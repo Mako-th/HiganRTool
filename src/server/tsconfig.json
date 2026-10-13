@@ -1,0 +1,18 @@
+{
+  // 編集器の型の手がかり用。検査と wrangler は esbuild で型を剥がして走らせるので、ここは建て方に効かない。
+  // 型の定義は `npm run types`（wrangler types）が worker-configuration.d.ts に書く（生成物。git に入れない）。
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2024"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    // 検査が共通の見本（tests/fixtures/room/*.json）を import で読むため。
+    "resolveJsonModule": true,
+    "types": ["@cloudflare/vitest-pool-workers/types"]
+  },
+  "include": ["worker-configuration.d.ts", "src/**/*.ts", "test/**/*.ts"]
+}

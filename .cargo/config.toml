@@ -1,0 +1,7 @@
+# th09.exe is 32-bit, so everything we build is 32-bit (a 64-bit DLL cannot be loaded into it).
+# Static CRT: the target machine does not need the VC runtime installed.
+[build]
+target = "i686-pc-windows-msvc"
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

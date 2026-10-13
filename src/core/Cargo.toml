@@ -1,0 +1,34 @@
+[package]
+name = "higanr_core"
+description = "HiganRTool の中核（プロトコル・lockstep のフレームの式・リプレイの解析）。Win32 に依存しない"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# 更新の目録の署名を作る検査用の鍵（src/update.rs の test_key）。検査（loader の dev-dependency）だけが開ける。配る exe・dll には入らない。
+test_key = []
+
+[dependencies]
+encoding_rs = "0.8.42"
+# gzip で CSV を書く・読む（src/gzlog.rs。MIT OR Apache-2.0。裏は純 Rust の miniz_oxide。png が既に引いているので Cargo.lock の版は増えない）。
+flate2 = "1.1"
+hmac = "0.13"
+png = "0.18.1"
+sha2 = "0.11"
+# 更新の目録の署名の確かめ（src/update.rs。BSD-3-Clause。Ed25519。暗号は自作しない —— 開発の規約）。
+# 確かめる側だけなので既定の機能（fast = 事前計算の表・zeroize）は切る。検査は固定の種から署名を作る（署名の道具は src/manifest_sign）。
+ed25519-dalek = { version = "3", default-features = false }
+# 版 5 の使い捨ての鍵の交換（src/seal.rs。BSD-3-Clause。X25519。docs/Design_Protocol.md §1-3）。秘密鍵は dll が OS の乱数で引いた 32 B から
+# 作る（core は乱数を持たない）ので `static_secrets`（バイト列から秘密鍵を作る口）を開き、既定の機能（事前計算の表）は切る（繋がるときに 1 回だけ）。
+# `zeroize` は捨てた秘密鍵をメモリから消すため。
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+# 版 5 の便の暗号化（src/seal.rs。MIT OR Apache-2.0。ChaCha20-Poly1305。RFC 8439）。確保しない形（その場で暗号化する口）だけを使うので、
+# 既定の機能（alloc・getrandom）は切る（繋がりの箱で確保しない —— tests/alloc_check.rs）。
+chacha20poly1305 = { version = "0.11", default-features = false }
+# 版 5 の向きごとの鍵を共有の値から引く（src/seal.rs。MIT OR Apache-2.0。HKDF-SHA256。RFC 5869）。hmac 0.13・sha2 0.11 と同じ世代。
+hkdf = "0.13"

@@ -1,0 +1,42 @@
+// 部屋サーバーの設定。ローカルでは `npx wrangler dev` と `npm test` で動く。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "higanr-rooms",
+  "main": "src/index.ts",
+  // 同梱の workerd が知っている日付以下にする。
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOMS", "class_name": "Room" },
+      // 1 IP（IPv6 は /64）あたりの接続の回数を正確に数える（回数は src/rules.ts）。
+      { "name": "CONNECT_LIMITER", "class_name": "ConnectLimiter" },
+      // ランダム対戦の待ち列（ビルド番号ごとに 1 つ。src/random_queue.ts）。
+      { "name": "RANDOM_QUEUE", "class_name": "RandomQueue" },
+      // 進行中のランダム対戦の一覧（ビルド番号ごとに 1 つ。src/watch_list.ts）。
+      { "name": "WATCH_LIST", "class_name": "WatchList" }
+    ]
+  },
+  // 粗い前段の回数制限（src/rules.ts の CONNECT_PRELIMIT_PER_MINUTE と同じ値にする）。
+  // 正確ではないが、荒らしで Durable Object の無料枠を使い切らないための網。
+  "ratelimits": [
+    {
+      "name": "CONNECT_LIMIT",
+      "namespace_id": "1001",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
+  // 移行は既存の tag を書き換えず、新しい tag で足す。
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["ConnectLimiter"] },
+    { "tag": "v3", "new_sqlite_classes": ["RandomQueue"] },
+    { "tag": "v4", "new_sqlite_classes": ["WatchList"] }
+  ],
+  // 接続コードや部屋名をログに残さない。
+  "observability": { "enabled": false },
+  "send_metrics": false,
+  // 更新の口（src/update.ts）が 302 で回す先。配り場所を変えるときはこの値だけを直してデプロイする
+  // （配った exe は作り直さずに済む）。
+  "vars": { "UPDATE_BASE_URL": "https://github.com/Mako-th/HiganRTool/releases/latest/download/" }
+}

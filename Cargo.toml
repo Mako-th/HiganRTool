@@ -1,0 +1,65 @@
+# HiganRTool workspace (Rust, i686-pc-windows-msvc). See docs/Design_Architecture.md 1-1.
+#
+#   src/core     pure logic (protocol, lockstep frame math, replay parsing). No Win32, no unsafe.
+#   src/dll      cdylib -> build/bin/HiganRTool.dll (copied/renamed by build.bat)
+#   src/loader   bin    -> build/bin/HiganRTool.exe
+#   src/peer_sim bin    -> build/bin/peer_sim.exe (fake opponent for M2)
+#   src/manifest_sign bin -> target/.../manifest_sign.exe (distributor's tool: update manifest key / sign / verify. Not shipped)
+#
+# The target triple and static CRT are set in .cargo/config.toml.
+# Packages (crates) follow decision D14: write purpose and license in README.md, no GPL.
+
+[workspace]
+resolver = "3"
+members = ["src/core", "src/dll", "src/loader", "src/peer_sim", "src/manifest_sign"]
+
+[workspace.package]
+# 配布のバージョン（zip の名前と、更新の目録の表示名に使う）
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.release]
+debug = false
+# ビルドの場所を消す設定はここに書かない。パッケージ（crates.io）のパニックの位置の文に
+# %CARGO_HOME%（＝ユーザーのフォルダ）が残るが、`trim-paths` は cargo 1.98.1 の安定版では断られ
+# （「feature `trim-paths` is required」。2026-09-28 に試した）、`--remap-path-prefix` は絶対パスが要るので
+# 追跡するファイル（ここや .cargo/config.toml）に書けば個人のパスがリポジトリに入る。そこで配布用のビルドは
+# tools/make_dist.py がその場の場所を読んで `cargo --config` で足す（置き場は target/dist）。
+# build.bat の build/bin は開発用で、パッケージの置き場のパスが残っているので人に渡さない。
+
+# 暗号のパッケージだけは検査（dev / test）のビルドでも最適化する。最適化しないと 1 通を封じる・開くのが遅く、
+# 便を多く流す模型の検査（rollback_sim）が 27.6 秒 → 266.7 秒になり、build.bat が全件の回の 900 秒を越えた
+# （2026-10-08 夜、バージョン 5 の取り込み）。自分のコードは debug のまま（検査の debug_assert と overflow の検査を残す）。
+[profile.dev.package.aead]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.hkdf]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.inout]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.universal-hash]
+opt-level = 3
+[profile.dev.package.x25519-dalek]
+opt-level = 3
+# 暗号のパッケージは総称型（generic）が多く、実体は呼び手の core の中で作られて core の opt-level で建つ。
+# そこで core も最適化する（debug_assert と overflow の検査は opt-level と別の設定で、dev の既定のまま残る）。
+# 【測】rollback_sim の 39 本: v5 の前 27.6 秒 / v5・暗号のパッケージだけ 3 で 210.6 秒 / core 1 で 87.6 秒 / core 2 で 6.2 秒。
+[profile.dev.package.higanr_core]
+opt-level = 2

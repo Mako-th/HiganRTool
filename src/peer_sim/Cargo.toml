@@ -1,0 +1,19 @@
+[package]
+name = "peer_sim"
+description = "偽の対戦相手。花映塚を使わずプロトコルだけ話す（M2 で 1 台の lockstep に使う）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 本体は lib に置き、exe（main.rs）は引数を読んで lib を呼ぶだけにする。
+# `tests/` の組み上がりの検査が、同じ本体を 2 本のスレッドで直に呼べるように。
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "peer_sim"
+path = "src/main.rs"
+
+[dependencies]
+higanr_core = { path = "../core" }

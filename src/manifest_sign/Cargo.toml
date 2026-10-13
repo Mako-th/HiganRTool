@@ -1,0 +1,18 @@
+[package]
+name = "higanr_manifest_sign"
+description = "配る側の道具: 更新の目録の署名の鍵を作る・目録に署名する・確かめる。配る exe・dll には入らない"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "manifest_sign"
+path = "src/main.rs"
+
+[dependencies]
+higanr_core = { path = "../core" }
+# 署名する側（BSD-3-Clause。確かめる側と同じパッケージ・同じ版。core が既定の機能を切って入れている）。
+ed25519-dalek = { version = "3", default-features = false }
+# 秘密の鍵の種を OS の乱数から引く（MIT OR Apache-2.0。暗号の乱数は自作しない）。この道具だけが使う。
+getrandom = "0.4"
