@@ -103,7 +103,7 @@ Up to 10 people can watch each random match and each room match.
 2. Choose the match you want to watch. Full matches are greyed out and cannot be chosen. If there are more than 8, scroll with Up/Down.
 3. The match appears. If you join mid-match, you catch up from the start of the match in fast-forward.
 
-Only random matches where both players have `enable = 1` are listed.
+Only random matches where both players have `enable = 1` under `[spectate]` in `HiganRTool.ini` are listed (the default is `1`).
 
 **Watching a room match**
 
