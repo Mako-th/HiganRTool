@@ -73,6 +73,24 @@ pub fn build_line() -> String {
     )
 }
 
+/// OS のバージョン（`RtlGetVersion`。互換モードの影響を受けない値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub build: u32,
+}
+
+/// 起動の見出しの環境の 1 行（簡潔にも残す）。起動のときだけ落ちる環境の切り分けに使う。
+pub fn system_line(os: Option<OsVersion>, sse2: bool, avx2: bool) -> String {
+    let yn = |b: bool| if b { "あり" } else { "なし" };
+    let os = match os {
+        Some(v) => format!("Windows {}.{}.{}", v.major, v.minor, v.build),
+        None => "Windows（バージョンが取れなかった）".to_string(),
+    };
+    format!("環境: {os} / CPU: SSE2 {}・AVX2 {}", yn(sse2), yn(avx2))
+}
+
 /// 照合の本体。ログの行を `out` に書く（書けなくても続ける）。最後の「スレッドを終える」の行は呼び出し側が書く。
 pub fn run(
     env: &mut dyn Env,
@@ -204,6 +222,24 @@ pub(crate) mod tests {
     use crate::th09_addr::{FORBIDDEN, IMAGE_BASE, SITES};
     use higanr_core::pe::IdentField;
     use std::collections::HashMap;
+
+    /// 壊れたら落ちる: バージョンの欄の順・SSE2 と AVX2 の取り違え・取れなかったときの文。
+    #[test]
+    fn system_line_names_the_os_build_and_cpu_features() {
+        let v = OsVersion {
+            major: 10,
+            minor: 0,
+            build: 19045,
+        };
+        assert_eq!(
+            system_line(Some(v), true, false),
+            "環境: Windows 10.0.19045 / CPU: SSE2 あり・AVX2 なし"
+        );
+        assert_eq!(
+            system_line(None, false, true),
+            "環境: Windows（バージョンが取れなかった） / CPU: SSE2 なし・AVX2 あり"
+        );
+    }
 
     pub(crate) struct Fake {
         pub(crate) ident: IdentOutcome,

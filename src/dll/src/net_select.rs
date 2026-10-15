@@ -8,11 +8,11 @@ use higanr_core::input_model::keys;
 use higanr_core::lockstep::by_seat;
 use higanr_core::menu_model::{
     APPLY_CLEAR_BITS, MAP_ITEM_RANDOM_OF_TWO, MAP_LIST_EMPTY, SCREEN_CHARA, SCREEN_DIFFICULTY,
-    SCREEN_MAP, TRANSITION_BITS, align_chara_parts, align_chara_value, chara_value,
-    chara_value_parts, is_selection_screen, press_kind,
+    SCREEN_MAP, TRANSITION_BITS, chara_value, chara_value_parts, is_selection_screen,
+    peer_chara_word, press_kind,
 };
-use higanr_core::selection::Press;
-use higanr_core::wire::{Seat, Step, StepKind};
+use higanr_core::selection::{PeerCursor, Press};
+use higanr_core::wire::{CURSOR_NONE, Seat, Step, StepKind};
 
 use crate::th09_addr::{MENU_CHARA_CURSOR, MENU_CURSOR};
 
@@ -89,13 +89,12 @@ fn map_item_at_cursor(v: &MenuView) -> Option<u8> {
     })
 }
 
-/// ホスト: 今の画面の合わせの押下（value は `menu_model::align_chara_value` ほか）。選択の画面でなければ None。
+/// ホスト: 今の画面の合わせの押下（value は `menu_model::uses_align` の注）。合わせを使う画面（難易度・マップ）でなければ None。
 pub fn align_press(v: &MenuView) -> Option<Press> {
     let screen = u8::try_from(v.screen).ok()?;
     let value = match screen {
         SCREEN_DIFFICULTY => (v.cursor & 3) as u8,
         SCREEN_MAP => map_item_at_cursor(v)?,
-        SCREEN_CHARA => align_chara_value(v.chara_cursor),
         _ => return None,
     };
     Some(Press {
@@ -156,9 +155,6 @@ pub struct ApplyPlan {
     pub words: [u16; 3],
     /// キャラ選択の決定で、カーソルを書いた後に立ち絵を追わせる席とカーソル。難易度・マップの画面・取消では `None`。
     pub portrait: Option<(usize, u32)>,
-    /// 合わせ（キャラ選択）だけ: 2 つ目のカーソル（2P の分。1 つ目 `cursor` は 1P の分）と、その立ち絵。
-    pub cursor_b: Option<(u32, u32)>,
-    pub portrait_b: Option<(usize, u32)>,
 }
 
 /// 押下の語（決定は Z、取消は X。合わせは画面を移る押下ではないので押さない）。
@@ -190,8 +186,6 @@ pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u1
             cursor: None,
             words: normal_words(my_seat, local, remote),
             portrait: None,
-            cursor_b: None,
-            portrait_b: None,
         };
     }
     let mut w = normal_words(my_seat, local, remote);
@@ -238,14 +232,12 @@ pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u1
         cursor,
         words: w,
         portrait,
-        cursor_b: None,
-        portrait_b: None,
     }
 }
 
 /// 合わせを入れる tick の feed とカーソル。**ゲスト**は、カーソルをホストの値へ書き（マップは自分の一覧から値の添字を探す。
 /// 無ければ書かない）、3 本とも方向・Ctrl・Shift を落とす（書いた値をこの tick に動かさない）。**ホスト**は自分の値なので
-/// 何も書かず、語もそのまま（`is_guest` が偽）。
+/// 何も書かず、語もそのまま（`is_guest` が偽）。キャラ選択の合わせは無い（届いても書かない。呼び手は書けなかった数に数える）。
 pub fn align_plan(
     v: &MenuView,
     st: &Step,
@@ -259,8 +251,6 @@ pub fn align_plan(
         cursor: None,
         words: w,
         portrait: None,
-        cursor_b: None,
-        portrait_b: None,
     };
     if !is_guest {
         return plan;
@@ -278,16 +268,69 @@ pub fn align_plan(
                 .position(|&x| x == st.value)
                 .map(|i| (MENU_CURSOR, i as u32));
         }
-        SCREEN_CHARA => {
-            let [c1, c2] = align_chara_parts(st.value);
-            plan.cursor = Some((MENU_CHARA_CURSOR, c1));
-            plan.cursor_b = Some((MENU_CHARA_CURSOR + 4, c2));
-            plan.portrait = Some((0, c1));
-            plan.portrait_b = Some((1, c2));
-        }
         _ => {}
     }
     plan
+}
+
+/// キャラ選択の tick に、相手の席へ feed する相手の入力ワード（`menu_model::peer_chara_word`。カーソルは位置で書く）。ほかの画面はそのまま。
+pub fn peer_word(screen: u32, remote: u16) -> u16 {
+    if screen == u32::from(SCREEN_CHARA) {
+        peer_chara_word(remote)
+    } else {
+        remote
+    }
+}
+
+/// 自分の MENU に載せる、自分の画面と自分の席のキャラのカーソル（キャラ選択の外は `CURSOR_NONE`）。
+pub fn own_cursor(v: &MenuView, seat: usize) -> (u8, u8) {
+    let screen = u8::try_from(v.screen).unwrap_or(0);
+    let cursor = match v.chara_cursor.get(seat) {
+        Some(&c) if screen == SCREEN_CHARA && c <= 15 => c as u8,
+        _ => CURSOR_NONE,
+    };
+    (screen, cursor)
+}
+
+/// 相手の席の位置の書き込み（`peer_sync`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSync {
+    /// 書く MainMenu の欄（オフセット, 値）。
+    pub cursor: (u32, u32),
+    /// 立ち絵を追わせる席とカーソル。
+    pub portrait: (usize, u32),
+    /// カーソルの音を鳴らす（相手のカーソルの移動。ランダム・入ったときの最初の位置では鳴らさない）。
+    pub sound: bool,
+}
+
+/// キャラ選択で、この tick に相手の席のカーソルを相手の位置へ書くか（押下を入れない tick だけ。呼び手が見る）。ゲームが押下を読む状態で、
+/// 相手の席が決めていない（決めた席のカーソルはゲームも動かさない）ときだけ見る。位置が同じなら書かない。
+/// `take` は相手の位置を取る（取ると `moved` が消えるので、見る条件が揃ったときだけ呼ぶ）。
+pub fn peer_sync(
+    v: &MenuView,
+    my: usize,
+    take: impl FnOnce() -> Option<PeerCursor>,
+) -> Option<PeerSync> {
+    if v.screen != u32::from(SCREEN_CHARA) || !accepting(v) {
+        return None;
+    }
+    let other = 1 - (my & 1);
+    if v.decided.get(other) != Some(&0) {
+        return None;
+    }
+    let pc = take()?;
+    if pc.screen != SCREEN_CHARA || pc.cursor > 15 {
+        return None;
+    }
+    let cursor = u32::from(pc.cursor);
+    if v.chara_cursor.get(other) == Some(&cursor) {
+        return None;
+    }
+    Some(PeerSync {
+        cursor: (MENU_CHARA_CURSOR + 4 * other as u32, cursor),
+        portrait: (other, cursor),
+        sound: pc.moved,
+    })
 }
 
 /// マップ −2（解放済みから 1 つ）を、ホストが具体の値に置き換える（ゲームの乱数は使わない）。一覧の中の 0〜13 の値
@@ -436,9 +479,7 @@ mod tests {
     fn align_press_values_and_when_the_host_may_align() {
         let p = align_press(&view(7)).unwrap();
         assert_eq!((p.kind, p.value, p.screen), (StepKind::Align, 2, 7));
-        let p = align_press(&view(8)).unwrap();
-        assert_eq!((p.value, p.screen), (0x95, 8));
-        assert_eq!(align_chara_parts(p.value), [5, 9]);
+        assert_eq!(align_press(&view(8)), None, "キャラ選択は合わせない");
         let p = align_press(&view(16)).unwrap();
         assert_eq!(
             (p.value, p.screen),
@@ -478,12 +519,13 @@ mod tests {
         let p = align_plan(&view(16), &al(16, 2), Seat::P2, 0, 0, true);
         assert_eq!(p.cursor, None);
         let p = align_plan(&view(8), &al(8, 0x74), Seat::P2, local, remote, true);
-        assert_eq!(p.cursor, Some((MENU_CHARA_CURSOR, 4)));
-        assert_eq!(p.cursor_b, Some((MENU_CHARA_CURSOR + 4, 7)));
-        assert_eq!((p.portrait, p.portrait_b), (Some((0, 4)), Some((1, 7))));
-        assert_eq!(p.words, [0, 0, 0]);
-        let p = align_plan(&view(8), &al(8, 0x74), Seat::P1, keys::Z, 0x0040, false);
-        assert_eq!((p.cursor, p.cursor_b, p.portrait), (None, None, None));
+        assert_eq!(
+            (p.cursor, p.portrait),
+            (None, None),
+            "キャラ選択の合わせは書かない"
+        );
+        let p = align_plan(&view(7), &al(7, 3), Seat::P1, keys::Z, 0x0040, false);
+        assert_eq!((p.cursor, p.portrait), (None, None));
         assert_eq!(p.words, normal_words(Seat::P1, keys::Z, 0x0040));
         for screen in [7u8, 8, 16] {
             let cancel = Step {
@@ -493,11 +535,7 @@ mod tests {
                 screen,
             };
             let p = apply_plan(&view(screen), &cancel, Seat::P2, 0, 0);
-            assert_eq!(
-                (p.cursor, p.cursor_b, p.portrait),
-                (None, None, None),
-                "画面 {screen} の取消"
-            );
+            assert_eq!((p.cursor, p.portrait), (None, None), "画面 {screen} の取消");
         }
     }
 
@@ -587,5 +625,72 @@ mod tests {
         assert_eq!(p.cursor, None);
         assert_eq!(p.portrait, None, "取消は立ち絵を追わせない");
         assert_eq!(p.words, [keys::X, 0x0010, 0x0010 | keys::X]);
+    }
+
+    fn pc(cursor: u8, moved: bool) -> Option<PeerCursor> {
+        Some(PeerCursor {
+            screen: 8,
+            cursor,
+            moved,
+        })
+    }
+
+    /// 壊れたら落ちる: 自分の席へ書く・相手の席が決めた後も書く・押下を読まない間に書く・同じ位置へ書く・音の旗を落とす、
+    /// 見ない条件のときに相手の位置を取ってしまう（`moved` が消えて音が鳴らない）。
+    #[test]
+    fn peer_sync_writes_the_other_seat_only_when_it_may_move() {
+        let v = view(8);
+        let s = peer_sync(&v, 0, || pc(12, true)).unwrap();
+        assert_eq!(s.cursor, (MENU_CHARA_CURSOR + 4, 12));
+        assert_eq!((s.portrait, s.sound), ((1, 12), true));
+        let s = peer_sync(&v, 1, || pc(2, false)).unwrap();
+        assert_eq!(s.cursor, (MENU_CHARA_CURSOR, 2));
+        assert_eq!((s.portrait, s.sound), ((0, 2), false));
+        assert_eq!(peer_sync(&v, 0, || pc(9, true)), None, "同じ位置");
+        assert_eq!(peer_sync(&v, 0, || None), None);
+        assert_eq!(
+            peer_sync(&v, 0, || Some(PeerCursor {
+                screen: 16,
+                cursor: 3,
+                moved: true
+            })),
+            None,
+            "相手はキャラ選択の外"
+        );
+        let mut decided = v;
+        decided.decided = [0, 1];
+        for (bad, why) in [
+            (decided, "相手の席が決めた"),
+            (MenuView { sub: 0, ..v }, "入る演出"),
+            (MenuView { trans: 1, ..v }, "移る途中"),
+            (view(16), "画面 16"),
+        ] {
+            let mut taken = false;
+            let got = peer_sync(&bad, 0, || {
+                taken = true;
+                pc(12, true)
+            });
+            assert_eq!((got, taken), (None, false), "{why}");
+        }
+        let mut mine = v;
+        mine.decided = [1, 0];
+        assert!(
+            peer_sync(&mine, 0, || pc(12, true)).is_some(),
+            "自分の席が決めていても書く"
+        );
+    }
+
+    #[test]
+    fn own_cursor_is_sent_only_on_the_chara_screen() {
+        assert_eq!(own_cursor(&view(8), 0), (8, 5));
+        assert_eq!(own_cursor(&view(8), 1), (8, 9));
+        assert_eq!(own_cursor(&view(7), 0), (7, CURSOR_NONE));
+        assert_eq!(own_cursor(&view(16), 1), (16, CURSOR_NONE));
+        let mut v = view(8);
+        v.chara_cursor = [16, 99];
+        assert_eq!(own_cursor(&v, 0), (8, CURSOR_NONE), "範囲の外は送らない");
+        assert_eq!(peer_word(8, keys::UP | keys::Z), keys::Z);
+        assert_eq!(peer_word(7, keys::UP | keys::Z), keys::UP | keys::Z);
+        assert_eq!(peer_word(16, 0x0100 | keys::DOWN), 0x0100 | keys::DOWN);
     }
 }

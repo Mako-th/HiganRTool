@@ -230,7 +230,7 @@ pub enum Mode {
     BSpin,
     /// game → b → b-spin を `cycle_secs` ごとに入れ替える（切り分け用）。並びは `cycle_phases` で変えられる。
     Cycle,
-    /// B と同じ格子で、期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後は b-spin と同じに `Sleep(0)` で回る（CPU を下げるため。`crate::pacing_hybrid`）。既定ではない。
+    /// B と同じ格子で、期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後は b-spin と同じに `Sleep(0)` で回る（処理の重さを下げるため。`crate::pacing_hybrid`）。既定ではない。
     BHybrid,
     /// vpatch の通常のペースの形の再現（`crate::pacing_vpatch`）。遅延の表の「vpatch 相当」を測るための測定専用で、既定でも `auto_window` / `cycle_phases` の候補でもない。
     Vpatch,
@@ -317,7 +317,7 @@ pub fn auto_phase_with(s: Screen, window: Phase) -> Phase {
     }
 }
 
-/// `mode = auto` のウィンドウの方式の既定（ini の `auto_window` を書かないとき）。b-hybrid は CPU が軽いが入力 → Present の前の p50 が長いので既定にしない。
+/// `mode = auto` のウィンドウの方式の既定（ini の `auto_window` を書かないとき）。b-hybrid は処理が軽いが入力 → Present の前の p50 が長いので既定にしない。
 pub const DEFAULT_AUTO_WINDOW: Phase = Phase::BSpin;
 /// `auto_window` に書ける方式（ウィンドウで格子を刻む方式のうち、寝ずに回る 2 つ。b は寝ることで遅れた方式なので入れない）。
 pub const AUTO_WINDOW_PHASES: [Phase; 2] = [Phase::BSpin, Phase::BHybrid];
@@ -1022,7 +1022,7 @@ impl FrameRow {
     }
 
     /// 1 フレームにゲームのスレッドが CPU で走った周期（この行と 1 つ前の行の、Present の前の QueryThreadCycleTime の差）。番号が続いていて、どちらにも周期があるときだけ。
-    /// 寝ていた時間は数えないので、b-spin（回り続ける）と b-hybrid（寝る）で比べれば CPU を使った量の違いが出る。
+    /// 寝ていた時間は数えないので、b-spin（回り続ける）と b-hybrid（寝る）で比べれば処理に使った量の違いが出る。
     pub fn frame_cycles(&self, prev: Option<&FrameRow>) -> Option<i64> {
         let p = prev.filter(|p| p.frame.wrapping_add(1) == self.frame)?;
         (p.present_cycles != 0 && self.present_cycles != 0)

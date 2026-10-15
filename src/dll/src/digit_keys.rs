@@ -1,14 +1,15 @@
 //! Ctrl+上段の数字（0〜9）でディレイを替える入口の「押した瞬間」の取り方（pure。unsafe 無し）。
 //! 0〜8 がその値、9 が auto（`higanr_core::delay_pick::AUTO`）。Ctrl+Tab は同期方式の切替（キャラセレクトの間）。
+//! Ctrl+C は観戦コードのコピーの頼み（つながっている間。`net_ui::NetUi::copy_tick` が同じ取り方で読む）。
 //! キーボードの読み（`GetAsyncKeyState`）は `digit_keys_win.rs`、「読んでよい間」の判断は `net_game::NetGame::digit_keys`（ゲートの式は `may_read`）、
 //! 押下の行き先は `NetPlay::digit_tick`。
 //!
 //! 数字と Tab を使うのは、ゲームの入力の関数 `0x0042B850` が `GetKeyboardState` の表から読むキーに上段の数字 0〜9 と Tab が無いため
 //! （表の添字 `-0xd4`〜`-0xcb` と `-0xfb` の参照が 0 件）。テンキーは方向と衝突するので読まない。
 //! ゲームは Ctrl（VK_CONTROL。`0x0042BAAB`）を入力ワードの `0x0100` として読む（キャラ・マップ選択の「ランダム」）ので、
-//! 選択の画面では Ctrl を押している間 `0x0100` を落として使う（`menu_model::menu_word`）。
+//! 選択の画面で Ctrl+数字・Ctrl+Tab を押すと「ランダム」も回る（`0x0100` は落とさず、そのままゲームと相手へ届く）。
 //!
-//! 1 tick に 1 回、押下の集合（bit `d` = 数字 `d`・Tab・Ctrl・Alt/Win）を渡され、前の tick に離れていて今押されている数字・Tab だけを取る
+//! 1 tick に 1 回、押下の集合（bit `d` = 数字 `d`・Tab・C・Ctrl・Alt/Win）を渡され、前の tick に離れていて今押されている数字・Tab・C だけを取る
 //! （押し続けは 1 回）。取るのは、その押した瞬間に Ctrl が押されていて Alt・Win が押されていないときだけ: Ctrl を後から押しても押したままの
 //! 数字は取らず、Alt+Tab・Win+Tab でウィンドウを切り替えて戻った後に押しっぱなしの Tab も取らない。読んでよくない tick（`None`）が挟まると、
 //! 次に読めた tick で押されたままのキーを押下と取らない（前面に戻ったとき・文字の入力を閉じたときの誤爆を防ぐ）。
@@ -20,14 +21,19 @@ use higanr_core::wire::Mode;
 /// 読んだ集合の bit10: Tab（仮想キー `VK_TAB`）。ゲームは Tab を読まない（表の添字 `-0xfb` の参照が 0 件）ので衝突しない。
 pub const TAB_BIT: u16 = 1 << 10;
 
-/// 押した瞬間を取る対象のキー（数字 0〜9 と Tab）の bit。
-pub const KEYS_MASK: u16 = 0x07FF;
-
 /// 読んだ集合の bit11: Alt か Win が押されている。押した瞬間の集合には出ない。
 pub const MOD_BIT: u16 = 1 << 11;
 
 /// 読んだ集合の bit12: Ctrl が押されている。押した瞬間の集合には出ない。
 pub const CTRL_BIT: u16 = 1 << 12;
+
+/// 読んだ集合の bit13: C（Ctrl+C で観戦コードをコピーする）。ゲームの入力の関数 `0x0042B850` は C を読まない
+/// （Z・X・Shift・Esc・矢印・Ctrl・Q・S・P・Home・Enter・D・R だけ）ので、Ctrl の
+/// 扱いは Ctrl+数字と同じで足りる。
+pub const C_BIT: u16 = 1 << 13;
+
+/// 押した瞬間を取る対象のキー（数字 0〜9・Tab・C）の bit。
+pub const KEYS_MASK: u16 = 0x07FF | C_BIT;
 
 /// 読んだ集合の全部のビット。
 pub const ALL_HELD: u16 = KEYS_MASK | MOD_BIT | CTRL_BIT;
@@ -83,6 +89,11 @@ pub fn tab_pressed(pressed: u16) -> bool {
     pressed & TAB_BIT != 0
 }
 
+/// 押した瞬間の集合に Ctrl+C（観戦コードのコピーの頼み）があるか。
+pub fn copy_pressed(pressed: u16) -> bool {
+    pressed & C_BIT != 0
+}
+
 /// 押した瞬間の集合から、遅れの量の押下（`Connected::press_delay` に渡す値）を 1 つ選ぶ。0〜`bounds` の上限はその値、9 は `AUTO`。
 /// 同じ tick に複数押したら番号の大きい方が後勝ち。何も押していなければ `None`。
 pub fn pick(pressed: u16) -> Option<u8> {
@@ -111,7 +122,7 @@ mod tests {
         assert_eq!(e.feed(Some(K5 | K0 | C)), K0, "別のキーを足した");
         assert_eq!(e.feed(Some(K9 | C)), K9, "端のキー");
         assert_eq!(
-            e.feed(Some(0xE000 | K8 | C)),
+            e.feed(Some(0xC000 | K8 | C)),
             K8,
             "範囲の外のビットは押下でない"
         );
@@ -181,6 +192,43 @@ mod tests {
         assert_eq!(e.feed(Some(TAB_BIT | C)), 0);
         assert_eq!(e.feed(Some(C)), 0);
         assert_eq!(e.feed(Some(TAB_BIT | C)), TAB_BIT);
+    }
+
+    #[test]
+    fn ctrl_c_counts_once_per_press_and_only_with_ctrl_down_at_that_moment() {
+        let mut e = DigitEdge::new();
+        e.feed(Some(0));
+        assert_eq!(e.feed(Some(C_BIT)), 0, "Ctrl 無しの C");
+        assert_eq!(
+            e.feed(Some(C_BIT | C)),
+            0,
+            "Ctrl を後から押しても、押したままの C は取らない"
+        );
+        assert_eq!(e.feed(Some(0)), 0);
+        let p = e.feed(Some(C_BIT | C));
+        assert_eq!(p, C_BIT);
+        assert!(copy_pressed(p));
+        for _ in 0..10 {
+            assert_eq!(e.feed(Some(C_BIT | C)), 0, "押しっぱなしで繰り返さない");
+        }
+        assert_eq!(e.feed(Some(C)), 0, "C だけを離した");
+        assert_eq!(
+            e.feed(Some(C_BIT | C | MOD_BIT)),
+            0,
+            "Ctrl+Alt+C は取らない"
+        );
+        assert_eq!(e.feed(Some(C_BIT | C)), 0, "Alt を離した瞬間の誤爆");
+        assert_eq!(e.feed(None), 0);
+        assert_eq!(e.feed(Some(C_BIT | C)), 0, "読めない間から押していた");
+        assert_eq!(e.feed(Some(C)), 0);
+        assert_eq!(e.feed(Some(C_BIT | C)), C_BIT, "離して押せば効く");
+        // 数字と一緒でも、遅れの量の選びは C に影響されず、C は遅れの量にも Tab にもならない。
+        let mut e = DigitEdge::new();
+        e.feed(Some(C));
+        let p = e.feed(Some(C | C_BIT | K5));
+        assert_eq!((pick(p), copy_pressed(p)), (Some(5), true));
+        assert_eq!(pick(C_BIT), None);
+        assert!(!tab_pressed(C_BIT) && !copy_pressed(K5 | TAB_BIT));
     }
 
     #[test]

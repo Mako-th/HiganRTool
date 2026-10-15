@@ -121,7 +121,14 @@ fn query_number(request: &Handle, which: u32) -> Option<u32> {
     (ok != 0).then_some(value)
 }
 
-pub fn get(ep: &Endpoint, proxy: Proxy, t: Timeouts, max: usize) -> Result<Vec<u8>, HttpError> {
+/// `progress` には、本文を読み進めるたびにそこまでに受け取ったバイト数を渡す（呼ぶのはこのスレッド）。
+pub fn get(
+    ep: &Endpoint,
+    proxy: Proxy,
+    t: Timeouts,
+    max: usize,
+    progress: &mut dyn FnMut(usize),
+) -> Result<Vec<u8>, HttpError> {
     let agent = wide(USER_AGENT);
     let access = match proxy {
         Proxy::Automatic => WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -243,6 +250,7 @@ pub fn get(ep: &Endpoint, proxy: Proxy, t: Timeouts, max: usize) -> Result<Vec<u
         if body.len() > max {
             return Err(HttpError::TooLarge { max });
         }
+        progress(body.len());
     }
     if let Some(want) = declared
         && body.len() as u64 != want

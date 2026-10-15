@@ -42,7 +42,7 @@ pub fn summary(rep: &Report) -> String {
             "全部の seg を終えた（相手の BYE を受けた）".to_string()
         }
         End::Finished { peer_bye: false } => {
-            "全部の seg を終えた（相手の BYE は届かず、相手が 10 秒黙った）".to_string()
+            "全部の seg を終えた（相手の BYE は届かず、相手が 60 秒黙った）".to_string()
         }
         // 相手の HiganRTool のバージョンが違う: dll と同じ文字（自分は名乗ったバージョン）。
         End::HandshakeFailed(FailReason::OtherVersion { theirs }) => format!(
@@ -56,7 +56,7 @@ pub fn summary(rep: &Report) -> String {
         ),
         End::HandshakeFailed(r) => format!("接続できなかった: {r:?}"),
         End::PeerBye(r) => format!("終える前に相手が BYE を出した: {r:?}"),
-        End::Dead => "終える前に相手が 10 秒黙った（BYE(切断) を出した）".to_string(),
+        End::Dead => "終える前に相手が 60 秒黙った（BYE(切断) を出した）".to_string(),
         End::Desync { local, remote } => {
             format!(
                 "CHECK が合わなかった（BYE(ズレ検出) を出した）: 自分 {local:?} / 相手 {remote:?}"
@@ -217,7 +217,7 @@ pub fn summary(rep: &Report) -> String {
 
 pub fn log_text(rep: &Report, args_line: &str) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "# peer_sim の記録（docs/Design_Architecture.md §8-4）");
+    let _ = writeln!(s, "# peer_sim の記録");
     let _ = writeln!(s, "# 引数: {args_line}");
     // 入った押下は `#` の行に置く（`#` でない行は (seg frame 1P 2P delay) の列だけにして、dll の
     // `_net_frames.csv` や相手の記録と行ごとに突き合わせられる形を保つ）。

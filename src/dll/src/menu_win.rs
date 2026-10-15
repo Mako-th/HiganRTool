@@ -184,7 +184,8 @@ fn run_loop(shared: &Shared, file: &mut dyn Write) {
     let to_us = |d: i64| (d.max(0) as u128 * 1_000_000 / qpf as u128) as u64;
     write(file, format!("{MENU_CSV_HEADER}\n").as_bytes(), &mut local);
     let mut mem = OwnProcess;
-    let mut watch = MenuWatch::default();
+    // メニューのフレームごとの行は開発用のビルドだけ（配るバージョンは状態が変わった行だけ）。
+    let mut watch = MenuWatch::new(!cfg!(feature = "dist"));
     let t0 = qpc();
     let mut last = t0;
     let mut last_flush = t0;

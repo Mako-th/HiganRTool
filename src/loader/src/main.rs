@@ -2,13 +2,15 @@
 //!
 //! 手順と後始末は `launch.rs`、本物の Win32 は `real.rs`、引数は `cli.rs`。`game_pick.rs` は `--game` なしの起動で th09.exe の場所を
 //! 選ばせ、`update.rs` は配るバージョンの起動前の更新、`code_relay.rs` は接続コードの受け渡しのウィンドウ、`freshness.rs` は古い成果物での起動を断る。
-//! OS のキーボード・マウスの注入や前面を奪う呼び出しはしない。ゲームのフォルダには何も書かない。
+//! OS のキーボード・マウスの注入や前面を奪う呼び出しはしない。ゲームのフォルダに書くのは `HiganRTool.ini` だけ（ツールがその中に置かれたとき）。
 
 // unsafe を書いてよいのは real.rs・folder_dialog.rs・http_win.rs だけ。
 #[forbid(unsafe_code)]
 mod cli;
 #[forbid(unsafe_code)]
 mod code_relay;
+#[forbid(unsafe_code)]
+mod crash_log;
 #[forbid(unsafe_code)]
 mod env_block;
 mod folder_dialog;
@@ -20,12 +22,23 @@ mod game_pick;
 mod hold;
 mod http_win;
 #[forbid(unsafe_code)]
+mod imports;
+#[forbid(unsafe_code)]
 mod launch;
+#[cfg(any(test, not(feature = "dist")))]
 #[forbid(unsafe_code)]
 mod ledger;
+#[forbid(unsafe_code)]
+mod post_update;
 mod real;
+#[cfg(not(feature = "dist"))]
 #[forbid(unsafe_code)]
 mod selftest;
+#[forbid(unsafe_code)]
+mod single;
+#[forbid(unsafe_code)]
+mod staged;
+#[cfg(any(test, not(feature = "dist")))]
 #[forbid(unsafe_code)]
 mod synth;
 #[forbid(unsafe_code)]
@@ -34,18 +47,29 @@ mod ui_lang;
 mod update;
 #[forbid(unsafe_code)]
 mod win;
+#[forbid(unsafe_code)]
+mod writable;
+// build.rs と同じ定義を検査するためだけに取り込む。
+#[cfg(test)]
+#[path = "../manifest_link.rs"]
+mod manifest_link;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
+use higanr_core::ini_edit::Edit;
+use higanr_core::ini_store::{self, Legacy};
 use higanr_core::lang::Lang;
+use higanr_core::lang::Tx;
 use launch::{CleanupIssue, LaunchError, LaunchRequest};
+use staged::Logged;
 use ui_lang::by_lang;
-use win::Win32;
+use win::{LaunchNote, Win32};
 
 /// この exe と同じフォルダの `HiganRTool.dll`（`target\...\release` では cdylib の `higanrtool.dll`。大文字小文字は区別しない）。
 /// 自己検査は日本語のまま使う。
+#[cfg(not(feature = "dist"))]
 pub(crate) fn default_dll_path(exe: &Path) -> Result<PathBuf, String> {
     default_dll_path_in(exe, Lang::Ja)
 }
@@ -60,7 +84,7 @@ fn folder_unknown(exe: &Path, lang: Lang) -> String {
     let shown = exe.display();
     by_lang!(
         lang,
-        ja: "{shown} のフォルダが分からない",
+        ja: "{shown}のフォルダが分からない",
         en: "Cannot tell the folder of {shown}"
     )
 }
@@ -98,34 +122,34 @@ fn describe(e: &LaunchError, lang: Lang) -> String {
     match e {
         LaunchError::DllPathInvalid(why) => {
             let why = why.get(lang);
-            by_lang!(lang, ja: "DLL のパスが使えません（{why}）", en: "The DLL path cannot be used ({why})")
+            by_lang!(lang, ja: "DLLのパスが使えません（{why}）", en: "The DLL path cannot be used ({why})")
         }
         LaunchError::DllUnreadable(why) => {
-            by_lang!(lang, ja: "DLL が読めません（{why}）", en: "The DLL cannot be read ({why})")
+            by_lang!(lang, ja: "DLLが読めません（{why}）", en: "The DLL cannot be read ({why})")
         }
         LaunchError::DllNotPe32I386(why) => by_lang!(
             lang,
-            ja: "DLL が 32bit の DLL ではありません（{why:?}）",
+            ja: "DLLが32bitのDLLではありません（{why:?}）",
             en: "The DLL is not a 32-bit DLL ({why:?})"
         ),
         LaunchError::GamePathInvalid => match lang {
-            Lang::Ja => "exe のフォルダが分かりません",
+            Lang::Ja => "exeのフォルダが分かりません",
             Lang::En => "Cannot tell the folder of the exe",
         }
         .to_string(),
         LaunchError::GameUnreadable(why) => {
-            by_lang!(lang, ja: "exe が読めません（{why}）", en: "The exe cannot be read ({why})")
+            by_lang!(lang, ja: "exeが読めません（{why}）", en: "The exe cannot be read ({why})")
         }
         LaunchError::GameIdentMismatch(fields) => game_pick::ident_mismatch_text(fields, lang),
         LaunchError::LoadLibraryAddress(e) => by_lang!(
             lang,
-            ja: "LoadLibraryW のアドレスが引けません（GetLastError {e}）",
+            ja: "LoadLibraryWのアドレスが引けません（GetLastError {e}）",
             en: "Cannot find the address of LoadLibraryW (GetLastError {e})"
         ),
         // 740 = ERROR_ELEVATION_REQUIRED。th09.exe が「管理者として実行」の設定のとき。
         LaunchError::CreateProcess(ELEVATION_REQUIRED) => by_lang!(
             lang,
-            ja: "起動できません（CreateProcessW、GetLastError {ELEVATION_REQUIRED}）。th09.exe が「管理者として実行」の設定になっています。HiganRTool.exe も管理者として起動してください（ショートカットのプロパティ →「詳細設定」→「管理者として実行」）",
+            ja: "起動できません（CreateProcessW、GetLastError {ELEVATION_REQUIRED}）。th09.exeが「管理者として実行」の設定になっています。HiganRTool.exeも管理者として起動してください（ショートカットのプロパティ →「詳細設定」→「管理者として実行」）",
             en: "Cannot start (CreateProcessW, GetLastError {ELEVATION_REQUIRED}). th09.exe is set to run as administrator. Run HiganRTool.exe as administrator too (shortcut properties > Advanced > Run as administrator)"
         ),
         LaunchError::CreateProcess(e) => by_lang!(
@@ -140,7 +164,7 @@ fn describe(e: &LaunchError, lang: Lang) -> String {
         ),
         LaunchError::WriteMemory(e) => by_lang!(
             lang,
-            ja: "DLL のパスを書き込めません（GetLastError {e}）",
+            ja: "DLLのパスを書き込めません（GetLastError {e}）",
             en: "Cannot write the DLL path (GetLastError {e})"
         ),
         LaunchError::CreateRemoteThread(e) => by_lang!(
@@ -152,23 +176,23 @@ fn describe(e: &LaunchError, lang: Lang) -> String {
             let secs = launch::REMOTE_THREAD_TIMEOUT_MS / 1000;
             by_lang!(
                 lang,
-                ja: "DLL の読み込みが {secs} 秒で終わりませんでした",
+                ja: "DLLの読み込みが{secs}秒で終わりませんでした",
                 en: "Loading the DLL did not finish within {secs} seconds"
             )
         }
         LaunchError::RemoteThreadWaitFailed(e) => by_lang!(
             lang,
-            ja: "DLL の読み込みを待てませんでした（GetLastError {e}）",
+            ja: "DLLの読み込みを待てませんでした（GetLastError {e}）",
             en: "Cannot wait for the DLL to load (GetLastError {e})"
         ),
         LaunchError::LoadLibraryReturnedZero => match lang {
-            Lang::Ja => "ゲームの中で DLL が読み込めませんでした（LoadLibraryW が 0。DLL が自分から断った場合を含む）",
+            Lang::Ja => "ゲームの中でDLLが読み込めませんでした（LoadLibraryWが0。DLLが自分から断った場合を含む）",
             Lang::En => "The DLL could not be loaded inside the game (LoadLibraryW returned 0; this includes the DLL refusing to load by itself)",
         }
         .to_string(),
         LaunchError::ExitCodeUnavailable(e) => by_lang!(
             lang,
-            ja: "DLL の読み込みの結果が読めません（GetLastError {e}）",
+            ja: "DLLの読み込みの結果が読めません（GetLastError {e}）",
             en: "Cannot read the result of loading the DLL (GetLastError {e})"
         ),
         LaunchError::ResumeFailed(e) => by_lang!(
@@ -178,22 +202,22 @@ fn describe(e: &LaunchError, lang: Lang) -> String {
         ),
         LaunchError::PatchRead(at, e) => by_lang!(
             lang,
-            ja: "2 つ目の起動の書き換え: 0x{at:08X} が読めません（GetLastError {e}）。何も書いていません",
+            ja: "2つ目の起動の書き換え: 0x{at:08X}が読めません（GetLastError {e}）。何も書いていません",
             en: "Start-up patch: cannot read 0x{at:08X} (GetLastError {e}). Nothing was written"
         ),
         LaunchError::PatchMismatch { at, found } => by_lang!(
             lang,
-            ja: "2 つ目の起動の書き換え: 0x{at:08X} が期待のバイト列と違います（{found:02X?}）。何も書いていません",
+            ja: "2つ目の起動の書き換え: 0x{at:08X}が期待のバイト列と違います（{found:02X?}）。何も書いていません",
             en: "Start-up patch: 0x{at:08X} does not hold the expected bytes ({found:02X?}). Nothing was written"
         ),
         LaunchError::PatchWrite(at, e) => by_lang!(
             lang,
-            ja: "2 つ目の起動の書き換え: 0x{at:08X} に書けません（GetLastError {e}）",
+            ja: "2つ目の起動の書き換え: 0x{at:08X}に書けません（GetLastError {e}）",
             en: "Start-up patch: cannot write to 0x{at:08X} (GetLastError {e})"
         ),
         LaunchError::PatchVerify { at, found } => by_lang!(
             lang,
-            ja: "2 つ目の起動の書き換え: 0x{at:08X} を読み直すと書いた値になっていません（{found:02X?}）",
+            ja: "2つ目の起動の書き換え: 0x{at:08X}を読み直すと書いた値になっていません（{found:02X?}）",
             en: "Start-up patch: reading 0x{at:08X} back does not give the value that was written ({found:02X?})"
         ),
     }
@@ -237,14 +261,14 @@ fn child_env(
             Ok(_) => {
                 return Err(by_lang!(
                     lang,
-                    ja: "{flag} {shown} がファイルでない",
+                    ja: "{flag} {shown}がファイルでない",
                     en: "{flag} {shown} is not a file"
                 ));
             }
             Err(e) => {
                 return Err(by_lang!(
                     lang,
-                    ja: "{flag} {shown} が読めない（{e}）",
+                    ja: "{flag} {shown}が読めない（{e}）",
                     en: "{flag} {shown} cannot be read ({e})"
                 ));
             }
@@ -287,12 +311,21 @@ fn relay_ini_text(
     inherited: Option<&OsStr>,
     dll_dir: &Path,
 ) -> Option<String> {
+    ini_path_of(env, inherited, dll_dir).and_then(|p| std::fs::read_to_string(p).ok())
+}
+
+/// dll が読む ini のパス（`--ini` → 継いだ変数 → DLL のフォルダ）。
+fn ini_path_of(
+    env: &[(OsString, OsString)],
+    inherited: Option<&OsStr>,
+    dll_dir: &Path,
+) -> Option<PathBuf> {
     let name = OsStr::new(higanr_core::ini::PATH_ENV);
     let flag = env
         .iter()
         .find(|(k, _)| k.as_os_str() == name)
         .map(|(_, v)| Path::new(v));
-    code_relay::ini_location(flag, inherited, dll_dir).and_then(|p| std::fs::read_to_string(p).ok())
+    code_relay::ini_location(flag, inherited, dll_dir)
 }
 
 /// ウィンドウに出す ini の対戦の形。読めない・値が誤りなら None（dll はネットワークの準備をしないのでウィンドウは形を出さない）。
@@ -361,7 +394,8 @@ fn spawn_paste_reader(first: Option<String>) -> mpsc::Receiver<String> {
 }
 
 struct RealPickHost {
-    saved_file: PathBuf,
+    /// 覚える場所を書く ini（dll が読む ini と同じ）。
+    ini: PathBuf,
     lang: Lang,
 }
 
@@ -371,14 +405,20 @@ impl game_pick::Host for RealPickHost {
     }
 
     fn read_saved(&mut self) -> Option<String> {
-        std::fs::read_to_string(&self.saved_file).ok()
+        ini_store::get(&self.ini, game_pick::INI_SECTION, game_pick::INI_KEY)
     }
 
     fn write_saved(&mut self, text: &str) -> Result<(), String> {
-        std::fs::write(&self.saved_file, text).map_err(|e| {
-            let shown = self.saved_file.display();
-            by_lang!(self.lang, ja: "{shown} に書けません: {e}", en: "Cannot write to {shown}: {e}")
-        })
+        ini_store::update_creating(
+            &self.ini,
+            &new_ini_text(),
+            &[Edit::Set {
+                section: game_pick::INI_SECTION,
+                key: game_pick::INI_KEY,
+                value: text,
+            }],
+        )
+        .map(|_| ())
     }
 
     fn read_exe(&mut self, exe: &Path) -> std::io::Result<Vec<u8>> {
@@ -412,30 +452,349 @@ impl game_pick::Host for RealPickHost {
     }
 }
 
-fn pick_game(choose: bool, lang: Lang) -> Result<PathBuf, i32> {
-    let saved_file = std::env::current_exe()
-        .map_err(|e| e.to_string())
-        .and_then(|me| {
-            me.parent()
-                .map(|d| d.join(game_pick::SAVED_FILE))
-                .ok_or_else(|| folder_unknown(&me, lang))
-        })
-        .map_err(|e| {
-            eprintln!(
-                "{}",
-                by_lang!(
-                    lang,
-                    ja: "HiganRTool: この exe の場所が分かりません（{e}）。何も起動していません。",
-                    en: "HiganRTool: Cannot tell where this exe is ({e}). Nothing was started."
-                )
-            );
-            1
-        })?;
-    let mut host = RealPickHost { saved_file, lang };
+/// ini が無いときに作る中身。配るバージョンは配る ini と同じ（一部の設定だけの ini を作ると、dll が既定を書き出さなくなる）。
+fn new_ini_text() -> String {
+    if cfg!(feature = "dist") {
+        ini_store::dist_ini_text()
+    } else {
+        String::new()
+    }
+}
+
+/// 以前の版の game_path.txt（この exe と同じフォルダ）があれば ini の `[loader] game` へ移して消す（ini に値があれば ini が先）。
+/// 選ぶ前と、覚えを先に読む前（`early_game_dir`）の両方で呼ぶので、2 回目は何もしない。
+fn migrate_legacy_game(ini: &Path) {
+    let Some(legacy_file) = std::env::current_exe()
+        .ok()
+        .and_then(|me| me.parent().map(|d| d.join(game_pick::LEGACY_FILE)))
+    else {
+        return;
+    };
+    for line in ini_store::migrate(
+        ini,
+        Some(&new_ini_text()),
+        &[Legacy {
+            file: legacy_file,
+            section: game_pick::INI_SECTION,
+            key: game_pick::INI_KEY,
+            parse: game_pick::parse_legacy,
+            is_default: |_| false,
+        }],
+    ) {
+        eprintln!("HiganRTool: {line}");
+    }
+}
+
+/// dll が読む ini のパス（`--ini` → 継いだ変数 → DLL のフォルダ。DLL を指さなければこの exe のフォルダ）。
+fn loader_ini_path(ini: Option<&Path>, dll: Option<&Path>) -> Option<PathBuf> {
+    let flag = ini.and_then(|p| std::path::absolute(p).ok());
+    let dll_dir = match dll {
+        Some(d) => std::path::absolute(d).ok()?.parent()?.to_path_buf(),
+        None => std::env::current_exe().ok()?.parent()?.to_path_buf(),
+    };
+    code_relay::ini_location(
+        flag.as_deref(),
+        std::env::var_os(higanr_core::ini::PATH_ENV).as_deref(),
+        &dll_dir,
+    )
+}
+
+fn pick_game(choose: bool, ini: &Path, lang: Lang) -> Result<PathBuf, i32> {
+    migrate_legacy_game(ini);
+    let mut host = RealPickHost {
+        ini: ini.to_path_buf(),
+        lang,
+    };
     game_pick::resolve(&mut host, choose).map_err(|e| {
         eprintln!("HiganRTool: {}", e.describe(lang));
         1
     })
+}
+
+const SLOW_LOAD_TEXT: Tx = Tx {
+    ja: "HiganRTool: 読み込みに時間がかかっています。ウイルス対策ソフトの確認を待っている可能性があります。このままお待ちください。",
+    en: "HiganRTool: Loading is taking a while. Your antivirus software may be checking the files. Please wait.",
+};
+
+fn announce_note(lang: Lang, note: LaunchNote) {
+    match note {
+        LaunchNote::SlowLoad => println!("{}", SLOW_LOAD_TEXT.get(lang)),
+    }
+}
+
+/// Wine の上で読み込みの待ちが時間切れになったときの次の一手。Wine の前回の起動（死にきらない th09.exe・wineserver の
+/// 状態）が残っていると、次の読み込みが止まるという推定による（Linux の実機では測っていない）。
+const WINE_LEFTOVER_TEXT: Tx = Tx {
+    ja: "Wineの前回の起動が残っている可能性があります。`wineserver -k`を実行してから、もう一度起動してください。",
+    en: "A previous Wine session may still be running. Run `wineserver -k`, then start again.",
+};
+
+/// 時間切れの案内に足す 1 文。Wine のときだけ出す（Windows の時間切れは今までどおり）。
+fn wine_hint(e: &LaunchError, wine: bool, lang: Lang) -> Option<&'static str> {
+    (wine && matches!(e, LaunchError::RemoteThreadTimedOut)).then(|| WINE_LEFTOVER_TEXT.get(lang))
+}
+
+/// 起動を止める理由の文を、画面に出すとともに段階ログにも残す。
+fn fail_line(text: &str) {
+    eprintln!("{text}");
+    crash_log::stage(&format!("画面: {text}"));
+}
+
+/// 段階ログを用意し、未処理例外のフィルターを置き、起動の最初の行を貯める。ログのファイルはまだ開かない（`settle_tool_folder`）。
+fn start_log(lang: Lang, args: &[OsString]) {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    let logs = dir.join(code_relay::LOGS_DIR);
+    let scrub = higanr_core::log_scrub::Scrub::new().dir(&dir.to_string_lossy(), "<ツール>");
+    let mut log = crash_log::StageLog::new(&logs, real::local_stamp, scrub);
+    real::install_exception_filter(real::EXCEPTION_PASS_ON);
+    log.begin_run(std::process::id());
+    crash_log::install(log);
+    let build = higanr_core::update::BUILD_NUMBER;
+    let kind = if cfg!(feature = "dist") {
+        "配布版"
+    } else {
+        "開発版"
+    };
+    crash_log::stage(&format!(
+        "HiganRTool.exe {} ビルド番号 {build}（{kind}）",
+        env!("CARGO_PKG_VERSION")
+    ));
+    // 値を持つ引数（パス）は書かず、スイッチの名前だけを書く。
+    let flags: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| a.starts_with("--"))
+        .collect();
+    crash_log::stage(&format!(
+        "Windows {}{} / 言語 {}（OS の UI 言語 0x{:04X}）/ スイッチ: {}",
+        real::os_version(),
+        if real::is_wine() {
+            "（Wine / Proton）"
+        } else {
+            ""
+        },
+        match lang {
+            Lang::Ja => "ja",
+            Lang::En => "en",
+        },
+        real::user_ui_langid(),
+        if flags.is_empty() {
+            "なし".to_string()
+        } else {
+            flags.join(" ")
+        }
+    ));
+}
+
+/// ゲームのフォルダが分かったときに、ログのファイルを開いてよいか（ツールのフォルダがゲームのフォルダの外か）を決める。
+/// 外ならログを開いて貯めた行を書き、フォルダへ書き込めるかを確かめる。中（同じ・下の階層・`th09.exe` が同居）なら、
+/// ゲームのフォルダへは何も作らず、ログは書かない（画面だけ）。決めるのは 1 回だけ。
+fn settle_tool_folder(game_dir: &Path, lang: Lang) {
+    if !crash_log::is_waiting() {
+        return;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        crash_log::decide(true);
+        return;
+    };
+    let inside = update::in_game_folder(&dir) || crash_log::is_inside_game(&dir, game_dir);
+    if crash_log::decide(inside) == crash_log::Decision::Opened {
+        if let Some(file) = crash_log::clone_file() {
+            real::attach_exception_file(file);
+        }
+        // 配るバージョンだけ古いログを消す（DLL のログと同じ扱い）。
+        if cfg!(feature = "dist") {
+            let (removed, failed) = crash_log::prune(
+                &dir.join(code_relay::LOGS_DIR),
+                &real::local_stamp(),
+                crash_log::KEEP_LOG_DAYS,
+            );
+            crash_log::stage(&format!(
+                "古いログ: {} 日より前のものを {removed} 個消した（消せなかった {failed} 個）",
+                crash_log::KEEP_LOG_DAYS
+            ));
+        }
+    }
+    check_tool_folder_writable(&dir, inside, lang);
+}
+
+/// 配るバージョンの起動で、この exe のフォルダへ書き込めるかを確かめ、書けなければ知らせて起動を続ける。
+/// ゲームのフォルダの中では試さない（一時ファイルでもゲームのフォルダに作らない）。
+fn check_tool_folder_writable(dir: &Path, in_game: bool, lang: Lang) {
+    let mut site = writable::RealSite(writable::FsProbe::real());
+    writable::check(update::this_build_is_dist(), in_game, dir, lang, &mut site);
+}
+
+/// 花映塚を起こす前（更新の確認の前）に分かるゲームのフォルダ。`--game` で指した場所か、そのまま使える覚え（選び直しにならないもの）。
+/// 分からなければ None で、`run_launch` が選んだ後に決める。
+fn early_game_dir(
+    source: &cli::GameSource,
+    ini_path: Option<&Path>,
+    lang: Lang,
+) -> Option<PathBuf> {
+    match source {
+        cli::GameSource::Path(p) => {
+            if game_pick::is_drive_relative(p) {
+                return None;
+            }
+            std::path::absolute(p).ok()?.parent().map(Path::to_path_buf)
+        }
+        cli::GameSource::Remembered { choose: true } => None,
+        cli::GameSource::Remembered { choose: false } => {
+            let ini = ini_path?;
+            migrate_legacy_game(ini);
+            let mut host = RealPickHost {
+                ini: ini.to_path_buf(),
+                lang,
+            };
+            game_pick::remembered_exe(&mut host)?
+                .parent()
+                .map(Path::to_path_buf)
+        }
+    }
+}
+
+/// 注入する DLL の import が、この Windows で全部引けるか。欠けていれば理由を出して終了コードを返す（ゲームは起こさない）。
+/// Wine / Proton の上では欠けて見えても止めない。確かめられなかった場合（DLL が読めない・表が読めない・DLL を読み込めない）も止めずに続ける。
+fn check_dll_imports(dll: &Path, lang: Lang) -> Result<(), i32> {
+    let Ok(bytes) = std::fs::read(dll) else {
+        crash_log::stage("import の確認: DLL が読めないので省く（起動の手順が理由を出す）");
+        return Ok(());
+    };
+    crash_log::stage("import の確認を始める（DLL が使う関数がこの Windows にあるか）");
+    let mut probe = real::RealProbe::default();
+    let report = match imports::check(&bytes, &mut probe) {
+        Ok(r) => r,
+        Err(why) => {
+            crash_log::stage(&format!("import の確認: 表が読めない（{why}）ので省く"));
+            return Ok(());
+        }
+    };
+    crash_log::stage(&format!(
+        "import の確認: {} 件を引いた / 無い {} 件 / 確かめられなかった DLL {} 個",
+        report.checked,
+        report.missing.len(),
+        report.unchecked.len()
+    ));
+    for (dll, code) in &report.unchecked {
+        crash_log::stage(&format!(
+            "  確かめられなかった: {dll}（GetLastError {code}）"
+        ));
+    }
+    let os = real::os_version();
+    for m in &report.missing {
+        let what = match &m.function {
+            Some(f) => format!("{}!{f}", m.dll),
+            None => m.dll.clone(),
+        };
+        crash_log::stage(&format!("  無い: {what}（Windows {os}）"));
+    }
+    match imports::judge(&report, &os, real::is_wine(), lang) {
+        imports::Verdict::Clear => Ok(()),
+        imports::Verdict::Tolerated { missing } => {
+            crash_log::stage(&format!(
+                "import の確認: Wine / Proton の上なので、無い {missing} 件があっても止めずに続ける"
+            ));
+            Ok(())
+        }
+        imports::Verdict::Stop(text) => {
+            fail_line(&format!("HiganRTool: {text}"));
+            Err(1)
+        }
+    }
+}
+
+fn cannot_use_path(e: &str, lang: Lang) {
+    fail_line(
+        &by_lang!(lang, ja: "HiganRTool: パスが使えません: {e}", en: "HiganRTool: Cannot use the path: {e}"),
+    )
+}
+
+/// 開発用の引数があるか（あれば更新は確かめない）。
+fn has_dev_args(
+    ini: Option<&Path>,
+    script: Option<&Path>,
+    second: bool,
+    no_clipboard: bool,
+    choose: Option<higanr_core::mode_pick::Pick>,
+    background: bool,
+) -> bool {
+    ini.is_some() || script.is_some() || second || no_clipboard || choose.is_some() || background
+}
+
+/// 花映塚を起こす前の更新の確認（配るバージョンだけ。開発用の引数があれば確かめない）。`game_dir` は決まったゲームのフォルダ。
+fn check_for_update(dev_args: bool, game_dir: &Path, lang: Lang) -> update::Outcome {
+    crash_log::stage(&format!(
+        "更新の確認を始める（開発用の引数: {}。配布版でなければ確かめない）",
+        if dev_args { "あり" } else { "なし" }
+    ));
+    let outcome = update::startup(dev_args, game_dir, lang);
+    if !matches!(outcome, update::Outcome::Restarted(_)) {
+        crash_log::stage(
+            "更新の確認: このまま起動する（更新なし・確認しない・確認できなかったのどれか）",
+        );
+    }
+    outcome
+}
+
+enum Decided {
+    Go(PathBuf),
+    /// 更新して起こし直した新しい版が終わった。値はその終了コード。
+    Restarted(i32),
+}
+
+/// ゲームのパスを決め（`--game`・覚え・選ぶウィンドウ）、`on_decided` でログの置き場を決めてから、`update` で更新を確かめる。
+/// 更新の確認はパスが決まった後（ツールがゲームの下の階層にあるとき、確認がその中へ書かないため）。
+/// ゲームのフォルダが分からないパスなら更新は確かめない。
+fn decide_game_then_update(
+    source: cli::GameSource,
+    lang: Lang,
+    pick: &mut dyn FnMut(bool) -> Result<PathBuf, i32>,
+    on_decided: &mut dyn FnMut(&Path),
+    update: &mut dyn FnMut(&Path) -> update::Outcome,
+) -> Result<Decided, i32> {
+    let game = match source {
+        cli::GameSource::Path(p) => {
+            // `D:原作\th09.exe` のように `D:` の後に `\` が無い値は、起こした場所で指す先が変わるので断る。
+            if game_pick::is_drive_relative(&p) {
+                cannot_use_path(&game_pick::drive_relative_message(&p, lang), lang);
+                return Err(1);
+            }
+            crash_log::stage("ゲームのパス: --game で指定された");
+            p
+        }
+        cli::GameSource::Remembered { choose } => match pick(choose) {
+            Ok(p) => {
+                crash_log::stage("ゲームのパス: 記憶していたものか、選んだものに決まった");
+                p
+            }
+            Err(code) => {
+                crash_log::stage(&format!(
+                    "ゲームのパス: 決まらなかった（見つからない・選ばれない・断られた。終了コード {code}）"
+                ));
+                return Err(code);
+            }
+        },
+    };
+    let game = std::path::absolute(&game).map_err(|e| {
+        cannot_use_path(&format!("{}: {e}", game.display()), lang);
+        1
+    })?;
+    if let Some(dir) = game.parent() {
+        on_decided(dir);
+        if let update::Outcome::Restarted(code) = update(dir) {
+            return Ok(Decided::Restarted(code));
+        }
+    }
+    Ok(Decided::Go(game))
 }
 
 // 引数は cli の `Command::Launch` の欄をそのまま受ける。まとめる型を足すと増えるだけなので 8 個のまま。
@@ -452,26 +811,26 @@ fn run_launch(
     lang: Lang,
 ) -> i32 {
     let no_activate = cli::launches_in_background(background, script.as_ref());
+    let dev_args = has_dev_args(
+        ini.as_deref(),
+        script.as_deref(),
+        second,
+        no_clipboard,
+        choose,
+        background,
+    );
     let env = match child_env(ini.as_deref(), script.as_deref(), lang) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!(
-                "{}",
-                by_lang!(
-                    lang,
-                    ja: "HiganRTool: {e}。何も起動していません。",
-                    en: "HiganRTool: {e}. Nothing was started."
-                )
-            );
+            fail_line(&by_lang!(
+                lang,
+                ja: "HiganRTool: {e}。何も起動していません。",
+                en: "HiganRTool: {e}. Nothing was started."
+            ));
             return 1;
         }
     };
-    let cannot_use_path = |e: &str| {
-        eprintln!(
-            "{}",
-            by_lang!(lang, ja: "HiganRTool: パスが使えません: {e}", en: "HiganRTool: Cannot use the path: {e}")
-        )
-    };
+    let ini_path = loader_ini_path(ini.as_deref(), dll.as_deref());
     let resolve = |p: &Path| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()));
     let dll = match dll {
         Some(d) => resolve(&d),
@@ -482,7 +841,7 @@ fn run_launch(
     let dll = match dll {
         Ok(d) => d,
         Err(e) => {
-            cannot_use_path(&e);
+            cannot_use_path(&e, lang);
             return 1;
         }
     };
@@ -495,29 +854,63 @@ fn run_launch(
         }
         // 開発のビルド専用の検査なので、日本語のまま。
         eprintln!(
-            "HiganRTool: build\\bin の成果物がソースより古いので、何も起動していません。build.bat を先に回してください。"
+            "HiganRTool: build\\binの成果物がソースより古いので、何も起動していません。build.batを先に回してください。"
         );
         return 1;
     }
-    let game = match game {
-        cli::GameSource::Path(p) => {
-            // `D:原作\th09.exe` のように `D:` の後に `\` が無い値は、起こした場所で指す先が変わるので断る。
-            if game_pick::is_drive_relative(&p) {
-                cannot_use_path(&game_pick::drive_relative_message(&p, lang));
-                return 1;
-            }
-            p
-        }
-        cli::GameSource::Remembered { choose } => match pick_game(choose, lang) {
-            Ok(p) => p,
-            Err(code) => return code,
+    // ゲームのパスが決まり、ゲームのフォルダの外と確かめてから更新を確かめる（ツールがゲームの下の階層にあっても、その中へ書かないため）。
+    // 更新したらこの exe は何もせず終わる。
+    let game = match decide_game_then_update(
+        game,
+        lang,
+        &mut |choose| {
+            let Some(ini_path) = ini_path.as_deref() else {
+                cannot_use_path(&folder_unknown(&dll, lang), lang);
+                return Err(1);
+            };
+            pick_game(choose, ini_path, lang)
         },
+        &mut |dir| {
+            crash_log::hide_dir(&dir.to_string_lossy(), "<ゲーム>");
+            settle_tool_folder(dir, lang);
+        },
+        &mut |dir| check_for_update(dev_args, dir, lang),
+    ) {
+        Ok(Decided::Go(g)) => g,
+        Ok(Decided::Restarted(code)) => {
+            // 新しい版が終わるまで待った後。その終了コードで終わり、失敗なら main の Enter 待ち（この exe だけの窓のとき）に任せる。
+            crash_log::stage(&format!(
+                "更新の確認: 更新して、新しい版で起動し直した。その終了コード {code} で終わる"
+            ));
+            return code;
+        }
+        Err(code) => return code,
     };
-    let game = match resolve(&game) {
-        Ok(g) => g,
-        Err(e) => {
-            cannot_use_path(&e);
-            return 1;
+    if let Some(dir) = dll.parent() {
+        crash_log::hide_dir(&dir.to_string_lossy(), "<ツール>");
+    }
+    // ゲームを起こす前に、DLL が使う関数がこの Windows に揃っているかを確かめる。
+    if let Err(code) = check_dll_imports(&dll, lang) {
+        return code;
+    }
+
+    // 同じ th09.exe が動いていれば何もせず終わる。確認から起動の終わりまでミューテックスを持つ（Enter のキーリピートで 2 つ起動しないため）。
+    // 台本の起動と `--second` は開発用なので確認しない。
+    let single_guard = if !single::is_checked(second, script.as_deref()) {
+        None
+    } else {
+        let log = |s: &str| crash_log::stage(s);
+        match single::enter(&mut real::RealSingle, &game, std::process::id(), &log) {
+            Ok(held) => Some(held),
+            Err(_) => {
+                let what = single::ALREADY_RUNNING.get(lang);
+                fail_line(&by_lang!(
+                    lang,
+                    ja: "HiganRTool: {what}何も起動していません。",
+                    en: "HiganRTool: {what} Nothing was started."
+                ));
+                return hold::ALREADY_RUNNING_EXIT_CODE;
+            }
         }
     };
 
@@ -532,7 +925,7 @@ fn run_launch(
                 "{}",
                 match lang {
                     Lang::Ja =>
-                        "HiganRTool: --choose は接続コードのウィンドウを開く回（ini の code_side が offer か answer）にだけ効きます。このまま起動します。",
+                        "HiganRTool: --chooseは接続コードのウィンドウを開く回（iniのcode_sideがofferかanswer）にだけ効きます。このまま起動します。",
                     Lang::En =>
                         "HiganRTool: --choose only works when the connection code window opens (code_side in the ini is offer or answer). Starting anyway.",
                 }
@@ -544,7 +937,7 @@ fn run_launch(
                 "{}",
                 match lang {
                     Lang::Ja =>
-                        "HiganRTool: ini の同期方式とディレイ（mode と delay）が読めないので、--choose は使いません。このまま起動します。",
+                        "HiganRTool: iniの同期方式とディレイ（modeとdelay）が読めないので、--chooseは使いません。このまま起動します。",
                     Lang::En =>
                         "HiganRTool: Cannot read the netcode in the ini (mode and delay), so --choose is not used. Starting anyway.",
                 }
@@ -572,17 +965,28 @@ fn run_launch(
         },
         no_activate,
     };
-    let mut w = real::RealWin32;
-    match launch::launch(&mut w, &req) {
+    let log = |s: &str| crash_log::stage(s);
+    let announce = |n: LaunchNote| announce_note(lang, n);
+    let mut w = Logged::new(real::RealWin32, &log, &announce);
+    crash_log::stage("起動の手順を始める");
+    let launched = launch::launch(&mut w, &req);
+    if let Some(held) = single_guard {
+        single::leave(&mut real::RealSingle, held);
+    }
+    match launched {
         Ok(ok) => {
+            crash_log::stage(&format!(
+                "起動できた（pid {}、DLL のアドレス 0x{:08X}）",
+                ok.pid, ok.module
+            ));
             // 新しいバージョンが花映塚を起こせた印（`.old` を消してよい合図）。ゲームが長く続いても起動の時点で残す。
-            update::note_launched(lang);
+            update::note_launched(req.game.parent(), lang);
             let (pid, module) = (ok.pid, ok.module);
             println!(
                 "{}",
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: 起動しました（pid {pid}、DLL をゲームの中の 0x{module:08X} に読み込みました）。",
+                    ja: "HiganRTool: 起動しました（pid {pid}、DLLをゲームの中の0x{module:08X}に読み込みました）。",
                     en: "HiganRTool: Started (pid {pid}, loaded the DLL at 0x{module:08X} inside the game)."
                 )
             );
@@ -592,7 +996,7 @@ fn run_launch(
                     "{}",
                     by_lang!(
                         lang,
-                        ja: "HiganRTool: ゲームの環境変数に {k}={v} を設定しました。",
+                        ja: "HiganRTool: ゲームの環境変数に{k}={v}を設定しました。",
                         en: "HiganRTool: Set {k}={v} in the game's environment."
                     )
                 );
@@ -603,7 +1007,7 @@ fn run_launch(
                 "{}",
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: ふだんの花映塚と独立させた（プロセスのメモリの 0x{at:08X} を {expect:02X?} → {new:02X?}。名前つきの印を作らない。ゲームのファイルには書いていない）。",
+                    ja: "HiganRTool: ふだんの花映塚と独立させた（プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}。名前つきの印を作らない。ゲームのファイルには書いていない）。",
                     en: "HiganRTool: Made it independent from your usual Touhou 9 (process memory 0x{at:08X}: {expect:02X?} -> {new:02X?}. No named marker is created. Game files are not written)."
                 )
             );
@@ -625,7 +1029,7 @@ fn run_launch(
                     "{}",
                     by_lang!(
                         lang,
-                        ja: "HiganRTool: 2 つ目の起動として、プロセスのメモリの 0x{at:08X} を {expect:02X?} → {new:02X?} に書き換えた（読み直して一致。ゲームのファイルには書いていない）。",
+                        ja: "HiganRTool: 2つ目の起動として、プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}に書き換えた（読み直して一致。ゲームのファイルには書いていない）。",
                         en: "HiganRTool: Second launch: changed process memory 0x{at:08X} from {expect:02X?} to {new:02X?} (read back and matched. Game files are not written)."
                     )
                 );
@@ -646,7 +1050,7 @@ fn run_launch(
                 println!("{}", r.intro());
                 let pasted = spawn_paste_reader(choose.map(|c| c.token()));
                 let mut host = RealRelayHost {
-                    w: &mut w,
+                    w: &mut w.inner,
                     process,
                     lang,
                 };
@@ -666,7 +1070,8 @@ fn run_launch(
                         lang,
                     );
                 }
-                let _ = w.close_handle(process);
+                let _ = w.inner.close_handle(process);
+                crash_log::stage("接続コードの窓: 終わった");
             }
             0
         }
@@ -676,6 +1081,14 @@ fn run_launch(
                 f.error.row(),
                 aftermath(&f.error, lang),
             );
+            crash_log::stage(&format!(
+                "起動に失敗（表の行 {row}）: {}。{}",
+                describe(&f.error, Lang::Ja),
+                aftermath(&f.error, Lang::Ja)
+            ));
+            if !f.cleanup_issues.is_empty() {
+                crash_log::stage(&format!("後始末の問題: {:?}", f.cleanup_issues));
+            }
             eprintln!(
                 "{}",
                 by_lang!(
@@ -684,12 +1097,17 @@ fn run_launch(
                     en: "HiganRTool: {what} (table row {row}). {after}"
                 )
             );
+            if let Some(hint) = wine_hint(&f.error, real::is_wine(), lang) {
+                eprintln!("  {hint}");
+                crash_log::stage(&format!("  {}", WINE_LEFTOVER_TEXT.ja));
+            }
             // 一致しなかったときは、読んだファイルと値・期待の値を続けて出す（そのまま送ってもらえるように）。
             if matches!(f.error, LaunchError::GameIdentMismatch(_)) {
                 match std::fs::read(&req.game) {
                     Ok(bytes) => {
                         for l in game_pick::ident_details(&req.game, &bytes, lang) {
                             eprintln!("  {l}");
+                            crash_log::stage(&format!("  {l}"));
                         }
                     }
                     Err(e) => {
@@ -719,6 +1137,8 @@ fn bad_args_text(reason: &str, lang: Lang) -> String {
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut lang = initial_lang();
+    crash_log::set_lang(lang);
+    crash_log::install_panic_hook(hold::wait_after_panic);
     let code = match cli::parse(&args, lang) {
         Ok(cli::Command::Launch {
             game,
@@ -736,15 +1156,20 @@ fn main() {
                 dll.as_deref(),
                 std::env::current_exe().ok().as_deref(),
             );
-            // 花映塚を起こす前の更新の確認（配るバージョンだけ。開発用の引数があれば確かめない）。更新したらこの exe は何もせず終わる。
-            let dev_args = ini.is_some()
-                || script.is_some()
-                || second
-                || no_clipboard
-                || choose.is_some()
-                || background;
-            if update::startup(dev_args, lang) == update::Outcome::Restarted {
-                std::process::exit(0);
+            crash_log::set_lang(lang);
+            start_log(lang, &args);
+            // --game の値は、どの行にも出さないよう最初に伏せる。ゲームのフォルダが先に分かれば、選ぶウィンドウや更新の確認の前にログを開く
+            // （途中で落ちても残る）。分からなければ `run_launch` が選んだ後に開く。
+            if let cli::GameSource::Path(p) = &game {
+                crash_log::hide_dir(&p.to_string_lossy(), "<ゲーム>");
+                if let Some(dir) = p.parent() {
+                    crash_log::hide_dir(&dir.to_string_lossy(), "<ゲーム>");
+                }
+            }
+            let ini_path = loader_ini_path(ini.as_deref(), dll.as_deref());
+            if let Some(dir) = early_game_dir(&game, ini_path.as_deref(), lang) {
+                crash_log::hide_dir(&dir.to_string_lossy(), "<ゲーム>");
+                settle_tool_folder(&dir, lang);
             }
             run_launch(
                 game,
@@ -758,7 +1183,9 @@ fn main() {
                 lang,
             )
         }
+        #[cfg(not(feature = "dist"))]
         Ok(cli::Command::SelfTest { dll }) => selftest::run(dll),
+        #[cfg(not(feature = "dist"))]
         Ok(cli::Command::SelfTestTarget { dll }) => selftest::target(&dll),
         Ok(cli::Command::Help) => {
             println!("{}", cli::USAGE.get(lang));
@@ -769,9 +1196,10 @@ fn main() {
             2
         }
     };
+    crash_log::stage(&format!("終了 コード {code}"));
     // ショートカットから開いたウィンドウなら、断った理由を読めるよう Enter まで残す。
     if hold::should_hold(code, real::console_process_count()) {
-        eprintln!("{}", hold::HOLD_TEXT.get(lang));
+        eprintln!("{}", hold::hold_text(code).get(lang));
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
     }
@@ -781,6 +1209,98 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use game_pick::Host;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "HiganRTool_loader_main_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_picked_game_is_written_to_and_read_from_the_ini_loader_section() {
+        let dir = temp_dir("pick_ini");
+        let ini = dir.join("HiganRTool.ini");
+        let mut h = RealPickHost {
+            ini: ini.clone(),
+            lang: Lang::Ja,
+        };
+        assert_eq!(h.read_saved(), None);
+        // ini が無ければ作る（開発用のビルドは [loader] だけ。配るビルドは配る ini と同じ中身から）。
+        h.write_saved("C:\\花映塚\\th09.exe").unwrap();
+        assert_eq!(h.read_saved().as_deref(), Some("C:\\花映塚\\th09.exe"));
+        let made = std::fs::read_to_string(&ini).unwrap();
+        #[cfg(not(feature = "dist"))]
+        assert!(
+            made.ends_with("[loader]\r\ngame = C:\\花映塚\\th09.exe\r\n"),
+            "{made}"
+        );
+        #[cfg(feature = "dist")]
+        {
+            let loader = made
+                .split("[loader]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{made}"));
+            assert!(
+                loader.lines().any(|l| l == "game = C:\\花映塚\\th09.exe"),
+                "{made}"
+            );
+            assert!(
+                made.contains("[netplay]"),
+                "配る ini の全文から作っていない: {made}"
+            );
+        }
+        // 既にある ini は、game の 1 行だけを替える。
+        std::fs::write(&ini, "; 注\r\n[netplay]\r\nenable = 1\r\n\r\n[loader]\r\n; 場所\r\ngame = D:\\old\\th09.exe ; 前\r\n").unwrap();
+        h.write_saved("E:\\new\\th09.exe").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            "; 注\r\n[netplay]\r\nenable = 1\r\n\r\n[loader]\r\n; 場所\r\ngame = E:\\new\\th09.exe ; 前\r\n"
+        );
+        assert_eq!(h.read_saved().as_deref(), Some("E:\\new\\th09.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ini_path_follows_the_flag_then_the_inherited_variable_then_the_dll_folder() {
+        let dll_dir = Path::new("C:\\bin");
+        let flag = vec![(
+            OsString::from(higanr_core::ini::PATH_ENV),
+            OsString::from("C:\\other\\a.ini"),
+        )];
+        assert_eq!(
+            ini_path_of(&flag, None, dll_dir),
+            Some(PathBuf::from("C:\\other\\a.ini"))
+        );
+        assert_eq!(
+            ini_path_of(&[], None, dll_dir),
+            Some(PathBuf::from("C:\\bin\\HiganRTool.ini"))
+        );
+        assert_eq!(
+            ini_path_of(&[], Some(OsStr::new("C:\\inh.ini")), dll_dir),
+            Some(PathBuf::from("C:\\inh.ini"))
+        );
+    }
+
+    // 壊れたら落ちる: 選ぶ前と覚えを先に読む前で ini の場所がずれる（--ini が効かない、DLL のフォルダを見ない）。
+    #[test]
+    fn the_loader_ini_path_follows_the_flag_then_the_dll_folder() {
+        let dir = temp_dir("loader_ini");
+        let flag = dir.join("a.ini");
+        assert_eq!(loader_ini_path(Some(&flag), None), Some(flag.clone()));
+        if std::env::var_os(higanr_core::ini::PATH_ENV).is_none() {
+            let dll = dir.join("bin").join("HiganRTool.dll");
+            assert_eq!(
+                loader_ini_path(None, Some(&dll)),
+                Some(dir.join("bin").join("HiganRTool.ini"))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn child_env_names_absolute_paths_of_existing_files() {
@@ -907,6 +1427,117 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// 選ぶ・決まった・更新の確認が起きた順を記録して `decide_game_then_update` を走らせる。
+    fn run_decide(
+        source: cli::GameSource,
+        pick: Result<PathBuf, i32>,
+        outcome: update::Outcome,
+    ) -> (Result<Decided, i32>, Vec<String>) {
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        let r = decide_game_then_update(
+            source,
+            Lang::Ja,
+            &mut |choose| {
+                events.borrow_mut().push(format!("pick choose={choose}"));
+                pick.clone()
+            },
+            &mut |dir| {
+                events
+                    .borrow_mut()
+                    .push(format!("decided {}", dir.display()))
+            },
+            &mut |dir| {
+                events
+                    .borrow_mut()
+                    .push(format!("update {}", dir.display()));
+                outcome
+            },
+        );
+        (r, events.into_inner())
+    }
+
+    // 何が壊れたら落ちるか: 更新の確認がゲームのパスの決定より前に走る（ツールがゲームの下の階層にある初回で、
+    // 確認がゲームのフォルダへ書く）、決まらないのに確認する、`--game` や覚えのある人が選ぶ窓を通る。
+    #[test]
+    fn the_update_check_runs_after_the_game_path_is_decided() {
+        let game = std::path::absolute("Z:\\HiganR_decide\\Game\\th09.exe").unwrap();
+        let dir = game.parent().unwrap().display().to_string();
+        let go = |r: &Result<Decided, i32>| match r {
+            Ok(Decided::Go(p)) => Some(p.clone()),
+            _ => None,
+        };
+
+        // 覚えも --game も無い初回: 選ぶ窓 → 決まった → 更新の確認、の順。
+        let remembered = cli::GameSource::Remembered { choose: false };
+        let (r, ev) = run_decide(remembered, Ok(game.clone()), update::Outcome::Proceed);
+        assert_eq!(go(&r), Some(game.clone()));
+        assert_eq!(
+            ev,
+            [
+                "pick choose=false".to_string(),
+                format!("decided {dir}"),
+                format!("update {dir}")
+            ]
+        );
+
+        // 選ぶ窓を閉じた・失敗した: 更新を確かめず、終了コードをそのまま返す。
+        let (r, ev) = run_decide(
+            cli::GameSource::Remembered { choose: false },
+            Err(3),
+            update::Outcome::Proceed,
+        );
+        assert!(matches!(r, Err(3)));
+        assert_eq!(ev, ["pick choose=false"]);
+
+        // --choose-game は選ぶ窓へ伝わる。
+        let (_, ev) = run_decide(
+            cli::GameSource::Remembered { choose: true },
+            Ok(game.clone()),
+            update::Outcome::Proceed,
+        );
+        assert_eq!(ev[0], "pick choose=true");
+
+        // --game: 窓を通らず、指したフォルダで決まる。
+        let (r, ev) = run_decide(
+            cli::GameSource::Path(game.clone()),
+            Err(9),
+            update::Outcome::Proceed,
+        );
+        assert_eq!(go(&r), Some(game.clone()));
+        assert_eq!(ev, [format!("decided {dir}"), format!("update {dir}")]);
+
+        // ドライブ名の後に \ が無い --game は断り、何も確かめない。
+        let (r, ev) = run_decide(
+            cli::GameSource::Path(PathBuf::from("D:th09.exe")),
+            Err(9),
+            update::Outcome::Proceed,
+        );
+        assert!(matches!(r, Err(1)));
+        assert!(ev.is_empty(), "{ev:?}");
+
+        // 更新して起こし直すときは、起動へ進まない。
+        let (r, _) = run_decide(
+            cli::GameSource::Path(game),
+            Err(9),
+            update::Outcome::Restarted(5),
+        );
+        assert!(matches!(r, Ok(Decided::Restarted(5))));
+    }
+
+    #[test]
+    fn dev_arguments_turn_the_update_check_off() {
+        let none = || has_dev_args(None, None, false, false, None, false);
+        assert!(!none());
+        let p = Path::new("x");
+        assert!(has_dev_args(Some(p), None, false, false, None, false));
+        assert!(has_dev_args(None, Some(p), false, false, None, false));
+        assert!(has_dev_args(None, None, true, false, None, false));
+        assert!(has_dev_args(None, None, false, true, None, false));
+        let pick = Some(higanr_core::mode_pick::Pick::Delay);
+        assert!(has_dev_args(None, None, false, false, pick, false));
+        assert!(has_dev_args(None, None, false, false, None, true));
+    }
+
     #[test]
     fn the_choose_line_reaches_the_window_first() {
         let rx = spawn_paste_reader(Some("2".to_string()));
@@ -997,6 +1628,47 @@ mod tests {
             t.contains("run as administrator") && t.contains("740"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn slow_load_notice_names_the_antivirus_and_the_timeout_names_the_full_wait() {
+        use higanr_core::lang::has_japanese;
+        assert!(
+            SLOW_LOAD_TEXT.ja.contains("ウイルス対策ソフト"),
+            "{}",
+            SLOW_LOAD_TEXT.ja
+        );
+        assert!(
+            SLOW_LOAD_TEXT.en.contains("antivirus") && !has_japanese(SLOW_LOAD_TEXT.en),
+            "{}",
+            SLOW_LOAD_TEXT.en
+        );
+        let t = describe(&LaunchError::RemoteThreadTimedOut, Lang::Ja);
+        assert!(t.contains("60秒"), "{t}");
+    }
+
+    #[test]
+    fn wine_hint_is_only_for_a_timeout_under_wine() {
+        use higanr_core::lang::has_japanese;
+        for lang in [Lang::Ja, Lang::En] {
+            // 否定: Windows の時間切れと、Wine での別の失敗には出さない。
+            assert_eq!(
+                wine_hint(&LaunchError::RemoteThreadTimedOut, false, lang),
+                None
+            );
+            assert_eq!(
+                wine_hint(&LaunchError::RemoteThreadWaitFailed(5), true, lang),
+                None
+            );
+            assert_eq!(
+                wine_hint(&LaunchError::CreateRemoteThread(5), true, lang),
+                None
+            );
+        }
+        let ja = wine_hint(&LaunchError::RemoteThreadTimedOut, true, Lang::Ja).unwrap_or("");
+        assert!(ja.contains("wineserver -k") && has_japanese(ja), "{ja}");
+        let en = wine_hint(&LaunchError::RemoteThreadTimedOut, true, Lang::En).unwrap_or("");
+        assert!(en.contains("wineserver -k") && !has_japanese(en), "{en}");
     }
 
     #[test]

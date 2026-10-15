@@ -50,6 +50,12 @@ pub trait ScriptHost {
     fn read_net_ini(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// `read_net_ini` の本文に、読めない行を捨てた注と、Shift_JIS として読み直した注を添える。本文は誤りの行を空行にしたもの。
+    fn read_net_ini_noted(
+        &mut self,
+    ) -> Result<Option<(String, Vec<higanr_core::ini_lenient::IniNote>)>, String> {
+        Ok(self.read_net_ini()?.map(|t| (t, Vec::new())))
+    }
     /// ini の置き場の文（本ログの「ini: …」の行）。
     fn ini_origin(&self) -> String {
         format!("DLL のフォルダの {INI_FILE}")
@@ -107,10 +113,9 @@ pub trait ScriptHost {
         Ok(None)
     }
 
-    /// メニューで決めて覚えた名前（ゲーム内のメニューの実行だけ）。あれば `load_net` が ini の `name` より優先して使う
-    /// （自動保存の自分の名前にも同じ値が渡る）。
-    fn saved_name(&mut self, _s: &NetSettings) -> Option<String> {
-        None
+    /// 以前の版が別ファイルに覚えていた名前・ルーム名を ini へ移す（`load_net` が ini を読む前に 1 回）。本ログに出す文を返す（値は含めない）。
+    fn migrate_legacy(&mut self) -> Vec<String> {
+        Vec::new()
     }
 
     /// OS の UI の言語（LANGID）。既定は日本語。
@@ -147,7 +152,10 @@ fn decide_lang(host: &mut dyn ScriptHost, text: &str, out: &mut dyn Write) {
 /// （ネットワークなしで走る）。
 fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSettings> {
     let _ = writeln!(detail_out(out), "ini: {}", host.ini_origin());
-    let text = match host.read_net_ini() {
+    for line in host.migrate_legacy() {
+        let _ = writeln!(out, "設定: {line}");
+    }
+    let (text, host_notes) = match host.read_net_ini_noted() {
         Ok(None) => {
             let _ = writeln!(
                 out,
@@ -164,8 +172,14 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
             return None;
         }
     };
+    let log_notes = |out: &mut dyn Write, notes: &[higanr_core::ini_lenient::IniNote]| {
+        for n in notes {
+            let _ = writeln!(out, "ネットワーク: {}", n.log_text());
+        }
+    };
     match net_config::from_text(&text) {
         Ok(None) => {
+            log_notes(out, &host_notes);
             let _ = writeln!(
                 out,
                 "ネットワーク: {INI_FILE} に [{SECTION}] が無いか enable = 1 でない（ネットワークなしで走る）"
@@ -173,16 +187,14 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
             None
         }
         Ok(Some(mut s)) => {
+            // 前処理で捨てた行と、読むときに既定へ戻した行を合わせて、メニューの 1 か所とログに出す。
+            let mut notes = host_notes;
+            notes.append(&mut s.ini_notes);
+            notes.sort_by_key(|n| n.line);
+            log_notes(out, &notes);
+            s.ini_notes = notes;
             for note in s.old_key_notes() {
                 let _ = writeln!(out, "ネットワーク: {note}");
-            }
-            // メニューで決めて覚えた名前は ini の `name` より優先する（ネットワーク・自動保存の自分の名前の全部が同じ値を使う）。
-            if let Some(saved) = host.saved_name(&s) {
-                let _ = writeln!(
-                    detail_out(out),
-                    "ネットワーク: 名前は覚えたファイルの値を使う（ini の name より優先）"
-                );
-                s.name = saved;
             }
             decide_lang(host, &text, out);
             let _ = writeln!(
@@ -193,6 +205,7 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
             Some(s)
         }
         Err(e) => {
+            log_notes(out, &host_notes);
             let _ = writeln!(
                 out,
                 "ネットワーク: {INI_FILE} の [{SECTION}] を読めない（{e}）。ネットワークなしで走る"
@@ -980,6 +993,8 @@ mod tests {
         pub events: Vec<String>,
         pub armed: Option<(usize, u32, u32)>,
         pub ini: Option<String>,
+        /// 本物の読み手と同じく、誤りの行を空行にする前処理（`ini_lenient::clean`）を掛けて返す。
+        pub clean_ini: bool,
         pub ini_reads: u32,
         pub net_arm_fail: bool,
         /// `arm_net` が返す文（None なら既定の合成の文）。
@@ -996,14 +1011,19 @@ mod tests {
         pub portrait_armed: Option<[u32; 3]>,
         /// 素の poll の入口を渡されたとき（`events` には入れない）。
         pub poll_armed: Option<u32>,
-        pub saved_name: Option<String>,
+        /// `migrate_legacy` が返す文。
+        pub migrate_logs: Vec<String>,
+        /// `migrate_legacy` を呼んだ回数と、ini を最初に読んだときのその回数。
+        pub migrate_calls: u32,
+        pub migrate_calls_at_read: Option<u32>,
         /// OS の UI の言語（LANGID）。None なら日本語（0x0411）。
         pub os_langid: Option<u16>,
     }
 
     impl ScriptHost for FakeScript {
-        fn saved_name(&mut self, _s: &NetSettings) -> Option<String> {
-            self.saved_name.clone()
+        fn migrate_legacy(&mut self) -> Vec<String> {
+            self.migrate_calls += 1;
+            self.migrate_logs.clone()
         }
         fn os_langid(&mut self) -> u16 {
             self.os_langid.unwrap_or(0x0411)
@@ -1054,7 +1074,21 @@ mod tests {
         }
         fn read_net_ini(&mut self) -> Result<Option<String>, String> {
             self.ini_reads += 1;
+            self.migrate_calls_at_read.get_or_insert(self.migrate_calls);
             Ok(self.ini.clone())
+        }
+        fn read_net_ini_noted(
+            &mut self,
+        ) -> Result<Option<(String, Vec<higanr_core::ini_lenient::IniNote>)>, String> {
+            let text = self.read_net_ini()?;
+            Ok(text.map(|t| {
+                if self.clean_ini {
+                    let c = higanr_core::ini_lenient::clean(&t);
+                    (c.text, c.notes)
+                } else {
+                    (t, Vec::new())
+                }
+            }))
         }
         fn arm_net(&mut self, s: &NetSettings, set_state_fn: u32) -> Result<String, String> {
             self.events.push("arm_net".to_string());
@@ -1608,28 +1642,29 @@ mod tests {
     }
 
     #[test]
-    fn a_remembered_name_beats_the_ini_name() {
+    fn legacy_files_are_moved_into_the_ini_before_it_is_read_and_the_name_comes_only_from_the_ini()
+    {
         let ini = format!("{NET_INI}name = ini-name\n");
-        for (saved, want) in [(Some("saved-name"), "saved-name"), (None, "ini-name")] {
-            let mut env = Fake::all_match();
-            let mut h = fake_hook_three_writable();
-            let mut s = FakeScript {
-                ini: Some(ini.clone()),
-                saved_name: saved.map(str::to_string),
-                ..net_script()
-            };
-            let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
-            let (settings, _) = s
-                .net_armed
-                .clone()
-                .expect("ネットワークのセッションを置いていない");
-            assert_eq!(settings.name, want, "{log}");
-            assert_eq!(
-                log.contains("名前は覚えたファイルの値を使う"),
-                saved.is_some(),
-                "{log}"
-            );
-        }
+        let mut env = Fake::all_match();
+        let mut h = fake_hook_three_writable();
+        let mut s = FakeScript {
+            ini: Some(ini),
+            migrate_logs: vec!["x を ini へ移した".to_string()],
+            ..net_script()
+        };
+        let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
+        assert_eq!(s.migrate_calls, 1, "{log}");
+        assert_eq!(
+            s.migrate_calls_at_read,
+            Some(1),
+            "ini を読んだ後に引き継いだ"
+        );
+        assert!(log.contains("設定: x を ini へ移した"), "{log}");
+        let (settings, _) = s
+            .net_armed
+            .clone()
+            .expect("ネットワークのセッションを置いていない");
+        assert_eq!(settings.name, "ini-name", "{log}");
     }
 
     #[test]
@@ -1661,6 +1696,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    const DIST_INI: &str = include_str!("../../../scripts/dist/HiganRTool.ini");
+
+    /// 配る ini（`code_side = game`）を `edit` で書き換えて、ネットワークを開くところまで走らせる。
+    fn run_dist_with(edit: impl Fn(&str) -> String) -> (FakeScript, String) {
+        let dist = DIST_INI.replace("\r\n", "\n");
+        let mut env = Fake::all_match();
+        let mut h = fake_hook_three_writable();
+        let mut s = FakeScript {
+            ini: Some(edit(&dist)),
+            clean_ini: true,
+            ..net_script()
+        };
+        let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
+        (s, log)
+    }
+
+    /// `[section]` の中の最初の `from` を `to` に替える。
+    fn edit_in(dist: &str, section: &str, from: &str, to: &str) -> String {
+        let at = dist.find(&format!("\n[{section}]\n")).unwrap() + 1;
+        let (head, tail) = dist.split_at(at);
+        assert!(tail.contains(from), "{from:?}");
+        format!("{head}{}", tail.replacen(from, to, 1))
+    }
+
+    #[test]
+    fn the_shipped_ini_runs_with_no_ini_notes() {
+        let (s, log) = run_dist_with(str::to_string);
+        let (armed, _) = s.net_armed.as_ref().expect(&log);
+        assert_eq!(armed.ini_notes, vec![], "{log}");
+        assert!(!log.contains("HiganRTool.ini の"), "{log}");
+    }
+
+    #[test]
+    fn every_bad_line_of_the_shipped_ini_is_dropped_alone_with_one_note() {
+        type Edit = fn(&str) -> String;
+        let cases: [(&str, Edit, &str, &str); 5] = [
+            (
+                "unknown_key = 1",
+                |d| {
+                    edit_in(
+                        d,
+                        "netplay",
+                        "enable = 1\n",
+                        "enable = 1\nunknown_key = 1\n",
+                    )
+                },
+                "netplay",
+                "unknown_key",
+            ),
+            (
+                "upnp = yes",
+                |d| edit_in(d, "netplay", "upnp = on", "upnp = yes"),
+                "netplay",
+                "upnp",
+            ),
+            (
+                "host_seat = 3",
+                |d| edit_in(d, "netplay", "; host_seat = 1", "host_seat = 3"),
+                "netplay",
+                "host_seat",
+            ),
+            (
+                "ipv6 =",
+                |d| edit_in(d, "netplay", "ipv6 = on", "ipv6 ="),
+                "netplay",
+                "ipv6",
+            ),
+            (
+                "[spectate] enable = off",
+                |d| edit_in(d, "spectate", "enable = 1", "enable = off"),
+                "spectate",
+                "enable",
+            ),
+        ];
+        for (label, edit, section, key) in cases {
+            let text = edit(&DIST_INI.replace("\r\n", "\n"));
+            let (s, log) = run_dist_with(edit);
+            let (armed, _) = s
+                .net_armed
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: {log}"));
+            let got: Vec<(&str, &str)> = armed
+                .ini_notes
+                .iter()
+                .map(|n| (n.section.as_str(), n.key.as_str()))
+                .collect();
+            assert_eq!(got, vec![(section, key)], "{label}: {log}");
+            // 書き換えた行（その節の中で最初にそのキーを書いた行）の番号。
+            let at = text.find(&format!("\n[{section}]\n")).unwrap() + 1;
+            let before = text[..at].lines().count();
+            let in_section = text[at..]
+                .lines()
+                .position(|l| l.starts_with(&format!("{key} =")))
+                .map(|i| before + i + 1);
+            assert_eq!(armed.ini_notes[0].line, in_section.unwrap(), "{label}");
+            assert!(
+                log.contains(&format!(
+                    "ネットワーク: HiganRTool.ini の {} 行目 [{section}] {key}",
+                    armed.ini_notes[0].line
+                )),
+                "{label}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_line_does_not_change_the_other_settings() {
+        let (s, log) = run_dist_with(|d| edit_in(d, "netplay", "upnp = on", "upnp = yes"));
+        let (armed, _) = s.net_armed.as_ref().expect(&log);
+        let (base, _) = run_dist_with(str::to_string);
+        let base = base.net_armed.unwrap().0;
+        assert!(armed.upnp, "読めない upnp は既定の on");
+        let mut same = armed.clone();
+        same.ini_notes = vec![];
+        assert_eq!(same, base);
+    }
+
+    #[test]
+    fn a_comment_after_a_value_is_not_part_of_the_value() {
+        let (s, log) = run_dist_with(|d| {
+            edit_in(d, "netplay", "upnp = on", "upnp = off ; ルーターが古いので")
+        });
+        let (armed, _) = s.net_armed.as_ref().expect(&log);
+        assert!(!armed.upnp);
+        assert_eq!(armed.ini_notes, vec![], "{log}");
+    }
+
+    #[test]
+    fn a_line_without_equals_and_a_double_key_are_dropped_with_their_line_numbers() {
+        let (s, log) = run_dist_with(|d| {
+            edit_in(
+                d,
+                "netplay",
+                "upnp = on",
+                "upnp = on\nthis is not a setting\nupnp = off",
+            )
+        });
+        let (armed, _) = s.net_armed.as_ref().expect(&log);
+        assert!(armed.upnp, "最初の行を採る");
+        let lines: Vec<usize> = armed.ini_notes.iter().map(|n| n.line).collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(lines[1], lines[0] + 1);
     }
 
     #[test]
@@ -1759,7 +1938,7 @@ mod tests {
         );
         for (ini, want) in [
             (
-                Some(format!("{NET_INI}latancy = 3\n")),
+                Some(format!("{NET_INI}after_script = 1\n")),
                 "ネットワーク: HiganRTool.ini の [netplay] を読めない",
             ),
             (
@@ -2364,7 +2543,7 @@ mod tests {
         );
         for (ini, want) in [
             (
-                Some(format!("{NET_INI}latancy = 3\n")),
+                Some(format!("{NET_INI}after_script = 1\n")),
                 "ネットワーク: HiganRTool.ini の [netplay] を読めない",
             ),
             (
@@ -2416,7 +2595,7 @@ mod tests {
             let mut h = fake_hook_three_writable();
             let mut s = FakeScript {
                 ini: Some(INI.to_string()),
-                saved_name: Some("SecretSaved".to_string()),
+                migrate_logs: vec!["引き継ぎの文".to_string()],
                 ini_from: Some(format!(
                     "環境の変数 HIGANRTOOL_INI で渡された {home}\\Downloads\\HiganRTool\\HiganRTool.ini"
                 )),
@@ -2434,7 +2613,7 @@ mod tests {
             String::from_utf8(out).unwrap()
         };
         for (mode, log) in [("簡潔", brief(run)), ("詳細", detailed(run))] {
-            for secret in ["SecretPlayer", "SecretSaved", "198.51.100.9", "bob"] {
+            for secret in ["SecretPlayer", "198.51.100.9", "bob"] {
                 assert!(!log.contains(secret), "{mode}: {secret} が出た:\n{log}");
             }
         }

@@ -16,6 +16,18 @@ pub struct MatchWatch {
     ended: u32,
     /// 前の秒のセッションを作った時刻（`NetSnapshot::link_started_ms`）。変わったら新しい接続。
     link: u32,
+    /// 観戦者の今のマッチで、対戦者の値の行を出したか。
+    peer_shown: bool,
+}
+
+/// 観戦者の実行で、流れから対戦者の値を受けていれば「対戦者: rollback・delay N」/「対戦者: delay 方式 N」。
+fn peer_text(snap: &NetSnapshot) -> Option<String> {
+    let p = snap.peer.filter(|_| snap.watcher)?;
+    Some(if p.rollback.is_some() {
+        format!("対戦者: rollback・delay {}", p.latency)
+    } else {
+        format!("対戦者: delay 方式 {}", p.latency)
+    })
 }
 
 impl MatchWatch {
@@ -29,21 +41,44 @@ impl MatchWatch {
             self.segs = 0;
             self.ended = 0;
             self.in_match = false;
+            self.peer_shown = false;
         }
         while self.segs < snap.segs_started {
             self.segs += 1;
+            self.peer_shown = false;
+            let what = if snap.watcher {
+                // 観戦者は遅延と rollback の欄を書かないので、対戦者の値は流れで受けた分だけを出す。
+                match peer_text(snap) {
+                    Some(t) => {
+                        self.peer_shown = true;
+                        format!("観戦・{t}")
+                    }
+                    None => "観戦".to_string(),
+                }
+            } else {
+                format!(
+                    "{}・遅延 {}",
+                    if snap.rollback {
+                        "rollback"
+                    } else {
+                        "delay 方式"
+                    },
+                    snap.delay
+                )
+            };
             lines.push(format!(
-                "試合: {} 試合目が始まった（{}・遅延 {}、計測 {k} 秒の時点）",
-                self.segs,
-                if snap.rollback {
-                    "rollback"
-                } else {
-                    "delay 方式"
-                },
-                snap.delay
+                "試合: {} 試合目が始まった（{what}、計測 {k} 秒の時点）",
+                self.segs
             ));
         }
         let now_in_match = snap.phase == phase_code(Phase::Lockstep);
+        if now_in_match
+            && !self.peer_shown
+            && let Some(t) = peer_text(snap)
+        {
+            self.peer_shown = true;
+            lines.push(format!("試合: {t}（計測 {k} 秒の時点）"));
+        }
         if self.in_match && !now_in_match {
             self.ended += 1;
             lines.push(format!(
@@ -59,6 +94,7 @@ impl MatchWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use higanr_core::net_menu::PeerStats;
 
     fn snap(segs: u32, phase: u32) -> NetSnapshot {
         NetSnapshot {
@@ -101,6 +137,72 @@ mod tests {
         assert!(w.step(&snap(1, 1), 5).is_empty());
         let again = w.step(&snap(2, 4), 6);
         assert!(again[0].contains("2 試合目が始まった"), "{again:?}");
+    }
+
+    fn watching(segs: u32, phase: u32, peer: Option<PeerStats>) -> NetSnapshot {
+        NetSnapshot {
+            watcher: true,
+            peer,
+            ..snap(segs, phase)
+        }
+    }
+
+    /// 壊れたら落ちる: 観戦者の行に、書いていない遅延 0・delay 方式が出る。
+    #[test]
+    fn a_watchers_line_has_no_format_or_delay_of_its_own() {
+        let mut w = MatchWatch::default();
+        let start = w.step(&watching(1, 4, None), 1);
+        assert_eq!(start.len(), 1, "{start:?}");
+        assert!(start[0].contains("1 試合目が始まった（観戦、"), "{start:?}");
+        assert!(
+            !start[0].contains("delay")
+                && !start[0].contains("rollback")
+                && !start[0].contains("遅延"),
+            "{start:?}"
+        );
+        assert!(w.step(&watching(1, 4, None), 2).is_empty());
+    }
+
+    /// 壊れたら落ちる: 流れで受けた対戦者の値が出ない・同じ値を毎秒出す・delay 方式を rollback と書く。
+    #[test]
+    fn a_watcher_shows_the_players_values_once_they_arrive() {
+        let rb = PeerStats::from_record(14, 2, 3);
+        let dl = PeerStats::from_record(14, 1, higanr_core::wire::STATS_ROLLBACK_NONE);
+        let mut w = MatchWatch::default();
+        let start = w.step(&watching(1, 4, Some(rb)), 1);
+        assert!(
+            start[0].contains("観戦・対戦者: rollback・delay 2"),
+            "{start:?}"
+        );
+        assert!(w.step(&watching(1, 4, Some(rb)), 2).is_empty());
+        // 値が試合の始まりの後に届く場合は、届いた秒に 1 行。
+        let mut w = MatchWatch::default();
+        assert!(w.step(&watching(1, 4, None), 1)[0].ends_with("時点）"));
+        assert!(w.step(&watching(1, 4, None), 2).is_empty());
+        let late = w.step(&watching(1, 4, Some(dl)), 3);
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("対戦者: delay 方式 1"), "{late:?}");
+        assert!(!late[0].contains("rollback"), "{late:?}");
+        assert!(w.step(&watching(1, 4, Some(dl)), 4).is_empty());
+        // 次の試合ではまた出す。
+        let again = w.step(&watching(2, 4, Some(rb)), 5);
+        assert!(again[0].contains("対戦者: rollback・delay 2"), "{again:?}");
+    }
+
+    /// 壊れたら落ちる: 対戦者の側の行に、観戦用の値が混ざる。
+    #[test]
+    fn a_player_keeps_its_own_format_and_delay() {
+        let mut w = MatchWatch::default();
+        let s = NetSnapshot {
+            rollback: true,
+            delay: 3,
+            peer: Some(PeerStats::from_record(1, 9, 9)),
+            ..snap(1, 4)
+        };
+        let start = w.step(&s, 1);
+        assert_eq!(start.len(), 1, "{start:?}");
+        assert!(start[0].contains("rollback・遅延 3"), "{start:?}");
+        assert!(!start[0].contains("対戦者"), "{start:?}");
     }
 
     #[test]

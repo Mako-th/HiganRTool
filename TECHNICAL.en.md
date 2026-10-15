@@ -34,6 +34,7 @@ The game is 32-bit, so every Rust part is built for `i686-pc-windows-msvc` (stat
 - **Room server** (`src/server`): A small server on Cloudflare Workers and Durable Objects. It only relays connection codes, runs the random-match queue and the spectator list, and redirects update downloads.
 - **Fake opponent** (`src/peer_sim`, `peer_sim.exe`): A test opponent that speaks the protocol without the game. It is not shipped.
 - **Manifest signing tool** (`src/manifest_sign`): Used by the distributor to sign the update manifest. It is not shipped.
+- **Replay fix tool** (`HiganRTool_replay_fix.exe`): Fixes the header of replays saved by v1.0.0 when the two players used different charge settings. It never changes the original files.
 
 `unsafe` is confined to the layers of the DLL and loader that touch Win32, hooks and game memory, and each use has a `// SAFETY:` comment explaining why it is sound.
 
@@ -70,7 +71,7 @@ The loader works in this order (`src/loader/src/launch.rs`):
 2. Read the `th09.exe` file and check that it is ver.1.50a (2-2).
 3. Call `CreateProcessW` with `CREATE_SUSPENDED`, creating the game process with its main thread stopped.
 4. Write the DLL's absolute path into the game process with `VirtualAllocEx` and `WriteProcessMemory`.
-5. Make the game call `LoadLibraryW` through `CreateRemoteThread`, and wait for it to finish (up to 10 seconds).
+5. Make the game call `LoadLibraryW` through `CreateRemoteThread`, and wait for it to finish (up to 60 seconds; after 10 seconds it tells you that security software may be checking it).
 6. Free the memory and let the game run with `ResumeThread`.
 
 If any step fails, the loader kills the game, which has not run a single instruction yet, with `TerminateProcess`.
@@ -120,6 +121,8 @@ The game keeps input in three parts: 1P, 2P, and the two combined.
 HiganRTool uses the same building blocks as the game's own built-in netplay.
 
 1. It has the game's own input-reading function read the local input as 1P. The value follows the 1P key configuration.
+   When the 1P input device is a gamepad, input from the keyboard's FULL layout is added.
+   If the 2P input device is also a gamepad, that gamepad's input is mixed in as well.
 2. Only the bits for Z, X, Shift, Esc and the directions are sent. The opponent's bits also take effect on your side, so keys such as the screenshot key are not sent.
 3. It orders the two values by seat and lets the game's own input-building function produce all three parts. The previous value, press and release edges, and key repeat are produced by the game itself, so the rules are exactly those of the unmodified game.
 
@@ -129,7 +132,7 @@ The local input is read at the same point as in the unmodified game (the start o
 
 The tool does not modify files in the game folder (exe, settings, save data, `replay\`).
 The only place it writes inside the game folder is `Replay_HiganRTool\` (8).
-Settings (`HiganRTool.ini`), logs, the last room name and similar files go in the tool's own folder.
+Settings (`HiganRTool.ini`), logs and similar files go in the tool's own folder.
 
 ### 2-6. Rules for code on the game thread
 
@@ -195,7 +198,9 @@ Because the switch is tied to a frame number rather than to the moment of the ke
 
 Auto picks a recommended value from the round-trip time (RTT):
 
-- **Recommended value**: ⌈RTT × 3 ÷ 100⌉ (one-way time = RTT ÷ 2, divided by one frame = 1000 ÷ 60 ms, rounded up), clamped to 1–8.
+- **Recommended value**: Based on the one-way time (RTT ÷ 2) divided by one frame (1000 ÷ 60 ms), clamped to 1–8.
+  - Delay mode: the one-way frames rounded up (⌈RTT × 3 ÷ 100⌉). Anything lower makes every frame wait for the opponent's input.
+  - Rollback: half of the one-way frames, rounded to the nearest (an exact half goes down). Prediction covers the other half. 30 ms RTT gives 1, 150 ms gives 2, 280 ms gives 4, 400 ms gives 6.
 - **RTT**: The median of the last 8 PING/PONG exchanges, sent once per second. PONG is answered by the receive thread, so the length of a game frame is not included.
 - **Re-evaluation**: Only when 9 is pressed, when the guest asks for auto, and at the start of each seg; it does not follow the RTT during a match. So that an RTT sitting on a boundary does not flip the value every match, the value goes up only if "RTT − 5 ms" still gives a higher recommendation, and goes down only after two lower recommendations in a row.
 
@@ -250,7 +255,7 @@ Every packet starts with a 12-byte header:
 | Offset | Size | Content |
 |---:|---:|---|
 | 0 | 4 | magic `"HGRT"` |
-| 4 | 1 | Protocol version (currently 7) |
+| 4 | 1 | Protocol version (currently 8) |
 | 5 | 1 | Type |
 | 6 | 2 | Reserved (0) |
 | 8 | 4 | session_id (random number chosen by the side that starts the connection) |
@@ -269,7 +274,7 @@ Each type has a fixed body length, and packets of the wrong length are dropped.
 | 4 | CHECK | Both | Sync check (3-6) |
 | 8 / 9 | PING / PONG | Both | Liveness and RTT measurement (once per second) |
 | 11 | SELECT | Both | Selection results |
-| 16 | MENU | Both | Input on the selection screens |
+| 16 | MENU | Both | Input on the selection screens, and cursor positions |
 | 17 / 18 | STEP_REQ / STEP | Both | Request for a screen-changing key press, and the order decided by the host |
 | 20 | READY | Both | "妖怪 対 妖怪" has been selected |
 | 21 | HOST_STATE | Host → guest | Display-only values (such as whether auto is on) |
@@ -281,7 +286,7 @@ Each type has a fixed body length, and packets of the wrong length are dropped.
 The side whose HELLO carries the larger random number becomes the host.
 The host decides the content of AGREE, the order of screen changes and the delay schedule.
 The host is also the one that streams to spectators (7).
-Liveness is checked with PING/PONG once per second; if nothing arrives for 10 seconds, the connection is treated as lost.
+Liveness is checked with PING/PONG once per second; if nothing arrives for 60 seconds, the connection is treated as lost.
 
 ### 4-3. Encryption and authentication
 
@@ -322,7 +327,7 @@ Spectating uses the same scheme, with separate keys for each spectator.
 
 ### 4-4. Version and build number
 
-- **Protocol version** (currently 7; `wire::PROTO_VER`): Carried in the header, in HELLO and at the start of the connection code. A peer with a different version is refused before connecting, as "the peer's version is different", after its tag has been verified. There is no backward compatibility.
+- **Protocol version** (currently 8; `wire::PROTO_VER`): Carried in the header, in HELLO and at the start of the connection code. A peer with a different version is refused before connecting, as "the peer's version is different", after its tag has been verified. There is no backward compatibility.
 - **Build number** (`update::BUILD_NUMBER`): An increasing number assigned to each released zip. It is carried in connection codes, HELLO and SPECTATE_JOIN, and a mismatch is refused before a single packet is encrypted. Synchronization depends on both players running the same code, so different builds never connect. Your own builds (number 0) connect only with other number-0 builds.
 
 
@@ -468,7 +473,9 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
 - **Catching up**: A spectator who joins mid-match receives everything from the start of the current seg. Time spent on the selection screens is skipped, and while more than 6 frames of match input are queued, the game update is run up to 16 extra times per drawn frame to fast-forward (using at most 8 ms extra per drawn frame). Normal speed resumes at 3 frames or fewer.
 - **Refusing**: In a random match, if either player has `[spectate] enable = 0`, the match is not posted to the list. In a room match, if the host has `enable = 0`, it does not enter the spectating room. The match host is decided at random, so to refuse spectators in a room match, both players set `enable = 0`.
 
-Matches connected with connection codes cannot be spectated, because there is no room name to derive a spectating room from.
+Matches connected with connection codes cannot be spectated through a room, because there is no room name to derive a spectating room from.
+Instead, the host copies a watch code with Ctrl + C, and the spectator pastes it with "Paste watch code". The spectator then connects directly to the host without going through the room server.
+A watch code expires after 30 minutes, and the spectator cannot connect unless the host's port can be reached from outside.
 
 
 ## 8. Replays
@@ -507,6 +514,7 @@ Readers skip keys they do not know.
 | `net` | RTT median and maximum, stall count, number of re-simulations, number of frames re-simulated |
 | `r1`–`r16` | Per round: frames, winner, lives, C2 and C3 counts, boss attack counts, reversal counts, scores |
 | `rx` | Number of rounds beyond the limit that could not be recorded |
+| `charge` | The charge settings of 1P and 2P used in the match (`0` = slow / `1` = charge). The same values are written into the replay header |
 | `role` / `p1` / `p2` | Only when saved by a spectator: `watch` and both names |
 
 IP addresses, ports, connection codes, room names and connection IDs are never written (the keys come from a closed list).

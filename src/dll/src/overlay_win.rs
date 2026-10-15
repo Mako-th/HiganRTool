@@ -4,7 +4,11 @@
 //! - 文字の表は読み取りのスレッドが GDI で 1 回だけメモリの面に描く。ゲームのスレッドは最初の 1 回だけ D3D8 のテクスチャ
 //!   （`D3DPOOL_MANAGED`。デバイスの Reset を越えて残る）を作ってコピー、以後は毎フレーム頂点をスタックの固定の配列に作って
 //!   `DrawPrimitiveUP` で出す。
-//! - **ゲームの描画の状態は、描く前に自分で読み（Get*）、描いた後に読んだ値へ戻す。** state block は使わない: (1) 取り込んだテクスチャ・
+//! - **ゲームの描画の状態は、描く前に自分で読み（Get*）、描いた後に読んだ値へ戻す。** ただし段 0 のテクスチャと頂点の流れ 0 は読まない。
+//!   GetTexture / GetStreamSource は参照を 1 つ足して返すので Release が要るが、d3d8.dll を差し替える ENBSeries の DX8 to DX9 Convertor は、
+//!   何も置かれていないときも中身が NULL の包みを返し、その Release で落ちる。テクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で置く
+//!   NULL へ戻す。流れ 0 は、ゲームの頂点の形の覚えから置き直す（`overlay::stream0_to_restore`）。参照を受け取る所は無い。
+//!   state block は使わない: (1) 取り込んだテクスチャ・
 //!   頂点バッファへの参照を次に取り込むまで持ち続けるので、ゲームが Reset する（`0x0042DB88`。戻り値を見ずに毎フレームやり直す）ときに
 //!   D3DPOOL_DEFAULT の物を生かしたままにして Reset を失敗させうる。(2) Reset の前に消す流儀があるが、ゲームの Reset はこちらの入口の後
 //!   （Present のラッパの中）で起きるので消す機会が無い。(3) ゲームは自分の描画の状態を覚えていて、同じなら Set を飛ばす（頂点の形の覚え
@@ -31,13 +35,15 @@ use higanr_core::shot::D3DFMT_A8R8G8B8;
 
 use crate::net_ui::{BOARD, draw_board};
 use crate::overlay::{
-    Fail, GameAddrs, GameFontWhy, GfGate, OverlayCounters, OverlayHost, TEXT, TEXT_UNITS, TIMINGS,
-    TimingSnapshot, Updater, gf_gate, gf_lock_gives_up, probe_game_font, swap_should_try,
+    Fail, GET_RENDER_STATE, GET_TEXTURE_STAGE_STATE, GET_VERTEX_SHADER, GET_VIEWPORT, GameAddrs,
+    GameFontWhy, GfGate, OverlayCounters, OverlayHost, TEXT, TEXT_UNITS, TIMINGS, TimingSnapshot,
+    Updater, gf_gate, gf_lock_gives_up, probe_game_font, stop_detail, stream0_to_restore,
+    swap_should_try,
 };
 use crate::pacing_win::{qpc, qpf};
 use crate::th09_addr::{
-    ANM_MANAGER_PTR, ASCII_ANM_LOADED_PTR, D3D8_SURF_RELEASE_SLOT, PP_HEIGHT, PP_WIDTH,
-    SURFACE_DESC_FORMAT, SURFACE_DESC_HEIGHT, SURFACE_DESC_WIDTH, TEX_GETLEVELDESC_SLOT,
+    ANM_MANAGER_PTR, ANM_QUAD_VB_STRIDE, ASCII_ANM_LOADED_PTR, D3D8_SURF_RELEASE_SLOT, PP_HEIGHT,
+    PP_WIDTH, SURFACE_DESC_FORMAT, SURFACE_DESC_HEIGHT, SURFACE_DESC_WIDTH, TEX_GETLEVELDESC_SLOT,
 };
 use crate::win::{read_own_into, read_own_memory};
 
@@ -47,16 +53,16 @@ use crate::win::{read_own_into, read_own_memory};
 // Present `0x3C` / GetBackBuffer `0x40` / CreateTexture `0x50`（`0x00452D52` の 7 引数）/ BeginScene `0x88` / EndScene `0x8C` /
 // SetRenderState `0xC8`（`0x0042FF2C` で FOGENABLE = 0x1C を 0 に）/ SetTexture `0xF4`（`0x0042DD4B`）/ SetTextureStageState `0xFC` /
 // DrawPrimitiveUP `0x120`（`0x00417447`: 種類 5・数 2・stride 0x14）/ SetVertexShader `0x130`（`0x004396E2` で `0x144`）/
-// SetStreamSource `0x14C`（`0x0043B478`: 0 番・stride 0x14）。Get の側（`0xCC` `0xF0` `0xF8` `0x134` `0x150` `0xA4`）と
-// TestCooperativeLevel `0x0C`・SetViewport `0xA0`、テクスチャの LockRect `0x40` / UnlockRect `0x44` は、ゲームが呼ばないので
-// SDK の並びだけが根拠（実機で見る）。Set と Get は SDK で隣り合い、GetTexture / GetTextureStageState は Set の 1 つ前。
+// SetStreamSource `0x14C`（`0x0043B478`: 0 番・stride 0x14）/ SetViewport `0xA0`（`0x004013C5` ほか 3 か所。`this` は Supervisor
+// `0x4B3100`、デバイスは `[this+8]`）。Get の側（`0xCC` `0xF8` `0x134` `0xA4`）と TestCooperativeLevel `0x0C`、テクスチャの
+// LockRect `0x40` / UnlockRect `0x44` は、ゲームが呼ばないので SDK の並びだけが根拠。Set と Get は SDK で隣り合い、GetTextureStageState は
+// Set の 1 つ前。
 const DEV_TESTCOOPERATIVELEVEL: u32 = 0x0C;
 const DEV_CREATETEXTURE: u32 = 0x50;
 const DEV_SETVIEWPORT: u32 = 0xA0;
 const DEV_GETVIEWPORT: u32 = 0xA4;
 const DEV_SETRENDERSTATE: u32 = 0xC8;
 const DEV_GETRENDERSTATE: u32 = 0xCC;
-const DEV_GETTEXTURE: u32 = 0xF0;
 const DEV_SETTEXTURE: u32 = 0xF4;
 const DEV_GETTEXTURESTAGESTATE: u32 = 0xF8;
 const DEV_SETTEXTURESTAGESTATE: u32 = 0xFC;
@@ -64,7 +70,6 @@ const DEV_DRAWPRIMITIVEUP: u32 = 0x120;
 const DEV_SETVERTEXSHADER: u32 = 0x130;
 const DEV_GETVERTEXSHADER: u32 = 0x134;
 const DEV_SETSTREAMSOURCE: u32 = 0x14C;
-const DEV_GETSTREAMSOURCE: u32 = 0x150;
 /// IDirect3DTexture8 の LockRect / UnlockRect（IUnknown 3・IDirect3DResource8 8・IDirect3DBaseTexture8 3・GetLevelDesc・
 /// GetSurfaceLevel の後の 16 番目・17 番目）。
 const TEX_LOCKRECT: u32 = 0x40;
@@ -197,6 +202,10 @@ static SET_FAILED: AtomicU32 = AtomicU32::new(0);
 static PANICS: AtomicU32 = AtomicU32::new(0);
 static FAIL: AtomicU32 = AtomicU32::new(0);
 static FAIL_HR: AtomicU32 = AtomicU32::new(0);
+/// 止めた理由の詳細（`overlay::stop_detail`）と、`FAIL` / `FAIL_HR` / `FAIL_DETAIL` が揃ったか・読み取りのスレッドが本ログへ書いたか。
+static FAIL_DETAIL: AtomicU32 = AtomicU32::new(0);
+static FAIL_PUBLISHED: AtomicU32 = AtomicU32::new(0);
+static FAIL_REPORTED: AtomicU32 = AtomicU32::new(0);
 static SETUP_TICKS: AtomicU32 = AtomicU32::new(0);
 static UPDATER_STARTED: AtomicU32 = AtomicU32::new(0);
 
@@ -244,6 +253,8 @@ static SWAP_TICKS: AtomicU32 = AtomicU32::new(0);
 static GF_NOTE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static GF_LOADED_PTR: AtomicU32 = AtomicU32::new(ASCII_ANM_LOADED_PTR);
 static GF_MGR_PTR: AtomicU32 = AtomicU32::new(ANM_MANAGER_PTR);
+/// 描いた後に頂点の流れ 0 を戻すときに読む AnmManager のポインタの置き場（検査は偽のメモリ）。
+static STREAM_MGR_PTR: AtomicU32 = AtomicU32::new(ANM_MANAGER_PTR);
 
 /// 作業場: 文字 1 つあたり `SLOT_PX` 画素の ARGB（幅 `GAME_SLOT_W` の行）＋ 大きさの 4 語（絵の幅・高さ・画面の幅・高さ。幅 0 は
 /// 「コピーしていない」）。`GAME_GLYPHS` 文字ぶん。読み取りのスレッドが `ensure_scratch` で確保して返さない。書くのはゲームのスレッドだけ
@@ -344,13 +355,33 @@ pub fn counters() -> OverlayCounters {
 }
 
 fn stop(f: Fail, hr: u32) {
+    stop_with(f, hr, 0);
+}
+
+/// 描くのを止め、最初の理由だけ残す。ゲームのスレッドから呼ぶので、原子の値を置くだけ（ログは書かない。書くのは `take_stop_report` を呼ぶ読み取りのスレッド）。
+fn stop_with(f: Fail, hr: u32, detail: u32) {
     OVERLAY_ON.store(0, Ordering::Release);
     if FAIL
         .compare_exchange(0, f as u32, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
     {
         FAIL_HR.store(hr, Ordering::Release);
+        FAIL_DETAIL.store(detail, Ordering::Release);
+        FAIL_PUBLISHED.store(1, Ordering::Release);
     }
+}
+
+/// 描くのを止めた理由（`Fail` の番号, HRESULT, 詳細）を、止めたあと最初に呼んだ 1 回だけ返す。読み取りのスレッドが本ログへ書く。
+/// 止めていなければ、また返し済みなら `None`。
+pub fn take_stop_report() -> Option<(u32, u32, u32)> {
+    if FAIL_PUBLISHED.load(Ordering::Acquire) == 0 || FAIL_REPORTED.swap(1, Ordering::AcqRel) != 0 {
+        return None;
+    }
+    Some((
+        FAIL.load(Ordering::Acquire),
+        FAIL_HR.load(Ordering::Acquire),
+        FAIL_DETAIL.load(Ordering::Acquire),
+    ))
 }
 
 // ---- ゲームのスレッドの入口 ----
@@ -454,7 +485,7 @@ fn overlay_inner() {
             let t1 = qpc();
             match create_texture(d, atlas) {
                 Ok(new_tex) => {
-                    // SAFETY: 古い `TEX` は自分が作った参照を持つテクスチャで、描く間だけデバイスの段 0 に置き、描いた後にゲームの物へ
+                    // SAFETY: 古い `TEX` は自分が作った参照を持つテクスチャで、描く間だけデバイスの段 0 に置き、描いた後に NULL へ
                     // 戻している（`draw_with_saved_state`）ので、いまデバイスは掴んでいない。
                     unsafe { Dev(tex).release() };
                     tex = new_tex;
@@ -519,13 +550,13 @@ fn overlay_inner() {
         return;
     }
     // 状態の保存と戻しは 1 回にまとめ、右下の行（あれば）と盤の行を続けて描く。
-    if let Err((f, hr)) = draw_with_saved_state(d, tex, screen_w, screen_h, &mut |emit| {
+    if let Err((f, hr, detail)) = draw_with_saved_state(d, tex, screen_w, screen_h, &mut |emit| {
         if n > 0 {
             emit(&verts[..n]);
         }
         draw_board(&BOARD, &draw_atlas.spec, screen_w, screen_h, emit);
     }) {
-        stop(f, hr);
+        stop_with(f, hr, detail);
         return;
     }
     let dt = u32::try_from(qpc().wrapping_sub(t0)).unwrap_or(u32::MAX);
@@ -542,39 +573,29 @@ struct Saved {
     tss: [u32; TSS.len()],
     vs: u32,
     vp: [u32; 6],
-    /// 段 0 のテクスチャ（GetTexture が参照を 1 つ足して返す。0 なら無し）。
-    tex: u32,
-    /// 頂点の流れ 0 の頂点バッファと stride（GetStreamSource が参照を 1 つ足して返す。0 なら無し）。
-    vb: u32,
-    stride: u32,
 }
 
 /// 描く側の入口。状態を置いた後に 1 回だけ呼ばれ、渡された「頂点を出す関数」を何度でも呼んでよい（盤の行ごとの塊）。
 type DrawFn<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&[Vertex]));
 
-/// 状態を読み、自分の状態を置き、描き、読んだ値へ戻す。Get* が 1 つでも失敗したら、何も置かずに（取った参照は
-/// 返して）`Err`。Set* と DrawPrimitiveUP の失敗は数えるだけで、戻しは全部やる。
+/// 状態を読み、自分の状態を置き、描き、読んだ値へ戻す。Get* が 1 つでも失敗したら、何も置かずに `Err`。Set* と
+/// DrawPrimitiveUP の失敗は数えるだけで、戻しは全部やる。呼ぶのは描画の地点（`0x0042DD51`）の入口だけ（テクスチャの戻しがその地点の前提に頼る）。
 fn draw_with_saved_state(
     d: Dev,
     tex: u32,
     screen_w: u32,
     screen_h: u32,
     draw: DrawFn<'_>,
-) -> Result<(), (Fail, u32)> {
+) -> Result<(), (Fail, u32, u32)> {
     let mut s = Saved {
         rs: [0; RS.len()],
         tss: [0; TSS.len()],
         vs: 0,
         vp: [0; 6],
-        tex: 0,
-        vb: 0,
-        stride: 0,
     };
     // SAFETY: `d` は `overlay_inner` が確かめた生きているデバイスで、ゲームのスレッドから呼んでいる（以下の `d.*` も同じ）。
-    if let Err(hr) = unsafe { save(d, &mut s) } {
-        // SAFETY: 同上。`s` の参照は `save` が取れたものだけ（取れなかった欄は 0）。
-        unsafe { release_saved(&s) };
-        return Err((Fail::GetState, hr as u32));
+    if let Err((hr, detail)) = unsafe { save(d, &mut s) } {
+        return Err((Fail::GetState, hr as u32, detail));
     }
     let vp = [0, 0, screen_w, screen_h, 0.0f32.to_bits(), 1.0f32.to_bits()];
     let mut set_fail = 0u32;
@@ -595,9 +616,7 @@ fn draw_with_saved_state(
                 chk(d.set_texture_stage_state(stage, ty, v));
             }
         }
-        if s.tex != tex {
-            chk(d.set_texture(0, tex));
-        }
+        chk(d.set_texture(0, tex));
         if s.vs != FVF {
             chk(d.set_vertex_shader(FVF));
         }
@@ -624,9 +643,13 @@ fn draw_with_saved_state(
         }
     };
     draw(&mut emit);
-    // 戻す（置いたのと逆の順）。DrawPrimitiveUP は頂点の流れ 0 を NULL にするので、ゲームが頂点バッファを置いていたら置き直す
-    // （ゲームは頂点の形の覚え `[AnmManager+0x12886]` が同じなら SetStreamSource を飛ばす —— `0x0043B449`〜`0x0043B478`）。
-    // SAFETY: 同上。戻す値は `save` が読んだ値そのもの。テクスチャと頂点バッファは `save` が参照を持っているので生きている。
+    // 戻す（置いたのと逆の順）。段 0 のテクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で置いた NULL へ戻す。
+    // DrawPrimitiveUP は頂点の流れ 0 を NULL にするので、ゲームが SetStreamSource を飛ばす場面（頂点の形の覚えが 2）だけ、
+    // ゲームの頂点バッファを置き直す（`stream0_to_restore`）。
+    let mut read = |a: u32, b: &mut [u8]| read_own_into(a, b);
+    let vb = stream0_to_restore(&mut read, STREAM_MGR_PTR.load(Ordering::Relaxed));
+    // SAFETY: 同上。戻す値は `save` が読んだ値そのもの。`vb` はゲームが `[AnmManager+0x12890]` に持ち、流れ 0 に置いていた頂点バッファ
+    // （ゲームが参照を持ち、Release するときは 0 を書く。ゲームのスレッドなので、読んでから置くまでに変わらない）。
     unsafe {
         if s.vp != vp {
             chk(d.set_viewport(&s.vp));
@@ -634,9 +657,7 @@ fn draw_with_saved_state(
         if s.vs != FVF {
             chk(d.set_vertex_shader(s.vs));
         }
-        if s.tex != tex {
-            chk(d.set_texture(0, s.tex));
-        }
+        chk(d.set_texture(0, 0));
         for (i, &(stage, ty, v)) in TSS.iter().enumerate().rev() {
             if s.tss[i] != v {
                 chk(d.set_texture_stage_state(stage, ty, s.tss[i]));
@@ -647,10 +668,9 @@ fn draw_with_saved_state(
                 chk(d.set_render_state(st, s.rs[i]));
             }
         }
-        if s.vb != 0 {
-            chk(d.set_stream_source(0, s.vb, s.stride));
+        if let Some(vb) = vb {
+            chk(d.set_stream_source(0, vb, ANM_QUAD_VB_STRIDE));
         }
-        release_saved(&s);
     }
     if set_fail != 0 {
         SET_FAILED.fetch_add(set_fail, Ordering::Relaxed);
@@ -658,39 +678,34 @@ fn draw_with_saved_state(
     Ok(())
 }
 
-/// 状態を読む。参照を返すもの（テクスチャ・頂点バッファ）は最後に読む（その前で失敗しても返す物が無い）。
+/// 状態を読む。参照を返す Get*（GetTexture / GetStreamSource）は呼ばない（頭の注）。
 ///
 /// # Safety
 /// `d` は生きているデバイスで、ゲームのスレッドから呼ぶこと。
-unsafe fn save(d: Dev, s: &mut Saved) -> Result<(), i32> {
-    let ok = |hr: i32| if hr < 0 { Err(hr) } else { Ok(()) };
+unsafe fn save(d: Dev, s: &mut Saved) -> Result<(), (i32, u32)> {
+    // 失敗したら（HRESULT, どの Get* か）。
+    let ok = |hr: i32, detail: u32| if hr < 0 { Err((hr, detail)) } else { Ok(()) };
     // SAFETY: 呼び出し側の約束。書く先はどれも `s` の欄（書ける u32）。
     unsafe {
         for (i, &(st, _)) in RS.iter().enumerate() {
-            ok(d.get_render_state(st, &mut s.rs[i]))?;
+            ok(
+                d.get_render_state(st, &mut s.rs[i]),
+                stop_detail(GET_RENDER_STATE, st),
+            )?;
         }
         for (i, &(stage, ty, _)) in TSS.iter().enumerate() {
-            ok(d.get_texture_stage_state(stage, ty, &mut s.tss[i]))?;
+            ok(
+                d.get_texture_stage_state(stage, ty, &mut s.tss[i]),
+                stop_detail(GET_TEXTURE_STAGE_STATE, stage << 8 | ty),
+            )?;
         }
-        ok(d.get_vertex_shader(&mut s.vs))?;
-        ok(d.get_viewport(&mut s.vp))?;
-        ok(d.get_texture(0, &mut s.tex))?;
-        ok(d.get_stream_source(0, &mut s.vb, &mut s.stride))?;
+        ok(
+            d.get_vertex_shader(&mut s.vs),
+            stop_detail(GET_VERTEX_SHADER, 0),
+        )?;
+        ok(d.get_viewport(&mut s.vp), stop_detail(GET_VIEWPORT, 0))?;
     }
     Ok(())
-}
-
-/// `save` が取った参照を返す。
-///
-/// # Safety
-/// `s.tex` と `s.vb` は 0 か、`save` が参照を 1 つ足して受け取った COM の物であること。
-unsafe fn release_saved(s: &Saved) {
-    for obj in [s.tex, s.vb] {
-        if obj != 0 {
-            // SAFETY: 呼び出し側の約束（GetTexture / GetStreamSource が足した参照を 1 回だけ返す）。
-            unsafe { Dev(obj).release() };
-        }
-    }
 }
 
 /// 自分のテクスチャを作り、文字の表の画素をコピーする（最初の 1 回だけ）。
@@ -977,13 +992,6 @@ impl Dev {
         }
     }
 
-    /// `out` には参照が 1 つ足された物（か 0）が入る。
-    unsafe fn get_texture(self, stage: u32, out: &mut u32) -> i32 {
-        type F = unsafe extern "system" fn(u32, u32, *mut u32) -> i32;
-        // SAFETY: 上の注。
-        unsafe { core::mem::transmute::<usize, F>(self.f(DEV_GETTEXTURE))(self.0, stage, out) }
-    }
-
     /// `tex` は 0 か生きているテクスチャ。
     unsafe fn set_texture(self, stage: u32, tex: u32) -> i32 {
         type F = unsafe extern "system" fn(u32, u32, u32) -> i32;
@@ -1016,15 +1024,6 @@ impl Dev {
         type F = unsafe extern "system" fn(u32, *const u32) -> i32;
         // SAFETY: 上の注。
         unsafe { core::mem::transmute::<usize, F>(self.f(DEV_SETVIEWPORT))(self.0, vp.as_ptr()) }
-    }
-
-    /// `vb` には参照が 1 つ足された物（か 0）が入る。
-    unsafe fn get_stream_source(self, n: u32, vb: &mut u32, stride: &mut u32) -> i32 {
-        type F = unsafe extern "system" fn(u32, u32, *mut u32, *mut u32) -> i32;
-        // SAFETY: 上の注。
-        unsafe {
-            core::mem::transmute::<usize, F>(self.f(DEV_GETSTREAMSOURCE))(self.0, n, vb, stride)
-        }
     }
 
     /// `vb` は 0 か生きている頂点バッファ。
@@ -1846,11 +1845,25 @@ pub(crate) mod tests {
     static GAME_TEX_REFS: AtomicU32 = AtomicU32::new(0);
     static GAME_VB_REFS: AtomicU32 = AtomicU32::new(0);
 
+    /// GetTexture / GetStreamSource の番号（SDK の並び）。本体は呼ばないので定数を持たない。偽のデバイスは ENBSeries の変換と同じく、
+    /// 何も置かれていなくても中身の無い包み（`ENB_EMPTY`）を返し、その Release を数える。
+    const DEV_GETTEXTURE: u32 = 0xF0;
+    const DEV_GETSTREAMSOURCE: u32 = 0x150;
+    static ENB_EMPTY: Obj = Obj(AtomicU32::new(0));
+    static ENB_VTBL: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+    static N_REF_GET: AtomicU32 = AtomicU32::new(0);
+    static N_ENB_RELEASE: AtomicU32 = AtomicU32::new(0);
+
+    /// 偽の AnmManager の頂点の形の覚え（`+0x12886`）から頂点バッファ（`+0x12890`）までの 4 語（`+0x12884` から）。
+    /// `FAKE_ANM_PTR` は AnmManager の先頭に当たるアドレス（この配列 − 0x12884。先頭から 0x12884 バイトは読まない）。
+    static FAKE_ANM_PTR: AtomicU32 = AtomicU32::new(0);
+    static FAKE_ANM_TAIL: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
     static TCL_HR: AtomicU32 = AtomicU32::new(0);
     static CREATE_HR: AtomicU32 = AtomicU32::new(0);
     static LOCK_HR: AtomicU32 = AtomicU32::new(0);
     static GET_RS_HR: AtomicU32 = AtomicU32::new(0);
-    static GET_SS_HR: AtomicU32 = AtomicU32::new(0);
+    static GET_VP_HR: AtomicU32 = AtomicU32::new(0);
     static DRAW_HR: AtomicU32 = AtomicU32::new(0);
     const E_FAIL: u32 = 0x8000_4005;
     const DEVICELOST: u32 = 0x8876_0868;
@@ -1983,17 +1996,23 @@ pub(crate) mod tests {
         TSS_STATE[(stage * 32 + ty) as usize].store(v, Ordering::SeqCst);
         0
     }
-    extern "system" fn f_get_tex(this: u32, stage: u32, out: *mut u32) -> i32 {
-        N_GET.fetch_add(1, Ordering::SeqCst);
-        if !dev_ok(this) || stage != 0 {
-            bad();
+    extern "system" fn f_enb_get_tex(_this: u32, _stage: u32, out: *mut u32) -> i32 {
+        N_REF_GET.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: 呼ぶ側が渡した書ける 4 バイト（呼ばれないのが正しい）。
+        unsafe { out.write(addr_of(&ENB_EMPTY)) };
+        0
+    }
+    extern "system" fn f_enb_get_ss(_this: u32, _n: u32, vb: *mut u32, stride: *mut u32) -> i32 {
+        N_REF_GET.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: 同上。
+        unsafe {
+            vb.write(addr_of(&ENB_EMPTY));
+            stride.write(0);
         }
-        let t = TEX0.load(Ordering::SeqCst);
-        if t == addr_of(&GAME_TEX) {
-            GAME_TEX_REFS.fetch_add(1, Ordering::SeqCst);
-        }
-        // SAFETY: `out` は `Saved` の欄。
-        unsafe { out.write(t) };
+        0
+    }
+    extern "system" fn f_enb_release(_this: u32) -> u32 {
+        N_ENB_RELEASE.fetch_add(1, Ordering::SeqCst);
         0
     }
     extern "system" fn f_set_tex(this: u32, stage: u32, t: u32) -> i32 {
@@ -2026,6 +2045,10 @@ pub(crate) mod tests {
         if !dev_ok(this) {
             bad();
         }
+        let hr = GET_VP_HR.load(Ordering::SeqCst);
+        if hr != 0 {
+            return hr as i32;
+        }
         for (i, v) in VIEWPORT.iter().enumerate() {
             // SAFETY: `out` は `Saved` の 6 語。
             unsafe { out.add(i).write(v.load(Ordering::SeqCst)) };
@@ -2040,26 +2063,6 @@ pub(crate) mod tests {
         for (i, v) in VIEWPORT.iter().enumerate() {
             // SAFETY: `vp` は 6 語の配列。
             v.store(unsafe { vp.add(i).read() }, Ordering::SeqCst);
-        }
-        0
-    }
-    extern "system" fn f_get_ss(this: u32, n: u32, vb: *mut u32, stride: *mut u32) -> i32 {
-        N_GET.fetch_add(1, Ordering::SeqCst);
-        if !dev_ok(this) || n != 0 {
-            bad();
-        }
-        let hr = GET_SS_HR.load(Ordering::SeqCst);
-        if hr != 0 {
-            return hr as i32;
-        }
-        let v = VB0.load(Ordering::SeqCst);
-        if v == addr_of(&GAME_VB) {
-            GAME_VB_REFS.fetch_add(1, Ordering::SeqCst);
-        }
-        // SAFETY: どちらも `Saved` の欄。
-        unsafe {
-            vb.write(v);
-            stride.write(STRIDE0.load(Ordering::SeqCst));
         }
         0
     }
@@ -2420,15 +2423,43 @@ pub(crate) mod tests {
         for (i, a) in TSS_STATE.iter().enumerate() {
             a.store(0x2000 + i as u32, Ordering::SeqCst);
         }
-        TEX0.store(addr_of(&GAME_TEX), Ordering::SeqCst);
+        // 段 0 のテクスチャは、描画の地点の直前（`0x0042DD4B`）でゲームが置く NULL。流れ 0 はゲームの頂点バッファで、覚えは 2。
+        TEX0.store(0, Ordering::SeqCst);
         VS.store(GAME_VS, Ordering::SeqCst);
         VB0.store(addr_of(&GAME_VB), Ordering::SeqCst);
         STRIDE0.store(0x14, Ordering::SeqCst);
+        fake_anm(2, addr_of(&GAME_VB));
         for (a, v) in VIEWPORT.iter().zip(GAME_VP) {
             a.store(v, Ordering::SeqCst);
         }
         GAME_TEX_REFS.store(1, Ordering::SeqCst);
         GAME_VB_REFS.store(1, Ordering::SeqCst);
+    }
+
+    /// 偽の AnmManager の覚えと頂点バッファを置き、`STREAM_MGR_PTR` をそこへ向ける。
+    fn fake_anm(flag: u8, vb: u32) {
+        FAKE_ANM_PTR.store(
+            addr_of(&FAKE_ANM_TAIL).wrapping_sub(0x12884),
+            Ordering::SeqCst,
+        );
+        // `+0x12884` の語の 3 バイト目が `+0x12886`。隣の 3 バイトにも値を置き、1 バイトだけ読むことを見る。
+        FAKE_ANM_TAIL[0].store(
+            0xA5A5_A5A5 & !0x00FF_0000 | u32::from(flag) << 16,
+            Ordering::SeqCst,
+        );
+        FAKE_ANM_TAIL[1].store(0x5A5A_5A5A, Ordering::SeqCst);
+        FAKE_ANM_TAIL[2].store(0x1234_5678, Ordering::SeqCst);
+        FAKE_ANM_TAIL[3].store(vb, Ordering::SeqCst);
+        STREAM_MGR_PTR.store(addr_of(&FAKE_ANM_PTR), Ordering::SeqCst);
+    }
+
+    fn fake_anm_words() -> Vec<u32> {
+        let mut v: Vec<u32> = FAKE_ANM_TAIL
+            .iter()
+            .map(|a| a.load(Ordering::SeqCst))
+            .collect();
+        v.push(FAKE_ANM_PTR.load(Ordering::SeqCst));
+        v
     }
 
     fn device_state() -> Vec<u32> {
@@ -2458,13 +2489,13 @@ pub(crate) mod tests {
             (DEV_SETRENDERSTATE, f_set_rs as *const () as usize),
             (DEV_GETTEXTURESTAGESTATE, f_get_tss as *const () as usize),
             (DEV_SETTEXTURESTAGESTATE, f_set_tss as *const () as usize),
-            (DEV_GETTEXTURE, f_get_tex as *const () as usize),
+            (DEV_GETTEXTURE, f_enb_get_tex as *const () as usize),
             (DEV_SETTEXTURE, f_set_tex as *const () as usize),
             (DEV_GETVERTEXSHADER, f_get_vs as *const () as usize),
             (DEV_SETVERTEXSHADER, f_set_vs as *const () as usize),
             (DEV_GETVIEWPORT, f_get_vp as *const () as usize),
             (DEV_SETVIEWPORT, f_set_vp as *const () as usize),
-            (DEV_GETSTREAMSOURCE, f_get_ss as *const () as usize),
+            (DEV_GETSTREAMSOURCE, f_enb_get_ss as *const () as usize),
             (DEV_SETSTREAMSOURCE, f_set_ss as *const () as usize),
             (DEV_DRAWPRIMITIVEUP, f_draw_up as *const () as usize),
         ];
@@ -2487,12 +2518,22 @@ pub(crate) mod tests {
         OUR_TEX.0.store(addr_of(&TEX_VTBL), Ordering::SeqCst);
         GAME_TEX.0.store(addr_of(&REF_VTBL), Ordering::SeqCst);
         GAME_VB.0.store(addr_of(&REF_VTBL), Ordering::SeqCst);
+        ENB_VTBL[(COM_RELEASE / 4) as usize]
+            .store(f_enb_release as *const () as usize as u32, Ordering::SeqCst);
+        ENB_EMPTY.0.store(addr_of(&ENB_VTBL), Ordering::SeqCst);
         FAKE_DEVICE_PTR.store(addr_of(&FAKE_DEVICE), Ordering::SeqCst);
         for (a, v) in FAKE_PP.iter().zip([640, 480, 22]) {
             a.store(v, Ordering::SeqCst);
         }
         for a in [
-            &TCL_HR, &CREATE_HR, &LOCK_HR, &GET_RS_HR, &GET_SS_HR, &DRAW_HR,
+            &TCL_HR,
+            &CREATE_HR,
+            &LOCK_HR,
+            &GET_RS_HR,
+            &GET_VP_HR,
+            &DRAW_HR,
+            &N_REF_GET,
+            &N_ENB_RELEASE,
         ] {
             a.store(0, Ordering::SeqCst);
         }
@@ -2506,6 +2547,9 @@ pub(crate) mod tests {
             &TEX_DEVICE,
             &FAIL,
             &FAIL_HR,
+            &FAIL_DETAIL,
+            &FAIL_PUBLISHED,
+            &FAIL_REPORTED,
             &DRAWN,
             &LOST,
             &NO_DEVICE,
@@ -2741,10 +2785,15 @@ pub(crate) mod tests {
         TEX0.store(0, Ordering::SeqCst);
         VB0.store(0, Ordering::SeqCst);
         STRIDE0.store(0, Ordering::SeqCst);
+        fake_anm(0xFF, addr_of(&GAME_VB));
         let before = device_state();
         let s0 = N_SET.load(Ordering::SeqCst);
         draw_once();
-        assert_eq!(N_SET.load(Ordering::SeqCst) - s0, 2);
+        assert_eq!(
+            N_SET.load(Ordering::SeqCst) - s0,
+            2,
+            "置くのと戻すのはテクスチャの 2 回だけ"
+        );
         assert_eq!(device_state(), before);
         teardown();
     }
@@ -2826,6 +2875,16 @@ pub(crate) mod tests {
         assert_eq!((d, s), (0, 0));
         assert_eq!(after, before);
         assert_eq!(counters().fail, Fail::GetState as u32);
+        assert_eq!(
+            take_stop_report(),
+            Some((
+                Fail::GetState as u32,
+                E_FAIL,
+                stop_detail(GET_RENDER_STATE, D3DRS_ZENABLE)
+            )),
+            "どの Get* で失敗したかが読み取りのスレッドへ渡る"
+        );
+        assert_eq!(take_stop_report(), None, "2 回目は返さない");
         teardown();
 
         let _g2 = {
@@ -2833,12 +2892,125 @@ pub(crate) mod tests {
             setup()
         };
         draw_once();
-        let (d, s, _, before, after) = refuse_with(|| GET_SS_HR.store(E_FAIL, Ordering::SeqCst));
+        let (d, s, _, before, after) = refuse_with(|| GET_VP_HR.store(E_FAIL, Ordering::SeqCst));
+        assert_eq!((d, s), (0, 0));
+        assert_eq!(after, before);
+        assert_eq!(
+            take_stop_report().map(|r| r.2),
+            Some(stop_detail(GET_VIEWPORT, 0)),
+            "最後の Get*（viewport）の失敗が、その呼び出しの名前で渡る"
+        );
+        teardown();
+    }
+
+    /// 壊れたら落ちる: GetTexture か GetStreamSource を呼ぶ（ENBSeries の変換の上では、返った中身の無い包みの Release で落ちる）。
+    #[test]
+    fn reference_returning_gets_are_never_called() {
+        use crate::net_ui::SHOW_MENU;
+        use higanr_core::ui_layout::RowStyle;
+        let _g = setup();
+        draw_once();
+        BOARD.set_row(0, "妖怪 対 妖怪", RowStyle::Title);
+        BOARD.set_menu_len(1);
+        BOARD.set_show(SHOW_MENU);
+        for flag in [2u8, 1, 0xFF] {
+            fake_anm(flag, addr_of(&GAME_VB));
+            draw_once();
+        }
+        BOARD.set_show(0);
+        assert_eq!(counters().drawn, 4);
+        assert_eq!(
+            (
+                N_REF_GET.load(Ordering::SeqCst),
+                N_ENB_RELEASE.load(Ordering::SeqCst)
+            ),
+            (0, 0),
+            "参照を返す Get* を呼んだ / その Release を呼んだ"
+        );
+        teardown();
+    }
+
+    /// 壊れたら落ちる: 段 0 を NULL へ戻さない・覚えが 2 なのに流れ 0 を置き直さない（ゲームが空の流れで DrawPrimitive を呼ぶ）・
+    /// 覚えが 2 でないのに置き直す・AnmManager が無い / 読めないときに何かを置く・ゲームのメモリに書く。
+    #[test]
+    fn stream0_is_put_back_only_when_the_game_skips_setstreamsource() {
+        let _g = setup();
+        let bad0 = BAD_ARGS.load(Ordering::SeqCst);
+        let game_vb = addr_of(&GAME_VB);
+        let anm0 = fake_anm_words();
+        let before = device_state();
+        draw_once();
+        assert_eq!(
+            (
+                TEX0.load(Ordering::SeqCst),
+                VB0.load(Ordering::SeqCst),
+                STRIDE0.load(Ordering::SeqCst)
+            ),
+            (0, game_vb, 0x14),
+            "覚え 2: テクスチャは NULL、流れ 0 はゲームの頂点バッファ"
+        );
+        assert_eq!(device_state(), before);
+        assert_eq!(fake_anm_words(), anm0, "ゲームのメモリに書いた");
+
+        // 覚えが 2 でなければ、ゲームが描く前に自分で置くので、DrawPrimitiveUP が NULL にしたまま。
+        for flag in [0u8, 1, 3, 4, 0xFF] {
+            fake_anm(flag, game_vb);
+            VB0.store(game_vb, Ordering::SeqCst);
+            let s0 = N_SET.load(Ordering::SeqCst);
+            draw_once();
+            assert_eq!(VB0.load(Ordering::SeqCst), 0, "覚え {flag}");
+            let s_flag = N_SET.load(Ordering::SeqCst) - s0;
+            fake_anm(2, game_vb);
+            let s1 = N_SET.load(Ordering::SeqCst);
+            draw_once();
+            assert_eq!(
+                N_SET.load(Ordering::SeqCst) - s1,
+                s_flag + 1,
+                "覚え 2 のときだけ SetStreamSource が 1 回増える（覚え {flag}）"
+            );
+        }
+
+        // AnmManager がまだ無い・置き場が読めない・バッファが 0。
+        let none = [
+            Box::new(|| {
+                fake_anm(2, game_vb);
+                FAKE_ANM_PTR.store(0, Ordering::SeqCst);
+            }) as Box<dyn Fn()>,
+            Box::new(|| {
+                fake_anm(2, game_vb);
+                STREAM_MGR_PTR.store(0x10, Ordering::SeqCst);
+            }),
+            Box::new(|| fake_anm(2, 0)),
+        ];
+        for (i, prep) in none.iter().enumerate() {
+            prep();
+            VB0.store(game_vb, Ordering::SeqCst);
+            let d0 = counters().drawn;
+            draw_once();
+            assert_eq!(counters().drawn, d0 + 1, "場面 {i}: 描いていない");
+            assert_eq!(
+                VB0.load(Ordering::SeqCst),
+                0,
+                "場面 {i}: 置くものが無いのに置いた"
+            );
+        }
+        assert_eq!(BAD_ARGS.load(Ordering::SeqCst), bad0);
+        assert_eq!(counters().fail, 0);
+        teardown();
+    }
+
+    /// 壊れたら落ちる: 止める前に理由を返す・理由が組になる前に返す・同じ理由を 2 回返す（本ログに同じ行が並ぶ）。
+    #[test]
+    fn stop_report_is_given_once_and_only_after_a_stop() {
+        let _g = setup();
+        assert_eq!(take_stop_report(), None, "止めていないのに返した");
+        let (d, s, _, _, _) = refuse_with(|| CREATE_HR.store(E_FAIL, Ordering::SeqCst));
         assert_eq!((d, s), (0, 0));
         assert_eq!(
-            after, before,
-            "テクスチャの参照を返していない（参照の数が違う）"
+            take_stop_report(),
+            Some((Fail::CreateTexture as u32, E_FAIL, 0))
         );
+        assert_eq!(take_stop_report(), None);
         teardown();
     }
 

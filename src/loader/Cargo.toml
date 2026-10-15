@@ -18,7 +18,7 @@ dist = []
 [dependencies]
 higanr_core = { path = "../core" }
 
-# Win32 の宣言だけのパッケージ（MIT / Apache-2.0。設計 §1-1 で決めたもの）。
+# Win32 の宣言だけのパッケージ（MIT / Apache-2.0）。
 # features は使う関数の置き場所だけに絞る（ビルドの時間を増やさないため）:
 #   Foundation            CloseHandle / GetLastError / HANDLE / WAIT_*
 #   Security              CreateProcessW・CreateRemoteThread の引数の型（SECURITY_ATTRIBUTES）
@@ -26,7 +26,8 @@ higanr_core = { path = "../core" }
 #                         GetExitCodeThread / ResumeThread / TerminateProcess
 #   System_Memory         VirtualAllocEx / VirtualFreeEx
 #   System_Diagnostics_Debug  WriteProcessMemory / SetErrorMode（自己検査だけ）
-#   System_LibraryLoader  GetModuleHandleW / GetProcAddress（LoadLibraryW のアドレス）
+#   System_Diagnostics_ToolHelp  CreateToolhelp32Snapshot / Process32FirstW / Process32NextW（同じ th09.exe が動いていないかの確認。`single`）
+#   System_LibraryLoaderGetModuleHandleW / GetProcAddress（LoadLibraryW のアドレス）
 #   System_DataExchange   OpenClipboard / EmptyClipboard / SetClipboardData / CloseClipboard（接続コードの窓が
 #                         自分のコードをクリップボードへ写す。`code_relay`。GlobalAlloc などは System_Memory）
 #   System_Console        GetConsoleProcessList（断ったときに、ショートカットから開いた窓だけを Enter まで残す。`hold`）
@@ -34,6 +35,9 @@ higanr_core = { path = "../core" }
 #   UI_Shell              SHCreateItemFromParsingName / FOS_PICKFOLDERS / SIGDN_FILESYSPATH（同上）
 #   UI_WindowsAndMessaging  MessageBoxW（選び直しの理由の窓。同上。更新を尋ねる「はい / いいえ」の窓も）
 #   Globalization         GetUserDefaultUILanguage（画面の言語の既定。`real::user_ui_langid`）
+#   System_SystemInformation  GetLocalTime（段階ログの時刻と日ごとのファイル名。`real::local_stamp`）
+#   System_Kernel         EXCEPTION_POINTERS / EXCEPTION_RECORD / CONTEXT（未処理例外のフィルターが例外の場所を読む。`real`）
+#   Wdk_Storage_FileSystem  NtQueryVirtualMemory（同フィルターが、例外の場所のモジュール名をローダーロックを取らずに写像から引く。`real::module_of`）
 #   Networking_WinHttp    WinHttpOpen ほか（更新の目録とファイルを GET する。dll が部屋サーバーへの接続で使うのと同じ API。
 #                         OS の TLS とプロキシの設定をそのまま使い、クレートは足さない。`http_win`）
 [dependencies.windows-sys]
@@ -44,6 +48,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_DataExchange",
     "Win32_System_Console",
@@ -52,7 +57,14 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Globalization",
     "Win32_Networking_WinHttp",
+    "Win32_System_SystemInformation",
+    "Win32_System_Kernel",
+    "Wdk_Storage_FileSystem",
 ]
+
+[build-dependencies]
+# 配る exe のバージョン情報（.res）を作る。build.rs だけが使い、成果物には入らない（自作）。
+higanr_build_res = { path = "../build_res" }
 
 [dev-dependencies]
 # 検査だけ: 更新の目録に検査用の鍵で署名する（配る exe には入らない）。

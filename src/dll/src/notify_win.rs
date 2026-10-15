@@ -5,6 +5,8 @@
 //!   前面は奪わない。
 //! - `higanr_core::chime` で合成した音を `PlaySoundW` で鳴らす（メモリから、鳴り終わるまで待つ。約 0.9 秒。待つのは見張りのスレッドだけ）。
 //!
+//! 対戦の後に接続が切れた知らせ（`lost`）は音だけ（`higanr_core::chime_lost`。約 0.3 秒）。ゲームのスレッドが起こした短いスレッドが鳴らす。
+//!
 //! 他のプロセスのウィンドウには触らない。
 
 use core::ffi::c_void;
@@ -13,7 +15,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, GW_OWNER,
+    EnumWindows, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GW_OWNER,
     GetForegroundWindow, GetWindow, GetWindowThreadProcessId, IsWindowVisible,
 };
 use windows_sys::core::BOOL;
@@ -55,7 +57,11 @@ pub(crate) fn game_window() -> Option<HWND> {
     (!s.found.is_null()).then_some(s.found)
 }
 
-/// ウィンドウを点滅させる（前面に来るまで）。前面にあれば点滅しない。本ログへの 1 句を返す。
+/// タスクバーのボタンだけを前面に来るまで点滅させる。タイトルバーと枠（`FLASHW_CAPTION`）は点滅させない。
+/// 枠の点滅はアクティブの行き来に見え、パッドで遊ぶと前面に来ないまま点滅し続ける。
+const FLASH_FLAGS: u32 = FLASHW_TRAY | FLASHW_TIMERNOFG;
+
+/// タスクバーを点滅させる（前面に来るまで）。前面にあれば点滅しない。本ログへの 1 句を返す。
 fn flash() -> &'static str {
     let Some(hwnd) = game_window() else {
         return "ゲームのウィンドウが見つからないので点滅しなかった";
@@ -67,7 +73,7 @@ fn flash() -> &'static str {
     let info = FLASHWINFO {
         cbSize: size_of::<FLASHWINFO>() as u32,
         hwnd,
-        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        dwFlags: FLASH_FLAGS,
         uCount: 0,
         dwTimeout: 0,
     };
@@ -77,21 +83,32 @@ fn flash() -> &'static str {
 }
 
 fn chime() -> &'static str {
-    let wav = higanr_core::chime::connected_wav();
+    if play(&higanr_core::chime::connected_wav()) {
+        "音を鳴らした"
+    } else {
+        "音を鳴らせなかった（PlaySoundW が 0 を返した）"
+    }
+}
+
+/// 合成した WAV を鳴り終わるまで鳴らす（呼んだスレッドが待つ）。鳴らせなければ false。
+fn play(wav: &[u8]) -> bool {
     // SAFETY: `SND_MEMORY` なので 1 つ目の引数は WAV の先頭（`SND_SYNC` で戻るのは鳴り終わった後なので `wav` は生きている）。
     // `SND_NODEFAULT` なので読めなくても既定の音は鳴らさない。
-    let ok = unsafe {
+    let r = unsafe {
         PlaySoundW(
             wav.as_ptr().cast::<u16>(),
             core::ptr::null_mut::<c_void>(),
             SND_MEMORY | SND_SYNC | SND_NODEFAULT,
         )
-    } != 0;
-    if ok {
-        "音を鳴らした"
-    } else {
-        "音を鳴らせなかった（PlaySoundW が 0 を返した）"
-    }
+    };
+    r != 0
+}
+
+/// 接続が切れた知らせの音。鳴り終わるまで待つので、ゲームのスレッドでは呼ばない。鳴らせなければ false。
+// 検査のビルドでは呼び手（`script_win::play_lost_chime`）が音を鳴らさずに数えるだけなので、呼ばれない。
+#[cfg_attr(test, allow(dead_code))]
+pub fn lost() -> bool {
+    play(&higanr_core::chime_lost::lost_wav())
 }
 
 /// 繋がった知らせ（点滅 → 音）。本ログの「ネットワークの外」の行へ足す文を返す。見張りのスレッドから 1 回だけ呼ぶ。
@@ -108,5 +125,13 @@ mod tests {
     #[test]
     fn a_process_without_windows_finds_none() {
         assert_eq!(game_window(), None);
+    }
+
+    #[test]
+    fn only_the_taskbar_flashes_until_the_window_comes_to_the_front() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::FLASHW_CAPTION;
+        assert_eq!(FLASH_FLAGS & FLASHW_CAPTION, 0);
+        assert_ne!(FLASH_FLAGS & FLASHW_TRAY, 0);
+        assert_ne!(FLASH_FLAGS & FLASHW_TIMERNOFG, 0);
     }
 }

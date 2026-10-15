@@ -14,7 +14,7 @@
 //! - **CHECK**: ゲームの乱数とライフが無いので、それまでに使った (1P, 2P) の列のダイジェスト（FNV-1a 64 bit。seg をまたいで続ける）の
 //!   下 16 bit を rng_state、次の 32 bit を rng_count に入れ、ライフは 0 にする（`higanr_core::check`）。
 //! - **いつ終えるか**: 全部の seg を終え、相手の BYE を受けてから `LINGER_MS` 待って終える。待つ間も前の seg のバックアップの返信と、相手の
-//!   PING への BYE の返しを続ける。相手が 10 秒黙れば（`liveness` の Dead）それでも終える。`max_ms`（`--max-sec`）を過ぎたら途中でも
+//!   PING への BYE の返しを続ける。相手が 60 秒黙れば（`liveness` の Dead）それでも終える。`max_ms`（`--max-sec`）を過ぎたら途中でも
 //!   終え、繋がっていれば BYE(終了) を 1 通出す。
 //! - **繋がるまで待つ長さ**（`RunOpts::wait_ms`。`--wait-sec`）: 接続の手順が時間切れ（10 秒）になってもその長さまではセッションが作り直す
 //!   （`Link::set_retry_window`）。相手の花映塚の起動が遅い回のため。
@@ -85,7 +85,7 @@ use higanr_core::wire::{self, Datagram};
 use higanr_core::wire::{ByeReason, Check, FormatValue, Record, Seat, Select, Step, StepKind};
 
 use crate::fault::{Fate, FaultConfig, FaultCounts, Faults, Relabel};
-use crate::menu_plan::{FrameIn, MenuPlan, Runner, sim_align_press};
+use crate::menu_plan::{FrameIn, MenuPlan, Runner, SimCursor, sim_align_press};
 use crate::spectate_host::{self, SpectateHostOpts, SpectateHostReport, SpectateSide};
 
 const US_PER_SEC: u64 = 1_000_000;
@@ -251,13 +251,13 @@ pub struct FollowCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
     /// 全部の seg を終えた（付いていく形では、相手の BYE(終了) を受けて終えた）。`peer_bye` は相手の BYE を
-    /// 受けたか（false なら相手が 10 秒黙った）。
+    /// 受けたか（false なら相手が 60 秒黙った）。
     Finished { peer_bye: bool },
     /// 接続の手順でやめた。
     HandshakeFailed(handshake::FailReason),
     /// 終える前に、相手から BYE(終了) 以外の BYE を受けた。
     PeerBye(ByeReason),
-    /// 終える前に、相手が 10 秒黙った（BYE(切断) を送った）。
+    /// 終える前に、相手が 60 秒黙った（BYE(切断) を送った）。
     Dead,
     /// CHECK が合わなかった（BYE(ズレ検出) を送った）。
     Desync { local: Check, remote: Check },
@@ -674,6 +674,8 @@ struct MenuRun {
     difficulty: Option<u8>,
     /// 直前の相手の入力ワード（変わったところだけ記録する）。
     last_remote: u16,
+    /// 自分の席のキャラのカーソル（MENU の末尾で知らせる）。
+    cursor: SimCursor,
 }
 
 struct Sim<'c> {
@@ -1034,6 +1036,7 @@ impl Sim<'_> {
                 model: Model::new(SCREEN_DIFFICULTY),
                 difficulty: None,
                 last_remote: 0,
+                cursor: SimCursor::new(seat_index(e.seat)),
             }),
             sp_on: self.spectate.is_some() && e.role == Role::Host,
             sp_q: Vec::new(),
@@ -1316,6 +1319,10 @@ impl Sim<'_> {
             want.press = (!dirs_up).then_some(a);
         }
         let word = want.word & cfg.word_mask & !TRANSITION_BITS;
+        // MENU の末尾の自分の席の位置（このフレームの語で動かす前の位置。ゲームも入力の地点では前の tick までの結果を見せる）。
+        let (own_screen, own_cursor) = m.cursor.report(screen);
+        c.set_menu_cursor(own_screen, own_cursor);
+        m.cursor.on_word(screen, word);
         let step_before = c.selection().step();
         let carried = m.difficulty;
         let model = &mut m.model;
@@ -1347,6 +1354,9 @@ impl Sim<'_> {
         Self::spec_menu(c, p, word, fo.remote);
         if let Some(st) = fo.apply {
             rep.presses.push(st);
+            if let Some(m) = p.menu.as_mut() {
+                m.cursor.on_applied(&st, seat);
+            }
             if st.kind == StepKind::Format {
                 // 対戦の形式の切替（dll の相手が押した）: セッションの形式を替える。観戦の流れには積まない。
                 if let Some(v) = FormatValue::unpack(st.value) {
@@ -1668,7 +1678,7 @@ impl Sim<'_> {
 
     /// 終わり方を決め、状態機械の数をコピーする。ズレ・選択の食い違い・打ち切りでは、BYE をここで 1 通出す。
     ///
-    /// 打ち切り（`End::Deadline`）の BYE は理由を終了（`Finished`）にする。黙って終えると、dll は 10 秒の沈黙を待って「切断」と見るので、
+    /// 打ち切り（`End::Deadline`）の BYE は理由を終了（`Finished`）にする。黙って終えると、dll は 60 秒の沈黙を待って「切断」と見るので、
     /// 「peer_sim が打ち切った」と「ネットワークが切れた」が分けられない。取消は選択の食い違いと台本の中止に使っているので採らず、新しい理由の値も
     /// 足さない（プロトコルのバージョンに触るため）。
     fn finish(mut self, end: End) -> Report {

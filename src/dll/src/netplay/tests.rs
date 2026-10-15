@@ -530,7 +530,7 @@ fn nothing_goes_out_before_the_stop_point_and_the_hold_feeds_zero() {
 }
 
 #[test]
-fn a_remote_word_outside_the_send_mask_is_not_fed() {
+fn a_remote_word_outside_the_send_mask_is_not_fed_but_ctrl_is() {
     let (mut a, mut b, clock) = pair(CheckSource::InputDigest, games(60, 1, 1));
     for _ in 0..600 {
         clock.set(clock.get() + FRAME_US);
@@ -549,15 +549,43 @@ fn a_remote_word_outside_the_send_mask_is_not_fed() {
     let applied = Applied {
         frame: 999,
         local: 0x0002,
-        remote: 0x1800 | 0x0041,
+        remote: 0x1900 | 0x0041,
         switched_to: None,
     };
     let act = a.np.play(applied, &mut a.g, &mut a.net);
     match act {
-        Action::Played(r) => assert_eq!((r.p1, r.p2), (0x0041, 0x0002)),
+        Action::Played(r) => assert_eq!((r.p1, r.p2), (0x0141, 0x0002)),
         other => panic!("{other:?}"),
     }
     a.g.after(act, &mut a.np);
+}
+
+/// 試合の語の Ctrl（`0x0100`）は、取るときも相手から受けたときも両席・両側で残り、Enter（`0x1000`）は落ちる。
+/// 片側だけ落とすと INPUT の比べ（CHECK）がずれて止まるので、止まらないことも見る。
+#[test]
+fn ctrl_in_the_match_word_reaches_both_seats_on_both_sides_and_enter_does_not() {
+    let (mut ga, mut gb) = games(60, 1, 1);
+    ga.local_or = 0x1100;
+    gb.local_or = 0x1100;
+    let (mut a, mut b, clock) = pair(CheckSource::InputDigest, (ga, gb));
+    run(&mut a, &mut b, &clock, 20_000);
+    for (who, s) in [("A", &a), ("B", &b)] {
+        let ctrl_frames =
+            s.g.recs
+                .iter()
+                .filter(|r| r.p1 & 0x0100 != 0 && r.p2 & 0x0100 != 0)
+                .count();
+        assert!(
+            ctrl_frames > 30,
+            "{who}: Ctrl が両席に残った行 {ctrl_frames}"
+        );
+        for r in &s.g.recs {
+            assert_eq!((r.p1 | r.p2) & 0x1000, 0, "{who}: Enter が残った {r:?}");
+        }
+        let st = crate::net_watch::NetStatus::new();
+        st.publish(&s.np);
+        assert_eq!(st.snapshot().desync, None, "{who}");
+    }
 }
 
 #[test]
@@ -862,11 +890,15 @@ fn run_pick(a: &mut Side, b: &mut Side, clock: &std::cell::Cell<u64>, max_ticks:
             // 推奨値は最初の取得で渡す —— があればそれ）。印は付けない。
             for (h, s) in [(ha, &*a), (hb, &*b)] {
                 let c = s.np.connected().unwrap();
-                let rtt = c.liveness().rtt_ms();
-                assert!(h.recommend.is_some() && h.rtt_ms == rtt);
+                let live = c.liveness();
+                assert!(h.recommend.is_some() && h.rtt_ms == live.rtt_ms());
                 assert_eq!(
                     h.recommend,
-                    delay_pick::recommend(higanr_core::wire::Mode::Delay, rtt)
+                    delay_pick::recommend_with_max(
+                        higanr_core::wire::Mode::Delay,
+                        live.rtt_median_us().map(|us| us / 1_000).or(live.rtt_ms()),
+                        live.rtt_max_ms()
+                    )
                 );
                 let want =
                     s.np.delay_pick()
@@ -2056,4 +2088,312 @@ fn the_offered_seat_reaches_the_link() {
         SeatAsk::plain(Seat::P2),
         "添えなければ ini の host_seat"
     );
+}
+
+// ---- 相手を待ち続けたとき（知らせ・Esc・時間切れ・止める地点の時間切れ） ----
+
+/// A は 1 フレームずつ回し、B は手入れ（受信・PING・PONG）だけを回す（B のゲームスレッドは動いているがマッチを進めない）。
+fn tick_a_while_b_only_tends(a: &mut Side, b: &mut Side, clock: &std::cell::Cell<u64>) -> Action {
+    clock.set(clock.get() + FRAME_US);
+    let act = a.g.do_frame(&mut a.np, &mut a.net);
+    b.np.tend(&mut b.net);
+    act
+}
+
+#[test]
+fn a_peer_that_stays_alive_but_sends_no_input_is_cut_after_the_limit_with_a_notice_first() {
+    let (mut a, mut b, clock, _) = mid_match(2);
+    let mut stall_at_ms = None;
+    let mut shown_at_run = None;
+    // 切れるまでの tick の数は時計の進み方（1 tick で FRAME_US 以上）で変わるので、上限は FRAME_US で割った数に余白を足して置く。
+    let max_ticks = u64::from(peer_wait::LIMIT_MS) * 1_000 / FRAME_US + 2_000;
+    for _ in 0..max_ticks {
+        let before = clock.get();
+        let act = tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+        if a.np.phase() == Phase::Ended {
+            let waited = (clock.get() / 1_000) - stall_at_ms.expect("止まらないまま切れた");
+            assert!(
+                (u64::from(peer_wait::LIMIT_MS)..u64::from(peer_wait::LIMIT_MS) + 50)
+                    .contains(&waited),
+                "待った {waited} ms で切れた（前の tick は {} ms）",
+                (before / 1_000) - stall_at_ms.unwrap()
+            );
+            break;
+        }
+        if act == Action::RenderOnly && stall_at_ms.is_none() {
+            stall_at_ms = Some(clock.get() / 1_000);
+        }
+        if a.np.peer_wait_shown() && shown_at_run.is_none() {
+            shown_at_run = Some(a.np.stall_run);
+        }
+    }
+    assert_eq!(
+        shown_at_run,
+        Some(peer_wait::NOTICE_TICKS),
+        "知らせの出た時"
+    );
+    assert_eq!(
+        a.np.end(),
+        Some(End::Closed(ByeReason::Disconnected)),
+        "相手の生存（PING）が届いているのに沈黙で切れた"
+    );
+    assert_eq!(a.np.stats().peer_wait_cuts, 1);
+    assert!(!a.np.peer_wait_shown(), "切った後も知らせが残った");
+    for _ in 0..10 {
+        tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+    }
+    assert_eq!(b.np.end(), Some(End::PeerBye(ByeReason::Disconnected)));
+}
+
+#[test]
+fn esc_cuts_only_while_the_notice_is_shown_and_after_it_was_seen_up() {
+    let (mut a, mut b, clock, _) = mid_match(2);
+    for _ in 0..1_000 {
+        tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+        if a.np.stall_run == 60 {
+            a.g.esc_down = true;
+        }
+        if a.np.peer_wait_shown() {
+            break;
+        }
+    }
+    assert!(a.np.peer_wait_shown(), "知らせが出ない");
+    assert!(a.g.esc_down, "検査の前提: 押したまま知らせが出た");
+    for _ in 0..5 {
+        assert_eq!(
+            tick_a_while_b_only_tends(&mut a, &mut b, &clock),
+            Action::RenderOnly
+        );
+    }
+    assert_eq!(a.np.end(), None, "押したままの Esc で切った");
+    a.g.esc_down = false;
+    tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+    assert_eq!(a.np.end(), None, "離しただけで切った");
+    a.g.esc_down = true;
+    let act = tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+    assert_eq!(act, Action::RenderOnly, "Esc の tick はそのまま描画だけ");
+    assert_eq!(a.np.end(), Some(End::Closed(ByeReason::Cancelled)));
+    assert_eq!(a.np.stats().peer_wait_esc, 1);
+    assert_eq!(
+        tick_a_while_b_only_tends(&mut a, &mut b, &clock),
+        Action::Local,
+        "切った後はローカルの入力（Esc がゲームへ届く）"
+    );
+    for _ in 0..10 {
+        tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+    }
+    assert_eq!(b.np.end(), Some(End::PeerBye(ByeReason::Cancelled)));
+}
+
+#[test]
+fn the_notice_goes_away_and_nothing_is_cut_when_the_peer_comes_back() {
+    let (mut a, mut b, clock, _) = mid_match(2);
+    // B は丸ごと止める（何も送らない。届いたものは受けのリングが溢れた形で捨てる）。知らせが出るまでは沈黙の 60 秒より短い。
+    let mut buf = [0u8; MAX_DATAGRAM];
+    for _ in 0..1_000 {
+        clock.set(clock.get() + FRAME_US);
+        a.g.do_frame(&mut a.np, &mut a.net);
+        while b.net.recv(&mut buf).is_some() {}
+        if a.np.peer_wait_shown() {
+            break;
+        }
+    }
+    assert!(a.np.peer_wait_shown(), "知らせが出ない");
+    for _ in 0..30 {
+        tick_both(&mut a, &mut b, &clock);
+    }
+    assert!(!a.np.peer_wait_shown(), "相手が戻っても知らせが残った");
+    assert_eq!((a.np.end(), b.np.end()), (None, None));
+    assert_eq!(a.np.phase(), Phase::Lockstep);
+}
+
+#[test]
+fn the_stop_point_closes_at_the_peer_wait_limit_even_when_the_peer_is_alive() {
+    let (mut ga, mut gb) = games(300, 1, 1);
+    ga.menu_before_decide = 20;
+    gb.menu_before_decide = u32::MAX;
+    let (mut a, mut b, clock) = pair(CheckSource::InputDigest, (ga, gb));
+    // 1 tick 10 ms で回す。止める地点の待ちは tick の数でなく時間（`peer_wait::LIMIT_MS`）で切れる。
+    const TICK_US: u64 = 10_000;
+    let limit_ticks = u64::from(peer_wait::LIMIT_MS) * 1_000 / TICK_US;
+    let mut shown_at = None;
+    let mut ended_at = None;
+    for k in 0..limit_ticks + 1_000 {
+        clock.set(clock.get() + TICK_US);
+        a.g.do_frame(&mut a.np, &mut a.net);
+        b.g.do_frame(&mut b.np, &mut b.net);
+        if a.np.peer_wait_shown() && shown_at.is_none() {
+            shown_at = Some(a.np.stats().hold_frames);
+        }
+        if a.np.phase() == Phase::Ended {
+            ended_at = Some(k);
+            break;
+        }
+    }
+    assert!(ended_at.is_some(), "止める地点が閉じない");
+    assert_eq!(
+        shown_at,
+        Some(u64::from(peer_wait::NOTICE_TICKS)),
+        "知らせの出た時"
+    );
+    assert_eq!(a.np.end(), Some(End::Closed(ByeReason::Disconnected)));
+    let held = a.np.stats().hold_frames;
+    assert!(
+        (limit_ticks..limit_ticks + 5).contains(&held),
+        "閉じたフレーム {held}（見込み {limit_ticks}）"
+    );
+    assert_eq!(a.np.stats().peer_wait_cuts, 1);
+    for _ in 0..10 {
+        clock.set(clock.get() + TICK_US);
+        a.g.do_frame(&mut a.np, &mut a.net);
+        b.g.do_frame(&mut b.np, &mut b.net);
+    }
+    assert_eq!(b.np.end(), Some(End::PeerBye(ByeReason::Disconnected)));
+}
+
+// ---- 対戦の後に接続が終わったときの戻り道の理由（`NetPlay::take_lost`）----
+
+fn fresh_np() -> NetPlay {
+    let (a, _b, _clock) = pair(CheckSource::InputDigest, games(60, 1, 1));
+    a.np
+}
+
+#[test]
+fn take_lost_names_the_cause_once_and_only_after_the_match_was_made() {
+    use higanr_core::return_flow::Why;
+    let stuck = Step {
+        step: 1,
+        kind: StepKind::Decide,
+        value: 0,
+        screen: 8,
+    };
+    let bad = BadValue {
+        field: "キャラ",
+        value: 99,
+    };
+    let local = Check {
+        seg: 0,
+        frame: 0,
+        rng_state: 0,
+        rng_count: 0,
+        life_1p: 0,
+        life_2p: 0,
+    };
+    for (phase, end, esc, want) in [
+        (
+            Phase::Lockstep,
+            End::PeerBye(ByeReason::Finished),
+            0,
+            Some(Why::PeerLeft),
+        ),
+        (
+            Phase::Selecting,
+            End::PeerBye(ByeReason::Cancelled),
+            0,
+            Some(Why::PeerLeft),
+        ),
+        (
+            Phase::Loading,
+            End::PeerBye(ByeReason::Disconnected),
+            0,
+            Some(Why::Lost),
+        ),
+        (Phase::Holding, End::Dead, 0, Some(Why::Lost)),
+        (
+            Phase::Lockstep,
+            End::Closed(ByeReason::Disconnected),
+            0,
+            Some(Why::Lost),
+        ),
+        (
+            Phase::Lockstep,
+            End::Closed(ByeReason::Cancelled),
+            0,
+            Some(Why::Lost),
+        ),
+        (
+            Phase::Lockstep,
+            End::Closed(ByeReason::Cancelled),
+            1,
+            Some(Why::SelfCut),
+        ),
+        (Phase::Selecting, End::MenuStuck(stuck), 0, Some(Why::Lost)),
+        (Phase::Holding, End::BadSelect(bad), 0, Some(Why::Lost)),
+        // 戻さない: 台本の終わりの BYE(終了)・同期ズレ（止めて Esc を待つ）・成立の前。
+        (Phase::Lockstep, End::Closed(ByeReason::Finished), 0, None),
+        (Phase::Lockstep, End::PeerBye(ByeReason::Desync), 0, None),
+        (
+            Phase::Lockstep,
+            End::Desync {
+                local,
+                remote: local,
+            },
+            0,
+            None,
+        ),
+        (Phase::Selecting, End::PeerBye(ByeReason::Desync), 0, None),
+        (
+            Phase::Unconnected,
+            End::PeerBye(ByeReason::Cancelled),
+            0,
+            None,
+        ),
+        (Phase::Unconnected, End::Dead, 0, None),
+    ] {
+        let mut np = fresh_np();
+        np.phase = phase;
+        np.stats.peer_wait_esc = esc;
+        np.finish(end);
+        assert_eq!(np.take_lost(), want, "{phase:?} {end:?} Esc {esc}");
+        assert_eq!(np.take_lost(), None, "{phase:?} {end:?}: 2 回目");
+    }
+    // 終わった後の 2 度目の終わりで理由を作り直さない。
+    let mut np = fresh_np();
+    np.phase = Phase::Lockstep;
+    np.finish(End::Dead);
+    assert_eq!(np.take_lost(), Some(Why::Lost));
+    np.finish(End::PeerBye(ByeReason::Cancelled));
+    assert_eq!(np.take_lost(), None);
+}
+
+#[test]
+fn save_and_quit_and_a_desync_stop_give_no_reason_to_return() {
+    use higanr_core::return_flow::Why;
+    const F: u32 = 70;
+    let (mut ga, mut gb) = games(F, 1, 1);
+    ga.leave_req = REQ_SAVE_AND_QUIT;
+    gb.leave_req = REQ_SAVE_AND_QUIT;
+    let (mut a, mut b, clock) = pair(CheckSource::InputDigest, (ga, gb));
+    run_until_menu(&mut a, &mut b, &clock, 20_000);
+    for s in [&mut a, &mut b] {
+        assert_eq!(s.np.phase(), Phase::Ended, "検査の前提");
+        assert_eq!(
+            s.np.take_lost(),
+            None,
+            "{:?}: 自分の保存して終了で戻す",
+            s.np.end()
+        );
+    }
+    let (mut a, mut b, _clock) = stopped_pair();
+    for s in [&mut a, &mut b] {
+        assert_eq!(s.np.take_lost(), None, "同期ズレで戻す");
+    }
+    // 試合の途中で相手が抜けた: 抜けた側は自分から閉じた BYE(取消)、残った側は相手の BYE。
+    let (mut a, mut b, clock) = pair(CheckSource::InputDigest, games(600, 1, 1));
+    for _ in 0..2_000 {
+        tick_both(&mut a, &mut b, &clock);
+        if a.g.recs.len() > 40 {
+            break;
+        }
+    }
+    assert_eq!(a.np.phase(), Phase::Lockstep, "検査の前提");
+    a.np.close(ByeReason::Cancelled);
+    for _ in 0..300 {
+        tick_both(&mut a, &mut b, &clock);
+        if b.np.phase() == Phase::Ended {
+            break;
+        }
+    }
+    assert_eq!(b.np.take_lost(), Some(Why::PeerLeft));
+    assert_eq!(a.np.take_lost(), Some(Why::Lost));
 }

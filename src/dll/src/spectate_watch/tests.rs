@@ -138,6 +138,14 @@ fn every_end_has_its_own_code_and_a_word() {
 }
 
 #[test]
+fn the_watchers_stop_point_wait_outlasts_the_players_wait_by_a_margin() {
+    let player_ticks = u64::from(peer_wait::LIMIT_MS) * 60 / 1_000;
+    let watcher_ticks = u64::from(HOLD_LIMIT_TICKS);
+    assert!(watcher_ticks > player_ticks, "対戦者より先に観戦者が切れる");
+    assert_eq!(watcher_ticks - player_ticks, 600, "余白は 10 秒（60 fps）");
+}
+
+#[test]
 fn shot_pacer_asks_on_phase_change_screen_change_and_every_600_ticks_in_match() {
     use higanr_core::script::{SETTLE, TRANSITION};
     let mut p = ShotPacer::default();
@@ -380,4 +388,105 @@ fn a_watcher_asks_to_skip_the_save_screen_only_when_its_game_leaves_by_save_and_
         "次の試合の保存して終了で頼まない"
     );
     assert!(g.fed.is_empty(), "終わった後に feed した");
+}
+
+/// マッチの途中で語が届かず止まったら、次に使う前に溜まりが余裕（3）に戻るのを待つ。止まっていなければ、溜まりが 1 でも待たない。
+#[test]
+fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
+    use crate::netplay::fake::FakeNet;
+    use crate::netplay::{Action, Game, Phase};
+    struct InMatch;
+    impl Game for InMatch {
+        fn scenes(&mut self) -> (u32, u32) {
+            (SCENE_MATCH, 0)
+        }
+        fn local_input(&mut self, _s: higanr_core::wire::Seat) -> u16 {
+            0
+        }
+        fn feed(&mut self, _i: u32, _w: u16) {}
+        fn own_select(
+            &mut self,
+            _s: higanr_core::wire::Seat,
+            _r: higanr_core::lockstep::Role,
+        ) -> higanr_core::wire::Select {
+            unreachable!()
+        }
+        fn apply_agreed(
+            &mut self,
+            _p: higanr_core::wire::Seat,
+            _a: &higanr_core::selection::Agreed,
+        ) -> Result<(), crate::netplay::BadValue> {
+            unreachable!()
+        }
+        fn write_charge(&mut self, _p1: u8, _p2: u8) -> bool {
+            true
+        }
+        fn check_values(&mut self) -> (u16, u32, u8, u8) {
+            (0, 0, 0, 0)
+        }
+    }
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], 41_303));
+    let h = std::net::SocketAddr::from(([127, 0, 0, 1], 47_003));
+    let (mut net, _other, _clock) = FakeNet::pair(a, h, 0);
+    let mut wp = WatchPlay::new(
+        Arc::new(WatchSlot::new()),
+        WatchConfig {
+            // 語を待たずに止まる（描画だけのフレームにする）。
+            wait_budget_us: 0,
+            margin_frames: 3,
+            require_net_selection: true,
+        },
+    );
+    wp.set_phase_for_test(Phase::Lockstep);
+    wp.started = true;
+    let frame = |f: u32| {
+        Some((
+            f,
+            Record::Frame {
+                frame: f,
+                p1: 0,
+                p2: 0,
+            },
+        ))
+    };
+    let mut g = InMatch;
+    // 止まらずに続くなら、溜まり 1 でも使う。
+    wp.look[0] = frame(0);
+    wp.test_backlog = Some(1);
+    assert!(matches!(
+        wp.dispatch(&mut g, &mut net, false),
+        Action::Played(_)
+    ));
+    // 語が無くて止まった。
+    wp.test_backlog = None;
+    assert_eq!(wp.dispatch(&mut g, &mut net, false), Action::RenderOnly);
+    assert_eq!(wp.stats().stalls, 1);
+    // 1 つ届いても、余裕まで溜まるのを待つ。
+    wp.look[0] = frame(1);
+    wp.test_backlog = Some(1);
+    assert_eq!(wp.dispatch(&mut g, &mut net, false), Action::RenderOnly);
+    wp.test_backlog = Some(2);
+    assert_eq!(wp.dispatch(&mut g, &mut net, false), Action::RenderOnly);
+    assert_eq!(wp.stats().refill_ticks, 2);
+    wp.test_backlog = Some(3);
+    assert!(matches!(
+        wp.dispatch(&mut g, &mut net, false),
+        Action::Played(_)
+    ));
+    // 戻った後は、また溜まり 1 でも使う。
+    wp.look[0] = frame(2);
+    wp.test_backlog = Some(1);
+    assert!(matches!(
+        wp.dispatch(&mut g, &mut net, false),
+        Action::Played(_)
+    ));
+    assert_eq!(wp.stats().refill_ticks, 2);
+    let st = WatchStatus::new();
+    st.publish(&wp);
+    assert!(
+        st.text()
+            .contains("止まった後に溜まりが戻るのを待った描画だけのフレーム 2"),
+        "{}",
+        st.text()
+    );
 }

@@ -1,7 +1,7 @@
 //! 花映塚の th09.exe の場所を、初回だけ人に選ばせて覚える（`--game` をリンク先に足させる方式は不慣れな人には難しいため）。
 //!
-//! 判断だけをここに置き、ウィンドウ・ファイル・画面は `Host` の向こうへ出す。覚えるファイル `game_path.txt` は HiganRTool.exe と
-//! 同じフォルダ（花映塚のフォルダの外）に置き、中身は th09.exe のフルパス 1 行。`--game` を付けた起動は読み書きしない。
+//! 判断だけをここに置き、ウィンドウ・ファイル・画面は `Host` の向こうへ出す。覚える場所は ini の `[loader] game`（th09.exe のフルパス）。
+//! 以前の版の `game_path.txt` は起動のとき ini へ移して消す。`--game` を付けた起動は読み書きしない。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,12 +11,16 @@ use higanr_core::pe::{self, Ident, IdentField, TH09_V150A};
 
 use crate::ui_lang::by_lang;
 
-pub const SAVED_FILE: &str = "game_path.txt";
+/// 以前の版が th09.exe の場所を覚えていたファイル（HiganRTool.exe と同じフォルダ）。今は読まず、起動のとき ini へ移して消す。
+pub const LEGACY_FILE: &str = "game_path.txt";
+/// 覚える場所の ini の節とキー。
+pub const INI_SECTION: &str = "loader";
+pub const INI_KEY: &str = "game";
 
 pub const GAME_EXE: &str = "th09.exe";
 
 pub const DIALOG_TITLE: Tx = Tx {
-    ja: "花映塚のフォルダを選んでください（th09.exe が入っているフォルダ）",
+    ja: "花映塚のフォルダを選んでください（th09.exeが入っているフォルダ）",
     en: "Choose the Touhou 9 folder (the folder that contains th09.exe)",
 };
 
@@ -46,8 +50,8 @@ impl PickError {
             .to_string(),
             PickError::DialogFailed(why) => by_lang!(
                 lang,
-                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文をこの道具を渡してくれた人に送ってください。",
-                en: "Could not open the folder picker ({why}). Nothing was started. Send this message to the person who gave you this tool."
+                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文と、logsフォルダのファイルを添えて、GitHubのIssuesで知らせてください（https://github.com/Mako-th/HiganRTool/issues）。",
+                en: "Could not open the folder picker ({why}). Nothing was started. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with this message and the files in the logs folder."
             ),
         }
     }
@@ -96,15 +100,21 @@ pub fn parse_saved(text: &str) -> Option<PathBuf> {
     p.is_absolute().then_some(p)
 }
 
+/// ini の `game` に書く値（UTF-8 にできないパスは書けないので `None`）。
 pub fn saved_text(exe: &Path) -> Option<String> {
-    exe.to_str().map(|s| format!("{s}\r\n"))
+    exe.to_str().map(str::to_string)
+}
+
+/// 以前の版のファイル（`LEGACY_FILE`）の中身を、ini に書く値にする（引き継ぎ用）。
+pub fn parse_legacy(text: &str) -> Option<String> {
+    parse_saved(text).and_then(|p| saved_text(&p))
 }
 
 /// 食い違った欄の名前は原因の切り分けに使うのでそのまま出す。
 pub fn ident_mismatch_text(fields: &[IdentField], lang: Lang) -> String {
     by_lang!(
         lang,
-        ja: "選んだ exe が東方花映塚 ver.1.50a の th09.exe と一致しません。花映塚の th09.exe を選んでいるか（custom.exe や vpatch.exe ではないか）、ver.1.50a の修正パッチを当ててあるかを確かめてください（食い違った欄: {fields:?}）",
+        ja: "選んだexeが東方花映塚ver.1.50aのth09.exeと一致しません。花映塚のth09.exeを選んでいるか（custom.exeやvpatch.exeではないか）、ver.1.50aの修正パッチを当ててあるかを確かめてください（食い違った欄: {fields:?}）",
         en: "The chosen exe does not match th09.exe of Touhou 9 ver.1.50a. Check that you chose th09.exe of Touhou 9 (not custom.exe or vpatch.exe) and that the ver.1.50a patch is applied (mismatched fields: {fields:?})"
     )
 }
@@ -153,7 +163,7 @@ fn ident_details_against(path: &Path, bytes: &[u8], want: &Ident<'_>, lang: Lang
             let entry_len = want.entry_bytes.len();
             by_lang!(
                 lang,
-                ja: "読んだ値: TimeDateStamp 0x{stamp:08X}、.text の SizeOfRawData {text}、入口の先頭 {entry_len} バイト {entry}",
+                ja: "読んだ値: TimeDateStamp 0x{stamp:08X}、.textのSizeOfRawData {text}、入口の先頭 {entry_len} バイト {entry}",
                 en: "Value read: TimeDateStamp 0x{stamp:08X}, .text SizeOfRawData {text}, first {entry_len} bytes of the entry {entry}"
             )
         }
@@ -162,7 +172,7 @@ fn ident_details_against(path: &Path, bytes: &[u8], want: &Ident<'_>, lang: Lang
             let head = hex(&bytes[..head_len]);
             by_lang!(
                 lang,
-                ja: "読んだ値: 32bit の PE として読めません（{e:?}）。ファイルの先頭 {head_len} バイト {head}",
+                ja: "読んだ値: 32bitのPEとして読めません（{e:?}）。ファイルの先頭 {head_len} バイト {head}",
                 en: "Value read: not readable as a 32-bit PE ({e:?}). First {head_len} bytes of the file: {head}"
             )
         }
@@ -171,7 +181,7 @@ fn ident_details_against(path: &Path, bytes: &[u8], want: &Ident<'_>, lang: Lang
     let (entry_len, entry) = (want.entry_bytes.len(), hex(want.entry_bytes));
     lines.push(by_lang!(
         lang,
-        ja: "期待の値: TimeDateStamp 0x{stamp:08X}、.text の SizeOfRawData 0x{raw:08X}（{raw}）、入口の先頭 {entry_len} バイト {entry}",
+        ja: "期待の値: TimeDateStamp 0x{stamp:08X}、.textのSizeOfRawData 0x{raw:08X}（{raw}）、入口の先頭 {entry_len} バイト {entry}",
         en: "Expected: TimeDateStamp 0x{stamp:08X}, .text SizeOfRawData 0x{raw:08X} ({raw}), first {entry_len} bytes of the entry {entry}"
     ));
     lines
@@ -189,9 +199,15 @@ pub fn drive_relative_message(orig: &Path, lang: Lang) -> String {
     let orig = orig.display();
     by_lang!(
         lang,
-        ja: "--game の {orig} はドライブ名の後に \\ がありません。ドライブ名の後に \\ を足してください（例 D:\\Games\\th09\\th09.exe）",
+        ja: "--gameの{orig}はドライブ名の後に \\ がありません。ドライブ名の後に \\ を足してください（例 D:\\Games\\th09\\th09.exe）",
         en: "The --game path {orig} has no \\ after the drive name. Add a \\ after the drive name (e.g. D:\\Games\\th09\\th09.exe)"
     )
+}
+
+/// 覚えた場所がそのまま使える（`resolve` がウィンドウを出さずに返す）ときの exe。ウィンドウを出す前に、ゲームのフォルダを先に知るために使う。
+pub fn remembered_exe<H: Host>(h: &mut H) -> Option<PathBuf> {
+    let exe = h.read_saved().as_deref().and_then(parse_saved)?;
+    matches!(check_exe(h, &exe), Check::Ok).then_some(exe)
 }
 
 /// `force_dialog` は `--choose-game`（覚えた場所が使えてもウィンドウを出す）。
@@ -212,7 +228,7 @@ pub fn resolve<H: Host>(h: &mut H, force_dialog: bool) -> Result<PathBuf, PickEr
                 )),
                 Check::Unreadable(why) => h.say(&by_lang!(
                     lang,
-                    ja: "前に選んだ {shown} が読めません（{why}）。花映塚のフォルダを選び直してください。",
+                    ja: "前に選んだ{shown}が読めません（{why}）。花映塚のフォルダを選び直してください。",
                     en: "The previously chosen {shown} cannot be read ({why}). Choose the Touhou 9 folder again."
                 )),
                 Check::NotV150a(fields, _) => {
@@ -246,7 +262,7 @@ pub fn resolve<H: Host>(h: &mut H, force_dialog: bool) -> Result<PathBuf, PickEr
                 let shown = dir.display();
                 h.warn(&by_lang!(
                     lang,
-                    ja: "選んだフォルダに {GAME_EXE} がありません。花映塚の {GAME_EXE} が入っているフォルダを選び直してください。\n選んだフォルダ: {shown}",
+                    ja: "選んだフォルダに{GAME_EXE}がありません。花映塚の{GAME_EXE}が入っているフォルダを選び直してください。\n選んだフォルダ: {shown}",
                     en: "There is no {GAME_EXE} in the chosen folder. Choose the folder that contains th09.exe of Touhou 9.\nChosen folder: {shown}"
                 ))
             }
@@ -254,7 +270,7 @@ pub fn resolve<H: Host>(h: &mut H, force_dialog: bool) -> Result<PathBuf, PickEr
                 let shown = exe.display();
                 h.warn(&by_lang!(
                     lang,
-                    ja: "{shown} が読めません（{why}）。花映塚のフォルダを選び直してください。",
+                    ja: "{shown}が読めません（{why}）。花映塚のフォルダを選び直してください。",
                     en: "{shown} cannot be read ({why}). Choose the Touhou 9 folder again."
                 ))
             }
@@ -273,7 +289,7 @@ fn remember<H: Host>(h: &mut H, exe: &Path) {
     let lang = h.lang();
     let Some(text) = saved_text(exe) else {
         h.say(match lang {
-            Lang::Ja => "選んだ場所を覚えられませんでした（パスが UTF-8 にできません）。次の起動でも選んでください。",
+            Lang::Ja => "選んだ場所を覚えられませんでした（パスがUTF-8にできません）。次の起動でも選んでください。",
             Lang::En => "Could not remember the chosen location (the path cannot be turned into UTF-8). Choose it again next time.",
         });
         return;
@@ -461,6 +477,41 @@ mod tests {
         );
     }
 
+    /// 壊れたら落ちる: ウィンドウを出す覚え（無い・壊れた exe・別のバージョン）をそのまま使えると見なす、または使える覚えを見落とす。
+    /// ウィンドウを出す回に先に決めたゲームのフォルダと、実際に選ばれるフォルダが食い違うと、ログを置く場所の判断が狂う。
+    #[test]
+    fn a_remembered_exe_is_known_up_front_only_when_resolve_would_use_it_as_is() {
+        let (mut f, exe) = with_exe("X:\\game", good_exe());
+        f.saved = Some(format!("{}\r\n", exe.display()));
+        assert_eq!(remembered_exe(&mut f), Some(exe.clone()));
+        assert_eq!(resolve(&mut f, false), Ok(exe));
+        assert!(
+            f.asked_initial.is_empty(),
+            "先に分かるのにウィンドウを出した"
+        );
+
+        let mut none = Fake::default();
+        assert_eq!(remembered_exe(&mut none), None, "覚えが無い");
+        let mut gone = Fake {
+            saved: Some("X:\\gone\\th09.exe".into()),
+            ..Fake::default()
+        };
+        assert_eq!(remembered_exe(&mut gone), None, "exe が無い");
+        let mut other = Fake {
+            saved: Some("X:\\g\\th09.exe".into()),
+            ..Fake::default()
+        };
+        other
+            .files
+            .insert(p("X:\\g\\th09.exe"), synth_exe(1, 0x1000, &[0u8; 20]));
+        assert_eq!(remembered_exe(&mut other), None, "別のバージョン");
+        let mut relative = Fake {
+            saved: Some("th09.exe".into()),
+            ..Fake::default()
+        };
+        assert_eq!(remembered_exe(&mut relative), None, "相対パス");
+    }
+
     #[test]
     fn a_stale_remembered_exe_asks_again_and_says_why() {
         let mut f = Fake {
@@ -488,11 +539,22 @@ mod tests {
     }
 
     #[test]
+    fn the_old_game_path_file_becomes_the_ini_value() {
+        assert_eq!(
+            parse_legacy("\u{feff}C:\\a b\\th09.exe\r\nゴミ\r\n").as_deref(),
+            Some("C:\\a b\\th09.exe")
+        );
+        for bad in ["", "\n", "relative\\th09.exe\n", "   \n"] {
+            assert_eq!(parse_legacy(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn the_first_pick_is_remembered_as_the_full_exe_path() {
         let (mut f, exe) = with_exe("X:\\game", good_exe());
         f.answers.push_back(Answer::Folder(p("X:\\game")));
         assert_eq!(resolve(&mut f, false), Ok(exe.clone()));
-        assert_eq!(f.written, vec![format!("{}\r\n", exe.display())]);
+        assert_eq!(f.written, vec![exe.display().to_string()]);
         assert_eq!(parse_saved(&f.written[0]), Some(exe));
         assert!(f.said.iter().any(|l| l.contains("覚えました")));
     }
@@ -524,7 +586,7 @@ mod tests {
         f.answers.push_back(Answer::Folder(p("X:\\good")));
         assert_eq!(resolve(&mut f, false), Ok(exe));
         assert_eq!(f.warned.len(), 1);
-        assert!(f.warned[0].contains("選んだフォルダに th09.exe がありません"));
+        assert!(f.warned[0].contains("選んだフォルダにth09.exeがありません"));
         assert_eq!(f.asked_initial.len(), 2);
         assert_eq!(f.asked_initial[1], Some(p("X:\\empty")));
         assert_eq!(f.written.len(), 1, "失敗した選びを覚えた");
@@ -581,6 +643,11 @@ mod tests {
         let e = resolve(&mut f, false).unwrap_err();
         assert!(matches!(&e, PickError::DialogFailed(w) if w == "0x80004005"));
         assert!(e.describe(Lang::Ja).contains("0x80004005"));
+        for lang in [Lang::Ja, Lang::En] {
+            let t = e.describe(lang);
+            assert!(t.contains(higanr_core::issues::ISSUES_URL), "{t}");
+            assert!(!t.contains("渡して") && !t.contains("gave you"), "{t}");
+        }
         assert!(f.written.is_empty());
     }
 

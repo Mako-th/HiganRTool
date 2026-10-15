@@ -200,6 +200,16 @@ impl Shared {
     }
 }
 
+/// close の待ちの上限を置けなかったこと（Wine など）を、接続ごとでなく起動ごとに 1 回だけ本ログへ出す。
+fn log_close_timeout_once(code: u32) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::AcqRel) {
+        crate::main_log::push(format!(
+            "ルームの運び: WebSocket の close の待ちの上限を置けなかった（{code}）。既定の長さで続ける"
+        ));
+    }
+}
+
 fn recv_main(
     ep: Endpoint,
     proxy: Proxy,
@@ -220,6 +230,9 @@ fn recv_main(
             return;
         }
     };
+    if let Some(code) = ws.close_timeout_error() {
+        log_close_timeout_once(code);
+    }
     *shared.ws.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&ws));
     // 見張りが先に終えていた（繋ぐ途中の取りやめ）か、もう見張りがいない: 閉じて終わる。
     if shared.ended.load(Ordering::Acquire) || tx.send(Incoming::Upgraded).is_err() {
@@ -3240,6 +3253,34 @@ mod tests {
                 assert_eq!(*f.seen.client_closes.lock().unwrap(), vec![Some(1000)]);
             }
         }
+    }
+
+    /// Wine の winhttp は WebSocket のハンドルの close の待ちの設定を 12009 で断る。それでも開けて、送受信も閉じる処理もできる。
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn open_survives_a_refused_close_timeout() {
+        const ERROR_WINHTTP_INVALID_OPTION: u32 = 12009;
+        let f = FakeServer::start();
+        let ws = WebSocket::open_with_close_timeout(
+            &ep(&f, "wine"),
+            Proxy::Direct,
+            test_timeouts(),
+            4096,
+            |_, _| Err(ERROR_WINHTTP_INVALID_OPTION),
+        )
+        .expect("close の待ちを断られても開ける");
+        assert_eq!(ws.close_timeout_error(), Some(ERROR_WINHTTP_INVALID_OPTION));
+        assert!(matches!(ws.receive(4096), Ok(Received::Text(r)) if r.contains(r#""t":"room""#)));
+        assert_eq!(ws.send_text(higanr_core::room::PING_TEXT), Ok(()));
+        assert_eq!(
+            ws.receive(4096),
+            Ok(Received::Text(f.rules().pong_text.clone()))
+        );
+        assert_eq!(ws.close(CLOSE_NORMAL), Ok(()));
+
+        // 通常の経路は置けて、印が付かない。
+        let ws = open_ws(&f, "normal", test_timeouts());
+        assert_eq!(ws.close_timeout_error(), None);
     }
 
     #[test]

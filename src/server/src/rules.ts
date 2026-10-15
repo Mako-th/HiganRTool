@@ -109,6 +109,12 @@ export const WATCH_STALE_MS = 100 * 1000;
 export const WATCH_UNPOSTED_MS = 15 * 1000;
 /** 一覧の変化を観戦者へ送る最短の間隔（変化が続いても 1 秒に 1 回にまとめる。載せた人が連打して全員へ増幅されないため）。 */
 export const WATCH_BROADCAST_MIN_MS = 1000;
+/**
+ * 載せる口が WATCH_COUNT_WINDOW_MS のうちに送ってよい count の数（サーバーだけの値）。観戦者 10 人の出入りが重なっても
+ * 20 通ほどなので、それを越えるものは荒らしとして閉じる。送り直しは接続の回数の制限で縛られる。
+ */
+export const WATCH_COUNT_BURST = 30;
+export const WATCH_COUNT_WINDOW_MS = 10 * 1000;
 
 /** 一覧の 1 通の上限（バイト）。1 件 150 B 前後 × 100 件に余裕を足した値。 */
 export const WATCH_LIST_MAX_BYTES = 32 * 1024;

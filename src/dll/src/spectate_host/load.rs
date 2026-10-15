@@ -58,7 +58,7 @@ struct Report {
     /// 観戦の仕事の 1 周の長さ（µs）と、そのうち観戦者の便の処理の分（µs）。
     round_us: Vec<u64>,
     dgram_us: Vec<u64>,
-    /// 全観戦者が受けた量の合計（バイト）と秒。
+    /// 全観戦者が受けた量の合計（バイト）と、その秒（観戦者が終わりまで受けた時まで）。
     bytes: u64,
     secs: f64,
     /// 観戦者が記録を使えるまでの遅れ（µs。ホストのリングバッファへ積んでから。Frame の記録だけ）。
@@ -74,7 +74,9 @@ struct Report {
     snap: Snapshot,
 }
 
-fn run(n: usize, secs: u64) -> Report {
+/// `late` が 0 でなければ、観戦者が入る前に試合の頭からの記録を `late` 個積んでおく（遅れて入った観戦者が、全員そろって追いつきを
+/// 始める形）。
+fn run(n: usize, secs: u64, late: u32) -> Report {
     let peer = UdpSocket::bind(lo()).unwrap();
     let peer_addr = peer.local_addr().unwrap();
     let (mut net, rx) = net_udp::open(lo(), &[peer_addr]).unwrap();
@@ -92,16 +94,46 @@ fn run(n: usize, secs: u64) -> Report {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
-    let observers: Vec<Observer> = (0..n)
-        .map(|i| Observer::spawn(&p.code_text, Behavior::Normal, 0x200 + i as u64))
-        .collect();
-    while rx.spectate_snapshot().map_or(0, |s| s.host.joined) < n as u64 {
-        assert!(
-            Instant::now() < deadline,
-            "観戦者が {n} 人入らない: {:?}",
-            rx.spectate_snapshot()
-        );
-        std::thread::sleep(Duration::from_millis(1));
+    let frame_rec = |k: u32| Record::Frame {
+        frame: k,
+        p1: (k as u16) & 0xFF,
+        p2: (k as u16).wrapping_mul(3) & 0xFF,
+    };
+    assert!(ring.push(Record::Seg { seg: 0 }));
+    if late > 0 {
+        // ゲームのリングバッファ（4,096。溢れると次の `Seg` まで受けない）を溢れさせないよう、2,000 ずつ積んで、受信スレッドが
+        // ホストへ移し終えるのを待つ。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut k = 0;
+        while k < late {
+            let end = (k + 2_000).min(late);
+            for f in k..end {
+                assert!(ring.push(frame_rec(f)), "ゲームのリングバッファが溢れた");
+            }
+            k = end;
+            while rx.spectate_snapshot().map_or(0, |s| s.host.pushed) < u64::from(k) + 1 {
+                assert!(Instant::now() < deadline, "積んだ記録がホストに入らない");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    let spawn = || -> Vec<Observer> {
+        (0..n)
+            .map(|i| Observer::spawn(&p.code_text, Behavior::Normal, 0x200 + i as u64))
+            .collect()
+    };
+    let mut observers = Vec::new();
+    if late == 0 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        observers = spawn();
+        while rx.spectate_snapshot().map_or(0, |s| s.host.joined) < n as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "観戦者が {n} 人入らない: {:?}",
+                rx.spectate_snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     let total_sends = (secs * 1000 / PEER_GAP.as_millis() as u64) as usize;
@@ -125,21 +157,21 @@ fn run(n: usize, secs: u64) -> Report {
     let mut push_ns: Vec<u64> = Vec::with_capacity(frames as usize);
     let mut stamp_raw: Vec<u64> = Vec::new();
     let mut game_at: Vec<Instant> = Vec::new();
-    assert!(ring.push(Record::Seg { seg: 0 }));
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut next_frame = start;
     let t_end = start + Duration::from_secs(secs) + Duration::from_millis(500);
+    // 遅れて入る観戦者は、測りの 1 秒目に全員そろって入る（対戦の相手の便が届いている間に、追いつきの送りが重なる）。
+    let join_at = start + Duration::from_secs(1);
     let mut k = 0u32;
     while Instant::now() < t_end {
         let now = Instant::now();
+        if late > 0 && observers.is_empty() && now >= join_at {
+            observers = spawn();
+        }
         if k < frames && now >= next_frame {
             pushed_at.push(now);
             let began = Instant::now();
-            let ok = ring.push(Record::Frame {
-                frame: k,
-                p1: (k as u16) & 0xFF,
-                p2: (k as u16).wrapping_mul(3) & 0xFF,
-            });
+            let ok = ring.push(frame_rec(late + k));
             push_ns.push(began.elapsed().as_nanos() as u64);
             assert!(ok);
             k += 1;
@@ -160,6 +192,8 @@ fn run(n: usize, secs: u64) -> Report {
             "観戦者が終わりまで受けない"
         );
     }
+    // 送った量の秒は、観戦者が終わりまで受けた時まで（遅れて入った観戦者は、測りの終わりの後も追いつきを受けている）。
+    let xfer = base.elapsed();
     let seen: Vec<_> = observers.into_iter().map(Observer::finish).collect();
     let snap = rx.spectate_snapshot().expect("集計");
 
@@ -173,7 +207,7 @@ fn run(n: usize, secs: u64) -> Report {
         .collect();
 
     // 観戦者が受けた列が全員同じで、書いた列と一致する（同期）。
-    let want_len = 2 + frames as usize;
+    let want_len = 2 + late as usize + frames as usize;
     let mut watch_us = Vec::new();
     for sn in &seen {
         assert_eq!(sn.recs.len(), want_len, "観戦者が受けた記録の数");
@@ -188,11 +222,13 @@ fn run(n: usize, secs: u64) -> Report {
                     ),
                     "観戦者の列が書いた列と違う"
                 );
-                watch_us.push(
-                    sn.popped[j]
-                        .duration_since(pushed_at[*frame as usize])
-                        .as_micros() as u64,
-                );
+                // 先に積んでおいた記録（追いつきの分）は数えない。
+                if let Some(at) = frame
+                    .checked_sub(late)
+                    .and_then(|f| pushed_at.get(f as usize))
+                {
+                    watch_us.push(sn.popped[j].duration_since(*at).as_micros() as u64);
+                }
             }
         }
     }
@@ -222,7 +258,7 @@ fn run(n: usize, secs: u64) -> Report {
         round_us,
         dgram_us,
         bytes: seen.iter().map(|s| s.bytes).sum(),
-        secs: elapsed.as_secs_f64(),
+        secs: xfer.as_secs_f64(),
         watch_us,
         duty: sum_ns as f64 / 1e9 / elapsed.as_secs_f64(),
         push_ns,
@@ -276,28 +312,24 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-/// 観戦者の数が 0・4・10 のとき、同じ受信スレッドで対戦の相手の便が届く遅れがどう変わるかを実測する。値は標準エラーに出す
-/// （条件を交互に何回も回し、実行ごとの要約の中央値で比べる。この PC は他の仕事で揺れるので、標本を合わせず実行ごとに見る）。
-/// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う・観戦者 10 人で相手の便の遅れ（受信スレッドの印まで）の平均の
-/// 中央値が 0 人より 0.5 ms を越えて増える。
-#[test]
-#[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 9 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
-fn measure_receive_thread_load_with_0_4_and_10_spectators() {
-    let env = |k: &str, d: u64| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(d)
-    };
-    let (secs, passes) = (env("HIGANR_LOAD_SECS", 10), env("HIGANR_LOAD_PASSES", 3));
-    let counts = [0usize, 4, 10];
-    // 条件ごとの実行の要約: 印までの遅れ・ゲームが取るまでの遅れ・観戦の 1 周・観戦者が使えるまでの遅れ。
-    let mut runs: Vec<Vec<[[u64; 5]; 5]>> = vec![vec![]; 3];
-    let mut duty: Vec<Vec<f64>> = vec![vec![]; 3];
-    let mut expect: Vec<Vec<f64>> = vec![vec![]; 3];
+fn env(k: &str, d: u64) -> u64 {
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
+}
+
+/// 条件（観戦者の数, 先に積む記録の数）を交互に `passes` 回ずつ回し、実行ごとの要約の中央値を標準エラーに出す。戻りは条件ごとの
+/// （相手の便が受信スレッドの印を受けるまでの遅れの平均の中央値, 観戦の 1 周の最大の中央値）（µs）。
+fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64)> {
+    // 条件ごとの実行の要約: 印までの遅れ・ゲームが取るまでの遅れ・観戦の 1 周・観戦者が使えるまでの遅れ・リングバッファへ書く所要。
+    let mut runs: Vec<Vec<[[u64; 5]; 5]>> = vec![vec![]; cases.len()];
+    let mut duty: Vec<Vec<f64>> = vec![vec![]; cases.len()];
+    let mut expect: Vec<Vec<f64>> = vec![vec![]; cases.len()];
+    let mut sends: Vec<Vec<String>> = vec![vec![]; cases.len()];
     for pass in 0..passes {
-        for (slot, &n) in counts.iter().enumerate() {
-            let r = run(n, secs);
+        for (slot, &(n, late)) in cases.iter().enumerate() {
+            let r = run(n, secs, late);
             assert_eq!(r.sent, r.received, "対戦の相手の便が欠けた");
             show(n, pass as usize, &r);
             runs[slot].push([
@@ -309,6 +341,11 @@ fn measure_receive_thread_load_with_0_4_and_10_spectators() {
             ]);
             duty[slot].push(r.duty * 100.0);
             expect[slot].push(r.expected_wait_us);
+            sends[slot].push(format!(
+                "{:.1} KB/s（送り直した記録 {}）",
+                r.bytes as f64 / r.secs / 1000.0,
+                r.snap.host.records_resent
+            ));
         }
     }
     eprintln!("=== 実行 {passes} 回ぶんの要約の中央値（平均 / p50 / p95 / p99 / 最大、µs） ===");
@@ -319,9 +356,13 @@ fn measure_receive_thread_load_with_0_4_and_10_spectators() {
         "観戦者が使えるまでの遅れ",
         "ゲームのスレッドがリングバッファへ書く（ns）",
     ];
-    let mut mean_stamp = [0.0f64; 3];
-    for (slot, &n) in counts.iter().enumerate() {
-        eprintln!("[観戦者 {n:2} 人] 実行 {} 回", runs[slot].len());
+    let mut out = Vec::new();
+    for (slot, &(n, late)) in cases.iter().enumerate() {
+        eprintln!(
+            "[観戦者 {n:2} 人・先に積んだ記録 {late}] 実行 {} 回・送り {:?}",
+            runs[slot].len(),
+            sends[slot]
+        );
         for (k, name) in names.iter().enumerate() {
             let col: Vec<String> = (0..5)
                 .map(|c| {
@@ -333,15 +374,44 @@ fn measure_receive_thread_load_with_0_4_and_10_spectators() {
                 .collect();
             eprintln!("  {name}: {}", col.join(" / "));
         }
-        mean_stamp[slot] = median(runs[slot].iter().map(|r| r[0][0] as f64).collect());
+        out.push((
+            median(runs[slot].iter().map(|r| r[0][0] as f64).collect()),
+            median(runs[slot].iter().map(|r| r[2][4] as f64).collect()),
+        ));
         eprintln!(
             "  観戦の仕事の割合（中央値）{:.3}% / 相手の便が観戦の仕事に当たって待つ時間の期待値（Σ周² / 2 / 実時間。µs）{:.2}",
             median(duty[slot].clone()),
             median(expect[slot].clone())
         );
     }
+    out
+}
+
+/// 観戦者の数が 0・4・10 のとき、同じ受信スレッドで対戦の相手の便が届く遅れがどう変わるかを実測する。値は標準エラーに出す
+/// （条件を交互に何回も回し、実行ごとの要約の中央値で比べる。この PC は他の仕事で揺れるので、標本を合わせず実行ごとに見る）。
+/// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う・観戦者 10 人で相手の便の遅れ（受信スレッドの印まで）の平均の
+/// 中央値が 0 人より 0.5 ms を越えて増える。
+#[test]
+#[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 9 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
+fn measure_receive_thread_load_with_0_4_and_10_spectators() {
+    let (secs, passes) = (env("HIGANR_LOAD_SECS", 10), env("HIGANR_LOAD_PASSES", 3));
+    let r = compare(&[(0, 0), (4, 0), (10, 0)], secs, passes);
     assert!(
-        mean_stamp[2] <= mean_stamp[0] + 500.0,
+        r[2].0 <= r[0].0 + 500.0,
         "観戦者 10 人で相手の便の遅れの平均が 0.5 ms を越えて増えた"
+    );
+}
+
+/// 試合の頭から 135 秒ぶん（8,100 記録）遅れて入った観戦者 10 人が、測りの 1 秒目にそろって追いつきを始めるとき、同じ受信スレッドで
+/// 対戦の相手の便が届く遅れと、観戦の 1 周の最悪を、観戦者 0 人と比べる。値は標準エラーに出す。落ちる条件: 相手の便が欠ける・
+/// 観戦者の列が書いた列と違う（全員が先に積んだ記録から最後まで受ける）。
+#[test]
+#[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 6 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
+fn measure_receive_thread_load_with_ten_late_spectators() {
+    let (secs, passes) = (env("HIGANR_LOAD_SECS", 10), env("HIGANR_LOAD_PASSES", 3));
+    let r = compare(&[(0, 0), (10, 135 * 60)], secs, passes);
+    eprintln!(
+        "相手の便の遅れの平均: 0 人 {:.0} µs・遅れて入った 10 人 {:.0} µs / 観戦の 1 周の最大: {:.0} µs",
+        r[0].0, r[1].0, r[1].1
     );
 }

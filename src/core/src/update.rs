@@ -69,9 +69,10 @@ pub const JUST_UPDATED_ENV: &str = "HIGANRTOOL_JUST_UPDATED";
 
 /// このバージョンが配るファイル名（配る zip の中身のうち、利用者の設定でないもの）。更新の片づけ（`.old` / `.new`）はこの名前だけを
 /// 見る。置き換えてよい名前は [`is_allowed_name`] の規則で決まり、この表には縛られない（目録は署名で守られている）。
-pub const SHIPPED_FILES: [&str; 6] = [
+pub const SHIPPED_FILES: [&str; 7] = [
     "HiganRTool.exe",
     "HiganRTool.dll",
+    "HiganRTool_replay_fix.exe",
     "README.txt",
     "README_en.txt",
     "LICENSE.txt",
@@ -797,9 +798,10 @@ mod tests {
     }
 
     /// サーバー（`src/server/test/update.test.ts` の `ACCEPT` / `REJECT`）と同じ表。`tools/make_dist.py` が 2 つの一致を見る。
-    const NAME_RULE_ACCEPT: [&str; 17] = [
+    const NAME_RULE_ACCEPT: [&str; 18] = [
         "HiganRTool.exe",
         "HiganRTool.dll",
+        "HiganRTool_replay_fix.exe",
         "README.txt",
         "README_en.txt",
         "LICENSE.txt",

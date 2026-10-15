@@ -16,6 +16,8 @@ import {
   PONG_TEXT,
   type ServerMessage,
   WATCH_BROADCAST_MIN_MS,
+  WATCH_COUNT_BURST,
+  WATCH_COUNT_WINDOW_MS,
   WATCH_MAX_PER_IP,
   WATCH_MAX_TOTAL,
   WATCH_STALE_MS,
@@ -38,6 +40,9 @@ interface PostAtt {
   seq: number;
   item: WatchItem | null;
   done: boolean;
+  /** count の数え窓の始まりと、その窓で受けた数。 */
+  cw?: number;
+  cn?: number;
 }
 
 interface ViewAtt {
@@ -48,11 +53,17 @@ interface ViewAtt {
 type Att = PostAtt | ViewAtt;
 
 const OPEN = 1;
-const FLUSH_KEY = "flush";
 
 export class WatchList extends DurableObject<Env> {
   /** 最後に観戦者へ全体を送った時刻（起こされ直したら 0 から。すぐ送る側に倒れる）。 */
   private lastSent = 0;
+  /**
+   * まとめて送る変化が残っている印。ストレージには書かない（書き込みの枠を荒らしに使わせない）。追い出されて失っても、
+   * 起こされ直した最初のアラームで必ず全体を送る（alarm）ので、観戦者の表示が古いままになることはない。
+   */
+  private flushPending = false;
+  /** 掛けてあるアラームの時刻。undefined は未確認（起こされ直した直後）、null は無い。 */
+  private alarmAt: number | null | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -133,6 +144,16 @@ export class WatchList extends DurableObject<Env> {
         await this.changed(now);
         return;
       }
+      if (a.cw === undefined || now - a.cw >= WATCH_COUNT_WINDOW_MS) {
+        a.cw = now;
+        a.cn = 0;
+      }
+      a.cn = (a.cn ?? 0) + 1;
+      if (a.cn > WATCH_COUNT_BURST) {
+        closeWith(ws, Close.BadMessage, true);
+        await this.changed(now);
+        return;
+      }
       a.at = now;
       const differs = a.item.watchers !== w;
       a.item.watchers = w;
@@ -162,8 +183,10 @@ export class WatchList extends DurableObject<Env> {
         changed ||= a.item !== null;
       }
     }
-    const flush = (await this.ctx.storage.get(FLUSH_KEY)) !== undefined;
-    if (flush) await this.ctx.storage.delete(FLUSH_KEY);
+    // lastSent が 0 なら起こされ直した後で、残っていたかもしれない印を失っている。念のため全体を送る。
+    const flush = this.flushPending || this.lastSent === 0;
+    this.flushPending = false;
+    this.alarmAt = null;
     if (flush || changed) this.broadcast(now);
     await this.scheduleAlarm();
   }
@@ -213,7 +236,7 @@ export class WatchList extends DurableObject<Env> {
     if (now - this.lastSent >= WATCH_BROADCAST_MIN_MS) {
       this.broadcast(now);
     } else {
-      await this.ctx.storage.put(FLUSH_KEY, 1);
+      this.flushPending = true;
     }
     await this.scheduleAlarm();
   }
@@ -236,16 +259,30 @@ export class WatchList extends DurableObject<Env> {
     return last + WATCH_STALE_MS;
   }
 
+  /**
+   * アラームは今の予定より早めるときだけ掛ける（setAlarm は書き込みに数えられる）。予定が早すぎても、鳴ったときに
+   * alarm が掛け直す。書けなくても入室・載せる操作は失敗にしない（期限の掃除は次の操作かアラームで遅れて済む）。
+   */
   private async scheduleAlarm(): Promise<void> {
-    const times: number[] = this.livePosts().map((w) => this.deadline(w, att(w) as PostAtt));
-    if ((await this.ctx.storage.get(FLUSH_KEY)) !== undefined) {
-      times.push(this.lastSent + WATCH_BROADCAST_MIN_MS);
+    try {
+      const times: number[] = this.livePosts().map((w) => this.deadline(w, att(w) as PostAtt));
+      if (this.flushPending) times.push(this.lastSent + WATCH_BROADCAST_MIN_MS);
+      if (this.alarmAt === undefined) this.alarmAt = await this.ctx.storage.getAlarm();
+      if (times.length === 0) {
+        if (this.alarmAt !== null) {
+          await this.ctx.storage.deleteAlarm();
+          this.alarmAt = null;
+        }
+        return;
+      }
+      const at = Math.min(...times);
+      if (this.alarmAt === null || at < this.alarmAt) {
+        await this.ctx.storage.setAlarm(at);
+        this.alarmAt = at;
+      }
+    } catch {
+      this.alarmAt = undefined;
     }
-    if (times.length === 0) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    await this.ctx.storage.setAlarm(Math.min(...times));
   }
 }
 

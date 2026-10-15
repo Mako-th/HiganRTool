@@ -5,9 +5,11 @@
 //! この模型で画面を追う）。
 //!
 //! 画面を移る押下は、ホストが順番を決めて両者のゲームへ同じ順に入れる（`selection.rs`）ので、両者の画面と席の旗は
-//! 模型のとおりに同じに動く。模型が持たないもの: カーソルの移動（MENU の入力ワードで動く。表示だけ）、入る演出（押下の後
+//! 模型のとおりに同じに動く。模型が持たないもの: カーソルの移動（MENU の入力ワードで動く。キャラ選択の相手の席は MENU が運ぶ位置で
+//! 書く。どちらも表示だけ）、入る演出（押下の後
 //! 8〜9 tick は押下を読まない。dll はゲームのメモリの `+0x28` で見る）。
 
+use crate::input_model::keys;
 use crate::wire::{Step, StepKind};
 
 /// 画面の ID（`[[0x4AC8C0]+0x1B228]`）。
@@ -16,7 +18,7 @@ pub const SCREEN_DIFFICULTY: u8 = 7;
 pub const SCREEN_CHARA: u8 = 8;
 pub const SCREEN_MAP: u8 = 16;
 
-/// 決定のビット（`+0x06 & 0x1001`。Z と Enter）。送る入力ワードは `SEND_MASK` を掛けるので、ネットワークでは Z だけが残る。
+/// 決定のビット（`+0x06 & 0x1001`。Z と Enter）。送る入力ワードは `MATCH_SEND_MASK` を掛けるので、ネットワークでは Z だけが残る。
 pub const DECIDE_BITS: u16 = 0x1001;
 /// 取消のビット（`+0x06 & 0x000A`。X と Esc）。
 pub const CANCEL_BITS: u16 = 0x000A;
@@ -49,16 +51,25 @@ pub fn map_select_byte(item: u8) -> u8 {
     }
 }
 
-/// 合わせ（`StepKind::Align`）の value。画面ごとにホストのカーソルの値を 1 バイトに詰める: 難易度（7）= カーソル 0〜3 /
-/// マップ（16）= カーソルが指す一覧の値 0〜15（添字は解放状況で両者ごとに違うので使わない）/
-/// キャラ（8）= bit0〜3 が 1P のカーソル・bit4〜7 が 2P のカーソル。
-pub fn align_chara_value(cursors: [u32; 2]) -> u8 {
-    ((cursors[0] & 0x0F) | ((cursors[1] & 0x0F) << 4)) as u8
+/// 合わせ（`StepKind::Align`）を使う画面か（難易度 7・マップ 16）。合わせの value は、難易度 = カーソル 0〜3 / マップ = カーソルが
+/// 指す一覧の値 0〜15（添字は解放状況で両者ごとに違うので使わない）。
+///
+/// キャラ選択（8）は使わない。相手の席のカーソルは MENU が運ぶ位置へ毎 tick 書く（`selection::PeerCursor`）。入力ワードで動かすと、
+/// 未解放のキャラを飛ばす `0x0042304D` と「ランダム」の乱数が両者で違い、相手のカーソルが別のキャラへずれる。
+pub fn uses_align(screen: u8) -> bool {
+    screen == SCREEN_DIFFICULTY || screen == SCREEN_MAP
 }
 
-/// `align_chara_value` の逆。
-pub fn align_chara_parts(v: u8) -> [u32; 2] {
-    [u32::from(v & 0x0F), u32::from(v >> 4)]
+/// キャラ選択で、相手の席へ feed する相手の入力ワード。方向（`0x0042474A` が上下左右でカーソルを動かす）と「ランダム」の Ctrl は落とす
+/// （カーソルは位置で書く）。Shift を押している間の左右は初期ライフの増減（`0x00428C63`〜。カーソルは動かない）なので残し、上下は落とす
+/// （Shift を離した後もリピートで動きうる）。
+pub fn peer_chara_word(word: u16) -> u16 {
+    let keep = if word & keys::SHIFT != 0 {
+        keys::LEFT | keys::RIGHT
+    } else {
+        0
+    };
+    word & !(keys::UP | keys::DOWN | KEY_CTRL | ((keys::LEFT | keys::RIGHT) & !keep))
 }
 
 /// キャラ選択の STEP の value: bit0 = 押した席（0 = 1P / 1 = 2P）、bit1 = Shift（色違い）、bit2〜5 = カーソル。
@@ -240,130 +251,29 @@ pub fn is_selection_screen(screen: u32) -> bool {
 
 /// 選択の画面で効く「ランダム」のキー（Ctrl）。キャラ選択 `0x00428B48`（1P は `[0]+0x00`）・`0x00428CC6`（2P は `[1]`）と
 /// マップ `0x0042638B`（`[2]`）が、押している間に毎フレーム乱数でカーソルを回す（パッドのスキップのボタンも同じビット）。
-pub const KEY_CTRL: u16 = 0x0100;
-/// キーボードの R（`0x4000`）。ゲームは R を 2 か所でしか見ない（ミュージックルーム `0x00427197 testb $0x40,0x4acf3b` と、
-/// プレイヤーデータの画面の隠しの並び `0x00426715 test $0x40,%ah`）ので、選択の画面（キャラ 8・マップ 16）では他の用途に
-/// 当たらない。キャラ選択 `0x004289DB`〜`0x0042929C` とマップ `0x00426334`〜`0x004266B5` に R を見る比べは無い。
-pub const KEY_R: u16 = 0x4000;
-
-/// 選択の画面（キャラ 8・マップ 16）で、R を「ランダム」（Ctrl）に読み替えた入力ワードを返す（R は落とす）。ほかの画面・R が無い入力ワードは
-/// そのまま。難易度の画面（7）は「ランダム」を使わない。
-pub fn random_key(screen: u32, word: u16) -> u16 {
-    if !on_random_screen(screen) || word & KEY_R == 0 {
-        return word;
-    }
-    (word & !KEY_R) | KEY_CTRL
-}
-
-/// 「ランダム」（Ctrl）が効く選択の画面（キャラ 8・マップ 16）か。
-pub fn on_random_screen(screen: u32) -> bool {
-    screen == u32::from(SCREEN_CHARA) || screen == u32::from(SCREEN_MAP)
-}
-
-/// 選択の画面で自分の入力ワードから作る入力ワード。キーボードの Ctrl が押されている間は Ctrl のビット（`KEY_CTRL`）を落とし（Ctrl+数字・Ctrl+Tab で
-/// 「ランダム」が回らないように）、そのあと R を「ランダム」に読み替える（R を押していれば Ctrl は立つ）。キーボードの Ctrl が離れているときの
-/// `KEY_CTRL` はパッドのスキップのボタンなので残す。「ランダム」の無い画面は入力ワードをそのまま返す。
-pub fn menu_word(screen: u32, word: u16, keyboard_ctrl: bool) -> u16 {
-    let word = if keyboard_ctrl && on_random_screen(screen) {
-        word & !KEY_CTRL
-    } else {
-        word
-    };
-    random_key(screen, word)
-}
-
-/// キーボードの Ctrl として入力ワードの `KEY_CTRL` を落とすか。ゲームは `GetKeyboardState` の表で Ctrl を読み、こちらが読むキーの状態より遅れうる。
-/// Ctrl を離した直後の 1 フレームに `KEY_CTRL` だけが残って「ランダム」が回らないよう、入力ワードの `KEY_CTRL` が 0 に戻るまで前回の落としを保つ。
-pub fn drop_keyboard_ctrl(keyboard_ctrl: bool, prev_drop: bool, word: u16) -> bool {
-    keyboard_ctrl || (prev_drop && word & KEY_CTRL != 0)
-}
-
-/// 選択の画面（ネットの MENU）で相手へ送る入力ワードのマスク。マッチの入力ワードのマスク（`input_model::SEND_MASK`）に「ランダム」の Ctrl を
-/// 足したもの。足さないと選択の画面でも Ctrl が落ちて、ネットワークでは「ランダム」が効かない。
-pub const MENU_SEND_MASK: u16 = crate::input_model::SEND_MASK | KEY_CTRL;
+pub const KEY_CTRL: u16 = keys::CTRL;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input_model::MATCH_SEND_MASK;
 
     const D: StepKind = StepKind::Decide;
     const C: StepKind = StepKind::Cancel;
 
     #[test]
-    fn r_becomes_the_random_key_only_on_the_chara_and_map_screens() {
-        for screen in [u32::from(SCREEN_CHARA), u32::from(SCREEN_MAP)] {
-            assert_eq!(random_key(screen, KEY_R), KEY_CTRL, "screen {screen}");
-            assert_eq!(
-                random_key(screen, KEY_R | 0x0081 | 0x0004),
-                KEY_CTRL | 0x0081 | 0x0004
-            );
-            assert_eq!(random_key(screen, 0x0001), 0x0001);
-            assert_eq!(random_key(screen, KEY_CTRL | 0x0010), KEY_CTRL | 0x0010);
-            assert_eq!(random_key(screen, 0), 0);
-        }
-        for screen in [0, 1, 6, 7, 9, 12, 13, 15, 17, 100] {
-            assert_eq!(random_key(screen, KEY_R), KEY_R, "screen {screen}");
-        }
+    fn the_network_word_mask_keeps_ctrl_and_drops_r_and_the_other_high_bits() {
         assert_ne!(
-            MENU_SEND_MASK & KEY_CTRL,
+            MATCH_SEND_MASK & KEY_CTRL,
             0,
-            "ネットワークの MENU は Ctrl を送る（ランダム）"
+            "ネットワークの語は Ctrl を送る（ランダム）"
         );
         assert_eq!(
-            crate::input_model::SEND_MASK & KEY_CTRL,
-            0,
-            "試合の語は Ctrl を送らない"
+            MATCH_SEND_MASK, 0x01FF,
+            "Enter など Ctrl 以外の上位ビットは送らない"
         );
-        assert_eq!(MENU_SEND_MASK & KEY_R, 0, "R そのものは送らない");
-        assert_eq!(MENU_SEND_MASK & TRANSITION_BITS, TRANSITION_BITS & 0x00FF);
-    }
-
-    #[test]
-    fn the_keyboard_ctrl_is_dropped_on_the_random_screens_but_a_pad_skip_and_r_stay() {
-        let (chara, map) = (u32::from(SCREEN_CHARA), u32::from(SCREEN_MAP));
-        for screen in [chara, map] {
-            assert_eq!(
-                menu_word(screen, KEY_CTRL | 0x0001, true),
-                0x0001,
-                "キーボードの Ctrl はランダムにしない（{screen}）"
-            );
-            assert_eq!(
-                menu_word(screen, KEY_CTRL | 0x0001, false),
-                KEY_CTRL | 0x0001,
-                "Ctrl が離れているときの 0x0100 はパッドのスキップ（{screen}）"
-            );
-            assert_eq!(
-                menu_word(screen, KEY_R | KEY_CTRL, true),
-                KEY_CTRL,
-                "R は Ctrl を押していても「ランダム」（{screen}）"
-            );
-            assert_eq!(menu_word(screen, KEY_R, true), KEY_CTRL);
-            assert_eq!(menu_word(screen, KEY_R, false), KEY_CTRL);
-            assert_eq!(menu_word(screen, 0x0010, true), 0x0010);
-        }
-        for screen in [0, 1, 6, 7, 9, 100] {
-            assert_eq!(
-                menu_word(screen, KEY_CTRL | KEY_R, true),
-                KEY_CTRL | KEY_R,
-                "ランダムの無い画面は語を変えない（{screen}）"
-            );
-        }
-        assert!(on_random_screen(chara) && on_random_screen(map));
-        assert!(!on_random_screen(u32::from(SCREEN_DIFFICULTY)));
-    }
-
-    #[test]
-    fn the_ctrl_drop_is_held_until_the_word_ctrl_bit_clears() {
-        assert!(drop_keyboard_ctrl(true, false, 0));
-        assert!(drop_keyboard_ctrl(false, true, KEY_CTRL | 0x0001));
-        assert!(
-            !drop_keyboard_ctrl(false, true, 0x0001),
-            "語が 0 に戻れば解く"
-        );
-        assert!(
-            !drop_keyboard_ctrl(false, false, KEY_CTRL),
-            "前回の落としが無ければ（パッドのスキップ）通す"
-        );
+        assert_eq!(MATCH_SEND_MASK & 0x4000, 0, "R は送らない");
+        assert_eq!(MATCH_SEND_MASK & TRANSITION_BITS, TRANSITION_BITS & 0x00FF);
     }
 
     fn st(screen: u8, kind: StepKind, value: u8) -> Step {
@@ -451,11 +361,40 @@ mod tests {
             m.apply(&al(SCREEN_MAP, 14)),
             Err(Mismatch::Screen { model: 8, step: 16 })
         );
-        for c in [[0u32, 0], [15, 15], [4, 6], [9, 2]] {
-            assert_eq!(align_chara_parts(align_chara_value(c)), c);
-        }
-        assert_eq!(align_chara_value([4, 6]), 0x64);
         assert_eq!(outcome_of(SCREEN_MAP, StepKind::Align), Outcome::Stay);
+        assert!(uses_align(SCREEN_DIFFICULTY) && uses_align(SCREEN_MAP));
+        assert!(!uses_align(SCREEN_CHARA) && !uses_align(SCREEN_MODE) && !uses_align(0));
+    }
+
+    /// 壊れたら落ちる: 相手の語の方向・Ctrl を残す（カーソルが入力ワードでも動き、書いた位置からずれる）・Shift 付きの左右を
+    /// 落とす（相手の初期ライフの表示が動かない）・Shift 付きの上下を残す。
+    #[test]
+    fn peer_chara_word_keeps_only_buttons_and_shift_left_right() {
+        use crate::input_model::keys::{DOWN, LEFT, RIGHT, SHIFT, UP, X, Z};
+        assert_eq!(peer_chara_word(UP | DOWN | LEFT | RIGHT | KEY_CTRL), 0);
+        assert_eq!(peer_chara_word(Z | X | LEFT | KEY_CTRL), Z | X);
+        assert_eq!(
+            peer_chara_word(SHIFT | LEFT | UP | DOWN | KEY_CTRL),
+            SHIFT | LEFT
+        );
+        assert_eq!(peer_chara_word(SHIFT | RIGHT | UP), SHIFT | RIGHT);
+        assert_eq!(peer_chara_word(SHIFT | DOWN), SHIFT);
+        for w in 0u16..=0xFFFF {
+            let out = peer_chara_word(w);
+            assert_eq!(out & !w, 0, "{w:#06x}: 無いビットを足した");
+            assert_eq!(out & (UP | DOWN | KEY_CTRL), 0, "{w:#06x}");
+            let lr = if w & SHIFT != 0 {
+                w & (LEFT | RIGHT)
+            } else {
+                0
+            };
+            assert_eq!(out & (LEFT | RIGHT), lr, "{w:#06x}");
+            assert_eq!(
+                out & !(UP | DOWN | LEFT | RIGHT | KEY_CTRL),
+                w & !(UP | DOWN | LEFT | RIGHT | KEY_CTRL),
+                "{w:#06x}: ほかのビット"
+            );
+        }
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! - **受信スレッド**は `recv_from` で受けた生のバイト列を `net_ring::RecvRing` へ書き、受信のイベントを立てるだけ。解析と状態機械は
 //!   ゲームスレッド（`netplay.rs`）。例外は PING への PONG で、受信スレッドが受けたその場で返す（`answer_ping`。ゲームのスレッドの
-//!   tick を待つと PONG が最大 1 tick 遅れ、相手の測る RTT がその分大きく出るため）。Windows の UDP は、前に送った先のポートが
+//!   tick を待つと PONG が最大 1 tick 遅れ、相手の測る RTT がその分大きく出るため）。ゲームスレッドの心拍が古ければ PONG を返さず、ゲームスレッドが
+//!   パニックで止まった後（`RecvThread::say_bye`）は PONG の代わりに BYE を返す（相手が止まったこちらを生きていると見続けないため）。Windows の UDP は、前に送った先のポートが
 //!   閉じていると次の受信が `WSAECONNRESET` になる（相手が先に終えた）ので読み飛ばす（相手の生死は liveness が決める）。
 //! - **ゲームスレッドのインターフェース** `GameNet` は `netplay::Net` の本物: 時計（`Instant`。QPC）・リングの取り出し・イベントか高分解能の
 //!   待機タイマーでの待ち（`net_win.rs`）・送る（std の `UdpSocket::send_to`。アドレスはスタックで詰め、確保しない）。
@@ -31,18 +32,21 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use higanr_core::adapter_pick::{self, Adapter};
 use higanr_core::auth::{SECRET_LEN, Secret};
 use higanr_core::candidate::{Candidate, is_global_unicast_v6, kind_of};
 use higanr_core::guard::{self, Scope};
 use higanr_core::link::{self, KIND_SLOTS, Outlet, kind_slot};
+use higanr_core::liveness;
 use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::pong::PongResponder;
 use higanr_core::seal::{KeySeed, SEED_LEN};
 use higanr_core::stun;
 use higanr_core::upnp::OuterCheck;
-use higanr_core::wire::{self, Datagram, MAX_DATAGRAM};
+use higanr_core::wire::{self, ByeReason, Datagram, MAX_DATAGRAM};
 
-use crate::net_config::{NetSettings, StunTarget};
+use crate::adapters_win;
+use crate::net_config::{AddrSource, NetSettings, StunTarget};
 use crate::net_ring::{RecvRing, RingCounts};
 use crate::net_win::{Event, Waiter, Woke, os_random};
 use crate::netplay::{HANDSHAKE_RETRY_MS, Net};
@@ -470,6 +474,11 @@ struct PongSlot {
     generation: AtomicU32,
     /// 返してよいか（生存が「生きている」の間だけ true）。
     on: AtomicBool,
+    /// ゲームスレッドの心拍（`Net::heartbeat` が tick ごとに書く `now_ms`。0 はまだ書いていない）。古ければ PONG を返さない
+    /// （`liveness::heartbeat_fresh`）。
+    beat: AtomicU32,
+    /// 0 でなければ、ゲームスレッドが止まったので受信スレッドが BYE を出す（値は `bye_code` の理由）。立ったら PING には PONG の代わりに BYE を返す。
+    bye: AtomicU32,
     responder: Mutex<Option<PongResponder>>,
     /// PONG の通し番号。IPv4・IPv6 の 2 本の受信スレッドと、置き直したどの口も、この 1 つを進める。ネットワークと同じ寿命で 0 に戻さない
     /// （鍵はセッションごとに替わるので、鍵ごとに 0 からでなくても重ならないことだけが要る）。
@@ -478,6 +487,24 @@ struct PongSlot {
     sent: AtomicU32,
     refused: AtomicU32,
     send_errors: AtomicU32,
+    /// 心拍が古いので返さなかった PING の数と、受信スレッドが出した BYE の数（頼まれずに出した 1 通と PING への返し）。
+    stale: AtomicU32,
+    byes_sent: AtomicU32,
+}
+
+fn bye_code(r: ByeReason) -> u32 {
+    r as u32
+}
+
+fn bye_of(code: u32) -> Option<ByeReason> {
+    [
+        ByeReason::Finished,
+        ByeReason::Disconnected,
+        ByeReason::Desync,
+        ByeReason::Cancelled,
+    ]
+    .into_iter()
+    .find(|&r| bye_code(r) == code)
 }
 
 /// 観戦のホストの受け渡し。読み取りのスレッドが開くときに 1 回だけ置き、受信スレッドが 1 回だけ取って自分で持つ（周回ごとには錠を
@@ -505,6 +532,9 @@ pub struct RecvStats {
     pub pongs_sent: u32,
     pub pongs_refused: u32,
     pub pong_send_errors: u32,
+    /// ゲームスレッドの心拍が古いので返さなかった PING / ゲームスレッドが止まった後に受信スレッドが出した BYE。
+    pub pongs_stale: u32,
+    pub byes_sent: u32,
     /// 繋がらなかった理由を読むための診断（STUN の聞き直し・送りの誤り・候補の数。`NetDiag`）。
     pub diag: NetDiag,
 }
@@ -630,6 +660,7 @@ fn recv_loop(sock: &UdpSocket, shared: &Shared) {
     let mut spectate_taken = false;
     let mut keep = KeepPhase::NotYet;
     let mut second = SecondPhase::NotYet;
+    let mut bye_done = false;
     while !shared.stop.load(Ordering::Relaxed) {
         if !spectate_taken && shared.spectate.installed.load(Ordering::Acquire) {
             spectate_taken = true;
@@ -690,6 +721,7 @@ fn recv_loop(sock: &UdpSocket, shared: &Shared) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        bye_once(sock, shared, &mut cache, &mut bye_done);
         keep_step(&mut keep, sock, shared);
         second_step(&mut second, sock, shared);
         if spectate.is_some() {
@@ -752,39 +784,102 @@ fn answer_ping(
     bytes: &[u8],
 ) -> bool {
     let slot = &shared.pong;
-    if !wire::peek_is_ping(bytes) || !slot.on.load(Ordering::Acquire) {
+    if !wire::peek_is_ping(bytes) {
         return false;
     }
+    let bye = bye_of(slot.bye.load(Ordering::Acquire));
+    if bye.is_none() {
+        if !slot.on.load(Ordering::Acquire) {
+            return false;
+        }
+        // 心拍を先に読み、時刻は後で取る（同じ時計なので、書き手が先に進んでいても差は小さい）。
+        let beat = slot.beat.load(Ordering::Acquire);
+        if !liveness::heartbeat_fresh(beat, now_ms(shared)) {
+            slot.stale.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+    let Some(r) = cached_responder(slot, cache) else {
+        return false;
+    };
+    let mut out = [0u8; MAX_DATAGRAM];
+    let answered = match bye {
+        Some(reason) => r.answer_bye(&slot.seq, from, bytes, reason, &mut out),
+        None => r.answer(&slot.seq, from, bytes, &mut out),
+    };
+    let Some((to, n)) = answered else {
+        return false;
+    };
+    if !send_to_path(sock, shared, to, out.get(..n).unwrap_or(&[])) {
+        return false;
+    }
+    let count = if bye.is_some() {
+        &slot.byes_sent
+    } else {
+        &slot.sent
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// 置かれた口のコピー（世代が変わったときだけ錠を取ってコピーする。ゲームのスレッドは try_lock しかしないので、ここで待つのは受信スレッドだけ）。
+fn cached_responder<'a>(
+    slot: &PongSlot,
+    cache: &'a mut (u32, Option<PongResponder>),
+) -> Option<&'a PongResponder> {
     let generation = slot.generation.load(Ordering::Acquire);
     if generation != cache.0 {
-        // 世代が変わったときだけ錠を取ってコピーする（ゲームのスレッドは try_lock しかしないので、ここで待つのは受信スレッドだけ）。
         let g = slot.responder.lock().unwrap_or_else(|e| e.into_inner());
         cache.1 = g.clone();
         cache.0 = generation;
     }
-    let Some(r) = cache.1.as_ref() else {
-        return false;
-    };
-    let mut out = [0u8; MAX_DATAGRAM];
-    let Some((to, n)) = r.answer(&slot.seq, from, bytes, &mut out) else {
-        return false;
-    };
-    // 送る直前のガードは `Outlet::send`（`GameNet::may_send`）と同じ関数・同じ範囲。
+    cache.1.as_ref()
+}
+
+/// 受信スレッドが経路へ 1 通送る。送る直前のガードは `Outlet::send`（`GameNet::may_send`）と同じ関数・同じ範囲。返す先（繋がった経路）の族の
+/// ソケットから送る（PING が来たソケットと同じとは限らない。IPv6 のソケットを開いていなければ `sock` のまま）。
+fn send_to_path(sock: &UdpSocket, shared: &Shared, to: SocketAddr, bytes: &[u8]) -> bool {
+    let slot = &shared.pong;
     if !guard::allows(shared.scope, to) {
         slot.refused.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    // 返す先（繋がった経路）の族のソケットから返す。PING が来たソケットと同じとは限らない。IPv6 のソケットを開いていなければソケット `sock` のまま。
     let out_sock: &UdpSocket = match (to.is_ipv6(), shared.sock6.get()) {
         (true, Some(s6)) => s6,
         _ => sock,
     };
-    if out_sock.send_to(out.get(..n).unwrap_or(&[]), to).is_err() {
+    if out_sock.send_to(bytes, to).is_err() {
         slot.send_errors.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    slot.sent.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// ゲームスレッドが止まった（`RecvThread::say_bye`）後の最初の 1 回だけ、頼まれずに BYE を出す。口が無い（繋がる前）なら何も出さない。
+/// 以後は相手の PING への返しが BYE になる（`answer_ping`）ので、この 1 通が落ちても次の PING で届く。
+fn bye_once(
+    sock: &UdpSocket,
+    shared: &Shared,
+    cache: &mut (u32, Option<PongResponder>),
+    done: &mut bool,
+) {
+    if *done {
+        return;
+    }
+    let slot = &shared.pong;
+    let Some(reason) = bye_of(slot.bye.load(Ordering::Acquire)) else {
+        return;
+    };
+    *done = true;
+    let Some(r) = cached_responder(slot, cache) else {
+        return;
+    };
+    let mut out = [0u8; MAX_DATAGRAM];
+    if let Some((to, n)) = r.bye(&slot.seq, reason, &mut out)
+        && send_to_path(sock, shared, to, out.get(..n).unwrap_or(&[]))
+    {
+        slot.byes_sent.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl RecvThread {
@@ -798,6 +893,8 @@ impl RecvThread {
             pongs_sent: p.sent.load(Ordering::Relaxed),
             pongs_refused: p.refused.load(Ordering::Relaxed),
             pong_send_errors: p.send_errors.load(Ordering::Relaxed),
+            pongs_stale: p.stale.load(Ordering::Relaxed),
+            byes_sent: p.byes_sent.load(Ordering::Relaxed),
             diag: self.diag(),
         }
     }
@@ -835,6 +932,16 @@ impl RecvThread {
                 .map(upnp::Handle::stats)
                 .unwrap_or_default(),
         }
+    }
+
+    /// ゲームスレッドが止まった（パニックを受けた）ので、受信スレッドに BYE を出させる。PONG はもう返さない。原子変数を書くだけで待たない。
+    /// 最初の理由だけが効く。
+    pub fn say_bye(&self, reason: ByeReason) {
+        let p = &self.shared.pong;
+        p.on.store(false, Ordering::Release);
+        let _ = p
+            .bye
+            .compare_exchange(0, bye_code(reason), Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// 観戦のホストを置く（読み取りのスレッド。開くときに 1 回だけ）。2 回目は置かずに false。
@@ -1264,7 +1371,25 @@ fn judge_route(
 /// ini の `bind` から、開くソケットのアドレスを決める（`auto:ポート` なら経路表を引く。戻りの文は `auto` から何に決めたか、手で書いた
 /// アドレスなら空）。読み取りのスレッドで開くときにだけ。
 pub fn resolve_bind(s: &NetSettings) -> Result<(SocketAddr, String), String> {
-    s.bind.resolve(s.scope, probe_route_ip)
+    s.bind.resolve_by(s.scope, || {
+        route_or_adapters(probe_route_ip(), adapters_win::list)
+    })
+}
+
+/// 経路が引けたらその送り元（今までの動き）。引けなかったときだけ、アダプターの一覧から LAN のアドレスを選ぶ（ルーターなしの直結など、
+/// デフォルト経路の無い PC のため）。選べなければ、経路が引けなかった理由と一覧で選べなかった理由を並べて返す。
+fn route_or_adapters(
+    route: Result<IpAddr, String>,
+    adapters: impl FnOnce() -> Result<Vec<Adapter>, String>,
+) -> Result<(IpAddr, AddrSource), String> {
+    let route_err = match route {
+        Ok(ip) => return Ok((ip, AddrSource::Route)),
+        Err(e) => e,
+    };
+    let list = adapters().map_err(|e| format!("{route_err}。{e}"))?;
+    adapter_pick::choose(&list)
+        .map(|ip| (IpAddr::V4(ip), AddrSource::Adapters))
+        .map_err(|r| format!("{route_err}。{}", r.text()))
 }
 
 /// IPv6 の経路を引くための文書用の宛先（RFC 3849 の 2001:db8::/32。実在の相手ではない）。`ROUTE_PROBE` の IPv6 バージョン。
@@ -1851,6 +1976,13 @@ impl Net for GameNet {
 
     fn pong_enable(&mut self, on: bool) {
         self.shared.pong.on.store(on, Ordering::Release);
+    }
+
+    fn heartbeat(&mut self, now_ms: u32) {
+        self.shared
+            .pong
+            .beat
+            .store(now_ms.max(1), Ordering::Release);
     }
 
     fn link_up(&mut self) {
@@ -2538,6 +2670,103 @@ mod tests {
             e.contains("経路") && e.contains("アドレスが取れない"),
             "{e}"
         );
+    }
+
+    fn nic(ip: &str, gateway: bool, metric: u32) -> Adapter {
+        Adapter {
+            description: "Realtek PCIe GbE Family Controller".to_string(),
+            if_type: 6,
+            oui: [0x3C, 0x52, 0x82],
+            up: true,
+            preferred: true,
+            ip: ip.parse().unwrap(),
+            gateway,
+            metric,
+        }
+    }
+
+    /// 壊れたら落ちる: 経路が引けたのに一覧を引く（今の環境の動きが変わる）、経路が引けないときに一覧から選ばない、選べないときの理由が
+    /// 経路の理由か一覧の理由のどちらかしか出ない、同点を選んでしまう。
+    #[test]
+    fn the_list_is_used_only_when_the_route_fails_and_a_tie_is_not_chosen() {
+        let route_ok: IpAddr = "192.168.0.7".parse().unwrap();
+        let never = || -> Result<Vec<Adapter>, String> {
+            panic!("経路が引けたのに一覧を引いた")
+        };
+        assert_eq!(
+            route_or_adapters(Ok(route_ok), never),
+            Ok((route_ok, AddrSource::Route))
+        );
+        let no_route = || Err("外へ出る経路が無い: 到達できない".to_string());
+        // 直結: 経路は無く、169.254 が 1 つだけ。
+        let direct = vec![nic("169.254.20.5", false, 25)];
+        let (ip, src) = route_or_adapters(no_route(), || Ok(direct)).unwrap();
+        assert_eq!(
+            (ip, src),
+            ("169.254.20.5".parse().unwrap(), AddrSource::Adapters)
+        );
+        // 同点: 選ばず、両方の理由とアドレスを並べる。
+        let tie = vec![nic("192.168.0.10", true, 30), nic("192.168.0.20", true, 30)];
+        let e = route_or_adapters(no_route(), || Ok(tie)).unwrap_err();
+        assert!(
+            e.contains("外へ出る経路が無い")
+                && e.contains("決められない")
+                && e.contains("192.168.0.10・192.168.0.20"),
+            "{e}"
+        );
+        // 仮想だけ。
+        let mut vpn = nic("10.8.0.6", true, 5);
+        vpn.if_type = 131;
+        let e = route_or_adapters(no_route(), || Ok(vec![vpn])).unwrap_err();
+        assert!(
+            e.contains("外へ出る経路が無い") && e.contains("LAN で使える"),
+            "{e}"
+        );
+        // 一覧が引けない。
+        let e = route_or_adapters(no_route(), || Err("一覧が引けない".to_string())).unwrap_err();
+        assert!(
+            e.contains("外へ出る経路が無い") && e.contains("一覧が引けない"),
+            "{e}"
+        );
+    }
+
+    /// 壊れたら落ちる: `bind = auto` の経路が引けないとき、一覧から選んだことがログの文に出ない・scope = internet でも 169.254 を断る。
+    #[test]
+    fn bind_auto_names_the_adapter_list_when_it_picks_from_it() {
+        use crate::net_config::Bind;
+        let list = || Ok(vec![nic("169.254.20.5", false, 25)]);
+        let (a, note) = Bind::Auto(17723)
+            .resolve_by(Scope::Lan, || {
+                route_or_adapters(Err("外へ出る経路が無い: x".to_string()), list)
+            })
+            .unwrap();
+        assert_eq!(a, "169.254.20.5:17723".parse::<SocketAddr>().unwrap());
+        assert!(note.contains("アダプターの一覧"), "{note}");
+        // scope = internet でも、直結の 169.254 を選べる（ルーターなしの直結はインターネットの設定のままでも使える）。
+        let (a, note) = Bind::Auto(17723)
+            .resolve_by(Scope::Internet, || {
+                route_or_adapters(Err("外へ出る経路が無い: x".to_string()), list)
+            })
+            .unwrap();
+        assert_eq!(a, "169.254.20.5:17723".parse::<SocketAddr>().unwrap());
+        assert!(note.contains("scope = internet"), "{note}");
+        // 経路が引けたときの文は今までのまま。
+        let (_, note) = Bind::Auto(17723)
+            .resolve_by(Scope::Lan, || {
+                route_or_adapters(Ok("192.168.0.7".parse().unwrap()), list)
+            })
+            .unwrap();
+        assert!(
+            note.contains("外へ出る経路の自分のアドレス") && !note.contains("アダプター"),
+            "{note}"
+        );
+        // 範囲 loopback では一覧を引かない。
+        let (a, _) = Bind::Auto(17723)
+            .resolve_by(Scope::Loopback, || -> Result<_, String> {
+                panic!("loopback で引いた")
+            })
+            .unwrap();
+        assert!(a.ip().is_loopback());
     }
 
     #[test]
@@ -3613,6 +3842,8 @@ mod tests {
         );
         assert!(a.pong_install(&r));
         a.pong_enable(true);
+        let now = (a.now_us() / 1_000) as u32;
+        a.heartbeat(now);
         let peer_seq = higanr_core::seal::Seq::new();
         let ping = |t: u32| {
             let mut out = [0u8; MAX_DATAGRAM];
@@ -3885,6 +4116,7 @@ mod pong_gate_tests {
         ));
         s.pong.generation.store(1, Ordering::Release);
         s.pong.on.store(true, Ordering::Release);
+        s.pong.beat.store(now_ms(s).max(1), Ordering::Release);
     }
 
     /// 口の向きの鍵。相手役は入れ替えた鍵で封じる。
@@ -3939,6 +4171,123 @@ mod pong_gate_tests {
                 open_for_code_scoped(scope, SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
             assert_eq!(th.shared.scope, scope);
         }
+    }
+
+    /// 相手役の受け（口の向きの逆の鍵で開く）。
+    fn read_at_peer(dest: &UdpSocket) -> Option<Message> {
+        let mut buf = [0u8; 2048];
+        let (n, _) = dest.recv_from(&mut buf).ok()?;
+        let key = AuthKey::derive(&Secret([0x33; 16]), SID);
+        wire::decode(&key, Some(&test_dir().swapped().opener()), &buf[..n])
+            .ok()
+            .map(|p| p.msg)
+    }
+
+    #[test]
+    fn a_stale_heartbeat_stops_the_pong_and_a_fresh_one_brings_it_back() {
+        let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let dest = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        dest.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let path = dest.local_addr().unwrap();
+        let s = shared(Scope::Loopback);
+        install(&s, path);
+        let mut cache = (0, None);
+        let p = &s.pong;
+        let counts = || {
+            (
+                p.sent.load(Ordering::Relaxed),
+                p.stale.load(Ordering::Relaxed),
+            )
+        };
+        assert!(answer_ping(&sock, &s, &mut cache, path, &ping()));
+        assert_eq!(read_at_peer(&dest), Some(Message::Pong { send_time: 7 }));
+        assert_eq!(counts(), (1, 0));
+        let old = now_ms(&s).wrapping_sub(liveness::HEARTBEAT_LIMIT_MS);
+        for (beat, why) in [(old, "古い心拍"), (0, "まだ書いていない心拍")] {
+            p.beat.store(beat, Ordering::Release);
+            assert!(!answer_ping(&sock, &s, &mut cache, path, &ping()), "{why}");
+        }
+        assert_eq!(counts(), (1, 2));
+        p.beat.store(now_ms(&s).max(1), Ordering::Release);
+        assert!(answer_ping(&sock, &s, &mut cache, path, &ping()));
+        assert_eq!(counts(), (2, 2));
+        assert_eq!(read_at_peer(&dest), Some(Message::Pong { send_time: 7 }));
+    }
+
+    #[test]
+    fn after_the_game_thread_stops_pings_get_a_bye_and_one_bye_goes_out_unasked() {
+        let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let dest = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        dest.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let path = dest.local_addr().unwrap();
+        let s = shared(Scope::Loopback);
+        install(&s, path);
+        let mut cache = (0, None);
+        let mut done = false;
+        // 立てる前は何も出さない（下の BYE がいつも出る形でないことの隣）。
+        bye_once(&sock, &s, &mut cache, &mut done);
+        assert!(!done);
+        assert_eq!(read_at_peer(&dest), None);
+        s.pong.on.store(false, Ordering::Release);
+        s.pong
+            .bye
+            .store(bye_code(ByeReason::Cancelled), Ordering::Release);
+        // 心拍が古くても BYE は返す（止まった後こそ返す）。
+        s.pong.beat.store(0, Ordering::Release);
+        assert!(answer_ping(&sock, &s, &mut cache, path, &ping()));
+        assert_eq!(
+            read_at_peer(&dest),
+            Some(Message::Bye(ByeReason::Cancelled))
+        );
+        bye_once(&sock, &s, &mut cache, &mut done);
+        bye_once(&sock, &s, &mut cache, &mut done);
+        assert_eq!(
+            read_at_peer(&dest),
+            Some(Message::Bye(ByeReason::Cancelled))
+        );
+        assert_eq!(read_at_peer(&dest), None, "頼まれない BYE が 2 通出た");
+        let p = &s.pong;
+        assert_eq!(
+            (
+                p.byes_sent.load(Ordering::Relaxed),
+                p.sent.load(Ordering::Relaxed)
+            ),
+            (2, 0)
+        );
+        for r in [
+            ByeReason::Finished,
+            ByeReason::Disconnected,
+            ByeReason::Desync,
+            ByeReason::Cancelled,
+        ] {
+            assert_eq!(bye_of(bye_code(r)), Some(r));
+        }
+        assert_eq!(bye_of(0), None);
+    }
+
+    #[test]
+    fn say_bye_makes_the_receive_thread_send_a_bye_without_any_ping() {
+        let dest = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        dest.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let path = dest.local_addr().unwrap();
+        let (_net, th) = open_for_code(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        install(&th.shared, path);
+        th.say_bye(ByeReason::Cancelled);
+        th.say_bye(ByeReason::Desync);
+        assert_eq!(
+            read_at_peer(&dest),
+            Some(Message::Bye(ByeReason::Cancelled)),
+            "最初の理由で出ない"
+        );
+        assert!(!th.shared.pong.on.load(Ordering::Acquire));
+        // 数えは送った後に足すので、相手が受けた直後はまだ 0 のことがある。
+        let t = std::time::Instant::now();
+        while th.stats().byes_sent == 0 && t.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(th.stats().byes_sent, 1);
     }
 }
 

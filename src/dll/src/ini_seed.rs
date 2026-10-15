@@ -12,12 +12,9 @@ use std::sync::OnceLock;
 
 use crate::net_config::Located;
 
-/// 配る ini の原本（zip に入るものと同じファイル。コピーは作らない）。
-const DIST_INI: &str = include_str!("../../../scripts/dist/HiganRTool.ini");
-
-/// 書き出す中身。`tools/make_dist.py` が zip に入れるときと同じ改行（CRLF。古いメモ帳で 1 行に潰れないように）。
+/// 書き出す中身（配る ini の原本と同じ。ローダーが先に作るときと同じ中身にするため core に置く）。
 pub fn dist_ini_text() -> String {
-    DIST_INI.replace("\r\n", "\n").replace('\n', "\r\n")
+    higanr_core::ini_store::dist_ini_text()
 }
 
 /// そのビルドで書き出す中身。配るバージョンだけ（開発用のビルドは ini が無ければネットワークなし、のまま）。

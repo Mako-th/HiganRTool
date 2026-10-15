@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use higanr_core::watch_list::{ListStatus, ViewEvent};
 
-use crate::net_room::{RoomOptions, ViewListConn};
+use crate::net_room::{RoomOptions, TransportNote, ViewListConn};
 use crate::net_ui::UiLink;
 
 /// 一覧の接続のスレッドが `poll` する間隔（見張り `net_code_game::GAME_POLL` と同じ 50 ms）。
@@ -88,7 +88,9 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
     };
     let mut skipped_logged = false;
     while !stop.load(Ordering::Acquire) {
-        for ev in conn.poll() {
+        let events = conn.poll();
+        let notes = conn.take_notes();
+        for ev in events {
             match ev {
                 ViewEvent::List { rows, skipped } => {
                     if skipped > 0 && !skipped_logged {
@@ -100,7 +102,7 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
                     publish(link, generation, ListStatus::Ready, &rows);
                 }
                 ViewEvent::Failed(f) => {
-                    crate::main_log::push(format!("観戦の一覧: 取得できなかった（{f:?}）"));
+                    crate::main_log::push(failure_line(&f, &notes));
                     publish(link, generation, ListStatus::Failed, &[]);
                     conn.cancel();
                     return;
@@ -110,6 +112,15 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
         std::thread::sleep(POLL);
     }
     conn.cancel();
+}
+
+/// 取得できなかったときの本ログの 1 行。運びの記録は WinHTTP の段階名と番号だけで、ルーム名・アドレスは含まない。
+fn failure_line(f: &impl std::fmt::Debug, notes: &[TransportNote]) -> String {
+    if notes.is_empty() {
+        format!("観戦の一覧: 取得できなかった（{f:?}）")
+    } else {
+        format!("観戦の一覧: 取得できなかった（{f:?}）運び {notes:?}")
+    }
 }
 
 fn publish(

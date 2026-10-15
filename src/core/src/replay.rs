@@ -717,6 +717,7 @@ mod tests {
                 round(3, Winner::P1),
             ],
             rounds_dropped: 0,
+            charge: None,
         }
     }
 
@@ -1170,6 +1171,39 @@ mod tests {
             panic!("V1 が読めない");
         };
         assert_eq!(v1.detail, None);
+    }
+
+    /// 壊れたら落ちる: チャージ型を印に書かない・席を入れ替える・無いのに書く・足す前の読みが新しい印を壊れたと扱う。
+    #[test]
+    fn the_charge_key_round_trips_and_an_old_reader_skips_it() {
+        let mut m = detail_mark();
+        m.detail.as_mut().unwrap().charge = Some([1, 0]);
+        let body = mark_body(&m).unwrap();
+        assert!(body.contains("\tcharge=1.0\t"), "{body}");
+        let BodyRead::Mark(back) = parse_mark_body(body.as_bytes()).unwrap() else {
+            panic!("読めない");
+        };
+        assert_eq!(back.detail.unwrap().charge, Some([1, 0]));
+        // ファイルの末尾に足した印としても往復する。
+        let read = read_mark(&file_with_mark_bodies(&[body.as_bytes()]));
+        assert!(
+            matches!(&read, Ok(MarkRead::Found(f)) if f.detail.as_ref().unwrap().charge == Some([1, 0])),
+            "{read:?}"
+        );
+        // このキーを知らない読み（足す前）は、キーを除いた本文と同じに読む。
+        let old: Vec<&str> = body
+            .split('\t')
+            .filter(|f| !f.starts_with("charge="))
+            .collect();
+        assert_eq!(old.join("\t"), mark_body(&detail_mark()).unwrap());
+        assert_eq!(
+            parse_mark_body(old.join("\t").as_bytes()).unwrap(),
+            BodyRead::Mark(detail_mark())
+        );
+        // 無いときは書かない。
+        assert!(!mark_body(&detail_mark()).unwrap().contains("charge"));
+        // 知らない key は無視して読む約束（足す前の読みはこの経路で `charge` を飛ばす）。
+        assert!(parse_mark_body(format!("{V1}\tcharge=1.0").as_bytes()).is_ok());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 偽の STUN の応答役（検査の道具）。本物の STUN サーバーへの問い合わせは外へ出る通信なので、本人の許可の後。それまでは loopback に立てた
+//! 偽の STUN の応答役（検査の道具）。本物の STUN サーバーへの問い合わせは外へ出る通信なので、検査は loopback に立てた
 //! これで、dll と peer_sim の「STUN の Binding を送って受ける口」を見る。受けた Binding Request に、送り元のアドレスを
 //! XOR-MAPPED-ADDRESS に載せた Success Response を返す（本物と同じ答え方。loopback なので答えは 127.0.0.1:ポート）。組み立ては
 //! `higanr_core::stun::encode_binding_success`。既定は受信ソケットも相手も loopback だけ。

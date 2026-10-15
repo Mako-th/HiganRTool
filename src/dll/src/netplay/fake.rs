@@ -88,10 +88,10 @@ pub struct FakeGame {
     pub seats_seen: u8,
     /// 人が Esc を押している（`peek_local_input` が `ESC` を返す）。同期ズレで止めたマッチの Esc の検査用。
     pub esc_down: bool,
+    /// `local_input` の語に足すビット（既定 0）。マスクの内外のビットを人が押した形の検査用。
+    pub local_or: u16,
     /// 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`Game::digit_keys`。bit の並びは `digit_keys`）。`None` は読んではいけない間。検査が tick の合間に置く。
     pub digit_held: Option<u16>,
-    /// キーボードの Ctrl が押されている（`Game::keyboard_ctrl_down`）。
-    pub ctrl_down: bool,
     /// `digit_keys` を呼ばれた回数（1 tick に 1 回、読んでよい phase だけ —— マッチの外は `dispatch`、マッチの間は取得で）。
     pub digit_reads: u64,
     /// 台本の付いている実行（`Game::scripted_run`）の印。検査が立てる（既定は false = 台本の無い実行）。
@@ -140,8 +140,8 @@ impl FakeGame {
             reject_agreed: None,
             seats_seen: 0,
             esc_down: false,
+            local_or: 0,
             digit_held: None,
-            ctrl_down: false,
             digit_reads: 0,
             scripted: false,
             script_press: None,
@@ -272,16 +272,12 @@ impl Game for FakeGame {
         self.seats_seen |= 1 << (seat as u8);
         self.word_n += 1;
         self.local_reads += 1;
-        local_word(self.seed, self.word_n)
+        local_word(self.seed, self.word_n) | self.local_or
     }
 
     fn digit_keys(&mut self) -> Option<u16> {
         self.digit_reads += 1;
         self.digit_held
-    }
-
-    fn keyboard_ctrl_down(&mut self) -> bool {
-        self.ctrl_down
     }
 
     fn digit_script(&mut self) -> Option<u16> {

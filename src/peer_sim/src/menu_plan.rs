@@ -32,29 +32,30 @@
 use std::collections::HashMap;
 
 use higanr_core::input_model::SEND_MASK;
+use higanr_core::input_model::keys;
 use higanr_core::lockstep::Role;
 use higanr_core::menu_model::{
-    SCREEN_CHARA, SCREEN_DIFFICULTY, SCREEN_MAP, SCREEN_MODE, TRANSITION_BITS, align_chara_value,
-    chara_value,
+    SCREEN_CHARA, SCREEN_DIFFICULTY, SCREEN_MAP, SCREEN_MODE, TRANSITION_BITS, chara_value,
+    chara_value_parts,
 };
 use higanr_core::script::{ParseError, key_by_name};
 use higanr_core::selection::Press;
-use higanr_core::wire::{Step, StepKind};
+use higanr_core::wire::{CURSOR_NONE, Step, StepKind};
 
 /// ゲストの要求が捨てられてから押し直すまで（フレーム）。すぐ押し直すと同じ理由でまた捨てられやすい。
 pub const RETRY_FRAMES: u32 = 30;
 
 /// peer_sim がホストの役のときに出す合わせの value。peer_sim は画面のカーソルを持たないので固定にした。実機が相手のとき、受けた
-/// ゲスト（dll）はカーソルを難易度 2、キャラは 1P のカーソル 4・2P のカーソル 6、マップは値 14（一覧の最後から 2 番目）へ書く。
+/// ゲスト（dll）はカーソルを難易度 2、マップは値 14（一覧の最後から 2 番目）へ書く。
 pub const SIM_ALIGN_DIFFICULTY: u8 = 2;
-pub const SIM_ALIGN_CHARA_CURSORS: [u32; 2] = [4, 6];
 pub const SIM_ALIGN_MAP_ITEM: u8 = 14;
+/// peer_sim の席のキャラのカーソルの最初の値（1P・2P）。MENU の末尾で相手へ知らせる（相手の dll は相手の席をこの位置へ書く）。
+pub const SIM_CHARA_CURSORS: [u8; 2] = [4, 6];
 
-/// 模型の画面 `screen` の、peer_sim がホストの役のときの合わせの押下。選択の画面でなければ None。
+/// 模型の画面 `screen` の、peer_sim がホストの役のときの合わせの押下。合わせを使う画面（難易度・マップ）でなければ None。
 pub fn sim_align_press(screen: u8) -> Option<Press> {
     let value = match screen {
         SCREEN_DIFFICULTY => SIM_ALIGN_DIFFICULTY,
-        SCREEN_CHARA => align_chara_value(SIM_ALIGN_CHARA_CURSORS),
         SCREEN_MAP => SIM_ALIGN_MAP_ITEM,
         _ => return None,
     };
@@ -352,6 +353,64 @@ pub fn load(path: &std::path::Path) -> Result<MenuPlan, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("選択の台本 {} が読めない: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("選択の台本 {} の {e}", path.display()))
+}
+
+/// peer_sim の席のキャラのカーソル（MENU の末尾で相手へ知らせる位置）。ゲームが無いので、自分の語の方向の押した瞬間で ±1 し
+/// （ゲームの `0x0042474A` と同じく左 → 右 → 上 → 下の順に 1 つ。Shift を押している間は初期ライフの操作なので動かさない）、自分の席の
+/// キャラの決定が入ったらその値にする。未解放のキャラの飛ばしとランダムは無い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimCursor {
+    cursor: u8,
+    prev: u16,
+}
+
+impl SimCursor {
+    pub fn new(seat: usize) -> Self {
+        SimCursor {
+            cursor: SIM_CHARA_CURSORS[seat & 1],
+            prev: 0,
+        }
+    }
+
+    /// このフレームの自分の語（送る語）で動かす。キャラの画面のときだけ。
+    pub fn on_word(&mut self, screen: u8, word: u16) {
+        let pressed = word & !self.prev;
+        self.prev = word;
+        if screen != SCREEN_CHARA || word & keys::SHIFT != 0 {
+            return;
+        }
+        let step = if pressed & keys::LEFT != 0 {
+            15
+        } else if pressed & keys::RIGHT != 0 {
+            1
+        } else if pressed & keys::UP != 0 {
+            15
+        } else if pressed & keys::DOWN != 0 {
+            1
+        } else {
+            0
+        };
+        self.cursor = (self.cursor + step) % 16;
+    }
+
+    /// 入った押下が自分の席のキャラの決定なら、そのカーソルにする。
+    pub fn on_applied(&mut self, st: &Step, seat: usize) {
+        if st.screen == SCREEN_CHARA && st.kind == StepKind::Decide {
+            let (s, _, c) = chara_value_parts(st.value);
+            if s == seat & 1 {
+                self.cursor = c;
+            }
+        }
+    }
+
+    /// MENU に載せる（画面, カーソル）。キャラの画面の外は `CURSOR_NONE`。
+    pub fn report(&self, screen: u8) -> (u8, u8) {
+        if screen == SCREEN_CHARA {
+            (screen, self.cursor)
+        } else {
+            (screen, CURSOR_NONE)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -818,5 +877,35 @@ mod tests {
             }
         }
         assert!(n >= 2, "scripts/*.plan が {n} 本");
+    }
+
+    /// 壊れたら落ちる: 押し続けで毎フレーム動く・Shift 付きで動く・キャラの画面の外でも位置を送る・自分の決定の値へ合わせない・
+    /// 相手の席の決定で動く。
+    #[test]
+    fn sim_cursor_moves_on_edges_and_takes_its_own_decide() {
+        use keys::{DOWN, LEFT, RIGHT, SHIFT, UP};
+        let mut c = SimCursor::new(1);
+        assert_eq!(c.report(8), (8, 6));
+        assert_eq!(c.report(7), (7, CURSOR_NONE));
+        for w in [RIGHT, RIGHT, 0, RIGHT, 0, LEFT | RIGHT, 0, UP, 0, DOWN] {
+            c.on_word(8, w);
+        }
+        assert_eq!(c.report(8), (8, 7), "右 2 回・左 1 回・上 1 回・下 1 回");
+        c.on_word(8, 0);
+        c.on_word(8, SHIFT | LEFT);
+        c.on_word(16, 0);
+        c.on_word(16, RIGHT);
+        assert_eq!(c.report(8), (8, 7), "Shift 付き・ほかの画面では動かない");
+        let dec = |seat, cursor| Step {
+            step: 3,
+            kind: StepKind::Decide,
+            value: chara_value(seat, false, cursor),
+            screen: SCREEN_CHARA,
+        };
+        c.on_applied(&dec(0, 12), 1);
+        assert_eq!(c.report(8), (8, 7), "相手の席の決定");
+        c.on_applied(&dec(1, 12), 1);
+        assert_eq!(c.report(8), (8, 12));
+        assert_eq!(SimCursor::new(0).report(8), (8, 4));
     }
 }

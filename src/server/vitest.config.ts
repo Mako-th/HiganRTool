@@ -3,7 +3,7 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  // 数十本の接続を張る検査があり、ファイルを並列に走らせると 5 秒の既定では CPU の取り合いで落ちる。
+  // 数十本の接続を張る検査があり、ファイルを並列に走らせると 5 秒の既定では処理の取り合いで落ちる。
   test: { testTimeout: 20_000 },
   plugins: [
     cloudflareTest({

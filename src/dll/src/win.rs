@@ -20,15 +20,17 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW,
+    GetModuleFileNameW, GetModuleHandleExW, GetModuleHandleW, GetProcAddress,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     PAGE_WRITECOPY, VirtualQuery,
 };
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-use windows_sys::Win32::System::Threading::{CreateMutexW, CreateThread};
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, OSVERSIONINFOW};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, CreateThread, IsProcessorFeaturePresent, PF_XMMI64_INSTRUCTIONS_AVAILABLE,
+};
 
 use crate::hook_win::RealHook;
 use crate::log_mode::detail_out;
@@ -84,6 +86,66 @@ pub fn module_of_addr(addr: u32) -> Option<PathBuf> {
         return None;
     }
     module_path(module)
+}
+
+/// Wine の版（`ntdll.dll` が `wine_get_version` を持つときだけ）。Windows では `None`。ログの 1 行のためで、ゲームのスレッドでは呼ばない。
+pub fn wine_version() -> Option<String> {
+    let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: 0 終わりの UTF-16 の名前。ntdll は全プロセスに読み込み済みで、参照カウントを増やさない。
+    let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: 読み込み済みのモジュールのハンドルと 0 終わりの ASCII の名前。無ければ None が返るだけ。
+    let proc = unsafe { GetProcAddress(module, c"wine_get_version".as_ptr().cast()) }?;
+    // SAFETY: Wine の ntdll がこの名前で出す関数は引数なしで、静的な C 文字列へのポインタを返す（cdecl。i686 の extern "C" と同じ）。
+    let get: extern "C" fn() -> *const core::ffi::c_char = unsafe { core::mem::transmute(proc) };
+    let p = get();
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: 上の関数が返す 0 終わりの静的な文字列。
+    let s = unsafe { core::ffi::CStr::from_ptr(p) }.to_string_lossy();
+    let s: String = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(32)
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
+
+/// OS のバージョン（`ntdll!RtlGetVersion`。`GetVersionEx` と違い、exe の互換モードの宣言で値が変わらない）。ゲームのスレッドでは呼ばない。
+pub fn os_version() -> Option<probe::OsVersion> {
+    let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: 0 終わりの UTF-16 の名前。ntdll は全プロセスに読み込み済みで、参照カウントを増やさない。
+    let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: 読み込み済みのモジュールのハンドルと 0 終わりの ASCII の名前。無ければ None が返るだけ。
+    let proc = unsafe { GetProcAddress(module, c"RtlGetVersion".as_ptr().cast()) }?;
+    // SAFETY: RtlGetVersion は `NTSTATUS NTAPI (PRTL_OSVERSIONINFOW)`（stdcall。i686 の extern "system"）。
+    let get: unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32 =
+        unsafe { core::mem::transmute(proc) };
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: core::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: 大きさの欄を埋めた OSVERSIONINFOW を渡す。関数はそれを書くだけ。
+    let status = unsafe { get(&mut info) };
+    (status >= 0).then_some(probe::OsVersion {
+        major: info.dwMajorVersion,
+        minor: info.dwMinorVersion,
+        build: info.dwBuildNumber,
+    })
+}
+
+/// CPU の（SSE2, AVX2）。SSE2 は OS の見方（i686 のビルドは SSE2 を前提にしているので、無ければここまで来ない）、
+/// AVX2 は CPUID と OS の保存の対応（XGETBV）の両方。
+pub fn cpu_features() -> (bool, bool) {
+    // SAFETY: 引数は機能の番号だけで、失敗しない。
+    let sse2 = unsafe { IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) } != 0;
+    (sse2, std::arch::is_x86_feature_detected!("avx2"))
 }
 
 pub fn exe_image_base() -> usize {
@@ -284,6 +346,8 @@ fn run_probe_thread(module: HMODULE) {
             return;
         }
     };
+    // 例外の記録は、この後のどこで落ちても残るように、ログを開いた直後に入れる。
+    let veh = crate::crash_win::install(&file);
     // 区切りの行はウィンドウとパッドの頼まれた行（`DllMain` から積まれる）より先に、包みの外から 1 回で書く。
     let stem = run_path.file_stem().map(|s| s.to_string_lossy());
     let header = format!(
@@ -323,6 +387,17 @@ fn run_probe_thread(module: HMODULE) {
     );
     crate::log_mode::set_detail(choice.detail);
     let _ = writeln!(file, "{}", mode_line(choice.detail));
+    let (sse2, avx2) = cpu_features();
+    let _ = writeln!(file, "{}", probe::system_line(os_version(), sse2, avx2));
+    let _ = match &veh {
+        Ok(()) => writeln!(detail_out(&mut file), "例外の記録: 入れた"),
+        Err(why) => writeln!(file, "例外の記録: 入れられなかった（{why}）"),
+    };
+    if let Some(v) = wine_version() {
+        let _ = writeln!(file, "環境: Wine {v}");
+    }
+    // 落ちたときの `d3d8.dll+RVA` が OS のものか差し替えかを読めるように。
+    let _ = writeln!(file, "{}", crate::d3d8_info_win::d3d8_line());
     if let Some(line) = &seed_line {
         let _ = writeln!(file, "{line}");
     }
@@ -382,6 +457,9 @@ fn run_probe_thread(module: HMODULE) {
             panic_text(p.as_ref())
         ),
     };
+    if let Some(line) = crate::crash_win::summary_line() {
+        let _ = writeln!(file, "{line}");
+    }
     // 「終了」の行の後に頼まれた分も本ログの最後へ流す。
     file.drain_now();
 }
@@ -573,6 +651,26 @@ mod tests {
     use super::*;
 
     static SAMPLE: [u8; 8] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
+
+    /// Windows では `wine_get_version` が無く `None`。Wine で走らせたときは版の文字列（空でない ASCII）になる。
+    #[test]
+    fn wine_version_is_none_or_a_plain_string() {
+        if let Some(v) = wine_version() {
+            assert!(
+                !v.is_empty() && v.chars().all(|c| c.is_ascii_graphic()),
+                "{v}"
+            );
+        }
+    }
+
+    /// 壊れたら落ちる: RtlGetVersion の呼び方（構造体の大きさ・呼び出し規約）を誤って値が取れない・0 になる。
+    #[test]
+    fn os_version_and_cpu_features_are_read() {
+        let v = os_version().expect("RtlGetVersion が値を返す");
+        assert!(v.major >= 6 && v.build > 0, "{v:?}");
+        let (sse2, _avx2) = cpu_features();
+        assert!(sse2, "i686 のビルドが走っているなら SSE2 はある");
+    }
 
     #[test]
     fn read_own_memory_reads_a_static_array() {

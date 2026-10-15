@@ -43,6 +43,7 @@ fn armed(s: &NetSettings, mapped: Option<SocketAddr>) -> Armed {
         s,
         lo(47_001),
         mapped,
+        None,
         Some(room_opts("ws://127.0.0.1:9")),
         || Ok(SESSION),
         || Ok(SECRET),
@@ -95,18 +96,35 @@ fn punch_candidates_keep_only_the_in_scope_addresses_of_the_sockets_family() {
 }
 
 #[test]
-fn arming_needs_the_spectate_section_and_a_room_server_and_draws_fresh_values() {
+fn arming_needs_the_spectate_section_and_draws_fresh_values() {
     let off = crate::net_config::from_text(
         "[netplay]\nenable = 1\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\n",
     )
     .unwrap()
     .unwrap();
-    let (a, note) = arm(&off, lo(47_001), None, Some(room_opts("ws://127.0.0.1:9")));
+    let (a, note) = arm(
+        &off,
+        lo(47_001),
+        None,
+        None,
+        Some(room_opts("ws://127.0.0.1:9")),
+    );
     assert!(a.is_none() && note.is_empty(), "{note}");
     let on = settings("");
-    let (a, note) = arm(&on, lo(47_001), None, None);
-    assert!(a.is_none() && note.contains("room_server"), "{note}");
-    let (a, note) = arm(&on, lo(47_001), None, Some(room_opts("ws://127.0.0.1:9")));
+    // ルームサーバーが無くても用意する（観戦コードの経路だけ）。配る側のスレッドは起こせない。
+    let (a, note) = arm(&on, lo(47_001), None, None, None);
+    let a = a.expect(&note);
+    assert!(note.contains("観戦用のルームへは入らない"), "{note}");
+    let room = RoomName::parse("synth-room").unwrap();
+    let err = spawn(a.kit, &room, None).unwrap_err();
+    assert!(err.contains("room_server"), "{err}");
+    let (a, note) = arm(
+        &on,
+        lo(47_001),
+        None,
+        None,
+        Some(room_opts("ws://127.0.0.1:9")),
+    );
     assert!(a.is_some(), "{note}");
     assert!(
         note.contains("配る側を用意した") && !note.contains("127.0.0.1"),
@@ -133,6 +151,7 @@ fn arming_needs_the_spectate_section_and_a_room_server_and_draws_fresh_values() 
         &on,
         lo(47_001),
         None,
+        None,
         Some(room_opts("ws://127.0.0.1:9")),
         &mut draw,
         || Ok(Secret([1; 16])),
@@ -141,6 +160,7 @@ fn arming_needs_the_spectate_section_and_a_room_server_and_draws_fresh_values() 
     let a2 = arm_with(
         &on,
         lo(47_001),
+        None,
         None,
         Some(room_opts("ws://127.0.0.1:9")),
         &mut draw,
@@ -297,6 +317,7 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
         &s,
         lo(47_002),
         None,
+        None,
         Some(room_opts(&base)),
         || Ok(SESSION),
         || Ok(SECRET),
@@ -448,6 +469,7 @@ fn listing_runner(srv: &FakeServer, listing: Option<ListingInfo>) -> (Runner, Ar
     let a = arm_with(
         &s,
         lo(47_003),
+        None,
         None,
         Some(room_opts(&base)),
         || Ok(SESSION),

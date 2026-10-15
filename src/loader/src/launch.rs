@@ -16,11 +16,14 @@ use std::path::{Path, PathBuf};
 use higanr_core::lang::Tx;
 use higanr_core::pe::{self, Ident, IdentField, PeError};
 
-use crate::win::{ErrorCode, Handle, ProcessInfo, Remote, Spawn, WaitResult, Win32};
+use crate::win::{ErrorCode, Handle, LaunchNote, ProcessInfo, Remote, Spawn, WaitResult, Win32};
 
 /// リモートスレッドを待つ上限（行 7）。DllMain は重い仕事をしない約束なので普段は数十ミリ秒。
-/// 超えたら DLL かゲームの初期化で止まっている。
-pub const REMOTE_THREAD_TIMEOUT_MS: u32 = 10_000;
+/// ウイルス対策ソフトが初回の読み込みを止めている間（クラウド照会で長引くことがある。実測はしていない）も待てるよう長く取る。
+pub const REMOTE_THREAD_TIMEOUT_MS: u32 = 60_000;
+
+/// 最初の待ち。ここまでに終わらず、ゲームのプロセスが生きていれば知らせて `REMOTE_THREAD_TIMEOUT_MS` まで延ばす。
+pub const REMOTE_THREAD_NOTICE_MS: u32 = 10_000;
 
 /// 消えたかを待つ上限。`TerminateProcess` は終わりを待たずに戻るため。
 pub const TERMINATE_WAIT_MS: u32 = 5_000;
@@ -156,7 +159,7 @@ pub const DLL_NOT_ABSOLUTE: Tx = Tx {
     en: "not an absolute path",
 };
 pub const DLL_PATH_HAS_NUL: Tx = Tx {
-    ja: "パスの途中に 0 がある",
+    ja: "パスの途中に0がある",
     en: "the path contains a NUL character",
 };
 
@@ -325,7 +328,12 @@ fn inject_and_resume<W: Win32>(
     };
 
     // 行 7: 時間切れでは領域を返さない（スレッドがまだパスを読んでいるかもしれない）。プロセスごと消せば領域も返る。
-    match w.wait(remote, REMOTE_THREAD_TIMEOUT_MS) {
+    let mut waited = w.wait(remote, REMOTE_THREAD_NOTICE_MS);
+    if waited == WaitResult::TimedOut && w.wait(pi.process, 0) == WaitResult::TimedOut {
+        w.note(LaunchNote::SlowLoad);
+        waited = w.wait(remote, REMOTE_THREAD_TIMEOUT_MS - REMOTE_THREAD_NOTICE_MS);
+    }
+    match waited {
         WaitResult::Signaled => {}
         other => {
             close(w, remote, issues);
@@ -390,8 +398,11 @@ mod tests {
     //! ファイルは合成の PE。
     use super::*;
     use crate::ledger::{Call, Traced};
+    use crate::staged::Logged;
     use crate::synth;
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     const GAME: &str = r"C:\fake\game\target.exe";
     const GAME_DIR: &str = r"C:\fake\game";
@@ -420,6 +431,10 @@ mod tests {
         FreeOnly,
         PatchWrite,
         PatchLies,
+        /// 最初の待ちは時間切れ、ゲームのプロセスは生きていて、延ばした待ちで終わる。
+        SlowLoad,
+        /// 最初の待ちも延ばした待ちも時間切れ（プロセスは生きている）。
+        SlowLoadNeverEnds,
     }
 
     struct Fake {
@@ -429,6 +444,11 @@ mod tests {
         process: Option<Handle>,
         remote_thread: Option<Handle>,
         mem: HashMap<usize, u8>,
+        remote_waits: u32,
+        notes: Vec<LaunchNote>,
+        /// ログの行の置き場（`staged::Logged` の検査用）。呼ばれた瞬間の最後の行を `at_call` に残す。
+        trail: Option<Rc<RefCell<Vec<String>>>>,
+        at_call: Vec<(&'static str, String)>,
     }
 
     impl Fake {
@@ -444,6 +464,16 @@ mod tests {
                 process: None,
                 remote_thread: None,
                 mem: HashMap::new(),
+                remote_waits: 0,
+                notes: Vec::new(),
+                trail: None,
+                at_call: Vec::new(),
+            }
+        }
+        fn mark(&mut self, what: &'static str) {
+            if let Some(t) = &self.trail {
+                let last = t.borrow().last().cloned().unwrap_or_default();
+                self.at_call.push((what, last));
             }
         }
         fn with_mem(mut self, at: usize, bytes: &[u8]) -> Self {
@@ -473,6 +503,7 @@ mod tests {
             Ok(LLW)
         }
         fn create_process_suspended(&mut self, _spawn: &Spawn) -> Result<ProcessInfo, ErrorCode> {
+            self.mark("CreateProcess");
             if self.fail == FailAt::CreateProcess {
                 return Err(5); // ERROR_ACCESS_DENIED
             }
@@ -486,12 +517,14 @@ mod tests {
             })
         }
         fn virtual_alloc(&mut self, _p: Handle, _size: usize) -> Result<Remote, ErrorCode> {
+            self.mark("VirtualAlloc");
             if self.fail == FailAt::VirtualAlloc {
                 return Err(8);
             }
             Ok(Remote(0x0023_0000))
         }
         fn write_memory(&mut self, _p: Handle, _at: Remote, _d: &[u8]) -> Result<(), ErrorCode> {
+            self.mark("WriteMemory");
             if self.fail == FailAt::WriteMemory {
                 return Err(299);
             }
@@ -520,6 +553,7 @@ mod tests {
             _start: usize,
             _param: Remote,
         ) -> Result<Handle, ErrorCode> {
+            self.mark("CreateRemoteThread");
             if self.fail == FailAt::CreateRemoteThread {
                 return Err(5);
             }
@@ -527,16 +561,30 @@ mod tests {
             self.remote_thread = Some(h);
             Ok(h)
         }
-        fn wait(&mut self, handle: Handle, _ms: u32) -> WaitResult {
+        fn wait(&mut self, handle: Handle, ms: u32) -> WaitResult {
             // 失敗を仕込むのはリモートスレッドの待ちだけ。
             if Some(handle) == self.remote_thread {
+                self.remote_waits += 1;
                 match self.fail {
-                    FailAt::RemoteWaitTimeout => return WaitResult::TimedOut,
+                    FailAt::RemoteWaitTimeout | FailAt::SlowLoadNeverEnds => {
+                        return WaitResult::TimedOut;
+                    }
+                    FailAt::SlowLoad if self.remote_waits == 1 => return WaitResult::TimedOut,
                     FailAt::RemoteWaitFailed => return WaitResult::Failed(6),
                     _ => {}
                 }
             }
+            // 生きているかの問い合わせ（待ち 0）にだけ「生きている」と答える。
+            if Some(handle) == self.process
+                && ms == 0
+                && matches!(self.fail, FailAt::SlowLoad | FailAt::SlowLoadNeverEnds)
+            {
+                return WaitResult::TimedOut;
+            }
             WaitResult::Signaled
+        }
+        fn note(&mut self, note: LaunchNote) {
+            self.notes.push(note);
         }
         fn thread_exit_code(&mut self, _t: Handle) -> Result<u32, ErrorCode> {
             match self.fail {
@@ -552,6 +600,7 @@ mod tests {
             Ok(())
         }
         fn resume_thread(&mut self, _t: Handle) -> Result<u32, ErrorCode> {
+            self.mark("Resume");
             if self.fail == FailAt::Resume {
                 return Err(6);
             }
@@ -921,6 +970,195 @@ mod tests {
             )));
             assert_all_closed(&t);
         }
+    }
+
+    fn remote_waits(t: &Traced<Fake>) -> Vec<u32> {
+        let remote = t.inner.remote_thread.unwrap();
+        t.calls()
+            .iter()
+            .filter_map(|c| match c {
+                Call::Wait {
+                    handle, timeout_ms, ..
+                } if *handle == remote => Some(*timeout_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row7_a_slow_load_is_announced_and_waited_for_while_the_game_lives() {
+        let (r, t) = run(Fake::new(FailAt::SlowLoad), &request(false));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(t.inner.notes, vec![LaunchNote::SlowLoad]);
+        assert_eq!(
+            remote_waits(&t),
+            vec![
+                REMOTE_THREAD_NOTICE_MS,
+                REMOTE_THREAD_TIMEOUT_MS - REMOTE_THREAD_NOTICE_MS
+            ]
+        );
+        assert_eq!(t.count("ResumeThread"), 1);
+        assert_eq!(t.count("TerminateProcess"), 0);
+        assert_all_closed(&t);
+    }
+
+    #[test]
+    fn row7_gives_up_after_the_full_limit_even_while_the_game_lives() {
+        let (f, t) = run_fail(FailAt::SlowLoadNeverEnds);
+        assert_eq!(f.error, LaunchError::RemoteThreadTimedOut);
+        assert_eq!(t.inner.notes, vec![LaunchNote::SlowLoad]);
+        assert_eq!(
+            remote_waits(&t).iter().sum::<u32>(),
+            REMOTE_THREAD_TIMEOUT_MS
+        );
+        assert_aborted(&t);
+        assert_all_closed(&t);
+    }
+
+    #[test]
+    fn row7_does_not_extend_the_wait_when_the_game_is_already_gone() {
+        let (f, t) = run_fail(FailAt::RemoteWaitTimeout);
+        assert_eq!(f.error, LaunchError::RemoteThreadTimedOut);
+        assert!(t.inner.notes.is_empty(), "{:?}", t.inner.notes);
+        assert_eq!(remote_waits(&t), vec![REMOTE_THREAD_NOTICE_MS]);
+    }
+
+    #[test]
+    fn a_normal_load_waits_once_and_says_nothing() {
+        let (r, t) = run(Fake::new(FailAt::None), &request(false));
+        assert!(r.is_ok());
+        assert!(t.inner.notes.is_empty());
+        assert_eq!(remote_waits(&t), vec![REMOTE_THREAD_NOTICE_MS]);
+    }
+
+    struct LoggedRun {
+        result: Result<Launched, LaunchFailure>,
+        lines: Vec<String>,
+        /// 各段が呼ばれた瞬間の、ログの最後の行。
+        at_call: Vec<(&'static str, String)>,
+        shown: Vec<LaunchNote>,
+    }
+
+    /// 段階ログの包みで `fake` を起動する。
+    fn run_logged(mut fake: Fake) -> LoggedRun {
+        let trail = Rc::new(RefCell::new(Vec::<String>::new()));
+        fake.trail = Some(Rc::clone(&trail));
+        let sink = {
+            let t = Rc::clone(&trail);
+            move |s: &str| t.borrow_mut().push(s.to_string())
+        };
+        let shown = RefCell::new(Vec::new());
+        let announce = |n| shown.borrow_mut().push(n);
+        let mut w = Logged::new(fake, &sink, &announce);
+        let r = launch(&mut w, &request(false));
+        let at_call = std::mem::take(&mut w.inner.at_call);
+        drop(w);
+        let lines = trail.borrow().clone();
+        LoggedRun {
+            result: r,
+            lines,
+            at_call,
+            shown: shown.into_inner(),
+        }
+    }
+
+    fn index_of(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} の行が無い: {lines:#?}"))
+    }
+
+    // 何が壊れたら落ちるか: 段の行を呼ぶ後に書く・段を飛ばす・順を誤ると、落ちた回の最後の行が「どの段で止まったか」を示さない。
+    #[test]
+    fn every_stage_is_logged_before_its_call_and_in_order() {
+        let LoggedRun {
+            result,
+            lines,
+            at_call,
+            shown,
+        } = run_logged(Fake::new(FailAt::None));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(shown.is_empty());
+        let order = [
+            "CreateProcessW を呼ぶ",
+            "VirtualAllocEx を呼ぶ",
+            "WriteProcessMemory を呼ぶ",
+            "CreateRemoteThread を呼ぶ",
+            "LoadLibraryW の戻り: 0x10000000（DLL を読み込めた）",
+            "ResumeThread を呼ぶ",
+        ];
+        let at: Vec<usize> = order.iter().map(|n| index_of(&lines, n)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?} {lines:#?}");
+        let want = [
+            ("CreateProcess", "CreateProcessW を呼ぶ"),
+            ("VirtualAlloc", "VirtualAllocEx を呼ぶ"),
+            ("WriteMemory", "WriteProcessMemory を呼ぶ"),
+            ("CreateRemoteThread", "CreateRemoteThread を呼ぶ"),
+            ("Resume", "ResumeThread を呼ぶ"),
+        ];
+        assert_eq!(at_call.len(), want.len(), "{at_call:?}");
+        for ((what, last), (want_what, phrase)) in at_call.iter().zip(want) {
+            assert_eq!(*what, want_what);
+            assert!(
+                last.contains(phrase),
+                "{what} が呼ばれた瞬間の最後の行が「{phrase}」でない: {last}"
+            );
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("→ 成功 pid 4242")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("最大 0 ms")),
+            "生死の問い合わせ（待ち 0）まで書いた"
+        );
+    }
+
+    #[test]
+    fn a_failed_stage_and_a_zero_load_library_are_logged() {
+        let LoggedRun { result, lines, .. } = run_logged(Fake::new(FailAt::CreateProcess));
+        assert_eq!(result.unwrap_err().error, LaunchError::CreateProcess(5));
+        assert!(
+            lines.iter().any(|l| l.contains("→ 失敗 GetLastError 5")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("VirtualAllocEx")));
+
+        let LoggedRun { result, lines, .. } = run_logged(Fake::new(FailAt::LoadLibraryZero));
+        assert_eq!(
+            result.unwrap_err().error,
+            LaunchError::LoadLibraryReturnedZero
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("LoadLibraryW の戻り: 0（DLL を読み込めなかった）")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("ResumeThread")));
+    }
+
+    #[test]
+    fn a_slow_load_is_logged_and_announced_once() {
+        let LoggedRun {
+            result,
+            lines,
+            shown,
+            ..
+        } = run_logged(Fake::new(FailAt::SlowLoad));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(shown, vec![LaunchNote::SlowLoad]);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("10 秒で終わらない") && l.contains("最大 60 秒")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("待つ（最大 50000 ms）")),
+            "{lines:#?}"
+        );
     }
 
     #[test]

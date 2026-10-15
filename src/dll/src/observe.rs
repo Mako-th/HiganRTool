@@ -155,6 +155,10 @@ pub trait RecordEnv {
     fn d3d8_probe(&mut self) -> D3d8Probe {
         D3d8Probe::default()
     }
+    /// 文字の描画が止まった理由の本ログの行。止めたあと最初に呼んだ 1 回だけ返す（ゲームのスレッドは原子の値を置くだけで、書くのはこの側）。
+    fn overlay_stop_line(&mut self) -> Option<String> {
+        None
+    }
 
     // ---- 台本の feed のリングバッファ・進み具合・撮影の置き場。既定は「台本なし」で何も返さない。
     fn feed_next_seq(&self) -> u32 {
@@ -322,7 +326,7 @@ pub enum RunLen {
 }
 
 /// この実行で描画だけのフレームを作るか。作るのは台本なしの実行（`Fixed`）だけで、配るバージョン（feature `dist`）ではそれも作らない
-/// （ネットワークなしで起こした友人の花映塚が 3 秒ごとに止まって見えるため）。`dist` を引数で受けるのは、配るバージョンの形を開発用のビルドの検査でも見るため。
+/// （ネットワークなしで起こした配布版の花映塚が 3 秒ごとに止まって見えるため）。`dist` を引数で受けるのは、配るバージョンの形を開発用のビルドの検査でも見るため。
 fn makes_render_only(len: RunLen, dist: bool) -> bool {
     matches!(len, RunLen::Fixed(_)) && !dist
 }
@@ -506,7 +510,7 @@ struct Streams {
 /// `_snap.bin` に書く件の上限（計測の上限 `SCRIPT_MAX_SECONDS` × 60 tick。約 70 MB）。
 const SNAP_MAX_RECORDS: u64 = SCRIPT_MAX_SECONDS as u64 * 60;
 
-/// 観測用の 4 つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くか。配るバージョンでは書かない（友人の 1 回の起動のログの約 88% がこの 4 つだった）。
+/// 観測用の 4 つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くか。配るバージョンでは書かない（配った版を使う人の 1 回の起動のログの約 88% がこの 4 つだった）。
 /// 集計（本ログ）・`_net_frames.csv`・`_pacing.csv`・`_menu.csv` は、配るバージョンでも詳細なログ（ini の `[log] detail = 1`）なら書く。
 fn writes_observe_files(dist: bool) -> bool {
     !dist
@@ -739,7 +743,7 @@ pub fn run(
 /// （`script_watch::ScriptWatch`）、描画だけのフレームの予定は作らず、台本が終わるか止まってから `tail` 秒で終える（上限 `max` 秒）。
 ///
 /// 試験のまとめ（`trial_summary`）: 1 秒ごとに材料を集め、項目の印の並びが変わったとき（と、60 秒ごと）に「途中経過」の節を本ログへ書く。
-/// 友人がゲームを閉じて終えると、この関数が終わりの節を書く前にプロセスごと消えるため。終わりの節は呼び手（`session::run`）が、
+/// 使う人がゲームを閉じて終えると、この関数が終わりの節を書く前にプロセスごと消えるため。終わりの節は呼び手（`session::run`）が、
 /// ペースなどの終わりの集計の後（本ログの最後）に書く。`game` は設置までに分かったこと。
 pub fn run_len(
     hook: &mut dyn HookEnv,
@@ -975,6 +979,9 @@ pub fn run_len(
             "計測 {k}/{max_text}: 経過 {} ms / 回数 {c} / 増分 {step}",
             hook.now_ms().saturating_sub(start)
         );
+        if let Some(l) = rec.overlay_stop_line() {
+            let _ = writeln!(out, "{l}（{k} 秒の時点で見た）");
+        }
         // 別のスレッドが本ログへ頼んだ行を、簡潔なログでも 1 秒以内に書く。
         let _ = out.flush();
         // ネットワークの数は 1 秒ごとに読む（作り直しの行と、ネットワークの実行の終わりの判定）。ネットワークのセッションを置いていなければ None。
@@ -1281,6 +1288,9 @@ pub(crate) mod tests {
         /// 観戦者のセッションの材料（`watch_log` を呼んだ回数 1, 2, … → 材料）。None なら観戦者のセッションが無い実行（既定の空）。
         pub(crate) watch: Option<fn(u32) -> WatchLog>,
         pub(crate) watch_calls: u32,
+        /// `overlay_stop_line` を呼んだ回数と、その何回目に返すか・返す行（1 回だけ返す本物と同じ）。
+        pub(crate) overlay_stop_calls: u32,
+        pub(crate) overlay_stop: Option<(u32, String)>,
         /// 試験のまとめの材料（パニックなど）。
         pub(crate) host: HostFacts,
     }
@@ -1325,6 +1335,8 @@ pub(crate) mod tests {
                 render_only_asks: Vec::new(),
                 watch: None,
                 watch_calls: 0,
+                overlay_stop_calls: 0,
+                overlay_stop: None,
                 host: HostFacts::default(),
             }
         }
@@ -1411,6 +1423,13 @@ pub(crate) mod tests {
         }
         fn host_facts(&mut self) -> HostFacts {
             self.host.clone()
+        }
+        fn overlay_stop_line(&mut self) -> Option<String> {
+            self.overlay_stop_calls += 1;
+            match &self.overlay_stop {
+                Some((at, line)) if *at == self.overlay_stop_calls => Some(line.clone()),
+                _ => None,
+            }
         }
         fn watch_log(&mut self) -> WatchLog {
             self.watch_calls += 1;
@@ -2637,6 +2656,25 @@ pub(crate) mod tests {
         );
         assert!(
             log.contains("（終わりに読み直し）D3D8 の下見: EndScene のモジュール = th09.exe"),
+            "{log}"
+        );
+    }
+
+    /// 壊れたら落ちる: 見張りが文字の描画の止まった理由を問わない・問っても本ログへ書かない・秒の時点を付けない。
+    /// 落ちた後の調べで描画が止まっていたかが読めなくなる。
+    #[test]
+    fn overlay_stop_line_is_asked_every_second_and_written_to_the_brief_log() {
+        let mut h = clock_hook();
+        let mut r = FakeRecord::new(sixty_fps(6), 6);
+        r.overlay_stop = Some((3, "文字の描画: 描画を止めた（合成）".to_string()));
+        let mut out = Vec::new();
+        run(&mut h, &mut r, 0, &mut out, 5);
+        let log = String::from_utf8(out).unwrap();
+        assert_eq!(r.overlay_stop_calls, 5, "1 秒ごとに問う");
+        assert_eq!(
+            log.matches("文字の描画: 描画を止めた（合成）（3 秒の時点で見た）")
+                .count(),
+            1,
             "{log}"
         );
     }

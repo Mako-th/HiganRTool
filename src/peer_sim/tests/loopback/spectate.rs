@@ -349,7 +349,7 @@ fn spectator_survives_random_fault_both_ways() {
 
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
-fn late_join_in_a_rematch_starts_at_the_seg_record() {
+fn late_join_in_a_rematch_starts_at_the_last_select_seg() {
     let t = run_trio(
         FaultConfig::default(),
         FaultConfig::default(),
@@ -357,41 +357,11 @@ fn late_join_in_a_rematch_starts_at_the_seg_record() {
         |c| c.start_after_ms = 4_000,
         false,
     );
-    let (a, b, w) = (&t.a, &t.b, &t.w);
-    assert_pair_ok(a, b, "遅れた JOIN");
-    assert_eq!(
-        w.end,
-        WatchEnd::HostEnded(ByeReason::Finished),
-        "{}",
-        watch::summary(w)
-    );
-    assert_eq!(w.frames.len(), FRAMES as usize, "{}", watch::summary(w));
-    assert_same_frames(&w.frames, &rows(&a.recs[FRAMES as usize..]), "遅れた JOIN");
-    assert_eq!(w.frames.first().map(|f| (f.seg, f.frame)), Some((1, 0)));
-    // 記録は「seg 1 の始まり（と名前）・次の seg 2 の始まり（と名前）・終わり」だけ（名前は各 seg の `Seg` の直後。遅れて入った観戦者も受ける）。
-    // seg 1 は再戦で押下・SELECT が無く（`Seg` 1 の直後がマッチの語）、seg 0 の記録（`Seg` 0・押下・SELECT）は seg 1 の先頭より前で、受けない。
-    assert_eq!(
-        kinds(w),
-        [
-            "seg1",
-            "name1=sim-b",
-            "name2=sim-a",
-            "seg2",
-            "name1=sim-b",
-            "name2=sim-a",
-            "endFinished"
-        ]
-    );
-    let watch_rows = compare_spectate::parse_watch_frames(&watch::frames_csv(w)).unwrap();
-    let player = compare_spectate::parse_player(&record::log_text(a, "test")).unwrap();
-    let o = compare_spectate::compare(&watch_rows, &player);
-    assert!(
-        o.ok && o.offset == Some(FRAMES as usize) && o.starts_at_seg_head && o.tail_left == Some(0),
-        "{o:?}"
-    );
-    let sp = a.spectate.as_ref().unwrap();
+    // 再戦の seg 1 の途中で入っても、選択のある seg 0（`Seg` 0・押下・SELECT）から全部受ける（頭から観戦したのと同じ列）。
+    assert_full_watch(&t, "再戦の途中の JOIN");
+    let sp = t.a.spectate.as_ref().unwrap();
     assert_eq!(sp.counts.joined, 1);
-    assert_eq!(a.recs, baseline().0.recs);
+    assert_eq!(t.a.recs, baseline().0.recs);
 }
 
 /// 両者の読み込みの長さを揃える（`configs` は A 30 ms・B 250 ms で、先に読み込みを終えた側が 13〜14 フレーム stall する。その stall は

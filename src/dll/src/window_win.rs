@@ -500,7 +500,7 @@ mod tests {
     }
     impl Drop for Page {
         fn drop(&mut self) {
-            // SAFETY: `new` で確保した頁を、確保した本人が解放する。
+            // SAFETY: `new` で確保した頁を、確保した側が解放する。
             unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
         }
     }

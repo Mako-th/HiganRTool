@@ -1,7 +1,7 @@
 //! ゲーム内のメニューの「ルーム名の入力」（pure。確保しない）。
 //!
-//! ルーム名はゲームの中（花映塚のネット対戦のメニュー）でキーボードから打って決め、前に使った名を次の初めの値にする。ここは文字の受け方・
-//! 編集・初めの値・覚えるファイルの文字だけで、ウィンドウから文字を受けること（`WM_CHAR`）とファイルの読み書きは dll（`text_input_win` / `room_last`）の仕事。
+//! ルーム名はゲームの中（花映塚のネット対戦のメニュー）でキーボードから打って決め、決めた名は ini の `room` に書き戻す（次の初めの値になる）。
+//! ここは文字の受け方・編集・初めの値だけで、ウィンドウから文字を受けること（`WM_CHAR`）と ini の書き換えは dll（`text_input_win` / `ini_save`）の仕事。
 //!
 //! - 受ける文字は `room::RoomName::accepts_char`（ASCII の英数字・`-`・`_`）。全角の英数字・`－`・`＿` は半角に直して受け、
 //!   ほかの文字は捨てる。32 文字（`room::ROOM_NAME_MAX`）まで。
@@ -13,7 +13,7 @@
 
 use crate::room::{ROOM_NAME_MAX, RoomName, RoomNameError};
 
-/// 前に使ったルーム名を覚えるファイルの名前（`HiganRTool.exe` の側の置き場。ゲームのフォルダには書かない）。
+/// 以前の版がルーム名を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、起動のときに ini の `room` へ移して消す。
 pub const ROOM_LAST_FILE: &str = "room_last.txt";
 
 /// `WM_CHAR` の制御文字（Backspace・Enter・改行・Ctrl+Backspace の 0x7F）。
@@ -221,34 +221,27 @@ impl RoomInput {
     }
 }
 
-/// 入力の初めの値: ini の `room`（文字の決まりを通るもの）→ 前に使った名 → 空。ini の文字が決まりの外なら黙って前の名に落とす。
-pub fn initial(ini: Option<&str>, last: Option<RoomBuf>) -> RoomBuf {
-    initial_from(ini, last).0
+/// 入力の初めの値: ini の `room`（文字の決まりを通るもの）→ 空。ini の文字が決まりの外なら黙って空に落とす。
+pub fn initial(ini: Option<&str>) -> RoomBuf {
+    initial_from(ini).0
 }
 
 /// 初めの値の出どころ（本ログの 1 行に出どころだけ書く。名は書かない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialFrom {
     Ini,
-    LastName,
     Empty,
 }
 
-pub fn initial_from(ini: Option<&str>, last: Option<RoomBuf>) -> (RoomBuf, InitialFrom) {
-    if let Some(b) = ini.and_then(RoomBuf::from_name) {
-        (b, InitialFrom::Ini)
-    } else if let Some(b) = last {
-        (b, InitialFrom::LastName)
-    } else {
-        (RoomBuf::new(), InitialFrom::Empty)
+pub fn initial_from(ini: Option<&str>) -> (RoomBuf, InitialFrom) {
+    match ini.and_then(RoomBuf::from_name) {
+        Some(b) => (b, InitialFrom::Ini),
+        None => (RoomBuf::new(), InitialFrom::Empty),
     }
 }
 
-pub fn last_text(name: &RoomBuf) -> String {
-    format!("{}\n", name.as_str())
-}
-
-/// 覚えたファイルの中身を読む。先頭の BOM と前後の空白は除き、最初の 1 行だけを見る。決まりの外・空・壊れた文字は `None`。
+/// 以前の版が覚えたファイル（`ROOM_LAST_FILE`）の中身を読む（引き継ぎ用）。先頭の BOM と前後の空白は除き、最初の 1 行だけを見る。
+/// 決まりの外・空・壊れた文字は `None`。
 pub fn parse_last(text: &str) -> Option<RoomBuf> {
     let first = text.trim_start_matches('\u{FEFF}').lines().next()?;
     RoomBuf::from_name(first.trim())
@@ -381,27 +374,25 @@ mod tests {
     }
 
     #[test]
-    fn the_initial_value_prefers_ini_then_the_last_name_then_empty() {
-        let last = RoomBuf::from_name("last").unwrap();
-        assert_eq!(initial(Some("from-ini"), Some(last)).as_str(), "from-ini");
-        assert_eq!(initial(None, Some(last)).as_str(), "last");
-        assert_eq!(initial(Some(""), Some(last)).as_str(), "last");
-        assert_eq!(initial(Some("花 映塚"), Some(last)).as_str(), "last");
-        assert_eq!(initial(Some("bad name"), None).as_str(), "");
-        assert_eq!(initial(None, None).as_str(), "");
-        assert_eq!(initial_from(Some("x"), Some(last)).1, InitialFrom::Ini);
-        assert_eq!(
-            initial_from(Some("x y"), Some(last)).1,
-            InitialFrom::LastName
-        );
-        assert_eq!(initial_from(None, Some(last)).1, InitialFrom::LastName);
-        assert_eq!(initial_from(Some("x y"), None).1, InitialFrom::Empty);
+    fn the_initial_value_is_the_ini_room_or_empty() {
+        assert_eq!(initial(Some("from-ini")).as_str(), "from-ini");
+        for bad in [
+            None,
+            Some(""),
+            Some("花 映塚"),
+            Some("bad name"),
+            Some(".."),
+        ] {
+            assert_eq!(initial(bad).as_str(), "", "{bad:?}");
+            assert_eq!(initial_from(bad).1, InitialFrom::Empty, "{bad:?}");
+        }
+        assert_eq!(initial_from(Some("x")).1, InitialFrom::Ini);
     }
 
     #[test]
-    fn the_remembered_file_round_trips_and_a_broken_one_is_ignored() {
+    fn the_old_remembered_file_is_read_and_a_broken_one_is_ignored() {
         let name = RoomBuf::from_name("Room_9-x").unwrap();
-        assert_eq!(parse_last(&last_text(&name)), Some(name));
+        assert_eq!(parse_last("Room_9-x\n"), Some(name));
         assert_eq!(parse_last("\u{FEFF}Room_9-x\r\n"), Some(name));
         assert_eq!(parse_last("  Room_9-x  \n"), Some(name));
         assert_eq!(parse_last("Room_9-x"), Some(name));

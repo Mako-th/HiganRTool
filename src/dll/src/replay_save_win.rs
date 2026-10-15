@@ -22,17 +22,20 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use higanr_core::autosave::{self, NAME_BUF};
+use higanr_core::autosave::{self, ChargeSync, NAME_BUF};
 use higanr_core::handshake::Name;
 use higanr_core::log_scrub::{Scrub, ScrubWrite};
 use higanr_core::replay::Timestamp;
+use higanr_core::replay_playcheck::{HEADER_DATE_OFFSET, HEADER_FIELD_LEN, HEADER_NAME_OFFSET};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileA, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, GetFileInformationByHandle,
     OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::menu::MemRead;
 use crate::menu_win::OwnProcess;
@@ -43,16 +46,18 @@ use crate::replay_save::{
     CHAIN_LIMIT, CallOut, Driver, EstimateReal, Handoff, LOG_SUFFIX, NetView, Outcome, RNG_BYTES,
     STAGES, SaveIo, VaultOs, WORKER_PERIOD_MS, Watching, Worker, read_sides,
 };
+use crate::replay_watch::HeaderIdent;
 use crate::th09_addr::{
-    COMPLETED_ROUNDS, EXE_DIR, EXE_DIR_LEN, GAME_MODE, LOADING, MATCH_END_MENU, P1_PLAYER_PTR,
-    P1_STATS_PTR, P1_WINS, P2_PLAYER_PTR, P2_STATS_PTR, P2_WINS, REPLAY_HEADER_PTR,
-    REPLAY_HEADER_STAGE_FLAGS, REPLAY_MANAGER_PTR, REPLAY_MODE, REPLAY_NODE_NEXT, REPLAY_SAVE_FN,
-    REPLAY_SAVE_FRAME_SHIFT, REPLAY_SAVE_SIG, REPLAY_STAGE_NODES, REPLAY_STAGE_STRIDE, RNG_ADDR,
-    ROUND_FRAMES, ROUNDS_REQUIRED, SAVE_EST_BASE_SITE, SAVE_EST_FLAGS_EBP, SAVE_EST_PER_CHUNK,
-    SAVE_EST_PER_STAGE, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
+    COMPLETED_ROUNDS, EXE_DIR, EXE_DIR_LEN, GAME_MODE, LOADING, MATCH_END_MENU, OPT_CHARGE,
+    OPTIONS_COPY_PTR, P1_PLAYER_PTR, P1_STATS_PTR, P1_WINS, P2_PLAYER_PTR, P2_STATS_PTR, P2_WINS,
+    REPLAY_HEADER_CHARGE, REPLAY_HEADER_PTR, REPLAY_HEADER_STAGE_FLAGS, REPLAY_MANAGER_PTR,
+    REPLAY_MODE, REPLAY_NODE_NEXT, REPLAY_SAVE_FN, REPLAY_SAVE_FRAME_SHIFT, REPLAY_SAVE_SIG,
+    REPLAY_STAGE_NODES, REPLAY_STAGE_STRIDE, RNG_ADDR, ROUND_FRAMES, ROUNDS_REQUIRED,
+    SAVE_EST_BASE_SITE, SAVE_EST_FLAGS_EBP, SAVE_EST_PER_CHUNK, SAVE_EST_PER_STAGE, SUP_SCENE_CUR,
+    SUP_SCENE_REQ, SUPERVISOR,
 };
 use crate::trial_summary::ReplayFacts;
-use crate::win::{self, read_own_memory};
+use crate::win::{self, read_own_into, read_own_memory};
 use higanr_core::replay_rounds::Boundary;
 
 /// 自動保存が入っているか。0 から 1 にするのは `arm`（アドレスを置き、保管庫のスレッドを起こした後）、1 から 0 にするのはパニックを受けたとき。
@@ -85,9 +90,12 @@ pub struct SaveAddrs {
     /// 1P・2P の Player へのポインタの欄、スコアを持つ塊へのポインタの欄（欄そのものは直に読み、先は落ちない読み方でたどる）。
     pub players: [u32; 2],
     pub stats: [u32; 2],
+    /// ゲームの設定の写しへのポインタの欄（`[欄]+0xB4` / `+0xB5` が生きた試合の 1P / 2P のチャージ型）。欄そのものは `arm` が読めると
+    /// 確かめ、先は落ちない読み方でたどる。
+    pub options_copy: u32,
 }
 
-const ADDR_WORDS: usize = 17;
+const ADDR_WORDS: usize = 18;
 static ADDRS: [AtomicU32; ADDR_WORDS] = [const { AtomicU32::new(0) }; ADDR_WORDS];
 
 impl SaveAddrs {
@@ -106,10 +114,11 @@ impl SaveAddrs {
             round_frames: ROUND_FRAMES,
             players: [P1_PLAYER_PTR, P2_PLAYER_PTR],
             stats: [P1_STATS_PTR, P2_STATS_PTR],
+            options_copy: OPTIONS_COPY_PTR,
         }
     }
 
-    pub fn direct_ranges(&self) -> [(u32, u32); 17] {
+    pub fn direct_ranges(&self) -> [(u32, u32); 18] {
         [
             (self.supervisor.wrapping_add(SUP_SCENE_CUR), 4),
             (self.supervisor.wrapping_add(SUP_SCENE_REQ), 4),
@@ -128,6 +137,7 @@ impl SaveAddrs {
             (self.players[1], 4),
             (self.stats[0], 4),
             (self.stats[1], 4),
+            (self.options_copy, 4),
         ]
     }
 
@@ -150,6 +160,7 @@ impl SaveAddrs {
             self.players[1],
             self.stats[0],
             self.stats[1],
+            self.options_copy,
         ]
     }
 
@@ -179,6 +190,7 @@ impl SaveAddrs {
             round_frames: w[12],
             players: [w[13], w[14]],
             stats: [w[15], w[16]],
+            options_copy: w[17],
         }
     }
 }
@@ -335,6 +347,20 @@ impl SaveIo for RealSaveIo {
     fn replay_mode(&mut self, rm: u32) -> Option<u32> {
         OwnProcess.u32_at(rm.checked_add(REPLAY_MODE)?)
     }
+    fn replay_ident(&mut self, rm: u32) -> Option<HeaderIdent> {
+        let hdr = OwnProcess.u32_at(rm.checked_add(REPLAY_HEADER_PTR)?)?;
+        if hdr == 0 {
+            return None;
+        }
+        // 確保しない・落ちない読み方だけを使う（ゲームのスレッド）。
+        let mut id = HeaderIdent {
+            date: [0; HEADER_FIELD_LEN],
+            name: [0; HEADER_FIELD_LEN],
+        };
+        let date_at = hdr.checked_add(HEADER_DATE_OFFSET as u32)?;
+        let name_at = hdr.checked_add(HEADER_NAME_OFFSET as u32)?;
+        (read_own_into(date_at, &mut id.date) && read_own_into(name_at, &mut id.name)).then_some(id)
+    }
     fn signature_ok(&mut self) -> bool {
         rd::<12>(self.a.save_fn) == REPLAY_SAVE_SIG
     }
@@ -407,6 +433,25 @@ impl SaveIo for RealSaveIo {
             side: read_sides(&mut OwnProcess, self.a.players, self.a.stats),
         }
     }
+    fn sync_header_charge(&mut self, rm: u32) -> ChargeSync {
+        let mut m = OwnProcess;
+        let copy = m.u32_at(self.a.options_copy);
+        let header = rm
+            .checked_add(REPLAY_HEADER_PTR)
+            .and_then(|at| m.u32_at(at));
+        // 確保しない読み書きだけを使う（ゲームのスレッド）。
+        autosave::sync_header_charge(
+            copy,
+            header,
+            OPT_CHARGE,
+            REPLAY_HEADER_CHARGE,
+            |at| {
+                let mut b = [0u8; 1];
+                read_own_into(at, &mut b).then_some(b[0])
+            },
+            write_own_u8,
+        )
+    }
     fn call_save(
         &mut self,
         rm: u32,
@@ -445,6 +490,23 @@ impl SaveIo for RealSaveIo {
             game_est,
         }
     }
+}
+
+/// 自分のプロセスへ 1 バイトを落ちない書き方で書く（アドレスが確保されていない・書けないなら false。例外は出ない）。
+fn write_own_u8(addr: u32, v: u8) -> bool {
+    let mut n: usize = 0;
+    // SAFETY: 自分のプロセスの擬似ハンドルと、書くアドレス・書く元（スタックの `v`）・長さ 1・書けたバイト数の書く先を渡すだけ。
+    // アドレスが確保されていない・書けないなら、OS が失敗を返す。
+    let ok = unsafe {
+        WriteProcessMemory(
+            GetCurrentProcess(),
+            addr as usize as *const core::ffi::c_void,
+            &v as *const u8 as *const core::ffi::c_void,
+            1,
+            &mut n,
+        )
+    };
+    ok != 0 && n == 1
 }
 
 /// `call` の時点の esp（E）から、ゲームの見積もりのループが読む 10 語の始まりまで（`E − 0x200`）。
@@ -780,6 +842,10 @@ mod tests {
     static SEEN_NAME: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
     static SEEN_FLAGS: [AtomicU32; STAGES] = [const { AtomicU32::new(0) }; STAGES];
     static FAKE_RNG: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+    /// 偽の保存関数が呼ばれた時点の、見出しの `+0x190` / `+0x191`（下位 2 バイト）。
+    static SEEN_CHARGE: AtomicU32 = AtomicU32::new(u32::MAX);
+    /// 1 のときだけ、偽の保存関数が `this` を ReplayManager として見出しを読む（踏み台の検査の `this` は適当な値）。
+    static PROBE_HEADER: AtomicU32 = AtomicU32::new(0);
 
     // SAFETY（`#[unsafe(naked)]`）: 花映塚の保存関数の真似。先頭の 12 バイトは署名と同じ（`.byte` で書くのは、アセンブラが
     // `mov ebp,esp` を別の符号にしうるため）。呼ばれた回数・this・path・名前・ゲームの見積もりのループが読む 10 語を検査の
@@ -819,6 +885,12 @@ mod tests {
             "mov dword ptr [{flags} + 32], ecx",
             "mov ecx, dword ptr [ebp - {f} + 36]",
             "mov dword ptr [{flags} + 36], ecx",
+            "cmp dword ptr [{probe}], 0",
+            "je 2f",
+            "mov eax, dword ptr [edi + {hdr}]",
+            "movzx ecx, word ptr [eax + {charge}]",
+            "mov dword ptr [{seen_charge}], ecx",
+            "2:",
             "xor dword ptr [{rng}], 0x5A5A",
             "add dword ptr [{rng} + 4], 3",
             "pop edi",
@@ -831,6 +903,10 @@ mod tests {
             name = sym SEEN_NAME,
             flags = sym SEEN_FLAGS,
             rng = sym FAKE_RNG,
+            seen_charge = sym SEEN_CHARGE,
+            probe = sym PROBE_HEADER,
+            hdr = const REPLAY_HEADER_PTR,
+            charge = const REPLAY_HEADER_CHARGE,
             f = const SAVE_EST_FLAGS_EBP,
         )
     }
@@ -919,6 +995,7 @@ mod tests {
         base: u32,
         need: u32,
     ) -> Run {
+        PROBE_HEADER.store(0, Ordering::SeqCst);
         let name: [u8; NAME_BUF] = *b"12:34:56\0\0\0\0";
         let path = b"C:\\x\0";
         let mut before = [0xFFFF_FFFFu32; STAGES];
@@ -1048,11 +1125,13 @@ mod tests {
     struct Words<const N: usize>([AtomicU32; N]);
     static SUP: Words<{ 0x600 / 4 }> = Words([const { AtomicU32::new(0) }; 0x600 / 4]);
     /// menu, loading, game_mode, manager_ptr, p1 wins, p2 wins, required, completed_rounds, round_frames, 1P / 2P の Player のポインタ、1P / 2P の stats のポインタ
-    static GLOBALS: Words<13> = Words([const { AtomicU32::new(0) }; 13]);
+    static GLOBALS: Words<14> = Words([const { AtomicU32::new(0) }; 14]);
+    /// 偽の設定の写し（`+0xB5` まで）。`GLOBALS` の 13 番目が、これを指すポインタの欄。
+    static OPT_COPY: Words<{ 0xC0 / 4 }> = Words([const { AtomicU32::new(0) }; 0xC0 / 4]);
     static MENU_BYTE: AtomicU8 = AtomicU8::new(0);
     /// 偽の ReplayManager（+0x114 まで）と偽のヘッダ（+0x48 まで）と、面 9 の次の塊（2 つ。長いマッチの検査では 3 つ）。
     static RM: Words<{ 0x120 / 4 }> = Words([const { AtomicU32::new(0) }; 0x120 / 4]);
-    static HDR: Words<{ 0x60 / 4 }> = Words([const { AtomicU32::new(0) }; 0x60 / 4]);
+    static HDR: Words<{ 0x1F0 / 4 }> = Words([const { AtomicU32::new(0) }; 0x1F0 / 4]);
     static NODES: Words<{ 0x80 / 4 }> = Words([const { AtomicU32::new(0) }; 0x80 / 4]);
     static BASE_SITE: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
     /// 偽の Player（`+0xB8` まで）と、スコアを持つ塊（`+0x04` まで）。
@@ -1080,7 +1159,20 @@ mod tests {
             round_frames: a32(&GLOBALS, 8),
             players: [a32(&GLOBALS, 9), a32(&GLOBALS, 10)],
             stats: [a32(&GLOBALS, 11), a32(&GLOBALS, 12)],
+            options_copy: a32(&GLOBALS, 13),
         }
+    }
+
+    /// 偽の設定の写しのチャージ型（1P・2P）と、偽の見出しの `+0x190` / `+0x191`（下位 2 バイト）。
+    fn set_copy_charge(p1: u8, p2: u8) {
+        let w = u32::from(p1) | u32::from(p2) << 8;
+        OPT_COPY.0[(OPT_CHARGE / 4) as usize].store(w << ((OPT_CHARGE % 4) * 8), Ordering::SeqCst);
+    }
+
+    fn header_charge() -> [u8; 2] {
+        let w = HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].load(Ordering::SeqCst);
+        let sh = (REPLAY_HEADER_CHARGE % 4) * 8;
+        [(w >> sh) as u8, (w >> (sh + 8)) as u8]
     }
 
     fn setup_fake_game() {
@@ -1111,6 +1203,14 @@ mod tests {
         for (a, b) in BASE_SITE.iter().zip([0xB9u8, 0xEC, 0x01, 0x01, 0x00]) {
             a.store(b, Ordering::SeqCst);
         }
+        GLOBALS.0[13].store(a32(&OPT_COPY, 0), Ordering::SeqCst);
+        for w in OPT_COPY.0.iter() {
+            w.store(0, Ordering::SeqCst);
+        }
+        // 見出しは手元の cfg の値（0 / 0）、生きた試合の値は 1 / 0。
+        set_copy_charge(1, 0);
+        SEEN_CHARGE.store(u32::MAX, Ordering::SeqCst);
+        PROBE_HEADER.store(1, Ordering::SeqCst);
         FAKE_RNG[0].store(0x0000_BEEF, Ordering::SeqCst);
         FAKE_RNG[1].store(17, Ordering::SeqCst);
         FAKE_RNG[2].store(0x1234_5678, Ordering::SeqCst);
@@ -1180,6 +1280,126 @@ mod tests {
         assert_eq!(SEEN_PATH.load(Ordering::SeqCst), h.path_addr());
         assert_eq!(r.wins, [0, 2, 2]);
         assert!(r.duration_us < 10_000_000);
+        // 見出しは保存関数が呼ばれた時点で、設定の写しの値（1P = 1 / 2P = 0）になっている。
+        assert_eq!(r.charge, ChargeSync::Written { p1: 1, p2: 0 });
+        assert_eq!(
+            SEEN_CHARGE.load(Ordering::SeqCst),
+            1,
+            "呼ぶ前に直していない"
+        );
+        assert_eq!(header_charge(), [1, 0]);
+    }
+
+    /// 壊れたら落ちる: 席の入れ替え・写しの別の欄を読む・ポインタが 0 でも書く・見出しの別の欄へ書く。
+    #[test]
+    fn real_io_copies_the_charge_into_the_header_seat_for_seat_and_refuses_bad_pointers() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        setup_fake_game();
+        let rm = &RM as *const _ as usize as u32;
+        let mut io = RealSaveIo {
+            a: fake_addrs(addr_of_fn(fake_save)),
+        };
+        // 2P だけチャージ型。
+        set_copy_charge(0, 1);
+        assert_eq!(
+            io.sync_header_charge(rm),
+            ChargeSync::Written { p1: 0, p2: 1 }
+        );
+        assert_eq!(header_charge(), [0, 1]);
+        // 1P だけ。隣の欄（+0x18F / +0x192）には触らない。
+        HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].store(0xAABB_CCDD, Ordering::SeqCst);
+        HDR.0[(REPLAY_HEADER_CHARGE / 4 + 1) as usize].store(0x1122_3344, Ordering::SeqCst);
+        set_copy_charge(1, 0);
+        assert_eq!(
+            io.sync_header_charge(rm),
+            ChargeSync::Written { p1: 1, p2: 0 }
+        );
+        let w0 = HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].load(Ordering::SeqCst);
+        let sh = (REPLAY_HEADER_CHARGE % 4) * 8;
+        let mut want = 0xAABB_CCDDu32;
+        want = (want & !(0xFFFF << sh)) | (1 << sh);
+        assert_eq!(w0, want, "2 バイトだけ書く");
+        assert_eq!(
+            HDR.0[(REPLAY_HEADER_CHARGE / 4 + 1) as usize].load(Ordering::SeqCst),
+            0x1122_3344
+        );
+        // 悪いポインタでは書かない（落ちない）。
+        HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].store(0, Ordering::SeqCst);
+        let good = a32(&OPT_COPY, 0);
+        for (cell, cell_value, rm_arg, want) in [
+            // 写しのポインタの欄が読めない・値が 0・値が読めない場所を指す
+            (0x10, good, rm, ChargeSync::NoCopy),
+            (a32(&GLOBALS, 13), 0, rm, ChargeSync::NoCopy),
+            (a32(&GLOBALS, 13), 0x10, rm, ChargeSync::CopyUnreadable),
+            // ReplayManager が 0 か読めない場所
+            (a32(&GLOBALS, 13), good, 0, ChargeSync::NoHeader),
+            (a32(&GLOBALS, 13), good, 0x10, ChargeSync::NoHeader),
+        ] {
+            GLOBALS.0[13].store(cell_value, Ordering::SeqCst);
+            let mut io = RealSaveIo {
+                a: SaveAddrs {
+                    options_copy: cell,
+                    ..fake_addrs(addr_of_fn(fake_save))
+                },
+            };
+            assert_eq!(
+                io.sync_header_charge(rm_arg),
+                want,
+                "{cell:#x} {cell_value:#x} {rm_arg:#x}"
+            );
+            assert_eq!(header_charge(), [0, 0], "書いてはいけない");
+        }
+        // 見出しのポインタが 0 の ReplayManager。
+        GLOBALS.0[13].store(a32(&OPT_COPY, 0), Ordering::SeqCst);
+        RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0, Ordering::SeqCst);
+        assert_eq!(io.sync_header_charge(rm), ChargeSync::NoHeader);
+        // 見出しが読めない場所を指す。
+        RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0x10, Ordering::SeqCst);
+        assert_eq!(io.sync_header_charge(rm), ChargeSync::WriteFailed);
+    }
+
+    /// 壊れたら落ちる: 日付と名前の位置の取り違え・見出しが 0 や読めない場所のときに値を返す。
+    #[test]
+    fn real_io_reads_the_header_date_and_name_from_their_offsets_and_refuses_bad_pointers() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        setup_fake_game();
+        let rm = &RM as *const _ as usize as u32;
+        let mut io = RealSaveIo {
+            a: fake_addrs(addr_of_fn(fake_save)),
+        };
+        let put = |off: usize, bytes: &[u8]| {
+            for (i, b) in bytes.iter().enumerate() {
+                let at = off + i;
+                let sh = (at % 4) * 8;
+                let w = &HDR.0[at / 4];
+                let old = w.load(Ordering::SeqCst);
+                w.store(
+                    (old & !(0xFF << sh)) | (u32::from(*b) << sh),
+                    Ordering::SeqCst,
+                );
+            }
+        };
+        put(HEADER_DATE_OFFSET, b"26/10/14\0");
+        put(HEADER_NAME_OFFSET, b"12:34:56\0");
+        assert_eq!(
+            io.replay_ident(rm),
+            Some(HeaderIdent {
+                date: *b"26/10/14\0",
+                name: *b"12:34:56\0",
+            })
+        );
+        // 隣の欄（日付の直前の語・名前の直後の難易度）は読まない。
+        put(HEADER_DATE_OFFSET - 1, b"Z");
+        put(HEADER_NAME_OFFSET + HEADER_FIELD_LEN, b"Q");
+        let got = io.replay_ident(rm).unwrap();
+        assert_eq!(&got.date, b"26/10/14\0");
+        assert_eq!(&got.name, b"12:34:56\0");
+        RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0, Ordering::SeqCst);
+        assert_eq!(io.replay_ident(rm), None, "見出しが 0");
+        RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0x10, Ordering::SeqCst);
+        assert_eq!(io.replay_ident(rm), None, "見出しが読めない場所");
+        assert_eq!(io.replay_ident(0), None, "ReplayManager が 0");
+        assert_eq!(io.replay_ident(0x10), None, "ReplayManager が読めない場所");
     }
 
     #[test]
@@ -1481,9 +1701,19 @@ mod tests {
             a.players[1],
             a.stats[0],
             a.stats[1],
+            a.options_copy,
         ] {
             assert!(ranges.contains(&(addr, 4)), "0x{addr:08X}");
         }
+        // 設定の写しのポインタの欄と、チャージ型の位置は、ゲーム側の名前と同じ値（`net_game::write_charge` が生きた試合で書く先）。
+        assert_eq!(a.options_copy, 0x004A_7E78);
+        assert_eq!(OPT_CHARGE, 0xB4);
+        // 見出しの位置は、リプレイを書き換える側（core）の位置 `+0x190` と同じ。
+        assert_eq!(
+            REPLAY_HEADER_CHARGE as usize,
+            higanr_core::replay_rewrite::CHARGE_OFFSET
+        );
+        assert_eq!(REPLAY_HEADER_CHARGE, 0x190);
         // 語へのコピーと戻しで欄が入れ替わらない（全部違う値で見る）。
         let distinct = SaveAddrs {
             supervisor: 1,
@@ -1499,11 +1729,12 @@ mod tests {
             round_frames: 13,
             players: [14, 15],
             stats: [16, 17],
+            options_copy: 18,
         };
         assert_eq!(SaveAddrs::from_words(distinct.words()), distinct);
         let mut seen = distinct.words().to_vec();
         seen.sort_unstable();
-        assert_eq!(seen, (1..=17).collect::<Vec<u32>>());
+        assert_eq!(seen, (1..=18).collect::<Vec<u32>>());
     }
 
     #[test]

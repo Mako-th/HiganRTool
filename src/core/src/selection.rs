@@ -21,14 +21,20 @@
 //! ことがあり、ゲストのゲームだけが押下を読み捨てると画面が分かれる。そこでゲストは届いた STEP を、ホストは受けた要求を、
 //! ゲームが読む状態になるまで持ち越す（`ready_ok`）。遅延の増分は、演出の間に届いた押下だけ演出が明けるまで。
 //!
-//! 合わせ: カーソルの動きは MENU の入力ワードの相対なので、最初のカーソルが違うと見た目がずっとずれる。両者が同じ画面にそろったら、
-//! ホストが自分のカーソルの値を STEP（`StepKind::Align`）で送り、ゲストがその値へ書く。
+//! 合わせ（難易度・マップの画面。`menu_model::uses_align`）: カーソルの動きは MENU の入力ワードの相対なので、最初のカーソルが違うと見た目が
+//! ずっとずれる。両者が同じ画面にそろったら、ホストが自分のカーソルの値を STEP（`StepKind::Align`）で送り、ゲストがその値へ書く。
 //! - ホストは「相手が来ていて、前の STEP が届いていて、今の画面の合わせがまだ」（`align_due`）のとき、自分の押下より先に渡す。
 //!   画面が移るたびに 1 回。同じ画面のままの押下（キャラ選択の 1 席の決定）の後には出さない。
 //! - STEP なので step が進み、語の番号は 0 から数え直す。ゲストは合わせが届くまで動かず（`is_aligned`）、自分の押下も合わせの後に要求する。
 //! - 合わせは画面を移らないので `Outcome` は `Stay`。取消では揃えない。
 //! - ホストの合わせの tick は、自分の入力ワードに方向・Ctrl・Shift が立っていないときに選ぶ（dll が見る）。押し続けが跨ぐと、
 //!   ゲスト側でその方向の「押した瞬間」が 1 回余計に数えられてカーソルが 1 つずれる。
+//!
+//! 相手の席の位置（キャラ選択）: MENU の末尾に送り手の画面と送り手の席のキャラのカーソルを載せる（dll が毎フレーム `set_own_cursor`）。
+//! 受け手は自分と同じ step の MENU のうち、いちばん新しい入力ワードを含むものの位置を持つ（`take_peer_cursor`）。違う step・古い MENU の
+//! 位置は使わない（画面を出て入り直した後に、前に居たときの位置へ戻さない）。`moved` は前の位置から動いていて、その間の相手の入力ワードに
+//! 「ランダム」（Ctrl）が無かったこと（ゲームはカーソルの移動では音を鳴らし、ランダムでは鳴らさない）。選択に入ったとき・画面が移る
+//! step で位置を捨てる。
 //!
 //! 相手の入力ワードの再生: 選択に入って最初に受けた MENU は、溜まった古い入力ワードを再生せず新しい入力ワードから始める（`fresh`。再生すると
 //! 約 32 フレーム遅れ続ける）。合わせの後に溜まる「何も押していない」語は飛ばして追いつく（`next_remote`）。
@@ -41,8 +47,8 @@
 //! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を置かない。入力ワードの列は 32 ワードの固定のリングバッファで、
 //! 添字はいつも `% 32`。数の足し算は飽和させる。
 
-use crate::menu_model::{Model, Outcome};
-use crate::wire::{MAX_WORDS, Menu, Message, Select, Step, StepKind};
+use crate::menu_model::{KEY_CTRL, Model, Outcome, uses_align};
+use crate::wire::{CURSOR_NONE, MAX_WORDS, Menu, Message, Select, Step, StepKind};
 
 /// STEP・STEP_REQ・SELECT を送り直す間隔（ms）。INPUT の待ち中の再送と同じ値に揃えてあるが、由来が別なので別の名前で持つ。
 pub const RESEND_MS: u32 = 4;
@@ -114,6 +120,17 @@ pub struct Agreed {
     pub mismatch: Mismatch,
 }
 
+/// 相手の席のキャラのカーソル（相手の MENU の末尾）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCursor {
+    /// 送り手の画面。
+    pub screen: u8,
+    /// 0〜15。
+    pub cursor: u8,
+    /// 前に受けた位置（同じ画面）から動いていて、その間の相手の入力ワードに「ランダム」（Ctrl）が無かった。`take_peer_cursor` で消える。
+    pub moved: bool,
+}
+
 /// 捨てたものの数（ログ用）。増え続けるなら相手か経路がおかしい。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counters {
@@ -178,6 +195,16 @@ pub struct Selection {
     rx_last: u16,
     /// この選択に入ってから入れた STEP で追う画面（同じ画面に残る step かを決める）。
     screens: Screens,
+
+    // ---- 席の位置（MENU の末尾） ----
+    /// 送る自分の画面と自分の席のキャラのカーソル（0〜15 か `CURSOR_NONE`）。
+    own_screen: u8,
+    own_cursor: u8,
+    peer_cursor: Option<PeerCursor>,
+    /// `peer_cursor` を運んだ MENU の入力ワードの終わりの番号（今の step。これより古い MENU の位置は使わない）。
+    peer_cursor_end: u32,
+    /// 今の step で受けた相手の入力ワードのうち、Ctrl が立っていたいちばん大きい番号。
+    peer_ctrl_at: Option<u32>,
 
     // ---- SELECT ----
     /// その接続で何戦目か（0 から。SELECT を置いた選択の次の `enter` で 1 進む）。
@@ -299,6 +326,11 @@ impl Selection {
             prev_step: None,
             rx_last: 0,
             screens: Screens::Unseen,
+            own_screen: 0,
+            own_cursor: CURSOR_NONE,
+            peer_cursor: None,
+            peer_cursor_end: 0,
+            peer_ctrl_at: None,
             match_no: 0,
             own_select: None,
             own_select_step: 0,
@@ -361,17 +393,19 @@ impl Selection {
         self.prev_step = None;
         self.rx_last = 0;
         self.screens = Screens::Unseen;
+        self.forget_peer_cursor();
     }
 
-    /// 今の画面 `screen` の合わせを入れ終えたか。ゲストはこれが偽の間、動かない。
+    /// 今の画面 `screen` の合わせを入れ終えたか。ゲストはこれが偽の間、動かない。合わせを使わない画面（キャラ選択）はいつも真。
     pub fn is_aligned(&self, screen: u8) -> bool {
-        self.aligned == Some(screen)
+        !uses_align(screen) || self.aligned == Some(screen)
     }
 
     /// ホスト: 今の画面 `screen` の合わせをいま押下として渡してよいか（相手が来ていて、前の STEP が届いていて、この画面の合わせがまだ）。
-    /// ゲームが読む状態か・自分の入力ワードに方向が立っていないかは dll が見る。ゲストはいつも false。
+    /// ゲームが読む状態か・自分の入力ワードに方向が立っていないかは dll が見る。ゲストと、合わせを使わない画面ではいつも false。
     pub fn align_due(&self, screen: u8) -> bool {
         self.role == Role::Host
+            && uses_align(screen)
             && self.active
             && self.present
             && self.guest_step >= self.step
@@ -391,6 +425,66 @@ impl Selection {
         self.pending = None;
         self.pending_sent = None;
         self.ready = None;
+        self.forget_peer_cursor();
+    }
+
+    /// 次に送る MENU に載せる、自分の画面と自分の席のキャラのカーソル（キャラ選択の外は `CURSOR_NONE`）。0〜15 の外は
+    /// `CURSOR_NONE` にする（相手の decode は範囲の外の MENU を丸ごと捨てる）。
+    pub fn set_own_cursor(&mut self, screen: u8, cursor: u8) {
+        self.own_screen = screen;
+        self.own_cursor = if cursor <= 15 { cursor } else { CURSOR_NONE };
+    }
+
+    /// 相手の席の最新の位置（見るだけ。`moved` は消さない）。
+    pub fn peer_cursor(&self) -> Option<PeerCursor> {
+        self.peer_cursor
+    }
+
+    /// 相手の席の最新の位置（同じ step の MENU から）。返した後、`moved` を消す（位置は持ったまま）。
+    pub fn take_peer_cursor(&mut self) -> Option<PeerCursor> {
+        let pc = self.peer_cursor?;
+        if let Some(p) = self.peer_cursor.as_mut() {
+            p.moved = false;
+        }
+        Some(pc)
+    }
+
+    fn forget_peer_cursor(&mut self) {
+        self.peer_cursor = None;
+        self.peer_cursor_end = 0;
+        self.peer_ctrl_at = None;
+    }
+
+    /// 今の step の相手の MENU から、相手の席の位置を取る。`end` はその MENU の入力ワードの終わりの番号。
+    fn note_peer_cursor(&mut self, m: &Menu, words: &[u16], end: u32) {
+        for (i, &w) in words.iter().enumerate() {
+            if w & KEY_CTRL != 0 {
+                let n = m.base.saturating_add(i as u32);
+                self.peer_ctrl_at = Some(self.peer_ctrl_at.map_or(n, |x| x.max(n)));
+            }
+        }
+        if end < self.peer_cursor_end {
+            // 入れ替わって遅れて届いた古い MENU。
+            return;
+        }
+        // 前の位置を運んだ MENU のいちばん新しい語（番号 `peer_cursor_end − 1`）から、この MENU のいちばん新しい語までに Ctrl が
+        // あれば、その間の動きは「ランダム」と見る（位置は語の 1 つ前までの結果なので、前の MENU の最後の語から数える）。
+        let random = self
+            .peer_ctrl_at
+            .is_some_and(|n| n.saturating_add(1) >= self.peer_cursor_end);
+        let prev = self.peer_cursor;
+        self.peer_cursor_end = end;
+        if m.cursor > 15 {
+            self.peer_cursor = None;
+            return;
+        }
+        let moved_now = prev.is_some_and(|p| p.screen == m.screen && p.cursor != m.cursor);
+        let carried = prev.is_some_and(|p| p.moved && p.screen == m.screen);
+        self.peer_cursor = Some(PeerCursor {
+            screen: m.screen,
+            cursor: m.cursor,
+            moved: carried || (moved_now && !random),
+        });
     }
 
     /// 1 フレームぶん。`local` は画面を移るビットを落とした自分の入力ワード、`press` は画面を移る押下（ゲームがこのフレームに押下を読む
@@ -533,6 +627,10 @@ impl Selection {
             self.prev_step = None;
             self.rx_last = 0;
         }
+        // 位置は同じ画面に残る step なら持ち越す（相手はその画面で動き続けている）。語の番号は step ごとに 0 から。
+        let kept = if stays { self.peer_cursor } else { None };
+        self.forget_peer_cursor();
+        self.peer_cursor = kept;
         self.step = self.step.saturating_add(1);
         self.fresh = false;
         self.tx_next = 0;
@@ -601,6 +699,9 @@ impl Selection {
             base,
             count: count as u8,
             words,
+            screen: self.own_screen,
+            cursor: self.own_cursor,
+            shared: [CURSOR_NONE, 0],
         })
     }
 
@@ -642,6 +743,8 @@ impl Selection {
             self.counters.impossible = self.counters.impossible.saturating_add(1);
             return;
         }
+        // `receive` が true なら `base + count` は桁あふれしない。
+        self.note_peer_cursor(m, &m.words[..count], m.base.saturating_add(count as u32));
         if first && self.rx.len() > 1 {
             // 選択に入って最初の MENU: 相手が入る前から溜めていた古い入力ワードは再生しない（再生すると以後の入力ワードもその分遅れる）。
             self.rx.play = self.rx.end - 1;
@@ -1790,6 +1893,18 @@ mod tests {
             base,
             count: ws.len() as u8,
             words,
+            screen: 0,
+            cursor: CURSOR_NONE,
+            shared: [CURSOR_NONE, 0],
+        }
+    }
+
+    /// 相手の席の位置つきの MENU（画面 8）。
+    fn menu_at(step: u16, base: u32, ws: &[u16], cursor: u8) -> Menu {
+        Menu {
+            screen: SCREEN_CHARA,
+            cursor,
+            ..menu(step, 0, base, ws)
         }
     }
 
@@ -2286,7 +2401,8 @@ mod tests {
     // ================= 合わせ =================
 
     const AL: StepKind = StepKind::Align;
-    const SCR: u8 = 8;
+    /// 合わせを使う画面（マップ）。下の 2 台の模型の「2 つのカーソル」は合わせの値の詰め方を確かめるための抽象で、画面の意味は持たない。
+    const SCR: u8 = 16;
 
     fn align_press(value: u8, screen: u8) -> Option<Press> {
         Some(Press {
@@ -2403,12 +2519,185 @@ mod tests {
         assert_eq!(g.build_menu().map(|m| m.ack), Some(1));
     }
 
+    // ================= 相手の席の位置（キャラ選択） =================
+
+    fn peer(s: &mut Selection) -> Option<(u8, u8, bool)> {
+        s.take_peer_cursor().map(|p| (p.screen, p.cursor, p.moved))
+    }
+
+    #[test]
+    fn chara_screen_needs_no_alignment() {
+        let mut h = present(Role::Host);
+        assert!(
+            !h.align_due(SCREEN_CHARA),
+            "ホストは画面 8 で合わせを出さない"
+        );
+        assert!(h.align_due(SCREEN_DIFFICULTY) && h.align_due(SCREEN_MAP));
+        h.leave();
+        let g = Selection::new(Role::Guest);
+        assert!(g.is_aligned(SCREEN_CHARA), "ゲストは画面 8 で待たない");
+        assert!(!g.is_aligned(SCREEN_DIFFICULTY) && !g.is_aligned(SCREEN_MAP));
+    }
+
+    /// 壊れたら落ちる: 違う step の MENU・入れ替わって遅れた MENU の位置を使う、位置なしの報告で古い位置を残す、`moved` を
+    /// 消さない・動いたのに立てない。
+    #[test]
+    fn peer_cursor_comes_from_the_newest_menu_of_the_same_step() {
+        for role in [Role::Host, Role::Guest] {
+            let mut s = present(role);
+            assert_eq!(peer(&mut s), None);
+            s.on_menu(&menu_at(0, 0, &[0], 5));
+            assert_eq!(
+                peer(&mut s),
+                Some((8, 5, false)),
+                "{role:?}: 最初の位置は動きではない"
+            );
+            s.on_menu(&menu_at(0, 1, &[0], 6));
+            assert_eq!(peer(&mut s), Some((8, 6, true)), "{role:?}");
+            assert_eq!(
+                peer(&mut s),
+                Some((8, 6, false)),
+                "{role:?}: 取ったら消える"
+            );
+            s.on_menu(&menu_at(0, 0, &[0], 9));
+            assert_eq!(peer(&mut s), Some((8, 6, false)), "{role:?}: 古い MENU");
+            s.on_menu(&menu_at(0, 2, &[0], 6));
+            assert_eq!(peer(&mut s), Some((8, 6, false)), "{role:?}: 同じ位置");
+            let dropped = s.counters().menu_dropped;
+            s.on_menu(&menu_at(1, 50, &[0], 12));
+            s.on_menu(&menu_at(u16::MAX, 50, &[0], 13));
+            assert_eq!(s.counters().menu_dropped, dropped + 2);
+            assert_eq!(peer(&mut s), Some((8, 6, false)), "{role:?}: 違う step");
+            s.on_menu(&menu(0, 0, 3, &[0]));
+            assert_eq!(peer(&mut s), None, "{role:?}: 位置なしの報告");
+        }
+    }
+
+    /// 壊れたら落ちる: ランダム（Ctrl）の間の位置の変化を「動いた」にする（ゲームはランダムでは音を鳴らさない）、ランダムを離した直後の
+    /// 1 回を「動いた」にする、ランダムの後の本当の移動を落とす。
+    #[test]
+    fn moves_during_the_random_are_not_moves() {
+        let mut g = present(Role::Guest);
+        g.on_menu(&menu_at(0, 0, &[0], 3));
+        g.on_menu(&menu_at(0, 1, &[KEY_CTRL], 3));
+        assert_eq!(peer(&mut g), Some((8, 3, false)));
+        g.on_menu(&menu_at(0, 2, &[KEY_CTRL], 11));
+        assert_eq!(peer(&mut g), Some((8, 11, false)), "ランダムの間");
+        g.on_menu(&menu_at(0, 3, &[0], 7));
+        assert_eq!(
+            peer(&mut g),
+            Some((8, 7, false)),
+            "離した後の最初の位置は、前の MENU の最後の Ctrl の結果"
+        );
+        g.on_menu(&menu_at(0, 4, &[0], 7));
+        g.on_menu(&menu_at(0, 5, &[0, 0], 8));
+        assert_eq!(peer(&mut g), Some((8, 8, true)), "ランダムの後の移動");
+        // 1 通に何語も載る（ack が遅れる）ときも、前の位置の後の語だけを見る。
+        g.on_menu(&menu_at(0, 7, &[KEY_CTRL, 0, 0], 9));
+        assert_eq!(peer(&mut g), Some((8, 9, false)), "前の位置の後の語に Ctrl");
+        g.on_menu(&menu_at(0, 10, &[0, 0, 0], 10));
+        assert_eq!(peer(&mut g), Some((8, 10, true)), "Ctrl は前の位置より前");
+    }
+
+    /// 壊れたら落ちる: 取らないうちに 2 通届いたとき、間の動きを落とす（音が鳴らない）。
+    #[test]
+    fn a_move_waits_until_it_is_taken() {
+        let mut g = present(Role::Guest);
+        g.on_menu(&menu_at(0, 0, &[0], 3));
+        g.on_menu(&menu_at(0, 1, &[0], 4));
+        g.on_menu(&menu_at(0, 2, &[0], 4));
+        assert_eq!(peer(&mut g), Some((8, 4, true)));
+        g.on_menu(&menu_at(0, 3, &[0], 5));
+        g.on_menu(&menu(0, 0, 4, &[0]));
+        g.on_menu(&menu_at(0, 5, &[0], 6));
+        assert_eq!(
+            peer(&mut g),
+            Some((8, 6, false)),
+            "位置なしを挟んだら新しく入り直したのと同じ"
+        );
+    }
+
+    /// 壊れたら落ちる: 選択に入り直しても・画面が移る step の後も古い位置を使う、同じ画面に残る step で位置を捨てる。
+    #[test]
+    fn enter_and_screen_changes_forget_the_peer_cursor_but_a_staying_step_keeps_it() {
+        let cv = |seat| chara_value(seat, false, 5);
+        let mut g = present(Role::Guest);
+        g.on_menu(&menu_at(0, 0, &[0], 3));
+        g.on_step(&Step {
+            step: 0,
+            kind: D,
+            value: cv(0),
+            screen: SCREEN_CHARA,
+        });
+        assert!(g.local_frame(0, None, true).apply.is_some());
+        assert_eq!(peer(&mut g), Some((8, 3, false)), "1 席の決定の後も持つ");
+        g.on_menu(&menu_at(0, 1, &[0], 9));
+        assert_eq!(
+            peer(&mut g),
+            Some((8, 3, false)),
+            "前の step の MENU の位置は使わない"
+        );
+        g.on_menu(&menu_at(1, 0, &[0], 4));
+        assert_eq!(
+            peer(&mut g),
+            Some((8, 4, true)),
+            "新しい step の番号は 0 から"
+        );
+        g.on_step(&Step {
+            step: 1,
+            kind: D,
+            value: cv(1),
+            screen: SCREEN_CHARA,
+        });
+        assert!(g.local_frame(0, None, true).apply.is_some());
+        assert_eq!(peer(&mut g), None, "2 席目の決定でマップの画面へ移った");
+        g.on_menu(&menu_at(2, 0, &[0], 5));
+        assert_eq!(peer(&mut g), Some((8, 5, false)));
+        g.leave();
+        assert_eq!(peer(&mut g), None, "選択を出た");
+        g.enter();
+        g.on_menu(&menu_at(2, 1, &[0], 6));
+        assert_eq!(
+            peer(&mut g),
+            Some((8, 6, false)),
+            "入り直した後の最初の位置"
+        );
+    }
+
+    /// 壊れたら落ちる: 自分の位置を MENU に載せない・範囲の外をそのまま送る（相手の decode が MENU ごと捨てる）。
+    #[test]
+    fn build_menu_carries_the_own_cursor() {
+        let mut h = present(Role::Host);
+        let m = h.build_menu().unwrap();
+        assert_eq!(
+            (m.screen, m.cursor, m.shared),
+            (0, CURSOR_NONE, [CURSOR_NONE, 0])
+        );
+        h.set_own_cursor(SCREEN_CHARA, 13);
+        let m = h.build_menu().unwrap();
+        assert_eq!((m.screen, m.cursor), (SCREEN_CHARA, 13));
+        h.set_own_cursor(SCREEN_CHARA, 16);
+        assert_eq!(h.build_menu().unwrap().cursor, CURSOR_NONE);
+        h.set_own_cursor(SCREEN_MAP, CURSOR_NONE);
+        let m = h.build_menu().unwrap();
+        assert_eq!((m.screen, m.cursor), (SCREEN_MAP, CURSOR_NONE));
+    }
+
     // ---- 合わせの 2 台の模型（カーソルを持つ） ----
 
     use crate::input_model::keys;
-    use crate::menu_model::{APPLY_CLEAR_BITS, align_chara_parts, align_chara_value};
+    use crate::menu_model::APPLY_CLEAR_BITS;
 
-    /// 合わせの検査の 1 台。画面 `SCR`（キャラ選択。2 席分のカーソル 0〜15）を持ち、dll の `menu_tick` と同じ順に `Selection` を呼ぶ。
+    /// 模型の 2 つのカーソル（0〜15）を合わせの value の 1 バイトに詰める・戻す。
+    fn pack2(c: [u8; 2]) -> u8 {
+        (c[0] & 0x0F) | (c[1] << 4)
+    }
+
+    fn unpack2(v: u8) -> [u8; 2] {
+        [v & 0x0F, v >> 4]
+    }
+
+    /// 合わせの検査の 1 台。画面 `SCR` で 2 つのカーソル（0〜15）を持ち、dll の `menu_tick` と同じ順に `Selection` を呼ぶ。
     /// ゲームは語の押した瞬間（右 = +1、左 = −1）で席ごとのカーソルを動かす。合わせを受けたゲストは、書いてからその tick は動かさない。
     struct CursorNode {
         sel: Selection,
@@ -2467,7 +2756,7 @@ mod tests {
                 && local & APPLY_CLEAR_BITS == 0)
                 .then_some(Press {
                     kind: AL,
-                    value: align_chara_value([u32::from(self.cur[0]), u32::from(self.cur[1])]),
+                    value: pack2(self.cur),
                     screen: SCR,
                 });
             let fo = self.sel.local_frame(local, press, true);
@@ -2479,8 +2768,8 @@ mod tests {
                 assert_eq!(st.kind, AL, "この模型は合わせしか入れない");
                 self.aligned_at = self.aligned_at.or(Some(now));
                 if self.role == Role::Guest {
-                    let [a, b] = align_chara_parts(st.value);
-                    self.cur = [a as u8, b as u8];
+                    let [a, b] = unpack2(st.value);
+                    self.cur = [a, b];
                     words = [0; 2];
                 }
             } else if !aligned && words.iter().any(|w| w & APPLY_CLEAR_BITS != 0) {

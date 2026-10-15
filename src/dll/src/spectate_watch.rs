@@ -36,16 +36,21 @@
 //! `START_HOLD_TICKS` = 30 tick 経つ）のを待つ。以後は 1 tick に 1 フレームずつ使うので、遅れは溜まった数のまま変わらない。3 は、
 //! ホストの送りの最大 19.4 ms を吸収する 2 フレームに、tick と受信の周回の位相のずれの分の 1 フレームを足した値。実測（loopback。
 //! 485 フレーム）は、ホストが使ってから観戦者が使うまで p50 約 49 ms・最大 51.4 ms。遅れは観戦者だけに掛かり、対戦者には掛からない。
+//! マッチの途中で語が届かず止まったら、次に使う前に溜まりが戻るのを待つ（`spectate_pace::Pace::may_play`。最長 1 秒）。戻す数は、
+//! 追いついている途中（往復ごとにまとまって届く）なら次のまとまりまで尽きない数（往復が長いほど多い）、追いついて 1 フレームに 1 つ
+//! ずつ届いているなら余裕だけ。
 //!
 //! ## 遅れて JOIN した観戦者・流れが切れたとき
 //!
-//! 遅れて JOIN すると、ホストはいまの seg の始まり（`Seg(k)`。その後ろにその seg の選択の押下・SELECT が続く）から流す。**選択の画面は
+//! 遅れて JOIN すると、ホストは最後に選択があった seg の始まり（`Seg(k)`。その後ろにその seg の選択の押下・SELECT が続く）から流す。
+//! 再戦が続いている間に入っても、その再戦の列を最初から追う（`SpectateHost::join_start`）。**選択の画面は
 //! 遅れを詰める**（`catch_up_menus`）: `Menu` は 1 tick に 1 つ積まれるので、同じ速さで使うとホストが選択の画面に居た時間（実測で
 //! 62 秒）がそのまま遅れになる。使っていない記録が `MENU_CATCHUP_ABOVE` を越えているあいだ、押下のない `Menu` を 1 tick を使わずに
-//! 捨てる（押下は全部、順に入れる）。マッチの語は詰めず、溜まりが `FF_ENTER_FRAMES` を越えている間はゲームの更新を余分に回して
-//! **早送り**する（`spectate_watch/ff.rs`）。選択を先最初から辿れないなら（マッチから戻った選択は 8 から入る・再戦の seg は選択が無い）、
+//! 捨てる（押下は全部、順に入れる）。マッチの語は詰めず、溜まりが `FF_ENTER_FRAMES` を越えたらゲームの更新を余分に回して
+//! **早送り**する（`spectate_watch/ff.rs`。速さは届く速さに合わせる —— `spectate_pace`）。選択を先最初から辿れないなら（マッチから戻った選択は 8 から入る・再戦の seg は選択が無い）、
 //! 先頭の記録がゲームの画面と合わず `MENU_HOLD_LIMIT` tick 持ち越した後にやめる（`Stuck`）。選択の記録が無いマッチの語（`Seg` の直後の
-//! `Frame`）は使えないので、選択の画面にいる間に先頭に来た `Frame` は捨てて（`orphan_frames`）、次の `Seg` を待つ。
+//! `Frame`）は使えないので、選択の画面にいる間に先頭に来た `Frame` は捨てて（`orphan_frames`）、次の `Seg` を待つ。ホストが選択の seg まで
+//! 遡れなかった（リングバッファから落ちた・遡りの上限を越えた）ときがこの形で、待つ間は `awaiting_select` が真（画面の知らせの元）。
 //!
 //! ## ゲーム内のメニューの経路（観戦の「ルームマッチ」）
 //!
@@ -69,16 +74,18 @@ use higanr_core::input_model::keys::{ESC, Z};
 use higanr_core::lockstep::RESEND_MS;
 use higanr_core::menu_model::{
     APPLY_CLEAR_BITS, DECIDE_BITS, Outcome, SCREEN_CHARA, SCREEN_DIFFICULTY, TRANSITION_BITS,
-    outcome_of,
+    outcome_of, uses_align,
 };
 use higanr_core::net_menu::PeerStats;
 use higanr_core::spectate::{AsmCounts, Watcher, WatcherConfig, WatcherCounts};
+use higanr_core::spectate_pace::Pace;
 use higanr_core::wire::{ByeReason, MAX_DATAGRAM, Record, Seat, Select, Step, StepKind};
 
 use crate::net_portrait::Followed;
 use crate::net_select::{self, MenuView};
 use crate::net_ui::{HudNames, WatchHudFacts};
 use crate::net_watch::phase_code;
+use crate::netplay::peer_wait;
 use crate::netplay::{
     Action, BadValue, CursorWrite, FrameRec, FrameTiming, Game, MENU_HOLD_LIMIT, Net, Phase,
     REQ_LEAVE_MATCH, REQ_REBUILD_MATCH, REQ_SAVE_AND_QUIT, SCENE_MATCH, StepLog, StepRec,
@@ -98,8 +105,9 @@ pub const START_HOLD_TICKS: u32 = 30;
 /// 繋がった後、ホストから何も聞こえない時間（ms）がこれを越えたら見るのをやめる。観戦者が黙って外される時間
 /// （`spectate::SILENT_MS` = 10 秒）の 2 倍で、越えたらホストが終えた（か、外された後の JOIN にも答えない）と読む。
 pub const HOST_SILENT_END_MS: u32 = 20_000;
-/// 止める地点で `Select` が両席揃うのを待ってよい tick の数（10 秒）。
-pub const HOLD_LIMIT_TICKS: u32 = 600;
+/// 止める地点で `Select` が両席揃うのを待ってよい tick の数。対戦者の待ち（`peer_wait::LIMIT_MS`）に 10 秒の余白を足した長さ（60 fps）。
+/// 対戦者が最小化などで止まっても、先に観戦者が見るのをやめない。
+pub const HOLD_LIMIT_TICKS: u32 = (peer_wait::LIMIT_MS + 10_000) / 1000 * 60;
 /// 先頭の `Step` の次の記録（その tick の `Menu`）が届くのを待ってよい tick の数。来なければ語 0 で入れる。
 pub const PAIR_WAIT_TICKS: u32 = 6;
 /// 選択の画面で、使っていない記録がこの数を**越えたら**、遅れて入った観戦者として押下のない `Menu` を捨てて追いつく
@@ -222,6 +230,8 @@ pub struct WatchStats {
     /// 語が届いていなくて描画だけのフレームにした回と、その最長の連続。
     pub stalls: u64,
     pub max_stall_run: u32,
+    /// マッチの途中で止まった後、溜まりが戻るのを待った描画だけのフレーム（`spectate_pace::Pace::may_play`）。
+    pub refill_ticks: u64,
     /// マッチの 1 フレーム目の前に、余裕が溜まるのを待った描画だけのフレーム。
     pub start_hold_ticks: u64,
     /// 止める地点で `Select` を待った描画だけのフレーム。
@@ -315,6 +325,8 @@ pub struct WatchPlay {
     pair_wait: u32,
     /// 今の seg で入れた押下の数。0 のまま先頭の押下が画面 8 のときは、画面 7 にいる観戦者が遅れて入った seg（`walk_to_chara`）。
     seg_steps: u32,
+    /// 選択の記録の無い seg のマッチの語を捨てて、次の選択を待っている（選択の記録を 1 つ使えば戻す）。
+    awaiting_select: bool,
     pre_join_decide_held: bool,
     steps: StepLog,
     sel: [Option<Select>; 2],
@@ -329,6 +341,10 @@ pub struct WatchPlay {
     arrivals: [Arrival; ARRIVAL_SLOTS],
     stats: WatchStats,
     ff: FfState,
+    /// 早送りの速さと、止まった後の余裕の作り直し（1 表示ごとに届いた記録の数を入れる）。
+    pace: Pace,
+    /// 前の表示の始まりから、使えるようになった記録の数（組み立ての連続の終わりが進んだ数。`reset` で飛んだ便は、飛んだ先から数える）。
+    pace_arrived: u32,
     /// 画面の通信の状態の行に出す遅れ（`hud_facts`）: 使う直前の溜まりの直近 `HUD_DELAY_WINDOW` フレームの最大（そのまま出すと数字が
     /// ちらつく）。上がるときはすぐ、下がるときは期間が閉じるときにコピーする。
     hud_delay: u32,
@@ -369,6 +385,7 @@ impl WatchPlay {
             hold_run: 0,
             pair_wait: 0,
             seg_steps: 0,
+            awaiting_select: false,
             pre_join_decide_held: false,
             steps: StepLog::new(),
             sel: [None; 2],
@@ -381,6 +398,8 @@ impl WatchPlay {
             arrivals: [NO_ARRIVAL; ARRIVAL_SLOTS],
             stats: WatchStats::default(),
             ff: FfState::default(),
+            pace: Pace::new(),
+            pace_arrived: 0,
             hud_delay: 0,
             hud_win_max: 0,
             hud_win_n: 0,
@@ -401,6 +420,11 @@ impl WatchPlay {
 
     pub fn menu_screen(&self) -> Option<u8> {
         self.aligned
+    }
+
+    /// 次のキャラ選択まで映らない（ホストが選択の seg まで遡れなかった）。画面に `T_SPECTATE_NEXT_SELECT` を出す間。
+    pub fn awaiting_select(&self) -> bool {
+        self.phase == Phase::Selecting && self.awaiting_select
     }
 
     pub fn stats(&self) -> WatchStats {
@@ -624,8 +648,16 @@ impl WatchPlay {
         while let Some((from, n, t_us, _)) = net.recv_marked(&mut buf) {
             let now = ms(net.now_us());
             let before = w.ack();
+            let jumps = w.assembler_counts().jumps;
             w.on_datagram(from, buf.get(..n).unwrap_or(&[]), now, net);
             stamp_arrivals(&mut self.arrivals, before, w.ack(), t_us);
+            // `reset` で飛んだ便は、飛んだ先（組み立ての先頭）から数える（飛んだ距離を届いた数にしない）。
+            let arrived = if w.assembler_counts().jumps != jumps {
+                w.pending() as u32
+            } else {
+                w.ack().saturating_sub(before)
+            };
+            self.pace_arrived = self.pace_arrived.saturating_add(arrived);
         }
         let now = ms(net.now_us());
         w.poll(now, net);
@@ -764,6 +796,7 @@ impl WatchPlay {
         self.started = false;
         self.start_hold = 0;
         self.stall_run = 0;
+        self.pace.reset_seg();
         self.stats.matches_started = self.stats.matches_started.saturating_add(1);
     }
 
@@ -855,6 +888,7 @@ impl WatchPlay {
                 Some(Record::Frame { .. }) => {
                     self.pop();
                     self.stats.orphan_frames = self.stats.orphan_frames.saturating_add(1);
+                    self.awaiting_select = true;
                 }
                 Some(Record::End(r)) => {
                     self.pop();
@@ -866,8 +900,9 @@ impl WatchPlay {
         }
         self.catch_up_menus();
         let screen8 = u8::try_from(v.screen).unwrap_or(0);
-        // 合わせが届くまでの語は、カーソルの値が食い違ったまま動かさないよう、方向・Ctrl・Shift を落とす（ゲストと同じ）。
-        let clear: u16 = if self.aligned == Some(screen8) {
+        // 合わせが届くまでの語は、カーソルの値が食い違ったまま動かさないよう、方向・Ctrl・Shift を落とす（ゲストと同じ）。キャラ選択には
+        // 合わせが無いので、両席とも語のまま動かす（観戦者の画面の相手の席は語の相対で動く。対戦者の側の位置は記録に無い）。
+        let clear: u16 = if self.aligned == Some(screen8) || !uses_align(screen8) {
             u16::MAX
         } else {
             !APPLY_CLEAR_BITS
@@ -876,6 +911,7 @@ impl WatchPlay {
             (Some(Record::Menu { p1, p2 }), _) => {
                 self.pop();
                 self.hold_run = 0;
+                self.awaiting_select = false;
                 let [w1, w2, w3] = net_select::normal_words(Seat::P1, p1 & clear, p2 & clear);
                 game.feed(0, w1);
                 game.feed(1, w2);
@@ -999,7 +1035,7 @@ impl WatchPlay {
         };
         match plan.cursor {
             Some(_) => {
-                for w in write_plan_cursors(game, v, &plan).into_iter().flatten() {
+                if let Some(w) = write_plan_cursors(game, v, &plan) {
                     match w {
                         CursorWrite::Miss => {
                             self.stats.menu_align_miss =
@@ -1042,6 +1078,7 @@ impl WatchPlay {
         game.feed(1, p2);
         game.feed(2, p3);
         self.stats.menu_frames = self.stats.menu_frames.saturating_add(1);
+        self.awaiting_select = false;
     }
 
     fn hold<G: Game>(&mut self, game: &mut G) -> Action {
@@ -1184,6 +1221,10 @@ impl WatchPlay {
                             return Action::RenderOnly;
                         }
                         self.started = true;
+                    } else if !self.pace.may_play(self.available(), self.cfg.margin_frames) {
+                        // 止まった後: 溜まりが戻るまで待つ（1 記録ずつ使うとすぐまた止まる）。
+                        self.stats.refill_ticks = self.stats.refill_ticks.saturating_add(1);
+                        return Action::RenderOnly;
                     }
                     let backlog = self.available();
                     let idx = self.look[0].map_or(u32::MAX, |(i, _)| i);
@@ -1211,6 +1252,9 @@ impl WatchPlay {
             self.stats.stalls = self.stats.stalls.saturating_add(1);
             self.stall_run = self.stall_run.saturating_add(1);
             self.stats.max_stall_run = self.stats.max_stall_run.max(self.stall_run);
+            if self.started {
+                self.pace.on_stall();
+            }
             return Some(Action::RenderOnly);
         }
         let left = (deadline - now).min(u64::from(RESEND_MS) * 1_000);
@@ -1373,7 +1417,9 @@ const S_FF_DROP_FAIL: usize = 64;
 const S_FF_ACTIVE: usize = 65;
 // 選択の画面で遅れを詰めるために捨てた `Menu`（`catch_up_menus`）。
 const S_MENU_SKIPPED: usize = 66;
-const WORDS: usize = 67;
+// マッチの途中で止まった後、溜まりが戻るのを待った描画だけのフレーム。
+const S_REFILL: usize = 67;
+const WORDS: usize = 68;
 const NO_VALUE: u32 = u32::MAX;
 
 impl WatchStatus {
@@ -1401,6 +1447,7 @@ impl WatchStatus {
         set(S_ZERO, c(s.zero_ticks));
         set(S_STALLS, c(s.stalls));
         set(S_MAX_STALL, s.max_stall_run);
+        set(S_REFILL, c(s.refill_ticks));
         set(S_START_HOLD, c(s.start_hold_ticks));
         set(S_HOLD, c(s.hold_frames));
         set(S_MENU_FRAMES, c(s.menu_frames));
@@ -1492,7 +1539,7 @@ impl WatchStatus {
             v => format!("{v} ms"),
         };
         let main = format!(
-            "観戦者: 段階 {} / 終わり {}（{}） / tick {} / 使った試合のフレーム {} / 0 を feed {} / 入力ワードが届かず描画だけのフレーム {} 回（最長の連続 {}） / 試合の始めに余裕を待った描画だけのフレーム {} / 止める地点で待った {} / 選択のフレーム {}（入れた押下 {}・持ち越したフレーム {}・カーソルを書けなかった {}・立ち絵を追わせた {}・追わせなかった {}・遅れて入って画面 7 から 8 へ自分で押した決定 {}・遅れて入って追いつくために捨てた選択の語 {}） / 消費した seg の先頭 {}・受けた SELECT {}・始まった試合 {} / 使えなかった記録（選択の画面の先頭の試合の語 {}・種類違い {}）・番号が続かなかったフレーム {}・チャージ型を書けなかった {}\n\
+            "観戦者: 段階 {} / 終わり {}（{}） / tick {} / 使った試合のフレーム {} / 0 を feed {} / 入力ワードが届かず描画だけのフレーム {} 回（最長の連続 {}） / 止まった後に溜まりが戻るのを待った描画だけのフレーム {} / 試合の始めに余裕を待った描画だけのフレーム {} / 止める地点で待った {} / 選択のフレーム {}（入れた押下 {}・持ち越したフレーム {}・カーソルを書けなかった {}・立ち絵を追わせた {}・追わせなかった {}・遅れて入って画面 7 から 8 へ自分で押した決定 {}・遅れて入って追いつくために捨てた選択の語 {}） / 消費した seg の先頭 {}・受けた SELECT {}・始まった試合 {} / 使えなかった記録（選択の画面の先頭の試合の語 {}・種類違い {}）・番号が続かなかったフレーム {}・チャージ型を書けなかった {}\n\
              観戦者の受け: 繋がるまで {join} / 受けた STREAM {}（送った JOIN {}・ACK {}） / 組み立て（入れた {}・重複 {}・置き場の外 {}・飛び {}）・消費後の飛び {} / 捨てたもの（候補に無い送り元 {}・別の session {}・タグ {}・読めない {}）\n\
              観戦者の遅れ: 記録が届いてから使うまで（余裕）{} µs 未満 {} / {} 未満 {} / {} 未満 {} / {} 未満 {} / {} 未満 {} / それ以上 {}（平均 {mean} µs・最大 {} µs・分からなかった {}） / 使う直前に溜まっていた記録の最大 {}（使ったフレーム {n}）",
             PHASES.get(g(S_PHASE) as usize).copied().unwrap_or("?"),
@@ -1503,6 +1550,7 @@ impl WatchStatus {
             g(S_ZERO),
             g(S_STALLS),
             g(S_MAX_STALL),
+            g(S_REFILL),
             g(S_START_HOLD),
             g(S_HOLD),
             g(S_MENU_FRAMES),

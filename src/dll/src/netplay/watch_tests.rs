@@ -49,6 +49,8 @@ const NAME_B: &str = "guest-b";
 thread_local! {
     /// 真の間に作った `Rig` は、ホストのリングバッファから取り出した `Name` の記録を観戦の流れへ積まない（名前を受けていない観戦者の形を作る）。検査のスレッドごと。
     static DROP_NAMES: Cell<bool> = const { Cell::new(false) };
+    /// `Some` の間に作った `Rig` のホストは、遅れた JOIN の遡りの上限をこの値にする（0 = 選択の seg まで遡れない形）。
+    static HOST_REWIND: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// 観戦用のコードの session と秘密（対戦の session 9・`DEFAULT_SECRET` とは別の値）。
@@ -150,6 +152,8 @@ struct Rig {
     /// 最初に追いつき終えた後に使ったマッチのフレームの余裕（記録が届いてから使うまで。µs）。
     after_margins: Vec<u32>,
     hud: Vec<Option<WatchHudFacts>>,
+    /// tick ごとの（`awaiting_select`、それまでに使ったマッチのフレームの数）。
+    awaiting: Vec<(bool, u64)>,
 }
 
 impl Rig {
@@ -217,6 +221,7 @@ impl Rig {
             extra_not_played: 0,
             after_margins: Vec::new(),
             hud: Vec::new(),
+            awaiting: Vec::new(),
         }
     }
 
@@ -303,6 +308,8 @@ impl Rig {
         let ended_before = self.wp.end().is_some();
         let a = self.wg.tick(&mut self.wp, &mut self.wnet);
         self.hud.push(self.wp.hud_facts());
+        self.awaiting
+            .push((self.wp.awaiting_select(), self.wp.stats().played));
         self.wticks += 1;
         if ended_before {
             self.post_end_ticks += 1;
@@ -485,6 +492,9 @@ fn run_rig_inner(
     let mut npa = NetPlay::new(link_cfg_named(2, 0xF000, NAME_A), cfg, &mut na);
     let mut rig = Rig::new(w, spec_delay_us);
     rig.drop_names = DROP_NAMES.with(Cell::get);
+    if let Some(n) = HOST_REWIND.with(Cell::get) {
+        rig.host.set_rewind_max(n);
+    }
     rig.end_delay_ticks = end_delay_ticks;
     rig.bare_tail = bare_tail;
     rig.ff_on = ff.is_some();
@@ -593,7 +603,18 @@ fn assert_follows_with(o: &Out, tag: &str, late: bool) {
             .filter(|f| *f != [0; 3])
             .collect::<Vec<_>>()
     };
-    let (fw, fa) = (nonzero(&w.fed_menu), nonzero(&o.a.fed_menu));
+    // キャラ選択では、A は相手（B・2P）の語の方向と「ランダム」を落として入れ、カーソルは位置で書く。観戦者は両席を語のまま入れるので、
+    // 観戦者の列の画面 8 の 2P の語に同じ落とし方を当ててから比べる。
+    let as_host: Vec<[u16; 3]> = w
+        .fed_menu
+        .iter()
+        .zip(&w.fed_menu_screen)
+        .map(|(f, &s)| {
+            let p2 = crate::net_select::peer_word(s, f[1]);
+            if s == 8 { [f[0], p2, f[0] | p2] } else { *f }
+        })
+        .collect();
+    let (fw, fa) = (nonzero(&as_host), nonzero(&o.a.fed_menu));
     if late {
         let mut rest = fa.iter();
         assert!(
@@ -1533,8 +1554,9 @@ fn the_screen_eight_walk_does_not_fire_when_the_game_is_where_the_record_starts(
     }
 }
 
-#[test]
-fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
+/// 1 回選んで 2 回再戦する 3 試合（各 50 フレーム）。観戦者は 2 試合目（再戦の seg 1）の途中で入る。`bare_tail` は `run_rig_full` と同じ
+/// （最後の seg を出た後の選択の記録を積まず、`End` が `Seg` の直後に来る）。
+fn rematch_run(bare_tail: bool) -> Out {
     let (pa, pb) = plans();
     let round0 = |p: Vec<Act>| p.into_iter().filter(|a| a.round == 0).collect::<Vec<_>>();
     let mut a = MenuGame::new(
@@ -1550,9 +1572,55 @@ fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
         g.rematches = 2;
         g.match_frames = 50;
     }
+    a.match_words = Some(0xA1);
+    b.match_words = Some(0xB2);
     let w = watcher_game(50, 3, 2);
     let late = |a: &MenuGame| a.matches == 1 && a.played.len() >= 60;
-    let o = run_rig(a, b, w, true, &late, 5_000, 20_000);
+    run_rig_full(
+        a,
+        b,
+        w,
+        true,
+        &late,
+        &|_| false,
+        (bare_tail, 0),
+        5_000,
+        20_000,
+    )
+}
+
+#[test]
+fn a_late_joiner_in_a_rematch_seg_replays_the_rematches_from_the_last_selection() {
+    let o = rematch_run(false);
+    assert!(o.rig.started);
+    let (wp, wg) = (&o.rig.wp, &o.rig.wg);
+    let s = wp.stats();
+    assert_eq!(
+        wp.end(),
+        Some(WatchEnd::HostEnded(ByeReason::Finished)),
+        "{s:?}"
+    );
+    assert_eq!(o.a.played.len(), 150, "A が 3 試合していない");
+    assert_eq!(wg.played, o.a.played, "1 試合目の選択から全部");
+    assert_eq!(wg.played, o.b.played);
+    assert_eq!(wg.watched.len(), 1, "止める地点は最初の選択の 1 回");
+    assert_eq!(s.matches_started, 3, "{s:?}");
+    assert_eq!(s.orphan_frames, 0, "{s:?}");
+    assert!(
+        o.rig.awaiting.iter().all(|(a, _)| !a),
+        "遡れたのに次の選択を待つ印が立った"
+    );
+    assert_eq!((s.stray_records, s.stalls, s.jumps), (0, 0, 0), "{s:?}");
+    assert_eq!(o.rig.leaks, 0);
+    assert_eq!(wg.ignored_presses, 0);
+}
+
+#[test]
+fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
+    HOST_REWIND.with(|c| c.set(Some(0)));
+    // 最後の試合の後の選択を積まない: 印が立ったまま `End` を受ける形（終われば下りる）。
+    let o = rematch_run(true);
+    HOST_REWIND.with(|c| c.set(None));
     assert!(o.rig.started);
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     assert_eq!(wp.end(), Some(WatchEnd::HostEnded(ByeReason::Finished)));
@@ -1564,10 +1632,17 @@ fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
     assert_eq!(wg.screen, 7, "選択の画面のまま（自分の入力は届かない）");
     assert_eq!(o.rig.leaks, 0);
     assert_eq!(wg.ignored_presses, 0);
+    // 最初の試合の語を捨てた tick から観戦が終わるまで「次のキャラ選択から映ります」の印が続き、終われば下りる。
+    let marks: Vec<bool> = o.rig.awaiting.iter().map(|x| x.0).collect();
+    let first = marks.iter().position(|a| *a).expect("印が立っていない");
+    let last = marks.iter().rposition(|a| *a).unwrap_or(first);
+    assert!(marks[first..=last].iter().all(|a| *a), "途中で印が下りた");
+    assert_eq!(marks.last(), Some(&false), "終わった後も印が立っている");
 }
 
 #[test]
 fn a_late_joiner_in_a_rematch_seg_waits_for_the_next_seg_and_walks_into_its_selection() {
+    HOST_REWIND.with(|c| c.set(Some(0)));
     let (pa, pb) = plans();
     let remap = |p: Vec<Act>| {
         p.into_iter()
@@ -1595,6 +1670,7 @@ fn a_late_joiner_in_a_rematch_seg_waits_for_the_next_seg_and_walks_into_its_sele
     let w = watcher_game(40, 4, 1);
     let late = |a: &MenuGame| a.matches == 1 && a.played.len() >= 50;
     let o = run_rig(a, b, w, true, &late, 5_000, 40_000);
+    HOST_REWIND.with(|c| c.set(None));
     assert!(o.rig.started, "W を起こせていない");
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     let s = wp.stats();
@@ -1615,6 +1691,62 @@ fn a_late_joiner_in_a_rematch_seg_waits_for_the_next_seg_and_walks_into_its_sele
     assert_eq!((s.stray_records, s.stalls, s.jumps), (0, 0, 0), "{s:?}");
     assert_eq!(wg.ignored_presses, 0);
     assert_eq!(o.rig.leaks, 0);
+    // 待つ間だけ印が立ち、次の選択の記録を使った後（試合を映している間）は立たない。
+    assert!(o.rig.awaiting.iter().any(|(a, _)| *a), "印が立っていない");
+    assert!(
+        !o.rig.awaiting.iter().any(|&(a, played)| a && played > 0),
+        "試合を映し始めた後も印が立っている"
+    );
+}
+
+#[test]
+fn the_wait_mark_goes_down_with_the_first_selection_record_used_menu_or_step() {
+    use higanr_core::wire::{Step, StepKind};
+    for with_step in [false, true] {
+        let w = MenuGame::new(0, vec![act(0, 6, 12, Z, 1)], &[0, 1, 2, 3]);
+        let mut rig = Rig::new(w, 1_000);
+        for r in [
+            Record::Seg { seg: 0 },
+            Record::Frame {
+                frame: 0,
+                p1: 1,
+                p2: 2,
+            },
+            Record::Frame {
+                frame: 1,
+                p1: 1,
+                p2: 2,
+            },
+        ] {
+            rig.host.push(r).unwrap();
+        }
+        let mut now = 1_000_000u64;
+        for _ in 0..300 {
+            rig.hook(now, true);
+            now += FRAME_US;
+        }
+        assert!(rig.wp.awaiting_select(), "{with_step}: 印が立っていない");
+        rig.host.push(Record::Seg { seg: 1 }).unwrap();
+        if with_step {
+            // 押下とその tick の `Menu` は Step の側で一緒に使う（`Menu` の枝を通らない）。
+            rig.host
+                .push(Record::Step(Step {
+                    step: 0,
+                    kind: StepKind::Align,
+                    value: 2,
+                    screen: 7,
+                }))
+                .unwrap();
+        }
+        rig.host.push(Record::Menu { p1: 0, p2: 0 }).unwrap();
+        for _ in 0..60 {
+            rig.hook(now, true);
+            now += FRAME_US;
+        }
+        let s = rig.wp.stats();
+        assert_eq!(s.menu_applied, u32::from(with_step), "{with_step}: {s:?}");
+        assert!(!rig.wp.awaiting_select(), "{with_step}: 印が下りない {s:?}");
+    }
 }
 
 #[test]

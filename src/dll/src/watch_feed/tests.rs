@@ -200,6 +200,21 @@ fn the_feed_shows_the_servers_list_follows_its_changes_and_closes_when_stopped()
 }
 
 #[test]
+fn the_failure_line_carries_the_transport_step_and_code_only() {
+    use crate::room_win::Step;
+    let notes = [TransportNote::OpenFailed {
+        step: Step::ReceiveResponse,
+        code: 12002,
+    }];
+    let line = failure_line(&"X", &notes);
+    assert!(
+        line.contains("ReceiveResponse") && line.contains("12002"),
+        "{line}"
+    );
+    assert!(!failure_line(&"X", &[]).contains("運び"));
+}
+
+#[test]
 #[ignore = "偽サーバーと本物のスレッド・WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
 fn the_feed_says_failed_when_the_server_refuses_or_is_unreachable_and_never_rows() {
     // 429（回数超え）。

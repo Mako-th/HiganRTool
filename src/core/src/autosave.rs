@@ -303,6 +303,92 @@ pub fn settings_from_ini(ini: &Ini) -> Result<Option<ReplaySettings>, String> {
     Ok(Some(ReplaySettings { split }))
 }
 
+/// 保存の直前に、見出しのチャージ型をゲームの設定の写し（生きた試合が使った値）に合わせた結果。見出しは読み込みスレッドがその PC の
+/// `th09.cfg` から写したままなので、そのまま保存すると、相手と設定が違う試合を素の花映塚で再生したときにずれる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChargeSync {
+    /// 試みていない（保存の記録の初期値）。
+    #[default]
+    NotTried,
+    Written {
+        p1: u8,
+        p2: u8,
+    },
+    /// 写しのポインタが 0 か読めない（書かない）。
+    NoCopy,
+    /// 見出しのポインタが 0 か読めない（書かない）。
+    NoHeader,
+    /// 写しの中のチャージ型が読めない（書かない）。
+    CopyUnreadable,
+    /// 見出しへ書けなかった。
+    WriteFailed,
+}
+
+impl ChargeSync {
+    /// 保存の記録（原子変数の 1 語）へ。下位 8 ビットが種類、次の 8 ビットが 1P、その次の 8 ビットが 2P。
+    pub fn to_word(self) -> u32 {
+        match self {
+            ChargeSync::NotTried => 0,
+            ChargeSync::Written { p1, p2 } => 1 | u32::from(p1) << 8 | u32::from(p2) << 16,
+            ChargeSync::NoCopy => 2,
+            ChargeSync::NoHeader => 3,
+            ChargeSync::CopyUnreadable => 4,
+            ChargeSync::WriteFailed => 5,
+        }
+    }
+
+    pub fn from_word(w: u32) -> Option<ChargeSync> {
+        Some(match w & 0xFF {
+            0 => ChargeSync::NotTried,
+            1 => ChargeSync::Written {
+                p1: (w >> 8) as u8,
+                p2: (w >> 16) as u8,
+            },
+            2 => ChargeSync::NoCopy,
+            3 => ChargeSync::NoHeader,
+            4 => ChargeSync::CopyUnreadable,
+            5 => ChargeSync::WriteFailed,
+            _ => return None,
+        })
+    }
+}
+
+/// 設定の写しのチャージ型 2 バイト（`copy + copy_off`、1P・2P の順）を、見出しの同じ並びの 2 バイト（`header + header_off`）へ写す。
+/// ポインタが 0 のとき・読めないときは 1 バイトも書かない。席は入れ替えない（1P は 1P へ、2P は 2P へ）。
+/// `read` / `write` は落ちない読み書き（読めない・書けないアドレスは `None` / false を返す）。
+pub fn sync_header_charge(
+    copy: Option<u32>,
+    header: Option<u32>,
+    copy_off: u32,
+    header_off: u32,
+    mut read: impl FnMut(u32) -> Option<u8>,
+    mut write: impl FnMut(u32, u8) -> bool,
+) -> ChargeSync {
+    let Some(src) = copy
+        .filter(|&p| p != 0)
+        .and_then(|p| p.checked_add(copy_off))
+    else {
+        return ChargeSync::NoCopy;
+    };
+    let Some(dst) = header
+        .filter(|&p| p != 0)
+        .and_then(|p| p.checked_add(header_off))
+    else {
+        return ChargeSync::NoHeader;
+    };
+    let (Some(p1), Some(p2)) = (read(src), src.checked_add(1).and_then(&mut read)) else {
+        return ChargeSync::CopyUnreadable;
+    };
+    let Some(dst2) = dst.checked_add(1) else {
+        return ChargeSync::NoHeader;
+    };
+    if write(dst, p1) && write(dst2, p2) {
+        ChargeSync::Written { p1, p2 }
+    } else {
+        ChargeSync::WriteFailed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +692,129 @@ mod tests {
         assert!(settings_from_ini(&ini("[replay]\nenable = 1\nlayuot = date\n")).is_err());
         assert!(settings_from_ini(&ini("[replay]\nenable = 1\nlayout = daily\n")).is_err());
         assert!(settings_from_ini(&ini("[replay]\nenable = 0\nx = 1\n")).is_err());
+    }
+
+    /// 偽のメモリ: 写し（0x1000 から）と見出し（0x2000 から）。書けない範囲は `ro` で指定する。
+    struct Mem {
+        bytes: std::collections::BTreeMap<u32, u8>,
+        ro: Vec<u32>,
+        writes: Vec<(u32, u8)>,
+    }
+
+    impl Mem {
+        fn new() -> Mem {
+            let mut bytes = std::collections::BTreeMap::new();
+            // 写し: +0xB4 = 1P、+0xB5 = 2P。見出しは cfg 由来の 0 / 0。
+            bytes.insert(0x1000 + 0xB4, 1);
+            bytes.insert(0x1000 + 0xB5, 0);
+            bytes.insert(0x2000 + 0x190, 0);
+            bytes.insert(0x2000 + 0x191, 0);
+            Mem {
+                bytes,
+                ro: Vec::new(),
+                writes: Vec::new(),
+            }
+        }
+
+        fn sync(&mut self, copy: Option<u32>, header: Option<u32>) -> ChargeSync {
+            let bytes = &mut self.bytes;
+            let ro = &self.ro;
+            let writes = &mut self.writes;
+            // 読みと書きが同じ偽のメモリを触るので、読みは呼ぶ前の写しから引く。
+            let snapshot = bytes.clone();
+            sync_header_charge(
+                copy,
+                header,
+                0xB4,
+                0x190,
+                |a| snapshot.get(&a).copied(),
+                |a, v| {
+                    if ro.contains(&a) || !bytes.contains_key(&a) {
+                        return false;
+                    }
+                    bytes.insert(a, v);
+                    writes.push((a, v));
+                    true
+                },
+            )
+        }
+    }
+
+    /// 壊れたら落ちる: 書かない・席を入れ替える・違う欄へ書く。
+    #[test]
+    fn charge_goes_to_the_same_seat_in_the_header() {
+        let mut m = Mem::new();
+        assert_eq!(
+            m.sync(Some(0x1000), Some(0x2000)),
+            ChargeSync::Written { p1: 1, p2: 0 }
+        );
+        assert_eq!(m.bytes[&(0x2000 + 0x190)], 1, "1P の欄は写しの 1P");
+        assert_eq!(m.bytes[&(0x2000 + 0x191)], 0, "2P の欄は写しの 2P");
+        // 席を入れ替えて見る（2P だけチャージ型）。
+        let mut m = Mem::new();
+        m.bytes.insert(0x1000 + 0xB4, 0);
+        m.bytes.insert(0x1000 + 0xB5, 1);
+        assert_eq!(
+            m.sync(Some(0x1000), Some(0x2000)),
+            ChargeSync::Written { p1: 0, p2: 1 }
+        );
+        assert_eq!(
+            (m.bytes[&(0x2000 + 0x190)], m.bytes[&(0x2000 + 0x191)]),
+            (0, 1)
+        );
+        // 書くのは 2 バイトだけ。
+        assert_eq!(m.writes, vec![(0x2000 + 0x190, 0), (0x2000 + 0x191, 1)]);
+    }
+
+    #[test]
+    fn nothing_is_written_when_a_pointer_is_missing_or_unreadable() {
+        for (copy, header, want) in [
+            (None, Some(0x2000), ChargeSync::NoCopy),
+            (Some(0), Some(0x2000), ChargeSync::NoCopy),
+            (Some(u32::MAX), Some(0x2000), ChargeSync::NoCopy),
+            (Some(0x1000), None, ChargeSync::NoHeader),
+            (Some(0x1000), Some(0), ChargeSync::NoHeader),
+            (Some(0x1000), Some(u32::MAX), ChargeSync::NoHeader),
+            // 指す先が読めない
+            (Some(0x5000), Some(0x2000), ChargeSync::CopyUnreadable),
+        ] {
+            let mut m = Mem::new();
+            assert_eq!(m.sync(copy, header), want, "{copy:x?} {header:x?}");
+            assert!(
+                m.writes.is_empty(),
+                "{copy:x?} {header:x?}: 書いてはいけない"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unwritable_header_is_reported() {
+        let mut m = Mem::new();
+        m.ro.push(0x2000 + 0x190);
+        assert_eq!(m.sync(Some(0x1000), Some(0x2000)), ChargeSync::WriteFailed);
+        // 見出しの先が無い（書けない）。
+        let mut m = Mem::new();
+        assert_eq!(m.sync(Some(0x1000), Some(0x3000)), ChargeSync::WriteFailed);
+    }
+
+    #[test]
+    fn charge_sync_survives_the_record_word() {
+        for c in [
+            ChargeSync::NotTried,
+            ChargeSync::Written { p1: 1, p2: 0 },
+            ChargeSync::Written { p1: 0, p2: 1 },
+            ChargeSync::NoCopy,
+            ChargeSync::NoHeader,
+            ChargeSync::CopyUnreadable,
+            ChargeSync::WriteFailed,
+        ] {
+            assert_eq!(ChargeSync::from_word(c.to_word()), Some(c));
+        }
+        assert_eq!(ChargeSync::from_word(0), Some(ChargeSync::NotTried));
+        assert_eq!(ChargeSync::from_word(0xFF), None);
+        assert_ne!(
+            ChargeSync::Written { p1: 1, p2: 0 }.to_word(),
+            ChargeSync::Written { p1: 0, p2: 1 }.to_word()
+        );
     }
 }

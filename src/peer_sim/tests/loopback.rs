@@ -304,7 +304,7 @@ fn run_follow(follower_is_host: bool, ff: FaultConfig, poll_ms: u32) -> (Report,
 }
 
 /// `follower_sends_drop` は付いていく側の送りを落とす実行。そのときは付いていく側の BYE(終了) が、最初の 1 通も先に立つ側の
-/// PING への返し（`LINGER_MS` の間の 2〜3 回）も全部落ちることがあり、先に立つ側は 10 秒の沈黙で `Finished { peer_bye: false }` に
+/// PING への返し（`LINGER_MS` の間の 2〜3 回）も全部落ちることがあり、先に立つ側は 60 秒の沈黙で `Finished { peer_bye: false }` に
 /// なる。付いていく側は相手の BYE を受けてから閉じるので、いつも `peer_bye: true`。
 fn assert_follow_ok(rl: &Report, rf: &Report, tag: &str, follower_sends_drop: bool) {
     let sum = |r: &Report| peer_sim::record::summary(r);
@@ -533,7 +533,11 @@ fn peer_going_silent_after_connecting_ends_with_disconnect() {
         "試合に入る前に黙った（検査の前提が崩れた）"
     );
     assert!(ra.recs.len() < (SEGS * FRAMES) as usize);
-    assert!(ra.elapsed_ms >= 10_000, "{}", ra.elapsed_ms);
+    assert!(
+        ra.elapsed_ms >= higanr_core::liveness::SILENCE_LIMIT_MS,
+        "{}",
+        ra.elapsed_ms
+    );
 }
 
 #[test]
@@ -569,7 +573,7 @@ fn a_peer_of_another_version_is_refused_on_both_sides() {
     let sb = peer_sim::record::summary(&rb);
     assert!(sa.contains(&format!("（自分 {now}・相手 0）")), "{sa}");
     assert!(sb.contains(&format!("（自分 0・相手 {now}）")), "{sb}");
-    assert!(sa.contains("同じ zip"), "{sa}");
+    assert!(sa.contains("同じzip"), "{sa}");
     eprintln!(
         "A（{} ms）: {sa}
 B（{} ms）: {sb}",
@@ -718,7 +722,7 @@ fn deadline_sends_one_finished_bye_and_the_follower_closes() {
         "試合に入る前に打ち切った（検査の前提が崩れた）"
     );
     assert_eq!(byes.lock().unwrap().len(), 1, "A が出した BYE の数");
-    // B は相手の BYE(終了) を受けて閉じた（10 秒の沈黙で切れたのではない —— それなら `Dead` で 13 秒を越える）。
+    // B は相手の BYE(終了) を受けて閉じた（60 秒の沈黙で切れたのではない —— それなら `Dead` で 63 秒を越える）。
     assert_eq!(rb.end, End::Finished { peer_bye: true }, "{}", sum(&rb));
     assert!(rb.elapsed_ms < 9_000, "{}\n{}", rb.elapsed_ms, sum(&rb));
     // 使ったフレームの列は、短い方の長さまで一致する（打ち切りの時点で相手のワードがどこまで届いていたかで長さが違う）。
@@ -953,9 +957,9 @@ screen=8 wait=180 press=decide cursor=9  # step 5: 2P が決める（ホスト�
 ";
 
 /// 両者に入るはずの押下の列 (step, kind, value, screen)。value はプロトコルの行の形から手で書いた（キャラ: bit0 = 席、bit1 = Shift、
-/// bit2〜5 = カーソル。合わせ: 難易度 = カーソル、キャラ = 1P のカーソル | 2P のカーソル << 4、マップ = 一覧の値。ホストの peer_sim が
-/// 出す値は `menu_plan::SIM_ALIGN_*`）。画面に入るたび（選択の外から入り直した 7 も、8 へ移った後も、16 へ移った後も）、
-/// その画面の最初の押下より先にホストの合わせが 1 つ入る。
+/// bit2〜5 = カーソル。合わせ: 難易度 = カーソル、マップ = 一覧の値。ホストの peer_sim が出す値は `menu_plan::SIM_ALIGN_*`）。
+/// 難易度とマップの画面に入るたび（選択の外から入り直した 7 も、16 へ移った後も）、その画面の最初の押下より先にホストの合わせが
+/// 1 つ入る。キャラ選択（8）は合わせない。
 fn menu_expected_presses() -> Vec<(u16, StepKind, u8, u8)> {
     use StepKind::{Align as A, Cancel as C, Decide as D};
     vec![
@@ -963,13 +967,12 @@ fn menu_expected_presses() -> Vec<(u16, StepKind, u8, u8)> {
         (1, C, 0, 7),
         (2, A, 2, 7),
         (3, D, 3, 7),
-        (4, A, 0x64, 8), // 1P のカーソル 4・2P のカーソル 6
-        (5, D, 0x08, 8), // 1P・カーソル 2
-        (6, C, 0x00, 8), // 1P の取消（カーソル 0）
-        (7, D, 0x1E, 8), // 1P・Shift・カーソル 7
-        (8, D, 0x25, 8), // 2P・カーソル 9
-        (9, A, 14, 16),
-        (10, D, 15, 16),
+        (4, D, 0x08, 8), // 1P・カーソル 2
+        (5, C, 0x00, 8), // 1P の取消（カーソル 0）
+        (6, D, 0x1E, 8), // 1P・Shift・カーソル 7
+        (7, D, 0x25, 8), // 2P・カーソル 9
+        (8, A, 14, 16),
+        (9, D, 15, 16),
     ]
 }
 
@@ -1073,11 +1076,10 @@ fn assert_menu_ok(ra: &Report, rb: &Report, tag: &str) {
             "{tag}"
         );
     }
-    // MENU のワード: ゲストのワード（B。合わせを待ってから出す）は、キャラの画面の合わせ（step 4）の後の step 5 で A に届く。ホストのワード
-    // （A。ホストは待たない）は、方向が立っている間は合わせを出さないので、合わせの前の step 4 の間に B へ届く（実機のゲストなら、
-    // 合わせの前のワードは入れずに捨てる）。画面を移るビットは落ちている。
+    // MENU のワード: キャラの画面は合わせないので、ゲストのワード（B）もホストのワード（A）も、1P の決定（step 4）の前の step 4 の間に
+    // 相手へ届く。画面を移るビットは落ちている。
     assert!(
-        ma.remote_words.contains(&(5, 0x44)),
+        ma.remote_words.contains(&(4, 0x44)),
         "{tag}: {:?}",
         ma.remote_words
     );

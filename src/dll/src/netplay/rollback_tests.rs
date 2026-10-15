@@ -491,6 +491,31 @@ fn two_rollback_sides_confirm_the_same_rows_and_reach_the_same_state() {
     assert_eq!(a.rows, b.rows, "両者の確定の列が違う");
 }
 
+/// rollback でも試合の語の Ctrl（`0x0100`）は両席・両側の確定の行に残り、Enter（`0x1000`）は落ちる。
+#[test]
+fn ctrl_in_the_match_word_reaches_both_seats_in_the_confirmed_rows_of_both_sides() {
+    let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, 3);
+    for s in [&mut a, &mut b] {
+        s.g.local_or = 0x1100;
+    }
+    run(&mut a, &mut b, &clock, 120);
+    settle(&mut a, &mut b, &clock, 60);
+    for (who, s) in [("A", &a), ("B", &b)] {
+        assert_eq!(s.rows.len(), 120, "{who}: 確定した行の数");
+        for (i, r) in s.rows.iter().enumerate() {
+            let (p1, p2) = ref_row(1, i as u32);
+            let ctrl = if i == 0 { 0 } else { 0x0100 };
+            assert_eq!(
+                (r.p1, r.p2),
+                (p1 | ctrl, p2 | ctrl),
+                "{who}: 行 {i}（Ctrl は両席に残り Enter は落ちる）"
+            );
+        }
+        assert_eq!(s.np.phase(), Phase::Lockstep, "{who}: {:?}", s.np.end());
+    }
+    assert_eq!(a.rows, b.rows, "両者の確定の列が違う");
+}
+
 /// リプレイの印の通信の要約: rollback のモードの接続は、形式・何マッチ目・止まった数（入力の地点が待った数）・進め直しの数を渡す。
 #[test]
 fn the_replay_mark_view_reports_the_rollback_state_and_totals() {
@@ -650,7 +675,9 @@ fn both_sides_pick_d_with_digit_keys_and_it_switches_in_the_same_match() {
         );
         let c = s.np.connected().unwrap();
         let want = c.shown_delay();
-        let rtt = c.liveness().rtt_ms();
+        let live = c.liveness();
+        let median = live.rtt_median_us().map(|us| us / 1_000).or(live.rtt_ms());
+        let max = live.rtt_max_ms();
         let h = s.np.hud_facts().unwrap();
         assert_eq!(
             h.latency,
@@ -659,7 +686,8 @@ fn both_sides_pick_d_with_digit_keys_and_it_switches_in_the_same_match() {
         );
         assert_eq!(
             h.recommend,
-            delay_pick::recommend(higanr_core::wire::Mode::Rollback, rtt)
+            delay_pick::recommend_with_max(higanr_core::wire::Mode::Rollback, median, max),
+            "{who}: 画面の推奨値が往復の中央値と最大から引いた値でない"
         );
         let mut l = LineBuf::new();
         hud_line(
@@ -1500,6 +1528,50 @@ fn the_guest_follows_the_hosts_auto_flag_in_a_rollback_match_without_flicker() {
         (1, 1),
         "ゲストの数字が両者に揃わない: {v:?}"
     );
+}
+
+/// 往復がほぼ 0 の回線（片道 0 フレーム）で測れた窓の最大が小さいとき auto は D 0 を選び、片道 3 フレームの回線では 1 を選ぶ（両者へ揃う）。
+#[test]
+fn auto_picks_d_zero_only_on_a_fast_link() {
+    use higanr_core::delay_pick::AUTO;
+    use higanr_core::lockstep::Role;
+    for (one_way, want) in [(0u64, 0u8), (3, 1)] {
+        let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, one_way);
+        run(&mut a, &mut b, &clock, 300);
+        let host_is_a = a.np.connected().unwrap().role() == Role::Host;
+        let (h, g) = if host_is_a {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        let c = h.np.connected().unwrap();
+        let max = c.liveness().rtt_max_ms();
+        assert!(max.is_some(), "往復の窓が 3 個に満たない（検査の前提）");
+        assert_eq!(c.recommend_now(), Some(want), "one_way {one_way}: {max:?}");
+        h.np.link.connected_mut().unwrap().press_delay(AUTO);
+        let (ha, hb) = (h, g);
+        let mut slot = clock.get();
+        for _ in 0..60 {
+            if clock.get() < slot {
+                clock.set(slot);
+            }
+            frame(ha);
+            frame(hb);
+            slot += FRAME_US;
+        }
+        for s in [&*ha, &*hb] {
+            assert_eq!(
+                s.np.connected().unwrap().cur_delay(),
+                want,
+                "one_way {one_way}: auto の D"
+            );
+        }
+        assert_eq!(
+            ha.np.hud_facts().unwrap().recommend,
+            Some(want),
+            "画面の推奨値も同じ"
+        );
+    }
 }
 
 #[test]

@@ -533,8 +533,8 @@ mod tests {
         assert_eq!(back, now_ver);
         assert_eq!(wire::decode(&key, None, &back).map(|p| p.msg), Ok(hello));
         assert_eq!(
-            (rl.swap_ver(PROTO_VER), rl.swap_ver(0), rl.swap_ver(8)),
-            (0, PROTO_VER, 8)
+            (rl.swap_ver(PROTO_VER), rl.swap_ver(0), rl.swap_ver(9)),
+            (0, PROTO_VER, 9)
         );
         let mut bad = now_ver.clone();
         let last = bad.len() - 1;

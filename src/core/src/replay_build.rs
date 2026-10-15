@@ -39,7 +39,8 @@ impl BitWriter {
 }
 
 /// 展開の逆（ゲームの圧縮 `0x00434020` と同じ形式）。履歴は 8192 バイトのリングバッファで、書き込み位置は 1 から。
-/// 位置 0 は終わりの印なので一致には使わない。
+/// 位置 0 は終わりの印なので一致には使わない。まだ書いていない位置も使わない: ゲームの展開は履歴を 0 で埋めておらず、
+/// ゲーム自身の圧縮もそこを指さない（指したリプレイは一覧で読めない枠になった）。
 pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter {
         out: Vec::new(),
@@ -47,6 +48,7 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
         n: 0,
     };
     let mut history = vec![0u8; WINDOW];
+    let mut filled = vec![false; WINDOW];
     let mut write = LZSS_INITIAL_WRITE;
     let mut i = 0usize;
     while i < data.len() {
@@ -63,8 +65,10 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
                     let back = (q + WINDOW - write) & WINDOW_MASK;
                     let src = if back < len {
                         data[i + back]
-                    } else {
+                    } else if filled[q] {
                         history[q]
+                    } else {
+                        break;
                     };
                     if src != data[i + len] {
                         break;
@@ -86,6 +90,7 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
             w.put_bits((best_len - MIN_MATCH) as u32, 4);
             for k in 0..best_len {
                 history[write] = data[i + k];
+                filled[write] = true;
                 write = (write + 1) & WINDOW_MASK;
             }
             i += best_len;
@@ -93,6 +98,7 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
             w.put(true);
             w.put_bits(u32::from(data[i]), 8);
             history[write] = data[i];
+            filled[write] = true;
             write = (write + 1) & WINDOW_MASK;
             i += 1;
         }
@@ -301,6 +307,60 @@ mod tests {
         assert_eq!(layout.chunks.len(), 1);
         assert_eq!(read_mark(&f).unwrap(), MarkRead::Absent);
         assert_eq!(chunk_constants(), (3598, 30));
+    }
+
+    /// 履歴を `fill` で埋めて展開する（ゲームの展開は履歴を 0 で埋めない）。終わりの印で止まる。
+    fn unlzss_with_fill(data: &[u8], fill: u8) -> Vec<u8> {
+        let bit = |p: usize| (data[p / 8] >> (7 - p % 8)) & 1;
+        let take = |p: &mut usize, n: usize| {
+            let mut v = 0usize;
+            for _ in 0..n {
+                v = (v << 1) | usize::from(bit(*p));
+                *p += 1;
+            }
+            v
+        };
+        let mut history = vec![fill; WINDOW];
+        let mut write = LZSS_INITIAL_WRITE;
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        while p + 14 <= data.len() * 8 {
+            if take(&mut p, 1) == 1 {
+                let b = take(&mut p, 8) as u8;
+                out.push(b);
+                history[write] = b;
+                write = (write + 1) & WINDOW_MASK;
+                continue;
+            }
+            let mut from = take(&mut p, 13);
+            if from == 0 {
+                break;
+            }
+            for _ in 0..take(&mut p, 4) + MIN_MATCH {
+                let b = history[from];
+                out.push(b);
+                history[write] = b;
+                write = (write + 1) & WINDOW_MASK;
+                from = (from + 1) & WINDOW_MASK;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn compress_never_reads_unwritten_history() {
+        // 先頭が 0 の並びだと、0 のまま書いていない履歴の位置に一致してしまう。
+        let mut data = vec![0x77u8, 0x61, 0x50, 0x01];
+        data.extend(std::iter::repeat_n(0u8, 40));
+        data.extend((0..3000u32).map(|i| (i % 13) as u8));
+        data.extend(std::iter::repeat_n(0u8, 100));
+        let c = lzss_compress(&data);
+        assert_eq!(unlzss_with_fill(&c, 0x00), data);
+        assert_eq!(
+            unlzss_with_fill(&c, 0xAA),
+            data,
+            "書いていない履歴の位置を指す一致がある"
+        );
     }
 
     #[test]

@@ -16,7 +16,19 @@ import {
   newRandomRoomName,
   spectateRoomName,
 } from "../src/rules";
-import { Client, connectWatch, freshBuild, freshIp, rawConnect, sameSlash64, sleep } from "./helpers";
+import {
+  Client,
+  connect,
+  connectRandom,
+  connectWatch,
+  freshBuild,
+  freshIp,
+  freshRoom,
+  rawConnect,
+  sameSlash64,
+  sleep,
+  stubFor,
+} from "./helpers";
 
 const W_RE = /^w\.[0-9a-f]{16}$/;
 
@@ -454,6 +466,110 @@ describe("入口で断るもの", () => {
     const build = freshBuild();
     expect(listStub(build).id.equals(listStub(build).id)).toBe(true);
     expect(listStub(build).id.equals(listStub(build + 1).id)).toBe(false);
+  });
+});
+
+/** ストレージへの書き込み（put / delete / setAlarm / deleteAlarm）を数える。 */
+async function countWrites(stub: DurableObjectStub): Promise<{ read: () => Promise<Record<string, number>> }> {
+  await runInDurableObject(stub, (_inst, state) => {
+    const s = state.storage as unknown as Record<string, any>;
+    const c: Record<string, number> = { put: 0, delete: 0, setAlarm: 0, deleteAlarm: 0 };
+    for (const k of Object.keys(c)) {
+      const orig = s[k].bind(s);
+      s[k] = (...args: unknown[]) => {
+        c[k] += 1;
+        return orig(...args);
+      };
+    }
+    (state as any).__writes = c;
+  });
+  return { read: () => runInDurableObject(stub, (_inst, state) => ({ ...(state as any).__writes })) };
+}
+
+describe("書き込みの回数（無料枠を荒らしに使わせない）", () => {
+  it("count を 0 と 1 で交互に 100 通送っても、put は 0 回・setAlarm は数回まで。窓の上限を越えた載せ手は閉じられる", async () => {
+    const build = freshBuild();
+    const host = await listed(build, { watchers: 0, cap: 5 });
+    await view(build);
+    const w = await countWrites(listStub(build));
+    for (let i = 0; i < 100; i++) host.c.sendJson({ t: "count", watchers: (i + 1) % 2 });
+    expect((await host.c.closed).code).toBe(Close.BadMessage);
+    const n = await w.read();
+    expect(n.put, JSON.stringify(n)).toBe(0);
+    expect(n.setAlarm, JSON.stringify(n)).toBeLessThanOrEqual(3);
+  });
+
+  it("荒らしでない連打（20 通）は閉じられず、put は 0 回・setAlarm は数回で、最後の数が 2 秒以内に一覧へ届く", async () => {
+    const build = freshBuild();
+    const host = await listed(build, { watchers: 0, cap: 5 });
+    const { v } = await view(build);
+    const w = await countWrites(listStub(build));
+    for (let i = 0; i < 20; i++) host.c.sendJson({ t: "count", watchers: i % 2 ? 2 : 3 });
+    let last = -1;
+    const until = Date.now() + 2500;
+    while (Date.now() < until && last !== 2) {
+      const m = await v.next(2500).catch(() => null);
+      if (m === null) break;
+      last = m.items[0]?.watchers;
+    }
+    expect(last, "最後の数（2）が一覧に届かない").toBe(2);
+    expect(host.c.isClosed).toBe(false);
+    const n = await w.read();
+    expect(n.put, JSON.stringify(n)).toBe(0);
+    expect(n.setAlarm, JSON.stringify(n)).toBeLessThanOrEqual(3);
+  });
+
+  it("起こされ直して印を失っても、次のアラームで全体が届く（lastSent が 0 のとき）", async () => {
+    const build = freshBuild();
+    const host = await listed(build, { watchers: 0 });
+    const { v } = await view(build);
+    host.c.sendJson({ t: "count", watchers: 3 });
+    await sleep(100);
+    expect(await v.silentFor(0)).toBeNull();
+    await runInDurableObject(listStub(build), (inst) => {
+      (inst as any).flushPending = false;
+      (inst as any).lastSent = 0;
+    });
+    expect(await runDurableObjectAlarm(listStub(build))).toBe(true);
+    expect((await v.next()).items[0].watchers).toBe(3);
+  });
+});
+
+describe("setAlarm が失敗しても入室・載せる操作は通る", () => {
+  async function breakAlarm(stub: DurableObjectStub): Promise<void> {
+    await runInDurableObject(stub, (_inst, state) => {
+      const s = state.storage as unknown as Record<string, any>;
+      s.setAlarm = async () => {
+        throw new Error("storage quota exceeded");
+      };
+    });
+  }
+
+  it("一覧: 載せる口の接続も post も count も通る", async () => {
+    const build = freshBuild();
+    await breakAlarm(listStub(build));
+    const { c } = await listed(build);
+    c.sendJson({ t: "count", watchers: 1 });
+    expect(await c.silentFor(100)).toBeNull();
+    expect(c.isClosed).toBe(false);
+  });
+
+  it("ルーム: 入室は 101 で host が入り、次の人が guest として入れる", async () => {
+    const name = freshRoom("alarmfail");
+    await breakAlarm(stubFor(name));
+    const a = await connect(name);
+    expect(await a.next()).toMatchObject({ t: "room", role: "host" });
+    const b = await connect(name);
+    expect(await b.next()).toMatchObject({ t: "room", role: "guest" });
+  });
+
+  it("待ち列: 入室は 101 で、2 人目が来れば組になる", async () => {
+    const build = freshBuild();
+    await breakAlarm(env.RANDOM_QUEUE.get(env.RANDOM_QUEUE.idFromName(`b${build}`)));
+    const a = await connectRandom(build);
+    expect(await a.next()).toMatchObject({ t: "queue" });
+    await connectRandom(build);
+    expect(await a.next()).toMatchObject({ t: "paired", order: "first" });
   });
 });
 

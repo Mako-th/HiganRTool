@@ -13,15 +13,15 @@ compile_error!(
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use higanr_core::pacing::{self as pace, CpuClasses, PacingIni, Preamble};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
 use windows_sys::Win32::System::Threading::{
     CreateWaitableTimerW, GetCurrentProcessorNumberEx, GetCurrentThread, SetWaitableTimer, Sleep,
     WaitForSingleObject,
@@ -75,13 +75,48 @@ pub fn thread_cycles() -> u64 {
     if ok == 0 { 0 } else { c }
 }
 
+type CpuSetInformationFn = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    u32,
+    *mut u32,
+    *mut core::ffi::c_void,
+    u32,
+) -> i32;
+
+/// kernel32 の `GetSystemCpuSetInformation` を実行時に引く。import 表に載せないのは、無い Windows でも DLL ごと読み込めなく
+/// ならないようにするため。引くのは設置の時（読み取りのスレッド）の 1 回だけで、ゲームのスレッドでは引かない。
+fn cpu_set_information_fn() -> Option<CpuSetInformationFn> {
+    static FOUND: OnceLock<Option<CpuSetInformationFn>> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        // SAFETY: `name` は終端 0 つきで生きている。kernel32.dll は常に載っているので参照を増やさない関数で足りる。
+        let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: `module` は有効な HMODULE、名前は終端 0 つきの ASCII。
+        let f = unsafe { GetProcAddress(module, c"GetSystemCpuSetInformation".as_ptr().cast()) }?;
+        // SAFETY: GetSystemCpuSetInformation は上の型の引数（情報の箱・長さ・返す長さ・プロセス・旗）を取る関数で、
+        // 32 ビットでは関数ポインタ同士の大きさが同じ。
+        Some(unsafe {
+            core::mem::transmute::<unsafe extern "system" fn() -> isize, CpuSetInformationFn>(f)
+        })
+    })
+}
+
 /// 論理 CPU ごとの効率クラスの表（GetSystemCpuSetInformation で大きさを聞いてから、8 バイト揃えの箱に埋めさせる。`AllocationTag` が
-/// u64 なので揃える）。読み取りのスレッドで設置の時に 1 回だけ呼ぶ。
+/// u64 なので揃える）。読み取りのスレッドで設置の時に 1 回だけ呼ぶ。この関数が無い Windows では `Err`（表を取れなかった経路と同じ）。
 pub fn cpu_classes_now() -> Result<CpuClasses, String> {
+    cpu_classes_from(cpu_set_information_fn())
+}
+
+fn cpu_classes_from(get: Option<CpuSetInformationFn>) -> Result<CpuClasses, String> {
+    let get =
+        get.ok_or_else(|| "この Windows には GetSystemCpuSetInformation が無い".to_string())?;
     let mut need: u32 = 0;
     // SAFETY: 箱を渡さず（null・長さ 0）必要な大きさだけを聞く。プロセスは null（全体の表）。
     unsafe {
-        GetSystemCpuSetInformation(
+        get(
             core::ptr::null_mut(),
             0,
             &mut need,
@@ -96,7 +131,7 @@ pub fn cpu_classes_now() -> Result<CpuClasses, String> {
     let mut got: u32 = 0;
     // SAFETY: `buf` は `need` バイト以上・8 バイト揃えで書ける。`got` に書いた大きさが返る。
     let ok = unsafe {
-        GetSystemCpuSetInformation(
+        get(
             buf.as_mut_ptr().cast(),
             (buf.len() * 8) as u32,
             &mut got,
@@ -376,6 +411,8 @@ pub extern "C" fn pace_after_present() {
     if catch_unwind(f).is_err() {
         AFTER_PRESENT_FN.store(0, Ordering::SeqCst);
         PANICS.fetch_add(1, Ordering::Relaxed);
+        // 確定の前線を進めるフックが外れた対戦は続けられないので、ネットワークを閉じて相手に BYE を出す。
+        crate::script_win::net_panicked();
     }
 }
 
@@ -425,9 +462,12 @@ pub extern "C" fn pacing_head_entry() {
 
 // SAFETY（`#[unsafe(naked)]`）: `0x0042DD6D` の `call 0x42db50`（Present のラッパ）の差し替え先。入った時のスタックは
 // [戻りアドレス `0x0042DD72`]…、x87 のスタックは空。ラッパは引数を読まず、ecx・edx も入口で読まない。戻り値は呼ぶ側が使わない。
-// - `pace_present_begin` → ラッパ（PRESENT_ORIGINAL。自分の戻りアドレスを積んで呼ぶ）→ `pace_present_end` → `pace_after_present`
-//   （フックが 0 なら原子変数を 1 回読んで戻る）→ `ret`。呼ぶ 4 つはどれも cdecl / MSVC の決まりで ebx・esi・edi・ebp と esp を保つ。
-//   Rust の 3 つは x87 を使わない（フックの先で使う x87 は、フックが制御語を置き直して戻す）。DF は `cld` で 0。
+// - `pace_present_begin` → `shot_present_begin` → ラッパ（PRESENT_ORIGINAL。自分の戻りアドレスを積んで呼ぶ）→ `shot_present_end` →
+//   `pace_present_end` → `pace_after_present`（フックが 0 なら原子変数を 1 回読んで戻る）→ `ret`。呼ぶ 6 つはどれも cdecl / MSVC の決まりで
+//   ebx・esi・edi・ebp と esp を保つ。Rust の 5 つは x87 を使わない（フックの先で使う x87 は、フックが制御語を置き直して戻す）。DF は `cld` で 0。
+// - `shot_present_*` はゲームの語（合成の InputManager の押した瞬間）の 1 ビットを、ラッパを呼ぶ間だけ立てて戻す（自分の PC にだけゲーム自身の
+//   スクリーンショットを撮らせる）。ラッパの直前・直後に置くのは、語にビットが立っている時間（他のスレッドの読みに見える窓）をラッパの間だけにするため。
+//   押下が無いフレームは何も書かない。
 // - `ret` の時点のスタックは入った時と同じなので、呼ぶ側の `0x0042DD72` へ戻る。
 // - PRESENT_ORIGINAL は、この入口へ向く call を書く前に置かれる（`set_present_original`）。
 /// Present の call（`0x0042DD6D`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
@@ -436,14 +476,20 @@ pub extern "C" fn present_entry() {
     core::arch::naked_asm!(
         "cld",
         "call {begin}",
+        "cld",
+        "call {shot_begin}",
         "call dword ptr [{orig}]",
+        "cld",
+        "call {shot_end}",
         "cld",
         "call {end}",
         "cld",
         "call {after}",
         "ret",
         begin = sym pace_present_begin,
+        shot_begin = sym crate::shot_key_win::shot_present_begin,
         orig = sym PRESENT_ORIGINAL,
+        shot_end = sym crate::shot_key_win::shot_present_end,
         end = sym pace_present_end,
         after = sym pace_after_present,
     )
@@ -860,6 +906,29 @@ mod tests {
         assert_eq!(PANICS.load(Ordering::SeqCst), p0 + 1);
         assert_eq!(AFTER_PRESENT_FN.load(Ordering::SeqCst), 0, "口を外さない");
         assert_callee_saved("Present（パニック）");
+        PACE_RING.reset();
+    }
+
+    #[test]
+    fn a_panicking_after_present_hook_closes_the_net_and_asks_for_a_bye() {
+        use crate::script_win::{NET_ON, NET_PANICKED, PANIC_BYES};
+        let _g = lock();
+        PACE_RING.reset();
+        PRESENT_ORIGINAL.store(seen_target_addr(), Ordering::SeqCst);
+        NET_PANICKED.store(0, Ordering::SeqCst);
+        NET_ON.store(1, Ordering::SeqCst);
+        set_after_present(Some(after_panics));
+        let b0 = PANIC_BYES.load(Ordering::SeqCst);
+        call_with_regs(fn_addr(present_entry));
+        assert_eq!(NET_ON.load(Ordering::SeqCst), 0, "ネットワークを閉じない");
+        assert_eq!(NET_PANICKED.load(Ordering::SeqCst), 1);
+        assert_eq!(PANIC_BYES.load(Ordering::SeqCst), b0 + 1, "BYE を頼まない");
+        // ネットワークが動いていなければ BYE は頼まない。
+        set_after_present(Some(after_panics));
+        call_with_regs(fn_addr(present_entry));
+        assert_eq!(PANIC_BYES.load(Ordering::SeqCst), b0 + 1);
+        NET_PANICKED.store(0, Ordering::SeqCst);
+        set_after_present(None);
         PACE_RING.reset();
     }
 
@@ -1455,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Sleep(0) で 60 fps を刻む実時間の検査（約 2 秒、CPU を 1 つ回し続ける）。全件の回（build.bat）で --ignored で走る"]
+    #[ignore = "Sleep(0) で 60 fps を刻む実時間の検査（約 2 秒、論理コア 1 つで処理を回し続ける）。全件の回（build.bat）で --ignored で走る"]
     fn real_pacer_b_spin_keeps_60_fps() {
         run_real_pacer(Mode::BSpin, 60, 120, 4_000, 300.0);
     }
@@ -1498,6 +1567,14 @@ mod tests {
             CPU_SET_OFF_EFFICIENCY
         );
         assert_eq!(core::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>(), 32);
+    }
+
+    // 何が壊れたら落ちるか: 関数が無い Windows で表なしの経路（Err）を返さず落ちる、または関数を引き当てられない。
+    #[test]
+    fn a_windows_without_the_cpu_set_function_gives_the_table_less_error() {
+        assert!(cpu_set_information_fn().is_some(), "この機械には在るはず");
+        let e = cpu_classes_from(None).unwrap_err();
+        assert!(e.contains("GetSystemCpuSetInformation が無い"), "{e}");
     }
 
     #[test]

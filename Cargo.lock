@@ -239,8 +239,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "higanr_build_res"
+version = "1.1.0"
+
+[[package]]
 name = "higanr_core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -255,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "higanr_manifest_sign"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom",
@@ -264,8 +268,9 @@ dependencies = [
 
 [[package]]
 name = "higanrtool_dll"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
+ "higanr_build_res",
  "higanr_core",
  "peer_sim",
  "png",
@@ -274,8 +279,18 @@ dependencies = [
 
 [[package]]
 name = "higanrtool_loader"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
+ "higanr_build_res",
+ "higanr_core",
+ "windows-sys",
+]
+
+[[package]]
+name = "higanrtool_replay_fix"
+version = "1.1.0"
+dependencies = [
+ "higanr_build_res",
  "higanr_core",
  "windows-sys",
 ]
@@ -350,7 +365,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "peer_sim"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "higanr_core",
 ]

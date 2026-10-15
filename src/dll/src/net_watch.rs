@@ -15,7 +15,7 @@ use higanr_core::candidate::kind_of;
 use higanr_core::handshake::{FailReason, Restart};
 use higanr_core::link;
 use higanr_core::match_gate::NoMatch;
-use higanr_core::net_menu::other_version_text;
+use higanr_core::net_menu::{PeerStats, other_version_text};
 use higanr_core::selection::Agreed;
 use higanr_core::wire::{ByeReason, Check, Mode, PROTO_VER, Select};
 
@@ -155,7 +155,7 @@ pub struct NetStatus {
     w: [AtomicU32; STATUS_WORDS],
 }
 
-const STATUS_WORDS: usize = S_FMT + FMT_WORDS;
+const STATUS_WORDS: usize = S_SEAT_CURSOR + SEAT_CURSOR_WORDS;
 const S_PHASE: usize = 0;
 const S_END: usize = 1;
 const S_END_DETAIL: usize = 2;
@@ -200,7 +200,7 @@ const S_PORTRAIT: usize = S_RECV + RECV_WORDS;
 /// 繋がる前に選択の画面で落とした決定の押下の回数（`Stats::menu_pre_link_decides`）。
 const S_PRE_LINK: usize = S_PORTRAIT + 2;
 /// 繋がったか・経路の種類・繋がるまでの ms・RTT: 語 0 = 繋がった | rollback に決まった << 1 | 採った経路が学んだ候補 << 2 |
-/// 経路の種類（`CandKind` の番号）<< 8、語 1 = セッションを作ってから繋がったのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）。
+/// 経路の種類（`CandKind` の番号）<< 8（bit3 は観戦者の実行）、語 1 = セッションを作ってから繋がったのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）。
 const S_CONN: usize = S_PRE_LINK + 1;
 const CONN_WORDS: usize = 3;
 /// CHECK のズレのときの、自分と相手の CHECK の全部の欄（`pack_check` の 4 語ずつ。ゲームのスレッドが `End::Desync` を見たときだけ書く）。
@@ -274,6 +274,15 @@ const FMT_REC_WORDS: usize = 2;
 const FMT_WORDS: usize = F_LOG + FMT_REC_WORDS * higanr_core::link::FORMAT_LOG;
 const FMT_ABLE: u32 = 1;
 const FMT_ROLLBACK: u32 = 2;
+/// 観戦者が受けた対戦者の状態（`pack_peer`）。
+const S_PEER: usize = S_FMT + FMT_WORDS;
+const PEER_WORDS: usize = 2;
+/// キャラ選択で相手の席を相手の位置へ書いた回数・カーソルの音を積んだ回数・積めなかった回数（`Stats::menu_peer_writes` / `menu_cursor_se` /
+/// `menu_cursor_se_failed`）。
+const S_SEAT_CURSOR: usize = S_PEER + PEER_WORDS;
+const SEAT_CURSOR_WORDS: usize = 3;
+/// `S_CONN` の語 0 の bit3: 観戦者の実行。
+const CONN_WATCHER: u32 = 8;
 
 /// 形式の切替の記録 1 件を 2 語に: 語 0 = 使った枠の印（bit31。空の枠 0 と区別する）| 相手の押下 << 15 | auto の旗 << 14 | 前の形式
 /// （rollback = 1）<< 13 | 新しい形式 << 12 | 新しい D（0〜8 なので下位 4 ビット）、語 1 = seg。
@@ -609,6 +618,31 @@ pub struct NetSnapshot {
     /// この実行は、つながりが終わってもネットワークを開き直せる（ゲーム内のメニューの実行）。`NetStatus` の語には無く、
     /// 読み取りのスレッドが `script_win::net_status` で置く。
     pub relink: bool,
+    /// 観戦者の実行（`publish_watch` が置く）。遅延と rollback の欄は対戦者の設定ではないので読まない。
+    pub watcher: bool,
+    /// 観戦の流れで受けた、対戦者 2 人の間の状態（観戦者の実行だけ。まだ受けていなければ None）。
+    pub peer: Option<PeerStats>,
+}
+
+/// 観戦者が受けた対戦者の状態（`PeerStats`）を 2 語に: 語 0 = 受けた | ping が測れている << 1 | rollback のマッチ << 2、
+/// 語 1 = ping | 遅れ << 16 | rollback << 24。
+fn pack_peer(p: Option<PeerStats>) -> [u32; PEER_WORDS] {
+    p.map_or([0; PEER_WORDS], |p| {
+        [
+            1 | u32::from(p.ping_ms.is_some()) << 1 | u32::from(p.rollback.is_some()) << 2,
+            u32::from(p.ping_ms.unwrap_or(0))
+                | u32::from(p.latency) << 16
+                | u32::from(p.rollback.unwrap_or(0)) << 24,
+        ]
+    })
+}
+
+fn unpack_peer(w: [u32; PEER_WORDS]) -> Option<PeerStats> {
+    (w[0] & 1 != 0).then(|| PeerStats {
+        ping_ms: (w[0] & 2 != 0).then_some((w[1] & 0xFFFF) as u16),
+        latency: (w[1] >> 16) as u8,
+        rollback: (w[0] & 4 != 0).then_some((w[1] >> 24) as u8),
+    })
 }
 
 /// 作り直しの直前の 1 回を 1 語に（0 = まだ。下位 4 ビットはやめた理由: 1 = 同じ nonce・2 = 1 通も届かない・3 = 届いたが
@@ -785,6 +819,13 @@ impl NetStatus {
         self.w[S_PORTRAIT].store(s.menu_portrait_called, Ordering::Relaxed);
         self.w[S_PORTRAIT + 1].store(s.menu_portrait_refused, Ordering::Relaxed);
         self.w[S_PRE_LINK].store(s.menu_pre_link_decides, Ordering::Relaxed);
+        for (a, v) in self.w.iter().skip(S_SEAT_CURSOR).zip([
+            s.menu_peer_writes,
+            s.menu_cursor_se,
+            s.menu_cursor_se_failed,
+        ]) {
+            a.store(v, Ordering::Relaxed);
+        }
         let conn = np.connected();
         let kind = np.link_path().map_or(0, |a| u32::from(kind_of(a).to_u8()));
         let rtt = conn
@@ -1013,7 +1054,7 @@ impl NetStatus {
             (S_PORTRAIT, s.menu_portrait_called),
             (S_PORTRAIT + 1, s.menu_portrait_refused),
             (S_PRE_LINK, s.pre_join_decides),
-            (S_CONN, u32::from(joined) | kind << 8),
+            (S_CONN, u32::from(joined) | CONN_WATCHER | kind << 8),
             (S_CONN + 1, s.join_wait_ms.unwrap_or(0)),
             (S_CONN + 2, NO_MARGIN),
         ];
@@ -1022,6 +1063,7 @@ impl NetStatus {
                 a.store(v, Ordering::Relaxed);
             }
         }
+        self.store_peer(wp.hud_facts().and_then(|f| f.stats));
         let log = wp.step_log();
         self.w[S_STEP_COUNT].store(log.count, Ordering::Relaxed);
         for (i, r) in log.iter().enumerate() {
@@ -1037,11 +1079,17 @@ impl NetStatus {
         }
     }
 
+    fn store_peer(&self, p: Option<PeerStats>) {
+        for (i, v) in pack_peer(p).into_iter().enumerate() {
+            self.w[S_PEER + i].store(v, Ordering::Relaxed);
+        }
+    }
+
     pub fn menu_text(&self) -> String {
         let l = |i: usize| self.w.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
         let count = l(S_STEP_COUNT);
         let mut out = format!(
-            "ネットの選択: 選択のフレーム {} / 入れた押下 {} / 持ち越したフレーム {} / カーソルを合わせられなかった {} / 押下なしで選択を出た {} / 立ち絵を追わせた {} / 追わせなかった {} / 繋がる前に落とした決定 {} 回",
+            "ネットの選択: 選択のフレーム {} / 入れた押下 {} / 持ち越したフレーム {} / カーソルを合わせられなかった {} / 押下なしで選択を出た {} / 立ち絵を追わせた {} / 追わせなかった {} / 相手の席を位置で書いた {} / カーソルの音を積んだ {} / 積めなかった {} / 繋がる前に落とした決定 {} 回",
             l(S_MENU_FRAMES),
             l(S_MENU_APPLIED),
             l(S_MENU_HELD),
@@ -1049,6 +1097,9 @@ impl NetStatus {
             l(S_MENU_LOST),
             l(S_PORTRAIT),
             l(S_PORTRAIT + 1),
+            l(S_SEAT_CURSOR),
+            l(S_SEAT_CURSOR + 1),
+            l(S_SEAT_CURSOR + 2),
             l(S_PRE_LINK)
         );
         let shown = (count as usize).min(STEP_LOG_LEN);
@@ -1272,6 +1323,8 @@ impl NetStatus {
             hello_sent_learned: l(S_DIAG + 2 * link::KIND_SLOTS + 1),
             diag: crate::net_udp::NetDiag::default(),
             relink: false,
+            watcher: l(S_CONN) & CONN_WATCHER != 0,
+            peer: unpack_peer([l(S_PEER), l(S_PEER + 1)]),
         }
     }
 
@@ -2145,7 +2198,7 @@ mod tests {
             );
             assert_eq!((s.end, s.end_detail), (END_OTHER_VERSION, 0));
             let want = format!(
-                "終わり 相手の HiganRTool のバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じ zip の HiganRTool を使ってください。"
+                "終わり 相手のHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
             );
             assert!(s.text().contains(&want), "{}", s.text());
             assert_eq!(s.hs_restarts, 0, "バージョン違いを作り直した");
@@ -2407,6 +2460,44 @@ mod tests {
         assert_eq!(st.snapshot().desync, Some((c, c)), "検査の前提");
         st.reset();
         assert_eq!(st.snapshot(), NetSnapshot::default(), "消し残した欄がある");
+    }
+
+    /// 壊れたら落ちる: 観戦者の印が立たない（観戦者の行に delay 方式・遅延 0 が出る）、または対戦者の値の語が欠ける・混ざる。
+    #[test]
+    fn a_watchers_snapshot_carries_the_flag_and_the_players_values() {
+        use crate::spectate_watch::{WATCH_MARGIN_FRAMES, WatchConfig, WatchSlot};
+        let wp = WatchPlay::new(
+            std::sync::Arc::new(WatchSlot::new()),
+            WatchConfig {
+                wait_budget_us: 0,
+                margin_frames: WATCH_MARGIN_FRAMES,
+                require_net_selection: true,
+            },
+        );
+        let st = NetStatus::new();
+        assert!(!st.snapshot().watcher);
+        st.publish_watch(&wp);
+        let s = st.snapshot();
+        assert!(s.watcher, "観戦者の印");
+        assert_eq!(s.peer, None, "受けていない値は出さない");
+        assert!(!s.rollback && s.delay == 0);
+
+        for p in [
+            PeerStats::from_record(14, 2, 3),
+            PeerStats::from_record(999, 8, 0),
+            PeerStats::from_record(
+                higanr_core::wire::STATS_PING_UNKNOWN,
+                0,
+                higanr_core::wire::STATS_ROLLBACK_NONE,
+            ),
+        ] {
+            st.store_peer(Some(p));
+            assert_eq!(st.snapshot().peer, Some(p));
+        }
+        st.store_peer(None);
+        assert_eq!(st.snapshot().peer, None, "前の試合の値が残った");
+        st.reset();
+        assert!(!st.snapshot().watcher);
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl<G: Game, N: Net> Machine for NpMachine<'_, G, N> {
             Some(w) => w,
             None => {
                 np.stats.local_reads = np.stats.local_reads.saturating_add(1);
-                self.game.local_input(c.seat()) & SEND_MASK
+                self.game.local_input(c.seat()) & MATCH_SEND_MASK
             }
         };
         // 初めの値をネットワークの側へ渡す（この取得の前に）。ホストは seg の途中の D の予定（`SWITCH_LEAD` フレーム先から）、

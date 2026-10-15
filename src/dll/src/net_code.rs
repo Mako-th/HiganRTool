@@ -1336,7 +1336,7 @@ mod tests {
         assert!(has_japanese(show_not_started()));
         assert!(
             status_text(CodeSide::Offer, 1.0, "x")
-                .starts_with("HiganRTool の接続コード（始める側 offer）")
+                .starts_with("HiganRToolの接続コード：始める側（offer）")
         );
     }
 
@@ -1486,7 +1486,7 @@ mod tests {
         let why = refused(off.on_peer_file(Some(other_offer.own_text().unwrap().as_bytes()), NOW));
         assert!(why.log.contains("2 人とも始める側"), "{why:?}");
         assert!(why.log.contains("code_side = answer"), "{why:?}");
-        assert!(why.show.contains("code_side を answer"), "{why:?}");
+        assert!(why.show.contains("code_sideをanswer"), "{why:?}");
         kinds.push(why.kind);
         shows.push(why.show);
         let own = off.own_text().unwrap().to_string();
@@ -1520,7 +1520,7 @@ mod tests {
         let why = refused(ans2.on_peer_file(Some(reply.as_bytes()), NOW));
         assert!(why.log.contains("2 人とも返す側"), "{why:?}");
         assert!(why.log.contains("code_side = offer"), "{why:?}");
-        assert!(why.show.contains("code_side を offer"), "{why:?}");
+        assert!(why.show.contains("code_sideをoffer"), "{why:?}");
         kinds.push(why.kind);
         shows.push(why.show);
         let why =
@@ -1557,11 +1557,11 @@ mod tests {
     #[test]
     fn the_window_texts_are_built_from_the_code_lifetime() {
         let want = code::span_text(code::DEFAULT_TTL_SECS);
-        for (secs, span) in [(45 * 60, "45 分"), (90, "90 秒"), (7_200, "120 分")] {
+        for (secs, span) in [(45 * 60, "45分"), (90, "90秒"), (7_200, "120分")] {
             let e = st::expired(higanr_core::lang::Lang::Ja, secs);
             let w = offer_waiting(secs);
             assert!(e.contains(&format!("（{span}）")), "{e}");
-            assert!(w.show.contains(&format!("は {span}で使えなく")), "{w:?}");
+            assert!(w.show.contains(&format!("は{span}で使えなく")), "{w:?}");
             assert!(w.log.contains(&format!("有効期限 {span}")), "{w:?}");
             for_people(&e);
             for_people(&w.show);
@@ -1581,7 +1581,7 @@ mod tests {
         .unwrap();
         let status = std::fs::read_to_string(d.join(STATUS_FILE)).unwrap();
         assert!(
-            status.contains(&format!("は {want}で使えなく")),
+            status.contains(&format!("は{want}で使えなく")),
             "本物の期限の長さ {want} が窓の文に無い: {status}"
         );
         drop(w);
@@ -1591,8 +1591,8 @@ mod tests {
     #[test]
     fn the_connected_text_says_which_seat_you_are() {
         for (seat, want) in [
-            (Some(Seat::P1), "接続しました。あなたは 1P です。"),
-            (Some(Seat::P2), "接続しました。あなたは 2P です。"),
+            (Some(Seat::P1), "接続しました。あなたは1Pです。"),
+            (Some(Seat::P2), "接続しました。あなたは2Pです。"),
             (None, "接続しました。"),
         ] {
             let say = connected_say(seat, None);
@@ -1611,7 +1611,7 @@ mod tests {
             for (shape, tail) in [
                 ((Mode::Rollback, 1), "（rollback・ディレイ 1 フレーム）"),
                 ((Mode::Rollback, 0), "（rollback・ディレイ 0 フレーム）"),
-                ((Mode::Delay, 2), "（delay 方式・ディレイ 2 フレーム）"),
+                ((Mode::Delay, 2), "（delay方式・ディレイ 2 フレーム）"),
             ] {
                 let say = connected_say(seat, Some(shape));
                 assert_eq!(say.show, format!("{want}{tail}"));
@@ -1929,7 +1929,7 @@ mod tests {
                 Some((me, Pick::Rollback(2))),
                 false,
                 (Mode::Delay, 1),
-                Some("rollback の準備ができなかった"),
+                Some("rollbackの準備ができなかった"),
             ),
         ];
         for (tag, file, wired, want, say) in cases {
@@ -1971,7 +1971,7 @@ mod tests {
             let status = std::fs::read_to_string(d.join(STATUS_FILE)).unwrap();
             match say {
                 Some(t) => assert!(status.contains(t), "{tag}: {status}"),
-                None => assert!(!status.contains("rollback は使えません"), "{tag}: {status}"),
+                None => assert!(!status.contains("rollbackは使えません"), "{tag}: {status}"),
             }
             for_people(&status);
             drop(w);
@@ -2669,13 +2669,13 @@ mod tests {
             );
             let status = std::fs::read_to_string(d.join(STATUS_FILE)).unwrap();
             let line = if seat == Seat::P1 {
-                "接続しました。あなたは 1P です。"
+                "接続しました。あなたは1Pです。"
             } else {
-                "接続しました。あなたは 2P です。"
+                "接続しました。あなたは2Pです。"
             };
             assert!(status.contains(line), "自分の席が窓の文に無い: {status}");
             assert!(
-                status.contains(&format!("{line}（delay 方式・ディレイ 3 フレーム）")),
+                status.contains(&format!("{line}（delay方式・ディレイ 3 フレーム）")),
                 "決まった形が窓の文に無い: {status}"
             );
             for_people(&status);
@@ -2759,7 +2759,7 @@ mod tests {
         let mut ans = answer_swapper(41_009);
         let why = refused(ans.on_peer_file(Some(OFFER_V0.as_bytes()), NOW));
         let want = format!(
-            "相手の HiganRTool のバージョンが違います（自分 {}・相手 0）。相手と同じ zip の HiganRTool を使ってください。",
+            "相手のHiganRToolのバージョンが違います（自分 {}・相手 0）。相手と同じzipのHiganRToolを使ってください。",
             higanr_core::wire::PROTO_VER
         );
         assert!(why.log.contains(&want), "{why:?}");

@@ -28,16 +28,23 @@
 //! 読み書き・`CreateFileA` でのファイルの同一性の確かめ）・`notify_win.rs`（自分のプロセスのウィンドウを探す・`FlashWindowEx`・
 //! `PlaySoundW`）・`clipboard_win.rs`（クリップボード）・`room_win.rs`（WinHTTP の WebSocket・検査の SHA-1）・
 //! `text_input_win.rs`（ゲームのウィンドウの手続きの差し替えと IME の切り離し）・`digit_keys_win.rs`（`GetAsyncKeyState`）・
-//! `pad_extra_win.rs`（ゲームが呼ぶ入口・DirectInput と winmm の読み）・`ui_lang_win.rs`（`GetUserDefaultUILanguage`）。
+//! `shot_key_win.rs`（P・Home の読みと、Present のラッパの間だけゲームの語を立てる書き込み）・`pad_extra_win.rs`（ゲームが呼ぶ入口・DirectInput と winmm の読み）・`ui_lang_win.rs`（`GetUserDefaultUILanguage`）・
+//! `crash_win.rs`（致命的な例外の VEH・DLL の固定・アドレスからモジュールを引く・生のハンドルへの書き込み）・
+//! `adapters_win.rs`（ネットワークアダプターの一覧を引く）。
 //! 検査のときだけ `test_alloc.rs` も。
 //! 他のモジュールは `#![forbid(unsafe_code)]`。
 
+// ネットワークアダプターの一覧（`bind = auto` が経路を引けないとき・LAN のホストが自分のアドレスを見せるとき。unsafe はこの中だけ）。
+mod adapters_win;
 mod alloc_count;
 mod alloc_win;
 // ゲームの中のメニューが接続コードをコピーする・貼る部分（本物のクリップボードの unsafe は `clipboard_win.rs` の中だけ）。
 mod clipboard;
 mod clipboard_win;
 mod copies;
+mod crash_win;
+// 読み込まれている d3d8.dll の場所とバージョン情報（本ログの 1 行。unsafe はこの中だけ）。
+mod d3d8_info_win;
 mod detour;
 // 数字キー（上段の 0〜9）で遅れの量を替える入口: 押した瞬間の取り方（pure）と、キーの読み（`GetAsyncKeyState`。unsafe はこの中だけ）。
 mod digit_keys;
@@ -46,6 +53,8 @@ mod draw;
 mod feeds;
 mod hook;
 mod hook_win;
+// LAN 対戦の申し込みの運び手（std のソケットだけ。unsafe 無し）。
+mod lan_link;
 mod menu;
 mod menu_win;
 mod names;
@@ -83,14 +92,15 @@ mod main_log;
 mod match_events;
 mod pad_extra;
 mod pad_extra_win;
-// メニューで決めたプレイヤー名を覚えるファイル（pure。起動のときと、名前を決めたときの別のスレッドだけが読み書きする）。
-mod player_name_file;
 mod probe;
 mod record_win;
 mod render_only;
 // 自動保存（unsafe は `replay_save_win.rs` の中だけ）。
 mod replay_save;
 mod replay_save_win;
+// 素の花映塚でのリプレイの再生の見張り（判断は `replay_watch.rs`（pure）、ゲームのスレッドと本ログへの受け渡しは `replay_watch_win.rs`）。
+mod replay_watch;
+mod replay_watch_win;
 // 描画用の VM の欄の診断と除外（pure）。
 mod rollback_draw;
 // rollback のモードの製品の経路の部品（pure。Win32 とゲームのメモリは `rollback_play_win.rs`）。`netplay/rollback.rs` が状態機械を
@@ -103,17 +113,21 @@ mod rollback_testkit;
 // 進め直しを 1 回の描画の中で行う形（pure。入口のアセンブリは `rollback_win.rs`）。
 mod rollback_resim;
 mod rollback_win;
-// 前に使ったルーム名を覚えるファイル（ルーム名の入力の初めの値。pure。見張りのスレッドと起動のときだけが読み書きする）。
-mod room_last;
 // ルームサーバーの WebSocket（WinHTTP。unsafe はこの中だけ）。`net_room` から使う（製品で使わない関数が残るので dead_code を許す）。
 #[cfg_attr(not(test), allow(dead_code))]
 mod room_win;
 // 配るバージョンで ini が無いとき、配る ini と同じ中身を DLL のフォルダへ書き出す（起動のとき 1 回）。
 mod ini_seed;
+// メニューで決めた設定を ini の該当の 1 行へ書き戻す（別のスレッド）と、以前の版の別ファイルの引き継ぎ（pure。unsafe 無し）。
+mod ini_save;
 mod script_watch;
 mod script_win;
 mod scripted;
 mod session;
+// 自分の PC にだけゲーム自身のスクリーンショットを撮らせるキー（P・Home）: 押した瞬間の取り方と持ち越し（pure）と、Present のラッパを呼ぶ間だけ
+// 語を立てる層（unsafe はこの中だけ）。
+mod shot_key;
+mod shot_key_win;
 // ローダーのウィンドウ（status.txt）に出す文の日本語・英語（pure）。
 mod shot_win;
 mod shots;

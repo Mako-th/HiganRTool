@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::win::{ErrorCode, Handle, ProcessInfo, Remote, Spawn, WaitResult, Win32};
+use crate::win::{ErrorCode, Handle, LaunchNote, ProcessInfo, Remote, Spawn, WaitResult, Win32};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
@@ -146,6 +146,8 @@ impl<W: Win32> Traced<W> {
         &self.bad_closes
     }
 
+    // 自己検査（dist なしのビルド）だけが読む。
+    #[cfg_attr(feature = "dist", allow(dead_code))]
     pub fn created_pids(&self) -> &[u32] {
         &self.created_pids
     }
@@ -309,5 +311,9 @@ impl<W: Win32> Win32 for Traced<W> {
             self.bad_closes.push(handle);
         }
         self.inner.close_handle(handle)
+    }
+
+    fn note(&mut self, note: LaunchNote) {
+        self.inner.note(note);
     }
 }

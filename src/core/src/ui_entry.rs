@@ -46,10 +46,15 @@ pub struct EntryView {
 /// ゲームの上下の処理（`0x0042457A`）の後のカーソル。`edge` は InputManager[2] の押した瞬間 `+0x06` とリピート `+0x04` の
 /// 論理和（どちらに立っていても `0x00423158` は真を返す）。上が立っていれば下は見ない。
 pub fn cursor_after_move(cursor: i32, edge: u16) -> i32 {
+    cursor_after_move_n(cursor, edge, MODE_ITEMS)
+}
+
+/// `cursor_after_move` の項目の数 `n` を選べる形（同じ `0x0042457A` をタイトルは n = 8 で呼ぶ —— `0x0042A0C4 push $8`）。
+pub fn cursor_after_move_n(cursor: i32, edge: u16, n: i32) -> i32 {
     let step = |c: i32| {
         // 動いた後の折り返し: 負なら n − 1、n 以上なら 0（この順。`0x004245B1`〜`0x004245BE`）。
-        let c = if c < 0 { MODE_ITEMS - 1 } else { c };
-        if c >= MODE_ITEMS { 0 } else { c }
+        let c = if c < 0 { n - 1 } else { c };
+        if c >= n { 0 } else { c }
     };
     if edge & UP != 0 {
         step(cursor.wrapping_sub(1))

@@ -14,9 +14,10 @@ use higanr_core::pacing::Dist;
 
 use crate::log_mode::detail_out;
 use crate::th09_addr::{
-    ANM_LOADED_START, ANM_LOADED_STRIDE, ASCII_ANM_INDEX, ASCII_ANM_NAME, LOADED_FILE, LOADED_NAME,
-    LOADED_PROGRESS, LOADED_SPRITES, SPRITE_CHAR_BASE, SPRITE_H, SPRITE_STRIDE, SPRITE_TEX_H,
-    SPRITE_TEX_W, SPRITE_TEXTURE, SPRITE_W, SPRITE_X0, SPRITE_X1, SPRITE_Y0, SPRITE_Y1,
+    ANM_LOADED_START, ANM_LOADED_STRIDE, ANM_QUAD_VB, ANM_VTX_FORMAT, ANM_VTX_FORMAT_QUAD_VB,
+    ASCII_ANM_INDEX, ASCII_ANM_NAME, LOADED_FILE, LOADED_NAME, LOADED_PROGRESS, LOADED_SPRITES,
+    SPRITE_CHAR_BASE, SPRITE_H, SPRITE_STRIDE, SPRITE_TEX_H, SPRITE_TEX_W, SPRITE_TEXTURE,
+    SPRITE_W, SPRITE_X0, SPRITE_X1, SPRITE_Y0, SPRITE_Y1,
 };
 
 // ---- 文の二重のバッファ ----
@@ -253,6 +254,46 @@ impl Fail {
             Fail::Panic => "ゲームのスレッドでパニックを受けた",
         }
     }
+}
+
+/// `Fail::GetState` で失敗した Get* の呼び出し（`stop` に渡す詳細の上位 16 ビット）。下位 16 ビットは引数。
+pub const GET_RENDER_STATE: u32 = 1;
+pub const GET_TEXTURE_STAGE_STATE: u32 = 2;
+pub const GET_VERTEX_SHADER: u32 = 3;
+pub const GET_VIEWPORT: u32 = 4;
+
+/// 止めた詳細の値: 呼び出しの番号と引数（`GET_TEXTURE_STAGE_STATE` は 段 << 8 | 種類）。
+pub fn stop_detail(call: u32, arg: u32) -> u32 {
+    call << 16 | (arg & 0xFFFF)
+}
+
+fn stop_detail_text(detail: u32) -> Option<String> {
+    let arg = detail & 0xFFFF;
+    Some(match detail >> 16 {
+        GET_RENDER_STATE => format!("GetRenderState({arg})"),
+        GET_TEXTURE_STAGE_STATE => {
+            format!("GetTextureStageState(段 {}, 種類 {})", arg >> 8, arg & 0xFF)
+        }
+        GET_VERTEX_SHADER => "GetVertexShader".to_string(),
+        GET_VIEWPORT => "GetViewport".to_string(),
+        _ => return None,
+    })
+}
+
+/// 描画を止めたときの本ログの 1 行（読み取りのスレッドが 1 回だけ書く）。`fail` は `Fail` の番号、`hr` は失敗した呼び出しの HRESULT
+/// （0 は呼び出しの失敗ではない理由）、`detail` は `stop_detail`（0 は無し）。
+pub fn stop_line(fail: u32, hr: u32, detail: u32) -> String {
+    let why = Fail::from_code(fail).map_or_else(
+        || format!("知らない理由の番号 {fail}"),
+        |f| f.text().to_string(),
+    );
+    let call = stop_detail_text(detail).map_or(String::new(), |c| format!(" / 呼び出し: {c}"));
+    let hr = if hr == 0 {
+        "HRESULT: 無し".to_string()
+    } else {
+        format!("HRESULT: 0x{hr:08X}")
+    };
+    format!("文字の描画: 描画を止めた。以後は文字を描かない（{why}{call} / {hr}）")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -578,6 +619,20 @@ pub fn probe_game_font(read: ReadMem, a: GameAddrs) -> Result<Probed, GameFontWh
         });
     }
     Ok(out)
+}
+
+/// 描いた後に頂点の流れ 0 へ置き直す頂点バッファ（読むだけ）。DrawPrimitiveUP は流れ 0 を NULL にするが、ゲームは頂点の形の覚え
+/// `[AnmManager+0x12886]` が 2 なら SetStreamSource を飛ばして DrawPrimitive（`0x0043B4BB`）へ進むので、そのときだけゲームの頂点バッファ
+/// `[AnmManager+0x12890]` を返す。2 でなければゲームが描く前に自分で置き直すので `None`。AnmManager がまだ無い・読めない・バッファが 0 のときも `None`。
+/// GetStreamSource を使わない理由は `overlay_win` の頭の注。
+pub fn stream0_to_restore(read: ReadMem, anm_manager_ptr: u32) -> Option<u32> {
+    let m = rd32(read, anm_manager_ptr).filter(|&m| m != 0)?;
+    // 覚え（1 バイト）から頂点バッファ（4 バイト）までを 1 回で読む。
+    let mut b = [0u8; (ANM_QUAD_VB + 4 - ANM_VTX_FORMAT) as usize];
+    if !read(m.checked_add(ANM_VTX_FORMAT)?, &mut b) || b[0] != ANM_VTX_FORMAT_QUAD_VB {
+        return None;
+    }
+    u32_at(&b, ANM_QUAD_VB - ANM_VTX_FORMAT).filter(|&vb| vb != 0)
 }
 
 fn ov_range() -> core::ops::RangeInclusive<u32> {
@@ -1680,5 +1735,116 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         finish(&mut empty, &mut out);
         assert!(String::from_utf8(out).unwrap().contains("描いた件が 0 件"));
+    }
+
+    /// 壊れたら落ちる: 止めた理由・失敗した呼び出し・HRESULT のどれかが行から落ちる（落ちた後の調べで「どこで止まったか」が読めなくなる）。
+    #[test]
+    fn stop_line_names_the_reason_the_call_and_the_hresult() {
+        assert_eq!(
+            stop_line(Fail::CreateTexture as u32, 0x8876_086C, 0),
+            "文字の描画: 描画を止めた。以後は文字を描かない（CreateTexture が失敗した / HRESULT: 0x8876086C）"
+        );
+        let get = stop_line(
+            Fail::GetState as u32,
+            0x8876_0866,
+            stop_detail(GET_RENDER_STATE, 28),
+        );
+        assert!(get.contains("状態を読む Get*"), "{get}");
+        assert!(get.contains("呼び出し: GetRenderState(28)"), "{get}");
+        assert!(get.contains("HRESULT: 0x88760866"), "{get}");
+        let ss = stop_line(
+            Fail::GetState as u32,
+            0x8876_0866,
+            stop_detail(GET_TEXTURE_STAGE_STATE, 1 << 8 | 4),
+        );
+        assert!(ss.contains("GetTextureStageState(段 1, 種類 4)"), "{ss}");
+    }
+
+    /// 壊れたら落ちる: HRESULT が無い理由（パニック・デバイスの作り直し）に 0 を失敗の値のように書く。知らない番号を黙って捨てる。
+    #[test]
+    fn stop_line_handles_reasons_without_an_hresult_and_unknown_codes() {
+        let p = stop_line(Fail::Panic as u32, 0, 0);
+        assert!(p.contains("パニック") && p.contains("HRESULT: 無し"), "{p}");
+        assert!(!p.contains("呼び出し:"), "{p}");
+        let u = stop_line(99, 5, stop_detail(77, 0));
+        assert!(
+            u.contains("知らない理由の番号 99") && !u.contains("呼び出し:"),
+            "{u}"
+        );
+        for (call, arg, want) in [
+            (GET_VERTEX_SHADER, 0, "GetVertexShader"),
+            (GET_VIEWPORT, 0, "GetViewport"),
+        ] {
+            let l = stop_line(Fail::GetState as u32, 1, stop_detail(call, arg));
+            assert!(l.contains(&format!("呼び出し: {want}")), "{l}");
+        }
+    }
+
+    const P_ANM: u32 = 0x1000;
+    const ANM: u32 = 0x0010_0000;
+    const VB: u32 = 0xBBBB_0000;
+
+    /// AnmManager のポインタの置き場と、覚え・頂点バッファの区画だけを持つ偽のメモリ。0 番地からの区画も置く（ポインタが 0 のときに
+    /// 0 + 0x12886 を読みに行くと、覚え 2・バッファありが返る）。
+    fn anm_world(mgr: u32, flag: u8, vb: u32) -> Mem {
+        let mut m = Mem {
+            regions: vec![(P_ANM, vec![0; 4])],
+            reads: Vec::new(),
+        };
+        m.put(P_ANM, &mgr.to_le_bytes());
+        for base in [ANM, 0] {
+            let mut b = vec![0u8; 0x10];
+            b[0] = flag;
+            b[0xA..0xE].copy_from_slice(&vb.to_le_bytes());
+            m.regions.push((base + 0x12886, b));
+        }
+        m
+    }
+
+    fn stream0(m: &mut Mem, at: u32) -> Option<u32> {
+        stream0_to_restore(&mut |a, b| m.read(a, b), at)
+    }
+
+    /// 壊れたら落ちる: 覚えを見ずに置き直す（ゲームが自分で置く場面で余計な Set をする）・覚えが 2 なのに置き直さない（ゲームが空の流れで
+    /// DrawPrimitive を呼ぶ）・違う欄を頂点バッファとして返す。
+    #[test]
+    fn stream0_is_restored_only_when_the_game_skips_setstreamsource() {
+        let mut m = anm_world(ANM, 2, VB);
+        assert_eq!(stream0(&mut m, P_ANM), Some(VB));
+        assert_eq!(
+            m.reads,
+            vec![(P_ANM, 4), (ANM + 0x12886, 14)],
+            "読みは 2 回"
+        );
+        for flag in [0u8, 1, 3, 4, 0xFF] {
+            assert_eq!(
+                stream0(&mut anm_world(ANM, flag, VB), P_ANM),
+                None,
+                "覚え {flag}"
+            );
+        }
+        assert_eq!(
+            stream0(&mut anm_world(ANM, 2, 0), P_ANM),
+            None,
+            "バッファ 0"
+        );
+    }
+
+    /// 壊れたら落ちる: AnmManager がまだ無い（0）のに 0 + オフセットを読む・読めない置き場で何かを返す。
+    #[test]
+    fn stream0_is_left_alone_without_an_anm_manager() {
+        let mut m = anm_world(0, 2, VB);
+        assert_eq!(stream0(&mut m, P_ANM), None);
+        assert_eq!(m.reads, vec![(P_ANM, 4)], "0 のポインタの先を読んだ");
+        assert_eq!(
+            stream0(&mut anm_world(ANM, 2, VB), 0x10),
+            None,
+            "読めない置き場"
+        );
+        assert_eq!(
+            stream0(&mut anm_world(u32::MAX - 4, 2, VB), P_ANM),
+            None,
+            "溢れるアドレス"
+        );
     }
 }

@@ -17,26 +17,28 @@
 //!   （終了時に th09.cfg へ書き出される）。
 #![forbid(unsafe_code)]
 
-use higanr_core::input_model::{InputState, SEND_MASK, keys};
+use higanr_core::input_model::{InputState, MATCH_SEND_MASK, keys};
 use higanr_core::lockstep::Role;
+use higanr_core::return_flow::{MenuState, PlayView};
 use higanr_core::script::{Engine, Status};
 use higanr_core::selection::Agreed;
 use higanr_core::wire::{ByeReason, Seat, Select};
 
 use crate::feeds::{IM_BYTES, im_from_bytes};
 use crate::net_config::AfterScript;
-use crate::net_portrait::{self, Followed, Plan, PortraitCall, PortraitEnv};
+use crate::net_portrait::{self, Followed, Locked, Plan, PortraitCall, PortraitEnv};
 use crate::net_select::MenuView;
 use crate::netplay::{Action, BadValue, Game, watched_agreed};
 use crate::scripted::{self, GameAddrs, Stepped, TickIo, read_obs};
 use crate::th09_addr::{
     APP_ACTIVE, CHARA_MAX, CHARA_UNLOCK, CHARGE_MAX, COLOR_MAX, DIFFICULTY, DIFFICULTY_MAX,
-    INPUT_MANAGERS, LIFE_MAX, LIFE_MIN, MAIN_MENU_PTR, MAP, MAP_LIST, MAP_LIST_LEN, MAP_MAX,
-    MAP_RANDOM_ANY, MAP_RANDOM_OF_TWO, MENU_CHARA_CURSOR, MENU_CHARA_DECIDED, MENU_CURSOR,
-    MENU_PARTS_PTR, MENU_SCREEN_ID, MENU_SUBSTATE, MENU_TRANSITIONING, OPT_CHARGE,
-    OPTION_DIGEST_RANGES, OPTIONS_BLOCK, OPTIONS_COPY_PTR, P1_CHAR, P1_COLOR, P1_LIFE_INIT,
-    P1_PLAYER_PTR, P2_CHAR, P2_COLOR, P2_LIFE_INIT, P2_PLAYER_PTR, PLAYER_LIFE, RNG_ADDR,
-    RNG_COUNT, SELECT_KIND, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
+    END_MENU, INPUT_MANAGERS, LIFE_MAX, LIFE_MIN, LOADING, MAIN_MENU_PTR, MAP, MAP_LIST,
+    MAP_LIST_LEN, MAP_MAX, MAP_RANDOM_ANY, MAP_RANDOM_OF_TWO, MATCH_END_MENU, MENU_CHARA_CURSOR,
+    MENU_CHARA_DECIDED, MENU_CURSOR, MENU_OBJ_FRAMES, MENU_OBJ_STATE, MENU_PARTS_PTR,
+    MENU_SCREEN_ID, MENU_SUBSTATE, MENU_TRANSITIONING, OPT_CHARGE, OPTION_DIGEST_RANGES,
+    OPTIONS_BLOCK, OPTIONS_COPY_PTR, P1_CHAR, P1_COLOR, P1_LIFE_INIT, P1_PLAYER_PTR, P2_CHAR,
+    P2_COLOR, P2_LIFE_INIT, P2_PLAYER_PTR, PAUSE, PAUSE_MENU, PLAYER_LIFE, RNG_ADDR, RNG_COUNT,
+    SE_ID_MENU_CURSOR, SE_PAN_MENU_CURSOR, SELECT_KIND, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
 };
 
 /// ゲームのスレッドが外から得るもの（台本の `TickIo` に書き込みとシードを足したもの）。本物は
@@ -75,6 +77,10 @@ pub trait NetIo: TickIo {
     /// 立ち絵の関数を 1 回呼ぶ（thiscall、ecx = MainMenu `m`、引数 4 つ、`ret 0x10`）。`portrait_armed` が false なら
     /// 何もしない。
     fn call_portrait(&mut self, _m: u32, _call: PortraitCall) {}
+    /// SE を 1 つ積む（`0x43E2F0`。呼ぶ前に関数の頭のバイト列を照合する）。積めなければ false。偽物は積まない。
+    fn push_se(&mut self, _id: u32, _pan: i32) -> bool {
+        false
+    }
 }
 
 struct PortraitGate<'a> {
@@ -216,6 +222,14 @@ pub struct NetGame<'a> {
     pub peeked: Option<Stepped>,
     /// ゲーム内のメニューが読んだ入力ワードの預かり（`Game::stash_local`）。次の `local_input` が返す。
     pub stashed: Option<u16>,
+    /// この tick に `digit_keys` が読んだ結果（`NetGame` は tick ごとに作る）。Ctrl+数字の読み（`NetPlay::digit_tick`）と Ctrl+C の読み
+    /// （`NetUi::copy_tick`）が同じ tick に呼んでも、キーの問い合わせは 1 tick に 1 回で済ませる。
+    keys: Option<Option<u16>>,
+    /// この tick に台本から取り出した押下（数字・Tab・Ctrl+C）。`digit_script` と `copy_script` が同じ tick に別々に呼ばれるので、台本からは 1 回だけ取る。
+    script_keys: Option<Option<higanr_core::script::KeyPress>>,
+    /// `script_keys` の数字・Tab / Ctrl+C を、もう渡した。
+    digits_given: bool,
+    copy_given: bool,
 }
 
 impl<'a> NetGame<'a> {
@@ -231,7 +245,26 @@ impl<'a> NetGame<'a> {
             script_step: None,
             peeked: None,
             stashed: None,
+            keys: None,
+            script_keys: None,
+            digits_given: false,
+            copy_given: false,
         }
+    }
+
+    fn script_keys(&mut self) -> Option<higanr_core::script::KeyPress> {
+        let script = &mut self.script;
+        *self
+            .script_keys
+            .get_or_insert_with(|| script.as_deref_mut().and_then(Engine::take_keys))
+    }
+
+    fn read_keys(&mut self) -> Option<u16> {
+        let active = self.io.safe_u32(APP_ACTIVE)? != 0;
+        if !crate::digit_keys::may_read(active, crate::digit_keys_win::foreground_is_game) {
+            return None;
+        }
+        crate::digit_keys_win::held()
     }
 
     /// 台本が動いていれば 1 tick 進めて、結果を `script_step` に残す（`peek_local_input` 用。1 つの期間で 1 回だけ進め、2 回目からは
@@ -299,29 +332,37 @@ impl Game for NetGame<'_> {
     /// このゲームのものであることを要る（`digit_keys_win::foreground_is_game`）。どちらかが満たされない・旗が読めないときは
     /// `None`。文字の入力中かどうかは `digit_keys_win::held` が見る。
     ///
-    /// 遅延の増分: 旗が立っている tick に前面のウィンドウの問い合わせ 3 回。
+    /// 遅延の増分: 旗が立っている tick に前面のウィンドウの問い合わせ 3 回。同じ `NetGame` の 2 回目からは前の結果を返す。
     fn digit_keys(&mut self) -> Option<u16> {
-        let active = self.io.safe_u32(APP_ACTIVE)? != 0;
-        if !crate::digit_keys::may_read(active, crate::digit_keys_win::foreground_is_game) {
-            return None;
+        if let Some(k) = self.keys {
+            return k;
         }
-        crate::digit_keys_win::held()
-    }
-
-    /// キーボードの Ctrl の読み。`digit_keys` と同じく、ゲームのウィンドウが前面のときだけ読む（前面でなければゲームもキーボードを読まない）。
-    fn keyboard_ctrl_down(&mut self) -> bool {
-        let Some(active) = self.io.safe_u32(APP_ACTIVE) else {
-            return false;
-        };
-        crate::digit_keys::may_read(active != 0, crate::digit_keys_win::foreground_is_game)
-            && crate::digit_keys_win::ctrl_down()
+        let k = self.read_keys();
+        self.keys = Some(k);
+        k
     }
 
     /// 台本の段階（`digit=x` / `tab=1`）が効き始めたとき、その次の tick に 1 回だけ、押した瞬間の集合（`digit_keys` の bit の並び）を
-    /// 返す。OS には何も注がない。台本が動いていない・段階が無いときは `None`。
+    /// 返す。OS には何も注がない。台本が動いていない・段階が無い・`copy=1` だけの段階のときは `None`。
     fn digit_script(&mut self) -> Option<u16> {
-        let k = self.script.as_deref_mut()?.take_keys()?;
+        if self.digits_given {
+            return None;
+        }
+        let k = self.script_keys()?;
+        if k.digit.is_none() && !k.tab {
+            return None;
+        }
+        self.digits_given = true;
         Some(k.digit.map_or(0, |d| 1u16 << d) | if k.tab { crate::digit_keys::TAB_BIT } else { 0 })
+    }
+
+    /// 台本の段階（`copy=1`）が効き始めたとき、その次の tick に 1 回だけ `true`（Ctrl+C を押したことにする）。
+    fn copy_script(&mut self) -> bool {
+        if self.copy_given {
+            return false;
+        }
+        self.copy_given = self.script_keys().is_some_and(|k| k.copy);
+        self.copy_given
     }
 
     /// 台本の入れ物（`script`）があれば台本の付いている実行。入れ物は `script_win` が武装している間ずっと残る（終わっても外さない）ので、
@@ -342,7 +383,7 @@ impl Game for NetGame<'_> {
                     Seat::P1 => p1,
                     Seat::P2 => p2,
                 };
-                return w & SEND_MASK;
+                return w & MATCH_SEND_MASK;
             }
             return self.io.local_input() as u16;
         }
@@ -362,7 +403,7 @@ impl Game for NetGame<'_> {
                     Seat::P1 => p1,
                     Seat::P2 => p2,
                 };
-                return w & SEND_MASK;
+                return w & MATCH_SEND_MASK;
             }
         }
         self.io.local_input() as u16
@@ -500,8 +541,20 @@ impl Game for NetGame<'_> {
         list
     }
 
-    fn follow_portrait(&mut self, v: &MenuView, seat: usize, cursor: u32) -> Followed {
-        let plan = net_portrait::plan(v, seat, cursor, &mut PortraitGate { io: &mut *self.io });
+    fn follow_portrait(
+        &mut self,
+        v: &MenuView,
+        seat: usize,
+        cursor: u32,
+        locked: Locked,
+    ) -> Followed {
+        let plan = net_portrait::plan(
+            v,
+            seat,
+            cursor,
+            locked,
+            &mut PortraitGate { io: &mut *self.io },
+        );
         match plan {
             Plan::Unchanged => Followed::Unchanged,
             Plan::Refused => Followed::Refused,
@@ -514,8 +567,36 @@ impl Game for NetGame<'_> {
         }
     }
 
+    fn cursor_se(&mut self) -> bool {
+        self.io.push_se(SE_ID_MENU_CURSOR, SE_PAN_MENU_CURSOR)
+    }
+
     fn check_values(&mut self) -> (u16, u32, u8, u8) {
         read_check_values(&mut IoRead(&mut *self.io))
+    }
+
+    fn play_view(&mut self) -> Option<PlayView> {
+        // 戻り道の間だけ読む（つながっている試合の tick には呼ばれない）ので、どれも落ちない読み方でよい。
+        let loading = self.io.safe_u32(LOADING)? != 0;
+        // どちらも 1 バイトの欄（`movb`）。隣の 3 バイトは見ない。
+        let paused = self.io.safe_u32(PAUSE)? & 0xFF != 0;
+        let end_menu = self.io.safe_u32(MATCH_END_MENU)? & 0xFF != 0;
+        let mut menu = |base: u32| {
+            Some(MenuState {
+                state: self.io.safe_u32(base + MENU_OBJ_STATE)?,
+                frames: self.io.safe_u32(base + MENU_OBJ_FRAMES)?,
+            })
+        };
+        // 出ていないメニューの状態は前の値のままなので読まない。
+        let pause = if paused { menu(PAUSE_MENU) } else { None };
+        let end = if end_menu { menu(END_MENU) } else { None };
+        Some(PlayView {
+            loading,
+            paused,
+            end_menu,
+            pause,
+            end,
+        })
     }
 }
 
@@ -581,6 +662,8 @@ mod tests {
         /// 立ち絵の 3 本の関数が照合済みか（`NetIo::portrait_armed`）と、呼ばれた（ecx, 呼び出し）の列。
         portrait_armed: bool,
         portrait_calls: Vec<(u32, PortraitCall)>,
+        /// 積んだ SE（id, パン）。
+        se: Vec<(u32, i32)>,
     }
 
     impl TickIo for Fake {
@@ -630,6 +713,10 @@ mod tests {
         fn call_portrait(&mut self, m: u32, call: PortraitCall) {
             assert!(self.portrait_armed, "照合していない関数を呼んだ");
             self.portrait_calls.push((m, call));
+        }
+        fn push_se(&mut self, id: u32, pan: i32) -> bool {
+            self.se.push((id, pan));
+            true
         }
         fn read_data(&mut self, addr: u32, out: &mut [u8]) {
             if addr == MAP_LIST {
@@ -738,28 +825,26 @@ mod tests {
             let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
             assert_eq!(g.digit_keys(), None);
         }
-        // キーボードの Ctrl も同じガード: 旗が読めない・0・前面が別のアプリのときは、押されていても読まない。
-        crate::digit_keys_win::test_set_ctrl(true);
-        for (flag, front, want) in [
-            (None, true, false),
-            (Some(0), true, false),
-            (Some(1), false, false),
-            (Some(1), true, true),
-        ] {
-            f.safe.remove(&APP_ACTIVE);
-            if let Some(v) = flag {
-                f.safe.insert(APP_ACTIVE, v);
-            }
-            crate::digit_keys_win::test_set_foreground(front);
-            let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
-            assert_eq!(g.keyboard_ctrl_down(), want, "{flag:?} {front}");
-        }
-        crate::digit_keys_win::test_set_ctrl(false);
+        crate::digit_keys_win::test_set_foreground(true);
+        // 同じ tick の 2 回目の呼び出し（Ctrl+数字の読みと Ctrl+C の読み）は問い合わせ直さない。次の tick（新しい `NetGame`）は読み直す。
+        use crate::digit_keys::{C_BIT, CTRL_BIT};
+        f.safe.insert(APP_ACTIVE, 1);
+        crate::digit_keys_win::test_set_held(Some(C_BIT | CTRL_BIT));
         {
             let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
-            assert!(!g.keyboard_ctrl_down(), "Ctrl が離れているのに真");
+            assert_eq!(g.digit_keys(), Some(C_BIT | CTRL_BIT));
+            crate::digit_keys_win::test_set_held(Some(0));
+            assert_eq!(
+                g.digit_keys(),
+                Some(C_BIT | CTRL_BIT),
+                "同じ tick に読み直した"
+            );
         }
-        crate::digit_keys_win::test_set_foreground(true);
+        {
+            let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+            assert_eq!(g.digit_keys(), Some(0), "次の tick に読み直さない");
+        }
+        crate::digit_keys_win::test_set_held(None);
         assert_eq!(APP_ACTIVE, 0x004B_30B8);
     }
 
@@ -805,6 +890,61 @@ mod tests {
         );
         let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
         assert_eq!(g.digit_script(), None);
+    }
+
+    /// 壊れたら落ちる: `copy=1` の段で数字・Tab の押下が出る、`digit=` の段で Ctrl+C が出る、同じ tick に 2 回取り出せる、
+    /// 呼ぶ順（コピーが先・数字が先）で結果が変わる。
+    #[test]
+    fn a_script_step_with_copy_gives_it_once_and_the_call_order_does_not_matter() {
+        use higanr_core::script::{Engine, Obs, parse};
+        let obs = Obs {
+            scene: 1,
+            screen: None,
+            cursor: None,
+            sub: None,
+            trans: None,
+            pause: false,
+            loading: false,
+            demo: false,
+            end_menu: false,
+            menu_flag: false,
+            talk: None,
+        };
+        for copy_first in [true, false] {
+            let mut f = fake();
+            let mut e = Engine::new(
+                parse("scene=1 wait=1 copy=1\nscene=1 wait=1 digit=4\nscene=1 wait=1\n").unwrap(),
+            );
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                let mut g = NetGame::new(&mut f, Some(&mut e), GameAddrs::th09());
+                let (c, d) = if copy_first {
+                    let c = g.copy_script();
+                    (c, g.digit_script())
+                } else {
+                    let d = g.digit_script();
+                    (g.copy_script(), d)
+                };
+                assert!(!g.copy_script(), "コピーを 2 回取り出せた");
+                assert_eq!(g.digit_script(), None, "数字を 2 回取り出せた");
+                seen.push((c, d));
+                e.step(&obs);
+            }
+            assert_eq!(
+                seen,
+                vec![
+                    (false, None),
+                    (true, None),
+                    (false, Some(1 << 4)),
+                    (false, None),
+                    (false, None)
+                ],
+                "copy_first = {copy_first}"
+            );
+        }
+        let mut f = fake();
+        let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+        assert!(!g.copy_script(), "台本が無いのにコピーが出た");
     }
 
     #[test]
@@ -1042,7 +1182,12 @@ mod tests {
             f
         };
         let follow = |f: &mut Fake, seat: usize, cursor: u32| {
-            NetGame::new(f, None, GameAddrs::th09()).follow_portrait(&view, seat, cursor)
+            NetGame::new(f, None, GameAddrs::th09()).follow_portrait(
+                &view,
+                seat,
+                cursor,
+                Locked::Refuse,
+            )
         };
         let mut f = open();
         assert_eq!(follow(&mut f, 0, 6), Followed::Called);
@@ -1088,6 +1233,34 @@ mod tests {
         f.safe.insert(CHARA_UNLOCK + 0x0E, 0x0100);
         assert_eq!(follow(&mut f, 0, 7), Followed::Refused);
         assert!(f.portrait_calls.is_empty());
+        // 相手の席の位置の経路は、未解放でも呼ぶ（ほかの門は同じ）。
+        let mut f = open();
+        f.safe.insert(CHARA_UNLOCK + 6, 0);
+        let got = NetGame::new(&mut f, None, GameAddrs::th09()).follow_portrait(
+            &view,
+            0,
+            6,
+            Locked::Allow,
+        );
+        assert_eq!(got, Followed::Called);
+        assert_eq!(f.portrait_calls.len(), 3);
+        let mut f = open();
+        f.portrait_armed = false;
+        let got = NetGame::new(&mut f, None, GameAddrs::th09()).follow_portrait(
+            &view,
+            0,
+            6,
+            Locked::Allow,
+        );
+        assert_eq!(got, Followed::Refused, "署名が合わなければ呼ばない");
+    }
+
+    /// 壊れたら落ちる: カーソルの音の id・パンがゲームのカーソルの移動 `0x0042474A`（`push $0x0`・`push $0xc`）と違う。
+    #[test]
+    fn the_cursor_sound_is_the_games_cursor_move_sound() {
+        let mut f = fake();
+        assert!(NetGame::new(&mut f, None, GameAddrs::th09()).cursor_se());
+        assert_eq!(f.se, vec![(0x0C, 0)]);
     }
 
     #[test]
@@ -1360,5 +1533,51 @@ mod tests {
             g.local_input(Seat::P1);
         }
         assert_eq!(crate::test_alloc::count(), a0, "読みが確保した");
+    }
+
+    #[test]
+    fn play_view_reads_the_one_byte_flags_and_only_the_menus_that_are_shown() {
+        let mut f = fake();
+        // 隣の 3 バイトが立っていても 1 バイトの欄だけを見る（一時停止の `0x4A7ECC` と `0x4A7ECE` は同じ 4 バイトに並ぶ）。
+        f.safe.insert(LOADING, 0);
+        f.safe.insert(PAUSE, 0x0001_0000);
+        f.safe.insert(MATCH_END_MENU, 0x0000_0100);
+        f.safe.insert(PAUSE_MENU + MENU_OBJ_STATE, 2);
+        f.safe.insert(PAUSE_MENU + MENU_OBJ_FRAMES, 9);
+        {
+            let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+            let v = g.play_view().unwrap();
+            assert!(!v.loading && !v.paused && !v.end_menu);
+            assert_eq!((v.pause, v.end), (None, None), "出ていないメニューを読んだ");
+        }
+        f.safe.insert(PAUSE, 0x0001_0002);
+        f.safe.insert(MATCH_END_MENU, 0x0000_0001);
+        f.safe.insert(END_MENU + MENU_OBJ_STATE, 3);
+        f.safe.insert(END_MENU + MENU_OBJ_FRAMES, 40);
+        f.safe.insert(LOADING, 1);
+        let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+        let v = g.play_view().unwrap();
+        assert!(v.loading && v.paused && v.end_menu);
+        assert_eq!(
+            v.pause,
+            Some(MenuState {
+                state: 2,
+                frames: 9
+            })
+        );
+        assert_eq!(
+            v.end,
+            Some(MenuState {
+                state: 3,
+                frames: 40
+            })
+        );
+        // 一時停止のメニューの状態が読めなければ、試合の場面ごと読めない扱いにせず、その欄だけ None。
+        f.safe.remove(&(PAUSE_MENU + MENU_OBJ_FRAMES));
+        let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+        assert_eq!(g.play_view().unwrap().pause, None);
+        f.safe.remove(&PAUSE);
+        let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+        assert_eq!(g.play_view(), None);
     }
 }

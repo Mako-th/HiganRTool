@@ -16,12 +16,13 @@ use higanr_core::handshake::{self, Name};
 use higanr_core::input_model::keys;
 use higanr_core::link;
 use higanr_core::lockstep::Role;
+use higanr_core::menu_model::KEY_CTRL;
 use higanr_core::selection::Agreed;
 use higanr_core::wire::{Seat, Select, StepKind};
 
 use super::fake::{FRAME_US, FakeNet, local_word};
 use super::{Action, BadValue, CheckSource, Config, Game, Net, NetPlay, Phase, WAIT_BUDGET_US};
-use crate::net_portrait::{Followed, Plan, PortraitEnv, plan};
+use crate::net_portrait::{Followed, Locked, Plan, PortraitEnv, plan};
 use crate::net_select::{MenuView, seat_index};
 use crate::th09_addr::{MENU_CHARA_CURSOR, MENU_CURSOR};
 
@@ -143,6 +144,8 @@ pub struct MenuGame {
     pub fed_played: Vec<[u16; 3]>,
     /// 選択の画面で feed された 3 本（`Action::Menu` の tick。席の入れ違いを見る）。
     pub fed_menu: Vec<[u16; 3]>,
+    /// `fed_menu` の各 tick の画面（入力の地点で見えていた画面）。
+    pub fed_menu_screen: Vec<u32>,
     /// マッチから戻った: 次のメニューの tick で押下なしに 7 → 8。
     pub pending_auto8: bool,
     /// ゲームが決めた値（止める地点で SELECT が書き直す前）: 両席が揃ったときの両席のキャラ、決めたマップ。
@@ -194,6 +197,19 @@ pub struct MenuGame {
     /// 「カーソルが動く → 立ち絵と席の目印」なので、両方の列は同じでなければならない。
     pub cursor_jumps: Vec<(usize, u32, u32)>,
     pub portraits: Vec<(usize, u32, u32)>,
+    // ---- キャラ選択の解放・ランダム・初期ライフ・音 ----
+    /// 手元で解放済みのキャラ（キャラの番号で引く。`[0x4A81CC + キャラ]`）。移動とランダムは未解放のキャラを飛ばす（`0x0042304D`）。
+    pub chara_unlocked: [bool; 16],
+    /// ランダム（Ctrl）の乱数（ゲームの乱数 `0x42AE50` の代わり）。台ごとに違えると、ランダムの行き先が両者で違う。
+    pub menu_rng: u32,
+    /// 初期ライフ（Shift＋左右。1〜10）。
+    pub life: [u32; 2],
+    /// ゲームの移動の道が鳴らしたカーソルの音（`0x0042474A`。席ごと）。
+    pub move_se: [u32; 2],
+    /// dll が積んだカーソルの音（`Game::cursor_se`）の tick。
+    pub dll_cursor_se: Vec<u32>,
+    /// 自分の席のカーソルが取った値（最初の値と、変わるたび）。
+    pub own_cursor_values: Vec<u32>,
     // ---- 合わせの観測 ----
     /// 何 tick 目か（`tick` の呼び出しの数）と、今の画面に入ってからの tick。
     pub tick_no: u32,
@@ -234,8 +250,6 @@ pub struct MenuGame {
     pub tab_at: Vec<(u32, u32)>,
     /// 本物のキーの読み（`Game::digit_keys`）の代わり: 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`digit_keys` の bit の並び）。`None` は読んではいけない間。
     pub digit_held: Option<u16>,
-    /// キーボードの Ctrl が押されている（`Game::keyboard_ctrl_down`）。
-    pub ctrl_down: bool,
     /// 台本の付いている実行（`Game::scripted_run`）。
     pub scripted: bool,
 }
@@ -291,6 +305,7 @@ impl MenuGame {
             played: Vec::new(),
             fed_played: Vec::new(),
             fed_menu: Vec::new(),
+            fed_menu_screen: Vec::new(),
             pending_auto8: false,
             decided_chars: Vec::new(),
             decided_maps: Vec::new(),
@@ -317,8 +332,14 @@ impl MenuGame {
             demo_req_phase: None,
             spam: None,
             spam_t: 0,
-            cursor_jumps: Vec::with_capacity(64),
-            portraits: Vec::with_capacity(64),
+            cursor_jumps: Vec::with_capacity(4096),
+            portraits: Vec::with_capacity(4096),
+            chara_unlocked: [true; 16],
+            menu_rng: 0x2468_ACE1,
+            life: [10, 10],
+            move_se: [0, 0],
+            dll_cursor_se: Vec::with_capacity(4096),
+            own_cursor_values: Vec::new(),
             tick_no: 0,
             screen_age: 0,
             snaps: Vec::new(),
@@ -339,7 +360,6 @@ impl MenuGame {
             digit_script: None,
             tab_at: Vec::new(),
             digit_held: None,
-            ctrl_down: false,
             scripted: false,
         };
         // 画面 6（人対人を選ぶ画面）から始める。台本が 6 で決めて 7 へ入る（繋がった後に選択の画面へ入る形）。
@@ -362,6 +382,10 @@ impl MenuGame {
 
     fn observe(&mut self) {
         self.tick_no += 1;
+        let own = self.chara_cursor[self.seat & 1];
+        if self.own_cursor_values.last() != Some(&own) {
+            self.own_cursor_values.push(own);
+        }
         // キャラのカーソルはキャラ選択（8）の間だけ見る（ほかの画面では、まだ合わせ前の最初のカーソルのままでよい）。
         let chara = if self.screen == 8 {
             self.chara_cursor
@@ -381,6 +405,18 @@ impl MenuGame {
         if self.screen_age == SNAP_AGE && matches!(self.screen, 7 | 8 | 16) {
             self.snaps.push(view);
         }
+    }
+
+    /// `0x0042304D`: カーソルのキャラが手元で未解放なら、`delta` の向きに解放済みのキャラまで進める。
+    fn skip_locked(&self, cur: u32, delta: i32) -> u32 {
+        let mut c = cur;
+        for _ in 0..16 {
+            if self.chara_unlocked[usize::from(CHARA_TABLE[c as usize])] {
+                return c;
+            }
+            c = (c as i32 + delta).rem_euclid(16) as u32;
+        }
+        cur
     }
 
     fn set_screen(&mut self, s: u32, direct: bool) {
@@ -513,6 +549,7 @@ impl MenuGame {
         self.fed = [None; 3];
         self.tick_word = None;
         self.script_word = None;
+        let screen_at_input = self.screen;
         let before = crate::test_alloc::count();
         let a = np.on_input(self, net);
         self.on_input_allocs += crate::test_alloc::count() - before;
@@ -557,6 +594,7 @@ impl MenuGame {
         self.menu_fed = matches!(a, Action::Menu);
         if self.menu_fed {
             self.fed_menu.push(fed);
+            self.fed_menu_screen.push(screen_at_input);
         }
         if let Action::Played(r) = a {
             self.played.push((r.seg, r.frame, r.p1, r.p2));
@@ -724,19 +762,45 @@ impl MenuGame {
                 }
             }
             8 => {
-                for ((cur, &dec), &p) in self
-                    .chara_cursor
-                    .iter_mut()
-                    .zip(&self.decided)
-                    .zip(&pressed)
-                {
-                    if dec == 0 {
+                // 席ごとに: Shift を押していれば左右で初期ライフ（`0x00428AE5`〜）、でなければ `0x0042474A` の移動（左 → 右 → 上 → 下の順に
+                // 1 つだけ。音を鳴らす）と未解放の飛ばし（`0x0042304D`）。続けて Ctrl を押していればランダム（`0x00428B48`〜。音なし）。
+                for s in 0..2 {
+                    if self.decided[s] != 0 {
+                        continue;
+                    }
+                    let p = pressed[s];
+                    if held[s] & keys::SHIFT != 0 {
                         if p & keys::LEFT != 0 {
-                            *cur = (*cur + 15) % 16;
+                            self.life[s] = self.life[s].saturating_sub(1).max(1);
                         }
                         if p & keys::RIGHT != 0 {
-                            *cur = (*cur + 1) % 16;
+                            self.life[s] = (self.life[s] + 1).min(10);
                         }
+                    } else {
+                        let delta = if p & keys::LEFT != 0 {
+                            -1
+                        } else if p & keys::RIGHT != 0 {
+                            1
+                        } else if p & keys::UP != 0 {
+                            -1
+                        } else if p & keys::DOWN != 0 {
+                            1
+                        } else {
+                            0
+                        };
+                        if delta != 0 {
+                            let c = (self.chara_cursor[s] as i32 + delta).rem_euclid(16) as u32;
+                            self.chara_cursor[s] = self.skip_locked(c, delta);
+                            self.move_se[s] += 1;
+                        }
+                    }
+                    if held[s] & KEY_CTRL != 0 {
+                        self.menu_rng = self
+                            .menu_rng
+                            .wrapping_mul(1_103_515_245)
+                            .wrapping_add(12_345);
+                        let c = (self.chara_cursor[s] + ((self.menu_rng >> 16) & 15)) % 16;
+                        self.chara_cursor[s] = self.skip_locked(c, 1);
                     }
                 }
                 let ch = [0, 1].map(|s| CHARA_TABLE[self.chara_cursor[s] as usize]);
@@ -823,9 +887,6 @@ impl Game for MenuGame {
     }
     fn digit_keys(&mut self) -> Option<u16> {
         self.digit_held
-    }
-    fn keyboard_ctrl_down(&mut self) -> bool {
-        self.ctrl_down
     }
     fn scripted_run(&self) -> bool {
         self.scripted
@@ -933,18 +994,24 @@ impl Game for MenuGame {
         }
         true
     }
-    fn follow_portrait(&mut self, v: &MenuView, seat: usize, cursor: u32) -> Followed {
-        /// ゲートを全部開けた偽物（署名・MainMenu・部品・解放は本物の窓の検査 `net_game.rs` が見る）。
-        struct Open;
+    fn follow_portrait(
+        &mut self,
+        v: &MenuView,
+        seat: usize,
+        cursor: u32,
+        locked: Locked,
+    ) -> Followed {
+        /// 署名・MainMenu・部品の門を開けた偽物（それらは本物の窓の検査 `net_game.rs` が見る）。解放はこの台の表。
+        struct Open([bool; 16]);
         impl PortraitEnv for Open {
-            fn unlocked(&mut self, _chara: u8) -> bool {
-                true
+            fn unlocked(&mut self, chara: u8) -> bool {
+                self.0.get(usize::from(chara)) == Some(&true)
             }
             fn ready(&mut self) -> Option<u32> {
                 Some(1)
             }
         }
-        match plan(v, seat, cursor, &mut Open) {
+        match plan(v, seat, cursor, locked, &mut Open(self.chara_unlocked)) {
             Plan::Unchanged => Followed::Unchanged,
             Plan::Refused => Followed::Refused,
             Plan::Calls { .. } => {
@@ -956,6 +1023,10 @@ impl Game for MenuGame {
     }
     fn map_list(&mut self) -> [u8; 16] {
         self.map_list
+    }
+    fn cursor_se(&mut self) -> bool {
+        self.dll_cursor_se.push(self.tick_no);
+        true
     }
 }
 
@@ -1190,19 +1261,20 @@ fn both_sides_walk_the_same_screens() {
             r.a.saved_diff, r.b.saved_diff,
             "{ctx}: 難易度のカーソルの控え"
         );
-        // 1 マッチ目は合わせの後の値（両者の最初のカーソルが違っても、入ったときに B が A の値へ寄る）。
+        // 1 マッチ目: 難易度・マップは合わせの後の値（両者の最初のカーソルが違っても、入ったときに B が A の値へ寄る）。キャラは各自の
+        // 席のカーソルのまま（B の 2P は B の最初の 10 から左へ 1 つ。キャラ選択は合わせない）。
         let first = r.a.agreed[0];
         assert_eq!(first.difficulty, 2, "{ctx}: 難易度");
         assert_eq!(first.map, 9, "{ctx}: マップ");
         assert_eq!(r.b.agreed[0].map, first.map, "{ctx}");
         assert_eq!(
             (first.peer.chara, first.peer.color),
-            (CHARA_TABLE[7], 1),
+            (CHARA_TABLE[9], 1),
             "{ctx}: A が受けた 2P"
         );
         assert_eq!(
             r.a.decided_chars.first(),
-            Some(&[CHARA_TABLE[5], CHARA_TABLE[7]]),
+            Some(&[CHARA_TABLE[5], CHARA_TABLE[9]]),
             "{ctx}"
         );
         let second = r.a.agreed[1];
@@ -1351,7 +1423,7 @@ fn a_human_walks_selection_match_rematch_and_bye() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(steps(&npa), steps(&npb), "{ctx}: 入った押下の列");
-        // 決定・取消（合わせを除く）の数。合わせは画面ごとに 1 回ずつ（5 回）。
+        // 決定・取消（合わせを除く）の数。合わせは難易度・マップの画面ごとに 1 回ずつ（3 回。キャラ選択は合わせない）。
         let real = |np: &NetPlay| {
             np.step_log()
                 .iter()
@@ -1366,7 +1438,7 @@ fn a_human_walks_selection_match_rematch_and_bye() {
         );
         assert_eq!(
             steps(&npa).len() - real(&npa),
-            5,
+            3,
             "{ctx}: 画面ごとの合わせの数: {:?}",
             steps(&npa)
         );
@@ -1379,7 +1451,7 @@ fn a_human_walks_selection_match_rematch_and_bye() {
         );
         assert_eq!(
             a.decided_chars.first(),
-            Some(&[CHARA_TABLE[4], CHARA_TABLE[7]]),
+            Some(&[CHARA_TABLE[4], CHARA_TABLE[9]]),
             "{ctx}: 押し続けが決定になった"
         );
         assert_eq!(a.decided_chars, b.decided_chars, "{ctx}");
@@ -2086,10 +2158,13 @@ fn cursors_are_aligned_on_every_selection_screen_before_any_decision() {
         assert!(d.until_done(20_000), "{ctx}: 台本を使い切っていない");
         assert_eq!(
             d.a.snaps,
-            vec![(7, 1, [0; 2]), (8, 0, [3, 8]), (16, 14, [0; 2])],
-            "{ctx}: A（ホスト）の値は変わらない"
+            vec![(7, 1, [0; 2]), (8, 0, [3, 10]), (16, 14, [0; 2])],
+            "{ctx}: A（ホスト）の難易度・マップの値は変わらない。キャラは各自の席のカーソル（A の 1P 3・B の 2P 10）"
         );
-        assert_eq!(d.b.snaps, d.a.snaps, "{ctx}: B が A の値へ寄っていない");
+        assert_eq!(
+            d.b.snaps, d.a.snaps,
+            "{ctx}: B が A の値へ寄っていない・相手の席が相手の位置でない"
+        );
         for np in [&d.npa, &d.npb] {
             assert_eq!(np.stats().menu_align_miss, 0, "{ctx}");
         }
@@ -2100,7 +2175,10 @@ fn cursors_are_aligned_on_every_selection_screen_before_any_decision() {
             .filter(|s| s.step.kind == StepKind::Align)
             .count();
     }
-    assert_eq!(total_aligns, 21);
+    assert_eq!(
+        total_aligns, 14,
+        "難易度とマップで 1 回ずつ × 7 走行（キャラ選択は合わせない）"
+    );
 }
 
 #[test]
@@ -2226,6 +2304,169 @@ fn a_guest_decide_before_the_alignment_waits_and_takes_the_aligned_value() {
         assert_eq!(d.a.screens, d.b.screens, "片道 {delay_ms}");
         assert_eq!(d.npb.stats().menu_lost, 0);
     }
+}
+
+// ---- キャラ選択の相手の席の位置 ----
+
+/// B（2P）の手元で解放済みのキャラのカーソル（キャラ 0〜5・8 = カーソル 0〜5・10）。A（1P）は全部解放済み。A のカーソルが
+/// 6〜9・11〜15 に来ると、B の手元では未解放のキャラの上に居る。
+const B_UNLOCKED_CURSORS: [u32; 7] = [0, 1, 2, 3, 4, 5, 10];
+
+/// 解放の集合を違えた 2 台。A は右・右・下・ランダム 25 tick・左・上の後に決め、B は左・左・ランダム 20 tick・右の後に決める。
+fn unlock_duo(delay_ms: u64, drop_a: u32, drop_b: u32) -> Duo {
+    use keys::{DOWN, LEFT, RIGHT, UP, Z};
+    let pa = vec![
+        act(0, 6, 30, Z, 1),
+        act(0, 7, 100, Z, 1),
+        act(0, 8, 60, RIGHT, 1),
+        act(0, 8, 10, RIGHT, 1),
+        act(0, 8, 10, DOWN, 1),
+        act(0, 8, 20, KEY_CTRL, 25),
+        act(0, 8, 40, LEFT, 1),
+        act(0, 8, 10, UP, 1),
+        act(0, 8, 200, Z, 1),
+    ];
+    let pb = vec![
+        act(0, 6, 30, Z, 1),
+        act(0, 8, 80, LEFT, 1),
+        act(0, 8, 10, LEFT, 1),
+        act(0, 8, 20, KEY_CTRL, 20),
+        act(0, 8, 40, RIGHT, 1),
+        act(0, 8, 260, Z, 1),
+    ];
+    let (a, mut b) = differing_games(pa, pb);
+    b.chara_unlocked = [false; 16];
+    for c in B_UNLOCKED_CURSORS {
+        b.chara_unlocked[usize::from(CHARA_TABLE[c as usize])] = true;
+    }
+    b.menu_rng = 0x1357_9BDF;
+    Duo::new(a, b, delay_ms, drop_a, drop_b)
+}
+
+/// 壊れたら落ちる: 相手の席を相手の語で動かす（未解放の飛ばしとランダムの乱数が両者で違い、相手の席が相手の位置からずれる）・位置を書かない
+/// tick がある・相手が取ったことの無い位置を見せる・キャラ選択で合わせを出す・カーソルの音を鳴らさない・ランダムでも鳴らす・
+/// 未解放のキャラの上で立ち絵を追わせない。
+#[test]
+fn the_peer_seat_follows_the_peers_own_cursor_with_different_unlocks_and_the_random() {
+    let (mut checked_total, mut on_locked_total, mut random_writes) = (0u32, 0u32, 0u32);
+    for (delay_ms, drop_a, drop_b) in [(1u64, 0u32, 0u32), (16, 0, 0), (40, 0, 0), (12, 5, 7)] {
+        let ctx = format!("片道 {delay_ms} ms・落とす {drop_a}/{drop_b}");
+        let mut d = unlock_duo(delay_ms, drop_a, drop_b);
+        let mut checked = [0u32; 2];
+        for _ in 0..1_500 {
+            let pre = |g: &MenuGame, np: &NetPlay| {
+                (
+                    g.screen == 8 && g.sub == 1,
+                    g.decided,
+                    np.stats().menu_applied,
+                )
+            };
+            let (pa, pb) = (pre(&d.a, &d.npa), pre(&d.b, &d.npb));
+            d.tick();
+            for (who, g, np, (on8, decided, applied), other) in [
+                ("A", &d.a, &d.npa, pa, 1usize),
+                ("B", &d.b, &d.npb, pb, 0usize),
+            ] {
+                let pc = np
+                    .link
+                    .connected()
+                    .and_then(|c| c.selection().peer_cursor())
+                    .filter(|p| p.screen == 8);
+                let Some(pc) = pc else { continue };
+                if !on8 || decided[other] != 0 || np.stats().menu_applied != applied {
+                    continue;
+                }
+                assert_eq!(
+                    g.chara_cursor[other],
+                    u32::from(pc.cursor),
+                    "{ctx}: {who} の tick {} の相手の席が相手の位置でない",
+                    g.tick_no
+                );
+                checked[other] += 1;
+                if who == "B" && !B_UNLOCKED_CURSORS.contains(&g.chara_cursor[0]) {
+                    on_locked_total += 1;
+                }
+            }
+            if d.a.screen == 16 && d.b.screen == 16 {
+                break;
+            }
+        }
+        assert_eq!(
+            (d.a.screen, d.b.screen),
+            (16, 16),
+            "{ctx}: マップの画面へ進まない"
+        );
+        assert!(
+            checked[0] > 200 && checked[1] > 200,
+            "{ctx}: 見た tick {checked:?}"
+        );
+        checked_total += checked[0] + checked[1];
+        for (who, np) in [("A", &d.npa), ("B", &d.npb)] {
+            assert!(
+                np.step_log()
+                    .iter()
+                    .all(|s| !(s.step.kind == StepKind::Align && s.step.screen == 8)),
+                "{ctx}: {who} にキャラ選択の合わせが入った"
+            );
+        }
+        // 相手の席に書いた値は、相手が自分の席で取った値だけ（取ったことの無い位置を見せない）。
+        for (who, g, peer, other) in [("A", &d.a, &d.b, 1usize), ("B", &d.b, &d.a, 0usize)] {
+            for &(seat, _, to) in &g.cursor_jumps {
+                if seat == other {
+                    assert!(
+                        peer.own_cursor_values.contains(&to),
+                        "{ctx}: {who} が相手の席へ書いた {to} は相手の値 {:?} に無い",
+                        peer.own_cursor_values
+                    );
+                }
+            }
+            assert_eq!(g.portraits, g.cursor_jumps, "{ctx}: {who} の立ち絵");
+        }
+        // 音: 相手のゲームの移動の道が鳴らした数だけ鳴らす（ランダムでは鳴らさない）。数は dll の数とも合う。
+        for (who, g, np, peer, other) in [
+            ("A", &d.a, &d.npa, &d.b, 1usize),
+            ("B", &d.b, &d.npb, &d.a, 0usize),
+        ] {
+            let st = np.stats();
+            assert_eq!(
+                g.dll_cursor_se.len() as u32,
+                peer.move_se[other],
+                "{ctx}: {who} が鳴らした音と相手の移動の数"
+            );
+            assert_eq!(
+                st.menu_cursor_se,
+                g.dll_cursor_se.len() as u32,
+                "{ctx}: {who}"
+            );
+            assert_eq!(st.menu_cursor_se_failed, 0, "{ctx}: {who}");
+            let writes = g.cursor_jumps.iter().filter(|j| j.0 == other).count() as u32;
+            assert!(
+                st.menu_peer_writes <= writes && st.menu_peer_writes > st.menu_cursor_se,
+                "{ctx}: {who} の書いた数 {} / 立ち絵まで含めた書いた数 {writes} / 音 {}",
+                st.menu_peer_writes,
+                st.menu_cursor_se
+            );
+            random_writes += st.menu_peer_writes - st.menu_cursor_se;
+            assert!(
+                st.menu_peer_random > 0,
+                "{ctx}: {who} が相手のランダムを受けていない"
+            );
+            assert_eq!(st.menu_align_miss, 0, "{ctx}: {who}");
+        }
+        assert_eq!(
+            (d.a.on_input_allocs, d.b.on_input_allocs),
+            (0, 0),
+            "{ctx}: on_input が確保した"
+        );
+        // 決めたキャラは両者で同じ（相手の席は STEP の値で決まる）。
+        assert_eq!(d.a.decided_chars, d.b.decided_chars, "{ctx}");
+    }
+    eprintln!(
+        "相手の席の位置（4 走行）: 見た tick {checked_total}、B が未解放のキャラの上の A の位置を見せた tick {on_locked_total}、ランダムなどで音なしに書いた {random_writes}"
+    );
+    // 効く期間を踏んだ（0 なら未解放の飛ばしもランダムも試せていない）。
+    assert!(on_locked_total > 20, "{on_locked_total}");
+    assert!(random_writes > 20, "{random_writes}");
 }
 
 #[test]
@@ -2743,66 +2984,73 @@ fn chara_select_duo(scripted: bool, pick: bool) -> Duo {
 }
 
 /// A が `ticks` tick のあいだ語の Ctrl（`0x0100`）を押し、その間に自分のゲームへ入った語・相手へ届いた語に `0x0100` が残ったか。
+/// 相手へ届いた語は B の数（`menu_peer_random`）で見る（キャラ選択の B は相手の語の Ctrl を相手の席へ入れずに落とすので、B の feed には出ない）。
 fn skip_bit_leaks(d: &mut Duo, ticks: u32) -> (bool, bool) {
     const SKIP: u16 = 0x0100;
     let (na, nb) = (d.a.fed_menu.len(), d.b.fed_menu.len());
+    let rb = d.npb.stats().menu_peer_random;
     d.a.presses.push(Press::new(|_| true, SKIP, ticks));
     d.ticks(ticks + 20);
     let has = |v: &[[u16; 3]]| v.iter().any(|w| w.iter().any(|x| x & SKIP != 0));
-    (has(&d.a.fed_menu[na..]), has(&d.b.fed_menu[nb..]))
+    assert!(
+        !has(&d.b.fed_menu[nb..]),
+        "B のゲームへ相手のランダムが入った"
+    );
+    (
+        has(&d.a.fed_menu[na..]),
+        d.npb.stats().menu_peer_random > rb,
+    )
 }
 
-/// 選択の画面（キャラセレクト）では、キーボードの Ctrl が押されている間は語の Ctrl（`0x0100`。ゲームの「ランダム」）を落とす。
-/// 自分のゲームへ入れる語にも相手へ送る語にも残らない。Ctrl が離れているときの `0x0100`（パッドのスキップ）は両方に残る。
+/// キャラセレクトでは語の Ctrl（`0x0100`。ゲームの「ランダム」）を落とさない: キーボードの Ctrl でもパッドのスキップでも、
+/// 自分のゲームへ入れる語にも相手へ送る語にも残る。
 #[test]
-fn the_keyboard_ctrl_never_reaches_the_chara_select_but_a_pad_skip_does() {
-    for ctrl_down in [true, false] {
-        let mut d = chara_select_duo(false, true);
-        d.a.ctrl_down = ctrl_down;
-        let (mine, theirs) = skip_bit_leaks(&mut d, 20);
-        assert_eq!(
-            (mine, theirs),
-            (!ctrl_down, !ctrl_down),
-            "ctrl_down {ctrl_down}: 自分のゲームへ入った {mine} / 相手へ届いた {theirs}"
-        );
-    }
+fn the_ctrl_bit_reaches_both_the_own_game_and_the_peer_on_the_chara_select() {
+    let mut d = chara_select_duo(false, true);
+    let (mine, theirs) = skip_bit_leaks(&mut d, 20);
+    assert_eq!(
+        (mine, theirs),
+        (true, true),
+        "自分のゲームへ入った {mine} / 相手へ届いた {theirs}"
+    );
 }
 
-/// ゲームの Ctrl の読みはこちらのキーの読みより遅れうる。Ctrl を離しても、語の `0x0100` が 0 に戻るまでは落とし続ける。
-/// 戻った後のパッドのスキップは通る。
+/// R（`0x4000`）はキャラセレクトでも「ランダム」の Ctrl にならず、自分のゲームにも相手にも Ctrl が立たない。
 #[test]
-fn the_ctrl_drop_outlives_the_key_release_until_the_word_clears() {
+fn r_on_the_chara_select_does_not_become_the_random_key() {
     let mut d = chara_select_duo(false, true);
     let (na, nb) = (d.a.fed_menu.len(), d.b.fed_menu.len());
-    d.a.ctrl_down = true;
-    d.a.presses.push(Press::new(|_| true, 0x0100, 30));
-    d.ticks(5);
-    d.a.ctrl_down = false;
+    let rb = d.npb.stats().menu_peer_random;
+    d.a.presses.push(Press::new(|_| true, 0x4000, 20));
     d.ticks(40);
     let has = |v: &[[u16; 3]]| v.iter().any(|w| w.iter().any(|x| x & 0x0100 != 0));
     assert!(
-        !has(&d.a.fed_menu[na..]) && !has(&d.b.fed_menu[nb..]),
-        "Ctrl を離した後も語に残る間に 0x0100 が漏れた"
-    );
-    assert_eq!(
-        skip_bit_leaks(&mut d, 20),
-        (true, true),
-        "語が 0 に戻った後のパッドのスキップまで落とした"
+        !has(&d.a.fed_menu[na..])
+            && !has(&d.b.fed_menu[nb..])
+            && d.npb.stats().menu_peer_random == rb,
+        "R が Ctrl になった"
     );
 }
 
-/// 台本の実行と、Ctrl+数字を読まない実行（`pick` が無い）は、本物の Ctrl を読まない。
+/// Ctrl+C（観戦コードのコピー）の Ctrl も語に残る。C は遅れの量にも同期方式の切替にもならない。
 #[test]
-fn the_real_ctrl_is_not_read_in_a_scripted_run_or_without_a_pick() {
-    for (scripted, pick) in [(true, true), (false, false)] {
-        let mut d = chara_select_duo(scripted, pick);
-        d.a.ctrl_down = true;
-        assert_eq!(
-            skip_bit_leaks(&mut d, 20),
-            (true, true),
-            "scripted {scripted} pick {pick}: 本物の Ctrl を読んで落とした"
-        );
-    }
+fn ctrl_c_on_the_chara_select_keeps_the_ctrl_bit_and_does_not_change_the_delay() {
+    use crate::digit_keys::{C_BIT, CTRL_BIT};
+    let mut d = chara_select_duo(false, true);
+    let before = d.npa.stats();
+    d.a.digit_held = Some(0);
+    d.ticks(3);
+    d.a.digit_held = Some(C_BIT | CTRL_BIT);
+    let leaks = skip_bit_leaks(&mut d, 20);
+    d.a.digit_held = Some(0);
+    d.ticks(5);
+    assert_eq!(leaks, (true, true), "Ctrl+C の間に語の Ctrl が消えた");
+    let after = d.npa.stats();
+    assert_eq!(
+        (after.digit_presses, after.tab_presses),
+        (before.digit_presses, before.tab_presses),
+        "C が遅れの量か形式の切替になった"
+    );
 }
 
 #[test]
@@ -2916,4 +3164,42 @@ fn a_format_step_does_not_swallow_the_guests_pending_decide_retry() {
         assert_eq!(d.a.played, d.b.played, "{tag}");
         assert!(!d.a.played.is_empty(), "{tag}");
     }
+}
+
+/// キャラセレクトで相手のゲームスレッドが黙ると（ここでは B を丸ごと止める）、沈黙の 60 秒より前に「相手の応答を待っています」が出る。
+#[test]
+fn a_quiet_peer_on_the_chara_screen_brings_the_notice_before_the_silence_limit() {
+    let mut d = chara_select_duo(false, false);
+    assert!(!d.npa.peer_wait_shown(), "B が動いている間に知らせが出た");
+    let stopped_ms = d.clock.get() / 1_000;
+    let mut buf = [0u8; higanr_core::wire::MAX_DATAGRAM];
+    let mut shown_ms = None;
+    for _ in 0..5_000 {
+        d.clock.set(d.clock.get() + FRAME_US);
+        d.a.tick(&mut d.npa, &mut d.na);
+        while d.nb.recv(&mut buf).is_some() {}
+        if d.npa.phase() == Phase::Ended {
+            break;
+        }
+        if shown_ms.is_none() && d.npa.peer_wait_shown() {
+            shown_ms = Some(d.clock.get() / 1_000 - stopped_ms);
+        }
+    }
+    let shown = shown_ms.expect("相手が黙っても知らせが出ない");
+    // B は選択の間 MENU を毎フレーム送るので、黙った始まりは止めた時刻。そこから QUIET_MS で待ちに入り、NOTICE_TICKS で出る。
+    let at = u64::from(super::peer_wait::QUIET_MS)
+        + u64::from(super::peer_wait::NOTICE_TICKS) * FRAME_US / 1_000;
+    assert!(
+        (at - 50..at + 100).contains(&shown),
+        "知らせが出たのは B を止めて {shown} ms（見込み {at} ms）"
+    );
+    assert!(
+        matches!(
+            d.npa.end(),
+            Some(super::End::Dead | super::End::Closed(higanr_core::wire::ByeReason::Disconnected))
+        ),
+        "{:?}",
+        d.npa.end()
+    );
+    assert!(!d.npa.peer_wait_shown());
 }

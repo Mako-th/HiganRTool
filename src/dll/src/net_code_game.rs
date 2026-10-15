@@ -10,7 +10,7 @@
 //!   次の tick でセッションを作り、繋ぎ始める）。
 //! - **取りやめる**: 待ちをやめる。セッションをもう作っていたら、候補の無い設定を置いて繋がらないセッションに替える。
 //! - **ルームで待つ**: メニューの入力で決めたルーム名（`UiLink::room_name`）で、ルームサーバーへ繋ぐ（`net_room::RoomConn`。受信は
-//!   専用のスレッド `higanr-room`、送りと手順の判断はこの見張り）。決めた名は次の初めの値として覚える（`room_last`）。
+//!   専用のスレッド `higanr-room`、送りと手順の判断はこの見張り）。決めた名は ini の `room` に書く（`ini_save`）。
 //!   始める側で相手がまだ来ていない間にルームの期限が切れたら、同じ名で自動で入り直す（`room_rejoin`）。ルームに先に入った側
 //!   （`room::Role::Offer`）は「作る」と同じに `Swapper::offer` でコードを作ってルームへ渡し、相手のコードを受けたらセッションの設定を置く。
 //!   後に入った側（`Answer`）は相手のコードを読み、返すコードをルームへ渡せた時点（`submit_code` の `Ok`）でセッションの設定を置く
@@ -23,7 +23,8 @@
 //! 見張り → メニューは、文字列でなく「種類（`Event` / `CodeState`）＋数」の `Note` を `UiLink::publish` で渡す。
 //! 相手の名前だけは文字の表に無い文字を `?` に直してから載せる（`sanitize_name`）。
 //!
-//! 繋がったのを見たら、本ログへ「繋がった」と決まった形を残し、知らせ（`Notify`。音と点滅）を 1 回呼んで終わる。
+//! 繋がったのを見たら、本ログへ「繋がった」と決まった形を残し、知らせ（`Notify`。音と点滅）を 1 回呼ぶ。その後はネットワークが終わるまで
+//! 「観戦コードをコピー」の頼み（`Order::SpectateCopy`）だけを受ける（`serve_linked`。ホストなら観戦コードをクリップボードへ書く）。
 //! ゲームのスレッドはこのスレッドに触らない（指示のリングバッファと状態の入れ物だけ）。遅延の増分は 0（繋がる前のメニューの間だけ動く）。
 #![forbid(unsafe_code)]
 
@@ -57,6 +58,8 @@ use higanr_core::wire::{Arrival, Mode, Seat};
 type MenuShape = (Option<Pick>, Option<DelayChoice>);
 
 use crate::clipboard::Clipboard;
+use crate::ini_save;
+use crate::lan_link::{BridgeCmd, LanBridge};
 use crate::net_code::{
     Kind, ModeCtx, Notify, Say, Shared, Step, Swapper, Timing, Watch, addrs_text, connected_say,
     decided_shape_log, draw_session,
@@ -66,8 +69,7 @@ use crate::net_room::{QueueConn, RoomConn, RoomOptions, SubmitRefused, code_side
 use crate::net_udp::{self, GameNet, RecvThread};
 use crate::net_ui::{Order, UiLink};
 use crate::netplay::{LinkSlot, NetPlay};
-use crate::room_last;
-use crate::spectate_offer::{self, ListingInfo, OfferKit, Parts};
+use crate::spectate_offer::{self, ListingInfo, OfferKit, OnewayCode, Parts};
 use crate::trial_summary::Refusal;
 
 /// 見張りが指示を見に来る間隔（指示が無い間は原子変数を 1 つ読むだけ）。
@@ -78,13 +80,29 @@ pub struct GameUi {
     pub clip: Box<dyn Clipboard>,
     /// ルームサーバーへ繋ぐ設定（ini の `room_server` から）。None なら対戦の「ルームマッチ」の指示は来ない（メニューが項目を出さない）。
     pub room: Option<RoomOptions>,
-    /// 前に使ったルーム名を覚えるファイルの置き場（`room_last`。接続コードの置き場 `code_dir`。None なら覚えない）。
-    /// 書くのは見張りのスレッドだけ。
-    pub room_last_dir: Option<PathBuf>,
+    /// 入ったルーム名を `room` に書く ini（None なら書かない）。書くのは見張りのスレッドだけ。
+    pub ini_path: Option<PathBuf>,
     /// この起動の前のつながりの session。同じ session のコードを貼られたら読まない（`Event::Spent`）: 片づけた後もクリップボードには
     /// 前の相手のコードが残りうるので、そのまま貼ると前の相手（もう別の受信ソケット・別のコードで待っている）へつなぎに行き、
     /// 30 分の期間まで待ち続ける。最初のつながりは空。
     pub spent: Vec<u32>,
+    /// LAN の接続のときの、運び手との受け渡し（`lan_link`）。あれば、コードの受け渡し先はクリップボードでなく運び手（`clip` が `LanClip`）で、
+    /// 作る・貼る・観戦コードの頼みは指示のリングバッファでなく運び手から来る。
+    pub lan: Option<Arc<LanBridge>>,
+    /// 観戦コードのコピー（Ctrl+C）の書き先。`clip` が人のクリップボードでないとき（LAN）だけ持つ。無ければ `clip` へ書く。
+    pub spectate_clip: Option<Box<dyn Clipboard>>,
+}
+
+/// LAN で、相手のコードを読んでから接続が成立するまで待つ上限。越えたら「接続できませんでした」で待ちをやめる。
+const LAN_LINK_LIMIT: Duration = Duration::from_secs(45);
+
+/// LAN の接続での出来事の言い換え: 「クリップボードにコピーしました」の文は使えないので、接続の手順に入った 1 つの出来事にまとめる。
+fn lan_event(e: Event) -> Event {
+    match e {
+        Event::Made | Event::ReplyMade | Event::PeerRead => Event::LanPeer,
+        Event::Cancelled => Event::LanCancelled,
+        e => e,
+    }
 }
 
 struct RoomRun {
@@ -128,6 +146,8 @@ pub(crate) struct GameWatcher {
     last_rejoin: Option<Instant>,
     /// 観戦の配る側の材料（`[spectate] enable = 1` で、用意できたときだけ。つながったら `start_casting` が使って空にする）。
     spectate: Option<OfferKit>,
+    /// 観戦コードの材料（`spectate` と同じ観戦のホストのもの。つながった後も持ち、頼まれるたびに書く）。
+    oneway: Option<OnewayCode>,
     /// 自分のコードに載せる回線の型の印（ネットワークを開いたときに決まる。`start_game`）。
     nat: NatMark,
     /// 対戦の「ルームマッチ」で相手のコードを読んでセッションの設定を置いたときのルーム名（観戦用のルームの名を導く元。`Debug` に名が出るので
@@ -146,6 +166,8 @@ pub(crate) struct GameWatcher {
     random_met: bool,
     /// 待ち列の鍵のビルド番号（製品は `update::BUILD_NUMBER`。検査が替える）。
     build: u32,
+    /// LAN で、相手のコードを読み始めた時刻（`LAN_LINK_LIMIT` の起点）。
+    lan_started: Option<Instant>,
 }
 
 impl GameWatcher {
@@ -187,6 +209,7 @@ impl GameWatcher {
             room_gen: 0,
             last_rejoin: None,
             spectate: None,
+            oneway: None,
             nat: NatMark::UNKNOWN,
             met_room: None,
             peer_name: None,
@@ -195,6 +218,7 @@ impl GameWatcher {
             last_requeue: None,
             random_met: false,
             build: BUILD_NUMBER,
+            lan_started: None,
         }
     }
 
@@ -204,6 +228,10 @@ impl GameWatcher {
 
     pub(crate) fn set_spectate(&mut self, kit: OfferKit) {
         self.spectate = Some(kit);
+    }
+
+    pub(crate) fn set_oneway(&mut self, oneway: OnewayCode) {
+        self.oneway = Some(oneway);
     }
 
     /// つながった: マッチのホストで、そのつながりが対戦の「ルームマッチ」かランダム対戦で会った相手で、観戦の用意があれば、観戦用のルームで観戦者を待つ
@@ -313,8 +341,36 @@ impl GameWatcher {
     }
 
     fn event(&mut self, e: Event) {
+        self.publish_event(e, true);
+    }
+
+    /// 観戦コードのコピー（Ctrl+C）の結果。LAN の務めは終わらせない（コピーできないのは試合の失敗ではなく、運び手は LAN の観戦を受け続ける）。
+    fn copy_event(&mut self, e: Event) {
+        self.publish_event(e, false);
+    }
+
+    fn publish_event(&mut self, e: Event, ends_lan: bool) {
+        let mut e = e;
+        if let Some(b) = self.ui.lan.clone() {
+            e = lan_event(e);
+            // LAN の待ちの状態は 1 つにまとめる（作った・返した・つないでいる）。
+            if matches!(
+                self.note.state,
+                CodeState::Offered | CodeState::Replied | CodeState::Linking
+            ) {
+                self.note.state = CodeState::LanLinking;
+            }
+            // 失敗と取りやめは LAN の務めの終わり: 待ちを終えて元のメニューへ戻し、運び手を止める（同期方式を替えたことの知らせは失敗ではない）。
+            if ends_lan && ((e.is_trouble() && e != Event::ShapeLate) || e == Event::LanCancelled) {
+                self.note.state = CodeState::Idle;
+                self.lan_started = None;
+                b.abort();
+            }
+        }
         self.note.event = e;
-        self.note.seq = self.note.seq.wrapping_add(1);
+        // LAN のホストの運び手も同じ札へ書く（待機へ戻ったとき）ので、最後に書かれた数の続きから数える（同じ数だとメニューが変化を見落とす）。
+        let last = self.ui.link.note().map_or(self.note.seq, |n| n.seq);
+        self.note.seq = last.wrapping_add(1);
         self.ui.link.publish(&self.note);
     }
 
@@ -324,6 +380,71 @@ impl GameWatcher {
         self.note.head = head;
         self.note.tail = tail;
         self.note.since = now as u32;
+    }
+
+    /// LAN の運び手からの頼み（作る・貼る・観戦コード）と、運び手が決めた失敗を、見張りの 1 周ごとに受ける。
+    fn lan_tick(&mut self) {
+        let Some(b) = self.ui.lan.clone() else {
+            return;
+        };
+        if let Some(ev) = b.take_failure() {
+            self.lan_fail(ev);
+            return;
+        }
+        while let Some(cmd) = b.take_cmd() {
+            match cmd {
+                // 上限の時計は相手のコードを読んでから数える。ホストがコードを作ってから返すコードを待つ長さは運び手が決める（返らなければ
+                // 運び手が待機へ戻し、次の参加者のために作り直させる）。
+                BridgeCmd::Create => {
+                    self.refresh_player_name();
+                    self.create();
+                }
+                BridgeCmd::Paste => {
+                    self.lan_started.get_or_insert_with(Instant::now);
+                    self.paste();
+                }
+                BridgeCmd::WatchCode { src, id } => self.lan_watch_code(src, id),
+            }
+        }
+        if self
+            .lan_started
+            .is_some_and(|t| t.elapsed() > LAN_LINK_LIMIT)
+            && !self.slot.is_connected()
+        {
+            self.log("LAN: コードを受け渡してから成立しないまま上限が過ぎた");
+            self.lan_fail(Event::LanNoLink);
+        }
+    }
+
+    /// LAN の待ちを失敗として終える（置いたセッションは候補の無いものに替える）。
+    fn lan_fail(&mut self, ev: Event) {
+        self.forget_code();
+        self.event(ev);
+    }
+
+    /// LAN の観戦の申し込みに観戦コードを答える（ホストなら作って答え、ほかは断る）。クリップボードには書かない。
+    fn lan_watch_code(&mut self, src: std::net::SocketAddrV4, id: u32) {
+        let Some(b) = self.ui.lan.clone() else {
+            return;
+        };
+        let answer = match (self.slot.is_host(), self.oneway.as_ref()) {
+            (Some(true), Some(oneway)) => oneway
+                .write(net_udp::now_unix())
+                .map_err(|e| format!("観戦コードを作れない: {e:?}")),
+            (Some(true), None) => Err("観戦の用意が無い".to_string()),
+            (Some(false), _) => Err("この試合のゲストなので配らない".to_string()),
+            (None, _) => Err("試合の役が分からない".to_string()),
+        };
+        match answer {
+            Ok(text) => {
+                self.log("LAN: 観戦の申し込みに観戦コードを答えた（コードは記録しない）");
+                b.post_watch_answer(src, id, Ok(text));
+            }
+            Err(why) => {
+                self.log(format!("LAN: 観戦の申し込みを断った（{why}）"));
+                b.post_watch_answer(src, id, Err(higanr_core::lan_proto::Why::WatchOff));
+            }
+        }
     }
 
     pub(crate) fn handle(&mut self, o: Order) {
@@ -339,11 +460,102 @@ impl GameWatcher {
             // 片づけてから開く）、観戦者のルームのスレッド（`spectate_join`）が自分の指示のリングバッファの読み手になる。この指示が届くのは
             // 観戦者のネットワークを開く前の短い間だけなので、読み捨てる。
             Order::Spectate | Order::SpectateCancel => {}
+            // 観戦コードは試合の役が決まってから配る（つながった後の見回り `serve_linked` が受ける）。
+            Order::SpectateCopy => {
+                self.log("つながる前に観戦コードを頼まれたので、コピーしない");
+            }
+        }
+    }
+
+    /// 観戦コードをコピー: ホストなら、いまから新しい期限の観戦コードをクリップボードへ書く。ゲスト・役が分からない・観戦の用意が無いときは書かない
+    /// （人のクリップボードの中身を、配れないコードで替えない）。コードの文字は本ログへ書かない。見張りのスレッドで呼ぶ。
+    fn copy_spectate_code(&mut self) {
+        match self.slot.is_host() {
+            Some(true) => {}
+            Some(false) => {
+                self.log(
+                    "観戦コードを頼まれたが、この試合のゲストなのでコピーしない（ホストが配る）",
+                );
+                self.copy_event(Event::SpectateCodeHostOnly);
+                return;
+            }
+            None => {
+                self.log("観戦コードを頼まれたが、試合の役が分からないのでコピーしない");
+                self.copy_event(Event::SpectateCodeHostOnly);
+                return;
+            }
+        }
+        let Some(oneway) = self.oneway.as_ref() else {
+            self.log_problem(
+                "観戦コードを頼まれたが、観戦の用意が無い（[spectate] enable = 0 か、用意に失敗した）",
+            );
+            self.copy_event(Event::Internal);
+            return;
+        };
+        let text = match oneway.write(net_udp::now_unix()) {
+            Ok(t) => t,
+            Err(e) => {
+                self.log_problem(format!("観戦コードを作れない: {e:?}"));
+                self.copy_event(Event::Internal);
+                return;
+            }
+        };
+        let cands = oneway.candidates_len();
+        let written = match self.spectate_clip() {
+            Some(c) => c.write(&text),
+            None => Err("LAN の接続で、人のクリップボードを開けていない".to_string()),
+        };
+        match written {
+            Ok(()) => {
+                self.log(format!(
+                    "観戦コードをクリップボードへコピーした（{} 文字・候補 {cands} 件・期限 {}）",
+                    text.chars().count(),
+                    code::span_text(code::DEFAULT_TTL_SECS)
+                ));
+                self.copy_event(Event::SpectateCodeCopied);
+            }
+            Err(e) => {
+                self.log_problem(format!("観戦コードをクリップボードへコピーできない: {e}"));
+                self.copy_event(Event::SpectateCodeClipWrite);
+            }
+        }
+    }
+
+    /// 観戦コードの書き先。LAN の接続では `clip` がコードの運び先なので、人のクリップボード（`GameUi::spectate_clip`）へ書く
+    /// （LAN の観戦のほかに、観戦コードを人に渡して観戦してもらえる）。LAN で人のクリップボードを開けていなければ None。
+    fn spectate_clip(&mut self) -> Option<&mut dyn Clipboard> {
+        match (self.ui.spectate_clip.as_mut(), self.ui.lan.is_some()) {
+            (Some(c), _) => Some(c.as_mut()),
+            (None, false) => Some(self.ui.clip.as_mut()),
+            (None, true) => None,
+        }
+    }
+
+    /// つながった後の見回り: ネットワークが終わるか止められるまで、観戦コードの頼みだけを受ける。この間メニューは他の指示を出さない
+    /// （つながっている間は開かない）ので、他の指示は読み捨てて数を本ログに残す。
+    fn serve_linked(&mut self) {
+        let mut ignored = 0u32;
+        loop {
+            if self.shared.stop.load(std::sync::atomic::Ordering::Relaxed) || self.slot.is_done() {
+                break;
+            }
+            self.lan_tick();
+            while let Some(o) = self.ui.link.take_order() {
+                if o == Order::SpectateCopy {
+                    self.copy_spectate_code();
+                } else {
+                    ignored = ignored.saturating_add(1);
+                }
+            }
+            std::thread::sleep(GAME_POLL);
+        }
+        if ignored > 0 {
+            self.log(format!("つながった後に読み捨てた指示 {ignored}"));
         }
     }
 
     /// メニューで名前を決めていれば、以後に作る接続コード・ルームの HELLO はその名前で名乗る。名前は指示のリングバッファを通さず `UiLink` の入れ物に
-    /// 置かれるので、指示を 1 つ行う前にここで読み直す。まだ決めていなければ ini・覚えたファイルの名前のまま。名前を変えられるのは
+    /// 置かれるので、指示を 1 つ行う前にここで読み直す。まだ決めていなければ ini の名前のまま。名前を変えられるのは
     /// 何も待っていない間だけなので、待ちの途中で名乗る名前が替わることは無い。
     fn refresh_player_name(&mut self) {
         if let Some(n) = self.ui.link.player_name()
@@ -684,14 +896,14 @@ impl GameWatcher {
         self.event(Event::RoomNameBad);
     }
 
-    /// 前に使ったルーム名を覚える（置き場へ一時ファイル → 置き換え。名は本ログに書かない）。
+    /// 入ったルーム名を ini の `room` に書く（名は本ログに書かない）。
     fn remember_room(&self, name: &RoomBuf) {
-        let Some(dir) = self.ui.room_last_dir.as_deref() else {
+        let Some(path) = self.ui.ini_path.as_deref() else {
             return;
         };
-        match room_last::write(dir, name) {
-            Ok(()) => self.log("前に使ったルーム名を覚えた（名は記録しない）"),
-            Err(e) => self.log(format!("前に使ったルーム名を覚えられない: {e}")),
+        match ini_save::remember_room(path, name) {
+            Ok(_) => self.log("入ったルーム名を ini の room に書いた（名は記録しない）"),
+            Err(e) => self.log(format!("入ったルーム名を ini に書けない: {e}")),
         }
     }
 
@@ -796,7 +1008,7 @@ impl GameWatcher {
     // ---- ランダム対戦の経路 ----
     //
     // 待ち列（`room_queue`）に入り、組になったら割り当てられたルームへ入り直して、あとは名前つきのルームと同じ手順
-    // （offer / answer の受け渡し → セッションの設定）。割り当てられたルーム名は画面にもログにも出さず、前に使った名としても覚えず、
+    // （offer / answer の受け渡し → セッションの設定）。割り当てられたルーム名は画面にもログにも出さず、ini の `room` にも書かず、
     // 観戦用のルームの名の元にもしない。
 
     /// 「ランダム対戦」: 待ち列へ繋ぎ始める（待たない）。
@@ -1144,7 +1356,7 @@ impl GameWatcher {
             r.placed = true;
             r.side
         });
-        // 観戦用のルームの名の元（ルームの経路を終えた後も、つながったときに使う）。ランダム対戦は割り当てのルーム名（画面・ログ・覚えるファイルには出さない）。
+        // 観戦用のルームの名の元（ルームの経路を終えた後も、つながったときに使う）。ランダム対戦は割り当てのルーム名（画面・ログ・ini には出さない）。
         self.random_met = self.random_order.is_some();
         self.met_room = self.room.as_ref().map(|r| r.name);
         self.note.state = CodeState::RoomLinking;
@@ -1211,8 +1423,8 @@ impl GameWatcher {
 
     /// 使えるコードが `window` の間に届かなかったら、待ちをやめる（ネットワークは終えない。メニューからやり直せる）。
     fn check_window(&mut self) {
-        // ルームで待つ間はルームの期限（10 分。サーバーが 4408 で切り、core が予備の期限を持つ）に任せる。
-        if self.room.is_some() || self.queue.is_some() {
+        // ルームで待つ間はルームの期限（10 分。サーバーが 4408 で切り、core が予備の期限を持つ）に任せる。LAN は `lan_tick` が自分の上限で見る。
+        if self.room.is_some() || self.queue.is_some() || self.ui.lan.is_some() {
             return;
         }
         let Some(t) = self.started else {
@@ -1238,12 +1450,18 @@ impl GameWatcher {
     }
 
     fn run(&mut self) {
+        if let Some(b) = &self.ui.lan {
+            b.attach();
+        }
         loop {
             if self.shared.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 self.log("見張りを止めた");
                 return;
             }
             if self.slot.is_connected() {
+                if let Some(b) = &self.ui.lan {
+                    b.set_connected();
+                }
                 let shape = self.slot.shape();
                 self.say(&connected_say(self.slot.seat(), shape));
                 self.log(decided_shape_log(shape));
@@ -1252,6 +1470,7 @@ impl GameWatcher {
                 // 本ログへ知らせの結果を残す（音は鳴り終わるまで待つが、待つのはこのスレッドだけ）。
                 let n = (self.notify)();
                 self.log(n);
+                self.serve_linked();
                 return;
             }
             if self.slot.is_done() {
@@ -1266,6 +1485,7 @@ impl GameWatcher {
                 self.handle(o);
             }
             // ルームの運び（受信は別のスレッドが積む。ここは取り出して手順を進めるだけで、止まらない）。
+            self.lan_tick();
             self.queue_tick();
             self.room_tick();
             self.check_shape_late();
@@ -1358,13 +1578,14 @@ pub fn start_game(
         .candidates_for_upnp(local, mapped, v6, nat.upnp_port)
         .map_err(|e| format!("{e}{note}"))?;
     net.note_own_candidates(own_cands.as_slice());
-    // 観戦の配る側（`[spectate] enable = 1`）。観戦用のコードの候補は自分の受信ソケットと STUN で見えたアドレス。
-    // 用意できなくても対戦は開く（理由は note に足す）。
-    let (armed, spectate_note) = spectate_offer::arm(s, local, mapped, ui.room.clone());
+    // 観戦の配る側（`[spectate] enable = 1`）。観戦用のコードの候補は自分の受信ソケットと STUN で見えたアドレス（観戦コードは UPnP のポートも）。
+    // ルームサーバーが無くても観戦コードの経路のために用意する。用意できなくても対戦は開く（理由は note に足す）。
+    let (armed, spectate_note) =
+        spectate_offer::arm(s, local, mapped, nat.upnp_port, ui.room.clone());
     note.push_str(&spectate_note);
-    let (kit, parts) = match armed {
-        Some(a) => (Some(a.kit), Some(a.parts)),
-        None => (None, None),
+    let (kit, parts, oneway) = match armed {
+        Some(a) => (Some(a.kit), Some(a.parts), Some(a.oneway)),
+        None => (None, None, None),
     };
     let shared = Arc::new(Shared::new(CodeSide::Game, stun));
     let mut w = GameWatcher::new(
@@ -1382,6 +1603,9 @@ pub fn start_game(
     if let Some(k) = kit {
         w.set_spectate(k);
     }
+    if let Some(o) = oneway {
+        w.set_oneway(o);
+    }
     w.log(if w.ui.room.is_some() {
         "ゲーム内のメニューの見張りを起こした（対戦のルームマッチ・作る・貼るの指示を待つ。ファイルは使わない）"
     } else {
@@ -1390,8 +1614,13 @@ pub fn start_game(
     let join = std::thread::Builder::new()
         .name("higanr-code".into())
         .spawn(move || {
+            let lan = w.ui.lan.clone();
             // パニックは受けて外へ出さない。受けたら見張りをやめる（ネットワークは相手の沈黙か時間切れで終わる）。
             let _ = catch_unwind(AssertUnwindSafe(|| w.run()));
+            // 見張りが終わった（LAN の運び手はこれを見て務めを終える）。
+            if let Some(b) = lan {
+                b.close();
+            }
         })
         .map_err(|e| format!("接続コードの見張りのスレッドを起こせない: {e}"))?;
     Ok((Watch::from_parts(shared, join), note, parts))
@@ -1552,8 +1781,10 @@ mod tests {
                 link: Arc::clone(&link),
                 clip: Box::new(clip.clone()),
                 room,
-                room_last_dir: None,
+                ini_path: None,
                 spent: Vec::new(),
+                lan: None,
+                spectate_clip: None,
             },
         );
         Side {
@@ -1562,6 +1793,255 @@ mod tests {
             link,
             slot,
         }
+    }
+
+    /// LAN の接続の見張り（コードの受け渡し先が運び手との受け渡し `LanBridge`）。
+    struct LanSide {
+        w: GameWatcher,
+        bridge: Arc<LanBridge>,
+        link: Arc<UiLink>,
+        /// 人のクリップボード（観戦コードの書き先）。
+        human: FakeClipboard,
+    }
+
+    fn lan_side(name: &str, port: u16, nonce: u64) -> LanSide {
+        let bridge = LanBridge::new();
+        let link = Arc::new(UiLink::new());
+        let human = FakeClipboard::default();
+        let s = crate::net_config::from_text(&format!(
+            "[netplay]\nenable = 1\nscope = lan\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\nname = {name}\ndelay = 3\n[spectate]\nenable = 1\n"
+        ))
+        .unwrap()
+        .unwrap();
+        let w = GameWatcher::new(
+            &s,
+            nonce,
+            cands(port),
+            Arc::new(LinkSlot::new()),
+            Arc::new(Shared::new(
+                CodeSide::Game,
+                crate::trial_summary::Stun::NotUsed,
+            )),
+            T,
+            quiet_notify,
+            ModeCtx::none(),
+            GameUi {
+                link: Arc::clone(&link),
+                clip: Box::new(crate::lan_link::LanClip(Arc::clone(&bridge))),
+                room: None,
+                ini_path: None,
+                spent: Vec::new(),
+                lan: Some(Arc::clone(&bridge)),
+                spectate_clip: Some(Box::new(human.clone())),
+            },
+        );
+        LanSide {
+            w,
+            bridge,
+            link,
+            human,
+        }
+    }
+
+    fn lan_note(s: &LanSide) -> (CodeState, Event) {
+        let n = s.link.note().expect("状態が書かれていない");
+        (n.state, n.event)
+    }
+
+    /// 壊れたら落ちる: LAN の見張りが、作る・貼るの頼みを運び手から受けず、コードを運び手の入れ物へ渡さない、状態が LAN のものにならない
+    /// （「コピーしました」の文が出る、接続コードの待ちの状態のままになる）、返したコードが相手の見張りに読まれない。
+    #[test]
+    fn a_lan_watcher_trades_codes_through_the_bridge_and_never_says_copied() {
+        let mut a = lan_side("alice", 41_201, 0xF000);
+        let mut b = lan_side("bob", 41_202, 0x0F00);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        let offer = a
+            .bridge
+            .take_outgoing()
+            .expect("始める側のコードが渡らない");
+        assert!(code::read_initiator(&offer, net_udp::now_unix()).is_ok());
+        assert_eq!(lan_note(&a), (CodeState::LanLinking, Event::LanPeer));
+        b.bridge.set_incoming(&offer);
+        b.bridge.post_cmd(BridgeCmd::Paste);
+        b.w.lan_tick();
+        let reply = b.bridge.take_outgoing().expect("返すコードが渡らない");
+        assert_ne!(reply, offer);
+        let nb = b.link.note().unwrap();
+        assert_eq!(
+            (nb.state, nb.event),
+            (CodeState::LanLinking, Event::LanPeer)
+        );
+        assert_eq!(nb.name[0], u16::from(b'a'), "相手の名前が札に載る");
+        a.bridge.set_incoming(&reply);
+        a.bridge.post_cmd(BridgeCmd::Paste);
+        a.w.lan_tick();
+        let na = a.link.note().unwrap();
+        assert_eq!(
+            (na.state, na.event),
+            (CodeState::LanLinking, Event::LanPeer)
+        );
+        assert_eq!(na.name[0], u16::from(b'b'));
+        assert!(a.w.slot.generation() > 0, "セッションの設定を置いていない");
+        assert!(!a.bridge.is_aborted() && !b.bridge.is_aborted());
+    }
+
+    /// 壊れたら落ちる: 取りやめが運び手に届かない（運び手が務めを続ける）、取りやめの札が LAN の文にならない。
+    #[test]
+    fn cancelling_a_lan_wait_aborts_the_carrier_and_clears_the_menu() {
+        let mut a = lan_side("alice", 41_203, 0xF000);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        a.w.handle(Order::Cancel);
+        assert_eq!(lan_note(&a), (CodeState::Idle, Event::LanCancelled));
+        assert!(a.bridge.is_aborted());
+    }
+
+    /// 壊れたら落ちる: 運び手が決めた失敗（時間切れ）を画面へ出して待ちをやめない、断られた貼り付けで運び手が止まらない。
+    #[test]
+    fn a_failure_from_the_carrier_or_a_refused_code_ends_the_lan_wait() {
+        let mut a = lan_side("alice", 41_204, 0xF000);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        let _ = a.bridge.take_outgoing();
+        a.bridge.fail(Event::LanNoLink);
+        // 失敗と同じ周に届いた頼みは動かさない（失敗の画面を作り直さない）。
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        assert_eq!(lan_note(&a), (CodeState::Idle, Event::LanNoLink));
+        assert!(a.bridge.is_aborted());
+        assert!(
+            a.bridge.take_outgoing().is_none(),
+            "失敗の後にコードを作った"
+        );
+        // 読めないコード（短すぎる）を渡された。
+        let mut b = lan_side("bob", 41_205, 0x0F00);
+        b.bridge.set_incoming("short");
+        b.bridge.post_cmd(BridgeCmd::Paste);
+        b.w.lan_tick();
+        assert_eq!(lan_note(&b), (CodeState::Idle, Event::Short));
+        assert!(b.bridge.is_aborted());
+        // 別のバージョンのコード。
+        let mut c = lan_side("carol", 41_206, 0xF000);
+        c.bridge.post_cmd(BridgeCmd::Create);
+        c.w.lan_tick();
+        let mut bytes = c.bridge.take_outgoing().unwrap().into_bytes();
+        bytes[0] = bytes[0].wrapping_add(1);
+        let mut d = lan_side("dave", 41_207, 0x0F00);
+        d.bridge.set_incoming(&String::from_utf8_lossy(&bytes));
+        d.bridge.post_cmd(BridgeCmd::Paste);
+        d.w.lan_tick();
+        assert!(d.bridge.is_aborted(), "{:?}", lan_note(&d));
+        assert_eq!(lan_note(&d).0, CodeState::Idle);
+    }
+
+    /// 壊れたら落ちる: コードを受け渡した後、成立しないまま上限が過ぎても待ちが続く。成立していれば上限で切らない。
+    #[test]
+    fn a_lan_link_that_never_forms_gives_up_with_no_link() {
+        let mut a = lan_side("alice", 41_208, 0xF000);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        // コードを作っただけでは数えない（返すコードを待つ長さは運び手が決め、返らなければ待機へ戻して作り直させる）。
+        assert!(
+            a.w.lan_started.is_none(),
+            "コードを作っただけで時計を始めた"
+        );
+        a.w.lan_started = Some(Instant::now() - LAN_LINK_LIMIT - Duration::from_secs(1));
+        a.w.lan_tick();
+        assert_eq!(lan_note(&a), (CodeState::Idle, Event::LanNoLink));
+        assert!(a.bridge.is_aborted());
+        let mut b = lan_side("bob", 41_209, 0x0F00);
+        b.bridge.post_cmd(BridgeCmd::Create);
+        b.w.lan_tick();
+        b.w.lan_started = Some(Instant::now() - Duration::from_secs(5));
+        b.w.lan_tick();
+        assert_eq!(lan_note(&b).0, CodeState::LanLinking, "上限の前は待つ");
+        // コードの待ちの上限（30 分）は LAN には使わない（「待機をやめました（30 分たちました）」が出ない）。
+        b.w.started = Some(Instant::now() - Duration::from_secs(3_600));
+        b.w.check_window();
+        assert_eq!(lan_note(&b), (CodeState::LanLinking, Event::LanPeer));
+        assert!(!b.bridge.is_aborted());
+        // 成立している接続は、上限を過ぎても切らない。
+        let mut c = lan_side("carol", 41_211, 0xF000);
+        c.bridge.post_cmd(BridgeCmd::Create);
+        c.w.lan_tick();
+        c.w.slot.mark_connected(Seat::P1, Mode::Delay, 2);
+        c.w.lan_started = Some(Instant::now() - LAN_LINK_LIMIT - Duration::from_secs(1));
+        c.w.lan_tick();
+        assert!(!c.bridge.is_aborted(), "成立した接続を上限で切った");
+        assert_ne!(lan_note(&c).1, Event::LanNoLink);
+    }
+
+    /// 壊れたら落ちる: LAN の接続の Ctrl+C の観戦コードが人のクリップボードへ書かれない（運び手へ渡って捨てられるのに「コピーしました」と出る）、
+    /// 観戦の用意が無い・コピーできないときの Ctrl+C で運び手が止まる（以後その試合の LAN の観戦を受けない）・待ちの状態が「何も無い」になる。
+    #[test]
+    fn a_lan_host_copies_the_watch_code_to_the_human_clipboard_and_keeps_the_carrier() {
+        use higanr_core::lockstep::Role;
+        let mut a = lan_side("alice", 41_212, 0xF000);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        let _ = a.bridge.take_outgoing();
+        a.w.slot.mark_role(Role::Host);
+        a.w.slot.mark_connected(Seat::P1, Mode::Delay, 2);
+        a.w.copy_spectate_code();
+        let (state, ev) = lan_note(&a);
+        assert_eq!(ev, Event::Internal, "観戦の用意が無い");
+        assert_eq!(state, CodeState::LanLinking, "待ちの状態を消した");
+        assert!(!a.bridge.is_aborted(), "観戦コードの失敗で運び手を止めた");
+        let armed = arm_with(
+            &a.w.s,
+            "127.0.0.1:41212".parse().unwrap(),
+            None,
+            None,
+            None,
+            || Ok(0x5EED_0C03),
+            || Ok(Secret([0x33; 16])),
+        )
+        .unwrap();
+        a.w.set_oneway(armed.oneway);
+        a.w.copy_spectate_code();
+        assert_eq!(lan_note(&a).1, Event::SpectateCodeCopied);
+        let w = a.human.writes();
+        assert_eq!(w.len(), 1, "人のクリップボードへ書いていない");
+        assert!(code::read_spectate(&w[0], net_udp::now_unix()).is_ok());
+        assert!(
+            a.bridge.take_outgoing().is_none(),
+            "観戦コードを運び手へ渡した"
+        );
+        a.human.0.lock().unwrap().fail_write = true;
+        a.w.copy_spectate_code();
+        assert_eq!(lan_note(&a).1, Event::SpectateCodeClipWrite);
+        assert!(!a.bridge.is_aborted());
+    }
+
+    /// 壊れたら落ちる: 運び手が札を書いた後（ホストが待機へ戻った）に、見張りが同じ数の札を書く（メニューが変化を見落とし、取りやめの文が出ない）。
+    #[test]
+    fn the_watcher_counts_on_from_the_note_the_carrier_wrote() {
+        let mut a = lan_side("alice", 41_213, 0xF000);
+        a.bridge.post_cmd(BridgeCmd::Create);
+        a.w.lan_tick();
+        let mine = a.link.note().unwrap().seq;
+        a.link.publish(&Note {
+            seq: mine.wrapping_add(1),
+            state: CodeState::LanWaiting,
+            ..Note::default()
+        });
+        a.w.handle(Order::Cancel);
+        let n = a.link.note().unwrap();
+        assert_eq!(n.seq, mine.wrapping_add(2));
+        assert_eq!((n.state, n.event), (CodeState::Idle, Event::LanCancelled));
+    }
+
+    /// 壊れたら落ちる: 対戦の成立の前（試合の役が決まっていない）の観戦コードの頼みに観戦コードを答える、答えない（運び手が待ち続ける）。
+    #[test]
+    fn a_watch_code_request_before_the_match_is_refused_through_the_bridge() {
+        let mut a = lan_side("alice", 41_210, 0xF000);
+        let src: std::net::SocketAddrV4 = "127.0.0.1:50000".parse().unwrap();
+        a.bridge.post_cmd(BridgeCmd::WatchCode { src, id: 7 });
+        a.w.lan_tick();
+        let (s, id, answer) = a.bridge.take_watch_answer().expect("答えが無い");
+        assert_eq!((s, id), (src, 7));
+        assert_eq!(answer, Err(higanr_core::lan_proto::Why::WatchOff));
     }
 
     fn quiet_notify() -> String {
@@ -2255,8 +2735,7 @@ mod tests {
         );
         let last_dir =
             std::env::temp_dir().join(format!("higanr_room_meet_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&last_dir);
-        a.w.ui.room_last_dir = Some(last_dir.clone());
+        a.w.ui.ini_path = Some(ini_in(&last_dir));
         let b_clip = "  unrelated clipboard text\r\n";
         b.clip.set(b_clip);
         choose(&mut a, "Synth-Room-7");
@@ -2278,9 +2757,9 @@ mod tests {
         let waited = (net_udp::now_unix() as u32).wrapping_sub(n.since);
         assert!(waited <= 10, "待ち始めた時刻が今でない（{waited} 秒前）");
         assert_eq!(
-            room_last::read(&last_dir),
+            room_of(&last_dir),
             RoomBuf::from_name("Synth-Room-7"),
-            "決めた名を覚えていない"
+            "決めた名を ini に書いていない"
         );
         let shown: String = n
             .room
@@ -2545,8 +3024,7 @@ mod tests {
         );
         let last_dir =
             std::env::temp_dir().join(format!("higanr_room_rename_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&last_dir);
-        a.w.ui.room_last_dir = Some(last_dir.clone());
+        a.w.ui.ini_path = Some(ini_in(&last_dir));
         choose(&mut a, "name-x");
         pump(&mut [&mut a], 5, |_| offers() == 1);
         let gen_first = a.w.room_gen;
@@ -2564,9 +3042,9 @@ mod tests {
         );
         pump(&mut [&mut a], 5, |_| offers() == 2);
         assert_eq!(
-            room_last::read(&last_dir),
+            room_of(&last_dir),
             RoomBuf::from_name("name-y"),
-            "新しい名を覚えていない"
+            "新しい名を ini に書いていない"
         );
         let paths = srv.seen.paths.lock().unwrap().clone();
         assert!(paths.contains(&"/v0/rooms/name-x".to_string()), "{paths:?}");
@@ -2746,8 +3224,10 @@ mod tests {
                     link: Arc::clone(link),
                     clip: Box::new(clip.clone()),
                     room: Some(room_opts(&base)),
-                    room_last_dir: None,
+                    ini_path: None,
                     spent: Vec::new(),
+                    lan: None,
+                    spectate_clip: None,
                 },
             )
             .map(|(w, _, parts)| (w, parts))
@@ -2998,6 +3478,23 @@ mod tests {
         s.link.note().map_or(CodeState::Idle, |n| n.state)
     }
 
+    const INI_TEXT: &str = "[netplay]\nenable = 1\n";
+
+    /// `dir` を作り直し、中に ini を置く（ルーム名を書き戻す先）。
+    fn ini_in(dir: &std::path::Path) -> PathBuf {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("HiganRTool.ini");
+        std::fs::write(&p, INI_TEXT).unwrap();
+        p
+    }
+
+    /// `ini_in` で置いた ini の `room`。
+    fn room_of(dir: &std::path::Path) -> Option<RoomBuf> {
+        higanr_core::ini_store::get(&dir.join("HiganRTool.ini"), "netplay", "room")
+            .and_then(|v| RoomBuf::from_name(&v))
+    }
+
     fn shown_room(n: &Note) -> String {
         n.room
             .iter()
@@ -3033,8 +3530,7 @@ mod tests {
         let base = "ws://127.0.0.1:9";
         let mut a = random_side("alice", 41_142, 0xF000, base, 7);
         let dir = std::env::temp_dir().join(format!("higanr_random_last_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        a.w.ui.room_last_dir = Some(dir.clone());
+        a.w.ui.ini_path = Some(ini_in(&dir));
         pick_random(&mut a);
         let n = a.link.note().unwrap();
         assert_eq!(
@@ -3046,9 +3542,9 @@ mod tests {
         assert!(a.w.queue.is_some() && a.w.room.is_none());
         assert_eq!(a.w.random_order, Some(Arrival::Unknown));
         assert_eq!(
-            room_last::read(&dir),
+            room_of(&dir),
             None,
-            "ランダム対戦は前に使った名を覚えない"
+            "ランダム対戦はルーム名を ini に書かない"
         );
         // 待っている間にもう一度選ぶ: 読み捨てる（待ち列の順を手放さない）。
         let gen_before = a.w.room_gen;
@@ -3061,7 +3557,7 @@ mod tests {
         assert!(a.w.queue.is_none() && a.w.room.is_some());
         assert!(!n.random && a.w.random_order.is_none());
         assert_eq!(shown_room(&n), "named-room");
-        assert_eq!(room_last::read(&dir), RoomBuf::from_name("named-room"));
+        assert_eq!(room_of(&dir), RoomBuf::from_name("named-room"));
         // ランダム対戦へ戻る: 名前つきのルームをやめ、ルーム名の欄を空にする。
         pick_random(&mut a);
         let n = a.link.note().unwrap();
@@ -3237,9 +3733,9 @@ mod tests {
         let mut a = random_side("alice", 41_151, 0xF000, &base, 7);
         let mut b = random_side("bob", 41_152, 0x0F00, &base, 7);
         let dir = std::env::temp_dir().join(format!("higanr_random_seats_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        a.w.ui.room_last_dir = Some(dir.clone());
-        b.w.ui.room_last_dir = Some(dir.clone());
+        let ini = ini_in(&dir);
+        a.w.ui.ini_path = Some(ini.clone());
+        b.w.ui.ini_path = Some(ini.clone());
         pick_random(&mut a);
         queued(&srv, &mut a, 1);
         assert!(lock_assigned(&srv).is_empty(), "1 人では組にならない");
@@ -3289,8 +3785,12 @@ mod tests {
             );
             assert!(!log.contains(&assigned[0][2..]), "{log}");
         }
-        assert_eq!(room_last::read(&dir), None, "割り当てたルーム名を覚えた");
-        assert!(!dir.exists(), "ランダム対戦が覚えるファイルを作った");
+        assert_eq!(room_of(&dir), None, "割り当てたルーム名を ini に書いた");
+        assert_eq!(
+            std::fs::read_to_string(&ini).unwrap(),
+            INI_TEXT,
+            "ランダム対戦が ini を書き換えた"
+        );
         let paths = srv.seen.paths.lock().unwrap().clone();
         assert_eq!(
             paths.iter().filter(|p| *p == "/v0/random/7").count(),
@@ -3483,8 +3983,10 @@ mod tests {
                     link: Arc::clone(&self.link),
                     clip: Box::new(self.clip.clone()),
                     room: None,
-                    room_last_dir: None,
+                    ini_path: None,
                     spent: self.spent.clone(),
+                    lan: None,
+                    spectate_clip: None,
                 },
             )
             .expect("ネットワークの組を開けない");
@@ -3614,6 +4116,214 @@ mod tests {
         (ga.recs, gb.recs, session)
     }
 
+    /// LAN の運び手（`lan_link`）が申し込みを運び、見張りがコードを受け渡して、2 台が loopback でつながり最後まで遊べる。成立した後は観戦の申し込みに
+    /// ホストの見張りが観戦コードを返し、読める観戦コードである。ネットワークの設定（範囲 lan で開く・STUN なし）とコードの運び先（運び手へ運び、
+    /// 人のクリップボードへは観戦コードだけ）は、この検査では自分で組んで渡している。製品の組み立て（`lan_net_settings`・`code_clips`）は
+    /// `script_win::lan_tests` が見る。
+    #[test]
+    #[ignore = "運び手・見張りのスレッドと本物の UDP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+    fn two_games_meet_through_the_lan_carrier_and_play_over_loopback() {
+        use crate::lan_link::{End, LanClip, LanEnv, LanRole, run_client, run_host, run_watch};
+        use crate::netplay::fake::{FRAME_US, FakeGame};
+        use higanr_core::lan_addr::LanAddr;
+        use higanr_core::lan_proto::Ver;
+        use higanr_core::net_menu::Conn;
+        use higanr_core::wire::ByeReason;
+        use std::net::Ipv4Addr;
+        use std::sync::Mutex;
+
+        let _j = crate::spectate_join::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let settings = |name: &str| {
+            crate::net_config::from_text(&format!(
+                "[netplay]\nenable = 1\nscope = lan\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\nname = {name}\ndelay = 3\n[spectate]\nenable = 1\n"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let link_h = Arc::new(UiLink::new());
+        let link_c = Arc::new(UiLink::new());
+        let opened_h: Arc<Mutex<Option<Opened>>> = Arc::new(Mutex::new(None));
+        let opened_c: Arc<Mutex<Option<Opened>>> = Arc::new(Mutex::new(None));
+        let watch_got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ver = Ver {
+            proto: higanr_core::wire::PROTO_VER,
+            build: BUILD_NUMBER,
+        };
+        let env = |link: &Arc<UiLink>,
+                   opened: &Arc<Mutex<Option<Opened>>>,
+                   name: &'static str,
+                   port: u16,
+                   id: u32| {
+            let (link2, opened2) = (Arc::clone(link), Arc::clone(opened));
+            let got = Arc::clone(&watch_got);
+            LanEnv {
+                link: Arc::clone(link),
+                ver,
+                watch_ok: true,
+                port,
+                reply_wait_ms: higanr_core::lan_proto::HOST_WAIT_REPLY_MS,
+                addresses: Box::new(|| Ok(vec![Ipv4Addr::LOCALHOST])),
+                net_free: Box::new(|| true),
+                open_net: Box::new(move |ip, role, bridge| {
+                    assert_eq!(ip, Ipv4Addr::LOCALHOST);
+                    let cfg = crate::netplay::Config {
+                        check: crate::netplay::CheckSource::InputDigest,
+                        wait_budget_us: crate::netplay::WAIT_BUDGET_US,
+                        match_gate: true,
+                        ..crate::netplay::Config::default()
+                    };
+                    // ホストの役割の乱数は大きい（いつも試合のホスト）。
+                    let nonce = match role {
+                        LanRole::Host => (1u64 << 63) | 0xF000,
+                        LanRole::Client => 0x0F00,
+                    };
+                    let o = open_set(
+                        &settings(name),
+                        cfg,
+                        nonce,
+                        T,
+                        quiet_notify,
+                        ModeCtx::none(),
+                        GameUi {
+                            link: Arc::clone(&link2),
+                            clip: Box::new(LanClip(Arc::clone(&bridge))),
+                            room: None,
+                            ini_path: None,
+                            spent: Vec::new(),
+                            lan: Some(bridge),
+                            spectate_clip: None,
+                        },
+                    )?;
+                    *opened2.lock().unwrap() = Some(o);
+                    Ok(())
+                }),
+                start_watch: Box::new(move |code, _| {
+                    got.lock().unwrap().push(code);
+                    Ok(())
+                }),
+                id,
+                unix: net_udp::now_unix,
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        };
+        let port = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap().port()
+        };
+        let host_env = env(&link_h, &opened_h, "alice", port, 0);
+        let host_stop = Arc::clone(&host_env.stop);
+        let host = std::thread::spawn(move || run_host(&host_env));
+        let t0 = Instant::now();
+        while link_h.note().map(|n| n.state) != Some(CodeState::LanWaiting) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "待機の状態にならない"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let addr = LanAddr {
+            ip: Ipv4Addr::LOCALHOST,
+            port,
+        };
+        let client_env = env(&link_c, &opened_c, "bob", 0, 4242);
+        let client = std::thread::spawn(move || run_client(&client_env, addr));
+        // 両方のネットワークが開いて、コードが渡り、2 台が READY を出せるまで回す。
+        let (mut ga, mut gb) = (FakeGame::new(0xA1, 90, 1, 1), FakeGame::new(0xB1, 90, 1, 1));
+        ga.menu_before_decide = 20;
+        gb.menu_before_decide = 20;
+        let mut closed_b = false;
+        // 成立してから数えるフレーム（見張りが成立を運び手へ知らせるのは、セッションの次の周回）。`None` はまだ成立していない。
+        let mut linked_frames: Option<u32> = None;
+        let mut asked = false;
+        let mut next = Instant::now();
+        let t0 = Instant::now();
+        loop {
+            let mut ha = opened_h.lock().unwrap();
+            let mut hb = opened_c.lock().unwrap();
+            if let (Some(a), Some(b)) = (ha.as_mut(), hb.as_mut()) {
+                for (o, g) in [(&mut *a, &mut ga), (&mut *b, &mut gb)] {
+                    if matches!(o.np.ui_conn(0).0, Conn::Found { ready: false, .. }) {
+                        o.np.set_ready(&mut o.net);
+                    }
+                    g.do_frame(&mut o.np, &mut o.net);
+                }
+                if gb.done && !closed_b {
+                    b.np.close(ByeReason::Finished);
+                    closed_b = true;
+                }
+                if ga.done && gb.done {
+                    break;
+                }
+                // 成立した後（試合の途中）に観戦の申し込み。
+                if linked_frames.is_none()
+                    && a.np.connected().is_some()
+                    && b.np.connected().is_some()
+                {
+                    linked_frames = Some(0);
+                }
+                if let Some(n) = linked_frames.as_mut() {
+                    *n += 1;
+                    asked = asked || *n >= 20;
+                }
+            }
+            drop((ha, hb));
+            if asked && watch_got.lock().unwrap().is_empty() {
+                let w = env(
+                    &Arc::new(UiLink::new()),
+                    &Arc::new(Mutex::new(None)),
+                    "carol",
+                    0,
+                    99,
+                );
+                // 成立の印が運び手に届くまでの短い間は「まだ」と断られる。届いたら観戦コードが返る。
+                let until = Instant::now() + Duration::from_secs(3);
+                let end = loop {
+                    let end = run_watch(&w, addr);
+                    if end != End::Failed(Event::LanNoMatch) || Instant::now() > until {
+                        break end;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                assert_eq!(end, End::Done, "観戦の申し込み");
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(40),
+                "試合が終わらない: {:?} / {:?}",
+                link_h.note(),
+                link_c.note()
+            );
+            next += Duration::from_micros(FRAME_US);
+            if let Some(d) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+        }
+        assert_eq!(client.join().unwrap(), End::Done);
+        assert_eq!(ga.recs.len(), 90, "試合が最後まで進まない");
+        assert_eq!(ga.recs, gb.recs, "両者の列が違う");
+        // 観戦コードは読める観戦コード（種別 3）で、ホストの見張りが答えた。
+        let codes = watch_got.lock().unwrap().clone();
+        assert_eq!(codes.len(), 1, "観戦コードを受けていない");
+        let sv = settings("carol");
+        let mut reader = crate::spectate_watch_code::Reader::new(&sv, 0x77);
+        let step = reader.on_peer_file(Some(codes[0].as_bytes()), net_udp::now_unix());
+        assert!(
+            matches!(step, crate::spectate_watch_code::Step::Ready(..)),
+            "{step:?}"
+        );
+        // 観戦コードは運び手の頼みにホストの見張りが答えたもの（本ログで確かめる）。
+        let notes = opened_h.lock().unwrap().as_ref().unwrap().watch.notes();
+        assert!(
+            notes
+                .iter()
+                .any(|l| l.contains("観戦の申し込みに観戦コードを答えた")),
+            "{notes:?}"
+        );
+        host_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(host.join().unwrap(), End::Stopped | End::Done));
+    }
+
     #[test]
     #[ignore = "見張りのスレッド・本物の UDP（loopback）で実時間に回す（2 回のつながりと片づけの待ちで十数秒）。全件の回（build.bat）で --ignored で走る"]
     fn two_games_play_part_and_connect_again_with_new_codes_over_loopback() {
@@ -3684,6 +4394,7 @@ mod tests {
             &s.w.s,
             "127.0.0.1:41131".parse().unwrap(),
             None,
+            None,
             Some(room_opts("ws://127.0.0.1:9")),
             || Ok(0x5EED_0C01),
             || Ok(Secret([0x31; 16])),
@@ -3704,6 +4415,100 @@ mod tests {
         }
         s.slot.mark_may_list(may_list);
         s.slot.mark_connected(Seat::P1, Mode::Delay, 2);
+    }
+
+    /// 「観戦コードをコピー」: ホストだけが書き、書くたびに新しい期限のコードになる。ゲスト・役が分からない・つながる前・観戦の用意が無い・
+    /// クリップボードへ書けないは、それぞれの出来事で答えてクリップボードを替えない。
+    #[test]
+    fn only_the_host_copies_a_fresh_watch_code() {
+        use higanr_core::lockstep::Role;
+        let (mut s, a) = spectate_side(0xF000);
+        s.w.set_oneway(a.oneway);
+        // つながる前の頼みは読み捨てる（役が決まっていない）。
+        s.w.handle(Order::SpectateCopy);
+        assert!(s.clip.writes().is_empty());
+        assert!(
+            log_of(&s).contains("つながる前に観戦コード"),
+            "{}",
+            log_of(&s)
+        );
+        mark(&s, Some(Role::Host));
+        s.w.copy_spectate_code();
+        assert_eq!(last_event(&s), Event::SpectateCodeCopied);
+        let first = s.clip.writes().last().cloned().expect("書いていない");
+        let now = net_udp::now_unix();
+        let c = code::read_spectate(&first, now).expect("観戦コードとして読めない");
+        assert_eq!(
+            c.code.session_id, 0x5EED_0C01,
+            "配る側と同じ観戦のホストの session"
+        );
+        assert_eq!(c.code.secret, Some(Secret([0x31; 16])));
+        assert!(
+            c.code.expires >= now + code::DEFAULT_TTL_SECS - 5
+                && c.code.expires <= now + code::DEFAULT_TTL_SECS + 5,
+            "期限は書いた時刻から 30 分: {}",
+            c.code.expires
+        );
+        assert!(
+            code::read_initiator(&first, now).is_err(),
+            "対戦のコードとして読めた"
+        );
+        assert!(!log_of(&s).contains(&first[..40]), "本ログに観戦コード");
+        let ga = |s: &Side| s.clip.writes().len();
+        let before = ga(&s);
+        s.clip.0.lock().unwrap().fail_write = true;
+        s.w.copy_spectate_code();
+        assert_eq!(last_event(&s), Event::SpectateCodeClipWrite);
+        assert_eq!(ga(&s), before);
+        // ゲスト・役が分からない: 書かない。
+        for role in [Some(Role::Guest), None] {
+            let (mut g, a) = spectate_side(0x0F00);
+            g.w.set_oneway(a.oneway);
+            mark(&g, role);
+            g.w.copy_spectate_code();
+            assert_eq!(last_event(&g), Event::SpectateCodeHostOnly, "{role:?}");
+            assert!(g.clip.writes().is_empty(), "{role:?}");
+        }
+        // 観戦の用意が無いホスト（`[spectate] enable = 0`）: 書かない。
+        let mut h = side("alice", 41_133, 0xF000, T);
+        mark(&h, Some(Role::Host));
+        h.w.copy_spectate_code();
+        assert_eq!(last_event(&h), Event::Internal);
+        assert!(h.clip.writes().is_empty());
+    }
+
+    /// 観戦コードの候補は、観戦用のルームへ預けるコードの候補に UPnP で開けたポートを足したもの（IPv6 は載せない）。
+    #[test]
+    fn the_watch_code_carries_the_upnp_port_and_no_ipv6() {
+        use higanr_core::lockstep::Role;
+        let (mut s, _) = spectate_side(0xF000);
+        let mapped: std::net::SocketAddr = "203.0.113.9:50000".parse().unwrap();
+        let a = arm_with(
+            &s.w.s,
+            "127.0.0.1:41131".parse().unwrap(),
+            Some(mapped),
+            Some(51_000),
+            None,
+            || Ok(0x5EED_0C02),
+            || Ok(Secret([0x32; 16])),
+        )
+        .unwrap();
+        s.w.set_oneway(a.oneway);
+        mark(&s, Some(Role::Host));
+        s.w.copy_spectate_code();
+        let text = s.clip.writes().last().cloned().expect("書いていない");
+        let c = code::read_spectate(&text, net_udp::now_unix()).unwrap();
+        let addrs: Vec<std::net::SocketAddr> = c
+            .code
+            .candidates
+            .as_slice()
+            .iter()
+            .map(|x| x.addr)
+            .collect();
+        let upnp: std::net::SocketAddr = "203.0.113.9:51000".parse().unwrap();
+        assert!(addrs.contains(&upnp), "UPnP のポートが無い: {addrs:?}");
+        assert!(addrs.contains(&mapped), "{addrs:?}");
+        assert!(addrs.iter().all(|x| x.is_ipv4()), "{addrs:?}");
     }
 
     #[test]
@@ -3805,8 +4610,10 @@ mod tests {
                     link: Arc::clone(link),
                     clip: Box::new(FakeClipboard::default()),
                     room: Some(room_opts(&base)),
-                    room_last_dir: None,
+                    ini_path: None,
                     spent: Vec::new(),
+                    lan: None,
+                    spectate_clip: None,
                 },
             )
             .expect("ネットワークの組を開けない")
@@ -4067,8 +4874,10 @@ mod tests {
                     link: Arc::clone(link),
                     clip: Box::new(FakeClipboard::default()),
                     room: Some(room_opts(&base)),
-                    room_last_dir: None,
+                    ini_path: None,
                     spent: Vec::new(),
+                    lan: None,
+                    spectate_clip: None,
                 },
             )
             .expect("ネットワークの組を開けない")
@@ -4100,8 +4909,10 @@ mod tests {
         // 最初の状態（開くスレッドが書く `SpectateJoining`）。見張りを起こす前に控える。
         let first_note = link_w.note().map(|n| (n.state, n.event));
         let kit = move |watch_room: RoomName| JoinKit {
-            room: room_opts(&base),
-            watch_room,
+            source: crate::spectate_join::JoinSource::Room {
+                room: room_opts(&base),
+                watch_room,
+            },
             reader: crate::spectate_watch_code::Reader::new(&sv, 0x77),
             reply_name: higanr_core::handshake::Name::new("viewer"),
             own: Candidates::from_addrs(&[viewer_addr]).unwrap(),
@@ -4404,6 +5215,310 @@ mod tests {
         assert!(!low.contains(&w.assigned[0]), "{}", w.logs);
         assert!(!low.contains(&w.assigned[0][2..]), "{}", w.logs);
         assert!(!low.contains(q.spectate_of().as_str()), "{}", w.logs);
+    }
+
+    /// 観戦コードの組み上がり: ルームサーバーの無い設定（オフラインの LAN の会場）で、対戦者 2 台が接続コード（コード作成・コード入力）で繋がり、
+    /// つながった後に両者が「観戦コードをコピー」を頼む。ホストだけがクリップボードへ観戦コードを書き、観戦者（偽のゲーム ＋ 本物の
+    /// `WatchPlay` ＋ 観戦者のスレッドの観戦コードの経路）はそのコードだけでホストへ繋ぎ、最初のキャラ選択から最後まで対戦者と同じ列を受ける。
+    #[test]
+    #[ignore = "見張りのスレッド・本物の UDP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+    fn a_spectator_follows_a_code_match_with_only_the_hosts_watch_code() {
+        use crate::netplay::fake::{FRAME_US, FakeGame};
+        use crate::netplay::{self, CheckSource, Phase, WAIT_BUDGET_US};
+        use crate::spectate_join::{JoinKit, JoinSource, Publisher};
+        use crate::spectate_watch::{WATCH_MARGIN_FRAMES, WatchConfig, WatchPlay, WatchSlot};
+        use higanr_core::wire::ByeReason;
+
+        let _j = crate::spectate_join::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::spectate_join::tests::reset_globals();
+        let mk = |name: &str, extra: &str| {
+            crate::net_config::from_text(&format!(
+                "[netplay]\nenable = 1\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\nname = {name}\ndelay = 3\n{extra}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let (sa, sb) = (
+            mk("alice", "[spectate]\nenable = 1\n"),
+            mk("bob", "[spectate]\nenable = 1\n"),
+        );
+        let sv = mk("viewer", "");
+        let cfg = netplay::Config {
+            check: CheckSource::InputDigest,
+            wait_budget_us: WAIT_BUDGET_US,
+            ..netplay::Config::default()
+        };
+        let (link_a, link_b, link_w) = (
+            Arc::new(UiLink::new()),
+            Arc::new(UiLink::new()),
+            Arc::new(UiLink::new()),
+        );
+        let (clip_a, clip_b) = (FakeClipboard::default(), FakeClipboard::default());
+        let open = |s: &NetSettings, nonce: u64, link: &Arc<UiLink>, clip: &FakeClipboard| {
+            open_set(
+                s,
+                cfg,
+                nonce,
+                T,
+                quiet_notify,
+                ModeCtx::none(),
+                GameUi {
+                    link: Arc::clone(link),
+                    clip: Box::new(clip.clone()),
+                    room: None,
+                    ini_path: None,
+                    spent: Vec::new(),
+                    lan: None,
+                    spectate_clip: None,
+                },
+            )
+            .expect("ネットワークの組を開けない")
+        };
+        let mut oa = open(&sa, 0xF000, &link_a, &clip_a);
+        let mut ob = open(&sb, 0x0F00, &link_b, &clip_b);
+        let wait_write = |clip: &FakeClipboard, n: usize| {
+            let t0 = Instant::now();
+            while clip.writes().len() < n {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(5),
+                    "クリップボードへ書かれない"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            clip.writes()[n - 1].clone()
+        };
+        // 接続コードの往復（ルームサーバーは使わない）。
+        link_a.send(Cmd::Create);
+        let offer = wait_write(&clip_a, 1);
+        clip_b.set(&offer);
+        link_b.send(Cmd::Paste);
+        let reply = wait_write(&clip_b, 1);
+        clip_a.set(&reply);
+        link_a.send(Cmd::Paste);
+
+        let (mut wnet, wrecv) = net_udp::open_for_code(sv.bind.fixed().unwrap()).unwrap();
+        let viewer_addr = wnet.local_addr().unwrap();
+        let slot = Arc::new(WatchSlot::new());
+        let mut wp = WatchPlay::new(
+            Arc::clone(&slot),
+            WatchConfig {
+                wait_budget_us: WAIT_BUDGET_US,
+                margin_frames: WATCH_MARGIN_FRAMES,
+                require_net_selection: false,
+            },
+        );
+        let glyphs = ui_glyphs();
+        let mut publisher = Publisher::new(
+            Arc::clone(&link_w),
+            sanitize_room("", |c| glyphs.binary_search(&c).is_ok()),
+            net_udp::now_unix() as u32,
+        );
+        publisher.publish(CodeState::SpectateJoining, Event::None);
+        let mut kit_parts = Some((slot, publisher));
+
+        const FRAMES: u32 = 420;
+        let mut ga = FakeGame::new(0xA, FRAMES, 1, 1);
+        let mut gb = FakeGame::new(0xB, FRAMES, 1, 1);
+        let mut gw = FakeGame::new(0xC, FRAMES, 1, 1);
+        for g in [&mut ga, &mut gb, &mut gw] {
+            g.menu_before_decide = 20;
+        }
+        let (mut closed_a, mut closed_b) = (false, false);
+        let mut asked = false;
+        let mut join_shared = None;
+        let mut watch_code = String::new();
+        let mut seen: Vec<(CodeState, Event)> = Vec::new();
+        let mut name_when_linking = String::new();
+        let mut after_end = 0u32;
+        let t0 = Instant::now();
+        let mut next = t0;
+        loop {
+            ga.do_frame(&mut oa.np, &mut oa.net);
+            if ga.done && !closed_a {
+                oa.np.close(ByeReason::Finished);
+                closed_a = true;
+            }
+            gb.do_frame(&mut ob.np, &mut ob.net);
+            if gb.done && !closed_b {
+                ob.np.close(ByeReason::Finished);
+                closed_b = true;
+            }
+            if !asked && oa.np.connected().is_some() && ob.np.connected().is_some() {
+                link_a.send(Cmd::CopySpectateCode);
+                link_b.send(Cmd::CopySpectateCode);
+                asked = true;
+            }
+            if asked && join_shared.is_none() && clip_a.writes().len() >= 2 {
+                watch_code = clip_a.writes()[1].clone();
+                let (slot, publisher) = kit_parts.take().unwrap();
+                join_shared = Some(
+                    crate::spectate_join::spawn(JoinKit {
+                        source: JoinSource::Code(Ok(Some(format!("\u{FEFF}{watch_code}\r\n")))),
+                        reader: crate::spectate_watch_code::Reader::new(&sv, 0x77),
+                        reply_name: higanr_core::handshake::Name::new("viewer"),
+                        own: Candidates::from_addrs(&[viewer_addr]).unwrap(),
+                        slot,
+                        publisher,
+                    })
+                    .unwrap(),
+                );
+            }
+            if join_shared.is_some() {
+                gw.do_frame(&mut wp, &mut wnet);
+            }
+            if let Some(n) = link_w.note()
+                && seen.last() != Some(&(n.state, n.event))
+            {
+                seen.push((n.state, n.event));
+                if n.state == CodeState::SpectateLinking && name_when_linking.is_empty() {
+                    name_when_linking = n
+                        .name
+                        .iter()
+                        .take_while(|&&u| u != 0)
+                        .map(|&u| char::from_u32(u32::from(u)).unwrap_or('?'))
+                        .collect();
+                }
+            }
+            if wp.phase() == Phase::Ended && crate::spectate_join::finished() {
+                after_end += 1;
+                if after_end > 30 {
+                    break;
+                }
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(40),
+                "終わらない: A {:?} / 観戦者 {:?} {:?} {:?}\nseen {seen:?}\nA: {:?}\nB: {:?}\n{}",
+                oa.np.phase(),
+                wp.phase(),
+                wp.end(),
+                wp.stats(),
+                oa.watch.notes(),
+                ob.watch.notes(),
+                crate::spectate_join::stats_text()
+            );
+            next += Duration::from_micros(FRAME_US);
+            if let Some(d) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+        }
+        let counts = join_shared.as_ref().unwrap().counts();
+        let join_line = crate::spectate_join::stats_text();
+        crate::spectate_join::stop_and_join();
+        drop(wnet);
+        let _ = wrecv.stop();
+
+        // 対戦と観戦の列: 観戦者はホストの最初のキャラ選択から最後まで、対戦者と同じ列を受けた。
+        assert_eq!(
+            ga.recs.len(),
+            FRAMES as usize,
+            "ホストの試合が最後まで進まない"
+        );
+        assert_eq!(ga.recs, gb.recs, "対戦者の列が食い違う");
+        assert_eq!(
+            gw.recs,
+            ga.recs,
+            "観戦者の列がホストの列と一致しない（観戦者 {} 行・ホスト {} 行）",
+            gw.recs.len(),
+            ga.recs.len()
+        );
+        assert_eq!(
+            wp.end(),
+            Some(crate::spectate_watch::WatchEnd::HostEnded(
+                ByeReason::Finished
+            )),
+            "{:?}",
+            wp.stats()
+        );
+        // ホスト（A）だけが観戦コードを書いた。ゲスト（B）は「ホストの画面で」の出来事だけで、クリップボードは返答コードのまま。
+        let spec = code::read_spectate(&watch_code, net_udp::now_unix()).expect("観戦コード");
+        assert_eq!(spec.code.name.as_str(), "alice");
+        assert_eq!(
+            clip_a.writes().len(),
+            2,
+            "ホストが観戦コードを 2 回以上書いた"
+        );
+        assert_eq!(
+            clip_b.writes(),
+            vec![reply.clone()],
+            "ゲストがクリップボードを書き換えた"
+        );
+        assert_eq!(
+            link_a.note().map(|n| n.event),
+            Some(Event::SpectateCodeCopied)
+        );
+        assert_eq!(
+            link_b.note().map(|n| n.event),
+            Some(Event::SpectateCodeHostOnly)
+        );
+        // 観戦者の状態の変わり目（ルームの段階を通らない）と、左上の行の材料のホストの名前。
+        let idx = |want: (CodeState, Event)| seen.iter().position(|s| *s == want);
+        let linking = idx((CodeState::SpectateLinking, Event::SpectatePeer));
+        let watching = idx((CodeState::SpectateIdle, Event::None));
+        let ended = idx((CodeState::Idle, Event::SpectateEnded));
+        assert!(
+            matches!((linking, watching, ended), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "状態の変わり目の順が違う: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(_, e)| *e == Event::RoomJoining),
+            "観戦コードの経路がルームへ入ろうとした: {seen:?}"
+        );
+        assert_eq!(name_when_linking, "alice");
+        assert_eq!(
+            (
+                counts.by_code,
+                counts.codes_received,
+                counts.replies_sent,
+                counts.entered,
+                counts.linked,
+                counts.ended
+            ),
+            (1, 1, 0, 0, 1, 1),
+            "{counts:?}"
+        );
+        // ホストはルームへ入らず、穴もあけず、観戦者の JOIN を受けた。
+        let snap = oa.recv.spectate_snapshot().expect("ホストの観戦の集計");
+        assert_eq!(
+            (
+                snap.offer.entered,
+                snap.offer.punch_requested,
+                snap.punch.sent
+            ),
+            (0, 0, 0),
+            "{:?}",
+            snap.offer
+        );
+        assert!(snap.host.joined >= 1, "{snap:?}");
+        // 観戦コードの文字は本ログに出ない。
+        let logs = format!(
+            "{}\n{}\n{join_line}",
+            oa.watch.notes().join("\n"),
+            ob.watch.notes().join("\n")
+        );
+        assert!(!logs.contains(&watch_code[..40]), "{logs}");
+        assert!(
+            logs.contains("観戦コードをクリップボードへコピーした"),
+            "{logs}"
+        );
+        assert!(logs.contains("ゲストなのでコピーしない"), "{logs}");
+        assert!(
+            join_line.contains("観戦コードでホストへ直に繋ぐ"),
+            "{join_line}"
+        );
+        for o in [oa, ob] {
+            let mark = UiLink::new().order_mark();
+            let Opened {
+                np,
+                net,
+                mut watch,
+                recv,
+                ..
+            } = o;
+            close_parts(np, net, &mut watch, recv, &UiLink::new(), mark);
+        }
+        crate::spectate_join::tests::reset_globals();
     }
 
     #[test]

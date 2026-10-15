@@ -11,11 +11,13 @@
 //!      （`net_select.rs`）: 自分の入力ワードを自分の席に、相手の入力ワードを相手の席に、合成（3 本目）へは OR で feed し、画面を移る押下はホストが順番を決めてから
 //!      両者のゲームへ入れる。それ以外は `Local`。
 //!      `Config::require_net_selection` でネットワークの選択を通っていない場面 2 はデモ・リプレイの再生などなので `Local`。
-//!    - Holding（止める地点）: 3 本とも 0 を feed。自分の SELECT を置き、両者の SELECT が揃うまで `RenderOnly`。揃ったら値をゲームへ書き、LOADING へ。
+//!    - Holding（止める地点）: 3 本とも 0 を feed。自分の SELECT を置き、両者の SELECT が揃うまで `RenderOnly`（待ちが `peer_wait::LIMIT_MS`
+//!      続いたら BYE(切断) で閉じる）。揃ったら値をゲームへ書き、LOADING へ。
 //!    - Loading: 3 本とも 0 を feed して `Zero`。開始のフック（`on_match_start`）で Lockstep へ。
 //!    - Lockstep: 次の要求が 3 / 10 / 11 / 12 / 13（再戦ほか）なら 0 を feed して LOADING へ。1 / 6 / 7 / 9（マッチを出る）なら Selecting へ。ただし 6
 //!      （「リプレイを保存して終了」）は接続を終え（`close(Finished)`）、保存の画面を飛ばす印を頼む（`take_save_quit`）。それ以外は、取っていなければ
 //!      ローカル入力を 1 回取ってすぐ送り、相手の入力ワードを予算まで待つ。揃えば 3 本を feed して `Played`、揃わなければ `RenderOnly`（次の tick で同じフレームをやり直す）。
+//! 3. 相手を待つ tick（描画だけのフレーム・止める地点・選択の画面で相手が黙っている間）が続いたら画面に知らせ、Esc か 60 秒で閉じる（`peer_wait`）。
 //!
 //! latency の切替: ホストは `Config::lat_plan` の予定どおり、使ったフレームの数が `at` に達した後の最初の取得の前に `request_delay` する
 //! （`Busy` なら次のフレームで出し直す）。`FrameTiming` の余裕は、相手の入力ワードがそれより前の入力ワードと途切れなく揃った時刻（受信スレッドが受けた時刻）から、
@@ -39,19 +41,19 @@ use higanr_core::code::DEFAULT_TTL_SECS;
 use higanr_core::delay_pick::{self, DelayChoice, DelayPick};
 use higanr_core::handshake::{self, FailReason, ModeWish, Restart};
 use higanr_core::input_model::keys::ESC;
-use higanr_core::input_model::{InputState, SEND_MASK};
+use higanr_core::input_model::{InputState, MATCH_SEND_MASK};
 use higanr_core::link::{self, Connected, FormatSwitch, Link, Outlet, Recv, SelExit};
 use higanr_core::liveness;
 use higanr_core::lockstep::{self, Applied, CaptureError, LatError, Role, by_seat};
 use higanr_core::match_gate::NoMatch;
 use higanr_core::menu_model::{
-    APPLY_CLEAR_BITS, DECIDE_BITS, MAP_ITEM_RANDOM_ANY, MAP_LIST_EMPTY, MENU_SEND_MASK, Outcome,
-    SCREEN_CHARA, SCREEN_DIFFICULTY, SCREEN_MAP, TRANSITION_BITS, drop_keyboard_ctrl,
-    map_select_byte, menu_word, on_random_screen, outcome_of, random_key,
+    APPLY_CLEAR_BITS, DECIDE_BITS, KEY_CTRL, MAP_ITEM_RANDOM_ANY, MAP_LIST_EMPTY, Outcome,
+    SCREEN_CHARA, SCREEN_DIFFICULTY, SCREEN_MAP, TRANSITION_BITS, map_select_byte, outcome_of,
 };
 use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::net_menu::{Conn, RewindWindow};
 use higanr_core::pong::PongResponder;
+use higanr_core::return_flow::{PlayView, Why};
 use higanr_core::seat_pick::SeatAsk;
 use higanr_core::selection::{Agreed, Press};
 use higanr_core::wire::{
@@ -59,7 +61,7 @@ use higanr_core::wire::{
 };
 
 use crate::digit_keys::{self, DigitEdge};
-use crate::net_portrait::Followed;
+use crate::net_portrait::{Followed, Locked};
 use crate::net_select::{self, MenuView};
 use crate::net_ui::{HudFacts, HudNames};
 use crate::scripted::SCENE_MENU;
@@ -99,7 +101,7 @@ pub const MENU_RETRY_TICKS: u32 = 60;
 pub const HANDSHAKE_RETRY_MS: u32 = (DEFAULT_TTL_SECS * 1000) as u32;
 const _: () = assert!(DEFAULT_TTL_SECS * 1000 <= u32::MAX as u64);
 /// ネットワークが終わってからネットワークの組を片づけてよくなるまで（ms。`NetPlay::relink_due`）。片づけるとセッションが消えて、落ちた BYE を相手の PING（1 秒ごと）への
-/// 返しで届け直せなくなるので、PING 2 回ぶんはセッションを残す（残さないと、BYE が落ちた相手は 10 秒の沈黙を待って終わる）。待つのはマッチの外だけ。
+/// 返しで届け直せなくなるので、PING 2 回ぶんはセッションを残す（残さないと、BYE が落ちた相手は 60 秒の沈黙を待って終わる）。待つのはマッチの外だけ。
 pub const RELINK_GRACE_MS: u32 = 2_000;
 
 /// `LinkSlot` に置く 1 組: セッションの設定と、名乗る形の上書き（None なら `Config::mode_wish` のまま）と、席の希望と先にいたかの名乗り
@@ -333,6 +335,8 @@ pub trait Net: Outlet {
         true
     }
     fn pong_enable(&mut self, _on: bool) {}
+    /// ゲームスレッドの心拍（`now_us` と同じ時計の ms。tick ごとに 1 回）。本物は原子変数へ 1 回書くだけで、受信スレッドはこれが古いと PONG を返さない。
+    fn heartbeat(&mut self, _now_ms: u32) {}
     /// 接続の手順が成り立った（繋がったのを最初に見た tick に 1 回）。本物は、待っている間だけ続ける STUN の聞き直しを止める。
     fn link_up(&mut self) {}
     /// 自分の回線が宛先ごとに外側のポートを変える型か（2 か所目の STUN の比べ）。比べられていなければ `None`。左上の「つながらない」の
@@ -385,13 +389,14 @@ pub trait Game {
     fn digit_keys(&mut self) -> Option<u16> {
         None
     }
-    /// キーボードの Ctrl が今押されているか（読んではいけない間は false）。ゲームは Ctrl を「ランダム」と読むので、選択の画面で落とすのに使う。
-    fn keyboard_ctrl_down(&mut self) -> bool {
-        false
-    }
     /// 台本の段階（`digit=x` / `tab`）が、この tick の「押した瞬間」の集合を差し替える（`DigitEdge` を通さない）。段階が効き始めた次の tick に 1 回だけ `Some`。
     fn digit_script(&mut self) -> Option<u16> {
         None
+    }
+    /// 台本の段階（`copy=1`）が、この tick に Ctrl+C を押したことにするか。段階が効き始めた次の tick に 1 回だけ `true`（台本の実行は本物のキーを読まない）。
+    /// `digit_script` と同じ段階から取り出すので、1 つの段に `digit=` と `copy=` を一緒に書かない。
+    fn copy_script(&mut self) -> bool {
+        false
     }
     /// この実行に台本が付いているか。付いている実行は、段階の無い tick に本物の数字キー・Tab を読まない。台本が終わった後も `true`。
     fn scripted_run(&self) -> bool {
@@ -427,10 +432,25 @@ pub trait Game {
     fn map_list(&mut self) -> [u8; 16] {
         [MAP_LIST_EMPTY; 16]
     }
-    /// キャラ選択の決定で席 `seat` のカーソルを `cursor` に書いた直後に、立ち絵と席の目印を追わせる（ゲームの移動の経路が呼ぶ 3 本の関数。
+    /// キャラ選択で席 `seat` のカーソルを `cursor` に書いた直後に、立ち絵と席の目印を追わせる（ゲームの移動の経路が呼ぶ 3 本の関数。
     /// `net_portrait`）。`v` は書く前に読んだ画面。関数を持たない偽物はいつも `Refused`。
-    fn follow_portrait(&mut self, _v: &MenuView, _seat: usize, _cursor: u32) -> Followed {
+    fn follow_portrait(
+        &mut self,
+        _v: &MenuView,
+        _seat: usize,
+        _cursor: u32,
+        _locked: Locked,
+    ) -> Followed {
         Followed::Refused
+    }
+    /// 選択の画面のカーソルの音を 1 回積む（`0x43E2F0(0x4DC698, 0xC, 0)`。ゲームのカーソルの移動 `0x0042474A` と同じ呼び出し）。
+    /// 積めなければ（関数の頭のバイト列が合わない・偽物）false。
+    fn cursor_se(&mut self) -> bool {
+        false
+    }
+    /// 試合の場面の読み込み・一時停止・終わりのメニューの状態（対戦が終わった後の戻り道だけが読む）。読めなければ None。
+    fn play_view(&mut self) -> Option<PlayView> {
+        None
     }
 }
 
@@ -456,35 +476,36 @@ pub(crate) enum CursorWrite {
 }
 
 /// 押下を入れる tick の計画（`net_select::apply_plan` / `align_plan`）のカーソルをゲームへ書き、キャラ選択なら同じ tick のうちに立ち絵を追わせる。
-/// 合わせ（キャラ選択）の 2 つ目は、立ち絵の目印が相手の席のキャラも使うので、1 つ目を書いた後の画面で作る。計画にカーソルが無ければ `[None, None]`。
-/// 対戦の `NetPlay` と観戦者（`spectate_watch.rs`）が同じ関数を使う。
+/// 計画にカーソルが無ければ `None`。対戦の `NetPlay` と観戦者（`spectate_watch.rs`）が同じ関数を使う。
 pub(crate) fn write_plan_cursors<G: Game>(
     game: &mut G,
     v: &MenuView,
     plan: &net_select::ApplyPlan,
-) -> [Option<CursorWrite>; 2] {
-    let Some(cursor) = plan.cursor else {
-        return [None, None];
-    };
-    let one =
-        |game: &mut G, v: &MenuView, (off, val): (u32, u32), portrait: Option<(usize, u32)>| {
-            if !game.write_menu_u32(off, val) {
-                return CursorWrite::Miss;
-            }
-            CursorWrite::Wrote(portrait.map(|(seat, cur)| game.follow_portrait(v, seat, cur)))
-        };
-    let first = one(game, v, cursor, plan.portrait);
-    let second = match (first, plan.cursor_b) {
-        (CursorWrite::Wrote(_), Some(cursor_b)) => {
-            let mut vb = *v;
-            if let (Some(c0), Some((0, cur))) = (vb.chara_cursor.get_mut(0), plan.portrait) {
-                *c0 = cur;
-            }
-            Some(one(game, &vb, cursor_b, plan.portrait_b))
-        }
-        _ => None,
-    };
-    [Some(first), second]
+) -> Option<CursorWrite> {
+    let (off, val) = plan.cursor?;
+    Some(write_cursor(
+        game,
+        v,
+        off,
+        val,
+        plan.portrait,
+        Locked::Refuse,
+    ))
+}
+
+/// MainMenu の欄 `off` へカーソル `val` を書き、`portrait` があれば同じ tick のうちに立ち絵を追わせる。
+fn write_cursor<G: Game>(
+    game: &mut G,
+    v: &MenuView,
+    off: u32,
+    val: u32,
+    portrait: Option<(usize, u32)>,
+    locked: Locked,
+) -> CursorWrite {
+    if !game.write_menu_u32(off, val) {
+        return CursorWrite::Miss;
+    }
+    CursorWrite::Wrote(portrait.map(|(seat, cur)| game.follow_portrait(v, seat, cur, locked)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,6 +745,12 @@ pub struct Stats {
     /// （関数の署名が合わない・手元で未解放・MainMenu の部品が無いなど。`net_portrait`）。
     pub menu_portrait_called: u32,
     pub menu_portrait_refused: u32,
+    /// キャラ選択で相手の席のカーソルを相手の位置へ書いた回数と、そのうちカーソルの音を積んだ・積めなかった（関数の頭が合わない）回数。
+    pub menu_peer_writes: u32,
+    pub menu_cursor_se: u32,
+    pub menu_cursor_se_failed: u32,
+    /// 相手の入力ワードに「ランダム」（Ctrl）が立っていた選択の tick の数（キャラ選択では相手の席へ入れずに落とす）。
+    pub menu_peer_random: u32,
     /// 繋がる前に選択の画面（7・8・16）で、ゲームへ入れずに落とした決定の押下（押した瞬間）の回数（`unconnected_tick`）。
     pub menu_pre_link_decides: u32,
     pub lat_requested: u32,
@@ -762,6 +789,9 @@ pub struct Stats {
     pub rb_aborts: u32,
     pub stop_ticks: u64,
     pub stop_played: u64,
+    /// 相手を待つ知らせの間に Esc で閉じた回数・待ちが `peer_wait::LIMIT_MS` 続いて閉じた回数（止める地点の待ちも含む）。
+    pub peer_wait_esc: u32,
+    pub peer_wait_cuts: u32,
 }
 
 /// マッチの最中の同期ズレ（CHECK の食い違い）で、そのマッチを止めている状態。ゲームは決定的なので食い違いは 1 回で本物のズレ。ネットワークを閉じても
@@ -837,13 +867,15 @@ pub struct NetPlay {
     peer_finished: bool,
     /// lockstep の中で「保存して終了」（今 2・次 `REQ_SAVE_AND_QUIT`）を見て閉じた。呼び手が同じ tick に `take_save_quit` で 1 回だけ取る。
     save_quit: bool,
+    /// 「保存して終了」で試合の場面を出た（`save_quit` と違い取られても残る。戻り道を始めないための印）。
+    left_by_save_quit: bool,
+    /// 成立した後に終わり、まだ `take_lost` が取っていない。
+    lost_pending: bool,
     digest: u64,
     stall_run: u32,
     stats: Stats,
     menu_net: bool,
     menu_prev: u16,
-    /// 前回の tick に入力ワードの Ctrl を落としたか（`drop_keyboard_ctrl`）。
-    menu_ctrl_drop: bool,
     pre_link_decide_held: bool,
     decisions: Decisions,
     map_decided: bool,
@@ -891,6 +923,11 @@ pub struct NetPlay {
     /// 選択の局面で最後に見た選択の画面の番号（`menu_tick` が書く。選択の外の tick は 0）。キャラセレクト（画面 8）とマップ（画面 16）の間だけ
     /// 左下の行と名前の帯を出すための印（`hud_facts`。画面 6・7 は出さない）。
     hud_screen: u8,
+    /// 止める地点で相手の SELECT を待ち続けているフレームの数。
+    hold_run: u32,
+    wait: PeerWait,
+    /// 最後に `peer_wait_tick` が見た tick（`Stats::ticks`）。
+    wait_tick: u64,
     #[cfg(test)]
     sent_checks: Vec<Check>,
 }
@@ -996,12 +1033,13 @@ impl NetPlay {
             held_local: None,
             peer_finished: false,
             save_quit: false,
+            left_by_save_quit: false,
+            lost_pending: false,
             digest: INPUT_DIGEST_INIT,
             stall_run: 0,
             stats: Stats::default(),
             menu_net: false,
             menu_prev: 0,
-            menu_ctrl_drop: false,
             pre_link_decide_held: false,
             decisions: Decisions::default(),
             map_decided: false,
@@ -1036,6 +1074,9 @@ impl NetPlay {
             digits: DigitEdge::new(),
             tab_edge: false,
             hud_screen: 0,
+            hold_run: 0,
+            wait: PeerWait::default(),
+            wait_tick: u64::MAX,
             #[cfg(test)]
             sent_checks: Vec::new(),
         }
@@ -1178,6 +1219,32 @@ impl NetPlay {
     /// いればゲームの保存の画面を飛ばす印を立てる（`higanr_core::save_skip`）。観戦者の頼みは `WatchPlay::take_save_quit`。
     pub fn take_save_quit(&mut self) -> bool {
         core::mem::take(&mut self.save_quit)
+    }
+
+    /// 成立した後にネットワークが終わったとき 1 回だけ、「妖怪 対 妖怪」へ戻す理由を返す（`net_ui::NetUi::on_lost`）。戻さない終わり方は
+    /// `None`: 同期ズレ（止めて Esc を待つ別の経路）・「保存して終了」（タイトルのまま）・自分から終えた BYE(終了)（台本の終わり）。
+    /// 確かめの枠で抜けた BYE(取消) は呼び手が見分ける（ゲームが自分で画面 6 へ戻る）。
+    pub fn take_lost(&mut self) -> Option<Why> {
+        if !core::mem::take(&mut self.lost_pending)
+            || self.left_by_save_quit
+            || self.stop != Stop::None
+        {
+            return None;
+        }
+        match self.end? {
+            End::PeerBye(ByeReason::Finished | ByeReason::Cancelled) => Some(Why::PeerLeft),
+            End::Closed(ByeReason::Cancelled) if self.stats.peer_wait_esc > 0 => Some(Why::SelfCut),
+            End::PeerBye(ByeReason::Disconnected)
+            | End::Closed(ByeReason::Disconnected | ByeReason::Cancelled)
+            | End::Dead
+            | End::MenuStuck(_)
+            | End::BadSelect(_) => Some(Why::Lost),
+            End::PeerBye(ByeReason::Desync)
+            | End::Desync { .. }
+            | End::Closed(ByeReason::Finished | ByeReason::Desync)
+            | End::HandshakeFailed(_)
+            | End::Unmatched(_) => None,
+        }
     }
 
     /// 検査用: 「保存して終了」で閉じた tick と同じ印だけを置く。
@@ -1356,7 +1423,7 @@ impl NetPlay {
         ) {
             self.digit_tick(game);
         }
-        match self.phase {
+        let action = match self.phase {
             Phase::Unconnected => self.unconnected_tick(game),
             // 終えた（相手が来ないまま期間が切れた・BYE・沈黙など）後はネットワークの外。人が画面から出られるようにローカルの入力のまま。
             // ただしマッチの最中の同期ズレで止めている間は、Esc まで描画だけのフレーム（`ended_tick`）。
@@ -1369,10 +1436,12 @@ impl NetPlay {
                         // ネットワークの選択でマップが決まっていない場面 2 はネットワークのマッチではない（デモ・リプレイの再生など）。止める地点に入ると
                         // 相手の SELECT を待って描画だけのフレームを返し続け、ゲームが止まる（`Config::require_net_selection`）。MainMenu は読まない。
                         self.stats.local_scene2 = self.stats.local_scene2.saturating_add(1);
-                        return Action::Local;
+                        Action::Local
+                    } else {
+                        self.phase = Phase::Holding;
+                        self.hold_run = 0;
+                        self.hold(game, net)
                     }
-                    self.phase = Phase::Holding;
-                    self.hold(game, net)
                 } else if cur == SCENE_MENU {
                     self.menu_tick(game, net)
                 } else {
@@ -1382,7 +1451,61 @@ impl NetPlay {
             Phase::Holding => self.hold(game, net),
             Phase::Loading => self.zero(game),
             Phase::Lockstep => self.lockstep_tick(game, net),
+        };
+        self.peer_wait_tick(game, net);
+        action
+    }
+
+    /// 相手を待ち続けている間の知らせと切断（`peer_wait`）。1 tick に 1 回: delay 方式は `dispatch` の終わり、rollback のモードのマッチは
+    /// 走査の包みのフックの後（`script_win::rb_scan_handler`）。待っていたかは、マッチは描画だけのフレームが続いているか、止める地点は相手の SELECT を
+    /// 待っているか、選択の画面は相手のゲームスレッドが黙っているか（PONG だけでは戻らない `Liveness::quiet_ms`）。切るときは自分から閉じる
+    /// （Esc は BYE(取消)、時間切れは BYE(切断)）ので、その後は普段の「接続が終わった」の経路。Esc は知らせを出している間だけ読む。
+    pub fn peer_wait_tick<G: Game, N: Net>(&mut self, game: &mut G, net: &mut N) {
+        if self.wait_tick == self.stats.ticks {
+            return;
         }
+        self.wait_tick = self.stats.ticks;
+        // 時計はマッチ・止める地点では待っている tick にだけ読む（ふだんのマッチの tick に足すのは比べだけ）。
+        let stalled = match self.phase {
+            Phase::Lockstep => self.stall_run > 0,
+            Phase::Holding => self.hold_run > 0,
+            _ => false,
+        };
+        let (blocked, now) = if stalled {
+            let now = ms(net.now_us());
+            (Some(now), now)
+        } else if self.phase == Phase::Selecting && self.hud_screen != 0 {
+            let now = ms(net.now_us());
+            let quiet = self
+                .link
+                .connected()
+                .map_or(0, |c| c.liveness().quiet_ms(now));
+            (
+                (quiet >= peer_wait::QUIET_MS).then(|| now.wrapping_sub(quiet)),
+                now,
+            )
+        } else {
+            (None, 0)
+        };
+        match self
+            .wait
+            .step(blocked, now, || game.peek_local_input() & ESC != 0)
+        {
+            Verdict::Keep => {}
+            Verdict::Esc => {
+                self.stats.peer_wait_esc = self.stats.peer_wait_esc.saturating_add(1);
+                self.close(ByeReason::Cancelled);
+            }
+            Verdict::TimedOut => {
+                self.stats.peer_wait_cuts = self.stats.peer_wait_cuts.saturating_add(1);
+                self.close(ByeReason::Disconnected);
+            }
+        }
+    }
+
+    /// 相手を待つ知らせ（`net_menu::T_PEER_WAIT`）を出す間か。
+    pub fn peer_wait_shown(&self) -> bool {
+        self.phase != Phase::Ended && self.wait.shown()
     }
 
     /// 開始のフック（`0x0041AB2B`。読み込みの後の最初の更新の中）: コピーにチャージ型を書き、次の tick を frame 0 にする。LOADING のときだけ。
@@ -1478,6 +1601,7 @@ impl NetPlay {
         }
         let now = ms(net.now_us());
         self.link.poll(now, net);
+        net.heartbeat(now);
         let r = self.link.restarts();
         self.stats.hs_restarts = r.count;
         self.stats.hs_restart_last = r.last;
@@ -1583,6 +1707,8 @@ impl NetPlay {
                 self.stop = Stop::Held { esc_armed: false };
                 self.stats.stop_played = self.stats.played;
             }
+            // 成立していた（選択・止める地点・読み込み・試合のどこか）なら、「妖怪 対 妖怪」へ戻す候補（`take_lost`）。
+            self.lost_pending = self.phase != Phase::Unconnected;
             self.phase = Phase::Ended;
             self.end = Some(end);
             // 観戦: 流れの終わり。繋がっていなかった（接続の失敗）なら積まない。
@@ -1754,7 +1880,7 @@ impl NetPlay {
                     self.shown_delay(c),
                     rtt,
                     c.rollback().is_some(),
-                    delay_pick::recommend(c.mode(), rtt),
+                    c.recommend_now(),
                     HudNames::of(est.seat, est.own_name, est.peer_name),
                     c.shown_auto(),
                     c.mode(),
@@ -1922,17 +2048,16 @@ impl NetPlay {
         }
         let (cur, next) = game.scenes();
         // 止める地点（場面 2 への切替の tick）では MainMenu を読まない（`Game::menu_view`）。
-        let view = if cur != SCENE_MENU || next == SCENE_MATCH {
-            None
+        let in_selection = if cur != SCENE_MENU || next == SCENE_MATCH {
+            false
         } else {
-            game.menu_view().filter(net_select::in_selection)
+            game.menu_view().filter(net_select::in_selection).is_some()
         };
-        let Some(view) = view else {
+        if !in_selection {
             self.pre_link_decide_held = false;
             return Action::Local;
-        };
-        // キャラ・マップの画面では R を「ランダム」（Ctrl）に読み替える（`menu_model::random_key`）。
-        let raw = random_key(view.screen, game.local_input(Seat::P1));
+        }
+        let raw = game.local_input(Seat::P1);
         let held = raw & DECIDE_BITS != 0;
         if held && !self.pre_link_decide_held {
             self.stats.menu_pre_link_decides = self.stats.menu_pre_link_decides.saturating_add(1);
@@ -1969,23 +2094,14 @@ impl NetPlay {
             self.menu_hold_run = 0;
             self.menu_retry = None;
         }
-        // 選択の画面の入力ワードは、マッチの入力ワードのマスクに「ランダム」の Ctrl を足したもの（`MENU_SEND_MASK`）で相手へ送る。
-        // キャラ・マップの画面では R を Ctrl に読み替え、キーボードの Ctrl（Ctrl+数字・Ctrl+Tab）は落とす（`menu_model::menu_word`）。
-        // 自分のゲームへ入れる入力ワードも相手へ送る入力ワードもこの `raw` から作るので、ここで落とせば両方に効く。
-        // 台本の実行と、Ctrl+数字を読まない実行（`pick` が無い）は本物のキーを読まない。
-        let word = game.local_input(seat);
-        let key = on_random_screen(v.screen)
-            && self.pick.is_some()
-            && !game.scripted_run()
-            && game.keyboard_ctrl_down();
-        let ctrl = on_random_screen(v.screen) && drop_keyboard_ctrl(key, self.menu_ctrl_drop, word);
-        self.menu_ctrl_drop = ctrl;
-        let raw = menu_word(v.screen, word, ctrl) & MENU_SEND_MASK;
+        // 選択の画面の入力ワードも試合と同じマスク（`MATCH_SEND_MASK`。Ctrl を含む）で相手へ送る。
+        // Ctrl（キャラ・マップの「ランダム」。Ctrl+数字・Ctrl+Tab を含む）は落とさず、自分のゲームと相手へ届く。
+        let raw = game.local_input(seat) & MATCH_SEND_MASK;
         let pressed = if entering { 0 } else { raw & !self.menu_prev };
         self.menu_prev = raw;
         let my = net_select::seat_index(seat);
-        // 合わせ（`selection.rs`）。ゲストは、この画面の合わせが届くまで動かず、押下も要求しない（相手が来る前の動きが捨てられて、カーソルの値だけ食い違う形を無くす）。
-        // ホストは止めない。
+        // 合わせ（難易度・マップの画面。`selection.rs`）。ゲストは、この画面の合わせが届くまで動かず、押下も要求しない（相手が来る前の動きが
+        // 捨てられて、カーソルの値だけ食い違う形を無くす）。ホストは止めない。キャラ選択は合わせない（相手の席は位置で書く。下の `peer_sync`）。
         let screen8 = u8::try_from(v.screen).unwrap_or(0);
         let mute = role == Role::Guest && !c.selection().is_aligned(screen8);
         let mut press = net_select::local_press(&v, raw, pressed, my);
@@ -2081,14 +2197,27 @@ impl NetPlay {
             self.menu_hold_run = 0;
         }
         let my_request = c.selection().pending_press();
+        let (own_screen, own_cursor) = net_select::own_cursor(&v, my);
+        c.set_menu_cursor(own_screen, own_cursor);
         let fo = c.selection_frame(local, press, ready_ok, net, |fo| match fo.apply {
             Some(st) if outcome_of(st.screen, st.kind) != Outcome::Stay => SelExit::Leave,
             _ => SelExit::Stay,
         });
-        let remote = if mute {
-            fo.remote & MENU_SEND_MASK & !APPLY_CLEAR_BITS
+        // 観戦の記録には相手の語をそのまま積む（観戦者は両席を語で動かす）。自分のゲームの相手の席へは、キャラ選択では方向と
+        // 「ランダム」を落として入れ、カーソルは相手の位置で書く（`peer_sync`）。
+        let remote_rec = if mute {
+            fo.remote & MATCH_SEND_MASK & !APPLY_CLEAR_BITS
         } else {
-            fo.remote & MENU_SEND_MASK
+            fo.remote & MATCH_SEND_MASK
+        };
+        let remote = net_select::peer_word(v.screen, remote_rec);
+        if remote_rec & KEY_CTRL != 0 {
+            self.stats.menu_peer_random = self.stats.menu_peer_random.saturating_add(1);
+        }
+        let sync = if fo.apply.is_none() {
+            net_select::peer_sync(&v, my, || c.take_peer_cursor())
+        } else {
+            None
         };
         // 自分の押下が捨てられたか（ホスト: 押したのに入らなかった —— 前の STEP がまだ届いていない・相手が来ていない・
         // 同じ tick に合わせを出した。ゲスト: 要求していた押下（この tick の押下を含む）の代わりに、ホストの別の押下が入った）。
@@ -2167,14 +2296,37 @@ impl NetPlay {
                 plan.words
             }
         };
+        if let Some(s) = sync {
+            self.write_peer_cursor(game, &v, s);
+        }
         let [p1, p2, p3] = words;
         game.feed(0, p1);
         game.feed(1, p2);
         game.feed(2, p3);
-        let (m1, m2) = by_seat(seat, local, remote);
+        let (m1, m2) = by_seat(seat, local, remote_rec);
         Self::spec_to(&self.spec, Record::Menu { p1: m1, p2: m2 });
         self.stats.menu_frames = self.stats.menu_frames.saturating_add(1);
         Action::Menu
+    }
+
+    /// キャラ選択で、相手の席のカーソルを相手の位置へ書き、立ち絵を追わせ（手元で未解放のキャラでも）、相手のカーソルが動いたならゲームと同じ
+    /// カーソルの音を積む。feed の前（入力の地点）に呼ぶ。
+    fn write_peer_cursor<G: Game>(&mut self, game: &mut G, v: &MenuView, s: net_select::PeerSync) {
+        let (off, val) = s.cursor;
+        let w = write_cursor(game, v, off, val, Some(s.portrait), Locked::Allow);
+        self.count_cursor_write(w);
+        if !matches!(w, CursorWrite::Wrote(_)) {
+            return;
+        }
+        self.stats.menu_peer_writes = self.stats.menu_peer_writes.saturating_add(1);
+        if s.sound {
+            if game.cursor_se() {
+                self.stats.menu_cursor_se = self.stats.menu_cursor_se.saturating_add(1);
+            } else {
+                self.stats.menu_cursor_se_failed =
+                    self.stats.menu_cursor_se_failed.saturating_add(1);
+            }
+        }
     }
 
     /// 形式の切替の STEP を入れた tick に、ネットワークの側の形式（`Connected::switch_format`）と遅れの選び（`DelayPick::switch_mode`）を替える。
@@ -2205,21 +2357,24 @@ impl NetPlay {
     }
 
     fn write_plan<G: Game>(&mut self, game: &mut G, v: &MenuView, plan: &net_select::ApplyPlan) {
-        for w in write_plan_cursors(game, v, plan).into_iter().flatten() {
-            match w {
-                CursorWrite::Miss => {
-                    self.stats.menu_align_miss = self.stats.menu_align_miss.saturating_add(1);
-                }
-                CursorWrite::Wrote(Some(Followed::Called)) => {
-                    self.stats.menu_portrait_called =
-                        self.stats.menu_portrait_called.saturating_add(1);
-                }
-                CursorWrite::Wrote(Some(Followed::Refused)) => {
-                    self.stats.menu_portrait_refused =
-                        self.stats.menu_portrait_refused.saturating_add(1);
-                }
-                CursorWrite::Wrote(Some(Followed::Unchanged) | None) => {}
+        if let Some(w) = write_plan_cursors(game, v, plan) {
+            self.count_cursor_write(w);
+        }
+    }
+
+    fn count_cursor_write(&mut self, w: CursorWrite) {
+        match w {
+            CursorWrite::Miss => {
+                self.stats.menu_align_miss = self.stats.menu_align_miss.saturating_add(1);
             }
+            CursorWrite::Wrote(Some(Followed::Called)) => {
+                self.stats.menu_portrait_called = self.stats.menu_portrait_called.saturating_add(1);
+            }
+            CursorWrite::Wrote(Some(Followed::Refused)) => {
+                self.stats.menu_portrait_refused =
+                    self.stats.menu_portrait_refused.saturating_add(1);
+            }
+            CursorWrite::Wrote(Some(Followed::Unchanged) | None) => {}
         }
     }
 
@@ -2282,8 +2437,10 @@ impl NetPlay {
             .flatten();
         let Some(a) = agreed else {
             self.stats.hold_frames = self.stats.hold_frames.saturating_add(1);
+            self.hold_run = self.hold_run.saturating_add(1);
             return Action::RenderOnly;
         };
+        self.hold_run = 0;
         let peer_seat = match c.seat() {
             Seat::P1 => Seat::P2,
             Seat::P2 => Seat::P1,
@@ -2319,6 +2476,7 @@ impl NetPlay {
             // （先に相手の BYE を受けていれば `leave_seg` が `PeerBye` で終え、下の `close` は終わり方を書き換えない）。
             self.leave_seg();
             self.save_quit = true;
+            self.left_by_save_quit = true;
             self.close(ByeReason::Finished);
             return self.zero(game);
         }
@@ -2422,7 +2580,7 @@ impl NetPlay {
             Some(w) => w,
             None => {
                 self.stats.local_reads = self.stats.local_reads.saturating_add(1);
-                game.local_input(c.seat()) & SEND_MASK
+                game.local_input(c.seat()) & MATCH_SEND_MASK
             }
         };
         // 作った値（と、最初のマッチの始まりの推奨値）をネットワークの側へ渡す。ホストは次の取得（この取得）で切替に結び付け、ゲストはホストへ要求する。
@@ -2439,9 +2597,9 @@ impl NetPlay {
             return Action::Local;
         };
         let seg = c.lockstep().seg();
-        // 相手の入力ワードも SEND_MASK の外を落とす（外のビットは自分の側でも効く。P/Home はゲームのフォルダへスクリーンショットを書く）。
+        // 相手の入力ワードも MATCH_SEND_MASK の外を落とす（外のビットは自分の側でも効く。P/Home はゲームのフォルダへスクリーンショットを書く）。
         // 自分の入力ワードは取るときに落としてある。
-        let (p1, p2) = by_seat(c.seat(), a.local, a.remote & SEND_MASK);
+        let (p1, p2) = by_seat(c.seat(), a.local, a.remote & MATCH_SEND_MASK);
         if self.cfg.check == CheckSource::InputDigest {
             self.digest = input_digest_push(self.digest, p1, p2);
         }
@@ -2553,6 +2711,8 @@ impl NetPlay {
     }
 }
 
+pub(crate) mod peer_wait;
+use peer_wait::{PeerWait, Verdict};
 mod rollback;
 pub use rollback::{RbAbort, RbScan};
 

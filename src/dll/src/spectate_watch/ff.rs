@@ -4,6 +4,8 @@
 //! 観戦者はマッチの途中で入ると、その seg の始まりから同じ速さで再生するので、入るまでの時間の分だけずっと遅れる（実機で記録が届いてから
 //! 使うまで 平均 16.2 秒・最大 17.9 秒）。使っていないマッチのフレームが閾値より溜まっている間、1 回の表示（do_frame）の中で
 //! ゲームの更新（走査 `0x42C700`）を余分に回して進める。溜まりが戻る閾値まで減ったら普段の速さに戻す（入る閾値と戻る閾値を分ける）。
+//! 1 表示に余分に回す数は core の `spectate_pace::Pace` が決める（届く平均の速さに合わせる。往復が長い回線で往復ごとにまとまって
+//! 届く間も、最大の速さで溜まりを使い切って止まらない）。
 //!
 //! ## 更新の経路
 //!
@@ -30,16 +32,8 @@ use super::WatchPlay;
 use crate::netplay::Phase;
 use crate::rollback_resim::abort_of;
 
-/// 早送りに入る溜まり: 使っていないマッチのフレームがこの数を越えたら入る。ふだんの溜まりは余裕（`WATCH_MARGIN_FRAMES` = 3）前後で、
-/// ホストの送りが 1 フレーム強ぶれても 5 を越えない。6 は、100 ms 以上遅れたときだけ入る値。
-pub const FF_ENTER_FRAMES: u32 = 6;
-/// 早送りから戻る溜まり: この数以下になったら普段の速さに戻す。余裕と同じ 3 にして、戻った後も入力ワードを待たずに続けられるようにする。
-pub const FF_EXIT_FRAMES: u32 = 3;
-/// 1 回の表示の中で余分に回す更新の数の上限（最大 17 倍速 = 普段の 1 回 ＋ 余分 16 回 ≒ 毎秒 1,020 更新）。ペースの格子の上限
-/// `MAX_FPS`（1000）に寄せた。速さを決めるのはこの数でなく下の時間の上限（遅い PC では余分が少ない回数で打ち切られて自然に落ちる）。
-/// 更新 1 回は p50 0.04 / p99 0.07 ms（n = 660。弾の多い場面は重い見込み）なので、16 回で 1 ms 前後の見込み（外挿）。
-/// ホストの送りが追いつかなければ（送りのウィンドウ 64 記録 ÷ 往復）その速さに落ちる。
-pub const FF_MAX_EXTRA: u32 = 16;
+/// 入る閾値・戻る閾値・1 表示の余分の上限（観戦者の模型と同じ値を使うため core に置く）。
+pub use higanr_core::spectate_pace::{FF_ENTER_FRAMES, FF_EXIT_FRAMES, FF_MAX_EXTRA};
 /// 1 回の表示の中で余分な更新に使う時間の上限（µs。8 ms）。越えたらその表示では打ち切る（60 Hz の 1 フレーム 16.7 ms の半分を
 /// 越えて描画とメッセージ処理を遅らせない）。遅い PC では上の回数に届く前にここで止まり、PC が回せる速さまで自然に落ちる。
 pub const FF_BUDGET_US: u64 = 8_000;
@@ -75,6 +69,8 @@ pub(super) struct FfState {
     /// 前に見たときの `stats.played`（直前の走査がマッチのフレームを使ったかを見る）。
     seen_played: u64,
     extra: u32,
+    /// この表示で余分に回してよい数（表示の最初の問いで `Pace::extras` が決める）。
+    allow: u32,
     /// この表示の余分な更新の時間の起点（µs）。
     t0_us: u64,
 }
@@ -90,18 +86,24 @@ pub(super) enum Verdict {
     Go,
 }
 
-/// `active`: いま早送り中か / `backlog`: 使っていない記録の数 / `extra`: この表示で認めた余分な更新の数 / `elapsed_us`: この表示の
-/// 余分な更新に使った時間。入る閾値（`FF_ENTER_FRAMES` を越えた）と戻る閾値（`FF_EXIT_FRAMES` 以下）を分けて、行ったり来たりしない。
-pub(super) fn decide(active: bool, backlog: u32, extra: u32, elapsed_us: u64) -> Verdict {
-    if active {
-        if backlog <= FF_EXIT_FRAMES {
-            return Verdict::Leave;
-        }
-    } else if backlog <= FF_ENTER_FRAMES {
-        return Verdict::Idle;
+/// `active`: いま早送り中か / `backlog`: 使っていない記録の数 / `extra`: この表示で認めた余分な更新の数 / `allow`: この表示で余分に
+/// 回してよい数（`Pace::extras`。入る閾値・戻る閾値もそこで見る）/ `elapsed_us`: この表示の余分な更新に使った時間。
+pub(super) fn decide(
+    active: bool,
+    backlog: u32,
+    extra: u32,
+    allow: u32,
+    elapsed_us: u64,
+) -> Verdict {
+    if active && backlog <= FF_EXIT_FRAMES {
+        return Verdict::Leave;
     }
-    if extra >= FF_MAX_EXTRA {
-        return Verdict::Max;
+    if extra >= allow.min(FF_MAX_EXTRA) {
+        return if active || extra > 0 {
+            Verdict::Max
+        } else {
+            Verdict::Idle
+        };
     }
     if elapsed_us >= FF_BUDGET_US {
         return Verdict::Cutoff;
@@ -110,10 +112,13 @@ pub(super) fn decide(active: bool, backlog: u32, extra: u32, elapsed_us: u64) ->
 }
 
 impl WatchPlay {
+    /// 表示の始まり。前の表示の間に使えるようになった記録の数（組み立ての `ack` の進み）を `Pace` へ入れる。
     pub fn ff_begin(&mut self, _now_us: u64) {
         self.ff.seen_played = self.stats.played;
         self.ff.extra = 0;
+        self.ff.allow = 0;
         self.stats.ff.begun = self.stats.ff.begun.saturating_add(1);
+        self.pace.on_display(std::mem::take(&mut self.pace_arrived));
     }
 
     /// 走査を 1 回呼んだ後に聞く: もう 1 回、余分に更新を回してよいか。真を返したら呼び手は必ず回す（数えている）。
@@ -137,9 +142,21 @@ impl WatchPlay {
         let backlog = self.available();
         if self.ff.extra == 0 {
             self.ff.t0_us = now_us;
+            self.ff.allow = self.pace.extras(backlog, self.cfg.margin_frames);
+            if self.ff.active && !self.pace.is_active() {
+                // 溜まりが戻る閾値まで減った（`Pace` が早送りをやめた）。
+                self.ff_leave(now_us);
+                return false;
+            }
         }
         let elapsed = now_us.saturating_sub(self.ff.t0_us);
-        match decide(self.ff.active, backlog, self.ff.extra, elapsed) {
+        match decide(
+            self.ff.active,
+            backlog,
+            self.ff.extra,
+            self.ff.allow,
+            elapsed,
+        ) {
             Verdict::Idle | Verdict::Max => false,
             Verdict::Leave => {
                 self.ff_leave(now_us);
@@ -183,6 +200,7 @@ impl WatchPlay {
     }
 
     fn ff_leave(&mut self, now_us: u64) {
+        self.pace.leave();
         if !self.ff.active {
             return;
         }
@@ -256,25 +274,29 @@ mod tests {
     }
 
     #[test]
-    fn the_verdict_has_separate_enter_and_exit_thresholds_and_two_caps() {
-        assert_eq!(decide(false, FF_ENTER_FRAMES, 0, 0), Verdict::Idle);
-        assert_eq!(decide(false, FF_ENTER_FRAMES + 1, 0, 0), Verdict::Go);
-        assert_eq!(decide(false, 0, 0, 0), Verdict::Idle);
-        for b in FF_EXIT_FRAMES + 1..=FF_ENTER_FRAMES {
-            assert_eq!(decide(true, b, 0, 0), Verdict::Go, "溜まり {b}");
-            assert_eq!(decide(false, b, 0, 0), Verdict::Idle, "溜まり {b}");
+    fn the_verdict_follows_the_allowance_the_exit_threshold_and_two_caps() {
+        // 早送りでなく、この表示の許しも 0（入る閾値は `Pace` が見る）。
+        assert_eq!(decide(false, 50, 0, 0, 0), Verdict::Idle);
+        assert_eq!(decide(false, 50, 0, 3, 0), Verdict::Go);
+        // 許した数まで回したら、その表示はおしまい。早送り中で許しが 0（端数を貯めている表示）も同じ。
+        assert_eq!(decide(true, 50, 2, 3, 0), Verdict::Go);
+        assert_eq!(decide(true, 50, 3, 3, 0), Verdict::Max);
+        assert_eq!(decide(true, 50, 0, 0, 0), Verdict::Max);
+        // 上限の数（許しが上限を越えても）。
+        assert_eq!(decide(true, 50, FF_MAX_EXTRA - 1, 40, 0), Verdict::Go);
+        assert_eq!(decide(true, 50, FF_MAX_EXTRA, 40, 0), Verdict::Max);
+        // 戻る閾値が先。
+        for b in 0..=FF_EXIT_FRAMES {
+            assert_eq!(decide(true, b, 0, 5, 0), Verdict::Leave, "溜まり {b}");
         }
-        assert_eq!(decide(true, FF_EXIT_FRAMES, 0, 0), Verdict::Leave);
-        assert_eq!(decide(true, 0, 0, 0), Verdict::Leave);
-        // 上限の数: 戻る判断が先。
-        assert_eq!(decide(true, 50, FF_MAX_EXTRA - 1, 0), Verdict::Go);
-        assert_eq!(decide(true, 50, FF_MAX_EXTRA, 0), Verdict::Max);
         assert_eq!(
-            decide(true, FF_EXIT_FRAMES, FF_MAX_EXTRA, 0),
+            decide(true, FF_EXIT_FRAMES, FF_MAX_EXTRA, 40, 0),
             Verdict::Leave
         );
-        assert_eq!(decide(true, 50, 1, FF_BUDGET_US - 1), Verdict::Go);
-        assert_eq!(decide(true, 50, 1, FF_BUDGET_US), Verdict::Cutoff);
+        assert_eq!(decide(true, FF_EXIT_FRAMES + 1, 0, 5, 0), Verdict::Go);
+        // 時間の上限。
+        assert_eq!(decide(true, 50, 1, 5, FF_BUDGET_US - 1), Verdict::Go);
+        assert_eq!(decide(true, 50, 1, 5, FF_BUDGET_US), Verdict::Cutoff);
         const { assert!(FF_EXIT_FRAMES < FF_ENTER_FRAMES) };
     }
 
@@ -423,7 +445,7 @@ mod tests {
             }),
             ("先頭が無い", |s: &mut Stub| s.wp.look[0] = None),
             (
-                "走査が 1 を返す（描画だけのフレーム・場面の切替。一時停止の間も 1 —— analysis/notes/th09_rollback_E1.md 755 行付近）",
+                "走査が 1 を返す（描画だけのフレーム・場面の切替。一時停止の間も 1）",
                 |s| s.ret = 1,
             ),
             ("走査が 0 を返す", |s| s.ret = 0),

@@ -12,7 +12,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use higanr_core::lang::{Lang, set_lang_in_ini_text};
+use higanr_core::ini_edit::Edit;
+use higanr_core::ini_store;
+use higanr_core::lang::Lang;
 
 /// 言語の番号（`Lang::index`）を持つ変数。
 struct LangCell(AtomicU32);
@@ -59,27 +61,19 @@ pub fn set(l: Lang) {
     CURRENT.with(|c| c.set(l));
 }
 
-/// ini の `[ui] lang` を `lang` に書き換える（読む → `set_lang_in_ini_text` → 一時ファイルへ書いて置き換える）。
+/// ini の `[ui] lang` を `lang` に書き換える。ほかの設定の書き戻しと同じ鍵の中で書く（`ini_store`）。
 /// 中身が変わらなければ書かない。`path` が無い（ini なしで走っている）なら書かずに誤りを返す。
 pub fn save_to_ini(path: Option<&Path>, lang: Lang) -> Result<(), String> {
     let path = path.ok_or("ini の置き場が分からない（ini なしの実行）ので言語を書かない")?;
-    let text = std::fs::read(path)
-        .map_err(|e| format!("{} を読めない: {e}", path.display()))
-        .and_then(|b| {
-            String::from_utf8(b).map_err(|_| format!("{} が UTF-8 でない", path.display()))
-        })?;
-    let new = set_lang_in_ini_text(&text, lang);
-    if new == text {
-        return Ok(());
-    }
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_name);
-    std::fs::write(&tmp, new).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{} へ置き換えられない: {e}", path.display())
-    })
+    ini_store::update(
+        path,
+        &[Edit::Set {
+            section: higanr_core::lang::SECTION,
+            key: "lang",
+            value: lang.word(),
+        }],
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

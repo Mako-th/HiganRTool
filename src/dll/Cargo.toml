@@ -18,43 +18,50 @@ dist = []
 
 [dependencies]
 higanr_core = { path = "../core" }
-# Win32 の宣言だけ（MIT OR Apache-2.0。設計 docs/Design_Architecture.md §1-1 で dll と loader に入れると決めてある）。
+# Win32 の宣言だけ（MIT OR Apache-2.0。dll と loader が使う）。
 # 機能は使う API の分だけ開ける。Win32_Security は CreateMutexW / CreateThread の引数の型
 # （SECURITY_ATTRIBUTES）に要る。Win32_System_Kernel は x86 の CONTEXT（GetThreadContext）の中の
-# FLOATING_SAVE_AREA に、Win32_System_Diagnostics_ToolHelp はスレッドの一覧に要る（どちらも M1b の最初のフック）。
-# Win32_System_Performance は QueryPerformanceCounter / QueryPerformanceFrequency（M1b の tick ごとの記録で
+# FLOATING_SAVE_AREA に、Win32_System_Diagnostics_ToolHelp はスレッドの一覧に要る（どちらも最初のフックで使う）。
+# Win32_System_Performance は QueryPerformanceCounter / QueryPerformanceFrequency（tick ごとの記録で
 # TSC の周波数を求める）に要る。
-# Win32_Storage_FileSystem は MoveFileExW（M1d の台本 script.txt を logs\ へ上書きせずに移す。std::fs::rename は
+# Win32_Storage_FileSystem は MoveFileExW（台本 script.txt を logs\ へ上書きせずに移す。std::fs::rename は
 # 上書きする旗で呼ぶので使わない）に要る。
-# Win32_Security_Cryptography は BCryptGenRandom（M3a: 接続の秘密 16 B と STUN の transaction id を OS の乱数で
-# 引く。暗号は自作しない —— docs/Design_Protocol.md §1-2）に要る。
+# Win32_Security_Cryptography は BCryptGenRandom（接続の秘密 16 B と STUN の transaction id を OS の乱数で
+# 引く。暗号は自作しない）に要る。
 # Win32_Globalization は GetUserDefaultUILanguage（画面の言語の既定を OS の UI の言語から決める。起動のとき 1 回読むだけ —— src/dll/src/ui_lang_win.rs）に要る。
-# Win32_Graphics_Gdi は CreateFontW / CreateDIBSection / TextOutW ほか（M1c-2: 読み取りのスレッドで ASCII の字の表を
+# Win32_Graphics_Gdi は CreateFontW / CreateDIBSection / TextOutW ほか（読み取りのスレッドで ASCII の字の表を
 # メモリの面に描く。ゲームの窓の DC には触らない）に要る。
-# Win32_System_WindowsProgramming は QueryThreadCycleTime（M7 の切り分け: 入力 → Present の前にゲームのスレッドが CPU で
-# 走った周期を記録する。analysis/notes/th09_frame_pacing_M7.md §11）に要る。
-# Win32_System_DataExchange は OpenClipboard / SetClipboardData / GetClipboardData ほか（M1c-3: ゲームの中のメニューが接続コードを
+# Win32_System_WindowsProgramming は QueryThreadCycleTime（入力 → Present の前にゲームのスレッドが CPU で
+# 走った周期を記録する。フレームの刻みの切り分け用）に要る。
+# Win32_System_DataExchange は OpenClipboard / SetClipboardData / GetClipboardData ほか（ゲームの中のメニューが接続コードを
 # クリップボードへ写す・貼る。自分のプロセスのクリップボードの読み書きだけで、他の窓・入力・前面には触らない —— src/dll/src/clipboard_win.rs）に
 # 要る（GlobalAlloc / GlobalLock は Win32_System_Memory、GlobalFree は Win32_Foundation で、どちらも開けてある）。
 # Win32_UI_WindowsAndMessaging は EnumWindows / FlashWindowEx ほか、Win32_Media_Audio は PlaySoundW（繋がった知らせ。
 # 自分のプロセスの窓を探して点滅させ、合成した音を鳴らす。前面は奪わない —— src/dll/src/notify_win.rs）に要る。
 # Win32_Networking_WinSock は setsockopt（UPnP の SSDP を出すネットワークインターフェースを指定する IP_MULTICAST_IF の 1 回の呼び出しだけ —— src/dll/src/net_win.rs）に要る。
-# Win32_Networking_WinHttp は WinHttpOpen ほかと WinHttpWebSocket*（M4: 部屋サーバーへの WebSocket。OS の TLS とプロキシの設定を
-# そのまま使い、クレートは足さない —— docs/Design_Protocol.md §5-2・src/dll/src/room_win.rs）に要る。検査の偽サーバーの握手の
+# Win32_Networking_WinHttp は WinHttpOpen ほかと WinHttpWebSocket*（部屋サーバーへの WebSocket。OS の TLS とプロキシの設定を
+# そのまま使い、クレートは足さない —— src/dll/src/room_win.rs）に要る。検査の偽サーバーの握手の
 # SHA-1 は、開けてある Win32_Security_Cryptography の BCryptHash。
 # Win32_UI_Input_Ime は ImmAssociateContext ほか（部屋名の入力の間だけ、ゲームの窓から IME を切り離して、打った字が変換の途中の
 # 字にならないようにする。ゲームの窓の手続きの差し替え自体は Win32_UI_WindowsAndMessaging の SetWindowLongPtrW /
 # CallWindowProcW。自分のプロセスの窓だけ —— src/dll/src/text_input_win.rs）に要る。
-# Win32_UI_Input_KeyboardAndMouse は GetAsyncKeyState（数字キーの 0〜9 を読むだけ。遅れの量を試合中に替える —— src/dll/src/digit_keys_win.rs。
+# Win32_UI_Input_KeyboardAndMouse は GetAsyncKeyState（数字キーの 0〜9 などと P・Home を読むだけ。遅れの量を試合中に替える —— src/dll/src/digit_keys_win.rs、
+# 自分の PC のスクリーンショット —— src/dll/src/shot_key_win.rs。
 # このモジュールには入力を注ぐ API も入っているが、呼ぶのは読む 1 本だけで、OS への注入はしない）に要る。
 # Win32_Media_Multimedia は joyGetPosEx / joyGetDevCapsW と JOYINFOEX / JOYCAPSW（パッドの十字キー（POV）を読むだけ。花映塚が自分で呼ぶ
 # winmm の関数と同じもの。入力を注ぐ API ではない —— src/dll/src/pad_extra_win.rs）に要る。
+# Win32_NetworkManagement_IpHelper / Win32_NetworkManagement_Ndis は GetAdaptersAddresses とその構造体（`bind = auto` が外への経路を引けないとき、LAN の
+# アドレスをアダプターの一覧から選ぶ。LAN のホストが自分のアドレスを見せる。読むだけ —— src/dll/src/adapters_win.rs）に要る。
+# Wdk_Storage_FileSystem は NtQueryVirtualMemory（例外ハンドラが、例外の場所のモジュール名を、ローダーロックを取らずに写像から引く。src/crash_win.rs）に要る。
 windows-sys = { version = "0.61", features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Multimedia",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinHttp",
     "Win32_Networking_WinSock",
     "Win32_Security",
@@ -75,6 +82,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# 配る DLL のバージョン情報（.res）を作る。build.rs だけが使い、成果物には入らない（自作）。
+higanr_build_res = { path = "../build_res" }
 
 [dev-dependencies]
 # 検査だけ: 撮影の PNG を読み戻して画素を比べる（MIT OR Apache-2.0。core が符号化に使うものと同じ版）。

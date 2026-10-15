@@ -1,5 +1,5 @@
 //! 花映塚 1.50a（th09.exe）のアドレスと期待バイト列。**この値はここ 1 か所にだけ置く**（同定の値だけは `higanr_core::pe::TH09_V150A`）。
-//! 各行の `source` に、ノート（`analysis/notes/th09_hook_sites_M1a.md`）の節と逆アセンブルの行を書く。ノートに無い値は書かない
+//! 各行の `source` に、解析のノートの節と逆アセンブルの行を書く。ノートに無い値は書かない
 //! （転記ミスは `every_site_appears_in_the_note_with_its_address` が見る）。アドレスはすべて image base `0x400000` の VA（ASLR 無し）。
 #![forbid(unsafe_code)]
 
@@ -10,7 +10,7 @@ use crate::rollback_play::RbRenderReset;
 use crate::rollback_probe::{RbBlock, RbCallers, RbData, RbEffect, RbSkip, RbSkipKind, RbVmArray};
 use crate::sites::{SiteDef, Use};
 
-/// 地点の表の `source`（ノートの節と逆アセンブルの行）を置く。配布のビルド（feature `dist`）では `""` にする（友人に渡すバイナリに解析の跡を残さないため）。
+/// 地点の表の `source`（ノートの節と逆アセンブルの行）を置く。配布のビルド（feature `dist`）では `""` にする（配るバイナリに解析の跡を残さないため）。
 /// `macro_rules!` の定義を 2 つに分けるのは、配布のビルドでは文字列が展開の段階で消え、成果物に残るかをコンパイラの作りに頼らずに済むため。
 #[cfg(not(feature = "dist"))]
 macro_rules! site_source {
@@ -85,6 +85,11 @@ pub const IM_DOWN: u32 = 0x06;
 pub const IM_UP: u32 = 0x08;
 pub const IM_CHARGE: u32 = 0x2A;
 pub const IM_GAME: u32 = 0x2C;
+/// ゲーム自身のスクリーンショットが見る語（合成 `[2]` の押した瞬間 `+0x06` = `0x004ACF3A`）と、P・Home のビット。
+/// 読むのは Present のラッパ `0x0042DB50` の中の `0x0042DBAA`（`[2]+0x06 & 0x0800`。ノート `th09_title_and_d3d8.md` §2-6・`th09_input_and_wait_A0.md` §2。
+/// 逆アセンブルの読みで実機とは未照合）。`shot_key_win` が、自分の PC で P/Home を押した tick の Present のラッパを呼ぶ間だけ立てて戻す。
+pub const SHOT_WORD: u32 = INPUT_MANAGERS[2] + IM_DOWN;
+pub const SHOT_BIT: u16 = 0x0800;
 
 // 範囲の中のグローバル（CSV の列にするもの。値は u32 として読む）。
 /// 1P / 2P の Player へのポインタ（読み取りのスレッドがライフをたどる起点）。
@@ -258,6 +263,10 @@ pub const OPTIONS_BLOCK: u32 = 0x004B_3488;
 pub const OPTIONS_COPY_PTR: u32 = 0x004A_7E78;
 /// ブロックとコピーの中のチャージ型（`+0xB4` が 1P、`+0xB5` が 2P。自分の値は `+0xB4`）。
 pub const OPT_CHARGE: u32 = 0xB4;
+/// ブロックの中の入力機器（`+0xB7` が 1P、`+0xB8` が 2P。0 / 1 = パッド、2〜4 = キーボードの配置）。読むだけ。
+pub const OPT_INPUT_DEVICE: u32 = 0xB7;
+/// 1P の入力機器（`0x004B353F`）。
+pub const INPUT_DEVICE_P1: u32 = OPTIONS_BLOCK + OPT_INPUT_DEVICE;
 /// SELECT のダイジェストに入れる、意味の分からない欄（ブロックの中の `[始め, 終わり)`。`+0x6C`〜`+0xA3`・`+0xB3`・`+0xB6`・`+0xB9`）。
 pub const OPTION_DIGEST_RANGES: [(u32, u32); 4] =
     [(0x6C, 0xA4), (0xB3, 0xB4), (0xB6, 0xB7), (0xB9, 0xBA)];
@@ -582,6 +591,24 @@ pub const P1_WINS: u32 = 0x004A_7E98;
 pub const P2_WINS: u32 = 0x004A_7E9C;
 /// マッチの終わりのメニューが出ているか（1 バイト。1 = 出ている）。書くのは `movb` の 4 か所（`0x4170A8` / `0x4178BE` が 1、`0x43560C` / `0x435A4A` が 0）。
 pub const MATCH_END_MENU: u32 = 0x004A_7ECE;
+
+// ---- 対戦が終わった後の戻り道（`higanr_core::return_flow`）が読むだけのメニューの状態 ----
+// AsciiManager（`0x4CE458`）の on_tick `0x00435B00` が、一時停止のバイト `PAUSE` が 0 でなければ `0x00435BA8 lea 0x82a0(%esi),%ecx` →
+// `call 0x434740`、`MATCH_END_MENU` が 0 でなければ `0x00435BD4 lea 0xa7a8(%esi),%ecx` → `call 0x4355F0`。どちらも状態が `+0x00`、
+// フレームの数えが `+0x04`（関数の先頭の `mov %ecx,%esi` の後の `(%esi)` / `0x4(%esi)`）。実機で値を確かめていない。
+/// 一時停止のメニュー（`0x4D66F8`）。
+pub const PAUSE_MENU: u32 = 0x004C_E458 + 0x82A0;
+/// マッチの終わりのメニュー（`0x4D8C00`）。
+pub const END_MENU: u32 = 0x004C_E458 + 0xA7A8;
+pub const MENU_OBJ_STATE: u32 = 0x00;
+pub const MENU_OBJ_FRAMES: u32 = 0x04;
+// 足し算の書き誤りを建てるときに落とす。ascii.anm のスロット（`+0x8288`）より後ろの、重ならない 2 つの欄。
+const _: () = assert!(
+    PAUSE_MENU == 0x004D_66F8
+        && END_MENU == 0x004D_8C00
+        && PAUSE_MENU > ASCII_ANM_LOADED_PTR
+        && END_MENU > PAUSE_MENU + MENU_OBJ_FRAMES
+);
 
 // ---- 巻き戻しの可否実験: コピーする範囲・確保を DLL の領域へ向ける条件の値 ----
 // 入口のアドレスと期待バイト列は上の `ALLOC_SITES` の `crt_malloc` / `op_new` / `crt_free` の行をそのまま使う（転記しない）。
@@ -1131,7 +1158,8 @@ pub const ROLLBACK_EXCLUDED_CALLERS: &[RbCallers] = &[
         why: "BGM のストリームの通知の配列（DirectSound。0x43F8EC / 0x43F94C の new）",
     },
     // ゲームのスクリーンショット `0x42F540` は確保の包み `0x401340` を 2 回呼ぶ（`0x42F5D2` 0x2C B・`0x42F60E` 0xE1000 B）。転送が有効な間は DLL の領域へ入り、
-    // 片側の PC だけ領域の top と空きの並びが変わる（キー 0x800 は `SEND_MASK` の外なので相手は押さない）。終わりは `0x0042F75C ret $0x4`（3 B）の次。
+    // 片側の PC だけ領域の top と空きの並びが変わる（P/Home の 0x800 は試合の語のマスクの外なので相手へは送らない。自分の側では `shot_key_win` が
+    // Present のラッパを呼ぶ間だけ立てて撮る）。終わりは `0x0042F75C ret $0x4`（3 B）の次。
     RbCallers {
         start: 0x0042_F540,
         end: 0x0042_F75F,
@@ -1263,6 +1291,11 @@ pub const SE_PUSH_HEAD: [u8; 25] = [
 /// 初めて出た数を本ログで id 別に見るために名前を付ける。
 pub const SE_ID_CUTIN: u32 = 0x0E;
 pub const SE_ID_CUTIN_SPELL: u32 = 0x35;
+/// 選択の画面のカーソルの移動の SE の id とパン。カーソルを ±1 する `0x0042474A` の `0x004247D6 push $0x0`・`0x004247D8 push $0xc` →
+/// `0x004247DA mov $0x4dc698,%ecx` → `0x004247DF call 0x43e2f0`。キャラ選択で相手の席のカーソルを位置で書いたとき、同じ呼び出しで鳴らす
+/// （「ランダム」の道 `0x00428B48`〜 / `0x00428CC6`〜 は鳴らさない）。
+pub const SE_ID_MENU_CURSOR: u32 = 0x0C;
+pub const SE_PAN_MENU_CURSOR: i32 = 0;
 /// BGM の命令の待ち行列: 0x10C バイトの枠 × 31（`0x43EE40` の `cmpl $0x0,(%edx)`・`add $0x10c,%edx`・`cmp $0x1f,%eax`。`0x0043EE45 lea 0x1f88(%ecx)`・
 /// `0x0043EE50`〜`0x0043EE5F`）。枠の先頭の語が 0 なら空き。鳴らす `0x43F1F0` が詰め直す（`0x0043F51D mov $0x43,%ecx` の `rep movsl` = 0x10C バイト）。
 /// 積む側は走査の中、詰める側は走査の外なので、進め直しの前にバックアップして最後の回の前に戻す。
@@ -1496,6 +1529,11 @@ pub const SAVE_EST_PER_CHUNK: u32 = 0x54D9;
 pub const REPLAY_HEADER_PTR: u32 = 0x08;
 pub const REPLAY_HEADER_LEN: u32 = 0x1EC;
 pub const REPLAY_HEADER_STAGE_FLAGS: u32 = 0x20;
+/// 見出しの中のオプションの塊の位置（読み込みスレッドが `th09.cfg` 由来のオプションを 1 回だけ写す。0xCC バイトで、並びは `OPTIONS_BLOCK` と同じ）。
+/// 値は `higanr_core::replay_rewrite::OPTIONS_OFFSET`、写す箇所は `0x00421266`〜`0x00421271`。
+pub const REPLAY_HEADER_OPTIONS: u32 = 0xDC;
+/// 見出しの中のチャージ型（1P が `+0x190`、2P が `+0x191`）。ここが生きた試合の値と違うと、素の花映塚の再生がずれる。
+pub const REPLAY_HEADER_CHARGE: u32 = REPLAY_HEADER_OPTIONS + OPT_CHARGE;
 /// 面ごとの塊の列の先頭（`0x00420C8C lea 0x1c(%edi),%edx`）、その刻み（`0x00420CC2 add $0x18,%edx`）、塊の次
 /// （`0x00420CB4 mov 0x14(%eax),%eax`）。
 pub const REPLAY_STAGE_NODES: u32 = 0x1C;
@@ -1916,6 +1954,21 @@ mod tests {
     }
 
     #[test]
+    fn shot_word_is_the_pressed_word_of_the_composite_input_manager() {
+        const A0: &str = include_str!("../../../analysis/notes/th09_input_and_wait_A0.md");
+        const D3D: &str = include_str!("../../../analysis/notes/th09_title_and_d3d8.md");
+        assert_eq!(SHOT_WORD, 0x004A_CF3A);
+        assert_eq!(SHOT_BIT, 0x0800);
+        // 二つのノートが、Present のラッパの中の判定 `[2]+0x06 & 0x0800` と、P と Home の割り当てを書いている。
+        for note in [A0, D3D] {
+            assert!(note.contains("0x0042DBAA"), "判定の地点がノートに無い");
+            assert!(note.contains("[2]+0x06"), "判定の語がノートに無い");
+        }
+        assert!(A0.contains("P と Home=0x0800"));
+        assert!(A0.contains("Present の包みの中"));
+    }
+
+    #[test]
     fn poll_row_matches_the_note_and_overlaps_nothing() {
         const A0: &str = include_str!("../../../analysis/notes/th09_input_and_wait_A0.md");
         assert_eq!(POLL_SITES.len(), 1, "行は 1 つだけ");
@@ -2174,6 +2227,12 @@ mod tests {
     }
 
     #[test]
+    fn the_input_device_address_is_the_one_the_poll_reads() {
+        // 素の poll は `movzbl 0x4b353f(%ebx)`（`0x0042B8A4`）で席ごとの入力機器を読む。
+        assert_eq!(INPUT_DEVICE_P1, 0x004B_353F);
+    }
+
+    #[test]
     fn netplay_addresses_appear_in_the_design() {
         const DESIGN: &str = include_str!("../../../docs/Design_Architecture.md");
         let start = DESIGN
@@ -2428,6 +2487,22 @@ pub const TEX_GETLEVELDESC_SLOT: u32 = 0x38;
 pub const SURFACE_DESC_FORMAT: usize = 0;
 pub const SURFACE_DESC_WIDTH: usize = 6;
 pub const SURFACE_DESC_HEIGHT: usize = 7;
+
+// ---- 文字の描画の後で頂点の流れ 0 を戻す（読むだけ。ゲームには 1 バイトも書かない）----
+// ゲームの DrawPrimitive は `0x0043B4BB` の 1 か所だけ（DrawIndexedPrimitive は 0 か所）。その前の `0x0043B449`〜`0x0043B4A6` は、頂点の形の覚えが
+// 2 なら SetVertexShader（0x102）・SetStreamSource・段 0 の 2 つを飛ばす。ゲーム自身も DrawPrimitiveUP の後で覚えを 0xFF にする所がある
+// （`0x00417447` の DrawPrimitiveUP → `0x00417453 call 0x40e380`）。読み方は `overlay::stream0_to_restore`。
+/// AnmManager の頂点の形の覚え（1 バイト。`0x0043B449 cmpb $0x2,0x12886(%esi)`・`0x0043B4A6 movb $0x2`・`0x0040E380 movb $0xff`）。
+pub const ANM_VTX_FORMAT: u32 = 0x12886;
+/// 覚えがこの値なら、ゲームは流れ 0 に `[AnmManager + ANM_QUAD_VB]` が置いてあるものとして描く。
+pub const ANM_VTX_FORMAT_QUAD_VB: u8 = 2;
+/// ゲームの頂点バッファ（`0x0043BB4E` の CreateVertexBuffer（長さ 0x50・FVF 0x102・MANAGED）の書き先。`0x0043B465` が読み、
+/// `0x0043B478` で SetStreamSource。`0x0042F3D0` が Release して 0 にする）。
+pub const ANM_QUAD_VB: u32 = 0x12890;
+/// その stride（`0x0043B472 push $0x14`。作った直後の `0x0043BB8B` の SetStreamSource も同じ）。
+pub const ANM_QUAD_VB_STRIDE: u32 = 0x14;
+// 覚えから頂点バッファまでを 1 回で読む（`stream0_to_restore`）ので、この順で並び、バッファは 4 バイトの境目にあること。
+const _: () = assert!(ANM_VTX_FORMAT < ANM_QUAD_VB && ANM_QUAD_VB.is_multiple_of(4));
 
 #[cfg(test)]
 mod pacing_tests {
@@ -2715,6 +2790,20 @@ mod game_font_tests {
             [SURFACE_DESC_FORMAT, SURFACE_DESC_WIDTH, SURFACE_DESC_HEIGHT]
                 .iter()
                 .all(|&i| i < 8)
+        );
+    }
+
+    /// 壊れたら落ちる: 頂点の形の覚え・頂点バッファ・stride のどれかを書き写し損ねる（ゲームの頂点バッファでない値を流れ 0 に置く）。
+    #[test]
+    fn stream0_addresses_match_the_disassembly() {
+        assert_eq!(
+            (
+                ANM_VTX_FORMAT,
+                ANM_VTX_FORMAT_QUAD_VB,
+                ANM_QUAD_VB,
+                ANM_QUAD_VB_STRIDE
+            ),
+            (0x12886, 2, 0x12890, 0x14)
         );
     }
 }

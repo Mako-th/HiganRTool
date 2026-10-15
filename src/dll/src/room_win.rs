@@ -84,7 +84,6 @@ pub enum Step {
     ReceiveResponse,
     StatusCode,
     CompleteUpgrade,
-    CloseTimeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +154,20 @@ pub struct WebSocket {
     ws: Handle,
     _connect: Handle,
     _session: Handle,
+    /// close の待ちの上限を置けなかったときの `GetLastError`。Wine の winhttp はこの設定を断る（12009）が通信はできるので、
+    /// 接続は捨てず、close の待ちが既定の長さになるだけにする。
+    close_timeout_error: Option<u32>,
+}
+
+/// WebSocket のハンドルへ close の待ちの上限（ms）を置く。
+type CloseTimeoutSetter = fn(*mut c_void, u32) -> Result<(), u32>;
+
+fn set_close_timeout(ws: *mut c_void, ms: u32) -> Result<(), u32> {
+    if set_u32_option(ws, WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT, ms) {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
 }
 
 // SAFETY: WinHTTP のハンドルはどのスレッドから使ってもよい。WebSocket のハンドルは送り 1 本と受け 1 本を同時に持てる
@@ -171,6 +184,28 @@ impl WebSocket {
         proxy: Proxy,
         t: Timeouts,
         body_max: usize,
+    ) -> Result<WebSocket, OpenError> {
+        Self::open_with(ep, proxy, t, body_max, set_close_timeout)
+    }
+
+    /// 検査だけ: close の待ちの設定を差し替えて開く（Wine のように断られる場合を再現する）。
+    #[cfg(test)]
+    pub fn open_with_close_timeout(
+        ep: &Endpoint,
+        proxy: Proxy,
+        t: Timeouts,
+        body_max: usize,
+        setter: fn(*mut c_void, u32) -> Result<(), u32>,
+    ) -> Result<WebSocket, OpenError> {
+        Self::open_with(ep, proxy, t, body_max, setter)
+    }
+
+    fn open_with(
+        ep: &Endpoint,
+        proxy: Proxy,
+        t: Timeouts,
+        body_max: usize,
+        set_close_timeout: CloseTimeoutSetter,
     ) -> Result<WebSocket, OpenError> {
         let agent = wide(USER_AGENT);
         let access = match proxy {
@@ -277,21 +312,18 @@ impl WebSocket {
             Step::CompleteUpgrade,
         )?;
         drop(request);
-        if !set_u32_option(
-            ws.0,
-            WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
-            t.close_wait_ms,
-        ) {
-            return Err(OpenError::Transport {
-                step: Step::CloseTimeout,
-                code: last_error(),
-            });
-        }
+        let close_timeout_error = set_close_timeout(ws.0, t.close_wait_ms).err();
         Ok(WebSocket {
             ws,
             _connect: connect,
             _session: session,
+            close_timeout_error,
         })
+    }
+
+    /// close の待ちの上限を置けなかったときの番号（置けていれば `None`）。
+    pub fn close_timeout_error(&self) -> Option<u32> {
+        self.close_timeout_error
     }
 
     pub fn send_text(&self, text: &str) -> Result<(), u32> {

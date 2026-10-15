@@ -1840,7 +1840,7 @@ mod tests {
         use crate::netplay::End;
         use higanr_core::handshake::FailReason;
         let want = format!(
-            "相手の HiganRTool のバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じ zip の HiganRTool を使ってください。"
+            "相手のHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
         );
         let mut f = good();
         let (end, detail) =

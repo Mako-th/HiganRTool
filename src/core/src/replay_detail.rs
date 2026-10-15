@@ -13,6 +13,7 @@
 //! | `net` | `<ping 中央値 ms>.<ping 最大 ms>.<止まった回数>.<進め直しの回数>.<進め直しで進めた tick 数>`。測れなかった ping は `-` |
 //! | `r1`〜`r16` | ラウンドごと。`<frames>.<勝者>.<ライフ1P>.<ライフ2P>.<C2+C3 1P>.<同 2P>.<ボス 1P>.<同 2P>.<リバーサル 1P>.<同 2P>.<スコア 1P>.<同 2P>`。勝者は `1` / `2` / `-`、読めなかった値は `-` |
 //! | `rx` | 上限を越えて記録できなかったラウンドの数（0 のときは書かない） |
+//! | `charge` | 生きた試合で使った 1P / 2P のチャージ型 `<1P>.<2P>`（0 通常 / 1 チャージ。見出しへ書いた値と同じ。書けなかったときは書かない） |
 //!
 //! ゲームのスレッドの外（保管庫のスレッドと検査）で使うので、ヒープを使い、どんなバイト列でもパニックしない。
 #![forbid(unsafe_code)]
@@ -33,7 +34,8 @@ const KEY_START: usize = 2;
 const KEY_N: usize = 3;
 const KEY_NET: usize = 4;
 const KEY_RX: usize = 5;
-const KEY_ROUNDS: usize = 6;
+const KEY_CHARGE: usize = 6;
+const KEY_ROUNDS: usize = 7;
 const KEY_COUNT: usize = KEY_ROUNDS + MAX_ROUND_KEYS;
 
 /// このモジュールが書く・読むキー（並びは `values` の添字と同じ）。
@@ -45,6 +47,7 @@ pub const ALLOWED_KEYS: [&str; KEY_COUNT] = {
     k[KEY_N] = "n";
     k[KEY_NET] = "net";
     k[KEY_RX] = "rx";
+    k[KEY_CHARGE] = "charge";
     let mut i = 0;
     while i < MAX_ROUND_KEYS {
         k[KEY_ROUNDS + i] = ROUND_KEY_NAMES[i];
@@ -117,6 +120,8 @@ pub struct MatchDetail {
     pub rounds: Vec<RoundRec>,
     /// 記録の上限を越えて捨てたラウンドの数。
     pub rounds_dropped: u32,
+    /// 生きた試合で使った 1P / 2P のチャージ型（見出しへ書いたのと同じ値）。書けなかった・読めなかったときは `None`。
+    pub charge: Option<[u8; 2]>,
 }
 
 fn opt_u32(v: Option<u32>) -> String {
@@ -231,6 +236,14 @@ fn dash_u64(b: &[u8]) -> Option<Option<u64>> {
     }
 }
 
+/// `charge` の値 `<1P>.<2P>`（それぞれ 0〜255 の 10 進）を読む。
+fn parse_charge(v: &[u8]) -> Option<[u8; 2]> {
+    let mut it = v.split(|&b| b == b'.');
+    let p1 = u8::try_from(digits_u32(it.next()?)?).ok()?;
+    let p2 = u8::try_from(digits_u32(it.next()?)?).ok()?;
+    it.next().is_none().then_some([p1, p2])
+}
+
 impl MatchDetail {
     /// 書くキーと値（`ALLOWED_KEYS` の並び）。値は逃がす前。
     pub fn fields(&self) -> Vec<(&'static str, String)> {
@@ -252,6 +265,9 @@ impl MatchDetail {
         }
         if self.rounds_dropped > 0 {
             out.push((ALLOWED_KEYS[KEY_RX], self.rounds_dropped.to_string()));
+        }
+        if let Some([p1, p2]) = self.charge {
+            out.push((ALLOWED_KEYS[KEY_CHARGE], format!("{p1}.{p2}")));
         }
         for (i, r) in self.rounds.iter().enumerate() {
             if let Some(&key) = ALLOWED_KEYS.get(KEY_ROUNDS + i) {
@@ -335,6 +351,9 @@ impl DetailFields {
         }
         if let Some(v) = get(KEY_RX) {
             d.rounds_dropped = digits_u32(v).ok_or(bad(KEY_RX))?;
+        }
+        if let Some(v) = get(KEY_CHARGE) {
+            d.charge = Some(parse_charge(v).ok_or(bad(KEY_CHARGE))?);
         }
         let mut gap = false;
         for i in 0..MAX_ROUND_KEYS {
@@ -445,11 +464,14 @@ mod tests {
             }),
             rounds: vec![sample_round(0), sample_round(1), sample_round(2)],
             rounds_dropped: 1,
+            charge: Some([1, 0]),
         };
         let keys: Vec<&str> = d.fields().iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            ["sync", "build", "start", "n", "net", "rx", "r1", "r2", "r3"]
+            [
+                "sync", "build", "start", "n", "net", "rx", "charge", "r1", "r2", "r3"
+            ]
         );
         for k in &keys {
             assert!(ALLOWED_KEYS.contains(k), "{k}");
@@ -500,10 +522,49 @@ mod tests {
         assert_eq!(err(&[("n", "")]), MarkError::BadValue("n"));
         assert_eq!(err(&[("net", "1.2")]), MarkError::BadValue("net"));
         assert_eq!(err(&[("rx", "z")]), MarkError::BadValue("rx"));
+        for bad in [
+            "", "1", "1.", ".1", "1.0.0", "1.-", "a.0", "256.0", "0.256", "+1.0",
+        ] {
+            assert_eq!(
+                err(&[("charge", bad)]),
+                MarkError::BadValue("charge"),
+                "{bad:?}"
+            );
+        }
         assert_eq!(err(&[("r1", "1.2")]), MarkError::BadValue("r1"));
         // r1 が無いのに r2 がある（途切れている）。
         assert_eq!(err(&[("r2", &r2)]), MarkError::BadValue("r2"));
         assert_eq!(err(&[("r1", &r1), ("r3", &r2)]), MarkError::BadValue("r3"));
+    }
+
+    /// 壊れたら落ちる: 席の入れ替え・値を出さない・無いのに出す。
+    #[test]
+    fn charge_round_trips_and_is_absent_when_unknown() {
+        for c in [[1u8, 0], [0, 1], [0, 0], [1, 1]] {
+            let d = MatchDetail {
+                charge: Some(c),
+                ..MatchDetail::default()
+            };
+            assert_eq!(d.fields(), vec![("charge", format!("{}.{}", c[0], c[1]))]);
+            let back = feed(&[("charge", &format!("{}.{}", c[0], c[1]))])
+                .finish()
+                .unwrap()
+                .unwrap();
+            assert_eq!(back, d);
+        }
+        // 席は 1P . 2P の順。
+        let d = feed(&[("charge", "1.0")]).finish().unwrap().unwrap();
+        assert_eq!(d.charge, Some([1, 0]));
+        // 無いときは出さない。
+        let none = MatchDetail {
+            sync: Some(SyncKind::Delay),
+            ..MatchDetail::default()
+        };
+        assert!(none.fields().iter().all(|(k, _)| *k != "charge"));
+        assert_eq!(
+            feed(&[("sync", "delay")]).finish().unwrap().unwrap().charge,
+            None
+        );
     }
 
     #[test]

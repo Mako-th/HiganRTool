@@ -24,7 +24,7 @@ export { WatchList } from "./watch_list";
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     // 更新のエンドポイント（/update/…）。Durable Object にも回数の数えにも触らない（回すだけのエンドポイント）。ルームのエンドポイントより先に見る。
-    const update = handleUpdate(req, env.UPDATE_BASE_URL);
+    const update = await handleUpdate(req, env.UPDATE_BASE_URL);
     if (update !== null) return update;
     const url = new URL(req.url);
 

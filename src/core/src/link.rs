@@ -95,7 +95,7 @@ use crate::match_gate::Gate;
 use crate::pong::PongResponder;
 use crate::rollback::{self, After, Rollback, Window};
 use crate::seal::{DirKeys, Ephemeral, KeySeed, Opener, PUBLIC_LEN, Sealer, Sender, Seq};
-use crate::selection::{FrameOut, Press, Selection};
+use crate::selection::{FrameOut, PeerCursor, Press, Selection};
 use crate::wire::{
     self, ByeReason, Check, Datagram, DecodeError, FormatValue, HostState, Input, MAX_DATAGRAM,
     MAX_WORDS, Message, Mode, Seat, Select,
@@ -1348,6 +1348,16 @@ impl Connected {
         self.sel.leave();
     }
 
+    /// 次に送る MENU に載せる自分の画面と自分の席のキャラのカーソル（`Selection::set_own_cursor`）。`selection_frame` の前に呼ぶ。
+    pub fn set_menu_cursor(&mut self, screen: u8, cursor: u8) {
+        self.sel.set_own_cursor(screen, cursor);
+    }
+
+    /// 相手の席の最新の位置（`Selection::take_peer_cursor`。`moved` は取ると消える）。
+    pub fn take_peer_cursor(&mut self) -> Option<PeerCursor> {
+        self.sel.take_peer_cursor()
+    }
+
     pub fn selection_frame<O: Outlet, F: FnOnce(&FrameOut) -> SelExit>(
         &mut self,
         local: u16,
@@ -1483,7 +1493,8 @@ impl Connected {
         let auto = self.auto_on();
         let (lo, hi) = crate::delay_pick::bounds(target);
         let d = if auto {
-            crate::delay_pick::recommend(target, self.rtt_for_recommend_ms())
+            self.recommend_for(target)
+                .map(|r| r.raw)
                 .unwrap_or_else(|| self.shown_delay())
         } else {
             self.shown_delay()
@@ -1534,22 +1545,30 @@ impl Connected {
         }
     }
 
-    /// 今の推奨値（`delay_pick::recommend`）: 直近の往復の中央値（3 回に満たなければ無い）、無ければ最後の往復。どちらも無ければ
-    /// `None`。
+    /// 今の推奨値（`delay_pick::recommend_with_max`）: 直近の往復の中央値（3 回に満たなければ最後の往復。どちらも無ければ `None`）で引き、
+    /// 窓の最大がしきい値以下なら 0。画面の推奨値も auto もこの入口を通る。
     pub fn recommend_now(&self) -> Option<u8> {
-        crate::delay_pick::recommend(self.mode, self.rtt_for_recommend_ms())
+        self.recommend_pair_now().map(|r| r.raw)
     }
 
     /// 推奨値の素と「上げる判断用」の組（同じ往復から引く。素は `recommend_now` と同じ値）。
     pub fn recommend_pair_now(&self) -> Option<crate::delay_pick::Recommend> {
-        crate::delay_pick::Recommend::from_rtt(self.mode, self.rtt_for_recommend_ms())
+        self.recommend_for(self.mode)
     }
 
-    fn rtt_for_recommend_ms(&self) -> Option<u32> {
-        self.live
+    fn recommend_for(&self, mode: Mode) -> Option<crate::delay_pick::Recommend> {
+        let (median, max) = self.rtt_for_recommend_ms();
+        crate::delay_pick::Recommend::from_rtt_max(mode, median, max)
+    }
+
+    /// 推奨値を引く往復 (中央値 ms, 窓の最大 ms)。中央値が無い（3 個に満たない）間は最後の往復で、最大は無い（0 を推さない）。
+    fn rtt_for_recommend_ms(&self) -> (Option<u32>, Option<u32>) {
+        let median = self
+            .live
             .rtt_median_us()
             .map(|us| us / 1_000)
-            .or_else(|| self.live.rtt_ms())
+            .or_else(|| self.live.rtt_ms());
+        (median, self.live.rtt_max_ms())
     }
 
     fn refresh_recommend(&mut self) {
@@ -2891,6 +2910,79 @@ mod tests {
         assert!(!p.ca().auto_on(), "数字の押下で旗が降りない");
     }
 
+    /// 往復の窓の最大が小さいときだけ推奨値が 0 になり、auto の押下と形式の切替の D もその 0 を使う。境目は手で数えた値
+    /// （delay 方式 8 ms で 0・9 ms で 1、rollback 16 ms で 0・17 ms で 1。窓に 3 個無ければ 0 を推さない）。
+    #[test]
+    fn a_pong_window_with_a_small_max_recommends_zero() {
+        use crate::delay_pick::AUTO;
+        let mut p = Pair::connect();
+        let mut k = 0u32;
+        // 両側に同じ往復の PONG を返す（B がホスト、A がゲスト）。
+        let mut pong = |p: &mut Pair, rtt: u32| {
+            k += 1;
+            let tk = p.now + 5_000 * k;
+            p.a.poll(tk, &mut p.qa);
+            p.b.poll(tk, &mut p.qb);
+            p.qa.take();
+            p.qb.take();
+            let to_a = enc_to(&p.a, SID, &Message::Pong { send_time: tk });
+            p.a.on_datagram_at(addr(PORT_B), &to_a, tk + rtt, tk + rtt, false, &mut p.qa);
+            let to_b = enc_to(&p.b, SID, &Message::Pong { send_time: tk });
+            p.b.on_datagram_at(addr(PORT_A), &to_b, tk + rtt, tk + rtt, false, &mut p.qb);
+        };
+        fn host(p: &mut Pair) -> &mut Connected {
+            p.b.connected_mut().unwrap()
+        }
+        assert_eq!(host(&mut p).role(), Role::Host, "B がホスト");
+        // 繋がった時の PING の 1 個と合わせて 2 個: 小さくても 0 を推さない。
+        pong(&mut p, 2);
+        assert_eq!(p.ca().liveness().rtt_max_ms(), None, "窓は 2 個");
+        assert_eq!(
+            p.ca().recommend_now(),
+            Some(1),
+            "測った数が 2 個では 0 を出さない"
+        );
+        pong(&mut p, 3);
+        pong(&mut p, 8);
+        assert_eq!(p.ca().liveness().rtt_max_ms(), Some(8));
+        assert_eq!(p.ca().recommend_now(), Some(0), "delay 方式: 最大 8 ms");
+        assert_eq!(
+            p.ca().recommend_pair_now(),
+            Some(crate::delay_pick::Recommend { raw: 0, up: 0 })
+        );
+        host(&mut p).press_delay(5);
+        host(&mut p).press_delay(AUTO);
+        assert!(host(&mut p).auto_on());
+        assert_eq!(
+            host(&mut p).shown_delay(),
+            0,
+            "9 を押した瞬間に素の 0 を使う"
+        );
+        pong(&mut p, 9);
+        assert_eq!(p.ca().recommend_now(), Some(1), "delay 方式: 最大 9 ms");
+        // 同じ窓を rollback の式で引くと 16 ms まで 0、17 ms で 1（形式の切替の D）。
+        let to_rb = |p: &mut Pair| host(p).format_value_for(Mode::Rollback).delay;
+        assert_eq!(to_rb(&mut p), 0, "rollback: 最大 9 ms");
+        pong(&mut p, 16);
+        assert_eq!(p.ca().recommend_now(), Some(1), "delay 方式: 最大 16 ms");
+        assert_eq!(to_rb(&mut p), 0, "rollback: 最大 16 ms");
+        pong(&mut p, 17);
+        assert_eq!(to_rb(&mut p), 1, "rollback: 最大 17 ms");
+        // 窓が 8 個とも小さくなれば 0 に戻る（古い 9・16・17 が窓から外れるまで 0 にしない）。
+        for _ in 0..7 {
+            assert_eq!(p.ca().recommend_now(), Some(1));
+            pong(&mut p, 2);
+        }
+        assert_eq!(p.ca().recommend_now(), Some(1), "17 ms がまだ窓にある");
+        pong(&mut p, 2);
+        assert_eq!(
+            p.ca().recommend_now(),
+            Some(0),
+            "窓の最大が 8 ms 以下に戻った"
+        );
+        assert_eq!(to_rb(&mut p), 0);
+    }
+
     /// ホスト側・ゲスト側のセッションと `Outlet` を取り出す（`(host, guest, host の Outlet, guest の Outlet, host の送り元のアドレス)`）。
     fn host_guest(p: &mut Pair) -> (&mut Link, &mut Link, &mut Q, &mut Q, SocketAddr) {
         if p.a.connected().unwrap().role() == Role::Host {
@@ -3253,6 +3345,9 @@ mod tests {
                 base: 0,
                 count: 0,
                 words: [0; MAX_WORDS],
+                screen: 0,
+                cursor: wire::CURSOR_NONE,
+                shared: [wire::CURSOR_NONE, 0],
             }),
         )
     }

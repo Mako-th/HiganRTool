@@ -19,7 +19,7 @@
 //! - vpatch（`higanr_core::pacing_vpatch`。測定専用の `mode = vpatch`）: 先頭で「期限 − 準備時間」まで普通の待機タイマーで寝てから始め、Present の直前（`Pacer::before_present`）で期限まで待つ。
 //!   遅延の表の「vpatch 相当」の列を測るためのもので、既定の経路は変えない（他の方式では Present の前のフックは何もしない）。
 //! - b-hybrid（`higanr_core::pacing_hybrid`）: B の格子のまま、残りが「回し読み 1 ms + 余裕」より多い間は待機タイマーで寝て（1 回最大 1 ms）、余裕の間は
-//!   b-spin と同じく `Sleep(0)` で譲り、最後の 1 ms は同じ回し読み。CPU を下げるための形で、既定ではない（`mode = b-hybrid`、auto のウィンドウなら `auto_window = b-hybrid`、
+//!   b-spin と同じく `Sleep(0)` で譲り、最後の 1 ms は同じ回し読み。処理の重さを下げるための形で、既定ではない（`mode = b-hybrid`、auto のウィンドウなら `auto_window = b-hybrid`、
 //!   cycle なら `cycle_phases` に入れる）。寝る長さと余裕の決め方は core にだけ書く。
 #![forbid(unsafe_code)]
 

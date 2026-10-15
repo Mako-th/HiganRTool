@@ -31,7 +31,7 @@
 //! - 一覧の「名前　<今の名前>」（`Menu::with_player_name`。何も待っていない間だけ）を決めると、ルーム名と同じ形の入力
 //!   （`WM_CHAR`・Backspace・Enter・Esc）になり、決めた名前は `Cmd::Name` で `UiLink` の入れ物（`PlayerNameBox`）へ置かれる。
 //!   指示のリングバッファは通さない（見張り・ネットワークを開くスレッドが次に名乗るときに入れ物から読む: `GameWatcher::refresh_player_name`・
-//!   `script_win::LazyNet::settings_now`）。覚えるファイルへは別のスレッド（`script_win::save_player_name`。ゲームのスレッドで
+//!   `script_win::LazyNet::settings_now`）。ini の `name` へは別のスレッド（`ini_save::save_name`。ゲームのスレッドで
 //!   書かない）が書く（`name_saver`）。
 //! - 対戦中は、上の枠の左に「1P 名前」・右に「名前 2P」（右寄せ）、通信の状態の行は下の枠の左（`draw_board` の `Band`）。
 //!   名前は HELLO で交換した値（`Established::own_name` / `peer_name`）を、`NetPlay::hud_facts` が席に合わせて並べて渡す
@@ -50,6 +50,12 @@
 //! 呼び手へ伝わり、対戦者のネットワークは開かない。観戦者のセッションを手放した後（`after_watch_teardown`）は、観戦の終わりの理由を左上に
 //! 残したまま、メニューが対戦者の項目（作る・貼る・ルームで待つ・ルームで観戦）に戻る。
 //!
+//! ## 観戦コードのコピー（Ctrl+C）
+//! 見つかった・つながった間（`Conn::is_linked`）は、毎 tick `copy_tick` が Ctrl+C の押した瞬間を読み（Ctrl+数字と同じ取り方）、
+//! 見張りへ `Cmd::CopySpectateCode` を 1 回送る。結果（コピーした・ゲストなのでコピーしない・書けなかった）は見張りが `Note` の出来事で返し、
+//! `ROW_COPY` の 1 行に数秒出す。ホストには、つながった直後の左上に案内の 1 行を出す。rollback のマッチの間は `tick` が呼ばれないので、
+//! `script_win::rb_scan_handler` が同じ `copy_tick` を呼ぶ。
+//!
 //! ## つなぎ直し
 //! つながりが終わってマッチの外へ戻ると、`script_win` がネットワークのセッションを手放し（`NetUi::after_teardown`）、ワーカースレッドがネットワークの組を
 //! 片づける（`UiLink::reset_for_next_watcher` が前の見張りの残りを消す）。メニューの入れ物とメニューとのインターフェースは実行に 1 つのまま残り、
@@ -63,16 +69,20 @@ use std::sync::Arc;
 use higanr_core::delay_pick::DelayChoice;
 use higanr_core::handshake::Name;
 use higanr_core::input_model::{InputState, keys};
-use higanr_core::lang::Lang;
+use higanr_core::lan_addr::{AddrBuf, LanAddr};
+use higanr_core::lang::{Lang, Tx};
 use higanr_core::menu_model::{CANCEL_BITS, SCREEN_DIFFICULTY};
 use higanr_core::mode_pick::{MAX_PICK_DELAY, Pick, Shape};
+use higanr_core::net_menu::return_lines;
 use higanr_core::net_menu::{
-    Answer, Cmd, Conn, HudView, LineBuf, MENU_ROWS, Menu, MenuRows, NOTE_WORDS, Note, PeerStats,
-    RewindWindow, RoomItem, STALL_ROWS, Stall, TextIn, TickIn, WatchHudView, corner_is_band,
-    corner_lines, hud_line, name_band_line, stall_block, watch_hud_line,
+    Answer, Cmd, Conn, Event, HudView, LineBuf, MENU_ROWS, Menu, MenuRows, NOTE_WORDS, Note,
+    PeerStats, RewindWindow, RoomItem, STALL_ROWS, Stall, T_PEER_WAIT, T_SPECTATE_NEXT_SELECT,
+    TextIn, TickIn, WatchHudView, copy_hint, copy_notice, corner_is_band, corner_lines, hud_line,
+    name_band_line, stall_block, watch_hud_line,
 };
 use higanr_core::overlay::{AtlasSpec, MAX_TEXT_UTF8, Vertex, utf16_to_utf8};
 use higanr_core::player_name::{NAME_BUF_WORDS, NameBuf};
+use higanr_core::return_flow::{self, Facts, Finish, Flow, Reads, Screen, Why};
 use higanr_core::room_input::{ROOM_BUF_WORDS, RoomBuf};
 use higanr_core::ui_entry::{self, Advance, EntryView, SCREEN_MATCH_MODE};
 use higanr_core::ui_layout::{self as lay, HUD_BAND_H, HUD_TEXT_MAX_W, HUD_X, HUD_Y, RowStyle};
@@ -81,6 +91,8 @@ use higanr_core::watch_list::{
 };
 use higanr_core::wire::{ByeReason, Mode, Seat, SeatWish};
 
+use crate::digit_keys::{self, DigitEdge};
+use crate::netplay::REQ_SAVE_AND_QUIT;
 use crate::netplay::{Action, Game, Net, NetPlay, Phase, SCENE_MATCH};
 use crate::overlay::{TEXT_UNITS, TextBox};
 use crate::scripted::SCENE_MENU;
@@ -102,6 +114,8 @@ pub enum Order {
     SpectateCancel,
     /// ランダムマッチの待ち列に入る（名の入れ物は使わない: ルーム名はサーバーが割り当てる）。
     Random,
+    /// 観戦コードをコピー（対戦の最中。ホストの見張りがクリップボードへ書く）。
+    SpectateCopy,
 }
 
 impl Order {
@@ -114,6 +128,7 @@ impl Order {
             Order::Spectate => 5,
             Order::SpectateCancel => 6,
             Order::Random => 7,
+            Order::SpectateCopy => 8,
         }
     }
 
@@ -126,6 +141,7 @@ impl Order {
             5 => Some(Order::Spectate),
             6 => Some(Order::SpectateCancel),
             7 => Some(Order::Random),
+            8 => Some(Order::SpectateCopy),
             _ => None,
         }
     }
@@ -151,7 +167,7 @@ pub struct UiLink {
     room_name: RoomNameBox,
     /// 観戦の「ルームマッチ」の入力で決めた名（`Order::Spectate` を積む前に書く）。対戦の「ルームマッチ」の名と入れ違わないよう別の入れ物にする。
     spectate_name: RoomNameBox,
-    /// メニューで決めたプレイヤー名（`Cmd::Name`。決めていなければ空で、ネットワークを開くスレッドは ini・覚えたファイルの名前を使う）。
+    /// メニューで決めたプレイヤー名（`Cmd::Name`。決めていなければ空で、ネットワークを開くスレッドは ini の名前を使う）。
     /// 書き手はゲームのスレッド、読み手はネットワークを開くスレッドと見張りのスレッド。
     player_name: PlayerNameBox,
     /// 観戦の「ランダムマッチ」の一覧（書き手は一覧の接続のスレッド `watch_feed`、読み手はゲームのスレッド）。
@@ -161,6 +177,8 @@ pub struct UiLink {
     /// 一覧から選んだ行（`Cmd::SpectateListed`。`Order::Spectate` を積む前に書く）。読み手は観戦者のネットワークを開く仕事。
     /// 観戦の「ルームマッチ」を決めると空にする（古い選びが入力した名を奪わないように）。
     spectate_pick: WatchRowBox,
+    /// 観戦の決定が「観戦コード入力」か（1 = 観戦コード、0 = ルーム名か一覧の行）。`Order::Spectate` を積む前に書く。
+    spectate_by_code: AtomicU32,
 }
 
 impl Default for UiLink {
@@ -222,6 +240,7 @@ impl UiLink {
             watch_list: WatchListBox::new(),
             watch_gen: AtomicU32::new(0),
             spectate_pick: WatchRowBox::new(),
+            spectate_by_code: AtomicU32::new(0),
         }
     }
 
@@ -240,6 +259,9 @@ impl UiLink {
             Cmd::Seat(w) => self.seat.store(1 + seat_code(w), Ordering::Release),
             // 言語は見張りに関係しない（ini へ書くのは `NetUi::lang_saver` が起こす別のスレッド）。
             Cmd::Lang(_) => {}
+            // LAN の申し込みは見張りへの指示ではない（見張りはまだ居ない。ゲームのスレッドが `UiOut::lan` で呼び手へ頼み、LAN の運び手のスレッドが
+            // 自分で指示のリングバッファを読む）。
+            Cmd::LanHost | Cmd::LanClient(_) | Cmd::LanWatch(_) => {}
             Cmd::Create => self.push(Order::Create),
             Cmd::Paste => self.push(Order::Paste),
             Cmd::Cancel => self.push(Order::Cancel),
@@ -251,13 +273,21 @@ impl UiLink {
             Cmd::Spectate(name) => {
                 self.spectate_name.publish(&name);
                 self.spectate_pick.publish(None);
+                self.spectate_by_code.store(0, Ordering::Release);
                 self.push(Order::Spectate);
             }
             Cmd::SpectateListed(row) => {
                 self.spectate_pick.publish(Some(&row));
+                self.spectate_by_code.store(0, Ordering::Release);
+                self.push(Order::Spectate);
+            }
+            Cmd::SpectateCode => {
+                self.spectate_pick.publish(None);
+                self.spectate_by_code.store(1, Ordering::Release);
                 self.push(Order::Spectate);
             }
             Cmd::SpectateCancel => self.push(Order::SpectateCancel),
+            Cmd::CopySpectateCode => self.push(Order::SpectateCopy),
         }
     }
 
@@ -275,6 +305,11 @@ impl UiLink {
     /// 観戦者のネットワークを開く仕事（`script_win::open_watch_net`）が読む、`Cmd::Spectate` に添えられたルーム名（`room_name` と同じ読み方。別の入れ物）。
     pub fn spectate_name(&self) -> Option<RoomBuf> {
         (0..4).find_map(|_| self.spectate_name.read())
+    }
+
+    /// 観戦者のネットワークを開く仕事が読む: 最後の観戦の決定が「観戦コード入力」か（真ならクリップボードの観戦コードでホストへ直に繋ぐ）。
+    pub fn spectate_by_code(&self) -> bool {
+        self.spectate_by_code.load(Ordering::Acquire) != 0
     }
 
     /// 観戦者のネットワークを開く仕事が読む、一覧から選んだ行（選んでいなければ `None`。この場合は `spectate_name` を使う）。
@@ -695,7 +730,11 @@ pub const ROW_NAME_R: usize = MENU_ROWS + 5;
 pub const ROW_TL2: usize = MENU_ROWS + 6;
 pub const ROW_TL3: usize = MENU_ROWS + 7;
 pub const ROW_TL4: usize = MENU_ROWS + 8;
-pub const BOARD_ROWS: usize = MENU_ROWS + 9;
+/// 相手を待つ知らせの 1 行（`NetPlay::peer_wait_shown`）。左上の行の続きに描く。
+pub const ROW_PEER_WAIT: usize = MENU_ROWS + 9;
+/// つながっている間の観戦コードの知らせ（ホストへの案内と、Ctrl+C の結果）の 1 行。左上の行の続きに描く。
+pub const ROW_COPY: usize = MENU_ROWS + 10;
+pub const BOARD_ROWS: usize = MENU_ROWS + 11;
 pub const SHOW_MENU: u32 = 1;
 pub const SHOW_TL0: u32 = 2;
 pub const SHOW_TL1: u32 = 4;
@@ -708,6 +747,9 @@ pub const SHOW_NAMES: u32 = 32;
 pub const SHOW_TL2: u32 = 64;
 pub const SHOW_TL3: u32 = 128;
 pub const SHOW_TL4: u32 = 256;
+pub const SHOW_PEER_WAIT: u32 = 512;
+/// 観戦コードの知らせ（`ROW_COPY`）。
+pub const SHOW_COPY: u32 = 1024;
 /// 左上の行の旗と行の組（上から順）。
 const TL_ROWS: [(u32, usize); STALL_ROWS] = [
     (SHOW_TL0, ROW_TL0),
@@ -718,6 +760,8 @@ const TL_ROWS: [(u32, usize); STALL_ROWS] = [
 ];
 /// マッチ中だけ出る旗（`hud` が決める。メニュー・左上の行の更新が残す側）。
 const SHOW_MATCH: u32 = SHOW_HUD | SHOW_NAMES;
+/// メニュー・左上の行の更新が消さずに残す旗（相手を待つ知らせは `peer_wait` だけが、観戦コードの知らせは `copy_tick` だけが決める）。
+const SHOW_KEPT: u32 = SHOW_MATCH | SHOW_PEER_WAIT | SHOW_COPY;
 
 /// 左上の行の置き場（画素。ゲームの上の枠の下から）。マッチ中の行の置き場と幅の上限は `ui_layout` の `HUD_*`。
 const TL_X: u32 = 6;
@@ -860,11 +904,17 @@ pub fn draw_board(
         }
     }
     let mut buf = [0u8; MAX_TEXT_UTF8];
-    for (line, (bit, row)) in TL_ROWS.into_iter().enumerate() {
-        let line = line as u32;
+    // 左上の行は出ているものを上から詰める（相手を待つ知らせは左上の行の続き）。
+    let mut next_line = 0u32;
+    for (bit, row) in TL_ROWS
+        .into_iter()
+        .chain([(SHOW_PEER_WAIT, ROW_PEER_WAIT), (SHOW_COPY, ROW_COPY)])
+    {
         if show & bit == 0 {
             continue;
         }
+        let line = next_line;
+        next_line += 1;
         let Some((text, style)) = board.read_row(row, &mut buf) else {
             continue;
         };
@@ -1014,7 +1064,7 @@ pub struct HudFacts {
     pub rtt_ms: Option<u32>,
     /// rollback のとき、前の tick から今までに進め直した更新の数（`Rollback::stats` の差）。delay 方式なら `None`。
     pub rewound: Option<u32>,
-    /// 遅れの推奨値（`delay_pick::recommend`。RTT が測れていなければ `None`）。
+    /// 遅れの推奨値（`Connected::recommend_now`。RTT が測れていなければ `None`）。
     pub recommend: Option<u8>,
     /// auto の旗（ホストは自分の旗、ゲストはホストの旗か自分の auto の要求 —— `Connected::shown_auto`）。立っていれば行の括弧の中は `A`。
     pub auto: bool,
@@ -1068,6 +1118,23 @@ pub struct UiOut {
     /// 観戦の「ルームマッチ」が決まった（この tick に `Cmd::Spectate` を見張りへ送った）。呼び手が観戦者のネットワークを開く仕事を頼む
     /// （`script_win::request_spectate`）。対戦者のネットワークは開かない（`open_net` は出ない。インターネット越しの観戦 v1）。
     pub spectate_open: bool,
+    /// 戻り道（`return_flow`）が、終わりのメニューの「リプレイを保存して終了」で試合の場面を出るのを見た。呼び手が保存の画面を飛ばす
+    /// 印を立てる（`save_skip`）。
+    pub save_quit: bool,
+    /// LAN の項目が決まった（この tick に `Cmd::LanHost` / `Cmd::LanClient` / `Cmd::LanWatch` が出た）。呼び手が LAN の運び手のスレッドを起こす
+    /// （`script_win::request_lan`）。対戦者のネットワークはここでは開かない（`open_net` は出ない）。
+    pub lan: Option<LanAsk>,
+}
+
+/// LAN の項目で頼まれたこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanAsk {
+    /// ホストとして待つ。
+    Host,
+    /// 打ったアドレスのホストへ、対戦者として参加を申し込む。
+    Client(LanAddr),
+    /// 打ったアドレスのホストへ、観戦を申し込む。
+    Watch(LanAddr),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1086,6 +1153,13 @@ const AUTO_MAX_TICKS: u32 = 600;
 
 /// 取消の語（X。確かめの枠で「はい」と答えた後、ゲームへ 1 tick だけ通す）。
 const KEY_CANCEL: u16 = keys::X;
+
+/// 観戦コードのコピーの結果を左上に出す秒数（UNIX 秒の刻みなので 4〜5 秒）。
+const COPY_NOTICE_SECS: u64 = 5;
+
+/// Ctrl+C を頼んでから結果の出来事を待つ上限（秒）。見張りは 50 ms ごとに指示を取るので普段は 1 秒もかからない。
+/// 超えたら（見張りがまだつながりを見ていない等）結果を待つのをやめる。
+const COPY_WAIT_SECS: u64 = 10;
 
 pub struct NetUi {
     menu: Menu,
@@ -1122,14 +1196,30 @@ pub struct NetUi {
     /// いまの入力で、ゲートを開けようとした（開けられたかは `text_gate`。入力を出ると false に戻る）。
     text_gate_tried: bool,
     hud_names: Option<HudNames>,
-    /// プレイヤー名を決めたとき（`Cmd::Name`）に呼ぶ、覚えるファイルへ書く仕事（`script_win::save_player_name`）。
-    /// ゲームのスレッドでファイルに書かないため、別のスレッドを起こして書かせる。置かなければ（検査）覚えない。
+    /// プレイヤー名を決めたとき（`Cmd::Name`）に呼ぶ、ini の `name` へ書く仕事（`ini_save::save_name`）。
+    /// ゲームのスレッドでファイルに書かないため、別のスレッドを起こして書かせる。置かなければ（検査）書かない。
     name_saver: Option<fn(NameBuf)>,
-    /// 設定の「ルーム名」を決めたとき（`Cmd::RoomSet`）に呼ぶ、前に使ったルーム名を覚える仕事（`script_win::save_room_name`。
-    /// `name_saver` と同じ作り）。置かなければ（検査）覚えない。
+    /// 設定の「ルーム名」を決めたとき（`Cmd::RoomSet`）に呼ぶ、ini の `room` へ書く仕事（`ini_save::save_room`。
+    /// `name_saver` と同じ作り）。置かなければ（検査）書かない。
     room_saver: Option<fn(RoomBuf)>,
     /// 言語を替えたとき（`Cmd::Lang`）に呼ぶ、今の言語を置いて ini へ書く仕事（`script_win::save_ui_lang`）。置かなければ（検査）書かない。
     lang_saver: Option<fn(Lang)>,
+    /// LAN のホストのアドレスを決めたとき（`Cmd::LanClient` / `Cmd::LanWatch`）に呼ぶ、ini の `lan_host` へ書く仕事（`ini_save::save_lan_host`）。
+    /// 置かなければ（検査）書かない。
+    lan_saver: Option<fn(LanAddr)>,
+    /// Ctrl+C（観戦コードのコピー）の押した瞬間の取り方。数字・Tab の取り方（`NetPlay` の持つもの）とは別に持つ（二重に `feed` しても
+    /// 取り合わないように）。
+    copy_edge: DigitEdge,
+    /// ホストの案内（「Ctrl+C で観戦コードをコピーできます。」）を出す実行か（ini の `[spectate] enable = 1`）。
+    copy_hint_on: bool,
+    /// コピーを頼んだ後、結果の出来事を待っている（頼んだ時点の `Note::seq` と、待つのをやめる UNIX 秒）。
+    copy_wait: Option<(u32, u64)>,
+    /// 左上に出している結果の出来事と、消す UNIX 秒。
+    copy_shown: Option<(Event, u64)>,
+    /// 同期方式かディレイを替えたとき（`Cmd::Shape`）に呼ぶ、ini の `mode` と `delay` へ書く仕事（`ini_save::save_shape`）。置かなければ（検査）書かない。
+    shape_saver: Option<fn(Pick, DelayChoice)>,
+    /// サイドを替えたとき（`Cmd::Seat`）に呼ぶ、ini の `host_seat` へ書く仕事（`ini_save::save_seat`）。置かなければ（検査）書かない。
+    seat_saver: Option<fn(SeatWish)>,
     /// 観戦の「ランダムマッチ」の一覧の画面に入った（`true`）・出た（`false`）ときに呼ぶ、一覧の接続を開け閉めする仕事（`script_win`。
     /// 開ける仕事はスレッドを起こす。メニューの外では呼ばない）。置かなければ（検査）一覧は届かない。
     watch_feed: Option<fn(bool)>,
@@ -1140,6 +1230,18 @@ pub struct NetUi {
     watch_scratch: Box<WatchSnapshot>,
     /// 読んだ一覧のバージョン（`UiLink::read_watch_list`）。
     watch_seen: u32,
+    /// 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す（`with_return_flow`。置かない実行・検査は今までどおり）。
+    ret_on: bool,
+    /// 戻している途中。
+    ret: Option<Flow>,
+    /// 戻した理由（左上の 1 行目）。入口のメニューを開く・次の相手と接続するまで出す。
+    lost: Option<Why>,
+    /// 戻り始めに鳴らす音（別のスレッドを起こして鳴らす仕事。`script_win`）。
+    lost_chime: Option<fn()>,
+    /// 確かめの枠で「抜ける」と答えた（その BYE(取消) では戻さない。ゲームが取消で自分で画面 6 へ戻る）。
+    left_by_menu: bool,
+    /// 戻り道の数え（始めた・着いた・やめた）が変わるたびに呼ぶ。本ログへ出す原子変数へ写す仕事（`script_win`）。置かなければ（検査）呼ばない。
+    ret_log: Option<fn(&UiStats)>,
     stats: UiStats,
 }
 
@@ -1159,6 +1261,14 @@ pub struct UiStats {
     pub readies: u32,
     /// ネットワークの組を片づけてメニューを「つなぐ前」へ戻した回数（つなぎ直し。`after_teardown`）。
     pub teardowns: u32,
+    /// Ctrl+C で観戦コードのコピーを頼んだ回数（押した瞬間に 1 回。押しっぱなしでは増えない）。
+    pub copy_asks: u32,
+    /// 「妖怪 対 妖怪」へ戻し始めた回数・着いた回数・途中でやめた回数（`return_flow::Finish`）。
+    pub returns: u32,
+    pub return_arrived: u32,
+    pub return_gave_up: u32,
+    /// 最後に途中でやめた理由（`GiveUp::encode`。0 はまだ無い）。
+    pub return_why: u32,
 }
 
 impl NetUi {
@@ -1186,11 +1296,24 @@ impl NetUi {
             name_saver: None,
             room_saver: None,
             lang_saver: None,
+            lan_saver: None,
+            copy_edge: DigitEdge::new(),
+            copy_hint_on: false,
+            copy_wait: None,
+            copy_shown: None,
+            shape_saver: None,
+            seat_saver: None,
             watch_feed: None,
             watch_on: false,
             watch: Box::new(WatchSnapshot::EMPTY),
             watch_scratch: Box::new(WatchSnapshot::EMPTY),
             watch_seen: 0,
+            ret_on: false,
+            ret: None,
+            lost: None,
+            lost_chime: None,
+            left_by_menu: false,
+            ret_log: None,
             stats: UiStats::default(),
         }
     }
@@ -1198,6 +1321,12 @@ impl NetUi {
     /// 観戦の「ランダムマッチ」の一覧の接続を開け閉めする仕事を置く。
     pub fn with_watch_feed(mut self, feed: Option<fn(bool)>) -> NetUi {
         self.watch_feed = feed;
+        self
+    }
+
+    /// ホストの案内を出す実行にする（観戦のホスト `[spectate] enable = 1` のとき）。
+    pub fn with_spectate_hint(mut self, on: bool) -> NetUi {
+        self.copy_hint_on = on;
         self
     }
 
@@ -1211,7 +1340,7 @@ impl NetUi {
         self
     }
 
-    /// 「名前」の項目を置く（`name` は今のプレイヤー名。ゲーム内のメニューの実行だけ）。`saver` は決めた名前を覚えるファイルへ
+    /// 「名前」の項目を置く（`name` は今のプレイヤー名。ゲーム内のメニューの実行だけ）。`saver` は決めた名前を ini へ
     /// 書く仕事（ゲームのスレッドでは書かない）。
     pub fn with_player_name(mut self, name: NameBuf, saver: Option<fn(NameBuf)>) -> NetUi {
         self.menu = self.menu.with_player_name(name);
@@ -1224,10 +1353,35 @@ impl NetUi {
         self
     }
 
+    /// LAN の「クライアント」「観戦」のアドレスの入力の初めの値（前回打ったアドレス）と、決めたときに ini へ書く仕事。
+    pub fn with_lan_addr(mut self, addr: AddrBuf, saver: Option<fn(LanAddr)>) -> NetUi {
+        self.menu = self.menu.with_lan_addr(addr);
+        self.lan_saver = saver;
+        self
+    }
+
+    /// 「同期方式」「ディレイ」を替えたときに呼ぶ、ini へ書く仕事。
+    pub fn with_shape_saver(mut self, saver: Option<fn(Pick, DelayChoice)>) -> NetUi {
+        self.shape_saver = saver;
+        self
+    }
+
+    /// 「サイド」を替えたときに呼ぶ、ini へ書く仕事。
+    pub fn with_seat_saver(mut self, saver: Option<fn(SeatWish)>) -> NetUi {
+        self.seat_saver = saver;
+        self
+    }
+
     /// 画面の言語の初めの値と、「言語」の行で替えたときの仕事。
     pub fn with_lang(mut self, lang: Lang, saver: Option<fn(Lang)>) -> NetUi {
         self.menu = self.menu.with_lang(lang);
         self.lang_saver = saver;
+        self
+    }
+
+    /// ini の読めない行を捨てたことを、メニューの下に出す。
+    pub fn with_ini_notice(mut self, notice: Option<higanr_core::net_menu::IniNotice>) -> NetUi {
+        self.menu = self.menu.with_ini_notice(notice);
         self
     }
 
@@ -1252,6 +1406,8 @@ impl NetUi {
         self.ended = None;
         // 観戦のマッチ中の帯（名前・通信の状態）を残さない（セッションを手放した後は `watch_hud` を呼ぶ者がいない）。
         self.hud(false, HudFacts::default());
+        self.watch_select_wait(false);
+        self.copy_clear();
         self.stats.teardowns = self.stats.teardowns.saturating_add(1);
     }
 
@@ -1272,7 +1428,20 @@ impl NetUi {
         self.auto = None;
         self.was_connected = false;
         self.was_found = false;
+        self.peer_wait(false);
+        self.copy_clear();
+        // 戻り道（`ret`）と理由の行（`lost`）は片づけをまたいで続ける（片づけは終わりから 2 秒後で、場面を問わない）。
+        self.left_by_menu = false;
         self.stats.teardowns = self.stats.teardowns.saturating_add(1);
+    }
+
+    /// 観戦コードの知らせ（案内と結果）を消し、結果の待ちをやめる。
+    fn copy_clear(&mut self) {
+        self.copy_wait = None;
+        self.copy_shown = None;
+        if self.shown_mask & SHOW_COPY != 0 {
+            self.set_mask(self.shown_mask & !SHOW_COPY);
+        }
     }
 
     fn corner_conn(&self, f: &UiFacts) -> Conn {
@@ -1346,7 +1515,7 @@ impl NetUi {
             self.board.set_menu_len(rows.len);
             self.shown_menu_len = rows.len;
         }
-        let hud = self.shown_mask & SHOW_MATCH;
+        let hud = self.shown_mask & SHOW_KEPT;
         self.set_mask(SHOW_MENU | hud);
     }
 
@@ -1377,19 +1546,22 @@ impl NetUi {
             &mut block,
             &mut block_styles,
         );
-        let mut n = corner_lines(
-            conn,
-            &self.note,
-            f.now,
-            f.stall,
-            lang,
-            &mut lines,
-            &mut styles,
-        );
+        let mut n = match self.lost {
+            Some(why) if conn == Conn::Finished => return_lines(why, lang, &mut lines, &mut styles),
+            _ => corner_lines(
+                conn,
+                &self.note,
+                f.now,
+                f.stall,
+                lang,
+                &mut lines,
+                &mut styles,
+            ),
+        };
         if matches!(conn, Conn::Connected { .. }) && !self.connected_line_shows() {
             n = 0;
         }
-        let mut mask = self.shown_mask & SHOW_MATCH;
+        let mut mask = self.shown_mask & SHOW_KEPT;
         if blocks > 0 {
             for (i, (bit, row)) in TL_ROWS.into_iter().enumerate() {
                 if i < blocks {
@@ -1431,18 +1603,20 @@ impl NetUi {
     fn leave_menu_scene(&mut self, f: &UiFacts) {
         self.menu.reset();
         self.auto = None;
+        let conn = self.corner_conn(f);
         if matches!(
-            self.corner_conn(f),
+            conn,
             Conn::Waiting
                 | Conn::Found { .. }
                 | Conn::Unmatched(_)
                 | Conn::OtherVersion { .. }
                 | Conn::OtherBuild { .. }
                 | Conn::Desynced
-        ) {
+        ) || (self.lost.is_some() && conn == Conn::Finished)
+        {
             self.publish_corner(f);
         } else {
-            let hud = self.shown_mask & SHOW_MATCH;
+            let hud = self.shown_mask & SHOW_KEPT;
             self.set_mask(hud);
         }
     }
@@ -1479,7 +1653,71 @@ impl NetUi {
         let out = self.tick_inner(game, f);
         self.sync_text_gate(game);
         self.sync_watch_feed();
+        self.copy_tick(game, f.conn, f.now);
         out
+    }
+
+    /// 観戦コードのコピー（Ctrl+C）を 1 tick 進める。ゲームのスレッドで確保しない。入力を握る tick もマッチの中（rollback の間は `tick` が
+    /// 呼ばれないので `script_win::rb_scan_handler` からも）も毎 tick 呼ぶ。
+    ///
+    /// - つながっている間（`Conn::is_linked`: 見つかった・つながった）だけキーを読む。読み方は Ctrl+数字と同じ（`Game::digit_keys`、
+    ///   押した瞬間だけ・Ctrl が押されている間だけ）。押した瞬間に見張りへ頼みを 1 回送る（ホストなら観戦コードがクリップボードへ入り、
+    ///   ゲストなら「ホストの画面で」の知らせが返る）。つながる前・台本の実行は本物のキーを読まない（台本の実行は段階の `copy=1` を押下にする）。
+    /// - 結果の出来事（`Event::is_copy_result`）が来たら、左上に `COPY_NOTICE_SECS` 秒出す。
+    /// - ホストには、つながった直後の左上（「つながりました」の行と同じ間）に案内を出す。
+    ///
+    /// 遅延の増分: つながっている間は `digit_keys` の読み 1 回（同じ tick に Ctrl+数字の読みが同じ `NetGame` で済んでいれば足さない）。
+    pub fn copy_tick<G: Game>(&mut self, game: &mut G, conn: Conn, now: u64) {
+        let linked = conn.is_linked();
+        let held = if linked && !game.scripted_run() {
+            game.digit_keys()
+        } else {
+            None
+        };
+        let pressed = self.copy_edge.feed(held);
+        // 台本の実行は本物のキーを読まない代わりに、段階の `copy=1` を押下にする（実機の回で人のクリップボードを使わず、`clipboard = file` の置き場へ書かせる）。
+        let scripted = linked && game.scripted_run() && game.copy_script();
+        if digit_keys::copy_pressed(pressed) || scripted {
+            let seq = self.link.note().map_or(0, |n| n.seq);
+            self.link.send(Cmd::CopySpectateCode);
+            self.copy_wait = Some((seq, now.saturating_add(COPY_WAIT_SECS)));
+            self.stats.orders_sent = self.stats.orders_sent.saturating_add(1);
+            self.stats.copy_asks = self.stats.copy_asks.saturating_add(1);
+        }
+        if let Some((seq0, until)) = self.copy_wait {
+            if now >= until {
+                self.copy_wait = None;
+            } else if let Some(n) = self.link.note()
+                && n.seq != seq0
+                && n.event.is_copy_result()
+            {
+                self.copy_wait = None;
+                self.copy_shown = Some((n.event, now.saturating_add(COPY_NOTICE_SECS)));
+            }
+        }
+        if self.copy_shown.is_some_and(|(_, until)| now >= until) {
+            self.copy_shown = None;
+        }
+        let lang = self.menu.lang();
+        let line = match (self.copy_shown, conn) {
+            (Some((ev, _)), _) if linked => copy_notice(ev, lang),
+            (None, Conn::Connected { host: true, .. })
+                if self.copy_hint_on && self.connected_line_shows() =>
+            {
+                Some((copy_hint(lang), RowStyle::Hint))
+            }
+            _ => None,
+        };
+        match line {
+            Some((text, style)) => {
+                self.put(ROW_COPY, text, style);
+                self.set_mask(self.shown_mask | SHOW_COPY);
+            }
+            None if self.shown_mask & SHOW_COPY != 0 => {
+                self.set_mask(self.shown_mask & !SHOW_COPY);
+            }
+            None => {}
+        }
     }
 
     /// 一覧の接続を、メニューが一覧の画面か（`Menu::wants_watch_list`）に合わせる。どの経路でメニューが一覧の画面を出ても（取消・
@@ -1539,6 +1777,9 @@ impl NetUi {
         // 片づけた後の終わりの行は、人が入口のメニューを開いた・次のネットワークを開き始めたら役目を終える。
         if f.net != NetPhase::Closed || self.menu.is_active() {
             self.ended = None;
+        }
+        if let Some(out) = self.return_tick(game, f) {
+            return out;
         }
         let found = matches!(f.conn, Conn::Found { .. });
         let found_edge = found && !self.was_found;
@@ -1631,7 +1872,7 @@ impl NetUi {
             );
             if let Some(c) = o.cmd {
                 self.link.send(c);
-                // 名前は見張りへの指示ではない（入れ物に置いただけ）ので数えない。覚えるファイルへは別のスレッドが書く（人が名前を決めた tick に 1 回）。
+                // 名前は見張りへの指示ではない（入れ物に置いただけ）ので数えない。ini へは別のスレッドが書く（人が名前を決めた tick に 1 回）。
                 if let Cmd::Name(n) = c {
                     if let Some(save) = self.name_saver {
                         save(n);
@@ -1645,8 +1886,33 @@ impl NetUi {
                     if let Some(save) = self.lang_saver {
                         save(l);
                     }
-                } else {
+                } else if let Cmd::LanClient(a) | Cmd::LanWatch(a) = c {
+                    // 決めたアドレスを使った値として覚える（指示のリングバッファは通らないので数えない）。
+                    if let Some(save) = self.lan_saver {
+                        save(a);
+                    }
+                } else if c != Cmd::LanHost {
                     self.stats.orders_sent = self.stats.orders_sent.saturating_add(1);
+                }
+                out.lan = match c {
+                    Cmd::LanHost => Some(LanAsk::Host),
+                    Cmd::LanClient(a) => Some(LanAsk::Client(a)),
+                    Cmd::LanWatch(a) => Some(LanAsk::Watch(a)),
+                    _ => None,
+                };
+                // 替えた設定は ini の該当の行へ書く（指示は指示として数える）。
+                match c {
+                    Cmd::Shape(pick, delay) => {
+                        if let Some(save) = self.shape_saver {
+                            save(pick, delay);
+                        }
+                    }
+                    Cmd::Seat(wish) => {
+                        if let Some(save) = self.seat_saver {
+                            save(wish);
+                        }
+                    }
+                    _ => {}
                 }
                 if matches!(c, Cmd::Create | Cmd::Paste | Cmd::Room(_) | Cmd::Random)
                     && f.net == NetPhase::Closed
@@ -1654,12 +1920,16 @@ impl NetUi {
                     out.open_net = true;
                 }
                 // 観戦の「ルームマッチ」は対戦者のネットワークを開かない。呼び手が観戦者のネットワークを（別のスレッドで）開く。
-                if matches!(c, Cmd::Spectate(_) | Cmd::SpectateListed(_)) {
+                if matches!(
+                    c,
+                    Cmd::Spectate(_) | Cmd::SpectateListed(_) | Cmd::SpectateCode
+                ) {
                     out.spectate_open = true;
                 }
             }
             if o.answer == Some(Answer::Leave) {
                 out.leave = true;
+                self.left_by_menu = true;
                 self.auto = None;
                 self.stats.leaves = self.stats.leaves.saturating_add(1);
             }
@@ -1789,6 +2059,26 @@ impl NetUi {
         self.show_match_rows(w.names);
     }
 
+    /// 相手を待つ知らせの 1 行を出す・消す（tick ごと）。変わった tick だけ盤へ書く（ふだんの増分は比べ 1 回）。
+    pub fn peer_wait(&mut self, on: bool) {
+        self.wait_notice(on, T_PEER_WAIT, RowStyle::Warn);
+    }
+
+    /// 観戦者が次のキャラ選択まで映らない間の知らせ（`peer_wait` と同じ置き場。観戦者のセッションでは `peer_wait` は呼ばれない）。
+    pub fn watch_select_wait(&mut self, on: bool) {
+        self.wait_notice(on, T_SPECTATE_NEXT_SELECT, RowStyle::Normal);
+    }
+
+    fn wait_notice(&mut self, on: bool, text: Tx, style: RowStyle) {
+        if on == (self.shown_mask & SHOW_PEER_WAIT != 0) {
+            return;
+        }
+        if on {
+            self.put(ROW_PEER_WAIT, text.get(self.menu.lang()), style);
+        }
+        self.set_mask(self.shown_mask ^ SHOW_PEER_WAIT);
+    }
+
     fn show_match_rows(&mut self, names: Option<HudNames>) {
         let mut m = self.shown_mask | SHOW_HUD;
         match names {
@@ -1812,6 +2102,145 @@ impl NetUi {
     }
 }
 
+// ---- 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す（判断は `higanr_core::return_flow`）----
+//
+// 始めるのは `net_input` が `NetPlay::take_lost` で理由を受けた tick。以後は場面を問わず `tick_inner` の先頭で 1 tick に 1 回進め、
+// ネットワークの組を片づけた後（`ui_only_step`）も続ける。ゲームのメモリには書かず、入力の語だけを作る。つながっている試合の tick には
+// `ret` の有無の比べ 1 回しか足さない。
+
+/// 戻り道が読む人の語と InputManager（読むのは要る tick だけ）。
+struct FlowReads<'a, G: Game> {
+    game: &'a mut G,
+    seat: Seat,
+}
+
+impl<G: Game> Reads for FlowReads<'_, G> {
+    fn raw(&mut self) -> u16 {
+        // 一時停止・終わりのメニューが読む `[2]` の語（素の poll の席 2 = キーボードと両方のパッド）。
+        self.game.menu_words(self.seat)[2]
+    }
+    fn im(&mut self, index: usize) -> InputState {
+        self.game.input_state(index)
+    }
+}
+
+impl NetUi {
+    /// 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す。`chime` は戻り始めに 1 回呼ぶ音の仕事（ゲームのスレッドから呼ぶので、
+    /// スレッドを起こすだけにする）。
+    pub fn with_return_flow(mut self, chime: Option<fn()>) -> NetUi {
+        self.ret_on = true;
+        self.lost_chime = chime;
+        self
+    }
+
+    /// 戻り道の数えを本ログへ出す仕事を置く（始めた・着いた・途中でやめたときに呼ぶ。ゲームのスレッドで確保しない仕事に限る）。
+    pub fn with_return_log(mut self, log: Option<fn(&UiStats)>) -> NetUi {
+        self.ret_log = log;
+        self
+    }
+
+    fn log_return(&self) {
+        if let Some(log) = self.ret_log {
+            log(&self.stats);
+        }
+    }
+
+    /// 成立した後にネットワークが終わった（`NetPlay::take_lost`。1 接続に 1 回）。確かめの枠で自分から抜けたときは戻さない
+    /// （取消でゲームが自分で戻る）。
+    pub fn on_lost(&mut self, why: Why) {
+        let by_menu = core::mem::take(&mut self.left_by_menu);
+        if !self.ret_on || (by_menu && why != Why::PeerLeft) {
+            return;
+        }
+        self.ret = Some(Flow::new());
+        self.lost = Some(why);
+        // 開いていた確かめの枠と、その後に通す取消を捨てる（戻り道が入力を握る）。
+        self.menu.reset();
+        self.auto = None;
+        self.stats.returns = self.stats.returns.saturating_add(1);
+        self.log_return();
+        if why != Why::SelfCut
+            && let Some(chime) = self.lost_chime
+        {
+            chime();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn returning(&self) -> bool {
+        self.ret.is_some()
+    }
+
+    /// 戻り道の 1 tick。入力を握ったら `Some`（feed は済ませた）。握らない tick（保存の画面・やめた tick）は `None` で、
+    /// 呼び手はいつもの処理へ進む。
+    fn return_tick<G: Game>(&mut self, game: &mut G, f: &UiFacts) -> Option<UiOut> {
+        if self.ret.is_none() && (self.menu.is_active() || f.conn.is_linked()) {
+            self.lost = None;
+        }
+        let flow = self.ret.as_mut()?;
+        let (cur, next) = game.scenes();
+        let facts = Facts {
+            in_match: cur == SCENE_MATCH && next == SCENE_MATCH,
+            in_menu: cur == SCENE_MENU && next == SCENE_MENU,
+            save_quit: cur == SCENE_MATCH && next == REQ_SAVE_AND_QUIT,
+            play: if cur == SCENE_MATCH {
+                game.play_view()
+            } else {
+                None
+            },
+            // 場面 2 への切替の tick は MainMenu が片付けられうるので読まない（`Game::menu_view`）。
+            menu: if cur == SCENE_MENU && next != SCENE_MATCH {
+                game.menu_view().map(|v| Screen {
+                    id: v.screen,
+                    sub: v.sub,
+                    trans: v.trans,
+                    cursor: v.cursor as i32,
+                    decided: v.decided,
+                })
+            } else {
+                None
+            },
+        };
+        let s = flow.step(
+            &facts,
+            &mut FlowReads {
+                game: &mut *game,
+                seat: f.seat,
+            },
+        );
+        match s.finish {
+            Some(Finish::Arrived) => {
+                self.ret = None;
+                self.stats.return_arrived = self.stats.return_arrived.saturating_add(1);
+                self.log_return();
+            }
+            Some(Finish::GaveUp(why)) => {
+                self.ret = None;
+                self.stats.return_gave_up = self.stats.return_gave_up.saturating_add(1);
+                self.stats.return_why = why.encode();
+                self.log_return();
+            }
+            None => {}
+        }
+        let mut out = UiOut {
+            save_quit: s.save_quit,
+            ..UiOut::default()
+        };
+        match s.out {
+            return_flow::Out::Pass => return None,
+            return_flow::Out::Freeze => out.action = Some(Action::RenderOnly),
+            return_flow::Out::Feed(w) => {
+                for (i, x) in w.into_iter().enumerate() {
+                    game.feed(i as u32, x);
+                }
+                out.action = Some(Action::Menu);
+            }
+        }
+        self.publish_corner(f);
+        Some(out)
+    }
+}
+
 /// ネットワークの経路（ネットワークのセッションが動いている実行）の 1 tick の入力の部分。順序がこの関数の要:
 ///
 /// 1. ネットワークの手入れ（`NetPlay::tend`）。**メニューが入力を握る tick も毎 tick 先に呼ぶ**（ここで手入れを止めると、貼ってもつながらない）。
@@ -1830,6 +2259,9 @@ pub fn net_input<G: Game, N: Net>(
     np.tend(net);
     let out = match ui {
         Some(ui) => {
+            if let Some(why) = np.take_lost() {
+                ui.on_lost(why);
+            }
             let (conn, seat) = np.ui_conn((net.now_us() / 1_000) as u32);
             // 作り直しが 1 回でもあるとき、か相手のコードを読んだ後だけ、自分の回線の型を読む（原子変数が数個）。確保しない。
             let r = np.restarts();
@@ -1907,6 +2339,7 @@ pub fn watch_input<G: Game, N: Net>(
         Some(h) => ui.watch_hud(true, h),
         None => ui.watch_hud(false, WatchHudFacts::default()),
     }
+    ui.watch_select_wait(wp.awaiting_select());
     let action = match out.action {
         Some(a) => {
             if esc && !menu_was_open {
@@ -1920,12 +2353,18 @@ pub fn watch_input<G: Game, N: Net>(
 }
 
 #[cfg(test)]
+mod return_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use higanr_core::lockstep::Role;
     use higanr_core::match_gate::NoMatch;
     use higanr_core::menu_model::DECIDE_BITS;
-    use higanr_core::net_menu::{CodeState, Event, T_AGAIN};
+    use higanr_core::net_menu::{
+        CodeState, Event, T_AGAIN, T_SPECTATE_CODE_COPIED, T_SPECTATE_CODE_COPY_FAILED,
+        T_SPECTATE_CODE_HINT, T_SPECTATE_CODE_HOST_ONLY,
+    };
     use higanr_core::overlay::{blit_quads, ui_glyphs};
     use higanr_core::selection::Agreed;
     use higanr_core::wire::{Mode, Select};
@@ -1955,6 +2394,14 @@ mod tests {
         typed_while_closed: u32,
         /// 観戦者の Esc の読み（`peek_local_input`）が返す語。`local_input` の語とは別に読むので `words` を消費しない。
         esc_word: u16,
+        /// 本物のキーの読み（`Game::digit_keys`）の代わり。`None` は読んではいけない間。
+        keys: Option<u16>,
+        /// `digit_keys` を呼ばれた回数。
+        keys_reads: u32,
+        /// 台本の実行（`Game::scripted_run`）。
+        scripted: bool,
+        /// 台本の `copy=1`（`Game::copy_script`）。次の 1 回だけ `true` を返す。
+        copy_script_next: bool,
     }
 
     impl Fake {
@@ -1982,6 +2429,10 @@ mod tests {
                 gate_open: false,
                 typed_while_closed: 0,
                 esc_word: 0,
+                keys: None,
+                keys_reads: 0,
+                scripted: false,
+                copy_script_next: false,
             }
         }
 
@@ -2040,6 +2491,16 @@ mod tests {
         }
         fn peek_local_input(&mut self) -> u16 {
             self.esc_word
+        }
+        fn digit_keys(&mut self) -> Option<u16> {
+            self.keys_reads += 1;
+            self.keys
+        }
+        fn scripted_run(&self) -> bool {
+            self.scripted
+        }
+        fn copy_script(&mut self) -> bool {
+            std::mem::take(&mut self.copy_script_next)
         }
         fn feed(&mut self, index: u32, word: u16) {
             if let Some(s) = self.cur_feed.get_mut(index as usize) {
@@ -2173,6 +2634,26 @@ mod tests {
         assert_eq!(l.take_order(), None);
         assert_eq!(l.spectate_name(), RoomBuf::from_name("Watch-1"));
         assert_eq!(l.room_name(), RoomBuf::from_name("Synth-Room_1"));
+        // 観戦コード入力は観戦の決定と同じ指示で、開く仕事が印を見て観戦コードの経路を選ぶ。ルーム名で観戦を決め直すと印は消える。
+        assert!(!l.spectate_by_code());
+        l.send(Cmd::SpectateCode);
+        assert_eq!(l.take_order(), Some(Order::Spectate));
+        assert!(l.spectate_by_code());
+        l.send(Cmd::Spectate(RoomBuf::from_name("Watch-2").unwrap()));
+        assert!(
+            !l.spectate_by_code(),
+            "ルーム名の観戦が観戦コードの経路のまま"
+        );
+        l.send(Cmd::SpectateCode);
+        let row = watch_row(7, "a", "b", 0);
+        l.send(Cmd::SpectateListed(row));
+        assert!(!l.spectate_by_code(), "一覧の観戦が観戦コードの経路のまま");
+        l.send(Cmd::CopySpectateCode);
+        assert_eq!(l.take_order(), Some(Order::Spectate));
+        assert_eq!(l.take_order(), Some(Order::Spectate));
+        assert_eq!(l.take_order(), Some(Order::Spectate));
+        assert_eq!(l.take_order(), Some(Order::SpectateCopy));
+        assert_eq!(l.take_order(), None);
         for _ in 0..(ORDER_RING + 5) {
             l.send(Cmd::Create);
         }
@@ -2392,14 +2873,14 @@ mod tests {
         let rows = menu_rows(b);
         assert_eq!(rows[0], "対戦", "{rows:?}");
         assert_eq!(rows[1], "> ランダムマッチ", "{rows:?}");
-        assert_eq!(rows[3], "  ルームマッチ", "{rows:?}");
-        assert_eq!(rows[4], "  ルーム名\u{3000}first", "{rows:?}");
-        assert_eq!(rows[6], "観戦", "{rows:?}");
-        assert_eq!(rows[7], "  ランダムマッチ");
-        assert_eq!(rows[9], "  ルームマッチ");
-        assert_eq!(rows[12], "  コード作成");
+        assert_eq!(rows[2], "  ルームマッチ", "{rows:?}");
+        assert_eq!(rows[3], "  ルーム名\u{3000}first", "{rows:?}");
+        assert_eq!(rows[5], "観戦", "{rows:?}");
+        assert_eq!(rows[6], "  ランダムマッチ");
+        assert_eq!(rows[7], "  ルームマッチ");
+        assert_eq!(rows[10], "  対戦コード作成");
         down_to_play(&mut ui, &mut g);
-        assert_eq!(menu_rows(b)[3], "> ルームマッチ");
+        assert_eq!(menu_rows(b)[2], "> ルームマッチ");
         let o = g.step(&mut ui, &facts(), Z);
         assert!(
             o.open_net,
@@ -2419,7 +2900,7 @@ mod tests {
         g.step(&mut ui, &facts(), Z);
         g.step(&mut ui, &facts(), 0);
         down_to_play(&mut ui, &mut g);
-        assert_eq!(menu_rows(b)[3], "> ルームマッチ");
+        assert_eq!(menu_rows(b)[2], "> ルームマッチ");
         let o = g.step(&mut ui, &facts(), Z);
         assert!(!o.open_net, "名を決める前にネットワークを開く頼みが出た");
         assert_eq!(link.take_order(), None, "入力を経ずに指示が出た");
@@ -2553,11 +3034,11 @@ mod tests {
         g.step(&mut ui, &facts(), Z);
         g.step(&mut ui, &facts(), 0);
         let rows = menu_rows(b);
-        assert_eq!(rows[3], "  ルームマッチ", "{rows:?}");
-        assert_eq!(rows[4], "  ルーム名\u{3000}first", "{rows:?}");
-        assert_eq!(rows[6], "観戦", "{rows:?}");
-        assert_eq!(rows[7], "  ランダムマッチ", "{rows:?}");
-        assert_eq!(rows[9], "  ルームマッチ", "{rows:?}");
+        assert_eq!(rows[2], "  ルームマッチ", "{rows:?}");
+        assert_eq!(rows[3], "  ルーム名\u{3000}first", "{rows:?}");
+        assert_eq!(rows[5], "観戦", "{rows:?}");
+        assert_eq!(rows[6], "  ランダムマッチ", "{rows:?}");
+        assert_eq!(rows[7], "  ルームマッチ", "{rows:?}");
         down_to_play(&mut ui, &mut g);
         down_to_watch(&mut ui, &mut g);
         let o = g.step(&mut ui, &facts(), Z);
@@ -2656,7 +3137,7 @@ mod tests {
         assert_eq!(b.show() & SHOW_WAIT, 0, "待ちの行が残った");
         assert_eq!(
             row_text(b, ROW_TL0),
-            "30 分待っても、相手がルームに来ませんでした。"
+            "30分待っても、相手がルームに来ませんでした。"
         );
         assert_eq!(
             row_text(b, ROW_TL1),
@@ -2756,7 +3237,7 @@ mod tests {
             rows.iter().any(|r| r == "> ランダムマッチ")
                 && rows.iter().any(|r| r == "  ルームマッチ")
                 && rows.iter().any(|r| r == "観戦")
-                && rows.iter().any(|r| r == "  コード作成"),
+                && rows.iter().any(|r| r == "  対戦コード作成"),
             "{rows:?}"
         );
     }
@@ -3063,8 +3544,8 @@ mod tests {
         let mut g = Fake::on_match_screen(4);
         g.step(&mut ui, &facts(), Z);
         assert_ne!(b.show() & SHOW_MENU, 0);
-        assert_eq!(row_text(b, 0), "接続コードで対戦");
-        assert!(row_text(b, 1).contains("コード作成"));
+        assert_eq!(row_text(b, 0), "接続コード");
+        assert!(row_text(b, 1).contains("対戦コード作成"));
         let opening = UiFacts {
             net: NetPhase::Opening,
             ..facts()
@@ -3387,7 +3868,7 @@ mod tests {
         g.step(&mut ui, &c, 0);
         assert_eq!(
             row_text(b, ROW_TL0),
-            "接続しました。あなたは 1P です。（rollback・delay 1）"
+            "接続しました。あなたは1Pです。（rollback・delay 1）"
         );
         assert_eq!(
             b.show() & SHOW_TL1,
@@ -3397,6 +3878,8 @@ mod tests {
         let mut g = Fake::on_match_screen(4);
         let (mut ui, _l, b) = new_ui();
         g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        open_settings(&mut g, &mut ui, b);
         let rows = menu_rows(b);
         assert!(
             rows.iter()
@@ -3607,10 +4090,7 @@ mod tests {
         let f = facts();
         g.step(&mut ui, &f, Z);
         g.step(&mut ui, &f, 0);
-        g.step(&mut ui, &f, DOWN);
-        g.step(&mut ui, &f, 0);
-        g.step(&mut ui, &f, DOWN);
-        g.step(&mut ui, &f, 0);
+        open_settings(&mut g, &mut ui, b);
         let rows = menu_rows(b);
         assert!(
             rows.iter().any(|l| l == "> 同期方式\u{3000}◀ rollback ▶"),
@@ -3625,7 +4105,7 @@ mod tests {
 
     #[test]
     fn the_connected_line_stops_at_the_difficulty_screen_and_other_lines_stay() {
-        const CONNECTED: &str = "接続しました。あなたは 1P です。（rollback・delay 1）";
+        const CONNECTED: &str = "接続しました。あなたは1Pです。（rollback・delay 1）";
         let c = connected_facts();
         let shown = |b: &Board| b.show() & (SHOW_TL0 | SHOW_TL1) != 0;
         for screen in [6, 7] {
@@ -4098,26 +4578,26 @@ mod tests {
         use higanr_core::nat::{NatMark, Symmetry};
         const F1: &[&str] = &[
             "接続失敗：",
-            "不明な原因で相手からの UDP パケットが届きません",
-            "iniをdetail=1に書き換えてもう一度試し、開発者にログを送ってください。",
+            "不明な原因で相手からのUDPパケットが届きません",
+            "iniをdetail=1に書き換えてもう一度試し、ログをGitHubのIssuesへ送ってください。",
             "（README「接続できないとき」1）",
         ];
         const F2: &[&str] = &[
             "接続失敗：",
-            "相手がシンメトリック NATであり、こちらはUPnPが使用不可です。",
+            "相手がシンメトリックNATであり、こちらはUPnPが使用不可です。",
             "ルーターのUPnPをオンにするか、ポート開放してください。",
             "（README「接続できないとき」2）",
         ];
         const F3: &[&str] = &[
             "接続失敗：",
-            "こちらがシンメトリック NATです。",
+            "こちらがシンメトリックNATです。",
             "相手側のポート開放が必要です。",
             "相手もシンメトリックNATなら通信できません。",
             "（README「接続できないとき」3）",
         ];
         const F4: &[&str] = &[
             "接続不可：",
-            "こちらも相手もシンメトリック NAT のため、直接接続できません。",
+            "こちらも相手もシンメトリックNATのため、直接接続できません。",
             "（README「接続できないとき」4）",
         ];
         let mark = |symmetry, upnp| Some(NatMark { symmetry, upnp });
@@ -4471,11 +4951,11 @@ mod tests {
         for (why, want) in [
             (
                 NoMatch::TimedOut,
-                "対戦が始まらないまま 10 分 たったので、接続を閉じました。",
+                "対戦が始まらないまま10分たったので、接続を閉じました。",
             ),
             (
                 NoMatch::PeerHasNoGate,
-                "相手の HiganRTool が古いか、ゲーム内のメニューを使っていないので接続を閉じました。",
+                "相手のHiganRToolが古いか、ゲーム内のメニューを使っていないので接続を閉じました。",
             ),
             (
                 NoMatch::PeerLeft,
@@ -4507,7 +4987,7 @@ mod tests {
             ..facts()
         };
         let want = format!(
-            "相手の HiganRTool のバージョンが違います（自分 {}・相手 0）。",
+            "相手のHiganRToolのバージョンが違います（自分 {}・相手 0）。",
             higanr_core::wire::PROTO_VER
         );
         for scenes in [(2u32, 0u32), (SCENE_MENU, 0)] {
@@ -4519,7 +4999,7 @@ mod tests {
             assert_eq!(row_text(b, ROW_TL0), want, "{scenes:?}");
             assert_eq!(
                 row_text(b, ROW_TL1),
-                "相手と同じ zip の HiganRTool を使ってください。",
+                "相手と同じzipのHiganRToolを使ってください。",
                 "{scenes:?}"
             );
         }
@@ -4833,7 +5313,7 @@ mod tests {
         );
         assert_eq!(
             row(&r.ui_b).as_deref(),
-            Some("対戦が始まらないまま 10 分 たったので、接続を閉じました。")
+            Some("対戦が始まらないまま10分たったので、接続を閉じました。")
         );
         for _ in 0..3 {
             r.tick_by(0, 0, 1_000_000);
@@ -5021,7 +5501,7 @@ mod tests {
         assert_eq!(
             row(ROW_TL0).as_deref(),
             Some(
-                "相手の HiganRTool が古いか、ゲーム内のメニューを使っていないので接続を閉じました。"
+                "相手のHiganRToolが古いか、ゲーム内のメニューを使っていないので接続を閉じました。"
             )
         );
         assert_eq!(row(ROW_TL1).as_deref(), Some(T_AGAIN.ja));
@@ -5381,7 +5861,7 @@ mod tests {
         assert_eq!(link.take_order(), Some(Order::Room));
     }
 
-    /// 設定で決めたルーム名の記録（本物は別のスレッドがファイルへ書く `script_win::save_room_name`）。
+    /// 設定で決めたルーム名の記録（本物は別のスレッドが ini へ書く `ini_save::save_room`）。
     static SAVED_ROOMS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     fn record_saved_room(n: RoomBuf) {
@@ -5554,6 +6034,7 @@ mod tests {
         g.step(&mut ui, &f, X);
         g.step(&mut ui, &f, 0);
         assert!(!ui.menu.wants_watch_list() && ui.menu_active());
+        // 観戦のランダムマッチの次は観戦の「ルームマッチ」。
         g.step(&mut ui, &f, DOWN);
         g.step(&mut ui, &f, 0);
         g.step(&mut ui, &f, Z);
@@ -5591,7 +6072,8 @@ mod tests {
         g.step(&mut ui, &f, 0);
         let rows = menu_rows(b);
         assert_eq!(rows[1], "> ランダムマッチ", "{rows:?}");
-        assert_eq!(rows[3], "  ルームマッチ", "{rows:?}");
+        assert_eq!(rows[2], "  ルームマッチ", "{rows:?}");
+        assert_eq!(rows[5], "  観戦コード入力", "{rows:?}");
         shot(b, "7_menu_failure");
         assert_eq!(
             shown,
@@ -5900,7 +6382,7 @@ mod tests {
         }
         let want = [
             "同期がずれたため、試合を終了しました。",
-            "HiganRTool の logs フォルダのログを開発者へ送ってください（Esc でメニューへ）。",
+            "logsフォルダのログをGitHubのIssuesへ送ってください（Escでメニューへ）。",
         ];
         for (who, b) in [("A", board_a), ("B", board_b)] {
             assert_eq!(
@@ -5955,9 +6437,316 @@ mod tests {
         );
     }
 
+    // ---- 観戦コードのコピー（Ctrl+C） ----
+
+    use crate::digit_keys::{C_BIT as K_C, CTRL_BIT as K_CTRL, MOD_BIT as K_MOD};
+
+    fn linked(host: bool) -> UiFacts {
+        UiFacts {
+            conn: Conn::Connected {
+                seat: Seat::P1,
+                host,
+                shape: Some((Mode::Rollback, 1)),
+            },
+            net: NetPhase::Open,
+            ..facts()
+        }
+    }
+
+    /// 本物のキーの読みを `keys` にして 1 tick 回す。
+    fn tick_keys(g: &mut Fake, ui: &mut NetUi, f: &UiFacts, keys: Option<u16>) {
+        g.keys = keys;
+        g.step(ui, f, 0);
+    }
+
+    fn orders(link: &UiLink) -> Vec<Order> {
+        std::iter::from_fn(|| link.take_order()).collect()
+    }
+
+    fn row_style(b: &Board, i: usize) -> RowStyle {
+        let mut buf = [0u8; MAX_TEXT_UTF8];
+        b.read_row(i, &mut buf).map(|(_, s)| s).unwrap()
+    }
+
+    /// 押した瞬間に 1 回だけ頼む（押しっぱなしでは繰り返さない）。ホストもゲストも・見つかった間もつながった後も・メニューの場面もマッチの場面も同じ。
+    #[test]
+    fn ctrl_c_asks_the_watcher_once_per_press_while_linked() {
+        for (name, f, scene) in [
+            ("ホスト・メニューの場面", linked(true), (SCENE_MENU, 0)),
+            ("ホスト・マッチの場面", linked(true), (SCENE_MATCH, 0)),
+            ("ゲスト", linked(false), (SCENE_MENU, 0)),
+            ("見つかった", found_facts(false), (SCENE_MENU, 0)),
+        ] {
+            let (mut ui, link, _b) = new_ui();
+            let mut g = Fake::on_screen(8, 0);
+            g.scenes = scene;
+            tick_keys(&mut g, &mut ui, &f, Some(0));
+            tick_keys(&mut g, &mut ui, &f, Some(K_CTRL));
+            tick_keys(&mut g, &mut ui, &f, Some(0));
+            tick_keys(&mut g, &mut ui, &f, Some(K_C));
+            tick_keys(&mut g, &mut ui, &f, Some(0));
+            assert_eq!(orders(&link), [], "{name}: Ctrl だけ・C だけで頼んだ");
+            tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+            assert_eq!(orders(&link), [Order::SpectateCopy], "{name}");
+            for _ in 0..30 {
+                tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+            }
+            assert_eq!(orders(&link), [], "{name}: 押しっぱなしで繰り返した");
+            tick_keys(&mut g, &mut ui, &f, Some(K_CTRL));
+            tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+            assert_eq!(orders(&link), [Order::SpectateCopy], "{name}: 押し直し");
+            assert_eq!(ui.stats().copy_asks, 2, "{name}");
+        }
+    }
+
+    /// つながる前はキーを読まない。押したままつながっても、読めない間に押されたキーも、Alt・Win と一緒のものも、台本の実行も取らない。
+    #[test]
+    fn ctrl_c_is_ignored_before_the_link_after_a_gap_with_alt_and_in_a_scripted_run() {
+        let (mut ui, link, _b) = new_ui();
+        let mut g = Fake::on_screen(8, 0);
+        for _ in 0..5 {
+            tick_keys(&mut g, &mut ui, &facts(), Some(K_C | K_CTRL));
+        }
+        assert_eq!(g.keys_reads, 0, "つながる前にキーを読んだ");
+        let f = linked(true);
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+        assert_eq!(orders(&link), [], "押したままつながって頼んだ");
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        tick_keys(&mut g, &mut ui, &f, None);
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+        assert_eq!(orders(&link), [], "読めない間から押していたキーで頼んだ");
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL | K_MOD));
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+        assert_eq!(orders(&link), [], "Alt・Win と一緒の C で頼んだ");
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+        assert_eq!(orders(&link), [Order::SpectateCopy]);
+        // 台本の実行は本物のキーを読まない。
+        let (mut ui, link, _b) = new_ui();
+        let mut g = Fake::on_screen(8, 0);
+        g.scripted = true;
+        for k in [0, K_C | K_CTRL, 0, K_C | K_CTRL] {
+            tick_keys(&mut g, &mut ui, &f, Some(k));
+        }
+        assert_eq!((g.keys_reads, orders(&link)), (0, vec![]));
+    }
+
+    /// 壊れたら落ちる: 台本の `copy=1` が頼みにならない（実機の回で観戦コードが書かれない）、台本でない実行・つながる前でも頼む、1 回の押下が 2 回の頼みになる。
+    #[test]
+    fn a_scripted_copy_press_asks_once_and_only_while_linked_in_a_scripted_run() {
+        let f = linked(true);
+        let (mut ui, link, _b) = new_ui();
+        let mut g = Fake::on_screen(8, 0);
+        g.scripted = true;
+        g.copy_script_next = true;
+        tick_keys(&mut g, &mut ui, &f, None);
+        assert_eq!(orders(&link), [Order::SpectateCopy]);
+        assert_eq!(g.keys_reads, 0, "台本の実行で本物のキーを読んだ");
+        tick_keys(&mut g, &mut ui, &f, None);
+        assert_eq!(orders(&link), [], "1 回の押下が 2 回の頼みになった");
+        // つながる前は押下を取らない（取り出しは残る）。
+        g.copy_script_next = true;
+        tick_keys(&mut g, &mut ui, &facts(), None);
+        assert_eq!(orders(&link), [], "つながる前に頼んだ");
+        assert!(g.copy_script_next, "つながる前に押下を取り出した");
+        // 台本の無い実行は `copy_script` を見ない。
+        g.scripted = false;
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        assert_eq!(orders(&link), [], "台本の無い実行で台本の押下を使った");
+        assert_eq!(ui.stats().copy_asks, 1);
+    }
+
+    /// 頼んだ後に来た結果だけを、メニューの場面でもマッチの場面でも数秒、左上の知らせの行に出す。
+    #[test]
+    fn the_copy_result_shows_for_a_few_seconds_after_asking_on_every_scene() {
+        for scene in [(SCENE_MENU, 0), (SCENE_MATCH, 0)] {
+            for (ev, text, style) in [
+                (
+                    Event::SpectateCodeCopied,
+                    T_SPECTATE_CODE_COPIED.ja,
+                    RowStyle::Normal,
+                ),
+                (
+                    Event::SpectateCodeHostOnly,
+                    T_SPECTATE_CODE_HOST_ONLY.ja,
+                    RowStyle::Normal,
+                ),
+                (
+                    Event::SpectateCodeClipWrite,
+                    T_SPECTATE_CODE_COPY_FAILED.ja,
+                    RowStyle::Warn,
+                ),
+            ] {
+                let (mut ui, link, b) = new_ui();
+                let f = linked(true);
+                let mut g = Fake::on_screen(8, 0);
+                g.scenes = scene;
+                let note = |seq| Note {
+                    seq,
+                    event: ev,
+                    ..Note::default()
+                };
+                // 頼んでいないのに来ていた出来事は出さない。
+                link.publish(&note(5));
+                tick_keys(&mut g, &mut ui, &f, Some(0));
+                tick_keys(&mut g, &mut ui, &f, Some(0));
+                assert_eq!(b.show() & SHOW_COPY, 0, "{ev:?}: 頼んでいないのに出た");
+                tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+                tick_keys(&mut g, &mut ui, &f, Some(0));
+                assert_eq!(b.show() & SHOW_COPY, 0, "{ev:?}: 結果が来る前に出た");
+                link.publish(&note(6));
+                tick_keys(&mut g, &mut ui, &f, Some(0));
+                assert_eq!(b.show() & SHOW_COPY, SHOW_COPY, "{ev:?} {scene:?}");
+                assert_eq!(row_text(b, ROW_COPY), text, "{ev:?}");
+                assert_eq!(row_style(b, ROW_COPY), style, "{ev:?}");
+                let at = |secs| UiFacts {
+                    now: f.now + secs,
+                    ..f
+                };
+                tick_keys(&mut g, &mut ui, &at(COPY_NOTICE_SECS - 1), Some(0));
+                assert_eq!(b.show() & SHOW_COPY, SHOW_COPY, "{ev:?}: 消えるのが早い");
+                tick_keys(&mut g, &mut ui, &at(COPY_NOTICE_SECS), Some(0));
+                assert_eq!(b.show() & SHOW_COPY, 0, "{ev:?}: 消えない");
+            }
+        }
+    }
+
+    /// rollback のマッチの間は `NetUi::tick` が呼ばれず、`copy_tick` だけが毎フレーム呼ばれる。そこでも頼みと結果の知らせが動く。
+    #[test]
+    fn copy_tick_alone_asks_and_shows_the_result() {
+        let (mut ui, link, b) = new_ui();
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let conn = linked(false).conn;
+        let now = 1_000_000;
+        g.keys = Some(0);
+        ui.copy_tick(&mut g, conn, now);
+        g.keys = Some(K_C | K_CTRL);
+        ui.copy_tick(&mut g, conn, now);
+        assert_eq!(orders(&link), [Order::SpectateCopy]);
+        link.publish(&Note {
+            seq: 1,
+            event: Event::SpectateCodeHostOnly,
+            ..Note::default()
+        });
+        ui.copy_tick(&mut g, conn, now + 1);
+        assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_HOST_ONLY.ja);
+        ui.copy_tick(&mut g, Conn::Waiting, now + 2);
+        assert_eq!(b.show() & SHOW_COPY, 0, "つながりが終わった後も残った");
+    }
+
+    /// 案内はホストにだけ、`[spectate] enable = 1` のときだけ、「つながりました」の行が出ている間（画面 7 まで）出る。
+    #[test]
+    fn the_hint_shows_only_to_a_host_with_spectating_on_while_the_connected_line_shows() {
+        let build = |on: bool| {
+            let link = Arc::new(UiLink::new());
+            let b = board();
+            let ui = NetUi::new(ini(), Arc::clone(&link), b).with_spectate_hint(on);
+            (ui, link, b)
+        };
+        for screen in [6, 7] {
+            let (mut ui, _l, b) = build(true);
+            let mut g = Fake::on_screen(screen, 0);
+            g.step(&mut ui, &linked(true), 0);
+            assert_eq!(b.show() & SHOW_COPY, SHOW_COPY, "画面 {screen}");
+            assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_HINT.ja);
+            assert_eq!(row_style(b, ROW_COPY), RowStyle::Hint);
+            assert_eq!(
+                row_text(b, ROW_TL0).chars().next(),
+                Some('接'),
+                "案内は「つながりました」の行の続き"
+            );
+        }
+        let hidden = |name: &str, on: bool, f: &UiFacts, screen: u32| {
+            let (mut ui, _l, b) = build(on);
+            let mut g = Fake::on_screen(screen, 0);
+            g.step(&mut ui, f, 0);
+            assert_eq!(b.show() & SHOW_COPY, 0, "{name}");
+        };
+        hidden("ゲストに出た", true, &linked(false), 7);
+        hidden("観戦を切ったホストに出た", false, &linked(true), 7);
+        hidden(
+            "つながった行が消える画面 8 に残った",
+            true,
+            &linked(true),
+            8,
+        );
+        hidden("つながる前に出た", true, &facts(), 7);
+        hidden("見つかった間に出た", true, &found_facts(false), 7);
+        // 英語。
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_spectate_hint(true)
+            .with_lang(Lang::En, None);
+        let mut g = Fake::on_screen(7, 0);
+        g.step(&mut ui, &linked(true), 0);
+        assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_HINT.en);
+        // 結果が出ている間は結果、消えたら案内に戻る。画面 8 へ進めば案内も消える。
+        g.keys = Some(0);
+        g.step(&mut ui, &linked(true), 0);
+        g.keys = Some(K_C | K_CTRL);
+        g.step(&mut ui, &linked(true), 0);
+        link.publish(&Note {
+            seq: 3,
+            event: Event::SpectateCodeCopied,
+            ..Note::default()
+        });
+        g.keys = Some(0);
+        g.step(&mut ui, &linked(true), 0);
+        assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_COPIED.en);
+        let later = UiFacts {
+            now: 1_000_000 + COPY_NOTICE_SECS,
+            ..linked(true)
+        };
+        g.step(&mut ui, &later, 0);
+        assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_HINT.en);
+        g.view = Some(MenuView {
+            screen: 8,
+            sub: 1,
+            ..MenuView::default()
+        });
+        g.step(&mut ui, &later, 0);
+        assert_eq!(b.show() & SHOW_COPY, 0);
+    }
+
+    /// 片づけ（つなぎ直し）で案内も結果も待ちも消える。知らせの行は盤に描かれる。
+    #[test]
+    fn the_copy_row_is_cleared_on_teardown_and_drawn_on_the_board() {
+        let (mut ui, link, b) = new_ui();
+        let mut g = Fake::on_screen(8, 0);
+        let f = linked(true);
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        tick_keys(&mut g, &mut ui, &f, Some(K_C | K_CTRL));
+        link.publish(&Note {
+            seq: 1,
+            event: Event::SpectateCodeCopied,
+            ..Note::default()
+        });
+        tick_keys(&mut g, &mut ui, &f, Some(0));
+        assert_eq!(b.show() & SHOW_COPY, SHOW_COPY);
+        let s = spec();
+        assert_eq!(
+            draw_board(b, &s, 640, 480, &mut |v| assert!(v.len() % 6 == 0)),
+            1
+        );
+        ui.after_teardown(Conn::Finished);
+        assert_eq!(b.show() & SHOW_COPY, 0);
+        assert_eq!(draw_board(b, &s, 640, 480, &mut |_| {}), 0);
+        // 片づけた後に前の結果が来ても、頼んでいないので出ない。
+        link.publish(&Note {
+            seq: 2,
+            event: Event::SpectateCodeCopied,
+            ..Note::default()
+        });
+        tick_keys(&mut g, &mut ui, &facts(), Some(0));
+        assert_eq!(b.show() & SHOW_COPY, 0);
+    }
+
     // ---- プレイヤー名 ----
 
-    /// 名前を覚える仕事の記録（本物は別のスレッドがファイルへ書く `script_win::save_player_name`）。
+    /// 名前を覚える仕事の記録（本物は別のスレッドが ini へ書く `ini_save::save_name`）。
     static SAVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     fn record_saved(n: NameBuf) {
@@ -5965,6 +6754,79 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(n.as_str().to_string());
+    }
+
+    static LAN_SAVED: std::sync::Mutex<Vec<LanAddr>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_lan(a: LanAddr) {
+        LAN_SAVED.lock().unwrap_or_else(|e| e.into_inner()).push(a);
+    }
+
+    /// 壊れたら落ちる: LAN の項目が見張りへの指示（リングバッファ）を通る・ネットワークを開く頼み（open_net）になる、
+    /// 打ったアドレスが呼び手（`UiOut::lan`）に届かない・ini へ覚えさせる仕事が呼ばれない、初めの値が前回のアドレスでない。
+    #[test]
+    fn the_lan_items_ask_the_caller_directly_and_remember_the_typed_address() {
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_lan_addr(AddrBuf::from_ini(Some("10.0.0.5")), Some(record_lan));
+        LAN_SAVED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        // ホスト: 入力なしで呼び手へ。
+        cursor_to(&mut g, &mut ui, b, "ホスト");
+        let o = g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(o.lan, Some(LanAsk::Host));
+        assert!(
+            !o.open_net && !o.spectate_open,
+            "LAN は自分でネットワークを開く"
+        );
+        assert_eq!(link.take_order(), None, "見張りへの指示にしてはいけない");
+        assert_eq!(ui.stats().orders_sent, 0);
+        // クライアント: 初めの値は前回のアドレス。打ち足して決めると呼び手へ届き、ini へ覚えさせる。
+        cursor_to(&mut g, &mut ui, b, "クライアント");
+        let o = g.step(&mut ui, &facts(), Z);
+        assert_eq!(o.lan, None, "入力を経ずに頼みが出た");
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(menu_rows(b)[0], "LAN ─ クライアント");
+        assert_eq!(menu_rows(b)[2], "ホストのアドレス: 10.0.0.5|");
+        g.typed.extend(":19000".encode_utf16().chain(Some(0x0D)));
+        let o = g.step(&mut ui, &facts(), 0);
+        let want = LanAddr {
+            ip: std::net::Ipv4Addr::new(10, 0, 0, 5),
+            port: 19000,
+        };
+        assert_eq!(o.lan, Some(LanAsk::Client(want)));
+        assert_eq!(*LAN_SAVED.lock().unwrap(), vec![want]);
+        assert_eq!(link.take_order(), None);
+        // 観戦: 次の初めの値は今決めたアドレス。
+        g.step(&mut ui, &facts(), 0);
+        g.step(&mut ui, &facts(), 0);
+        cursor_to(&mut g, &mut ui, b, "観戦");
+        // 入口の「観戦」の見出しの下の行とは別に、LAN の中の「観戦」を選ぶ。
+        let rows = menu_rows(b);
+        let lan_at = rows.iter().position(|r| r == "LAN").unwrap();
+        while !menu_rows(b).iter().skip(lan_at).any(|r| r == "> 観戦") {
+            g.step(&mut ui, &facts(), DOWN);
+            g.step(&mut ui, &facts(), 0);
+        }
+        g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(menu_rows(b)[0], "LAN ─ 観戦");
+        assert_eq!(menu_rows(b)[2], "ホストのアドレス: 10.0.0.5:19000|");
+        // 「:19000」の 6 文字を消して、ポートを省いた形にする。
+        g.typed
+            .extend("\u{8}".repeat(6).encode_utf16().chain(Some(0x0D)));
+        let o = g.step(&mut ui, &facts(), 0);
+        assert_eq!(
+            o.lan,
+            Some(LanAsk::Watch(LanAddr {
+                ip: std::net::Ipv4Addr::new(10, 0, 0, 5),
+                port: 17723
+            }))
+        );
     }
 
     #[test]
@@ -5979,12 +6841,14 @@ mod tests {
         g.step(&mut ui, &facts(), Z);
         g.step(&mut ui, &facts(), 0);
         let rows = menu_rows(b);
-        assert_eq!(rows[4], "設定", "{rows:?}");
-        assert_eq!(rows[5], "  プレイヤー名\u{3000}Alice-synth", "{rows:?}");
-        for _ in 0..2 {
-            g.step(&mut ui, &facts(), DOWN);
-            g.step(&mut ui, &facts(), 0);
-        }
+        assert!(
+            rows.contains(&"  設定\u{3000}Alice-synth".to_string()),
+            "入口のメニューの「設定」の行に今の名前が出ない: {rows:?}"
+        );
+        open_settings(&mut g, &mut ui, b);
+        let rows = menu_rows(b);
+        assert_eq!(rows[0], "設定", "{rows:?}");
+        assert_eq!(rows[1], "> プレイヤー名\u{3000}Alice-synth", "{rows:?}");
         let o = g.step(&mut ui, &facts(), Z);
         assert!(!o.open_net, "名前の入力がネットワークを開く頼みになった");
         assert_eq!(link.player_name(), None, "入力を経ずに名前が決まった");
@@ -6027,9 +6891,9 @@ mod tests {
         );
         g.step(&mut ui, &facts(), 0);
         assert_eq!(
-            menu_rows(b)[5],
+            menu_rows(b)[1],
             "> プレイヤー名\u{3000}Bob_synth_",
-            "{:?}",
+            "決めた後は設定の画面に戻る: {:?}",
             menu_rows(b)
         );
         let (mut ui2, _l, b2) = new_ui();
@@ -6058,12 +6922,13 @@ mod tests {
         let mut g = Fake::on_match_screen(4);
         g.step(&mut ui, &facts(), Z);
         g.step(&mut ui, &facts(), 0);
+        open_settings(&mut g, &mut ui, b);
         let rows = menu_rows(b);
         assert!(
             rows.contains(&"  言語\u{3000}\u{3000}\u{3000}◀ 日本語 ▶".to_string()),
             "{rows:?}"
         );
-        for _ in 0..4 {
+        for _ in 0..2 {
             g.step(&mut ui, &facts(), DOWN);
             g.step(&mut ui, &facts(), 0);
         }
@@ -6094,6 +6959,107 @@ mod tests {
         g.step(&mut ui, &facts(), LEFT);
         assert!(menu_rows(b).contains(&"> 言語\u{3000}\u{3000}\u{3000}◀ 日本語 ▶".to_string()));
         assert_eq!(*LANG_SAVED.lock().unwrap(), vec![Lang::En, Lang::Ja]);
+    }
+
+    // ---- 同期方式・ディレイ・サイド ----
+
+    static SHAPE_SAVED: std::sync::Mutex<Vec<(Pick, DelayChoice)>> =
+        std::sync::Mutex::new(Vec::new());
+    static SEAT_SAVED: std::sync::Mutex<Vec<SeatWish>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_shape(p: Pick, d: DelayChoice) {
+        SHAPE_SAVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((p, d));
+    }
+
+    fn record_seat(w: SeatWish) {
+        SEAT_SAVED.lock().unwrap_or_else(|e| e.into_inner()).push(w);
+    }
+
+    /// 入口のメニューの「設定」の行へ動かして決め、設定の画面を開く（開いたメニューから）。
+    fn open_settings(g: &mut Fake, ui: &mut NetUi, b: &'static Board) {
+        cursor_to(g, ui, b, "設定");
+        g.step(ui, &facts(), Z);
+        g.step(ui, &facts(), 0);
+    }
+
+    /// カーソルを `label` の行まで下げる（設定の画面の行は 名前 → サイド → 同期方式 → ディレイ → 言語 の順）。
+    fn cursor_to(g: &mut Fake, ui: &mut NetUi, b: &'static Board, label: &str) {
+        for _ in 0..16 {
+            if menu_rows(b)
+                .iter()
+                .any(|r| r.starts_with(&format!("> {label}")))
+            {
+                return;
+            }
+            g.step(ui, &facts(), DOWN);
+            g.step(ui, &facts(), 0);
+        }
+        panic!("{label} の行に着かない: {:?}", menu_rows(b));
+    }
+
+    #[test]
+    fn changing_the_side_the_netcode_or_the_delay_asks_to_write_the_ini_once_per_change() {
+        const LEFT: u16 = 0x0040;
+        const RIGHT: u16 = 0x0080;
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_seat(SeatWish::Any)
+            .with_shape_saver(Some(record_shape))
+            .with_seat_saver(Some(record_seat));
+        SHAPE_SAVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        SEAT_SAVED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        open_settings(&mut g, &mut ui, b);
+        cursor_to(&mut g, &mut ui, b, "サイド");
+        g.step(&mut ui, &facts(), LEFT);
+        g.step(&mut ui, &facts(), 0);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(*SEAT_SAVED.lock().unwrap(), vec![SeatWish::P2]);
+        g.step(&mut ui, &facts(), RIGHT);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(
+            *SEAT_SAVED.lock().unwrap(),
+            vec![SeatWish::P2, SeatWish::Any]
+        );
+        assert!(SHAPE_SAVED.lock().unwrap().is_empty(), "サイドで形を頼んだ");
+        cursor_to(&mut g, &mut ui, b, "同期方式");
+        g.step(&mut ui, &facts(), RIGHT);
+        g.step(&mut ui, &facts(), 0);
+        g.step(&mut ui, &facts(), 0);
+        {
+            let saved = SHAPE_SAVED.lock().unwrap();
+            assert_eq!(saved.len(), 1, "替えた回に 1 回だけ頼まない: {saved:?}");
+            assert_eq!(saved[0].0, Pick::Delay);
+        }
+        cursor_to(&mut g, &mut ui, b, "ディレイ");
+        g.step(&mut ui, &facts(), RIGHT);
+        g.step(&mut ui, &facts(), 0);
+        {
+            let saved = SHAPE_SAVED.lock().unwrap();
+            assert_eq!(saved.len(), 2, "{saved:?}");
+            assert_eq!(saved[1].0, Pick::Delay);
+            assert!(
+                matches!(saved[1].1, DelayChoice::Fixed(_)),
+                "ディレイが固定の値にならない: {saved:?}"
+            );
+            assert_ne!(saved[1].1, saved[0].1, "ディレイを替えたのに値が同じ");
+        }
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(
+            SHAPE_SAVED.lock().unwrap().len(),
+            2,
+            "替えない tick で頼んだ"
+        );
+        assert_eq!(SEAT_SAVED.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -6182,6 +7148,79 @@ mod tests {
         ui.hud(true, hud_with(Some(weird)));
         assert_eq!(row_text(b, ROW_NAME_L), "1P a?b");
         assert!(row_text(b, ROW_NAME_R).ends_with(" 2P"));
+    }
+
+    #[test]
+    fn the_next_select_notice_is_shown_while_waiting_and_cleared_by_the_watch_teardown() {
+        let (mut ui, _l, b) = new_ui();
+        ui.watch_select_wait(true);
+        assert_eq!(b.show() & SHOW_PEER_WAIT, SHOW_PEER_WAIT);
+        assert_eq!(row_text(b, ROW_PEER_WAIT), T_SPECTATE_NEXT_SELECT.ja);
+        ui.watch_select_wait(false);
+        assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "待ちが解けても残った");
+        ui.watch_select_wait(true);
+        ui.after_watch_teardown();
+        assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "観戦を手放した後も残った");
+    }
+
+    #[test]
+    fn the_peer_wait_line_survives_the_other_updates_and_is_drawn_under_the_corner_lines() {
+        let (mut ui, _l, b) = new_ui();
+        ui.peer_wait(false);
+        assert_eq!(b.show() & SHOW_PEER_WAIT, 0);
+        ui.hud(true, hud_with(Some(names_of(Seat::P1))));
+        ui.peer_wait(true);
+        assert_eq!(row_text(b, ROW_PEER_WAIT), T_PEER_WAIT.ja);
+        // マッチの場面の tick・左上の行・メニューの更新・マッチ中の行を消す更新のどれも、知らせを消さない。
+        let mut g = Fake::on_screen(6, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        g.view = None;
+        g.step(&mut ui, &connected_facts(), 0);
+        ui.publish_corner(&facts());
+        ui.publish_menu(&facts());
+        ui.hud(false, HudFacts::default());
+        assert_eq!(
+            b.show() & SHOW_PEER_WAIT,
+            SHOW_PEER_WAIT,
+            "ほかの更新で消えた"
+        );
+        assert_eq!(b.show() & SHOW_MENU, SHOW_MENU, "メニューの旗の確かめ");
+        ui.peer_wait(true);
+        ui.peer_wait(false);
+        assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "待ちが解けても残った");
+        ui.peer_wait(true);
+        ui.after_teardown(Conn::Finished);
+        assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "片づけた後も残った");
+
+        // 描く: 左上の行の続き（左上の行が無ければ 1 行目）。
+        let s = spec();
+        let (sw, sh) = (640u32, 480u32);
+        let texels = vec![0xFFFF_FFFFu32; s.texel_count()];
+        let row_h = lay::row_height(&s);
+        let b = board();
+        b.set_row(ROW_TL0, "abc", RowStyle::Normal);
+        b.set_row(ROW_PEER_WAIT, "xyz", RowStyle::Normal);
+        let lit = |show: u32| {
+            b.set_show(show);
+            let mut canvas = vec![0u8; (sw * sh * 3) as usize];
+            draw_board(b, &s, sw, sh, &mut |v| {
+                blit_quads(v, &texels, s.tex_w, s.tex_h, &mut canvas, sw, sh, 0, 0);
+            });
+            let px = |y: u32| canvas[((y * sw + TL_X) * 3) as usize];
+            (px(TL_Y), px(TL_Y + row_h))
+        };
+        assert_eq!(
+            lit(SHOW_PEER_WAIT).0,
+            255,
+            "左上の行が無いのに 1 行目に描かない"
+        );
+        assert_eq!(lit(SHOW_PEER_WAIT).1, 0);
+        assert_eq!(
+            lit(SHOW_TL0 | SHOW_PEER_WAIT),
+            (255, 255),
+            "左上の行の続きに描かない"
+        );
+        assert_eq!(lit(SHOW_TL0), (255, 0));
     }
 
     #[test]

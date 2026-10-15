@@ -40,7 +40,7 @@
 use std::io::Write;
 
 use higanr_core::frame::is_prefill;
-use higanr_core::input_model::SEND_MASK;
+use higanr_core::input_model::MATCH_SEND_MASK;
 use higanr_core::lockstep::CaptureError;
 use higanr_core::patch::AddrRange;
 use higanr_core::render_reset::{self, Field as ResetField, Refused};
@@ -1708,12 +1708,12 @@ impl Window for GameWindow<'_> {
         let se_pre =
             (t.kind == TickKind::Live).then(|| read_se_queue(&mut AsOutputs(&mut *self.mem)));
         let t0 = self.mem.now_us();
-        // 相手の入力ワードも SEND_MASK の外を落とす（`netplay::play` の delay 方式と同じ。外のビットは自分の側でも効く: P/Home は
+        // 相手の入力ワードも MATCH_SEND_MASK の外を落とす（`netplay::play` の delay 方式と同じ。外のビットは自分の側でも効く: P/Home は
         // ゲームのフォルダへスクリーンショットを書く）。自分の入力ワードは取るときに落としてある。
         let run = self.mem.run_scan(
             Order::Feed {
-                p1: t.p1 & SEND_MASK,
-                p2: t.p2 & SEND_MASK,
+                p1: t.p1 & MATCH_SEND_MASK,
+                p2: t.p2 & MATCH_SEND_MASK,
             },
             t.kind != TickKind::Live,
         );
@@ -1847,7 +1847,7 @@ impl Window for GameWindow<'_> {
         if !self
             .st
             .confirmed
-            .push((frame, p1 & SEND_MASK, p2 & SEND_MASK))
+            .push((frame, p1 & MATCH_SEND_MASK, p2 & MATCH_SEND_MASK))
         {
             self.st.stats.confirmed_dropped = self.st.stats.confirmed_dropped.saturating_add(1);
         }
@@ -5503,7 +5503,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn words_are_masked_before_they_reach_the_game_and_the_recorded_rows() {
+    fn words_keep_ctrl_and_are_masked_before_they_reach_the_game_and_the_recorded_rows() {
         let mut g = FakeGame::new();
         let mut st = play_state();
         {
@@ -5514,15 +5514,24 @@ pub(crate) mod tests {
             w.tick(Tick {
                 frame: 3,
                 p1: 0xFF35,
-                p2: 0x1234,
+                p2: 0x1334,
                 kind: TickKind::Predicted,
             });
-            w.confirmed(3, 0xFF35, 0x1234);
+            w.confirmed(3, 0xFF35, 0x1334);
         }
-        assert_eq!(g.scans, vec![(Order::Feed { p1: 0x35, p2: 0x34 }, true)]);
+        assert_eq!(
+            g.scans,
+            vec![(
+                Order::Feed {
+                    p1: 0x0135,
+                    p2: 0x0134
+                },
+                true
+            )]
+        );
         let mut rows = Vec::new();
         st.drain_confirmed(&mut |f, p1, p2| rows.push((f, p1, p2)));
-        assert_eq!(rows, vec![(3, 0x35, 0x34)]);
+        assert_eq!(rows, vec![(3, 0x0135, 0x0134)]);
     }
 
     /// 直す前の製品の経路の .data の表（7 行 ＋ つなぎ。`globals_c` が fps の計測の 6 語を含む）。対照の実行だけが使う。

@@ -25,6 +25,7 @@ compile_error!(
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::ffi::OsStr;
+use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -41,33 +42,39 @@ use crate::menu_win::OwnProcess;
 use crate::names::{is_same_or_inside, side_file_name};
 use std::sync::{Arc, OnceLock};
 
+use higanr_core::lan_addr::LanAddr;
+use higanr_core::lan_proto::Ver;
 use higanr_core::lang::Lang;
 use higanr_core::mode_pick::Shape;
 use higanr_core::net_menu::{CodeState, Conn, Event, Note, RoomItem, sanitize_room};
 use higanr_core::player_name::NameBuf;
-use higanr_core::room_input::{InitialFrom, RoomBuf};
+use higanr_core::room_input::InitialFrom;
 use higanr_core::save_skip::{
     self, Clear, Marked, Refuse as SkipRefuse, Side as SkipSide, SkipMem, Watch,
 };
 use higanr_core::wire::Seat;
 
+use crate::adapters_win;
 use crate::clipboard::{Clipboard, FileClipboard};
 use crate::clipboard_win::SystemClipboard;
+use crate::lan_link::{self, LanBridge, LanClip, LanEnv, LanRole};
 use crate::net_code;
 use crate::net_code_game::{self, GameUi};
-use crate::net_config::{AfterScript, ClipboardKind, CodeSide, NetSettings};
+use crate::net_config::{
+    AfterScript, Bind, ClipboardKind, CodeSide, DEFAULT_BIND_PORT, NetSettings,
+};
 use crate::net_game::{self, NetGame, NetIo};
 use crate::net_portrait::PortraitCall;
 use crate::net_room::RoomOptions;
 use crate::net_udp::{self, GameNet, RecvThread};
-use crate::net_ui::{self, BOARD, HudFacts, NetPhase, NetUi, UiFacts, UiLink, UiOut};
+use crate::net_ui::{self, BOARD, HudFacts, LanAsk, NetPhase, NetUi, UiFacts, UiLink, UiOut};
 use crate::net_watch::{NET_FRAMES, NET_STATUS, NetSnapshot};
 use crate::netplay::{self, Action, NetPlay};
 use crate::scripted::{self, GameAddrs, Progress, RunState, TickIo};
 use crate::session::ScriptHost;
 use crate::shot_win;
 use crate::spectate_host;
-use crate::spectate_join::{self, JoinKit, Publisher};
+use crate::spectate_join::{self, JoinKit, JoinSource, Publisher};
 use crate::spectate_watch::{WATCH_MARGIN_FRAMES, WATCH_STATUS, WatchConfig, WatchPlay, WatchSlot};
 use crate::spectate_watch_code::{self, Reader};
 use crate::state_ops::{self, PLAYER_SLOTS, Refuse, STATE_LOG, StateMem};
@@ -97,6 +104,9 @@ struct EngineCell(UnsafeCell<Option<Engine>>);
 // ゲームのスレッドは Acquire で読んでから触る。
 unsafe impl Sync for EngineCell {}
 static ENGINE: EngineCell = EngineCell(UnsafeCell::new(None));
+/// 台本の入れ物に台本が入っているか（`arm` が 1、`arm_io` が 0）。台本の付いた実行は本物のキーを読まないが、rollback のフックが入れ物を `&mut` で
+/// 持っている間は入れ物を覗けないので、別に持つ（`shot_tick`）。書くのは `SCRIPT_ON` が 0 の間の読み取りのスレッドだけ。
+static HAS_SCRIPT: AtomicU32 = AtomicU32::new(0);
 
 static STATE: AtomicU32 = AtomicU32::new(0);
 static STEP: AtomicU32 = AtomicU32::new(0);
@@ -234,36 +244,26 @@ impl LazyNet {
     }
 }
 
-/// 名前を覚えるファイルを書く仕事が重ならないための鍵（続けて名前を決めても、一時ファイルを取り合わない）。
-static NAME_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// メニューで名前を決めた（ゲームのスレッド）: 覚えるファイル（置き場の `player_name.txt`）へ別のスレッドが書く（ゲームのスレッドでは
-/// ファイルに書かない。走るのはスレッドを 1 本起こすことだけ）。書くのは**そのとき入れ物にある最後に決めた名前**。置き場が無い・書けない
-/// ときは本ログへ書く（名前は含めない）。
-fn save_player_name(n: NameBuf) {
-    let Some(lazy) = LAZY.get() else {
-        return;
-    };
-    let Some(dir) = lazy.code_dir.clone() else {
-        return;
-    };
-    let spawned = std::thread::Builder::new()
-        .name("higanr-name".into())
-        .spawn(move || {
-            if let Err(e) = write_player_name(&dir, &lazy.link, n) {
-                game_net_problem(format!("名前: 覚えるファイルへ書けなかった（{e}）"));
-            }
-        });
-    if let Err(e) = spawned {
-        game_net_problem(format!("名前: 書くスレッドを起こせなかった（{e}）"));
+/// 対戦の後に接続が切れて「妖怪 対 妖怪」へ戻し始めた（ゲームのスレッド）: 知らせの音を別のスレッドが鳴らす（合成は確保し、鳴らすのは
+/// 鳴り終わるまで待つので、ゲームのスレッドでは走らせない）。
+fn play_lost_chime() {
+    // 検査のビルドでは鳴らさない。
+    #[cfg(not(test))]
+    {
+        let spawned = std::thread::Builder::new()
+            .name("higanr-lost".into())
+            .spawn(|| {
+                if !crate::notify_win::lost() {
+                    game_net_problem(
+                        "戻り道: 切れた知らせの音を鳴らせなかった（PlaySoundW が 0 を返した）"
+                            .to_string(),
+                    );
+                }
+            });
+        if let Err(e) = spawned {
+            game_net_problem(format!("戻り道: 音を鳴らすスレッドを起こせなかった（{e}）"));
+        }
     }
-}
-
-/// 覚えるファイルへ名前を書く（`save_player_name` が起こしたスレッドで走る）。
-fn write_player_name(dir: &Path, link: &UiLink, n: NameBuf) -> Result<(), String> {
-    let _g = NAME_WRITE.lock().unwrap_or_else(|e| e.into_inner());
-    let latest = link.player_name().unwrap_or(n);
-    crate::player_name_file::write(dir, &latest)
 }
 
 /// ini の言語の行を書く仕事が重ならないための鍵（続けて替えても、読み → 書きと一時ファイルを取り合わない）。
@@ -338,36 +338,247 @@ fn feed_watch_list(on: bool) {
     }
 }
 
-/// 最後に決めたルーム名の回の番号（古い方のスレッドが新しい名を上書きしないため）。取るのはゲームのスレッド、見るのは書くスレッドの
-/// `room_last::write_if_latest` の鍵の中。
-static ROOM_SAVE_SEQ: AtomicU32 = AtomicU32::new(0);
+// ---- LAN ----
+//
+// メニューの LAN の項目（「ホスト」「クライアント」「観戦」）は、ゲームのスレッドが運び手のスレッド（`lan_link`）を 1 本起こすだけ（`request_lan`）。運び手が
+// ホストの受け口・申し込みを行い、ゲームのネットワークは参加を受けてから運び手が開く（`lan_open_net` → 開くスレッド → 見張り）。ゲームのスレッドに足すのは、
+// 項目を決めた tick の `request_lan` と、毎 tick の原子変数 1 つの読み（`lan_watch_poll`）だけ。
 
-/// 設定の「ルーム名」を決めた（ゲームのスレッド）: 「前に使ったルーム名」（置き場の `room_last.txt`）へ別のスレッドが書く。ゲームのスレッドでは
-/// ファイルに書かない。誤りの文は名を含めない。
-fn save_room_name(n: RoomBuf) {
-    let Some(lazy) = LAZY.get() else {
-        return;
-    };
-    let Some(dir) = lazy.code_dir.clone() else {
-        return;
-    };
-    let seq = ROOM_SAVE_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    let spawned = std::thread::Builder::new()
-        .name("higanr-room".into())
-        .spawn(move || {
-            if let Err(e) = write_room_name(&dir, seq, &n) {
-                game_net_problem(format!("ルーム名: 覚えるファイルへ書けなかった（{e}）"));
-            }
-        });
-    if let Err(e) = spawned {
-        game_net_problem(format!("ルーム名: 書くスレッドを起こせなかった（{e}）"));
+/// LAN の接続でゲームのネットワークを開く頼み（運び手が置き、開くスレッドが 1 度だけ取る）。
+struct LanOpen {
+    /// ゲームの受信ソケットを開く自分の LAN のアドレス（ホストは申し込みが届いたアドレス、クライアントは申し込み先へ届くアドレス）。
+    ip: Ipv4Addr,
+    role: LanRole,
+    bridge: Arc<LanBridge>,
+}
+static LAN_OPEN: std::sync::Mutex<Option<LanOpen>> = std::sync::Mutex::new(None);
+
+/// LAN の観戦コード（運び手が置き、観戦者のネットワークを開くスレッドが 1 度だけ取る）と、置いた時刻。古いものは使わない。
+static LAN_WATCH: std::sync::Mutex<Option<(String, Ipv4Addr, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+/// 1 = 運び手が観戦コードを受けた（ゲームのスレッドが観戦者のネットワークを開く頼みにする）。
+static LAN_WATCH_READY: AtomicU32 = AtomicU32::new(0);
+/// 観戦コードを置いてから、観戦者のネットワークを開くスレッドが取るまでの上限。越えたものは使わない（別の観戦に混ざらないように）。
+const LAN_WATCH_FRESH: std::time::Duration = std::time::Duration::from_secs(20);
+/// LAN の頼みを受けた回数（`request_lan` を呼んだ数。本ログ用）。
+static LAN_REQUESTS: AtomicU32 = AtomicU32::new(0);
+
+/// 役割の乱数の最上位の bit。LAN のホストは立てて、クライアントは落とす（ホストがいつも試合のホスト = 観戦コードを出す側になる。大きい方がホスト）。
+const LAN_HOST_BIT: u64 = 1 << 63;
+
+/// LAN の接続の設定: 範囲 lan・自分の LAN のアドレス（ポートは OS が選ぶ）で開き、STUN・UPnP・IPv6・ルームサーバーは使わない。ini は書き換えない
+/// （この接続だけの設定）。`role` があれば役割の乱数を決める。
+fn lan_net_settings(mut s: NetSettings, ip: Ipv4Addr, role: Option<LanRole>) -> NetSettings {
+    s.scope = higanr_core::guard::Scope::Lan;
+    s.bind = Bind::Fixed(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 0));
+    s.stun = None;
+    s.stun2 = None;
+    s.upnp = false;
+    s.ipv6 = false;
+    s.room_server = None;
+    s.room = None;
+    match role {
+        Some(LanRole::Host) => s.role_nonce = Some(default_nonce() | LAN_HOST_BIT),
+        Some(LanRole::Client) => s.role_nonce = Some(default_nonce() & !LAN_HOST_BIT),
+        None => {}
+    }
+    s
+}
+
+#[cfg(test)]
+mod lan_tests {
+    use super::*;
+
+    /// 壊れたら落ちる: LAN の接続が範囲 lan を外れる、自分の LAN のアドレス以外で開く、STUN・UPnP・IPv6・ルームサーバーを使う、ホストが
+    /// 役割の乱数で負ける（観戦コードを出す側になれない）、クライアントが勝つ。
+    #[test]
+    fn lan_connections_open_on_the_lan_address_with_no_internet_helpers() {
+        let base = crate::net_config::from_text(
+            "[netplay]\nenable = 1\nscope = internet\nbind = auto:17723\ncode_side = game\nclipboard = file\nroom_server = https://rooms.example\nstun = stun.example.test:3478\nstun2 = stun.example.test:3479\nupnp = on\nipv6 = on\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(base.stun.is_some() && base.upnp && base.ipv6 && base.room_server.is_some());
+        let ip = Ipv4Addr::new(192, 168, 7, 20);
+        let h = lan_net_settings(base.clone(), ip, Some(LanRole::Host));
+        let c = lan_net_settings(base.clone(), ip, Some(LanRole::Client));
+        for s in [&h, &c] {
+            assert_eq!(s.scope, higanr_core::guard::Scope::Lan);
+            assert_eq!(
+                s.bind,
+                Bind::Fixed(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 0))
+            );
+            assert!(s.stun.is_none() && s.stun2.is_none(), "STUN を使う");
+            assert!(!s.upnp && !s.ipv6, "UPnP か IPv6 を使う");
+            assert!(s.room_server.is_none(), "ルームサーバーを使う");
+            // それ以外の設定（名前・形）はそのまま。
+            assert_eq!(s.name, base.name);
+            assert_eq!(s.mode, base.mode);
+        }
+        for _ in 0..50 {
+            let h = lan_net_settings(base.clone(), ip, Some(LanRole::Host));
+            let c = lan_net_settings(base.clone(), ip, Some(LanRole::Client));
+            assert!(
+                h.role_nonce.unwrap() > c.role_nonce.unwrap(),
+                "ホストが役割の乱数で勝てない"
+            );
+        }
+        // 観戦者の設定は役割の乱数を替えない。
+        let w = lan_net_settings(base.clone(), ip, None);
+        assert_eq!(w.role_nonce, base.role_nonce);
+        assert_eq!(w.scope, higanr_core::guard::Scope::Lan);
+    }
+
+    /// 壊れたら落ちる: LAN の接続で、接続コードが人のクリップボードへ書かれる（運び手へ渡らない）、観戦コード（Ctrl+C）の書き先が人の
+    /// クリップボードでない（運び手へ渡って捨てられる）、LAN でない接続が人のクリップボードを使わない。
+    #[test]
+    fn a_lan_connection_trades_codes_through_the_carrier_and_copies_the_watch_code_for_people() {
+        use crate::clipboard::fake::FakeClipboard;
+        let human = FakeClipboard::default();
+        let h = human.clone();
+        let bridge = LanBridge::new();
+        let (mut clip, spectate) =
+            code_clips(Some(&bridge), move || Ok(Box::new(h) as Box<dyn Clipboard>)).unwrap();
+        clip.write("CONNECT-CODE").unwrap();
+        assert_eq!(bridge.take_outgoing().as_deref(), Some("CONNECT-CODE"));
+        assert!(
+            human.writes().is_empty(),
+            "接続コードを人のクリップボードへ書いた"
+        );
+        spectate
+            .expect("観戦コードの書き先が無い")
+            .write("WATCH-CODE")
+            .unwrap();
+        assert_eq!(human.writes(), vec!["WATCH-CODE".to_string()]);
+        assert!(bridge.take_outgoing().is_none());
+        // 人のクリップボードを開けなくても、LAN の接続は開く（観戦コードのコピーだけができない）。
+        let (_, none) = code_clips(Some(&bridge), || Err("開けない".to_string())).unwrap();
+        assert!(none.is_none());
+        // LAN でない接続: 人のクリップボードが運び先で、観戦コードも同じ所へ書く。
+        let other = FakeClipboard::default();
+        let o = other.clone();
+        let (mut clip, spectate) =
+            code_clips(None, move || Ok(Box::new(o) as Box<dyn Clipboard>)).unwrap();
+        clip.write("CODE").unwrap();
+        assert_eq!(other.writes(), vec!["CODE".to_string()]);
+        assert!(spectate.is_none());
+        assert!(code_clips(None, || Err("開けない".to_string())).is_err());
     }
 }
 
-/// 前に使ったルーム名を書く（`save_room_name` が起こしたスレッドで走る）。もっと新しく決めた回があれば何も書かない。番号を見るのも
-/// 書くのも `room_last` の鍵の中。
-fn write_room_name(dir: &Path, seq: u32, n: &RoomBuf) -> Result<(), String> {
-    crate::room_last::write_if_latest(dir, n, || ROOM_SAVE_SEQ.load(Ordering::Acquire) == seq)
+/// 運び手の材料（ゲームのスレッドで作る。確保はあるが、項目を決めた tick に 1 回だけ）。
+fn lan_env(lazy: &'static LazyNet) -> LanEnv {
+    let s = lazy.settings_now();
+    // 待ち受けのポート: ini の `bind` のポート（`auto:ポート` か、ポートを書いた固定のアドレス）。無ければ既定。
+    let port = match s.bind {
+        Bind::Auto(p) => p,
+        Bind::Fixed(a) if a.port() != 0 => a.port(),
+        Bind::Fixed(_) => DEFAULT_BIND_PORT,
+    };
+    LanEnv {
+        link: Arc::clone(&lazy.link),
+        ver: Ver {
+            proto: higanr_core::wire::PROTO_VER,
+            build: higanr_core::update::BUILD_NUMBER,
+        },
+        watch_ok: s.spectate.is_some(),
+        port,
+        reply_wait_ms: higanr_core::lan_proto::HOST_WAIT_REPLY_MS,
+        addresses: Box::new(|| {
+            adapters_win::list().map(|l| higanr_core::adapter_pick::lan_addresses(&l))
+        }),
+        net_free: Box::new(|| OPEN_STATE.load(Ordering::SeqCst) == OPEN_IDLE),
+        open_net: Box::new(lan_open_net),
+        start_watch: Box::new(lan_start_watch),
+        id: default_nonce() as u32,
+        unix: net_udp::now_unix,
+        stop: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+/// 運び手の頼み: ゲームのネットワークを LAN の設定で開く（開くスレッドを起こして返る。開き終わるとゲームのスレッドが次の tick で置く）。
+fn lan_open_net(ip: Ipv4Addr, role: LanRole, bridge: Arc<LanBridge>) -> Result<(), String> {
+    let lazy = LAZY
+        .get()
+        .ok_or("ゲーム内のメニューが置かれていない".to_string())?;
+    if OPEN_STATE
+        .compare_exchange(OPEN_IDLE, OPEN_BUSY, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("ネットワークがほかの用で使われている".to_string());
+    }
+    SPECTATE_AFTER.store(0, Ordering::SeqCst);
+    *LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(LanOpen { ip, role, bridge });
+    spawn_open(lazy, false);
+    Ok(())
+}
+
+/// 運び手の頼み: 観戦コードを受けた。置いて、ゲームのスレッドに観戦者のネットワークを開かせる（`lan_watch_poll`）。
+fn lan_start_watch(code: String, ip: Ipv4Addr) -> Result<(), String> {
+    *LAN_WATCH.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((code, ip, std::time::Instant::now()));
+    LAN_WATCH_READY.store(1, Ordering::SeqCst);
+    Ok(())
+}
+
+/// ゲームのスレッド（毎 tick。原子変数 1 つの読み）: 運び手が観戦コードを受けたなら、観戦者のネットワークを開く頼みを出す。
+fn lan_watch_poll() {
+    if LAN_WATCH_READY.load(Ordering::Relaxed) != 0
+        && LAN_WATCH_READY.swap(0, Ordering::SeqCst) != 0
+    {
+        request_spectate();
+    }
+}
+
+fn lan_done(end: lan_link::End) {
+    game_net_note(format!("LAN: 運び手の務めを終えた（{end:?}）"));
+}
+
+/// メニューの LAN の項目が決まった（ゲームのスレッド）。運び手のスレッドを起こす。待っているだけのセッションが残っていれば手放す（ホストの受け口のポートを
+/// 空けるため。運び手は片づけが済むのを待ってから受け口を開く）。動いている運び手があれば読み捨てる。
+fn request_lan(ask: LanAsk) {
+    LAN_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let Some(lazy) = LAZY.get() else {
+        return;
+    };
+    if lan_link::is_active() {
+        game_net_note("LAN: 動いている運び手があるので、頼みを読み捨てた".to_string());
+        return;
+    }
+    if OPEN_STATE.load(Ordering::SeqCst) == OPEN_DONE {
+        release_slot(|s| match s {
+            Slot::Play(p) => matches!(p.np.ui_conn(0).0, Conn::Waiting),
+            Slot::Watch(w) => w.wp.is_ended() && spectate_join::finished(),
+        });
+    }
+    let env = lan_env(lazy);
+    let spawned = match ask {
+        LanAsk::Host => lan_link::spawn("higanr-lan", env, lan_link::run_host, lan_done),
+        LanAsk::Client(a) => lan_link::spawn(
+            "higanr-lan",
+            env,
+            move |e| lan_link::run_client(e, a),
+            lan_done,
+        ),
+        LanAsk::Watch(a) => lan_link::spawn(
+            "higanr-lan",
+            env,
+            move |e| lan_link::run_watch(e, a),
+            lan_done,
+        ),
+    };
+    match spawned {
+        Ok(true) => {}
+        Ok(false) => game_net_note("LAN: 動いている運び手があるので、頼みを読み捨てた".to_string()),
+        Err(e) => {
+            game_net_problem(e);
+            lazy.link.publish(&Note {
+                event: Event::Internal,
+                seq: lazy.link.note().map_or(1, |n| n.seq.wrapping_add(1)),
+                ..Note::default()
+            });
+        }
+    }
 }
 
 /// ネットワークの開き: 0 = まだ（か、開けなかった・片づけ終えたのでやり直せる）/ 1 = 別のスレッドが開いている最中 / 2 = ネットワークのセッションを置いた /
@@ -767,11 +978,10 @@ fn arm_game_ui_with(
     GAME_TID.store(0, Ordering::SeqCst);
     let link = Arc::new(UiLink::new());
     let (ini, start_auto) = menu_start(s);
-    // ルーム名の入力の初めの値: ini の `room`（決まりを通るもの）→ 前に使った名（置き場の `room_last.txt`）→ 空。読むのはここ（起動の
-    // ときの読み取りのスレッド）だけで、ゲームのスレッドは読まない。
-    let last = code_dir.as_deref().and_then(crate::room_last::read);
+    // ルーム名の入力の初めの値: ini の `room`（決まりを通るもの）→ 空。メニューで決めた名は `room` に書き戻してあるので、次の起動で同じ値から始まる。
     let (initial, from) =
-        higanr_core::room_input::initial_from(s.room.as_ref().map(|r| r.0.as_str()), last);
+        higanr_core::room_input::initial_from(s.room.as_ref().map(|r| r.0.as_str()));
+    crate::ini_save::set_target(ini_path.clone());
     LAZY.set(LazyNet {
         settings: s.clone(),
         code_dir,
@@ -780,16 +990,27 @@ fn arm_game_ui_with(
     })
     .map_err(|_| "ゲーム内のメニューはもう置いてある".to_string())?;
     let room = room_item(s, initial);
-    // 「名前」の項目: 今の名前（打てない文字は `?` に直した表示用の形）。決めたら覚えるファイルへ別のスレッドが書く。
+    // 「名前」の項目: 今の名前（打てない文字は `?` に直した表示用の形）。メニューで決めた名前・ルーム名・同期方式・ディレイ・サイドは、
+    // 決めたとき別のスレッドが ini の該当の行へ書く（`ini_save`）。
     // 「サイド」の初めの値は「おまかせ」（ini に `host_seat` があればその席）。
     let ui = NetUi::new(ini, link, &BOARD)
         .with_start_auto(start_auto)
         .with_room(room)
         .with_seat(initial_seat(s))
-        .with_player_name(NameBuf::lossy(&s.name), Some(save_player_name))
-        .with_room_saver(Some(save_room_name))
+        .with_player_name(NameBuf::lossy(&s.name), Some(crate::ini_save::save_name))
+        .with_room_saver(Some(crate::ini_save::save_room))
+        .with_lan_addr(
+            s.lan_host.map(LanAddr::to_buf).unwrap_or_default(),
+            Some(crate::ini_save::save_lan_host),
+        )
+        .with_shape_saver(Some(crate::ini_save::save_shape))
+        .with_seat_saver(Some(crate::ini_save::save_seat))
         .with_watch_feed(Some(feed_watch_list))
-        .with_lang(lang, Some(save_ui_lang));
+        .with_ini_notice(higanr_core::net_menu::IniNotice::from_notes(&s.ini_notes))
+        .with_spectate_hint(s.spectate.is_some())
+        .with_lang(lang, Some(save_ui_lang))
+        .with_return_flow(Some(play_lost_chime))
+        .with_return_log(Some(publish_return_stats));
     // SAFETY: `UI_ON` が 0 なので、ゲームのスレッドはメニューの入れ物に触らない（`UiCell` の Sync の注）。
     unsafe { *UI.0.get() = Some(ui) };
     UI_ON.store(1, Ordering::Release);
@@ -804,9 +1025,6 @@ fn arm_game_ui_with(
             // 名は書かない。初めの値の出どころだけ。
             (RoomItem::On(_), InitialFrom::Ini) => {
                 "出す（ルーム名はメニューで打つ。初めの値は ini の room。名は記録しない）"
-            }
-            (RoomItem::On(_), InitialFrom::LastName) => {
-                "出す（ルーム名はメニューで打つ。初めの値は前に使った名。名は記録しない）"
             }
             (RoomItem::On(_), InitialFrom::Empty) => {
                 "出す（ルーム名はメニューで打つ。初めの値は空。名は記録しない）"
@@ -849,6 +1067,32 @@ pub(crate) fn initial_seat(s: &NetSettings) -> higanr_core::wire::SeatWish {
 /// メニューの数え（`UiStats` のコピー。ゲームのスレッドが書き、読み取りのスレッドが本ログへ読む）。
 static UI_STATS: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
 
+/// 戻り道の数え（始めた・着いた・途中でやめた・最後にやめた理由の印）。変わるたびにゲームのスレッドが書く（原子変数 4 つ。確保しない）。
+static RET_STATS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+fn publish_return_stats(st: &net_ui::UiStats) {
+    for (a, v) in RET_STATS.iter().zip([
+        st.returns,
+        st.return_arrived,
+        st.return_gave_up,
+        st.return_why,
+    ]) {
+        a.store(v, Ordering::Relaxed);
+    }
+}
+
+/// 本ログの「戻り道」の行。始めなかった回も 0 回と書く（0 回を「測れていない」と区別するため）。
+fn return_stats_text() -> String {
+    let l = |i: usize| RET_STATS[i].load(Ordering::Relaxed);
+    format!(
+        "\n戻り道: 始めた {} 回 / 着いた {} 回 / 途中でやめた {} 回（最後の理由: {}）",
+        l(0),
+        l(1),
+        l(2),
+        higanr_core::return_flow::GiveUp::describe(l(3))
+    )
+}
+
 /// 本ログの「ネットワークの外」の行へ足すメニューの数え（メニューを置いていない実行は空）。
 fn ui_stats_text() -> String {
     if LAZY.get().is_none() {
@@ -868,7 +1112,7 @@ fn ui_stats_text() -> String {
         crate::text_input_win::install_text(),
         TYPED_PUSHED.load(Ordering::Relaxed),
         TYPED_DROPPED.load(Ordering::Relaxed)
-    )
+    ) + &return_stats_text()
 }
 
 /// 台本の `type=` / `bs=` / `enter=` の文字を、ルーム名の入力欄へ入れた・入力欄が閉じていて捨てた単位の数（ゲームのスレッドが書き、本ログが読む。
@@ -1072,16 +1316,9 @@ fn play_config(s: &NetSettings, rb_wired: bool) -> netplay::Config {
     }
 }
 
-/// ネットワークを開く（開くスレッド。`code_side = game`）: 受信ソケット・STUN・見張り・ネットワークのセッション。`open_net` の接続コードの形と同じ手順で、置き場へは触らない
-/// （`clipboard = file` のときだけ置き場の下のファイルを使う）。戻りは置くネットワークのセッション。
-fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
-    let named = lazy.settings_now();
-    let s = &named;
-    // 役割の乱数は開くたびに引く（ini に書いてあればその値。つなぎ直しでも同じ値）。
-    let nonce = s.role_nonce.unwrap_or_else(default_nonce);
-    let rb_wired = crate::rollback_play_win::armed();
-    let cfg = play_config(s, rb_wired);
-    let clip: Box<dyn Clipboard> = match (s.clipboard, lazy.code_dir.as_deref()) {
+/// コードを受け渡すクリップボード（ini の `clipboard`。開発用の `file` は置き場の下のファイル）。
+fn open_clipboard(s: &NetSettings, lazy: &LazyNet) -> Result<Box<dyn Clipboard>, String> {
+    Ok(match (s.clipboard, lazy.code_dir.as_deref()) {
         (ClipboardKind::System, _) => Box::new(SystemClipboard),
         (ClipboardKind::File, Some(d)) => {
             std::fs::create_dir_all(d)
@@ -1089,7 +1326,47 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
             Box::new(FileClipboard::new(d.to_path_buf()))
         }
         (ClipboardKind::File, None) => return Err("接続コードの置き場が決まっていない".to_string()),
+    })
+}
+
+/// 見張りのコードの運び先（`GameUi::clip`）と観戦コードの書き先（`GameUi::spectate_clip`）。LAN の接続では、コードは運び手へ運び、
+/// 観戦コード（Ctrl+C）だけを人のクリップボードへ書く（開けなければ、観戦コードのコピーだけができない。接続は続ける）。
+type CodeClips = (Box<dyn Clipboard>, Option<Box<dyn Clipboard>>);
+fn code_clips(
+    lan: Option<&Arc<LanBridge>>,
+    open: impl FnOnce() -> Result<Box<dyn Clipboard>, String>,
+) -> Result<CodeClips, String> {
+    let Some(bridge) = lan else {
+        return Ok((open()?, None));
     };
+    let spectate = match open() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            game_net_note(format!(
+                "LAN: 観戦コードをコピーするクリップボードを開けない（{e}）"
+            ));
+            None
+        }
+    };
+    Ok((Box::new(LanClip(Arc::clone(bridge))), spectate))
+}
+
+/// ネットワークを開く（開くスレッド。`code_side = game`）: 受信ソケット・STUN・見張り・ネットワークのセッション。`open_net` の接続コードの形と同じ手順で、置き場へは触らない
+/// （`clipboard = file` のときだけ置き場の下のファイルを使う）。戻りは置くネットワークのセッション。
+fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
+    // LAN の接続の頼みがあれば（運び手が置いた）、その設定とコードの運び先で開く。ほかの接続は今までどおり。
+    let lan = LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let named = match &lan {
+        Some(l) => lan_net_settings(lazy.settings_now(), l.ip, Some(l.role)),
+        None => lazy.settings_now(),
+    };
+    let s = &named;
+    // 役割の乱数は開くたびに引く（ini に書いてあればその値。つなぎ直しでも同じ値）。
+    let nonce = s.role_nonce.unwrap_or_else(default_nonce);
+    let rb_wired = crate::rollback_play_win::armed();
+    let cfg = play_config(s, rb_wired);
+    let lan_bridge = lan.map(|l| l.bridge);
+    let (clip, spectate_clip) = code_clips(lan_bridge.as_ref(), || open_clipboard(s, lazy))?;
     let net_code_game::Opened {
         np,
         net,
@@ -1111,10 +1388,12 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
             clip,
             // ルームサーバー: OS のプロキシの設定に従う製品の待ち。
             room: s.room_server.clone().map(RoomOptions::product),
-            // 前に使ったルーム名を覚えるファイルの置き場（接続コードの置き場。ゲームのフォルダの外 —— `arm_net` が確かめてある）。
-            room_last_dir: lazy.code_dir.clone(),
+            // ルームへ入った名を `room` に書く ini。
+            ini_path: lazy.ini_path.clone(),
             // つなぎ直し: 前のつながりで使ったコードは読まない。
             spent: spent_sessions(),
+            lan: lan_bridge,
+            spectate_clip,
         },
     )?;
     let local = local_addr.map_or("（分からない）".to_string(), |a| a.to_string());
@@ -1207,20 +1486,52 @@ fn watch_target(link: &UiLink) -> Result<(higanr_core::room::RoomName, String), 
 /// 観戦者のネットワークを開く（開くスレッド）: 受信ソケット・STUN・受信スレッド・観戦者のセッション・観戦者のルームのスレッド。接続コードの見張りは作らない
 /// （観戦用のコードはルームが運ぶ）。決めたルーム名は `UiLink::spectate_name` から読み、**本ログには書かない**。
 fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
-    let named = lazy.settings_now();
+    // LAN の観戦: 運び手が受けた観戦コードを使い、LAN の設定（範囲 lan・自分の LAN のアドレス・STUN なし）で開く。古い（別の観戦のために置いた）ものは使わない。
+    let lan = LAN_WATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .filter(|(_, _, at)| at.elapsed() < LAN_WATCH_FRESH);
+    let named = match &lan {
+        Some((_, ip, _)) => lan_net_settings(lazy.settings_now(), *ip, None),
+        None => lazy.settings_now(),
+    };
     let s = &named;
-    let (watch_room, shown) = watch_target(&lazy.link)?;
-    let base = s
-        .room_server
-        .clone()
-        .ok_or("ルームサーバー（room_server）が無い（観戦用のルームへ入れない）")?;
+    // 観戦コード入力: ルームサーバーは使わない。クリップボードはここで 1 回だけ読み、読めたかどうかの判断は観戦者のスレッドが状態に書く。
+    let by_code = lan.is_some() || lazy.link.spectate_by_code();
+    let (source, shown) = if let Some((code, _, _)) = lan {
+        (JoinSource::Code(Ok(Some(code))), String::new())
+    } else if by_code {
+        let read = open_clipboard(s, lazy)?.read();
+        (JoinSource::Code(read), String::new())
+    } else {
+        let (watch_room, shown) = watch_target(&lazy.link)?;
+        let base = s
+            .room_server
+            .clone()
+            .ok_or("ルームサーバー（room_server）が無い（観戦用のルームへ入れない）")?;
+        (
+            JoinSource::Room {
+                room: RoomOptions::product(base),
+                watch_room,
+            },
+            shown,
+        )
+    };
     let glyphs = higanr_core::overlay::ui_glyphs();
     let mut publisher = Publisher::new(
         Arc::clone(&lazy.link),
         sanitize_room(&shown, |c| glyphs.binary_search(&c).is_ok()),
         net_udp::now_unix() as u32,
     );
-    publisher.publish(CodeState::SpectateJoining, Event::RoomJoining);
+    publisher.publish(
+        CodeState::SpectateJoining,
+        if by_code {
+            Event::None
+        } else {
+            Event::RoomJoining
+        },
+    );
     // 役割の乱数は JOIN の nonce に使う（観戦者の識別。ini に書いてあればその値）。
     let nonce = s.role_nonce.unwrap_or_else(default_nonce);
     let (bind, bind_note) = net_udp::resolve_bind(s)?;
@@ -1247,8 +1558,7 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
         },
     );
     let kit = JoinKit {
-        room: RoomOptions::product(base),
-        watch_room,
+        source,
         reader: Reader::new(s, nonce),
         reply_name: higanr_core::handshake::Name::new(&s.name),
         own,
@@ -1269,7 +1579,12 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
     game_net_note(format!("観戦: 早送り: {}", arm_watch_scan_at_open()));
     let nth = WATCHES_CLOSED.load(Ordering::SeqCst) + 1;
     game_net_note(format!(
-        "観戦: 「ルームで観戦」で観戦者のネットワークを開いた（{nth} 回目。ルーム名は記録しない）。受信ソケット {local}（待ちは{}）{bind_note}{note}",
+        "観戦: {}で観戦者のネットワークを開いた（{nth} 回目。ルーム名・コードは記録しない）。受信ソケット {local}（待ちは{}）{bind_note}{note}",
+        if by_code {
+            "「観戦コード入力」"
+        } else {
+            "「ルームで観戦」"
+        },
         if timer {
             "高分解能の待機タイマー"
         } else {
@@ -1403,6 +1718,7 @@ fn ui_only_step(game: &mut NetGame<'_>) -> UiOut {
         stall: None,
     };
     let out = ui.tick(game, &f);
+    return_save_quit_tick(&out);
     if out.action.is_some() || out.open_net {
         publish_ui_stats(ui);
     }
@@ -1412,6 +1728,10 @@ fn ui_only_step(game: &mut NetGame<'_>) -> UiOut {
     if spectate_asked(&out) {
         request_spectate();
     }
+    if let Some(ask) = out.lan {
+        request_lan(ask);
+    }
+    lan_watch_poll();
     out
 }
 
@@ -1425,6 +1745,7 @@ fn ui_hud_tick(np: &mut NetPlay) {
         Some(h) => ui.hud(true, h),
         None => ui.hud(false, HudFacts::default()),
     }
+    ui.peer_wait(np.peer_wait_shown());
 }
 
 /// ネットワークをまだ開いていない実行の 1 tick。画面 6 以外・メニューが握らない tick は台本があれば台本、無ければ 0 = poll_all へ返す。画面 6 は
@@ -1466,6 +1787,7 @@ pub fn arm(script: Script, addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Res
     arm_io(addrs, feed_fn, local_fn)?;
     // SAFETY: `SCRIPT_ON` が 0 なので、ゲームのスレッドは入れ物に触らない（`EngineCell` の Sync の注。`arm_io` が見た）。
     unsafe { *ENGINE.0.get() = Some(Engine::new(script)) };
+    HAS_SCRIPT.store(1, Ordering::SeqCst);
     STATE.store(RunState::Running.code(), Ordering::SeqCst);
     Ok(())
 }
@@ -1510,6 +1832,7 @@ pub fn arm_io(addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), Strin
     STATE_LOG.reset();
     // SAFETY: `SCRIPT_ON` が 0 なので、ゲームのスレッドは入れ物に触らない（`EngineCell` の Sync の注）。
     unsafe { *ENGINE.0.get() = None };
+    HAS_SCRIPT.store(0, Ordering::SeqCst);
     for a in [&STEP, &LINE, &TICKS, &FED] {
         a.store(0, Ordering::SeqCst);
     }
@@ -1635,8 +1958,38 @@ pub fn arm_portrait(fns: [u32; 3]) {
 }
 
 /// 受信スレッド（開いたら閉じない。プロセスの終わりまで残す）。ゲーム内のメニューの実行だけは、つながりが終わったらワーカーのスレッドが取り出して
-/// 止め（`relink_tick`）、次のつながりを開くスレッドが新しいものを置く。ゲームのスレッドは触らない。
+/// 止め（`relink_tick`）、次のつながりを開くスレッドが新しいものを置く。ゲームのスレッドが触るのは、パニックを受けたときの `try_lock` 1 回だけ
+/// （`bye_after_panic`）。
 static RECV: std::sync::Mutex<Option<RecvThread>> = std::sync::Mutex::new(None);
+
+/// ゲームスレッドの経路でパニックを受けた後、受信スレッドに BYE を出させる（相手は 60 秒の沈黙を待たずに切れる）。錠は待たない: 取れなければ
+/// 何もせず、相手は心拍の古さで PONG が止まってから切れる。
+fn bye_after_panic() {
+    #[cfg(test)]
+    PANIC_BYES.fetch_add(1, Ordering::SeqCst);
+    let recv = match RECV.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if let Some(r) = recv.as_ref() {
+        r.say_bye(higanr_core::wire::ByeReason::Cancelled);
+    }
+}
+
+/// 検査だけ: `bye_after_panic` を呼んだ回数。
+#[cfg(test)]
+pub(crate) static PANIC_BYES: AtomicU32 = AtomicU32::new(0);
+
+/// ゲームスレッドの経路（入力の入口・開始のフック・rollback の走査と Present の後のフック）でパニックを受けた後始末。ネットワークの分岐を閉じ、
+/// 受信スレッドに BYE を出させる。ネットワークが動いていなかった（もう閉じた）ときは何もしない。
+pub(crate) fn net_panicked() {
+    if NET_ON.swap(0, Ordering::SeqCst) != 0 {
+        NET_PANICKED.store(1, Ordering::SeqCst);
+        bye_after_panic();
+    }
+}
+
 /// ネットワークのセッションを置いた（読み取りのスレッドが `_net_frames.csv` を開くかの印）。
 static NET_ARMED: AtomicU32 = AtomicU32::new(0);
 
@@ -2145,6 +2498,24 @@ unsafe fn poll_seat_keeping_im(poll: PollFn, seat: u32, im: *mut u8) -> u32 {
     ax & 0xFFFF
 }
 
+/// 1P の入力機器（`INPUT_DEVICE_P1` から読んだ 4 バイトの下位 1 バイトが機器）がパッド（0 = PAD1・1 = PAD2）か。パッドのときだけ、
+/// 自分の入力にキーボードを足す。読めなかった（`None`）ときは足さない。
+fn keyboard_joins_pad(device_word: Option<u32>) -> bool {
+    device_word.is_some_and(|w| w & 0xFF < 2)
+}
+
+/// 1P の入力機器を含む 4 バイト（`INPUT_DEVICE_P1`）。読めなければ `None`。落ちない読み方（`ReadProcessMemory`）で、確保もロック待ちもしない。
+fn input_device_word() -> Option<u32> {
+    #[cfg(test)]
+    {
+        fake_mem::input_device()
+    }
+    #[cfg(not(test))]
+    {
+        OwnProcess.u32_at(crate::th09_addr::INPUT_DEVICE_P1)
+    }
+}
+
 /// 検査だけ: ゲームのメモリの代わりの表（アドレス → 値）。有効にしている間、`RealTickIo` のゲームのメモリの読みはこの表を引く（無いアドレスは 0）。
 /// 本物の入口を偽のゲームの画面で通すため。
 #[cfg(test)]
@@ -2163,6 +2534,20 @@ pub(crate) mod fake_mem {
 
     pub fn on() -> bool {
         ON.load(Ordering::SeqCst) != 0
+    }
+
+    static DEVICE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// 1P の入力機器の偽の読み。置いていなければ読めなかったことにする（検査のプロセスの `0x004B353F` には別のものが入っているため）。
+    pub fn input_device() -> Option<u32> {
+        match DEVICE.load(Ordering::SeqCst) {
+            u32::MAX => None,
+            d => Some(d),
+        }
+    }
+
+    pub fn set_input_device(device: Option<u32>) {
+        DEVICE.store(device.unwrap_or(u32::MAX), Ordering::SeqCst);
     }
 
     pub fn clear() {
@@ -2233,14 +2618,23 @@ impl TickIo for RealTickIo {
         };
     }
     fn local_input(&mut self) -> u32 {
-        // 本人の入力は 1P の設定どおりに読む（席が 2P でも同じ）。素の poll の席 0 を InputManager[0] を汚さずに呼ぶ。
+        // 実際に操作する人の入力は 1P の設定どおりに読む（席が 2P でも同じ）。素の poll の席 0 を InputManager[0] を汚さずに呼ぶ。
         // poll の入口の照合が合わなかった実行（`POLL_FN` = 0）は今までの読み方へ戻る。
         if let Some(poll) = self.poll
             && self.ims[0] != 0
         {
             // SAFETY: `poll` は `POLL_SITES` の `fn_poll` 行（`session::arm_poll` が実バイトと照合して一致したときだけ置いた入口）。
             // `ims[0]` は `arm_io` が置いた InputManager[0]。ゲームのスレッドから呼ぶ。
-            return unsafe { poll_seat_keeping_im(poll, 0, self.ims[0] as usize as *mut u8) };
+            let own = unsafe { poll_seat_keeping_im(poll, 0, self.ims[0] as usize as *mut u8) };
+            // 1P がパッドのとき、席 0 はキーボードの移動・ショットを読まない。席 2 は FULL の配置のキーボードと両方のパッドを足した語なので、
+            // 足してキーボードでも動かせるようにする。2P の入力機器もパッドなら、その分も混ざる。
+            // 設定は毎 tick 読む（遊びながらキー設定を変えても効く）。読めなければ席 0 だけ。
+            if self.ims[2] != 0 && keyboard_joins_pad(input_device_word()) {
+                // SAFETY: 席 0 と同じ約束。席 2 は `poll_all` も呼ぶ席で、`ims[2]` は `arm_io` が置いた InputManager[2]。
+                return own
+                    | unsafe { poll_seat_keeping_im(poll, 2, self.ims[2] as usize as *mut u8) };
+            }
+            return own;
         }
         // SAFETY: `local` は `fn_local_input` 行（照合で一致した入口）。引数なし・戻り値 ax・ebx と edi に触らず esi と ebp を保ち、
         // 素の `ret` で戻るので、cdecl の引数なしの関数として呼んでよい。ゲームのスレッドから呼ぶ。
@@ -2341,6 +2735,13 @@ impl NetIo for RealTickIo {
             f(m, a0, a1, a2, a3)
         }
     }
+    fn push_se(&mut self, id: u32, pan: i32) -> bool {
+        #[cfg(test)]
+        if fake_mem::on() {
+            return false;
+        }
+        crate::rollback_play_win::push_se_checked(id, pan)
+    }
 }
 
 impl StateMem for RealTickIo {
@@ -2391,13 +2792,12 @@ pub extern "C" fn script_on_tick(k: u32) -> u32 {
         Err(_) => {
             SCRIPT_ON.store(0, Ordering::SeqCst);
             UI_ON.store(0, Ordering::SeqCst);
-            if NET_ON.swap(0, Ordering::SeqCst) != 0 {
-                NET_PANICKED.store(1, Ordering::SeqCst);
-            }
+            net_panicked();
             // rollback のモードのフックが開けていた確保の向け先と見張りを閉じる（ネットワークが止まった後はフックが動かないので、開いたまま残さない）。
             crate::rollback_win::RB_REDIRECT.store(0, Ordering::SeqCst);
             crate::rollback_win::RB_WATCH.store(0, Ordering::SeqCst);
             shot_win::set_off();
+            crate::shot_key_win::clear();
             // 保存の画面を飛ばす印を立てたままなら落とす（入口が閉じると見張れない。残すと継続の開始から画面 15 へ来たときに飛ぶ）。
             save_skip_abandon();
             STATE.store(RunState::Panicked.code(), Ordering::SeqCst);
@@ -2430,6 +2830,23 @@ fn real_io() -> Option<RealTickIo> {
 }
 
 fn tick_inner(k: u32) -> u32 {
+    let ret = tick_body(k);
+    shot_tick(ret);
+    ret
+}
+
+/// 自分の PC にだけ撮るスクリーンショット（`shot_key_win`）の毎 tick の読み。入力の入口の戻り値が 0 でない tick は、ツールが入力を握っている
+/// （台本・ネットワークの feed、または描画だけのフレーム）。0 の tick はゲーム自身の poll が P を読むので、ここでは何もしない。握っているかの判断は
+/// 全部の経路（ネットワーク・rollback・メニュー・台本）がこの戻り値に集まるので、ここ 1 か所にある。進め直しの回（rollback の進め直し・観戦者の
+/// 早送り）は 1 フレームに何度も来るので読まない。
+fn shot_tick(ret: u32) {
+    if !crate::shot_key_win::armed() || crate::rollback_play_win::resim_active() {
+        return;
+    }
+    crate::shot_key_win::on_tick(ret != 0, HAS_SCRIPT.load(Ordering::Relaxed) != 0);
+}
+
+fn tick_body(k: u32) -> u32 {
     if SCRIPT_ON.load(Ordering::Acquire) == 0 {
         return 0;
     }
@@ -2625,6 +3042,18 @@ fn save_quit_tick(np: &mut NetPlay) {
     }
 }
 
+/// 接続が終わった後の戻り道（`net_ui::NetUi` の `return_flow`）が、終わりのメニューの「リプレイを保存して終了」で試合の場面を出るのを見た tick:
+/// `save_quit_tick` と同じ判断で、この試合の自動保存が保存関数を呼んでいれば保存の画面を飛ばす印を立てる。ネットワークの経路と、片づけた後の
+/// メニューだけの経路の両方から呼ぶ。
+fn return_save_quit_tick(out: &UiOut) {
+    if out.save_quit {
+        save_skip_mark(save_skip::may_skip(
+            SkipSide::Player,
+            crate::replay_save_win::saved_this_seg(),
+        ));
+    }
+}
+
 /// 観戦者の経路の 1 tick（`watch_tick`）: 観戦者のゲームがホストの押下を辿って「リプレイを保存して終了」でマッチを出た tick なら、保存の画面を
 /// 飛ばす印を立てる。対戦者と違い、自動保存が呼んだかに依らない（`save_skip::may_skip`）。
 fn watch_save_quit_tick(wp: &mut WatchPlay) {
@@ -2772,6 +3201,8 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
         };
         crate::replay_save_win::on_tick(np, watching);
     }
+    // 素の花映塚でのリプレイの再生の見張り（再生の側でなければ場面の 2 語を読んで戻る。自動保存の設定に依らない）。
+    crate::replay_watch_win::on_tick();
     // ゲーム内のメニューが頼んだ「ネットワークを開く仕事」が終わっていれば、セッションを置く。**置いた tick もそのまま下のネットワークの経路へ流す**（置いた tick だけ
     // ゲーム自身の poll に任せると、決定キーを押したままのとき、画面 6・カーソル 4 の決定が内蔵ネット対戦へ漏れる）。置くのは `UI_ON` の実行の、
     // ネットワークがまだ無い間だけ。
@@ -2782,8 +3213,8 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
         // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` / `arm_watch` が置いたセッションが見える。以後はゲームのスレッドだけが触る。
         match unsafe { (*NET.0.get()).as_mut() } {
             Some(Slot::Play(slot)) => {
-                let (mut relink, mut spectate) = (false, false);
-                let r = net_tick(slot, engine, io, k, &mut relink, &mut spectate);
+                let (mut relink, mut spectate, mut lan) = (false, false, None);
+                let r = net_tick(slot, engine, io, k, &mut relink, &mut spectate, &mut lan);
                 if relink {
                     // つながりが終わってマッチの外へ戻った（ゲーム内のメニューの実行だけ）。この tick の戻り値はネットワークの経路の判断のまま、
                     // ネットワークのセッションを手放す（次の tick からメニューだけの経路）。
@@ -2793,6 +3224,11 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
                     // 待っているだけの対戦者のセッションの上から「ルームで観戦」が決まった: セッションを手放し、続けて観戦者のネットワークを開く。
                     request_spectate();
                 }
+                if let Some(ask) = lan {
+                    // 待っているだけの対戦者のセッションの上から LAN の項目が決まった: 運び手を起こす（セッションは手放す）。
+                    request_lan(ask);
+                }
+                lan_watch_poll();
                 return r;
             }
             Some(Slot::Watch(slot)) => {
@@ -2804,6 +3240,10 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
                 if follow.spectate {
                     request_spectate();
                 }
+                if let Some(ask) = follow.lan {
+                    request_lan(ask);
+                }
+                lan_watch_poll();
                 return r;
             }
             None => {}
@@ -2878,6 +3318,7 @@ fn net_tick(
     k: u32,
     relink: &mut bool,
     spectate: &mut bool,
+    lan: &mut Option<LanAsk>,
 ) -> u32 {
     // SAFETY: 引数の無い呼び出し。
     let tid = unsafe { GetCurrentThreadId() };
@@ -2890,7 +3331,9 @@ fn net_tick(
         let menu_run = ui.is_some();
         let now = if menu_run { net_udp::now_unix() } else { 0 };
         let (a, out) = net_ui::net_input(ui, &mut game, &mut slot.np, &mut slot.net, now);
+        return_save_quit_tick(&out);
         *spectate = spectate_asked(&out);
+        *lan = out.lan;
         if (out.action.is_some() || out.leave)
             && let Some(ui) = game_ui()
         {
@@ -2949,6 +3392,8 @@ struct WatchFollow {
     release: bool,
     /// 「ルームで観戦」が決まった（`UiOut::spectate_open`）。
     spectate: bool,
+    /// LAN の項目が決まった（`UiOut::lan`）。
+    lan: Option<LanAsk>,
 }
 
 /// 観戦者の経路の 1 tick（`net_tick` の観戦者バージョン）: 台本が終わってもネットワークは閉じない（観戦者の台本はタイトルから 7 の画面までを進め、以後は
@@ -2981,6 +3426,7 @@ fn watch_tick(
                     net_udp::now_unix(),
                 );
                 follow.spectate = spectate_asked(&out);
+                follow.lan = out.lan;
                 if out.action.is_some() {
                     publish_ui_stats(ui);
                 }
@@ -3083,8 +3529,7 @@ pub extern "C" fn match_start_on() {
         }
     }));
     if r.is_err() {
-        NET_ON.store(0, Ordering::SeqCst);
-        NET_PANICKED.store(1, Ordering::SeqCst);
+        net_panicked();
     }
 }
 
@@ -3273,6 +3718,15 @@ pub fn rb_scan_handler(this: u32) -> Option<i32> {
             .rollback_scan(&mut game, &mut slot.net, st, mem, &mut |rec, t| {
                 NET_FRAMES.push(rec, t);
             });
+        if matches!(r, netplay::RbScan::Ran { .. }) {
+            // このフレームは入力の地点が `dispatch` を通らないので、相手を待つ知らせと切断をここで進める。
+            slot.np.peer_wait_tick(&mut game, &mut slot.net);
+            // 同じく `NetUi::tick` も通らないので、観戦コードのコピー（Ctrl+C）の読みと知らせもここで進める。
+            if let Some(ui) = game_ui() {
+                let (conn, _) = slot.np.ui_conn(0);
+                ui.copy_tick(&mut game, conn, net_udp::now_unix());
+            }
+        }
         script_step = game.script_step;
         r
     });
@@ -3527,20 +3981,91 @@ impl RealScriptHost {
 
 /// 置き場の ini を読む。DLL のフォルダの ini が無ければ `Ok(None)`（ネットワークなしで走る）。ローダーが渡した ini が無いのは渡し方の誤りなので、
 /// 「無い ⇒ ネットワークなし」に丸めず、読めないとして返す。`fallback` は DLL のフォルダに ini が無いときに返す中身（配るバージョンで書き出せなかったとき）。
+#[cfg(test)]
 pub(crate) fn read_ini_at(
     loc: &crate::net_config::Located,
     fallback: Option<&str>,
 ) -> Result<Option<String>, String> {
+    Ok(read_ini_raw(loc, fallback)?.map(|(text, _)| text))
+}
+
+/// `read_ini_at` に、Shift_JIS として読み直したか（UTF-8 でなかったとき）を添える。
+fn read_ini_raw(
+    loc: &crate::net_config::Located,
+    fallback: Option<&str>,
+) -> Result<Option<(String, bool)>, String> {
     let path = &loc.path;
     match std::fs::read(path) {
-        Ok(b) => String::from_utf8(b)
+        Ok(b) => decode_ini(b)
             .map(Some)
-            .map_err(|_| format!("{} が UTF-8 でない", path.display())),
+            .map_err(|why| format!("{} {why}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && loc.from_env.is_none() => {
-            Ok(fallback.map(str::to_string))
+            Ok(fallback.map(|t| (t.to_string(), false)))
         }
         Err(e) => Err(format!("{} を読めない: {e}", path.display())),
     }
+}
+
+/// `read_ini_raw` に、誤りの行を空行にする前処理（`ini_lenient::clean`）を掛けた結果。Shift_JIS として読み直したときは
+/// 先頭にその注を足す。
+pub(crate) fn read_ini_cleaned(
+    loc: &crate::net_config::Located,
+    fallback: Option<&str>,
+) -> Result<Option<higanr_core::ini_lenient::Cleaned>, String> {
+    Ok(read_ini_raw(loc, fallback)?.map(|(text, sjis)| {
+        let mut c = higanr_core::ini_lenient::clean(&text);
+        if sjis {
+            c.notes
+                .insert(0, higanr_core::ini_lenient::IniNote::encoding());
+        }
+        c
+    }))
+}
+
+/// UTF-8 の ini はそのまま、そうでなければ Shift_JIS（CP932）として読む。どちらでもなければ断る。
+fn decode_ini(bytes: Vec<u8>) -> Result<(String, bool), String> {
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok((s, false)),
+        Err(e) => cp932_to_string(e.as_bytes())
+            .map(|s| (s, true))
+            .ok_or_else(|| "が UTF-8 でも Shift_JIS でもない".to_string()),
+    }
+}
+
+fn cp932_to_string(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MB_ERR_INVALID_CHARS, MultiByteToWideChar};
+    const CP932: u32 = 932;
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: `bytes` は `len` バイト読める。出力先は NULL・0（必要な長さだけを返す呼び方）。
+    let n = unsafe {
+        MultiByteToWideChar(
+            CP932,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; usize::try_from(n).ok()?];
+    // SAFETY: 入力は上と同じ。出力先は `n` 個の u16 を書ける。
+    let wrote = unsafe {
+        MultiByteToWideChar(
+            CP932,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            wide.as_mut_ptr(),
+            n,
+        )
+    };
+    if wrote != n {
+        return None;
+    }
+    String::from_utf16(&wide).ok()
 }
 
 fn wide(p: &Path) -> Vec<u16> {
@@ -3610,8 +4135,15 @@ impl ScriptHost for RealScriptHost {
     }
 
     fn read_net_ini(&mut self) -> Result<Option<String>, String> {
+        Ok(self.read_net_ini_noted()?.map(|(text, _)| text))
+    }
+
+    fn read_net_ini_noted(
+        &mut self,
+    ) -> Result<Option<(String, Vec<higanr_core::ini_lenient::IniNote>)>, String> {
         // 読むだけ（台本と違って移さない）。
-        read_ini_at(&self.ini_location()?, crate::ini_seed::fallback())
+        let loc = self.ini_location()?;
+        Ok(read_ini_cleaned(&loc, crate::ini_seed::fallback())?.map(|c| (c.text, c.notes)))
     }
 
     fn ini_origin(&self) -> String {
@@ -3659,15 +4191,20 @@ impl ScriptHost for RealScriptHost {
         open_net(s, set_state_fn, code_dir, spectate_dir)
     }
 
-    fn saved_name(&mut self, s: &NetSettings) -> Option<String> {
-        // ゲーム内のメニューの実行だけ（覚えるファイルの置き場は接続コードの置き場）。置き場がゲームのフォルダの中なら読まない
-        // （`arm_net` と同じガード）。
-        if s.code_side != Some(CodeSide::Game) {
-            return None;
+    fn migrate_legacy(&mut self) -> Vec<String> {
+        // 以前の版が接続コードの置き場に覚えていた名前とルーム名を ini へ移す。置き場がゲームのフォルダの中なら触らない（`arm_net` と同じガード）。
+        let Ok(loc) = self.ini_location() else {
+            return Vec::new();
+        };
+        let setting =
+            higanr_core::ini_store::get(&loc.path, crate::net_config::SECTION, "code_dir");
+        let Ok(dir) = net_code::code_dir(self.dll_dir.as_deref(), setting.as_deref()) else {
+            return Vec::new();
+        };
+        if self.guard(&dir).is_err() {
+            return Vec::new();
         }
-        let d = net_code::code_dir(self.dll_dir.as_deref(), s.code_dir.as_deref()).ok()?;
-        self.guard(&d).ok()?;
-        crate::player_name_file::read(&d)
+        crate::ini_save::migrate_legacy(&loc.path, &dir)
     }
 
     fn os_langid(&mut self) -> u16 {
@@ -3730,6 +4267,13 @@ impl ScriptHost for RealScriptHost {
     }
 
     fn arm_replay(&mut self, net: Option<&NetSettings>) -> Result<Option<String>, String> {
+        // 再生の見張りは自動保存の設定（`[replay]`）に依らず入れる。入れられない理由は本ログに残す（見張りが無いと比べる材料が無い）。
+        match crate::replay_watch_win::arm() {
+            Ok(()) => crate::main_log::push_detail(
+                "再生の見張り: 入れた（再生した試合の決着の値を1行ずつ書く）",
+            ),
+            Err(why) => crate::main_log::push(format!("再生の見張り: 入れられない（{why}）")),
+        }
         // `[replay]` はネットワークと同じ ini（DLL のフォルダ）にある。読むだけ。
         let text = self.read_net_ini()?;
         crate::replay_save_win::arm(
@@ -3971,6 +4515,79 @@ pub(crate) mod tests {
         stop();
     }
 
+    /// 入力の入口の戻り値（0 でなければツールが入力を握った）と台本の有無から、P・Home の押下を取るかが決まる（`shot_tick`）。
+    #[test]
+    fn shot_press_is_taken_only_on_ticks_the_tool_holds_and_never_in_a_scripted_run() {
+        use crate::pacing_win::PRESENT_ORIGINAL;
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let old = PRESENT_ORIGINAL.swap(1, Ordering::SeqCst);
+        let tick = |ret: u32, down: Option<bool>| {
+            crate::shot_key_win::test_set_down(down);
+            FORCE_RET.store(ret + 1, Ordering::SeqCst);
+            assert_eq!(script_on_tick(7), ret);
+        };
+        let press = |hold: u32| {
+            tick(hold, Some(false));
+            tick(hold, Some(true));
+            crate::shot_key_win::test_pending()
+        };
+
+        // 台本の無い実行（arm_io）。
+        prepare_entry(3);
+        arm_io(fake_addrs(), feed_fn_addr(), local_fn_addr()).unwrap();
+        SCRIPT_ON.store(1, Ordering::SeqCst);
+        crate::shot_key_win::test_enable(true);
+        assert!(!press(0), "ツールが握っていない tick（戻り値 0）で取った");
+        assert!(press(1), "feed した tick（戻り値 1）で取れない");
+        tick(0, Some(true));
+        assert!(
+            !crate::shot_key_win::test_pending(),
+            "握っていない tick の後に持ち越しが残った"
+        );
+        assert!(press(2), "描画だけの tick（戻り値 2）で取れない");
+        // 進め直しの回は読まない。
+        crate::shot_key_win::test_enable(true);
+        crate::rollback_play_win::RESIM_TICK.store(1, Ordering::SeqCst);
+        let in_resim = press(1);
+        crate::rollback_play_win::RESIM_TICK.store(0, Ordering::SeqCst);
+        assert!(!in_resim, "進め直しの回で読んだ");
+        // 差し替え口が置けなかった実行（PRESENT_ORIGINAL が 0）は読まない。
+        crate::shot_key_win::test_enable(true);
+        PRESENT_ORIGINAL.store(0, Ordering::SeqCst);
+        assert!(!press(1), "Present の差し替え口が無いのに読んだ");
+        PRESENT_ORIGINAL.store(1, Ordering::SeqCst);
+        // 読んではいけない間（前面が別のアプリなど）は取らない。
+        crate::shot_key_win::test_enable(true);
+        tick(1, Some(false));
+        tick(1, None);
+        tick(1, Some(true));
+        assert!(!crate::shot_key_win::test_pending());
+
+        // 台本の付いた実行（arm）は、本物のキーを読まない。
+        stop();
+        prepare_entry(3);
+        arm(
+            parse("scene=3 wait=100 p1=Z\n").unwrap(),
+            fake_addrs(),
+            feed_fn_addr(),
+            local_fn_addr(),
+        )
+        .unwrap();
+        start().unwrap();
+        crate::shot_key_win::test_enable(true);
+        assert!(!press(1), "台本の実行で押下を取った");
+        // 台本の入れ物を空にし直す（arm_io）と、また取る。
+        stop();
+        arm_io(fake_addrs(), feed_fn_addr(), local_fn_addr()).unwrap();
+        SCRIPT_ON.store(1, Ordering::SeqCst);
+        crate::shot_key_win::test_enable(true);
+        assert!(press(1), "arm_io の後に取れない（台本の旗が残った）");
+
+        crate::shot_key_win::test_enable(false);
+        PRESENT_ORIGINAL.store(old, Ordering::SeqCst);
+        stop();
+    }
+
     #[test]
     fn arm_net_refuses_bad_setups() {
         let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4200,6 +4817,48 @@ pub(crate) mod tests {
         assert_ne!(want0b, want0);
         assert_eq!(io.local_input(), POLL_VALUE & 0xFFFF);
         assert_eq!(dump(0), want0b, "2 回目に呼ぶ直前の中身へ戻さない");
+        // 1P の入力機器ごとの語。席 0 = 0x0011、席 1 = 0x0200（どの組でも混ざらない）、席 2 = 0x4400。
+        // パッド（0・1）は席 0 | 席 2 を席 0・席 2 の順に 2 回、キーボードの配置（2〜4）と読めないときは席 0 の 1 回だけ。
+        for (w, v) in POLL_WORDS.iter().zip([0xAB_0011u32, 0x0200, 0xCD_4400]) {
+            w.store(v, Ordering::SeqCst);
+        }
+        let im_before = |i: usize| -> Vec<u8> { (0..IM_BYTES).map(|j| init(i, j)).collect() };
+        for (i, im) in FAKE_IMS.iter().enumerate() {
+            for (j, a) in im.iter().enumerate() {
+                a.store(init(i, j), Ordering::SeqCst);
+            }
+        }
+        for (device, want, polls, last_seat) in [
+            (Some(0), 0x4411, 2, 2),
+            (Some(1), 0x4411, 2, 2),
+            (Some(2), 0x0011, 1, 0),
+            (Some(3), 0x0011, 1, 0),
+            (Some(4), 0x0011, 1, 0),
+            (None, 0x0011, 1, 0),
+            (Some(0xFFFF_FF02), 0x0011, 1, 0),
+            (Some(0x0000_0100), 0x4411, 2, 2),
+        ] {
+            fake_mem::set_input_device(device);
+            POLL_N.store(0, Ordering::SeqCst);
+            assert_eq!(io.local_input(), want, "入力機器 {device:x?}");
+            assert_eq!(POLL_N.load(Ordering::SeqCst), polls, "{device:x?}: 呼び数");
+            assert_eq!(
+                POLL_SEAT.load(Ordering::SeqCst),
+                last_seat,
+                "{device:x?}: 最後の席"
+            );
+            for i in 0..3 {
+                assert_eq!(
+                    dump(i),
+                    im_before(i),
+                    "{device:x?}: InputManager[{i}] が変わった"
+                );
+            }
+        }
+        fake_mem::set_input_device(None);
+        for w in POLL_WORDS.iter() {
+            w.store(POLL_VALUE, Ordering::SeqCst);
+        }
         arm_io(fake_addrs(), feed_fn_addr(), local_fn_addr()).expect("arm_io");
         assert!(real_io().unwrap().poll.is_none());
         arm_poll(0);
@@ -4758,8 +5417,10 @@ pub(crate) mod tests {
                 link: Arc::clone(&link),
                 clip: Box::new(crate::clipboard::fake::FakeClipboard::default()),
                 room: None,
-                room_last_dir: None,
+                ini_path: None,
                 spent: Vec::new(),
+                lan: None,
+                spectate_clip: None,
             },
         )
         .expect("ネットワークの組を開けない");
@@ -5625,6 +6286,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_panic_with_the_net_on_makes_the_receive_thread_send_a_bye() {
+        use higanr_core::auth::{AuthKey, Secret};
+        use higanr_core::candidate::Candidates;
+        use higanr_core::pong::PongResponder;
+        use higanr_core::seal::{DirKeys, Sender};
+        use higanr_core::wire::{self, ByeReason, Message};
+        use std::net::{SocketAddr, UdpSocket};
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        const SID: u32 = 0x0B7E_0001;
+        let dest = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        dest.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let path = dest.local_addr().unwrap();
+        let key = AuthKey::derive(&Secret([0x44; 16]), SID);
+        let dir = DirKeys::from_raw([0x45; 32], [0x46; 32]);
+        let (mut net, th) = net_udp::open_for_code(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let r = PongResponder::new(
+            SID,
+            key.clone(),
+            dir.opener(),
+            dir.sealer(Sender::Pong),
+            Candidates::from_addrs(&[path]).unwrap(),
+            path,
+        );
+        assert!(netplay::Net::pong_install(&mut net, &r));
+        let prev = RECV.lock().unwrap_or_else(|e| e.into_inner()).replace(th);
+        prepare_entry(3);
+        arm(
+            parse("scene=3 p1=Z\n").unwrap(),
+            fake_addrs(),
+            feed_fn_addr(),
+            local_fn_addr(),
+        )
+        .unwrap();
+        start().unwrap();
+        NET_ON.store(1, Ordering::SeqCst);
+        PANIC_NEXT.store(true, Ordering::SeqCst);
+        assert_eq!(script_on_tick(5), 0);
+        assert_eq!(NET_ON.load(Ordering::SeqCst), 0);
+        let panicked = NET_PANICKED.swap(0, Ordering::SeqCst);
+        let mut buf = [0u8; 2048];
+        let got = dest.recv_from(&mut buf).ok().and_then(|(n, _)| {
+            wire::decode(&key, Some(&dir.swapped().opener()), &buf[..n])
+                .ok()
+                .map(|p| p.msg)
+        });
+        let th = std::mem::replace(&mut *RECV.lock().unwrap_or_else(|e| e.into_inner()), prev);
+        drop(th);
+        drop(net);
+        assert_eq!(panicked, 1);
+        assert_eq!(got, Some(Message::Bye(ByeReason::Cancelled)));
+    }
+
+    #[test]
     fn held_box_without_order_returns_one_and_counts_stray() {
         let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         prepare_entry(3);
@@ -6026,6 +6741,76 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// 検査用: 文字列を Shift_JIS（CP932）のバイト列にする。表せない文字があれば None。
+    fn to_cp932(text: &str) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Globalization::{WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut out = vec![0u8; wide.len() * 2 + 4];
+        let mut used_default = 0i32;
+        // SAFETY: 入力は `wide.len()` 個の u16、出力先は `out.len()` バイト書ける。既定の文字は NULL（使われたかだけ `used_default` で見る）。
+        let n = unsafe {
+            WideCharToMultiByte(
+                932,
+                WC_NO_BEST_FIT_CHARS,
+                wide.as_ptr(),
+                wide.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                core::ptr::null(),
+                &mut used_default,
+            )
+        };
+        if n <= 0 || used_default != 0 {
+            return None;
+        }
+        out.truncate(n as usize);
+        Some(out)
+    }
+
+    #[test]
+    fn a_shift_jis_ini_is_read_again_as_shift_jis_and_noted_once() {
+        use crate::net_config::Located;
+        use higanr_core::ini_lenient::NoteKind;
+        let d = temp_dir("sjis");
+        let at = |name: &str| Located {
+            path: d.join(name),
+            from_env: None,
+        };
+        // 配る ini の「〜」（U+301C）は Shift_JIS に無い（全角チルダ U+FF5E が同じ区点）ので、検査用に直してから符号化する。
+        let dist = include_str!("../../../scripts/dist/HiganRTool.ini")
+            .replace("\r\n", "\n")
+            .replace('\u{301C}', "\u{FF5E}")
+            .replace(
+                "name = HiganRTool",
+                "name = 日本語のなまえ ; 名前のコメント",
+            );
+        let bytes = to_cp932(&dist).expect("Shift_JIS にできる文字だけ");
+        assert!(String::from_utf8(bytes.clone()).is_err(), "UTF-8 ではない");
+        std::fs::write(d.join("sjis.ini"), &bytes).unwrap();
+        let c = read_ini_cleaned(&at("sjis.ini"), None).unwrap().unwrap();
+        assert_eq!(c.text, dist, "日本語のコメントと値が読み戻せる");
+        assert_eq!(
+            c.notes.iter().map(|n| n.kind).collect::<Vec<_>>(),
+            vec![NoteKind::Encoding]
+        );
+        let s = crate::net_config::from_text(&c.text).unwrap().unwrap();
+        assert_eq!(
+            s.name,
+            crate::net_config::DEFAULT_NAME,
+            "日本語の名前は使えない文字なので既定"
+        );
+        assert_eq!(s.ini_notes, vec![], "ネットワークの設定側の注は無い");
+        // UTF-8 の同じ内容は読み直さず、注も無い。
+        std::fs::write(d.join("utf8.ini"), dist.as_bytes()).unwrap();
+        let c = read_ini_cleaned(&at("utf8.ini"), None).unwrap().unwrap();
+        assert_eq!((c.text.as_str(), c.notes.len()), (dist.as_str(), 0));
+        // どちらの文字コードでもないバイト列は断る。
+        std::fs::write(d.join("bad.ini"), [0x80u8, 0x80, 0xFF]).unwrap();
+        let e = read_ini_cleaned(&at("bad.ini"), None).unwrap_err();
+        assert!(e.contains("bad.ini") && e.contains("Shift_JIS"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn script_file_is_read_and_moved_without_replacing() {
         let d = temp_dir("move");
@@ -6063,7 +6848,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_decided_name_is_used_by_the_next_net_and_the_latest_one_is_remembered() {
+    fn a_decided_name_is_used_by_the_next_net() {
         let d = temp_dir("namenext");
         let link = Arc::new(UiLink::new());
         let s = crate::net_config::from_text(
@@ -6090,75 +6875,48 @@ pub(crate) mod tests {
             "起動のときの設定を書き換えた"
         );
         link.send(higanr_core::net_menu::Cmd::Name(name("second")));
-        write_player_name(&d, &link, name("first-one")).unwrap();
-        assert_eq!(
-            crate::player_name_file::read(&d).as_deref(),
-            Some("second"),
-            "古い名前が残った"
-        );
         assert_eq!(lazy.settings_now().name, "second");
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn a_room_name_decided_in_settings_is_remembered_and_a_stale_write_is_dropped() {
-        let d = temp_dir("roomset");
-        let name = |t: &str| RoomBuf::from_name(t).unwrap();
-        assert_eq!(crate::room_last::read(&d), None);
-        ROOM_SAVE_SEQ.store(7, Ordering::SeqCst);
-        write_room_name(&d, 7, &name("decided-1")).unwrap();
-        assert_eq!(crate::room_last::read(&d), Some(name("decided-1")));
-        ROOM_SAVE_SEQ.store(8, Ordering::SeqCst);
-        write_room_name(&d, 7, &name("stale")).unwrap();
-        assert_eq!(
-            crate::room_last::read(&d),
-            Some(name("decided-1")),
-            "古い回が新しい名を上書きした"
-        );
-        write_room_name(&d, 8, &name("latest")).unwrap();
-        assert_eq!(crate::room_last::read(&d), Some(name("latest")));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn the_remembered_name_is_read_only_for_the_in_game_menu_and_outside_the_game_folder() {
-        let d = temp_dir("savedname");
+    fn legacy_files_move_into_the_ini_from_the_code_dir_unless_it_is_in_the_game_folder() {
+        let d = temp_dir("legacy_host");
+        let ini = d.join("HiganRTool.ini");
+        std::fs::write(&ini, "[netplay]\nenable = 1\n").unwrap();
         let code = d.join("code");
         std::fs::create_dir_all(&code).unwrap();
-        let mut h = RealScriptHost {
+        std::fs::write(code.join("player_name.txt"), "saved-synth\n").unwrap();
+        let host = |exe_dir: PathBuf| RealScriptHost {
             dll_dir: Some(d.clone()),
             run_path: Some(d.join("logs").join("dll_x.log")),
-            exe_dir: Some(d.join("game")),
+            exe_dir: Some(exe_dir),
         };
-        let game = |extra: &str| {
-            crate::net_config::from_text(&format!(
-                "[netplay]\nenable = 1\nbind = 127.0.0.1:0\n{extra}"
-            ))
-            .unwrap()
-            .unwrap()
-        };
-        let menu = game("code_side = game\nclipboard = file\n");
-        assert_eq!(h.saved_name(&menu), None);
-        std::fs::write(code.join("player_name.txt"), "saved-synth\n").unwrap();
-        assert_eq!(h.saved_name(&menu).as_deref(), Some("saved-synth"));
-        std::fs::write(code.join("player_name.txt"), "\n").unwrap();
-        assert_eq!(h.saved_name(&menu), None);
-        std::fs::write(code.join("player_name.txt"), "saved-synth\n").unwrap();
-        let offer = game("code_side = offer\n");
-        assert_eq!(h.saved_name(&offer), None);
-        let peer = game("peer = 127.0.0.1:7002\nsession = 0x1\n");
-        assert_eq!(h.saved_name(&peer), None);
-        let other = game("code_side = game\nclipboard = file\ncode_dir = other\n");
-        assert_eq!(h.saved_name(&other), None);
+        // ゲームのフォルダの中の置き場には触らない。
+        assert!(host(d.clone()).migrate_legacy().is_empty());
+        assert!(code.join("player_name.txt").exists());
+        assert!(
+            !std::fs::read_to_string(&ini)
+                .unwrap()
+                .contains("saved-synth")
+        );
+        assert_eq!(host(d.join("game")).migrate_legacy().len(), 1);
+        assert!(!code.join("player_name.txt").exists());
+        assert!(
+            std::fs::read_to_string(&ini)
+                .unwrap()
+                .contains("name = saved-synth")
+        );
+        // ini の code_dir の置き場も見る。
+        std::fs::write(&ini, "[netplay]\nenable = 1\ncode_dir = other\n").unwrap();
         std::fs::create_dir_all(d.join("other")).unwrap();
         std::fs::write(d.join("other").join("player_name.txt"), "other-synth\n").unwrap();
-        assert_eq!(h.saved_name(&other).as_deref(), Some("other-synth"));
-        let mut inside = RealScriptHost {
-            dll_dir: Some(d.clone()),
-            run_path: None,
-            exe_dir: Some(d.clone()),
-        };
-        assert_eq!(inside.saved_name(&menu), None);
+        assert_eq!(host(d.join("game")).migrate_legacy().len(), 1);
+        assert!(
+            std::fs::read_to_string(&ini)
+                .unwrap()
+                .contains("name = other-synth")
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -6642,6 +7400,183 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_return_flows_save_quit_marks_only_when_the_autosave_ran() {
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let addrs_before = ADDRS[3].load(Ordering::SeqCst);
+        ADDRS[3].store(FAKE_STATE, Ordering::SeqCst);
+        fake_mem::enable();
+        skip_reset();
+        SKIP_SITE_AT.store(
+            SAVE_SKIP_SITE.expected.as_ptr() as usize as u32,
+            Ordering::SeqCst,
+        );
+        let word = || fake_mem::get(FAKE_STATE).unwrap();
+        fake_mem::set(FAKE_STATE, 0x0001_0004);
+        let asked = UiOut {
+            save_quit: true,
+            ..UiOut::default()
+        };
+        crate::replay_save_win::set_seg_saved_for_test(true, true);
+        return_save_quit_tick(&UiOut::default());
+        assert_eq!(word(), 0x0001_0004, "戻り道が見ていないのに立てた");
+        crate::replay_save_win::set_seg_saved_for_test(true, false);
+        return_save_quit_tick(&asked);
+        assert_eq!(word(), 0x0001_0004, "自動保存が呼んでいない試合で立てた");
+        crate::replay_save_win::set_seg_saved_for_test(true, true);
+        return_save_quit_tick(&asked);
+        assert_eq!(word(), 0x0001_0004 | CONTINUED_BIT);
+        assert_eq!(watch_of(SKIP_WATCH.load(Ordering::SeqCst)), Watch::Leaving);
+
+        crate::replay_save_win::set_seg_saved_for_test(false, false);
+        skip_reset();
+        fake_mem::clear();
+        ADDRS[3].store(addrs_before, Ordering::SeqCst);
+    }
+
+    /// 組み上がり: ネットワークを片づけた後のメニューだけの経路（入口 → `ui_only_tick`）で、戻り道が試合の場面を止め、
+    /// 「保存して終了」の切替を見た tick に保存の画面を飛ばす印を立てる。
+    #[test]
+    fn the_menu_only_path_freezes_the_match_and_marks_the_save_skip_for_the_return_flow() {
+        use crate::th09_addr::{
+            LOADING, MATCH_END_MENU, PAUSE, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
+        };
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        prepare_entry(3);
+        fake_match_screen(0);
+        arm_menu_run([0, 0, 0]);
+        let board: &'static crate::net_ui::Board = Box::leak(Box::new(crate::net_ui::Board::new()));
+        let ini = Shape {
+            mode: higanr_core::wire::Mode::Rollback,
+            delay: 1,
+        };
+        // SAFETY: 検査は `REAL_HOOK_TESTS` の下で 1 本ずつ。ゲームのスレッドの入口はこの後の `hook_tick` からしか来ない。
+        unsafe {
+            *UI.0.get() =
+                Some(NetUi::new(ini, Arc::new(UiLink::new()), board).with_return_flow(None))
+        };
+        game_ui()
+            .expect("メニュー")
+            .on_lost(higanr_core::return_flow::Why::PeerLeft);
+        for (a, v) in [
+            (SUPERVISOR + SUP_SCENE_CUR, 2),
+            (SUPERVISOR + SUP_SCENE_REQ, 2),
+            (LOADING, 0),
+            (PAUSE, 0),
+            (MATCH_END_MENU, 0),
+        ] {
+            fake_mem::set(a, v);
+        }
+        for t in 0..higanr_core::return_flow::HOLD_TICKS {
+            let (feeds, hits) = hook_tick();
+            assert!(
+                feeds.is_empty() && hits == 0,
+                "tick {t}: 入力止めの間に feed した・poll へ任せた"
+            );
+            // 出口（描画だけのフレーム）を通ると eax は 3（`fake_exit`）。
+            assert_eq!(
+                load(&AFTER)[0],
+                3,
+                "tick {t}: 試合を描画だけのフレームで止めていない"
+            );
+        }
+        // 印を頼んだかは、自動保存が呼んでいない試合の断り（メモリに触る前に断る）の数で見る。立てる・照合する判断は
+        // `the_return_flows_save_quit_marks_only_when_the_autosave_ran`。
+        skip_reset();
+        crate::replay_save_win::set_seg_saved_for_test(false, false);
+        let not_saved = SkipRefuse::ALL
+            .iter()
+            .position(|&r| r == SkipRefuse::NotSaved)
+            .unwrap();
+        hook_tick();
+        assert_eq!(
+            SKIP_REFUSED[not_saved].load(Ordering::SeqCst),
+            0,
+            "切替の前に頼んだ"
+        );
+        fake_mem::set(SUPERVISOR + SUP_SCENE_REQ, netplay::REQ_SAVE_AND_QUIT);
+        hook_tick();
+        assert_eq!(
+            SKIP_REFUSED[not_saved].load(Ordering::SeqCst),
+            1,
+            "戻り道の「保存して終了」で保存の画面を飛ばす印を頼んでいない"
+        );
+
+        skip_reset();
+        disarm_menu_run();
+    }
+
+    /// 同じことを、終わったネットワークのセッションが残っている経路（入口 → `net_tick` → `net_input`）で。
+    #[test]
+    fn the_net_path_also_marks_the_save_skip_for_the_return_flow() {
+        use crate::th09_addr::{
+            LOADING, MATCH_END_MENU, PAUSE, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
+        };
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        prepare_entry(3);
+        fake_match_screen(0);
+        arm_menu_run([0, 0, 0]);
+        let board: &'static crate::net_ui::Board = Box::leak(Box::new(crate::net_ui::Board::new()));
+        let ini = Shape {
+            mode: higanr_core::wire::Mode::Rollback,
+            delay: 1,
+        };
+        // SAFETY: 検査は `REAL_HOOK_TESTS` の下で 1 本ずつ。ゲームのスレッドの入口はこの後の `hook_tick` からしか来ない。
+        unsafe {
+            *UI.0.get() =
+                Some(NetUi::new(ini, Arc::new(UiLink::new()), board).with_return_flow(None))
+        };
+        OPEN_STATE.store(OPEN_BUSY, Ordering::SeqCst);
+        *PENDING.lock().unwrap() = Some(Ok(pending_box()));
+        hook_tick();
+        assert_eq!(
+            NET_ON.load(Ordering::SeqCst),
+            1,
+            "検査の前提: セッションを置いた"
+        );
+        // SAFETY: 同上（入口の外。セッションに触るのはこの検査だけ）。
+        match unsafe { (*NET.0.get()).as_mut() } {
+            Some(Slot::Play(s)) => s.np.close(higanr_core::wire::ByeReason::Disconnected),
+            _ => panic!("対戦者のセッションが無い"),
+        }
+        game_ui()
+            .expect("メニュー")
+            .on_lost(higanr_core::return_flow::Why::Lost);
+        for (a, v) in [
+            (SUPERVISOR + SUP_SCENE_CUR, 2),
+            (SUPERVISOR + SUP_SCENE_REQ, 2),
+            (LOADING, 0),
+            (PAUSE, 0),
+            (MATCH_END_MENU, 0),
+        ] {
+            fake_mem::set(a, v);
+        }
+        for _ in 0..higanr_core::return_flow::HOLD_TICKS {
+            hook_tick();
+        }
+        skip_reset();
+        crate::replay_save_win::set_seg_saved_for_test(false, false);
+        let not_saved = SkipRefuse::ALL
+            .iter()
+            .position(|&r| r == SkipRefuse::NotSaved)
+            .unwrap();
+        fake_mem::set(SUPERVISOR + SUP_SCENE_REQ, netplay::REQ_SAVE_AND_QUIT);
+        hook_tick();
+        assert_eq!(
+            NET_ON.load(Ordering::SeqCst),
+            1,
+            "検査の前提: ネットワークの経路のまま"
+        );
+        assert_eq!(
+            SKIP_REFUSED[not_saved].load(Ordering::SeqCst),
+            1,
+            "ネットワークの経路で戻り道の「保存して終了」の印を頼んでいない"
+        );
+
+        skip_reset();
+        disarm_menu_run();
+    }
+
+    #[test]
     fn save_skip_is_watched_at_the_entry_and_dropped_on_panic() {
         let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         prepare_entry(2);
@@ -6689,7 +7624,7 @@ pub(crate) mod tests {
         let link = UiLink::new();
         assert!(watch_target(&link).is_err(), "何も置いていない");
         // 打ったルーム名: その名から観戦用のルームを導く。
-        let typed = RoomBuf::from_name("Typed-Room").unwrap();
+        let typed = higanr_core::room_input::RoomBuf::from_name("Typed-Room").unwrap();
         link.send(Cmd::Spectate(typed));
         let (room, shown) = watch_target(&link).unwrap();
         assert_eq!(room, typed.parse().unwrap().spectate_of());

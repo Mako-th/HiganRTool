@@ -1,16 +1,24 @@
 //! 繋がった後の生存（PING / PONG と、沈黙による切断）と、終わりの BYE。
 //!
-//! PING / PONG を 1 秒に 1 回送り合い、同じ session_id のものが 10 秒何も届かなければ切れたとして BYE(切断) を出す。
+//! PING / PONG を 1 秒に 1 回送り合い、同じ session_id のものが 60 秒何も届かなければ切れたとして BYE(切断) を出す。
 //! ソケットも時計も持たない。dll と peer_sim は、繋がったときに `Liveness::new(session_id, いまの ms)` を作り、
 //! 以後に受けた全部のパケットを `on_packet` へ渡し、1〜4 ms ごとに `poll_send` を呼ぶ。
 //!
 //! ## 終わりの BYE
 //!
-//! BYE は送り直しの決まりが無く、落ちると相手は 10 秒の沈黙を待つ。そこで自分から終える（`close`）ときは:
+//! BYE は送り直しの決まりが無く、落ちると相手は 60 秒の沈黙を待つ。そこで自分から終える（`close`）ときは:
 //!
 //! - 直後の `poll_send` で BYE を 1 通出す。
 //! - その後も PING は 1 秒に 1 回続け、相手の PING には PONG の代わりに BYE を返す（最初の BYE が落ちても次で届く）。
 //! - 受けた BYE には返さない（両者が閉じているとき、返しの返しが往復し続けるため）。
+//!
+//! ## 相手のゲームスレッドが止まったとき
+//!
+//! PONG は受信スレッドがその場で返すので、相手のゲームスレッドが止まっても PONG だけは届き続けうる。そこで:
+//!
+//! - 受信スレッドは、自分のゲームスレッドの心拍が `HEARTBEAT_LIMIT_MS` より古ければ PONG を返さない（`heartbeat_fresh`）。
+//!   相手には PONG も届かなくなるので、上の 60 秒の沈黙で切れる。
+//! - PONG 以外の便はゲームスレッドしか送らないので、それが途絶えた長さ（`quiet_ms`）を「相手のゲームスレッドが黙った長さ」として読める。
 //!
 //! 受信スレッドかゲームスレッドから呼ばれうるので、ヒープを使わず、パニックしうる添字と unwrap を置かない。
 //! 時刻は u32 の ms で、差は `wrapping_sub` で取る（49 日で折り返しても差は正しい）。
@@ -19,15 +27,33 @@ use crate::wire::{ByeReason, Message, Packet};
 
 pub const PING_INTERVAL_MS: u32 = 1_000;
 
-/// 相手から何も届かなければ切れたと見るまでの時間（ms）。ちょうど 10000 ms で切れたとする。
-pub const SILENCE_LIMIT_MS: u32 = 10_000;
+/// 相手から何も届かなければ切れたと見るまでの時間（ms）。ちょうど 60000 ms で切れたとする。全画面のゲームは最小化して接続コードを
+/// 渡すので、通信が途切れても長めに待つ。繋がる前の時間切れは `handshake::TIMEOUT_MS` で、これとは別。
+pub const SILENCE_LIMIT_MS: u32 = 60_000;
+
+/// ゲームスレッドの心拍がこれより古ければ、受信スレッドは PONG を返さない（ms）。ウィンドウのドラッグ・最小化・デバイスの喪失で
+/// ゲームスレッドが止まるのは正常なので、これより短くしない。自分のゲームスレッドが同じ長さ止まると、戻ったときに自分の側でも
+/// 切れる（`check_silence`）ので、同じ長さにそろえた。
+pub const HEARTBEAT_LIMIT_MS: u32 = SILENCE_LIMIT_MS;
+const _: () = assert!(
+    HEARTBEAT_LIMIT_MS >= 60_000,
+    "最小化してコードを渡す間より短い"
+);
+
+/// 心拍がまだ新しいか。`beat` はゲームスレッドが最後に書いた時刻（0 はまだ書いていない）、`now` は受信スレッドが `beat` を読んだ後に
+/// 同じ時計で取った時刻。`beat` が `now` より少し先なのは読みの順の差なので新しいとみなす。
+pub fn heartbeat_fresh(beat: u32, now: u32) -> bool {
+    beat != 0
+        && (now.wrapping_sub(beat) < HEARTBEAT_LIMIT_MS
+            || beat.wrapping_sub(now) < HEARTBEAT_LIMIT_MS)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Alive,
     /// 自分から終えた（`close`）。相手の PING に BYE を返す。
     Closing(ByeReason),
-    /// 相手から 10 秒何も届かなかった。以後は何も送らない。
+    /// 相手から 60 秒何も届かなかった。以後は何も送らない。
     Dead,
 }
 
@@ -70,12 +96,23 @@ pub fn median_ms(samples: &[u32]) -> Option<u32> {
     Some(((u64::from(lo) + u64::from(hi)) / 2) as u32)
 }
 
+/// 往復（ms）の最大。`RTT_MEDIAN_MIN` 個に満たなければ None（1〜2 個の「最大」は偶然の 1 回で、良い回線の印にならない）。
+pub fn max_ms(samples: &[u32]) -> Option<u32> {
+    if samples.len() < RTT_MEDIAN_MIN {
+        return None;
+    }
+    let n = samples.len().min(RTT_WINDOW);
+    samples.get(samples.len() - n..)?.iter().copied().max()
+}
+
 #[derive(Debug, Clone)]
 pub struct Liveness {
     session_id: u32,
     state: State,
     /// 同じ session_id のものが最後に届いた時刻。
     last_heard: u32,
+    /// 同じ session_id の PONG 以外のものが最後に届いた時刻（相手のゲームスレッドが最後に動いていた印）。
+    last_active: u32,
     ping_sent: Option<u32>,
     /// 最初に PING を送った時刻（PONG の send_time がこれより前なら、送った覚えが無い）。
     first_ping: Option<u32>,
@@ -102,6 +139,7 @@ impl Liveness {
             session_id,
             state: State::Alive,
             last_heard: now,
+            last_active: now,
             ping_sent: None,
             first_ping: None,
             bye_due: None,
@@ -129,6 +167,12 @@ impl Liveness {
         median_ms(hist).map(|ms| ms.saturating_mul(1_000))
     }
 
+    /// 直近の PONG の往復の最大（ms）。推奨値が 0 を選ぶ条件（回線が安定しているか）を見るのに使う。
+    pub fn rtt_max_ms(&self) -> Option<u32> {
+        let n = (self.rtt_n as usize).min(RTT_WINDOW);
+        max_ms(self.rtt_hist.get(..n)?)
+    }
+
     pub fn peer_bye(&self) -> Option<ByeReason> {
         self.peer_bye
     }
@@ -141,7 +185,12 @@ impl Liveness {
         now.wrapping_sub(self.last_heard)
     }
 
-    /// 10 秒（ちょうどを含む）何も届かなければ切れたとする。`on_packet` と `poll_send` の両方の入口で見る。
+    /// PONG 以外が届いていない長さ（ms）。相手の受信スレッドが PONG を返し続けていても、相手のゲームスレッドが止まれば伸びる。
+    pub fn quiet_ms(&self, now: u32) -> u32 {
+        now.wrapping_sub(self.last_active)
+    }
+
+    /// 60 秒（ちょうどを含む）何も届かなければ切れたとする。`on_packet` と `poll_send` の両方の入口で見る。
     /// 生きていたときだけ BYE(切断) を出す。
     fn check_silence(&mut self, now: u32) {
         if self.state == State::Dead || self.silence_ms(now) < SILENCE_LIMIT_MS {
@@ -172,6 +221,9 @@ impl Liveness {
             return None;
         }
         self.last_heard = now;
+        if !matches!(pkt.msg, Message::Pong { .. }) {
+            self.last_active = now;
+        }
         match pkt.msg {
             Message::Bye(r) => {
                 // 受けた BYE には返さない（返しの返しが往復し続けるため）。
@@ -329,6 +381,32 @@ mod tests {
     }
 
     #[test]
+    fn rtt_max_needs_three_pongs_and_forgets_the_oldest_after_eight() {
+        assert_eq!(max_ms(&[]), None);
+        assert_eq!(max_ms(&[300, 20]), None, "2 個では出さない");
+        assert_eq!(max_ms(&[5, 300, 20]), Some(300));
+        let mut l = Liveness::new(SID, 1_000);
+        let mut t = 1_000;
+        let mut pong = |l: &mut Liveness, rtt: u32| {
+            assert!(l.poll_send(t).ping.is_some());
+            l.on_packet(&pkt(SID, Message::Pong { send_time: t }), t + rtt);
+            t += 1_000;
+        };
+        pong(&mut l, 300);
+        pong(&mut l, 4);
+        assert_eq!(l.rtt_max_ms(), None, "2 個では出さない");
+        pong(&mut l, 5);
+        assert_eq!(l.rtt_max_ms(), Some(300));
+        assert_eq!(l.rtt_median_us(), Some(5_000), "中央値は外れ値で動かない");
+        for _ in 0..5 {
+            pong(&mut l, 6);
+        }
+        assert_eq!(l.rtt_max_ms(), Some(300), "8 個目までは窓に残る");
+        pong(&mut l, 6);
+        assert_eq!(l.rtt_max_ms(), Some(6), "窓から外れた 300 は数えない");
+    }
+
+    #[test]
     fn pong_with_unknown_time_is_not_rtt() {
         let mut l = Liveness::new(SID, 1_000);
         l.on_packet(&pkt(SID, Message::Pong { send_time: 1_000 }), 1_000);
@@ -355,10 +433,10 @@ mod tests {
             l.on_packet_at(&pkt(SID, Message::Pong { send_time: 2_000 }), now, rx);
             assert_eq!(l.rtt_ms(), Some(3), "渡した時刻 {now}");
         }
-        // 沈黙は渡した時刻から数える: 最後に渡したのが 2050（受けたのは 2003）なので、12049 ではまだ生きていて、12050 で切れる。
-        l.poll_send(12_049);
+        // 沈黙は渡した時刻から数える: 最後に渡したのが 2050（受けたのは 2003）なので、61999 ではまだ生きていて、62050 で切れる。
+        l.poll_send(61_999);
         assert_eq!(l.state(), State::Alive);
-        l.poll_send(12_050);
+        l.poll_send(62_050);
         assert_eq!(l.state(), State::Dead);
         // 送った覚えの無い PONG（受けた時刻より後に送ったことになる）は、渡した時刻が後でも RTT に使わない。
         let mut l = Liveness::new(SID, 1_000);
@@ -368,18 +446,20 @@ mod tests {
     }
 
     #[test]
-    fn silence_of_exactly_ten_seconds_is_a_disconnect() {
+    fn silence_of_exactly_sixty_seconds_is_a_disconnect() {
+        assert_eq!(SILENCE_LIMIT_MS, 60_000);
         let mut l = Liveness::new(SID, 0);
         l.poll_send(0);
         l.on_packet(&ping(0), 500);
-        let o = l.poll_send(10_499);
-        assert_eq!(o.bye, None);
+        // 10 秒では切れない（最小化してコードを渡す間）。
+        assert_eq!(l.poll_send(10_500).bye, None);
+        assert_eq!(l.poll_send(60_499).bye, None, "59 秒 999 では切れない");
         assert_eq!(l.state(), State::Alive);
-        let o = l.poll_send(10_500);
+        let o = l.poll_send(60_500);
         assert_eq!(o.bye, Some(Message::Bye(ByeReason::Disconnected)));
         assert_eq!(o.ping, None, "切れた後は PING も出さない");
         assert_eq!(l.state(), State::Dead);
-        for t in [10_501, 11_500, 30_000] {
+        for t in [60_501, 61_500, 90_000] {
             assert_eq!(l.poll_send(t), Outbox::default());
         }
     }
@@ -398,22 +478,22 @@ mod tests {
             ),
             9_000,
         );
-        assert_eq!(l.poll_send(18_999).bye, None);
+        assert_eq!(l.poll_send(68_999).bye, None);
         assert_eq!(
-            l.poll_send(19_000).bye,
+            l.poll_send(69_000).bye,
             Some(Message::Bye(ByeReason::Disconnected))
         );
     }
 
     #[test]
     fn packet_at_the_boundary_does_not_revive() {
-        // 10000 ms ちょうどに届いたものは、先に切れたと見る（handshake の時間切れと同じ順）。
+        // 60000 ms ちょうどに届いたものは、先に切れたと見る（handshake の時間切れと同じ順）。
         let mut l = Liveness::new(SID, 0);
-        assert_eq!(l.on_packet(&ping(1), 10_000), None);
+        assert_eq!(l.on_packet(&ping(1), 60_000), None);
         assert_eq!(l.state(), State::Dead);
         assert_eq!(l.counters().after_dead, 1);
         assert_eq!(
-            l.poll_send(10_000).bye,
+            l.poll_send(60_000).bye,
             Some(Message::Bye(ByeReason::Disconnected))
         );
     }
@@ -421,23 +501,23 @@ mod tests {
     #[test]
     fn wrong_session_is_not_heard() {
         let mut l = Liveness::new(SID, 0);
-        for t in (1_000..10_000).step_by(1_000) {
+        for t in (1_000..SILENCE_LIMIT_MS).step_by(1_000) {
             assert_eq!(
                 l.on_packet(&pkt(SID ^ 1, Message::Ping { send_time: t }), t),
                 None
             );
         }
-        assert_eq!(l.counters().wrong_session, 9);
-        assert_eq!(l.poll_send(9_999).bye, None);
+        assert_eq!(l.counters().wrong_session, 59);
+        assert_eq!(l.poll_send(59_999).bye, None);
         assert_eq!(
-            l.poll_send(10_000).bye,
+            l.poll_send(60_000).bye,
             Some(Message::Bye(ByeReason::Disconnected))
         );
         let mut m = Liveness::new(SID, 0);
-        for t in (1_000..10_000).step_by(1_000) {
+        for t in (1_000..SILENCE_LIMIT_MS).step_by(1_000) {
             m.on_packet(&ping(t), t);
         }
-        assert_eq!(m.poll_send(10_000).bye, None);
+        assert_eq!(m.poll_send(60_000).bye, None);
         assert_eq!(m.state(), State::Alive);
     }
 
@@ -470,10 +550,10 @@ mod tests {
         let mut l = Liveness::new(SID, 0);
         l.close(ByeReason::Finished);
         assert_eq!(l.poll_send(0).bye, Some(Message::Bye(ByeReason::Finished)));
-        assert_eq!(l.poll_send(10_000).bye, None);
+        assert_eq!(l.poll_send(60_000).bye, None);
         assert_eq!(l.state(), State::Dead);
         l.close(ByeReason::Cancelled);
-        assert_eq!(l.poll_send(10_001), Outbox::default());
+        assert_eq!(l.poll_send(60_001), Outbox::default());
     }
 
     #[test]
@@ -490,14 +570,72 @@ mod tests {
     }
 
     #[test]
+    fn when_pongs_stop_the_side_that_only_pings_dies_sixty_seconds_after_the_last_pong() {
+        // 相手はこちらの PING に PONG を返すだけ（相手のゲームスレッドは止まっていて PING も INPUT も来ない）。
+        let mut l = Liveness::new(SID, 0);
+        let mut last_pong = 0;
+        for t in (0..=6_000).step_by(1_000) {
+            assert!(l.poll_send(t).ping.is_some(), "{t}");
+            l.on_packet(&pkt(SID, Message::Pong { send_time: t }), t + 20);
+            last_pong = t + 20;
+        }
+        // 相手の受信スレッドが心拍の古さで PONG をやめた後も、こちらは PING を送り続ける。
+        for t in (7_000..last_pong + SILENCE_LIMIT_MS).step_by(1_000) {
+            assert!(l.poll_send(t).ping.is_some(), "{t}");
+        }
+        assert_eq!(l.poll_send(last_pong + SILENCE_LIMIT_MS - 1).bye, None);
+        assert_eq!(l.state(), State::Alive);
+        assert_eq!(
+            l.poll_send(last_pong + SILENCE_LIMIT_MS).bye,
+            Some(Message::Bye(ByeReason::Disconnected))
+        );
+        assert_eq!(l.state(), State::Dead);
+    }
+
+    #[test]
+    fn pongs_alone_keep_the_link_alive_but_not_the_quiet_time() {
+        let mut l = Liveness::new(SID, 0);
+        l.on_packet(&ping(1), 500);
+        assert_eq!(l.quiet_ms(500), 0);
+        for t in (1_000..=30_000).step_by(1_000) {
+            assert!(l.poll_send(t).ping.is_some());
+            l.on_packet(&pkt(SID, Message::Pong { send_time: t }), t + 10);
+        }
+        assert_eq!(l.state(), State::Alive, "PONG が届く間は切れない");
+        assert_eq!(l.quiet_ms(30_010), 29_510, "PONG で静かな時間が戻った");
+        assert_eq!(l.silence_ms(30_010), 0);
+        // PONG 以外は 1 通で戻る。別の session のものは数えない。
+        l.on_packet(&pkt(SID ^ 1, Message::Ping { send_time: 2 }), 30_100);
+        assert_eq!(l.quiet_ms(30_100), 29_600);
+        l.on_packet(&pkt(SID, Message::Bye(ByeReason::Finished)), 30_200);
+        assert_eq!(l.quiet_ms(30_300), 100);
+    }
+
+    #[test]
+    fn the_heartbeat_is_fresh_only_within_the_limit_and_never_before_the_first_beat() {
+        assert!(!heartbeat_fresh(0, 0), "まだ書いていない");
+        assert!(!heartbeat_fresh(0, 5), "まだ書いていない");
+        assert!(heartbeat_fresh(1_000, 1_000));
+        assert!(heartbeat_fresh(1_000, 1_000 + HEARTBEAT_LIMIT_MS - 1));
+        assert!(!heartbeat_fresh(1_000, 1_000 + HEARTBEAT_LIMIT_MS));
+        assert!(!heartbeat_fresh(1_000, 1_000 + 3_600_000));
+        // 書き手が読みより少し先（読みの順の差）。
+        assert!(heartbeat_fresh(1_005, 1_000));
+        // 時計の折り返しをまたいでも同じ。
+        let b = u32::MAX - 100;
+        assert!(heartbeat_fresh(b, b.wrapping_add(HEARTBEAT_LIMIT_MS - 1)));
+        assert!(!heartbeat_fresh(b, b.wrapping_add(HEARTBEAT_LIMIT_MS)));
+    }
+
+    #[test]
     fn clock_wraparound_does_not_disconnect() {
         let start = u32::MAX - 3_000;
         let mut l = Liveness::new(SID, start);
         l.on_packet(&ping(0), start.wrapping_add(5_000));
-        assert_eq!(l.poll_send(start.wrapping_add(14_999)).bye, None);
+        assert_eq!(l.poll_send(start.wrapping_add(64_999)).bye, None);
         assert_eq!(l.state(), State::Alive);
         assert_eq!(
-            l.poll_send(start.wrapping_add(15_000)).bye,
+            l.poll_send(start.wrapping_add(65_000)).bye,
             Some(Message::Bye(ByeReason::Disconnected))
         );
     }

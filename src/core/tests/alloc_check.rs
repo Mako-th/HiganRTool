@@ -13,6 +13,7 @@ use higanr_core::link::{self, Link, Outlet, SelExit};
 use higanr_core::script::{Engine, Obs, parse};
 use higanr_core::seal::KeySeed;
 use higanr_core::spectate::{Assembler, HostConfig, SpectateHost, Watcher, WatcherConfig};
+use higanr_core::spectate_pace::Pace;
 use higanr_core::wire::{ByeReason, Check, MAX_DATAGRAM, Record, Seat, Select};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -89,6 +90,45 @@ fn engine_step_never_allocates() {
         eng.step(&obs_scene(s));
     }
     assert_eq!(count(), before, "Engine::step がヒープを確保した");
+}
+
+/// 予測の方法（`pred_eval`）は、作った後の `observe` / `predict` / `reset_stream` で確保しない。
+#[test]
+fn predictors_never_allocate() {
+    use higanr_core::pred_eval::{
+        Context, FarRelease, HazardRelease, MAX_M, Majority3, Predictor, Repeat, RunHazard,
+    };
+    let mut p0 = Repeat::default();
+    let mut p1 = Majority3::default();
+    let mut p2 = Box::<RunHazard>::default();
+    let mut p3 = Box::<Context>::default();
+    let mut p4 = FarRelease::new(3);
+    let mut p5 = Box::new(HazardRelease::new(4));
+    let mut out = [0u16; MAX_M];
+    // 数え方が働いている証拠: 確保すれば増える。
+    let probe = count();
+    drop(std::hint::black_box(vec![0u8; 64]));
+    assert!(count() > probe, "割り当ての数え方が動いていない");
+    let before = count();
+    for i in 0..3000u32 {
+        // 押す・離すを不規則に混ぜた語。
+        let w = ((i.wrapping_mul(2654435761) >> 13) & 0xFF) as u16;
+        for p in [
+            &mut p0 as &mut dyn Predictor,
+            &mut p1,
+            &mut *p2,
+            &mut *p3,
+            &mut p4,
+            &mut *p5,
+        ] {
+            p.observe(w);
+            p.predict(1 + (i as usize % MAX_M), &mut out);
+            if i % 500 == 499 {
+                p.reset_stream();
+            }
+        }
+    }
+    assert_eq!(count(), before, "予測の方法がヒープを確保した");
 }
 
 /// 送られたデータグラムを固定の枠に溜める `Outlet`（検査の側も確保しない）。溢れた分は捨てる。
@@ -312,6 +352,9 @@ fn spectate_never_allocates() {
     );
     let (mut to_host, mut to_w) = (SpectateMail::new(), SpectateMail::new());
     let (mut got, mut seen, mut ranged) = (0u32, 0u32, 0u32);
+    // 観戦者の早送りの決め方（ゲームのスレッドで 1 表示ごとに呼ぶ）。
+    let mut pace = Pace::new();
+    let (mut last_ack, mut extras) = (0u32, 0u32);
 
     let before = count();
     for t in 1..=3_000u32 {
@@ -347,11 +390,25 @@ fn spectate_never_allocates() {
         if w.sack() != 0 {
             ranged += 1;
         }
+        if t % 16 == 8 {
+            pace.on_display(w.ack().saturating_sub(last_ack));
+            last_ack = w.ack();
+            // 溜まりは決め打ち（この検査はすぐ全部使うので溜まらない）。止まり・待ち・早送りの道を順に通す。
+            let backlog = (t / 16) % 20;
+            if pace.may_play(backlog, 3) {
+                if backlog == 0 {
+                    pace.on_stall();
+                } else {
+                    extras += pace.extras(backlog, 3);
+                }
+            }
+        }
         while w.pop().is_some() {
             got += 1;
         }
     }
     let after = count();
+    assert!(extras > 0, "早送りの決め方の道を通っていない");
 
     assert!(w.is_joined(), "JOIN が通らなかった");
     assert!(got >= 100, "届いた記録が {got}");

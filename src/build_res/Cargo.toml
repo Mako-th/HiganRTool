@@ -1,0 +1,10 @@
+[package]
+name = "higanr_build_res"
+description = "配る exe・DLL に付けるバージョン情報（VS_VERSIONINFO）の .res を作る。各クレートの build.rs だけが使う（build-dependency）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"

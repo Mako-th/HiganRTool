@@ -2,9 +2,15 @@
 //!
 //! ## 推奨値（`recommend`）
 //!
-//! 片道 ≈ RTT / 2 を 1 フレーム（1000 / 60 ms）で割って切り上げる（相手の入力ワードが使うフレームまでに届く遅れの最小）。
-//! delay 方式も rollback の D も同じ式で、範囲は `RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。rollback は
-//! 巻き戻しが少ない方を推す: D 0 は先の側が毎フレーム予測するので推さず、片道が D フレームに収まれば予測がほぼ 0 になる。
+//! 片道 ≈ RTT / 2 を 1 フレーム（1000 / 60 ms）で割ったフレーム数を元にする。範囲は両方式とも `RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。
+//! - delay 方式: 片道を切り上げる（相手の入力ワードが使うフレームまでに届く遅れの最小。これより小さいと毎フレーム待つ）。
+//! - rollback: 片道の半分を D で吸い、残りを予測で埋める（半分を四捨五入し、ちょうど半分は遅れの少ない低い側）。片道を全部 D で吸うと
+//!   遠い相手で入力の遅れが大きすぎる（往復 約 280 ms の実回線で D 8 より D 4 の方が遊びやすかった。1 組の体感）。
+//!
+//! 0 を推すのは、直近の往復の窓の最大が方式ごとのしきい値（`ZERO_MAX_ROLLBACK_MS` / `ZERO_MAX_DELAY_MS`）以下のときだけ
+//! （`recommend_with_max`）。1 回でも揺れた回線では 0 にしない（D 0 は毎フレーム予測し、delay 方式の 0 は毎フレーム 1 往復を待つ）。
+//! 最大が無い（窓が 3 個に満たない・往復を持たない呼び手）ときは 0 を推さない。
+//!
 //! RTT は生存の測り（`liveness::Liveness::rtt_ms`。受信スレッドが PONG を受けた時刻で測る）で、測れていなければ推奨は出さない（`None`）。
 //!
 //! ## 両者が選ぶ（`DelayPick`）
@@ -22,7 +28,8 @@
 //! 要求したとき・seg の最初の取得のときだけ D を `recommend`（直近 8 回の往復の中央値）にする。マッチの途中では追わない。
 //! ゲストの auto の要求は INPUT の lat の delay の欄に `AUTO` を載せる。
 //! seg の始まりの見直しだけは変わりにくくする（往復が境目で揺れてマッチごとに D が替わるのを避ける）: 上げるのは「往復 − `UP_MARGIN_MS`」で
-//! 引いた推奨値が今の D より大きいときだけ、下げるのは素の推奨値が今の D より小さい seg の始まりが `DOWN_RUN` 回続いたときだけ。規則は `AutoHold` に 1 つ。
+//! 引いた推奨値が今の D より大きいときだけ（最大も同じ余裕で引く。0 から上がるのは最大がしきい値 + `UP_MARGIN_MS` を越えたとき）、
+//! 下げるのは素の推奨値が今の D より小さい seg の始まりが `DOWN_RUN` 回続いたときだけ。規則は `AutoHold` に 1 つ。
 //!
 //! ## 並び
 //!
@@ -47,8 +54,21 @@ const _: () = assert!(
 /// 推奨値の下限は別（`RECOMMEND_MIN`）。
 pub const DELAY_MIN: u8 = 0;
 
-/// 推奨値の下限。LAN で 0 を勧めない（D 0 は毎フレーム予測し、delay 方式の 0 は毎フレーム 1 往復を待つ）。0 は人が選ぶ値。
+/// 往復から引く推奨値の下限。0 を推すのは往復の窓の最大が下のしきい値以下のときだけ（`recommend_with_max`）。
 pub const RECOMMEND_MIN: u8 = 1;
+
+/// 往復の窓の最大がこれ以下なら推奨値を 0 にする（ms）。delay 方式の 0 は毎フレーム相手の語を待つので rollback の半分にした。
+/// どちらも実測の裏付けは無く、決め直してよい値。
+pub const ZERO_MAX_ROLLBACK_MS: u32 = 16;
+pub const ZERO_MAX_DELAY_MS: u32 = 8;
+
+/// 方式ごとの、推奨値 0 を許す往復の最大（ms）。
+pub fn zero_max_ms(mode: Mode) -> u32 {
+    match mode {
+        Mode::Delay => ZERO_MAX_DELAY_MS,
+        Mode::Rollback => ZERO_MAX_ROLLBACK_MS,
+    }
+}
 
 /// 要求（ゲストの INPUT の lat の delay の欄）と押下で「auto」を表す値（数字キーの 9）。選べる範囲の外で、wire が通す上限
 /// `frame::MAX_DELAY`（9）と同じなので、本文の形も検査も変えずに運べる。ホストが送る予定・切替がこの値になることは無い。
@@ -102,12 +122,27 @@ impl DelayChoice {
     }
 }
 
-/// 推奨値（delay 方式なら遅れ、rollback なら D）。RTT が測れていなければ `None`。下限は `RECOMMEND_MIN`、上限は `bounds`。
+/// 往復の最大が無い呼び手向けの推奨値（delay 方式なら遅れ、rollback なら D）。RTT が測れていなければ `None`。
+/// 下限は `RECOMMEND_MIN`（0 は推さない）、上限は `bounds`。
 pub fn recommend(mode: Mode, rtt_ms: Option<u32>) -> Option<u8> {
-    let frames = (u64::from(rtt_ms?) * PER_RTT_NUM)
-        .div_ceil(PER_RTT_DEN)
-        .clamp(u64::from(RECOMMEND_MIN), u64::from(bounds(mode).1));
-    Some(frames as u8)
+    let scaled = u64::from(rtt_ms?) * PER_RTT_NUM;
+    let frames = match mode {
+        Mode::Delay => scaled.div_ceil(PER_RTT_DEN),
+        // 片道のフレーム数（scaled / DEN）の半分。ちょうど半分は切り下げる。
+        Mode::Rollback => (scaled + PER_RTT_DEN - 1) / (2 * PER_RTT_DEN),
+    };
+    Some(frames.clamp(u64::from(RECOMMEND_MIN), u64::from(bounds(mode).1)) as u8)
+}
+
+/// 推奨値。往復の窓の最大 `max_ms` がしきい値（`zero_max_ms`）以下なら 0、そうでなければ `recommend`（中央値 `rtt_ms` で引く）。
+/// `max_ms` が `None` なら 0 を推さない。
+pub fn recommend_with_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<u8> {
+    let r = recommend(mode, rtt_ms)?;
+    Some(if max_ms.is_some_and(|m| m <= zero_max_ms(mode)) {
+        DELAY_MIN
+    } else {
+        r
+    })
 }
 
 /// 選べる範囲 (下限, 上限)。ホストがゲストの要求を詰めるのにも使う。`mode` は、方式で範囲を分けたくなったとき呼び手を直さずに済むよう残す。
@@ -122,10 +157,10 @@ pub fn clamp(mode: Mode, x: u8) -> u8 {
 
 // ---- auto の「マッチごとに見直す ＋ 変わりにくくする」----
 //
-// 往復が約 33 ms の環境では、推奨値の式の 1 と 2 の境目（33 ms で 1、34 ms で 2）に乗る。seg の始まりごとに素の推奨値へ合わせると
-// 往復が数 ms 揺れるだけでマッチごとに D が 1 ↔ 2 と替わるので、seg の始まりの見直しだけ「上げにくく・下げにくく」する。
+// 往復が推奨値の境目（delay 方式の 1 と 2 は 33 ms で 1、34 ms で 2。rollback の 1 と 2 は 100 ms で 1、101 ms で 2）に乗ると、seg の始まりごとに
+// 素の推奨値へ合わせては往復が数 ms 揺れるだけでマッチごとに D が替わるので、seg の始まりの見直しだけ「上げにくく・下げにくく」する。
 
-/// 上げるときに往復から差し引く余裕（ms）。今 1 なら往復 39 ms 以上で 2（34〜38 ms は 1 のまま）。5 ms は往復の揺れ幅の見込みで、実測の裏付けは無い。
+/// 上げるときに往復から差し引く余裕（ms）。delay 方式で今 1 なら往復 39 ms 以上で 2（34〜38 ms は 1 のまま）。5 ms は往復の揺れ幅の見込みで、実測の裏付けは無い。
 pub const UP_MARGIN_MS: u32 = 5;
 
 /// 下げるのに要る、続けて「今の D より低い」と出た seg の始まりの数（間に「下げない」seg の始まりが挟まれば数え直し）。
@@ -139,10 +174,19 @@ pub struct Recommend {
 }
 
 impl Recommend {
-    /// 往復（ms）から。測れていなければ `None`。余裕で引く往復は 0 で止める。
+    /// 往復（ms）から。測れていなければ `None`。最大を持たないので 0 は推さない。
     pub fn from_rtt(mode: Mode, rtt_ms: Option<u32>) -> Option<Recommend> {
-        let raw = recommend(mode, rtt_ms)?;
-        let up = recommend(mode, rtt_ms.map(|r| r.saturating_sub(UP_MARGIN_MS)))?;
+        Recommend::from_rtt_max(mode, rtt_ms, None)
+    }
+
+    /// 往復の中央値と窓の最大（ms）から。測れていなければ `None`。`up` は両方から余裕を引く。引く値は 0 で止める。
+    pub fn from_rtt_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<Recommend> {
+        let raw = recommend_with_max(mode, rtt_ms, max_ms)?;
+        let up = recommend_with_max(
+            mode,
+            rtt_ms.map(|r| r.saturating_sub(UP_MARGIN_MS)),
+            max_ms.map(|m| m.saturating_sub(UP_MARGIN_MS)),
+        )?;
         Some(Recommend { raw, up })
     }
 
@@ -352,26 +396,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_recommendation_rounds_the_one_way_frames_up_for_both_modes() {
-        for mode in [Mode::Delay, Mode::Rollback] {
-            let r = |ms| recommend(mode, Some(ms));
-            // 0〜33 ms は 1（推奨の下限）、34 ms で 2。
-            assert_eq!(r(0), Some(1), "{mode:?}: 推奨の下限 1（0 は人が選ぶ値）");
-            assert_eq!(r(1), Some(1));
-            assert_eq!(r(33), Some(1), "0.99 フレーム");
-            assert_eq!(r(34), Some(2), "1.02 フレーム");
-            assert_eq!(r(66), Some(2), "1.98 フレーム");
-            assert_eq!(r(67), Some(3), "2.01 フレーム");
-            assert_eq!(r(233), Some(7), "6.99 フレーム");
-            assert_eq!(r(234), Some(8), "7.02 フレーム");
-            assert_eq!(r(266), Some(8), "7.98 フレーム");
-            assert_eq!(r(267), Some(MAX_PICK_DELAY), "8.01 フレーム → 上限 8");
-            assert_eq!(r(300), Some(MAX_PICK_DELAY), "9.00 フレームでも上限 8");
-            assert_eq!(r(1_000), Some(MAX_PICK_DELAY));
-            assert_eq!(r(u32::MAX), Some(MAX_PICK_DELAY), "桁あふれしない");
-            assert_eq!(recommend(mode, None), None);
+    fn the_delay_recommendation_rounds_the_one_way_frames_up() {
+        let r = |ms| recommend(Mode::Delay, Some(ms));
+        // 0〜33 ms は 1（推奨の下限）、34 ms で 2。
+        assert_eq!(r(0), Some(1), "推奨の下限 1（0 は人が選ぶ値）");
+        assert_eq!(r(1), Some(1));
+        assert_eq!(r(33), Some(1), "0.99 フレーム");
+        assert_eq!(r(34), Some(2), "1.02 フレーム");
+        assert_eq!(r(66), Some(2), "1.98 フレーム");
+        assert_eq!(r(67), Some(3), "2.01 フレーム");
+        assert_eq!(r(233), Some(7), "6.99 フレーム");
+        assert_eq!(r(234), Some(8), "7.02 フレーム");
+        assert_eq!(r(266), Some(8), "7.98 フレーム");
+        assert_eq!(r(267), Some(MAX_PICK_DELAY), "8.01 フレーム → 上限 8");
+        assert_eq!(r(300), Some(MAX_PICK_DELAY), "9.00 フレームでも上限 8");
+        assert_eq!(r(1_000), Some(MAX_PICK_DELAY));
+        assert_eq!(r(u32::MAX), Some(MAX_PICK_DELAY), "桁あふれしない");
+        assert_eq!(recommend(Mode::Delay, None), None);
+        assert_eq!(MAX_PICK_DELAY, 8, "決めた範囲は 0〜8");
+    }
+
+    /// 境目は手で数えた値（片道のフレーム数 RTT × 3 / 100 の半分。ちょうど半分は低い側）。
+    #[test]
+    fn the_rollback_recommendation_is_half_the_one_way_frames() {
+        let r = |ms| recommend(Mode::Rollback, Some(ms));
+        assert_eq!(r(0), Some(1), "推奨の下限 1（D 0 は推さない）");
+        assert_eq!(r(30), Some(1), "片道 0.9 フレームの半分");
+        assert_eq!(r(100), Some(1), "片道 3.0 フレームの半分 1.5 は低い側");
+        assert_eq!(r(101), Some(2), "1.515");
+        assert_eq!(r(166), Some(2), "2.49");
+        assert_eq!(r(167), Some(3), "2.505");
+        assert_eq!(r(233), Some(3), "3.495");
+        assert_eq!(r(234), Some(4), "3.51");
+        assert_eq!(r(280), Some(4), "4.2（実回線で遊びやすかった値）");
+        assert_eq!(r(300), Some(4), "4.5 は低い側");
+        assert_eq!(r(301), Some(5), "4.515");
+        assert_eq!(r(400), Some(6), "6.0");
+        assert_eq!(r(500), Some(7), "7.5 は低い側");
+        assert_eq!(r(501), Some(MAX_PICK_DELAY), "7.515 → 8");
+        assert_eq!(r(u32::MAX), Some(MAX_PICK_DELAY), "上限・桁あふれしない");
+        assert_eq!(recommend(Mode::Rollback, None), None);
+        for ms in [34, 67, 100, 167, 234, 300] {
+            assert!(
+                r(ms) < recommend(Mode::Delay, Some(ms)),
+                "{ms} ms: rollback は delay 方式より低い"
+            );
         }
-        assert_eq!(MAX_PICK_DELAY, 8, "本人の決定: 範囲は 0〜8");
+    }
+
+    /// 境目は手で数えた値（rollback は最大 16 ms で 0・17 ms で 1、delay 方式は 8 ms で 0・9 ms で 1。中央値は小さくてよい）。
+    #[test]
+    fn zero_is_recommended_only_when_the_window_max_is_within_the_mode_threshold() {
+        assert_eq!((ZERO_MAX_ROLLBACK_MS, ZERO_MAX_DELAY_MS), (16, 8));
+        let rb = |med, max| recommend_with_max(Mode::Rollback, Some(med), Some(max));
+        let dl = |med, max| recommend_with_max(Mode::Delay, Some(med), Some(max));
+        assert_eq!(rb(2, 16), Some(0));
+        assert_eq!(
+            rb(2, 17),
+            Some(1),
+            "中央値が小さくても最大が越えれば 0 にしない"
+        );
+        assert_eq!(rb(16, 16), Some(0));
+        assert_eq!(rb(0, 0), Some(0));
+        assert_eq!(rb(100, 300), Some(1), "しきい値を越えたら今までの式");
+        assert_eq!(rb(300, 300), Some(4));
+        assert_eq!(dl(2, 8), Some(0));
+        assert_eq!(dl(2, 9), Some(1));
+        assert_eq!(dl(2, 16), Some(1), "rollback のしきい値では 0 にしない");
+        assert_eq!(dl(70, 70), Some(3));
+        // 最大が無い（窓が 3 個に満たない・往復を持たない呼び手）なら 0 を推さない。
+        for mode in [Mode::Delay, Mode::Rollback] {
+            assert_eq!(recommend_with_max(mode, Some(0), None), Some(1), "{mode:?}");
+            assert_eq!(recommend_with_max(mode, None, Some(0)), None, "{mode:?}");
+            assert_eq!(recommend_with_max(mode, None, None), None, "{mode:?}");
+            assert_eq!(
+                recommend(mode, Some(0)),
+                Some(1),
+                "{mode:?}: 最大の無い式は 0 を推さない"
+            );
+        }
+    }
+
+    /// `up` は中央値と最大の両方から 5 ms を引く: 0 から上がるのは最大がしきい値 + 5 ms を越えたとき（rollback は 22 ms、delay 方式は 14 ms）。
+    #[test]
+    fn the_pair_with_a_max_keeps_zero_until_the_max_clears_threshold_plus_margin() {
+        let p = |mode, med, max| Recommend::from_rtt_max(mode, Some(med), Some(max));
+        let pair = |raw, up| Some(Recommend { raw, up });
+        assert_eq!(p(Mode::Rollback, 2, 16), pair(0, 0));
+        assert_eq!(
+            p(Mode::Rollback, 2, 17),
+            pair(1, 0),
+            "素は 1、最大 − 5 = 12 で 0"
+        );
+        assert_eq!(
+            p(Mode::Rollback, 2, 21),
+            pair(1, 0),
+            "最大 − 5 = 16 はまだ 0"
+        );
+        assert_eq!(
+            p(Mode::Rollback, 2, 22),
+            pair(1, 1),
+            "最大 − 5 = 17 で上がる"
+        );
+        assert_eq!(p(Mode::Delay, 2, 8), pair(0, 0));
+        assert_eq!(p(Mode::Delay, 2, 9), pair(1, 0));
+        assert_eq!(p(Mode::Delay, 2, 13), pair(1, 0), "最大 − 5 = 8 はまだ 0");
+        assert_eq!(p(Mode::Delay, 2, 14), pair(1, 1), "最大 − 5 = 9 で上がる");
+        assert_eq!(
+            Recommend::from_rtt_max(Mode::Delay, Some(2), None),
+            pair(1, 1),
+            "最大が無ければ 0 を推さない"
+        );
+        assert_eq!(Recommend::from_rtt(Mode::Rollback, Some(0)), pair(1, 1));
+        assert_eq!(Recommend::from_rtt_max(Mode::Delay, None, Some(1)), None);
     }
 
     #[test]
@@ -488,8 +625,9 @@ mod tests {
         );
     }
 
+    /// `AutoHold` は方式によらず推奨値の組だけを見る。境目は delay 方式の式で手で数える。
     fn rec(rtt: u32) -> Option<Recommend> {
-        Recommend::from_rtt(Mode::Rollback, Some(rtt))
+        Recommend::from_rtt(Mode::Delay, Some(rtt))
     }
 
     /// 旗を立てて最初の適用を済ませた AutoHold（以降の seg の始まりは余裕つきの規則で動く）。
@@ -500,11 +638,21 @@ mod tests {
         a
     }
 
-    /// 境目は手で数えた値（RTT × 3 / 100 の切り上げ: 33 ms で 1、34 ms で 2。「−5 ms」の側は 38 ms で 1、39 ms で 2）。
+    /// 境目は手で数えた値（delay 方式は RTT × 3 / 100 の切り上げ: 33 ms で 1、34 ms で 2。「−5 ms」の側は 38 ms で 1、39 ms で 2。
+    /// rollback は 100 ms で 1、101 ms で 2。「−5 ms」の側は 105 ms で 1、106 ms で 2）。
     #[test]
     fn the_recommend_pair_takes_the_margin_off_only_the_up_side() {
         assert_eq!(UP_MARGIN_MS, 5);
-        for mode in [Mode::Delay, Mode::Rollback] {
+        let rb = |ms| Recommend::from_rtt(Mode::Rollback, Some(ms));
+        let pair = |raw, up| Some(Recommend { raw, up });
+        assert_eq!(rb(100), pair(1, 1));
+        assert_eq!(rb(101), pair(2, 1), "素は 2、−5 ms の側は 96 ms で 1");
+        assert_eq!(rb(105), pair(2, 1));
+        assert_eq!(rb(106), pair(2, 2));
+        assert_eq!(rb(0), pair(1, 1), "0 から 5 を引いても桁あふれしない");
+        assert_eq!(Recommend::from_rtt(Mode::Rollback, None), None);
+        {
+            let mode = Mode::Delay;
             let p = |ms| Recommend::from_rtt(mode, Some(ms));
             let pair = |raw, up| Some(Recommend { raw, up });
             assert_eq!(p(33), pair(1, 1), "{mode:?}");
@@ -642,6 +790,60 @@ mod tests {
         assert!(!off.is_on());
         assert_eq!(off.pick_now(rec(34)), None);
         assert_eq!(off.pick_head(1, rec(34)), None);
+    }
+
+    /// 0 の出入り（rollback。中央値 2 ms）: 0 から上がるのは最大 22 ms から、0 へ下がるのは素が 0 の seg の始まりが 2 回続いたとき。
+    #[test]
+    fn auto_holds_zero_until_the_max_clears_the_margin_and_drops_to_zero_after_two_heads() {
+        let r = |max| Recommend::from_rtt_max(Mode::Rollback, Some(2), Some(max));
+        let used0 = |max| {
+            let mut a = AutoHold::default();
+            a.raise();
+            assert!(a.pick_now(r(max)).is_some());
+            a
+        };
+        for max in 17..=21u32 {
+            let mut a = used0(4);
+            assert_eq!(
+                a.pick_head(0, r(max)).unwrap(),
+                HeadPick { d: 0, held: true },
+                "最大 {max} ms: 素は 1 だが 0 のまま"
+            );
+        }
+        let mut a = used0(4);
+        assert_eq!(
+            a.pick_head(0, r(22)).unwrap(),
+            HeadPick { d: 1, held: false },
+            "最大 22 ms で 0 から上がる"
+        );
+        let mut a = used0(300);
+        assert_eq!(
+            a.pick_head(1, r(10)).unwrap(),
+            HeadPick { d: 1, held: true },
+            "素 0 < 1 の 1 回目は据え置き"
+        );
+        assert_eq!(
+            a.pick_head(1, r(10)).unwrap(),
+            HeadPick { d: 0, held: false },
+            "2 回続けて 0 へ下がる"
+        );
+        let mut b = used0(300);
+        assert_eq!(b.pick_head(1, r(10)).unwrap().d, 1);
+        assert_eq!(
+            b.pick_head(1, r(40)).unwrap().d,
+            1,
+            "間に 0 でない回が挟まれば数え直し"
+        );
+        assert_eq!(b.pick_head(1, r(10)).unwrap().d, 1);
+        // 押した瞬間・最初の適用は素の 0 をすぐ使う。
+        let mut c = AutoHold::default();
+        c.raise();
+        assert_eq!(
+            c.pick_head(5, r(10)).unwrap(),
+            HeadPick { d: 0, held: false }
+        );
+        let mut d = used0(300);
+        assert_eq!(d.pick_now(r(10)), Some(0));
     }
 
     #[test]

@@ -62,6 +62,22 @@ unsafe fn call_se_fn(f: u32, this: u32, id: u32, pan: i32) {
     }
 }
 
+/// SE を 1 つ積む（ゲームの `0x43E2F0`。進め直しの積み直しと、選択の画面の相手のカーソルの音）。ゲームのスレッドの、ゲームの更新の外
+/// （入力の地点・Present の後）からだけ呼ぶ。呼ぶ先の先頭 25 バイトを実バイトと照合し、合わなければ何も呼ばずに false。
+pub(crate) fn push_se_checked(id: u32, pan: i32) -> bool {
+    // `OwnProcess` の落ちない読み。
+    if !code_head_matches(SE_PUSH_FN, &SE_PUSH_HEAD, &mut |a| OwnProcess.u32_at(a)) {
+        return false;
+    }
+    // SAFETY: `SE_PUSH_FN` は SE を積む `0x43E2F0`。先頭 25 バイトを上で実バイトと照合した。thiscall で ecx = SoundManager
+    // `SOUND_MANAGER`（th09.exe の .data）、スタックの引数は (id, パン) の 2 つで `ret $0x8` で自分で片付ける（ゲーム自身の
+    // 呼び出し `0x00404081 mov $0x4dc698,%ecx` → `0x00404086 call 0x43e2f0`、`0x004247DA` → `0x004247DF` と同じ）。ebx・esi・edi・ebp は
+    // push / pop で戻し、eax・ecx・edx は壊してよい（thiscall）。触るのは SoundManager の `+0x620`〜`+0x1E80` と `+0x408 + id × 4` だけ
+    // （枠が 12 を越えるなら何も書かずに戻る）。呼び手はゲームのスレッドで、ゲームの更新は走っていない。
+    unsafe { call_se_fn(SE_PUSH_FN, SOUND_MANAGER, id, pan) };
+    true
+}
+
 /// 1 なら設置が全部済んでいて、入口の関数が入れ物に触ってよい。
 static PLAY_ARMED: AtomicU32 = AtomicU32::new(0);
 
@@ -291,17 +307,7 @@ impl PlayMem for RealPlayMem {
     }
 
     fn push_se(&mut self, id: u32, pan: i32) -> bool {
-        // 呼ぶ先の先頭 25 バイトを実バイトと照合する（`OwnProcess` の落ちない読み。合わなければ何も呼ばない）。
-        if !code_head_matches(SE_PUSH_FN, &SE_PUSH_HEAD, &mut |a| OwnProcess.u32_at(a)) {
-            return false;
-        }
-        // SAFETY: `SE_PUSH_FN` は SE を積む `0x43E2F0`。先頭 25 バイトを上で実バイトと照合した。thiscall で ecx = SoundManager
-        // `SOUND_MANAGER`（th09.exe の .data）、スタックの引数は (id, パン) の 2 つで `ret $0x8` で自分で片付ける（ゲーム自身の
-        // 呼び出し `0x00404081 mov $0x4dc698,%ecx` → `0x00404086 call 0x43e2f0` と同じ）。ebx・esi・edi・ebp は push / pop で戻し、eax・ecx・edx は壊してよい（thiscall）。
-        // 触るのは SoundManager の `+0x620`〜`+0x1E80` と `+0x408 + id × 4` だけ（枠が 12 を越えるなら何も書かずに戻る）。
-        // ゲームのスレッドで、ゲームは動いていない。
-        unsafe { call_se_fn(SE_PUSH_FN, SOUND_MANAGER, id, pan) };
-        true
+        push_se_checked(id, pan)
     }
 
     fn read_strided(&mut self, base: u32, stride: u32, out: &mut [u32]) -> bool {

@@ -5,7 +5,7 @@
 //! ここはゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を置かない（`FeedRecord` はスタックに置く）。
 #![forbid(unsafe_code)]
 
-use higanr_core::input_model::SEND_MASK;
+use higanr_core::input_model::MATCH_SEND_MASK;
 use higanr_core::script::{Engine, Obs, Out, Status};
 
 use crate::feeds::{FeedRecord, IM_BYTES};
@@ -181,7 +181,7 @@ pub struct Stepped {
 
 impl Stepped {
     pub fn word(&self) -> Option<u16> {
-        self.out.feed.map(|(p1, p2)| (p1 | p2) & SEND_MASK)
+        self.out.feed.map(|(p1, p2)| (p1 | p2) & MATCH_SEND_MASK)
     }
 }
 
@@ -210,8 +210,8 @@ pub fn commit(io: &mut dyn TickIo, a: &GameAddrs, k: u32, stepped: &Stepped) -> 
             status,
         };
     };
-    // 語は念のためここでも `SEND_MASK` の中へ（台本の読み込みで断ってあるが、feed する直前の守り）。
-    let (p1, p2) = (p1 & SEND_MASK, p2 & SEND_MASK);
+    // 語は念のためここでも `MATCH_SEND_MASK` の中へ（台本の読み込みで断ってあるが、feed する直前の守り）。
+    let (p1, p2) = (p1 & MATCH_SEND_MASK, p2 & MATCH_SEND_MASK);
     let mut rec = FeedRecord {
         k,
         step: out.step,
@@ -631,7 +631,7 @@ pub(crate) mod tests {
             let b = commit(&mut io2, &ADDRS, k, &s);
             assert_eq!(a, b, "k={k}");
             assert_eq!(io1.log, io2.log, "k={k}: 偽のゲームへの呼び出し");
-            assert_eq!(s.word(), a.record.map(|r| (r.p1 | r.p2) & SEND_MASK));
+            assert_eq!(s.word(), a.record.map(|r| (r.p1 | r.p2) & MATCH_SEND_MASK));
         }
         assert_eq!(e1.status(), e2.status());
         assert_eq!(e2.status(), Status::Done);

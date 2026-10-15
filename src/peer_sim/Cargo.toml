@@ -1,6 +1,6 @@
 [package]
 name = "peer_sim"
-description = "偽の対戦相手。花映塚を使わずプロトコルだけ話す（M2 で 1 台の lockstep に使う）"
+description = "偽の対戦相手。花映塚を使わずプロトコルだけ話す。検査と、1 台での lockstep の確かめに使う"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

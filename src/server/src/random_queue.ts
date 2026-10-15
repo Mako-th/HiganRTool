@@ -106,13 +106,18 @@ export class RandomQueue extends DurableObject<Env> {
     }
   }
 
+  /** 書けなくても入室は失敗にしない（無料枠の使い切りなど）。期限は次の入室の expireIfDue か、掛け直されたアラームで片づく。 */
   private async scheduleAlarm(): Promise<void> {
-    const live = this.live();
-    if (live.length === 0) {
-      await this.ctx.storage.deleteAlarm();
-      return;
+    try {
+      const live = this.live();
+      if (live.length === 0) {
+        await this.ctx.storage.deleteAlarm();
+        return;
+      }
+      await this.ctx.storage.setAlarm(Math.min(...live.map((w) => att(w).deadline)));
+    } catch {
+      // 受け付けたソケットを占有者のまま 500 で捨てるより、期限が遅れる方を取る。
     }
-    await this.ctx.storage.setAlarm(Math.min(...live.map((w) => att(w).deadline)));
   }
 
   private async gone(ws: WebSocket): Promise<void> {

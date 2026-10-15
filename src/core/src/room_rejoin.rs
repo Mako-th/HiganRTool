@@ -139,6 +139,6 @@ mod tests {
             s.since_last_rejoin_secs = gap;
             assert_eq!(should_rejoin(Failure::Expired, &s), want, "{gap:?}");
         }
-        assert_eq!(MIN_GAP_SECS, 60, "本人の決定の 60 秒");
+        assert_eq!(MIN_GAP_SECS, 60, "決めた間隔は 60 秒");
     }
 }

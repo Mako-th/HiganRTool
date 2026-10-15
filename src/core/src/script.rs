@@ -5,7 +5,7 @@
 //! 段階の `inv=` / `life1=` / `life2=` / `gauge1=` / `gauge2=` は「いつ効くか」だけをここで決め、ゲームのメモリへ書くのは DLL。
 //! `inv` は後の段階で変えるまで続く値、ライフとゲージは 1 回だけの値で、書けない tick の間は `Engine` が持ち越す（`take_pending`）。
 
-use crate::input_model::{SEND_MASK, keys};
+use crate::input_model::{MATCH_SEND_MASK, keys};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -45,18 +45,20 @@ pub struct Step {
     pub set: SetOnce,
     /// `type=` / `bs=` / `enter=`（ルーム名の入力欄へ入れる文字。段階が効き始めたとき 1 回だけ）。
     pub typed: Option<Typed>,
-    /// `digit=` / `tab=`（数字キー・Tab をその tick に押したことにする。段階が効き始めたとき 1 回だけ）。
+    /// `digit=` / `tab=` / `copy=`（数字キー・Tab・Ctrl+C をその tick に押したことにする。段階が効き始めたとき 1 回だけ）。
     pub keys: Option<KeyPress>,
 }
 
-/// 台本が「押した」ことにする数字キー・Tab。OS には何も注がず、dll の `NetPlay::digit_tick` が読む「押した瞬間」の集合をその 1 tick だけ
-/// 差し替える。ビットの並び（数字 d = bit d、Tab = bit10）は dll の `digit_keys` が持つ。
+/// 台本が「押した」ことにする数字キー・Tab・Ctrl+C。OS には何も注がず、dll の `NetPlay::digit_tick` と `NetUi::copy_tick` が読む「押した瞬間」の
+/// 集合をその 1 tick だけ差し替える。ビットの並び（数字 d = bit d、Tab = bit10、C = bit13）は dll の `digit_keys` が持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeyPress {
     /// 押した数字（0〜9。0〜8 が遅れの値、9 が auto）。
     pub digit: Option<u8>,
     /// Tab（対戦の形式の切替）。
     pub tab: bool,
+    /// Ctrl+C（観戦コードのコピー）。台本の実行は本物のキーを読まないので、人のクリップボードを使わずに `clipboard = file` の置き場へ書かせる。
+    pub copy: bool,
 }
 
 /// `type=` の文字の長さの上限（ルーム名の上限 `room::ROOM_NAME_MAX` と同じ）。
@@ -281,13 +283,14 @@ fn get_u32_ranged(
     Ok(v)
 }
 
-/// キー名 1 つを `SEND_MASK` の中のビットへ。peer_sim の選択の台本も使う。
+/// キー名 1 つを `MATCH_SEND_MASK` の中のビットへ。peer_sim の選択の台本も使う。
 pub fn key_by_name(name: &str) -> Option<u16> {
     match name {
         "Z" => Some(keys::Z),
         "X" => Some(keys::X),
         "SHIFT" => Some(keys::SHIFT),
         "ESC" => Some(keys::ESC),
+        "CTRL" => Some(keys::CTRL),
         "UP" => Some(keys::UP),
         "DOWN" => Some(keys::DOWN),
         "LEFT" => Some(keys::LEFT),
@@ -296,7 +299,7 @@ pub fn key_by_name(name: &str) -> Option<u16> {
     }
 }
 
-/// `p1=`/`p2=`: `0x` の 16 進、またはキー名を `+` でつないだもの。`SEND_MASK` の外のビットが立てば誤り。
+/// `p1=`/`p2=`: `0x` の 16 進、またはキー名を `+` でつないだもの。`MATCH_SEND_MASK` の外のビットが立てば誤り。
 fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
     let Some(v) = fields.get(name) else {
         return Ok(0);
@@ -313,10 +316,10 @@ fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
         }
         acc
     };
-    if value & !SEND_MASK != 0 {
+    if value & !MATCH_SEND_MASK != 0 {
         return Err(err(
             line,
-            format!("{name} が SEND_MASK（{SEND_MASK:#06x}）の外です: {v}"),
+            format!("{name} が MATCH_SEND_MASK（{MATCH_SEND_MASK:#06x}）の外です: {v}"),
         ));
     }
     Ok(value)
@@ -325,12 +328,12 @@ fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
 const KNOWN_STEP_FIELDS: &[&str] = &[
     "scene", "screen", "cursor", "sub", "trans", "pause", "loading", "demo", "endmenu", "menuflag",
     "talk", "optional", "p1", "p2", "hold", "wait", "limit", "shot", "note", "inv", "life1",
-    "life2", "gauge1", "gauge2", "type", "bs", "enter", "digit", "tab",
+    "life2", "gauge1", "gauge2", "type", "bs", "enter", "digit", "tab", "copy",
 ];
 
-/// `digit=` / `tab=`。`digit` は 0〜9 の 1 桁（2 桁以上・符号・空は断る）、`tab` は 1 だけ。
+/// `digit=` / `tab=` / `copy=`。`digit` は 0〜9 の 1 桁（2 桁以上・符号・空は断る）、`tab` と `copy` は 1 だけ。
 fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseError> {
-    if !(fields.contains("digit") || fields.contains("tab")) {
+    if !(fields.contains("digit") || fields.contains("tab") || fields.contains("copy")) {
         return Ok(None);
     }
     let mut k = KeyPress::default();
@@ -350,6 +353,11 @@ fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseE
         None => {}
         Some("1") => k.tab = true,
         Some(v) => return Err(err(line, format!("tab は 1 だけ: {v}"))),
+    }
+    match fields.get("copy") {
+        None => {}
+        Some("1") => k.copy = true,
+        Some(v) => return Err(err(line, format!("copy は 1 だけ: {v}"))),
     }
     Ok(Some(k))
 }
@@ -862,7 +870,7 @@ impl Engine {
                     if first {
                         self.activate();
                     }
-                    feed = Some((p1 & SEND_MASK, p2 & SEND_MASK));
+                    feed = Some((p1 & MATCH_SEND_MASK, p2 & MATCH_SEND_MASK));
                     if remaining > 1 {
                         self.phase = Phase::Holding {
                             remaining: remaining - 1,
@@ -1059,6 +1067,13 @@ mod tests {
     fn parse_rejects_bits_outside_send_mask_hex_enter() {
         let e = parse("scene=1 p1=0x1000\n").unwrap_err();
         assert_eq!(e.line, 1);
+    }
+
+    #[test]
+    fn parse_accepts_ctrl_by_name_and_hex() {
+        let s = parse("scene=1 p1=CTRL+Z\nscene=1 p2=0x0100\n").expect("parse");
+        assert_eq!(s.steps[0].p1, keys::CTRL | keys::Z);
+        assert_eq!(s.steps[1].p2, keys::CTRL);
     }
 
     #[test]
@@ -1585,21 +1600,24 @@ mod tests {
             s.steps[0].keys,
             Some(KeyPress {
                 digit: Some(5),
-                tab: true
+                tab: true,
+                ..KeyPress::default()
             })
         );
         assert_eq!(
             s.steps[1].keys,
             Some(KeyPress {
                 digit: Some(9),
-                tab: false
+                tab: false,
+                ..KeyPress::default()
             })
         );
         assert_eq!(
             s.steps[2].keys,
             Some(KeyPress {
                 digit: None,
-                tab: true
+                tab: true,
+                ..KeyPress::default()
             })
         );
         assert_eq!(s.steps[3].keys, None, "押下の欄が無い段");
@@ -1630,7 +1648,8 @@ mod tests {
             eng.take_keys(),
             Some(KeyPress {
                 digit: Some(5),
-                tab: true
+                tab: true,
+                ..KeyPress::default()
             })
         );
         assert_eq!(eng.take_keys(), None, "2 回取り出せた");
@@ -1646,6 +1665,39 @@ mod tests {
         eng.step(&o);
         assert_eq!(eng.status(), Status::Done);
         assert_eq!(eng.take_keys(), None, "台本が終わった後に出た");
+    }
+
+    /// 壊れたら落ちる: `copy=1` が読めない・数字や Tab と同じ段で一緒に取れない・段が効き始める前に出る・2 回取れる・`copy=0` を通す。
+    #[test]
+    fn copy_field_parses_and_is_taken_once_with_the_other_keys() {
+        let s = parse("scene=1 wait=2 copy=1\nscene=1 wait=1 digit=3 copy=1\nscene=1 wait=1\n")
+            .unwrap();
+        assert_eq!(
+            s.steps[0].keys,
+            Some(KeyPress {
+                copy: true,
+                ..KeyPress::default()
+            })
+        );
+        assert_eq!(
+            s.steps[1].keys,
+            Some(KeyPress {
+                digit: Some(3),
+                copy: true,
+                ..KeyPress::default()
+            })
+        );
+        assert_eq!(s.steps[2].keys, None);
+        for bad in ["copy=0", "copy=", "copy=yes", "copy=11"] {
+            assert!(parse(&format!("scene=1 {bad}\n")).is_err(), "{bad}");
+        }
+        let mut eng = Engine::new(s);
+        let o = obs_scene(1);
+        eng.step(&o);
+        assert_eq!(eng.take_keys(), None, "効き始める前に出た");
+        eng.step(&o);
+        assert!(eng.take_keys().is_some_and(|k| k.copy));
+        assert_eq!(eng.take_keys(), None, "2 回取り出せた");
     }
 
     // `Engine::step` が確保しないことの検査は `src/core/tests/alloc_check.rs` に置く。割り当てを数えるには `unsafe impl GlobalAlloc`

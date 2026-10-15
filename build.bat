@@ -21,14 +21,11 @@ rem Usage:  cmd /c build.bat [/skip-unit] [/skip-realtime]
 rem         (from Git Bash: MSYS_NO_PATHCONV=1 cmd /c build.bat)
 rem
 rem Run by hand with no arguments, every step runs (1/4 to 4/4 including 2b and 2c).
-rem tools/run_all_tests.py --full passes both switches, because it runs those steps
-rem itself (2026-10-08, docs/investigation/Test_Time_20261008_WIP.md):
-rem   /skip-unit      skip 2/4 (cargo test). run_all_tests.py runs the very same
-rem                   command as its cargo_test step, so it was run twice (S1).
-rem   /skip-realtime  skip 2b and 2c. run_all_tests.py runs them as its own steps:
-rem                   2b as peer_sim_loopback, 2c split in two groups (the timing
-rem                   tests one at a time, the rest in parallel) so that it takes
-rem                   a few minutes instead of seven (S3).
+rem Another test runner can pass the switches when it runs those steps itself:
+rem   /skip-unit      skip 2/4 (cargo test), when the runner runs the very same
+rem                   command, so it is not run twice.
+rem   /skip-realtime  skip 2b and 2c, when the runner runs them as its own steps
+rem                   (the timing tests one at a time, the rest in parallel).
 
 setlocal
 set "NoDefaultCurrentDirectoryInExePath="
@@ -78,22 +75,21 @@ if errorlevel 1 exit /b 1
 
 if defined SKIP_REALTIME goto after_realtime
 rem peer_sim's loopback tests (tests/loopback.rs) use real-time waits and are
-rem marked #[ignore] so the cheap run (tools/run_all_tests.py) skips them.
+rem marked #[ignore] so the cheap run skips them.
 rem The answer only changes when the source/build changes, so run them here,
-rem in the full run only, with --ignored (see the project test rules, Q1-Q3).
+rem in the full run only, with --ignored.
 echo === 2b/4 cargo test -p peer_sim --test loopback -- --ignored ===
 "%CARGO%" test --manifest-path "%ROOT%Cargo.toml" -p peer_sim --test loopback -- --ignored
 if errorlevel 1 exit /b 1
 
-rem The DLL's real-time tests (M2-1: the fake game + real UDP layer against
+rem The DLL's real-time tests (the fake game + real UDP layer against
 rem peer_sim over loopback, and the high-resolution timer precision) are also
-rem #[ignore]; run them here in the full run only. One at a time: the M7 pacer
-rem test measures OS wake-ups and failed once (7 late frames of 180) while the
-rem loopback tests spun the CPU next to it (2026-09-28).
+rem #[ignore]; run them here in the full run only. One at a time: the frame
+rem pacer test measures OS wake-ups and failed once (7 late frames of 180) while
+rem the loopback tests kept the processor busy next to it.
 rem The selection is the whole workspace plus --lib (not -p higanrtool_dll), the
-rem same way as step 2/4, so the DLL's test binary is not rebuilt (S4). That also
+rem same way as step 2/4, so the DLL's test binary is not rebuilt. That also
 rem picks up two tools that are run by hand only; they are skipped by name.
-rem MANUAL_TOOL_SKIPS in tools/run_all_tests.py has the same names (a test checks it).
 echo === 2c/4 cargo test --lib -- --ignored --test-threads=1 ===
 "%CARGO%" test --manifest-path "%ROOT%Cargo.toml" --lib -- --ignored --test-threads=1 --skip measure_ --skip built_build_bin_is_fresh
 if errorlevel 1 exit /b 1

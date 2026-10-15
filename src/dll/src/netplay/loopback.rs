@@ -145,7 +145,7 @@ fn run(case: Case) -> Outcome {
         host_seat: Seat::P2,
         seed: 0x51,
         follow: case.follow,
-        word_mask: SEND_MASK,
+        word_mask: MATCH_SEND_MASK,
         life: 3,
         poll_ms: 1,
         segs: SEGS,
@@ -512,7 +512,7 @@ fn peer_sim_waking_15_seconds_late_still_connects() {
         host_seat: Seat::P2,
         seed: 0x51,
         follow: false,
-        word_mask: SEND_MASK,
+        word_mask: MATCH_SEND_MASK,
         life: 3,
         poll_ms: 1,
         segs: 1,
@@ -897,7 +897,7 @@ fn menu_plan_walk(spectate: bool) {
         host_seat: Seat::P1,
         seed: 0x51,
         follow: true,
-        word_mask: SEND_MASK,
+        word_mask: MATCH_SEND_MASK,
         life: 3,
         poll_ms: 1,
         segs: 1,
@@ -998,19 +998,18 @@ fn menu_plan_walk(spectate: bool) {
     };
     let d = StepKind::Decide;
     let al = StepKind::Align;
+    // キャラ選択（8）は合わせない（相手の席は MENU の位置で書く）。
     let expected = vec![
         st(0, al, 1, 7),
         st(1, d, 1, 7),
-        st(2, al, 0x83, 8),
-        st(3, d, chara_value(0, false, 4), 8),
-        st(4, d, chara_value(1, false, 4), 8),
-        st(5, al, 14, 16),
-        st(6, d, 15, 16),
-        st(7, al, 0x44, 8),
-        st(8, d, chara_value(0, false, 4), 8),
-        st(9, d, chara_value(1, false, 2), 8),
-        st(10, al, 14, 16),
-        st(11, d, 13, 16),
+        st(2, d, chara_value(0, false, 4), 8),
+        st(3, d, chara_value(1, false, 4), 8),
+        st(4, al, 14, 16),
+        st(5, d, 15, 16),
+        st(6, d, chara_value(0, false, 4), 8),
+        st(7, d, chara_value(1, false, 2), 8),
+        st(8, al, 14, 16),
+        st(9, d, 13, 16),
     ];
     let dll_steps: Vec<Step> = np.step_log().iter().map(|r| r.step).collect();
     assert_eq!(dll_steps, expected, "dll の入った押下\n{summary}");
@@ -1151,7 +1150,7 @@ fn the_dll_as_guest_walks_the_selection_with_a_host_peer_sim() {
         host_seat: Seat::P2,
         seed: 0x51,
         follow: true,
-        word_mask: SEND_MASK,
+        word_mask: MATCH_SEND_MASK,
         life: 3,
         poll_ms: 1,
         segs: 1,
@@ -1237,7 +1236,8 @@ fn the_dll_as_guest_walks_the_selection_with_a_host_peer_sim() {
         .iter()
         .filter(|s| s.kind != StepKind::Align)
         .count();
-    assert_eq!((real, dll_steps.len() - real), (7, 5), "{dll_steps:?}");
+    // 合わせは難易度・マップの画面に入るたび（3 回）。キャラ選択は合わせない。
+    assert_eq!((real, dll_steps.len() - real), (7, 3), "{dll_steps:?}");
     assert_eq!(
         np.step_log().iter().filter(|r| r.own).count(),
         4,

@@ -21,8 +21,8 @@ pub const BROKEN: Tx = Tx {
 
 /// ネットワークを開けなかった（見張りを起こす前に断った・見張りが止められた）ときの文。
 pub const NOT_STARTED: Tx = Tx {
-    ja: "通信を始められませんでした（理由はログにあります）。この道具を渡してくれた人にログを送ってください。",
-    en: "Could not start networking (the reason is in the log). Send the log to the person who gave you this tool.",
+    ja: "通信を始められませんでした（理由はログにあります）。logsフォルダのファイルを添えて、GitHubのIssuesで知らせてください。",
+    en: "Could not start networking (the reason is in the log). Please report this on GitHub Issues with the files in the logs folder.",
 };
 
 pub const PEER_UNREADABLE: Tx = Tx {
@@ -41,12 +41,12 @@ pub const OWN_CODE: Tx = Tx {
 };
 
 pub const BOTH_OFFER: Tx = Tx {
-    ja: "2 人とも「始める側」の設定です。どちらか一方が HiganRTool.ini の code_side を answer にして、起動し直してください。",
+    ja: "2人とも「始める側」の設定です。どちらか一方がHiganRTool.iniのcode_sideをanswerにして、起動し直してください。",
     en: "Both players are set to the offer side. One of you: set code_side to answer in HiganRTool.ini and start the game again.",
 };
 
 pub const BOTH_ANSWER: Tx = Tx {
-    ja: "2 人とも「返す側」の設定です。どちらか一方が HiganRTool.ini の code_side を offer にして、起動し直してください。",
+    ja: "2人とも「返す側」の設定です。どちらか一方がHiganRTool.iniのcode_sideをofferにして、起動し直してください。",
     en: "Both players are set to the answer side. One of you: set code_side to offer in HiganRTool.ini and start the game again.",
 };
 
@@ -66,7 +66,7 @@ pub const ANSWER_WAITING: Tx = Tx {
 };
 
 pub const ENDED_UNCONNECTED: Tx = Tx {
-    ja: "相手と接続できないまま終わりました。もう一度試すときは、2 人ともゲームを閉じて起動し直してください。",
+    ja: "相手と接続できないまま終わりました。もう一度試すときは、2人ともゲームを閉じて起動し直してください。",
     en: "Ended without connecting. To try again, both players close the game and start it again.",
 };
 
@@ -107,13 +107,13 @@ pub const WATCH_ENDED_UNCONNECTED: Tx = Tx {
 
 /// ウィンドウで選んだ rollback を採れなかったときに「状態」の行へ足す文（`NetSettings` の ini が delay 方式）。
 pub const ROLLBACK_INI_DELAY: Tx = Tx {
-    ja: "ウィンドウで選んだ rollback は使えません（設定ファイルが delay 方式になっているため）。delay 方式で接続します。",
+    ja: "ウィンドウで選んだrollbackは使えません（設定ファイルがdelay方式になっているため）。delay方式で接続します。",
     en: "The rollback you chose in the window cannot be used (the setting file says delay mode). Connecting in delay mode.",
 };
 
 /// 同じく、この起動で rollback の準備ができなかったとき。
 pub const ROLLBACK_NOT_READY: Tx = Tx {
-    ja: "ウィンドウで選んだ rollback は使えません（この起動では rollback の準備ができなかったため。理由はログにあります）。delay 方式で接続します。",
+    ja: "ウィンドウで選んだrollbackは使えません（この起動ではrollbackの準備ができなかったため。理由はログにあります）。delay方式で接続します。",
     en: "The rollback you chose in the window cannot be used (rollback was not ready in this start; the reason is in the log). Connecting in delay mode.",
 };
 
@@ -146,7 +146,7 @@ pub fn offer_waiting(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
         Lang::Ja => format!(
-            "相手から返ってくるコードを待っています（自分のコードは {span}で使えなくなります）。"
+            "相手から返ってくるコードを待っています（自分のコードは{span}で使えなくなります）。"
         ),
         Lang::En => {
             format!("Waiting for the reply code from your opponent (your code expires in {span}).")
@@ -199,7 +199,7 @@ pub fn watch_read(lang: Lang, who: &str) -> String {
 pub fn no_route(lang: Lang, scope: &str) -> String {
     match lang {
         Lang::Ja => format!(
-            "今の設定（scope = {scope}）では相手に接続できません。同じ家の中の相手なら HiganRTool.ini の scope を lan に、インターネットの向こうの相手なら internet にして、起動し直してください。"
+            "今の設定（scope = {scope}）では相手に接続できません。同じ家の中の相手ならHiganRTool.iniのscopeをlanに、インターネットの向こうの相手ならinternetにして、起動し直してください。"
         ),
         Lang::En => format!(
             "Cannot reach the opponent with the current settings (scope = {scope}). For an opponent on your LAN, set scope to lan in HiganRTool.ini; for one over the internet, set it to internet. Then start the game again."
@@ -215,8 +215,8 @@ pub fn connected(
 ) -> String {
     use higanr_core::wire::{Mode, Seat};
     let who = match (lang, seat) {
-        (Lang::Ja, Some(Seat::P1)) => "接続しました。あなたは 1P です。",
-        (Lang::Ja, Some(Seat::P2)) => "接続しました。あなたは 2P です。",
+        (Lang::Ja, Some(Seat::P1)) => "接続しました。あなたは1Pです。",
+        (Lang::Ja, Some(Seat::P2)) => "接続しました。あなたは2Pです。",
         (Lang::Ja, None) => "接続しました。",
         (Lang::En, Some(Seat::P1)) => "Connected. You are 1P.",
         (Lang::En, Some(Seat::P2)) => "Connected. You are 2P.",
@@ -226,7 +226,7 @@ pub fn connected(
         (Lang::Ja, Some((Mode::Rollback, d))) => {
             format!("{who}（rollback・ディレイ {d} フレーム）")
         }
-        (Lang::Ja, Some((Mode::Delay, d))) => format!("{who}（delay 方式・ディレイ {d} フレーム）"),
+        (Lang::Ja, Some((Mode::Delay, d))) => format!("{who}（delay方式・ディレイ {d} フレーム）"),
         (Lang::En, Some((Mode::Rollback, d))) => format!("{who} (rollback, delay {d})"),
         (Lang::En, Some((Mode::Delay, d))) => format!("{who} (delay mode, delay {d})"),
         (_, None) => who.to_string(),
@@ -279,12 +279,12 @@ pub fn status_header(lang: Lang, side: Side, secs: f32) -> String {
     match lang {
         Lang::Ja => {
             let side = match side {
-                Side::Offer => "始める側 offer",
-                Side::Answer => "返す側 answer",
-                Side::Spectate => "見るだけの側 spectate",
-                Side::Game => "ゲームの中のメニュー game",
+                Side::Offer => "始める側（offer）",
+                Side::Answer => "返す側（answer）",
+                Side::Spectate => "見るだけの側（spectate）",
+                Side::Game => "ゲームの中のメニュー（game）",
             };
-            format!("HiganRTool の接続コード（{side}）。開いてから {secs:.1} 秒の時点:")
+            format!("HiganRToolの接続コード：{side}。開いてから{secs:.1}秒の時点:")
         }
         Lang::En => {
             let side = match side {
@@ -347,6 +347,18 @@ mod tests {
         }
     }
 
+    /// 壊れたら落ちる: 公開した後の利用者に「この道具を渡してくれた人」へ送るよう案内する（報告先は GitHub の Issues）。
+    #[test]
+    fn the_failure_text_points_at_github_issues_not_at_whoever_handed_over_the_tool() {
+        assert!(
+            NOT_STARTED.ja.contains("GitHubのIssues") && NOT_STARTED.ja.contains("logsフォルダ")
+        );
+        assert!(NOT_STARTED.en.contains("GitHub Issues") && NOT_STARTED.en.contains("logs folder"));
+        for t in [NOT_STARTED.ja, NOT_STARTED.en] {
+            assert!(!t.contains("渡して") && !t.contains("gave you"), "{t}");
+        }
+    }
+
     #[test]
     fn formatted_texts_differ_by_language_and_keep_the_values() {
         let who = "Bob";
@@ -385,7 +397,7 @@ mod tests {
             assert!(!has_japanese(en), "{en}");
         }
         assert!(expired(Lang::En, 1800).contains("30 min"));
-        assert!(expired(Lang::Ja, 1800).contains("30 分"));
+        assert!(expired(Lang::Ja, 1800).contains("30分"));
         assert!(gave_up(Lang::En, 45).contains("45 s"));
         assert!(reply_read(Lang::En, who).contains("\"Bob\""));
         assert!(no_route(Lang::En, "lan").contains("scope = lan"));
@@ -428,7 +440,7 @@ mod tests {
         assert_eq!(connected(Lang::En, None, None), "Connected.");
         assert_eq!(
             connected(Lang::Ja, Some(Seat::P1), Some((Mode::Rollback, 2))),
-            "接続しました。あなたは 1P です。（rollback・ディレイ 2 フレーム）"
+            "接続しました。あなたは1Pです。（rollback・ディレイ 2 フレーム）"
         );
     }
 

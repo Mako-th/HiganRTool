@@ -16,8 +16,8 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use higanr_core::autosave::{
-    self, ANSI_PATH_MAX, GateScene, NAME_BUF, SaveGate, SaveKind, VAULT_DIR, clock_name,
-    exe_dir_of, result_of,
+    self, ANSI_PATH_MAX, ChargeSync, GateScene, NAME_BUF, SaveGate, SaveKind, VAULT_DIR,
+    clock_name, exe_dir_of, result_of,
 };
 use higanr_core::handshake::Name;
 use higanr_core::replay::{self, Mark, MarkRead, MarkRole, MatchResult, Side, Timestamp};
@@ -33,8 +33,8 @@ use crate::names::is_same_or_inside;
 use crate::netplay::{NetPlay, SCENE_MATCH};
 use crate::th09_addr::{
     GAME_MODE_MATCH, PLAYER_BOSS_ATTACKS, PLAYER_BOSS_REVERSALS, PLAYER_LIFE, PLAYER_SPELL_ATTACKS,
-    REPLAY_HEADER_LEN, RNG_LEN, SAVE_EST_BASE, SAVE_EST_PER_CHUNK, SAVE_EST_PER_STAGE,
-    SAVE_EST_STAGES, STATS_SCORE,
+    REPLAY_HEADER_CHARGE, REPLAY_HEADER_LEN, RNG_LEN, SAVE_EST_BASE, SAVE_EST_PER_CHUNK,
+    SAVE_EST_PER_STAGE, SAVE_EST_STAGES, STATS_SCORE,
 };
 
 /// メニューの印が何 tick 続いたら呼ぶか。adonis rev5 と同じ 6。メニューは最初の 4 フレームは入力を見ず、決めてから次の要求を
@@ -281,6 +281,8 @@ pub struct SaveRecord {
     pub manager: u32,
     /// 1P の勝ち数・2P の勝ち数・勝ちに要る数。
     pub wins: [u32; 3],
+    /// 見出しのチャージ型を設定の写しに合わせた結果（保存の直前）。
+    pub charge: ChargeSync,
 }
 
 /// 記録の語の数（先頭の 13 語、10 語の配列 4 つ、乱数 12 バイト × 3）。
@@ -331,7 +333,7 @@ impl SaveRecord {
         w[7] = self.need;
         w[8] = self.manager;
         w[9..12].copy_from_slice(&self.wins);
-        w[12] = 0;
+        w[12] = self.charge.to_word();
         let mut i = 13;
         for arr in [&self.seen, &self.real, &self.written, &self.chunks] {
             w[i..i + STAGES].copy_from_slice(arr);
@@ -394,6 +396,7 @@ impl SaveRecord {
             need: w[7],
             manager: w[8],
             wins: [w[9], w[10], w[11]],
+            charge: ChargeSync::from_word(w[12])?,
             seen: arr(13),
             real: arr(13 + STAGES),
             written: arr(13 + 2 * STAGES),
@@ -688,6 +691,10 @@ pub trait SaveIo {
     fn replay_manager(&mut self) -> u32;
     /// `[rm + 0x114]`（落ちない読み方。読めなければ `None`）。
     fn replay_mode(&mut self, rm: u32) -> Option<u32>;
+    /// 見出し `[rm + 8]` の日付と名前（再生の見張りが、どのリプレイかを行に残すため）。読めなければ `None`。
+    fn replay_ident(&mut self, _rm: u32) -> Option<crate::replay_watch::HeaderIdent> {
+        None
+    }
     fn signature_ok(&mut self) -> bool;
     fn estimate_real(&mut self, rm: u32) -> Option<EstimateReal>;
     /// （1P の勝ち数, 2P の勝ち数, 勝ちに要る数）。
@@ -702,6 +709,9 @@ pub trait SaveIo {
     fn completed_rounds(&mut self) -> u32;
     /// いまの tick の値を境目として読む（`completed_rounds` が増えた tick にだけ呼ぶ。席の塊が読めなければその席は `None`）。
     fn read_boundary(&mut self) -> Boundary;
+    /// 保存関数を呼ぶ直前に、見出し `[[0x4A7E64]+8]` のチャージ型（`+0x190` / `+0x191`）を、ゲームの設定の写し `[0x4A7E78]` の
+    /// `+0xB4` / `+0xB5`（生きた試合が使った値）に合わせる。ポインタが 0 か読めないときは書かない。
+    fn sync_header_charge(&mut self, rm: u32) -> ChargeSync;
     /// 踏み台で保存関数を呼ぶ。ゲームの見積もりが読む 10 語へ `est.flags`（本当の印）を書いてから見積もりを計算し、`need` より小さければ呼ばない。
     fn call_save(
         &mut self,
@@ -914,6 +924,8 @@ impl Driver {
         let seat = net.map_or(Seat::P1, |n| n.seat);
         let side = side_of(seat);
         let result = result_of(kind, side, wins[0], wins[1], wins[2]);
+        // 見出しは読み込みスレッドが手元の cfg から写したままなので、生きた試合の値に直してから保存する。
+        let charge = io.sync_header_charge(rm);
         let before = io.read_rng();
         let t0 = io.now_us();
         let out = io.call_save(rm, h.path_addr(), &name, &est, need);
@@ -946,6 +958,7 @@ impl Driver {
             rng: [before, after_call, after_restore],
             manager: rm,
             wins,
+            charge,
         });
         Attempt::Recorded
     }
@@ -990,6 +1003,8 @@ pub struct Worker {
     backoff: u32,
     saves: u32,
     marks: u32,
+    /// 見出しのチャージ型を合わせられなかった保存の数。
+    charge_failures: u32,
     /// このワーカー（このプロセス）が押さえた名前。古い予約を消すときに、これは消さない。
     mine: Vec<PathBuf>,
     since_touch: u32,
@@ -1077,6 +1092,7 @@ impl Worker {
             backoff: 0,
             saves: 0,
             marks: 0,
+            charge_failures: 0,
             mine: Vec::new(),
             since_touch: 0,
             touch_error: None,
@@ -1491,7 +1507,12 @@ impl Worker {
     /// `side` は 1、結果は 1P から見たもの、`lat`・`ping` は 0。どちらの印にも、マッチの記録（`summary`。ネットワークの対戦でなければ同期方式・通信の要約・
     /// 何マッチ目は付かない）を足す。
     fn mark_of(&self, info: &MatchInfo, r: &SaveRecord, summary: &MatchSummary) -> Mark {
-        let detail = Some(summary.detail(BUILD_NUMBER));
+        let mut detail = summary.detail(BUILD_NUMBER);
+        // 見出しへ書いたのと同じ値だけを印に残す（書けなかったときは項目を出さない）。
+        if let ChargeSync::Written { p1, p2 } = r.charge {
+            detail.charge = Some([p1, p2]);
+        }
+        let detail = Some(detail);
         if let Watching::Names([a, b]) = info.watching {
             return Mark {
                 peer: String::new(),
@@ -1573,6 +1594,7 @@ impl Worker {
             r.wins[1],
             r.wins[2],
         );
+        self.log_charge(r.charge);
         let _ = writeln!(
             self.out,
             "  乱数: 前 [{}] / 呼んだ後 [{}] / 戻した後 [{}]（前と同じ = {}）",
@@ -1618,6 +1640,31 @@ impl Worker {
                 r.base
             );
         }
+    }
+
+    /// 見出しのチャージ型の行。書けなかった回は数えて、理由を ★ 付きで出す。
+    fn log_charge(&mut self, c: ChargeSync) {
+        let why = match c {
+            ChargeSync::Written { p1, p2 } => {
+                let _ = writeln!(
+                    self.out,
+                    "  見出しのチャージ型: 1P = {p1} / 2P = {p2} を設定の写しから見出し（+0x{REPLAY_HEADER_CHARGE:X} / +0x{:X}）へ書いた",
+                    REPLAY_HEADER_CHARGE + 1
+                );
+                return;
+            }
+            ChargeSync::NotTried => "試みていない",
+            ChargeSync::NoCopy => "設定の写しのポインタが 0 か読めない",
+            ChargeSync::NoHeader => "見出しのポインタが 0 か読めない",
+            ChargeSync::CopyUnreadable => "設定の写しの中のチャージ型が読めない",
+            ChargeSync::WriteFailed => "見出しへ書けなかった",
+        };
+        self.charge_failures += 1;
+        let _ = writeln!(
+            self.out,
+            "  ★ 見出しのチャージ型を合わせられなかった（{why}。この実行で {} 回目）。見出しは手元の cfg の値のまま",
+            self.charge_failures
+        );
     }
 
     fn log_skips(&mut self, h: &Handoff) {
@@ -1666,6 +1713,9 @@ pub(crate) mod tests {
         pub mode: u32,
         pub rm: u32,
         pub replay_mode: Option<u32>,
+        /// `replay_mode` を読まれた回数。
+        pub mode_reads: u32,
+        pub ident: Option<crate::replay_watch::HeaderIdent>,
         pub sig_ok: bool,
         pub est: Option<EstimateReal>,
         pub seen: [u32; STAGES],
@@ -1682,6 +1732,10 @@ pub(crate) mod tests {
         pub sides: [Option<SideSnap>; 2],
         pub utc: u64,
         pub boundary_reads: u32,
+        /// `sync_header_charge` が返す値、呼ばれた回数、保存関数が呼ばれた時点でそれが済んでいたか（確保しない形で持つ）。
+        pub charge: ChargeSync,
+        pub syncs: u32,
+        pub synced_at_call: Option<bool>,
     }
 
     impl Default for FakeGame {
@@ -1694,6 +1748,8 @@ pub(crate) mod tests {
                 mode: GAME_MODE_MATCH,
                 rm: 0x0123_4560,
                 replay_mode: Some(0),
+                mode_reads: 0,
+                ident: None,
                 sig_ok: true,
                 est: Some(EstimateReal {
                     base: SAVE_EST_BASE,
@@ -1720,6 +1776,9 @@ pub(crate) mod tests {
                 sides: [None; 2],
                 utc: 1_790_000_000,
                 boundary_reads: 0,
+                charge: ChargeSync::Written { p1: 1, p2: 0 },
+                syncs: 0,
+                synced_at_call: None,
             }
         }
     }
@@ -1741,7 +1800,11 @@ pub(crate) mod tests {
             self.rm
         }
         fn replay_mode(&mut self, _rm: u32) -> Option<u32> {
+            self.mode_reads += 1;
             self.replay_mode
+        }
+        fn replay_ident(&mut self, _rm: u32) -> Option<crate::replay_watch::HeaderIdent> {
+            self.ident
         }
         fn signature_ok(&mut self) -> bool {
             self.sig_ok
@@ -1779,6 +1842,10 @@ pub(crate) mod tests {
                 side: self.sides,
             }
         }
+        fn sync_header_charge(&mut self, _rm: u32) -> ChargeSync {
+            self.syncs += 1;
+            self.charge
+        }
         fn call_save(
             &mut self,
             _rm: u32,
@@ -1787,6 +1854,7 @@ pub(crate) mod tests {
             est: &EstimateReal,
             need: u32,
         ) -> CallOut {
+            self.synced_at_call = Some(self.syncs > 0);
             // 踏み台の約束のコピー: 書く前の 10 語を返し、本当の印を書いて、書いた後の 10 語で見積もる。
             let written = est.flags;
             let game_est = game_estimate(est.base, &written, &est.chunks);
@@ -1850,6 +1918,73 @@ pub(crate) mod tests {
         let a = menu_ticks(&mut d, &h, &mut g, MENU_SETTLE_TICKS);
         assert_eq!(a, vec![Attempt::Recorded]);
         assert_eq!(g.calls, 1);
+    }
+
+    /// 壊れたら落ちる: 保存の前に見出しを直さない・保存の後に直す・パスを取れない tick で直す・記録に結果を残さない。
+    #[test]
+    fn the_header_charge_is_synced_right_before_the_call_and_only_when_calling() {
+        let h = Handoff::new();
+        let mut d = Driver::new();
+        let mut g = FakeGame::default();
+        // パスの準備が無い（ST_READY でない）間は、保存を試みても見出しに触らない。
+        let a = menu_ticks(&mut d, &h, &mut g, MENU_SETTLE_TICKS);
+        assert_eq!(a, vec![Attempt::Retry(Skip::NotReady)]);
+        assert_eq!((g.syncs, g.synced_at_call), (0, None));
+        ready(&h);
+        let a = menu_ticks(&mut d, &h, &mut g, 1);
+        assert_eq!(a, vec![Attempt::Recorded]);
+        assert_eq!((g.syncs, g.synced_at_call), (1, Some(true)));
+        let r = h.read_record().unwrap();
+        assert_eq!(r.charge, ChargeSync::Written { p1: 1, p2: 0 });
+    }
+
+    /// 壊れたら落ちる: 席の入れ替え・書けなかったのに印へ残す・失敗を数えない。
+    #[test]
+    fn the_mark_keeps_the_charge_that_was_written_and_a_failure_is_counted() {
+        for (charge, want, failed) in [
+            (ChargeSync::Written { p1: 1, p2: 0 }, Some([1, 0]), false),
+            (ChargeSync::Written { p1: 0, p2: 1 }, Some([0, 1]), false),
+            (ChargeSync::NoCopy, None, true),
+            (ChargeSync::NoHeader, None, true),
+            (ChargeSync::CopyUnreadable, None, true),
+            (ChargeSync::WriteFailed, None, true),
+        ] {
+            let dir = temp_dir("charge_mark");
+            let h = Handoff::new();
+            let mut d = Driver::new();
+            let mut g = FakeGame {
+                charge,
+                ..FakeGame::default()
+            };
+            d.tick(&h, &mut g, None);
+            let (mut w, log) = worker(Split::Peer);
+            let mut os = FakeOs::at(&dir);
+            w.step(&h, &mut os);
+            assert_eq!(h.state(), ST_READY, "{}", log.text());
+            menu_ticks(&mut d, &h, &mut g, MENU_SETTLE_TICKS);
+            assert_eq!(h.state(), ST_USED);
+            let f = dir.join(VAULT_DIR).join("1P vs 2P").join("th9_ud0001.rpy");
+            fs::write(&f, synthetic_replay()).unwrap();
+            w.step(&h, &mut os);
+            let text = log.text();
+            let (_, det) = read_detail(&f);
+            assert_eq!(det.charge, want, "{charge:?}\n{text}");
+            assert_eq!(
+                text.contains("★ 見出しのチャージ型を合わせられなかった"),
+                failed,
+                "{charge:?}\n{text}"
+            );
+            if let ChargeSync::Written { p1, p2 } = charge {
+                assert!(
+                    text.contains(&format!("見出しのチャージ型: 1P = {p1} / 2P = {p2} を")),
+                    "{text}"
+                );
+                assert!(text.contains("+0x190 / +0x191"), "{text}");
+            } else {
+                assert!(text.contains("この実行で 1 回目"), "{text}");
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -2171,6 +2306,7 @@ pub(crate) mod tests {
             ],
             manager: 0x0BAD_F00D,
             wins: [1, 2, 3],
+            charge: ChargeSync::Written { p1: 0, p2: 1 },
         };
         assert_eq!(SaveRecord::from_words(&r.to_words()), Some(r));
         let mut w = r.to_words();
@@ -2987,6 +3123,7 @@ pub(crate) mod tests {
             rng: [[0; RNG_BYTES]; 3],
             manager: 0,
             wins: [2, 0, 2],
+            charge: ChargeSync::Written { p1: 1, p2: 0 },
         }
     }
 

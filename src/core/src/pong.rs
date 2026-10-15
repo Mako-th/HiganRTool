@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use crate::auth::AuthKey;
 use crate::candidate::{Candidates, Learned};
 use crate::seal::{Opener, Sealer, Seq};
-use crate::wire::{self, MAX_DATAGRAM, Message};
+use crate::wire::{self, ByeReason, MAX_DATAGRAM, Message};
 
 /// 受信スレッドの PONG の応答役（繋がった後のセッションの値のコピー）。接続ごとに 1 つ。
 ///
@@ -90,6 +90,36 @@ impl PongResponder {
         bytes: &[u8],
         out: &mut [u8; MAX_DATAGRAM],
     ) -> Option<(SocketAddr, usize)> {
+        let send_time = self.real_ping(from, bytes)?;
+        self.seal_to_path(seq, &Message::Pong { send_time }, out)
+    }
+
+    /// `answer` と同じガードで、本物の PING への返しを PONG の代わりに BYE にする（自分のゲームスレッドが止まった後、閉じたことを
+    /// 相手の PING のたびに知らせ直す。セッションの `Liveness::close` の後と同じ形）。
+    pub fn answer_bye(
+        &self,
+        seq: &Seq,
+        from: SocketAddr,
+        bytes: &[u8],
+        reason: ByeReason,
+        out: &mut [u8; MAX_DATAGRAM],
+    ) -> Option<(SocketAddr, usize)> {
+        self.real_ping(from, bytes)?;
+        self.seal_to_path(seq, &Message::Bye(reason), out)
+    }
+
+    /// 頼まれずに出す BYE（返す先は経路）。
+    pub fn bye(
+        &self,
+        seq: &Seq,
+        reason: ByeReason,
+        out: &mut [u8; MAX_DATAGRAM],
+    ) -> Option<(SocketAddr, usize)> {
+        self.seal_to_path(seq, &Message::Bye(reason), out)
+    }
+
+    /// 本物の PING なら send_time。
+    fn real_ping(&self, from: SocketAddr, bytes: &[u8]) -> Option<u32> {
         // 先に type だけを見る（INPUT などにタグの計算を足さない）。
         if !wire::peek_is_ping(bytes) {
             return None;
@@ -101,17 +131,20 @@ impl PongResponder {
             return None;
         }
         let pkt = wire::decode(&self.key, Some(&self.open), bytes).ok()?;
-        let Message::Ping { send_time } = pkt.msg else {
-            return None;
-        };
+        match pkt.msg {
+            Message::Ping { send_time } => Some(send_time),
+            _ => None,
+        }
+    }
+
+    fn seal_to_path(
+        &self,
+        seq: &Seq,
+        msg: &Message,
+        out: &mut [u8; MAX_DATAGRAM],
+    ) -> Option<(SocketAddr, usize)> {
         // 通し番号を使い切っていたら返さない（手順の上では起きない）。
-        let n = wire::seal(
-            &self.seal,
-            seq,
-            self.session_id,
-            &Message::Pong { send_time },
-            out,
-        )?;
+        let n = wire::seal(&self.seal, seq, self.session_id, msg, out)?;
         Some((self.path, n))
     }
 }
@@ -263,6 +296,47 @@ mod tests {
             );
         }
         assert_eq!(seq.next(), 30, "3 つの送り手が同じ番号の入れ物を進める");
+    }
+
+    #[test]
+    fn the_bye_answers_and_the_unasked_bye_reach_the_path_on_the_same_sequence() {
+        let seq = Seq::new();
+        let r = responder();
+        let mut out = [0u8; MAX_DATAGRAM];
+        let (to, n) = r.bye(&seq, ByeReason::Cancelled, &mut out).unwrap();
+        assert_eq!(to, sa("127.0.0.1:4002"));
+        assert_eq!(
+            read_at_peer(&out[..n]).map(|p| p.msg),
+            Ok(Message::Bye(ByeReason::Cancelled))
+        );
+        let (to, n) = r
+            .answer_bye(
+                &seq,
+                sa("127.0.0.1:4001"),
+                &ping(3),
+                ByeReason::Cancelled,
+                &mut out,
+            )
+            .expect("本物の PING に BYE を返さない");
+        assert_eq!(to, sa("127.0.0.1:4002"));
+        assert_eq!(
+            read_at_peer(&out[..n]).map(|p| p.msg),
+            Ok(Message::Bye(ByeReason::Cancelled))
+        );
+        let field: [u8; NONCE_FIELD_LEN] = out[HEADER_LEN..HEADER_LEN + NONCE_FIELD_LEN]
+            .try_into()
+            .unwrap();
+        assert_eq!(read_nonce_field(&field), (Sender::Pong as u8, 1));
+        // PING でない・候補の外の送り元には返さない（ガードは `answer` と同じ）。
+        let pong = packet(SID, &Message::Pong { send_time: 3 });
+        for (from, bytes) in [("127.0.0.1:4001", &pong), ("127.0.0.1:4003", &ping(3))] {
+            assert_eq!(
+                r.answer_bye(&seq, sa(from), bytes, ByeReason::Cancelled, &mut out),
+                None,
+                "{from}"
+            );
+        }
+        assert_eq!(seq.next(), 2, "返さなかった分は番号を使わない");
     }
 
     #[test]

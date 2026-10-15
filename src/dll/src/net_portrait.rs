@@ -1,4 +1,5 @@
-//! ネットの選択のキャラ選択で、dll が決定の tick にカーソルを書いたとき、立ち絵と席の目印を追わせる呼び出しを決める（pure）。
+//! ネットの選択のキャラ選択で、dll がカーソルを書いたとき（決定の tick と、相手の席の位置）、立ち絵と席の目印を追わせる呼び出しを
+//! 決める（pure）。
 //!
 //! 立ち絵を動かすのはゲームの移動の経路（カーソルを ±1 → 解放されていない席を飛ばす → 立ち絵の関数 2 回 → 席の目印の関数）
 //! だけで、dll はカーソルを直に書くので、書いた tick にはどれも走らない。ここは「呼ぶか・どの関数を・どの引数で」だけを決め、
@@ -61,6 +62,17 @@ pub enum Followed {
     Refused,
 }
 
+/// 手元で未解放のキャラへ書いたときも呼ぶか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locked {
+    /// 呼ばない（決定の tick のカーソル合わせ）。
+    Refuse,
+    /// 呼ぶ（相手の席の位置。相手の手元では解放済みで、こちらの画面にも相手のキャラの立ち絵を出す）。立ち絵の 2 本 `0x00424EDD` は
+    /// 16 本の部品を全部触り、解放の印を読まない。席の目印 `0x00425233` は解放済みのアイコンの数で位置を決めるので、未解放のキャラ
+    /// では次の解放済みのマスに載る。どちらも逆アセンブルからの見込みで、実機の絵では確かめていない。
+    Allow,
+}
+
 /// `plan` がゲートとして読むゲームの状態（どちらも落ちない読み方で、確保しない）。
 pub trait PortraitEnv {
     /// キャラが手元で解放済みか（`[0x4A81CC + キャラ]`。`0x0042306E`）。書いたカーソルのキャラだけを尋ねる（ゲームは
@@ -85,7 +97,13 @@ fn chara_of(cursor: u32) -> Option<u32> {
 /// （`0x00428A90`〜`0x00428AA5` の `jle` と `0x00428C05`〜`0x00428C23` の `jge`）が、決定の tick に `0x00424FB0` を呼ぶと立ち絵が
 /// 入れ替わらず、マップの画面まで前のキャラが残った（実測: 増える向きで 2 回とも。減る向きは入れ替わった）。
 /// `0x00424FB0` は中で ANM の VM を回さない。
-pub fn plan(v: &MenuView, seat: usize, new_cursor: u32, env: &mut impl PortraitEnv) -> Plan {
+pub fn plan(
+    v: &MenuView,
+    seat: usize,
+    new_cursor: u32,
+    locked: Locked,
+    env: &mut impl PortraitEnv,
+) -> Plan {
     let other = match seat {
         0 => 1,
         1 => 0,
@@ -110,7 +128,7 @@ pub fn plan(v: &MenuView, seat: usize, new_cursor: u32, env: &mut impl PortraitE
     let Ok(own_byte) = u8::try_from(own) else {
         return Plan::Refused;
     };
-    if !env.unlocked(own_byte) {
+    if locked == Locked::Refuse && !env.unlocked(own_byte) {
         return Plan::Refused;
     }
     let Some(m) = env.ready() else {
@@ -184,7 +202,7 @@ mod tests {
     }
 
     fn go(v: &MenuView, seat: usize, new: u32) -> Plan {
-        plan(v, seat, new, &mut Fake::open())
+        plan(v, seat, new, Locked::Refuse, &mut Fake::open())
     }
 
     fn calls(p: Plan) -> [PortraitCall; 3] {
@@ -292,7 +310,10 @@ mod tests {
         let mut env = Fake::open();
         for seat in [0usize, 1] {
             let same = view().chara_cursor[seat];
-            assert_eq!(plan(&view(), seat, same, &mut env), Plan::Unchanged);
+            assert_eq!(
+                plan(&view(), seat, same, Locked::Refuse, &mut env),
+                Plan::Unchanged
+            );
         }
         assert_eq!((env.asked_ready, env.asked_unlocked.len()), (0, 0));
     }
@@ -314,10 +335,18 @@ mod tests {
         }
         let mut no_m = Fake::open();
         no_m.m = None;
-        assert_eq!(plan(&v, 0, 6, &mut no_m), Plan::Refused, "M か署名");
+        assert_eq!(
+            plan(&v, 0, 6, Locked::Refuse, &mut no_m),
+            Plan::Refused,
+            "M か署名"
+        );
         let mut locked = Fake::open();
         locked.unlocked = false;
-        assert_eq!(plan(&v, 0, 7, &mut locked), Plan::Refused, "未解放");
+        assert_eq!(
+            plan(&v, 0, 7, Locked::Refuse, &mut locked),
+            Plan::Refused,
+            "未解放"
+        );
         assert_eq!(
             locked.asked_unlocked,
             vec![0x0E],
@@ -332,5 +361,41 @@ mod tests {
         let mut w = v;
         w.chara_cursor[1] = 99;
         assert_eq!(go(&w, 0, 6), Plan::Refused, "相手のカーソルが範囲の外");
+    }
+
+    /// 壊れたら落ちる: 相手の席の位置の経路で未解放の門を残す（相手が手元で未解放のキャラに居ると、前のキャラの立ち絵が残る）。
+    /// ほかの門は残ることも見る。
+    #[test]
+    fn the_peer_position_path_calls_even_for_a_locally_locked_chara() {
+        let v = view();
+        let mut locked = Fake::open();
+        locked.unlocked = false;
+        let c = calls(plan(&v, 1, 7, Locked::Allow, &mut locked));
+        assert_eq!(c[0], call(PortraitFn::Slide, [0x0E, 0x5D, 16, 2]));
+        assert!(locked.asked_unlocked.is_empty(), "解放の印を読まない");
+        for bad in [
+            MenuView { screen: 16, ..v },
+            MenuView { sub: 0, ..v },
+            MenuView { trans: 1, ..v },
+        ] {
+            let mut env = Fake::open();
+            env.unlocked = false;
+            assert_eq!(
+                plan(&bad, 1, 7, Locked::Allow, &mut env),
+                Plan::Refused,
+                "{bad:?}"
+            );
+        }
+        let mut no_m = Fake::open();
+        no_m.m = None;
+        assert_eq!(
+            plan(&v, 1, 7, Locked::Allow, &mut no_m),
+            Plan::Refused,
+            "M か署名"
+        );
+        assert_eq!(
+            plan(&v, 1, 9, Locked::Allow, &mut Fake::open()),
+            Plan::Unchanged
+        );
     }
 }

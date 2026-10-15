@@ -1,9 +1,9 @@
 //! プレイヤー名（ゲーム内メニューの「名前」。pure・確保しない）。
 //!
 //! 名前は HELLO で相手に名乗る値（`handshake::Name`。UTF-8 の 32 バイトまで）で、ini の `name` が元になる。
-//! ここはウィンドウで打つ名前の文字の決まり・編集・覚えるファイルの文字だけで、文字の受け取りとファイルの読み書きは dll の仕事。
+//! ここはウィンドウで打つ名前の文字の決まり・編集だけで、文字の受け取りと ini の書き換えは dll の仕事。
 //! 打てる文字は ASCII の英数字・`-`・`_`・`@`（ルーム名と同じ）で、最大 `wire::NAME_MAX`（32 バイト）= 32 文字。
-//! ini の `name` や手書きのファイルの名前は検査しない（任意の UTF-8 を 32 バイトで切る）。ウィンドウで打ち直すときは空から始める。
+//! ini の `name` は検査しない（任意の UTF-8 を 32 バイトで切る）。ウィンドウで打ち直すときは空から始める。
 
 use crate::room::RoomName;
 use crate::room_input::{Edit, TextKey, UNIT_BACKSPACE, classify_by};
@@ -12,12 +12,15 @@ use crate::wire::NAME_MAX;
 /// 名前の長さの上限（バイト）。HELLO の name の欄（`wire::NAME_MAX`）と同じ。
 pub const PLAYER_NAME_MAX: usize = NAME_MAX;
 
-/// 覚えるファイルの名前（`code_dir` の側に置き、ゲームのフォルダには書かない）。
+/// 以前の版が名前を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、起動のときに ini の `name` へ移して消す。
 pub const PLAYER_NAME_FILE: &str = "player_name.txt";
 
 /// `NameBuf` を原子変数の語に詰めた長さ（32 バイトを 4 バイトずつ ＋ 長さ 1 語）。
 pub const NAME_BUF_WORDS: usize = PLAYER_NAME_MAX / 4 + 1;
 const _: () = assert!(PLAYER_NAME_MAX.is_multiple_of(4));
+
+/// 利用者が名前を決めていない間の名前（配る ini の `name` の値）。メニューは、これのままの間「設定」でプレイヤー名を決めるよう案内する。
+pub const DEFAULT_NAME: &str = "HiganRTool";
 
 /// 名前に打てる文字か（ASCII の英数字・`-`・`_`・`@`）。文字の表はルーム名の `RoomName::accepts_char` の 1 か所に置く。
 pub fn accepts_char(c: char) -> bool {
@@ -118,6 +121,11 @@ impl NameBuf {
         b
     }
 
+    /// 既定の名前（`DEFAULT_NAME`）のままか。
+    pub fn is_default(&self) -> bool {
+        self.as_str() == DEFAULT_NAME
+    }
+
     /// `lossy` が `?` に直した文字を含まないか。含むならウィンドウでの打ち直しは空から始める。
     pub fn is_editable(&self) -> bool {
         self.as_str().chars().all(accepts_char)
@@ -202,11 +210,7 @@ impl NameInput {
     pub const BACKSPACE: u16 = UNIT_BACKSPACE;
 }
 
-pub fn file_text(name: &NameBuf) -> String {
-    format!("{}\n", name.as_str())
-}
-
-/// 覚えたファイルの中身を読む。BOM と前後の空白を除き、最初の 1 行だけを見る。空・制御文字を含む行は `None`。
+/// 以前の版が覚えたファイル（`PLAYER_NAME_FILE`）の中身を読む（引き継ぎ用）。BOM と前後の空白を除き、最初の 1 行だけを見る。空・制御文字を含む行は `None`。
 /// 手書きの日本語の名前も通し、`PLAYER_NAME_MAX` バイトを越える分は文字の境で切る。
 pub fn parse_file(text: &str) -> Option<String> {
     let first = text.trim_start_matches('\u{FEFF}').lines().next()?.trim();
@@ -368,7 +372,5 @@ mod tests {
         assert!(cut.len() <= PLAYER_NAME_MAX);
         assert_eq!(parse_file(&"a".repeat(32)).unwrap().len(), 32);
         assert_eq!(parse_file(&"a".repeat(40)).unwrap().len(), 32);
-        let n = NameBuf::from_name("Written_1").unwrap();
-        assert_eq!(parse_file(&file_text(&n)).as_deref(), Some("Written_1"));
     }
 }

@@ -1,0 +1,48 @@
+[package]
+name = "higanrtool_replay_fix"
+description = "古いリプレイのチャージ型を直す窓の道具。配布の zip では HiganRTool_replay_fix.exe（tools/make_dist.py）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay_fix"
+path = "src/main.rs"
+
+[dependencies]
+higanr_core = { path = "../core" }
+
+# Win32 の宣言だけのパッケージ（MIT / Apache-2.0。ローダー・dll と同じ版）。窓の道具だけが使うので Windows 向けのビルドにだけ入る
+# （画面の状態・ファイルの扱いは lib に分け、Linux でも cargo test できる）。features は使う関数の置き場所だけに絞る:
+#   Foundation              HWND / RECT / LPARAM ほか
+#   Graphics_Gdi            フォント（CreateFontIndirectW）・文字幅（GetTextExtentPoint32W）・システムの色（GetSysColorBrush）
+#   System_LibraryLoader    GetModuleHandleW（窓クラスの登録）
+#   System_Com              CoInitializeEx / CoCreateInstance / CoTaskMemFree（標準の「ファイルを開く」「フォルダーの選択」の窓）
+#   System_SystemServices   SS_*（STATIC の様式）
+#   UI_Controls             InitCommonControlsEx（標準の部品を今風の見た目で出すコモンコントロール v6 の読み込み）
+#   UI_Shell                DragQueryFileW（窓へ落としたファイル）/ SHCreateItemFromParsingName / FOS_* / SIGDN_FILESYSPATH
+#   UI_Input_KeyboardAndMouse  EnableWindow / SetFocus / GetFocus（標準の部品の有効・フォーカス）
+#   UI_WindowsAndMessaging  窓・部品の作成・SendMessageW（自分の窓の部品への WM_SETFONT / CB_*）・IsDialogMessageW・MessageBoxW
+#   Globalization           GetUserDefaultUILanguage（画面の言語）
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Globalization",
+]
+
+[build-dependencies]
+# 配る exe のバージョン情報（.res）を作る。build.rs だけが使い、成果物には入らない（自作）。
+higanr_build_res = { path = "../build_res" }

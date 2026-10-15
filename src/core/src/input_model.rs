@@ -2,9 +2,15 @@
 //! （prev・リピート発火・押した瞬間・離した瞬間）。逆アセンブル `42ace0`〜`42ad62` を読んで確かめた。
 //! feed 1 個ぶんの状態機械だけを持ち、1P・2P・合成の 3 本の呼び分けは呼び出し側が行う。
 
-/// 台本の語のうち、ゲームへ送ってよいビット。Z・X・Shift・Esc・方向の 8 ビットだけ。
-/// 相手の語のビットは自分の側でも効くので、Enter や P/Home（スクリーンショット `0x0042DBAA`）などは送らない。
+/// 台本の語のうち、ゲームへ送ってよいビット。Z・X・Shift・Esc・方向の 8 ビットだけ。台本・peer_sim の語の検証が使う。
+/// ネットワークで送る語は Ctrl を足した `MATCH_SEND_MASK`（どちらも P/Home の `0x0800` は含まない）。
 pub const SEND_MASK: u16 = 0x00FF;
+
+/// ネットワークで送る入力ワード（選択の画面も試合も）のマスク。`SEND_MASK` に Ctrl（`keys::CTRL`）を足したもの。
+/// 相手の語のビットは自分の側でも効くので、Enter や P/Home（スクリーンショット `0x0042DBAA`）などは送らない
+/// （送ると相手の PC にスクリーンショットを書かせる）。P/Home は語に混ぜず、自分の PC では DLL が自分のキーボードの押した瞬間を覚え、
+/// Present のラッパを呼ぶ間だけゲーム自身の判定のビットを立てて撮らせる（DLL の `shot_key_win`）。
+pub const MATCH_SEND_MASK: u16 = SEND_MASK | keys::CTRL;
 
 /// 台本の `p1=`/`p2=` に名前で書けるキーの値（InputManager の `+0x00` の語のビット）。
 /// 方向は分岐表 `0x0041C89C` を exe から読んだ値（実測の向きの一致 97.80%、母数 1,152,165 tick）。
@@ -18,6 +24,8 @@ pub mod keys {
     pub const DOWN: u16 = 0x0020;
     pub const LEFT: u16 = 0x0040;
     pub const RIGHT: u16 = 0x0080;
+    /// キーボードの Ctrl（VK_CONTROL。`0x0042BAAB`）とパッドのスキップのボタン。
+    pub const CTRL: u16 = 0x0100;
 }
 
 /// feed が作る 1 本ぶんの状態（InputManager の `+0x00`〜`+0x29` のコピー）。

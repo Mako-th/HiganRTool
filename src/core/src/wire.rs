@@ -38,7 +38,7 @@ use crate::seal::{NONCE_FIELD_LEN, Opener, PUBLIC_LEN, SEAL_OVERHEAD, SEAL_TAG_L
 /// パケットの先頭 4B。
 pub const MAGIC: [u8; 4] = *b"HGRT";
 /// プロトコルのバージョン（ヘッダ offset 4 と HELLO 本文の offset 0。接続コードの offset 0 も同じ数）。違うバージョンの相手とは繋がる前に断る。
-pub const PROTO_VER: u8 = 7;
+pub const PROTO_VER: u8 = 8;
 
 /// HELLO の本文の長さ（B）。
 pub const HELLO_LEN: usize = 82;
@@ -385,7 +385,16 @@ pub struct Menu {
     pub count: u8,
     /// `count` を超える分は decode では 0 で埋める。
     pub words: [u16; MAX_WORDS],
+    /// 送り手の画面（`[[0x4AC8C0]+0x1B228]`。読めなければ 0）。受け手は自分の画面と比べる。
+    pub screen: u8,
+    /// 送り手の席のキャラのカーソル（0〜15）。キャラ選択の画面の外なら `CURSOR_NONE`。
+    pub cursor: u8,
+    /// 難易度・マップの画面の共有カーソル用。今は `[CURSOR_NONE, 0]` を送り、受け手は読まない。
+    pub shared: [u8; 2],
 }
+
+/// MENU の `cursor`（と `shared[0]`）の「位置なし」。
+pub const CURSOR_NONE: u8 = 0xFF;
 
 /// STEP_REQ / STEP 共通の本文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,7 +994,11 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             for k in 0..n {
                 put_u16(out, 11 + 2 * k, m.words[k]);
             }
-            11 + 2 * n
+            let tail = 11 + 2 * n;
+            out[tail] = m.screen;
+            out[tail + 1] = m.cursor;
+            out[tail + 2..tail + MENU_TAIL_LEN].copy_from_slice(&m.shared);
+            tail + MENU_TAIL_LEN
         }
         Message::StepReq(s) | Message::Step(s) => {
             put_step(out, s);
@@ -1633,8 +1646,11 @@ fn decode_bye(body: &[u8]) -> Result<Message, DecodeError> {
     Ok(Message::Bye(reason))
 }
 
+/// MENU の本文の末尾の固定の欄（画面・カーソル・共有カーソル 2 B）の長さ。
+const MENU_TAIL_LEN: usize = 4;
+
 fn decode_menu(body: &[u8]) -> Result<Message, DecodeError> {
-    const MIN: usize = 11;
+    const MIN: usize = 11 + MENU_TAIL_LEN;
     if body.len() < MIN {
         return Err(DecodeError::LengthMismatch {
             msg_type: TYPE_MENU,
@@ -1664,12 +1680,23 @@ fn decode_menu(body: &[u8]) -> Result<Message, DecodeError> {
     for (k, w) in words.iter_mut().enumerate().take(count as usize) {
         *w = get_u16(body, 11 + 2 * k);
     }
+    let tail = 11 + 2 * count as usize;
+    let cursor = body[tail + 1];
+    if cursor > 15 && cursor != CURSOR_NONE {
+        return Err(DecodeError::FieldOutOfRange {
+            msg_type: TYPE_MENU,
+            field: "cursor",
+        });
+    }
     Ok(Message::Menu(Menu {
         step,
         ack,
         base,
         count,
         words,
+        screen: body[tail],
+        cursor,
+        shared: [body[tail + 2], body[tail + 3]],
     }))
 }
 
@@ -1927,13 +1954,13 @@ mod tests {
     const HELLO_GOLDEN: [u8; HEADER_LEN + HELLO_LEN] = [
         // ヘッダ 12B
         0x48, 0x47, 0x52, 0x54, // magic "HGRT"
-        0x07,                   // proto_ver = 7（`PROTO_VER`）
+        0x08,                   // proto_ver = 8（`PROTO_VER`）
         0x01,                   // type = 1 (HELLO)
         0x00,                   // flags（予約。0）
         0x00,                   // 予約
         0x44, 0x33, 0x22, 0x11, // session_id = 0x11223344
         // 本文 82B
-        0x07,                   // 本文の proto_ver（ヘッダと同じ 7 だけ通る）
+        0x08,                   // 本文の proto_ver（ヘッダと同じ 8 だけ通る）
         0x03,                   // latency（希望。3）
         0x09,                   // name_len = 9（「テスト」の UTF-8 バイト数）
         0x00,                   // mode = 0（delay 方式。M8-2a の前は予約で、古いバージョンの HELLO もこの形）
@@ -1960,7 +1987,7 @@ mod tests {
 
     fn hello_golden_msg() -> Message {
         Message::Hello(Hello {
-            proto_ver: 7,
+            proto_ver: 8,
             latency: 3,
             name_len: 9,
             mode: Mode::Delay,
@@ -2006,7 +2033,7 @@ mod tests {
     #[rustfmt::skip]
     const HELLO_ACK_GOLDEN: [u8; HEADER_LEN + HELLO_ACK_LEN] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x02, 0x00, 0x00,
+        0x08, 0x02, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // echo_nonce = 0x1122334455667788
@@ -2037,7 +2064,7 @@ mod tests {
     #[rustfmt::skip]
     const INPUT_COUNT0_GOLDEN: [u8; HEADER_LEN + 16] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x03, 0x00, 0x00,
+        0x08, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文（count = 0。語なし）
         0x01, 0x00,             // seg = 1
@@ -2072,7 +2099,7 @@ mod tests {
     #[rustfmt::skip]
     const INPUT_COUNT3_GOLDEN: [u8; HEADER_LEN + 22] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x03, 0x00, 0x00,
+        0x08, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文（count = 3。lat なし）
         0x02, 0x00,             // seg = 2
@@ -2112,7 +2139,7 @@ mod tests {
     #[rustfmt::skip]
     const INPUT_COUNT2_LAT_GOLDEN: [u8; HEADER_LEN + 20] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x03, 0x00, 0x00,
+        0x08, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文（count = 2。lat あり）
         0x03, 0x00,             // seg = 3
@@ -2154,7 +2181,7 @@ mod tests {
     #[rustfmt::skip]
     const CHECK_GOLDEN: [u8; HEADER_LEN + 14] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x04, 0x00, 0x00,
+        0x08, 0x04, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x04, 0x00,             // seg = 4
         0x64, 0x00, 0x00, 0x00, // frame = 100
@@ -2185,7 +2212,7 @@ mod tests {
     #[rustfmt::skip]
     const PING_GOLDEN: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x08, 0x00, 0x00,
+        0x08, 0x08, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x60, 0xEA, 0x00, 0x00, // send_time = 60000
     ];
@@ -2201,7 +2228,7 @@ mod tests {
     #[rustfmt::skip]
     const PONG_GOLDEN: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x09, 0x00, 0x00,
+        0x08, 0x09, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x61, 0xEA, 0x00, 0x00, // send_time = 60001
     ];
@@ -2217,7 +2244,7 @@ mod tests {
     #[rustfmt::skip]
     const AGREE_GOLDEN: [u8; HEADER_LEN + 2] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x0A, 0x00, 0x00,
+        0x08, 0x0A, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x01, // host_seat = 1 (P2)
         0x04, // delay = 4
@@ -2238,7 +2265,7 @@ mod tests {
     #[rustfmt::skip]
     const AGREE_ROLLBACK_GOLDEN: [u8; HEADER_LEN + 3] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x0A, 0x00, 0x00,
+        0x08, 0x0A, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x00, // host_seat = 0 (P1)
         0x02, // delay = D = 2
@@ -2259,7 +2286,7 @@ mod tests {
     #[rustfmt::skip]
     const SELECT_GOLDEN: [u8; HEADER_LEN + 18] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x0B, 0x00, 0x00,
+        0x08, 0x0B, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x02, 0x00, // match_no = 2
         0x03,       // chara
@@ -2303,7 +2330,7 @@ mod tests {
     #[rustfmt::skip]
     const BYE_GOLDEN: [u8; HEADER_LEN + 1] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x0F, 0x00, 0x00,
+        0x08, 0x0F, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x03, // reason = 3（ズレ検出）
     ];
@@ -2320,7 +2347,7 @@ mod tests {
     #[rustfmt::skip]
     const READY_GOLDEN: [u8; HEADER_LEN] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x14, 0x00, 0x00,
+        0x08, 0x14, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
     ];
 
@@ -2348,7 +2375,7 @@ mod tests {
     #[rustfmt::skip]
     const HOST_STATE_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x15, 0x00, 0x00, // type = 21
+        0x08, 0x15, 0x00, 0x00, // type = 21
         0x44, 0x33, 0x22, 0x11,
         0x02, 0x01,             // seq = 0x0102（LE）
         0x01,                   // mode = 1（rollback）
@@ -2429,9 +2456,9 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    const MENU_GOLDEN: [u8; HEADER_LEN + 15] = [
+    const MENU_GOLDEN: [u8; HEADER_LEN + 19] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x10, 0x00, 0x00,
+        0x08, 0x10, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文（count = 2）
         0x05, 0x00,             // step = 5
@@ -2440,6 +2467,9 @@ mod tests {
         0x02,                   // count = 2
         0x00, 0x01,             // 語 0 = 0x0100（決定キーの印。そのまま送る）
         0x02, 0x00,             // 語 1 = 0x0002
+        0x08,                   // screen = 8（キャラ選択）
+        0x0C,                   // cursor = 12
+        0xFF, 0x00,             // shared（今は 0xFF, 0）
     ];
 
     fn menu_golden_msg() -> Message {
@@ -2452,6 +2482,9 @@ mod tests {
             base: 2,
             count: 2,
             words,
+            screen: 8,
+            cursor: 12,
+            shared: [CURSOR_NONE, 0],
         })
     }
 
@@ -2463,9 +2496,65 @@ mod tests {
     }
 
     #[rustfmt::skip]
+    const MENU_COUNT0_GOLDEN: [u8; HEADER_LEN + 15] = [
+        0x48, 0x47, 0x52, 0x54,
+        0x08, 0x10, 0x00, 0x00,
+        0x44, 0x33, 0x22, 0x11,
+        0x01, 0x00,             // step = 1
+        0x00, 0x00, 0x00, 0x00, // ack = 0
+        0x00, 0x00, 0x00, 0x00, // base = 0
+        0x00,                   // count = 0
+        0x07,                   // screen = 7（難易度）
+        0xFF,                   // cursor = 位置なし
+        0xFF, 0x00,             // shared
+    ];
+
+    #[test]
+    fn golden_menu_count0_puts_the_tail_right_after_the_count() {
+        let m = Message::Menu(Menu {
+            step: 1,
+            ack: 0,
+            base: 0,
+            count: 0,
+            words: [0; MAX_WORDS],
+            screen: 7,
+            cursor: CURSOR_NONE,
+            shared: [CURSOR_NONE, 0],
+        });
+        assert_eq!(encode_to_vec(SID, &m), MENU_COUNT0_GOLDEN);
+        assert_eq!(dec(&MENU_COUNT0_GOLDEN).unwrap().msg, m);
+    }
+
+    /// 末尾の 4 B が語の個数に合わせてずれる（語の前や固定の位置に書くと落ちる）。欄ごとに違う値にして、入れ違いも落とす。
+    #[test]
+    fn menu_tail_follows_the_words_for_every_count() {
+        for n in 0..=MAX_WORDS {
+            let mut words = [0u16; MAX_WORDS];
+            for (i, w) in words.iter_mut().enumerate().take(n) {
+                *w = 0xA000 | i as u16;
+            }
+            let m = Menu {
+                step: 2,
+                ack: 3,
+                base: 4,
+                count: n as u8,
+                words,
+                screen: 16,
+                cursor: n as u8 & 15,
+                shared: [0x5A, 0xC3],
+            };
+            let bytes = encode_to_vec(SID, &Message::Menu(m));
+            let tail = HEADER_LEN + 11 + 2 * n;
+            assert_eq!(bytes.len(), tail + 4, "count {n}");
+            assert_eq!(&bytes[tail..], &[16, n as u8 & 15, 0x5A, 0xC3], "count {n}");
+            assert_eq!(dec(&bytes).unwrap().msg, Message::Menu(m), "count {n}");
+        }
+    }
+
+    #[rustfmt::skip]
     const STEP_REQ_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x11, 0x00, 0x00,
+        0x08, 0x11, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x06, 0x00, // step = 6
         0x01,       // kind = 1（決定）
@@ -2489,7 +2578,7 @@ mod tests {
     #[rustfmt::skip]
     const STEP_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x12, 0x00, 0x00,
+        0x08, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x07, 0x00, // step = 7
         0x02,       // kind = 2（取消）
@@ -2560,9 +2649,9 @@ mod tests {
     /// PING は Alice → Bob（前 32 B）・送り手 0・通し番号 0・send_time 60000、PONG は Bob → Alice（後ろ 32 B）・送り手 1・
     /// 通し番号 0x0102030405・send_time 7）。式は `ChaCha20Poly1305(key).encrypt(0 の 4 B ‖ 送り手 ‖ 番号 7 B LE, 本文, ヘッダ)`。
     const PING_SEALED: &str =
-        "4847525407080000443322110000000000000000eab77930f219b06945cd3551562305a56b2605db";
+        "4847525408080000443322110000000000000000eab779300a40535fb59f1f3e030312851a682146";
     const PONG_SEALED: &str =
-        "4847525407090000443322110105040302010000873647e2904f158ea172228851cdf61d9d881c62";
+        "4847525408090000443322110105040302010000873647e238e47d106d5c8563ed85a362f6d0b23d";
 
     #[test]
     fn golden_sealed_ping_and_pong() {
@@ -2880,7 +2969,7 @@ mod tests {
 
     #[test]
     fn poison_bad_version() {
-        for v in [0u8, 1, 2, 3, 4, 5, 6, 8, 0xFF] {
+        for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 9, 0xFF] {
             let mut bytes = HELLO_GOLDEN;
             bytes[4] = v;
             assert_eq!(
@@ -3050,7 +3139,7 @@ mod tests {
 
     #[test]
     fn poison_hello_body_proto_ver_nonzero() {
-        for v in [0u8, 1, 2, 3, 4, 5, 6, 8, 0xFF] {
+        for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 9, 0xFF] {
             let mut bytes = HELLO_GOLDEN;
             bytes[12] = v;
             assert_eq!(
@@ -3097,9 +3186,12 @@ mod tests {
             base: 2,
             count: 40,
             words,
+            screen: 8,
+            cursor: 3,
+            shared: [CURSOR_NONE, 0],
         });
         let bytes = encode_to_vec(SID, &menu);
-        assert_eq!(bytes.len(), 12 + 11 + 64);
+        assert_eq!(bytes.len(), 12 + 11 + 64 + 4);
         assert_eq!(bytes[12 + 10], 32);
         match dec(&bytes).map(|p| p.msg) {
             Ok(Message::Menu(m)) => {
@@ -3337,6 +3429,59 @@ mod tests {
     }
 
     #[test]
+    fn poison_menu_cursor_out_of_range_and_missing_tail() {
+        let at = HEADER_LEN + 11 + 4 + 1;
+        for v in [16u8, 0x80, 0xFE] {
+            let mut bytes = MENU_GOLDEN;
+            bytes[at] = v;
+            assert_eq!(
+                dec(&bytes),
+                Err(DecodeError::FieldOutOfRange {
+                    msg_type: TYPE_MENU,
+                    field: "cursor",
+                }),
+                "cursor = {v}"
+            );
+        }
+        for v in [0u8, 15, CURSOR_NONE] {
+            let mut bytes = MENU_GOLDEN;
+            bytes[at] = v;
+            assert!(dec(&bytes).is_ok(), "cursor = {v}");
+        }
+        // 末尾の 4 B が無い（前のバージョンの形）・1 B 足りない・1 B 多い。
+        for cut in [4usize, 1] {
+            assert_eq!(
+                dec(&MENU_GOLDEN[..MENU_GOLDEN.len() - cut]),
+                Err(DecodeError::LengthMismatch {
+                    msg_type: TYPE_MENU,
+                    expected: 19,
+                    actual: 19 - cut,
+                }),
+                "{cut} B 削った"
+            );
+        }
+        let mut long = MENU_GOLDEN.to_vec();
+        long.push(0);
+        assert_eq!(
+            dec(&long),
+            Err(DecodeError::LengthMismatch {
+                msg_type: TYPE_MENU,
+                expected: 19,
+                actual: 20,
+            })
+        );
+        assert_eq!(
+            dec(&MENU_COUNT0_GOLDEN[..HEADER_LEN + 14]),
+            Err(DecodeError::LengthMismatch {
+                msg_type: TYPE_MENU,
+                expected: 15,
+                actual: 14,
+            }),
+            "count を読む前の短さ"
+        );
+    }
+
+    #[test]
     fn poison_step_req_kind_out_of_range() {
         let mut bytes = STEP_REQ_GOLDEN;
         bytes[12 + 2] = 3; // kind = 3（STEP_REQ は 1/2 のみ。3 は STEP の合わせ）
@@ -3352,7 +3497,7 @@ mod tests {
     #[rustfmt::skip]
     const STEP_ALIGN_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x12, 0x00, 0x00,
+        0x08, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x08, 0x00, // step = 8
         0x03,       // kind = 3（合わせ）
@@ -3416,7 +3561,7 @@ mod tests {
     #[rustfmt::skip]
     const STEP_FORMAT_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x07, 0x12, 0x00, 0x00,
+        0x08, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x09, 0x00, // step = 9
         0x04,       // kind = 4（形式の切替）
@@ -3838,12 +3983,19 @@ mod tests {
                 for w in words.iter_mut().take(count as usize) {
                     *w = rng.next_u16();
                 }
+                let cursor = match rng.next_range_u8(16) {
+                    16 => CURSOR_NONE,
+                    c => c,
+                };
                 Message::Menu(Menu {
                     step: rng.next_u16(),
                     ack: rng.next_u32(),
                     base: rng.next_u32(),
                     count,
                     words,
+                    screen: rng.next_range_u8(0xFF),
+                    cursor,
+                    shared: [rng.next_range_u8(0xFF), rng.next_range_u8(0xFF)],
                 })
             }
             10 => {
@@ -3919,8 +4071,8 @@ mod tests {
 
     fn spectate_pkt(msg_type: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![
-            b'H', b'G', b'R', b'T', 7, msg_type, 0, 0, 0x44, 0x33, 0x22,
-            0x11, // バージョン 7
+            b'H', b'G', b'R', b'T', 8, msg_type, 0, 0, 0x44, 0x33, 0x22,
+            0x11, // バージョン 8
         ];
         v.extend_from_slice(body);
         v

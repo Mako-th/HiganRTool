@@ -281,7 +281,7 @@ fn a_spectate_code_of_another_version_is_refused_by_its_version() {
         "AANEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBu_oMCs";
     let mut r = Reader::new(&settings("loopback"), 1);
     let want = format!(
-        "相手の HiganRTool のバージョンが違います（自分 {}・相手 0）。相手と同じ zip の HiganRTool を使ってください。",
+        "相手のHiganRToolのバージョンが違います（自分 {}・相手 0）。相手と同じzipのHiganRToolを使ってください。",
         higanr_core::wire::PROTO_VER
     );
     match r.on_peer_file(Some(SPECTATE_V0.as_bytes()), NOW) {

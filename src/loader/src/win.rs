@@ -42,6 +42,13 @@ pub struct Spawn {
     pub no_activate: bool,
 }
 
+/// 起動の途中で、画面とログに知らせたい出来事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchNote {
+    /// DLL の読み込みが最初の待ちで終わらず、ゲームのプロセスは生きているので待ちを延ばす。
+    SlowLoad,
+}
+
 /// どれも呼んだら何が起きたかを返すだけで、後始末は呼んだ側（`launch.rs`）が決める。
 pub trait Win32 {
     fn read_file(&mut self, path: &Path) -> Result<Vec<u8>, String>;
@@ -85,4 +92,7 @@ pub trait Win32 {
 
     /// 失敗しても呼んだ側にできることは無い。
     fn close_handle(&mut self, handle: Handle) -> Result<(), ErrorCode>;
+
+    /// 知らせを受け取る側（画面とログに出す）。受けない実装は何もしない。
+    fn note(&mut self, _note: LaunchNote) {}
 }

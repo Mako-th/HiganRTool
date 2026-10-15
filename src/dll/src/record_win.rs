@@ -263,6 +263,11 @@ impl RecordEnv for RealRecord {
             present_module: module(present),
         }
     }
+
+    fn overlay_stop_line(&mut self) -> Option<String> {
+        let (fail, hr, detail) = crate::overlay_win::take_stop_report()?;
+        Some(crate::overlay::stop_line(fail, hr, detail))
+    }
 }
 
 #[cfg(test)]

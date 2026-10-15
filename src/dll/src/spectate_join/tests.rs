@@ -90,8 +90,10 @@ fn kit_parts(base: &str) -> (JoinKit, Arc<UiLink>, Arc<WatchSlot>) {
         1_000,
     );
     let kit = JoinKit {
-        room: room_opts(base),
-        watch_room: RoomName::parse(NAME).unwrap().spectate_of(),
+        source: JoinSource::Room {
+            room: room_opts(base),
+            watch_room: RoomName::parse(NAME).unwrap().spectate_of(),
+        },
         reader: Reader::new(&settings(), 0x77),
         reply_name: Name::new("viewer"),
         own: Candidates::from_addrs(&[viewer_addr()]).unwrap(),
@@ -110,6 +112,38 @@ fn kit(base: &str) -> Kit {
         slot,
         shared,
     }
+}
+
+/// 観戦コードの経路の材料（クリップボードを読んだ結果 `read`）。
+fn code_kit(read: Result<Option<String>, String>) -> Kit {
+    let (mut jk, link, slot) = kit_parts("ws://127.0.0.1:9");
+    jk.source = JoinSource::Code(read);
+    let shared = Arc::new(JoinShared::default());
+    Kit {
+        runner: Runner::new(jk, Arc::clone(&shared)),
+        link,
+        slot,
+        shared,
+    }
+}
+
+/// ホストが書く観戦コード（種別 3。候補は loopback の 1 つ）。`build` を替えると別のビルドのコード。
+fn watch_code(expires: u64, build: u32) -> String {
+    code::write_with_build(
+        &Code {
+            side: Side::Spectate,
+            session_id: SESSION,
+            secret: Some(SECRET),
+            name: Name::new("caster"),
+            nat: higanr_core::nat::NatMark::UNKNOWN,
+            candidates: Candidates::from_addrs(&[caster_addr()]).unwrap(),
+            expires,
+        },
+        build,
+        None,
+        Some(&[0x41; 32]),
+    )
+    .unwrap()
 }
 
 fn state_of(link: &UiLink) -> (CodeState, Event) {
@@ -195,6 +229,157 @@ fn once_watching_a_cancel_is_dropped_and_the_end_is_told() {
     assert_eq!(state_of(&k.link), (CodeState::Idle, Event::SpectateEnded));
     assert_eq!(k.shared.counts().ended, 1);
     assert!(!k.slot.gave_up(), "終わりを取りやめと取り違えた");
+}
+
+/// 観戦コードの経路: 読めたら JOIN を始めさせ（ルームへは繋がない）、ホストの名前を左上の材料に載せる。答えが無ければ
+/// `CODE_LINK_TIMEOUT_MS` で「ホストに接続できませんでした」で終える。
+#[test]
+fn a_watch_code_starts_the_join_without_a_room_and_gives_up_after_ten_seconds() {
+    let now = 5_000_000u64;
+    let mut k = code_kit(Ok(Some(format!(
+        "\u{FEFF}{}\r\n",
+        watch_code(now + 1_800, higanr_core::update::BUILD_NUMBER)
+    ))));
+    k.runner.step(1_000, now);
+    assert_ne!(k.slot.generation(), 0, "観戦者の設定を置いていない");
+    assert!(k.runner.conn.is_none(), "観戦コードの経路がルームへ繋いだ");
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::SpectateLinking, Event::SpectatePeer)
+    );
+    assert_eq!(units_text(&k.link.note().unwrap().name), "caster");
+    let c = k.shared.counts();
+    assert_eq!(
+        (c.by_code, c.codes_received, c.replies_sent, c.entered),
+        (1, 1, 0, 0),
+        "{c:?}"
+    );
+    k.runner.step(1_000 + CODE_LINK_TIMEOUT_MS - 1, now);
+    assert!(!k.runner.is_done(), "上限の手前で諦めた");
+    k.runner.step(1_000 + CODE_LINK_TIMEOUT_MS, now);
+    assert!(k.runner.is_done());
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::Idle, Event::SpectateCodeNoLink)
+    );
+    assert!(k.slot.gave_up());
+    assert_eq!(k.shared.counts().link_timeout, 1);
+    assert!(k.shared.line().contains("観戦コードでホストへ直に繋ぐ"));
+}
+
+/// 期限の切れた観戦コード: 時計のずれを見込んで繋ぎに行き、答えが無ければ期限切れの文で終える。答えが来れば観戦になる。
+#[test]
+fn an_expired_watch_code_still_tries_and_names_the_expiry_only_when_nobody_answers() {
+    let now = 5_000_000u64;
+    let text = watch_code(now - 1, higanr_core::update::BUILD_NUMBER);
+    let mut k = code_kit(Ok(Some(text.clone())));
+    k.runner.step(0, now);
+    assert_ne!(k.slot.generation(), 0, "期限切れで繋ぎに行かなかった");
+    assert_eq!(k.shared.counts().expired_but_tried, 1);
+    k.runner.step(CODE_LINK_TIMEOUT_MS, now);
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::Idle, Event::SpectateCodeExpired)
+    );
+    let mut k = code_kit(Ok(Some(text)));
+    k.runner.step(0, now);
+    k.slot.mark_joined();
+    k.runner.step(50, now);
+    assert_eq!(state_of(&k.link), (CodeState::SpectateIdle, Event::None));
+    assert!(!k.runner.is_done());
+}
+
+/// 観戦コードとして使えないものは、JOIN を始めずに理由ごとの出来事で終える（クリップボードの空・読めない・対戦のコード・壊れた・別のビルド・範囲の外）。
+#[test]
+fn an_unusable_watch_code_ends_with_its_own_event_and_never_joins() {
+    let now = 5_000_000u64;
+    let initiator = code::write_initiator(&Code {
+        side: Side::Initiator,
+        session_id: SESSION,
+        secret: Some(SECRET),
+        name: Name::new("player"),
+        nat: higanr_core::nat::NatMark::UNKNOWN,
+        candidates: Candidates::from_addrs(&[caster_addr()]).unwrap(),
+        expires: now + 1_800,
+    })
+    .unwrap();
+    let good = watch_code(now + 1_800, higanr_core::update::BUILD_NUMBER);
+    let mut broken: Vec<char> = good.chars().collect();
+    let mid = broken.len() / 2;
+    broken[mid] = if broken[mid] == 'A' { 'B' } else { 'A' };
+    let broken: String = broken.into_iter().collect();
+    let far = {
+        let c = Code {
+            side: Side::Spectate,
+            session_id: SESSION,
+            secret: Some(SECRET),
+            name: Name::new("caster"),
+            nat: higanr_core::nat::NatMark::UNKNOWN,
+            candidates: Candidates::from_addrs(&["203.0.113.5:2000".parse().unwrap()]).unwrap(),
+            expires: now + 1_800,
+        };
+        code::write_spectate(&c, &[0x41; 32]).unwrap()
+    };
+    let other_build = higanr_core::update::BUILD_NUMBER.wrapping_add(1);
+    type ClipRead = Result<Option<String>, String>;
+    let cases: [(&str, ClipRead, Event); 7] = [
+        ("空", Ok(None), Event::SpectateCodeEmpty),
+        (
+            "空白だけ",
+            Ok(Some(" \r\n".to_string())),
+            Event::SpectateCodeEmpty,
+        ),
+        (
+            "読めない",
+            Err("偽のクリップボードを読めない".to_string()),
+            Event::Unreadable,
+        ),
+        (
+            "対戦のコード",
+            Ok(Some(initiator)),
+            Event::SpectateCodeWrongKind,
+        ),
+        ("壊れた", Ok(Some(broken)), Event::SpectateCodeBroken),
+        (
+            "別のビルド",
+            Ok(Some(watch_code(now + 1_800, other_build))),
+            Event::SpectateOtherBuild,
+        ),
+        // 検査の ini の範囲（既定）の外の候補だけ。
+        ("範囲の外", Ok(Some(far)), Event::NoRoute),
+    ];
+    for (name, read, want) in cases {
+        let mut k = code_kit(read);
+        k.runner.step(0, now);
+        assert!(k.runner.is_done(), "{name}: 終わっていない");
+        assert_eq!(state_of(&k.link), (CodeState::Idle, want), "{name}");
+        assert_eq!(k.slot.generation(), 0, "{name}: JOIN を始めた");
+        assert!(k.slot.gave_up(), "{name}: WatchPlay を終わらせていない");
+        if want == Event::SpectateOtherBuild {
+            assert_eq!(k.link.note().unwrap().peer_build, other_build);
+        }
+    }
+}
+
+/// 観戦コードの経路でも、つなぎに行く間は「観戦をやめる」で取りやめられる。
+#[test]
+fn a_watch_code_link_can_be_cancelled() {
+    let now = 5_000_000u64;
+    let mut k = code_kit(Ok(Some(watch_code(
+        now + 1_800,
+        higanr_core::update::BUILD_NUMBER,
+    ))));
+    k.link.send(Cmd::SpectateCode);
+    k.runner.step(0, now);
+    assert!(!k.runner.is_done());
+    k.link.send(Cmd::SpectateCancel);
+    k.runner.step(100, now);
+    assert!(k.runner.is_done());
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::Idle, Event::SpectateCancelled)
+    );
+    assert_eq!(k.shared.counts().ignored_orders, 0, "起こした指示を数えた");
 }
 
 #[test]

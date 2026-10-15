@@ -2,8 +2,8 @@
 //!
 //! - 行ごとに前後の空白を落とす。空の行と、`;` か `#` で始まる行、先頭の BOM は読まない。
 //! - `[名前]` で節を始める。最初の節より前の `キー = 値` は名前の無い節（`""`）に入る。
-//! - 節の名前とキーは ASCII の大文字・小文字を区別しない（小文字にして持つ）。値の後ろの `;` は注にしない（値の一部）。
-//! - 同じ節に同じキーが 2 回、`=` の無い行、閉じない `[` は誤り。
+//! - 節の名前とキーは ASCII の大文字・小文字を区別しない（小文字にして持つ）。値の後ろの「空白 + `;`」から行末までは注（`a;b` の `;` は値の一部）。
+//! - 同じ節に同じキーが 2 回、`=` の無い行、閉じない `[` は誤り。`parse` は最初の誤りで断り、`parse_lenient` は誤りの行だけ読み飛ばす。
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -44,6 +44,18 @@ pub enum IniError {
     },
 }
 
+impl IniError {
+    /// 誤りの行の番号（重複は 2 回目の行）。
+    pub fn line(&self) -> usize {
+        match self {
+            IniError::NoEquals { line }
+            | IniError::BadSection { line }
+            | IniError::EmptyKey { line }
+            | IniError::Duplicate { line, .. } => *line,
+        }
+    }
+}
+
 impl fmt::Display for IniError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -75,9 +87,23 @@ impl Ini {
             .map(|e| e.value.as_str())
     }
 
+    /// キーを書いた行の番号。
+    pub fn line_of(&self, section: &str, key: &str) -> Option<usize> {
+        let (s, k) = (section.to_ascii_lowercase(), key.to_ascii_lowercase());
+        self.entries
+            .iter()
+            .find(|e| e.section == s && e.key == k)
+            .map(|e| e.line)
+    }
+
     pub fn has_section(&self, section: &str) -> bool {
         let s = section.to_ascii_lowercase();
         self.sections.contains(&s)
+    }
+
+    /// 見出しのある節の名前（小文字。初めて現れた順）。見出しより前の名前の無い節（`""`）は含まない。
+    pub fn sections(&self) -> &[String] {
+        &self.sections
     }
 
     /// キーと、それを書いた行の番号（書いた順）。知らないキーを読む側が断るのに使う。
@@ -91,10 +117,40 @@ impl Ini {
     }
 }
 
-pub fn parse(text: &str) -> Result<Ini, IniError> {
+/// 値の後ろの注（空白 + `;` から行末まで）を落とす。
+pub fn strip_comment(v: &str) -> &str {
+    let mut prev_space = true;
+    for (i, c) in v.char_indices() {
+        if c == ';' && prev_space {
+            return v[..i].trim_end();
+        }
+        prev_space = c.is_whitespace();
+    }
+    v
+}
+
+/// 読み飛ばした行と、その時いた節。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub error: IniError,
+    pub section: String,
+}
+
+/// `parse_lenient` の結果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lenient {
+    pub ini: Ini,
+    pub skipped: Vec<Skipped>,
+    /// 読まなかった行の番号（昇順）。`skipped` の行と、読めない `[` の見出しの下で次の見出しまでの行。
+    pub dropped: Vec<usize>,
+}
+
+/// 誤りの行だけ読み飛ばして読む。読めない見出しの下の行は、前の節に入れず次の見出しまで捨てる。
+pub fn parse_lenient(text: &str) -> Lenient {
     let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    let mut ini = Ini::default();
+    let mut out = Lenient::default();
     let mut section = String::new();
+    let mut lost = false;
     for (i, raw) in body.lines().enumerate() {
         let line = i + 1;
         let t = raw.trim();
@@ -105,39 +161,74 @@ pub fn parse(text: &str) -> Result<Ini, IniError> {
             let name = rest
                 .strip_suffix(']')
                 .map(str::trim)
-                .filter(|n| !n.is_empty())
-                .ok_or(IniError::BadSection { line })?;
-            section = name.to_ascii_lowercase();
-            if !ini.sections.contains(&section) {
-                ini.sections.push(section.clone());
+                .filter(|n| !n.is_empty());
+            if let Some(n) = name {
+                lost = false;
+                section = n.to_ascii_lowercase();
+                if !out.ini.sections.contains(&section) {
+                    out.ini.sections.push(section.clone());
+                }
+            } else {
+                lost = true;
+                out.skip(&section, IniError::BadSection { line });
             }
             continue;
         }
-        let (k, v) = t.split_once('=').ok_or(IniError::NoEquals { line })?;
+        if lost {
+            out.dropped.push(line);
+            continue;
+        }
+        let Some((k, v)) = t.split_once('=') else {
+            out.skip(&section, IniError::NoEquals { line });
+            continue;
+        };
         let key = k.trim().to_ascii_lowercase();
         if key.is_empty() {
-            return Err(IniError::EmptyKey { line });
+            out.skip(&section, IniError::EmptyKey { line });
+            continue;
         }
-        if let Some(e) = ini
+        let first = out
+            .ini
             .entries
             .iter()
             .find(|e| e.section == section && e.key == key)
-        {
-            return Err(IniError::Duplicate {
-                section,
+            .map(|e| e.line);
+        if let Some(first) = first {
+            let error = IniError::Duplicate {
+                section: section.clone(),
                 key,
-                first: e.line,
+                first,
                 line,
-            });
+            };
+            out.skip(&section, error);
+            continue;
         }
-        ini.entries.push(Entry {
+        out.ini.entries.push(Entry {
             section: section.clone(),
             key,
-            value: v.trim().to_string(),
+            value: strip_comment(v.trim()).to_string(),
             line,
         });
     }
-    Ok(ini)
+    out
+}
+
+impl Lenient {
+    fn skip(&mut self, section: &str, error: IniError) {
+        self.dropped.push(error.line());
+        self.skipped.push(Skipped {
+            error,
+            section: section.to_string(),
+        });
+    }
+}
+
+pub fn parse(text: &str) -> Result<Ini, IniError> {
+    let r = parse_lenient(text);
+    match r.skipped.into_iter().next() {
+        Some(s) => Err(s.error),
+        None => Ok(r.ini),
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +274,38 @@ mod tests {
                 line: 6
             }
         );
-        assert_eq!(parse("k = 2 ; x\n").unwrap().get("", "k"), Some("2 ; x"));
+    }
+
+    #[test]
+    fn a_comment_after_a_value_needs_a_space_before_the_semicolon() {
+        let ini = parse("k = 2 ; x\nj = a;b\nm = ; none\nn = 1\t; tab\nname = a;b ; c\n").unwrap();
+        assert_eq!(ini.get("", "k"), Some("2"));
+        assert_eq!(ini.get("", "j"), Some("a;b"));
+        assert_eq!(ini.get("", "m"), Some(""));
+        assert_eq!(ini.get("", "n"), Some("1"));
+        assert_eq!(ini.get("", "name"), Some("a;b"));
+    }
+
+    #[test]
+    fn lenient_parse_skips_only_the_bad_lines() {
+        let text = "[a]\nk = 1\nfoo\n = 2\nk = 3\nj = 4\n[b\nx = 5\n[c]\ny = 6\n";
+        let r = parse_lenient(text);
+        assert_eq!(
+            r.skipped.iter().map(|s| s.error.line()).collect::<Vec<_>>(),
+            vec![3, 4, 5, 7]
+        );
+        assert_eq!(r.skipped[0].section, "a");
+        assert_eq!(r.dropped, vec![3, 4, 5, 7, 8]);
+        assert_eq!(r.ini.get("a", "k"), Some("1"), "重複は最初の行を採る");
+        assert_eq!(r.ini.get("a", "j"), Some("4"));
+        assert_eq!(
+            r.ini.get("a", "x"),
+            None,
+            "読めない見出しの下は前の節に入れない"
+        );
+        assert_eq!(r.ini.get("b", "x"), None);
+        assert_eq!(r.ini.get("c", "y"), Some("6"));
+        assert_eq!(r.ini.line_of("c", "Y"), Some(10));
+        assert_eq!(parse(text).unwrap_err(), IniError::NoEquals { line: 3 });
     }
 }

@@ -2561,7 +2561,8 @@ fn host_heads(d0: u8, recs: &[Recommend], presses: &[(usize, u8)]) -> (Vec<u8>, 
 
 #[test]
 fn the_auto_head_d_does_not_flicker_when_the_rtt_wanders_around_a_boundary() {
-    let rtts = [33u32, 34, 38, 39, 33, 34, 33, 30];
+    // rollback の推奨値の 1 と 2 の境目（100 ms で 1・101 ms で 2。「−5 ms」の側は 105 ms で 1・106 ms で 2）の上で揺れる往復。
+    let rtts = [100u32, 101, 105, 106, 100, 101, 100, 95];
     let mut sc = Scenario::rollback(1, 8, rtts.len() as u32);
     sc.life = 30;
     sc.rec_seq = rtt_recs(&rtts);
@@ -2601,22 +2602,22 @@ fn the_auto_head_d_does_not_flicker_when_the_rtt_wanders_around_a_boundary() {
 
 #[test]
 fn the_host_head_uses_the_press_at_once_then_holds_and_a_number_lowers_the_flag() {
-    // 往復 34 ms: 素 2・「−5 ms」の側 1。今 1 から 9 で 2（すぐ）、次の始まりは 33 ms（素 1）が 1 回目なので 2 のまま、2 回目で 1。
-    let rtt = [34u32, 33, 33, 34, 33, 33];
+    // 往復 101 ms: 素 2・「−5 ms」の側 1。今 1 から 9 で 2（すぐ）、次の始まりは 100 ms（素 1）が 1 回目なので 2 のまま、2 回目で 1。
+    let rtt = [101u32, 100, 100, 101, 100, 100];
     let (heads, host) = host_heads(1, &rtt_recs(&rtt), &[(0, higanr_core::delay_pick::AUTO)]);
     assert_eq!(
         heads,
         vec![1, 2, 1, 1, 1, 1],
-        "seg 0 の始まりは 1（9 の 2 は 12 フレーム先の予定ではなくゲートの前に持つ）、seg 1 の始まりは 9 の 2、seg 2 で下がる、34 ms は上げない"
+        "seg 0 の始まりは 1（9 の 2 は 12 フレーム先の予定ではなくゲートの前に持つ）、seg 1 の始まりは 9 の 2、seg 2 で下がる、101 ms は上げない"
     );
     let s = host.stats();
     assert_eq!(
         s.d_auto_held, 2,
         "据え置いたのは seg 1（素 1 が低い 1 回目）と seg 3（素 2 を上げの余裕で）: {s:?}"
     );
-    // 数字で旗が降りる: D 3 から 9（往復 70 ms: 素 3）、seg 1 の始まりは 33 ms の低い 1 回目で 3 のまま。seg 2 の読み込みの間にホストが 3 を押して
-    // 旗を降ろすと、その後は 33 ms が何回続いても 3 のまま。seg 4 の読み込みの間の 9 は素の推奨値（33 ms で 1）をすぐ使う。
-    let rtt = [70u32, 33, 33, 33, 33];
+    // 数字で旗が降りる: D 3 から 9（往復 167 ms: 素 3）、seg 1 の始まりは 100 ms の低い 1 回目で 3 のまま。seg 2 の読み込みの間にホストが 3 を押して
+    // 旗を降ろすと、その後は 100 ms が何回続いても 3 のまま。seg 4 の読み込みの間の 9 は素の推奨値（100 ms で 1）をすぐ使う。
+    let rtt = [167u32, 100, 100, 100, 100];
     let (heads, host) = host_heads(
         3,
         &rtt_recs(&rtt),

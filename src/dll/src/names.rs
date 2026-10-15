@@ -4,6 +4,7 @@
 
 use std::ffi::OsStr;
 
+use higanr_core::log_days::{is_expired, parse_date8};
 use higanr_core::log_names::LOG_PREFIX;
 
 /// 現地時刻（`GetLocalTime` の `SYSTEMTIME` からコピーする。Win32 の型を持ち込まないため）。
@@ -67,49 +68,32 @@ pub fn side_file_name(log_name: &str, suffix: &str) -> String {
     format!("{stem}{suffix}")
 }
 
-/// 配るバージョンで `logs\` に残す日数。名前の日付が今日からこの日数より前のログ（`dll_` で始まる本ログと隣のファイル）は起動の
-/// たびに消す（3 日前の回は残し、4 日前から消す）。日数の原本はここだけ（`win::prune_old_logs` と配る README が引く）。
-/// 開発用のビルドでは消さない。
-pub const KEEP_LOG_DAYS: i64 = 3;
-
-fn day_number(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
+/// 配るバージョンで `logs\` に残す日数（原本は core の `log_days`。ローダーのログと同じ日数。`win::prune_old_logs` と配る README が引く）。
+/// 名前の日付が今日からこの日数より前のログ（`dll_` で始まる本ログと隣のファイル）は起動のたびに消す。開発用のビルドでは消さない。
+pub use higanr_core::log_days::KEEP_LOG_DAYS;
 
 /// 名前の日付。`dll_YYYYMMDD-…`（回ごと・隣のファイル）か `dll_YYYYMMDD.log`（日ごと）。
-fn log_name_day(name: &str) -> Option<i64> {
+fn log_name_date(name: &str) -> Option<(i64, i64, i64)> {
     let rest = name.strip_prefix(LOG_PREFIX)?;
-    let digits = rest.get(..8)?;
     let tail = rest.get(8..)?;
-    if !digits.bytes().all(|b| b.is_ascii_digit()) || !(tail.starts_with('-') || tail == ".log") {
+    if !(tail.starts_with('-') || tail == ".log") {
         return None;
     }
-    let num = |r: std::ops::Range<usize>| digits[r].parse::<i64>().ok();
-    let (y, m, d) = (num(0..4)?, num(4..6)?, num(6..8)?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    Some(day_number(y, m, d))
+    parse_date8(rest.get(..8)?)
 }
 
 /// 消してよい古いログか: 名前が `dll_YYYYMMDD-` で始まるか `dll_YYYYMMDD.log` で、その日が今日から `keep_days` 日より前。名前の形が違うもの・
 /// 今日より先の日付のもの（時計を戻した）は消さない。日付はファイル名から読む（zip から出すと更新時刻が変わるため）。
 pub fn is_expired_log(name: &str, today: &LocalTime, keep_days: i64) -> bool {
-    let Some(day) = log_name_day(name) else {
+    let Some(date) = log_name_date(name) else {
         return false;
     };
-    let now = day_number(
+    let today = (
         i64::from(today.year),
         i64::from(today.month),
         i64::from(today.day),
     );
-    now - day > keep_days
+    is_expired(today, date, keep_days)
 }
 
 /// 二重注入を防ぐミューテックスの名前（`Local\HiganRTool.<pid>`）。ローダーが注入の前に同じ名前を開いてみるので、
@@ -253,7 +237,7 @@ mod tests {
 
     #[test]
     fn expired_logs_are_decided_by_the_date_in_the_name() {
-        assert_eq!(KEEP_LOG_DAYS, 3, "本人が決めた保存の日数");
+        assert_eq!(KEEP_LOG_DAYS, 3, "決めた保存の日数");
         let today = day(2026, 10, 8);
         let name = |y, m, d| log_file_name(&day(y, m, d), 4242, 0);
         assert!(!is_expired_log(&name(2026, 10, 8), &today, KEEP_LOG_DAYS));

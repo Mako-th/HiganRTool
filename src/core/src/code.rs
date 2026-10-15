@@ -733,13 +733,13 @@ mod tests {
 
     #[test]
     fn span_text_writes_minutes_only_for_whole_minutes() {
-        assert_eq!(span_text(30 * 60), "30 分");
-        assert_eq!(span_text(45 * 60), "45 分");
-        assert_eq!(span_text(60), "1 分");
-        assert_eq!(span_text(90), "90 秒");
-        assert_eq!(span_text(59), "59 秒");
-        assert_eq!(span_text(1), "1 秒");
-        assert_eq!(span_text(0), "0 秒");
+        assert_eq!(span_text(30 * 60), "30分");
+        assert_eq!(span_text(45 * 60), "45分");
+        assert_eq!(span_text(60), "1分");
+        assert_eq!(span_text(90), "90秒");
+        assert_eq!(span_text(59), "59秒");
+        assert_eq!(span_text(1), "1秒");
+        assert_eq!(span_text(0), "0秒");
     }
 
     #[test]
@@ -763,7 +763,7 @@ mod tests {
     /// golden の読みはビルド違いで落ちる）。
     #[rustfmt::skip]
     const INIT_BODY: [u8; 67] = [
-        0x07,                   // バージョン 7（`PROTO_VER`）
+        0x08,                   // バージョン 8（`PROTO_VER`）
         0x00, 0x00, 0x00, 0x00, // build 0（開発用）
         0x01,                   // 始める側
         0x44, 0x33, 0x22, 0x11, // session 0x11223344
@@ -776,10 +776,12 @@ mod tests {
         0x04, 0x06, 0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58, 0x1B, // IPv6 [2001:db8::1]:7000
     ];
     /// 検算（Python: `hashlib.sha256(INIT_BODY).digest()[:4]`）。
-    const INIT_CHECK: [u8; 4] = [0xAC, 0x3B, 0x3A, 0xBD];
+    const INIT_CHECK: [u8; 4] = [0xB2, 0xFB, 0x0F, 0xBB];
     /// 文字（Python: `base64.urlsafe_b64encode(INIT_BODY + INIT_CHECK).rstrip(b"=")`）。
-    const INIT_TEXT: &str = "BwAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG6w7Or0";
-    /// バージョン 6 の始める側のコードの文字（形はバージョン 7 と同じで、先頭の 1 B と検算だけが違う）。
+    const INIT_TEXT: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7L7D7s";
+    /// バージョン 7 の始める側のコードの文字（形はバージョン 8 と同じで、先頭の 1 B と検算だけが違う）。
+    const INIT_TEXT_V7: &str = "BwAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG6w7Or0";
+    /// バージョン 6 の始める側のコードの文字（形はバージョン 8 と同じで、先頭の 1 B と検算だけが違う）。
     const INIT_TEXT_V6: &str = "BgAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7UpLvs";
     /// バージョン 5 の始める側のコードの文字（回線の型の印の 1 B が無い形）。
     const INIT_TEXT_V5: &str = "BQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgb7NLang";
@@ -787,7 +789,7 @@ mod tests {
     const INIT_TEXT_V4: &str =
         "BAFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtTz18H";
     /// ビルド 403920 の始める側のコードの文字（`INIT_BODY` の build だけを変えて検算を付け直した）。
-    const INIT_TEXT_B403920: &str = "B9ApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG13dgdg";
+    const INIT_TEXT_B403920: &str = "CNApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG3mwXng";
     /// バージョン 3 の始める側のコードの文字。
     const INIT_TEXT_V3: &str =
         "AwFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtQIsU3";
@@ -804,7 +806,7 @@ mod tests {
     /// 返す側の golden の本文（31 B）。
     #[rustfmt::skip]
     const REPLY_BODY: [u8; 31] = [
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン 7・build 0・返す側
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン 8・build 0・返す側
         0x44, 0x33, 0x22, 0x11,
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00,
         0x02, b'c', b'd',
@@ -814,10 +816,12 @@ mod tests {
     ];
     /// タグ（Python: `hmac.new(K, REPLY_BODY, sha256).digest()[:16]`。K は `auth.rs` の `K_GOLDEN`）。
     const REPLY_TAG: [u8; 16] = [
-        0xA4, 0xA1, 0x33, 0xC9, 0xC5, 0xAA, 0xD7, 0xF5, 0x05, 0x28, 0xE0, 0x91, 0x7A, 0xC1, 0xD9,
-        0x8F,
+        0xE0, 0x9B, 0x07, 0xA7, 0x2E, 0x34, 0x8E, 0x3D, 0xF7, 0x78, 0xBC, 0xAD, 0x91, 0xE1, 0xA6,
+        0x2C,
     ];
-    const REPLY_TEXT: &str = "BwAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6ShM8nFqtf1BSjgkXrB2Y8";
+    const REPLY_TEXT: &str = "CAAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-CbB6cuNI4993i8rZHhpiw";
+    /// バージョン 7 の返す側のコードの文字。
+    const REPLY_TEXT_V7: &str = "BwAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6ShM8nFqtf1BSjgkXrB2Y8";
     /// バージョン 6 の返す側のコードの文字。
     const REPLY_TEXT_V6: &str = "BgAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6EIdoTV8ABRMEBjMpbG2KU";
     /// バージョン 5 の返す側のコードの文字。
@@ -946,7 +950,7 @@ mod tests {
     /// 候補の並びは優先の順（IPv6 → LAN → 外側）。
     #[rustfmt::skip]
     const DUAL_BODY: [u8; 75] = [
-        0x07, 0x00, 0x00, 0x00, 0x00, // バージョン 7・build 0
+        0x08, 0x00, 0x00, 0x00, 0x00, // バージョン 8・build 0
         0x01, 0x44, 0x33, 0x22, 0x11, 0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 始める側・session・期限
         0x02, 0x61, 0x62,                                                                   // 名前 "ab"
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密
@@ -957,9 +961,9 @@ mod tests {
         0x03, 0x04, 0xCB, 0x00, 0x71, 0x05, 0x99, 0xB7,                                     // 種別 3・203.0.113.5:47001
     ];
     /// 検算（Python: `hashlib.sha256(DUAL_BODY).digest()[:4]`）。
-    const DUAL_CHECK: [u8; 4] = [0xB9, 0x11, 0x90, 0xD2];
+    const DUAL_CHECK: [u8; 4] = [0x76, 0xCF, 0x51, 0x57];
     /// 文字（Python: `base64.urlsafe_b64encode(DUAL_BODY + DUAL_CHECK).rstrip(b"=")`）。
-    const DUAL_TEXT: &str = "BwAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3uRGQ0g";
+    const DUAL_TEXT: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3ds9RVw";
 
     #[test]
     fn a_code_with_a_global_ipv6_candidate_keeps_the_version_2_shape_and_round_trips() {
@@ -1220,7 +1224,9 @@ mod tests {
     ];
     /// 観戦用のコードの文字（Python: INIT_BODY の種別の 1 B を 3 にし、秘密の後ろに `HOST_PUBLIC` の 32 B を挟んで
     /// 検算を付け、`base64.urlsafe_b64encode(..).rstrip(b"=")`）。
-    const SPECTATE_TEXT: &str = "BwAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbhcFBcQ";
+    const SPECTATE_TEXT: &str = "CAAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbbnxN_Q";
+    /// バージョン 7 の観戦用のコードの文字。
+    const SPECTATE_TEXT_V7: &str = "BwAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbhcFBcQ";
     /// バージョン 6 の観戦用のコードの文字。
     const SPECTATE_TEXT_V6: &str = "BgAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbKz_PJg";
     /// バージョン 5 の観戦用のコードの文字。
@@ -1302,6 +1308,15 @@ mod tests {
         assert_eq!(
             read_peer(REPLY_TEXT_V6, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(6)))
+        );
+        // バージョン 7 も形は同じだが、MENU の末尾の 4 B を持たない相手なのでバージョンで断る。
+        let v7 = Err(CodeError::BadVersion(7));
+        assert_eq!(read_initiator(INIT_TEXT_V7, EXPIRES), v7);
+        assert_eq!(read_reply(REPLY_TEXT_V7, &secret(), SID, EXPIRES), v7);
+        assert_eq!(read_spectate(SPECTATE_TEXT_V7, EXPIRES), v7);
+        assert_eq!(
+            read_peer(REPLY_TEXT_V7, mine_offer(), EXPIRES),
+            Err(PeerError::Code(CodeError::BadVersion(7)))
         );
         assert_eq!(read_initiator(INIT_TEXT, EXPIRES), Ok(init_code()));
         assert_eq!(read_spectate(SPECTATE_TEXT, EXPIRES), Ok(spectate_code()));
@@ -1397,8 +1412,8 @@ mod tests {
                 "{what}のコードのバージョンとパケットのバージョン"
             );
         }
-        // 書いた物のバージョンが今の数（7）である。数を上げるなら golden も一緒に直す。
-        assert_eq!(packet_ver, 7);
+        // 書いた物のバージョンが今の数（8）である。数を上げるなら golden も一緒に直す。
+        assert_eq!(packet_ver, 8);
         // ビルド番号も、コードと HELLO で同じ数（`BUILD_NUMBER`）。コードは offset 1、HELLO は本文の +46。
         for (what, b) in [
             ("始める側", &code),
@@ -1515,7 +1530,7 @@ mod tests {
     /// 観戦者の返し（種別 4）の golden の本文（`REPLY_BODY` の種別の 1 B だけを 4 にした 31 B）。
     #[rustfmt::skip]
     const SPECTATE_REPLY_BODY: [u8; 31] = [
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン 7・build 0・観戦者の返し
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン 8・build 0・観戦者の返し
         0x44, 0x33, 0x22, 0x11, // 観戦用のコードの session 0x11223344
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 期限 1800000000
         0x02, b'c', b'd',       // 名前 "cd"
@@ -1526,12 +1541,12 @@ mod tests {
     /// タグ（Python: `hmac.new(K, SPECTATE_REPLY_BODY, sha256).digest()[:16]`。K は観戦用のコードの秘密と
     /// session から導く。`auth.rs` の `K_GOLDEN`）。
     const SPECTATE_REPLY_TAG: [u8; 16] = [
-        0x3C, 0x2B, 0x90, 0xB1, 0xF8, 0x0F, 0x3B, 0x3F, 0xA3, 0x38, 0xDE, 0xD5, 0xFC, 0x2C, 0x6C,
-        0x29,
+        0x60, 0x3A, 0x6F, 0xFA, 0xF9, 0x51, 0x13, 0xAB, 0x00, 0x3A, 0x81, 0x5A, 0x72, 0xA8, 0x69,
+        0x9C,
     ];
     /// 文字（Python: `base64.urlsafe_b64encode(SPECTATE_REPLY_BODY + SPECTATE_REPLY_TAG).rstrip(b"=")`）。
     const SPECTATE_REPLY_TEXT: &str =
-        "BwAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZGzwrkLH4Dzs_ozje1fwsbCk";
+        "CAAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG2A6b_r5UROrADqBWnKoaZw";
 
     fn spectate_reply_code() -> Code {
         Code {
@@ -1680,7 +1695,7 @@ mod tests {
             Err(CodeError::BadTag)
         );
         // バージョン違い（タグも合わなくなるが、バージョンが先）。
-        for ver in [0u8, 1, 2, 3, 4, 5, 6, 8] {
+        for ver in [0u8, 1, 2, 3, 4, 5, 6, 7, 9] {
             let mut v = SPECTATE_REPLY_BODY.to_vec();
             v[0] = ver;
             v.extend_from_slice(&SPECTATE_REPLY_TAG);
@@ -1784,8 +1799,8 @@ mod tests {
         let mut t = INIT_TEXT.to_string();
         t.replace_range(10..11, "+");
         assert_eq!(read_initiator(&t, now), Err(CodeError::BadChar { pos: 10 }));
-        // バージョンの 1 B だけ合う先頭（"BwAA"）は、バージョン違いでなく短い。
-        assert_eq!(read_initiator("BwAA", now), Err(CodeError::TooShort));
+        // バージョンの 1 B だけ合う先頭（"CAAA"）は、バージョン違いでなく短い。
+        assert_eq!(read_initiator("CAAA", now), Err(CodeError::TooShort));
         // バージョン 0 の先頭（"AAFE"）は、短くてもバージョン違いが先。
         assert_eq!(read_initiator("AAFE", now), Err(CodeError::BadVersion(0)));
         assert_eq!(read_initiator("", now), Err(CodeError::TooShort));
@@ -1807,7 +1822,7 @@ mod tests {
             Err(CodeError::TooShort)
         );
         // バージョン違い（検算は付け直してあるので、バージョンのガードだけが落とす）。
-        for v in [0u8, 1, 2, 3, 4, 5, 6, 8] {
+        for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 9] {
             let mut b = INIT_BODY;
             b[0] = v;
             assert_eq!(

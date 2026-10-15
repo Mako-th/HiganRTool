@@ -15,6 +15,9 @@
 //! - 数は `Shared` の原子変数に積み、本ログの観戦の集計の行（`spectate_host::Snapshot::text`）に出す。
 //! - 止めるのは `spectate_host::Shared::stop_offer`（つながりの片づけ）。止まったらルームの接続を手放す（閉じ始めるだけで待たない）。
 //!
+//! 観戦コード（ルームを使わない観戦。`OnewayCode`）: 同じ観戦のホストの session・秘密・鍵で、ホストが頼まれるたびに新しい期限のコードを書く
+//! （書くのは `net_code_game` の見張り）。ルームサーバーが無い設定でも用意する。観戦者は返しを出さず、ホストは穴をあけない。
+//!
 //! 観戦用のコードの session と対戦の session は別に引く（`spectate_host::pick_session`）。ゲーム内のメニューの経路では対戦の session は
 //! ルームで相手と会ってから引くので、等しくならない保証は無い（偶然に同じになる確率は 2^-32。同じになると相手のパケットが観戦のホストへ回る）。
 #![forbid(unsafe_code)]
@@ -244,27 +247,64 @@ pub struct OfferKit {
     scope: Scope,
     /// 受信ソケットの族（観戦者の候補のうち、受信スレッドの受信ソケットから送れる族だけに穴をあける）。
     v4: bool,
-    room: RoomOptions,
+    /// ルームサーバー。無ければ観戦用のルームへは入らない（観戦コードの経路だけ）。
+    room: Option<RoomOptions>,
     shared: Arc<Shared>,
+}
+
+/// 観戦コード（ルームを使わない観戦）の材料。ホストが「観戦コードをコピー」のたびに、いまから新しい期限の観戦用のコード（種別 3）を書く。
+/// session・秘密・鍵は配る側と同じ（受信スレッドの観戦のホストは 1 つ）。`Debug` は書かない（秘密を含む）。
+#[derive(Clone)]
+pub struct OnewayCode {
+    session_id: u32,
+    secret: Secret,
+    host_public: [u8; higanr_core::seal::PUBLIC_LEN],
+    /// LAN のアドレス・STUN で見えたアドレス・UPnP で開けたポート。観戦者は穴あけの返しを出さないので、ホストのポートへ外から届く候補だけが効く。
+    candidates: Candidates,
+    name: Name,
+}
+
+impl OnewayCode {
+    /// 観戦コードの文字（期限は `unix` から `code::DEFAULT_TTL_SECS`）。
+    pub fn write(&self, unix: u64) -> Result<String, CodeError> {
+        code::write_spectate(
+            &Code {
+                side: code::Side::Spectate,
+                session_id: self.session_id,
+                secret: Some(self.secret),
+                name: self.name,
+                nat: higanr_core::nat::NatMark::UNKNOWN,
+                candidates: self.candidates,
+                expires: unix.saturating_add(code::DEFAULT_TTL_SECS),
+            },
+            &self.host_public,
+        )
+    }
+
+    pub fn candidates_len(&self) -> usize {
+        self.candidates.len()
+    }
 }
 
 pub struct Armed {
     pub parts: Parts,
     pub kit: OfferKit,
+    pub oneway: OnewayCode,
 }
 
 /// 観戦を使う設定（`[spectate] enable = 1`）のとき、ゲーム内のメニューの経路の観戦のホストを用意する（読み取りのスレッド）。
-/// `local` は受信ソケット、`mapped` は STUN で見えたアドレスで、観戦用のコードの候補はこの 2 つ（IPv6 は載せない。受信スレッドの観戦は IPv4 の受信ソケットだけ）。
-/// 秘密と session はつながりごとに引く。`room` が無ければ観戦用のルームへ入れないので用意しない（理由を返す）。
+/// `local` は受信ソケット、`mapped` は STUN で見えたアドレス、`upnp_port` は UPnP で開けた外側のポート。観戦用のルームへ預けるコードの候補は
+/// `local` と `mapped`、観戦コードの候補はそれに UPnP のポートを足したもの（どちらも IPv6 は載せない。受信スレッドの観戦は IPv4 の受信ソケットだけ）。
+/// 秘密と session はつながりごとに引く。`room` が無くても用意する（観戦コードの経路だけになる）。
 pub fn arm_with(
     s: &NetSettings,
     local: SocketAddr,
     mapped: Option<SocketAddr>,
+    upnp_port: Option<u16>,
     room: Option<RoomOptions>,
     mut draw_session: impl FnMut() -> Result<u32, String>,
     draw_secret: impl FnOnce() -> Result<Secret, String>,
 ) -> Result<Armed, String> {
-    let room = room.ok_or("ルームサーバー（room_server）が無い（観戦用のルームへ入れない）")?;
     let session_id = spectate_host::pick_session(&mut draw_session, s.session_id)?;
     let secret = draw_secret()?;
     // 観戦用の使い捨ての鍵: つながりごとに OS の乱数で引く。公開鍵は観戦用のコード（ルームサーバーへ預ける）に載せる。
@@ -275,10 +315,12 @@ pub fn arm_with(
     };
     let host_public = host.public();
     let candidates = s.candidates_for(local, mapped, None)?;
+    let oneway_candidates = s.candidates_for_upnp(local, mapped, None, upnp_port)?;
     let ring = Arc::new(SpectateRing::new());
     let shared = Arc::new(Shared::default());
     shared.offer.armed.store(true, Ordering::Release);
     let sender = SpectateSender::new(host, Arc::clone(&ring), s.scope, Arc::clone(&shared));
+    let name = Name::new(&s.name);
     Ok(Armed {
         parts: Parts { ring, sender },
         kit: OfferKit {
@@ -286,11 +328,18 @@ pub fn arm_with(
             secret,
             host_public,
             candidates,
-            name: Name::new(&s.name),
+            name,
             scope: s.scope,
             v4: local.is_ipv4(),
             room,
             shared,
+        },
+        oneway: OnewayCode {
+            session_id,
+            secret,
+            host_public,
+            candidates: oneway_candidates,
+            name,
         },
     })
 }
@@ -300,6 +349,7 @@ pub fn arm(
     s: &NetSettings,
     local: SocketAddr,
     mapped: Option<SocketAddr>,
+    upnp_port: Option<u16>,
     room: Option<RoomOptions>,
 ) -> (Option<Armed>, String) {
     if s.spectate.is_none() {
@@ -309,6 +359,7 @@ pub fn arm(
         s,
         local,
         mapped,
+        upnp_port,
         room,
         || {
             let mut b = [0u8; 4];
@@ -321,9 +372,15 @@ pub fn arm(
     ) {
         Ok(a) => {
             let note = format!(
-                " / 観戦の配る側を用意した（観戦用の session 0x{:08X}・候補 {} 件。ルームで会った相手と繋がった試合のホストだけが、観戦用のルームで観戦者を待つ）",
+                " / 観戦の配る側を用意した（観戦用の session 0x{:08X}・候補 {} 件・観戦コードの候補 {} 件。{}）",
                 a.kit.session_id,
-                a.kit.candidates.len()
+                a.kit.candidates.len(),
+                a.oneway.candidates_len(),
+                if a.kit.room.is_some() {
+                    "ルームで会った相手と繋がった試合のホストだけが、観戦用のルームで観戦者を待つ。観戦コードはどの経路の試合でもホストが配る"
+                } else {
+                    "ルームサーバーが無いので、観戦用のルームへは入らない。観戦コードはホストが配る"
+                }
             );
             (Some(a), note)
         }
@@ -349,6 +406,9 @@ pub struct ListingInfo {
 /// （ランダム対戦は割り当てのルーム名）。`listing` があれば、観戦者の数を載せつつ一覧に載せる。
 /// 起こせなければ理由を返す（観戦だけを使わない。対戦は続く）。
 pub fn spawn(kit: OfferKit, room: &RoomName, listing: Option<ListingInfo>) -> Result<(), String> {
+    if kit.room.is_none() {
+        return Err("ルームサーバー（room_server）が無い（観戦用のルームへ入れない）".to_string());
+    }
     let shared = Arc::clone(&kit.shared);
     let mut runner = Runner::new(kit, room.spectate_of(), listing);
     let sh = Arc::clone(&shared);
@@ -480,12 +540,15 @@ impl Runner {
             .unwrap_or(u8::MAX)
             .min(l.info.posting.cap);
         if l.conn.is_none() && now_ms >= l.retry_at_ms {
-            match HostListConn::start_post(&self.kit.room, l.info.build, l.info.posting, watchers) {
-                Ok(c) => {
+            let started = self.kit.room.as_ref().and_then(|r| {
+                HostListConn::start_post(r, l.info.build, l.info.posting, watchers).ok()
+            });
+            match started {
+                Some(c) => {
                     l.watchers = watchers;
                     l.conn = Some(c);
                 }
-                Err(_) => {
+                None => {
                     self.kit.shared.offer.bump(Stat::ConnectErrors);
                     l.fails = l.fails.saturating_add(1);
                     l.retry_at_ms = now_ms + relist_delay(l.fails);
@@ -532,9 +595,14 @@ impl Runner {
     }
 
     fn connect(&mut self, now_ms: u64) {
-        match RoomConn::start(&self.kit.room, &self.room) {
-            Ok(c) => self.conn = Some(c),
-            Err(_) => {
+        let started = self
+            .kit
+            .room
+            .as_ref()
+            .and_then(|r| RoomConn::start(r, &self.room).ok());
+        match started {
+            Some(c) => self.conn = Some(c),
+            None => {
                 // スレッドを起こせない。`Caster` に「繋げなかった」の入口が無いので、応答しない扱い（30 秒から倍々で待つ）にする。
                 self.stats().bump(Stat::ConnectErrors);
                 self.caster

@@ -47,6 +47,10 @@ pub fn detect(ini_flag: Option<&Path>, dll_dir: &Path, os_langid: u16) -> Lang {
     detect_with(ini_flag, inherited.as_deref(), dll_dir, os_langid)
 }
 
+/// ゲームのメニューの項目の名前。英語の文でも訳さずに書くので、「英語に日本語が無い」検査は除いてから見る。
+#[cfg(test)]
+pub const GAME_ITEM_NAME: &str = "妖怪 対 妖怪";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +131,10 @@ mod tests {
             ("code_relay::CLOSE_HINT", relay::CLOSE_HINT),
             ("game_pick::DIALOG_TITLE", game_pick::DIALOG_TITLE),
             ("hold::HOLD_TEXT", hold::HOLD_TEXT),
+            ("hold::CLOSE_ONLY_TEXT", hold::CLOSE_ONLY_TEXT),
+            ("single::ALREADY_RUNNING", crate::single::ALREADY_RUNNING),
+            ("post_update::NOTES", crate::post_update::NOTES),
+            ("post_update::ENTER_TEXT", crate::post_update::ENTER_TEXT),
             ("launch::DLL_NOT_ABSOLUTE", launch::DLL_NOT_ABSOLUTE),
             ("launch::DLL_PATH_HAS_NUL", launch::DLL_PATH_HAS_NUL),
         ]
@@ -140,7 +148,7 @@ mod tests {
             assert_ne!(t.ja, t.en, "{name} が日英で同じ");
             assert!(has_japanese(t.ja), "{name} の日本語に日本語の文字が無い");
             // ゲームの項目の名前は訳さないので数えない。英語の文に日本語の括弧は使わない。
-            let without_game_item = t.en.replace("妖怪 対 妖怪", "");
+            let without_game_item = t.en.replace(GAME_ITEM_NAME, "");
             assert!(
                 !has_japanese(&without_game_item),
                 "{name} の英語に日本語の文字: {}",

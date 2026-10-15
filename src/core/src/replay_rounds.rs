@@ -358,6 +358,7 @@ impl MatchSummary {
             }),
             rounds: round_records(&bs),
             rounds_dropped: self.rounds_dropped,
+            charge: None,
         }
     }
 }

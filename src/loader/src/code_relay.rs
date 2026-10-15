@@ -92,7 +92,7 @@ pub fn is_game_menu(ini_text: &str) -> bool {
 
 /// 項目の名前（妖怪 対 妖怪）は訳さない。
 pub const GAME_MENU_HINT: Tx = Tx {
-    ja: "ゲームの中の Match Mode →「妖怪 対 妖怪」から接続します。",
+    ja: "ゲームの中のMatch Mode →「妖怪 対 妖怪」から接続します。",
     en: "Connect from Match Mode > 妖怪 対 妖怪 in the game.",
 };
 
@@ -133,7 +133,7 @@ pub fn plan(
         let shown = dir.display();
         return Err(by_lang!(
             lang,
-            ja: "接続コードの置き場 {shown} がゲームのフォルダの中なので、このウィンドウでの受け渡しはしません",
+            ja: "接続コードの置き場{shown}がゲームのフォルダの中なので、このウィンドウでの受け渡しはしません",
             en: "The connection code folder {shown} is inside the game folder, so codes are not exchanged in this window"
         ));
     }
@@ -192,7 +192,7 @@ pub const CLEANED_UP_MY_CODE: Tx = Tx {
 
 fn cannot_remove(p: &Path, e: &std::io::Error, lang: Lang) -> String {
     let shown = p.display();
-    by_lang!(lang, ja: "{shown} を消せません: {e}", en: "Cannot delete {shown}: {e}")
+    by_lang!(lang, ja: "{shown}を消せません: {e}", en: "Cannot delete {shown}: {e}")
 }
 
 /// ゲームの強制終了で dll が消しそびれた `my_code.txt`（始める側の秘密を含む）を消す。`peer_code.txt` と `status.txt` は残す。
@@ -367,7 +367,7 @@ fn shape_words(mode: Mode, d: u8, lang: Lang) -> String {
             let unit = if d == 1 { "frame" } else { "frames" };
             format!("rollback, Delay {d} {unit}")
         }
-        (Mode::Delay, Lang::Ja) => "delay 方式".to_string(),
+        (Mode::Delay, Lang::Ja) => "delay方式".to_string(),
         (Mode::Delay, Lang::En) => "delay".to_string(),
     }
 }
@@ -384,12 +384,12 @@ pub fn mode_intro(ini: Shape, lang: Lang) -> String {
     let words = shape_words(ini.mode, ini.delay, lang);
     match (ini.mode, lang) {
         (Mode::Rollback, Lang::Ja) => format!(
-            "HiganRTool: 同期方式: {words}。変えるなら、相手のコードを貼る前に 0〜8 の数字（rollback のディレイのフレーム数）か delay と打って Enter を押してください（rollback は 2 人とも選んだときだけ。ディレイはホストの値を使います）。"
+            "HiganRTool: 同期方式: {words}。変えるなら、相手のコードを貼る前に0〜8の数字（rollbackのディレイのフレーム数）かdelayと打ってEnterを押してください（rollbackは2人とも選んだときだけ。ディレイはホストの値を使います）。"
         ),
         (Mode::Rollback, Lang::En) => format!(
             "HiganRTool: Netcode: {words}. To change it, type a number 0-8 (the Delay in frames for rollback) or delay and press Enter before you paste your opponent's code (rollback is used only when both players choose it; the host's Delay is used)."
         ),
-        (Mode::Delay, Lang::Ja) => "HiganRTool: 同期方式: delay 方式。".to_string(),
+        (Mode::Delay, Lang::Ja) => "HiganRTool: 同期方式: delay方式。".to_string(),
         (Mode::Delay, Lang::En) => "HiganRTool: Netcode: delay.".to_string(),
     }
 }
@@ -398,7 +398,7 @@ pub fn mode_intro(ini: Shape, lang: Lang) -> String {
 pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
     let head = match (pick, ini.mode, lang) {
         (Pick::Rollback(_), Mode::Delay, Lang::Ja) => {
-            "HiganRTool: 設定ファイル HiganRTool.ini が delay 方式になっているので、rollback にはなりません。delay 方式で接続します。".to_string()
+            "HiganRTool: 設定ファイルHiganRTool.iniがdelay方式になっているので、rollbackにはなりません。delay方式で接続します。".to_string()
         }
         (Pick::Rollback(_), Mode::Delay, Lang::En) => {
             "HiganRTool: HiganRTool.ini is set to delay, so rollback is not used. Connecting with delay.".to_string()
@@ -407,7 +407,7 @@ pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
             let words = pick_words(pick, lang);
             by_lang!(
                 lang,
-                ja: "HiganRTool: 同期方式を {words}にしました。",
+                ja: "HiganRTool: 同期方式を{words}にしました。",
                 en: "HiganRTool: Netcode set to {words}."
             )
         }
@@ -415,7 +415,7 @@ pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
     if placed {
         match lang {
             Lang::Ja => format!(
-                "{head} 相手のコードをもう受け取ったので、この接続では変わりません。変えるなら 2 人とも起動し直してください。"
+                "{head} 相手のコードをもう受け取ったので、この接続では変わりません。変えるなら2人とも起動し直してください。"
             ),
             Lang::En => format!(
                 "{head} Your opponent's code was already received, so this does not change this connection. To change it, both players must restart."
@@ -427,7 +427,7 @@ pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
 }
 
 pub const REFUSE_SHORT: Tx = Tx {
-    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら 0〜8 の数字か delay のどれか、接続コードなら途中で切れていないか確かめて 1 行で全部貼ってください。",
+    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら0〜8の数字かdelayのどれか、接続コードなら途中で切れていないか確かめて1行で全部貼ってください。",
     en: "HiganRTool: Too short to be a connection code or a netcode choice. For a netcode, type a number 0-8 or delay. For a connection code, check that it was not cut off and paste all of it on one line.",
 };
 
@@ -480,12 +480,12 @@ fn replace_file(
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| {
         let shown = dir.display();
-        by_lang!(lang, ja: "{shown} を作れません: {e}", en: "Cannot create {shown}: {e}")
+        by_lang!(lang, ja: "{shown}を作れません: {e}", en: "Cannot create {shown}: {e}")
     })?;
     let tmp = dir.join(tmp_name);
     std::fs::write(&tmp, text).map_err(|e| {
         let shown = tmp.display();
-        by_lang!(lang, ja: "{shown} に書けません: {e}", en: "Cannot write to {shown}: {e}")
+        by_lang!(lang, ja: "{shown}に書けません: {e}", en: "Cannot write to {shown}: {e}")
     })?;
     let dest = dir.join(dest_name);
     let mut last = None;
@@ -503,7 +503,7 @@ fn replace_file(
     let why = last.map_or_else(String::new, |e| e.to_string());
     Err(by_lang!(
         lang,
-        ja: "{shown} へ置き換えられません: {why}",
+        ja: "{shown}へ置き換えられません: {why}",
         en: "Cannot replace {shown}: {why}"
     ))
 }
@@ -570,13 +570,13 @@ impl Relay {
         let lang = self.lang;
         let todo = match (self.plan.side, lang) {
             (Side::Offer, Lang::Ja) => {
-                "自分の接続コードが下に出たら相手に送り、相手から返ってきたコードをここに貼って Enter を押してください。"
+                "自分の接続コードが下に出たら相手に送り、相手から返ってきたコードをここに貼ってEnterを押してください。"
             }
             (Side::Offer, Lang::En) => {
                 "When your connection code appears below, send it to your opponent, paste the code they send back here, and press Enter."
             }
             (Side::Answer, Lang::Ja) => {
-                "相手から届いた接続コードをここに貼って Enter を押してください。"
+                "相手から届いた接続コードをここに貼ってEnterを押してください。"
             }
             (Side::Answer, Lang::En) => {
                 "Paste the connection code you received from your opponent here and press Enter."
@@ -801,7 +801,7 @@ pub const LOGS_DIR: &str = "logs";
 pub const NET_FRAMES_SUFFIX: &str = "_net_frames.csv.gz";
 
 pub const CLOSE_HINT: Tx = Tx {
-    ja: "HiganRTool: Enter キーを押すと、このウィンドウを閉じます。",
+    ja: "HiganRTool: Enterキーを押すと、このウィンドウを閉じます。",
     en: "HiganRTool: Press Enter to close this window.",
 };
 
@@ -834,7 +834,7 @@ pub fn send_files_line(log: Option<&str>, csv: Option<&str>, lang: Lang) -> Stri
             if let Some(c) = csv {
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}\\{l} と {LOGS_DIR}\\{c}",
+                    ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}\\{l}と{LOGS_DIR}\\{c}",
                     en: "HiganRTool: Files to send: {LOGS_DIR}\\{l} and {LOGS_DIR}\\{c}"
                 )
             } else {
@@ -847,7 +847,7 @@ pub fn send_files_line(log: Option<&str>, csv: Option<&str>, lang: Lang) -> Stri
         }
         None => by_lang!(
             lang,
-            ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR} フォルダの一番新しい dll_…log と、同じ名前で始まる {NET_FRAMES_SUFFIX}",
+            ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}フォルダの一番新しいdll_…logと、同じ名前で始まる{NET_FRAMES_SUFFIX}",
             en: "HiganRTool: Files to send: the newest dll_...log in the {LOGS_DIR} folder, and the {NET_FRAMES_SUFFIX} file whose name starts the same"
         ),
     }
@@ -857,7 +857,7 @@ pub fn send_files_line(log: Option<&str>, csv: Option<&str>, lang: Lang) -> Stri
 pub fn more_detail_line(lang: Lang) -> String {
     by_lang!(
         lang,
-        ja: "HiganRTool: もっと詳しい記録が要るときは、HiganRTool.ini の [log] の detail = 0 を detail = 1 に変えて（[log] が無い古い ini なら [log] と detail = 1 の 2 行を足して）もう一度遊んでください。",
+        ja: "HiganRTool: もっと詳しい記録が要るときは、HiganRTool.iniの[log]のdetail = 0をdetail = 1に変えて（[log]が無い古いiniなら[log]とdetail = 1の2行を足して）もう一度遊んでください。",
         en: "HiganRTool: For a more detailed record, change detail = 0 under [log] in HiganRTool.ini to detail = 1 and play again. If your old ini has no [log], add the two lines [log] and detail = 1."
     )
 }
@@ -1064,7 +1064,7 @@ mod tests {
         }
         assert_eq!(
             GAME_MENU_HINT.ja,
-            "ゲームの中の Match Mode →「妖怪 対 妖怪」から接続します。"
+            "ゲームの中のMatch Mode →「妖怪 対 妖怪」から接続します。"
         );
         assert_eq!(
             GAME_MENU_HINT.en, "Connect from Match Mode > 妖怪 対 妖怪 in the game.",
@@ -1738,7 +1738,7 @@ mod tests {
         let both = send_files_line(Some(log), Some(csv), Lang::Ja);
         assert_eq!(
             both,
-            "HiganRTool: 送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.log と logs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"
+            "HiganRTool: 送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.logとlogs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"
         );
         let only = send_files_line(Some(log), None, Lang::Ja);
         assert_eq!(
@@ -1747,7 +1747,7 @@ mod tests {
         );
         let none = send_files_line(None, None, Lang::Ja);
         assert!(
-            none.contains("logs フォルダの一番新しい dll_…log")
+            none.contains("logsフォルダの一番新しいdll_…log")
                 && none.contains("_net_frames.csv.gz"),
             "{none}"
         );
@@ -1770,7 +1770,7 @@ mod tests {
         }
         let both = send_files_for(&logs, 2944, Lang::Ja);
         assert!(
-            both.contains("logs\\dll_20260929-091738-034_pid2944.log と logs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"),
+            both.contains("logs\\dll_20260929-091738-034_pid2944.logとlogs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"),
             "{both}"
         );
         let no_csv = send_files_for(&logs, 45288, Lang::Ja);
@@ -1824,7 +1824,7 @@ mod tests {
         assert!(!hint(&clean), "他の実行の × を拾った: {clean}");
         assert!(
             clean.ends_with(&format!(
-                "logs\\dll_20261013.log と logs\\{}_net_frames.csv.gz",
+                "logs\\dll_20261013.logとlogs\\{}_net_frames.csv.gz",
                 stem(21)
             )),
             "同じ PID の最後の実行の CSV を指す: {clean}"
@@ -1838,7 +1838,7 @@ mod tests {
         let yesterday = send_files_for(&logs, 40, Lang::Ja);
         assert!(hint(&yesterday), "{yesterday}");
         assert!(
-            yesterday.contains("logs\\dll_20261012.log と logs\\"),
+            yesterday.contains("logs\\dll_20261012.logとlogs\\"),
             "{yesterday}"
         );
         let none = send_files_for(&logs, 99, Lang::Ja);
@@ -2072,7 +2072,7 @@ mod tests {
                 mode_pick::Pick::Rollback(8),
                 "rollback・ディレイ 8 フレームにしました",
             ),
-            ("DeLay", mode_pick::Pick::Delay, "delay 方式にしました"),
+            ("DeLay", mode_pick::Pick::Delay, "delay方式にしました"),
             (
                 "1",
                 mode_pick::Pick::Rollback(1),
@@ -2090,7 +2090,7 @@ mod tests {
             // 文全体で比べる（部分の一致では空白の抜けを見逃す）。
             assert_eq!(
                 h.said[n],
-                format!("HiganRTool: 同期方式を {reply}。"),
+                format!("HiganRTool: 同期方式を{reply}。"),
                 "{typed:?}"
             );
             assert!(!h.said[n].contains("貼り直した"), "{}", h.said[n]);
@@ -2137,7 +2137,7 @@ mod tests {
             assert_eq!(h.said[n0], REFUSE_SHORT.ja, "{bad:?}");
         }
         assert!(
-            REFUSE_SHORT.ja.contains("0〜8 の数字か delay") && !REFUSE_SHORT.ja.contains("auto"),
+            REFUSE_SHORT.ja.contains("0〜8の数字かdelay") && !REFUSE_SHORT.ja.contains("auto"),
             "{}",
             REFUSE_SHORT.ja
         );
@@ -2201,9 +2201,9 @@ mod tests {
         assert_eq!(r.tick(&mut h, &lines(&["delay"])), None);
         let last = h.said.last().unwrap();
         assert!(
-            last.contains("delay 方式にしました")
+            last.contains("delay方式にしました")
                 && last.contains(
-                    "相手のコードをもう受け取ったので、この接続では変わりません。変えるなら 2 人とも起動し直してください。"
+                    "相手のコードをもう受け取ったので、この接続では変わりません。変えるなら2人とも起動し直してください。"
                 ),
             "{last}"
         );
@@ -2228,7 +2228,7 @@ mod tests {
         let line = intro.lines().last().unwrap();
         assert_eq!(
             line,
-            "HiganRTool: 同期方式: rollback・ディレイ 1 フレーム。変えるなら、相手のコードを貼る前に 0〜8 の数字（rollback のディレイのフレーム数）か delay と打って Enter を押してください（rollback は 2 人とも選んだときだけ。ディレイはホストの値を使います）。"
+            "HiganRTool: 同期方式: rollback・ディレイ 1 フレーム。変えるなら、相手のコードを貼る前に0〜8の数字（rollbackのディレイのフレーム数）かdelayと打ってEnterを押してください（rollbackは2人とも選んだときだけ。ディレイはホストの値を使います）。"
         );
         for l in intro.lines() {
             for_people(l);
@@ -2241,14 +2241,14 @@ mod tests {
         let mut r = mode_relay(&d, "enable = 1\nmode = delay\ndelay = 0\n");
         assert_eq!(
             r.intro().lines().last().unwrap(),
-            "HiganRTool: 同期方式: delay 方式。"
+            "HiganRTool: 同期方式: delay方式。"
         );
         let mut h = Fake::new();
         assert_eq!(r.tick(&mut h, &lines(&["2"])), None);
         let said = &h.said[0];
         assert!(
-            said.contains("rollback にはなりません")
-                && said.contains("delay 方式で接続します")
+            said.contains("rollbackにはなりません")
+                && said.contains("delay方式で接続します")
                 && !said.contains("にしました"),
             "{said}"
         );
@@ -2259,7 +2259,7 @@ mod tests {
             Some(mode_pick::FileRead::Mine(mode_pick::Pick::Rollback(2)))
         );
         assert_eq!(r.tick(&mut h, &lines(&["delay"])), None);
-        assert!(h.said[1].contains("delay 方式にしました"), "{}", h.said[1]);
+        assert!(h.said[1].contains("delay方式にしました"), "{}", h.said[1]);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use higanr_core::candidate::Candidates;
 use higanr_core::handshake::{self, Name};
-use higanr_core::input_model::SEND_MASK;
+use higanr_core::input_model::MATCH_SEND_MASK;
 use higanr_core::link;
 use higanr_core::spectate::WatcherConfig;
 use higanr_core::wire::{ByeReason, Seat};
@@ -220,7 +220,8 @@ fn a_dll_watcher_follows_peer_sim_players_through_selection_and_rematches() {
     assert_eq!(w.wg.played, rows(&ra.recs), "観戦者の列とホストの列");
     let steps: Vec<_> = w.wp.step_log().iter().map(|s| s.step).collect();
     assert_eq!(steps, ra.presses, "入った押下の列\n{summary}");
-    assert_eq!(steps.len(), 11);
+    // キャラ選択（8）は合わせない（難易度・マップの合わせだけが入る）。
+    assert_eq!(steps.len(), 10);
     assert_eq!(w.wg.watched.len(), 1);
     let [s1, s2] = w.wg.watched[0];
     assert_eq!(
@@ -423,7 +424,7 @@ fn play(with_watcher: bool, sc: Scenario) -> Play {
         host_seat: Seat::P2,
         seed: 0x51,
         follow: sc.follow,
-        word_mask: SEND_MASK,
+        word_mask: MATCH_SEND_MASK,
         life: 3,
         poll_ms: 1,
         segs: 3,

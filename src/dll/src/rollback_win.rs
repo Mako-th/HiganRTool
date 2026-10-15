@@ -1096,6 +1096,8 @@ extern "C" fn rb_scan_wrapper(this: u32) -> i32 {
                 // パニック: フックを外す。フックの中で走査を呼び終えていたかは分からないので、走査を呼び直さず 1（描画へ進む値）を返す（同じフレームで 2 回更新しない）。
                 SCAN_HANDLER.store(0, Ordering::SeqCst);
                 RB_REDIRECT.store(0, Ordering::SeqCst);
+                // フックを外したまま対戦を続けると相手だけが先へ進むので、ネットワークを閉じて相手に BYE を出す。
+                crate::script_win::net_panicked();
                 return 1;
             }
         }
@@ -1637,6 +1639,27 @@ mod tests {
             assert!(!redirectable(c.start, 0), "{}", c.why);
             assert!(!redirectable(ALLOC_WRAP_RET, c.end - 1), "{}", c.why);
         }
+    }
+
+    fn panicking_scan_handler(_this: u32) -> Option<i32> {
+        panic!("検査: 走査のフックのパニック");
+    }
+
+    #[test]
+    fn a_panicking_scan_handler_is_dropped_closes_the_net_and_asks_for_a_bye() {
+        use crate::script_win::{NET_ON, NET_PANICKED, PANIC_BYES};
+        use crate::stub::testkit::REAL_HOOK_TESTS;
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        NET_PANICKED.store(0, Ordering::SeqCst);
+        NET_ON.store(1, Ordering::SeqCst);
+        set_scan_handler(Some(panicking_scan_handler));
+        let b0 = PANIC_BYES.load(Ordering::SeqCst);
+        assert_eq!(rb_scan_wrapper(0), 1, "走査を呼び直さず 1 を返す");
+        assert!(!scan_handler_is_set(), "フックを外さない");
+        assert_eq!(NET_ON.load(Ordering::SeqCst), 0, "ネットワークを閉じない");
+        assert_eq!(NET_PANICKED.load(Ordering::SeqCst), 1);
+        assert_eq!(PANIC_BYES.load(Ordering::SeqCst), b0 + 1, "BYE を頼まない");
+        NET_PANICKED.store(0, Ordering::SeqCst);
     }
 
     static SEEN_ECX: AtomicU32 = AtomicU32::new(0);
