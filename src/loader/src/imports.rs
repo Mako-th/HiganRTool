@@ -180,7 +180,7 @@ fn missing_line(m: &Missing, os: &str, lang: Lang) -> String {
             let dll = &m.dll;
             by_lang!(
                 lang,
-                ja: "この Windows には {dll}!{f} がありません（Windows のバージョン: {os}）",
+                ja: "このWindowsには{dll}!{f}がありません（Windowsのバージョン: {os}）",
                 en: "This Windows does not have {dll}!{f} (Windows version: {os})"
             )
         }
@@ -188,7 +188,7 @@ fn missing_line(m: &Missing, os: &str, lang: Lang) -> String {
             let dll = &m.dll;
             by_lang!(
                 lang,
-                ja: "この Windows には {dll} がありません（Windows のバージョン: {os}）",
+                ja: "このWindowsには{dll}がありません（Windowsのバージョン: {os}）",
                 en: "This Windows does not have {dll} (Windows version: {os})"
             )
         }
@@ -205,7 +205,7 @@ pub fn describe(report: &Report, os: &str, lang: Lang) -> Option<String> {
         let _ = writeln!(text, "{}", missing_line(m, os, lang));
     }
     text.push_str(match lang {
-        Lang::Ja => "この Windows では HiganRTool を動かせないため、何も起動していません。",
+        Lang::Ja => "このWindowsではHiganRToolを動かせないため、何も起動していません。",
         Lang::En => "HiganRTool cannot run on this Windows, so nothing was started.",
     });
     Some(text)
@@ -409,7 +409,7 @@ mod tests {
         let text = describe(&r, "10.0.10240", Lang::Ja).unwrap();
         assert!(
             text.contains(
-                "この Windows には KERNEL32.dll!GetSystemCpuSetInformation がありません（Windows のバージョン: 10.0.10240）"
+                "このWindowsにはKERNEL32.dll!GetSystemCpuSetInformationがありません（Windowsのバージョン: 10.0.10240）"
             ),
             "{text}"
         );

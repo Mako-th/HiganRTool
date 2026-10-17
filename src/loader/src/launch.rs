@@ -155,11 +155,11 @@ pub struct LaunchFailure {
 }
 
 pub const DLL_NOT_ABSOLUTE: Tx = Tx {
-    ja: "絶対パスでない",
+    ja: "絶対パスではありません",
     en: "not an absolute path",
 };
 pub const DLL_PATH_HAS_NUL: Tx = Tx {
-    ja: "パスの途中に0がある",
+    ja: "パスの途中に0があります",
     en: "the path contains a NUL character",
 };
 

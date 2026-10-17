@@ -1,32 +1,16 @@
-HiganRTool v1.1.0 changes
+HiganRTool v1.1.1 changes
 
-Not compatible with v1.0.0. Both players need the same version.
-
-[New]
-- LAN play (host, client and spectating).
-- Watch codes. The host copies the code with Ctrl+C and gives it to a spectator, who enters it in Paste watch code.
-- Ctrl now works for random character/stage select and for skipping dialogue.
-- The R key for random select has been removed.
-- After a disconnect, you return to 妖怪 対 妖怪 in Match Mode.
-- HiganRTool_replay_fix.exe (repairs old replays) is included in the zip.
-- Automatic updates show their progress and then these change notes.
-- During online play, P / Home take a screenshot on your own PC only (not on the opponent's).
+Different versions cannot connect to each other. Use the same version as your opponent.
 
 [Fixed]
-- Saved replays desynced on playback when the two players used different charge settings (slow / charge).
-- Could not connect to the room server under Wine.
-- The launcher now waits up to 60 seconds (was 10) for the DLL to load, for slow starts such as under Wine.
-- The game no longer waits forever when the opponent freezes or crashes (disconnects after 60 seconds).
-- Keyboard input works even when Player 1's input device is set to a gamepad.
-- On character select, the opponent's cursor no longer drifts.
-- Late spectators catch up without stalling.
-- With a d3d8.dll (such as ENB) in the game folder, the game crashed when 妖怪 対 妖怪 was chosen.
-- Starting HiganRTool.exe several times in a row started several copies of the game.
-- The notice when a match connects now flashes only the taskbar button.
+- Fixed LAN play and spectating not working over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
+- The LAN host's waiting screen now also shows the addresses of virtual adapters (such as VMware). With 4 or more, use Up/Down to see the rest.
+- When both players want the same side, it is now decided at random instead of first come, first served.
+- While "Waiting for the opponent" is shown, you now disconnect by holding Esc for 3 seconds.
+- Fixed replays recording the delay from before the change in matches where the delay was changed right after connecting.
+- Fixed the detailed log (.csv.gz) sometimes being cut off when the game was closed.
+- Some on-screen wording and menu messages were fine-tuned.
 
-[Controls and settings]
-- The menu is now Play / Watch / Connect code / LAN / Settings.
-- Auto delay was revised. For rollback it picks a lower value for the same ping, and it picks 0F when the ping is low and stable.
-- A line in HiganRTool.ini that cannot be read falls back to its default; the rest still works.
-- On update, HiganRTool.ini is brought to the new layout. Settings you changed are kept.
-- Set update_check = 0 under [loader] in HiganRTool.ini to turn off automatic updates.
+[Logs]
+- Each connection (the menu item chosen, whether you are the host, and the waiting time) and spectators joining and leaving are now recorded.
+- When the update check is skipped at startup, the reason is now recorded.

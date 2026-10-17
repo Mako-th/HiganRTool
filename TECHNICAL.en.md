@@ -6,6 +6,7 @@ This document explains how HiganRTool works, for people involved in developing t
 For how to play, see the [README](./README.en.md).
 Values (limits, timeouts and so on) are taken from constants in the source in this repository.
 If this document and the source disagree, treat the source as correct.
+This document was written by AI (see "[About the use of AI](./README.en.md#about-the-use-of-ai)" in the README).
 
 ## Contents
 
@@ -34,7 +35,7 @@ The game is 32-bit, so every Rust part is built for `i686-pc-windows-msvc` (stat
 - **Room server** (`src/server`): A small server on Cloudflare Workers and Durable Objects. It only relays connection codes, runs the random-match queue and the spectator list, and redirects update downloads.
 - **Fake opponent** (`src/peer_sim`, `peer_sim.exe`): A test opponent that speaks the protocol without the game. It is not shipped.
 - **Manifest signing tool** (`src/manifest_sign`): Used by the distributor to sign the update manifest. It is not shipped.
-- **Replay fix tool** (`HiganRTool_replay_fix.exe`): Fixes the header of replays saved by v1.0.0 when the two players used different charge settings. It never changes the original files.
+- **Replay Repair Tool** (`HiganRTool_replay_fix.exe`): Fixes the header of replays saved by v1.0.0 when the two players used different charge settings. It never changes the original files.
 
 `unsafe` is confined to the layers of the DLL and loader that touch Win32, hooks and game memory, and each use has a `// SAFETY:` comment explaining why it is sound.
 
@@ -121,9 +122,11 @@ The game keeps input in three parts: 1P, 2P, and the two combined.
 HiganRTool uses the same building blocks as the game's own built-in netplay.
 
 1. It has the game's own input-reading function read the local input as 1P. The value follows the 1P key configuration.
-   When the 1P input device is a gamepad, input from the keyboard's FULL layout is added.
-   If the 2P input device is also a gamepad, that gamepad's input is mixed in as well.
-2. Only the bits for Z, X, Shift, Esc and the directions are sent. The opponent's bits also take effect on your side, so keys such as the screenshot key are not sent.
+   When the 1P input device is a gamepad, the keyboard (FULL layout) also works.
+   For this, the input the game itself reads for both players combined is added.
+   So if a different gamepad is selected as the 2P input device and it is connected, that gamepad's input is mixed in as well.
+   Until the match is set, input is read the game's own way.
+2. Only the bits for Z, X, Shift, Esc, Ctrl and the directions are sent (Ctrl is used for skipping dialogue and random character / map select). The opponent's bits also take effect on your side, so keys such as the screenshot key are not sent.
 3. It orders the two values by seat and lets the game's own input-building function produce all three parts. The previous value, press and release edges, and key repeat are produced by the game itself, so the rules are exactly those of the unmodified game.
 
 The local input is read at the same point as in the unmodified game (the start of the input update), so reading input adds no delay.
@@ -191,16 +194,17 @@ Because re-simulation happens after `Present`, it adds no time between reading i
 
 The delay can be set to `auto` or to 0 to 8 frames.
 For both netcodes, the initial value comes from the "Delay" item in the menu or from `[netplay] delay` in `HiganRTool.ini` (`auto` or `0` to `8`; the default is `auto`).
-Both players can change it with Ctrl + a number key, even during a match (9 is auto).
+Both players can change it with Ctrl+number key, even during a match (9 is auto).
 A change by the guest is a request to the host.
 The host puts a schedule, "from this frame, the delay is x", into INPUT, and both players switch at that same frame.
 Because the switch is tied to a frame number rather than to the moment of the key press, network latency cannot make the two input sequences diverge.
 
 Auto picks a recommended value from the round-trip time (RTT):
 
-- **Recommended value**: Based on the one-way time (RTT ÷ 2) divided by one frame (1000 ÷ 60 ms), clamped to 1–8.
+- **Recommended value**: Based on the one-way time (RTT ÷ 2) divided by one frame (1000 ÷ 60 ms), clamped to 1–8. It is 0 only when the round trip is small and stable.
   - Delay mode: the one-way frames rounded up (⌈RTT × 3 ÷ 100⌉). Anything lower makes every frame wait for the opponent's input.
   - Rollback: half of the one-way frames, rounded to the nearest (an exact half goes down). Prediction covers the other half. 30 ms RTT gives 1, 150 ms gives 2, 280 ms gives 4, 400 ms gives 6.
+  - Zero: the recommendation is 0 only when the largest of the last 8 round trips is at most 8 ms in delay mode or 16 ms in rollback. A single round trip above that rules it out, and so does having fewer than 3 measurements.
 - **RTT**: The median of the last 8 PING/PONG exchanges, sent once per second. PONG is answered by the receive thread, so the length of a game frame is not included.
 - **Re-evaluation**: Only when 9 is pressed, when the guest asks for auto, and at the start of each seg; it does not follow the RTT during a match. So that an RTT sitting on a boundary does not flip the value every match, the value goes up only if "RTT − 5 ms" still gives a higher recommendation, and goes down only after two lower recommendations in a row.
 
@@ -240,7 +244,7 @@ Minimizing input latency takes priority over everything else.
 - Input is read just before the game reads it, and sent immediately.
 - Waiting for the opponent is driven by receive events, not by polling at a fixed interval.
 - Every packet carries all recent unacknowledged input, so a single lost packet is filled in without waiting for a resend.
-- There is no DTLS, SCTP or WebRTC in between; the tool's own encryption runs directly on plain UDP (its cost is on the order of microseconds per packet).
+- There is no DTLS, SCTP or WebRTC in between; encryption (see 4-3) runs directly on plain UDP (its cost is on the order of microseconds per packet).
 - Work for the room server, spectators and replays is done off the game thread.
 
 
@@ -474,7 +478,7 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
 - **Refusing**: In a random match, if either player has `[spectate] enable = 0`, the match is not posted to the list. In a room match, if the host has `enable = 0`, it does not enter the spectating room. The match host is decided at random, so to refuse spectators in a room match, both players set `enable = 0`.
 
 Matches connected with connection codes cannot be spectated through a room, because there is no room name to derive a spectating room from.
-Instead, the host copies a watch code with Ctrl + C, and the spectator pastes it with "Paste watch code". The spectator then connects directly to the host without going through the room server.
+Instead, the host copies a watch code with Ctrl+C, and the spectator pastes it with "Paste watch code". The spectator then connects directly to the host without going through the room server.
 A watch code expires after 30 minutes, and the spectator cannot connect unless the host's port can be reached from outside.
 
 
@@ -578,7 +582,7 @@ Rename them to `HiganRTool.exe` and `HiganRTool.dll` and put them in the same fo
 Visual Studio Build Tools is used as the linker.
 The target and the static CRT are set in `.cargo/config.toml`.
 
-- Released zips are built by a separate procedure that embeds the build number and enables the `dist` feature (which turns on automatic updates, embeds the shipped settings file, and strips the reverse-engineering source notes).
+- Released zips are built by a separate procedure that embeds the build number and enables the `dist` feature (which turns on automatic updates, embeds the shipped settings file, and leaves out strings used only in development logs, such as references to the notes for each hook point).
 - Your own builds get build number 0 and cannot connect to the released zip. Number-0 builds can connect to each other.
 - This public repository only guarantees that the code builds. The tests in the source are run in the development environment (some data they read is not in this repository).
 - The development environment runs core unit tests, a two-peer network model, matches against the fake opponent (`peer_sim`), DLL tests that do not use the game, server tests (vitest), and a check that release build outputs are `pei-i386`.

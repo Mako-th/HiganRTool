@@ -79,6 +79,8 @@ pub struct FakeGame {
     /// マッチのフレームを使った数がこれになったら、乱数を 1 ビット壊す（ズレの検査）。
     pub corrupt_at: Option<u64>,
     pub select_chara: u8,
+    /// 自分の SELECT に載せるマップ（両者で違えばホストの値を採る）。
+    pub select_map: u8,
     pub agreed: Vec<(Seat, Agreed)>,
     pub charges: Vec<(u8, u8)>,
     pub match_starts: u32,
@@ -133,6 +135,7 @@ impl FakeGame {
             rng: 0x1234_5678,
             corrupt_at: None,
             select_chara: (seed % 16) as u8,
+            select_map: 1,
             // 割り当ての検査で、`on_input` の中から呼ばれる push が伸びないように先に広げておく。
             agreed: Vec::with_capacity(64),
             charges: Vec::with_capacity(64),
@@ -312,7 +315,7 @@ impl Game for FakeGame {
             color: 0,
             life: 10,
             charge: self.select_chara % 3,
-            map: 1,
+            map: self.select_map,
             difficulty: 2,
             cpu_1p: 0,
             cpu_2p: 0,

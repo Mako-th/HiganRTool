@@ -974,7 +974,8 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "lan_host",
-            lan_addr::parse(v).map(Some).map_err(|_| {
+            // 形とポートだけ見る。VPN のアドレスも書かれるが、起動のときは VPN がつながっているか分からないので、範囲はメニューが使うときに見る。
+            lan_addr::parse_form(v).map(Some).map_err(|_| {
                 format!(
                     "lan_host の値 {v:?} は 192.168.0.2 か 192.168.0.2:17723 の形（LAN のアドレスとポート）"
                 )
@@ -1851,7 +1852,7 @@ mod tests {
         let said = |c: ModeChoice| c.show_text(higanr_core::lang::Lang::Ja);
         assert!(
             said(dl3.mode_choice(false, Some(Pick::Rollback(1))))
-                .is_some_and(|t| t.contains("設定ファイル"))
+                .is_some_and(|t| t.contains("HiganRTool.ini"))
         );
         assert!(
             said(rb5.mode_choice(false, Some(Pick::Rollback(1))))
@@ -2109,12 +2110,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(b.lan_host.map(|x| x.port), Some(19000));
-        for bad in ["8.8.8.8", "192.168.0", "192.168.0.2:0", "host.example", "x"] {
+        for bad in [
+            "192.168.0",
+            "192.168.0.2:0",
+            "host.example",
+            "x",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
             let s = from_text(&format!("{OK}lan_host = {bad}\n"))
                 .unwrap()
                 .unwrap();
             assert_eq!(s.lan_host, None, "{bad}");
             assert_eq!(note_keys(&s), vec!["lan_host"], "{bad}");
+        }
+        // LAN の外のアドレス（VPN の 26/8 など）は、VPN がつながる前の起動でも注にしない。使うかは入力の欄が VPN のネットワークと突き合わせて決める。
+        for outside in ["26.12.34.56:19000", "25.1.2.3", "8.8.8.8"] {
+            let s = from_text(&format!("{OK}lan_host = {outside}\n"))
+                .unwrap()
+                .unwrap();
+            assert!(s.lan_host.is_some(), "{outside}");
+            assert!(s.ini_notes.is_empty(), "{outside}");
         }
         // 空の行は書かないのと同じ（注も出さない）。
         let s = from_text(&format!("{OK}lan_host =\n")).unwrap().unwrap();

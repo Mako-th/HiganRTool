@@ -4,9 +4,10 @@
 //! 169.254 だけ）ではそれが引けないので、そのときだけ一覧から選ぶ。LAN のホストが「自分のアドレスを全部見せる」ときも同じ一覧を使う。
 //! 一覧を引くのは dll の Win32 の層（`adapters_win`）で、ここは決まった入力から選ぶ判断だけを持つ。
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
-use crate::guard;
+use crate::guard::{self, Scope};
+use crate::vpn_net::{Net4, VpnSet, VpnTool};
 
 /// `IP_ADAPTER_ADDRESSES` の `IfType` のうち、物理のアダプター（有線・無線）として扱うもの。
 /// 6 = Ethernet、62 = Fast Ethernet、69 = Fibre Ethernet、71 = IEEE 802.11（無線）、117 = Gigabit Ethernet（IANA ifType）。
@@ -56,6 +57,10 @@ const VIRTUAL_OUIS: [[u8; 3]; 7] = [
 pub struct Adapter {
     /// 説明（`Description`）。仮想かどうかの見分けにだけ使い、画面にもログにも出さない。
     pub description: String,
+    /// 接続の名前（`FriendlyName`）。VPN のツールの見分けにだけ使い、画面にもログにも出さない。
+    pub name: String,
+    /// アドレスのネットワークの長さ（`OnLinkPrefixLength`。分からなければ 0）。
+    pub prefix: u8,
     /// `IfType`。
     pub if_type: u32,
     /// MAC アドレスの上位 3 バイト（無ければ 0）。
@@ -75,7 +80,7 @@ pub struct Adapter {
 impl Adapter {
     /// 仮想のアダプター（トンネル・VPN・仮想マシン・loopback）か。
     pub fn is_virtual(&self) -> bool {
-        if !PHYSICAL_IF_TYPES.contains(&self.if_type) {
+        if !PHYSICAL_IF_TYPES.contains(&self.if_type) || self.vpn_tool().is_some() {
             return true;
         }
         let d = self.description.to_ascii_lowercase();
@@ -92,13 +97,85 @@ impl Adapter {
 
     /// LAN で使える候補か: Up・アドレスが使える状態・仮想でない・LAN の範囲（私設かリンクローカル。`guard::is_lan_v4`）。
     pub fn is_lan_candidate(&self) -> bool {
-        self.up && self.preferred && !self.is_virtual() && guard::is_lan_v4(self.ip)
+        self.usable_lan() && !self.is_virtual()
+    }
+
+    /// 名前で見分けた VPN のツール（Radmin VPN・Hamachi・ZeroTier）。
+    pub fn vpn_tool(&self) -> Option<VpnTool> {
+        VpnTool::of_names(&self.description, &self.name)
+    }
+
+    /// VPN のツールのアダプターで、私設でない（インターネットの範囲の）アドレスのネットワーク。長さが `vpn_net::PREFIX_MIN..=PREFIX_MAX` の外なら無し。
+    /// 私設のアドレスは範囲 lan に入るので、足す必要が無く無しにする。
+    fn vpn_net(&self) -> Option<Net4> {
+        self.vpn_tool()?;
+        if guard::reach(IpAddr::V4(self.ip)) != Some(Scope::Internet) {
+            return None;
+        }
+        Net4::new(self.ip, self.prefix)
+    }
+
+    /// 仮想かどうかを問わず、LAN の範囲で使えるアドレスか。
+    fn usable_lan(&self) -> bool {
+        self.up && self.preferred && guard::is_lan_v4(self.ip)
+    }
+
+    /// LAN のホストが受け口を開けるアドレスか: 使える LAN のアドレスか、VPN のツールの私設でないアドレス（ネットワークが取れるもの）。
+    fn listable(&self) -> bool {
+        self.usable_lan() || (self.up && self.preferred && self.vpn_net().is_some())
+    }
+
+    /// ホストの一覧の並び: 0 = 本物の LAN・1 = VPN のツール・2 = ほかの仮想。
+    fn class(&self) -> u8 {
+        if self.vpn_tool().is_some() {
+            1
+        } else if self.is_virtual() {
+            2
+        } else {
+            0
+        }
     }
 
     /// 優先の高さ（大きいほど優先）: ゲートウェイあり、次にメトリックが小さい。
     fn rank(&self) -> (bool, std::cmp::Reverse<u32>) {
         (self.gateway, std::cmp::Reverse(self.metric))
     }
+}
+
+/// LAN のホストが受け口を開く自分のアドレス 1 つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostAddr {
+    pub ip: Ipv4Addr,
+    /// VPN のツールのアダプターのアドレスなら、そのツール（待機の画面でアドレスに名前を添える）。
+    pub tool: Option<VpnTool>,
+    /// 私設でない VPN のアドレスなら、そのネットワーク（受け口は同じネットワークから来た申し込みだけを読み、ゲームのネットワークはこれを足した範囲で開く）。
+    /// 私設のアドレスは `None` で、今までどおり範囲 lan の送り元を読む。
+    pub net: Option<Net4>,
+}
+
+/// 自分の PC の、私設でない VPN のアドレス 1 つ（クライアントが打たれたアドレスを受けるか決める材料）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnLink {
+    pub ip: Ipv4Addr,
+    pub tool: VpnTool,
+    pub net: Net4,
+}
+
+/// Up で使える状態の VPN のツールのアダプターにある、私設でないアドレス（同じアドレスは 1 つ）。
+pub fn vpn_links(all: &[Adapter]) -> Vec<VpnLink> {
+    let mut out: Vec<VpnLink> = Vec::new();
+    for a in all.iter().filter(|a| a.up && a.preferred) {
+        if let (Some(tool), Some(net)) = (a.vpn_tool(), a.vpn_net())
+            && !out.iter().any(|l| l.ip == a.ip)
+        {
+            out.push(VpnLink {
+                ip: a.ip,
+                tool,
+                net,
+            });
+        }
+    }
+    out
 }
 
 /// 選べなかった理由。
@@ -128,14 +205,25 @@ impl Refusal {
     }
 }
 
-/// LAN で使える自分のアドレスを、優先の高い順に並べる（同じアドレスは 1 つ）。LAN のホストが自分のアドレスを全部見せるときに使う。
-pub fn lan_addresses(all: &[Adapter]) -> Vec<Ipv4Addr> {
-    let mut c: Vec<&Adapter> = all.iter().filter(|a| a.is_lan_candidate()).collect();
-    c.sort_by_key(|a| std::cmp::Reverse(a.rank()));
-    let mut out: Vec<Ipv4Addr> = Vec::new();
+/// `vpn_links` のネットワークを、アドレスの入力の判定に渡す形にする。
+pub fn vpn_set(links: &[VpnLink]) -> VpnSet {
+    VpnSet::from_nets(links.iter().map(|l| l.net))
+}
+
+/// LAN のホストが受け口を開く自分のアドレスを、並べて返す（同じアドレスは 1 つ）。LAN のホストが自分のアドレスを全部見せるときに使う。
+/// 本物の LAN → VPN のツール（Radmin VPN・Hamachi・ZeroTier）→ ほかの仮想（仮想マシンの中の NIC・ホストの VMnet など。同じ PC の仮想マシンと
+/// LAN で対戦できるように）の順で、それぞれ優先の高い順。VPN のツールの私設でないアドレスは、ネットワークの長さが取れるものだけ入れる。
+pub fn host_addresses(all: &[Adapter]) -> Vec<HostAddr> {
+    let mut c: Vec<&Adapter> = all.iter().filter(|a| a.listable()).collect();
+    c.sort_by_key(|a| (a.class(), std::cmp::Reverse(a.rank())));
+    let mut out: Vec<HostAddr> = Vec::new();
     for a in c {
-        if !out.contains(&a.ip) {
-            out.push(a.ip);
+        if !out.iter().any(|h| h.ip == a.ip) {
+            out.push(HostAddr {
+                ip: a.ip,
+                tool: a.vpn_tool(),
+                net: a.vpn_net(),
+            });
         }
     }
     out
@@ -175,9 +263,16 @@ mod tests {
     }
 
     /// 物理の有線で、Up・使える状態・ゲートウェイあり・メトリック 25 の見本。
+    /// 一覧の並び（ホストの画面に出る順）のアドレスだけ。
+    fn lan_addresses(all: &[Adapter]) -> Vec<Ipv4Addr> {
+        host_addresses(all).iter().map(|h| h.ip).collect()
+    }
+
     fn wired(addr: &str) -> Adapter {
         Adapter {
             description: "Realtek PCIe GbE Family Controller".to_string(),
+            name: "イーサネット".to_string(),
+            prefix: 24,
             if_type: ETHERNET,
             oui: [0x3C, 0x52, 0x82],
             up: true,
@@ -322,7 +417,8 @@ mod tests {
         assert!(wsl.is_virtual());
         assert_eq!(
             lan_addresses(&[wsl.clone(), external.clone()]),
-            vec![ip("192.168.0.10")]
+            vec![ip("192.168.0.10"), ip("172.20.16.1")],
+            "本物の LAN が先"
         );
         assert_eq!(choose(&[wsl, external]), Ok(ip("192.168.0.10")));
         let vmware = Adapter {
@@ -339,6 +435,63 @@ mod tests {
             ..wired("10.8.0.6")
         };
         assert!(vpn.is_virtual());
+    }
+
+    /// 壊れたら落ちる: 仮想マシンの中（NIC が VMware の 1 つだけ）でホストのアドレスが 0 個になる、ホストの PC の VMnet のアドレスが
+    /// 一覧に出ない・本物より先に出る、仮想のアダプターが `choose`（`bind = auto` の代わり）に選ばれる。
+    #[test]
+    fn virtual_adapters_are_listed_after_the_real_ones_but_never_chosen() {
+        let guest_nic = Adapter {
+            description: "Intel(R) 82574L Gigabit Network Connection".to_string(),
+            oui: [0x00, 0x0C, 0x29],
+            ..wired("192.168.88.128")
+        };
+        assert!(guest_nic.is_virtual());
+        assert_eq!(
+            lan_addresses(std::slice::from_ref(&guest_nic)),
+            vec![ip("192.168.88.128")]
+        );
+        assert_eq!(choose(&[guest_nic]), Err(Refusal::NoCandidate));
+
+        let vmnet = |addr: &str, n: u32| Adapter {
+            description: format!("VMware Virtual Ethernet Adapter for VMnet{n}"),
+            oui: [0x00, 0x50, 0x56],
+            gateway: false,
+            metric: 1,
+            ..wired(addr)
+        };
+        let host = [
+            vmnet("192.168.192.1", 1),
+            vmnet("192.168.88.1", 8),
+            wired("10.20.30.133"),
+        ];
+        assert_eq!(
+            lan_addresses(&host),
+            vec![ip("10.20.30.133"), ip("192.168.192.1"), ip("192.168.88.1")]
+        );
+        assert_eq!(choose(&host), Ok(ip("10.20.30.133")));
+        // ゲートウェイを持ち、メトリックも小さい仮想（VPN など）でも、本物の後ろ。
+        let vpn = Adapter {
+            description: "TAP-Windows Adapter V9".to_string(),
+            metric: 1,
+            ..wired("10.8.0.6")
+        };
+        assert_eq!(
+            lan_addresses(&[vpn, wifi("192.168.0.20")]),
+            vec![ip("192.168.0.20"), ip("10.8.0.6")]
+        );
+
+        // LAN の外・使えない状態のものは、仮想でも出さない。
+        let down = Adapter {
+            up: false,
+            ..vmnet("192.168.50.1", 2)
+        };
+        let loopback = Adapter {
+            description: "Software Loopback Interface 1".to_string(),
+            if_type: LOOPBACK,
+            ..wired("127.0.0.1")
+        };
+        assert!(lan_addresses(&[down, loopback]).is_empty());
     }
 
     #[test]
@@ -377,6 +530,258 @@ mod tests {
             Err(Refusal::NoCandidate),
             "グローバルのアドレスは LAN の候補にしない"
         );
+    }
+
+    /// VPN のツールのアダプター（有線に見える Ethernet。ゲートウェイは無く、メトリックは小さい）。
+    fn vpn_adapter(description: &str, name: &str, addr: &str, prefix: u8, metric: u32) -> Adapter {
+        Adapter {
+            description: description.to_string(),
+            name: name.to_string(),
+            prefix,
+            oui: [0x7A, 0x79, 0x01],
+            gateway: false,
+            metric,
+            ..wired(addr)
+        }
+    }
+
+    fn radmin(addr: &str) -> Adapter {
+        vpn_adapter(
+            "Famatech Radmin VPN Ethernet Adapter",
+            "Radmin VPN",
+            addr,
+            8,
+            2,
+        )
+    }
+
+    fn hamachi(addr: &str) -> Adapter {
+        vpn_adapter(
+            "LogMeIn Hamachi Virtual Ethernet Adapter",
+            "Hamachi",
+            addr,
+            8,
+            3,
+        )
+    }
+
+    fn zerotier(addr: &str, prefix: u8) -> Adapter {
+        vpn_adapter(
+            "ZeroTier Virtual Port",
+            "ZeroTier One [8056c2e21c000001]",
+            addr,
+            prefix,
+            4,
+        )
+    }
+
+    fn net(addr: &str, prefix: u8) -> Net4 {
+        Net4::new(ip(addr), prefix).unwrap()
+    }
+
+    /// 壊れたら落ちる: Radmin VPN の 26/8・Hamachi の 25/8・私設でない ZeroTier のネットワークを受け口に出さない、ツールとネットワークを
+    /// 付けない、並びが本物の LAN → VPN のツール → ほかの仮想にならない（VMnet が VPN より前に出て、上限の 8 個から VPN が落ちる）。
+    #[test]
+    fn vpn_tools_are_listed_with_their_network_between_the_real_lan_and_other_virtual_adapters() {
+        let vmnet = Adapter {
+            description: "VMware Virtual Ethernet Adapter for VMnet8".to_string(),
+            oui: [0x00, 0x50, 0x56],
+            gateway: false,
+            metric: 1,
+            ..wired("192.168.88.1")
+        };
+        let list = [
+            vmnet,
+            zerotier("28.9.9.9", 24),
+            hamachi("25.1.2.3"),
+            radmin("26.12.34.56"),
+            wired("192.168.0.10"),
+        ];
+        let got = host_addresses(&list);
+        assert_eq!(
+            got,
+            vec![
+                HostAddr {
+                    ip: ip("192.168.0.10"),
+                    tool: None,
+                    net: None
+                },
+                HostAddr {
+                    ip: ip("26.12.34.56"),
+                    tool: Some(VpnTool::Radmin),
+                    net: Some(net("26.0.0.0", 8))
+                },
+                HostAddr {
+                    ip: ip("25.1.2.3"),
+                    tool: Some(VpnTool::Hamachi),
+                    net: Some(net("25.0.0.0", 8))
+                },
+                HostAddr {
+                    ip: ip("28.9.9.9"),
+                    tool: Some(VpnTool::ZeroTier),
+                    net: Some(net("28.9.9.0", 24))
+                },
+                HostAddr {
+                    ip: ip("192.168.88.1"),
+                    tool: None,
+                    net: None
+                },
+            ]
+        );
+        // ツール自体は仮想として扱う（`choose` の bind = auto の代わりに選ばれない）。
+        for a in [
+            radmin("26.1.1.1"),
+            hamachi("25.1.1.1"),
+            zerotier("28.1.1.1", 24),
+        ] {
+            assert!(a.is_virtual() && !a.is_lan_candidate(), "{a:?}");
+            assert_eq!(choose(&[a]), Err(Refusal::NoCandidate));
+        }
+    }
+
+    /// 壊れたら落ちる: 名前の分からない仮想のアダプターの 25.x（会社の VPN など）を受け口にする、ネットワークの長さが 8〜30 の外のものを使う、
+    /// Down・重複検出の途中のものを使う、物理のアダプターの世界のアドレスを使う、Tailscale を使う、
+    /// ネットワークの長さが取れないツール（0）を使う。
+    #[test]
+    fn only_named_vpn_tools_with_a_usable_network_are_listed_outside_the_private_ranges() {
+        let corp = vpn_adapter(
+            "Acme Corporate VPN Virtual Adapter",
+            "Acme VPN",
+            "25.1.2.3",
+            8,
+            1,
+        );
+        let tailscale = vpn_adapter("Tailscale Tunnel", "Tailscale", "100.101.102.103", 10, 1);
+        let physical = wired("26.1.2.3");
+        assert!(lan_addresses(&[corp, tailscale, physical]).is_empty());
+        for prefix in [0, 7, 31, 32] {
+            for a in [
+                radmin("26.1.2.3"),
+                hamachi("25.1.2.3"),
+                zerotier("28.1.2.3", 24),
+            ] {
+                let a = Adapter { prefix, ..a };
+                assert!(
+                    lan_addresses(std::slice::from_ref(&a)).is_empty(),
+                    "/{prefix} {a:?}"
+                );
+            }
+        }
+        for prefix in [8, 9, 24, 30] {
+            let a = Adapter {
+                prefix,
+                ..radmin("26.1.2.3")
+            };
+            assert_eq!(lan_addresses(&[a]), vec![ip("26.1.2.3")], "/{prefix}");
+        }
+        let down = Adapter {
+            up: false,
+            ..radmin("26.1.2.3")
+        };
+        let tentative = Adapter {
+            preferred: false,
+            ..radmin("26.1.2.3")
+        };
+        assert!(lan_addresses(&[down, tentative]).is_empty());
+        // ツールの名前が接続の名前だけにあっても使う（説明は物理の NIC の名前のまま）。
+        let by_name = Adapter {
+            name: "Hamachi".to_string(),
+            ..wired("25.4.5.6")
+        };
+        assert!(by_name.is_virtual());
+        assert_eq!(lan_addresses(&[by_name]), vec![ip("25.4.5.6")]);
+        // 使えないアドレス（loopback・マルチキャスト・0.x）は、ツールの名前があっても出さない。
+        for bad in ["127.0.0.1", "224.0.0.9", "0.1.2.3", "255.255.255.255"] {
+            assert!(lan_addresses(&[radmin(bad)]).is_empty(), "{bad}");
+        }
+    }
+
+    /// 壊れたら落ちる: 私設のアドレスを持つ ZeroTier からツールの名前が落ちる（画面にツールの名前が付かない）、私設のアドレスにネットワークが付く
+    /// （受け口が lan 全体でなく、狭いネットワークの送り元だけを読み、今までの振る舞いが変わる）。
+    #[test]
+    fn a_private_vpn_address_keeps_its_tool_name_but_no_network() {
+        let got = host_addresses(&[zerotier("10.147.17.5", 24), wired("192.168.0.10")]);
+        assert_eq!(
+            got,
+            vec![
+                HostAddr {
+                    ip: ip("192.168.0.10"),
+                    tool: None,
+                    net: None
+                },
+                HostAddr {
+                    ip: ip("10.147.17.5"),
+                    tool: Some(VpnTool::ZeroTier),
+                    net: None
+                },
+            ]
+        );
+        // 長さが取れなくても、私設のアドレスは今までどおり出る。
+        let odd = Adapter {
+            prefix: 0,
+            ..zerotier("10.147.17.5", 24)
+        };
+        assert_eq!(lan_addresses(&[odd]), vec![ip("10.147.17.5")]);
+        assert!(vpn_links(&[zerotier("10.147.17.5", 24)]).is_empty());
+    }
+
+    /// 壊れたら落ちる: クライアントが受けるネットワークの材料に、私設のアドレス・Down・名前の分からない仮想・長さの外が混ざる、
+    /// 同じアドレスが重なる、集まりに入らない。
+    #[test]
+    fn vpn_links_are_the_up_non_private_tool_addresses_and_make_the_set() {
+        let corp = vpn_adapter("Acme Corporate VPN", "Acme", "25.1.2.3", 8, 1);
+        // 使えない状態のものは、ほかの項目と同じアドレスにせず（重なりの除外に紛れない）別のアドレスにする。
+        let down = Adapter {
+            up: false,
+            ..hamachi("25.8.8.8")
+        };
+        let tentative = Adapter {
+            preferred: false,
+            ..zerotier("28.5.5.5", 24)
+        };
+        let links = vpn_links(&[
+            radmin("26.12.34.56"),
+            radmin("26.12.34.56"),
+            hamachi("25.1.2.3"),
+            zerotier("28.9.9.9", 24),
+            zerotier("10.147.17.5", 24),
+            corp,
+            down,
+            tentative,
+            Adapter {
+                prefix: 7,
+                ..radmin("26.7.7.7")
+            },
+            wired("192.168.0.10"),
+        ]);
+        assert_eq!(
+            links,
+            vec![
+                VpnLink {
+                    ip: ip("26.12.34.56"),
+                    tool: VpnTool::Radmin,
+                    net: net("26.0.0.0", 8)
+                },
+                VpnLink {
+                    ip: ip("25.1.2.3"),
+                    tool: VpnTool::Hamachi,
+                    net: net("25.0.0.0", 8)
+                },
+                VpnLink {
+                    ip: ip("28.9.9.9"),
+                    tool: VpnTool::ZeroTier,
+                    net: net("28.9.9.0", 24)
+                },
+            ]
+        );
+        let set = vpn_set(&links);
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.find(ip("26.200.0.1")), Some(net("26.0.0.0", 8)));
+        assert_eq!(set.find(ip("25.200.0.1")), Some(net("25.0.0.0", 8)));
+        assert_eq!(set.find(ip("28.9.9.77")), Some(net("28.9.9.0", 24)));
+        assert_eq!(set.find(ip("28.9.10.77")), None);
+        assert_eq!(set.find(ip("27.0.0.1")), None);
+        assert!(vpn_set(&[]).is_empty());
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub trait Site {
 pub fn notice_text(lang: Lang) -> String {
     by_lang!(
         lang,
-        ja: "HiganRTool: このフォルダには書き込めないので、更新とログの保存ができません。ドキュメントなど、書き込めるフォルダへ移してください。",
+        ja: "HiganRTool: このフォルダには書き込めないため、更新とログの保存ができません。ドキュメントなど、書き込めるフォルダへ移してください。",
         en: "HiganRTool: This folder is not writable, so updates and logs cannot be saved. Please move HiganRTool to a folder you can write to, such as Documents."
     )
 }
@@ -260,7 +260,7 @@ mod tests {
     fn the_notice_is_in_both_languages() {
         let ja = notice_text(Lang::Ja);
         assert!(
-            ja.contains("書き込めないので、更新とログの保存ができません"),
+            ja.contains("書き込めないため、更新とログの保存ができません"),
             "{ja}"
         );
         assert!(ja.contains("書き込めるフォルダへ移してください。"), "{ja}");

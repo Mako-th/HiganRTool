@@ -9,7 +9,7 @@ use higanr_build_res::{Artifact, FileKind, VersionInfo, emit};
 fn main() {
     emit(
         &VersionInfo {
-            file_description: "HiganRTool replay fixer",
+            file_description: "HiganRTool Replay Repair Tool",
             internal_name: "HiganRTool_replay_fix",
             original_filename: "HiganRTool_replay_fix.exe",
             kind: FileKind::App,

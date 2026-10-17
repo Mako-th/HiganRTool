@@ -1,7 +1,7 @@
 //! 相手を待ち続けている間の知らせと切断（pure）。
 //!
-//! 入力の地点が tick ごとに「この tick は相手を待っていたか」を渡す。`NOTICE_TICKS` 続いたら画面に 1 行出し（`shown`）、その間に Esc の
-//! 押した瞬間を見たら切る。待ちが `LIMIT_MS` 続いたら切る。待ちが解けたら数え直す。
+//! 入力の地点が tick ごとに「この tick は相手を待っていたか」を渡す。`NOTICE_TICKS` 続いたら画面に 1 行出し（`shown`）、その間に Esc が
+//! `ESC_HOLD_MS` 押され続けたら切る（一時停止のつもりの 1 回の押下では切らない）。待ちが `LIMIT_MS` 続いたら切る。待ちが解けたら数え直す。
 //!
 //! 何を「待っていた」とするかは呼び手が決める（`NetPlay::peer_wait_tick`）: マッチの描画だけのフレーム、止める地点で相手の SELECT を待つ
 //! フレーム、選択の画面で相手のゲームスレッドが `QUIET_MS` 黙っている間。
@@ -20,11 +20,13 @@ pub const LIMIT_MS: u32 = SILENCE_LIMIT_MS;
 /// 落ちても黙ったとみなすのは 0.5 秒ほどで、知らせ（`NOTICE_TICKS`）までは続かない。
 pub const QUIET_MS: u32 = 1_500;
 const _: () = assert!(QUIET_MS > PING_INTERVAL_MS);
+/// 知らせを出している間に、切るまで Esc を押し続ける長さ（ms）。画面の文（`net_menu::T_PEER_WAIT`）の「3秒」と同じ。
+pub const ESC_HOLD_MS: u32 = 3_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Keep,
-    /// 知らせを出している間に Esc が押された。
+    /// 知らせを出している間に Esc が `ESC_HOLD_MS` 押され続けた。
     Esc,
     /// 待ちが `LIMIT_MS` 続いた。
     TimedOut,
@@ -36,6 +38,8 @@ pub struct PeerWait {
     since_ms: u32,
     /// 知らせを出してから Esc が離れているのを 1 度見たか（押したまま待ちに入った瞬間に切らないため）。
     esc_armed: bool,
+    /// 離れているのを見た後に Esc が押され始めた時刻。離れたら None。
+    esc_since: Option<u32>,
 }
 
 impl PeerWait {
@@ -63,8 +67,12 @@ impl PeerWait {
         }
         if !esc() {
             self.esc_armed = true;
+            self.esc_since = None;
         } else if self.esc_armed {
-            return Verdict::Esc;
+            let since = *self.esc_since.get_or_insert(now_ms);
+            if now_ms.wrapping_sub(since) >= ESC_HOLD_MS {
+                return Verdict::Esc;
+            }
         }
         Verdict::Keep
     }
@@ -118,13 +126,50 @@ mod tests {
         assert_eq!(reads, 31, "知らせを出していない tick に Esc を読んだ");
         let at = T0 + (NOTICE_TICKS + 30) * FRAME_MS;
         assert_eq!(w.step(Some(T0), at, || false), Verdict::Keep);
-        assert_eq!(w.step(Some(T0), at + FRAME_MS, || true), Verdict::Esc);
-        // 知らせが出た tick に離れていれば、次の押下で切る。
+        let pressed = at + FRAME_MS;
+        assert_eq!(w.step(Some(T0), pressed, || true), Verdict::Keep);
+        assert_eq!(
+            w.step(Some(T0), pressed + ESC_HOLD_MS, || true),
+            Verdict::Esc
+        );
+        // 知らせが出た tick に離れていれば、そこから押し続けて切る。
         let mut w = PeerWait::default();
         waited(&mut w, NOTICE_TICKS - 1, true);
         let at = T0 + NOTICE_TICKS * FRAME_MS;
         assert_eq!(w.step(Some(T0), at, || false), Verdict::Keep);
-        assert_eq!(w.step(Some(T0), at + FRAME_MS, || true), Verdict::Esc);
+        assert_eq!(w.step(Some(T0), at + FRAME_MS, || true), Verdict::Keep);
+        assert_eq!(
+            w.step(Some(T0), at + FRAME_MS + ESC_HOLD_MS, || true),
+            Verdict::Esc
+        );
+    }
+
+    #[test]
+    fn a_short_esc_press_does_not_cut_and_releasing_starts_the_hold_over() {
+        let mut w = PeerWait::default();
+        waited(&mut w, NOTICE_TICKS, false);
+        let start = T0 + NOTICE_TICKS * FRAME_MS;
+        // 押し続けて、3 秒の 1 tick 手前までは切らない。
+        let mut t = start;
+        while t < start + ESC_HOLD_MS {
+            assert_eq!(
+                w.step(Some(T0), t, || true),
+                Verdict::Keep,
+                "{} ms で切った",
+                t - start
+            );
+            t += FRAME_MS;
+        }
+        // 1 tick 離すと数え直し。続けて押しても、そこから 3 秒たつまで切らない。
+        assert_eq!(w.step(Some(T0), t, || false), Verdict::Keep);
+        let again = t + FRAME_MS;
+        assert_eq!(w.step(Some(T0), again, || true), Verdict::Keep);
+        assert_eq!(
+            w.step(Some(T0), again + ESC_HOLD_MS - 1, || true),
+            Verdict::Keep,
+            "離した前の押下の長さが残った"
+        );
+        assert_eq!(w.step(Some(T0), again + ESC_HOLD_MS, || true), Verdict::Esc);
     }
 
     #[test]

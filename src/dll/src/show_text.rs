@@ -21,7 +21,7 @@ pub const BROKEN: Tx = Tx {
 
 /// ネットワークを開けなかった（見張りを起こす前に断った・見張りが止められた）ときの文。
 pub const NOT_STARTED: Tx = Tx {
-    ja: "通信を始められませんでした（理由はログにあります）。logsフォルダのファイルを添えて、GitHubのIssuesで知らせてください。",
+    ja: "通信を始められませんでした（理由はログにあります）。logsフォルダのファイルを添えて、開発者に伝えてください。",
     en: "Could not start networking (the reason is in the log). Please report this on GitHub Issues with the files in the logs folder.",
 };
 
@@ -107,7 +107,7 @@ pub const WATCH_ENDED_UNCONNECTED: Tx = Tx {
 
 /// ウィンドウで選んだ rollback を採れなかったときに「状態」の行へ足す文（`NetSettings` の ini が delay 方式）。
 pub const ROLLBACK_INI_DELAY: Tx = Tx {
-    ja: "ウィンドウで選んだrollbackは使えません（設定ファイルがdelay方式になっているため）。delay方式で接続します。",
+    ja: "ウィンドウで選んだrollbackは使えません（HiganRTool.iniがdelay方式になっているため）。delay方式で接続します。",
     en: "The rollback you chose in the window cannot be used (the setting file says delay mode). Connecting in delay mode.",
 };
 
@@ -122,7 +122,7 @@ pub fn expired(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
         Lang::Ja => format!(
-            "相手のコードは期限（{span}）が切れています。相手に新しいコードを生成してもらってください。"
+            "相手のコードは期限（{span}）が切れています。相手に新しいコードを作ってもらってください。"
         ),
         Lang::En => {
             format!("The opponent's code has expired ({span}). Ask your opponent for a new code.")
@@ -135,7 +135,7 @@ pub fn watch_expired(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
         Lang::Ja => format!(
-            "観戦用のコードは期限（{span}）が切れています。ホストに新しいコードを生成してもらってください。"
+            "観戦用のコードは期限（{span}）が切れています。ホストに新しいコードを作ってもらってください。"
         ),
         Lang::En => format!("The watch code has expired ({span}). Ask the host for a new code."),
     }
@@ -145,9 +145,9 @@ pub fn watch_expired(lang: Lang, ttl_secs: u64) -> String {
 pub fn offer_waiting(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
-        Lang::Ja => format!(
-            "相手から返ってくるコードを待っています（自分のコードは{span}で使えなくなります）。"
-        ),
+        Lang::Ja => {
+            format!("相手の返答コードを待っています（自分のコードは{span}で使えなくなります）。")
+        }
         Lang::En => {
             format!("Waiting for the reply code from your opponent (your code expires in {span}).")
         }
@@ -347,11 +347,12 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 公開した後の利用者に「この道具を渡してくれた人」へ送るよう案内する（報告先は GitHub の Issues）。
+    /// 壊れたら落ちる: 公開した後の利用者に「この道具を渡してくれた人」へ送るよう案内する（報告先は開発者・GitHub の Issues）。
     #[test]
-    fn the_failure_text_points_at_github_issues_not_at_whoever_handed_over_the_tool() {
+    fn the_failure_text_points_at_the_developer_not_at_whoever_handed_over_the_tool() {
         assert!(
-            NOT_STARTED.ja.contains("GitHubのIssues") && NOT_STARTED.ja.contains("logsフォルダ")
+            NOT_STARTED.ja.contains("開発者に伝えてください")
+                && NOT_STARTED.ja.contains("logsフォルダ")
         );
         assert!(NOT_STARTED.en.contains("GitHub Issues") && NOT_STARTED.en.contains("logs folder"));
         for t in [NOT_STARTED.ja, NOT_STARTED.en] {

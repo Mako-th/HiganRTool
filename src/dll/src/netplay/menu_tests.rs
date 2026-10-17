@@ -1802,12 +1802,12 @@ fn dropped_decides_reach_the_log_line() {
     let mut t = Alone::new(7, vec![act(0, 7, 2, keys::Z, 1)]);
     t.tick(10);
     let st = NetStatus::new();
-    st.publish(&t.np);
+    st.publish(&t.np, false);
     let line = st.menu_text();
     assert!(line.contains("繋がる前に落とした決定 1 回"), "{line}");
     let fresh = Alone::new(7, Vec::new());
     let st = NetStatus::new();
-    st.publish(&fresh.np);
+    st.publish(&fresh.np, false);
     assert!(st.menu_text().contains("繋がる前に落とした決定 0 回"));
 }
 
@@ -2795,8 +2795,8 @@ fn tab_in_the_chara_select_flips_the_format_for_both_sides_in_the_same_step() {
             crate::net_watch::NetStatus::new(),
             crate::net_watch::NetStatus::new(),
         );
-        ta.publish(&d.npa);
-        tb.publish(&d.npb);
+        ta.publish(&d.npa, false);
+        tb.publish(&d.npb, false);
         let (xa, xb) = (ta.fmt_text(), tb.fmt_text());
         for (who, t) in [("A", &xa), ("B", &xb)] {
             assert!(t.contains("入れた切替の STEP 4"), "{tag} {who}: {t}");

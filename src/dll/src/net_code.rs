@@ -775,6 +775,15 @@ impl Shared {
         n.push(line);
     }
 
+    /// 数の入れ物を書き換える（ゲーム内のメニューの見張りが、選んだ項目・待ち列の順・自分の側を置く）。
+    pub(crate) fn update(&self, f: impl FnOnce(&mut CodeFacts)) {
+        f(&mut self.facts.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    pub(crate) fn facts_now(&self) -> CodeFacts {
+        self.facts.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub(crate) fn count(&self, kind: Kind, secs: f32) {
         let mut f = self.facts.lock().unwrap_or_else(|e| e.into_inner());
         match kind {
@@ -2069,6 +2078,57 @@ mod tests {
         }
     }
 
+    /// 壊れたら落ちる: VPN のネットワークを足した範囲（LAN の接続が開く範囲）で、相手のコードの候補のうち VPN のネットワークの中が落ちる、
+    /// ネットワークの外（隣の /8・ネットワークのアドレス・世界のアドレス）が残る、lan の分（私設）が落ちる、範囲 lan のままの接続が VPN の候補を通す、
+    /// VPN の候補しか無い範囲 lan の接続が断られない。
+    #[test]
+    fn a_vpn_scope_keeps_the_candidates_inside_its_network_and_lan_only() {
+        let their = [
+            "26.12.34.56:41001",
+            "192.168.0.2:41001",
+            "26.0.0.0:41001",
+            "27.0.0.1:41001",
+            "203.0.113.7:41001",
+        ];
+        let ini = "[netplay]\nenable = 1\nscope = lan\nbind = 127.0.0.1:0\ncode_side = answer\nname = a\n";
+        let radmin =
+            Scope::LanVpn(higanr_core::vpn_net::Net4::new([26, 1, 2, 3].into(), 8).unwrap());
+        let off =
+            Swapper::offer(&settings("offer", "o"), 1, cands(&their), SECRET, SID, NOW).unwrap();
+        for (scope, want) in [
+            (
+                radmin,
+                Some(cands(&["26.12.34.56:41001", "192.168.0.2:41001"])),
+            ),
+            (Scope::Lan, Some(cands(&["192.168.0.2:41001"]))),
+        ] {
+            let mut s = crate::net_config::from_text(ini).unwrap().unwrap();
+            s.scope = scope;
+            let mut ans = Swapper::answer(&s, 0x0F00, cands(&["127.0.0.1:41002"]));
+            match ans.on_peer_file(Some(off.own_text().unwrap().as_bytes()), NOW) {
+                Step::Ready { link, .. } => assert_eq!(Some(link.peers), want, "{scope:?}"),
+                g => panic!("{scope:?}: {g:?}"),
+            }
+        }
+        // VPN の候補しか無いコードは、範囲 lan では断り、VPN のネットワークを足した範囲では通す。
+        let only = Swapper::offer(
+            &settings("offer", "o"),
+            1,
+            cands(&["26.12.34.56:41001"]),
+            SECRET,
+            SID,
+            NOW,
+        )
+        .unwrap();
+        for (scope, ok) in [(Scope::Lan, false), (radmin, true)] {
+            let mut s = crate::net_config::from_text(ini).unwrap().unwrap();
+            s.scope = scope;
+            let mut ans = Swapper::answer(&s, 0x0F00, cands(&["127.0.0.1:41002"]));
+            let got = ans.on_peer_file(Some(only.own_text().unwrap().as_bytes()), NOW);
+            assert_eq!(matches!(got, Step::Ready { .. }), ok, "{scope:?}: {got:?}");
+        }
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let d =
             std::env::temp_dir().join(format!("higanrtool_net_code_{tag}_{}", std::process::id()));
@@ -2702,7 +2762,7 @@ mod tests {
             use crate::net_watch::NetStatus;
             use crate::trial_summary::{self as ts, Facts, HostFacts, OpenInfo, Stage, Stun};
             let st = NetStatus::new();
-            st.publish(np);
+            st.publish(np, false);
             let facts = Facts {
                 game: ts::installed_game_facts(),
                 net: Some(st.snapshot()),
@@ -2759,7 +2819,7 @@ mod tests {
         let mut ans = answer_swapper(41_009);
         let why = refused(ans.on_peer_file(Some(OFFER_V0.as_bytes()), NOW));
         let want = format!(
-            "相手のHiganRToolのバージョンが違います（自分 {}・相手 0）。相手と同じzipのHiganRToolを使ってください。",
+            "相手とHiganRToolのバージョンが違います（自分 {}・相手 0）。相手と同じzipのHiganRToolを使ってください。",
             higanr_core::wire::PROTO_VER
         );
         assert!(why.log.contains(&want), "{why:?}");

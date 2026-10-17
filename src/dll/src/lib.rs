@@ -55,6 +55,8 @@ mod hook;
 mod hook_win;
 // LAN 対戦の申し込みの運び手（std のソケットだけ。unsafe 無し）。
 mod lan_link;
+// つながりごとの本ログの行（接続した行・stall の内訳・RTT・観戦者の出入り。pure）。
+mod link_log;
 mod menu;
 mod menu_win;
 mod names;
@@ -95,6 +97,8 @@ mod pad_extra_win;
 mod probe;
 mod record_win;
 mod render_only;
+// 自分の PC の VPN のネットワークの控え（LAN のアドレスの入力が使う。unsafe 無し）。
+mod vpn_snap;
 // 自動保存（unsafe は `replay_save_win.rs` の中だけ）。
 mod replay_save;
 mod replay_save_win;

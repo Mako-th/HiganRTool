@@ -12,7 +12,7 @@ pub fn should_hold(exit_code: i32, console_procs: Option<u32>) -> bool {
 }
 
 pub const HOLD_TEXT: Tx = Tx {
-    ja: "HiganRTool: 上の理由の行と、logsフォルダのファイルを添えて、GitHubのIssuesで知らせてください（https://github.com/Mako-th/HiganRTool/issues）。Enterキーで閉じます。",
+    ja: "HiganRTool: 上の理由の行と、logsフォルダのファイルを添えて、開発者に伝えてください（https://github.com/Mako-th/HiganRTool/issues）。Enterキーで閉じます。",
     en: "HiganRTool: Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with the reason lines above and the files in the logs folder. Press Enter to close.",
 };
 
@@ -34,7 +34,7 @@ pub fn hold_text(exit_code: i32) -> Tx {
 }
 
 pub const PANIC_HOLD_TEXT: Tx = Tx {
-    ja: "HiganRTool: 予期しないエラーで止まりました。ツールのフォルダのlogsにあるloader_で始まるログ（.log）を添えて、GitHubのIssuesで知らせてください（https://github.com/Mako-th/HiganRTool/issues）。Enterキーで閉じます。",
+    ja: "HiganRTool: 予期しないエラーで止まりました。ツールのフォルダのlogsにあるloader_で始まるログ（.log）を添えて、開発者に伝えてください（https://github.com/Mako-th/HiganRTool/issues）。Enterキーで閉じます。",
     en: "HiganRTool: Stopped by an unexpected error. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with the log file starting with loader_ (.log) in the logs folder next to the tool. Press Enter to close.",
 };
 

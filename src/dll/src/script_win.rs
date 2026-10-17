@@ -42,7 +42,8 @@ use crate::menu_win::OwnProcess;
 use crate::names::{is_same_or_inside, side_file_name};
 use std::sync::{Arc, OnceLock};
 
-use higanr_core::lan_addr::LanAddr;
+use higanr_core::guard::Scope;
+use higanr_core::lan_addr::{AddrBuf, LanAddr};
 use higanr_core::lan_proto::Ver;
 use higanr_core::lang::Lang;
 use higanr_core::mode_pick::Shape;
@@ -348,14 +349,22 @@ fn feed_watch_list(on: bool) {
 struct LanOpen {
     /// ゲームの受信ソケットを開く自分の LAN のアドレス（ホストは申し込みが届いたアドレス、クライアントは申し込み先へ届くアドレス）。
     ip: Ipv4Addr,
+    /// ゲームのネットワークの範囲（`Scope::lan_via`。VPN のアドレスなら、その VPN のネットワークを足した範囲）。
+    scope: Scope,
     role: LanRole,
     bridge: Arc<LanBridge>,
 }
 static LAN_OPEN: std::sync::Mutex<Option<LanOpen>> = std::sync::Mutex::new(None);
 
 /// LAN の観戦コード（運び手が置き、観戦者のネットワークを開くスレッドが 1 度だけ取る）と、置いた時刻。古いものは使わない。
-static LAN_WATCH: std::sync::Mutex<Option<(String, Ipv4Addr, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
+static LAN_WATCH: std::sync::Mutex<Option<LanWatch>> = std::sync::Mutex::new(None);
+
+struct LanWatch {
+    code: String,
+    ip: Ipv4Addr,
+    scope: Scope,
+    at: std::time::Instant,
+}
 /// 1 = 運び手が観戦コードを受けた（ゲームのスレッドが観戦者のネットワークを開く頼みにする）。
 static LAN_WATCH_READY: AtomicU32 = AtomicU32::new(0);
 /// 観戦コードを置いてから、観戦者のネットワークを開くスレッドが取るまでの上限。越えたものは使わない（別の観戦に混ざらないように）。
@@ -366,10 +375,15 @@ static LAN_REQUESTS: AtomicU32 = AtomicU32::new(0);
 /// 役割の乱数の最上位の bit。LAN のホストは立てて、クライアントは落とす（ホストがいつも試合のホスト = 観戦コードを出す側になる。大きい方がホスト）。
 const LAN_HOST_BIT: u64 = 1 << 63;
 
-/// LAN の接続の設定: 範囲 lan・自分の LAN のアドレス（ポートは OS が選ぶ）で開き、STUN・UPnP・IPv6・ルームサーバーは使わない。ini は書き換えない
-/// （この接続だけの設定）。`role` があれば役割の乱数を決める。
-fn lan_net_settings(mut s: NetSettings, ip: Ipv4Addr, role: Option<LanRole>) -> NetSettings {
-    s.scope = higanr_core::guard::Scope::Lan;
+/// LAN の接続の設定: 範囲 `scope`（lan か、VPN のネットワークを足した lan）・自分の LAN のアドレス（ポートは OS が選ぶ）で開き、STUN・UPnP・IPv6・
+/// ルームサーバーは使わない。ini は書き換えない（この接続だけの設定）。`role` があれば役割の乱数を決める。
+fn lan_net_settings(
+    mut s: NetSettings,
+    ip: Ipv4Addr,
+    scope: Scope,
+    role: Option<LanRole>,
+) -> NetSettings {
+    s.scope = scope;
     s.bind = Bind::Fixed(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 0));
     s.stun = None;
     s.stun2 = None;
@@ -400,10 +414,10 @@ mod lan_tests {
         .unwrap();
         assert!(base.stun.is_some() && base.upnp && base.ipv6 && base.room_server.is_some());
         let ip = Ipv4Addr::new(192, 168, 7, 20);
-        let h = lan_net_settings(base.clone(), ip, Some(LanRole::Host));
-        let c = lan_net_settings(base.clone(), ip, Some(LanRole::Client));
+        let h = lan_net_settings(base.clone(), ip, Scope::Lan, Some(LanRole::Host));
+        let c = lan_net_settings(base.clone(), ip, Scope::Lan, Some(LanRole::Client));
         for s in [&h, &c] {
-            assert_eq!(s.scope, higanr_core::guard::Scope::Lan);
+            assert_eq!(s.scope, Scope::Lan);
             assert_eq!(
                 s.bind,
                 Bind::Fixed(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 0))
@@ -416,17 +430,49 @@ mod lan_tests {
             assert_eq!(s.mode, base.mode);
         }
         for _ in 0..50 {
-            let h = lan_net_settings(base.clone(), ip, Some(LanRole::Host));
-            let c = lan_net_settings(base.clone(), ip, Some(LanRole::Client));
+            let h = lan_net_settings(base.clone(), ip, Scope::Lan, Some(LanRole::Host));
+            let c = lan_net_settings(base.clone(), ip, Scope::Lan, Some(LanRole::Client));
             assert!(
                 h.role_nonce.unwrap() > c.role_nonce.unwrap(),
                 "ホストが役割の乱数で勝てない"
             );
         }
         // 観戦者の設定は役割の乱数を替えない。
-        let w = lan_net_settings(base.clone(), ip, None);
+        let w = lan_net_settings(base.clone(), ip, Scope::Lan, None);
         assert_eq!(w.role_nonce, base.role_nonce);
-        assert_eq!(w.scope, higanr_core::guard::Scope::Lan);
+        assert_eq!(w.scope, Scope::Lan);
+        // VPN の接続は、運び手が決めた範囲（VPN のネットワークを足した lan）で開く。ほかの設定は同じ。
+        let vpn_ip = Ipv4Addr::new(26, 12, 34, 56);
+        let wide = Scope::LanVpn(higanr_core::vpn_net::Net4::new(vpn_ip, 8).unwrap());
+        for role in [Some(LanRole::Host), Some(LanRole::Client), None] {
+            let v = lan_net_settings(base.clone(), vpn_ip, wide, role);
+            assert_eq!(v.scope, wide);
+            assert_eq!(
+                v.bind,
+                Bind::Fixed(std::net::SocketAddr::new(std::net::IpAddr::V4(vpn_ip), 0))
+            );
+            assert!(v.stun.is_none() && !v.upnp && !v.ipv6 && v.room_server.is_none());
+        }
+    }
+
+    /// 壊れたら落ちる: 前回打った LAN のアドレス（ini の `lan_host`）が入力の初めの値に出ない、LAN の外のアドレスが VPN のネットワークの確認なしで
+    /// 初めの値になる（VPN のネットワークは実機の一覧で決まるので、LAN の中の値と無いときだけを見る）。
+    #[test]
+    fn the_remembered_lan_address_starts_the_input_only_when_it_is_usable() {
+        let at = |s: &str| {
+            Some(LanAddr {
+                ip: s.parse().unwrap(),
+                port: 19000,
+            })
+        };
+        assert!(initial_lan_addr(None).is_empty());
+        assert_eq!(
+            initial_lan_addr(at("192.168.0.2")).as_str(),
+            "192.168.0.2:19000"
+        );
+        assert_eq!(initial_lan_addr(at("10.9.8.7")).as_str(), "10.9.8.7:19000");
+        // この PC の VPN にあるはずのない世界のアドレスは、初めの値にしない。
+        assert!(initial_lan_addr(at("8.8.8.8")).is_empty());
     }
 
     /// 壊れたら落ちる: LAN の接続で、接続コードが人のクリップボードへ書かれる（運び手へ渡らない）、観戦コード（Ctrl+C）の書き先が人の
@@ -485,19 +531,36 @@ fn lan_env(lazy: &'static LazyNet) -> LanEnv {
         port,
         reply_wait_ms: higanr_core::lan_proto::HOST_WAIT_REPLY_MS,
         addresses: Box::new(|| {
-            adapters_win::list().map(|l| higanr_core::adapter_pick::lan_addresses(&l))
+            adapters_win::list().map(|l| higanr_core::adapter_pick::host_addresses(&l))
+        }),
+        vpn_links: Box::new(|| {
+            adapters_win::list()
+                .map(|l| higanr_core::adapter_pick::vpn_links(&l))
+                .unwrap_or_default()
         }),
         net_free: Box::new(|| OPEN_STATE.load(Ordering::SeqCst) == OPEN_IDLE),
         open_net: Box::new(lan_open_net),
         start_watch: Box::new(lan_start_watch),
+        note: Box::new(lan_note),
         id: default_nonce() as u32,
         unix: net_udp::now_unix,
         stop: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     }
 }
 
+/// 運び手の行（本ログと「ネットワーク」の詳細へ書く）。
+fn lan_note(line: String) {
+    crate::main_log::push(line.clone());
+    game_net_note(line);
+}
+
 /// 運び手の頼み: ゲームのネットワークを LAN の設定で開く（開くスレッドを起こして返る。開き終わるとゲームのスレッドが次の tick で置く）。
-fn lan_open_net(ip: Ipv4Addr, role: LanRole, bridge: Arc<LanBridge>) -> Result<(), String> {
+fn lan_open_net(
+    ip: Ipv4Addr,
+    scope: Scope,
+    role: LanRole,
+    bridge: Arc<LanBridge>,
+) -> Result<(), String> {
     let lazy = LAZY
         .get()
         .ok_or("ゲーム内のメニューが置かれていない".to_string())?;
@@ -508,15 +571,24 @@ fn lan_open_net(ip: Ipv4Addr, role: LanRole, bridge: Arc<LanBridge>) -> Result<(
         return Err("ネットワークがほかの用で使われている".to_string());
     }
     SPECTATE_AFTER.store(0, Ordering::SeqCst);
-    *LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(LanOpen { ip, role, bridge });
+    *LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(LanOpen {
+        ip,
+        scope,
+        role,
+        bridge,
+    });
     spawn_open(lazy, false);
     Ok(())
 }
 
 /// 運び手の頼み: 観戦コードを受けた。置いて、ゲームのスレッドに観戦者のネットワークを開かせる（`lan_watch_poll`）。
-fn lan_start_watch(code: String, ip: Ipv4Addr) -> Result<(), String> {
-    *LAN_WATCH.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((code, ip, std::time::Instant::now()));
+fn lan_start_watch(code: String, ip: Ipv4Addr, scope: Scope) -> Result<(), String> {
+    *LAN_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(LanWatch {
+        code,
+        ip,
+        scope,
+        at: std::time::Instant::now(),
+    });
     LAN_WATCH_READY.store(1, Ordering::SeqCst);
     Ok(())
 }
@@ -958,6 +1030,19 @@ pub fn arm_game_ui(
     )
 }
 
+/// LAN のアドレスの入力の初めの値（ini の `lan_host`）。LAN の外のアドレスは、起動のとき自分の PC の VPN のネットワークの中にあるときだけ使う
+/// （アダプターの一覧を引くのは、LAN の外のアドレスが書かれているときだけ）。
+fn initial_lan_addr(host: Option<LanAddr>) -> AddrBuf {
+    let Some(b) = host.map(LanAddr::to_buf) else {
+        return AddrBuf::new();
+    };
+    if b.parse().is_ok() || b.parse_with(&crate::vpn_snap::scan()).is_ok() {
+        b
+    } else {
+        AddrBuf::new()
+    }
+}
+
 /// `arm_game_ui` の中身（メニューが始まる言語と、読めるかを見る範囲を渡す。検査は自分の言語と静的変数を渡す）。
 fn arm_game_ui_with(
     s: &NetSettings,
@@ -1000,9 +1085,13 @@ fn arm_game_ui_with(
         .with_player_name(NameBuf::lossy(&s.name), Some(crate::ini_save::save_name))
         .with_room_saver(Some(crate::ini_save::save_room))
         .with_lan_addr(
-            s.lan_host.map(LanAddr::to_buf).unwrap_or_default(),
+            initial_lan_addr(s.lan_host),
             Some(crate::ini_save::save_lan_host),
         )
+        .with_vpn_hooks(Some(crate::net_ui::VpnHooks {
+            scan: crate::vpn_snap::request_scan,
+            read: crate::vpn_snap::read,
+        }))
         .with_shape_saver(Some(crate::ini_save::save_shape))
         .with_seat_saver(Some(crate::ini_save::save_seat))
         .with_watch_feed(Some(feed_watch_list))
@@ -1015,11 +1104,16 @@ fn arm_game_ui_with(
     unsafe { *UI.0.get() = Some(ui) };
     UI_ON.store(1, Ordering::Release);
     Ok(format!(
-        "ゲーム内のメニューを置いた（受信ソケット・STUN・見張りは、メニューの最初の「ルームで待つ」「作る」「貼る」まで開かない。コードの受け渡しは{}。ルームで待つは{}）",
+        "ゲーム内のメニューを置いた（受信ソケット・STUN・見張りは、メニューで最初に「{}」「{}」「{}」「{}」のどれかを選ぶまで開かない。コードの受け渡しは{}。「{}」は{}）",
+        higanr_core::net_menu::T_RANDOM.ja,
+        higanr_core::net_menu::T_ROOM.ja,
+        higanr_core::net_menu::T_CREATE.ja,
+        higanr_core::net_menu::T_PASTE.ja,
         match s.clipboard {
             ClipboardKind::System => "クリップボード",
             ClipboardKind::File => "ファイル（開発用 clipboard = file）",
         },
+        higanr_core::net_menu::T_ROOM.ja,
         match (room, from) {
             (RoomItem::Off, _) => "出さない（room_server が無い）",
             // 名は書かない。初めの値の出どころだけ。
@@ -1033,7 +1127,7 @@ fn arm_game_ui_with(
     ))
 }
 
-/// 「ルームで待つ」の項目（ini の `room_server` が無ければ出さない。あれば入力の初めの値 `initial` を持たせる）。
+/// 「ルームマッチ」の項目（ini の `room_server` が無ければ出さない。あれば入力の初めの値 `initial` を持たせる）。
 pub(crate) fn room_item(s: &NetSettings, initial: higanr_core::room_input::RoomBuf) -> RoomItem {
     match &s.room_server {
         None => RoomItem::Off,
@@ -1357,7 +1451,7 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
     // LAN の接続の頼みがあれば（運び手が置いた）、その設定とコードの運び先で開く。ほかの接続は今までどおり。
     let lan = LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()).take();
     let named = match &lan {
-        Some(l) => lan_net_settings(lazy.settings_now(), l.ip, Some(l.role)),
+        Some(l) => lan_net_settings(lazy.settings_now(), l.ip, l.scope, Some(l.role)),
         None => lazy.settings_now(),
     };
     let s = &named;
@@ -1491,16 +1585,16 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-        .filter(|(_, _, at)| at.elapsed() < LAN_WATCH_FRESH);
+        .filter(|w| w.at.elapsed() < LAN_WATCH_FRESH);
     let named = match &lan {
-        Some((_, ip, _)) => lan_net_settings(lazy.settings_now(), *ip, None),
+        Some(w) => lan_net_settings(lazy.settings_now(), w.ip, w.scope, None),
         None => lazy.settings_now(),
     };
     let s = &named;
     // 観戦コード入力: ルームサーバーは使わない。クリップボードはここで 1 回だけ読み、読めたかどうかの判断は観戦者のスレッドが状態に書く。
     let by_code = lan.is_some() || lazy.link.spectate_by_code();
-    let (source, shown) = if let Some((code, _, _)) = lan {
-        (JoinSource::Code(Ok(Some(code))), String::new())
+    let (source, shown) = if let Some(w) = lan {
+        (JoinSource::Code(Ok(Some(w.code))), String::new())
     } else if by_code {
         let read = open_clipboard(s, lazy)?.read();
         (JoinSource::Code(read), String::new())
@@ -2210,17 +2304,25 @@ fn menu_net_of(menu_placed: bool, asked: bool) -> MenuNet {
 
 /// ネットワークの数と、ネットワークの外の数の文（読み取りのスレッド。ログ用）。
 pub fn net_status() -> (NetSnapshot, String) {
-    let (recv, spec, diag) = {
+    let (recv, spec, spectators, diag) = {
         let g = RECV.lock().unwrap_or_else(|e| e.into_inner());
+        // 観戦のホストの集計（`[spectate] enable = 1` のときだけ 1 行。無ければ今までの行のまま）。
+        let host = g.as_ref().and_then(RecvThread::spectate_snapshot);
         (
             g.as_ref().map_or("受信スレッドなし".to_string(), |t| {
                 format!("受信 {:?}", t.stats())
             }),
-            // 観戦のホストの集計（`[spectate] enable = 1` のときだけ 1 行。無ければ今までの行のまま）。
-            g.as_ref()
-                .and_then(RecvThread::spectate_snapshot)
-                .map(|s| format!("\n{}", s.text()))
-                .unwrap_or_default(),
+            host.map(|s| format!("\n{}", s.text())).unwrap_or_default(),
+            host.map(|s| {
+                let c = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+                crate::net_watch::SpectatorCounts {
+                    now: s.spectators,
+                    joined: c(s.host.joined),
+                    left: c(s.host.left),
+                    silenced: c(s.host.silenced),
+                    refused_full: c(s.host.refused_full),
+                }
+            }),
             // 受信側が持つ診断（STUN の聞き直し・送りの誤り・自分の候補。受信スレッドが無ければ全部 0 / なし）。
             g.as_ref().map(RecvThread::diag).unwrap_or_default(),
         )
@@ -2276,6 +2378,7 @@ pub fn net_status() -> (NetSnapshot, String) {
     let mut snap = NET_STATUS.snapshot();
     snap.relink = UI_ON.load(Ordering::SeqCst) != 0;
     snap.diag = diag;
+    snap.spectators = spectators;
     // 繋がらなかった理由を読むための診断（セッションを作った後・STUN を使った実行だけ。人を特定する値は書かない）。
     let diag_line = if snap.has_link_box() || diag.keep.installed || diag.port_kept.is_some() {
         format!("\n{}", snap.diag_text())
@@ -3364,7 +3467,7 @@ fn net_tick(
         // （人の入力で続く）。
         slot.np.close(r);
     }
-    NET_STATUS.publish(&slot.np);
+    NET_STATUS.publish(&slot.np, slot.net.is_vpn());
     if let Some(s) = step {
         // lockstep のフレームで台本を 1 tick 進めた（自分の席の入力ワードに使った）。
         if s.shot != 0 {
@@ -3444,7 +3547,7 @@ fn watch_tick(
     };
     watch_save_quit_tick(&mut slot.wp);
     WATCH_STATUS.publish(&slot.wp);
-    NET_STATUS.publish_watch(&slot.wp);
+    NET_STATUS.publish_watch(&slot.wp, slot.net.is_vpn());
     if let Some(s) = step {
         if s.shot != 0 {
             shot_win::place_request(s.shot, s.step, k);
@@ -3517,13 +3620,13 @@ pub extern "C" fn match_start_on() {
             Some(Slot::Play(slot)) => {
                 let mut game = NetGame::new(&mut io, None, load_addrs());
                 slot.np.on_match_start(&mut game);
-                NET_STATUS.publish(&slot.np);
+                NET_STATUS.publish(&slot.np, slot.net.is_vpn());
             }
             Some(Slot::Watch(slot)) => {
                 let mut game = NetGame::new(&mut io, None, load_addrs());
                 slot.wp.on_match_start(&mut game);
                 WATCH_STATUS.publish(&slot.wp);
-                NET_STATUS.publish_watch(&slot.wp);
+                NET_STATUS.publish_watch(&slot.wp, slot.net.is_vpn());
             }
             None => {}
         }
@@ -3750,7 +3853,7 @@ pub fn rb_scan_handler(this: u32) -> Option<i32> {
             // 台本が終わった（`net_tick` と同じ。2 回目からは何もしない）。
             slot.np.close(r);
         }
-        NET_STATUS.publish(&slot.np);
+        NET_STATUS.publish(&slot.np, slot.net.is_vpn());
         ui_hud_tick(&mut slot.np);
         if let Some(s) = script_step {
             if s.shot != 0 {
@@ -7649,5 +7752,17 @@ pub(crate) mod tests {
         link.send(Cmd::Spectate(typed));
         let (room, _) = watch_target(&link).unwrap();
         assert_eq!(room, typed.parse().unwrap().spectate_of());
+    }
+
+    /// 壊れたら落ちる: 運び手の行が本ログ（簡潔なログにも出る）と「ネットワーク」の詳細の一覧の両方に入らない。
+    #[test]
+    fn a_lan_line_reaches_the_simple_log_and_the_detail_list() {
+        let line = "LAN: 検査の行（/8）を足した範囲で開く".to_string();
+        lan_note(line.clone());
+        assert!(crate::main_log::peek().contains(&line), "本ログに無い");
+        assert!(
+            GAME_NET_NOTES.lock().unwrap().contains(&line),
+            "詳細の一覧に無い"
+        );
     }
 }

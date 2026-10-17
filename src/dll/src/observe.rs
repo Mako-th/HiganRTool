@@ -224,8 +224,23 @@ const ROLLBACK_LINE_HEAD: &str = "巻き戻し（";
 
 /// 途中経過の巻き戻しの要約。`net_text` は `RecordEnv::net_status` の文で、終わりの要約と同じ行をそのまま選んで書く。
 /// 巻き戻しの行が無い実行（delay 方式・rollback の入口を書いていない）は何も書かない。
-fn write_rollback_interim(out: &mut dyn Write, k: u32, net_text: &str) {
+/// 前の途中経過と同じ行（数が 1 つも変わらない。マッチの間やメニューにいる間）は書かない。
+fn write_rollback_interim(out: &mut dyn Write, k: u32, net_text: &str, last: &mut Option<String>) {
+    let body = rollback_body(net_text);
+    if last.as_deref() == Some(body.as_str()) {
+        return;
+    }
     write_rollback_lines(&mut detail_out(out), "途中経過", k, net_text);
+    *last = Some(body);
+}
+
+/// 巻き戻しの要約の行だけを改行でつないだもの（途中経過が前と同じかを比べる）。
+fn rollback_body(net_text: &str) -> String {
+    net_text
+        .lines()
+        .filter(|l| l.starts_with(ROLLBACK_LINE_HEAD))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 巻き戻しの要約の見出しと行（途中経過と、つながりの終わりの節が使う）。`what` は見出しの括弧の先頭。
@@ -265,6 +280,7 @@ fn write_link_end(
     start_pair: (u64, i64),
     qpf: i64,
     streams: &Streams,
+    link_log: &crate::link_log::LinkLog,
 ) {
     let what = format!("{n} 回目のつながりの終わり");
     let _ = writeln!(
@@ -283,6 +299,7 @@ fn write_link_end(
         qpf,
         streams,
         menu,
+        None,
     );
     let facts = trial_facts(game, rec, Some(snap), None, Stage::Final);
     let text = trial_summary::render(&facts);
@@ -292,6 +309,9 @@ fn write_link_end(
         out,
         "==== 試験のまとめ（{what}。計測 {k} 秒の時点） ====\n{body}"
     );
+    for l in link_log.end_lines(&snap) {
+        let _ = writeln!(out, "{l}");
+    }
     write_rollback_lines(&mut detail_out(out), &what, k, net_text);
 }
 
@@ -623,9 +643,13 @@ impl Streams {
         self.draws.flush();
     }
 
+    #[cfg(test)]
     fn write_status(&self, out: &mut dyn Write) {
-        let _ = writeln!(
-            out,
+        let _ = writeln!(out, "{}", self.status_text());
+    }
+
+    fn status_text(&self) -> String {
+        format!(
             "書き出し: {} / {} / {}{} / {}（描画の読み落とし {}）",
             self.ticks.status("行"),
             self.changes.status("行"),
@@ -640,8 +664,26 @@ impl Streams {
             },
             self.draws.status("行"),
             self.draw_lost,
-        );
+        )
     }
+}
+
+/// 途中経過の集計で、前に書いた節と変わらない行を繰り返さないための覚え。tick の集計は取れた件が上限（`MAX_RECORDS`）に達すると
+/// 中身が変わらなくなり（1 時間 13 分で 262,144 件。以後 60 秒ごとに同じ行が並んだ）、書き出しの行は書かない設定だと毎回同じになる。
+/// 持ちきれなかった件数のように増え続ける値は、比べから外して終わりの節に書く。終わりの集計とつながりの終わりの節は覚えを使わず全部書く。
+#[derive(Default)]
+struct ProgressEcho {
+    ticks: Option<crate::ticks::TickSummary>,
+    status: Option<String>,
+    /// 省いたことを言う行を書いたか（1 本の計測で 1 回）。
+    noted: bool,
+}
+
+/// `overflow`（持ちきれなかった件数。上限に達した後は増え続ける）以外が同じか。
+fn same_but_overflow(a: &crate::ticks::TickSummary, b: &crate::ticks::TickSummary) -> bool {
+    let mut a = a.clone();
+    a.overflow = b.overflow;
+    a == *b
 }
 
 #[allow(clippy::too_many_arguments)] // 集計に要るものを 1 か所で渡す
@@ -655,6 +697,7 @@ fn write_progress(
     qpf: i64,
     streams: &Streams,
     menu: Option<TickStats>,
+    echo: Option<&mut ProgressEcho>,
 ) -> crate::ticks::TickSummary {
     let _ = writeln!(out, "==== 集計（{label}。始めからここまで） ====");
     let now_freq = tsc_frequency(start_pair, now_pair, qpf);
@@ -682,8 +725,34 @@ fn write_progress(
         ),
     };
     let ticks = summarize(col, freq0);
-    write_summary(out, &ticks);
-    streams.write_status(out);
+    let status = streams.status_text();
+    let (same_ticks, same_status) = echo.as_deref().map_or((false, false), |e| {
+        (
+            e.ticks
+                .as_ref()
+                .is_some_and(|p| same_but_overflow(p, &ticks)),
+            e.status.as_deref() == Some(status.as_str()),
+        )
+    });
+    if !same_ticks {
+        write_summary(out, &ticks);
+    }
+    if !same_status {
+        let _ = writeln!(out, "{status}");
+    }
+    if let Some(e) = echo {
+        if (same_ticks || same_status) && !e.noted {
+            e.noted = true;
+            let _ = writeln!(
+                out,
+                "集計: tick の集計と書き出しの行は、前の節から変わらないときは書かない（持ちきれなかった件数など増え続ける値は終わりの節に書く）"
+            );
+        }
+        if !same_ticks {
+            e.ticks = Some(ticks.clone());
+        }
+        e.status = Some(status);
+    }
     match menu {
         Some(m) => m.write_summary(out, label),
         None => {
@@ -907,6 +976,12 @@ pub fn run_len(
     // rollback のマッチをやめた行（回数が変わるたびに 1 回。簡潔なログにも残す）。
     let mut last_abort_line: Option<String> = None;
     let mut matches = crate::match_events::MatchWatch::default();
+    // つながりごとの観戦者の出入り・RTT の標本（終わりの節に stall の内訳と一緒に書く）。
+    let mut link_log = crate::link_log::LinkLog::default();
+    let mut last_net: Option<NetSnapshot> = None;
+    // 途中経過の集計・巻き戻しの要約で、前と変わらないものを繰り返さないための覚え。
+    let mut echo = ProgressEcho::default();
+    let mut last_rollback_interim: Option<String> = None;
     // つなぎ直せる実行で、前の秒に見たつながりが終わっていたか（終わりの節を 1 本に 1 回だけ書くための縁の検出）と、書いた本数。
     // ネットワークの数を読めなかった秒は前の値のまま（片づけの後は、次のセッションを置くまでネットワークの数が前のつながりの終わりのまま残る）。
     let mut link_end_seen = false;
@@ -991,6 +1066,10 @@ pub fn run_len(
             for l in matches.step(&snap, k) {
                 let _ = writeln!(out, "{l}");
             }
+            for l in link_log.step(&snap, k) {
+                let _ = writeln!(out, "{l}");
+            }
+            last_net = Some(snap);
             while restarts_logged < snap.hs_restarts {
                 restarts_logged += 1;
                 let _ = writeln!(
@@ -1084,6 +1163,7 @@ pub fn run_len(
                     start_pair,
                     qpf,
                     &streams,
+                    &link_log,
                 );
             }
             link_end_seen = ended_now;
@@ -1103,6 +1183,7 @@ pub fn run_len(
                 qpf,
                 &streams,
                 menu,
+                Some(&mut echo),
             );
         }
         if !last {
@@ -1131,7 +1212,7 @@ pub fn run_len(
                 if due.rollback
                     && let Some((_, text)) = &net_now
                 {
-                    write_rollback_interim(out, k, text);
+                    write_rollback_interim(out, k, text, &mut last_rollback_interim);
                 }
                 last_marks = Some(now_marks);
                 last_items = Some(items);
@@ -1163,7 +1244,14 @@ pub fn run_len(
         qpf,
         &streams,
         menu,
+        None,
     );
+    // つなぎ直せない実行（つながりが終わると計測も終わる）の、つながりの終わりの行。つなぎ直せる実行は終わりを見た秒に `write_link_end` が書いている。
+    if let Some(s) = last_net.filter(|s| !s.relink) {
+        for l in link_log.end_lines(&s) {
+            let _ = writeln!(out, "{l}");
+        }
+    }
     // D3D8 のデバイスの下見をもう一度読む（設置の直後は主スレッドがまだデバイスを作っていないことがあるので、描画の地点を通った後の値を見る）。
     for l in rec.d3d8_probe().lines().lines() {
         let _ = writeln!(detail_out(out), "（終わりに読み直し）{l}");
@@ -2309,6 +2397,170 @@ pub(crate) mod tests {
             "{log}"
         );
         assert!(log.contains("計測の集計: 7 回"), "{log}");
+    }
+
+    /// 1 本目は 0〜2 回目の読みで繋がって進み、3 回目から終わる。観戦者が 1 人入り（1 回目）、抜ける（終わり）。RTT の測定は 1 秒に 1 個。
+    fn ending_link_snap(i: u32) -> NetSnapshot {
+        let ended = i >= 3;
+        NetSnapshot {
+            phase: if ended { 5 } else { 4 },
+            end: if ended { 5 } else { 0 },
+            end_detail: u32::from(ended),
+            connected: true,
+            path_kind: 2,
+            segs_started: 1,
+            relink: true,
+            link_started_ms: 4_000,
+            played: 600,
+            stalls: 10,
+            stalls_sync: 6,
+            stalls_ahead: 3,
+            stalls_boundary: 1,
+            rtt_ms: Some([170, 180, 176, 176][i.min(3) as usize]),
+            rtt_pongs: i + 1,
+            agreed_mismatch: Some(0),
+            spectators: Some(crate::net_watch::SpectatorCounts {
+                now: u32::from((1..3).contains(&i)),
+                joined: u32::from(i >= 1),
+                left: u32::from(ended),
+                ..Default::default()
+            }),
+            ..NetSnapshot::default()
+        }
+    }
+
+    /// 壊れたら落ちる: つながりの終わりの節に stall の内訳・RTT の中央値と最大（標本の数と PONG の数つき）・観戦者の数が出ない、
+    /// 観戦者が来た・抜けた行が本ログに出ない / 毎秒出る、試合の終わりの行に接続が終わった理由が付かない。
+    #[test]
+    fn the_link_end_section_carries_the_stall_split_rtt_and_spectator_counts() {
+        let mut h = clock_hook();
+        let mut rec = FakeRecord::new(Vec::new(), 0);
+        rec.net = Some(ending_link_snap);
+        rec.net_text = Some(relink_text);
+        let mut out = Vec::new();
+        run_len(
+            &mut h,
+            &mut rec,
+            0,
+            &mut out,
+            RunLen::Net {
+                tail: 3,
+                max: Some(12),
+                steps: 0,
+                feed_first: 0,
+            },
+            &trial_summary::installed_game_facts(),
+        );
+        let log = String::from_utf8(out).unwrap();
+        assert_eq!(
+            log.matches("観戦: 観戦者が来た（1 人。いま 1 人").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            log.matches("観戦: 観戦者が抜けた（自分で抜けた 1 人・黙って外した 0 人。いま 0 人")
+                .count(),
+            1,
+            "{log}"
+        );
+        let at = log.find("==== 1 回目のつながりの終わり（").expect(&log);
+        let sec = &log[at..];
+        let sec = &sec[..sec.find("計測 5/").expect(sec)];
+        for want in [
+            "つながり: stall の内訳（フレーム数）: 時刻合わせ 6 / 先に行き過ぎ 3 / 境目 1 / 相手の入力待ち 0 / ほか 0（合計 10）。使ったフレーム 600 のうち 1.67%",
+            "つながり: RTT 中央値 176 ms / 最大 180 ms（測れた PONG 4 個のうち、1 秒ごとの読み取りで採れた標本 4 個。見逃し 0 個）",
+            "つながり: 観戦者 入った 1 人 / 自分で抜けた 1 人 / 黙って外した 0 人 / 上限で断った 0 人（終わりにいた 0 人）",
+        ] {
+            assert!(sec.contains(want), "{want}\n---\n{sec}");
+        }
+        assert_eq!(log.matches("つながり: stall の内訳").count(), 1, "{log}");
+        // 試合の始まりと終わりの番号が揃い、終わりに接続の終わりの理由が付く。
+        assert!(log.contains("試合: 1 試合目が始まった"), "{log}");
+        assert!(
+            log.contains("試合: 1 試合目が終わった（接続が終わったため（自分から終えた）"),
+            "{log}"
+        );
+    }
+
+    /// 壊れたら落ちる: 前の節と変わらない巻き戻しの要約・tick の集計・書き出しの行を、途中経過のたびに繰り返す。
+    #[test]
+    fn unchanged_interim_lines_are_not_repeated() {
+        let mut h = clock_hook();
+        let mut rec = FakeRecord::new(Vec::new(), 0);
+        rec.net = Some(|_| NetSnapshot {
+            phase: 4,
+            connected: true,
+            segs_started: 1,
+            agreed_mismatch: Some(0),
+            ..NetSnapshot::default()
+        });
+        rec.net_text = Some(|_| "受信 合成\n巻き戻し（製品の経路）: コピー 7".to_string());
+        let mut out = Vec::new();
+        run_len(
+            &mut h,
+            &mut rec,
+            0,
+            &mut out,
+            RunLen::Net {
+                tail: 3,
+                max: Some(185),
+                steps: 0,
+                feed_first: 0,
+            },
+            &trial_summary::installed_game_facts(),
+        );
+        let log = String::from_utf8(out).unwrap();
+        // 途中経過は 60・120・180 秒。同じ中身は最初の 1 回だけ。終わりの集計は毎回の全部を書く。
+        assert_eq!(
+            log.matches("---- 巻き戻しの要約（途中経過。").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(log.matches("==== 集計（途中 ").count(), 3, "{log}");
+        assert_eq!(log.matches("tick の集計: 取れた 0 件").count(), 2, "{log}");
+        assert_eq!(
+            log.lines().filter(|l| l.starts_with("書き出し: ")).count(),
+            2,
+            "{log}"
+        );
+        assert_eq!(
+            log.matches("集計: tick の集計と書き出しの行は、前の節から変わらないときは書かない")
+                .count(),
+            1,
+            "{log}"
+        );
+    }
+
+    /// 壊れたら落ちる: 持ちきれなかった件数が増えるだけの節を別の中身と見て毎回書く / 件数以外の変わりを同じと見て書かない。
+    #[test]
+    fn a_tick_summary_that_only_grew_its_overflow_counts_as_unchanged() {
+        let base = Collected::default();
+        let a = summarize(
+            &Collected {
+                overflow: 5,
+                ..base.clone()
+            },
+            None,
+        );
+        let b = summarize(
+            &Collected {
+                overflow: 90_000,
+                ..base.clone()
+            },
+            None,
+        );
+        assert!(same_but_overflow(&a, &b));
+        let c = summarize(
+            &Collected {
+                lost: 1,
+                ..base.clone()
+            },
+            None,
+        );
+        assert!(
+            !same_but_overflow(&a, &c),
+            "読み落としが増えたのに同じと見た"
+        );
     }
 
     fn clock_hook() -> FakeHook {

@@ -16,7 +16,7 @@ members = ["src/core", "src/dll", "src/loader", "src/peer_sim", "src/manifest_si
 
 [workspace.package]
 # 配布のバージョン（zip の名前と、更新の目録の表示名に使う）
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false

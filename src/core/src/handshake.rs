@@ -1235,13 +1235,13 @@ mod tests {
     }
 
     #[test]
-    fn seats_follow_both_wishes_with_the_first_comer_winning_a_clash() {
+    fn seats_follow_both_wishes_and_a_clash_goes_to_the_coin() {
         use crate::wire::{Arrival, SeatWish};
         use SeatWish::{Any, P1 as W1, P2 as W2};
         let coin = seat_pick::coin(900, 100);
         let table = [
-            (W1, W1, Seat::P1),
-            (W2, W2, Seat::P2),
+            (W1, W1, coin),
+            (W2, W2, coin),
             (W1, W2, Seat::P1),
             (W2, W1, Seat::P2),
             (W1, Any, Seat::P1),

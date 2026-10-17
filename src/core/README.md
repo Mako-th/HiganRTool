@@ -17,7 +17,7 @@ DLL（`src/dll`）・ローダー（`src/loader`）・偽の対戦相手（`src/
 
 - **プロトコル**: `wire.rs`（パケットのエンコードとデコード。プロトコルのバージョン`PROTO_VER`もここ）・`auth.rs`（認証タグ）・`seal.rs`（使い捨ての鍵の交換と暗号化）・`handshake.rs`（接続の手順）・`link.rs`（受けたパケットをどの状態機械へ渡すか。DLLと`peer_sim`が共有）・`liveness.rs`（PINGと、沈黙による切断）・`pong.rs`。
 - **同期**: `frame.rs`（フレーム番号の式）・`lockstep.rs`（delay方式）・`rollback.rs`（rollback方式）・`word_ring.rs`（入力の置き場）・`check.rs`（同期の確かめ）・`selection.rs`と`menu_model.rs`（キャラ選択などの画面の同期）・`match_gate.rs`（対戦の成立）・`delay_pick.rs`と`mode_pick.rs`（ディレイと同期方式の選び方）・`seat_pick.rs`（席）・`testnet.rs`（検査用の2台の模型）。
-- **接続**: `code.rs`と`code_files.rs`（接続コード）・`candidate.rs`（候補のアドレスと経路の選び方）・`stun.rs`・`upnp.rs`・`nat.rs`（回線の型と、接続できなかったときの文）・`guard.rs`（接続してよいアドレスの範囲。既定はloopbackだけ）・`lan_addr.rs`と`lan_proto.rs`と`adapter_pick.rs`（LAN対戦）。
+- **接続**: `code.rs`と`code_files.rs`（接続コード）・`candidate.rs`（候補のアドレスと経路の選び方）・`stun.rs`・`upnp.rs`・`nat.rs`（回線の型と、接続できなかったときの文）・`guard.rs`（接続してよいアドレスの範囲。既定はloopbackだけ）・`lan_addr.rs`と`lan_proto.rs`と`adapter_pick.rs`（LAN対戦）・`vpn_net.rs`（Radmin VPN・Hamachi・ZeroTierのネットワークの範囲）。
 - **ルームサーバーのクライアント**: `room.rs`（ルームマッチ）・`room_queue.rs`（ランダムマッチ）・`watch_list.rs`（観戦の一覧）・`room_rejoin.rs`・`spectate_room.rs`。サーバーの側は`src/server`です。
 - **観戦**: `spectate.rs`（観戦のパケットと、ホストと観戦者の状態機械）。
 - **ゲーム内のメニュー**: `net_menu.rs`（メニューの状態機械と、画面に出す文の表）・`ui_entry.rs`・`ui_layout.rs`・`room_input.rs`・`player_name.rs`・`overlay.rs`（文字の描画の下ごしらえ）・`lang.rs`。

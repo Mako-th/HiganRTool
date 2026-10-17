@@ -18,7 +18,7 @@ use crate::guard::{self, Scope};
 pub fn ip_kind(ip: IpAddr) -> &'static str {
     match guard::reach(ip) {
         Some(Scope::Loopback) => "同じ PC の中",
-        Some(Scope::Lan) => "家の中",
+        Some(Scope::Lan | Scope::LanVpn(_)) => "家の中",
         Some(Scope::Internet) => "外",
         None => "使えないアドレス",
     }

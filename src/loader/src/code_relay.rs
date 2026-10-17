@@ -181,7 +181,7 @@ impl Before {
 }
 
 pub const CLEARED_PEER: Tx = Tx {
-    ja: "前回の相手のコードを片づけました。",
+    ja: "前回の相手のコードを消しました。",
     en: "Cleared the opponent's connection code from the previous run.",
 };
 
@@ -226,7 +226,7 @@ pub fn before_launch(plan: &Plan, lang: Lang) -> (Before, Option<String>) {
         Ok(false) => None,
         Err(e) => Some(by_lang!(
             lang,
-            ja: "HiganRTool: 前回の相手のコードを片づけられませんでした（{e}）。このまま続けます。",
+            ja: "HiganRTool: 前回の相手のコードを消せませんでした（{e}）。このまま続けます。",
             en: "HiganRTool: Could not clear the opponent's code from the previous run ({e}). Continuing."
         )),
     };
@@ -234,7 +234,7 @@ pub fn before_launch(plan: &Plan, lang: Lang) -> (Before, Option<String>) {
     let mode = clear_stale_mode(&plan.dir, lang).err().map(|e| {
         by_lang!(
             lang,
-            ja: "HiganRTool: 前回の同期方式の選択を片づけられませんでした（{e}）。今回の番号と合わない選択は使いません。",
+            ja: "HiganRTool: 前回の同期方式の選択を消せませんでした（{e}）。今回の番号と合わない選択は使いません。",
             en: "HiganRTool: Could not clear the netcode choice from the previous run ({e}). A choice that does not match this run is not used."
         )
     });
@@ -427,7 +427,7 @@ pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
 }
 
 pub const REFUSE_SHORT: Tx = Tx {
-    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら0〜8の数字かdelayのどれか、接続コードなら途中で切れていないか確かめて1行で全部貼ってください。",
+    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら0〜8の数字かdelayのどれかを入力してください。接続コードなら途中で切れていないか確かめて、1行で全部貼ってください。",
     en: "HiganRTool: Too short to be a connection code or a netcode choice. For a netcode, type a number 0-8 or delay. For a connection code, check that it was not cut off and paste all of it on one line.",
 };
 
@@ -656,7 +656,7 @@ impl Relay {
                     host.say(&text);
                     if !self.clipboard {
                         host.say(match lang {
-                            Lang::Ja => "HiganRTool: クリップボードにはコピーしなかった（--no-clipboard）。上のコードを選んでコピーし、チャットで相手に送ってください。",
+                            Lang::Ja => "HiganRTool: クリップボードにはコピーしていません（--no-clipboard）。上のコードを選んでコピーし、チャットで相手に送ってください。",
                             Lang::En => "HiganRTool: Not copied to the clipboard (--no-clipboard). Select the code above, copy it, and send it to your opponent in chat.",
                         });
                         continue;
@@ -1274,7 +1274,7 @@ mod tests {
         std::fs::create_dir(d.join(PEER_CODE_FILE)).unwrap();
         let (_, note) = before_launch(&plan, Lang::Ja);
         let note = note.expect("消せないのに黙った");
-        assert!(note.contains("片づけられませんでした"), "{note}");
+        assert!(note.contains("消せませんでした"), "{note}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1399,7 +1399,7 @@ mod tests {
         let t = h.text();
         assert!(t.contains("\nOFFER1\n") && t.contains("\nOFFER2\n"), "{t}");
         assert_eq!(
-            t.matches("クリップボードにはコピーしなかった（--no-clipboard）")
+            t.matches("クリップボードにはコピーしていません（--no-clipboard）")
                 .count(),
             2,
             "{t}"
@@ -2288,10 +2288,7 @@ mod tests {
         std::fs::create_dir(d.join(MODE_FILE)).unwrap();
         let (_, note) = before_launch(&plan, Lang::Ja);
         let note = note.expect("消せないのに黙った");
-        assert!(
-            note.contains("同期方式の選択を片づけられませんでした"),
-            "{note}"
-        );
+        assert!(note.contains("同期方式の選択を消せませんでした"), "{note}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

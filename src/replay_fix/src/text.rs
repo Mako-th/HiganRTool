@@ -17,12 +17,16 @@ pub struct Text(pub Lang);
 
 impl Text {
     pub fn title(self) -> &'static str {
-        tx("HiganRToolリプレイを直す", "HiganRTool Replay fix").get(self.0)
+        tx(
+            "HiganRToolリプレイ修復ツール",
+            "HiganRTool Replay Repair Tool",
+        )
+        .get(self.0)
     }
 
     pub fn start_hint(self) -> &'static str {
         tx(
-            "チャージ型が合わず、再生でずれるリプレイを直します。\n直したいリプレイか、リプレイの入ったフォルダを選んでください。\nこのウィンドウへドラッグしても選べます。",
+            "チャージの設定が合わず、再生でずれるリプレイを直します。\n直したいリプレイか、リプレイの入ったフォルダを選んでください。\nこのウィンドウへドラッグしても選べます。",
             "Fixes replays that go out of sync because the charge types differ.\nChoose the replays, or a folder that contains them.\nYou can also drop them on this window.",
         )
         .get(self.0)
@@ -115,20 +119,20 @@ impl Text {
         Some(match a {
             Analysis::Fixable(_) => return None,
             Analysis::Recorded => tx(
-                "新しいバージョンで保存した／直し済みのリプレイなので、直すものはありません。",
+                "新しいバージョンで保存した／直し済みのリプレイなので、修正を適用しませんでした。",
                 "This replay was saved by a newer version or has already been fixed. There is nothing to fix.",
             )
             .get(self.0)
             .to_string(),
             Analysis::NoMark => tx(
-                "HiganRToolで保存したリプレイではないので、直せません。",
+                "HiganRToolで保存したリプレイではないので修正を適用しませんでした。",
                 "This replay was not saved by HiganRTool, so it cannot be fixed.",
             )
             .get(self.0)
             .to_string(),
             Analysis::OddValue(a, b) => match self.0 {
                 Lang::Ja => format!(
-                    "チャージ型の値（{a}, {b}）がslow / chargeのどちらでもないので、直せません。"
+                    "チャージの設定の値（{a}, {b}）がslow / chargeのどちらでもないので、直せません。"
                 ),
                 Lang::En => format!(
                     "The charge values ({a}, {b}) are neither slow nor charge, so it cannot be fixed."
@@ -209,7 +213,7 @@ impl Text {
             ),
             (
                 r.odd_value,
-                "チャージ型の値がslow / chargeではない",
+                "チャージの設定の値がslow / chargeではない",
                 "charge value is neither slow nor charge",
             ),
         ];
@@ -234,8 +238,8 @@ impl Text {
         }
         lines.push(
             tx(
-                "実際のゲームでの確認や、壊れたリプレイとの入れ換えはご自身で行ってください。",
-                "Check them in the game and replace the broken replays yourself.",
+                "花映塚での確認や、ずれるリプレイとの入れ換えは、ご自身で行ってください。",
+                "Check them in the game and replace the replays that go out of sync yourself.",
             )
             .get(self.0)
             .to_string(),
@@ -432,7 +436,9 @@ mod tests {
         let t = Text(Lang::Ja);
         assert_eq!(
             t.unavailable(&Analysis::Recorded).as_deref(),
-            Some("新しいバージョンで保存した／直し済みのリプレイなので、直すものはありません。")
+            Some(
+                "新しいバージョンで保存した／直し済みのリプレイなので、修正を適用しませんでした。"
+            )
         );
         for a in [
             Analysis::NoMark,
@@ -536,13 +542,13 @@ mod tests {
         assert_eq!(
             Text(Lang::Ja).result_report(&r),
             format!(
-                "8件中7件を処理しました。\n修復したリプレイは \"{d}\" に保存されています。\nth9_ud0002.rpyは修正が不要なのでスキップしました。\n実際のゲームでの確認や、壊れたリプレイとの入れ換えはご自身で行ってください。"
+                "8件中7件を処理しました。\n修復したリプレイは \"{d}\" に保存されています。\nth9_ud0002.rpyは修正が不要なのでスキップしました。\n花映塚での確認や、ずれるリプレイとの入れ換えは、ご自身で行ってください。"
             )
         );
         assert_eq!(
             Text(Lang::En).result_report(&r),
             format!(
-                "Processed 7 of 8 replays.\nThe fixed replays are saved in \"{d}\".\nth9_ud0002.rpy needs no fix and was skipped.\nCheck them in the game and replace the broken replays yourself."
+                "Processed 7 of 8 replays.\nThe fixed replays are saved in \"{d}\".\nth9_ud0002.rpy needs no fix and was skipped.\nCheck them in the game and replace the replays that go out of sync yourself."
             )
         );
     }
@@ -552,7 +558,7 @@ mod tests {
         let (r, _) = report(2, &[1, 2]);
         assert_eq!(
             Text(Lang::Ja).result_report(&r),
-            "2件中0件を処理しました。\nth9_ud0001.rpy〜th9_ud0002.rpyは修正が不要なのでスキップしました。\n実際のゲームでの確認や、壊れたリプレイとの入れ換えはご自身で行ってください。"
+            "2件中0件を処理しました。\nth9_ud0001.rpy〜th9_ud0002.rpyは修正が不要なのでスキップしました。\n花映塚での確認や、ずれるリプレイとの入れ換えは、ご自身で行ってください。"
         );
         let en = Text(Lang::En).result_report(&r);
         assert!(en.starts_with("Processed 0 of 2 replays.\n"), "{en}");
@@ -573,6 +579,6 @@ mod tests {
         assert!(s.contains("読めなかった・書けなかった: 1本"), "{s}");
         assert!(s.contains("a\\2.rpy: 読めない"), "{s}");
         assert!(!s.contains("スキップ"), "{s}");
-        assert!(!s.contains("チャージ型の値"), "{s}");
+        assert!(!s.contains("チャージの設定の値"), "{s}");
     }
 }

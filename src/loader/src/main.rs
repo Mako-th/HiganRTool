@@ -84,7 +84,7 @@ fn folder_unknown(exe: &Path, lang: Lang) -> String {
     let shown = exe.display();
     by_lang!(
         lang,
-        ja: "{shown}のフォルダが分からない",
+        ja: "{shown}のフォルダを特定できません",
         en: "Cannot tell the folder of {shown}"
     )
 }
@@ -525,7 +525,7 @@ fn announce_note(lang: Lang, note: LaunchNote) {
 /// Wine の上で読み込みの待ちが時間切れになったときの次の一手。Wine の前回の起動（死にきらない th09.exe・wineserver の
 /// 状態）が残っていると、次の読み込みが止まるという推定による（Linux の実機では測っていない）。
 const WINE_LEFTOVER_TEXT: Tx = Tx {
-    ja: "Wineの前回の起動が残っている可能性があります。`wineserver -k`を実行してから、もう一度起動してください。",
+    ja: "Wineの前回の起動が残っている可能性があります。wineserver -kを実行してから、もう一度起動してください。",
     en: "A previous Wine session may still be running. Run `wineserver -k`, then start again.",
 };
 
@@ -738,9 +738,8 @@ fn check_for_update(dev_args: bool, game_dir: &Path, lang: Lang) -> update::Outc
     ));
     let outcome = update::startup(dev_args, game_dir, lang);
     if !matches!(outcome, update::Outcome::Restarted(_)) {
-        crash_log::stage(
-            "更新の確認: このまま起動する（更新なし・確認しない・確認できなかったのどれか）",
-        );
+        // 結果（更新なし・確認しなかった・確認できなかった・更新を断った）は直前の行に出ている。
+        crash_log::stage("更新の確認: 終わり。このまま起動する");
     }
     outcome
 }
@@ -1007,7 +1006,7 @@ fn run_launch(
                 "{}",
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: ふだんの花映塚と独立させた（プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}。名前つきの印を作らない。ゲームのファイルには書いていない）。",
+                    ja: "HiganRTool: ふだんの花映塚と独立させました（プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}に書き換えました。名前つきの印は作りません。ゲームのファイルには書いていません）。",
                     en: "HiganRTool: Made it independent from your usual Touhou 9 (process memory 0x{at:08X}: {expect:02X?} -> {new:02X?}. No named marker is created. Game files are not written)."
                 )
             );
@@ -1016,7 +1015,7 @@ fn run_launch(
                     "{}",
                     match lang {
                         Lang::Ja =>
-                            "HiganRTool: 起こしたウィンドウを前面にしない（SW_SHOWNOACTIVATE）。",
+                            "HiganRTool: 起こしたウィンドウを前面にしません（SW_SHOWNOACTIVATE）。",
                         Lang::En =>
                             "HiganRTool: The game window is not brought to the front (SW_SHOWNOACTIVATE).",
                     }
@@ -1029,7 +1028,7 @@ fn run_launch(
                     "{}",
                     by_lang!(
                         lang,
-                        ja: "HiganRTool: 2つ目の起動として、プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}に書き換えた（読み直して一致。ゲームのファイルには書いていない）。",
+                        ja: "HiganRTool: 2つ目の起動として、プロセスのメモリの0x{at:08X}を{expect:02X?} → {new:02X?}に書き換えました（読み直して一致しました。ゲームのファイルには書いていません）。",
                         en: "HiganRTool: Second launch: changed process memory 0x{at:08X} from {expect:02X?} to {new:02X?} (read back and matched. Game files are not written)."
                     )
                 );

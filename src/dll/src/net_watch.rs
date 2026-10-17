@@ -155,7 +155,7 @@ pub struct NetStatus {
     w: [AtomicU32; STATUS_WORDS],
 }
 
-const STATUS_WORDS: usize = S_SEAT_CURSOR + SEAT_CURSOR_WORDS;
+const STATUS_WORDS: usize = S_SPLIT + SPLIT_WORDS;
 const S_PHASE: usize = 0;
 const S_END: usize = 1;
 const S_END_DETAIL: usize = 2;
@@ -200,9 +200,10 @@ const S_PORTRAIT: usize = S_RECV + RECV_WORDS;
 /// 繋がる前に選択の画面で落とした決定の押下の回数（`Stats::menu_pre_link_decides`）。
 const S_PRE_LINK: usize = S_PORTRAIT + 2;
 /// 繋がったか・経路の種類・繋がるまでの ms・RTT: 語 0 = 繋がった | rollback に決まった << 1 | 採った経路が学んだ候補 << 2 |
-/// 経路の種類（`CandKind` の番号）<< 8（bit3 は観戦者の実行）、語 1 = セッションを作ってから繋がったのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）。
+/// 経路の種類（`CandKind` の番号）<< 8（bit3 は観戦者の実行）、語 1 = セッションを作ってから繋がったのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）、
+/// 語 3 = 今までに測れた PONG の数（`Counters::pongs_received`。読み取りのスレッドが同じ PONG を 2 度標本にしないために使う）。
 const S_CONN: usize = S_PRE_LINK + 1;
-const CONN_WORDS: usize = 3;
+const CONN_WORDS: usize = 4;
 /// CHECK のズレのときの、自分と相手の CHECK の全部の欄（`pack_check` の 4 語ずつ。ゲームのスレッドが `End::Desync` を見たときだけ書く）。
 const S_DESYNC: usize = S_CONN + CONN_WORDS;
 const DESYNC_WORDS: usize = 8;
@@ -281,8 +282,18 @@ const PEER_WORDS: usize = 2;
 /// `menu_cursor_se_failed`）。
 const S_SEAT_CURSOR: usize = S_PEER + PEER_WORDS;
 const SEAT_CURSOR_WORDS: usize = 3;
+/// stall の内訳 5 語（`Stats::stalls_sync` / `stalls_ahead` / `stalls_boundary` / `stalls_other` / `stalls_peer`。和が `S_STALLS`）と、
+/// 選択が揃った回数・ホストの値と食い違った欄ごとの回数 4 語（`Stats::selects_agreed` / `select_diff_map` / `select_diff_difficulty` / `select_diff_digest`）。
+const S_SPLIT: usize = S_SEAT_CURSOR + SEAT_CURSOR_WORDS;
+const SPLIT_WORDS: usize = 9;
 /// `S_CONN` の語 0 の bit3: 観戦者の実行。
 const CONN_WATCHER: u32 = 8;
+/// `S_CONN` の語 0 の bit4: VPN の範囲で開いた実行（外側の候補の欄を「VPN」と書く。インターネットのアドレスと見分けるため）。
+const CONN_VPN: u32 = 16;
+
+fn vpn_bit(vpn: bool) -> u32 {
+    if vpn { CONN_VPN } else { 0 }
+}
 
 /// 形式の切替の記録 1 件を 2 語に: 語 0 = 使った枠の印（bit31。空の枠 0 と区別する）| 相手の押下 << 15 | auto の旗 << 14 | 前の形式
 /// （rollback = 1）<< 13 | 新しい形式 << 12 | 新しい D（0〜8 なので下位 4 ビット）、語 1 = seg。
@@ -545,6 +556,12 @@ pub struct NetSnapshot {
     pub played: u32,
     pub zero: u32,
     pub stalls: u32,
+    /// `stalls` の内訳（和が `stalls`。観戦者の実行は 0）。
+    pub stalls_sync: u32,
+    pub stalls_ahead: u32,
+    pub stalls_boundary: u32,
+    pub stalls_other: u32,
+    pub stalls_peer: u32,
     pub max_stall_run: u32,
     pub hold_frames: u32,
     pub local_reads: u32,
@@ -587,6 +604,8 @@ pub struct NetSnapshot {
     pub connect_wait_ms: u32,
     /// 最後に測った RTT（ms。測れていなければ None）。
     pub rtt_ms: Option<u32>,
+    /// 今までに測れた PONG の数。読み取りのスレッドが 1 秒ごとに `rtt_ms` を標本にするとき、同じ PONG を 2 度採らず、取りこぼした数も言えるようにするため。
+    pub rtt_pongs: u32,
     // ---- 繋がらなかった理由を読むための診断（`diag_text`）----
     /// 今のセッションが送った HELLO の数と、相手の候補の数（どちらも候補の種類ごと。`link::kind_slot` の並び）。セッションを作る前は相手の候補が全部 0。
     pub hello_sent: [u32; link::KIND_SLOTS],
@@ -604,6 +623,11 @@ pub struct NetSnapshot {
     pub menu_pre_link_decides: u32,
     /// 揃った値の食い違いの印（bit0 マップ・bit1 難易度・bit2 ダイジェスト。揃っていなければ None）。
     pub agreed_mismatch: Option<u8>,
+    /// 選択が揃った回数と、そのうちホストの値と食い違った欄ごとの回数（`agreed_mismatch` は最後の 1 回の印）。
+    pub selects_agreed: u32,
+    pub select_diff_map: u32,
+    pub select_diff_difficulty: u32,
+    pub select_diff_digest: u32,
     /// CHECK のズレ（自分の CHECK と、相手の CHECK。ズレていなければ None）。
     pub desync: Option<(Check, Check)>,
     /// 同期ズレでマッチを止めたこと（`NetPlay::stop_flags` の印）と、止めた間の描画だけのフレームの数・止めるまでに使ったフレームの数。
@@ -620,8 +644,24 @@ pub struct NetSnapshot {
     pub relink: bool,
     /// 観戦者の実行（`publish_watch` が置く）。遅延と rollback の欄は対戦者の設定ではないので読まない。
     pub watcher: bool,
+    /// VPN の範囲で開いた実行（`publish` が置く）。外側の候補の欄を「VPN」と書く。
+    pub vpn: bool,
     /// 観戦の流れで受けた、対戦者 2 人の間の状態（観戦者の実行だけ。まだ受けていなければ None）。
     pub peer: Option<PeerStats>,
+    /// 観戦のホストの集計（観戦の配る側の用意がある実行だけ。`NET_STATUS` の語には無く、読み取りのスレッドが `script_win::net_status` で足す）。
+    pub spectators: Option<SpectatorCounts>,
+}
+
+/// 観戦のホスト（`spectate_host::Snapshot`）のうち、つながりごとのログに出す数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpectatorCounts {
+    /// いま繋がっている観戦者。
+    pub now: u32,
+    /// 入った・自分で抜けた・黙って外した・上限で断った、の累計（観戦のホストを作ってから）。
+    pub joined: u32,
+    pub left: u32,
+    pub silenced: u32,
+    pub refused_full: u32,
 }
 
 /// 観戦者が受けた対戦者の状態（`PeerStats`）を 2 語に: 語 0 = 受けた | ping が測れている << 1 | rollback のマッチ << 2、
@@ -745,7 +785,7 @@ impl NetStatus {
     }
 
     /// コピーする（ゲームのスレッド。確保しない）。
-    pub fn publish(&self, np: &NetPlay) {
+    pub fn publish(&self, np: &NetPlay, vpn: bool) {
         let s = np.stats();
         let (end, detail) = end_code(np.end());
         let c = |v: u64| v.min(u64::from(u32::MAX)) as u32;
@@ -837,9 +877,23 @@ impl NetStatus {
                 conn.is_some_and(|c| c.mode() == Mode::Rollback),
                 np.link_path_is_learned(),
                 kind,
-            ),
+            ) | vpn_bit(vpn),
             np.connect_wait_ms().unwrap_or(0),
             rtt,
+            conn.map_or(0, |c| c.liveness().counters().pongs_received),
+        ]) {
+            a.store(v, Ordering::Relaxed);
+        }
+        for (a, v) in self.w.iter().skip(S_SPLIT).zip([
+            c(s.stalls_sync),
+            c(s.stalls_ahead),
+            c(s.stalls_boundary),
+            c(s.stalls_other),
+            c(s.stalls_peer),
+            s.selects_agreed,
+            s.select_diff_map,
+            s.select_diff_difficulty,
+            s.select_diff_digest,
         ]) {
             a.store(v, Ordering::Relaxed);
         }
@@ -1028,7 +1082,7 @@ impl NetStatus {
 
     /// 観戦者の数をコピーする（確保しない）。対戦の `publish` と同じ欄のうち観戦者に意味のあるものだけ。残りは 0 のまま。
     /// 観戦者だけの数は `spectate_watch::WATCH_STATUS`。
-    pub fn publish_watch(&self, wp: &WatchPlay) {
+    pub fn publish_watch(&self, wp: &WatchPlay, vpn: bool) {
         let s = wp.stats();
         let c = |v: u64| v.min(u64::from(u32::MAX)) as u32;
         let (end, detail) = watch_end_code(wp.end());
@@ -1054,7 +1108,10 @@ impl NetStatus {
             (S_PORTRAIT, s.menu_portrait_called),
             (S_PORTRAIT + 1, s.menu_portrait_refused),
             (S_PRE_LINK, s.pre_join_decides),
-            (S_CONN, u32::from(joined) | CONN_WATCHER | kind << 8),
+            (
+                S_CONN,
+                u32::from(joined) | CONN_WATCHER | kind << 8 | vpn_bit(vpn),
+            ),
             (S_CONN + 1, s.join_wait_ms.unwrap_or(0)),
             (S_CONN + 2, NO_MARGIN),
         ];
@@ -1272,11 +1329,16 @@ impl NetStatus {
             connect_wait_ms: l(S_CONN + 1),
             // 何もコピーしていない数（語が 0 のまま）を「RTT 0 ms」と読まないよう、繋がった印があるときだけ読む。
             rtt_ms: Some(l(S_CONN + 2)).filter(|r| *r != NO_MARGIN && l(S_CONN) & 1 != 0),
+            rtt_pongs: l(S_CONN + 3),
             menu_applied: l(S_MENU_APPLIED),
             menu_align_miss: l(S_MENU_ALIGN_MISS),
             menu_lost: l(S_MENU_LOST),
             menu_pre_link_decides: l(S_PRE_LINK),
             agreed_mismatch: (agreed[2] != 0).then_some(agreed[3]),
+            selects_agreed: l(S_SPLIT + 5),
+            select_diff_map: l(S_SPLIT + 6),
+            select_diff_difficulty: l(S_SPLIT + 7),
+            select_diff_digest: l(S_SPLIT + 8),
             desync: check(S_DESYNC).zip(check(S_DESYNC + 4)),
             stop: l(S_STOP),
             stop_ticks: l(S_STOP + 1),
@@ -1288,6 +1350,11 @@ impl NetStatus {
             played: l(S_PLAYED),
             zero: l(S_ZERO),
             stalls: l(S_STALLS),
+            stalls_sync: l(S_SPLIT),
+            stalls_ahead: l(S_SPLIT + 1),
+            stalls_boundary: l(S_SPLIT + 2),
+            stalls_other: l(S_SPLIT + 3),
+            stalls_peer: l(S_SPLIT + 4),
             max_stall_run: l(S_MAX_STALL),
             hold_frames: l(S_HOLD),
             local_reads: l(S_LOCAL_READS),
@@ -1324,7 +1391,9 @@ impl NetStatus {
             diag: crate::net_udp::NetDiag::default(),
             relink: false,
             watcher: l(S_CONN) & CONN_WATCHER != 0,
+            vpn: l(S_CONN) & CONN_VPN != 0,
             peer: unpack_peer([l(S_PEER), l(S_PEER + 1)]),
+            spectators: None,
         }
     }
 
@@ -1400,9 +1469,11 @@ impl NetSnapshot {
 
     /// 繋がらなかった理由を読むための診断の句（本ログの作り直しの行・「ネットワークの外」の行・試験のまとめ）。人を特定する値（アドレス・ポート）は書かない。
     pub fn diag_text(&self) -> String {
+        // VPN の範囲で開いた実行では、外側の候補はすべて VPN のネットワークの中のアドレス（範囲 lan のガードが通すのはそれだけ）。
+        let outside = if self.vpn { "VPN" } else { "外側" };
         let kinds = |n: &[u32; link::KIND_SLOTS]| {
             format!(
-                "同じ PC の中 {} / 家の中 {} / 外側 {} / IPv6 {}",
+                "同じ PC の中 {} / 家の中 {} / {outside} {} / IPv6 {}",
                 n[0], n[1], n[2], n[3]
             )
         };
@@ -1761,7 +1832,7 @@ mod tests {
             while nb.recv(&mut buf).is_some() {}
         }
         let st = NetStatus::new();
-        st.publish(&np);
+        st.publish(&np, false);
         let s = st.snapshot();
         assert_eq!(s.hs_restarts, 2, "{}", s.text());
         // 作り直しの行の前半は今までの文のまま、後ろに診断（セッションを作った後だけ）が付く。
@@ -1895,7 +1966,7 @@ mod tests {
                 while nb.recv(&mut rbuf).is_some() {}
             }
             let st = NetStatus::new();
-            st.publish(&np);
+            st.publish(&np, false);
             (
                 st.snapshot(),
                 np.recv_counts(),
@@ -2001,7 +2072,7 @@ mod tests {
             while nb.recv(&mut rbuf).is_some() {}
         }
         let st = NetStatus::new();
-        st.publish(&np);
+        st.publish(&np, false);
         let s = st.snapshot();
         assert_eq!(s.hs_restarts, 1, "{}", s.text());
         let line = s.restart_line(1);
@@ -2179,7 +2250,7 @@ mod tests {
                 while nb.recv(&mut rbuf).is_some() {}
             }
             let st = NetStatus::new();
-            st.publish(&np);
+            st.publish(&np, false);
             let s = st.snapshot();
             if ver == PROTO_VER {
                 assert_eq!(
@@ -2198,7 +2269,7 @@ mod tests {
             );
             assert_eq!((s.end, s.end_detail), (END_OTHER_VERSION, 0));
             let want = format!(
-                "終わり 相手のHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
+                "終わり 相手とHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
             );
             assert!(s.text().contains(&want), "{}", s.text());
             assert_eq!(s.hs_restarts, 0, "バージョン違いを作り直した");
@@ -2416,6 +2487,45 @@ mod tests {
         }
     }
 
+    /// 壊れたら落ちる: VPN の印が語 0 の bit4 から読まれない（VPN でない実行に「VPN」が出る・VPN の実行に「外側」が残る）、
+    /// 外側の候補の欄が VPN の実行だけ「VPN」になる（VPN でない実行の文は変わらない）、経路の種類の番号が印で崩れる。
+    #[test]
+    fn the_vpn_mark_rides_in_the_conn_word_and_names_only_the_outside_column() {
+        let st = NetStatus::new();
+        st.w[S_CONN].store(
+            pack_conn(true, false, false, 3) | vpn_bit(true),
+            Ordering::Relaxed,
+        );
+        let s = st.snapshot();
+        assert_eq!((s.vpn, s.connected, s.path_kind), (true, true, 3));
+        st.w[S_CONN].store(pack_conn(true, false, false, 3), Ordering::Relaxed);
+        assert!(!st.snapshot().vpn);
+
+        let mut s = NetSnapshot {
+            peer_cands: [0, 1, 1, 0],
+            diag: crate::net_udp::NetDiag {
+                own_cands: [0, 0, 1, 0],
+                ..Default::default()
+            },
+            vpn: true,
+            ..NetSnapshot::default()
+        };
+        let t = s.diag_text();
+        assert!(
+            t.contains("自分の候補 [同じ PC の中 0 / 家の中 0 / VPN 1 / IPv6 0]")
+                && t.contains("相手の候補 [同じ PC の中 0 / 家の中 1 / VPN 1 / IPv6 0]"),
+            "{t}"
+        );
+        s.vpn = false;
+        let t = s.diag_text();
+        assert!(
+            t.contains("自分の候補 [同じ PC の中 0 / 家の中 0 / 外側 1 / IPv6 0]")
+                && t.contains("相手の候補 [同じ PC の中 0 / 家の中 1 / 外側 1 / IPv6 0]")
+                && !t.contains("VPN"),
+            "{t}"
+        );
+    }
+
     #[test]
     fn local_scene2_is_published_and_worded() {
         let s = NetSnapshot {
@@ -2476,7 +2586,7 @@ mod tests {
         );
         let st = NetStatus::new();
         assert!(!st.snapshot().watcher);
-        st.publish_watch(&wp);
+        st.publish_watch(&wp, false);
         let s = st.snapshot();
         assert!(s.watcher, "観戦者の印");
         assert_eq!(s.peer, None, "受けていない値は出さない");

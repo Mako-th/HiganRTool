@@ -22,7 +22,7 @@ const START_BYTES: u32 = 16 * 1024;
 const RETRIES: usize = 4;
 /// つながりをたどる数の上限（壊れた一覧で終わらなくならないように）。
 const WALK_MAX: usize = 512;
-/// `Description` を読む長さの上限（UTF-16 の単位）。
+/// `Description` と `FriendlyName` を読む長さの上限（UTF-16 の単位）。
 const DESCRIPTION_MAX: usize = 256;
 
 /// IPv4 のアドレスを持つアダプターを、アドレスごとに返す。引けなければ理由の文。
@@ -84,10 +84,12 @@ unsafe fn collect(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
 /// 1 つのアダプターの IPv4 アドレスごとに `Adapter` を足す。
 ///
 /// # Safety
-/// `a` の `Description`・`FirstUnicastAddress`・`FirstGatewayAddress` は、NULL か OS が書いた有効な領域を指す。
+/// `a` の `Description`・`FriendlyName`・`FirstUnicastAddress`・`FirstGatewayAddress` は、NULL か OS が書いた有効な領域を指す。
 unsafe fn push_adapter(a: &IP_ADAPTER_ADDRESSES_LH, out: &mut Vec<Adapter>) {
     // SAFETY: 約束どおり `Description` は NULL か終端つきの UTF-16。
     let description = unsafe { read_wide(a.Description) };
+    // SAFETY: 同上（`FriendlyName`）。
+    let name = unsafe { read_wide(a.FriendlyName) };
     let mut oui = [0u8; 3];
     if a.PhysicalAddressLength >= 3 {
         oui.copy_from_slice(&a.PhysicalAddress[..3]);
@@ -105,6 +107,8 @@ unsafe fn push_adapter(a: &IP_ADAPTER_ADDRESSES_LH, out: &mut Vec<Adapter>) {
         if let Some(ip) = unsafe { ipv4_of(&e.Address) } {
             out.push(Adapter {
                 description: description.clone(),
+                name: name.clone(),
+                prefix: e.OnLinkPrefixLength,
                 if_type: a.IfType,
                 oui,
                 up: a.OperStatus == IfOperStatusUp,

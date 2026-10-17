@@ -47,7 +47,7 @@ pub enum Refusal {
 pub struct Held(Option<usize>);
 
 pub const ALREADY_RUNNING: Tx = Tx {
-    ja: "東方花映塚はすでに起動しています。",
+    ja: "花映塚はすでに起動しています。",
     en: "Touhou 9 is already running.",
 };
 

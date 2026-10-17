@@ -724,7 +724,7 @@ fn the_log_line_carries_the_input_counts_in_rollback_mode() {
     run(&mut a, &mut b, &clock, 60);
     for s in [&a, &b] {
         let st = crate::net_watch::NetStatus::new();
-        st.publish(&s.np);
+        st.publish(&s.np, false);
         let snap = st.snapshot();
         let c = s.np.connected().unwrap().counts();
         assert!(c.input_accepted > 10, "検査が素通り: {c:?}");
@@ -859,7 +859,7 @@ fn a_host_press_and_a_guest_wish_switch_d_mid_match_on_both_sides() {
     );
     assert!(la[0].1 < 130 && la[1].1 > 160, "{la:?}");
     let st = crate::net_watch::NetStatus::new();
-    st.publish(&a.np);
+    st.publish(&a.np, false);
     let text = st.timing_text();
     for want in [
         format!(
@@ -876,7 +876,7 @@ fn a_host_press_and_a_guest_wish_switch_d_mid_match_on_both_sides() {
         assert!(text.contains(&want), "本ログに「{want}」が無い:\n{text}");
     }
     let st_b = crate::net_watch::NetStatus::new();
-    st_b.publish(&b.np);
+    st_b.publish(&b.np, false);
     let wire_rows = |t: &str| -> Vec<(String, String)> {
         t.lines()
             .filter(|l| l.contains("から D "))
@@ -1122,6 +1122,14 @@ fn a_stalled_side_waits_for_words_within_the_budget_and_still_agrees() {
     for s in [&a, &b] {
         assert!(s.net.waits > 0, "止まっている間に待っていない");
         assert!(s.np.stats().stalls > 0, "{:?}", s.np.stats());
+        // 内訳は rollback の待ちの種類。和が stall の数と同じで、delay 方式の「相手の入力待ち」は 0。
+        let st = s.np.stats();
+        assert_eq!(st.stalls_split_sum(), st.stalls, "{st:?}");
+        assert_eq!(st.stalls_peer, 0, "{st:?}");
+        assert!(
+            st.stalls_ahead > 0,
+            "先に行き過ぎの待ちが数えられていない: {st:?}"
+        );
         assert!(s.np.stats().wakes > 0);
         assert_eq!(s.np.phase(), Phase::Lockstep, "{:?}", s.np.end());
     }

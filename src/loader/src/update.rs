@@ -55,6 +55,8 @@ pub trait Host {
     /// ウィンドウにも黒いウィンドウにも出す。
     fn tell(&mut self, text: &str);
     fn say(&mut self, line: &str);
+    /// 画面には出さず、ローダーのログにだけ残す（確認しなかった理由など。人が起こす起動で毎回出すほどではない）。
+    fn record(&mut self, _line: &str) {}
     /// 見出しなどの飾りのない行を出す（変更点の文）。
     fn show(&mut self, text: &str);
     /// 同じ行を書き直して進み具合を出す。区切りは `progress_end`。
@@ -293,14 +295,14 @@ fn check_file(f: &FileEntry, data: &[u8], lang: Lang) -> Result<(), String> {
         let (want, got) = (f.size, data.len());
         return Err(by_lang!(
             lang,
-            ja: "{name}の大きさが目録と違います（{want}バイトのはずが{got}バイト）",
+            ja: "{name}の大きさが更新ファイルのハッシュ一覧と違います（{want}バイトのはずが{got}バイト）",
             en: "The size of {name} does not match the update list ({got} bytes, expected {want})"
         ));
     }
     if update::sha256(data) != f.sha256 {
         return Err(by_lang!(
             lang,
-            ja: "{name}のSHA-256が目録と合いません",
+            ja: "{name}のSHA-256が更新ファイルのハッシュ一覧と合いません",
             en: "The SHA-256 of {name} does not match the update list"
         ));
     }
@@ -418,7 +420,7 @@ fn place_one(dir: &Path, name: &str, lang: Lang) -> Result<bool, String> {
         std::fs::remove_file(&old).map_err(|e| {
             by_lang!(
                 lang,
-                ja: "前の更新の{old_shown}を消せません（{e}）。別のHiganRToolか花映塚が使っていないか見てください",
+                ja: "前の更新の{old_shown}を消せません（{e}）。別のHiganRToolか花映塚が使っていないか確かめてください",
                 en: "Cannot delete {old_shown} left by the previous update ({e}). Check that no other HiganRTool or Touhou 9 is using it"
             )
         })?;
@@ -620,6 +622,27 @@ pub struct Gate {
     pub ini_enabled: bool,
 }
 
+impl Skip {
+    /// ローダーのログに書く確認しなかった理由。
+    pub fn reason(self) -> &'static str {
+        match self {
+            Skip::NotDist => "開発用のビルド",
+            Skip::InGameFolder => "このツールが花映塚と同じディレクトリにある",
+            Skip::DevArgs => "開発用の引数がある",
+            Skip::JustUpdated => "更新した直後の起動",
+            Skip::InheritedIni => "引き継いだ ini を使う起動",
+            Skip::NoBuildNumber => "ビルド番号が 0",
+            Skip::OtherExeName => "exe の名前が HiganRTool.exe でない",
+            Skip::IniOff => "HiganRTool.ini の [loader] update_check が 0",
+        }
+    }
+}
+
+/// 「確認しなかった」の行。「更新なし」（確認して新しいバージョンが無かった）「確認できなかった」（確認に失敗した）とは別の文にする。
+fn not_checked(reason: &str) -> String {
+    format!("更新の確認: 確認しませんでした（{reason}）。")
+}
+
 pub fn skip_reason(g: &Gate) -> Option<Skip> {
     if !g.dist {
         Some(Skip::NotDist)
@@ -765,12 +788,19 @@ impl Host for RealHost {
     fn tell(&mut self, text: &str) {
         self.close_line();
         eprintln!("HiganRTool: {text}");
+        crate::crash_log::stage(text);
         crate::folder_dialog::message_box(text);
     }
 
+    // 画面に出す行はローダーのログにも同じ文で残す（更新の確認の結果をログから読めるように）。
     fn say(&mut self, line: &str) {
         self.close_line();
         println!("HiganRTool: {line}");
+        crate::crash_log::stage(line);
+    }
+
+    fn record(&mut self, line: &str) {
+        crate::crash_log::stage(line);
     }
 
     fn show(&mut self, text: &str) {
@@ -844,9 +874,11 @@ pub struct Start<'a> {
 /// 起動の入口の本体。条件がそろえば確かめ、`Restarted` なら呼び出し側は子の終了コードで終わる。
 pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outcome {
     if !c.dist {
+        host.record(&not_checked(Skip::NotDist.reason()));
         return Outcome::Proceed;
     }
     let (Some(dir), Some(game_dir)) = (c.exe.parent(), c.game_dir) else {
+        host.record(&not_checked("ゲームのフォルダが決まっていない"));
         return Outcome::Proceed;
     };
     let in_game = in_game_folder(dir) || is_inside_game(dir, game_dir);
@@ -905,20 +937,31 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
         ini_enabled,
     };
     if let Some(reason) = skip_reason(&gate) {
-        if reason == Skip::InGameFolder {
-            println!(
+        host.record(&not_checked(reason.reason()));
+        match reason {
+            Skip::InGameFolder => println!(
                 "{}",
                 match lang {
                     Lang::Ja =>
-                        "HiganRTool: このツールが花映塚と同じディレクトリに置かれています。更新は確かめません（別のディレクトリへ置くと確かめます）。",
+                        "HiganRTool: このツールが花映塚と同じフォルダに置かれています。更新は確かめません（別のフォルダへ置くと確かめます）。",
                     Lang::En =>
                         "HiganRTool: This HiganRTool is inside the game folder, so updates are not checked (put it in another folder to check).",
                 }
-            );
+            ),
+            Skip::IniOff => host.say(match lang {
+                Lang::Ja => {
+                    "更新の確認: 確認しません（HiganRTool.iniの[loader]のupdate_checkが0です）。"
+                }
+                Lang::En => {
+                    "Update check: skipped (update_check is 0 in [loader] of HiganRTool.ini)."
+                }
+            }),
+            _ => {}
         }
         return Outcome::Proceed;
     }
     let Some(key) = c.key else {
+        host.record(&not_checked("更新データの公開鍵が読めない"));
         eprintln!(
             "{}",
             match lang {
@@ -1147,6 +1190,8 @@ mod tests {
         asked: Vec<String>,
         told: Vec<String>,
         said: Vec<String>,
+        /// `record`（ログだけの行）。
+        recorded: Vec<String>,
         shown: Vec<String>,
         /// `progress` で書き直した行（`progress_end` で確定したものは `finished` にも入る）。
         progress: Vec<String>,
@@ -1167,6 +1212,9 @@ mod tests {
         }
         fn say(&mut self, line: &str) {
             self.said.push(line.to_string());
+        }
+        fn record(&mut self, line: &str) {
+            self.recorded.push(line.to_string());
         }
         fn show(&mut self, text: &str) {
             self.shown.push(text.to_string());
@@ -2337,6 +2385,87 @@ mod tests {
         assert!(dir.join("HiganRTool.exe.new").exists(), ".new を消した");
         assert!(dir.join("README.txt.old").exists(), ".old を消した");
         std::fs::remove_dir_all(&dir).expect("後片づけ");
+    }
+
+    // 何が壊れたら落ちるか: 「確認しなかった」「更新なし」「確認できなかった」の文が同じに戻る（ログから結果を区別できない）、
+    // 確認しなかった理由がログに残らない、ini で止めたことが画面に出ない。
+    #[test]
+    fn not_checking_no_update_and_failed_check_have_different_lines() {
+        let dir = temp_dir("three_lines");
+        install(&dir);
+        let exe = dir.join("HiganRTool.exe");
+        let args: Vec<OsString> = Vec::new();
+
+        // 確認しなかった: 開発用のビルド（ログだけ）。
+        let mut host = FakeHost::default();
+        start_with(
+            &start(&exe, &args, false, OLD_VERSION),
+            &mut fake_net(),
+            &mut host,
+        );
+        assert_eq!(host.recorded.len(), 1, "{:?}", host.recorded);
+        assert!(host.recorded[0].contains("確認しませんでした（開発用のビルド）"));
+        assert!(host.said.is_empty());
+
+        // 確認しなかった: ini の update_check = 0（ログと画面）。
+        std::fs::write(dir.join("HiganRTool.ini"), "[loader]\nupdate_check = 0\n").expect("ini");
+        let mut host = FakeHost::default();
+        let mut net = fake_net();
+        start_with(&start(&exe, &args, true, OLD_VERSION), &mut net, &mut host);
+        assert!(net.calls.is_empty(), "確認しない設定なのに通信した");
+        assert!(host.recorded[0].contains("update_check が 0"));
+        assert!(host.said[0].contains("確認しません"), "{:?}", host.said);
+        let ini_off_screen = host.said[0].clone();
+        std::fs::remove_file(dir.join("HiganRTool.ini")).expect("消す");
+
+        // 更新なし: 確認して、新しいバージョンが無かった。
+        let server = Server::start(happy_routes());
+        let mut host = FakeHost::default();
+        assert_eq!(go(&dir, &server, &mut host, NEW_VERSION), Outcome::Proceed);
+        let no_update = host.said[0].clone();
+        assert!(
+            no_update.contains("新しいバージョンはありません"),
+            "{no_update}"
+        );
+
+        // 確認できなかった: 目録が取れない。
+        let empty = Server::start(HashMap::new());
+        let mut host = FakeHost::default();
+        assert_eq!(go(&dir, &empty, &mut host, OLD_VERSION), Outcome::Proceed);
+        let failed = host.said[0].clone();
+        assert!(failed.contains("確認できませんでした"), "{failed}");
+
+        let lines = [&ini_off_screen, &no_update, &failed];
+        for (i, a) in lines.iter().enumerate() {
+            for b in &lines[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // 英語の回の画面の文に日本語が混ざらない。
+        std::fs::write(dir.join("HiganRTool.ini"), "[loader]\nupdate_check = 0\n").expect("ini");
+        let mut host = FakeHost::default();
+        let mut c = start(&exe, &args, true, OLD_VERSION);
+        c.lang = Lang::En;
+        start_with(&c, &mut fake_net(), &mut host);
+        assert_eq!(host.said.len(), 1);
+        assert!(!has_japanese(&host.said[0]), "{:?}", host.said);
+        std::fs::remove_dir_all(&dir).expect("後片づけ");
+    }
+
+    #[test]
+    fn every_skip_reason_has_its_own_log_text() {
+        let all = [
+            Skip::NotDist,
+            Skip::InGameFolder,
+            Skip::DevArgs,
+            Skip::JustUpdated,
+            Skip::InheritedIni,
+            Skip::NoBuildNumber,
+            Skip::OtherExeName,
+            Skip::IniOff,
+        ];
+        let texts: std::collections::HashSet<_> = all.iter().map(|s| s.reason()).collect();
+        assert_eq!(texts.len(), all.len());
     }
 
     #[test]

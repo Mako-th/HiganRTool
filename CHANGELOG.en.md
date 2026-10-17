@@ -6,20 +6,47 @@ Different versions cannot connect to each other.
 Use the same version as your opponent.
 
 
+## v1.1.1
+
+### Fixed
+
+- Fixed LAN play and spectating not working over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
+  On the host's screen, VPN addresses carry the tool's name, such as "(Radmin)".
+- The LAN host's waiting screen now also shows the addresses of virtual adapters (such as VMware).
+  Real LAN addresses come first, and up to 3 are shown at a time. With 4 or more, use ↑↓ to see the rest.
+- When both players want the same side, it is now decided at random instead of first come, first served.
+- While "Waiting for the opponent" is shown, you now disconnect by holding Esc for 3 seconds.
+- Fixed replays recording the delay from before the change in matches where the delay was changed right after connecting.
+  It now records the delay used the longest in the match.
+- Fixed the detailed log (`.csv.gz`) sometimes being cut off when the game was closed.
+- Some on-screen wording and menu messages were fine-tuned.
+
+### Logs
+
+- Each connection (the menu item chosen, whether you are the host, and the waiting time) and spectators joining and leaving are now recorded.
+- When the update check is skipped at startup, the reason is now recorded.
+  When `update_check` in `[loader]` of `HiganRTool.ini` is 0, it is also shown on screen.
+
+### Documents
+
+- The README was reorganized, and the zip's `README.txt` now has the same content.
+- Added the "About the use of AI" section.
+
+
 ## v1.1.0
 
 ### New
 
-- `HiganRTool_replay_fix.exe`, which fixes replays saved by v1.0.0, is included in the zip.
+- The Replay Repair Tool (`HiganRTool_replay_fix.exe`), which fixes replays saved by v1.0.0, is included in the zip.
 - LAN play.
   With "Host", "Client" and "Watch" under "LAN" in the menu, you can play and spectate with people on the same LAN without the server.
 - Matches connected with a connection code can now be spectated.
-  Once the match is connected, the host copies a watch code with `Ctrl+C` and gives it to the spectators.
+  Once the match is connected, the host copies a watch code with Ctrl+C and sends it to the spectators.
   Spectators enter it in "Paste watch code" in the menu.
-- Ctrl now picks at random and skips the dialogue after a match is decided.
+- Ctrl now picks characters and maps at random and skips the dialogue after a match is decided.
   It works on online select screens and in matches, as does the skip button on a gamepad.
   The R key for random select has been removed.
-  Note that changing the delay (Ctrl + number) on character select also moves the character at random.
+  Note that changing the delay (Ctrl+number) on character select also moves the character at random.
 - When a match ends (the connection is closed), you return to 妖怪 対 妖怪 on the title screen.
 - During online play, P / Home take screenshots (nothing is saved on the opponent's PC).
 - The update display has changed.

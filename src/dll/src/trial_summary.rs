@@ -10,7 +10,7 @@
 //! 配るバージョン（feature `dist`）でも出る。文言は配るバージョンの走査の語（`tools/make_dist.py` の `INTERNAL_WORDS`）を使わない。
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use higanr_core::guard::Scope;
 use higanr_core::net_menu::other_version_text;
@@ -183,6 +183,18 @@ impl Refusal {
     }
 }
 
+/// ゲーム内のメニューで、相手を探すために選んだ項目（名前の原本は `net_menu`。本ログの文字は `link_log::route_name`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Random,
+    Room,
+    /// 「対戦コード作成」（始める側）。
+    Create,
+    /// 「対戦コード入力」（返す側）。
+    Paste,
+    Lan,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeFacts {
     pub side: CodeSide,
@@ -193,6 +205,15 @@ pub struct CodeFacts {
     pub connected_at: Option<f32>,
     pub ended_unconnected: bool,
     pub gave_up: bool,
+    /// ゲーム内のメニューの実行で、選んだ項目と、選んだ時刻（`peer_read_at` と同じ、見張りを起こしてからの秒）。何も選ばなかった実行（観戦だけの起動を含む）は None。
+    pub route: Option<Route>,
+    pub chosen_at: Option<f32>,
+    /// ランダムマッチで待ち列から組になった時刻と、待ち列に先に入った側か。
+    pub paired_at: Option<f32>,
+    pub queue_first: Option<bool>,
+    /// 相手のコードを読んでセッションの設定を置いたときの自分の側（始める側 / 返す側）と、繋がったときの対戦のホストか。
+    pub placed_side: Option<CodeSide>,
+    pub host: Option<bool>,
 }
 
 impl CodeFacts {
@@ -206,6 +227,12 @@ impl CodeFacts {
             connected_at: None,
             ended_unconnected: false,
             gave_up: false,
+            route: None,
+            chosen_at: None,
+            paired_at: None,
+            queue_first: None,
+            placed_side: None,
+            host: None,
         }
     }
 }
@@ -287,12 +314,19 @@ fn menu_unopened(f: &Facts) -> bool {
     f.host.menu == MenuNet::NotAsked && f.host.open.is_none()
 }
 
-const MENU_NOT_OPENED: &str = "ゲーム内のメニューで「作る」「貼る」を選ばなかったので開いていない";
+/// ネットワークを開く頼み（`UiOut::open_net`）を出す項目。名前の原本は `net_menu`。LAN と観戦はこの頼みを出さない。
+fn menu_not_opened() -> String {
+    use higanr_core::net_menu::{T_CREATE, T_PASTE, T_RANDOM, T_ROOM};
+    format!(
+        "ゲーム内のメニューで「{}」「{}」「{}」「{}」のどれも選ばなかったので開いていない",
+        T_RANDOM.ja, T_ROOM.ja, T_CREATE.ja, T_PASTE.ja
+    )
+}
 
 /// ネットワークの数の項目の先頭の確かめ: ネットワークを使わない実行・メニューでネットワークを開かなかった実行は、理由つきの － を返す。
 fn net_or_skip(f: &Facts, name: &'static str) -> Result<NetSnapshot, Item> {
     if menu_unopened(f) {
-        return Err(skip(name, MENU_NOT_OPENED));
+        return Err(skip(name, menu_not_opened()));
     }
     f.net
         .filter(|_| f.game.net == Setup::On)
@@ -303,10 +337,20 @@ fn addr_kind(a: SocketAddr) -> &'static str {
     higanr_core::log_scrub::ip_kind(a.ip())
 }
 
-fn path_kind(k: u32) -> &'static str {
+/// 受信ソケットのアドレスの呼び名。VPN の範囲のネットワークの中のアドレスは、インターネットのアドレスと見分けて「VPN」と書く。
+fn local_kind(local: SocketAddr, scope: Scope) -> &'static str {
+    match (scope, local.ip()) {
+        (Scope::LanVpn(net), IpAddr::V4(ip)) if net.contains_host(ip) => "VPN",
+        _ => addr_kind(local),
+    }
+}
+
+/// 経路の呼び名。`vpn` は VPN の範囲で開いた実行（その範囲の外側のアドレスは VPN のネットワークの中の 1 台だけ）。
+fn path_kind(k: u32, vpn: bool) -> &'static str {
     match k {
         1 => "同じ PC の中",
         2 => "家の中",
+        3 if vpn => "VPN のアドレス",
         3 => "外側のアドレス",
         4 => "IPv6",
         _ => "種類は分からない",
@@ -543,11 +587,11 @@ fn open(f: &Facts) -> Item {
                 N_OPEN,
                 format!(
                     "受信ソケットを開いた（受信ソケットのアドレスは{}。scope = {}）",
-                    addr_kind(local),
+                    local_kind(local, scope),
                     scope.name()
                 ),
             ),
-            None if f.host.menu == MenuNet::NotAsked => skip(N_OPEN, MENU_NOT_OPENED),
+            None if f.host.menu == MenuNet::NotAsked => skip(N_OPEN, menu_not_opened()),
             None if f.host.menu == MenuNet::Asked => {
                 let why = "ネットワークを開く頼みは来たが、受信ソケットを開けていない（本ログの「ネットワーク:」の行にその理由がある。メニューからやり直せる）";
                 if f.stage == Stage::Final {
@@ -566,7 +610,7 @@ fn open(f: &Facts) -> Item {
 
 fn stun(f: &Facts) -> Item {
     if menu_unopened(f) {
-        return skip(N_STUN, MENU_NOT_OPENED);
+        return skip(N_STUN, menu_not_opened());
     }
     if f.game.net != Setup::On {
         return skip(N_STUN, "対戦の通信を開いていない");
@@ -613,64 +657,100 @@ fn stun(f: &Facts) -> Item {
 
 fn code(f: &Facts) -> Item {
     if menu_unopened(f) {
-        return skip(N_CODE, MENU_NOT_OPENED);
+        return skip(N_CODE, menu_not_opened());
     }
     let Some(c) = &f.host.code else {
         return skip(N_CODE, "接続コードを使わない設定");
     };
+    // ゲーム内のメニューの実行で相手を探す項目を選んでいない（観戦だけの起動など）。コードを使っていないので、貼られない・終わったとは言わない。
+    if c.side == CodeSide::Game && c.route.is_none() {
+        return skip(
+            N_CODE,
+            "相手を探す項目を選んでいないので、コードは使っていない（観戦だけの起動を含む）",
+        );
+    }
     let net_ended = f.net.is_some_and(|s| s.link_ended());
     let final_stage = f.stage == Stage::Final;
-    let side = match c.side {
-        CodeSide::Offer => "始める側",
-        CodeSide::Answer => "返す側",
-        CodeSide::Spectate => "見るだけの側",
-        CodeSide::Game => "ゲーム内のメニュー",
-    };
+    let side = crate::link_log::route_label(c).unwrap_or_else(|| {
+        match c.side {
+            CodeSide::Offer => "始める側",
+            CodeSide::Answer => "返す側",
+            CodeSide::Spectate => "見るだけの側",
+            CodeSide::Game => "ゲーム内のメニュー",
+        }
+        .to_string()
+    });
+    // ランダムマッチとルームマッチは、人がコードを見ない（サーバーを通して自動で受け渡す）ので「貼る・読む」と言わない。
+    let by_server = matches!(c.route, Some(Route::Random | Route::Room));
     if let Some(t) = c.peer_read_at {
         let again = match (c.refused, c.last_refusal) {
             (n, Some(r)) if n > 0 => format!(
-                "。その前後に読めなかったことが {n} 回あった（最後は: {}）",
+                "。その前後に{}ことが {n} 回あった（最後は: {}）",
+                if by_server {
+                    "受け取れなかった"
+                } else {
+                    "読めなかった"
+                },
                 r.text()
             ),
             _ => String::new(),
         };
-        return ok(
-            N_CODE,
-            format!("{side}。相手のコードを読めた（開いてから {t:.1} 秒）{again}"),
-        );
+        let waits = crate::link_log::waits_to_read(c);
+        let when = if waits.is_empty() {
+            format!("開いてから {t:.1} 秒")
+        } else {
+            waits.join(" / ")
+        };
+        let what = match c.route {
+            Some(Route::Random) => "待ち列で組になり、割り当てのルームで相手のコードを受け取れた",
+            Some(Route::Room) => "ルームで相手のコードを受け取れた",
+            Some(Route::Create) => "相手の返答コードを読めた",
+            _ => "相手のコードを読めた",
+        };
+        return ok(N_CODE, format!("{side}。{what}（{when}）{again}"));
     }
     if let Some(r) = c.last_refusal {
+        let what = if by_server {
+            "ルームで受け取った相手のコードを読めなかった"
+        } else {
+            "相手のコードを読めなかった"
+        };
         return bad(
             N_CODE,
-            format!(
-                "{side}。相手のコードを読めなかった（{} 回）: {}",
-                c.refused,
-                r.text()
-            ),
+            format!("{side}。{what}（{} 回）: {}", c.refused, r.text()),
         );
     }
     // 次にすること: ゲーム内のメニューは起動し直さずにメニューからつなぎ直せる。ローダーのウィンドウの形は起動し直す。
-    let again = if c.side == CodeSide::Game {
-        "「妖怪 対 妖怪」のメニューからもう一度つなぐ"
-    } else {
-        "相手のコードを貼ってから起動し直す"
+    let again = match c.route {
+        Some(r) if c.side == CodeSide::Game => format!(
+            "「妖怪 対 妖怪」からメニューを開き、「{}」を選び直す",
+            crate::link_log::route_name(r)
+        ),
+        _ if c.side == CodeSide::Game => {
+            "「妖怪 対 妖怪」からメニューを開いてもう一度接続する".to_string()
+        }
+        _ => "相手のコードを貼ってから起動し直す".to_string(),
     };
     if c.gave_up {
         return bad(
             N_CODE,
-            format!("{side}。使えるコードが貼られないまま待つのをやめた（{again}）"),
+            format!("{side}。使えるコードが届かないまま待つのをやめた（{again}）"),
         );
     }
     if c.ended_unconnected || (final_stage && net_ended) {
-        return bad(
-            N_CODE,
-            format!("{side}。相手のコードが貼られないまま終わった（{again}）"),
-        );
+        let what = if by_server {
+            "相手が見つからないか、相手のコードを受け取らないまま終わった"
+        } else {
+            "相手のコードが貼られないまま終わった"
+        };
+        return bad(N_CODE, format!("{side}。{what}（{again}）"));
     }
-    skip(
-        N_CODE,
-        format!("{side}。相手のコードが貼られるのを待っている"),
-    )
+    let waiting = if by_server {
+        "相手が来るのを待っている"
+    } else {
+        "相手のコードが貼られるのを待っている"
+    };
+    skip(N_CODE, format!("{side}。{waiting}"))
 }
 
 fn link_failure(s: &NetSnapshot) -> String {
@@ -732,7 +812,7 @@ fn link(f: &Facts) -> Item {
             format!(
                 "繋がった（接続の手順を始めてから {} 秒、経路は{}{learned}、作り直し {} 回）{diag}",
                 secs(s.connect_wait_ms),
-                path_kind(s.path_kind),
+                path_kind(s.path_kind, s.vpn),
                 s.hs_restarts
             ),
         );
@@ -762,6 +842,37 @@ fn link(f: &Facts) -> Item {
     skip(N_LINK, format!("まだ繋がっていない{diag}"))
 }
 
+/// 選択が揃ったときの、ホストの値との食い違いの数。マップ・難易度は食い違えばホストの値を採って続く（`selection::Agreed`）。オプションのダイジェストは記録だけ。
+/// 揃った回数が数えられていない（最後の 1 回の印だけある）ときは、その 1 回の印から言う。
+fn select_diff_text(s: &NetSnapshot) -> String {
+    let last = s.agreed_mismatch.unwrap_or(0);
+    let bit = |b: u8| u32::from(last & b != 0);
+    let (n, map, difficulty, digest) = if s.selects_agreed > 0 {
+        (
+            s.selects_agreed,
+            s.select_diff_map,
+            s.select_diff_difficulty,
+            s.select_diff_digest,
+        )
+    } else {
+        (
+            u32::from(s.agreed_mismatch.is_some()),
+            bit(1),
+            bit(2),
+            bit(4),
+        )
+    };
+    if n == 0 {
+        return "ホストの値との食い違いは揃った値がまだ無く不明".to_string();
+    }
+    if map + difficulty + digest == 0 {
+        return format!("揃った {n} 回のうち食い違い 0 回");
+    }
+    format!(
+        "揃った {n} 回のうち、ホストの値と食い違った欄: マップ {map} 回・難易度 {difficulty} 回（ホストの値を採って続けた）・オプションのダイジェスト {digest} 回（記録だけ）"
+    )
+}
+
 fn select(f: &Facts) -> Item {
     let s = match net_or_skip(f, N_SELECT) {
         Ok(s) => s,
@@ -789,25 +900,7 @@ fn select(f: &Facts) -> Item {
         }
         _ => {}
     }
-    if let Some(flags) = s.agreed_mismatch.filter(|f| *f != 0) {
-        let mut v = Vec::new();
-        for (bit, name) in [
-            (1, "マップ"),
-            (2, "難易度"),
-            (4, "オプションのダイジェスト"),
-        ] {
-            if flags & bit != 0 {
-                v.push(name);
-            }
-        }
-        return bad(
-            N_SELECT,
-            format!(
-                "揃った値が両者で食い違った: {}（{pre}）。2 人の設定を揃えて、選択からやり直す",
-                v.join("・")
-            ),
-        );
-    }
+    // 食い違いは × にしない。マップ・難易度はホストの値を採って続く作りで（`selection::Agreed`）、ここで返すと後ろの判定が隠れる。
     if s.menu_align_miss > 0 || s.menu_lost > 0 {
         return bad(
             N_SELECT,
@@ -822,13 +915,14 @@ fn select(f: &Facts) -> Item {
         return ok(
             N_SELECT,
             format!(
-                "入った押下 {}、SELECT の揃った値 {}、食い違い 0、{pre}",
+                "入った押下 {}、SELECT の揃った値 {}、{}、{pre}",
                 s.menu_applied,
                 if s.agreed_mismatch.is_some() {
                     "あり"
                 } else {
                     "まだ無い"
-                }
+                },
+                select_diff_text(&s)
             ),
         );
     }
@@ -964,70 +1058,74 @@ fn ending(f: &Facts) -> Item {
         Ok(s) => s,
         Err(item) => return item,
     };
-    let d = s.end_detail;
-    match s.end {
-        0 => skip(N_END, "ネットワークはまだ終わっていない"),
-        1 => bad(N_END, "接続できなかった（理由は「繋がったか」の行）"),
+    end_item(N_END, s.end, s.end_detail)
+}
+
+/// 終わりの種類（`NetSnapshot::end`）とその中身 `d` の印と文。試合の終わりの行（`match_events`）が同じ文を使う。
+pub fn end_item(name: &'static str, end: u32, d: u32) -> Item {
+    match end {
+        0 => skip(name, "ネットワークはまだ終わっていない"),
+        1 => bad(name, "接続できなかった（理由は「繋がったか」の行）"),
         2 => match d {
-            1 => ok(N_END, "相手が試合を終えた（相手からの BYE・終了）"),
+            1 => ok(name, "相手が試合を終えた（相手からの BYE・終了）"),
             2 => bad(
-                N_END,
+                name,
                 "相手が切断した（相手からの BYE・切断。相手のログを見る）",
             ),
             3 => bad(
-                N_END,
+                name,
                 "相手が CHECK のズレを見つけた（相手からの BYE・ズレ。相手のログを見る）",
             ),
             4 => bad(
-                N_END,
+                name,
                 "相手が中止した（相手からの BYE・中止。相手のログを見る）",
             ),
-            _ => bad(N_END, format!("相手から BYE を受けた（理由の番号 {d}）")),
+            _ => bad(name, format!("相手から BYE を受けた（理由の番号 {d}）")),
         },
         3 => bad(
-            N_END,
+            name,
             "相手が黙った（一定時間、相手から何も届かなかった。相手が閉じた・回線が切れた・ファイアウォール。相手のログを見る）",
         ),
         4 => bad(
-            N_END,
+            name,
             format!("CHECK のズレ（frame {d}）。詳しくは「同期」の行"),
         ),
         5 => match d {
-            1 => ok(N_END, "自分から終えた"),
-            _ => bad(N_END, format!("自分から中止した（理由の番号 {d}）")),
+            1 => ok(name, "自分から終えた"),
+            _ => bad(name, format!("自分から中止した（理由の番号 {d}）")),
         },
         6 => bad(
-            N_END,
+            name,
             "相手の SELECT が範囲の外だった。詳しくは「ネットの選択」の行",
         ),
         7 => bad(
-            N_END,
+            name,
             "押下を持ち越しすぎて画面が分かれた。詳しくは「ネットの選択」の行",
         ),
         // 道具の不具合ではない（どちらかが「妖怪 対 妖怪」を選ばなかった）ので × にしない。
         8 => skip(
-            N_END,
+            name,
             "つながったが、対戦が成立しないまま時間切れで閉じた（どちらかが「妖怪 対 妖怪」を選ばなかった）",
         ),
         // 8 と同じく道具の不具合ではない（相手の使い方・バージョンの違い）。
         9 => skip(
-            N_END,
+            name,
             "つながったが、相手の HiganRTool が古いか、相手がゲーム内のメニューからつないでいないので閉じた（相手の READY が来ないまま選択の通信が来た）",
         ),
         10 => skip(
-            N_END,
+            name,
             "つながったが、対戦が成立しないまま相手が閉じた（相手の時間切れか、相手が抜けた。相手のログを見る）",
         ),
         // 相手の HiganRTool のバージョンが違う（`net_watch::END_OTHER_VERSION`）。道具の使い方で直る（同じ zip を使う）が、マッチはできなかった。
         11 => bad(
-            N_END,
+            name,
             other_version_text(PROTO_VER, u8::try_from(d).unwrap_or(u8::MAX)),
         ),
         12 => bad(
-            N_END,
+            name,
             higanr_core::net_menu::other_build_text(higanr_core::update::BUILD_NUMBER, d),
         ),
-        _ => bad(N_END, format!("終わりの種類が読めない（{}）", s.end)),
+        _ => bad(name, format!("終わりの種類が読めない（{end}）")),
     }
 }
 
@@ -1564,13 +1662,110 @@ mod tests {
         assert_eq!(mark_of(&f, N_CODE), Mark::Bad);
         assert!(text_of(&f, N_CODE).contains("起動し直す"));
         f.host.code.as_mut().unwrap().side = CodeSide::Game;
+        f.host.code.as_mut().unwrap().route = Some(Route::Paste);
         let t = text_of(&f, N_CODE);
         assert!(
-            t.contains("「妖怪 対 妖怪」のメニューからもう一度つなぐ") && !t.contains("起動し直す"),
+            t.contains("「妖怪 対 妖怪」からメニューを開き、「対戦コード入力」を選び直す")
+                && !t.contains("起動し直す"),
             "{t}"
         );
         f.host.code = None;
         assert_eq!(mark_of(&f, N_CODE), Mark::Skip);
+    }
+
+    /// 壊れたら落ちる: ランダムマッチ・ルームマッチで「相手のコードを読めた」「貼られない」と、人がコードを見ない経路に合わない言い方が出る。
+    /// 待った秒数（待ち列・ルーム）が出ない。
+    #[test]
+    fn the_code_item_speaks_the_route_the_player_chose() {
+        let mut f = good();
+        {
+            let c = f.host.code.as_mut().unwrap();
+            c.side = CodeSide::Game;
+            c.route = Some(Route::Random);
+            c.chosen_at = Some(1.0);
+            c.paired_at = Some(76.6);
+            c.peer_read_at = Some(77.9);
+            c.connected_at = Some(78.2);
+            c.queue_first = Some(true);
+        }
+        assert_eq!(mark_of(&f, N_CODE), Mark::Ok);
+        assert_eq!(
+            text_of(&f, N_CODE),
+            "ランダムマッチ（待ち列に先に入った側）。待ち列で組になり、割り当てのルームで相手のコードを受け取れた（待ち列で組になるまで 75.6 秒 / 割り当てのルームで相手のコードを受け取るまで 1.3 秒）"
+        );
+        {
+            let c = f.host.code.as_mut().unwrap();
+            c.route = Some(Route::Room);
+            c.placed_side = Some(CodeSide::Answer);
+            c.paired_at = None;
+        }
+        let t = text_of(&f, N_CODE);
+        assert_eq!(
+            t,
+            "ルームマッチ（ルームに後から入った側）。ルームで相手のコードを受け取れた（ルームで相手のコードを受け取るまで 76.9 秒）"
+        );
+        assert!(!t.contains("読めた") && !t.contains("貼"), "{t}");
+        // 相手が来ないまま終わった。サーバーを通す経路は「コードが貼られない」と言わない。
+        {
+            let c = f.host.code.as_mut().unwrap();
+            c.peer_read_at = None;
+            c.connected_at = None;
+            c.ended_unconnected = true;
+        }
+        f.stage = Stage::Final;
+        assert_eq!(mark_of(&f, N_CODE), Mark::Bad);
+        let t = text_of(&f, N_CODE);
+        assert!(
+            t.contains("相手が見つからないか、相手のコードを受け取らないまま終わった（「妖怪 対 妖怪」からメニューを開き、「ルームマッチ」を選び直す）")
+                && !t.contains("貼られ"),
+            "{t}"
+        );
+        // 対戦コード作成は返答コードを読む。コードの項目は今までどおり「貼られない」。
+        f.host.code.as_mut().unwrap().route = Some(Route::Create);
+        assert!(text_of(&f, N_CODE).contains("相手のコードが貼られないまま終わった"));
+    }
+
+    /// 壊れたら落ちる: 観戦だけの起動（対戦の待機を 1 つも選ばなかった実行）で、使っていないコードが「貼られないまま終わった」と × になる。
+    #[test]
+    fn a_run_that_chose_no_route_does_not_say_a_code_was_never_pasted() {
+        let mut f = good();
+        {
+            let c = f.host.code.as_mut().unwrap();
+            c.side = CodeSide::Game;
+            c.peer_read_at = None;
+            c.connected_at = None;
+            c.ended_unconnected = true;
+        }
+        f.stage = Stage::Final;
+        assert_eq!(mark_of(&f, N_CODE), Mark::Skip);
+        let t = text_of(&f, N_CODE);
+        assert!(
+            t.contains("コードは使っていない") && !t.contains("貼られ"),
+            "{t}"
+        );
+        // 同じ状態でも、項目を選んでいれば今までどおり ×。
+        f.host.code.as_mut().unwrap().route = Some(Route::Create);
+        assert_eq!(mark_of(&f, N_CODE), Mark::Bad);
+    }
+
+    /// 壊れたら落ちる: 揃った回数が数えられていないのに「食い違い 0」と言う（測れていないを 0 件に見せる）。揃った回数を母数に並べない。
+    #[test]
+    fn select_diff_text_has_a_denominator_and_never_invents_zero() {
+        let mut f = good();
+        assert!(
+            text_of(&f, N_SELECT).contains("ホストの値との食い違いは揃った値がまだ無く不明"),
+            "{}",
+            text_of(&f, N_SELECT)
+        );
+        net_mut(&mut f).selects_agreed = 5;
+        assert!(text_of(&f, N_SELECT).contains("揃った 5 回のうち食い違い 0 回"));
+        net_mut(&mut f).select_diff_digest = 2;
+        let t = text_of(&f, N_SELECT);
+        assert!(
+            t.contains("マップ 0 回・難易度 0 回（ホストの値を採って続けた）・オプションのダイジェスト 2 回（記録だけ）"),
+            "{t}"
+        );
+        assert_eq!(mark_of(&f, N_SELECT), Mark::Ok);
     }
 
     #[test]
@@ -1627,10 +1822,30 @@ mod tests {
             t.contains("入った押下 6") && t.contains("繋がる前に落とした決定 1 回"),
             "{t}"
         );
+        // 食い違いはホストの値を採って続くので × にしない。何回あったかを情報として言う。
         let mut f = good();
-        net_mut(&mut f).agreed_mismatch = Some(0b011);
+        {
+            let s = net_mut(&mut f);
+            s.agreed_mismatch = Some(0b011);
+            s.selects_agreed = 12;
+            s.select_diff_map = 3;
+            s.select_diff_difficulty = 1;
+        }
+        assert_eq!(mark_of(&f, N_SELECT), Mark::Ok);
+        let t = text_of(&f, N_SELECT);
+        assert!(
+            t.contains("揃った 12 回のうち、ホストの値と食い違った欄: マップ 3 回・難易度 1 回（ホストの値を採って続けた）・オプションのダイジェスト 0 回（記録だけ）"),
+            "{t}"
+        );
+        assert!(!t.contains("やり直す"), "{t}");
+        // 食い違いがあっても、後ろの判定（カーソル・押下）は隠れない。
+        net_mut(&mut f).menu_align_miss = 1;
         assert_eq!(mark_of(&f, N_SELECT), Mark::Bad);
-        assert!(text_of(&f, N_SELECT).contains("マップ・難易度"));
+        assert!(text_of(&f, N_SELECT).contains("カーソルを合わせられなかった 1 回"));
+        net_mut(&mut f).menu_align_miss = 0;
+        net_mut(&mut f).menu_lost = 2;
+        assert_eq!(mark_of(&f, N_SELECT), Mark::Bad);
+        net_mut(&mut f).menu_lost = 0;
         net_mut(&mut f).agreed_mismatch = Some(0);
         net_mut(&mut f).menu_align_miss = 1;
         assert_eq!(mark_of(&f, N_SELECT), Mark::Bad);
@@ -1840,7 +2055,7 @@ mod tests {
         use crate::netplay::End;
         use higanr_core::handshake::FailReason;
         let want = format!(
-            "相手のHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
+            "相手とHiganRToolのバージョンが違います（自分 {PROTO_VER}・相手 0）。相手と同じzipのHiganRToolを使ってください。"
         );
         let mut f = good();
         let (end, detail) =
@@ -1954,7 +2169,7 @@ mod tests {
             assert_eq!(mark_of(&f, n), Mark::Skip, "{n}");
             assert_eq!(
                 text_of(&f, n),
-                "ゲーム内のメニューで「作る」「貼る」を選ばなかったので開いていない",
+                "ゲーム内のメニューで「ランダムマッチ」「ルームマッチ」「対戦コード作成」「対戦コード入力」のどれも選ばなかったので開いていない",
                 "{n}"
             );
         }
@@ -2112,5 +2327,41 @@ mod tests {
         let m = marks(&judge(&f));
         assert_eq!(m[10], Mark::Skip);
         assert_eq!(m.iter().filter(|x| **x != Mark::Ok).count(), 1);
+    }
+
+    /// 壊れたら落ちる: VPN の範囲の受信ソケットと経路が「外」「外側のアドレス」と書かれる（インターネットと見分かれない）、
+    /// VPN でない接続の語が変わる（範囲 lan の家の中・外の経路）、VPN の範囲の同じ PC・家の中の語が変わる。
+    #[test]
+    fn a_vpn_socket_and_path_are_named_as_vpn_and_nothing_else_changes() {
+        let vpn_net =
+            higanr_core::vpn_net::Net4::new(std::net::Ipv4Addr::new(26, 1, 2, 3), 8).expect("網");
+        let vpn = Scope::LanVpn(vpn_net);
+        let inner: SocketAddr = "26.1.2.3:47001".parse().unwrap();
+        assert_eq!(local_kind(inner, vpn), "VPN");
+        assert_eq!(
+            local_kind(inner, Scope::Lan),
+            "外",
+            "VPN の範囲でなければ VPN の語を付けない"
+        );
+        assert_eq!(
+            local_kind("192.168.1.5:1".parse().unwrap(), Scope::Lan),
+            "家の中"
+        );
+        assert_eq!(local_kind("192.168.1.5:1".parse().unwrap(), vpn), "家の中");
+        assert_eq!(
+            local_kind("127.0.0.1:1".parse().unwrap(), vpn),
+            "同じ PC の中"
+        );
+        assert_eq!(
+            local_kind("27.1.2.3:1".parse().unwrap(), vpn),
+            "外",
+            "ネットワークの外"
+        );
+        assert_eq!(path_kind(3, true), "VPN のアドレス");
+        assert_eq!(path_kind(3, false), "外側のアドレス");
+        assert_eq!(path_kind(1, true), "同じ PC の中");
+        assert_eq!(path_kind(2, true), "家の中");
+        assert_eq!(path_kind(4, true), "IPv6");
+        assert_eq!(path_kind(0, true), "種類は分からない");
     }
 }

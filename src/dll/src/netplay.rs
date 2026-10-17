@@ -728,6 +728,13 @@ pub struct Stats {
     pub zero_ticks: u64,
     /// lockstep の中の描画だけのフレーム（相手の入力ワードが予算までに揃わなかった）。
     pub stalls: u64,
+    /// `stalls` の内訳（数える場所は同じ。5 つの和が `stalls`）。rollback は時刻合わせ・先に行き過ぎ・場面の境目・ほか、delay 方式は相手の入力待ち。
+    /// `rollback::Stats` の待ちの数は入力の地点を呼んだ回数で、1 フレームの中で何度も数えるうえ seg ごとに 0 から数え直すので、ここで数え直す。
+    pub stalls_sync: u64,
+    pub stalls_ahead: u64,
+    pub stalls_boundary: u64,
+    pub stalls_other: u64,
+    pub stalls_peer: u64,
     pub max_stall_run: u32,
     pub hold_frames: u64,
     pub local_reads: u64,
@@ -753,6 +760,12 @@ pub struct Stats {
     pub menu_peer_random: u32,
     /// 繋がる前に選択の画面（7・8・16）で、ゲームへ入れずに落とした決定の押下（押した瞬間）の回数（`unconnected_tick`）。
     pub menu_pre_link_decides: u32,
+    /// 選択が両者で揃った回数と、そのうちホストの値と食い違った欄ごとの回数（食い違ってもマップ・難易度はホストの値を採って続ける。
+    /// オプションのダイジェストは記録だけ。一度の合意で複数の欄が食い違うことがある）。
+    pub selects_agreed: u32,
+    pub select_diff_map: u32,
+    pub select_diff_difficulty: u32,
+    pub select_diff_digest: u32,
     pub lat_requested: u32,
     pub lat_busy: u32,
     pub lat_refused: u32,
@@ -792,6 +805,18 @@ pub struct Stats {
     /// 相手を待つ知らせの間に Esc で閉じた回数・待ちが `peer_wait::LIMIT_MS` 続いて閉じた回数（止める地点の待ちも含む）。
     pub peer_wait_esc: u32,
     pub peer_wait_cuts: u32,
+}
+
+impl Stats {
+    /// `stalls` の内訳の和（検査用。`stalls` と一致する）。
+    #[cfg(test)]
+    pub(crate) fn stalls_split_sum(&self) -> u64 {
+        self.stalls_sync
+            + self.stalls_ahead
+            + self.stalls_boundary
+            + self.stalls_other
+            + self.stalls_peer
+    }
 }
 
 /// マッチの最中の同期ズレ（CHECK の食い違い）で、そのマッチを止めている状態。ゲームは決定的なので食い違いは 1 回で本物のズレ。ネットワークを閉じても
@@ -1114,6 +1139,19 @@ impl NetPlay {
         }
         for rec in higanr_core::spectate::seg_head(seg, est) {
             Self::spec_to(spec, rec);
+        }
+    }
+
+    /// 選択が揃った回を数える（欄ごとの食い違いも）。1 回の合意につき 1 回だけ呼ぶ。
+    fn count_agreed(&mut self, a: &Agreed) {
+        let s = &mut self.stats;
+        s.selects_agreed = s.selects_agreed.saturating_add(1);
+        for (differs, n) in [
+            (a.mismatch.map, &mut s.select_diff_map),
+            (a.mismatch.difficulty, &mut s.select_diff_difficulty),
+            (a.mismatch.option_digest, &mut s.select_diff_digest),
+        ] {
+            *n = n.saturating_add(u32::from(differs));
         }
     }
 
@@ -2453,6 +2491,7 @@ impl NetPlay {
         }
         Self::spec_selects(&self.spec, c.seat(), self.own_select, &a);
         self.peer_charge = a.peer.charge;
+        self.count_agreed(&a);
         self.agreed = Some(a);
         self.sel_entered = false;
         self.sel_left = false;
@@ -2524,6 +2563,7 @@ impl NetPlay {
                     return Action::Local;
                 }
                 self.stats.stalls = self.stats.stalls.saturating_add(1);
+                self.stats.stalls_peer = self.stats.stalls_peer.saturating_add(1);
                 self.stall_run = self.stall_run.saturating_add(1);
                 self.stats.max_stall_run = self.stats.max_stall_run.max(self.stall_run);
                 return Action::RenderOnly;

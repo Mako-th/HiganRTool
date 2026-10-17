@@ -86,6 +86,7 @@ use higanr_core::return_flow::{self, Facts, Finish, Flow, Reads, Screen, Why};
 use higanr_core::room_input::{ROOM_BUF_WORDS, RoomBuf};
 use higanr_core::ui_entry::{self, Advance, EntryView, SCREEN_MATCH_MODE};
 use higanr_core::ui_layout::{self as lay, HUD_BAND_H, HUD_TEXT_MAX_W, HUD_X, HUD_Y, RowStyle};
+use higanr_core::vpn_net::VpnSet;
 use higanr_core::watch_list::{
     ListStatus, WATCH_ROW_WORDS, WATCH_ROWS_MAX, WatchRow, WatchSnapshot,
 };
@@ -1161,6 +1162,15 @@ const COPY_NOTICE_SECS: u64 = 5;
 /// 超えたら（見張りがまだつながりを見ていない等）結果を待つのをやめる。
 const COPY_WAIT_SECS: u64 = 10;
 
+/// LAN のアドレスの入力が使う、自分の PC の VPN のネットワークの控えの仕事（製品は `vpn_snap`）。
+#[derive(Clone, Copy)]
+pub struct VpnHooks {
+    /// 控えの更新を頼む（別のスレッドを起こして返る）。
+    pub scan: fn(),
+    /// 控えを読む（確保しない）。
+    pub read: fn() -> VpnSet,
+}
+
 pub struct NetUi {
     menu: Menu,
     link: Arc<UiLink>,
@@ -1207,6 +1217,11 @@ pub struct NetUi {
     /// LAN のホストのアドレスを決めたとき（`Cmd::LanClient` / `Cmd::LanWatch`）に呼ぶ、ini の `lan_host` へ書く仕事（`ini_save::save_lan_host`）。
     /// 置かなければ（検査）書かない。
     lan_saver: Option<fn(LanAddr)>,
+    /// LAN のアドレスの入力に入ったとき呼ぶ、自分の PC の VPN のネットワークの控えを更新させる仕事（別のスレッドを起こす）と、控えの読み
+    /// （`vpn_snap`）。置かなければ（検査）VPN のアドレスは受けない。
+    vpn_hooks: Option<VpnHooks>,
+    /// 前の tick に LAN のアドレスの入力の間だった（入った瞬間に控えの更新を頼む）。
+    vpn_editing: bool,
     /// Ctrl+C（観戦コードのコピー）の押した瞬間の取り方。数字・Tab の取り方（`NetPlay` の持つもの）とは別に持つ（二重に `feed` しても
     /// 取り合わないように）。
     copy_edge: DigitEdge,
@@ -1297,6 +1312,8 @@ impl NetUi {
             room_saver: None,
             lang_saver: None,
             lan_saver: None,
+            vpn_hooks: None,
+            vpn_editing: false,
             copy_edge: DigitEdge::new(),
             copy_hint_on: false,
             copy_wait: None,
@@ -1316,6 +1333,19 @@ impl NetUi {
             ret_log: None,
             stats: UiStats::default(),
         }
+    }
+
+    /// LAN のアドレスの入力の間だけ、自分の PC の VPN のネットワークをメニューへ渡す。入った tick に控えの更新を頼む（別のスレッド。
+    /// 入力に何秒もかかるので、打ち終わるまでに更新は済む）。入力の間でなければ何もしない。
+    fn feed_vpn_nets(&mut self) {
+        let editing = self.menu.wants_lan_addr();
+        if let (true, Some(h)) = (editing, self.vpn_hooks) {
+            if !self.vpn_editing {
+                (h.scan)();
+            }
+            self.menu.set_vpn((h.read)());
+        }
+        self.vpn_editing = editing;
     }
 
     /// 観戦の「ランダムマッチ」の一覧の接続を開け閉めする仕事を置く。
@@ -1357,6 +1387,12 @@ impl NetUi {
     pub fn with_lan_addr(mut self, addr: AddrBuf, saver: Option<fn(LanAddr)>) -> NetUi {
         self.menu = self.menu.with_lan_addr(addr);
         self.lan_saver = saver;
+        self
+    }
+
+    /// LAN のアドレスの入力が VPN のネットワークを引く仕事を置く。
+    pub fn with_vpn_hooks(mut self, hooks: Option<VpnHooks>) -> NetUi {
+        self.vpn_hooks = hooks;
         self
     }
 
@@ -1594,7 +1630,7 @@ impl NetUi {
 
     /// 場面がメニューでない（マッチ・読み込み）ときは、メニューを閉じ、左上の行を消す（マッチ中の行は `hud` が決める）。
     /// ただし待っている間の行（`Conn::Waiting`）は、待っている間どの場面でも出す（待っている間にメニューを閉じて Story などを
-    /// 遊んでも、待っていることが分かるように）。「対戦相手が見つかりました」の行（`Conn::Found`）と、成立しないまま閉じた理由の行
+    /// 遊んでも、待っていることが分かるように）。「相手が見つかりました」の行（`Conn::Found`）と、成立しないまま閉じた理由の行
     /// （`Conn::Unmatched`）も同じ（別のモードで遊んでいる側は左上の行と音で知る）。位置は、見つかった・閉じた理由の行は上の枠
     /// （y = 0〜15）の下の左上（`TL_Y`）、待っている間の 1 行はマッチ中の行と同じ上の枠の左（`ROW_WAIT`）。成立した行・終わった行は
     /// マッチの中では出さない。相手のバージョンが違ってつながる前に終わった行（`Conn::OtherVersion`）は、成立しないまま閉じた理由の行と
@@ -1856,6 +1892,7 @@ impl NetUi {
             self.choose(&mut out);
         }
         // 1. 開いているメニュー（入口のメニュー・確かめの枠・閉じ始め）。
+        self.feed_vpn_nets();
         if self.menu.is_active() {
             let mut text = TextIn::NONE;
             if self.menu.wants_text() && self.text_gate {
@@ -3137,7 +3174,7 @@ mod tests {
         assert_eq!(b.show() & SHOW_WAIT, 0, "待ちの行が残った");
         assert_eq!(
             row_text(b, ROW_TL0),
-            "30分待っても、相手がルームに来ませんでした。"
+            "30分経ちましたが相手がルームに来ませんでした。"
         );
         assert_eq!(
             row_text(b, ROW_TL1),
@@ -4140,7 +4177,7 @@ mod tests {
         let mut g8 = Fake::on_screen(8, 0);
         g8.step(&mut ui, &found_facts(false), 0);
         assert!(
-            row_text(b, ROW_TL0).starts_with("対戦相手が見つかりました"),
+            row_text(b, ROW_TL0).starts_with("相手が見つかりました"),
             "{}",
             row_text(b, ROW_TL0)
         );
@@ -4578,8 +4615,8 @@ mod tests {
         use higanr_core::nat::{NatMark, Symmetry};
         const F1: &[&str] = &[
             "接続失敗：",
-            "不明な原因で相手からのUDPパケットが届きません",
-            "iniをdetail=1に書き換えてもう一度試し、ログをGitHubのIssuesへ送ってください。",
+            "不明な原因で相手からのUDPパケットが届きません。",
+            "iniをdetail=1に書き換えてもう一度試し、ログを添えて開発者に伝えてください。",
             "（README「接続できないとき」1）",
         ];
         const F2: &[&str] = &[
@@ -4895,7 +4932,7 @@ mod tests {
         assert!(!o.ready, "別の画面にいた側は選んでいない");
         assert_eq!(
             row_text(b, ROW_TL0),
-            "対戦相手が見つかりました（閉じるまで 9:59）"
+            "相手が見つかりました（閉じるまで 9:59）"
         );
         assert_eq!(row_text(b, ROW_TL1), "「妖怪 対 妖怪」を選んでください。");
         let mut story = Fake::on_match_screen(0);
@@ -4959,7 +4996,7 @@ mod tests {
             ),
             (
                 NoMatch::PeerLeft,
-                "相手が対戦を始めないまま、接続を閉じました。",
+                "相手が対戦を始めないまま抜けたので、接続を閉じました。",
             ),
         ] {
             let unmatched = UiFacts {
@@ -4987,7 +5024,7 @@ mod tests {
             ..facts()
         };
         let want = format!(
-            "相手のHiganRToolのバージョンが違います（自分 {}・相手 0）。",
+            "相手とHiganRToolのバージョンが違います（自分 {}・相手 0）。",
             higanr_core::wire::PROTO_VER
         );
         for scenes in [(2u32, 0u32), (SCENE_MENU, 0)] {
@@ -5156,7 +5193,7 @@ mod tests {
             Conn::Found { ready: false, .. }
         ));
         let st = crate::net_watch::NetStatus::new();
-        st.publish(&r.np_a);
+        st.publish(&r.np_a, false);
         let line = st.snapshot().gate_line().expect("ゲートの行が無い");
         assert!(
             line.starts_with("対戦の成立: 自分 選んだ / 相手 まだ / READY 送った "),
@@ -5309,7 +5346,7 @@ mod tests {
         };
         assert_eq!(
             row(&r.ui_a).as_deref(),
-            Some("相手が対戦を始めないまま、接続を閉じました。")
+            Some("相手が対戦を始めないまま抜けたので、接続を閉じました。")
         );
         assert_eq!(
             row(&r.ui_b).as_deref(),
@@ -5506,7 +5543,7 @@ mod tests {
         );
         assert_eq!(row(ROW_TL1).as_deref(), Some(T_AGAIN.ja));
         let st = crate::net_watch::NetStatus::new();
-        st.publish(&r.np_a);
+        st.publish(&r.np_a, false);
         let line = st.snapshot().gate_line().expect("ゲートの行が無い");
         assert!(line.contains("相手にゲートが無いので閉じた"), "{line}");
         assert!(line.contains("受けた 0 通"), "{line}");
@@ -6028,7 +6065,7 @@ mod tests {
         assert!(
             menu_rows(b)
                 .iter()
-                .any(|l| l == "  いま観戦できるランダムマッチはありません")
+                .any(|l| l == "  いま観戦できるランダムマッチはありません。")
         );
         shot(b, "1c_watch_empty");
         g.step(&mut ui, &f, X);
@@ -6382,7 +6419,7 @@ mod tests {
         }
         let want = [
             "同期がずれたため、試合を終了しました。",
-            "logsフォルダのログをGitHubのIssuesへ送ってください（Escでメニューへ）。",
+            "logsフォルダのログを添えて、開発者に伝えてください（Escでメニューへ）。",
         ];
         for (who, b) in [("A", board_a), ("B", board_b)] {
             assert_eq!(
@@ -6826,6 +6863,91 @@ mod tests {
                 ip: std::net::Ipv4Addr::new(10, 0, 0, 5),
                 port: 17723
             }))
+        );
+    }
+
+    static VPN_SCANS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn count_vpn_scan() {
+        VPN_SCANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn radmin_set() -> VpnSet {
+        VpnSet::from_nets([higanr_core::vpn_net::Net4::new(
+            std::net::Ipv4Addr::new(26, 0, 0, 1),
+            8,
+        )
+        .unwrap()])
+    }
+
+    /// 壊れたら落ちる: LAN のアドレスの入力に入ったときに VPN のネットワークの更新を頼まない・入力の間に毎 tick 頼む（別のスレッドを起こし続ける）、
+    /// 控えの集まりをメニューへ渡さず VPN のアドレスを断る、仕事を置かない実行（検査・古い構成）が VPN のアドレスを受ける、
+    /// 入力から出て入り直したときに頼み直さない。
+    #[test]
+    fn the_lan_address_input_asks_for_the_vpn_networks_once_per_entry_and_takes_a_vpn_address() {
+        use std::sync::atomic::Ordering;
+        let enter_client = |ui: &mut NetUi, g: &mut Fake, b| {
+            cursor_to(g, ui, b, "クライアント");
+            g.step(ui, &facts(), Z);
+            g.step(ui, &facts(), 0);
+            assert_eq!(menu_rows(b)[0], "LAN ─ クライアント");
+        };
+        let typed_vpn = |g: &mut Fake| {
+            g.typed
+                .extend("26.12.34.56".encode_utf16().chain(Some(0x0D)));
+        };
+        let hooks = VpnHooks {
+            scan: count_vpn_scan,
+            read: radmin_set,
+        };
+        // 仕事あり。
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::new(UiLink::new()), b).with_vpn_hooks(Some(hooks));
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        let before = VPN_SCANS.load(Ordering::SeqCst);
+        enter_client(&mut ui, &mut g, b);
+        for _ in 0..5 {
+            g.step(&mut ui, &facts(), 0);
+        }
+        assert_eq!(
+            VPN_SCANS.load(Ordering::SeqCst) - before,
+            1,
+            "入った 1 回だけ頼む"
+        );
+        typed_vpn(&mut g);
+        let o = g.step(&mut ui, &facts(), 0);
+        assert_eq!(
+            o.lan,
+            Some(LanAsk::Client(LanAddr {
+                ip: std::net::Ipv4Addr::new(26, 12, 34, 56),
+                port: 17723
+            }))
+        );
+        // 出て、入り直す: もう 1 回頼む。
+        for _ in 0..3 {
+            g.step(&mut ui, &facts(), 0);
+        }
+        enter_client(&mut ui, &mut g, b);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(VPN_SCANS.load(Ordering::SeqCst) - before, 2);
+        // 仕事なし: 同じアドレスを断り、理由を出す。
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::new(UiLink::new()), b);
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        enter_client(&mut ui, &mut g, b);
+        typed_vpn(&mut g);
+        let o = g.step(&mut ui, &facts(), 0);
+        assert_eq!(o.lan, None);
+        assert!(
+            menu_rows(b)
+                .iter()
+                .any(|r| r == higanr_core::net_menu::T_LAN_ADDR_NOT_LAN.ja),
+            "{:?}",
+            menu_rows(b)
         );
     }
 
@@ -7605,7 +7727,7 @@ mod tests {
         // 取得中の間は「取得しています」だけ。届くと行が出る。
         let t = menu_rows(b);
         assert!(
-            t.iter().any(|l| l.contains("一覧を取得しています")),
+            t.iter().any(|l| l.contains("一覧を取得しています。")),
             "{t:?}"
         );
         link.publish_watch_list(ListStatus::Ready, &[watch_row(1, "Alice", "Bob", 3)]);
@@ -7630,7 +7752,7 @@ mod tests {
             "前の行が残った: {t:?}"
         );
         assert!(
-            t.iter().any(|l| l.contains("一覧を取得しています")),
+            t.iter().any(|l| l.contains("一覧を取得しています。")),
             "{t:?}"
         );
         // 前に置いた一覧が入れ物に残っていても、開き直した後に置かれたものだけを読む。

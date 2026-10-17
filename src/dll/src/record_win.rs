@@ -148,10 +148,11 @@ impl RecordEnv for RealRecord {
 
     fn open_output(&mut self, suffix: &str) -> Result<(String, Box<dyn Write>), String> {
         // `.gz` で終わる名前（大きい CSV）は gzip で書く。圧縮は書き込み先を持つスレッドで行い、ゲームのスレッドには乗らない。
-        // `BufWriter` は挟まない（圧縮器が自分で塊にして書く）。
+        // `BufWriter` は挟まない（圧縮器が自分で塊にして書く）。ゲームを閉じるとこのスレッドごと消えて `Drop` が走らないので、
+        // ファイルは sync flush のたびに終わりの印の仮を書く形（`new_seekable`）で開く。
         if gzlog::is_gz_name(suffix) {
             let (name, f) = self.open_raw(suffix)?;
-            return Ok((name, Box::new(GzLogWriter::new(f))));
+            return Ok((name, Box::new(GzLogWriter::new_seekable(f))));
         }
         let (name, w) = self.open_file(suffix)?;
         Ok((name, Box::new(w)))
@@ -355,6 +356,21 @@ mod tests {
         let mut inside = RealRecord::new(Some(d.join("y.log")), Some(d.clone()));
         assert!(inside.open_output("_pacing.csv.gz").is_err());
         assert!(!d.join("y_pacing.csv.gz").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn open_output_gz_is_a_complete_gzip_while_the_game_still_runs() {
+        let d = temp_dir("gz_live");
+        let mut r = RealRecord::new(Some(d.join("dll_l.log")), Some(d.join("elsewhere")));
+        let (name, mut w) = r.open_output("_net_frames.csv.gz").unwrap();
+        let rows = "seg,frame\n0,0\n0,1\n";
+        w.write_all(rows.as_bytes()).unwrap();
+        w.flush().unwrap();
+        // 閉じずに（`Drop` を走らせずに）読む = ゲームを閉じた後のファイル。
+        let live = gzlog::read_log_text(&d.join(&name)).unwrap();
+        assert_eq!((live.text.as_str(), live.cut), (rows, false));
+        drop(w);
         let _ = std::fs::remove_dir_all(&d);
     }
 

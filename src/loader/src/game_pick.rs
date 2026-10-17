@@ -50,7 +50,7 @@ impl PickError {
             .to_string(),
             PickError::DialogFailed(why) => by_lang!(
                 lang,
-                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文と、logsフォルダのファイルを添えて、GitHubのIssuesで知らせてください（https://github.com/Mako-th/HiganRTool/issues）。",
+                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文と、logsフォルダのファイルを添えて、開発者に伝えてください（https://github.com/Mako-th/HiganRTool/issues）。",
                 en: "Could not open the folder picker ({why}). Nothing was started. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with this message and the files in the logs folder."
             ),
         }

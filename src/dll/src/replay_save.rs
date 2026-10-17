@@ -124,6 +124,7 @@ pub struct NetView {
     /// 起動のときの設定でなくこの値をフォルダ名と印の「自分」にする。
     pub own_name: Name,
     pub peer_name: Name,
+    /// 今の D（`cur_delay`）。リプレイの `lat` はこれを毎 tick 数えた `DTally`（マッチで最も長く使った D）から決める。
     pub delay: u8,
     pub rtt_ms: Option<u32>,
     /// 同期ズレでマッチを止めた（`NetPlay::stop_flags` が 0 でない。Esc で戻った後も立ったまま）。
@@ -161,7 +162,7 @@ impl NetView {
                 seat: c.seat(),
                 own_name: c.established().own_name,
                 peer_name: c.established().peer_name,
-                delay: c.seg_delay(),
+                delay: c.cur_delay(),
                 rtt_ms: c.liveness().rtt_ms(),
                 desynced: np.stop_flags() != 0,
                 rb_ready: np.rollback_ready(),
@@ -732,6 +733,40 @@ pub enum Attempt {
     Retry(Skip),
 }
 
+/// D の値の数（`frame::MAX_DELAY` = 9 まで）。範囲の外は最後の箱に入れる。
+const D_BUCKETS: usize = 16;
+
+/// マッチのフレームごとの D の数え。seg の始まりの D は、マッチの途中で D を上げると実際の D と合わない
+/// （つながりの最初に上げたマッチで始まりの D の 1 が `lat` に入った）ので、`lat` はフレームの数が最も多い D にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DTally {
+    frames: [u32; D_BUCKETS],
+}
+
+impl DTally {
+    const fn new() -> Self {
+        DTally {
+            frames: [0; D_BUCKETS],
+        }
+    }
+
+    fn note(&mut self, d: u8) {
+        let i = usize::from(d).min(D_BUCKETS - 1);
+        self.frames[i] = self.frames[i].saturating_add(1);
+    }
+
+    /// フレームの数が最も多い D。同数なら大きい方（遅れが大きい方が体感に効く）。1 フレームも数えていなければ `None`。
+    fn most_used(&self) -> Option<u8> {
+        let mut best: Option<(u32, usize)> = None;
+        for (d, &n) in self.frames.iter().enumerate() {
+            if n > 0 && best.is_none_or(|(m, _)| n >= m) {
+                best = Some((n, d));
+            }
+        }
+        best.map(|(_, d)| d as u8)
+    }
+}
+
 #[derive(Debug)]
 pub struct Driver {
     gate: SaveGate,
@@ -739,6 +774,8 @@ pub struct Driver {
     disabled: bool,
     /// 今の seg（マッチ）の記録: ラウンドの境目・ping・止まった数。`gate.epoch()` が替わったら捨てる。
     log: MatchLog,
+    /// 今の seg の D ごとのフレームの数（`lat` の元）。`log` と同じ時に捨てる。
+    d_tally: DTally,
     epoch: u32,
 }
 
@@ -755,6 +792,7 @@ impl Driver {
             last_info: None,
             disabled: false,
             log: MatchLog::new(),
+            d_tally: DTally::new(),
             epoch: 0,
         }
     }
@@ -774,6 +812,7 @@ impl Driver {
         if epoch != self.epoch {
             self.epoch = epoch;
             self.log.begin_seg();
+            self.d_tally = DTally::new();
         }
         if !scene.in_match || scene.loading || io.game_mode() != GAME_MODE_MATCH {
             return;
@@ -785,6 +824,7 @@ impl Driver {
         }
         if let Some(n) = net {
             self.log.sample(n.rtt_ms, Some(n.sample()));
+            self.d_tally.note(n.delay);
         }
         if !net.is_some_and(|n| n.rb_ready) {
             let completed = io.completed_rounds();
@@ -944,7 +984,7 @@ impl Driver {
             rng_restored: after_restore == before,
             result,
             side,
-            lat: net.map_or(0, |n| n.delay),
+            lat: net.map_or(0, |n| self.d_tally.most_used().unwrap_or(n.delay)),
             ping_ms: net.and_then(|n| n.rtt_ms).unwrap_or(0),
             at: t,
             duration_us: u32::try_from(t1.saturating_sub(t0)).unwrap_or(u32::MAX),
@@ -2388,6 +2428,86 @@ pub(crate) mod tests {
         let a1 = crate::test_alloc::count();
         assert_eq!(g.calls, 1, "保存の経路を通っていない");
         assert_eq!(a1, a0, "ゲームのスレッドの経路で確保した");
+    }
+
+    fn net_view_at(delay: u8) -> NetView {
+        NetView {
+            seat: Seat::P1,
+            own_name: Name::new("o"),
+            peer_name: Name::new("p"),
+            delay,
+            rtt_ms: None,
+            desynced: false,
+            rb_ready: false,
+            rollback: false,
+            match_no: 1,
+            totals: NetTotals::default(),
+        }
+    }
+
+    #[test]
+    fn d_tally_picks_the_most_frames_and_the_larger_on_a_tie() {
+        let mut t = DTally::new();
+        assert_eq!(t.most_used(), None);
+        for _ in 0..3 {
+            t.note(1);
+        }
+        t.note(4);
+        assert_eq!(t.most_used(), Some(1));
+        t.note(4);
+        t.note(4);
+        assert_eq!(t.most_used(), Some(4));
+        // 同数なら大きい D。
+        let mut t = DTally::new();
+        for d in [2, 5, 2, 5] {
+            t.note(d);
+        }
+        assert_eq!(t.most_used(), Some(5));
+        // 範囲の外の D でも添字を外さない。
+        t.note(200);
+        assert!(t.most_used().is_some());
+    }
+
+    // 何が壊れたら落ちるか: `lat` が seg の始まりの D や保存のときの D に戻る（始まりの D が 1 で、すぐ 3 に上げたマッチが `lat = 1` と
+    // 書かれた）。保存の tick の D（5）はマッチの大半（3）と違う値にしてある。
+    #[test]
+    fn lat_is_the_d_used_for_most_of_the_match() {
+        let h = Handoff::new();
+        ready(&h);
+        let mut d = Driver::new();
+        let mut g = FakeGame::default();
+        for _ in 0..5 {
+            d.tick(&h, &mut g, Some(net_view_at(1)));
+        }
+        for _ in 0..50 {
+            d.tick(&h, &mut g, Some(net_view_at(3)));
+        }
+        g.menu = 1;
+        for _ in 0..MENU_SETTLE_TICKS {
+            d.tick(&h, &mut g, Some(net_view_at(5)));
+        }
+        assert_eq!(h.state(), ST_USED);
+        assert_eq!(h.read_record().expect("記録").lat, 3);
+    }
+
+    #[test]
+    fn the_d_tally_starts_over_with_each_seg() {
+        let h = Handoff::new();
+        ready(&h);
+        let mut d = Driver::new();
+        let mut g = FakeGame::default();
+        for _ in 0..20 {
+            d.tick(&h, &mut g, Some(net_view_at(2)));
+        }
+        assert_eq!(d.d_tally.most_used(), Some(2));
+        // 場面 2 を抜けて戻る = 次の seg。
+        g.req = 10;
+        d.tick(&h, &mut g, Some(net_view_at(2)));
+        g.req = SCENE_MATCH;
+        for _ in 0..3 {
+            d.tick(&h, &mut g, Some(net_view_at(7)));
+        }
+        assert_eq!(d.d_tally.most_used(), Some(7), "前の seg の数が残った");
     }
 
     #[test]

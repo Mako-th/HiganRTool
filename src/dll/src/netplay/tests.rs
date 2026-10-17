@@ -139,6 +139,19 @@ fn games(frames: u32, segs: u32, sessions: u32) -> (FakeGame, FakeGame) {
     (ga, gb)
 }
 
+/// 壊れたら落ちる: VPN の印が `NetStatus` の語に載らない（VPN の実行の外側の欄が「外側」のまま）、VPN でない実行に印が残る。
+#[test]
+fn the_vpn_mark_of_the_session_reaches_the_snapshot() {
+    const F: u32 = 60;
+    let (mut a, mut b, clock) = pair(CheckSource::Game, games(F, 1, 1));
+    run(&mut a, &mut b, &clock, 20_000);
+    let st = crate::net_watch::NetStatus::new();
+    st.publish(&a.np, true);
+    assert!(st.snapshot().vpn, "VPN の印が載らない");
+    st.publish(&a.np, false);
+    assert!(!st.snapshot().vpn, "VPN でない実行に印が残る");
+}
+
 #[test]
 fn the_log_line_carries_the_input_counts_in_delay_mode() {
     const F: u32 = 60;
@@ -146,7 +159,7 @@ fn the_log_line_carries_the_input_counts_in_delay_mode() {
     run(&mut a, &mut b, &clock, 20_000);
     for s in [&a, &b] {
         let st = crate::net_watch::NetStatus::new();
-        st.publish(&s.np);
+        st.publish(&s.np, false);
         let snap = st.snapshot();
         let c = s.np.connected().unwrap().counts();
         assert!(c.input_accepted > 10, "検査が素通り: {c:?}");
@@ -157,6 +170,66 @@ fn the_log_line_carries_the_input_counts_in_delay_mode() {
         let want = format!("INPUT の受信ソケット: 受理 {} /", c.input_accepted);
         assert!(snap.text().contains(&want), "{}", snap.text());
     }
+}
+
+/// 壊れたら落ちる: 内訳・選択の食い違い・PONG の数が `NetStatus` の語に載らない（語の位置のずれ・書き忘れ）、
+/// 食い違いを数えない / 両者で数が違う / 食い違ったマップでホストの値を採らない。
+#[test]
+fn the_snapshot_carries_the_stall_split_the_selection_counts_and_the_pong_count() {
+    const F: u32 = 60;
+    let (ga, mut gb) = games(F, 1, 1);
+    gb.select_map = 2;
+    let (mut a, mut b, clock) = pair(CheckSource::Game, (ga, gb));
+    run(&mut a, &mut b, &clock, 20_000);
+    for s in [&a, &b] {
+        let st = crate::net_watch::NetStatus::new();
+        st.publish(&s.np, false);
+        let snap = st.snapshot();
+        let stats = s.np.stats();
+        assert_eq!(u64::from(snap.stalls), stats.stalls);
+        assert_eq!(
+            (
+                u64::from(snap.stalls_sync),
+                u64::from(snap.stalls_ahead),
+                u64::from(snap.stalls_boundary),
+                u64::from(snap.stalls_other),
+                u64::from(snap.stalls_peer)
+            ),
+            (
+                stats.stalls_sync,
+                stats.stalls_ahead,
+                stats.stalls_boundary,
+                stats.stalls_other,
+                stats.stalls_peer
+            )
+        );
+        assert_eq!(
+            (
+                snap.selects_agreed,
+                snap.select_diff_map,
+                snap.select_diff_difficulty,
+                snap.select_diff_digest
+            ),
+            (1, 1, 0, 0),
+            "マップだけ食い違った 1 回の合意: {stats:?}"
+        );
+        let pongs =
+            s.np.connected()
+                .unwrap()
+                .liveness()
+                .counters()
+                .pongs_received;
+        assert!(pongs > 3, "検査が素通り: PONG {pongs}");
+        assert_eq!(snap.rtt_pongs, pongs);
+    }
+    // 食い違ったマップはホストの値を採って続く（A の値は 1、B の値は 2）。
+    let a_is_host = a.np.connected().unwrap().role() == higanr_core::selection::Role::Host;
+    let want = if a_is_host { 1 } else { 2 };
+    assert_eq!(
+        (a.g.agreed[0].1.map, b.g.agreed[0].1.map),
+        (want, want),
+        "ホストの値を採っていない"
+    );
 }
 
 #[test]
@@ -213,6 +286,15 @@ fn a_pair_plays_the_same_frames_through_rematch_and_back_to_menu() {
     );
     assert!(a.np.stats().hold_frames > 100, "{:?}", a.np.stats());
     assert!(b.np.stats().stalls > 20, "{:?}", b.np.stats());
+    // stall の内訳（delay 方式は相手の入力待ちだけ）の和が stall の数と同じ。
+    for s in [&a, &b] {
+        let st = s.np.stats();
+        assert_eq!(
+            (st.stalls_split_sum(), st.stalls_peer),
+            (st.stalls, st.stalls),
+            "{st:?}"
+        );
+    }
     // リプレイの印の通信の要約: delay 方式は止まった数（描画だけにしたフレーム）をそのまま、進め直しは 0 で渡す。
     let v = crate::replay_save::NetView::of(&b.np).expect("つながっていた接続");
     assert_eq!(v.totals.stalls, b.np.stats().stalls);
@@ -413,7 +495,7 @@ fn a_desync_leaves_both_checks_in_the_status_and_the_summary() {
     run(&mut a, &mut b, &clock, 20_000);
     for (who, s, other) in [("A", &a, &b), ("B", &b, &a)] {
         let st = NetStatus::new();
-        st.publish(&s.np);
+        st.publish(&s.np, false);
         let snap = st.snapshot();
         let (local, remote) = snap
             .desync
@@ -482,7 +564,7 @@ fn a_desync_leaves_both_checks_in_the_status_and_the_summary() {
     let (mut a, mut b, clock) = pair(CheckSource::Game, (ga, gb));
     run(&mut a, &mut b, &clock, 20_000);
     let st = NetStatus::new();
-    st.publish(&a.np);
+    st.publish(&a.np, false);
     assert_eq!(st.snapshot().desync, None);
     assert!(st.snapshot().desync_line().is_none());
 }
@@ -583,7 +665,7 @@ fn ctrl_in_the_match_word_reaches_both_seats_on_both_sides_and_enter_does_not() 
             assert_eq!((r.p1 | r.p2) & 0x1000, 0, "{who}: Enter が残った {r:?}");
         }
         let st = crate::net_watch::NetStatus::new();
-        st.publish(&s.np);
+        st.publish(&s.np, false);
         assert_eq!(st.snapshot().desync, None, "{who}");
     }
 }
@@ -1500,8 +1582,8 @@ fn head_wait_moves_the_wait_before_the_input_and_never_changes_the_frames() {
         crate::net_watch::NetStatus::new(),
         crate::net_watch::NetStatus::new(),
     );
-    on_log.publish(&a1.np);
-    off_log.publish(&a0.np);
+    on_log.publish(&a1.np, false);
+    off_log.publish(&a0.np, false);
     let want = format!(
         "先頭で待つ: 有効（上限 {HEAD_WAIT_CAP_US} µs。ウィンドウ（b-spin / b）は格子の後、全画面（ゲーム自身の時計）はゲームがフレームを始める見込みの回だけ。rollback のモードでは待たない）/ 先頭で待った回 {} / 合計 {} µs / 上限に当たった回 0",
         st.head_waits, st.head_wait_us_total
@@ -1894,7 +1976,7 @@ fn a_check_mismatch_stops_the_match_on_both_sides_and_the_game_stays_frozen() {
     );
     assert_eq!(a.np.stats().stop_played, a.np.stats().played);
     let st = crate::net_watch::NetStatus::new();
-    st.publish(&a.np);
+    st.publish(&a.np, false);
     let snap = st.snapshot();
     let line = snap.stop_line().expect("止めた行が無い");
     assert!(
@@ -1956,7 +2038,7 @@ fn a_peer_desync_bye_stops_this_side_too_and_the_spectators_get_the_end() {
     }
     assert_eq!(last, Some(Record::End(ByeReason::Desync)));
     let st = crate::net_watch::NetStatus::new();
-    st.publish(&b.np);
+    st.publish(&b.np, false);
     let line = st.snapshot().stop_line().unwrap();
     assert!(line.contains("相手の BYE(同期ズレ) を受けた"), "{line}");
 }
@@ -2000,7 +2082,7 @@ fn esc_returns_a_stopped_match_to_local_only_after_the_key_was_seen_up() {
     assert!(a.np.relink_due(10_000_000, (SCENE_MENU, 0), 0));
     assert!(!b.np.relink_due(10_000_000, (SCENE_MENU, 0), 0));
     let st = crate::net_watch::NetStatus::new();
-    st.publish(&a.np);
+    st.publish(&a.np, false);
     let line = st.snapshot().stop_line().unwrap();
     assert!(line.contains("Esc で戻った"), "{line}");
 }
@@ -2170,8 +2252,32 @@ fn esc_cuts_only_while_the_notice_is_shown_and_after_it_was_seen_up() {
     tick_a_while_b_only_tends(&mut a, &mut b, &clock);
     assert_eq!(a.np.end(), None, "離しただけで切った");
     a.g.esc_down = true;
-    let act = tick_a_while_b_only_tends(&mut a, &mut b, &clock);
-    assert_eq!(act, Action::RenderOnly, "Esc の tick はそのまま描画だけ");
+    let pressed_ms = clock.get() / 1_000;
+    let max_ticks = u64::from(peer_wait::ESC_HOLD_MS) * 1_000 / FRAME_US + 600;
+    let mut held_ms = None;
+    for _ in 0..max_ticks {
+        let act = tick_a_while_b_only_tends(&mut a, &mut b, &clock);
+        assert_eq!(
+            act,
+            Action::RenderOnly,
+            "Esc を押している間はそのまま描画だけ"
+        );
+        if a.np.end().is_some() {
+            held_ms = Some(clock.get() / 1_000 - pressed_ms);
+            break;
+        }
+    }
+    let held_ms = held_ms.expect("押し続けても切れない");
+    // 画面の文が「3秒長押し」と言うので、3 秒は定数からでなく文から決める。
+    assert!(
+        higanr_core::net_menu::T_PEER_WAIT
+            .ja
+            .contains("Escを3秒長押し")
+    );
+    assert!(
+        (3_000..3_050).contains(&held_ms),
+        "Esc を {held_ms} ms 押して切れた"
+    );
     assert_eq!(a.np.end(), Some(End::Closed(ByeReason::Cancelled)));
     assert_eq!(a.np.stats().peer_wait_esc, 1);
     assert_eq!(

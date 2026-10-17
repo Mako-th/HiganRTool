@@ -87,6 +87,7 @@ pub mod ui_layout;
 pub mod update;
 pub mod upnp;
 pub mod vault;
+pub mod vpn_net;
 pub mod watch_list;
 pub mod window_size;
 pub mod wire;

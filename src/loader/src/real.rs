@@ -555,7 +555,7 @@ pub fn set_clipboard_text(text: &str, lang: Lang) -> Result<(), String> {
 
     if text.contains('\0') {
         return Err(match lang {
-            Lang::Ja => "字の途中に0がある",
+            Lang::Ja => "文字の途中に0があります",
             Lang::En => "the text contains a NUL character",
         }
         .to_string());

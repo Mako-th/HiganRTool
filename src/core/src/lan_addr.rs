@@ -8,6 +8,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::guard::{self, Scope};
 use crate::room_input::{Edit, TextKey, classify_by};
+use crate::vpn_net::VpnSet;
 
 /// ポートを省いたときのポート。ホストが待つポートの既定でもある（ゲームの受信ソケットの既定 `bind = auto:17723` と同じ数）。
 pub const DEFAULT_PORT: u16 = 17723;
@@ -151,6 +152,10 @@ impl AddrBuf {
     pub fn parse(&self) -> Result<LanAddr, AddrWhy> {
         parse(self.as_str())
     }
+
+    pub fn parse_with(&self, vpn: &VpnSet) -> Result<LanAddr, AddrWhy> {
+        parse_with(self.as_str(), vpn)
+    }
 }
 
 /// 打ったアドレスを断る理由。
@@ -161,12 +166,29 @@ pub enum AddrWhy {
     Form,
     /// ポートが 1〜65535 でない。
     Port,
-    /// LAN のアドレス（私設・リンクローカル。試験用に loopback も）でない。
+    /// LAN のアドレス（私設・リンクローカル・自分の PC の VPN のネットワークの中。試験用に loopback も）でない。
     NotLan,
 }
 
-/// 打ったアドレスを読む。`IPv4` か `IPv4:ポート`（前後の空白は除く）。ポートを省けば `DEFAULT_PORT`。
+/// 打ったアドレスを読む。`IPv4` か `IPv4:ポート`（前後の空白は除く）。ポートを省けば `DEFAULT_PORT`。LAN の範囲の外は `NotLan`。
 pub fn parse(s: &str) -> Result<LanAddr, AddrWhy> {
+    parse_with(s, &VpnSet::NONE)
+}
+
+/// `parse` に、自分の PC の VPN のネットワーク `vpn` の中のアドレスも通すもの。
+pub fn parse_with(s: &str, vpn: &VpnSet) -> Result<LanAddr, AddrWhy> {
+    let a = parse_form(s)?;
+    let in_lan = guard::reach(core::net::IpAddr::V4(a.ip)).is_some_and(|r| r <= Scope::Lan);
+    if in_lan || vpn.find(a.ip).is_some() {
+        Ok(a)
+    } else {
+        Err(AddrWhy::NotLan)
+    }
+}
+
+/// 形とポートだけを確かめ、範囲は見ない（どの範囲でも使えないアドレス = 未指定・マルチキャスト・ブロードキャスト・0.x は `NotLan`）。
+/// ini の `lan_host` は VPN の範囲のアドレスも書かれるが、VPN がつながっているかは起動のときに分からないので、これで読む。
+pub fn parse_form(s: &str) -> Result<LanAddr, AddrWhy> {
     let t = s.trim();
     if t.is_empty() {
         return Err(AddrWhy::Empty);
@@ -188,7 +210,7 @@ pub fn parse(s: &str) -> Result<LanAddr, AddrWhy> {
             }
         }
     };
-    if !guard::reach(core::net::IpAddr::V4(ip)).is_some_and(|r| r <= Scope::Lan) {
+    if guard::reach(core::net::IpAddr::V4(ip)).is_none() {
         return Err(AddrWhy::NotLan);
     }
     Ok(LanAddr { ip, port })
@@ -299,6 +321,83 @@ mod tests {
         }
         // 試験のための loopback は通す。
         assert!(parse("127.0.0.1:47001").is_ok());
+    }
+
+    fn vpn(nets: &[(&str, u8)]) -> VpnSet {
+        VpnSet::from_nets(
+            nets.iter()
+                .map(|(a, p)| crate::vpn_net::Net4::new(a.parse().unwrap(), *p).unwrap()),
+        )
+    }
+
+    /// 壊れたら落ちる: 自分の PC の VPN のネットワークの中のアドレスを断る、ネットワークの外（隣の /8・同じ /8 の別の /24・ネットワークのアドレス・
+    /// ブロードキャスト）を通す、VPN のネットワークが無いときに世界のアドレスを通す（今までの `parse` と変わる）、LAN の外の理由が替わる、
+    /// 形・ポートの断りが範囲の断りに負ける。
+    #[test]
+    fn an_address_inside_my_vpn_network_is_a_lan_address_and_nothing_else_outside_is() {
+        let set = vpn(&[("26.1.2.3", 8), ("25.9.9.9", 8), ("28.7.7.9", 24)]);
+        for (text, ok) in [
+            ("26.12.34.56", true),
+            ("26.0.0.1:19000", true),
+            ("25.255.255.254", true),
+            ("28.7.7.1", true),
+            ("26.0.0.0", false),
+            ("26.255.255.255", false),
+            ("27.0.0.1", false),
+            ("24.255.255.254", false),
+            ("28.7.6.1", false),
+            ("28.7.8.1", false),
+            ("28.7.7.0", false),
+            ("28.7.7.255", false),
+            ("8.8.8.8", false),
+            ("100.64.0.1", false),
+            ("192.168.0.2", true),
+            ("10.0.0.5:19000", true),
+            ("127.0.0.1", true),
+        ] {
+            let got = parse_with(text, &set);
+            assert_eq!(got.is_ok(), ok, "{text}: {got:?}");
+            if !ok {
+                assert_eq!(got, Err(AddrWhy::NotLan), "{text}");
+            }
+            // VPN のネットワークが無ければ、今までどおり私設と loopback だけ。
+            assert_eq!(
+                parse(text).is_ok(),
+                text.starts_with("192.168.") || text.starts_with("10.") || text.starts_with("127."),
+                "{text}"
+            );
+        }
+        // 形とポートの断りは、範囲より先。
+        assert_eq!(parse_with("26.1.2.3:0", &set), Err(AddrWhy::Port));
+        assert_eq!(parse_with("26.1.2", &set), Err(AddrWhy::Form));
+        assert_eq!(parse_with("", &set), Err(AddrWhy::Empty));
+        // 入力の欄から（`AddrBuf::parse_with`）。
+        let i = typed("26.1.2.3");
+        assert_eq!(i.text().parse(), Err(AddrWhy::NotLan));
+        assert_eq!(i.text().parse_with(&set).map(|a| a.port), Ok(DEFAULT_PORT));
+    }
+
+    /// 壊れたら落ちる: ini の `lan_host` に書かれた VPN のアドレスが、VPN がつながる前の起動で断られる（読めない行の注が出る）、
+    /// 形・ポート・どの範囲でも使えないアドレス（未指定・マルチキャスト・ブロードキャスト）まで通る。
+    #[test]
+    fn the_form_check_keeps_any_usable_address_for_the_ini_and_refuses_the_rest() {
+        assert_eq!(parse_form("26.12.34.56:19000").map(|a| a.port), Ok(19000));
+        assert_eq!(parse_form("8.8.8.8").map(|a| a.port), Ok(DEFAULT_PORT));
+        assert_eq!(
+            parse_form("192.168.0.2").map(|a| a.ip),
+            Ok(ip(192, 168, 0, 2))
+        );
+        for (text, why) in [
+            ("0.0.0.0", AddrWhy::NotLan),
+            ("224.0.0.1", AddrWhy::NotLan),
+            ("255.255.255.255", AddrWhy::NotLan),
+            ("0.1.2.3", AddrWhy::NotLan),
+            ("26.1.2.3:0", AddrWhy::Port),
+            ("26.1.2", AddrWhy::Form),
+            ("", AddrWhy::Empty),
+        ] {
+            assert_eq!(parse_form(text), Err(why), "{text:?}");
+        }
     }
 
     #[test]

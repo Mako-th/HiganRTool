@@ -25,7 +25,7 @@
 ほかのモジュールは`#![forbid(unsafe_code)]`です。
 
 - **照合と設置**: `th09_addr.rs`（花映塚のアドレスと期待バイト列。この値はここの1か所にだけ置きます）・`sites.rs`・`probe.rs`・`session.rs`・`hook.rs`・`detour.rs`・`hook_win.rs`・`stub.rs`・`win.rs`。
-- **ネットワーク**: `net_udp.rs`（UDPのソケット・受信スレッド・接続してよいアドレスの範囲）・`net_ring.rs`（受信スレッドからゲームのスレッドへの受け渡し）・`net_win.rs`（相手を待つ待ち）・`upnp.rs`・`adapters_win.rs`・`lan_link.rs`。
+- **ネットワーク**: `net_udp.rs`（UDPのソケット・受信スレッド・接続してよいアドレスの範囲）・`net_ring.rs`（受信スレッドからゲームのスレッドへの受け渡し）・`net_win.rs`（相手を待つ待ち）・`upnp.rs`・`adapters_win.rs`・`lan_link.rs`・`vpn_snap.rs`（自分のPCのVPNのネットワークの控え）。
 - **対戦**: `netplay.rs`と`netplay/`（入力の地点の判断。delay方式とrollback方式・相手を待つ間の切断）・`net_game.rs`（ゲームのメモリの読み書き）・`net_select.rs`と`net_portrait.rs`（キャラ選択などの画面の同期）・`rollback_play.rs`と`rollback_play_win.rs`と`rollback_resim.rs`と`rollback_draw.rs`（rollbackのための状態の保存と進め直し）・`digit_keys.rs`と`digit_keys_win.rs`（Ctrl＋数字などのキー）・`shot_key.rs`と`shot_key_win.rs`（ネット対戦の間も自分のPCにだけ撮るスクリーンショット）・`match_events.rs`。
 - **接続コードとルームサーバー**: `net_code.rs`・`net_code_game.rs`・`clipboard.rs`と`clipboard_win.rs`・`net_room.rs`と`room_win.rs`（WinHTTPのWebSocket）・`watch_feed.rs`（観戦の一覧）。
 - **観戦**: `spectate_host.rs`と`spectate_ring.rs`と`spectate_offer.rs`（配る側）・`spectate_watch.rs`と`spectate_join.rs`と`spectate_watch_code.rs`（観戦者の側）。

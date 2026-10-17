@@ -289,8 +289,15 @@ impl NetPlay {
                         st.set_redirect(mem, false);
                         self.rb_abort(RbAbort::CoreFault);
                     }
-                    Step::Wait(_) => {
+                    Step::Wait(why) => {
                         self.stats.stalls = self.stats.stalls.saturating_add(1);
+                        let kind = match why {
+                            Wait::Sync => &mut self.stats.stalls_sync,
+                            Wait::Ahead => &mut self.stats.stalls_ahead,
+                            Wait::Boundary => &mut self.stats.stalls_boundary,
+                            Wait::NotCaptured | Wait::Fault => &mut self.stats.stalls_other,
+                        };
+                        *kind = kind.saturating_add(1);
                         self.stall_run = self.stall_run.saturating_add(1);
                         self.stats.max_stall_run = self.stats.max_stall_run.max(self.stall_run);
                         if timed_out && self.peer_finished {

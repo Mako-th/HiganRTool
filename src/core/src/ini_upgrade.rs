@@ -20,7 +20,10 @@ use crate::ini::{self, Ini, strip_comment};
 
 /// これまでに配った版の配る ini（値の比べ先）。配る版を上げるときは、直前に配った版の `scripts/dist/HiganRTool.ini` を
 /// `ini_templates/` へ足して、ここへ 1 行足す（足し忘れは `every_old_template_file_is_listed` が落とす）。
-pub const OLD_TEMPLATES: [&str; 1] = [include_str!("ini_templates/v1.0.0.ini")];
+pub const OLD_TEMPLATES: [&str; 2] = [
+    include_str!("ini_templates/v1.0.0.ini"),
+    include_str!("ini_templates/v1.1.0.ini"),
+];
 
 /// 節とキー（どちらも小文字）。値は持たない（名前・ゲームのパスを文に出さないため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -677,16 +680,18 @@ lang = auto
         assert!(r.is_safe() && r.lost.is_empty(), "{r:?}");
     }
 
-    // 壊れたら落ちる: 配った v1.0.0 の配る ini の値のままの ini が、新しい配る ini の形・値にならない。
+    // 壊れたら落ちる: これまでに配った配る ini の値のままの ini が、新しい配る ini の形・値にならない。
     #[test]
-    fn the_v1_0_0_shipped_ini_upgrades_to_the_current_shipped_ini() {
+    fn every_shipped_ini_upgrades_to_the_current_shipped_ini() {
         let v100 = OLD_TEMPLATES[0];
         let dist = crate::ini_store::dist_ini_text();
-        let r = upgrade_known(&dist, v100);
-        assert!(r.is_safe(), "{r:?}");
-        assert_eq!(r.text, dist);
-        assert!(r.carried.is_empty(), "{r:?}");
-        assert!(!r.kept.is_empty(), "{r:?}");
+        for old in OLD_TEMPLATES {
+            let r = upgrade_known(&dist, old);
+            assert!(r.is_safe(), "{r:?}");
+            assert_eq!(r.text, dist);
+            assert!(r.carried.is_empty(), "{r:?}");
+            assert!(!r.kept.is_empty(), "{r:?}");
+        }
         // 新しい版が既定値を変えたとして、v1.0.0 のままの値が新しい値になる。
         let changed = dist.replace("\r\nupnp = on\r\n", "\r\nupnp = off\r\n");
         assert_ne!(changed, dist);

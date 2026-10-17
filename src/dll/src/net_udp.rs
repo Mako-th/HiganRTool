@@ -1020,6 +1020,11 @@ impl GameNet {
         self.sock.local_addr().ok()
     }
 
+    /// VPN の範囲（`Scope::LanVpn`）で開いたか。外側の候補の欄を「VPN」と書くかの判断に使う。
+    pub fn is_vpn(&self) -> bool {
+        matches!(self.scope, Scope::LanVpn(_))
+    }
+
     #[cfg(test)]
     pub fn recv_timeout(&self) -> Option<Duration> {
         self.sock.read_timeout().ok().flatten()
@@ -2038,6 +2043,18 @@ mod tests {
         assert!(open_for_code(lo(0)).is_ok());
     }
 
+    /// 壊れたら落ちる: VPN の範囲で開いた受信ソケットが VPN の印を持たない、範囲 lan の受信ソケットに VPN の印が付く。
+    #[test]
+    fn only_a_vpn_scope_socket_says_it_is_vpn() {
+        let _g = socket_lock();
+        let net = higanr_core::vpn_net::Net4::new(Ipv4Addr::new(127, 0, 0, 4), 30).unwrap();
+        let peer = SocketAddr::from(([127, 0, 0, 2], 40_000));
+        let (vpn, _t1) = open_scoped(Scope::LanVpn(net), lo(0), &[peer]).unwrap();
+        assert!(vpn.is_vpn(), "VPN の範囲で開いたのに印が無い");
+        let (plain, _t2) = open_scoped(Scope::Lan, lo(0), &[peer]).unwrap();
+        assert!(!plain.is_vpn(), "範囲 lan に VPN の印が付いた");
+    }
+
     #[test]
     fn gate_follows_the_scope_it_was_opened_with() {
         let _g = socket_lock();
@@ -2069,6 +2086,7 @@ mod tests {
                 Scope::Loopback => lan,
                 Scope::Lan => wan,
                 Scope::Internet => mcast,
+                Scope::LanVpn(_) => unreachable!("この表に LanVpn は無い"),
             };
             let e = net.stun_query(outside).unwrap_err();
             let named = format!("scope = {}", scope.name());
@@ -2080,6 +2098,64 @@ mod tests {
             net.send(outside, b"x");
             assert_eq!((net.send_counts(), net.send_refused()), ((0, 0), 1));
         }
+    }
+
+    /// 壊れたら落ちる: VPN のネットワークを足した範囲で開いたソケットが、そのネットワークの中の相手を断る（候補の検査・送る直前のガードの両方）、
+    /// ネットワークの外（隣の /8・ネットワークのアドレスとブロードキャスト・世界のアドレス）を通す、lan の分（私設・loopback）を落とす、
+    /// 送る直前のガードの拒否が数えられず外へ出る。開く範囲が lan のソケットは VPN のアドレスを今までどおり断る。
+    /// 通るアドレスへは送らない（`may_send` は判定だけ。26/8 は実在する世界のアドレスで、検査から外へ出さない）。
+    #[test]
+    fn a_lan_vpn_scope_passes_its_network_on_every_gate_and_a_lan_scope_does_not() {
+        let _g = socket_lock();
+        let radmin =
+            Scope::LanVpn(higanr_core::vpn_net::Net4::new([26, 1, 2, 3].into(), 8).unwrap());
+        let at = |a: [u8; 4]| SocketAddr::from((a, 40_000));
+        let (vpn, vpn_lo, vpn_hi) = (
+            at([26, 12, 34, 56]),
+            at([26, 0, 0, 0]),
+            at([26, 255, 255, 255]),
+        );
+        let (next, lan, wan, mcast) = (
+            at([27, 0, 0, 1]),
+            at([192, 168, 1, 2]),
+            at([203, 0, 113, 2]),
+            at([239, 1, 2, 3]),
+        );
+        // 開くときの宛先の検査。
+        assert!(open_scoped(radmin, lo(0), &[lo(40_000), lan, vpn]).is_ok());
+        for bad in [vpn_lo, vpn_hi, next, wan, mcast] {
+            assert!(open_scoped(radmin, lo(0), &[vpn, bad]).is_err(), "{bad}");
+        }
+        assert!(
+            open_scoped(Scope::Lan, lo(0), &[vpn]).is_err(),
+            "lan が VPN の宛先を通した"
+        );
+        // 受信ソケットのアドレスの検査（この PC に 26.x は無いので OS の bind までは行かない。ガードだけ見る）。
+        assert!(guard::check_bind(vpn, radmin, "受信ソケット").is_ok());
+        assert!(guard::check_bind(vpn, Scope::Lan, "受信ソケット").is_err());
+        assert!(guard::check_bind(vpn_lo, radmin, "受信ソケット").is_err());
+        // 送る直前のガード。
+        let (mut net, _th) = open_for_code_scoped(radmin, lo(0)).unwrap();
+        let got = [lo(40_000), lan, vpn, vpn_lo, vpn_hi, next, wan, mcast].map(|a| net.may_send(a));
+        assert_eq!(got, [true, true, true, false, false, false, false, false]);
+        assert!(
+            !net.may_send(SocketAddr::from(([26, 12, 34, 56], 0))),
+            "ポート 0"
+        );
+        for refused in [vpn_lo, vpn_hi, next, wan] {
+            net.send(refused, b"x");
+        }
+        assert_eq!((net.send_counts(), net.send_refused()), ((0, 0), 4));
+        let (mut lan_net, _th2) = open_for_code_scoped(Scope::Lan, lo(0)).unwrap();
+        assert!(
+            !lan_net.may_send(vpn),
+            "lan のソケットが VPN の宛先を通した"
+        );
+        lan_net.send(vpn, b"x");
+        assert_eq!((lan_net.send_counts(), lan_net.send_refused()), ((0, 0), 1));
+        // 受信スレッドの返信のガード（`answer` の検査は `pong_gate_tests`）が使う範囲も、開いた範囲そのもの。
+        let (_net, th) = open_for_code_scoped(radmin, lo(0)).unwrap();
+        assert_eq!(th.shared.scope, radmin);
     }
 
     #[test]
@@ -2675,6 +2751,8 @@ mod tests {
     fn nic(ip: &str, gateway: bool, metric: u32) -> Adapter {
         Adapter {
             description: "Realtek PCIe GbE Family Controller".to_string(),
+            name: "イーサネット".to_string(),
+            prefix: 24,
             if_type: 6,
             oui: [0x3C, 0x52, 0x82],
             up: true,
@@ -4171,6 +4249,30 @@ mod pong_gate_tests {
                 open_for_code_scoped(scope, SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
             assert_eq!(th.shared.scope, scope);
         }
+    }
+
+    /// 壊れたら落ちる: 受信スレッドの返信のガードが、VPN のネットワークを足した範囲の外（ネットワークのアドレス・ブロードキャスト・隣の /8・世界のアドレス）へ
+    /// 送る、範囲 lan のままの接続が VPN の宛先へ送る。通る宛先（VPN のネットワークの中）へは送らない（外へ出るため）ので、断る側だけ数える。
+    #[test]
+    fn the_receive_thread_gate_refuses_outside_a_widened_lan_scope() {
+        let radmin =
+            Scope::LanVpn(higanr_core::vpn_net::Net4::new(Ipv4Addr::new(26, 1, 2, 3), 8).unwrap());
+        let at = |a: [u8; 4]| SocketAddr::from((a, 47_001));
+        for refused in [
+            at([26, 0, 0, 0]),
+            at([26, 255, 255, 255]),
+            at([27, 0, 0, 1]),
+            at([203, 0, 113, 2]),
+        ] {
+            let (r, sent, count, _) = answer(radmin, refused);
+            assert_eq!((r, sent, count), (false, 0, 1), "{refused}");
+        }
+        let (r, sent, count, _) = answer(Scope::Lan, at([26, 12, 34, 56]));
+        assert_eq!(
+            (r, sent, count),
+            (false, 0, 1),
+            "lan の返信が VPN の宛先を通した"
+        );
     }
 
     /// 相手役の受け（口の向きの逆の鍵で開く）。
