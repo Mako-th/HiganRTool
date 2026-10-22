@@ -32,5 +32,12 @@ fn main() {
         for arg in manifest_link::link_args(&file.to_string_lossy()) {
             println!("cargo:rustc-link-arg-bins={arg}");
         }
+        // std の ProcessPrng（bcryptprimitives.dll）を最初の呼びまで遅らせる。古い Wine で読み込みの時点に落ちないため。
+        // 失敗のフックは higanr_prng_shim（real.rs の install_delay_load_hook!）。
+        println!(
+            "cargo:rustc-link-arg-bins=/DELAYLOAD:{}",
+            higanr_prng_shim::PRNG_DLL
+        );
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
     }
 }

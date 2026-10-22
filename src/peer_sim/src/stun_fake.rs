@@ -1,11 +1,7 @@
-//! 偽の STUN の応答役（検査の道具）。本物の STUN サーバーへの問い合わせは外へ出る通信なので、検査は loopback に立てた
-//! これで、dll と peer_sim の「STUN の Binding を送って受ける口」を見る。受けた Binding Request に、送り元のアドレスを
-//! XOR-MAPPED-ADDRESS に載せた Success Response を返す（本物と同じ答え方。loopback なので答えは 127.0.0.1:ポート）。組み立ては
-//! `higanr_core::stun::encode_binding_success`。既定は受信ソケットも相手も loopback だけ。
-//!
-//! ネットワークの範囲を広げる形（`spawn_in`）: 問い合わせの送り元のガードを `guard::allows(scope, 送り元)` にする。受信ソケットは `127.0.0.1` のままにできる ——
-//! `bind = auto` の dll は LAN のアドレスから送るので送り元は LAN のアドレスになるが、宛先は同じ PC の 127.0.0.1 なので、Windows のファイアウォールの
-//! 確かめは出ない。受信ソケット自体も範囲のガード（`guard::check_bind`）を通せば LAN のアドレスに開ける（範囲を広げた引数のときだけ）。
+//! 偽の STUN の応答役（検査のツール）。本物の STUN サーバーへの問い合わせは外へ出る通信なので、検査は loopback に立てたこれで、dll と peer_sim の「STUN の Binding を送って受ける口」を見る。
+//! 受けた Binding Request に、送り元のアドレスを XOR-MAPPED-ADDRESS に載せた Success Response を返す（本物と同じ答え方。loopback なので答えは 127.0.0.1:ポート）。組み立ては `higanr_core::stun::encode_binding_success`。既定は受信ソケットも相手も loopback だけ。
+//! ネットワークの範囲を広げる形（`spawn_in`）: 問い合わせの送り元のガードを `guard::allows(scope, 送り元)` にする。受信ソケットは `127.0.0.1` のままにできる —— `bind = auto` の dll は LAN のアドレスから送るので送り元は LAN のアドレスになるが、宛先は同じ PC の 127.0.0.1 なので、Windows のファイアウォールの確認のダイアログは出ない。
+//! 受信ソケット自体も範囲のガード（`guard::check_bind`）を通せば LAN のアドレスに開ける（範囲を広げた引数のときだけ）。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -17,7 +13,7 @@ use std::time::Duration;
 use higanr_core::guard::{self, Scope};
 use higanr_core::stun::{self, MAX_SUCCESS_LEN};
 
-/// 単体で起こす形（`peer_sim --stun-fake ADDR`。LAN の回で手で起こして落とす）の引数。
+/// 単体で起動する形（`peer_sim --stun-fake ADDR`。LAN の回で手で起動して落とす）の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub bind: SocketAddr,
@@ -26,7 +22,7 @@ pub struct Args {
     pub max_sec: u32,
 }
 
-/// `Args::max_sec` の既定（30 分。実機の回の `limit_min` は最長 60 分で、STUN は接続の始めに 1 回聞かれるだけなので足りる）。
+/// `Args::max_sec` の既定（30 分。実機の検証の `limit_min` は最長 60 分で、STUN は接続の始めに 1 回聞かれるだけなので足りる）。
 pub const DEFAULT_MAX_SEC: u32 = 1_800;
 
 pub const MAX_MAX_SEC: u32 = 7_200;

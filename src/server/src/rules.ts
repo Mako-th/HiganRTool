@@ -6,12 +6,8 @@ export const PROTO_PATH_PREFIX = "/v0/rooms/";
 
 /**
  * ルーム名。日本語を含む好きな文字を使える（パスには UTF-8 をパーセント符号化して載せ、ここで戻す）。
- * ルームを引く文字は ROOM_NAME_FOLD の順（NFKC → 前後の空白を除く → 小文字）に揃える。全角半角・大文字小文字・前後の空白の違いが
- * 同じルームになる。揃えるのはサーバーだけ（dll は NFKC を持たない）。
- *
- * 断るもの（400 bad_room_name）: 制御文字（Cc）・`/`（符号化を戻す途中の機器が %2F を `/` に戻すとパスが割れうる）・`.` と `..`
- * （URL のパスの読み方で消える）・揃えた後が 0 文字か 33 文字以上（HELLO の name の上限 wire::NAME_MAX = 32。コードポイントで数える）・
- * 揃える前の UTF-8 が 128 B 超（揃える手間とパスの長さの上限。dll も揃えずに確かめられる）。
+ * ルームを引く文字は ROOM_NAME_FOLD の順（NFKC → 前後の空白を除く → 小文字）に揃える。全角半角・大文字小文字・前後の空白の違いが同じルームになる。揃えるのはサーバーだけ（dll は NFKC を持たない）。
+ * 断るもの（400 bad_room_name）: 制御文字（Cc）・`/`（符号化を戻す途中の機器が %2F を `/` に戻すとパスが割れうる）・`.` と `..`（URL のパスの読み方で消える）・揃えた後が 0 文字か 33 文字以上（HELLO の name の上限 wire::NAME_MAX = 32。コードポイントで数える）・揃える前の UTF-8 が 128 B 超（揃える手間とパスの長さの上限）。
  * 文字と長さのガードは揃える前の文字で見る（dll が NFKC なしで同じ判断をできるように）。揃えて現れる `/`（全角の `／` など）は通す。
  */
 export const ROOM_NAME_MIN = 1;
@@ -37,7 +33,7 @@ const CODE_RE = /^[A-Za-z0-9_-]+$/;
 export const MESSAGE_MAX_BYTES = 2048;
 
 /**
- * ルームの期限: 最初の人が繋いでから 10 分。接続コードの期限（30 分）より短くし、待ち合わせ中にコードが切れないようにした。
+ * ルームの期限: 最初の人が接続してから 10 分。接続コードの期限（30 分）より短くし、待ち合わせ中にコードが切れないようにした。
  * 誰も来なければルーム名の打ち間違いか相手の不在と見て閉じる。
  */
 export const ROOM_TTL_MS = 10 * 60 * 1000;
@@ -46,7 +42,7 @@ export const ROOM_TTL_MS = 10 * 60 * 1000;
 export const ANSWER_TTL_MS = 60 * 1000;
 
 /**
- * ランダム対戦の待ち列のパス `/v0/random/<ビルド番号>`。ビルド番号ごとに別の待ち列にする（違うビルドどうしはつながらないため）。
+ * ランダム対戦の待ち列のパス `/v0/random/<ビルド番号>`。ビルド番号ごとに別の待ち列にする（違うビルドどうしは接続できないため）。
  * 番号は 10 進の整数 0〜4294967295 を、先頭に 0 を付けない 1 通りの書き方だけで受ける（同じ番号が 2 つの待ち列にならないように）。
  */
 export const RANDOM_PATH_PREFIX = "/v0/random/";
@@ -101,11 +97,11 @@ export const WATCH_NAME_MAX = 32;
 const WATCH_NAME_RE = /^[A-Za-z0-9_@?-]{1,32}$/;
 
 /**
- * 載せた人が生きているかの目安: 30 秒ごとの ping（Durable Object を起こさない自動応答）の最後の時刻から数える。
+ * 載せた人が生きているかの目安: 30 秒ごとの ping（Durable Object を起動しない自動応答）の最後の時刻から数える。
  * ping 3 回分に余裕を足した値を越えて何も無ければ、切れたものとして一覧から消す。
  */
 export const WATCH_STALE_MS = 100 * 1000;
-/** 繋いでから最初の post が来るまでの上限。 */
+/** 接続してから最初の post が来るまでの上限。 */
 export const WATCH_UNPOSTED_MS = 15 * 1000;
 /** 一覧の変化を観戦者へ送る最短の間隔（変化が続いても 1 秒に 1 回にまとめる。載せた人が連打して全員へ増幅されないため）。 */
 export const WATCH_BROADCAST_MIN_MS = 1000;
@@ -198,25 +194,39 @@ export function isRandomRoomName(name: string): boolean {
   return RANDOM_ROOM_RE.test(name);
 }
 
-/** ルームのエンドポイントのパス（`/v0/rooms/<名>`）から、そのルームの期限を決める。ランダム対戦の割り当てた名だけ短い。 */
-export function roomTtlForPath(pathname: string): number {
+/** ルームのエンドポイントのパス（`/v0/rooms/<名>`）の名を、入口と同じ決まりで引く形にする。決まりの外なら null。 */
+export function normalizedRoomNameOfPath(pathname: string): string | null {
   const raw = roomNameFromPath(pathname);
   const decoded = raw === null ? null : decodeRoomName(raw);
-  const name = decoded === null ? null : normalizeRoomName(decoded);
+  return decoded === null ? null : normalizeRoomName(decoded);
+}
+
+/** ルームのエンドポイントのパス（`/v0/rooms/<名>`）から、そのルームの期限を決める。ランダム対戦の割り当てた名だけ短い。 */
+export function roomTtlForPath(pathname: string): number {
+  const name = normalizedRoomNameOfPath(pathname);
   return name !== null && isRandomRoomName(name) ? RANDOM_ROOM_TTL_MS : ROOM_TTL_MS;
 }
 
 /**
- * 生存の確かめ: 待つ側が 30 秒ごとに送る文字列。完全一致でだけ Durable Object を起こさずに PONG を返す
+ * 観戦用のルーム（名の先頭 `w.`）か。引く形にした名で見る（大文字・全角でも同じルームになるので、同じ判断にする）。
+ * 利用者は `.` を打てない（クライアントの room.rs の `parse` が断る）ので、対戦のルームとは重ならない。
+ */
+export function isWatchRoomPath(pathname: string): boolean {
+  const name = normalizedRoomNameOfPath(pathname);
+  return name !== null && name.startsWith(WATCH_ROOM_PREFIX);
+}
+
+/**
+ * 生存のチェック: 待つ側が 30 秒ごとに送る文字列。完全一致でだけ Durable Object を起動せずに PONG を返す
  * （setWebSocketAutoResponse）ので、空白や鍵の順を変えない。ルームの期限は延ばさない。
  */
 export const PING_TEXT = '{"t":"ping"}';
 export const PONG_TEXT = '{"t":"pong"}';
 
 /**
- * 1 IP あたりの繋ぐ回数: 60 秒に 30 回まで（超えたら 429 と retry_after = 60）。普通は 1 マッチに 1〜2 回。
+ * 1 IP あたりの接続の回数: 60 秒に 30 回まで（超えたら 429 と retry_after = 60）。普通は 1 マッチに 1〜2 回。
  * 30 は、同じ家の複数台が 1 つの IPv4 を分け合っても足りる値（観戦の入り直しだけで 10 を超える）。
- * Rate Limiting の束縛だけでは場所ごと・結果整合で正確に数えられず、実サーバーで 2 分に 25 回以上通ったため、
+ * Rate Limiting の束縛だけでは場所ごと・結果整合で正確に数えられない（実サーバーで上限を越えて通った）ので、
  * 数える役は Durable Object に持たせた。
  */
 export const CONNECT_LIMIT_PER_MINUTE = 30;
@@ -308,12 +318,22 @@ export const Close = {
   PeerLeft: 4410,
   /** 1 通が MESSAGE_MAX_BYTES を越えた・コードが CODE_MAX_CHARS を越えた。 */
   TooLarge: 4413,
+  /** 観戦を断った host の観戦用のルームに来た観戦者（入ったときと、待っていたときの両方）。下 3 桁は 403 に揃えた。 */
+  Refused: 4403,
   BadCode: 4422,
   /** 一覧に載せられる数（全体・1 IP あたり）を越えた。 */
   ListFull: 4429,
 } as const;
 
-export type CloseName = "done" | "bad_message" | "expired" | "peer_left" | "too_large" | "bad_code" | "list_full";
+export type CloseName =
+  | "done"
+  | "bad_message"
+  | "expired"
+  | "peer_left"
+  | "too_large"
+  | "refused"
+  | "bad_code"
+  | "list_full";
 
 export const CLOSE_NAME: Record<number, CloseName> = {
   [Close.Done]: "done",
@@ -321,6 +341,7 @@ export const CLOSE_NAME: Record<number, CloseName> = {
   [Close.Expired]: "expired",
   [Close.PeerLeft]: "peer_left",
   [Close.TooLarge]: "too_large",
+  [Close.Refused]: "refused",
   [Close.BadCode]: "bad_code",
   [Close.ListFull]: "list_full",
 };
@@ -374,6 +395,8 @@ export function roomNameFromPath(pathname: string): string | null {
 export type Parsed =
   | { kind: "offer"; code: string }
   | { kind: "answer"; code: string }
+  /** 観戦を断る（観戦用のルームの host が 1 回だけ。本文は無い）。 */
+  | { kind: "refuse" }
   | { kind: "error"; close: number };
 
 /** 届いた 1 通を読む。文字・大きさ・形だけを見る（順と役割は Room が見る）。大きさを最初に見るのは、大きなものを JSON として解かないため。 */
@@ -390,6 +413,7 @@ export function parseClientMessage(data: string | ArrayBuffer): Parsed {
     return { kind: "error", close: Close.BadMessage };
   }
   const o = v as Record<string, unknown>;
+  if (o.t === "refuse") return { kind: "refuse" };
   if (o.t !== "offer" && o.t !== "answer") return { kind: "error", close: Close.BadMessage };
   const c = checkCode(o.code);
   if (c !== null) return { kind: "error", close: c };

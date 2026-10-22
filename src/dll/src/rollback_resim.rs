@@ -1,25 +1,12 @@
-//! 進め直しを 1 回の描画の中で行う形の判断（pure。unsafe 無し）: 走査の呼び方と、進め直しの間に捨てる・戻す出力（SE・BGM・文字の数）の手順。
-//! Win32・ゲームのメモリ・入口のアセンブリは `rollback_win.rs`。
+//! 進め直しを 1 回の描画の中で行う形の判断（pure。unsafe 無し）: 走査の呼び方と、進め直しの間に捨てる・戻す出力（SE・BGM・文字の数）の手順。Win32・ゲームのメモリ・入口のアセンブリは `rollback_win.rs`。
 //!
-//! 本物の rollback は 1 フレームの中で k tick を進め直す。do_frame の走査 `0x42C700`（`0x42DCA9` の call）を、書き戻しのあった
-//! フレームだけ k 回呼び、途中の回を描かない形でも k = 1・8・60 で D1 と D2 が一致するかを見る。
+//! 本物の rollback は 1 フレームの中で k tick を進め直す。do_frame の走査 `0x42C700`（`0x42DCA9` の call）を、書き戻しのあったフレームだけ k 回呼び、途中の回を描かない形でも k = 1・8・60 で D1 と D2 が一致するかを見る。手順（1 フレームの中。ゲームのスレッドで）:
+//! 1. 走査を 1 回呼ぶ（普段はこれだけで戻り値をそのまま返す）。書き戻しのフレームでは、この回の入力の地点で `Probe` が D1 をコピー、S を書き戻し、記録した 1 個目の入力ワードを feed する。
+//! 2. 走査の後、`Probe` に「あと何回呼ぶか」を聞く（`take_owed`）。呼ぶ回が残っていれば、回と回の間（走査の外。臨界区間の外）で走査を呼び直し、最後の回の前に途中の回が積んだ SE・BGM・文字の数を戻す。回の入力の地点は記録した入力ワードを順に feed する。
+//! 3. 途中の回が 1 を返したら打ち切る（普通のマッチの走査はノード数 ≥ 2 を返す。1 は「3 を返すノードで抜けた」= 場面の切替・読み込み・一時停止・描画だけの出口。0 と負の値は do_frame が `0x430230` を呼んで描画へ進まずに抜ける値）。残りは次のフレームから実時間で続ける。
 //!
-//! 手順（1 フレームの中。ゲームのスレッドで）:
-//! 1. 走査を 1 回呼ぶ（普段はこれだけで戻り値をそのまま返す）。書き戻しのフレームでは、この回の入力の地点で `Probe` が D1 をコピー、
-//!    S を書き戻し、記録した 1 個目の入力ワードを feed する。
-//! 2. 走査の後、`Probe` に「あと何回呼ぶか」を聞く（`take_owed`。書き戻しのフレームだけ `Some(k − 1)`、ほかは `None`）。
-//! 3. 呼ぶ回が残っていれば、回と回の間（走査の外。臨界区間の外）で走査を呼び直す。最後の回の前に、途中の回が積んだ SE・BGM・
-//!    文字の数を戻す。回の入力の地点は記録した入力ワードを順に feed する。
-//! 4. 途中の回が 1 を返したら打ち切る（普通のマッチの走査はノード数 ≥ 2 を返す。1 は「3 を返すノードで抜けた」= 場面の切替・読み込み・
-//!    一時停止・描画だけの出口。0 と負の値は do_frame が `0x430230` を呼んで描画へ進まずに抜ける値）。残りは次のフレームから実時間で続ける。
-//!
-//! 進め直しの間の出力: 走査の外の do_frame は 1 フレームに 1 回しか SE・BGM を鳴らさず（`0x42DCB5 call 0x43F1F0`）、描画で文字の数を
-//! 0 に戻す（`0x00431611 call 0x430220`）。途中の回は描画も鳴らしもしないので積んだ物が溜まる。
-//! - SE（`SoundManager +0x620`・`+0x650`）: 最後の回の前に id を −1・回数を 0 にする。
-//! - BGM の命令（`+0x1F88` から 0x10C × 31）: 進め直しの前（D1 の点）にバックアップし、最後の回の前に戻す。
-//! - 文字の数（`AsciiManager +0x8264`）: 同じくバックアップして戻す（戻さないと古い数字が重なり、256 本を超えた分は捨てられる）。
-//!
-//! ゲームのスレッドに確保・ロック・パニックを置かない（`SavedOutputs` は固定長。`run_scan` は `ScanIo` の呼び出しだけ）。
+//! 出力: 走査の外の do_frame は 1 フレームに 1 回しか SE・BGM を鳴らさず（`0x42DCB5 call 0x43F1F0`）、描画で文字の数を 0 に戻す（`0x00431611 call 0x430220`）。途中の回は描画も鳴らしもしないので積んだ物が溜まる。SE（`SoundManager +0x620`・`+0x650`）は最後の回の前に id を −1・回数を 0 にする。BGM の命令（`+0x1F88` から 0x10C × 31）と文字の数（`AsciiManager +0x8264`。戻さないと古い数字が重なり、256 本を超えた分は捨てられる）は、進め直しの前（D1 の点）にバックアップして戻す。
+//! ゲームのスレッドに確保・ロック・パニックを持ち込まない（`SavedOutputs` は固定長。`run_scan` は `ScanIo` の呼び出しだけ）。
 #![forbid(unsafe_code)]
 
 use crate::rollback_probe::{Outcome, TrialRecord};
@@ -51,7 +38,9 @@ impl ResimMode {
         match v {
             "realtime" => Ok(ResimMode::Realtime),
             "frame" => Ok(ResimMode::Frame),
-            _ => Err(format!("resim の値 {v:?} は realtime か frame")),
+            _ => Err(format!(
+                "resim の値 {v:?} は realtime か frame にしてください"
+            )),
         }
     }
 }
@@ -273,10 +262,8 @@ pub fn restore_full(mem: &mut dyn OutputMem, saved: &FullOutputs) -> bool {
 
 // ---- 進め直しで初めて起きた SE を遅れて鳴らす ----
 //
-// `restore_full` は進め直しの回が積んだ SE を全部捨てる。予測が外れて「相手の入力の変わり目で起きる出来事」（カットイン・被弾）は
-// 生きた tick では起きず（予測は相手の直前の確定の入力ワードの繰り返し）、進め直しの確定の回で初めて起きるので、その SE は一度も鳴らずに消えていた。
-// 直し: フレームごとに「鳴らした（積まれた）SE の id の集合」を覚え、進め直しの tick ごとに積まれた SE を読んで空にし、前後 2 フレームの
-// どこにも無い id だけを、`restore_full` の後に積み直す。次の do_frame の `0x43F1F0` が鳴らす。
+// `restore_full` は進め直しの回が積んだ SE を全部捨てる。予測が外れて「相手の入力の変わり目で起きる出来事」（カットイン・被弾）は生きた tick では起きず（予測は相手の直前の確定の入力ワードの繰り返し）、進め直しの確定の回で初めて起きるので、その SE は一度も鳴らずに消えていた。
+// 直し: フレームごとに「鳴らした（積まれた）SE の id の集合」を覚え、進め直しの tick ごとに積まれた SE を読んで空にし、前後 2 フレームのどこにも無い id だけを、`restore_full` の後に積み直す。次の do_frame の `0x43F1F0` が鳴らす。
 /// SE の id を追える上限（ビット集合の大きさ）。ゲームの表は id < 0x86 のはず（`0x43E2F0` が `+0x408 + id × 4` を書き、`+0x620` の手前の 0x218 B が表の大きさ）。
 /// 越えた id は追わず（積み直さず）数える。
 pub const SE_ID_LIMIT: u32 = 192;
@@ -285,36 +272,62 @@ pub const SE_RING: usize = 32;
 pub const SE_NEAR: u32 = 2;
 pub const SE_PENDING_CAP: usize = 32;
 
-/// 被弾音（`SE_ID_HIT`・`SE_ID_LAST_LIFE`）の鳴らし方（ini の `rollback_hit_se`）。予測で進めた tick の被弾は確定で起きなかったり位置がずれたりしうるが、
-/// 鳴らした音は取り消せないので、鳴る前に待つ。delay 方式には予測が無いので効かない。
+/// 被弾音（`SE_ID_HIT`・`SE_ID_LAST_LIFE`。ini の `rollback_hit_se`）とカットインの音（`SE_ID_CUTIN`・`SE_ID_CUTIN_SPELL`。ini の `rollback_cutin_se`）の鳴らし方。
+/// 予測で進めた tick の出来事は確定で起きなかったり位置がずれたりしうるが、鳴らした音は取り消せないので、鳴る前に待つ。delay 方式には予測が無いので効かない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HitSe {
-    /// 確定した tick の被弾だけを即座に鳴らし、未確定の tick の被弾は確定の回で初めて出たときに積み直して鳴らす。
+pub enum SeTiming {
+    /// 確定した tick の音だけを即座に鳴らし、未確定の tick の音は確定の回で初めて出たときに積み直して鳴らす。
     #[default]
     Confirmed,
-    /// 今までどおり、生きた tick の被弾を即座に鳴らす（予測が外れても取り消せない）。
+    /// 今までどおり、生きた tick の音を即座に鳴らす（予測が外れても取り消せない）。
     Live,
 }
 
-impl HitSe {
-    pub fn parse(v: &str) -> Result<HitSe, String> {
+impl SeTiming {
+    /// `key` は断るときの文に出す ini のキー。
+    pub fn parse(key: &str, v: &str) -> Result<SeTiming, String> {
         match v {
-            "confirmed" => Ok(HitSe::Confirmed),
-            "live" => Ok(HitSe::Live),
-            _ => Err(format!("rollback_hit_se の値 {v:?} は confirmed か live")),
+            "confirmed" => Ok(SeTiming::Confirmed),
+            "live" => Ok(SeTiming::Live),
+            _ => Err(format!(
+                "{key} の値 {v:?} は confirmed か live にしてください"
+            )),
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            HitSe::Confirmed => "confirmed",
-            HitSe::Live => "live",
+            SeTiming::Confirmed => "confirmed",
+            SeTiming::Live => "live",
         }
     }
 }
 
 pub const fn is_hit_se(id: u32) -> bool {
     id == SE_ID_HIT || id == SE_ID_LAST_LIFE
+}
+
+pub const fn is_cutin_se(id: u32) -> bool {
+    id == SE_ID_CUTIN || id == SE_ID_CUTIN_SPELL
+}
+
+/// 被弾音とカットインの音それぞれの鳴らし方。待たせるのは `Confirmed` の側の id だけで、ほかの SE はいつでも今までどおり。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeHold {
+    pub hit: SeTiming,
+    pub cutin: SeTiming,
+}
+
+impl SeHold {
+    /// 未確定の tick が積んだ `id` を、確定の回まで鳴らさずに待たせるか。
+    pub const fn waits(self, id: u32) -> bool {
+        (is_hit_se(id) && matches!(self.hit, SeTiming::Confirmed))
+            || (is_cutin_se(id) && matches!(self.cutin, SeTiming::Confirmed))
+    }
+
+    pub const fn any_waits(self) -> bool {
+        matches!(self.hit, SeTiming::Confirmed) || matches!(self.cutin, SeTiming::Confirmed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -559,7 +572,7 @@ pub struct SeStats {
     pub live_ids: u32,
     pub live_cutin: u32,
     pub live_spell: u32,
-    /// 進め直しの tick で積まれた SE の数（id × tick）。下の 4 つの和 ＋ 追えなかった id。確定まで待たせる被弾音の予測の回の分は数えない（確定の回で数える）。
+    /// 進め直しの tick で積まれた SE の数（id × tick）。下の 4 つの和 ＋ 追えなかった id。確定まで待たせる音（被弾音・カットインの音）の予測の回の分は数えない（確定の回で数える）。
     pub resim_ids: u32,
     /// 進め直しで初めて出た（前後 2 フレームのどこにも無かった）SE の数と、うちカットイン（0xE）・スペルカードのカットイン（0x35）。
     pub new_ids: u32,
@@ -575,14 +588,22 @@ pub struct SeStats {
     pub dropped: u32,
     pub unreadable: u32,
     pub untracked: u32,
-    pub hit_mode: HitSe,
-    /// 被弾音: 未確定の生きた tick が積んだので確定まで鳴らさずに待たせた数（`HitSe::Confirmed` のときだけ増える。`live_ids` にはこの分を数えない）。
+    pub hit_mode: SeTiming,
+    pub cutin_mode: SeTiming,
+    /// カットインの音（0xE・0x35）で確定まで待たせた数と、確定の回で対応が付いた数。どちらも 1 つの枠（id × tick）を 1 と数える（回数個の積みも 1）。
+    /// 遅れて積み直した数は `replayed_cutin` + `replayed_spell`。
+    pub cutin_waited: u32,
+    pub cutin_matched: u32,
+    /// 遅れて積み直したカットインの音だけの遅れ（`late_sum` / `late_max` と同じ定義）。
+    pub cutin_late_sum: u64,
+    pub cutin_late_max: u32,
+    /// 被弾音: 未確定の生きた tick が積んだので確定まで鳴らさずに待たせた数（`SeTiming::Confirmed` のときだけ増える。`live_ids` にはこの分を数えない）。
     pub hit_waited: u32,
     /// 確定の回が同じ出来事（前後 2 フレーム）を出して、待たせたものと対応が付いた数。待たせた数との差が、確定では起きなかった被弾音（幻）。
     pub hit_matched: u32,
     /// 遅れて積み直した被弾音の数（`replayed` のうち `is_hit_se`）。待たせたものに対応が付かなかった分は、予測では起きず確定で初めて起きた被弾。
     pub replayed_hit: u32,
-    /// `HitSe::Live` のときだけ増える。予測のうちに鳴らした被弾音の数: 未確定の生きた tick が積んだ分と、進め直しの予測の回で初めて出て記録に積めた分。
+    /// `SeTiming::Live` のときだけ増える。予測のうちに鳴らした被弾音の数: 未確定の生きた tick が積んだ分と、進め直しの予測の回で初めて出て記録に積めた分。
     /// 記録が溢れて積めなかった分は鳴らないので数えない。確定の回の突き合わせ（`hit_live_matched`）が枠ごとなので、1 つの枠（id × tick）を 1 と数える。
     pub hit_live_sounded: u32,
     /// 上のうち、確定の回が同じ出来事（前後 2 フレーム）を出して対応が付いた数。鳴らした数との差が、鳴ったのに確定では起きなかった被弾音（幻）。
@@ -617,25 +638,30 @@ pub fn note_live_se(
     }
 }
 
-/// 未確定の生きた tick（`frame`）が積んだ被弾音を、確定まで鳴らさずに待たせる（`HitSe::Confirmed`）。走査で増えた分のうち `is_hit_se` の id を引いた残りの
-/// 待ち行列を返す（呼び手がゲームの待ち行列をこの残りへ書き直す）。待たせた被弾音は `played` の待ちの記録に足し、鳴った記録（`add`）には足さない。
+/// 未確定の生きた tick（`frame`）が積んだ音のうち `hold.waits` の id を、確定まで鳴らさずに待たせる。走査で増えた分を引いた残りの
+/// 待ち行列を返す（呼び手がゲームの待ち行列をこの残りへ書き直す）。待たせた音は `played` の待ちの記録に足し、鳴った記録（`add`）には足さない。
 /// 走査の前に積まれていた分は引かない。引くものが無い・読めなかったら None。
-pub fn hold_hit_se(
+pub fn hold_se(
     played: &mut SePlayed,
     stats: &mut SeStats,
     frame: u32,
     pre: &SeQueue,
     post: &SeQueue,
+    hold: SeHold,
 ) -> Option<SeQueue> {
     if !pre.ok || !post.ok {
         return None;
     }
     let mut rest = SeQueue::EMPTY;
-    let mut held = 0u32;
+    let (mut held_hit, mut held_cutin) = (0u32, 0u32);
     for (e, c) in post.events() {
         let before = pre.count_of(e.id);
-        let (keep, pan) = if is_hit_se(e.id) && c > before {
-            held = held.saturating_add(c - before);
+        let (keep, pan) = if hold.waits(e.id) && c > before {
+            if is_hit_se(e.id) {
+                held_hit = held_hit.saturating_add(c - before);
+            } else {
+                held_cutin = held_cutin.saturating_add(1);
+            }
             if !played.hold(frame, e.id) {
                 stats.untracked = stats.untracked.saturating_add(1);
             }
@@ -651,14 +677,15 @@ pub fn hold_hit_se(
             rest.push_slot(SeEvent { id: e.id, pan }, keep);
         }
     }
-    if held == 0 {
+    if held_hit == 0 && held_cutin == 0 {
         return None;
     }
-    stats.hit_waited = stats.hit_waited.saturating_add(held);
+    stats.hit_waited = stats.hit_waited.saturating_add(held_hit);
+    stats.cutin_waited = stats.cutin_waited.saturating_add(held_cutin);
     Some(rest)
 }
 
-/// `HitSe::Live` で未確定の生きた tick が積んだ被弾音を、待たせずに（鳴る）待ちの記録にだけ覚える。確定の回が同じ出来事を出せば `sort_resim_se` が消して
+/// `SeTiming::Live` で未確定の生きた tick が積んだ被弾音を、待たせずに鳴らして、確定の回と突き合わせる記録にだけ覚える。確定の回が同じ出来事を出せば `sort_resim_se` が消して
 /// `hit_live_matched` に数える。残ったものが鳴ったのに確定では起きなかった被弾音。固定長の加算だけで確保しない。
 pub fn note_live_hit(
     played: &mut SePlayed,
@@ -683,15 +710,15 @@ pub fn note_live_hit(
 
 /// 進め直しの tick（`frame`）が積んだ SE（`q`。空にする前に読んだもの）を仕分ける: 前後 2 フレームのどこにも無い id は新しいので記録に足して積み直しの列へ、あるものは抑える。
 ///
-/// `hit` が `Confirmed` のとき、被弾音は予測の回（`confirmed` が偽）では鳴らさず記録にも足さない。確定の回で出たものは、未確定の生きた tick が待たせたものの前後 2 フレームに
-/// あれば対応を付ける（ずれて対応が付かなくても鳴るのは確定の回の 1 回だけ）。`hit` が `Live` で予測の回に初めて出た被弾音は、記録に積めたときだけ `hit_live_sounded` に数えて待ちの記録に覚える。
+/// `hold.waits` の id（被弾音・カットインの音。`Confirmed` の側）は予測の回（`confirmed` が偽）では鳴らさず記録にも足さない。確定の回で出たものは、未確定の生きた tick が待たせたものの前後 2 フレームに
+/// あれば対応を付ける（ずれて対応が付かなくても鳴るのは確定の回の 1 回だけ）。`hold.hit` が `Live` で予測の回に初めて出た被弾音は、記録に積めたときだけ `hit_live_sounded` に数えて確定の回と突き合わせる記録に覚える。
 pub fn sort_resim_se(
     played: &mut SePlayed,
     pending: &mut SePending,
     stats: &mut SeStats,
     frame: u32,
     q: &SeQueue,
-    hit: HitSe,
+    hold: SeHold,
     confirmed: bool,
 ) {
     if !q.ok {
@@ -699,9 +726,8 @@ pub fn sort_resim_se(
     }
     pending.top = pending.top.max(frame);
     for (e, _) in q.events() {
-        let waits = hit == HitSe::Confirmed && is_hit_se(e.id);
-        // 予測の回の被弾音は新しい／抑えたのどちらにも数えない（確定の回で数える）ので `resim_ids` にも足さない。
-        if waits && !confirmed {
+        // 予測の回の待たせる音は新しい／抑えたのどちらにも数えない（確定の回で数える）ので `resim_ids` にも足さない。
+        if hold.waits(e.id) && !confirmed {
             continue;
         }
         stats.resim_ids = stats.resim_ids.saturating_add(1);
@@ -709,10 +735,16 @@ pub fn sort_resim_se(
             stats.untracked = stats.untracked.saturating_add(1);
             continue;
         }
-        if is_hit_se(e.id) && confirmed && played.take_held_near(frame, e.id, SE_NEAR) {
-            match hit {
-                HitSe::Confirmed => stats.hit_matched = stats.hit_matched.saturating_add(1),
-                HitSe::Live => stats.hit_live_matched = stats.hit_live_matched.saturating_add(1),
+        if confirmed
+            && (is_hit_se(e.id) || is_cutin_se(e.id))
+            && played.take_held_near(frame, e.id, SE_NEAR)
+        {
+            if !is_hit_se(e.id) {
+                stats.cutin_matched = stats.cutin_matched.saturating_add(1);
+            } else if hold.hit == SeTiming::Live {
+                stats.hit_live_matched = stats.hit_live_matched.saturating_add(1);
+            } else {
+                stats.hit_matched = stats.hit_matched.saturating_add(1);
             }
         }
         if played.has_near(frame, e.id, SE_NEAR) {
@@ -726,10 +758,10 @@ pub fn sort_resim_se(
             SE_ID_CUTIN_SPELL => stats.new_spell = stats.new_spell.saturating_add(1),
             _ => {}
         }
-        // `Live` の予測の回で初めて出た被弾音は、積めたのでこのあと積み直されて実際に鳴る。積めなかった分は鳴らないので数えず、待ちの記録にも覚えない。
+        // `Live` の予測の回で初めて出た被弾音は、積めたのでこのあと積み直されて実際に鳴る。積めなかった分は鳴らないので数えず、確定の回と突き合わせる記録にも覚えない。
         if !pending.push(e, frame) {
             stats.dropped = stats.dropped.saturating_add(1);
-        } else if hit == HitSe::Live && !confirmed && is_hit_se(e.id) {
+        } else if hold.hit == SeTiming::Live && !confirmed && is_hit_se(e.id) {
             if played.hold(frame, e.id) {
                 stats.hit_live_sounded = stats.hit_live_sounded.saturating_add(1);
             } else {
@@ -761,6 +793,10 @@ pub fn flush_se(
         let late = pending.top.saturating_add(1).saturating_sub(*frame);
         stats.late_sum = stats.late_sum.saturating_add(u64::from(late));
         stats.late_max = stats.late_max.max(late);
+        if is_cutin_se(e.id) {
+            stats.cutin_late_sum = stats.cutin_late_sum.saturating_add(u64::from(late));
+            stats.cutin_late_max = stats.cutin_late_max.max(late);
+        }
     }
     pending.clear();
 }
@@ -785,7 +821,16 @@ pub fn se_summary_line(s: &SeStats) -> String {
     } else {
         format!("{:.2}", s.late_sum as f64 / f64::from(s.replayed))
     };
-    let live_phantom = if s.hit_mode == HitSe::Live {
+    let replayed_cutins = s.replayed_cutin.saturating_add(s.replayed_spell);
+    let cutin_mean = if replayed_cutins == 0 {
+        "—".to_string()
+    } else {
+        format!(
+            "{:.2}",
+            s.cutin_late_sum as f64 / f64::from(replayed_cutins)
+        )
+    };
+    let live_phantom = if s.hit_mode == SeTiming::Live {
         format!(
             "。live の被弾音（予測のうちに鳴らした）: 鳴らした {}・うち確定の回で見つかった {}・見つからなかった幻の被弾音（鳴ったのに確定では起きなかった。走り終わりの未確定の分を含む） {}",
             s.hit_live_sounded,
@@ -796,7 +841,7 @@ pub fn se_summary_line(s: &SeStats) -> String {
         String::new()
     };
     format!(
-        "巻き戻し（製品の経路）: SE 生きた tick で積まれた {}（カットイン 0xE {} / スペルカード 0x35 {}）・進め直しの tick で積まれた {}（うち前後 2 フレームのどこにも無く初めて出た {}（カットイン 0xE {} / スペルカード 0x35 {}）・前後 2 フレームの中で抑えた {}・追えない id {}）。遅れて積み直した {}（カットイン 0xE {} / スペルカード 0x35 {}。遅れ N − 出来事のフレーム 平均 {} / 最大 {}）・頭のバイト列が合わず積まなかった {}・捨てた {}・読めなかった {}。鳴ったカットイン（生きた tick ＋ 遅れて積み直した）0xE {} / スペルカード 0x35 {}。被弾音（id 4・0x30。rollback_hit_se = {}）: 確定まで待った {}・うち確定の回で見つかった {}・見つからず鳴らさなかった（確定では起きなかった。走り終わりの未確定の分を含む） {}・遅れて積み直した {}{}",
+        "巻き戻し（製品の処理フロー）: SE 生きた tick で積まれた {}（カットイン 0xE {} / スペルカード 0x35 {}）・進め直しの tick で積まれた {}（うち前後 2 フレームのどこにも無く初めて出た {}（カットイン 0xE {} / スペルカード 0x35 {}）・前後 2 フレームの中で抑えた {}・追えない id {}）。遅れて積み直した {}（カットイン 0xE {} / スペルカード 0x35 {}。遅れ N − 出来事のフレーム 平均 {} / 最大 {}）・頭のバイト列が合わず積まなかった {}・捨てた {}・読めなかった {}。鳴ったカットイン（生きた tick ＋ 遅れて積み直した）0xE {} / スペルカード 0x35 {}。カットインの音（0xE・0x35。rollback_cutin_se = {}）: 確定まで待った {}・うち確定の回で見つかった {}・見つからず鳴らさなかった（確定では起きなかった。走り終わりの未確定の分を含む） {}・遅れて積み直したカットインの遅れ 平均 {} / 最大 {}。被弾音（id 4・0x30。rollback_hit_se = {}）: 確定まで待った {}・うち確定の回で見つかった {}・見つからず鳴らさなかった（確定では起きなかった。走り終わりの未確定の分を含む） {}・遅れて積み直した {}{}",
         s.live_ids,
         s.live_cutin,
         s.live_spell,
@@ -816,6 +861,12 @@ pub fn se_summary_line(s: &SeStats) -> String {
         s.unreadable,
         s.live_cutin.saturating_add(s.replayed_cutin),
         s.live_spell.saturating_add(s.replayed_spell),
+        s.cutin_mode.name(),
+        s.cutin_waited,
+        s.cutin_matched,
+        s.cutin_waited.saturating_sub(s.cutin_matched),
+        cutin_mean,
+        s.cutin_late_max,
         s.hit_mode.name(),
         s.hit_waited,
         s.hit_matched,
@@ -902,7 +953,7 @@ fn abort_text(a: ScanAbort) -> &'static str {
     }
 }
 
-/// 終わりの集計（本ログ）。`samples` は追加の回 1 回ずつの時間（マイクロ秒）、`dropped` は置き場が足りずに落とした数。フレームの形の回が 1 つも無ければ空。
+/// 終わりの集計（本ログ）。`samples` は追加の回 1 回ずつの時間（マイクロ秒）、`dropped` は領域が足りずに落とした数。フレームの形の回が 1 つも無ければ空。
 pub fn summary_lines(rs: &[TrialRecord], samples: &[u32], dropped: u32) -> Vec<String> {
     let mut v = Vec::new();
     let frames: Vec<&TrialRecord> = rs.iter().filter(|r| r.resim.frame).collect();
@@ -1539,6 +1590,28 @@ mod tests {
         q
     }
 
+    impl SeHold {
+        const LIVE: SeHold = SeHold {
+            hit: SeTiming::Live,
+            cutin: SeTiming::Live,
+        };
+    }
+
+    /// 被弾音だけを待たせ、カットインの音は今までどおり（live）にする。
+    fn hit_only(hit: SeTiming) -> SeHold {
+        SeHold {
+            hit,
+            cutin: SeTiming::Live,
+        }
+    }
+
+    fn cutin_only(cutin: SeTiming) -> SeHold {
+        SeHold {
+            hit: SeTiming::Live,
+            cutin,
+        }
+    }
+
     #[test]
     fn the_se_queue_is_read_like_the_game_plays_it_and_cleared() {
         let mut m = SeMem::empty();
@@ -1627,7 +1700,7 @@ mod tests {
             &mut s,
             20,
             &q_of(&[0x0E, 0x35, 0x10]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!(
@@ -1640,7 +1713,7 @@ mod tests {
             &mut s,
             21,
             &q_of(&[0x0E]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         sort_resim_se(
@@ -1649,7 +1722,7 @@ mod tests {
             &mut s,
             22,
             &q_of(&[0x0E]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!((s.suppressed, s.new_ids), (2, 3));
@@ -1659,7 +1732,7 @@ mod tests {
             &mut s,
             23,
             &q_of(&[0x0E]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!((s.suppressed, s.new_ids, s.new_cutin), (2, 4, 2));
@@ -1683,7 +1756,7 @@ mod tests {
             &mut s,
             90,
             &q_of(&[0x01]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         flush_se(&mut pending, &mut s, &mut |_| false);
@@ -1695,7 +1768,7 @@ mod tests {
             &mut s,
             91,
             &q_of(&[SE_ID_LIMIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!((s.untracked, s.new_ids), (1, 0));
@@ -1710,7 +1783,7 @@ mod tests {
                 &mut s,
                 100 + i * 10,
                 &q_of(&[0x0E]),
-                HitSe::Live,
+                SeHold::LIVE,
                 true,
             );
         }
@@ -1734,7 +1807,7 @@ mod tests {
             &mut s,
             200,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             false,
         );
         assert_eq!(
@@ -1748,7 +1821,7 @@ mod tests {
             &mut s,
             200,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!(s.hit_live_matched, 0, "積めなかった分に対応が付いた: {s:?}");
@@ -1761,7 +1834,7 @@ mod tests {
             &mut s,
             200,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             false,
         );
         assert_eq!((s.dropped, s.hit_live_sounded), (0, 1), "{s:?}");
@@ -1771,7 +1844,7 @@ mod tests {
             &mut s,
             200,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             true,
         );
         assert_eq!((s.hit_live_matched, s.hit_live_sounded), (1, 1), "{s:?}");
@@ -1849,6 +1922,10 @@ mod tests {
             l.contains("遅れ N − 出来事のフレーム 平均 — / 最大 0"),
             "{l}"
         );
+        assert!(
+            l.contains("遅れて積み直したカットインの遅れ 平均 — / 最大 0"),
+            "{l}"
+        );
         let s = SeStats {
             live_ids: 11,
             live_cutin: 8,
@@ -1867,7 +1944,12 @@ mod tests {
             dropped: 3,
             unreadable: 7,
             untracked: 9,
-            hit_mode: HitSe::Confirmed,
+            hit_mode: SeTiming::Confirmed,
+            cutin_mode: SeTiming::Live,
+            cutin_waited: 4,
+            cutin_matched: 1,
+            cutin_late_sum: 7,
+            cutin_late_max: 5,
             hit_waited: 8,
             hit_matched: 5,
             replayed_hit: 6,
@@ -1886,6 +1968,7 @@ mod tests {
             "積まなかった 1",
             "捨てた 3",
             "読めなかった 7",
+            "カットインの音（0xE・0x35。rollback_cutin_se = live）: 確定まで待った 4・うち確定の回で見つかった 1・見つからず鳴らさなかった（確定では起きなかった。走り終わりの未確定の分を含む） 3・遅れて積み直したカットインの遅れ 平均 2.33 / 最大 5。被弾音（",
             "被弾音（id 4・0x30。rollback_hit_se = confirmed）: 確定まで待った 8・うち確定の回で見つかった 5・見つからず鳴らさなかった（確定では起きなかった。走り終わりの未確定の分を含む） 3・遅れて積み直した 6",
         ] {
             assert!(l.contains(want), "{want} が無い: {l}");
@@ -1895,7 +1978,7 @@ mod tests {
             "confirmed の行の末尾が変わった: {l}"
         );
         let live = SeStats {
-            hit_mode: HitSe::Live,
+            hit_mode: SeTiming::Live,
             ..s
         };
         let l = se_summary_line(&live);
@@ -1910,14 +1993,15 @@ mod tests {
         for id in 0..SE_ID_LIMIT {
             assert_eq!(is_hit_se(id), id == 4 || id == 0x30, "{id:#X}");
         }
-        assert_eq!(HitSe::default(), HitSe::Confirmed);
-        assert_eq!(HitSe::parse("confirmed"), Ok(HitSe::Confirmed));
-        assert_eq!(HitSe::parse("live"), Ok(HitSe::Live));
+        assert_eq!(SeTiming::default(), SeTiming::Confirmed);
+        assert_eq!(SeTiming::parse("k", "confirmed"), Ok(SeTiming::Confirmed));
+        assert_eq!(SeTiming::parse("k", "live"), Ok(SeTiming::Live));
         for bad in ["", "Live", "CONFIRMED", "on", "0", "confirmed "] {
-            assert!(HitSe::parse(bad).is_err(), "{bad:?}");
+            let e = SeTiming::parse("rollback_cutin_se", bad).unwrap_err();
+            assert!(e.starts_with("rollback_cutin_se の値"), "{bad:?}: {e}");
         }
-        assert_eq!(HitSe::Confirmed.name(), "confirmed");
-        assert_eq!(HitSe::Live.name(), "live");
+        assert_eq!(SeTiming::Confirmed.name(), "confirmed");
+        assert_eq!(SeTiming::Live.name(), "live");
     }
 
     #[test]
@@ -1960,7 +2044,15 @@ mod tests {
         post.ev[1].pan = 11;
         post.count[1] = 3;
         let a0 = crate::test_alloc::count();
-        let rest = hold_hit_se(&mut played, &mut s, 50, &pre, &post).expect("抜く");
+        let rest = hold_se(
+            &mut played,
+            &mut s,
+            50,
+            &pre,
+            &post,
+            hit_only(SeTiming::Confirmed),
+        )
+        .expect("抜く");
         assert_eq!(crate::test_alloc::count(), a0, "被弾音を抜く関数が確保した");
         let got: Vec<(u32, i32, u32)> = rest.events().map(|(e, c)| (e.id, e.pan, c)).collect();
         assert_eq!(
@@ -1978,14 +2070,44 @@ mod tests {
             (SeQueue::EMPTY, SeQueue::EMPTY),
         ] {
             let mut s = SeStats::default();
-            assert!(hold_hit_se(&mut fresh, &mut s, 1, &pre, &post).is_none());
+            assert!(
+                hold_se(
+                    &mut fresh,
+                    &mut s,
+                    1,
+                    &pre,
+                    &post,
+                    hit_only(SeTiming::Confirmed)
+                )
+                .is_none()
+            );
             assert_eq!(s, SeStats::default());
         }
         let mut bad = q_of(&[4]);
         bad.ok = false;
         let mut s = SeStats::default();
-        assert!(hold_hit_se(&mut fresh, &mut s, 1, &SeQueue::EMPTY, &bad).is_none());
-        assert!(hold_hit_se(&mut fresh, &mut s, 1, &bad, &q_of(&[4])).is_none());
+        assert!(
+            hold_se(
+                &mut fresh,
+                &mut s,
+                1,
+                &SeQueue::EMPTY,
+                &bad,
+                hit_only(SeTiming::Confirmed)
+            )
+            .is_none()
+        );
+        assert!(
+            hold_se(
+                &mut fresh,
+                &mut s,
+                1,
+                &bad,
+                &q_of(&[4]),
+                hit_only(SeTiming::Confirmed)
+            )
+            .is_none()
+        );
         assert_eq!(s.hit_waited, 0);
     }
 
@@ -2025,7 +2147,7 @@ mod tests {
             &mut s,
             20,
             &q_of(&[SE_ID_HIT, SE_ID_LAST_LIFE, SE_ID_CUTIN, 0x10]),
-            HitSe::Confirmed,
+            hit_only(SeTiming::Confirmed),
             false,
         );
         assert_eq!((s.resim_ids, s.new_ids, s.suppressed), (2, 2, 0));
@@ -2040,7 +2162,7 @@ mod tests {
             &mut s,
             20,
             &q,
-            HitSe::Confirmed,
+            hit_only(SeTiming::Confirmed),
             true,
         );
         assert_eq!(crate::test_alloc::count(), a0, "仕分けが確保した");
@@ -2052,7 +2174,7 @@ mod tests {
             &mut s,
             21,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Confirmed,
+            hit_only(SeTiming::Confirmed),
             true,
         );
         assert_eq!((s.hit_matched, s.suppressed, s.new_ids), (1, 1, 3));
@@ -2065,7 +2187,7 @@ mod tests {
             &mut s,
             20,
             &q_of(&[SE_ID_HIT]),
-            HitSe::Live,
+            SeHold::LIVE,
             false,
         );
         assert_eq!((s.new_ids, s.hit_matched, pending.n), (1, 0, 1));
@@ -2075,5 +2197,209 @@ mod tests {
             true
         });
         assert_eq!((order, s.replayed, s.replayed_hit), (vec![SE_ID_HIT], 1, 1));
+    }
+
+    #[test]
+    fn the_cutin_ids_and_the_two_timings_pick_the_waiting_ids_independently() {
+        for id in 0..SE_ID_LIMIT {
+            assert_eq!(is_cutin_se(id), id == 0x0E || id == 0x35, "{id:#X}");
+        }
+        assert_eq!(SeHold::default().hit, SeTiming::Confirmed);
+        assert_eq!(SeHold::default().cutin, SeTiming::Confirmed);
+        for hit in [SeTiming::Confirmed, SeTiming::Live] {
+            for cutin in [SeTiming::Confirmed, SeTiming::Live] {
+                let h = SeHold { hit, cutin };
+                for id in 0..SE_ID_LIMIT {
+                    let want = (is_hit_se(id) && hit == SeTiming::Confirmed)
+                        || (is_cutin_se(id) && cutin == SeTiming::Confirmed);
+                    assert_eq!(h.waits(id), want, "{h:?} {id:#X}");
+                }
+                assert_eq!(
+                    h.any_waits(),
+                    hit == SeTiming::Confirmed || cutin == SeTiming::Confirmed
+                );
+            }
+        }
+        assert!(!SeHold::LIVE.any_waits());
+    }
+
+    #[test]
+    fn holding_cutins_leaves_hits_and_the_other_se_and_counts_apart() {
+        let mut played = SePlayed::EMPTY;
+        let mut s = SeStats::default();
+        let mut pre = q_of(&[7, SE_ID_CUTIN]);
+        pre.ev[0].pan = -5;
+        pre.ev[1].pan = 33;
+        let mut post = q_of(&[
+            7,
+            SE_ID_CUTIN,
+            SE_ID_HIT,
+            SE_ID_CUTIN_SPELL,
+            SE_ID_LAST_LIFE,
+        ]);
+        post.ev[0].pan = -5;
+        post.count[1] = 3;
+        post.ev[2].pan = 9;
+        let a0 = crate::test_alloc::count();
+        let rest = hold_se(
+            &mut played,
+            &mut s,
+            50,
+            &pre,
+            &post,
+            cutin_only(SeTiming::Confirmed),
+        )
+        .expect("抜く");
+        assert_eq!(crate::test_alloc::count(), a0, "音を抜く関数が確保した");
+        let got: Vec<(u32, i32, u32)> = rest.events().map(|(e, c)| (e.id, e.pan, c)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (7, -5, 1),
+                (SE_ID_CUTIN, 33, 1),
+                (SE_ID_HIT, 9, 1),
+                (SE_ID_LAST_LIFE, 0, 1)
+            ],
+            "前からあったカットイン・被弾音・ほかの SE が残る"
+        );
+        assert_eq!(
+            (s.cutin_waited, s.hit_waited),
+            (2, 0),
+            "カットインは枠（id × tick）ごとに 1: 0xE が 2 回でも 1"
+        );
+        assert!(!played.has_near(50, SE_ID_CUTIN, 0) && !played.has_near(50, SE_ID_CUTIN_SPELL, 0));
+        assert!(
+            played.take_held_near(50, SE_ID_CUTIN, 0)
+                && played.take_held_near(50, SE_ID_CUTIN_SPELL, 0)
+        );
+        assert!(!played.take_held_near(50, SE_ID_HIT, 0), "被弾音を待たせた");
+        let mut fresh = SePlayed::EMPTY;
+        let mut s = SeStats::default();
+        let rest = hold_se(
+            &mut fresh,
+            &mut s,
+            50,
+            &pre,
+            &post,
+            hit_only(SeTiming::Confirmed),
+        )
+        .expect("抜く");
+        assert_eq!((s.cutin_waited, s.hit_waited), (0, 2));
+        assert!(rest.events().any(|(e, c)| e.id == SE_ID_CUTIN && c == 3));
+        let mut fresh = SePlayed::EMPTY;
+        let mut s = SeStats::default();
+        assert!(hold_se(&mut fresh, &mut s, 1, &pre, &post, SeHold::LIVE).is_none());
+        let (same, same_post) = (q_of(&[SE_ID_CUTIN]), q_of(&[SE_ID_CUTIN]));
+        assert!(
+            hold_se(&mut fresh, &mut s, 1, &same, &same_post, SeHold::default()).is_none(),
+            "走査が足していない"
+        );
+        assert_eq!(s, SeStats::default());
+    }
+
+    #[test]
+    fn flushing_adds_the_lateness_of_the_replayed_cutins_apart_from_the_others() {
+        let mut played = SePlayed::EMPTY;
+        let mut pending = SePending::EMPTY;
+        let mut s = SeStats::default();
+        for (frame, id) in [
+            (20, SE_ID_CUTIN),
+            (21, SE_ID_HIT),
+            (22, 0x10),
+            (23, SE_ID_CUTIN_SPELL),
+        ] {
+            sort_resim_se(
+                &mut played,
+                &mut pending,
+                &mut s,
+                frame,
+                &q_of(&[id]),
+                SeHold::LIVE,
+                true,
+            );
+        }
+        flush_se(&mut pending, &mut s, &mut |_| true);
+        assert_eq!(
+            (s.cutin_late_sum, s.cutin_late_max),
+            (4 + 1, 4),
+            "0xE は 20 → 24 で 4、0x35 は 1: {s:?}"
+        );
+        assert_eq!((s.late_sum, s.late_max), (4 + 3 + 2 + 1, 4), "{s:?}");
+        let mut pending = SePending::EMPTY;
+        let mut s = SeStats::default();
+        sort_resim_se(
+            &mut played,
+            &mut pending,
+            &mut s,
+            90,
+            &q_of(&[SE_ID_CUTIN]),
+            SeHold::LIVE,
+            true,
+        );
+        flush_se(&mut pending, &mut s, &mut |_| false);
+        assert_eq!(
+            (s.cutin_late_sum, s.cutin_late_max, s.refused),
+            (0, 0, 1),
+            "断られた分の遅れを足した"
+        );
+    }
+
+    #[test]
+    fn sorting_waits_for_cutins_in_predicted_resim_ticks_when_they_wait() {
+        let q = q_of(&[SE_ID_CUTIN, SE_ID_CUTIN_SPELL, SE_ID_HIT, 0x10]);
+        let mut played = SePlayed::EMPTY;
+        let mut pending = SePending::EMPTY;
+        let mut s = SeStats::default();
+        sort_resim_se(
+            &mut played,
+            &mut pending,
+            &mut s,
+            20,
+            &q,
+            cutin_only(SeTiming::Confirmed),
+            false,
+        );
+        assert_eq!((s.resim_ids, s.new_ids, pending.n), (2, 2, 2), "{s:?}");
+        assert!(!played.has_near(20, SE_ID_CUTIN, SE_NEAR), "記録に足した");
+        assert!(played.hold(22, SE_ID_CUTIN));
+        sort_resim_se(
+            &mut played,
+            &mut pending,
+            &mut s,
+            20,
+            &q_of(&[SE_ID_CUTIN]),
+            cutin_only(SeTiming::Confirmed),
+            true,
+        );
+        assert_eq!(
+            (
+                s.cutin_matched,
+                s.hit_matched,
+                s.hit_live_matched,
+                pending.n
+            ),
+            (1, 0, 0, 3),
+            "{s:?}"
+        );
+        let mut played = SePlayed::EMPTY;
+        let mut pending = SePending::EMPTY;
+        let mut s = SeStats::default();
+        sort_resim_se(
+            &mut played,
+            &mut pending,
+            &mut s,
+            20,
+            &q,
+            cutin_only(SeTiming::Live),
+            false,
+        );
+        assert_eq!((s.new_ids, s.new_cutin, s.new_spell), (4, 1, 1), "{s:?}");
+        assert_eq!(pending.n, 4, "live は予測の回でも積む");
+        let mut order = Vec::new();
+        flush_se(&mut pending, &mut s, &mut |e| {
+            order.push(e.id);
+            true
+        });
+        assert_eq!(order, vec![SE_ID_CUTIN, SE_ID_CUTIN_SPELL, SE_ID_HIT, 0x10]);
     }
 }

@@ -1,12 +1,11 @@
 //! 配る exe・DLL に付けるバージョン情報（VS_VERSIONINFO）の `.res` を作る。
-//!
-//! 外部のリソースコンパイラ（rc.exe）は使わない。`.res` は link.exe が入力としてそのまま受け付けるので、
-//! バイト列を自分で組んで `OUT_DIR` へ書き、リンカーの引数に足す。これで Windows SDK の場所探しに依存せず、
-//! Linux でも同じバイト列を作って検査できる（`tests/against_llvm_rc.rs` が llvm-rc の出力と比べる）。
-//! ここは build.rs からだけ呼ぶ。配る成果物には入らない。
+//! rc.exe は使わない。`.res` は link.exe がそのまま受け付けるので、バイト列を自分で組んで `OUT_DIR` へ書く。
+//! これで Windows SDK の場所探しに依存せず、Linux でも同じバイト列を作れる（`tests/against_llvm_rc.rs` が llvm-rc の出力と比べる）。
+//! 開発側の資料を読む検査のための cfg `dev_assets` を出す関数（`emit_dev_assets_cfg`）も、各クレートの build.rs が共有する。
+//! build.rs からだけ呼ぶ。配る成果物には入らない。
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 製品名。配る物すべてで同じ。
 pub const PRODUCT_NAME: &str = "HiganRTool";
@@ -173,7 +172,7 @@ pub fn version_info_data(info: &VersionInfo<'_>, version: [u16; 4]) -> Vec<u8> {
     )
 }
 
-/// `.res` ファイル全体。先頭の空のリソース（32 バイト）に続けて RT_VERSION（名前は ID 1）を 1 つ置く。
+/// `.res` ファイル全体。先頭の空のリソース（32 バイト）に続けて RT_VERSION（名前は ID 1）を 1 つ書く。
 pub fn version_res(info: &VersionInfo<'_>, version: [u16; 4]) -> Vec<u8> {
     const RT_VERSION: u16 = 16;
     const MOVEABLE_PURE: u16 = 0x0030;
@@ -216,7 +215,7 @@ pub enum Artifact {
 }
 
 /// build.rs から呼ぶ。MSVC でリンクするときだけ `.res` を書いて link.exe に渡す。
-/// 版は呼び出し側のクレートの `CARGO_PKG_VERSION`（ワークスペースの 1 か所）から取る。
+/// バージョンは呼び出し側のクレートの `CARGO_PKG_VERSION`（ワークスペースの 1 か所）から取る。
 /// mingw（Linux の検査用）はリンカーが .res を読めず、配る物でもないので何もしない。
 pub fn emit(info: &VersionInfo<'_>, artifact: Artifact) {
     println!("cargo:rerun-if-changed=build.rs");
@@ -237,9 +236,80 @@ pub fn emit(info: &VersionInfo<'_>, artifact: Artifact) {
     println!("cargo:rustc-link-arg-{kind}={}", out.display());
 }
 
+/// 開発リポジトリにだけある資料の場所（根からの部品）。実機の検証の定義・解析のメモ・設計資料。
+/// 公開用に書き出したツリーには `scripts/dist` と `tests/fixtures` しか無いので、これらの有無で見分ける。
+const DEV_DIRS: [&[&str]; 2] = [&["scripts", "runs"], &["analysis", "notes"]];
+const DEV_FILES: [&[&str]; 1] = [&["docs", "Design_Architecture.md"]];
+
+fn join_parts(root: &Path, parts: &[&str]) -> PathBuf {
+    parts.iter().fold(root.to_path_buf(), |p, s| p.join(s))
+}
+
+/// 開発リポジトリにだけある資料が `repo_root` の下に全部あるか。
+pub fn dev_assets_present(repo_root: &Path) -> bool {
+    DEV_DIRS.iter().all(|d| join_parts(repo_root, d).is_dir())
+        && DEV_FILES.iter().all(|f| join_parts(repo_root, f).is_file())
+}
+
+/// build.rs から呼ぶ。`dev_assets_present` が真なら cfg `dev_assets` を立てる。
+/// その資料を `include_str!` で読む検査は `#[cfg(dev_assets)]` の下に書き、資料の無い公開側では建てない。
+/// クレートは `<repo>/src/<name>/` にある前提（`CARGO_MANIFEST_DIR` の 2 つ上がリポジトリの根）。
+pub fn emit_dev_assets_cfg() {
+    println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rustc-check-cfg=cfg(dev_assets)");
+    let dir =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR が無い"));
+    if dev_assets_present(&dir.join("../..")) {
+        println!("cargo::rustc-cfg=dev_assets");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_assets_need_every_part() {
+        let tmp = std::env::temp_dir().join(format!(
+            "higanr_build_res_dev_assets_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!dev_assets_present(&tmp), "空の根が真");
+        let make = |root: &Path, skip: Option<usize>| {
+            let all: Vec<(&[&str], bool)> = DEV_DIRS
+                .iter()
+                .map(|d| (*d, true))
+                .chain(DEV_FILES.iter().map(|f| (*f, false)))
+                .collect();
+            for (i, (parts, is_dir)) in all.into_iter().enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
+                let at = join_parts(root, parts);
+                if is_dir {
+                    std::fs::create_dir_all(&at).unwrap();
+                } else {
+                    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    std::fs::write(&at, "x").unwrap();
+                }
+            }
+        };
+        for i in 0..DEV_DIRS.len() + DEV_FILES.len() {
+            let root = tmp.join(format!("missing{i}"));
+            make(&root, Some(i));
+            assert!(!dev_assets_present(&root), "{i} 番目を欠いたのに真");
+        }
+        let full = tmp.join("full");
+        make(&full, None);
+        assert!(dev_assets_present(&full));
+        // 公開用に残る scripts/dist だけでは真にならない。
+        let public = tmp.join("public");
+        std::fs::create_dir_all(public.join("scripts").join("dist")).unwrap();
+        assert!(!dev_assets_present(&public));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn parse_version_takes_three_numbers_and_ignores_pre_release() {

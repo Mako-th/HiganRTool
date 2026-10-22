@@ -1,75 +1,9 @@
 //! ネットワークの設定（`HiganRTool.ini` の `[netplay]` の節）を読む（pure。unsafe 無し）。
 //!
-//! ini は **DLL のフォルダ**（台本 `script.txt` と同じ所。ゲームのフォルダではない）に置く。`enable = 1` と書いた節があるときだけ
-//! ネットワークを開く（台本が無くても開く。人が選択を押し、マッチを操作する）。知らないキーは断る（綴りの誤りで既定の値のまま走らないように）。
-//! 宛先とソケットはネットワークの範囲 `scope` の中だけ（ガードは `higanr_core::guard`。開くときの `net_udp::open_scoped` でももう一度見る）。
-//!
-//! キー:
-//! - `peer` は空白で区切って何個でも書ける（相手の候補の列。全部へ HELLO を送り、最初に返しが来た経路を採る）。
-//! - `secret` = 接続の秘密（16 進 32 桁。peer_sim の `--secret` と揃える）。**無ければ、開くときに OS の乱数で引き**、
-//!   自分の始める側の接続コード（秘密・session・自分のソケットを候補に）をログに書く。peer_sim は `--code` でそれを読む。
-//! - `stun` = STUN の問い合わせ先（ネットワークの範囲の中だけ。空か無しなら問い合わせない）。`名前:ポート` も書ける（`StunTarget`。
-//!   読むときは形だけ、引くのは開くときに読み取りのスレッドで）。
-//! - `stun2` = 2 か所目の STUN の問い合わせ先（書き方は `stun` と同じ）。1 か所目と見えたアドレスを比べて、ルーターが宛先ごとに
-//!   外側のポートを変える型かを診断に出す。1 か所目が答えないときだけ、2 か所目の答えを接続コードの候補にする。
-//!   `scope = internet` で `stun` があるときだけ聞く（`net_udp::asks_second_stun`）。
-//! - `ipv6` = `on` | `off`（既定 `on`）: IPv6 の経路。`on` で `scope = internet` のとき、OS の既定の送り元が世界に通じる IPv6
-//!   （2000::/3）なら、そのアドレスで IPv6 のソケットを別に 1 本開き、自分のコードの候補に載せる（`net_udp::open_ipv6`）。`off` は
-//!   IPv4 だけ。`scope` が internet でなければ使わない。外へ送るものは増えない（STUN は IPv4 のまま）。
-//! - `upnp` = `on` | `off`（既定 `on`）: 家のルーターへ UPnP でソケットの UDP ポートの割り当てを頼む（`net_udp::upnp_begin`）。`scope = internet` で、
-//!   ソケットが家の中の IPv4 のアドレスのときだけ頼む。割り当てた外側のポートは、ルーターの外側のアドレスが STUN で見えた
-//!   アドレスと同じで世界に通じるときだけ自分の候補に載せ（違えば二重 NAT の見込みで割り当てを消す）、ネットワークを閉じたら消す（手で開けた期限なしの
-//!   同じ割り当てには触れない）。UPnP がオフなら使えないまま進む。`off` は頼まない。
-//! - `bind` = `IP:ポート` か `auto:ポート`（`Bind`。開くときに自分のアドレスを選ぶ）。
-//! - `code_side` = `offer` | `answer`: 相手の候補を ini の `peer` で手で与える代わりに、接続コードを DLL のフォルダの `code\` で
-//!   受け渡す（`net_code`）。`offer` は接続コードを**始める側**（秘密と session を作る）、`answer` は**返す側**。語はルームサーバーと
-//!   同じ（`host | guest` はマッチのホストと紛れる）。`peer` と一緒には書けない（どちらの候補で繋ぐのかが読み手に分からない）。
-//!   `answer` は `session` と `secret` も書けない（始める側のコードから取る）。`offer` は `session` を省けば開くときに OS の乱数で引く。
-//! - `code_side = spectate`: **見るだけの側**。ホストが `spectate_code.txt` に書いた観戦用のコード（種別 3）を置き場の
-//!   `peer_code.txt` から読み、ホストへ JOIN してマッチを観戦する（返しのコードは書かない。対戦用のコードは種別で断る）。
-//!   相手のアドレス・session・秘密はコードから取るので `peer`・`session`・`secret` は書けない。STUN と自分のコードの候補
-//!   （`stun`・`candidates`）も使わないので書けない。`code_dir`・`scope`・`bind`・`name`・`wait_budget_us` は使う。
-//!   `[spectate]`（観戦のホスト）とは一緒に書けない。
-//! - `code_side = game`: **ゲームの中のメニューで側を決める**。ソケット・STUN・見張りは起動のときには開かず（「妖怪 対 妖怪」が
-//!   選ばれない限りゲームの動作に何も影響しない）、メニューの最初の「作る」「貼る」で別のスレッドが開き、見張りは側を決めずに
-//!   待つ（`script_win::request_open` → `net_code_game::start_game`）。「接続コードを作る」で始める側、「相手の接続コードを貼る」で
-//!   （自分のコードがまだ無ければ）返す側になる。コードはクリップボードで受け渡す。ローダーのウィンドウは開かない。`session`・`secret` は
-//!   書けない（コードを作るたびに OS の乱数で引く）。
-//! - `clipboard` = `system` | `file`（`code_side = game` と一緒にだけ。既定 `system`。開発用）: `file` は、本物のクリップボードの
-//!   代わりに置き場（`code_dir`）の `clip_out.txt`（メニューがコピーする文字を書く）と `clip_in.txt`（メニューが貼る文字を読む）を使う
-//!   （検査と実機の回が利用者のクリップボードを書き換えないため）。
-//! - `candidates` = `all` | `mapped`（開発用。`code_side` と一緒にだけ。既定 `all`）: 自分の接続コードに載せる候補。`all` はソケットと、
-//!   STUN で見えたアドレス。`mapped` は STUN で見えたアドレス**だけ**（同じ PC の 2 台をヘアピン NAT 越しに繋ぎ、外のアドレスだけで繋がるかを
-//!   見る回のため）。`stun` が要り、STUN の答えが無ければネットワークを開かない（`net_code::start`）。配る ini には書かない。
-//! - `code_dir` = 接続コードのファイルの置き場（`code_side` と一緒にだけ。相対なら DLL のフォルダから、無ければ DLL のフォルダの
-//!   `code`）。同じ PC で花映塚を 2 つ起こすと DLL のフォルダは 1 つなので、ゲームごとに別の置き場にするため。
-//! - `room_server` = ルームサーバーの宿。`https://名前[:ポート]`（`wss://` に読み替える。平文の `http://` は `127.0.0.1` /
-//!   `localhost` だけ）。あればゲーム内のメニューに「ルームマッチ」が出る。空か無しなら出ない。`room` = ルーム名の**初めの値**
-//!   （`room_server` と一緒にだけ。ルーム名はメニューの入力で打って決め、ここに書いた名はその入力の初めの値になる。メニューで決めた名は
-//!   この行に書き戻される。無ければ空）。ルーム名は本ログに書かない。
-//! - `head_wait` = `0` | `1`（既定 1）: delay 方式の lockstep で、フレームの始まり（自分の入力を読む前）に相手のワードを待つ
-//!   （`netplay::NetPlay::head_wait`。上限 `netplay::HEAD_WAIT_CAP_US`）。0 は入力を読んだ後の待ちだけ。rollback・観戦者には
-//!   効かない。ウィンドウモード（b-spin / b）は格子の後、全画面（ゲーム自身の時計）はゲームがその回にフレームを始める見込みのときだけ待つ
-//!   （`pacing_win::pace_head`）。
-//! - `rollback_hit_se` = `confirmed` | `live`（既定 `confirmed`）: rollback のとき、被弾音（id 4 とラストライフの 0x30）を
-//!   確定するまで鳴らさない（`confirmed`。予測で起きて確定で起きなかった被弾の音が鳴らず、位置がずれても 1 回だけ鳴る。
-//!   音だけが未確定の被弾のときに確定までの間遅れる）か、生きた tick で即座に鳴らす（`live`）か。delay 方式には予測が無いので
-//!   効かない。入力 → 表示の遅れは変わらない（`rollback_resim::HitSe`）。
-//! - `delay` = `auto` | `0`〜`8`（既定 auto）: メニューの「ディレイ」の初めの値。rollback の D と delay 方式の希望 latency の両方を
-//!   これ 1 つから作る（`mode_pick::ini_delay`）。前の `latency` / `rollback_delay` は読まないが、書いてあっても節は断らず、本ログに 1 行出す。
-//!
-//! ネットワークの範囲（`higanr_core::guard` のモジュール doc）: `scope` = `loopback`（既定）| `lan` | `internet`。`bind`・`peer`・`stun` と、
-//! 接続コードで受けた相手の候補の全部がこの範囲の中でなければ断る。知らない値（大文字・別の綴り）は既定に落とさず断り、
-//! ネットワークを開かない（`lan` のつもりの誤記で loopback のまま開くと、繋がらない理由が設定だと分からないため）。`lan` / `internet` で
-//! 相手へ届くには、`bind` にも自分のそのインターフェースのアドレスを書く（ソケットが 127.0.0.1 のままだと LAN の相手へ届かない。全部のインターフェース `0.0.0.0` は、
-//! 自分の接続コードに載せられないのでどの範囲でも断る）。
-//!
-//! `after_script = keep` なら、台本が最後の段階まで押した後もネットワークを閉じない（「選択だけ台本 → 台本が終わって人が試合」の形。
-//! 既定の `bye` は台本の終わりに BYE）。
-//!
-//! 置き場: ローダーの `--ini` / `--script` が子の環境の変数（`higanr_core::ini::PATH_ENV` / `higanr_core::script::PATH_ENV`）に
-//! 置いたパスがあればそれを、無ければ DLL のフォルダの `HiganRTool.ini` / `script.txt` を読む（`locate`）。同じ PC で 2 つの
-//! ゲームを起こすと DLL のフォルダは 1 つなので、ゲームごとに別の ini（ソケット）と台本を持たせるため。
+//! ini は **DLL のフォルダ**（台本 `script.txt` と同じ所。ゲームのフォルダではない）にある。`enable = 1` と書いた節があるときだけネットワークを開く（台本が無くても開く。人が選択を押し、マッチを操作する）。知らないキーは断る（綴りの誤りで既定の値のまま走らないように）。
+//! 宛先とソケットはネットワークの範囲 `scope` の中だけ（ガードは `higanr_core::guard`。開くときの `net_udp::open_scoped` でももう一度チェックする）。知らない `scope` の値は既定に落とさず断り、ネットワークを開かない（`lan` のつもりの誤記で loopback のまま開くと、接続できない理由が設定だと分からないため）。
+//! キーの一覧は `KEYS`（知らないキーは断る）。
+//! ini の置き場: ローダーの `--ini` / `--script` が子の環境変数（`higanr_core::ini::PATH_ENV` / `higanr_core::script::PATH_ENV`）に設定したパスがあればそれを、無ければ DLL のフォルダの `HiganRTool.ini` / `script.txt` を読む（`locate`）。同じ PC で 2 つのゲームを起動すると DLL のフォルダは 1 つなので、ゲームごとに別の ini（ソケット）と台本を持たせるため。
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
@@ -88,11 +22,12 @@ use higanr_core::lan_addr::{self, LanAddr};
 use higanr_core::link;
 use higanr_core::mode_pick::{self, Pick, Shape};
 use higanr_core::rollback;
+use higanr_core::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX, FF_UPDATES_MIN};
 use higanr_core::wire::{Mode, Seat};
 
 use crate::net_room::{Base, BaseError};
 use crate::netplay::{CheckSource, LatPlan, WAIT_BUDGET_US};
-use crate::rollback_resim::HitSe;
+use crate::rollback_resim::SeTiming;
 
 pub const INI_FILE: &str = "HiganRTool.ini";
 pub const SECTION: &str = "netplay";
@@ -132,7 +67,7 @@ fn player_name_of(raw: Option<&str>) -> String {
 /// （`NetSettings::mode_wish_if`）。false に戻せば全部 delay 方式（旗はこの 1 か所）。
 pub const ANNOUNCE_ROLLBACK: bool = true;
 
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 30] = [
     "room_server",
     "room",
     "lan_host",
@@ -161,6 +96,7 @@ const KEYS: [&str; 29] = [
     "mode",
     "rollback_ahead",
     "rollback_hit_se",
+    "rollback_cutin_se",
     "head_wait",
 ];
 
@@ -169,9 +105,9 @@ const KEYS: [&str; 29] = [
 const OLD_DELAY_KEYS: [&str; 2] = ["latency", "rollback_delay"];
 
 /// 観戦の節。`[netplay]` の `enable = 1` と一緒にだけ効く（ネットワークが無ければ観戦もしない）。この節が無い・`enable = 0` なら
-/// 今までと 1 バイトも違わない。
+/// 観戦のホストは何もしない。`ff_max` と `relay` は観戦者の側の設定で、`enable` に関わらず効く。
 pub const SPECTATE_SECTION: &str = "spectate";
-const SPECTATE_KEYS: [&str; 2] = ["enable", "code_dir"];
+const SPECTATE_KEYS: [&str; 5] = ["enable", "code_dir", "ff_max", "relay", "fake_uplink"];
 
 /// ini の `[spectate] enable = 1` のときの設定（ホストの側。観戦者は `[netplay] code_side = spectate`）。
 ///
@@ -180,8 +116,11 @@ const SPECTATE_KEYS: [&str; 2] = ["enable", "code_dir"];
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SpectateSettings {
     /// 観戦用の接続コード `spectate_code.txt` の置き場（相対なら DLL のフォルダから。無ければ `[netplay]` の `code_dir`、それも
-    /// 無ければ DLL のフォルダの `code`）。同じ PC で 3 台を起こすとき、ゲームごとに分けるため。`code_side = game` では使わない。
+    /// 無ければ DLL のフォルダの `code`）。同じ PC で 3 台を起動するとき、ゲームごとに分けるため。`code_side = game` では使わない。
     pub code_dir: Option<String>,
+    /// 開発用（配る ini には書かない）: 観戦者の上りの見積もり（B/s）を、測りで 2 組以上そろった番でこの値にする。実機のテストで
+    /// 片方を中継役に向く太さに、もう片方を細く見せる。
+    pub fake_uplink: Option<u32>,
 }
 
 fn spectate_of(ini: &Ini, notes: &mut Vec<IniNote>) -> Result<Option<SpectateSettings>, String> {
@@ -194,24 +133,79 @@ fn spectate_of(ini: &Ini, notes: &mut Vec<IniNote>) -> Result<Option<SpectateSet
                 line,
                 SPECTATE_SECTION,
                 k,
-                format!("知らないキー（読めるのは {}）", SPECTATE_KEYS.join(" / ")),
+                format!(
+                    "キーの記法が不適切です（使用可能なキー: {}）",
+                    SPECTATE_KEYS.join(" / ")
+                ),
             ));
         }
     }
     let code_dir = match ini.get(SPECTATE_SECTION, "code_dir") {
         None => None,
-        Some("") => return Err("[spectate] の code_dir が空".to_string()),
+        Some("") => return Err("[spectate] の code_dir が空です".to_string()),
         Some(v) => Some(v.to_string()),
     };
     let enable = match ini.get(SPECTATE_SECTION, "enable") {
         Some("1") => true,
         Some("0") | None => false,
         Some(v) => {
-            let why = format!("enable の値 {v:?} は 0 か 1");
+            let why = format!("enable の値 {v:?} は 0 か 1 にしてください");
             soft(notes, ini, SPECTATE_SECTION, "enable", Err(why), false)
         }
     };
-    Ok(enable.then_some(SpectateSettings { code_dir }))
+    let fake_uplink = match ini.get(SPECTATE_SECTION, "fake_uplink") {
+        None => None,
+        Some(v) => {
+            let read = num_in::<u32>(v, "fake_uplink").and_then(|n| {
+                if n == 0 {
+                    Err("fake_uplink の値は 1 以上の B/s にしてください".to_string())
+                } else {
+                    Ok(Some(n))
+                }
+            });
+            soft(notes, ini, SPECTATE_SECTION, "fake_uplink", read, None)
+        }
+    };
+    Ok(enable.then_some(SpectateSettings {
+        code_dir,
+        fake_uplink,
+    }))
+}
+
+/// ini の `[spectate] ff_max`（観戦者の早送りの速さ。1 表示あたりの更新の数で、8 なら 8 倍）。観戦者の側の設定なので、`enable` に
+/// 関わらず読む。範囲の外・数でない値は注を残して既定に戻す。
+fn ff_max_of(ini: &Ini, notes: &mut Vec<IniNote>) -> u32 {
+    let Some(v) = ini.get(SPECTATE_SECTION, "ff_max") else {
+        return FF_UPDATES_DEFAULT;
+    };
+    let read = num_in::<u32>(v, "ff_max").and_then(|n| {
+        if (FF_UPDATES_MIN..=FF_UPDATES_MAX).contains(&n) {
+            Ok(n)
+        } else {
+            Err(format!(
+                "ff_max の値 {n} は {FF_UPDATES_MIN}〜{FF_UPDATES_MAX} にしてください"
+            ))
+        }
+    });
+    soft(
+        notes,
+        ini,
+        SPECTATE_SECTION,
+        "ff_max",
+        read,
+        FF_UPDATES_DEFAULT,
+    )
+}
+
+/// ini の `[spectate] relay`（観戦中に、ほかの観戦者へ中継するか。既定 1）。観戦者の側の設定なので、`enable` に関わらず読む。
+/// 0・1 以外は注を残して既定に戻す。
+fn relay_of(ini: &Ini, notes: &mut Vec<IniNote>) -> bool {
+    let read = match ini.get(SPECTATE_SECTION, "relay") {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(v) => Err(format!("relay の値 {v:?} は 0 か 1 にしてください")),
+    };
+    soft(notes, ini, SPECTATE_SECTION, "relay", read, true)
 }
 
 /// 読めた値を返す。読めなければ注を足して `default`（その行は無いものとして扱う）。
@@ -260,7 +254,7 @@ pub enum CodeSide {
 pub enum ClipboardKind {
     #[default]
     System,
-    /// 置き場（`code_dir`）の `clip_out.txt` / `clip_in.txt`（開発用。検査と実機の回が利用者のクリップボードを書き換えないため）。
+    /// 置き場（`code_dir`）の `clip_out.txt` / `clip_in.txt`（開発用。検査と実機の検証が利用者のクリップボードを書き換えないため）。
     File,
 }
 
@@ -315,11 +309,11 @@ pub fn locate(
         Some(v) => {
             let p = PathBuf::from(v);
             if v.is_empty() {
-                return Err(format!("環境の変数 {env_name} が空"));
+                return Err(format!("環境変数 {env_name} が空です"));
             }
             if !p.is_absolute() {
                 return Err(format!(
-                    "環境の変数 {env_name} の値 {} が絶対パスでない",
+                    "環境変数 {env_name} の値 {} が絶対パスではありません",
                     p.display()
                 ));
             }
@@ -329,7 +323,7 @@ pub fn locate(
             })
         }
         None => {
-            let dir = dll_dir.ok_or("DLL のフォルダが分からない")?;
+            let dir = dll_dir.ok_or("DLL のフォルダが不明")?;
             Ok(Located {
                 path: dir.join(file_name),
                 from_env: None,
@@ -368,7 +362,7 @@ pub struct NetSettings {
     pub ipv6: bool,
     /// UPnP でポートの割り当てを頼むか（ini の `upnp`。`on` が既定。`scope = internet` のときだけ実際に頼む —— `net_udp::upnp_begin`）。
     pub upnp: bool,
-    /// 役割を決める乱数（大きい方がホスト）。無ければ開くときに時刻とプロセス番号から作る。
+    /// 役割を決める乱数（大きい方がホスト）。無ければ開くときに時刻とプロセス番号から作り、ゲーム内のメニューの接続ではホストの決め方も使う（`LinkSlot::set_host_pick`）。
     pub role_nonce: Option<u64>,
     /// 希望 latency（ini の `delay`。0〜8。auto（書かないときも）なら `DEFAULT_LATENCY` で、`latency_auto`）。
     pub latency: u8,
@@ -386,6 +380,10 @@ pub struct NetSettings {
     pub after_script: AfterScript,
     /// 観戦のホスト（`[spectate] enable = 1`）。None なら観戦しない。
     pub spectate: Option<SpectateSettings>,
+    /// 観戦者の早送りの速さ（ini の `[spectate] ff_max`。1〜16、既定 `FF_UPDATES_DEFAULT`。観戦のホストの設定とは別で、`enable` に関わらず読む）。
+    pub ff_max: u32,
+    /// 観戦中に、ほかの観戦者へ中継するか（ini の `[spectate] relay`。既定 true。観戦のホストの設定とは別で、`enable` に関わらず読む）。
+    pub relay: bool,
     /// 望むモード（ini の `mode = rollback | delay`。既定 rollback）。両者が rollback を望んだときだけ rollback
     /// （`handshake::ModeWish`）。HELLO に載せるのは `mode_wish`（`ANNOUNCE_ROLLBACK` を見る）。
     pub mode: Mode,
@@ -397,7 +395,9 @@ pub struct NetSettings {
     /// rollback に決まったときの R（ini の `rollback_ahead`。1〜16、既定 `rollback::DEFAULT_AHEAD` = 8）。ネットワークに載せない。
     pub rollback_ahead: u8,
     /// rollback のときの被弾音の鳴らし方（ini の `rollback_hit_se = confirmed | live`。既定 `confirmed`。ネットワークに載せない）。
-    pub rollback_hit_se: HitSe,
+    pub rollback_hit_se: SeTiming,
+    /// rollback のときのカットインの音の鳴らし方（ini の `rollback_cutin_se = confirmed | live`。既定 `confirmed`。ネットワークに載せない）。
+    pub rollback_cutin_se: SeTiming,
     /// ルームサーバーの宿（ini の `room_server`。`https://` は `wss://` に読み替える）。None ならゲーム内のメニューに「ルームマッチ」を
     /// 出さない。使うのは `code_side = game` だけ（ほかの形でも読み、使わない。配る ini の `code_side` の 1 行だけを書き換えた形が
     /// 読めるように）。
@@ -442,12 +442,12 @@ fn room_server_of(v: &str) -> Result<Base, String> {
     };
     let b = Base::parse(&ws).map_err(|e| {
         format!(
-            "room_server の値 {v:?} が読めない（{}）。形は https://名前[:ポート]",
+            "room_server の値 {v:?} が読み取り不能（{}）。形は https://名前[:ポート] です",
             match e {
-                BaseError::Scheme => "https:// で始まらない",
-                BaseError::Host => "宿の名が空か、英数字・- ・. の外の文字がある",
-                BaseError::Port => "ポートが 1〜65535 の数でない",
-                BaseError::Path => "宿の後ろにパス・問い（/ ? #）が付いている",
+                BaseError::Scheme => "https:// で始まっていません",
+                BaseError::Host => "ホスト名が空か英数字・- ・. 以外の文字があります",
+                BaseError::Port => "ポートが 1〜65535 の数ではありません",
+                BaseError::Path => "ホスト名の後ろにパス・クエリ（/ ? #）が付いています",
             }
         )
     })?;
@@ -458,7 +458,7 @@ fn room_server_of(v: &str) -> Result<Base, String> {
         )
     {
         return Err(format!(
-            "room_server の値 {v:?} は平文（http）。平文は 127.0.0.1 と localhost だけ（接続コードは秘密を含むので https で）"
+            "room_server の値 {v:?} は平文（http）です。平文は 127.0.0.1 と localhost だけ使えます（接続コードは秘密を含むので https にしてください）"
         ));
     }
     Ok(b)
@@ -469,17 +469,18 @@ fn num(s: &str, key: &str) -> Result<u64, String> {
         Some(h) => u64::from_str_radix(h, 16),
         None => s.parse::<u64>(),
     };
-    r.map_err(|_| format!("{key} の値 {s:?} が数として読めない"))
+    r.map_err(|_| format!("{key} の値 {s:?} が数値として読み取り不能"))
 }
 
 fn num_in<T: TryFrom<u64>>(s: &str, key: &str) -> Result<T, String> {
     let v = num(s, key)?;
-    T::try_from(v).map_err(|_| format!("{key} の値 {v} が大きすぎる"))
+    T::try_from(v).map_err(|_| format!("{key} の値 {v} が大きすぎます"))
 }
 
 fn addr(s: &str, key: &str) -> Result<SocketAddr, String> {
-    s.parse::<SocketAddr>()
-        .map_err(|_| format!("{key} の値 {s:?} が IP:ポート として読めない（名前は受けない）"))
+    s.parse::<SocketAddr>().map_err(|_| {
+        format!("{key} の値 {s:?} が IP:ポート として読み取り不能（名前は使えません）")
+    })
 }
 
 /// `bind = auto` が選んだアドレスの出どころ。
@@ -513,7 +514,7 @@ impl Bind {
         }
     }
 
-    /// 開くときのソケットのアドレスを決める。`route` は「外へ出る出口の自分のアドレス」を引く道具（本物は `net_udp::probe_route_ip`。
+    /// 開くときのソケットのアドレスを決める。`route` は「外へ出る出口の自分のアドレス」を引くツール（本物は `net_udp::probe_route_ip`。
     /// 検査はアドレスを注入する）。範囲 loopback では引かずに 127.0.0.1。lan / internet では IPv4 の出口のアドレスを採り、範囲のガード
     /// （`guard::check_bind`）を通らなければ、ネットワークを開かせないために理由と「手で書く」案内の文を返す。戻りの文字列はログの 1 行に足す。
     #[cfg_attr(not(test), allow(dead_code))]
@@ -525,7 +526,7 @@ impl Bind {
         self.resolve_by(scope, || route().map(|ip| (ip, AddrSource::Route)))
     }
 
-    /// `resolve` の、アドレスの出どころ（経路かアダプターの一覧か）も返す道具を渡す形。出どころはログの文に出る。
+    /// `resolve` の、アドレスの出どころ（経路かアダプターの一覧か）も返すツールを渡す形。出どころはログの文に出る。
     pub fn resolve_by(
         self,
         scope: Scope,
@@ -544,21 +545,21 @@ impl Bind {
             ));
         }
         let (ip, source) = pick().map_err(|e| {
-            format!("bind = auto:{port} で自分のアドレスを決められない（{e}）。{hint}")
+            format!("bind = auto:{port} で自分のアドレスを決められません（{e}）。{hint}")
         })?;
         let IpAddr::V4(v4) = ip else {
             return Err(format!(
-                "bind = auto:{port} が選んだアドレス {ip} は IPv4 でない（auto は IPv4 だけ）。{hint}"
+                "bind = auto:{port} が選んだアドレス {ip} は IPv4 ではありません（auto は IPv4 だけです）。{hint}"
             ));
         };
         if v4.is_loopback() {
             return Err(format!(
-                "bind = auto:{port} が選んだアドレス {v4} は loopback（外へ出る経路が無い）。{hint}"
+                "bind = auto:{port} が選んだアドレス {v4} は loopback です（外へ出るアドレスがありません）。{hint}"
             ));
         }
         let a = SocketAddr::new(IpAddr::V4(v4), port);
         guard::check_bind(a, scope, "bind = auto が選んだアドレス")
-            .map_err(|e| format!("bind = auto:{port} を使えない: {e}。{hint}"))?;
+            .map_err(|e| format!("bind = auto:{port} を使えません: {e}。{hint}"))?;
         let what = match source {
             AddrSource::Route => "外へ出る経路の自分のアドレス",
             AddrSource::Adapters => {
@@ -588,14 +589,12 @@ fn bind_of(s: &str, scope: Scope) -> Result<Bind, String> {
         let p = s.strip_prefix("auto:").unwrap_or_default();
         if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
             return Err(format!(
-                "bind の値 {s:?}: auto の後にポートが要る（auto:47001 の形。1〜65535）"
+                "bind の値 {s:?}: auto の後にポートが必要です（auto:47001 の形。1〜65535）"
             ));
         }
-        let port = p
-            .parse::<u16>()
-            .ok()
-            .filter(|&n| n != 0)
-            .ok_or_else(|| format!("bind の値 {s:?}: auto のポート {p} は 1〜65535"))?;
+        let port = p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(|| {
+            format!("bind の値 {s:?}: auto のポート {p} は 1〜65535 にしてください")
+        })?;
         return Ok(Bind::Auto(port));
     }
     let a = addr(s, "bind")?;
@@ -631,16 +630,16 @@ fn stun_of(v: &str, scope: Scope) -> Result<StunTarget, String> {
         guard::check_peer(a, scope)?;
         return Ok(StunTarget::Addr(a));
     }
-    let hint = "IP:ポート か 名前:ポート（例 stun.cloudflare.com:3478）で";
+    let hint = "IP:ポート か 名前:ポート（例 stun.cloudflare.com:3478）の形にしてください";
     let (host, p) = v
         .rsplit_once(':')
-        .ok_or_else(|| format!("stun の値 {v:?} が読めない。{hint}"))?;
+        .ok_or_else(|| format!("stun の値 {v:?} が読み取り不能。{hint}"))?;
     let port = if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
         None
     } else {
         p.parse::<u16>().ok().filter(|&n| n != 0)
     }
-    .ok_or_else(|| format!("stun の値 {v:?} のポート {p:?} は 1〜65535。{hint}"))?;
+    .ok_or_else(|| format!("stun の値 {v:?} のポート {p:?} は 1〜65535 にしてください。{hint}"))?;
     guard::check_host_name(host).map_err(|e| format!("stun の値 {v:?}: {e}。{hint}"))?;
     Ok(StunTarget::Name {
         host: host.to_string(),
@@ -670,7 +669,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
                 line,
                 SECTION,
                 k,
-                "知らないキー".to_string(),
+                "キーの記法が不適切です".to_string(),
             ));
         }
     }
@@ -678,9 +677,9 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
     match get("enable") {
         Some("1") => {}
         Some("0") | None => return Ok(None),
-        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1")),
+        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1 にしてください")),
     }
-    let need = |k: &str| get(k).ok_or(format!("[{SECTION}] に {k} が無い"));
+    let need = |k: &str| get(k).ok_or(format!("[{SECTION}] に {k} がありません"));
     let code_side = match get("code_side") {
         None => None,
         Some("offer") => Some(CodeSide::Offer),
@@ -689,7 +688,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         Some("game") => Some(CodeSide::Game),
         Some(v) => {
             return Err(format!(
-                "code_side の値 {v:?} は offer か answer か spectate か game"
+                "code_side の値 {v:?} は offer / answer / spectate / game のどれかにしてください"
             ));
         }
     };
@@ -702,9 +701,12 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         "scope",
         match get("scope") {
             None => Ok(Scope::default()),
-            Some(v) => {
-                Scope::parse(v).ok_or_else(|| format!("scope の値 {v:?} は {}", Scope::NAMES))
-            }
+            Some(v) => Scope::parse(v).ok_or_else(|| {
+                format!(
+                    "scope の値 {v:?} は {} のどれかにしてください",
+                    Scope::NAMES
+                )
+            }),
         },
         if shipped {
             SHIPPED_SCOPE
@@ -726,16 +728,20 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         _ => bind_of(need("bind")?, scope)?,
     };
     let spectate = spectate_of(ini, &mut notes)?;
+    let ff_max = ff_max_of(ini, &mut notes);
+    let relay = relay_of(ini, &mut notes);
     let clipboard = match (code_side, get("clipboard")) {
         (_, None) => ClipboardKind::default(),
         (Some(CodeSide::Game), Some("system")) => ClipboardKind::System,
         (Some(CodeSide::Game), Some("file")) => ClipboardKind::File,
         (Some(CodeSide::Game), Some(v)) => {
-            return Err(format!("clipboard の値 {v:?} は system か file"));
+            return Err(format!(
+                "clipboard の値 {v:?} は system か file にしてください"
+            ));
         }
         (_, Some(_)) => {
             return Err(
-                "clipboard は code_side = game と一緒にだけ書ける（ゲームの中のメニューが接続コードを受け渡す場所）"
+                "clipboard は code_side = game と一緒にのみ書けます（ゲームの中のメニューが接続コードを受け渡す場所）"
                     .to_string(),
             );
         }
@@ -745,7 +751,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         for k in ["session", "secret"] {
             if get(k).is_some() {
                 return Err(format!(
-                    "code_side = game では {k} を書けない（接続コードを作るたびに OS の乱数で引く。返す側のときは始める側のコードから取る）"
+                    "code_side = game では {k} を書けません（接続コードを作るたびに OS の乱数で決めます。返す側のときは始める側のコードから取ります）"
                 ));
             }
         }
@@ -757,13 +763,13 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         for k in ["peer", "session", "secret", "stun", "stun2", "candidates"] {
             if get(k).is_some() {
                 return Err(format!(
-                    "code_side = spectate では {k} を書けない（相手のアドレス・session・秘密は観戦用のコードから取る。見るだけの側は STUN も自分のコードも使わない）"
+                    "code_side = spectate では {k} を書けません（相手のアドレス・session・秘密は観戦用のコードから取ります。見るだけの側は STUN も自分のコードも使いません）"
                 ));
             }
         }
         if spectate.is_some() {
             return Err(
-                "code_side = spectate と [spectate]（観戦のホスト）は一緒に書けない（見るだけの側が観戦のホストにはなれない）"
+                "code_side = spectate と [spectate]（観戦のホスト）は一緒に書けません（見るだけの側が観戦のホストにはなれません）"
                     .to_string(),
             );
         }
@@ -772,7 +778,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         Some(_) => {
             if get("peer").is_some() {
                 return Err(
-                    "peer と code_side は一緒に書けない（相手の候補を手で書くか、接続コードで受け渡すかのどちらか一方）"
+                    "peer と code_side は一緒に書けません（相手の候補を手で書くか、接続コードで受け渡すかのどちらか一方です）"
                         .to_string(),
                 );
             }
@@ -787,8 +793,8 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             }
             // 候補のガード（数の上限・重なり）も読むときに見る（開いてから並べられないと分かるのを避ける）。
             Candidates::from_addrs(&peers)
-                .map_err(|e| format!("peer の候補 {peers:?} が並べられない: {e:?}"))?;
-            let (&peer, extra) = peers.split_first().ok_or("peer が空")?;
+                .map_err(|e| format!("peer の候補 {peers:?} を並べられません: {e:?}"))?;
+            let (&peer, extra) = peers.split_first().ok_or("peer が空です")?;
             (Some(peer), extra.to_vec())
         }
     };
@@ -796,28 +802,32 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         (_, None) => None,
         (None, Some(_)) => {
             return Err(
-                "code_dir は code_side と一緒にだけ書ける（接続コードのファイルの置き場）"
+                "code_dir は code_side と一緒にのみ書けます（接続コードのファイルの置き場）"
                     .to_string(),
             );
         }
-        (Some(_), Some("")) => return Err("code_dir が空".to_string()),
+        (Some(_), Some("")) => return Err("code_dir が空です".to_string()),
         (Some(_), Some(v)) => Some(v.to_string()),
     };
     let candidates = match (code_side, get("candidates")) {
         (_, None) => OwnCandidates::default(),
         (None, Some(_)) => {
             return Err(
-                "candidates は code_side と一緒にだけ書ける（自分の接続コードに載せる候補。peer の形には接続コードが無い）"
+                "candidates は code_side と一緒にのみ書けます（自分の接続コードに載せる候補。peer の形には接続コードがありません）"
                     .to_string(),
             );
         }
         (Some(_), Some("all")) => OwnCandidates::All,
         (Some(_), Some("mapped")) => OwnCandidates::Mapped,
-        (Some(_), Some(v)) => return Err(format!("candidates の値 {v:?} は all か mapped")),
+        (Some(_), Some(v)) => {
+            return Err(format!(
+                "candidates の値 {v:?} は all か mapped にしてください"
+            ));
+        }
     };
     if candidates == OwnCandidates::Mapped && get("stun").is_none_or(str::is_empty) {
         return Err(
-            "candidates = mapped には stun が要る（STUN で見えたアドレスだけを候補にするので、問い合わせ先が無いと候補が空になる）"
+            "candidates = mapped には stun が必要です（STUN で見えたアドレスだけを候補にするので、問い合わせ先がないと候補が空になります）"
                 .to_string(),
         );
     }
@@ -825,7 +835,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         for k in ["session", "secret"] {
             if get(k).is_some() {
                 return Err(format!(
-                    "code_side = answer では {k} を書けない（始める側の接続コードから取る）"
+                    "code_side = answer では {k} を書けません（始める側の接続コードから取ります）"
                 ));
             }
         }
@@ -861,7 +871,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             key,
-            Err(format!("{key} の値 {v:?} は on か off")),
+            Err(format!("{key} の値 {v:?} は on か off にしてください")),
             true,
         ),
     };
@@ -871,7 +881,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
     // rollback の D と delay 方式の希望 latency は同じ `delay` から作る。auto のときの数だけが方式ごとに違う
     // （D は `rollback::DEFAULT_DELAY`、latency は `DEFAULT_LATENCY`）。
     // 望むモードと D の読み方は、接続コードのウィンドウ（ローダー）が ini から今の形を出すのと同じでなければならないので
-    // core の `mode_pick::ini_shape` に置く。読めない行は、その行だけ無いものとして渡す。
+    // core の `mode_pick::ini_shape` にある。読めない行は、その行だけ無いものとして渡す。
     let mut readable = |key: &'static str| {
         let alone = mode_pick::ini_shape(|k| if k == key { get(k) } else { None });
         match alone {
@@ -895,7 +905,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "host_seat",
-            Err(format!("host_seat の値 {v:?} は 1 か 2")),
+            Err(format!("host_seat の値 {v:?} は 1 か 2 にしてください")),
             None,
         ),
     };
@@ -910,7 +920,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "check",
-            Err(format!("check の値 {v:?} は game か digest")),
+            Err(format!("check の値 {v:?} は game か digest にしてください")),
             CheckSource::Game,
         ),
     };
@@ -919,7 +929,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         None => WAIT_BUDGET_US,
     };
     if wait_budget_us == 0 {
-        return Err("wait_budget_us が 0（相手のワードを 1 度も待たない）".to_string());
+        return Err("wait_budget_us が 0 です（相手のワードを 1 度も待ちません）".to_string());
     }
     let lat_plan = match get("lat_plan") {
         None => LatPlan::default(),
@@ -928,15 +938,19 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
     let after_script = match get("after_script") {
         None | Some("bye") => AfterScript::Bye,
         Some("keep") => AfterScript::Keep,
-        Some(v) => return Err(format!("after_script の値 {v:?} は bye か keep")),
+        Some(v) => {
+            return Err(format!(
+                "after_script の値 {v:?} は bye か keep にしてください"
+            ));
+        }
     };
     if code_side == Some(CodeSide::Game)
         && spectate.as_ref().is_some_and(|sp| sp.code_dir.is_some())
     {
-        // ゲーム内のメニューの経路の観戦は、観戦用のコードをファイルに書かずルームサーバーで渡す（`spectate_offer`）。
+        // ゲーム内のメニューの経路の観戦は、観戦用のコードをファイルに書かず、ホストがルームサーバーで観戦者へ渡す（`spectate_offer`）。
         // 置き場は使われないので、書いたつもりで走らないよう断る。
         return Err(
-            "code_side = game では [spectate] の code_dir を書けない（観戦用のコードはファイルに書かず、ルームサーバーで観戦者へ渡す）"
+            "code_side = game では [spectate] の code_dir を書けません（観戦用のコードはファイルに書かず、ルームサーバーで観戦者へ渡します）"
                 .to_string(),
         );
     }
@@ -961,7 +975,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "room",
-            Err("room は room_server と一緒にだけ書ける（ルームサーバーが無いとルーム名は使われない）"
+            Err("room は room_server と一緒にのみ書けます（ルームサーバーがないとルーム名は使われません）"
                 .to_string()),
             None,
         ),
@@ -974,10 +988,10 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "lan_host",
-            // 形とポートだけ見る。VPN のアドレスも書かれるが、起動のときは VPN がつながっているか分からないので、範囲はメニューが使うときに見る。
+            // 形とポートだけ見る。VPN のアドレスも書かれるが、起動のときは VPN が接続しているか分からないので、範囲はメニューが使うときに見る。
             lan_addr::parse_form(v).map(Some).map_err(|_| {
                 format!(
-                    "lan_host の値 {v:?} は 192.168.0.2 か 192.168.0.2:17723 の形（LAN のアドレスとポート）"
+                    "lan_host の値 {v:?} は 192.168.0.2 か 192.168.0.2:17723 の形にしてください（LAN のアドレスとポート）"
                 )
             }),
             None,
@@ -997,22 +1011,24 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
     };
     if !(rollback::MIN_AHEAD..=rollback::MAX_AHEAD).contains(&rollback_ahead) {
         return Err(format!(
-            "rollback_ahead の値 {rollback_ahead} は {}〜{}",
+            "rollback_ahead の値 {rollback_ahead} は {}〜{} にしてください",
             rollback::MIN_AHEAD,
             rollback::MAX_AHEAD
         ));
     }
-    let rollback_hit_se = match get("rollback_hit_se") {
-        None => HitSe::default(),
+    let mut se_timing = |key: &str| match get(key) {
+        None => SeTiming::default(),
         Some(v) => soft(
             &mut notes,
             ini,
             SECTION,
-            "rollback_hit_se",
-            HitSe::parse(v),
-            HitSe::default(),
+            key,
+            SeTiming::parse(key, v),
+            SeTiming::default(),
         ),
     };
+    let rollback_hit_se = se_timing("rollback_hit_se");
+    let rollback_cutin_se = se_timing("rollback_cutin_se");
     let head_wait = match get("head_wait") {
         None | Some("1") => true,
         Some("0") => false,
@@ -1021,7 +1037,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
             ini,
             SECTION,
             "head_wait",
-            Err(format!("head_wait の値 {v:?} は 0 か 1")),
+            Err(format!("head_wait の値 {v:?} は 0 か 1 にしてください")),
             true,
         ),
     };
@@ -1051,11 +1067,14 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         lat_plan,
         after_script,
         spectate,
+        ff_max,
+        relay,
         mode,
         rollback_delay,
         rollback_delay_auto: delay_auto,
         rollback_ahead,
         rollback_hit_se,
+        rollback_cutin_se,
         room_server,
         room,
         lan_host,
@@ -1069,7 +1088,7 @@ fn lat_plan(v: &str) -> Result<LatPlan, String> {
     let mut items = Vec::new();
     for part in v.split_whitespace() {
         let Some((f, n)) = part.split_once(':') else {
-            return Err(format!("lat_plan の {part:?} は F:N の形で"));
+            return Err(format!("lat_plan の {part:?} は F:N の形にしてください"));
         };
         items.push((num(f, "lat_plan の F")?, num_in::<u8>(n, "lat_plan の N")?));
     }
@@ -1229,7 +1248,7 @@ impl NetSettings {
         }
     }
 
-    /// 繋がりのセッションの設定（`peer` の形。`secret` は ini の値か、開くときに OS の乱数で引いた値）。候補は読むときにガードを通してあるので、
+    /// 接続のセッションの設定（`peer` の形。`secret` は ini の値か、開くときに OS の乱数で引いた値）。候補は読むときにガードを通してあるので、
     /// ここで並べられないことは無い（あれば候補を空にし、何も送らず何も受けない）。session も `peer` の形では読むときに必ず
     /// Some にしてある。`key_seed` は使い捨ての鍵の種（呼び手が OS の乱数で引く。`net_udp::draw_key_seed`）。
     pub fn link_config(
@@ -1269,9 +1288,9 @@ impl NetSettings {
                 continue;
             }
             let c = Candidate::guess(a)
-                .map_err(|e| format!("自分のアドレス {a} を候補にできない: {e:?}"))?;
+                .map_err(|e| format!("自分のアドレス {a} を候補にできません: {e:?}"))?;
             own.push(c)
-                .map_err(|e| format!("自分の候補を並べられない: {e:?}"))?;
+                .map_err(|e| format!("自分の候補を並べられません: {e:?}"))?;
         }
         Self::push_local_port_on_mapped(&mut own, local, mapped)?;
         Self::push_upnp_port_on_mapped(&mut own, mapped, upnp_port)?;
@@ -1280,7 +1299,7 @@ impl NetSettings {
     }
 
     /// STUN で見えた IPv4 のアドレスに、自分のソケットのポートを足す候補。ルーターが外側のポートを付け替えると、開けたポートは
-    /// `mapped` のポートに無い。このアドレスとポートは開けたポートを指すので、相手の HELLO がそこへ届けば学んだ候補が本当の送り元へ返す。
+    /// `mapped` のポートに無い。このアドレスとポートは開けたポートを指すので、相手の HELLO がそこへ届けば、自分が学んだ候補（HELLO の本当の送り元）へ返す。
     /// アドレスが IPv6 のときと、ポートが同じときは足さない。外側のアドレスと同じ優先で並ぶので、`mapped` の直後になる。
     fn push_local_port_on_mapped(
         own: &mut Candidates,
@@ -1295,10 +1314,10 @@ impl NetSettings {
             return Ok(());
         }
         let c = Candidate::guess(a).map_err(|e| {
-            format!("STUN で見えたアドレスに受信ソケットのポートを足せない: {a}: {e:?}")
+            format!("STUN で見えたアドレスに受信ソケットのポートを足せません: {a}: {e:?}")
         })?;
         own.push(c)
-            .map_err(|e| format!("自分の候補を並べられない: {e:?}"))?;
+            .map_err(|e| format!("自分の候補を並べられません: {e:?}"))?;
         Ok(())
     }
 
@@ -1317,9 +1336,9 @@ impl NetSettings {
             return Ok(());
         }
         let c = Candidate::guess(a)
-            .map_err(|e| format!("UPnP の外側のポートの候補を作れない: {a}: {e:?}"))?;
+            .map_err(|e| format!("UPnP の外側のポートの候補を作成できません: {a}: {e:?}"))?;
         own.push(c)
-            .map_err(|e| format!("自分の候補を並べられない: {e:?}"))?;
+            .map_err(|e| format!("自分の候補を並べられません: {e:?}"))?;
         Ok(())
     }
 
@@ -1328,14 +1347,14 @@ impl NetSettings {
             && !own.contains(c.addr)
         {
             own.push(c)
-                .map_err(|e| format!("自分の IPv6 の候補を並べられない: {e:?}"))?;
+                .map_err(|e| format!("自分の IPv6 の候補を並べられません: {e:?}"))?;
         }
         Ok(())
     }
 
     /// 自分のコードに載せる候補（ini の `candidates`）。`All` は `own_candidates`。`Mapped` は STUN で見えたアドレス（`mapped`）だけで、
     /// ソケット `local` は載せない（IPv6 のソケット `v6` は世界に通じるアドレスなので載せる）。載せる候補が空になるとき
-    /// （`mapped` も `v6` も無い）は Err（呼び手はネットワークを開かない。理由を本ログとウィンドウへ）。
+    /// （`mapped` も `v6` も無い）は Err（呼び手はネットワークを開かない。呼び手が理由を本ログとウィンドウへ出す）。
     pub fn candidates_for(
         &self,
         local: SocketAddr,
@@ -1353,23 +1372,34 @@ impl NetSettings {
         v6: Option<SocketAddr>,
         upnp_port: Option<u16>,
     ) -> Result<Candidates, String> {
-        match self.candidates {
+        Self::candidates_with(self.candidates, local, mapped, v6, upnp_port)
+    }
+
+    /// `candidates_for_upnp` の本体（設定を持たずに作り直す呼び手のため、`candidates` の値を引数で受ける）。
+    pub fn candidates_with(
+        mode: OwnCandidates,
+        local: SocketAddr,
+        mapped: Option<SocketAddr>,
+        v6: Option<SocketAddr>,
+        upnp_port: Option<u16>,
+    ) -> Result<Candidates, String> {
+        match mode {
             OwnCandidates::All => Self::own_candidates_upnp(local, mapped, v6, upnp_port),
             OwnCandidates::Mapped => {
                 let mut own = Candidates::EMPTY;
                 if let Some(m) = mapped {
                     let c = Candidate::guess(m).map_err(|e| {
-                        format!("STUN で見えたアドレス {m} を候補にできない: {e:?}")
+                        format!("STUN で見えたアドレス {m} を候補にできません: {e:?}")
                     })?;
                     own.push(c)
-                        .map_err(|e| format!("自分の候補を並べられない: {e:?}"))?;
+                        .map_err(|e| format!("自分の候補を並べられません: {e:?}"))?;
                 }
                 Self::push_local_port_on_mapped(&mut own, local, mapped)?;
                 Self::push_upnp_port_on_mapped(&mut own, mapped, upnp_port)?;
                 Self::push_own_v6(&mut own, v6)?;
                 if own.is_empty() {
                     return Err(
-                        "candidates = mapped なのに STUN で見えたアドレスも世界に通じる IPv6 のアドレスも無い（載せる候補が空になるのでネットワークを開かない）"
+                        "candidates = mapped なのに STUN で見えたアドレスも世界に通じる IPv6 のアドレスもありません（載せる候補が空になるのでネットワークを開きません）"
                             .to_string(),
                     );
                 }
@@ -1397,7 +1427,7 @@ impl NetSettings {
             candidates: self.candidates_for(local, mapped, v6)?,
             expires: now_unix.saturating_add(code::DEFAULT_TTL_SECS),
         })
-        .map_err(|e| format!("接続コードを書けない: {e:?}"))
+        .map_err(|e| format!("接続コードを書けません: {e:?}"))
     }
 
     /// ログ用の接続コードの置き場（ユーザー名を含みうる絶対パスは書かず、最後の 1 要素だけ）。
@@ -1539,7 +1569,7 @@ impl NetSettings {
     fn mode_text(&self) -> String {
         let base = self.mode_text_ini();
         // 接続コードのウィンドウで形を選べる実行（offer / answer。観戦は選べない）では、この行は ini の形のまま。ウィンドウで選べば、後に出る
-        // 接続コードの行と繋がった後の「対戦の形が決まった」の行が実際の形を言う。
+        // 接続コードの行と接続した後の「対戦の形が決まった」の行が実際の形を言う。
         match self.code_side {
             Some(CodeSide::Offer | CodeSide::Answer) => {
                 format!("{base}（接続コードのウィンドウで選べば、後の接続コードの行が勝つ）")
@@ -1555,7 +1585,12 @@ impl NetSettings {
     pub fn old_key_notes(&self) -> Vec<String> {
         self.old_keys
             .iter()
-            .map(|k| format!("古いキー {k} は読まない。{} を使う", mode_pick::DELAY_KEY))
+            .map(|k| {
+                format!(
+                    "古いキー {k} は読みません。{} を使います。",
+                    mode_pick::DELAY_KEY
+                )
+            })
             .collect()
     }
 
@@ -2056,7 +2091,7 @@ mod tests {
             let notes = s.old_key_notes();
             assert_eq!(notes.len(), want.len(), "{extra:?}");
             for (n, k) in notes.iter().zip(&want) {
-                assert_eq!(n, &format!("古いキー {k} は読まない。delay を使う"));
+                assert_eq!(n, &format!("古いキー {k} は読みません。delay を使います。"));
             }
         }
         // 古いキーと新しいキーが両方あれば、新しいキーだけ。
@@ -2091,8 +2126,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: `lan_host` が既定で空にならない、LAN のアドレスとポートが読めない、決まりの外の値（LAN の外・形が違う）を黙って使う
-    /// （使わずに注を残し、設定の残りは動かす）。
     #[test]
     fn lan_host_reads_a_lan_address_and_notes_anything_else() {
         assert_eq!(from_text(OK).unwrap().unwrap().lan_host, None);
@@ -2125,7 +2158,7 @@ mod tests {
             assert_eq!(s.lan_host, None, "{bad}");
             assert_eq!(note_keys(&s), vec!["lan_host"], "{bad}");
         }
-        // LAN の外のアドレス（VPN の 26/8 など）は、VPN がつながる前の起動でも注にしない。使うかは入力の欄が VPN のネットワークと突き合わせて決める。
+        // LAN の外のアドレス（VPN の 26/8 など）は、VPN が接続する前の起動でも注にしない。使うかは入力の欄が VPN のネットワークと突き合わせて決める。
         for outside in ["26.12.34.56:19000", "25.1.2.3", "8.8.8.8"] {
             let s = from_text(&format!("{OK}lan_host = {outside}\n"))
                 .unwrap()
@@ -2168,7 +2201,7 @@ mod tests {
     fn rollback_hit_se_defaults_to_confirmed_and_reads_the_two_spellings_only() {
         assert_eq!(
             from_text(OK).unwrap().unwrap().rollback_hit_se,
-            HitSe::Confirmed,
+            SeTiming::Confirmed,
             "既定は確定まで待つ"
         );
         let c = from_text(&format!("{OK}rollback_hit_se = confirmed\n"))
@@ -2179,11 +2212,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             (c.rollback_hit_se, l.rollback_hit_se),
-            (HitSe::Confirmed, HitSe::Live)
+            (SeTiming::Confirmed, SeTiming::Live)
         );
         assert_eq!(
             NetSettings {
-                rollback_hit_se: HitSe::Confirmed,
+                rollback_hit_se: SeTiming::Confirmed,
                 ..l
             },
             c
@@ -2196,9 +2229,79 @@ mod tests {
             ("rollback_hit_sd = live", "rollback_hit_sd"),
         ] {
             let s = from_text(&format!("{OK}{bad}\n")).unwrap().unwrap();
-            assert_eq!(s.rollback_hit_se, HitSe::Confirmed, "{bad}: 既定");
+            assert_eq!(s.rollback_hit_se, SeTiming::Confirmed, "{bad}: 既定");
             assert_eq!(note_keys(&s), vec![key], "{bad}");
         }
+    }
+
+    #[test]
+    fn rollback_cutin_se_defaults_to_confirmed_reads_the_two_spellings_only_and_is_independent() {
+        assert_eq!(
+            from_text(OK).unwrap().unwrap().rollback_cutin_se,
+            SeTiming::Confirmed,
+            "既定は確定まで待つ"
+        );
+        let c = from_text(&format!("{OK}rollback_cutin_se = confirmed\n"))
+            .unwrap()
+            .unwrap();
+        let l = from_text(&format!("{OK}rollback_cutin_se = live\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (c.rollback_cutin_se, l.rollback_cutin_se),
+            (SeTiming::Confirmed, SeTiming::Live)
+        );
+        assert_eq!(
+            (c.rollback_hit_se, l.rollback_hit_se),
+            (SeTiming::Confirmed, SeTiming::Confirmed),
+            "カットインの音の行が被弾音に効いた"
+        );
+        assert_eq!(
+            NetSettings {
+                rollback_cutin_se: SeTiming::Confirmed,
+                ..l
+            },
+            c
+        );
+        let both = from_text(&format!(
+            "{OK}rollback_hit_se = live\nrollback_cutin_se = confirmed\n"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (both.rollback_hit_se, both.rollback_cutin_se),
+            (SeTiming::Live, SeTiming::Confirmed)
+        );
+        let both = from_text(&format!(
+            "{OK}rollback_hit_se = confirmed\nrollback_cutin_se = live\n"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (both.rollback_hit_se, both.rollback_cutin_se),
+            (SeTiming::Confirmed, SeTiming::Live)
+        );
+        for (bad, key) in [
+            ("rollback_cutin_se =", "rollback_cutin_se"),
+            ("rollback_cutin_se = Live", "rollback_cutin_se"),
+            ("rollback_cutin_se = on", "rollback_cutin_se"),
+            ("rollback_cutin_se = 1", "rollback_cutin_se"),
+            ("rollback_cutin_sd = live", "rollback_cutin_sd"),
+        ] {
+            let s = from_text(&format!("{OK}{bad}\n")).unwrap().unwrap();
+            assert_eq!(s.rollback_cutin_se, SeTiming::Confirmed, "{bad}: 既定");
+            assert_eq!(note_keys(&s), vec![key], "{bad}");
+        }
+        let s = from_text(&format!(
+            "{OK}rollback_hit_se = live\nrollback_cutin_se = Live\n"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (s.rollback_hit_se, s.rollback_cutin_se),
+            (SeTiming::Live, SeTiming::Confirmed),
+            "片方の綴りの誤りがもう片方を巻き込んだ"
+        );
     }
 
     #[test]
@@ -2831,6 +2934,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m2_sample_ini_reads_as_documented() {
         let text = include_str!("../../../scripts/m2_netplay.ini");
@@ -2849,6 +2953,7 @@ mod tests {
         );
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m6_3_watch_ini_is_a_spectator_that_keeps_measuring() {
         let s = from_text(include_str!("../../../scripts/m6_3_watch.ini"))
@@ -2866,6 +2971,7 @@ mod tests {
         assert!(s.peer.is_none() && s.scope == Scope::Loopback);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_two_game_inis_mirror_each_other() {
         let h = from_text(include_str!("../../../scripts/two_host.ini"))
@@ -2955,6 +3061,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_code_inis_pair_up() {
         let o = from_text(include_str!("../../../scripts/code_offer.ini"))
@@ -3013,12 +3120,12 @@ mod tests {
                 "[netplay]\nenable = 1\nbind = 127.0.0.1:0\npeer = 127.0.0.1:7002\nsession = 1\nstun = 127.0.0.1:3478\ncandidates = {v}\n"
             ))
             .unwrap_err();
-            assert!(e.contains("code_side と一緒にだけ"), "{v}: {e}");
+            assert!(e.contains("code_side と一緒にのみ"), "{v}: {e}");
         }
         let no_stun = "[netplay]\nenable = 1\nbind = 127.0.0.1:0\ncode_side = offer\n";
         for extra in ["candidates = mapped\n", "candidates = mapped\nstun =\n"] {
             let e = from_text(&format!("{no_stun}{extra}")).unwrap_err();
-            assert!(e.contains("stun が要る"), "{extra:?}: {e}");
+            assert!(e.contains("stun が必要"), "{extra:?}: {e}");
         }
         assert!(from_text(&format!("{no_stun}candidates = all\n")).is_ok());
 
@@ -3057,6 +3164,7 @@ mod tests {
         );
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_hairpin_inis_pair_up() {
         let o = from_text(include_str!("../../../scripts/hairpin_offer.ini"))
@@ -3071,7 +3179,7 @@ mod tests {
         );
         for s in [&o, &a] {
             assert_eq!(s.candidates, OwnCandidates::Mapped);
-            assert!(!s.upnp, "実機の回で使う人のルーターを書き換えない");
+            assert!(!s.upnp, "実機の検証で使う人のルーターを書き換えない");
             assert_eq!(s.scope, Scope::Internet);
             assert!(matches!(s.stun, Some(StunTarget::Name { port: 3478, .. })));
             assert!(s.peer.is_none() && s.session_id.is_none() && s.secret.is_none());
@@ -3091,6 +3199,10 @@ mod tests {
             (o.latency, o.host_seat, o.check, o.after_script),
             (a.latency, a.host_seat, a.check, a.after_script)
         );
+    }
+
+    #[test]
+    fn the_shipped_ini_has_no_candidates_line() {
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini");
         assert!(
             !dist.contains("candidates"),
@@ -3098,6 +3210,7 @@ mod tests {
         );
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_lan_inis_pair_up() {
         let o = from_text(include_str!("../../../scripts/lan_offer.ini"))
@@ -3142,6 +3255,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m8_4_choose_inis_pair_up() {
         let read = |t: &str| from_text(t).unwrap().expect("ネットワークが開かない");
@@ -3178,6 +3292,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_shape_inis_pair_up() {
         let (a_text, b_text) = (
@@ -3237,7 +3352,7 @@ mod tests {
             assert_eq!(r.split, higanr_core::vault::Split::Peer);
         }
         let relay = format!("--a {a_bind} --b {b_bind} --via-a {a_peer} --via-b {b_peer}");
-        // 回の定義が A に shape_a.ini・B に shape_b.ini を指す（`runs_consistency` は 2 台の回の ini の取り違えを見ない）。
+        // 回の定義が、ホストの A に shape_a.ini・ゲストの B に shape_b.ini を指す（`runs_consistency` は 2 台の回の ini の取り違えを見ない）。
         for (run, ini_line) in [
             (
                 include_str!("../../../scripts/runs/shape_1_a.run"),
@@ -3267,6 +3382,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_two_game_scripts_pair_up() {
         use higanr_core::input_model::keys;
@@ -3280,6 +3396,7 @@ mod tests {
         assert_eq!(taps, 18);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_busy_two_game_scripts_press_many_words_and_pair_up() {
         use higanr_core::input_model::keys;
@@ -3322,6 +3439,7 @@ mod tests {
         assert!((6000..=12000).contains(&ticks), "試合の中が {ticks} tick");
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_third_two_game_scripts_walk_pause_title_chara_change_and_rematches() {
         use higanr_core::input_model::keys;
@@ -3345,7 +3463,7 @@ mod tests {
         let esc1 = at(0, &|s| plain(s, keys::ESC));
         let resume = at(esc1 + 1, &|s| paused(s) && plain(s, keys::Z));
         assert_eq!(resume, esc1 + 1, "Esc の次が「再開」でない");
-        // ② 一時停止（Esc）→ 下 → Z（タイトルへ戻る）→ 上 → Z（確かめの「はい」）→ 画面 8。
+        // ② 一時停止（Esc）→ 下 → Z（タイトルへ戻る）→ 上 → Z（確認の「はい」）→ 画面 8。
         let esc2 = at(resume + 1, &|s| plain(s, keys::ESC));
         let down = at(esc2 + 1, &|s| paused(s) && plain(s, keys::DOWN));
         for (i, k) in [keys::Z, keys::UP, keys::Z].iter().enumerate() {
@@ -3426,7 +3544,7 @@ mod tests {
             // 再戦の Z の前も ③ と同じ形（メニューを待つ上限は、マッチが長引いても中止しない長さ。1 マッチは約 12480 tick）。
             menu_pair(tail, i);
         }
-        // 会話を送る段階・会話の条件・endmenu は、どの台本にも置かない（会話の間もメニューは Z を受け付ける）。
+        // 会話を送る段階・会話の条件・endmenu は、どの台本にも書かない（会話の間もメニューは Z を受け付ける）。
         for (name, sc) in [("ホスト", &host), ("ゲスト", &guest)] {
             for s in &sc.steps {
                 assert!(
@@ -3484,6 +3602,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     fn match_tail(sc: &higanr_core::script::Script) -> Vec<(u32, u32, u16)> {
         let i = sc
             .steps
@@ -3498,6 +3617,7 @@ mod tests {
 
     /// 2 台の台本の組の共通の決まり（選択の経路と、ホスト 1P・ゲスト 2P の押し分け）。読んだ台本を返す。`allowed_down` は、
     /// タイトルの外で下を押してよい段階の `note`（一時停止のメニューの中 = `pause=1` の段階は名指しなしで通す）。
+    #[cfg(dev_assets)]
     fn check_two_game_pair(
         host: &str,
         guest: &str,
@@ -3546,6 +3666,7 @@ mod tests {
         (host, guest)
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m2_5_human_ini_is_the_m2_sample_and_can_keep_the_net() {
         let text = include_str!("../../../scripts/m2_05_human.ini");
@@ -3563,6 +3684,7 @@ mod tests {
         assert_eq!(keep.after_script, AfterScript::Keep);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m2_4_host_ini_is_the_m2_sample_plus_a_latency_plan() {
         let s = from_text(include_str!("../../../scripts/m2_04_host.ini"))
@@ -3805,7 +3927,6 @@ mod tests {
         assert!(s.spectate.is_some(), "enable は読める");
     }
 
-    /// 壊れたら落ちる: 配る ini が既定値として書いた行（行を消しても同じになるはずの行）の値が、読み手の既定とずれる。
     /// `host_seat` は「行が無い」ことが「おまかせ」なので、行を書かない（注のまま）。
     #[test]
     fn the_explicit_default_lines_of_the_shipped_ini_equal_leaving_them_out() {
@@ -3818,6 +3939,7 @@ mod tests {
             "lan_host =\n",
             "mode = rollback\n",
             "rollback_hit_se = confirmed\n",
+            "rollback_cutin_se = confirmed\n",
         ] {
             assert_eq!(dist.matches(&format!("\n{line}")).count(), 1, "{line}");
             bare = bare.replacen(&format!("\n{line}"), "\n", 1);
@@ -3825,19 +3947,22 @@ mod tests {
         let without = from_text(&bare).unwrap().unwrap();
         assert_eq!(with, without);
         assert!(with.ipv6 && with.room.is_none() && with.lan_host.is_none());
-        assert_eq!(with.rollback_hit_se, HitSe::Confirmed);
+        assert_eq!(with.rollback_hit_se, SeTiming::Confirmed);
+        assert_eq!(with.rollback_cutin_se, SeTiming::Confirmed);
         assert!(
             !dist.lines().any(|l| l.starts_with("host_seat")),
             "おまかせは行が無いこと"
         );
-        // [pacing] の auto_window は処理を軽くする選択肢なので注のまま。外して書けば b-hybrid が効く。
+        // [pacing] の mode・wait・vsync の行は既定値と同じ。
         let pacing = |t: &str| higanr_core::pacing::mode_from_ini(&ini::parse(t).unwrap());
-        assert!(pacing(&dist).is_ok());
-        let line = "\n; auto_window = b-hybrid\n";
-        assert!(dist.contains(line));
-        let opened = dist.replacen(line, "\nauto_window = b-hybrid\n", 1);
-        assert!(pacing(&opened).is_ok());
-        assert_ne!(pacing(&opened), pacing(&dist));
+        let mut bare = dist.clone();
+        for line in ["mode = auto\n", "wait = passive\n", "vsync = off\n"] {
+            assert_eq!(dist.matches(&format!("\n{line}")).count(), 1, "{line}");
+            bare = bare.replacen(&format!("\n{line}"), "\n", 1);
+        }
+        assert_eq!(pacing(&dist), pacing(&bare));
+        assert_eq!(pacing(&dist), Ok(higanr_core::pacing::PacingIni::DEFAULT));
+        assert!(!dist.contains("auto_window"));
     }
 
     #[test]
@@ -3918,7 +4043,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(on.code_side, Some(CodeSide::Game));
-        assert_eq!(on.spectate, Some(SpectateSettings { code_dir: None }));
+        assert_eq!(on.spectate, Some(SpectateSettings::default()));
         for off in ["", "[spectate]\nenable = 0\n"] {
             let s = from_text(&format!("{base}{off}")).unwrap().unwrap();
             assert_eq!(s.spectate, None, "{off:?}");
@@ -3942,7 +4067,8 @@ mod tests {
         assert_eq!(
             v0.spectate,
             Some(SpectateSettings {
-                code_dir: Some("spec_a".to_string())
+                code_dir: Some("spec_a".to_string()),
+                ..SpectateSettings::default()
             })
         );
     }
@@ -4021,7 +4147,7 @@ mod tests {
         let on = from_text(&format!("{OK}[spectate]\nenable = 1\n"))
             .unwrap()
             .unwrap();
-        assert_eq!(on.spectate, Some(SpectateSettings { code_dir: None }));
+        assert_eq!(on.spectate, Some(SpectateSettings::default()));
         assert_eq!(
             NetSettings {
                 spectate: None,
@@ -4035,7 +4161,8 @@ mod tests {
         assert_eq!(
             dir.spectate,
             Some(SpectateSettings {
-                code_dir: Some("spec_a".to_string())
+                code_dir: Some("spec_a".to_string()),
+                ..SpectateSettings::default()
             })
         );
         // 知らないキーと読めない enable は、その行だけ捨てる。code_dir の空は従来どおり断る。
@@ -4056,6 +4183,108 @@ mod tests {
         assert!(from_text(&format!("{OK}[spectate]\nenable = 1\ncode_dir =\n")).is_err());
         let off = "[netplay]\nenable = 0\nbind = 127.0.0.1:0\n[spectate]\nenable = 1\n";
         assert_eq!(from_text(off).unwrap(), None);
+    }
+
+    /// `[spectate] ff_max` は観戦者の側の設定で、`enable` に関わらず読む。既定 8、範囲は 1〜16。範囲の外・数でない値は注を残して既定。
+    #[test]
+    fn ff_max_reads_one_to_sixteen_with_or_without_enable_and_falls_back_on_bad_values() {
+        assert_eq!(FF_UPDATES_DEFAULT, 8);
+        let base = from_text(OK).unwrap().unwrap();
+        assert_eq!(base.ff_max, 8, "既定");
+        for (text, want) in [
+            ("[spectate]\nff_max = 1\n", 1),
+            ("[spectate]\nff_max = 16\n", 16),
+            ("[spectate]\nff_max = 4\n", 4),
+            // 観戦のホスト（enable）と関係なく読む。
+            ("[spectate]\nenable = 0\nff_max = 12\n", 12),
+            ("[spectate]\nenable = 1\nff_max = 12\n", 12),
+        ] {
+            let s = from_text(&format!("{OK}{text}")).unwrap().unwrap();
+            assert_eq!(s.ff_max, want, "{text:?}");
+            assert!(s.ini_notes.is_empty(), "{text:?}: 正しい値に注が付いた");
+        }
+        // 観戦者の形（code_side = spectate）でも読める。
+        let viewer_base = "[netplay]\nenable = 1\nscope = lan\nbind = 127.0.0.1:47201\n";
+        let viewer = from_text(&format!(
+            "{viewer_base}code_side = spectate\nname = viewer\ncode_dir = watch_a\n[spectate]\nff_max = 3\n"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(viewer.ff_max, 3);
+        for bad in ["0", "17", "-1", "abc", "", "8.5", "4294967297"] {
+            let s = from_text(&format!("{OK}[spectate]\nff_max = {bad}\n"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(s.ff_max, 8, "{bad:?}: 読めない行は既定");
+            assert_eq!(note_keys(&s), vec!["ff_max"], "{bad:?}");
+        }
+        // キーの綴りの間違いは、ff_max を読まず、そのキーに注が付く。
+        let typo = from_text(&format!("{OK}[spectate]\nff_mx = 3\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((typo.ff_max, note_keys(&typo)), (8, vec!["ff_mx"]));
+    }
+
+    #[test]
+    fn relay_is_on_by_default_reads_zero_and_one_and_falls_back_on_bad_values() {
+        let base = from_text(OK).unwrap().unwrap();
+        assert!(base.relay, "既定");
+        for (text, want) in [
+            ("[spectate]\nrelay = 0\n", false),
+            ("[spectate]\nrelay = 1\n", true),
+            ("[spectate]\nenable = 0\nrelay = 0\n", false),
+            ("[spectate]\nenable = 1\nrelay = 0\n", false),
+        ] {
+            let s = from_text(&format!("{OK}{text}")).unwrap().unwrap();
+            assert_eq!(s.relay, want, "{text:?}");
+            assert!(s.ini_notes.is_empty(), "{text:?}: 正しい値に注が付いた");
+        }
+        for bad in ["2", "yes", "", "-1", "true"] {
+            let s = from_text(&format!("{OK}[spectate]\nrelay = {bad}\n"))
+                .unwrap()
+                .unwrap();
+            assert!(s.relay, "{bad:?}: 読めない行は既定");
+            assert_eq!(note_keys(&s), vec!["relay"], "{bad:?}");
+        }
+    }
+
+    /// 開発用の `[spectate] fake_uplink`（B/s）は、観戦のホスト（`[spectate]` の `enable = 1`）の設定として読む。0・数でない値は注を残して無いものとして扱う。
+    #[test]
+    fn fake_uplink_is_a_host_side_dev_key_that_reads_a_positive_number_and_ignores_bad_values() {
+        let up = |text: &str| {
+            from_text(&format!("{OK}{text}"))
+                .unwrap()
+                .unwrap()
+                .spectate
+                .and_then(|s| s.fake_uplink)
+        };
+        assert_eq!(up("[spectate]\nenable = 1\n"), None, "既定は無し");
+        assert_eq!(
+            up("[spectate]\nenable = 1\nfake_uplink = 90000\n"),
+            Some(90_000)
+        );
+        assert_eq!(
+            up("[spectate]\nenable = 1\nfake_uplink = 0x10000\n"),
+            Some(65_536)
+        );
+        assert_eq!(
+            up("[spectate]\nenable = 0\nfake_uplink = 90000\n"),
+            None,
+            "ホストでなければ無い"
+        );
+        for bad in ["0", "-1", "fast", "", "4294967296"] {
+            let s = from_text(&format!(
+                "{OK}[spectate]\nenable = 1\nfake_uplink = {bad}\n"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                s.spectate.as_ref().and_then(|s| s.fake_uplink),
+                None,
+                "{bad:?}: 読めない行は無し"
+            );
+            assert_eq!(note_keys(&s), vec!["fake_uplink"], "{bad:?}");
+        }
     }
 
     #[test]

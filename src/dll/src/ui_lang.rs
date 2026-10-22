@@ -53,7 +53,7 @@ pub fn current() -> Lang {
     }
 }
 
-/// 今の言語を置く（起動のときの読み取りのスレッドと、メニューで替えたゲームのスレッド）。確保しない。
+/// 今の言語を設定する（起動のときの読み取りのスレッドと、メニューで替えたゲームのスレッド）。確保しない。
 pub fn set(l: Lang) {
     #[cfg(not(test))]
     CURRENT.set(l);
@@ -64,7 +64,7 @@ pub fn set(l: Lang) {
 /// ini の `[ui] lang` を `lang` に書き換える。ほかの設定の書き戻しと同じ鍵の中で書く（`ini_store`）。
 /// 中身が変わらなければ書かない。`path` が無い（ini なしで走っている）なら書かずに誤りを返す。
 pub fn save_to_ini(path: Option<&Path>, lang: Lang) -> Result<(), String> {
-    let path = path.ok_or("ini の置き場が分からない（ini なしの実行）ので言語を書かない")?;
+    let path = path.ok_or("ini の場所が不明（ini なしの実行）なので言語を書きません")?;
     ini_store::update(
         path,
         &[Edit::Set {

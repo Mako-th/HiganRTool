@@ -1,4 +1,4 @@
-//! 道具の画面の言語（日本語・英語）。pure。
+//! ツールの画面の言語（日本語・英語）。pure。
 //!
 //! 決まり方は、ini の `[ui] lang`（`auto` / `ja` / `en`）→ `auto` なら OS の UI の言語（`resolve`）。メニューで選んだ値は
 //! ini の `lang` の行へ書き戻す（`set_lang_in_ini_text`）。
@@ -82,7 +82,7 @@ pub fn setting_in_ini(ini: &Ini) -> Result<LangSetting, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -90,9 +90,9 @@ pub fn setting_in_ini(ini: &Ini) -> Result<LangSetting, String> {
     match ini.get(SECTION, "lang") {
         None => Ok(LangSetting::Auto),
         Some(v) if v.trim().eq_ignore_ascii_case("auto") => Ok(LangSetting::Auto),
-        Some(v) => Lang::from_word(v)
-            .map(LangSetting::Fixed)
-            .ok_or_else(|| format!("[{SECTION}] lang の値 {v:?} は auto / ja / en")),
+        Some(v) => Lang::from_word(v).map(LangSetting::Fixed).ok_or_else(|| {
+            format!("[{SECTION}] lang の値 {v:?} は auto / ja / en のどれかにしてください")
+        }),
     }
 }
 

@@ -1,11 +1,11 @@
 //! 観戦のリングバッファへの積みの組み上がりの検査（pure）: 選択の画面を持つ偽のゲーム 2 つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク
-//! （`FakeNet`）で繋ぎ、ホスト（A）に観戦のリングバッファを付けて、リングバッファへ書かれた記録が、ゲームが使った語・入った押下・SELECT の結果と食い違わないかを
+//! （`FakeNet`）で接続し、ホスト（A）に観戦のリングバッファを付けて、リングバッファへ書かれた記録が、ゲームが使った語・入った押下・SELECT の結果と食い違わないかを
 //! 見る（`menu_tests::both_sides_walk_the_same_screens` と同じ実行）。
 use std::sync::Arc;
 
 use higanr_core::wire::{Record, Seat};
 
-use super::menu_tests::{MenuGame, Run, plans, run_with_ring, run_with_rings};
+use super::menu_tests::{MenuGame, Run, plans, run_with_ring, run_with_rings, run_with_rings_as};
 use crate::spectate_ring::{Popped, SpectateRing};
 use crate::spectate_testkit::{expected_selects, fold};
 
@@ -87,12 +87,46 @@ fn the_ring_holds_exactly_what_the_host_game_used() {
                         "{ctx}: 1P の次が 2P でない"
                     );
                 } else {
+                    // 直後は frame 0 の照合、その次が frame 0。
                     assert!(
-                        matches!(recs.get(i + 1), Some(Record::Frame { frame: 0, .. })),
-                        "{ctx}: SELECT の後が frame 0 でない: {:?}",
+                        matches!(recs.get(i + 1), Some(Record::Check { check, .. }) if check.frame == 0),
+                        "{ctx}: SELECT の後が frame 0 の照合でない: {:?}",
                         recs.get(i + 1)
                     );
+                    assert!(
+                        matches!(recs.get(i + 2), Some(Record::Frame { frame: 0, .. })),
+                        "{ctx}: 照合の後が frame 0 でない: {:?}",
+                        recs.get(i + 2)
+                    );
                 }
+            }
+        }
+        // 照合: delay 方式は、約 1 秒ごとのフレームの直前に 1 つ。値は seg の frame 0 からの入力のダイジェスト（検査の対戦はダイジェストの作り方）。
+        let mut seg_digest = higanr_core::check::INPUT_DIGEST_INIT;
+        let mut want_checks = Vec::new();
+        for &(_, frame, p1, p2) in &f.frames {
+            if frame == 0 {
+                seg_digest = higanr_core::check::INPUT_DIGEST_INIT;
+            }
+            seg_digest = higanr_core::check::input_digest_push(seg_digest, p1, p2);
+            if higanr_core::check::is_watch_check_frame(frame) {
+                want_checks.push((
+                    higanr_core::wire::CheckKind::InputDigest,
+                    higanr_core::wire::WatchCheck::from(
+                        &higanr_core::check::check_from_input_digest(0, frame, seg_digest),
+                    ),
+                ));
+            }
+        }
+        assert!(want_checks.len() >= 2, "{ctx}: 照合の frame が少ない");
+        assert_eq!(f.checks, want_checks, "{ctx}: 照合の記録");
+        for (i, rec) in recs.iter().enumerate() {
+            if let Record::Check { check, .. } = rec {
+                assert!(
+                    matches!(recs.get(i + 1), Some(Record::Frame { frame, .. }) if *frame == check.frame),
+                    "{ctx}: 照合の次がそのフレームでない: {:?}",
+                    recs.get(i + 1)
+                );
             }
         }
         let (own, agreed) = r.npa.selects();
@@ -166,6 +200,33 @@ fn a_ring_that_overflows_changes_nothing_about_the_match() {
         marked.iter().all(|p| matches!(p.rec, Record::Seg { .. })),
         "溢れの印が Seg 以外に付いた"
     );
+}
+
+#[test]
+fn a_host_only_ring_is_dropped_by_both_when_the_players_do_not_both_allow_watching() {
+    let base = go(8_000, None);
+    let (ra, rb) = (
+        Arc::new(SpectateRing::with_len(1 << 16)),
+        Arc::new(SpectateRing::with_len(1 << 16)),
+    );
+    let (a, b) = games();
+    let r = run_with_rings_as(
+        a,
+        b,
+        8_000,
+        0,
+        0,
+        20_000,
+        (Some(Arc::clone(&ra)), Some(Arc::clone(&rb))),
+        true,
+        false,
+    );
+    assert_eq!((ra.counts().pushed, rb.counts().pushed), (0, 0));
+    assert!(!r.npa.has_spectate() && !r.npb.has_spectate());
+    assert_eq!(r.a.on_input_allocs, 0, "on_input が確保した");
+    // 試合は書かないときと同じに進む。
+    assert_eq!(r.a.played, base.a.played);
+    assert_eq!(r.npa.stats(), base.npa.stats());
 }
 
 #[test]

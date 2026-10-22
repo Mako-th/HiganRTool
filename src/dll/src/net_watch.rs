@@ -176,7 +176,7 @@ const S_MENU_APPLIED: usize = 15;
 const S_MENU_HELD: usize = 16;
 const S_MENU_ALIGN_MISS: usize = 17;
 const S_MENU_LOST: usize = 18;
-/// 置いた自分の SELECT（2 語）と揃った値（2 語）。`pack_select` / `pack_agreed`。
+/// 書いた自分の SELECT（2 語）と揃った値（2 語）。`pack_select` / `pack_agreed`。
 const S_OWN_SELECT: usize = 19;
 const S_AGREED: usize = 21;
 /// 入った押下の数と、押下ごとの 2 語（`StepLog` のリングバッファの並びのまま）。
@@ -197,10 +197,10 @@ const S_RECV: usize = S_HS + 3;
 const RECV_WORDS: usize = 8;
 /// キャラ選択の立ち絵を追わせた回数と、書いたカーソルが前と違うのに呼ばなかった回数（`Stats::menu_portrait_called` / `menu_portrait_refused`）。
 const S_PORTRAIT: usize = S_RECV + RECV_WORDS;
-/// 繋がる前に選択の画面で落とした決定の押下の回数（`Stats::menu_pre_link_decides`）。
+/// 接続する前に選択の画面で落とした決定の押下の回数（`Stats::menu_pre_link_decides`）。
 const S_PRE_LINK: usize = S_PORTRAIT + 2;
-/// 繋がったか・経路の種類・繋がるまでの ms・RTT: 語 0 = 繋がった | rollback に決まった << 1 | 採った経路が学んだ候補 << 2 |
-/// 経路の種類（`CandKind` の番号）<< 8（bit3 は観戦者の実行）、語 1 = セッションを作ってから繋がったのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）、
+/// 接続したか・経路の種類・接続するまでの ms・RTT: 語 0 = 接続した | rollback に決まった << 1 | 採った経路が学んだ候補 << 2 |
+/// 経路の種類（`CandKind` の番号）<< 8（bit3 は観戦者の実行）、語 1 = セッションを作ってから接続したのを見るまでの ms、語 2 = 最後に測った RTT の ms（無ければ `NO_MARGIN`）、
 /// 語 3 = 今までに測れた PONG の数（`Counters::pongs_received`。読み取りのスレッドが同じ PONG を 2 度標本にしないために使う）。
 const S_CONN: usize = S_PRE_LINK + 1;
 const CONN_WORDS: usize = 4;
@@ -215,7 +215,7 @@ const GATE_WORDS: usize = 4;
 /// 語 2 = Ctrl＋数字で変えた回数。
 const S_PICK: usize = S_GATE + GATE_WORDS;
 const PICK_WORDS: usize = 3;
-/// 繋がりのセッションの INPUT の受信の数（`link::ConnCounts`）: 受理・前の seg・前の seg へのバックアップの返し・別の seg・そのほかで捨てた
+/// 接続のセッションの INPUT の受信の数（`link::ConnCounts`）: 受理・前の seg・前の seg のバックアップを相手へ返した数・別の seg・そのほかで捨てた
 /// （うち切替つきの `GuestLat`・取り決めに合わない `BadLat`）。delay 方式でも rollback でもコピーする。
 const S_INPUT: usize = S_PICK + PICK_WORDS;
 const INPUT_WORDS: usize = 7;
@@ -223,8 +223,8 @@ const INPUT_WORDS: usize = 7;
 /// 頭打ち）、語 3 = 上限に当たって戻った回数。
 const S_HEAD: usize = S_INPUT + INPUT_WORDS;
 const HEAD_WORDS: usize = 4;
-/// 繋がらなかった理由を読むための診断: 送った HELLO の数（候補の種類ごとに 4 語。`link::kind_slot` の並び）・相手の候補の数（4 語）・
-/// 今のセッションを作った時刻（ms）。自分の候補・送りの誤り・STUN の聞き直しは受信側が持つので、読み取りのスレッドが `NetSnapshot::diag` へ足す
+/// 接続できなかった理由を読むための診断: 送った HELLO の数（候補の種類ごとに 4 語。`link::kind_slot` の並び）・相手の候補の数（4 語）・
+/// 今のセッションを作った時刻（ms）。自分の候補・相手へ送るときの誤り・STUN サーバーへの聞き直しは受信側が持つので、読み取りのスレッドが `NetSnapshot::diag` へ足す
 /// （`script_win::net_status`）。最後の 1 語は、学んだ候補（`Link::hello_sent_learned`）へ送った HELLO の数（種類の枠には混ぜない）。
 const S_DIAG: usize = S_HEAD + HEAD_WORDS;
 const DIAG_WORDS: usize = 2 * link::KIND_SLOTS + 2;
@@ -275,7 +275,7 @@ const FMT_REC_WORDS: usize = 2;
 const FMT_WORDS: usize = F_LOG + FMT_REC_WORDS * higanr_core::link::FORMAT_LOG;
 const FMT_ABLE: u32 = 1;
 const FMT_ROLLBACK: u32 = 2;
-/// 観戦者が受けた対戦者の状態（`pack_peer`）。
+/// 観戦者が受けた対戦する側の状態（`pack_peer`）。
 const S_PEER: usize = S_FMT + FMT_WORDS;
 const PEER_WORDS: usize = 2;
 /// キャラ選択で相手の席を相手の位置へ書いた回数・カーソルの音を積んだ回数・積めなかった回数（`Stats::menu_peer_writes` / `menu_cursor_se` /
@@ -334,7 +334,7 @@ fn fmt_rec_text(w: [u32; FMT_REC_WORDS]) -> Option<String> {
     ))
 }
 
-/// 形式の切替と HOST_STATE の欄（`S_FMT` からの並び）を作る。繋がる前は `conn` が `None` で全部 0。純粋な関数なので、ネットワークを作らずに並びを検査できる。
+/// 形式の切替と HOST_STATE の欄（`S_FMT` からの並び）を作る。接続する前は `conn` が `None` で全部 0。純粋な関数なので、ネットワークを作らずに並びを検査できる。
 fn fmt_words(
     s: &crate::netplay::Stats,
     conn: Option<&higanr_core::link::Connected>,
@@ -584,7 +584,7 @@ pub struct NetSnapshot {
     /// 最後に捨てた送り元（`pack_from` の 2 語。読むなら `last_foreign_text`）。
     pub last_foreign_ip: u32,
     pub last_foreign_port: u32,
-    /// 繋がりのセッションの INPUT の受信の数（`link::ConnCounts`。`input_text` で読む）。
+    /// 接続のセッションの INPUT の受信の数（`link::ConnCounts`。`input_text` で読む）。
     pub input_accepted: u32,
     pub input_prev_seg: u32,
     pub input_prev_replies: u32,
@@ -594,9 +594,9 @@ pub struct NetSnapshot {
     pub input_guest_lat: u32,
     pub input_bad_lat: u32,
     // ---- 試験のまとめ（`trial_summary`）----
-    /// 繋がった（ことがある）か。
+    /// 接続した（ことがある）か。
     pub connected: bool,
-    /// AGREE で決まった対戦の形が rollback か（false = delay 方式、または繋がる前）。
+    /// AGREE で決まった対戦の形が rollback か（false = delay 方式、または接続する前）。
     pub rollback: bool,
     pub path_kind: u32,
     /// 採った経路が、学んだ候補（接続コードに無かった送り元。`Link::path_is_learned`）か。
@@ -606,7 +606,7 @@ pub struct NetSnapshot {
     pub rtt_ms: Option<u32>,
     /// 今までに測れた PONG の数。読み取りのスレッドが 1 秒ごとに `rtt_ms` を標本にするとき、同じ PONG を 2 度採らず、取りこぼした数も言えるようにするため。
     pub rtt_pongs: u32,
-    // ---- 繋がらなかった理由を読むための診断（`diag_text`）----
+    // ---- 接続できなかった理由を読むための診断（`diag_text`）----
     /// 今のセッションが送った HELLO の数と、相手の候補の数（どちらも候補の種類ごと。`link::kind_slot` の並び）。セッションを作る前は相手の候補が全部 0。
     pub hello_sent: [u32; link::KIND_SLOTS],
     pub peer_cands: [u32; link::KIND_SLOTS],
@@ -616,7 +616,7 @@ pub struct NetSnapshot {
     pub link_started_ms: u32,
     /// 受信側が持つ診断。`NET_STATUS` の語には無く、読み取りのスレッドが `script_win::net_status` で足す（既定は全部 0 / なし）。
     pub diag: crate::net_udp::NetDiag,
-    /// ネットの選択で入った押下・カーソルを合わせられなかった数・押下なしで選択を出た数・繋がる前に落とした決定の数。
+    /// ネットの選択で入った押下・カーソルを合わせられなかった数・押下なしで選択を出た数・接続する前に落とした決定の数。
     pub menu_applied: u32,
     pub menu_align_miss: u32,
     pub menu_lost: u32,
@@ -634,37 +634,37 @@ pub struct NetSnapshot {
     pub stop: u32,
     pub stop_ticks: u32,
     pub stop_played: u32,
-    /// 対戦の成立の印（`gate_flags`。0 = ゲートが無い・繋がる前）と、READY を送った・受けた・そのうち重複の数。
+    /// 対戦の成立の印（`gate_flags`。0 = ゲートが無い・接続する前）と、READY を送った・受けた・そのうち重複の数。
     pub gate: u32,
     pub ready_sent: u32,
     pub ready_received: u32,
     pub ready_dup: u32,
-    /// この実行は、つながりが終わってもネットワークを開き直せる（ゲーム内のメニューの実行）。`NetStatus` の語には無く、
-    /// 読み取りのスレッドが `script_win::net_status` で置く。
+    /// この実行は、接続が終わってもネットワークを開き直せる（ゲーム内のメニューの実行）。`NetStatus` の語には無く、
+    /// 読み取りのスレッドが `script_win::net_status` で設定する。
     pub relink: bool,
-    /// 観戦者の実行（`publish_watch` が置く）。遅延と rollback の欄は対戦者の設定ではないので読まない。
+    /// 観戦者の実行（`publish_watch` が設定する）。遅延と rollback の欄は対戦する側の設定ではないので読まない。
     pub watcher: bool,
-    /// VPN の範囲で開いた実行（`publish` が置く）。外側の候補の欄を「VPN」と書く。
+    /// VPN の範囲で開いた実行（`publish` が設定する）。外側の候補の欄を「VPN」と書く。
     pub vpn: bool,
-    /// 観戦の流れで受けた、対戦者 2 人の間の状態（観戦者の実行だけ。まだ受けていなければ None）。
+    /// 観戦の流れで受けた、対戦する 2 人の間の状態（観戦者の実行だけ。まだ受けていなければ None）。
     pub peer: Option<PeerStats>,
-    /// 観戦のホストの集計（観戦の配る側の用意がある実行だけ。`NET_STATUS` の語には無く、読み取りのスレッドが `script_win::net_status` で足す）。
+    /// 観戦のホストの集計（観戦者へ試合の記録を配る側（`spectate_offer`）の用意がある実行だけ。`NET_STATUS` の語には無く、読み取りのスレッドが `script_win::net_status` で足す）。
     pub spectators: Option<SpectatorCounts>,
 }
 
-/// 観戦のホスト（`spectate_host::Snapshot`）のうち、つながりごとのログに出す数。
+/// 観戦のホスト（`spectate_host::Snapshot`）のうち、接続ごとのログに出す数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SpectatorCounts {
-    /// いま繋がっている観戦者。
+    /// いま接続している観戦者。
     pub now: u32,
-    /// 入った・自分で抜けた・黙って外した・上限で断った、の累計（観戦のホストを作ってから）。
+    /// 入った・自分で抜けた・応答が無く外した・上限で断った、の累計（観戦のホストを作ってから）。
     pub joined: u32,
     pub left: u32,
     pub silenced: u32,
     pub refused_full: u32,
 }
 
-/// 観戦者が受けた対戦者の状態（`PeerStats`）を 2 語に: 語 0 = 受けた | ping が測れている << 1 | rollback のマッチ << 2、
+/// 観戦者が受けた対戦する側の状態（`PeerStats`）を 2 語に: 語 0 = 受けた | ping が測れている << 1 | rollback のマッチ << 2、
 /// 語 1 = ping | 遅れ << 16 | rollback << 24。
 fn pack_peer(p: Option<PeerStats>) -> [u32; PEER_WORDS] {
     p.map_or([0; PEER_WORDS], |p| {
@@ -686,14 +686,14 @@ fn unpack_peer(w: [u32; PEER_WORDS]) -> Option<PeerStats> {
 }
 
 /// 作り直しの直前の 1 回を 1 語に（0 = まだ。下位 4 ビットはやめた理由: 1 = 同じ nonce・2 = 1 通も届かない・3 = 届いたが
-/// 繋がらない。次の 4 ビットは形: 1 = 最初から・2 = 引き継ぐ）。
+/// 接続できない。次の 4 ビットは形: 1 = 最初から・2 = 引き継ぐ）。
 pub fn restart_code(last: Option<(FailReason, Restart)>) -> u32 {
     last.map_or(0, |(why, kind)| {
         let w = match why {
             FailReason::SameNonce => 1,
             FailReason::NothingReceived => 2,
             FailReason::NoHandshake => 3,
-            // バージョン違い・ビルド違いは作り直さない（`Handshake::restart` が断る）ので、ここへは来ない。来ても「分からない」の側に置く。
+            // バージョン違い・ビルド違いは作り直さない（`Handshake::restart` が断る）ので、ここへは来ない。来ても「分からない」の側に倒す。
             FailReason::OtherVersion { .. } | FailReason::OtherBuild { .. } => 4,
         };
         let k = match kind {
@@ -704,7 +704,7 @@ pub fn restart_code(last: Option<(FailReason, Restart)>) -> u32 {
     })
 }
 
-/// `S_CONN` の語 0: bit0 = 繋がった、bit1 = AGREE で決まった形が rollback（試験のまとめの RTT の言い方が変わる）、bit2 = 採った経路が
+/// `S_CONN` の語 0: bit0 = 接続した、bit1 = AGREE で決まった形が rollback（試験のまとめの RTT の言い方が変わる）、bit2 = 採った経路が
 /// 学んだ候補（コードに無かった送り元）、bit8 以上 = 経路の種類。
 fn pack_conn(connected: bool, rollback: bool, learned: bool, kind: u32) -> u32 {
     u32::from(connected) | u32::from(rollback) << 1 | u32::from(learned) << 2 | kind << 8
@@ -722,7 +722,7 @@ pub(crate) fn phase_code(p: Phase) -> u32 {
 }
 
 /// 接続の手順をやめた理由の番号（終わりの種類 1 の中身。`text` の行と試験のまとめの `link_failure` が読む）。同じ nonce 0・1 通も届かない 1・
-/// 届いたが繋がらない 2（バージョン違いは中身に相手のバージョンを持つので別の種類 `END_OTHER_VERSION`）。
+/// 届いたが接続できない 2（バージョン違いは中身に相手のバージョンを持つので別の種類 `END_OTHER_VERSION`）。
 fn fail_code(r: FailReason) -> u32 {
     match r {
         FailReason::SameNonce => 0,
@@ -733,12 +733,12 @@ fn fail_code(r: FailReason) -> u32 {
     }
 }
 
-/// 終わりの種類: 相手の HiganRTool のバージョンが違うので、繋がる前にやめた（中身は相手のバージョン）。`end_code` の 11。
+/// 終わりの種類: 相手の HiganRTool のバージョンが違うので、接続する前にやめた（中身は相手のバージョン）。`end_code` の 11。
 pub(crate) const END_OTHER_VERSION: u32 = 11;
-/// 終わりの種類: 相手のビルドが違うので、繋がる前にやめた（中身は相手のビルド番号）。`end_code` の 12。
+/// 終わりの種類: 相手のビルドが違うので、接続する前にやめた（中身は相手のビルド番号）。`end_code` の 12。
 pub(crate) const END_OTHER_BUILD: u32 = 12;
 
-/// 観戦者の終わりを対戦の終わりの表（`NetSnapshot::text` の `ENDS`）の番号にコピーする。ホストの終わりは「相手の BYE」、黙った・
+/// 観戦者の終わりを対戦の終わりの表（`NetSnapshot::text` の `ENDS`）の番号にコピーする。観戦のホストの終わりは「相手の BYE」、黙った・
 /// 流れが切れたは「相手が黙った」、コードが貼られなかったは「接続できなかった（1 通も届かない）」。
 fn watch_end_code(e: Option<WatchEnd>) -> (u32, u32) {
     match e {
@@ -749,7 +749,9 @@ fn watch_end_code(e: Option<WatchEnd>) -> (u32, u32) {
         Some(WatchEnd::BadSelect(b)) => (6, b.value as u32),
         Some(WatchEnd::Stuck(st)) => (7, u32::from(st.step)),
         Some(WatchEnd::HoldTimeout) => (7, 0),
-        Some(WatchEnd::Quit) => (5, higanr_core::wire::ByeReason::Cancelled as u32),
+        Some(WatchEnd::Quit | WatchEnd::BufferFull | WatchEnd::Broken) => {
+            (5, higanr_core::wire::ByeReason::Cancelled as u32)
+        }
     }
 }
 
@@ -932,7 +934,7 @@ impl NetStatus {
         for (a, x) in self.w.iter().skip(S_FMT).zip(fmt_words(&s, np.connected())) {
             a.store(x, Ordering::Relaxed);
         }
-        // セッションが無い（繋がる前）間は 0 のまま。セッションを作り直すと数え直し（受信の数と同じ）。
+        // セッションが無い（接続する前）間は 0 のまま。セッションを作り直すと数え直し（受信の数と同じ）。
         let ic = np.connected().map(|c| c.counts()).unwrap_or_default();
         let input = [
             c(ic.input_accepted),
@@ -955,7 +957,7 @@ impl NetStatus {
         for (a, v) in self.w.iter().skip(S_HEAD).zip(head) {
             a.store(v, Ordering::Relaxed);
         }
-        // 止めたときだけ書く（止めないマッチの毎 tick は分岐 1 回だけ。印は戻らず、つなぎ直しの `reset` が消す）。
+        // 止めたときだけ書く（止めないマッチの毎 tick は分岐 1 回だけ。印は戻らず、再接続の `reset` が消す）。
         let stop = np.stop_flags();
         if stop != 0 {
             for (a, v) in self
@@ -1007,11 +1009,11 @@ impl NetStatus {
     }
 
     /// 遅れの量の切替の数と予定の記録をコピーする（確保しない。`S_DSW` の doc）。rollback は `rollback::Stats`、delay 方式は `lockstep::Stats`
-    /// （予定の欄は 0）。繋がる前は 0。
+    /// （予定の欄は 0）。接続する前は 0。
     fn publish_dsw(&self, np: &NetPlay, s: &crate::netplay::Stats) {
         let conn = np.connected();
         let r = conn.and_then(|c| c.rollback()).map(|r| r.stats());
-        // rollback の実行でなければ（繋がる前も含む）delay 方式の数を見る。rollback の実行では lockstep の数を読まない。
+        // rollback の実行でなければ（接続する前も含む）delay 方式の数を見る。rollback の実行では lockstep の数を読まない。
         let l = match (&r, conn) {
             (None, Some(c)) => Some(c.lockstep().stats()),
             _ => None,
@@ -1146,7 +1148,7 @@ impl NetStatus {
         let l = |i: usize| self.w.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
         let count = l(S_STEP_COUNT);
         let mut out = format!(
-            "ネットの選択: 選択のフレーム {} / 入れた押下 {} / 持ち越したフレーム {} / カーソルを合わせられなかった {} / 押下なしで選択を出た {} / 立ち絵を追わせた {} / 追わせなかった {} / 相手の席を位置で書いた {} / カーソルの音を積んだ {} / 積めなかった {} / 繋がる前に落とした決定 {} 回",
+            "ネットの選択: 選択のフレーム {} / 入れた押下 {} / 持ち越したフレーム {} / カーソルを合わせられなかった {} / 押下なしで選択を出た {} / 立ち絵を追わせた {} / 追わせなかった {} / 相手の席を位置で書いた {} / カーソルの音を積んだ {} / 積めなかった {} / 接続前に落とした決定 {} 回",
             l(S_MENU_FRAMES),
             l(S_MENU_APPLIED),
             l(S_MENU_HELD),
@@ -1288,7 +1290,7 @@ impl NetStatus {
             "先頭で待つ: 無効（ini の head_wait = 0 か、ネットワークの対戦でない実行）".to_string()
         } else {
             format!(
-                "先頭で待つ: 有効（上限 {} µs。ウィンドウ（b-spin / b）は格子の後、全画面（ゲーム自身の時計）はゲームがフレームを始める見込みの回だけ。rollback のモードでは待たない）/ 先頭で待った回 {} / 合計 {} µs / 上限に当たった回 {}",
+                "先頭で待つ: 有効（上限 {} µs。ウィンドウ（b-spin / b）は格子の後、フルスクリーン（ゲーム自身の時計）はゲームがフレームを始める見込みの回だけ。rollback のモードでは待たない）/ 先頭で待った回 {} / 合計 {} µs / 上限に当たった回 {}",
                 h(0),
                 h(1),
                 h(2),
@@ -1327,7 +1329,7 @@ impl NetStatus {
             path_kind: l(S_CONN) >> 8,
             path_learned: l(S_CONN) & 4 != 0,
             connect_wait_ms: l(S_CONN + 1),
-            // 何もコピーしていない数（語が 0 のまま）を「RTT 0 ms」と読まないよう、繋がった印があるときだけ読む。
+            // 何もコピーしていない数（語が 0 のまま）を「RTT 0 ms」と読まないよう、接続した印があるときだけ読む。
             rtt_ms: Some(l(S_CONN + 2)).filter(|r| *r != NO_MARGIN && l(S_CONN) & 1 != 0),
             rtt_pongs: l(S_CONN + 3),
             menu_applied: l(S_MENU_APPLIED),
@@ -1397,8 +1399,8 @@ impl NetStatus {
         }
     }
 
-    /// 全部の語を 0 にする（ゲーム内のメニューの実行で、ネットワークのセッションを置く tick に。確保しない）。`publish` は大半の語を毎 tick 上書きするが、
-    /// CHECK のズレの欄と入った押下のリングバッファの数より後ろの枠は上書きしないので、消さないと前のつながりの値が次の行に残る。
+    /// 全部の語を 0 にする（ゲーム内のメニューの実行で、ネットワークのセッションを登録する tick に。確保しない）。`publish` は大半の語を毎 tick 上書きするが、
+    /// CHECK のズレの欄と入った押下のリングバッファの数より後ろの枠は上書きしないので、消さないと前の接続の値が次の行に残る。
     pub fn reset(&self) {
         for a in &self.w {
             a.store(0, Ordering::Relaxed);
@@ -1427,13 +1429,13 @@ impl Default for NetStatus {
 pub static NET_STATUS: NetStatus = NetStatus::new();
 
 impl NetSnapshot {
-    /// ネットワーク実行が終えた（今のつながりが終わり、この起動ではもうネットワークを開かない）。計測の終わりの判定（`observe` の `RunLen::Net`）が読む。
+    /// ネットワーク実行が終えた（今の接続が終わり、この起動ではもうネットワークを開かない）。計測の終わりの判定（`observe` の `RunLen::Net`）が読む。
     /// ゲーム内のメニューの実行（`relink`）は、マッチの外へ戻ればネットワークを開き直せるので終えたことにしない。
     pub fn ended(&self) -> bool {
         self.link_ended() && !self.relink
     }
 
-    /// 今のつながりが終わった（BYE・ズレ・相手の沈黙・接続の失敗・成立しないまま閉じたのどれか）。試験のまとめが
+    /// 今の接続が終わった（BYE・ズレ・相手の沈黙・接続の失敗・成立しないまま閉じたのどれか）。試験のまとめが
     /// 「繋がらずに終わった」「マッチが始まらないまま終わった」を言うのに読む。
     pub fn link_ended(&self) -> bool {
         self.phase == phase_code(Phase::Ended)
@@ -1443,7 +1445,7 @@ impl NetSnapshot {
     pub fn restart_line(&self, n: u32) -> String {
         let why = match self.hs_restart_last & 0xF {
             2 => "10 秒のあいだ相手から 1 通も届かなかった",
-            3 => "相手から届いたが 10 秒で繋がらなかった",
+            3 => "相手から届いたが 10 秒で接続できなかった",
             _ => "理由は分からない",
         };
         let kind = match self.hs_restart_last >> 4 {
@@ -1458,7 +1460,7 @@ impl NetSnapshot {
             String::new()
         };
         format!(
-            "ネットワーク: 接続の手順を作り直した（{n} 回目。{why}。{kind}）{}{diag}",
+            "ネットワーク: 接続の手順を作り直しました（{n} 回目。{why}。{kind}）{}{diag}",
             self.dropped_recv_text()
         )
     }
@@ -1467,7 +1469,7 @@ impl NetSnapshot {
         self.peer_cands.iter().sum::<u32>() > 0
     }
 
-    /// 繋がらなかった理由を読むための診断の句（本ログの作り直しの行・「ネットワークの外」の行・試験のまとめ）。人を特定する値（アドレス・ポート）は書かない。
+    /// 接続できなかった理由を読むための診断の句（本ログの作り直しの行・「ネットワークの外」の行・試験のまとめ）。人を特定する値（アドレス・ポート）は書かない。
     pub fn diag_text(&self) -> String {
         // VPN の範囲で開いた実行では、外側の候補はすべて VPN のネットワークの中のアドレス（範囲 lan のガードが通すのはそれだけ）。
         let outside = if self.vpn { "VPN" } else { "外側" };
@@ -1521,7 +1523,7 @@ impl NetSnapshot {
         )
     }
 
-    /// 繋がりのセッションの INPUT の受信の句（本ログのネットワークの行の後ろへ付ける）。0 も出す。`BadLat` / `GuestLat` は捨てた数の内訳。
+    /// 接続のセッションの INPUT の受信の句（本ログのネットワークの行の後ろへ付ける）。0 も出す。`BadLat` / `GuestLat` は捨てた数の内訳。
     pub fn input_text(&self) -> String {
         format!(
             "INPUT の受信ソケット: 受理 {} / 前の seg {}（控えを返した {}） / 別の seg で捨てた {} / ほかの理由で捨てた {}（うち lat の取り決め違い BadLat {} ・ホストが切替つきを受けた GuestLat {}）",
@@ -1537,7 +1539,7 @@ impl NetSnapshot {
 
     pub fn text(&self) -> String {
         const PHASES: [&str; 6] = [
-            "繋がる前",
+            "接続前",
             "選択",
             "止める地点",
             "読み込み",
@@ -1545,19 +1547,19 @@ impl NetSnapshot {
             "終えた",
         ];
         const ENDS: [&str; 13] = [
-            "まだ",
-            "接続できなかった",
-            "相手の BYE",
-            "相手が黙った",
+            "未終了",
+            "接続不能",
+            "相手の BYE を受信",
+            "相手の沈黙",
             "CHECK のズレ",
-            "自分から終えた",
-            "相手の SELECT が範囲の外",
-            "押下を持ち越しすぎた（画面が分かれた）",
-            "対戦が成立しないまま時間切れで閉じた",
-            "相手に成立のゲートが無いので閉じた（READY が来ないまま選択・試合の通信が来た。相手が古いバージョンか offer / answer）",
-            "対戦が成立しないまま相手が閉じた（相手からの BYE・取消）",
-            "相手の HiganRTool のバージョンが違う",
-            "相手の HiganRTool のバージョン（ビルド）が違う",
+            "自分から終了",
+            "相手の SELECT が範囲外",
+            "押下の持ち越し超過（画面が不一致）",
+            "対戦不成立のまま時間切れ",
+            "相手が対戦成立の手順に未対応（READY が来ないまま選択・マッチの通信が到達。相手が古いバージョンか offer / answer）",
+            "対戦不成立のまま相手が終了（相手からの BYE・取消）",
+            "相手の HiganRTool のバージョン不一致",
+            "相手の HiganRTool のバージョン（ビルド）不一致",
         ];
         let phase = PHASES.get(self.phase as usize).copied().unwrap_or("?");
         let end = if self.end == END_OTHER_VERSION {
@@ -1644,7 +1646,7 @@ impl NetSnapshot {
             format!("seg {} frame {}。", l.seg, l.frame)
         });
         Some(format!(
-            "試合を止めた（{by}。{at}方式 {}。止めるまでに使ったフレーム {}。止めた間の描画だけのフレーム {}。{}）",
+            "マッチを止めました（{by}。{at}方式 {}。止めるまでに使ったフレーム {}。止めた間の描画だけのフレーム {}。{}）",
             if self.rollback {
                 "rollback"
             } else {
@@ -1668,7 +1670,7 @@ impl NetSnapshot {
 }
 
 /// `_net_frames.csv` の見出し。先頭の 5 列は peer_sim の記録の列の並びと同じ（seg・frame・1P・2P・使った後の delay）。後ろの 3 列は
-/// dll だけの時間（µs。余裕が分からなければ空。`head_wait_us` はフレームの始まりで相手の入力ワードを待った時間）。読む道具は 7 列の古いログ
+/// dll だけの時間（µs。余裕が分からなければ空。`head_wait_us` はフレームの始まりで相手の入力ワードを待った時間）。読むツールは 7 列の古いログ
 /// （`seg,frame,p1,p2,delay,margin_us,wait_us`）も読む。見出しの原本は core の `replay_compare::NET_FRAMES_HEADER`。
 pub use higanr_core::replay_compare::NET_FRAMES_HEADER;
 
@@ -1839,7 +1841,7 @@ mod tests {
         assert_eq!(
             s.restart_line(2),
             format!(
-                "ネットワーク: 接続の手順を作り直した（2 回目。10 秒のあいだ相手から 1 通も届かなかった。最初から作り直した）（受信ソケットに届いた 0 通。捨てた受信: 候補に無い送り元 0 通 / タグの誤り 0 通 / 別のセッション 0 通）〔{}〕",
+                "ネットワーク: 接続の手順を作り直しました（2 回目。10 秒のあいだ相手から 1 通も届かなかった。最初から作り直した）（受信ソケットに届いた 0 通。捨てた受信: 候補に無い送り元 0 通 / タグの誤り 0 通 / 別のセッション 0 通）〔{}〕",
                 s.diag_text()
             )
         );
@@ -1867,7 +1869,7 @@ mod tests {
         };
         assert!(
             s.restart_line(4)
-                .contains("相手から届いたが 10 秒で繋がらなかった。相手の値は引き継ぎ"),
+                .contains("相手から届いたが 10 秒で接続できなかった。相手の値は引き継ぎ"),
             "{}",
             s.restart_line(4)
         );
@@ -1942,6 +1944,9 @@ mod tests {
                 [0x77; 32],
             ))
             .public(),
+            host_pick: false,
+            nat: higanr_core::nat::NatMark::UNKNOWN,
+            rollback_delay: 0,
         });
         let ack = Message::HelloAck {
             echo_nonce: 9,
@@ -2037,7 +2042,7 @@ mod tests {
         };
         let mut np = NetPlay::new(lc, Config::default(), &mut na);
         let mut g = FakeGame::new(1, 10, 1, 1);
-        // 鍵もセッションも合った PING（送り元だけが候補に無い）。HELLO・HELLO_ACK・AGREE だと、繋がる前はタグまで通れば
+        // 鍵もセッションも合った PING（送り元だけが候補に無い）。HELLO・HELLO_ACK・AGREE だと、接続する前はタグまで通れば
         // 「学んだ候補」になって捨てられないので、手順の外の型にした。封じる鍵は検査の決め事の値でよい。
         let hello = Message::Ping { send_time: 5 };
         let mut buf = [0u8; wire::MAX_DATAGRAM];
@@ -2145,7 +2150,7 @@ mod tests {
         };
         assert_eq!(
             s.diag_text(),
-            "診断: 自分の候補 [同じ PC の中 0 / 家の中 1 / 外側 2 / IPv6 3] / 相手の候補 [同じ PC の中 5 / 家の中 6 / 外側 7 / IPv6 8] / 送った HELLO [同じ PC の中 1 / 家の中 22 / 外側 333 / IPv6 4444]（送りの誤り [同じ PC の中 9 / 家の中 8 / 外側 7 / IPv6 6]） / 学んだ候補 2 個（コードに無い送り元からタグの合う手順の 1 通が届いた。上限で断った 5・学んだアドレスへ送った HELLO 66） / 外側のポートは受信ソケットのポートと違う（ルーターが付け替えている） / コードの外側のアドレスを得てから接続の手順を始めるまで: 174.3 秒 / STUN の聞き直し: 止めた / 送った 11 回（送れなかった 4） / 答え 10 回（答えにならなかったもの 2） / 外側のアドレスが変わった 4 回（ポートだけ 3 / アドレスも 1）/ いまの外側のアドレスは、コードに載せたものと違う / 2 か所目の STUN: 外側のポートだけ 1 か所目と違う（宛先ごとに外側のポートを変える型。STUN で見えたアドレスは相手には使えない見込み） / UPnP: 使っていない（ini の upnp = off・scope が internet でない・受信ソケットが家の中のアドレスでないのどれか）"
+            "診断: 自分の候補 [同じ PC の中 0 / 家の中 1 / 外側 2 / IPv6 3] / 相手の候補 [同じ PC の中 5 / 家の中 6 / 外側 7 / IPv6 8] / 送った HELLO [同じ PC の中 1 / 家の中 22 / 外側 333 / IPv6 4444]（送りの誤り [同じ PC の中 9 / 家の中 8 / 外側 7 / IPv6 6]） / 学んだ候補 2 個（コードに無い送り元からタグの合う手順の 1 通が届いた。上限で断った 5・学んだアドレスへ送った HELLO 66） / 外側のポートは受信ソケットのポートと違う（ルーターが付け替えている） / コードの外側のアドレスを得てから接続の手順を始めるまで: 174.3 秒 / STUN の聞き直し: 休止中（観戦の配信中は再開） / 送った 11 回（送れなかった 4） / 答え 10 回（答えにならなかったもの 2） / 外側のアドレスが変わった 4 回（ポートだけ 3 / アドレスも 1）/ いまの外側のアドレスは、コードに載せたものと違う / 2 か所目の STUN: 外側のポートだけ 1 か所目と違う（宛先ごとに外側のポートを変える型。STUN で見えたアドレスは相手には使えない見込み） / UPnP: 使っていない（ini の upnp = off・scope が internet でない・受信ソケットが家の中のアドレスでないのどれか）"
         );
         let none = NetSnapshot {
             peer_cands: [1, 0, 0, 0],
@@ -2174,7 +2179,7 @@ mod tests {
         let t = same.diag_text();
         assert!(
             t.contains("外側のポートは受信ソケットのポートと同じ")
-                && t.contains("続けている")
+                && t.contains("STUN の聞き直し: 実行中")
                 && t.contains("答えがまだ無い"),
             "{t}"
         );
@@ -2232,6 +2237,9 @@ mod tests {
                     [0x77; 32],
                 ))
                 .public(),
+                host_pick: false,
+                nat: higanr_core::nat::NatMark::UNKNOWN,
+                rollback_delay: 0,
             });
             let key = AuthKey::derive(&secret, 3);
             let mut buf = [0u8; wire::MAX_DATAGRAM];
@@ -2365,7 +2373,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            s.text().contains("相手の SELECT が範囲の外（16）"),
+            s.text().contains("相手の SELECT が範囲外（16）"),
             "{}",
             s.text()
         );
@@ -2396,9 +2404,9 @@ mod tests {
         );
         assert_eq!(watch_end_code(Some(WatchEnd::GaveUp)), (1, 1));
         for (end, want) in [
-            (8, "対戦が成立しないまま時間切れで閉じた"),
-            (9, "相手に成立のゲートが無いので閉じた"),
-            (10, "対戦が成立しないまま相手が閉じた"),
+            (8, "対戦不成立のまま時間切れ"),
+            (9, "相手が対戦成立の手順に未対応"),
+            (10, "対戦不成立のまま相手が終了"),
         ] {
             let s = NetSnapshot {
                 end,
@@ -2487,8 +2495,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: VPN の印が語 0 の bit4 から読まれない（VPN でない実行に「VPN」が出る・VPN の実行に「外側」が残る）、
-    /// 外側の候補の欄が VPN の実行だけ「VPN」になる（VPN でない実行の文は変わらない）、経路の種類の番号が印で崩れる。
     #[test]
     fn the_vpn_mark_rides_in_the_conn_word_and_names_only_the_outside_column() {
         let st = NetStatus::new();
@@ -2572,7 +2578,6 @@ mod tests {
         assert_eq!(st.snapshot(), NetSnapshot::default(), "消し残した欄がある");
     }
 
-    /// 壊れたら落ちる: 観戦者の印が立たない（観戦者の行に delay 方式・遅延 0 が出る）、または対戦者の値の語が欠ける・混ざる。
     #[test]
     fn a_watchers_snapshot_carries_the_flag_and_the_players_values() {
         use crate::spectate_watch::{WATCH_MARGIN_FRAMES, WatchConfig, WatchSlot};
@@ -2582,6 +2587,7 @@ mod tests {
                 wait_budget_us: 0,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let st = NetStatus::new();

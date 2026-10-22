@@ -130,6 +130,12 @@ impl Text {
             )
             .get(self.0)
             .to_string(),
+            Analysis::MenuMark => tx(
+                "ゲームのメニューから保存したリプレイは修正の対象ではありません。",
+                "Replays saved from the game's menu are not subject to repair.",
+            )
+            .get(self.0)
+            .to_string(),
             Analysis::OddValue(a, b) => match self.0 {
                 Lang::Ja => format!(
                     "チャージの設定の値（{a}, {b}）がslow / chargeのどちらでもないので、直せません。"
@@ -203,13 +209,18 @@ impl Text {
         if !skipped.is_empty() {
             lines.push(self.skip_sentence(&skipped));
         }
-        let reasons: [(usize, &str, &str); 4] = [
+        let reasons: [(usize, &str, &str); 5] = [
             (r.unchanged, "変えるものがない", "nothing to change"),
             (r.exists, "同じ名前が既にある", "same name already exists"),
             (
                 r.no_mark,
                 "HiganRToolで保存したものではない",
                 "not saved by HiganRTool",
+            ),
+            (
+                r.menu_mark,
+                "ゲームのメニューから保存したもの",
+                "saved from the game's menu",
             ),
             (
                 r.odd_value,
@@ -442,11 +453,25 @@ mod tests {
         );
         for a in [
             Analysis::NoMark,
+            Analysis::MenuMark,
             Analysis::OddValue(2, 0),
             Analysis::Unreadable("x".into()),
         ] {
             assert!(t.unavailable(&a).is_some());
         }
+        // メニューの保存は「HiganRToolで保存したものではない」とは別の文にする。
+        assert_ne!(
+            t.unavailable(&Analysis::MenuMark),
+            t.unavailable(&Analysis::NoMark)
+        );
+        assert_eq!(
+            t.unavailable(&Analysis::MenuMark).as_deref(),
+            Some("ゲームのメニューから保存したリプレイは修正の対象ではありません。")
+        );
+        assert_eq!(
+            Text(Lang::En).unavailable(&Analysis::MenuMark).as_deref(),
+            Some("Replays saved from the game's menu are not subject to repair.")
+        );
     }
 
     fn ud(n: usize) -> (usize, PathBuf) {
@@ -533,6 +558,29 @@ mod tests {
             r.add(idx, &src, res);
         }
         (r, dir)
+    }
+
+    #[test]
+    fn menu_saved_replays_are_reported_as_their_own_reason() {
+        let (mut r, _) = report(2, &[]);
+        r.add(
+            2,
+            &PathBuf::from("rep").join("th9_01.rpy"),
+            MakeResult::MenuMark,
+        );
+        assert!(!r.has_problem());
+        let ja = Text(Lang::Ja).result_report(&r);
+        assert!(ja.starts_with("3件中2件を処理しました。"), "{ja}");
+        assert!(
+            ja.contains("作らなかった（ゲームのメニューから保存したもの）: 1本"),
+            "{ja}"
+        );
+        assert!(!ja.contains("HiganRToolで保存したものではない"), "{ja}");
+        let en = Text(Lang::En).result_report(&r);
+        assert!(
+            en.contains("Not made (saved from the game's menu): 1"),
+            "{en}"
+        );
     }
 
     #[test]

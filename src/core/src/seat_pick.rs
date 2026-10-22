@@ -1,19 +1,10 @@
 //! 席（1P / 2P）の希望から、ホストの席（AGREE の host_seat）を決める決まり（pure。確保しない）。
 //!
-//! - 各自が「妖怪 対 妖怪」の画面（ゲーム内のメニュー）で、あらかじめ希望（1P / 2P / おまかせ）を置いておく。
-//! - 片方がおまかせなら、相手の希望を優先する。
-//! - 希望がぶつかったら（両方 1P・両方 2P）と、両方おまかせなら、ランダムに決める（先着では決めない）。
-//!
-//! 乱数の答えは「先にいた人の席」として使う。「先にいた人」は、ルームサーバーの経路では先に入った人（始める側
-//! `CodeSide::Offer`。ランダムマッチは待ち列に先に入った人）、クリップボードの経路では「接続コードを作る」を選んだ人。
-//! 各自は自分がどちらかを知っていて、HELLO の `arrival` で名乗る（`wire::Arrival`）。名乗りが食い違うとき（手順の上では
-//! 起きない）は、ホストを先にいた人と見る。
-//! どちらも名乗らない経路（ini の `peer`・ローダーのウィンドウ・peer_sim）は、従来どおりホストの希望（ini の `host_seat`）が
-//! 必ず通る（`Config::host_seat`。台本の回が席を決め打ちにするため）。
-//!
-//! 両方おまかせのとき（`coin`）は、両者の role_nonce（HELLO で交換した u64 の乱数）の排他的論理和の立っているビットの
-//! 数の偶奇で決める。繋がる前に両方の nonce を持っているので追加の通信は要らず（遅延の増分 0）、ゲストは届いた AGREE の
-//! host_seat を同じ式で確かめられる（`handshake.rs` の `Counters::agree_bad_seat`）。席は接続の間ずっと同じ。
+//! - 各自が「妖怪 対 妖怪」の画面（ゲーム内のメニュー）で、あらかじめ希望（1P / 2P / おまかせ）を選んでおく。
+//! - 片方がおまかせなら相手の希望を優先する。希望がぶつかったとき・両方おまかせのときは、ランダムに決める（先着では決めない）。
+//! - 乱数の答えは「先にいた人の席」に使う。先にいた人は、ルームでは先に入った人（始める側 `CodeSide::Offer`。ランダムマッチは待ち列に先に入った人）、クリップボードでは「接続コードを作る」を選んだ人。各自が HELLO の `arrival` で名乗る（`wire::Arrival`）。
+//! - 名乗らない経路（ini の `peer`・ローダーのウィンドウ・peer_sim）は、ホストの希望（ini の `host_seat`）が必ず通る（`Config::host_seat`。台本の回が席を決め打ちにするため）。
+//! - 両方おまかせ（`coin`）は、両者の role_nonce（HELLO で交換した u64 の乱数）の排他的論理和の立っているビット数の偶奇で決める。接続する前に両方の nonce を持っているので追加の通信は要らず（遅延の増分 0）、ゲストは AGREE の host_seat を同じ式で検証できる（`handshake.rs` の `Counters::agree_bad_seat`）。
 #![forbid(unsafe_code)]
 
 use crate::wire::{Arrival, Seat, SeatWish};
@@ -75,7 +66,7 @@ pub const fn host_is_first(host: Arrival, guest: Arrival) -> bool {
     !matches!((host, guest), (Arrival::Second, Arrival::First))
 }
 
-/// ホストの席。ホストが AGREE を作るときもゲストが確かめるときもこれを使う。`host_nonce` / `guest_nonce` は両者の role_nonce。
+/// ホストの席。ホストが AGREE を作るときもゲストが検証するときもこれを使う。`host_nonce` / `guest_nonce` は両者の role_nonce。
 pub const fn host_seat(host: SeatAsk, guest: SeatAsk, host_nonce: u64, guest_nonce: u64) -> Seat {
     let both_any = coin(host_nonce, guest_nonce);
     if matches!(

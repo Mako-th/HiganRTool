@@ -21,7 +21,7 @@ DLL（`src/dll`）・ローダー（`src/loader`）・偽の対戦相手（`src/
 - **ルームサーバーのクライアント**: `room.rs`（ルームマッチ）・`room_queue.rs`（ランダムマッチ）・`watch_list.rs`（観戦の一覧）・`room_rejoin.rs`・`spectate_room.rs`。サーバーの側は`src/server`です。
 - **観戦**: `spectate.rs`（観戦のパケットと、ホストと観戦者の状態機械）。
 - **ゲーム内のメニュー**: `net_menu.rs`（メニューの状態機械と、画面に出す文の表）・`ui_entry.rs`・`ui_layout.rs`・`room_input.rs`・`player_name.rs`・`overlay.rs`（文字の描画の下ごしらえ）・`lang.rs`。
-- **リプレイ**: `replay.rs`（平文の部分と、HiganRToolの印`HGRT`）・`replay_detail.rs`と`replay_rounds.rs`（印に足すマッチの記録）・`replay_decode.rs`（暗号化と圧縮の部分）・`replay_rewrite.rs`（チャージの設定を直したコピーを作る）・`replay_playcheck.rs`と`replay_mark_cmp.rs`と`replay_compare.rs`（照合）・`autosave.rs`と`save_skip.rs`と`vault.rs`（自動保存）・`replay_build.rs`（検査用の合成のリプレイ）。
+- **リプレイ**: `replay.rs`（平文の部分と、HiganRToolの印`HGRT`）・`replay_detail.rs`と`replay_rounds.rs`（印に足すマッチの記録）・`replay_decode.rs`（暗号化と圧縮の部分）・`replay_rewrite.rs`（チャージの設定を直したコピーを作る）・`replay_playcheck.rs`と`replay_mark_cmp.rs`と`replay_compare.rs`（照合）・`autosave.rs`と`save_skip.rs`と`vault.rs`（自動保存）・`replay_build.rs`（検査用の合成のリプレイ）・`replay_menu_path.rs`（メニューの保存のパスの形と、更新時刻が今回の保存かの判断）。
 - **花映塚の模型**: `input_model.rs`（入力の展開の規則）・`return_flow.rs`（対戦の後にメニューへ戻る道筋）・`pad_dirs.rs`（パッドの十字キー）・`render_reset.rs`・`digest.rs`。ゲームのアドレスの表はここには無く、`src/dll/src/th09_addr.rs`にあります。
 - **フックの下ごしらえ**: `patch.rs`（期待バイト列の照合とdetourの組み立て）・`pe.rs`（PE32の見出しと、ゲームの同定）・`arena.rs`（rollbackのための割り当て器）。
 - **フレームのペース**: `pacing.rs`・`pacing_hybrid.rs`・`pacing_vpatch.rs`（遅延を比べて測るためだけの、vpatchの待ち方を組み直したモード）。

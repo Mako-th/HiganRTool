@@ -1,4 +1,4 @@
-//! 観戦者の接続コードの見張り（`code_side = spectate`）の検査。ファイルは一時ディレクトリだけ。接続コード・秘密・名前・アドレスは合成の値。
+//! 観戦者の接続コードの見張り（`code_side = spectate`）の検査。ファイルは一時フォルダだけ。接続コード・秘密・名前・アドレスは合成の値。
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -182,6 +182,41 @@ fn empty_broken_and_out_of_scope_codes_are_refused() {
     let _ = Scope::Loopback;
 }
 
+fn hosts_of(r: &mut Reader, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let text = spectate_text(addrs, NOW + 600);
+    let Step::Ready(cfg, ..) = r.on_peer_file(Some(text.as_bytes()), NOW) else {
+        panic!("読めない");
+    };
+    let mut v: Vec<SocketAddr> = cfg.0.host.as_slice().iter().map(|c| c.addr).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn ipv6_host_candidates_follow_the_viewers_socket_and_the_scope() {
+    let v4: SocketAddr = "203.0.113.5:47001".parse().unwrap();
+    let v6: SocketAddr = "[2606:4700::10]:47001".parse().unwrap();
+    let both = [v6, v4];
+    // IPv6 のソケットがある観戦者は、IPv4 も IPv6 も宛先にする。
+    let mut r = Reader::new(&settings("internet"), 1).with_v6(true);
+    assert_eq!(hosts_of(&mut r, &both), vec![v4, v6]);
+    // 既定(`Reader::new`)は IPv6 のソケットが無い扱い: IPv4 が残るかぎり IPv6 は宛先にしない。
+    let mut r = Reader::new(&settings("internet"), 1);
+    assert_eq!(hosts_of(&mut r, &both), vec![v4]);
+    // 明示しても同じ。
+    let mut r = Reader::new(&settings("internet"), 1).with_v6(false);
+    assert_eq!(hosts_of(&mut r, &both), vec![v4]);
+    // IPv6 しか無いコードは、そのまま通す（ソケットが無い観戦者は時間切れで知る）。
+    let mut r = Reader::new(&settings("internet"), 1).with_v6(false);
+    assert_eq!(hosts_of(&mut r, &[v6]), vec![v6]);
+    // 範囲の外の IPv6 は、IPv6 のソケットがあっても宛先にしない（対戦の候補と同じ範囲のガード）。
+    let mut r = Reader::new(&settings("loopback"), 1).with_v6(true);
+    assert_eq!(hosts_of(&mut r, &[lo(47_001), v6]), vec![lo(47_001)]);
+    let mut r = Reader::new(&settings("lan"), 1).with_v6(true);
+    let lan6: SocketAddr = "[fd00::5]:47001".parse().unwrap();
+    assert_eq!(hosts_of(&mut r, &[v6, lan6]), vec![lan6]);
+}
+
 fn fast() -> Timing {
     Timing {
         poll: Duration::from_millis(5),
@@ -242,10 +277,18 @@ fn the_watcher_thread_reads_peer_code_txt_and_never_writes_my_code() {
         "観戦者が返しのコードを書いた"
     );
     slot.mark_joined();
-    wait_until("見張りが終わらない", || w.finished());
-    assert!(status().contains("接続しました"), "{}", status());
+    wait_until("接続した状態が出ない", || {
+        status().contains("接続しました")
+    });
     assert!(w.facts().connected_at.is_some());
     assert!(!dir.join(MY_CODE_FILE).exists());
+    assert!(!w.finished(), "接続した後の終わりを見ずに終わった");
+    // 溜めた記録の上限で終えたら、その理由を「状態」に出して終わる。
+    slot.mark_buffer_full();
+    slot.mark_done();
+    wait_until("見張りが終わらない", || w.finished());
+    let want = higanr_core::net_menu::T_SPECTATE_BUFFER_FULL.get(ui_lang::current());
+    assert!(status().contains(want), "{}", status());
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
 }

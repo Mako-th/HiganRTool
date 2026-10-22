@@ -1,16 +1,38 @@
-HiganRTool v1.1.1 changes
+HiganRTool v1.2.0 changes
 
 Different versions cannot connect to each other. Use the same version as your opponent.
 
-[Fixed]
-- Fixed LAN play and spectating not working over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
-- The LAN host's waiting screen now also shows the addresses of virtual adapters (such as VMware). With 4 or more, use Up/Down to see the rest.
-- When both players want the same side, it is now decided at random instead of first come, first served.
-- While "Waiting for the opponent" is shown, you now disconnect by holding Esc for 3 seconds.
-- Fixed replays recording the delay from before the change in matches where the delay was changed right after connecting.
-- Fixed the detailed log (.csv.gz) sometimes being cut off when the game was closed.
-- Some on-screen wording and menu messages were fine-tuned.
+[Added]
+- Added rollback_cutin_se under [netplay] in HiganRTool.ini (when to play the cut-in sound while using rollback). With the default confirmed, it waits until confirmed.
+- Pressing Esc during a match while spectating now opens the game's pause menu.
+- When watching random matches and room matches, spectators now relay the match to each other. The host basically sends directly to up to 2 spectators.
+- Added ff_max under [spectate] in HiganRTool.ini (fast-forward speed when you join mid-match).
 
-[Logs]
-- Each connection (the menu item chosen, whether you are the host, and the waiting time) and spectators joining and leaving are now recorded.
-- When the update check is skipped at startup, the reason is now recorded.
+[Changed]
+- Added vsync under [pacing] in HiganRTool.ini. Choose from off (default) / on / game (the custom.exe setting as is).
+- Renamed auto_window under [pacing] to wait (passive / active), and made the lighter passive the default. Your current setting has been carried over.
+- The tool now keeps 60.000 fps in fullscreen without vsync as well.
+- Vsync in fullscreen is now off by default. To follow the custom.exe setting, set vsync = game under [pacing].
+- The tool now works around a game bug where saving a Story, Extra or Match replay of a long game could crash the game.
+- Replays saved outside 妖怪 対 妖怪 now also carry a mark that the game was started from HiganRTool (the tool's version).
+- Stopping spectating is now done by holding Esc for 3 seconds. You can also stop with "Return to title" in the pause menu.
+- Spectating connections now also use IPv6.
+- Spectators who join mid-match now catch up faster (8x by default).
+- When you cannot watch because the match is full of spectators, this is now shown on screen.
+- The host that sends the match to spectators is now chosen automatically as the player who is easier to connect to and has the faster upload.
+- When the host's sending to spectators could slow down the match traffic, the host now sends less to spectators and gives priority to the match.
+- Spectators keep receiving the match from the host even while the game is stopped.
+- Spectating now ends when the records buffered on the spectator's PC reach the limit (about one hour).
+- Reworded the log messages to be shorter and easier to read.
+- The GitHub repository now runs the tests with GitHub Actions on every push and pull request.
+- Dependency updates are now checked weekly with Dependabot and taken in only after the tests pass.
+
+[Fixed]
+- Fixed a crash that could happen when starting with the fullscreen setting.
+- Fixed the heavy processing load while another window was in front of the game in fullscreen.
+- Fixed thprac not recognizing the game started from HiganRTool.
+- Fixed Discord's game capture treating the game started from HiganRTool and the one registered with vpatch as different games.
+- Fixed HiganRTool.exe not starting on older Wine, such as CrossOver on Mac.
+- Fixed another copy of the game being able to start while the one started from HiganRTool was running.
+- Fixed matches being watchable in room matches, connection-code matches and LAN even when the opponent did not allow watching.
+- Fixed spectators not receiving the match over the internet in some cases.

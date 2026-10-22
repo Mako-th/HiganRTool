@@ -1,6 +1,6 @@
 //! 注入する DLL の import 表を読み、この Windows に無い DLL・関数を見つける。
 //! Windows が DLL を読むとき、import が 1 つでも解決できないと読み込みごと失敗する（原因は `LoadLibraryW` の 0 としか分からない）。
-//! 注入の前に自分のプロセスで同じ引き当てを試しておけば、何が無いかを名指しして、ゲームを起こす前に止められる。
+//! 注入の前に自分のプロセスで同じ引き当てを試しておけば、何が無いかを名指しして、ゲームを起動する前に止められる。
 //!
 //! 読むのは通常の import 表だけ（遅延 import は読まない）。表の読み取りは `pe::parse` の節の表を使う。
 
@@ -133,7 +133,7 @@ pub struct Missing {
 pub struct Report {
     pub checked: usize,
     pub missing: Vec<Missing>,
-    /// 確かめられなかった DLL と OS のエラー。
+    /// チェックできなかった DLL と OS のエラー。
     pub unchecked: Vec<(String, ErrorCode)>,
 }
 
@@ -144,7 +144,7 @@ pub fn check(bytes: &[u8], probe: &mut dyn ImportProbe) -> Result<Report, &'stat
         checked: imports.len(),
         ..Report::default()
     };
-    // DLL ごとの結論（無い・確かめられない）。同じ DLL の残りの関数は引かない。
+    // DLL ごとの結論（無い・チェックできない）。同じ DLL の残りの関数は引かない。
     let mut settled: BTreeSet<String> = BTreeSet::new();
     for imp in &imports {
         let key = imp.dll.to_ascii_lowercase();
@@ -219,7 +219,7 @@ pub enum Verdict {
     /// 起動を止める。画面に出す文。
     Stop(String),
     /// Wine / Proton の上なので止めずに続ける。欠けていた件数（ログに残す）。
-    /// Wine の loader は無い関数を代わりの実装で埋めて読み込みを成功させる（推定。実機の Wine では確かめていない）ため、
+    /// Wine の loader は無い関数を代わりの実装で埋めて読み込みを成功させる（推定。実機の Wine では検証していない）ため、
     /// 欠けて見えても動くことがある。
     Tolerated { missing: usize },
 }
@@ -476,7 +476,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: Windows で欠けているのに止めない、または Wine で欠けた関数が見えただけで止める。
     #[test]
     fn missing_imports_stop_a_windows_launch_but_not_a_wine_launch() {
         let mut probe = Table::new(&[

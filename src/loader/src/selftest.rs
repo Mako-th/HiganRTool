@@ -27,7 +27,7 @@ pub const TARGET_ENV_MISSING: i32 = 4;
 /// 親の環境（`SystemRoot`）が継がれていない（ブロックが親の環境を捨てた）。
 pub const TARGET_PARENT_ENV_LOST: i32 = 5;
 
-/// 行 9 で的の環境に置く変数（`--ini` / `--script` と同じ `env_block` の経路）。
+/// 行 9 で的の環境に追加する変数（`--ini` / `--script` と同じ `env_block` の経路）。
 const SELFTEST_ENV: &str = "HIGANRTOOL_SELFTEST_ENV";
 const SELFTEST_ENV_VALUE: &str = "row9 ツール";
 
@@ -171,7 +171,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
     println!("  DLL（行 9）: {}", good_dll.display());
     println!("  一時フォルダ: {}", tmp.0.display());
 
-    // 行 9（`keep`）だけ的の環境に変数を置く（行 1・2・8 は親の環境を継ぐ経路。両方を通す）。
+    // 行 9（`keep`）だけ的の環境に変数を追加する（行 1・2・8 は親の環境を継ぐ経路。両方を通す）。
     fn make_req<'a>(me: &Path, dll: &Path, ident: Ident<'a>, keep: bool) -> LaunchRequest<'a> {
         LaunchRequest {
             game: me.to_path_buf(),
@@ -185,7 +185,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
             ident,
             keep_process_handle: keep,
             patches: Vec::new(),
-            // 行 9 だけ前面にしない起こし方（STARTF_USESHOWWINDOW つきの STARTUPINFOW を受け付けることを通す）。
+            // 行 9 だけ前面にしない起動の仕方（STARTF_USESHOWWINDOW つきの STARTUPINFOW を受け付けることを通す）。
             no_activate: keep,
         }
     }
@@ -220,7 +220,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         },
     );
 
-    // 的の判定の否定側: DLL を読み込んでいないこのプロセスで、終了コード 0 が恒真でないことを確かめる。
+    // 的の判定の否定側: DLL を読み込んでいないこのプロセスで、終了コード 0 が恒真でないことをチェックする。
     report.check(
         "ターゲットの判定（否定側）",
         match target(&good_dll) {
@@ -296,7 +296,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         );
     }
 
-    // 行 9: 本物の DLL → 注入して再開。的は自分の中に DLL が居ることを確かめて 0 で終わる。
+    // 行 9: 本物の DLL → 注入して再開。的は自分の中に DLL が居ることをチェックして 0 で終わる。
     {
         let mut t = Traced::new(RealWin32);
         let r = launch::launch(&mut t, &req(&good_dll, ident, true));
@@ -310,7 +310,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
                 let mut outcome = match waited {
                     WaitResult::Signaled => match t.inner.process_exit_code(process) {
                         Ok(c) if c as i32 == TARGET_OK => Ok(format!(
-                            "注入して再開した（pid {}、DLL のアドレス 0x{:08X}）。ターゲットは DLL が自分の中に居ること、渡した環境の変数と親の環境が届いたことを確かめて終了コード 0 で終わった",
+                            "注入して再開した（pid {}、DLL のアドレス 0x{:08X}）。ターゲットは DLL が自分の中に居ること、渡した環境の変数と親の環境が届いたことをチェックして終了コード 0 で終わった",
                             ok.pid, ok.module
                         )),
                         Ok(c) => Err(format!(

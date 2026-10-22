@@ -1,12 +1,10 @@
 //! 進行中のランダム対戦の一覧（`src/server/src/watch_list.ts`）のクライアントの純粋な部品。
-//!
-//! - **載せる口**（[`HostClient`]）: ランダム対戦のホストが持ち続ける。繋いだら割り当てのルーム名（`q.…`）・1P と 2P の名前・同期方式・
+//! - **載せる口**（[`HostClient`]）: ランダム対戦のホストが持ち続ける。接続したら割り当てのルーム名（`q.…`）・1P と 2P の名前・同期方式・
 //!   観戦者の数と上限を `post` で送り、`listed` を待つ。以後は観戦者の数が変わるたびに `count` を送る。切れたら一覧から消える。
-//! - **見る口**（[`ViewClient`]）: 観戦者が一覧を開いている間だけ持つ。繋ぐと一覧の全体が届き、変わるたびに全体が届く。
+//! - **見る口**（[`ViewClient`]）: 観戦者が一覧を開いている間だけ持つ。接続すると一覧の全体が届き、変わるたびに全体が届く。
 //!
 //! サーバーは観戦用のルーム名（`w.…`）を割り当ての名から自分で導き、一覧には `w.…` だけを載せる。割り当ての名は画面にもログにも出さない
 //! （[`crate::room_queue::AssignedRoom`] の `Debug` は名を伏せる）。待ち列・ルームの手順と同じく、ソケットも時計も持たない。
-//!
 //! 見張りのスレッドで回す。ゲームのスレッドでは呼ばない（一覧をゲームのスレッドへ渡す入れ物は [`WatchSnapshot`]・[`WatchRow::to_words`]）。
 #![forbid(unsafe_code)]
 
@@ -41,9 +39,9 @@ const HASH_BYTES: usize = 8;
 
 const _: () = assert!(WATCH_CAP_MAX == 10);
 
-/// ランダムマッチのホストがこのマッチを一覧に載せてよいか。`own` は自分の `[spectate] enable = 1`、`peer` は相手が HELLO の
-/// +3 の bit2 で名乗った同じ設定。片方でも断れば載せない（一覧に載らなければ観戦用のルームの名を知る人もいないので、配る側も起こさない）。
-/// ルームマッチの観戦はこれを見ない（ホストの設定だけで決まる）。
+/// このマッチを観戦させてよいか。`own` は自分の `[spectate] enable = 1`、`peer` は相手が HELLO の +3 の bit2 で名乗った同じ設定。
+/// 片方でも許可していなければ、どの入口（ランダムマッチの一覧・観戦用のルーム・観戦コード・LAN の観戦）でも観戦の受付を作らない。
+/// 2 人が同じ 2 つの値から決めるので、どちらがホストになっても結論は同じ。
 pub fn may_list(own: bool, peer: bool) -> bool {
     own && peer
 }
@@ -182,7 +180,7 @@ impl WatchRow {
         RoomName::parse_server_rules(&s).ok()
     }
 
-    /// ゲームのスレッドへ渡す入れ物（原子変数の語）に詰める。
+    /// 見張りの側（書き手）が、ゲームのスレッドへ渡す入れ物（原子変数の語）に詰める。
     pub fn to_words(&self) -> [u32; WATCH_ROW_WORDS] {
         let mut w = [0u32; WATCH_ROW_WORDS];
         let le = |c: &[u8]| u32::from_le_bytes(c.try_into().unwrap_or([0; 4]));
@@ -308,12 +306,12 @@ fn read_row(pairs: &[(std::borrow::Cow<'_, str>, JsonValue<'_>)]) -> Option<Watc
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListStatus {
-    /// まだ一覧が届いていない（繋いでいる）。
+    /// まだ一覧が届いていない（接続している）。
     #[default]
     Loading,
     /// 一覧が届いている（0 件でもここ）。
     Ready,
-    /// 繋げなかった・切れた。
+    /// 接続できなかった・切れた。
     Failed,
 }
 
@@ -344,7 +342,7 @@ impl WatchSnapshot {
         self.len == 0
     }
 
-    /// 行を置き替える（`WATCH_ROWS_MAX` を越える分は捨てる）。
+    /// 行を入れ替える（`WATCH_ROWS_MAX` を越える分は捨てる）。
     pub fn set(&mut self, status: ListStatus, rows: &[WatchRow]) {
         self.status = status;
         self.len = rows.len().min(WATCH_ROWS_MAX);
@@ -462,7 +460,7 @@ impl core::fmt::Debug for Posting {
     }
 }
 
-/// `{"t":"post",…}` の文を作る。名前・ルーム名・方式は逃がしの要らない文字だけ（作る前に確かめてある）ので、そのまま書く。
+/// `{"t":"post",…}` の文を作る。名前・ルーム名・方式は逃がしの要らない文字だけ（作る前に検証してある）ので、そのまま書く。
 pub fn write_post(p: &Posting, watchers: u8) -> String {
     format!(
         r#"{{"t":"post","room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},"watchers":{},"cap":{}}}"#,
@@ -507,7 +505,7 @@ impl Pings {
         self.silence_deadline().is_some_and(|d| now.ms >= d)
     }
 
-    /// ping の時刻なら次の時刻を置いて ping の文を返す。
+    /// ping の時刻なら次の時刻を決めて ping の文を返す。
     fn due(&mut self, now: Now) -> Option<String> {
         let p = self.next_ping_ms?;
         if now.ms < p {
@@ -567,14 +565,14 @@ pub enum HostState {
     Failed(Failure),
 }
 
-/// 載せる口の手順。繋ぐ前に `new` → 101 なら `on_upgraded`（この中で `post` を送る）、101 でなければ `on_http_refused`、繋がらなければ
+/// 載せる口の手順。接続する前に `new` → 101 なら `on_upgraded`（この中で `post` を送る）、101 でなければ `on_http_refused`、接続できなければ
 /// `on_transport_failed`。以後、受けた文を `on_text`、閉じる番号を `on_close`。観戦者の数が変わったら `set_watchers`。
 /// `next_wake` の時刻か、それより前に `poll` を呼ぶ。終わりは失敗だけ（載せている間は閉じない）。
 #[derive(Debug, Clone)]
 pub struct HostClient {
     state: HostState,
     posting: Posting,
-    /// いまの観戦者の数（`set_watchers` が置く）と、サーバーへ最後に送った（`post` か `count` の）数。
+    /// いまの観戦者の数（`set_watchers` が更新する）と、サーバーへ最後に送った（`post` か `count` の）数。
     watchers: u8,
     sent: u8,
     deadline_ms: Option<u64>,
@@ -717,7 +715,7 @@ impl HostClient {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewEvent {
-    /// 一覧の全体（繋いだ直後と、変わるたびに届く）。
+    /// 一覧の全体（接続した直後と、変わるたびに届く）。
     List {
         rows: Vec<WatchRow>,
         skipped: usize,

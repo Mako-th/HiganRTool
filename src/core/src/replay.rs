@@ -4,11 +4,10 @@
 //!   `+0x18` から `comp_size` の手前（暗号化と圧縮）は読まない。印には要らず、復号を実装しても合成の標本を同じ実装で
 //!   作ることになり、復号の間違いを検査が見つけられないため。
 //! - `comp_size` は `0x0042063B`（実測 1455/1455）、USER の全長の丸めは `0x00420F49`。
-//! - 印は thprac の `ReplaySaveParam` と同じ形（末尾に USER を 1 つ足し、`+0x08` をタグにする）。仕組みだけの参考で、
-//!   コードはコピーしていない。タグは `HGRT`。
+//! - 印は thprac の `ReplaySaveParam` と同じ形（末尾に USER を 1 つ足し、`+0x08` をタグにする）。仕組みだけの参考で、コードはコピーしていない。タグは `HGRT`。
 //!
-//! ファイルには触らない（バイト列を受け、足すバイト列・読めた印・理由を返すだけ）。書くのは dll。ゲームスレッドの外で呼ぶので
-//! ヒープを使う。どんなバイト列でもパニックしない（添字は `get`、足し算は `checked_add`）。
+//! ファイルには触らない（バイト列を受け、足すバイト列・読めた印・理由を返すだけ）。書くのは dll。ゲームスレッドの外で呼ぶのでヒープを使う。
+//! どんなバイト列でもパニックしない（添字は `get`、足し算は `checked_add`）。
 
 use crate::frame::MAX_DELAY;
 use crate::replay_detail::{self, DetailFields, MatchDetail};
@@ -29,6 +28,13 @@ pub const USER_HEADER_LEN: usize = 12;
 pub const MARK_TAG: [u8; 4] = *b"HGRT";
 pub const MARK_HEAD: &str = "HIGANR";
 pub const MARK_VERSION: &str = "1";
+/// ゲームのメニューから保存したリプレイの印のバージョン。ネット対戦の印（`MARK_VERSION`）は必須の key を 7 つ持つが、こちらは持たない
+/// 別の形なので、バージョンを分けた。バージョン 1 しか知らない読み手はこの印を `UnknownVersion` として読み飛ばせる。
+pub const MENU_MARK_VERSION: &str = "2";
+/// メニューの保存の印の `kind` の値。知らない値（後で足す種類）は `UnknownVersion` として読み飛ばす。
+pub const MENU_KIND: &str = "menu";
+/// メニューの保存の印の `ver`（バージョン名）の最大バイト数。
+pub const MENU_VER_MAX: usize = 32;
 
 /// ファイルの平文の部分が読めなかった理由（印を付けずにログへ出す）。ゲームの保存が壊れている可能性があるので、直さずに返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +144,7 @@ pub fn parse(bytes: &[u8]) -> Result<Layout, ReplayError> {
         if read_tag(bytes, pos) != Some(USER_MAGIC) {
             return Err(ReplayError::NotUser { offset: pos });
         }
-        // remaining >= 12 を上で確かめたので読める。読めなければ余りとして断る。
+        // remaining >= 12 を上で検証したので読める。読めなければ余りとして断る。
         let total = read_u32(bytes, pos + 4).ok_or(ReplayError::TrailingBytes {
             offset: pos,
             len: remaining,
@@ -178,7 +184,7 @@ pub enum Side {
     P2,
 }
 
-/// マッチの結果（`result=`。自分から見た結果）。
+/// マッチの結果（`result=`。対戦の印は自分から、観戦の印は 1P から見た結果）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchResult {
     Win,
@@ -283,7 +289,7 @@ impl Timestamp {
 /// 知らない key は読み飛ばす約束なので、足す前の読み手も観戦の印を普通の印として読める）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkRole {
-    /// 対戦者として遊んだ（`role` の key は書かない。足す前の印と同じバイト列）。
+    /// 対戦に参加して遊んだ（`role` の key は書かない。足す前の印と同じバイト列）。
     Play,
     /// 観戦者として見た（`role=watch`）。`p1`・`p2` はマッチの 1P・2P の名前（無害化の前。UTF-8、32 バイトまで）。この印の `self_name` は
     /// 観戦した人の名前、`peer` は空、`side` は 1、`result` は 1P から見た結果、`lat`・`ping` は 0。
@@ -305,6 +311,14 @@ pub struct Mark {
     /// マッチの情報（ラウンドごとの記録・同期方式・ビルド番号・開始時刻・通信の要約。`replay_detail`）。`None` なら足す前の印と同じ
     /// バイト列になる。
     pub detail: Option<MatchDetail>,
+}
+
+/// ゲームのメニュー（Story・Extra・Match の保存）で保存したリプレイの印。ネット対戦の記録を持たない。`ver` は保存した
+/// HiganRTool のバージョン名（dll の `CARGO_PKG_VERSION`。1〜`MENU_VER_MAX` バイト）、`build` はそのビルド番号（`update::BUILD_NUMBER`。開発バージョンは 0）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuMark {
+    pub ver: String,
+    pub build: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,12 +350,15 @@ pub enum MarkRead {
     UnknownVersion,
     Broken(MarkError),
     Found(Mark),
+    /// ゲームのメニューから保存したリプレイの印。ネット対戦の記録（相手・結果・ラウンドの記録）は無い。
+    Menu(MenuMark),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyRead {
     UnknownVersion,
     Mark(Mark),
+    Menu(MenuMark),
 }
 
 /// 値の逃がし方: `[0-9A-Za-z-_.~]` 以外のバイトを `%XX`（大文字の 16 進）にする。タブ・`=`・`%` を含む名前でも欄が崩れない。
@@ -460,8 +477,28 @@ pub fn mark_body(mark: &Mark) -> Result<String, MarkError> {
 /// 印のチャンク 1 つ: `"USER"` ＋ 全長 ＋ `"HGRT"` ＋ 本文 ＋ NUL ＋ 詰め物の 0。
 /// 全長はゲームの USER と同じく偶数へ切り上げる（`strlen + 13` を偶数へ。`0x00420F49`）。
 pub fn mark_chunk(mark: &Mark) -> Result<Vec<u8>, MarkError> {
-    let body = mark_body(mark)?;
-    // 本文は最大でも数百バイトなので u32 に収まる。念のため確かめて、収まらなければ断る。
+    frame_chunk(&mark_body(mark)?)
+}
+
+/// メニューの保存の印の本文（1 行）: `HIGANR<TAB>2<TAB>kind=menu<TAB>ver=<バージョン名><TAB>build=<n>`。
+pub fn menu_mark_body(mark: &MenuMark) -> String {
+    format!(
+        "{MARK_HEAD}\t{MENU_MARK_VERSION}\tkind={MENU_KIND}\tver={}\tbuild={}",
+        escape_value(mark.ver.as_bytes()),
+        mark.build
+    )
+}
+
+/// メニューの保存の印のチャンク 1 つ（枠は `mark_chunk` と同じ）。`ver` が空か長すぎるものは、読むときに壊れている扱いになるので書かない。
+pub fn menu_mark_chunk(mark: &MenuMark) -> Result<Vec<u8>, MarkError> {
+    if mark.ver.is_empty() || mark.ver.len() > MENU_VER_MAX {
+        return Err(MarkError::BadValue("ver"));
+    }
+    frame_chunk(&menu_mark_body(mark))
+}
+
+fn frame_chunk(body: &str) -> Result<Vec<u8>, MarkError> {
+    // 本文は最大でも数百バイトなので u32 に収まる。念のため検証して、収まらなければ断る。
     let unpadded = USER_HEADER_LEN + body.len() + 1;
     let total = unpadded + (unpadded & 1);
     let total_u32 = u32::try_from(total).map_err(|_| MarkError::BadValue("body"))?;
@@ -476,13 +513,24 @@ pub fn mark_chunk(mark: &Mark) -> Result<Vec<u8>, MarkError> {
 }
 
 /// `file` の末尾へ足す印のチャンクを返す（dll はそのままファイルの末尾へ書く）。壊れている・既に印がある・印の値が範囲外、を分けて断る。
-/// `parse` が最後のチャンクの後ろに余りが無いことを確かめているので、足したチャンクもたどれる。
+/// `parse` が最後のチャンクの後ろに余りが無いことを検証しているので、足したチャンクもたどれる。
 pub fn chunk_to_append(file: &[u8], mark: &Mark) -> Result<Vec<u8>, AppendError> {
+    check_appendable(file)?;
+    mark_chunk(mark).map_err(AppendError::InvalidMark)
+}
+
+/// `chunk_to_append` のメニューの保存の印用。断る条件は同じ（壊れている・どの種類でも印が既にある）。
+pub fn chunk_to_append_menu(file: &[u8], mark: &MenuMark) -> Result<Vec<u8>, AppendError> {
+    check_appendable(file)?;
+    menu_mark_chunk(mark).map_err(AppendError::InvalidMark)
+}
+
+fn check_appendable(file: &[u8]) -> Result<(), AppendError> {
     let layout = parse(file).map_err(AppendError::Broken)?;
     if layout.has_mark() {
         return Err(AppendError::AlreadyMarked);
     }
-    mark_chunk(mark).map_err(AppendError::InvalidMark)
+    Ok(())
 }
 
 /// バージョン 1 の key。先頭の 7 つは必須、`role`・`p1`・`p2` は観戦の印にだけ付く任意の key。マッチの情報の key は `replay_detail::ALLOWED_KEYS`。
@@ -509,6 +557,9 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
         return Err(MarkError::NotHiganr);
     }
     let version = fields.next().ok_or(MarkError::MissingVersion)?;
+    if version == MENU_MARK_VERSION.as_bytes() {
+        return parse_menu_fields(fields);
+    }
     if version != MARK_VERSION.as_bytes() {
         return Ok(BodyRead::UnknownVersion);
     }
@@ -544,7 +595,7 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
     let ping = take(4)?;
     let result = take(5)?;
     let at = take(6)?;
-    // 任意の key。`role` が無い（か `play`）なら対戦者の印で、`p1`・`p2` があっても使わない（後のバージョンで意味を足せるように）。
+    // 任意の key。`role` が無い（か `play`）なら対戦に参加した側の印で、`p1`・`p2` があっても使わない（後のバージョンで意味を足せるように）。
     let role_value = values[7].take();
     let p1 = values[8].take();
     let p2 = values[9].take();
@@ -596,6 +647,49 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
     }))
 }
 
+/// メニューの保存の印（バージョン 2）の key と値。`kind` が `menu` でなければ、後で足す種類として読み飛ばす。知らない key は無視する。
+fn parse_menu_fields<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Result<BodyRead, MarkError> {
+    let mut kind: Option<Vec<u8>> = None;
+    let mut ver: Option<Vec<u8>> = None;
+    let mut build: Option<Vec<u8>> = None;
+    for field in fields {
+        let eq = field
+            .iter()
+            .position(|&b| b == b'=')
+            .ok_or(MarkError::FieldWithoutEquals)?;
+        let (key, value) = (&field[..eq], &field[eq + 1..]);
+        let (slot, name) = match key {
+            b"kind" => (&mut kind, "kind"),
+            b"ver" => (&mut ver, "ver"),
+            b"build" => (&mut build, "build"),
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(MarkError::DuplicateKey(name));
+        }
+        *slot = Some(unescape_value(value).ok_or(MarkError::BadEscape(name))?);
+    }
+    let kind = kind.ok_or(MarkError::MissingKey("kind"))?;
+    if kind != MENU_KIND.as_bytes() {
+        return Ok(BodyRead::UnknownVersion);
+    }
+    let ver = ver.ok_or(MarkError::MissingKey("ver"))?;
+    if ver.is_empty() || ver.len() > MENU_VER_MAX {
+        return Err(MarkError::BadValue("ver"));
+    }
+    let ver = String::from_utf8(ver).map_err(|_| MarkError::BadValue("ver"))?;
+    let build = build.ok_or(MarkError::MissingKey("build"))?;
+    // `+` や空白を受けないように、数字だけを見てから変換する。
+    if build.is_empty() || !build.iter().all(u8::is_ascii_digit) {
+        return Err(MarkError::BadValue("build"));
+    }
+    let build = std::str::from_utf8(&build)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or(MarkError::BadValue("build"))?;
+    Ok(BodyRead::Menu(MenuMark { ver, build }))
+}
+
 /// ファイルから印を読む。`comp_size` から USER を順にたどり、タグ `HGRT` のものだけを見る。知らないバージョンは読み飛ばし、
 /// 最初のバージョン 1 の結果（読めた / 壊れている）を返す。ファイル自体が読めなければ `Err`。
 pub fn read_mark(file: &[u8]) -> Result<MarkRead, ReplayError> {
@@ -609,6 +703,7 @@ pub fn read_mark(file: &[u8]) -> Result<MarkRead, ReplayError> {
         match parse_mark_body(body) {
             Ok(BodyRead::UnknownVersion) => saw_unknown = true,
             Ok(BodyRead::Mark(mark)) => return Ok(MarkRead::Found(mark)),
+            Ok(BodyRead::Menu(mark)) => return Ok(MarkRead::Menu(mark)),
             Err(e) => return Ok(MarkRead::Broken(e)),
         }
     }
@@ -1017,10 +1112,10 @@ mod tests {
         let plain = synthetic_replay(0xC0, 5);
         assert_eq!(read_mark(&plain).unwrap(), MarkRead::Absent);
 
-        let unknown = file_with_mark_bodies(&[b"HIGANR\t2\twhatever"]);
+        let unknown = file_with_mark_bodies(&[b"HIGANR\t9\twhatever"]);
         assert_eq!(read_mark(&unknown).unwrap(), MarkRead::UnknownVersion);
 
-        let both = file_with_mark_bodies(&[b"HIGANR\t2\tx", V1.as_bytes()]);
+        let both = file_with_mark_bodies(&[b"HIGANR\t9\tx", V1.as_bytes()]);
         let MarkRead::Found(m) = read_mark(&both).unwrap() else {
             panic!("バージョン 1 を読めていない");
         };
@@ -1173,7 +1268,6 @@ mod tests {
         assert_eq!(v1.detail, None);
     }
 
-    /// 壊れたら落ちる: チャージ型を印に書かない・席を入れ替える・無いのに書く・足す前の読みが新しい印を壊れたと扱う。
     #[test]
     fn the_charge_key_round_trips_and_an_old_reader_skips_it() {
         let mut m = detail_mark();
@@ -1393,6 +1487,258 @@ mod tests {
         assert!(
             details_seen > 20,
             "マッチの情報まで届いた本数 {details_seen} / 10000"
+        );
+    }
+
+    // ---- ゲームのメニューから保存したリプレイの印（バージョン 2・kind=menu） ----
+
+    /// thprac の `PRAC` と同じ形の USER（`+0x08` が `PRAC`）。
+    fn prac_chunk() -> Vec<u8> {
+        let text = b"THPRAC test body";
+        let total = (12 + text.len() + 1 + 1) & !1;
+        let mut c = Vec::new();
+        c.extend_from_slice(b"USER");
+        c.extend_from_slice(&(total as u32).to_le_bytes());
+        c.extend_from_slice(b"PRAC");
+        c.extend_from_slice(text);
+        c.push(0);
+        c.resize(total, 0);
+        c
+    }
+
+    #[test]
+    fn menu_mark_chunk_matches_the_hand_written_bytes() {
+        let m = MenuMark {
+            ver: "1.1.1".into(),
+            build: 411_272,
+        };
+        let body = "HIGANR\t2\tkind=menu\tver=1.1.1\tbuild=411272";
+        assert_eq!(menu_mark_body(&m), body);
+        let chunk = menu_mark_chunk(&m).unwrap();
+        let total = (12 + body.len() + 1 + 1) & !1;
+        assert_eq!(chunk.len(), total);
+        assert_eq!(&chunk[0..4], b"USER");
+        assert_eq!(
+            u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as usize,
+            total
+        );
+        assert_eq!(&chunk[8..12], b"HGRT");
+        assert_eq!(&chunk[12..12 + body.len()], body.as_bytes());
+        assert!(chunk[12 + body.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn menu_mark_carries_the_tool_version_and_refuses_one_it_cannot_read_back() {
+        for ver in ["1.1.1", "1.2.0-beta.1", "dev build+7", "v1_0"] {
+            let m = MenuMark {
+                ver: ver.to_string(),
+                build: 9,
+            };
+            let file = synthetic_replay(0xC0, 3);
+            let mut marked = file.clone();
+            marked.extend_from_slice(&chunk_to_append_menu(&file, &m).unwrap());
+            assert_eq!(read_mark(&marked).unwrap(), MarkRead::Menu(m), "{ver}");
+        }
+        assert_eq!(
+            menu_mark_body(&MenuMark {
+                ver: "a b".into(),
+                build: 1
+            }),
+            "HIGANR\t2\tkind=menu\tver=a%20b\tbuild=1"
+        );
+        for ver in ["".to_string(), "x".repeat(MENU_VER_MAX + 1)] {
+            let m = MenuMark { ver, build: 1 };
+            assert_eq!(menu_mark_chunk(&m), Err(MarkError::BadValue("ver")));
+            assert_eq!(
+                chunk_to_append_menu(&synthetic_replay(0xC0, 3), &m),
+                Err(AppendError::InvalidMark(MarkError::BadValue("ver")))
+            );
+        }
+        let ok = MenuMark {
+            ver: "x".repeat(MENU_VER_MAX),
+            build: 1,
+        };
+        assert!(menu_mark_chunk(&ok).is_ok());
+    }
+
+    #[test]
+    fn menu_mark_appends_after_the_game_bytes_and_reads_back() {
+        for (i, build) in [0u32, 1, 411_272, u32::MAX].into_iter().enumerate() {
+            let file = synthetic_replay(0xC0 + 9 * i as u32, 0x77 + i as u32);
+            let m = MenuMark {
+                ver: "1.1.1".into(),
+                build,
+            };
+            let chunk = chunk_to_append_menu(&file, &m).unwrap();
+            let mut marked = file.clone();
+            marked.extend_from_slice(&chunk);
+            assert_eq!(&marked[..file.len()], &file[..], "足す前の部分はバイト一致");
+            let layout = parse(&marked).unwrap();
+            assert_eq!(layout.chunks.len(), 2);
+            assert!(layout.chunks[1].is_mark());
+            assert_eq!(read_mark(&marked).unwrap(), MarkRead::Menu(m));
+        }
+    }
+
+    #[test]
+    fn menu_mark_is_appended_after_a_thprac_user_chunk() {
+        let mut file = synthetic_replay(0xC8, 5);
+        file.extend_from_slice(&prac_chunk());
+        let m = MenuMark {
+            ver: "1.1.1".into(),
+            build: 7,
+        };
+        let chunk = chunk_to_append_menu(&file, &m).unwrap();
+        let mut marked = file.clone();
+        marked.extend_from_slice(&chunk);
+        let layout = parse(&marked).unwrap();
+        assert_eq!(layout.chunks.len(), 3);
+        assert_eq!(layout.chunks[1].tag, *b"PRAC");
+        assert_eq!(read_mark(&marked).unwrap(), MarkRead::Menu(m));
+    }
+
+    #[test]
+    fn menu_mark_is_refused_for_marked_and_broken_files() {
+        let m = MenuMark {
+            ver: "1.1.1".into(),
+            build: 7,
+        };
+        // ネット対戦の印・メニューの印・知らないバージョンの印のどれが先にあっても、二重に付けない。
+        let base = synthetic_replay(0xC0, 1);
+        for first in [
+            chunk_to_append(&base, &sample_mark("a", "b")).unwrap(),
+            menu_mark_chunk(&MenuMark {
+                ver: "1.1.1".into(),
+                build: 1,
+            })
+            .unwrap(),
+            frame_chunk("HIGANR\t9\tfuture=1").unwrap(),
+        ] {
+            let mut f = base.clone();
+            f.extend_from_slice(&first);
+            assert_eq!(
+                chunk_to_append_menu(&f, &m),
+                Err(AppendError::AlreadyMarked)
+            );
+        }
+        let mut cut = base.clone();
+        cut.truncate(base.len() - 1);
+        assert!(matches!(
+            chunk_to_append_menu(&cut, &m),
+            Err(AppendError::Broken(_))
+        ));
+        assert!(matches!(
+            chunk_to_append_menu(&[0u8; 4], &m),
+            Err(AppendError::Broken(ReplayError::TooShort { .. }))
+        ));
+    }
+
+    #[test]
+    fn menu_body_reads_strictly_and_unknown_kinds_are_skipped() {
+        let read = |s: &str| parse_mark_body(s.as_bytes());
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1\tbuild=5"),
+            Ok(BodyRead::Menu(MenuMark {
+                ver: "1.1.1".into(),
+                build: 5
+            }))
+        );
+        // 順序・知らない key は問わない（後で足せる）。
+        assert_eq!(
+            read("HIGANR\t2\tbuild=5\tfuture=x\tver=1.1.1\tkind=menu"),
+            Ok(BodyRead::Menu(MenuMark {
+                ver: "1.1.1".into(),
+                build: 5
+            }))
+        );
+        // 知らない種類は読み飛ばす（バージョン 1 の `UnknownVersion` と同じ扱い）。
+        assert_eq!(read("HIGANR\t2\tkind=other"), Ok(BodyRead::UnknownVersion));
+        assert_eq!(
+            read("HIGANR\t3\tkind=menu\tver=1.1.1\tbuild=5"),
+            Ok(BodyRead::UnknownVersion)
+        );
+        assert_eq!(
+            read("HIGANR\t2\tbuild=5"),
+            Err(MarkError::MissingKey("kind"))
+        );
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1"),
+            Err(MarkError::MissingKey("build"))
+        );
+        // `ver` は必須（まだ配っていない形なので、key の無い古い形は読まない）。
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tbuild=5"),
+            Err(MarkError::MissingKey("ver"))
+        );
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1\tver=1.1.2\tbuild=5"),
+            Err(MarkError::DuplicateKey("ver"))
+        );
+        let long = "9".repeat(MENU_VER_MAX + 1);
+        for bad in ["", "%FF", "%zz", long.as_str()] {
+            assert!(
+                matches!(
+                    read(&format!("HIGANR\t2\tkind=menu\tver={bad}\tbuild=5")),
+                    Err(MarkError::BadValue("ver") | MarkError::BadEscape("ver"))
+                ),
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "+5", " 5", "x", "4294967296", "-1"] {
+            assert_eq!(
+                read(&format!("HIGANR\t2\tkind=menu\tver=1.1.1\tbuild={bad}")),
+                Err(MarkError::BadValue("build")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tkind=menu\tver=1.1.1\tbuild=5"),
+            Err(MarkError::DuplicateKey("kind"))
+        );
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1\tbuild=1\tbuild=2"),
+            Err(MarkError::DuplicateKey("build"))
+        );
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1\tbuild"),
+            Err(MarkError::FieldWithoutEquals)
+        );
+        assert_eq!(
+            read("HIGANR\t2\tkind=menu\tver=1.1.1\tbuild=%zz"),
+            Err(MarkError::BadEscape("build"))
+        );
+    }
+
+    #[test]
+    fn the_play_mark_form_is_unchanged_and_version_1_never_reads_a_menu_body() {
+        let mut mark = sample_mark("a b", "Z");
+        mark.side = Side::P1;
+        mark.result = MatchResult::Win;
+        assert_eq!(
+            mark_body(&mark).unwrap(),
+            "HIGANR\t1\tpeer=a%20b\tself=Z\tside=1\tlat=3\tping=48\tresult=win\tat=2026-09-25T23%3A05%3A09"
+        );
+        let mut f = synthetic_replay(0xC0, 2);
+        f.extend_from_slice(
+            &menu_mark_chunk(&MenuMark {
+                ver: "1.1.1".into(),
+                build: 3,
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            read_mark(&f).unwrap(),
+            MarkRead::Menu(MenuMark {
+                ver: "1.1.1".into(),
+                build: 3
+            })
+        );
+        // バージョン 1 の本文にメニューの key だけがあっても `Menu` にはならず、必須の key の欠けで壊れている扱い。
+        let mut g = synthetic_replay(0xC0, 2);
+        g.extend_from_slice(&frame_chunk("HIGANR\t1\tkind=menu\tver=1.1.1\tbuild=3").unwrap());
+        assert_eq!(
+            read_mark(&g).unwrap(),
+            MarkRead::Broken(MarkError::MissingKey("peer"))
         );
     }
 }

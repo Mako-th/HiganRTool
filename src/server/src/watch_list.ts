@@ -1,11 +1,11 @@
 // 進行中のランダム対戦の一覧 = Durable Object（ビルド番号ごとに 1 つ。idFromName("b<番号>")）。口は 2 つ。
 //
 // - post（載せる口）: 対戦のホストが持ち続ける。最初の 1 通 `post` で、割り当てのルーム名 q.…・1P・2P の名前・同期方式・観戦者の数と上限を
-//   送る。サーバーは q.… の形を確かめ、観戦用のルーム名 w.… を自分で導く（任意の w.… を載せられない。ルーム対戦の観戦用のルームを
+//   送る。サーバーは q.… の形をチェックし、観戦用のルーム名 w.… を自分で導く（任意の w.… を載せられない。ルーム対戦の観戦用のルームを
 //   一覧へ漏らさない）。q.… は持たず、一覧にも出さない。切れたら一覧から消す。1 IP（IPv6 は /64）から 2 件まで・全体で 100 件まで。
 // - view（見る口）: 観戦者が一覧を開いている間だけ持つ。開いたときに一覧の全体、変わるたびに全体を送る（変化は 1 秒に 1 回にまとめる）。
 //
-// 状態は WebSocket の attachment にだけ置く（Hibernation で起こされても一覧を作り直せる）。ログ（console）には何も書かない。
+// 状態は WebSocket の attachment にだけ保存する（Hibernation から復帰しても一覧を作り直せる）。ログ（console）には何も書かない。
 
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -40,7 +40,7 @@ interface PostAtt {
   seq: number;
   item: WatchItem | null;
   done: boolean;
-  /** count の数え窓の始まりと、その窓で受けた数。 */
+  /** count を数える期間の始まりと、その期間に受けた数。 */
   cw?: number;
   cn?: number;
 }
@@ -55,14 +55,14 @@ type Att = PostAtt | ViewAtt;
 const OPEN = 1;
 
 export class WatchList extends DurableObject<Env> {
-  /** 最後に観戦者へ全体を送った時刻（起こされ直したら 0 から。すぐ送る側に倒れる）。 */
+  /** 最後に観戦者へ全体を送った時刻（復帰し直したら 0 から。すぐ送る側に倒れる）。 */
   private lastSent = 0;
   /**
    * まとめて送る変化が残っている印。ストレージには書かない（書き込みの枠を荒らしに使わせない）。追い出されて失っても、
-   * 起こされ直した最初のアラームで必ず全体を送る（alarm）ので、観戦者の表示が古いままになることはない。
+   * 復帰し直した最初のアラームで必ず全体を送る（alarm）ので、観戦者の表示が古いままになることはない。
    */
   private flushPending = false;
-  /** 掛けてあるアラームの時刻。undefined は未確認（起こされ直した直後）、null は無い。 */
+  /** 掛けてあるアラームの時刻。undefined は未確認（復帰し直した直後）、null は無い。 */
   private alarmAt: number | null | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -183,7 +183,7 @@ export class WatchList extends DurableObject<Env> {
         changed ||= a.item !== null;
       }
     }
-    // lastSent が 0 なら起こされ直した後で、残っていたかもしれない印を失っている。念のため全体を送る。
+    // lastSent が 0 なら復帰し直した後で、残っていたかもしれない印を失っている。念のため全体を送る。
     const flush = this.flushPending || this.lastSent === 0;
     this.flushPending = false;
     this.alarmAt = null;

@@ -1,9 +1,6 @@
-//! コピーの表の確かめと、コピーした範囲の読み方（pure。unsafe 無し）。入口は枠の先頭（64 バイト）の後ろへ、コピーの表の範囲を
-//! そのままコピーする。ここは
-//! - 表の確かめ（枠に収まる・先頭と重ならない・互いに重ならない・元が読める）。入口が枠の外へ書かないための守りなので、
-//!   `stub::set_copy_table` も置く前に枠の側（`check_layout`）を通す。
-//! - `_ticks.csv` のコピーの列（乱数・InputManager 3 本・選んだグローバル）、`_changes.csv`（2 つのグローバルの範囲を
-//!   4 バイトずつ前の件と比べた差分）、`_snap.bin` の先頭。
+//! コピーの表のチェックと、コピーした範囲の読み方（pure。unsafe 無し）。入口は枠の先頭（64 バイト）の後ろへ、コピーの表の範囲をそのままコピーする。ここは
+//! - 表のチェック（枠に収まる・先頭と重ならない・互いに重ならない・元が読める）。入口が枠の外へ書かないための守りなので、`stub::set_copy_table` も設定する前に枠の側（`check_layout`）を通す。
+//! - `_ticks.csv` のコピーの列（乱数・InputManager 3 本・選んだグローバル）、`_changes.csv`（2 つのグローバルの範囲を 4 バイトずつ前の件と比べた差分）、`_snap.bin` の先頭。
 //!
 //! コピーした値は「入口が実際に使っている表」から引く。表に無いアドレスの列は空にする（0 と書くと「測れていない」が「0 だった」に見える）。
 #![forbid(unsafe_code)]
@@ -36,19 +33,19 @@ impl CopyError {
     pub fn text(&self) -> String {
         match *self {
             CopyError::TooMany { rows } => {
-                format!("行が {rows} 行で、上限 {COPY_MAX_ROWS} 行を越える")
+                format!("行数 {rows} が上限 {COPY_MAX_ROWS} 行を超過")
             }
             CopyError::Empty { row } => format!("{} 行目の長さが 0", row + 1),
             CopyError::OutOfSlot { row } => {
-                format!("{} 行目が枠（{SLOT_BYTES} バイト）からはみ出す", row + 1)
+                format!("{} 行目が枠（{SLOT_BYTES} バイト）からはみ出し", row + 1)
             }
             CopyError::OverlapsHead { row } => {
-                format!("{} 行目が枠の先頭（{HEAD_BYTES} バイト）と重なる", row + 1)
+                format!("{} 行目が枠の先頭（{HEAD_BYTES} バイト）と重複", row + 1)
             }
             CopyError::Overlap { a, b } => {
-                format!("{} 行目と {} 行目の置き場が重なる", a + 1, b + 1)
+                format!("{} 行目と {} 行目のコピー先が重複", a + 1, b + 1)
             }
-            CopyError::Unreadable { row } => format!("{} 行目の元の範囲が読めない", row + 1),
+            CopyError::Unreadable { row } => format!("{} 行目の元の範囲が読み取り不能", row + 1),
         }
     }
 }
@@ -58,7 +55,7 @@ fn dst_range(r: &CopyRow) -> Option<(u32, u32)> {
     Some((r.dst, r.dst.checked_add(r.len)?))
 }
 
-/// 枠の側の確かめ（入口が枠の外・先頭・他の行の置き場に書かないこと）。元を読まずに決まる。
+/// 枠の側のチェック（入口が枠の外・先頭・他の行の置き場に書かないこと）。元を読まずに決まる。
 pub fn check_layout(rows: &[CopyRow]) -> Result<(), CopyError> {
     if rows.len() > COPY_MAX_ROWS {
         return Err(CopyError::TooMany { rows: rows.len() });
@@ -88,7 +85,7 @@ pub fn check_layout(rows: &[CopyRow]) -> Result<(), CopyError> {
     Ok(())
 }
 
-/// 表の全部の確かめ: 枠の側に加えて、各行の元が読めるか（`readable`。本物は `Env::read`: コミット済みで読める保護の頁だけ）。
+/// 表の全部のチェック: 枠の側に加えて、各行の元が読めるか（`readable`。本物は `Env::read`: コミット済みで読める保護のページだけ）。
 pub fn check_copy_table(
     rows: &[CopyRow],
     mut readable: impl FnMut(u32, u32) -> bool,
@@ -256,7 +253,7 @@ pub const SNAP_VERSION: u32 = 1;
 
 /// `_snap.bin` の先頭: 印 8 / バージョン 4 / 枠の大きさ 4 / 先頭の大きさ 4 / 表の行の数 4 / 表の 8 行（元・長さ・置き場の
 /// 4 バイトずつ。使わない行は 0）96 / 残り 0。数はリトルエンディアン。枠の札（`+48`）が番号 + 1 なので、
-/// 件ごとの先頭は置かない。
+/// 件ごとの先頭は持たない。
 pub fn snap_header(rows: &[CopyRow]) -> Vec<u8> {
     let mut h = Vec::with_capacity(SNAP_HEADER_BYTES);
     h.extend_from_slice(SNAP_MAGIC);

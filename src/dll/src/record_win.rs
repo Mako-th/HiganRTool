@@ -23,16 +23,14 @@ use crate::menu::TickStats;
 use crate::menu_win::MenuThread;
 use crate::names::{is_same_or_inside, side_file_name};
 use crate::net_watch::{NET_FRAMES, NetFrameRing, NetSnapshot};
-use crate::observe::{D3d8Probe, MENU_SUFFIX, RecordEnv, WatchLog};
+use crate::observe::{MENU_SUFFIX, RecordEnv, WatchLog};
 use crate::scripted::Progress;
 use crate::shots::{ShotCounters, ShotHead};
 use crate::stub;
-use crate::th09_addr::{
-    D3D8_DEVICE_PTR, D3D8_ENDSCENE_SLOT, D3D8_PRESENT_SLOT, WINDOW_ADDR, WINDOW_CLOCK_DIVISOR,
-};
+use crate::th09_addr::{WINDOW_ADDR, WINDOW_CLOCK_DIVISOR};
 use crate::ticks::{CopyRow, SlotRead};
 use crate::trial_summary::HostFacts;
-use crate::win::{module_of_addr, read_own_memory};
+use crate::win::read_own_memory;
 use crate::{script_win, shot_win};
 
 /// CPUID の拡張の葉の最大を返す葉と、invariant TSC の葉（`0x80000007` の EDX bit 8 が「TSC が電力の状態によらず一定の速さで
@@ -59,35 +57,32 @@ impl RealRecord {
     }
 
     /// 本ログの隣に、本ログの名前の先頭 ＋ `suffix` のファイルを `create_new` で開く（既存を上書きしない）。
-    /// 置き場が exe のフォルダと同じかその下なら断る。
+    /// 出力先が exe のフォルダと同じかその下なら断る。
     fn open_raw(&self, suffix: &str) -> Result<(String, File), String> {
-        let log = self
-            .run_path
-            .as_ref()
-            .ok_or("本ログの置き場が決まっていない")?;
-        let dir = log.parent().ok_or("本ログのフォルダが分からない")?;
+        let log = self.run_path.as_ref().ok_or("本ログの場所が未決定")?;
+        let dir = log.parent().ok_or("本ログのフォルダが不明")?;
         let log_name = log
             .file_name()
-            .ok_or("本ログの名前が分からない")?
+            .ok_or("本ログの名前が不明")?
             .to_string_lossy();
         let name = side_file_name(&log_name, suffix);
         let path = dir.join(&name);
         let exe_dir = self
             .exe_dir
             .as_ref()
-            .ok_or("exe のフォルダが分からないので、ゲームのフォルダの外か確かめられない")?;
+            .ok_or("exe のフォルダが不明なのでゲームのフォルダの外かチェックできません")?;
         if is_same_or_inside(&dir.to_string_lossy(), &exe_dir.to_string_lossy()) {
             return Err(format!(
-                "置き場 {} が exe のフォルダの中なので書かない",
+                "場所 {} が exe のフォルダの中なので書きません",
                 dir.display()
             ));
         }
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(f) => Ok((name, f)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                Err(format!("{name} が既にある（上書きしない）"))
+                Err(format!("{name} が既に存在します（上書きしません）"))
             }
-            Err(e) => Err(format!("{} を開けない: {e}", path.display())),
+            Err(e) => Err(format!("{} を開けません: {e}", path.display())),
         }
     }
 
@@ -160,7 +155,7 @@ impl RecordEnv for RealRecord {
 
     fn start_menu(&mut self) -> Result<String, String> {
         if self.menu.is_some() {
-            return Err("もう起こしてある".to_string());
+            return Err("起動済み".to_string());
         }
         let (name, w) = self.open_file(MENU_SUFFIX)?;
         self.menu = Some(MenuThread::start(Box::new(w))?);
@@ -243,28 +238,6 @@ impl RecordEnv for RealRecord {
         script_win::trial_host()
     }
 
-    fn d3d8_probe(&mut self) -> D3d8Probe {
-        // どれも読むだけ（`read_own_memory` はコミット済みで読める頁でなければ `None`）。デバイスの関数は呼ばない。ポインタを
-        // たどる順: [0x4B3108] = device → [device] = vtable → [vtable+スロット]。
-        let read_u32 = |addr: u32| -> Option<u32> {
-            let b = read_own_memory(addr, 4)?;
-            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        };
-        let device = read_u32(D3D8_DEVICE_PTR);
-        let vtable = device.and_then(read_u32);
-        let endscene = vtable.and_then(|v| read_u32(v.wrapping_add(D3D8_ENDSCENE_SLOT)));
-        let present = vtable.and_then(|v| read_u32(v.wrapping_add(D3D8_PRESENT_SLOT)));
-        let module = |a: Option<u32>| a.and_then(module_of_addr).map(|p| p.display().to_string());
-        D3d8Probe {
-            device,
-            vtable,
-            endscene,
-            present,
-            endscene_module: module(endscene),
-            present_module: module(present),
-        }
-    }
-
     fn overlay_stop_line(&mut self) -> Option<String> {
         let (fail, hr, detail) = crate::overlay_win::take_stop_report()?;
         Some(crate::overlay::stop_line(fail, hr, detail))
@@ -273,7 +246,7 @@ impl RecordEnv for RealRecord {
 
 #[cfg(test)]
 mod tests {
-    //! 本物の Win32 を検査のプロセス自身に当てる（花映塚は使わない）。ファイルは一時ディレクトリだけ。
+    //! 本物の Win32 を検査のプロセス自身に当てる（花映塚は使わない）。ファイルは一時フォルダだけ。
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -314,7 +287,7 @@ mod tests {
                 .open_output(suffix)
                 .err()
                 .expect("2 回目は既にあるので断る");
-            assert!(e.contains("既にある"), "{e}");
+            assert!(e.contains("既に存在します"), "{e}");
             assert_eq!(std::fs::read(&path).unwrap(), b"a\n", "上書きした");
         }
 
@@ -350,7 +323,7 @@ mod tests {
             r.open_output("_net_frames.csv.gz")
                 .err()
                 .expect("2 回目は断る")
-                .contains("既にある")
+                .contains("既に存在します")
         );
         assert_eq!(std::fs::read(&path).unwrap(), raw, "上書きした");
         let mut inside = RealRecord::new(Some(d.join("y.log")), Some(d.clone()));

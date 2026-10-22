@@ -215,11 +215,11 @@ pub static TIMINGS: Timings = Timings::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fail {
     None = 0,
-    /// 文字の表が置かれていない（設置の順の誤り）。
+    /// 文字の表が用意されていない（設置の順の誤り）。
     NoAtlas = 1,
     /// CreateTexture が失敗した。
     CreateTexture = 2,
-    /// テクスチャの LockRect が失敗した・画素の置き場が返らなかった。
+    /// テクスチャの LockRect が失敗した・画素の領域が返らなかった。
     LockTexture = 3,
     /// 状態を読む Get* が失敗した（戻せないので描かない）。
     GetState = 4,
@@ -293,7 +293,7 @@ pub fn stop_line(fail: u32, hr: u32, detail: u32) -> String {
     } else {
         format!("HRESULT: 0x{hr:08X}")
     };
-    format!("文字の描画: 描画を止めた。以後は文字を描かない（{why}{call} / {hr}）")
+    format!("文字の描画: 描画を止めました。以後は文字を描きません（{why}{call} / {hr}）")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -308,7 +308,7 @@ pub struct OverlayCounters {
     pub torn: u32,
     /// `DrawPrimitiveUP` が失敗したフレーム。
     pub draw_failed: u32,
-    /// 自分の状態を置く・戻す `Set*` のどれかが失敗した回数。
+    /// 自分の状態を設定する・戻す `Set*` のどれかが失敗した回数。
     pub set_failed: u32,
     pub panics: u32,
     /// 止めた理由（`Fail` の番号）と、そのときの HRESULT。
@@ -318,7 +318,7 @@ pub struct OverlayCounters {
     pub setup_ticks: u32,
 }
 
-// ---- ゲームの文字（ascii.anm）を読み取る前の確かめ ----
+// ---- ゲームの文字（ascii.anm）を読み取る前のチェック ----
 
 /// ゲームの文字をコピーできていない理由（最後の 1 つを `overlay_win` が覚え、本ログが書く）。`Wait` の組は「まだ読み込み前かもしれない」ので
 /// 次の試しで直る。`Refuse` の組は直らないので試さない。
@@ -357,7 +357,7 @@ pub enum GameFontWhy {
     GlyphTooBig = 23,
     /// LockRect が失敗した（何度か試した後）。
     LockFailed = 24,
-    /// 画素の切り出しが断られた（呼ぶ前の確かめをすり抜けた —— あり得ない）。
+    /// 画素の切り出しが断られた（呼ぶ前のチェックをすり抜けた —— あり得ない）。
     ExtractFailed = 25,
     /// 試しの回数が上限（`GF_MAX_ATTEMPTS`）を越えた。待つ理由（読み込み前）が直らないまま長く続いたので、もう試さない。
     GaveUp = 26,
@@ -432,8 +432,7 @@ impl GameFontWhy {
 pub const GF_EVERY: u32 = 30;
 /// 試しの回数の上限。越えたら以降は試さず、GDI の文字のまま描く。600 回 × 30 フレーム = 5 分。ゲームは ascii.anm を起動時に読み込む形
 /// （`0x004344ED`〜`0x00434503` の AsciiManager の初期化）なので、読み込みは描画が始まってから長くかからないはず。
-/// 5 分は、それを大きく越えて待つ余裕として置いた値（読み込みにかかる時間そのものは測っていない）。5 分を越えても読み込み前なら、
-/// ゲームの作りが想定と違う（別のバージョンなど）。
+/// 5 分は余裕を見た値（読み込みにかかる時間そのものは測っていない）。5 分を越えても読み込み前なら、ゲームの作りが想定と違う（別のバージョンなど）。
 pub const GF_MAX_ATTEMPTS: u32 = 600;
 /// LockRect の失敗を待つ回数（この回数目の失敗であきらめる）。
 pub const GF_LOCK_FAIL_LIMIT: u32 = 5;
@@ -478,9 +477,9 @@ pub fn swap_should_try(tries: u32, frames_since: u32) -> bool {
 /// 読むアドレス（本物は `th09_addr` の定数。検査は偽のメモリのアドレス）。
 #[derive(Debug, Clone, Copy)]
 pub struct GameAddrs {
-    /// AsciiManager の読み込み口のポインタの置き場（`ASCII_ANM_LOADED_PTR`）。
+    /// AsciiManager の読み込み口のポインタが入っているアドレス（`ASCII_ANM_LOADED_PTR`）。
     pub loaded_ptr: u32,
-    /// AnmManager のポインタの置き場（`ANM_MANAGER_PTR`）。
+    /// AnmManager のポインタが入っているアドレス（`ANM_MANAGER_PTR`）。
     pub anm_manager_ptr: u32,
 }
 
@@ -492,7 +491,7 @@ pub struct SpriteInfo {
     pub quad_h: u32,
 }
 
-/// 確かめが通った結果: 文字の絵の載っているテクスチャ（1 つ）とその大きさ、文字ごとのスプライト
+/// チェックが通った結果: 文字の絵の載っているテクスチャ（1 つ）とその大きさ、文字ごとのスプライト
 /// （枠の番号 = `game_index`。`` ` `` の枠は `None`）。
 #[derive(Debug, Clone, Copy)]
 pub struct Probed {
@@ -525,7 +524,7 @@ fn pixel_of(f: f32) -> Option<u32> {
         .then(|| f.round() as u32)
 }
 
-/// ゲームが ascii.anm を読み終えているかを確かめ、英数字のスプライトを読む（読むだけ。確保しない）。確かめる順と根拠:
+/// ゲームが ascii.anm を読み終えているかを検証し、英数字のスプライトを読む（読むだけ。確保しない）。検証する順と根拠:
 /// 1. `[loaded_ptr]` = L（0 でない）。2. `[anm_manager_ptr]` = M（0 でない）で、`L == M + 0x120 × 1 + 0x24`（`0x0043C640`〜`0x0043C682` が
 ///    返す読み込み口の式）。3. `[L+4]`（ファイルの中身）が 0 でなく、`[L+0x18]`（読み込みの進み）が 0（`0x0043C7D0`〜 が 0 になるまで待つ）。
 /// 4. `L+0x20` が `"ascii.anm\0"`。5. `[L+0x0C]`（スプライトの配列）が 0 でなく、文字 `0x21`〜`0x7E`（`` ` `` を除く）の 0x44 バイトが
@@ -621,9 +620,9 @@ pub fn probe_game_font(read: ReadMem, a: GameAddrs) -> Result<Probed, GameFontWh
     Ok(out)
 }
 
-/// 描いた後に頂点の流れ 0 へ置き直す頂点バッファ（読むだけ）。DrawPrimitiveUP は流れ 0 を NULL にするが、ゲームは頂点の形の覚え
+/// 描いた後に頂点の流れ 0 へ戻す頂点バッファ（読むだけ）。DrawPrimitiveUP は流れ 0 を NULL にするが、ゲームは頂点の形の覚え
 /// `[AnmManager+0x12886]` が 2 なら SetStreamSource を飛ばして DrawPrimitive（`0x0043B4BB`）へ進むので、そのときだけゲームの頂点バッファ
-/// `[AnmManager+0x12890]` を返す。2 でなければゲームが描く前に自分で置き直すので `None`。AnmManager がまだ無い・読めない・バッファが 0 のときも `None`。
+/// `[AnmManager+0x12890]` を返す。2 でなければゲームが描く前に自分で戻すので `None`。AnmManager がまだ無い・読めない・バッファが 0 のときも `None`。
 /// GetStreamSource を使わない理由は `overlay_win` の頭の注。
 pub fn stream0_to_restore(read: ReadMem, anm_manager_ptr: u32) -> Option<u32> {
     let m = rd32(read, anm_manager_ptr).filter(|&m| m != 0)?;
@@ -677,9 +676,9 @@ impl Updater {
 pub trait OverlayHost {
     /// DLL のフォルダの `HiganRTool.ini` を読む（移さない）。無ければ `Ok(None)`。
     fn read_ini(&mut self) -> Result<Option<String>, String>;
-    /// GDI で文字の表を描き、ゲームのスレッドが読む置き場へ置く（1 回だけ）。文字の枠の大きさなどの文を返す。
+    /// GDI で文字の表を描き、ゲームのスレッドが読むバッファへ書く（1 回だけ）。文字の枠の大きさなどの文を返す。
     fn build_atlas(&mut self) -> Result<String, String>;
-    /// デバイスと present parameters のアドレスを確かめて置き、文の更新スレッドを起こす（描画の入口はまだ描かない）。
+    /// デバイスと present parameters のアドレスを検証して保存し、文の更新スレッドを作る（描画の入口はまだ描かない）。
     fn arm(&mut self) -> Result<(), String>;
     /// 描画の入口の分岐を開く（`OVERLAY_ON` = 1）。
     fn on(&mut self);
@@ -698,18 +697,18 @@ pub trait OverlayHost {
 }
 
 /// 文字の描画を入れる（`session::run` が描画の detour の後に 1 回呼ぶ）。ini の `[overlay]` に `enable = 1` が
-/// あり、描画の detour が書け、文字の表とアドレスが置けたときだけ開いて true を返す。ログは「文字の描画: 」で始まる行。
+/// あり、描画の detour が書け、文字の表とアドレスが用意できたときだけ開いて true を返す。ログは「文字の描画: 」で始まる行。
 pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Write) -> bool {
     let text = match host.read_ini() {
         Ok(Some(t)) => t,
         Ok(None) => {
-            let _ = writeln!(out, "文字の描画: HiganRTool.ini が無い（描かない）");
+            let _ = writeln!(out, "文字の描画: HiganRTool.ini が無い（描かない）。");
             return false;
         }
         Err(why) => {
             let _ = writeln!(
                 out,
-                "文字の描画: HiganRTool.ini を読めない（{why}）。描かない"
+                "文字の描画: HiganRTool.ini 読み込み不能（{why}）。描きません。"
             );
             return false;
         }
@@ -729,7 +728,7 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
         Ok((false, _, false)) => {
             let _ = writeln!(
                 detail_out(out),
-                "文字の描画: ini の [{}] に enable = 1 が無い（描かない）",
+                "文字の描画: ini の [{}] に enable = 1 がありません（描きません）",
                 ov::SECTION
             );
             return false;
@@ -737,7 +736,7 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
         Err(e) => {
             let _ = writeln!(
                 out,
-                "文字の描画: ini の [{}] を読めない（{e}）。描かない",
+                "文字の描画: ini の [{}] 読み込み不能（{e}）。描きません。",
                 ov::SECTION
             );
             return false;
@@ -746,7 +745,7 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
     if !draw_written {
         let _ = writeln!(
             out,
-            "文字の描画: 描画の地点の detour が書けていないので描かない"
+            "文字の描画: 描画のフック地点の detour が書けていないので描きません。"
         );
         return false;
     }
@@ -754,34 +753,37 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
         host.set_preview(true);
         let _ = writeln!(
             detail_out(out),
-            "文字の描画: 見本の旗（preview = 1）が立っている。ゲームの文字をコピーした後、文字の表と見本の行を PNG にして本ログの隣へ書き、画面の右下に見本の行を出す"
+            "文字の描画: 見本の旗（preview = 1）が立っています。ゲームの文字をコピーした後、文字の表と見本の行を PNG にして本ログの隣へ書き、画面の右下に見本の行を出します"
         );
     }
     if quiet {
         host.set_quiet(true);
         let _ = writeln!(
             detail_out(out),
-            "文字の描画: [{}] に enable = 1 が無いが、ゲーム内のメニュー（code_side = game）のために開く（右下の行は出さない）",
+            "文字の描画: [{}] に enable = 1 がありませんが、ゲーム内のメニュー（code_side = game）のために開きます（右下の行は出しません）",
             ov::SECTION
         );
     }
     match host.build_atlas() {
         Ok(desc) => {
-            let _ = writeln!(detail_out(out), "文字の描画: 文字の表を作った（{desc}）");
+            let _ = writeln!(
+                detail_out(out),
+                "文字の描画: 文字の表を作成しました（{desc}）"
+            );
         }
         Err(why) => {
-            let _ = writeln!(out, "文字の描画: 文字の表を作れない（{why}）。描かない");
+            let _ = writeln!(out, "文字の描画: 文字の表の作成不能（{why}）。描きません。");
             return false;
         }
     }
     if let Err(why) = host.arm() {
-        let _ = writeln!(out, "文字の描画: 置けない（{why}）。描かない");
+        let _ = writeln!(out, "文字の描画: 用意不可（{why}）。描きません。");
         return false;
     }
     host.on();
     let _ = writeln!(
         detail_out(out),
-        "文字の描画: 有効にした（描画の入口で、画面の右下に 1 行。状態は描くたびに読んで戻す）"
+        "文字の描画: 有効にしました（描画の入口で、画面の右下に 1 行。状態は描くたびに読んで戻します）"
     );
     true
 }
@@ -798,7 +800,7 @@ pub fn finish(host: &mut dyn OverlayHost, out: &mut dyn Write) {
     let out: &mut dyn Write = if abnormal { out } else { &mut detail_out(out) };
     let _ = writeln!(
         out,
-        "==== 文字の描画（M1c-2） ====\n文字の描画: 描いた {} フレーム / デバイスが失われていて描かなかった {} / デバイスが 0 で描かなかった {} / 文が書きかけで描かなかった {} / DrawPrimitiveUP の失敗 {} / Set* の失敗 {} / パニック {}",
+        "==== 文字の描画 ====\n文字の描画: 描いた {} フレーム / デバイスが失われていて描かなかった {} / デバイスが 0 で描かなかった {} / 文が書きかけで描かなかった {} / DrawPrimitiveUP の失敗 {} / Set* の失敗 {} / パニック {}",
         c.drawn, c.lost, c.no_device, c.torn, c.draw_failed, c.set_failed, c.panics
     );
     let _ = writeln!(
@@ -808,20 +810,24 @@ pub fn finish(host: &mut dyn OverlayHost, out: &mut dyn Write) {
     );
     let gf = host.game_font_report();
     if !gf.is_empty() {
-        let _ = writeln!(out, "文字の描画: ゲームの字: {gf}");
+        let _ = writeln!(out, "文字の描画: ゲームの文字: {gf}");
     }
     match Fail::from_code(c.fail) {
         Some(Fail::None) => {}
         Some(f) => {
             let _ = writeln!(
                 out,
-                "文字の描画: 止めた（{}。HRESULT 0x{:08X}）",
+                "文字の描画: 止めました（{}。HRESULT 0x{:08X}）。",
                 f.text(),
                 c.fail_hr
             );
         }
         None => {
-            let _ = writeln!(out, "文字の描画: 止めた（知らない理由の番号 {}）", c.fail);
+            let _ = writeln!(
+                out,
+                "文字の描画: 止めました（知らない理由の番号 {}）。",
+                c.fail
+            );
         }
     }
     let t = host.timings();
@@ -1167,7 +1173,7 @@ pub(crate) mod tests {
         finish(&mut f, &mut out);
         let log = String::from_utf8(out).unwrap();
         assert!(
-            log.contains("文字の描画: ゲームの字: 写した（テスト）"),
+            log.contains("文字の描画: ゲームの文字: 写した（テスト）"),
             "{log}"
         );
         f.report.clear();
@@ -1176,7 +1182,7 @@ pub(crate) mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("ゲームの字"));
     }
 
-    // ---- ゲームの文字を読む前の確かめ（偽のメモリ）----
+    // ---- ゲームの文字を読む前のチェック（偽のメモリ）----
 
     struct Mem {
         regions: Vec<(u32, Vec<u8>)>,
@@ -1547,6 +1553,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m1c2_sample_ini_reads_as_documented() {
         let text = include_str!("../../../scripts/m1c2_overlay.ini");
@@ -1556,6 +1563,7 @@ pub(crate) mod tests {
         assert!(!ini.has_section("pacing"));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_preview_sample_ini_reads_as_documented() {
         let text = include_str!("../../../scripts/m1c2_overlay_preview.ini");
@@ -1565,7 +1573,7 @@ pub(crate) mod tests {
         assert_eq!(crate::net_config::from_text(text), Ok(None));
     }
 
-    // ---- 読み取りのスレッドの実行（`session::run`）への繋ぎ ----
+    // ---- 読み取りのスレッドの実行（`session::run`）への配線 ----
 
     type Events = std::rc::Rc<core::cell::RefCell<Vec<&'static str>>>;
 
@@ -1684,7 +1692,9 @@ pub(crate) mod tests {
                         vec!["overlay_host", "read_ini", "atlas", "arm", "on", "counters"],
                         "{label}"
                     );
-                    let on_at = log.find("文字の描画: 有効にした").expect("有効にした行");
+                    let on_at = log
+                        .find("文字の描画: 有効にしました")
+                        .expect("有効にした行");
                     let summary_at = log.find("計測の集計").expect("計測の行");
                     let finish_at = log.find("==== 文字の描画").expect("集計の行");
                     assert!(on_at < summary_at && summary_at < finish_at, "{log}");
@@ -1695,7 +1705,7 @@ pub(crate) mod tests {
                         vec!["overlay_host", "read_ini"],
                         "{label}"
                     );
-                    assert!(log.contains("detour が書けていないので描かない"), "{log}");
+                    assert!(log.contains("detour が書けていないので描きません"), "{log}");
                     assert!(!log.contains("==== 文字の描画"), "{log}");
                 }
                 _ => {
@@ -1737,12 +1747,11 @@ pub(crate) mod tests {
         assert!(String::from_utf8(out).unwrap().contains("描いた件が 0 件"));
     }
 
-    /// 壊れたら落ちる: 止めた理由・失敗した呼び出し・HRESULT のどれかが行から落ちる（落ちた後の調べで「どこで止まったか」が読めなくなる）。
     #[test]
     fn stop_line_names_the_reason_the_call_and_the_hresult() {
         assert_eq!(
             stop_line(Fail::CreateTexture as u32, 0x8876_086C, 0),
-            "文字の描画: 描画を止めた。以後は文字を描かない（CreateTexture が失敗した / HRESULT: 0x8876086C）"
+            "文字の描画: 描画を止めました。以後は文字を描きません（CreateTexture が失敗した / HRESULT: 0x8876086C）"
         );
         let get = stop_line(
             Fail::GetState as u32,
@@ -1760,7 +1769,6 @@ pub(crate) mod tests {
         assert!(ss.contains("GetTextureStageState(段 1, 種類 4)"), "{ss}");
     }
 
-    /// 壊れたら落ちる: HRESULT が無い理由（パニック・デバイスの作り直し）に 0 を失敗の値のように書く。知らない番号を黙って捨てる。
     #[test]
     fn stop_line_handles_reasons_without_an_hresult_and_unknown_codes() {
         let p = stop_line(Fail::Panic as u32, 0, 0);
@@ -1784,7 +1792,7 @@ pub(crate) mod tests {
     const ANM: u32 = 0x0010_0000;
     const VB: u32 = 0xBBBB_0000;
 
-    /// AnmManager のポインタの置き場と、覚え・頂点バッファの区画だけを持つ偽のメモリ。0 番地からの区画も置く（ポインタが 0 のときに
+    /// AnmManager のポインタを入れる欄と、覚え・頂点バッファの区画だけを持つ偽のメモリ。アドレス 0 からの区画も持つ（ポインタが 0 のときに
     /// 0 + 0x12886 を読みに行くと、覚え 2・バッファありが返る）。
     fn anm_world(mgr: u32, flag: u8, vb: u32) -> Mem {
         let mut m = Mem {
@@ -1805,8 +1813,6 @@ pub(crate) mod tests {
         stream0_to_restore(&mut |a, b| m.read(a, b), at)
     }
 
-    /// 壊れたら落ちる: 覚えを見ずに置き直す（ゲームが自分で置く場面で余計な Set をする）・覚えが 2 なのに置き直さない（ゲームが空の流れで
-    /// DrawPrimitive を呼ぶ）・違う欄を頂点バッファとして返す。
     #[test]
     fn stream0_is_restored_only_when_the_game_skips_setstreamsource() {
         let mut m = anm_world(ANM, 2, VB);
@@ -1830,7 +1836,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// 壊れたら落ちる: AnmManager がまだ無い（0）のに 0 + オフセットを読む・読めない置き場で何かを返す。
     #[test]
     fn stream0_is_left_alone_without_an_anm_manager() {
         let mut m = anm_world(0, 2, VB);

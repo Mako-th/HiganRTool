@@ -1,19 +1,12 @@
 //! rollback の可否実験の判断（pure。unsafe 無し。Win32・ゲームのメモリ・入口のアセンブリは `rollback_win.rs`）。
 //!
-//! 問い: マッチの中のある tick T の始まりで状態をコピー、k tick 進めてからコピーを書き戻し、同じ入力で k tick 進め直すと、同じ状態に着くか。
-//! 手順（1 回ぶん。どれも入力の地点 = tick の始まりで、ゲームのスレッドで）:
-//! 1. マッチに入って `start_seconds` 秒（その後は `gap_ticks`）経った tick T の始まり: 範囲の表（決まった塊・EffectSys の要素の配列・.data の範囲・
-//!    DLL の領域と割り当て器の状態）を作り、コピー S を取る。台本はこの tick から普通に feed し、そのワード（1P・2P）を k 個記録する。
-//! 2. T + k の始まり: 期間の中で「書き戻すと壊れること」が起きていないかを見る。起きていれば書き戻さずに捨てる。起きていなければ今の状態を
-//!    D1 としてコピー、S を書き戻し、記録した 1 個目のワードを feed する（台本は進めない）。続く k − 1 tick は記録したワードを順に feed する。
+//! 問い: マッチの中のある tick T の始まりで状態をコピー、k tick 進めてからコピーを書き戻し、同じ入力で k tick 進め直すと、同じ状態に着くか。手順（1 回ぶん。どれも入力の地点 = tick の始まりで、ゲームのスレッドで）:
+//! 1. マッチに入って `start_seconds` 秒（その後は `gap_ticks`）経った tick T の始まり: 範囲の表（決まった塊・EffectSys の要素の配列・.data の範囲・DLL の領域と割り当て器の状態）を作り、コピー S を取る。台本はこの tick から普通に feed し、そのワード（1P・2P）を k 個記録する。
+//! 2. T + k の始まり: 期間の中で「書き戻すと壊れること」が起きていないかを見る。起きていれば書き戻さずに捨てる。起きていなければ今の状態を D1 としてコピー、S を書き戻し、記録した 1 個目のワードを feed する（台本は進めない）。続く k − 1 tick は記録したワードを順に feed する。
 //! 3. 次の始まり（D2）: D1 のコピーと今の状態を、範囲ごとにダイジェストで比べ、違った範囲だけバイトで比べる。
 //!
-//! 捨てる条件（書き戻した状態が「もう無い物」を指すか、状態の外と食い違う）: 期間の中でゲームのスレッドが DLL の領域の外の塊（CRT の塊）を
-//! 解放した / 別のスレッドが DLL の領域の塊を解放しようとした・領域の塊の解放が壊れていた・領域が足りず CRT へ回した確保があった /
-//! 更新の列・描画の列の並びが変わった（ScreenEffect の登録と解除。列のつなぎはレジストリにありコピーしていない）/ 決まった塊のポインタ・
-//! EffectSys の要素の数が変わった / マッチを出た / 台本が feed しなかった tick がある。
-//!
-//! この段はゲームの経路の判断だけを持つ。確保・ファイル・ロック待ち・パニックを置かない（`Probe` の中身は固定長）。
+//! 捨てる条件（書き戻した状態が「もう無い物」を指すか、状態の外と食い違う）: 期間の中でゲームのスレッドが DLL の領域の外の塊（CRT の塊）を解放した / 別のスレッドが DLL の領域の塊を解放しようとした・領域の塊の解放が壊れていた・領域が足りず CRT へ回した確保があった / 更新の列・描画の列の並びが変わった（ScreenEffect の登録と解除。列のリンクはレジストリにありコピーしていない）/ 決まった塊のポインタ・EffectSys の要素の数が変わった / マッチを出た / 台本が feed しなかった tick がある。
+//! 確保・ファイル・ロック待ち・パニックを持たない（`Probe` の中身は固定長）。
 #![forbid(unsafe_code)]
 
 use higanr_core::arena::{ArenaMem, ArenaState, STATE_WORDS};
@@ -24,9 +17,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::rollback_draw::{self, DrawDiag, SkipDraw};
 use crate::rollback_resim::{self, ResimMode, ResimRec};
 
-// ---- 表の型（値は `th09_addr` の E1-2 の段階）----
+// ---- 表の型（値は `th09_addr`）----
 
-/// 決まった塊（ポインタの置き場と大きさ）。
+/// 決まった塊（ポインタが入っているアドレスと大きさ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbBlock {
     pub name: &'static str,
@@ -35,7 +28,7 @@ pub struct RbBlock {
     pub source: &'static str,
 }
 
-/// EffectSys の要素の配列（EffectSys のポインタの置き場と、要素の数・足し分の想定）。
+/// EffectSys の要素の配列（EffectSys のポインタが入っているアドレスと、要素の数・足し分の想定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbEffect {
     pub name: &'static str,
@@ -46,7 +39,7 @@ pub struct RbEffect {
 }
 
 /// 塊の中のポインタと本数で決まる VM の配列（陣の背景の `bgscroll`）。読み込みのスレッドが CRT から取るので塊のコピーに入らず、
-/// 本数は読み込みの後に決まる。コピーの置き場は `max` 本ぶんを取り、回ごとに `[[owner]+ptr_off]` から `[[owner]+count_off]` 本
+/// 本数は読み込みの後に決まる。コピーのバッファは `max` 本ぶんを取り、回ごとに `[[owner]+ptr_off]` から `[[owner]+count_off]` 本
 /// （i32）だけをコピーする。本数が 0 以下・`max` を越える・ポインタが 0 ならコピーしない（長さ 0）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbVmArray {
@@ -55,7 +48,7 @@ pub struct RbVmArray {
     pub ptr_off: u32,
     pub count_off: u32,
     pub elem: u32,
-    /// コピーする本数の上限（置き場の大きさ）。
+    /// コピーする本数の上限（バッファの大きさ）。
     pub max: u32,
     pub source: &'static str,
 }
@@ -115,7 +108,7 @@ pub fn vm_array_shape(
     let len = if addr == 0 || count <= 0 || count as u32 > v.max {
         0
     } else {
-        // count ≤ max なので、置き場の大きさ（max × elem。`Layout::plan` が溢れを断った）を越えない。
+        // count ≤ max なので、バッファの大きさ（max × elem。`Layout::plan` が溢れを断った）を越えない。
         count as u32 * v.elem
     };
     Ok(VmShape { addr, count, len })
@@ -175,7 +168,7 @@ pub enum RbSkipKind {
 pub struct Tables {
     pub blocks: &'static [RbBlock],
     pub effects: &'static [RbEffect],
-    /// 塊の中のポインタと本数で決まる VM の配列（製品の経路だけ。E1 は空 —— E1 の実験の入口の挙動を変えない）。
+    /// 塊の中のポインタと本数で決まる VM の配列（製品の経路だけ。実験の経路は空にして、その入口の挙動を変えない）。
     pub vm_arrays: &'static [RbVmArray],
     pub data: &'static [RbData],
     /// 比べない所（`MAX_SKIP_ROWS` 行まで）。
@@ -192,7 +185,7 @@ impl Tables {
         Self::th09_with(crate::th09_addr::ROLLBACK_DATA, &[])
     }
 
-    /// 製品の経路（`rollback_play`）の表。E1 の表との違いは、.data に更新の列のつなぎ（レジストリの先頭の 2 つの節 0x40 B）を足し、
+    /// 製品の経路（`rollback_play`）の表。実験の表との違いは、.data に更新の列のつなぎ（レジストリの先頭の 2 つの節 0x40 B）を足し、
     /// fps の計測の 6 語を外し（`th09_addr::ROLLBACK_PLAY_DATA`）、陣の背景の VM の配列（`th09_addr::ROLLBACK_VM_ARRAYS`）を足すこと。
     pub fn th09_play() -> Self {
         Self::th09_with(
@@ -238,7 +231,7 @@ const KEYS: [&str; 8] = [
     "resim",
     rollback_draw::INI_KEY,
 ];
-/// k の値の数の上限と、k の上限（記録する語の置き場の大きさ。600 tick = 10 秒）。
+/// k の値の数の上限と、k の上限（記録する語の領域の大きさ。600 tick = 10 秒）。
 pub const MAX_KS: usize = 8;
 pub const MAX_K: u32 = 600;
 pub const MAX_RECORDS: usize = 120;
@@ -253,7 +246,7 @@ pub struct Settings {
     pub trials_per_k: u32,
     pub gap_ticks: u32,
     pub arena_bytes: u32,
-    /// 進め直しの形（既定は E1-2 の実時間の k フレーム。`frame` は E1-3: 1 回の描画の中で走査を k 回 —— `rollback_resim.rs`）。
+    /// 進め直しの形（既定は実時間の k フレーム。`frame` は 1 回の描画の中で走査を k 回 —— `rollback_resim.rs`）。
     pub resim: ResimMode,
 }
 
@@ -265,14 +258,14 @@ impl Settings {
 
 fn parse_u32(key: &str, v: &str) -> Result<u32, String> {
     v.parse::<u32>()
-        .map_err(|_| format!("{key} の値 {v:?} が数として読めない"))
+        .map_err(|_| format!("{key} の値 {v:?} が数値として読み取り不能"))
 }
 
 fn in_range(key: &str, v: u32, lo: u32, hi: u32) -> Result<u32, String> {
     if (lo..=hi).contains(&v) {
         Ok(v)
     } else {
-        Err(format!("{key} の値 {v} は {lo}〜{hi}"))
+        Err(format!("{key} の値 {v} は {lo}〜{hi} にしてください"))
     }
 }
 
@@ -285,7 +278,7 @@ pub fn settings_from_text(text: &str) -> Result<Option<Settings>, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -293,7 +286,7 @@ pub fn settings_from_text(text: &str) -> Result<Option<Settings>, String> {
     match ini.get(SECTION, "enable") {
         Some("1") => {}
         Some("0") | None => return Ok(None),
-        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1")),
+        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1 にしてください")),
     }
     let get = |key: &str, default: u32, lo: u32, hi: u32| -> Result<u32, String> {
         match ini.get(SECTION, key) {
@@ -310,17 +303,17 @@ pub fn settings_from_text(text: &str) -> Result<Option<Settings>, String> {
     for part in ini.get(SECTION, "ticks").unwrap_or("1,8,60").split(',') {
         let v = in_range("ticks", parse_u32("ticks", part.trim())?, 1, MAX_K)?;
         if nk == MAX_KS {
-            return Err(format!("ticks の値は {MAX_KS} 個まで"));
+            return Err(format!("ticks の値は {MAX_KS} 個までです"));
         }
         if ks[..nk].contains(&v) {
-            return Err(format!("ticks の値 {v} が 2 回ある"));
+            return Err(format!("ticks の値 {v} が重複しています"));
         }
         ks[nk] = v;
         nk += 1;
     }
     if (nk as u32) * trials_per_k > MAX_RECORDS as u32 {
         return Err(format!(
-            "ticks の数 {nk} × trials {trials_per_k} が記録の上限 {MAX_RECORDS} を越える"
+            "ticks の数 {nk} × trials {trials_per_k} が記録の上限 {MAX_RECORDS} を超えます"
         ));
     }
     let resim = match ini.get(SECTION, "resim") {
@@ -347,7 +340,7 @@ fn skip_draw_from_ini(ini: &ini::Ini) -> Result<SkipDraw, String> {
     }
 }
 
-/// 描画用の欄の除外（E1-3b。`skip_draw_fields`。既定は `none` = 数えるだけで比べの結果は変えない）。`Settings` には入れず別に読む
+/// 描画用の欄の除外（`skip_draw_fields`。既定は `none` = 数えるだけで比べの結果は変えない）。`Settings` には入れず別に読む
 /// （検査が多く組み立てるので、除外は `Probe::set_skip_draw` で渡す）。綴りは `settings_from_text` が先に断っている。
 pub fn skip_draw_from_text(text: &str) -> Result<SkipDraw, String> {
     skip_draw_from_ini(&ini::parse(text).map_err(|e| e.to_string())?)
@@ -372,7 +365,7 @@ pub enum RegionKind {
     ArenaState,
 }
 
-/// 1 つの範囲。`buf_off` はコピーの置き場の中の位置（`cap` ずつ並ぶ。範囲の表の形で決まり、回ごとに変わらない）。
+/// 1 つの範囲。`buf_off` はコピーのバッファの中の位置（`cap` ずつ並ぶ。範囲の表の形で決まり、回ごとに変わらない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     pub kind: RegionKind,
@@ -410,13 +403,13 @@ pub enum LayoutError {
 }
 
 impl Layout {
-    /// 範囲の表の形（置き場の中の位置と大きさ）を決める。.data の範囲はアドレスも決まる。塊と要素の配列のアドレスは
+    /// 範囲の表の形（バッファの中の位置と大きさ）を決める。.data の範囲はアドレスも決まる。塊と要素の配列のアドレスは
     /// `fill` が回ごとに読む。
     pub fn plan(t: &Tables, arena_base: u32, arena_bytes: u32) -> Result<Layout, String> {
-        // 書き位置の記録（`Marks`）は行の番号で引くので、置き場を越える行があると黙って外し損ねる。先に断る。
+        // 書き位置の記録（`Marks`）は行の番号で引くので、領域を越える行があると黙って外し損ねる。先に断る。
         if t.skips.len() > MAX_SKIP_ROWS {
             return Err(format!(
-                "比べない所の表が {} 行（{MAX_SKIP_ROWS} 行まで）",
+                "比較対象外の表が {} 行です（{MAX_SKIP_ROWS} 行まで）",
                 t.skips.len()
             ));
         }
@@ -427,7 +420,7 @@ impl Layout {
         let mut off = 0u32;
         let mut push = |l: &mut Layout, kind, addr, cap: u32| -> Result<(), String> {
             if l.n == MAX_REGIONS {
-                return Err(format!("範囲が {MAX_REGIONS} を越える"));
+                return Err(format!("範囲が {MAX_REGIONS} を超えます"));
             }
             l.regions[l.n] = Region {
                 kind,
@@ -439,7 +432,7 @@ impl Layout {
             l.n += 1;
             off = off
                 .checked_add(cap)
-                .ok_or("コピーの置き場が 4 GiB を越える")?;
+                .ok_or("コピー用の領域が 4 GiB を超えます")?;
             Ok(())
         };
         for (i, b) in t.blocks.iter().enumerate() {
@@ -448,22 +441,25 @@ impl Layout {
         for (i, e) in t.effects.iter().enumerate() {
             let cap = t
                 .effect_bytes(e)
-                .ok_or_else(|| format!("{} の大きさが溢れる", e.name))?;
+                .ok_or_else(|| format!("{} の大きさがオーバーフローします", e.name))?;
             push(&mut l, RegionKind::Effect(i as u8), 0, cap)?;
         }
         for (i, v) in t.vm_arrays.iter().enumerate() {
             if !t.blocks.iter().any(|b| b.name == v.owner) {
-                return Err(format!("{} の持ち主の塊 {} が表に無い", v.name, v.owner));
+                return Err(format!(
+                    "{} の持ち主の塊 {} が表にありません",
+                    v.name, v.owner
+                ));
             }
             let cap = v
                 .max
                 .checked_mul(v.elem)
-                .ok_or_else(|| format!("{} の大きさが溢れる", v.name))?;
+                .ok_or_else(|| format!("{} の大きさがオーバーフローします", v.name))?;
             push(&mut l, RegionKind::VmArray(i as u8), 0, cap)?;
         }
         for (i, d) in t.data.iter().enumerate() {
             if d.end <= d.start {
-                return Err(format!("{} の範囲が空か逆", d.name));
+                return Err(format!("{} の範囲が空か逆順です", d.name));
             }
             push(&mut l, RegionKind::Data(i as u8), d.start, d.end - d.start)?;
         }
@@ -491,7 +487,7 @@ impl Layout {
     }
 }
 
-/// 範囲の表を埋めるのに要るインターフェース（`fill_layout`）。E1 は `ProbeIo` から（`fill`）、M8-2b の製品の経路は `rollback_play` の
+/// 範囲の表を埋めるのに要るインターフェース（`fill_layout`）。実験は `ProbeIo` から（`fill`）、製品の経路は `rollback_play` の
 /// インターフェースから渡す（同じ手順を 2 つ書かないため）。
 pub trait LayoutIo {
     /// 落ちない読み方で 4 バイト。
@@ -595,7 +591,7 @@ pub fn fill_layout(
 /// 1 つの範囲の中の比べない所の数の上限（本物は fps_timing 1・fps の文字の枠 1〜2・記録係の塊の書き位置 1〜4）。
 /// 越えた分は外さずに比べる（`Skips::dropped`）。
 pub const MAX_SKIPS: usize = 32;
-/// 比べない所の表の行の上限（`Marks` の置き場の大きさ）。越えると `Layout::plan` が断る。
+/// 比べない所の表の行の上限（`Marks` の領域の大きさ）。越えると `Layout::plan` が断る。
 pub const MAX_SKIP_ROWS: usize = 8;
 
 /// `Cursor` の行ごとの書き位置（`[0]` = S の始まり・`[1]` = D1 の始まり・`[2]` = D2 の始まり。読めなければ `None`）。添字は表の行の番号。
@@ -609,7 +605,7 @@ impl Marks {
         at: [[None; 3]; MAX_SKIP_ROWS],
     };
 
-    /// `Cursor` の行の書き位置を今の値で読み、`[which]` へ置く（ゲームのスレッド。読むだけ）。
+    /// `Cursor` の行の書き位置を今の値で読み、`[which]` へ入れる（ゲームのスレッド。読むだけ）。
     fn read(&mut self, t: &Tables, io: &mut dyn ProbeIo, which: usize) {
         for (i, s) in t.skips.iter().enumerate().take(MAX_SKIP_ROWS) {
             if let RbSkipKind::Cursor {
@@ -650,7 +646,7 @@ pub fn cursor_span(p: u32, n: u32, s: u32, d: u32) -> Option<(u32, u32)> {
 pub struct Skips {
     n: usize,
     r: [(u32, u32); MAX_SKIPS],
-    /// 置き場が足りずに落とした数。落とした所は比べる（比べる所が増えるだけで、食い違いを隠す向きには働かない）。
+    /// 領域が足りずに落とした数。落とした所は比べる（比べる所が増えるだけで、食い違いを隠す向きには働かない）。
     pub dropped: u32,
 }
 
@@ -787,7 +783,7 @@ pub struct Compared {
     pub first4_d2: Option<u32>,
 }
 
-/// 表の外から足す比べない所（比べる範囲の先頭からの `[start, end)` を、始まりの小さい順に `emit` へ渡す関数）。E1-3b の描画用の欄の
+/// 表の外から足す比べない所（比べる範囲の先頭からの `[start, end)` を、始まりの小さい順に `emit` へ渡す関数）。描画用の欄の
 /// 除外: 枠ごと・塊ごとに数が変わり `Skips` の固定長に収まらないので、歩きながら渡す。渡す順が乱れると、比べる区間を取りこぼす・
 /// 二重に数える。
 pub type ExtraSkips<'a> = &'a dyn Fn(&mut dyn FnMut(u32, u32));
@@ -827,14 +823,14 @@ fn part(a: &[u8], s: u32, e: u32) -> &[u8] {
     &a[(s as usize).min(n)..(e as usize).min(n)]
 }
 
-/// 表の行の比べない所だけで比べる（検査が、E1-3b の前からの比べ方の基準に使う。本物は `compare_bytes_with`）。
+/// 表の行の比べない所だけで比べる（検査が、描画用の欄の除外を入れる前からの比べ方の基準に使う。本物は `compare_bytes_with`）。
 #[cfg(test)]
 pub fn compare_bytes(a1: &[u8], a2: &[u8], skips: &Skips) -> Compared {
     compare_bytes_with(a1, a2, skips, &no_extra_skips)
 }
 
 /// D1 のコピー `a1` と今 `a2` を、比べない所（表の行 `skips` と表の外から足す `extra`）を除いて比べる。ダイジェストは比べる区間を
-/// 先頭から順に `digest_continue` でつないだ値。バイトの比べはダイジェストか長さが違ったときだけ（ゲームのスレッドで約 12 MB を
+/// 先頭から順に `digest_continue` で連ねた値。バイトの比べはダイジェストか長さが違ったときだけ（ゲームのスレッドで約 12 MB を
 /// 通すため）。`skipped` には `extra` の分も数える。違いの位置は範囲の先頭から。長さが違えば、長い方のはみ出した分も
 /// （比べない所の外なら）違うと数える。確保しない・パニックしない。
 pub fn compare_bytes_with(a1: &[u8], a2: &[u8], skips: &Skips, extra: ExtraSkips) -> Compared {
@@ -950,7 +946,7 @@ impl Counters {
 pub const BORN_CAP: usize = 256;
 
 /// 見張りの間に CRT へ回した確保のアドレス（期間の中で生まれた、DLL の領域の外の塊）。見張りを立てるたびに空にする。入口
-/// （ゲームのスレッド）から呼ぶので、ヒープを使わず、パニックしない。`static` に置くため中身は原子の語にする（`Relaxed`）。
+/// （ゲームのスレッド）から呼ぶので、ヒープを使わず、パニックしない。`static` にするため中身は原子の語にする（`Relaxed`）。
 pub struct BornSet {
     v: [AtomicU32; BORN_CAP],
     len: AtomicU32,
@@ -1064,7 +1060,7 @@ impl RegionResult {
         Self::of_with(r, a1, a2, skips, &no_extra_skips)
     }
 
-    /// `of` に、表の外の比べない所 `extra`（E1-3b の描画用の欄）を足したもの。`skipped` に数える。
+    /// `of` に、表の外の比べない所 `extra`（描画用の欄）を足したもの。`skipped` に数える。
     pub fn of_with(
         r: &Region,
         a1: &[u8],
@@ -1108,14 +1104,14 @@ pub trait ProbeIo {
     /// 領域の外の確保・解放を数えるか（期間中だけ）。
     fn set_watch(&mut self, on: bool);
     fn counters(&mut self) -> Counters;
-    /// 範囲を置き場へコピーする（割り当て器の状態を含む）。
+    /// 範囲をバッファへコピーする（割り当て器の状態を含む）。
     fn save(&mut self, l: &Layout, to: Buf);
     /// S を書き戻す（領域は `[0, S の top)` を戻し、`[S の top, 今の top)` を 0 にし、割り当て器の状態を戻す）。
     fn restore(&mut self, l: &Layout);
-    /// D1 の置き場と今の状態を範囲ごとに比べる（`out` は `l.n` 個）。比べない所は `region_skips(t, …, marks)`、
+    /// D1 のバッファと今の状態を範囲ごとに比べる（`out` は `l.n` 個）。比べない所は `region_skips(t, …, marks)`、
     /// バイトの比べは `RegionResult::of`。
     fn compare(&mut self, t: &Tables, l: &Layout, marks: &Marks, out: &mut [RegionResult]);
-    /// `compare` に、E1-3b の診断（違ったバイトの内訳 `diag`）と描画用の欄の除外 `skip` を足したもの。既定は `compare` のまま。
+    /// `compare` に、診断（違ったバイトの内訳 `diag`）と描画用の欄の除外 `skip` を足したもの。既定は `compare` のまま。
     /// 本物（`rollback_win`）だけが上書きする。
     fn compare_draw(
         &mut self,
@@ -1138,7 +1134,7 @@ pub trait ProbeIo {
         false
     }
     /// フレームの形の進め直しの前（S を書き戻す前）に、BGM の待ち行列と文字の数を取っておく（`rollback_resim::capture_outputs`）。
-    /// E1-2 の形では呼ばない。
+    /// 実時間の形では呼ばない。
     fn capture_outputs(&mut self) {}
 }
 
@@ -1193,9 +1189,9 @@ pub struct TrialRecord {
     pub regions: [RegionResult; MAX_REGIONS],
     /// 比べない所の書き位置（S・D1・D2 の始まりで読んだ値）。
     pub marks: Marks,
-    /// フレームの形（E1-3）の進め直しの記録。E1-2 の形では全部 0 / なし。
+    /// フレームの形の進め直しの記録。実時間の形では全部 0 / なし。
     pub resim: ResimRec,
-    /// 違ったバイトの内訳（E1-3b。比べの後に本物の実装 `compare_draw` が埋める。埋めなければ `valid = false`）。
+    /// 違ったバイトの内訳（比べの後に本物の実装 `compare_draw` が埋める。埋めなければ `valid = false`）。
     pub draw: DrawDiag,
 }
 
@@ -1514,7 +1510,7 @@ impl Probe {
             // 期間の中で生まれて同じ期間で解放された外の塊だけなら捨てない。
             Some(Skip::OutsideFree)
         } else if d.out_allocs != d.out_frees_born {
-            // 期間の中で生まれて D1 でまだ生きている外の塊がある。書き戻しは安全だが、進め直した側は CRT から別のアドレスを受け取りうるので、
+            // 期間の中で生まれて D1 でまだ生きている外の塊がある。書き戻しは安全だが、進め直した側（D2）は CRT から別のアドレスを受け取りうるので、
             // 状態がそのポインタを持っていれば D1 と D2 が必ず違いうる。
             Some(Skip::OutsideAlive)
         } else if d.foreign_frees > 0 {
@@ -1748,7 +1744,7 @@ pub fn trial_lines(t: &Tables, plan: &Layout, r: &TrialRecord) -> Vec<String> {
         }
     };
     // 比べなかったバイト（表に書いた所だけ）。DLL の領域の分を分けて出すのは、記録係の fps のバイトを札と書き位置で見分けられたかを
-    // ログで確かめるため。
+    // ログで検証するため。
     let skipped: u64 = r.regions().iter().map(|x| u64::from(x.skipped)).sum();
     let skipped_arena: u32 = r
         .regions()
@@ -1902,8 +1898,10 @@ mod tests {
     use higanr_core::arena::{ArenaMem, ArenaState};
     use higanr_core::digest::{diff, digest};
 
+    #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
 
+    #[cfg(dev_assets)]
     #[test]
     fn rollback_values_appear_in_the_note() {
         use crate::th09_addr as a;
@@ -2197,6 +2195,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn sample_ini_enables_only_the_probe() {
         const SAMPLE: &str = include_str!("../../../scripts/e1_02_rollback.ini");
@@ -2206,6 +2205,7 @@ mod tests {
         assert_eq!(crate::net_config::from_text(SAMPLE), Ok(None));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn second_and_third_ini_change_one_thing_each() {
         use higanr_core::pacing::{Mode, mode_from_ini};
@@ -2228,6 +2228,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn script_keeps_shooting_and_never_moves_the_end_menu_cursor() {
         use higanr_core::input_model::keys;
@@ -2342,7 +2343,7 @@ mod tests {
     }
 
     /// 偽のゲーム: 0x0〜0x1000 の平らなメモリ（ポインタの欄・塊・要素の配列）と領域・割り当て器。1 tick の更新は語と乱数で塊を書き、
-    /// ときどき領域から確保・解放して、そのポインタを blk_a に置く（ポインタの値まで比べる）。
+    /// ときどき領域から確保・解放して、そのポインタを blk_a へ入れる（ポインタの値まで比べる）。
     struct Game {
         mem: Vec<u8>,
         arena: Vec<u8>,
@@ -2356,7 +2357,7 @@ mod tests {
         c: Counters,
         snap: Vec<u8>,
         d1: Vec<u8>,
-        /// コピーしない所に置いた、更新に効く値（true なら毎 tick 足す —— 巻き戻しても戻らない）。
+        /// コピーしない所に持たせた、更新に効く値（true なら毎 tick 足す —— 巻き戻しても戻らない）。
         hidden: u32,
         hidden_on: bool,
         /// この tick に領域の外の解放を起こす。
@@ -2780,7 +2781,7 @@ mod tests {
         assert!(sum.iter().any(|l| l.contains("globals 4")), "{sum:?}");
     }
 
-    /// `Game` を包み、`compare_draw` だけ上書きする偽（E1-3b のインターフェースの検査用。診断の中身は `rollback_draw` の検査で見る）。
+    /// `Game` を包み、`compare_draw` だけ上書きする偽（描画用の欄の診断のインターフェースの検査用。診断の中身は `rollback_draw` の検査で見る）。
     struct DrawGame {
         g: Game,
         seen: Vec<SkipDraw>,
@@ -3823,6 +3824,7 @@ mod tests {
         assert_eq!(frames_abort - frames_ok, 3, "{frames_abort} / {frames_ok}");
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn resim_key_and_the_frame_sample_ini() {
         use higanr_core::pacing::{Mode, mode_from_ini};
@@ -3866,6 +3868,7 @@ mod tests {
         assert_eq!(crate::net_config::from_text(FRAME), Ok(None));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn skipdraw_ini_differs_from_the_frame_ini_by_one_line() {
         use higanr_core::pacing::{Mode, mode_from_ini};
@@ -3903,6 +3906,7 @@ mod tests {
         );
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn all_ini_differs_from_the_skipdraw_ini_by_one_line() {
         use higanr_core::pacing::{Mode, mode_from_ini};
@@ -3952,6 +3956,7 @@ mod tests {
         assert!(keys(RUN_C).len() >= 3, "比べる行が無い");
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn lasers_run_reuses_the_all_ini_and_states_the_expected_skip_bytes() {
         const RUN_C: &str = include_str!("../../../scripts/runs/e1_3c_frame.run");

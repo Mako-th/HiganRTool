@@ -5,7 +5,7 @@
 //! 1 つ先の seg の相手の値も持ち、その seg に入ったら比べる（読み込みの短い側が先に frame 0 の CHECK を送るため）。
 //! それ以外の seg のものは捨てる。ゲームスレッドで呼ぶので固定長の表（16 枠）だけを使う。
 
-use crate::wire::Check;
+use crate::wire::{Check, CheckKind, WatchCheck};
 
 /// CHECK を送る間隔（フレーム）。
 pub const CHECK_INTERVAL: u32 = 30;
@@ -57,6 +57,13 @@ pub struct CheckLog {
 
 pub fn is_check_frame(frame: u32) -> bool {
     frame.is_multiple_of(CHECK_INTERVAL)
+}
+
+/// 観戦者へ送る流れに、ホストの照合の記録（`wire::Record::Check`）を積む間隔（フレーム。約 1 秒）。対戦の CHECK の 2 回に 1 回で、値は CHECK と同じ作り方。
+pub const WATCH_CHECK_INTERVAL: u32 = 2 * CHECK_INTERVAL;
+
+pub fn is_watch_check_frame(frame: u32) -> bool {
+    frame.is_multiple_of(WATCH_CHECK_INTERVAL)
 }
 
 // ---- 入力の列のダイジェスト（検査用）----
@@ -208,6 +215,83 @@ impl CheckLog {
             Some(CheckResult::Match { frame: local.frame })
         } else {
             Some(CheckResult::Mismatch { local, remote: r })
+        }
+    }
+}
+
+/// 観戦者が自分のゲームで作った照合の値（同じ frame の 2 通り。ホストの記録がどちらの作り方かは記録が持つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnCheck {
+    pub game: WatchCheck,
+    pub digest: WatchCheck,
+}
+
+/// 観戦者の照合の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchVerdict {
+    Match {
+        frame: u32,
+    },
+    Mismatch {
+        kind: CheckKind,
+        host: WatchCheck,
+        own: WatchCheck,
+    },
+}
+
+/// 観戦者の照合: ホストの `Record::Check` と同じ frame の自分の値を、どちらが先に来ても組にして比べる。delay 方式のホストは
+/// その frame の `Frame` の前に、rollback のホストは確定した後（`Frame` の後）に積むので、両方の順を持つ。1 秒に 1 回なので枠は 1 つずつ。
+/// seg の始まりで `clear` する（frame の番号は seg ごとに 0 から）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchChecks {
+    host: Option<(CheckKind, WatchCheck)>,
+    own: Option<OwnCheck>,
+}
+
+impl WatchChecks {
+    pub fn clear(&mut self) {
+        *self = WatchChecks::default();
+    }
+
+    pub fn on_host(&mut self, kind: CheckKind, c: WatchCheck) -> Option<WatchVerdict> {
+        if let Some(own) = self.own.filter(|o| o.game.frame == c.frame) {
+            *self = WatchChecks::default();
+            return Some(judge(kind, c, own));
+        }
+        self.host = Some((kind, c));
+        None
+    }
+
+    pub fn on_own(&mut self, own: OwnCheck) -> Option<WatchVerdict> {
+        if let Some((kind, c)) = self.host.filter(|(_, h)| h.frame == own.game.frame) {
+            *self = WatchChecks::default();
+            return Some(judge(kind, c, own));
+        }
+        self.own = Some(own);
+        None
+    }
+}
+
+fn judge(kind: CheckKind, host: WatchCheck, own: OwnCheck) -> WatchVerdict {
+    let (mine, rule) = match kind {
+        CheckKind::Game => (own.game, CheckRule::SkipCountAtFrame0),
+        CheckKind::InputDigest => (own.digest, CheckRule::All),
+    };
+    let as_check = |c: &WatchCheck| Check {
+        seg: 0,
+        frame: c.frame,
+        rng_state: c.rng_state,
+        rng_count: c.rng_count,
+        life_1p: c.life_1p,
+        life_2p: c.life_2p,
+    };
+    if same_values(&as_check(&host), &as_check(&mine), rule) {
+        WatchVerdict::Match { frame: host.frame }
+    } else {
+        WatchVerdict::Mismatch {
+            kind,
+            host,
+            own: mine,
         }
     }
 }
@@ -470,5 +554,94 @@ mod tests {
         log.record_local(chk(0, 30, 5));
         assert_eq!(log.on_remote(&chk(0, 31, 6)), None);
         assert_eq!(log.dropped(), 1);
+    }
+
+    fn wc(frame: u32, rng_state: u16, rng_count: u32) -> WatchCheck {
+        WatchCheck {
+            frame,
+            rng_state,
+            rng_count,
+            life_1p: 9,
+            life_2p: 8,
+        }
+    }
+
+    fn own(frame: u32, rng_state: u16, rng_count: u32) -> OwnCheck {
+        OwnCheck {
+            game: wc(frame, rng_state, rng_count),
+            digest: wc(frame, !rng_state, !rng_count),
+        }
+    }
+
+    #[test]
+    fn watch_check_frames_are_every_other_check_frame() {
+        let hits: Vec<u32> = (0..=180).filter(|&f| is_watch_check_frame(f)).collect();
+        assert_eq!(hits, vec![0, 60, 120, 180]);
+        assert!(hits.iter().all(|&f| is_check_frame(f)));
+    }
+
+    #[test]
+    fn a_watch_check_pairs_in_either_order_and_judges_by_the_hosts_kind() {
+        // ホストが先（delay 方式）。
+        let mut w = WatchChecks::default();
+        assert_eq!(w.on_host(CheckKind::Game, wc(60, 1, 2)), None);
+        assert_eq!(
+            w.on_own(own(60, 1, 2)),
+            Some(WatchVerdict::Match { frame: 60 })
+        );
+        // 自分が先（rollback の確定の後に積まれる）。
+        assert_eq!(w.on_own(own(120, 3, 4)), None);
+        assert_eq!(
+            w.on_host(CheckKind::Game, wc(120, 3, 5)),
+            Some(WatchVerdict::Mismatch {
+                kind: CheckKind::Game,
+                host: wc(120, 3, 5),
+                own: wc(120, 3, 4),
+            })
+        );
+        // ダイジェストの記録は自分のダイジェストと比べる（ゲームの値とは比べない）。
+        assert_eq!(w.on_own(own(180, 7, 8)), None);
+        assert_eq!(
+            w.on_host(CheckKind::InputDigest, wc(180, !7, !8)),
+            Some(WatchVerdict::Match { frame: 180 })
+        );
+        assert_eq!(w.on_own(own(240, 7, 8)), None);
+        assert!(matches!(
+            w.on_host(CheckKind::InputDigest, wc(240, 7, 8)),
+            Some(WatchVerdict::Mismatch {
+                kind: CheckKind::InputDigest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_watch_check_of_another_frame_waits_and_frame_0_skips_only_the_games_count() {
+        let mut w = WatchChecks::default();
+        assert_eq!(w.on_own(own(60, 1, 2)), None);
+        assert_eq!(
+            w.on_host(CheckKind::Game, wc(120, 1, 2)),
+            None,
+            "frame の違う組を比べた"
+        );
+        assert_eq!(
+            w.on_own(own(120, 1, 2)),
+            Some(WatchVerdict::Match { frame: 120 })
+        );
+        // frame 0 の抽選回数は読み込みの引きで両者が違ってよい（対戦の CHECK と同じ）。ダイジェストは全部比べる。
+        assert_eq!(w.on_host(CheckKind::Game, wc(0, 5, 999)), None);
+        assert_eq!(
+            w.on_own(own(0, 5, 1)),
+            Some(WatchVerdict::Match { frame: 0 })
+        );
+        assert_eq!(w.on_host(CheckKind::InputDigest, wc(0, !5, 999)), None);
+        assert!(matches!(
+            w.on_own(own(0, 5, 1)),
+            Some(WatchVerdict::Mismatch { .. })
+        ));
+        // seg の始まりで捨てる。
+        assert_eq!(w.on_host(CheckKind::Game, wc(60, 1, 2)), None);
+        w.clear();
+        assert_eq!(w.on_own(own(60, 1, 2)), None, "前の seg の記録と比べた");
     }
 }

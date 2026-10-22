@@ -1,13 +1,10 @@
-//! 起動前の更新（配るバージョンだけ）。花映塚を起こす前に署名つきの目録を取り、新しいバージョンがあればウィンドウで尋ね、「はい」なら
-//! 必要なファイルを置き換えて新しい `HiganRTool.exe` を同じ引数で起こし直す。通信とウィンドウは `Net` / `Host` の向こう。
-//!
-//! - 確かめるのは配るバージョン（feature `dist`）の通常起動だけ（`skip_reason`）。ゲームのフォルダが決まってからで、その中では何もしない。
+//! 起動前の更新（配るバージョンだけ）。花映塚を起動する前に署名つきの目録を取り、新しいバージョンがあればウィンドウで尋ね、「はい」なら
+//! 必要なファイルを置き換えて新しい `HiganRTool.exe` を同じ引数で起動し直す。通信とウィンドウは `Net` / `Host` の向こう。
+//! - 更新を確認するのは配るバージョン（feature `dist`）の通常起動だけ（`skip_reason`）。ゲームのフォルダが決まってからで、その中では何もしない。
 //! - 待ちは全体で `CHECK_DEADLINE_MS`（約 2 秒）まで。通信は別スレッドで走らせ、時間が来たら起動へ進む。
-//! - 置き換えは `<名前>.new` に書いて読み戻し、全部そろってから 1 つずつ「いまの物を `.old` へ改名 → `.new` を本来の名前へ」。
-//!   動いている exe や読み込み中の dll は上書きできないが改名はできるため。途中で失敗したら逆順に戻し、自分の exe は最後に置く。
-//! - `.old` は、新しいバージョンが花映塚を起こせた印（`note_launched`）を残した次の起動が消す。起こせなかったバージョンでは残るので手で戻せる。
-//! - ダウンロードの間は、ファイルごとの進み具合を `Host::progress` で同じ行に書き直す。更新して起こし直した初回は `post_update`
-//!   が ini を新しい形に合わせ、変更点を出して Enter を待つ。
+//! - 置き換えは `<名前>.new` に書いて読み戻し、全部そろってから 1 つずつ「いまの物を `.old` へ改名 → `.new` を本来の名前へ」（動いている exe や dll は上書きできないが改名はできるため）。途中で失敗したら逆順に戻し、自分の exe は最後に置く。
+//! - `.old` は、新しいバージョンが花映塚を起動できた印（`note_launched`）を残した次の起動が消す。
+//! - 進み具合は `Host::progress` で同じ行に書き直す。更新して起動し直した初回は `post_update` が ini を合わせて変更点を出す。
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -39,9 +36,9 @@ const DOWNLOAD_TIMEOUTS: Timeouts = Timeouts {
 };
 
 pub trait Net {
-    /// 待ちは自分で `CHECK_DEADLINE_MS` に収める。
+    /// Net の実装が、待ちを `CHECK_DEADLINE_MS` に収める。
     fn get_manifest(&mut self) -> Result<Vec<u8>, String>;
-    /// `size` は目録の大きさ。越える応答は断る。`progress` には、受け取り進むたびにそこまでのバイト数を渡す。
+    /// `size` は目録の大きさ。Net の実装は、越える応答を断る。`progress` には、受け取り進むたびにそこまでのバイト数を渡す。
     fn get_file(
         &mut self,
         name: &str,
@@ -55,7 +52,7 @@ pub trait Host {
     /// ウィンドウにも黒いウィンドウにも出す。
     fn tell(&mut self, text: &str);
     fn say(&mut self, line: &str);
-    /// 画面には出さず、ローダーのログにだけ残す（確認しなかった理由など。人が起こす起動で毎回出すほどではない）。
+    /// 画面には出さず、ローダーのログにだけ残す（確認しなかった理由など。人が起動するたびに出すほどではない）。
     fn record(&mut self, _line: &str) {}
     /// 見出しなどの飾りのない行を出す（変更点の文）。
     fn show(&mut self, text: &str);
@@ -63,11 +60,11 @@ pub trait Host {
     fn progress(&mut self, line: &str);
     /// 書き直していた行を確定して改行する。出していなければ何もしない。
     fn progress_end(&mut self);
-    /// 標準入力も出力もコンソールか（パイプや検査の道具からの起動は偽）。
+    /// 標準入力も出力もコンソールか（パイプや検査のツールからの起動は偽）。
     fn interactive(&self) -> bool;
     /// Enter が押されるまで待つ。
     fn wait_enter(&mut self);
-    /// 起こした子が終わるまで待ち、その終了コードを返す。起こせなければ Err（呼び出し側が全部戻す）。
+    /// 起動した子が終わるまで待ち、その終了コードを返す。起動できなければ Err（呼び出し側が全部戻す）。
     /// 子が失敗して終わっても更新は戻さないので、それは Ok。待つ間は何も読まず・書かない（子が同じコンソールの入力を使う）。
     fn restart(&mut self, exe: &Path, args: &[OsString]) -> Result<i32, String>;
 }
@@ -84,7 +81,7 @@ pub struct Setup<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Proceed,
-    /// 新しいバージョンを起こし直して終わるまで待った。値は子の終了コード（呼び出し側はそれで終わる）。
+    /// 新しいバージョンを起動し直して終わるまで待った。値は子の終了コード（呼び出し側はそれで終わる）。
     Restarted(i32),
 }
 
@@ -107,8 +104,8 @@ pub fn run(s: &Setup<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outcome {
         Err(e) => {
             host.say(&by_lang!(
                 lang,
-                ja: "更新データが不審でした（{e}）。無視して起動します。",
-                en: "Update check: the update data looked invalid ({e}). Ignoring it and starting."
+                ja: "更新データのチェックに失敗しました（{e}）。更新せずに起動します。",
+                en: "Update check: the update data failed verification ({e}). Starting without updating."
             ));
             return Outcome::Proceed;
         }
@@ -314,7 +311,7 @@ fn check_file(f: &FileEntry, data: &[u8], lang: Lang) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placed {
     pub name: String,
-    /// 置く前にあった物を `.old` に取ったか。
+    /// 置き換える前にあった物を `.old` に取ったか。
     pub had_old: bool,
 }
 
@@ -334,13 +331,13 @@ impl ReplaceError {
     }
 }
 
-/// 自分の exe を最後に置く（失敗しても、前の分を全部戻せるうちに済ませるため）。
+/// 自分の exe を最後に置き換える（失敗しても、前の分を全部戻せるうちに済ませるため）。
 fn commit_order(files: &[(String, Vec<u8>)]) -> Vec<&(String, Vec<u8>)> {
     let (own, others): (Vec<_>, Vec<_>) = files.iter().partition(|(n, _)| n == update::SELF_EXE);
     others.into_iter().chain(own).collect()
 }
 
-/// `dir` の直下に置き換える。成功なら置いた分（起こし直しに失敗したら `undo` で戻す）。失敗なら済んだ分は戻し `.new` は消す。
+/// `dir` の直下を置き換える。成功なら置き換えた分（起動し直しに失敗したら `undo` で戻す）。失敗なら済んだ分は戻し `.new` は消す。
 /// 名前は `update::is_allowed_name` の規則に合うものだけ（1 つでも外れたら何も書かない）。
 pub fn replace_files(
     dir: &Path,
@@ -420,7 +417,7 @@ fn place_one(dir: &Path, name: &str, lang: Lang) -> Result<bool, String> {
         std::fs::remove_file(&old).map_err(|e| {
             by_lang!(
                 lang,
-                ja: "前の更新の{old_shown}を消せません（{e}）。別のHiganRToolか花映塚が使っていないか確かめてください",
+                ja: "前の更新の{old_shown}を消せません（{e}）。別のHiganRToolか花映塚が使っていないかチェックしてください",
                 en: "Cannot delete {old_shown} left by the previous update ({e}). Check that no other HiganRTool or Touhou 9 is using it"
             )
         })?;
@@ -515,7 +512,7 @@ pub fn cleanup_leftovers(
     left
 }
 
-/// 起動のときの片づけ。ゲームのフォルダの中では触らない。`.old` は新しいバージョンが起こせた印を残した次の起動だけ消す。
+/// 起動のときの片づけ。ゲームのフォルダの中では触らない。`.old` は新しいバージョンが起動できた印を残した次の起動だけ消す。
 /// `just_updated` の親は子が終わるまで動き続けるので、親の exe の `.old` はこの間は消せない（消せなければ残し、次の起動で消す）。
 pub fn clear_leftovers_at(
     dir: &Path,
@@ -547,7 +544,7 @@ pub fn in_game_folder(dir: &Path) -> bool {
     })
 }
 
-/// 花映塚を起こせたことを印に残す（配るバージョンだけ）。書けなくても起動は止めない。
+/// 花映塚を起動できたことを印に残す（配るバージョンだけ）。書けなくても起動は止めない。
 /// ゲームのフォルダが分からなければ書かない。
 pub fn note_launched(game_dir: Option<&Path>, lang: Lang) {
     if !this_build_is_dist() {
@@ -595,7 +592,7 @@ pub fn note_launched_at(
     Ok(true)
 }
 
-// ---- 確かめに行くか ----
+// ---- 確認しに行くか ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
@@ -712,7 +709,7 @@ impl Net for WinHttpNet {
             .map_err(|e| {
                 by_lang!(
                     lang,
-                    ja: "通信のスレッドを作れません（{e}）",
+                    ja: "通信の処理を開始できません（{e}）",
                     en: "Cannot create the network thread ({e})"
                 )
             })?;
@@ -723,12 +720,12 @@ impl Net for WinHttpNet {
                 let ms = self.manifest_budget.as_millis();
                 Err(by_lang!(
                     lang,
-                    ja: "{ms}ミリ秒で答えが来ませんでした",
-                    en: "No answer within {ms} ms"
+                    ja: "更新サーバーから{ms}ミリ秒で応答がありませんでした",
+                    en: "No response from the update server within {ms} ms"
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(match lang {
-                Lang::Ja => "通信のスレッドが途中で止まりました",
+                Lang::Ja => "通信の処理が途中で止まりました",
                 Lang::En => "The network thread stopped midway",
             }
             .to_string()),
@@ -859,19 +856,19 @@ pub struct Start<'a> {
     pub just_updated: bool,
     pub inherited_ini: bool,
     pub args: &'a [OsString],
-    /// 読めなければ None（その回は確かめない）。
+    /// 読めなければ None（その回は確認しない）。
     pub key: Option<[u8; 32]>,
     /// 決まったゲームのフォルダ。None（まだ決まっていない）なら何も読まず・書かず `Proceed`
     /// （ツールがゲームの下の階層にあっても、その中へ `.new` などを書かないため）。
     pub game_dir: Option<&'a Path>,
     pub lang: Lang,
-    /// 更新して起こし直した初回に、ini を合わせる先の形（配る ini の全文）。
+    /// 更新して起動し直した初回に、ini を合わせる先の形（配る ini の全文）。
     pub ini_template: &'a str,
-    /// 更新して起こし直した初回に出す変更点。
+    /// 更新して起動し直した初回に出す変更点。
     pub notes: &'a str,
 }
 
-/// 起動の入口の本体。条件がそろえば確かめ、`Restarted` なら呼び出し側は子の終了コードで終わる。
+/// 起動の入口の本体。条件がそろえば確認し、`Restarted` なら呼び出し側は子の終了コードで終わる。
 pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outcome {
     if !c.dist {
         host.record(&not_checked(Skip::NotDist.reason()));
@@ -899,7 +896,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
             )
         );
     }
-    // 更新を確かめるのは通常の起動だけなので、起こし直しの初回は開発用の引数も継いだ ini も付かない。付いていたら人の起動ではない。
+    // 更新を確認するのは通常の起動だけなので、起動し直しの初回は開発用の引数も継いだ ini も付かない。付いていたら人の起動ではない。
     if c.just_updated && !in_game && !c.dev_args && !c.inherited_ini {
         post_update::run(
             host,
@@ -919,7 +916,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
                 "{}",
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: {why}。更新を確かめます。",
+                    ja: "HiganRTool: {why}。更新をチェックします。",
                     en: "HiganRTool: {why}. Checking for updates."
                 )
             );
@@ -943,7 +940,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
                 "{}",
                 match lang {
                     Lang::Ja =>
-                        "HiganRTool: このツールが花映塚と同じフォルダに置かれています。更新は確かめません（別のフォルダへ置くと確かめます）。",
+                        "HiganRTool: このツールが花映塚と同じフォルダにあります。更新はチェックしません（別のフォルダへコピーするとチェックします）。",
                     Lang::En =>
                         "HiganRTool: This HiganRTool is inside the game folder, so updates are not checked (put it in another folder to check).",
                 }
@@ -965,7 +962,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
         eprintln!(
             "{}",
             match lang {
-                Lang::Ja => "HiganRTool: 更新の公開鍵が読めないので、更新は確かめません。",
+                Lang::Ja => "HiganRTool: 更新の公開鍵が読めないので、更新はチェックしません。",
                 Lang::En =>
                     "HiganRTool: Cannot read the update public key, so updates are not checked.",
             }
@@ -985,7 +982,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
     )
 }
 
-/// 起こし直す exe に渡す引数。`--choose-game` は外す（更新の前に選び終えて覚えてあり、残すと選ぶウィンドウがもう一度出る）。
+/// 起動し直す exe に渡す引数。`--choose-game` は外す（更新の前に選び終えて覚えてあり、残すと選ぶウィンドウがもう一度出る）。
 pub fn restart_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     args.into_iter().filter(|a| a != "--choose-game").collect()
 }
@@ -1036,7 +1033,7 @@ mod tests {
     enum Route {
         Body(Vec<u8>),
         Redirect(String),
-        /// 別の宿（別ポート）への絶対 URL で回す。
+        /// 偽の HTTP サーバーが、別ポート（別のサーバー）への絶対 URL へ回す。
         RedirectTo(String),
         /// 待ってから中の応答をする。
         Slow(Duration, Box<Route>),
@@ -1185,7 +1182,7 @@ mod tests {
     struct FakeHost {
         answer: bool,
         restart_error: Option<String>,
-        /// 起こし直した子が終わったときの終了コード。
+        /// 起動し直した子が終わったときの終了コード。
         child_exit: i32,
         asked: Vec<String>,
         told: Vec<String>,
@@ -1341,7 +1338,7 @@ mod tests {
 
     #[test]
     fn english_run_asks_and_reports_every_update_step_in_english() {
-        // 更新する経路: 尋ねる文・取る・置き換える・起こし直す。
+        // 更新する経路: 尋ねる文・取る・置き換える・起動し直す。
         let dir = temp_dir("english_happy");
         install(&dir);
         let server = Server::start(happy_routes());
@@ -1391,7 +1388,7 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).expect("後片づけ");
 
-        // 起こし直しに失敗して元へ戻す経路と、置き換えの失敗の理由。
+        // 起動し直しに失敗して元へ戻す経路と、置き換えの失敗の理由。
         let dir = temp_dir("english_restart_fail");
         install(&dir);
         let mut host = FakeHost {
@@ -1491,8 +1488,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 子の終了コードが親の終了コードにならない（失敗した子でも 0 で終わる）、
-    // または子が失敗して終わっただけで更新を元に戻す（起こせたのだから戻さない）。
+    // 子が失敗して終わっただけでは更新を元に戻さない（起動はできたため）。
     #[test]
     fn the_parent_ends_with_the_exit_code_of_the_restarted_child() {
         for code in [0, 1, 7] {
@@ -1517,7 +1513,7 @@ mod tests {
         }
     }
 
-    /// 手元に無いリプレイを直す道具が目録に載っていても、更新は壊れずにその名前で新しく置く（v1.0.0 の手順も同じ）。
+    /// 手元に無いリプレイ修復ツールが目録に載っていても、更新は壊れずにその名前で新しく追加する（v1.0.0 の手順も同じ）。
     #[test]
     fn a_new_replay_fix_exe_in_the_manifest_is_placed_and_removed_again_when_the_restart_fails() {
         const FIX: &str = "HiganRTool_replay_fix.exe";
@@ -2387,8 +2383,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 何が壊れたら落ちるか: 「確認しなかった」「更新なし」「確認できなかった」の文が同じに戻る（ログから結果を区別できない）、
-    // 確認しなかった理由がログに残らない、ini で止めたことが画面に出ない。
     #[test]
     fn not_checking_no_update_and_failed_check_have_different_lines() {
         let dir = temp_dir("three_lines");
@@ -2613,8 +2607,7 @@ mod tests {
         std::fs::remove_dir_all(&game).expect("後片づけ");
     }
 
-    // 何が壊れたら落ちるか: ツールをゲームのフォルダの下の階層（th09.exe が無い）に置いた初回で、
-    // ゲームのフォルダを見ないと更新の確認が `.new` などをその階層に書く。決まる前に確かめる、中でも確かめる、外で確かめない、が落ちる。
+    // ツールをゲームのフォルダの下の階層（th09.exe が無い）に置いた初回で、ゲームのフォルダを見ないと更新の確認が `.new` などをその階層に書く。
     #[test]
     fn the_check_waits_for_the_game_folder_and_stays_out_of_it() {
         let root = temp_dir("below_game");
@@ -2672,7 +2665,7 @@ mod tests {
             );
         }
 
-        // 外: 今までどおり尋ねて、「はい」なら置き換えて起こし直す。
+        // 外: 今までどおり尋ねて、「はい」なら置き換えて起動し直す。
         let mut net = fake_net();
         let mut host = FakeHost {
             answer: true,
@@ -2689,7 +2682,6 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("後片づけ");
     }
 
-    // 何が壊れたら落ちるか: 起こし直しの引数が元の引数でなくなる、選ぶウィンドウがもう一度出る。
     #[test]
     fn the_restart_keeps_the_arguments_except_the_one_that_reopens_the_picker() {
         let a = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
@@ -2784,7 +2776,6 @@ mod tests {
             .unwrap_or(u64::MAX)
     }
 
-    // 壊れたら落ちる: 進み具合の行が、名前・何個目・受け取った量 / 全体・割合のどれかを欠く、割合が戻る、行が縮む（書き直しで前の字が残る）。
     #[test]
     fn the_progress_line_names_the_file_the_bytes_and_the_percent() {
         let mut p = Progress::new("HiganRTool.dll", 2, 3, 3_500_000, Lang::Ja);
@@ -2825,7 +2816,6 @@ mod tests {
         }
     }
 
-    // 壊れたら落ちる: ダウンロードの進み具合が host に届かない、ファイルごとに確定しない、割合が 100% で終わらない。
     #[test]
     fn each_file_gets_a_progress_line_that_ends_at_100_percent() {
         let dir = temp_dir("progress");
@@ -2868,7 +2858,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 失敗したファイルの行が確定されず、次の文が書き直しの行に重なる。
     #[test]
     fn a_failed_download_still_ends_its_progress_line() {
         let dir = temp_dir("progress_fail");
@@ -2893,7 +2882,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 受け取った量が途中経過として渡らない（大きなファイルで画面が止まって見える）。
     #[test]
     fn the_http_get_reports_a_growing_byte_count_while_receiving() {
         let body = vec![7u8; 300_000];
@@ -2914,7 +2902,7 @@ mod tests {
         assert_eq!(seen.last().copied(), Some(body.len() as u64));
     }
 
-    /// 更新して起こし直した初回の起動（外のゲームのフォルダ、通常の引数）の入口。
+    /// 更新して起動し直した初回の起動（外のゲームのフォルダ、通常の引数）の入口。
     fn after_update(dir: &Path, edit: impl FnOnce(&mut Start<'_>), host: &mut FakeHost) -> Outcome {
         let exe = dir.join("HiganRTool.exe");
         let args: Vec<OsString> = Vec::new();
@@ -2930,7 +2918,6 @@ mod tests {
 
     const UPGRADED_INI: &str = "[netplay]\nname = keep-me\nenable = 1\n";
 
-    // 壊れたら落ちる: 更新の後の初回に、ini が新しい形にならない・変更点が出ない・人のコンソールで Enter を待たない。
     #[test]
     fn the_first_launch_after_an_update_shows_the_notes_and_waits_for_enter() {
         let dir = temp_dir("after_update");
@@ -2966,7 +2953,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: パイプや検査の道具からの起動で Enter を待って止まる。
     #[test]
     fn a_console_that_is_not_a_person_never_waits() {
         let dir = temp_dir("after_update_piped");
@@ -2983,7 +2969,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 台本・開発用の引数・継いだ ini・ゲームのフォルダの中・開発版・2 回目の起動で、変更点や ini の書き換えが出る。
     #[test]
     fn nothing_happens_unless_it_is_a_human_first_launch_after_an_update() {
         type Edit = fn(&mut Start<'_>);
@@ -3029,7 +3014,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: ini が無いのに作る、ini が無いと変更点まで出なくなる。
     #[test]
     fn without_an_ini_the_notes_still_show_and_no_ini_is_made() {
         let dir = temp_dir("after_update_no_ini");
@@ -3045,7 +3029,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 更新の後の初回でも、その回がさらに更新を確かめる（更新が続く事故の歯止め）。
+    // 更新が続く事故の歯止め。
     #[test]
     fn the_first_launch_after_an_update_does_not_check_again() {
         let dir = temp_dir("after_update_no_check");

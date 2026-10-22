@@ -1,23 +1,11 @@
 //! ネットワークのガード。宛先と待ち受けのアドレスを、ネットワークの範囲（dll の ini の `scope`、peer_sim の `--scope`）が許すものに限る。peer_sim と dll の通信層が共有する。
 //!
-//! 範囲は 3 つで、広い方は狭い方を含む。
-//! - `loopback`（既定）… 127.0.0.0/8 と `::1` だけ。ini に `scope` を書き忘れても外へ出ないよう既定は狭い方。
-//! - `lan` … loopback ＋ 私設のアドレス（IPv4 の 10/8・172.16/12・192.168/16 = RFC 1918、169.254/16 = RFC 3927、
-//!   IPv6 の fc00::/7 = RFC 4193、fe80::/10 = RFC 4291）。100.64.0.0/10（CGNAT）は事業者の中のアドレスなので入れない。
-//! - `internet` … 上に加えて外のアドレス。
-//!
-//! `lan` の仲間に `LanVpn`（VPN の接続で開くときだけ。ini では選べない）がある。`lan` に、そのアダプターのネットワーク 1 つ
-//! （私設でない Radmin VPN の 26/8 など。`vpn_net`）を足した範囲。
-//!
-//! どの範囲でも断るもの: 未指定アドレス（`0.0.0.0` / `::`）と 0.0.0.0/8、マルチキャスト（224.0.0.0/4・ff00::/8。ただし UPnP の SSDP の
-//! 送り先 239.255.255.250 だけは、このガードを通さず dll の `upnp` が直接使う）、240.0.0.0/4（予約。ブロードキャストを含む）、IPv4 を埋めた IPv6（`::ffff:a.b.c.d` と `::a.b.c.d`。IPv4 の判定を迂回するため）、宛先のポート 0。
-//! 待ち受けを未指定アドレスにしないのは、接続コードに載せるアドレスにならず、範囲の外のアドレスでも待つ形になるため。LAN・外で使うときは待ち受けに
-//! 自分のそのネットワークのアドレスを書く。
-//!
-//! 名前（`localhost` など）は `check_*` と `allows` では受けない（DNS の問い合わせ自体が外への通信になる）。STUN の問い合わせ先だけは
-//! 名前でも書ける: `check_host_name` は文字の形だけを見て、引くのは開くときの読み取りのスレッドで、引けたアドレスをこのガードへ通す
-//! （dll の `net_udp::resolve_stun`）。範囲 loopback で引く名前は `localhost` だけ。送る直前のガード（dll の `Outlet::send`、peer_sim の
-//! `Tx::raw`）はゲームのスレッドなので、確保しない `allows` を使う。
+//! 範囲は 3 つで、広い方は狭い方を含む: `loopback`（既定。ini に `scope` を書き忘れても外へ出ない）、`lan`（loopback ＋ 私設のアドレス。100.64.0.0/10 の CGNAT は事業者の中のアドレスなので入れない）、`internet`（上に加えて外のアドレス）。
+//! `lan` の仲間に `LanVpn`（VPN の接続で開くときだけ。ini では選べない）がある。`lan` に、そのアダプターのネットワーク 1 つ（私設でない Radmin VPN の 26/8 など。`vpn_net`）を足した範囲。
+//! どの範囲でも断るもの: 未指定アドレスと 0.0.0.0/8、マルチキャスト（UPnP の SSDP の 239.255.255.250 だけは dll の `upnp` が直接使う）、240.0.0.0/4、IPv4 を埋めた IPv6（IPv4 の判定を迂回するため）、宛先のポート 0。
+//! 待ち受けを未指定アドレスにしないのは、接続コードに載せるアドレスにならず、範囲の外のアドレスでも待つ形になるため。
+//! 名前は `check_*` と `allows` では受けない（DNS の問い合わせ自体が外への通信になる）。STUN の問い合わせ先だけは名前でも書ける（`check_host_name` は文字の形だけを見る）。
+//! 送る直前のガード（dll の `Outlet::send`、peer_sim の `Tx::raw`）はゲームのスレッドなので、確保しない `allows` を使う。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -147,10 +135,10 @@ pub fn allows(scope: Scope, addr: SocketAddr) -> bool {
 fn check_reach(addr: SocketAddr, scope: Scope, what: &str) -> Result<(), String> {
     match reach(addr.ip()) {
         None => Err(format!(
-            "{what} {addr} は送り先・受信ソケットとして意味の無いアドレス（全部のアドレス・マルチキャスト・ブロードキャスト・IPv4 を埋めた IPv6 など）なので、どのネットワークの範囲でも断る"
+            "{what} {addr} は送り先・受信ソケットとして無効なアドレス（全アドレス・マルチキャスト・ブロードキャスト・IPv4 を埋め込んだ IPv6 など）なので、どのネットワークの範囲でも拒否します"
         )),
         Some(r) if !admits(scope, r, addr.ip()) => Err(format!(
-            "{what} {addr} はネットワークの範囲 scope = {} の外（このアドレスには scope = {} 以上が要る）なので断る",
+            "{what} {addr} はネットワークの範囲 scope = {} の外（このアドレスには scope = {} 以上が必要）なので拒否します",
             scope.name(),
             r.name()
         )),
@@ -167,12 +155,12 @@ pub fn check_bind(addr: SocketAddr, scope: Scope, what: &str) -> Result<(), Stri
 pub fn check_peer(addr: SocketAddr, scope: Scope) -> Result<(), String> {
     check_reach(addr, scope, "宛先")?;
     if addr.port() == 0 {
-        return Err(format!("宛先 {addr} のポートが 0 なので送れない"));
+        return Err(format!("宛先 {addr} のポートが 0 なので送信できません"));
     }
     Ok(())
 }
 
-/// 範囲を持たない検査用の道具（peer_sim の偽の STUN の応答役）が使う、loopback だけのガード。
+/// 範囲を持たない検査用のツール（peer_sim の偽の STUN の応答役）が使う、loopback だけのガード。
 pub fn check_loopback(addr: SocketAddr, what: &str) -> Result<(), String> {
     if is_loopback(addr.ip()) {
         Ok(())
@@ -188,11 +176,11 @@ pub fn check_loopback(addr: SocketAddr, what: &str) -> Result<(), String> {
 /// 空のラベル・`:` も断る。
 pub fn check_host_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err("名前が空".to_string());
+        return Err("名前が空です".to_string());
     }
     if name.len() > 253 {
         return Err(format!(
-            "名前が長すぎる（{} 文字。253 文字まで）",
+            "名前が長すぎます（{} 文字。253 文字まで）",
             name.len()
         ));
     }
@@ -200,7 +188,7 @@ pub fn check_host_name(name: &str) -> Result<(), String> {
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(format!(
-                "名前 {name:?} のラベル {label:?} は 1〜63 文字で（空のラベル・末尾の . は書けない）"
+                "名前 {name:?} のラベル {label:?} は 1〜63 文字にしてください（空のラベル・末尾の . は書けません）"
             ));
         }
         if let Some(c) = label
@@ -208,19 +196,19 @@ pub fn check_host_name(name: &str) -> Result<(), String> {
             .find(|c| !(c.is_ascii_alphanumeric() || *c == '-'))
         {
             return Err(format!(
-                "名前 {name:?} に使えない文字 {c:?} がある（英数字と - だけ。国際化ドメインは xn-- の形で）"
+                "名前 {name:?} に使えない文字 {c:?} があります（英数字と - だけ。国際化ドメインは xn-- の形にしてください）"
             ));
         }
         if label.starts_with('-') || label.ends_with('-') {
             return Err(format!(
-                "名前 {name:?} のラベル {label:?} が - で始まるか終わる"
+                "名前 {name:?} のラベル {label:?} が - で始まるか終わっています"
             ));
         }
         last = label;
     }
     if last.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
-            "名前 {name:?} の最後のラベルが数字だけ（IP アドレスの書き損じか。アドレスは IP:ポート で書く）"
+            "名前 {name:?} の最後のラベルが数字だけです（IP アドレスの書き損じの可能性。アドレスは IP:ポート で書いてください）"
         ));
     }
     Ok(())
@@ -407,9 +395,6 @@ mod tests {
         Net4::new(a.parse().unwrap(), p).unwrap()
     }
 
-    /// 壊れたら落ちる: VPN のネットワークの外（隣の /8・同じ /8 の別の /24・ネットワークのアドレス・ブロードキャスト）を通す、
-    /// 足したネットワークを使わない（範囲 lan のまま）、lan の分（私設・loopback）を落とす、世界のアドレスや IPv6 まで通す、ポート 0 を通す、
-    /// 受信ソケット・宛先・送る直前のガードで答えが割れる。
     #[test]
     fn lan_vpn_adds_exactly_one_network_to_lan() {
         let radmin = Scope::LanVpn(net("26.1.2.3", 8));
@@ -457,7 +442,6 @@ mod tests {
         assert!(Lan < radmin && radmin < Internet);
     }
 
-    /// 壊れたら落ちる: 私設の LAN の接続が VPN の範囲に替わる（VPN でない接続を変えない）、VPN のネットワークの外のアドレスで VPN の範囲を開く。
     #[test]
     fn lan_via_widens_only_for_a_non_private_address_inside_the_vpn_network() {
         let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();

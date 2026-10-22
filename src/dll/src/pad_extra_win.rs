@@ -1,13 +1,10 @@
 //! パッドの十字キー（POV）を足す入口の Win32 の層（unsafe はここに閉じ込める。1 つずつ `// SAFETY:`）。
 //!
-//! (1) ゲームが呼ぶ入口 `pad_entry`（元の `0x0042B410` を呼んで、戻り値に十字キーの方向を足す）、(2) デバイスの本物の読み
-//! （ゲームのメモリの 2 語・DirectInput の `GetDeviceState`・winmm の `joyGetPosEx`）、(3) `DllMain` からの設置と、ハットの有無の
-//! 引き直しと数えの行を頼む別スレッド。行は `main_log::push` で本ログの書き手に頼む。判断は `pad_extra.rs`、POV の値の読み方は
-//! `higanr_core::pad_dirs`。**OS へ入力を注ぎ込む API は使わない**（読むだけ）。
+//! (1) ゲームが呼ぶ入口 `pad_entry`（元の `0x0042B410` を呼んで、戻り値に十字キーの方向を足す）、(2) デバイスの本物の読み（ゲームのメモリの 2 語・DirectInput の `GetDeviceState`・winmm の `joyGetPosEx`）、(3) `DllMain` からの設置と、ハットの有無の引き直しと数えの行を頼む別スレッド。
+//! 行は `main_log::push` で本ログの書き手に頼む。判断は `pad_extra.rs`、POV の値の読み方は `higanr_core::pad_dirs`。**OS へ入力を注ぎ込む API は使わない**（読むだけ）。
 //!
-//! 設置を `DllMain` の中で行うのは、ローダーがゲームを `CREATE_SUSPENDED` で作り `LoadLibraryW` が戻るまで主スレッドを走らせない
-//! （`src/loader/src/launch.rs`）ので、この時点ならゲームのコードをまだ誰も実行していないため。別のスレッドから後で書くと、
-//! 読み取りのスレッド（`win.rs`）の設置と互いのスレッドを止め合う恐れがある（`hook::run_attempts` はどちらも自分以外の全スレッドを止める）。
+//! 設置を `DllMain` の中で行うのは、ローダーがゲームを `CREATE_SUSPENDED` で作り `LoadLibraryW` が戻るまで主スレッドを走らせない（`src/loader/src/launch.rs`）ので、この時点ならゲームのコードをまだ誰も実行していないため。
+//! 別のスレッドから後で書くと、読み取りのスレッド（`win.rs`）の設置と互いのスレッドを止め合う恐れがある（`hook::run_attempts` はどちらも自分以外の全スレッドを止める）。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -50,13 +47,13 @@ static STATE: PadState = PadState::new();
 /// 書けた呼び出しの数（0 = 入口は働かない。別スレッドが引き直すかの判断に使う）。
 static INSTALLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// `PovMode` を別スレッドへ渡す数（0 = 切る、1 = 既定、2 = always）。
+/// ini の `PovMode` を、設置（`attach_inner`）が別スレッドへ渡す数（0 = 切る、1 = 既定、2 = always）。
 static MODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// ゲームから呼ばれる入口。4 つの呼び出しの rel32 がここへ向く。引数は元の `0x0042B410` と同じ。
 pub extern "fastcall" fn pad_entry(seat: u32, dev: u32, acc: u32) -> u32 {
     // SAFETY: `PAD_READ_FN` は表 `PAD_SITES` の `pad_fn_head` / `pad_fn_ret` の行が th09.exe の実バイトと一致したときだけ
-    // 入口を呼び出しに繋いだ（`on_attach`）ので、ここに元の関数がある。
+    // 入口を呼び出しに向けた（`on_attach`）ので、ここに元の関数がある。
     let orig: PadFn = unsafe { core::mem::transmute::<usize, PadFn>(PAD_READ_FN as usize) };
     entry_with(&STATE, &RealPadIo, orig, seat, dev, acc)
 }
@@ -105,7 +102,7 @@ impl PadIo for RealPadIo {
 /// IDirectInputDevice8::GetDeviceState の型（COM は x86 では stdcall）。
 type GetDeviceStateFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 
-/// 4 バイトに揃えた `DIJOYSTATE2` の置き場（ゲームのスタックの置き場も 4 バイト境界）。
+/// 4 バイトに揃えた `DIJOYSTATE2` の領域（ゲームのスタックの領域も 4 バイト境界）。
 #[repr(C, align(4))]
 struct Dij2([u8; pad_dirs::DIJOYSTATE2_LEN]);
 
@@ -150,7 +147,7 @@ fn new_joyinfo() -> JOYINFOEX {
     }
 }
 
-/// winmm の `joyGetPosEx(joy_id)` の `dwPOV`。エラー（つながっていない）なら `None`。
+/// winmm の `joyGetPosEx(joy_id)` の `dwPOV`。エラー（接続されていない）なら `None`。
 fn winmm_pov_of(joy_id: u32) -> Option<u32> {
     let mut info = new_joyinfo();
     // SAFETY: `info` は `dwSize` を埋めた JOYINFOEX で、書ける。`joyGetPosEx` は winmm の関数で、引数は番号とこの構造体。
@@ -158,7 +155,7 @@ fn winmm_pov_of(joy_id: u32) -> Option<u32> {
     (r == 0).then_some(info.dwPOV)
 }
 
-/// `joyGetDevCapsW` の `wCaps`（つながっていない・引けないなら `None`）。ハットの有無の確かめ用（ゲームのスレッドでは呼ばない）。
+/// `joyGetDevCapsW` の `wCaps`（接続されていない・引けないなら `None`）。ハットの有無を調べる用（ゲームのスレッドでは呼ばない）。
 fn winmm_caps(joy_id: u32) -> Option<u32> {
     let mut caps = JOYCAPSW::default();
     // SAFETY: `caps` は書ける JOYCAPSW で、その大きさを渡している。
@@ -175,11 +172,13 @@ fn winmm_caps(joy_id: u32) -> Option<u32> {
 // ---- DllMain からの設置 ----
 
 /// `DllMain`（`DLL_PROCESS_ATTACH`）から呼ぶ。ini を読み、切ってなければ 6 行を照合して 4 つの呼び出しを入口へ向け、ログとハットの
-/// 引き直しの別スレッドを起こす。パニックは受けて何も書かない扱いにする。
+/// 引き直しの別スレッドを作る。パニックは受けて何も書かない扱いにする。
 pub fn on_attach(module: HMODULE) {
     let r = catch_unwind(AssertUnwindSafe(|| attach_inner(module)));
     if r.is_err() {
-        push_summary("pad: 設置の途中でパニックを受けた（書いた分は残る。入口は書いた分だけ働く）");
+        push_summary(
+            "pad: 設置の途中でパニックを受けました（書いた分は残る。入口は書いた分だけ働く）。",
+        );
     }
 }
 
@@ -214,7 +213,7 @@ fn attach_inner(module: HMODULE) {
     if settings.pov == PovMode::Off {
         push_setting_line(
             ini_problem,
-            &format!("{settings_text}。何も書かない（ゲームの読みのまま）"),
+            &format!("{settings_text}。何も書きません（ゲームの読みのまま）"),
         );
         start_thread(module);
         return;
@@ -239,7 +238,7 @@ fn attach_inner(module: HMODULE) {
     }
     if report.written > 0 && !report.complete() {
         push_summary(
-            "pad: 一部の呼び出しだけ書けた（書けなかった呼び出しは今までどおり元の関数を呼ぶだけ）",
+            "pad: 一部の呼び出しだけ書けました（書けなかった呼び出しは今までどおり元の関数を呼ぶだけ）。",
         );
     }
     start_thread(module);
@@ -278,7 +277,7 @@ fn load_settings_with(
         Err(e) => {
             return (
                 PadSettings::default(),
-                format!("{} を読めない（{e}）ので既定", loc.text()),
+                format!("{} 読み取り不能（{e}）。既定値を使います", loc.text()),
                 true,
             );
         }
@@ -287,7 +286,10 @@ fn load_settings_with(
         Ok(s) => (s, loc.text(), false),
         Err(e) => (
             PadSettings::default(),
-            format!("{} の [pad] を読めない（{e}）ので既定", loc.text()),
+            format!(
+                "{} の [pad] 読み込み不能（{e}）。既定値を使います",
+                loc.text()
+            ),
             true,
         ),
     }
@@ -309,7 +311,7 @@ fn start_thread(module: HMODULE) {
         )
     };
     if h.is_null() {
-        push_summary("pad: ハットの引き直しのスレッドを起こせない（winmm の経路は読まない）");
+        push_summary("pad: ハットの引き直しのスレッドの作成不能（winmm の処理フローは読まない）。");
         return;
     }
     // SAFETY: いま作ったスレッドのハンドル。閉じてもスレッドは止まらない。
@@ -324,10 +326,10 @@ extern "system" fn pad_thread(_param: *mut c_void) -> u32 {
     0
 }
 
-/// ハットの引き直しの間隔（ミリ秒）。つなぎ直したパッドを拾うためで、速くする理由が無い。
+/// ハットの引き直しの間隔（ミリ秒）。接続し直したパッドを拾うためで、速くする理由が無い。
 const REFRESH_MS: u64 = 1000;
 
-/// ハットの有無を引き直して旗を置き、数えの行を本ログへ頼む（初めて経路が使われた・初めて方向を足した・初めて読めなかった。それぞれ高々 1 回）。
+/// ハットの有無を引き直して旗を更新し、数えの行を本ログへ頼む（初めて経路が使われた・初めて方向を足した・初めて読めなかった。それぞれ高々 1 回）。
 fn run_thread() {
     // 設置を断った・1 つも書けなかった実行は、引き直すものが無い（設置の結果は `attach_inner` が本ログへ頼んである）。
     if INSTALLED.load(core::sync::atomic::Ordering::Acquire) == 0 {
@@ -441,7 +443,7 @@ mod tests {
         0
     }
 
-    /// 偽の IDirectInputDevice8: 先頭のワードが vtable。vtable の `0x24` 番目（バイト）に GetDeviceState を置く。
+    /// 偽の IDirectInputDevice8: 先頭のワードが vtable。vtable の `0x24` 番目（バイト）に GetDeviceState を入れる。
     #[repr(C)]
     struct FakeDevice {
         vtbl: *const [usize; 10],
@@ -539,9 +541,8 @@ mod tests {
 
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-    use crate::hook::{HookEnv, ThreadRef, WriteDone};
     use crate::sites::{SiteDef, Use};
-    use crate::ticks::CopyRow;
+    use crate::test_code::RawCode;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -565,75 +566,9 @@ mod tests {
 
     /// 検査の入口（`pad_entry` と同じ形。呼び先は機械語で書いた偽の元の関数）。
     extern "fastcall" fn test_entry(seat: u32, dev: u32, acc: u32) -> u32 {
-        // SAFETY: `T_ORIG` は検査が置いた、機械語の偽の元の関数（fastcall、スタック 1 個、`ret 4`）のアドレス。
+        // SAFETY: `T_ORIG` は検査が書いた、機械語の偽の元の関数（fastcall、スタック 1 個、`ret 4`）のアドレス。
         let orig = unsafe { core::mem::transmute::<usize, PadFn>(T_ORIG.load(Ordering::SeqCst)) };
         entry_with(&T_STATE, &TestIo, orig, seat, dev, acc)
-    }
-
-    /// 実行できるメモリに置いた偽のコード。`write_code` / `read_code` はそこへ直に書く（止めるスレッドは無い）。
-    struct RawCode {
-        base: u32,
-    }
-
-    impl HookEnv for RawCode {
-        fn open_other_threads(&mut self) -> Result<Vec<ThreadRef>, u32> {
-            Ok(Vec::new())
-        }
-        fn suspend(&mut self, _t: ThreadRef) -> bool {
-            true
-        }
-        fn resume(&mut self, _t: ThreadRef) -> bool {
-            true
-        }
-        fn close(&mut self, _t: ThreadRef) {}
-        fn eip(&mut self, _t: ThreadRef) -> Option<u32> {
-            None
-        }
-        fn read_code(&mut self, addr: u32, buf: &mut [u8]) -> bool {
-            assert!(addr >= self.base && addr + buf.len() as u32 <= self.base + 0x200);
-            // SAFETY: 範囲は検査が確保した 0x1000 バイトの中（上の assert）。
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    addr as usize as *const u8,
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                )
-            };
-            true
-        }
-        fn write_code(&mut self, addr: u32, bytes: &[u8]) -> Result<WriteDone, u32> {
-            assert!(addr >= self.base && addr + bytes.len() as u32 <= self.base + 0x200);
-            // SAFETY: 範囲は検査が確保した 0x1000 バイト（読み書き実行できる頁）の中（上の assert）。
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    addr as usize as *mut u8,
-                    bytes.len(),
-                )
-            };
-            Ok(WriteDone {
-                protect_restored: true,
-                flushed: true,
-            })
-        }
-        fn set_original_target(&mut self, _target: u32) {}
-        fn set_window(&mut self, _addr: u32) {}
-        fn set_copy_table(&mut self, _rows: &[CopyRow]) {}
-        fn set_render_only_exit(&mut self, _addr: u32) {}
-        fn entry_address(&self) -> u32 {
-            0
-        }
-        fn match_entry_address(&self) -> u32 {
-            0
-        }
-        fn set_match_original(&mut self, _target: u32) {}
-        fn sleep_ms(&mut self, _ms: u32) {}
-        fn now_ms(&self) -> u64 {
-            0
-        }
-        fn counter(&self) -> u32 {
-            0
-        }
     }
 
     #[test]
@@ -660,7 +595,7 @@ mod tests {
             0xC2, 0x04, 0x00, // ret 4
             0x90, 0x90, 0x90,
         ];
-        // 呼び出し元: ゲームと同じ形。呼んだ後でスタックが元の高さか確かめ、ずれていれば eax に印を入れて戻す。
+        // 呼び出し元: ゲームと同じ形。呼んだ後でスタックが元の高さかチェックし、ずれていれば eax に印を入れて戻す。
         let acc: u32 = 0x0000_1303;
         let seat: u32 = 1;
         let dev: u32 = 1;
@@ -727,7 +662,7 @@ mod tests {
         T_STATE.set_winmm_gate(1, true);
         let entry_fn: extern "fastcall" fn(u32, u32, u32) -> u32 = test_entry;
         let entry = entry_fn as usize as u32;
-        let report = crate::pad_extra::install(&mut RawCode { base }, &rows, entry);
+        let report = crate::pad_extra::install(&mut RawCode { base, span: 0x200 }, &rows, entry);
         assert!(report.complete(), "{:?}", report.lines);
 
         T_POV.store(27_000, Ordering::SeqCst);
@@ -751,7 +686,9 @@ mod tests {
         assert_eq!(r.written, 0, "{:?}", r.lines);
         assert!(!r.complete());
         assert!(
-            r.lines.iter().any(|l| l.contains("1 バイトも書いていない")),
+            r.lines
+                .iter()
+                .any(|l| l.contains("1 バイトも書いていません")),
             "{:?}",
             r.lines
         );
@@ -818,7 +755,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: `[pad]` の誤りの行が、設置が全部できた実行で詳細だけに回る（配線の検査。読みそのものは上の検査）。
+    /// 配線の検査（読みそのものは上の検査）。
     #[test]
     fn an_ini_problem_reaches_every_setup_line_as_a_brief_line() {
         let src = include_str!("pad_extra_win.rs");

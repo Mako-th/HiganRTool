@@ -1,13 +1,9 @@
 //! サスペンド起動の経路。失敗の後始末は下の「行」ごとに決まる。
-//!
-//! 行 1 DLL の確認 → 2 ゲームの同定 → 3 `CreateProcessW(CREATE_SUSPENDED)` → 4 `VirtualAllocEx` →
-//! 5 `WriteProcessMemory`（DLL の絶対パス、UTF-16）→ 6 `CreateRemoteThread(LoadLibraryW)` → 7 終わりを待つ →
-//! 8 戻り値を見る → 9 領域を返して `ResumeThread`。
-//!
-//! 失敗したら、一度も走っていないゲームを `TerminateProcess` で消して「始めずに終える」（ツールの無いゲームが
-//! 立ち上がると取り違えるため）。どの行でも、開いたハンドルは全部閉じる。unsafe は無い（Win32 は `Win32` トレイト越し）。
-//! 仕組みは thprac の `RunGame` / `LoadRemoteLibrary` と同じ（コードはコピーしていない）。違い: 失敗したらゲームを殺す、
-//! パスの終端の 0 を自分で書く、待ちに上限を置く。
+//! 行 1 DLL の確認 → 2 ゲームの同定 → 3 `CreateProcessW(CREATE_SUSPENDED)` → 4 `VirtualAllocEx` → 5 `WriteProcessMemory`（DLL の絶対パス、UTF-16）→
+//! 6 `CreateRemoteThread(LoadLibraryW)` → 7 終わりを待つ → 8 戻り値を見る → 9 領域を返して `ResumeThread`。
+//! 失敗したら、一度も走っていないゲームを `TerminateProcess` で消して「始めずに終える」（ツールの無いゲームが立ち上がると取り違えるため）。
+//! どの行でも、開いたハンドルは全部閉じる。unsafe は無い（Win32 は `Win32` トレイト越し）。
+//! 仕組みは thprac の `RunGame` / `LoadRemoteLibrary` と同じ（コードはコピーしていない）。違い: 失敗したらゲームを殺す、パスの終端の 0 を自分で書く、待ちに上限を付ける。
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
@@ -22,7 +18,7 @@ use crate::win::{ErrorCode, Handle, LaunchNote, ProcessInfo, Remote, Spawn, Wait
 /// ウイルス対策ソフトが初回の読み込みを止めている間（クラウド照会で長引くことがある。実測はしていない）も待てるよう長く取る。
 pub const REMOTE_THREAD_TIMEOUT_MS: u32 = 60_000;
 
-/// 最初の待ち。ここまでに終わらず、ゲームのプロセスが生きていれば知らせて `REMOTE_THREAD_TIMEOUT_MS` まで延ばす。
+/// 最初の待ち。ここまでに終わらず、ゲームのプロセスが生きていれば画面に知らせて `REMOTE_THREAD_TIMEOUT_MS` まで延ばす。
 pub const REMOTE_THREAD_NOTICE_MS: u32 = 10_000;
 
 /// 消えたかを待つ上限。`TerminateProcess` は終わりを待たずに戻るため。
@@ -52,12 +48,10 @@ pub const SECOND_INSTANCE: CodePatch = CodePatch {
     new: &[0xEB, 0x19],
 };
 
-/// 別に起動している花映塚と独立させる書き換え（毎回当てる）。名前つきの印を持つ花映塚が居る間に別の花映塚を起動すると、
+/// 別に起動している花映塚と独立させる書き換え（開発用の起動だけ当てる。`single::is_isolated`）。名前つきの印を持つ花映塚が居る間に別の花映塚を起動すると、
 /// 後から起動した方が「二つは起動できません」で終わる際に th09.cfg を全部 0 で書き出すため（実測）。
-/// `0x0042D909 68 44 02 49 00 push $0x490244`（CreateMutexA の名前 "Touhou 08 App"）
-/// を `6A 00 90 90 90`（push 0 と NOP 3 つ）に
-/// すると名前なしの印になり、GetLastError が ERROR_ALREADY_EXISTS を返さないので `0x0042D928` の jne も通る
-/// （`SECOND_INSTANCE` は要らない）。
+/// `0x0042D909 68 44 02 49 00 push $0x490244`（CreateMutexA の名前 "Touhou 08 App"）を `6A 00 90 90 90`（push 0 と NOP 3 つ）にすると名前なしの印になり、
+/// GetLastError が ERROR_ALREADY_EXISTS を返さないので `0x0042D928` の jne も通る（`SECOND_INSTANCE` は要らない）。
 pub const ISOLATED_INSTANCE: CodePatch = CodePatch {
     at: 0x0042_D909,
     expect: &[0x68, 0x44, 0x02, 0x49, 0x00],
@@ -77,7 +71,7 @@ pub struct LaunchRequest<'a> {
     pub ident: Ident<'a>,
     /// 成功したとき、プロセスのハンドルを閉じずに返すか（自己検査が的の終了コードを見るため。閉じるのは呼んだ側）。
     pub keep_process_handle: bool,
-    /// 起動の前に書く所。本番は毎回 `ISOLATED_INSTANCE`、`--second` なら `SECOND_INSTANCE` も。
+    /// 起動の前に書く所。開発用の起動は `ISOLATED_INSTANCE`、`--second` なら `SECOND_INSTANCE` も。普段の起動は空。
     pub patches: Vec<CodePatch>,
     pub no_activate: bool,
 }
@@ -446,7 +440,7 @@ mod tests {
         mem: HashMap<usize, u8>,
         remote_waits: u32,
         notes: Vec<LaunchNote>,
-        /// ログの行の置き場（`staged::Logged` の検査用）。呼ばれた瞬間の最後の行を `at_call` に残す。
+        /// ログの行を貯める場所（`staged::Logged` の検査用）。呼ばれた瞬間の最後の行を `at_call` に残す。
         trail: Option<Rc<RefCell<Vec<String>>>>,
         at_call: Vec<(&'static str, String)>,
     }
@@ -1069,7 +1063,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{needle} の行が無い: {lines:#?}"))
     }
 
-    // 何が壊れたら落ちるか: 段の行を呼ぶ後に書く・段を飛ばす・順を誤ると、落ちた回の最後の行が「どの段で止まったか」を示さない。
     #[test]
     fn every_stage_is_logged_before_its_call_and_in_order() {
         let LoggedRun {

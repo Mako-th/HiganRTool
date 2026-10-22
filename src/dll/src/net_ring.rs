@@ -1,12 +1,10 @@
 //! 受信のリング: 受信スレッド（書き手 1 本）が受けた生のデータグラムを書き、ゲームスレッド（読み手 1 本）が tick の始まりと相手を待つ間に取り出す。
 //!
-//! - 中身の解析はしない（生のバイト列と送り元のアドレスだけ）。例外は PING だけで、受信スレッドがその場で PONG を返し（`net_udp` の
-//!   `answer_ping`）、返したことを枠の印（`push_marked` / `pop_marked`）でセッションへ知らせる。
-//! - 書き手だけが「書いた数」を `Release` で進め、読み手は `Acquire` で読んでから枠を読む。読み手だけが「読んだ数」を `Release` で進め、
-//!   書き手は `Acquire` で読んでから枠を上書きする。枠は原子変数の配列（4 バイトずつ `Relaxed`）なので unsafe が要らない。
-//! - 満杯なら新しい方を捨てて数える（lockstep の語は送り直しと冗長送信で埋まる）。`MAX_DATAGRAM` を超えたものも捨てて数える。
+//! - 中身の解析はしない（生のバイト列と送り元のアドレスだけ）。例外は PING だけで、受信スレッドがその場で PONG を返し（`net_udp` の `answer_ping`）、返したことを枠の印（`push_marked` / `pop_marked`）でセッションへ知らせる。
+//! - 書き手だけが「書いた数」、読み手だけが「読んだ数」を `Release` で進め、相手側は `Acquire` で読んでから枠を読み書きする。枠は原子変数の配列（4 バイトずつ `Relaxed`）なので unsafe が要らない。
+//! - 満杯なら新しい方を捨てて数える。`MAX_DATAGRAM` を超えたものも捨てて数える。
 //!
-//! 読み手の側（`pop`）はゲームスレッドで走るので、確保・ロック待ち・パニックしうる添字を置かない。
+//! 読み手の側（`pop`）はゲームスレッドで走るので、確保・ロック待ち・パニックしうる添字を使わない。
 #![forbid(unsafe_code)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -19,7 +17,7 @@ use higanr_core::wire::MAX_DATAGRAM;
 pub const RING_SLOTS: usize = 64;
 const WORDS: usize = MAX_DATAGRAM.div_ceil(4);
 /// 送り元のアドレスを詰める語の数（種類・ポート・アドレス 4 語・flowinfo・scope_id）。
-const ADDR_WORDS: usize = 8;
+pub(crate) const ADDR_WORDS: usize = 8;
 
 struct Slot {
     len: AtomicU32,
@@ -67,7 +65,7 @@ impl Default for RecvRing {
     }
 }
 
-fn encode_addr(a: SocketAddr) -> [u32; ADDR_WORDS] {
+pub(crate) fn encode_addr(a: SocketAddr) -> [u32; ADDR_WORDS] {
     match a {
         SocketAddr::V4(v4) => {
             let ip = u32::from_be_bytes(v4.ip().octets());
@@ -89,7 +87,7 @@ fn encode_addr(a: SocketAddr) -> [u32; ADDR_WORDS] {
     }
 }
 
-fn decode_addr(w: &[u32; ADDR_WORDS]) -> SocketAddr {
+pub(crate) fn decode_addr(w: &[u32; ADDR_WORDS]) -> SocketAddr {
     let [kind, port, a, b, c, d, flow, scope] = *w;
     let port = port as u16;
     if kind == 6 {

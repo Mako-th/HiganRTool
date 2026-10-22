@@ -1,18 +1,15 @@
 //! ログの簡潔 / 詳細の切り替え（pure。unsafe 無し）。
 //!
 //! 簡潔は「本ログ 1 本だけ。起動・ネットワーク・試合の節目・異常・終わりのまとめ」、詳細は今までの全部（CSV も）。切り替えは ini の `[log] detail`
-//! （`higanr_core::log_cfg`）。決めるのは読み取りのスレッドの始まり（ログを開いた直後）で、それより前にログへ頼まれた行は
-//! 書くときの値で選ぶ。
-//!
-//! 書き方: 詳細だけの行は `writeln!(detail_out(out), ...)`、異常と節目の行は今までどおり `writeln!(out, ...)`。
-//! 迷う行は簡潔に残す（異常の行を落とさないほうを優先する）。
+//! （`higanr_core::log_cfg`）。決めるのは読み取りのスレッドの始まりで、それより前の行は書くときの値で選ぶ。
+//! 詳細だけの行は `writeln!(detail_out(out), ...)`、異常と節目の行は `writeln!(out, ...)`。迷う行は簡潔に残す。
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 配るバージョンは簡潔、開発用は詳細（実機の回の解析が CSV に頼っている）。
+/// 配るバージョンは簡潔、開発用は詳細（実機の検証の解析が CSV に頼っている）。
 pub const fn default_detail(dist: bool) -> bool {
     !dist
 }
@@ -34,7 +31,7 @@ pub fn detail() -> bool {
     DETAIL.load(Ordering::Relaxed)
 }
 
-/// 読み取りのスレッドの始まりで 1 回置く。
+/// 読み取りのスレッドの始まりで 1 回設定する。
 pub fn set_detail(on: bool) {
     DETAIL.store(on, Ordering::Relaxed);
 }

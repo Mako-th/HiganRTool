@@ -467,7 +467,7 @@ fn row(b: &Board, i: usize) -> String {
         .unwrap_or_default()
 }
 
-/// 人は `every` tick ごとに、そのときの画面に合う 1 つを押す（一時停止の「タイトルへ戻る」→ 確かめの「はい」・終わりのメニューの決定）。
+/// 人は `every` tick ごとに、そのときの画面に合う 1 つを押す（一時停止の「タイトルへ戻る」→ 確認の「はい」・終わりのメニューの決定）。
 fn tapper(g: &RetGame, t: u32) -> u16 {
     if !t.is_multiple_of(8) || g.scene != SCENE_MATCH {
         return 0;
@@ -635,7 +635,7 @@ fn leaving_by_the_confirm_box_and_runs_without_the_flow_do_not_return() {
     ui.left_by_menu = true;
     ui.on_lost(Why::PeerLeft);
     assert!(ui.returning());
-    // 戻り道を置かない実行（offer / answer・観戦の実行・ほかの検査）は今までどおり。
+    // 戻り道を設定しない実行（offer / answer・観戦の実行・ほかの検査）は今までどおり。
     let link = Arc::new(UiLink::new());
     let b: &'static Board = Box::leak(Box::new(Board::new()));
     let mut plain = NetUi::new(
@@ -693,7 +693,7 @@ fn unreadable_match_menus_leave_the_game_to_its_own_input() {
     assert_eq!(ui.stats().return_gave_up, 1);
 }
 
-/// 組み上がり: 2 台の `NetPlay` を偽のネットワークでつなぎ、片方が閉じたら、もう片方の `net_input` が `take_lost` を受けて戻り始める。
+/// 組み上がり: 2 台の `NetPlay` を偽のネットワークで接続し、片方が閉じたら、もう片方の `net_input` が `take_lost` を受けて戻り始める。
 #[test]
 fn net_input_starts_the_flow_when_the_peer_leaves_after_the_match_was_made() {
     use crate::netplay::fake::{FRAME_US, FakeNet};
@@ -753,7 +753,7 @@ fn net_input_starts_the_flow_when_the_peer_leaves_after_the_match_was_made() {
     );
     assert!(ui_b.returning(), "相手が抜けたのに戻り始めない");
     assert_eq!(ui_b.lost, Some(Why::PeerLeft));
-    // 閉じた側は自分から閉じた BYE(取消)（確かめの枠ではない）なので、接続が切れた扱いで戻る。
+    // 閉じた側は自分から閉じた BYE(取消)（確認の枠ではない）なので、接続が切れた扱いで戻る。
     assert!(ui_a.returning());
     assert_eq!(chimes(), c0 + 2);
     assert_eq!(np_b.take_lost(), None, "2 回目も理由を返した");
@@ -771,7 +771,6 @@ fn logged() -> Vec<UiStats> {
     LOGGED.with(|l| std::mem::take(&mut *l.borrow_mut()))
 }
 
-/// 壊れたら落ちる: 戻り道の始まり・到着・途中でやめた理由が、本ログへ出す仕事に渡らない（実機の回で合否が読めない）。
 #[test]
 fn the_return_log_hears_the_start_the_arrival_and_the_reason_for_giving_up() {
     let _ = logged();

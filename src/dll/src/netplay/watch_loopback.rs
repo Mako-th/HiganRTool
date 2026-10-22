@@ -1,7 +1,7 @@
 //! 観戦者の側の組み上がりの検査のうち、本物の UDP の上（loopback）で実時間に走るもの。dll の観戦者（`WatchPlay` ＋
 //! 本物の通信層 `net_udp`）を、
-//! - peer_sim のホスト（`--spectate-host`。選択の台本つき）と peer_sim のゲストに繋ぐ（`a_dll_watcher_follows_peer_sim_players_*`）、
-//! - dll のホスト（偽のゲーム）と peer_sim のゲストの対戦に繋ぎ、観戦者への遅れを測り、観戦者がいても対戦者の stall が
+//! - peer_sim のホスト（`--spectate-host`。選択の台本つき）と peer_sim のゲストに接続する（`a_dll_watcher_follows_peer_sim_players_*`）、
+//! - dll のホスト（偽のゲーム）と peer_sim のゲストの対戦に接続し、観戦者への遅れを測り、観戦者がいても対戦する側の stall が
 //!   増えないかを見る（`the_watch_lag_*`・`a_watcher_does_not_add_stalls_to_the_players`）。
 //!
 //! 実時間で走る（1 本 10〜30 秒）ので `#[ignore]`。全件の回（`build.bat`）が `--ignored` で走らせる。
@@ -57,7 +57,7 @@ screen=8 wait=180 press=decide cursor=9  # step 5: 2P が決める（ホスト�
 struct Watched {
     wg: MenuGame,
     wp: WatchPlay,
-    /// 繋がった後の tick の確保（0 のはず）。
+    /// 接続した後の tick の確保（0 のはず）。
     allocs_joined: u64,
     local_at_join: Option<u32>,
     leaks: u32,
@@ -82,6 +82,7 @@ fn drive_menu_watcher(host: SocketAddr, mut wg: MenuGame, wait_budget_us: u32) -
             wait_budget_us,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     let (mut allocs_joined, mut local_at_join, mut leaks) = (0u64, None, 0u32);
@@ -121,7 +122,11 @@ fn drive_menu_watcher(host: SocketAddr, mut wg: MenuGame, wait_budget_us: u32) -
         }
     }
     let rs = rx.stop();
-    assert_eq!(rs.ring.dropped_full, 0, "観戦者の受信のリングが溢れた");
+    assert!(
+        rs.watch.installed,
+        "観戦者の受け取りを受信スレッドへ渡していない"
+    );
+    assert_eq!(rs.watch.queue_dropped, 0, "観戦者の便の列が溢れた");
     Watched {
         wg,
         wp,
@@ -406,7 +411,7 @@ fn fake(seed: u64, sc: Scenario) -> FakeGame {
 }
 
 /// dll のホスト（席は 2P）と peer_sim のゲスト（付いていく形）を実時間で回す。`with_watcher` なら、ホストの観戦のポートに
-/// dll の観戦者（別のスレッド。偽のゲームは選択の画面を持たない v0）を繋ぐ。
+/// dll の観戦者（別のスレッド。偽のゲームは選択の画面を持たない v0）を接続する。
 fn play(with_watcher: bool, sc: Scenario) -> Play {
     let psock = UdpSocket::bind(lo()).expect("loopback に bind できる");
     let paddr = psock.local_addr().unwrap();
@@ -555,6 +560,7 @@ fn watch_fake(slot: Arc<WatchSlot>, sc: Scenario) -> WatchRun {
             wait_budget_us: WAIT_BUDGET_US,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: false,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     let mut g = fake(0xD22, sc);
@@ -647,7 +653,7 @@ fn the_watch_lag_is_a_margin_of_frames_and_the_columns_match() {
         "遅れの中央値が大きい: {} µs",
         pct(&lag, 0.5)
     );
-    // 実時間の loopback の 1 走行の値（変える前は送った 1,369 通のうち送り直し 877、変えた後は 492 通のうち 0。観戦者 1 人・494 記録）。
+    // 実時間の loopback の 1 走行の値（変える前は観戦者へ送った 1,369 通のうち送り直し 877、変えた後は 492 通のうち 0。観戦者 1 人・494 記録）。
     let h = p.spec.expect("観戦のホストの数");
     eprintln!(
         "ホストの観戦の送り（loopback、観戦者 1 人・{} 記録）: 送った {} 通・送り直し {}（送り直し / 送った通数 = {:.3}）",
@@ -707,7 +713,7 @@ fn a_watcher_does_not_add_stalls_to_the_players() {
     );
 }
 
-/// stall の回数の揺らぎとして許す幅。`loopback.rs` の `STALL_JITTER`（12）と同じ考え方: 観戦者を対戦者のゲームのスレッドが
+/// stall の回数の揺らぎとして許す幅。`loopback.rs` の `STALL_JITTER`（12）と同じ考え方: 観戦者を対戦する側のゲームのスレッドが
 /// 待てば 1 フレームごとに stall が出て数百回増えるので、揺らぎの最大の差を越える値。実測では観戦者なし・ありとも
 /// 6 走行ずつ全部 24 回（最長 15）で揺れは 0、観戦者なしの別の測定は 24〜35 回で、12 はその最大の差（11）を越える値。
 const STALL_JITTER: u64 = 12;

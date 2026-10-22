@@ -1,6 +1,6 @@
 //! 照合の手順（pure）。自分の exe の同定と、地点の表の各地点の期待バイト列の照合（読むだけ）をしてログに書く。
 //! 最初のフックからは、ここの集計が全部通ったときだけ `session::run` が 1 地点を書く。
-//! Win32 は `Env` の向こうに置き、ここは順番とログの文だけを持つ。同定が合わなければ 1 バイトも読まない。
+//! Win32 の呼び出しは `Env` の向こうへ分け、ここは順番とログの文だけを持つ。同定が合わなければ 1 バイトも読まない。
 //! 注入したスレッド（ゲームスレッドではない）で走るので、ファイルの I/O とヒープの確保は構わない。
 #![forbid(unsafe_code)]
 
@@ -10,7 +10,6 @@ use higanr_core::patch::AddrRange;
 use higanr_core::pe::{Ident, IdentMismatch, check_ident};
 
 use crate::log_mode::detail_out;
-use crate::names::LocalTime;
 use crate::sites::{SiteDef, SiteOutcome, check_table, hex_bytes, judge};
 use crate::trial_summary::IdentState;
 
@@ -35,8 +34,6 @@ pub fn ident_of_file(read: std::io::Result<Vec<u8>>, ident: &Ident<'_>) -> Ident
 
 /// 照合が外から得るもの。本物は `win::RealEnv`。
 pub trait Env {
-    fn now(&self) -> LocalTime;
-    fn pid(&self) -> u32;
     fn exe_path(&self) -> Option<String>;
     fn ident(&self) -> IdentOutcome;
     /// 自分の exe が読み込まれた位置（`GetModuleHandleW(NULL)`）。
@@ -86,9 +83,9 @@ pub fn system_line(os: Option<OsVersion>, sse2: bool, avx2: bool) -> String {
     let yn = |b: bool| if b { "あり" } else { "なし" };
     let os = match os {
         Some(v) => format!("Windows {}.{}.{}", v.major, v.minor, v.build),
-        None => "Windows（バージョンが取れなかった）".to_string(),
+        None => "Windows（バージョン取得不能）".to_string(),
     };
-    format!("環境: {os} / CPU: SSE2 {}・AVX2 {}", yn(sse2), yn(avx2))
+    format!("環境: {os}\nCPU: SSE2 {}・AVX2 {}", yn(sse2), yn(avx2))
 }
 
 /// 照合の本体。ログの行を `out` に書く（書けなくても続ける）。最後の「スレッドを終える」の行は呼び出し側が書く。
@@ -100,13 +97,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> Summary {
     let mut summary = Summary::default();
-    let _ = writeln!(
-        detail_out(out),
-        "HiganRTool.dll（M1b の最初のフック: 照合が全部通ったときだけ、入力と待ちの call の飛び先 1 か所を書き換える。他の地点は読むだけ）"
-    );
     let _ = writeln!(out, "{}", build_line());
-    let _ = writeln!(out, "時刻: {}", env.now().display());
-    let _ = writeln!(detail_out(out), "PID: {}", env.pid());
     let _ = writeln!(
         detail_out(out),
         "exe: {}",
@@ -120,14 +111,14 @@ pub fn run(
         }
         IdentOutcome::Mismatch(m) => {
             summary.ident = IdentState::Mismatch;
-            let _ = writeln!(out, "同定: 不一致（食い違った欄: {:?}）", m.fields);
-            let _ = writeln!(out, "地点の照合: しない（同定が合わないため）");
+            let _ = writeln!(out, "同定: 不一致（項目: {:?}）", m.fields);
+            let _ = writeln!(out, "フック地点の照合: 未実行（同定不能）");
             return summary;
         }
         IdentOutcome::Unreadable(why) => {
             summary.ident = IdentState::Unreadable;
-            let _ = writeln!(out, "同定: exe が読めない（{why}）");
-            let _ = writeln!(out, "地点の照合: しない（同定ができないため）");
+            let _ = writeln!(out, "同定: exe の読み取り不能（{why}）");
+            let _ = writeln!(out, "フック地点の照合: 未実行（同定不能）");
             return summary;
         }
     }
@@ -147,22 +138,19 @@ pub fn run(
         )
     };
     if !base_ok {
-        let _ = writeln!(
-            out,
-            "地点の照合: しない（image base が違うので、表の VA がどれも当たらない）"
-        );
+        let _ = writeln!(out, "フック地点の照合: 未実行（image base が不一致）");
         return summary;
     }
 
     // 読み込まれた DLL が同じ表を持っている証拠として、表の検査をここでも行う。
     if let Err(e) = check_table(sites, forbidden) {
-        let _ = writeln!(out, "表の検査: 落ちた（{e:?}）");
-        let _ = writeln!(out, "地点の照合: しない（表が壊れているため）");
+        let _ = writeln!(out, "表の検査: 失敗（{e:?}）");
+        let _ = writeln!(out, "フック地点の照合: 未実行（表が破損している）");
         return summary;
     }
     let _ = writeln!(
         detail_out(out),
-        "表の検査: 通った（{} 行、禁止の範囲 {} 個）",
+        "表の検査: 通過（{} 行、禁止の範囲 {} 個）",
         sites.len(),
         forbidden.len()
     );
@@ -173,7 +161,7 @@ pub fn run(
         let outcome = judge(def, actual.as_deref());
         summary.total += 1;
         let head = format!(
-            "地点 {} 0x{:08X} {} バイト（{}）",
+            "フック地点 {} 0x{:08X} {} バイト（{}）",
             def.name,
             def.addr,
             def.expected.len(),
@@ -203,13 +191,16 @@ pub fn run(
             SiteOutcome::Unreadable => {
                 summary.unreadable += 1;
                 summary.bad_sites.push(def.name);
-                writeln!(out, "{head}: 読めない（コミット済みの読める頁ではない）")
+                writeln!(
+                    out,
+                    "{head}: 読み取り不能（コミット済みの読めるページではない）"
+                )
             }
         };
     }
     let _ = writeln!(
         out,
-        "集計: {} 地点のうち 一致 {} / 不一致 {} / 読めない {}",
+        "集計: {} 地点のうち 一致 {} / 不一致 {} / 読み取り不能 {}",
         summary.total, summary.matched, summary.mismatched, summary.unreadable
     );
     summary
@@ -223,7 +214,7 @@ pub(crate) mod tests {
     use higanr_core::pe::IdentField;
     use std::collections::HashMap;
 
-    /// 壊れたら落ちる: バージョンの欄の順・SSE2 と AVX2 の取り違え・取れなかったときの文。
+    /// バージョンの欄の順・SSE2 と AVX2 の取り違え・取れなかったときの文を見る。
     #[test]
     fn system_line_names_the_os_build_and_cpu_features() {
         let v = OsVersion {
@@ -233,11 +224,11 @@ pub(crate) mod tests {
         };
         assert_eq!(
             system_line(Some(v), true, false),
-            "環境: Windows 10.0.19045 / CPU: SSE2 あり・AVX2 なし"
+            "環境: Windows 10.0.19045\nCPU: SSE2 あり・AVX2 なし"
         );
         assert_eq!(
             system_line(None, false, true),
-            "環境: Windows（バージョンが取れなかった） / CPU: SSE2 なし・AVX2 あり"
+            "環境: Windows（バージョン取得不能）\nCPU: SSE2 なし・AVX2 あり"
         );
     }
 
@@ -263,20 +254,6 @@ pub(crate) mod tests {
     }
 
     impl Env for Fake {
-        fn now(&self) -> LocalTime {
-            LocalTime {
-                year: 2026,
-                month: 1,
-                day: 2,
-                hour: 3,
-                minute: 4,
-                second: 5,
-                millis: 6,
-            }
-        }
-        fn pid(&self) -> u32 {
-            4321
-        }
         fn exe_path(&self) -> Option<String> {
             Some(r"C:\Synthetic\サンプル\game.exe".to_string())
         }
@@ -338,8 +315,8 @@ pub(crate) mod tests {
         let (s, log) = run_fake(&mut f);
         assert_eq!(f.reads, 0);
         assert!(!s.checked_sites);
-        assert!(log.contains("同定: 不一致（食い違った欄: [TimeDateStamp, EntryBytes]）"));
-        assert!(log.contains("地点の照合: しない（同定が合わないため）"));
+        assert!(log.contains("同定: 不一致（項目: [TimeDateStamp, EntryBytes]）"));
+        assert!(log.contains("フック地点の照合: 未実行（同定不能）"));
         assert!(!log.contains("地点 "));
     }
 
@@ -350,7 +327,7 @@ pub(crate) mod tests {
         let (s, log) = run_fake(&mut f);
         assert_eq!(f.reads, 0);
         assert!(!s.checked_sites);
-        assert!(log.contains("同定: exe が読めない（合成の理由）"));
+        assert!(log.contains("同定: exe の読み取り不能（合成の理由）"));
     }
 
     #[test]
@@ -374,7 +351,7 @@ pub(crate) mod tests {
         let s = run(&mut f, &table, FORBIDDEN, IMAGE_BASE, &mut out);
         assert_eq!(f.reads, 0);
         assert!(!s.checked_sites);
-        assert!(String::from_utf8(out).unwrap().contains("表の検査: 落ちた"));
+        assert!(String::from_utf8(out).unwrap().contains("表の検査: 失敗"));
     }
 
     #[test]
@@ -394,13 +371,13 @@ pub(crate) mod tests {
                 bad_sites: vec![],
             }
         );
-        assert!(log.contains("時刻: 2026-01-02 03:04:05.006"));
-        assert!(log.contains("PID: 4321"));
+        assert!(!log.contains("時刻: "));
+        assert!(!log.contains("PID: "));
         assert!(log.contains(r"exe: C:\Synthetic\サンプル\game.exe"));
         assert!(log.contains("同定: 一致"));
         assert_eq!(log.matches(": 一致\n").count(), SITES.len());
         assert!(log.contains(&format!(
-            "集計: {} 地点のうち 一致 {} / 不一致 0 / 読めない 0",
+            "集計: {} 地点のうち 一致 {} / 不一致 0 / 読み取り不能 0",
             SITES.len(),
             SITES.len()
         )));
@@ -427,7 +404,7 @@ pub(crate) mod tests {
         assert_eq!(s.mismatched, 1);
         assert_eq!(s.unreadable, 1);
         let want_mismatch = format!(
-            "地点 draw_before_endscene 0x{:08X} {} バイト（inline detour の予定）: 不一致 実際 = {} / 期待 = {}（ノート §1-2",
+            "フック地点 draw_before_endscene 0x{:08X} {} バイト（inline detour の予定）: 不一致 実際 = {} / 期待 = {}（ノート §1-2",
             draw.addr,
             draw.expected.len(),
             hex_bytes(&bytes),
@@ -435,7 +412,7 @@ pub(crate) mod tests {
         );
         assert!(log.contains(&want_mismatch), "{log}");
         let want_unreadable = format!(
-            "地点 title_decide 0x{:08X} {} バイト（inline detour の予定）: 読めない",
+            "フック地点 title_decide 0x{:08X} {} バイト（inline detour の予定）: 読み取り不能",
             decide.addr,
             decide.expected.len()
         );

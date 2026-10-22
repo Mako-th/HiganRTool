@@ -1,7 +1,7 @@
-//! 窓。Windows 標準の部品（BUTTON・COMBOBOX・STATIC）で作った、普通のダイアログに近い窓。
+//! ウィンドウ。Windows 標準の部品（BUTTON・COMBOBOX・STATIC）で作った、普通のダイアログに近いウィンドウ。
 //! 見た目はコモンコントロール v6 のマニフェスト（build.rs）に、Tab・Enter・Esc は `IsDialogMessageW` に任せる。
-//! 窓のクラスは `DefDlgProcW` を既定の処理にした「ダイアログ窓」で、既定のボタンの管理・フォーカスの戻し・背景色を OS が受け持つ。
-//! 自分の窓の部品へ送るメッセージ（WM_SETFONT / CB_*）にだけ `SendMessageW` を使う。他のプロセスの窓へは送らない。
+//! ウィンドウのクラスは `DefDlgProcW` を既定の処理にした「ダイアログウィンドウ」で、既定のボタンの管理・フォーカスの戻し・背景色を OS が受け持つ。
+//! 自分のウィンドウの部品へ送るメッセージ（WM_SETFONT / CB_*）にだけ `SendMessageW` を使う。他のプロセスのウィンドウへは送らない。
 //! 状態（何本目か・直した後の設定・押せるか）は `model`、文言は `text`、読み書きは `work` / `scan`。ここは部品の並べ方と入力の橋渡し。
 
 use core::ffi::c_void;
@@ -50,7 +50,7 @@ use super::dialogs;
 
 const CLASS_NAME: &str = "HiganRToolReplayFix";
 
-/// 論理ピクセル（96 dpi）での寸法。ボタンの高さ 23・最小幅 75・窓の縁の余白 12 は Windows のダイアログの標準
+/// 論理ピクセル（96 dpi）での寸法。ボタンの高さ 23・最小幅 75・ウィンドウの縁の余白 12 は Windows のダイアログの標準
 /// （ダイアログ単位の 14 と 50 と 7 を 96 dpi に直した値）。
 const CLIENT_W: i32 = 560;
 const CLIENT_H: i32 = 323;
@@ -139,7 +139,7 @@ thread_local! {
     static MESSAGE_STYLE: Cell<MessageStyle> = const { Cell::new(MessageStyle { hwnd: 0, color: 0 }) };
 }
 
-/// 窓の中の部品。作る順が Tab の順（言語は最後）。
+/// ウィンドウの中の部品。作る順が Tab の順（言語は最後）。
 struct Controls {
     path: HWND,
     lang_label: HWND,
@@ -169,14 +169,14 @@ struct App {
     dpi: i32,
     font: HFONT,
     screen: Screen,
-    /// 部品を並べた画面。切り替わったときだけ既定のボタンとフォーカスを置き直す。
+    /// 部品を並べた画面。切り替わったときだけ既定のボタンとフォーカスを設定し直す。
     shown: Option<Screen>,
     session: Option<Session>,
     notice: Option<Notice>,
     c: Controls,
 }
 
-/// 状態を借りて使う。借りられない（窓のメッセージの途中の再入）ときは `None` で、パニックしない。
+/// 状態を借りて使う。借りられない（ウィンドウのメッセージの途中の再入）ときは `None` で、パニックしない。
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|c| {
         let mut b = c.try_borrow_mut().ok()?;
@@ -214,19 +214,19 @@ fn system_font() -> HFONT {
             &mut ncm as *mut _ as *mut c_void,
             0,
         );
-        ncm.lfMessageFont.lfCharSet = 1; // DEFAULT_CHARSET: 日本語など、顔の文字集合に無い字も OS の代替で出す
+        ncm.lfMessageFont.lfCharSet = 1; // DEFAULT_CHARSET: 日本語など、顔の文字集合に無い文字も OS の代替で出す
         CreateFontIndirectW(&ncm.lfMessageFont)
     }
 }
 
 fn set_text(h: HWND, text: &str) {
     let w = wide_nul(text);
-    // SAFETY: `h` は自分の窓の部品。文字列は終端 0 つきで呼びの間生きている。
+    // SAFETY: `h` は自分のウィンドウの部品。文字列は終端 0 つきで呼びの間生きている。
     unsafe { SetWindowTextW(h, w.as_ptr()) };
 }
 
 fn place(h: HWND, x: i32, y: i32, w: i32, height: i32) {
-    // SAFETY: `h` は自分の窓の部品。
+    // SAFETY: `h` は自分のウィンドウの部品。
     unsafe {
         MoveWindow(h, x, y, w, height, 1);
         ShowWindow(h, SW_SHOW);
@@ -234,23 +234,23 @@ fn place(h: HWND, x: i32, y: i32, w: i32, height: i32) {
 }
 
 fn hide(h: HWND) {
-    // SAFETY: `h` は自分の窓の部品。
+    // SAFETY: `h` は自分のウィンドウの部品。
     unsafe { ShowWindow(h, SW_HIDE) };
 }
 
 fn enable(h: HWND, on: bool) {
-    // SAFETY: `h` は自分の窓の部品。
+    // SAFETY: `h` は自分のウィンドウの部品。
     unsafe { EnableWindow(h, i32::from(on)) };
 }
 
 fn is_enabled(h: HWND) -> bool {
-    // SAFETY: `h` は自分の窓の部品。
+    // SAFETY: `h` は自分のウィンドウの部品。
     unsafe { IsWindowEnabled(h) != 0 }
 }
 
-/// 自分の窓の部品へのメッセージ。他のプロセスの窓へは送らない。
+/// 自分のウィンドウの部品へのメッセージ。他のプロセスのウィンドウへは送らない。
 fn send(h: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // SAFETY: `h` は自分の窓か、その部品。`lparam` に渡すポインタは呼び出し側が呼びの間生かす。
+    // SAFETY: `h` は自分のウィンドウか、その部品。`lparam` に渡すポインタは呼び出し側が呼びの間生かす。
     unsafe { SendMessageW(h, msg, wparam, lparam) }
 }
 
@@ -271,7 +271,7 @@ fn combo_selected(h: HWND) -> Option<usize> {
 fn child(parent: HWND, class: &str, style: u32, id: i32, font: HFONT, hinst: *mut c_void) -> HWND {
     let c = wide_nul(class);
     let empty = wide_nul("");
-    // SAFETY: 文字列は終端 0 つきで呼びの間生きている。`parent` は作った自分の窓。識別番号は HMENU の欄で渡す決まり。
+    // SAFETY: 文字列は終端 0 つきで呼びの間生きている。`parent` は作った自分のウィンドウ。識別番号は HMENU の欄で渡す決まり。
     let h = unsafe {
         CreateWindowExW(
             0,
@@ -399,7 +399,7 @@ impl App {
     fn text_width(&self, text: &str) -> i32 {
         let w: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE { cx: 0, cy: 0 };
-        // SAFETY: 窓の DC を借りてフォントを選び、元へ戻して返す。`w` は長さ付きで、`size` は書ける。
+        // SAFETY: ウィンドウの DC を借りてフォントを選び、元へ戻して返す。`w` は長さ付きで、`size` は書ける。
         unsafe {
             let dc: HDC = GetDC(self.hwnd);
             let old = SelectObject(dc, self.font as HGDIOBJ);
@@ -418,7 +418,7 @@ impl App {
         self.screen == Screen::Detail && self.session.is_some()
     }
 
-    /// 窓の下の知らせ。直した結果がなければ、直せないリプレイの理由。
+    /// ウィンドウの下の知らせ。直した結果がなければ、直せないリプレイの理由。
     fn message(&self) -> Option<(String, Tone)> {
         let t = self.text();
         if let Some(n) = &self.notice {
@@ -510,7 +510,7 @@ impl App {
         enable(c.make_all, fixable.is_some());
     }
 
-    /// 部品を窓のダイアログの決まり（余白・ボタンの大きさと右寄せ・中央の「前へ」「次へ」）で並べる。
+    /// 部品をダイアログの決まり（余白・ボタンの大きさと右寄せ・中央の「前へ」「次へ」）で並べる。
     fn relayout(&self) {
         let (t, c) = (self.text(), &self.c);
         let detail = self.is_detail();
@@ -546,7 +546,7 @@ impl App {
         let label_x = combo_x - s(6) - label_w;
         place(c.lang_label, label_x, s(14), label_w, s(18));
 
-        // 窓の下: 区切りの線と、右下の「終了」。直す画面の 2 つは左寄せ、最初の画面の 2 つは「終了」の左に右寄せ。
+        // ウィンドウの下: 区切りの線と、右下の「終了」。直す画面の 2 つは左寄せ、最初の画面の 2 つは「終了」の左に右寄せ。
         place(c.separator, m, s(SEPARATOR_Y), w - 2 * m, s(2));
         let exit_w = self.button_width(t.close());
         let mut x = w - m - exit_w;
@@ -615,7 +615,7 @@ impl App {
         place(c.next, x0 + pw + pos_w, ny, nw, bh);
     }
 
-    /// 画面が切り替わったら既定のボタンと最初のフォーカスを置く。そうでなくても、フォーカスのある部品が
+    /// 画面が切り替わったら既定のボタンと最初のフォーカスを設定する。そうでなくても、フォーカスのある部品が
     /// 押せなくなっていたら（最後の 1 本で「次へ」を押したなど）既定のボタンへ移す。
     fn settle_focus(&mut self) {
         let now = self.screen_now();
@@ -632,7 +632,7 @@ impl App {
         // SAFETY: フォーカスの読み取りだけ。
         let f = unsafe { GetFocus() };
         let usable = !f.is_null()
-            // SAFETY: `f` は GetFocus が返した窓。親子と可視の判定だけ。
+            // SAFETY: `f` は GetFocus が返したウィンドウ。親子と可視の判定だけ。
             && unsafe { IsChild(self.hwnd, f) != 0 && IsWindowVisible(f) != 0 }
             && is_enabled(f);
         if changed || !usable {
@@ -641,7 +641,7 @@ impl App {
                 .map(|id| self.control(id))
                 .find(|h| is_enabled(*h))
                 .unwrap_or(self.c.close);
-            // SAFETY: 自分の窓の部品へのフォーカス。他のプロセスの窓や前面には触らない。
+            // SAFETY: 自分のウィンドウの部品へのフォーカス。他のプロセスのウィンドウや前面には触らない。
             unsafe { SetFocus(target) };
         }
     }
@@ -711,7 +711,7 @@ impl App {
         Notice::Failed(self.text().unavailable(&a).unwrap_or_default())
     }
 
-    /// 作れたときだけ、結果の窓に出す内容を返す。
+    /// 作れたときだけ、結果のウィンドウに出す内容を返す。
     fn make_current(&mut self) -> Option<Report> {
         let s = self.session.as_ref()?;
         let (path, pair) = match s.make_state() {
@@ -730,6 +730,7 @@ impl App {
             MakeResult::Exists(p) => Notice::Exists(p.clone()),
             MakeResult::Recorded => self.refused(Analysis::Recorded),
             MakeResult::NoMark => self.refused(Analysis::NoMark),
+            MakeResult::MenuMark => self.refused(Analysis::MenuMark),
             MakeResult::OddValue(a, b) => self.refused(Analysis::OddValue(*a, *b)),
             MakeResult::Failed(e) => Notice::Failed(e.clone()),
         });
@@ -764,11 +765,11 @@ impl App {
     }
 }
 
-// ---- 窓のメッセージ ----
+// ---- ウィンドウのメッセージ ----
 
 fn message_box(hwnd: HWND, caption: &str, text: &str, icon: u32) {
     let (t, c) = (wide_nul(text), wide_nul(caption));
-    // SAFETY: 2 つの文字列とも終端 0 つきで呼びの間生きている。`hwnd` は自分の窓（null でもよい）。
+    // SAFETY: 2 つの文字列とも終端 0 つきで呼びの間生きている。`hwnd` は自分のウィンドウ（null でもよい）。
     unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | icon) };
 }
 
@@ -780,7 +781,7 @@ fn activate(id: Id) {
     match id {
         Id::Close => {
             if let Some(h) = with_app(|a| a.hwnd) {
-                // SAFETY: 自分の窓。WM_DESTROY で終了の合図を出す。
+                // SAFETY: 自分のウィンドウ。WM_DESTROY で終了の合図を出す。
                 unsafe { DestroyWindow(h) };
             }
         }
@@ -802,7 +803,7 @@ fn activate(id: Id) {
             with_app(|a| a.step(id == Id::Next));
         }
         Id::Make => {
-            // 窓は with_app の外で出す（窓の中でメッセージ処理が回るため）。
+            // ウィンドウは with_app の外で出す（ウィンドウの中でメッセージ処理が回るため）。
             if let Some((h, t, r)) = with_app(|a| {
                 let r = a.make_current()?;
                 Some((a.hwnd, a.text(), r))
@@ -908,7 +909,7 @@ unsafe extern "system" fn wnd_proc(
             return 0;
         }
         WM_CLOSE => {
-            // SAFETY: 自分の窓。
+            // SAFETY: 自分のウィンドウ。
             unsafe { DestroyWindow(hwnd) };
             return 0;
         }
@@ -933,16 +934,16 @@ unsafe extern "system" fn wnd_proc(
         }
         _ => {}
     }
-    // SAFETY: 受け取った引数をそのままダイアログ窓の既定の処理へ渡す。
+    // SAFETY: 受け取った引数をそのままダイアログウィンドウの既定の処理へ渡す。
     unsafe { DefDlgProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// 窓を出して、閉じるまで回る。`initial` は最初から選んだ状態にするもの。
+/// ウィンドウを出して、閉じるまで回る。`initial` は最初から選んだ状態にするもの。
 pub fn run(lang: Lang, initial: &[PathBuf]) -> Result<(), String> {
     let class = wide_nul(CLASS_NAME);
     let title = wide_nul(Text(lang).title());
-    // SAFETY: 窓クラスの登録・窓の作成・メッセージループという通常の手順。文字列は終端 0 つきで呼びの間生きている。
-    // 窓の状態は thread_local に置き、窓のメッセージの再入では借りられなければ既定の処理へ流す。
+    // SAFETY: ウィンドウクラスの登録・ウィンドウの作成・メッセージループという通常の手順。文字列は終端 0 つきで呼びの間生きている。
+    // ウィンドウの状態は thread_local に持ち、ウィンドウのメッセージの再入では借りられなければ既定の処理へ流す。
     unsafe {
         SetProcessDPIAware();
         let icc = INITCOMMONCONTROLSEX {
@@ -1022,7 +1023,7 @@ pub fn run(lang: Lang, initial: &[PathBuf]) -> Result<(), String> {
         });
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-        // 窓が前面になった後で、既定のボタンへフォーカスを置き直す（窓を出す前の SetFocus は最初の部品に取られうる）。
+        // ウィンドウが前面になった後で、既定のボタンへフォーカスを設定し直す（ウィンドウを出す前の SetFocus は最初の部品に取られうる）。
         with_app(|a| {
             a.shown = None;
             a.settle_focus();

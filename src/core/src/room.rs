@@ -1,32 +1,11 @@
 //! ルームサーバー（`src/server/`）のクライアントの純粋な部品。
 //!
-//! ルーム名の確かめとパスの組み立て・文の読み書き（平らな JSON の小さな読み手）・閉じる番号・入口の HTTP の誤りの本文・
-//! クライアントの状態機械を持つ。ソケットも時計も持たない。WebSocket の運び（WinHTTP）と受信のスレッドは dll の仕事。
-//! サーバーの値は `src/server/src/rules.ts` と同じ（`tests/fixtures/room/rules.json` で突き合わせる）。順番は `room.ts`。
-//!
-//! ## 役割の語
-//!
-//! サーバーの JSON の `"host"` / `"guest"` は、読んだ境目で [`Role::Offer`] / [`Role::Answer`] へコピーする。マッチのホスト（1P）と
-//! 紛れないよう Rust の名前には host / guest を使わない。dll は `Offer → CodeSide::Offer`・`Answer → CodeSide::Answer` とコピーする
-//! （`CodeSide` は dll の型で core に無い）。
-//!
-//! ## 順番
-//!
-//! - 始める側（`host`）: `room` → こちらが `offer` → `matched` → `peer`（返す側のコード）→ サーバーが 1000 で閉じる。
-//!   `matched` は始める側のコードが届いた後にしか出ないので、`offer` より前の `matched` も、`matched` より前の `peer` も順番違い。
-//! - 返す側（`guest`）: `room` → `peer`（始める側のコード）→ こちらが `answer` → サーバーが 1000 で閉じる。返す側に
-//!   `matched` は来ない。始める側が先に `offer` を出していれば、`peer` は `room` の直後に続けて来る。
-//! - 誤りで閉じるときは `{"t":"error","code":<名>}` を 1 通送ってから閉じる（1000 では送らない）。error の文と閉じる番号の
-//!   どちらが先に来ても同じ結果にし、先に来た方で終える。
-//!
-//! ## 時刻
-//!
-//! 時刻は呼び手が [`Now`] で渡す（`ms` は単調な時計、`unix_secs` は壁の時計）。サーバーの `expires_at` は UNIX 秒で PC の時計と
-//! ずれうるので、こちらの期限は「サーバーが 4408 を送ってくるはずの時刻の後ろの予備」として持つ（[`DEADLINE_GRACE_MS`]）。
-//! 時計のずれで残りが 0 以下か上限より長く見えたら、上限（ルームの期限 10 分・answer の期限 60 秒）で代える。期限そのものはサーバーが切る。
-//!
-//! 見張りのスレッドで回す。ゲームのスレッドでは呼ばない（文字列の確保がある）。ほかの `src/core/` と同じく
-//! unsafe 禁止・パニックしうる添字と unwrap を置かない。
+//! ルーム名の検証とパスの組み立て・文の読み書き（平らな JSON の小さな読み手）・閉じる番号・入口の HTTP の誤りの本文・クライアントの状態機械を持つ。ソケットも時計も持たない。WebSocket の運び（WinHTTP）と受信のスレッドは dll の仕事。サーバーの値は `src/server/src/rules.ts` と同じ（`tests/fixtures/room/rules.json` で突き合わせる）。順番は `room.ts`。
+//! サーバーの JSON の `"host"` / `"guest"` は、読んだ境目で [`Role::Offer`] / [`Role::Answer`] へコピーする（マッチのホスト（1P）と紛れないよう Rust の名前には host / guest を使わない）。dll は `Offer → CodeSide::Offer`・`Answer → CodeSide::Answer` とコピーする。
+//! 順番: 始める側（`host`）は `room` → こちらが `offer` → `matched` → `peer`（返す側のコード）→ サーバーが 1000 で閉じる。返す側（`guest`）は `room` → `peer`（始める側のコード）→ こちらが `answer` → 1000 で閉じる（`matched` は来ない）。順番違いは失敗にする。誤りで閉じるときは `{"t":"error","code":<名>}` を 1 通送ってから閉じ、error の文と閉じる番号は先に来た方で終える。
+//! 観戦を断る配る側は、観戦用のルームで `room` の後に `offer` の代わりに `refuse` を送り、ルームの期限（4408）まで残る。入ってきた観戦者は `room` の後に 4403 で閉じられる（[`Failure::Refused`]）。
+//! 時刻は呼び手が [`Now`] で渡す（`ms` は単調な時計、`unix_secs` は壁の時計）。サーバーの `expires_at` は UNIX 秒で PC の時計とずれうるので、こちらの期限は「サーバーが 4408 を送ってくるはずの時刻の後ろの予備」として持つ（[`DEADLINE_GRACE_MS`]）。時計のずれで残りが 0 以下か上限より長く見えたら、上限（ルームの期限 10 分・answer の期限 60 秒）で代える。
+//! dll の見張りのスレッドで回す。ゲームのスレッドでは呼ばない（文字列の確保がある）。ほかの `src/core/` と同じく unsafe 禁止・パニックしうる添字と unwrap を使わない。
 
 use std::borrow::Cow;
 
@@ -40,7 +19,7 @@ pub const PATH_PREFIX: &str = "/v0/rooms/";
 /// 数える。こちらは NFKC を持たないので、揃えても文字の数が変わらないと分かる ASCII だけの名にしかこの数を当てない
 /// （[`RoomName::parse`]）。
 pub const ROOM_NAME_MAX: usize = 32;
-/// ルーム名の大きさの上限（揃える前の UTF-8 のバイト）。揃えずに数えられるので、サーバーと同じ数で確かめる。
+/// ルーム名の大きさの上限（揃える前の UTF-8 のバイト）。揃えずに数えられるので、サーバーと同じ数で検証する。
 pub const ROOM_NAME_MAX_BYTES: usize = 128;
 /// 名そのものがこれなら断る（パスに載せると URL の読み方で区切りが消え、サーバーに届かず 404 になる）。
 pub const ROOM_NAME_BAD_NAMES: [&str; 2] = [".", ".."];
@@ -50,15 +29,17 @@ pub const CODE_MAX_CHARS: usize = 1024;
 /// 1 通の文の上限（UTF-8 のバイト）。サーバーの送る文（いちばん長いのは 1024 文字のコードを載せた `peer`）もこれに収まるので、
 /// サーバーから届く文にも同じ上限を当てる（越えたら中を読まない）。
 pub const MESSAGE_MAX_BYTES: usize = 2048;
-/// ルームの期限（始める側が繋いでから）。
+/// ルームの期限（始める側が接続してから）。
 pub const ROOM_TTL_MS: u64 = 10 * 60 * 1000;
 /// answer の期限（始める側のコードを返す側へ渡してから）。
 pub const ANSWER_TTL_MS: u64 = 60 * 1000;
-/// 生存の確かめの文。サーバーは文字の完全一致でしか自動応答しない（`setWebSocketAutoResponse`）ので、
+/// 生存チェックの文。サーバーは文字の完全一致でしか自動応答しない（`setWebSocketAutoResponse`）ので、
 /// 空白も鍵の順も変えずにこの 12 文字をそのまま送る。
 pub const PING_TEXT: &str = r#"{"t":"ping"}"#;
 /// 自動応答の文（読むときは JSON として読むので、文字の形はこれに限らない）。
 pub const PONG_TEXT: &str = r#"{"t":"pong"}"#;
+/// 観戦用のルームの配る側が、観戦を断るときに `offer` の代わりに送る文（`rules.ts` の `parseClientMessage` の `refuse`）。
+pub const REFUSE_TEXT: &str = r#"{"t":"refuse"}"#;
 /// サーバーが 429 の本文に入れる待ちの秒。読み手は本文の `retry_after` を使い、この値で埋めない
 /// （本文に無いなら「サーバーの JSON でない」と見る）。
 pub const RETRY_AFTER_SECS: u32 = 60;
@@ -79,7 +60,7 @@ pub const PONG_TIMEOUT_MS: u64 = 3 * PING_INTERVAL_MS;
 /// 101（Upgrade）の後に `room` が来るのを待つ時間。サーバーは 101 を返す前に `room` を送るので普通はすぐ来る。
 /// 来なければ「サーバーが応答しません」の扱い。
 pub const ROOM_GREETING_TIMEOUT_MS: u64 = 10_000;
-/// こちらの期限の予備。サーバーの期限（4408）が先に届くよう、その後ろに置く。
+/// こちらの期限の予備。サーバーの期限（4408）が先に届くよう、その後ろの時刻にする。
 /// 秒の切り捨てで最大 2 秒ほど前へずれうるので、それより十分長く。
 pub const DEADLINE_GRACE_MS: u64 = 5_000;
 
@@ -97,11 +78,9 @@ fn is_room_name_byte(b: u8) -> bool {
 //
 // こちらは揃えない（NFKC を持たない。サーバーが揃える）。送る前に見るのは、揃えずに決まるガードだけ: 空・大きさ（揃える前の
 // UTF-8 のバイト）・制御文字・`/`・名そのものが `.` `..`・空白だけ・ASCII だけの名の長さ。
-//
-// `RoomName::parse`（dll の本番）はこれに加えて ASCII の英数字と `-` `_` `@` 以外を断る（`NotAscii`）。サーバーは日本語も受け付けたまま。
-// `parse_server_rules` が断る名はサーバーも必ず断る（逆は無い）。サーバーだけが断るのは、揃えて初めて長さの分かる ASCII 以外の名
-// （33 文字以上の日本語・揃えると伸びる文字）で、サーバーの 400 `bad_room_name`（[`Failure::BadRoomName`]）で知る。
-// `parse` は ASCII だけを通すので、dll からは出ない。
+// `RoomName::parse`（dll の本番）はこれに加えて ASCII の英数字と `-` `_` `@` 以外を断る（`NotAscii`）。`parse_server_rules` が断る名は
+// サーバーも必ず断る（逆は無い）。サーバーだけが断るのは、揃えて初めて長さの分かる ASCII 以外の名（33 文字以上の日本語・揃えると伸びる文字）で、
+// サーバーの 400 `bad_room_name`（[`Failure::BadRoomName`]）で知る。dll の `parse` は ASCII だけを通すので、ここは出ない。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomNameError {
@@ -123,7 +102,7 @@ pub enum RoomNameError {
     NotAscii { pos: usize },
 }
 
-/// 送る前の確かめを通ったルーム名（打った文字のまま。揃えていない）。確保しない。
+/// 送る前の検証を通ったルーム名（打った文字のまま。揃えていない）。確保しない。
 ///
 /// `==` は「同じ文字」で、「同じルーム」ではない（`ＡＢＣ` と `abc` は別の値だが、サーバーで同じルームになる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +138,7 @@ const SPECTATE_HASH_BYTES: usize = 8;
 pub const SPECTATE_ROOM_NAME_LEN: usize = SPECTATE_ROOM_PREFIX.len() + 2 * SPECTATE_HASH_BYTES;
 
 impl RoomName {
-    /// ルーム名を確かめる。サーバーの決まり（[`RoomName::parse_server_rules`]）に加えて、ASCII の英数字と `-` `_` `@` だけを通す
+    /// ルーム名を検証する。サーバーの決まり（[`RoomName::parse_server_rules`]）に加えて、ASCII の英数字と `-` `_` `@` だけを通す
     /// （画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。空白・記号・日本語・全角は
     /// [`RoomNameError::NotAscii`]。大文字と小文字は別の文字のまま通す（同じルームにするのはサーバー）。
     pub fn parse(raw: &str) -> Result<RoomName, RoomNameError> {
@@ -176,9 +155,9 @@ impl RoomName {
         c.is_ascii() && is_room_name_byte(c as u8)
     }
 
-    /// サーバーの決まりだけで確かめる（揃えない。前後の空白もそのまま送り、サーバーが除く）。ガードの順はサーバーと同じ:
+    /// サーバーの決まりだけで検証する（揃えない。前後の空白もそのまま送り、サーバーが除く）。ガードの順はサーバーと同じ:
     /// 大きさ → 制御文字と `/` → `.` `..` → 揃えた後の空と長さ。「サーバーは日本語の名も通す」ことを loopback の検査と
-    /// 見本の突き合わせで見るための入口で、画面の側の確かめには使わない。
+    /// 見本の突き合わせで見るための入口で、画面の側の検証には使わない。
     pub fn parse_server_rules(raw: &str) -> Result<RoomName, RoomNameError> {
         if raw.is_empty() {
             return Err(RoomNameError::Empty);
@@ -219,15 +198,9 @@ impl RoomName {
             .unwrap_or("")
     }
 
-    /// このルームの観戦用のルームの名（インターネット越しの観戦）: `w.` ＋ SHA-256(小文字にしたルーム名の ASCII) の先頭 8 B の
-    /// 16 進（小文字 16 文字）。計 18 文字（サーバーの 32 文字の上限の内）。今のルームの手順（2 人・host と guest）のまま、
-    /// 対戦者の dll と観戦者の dll がこの名のルームで会う。
-    ///
-    /// - 利用者は `.` を打てない（[`RoomName::parse`] が `NotAscii` で断る）ので、対戦のルームの名と重ならない。
-    ///   作るのに `parse` は通さない（[`RoomName::parse_server_rules`] は通る）。
-    /// - 呼ぶのは `parse` を通った名。その名の `to_ascii_lowercase` はサーバーの「NFKC → 前後の空白を除く → 小文字」と
-    ///   同じ結果になるので、大文字小文字だけが違う名（サーバーでは同じルーム）は同じ観戦用のルームになる。
-    ///   `parse_server_rules` だけを通った名（日本語・全角など）は揃え方が食い違いうる（dll の本番は `parse` だけを使うので出ない）。
+    /// このルームの観戦用のルームの名（インターネット越しの観戦）: `w.` ＋ SHA-256(小文字にしたルーム名の ASCII) の先頭 8 B の 16 進（小文字 16 文字）。計 18 文字（サーバーの 32 文字の上限の内）。今のルームの手順（2 人・host と guest）のまま、対戦する 2 人の dll と観戦者の dll がこの名のルームで会う。
+    /// - 利用者は `.` を打てない（[`RoomName::parse`] が `NotAscii` で断る）ので、対戦のルームの名と重ならない。作るのに `parse` は通さない（[`RoomName::parse_server_rules`] は通る）。
+    /// - 呼ぶのは `parse` を通った名。その名の `to_ascii_lowercase` はサーバーの「NFKC → 前後の空白を除く → 小文字」と同じ結果になるので、大文字小文字だけが違う名（サーバーでは同じルーム）は同じ観戦用のルームになる。`parse_server_rules` だけを通った名（日本語・全角など）は揃え方が食い違いうる（dll の本番は `parse` だけを使うので出ない）。
     /// - 確保しない（バイトごとに小文字にしてハッシュへ流す）。
     pub fn spectate_of(&self) -> RoomName {
         let mut h = Sha256::new();
@@ -250,7 +223,7 @@ impl RoomName {
         }
     }
 
-    /// 繋ぐパス（`/v0/rooms/<ルーム名>`）。ルーム名は UTF-8 をパーセント符号化して載せる（unreserved のほかは全部 `%XX`、
+    /// 接続するパス（`/v0/rooms/<ルーム名>`）。ルーム名は UTF-8 をパーセント符号化して載せる（unreserved のほかは全部 `%XX`、
     /// 16 進は大文字）。WinHTTP は宿とパスを別に渡すのでパスだけを返す。
     pub fn path(&self) -> String {
         let name = self.as_str();
@@ -281,7 +254,7 @@ impl RoomName {
         out
     }
 
-    /// 繋ぐ URL。`base` はスキームと宿（例 `wss://example.workers.dev`）。末尾の `/` は除く
+    /// 接続する URL。`base` はスキームと宿（例 `wss://example.workers.dev`）。末尾の `/` は除く
     /// （`//v0/...` はサーバーで 404 になるため）。`base` の形は見ない。
     pub fn url(&self, base: &str) -> String {
         format!("{}{}", base.trim_end_matches('/'), self.path())
@@ -327,7 +300,7 @@ pub fn check_code(code: &str) -> Result<(), CodeTextError> {
     Ok(())
 }
 
-/// 始める側の文 `{"t":"offer","code":"..."}`。コードは base64url の文字だけなので JSON の逃がしは要らない（確かめてから書く）。
+/// 始める側の文 `{"t":"offer","code":"..."}`。コードは base64url の文字だけなので JSON の逃がしは要らない（検証してから書く）。
 pub fn write_offer(code: &str) -> Result<String, CodeTextError> {
     check_code(code)?;
     Ok(format!(r#"{{"t":"offer","code":"{code}"}}"#))
@@ -358,11 +331,13 @@ pub enum CloseCode {
     BadCode,
     /// 進行中のランダム対戦の一覧に載せられる数（全体・1 IP あたり）を越えた。
     ListFull,
+    /// 観戦用のルームのホストが観戦を許可していない（観戦者だけが閉じられ、ホストは残る）。
+    Refused,
 }
 
 impl CloseCode {
     /// 全部（見本との突き合わせと、番号 ↔ 名の往復の検査のため）。
-    pub const ALL: [CloseCode; 7] = [
+    pub const ALL: [CloseCode; 8] = [
         CloseCode::Done,
         CloseCode::BadMessage,
         CloseCode::Expired,
@@ -370,6 +345,7 @@ impl CloseCode {
         CloseCode::TooLarge,
         CloseCode::BadCode,
         CloseCode::ListFull,
+        CloseCode::Refused,
     ];
 
     pub fn number(self) -> u16 {
@@ -381,6 +357,7 @@ impl CloseCode {
             CloseCode::TooLarge => 4413,
             CloseCode::BadCode => 4422,
             CloseCode::ListFull => 4429,
+            CloseCode::Refused => 4403,
         }
     }
 
@@ -394,6 +371,7 @@ impl CloseCode {
             CloseCode::TooLarge => "too_large",
             CloseCode::BadCode => "bad_code",
             CloseCode::ListFull => "list_full",
+            CloseCode::Refused => "refused",
         }
     }
 
@@ -414,7 +392,7 @@ pub(crate) enum JsonValue<'a> {
     Str(Cow<'a, str>),
     /// i64 に収まる整数（小数点・指数の無いもの）。
     Int(i64),
-    /// 上以外の値（形は確かめたが中身は捨てた）。
+    /// 上以外の値（形は検証したが中身は捨てた）。
     Other,
 }
 
@@ -616,7 +594,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// どんな値でも形だけ確かめて読み飛ばす（知らない鍵の値）。
+    /// どんな値でも形だけ検証して読み飛ばす（知らない鍵の値）。
     fn skip_value(&mut self, depth: usize) -> Result<(), JsonAt> {
         if depth > SKIP_DEPTH_MAX {
             return self.err();
@@ -838,7 +816,7 @@ impl Role {
 /// サーバーから届く文（と自動応答の pong）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMsg {
-    /// 繋いだ直後に 1 回。`expires_at` はルームの期限（UNIX 秒）。
+    /// 接続した直後に 1 回。`expires_at` はルームの期限（UNIX 秒）。
     Room { role: Role, expires_at: u64 },
     /// 相手のコード（返す側には始める側のコード、始める側には返す側のコード）。
     Peer { code: String },
@@ -907,7 +885,7 @@ pub fn parse_server_message(text: &str) -> Result<ServerMsg, MsgError> {
         }
         "peer" => {
             let code = f.str("code")?;
-            // サーバーは文字を確かめたコードしか渡さない。崩れていれば、サーバーか途中が壊れている。
+            // サーバーは文字を検証したコードしか渡さない。崩れていれば、サーバーか途中が壊れている。
             check_code(code).map_err(|_| MsgError::BadValue("code"))?;
             Ok(ServerMsg::Peer {
                 code: code.to_owned(),
@@ -990,7 +968,7 @@ pub fn read_http_error(body: &str) -> Result<HttpErrorBody, MsgError> {
 /// 「サーバーが応答しません」の中の、何が起きたか（記録と調べもの用。画面の文言は [`FailureKind`] で分ける）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
-    /// 繋ぐ要求に応答が無い（名前が引けない・時間切れ・繋がらない）。dll の運びが知らせる。
+    /// 接続する要求に応答が無い（名前が引けない・時間切れ・接続できない）。dll の運びが知らせる。
     NoAnswer,
     /// 101 以外の HTTP の番号（404 バージョン違い・405・426・5xx・その他）。
     HttpStatus(u16),
@@ -1016,19 +994,21 @@ pub enum Why {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
-    /// 利用者が直せない。「サーバーが応答しません。接続コードで繋いでください」の扱い。
+    /// 利用者が直せない。「サーバーが応答しません。接続コードで接続してください」の扱い。
     Unresponsive(Why),
-    /// 429。`retry_after_secs` 秒後に繋ぎ直せる（コピペへは誘導しない）。
+    /// 429。`retry_after_secs` 秒後に接続し直せる（コピペへは誘導しない）。
     RateLimited { retry_after_secs: u32 },
     /// 409。ルームに既に 2 人。ルーム名を変える。
     RoomFull,
-    /// 400。ルーム名が決まりの外（こちらでも確かめるので、普通は来ない）。ルーム名を変える。
+    /// 400。ルーム名が決まりの外（こちらでも検証するので、普通は来ない）。ルーム名を変える。
     BadRoomName,
     /// ルームの期限・answer の期限が切れた（4408、またはこちらの予備の期限）。始める側で相手がまだ来ていないときだけ
     /// dll が自動で入り直す（`room_rejoin::should_rejoin`）。
     Expired,
     /// 相手が手順の途中で抜けた（4410）。
     PeerLeft,
+    /// 観戦用のルームの配る側が観戦を断っている（4403。観戦者だけに来る）。入り直しても変わらない。
+    Refused,
 }
 
 /// 画面の文言の種類（文そのものは dll の表が持つ）。
@@ -1039,6 +1019,7 @@ pub enum FailureKind {
     ChangeRoomName,
     Expired,
     PeerLeft,
+    Refused,
 }
 
 impl Failure {
@@ -1049,11 +1030,12 @@ impl Failure {
             Failure::RoomFull | Failure::BadRoomName => FailureKind::ChangeRoomName,
             Failure::Expired => FailureKind::Expired,
             Failure::PeerLeft => FailureKind::PeerLeft,
+            Failure::Refused => FailureKind::Refused,
         }
     }
 }
 
-/// 101 でない入口の応答を、上に知らせる失敗にコピーする。本文が番号に合うサーバーの JSON のときだけ 400 / 409 / 429 を
+/// 101 でない入口の応答を、dll へ知らせる失敗にコピーする。本文が番号に合うサーバーの JSON のときだけ 400 / 409 / 429 を
 /// ルーム名・待ちの扱いにし、ほかは全部「サーバーが応答しません」（無料枠を越えたときの Cloudflare の頁を含む）。
 pub fn classify_http(status: u16, body: &str) -> Failure {
     let parsed = read_http_error(body).ok();
@@ -1100,7 +1082,7 @@ pub enum Event {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// この文字をそのままテキストの文で送る。
+    /// サーバーへ、この文字をそのままテキストの文で送る。
     Send(String),
     Notify(Event),
 }
@@ -1119,6 +1101,8 @@ pub enum State {
     AwaitPeerCode,
     /// 返す側: `answer` を送った後、サーバーの 1000 を待っている。
     AwaitClose,
+    /// 始める側: `refuse` を送った後、ルームの期限（4408）までルームに残っている。
+    Refusing,
     Done,
     Failed(Failure),
 }
@@ -1134,7 +1118,7 @@ pub enum SubmitError {
 
 /// ルームサーバーのクライアントの手順（モジュールの doc の「順番」）。I/O をせず、送る文と出来事の列を返す。
 ///
-/// 使い方: 繋ぐ前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、繋がらなければ `on_transport_failed`。
+/// 使い方: 接続する前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、接続できなければ `on_transport_failed`。
 /// 以後、受けたテキストの文を `on_text`、閉じる番号を `on_close`、受信の誤りを `on_transport_failed` へ。
 /// [`RoomClient::next_wake`] の時刻か、それより前に `poll` を呼ぶ（ping と期限）。
 #[derive(Debug, Clone)]
@@ -1259,7 +1243,7 @@ impl RoomClient {
         self.fail(classify_http(status, body))
     }
 
-    /// 繋がらない（名前が引けない・時間切れ）・繋がった後に閉じる番号なしに切れた。
+    /// 接続できない（名前が引けない・時間切れ）・接続した後に閉じる番号なしに切れた。
     pub fn on_transport_failed(&mut self) -> Vec<Action> {
         match self.state {
             State::Done | State::Failed(_) => Vec::new(),
@@ -1276,6 +1260,7 @@ impl RoomClient {
             Some(CloseCode::Done) if self.state == State::AwaitClose => vec![self.finish()],
             Some(CloseCode::Expired) => self.fail(Failure::Expired),
             Some(CloseCode::PeerLeft) => self.fail(Failure::PeerLeft),
+            Some(CloseCode::Refused) => self.fail(Failure::Refused),
             _ => self.fail(Failure::Unresponsive(Why::Closed(code))),
         }
     }
@@ -1298,6 +1283,7 @@ impl RoomClient {
             (_, _, ServerMsg::Error { code }) => match code {
                 Some(CloseCode::Expired) => self.fail(Failure::Expired),
                 Some(CloseCode::PeerLeft) => self.fail(Failure::PeerLeft),
+                Some(CloseCode::Refused) => self.fail(Failure::Refused),
                 other => self.fail(Failure::Unresponsive(Why::ErrorMessage(other))),
             },
             (State::AwaitRoom, _, ServerMsg::Room { role, expires_at }) => {
@@ -1334,7 +1320,7 @@ impl RoomClient {
         }
     }
 
-    /// 自分のコードを渡す（始める側は `Joined` の後、返す側は `PeerCode` の後）。送る文を返す。
+    /// 自分のコードをサーバーへ送る（始める側は `Joined` の後、返す側は `PeerCode` の後）。送る文を返す。
     pub fn submit_code(&mut self, code: &str) -> Result<Vec<Action>, SubmitError> {
         let role = match (self.state, self.role) {
             (State::NeedOwnCode, Some(r)) => r,
@@ -1347,6 +1333,18 @@ impl RoomClient {
         let text = text.map_err(SubmitError::Code)?;
         self.state = next;
         Ok(vec![Action::Send(text)])
+    }
+
+    /// 観戦を断る（観戦用のルームの始める側が `Joined` の後、`offer` の代わりに）。以後はルームの期限（4408）まで残り、来る観戦者は
+    /// サーバーが 4403 で閉じる。断ったときは状態を変えない。
+    pub fn refuse(&mut self) -> Result<Vec<Action>, SubmitError> {
+        match (self.state, self.role) {
+            (State::NeedOwnCode, Some(Role::Offer)) => {
+                self.state = State::Refusing;
+                Ok(vec![Action::Send(REFUSE_TEXT.to_owned())])
+            }
+            (s, _) => Err(SubmitError::NotNow(s)),
+        }
     }
 
     /// 時計を進める。期限を過ぎていれば失敗、ping の時刻なら ping。
@@ -2199,6 +2197,7 @@ mod tests {
         assert_eq!(BadRoomName.kind(), FailureKind::ChangeRoomName);
         assert_eq!(Expired.kind(), FailureKind::Expired);
         assert_eq!(PeerLeft.kind(), FailureKind::PeerLeft);
+        assert_eq!(Refused.kind(), FailureKind::Refused);
 
         let mut c = RoomClient::new();
         assert_eq!(
@@ -2300,6 +2299,70 @@ mod tests {
         );
         assert_eq!(c.on_close(1000), vec![Action::Notify(Event::Done)]);
         assert_eq!(c.state(), State::Done);
+    }
+
+    #[test]
+    fn a_refusing_offer_side_stays_until_the_room_expires_and_only_the_offer_side_may_refuse() {
+        let mut c = RoomClient::new();
+        assert_eq!(
+            c.refuse(),
+            Err(SubmitError::NotNow(State::Connecting)),
+            "room の前"
+        );
+        joined(&mut c, ROOM_OFFER, 0);
+        assert_eq!(c.refuse(), Ok(vec![send(REFUSE_TEXT)]));
+        assert_eq!(REFUSE_TEXT, r#"{"t":"refuse"}"#);
+        assert_eq!(c.state(), State::Refusing);
+        assert_eq!(c.refuse(), Err(SubmitError::NotNow(State::Refusing)));
+        assert_eq!(
+            c.submit_code("OfferCode"),
+            Err(SubmitError::NotNow(State::Refusing)),
+            "断った後に offer を出さない"
+        );
+        // ping は続け、pong では終わらない。
+        assert_eq!(c.poll(t(PING_INTERVAL_MS)), vec![send(PING_TEXT)]);
+        assert_eq!(c.on_text(t(PING_INTERVAL_MS + 10), PONG_TEXT), vec![]);
+        assert!(!c.is_finished());
+        // ルームの期限の 4408 で終わる（配る側は入り直して、また断る）。
+        assert_eq!(
+            c.on_close(4408),
+            vec![Action::Notify(Event::Failed(Failure::Expired))]
+        );
+        // こちらの予備の期限でも同じ。
+        let mut c = RoomClient::new();
+        joined(&mut c, ROOM_OFFER, 0);
+        c.refuse().unwrap();
+        let d = c.deadline_at().expect("ルームの期限を持たない");
+        assert!(d >= 600_000, "{d}");
+        assert_eq!(
+            c.poll(t(d)),
+            vec![Action::Notify(Event::Failed(Failure::Expired))]
+        );
+        // 返す側（観戦者）は断れない。
+        let mut c = RoomClient::new();
+        joined(&mut c, ROOM_ANSWER, 0);
+        assert_eq!(c.refuse(), Err(SubmitError::NotNow(State::AwaitPeerCode)));
+        c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+        assert_eq!(c.refuse(), Err(SubmitError::NotNow(State::NeedOwnCode)));
+    }
+
+    #[test]
+    fn a_spectator_closed_with_4403_or_the_refused_error_fails_as_refused() {
+        for by_error in [false, true] {
+            let mut c = RoomClient::new();
+            joined(&mut c, ROOM_ANSWER, 0);
+            let got = if by_error {
+                c.on_text(t(30), r#"{"t":"error","code":"refused"}"#)
+            } else {
+                c.on_close(4403)
+            };
+            assert_eq!(
+                got,
+                vec![Action::Notify(Event::Failed(Failure::Refused))],
+                "{by_error}"
+            );
+            assert_eq!(c.on_close(4403), vec![], "二重に知らせる");
+        }
     }
 
     fn failed(why: Why) -> Vec<Action> {

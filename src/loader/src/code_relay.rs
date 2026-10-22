@@ -1,10 +1,9 @@
 //! 接続コードの受け渡しのウィンドウ（ini の `code_side = offer | answer` のとき）。
-//!
-//! ゲームを起こしたローダーのウィンドウが残り、dll が書く `my_code.txt` をクリップボードへコピーし、ウィンドウに貼られた相手のコードを
-//! `peer_code.txt` に置き、`status.txt` の状態を 1 行で出す。`my_code.txt` が消えるかゲームが終わると待ちをやめる
-//! （dll は終わり方によらず先に `my_code.txt` を消すので、文言ではなくこれで終わりを見る）。
+//! ゲームを起動したローダーのウィンドウが残り、dll が書く `my_code.txt` をクリップボードへコピーし、貼られた相手のコードを
+//! `peer_code.txt` に書き、`status.txt` の状態を 1 行で出す。`my_code.txt` が消えるかゲームが終わると待ちをやめる
+//! （dll は終わり方によらず先に消すので、文言ではなくこれで終わりを見る）。
 //! 相手のコードの前に `0`〜`8` か `delay` を打つと、対戦の形として `mode.txt` に書く。
-//! ファイル名・置き場・ini の読み方は dll と同じ値にする。ゲームのフォルダの中なら dll がネットワークの準備をしないのでウィンドウも開かない。
+//! ファイル名・フォルダ・ini の読み方は dll と同じ。ゲームのフォルダの中なら dll がネットワークの準備をしないのでウィンドウも開かない。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,7 +12,7 @@ use std::time::Duration;
 
 pub const INI_FILE: &str = "HiganRTool.ini";
 const SECTION: &str = "netplay";
-// ファイル名・置き場は dll と同じ値にするため core に置く。
+// ファイル名・フォルダは dll と同じ値にするため core に定義する。
 pub use higanr_core::code_files::{
     MAX_FILE_BYTES as MAX_READ, MODE_FILE, MODE_TMP_FILE, MY_CODE_FILE, PEER_CODE_FILE,
     PEER_TMP_FILE, POLL, STATUS_FILE,
@@ -42,7 +41,7 @@ pub struct Plan {
     pub dir: PathBuf,
 }
 
-// ---------------- ini と置き場（pure） ----------------
+// ---------------- ini とフォルダ（pure） ----------------
 
 /// dll が読む ini の場所。`--ini` → 親から継いだ環境変数 → DLL のフォルダの順（dll の `net_config::locate` と同じ）。
 /// 継いだ値が空・相対なら dll はネットワークの準備をしないので None。
@@ -96,7 +95,7 @@ pub const GAME_MENU_HINT: Tx = Tx {
     en: "Connect from Match Mode > 妖怪 対 妖怪 in the game.",
 };
 
-/// 置き場。`code_dir` が絶対ならそれ、相対なら DLL のフォルダから、無ければ DLL のフォルダの `code`。
+/// 受け渡しのフォルダ。`code_dir` が絶対ならそれ、相対なら DLL のフォルダから、無ければ DLL のフォルダの `code`。
 pub fn code_dir(dll_dir: &Path, setting: Option<&str>) -> PathBuf {
     higanr_core::code_files::code_dir_under(dll_dir, setting)
 }
@@ -118,7 +117,7 @@ pub fn is_same_or_inside(dir: &Path, root: &Path) -> bool {
     d == r || (d.starts_with(&r) && d[r.len()..].starts_with('\\'))
 }
 
-/// ウィンドウで受け渡すか。置き場がゲームのフォルダの中なら断る（ローダーが書けばゲームのフォルダに書くことになる）。
+/// ウィンドウで受け渡すか。フォルダがゲームのフォルダの中なら断る（ローダーが書けばゲームのフォルダに書くことになる）。
 pub fn plan(
     ini_text: Option<&str>,
     dll_dir: &Path,
@@ -133,8 +132,8 @@ pub fn plan(
         let shown = dir.display();
         return Err(by_lang!(
             lang,
-            ja: "接続コードの置き場{shown}がゲームのフォルダの中なので、このウィンドウでの受け渡しはしません",
-            en: "The connection code folder {shown} is inside the game folder, so codes are not exchanged in this window"
+            ja: "接続コードを保存するフォルダ（{shown}）がゲームのフォルダの中なので、このウィンドウでは接続コードの受け渡しをしません",
+            en: "The folder for saving connection codes ({shown}) is inside the game folder, so connection codes are not exchanged in this window"
         ));
     }
     Ok(Some(Plan { side, dir }))
@@ -149,7 +148,7 @@ fn bare(bytes: &[u8]) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// `status.txt` をウィンドウの 1 行にする。dll が書く見出し行（末尾が `:`）は落とし、残りを ` / ` で繋ぐ。
+/// `status.txt` をウィンドウの 1 行にする。dll が書く見出し行（末尾が `:`）は落とし、残りを ` / ` で連結する。
 pub fn status_line(bytes: &[u8]) -> Option<String> {
     let t = String::from_utf8_lossy(bytes);
     let mut lines: Vec<&str> = t
@@ -164,7 +163,7 @@ pub fn status_line(bytes: &[u8]) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join(" / "))
 }
 
-/// ゲームを起こす前のファイルの中身。前の回の残りを「新しく現れた」と取り違えないため。
+/// ゲームを起動する前のファイルの中身。前の回の残りを「新しく現れた」と取り違えないため。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Before {
     my_code: Option<String>,
@@ -186,8 +185,8 @@ pub const CLEARED_PEER: Tx = Tx {
 };
 
 pub const CLEANED_UP_MY_CODE: Tx = Tx {
-    ja: "残っていた自分の接続コードを消しました（中に鍵が入っているため）。",
-    en: "Deleted your leftover connection code (it contains a key).",
+    ja: "残っていた自分の接続コードを消しました（接続の認証に使う鍵が入っているため）。",
+    en: "Deleted your leftover connection code (it contains the key used to authenticate the connection).",
 };
 
 fn cannot_remove(p: &Path, e: &std::io::Error, lang: Lang) -> String {
@@ -195,7 +194,7 @@ fn cannot_remove(p: &Path, e: &std::io::Error, lang: Lang) -> String {
     by_lang!(lang, ja: "{shown}を消せません: {e}", en: "Cannot delete {shown}: {e}")
 }
 
-/// ゲームの強制終了で dll が消しそびれた `my_code.txt`（始める側の秘密を含む）を消す。`peer_code.txt` と `status.txt` は残す。
+/// ゲームの強制終了で dll が消しそびれた `my_code.txt`（始める側（offer）の秘密を含む）を消す。`peer_code.txt` と `status.txt` は残す。
 pub fn cleanup_leftover_my_code(dir: &Path, lang: Lang) -> Result<bool, String> {
     let p = dir.join(MY_CODE_FILE);
     match std::fs::remove_file(&p) {
@@ -205,7 +204,7 @@ pub fn cleanup_leftover_my_code(dir: &Path, lang: Lang) -> Result<bool, String> 
     }
 }
 
-/// 前の回の `peer_code.txt`（と `.tmp`）を消す。残っていると dll が最初の回に読み、期限内なら古い相手へ繋ぎにいくため。
+/// 前の回の `peer_code.txt`（と `.tmp`）を消す。残っていると dll が最初の回に読み、期限内なら古い相手へ接続しにいくため。
 pub fn clear_stale_peer(dir: &Path, lang: Lang) -> Result<bool, String> {
     let mut removed = false;
     for name in [PEER_CODE_FILE, PEER_TMP_FILE] {
@@ -219,7 +218,7 @@ pub fn clear_stale_peer(dir: &Path, lang: Lang) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// 起動前の準備: 前の回の相手のコードを片づけ、置き場の中身を書き留める。片づけられなくても起動はやめない。
+/// 起動前の準備: 前の回の相手のコードを片づけ、フォルダの中身を書き留める。片づけられなくても起動はやめない。
 pub fn before_launch(plan: &Plan, lang: Lang) -> (Before, Option<String>) {
     let peer = match clear_stale_peer(&plan.dir, lang) {
         Ok(true) => Some(format!("HiganRTool: {}", CLEARED_PEER.get(lang))),
@@ -343,7 +342,7 @@ pub const REFUSE_SAME: Tx = Tx {
     en: "This code was already received (the result appears on the Status line).",
 };
 
-/// `own` はウィンドウに出した自分のコード、`last` は前に置いた相手のコード。
+/// `own` はウィンドウに出した自分のコード、`last` は前に書いた相手のコード。
 pub fn judge_paste(line: &str, own: Option<&str>, last: Option<&str>) -> Paste {
     let Some(t) = bare(line.as_bytes()) else {
         return Paste::Ignore;
@@ -427,7 +426,7 @@ pub fn pick_reply(pick: Pick, ini: Shape, placed: bool, lang: Lang) -> String {
 }
 
 pub const REFUSE_SHORT: Tx = Tx {
-    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら0〜8の数字かdelayのどれかを入力してください。接続コードなら途中で切れていないか確かめて、1行で全部貼ってください。",
+    ja: "HiganRTool: 短すぎて、接続コードとしても同期方式としても読めません。同期方式なら0〜8の数字かdelayのどれかを入力してください。接続コードなら途中で切れていないかチェックして、1行で全部貼ってください。",
     en: "HiganRTool: Too short to be a connection code or a netcode choice. For a netcode, type a number 0-8 or delay. For a connection code, check that it was not cut off and paste all of it on one line.",
 };
 
@@ -460,7 +459,7 @@ pub fn write_peer_code(dir: &Path, code: &str, lang: Lang) -> Result<(), String>
     )
 }
 
-/// `mode.txt` に置く。`pid` が合うときだけ dll が採る。
+/// `mode.txt` に書く。`pid` が合うときだけ dll が採る。
 pub fn write_mode_file(dir: &Path, pid: u32, pick: Pick, lang: Lang) -> Result<(), String> {
     replace_file(
         dir,
@@ -560,7 +559,7 @@ impl Relay {
         self
     }
 
-    /// 同じ PC で 2 台起こす開発の回で、使っている人のクリップボードを書き換えないため。
+    /// 同じ PC で 2 台起動する開発の回で、使っている人のクリップボードを書き換えないため。
     pub fn without_clipboard(mut self) -> Relay {
         self.clipboard = false;
         self
@@ -585,8 +584,8 @@ impl Relay {
         let dir = self.plan.dir.display();
         let mut s = by_lang!(
             lang,
-            ja: "HiganRTool: このウィンドウで接続コードをやり取りします。{todo}\nHiganRTool: （コードの置き場: {dir}）",
-            en: "HiganRTool: Connection codes are exchanged in this window. {todo}\nHiganRTool: (Code folder: {dir})"
+            ja: "HiganRTool: このウィンドウで接続コードをやり取りします。{todo}\nHiganRTool: （接続コードの保存先: {dir}）",
+            en: "HiganRTool: Connection codes are exchanged in this window. {todo}\nHiganRTool: (Connection codes are saved in: {dir})"
         );
         if let Some(m) = &self.mode {
             s.push('\n');
@@ -614,7 +613,7 @@ impl Relay {
                 }
                 continue;
             }
-            // 短すぎる文字（`3`・`rollback`・打ち間違い）は置かない。置くと dll が「字が欠けている」と言い、選択のつもりの人に原因が伝わらない。
+            // 短すぎる文字（`3`・`rollback`・打ち間違い）は書かない。書くと dll が「文字が欠けている」と言い、選択のつもりの人に原因が伝わらない。
             if self.mode.is_some()
                 && let Some(t) = bare(line.as_bytes())
                 && t.chars().count() < higanr_core::code::MIN_CODE_CHARS
@@ -733,7 +732,7 @@ impl Relay {
 }
 
 /// ウィンドウの手順を終わるまで回す。標準入力の読みは別スレッドで止まってよく、ここは `poll` ごとにファイルとゲームを見る。
-/// 貼られた行は `poll` を待たずに置く。
+/// 貼られた行は `poll` を待たずに書く。
 pub fn run(
     relay: &mut Relay,
     host: &mut dyn Host,
@@ -771,7 +770,7 @@ pub const AFTER_FINISH: Tx = Tx {
     en: "HiganRTool: The connection code exchange is already finished. To start over, close Touhou 9 and start it again.",
 };
 
-/// 受け渡しを終えた後、ゲームが終わるまでウィンドウを残す。ショートカットから起こすとウィンドウごと消え、最後の状態の行が読めなくなるため。
+/// 受け渡しを終えた後、ゲームが終わるまでウィンドウを残す。ショートカットから起動するとウィンドウごと消え、最後の状態の行が読めなくなるため。
 pub fn linger(host: &mut dyn Host, pasted: &Receiver<String>, poll: Duration, lang: Lang) -> End {
     host.say(LINGER.get(lang));
     let mut open = true;
@@ -834,21 +833,21 @@ pub fn send_files_line(log: Option<&str>, csv: Option<&str>, lang: Lang) -> Stri
             if let Some(c) = csv {
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}\\{l}と{LOGS_DIR}\\{c}",
-                    en: "HiganRTool: Files to send: {LOGS_DIR}\\{l} and {LOGS_DIR}\\{c}"
+                    ja: "HiganRTool: 開発者に送ってほしいファイル: {LOGS_DIR}\\{l}と{LOGS_DIR}\\{c}",
+                    en: "HiganRTool: Files to send to the developer: {LOGS_DIR}\\{l} and {LOGS_DIR}\\{c}"
                 )
             } else {
                 by_lang!(
                     lang,
-                    ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}\\{l}",
-                    en: "HiganRTool: File to send: {LOGS_DIR}\\{l}"
+                    ja: "HiganRTool: 開発者に送ってほしいファイル: {LOGS_DIR}\\{l}",
+                    en: "HiganRTool: File to send to the developer: {LOGS_DIR}\\{l}"
                 )
             }
         }
         None => by_lang!(
             lang,
-            ja: "HiganRTool: 送ってほしいファイル: {LOGS_DIR}フォルダの一番新しいdll_…logと、同じ名前で始まる{NET_FRAMES_SUFFIX}",
-            en: "HiganRTool: Files to send: the newest dll_...log in the {LOGS_DIR} folder, and the {NET_FRAMES_SUFFIX} file whose name starts the same"
+            ja: "HiganRTool: 開発者に送ってほしいファイル: {LOGS_DIR}フォルダの一番新しいdll_…logと、同じ名前で始まる{NET_FRAMES_SUFFIX}",
+            en: "HiganRTool: Files to send to the developer: the newest dll_...log in the {LOGS_DIR} folder, and the {NET_FRAMES_SUFFIX} file whose name starts the same"
         ),
     }
 }
@@ -1006,7 +1005,7 @@ pub fn farewell(
 
 #[cfg(test)]
 mod tests {
-    //! 一時ディレクトリだけを使い、クリップボードは偽物。
+    //! 一時フォルダだけを使い、クリップボードは偽物。
     use super::*;
     use higanr_core::code;
     use higanr_core::lang::has_japanese;
@@ -1738,12 +1737,12 @@ mod tests {
         let both = send_files_line(Some(log), Some(csv), Lang::Ja);
         assert_eq!(
             both,
-            "HiganRTool: 送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.logとlogs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"
+            "HiganRTool: 開発者に送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.logとlogs\\dll_20260929-091738-034_pid2944_net_frames.csv.gz"
         );
         let only = send_files_line(Some(log), None, Lang::Ja);
         assert_eq!(
             only,
-            "HiganRTool: 送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.log"
+            "HiganRTool: 開発者に送ってほしいファイル: logs\\dll_20260929-091738-034_pid2944.log"
         );
         let none = send_files_line(None, None, Lang::Ja);
         assert!(
@@ -1793,8 +1792,6 @@ mod tests {
         )
     }
 
-    /// 壊れたら落ちる: 日ごとの本ログ（同じ日の複数の実行が並ぶ）で、自分の実行でない行の「うまくいかなかった」印を拾う・
-    /// 自分の実行の CSV の名前を日ごとの名前から作る・前の日のファイルの実行を探さない・PID の最後の実行でなく最初を使う。
     #[test]
     fn the_daily_log_is_read_by_the_run_of_the_pid() {
         let d = temp_dir("daily_logs");
@@ -1846,7 +1843,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 日ごとの本ログの末尾だけを読んで、上限より前にある実行を見失う、または実行の本文を上限なしに読む。
     #[test]
     fn a_run_far_from_the_tail_of_a_big_daily_log_is_found_and_read_up_to_the_limit() {
         let d = temp_dir("daily_big");
@@ -1878,7 +1874,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 日ごとの本ログを書いている最中（DLL と同じ共有の指定で開いた書き込みの持ち主がいる）に、ローダーが既定の共有で読めない。
     #[test]
     fn the_daily_log_is_readable_while_the_dll_holds_it_open() {
         use std::io::Write;
@@ -1905,8 +1900,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 簡潔なログでうまくいかなかった回に「もっと詳しい記録が要るとき」の案内が付かない。何も無かった回・詳細な
-    /// ログ・印の無いログに付く。案内が利用者向けの言葉の規則（内部の語・括弧）を破る。英語の回に日本語が混ざる。
+    /// 案内の文が内部の語・括弧を含まないことと、英語の回に日本語が混ざらないこともチェックする。
     #[test]
     fn the_more_detail_hint_is_only_for_a_brief_log_of_a_run_that_went_wrong() {
         use higanr_core::log_cfg::{BRIEF_MARK, DETAIL_MARK};
@@ -1919,7 +1913,7 @@ mod tests {
         let logs_by_pid: Vec<(u32, String)> = vec![
             (1, brief("〇 パニック: 受けていない\n")),
             (2, brief("× 同期: CHECK がずれた\n")),
-            (3, brief("終了: パニックを受けて止めた（x）\n")),
+            (3, brief("終了: パニックを受けて止めました（x）\n")),
             (4, brief("ネットワーク: CHECK のズレ: 自分の CHECK\n")),
             (5, brief("★★★ コピーの表を置かない\n")),
             (
@@ -2376,7 +2370,7 @@ mod tests {
         tx2.send(String::new()).unwrap();
         farewell(&mut ended, &rx2, &logs, 9, true, Lang::En);
         assert!(ended.said[0].contains("This window closes when you close Touhou 9"));
-        assert!(ended.said[1].starts_with("HiganRTool: File to send: logs\\dll_"));
+        assert!(ended.said[1].starts_with("HiganRTool: File to send to the developer: logs\\dll_"));
         assert_eq!(ended.said[2], CLOSE_HINT.en);
         for l in h.said.iter().chain(&ended.said) {
             assert!(!has_japanese(l), "英語の回に日本語: {l}");

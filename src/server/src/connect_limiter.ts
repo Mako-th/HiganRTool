@@ -1,8 +1,8 @@
-// 繋ぐ回数を数える Durable Object。鍵（IPv4 または IPv6 の /64。rules.ts の connectLimitKey）ごとに 1 つ（idFromName）。
+// 接続の回数を数える Durable Object。鍵（IPv4 または IPv6 の /64。rules.ts の connectLimitKey）ごとに 1 つ（idFromName）。
 // 入口（index.ts）がルームの Durable Object へ渡す前に hit() を 1 回呼ぶ。数え方と理由は rules.ts の slideConnectWindow。
 //
 // 許した時刻（最大 CONNECT_LIMIT_PER_MINUTE 個）をストレージに 1 つの値として持つ。メモリだけにしないのは、使われていない
-// Durable Object は数秒で退去してメモリの数えが消え、「上限回つないで、退去を待って次の上限回」で 60 秒に上限の 2 倍通せてしまうため。
+// Durable Object は数秒で退去してメモリの数えが消え、「上限回接続して、退去を待って次の上限回」で 60 秒に上限の 2 倍通せてしまうため。
 // 書くのは許した回だけ（叩かれても書き込みが増えない）。古い IP の行は、最後の許した回の 60 秒後のアラームで全部消す。
 // ログには何も書かない（鍵は IP なので）。
 
@@ -16,7 +16,7 @@ export class ConnectLimiter extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // 起きたときに前の数えを読み直す（読み終わるまで他の要求を入れない）。
+    // 起動したときに前の数えを読み直す（読み終わるまで他の要求を入れない）。
     void ctx.blockConcurrencyWhile(async () => {
       this.stamps = (await ctx.storage.get<number[]>(KEY)) ?? [];
     });

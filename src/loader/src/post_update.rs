@@ -1,9 +1,9 @@
-//! 更新して起こし直した初回だけの仕事。ini を配る ini の形に合わせ、変更点を出して Enter を待つ。
+//! 更新して起動し直した初回だけの仕事。ini を配る ini の形に合わせ、変更点を出して Enter を待つ。
 //!
-//! - 呼ぶのは配るバージョンの、人が起こした初回（`update::start_with`）だけ。台本・開発用の引数の起動、ツールがゲームのフォルダの中の
+//! - 呼ぶのは配るバージョンの、人が起動した初回（`update::start_with`）だけ。台本・開発用の引数の起動、ツールがゲームのフォルダの中の
 //!   起動では呼ばない。
 //! - ini の値は引き継ぐ（`higanr_core::ini_upgrade`）。読めない行があるなど安全に合わせられないときは、ini に触らない。
-//! - Enter を待つのは、標準入力も出力もコンソールのときだけ（`Host::interactive`）。パイプや検査の道具からの起動では待たない。
+//! - Enter を待つのは、標準入力も出力もコンソールのときだけ（`Host::interactive`）。パイプや検査のツールからの起動では待たない。
 
 use std::path::Path;
 
@@ -112,7 +112,7 @@ fn unsafe_text(up: &Upgraded, lang: Lang) -> String {
         let list = names(&up.lost);
         return by_lang!(
             lang,
-            ja: "{INI_FILE}を新しい形に合わせた結果を確かめられなかったので（{list}）、今のまま使います。",
+            ja: "{INI_FILE}を新しい形に合わせた結果をチェックできなかったので（{list}）、今のまま使います。",
             en: "Could not verify {INI_FILE} after updating it to the new layout ({list}). Keeping it as it is."
         );
     }
@@ -208,7 +208,6 @@ mod tests {
         dir
     }
 
-    // 壊れたら落ちる: 更新で利用者の設定（名前・ウィンドウの大きさ）が雛形の値に戻る、または新しいキーが入らない。
     #[test]
     fn the_ini_is_rewritten_in_the_new_layout_keeping_the_users_values() {
         let dir = temp_dir("rewrite");
@@ -262,8 +261,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 前のバージョンの既定値のままの設定が新しい既定値にならない（古い値が固定される）、
-    // または利用者が変えた値まで新しい既定値に戻る。数を画面に言わない。
     #[test]
     fn settings_still_at_the_old_defaults_take_the_new_defaults() {
         let new_template = TEMPLATE.replace("enable = 1", "enable = 2");
@@ -300,7 +297,6 @@ mod tests {
         }
     }
 
-    // 壊れたら落ちる: ini が無いのに作る（DLL が書き出す既定と取り合う）、読めない行のある ini を黙って書き換えて行を失う。
     #[test]
     fn no_ini_means_nothing_and_an_unreadable_ini_is_left_alone() {
         let dir = temp_dir("leave");
@@ -331,7 +327,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: すでに新しい形の ini を毎回書き直す・「合わせました」と言う。
     #[test]
     fn an_ini_already_in_the_new_layout_is_not_touched_or_announced() {
         let dir = temp_dir("same");
@@ -355,7 +350,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("後片づけ");
     }
 
-    // 壊れたら落ちる: 検査の道具・台本の起動でも Enter を待って止まる／人の起動で待たずに流れてしまう。
     #[test]
     fn enter_is_awaited_only_on_a_human_console() {
         let mut human = Rec {
@@ -384,7 +378,6 @@ mod tests {
         assert_eq!((empty.waits, empty.shown.len()), (0, 0), "空の文で待った");
     }
 
-    // 壊れたら落ちる: 英語の画面に日本語の変更点・日本語の Enter の案内が出る。
     #[test]
     fn the_notes_and_the_prompt_follow_the_language() {
         for lang in Lang::ALL {

@@ -1,8 +1,8 @@
 //! 観戦の「ランダムマッチ」の一覧の接続: メニューが一覧の画面を開いている間だけ動くスレッド `higanr-watchlist`。
 //!
-//! 一覧の見る口へ繋ぎ（`net_room::ViewListConn`）、届いた一覧の全体を `UiLink` の入れ物へ置く。ゲームのスレッドは入れ物を読むだけで、
-//! 確保も待ちもこのスレッドと `ViewListConn` の受信スレッドの側（マッチ中は動かないので、対戦者への遅延の増分は 0）。
-//! 一覧の画面を出たら止める（`stop`）。繋げなかった・切れたときは「取得できなかった」を置いて終わる（入り直すのは人が画面を開き直す）。
+//! 一覧の接続先は見る口（`net_room::ViewListConn`）。届いた一覧の全体を `UiLink` の入れ物へ書く。ゲームのスレッドは入れ物を読むだけで、
+//! 確保も待ちもこのスレッドと `ViewListConn` の受信スレッドの側（マッチ中は動かないので、相手への遅延の増分は 0）。
+//! 一覧の画面を出たら止める（`stop`）。接続できなかった・切れたときは「取得できなかった」を書いて終わる（入り直すのは人が画面を開き直す）。
 //! 本ログには一覧の中身（名前・観戦用のルーム名）を書かない。
 #![forbid(unsafe_code)]
 
@@ -20,7 +20,7 @@ use crate::net_ui::UiLink;
 /// 一覧の接続のスレッドが `poll` する間隔（見張り `net_code_game::GAME_POLL` と同じ 50 ms）。
 const POLL: Duration = Duration::from_millis(50);
 
-/// 世代は `UiLink` が持つ（止めた古いスレッドが、後から開いた一覧の入れ物へ書かないための印。置く直前に自分の世代と比べる）。
+/// 世代は `UiLink` が持つ（止めた古いスレッドが、後から開いた一覧の入れ物へ書かないための印。書く直前に自分の世代と比べる）。
 pub struct WatchFeed {
     link: Arc<UiLink>,
     stop: Arc<AtomicBool>,
@@ -28,7 +28,7 @@ pub struct WatchFeed {
 }
 
 impl WatchFeed {
-    /// 一覧の接続のスレッドを起こす。入れ物へまず「取得中」を置く。起こせなければ誤りの文。
+    /// 一覧の接続のスレッドを作る。入れ物へまず「取得中」を書く。作れなければ誤りの文。
     pub fn start(link: Arc<UiLink>, opts: RoomOptions, build: u32) -> Result<WatchFeed, String> {
         let generation = link.next_watch_generation();
         let stop = Arc::new(AtomicBool::new(false));
@@ -38,7 +38,7 @@ impl WatchFeed {
         let thread = std::thread::Builder::new()
             .name("higanr-watchlist".into())
             .spawn(move || {
-                // パニックは受けて外へ出さない。受けたら「取得できなかった」を置く。
+                // パニックは受けて外へ出さない。受けたら「取得できなかった」を書く。
                 let r = catch_unwind(AssertUnwindSafe(|| {
                     run(&owner, &opts, build, &st, generation)
                 }));
@@ -46,7 +46,7 @@ impl WatchFeed {
                     publish(&owner, generation, ListStatus::Failed, &[]);
                 }
             })
-            .map_err(|e| format!("観戦の一覧のスレッドを起こせない: {e}"))?;
+            .map_err(|e| format!("観戦の一覧のスレッドの作成不能: {e}"))?;
         Ok(WatchFeed {
             link,
             stop,
@@ -81,7 +81,7 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
     let mut conn: ViewListConn = match ViewListConn::start_view(opts, build) {
         Ok(c) => c,
         Err(e) => {
-            crate::main_log::push(format!("観戦の一覧: 接続を始められなかった（{e}）"));
+            crate::main_log::push(format!("観戦の一覧: 接続を始められませんでした（{e}）。"));
             publish(link, generation, ListStatus::Failed, &[]);
             return;
         }
@@ -96,7 +96,7 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
                     if skipped > 0 && !skipped_logged {
                         skipped_logged = true;
                         crate::main_log::push(format!(
-                            "観戦の一覧: サーバーの決まりに合わない行を {skipped} 件捨てた"
+                            "観戦の一覧: サーバーの決まりに合わない行を {skipped} 件捨てました。"
                         ));
                     }
                     publish(link, generation, ListStatus::Ready, &rows);
@@ -114,12 +114,12 @@ fn run(link: &UiLink, opts: &RoomOptions, build: u32, stop: &AtomicBool, generat
     conn.cancel();
 }
 
-/// 取得できなかったときの本ログの 1 行。運びの記録は WinHTTP の段階名と番号だけで、ルーム名・アドレスは含まない。
+/// 取得できなかったときの本ログの 1 行。運び（通信）の記録は WinHTTP の段階名と番号だけで、ルーム名・アドレスは含まない。
 fn failure_line(f: &impl std::fmt::Debug, notes: &[TransportNote]) -> String {
     if notes.is_empty() {
-        format!("観戦の一覧: 取得できなかった（{f:?}）")
+        format!("観戦の一覧: 取得不能（{f:?}）")
     } else {
-        format!("観戦の一覧: 取得できなかった（{f:?}）運び {notes:?}")
+        format!("観戦の一覧: 取得不能（{f:?}）運び {notes:?}")
     }
 }
 

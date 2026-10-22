@@ -4,9 +4,9 @@
 //! 行の番号は変わらない。捨てた行は `IniNote` に残し、ログとメニューの 1 行に出す。
 //!
 //! - 書き方の誤り（`=` が無い・見出しが閉じない・キーが空・同じキーが 2 回）はどの節でも捨てる。
-//! - 値の誤り・知らないキーは、利用者が触る節（`CHECKED`）だけ、その節を読む関数で確かめて捨てる。
+//! - 値の誤り・知らないキーは、利用者が触る節（`CHECKED`）だけ、その節を読む関数で検証して捨てる。
 //!   `[netplay]` と `[spectate]` は、キーごとの既定を持つ dll の `net_config` が読むときに注を足す。
-//! - 実験用の節は確かめない（誤りは従来どおり、その節を読む側が断る）。
+//! - 実験用の節は検証しない（誤りは従来どおり、その節を読む側が断る）。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
@@ -52,7 +52,7 @@ impl IniNote {
             line: 0,
             section: String::new(),
             key: String::new(),
-            why: "UTF-8 でないので Shift_JIS（CP932）として読み直した".to_string(),
+            why: "UTF-8 でないので Shift_JIS（CP932）として読み直しました".to_string(),
         }
     }
 
@@ -66,7 +66,7 @@ impl IniNote {
                     (false, false) => format!(" [{}] {}", self.section, self.key),
                 };
                 format!(
-                    "HiganRTool.ini の {} 行目{at} を読めない（{}）。この行は使わず、既定値で動かす",
+                    "HiganRTool.ini の {} 行目{at} 読み込み不能（{}）。この行は使わず既定値で動きます。",
                     self.line, self.why
                 )
             }
@@ -88,7 +88,7 @@ fn parsed(t: &str) -> Result<ini::Ini, String> {
     ini::parse(t).map_err(|e| e.to_string())
 }
 
-/// 値を確かめる節と、その節を読む関数。
+/// 値を検証する節と、その節を読む関数。
 const CHECKED: [(&str, Check); 6] = [
     (pacing::SECTION, |t| {
         pacing::mode_from_ini(&parsed(t)?).map(|_| ())
@@ -206,20 +206,25 @@ mod tests {
         assert_eq!(c.text, DIST);
     }
 
-    /// 配る ini の `[pacing] mode` を手で替えても、配った行は 1 行も断られない。`auto_window` は注なので、
-    /// 外して書いたときだけ（`mode = auto` 以外では）その 1 行が断られる。
+    /// 配る ini の `[pacing] mode` を手で替えても、配った行（`wait`・`vsync` を含む）は 1 行も断られない。
+    /// 名前を替える前の `auto_window` は知らないキーとして、その 1 行だけ断られる。
     #[test]
     fn changing_the_pacing_mode_by_hand_drops_nothing_from_the_shipped_ini() {
-        let changed = DIST.replace("\nmode = auto\n", "\nmode = game\n");
-        assert_ne!(changed, DIST);
-        assert_eq!(
-            clean(&changed).notes,
-            vec![],
-            "配った行は mode を替えても使える"
+        for mode in ["game", "b", "b-spin", "b-hybrid", "vpatch", "cycle"] {
+            let changed = DIST.replace("\nmode = auto\n", &format!("\nmode = {mode}\n"));
+            assert_ne!(changed, DIST);
+            assert_eq!(
+                clean(&changed).notes,
+                vec![],
+                "配った行は mode = {mode} にしても使える"
+            );
+        }
+        let old = DIST.replace(
+            "\nwait = passive\n",
+            "\nwait = passive\nauto_window = b-hybrid\n",
         );
-        let opened = changed.replace("; auto_window = b-hybrid", "auto_window = b-hybrid");
-        assert_ne!(opened, changed);
-        let c = clean(&opened);
+        assert_ne!(old, DIST);
+        let c = clean(&old);
         assert_eq!(c.notes.len(), 1, "{:?}", c.notes);
         assert_eq!(
             (c.notes[0].section.as_str(), c.notes[0].key.as_str()),

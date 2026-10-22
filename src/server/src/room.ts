@@ -1,6 +1,6 @@
 // ルーム 1 つ = Durable Object 1 つ（ルーム名から idFromName）。1 ルーム 2 人（始める側 host・入る側 guest）。
 //
-// 状態は WebSocket の attachment にだけ置く（ストレージにもインスタンスの変数にも置かない）。Hibernation で眠ると変数は消えるが
+// 状態は WebSocket の attachment にだけ保存する（ストレージにもインスタンスの変数にも保存しない）。Hibernation で眠ると変数は消えるが
 // attachment は残り、接続コード（認証の秘密を含む）も WebSocket が閉じれば消える。ストレージに書くのは期限のアラームだけ。
 // ログ（console）には何も書かない（コードも、利用者の打ったルーム名も出さない）。
 
@@ -13,6 +13,7 @@ import {
   PING_TEXT,
   PONG_TEXT,
   type ServerMessage,
+  isWatchRoomPath,
   parseClientId,
   parseClientMessage,
   roomTtlForPath,
@@ -35,6 +36,10 @@ interface Att {
   cid: string | null;
   /** host だけ: 相手が揃ったことを知らせた（matched を送った）。guest が入れ替わっても 2 度は送らない。 */
   matched: boolean;
+  /** host だけ: 観戦を断った（refuse を受けた）。断った host はルームに残し、来る guest を断り続ける。 */
+  refused?: boolean;
+  /** 観戦用のルームか（`w.` の名）。refuse は観戦用のルームの host だけが送れる。 */
+  watch?: boolean;
 }
 
 const OPEN = 1;
@@ -42,7 +47,7 @@ const OPEN = 1;
 export class Room extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // 生存の確かめは Durable Object を起こさずに返す（起きた時間だけ課金されるため）。
+    // 生存のチェックは Durable Object を起動せずに返す（起動していた時間だけ課金されるため）。
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING_TEXT, PONG_TEXT));
   }
 
@@ -52,7 +57,8 @@ export class Room extends DurableObject<Env> {
     this.expireIfDue(now);
 
     // 同じ利用者の入り直し: 届かなかった前の入室が残っていても 3 人目にしない（クライアントは届く前に失敗扱いにして入り直す）。
-    const cid = parseClientId(new URL(req.url).searchParams.get(CLIENT_ID_PARAM));
+    const url = new URL(req.url);
+    const cid = parseClientId(url.searchParams.get(CLIENT_ID_PARAM));
     if (cid !== null) await this.dropStale(cid);
 
     const live = this.live();
@@ -60,12 +66,12 @@ export class Room extends DurableObject<Env> {
     let deadline: number;
     if (live.length === 0) {
       role = "host";
-      deadline = now + roomTtlForPath(new URL(req.url).pathname);
+      deadline = now + roomTtlForPath(url.pathname);
     } else if (live.length === 1 && att(live[0]).role === "host") {
       role = "guest";
       deadline = att(live[0]).deadline;
     } else {
-      // 3 人目。WebSocket を張らずに断る（張ってから断ると、その分だけ起きている時間が延びる）。
+      // 3 人目。WebSocket を張らずに断る（張ってから断ると、その分だけ起動している時間が延びる）。
       return Response.json({ error: "room_full" }, { status: 409 });
     }
 
@@ -73,9 +79,23 @@ export class Room extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [role]);
-    const a: Att = { role, deadline, code: null, gotPeer: false, done: false, cid, matched: false };
+    const a: Att = {
+      role,
+      deadline,
+      code: null,
+      gotPeer: false,
+      done: false,
+      cid,
+      matched: false,
+      watch: isWatchRoomPath(url.pathname),
+    };
     server.serializeAttachment(a);
     send(server, { t: "room", role, expires_at: toSecs(deadline) });
+    if (role === "guest" && att(live[0]).refused === true) {
+      // 観戦を断っている host のルームへ入った。コードは渡さず、断りの印つきで閉じる。host は残す（fail は host を閉じない）。
+      await this.fail(server, Close.Refused);
+      return new Response(null, { status: 101, webSocket: client });
+    }
     if (role === "guest") this.tryMatch(now);
     await this.scheduleAlarm();
     return new Response(null, { status: 101, webSocket: client });
@@ -91,13 +111,29 @@ export class Room extends DurableObject<Env> {
     }
     if (p.kind === "offer") {
       // offer は host が 1 回だけ。guest のコードのタグは host のコードから作る鍵で付くので、先に host のコードが要る。
-      if (a.role !== "host" || a.code !== null) {
+      // 断った host は offer を出さない（断りと offer が両方来ると、guest の入り方が決まらないため）。
+      if (a.role !== "host" || a.code !== null || a.refused === true) {
         await this.fail(ws, Close.BadMessage);
         return;
       }
       a.code = p.code;
       ws.serializeAttachment(a);
       this.tryMatch(Date.now());
+      await this.scheduleAlarm();
+      return;
+    }
+    if (p.kind === "refuse") {
+      // 観戦の断りは、観戦用のルームの host が offer の前に 1 回だけ。対戦のルーム・offer の後・guest からは誤り。
+      if (a.role !== "host" || a.watch !== true || a.code !== null || a.refused === true) {
+        await this.fail(ws, Close.BadMessage);
+        return;
+      }
+      a.refused = true;
+      ws.serializeAttachment(a);
+      // 待っている guest は、コードを受けないまま断る。host は閉じない（ルームの期限まで、来る guest を断り続ける）。
+      for (const w of this.live()) {
+        if (att(w).role === "guest") closeWith(w, Close.Refused, true);
+      }
       await this.scheduleAlarm();
       return;
     }

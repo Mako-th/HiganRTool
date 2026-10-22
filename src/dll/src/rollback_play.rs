@@ -1,40 +1,12 @@
 //! rollback のモードの製品の経路の部品（pure。unsafe 無し。Win32・ゲームのメモリ・入口のアセンブリは `rollback_play_win.rs` と `rollback_win.rs`）。
 //!
-//! 中身は 3 つ:
-//! - [`GameWindow`]: 本物の花映塚のための `higanr_core::rollback::Window`。コピー（決まった塊・`.data` の範囲・DLL の領域の使った所・
-//!   更新の列のつなぎ（レジストリの先頭の 2 つの節 0x40 B））と、コピーのときにバックアップする Supervisor の `+0x58C` / `+0x590`、書き戻し、
-//!   更新だけを 1 回回す tick（走査を 1 回呼ぶ形）、進め直しの前後の SE・BGM・文字の数のバックアップと戻し。
-//! - 入口の手順 [`scan_point_with`] / [`post_present_with`]: 状態機械を 1 フレームぶん進める。状態機械は [`Machine`] のインターフェースの向こう
-//!   （本物は `netplay/rollback.rs` の `NpMachine`、検査は `Rollback` そのもの）。
-//! - 設置の手順 [`install_play`]: 確保・解放の 3 入口 ＋ calloc ＋ 走査の call を、期待バイト列が全部合ったときだけ書く。
+//! - [`GameWindow`]: 本物の花映塚のための `higanr_core::rollback::Window`。コピー（決まった塊・`.data` の範囲・DLL の領域の使った所・更新の列のリンク（レジストリの先頭の 2 つの節 0x40 B））と、コピーのときにバックアップする Supervisor の `+0x58C` / `+0x590`、書き戻し、更新だけを 1 回回す tick、進め直しの前後の SE・BGM・文字の数のバックアップと戻し。
+//! - 入口の手順 [`scan_point_with`] / [`post_present_with`]: 状態機械を 1 フレームぶん進める。状態機械は [`Machine`] のインターフェースの向こう（本物は `netplay/rollback.rs` の `NpMachine`、検査は `Rollback` そのもの）。設置の手順 [`install_play`]: 確保・解放の 3 入口 ＋ calloc ＋ 走査の call を、期待バイト列が全部合ったときだけ書く。
+//! - 入力の地点は do_frame の走査の call `0x0042DCA9` の包み（走査の直前・走査の外）に設ける。花映塚の入力の地点 `0x0043112D` は更新の走査の中（優先度 0 の Supervisor::on_tick の先頭）にあり、そこから走査を呼び直すと再入するうえ、その tick の残りは入口から戻った後に走るので結果をその場で返せないため。1 回の tick = 「feed する語を指図して走査を 1 回呼ぶ」で、走査の中の入力の地点は指図された語を feed するだけ（[`Order`]）。待つフレームは、語を「描画だけ」にして走査を 1 回呼ぶ（入力の地点が描画だけの出口 `0x431259` へ抜ける）。走査の call と入力の地点の間にあるのは走査の臨界区間と Supervisor の先頭（`0x431116` の `+0x478 = 0` と `0x43111C` の NetworkManager のチェック）だけで、同じフレームの数 µs 前（推定）。
+//! - 境目（`TickReport::boundary`）: 次の場面の要求が立った（Supervisor `+0x590` ≠ `+0x58C`）・走査が 0 か負の値を返した（異常。1 は一時停止の tick を含め普通）・入力の地点が指図の入力ワードを受け取らなかった・確定していない tick で更新の列・描画の列の並びが変わった（確定した tick の並びの変化は境目にしない。ラウンドの終わりは場面の終わりではない）。書き戻しの後は並びがコピーのときと同じかを検証し、違えば [`Fault::ListNotRestored`] で止める。
+//! - 遅延: delay 方式で走る間、この層は何もしない（確保の向け先と 0 埋めは [`redirect_wanted`] が rollback のモードのときだけ開く）。入口は対戦の実行なら望みによらず書く（[`install_wanted`]）ので、確保 1 回あたり `cmp` / `je` / `jmp` の 3 命令と走査の包み 1 段が残る。rollback のモードでは、入力 → Present の間に足すのは走査の包み 1 段と、tick ごとの列の並びの読み（2 回）と場面の要求の読み。コピー・書き戻し・進め直しは Present の後。
 //!
-//! ## 入力の地点をどこに置くか
-//!
-//! 状態機械の `input_point` は、中で `Window::tick` を呼んでその場で結果（場面の要求が立ったか）を受け取り、止まっている間は書き戻しと
-//! 進め直し（`tick` を何回も）も同じ呼び出しの中で行う。花映塚の入力の地点 `0x0043112D` は更新の走査の中（優先度 0 の Supervisor::on_tick の先頭）
-//! なので、そこから走査を呼び直すと走査に再入するうえ、その tick の残り（優先度 1〜26）は入口から戻った後に走るので結果をその場で返せない。
-//! そこで rollback のモードでは、状態機械の入力の地点を do_frame の走査の call `0x0042DCA9` の包み（走査の直前・走査の外）に置く。
-//! 1 回の tick = 「feed する語を置いて走査を 1 回呼ぶ」で、走査の中の入力の地点（`0x0043112D`）は置かれた語を feed するだけ（[`Order`]）。
-//! 待つフレームは、置く語を「描画だけ」にして走査を 1 回呼ぶ（入力の地点が描画だけの出口 `0x431259` へ抜ける）。走査の call と入力の地点の間に
-//! あるのは走査の臨界区間と Supervisor の先頭（`0x431116` の `+0x478 = 0` と `0x43111C` の NetworkManager の確かめ）だけで、同じフレームの数 µs 前（推定）。
-//!
-//! ## 境目（`TickReport::boundary`）
-//!
-//! - その tick の後に次の場面の要求が立っている（Supervisor `+0x590` ≠ `+0x58C`。読めなければ立っている側）。
-//! - 走査が 0 か負の値を返した（異常 —— `rollback_resim::scan_ret_class`）。1（一時停止の tick を含む）は普通。
-//! - 入力の地点が置いた入力ワードを受け取らなかった（読み込みの枝など。その tick は自分の入力ワードで進んでいない）。
-//! - 確定していない tick で更新の列・描画の列の並びが変わった（ラウンドの終わりの ScreenEffect の登録など）。確定した tick の並びの変化は
-//!   境目にしない（ラウンドの終わりは場面の終わりではない）。書き戻しの後は並びがコピーのときと同じかを確かめ、違えば食い違い
-//!   （[`Fault::ListNotRestored`]。コピーの外の節のつなぎが戻らなかった形）で止める。
-//!
-//! ## 遅延
-//!
-//! delay 方式で走る間、この層は何もしない（確保の向け先と 0 埋めは [`redirect_wanted`] が rollback のモードのときだけ開く）。入口は対戦者なら
-//! 望みによらず書く（[`install_wanted`]）ので、delay 方式で走る間も確保 1 回あたり `cmp` / `je` / `jmp` の 3 命令と走査の包み 1 段が残る。
-//! rollback のモードでは、入力 → Present の間に足すのは走査の包み 1 段と、tick ごとの列の並びの読み（2 回）と場面の要求の読み。
-//! コピー・書き戻し・進め直しは Present の後。
-//!
-//! ゲームのスレッドで走るので、確保・ロック待ち・パニックしうる添字を置かない（バックアップの列は固定長、表は固定長の `Layout`）。
+//! ゲームのスレッドで走るので、確保・ロック待ち・パニックしうる添字を持たない（バックアップの列は固定長、表は固定長の `Layout`）。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -64,8 +36,8 @@ use crate::rollback_probe::{
     vm_array_shape,
 };
 use crate::rollback_resim::{
-    FullOutputs, HitSe, OutputMem, ScanRet, SePending, SePlayed, SeQueue, SeStats, capture_full,
-    clear_se_queue, drop_pending_se, flush_se, hold_hit_se, note_live_hit, note_live_se,
+    FullOutputs, OutputMem, ScanRet, SeHold, SePending, SePlayed, SeQueue, SeStats, SeTiming,
+    capture_full, clear_se_queue, drop_pending_se, flush_se, hold_se, note_live_hit, note_live_se,
     output_addr_allowed, output_addr_readable, read_se_queue, restore_full, scan_ret_class,
     se_summary_line, sort_resim_se,
 };
@@ -84,7 +56,7 @@ pub fn redirect_wanted(mode: Mode, controlled: bool) -> bool {
     mode == Mode::Rollback && controlled
 }
 
-/// 確保・解放・calloc・走査の call の入口を書くか。呼び手が `Mode::Rollback` を渡した実行だけ。対戦者は望みによらず `Rollback` を渡す
+/// 確保・解放・calloc・走査の call の入口を書くか。呼び手が `Mode::Rollback` を渡した実行だけ。対戦の実行は望みによらず `Rollback` を渡す
 /// （キャラセレクトの Tab で rollback へ替えられるように。入れなければ後から rollback へは行けない）。観戦者の delay 方式の実行だけ `Delay` を
 /// 渡して 1 バイトも書かない。入口は書いてあるが [`redirect_wanted`] が閉じたままの接続では、確保 1 回あたり `cmp` / `je` / `jmp` の 3 命令と
 /// 走査の包み 1 段だけが残る（遅延の増分）。
@@ -92,7 +64,7 @@ pub fn install_wanted(wish: Mode) -> bool {
     wish == Mode::Rollback
 }
 
-/// 走査の中の入力の地点に置く指図（[`PlayMem::run_scan`] が置き、入力の地点の入口が 1 回だけ取る）。
+/// 走査の中の入力の地点への指図（[`PlayMem::run_scan`] が出し、入力の地点の入口が 1 回だけ取る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     /// この (p1, p2) を 3 本へ feed する（0 に p1・1 に p2・2 に p1|p2。台本の経路と同じ順）。ローカル入力は読まない。
@@ -104,7 +76,7 @@ pub enum Order {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanRun {
     pub ret: i32,
-    /// 入力の地点が指図を取ったか（取らなければ、その tick は置いた語で進んでいない）。
+    /// 入力の地点が指図を取ったか（取らなければ、その tick は指図の語で進んでいない）。
     pub consumed: bool,
 }
 
@@ -128,20 +100,20 @@ pub trait PlayMem {
     fn write_u32(&mut self, addr: u32, v: u32) -> bool;
     fn check_rw(&mut self, addr: u32, len: u32) -> bool;
     fn arena_top(&mut self) -> u32;
-    /// 範囲をコピーの置き場へコピーする（割り当て器の状態を含む。`Layout` は `fill_layout` がアドレスを埋めたもの）。
+    /// 範囲をコピーのバッファへコピーする（割り当て器の状態を含む。`Layout` は `fill_layout` がアドレスを埋めたもの）。
     fn copy_out(&mut self, l: &Layout);
-    /// コピーの置き場から書き戻す（領域は `[0, コピーしたときの top)` を戻し、その先を今の top まで 0 に。割り当て器の状態も）。
+    /// コピーのバッファから書き戻す（領域は `[0, コピーしたときの top)` を戻し、その先を今の top まで 0 に。割り当て器の状態も）。
     fn copy_in(&mut self, l: &Layout);
-    /// コピーの置き場の中の範囲 `r` の先頭から、`fields` の欄を描画の後の値に置き換える（コピーの中だけ。ゲームのメモリには書かない）。
+    /// コピーのバッファの中の範囲 `r` の先頭から、`fields` の欄を描画の後の値に置き換える（コピーの中だけ。ゲームのメモリには書かない）。
     /// 戻り値は置き換える前の値が違っていた欄の数（`higanr_core::render_reset::apply`）。
     fn reset_in_snap(&mut self, r: &Region, fields: &[ResetField<'_>]) -> Result<u32, Refused>;
     fn list_signature(&mut self) -> u64;
-    /// `list_signature` と同じ値を返し、節のアドレスの並びを `out` にバックアップする（コピーのときと、書き戻しの後の並びの確かめ）。並びを持たない偽物はバックアップを空にする。
+    /// `list_signature` と同じ値を返し、節のアドレスの並びを `out` にバックアップする（コピーのときと、書き戻しの後の並びのチェック）。並びを持たない偽物はバックアップを空にする。
     fn list_chain(&mut self, out: &mut ListChain) -> u64 {
         *out = ListChain::EMPTY;
         self.list_signature()
     }
-    /// 指図を置いて走査を 1 回呼ぶ。`resim` は進め直しの回か（ペースの入口・tick の記録を分ける旗）。
+    /// 指図を出して走査を 1 回呼ぶ。`resim` は進め直しの回か（ペースの入口・tick の記録を分ける旗）。
     fn run_scan(&mut self, order: Order, resim: bool) -> ScanRun;
     fn now_us(&mut self) -> u64;
     fn set_redirect(&mut self, on: bool);
@@ -180,7 +152,7 @@ pub trait PlayMem {
         Some(w)
     }
     /// `out[i] = [base + i × stride]`（i < `out.len()`）を読む（陣の背景の VM の時計の測る入口）。1 つでも読めなければ false。本物は範囲の頁を
-    /// 1 回だけ確かめて直に読む（CRT の塊の語をシステムの呼び出しで 1 語ずつ読むと、Present の後に百回を越える）。
+    /// 1 回だけチェックして直に読む（CRT の塊の語をシステムの呼び出しで 1 語ずつ読むと、Present の後に百回を越える）。
     fn read_strided(&mut self, base: u32, stride: u32, out: &mut [u32]) -> bool {
         for (i, o) in out.iter_mut().enumerate() {
             let Some(a) = (i as u32)
@@ -219,7 +191,7 @@ pub struct RbRenderReset {
     pub source: &'static str,
 }
 
-/// 表の行の上限（`PlayState` の固定長の置き場。越えると `PlayState::new` が断る）。
+/// 表の行の上限（`PlayState` の固定長の領域。越えると `PlayState::new` が断る）。
 pub const MAX_RENDER_RESETS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +216,7 @@ pub fn render_reset_code_matches(
                 .map(|w| w as u8);
             if got != Some(want) {
                 return Err(format!(
-                    "{} の {:#010X} の命令が違う（{:#010X} が {:?}、想定 {want:#04X}）",
+                    "{} の {:#010X} の命令が不一致（{:#010X} が {:?}、想定 {want:#04X}）",
                     r.block,
                     r.code_at,
                     r.code_at.wrapping_add(i as u32),
@@ -261,8 +233,8 @@ pub const NODE_WORDS: usize = 8;
 pub const BODY_WORDS: usize = (SCREEN_EFFECT_BYTES / 4) as usize;
 /// コピーのときにバックアップする、コピーの範囲の外の ScreenEffect の本体の数の上限（同じ本体は 1 回だけ数える）。
 pub const OUTSIDE_BODIES_CAP: usize = 16;
-/// コピーのときにバックアップする、コピーの範囲の外の列の節の数の上限（2 本の列の合計）。越えた分はバックアップせず、数えて本ログへ（書き戻しの後の
-/// 並びの確かめが拾う）。
+/// コピーのときにバックアップする、コピーの範囲の外の列の節の数の上限（2 本の列の合計）。越えた分はバックアップせず、その数を本ログへ（書き戻しの後の
+/// 並びのチェックが拾う）。
 pub const OUTSIDE_NODES_CAP: usize = 64;
 
 /// コピーの範囲の外にある列の節のバックアップ（コピーのとき。書き戻しの後にそのまま書き戻す —— 予測の tick で外された節は、欄が 0 に
@@ -326,7 +298,7 @@ pub struct ChangedNode {
 /// `ChangedNode` をバックアップする種類の数（毎フレームの関数で分ける。越えた分は `changed_nodes_other` に数える）。
 pub const CHANGED_KINDS: usize = 8;
 
-/// `addr` がコピーの範囲（`layout` のどれか）の中か。VM の配列は今の長さだけ（置き場の大きさ `cap` は上限の本数ぶんで、配列の
+/// `addr` がコピーの範囲（`layout` のどれか）の中か。VM の配列は今の長さだけ（バッファの大きさ `cap` は上限の本数ぶんで、配列の
 /// 後ろの CRT の塊 —— 範囲の外の節や ScreenEffect の本体でありうる —— を「中」と見るとバックアップし損ねる）。
 fn in_layout(layout: &Layout, addr: u32) -> bool {
     layout.regions().iter().any(|r| {
@@ -469,7 +441,7 @@ pub enum Fault {
     BodyNotWritten { addr: u32 },
     /// 状態機械が更新したと言うのに、走査を呼んだ記録が無い。
     NoLiveRun,
-    /// 入口の中でパニックを受けた（本物の層が置く）。
+    /// 入口の中でパニックを受けた（本物の層が出す）。
     Panicked,
 }
 
@@ -847,8 +819,8 @@ pub struct PlayState {
     se_pending: SePending,
     /// この進め直しの SE の経路が生きているか（`resim_begin` でバックアップも空にもできたときだけ。`resim_end` で倒す）。
     se_armed: bool,
-    /// 被弾音の鳴らし方（ini の `rollback_hit_se`。既定は確定まで待つ。`set_hit_se` で置く）。
-    hit_se: HitSe,
+    /// 被弾音・カットインの音の鳴らし方（ini の `rollback_hit_se`・`rollback_cutin_se`。既定はどちらも確定まで待つ。`set_hit_se`・`set_cutin_se` で設定する）。
+    se_hold: SeHold,
     in_resim: bool,
     hint: Hint,
     front: u32,
@@ -890,12 +862,12 @@ impl PlayState {
                 .blocks
                 .iter()
                 .position(|b| b.name == name)
-                .ok_or_else(|| format!("塊 {name} がコピーの表に無い"))?;
+                .ok_or_else(|| format!("塊 {name} がコピーの表にありません"))?;
             Ok((i as u8, tables.blocks[i].size))
         };
         if resets.len() > MAX_RENDER_RESETS {
             return Err(format!(
-                "描画が消す欄の表が {} 行（{MAX_RENDER_RESETS} 行まで）",
+                "描画が消す欄の表が {} 行です（{MAX_RENDER_RESETS} 行まで）",
                 resets.len()
             ));
         }
@@ -915,7 +887,7 @@ impl PlayState {
             )
             .map_err(|e| {
                 format!(
-                    "描画が消す欄 {} +{:#X} を使えない（{e:?}）",
+                    "描画が消す欄 {} +{:#X} を使えません（{e:?}）",
                     r.block, r.offset
                 )
             })?;
@@ -939,7 +911,7 @@ impl PlayState {
             se_played: SePlayed::EMPTY,
             se_pending: SePending::EMPTY,
             se_armed: false,
-            hit_se: HitSe::default(),
+            se_hold: SeHold::default(),
             in_resim: false,
             hint: Hint::default(),
             front: 0,
@@ -1050,9 +1022,14 @@ impl PlayState {
         self.stats
     }
 
-    pub fn set_hit_se(&mut self, hit: HitSe) {
-        self.hit_se = hit;
+    pub fn set_hit_se(&mut self, hit: SeTiming) {
+        self.se_hold.hit = hit;
         self.stats.se.hit_mode = hit;
+    }
+
+    pub fn set_cutin_se(&mut self, cutin: SeTiming) {
+        self.se_hold.cutin = cutin;
+        self.stats.se.cutin_mode = cutin;
     }
 
     pub fn fault(&self) -> Option<Fault> {
@@ -1150,7 +1127,7 @@ impl PlayState {
     }
 }
 
-/// コピーのアドレスが今も同じか（塊と要素の配列のポインタを読み直すだけ。頁の確かめはしない —— 1 フレームに 1 回回すので軽くする）。
+/// コピーのアドレスが今も同じか（塊と要素の配列のポインタを読み直すだけ。頁のチェックはしない —— 1 フレームに 1 回回すので軽くする）。
 fn places_unchanged(l: &Layout, t: &Tables, mem: &mut dyn PlayMem) -> bool {
     first_moved(l, t, mem).is_none()
 }
@@ -1410,7 +1387,7 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 書き戻しの直後の確かめ: 両陣の Stage で、色の模様が 0（更新がもう色を書かない）なのに色の α が 0 でない（次の描画が色を掛ける）回数を数える。
+    /// 書き戻しの直後のチェック: 両陣の Stage で、色の模様が 0（更新がもう色を書かない）なのに色の α が 0 でない（次の描画が色を掛ける）回数を数える。
     /// 読むのはゲームのメモリ（書き戻した後の本物の値）で、4 語だけ。
     fn check_stage_tint(&mut self, layout: &Layout) {
         for (mode, tint) in self.stage_tints(layout).into_iter().flatten() {
@@ -1428,24 +1405,33 @@ impl GameWindow<'_> {
     /// - 進め直しの tick: 読んで空にし（次の tick が積んだ分だけを読めるように）、前後 2 フレームのどこにも無い id を積み直しの列へ。
     ///   積み直しは `resim_end`（書き戻した出力の後）。
     ///
-    /// 被弾音（`rollback_resim::is_hit_se`）は `hit_se` が `Confirmed` のとき、未確定の生きた tick（`confirmed` が偽）が積んだ分を待ち行列から
-    /// 抜いて鳴らさない（バックアップの `se_played` にも足さない）。確定の回で初めて出たものとして積み直されて鳴る。進め直しの予測の回で出た分も鳴らさない（`sort_resim_se`）。
+    /// 被弾音（`rollback_resim::is_hit_se`）とカットインの音（`is_cutin_se`）は `se_hold` が `Confirmed` の側のとき、未確定の生きた tick（`confirmed` が偽）が積んだ分を
+    /// 待ち行列から抜いて鳴らさない（バックアップの `se_played` にも足さない）。確定の回で初めて出たものとして積み直されて鳴る。進め直しの予測の回で出た分も鳴らさない（`sort_resim_se`）。
     fn note_se(&mut self, t: &Tick, pre: Option<&SeQueue>, confirmed: bool) {
         match (t.kind, pre) {
             (TickKind::Live, Some(pre)) => {
                 let mut post = read_se_queue(&mut AsOutputs(&mut *self.mem));
-                if !confirmed && self.st.hit_se == HitSe::Confirmed {
-                    let st = &mut *self.st;
-                    if let Some(rest) =
-                        hold_hit_se(&mut st.se_played, &mut st.stats.se, t.frame, pre, &post)
-                    {
-                        self.rewrite_se_queue(&rest);
-                        post = rest;
+                if !confirmed {
+                    let hold = self.st.se_hold;
+                    if hold.any_waits() {
+                        let st = &mut *self.st;
+                        if let Some(rest) = hold_se(
+                            &mut st.se_played,
+                            &mut st.stats.se,
+                            t.frame,
+                            pre,
+                            &post,
+                            hold,
+                        ) {
+                            self.rewrite_se_queue(&rest);
+                            post = rest;
+                        }
                     }
-                } else if !confirmed {
-                    // `live`: 待ち行列には触らず鳴らすが、確定の回が同じ被弾音を出すかを数えるために覚える。
-                    let st = &mut *self.st;
-                    note_live_hit(&mut st.se_played, &mut st.stats.se, t.frame, pre, &post);
+                    if hold.hit == SeTiming::Live {
+                        // 被弾音が `live`: 待ち行列には触らず鳴らすが、確定の回が同じ被弾音を出すかを数えるために覚える。
+                        let st = &mut *self.st;
+                        note_live_hit(&mut st.se_played, &mut st.stats.se, t.frame, pre, &post);
+                    }
                 }
                 note_live_se(
                     &mut self.st.se_played,
@@ -1469,7 +1455,7 @@ impl GameWindow<'_> {
                     &mut st.stats.se,
                     t.frame,
                     &q,
-                    st.hit_se,
+                    st.se_hold,
                     t.kind == TickKind::Confirmed,
                 );
             }
@@ -1477,7 +1463,7 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 生きた tick の待ち行列を `rest` に書き直す（被弾音を抜いた残り）。パンの欄は書いてよい範囲の外（`output_addr_allowed`）なので、
+    /// 生きた tick の待ち行列を `rest` に書き直す（待たせる音を抜いた残り）。パンの欄は書いてよい範囲の外（`output_addr_allowed`）なので、
     /// 枠を詰めるにはゲーム自身の積む関数（`push_se`）で積み直す: 空にして、残りを回数個ずつ（パンは平均。ゲームが鳴らすのも回数個の
     /// 平均なので、鳴り方は変わらない）。積む関数の先頭のバイト列が合わなければ積めず、その分は `refused` に数える。
     fn rewrite_se_queue(&mut self, rest: &SeQueue) {
@@ -1589,7 +1575,7 @@ impl Window for GameWindow<'_> {
             self.st.set_fault(Fault::PlacesMoved);
             return;
         }
-        // 範囲の外の ScreenEffect の本体: 何かを書く前に確かめる。バックアップできなかった本体があれば、その本体の欄（`+0x0C` など）が戻らず
+        // 範囲の外の ScreenEffect の本体: 何かを書く前にチェックする。バックアップできなかった本体があれば、その本体の欄（`+0x0C` など）が戻らず
         // 描画の節が解放済みの本体を指す形が残りうるので止める。バックアップした本体が見張りの外で本当に解放されていれば、書き戻すと
         // 解放済みの所へ書くので書かずに止める（予測の間の解放は CRT へ渡さずバックアップしている。渡したのは見張りの外の経路だけ）。
         if snap.bodies.missed != 0 {
@@ -1613,7 +1599,7 @@ impl Window for GameWindow<'_> {
             .pred_out_alive_at_restore
             .saturating_add(alive);
         self.mem.clear_born();
-        // fps の計測の欄を書き戻していないかの確かめ: 書き戻しの前後で描画の回数を読む（.data の 1 語ずつ）。
+        // fps の計測の欄を書き戻していないかのチェック: 書き戻しの前後で描画の回数を読む（.data の 1 語ずつ）。
         let draws_before = self.mem.read_u32(FPS_DRAWS);
         self.mem.copy_in(&snap.layout);
         let s = &mut self.st.stats;
@@ -1630,7 +1616,7 @@ impl Window for GameWindow<'_> {
             .filter(|r| matches!(r.kind, RegionKind::VmArray(_)) && r.len != 0)
             .count() as u32;
         s.bg_restored = s.bg_restored.saturating_add(bg);
-        // Supervisor の 2 欄とつなぎ（レジストリはもう範囲の中で戻った）を戻す。
+        // Supervisor の 2 欄とリンク（レジストリはもう範囲の中で戻った）を戻す。
         let ok = self.mem.write_u32(SUP_FIELDS[0], snap.sup[0])
             & self.mem.write_u32(SUP_FIELDS[1], snap.sup[1]);
         if !ok {
@@ -1869,7 +1855,7 @@ pub fn retry_after_wait(why: Wait) -> bool {
     match why {
         Wait::Ahead | Wait::Boundary => true,
         // 内部の食い違い（`Fault`）・取得がまだ（`NotCaptured`）は待たずに描画だけのフレーム。時刻合わせ（`Sync`）は相手の入力ワードを待つ待ちではなく、
-        // 同じフレームで試し直すと直後の呼び出しが更新まで進んで待ちが時間を取らない。理由が増えたらここで決める（ワイルドカードを置かない）。
+        // 同じフレームで試し直すと直後の呼び出しが更新まで進んで待ちが時間を取らない。理由が増えたらここで決める（ワイルドカードを使わない）。
         Wait::NotCaptured | Wait::Fault | Wait::Sync => false,
     }
 }
@@ -2093,7 +2079,7 @@ pub fn post_present(rb: &mut Rollback, st: &mut PlayState, mem: &mut dyn PlayMem
 pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
     vec![
         format!(
-            "巻き戻し（製品の経路）: フレーム {} のうち描画だけ {}。本物の tick {}・進め直しの tick 確定 {} / 予測 {}（確定していない tick {}）。コピー {}・書き戻し {}・範囲の表を埋めた回 {}",
+            "巻き戻し（製品の処理フロー）: フレーム {} のうち描画だけ {}。本物の tick {}・進め直しの tick 確定 {} / 予測 {}（確定していない tick {}）。コピー {}・書き戻し {}・範囲の表を埋めた回 {}",
             s.frames,
             s.render_only,
             s.live_ticks,
@@ -2105,7 +2091,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.layout_fills
         ),
         format!(
-            "巻き戻し（製品の経路）: 時間 コピー 平均 {} / 最大 {} ms（n = {}）・書き戻し 平均 {} / 最大 {} ms（n = {}）・進め直しの tick 1 回 平均 {} / 最大 {} ms（n = {}）・進め直しのあった Present の後の全体 平均 {} / 最大 {} ms（n = {}）",
+            "巻き戻し（製品の処理フロー）: 時間 コピー 平均 {} / 最大 {} ms（n = {}）・書き戻し 平均 {} / 最大 {} ms（n = {}）・進め直しの tick 1 回 平均 {} / 最大 {} ms（n = {}）・進め直しのあった Present の後の全体 平均 {} / 最大 {} ms（n = {}）",
             s.save_time.mean_ms(),
             s.save_time.max_ms(),
             s.save_time.n,
@@ -2120,7 +2106,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.resim_frame_time.n
         ),
         format!(
-            "巻き戻し（製品の経路）: 予測の間の領域の外の確保 {}・解放（前からある塊 {}（うち CRT へ渡さなかった {}） / 予測の間に生まれた塊 {}）・書き戻しの時点で予測の間に生まれて生きていた外の塊 {}",
+            "巻き戻し（製品の処理フロー）: 予測の間の領域の外の確保 {}・解放（前からある塊 {}（うち CRT へ渡さなかった {}） / 予測の間に生まれた塊 {}）・書き戻しの時点で予測の間に生まれて生きていた外の塊 {}",
             s.pred_out_allocs,
             s.pred_out_frees_old,
             s.pred_out_frees_held,
@@ -2128,7 +2114,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.pred_out_alive_at_restore
         ),
         format!(
-            "巻き戻し（製品の経路）: コピーの範囲の外の列の節 1 回のコピーで最大 {}（控えの枠が足りなかった {}・読めなかった {}・書き戻せなかった {}）・アドレスが動いた塊を元のアドレスへ書き戻した書き戻し {}",
+            "巻き戻し（製品の処理フロー）: コピーの範囲の外の列の節 1 回のコピーで最大 {}（控えの枠が足りなかった {}・読めなかった {}・書き戻せなかった {}）・アドレスが動いた塊を元のアドレスへ書き戻した書き戻し {}",
             s.outside_nodes_max,
             s.nodes_over,
             s.nodes_unreadable,
@@ -2136,7 +2122,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.places_moved_back
         ),
         format!(
-            "巻き戻し（製品の経路）: 控えた ScreenEffect の本体（コピーの範囲の外。0x38 B）1 回のコピーで最大 {}・書き戻し {}（うち中身が違っていた {}）・控えの枠が足りなかった {}・読めなかった {}・書き戻せなかった {}・見張りの外で解放されていて止めた {}",
+            "巻き戻し（製品の処理フロー）: 控えた ScreenEffect の本体（コピーの範囲の外。0x38 B）1 回のコピーで最大 {}・書き戻し {}（うち中身が違っていた {}）・控えの枠が足りなかった {}・読めなかった {}・書き戻せなかった {}・見張りの外で解放されていて止めた {}",
             s.bodies_max,
             s.bodies_restored,
             s.bodies_changed,
@@ -2146,7 +2132,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.bodies_freed
         ),
         format!(
-            "巻き戻し（製品の経路）: 境目 場面の要求 {}・確定していない tick の列の変化 {}（確定した tick の変化 {}）・走査が 1 {} / 0 か負 {}・語を取らなかった tick {}。SE ほかを控えられなかった {} / 戻せなかった {}。取得できなかったフレーム {}。落とした確定の語 {} / CHECK {}",
+            "巻き戻し（製品の処理フロー）: 境目 場面の要求 {}・確定していない tick の列の変化 {}（確定した tick の変化 {}）・走査が 1 {} / 0 か負 {}・語を取らなかった tick {}。SE ほかを控えられなかった {} / 戻せなかった {}。取得できなかったフレーム {}。落とした確定の語 {} / CHECK {}",
             s.scene_ticks,
             s.list_holds,
             s.list_changes_confirmed,
@@ -2160,7 +2146,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.checks_dropped
         ),
         format!(
-            "巻き戻し（製品の経路）: 描画が消す欄 表 {} 行・コピーの中で描画の後の値に置き換えた欄 {}（コピー {} 回 × {} 行のうち。断った {}）・コピーのときに Stage の色の α が 0 でなかった {}（コピー × 2 陣のうち。カットインの間のコピー）・書き戻しの直後に Stage の色が残っていた（模様 0 なのに α が 0 でない）{}（見た Stage {} のうち）",
+            "巻き戻し（製品の処理フロー）: 描画が消す欄 表 {} 行・コピーの中で描画の後の値に置き換えた欄 {}（コピー {} 回 × {} 行のうち。断った {}）・コピーのときに Stage の色の α が 0 でなかった {}（コピー × 2 陣のうち。カットインの間のコピー）・書き戻しの直後に Stage の色が残っていた（模様 0 なのに α が 0 でない）{}（見た Stage {} のうち）",
             s.reset_rows,
             s.reset_changed,
             s.saves,
@@ -2171,7 +2157,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.tint_checked
         ),
         format!(
-            "巻き戻し（製品の経路）: fps の表示（丸めた値 0x4B36C8。Present の後に読んだ {} 回の分布）: {}・平均 {}。書き戻しの前後で描画の回数 0x4B42CC が変わった書き戻し {}（見た {} のうち。fps の計測の欄を書き戻していなければ 0）",
+            "巻き戻し（製品の処理フロー）: fps の表示（丸めた値 0x4B36C8。Present の後に読んだ {} 回の分布）: {}・平均 {}。書き戻しの前後で描画の回数 0x4B42CC が変わった書き戻し {}（見た {} のうち。fps の計測の欄を書き戻していなければ 0）",
             s.fps_n,
             hist_text(&FPS_LABELS, &s.fps_hist),
             if s.fps_n == 0 {
@@ -2183,7 +2169,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.fps_words_checked
         ),
         format!(
-            "巻き戻し（製品の経路）: 陣の背景（中の名前は Stage）の VM の時計が描画 1 回あたりに進んだ tick（Present × 陣ごとの最大。delay 方式と同じく 1 に集まるのが正しい形）: {}。読めなかった {}。VM の本数 最大 {}（写す上限 {}。越えて写さなかった陣 {}）・書き戻しで背景の VM を書き戻した {}（書き戻し × 陣のうち）",
+            "巻き戻し（製品の処理フロー）: 陣の背景（中の名前は Stage）の VM の時計が描画 1 回あたりに進んだ tick（Present × 陣ごとの最大。delay 方式と同じく 1 に集まるのが正しい形）: {}。読めなかった {}。VM の本数 最大 {}（写す上限 {}。越えて写さなかった陣 {}）・書き戻しで背景の VM を書き戻した {}（書き戻し × 陣のうち）",
             hist_text(&BG_STEP_LABELS, &s.bg_step),
             s.bg_unreadable,
             s.bg_count_max,
@@ -2193,8 +2179,11 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
         ),
         se_summary_line(&s.se),
         match fault {
-            None => "巻き戻し（製品の経路）: 食い違い なし".to_string(),
-            Some(f) => format!("巻き戻し（製品の経路）: 食い違いで止めた（{}）", f.text()),
+            None => "巻き戻し（製品の処理フロー）: 食い違い なし".to_string(),
+            Some(f) => format!(
+                "巻き戻し（製品の処理フロー）: 食い違いで止めた（{}）",
+                f.text()
+            ),
         },
     ]
 }
@@ -2247,7 +2236,7 @@ pub fn hold_lines(
     recs: &[StrayRec],
 ) -> Vec<String> {
     let mut v = vec![format!(
-        "巻き戻し（製品の経路）: 予測の後・書き戻しの前に見張りの外で起きた領域の外の解放 {stray}・アドレスを控えられなかった解放 {held_untracked} / 確保 {out_untracked}"
+        "巻き戻し（製品の処理フロー）: 予測の後・書き戻しの前に見張りの外で起きた領域の外の解放 {stray}・アドレスを控えられなかった解放 {held_untracked} / 確保 {out_untracked}"
     )];
     let yn = |r: &StrayRec, bit: u32| {
         if r.flags & bit != 0 {
@@ -2258,7 +2247,7 @@ pub fn hold_lines(
     };
     for (i, r) in recs.iter().enumerate() {
         v.push(format!(
-            "巻き戻し（製品の経路）: 見張りの外の解放 {}件目: 呼び手 {:#010X}・ポインタ {:#010X}・範囲の外の節 {}・解放を控えたアドレス {}・コピーの表の塊 {}・ScreenEffect の本体 {}・コピーのフレーム {}",
+            "巻き戻し（製品の処理フロー）: 見張りの外の解放 {}件目: 呼び手 {:#010X}・ポインタ {:#010X}・範囲の外の節 {}・解放を控えたアドレス {}・コピーの表の塊 {}・ScreenEffect の本体 {}・コピーのフレーム {}",
             i + 1,
             r.ret,
             r.ptr,
@@ -2281,7 +2270,7 @@ pub fn hold_lines(
         .collect();
     if !kinds.is_empty() || other != 0 {
         v.push(format!(
-            "巻き戻し（製品の経路）: 書き戻しのとき中身が変わっていた範囲の外の節（コピーのときの値）: {}{}",
+            "巻き戻し（製品の処理フロー）: 書き戻しのとき中身が変わっていた範囲の外の節（コピーのときの値）: {}{}",
             kinds.join(" / "),
             if other != 0 {
                 format!(" / ほか {other} 回")
@@ -2453,7 +2442,7 @@ pub fn install_play(
     if !install_wanted(wish) {
         let _ = writeln!(
             detail_out(out),
-            "巻き戻し（製品の経路）: rollback を望んでいない走りなので、確保・解放・calloc・走査の入口は書かない"
+            "巻き戻し（製品の処理フロー）: rollback を望んでいない実行なので確保・解放・calloc・走査の入口は書きません"
         );
         return PlayInstall::NotWanted;
     }
@@ -2467,7 +2456,7 @@ pub fn install_play(
         if entry == 0 {
             let _ = writeln!(
                 out,
-                "巻き戻し（製品の経路）: 地点 {} の入口のアドレスが無いので、どこにも書かない",
+                "巻き戻し（製品の処理フロー）: フック地点 {} の入口のアドレスが無いのでどこにも書きません。",
                 def.name
             );
             return PlayInstall::Refused;
@@ -2475,7 +2464,7 @@ pub fn install_play(
         if let Err(e) = check_table(core::slice::from_ref(def), forbidden) {
             let _ = writeln!(
                 out,
-                "巻き戻し（製品の経路）: 地点 {} の表の検査に落ちた（{e:?}）ので、どこにも書かない",
+                "巻き戻し（製品の処理フロー）: フック地点 {} の表の検査に失敗した（{e:?}）のでどこにも書きません。",
                 def.name
             );
             return PlayInstall::Refused;
@@ -2500,7 +2489,7 @@ pub fn install_play(
             "一致".to_string()
         };
         checks.push(format!(
-            "巻き戻し（製品の経路）: 照合 {} 0x{:08X}: {line}",
+            "巻き戻し（製品の処理フロー）: 照合 {} 0x{:08X}: {line}",
             def.name, def.addr
         ));
     }
@@ -2514,7 +2503,7 @@ pub fn install_play(
     if !all_match {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: 5 地点のうち一致しない地点があるので、どこにも書かない"
+            "巻き戻し（製品の処理フロー）: 5 フック地点のうち一致しないフック地点があるのでどこにも書きません。"
         );
         return PlayInstall::Refused;
     }
@@ -2546,7 +2535,7 @@ pub fn install_play(
     };
     let _ = writeln!(
         o,
-        "巻き戻し（製品の経路）: 書いた地点 {}",
+        "巻き戻し（製品の処理フロー）: 書いたフック地点 {}",
         sites
             .iter()
             .zip(written)
@@ -2557,12 +2546,8 @@ pub fn install_play(
     PlayInstall::Written(written)
 }
 
-/// 観戦者の早送りのために、走査の call（`RESIM_SITES[0]`）の 1 地点だけを書く。観戦者の早送り（`spectate_watch/ff.rs`）は、走査の包みの中で
-/// 余分に更新を回すだけで、観戦するマッチの方式（rollback / delay）と関わらない。一方、走査の call は `install_play` でしか書かれず、ini が delay の
-/// 実行には書かれていなかった。そこで観戦者の実行（`watching`）は、走査の call がまだ書かれていなければ（`scan_hooked` が偽）そこだけを書く。
-/// 確保・解放・calloc の入口は書かない（観戦者は巻き戻さない）。観戦者でない実行（対戦者）は何も書かない —— delay 方式の対戦者の実行は 1 バイトも
-/// 書かない約束（遅延の増分 0）を、この関数の入口で守る。書く前の照合は `install_call_hook_at` が止めた後の再読みまで含めて行い、合わなければ何も書かない。
-/// 書いたら true。
+/// 観戦者の早送りのために、走査の call（`RESIM_SITES[0]`）の 1 地点だけを書く。早送り（`spectate_watch/ff.rs`）は走査の包みの中で余分に更新を回すだけで観戦するマッチの方式（rollback / delay）と関わらないが、走査の call は `install_play` でしか書かれず ini が delay の実行には書かれなかったため、観戦者の実行（`watching`）は、走査の call がまだ書かれていなければ（`scan_hooked` が偽）そこだけを書く。
+/// 確保・解放・calloc の入口は書かない（観戦者は巻き戻さない）。観戦者でない実行（対戦）は何も書かない —— delay 方式の対戦の実行は 1 バイトも書かない約束（遅延の増分 0）を、この関数の入口で守る。書く前の照合は `install_call_hook_at` が止めた後の再読みまで含めて行い、合わなければ何も書かない。書いたら true。
 pub fn install_watch_scan(
     watching: bool,
     scan_hooked: bool,
@@ -2579,14 +2564,14 @@ pub fn install_watch_scan(
     if entry == 0 {
         let _ = writeln!(
             out,
-            "観戦者の早送り: 走査の包みの入口のアドレスが無いので、どこにも書かない"
+            "観戦者の早送り: 走査の包みの入口のアドレスが無いのでどこにも書きません。"
         );
         return false;
     }
     if let Err(e) = check_table(core::slice::from_ref(def), forbidden) {
         let _ = writeln!(
             out,
-            "観戦者の早送り: 走査の call の表の検査に落ちた（{e:?}）ので、どこにも書かない"
+            "観戦者の早送り: 走査の call の表の検査に失敗した（{e:?}）のでどこにも書きません。"
         );
         return false;
     }
@@ -2606,12 +2591,14 @@ pub(crate) mod tests {
     use crate::rollback_probe::{RbData, RbSkipKind, RegionKind};
     use crate::rollback_resim::SE_NEAR;
     use crate::rollback_testkit::{
-        ARENA_BASE, ARENA_BYTES, FakeGame, LIST_OUTSIDE, STATE, TINT_TICKS, play_state,
+        ARENA_BASE, ARENA_BYTES, FakeGame, LIST_OUTSIDE, STATE, TINT_TICKS,
     };
+    #[cfg(dev_assets)]
+    use crate::th09_addr::ROLLBACK_EXCLUDED_CALLERS;
     use crate::th09_addr::{
         ASCII_COUNT, FORBIDDEN, PACING_SITES, REGISTRY_TAIL_OBJ, ROLLBACK_BLOCKS, ROLLBACK_DATA,
-        ROLLBACK_EXCLUDED_CALLERS, ROLLBACK_PLAY_DATA, SE_ID_CUTIN, SE_ID_HIT, SE_ID_LAST_LIFE,
-        SITES, SND_BGM_QUEUE, SND_SE_COUNTS, SND_SE_IDS, SOUND_MANAGER, STAGE_TINT_AFTER,
+        ROLLBACK_PLAY_DATA, SE_ID_CUTIN, SE_ID_CUTIN_SPELL, SE_ID_HIT, SE_ID_LAST_LIFE, SITES,
+        SND_BGM_QUEUE, SND_SE_COUNTS, SND_SE_IDS, SOUND_MANAGER, STAGE_TINT_AFTER,
         STAGE_TINT_RESET_AT, STAGE_TINT_RESET_CODE, UPDATE_REGISTRY_BYTES,
     };
     use crate::ticks::CopyRow;
@@ -2619,7 +2606,15 @@ pub(crate) mod tests {
     use higanr_core::wire::{MAX_WORDS, Seat};
     use std::collections::BTreeMap;
 
+    #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
+
+    /// 既存の検査は進め直しの仕組みをカットインの音で見ているので、カットインは今までどおり（live）にして始める。既定（確定まで待つ）は `the_default_waits_for_both_se_kinds`。
+    fn play_state_cutin_live() -> PlayState {
+        let mut st = crate::rollback_testkit::play_state();
+        st.set_cutin_se(SeTiming::Live);
+        st
+    }
 
     fn remote(rb: &Rollback, base: u32, words: &[u16]) -> Input {
         let mut w = [0u16; MAX_WORDS];
@@ -2629,6 +2624,7 @@ pub(crate) mod tests {
             ack: rb.frame(),
             base,
             lat: None,
+            stamp: higanr_core::wire::Stamp::NONE,
             count: words.len() as u8,
             words: w,
         }
@@ -2652,7 +2648,7 @@ pub(crate) mod tests {
         use higanr_core::lockstep::Role;
         use higanr_core::wire::LatChange;
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_role(Role::Guest));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         rb.begin_seg(1);
         let (mut reads, mut sent) = (0u32, 0u32);
@@ -2693,6 +2689,7 @@ pub(crate) mod tests {
             ack: 0,
             base: 1,
             lat: Some(LatChange { frame: 0, delay: 1 }),
+            stamp: higanr_core::wire::Stamp::NONE,
             count: 1,
             words,
         };
@@ -2767,7 +2764,7 @@ pub(crate) mod tests {
         }
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_role(Role::Guest));
         rb.begin_seg(1);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         let mut words = [0u16; MAX_WORDS];
         words[0] = 0x77;
@@ -2776,6 +2773,7 @@ pub(crate) mod tests {
             ack: 0,
             base: 1,
             lat: Some(LatChange { frame: 0, delay: 1 }),
+            stamp: higanr_core::wire::Stamp::NONE,
             count: 1,
             words,
         };
@@ -2854,7 +2852,7 @@ pub(crate) mod tests {
                 Mode::Rollback => Config::rollback(Seat::P1, 1, 8),
             };
             let mut rb = Rollback::new(cfg);
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             let mut g = FakeGame::new();
             let mut ran = 0;
             for k in 0..240u32 {
@@ -2905,7 +2903,7 @@ pub(crate) mod tests {
     #[test]
     fn restore_brings_back_the_registry_and_the_supervisor_fields() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.mem.insert(REGISTRY_TAIL_OBJ + 8, 0x5AB);
         let reg0 = g.registry();
         let state0 = g.get(STATE);
@@ -2999,7 +2997,7 @@ pub(crate) mod tests {
             c
         };
         let mut m = BTreeMap::from([(reg + UPDATE_NEXT, sup), (sup + UPDATE_NEXT, a)]);
-        let layout = *play_state().plan();
+        let layout = *play_state_cutin_live().plan();
         let want = chain_of(&m);
         assert_eq!(want.list(0), &[reg, sup, a]);
         assert_eq!(want.list(1), &[draw]);
@@ -3037,7 +3035,7 @@ pub(crate) mod tests {
     #[test]
     fn restore_refuses_what_it_cannot_put_back() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -3073,7 +3071,7 @@ pub(crate) mod tests {
         );
 
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -3098,7 +3096,7 @@ pub(crate) mod tests {
         );
 
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -3115,7 +3113,7 @@ pub(crate) mod tests {
     #[test]
     fn resim_outputs_return_to_the_values_before_the_resim() {
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         for k in 0..4u32 {
             let (f, _) = frame(&mut rb, &mut st, &mut g, 0x10 + k as u16);
@@ -3187,7 +3185,7 @@ pub(crate) mod tests {
     #[test]
     fn a_resim_tick_without_begin_and_end_changes_the_outputs() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let before = g.outputs();
         GameWindow {
             mem: &mut g,
@@ -3213,7 +3211,7 @@ pub(crate) mod tests {
         // 偽の相手は ack を自分の N のまま返し、語だけ 3 フレーム遅れて届ける（往路だけ遅いネットワーク）。この検査は予測・書き戻し・進め直しが毎フレーム
         // 起きる実行を見るので、時刻合わせは切る（時刻合わせの検査は `higanr_core` の `tests/rollback_sim.rs`）。
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         rb.begin_seg(1);
         for k in 0..loops {
             feed(&mut rb, k);
@@ -3368,12 +3366,11 @@ pub(crate) mod tests {
         GameWindow { mem: g, st }.resim_end();
     }
 
-    /// 壊れたら落ちる: リプレイの印のラウンドの境目を読む関数が、確定した tick の後だけ呼ばれる（予測の tick の境目は書き戻しで消える）。
     #[test]
     fn the_round_log_hook_runs_after_confirmed_ticks_only() {
         use crate::replay_save_win::confirmed_hook_calls;
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let calls = || confirmed_hook_calls();
         let c0 = calls();
         resim_once(
@@ -3418,7 +3415,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x35));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.se_queue_push(7, 0);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 20, 0x44)]);
         assert_eq!(g.se_pushed, vec![(0x35, 0)], "初めての出来事を積み直さない");
@@ -3440,7 +3437,7 @@ pub(crate) mod tests {
             let mut g = FakeGame::new();
             g.se_noise = false;
             g.se_p2_eq = Some((0x44, 0x35));
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 20, 0x44)]);
             assert_eq!(g.se_pushed.len(), 1);
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
@@ -3457,7 +3454,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x0E));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.se_queue_push(0x0E, 0);
         GameWindow {
             mem: &mut g,
@@ -3480,7 +3477,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x0E));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -3507,7 +3504,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x35));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -3537,7 +3534,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x35));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let ticks: Vec<(TickKind, u32, u16)> = (0..40u32)
             .map(|i| (TickKind::Confirmed, 100 + i * 10, 0x44))
             .collect();
@@ -3552,7 +3549,7 @@ pub(crate) mod tests {
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, 0x35));
         g.deny_read = Some(ASCII_COUNT);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.se_queue_push(7, 0);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 20, 0x44)]);
         assert_eq!(st.stats().outputs_uncaptured, 1);
@@ -3565,25 +3562,25 @@ pub(crate) mod tests {
         assert_eq!(g.se_queue(), vec![(7, 1), (0x35, 1)]);
     }
 
-    fn hit_game(hit: HitSe, id: u32) -> (FakeGame, PlayState) {
+    fn hit_game(hit: SeTiming, id: u32) -> (FakeGame, PlayState) {
         let mut g = FakeGame::new();
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, id));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         st.set_hit_se(hit);
         (g, st)
     }
 
     #[test]
     fn an_unconfirmed_live_hit_waits_for_the_confirmed_tick_and_sounds_once() {
-        let (mut g, mut st) = (FakeGame::new(), play_state());
+        let (mut g, mut st) = (FakeGame::new(), play_state_cutin_live());
         g.se_noise = false;
         g.se_p2_eq = Some((0x44, SE_ID_HIT));
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         assert_eq!(g.se_queue(), Vec::<(u32, u32)>::new(), "既定が即時");
-        assert_eq!(st.stats().se.hit_mode, HitSe::Confirmed);
+        assert_eq!(st.stats().se.hit_mode, SeTiming::Confirmed);
         for id in [SE_ID_HIT, SE_ID_LAST_LIFE] {
-            let (mut g, mut st) = hit_game(HitSe::Confirmed, id);
+            let (mut g, mut st) = hit_game(SeTiming::Confirmed, id);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             assert_eq!(
                 g.se_queue(),
@@ -3610,7 +3607,7 @@ pub(crate) mod tests {
             );
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
             assert_eq!(g.se_pushed.len(), 1, "id {id:#X}: 2 回目が積まれた");
-            let (mut g, mut st) = hit_game(HitSe::Live, id);
+            let (mut g, mut st) = hit_game(SeTiming::Live, id);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             assert_eq!(g.se_queue(), vec![(id, 1)], "id {id:#X}: live で待たせた");
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
@@ -3626,7 +3623,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_predicted_hit_that_the_confirmation_does_not_repeat_is_never_played() {
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         g.play_and_draw();
         let words = [(TickKind::Confirmed, 30, 0), (TickKind::Confirmed, 31, 0)];
@@ -3640,7 +3637,7 @@ pub(crate) mod tests {
             (1, 0, 0),
             "{se:?}"
         );
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         g.play_and_draw();
         resim_once(&mut g, &mut st, &words);
@@ -3652,7 +3649,7 @@ pub(crate) mod tests {
         for d in -6i32..=6 {
             let frame = (30 + d) as u32;
             let near = d.unsigned_abs() <= SE_NEAR;
-            let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+            let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             g.play_and_draw();
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
@@ -3660,7 +3657,7 @@ pub(crate) mod tests {
             assert_eq!(g.played_ids(), vec![SE_ID_HIT], "d = {d}");
             assert_eq!(st.stats().se.hit_matched, u32::from(near), "d = {d}");
 
-            let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+            let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             g.play_and_draw();
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
@@ -3675,7 +3672,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_confirmed_live_hit_sounds_at_once() {
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         st.hint.remote_next = 31;
         st.front = 30;
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
@@ -3686,7 +3683,7 @@ pub(crate) mod tests {
         assert_eq!((se.hit_waited, se.live_ids), (0, 1), "{se:?}");
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
         assert_eq!(g.se_pushed.len(), 0, "即座に鳴った被弾がもう 1 回鳴る");
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         st.hint.remote_next = 31;
         st.front = 28;
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
@@ -3699,7 +3696,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_predicted_resim_tick_does_not_play_or_remember_a_hit() {
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
         assert_eq!(g.se_pushed.len(), 0, "予測の回の被弾音を積んだ");
         let se = st.stats().se;
@@ -3710,22 +3707,22 @@ pub(crate) mod tests {
         );
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 40, 0x44)]);
         assert_eq!(g.se_pushed, vec![(SE_ID_HIT, 0)]);
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
         assert_eq!(g.se_pushed, vec![(SE_ID_HIT, 0)]);
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_CUTIN);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_CUTIN);
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
         assert_eq!(g.se_pushed, vec![(SE_ID_CUTIN, 0)], "カットインを待たせた");
     }
 
     #[test]
     fn a_whole_late_run_sounds_each_hit_once_and_only_after_it_is_confirmed() {
-        let run = |hit: HitSe| {
+        let run = |hit: SeTiming| {
             let mut g = FakeGame::new();
             g.se_noise = false;
             g.se_p2_change = Some(1);
             let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             st.set_hit_se(hit);
             rb.begin_seg(1);
             let feed = feed_one_by_one(remote_steps);
@@ -3742,7 +3739,7 @@ pub(crate) mod tests {
             );
             (g, st)
         };
-        let (g, st) = run(HitSe::Confirmed);
+        let (g, st) = run(SeTiming::Confirmed);
         assert_eq!(
             g.played_ids(),
             vec![4, 6, 1],
@@ -3760,7 +3757,7 @@ pub(crate) mod tests {
             (12..=12 + 8 + 2).contains(&draw),
             "被弾音が鳴った do_frame: {draw}"
         );
-        let (g, st) = run(HitSe::Live);
+        let (g, st) = run(SeTiming::Live);
         assert_eq!(g.played_ids(), vec![4, 6, 1]);
         assert_eq!(st.stats().se.hit_waited, 0);
         assert_eq!(st.stats().se.live_ids, 3);
@@ -3788,7 +3785,7 @@ pub(crate) mod tests {
         let phantom =
             |se: &crate::rollback_resim::SeStats| se.hit_live_sounded - se.hit_live_matched;
         for id in [SE_ID_HIT, SE_ID_LAST_LIFE] {
-            let (mut g, mut st) = hit_game(HitSe::Live, id);
+            let (mut g, mut st) = hit_game(SeTiming::Live, id);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             g.play_and_draw();
             assert_eq!(g.played_ids(), vec![id], "id {id:#X}: live で鳴らない");
@@ -3801,7 +3798,7 @@ pub(crate) mod tests {
                 "id {id:#X}: {se:?}"
             );
             assert_eq!((se.hit_waited, se.hit_matched), (0, 0), "{se:?}");
-            let (mut g, mut st) = hit_game(HitSe::Live, id);
+            let (mut g, mut st) = hit_game(SeTiming::Live, id);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
             let se = st.stats().se;
@@ -3815,7 +3812,7 @@ pub(crate) mod tests {
         for d in -6i32..=6 {
             let frame = (30 + d) as u32;
             let near = d.unsigned_abs() <= SE_NEAR;
-            let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+            let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
             let se = st.stats().se;
@@ -3824,7 +3821,7 @@ pub(crate) mod tests {
                 (1, u32::from(near), u32::from(!near)),
                 "d = {d}: {se:?}"
             );
-            let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+            let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
             tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
             resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
             assert_eq!(
@@ -3837,7 +3834,7 @@ pub(crate) mod tests {
 
     #[test]
     fn live_phantom_counts_stay_zero_for_confirmed_runs_and_other_cases() {
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0)]);
         let se = st.stats().se;
@@ -3856,19 +3853,19 @@ pub(crate) mod tests {
             !l.contains("live の被弾音"),
             "confirmed の行が変わった: {l}"
         );
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         st.hint.remote_next = 31;
         st.front = 30;
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
         let se = st.stats().se;
         assert_eq!((se.hit_live_sounded, se.hit_live_matched), (0, 0), "{se:?}");
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_CUTIN);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_CUTIN);
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0)]);
         let se = st.stats().se;
         assert_eq!((se.hit_live_sounded, se.hit_live_matched), (0, 0), "{se:?}");
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0)]);
         let l = crate::rollback_resim::se_summary_line(&st.stats().se);
@@ -3881,7 +3878,7 @@ pub(crate) mod tests {
 
     #[test]
     fn live_counts_a_hit_first_played_in_a_predicted_resim_tick() {
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
         assert_eq!(g.se_pushed, vec![(SE_ID_HIT, 0)], "live は予測の回でも積む");
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
@@ -3890,7 +3887,7 @@ pub(crate) mod tests {
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 40, 0x44)]);
         let se = st.stats().se;
         assert_eq!((se.hit_live_sounded, se.hit_live_matched), (1, 1), "{se:?}");
-        let (mut g, mut st) = hit_game(HitSe::Live, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
         resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 40, 0)]);
         let se = st.stats().se;
@@ -3899,12 +3896,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_whole_late_run_counts_the_live_hit_as_found_in_the_confirmed_tick() {
-        let run = |hit: HitSe| {
+        let run = |hit: SeTiming| {
             let mut g = FakeGame::new();
             g.se_noise = false;
             g.se_p2_change = Some(1);
             let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             st.set_hit_se(hit);
             rb.begin_seg(1);
             let feed = feed_one_by_one(remote_steps);
@@ -3916,13 +3913,13 @@ pub(crate) mod tests {
             }
             st.stats().se
         };
-        let se = run(HitSe::Live);
+        let se = run(SeTiming::Live);
         assert_eq!(
             (se.hit_live_sounded, se.hit_live_matched),
             (1, 1),
             "live の被弾 1 回: {se:?}"
         );
-        let se = run(HitSe::Confirmed);
+        let se = run(SeTiming::Confirmed);
         assert_eq!(
             (se.hit_live_sounded, se.hit_live_matched),
             (0, 0),
@@ -3936,7 +3933,7 @@ pub(crate) mod tests {
         g.se_noise = false;
         g.se_p1_change = Some(0); // p1 = 4 で id 4 を積む（被弾音）
         g.se_p2_eq = Some((0x44, SE_ID_CUTIN)); // 被弾音の後ろに 0xE
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.se_queue_push(7, 10); // 走査の前からある SE（7 が 2 回。パンの平均 15）
         g.se_queue_push(7, 20);
         g.se_queue_push(SE_ID_HIT, 33); // 走査の前からある被弾音（遅れて積み直した確定の分。抜かない）
@@ -3967,7 +3964,7 @@ pub(crate) mod tests {
             (1, 1, 1),
             "{se:?}"
         );
-        let (mut g, mut st) = hit_game(HitSe::Confirmed, SE_ID_HIT);
+        let (mut g, mut st) = hit_game(SeTiming::Confirmed, SE_ID_HIT);
         g.se_queue_push(7, 0);
         tick_with(&mut g, &mut st, TickKind::Live, 31, 0);
         assert_eq!(g.se_pushed.len(), 0);
@@ -3977,10 +3974,369 @@ pub(crate) mod tests {
         g.se_p1_change = Some(0);
         g.se_p2_eq = Some((0x44, SE_ID_CUTIN));
         g.se_refuse = true;
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         live(&mut g, &mut st);
         assert_eq!(g.se_queue(), Vec::<(u32, u32)>::new());
         assert_eq!(st.stats().se.refused, 1);
+    }
+
+    fn cutin_game(cutin: SeTiming, id: u32) -> (FakeGame, PlayState) {
+        let mut g = FakeGame::new();
+        g.se_noise = false;
+        g.se_p2_eq = Some((0x44, id));
+        let mut st = crate::rollback_testkit::play_state();
+        st.set_cutin_se(cutin);
+        (g, st)
+    }
+
+    const CUTIN_IDS: [u32; 2] = [SE_ID_CUTIN, SE_ID_CUTIN_SPELL];
+
+    #[test]
+    fn the_default_waits_for_both_se_kinds() {
+        let st = crate::rollback_testkit::play_state();
+        let se = st.stats().se;
+        assert_eq!(
+            (se.hit_mode, se.cutin_mode),
+            (SeTiming::Confirmed, SeTiming::Confirmed)
+        );
+        for id in [SE_ID_HIT, SE_ID_LAST_LIFE, SE_ID_CUTIN, SE_ID_CUTIN_SPELL] {
+            let (mut g, mut st) = (FakeGame::new(), crate::rollback_testkit::play_state());
+            g.se_noise = false;
+            g.se_p2_eq = Some((0x44, id));
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            assert_eq!(g.se_queue(), Vec::<(u32, u32)>::new(), "id {id:#X}");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_live_cutin_waits_for_the_confirmed_tick_and_sounds_once() {
+        for id in CUTIN_IDS {
+            let (mut g, mut st) = cutin_game(SeTiming::Confirmed, id);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            assert_eq!(
+                g.se_queue(),
+                Vec::<(u32, u32)>::new(),
+                "id {id:#X}: 未確定のカットインの音を待ち行列に残した"
+            );
+            g.play_and_draw();
+            assert_eq!(
+                g.played_ids(),
+                Vec::<u32>::new(),
+                "id {id:#X}: 確定の前に鳴った"
+            );
+            let se = st.stats().se;
+            assert_eq!(
+                (
+                    se.cutin_waited,
+                    se.hit_waited,
+                    se.live_ids,
+                    se.live_cutin,
+                    se.live_spell
+                ),
+                (1, 0, 0, 0, 0),
+                "{se:?}"
+            );
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
+            assert_eq!(g.se_pushed, vec![(id, 0)], "id {id:#X}");
+            g.play_and_draw();
+            assert_eq!(g.played_ids(), vec![id], "id {id:#X}");
+            let se = st.stats().se;
+            assert_eq!(
+                (
+                    se.cutin_matched,
+                    se.replayed_cutin + se.replayed_spell,
+                    se.replayed
+                ),
+                (1, 1, 1),
+                "{se:?}"
+            );
+            assert_eq!(
+                (se.cutin_late_sum, se.cutin_late_max),
+                (1, 1),
+                "確定の回 30 の次の do_frame で積んだ遅れ: {se:?}"
+            );
+            assert_eq!((se.hit_matched, se.hit_live_matched), (0, 0), "{se:?}");
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
+            assert_eq!(g.se_pushed.len(), 1, "id {id:#X}: 2 回目が積まれた");
+
+            let (mut g, mut st) = cutin_game(SeTiming::Live, id);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            assert_eq!(g.se_queue(), vec![(id, 1)], "id {id:#X}: live で待たせた");
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
+            assert_eq!(g.se_pushed.len(), 0, "id {id:#X}");
+            let se = st.stats().se;
+            assert_eq!(
+                (se.cutin_waited, se.live_ids, se.suppressed),
+                (0, 1, 1),
+                "{se:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_predicted_cutin_that_the_confirmation_does_not_repeat_is_never_played() {
+        let words = [(TickKind::Confirmed, 30, 0), (TickKind::Confirmed, 31, 0)];
+        for id in CUTIN_IDS {
+            let (mut g, mut st) = cutin_game(SeTiming::Confirmed, id);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            g.play_and_draw();
+            resim_once(&mut g, &mut st, &words);
+            g.play_and_draw();
+            assert_eq!(
+                g.played_ids(),
+                Vec::<u32>::new(),
+                "id {id:#X}: 幻のカットインの音が鳴った"
+            );
+            assert_eq!(g.se_pushed.len(), 0);
+            let se = st.stats().se;
+            assert_eq!(
+                (
+                    se.cutin_waited,
+                    se.cutin_matched,
+                    se.replayed_cutin + se.replayed_spell
+                ),
+                (1, 0, 0),
+                "{se:?}"
+            );
+            let (mut g, mut st) = cutin_game(SeTiming::Live, id);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            g.play_and_draw();
+            resim_once(&mut g, &mut st, &words);
+            assert_eq!(g.played_ids(), vec![id], "id {id:#X}: live は幻でも鳴る");
+        }
+    }
+
+    #[test]
+    fn a_cutin_confirmed_three_or_more_frames_away_still_sounds_once() {
+        for d in -6i32..=6 {
+            let frame = (30 + d) as u32;
+            let near = d.unsigned_abs() <= SE_NEAR;
+            let (mut g, mut st) = cutin_game(SeTiming::Confirmed, SE_ID_CUTIN);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            g.play_and_draw();
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
+            g.play_and_draw();
+            assert_eq!(g.played_ids(), vec![SE_ID_CUTIN], "d = {d}");
+            assert_eq!(st.stats().se.cutin_matched, u32::from(near), "d = {d}");
+
+            let (mut g, mut st) = cutin_game(SeTiming::Live, SE_ID_CUTIN);
+            tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+            g.play_and_draw();
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, frame, 0x44)]);
+            g.play_and_draw();
+            assert_eq!(
+                g.played_ids().len(),
+                1 + usize::from(!near),
+                "d = {d}（live の対照）"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_live_cutin_sounds_at_once() {
+        let (mut g, mut st) = cutin_game(SeTiming::Confirmed, SE_ID_CUTIN);
+        st.hint.remote_next = 31;
+        st.front = 30;
+        tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+        assert_eq!(
+            g.se_queue(),
+            vec![(SE_ID_CUTIN, 1)],
+            "確定したカットインを待たせた"
+        );
+        g.play_and_draw();
+        assert_eq!(g.played_ids(), vec![SE_ID_CUTIN]);
+        let se = st.stats().se;
+        assert_eq!(
+            (se.cutin_waited, se.live_ids, se.live_cutin),
+            (0, 1, 1),
+            "{se:?}"
+        );
+        resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 30, 0x44)]);
+        assert_eq!(
+            g.se_pushed.len(),
+            0,
+            "即座に鳴ったカットインがもう 1 回鳴る"
+        );
+        let (mut g, mut st) = cutin_game(SeTiming::Confirmed, SE_ID_CUTIN);
+        st.hint.remote_next = 31;
+        st.front = 28;
+        tick_with(&mut g, &mut st, TickKind::Live, 30, 0x44);
+        assert_eq!(
+            g.se_queue(),
+            Vec::<(u32, u32)>::new(),
+            "前に未確定が残っている"
+        );
+    }
+
+    #[test]
+    fn a_predicted_resim_tick_does_not_play_or_remember_a_cutin_when_it_waits() {
+        for id in CUTIN_IDS {
+            let (mut g, mut st) = cutin_game(SeTiming::Confirmed, id);
+            resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
+            assert_eq!(
+                g.se_pushed.len(),
+                0,
+                "id {id:#X}: 予測の回のカットインの音を積んだ"
+            );
+            let se = st.stats().se;
+            assert_eq!(
+                (se.resim_ids, se.new_ids, se.suppressed, se.cutin_waited),
+                (0, 0, 0, 0),
+                "{se:?}"
+            );
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 40, 0x44)]);
+            assert_eq!(g.se_pushed, vec![(id, 0)]);
+            let (mut g, mut st) = cutin_game(SeTiming::Live, id);
+            resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
+            assert_eq!(g.se_pushed, vec![(id, 0)], "live は今までどおり積む");
+        }
+    }
+
+    #[test]
+    fn the_hit_and_cutin_timings_are_independent_and_leave_the_other_se_alone() {
+        let live_tick = |hit: SeTiming, cutin: SeTiming| {
+            let mut g = FakeGame::new();
+            g.se_noise = false;
+            g.se_p1_change = Some(0);
+            g.se_p2_eq = Some((0x44, SE_ID_CUTIN));
+            let mut st = crate::rollback_testkit::play_state();
+            st.set_hit_se(hit);
+            st.set_cutin_se(cutin);
+            g.se_queue_push(7, 10);
+            g.se_queue_push(7, 20);
+            GameWindow {
+                mem: &mut g,
+                st: &mut st,
+            }
+            .tick(Tick {
+                frame: 30,
+                p1: 4,
+                p2: 0x44,
+                kind: TickKind::Live,
+            });
+            let q = read_se_queue(&mut AsOutputs(&mut g));
+            let got: Vec<(u32, i32, u32)> = q.events().map(|(e, c)| (e.id, e.pan, c)).collect();
+            (got, st.stats().se)
+        };
+        use SeTiming::{Confirmed as C, Live as L};
+        let (got, se) = live_tick(C, L);
+        assert_eq!(got, vec![(7, 15, 2), (SE_ID_CUTIN, 0, 1)], "被弾音だけ待つ");
+        assert_eq!((se.hit_waited, se.cutin_waited), (1, 0), "{se:?}");
+        let (got, se) = live_tick(L, C);
+        assert_eq!(
+            got,
+            vec![(7, 15, 2), (SE_ID_HIT, 0, 1)],
+            "カットインの音だけ待つ"
+        );
+        assert_eq!((se.hit_waited, se.cutin_waited), (0, 1), "{se:?}");
+        assert_eq!((se.hit_live_sounded, se.live_ids), (1, 1), "{se:?}");
+        let (got, se) = live_tick(C, C);
+        assert_eq!(got, vec![(7, 15, 2)], "両方待つ");
+        assert_eq!(
+            (se.hit_waited, se.cutin_waited, se.live_ids),
+            (1, 1, 0),
+            "{se:?}"
+        );
+        let (got, se) = live_tick(L, L);
+        assert_eq!(
+            got,
+            vec![(7, 15, 2), (SE_ID_HIT, 0, 1), (SE_ID_CUTIN, 0, 1)],
+            "どちらも待たない"
+        );
+        assert_eq!(
+            (se.hit_waited, se.cutin_waited, se.live_ids),
+            (0, 0, 2),
+            "{se:?}"
+        );
+    }
+
+    #[test]
+    fn counting_a_live_hit_in_a_predicted_resim_tick_does_not_depend_on_the_cutin_timing() {
+        for cutin in [SeTiming::Confirmed, SeTiming::Live] {
+            let (mut g, mut st) = hit_game(SeTiming::Live, SE_ID_HIT);
+            st.set_cutin_se(cutin);
+            resim_once(&mut g, &mut st, &[(TickKind::Predicted, 40, 0x44)]);
+            assert_eq!(g.se_pushed, vec![(SE_ID_HIT, 0)], "{cutin:?}");
+            let se = st.stats().se;
+            assert_eq!(
+                (se.hit_live_sounded, se.hit_live_matched),
+                (1, 0),
+                "{cutin:?}: {se:?}"
+            );
+            resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 40, 0x44)]);
+            assert_eq!(st.stats().se.hit_live_matched, 1, "{cutin:?}");
+        }
+    }
+
+    #[test]
+    fn a_whole_late_run_sounds_hit_and_cutin_once_each_whatever_the_two_timings() {
+        use SeTiming::{Confirmed as C, Live as L};
+        let run = |hit: SeTiming, cutin: SeTiming| {
+            let mut g = FakeGame::new();
+            g.se_noise = false;
+            g.se_p2_change = Some(1); // 相手の語 3 で id 4（被弾音）
+            g.se_p1_change = Some(0x0E - 5); // 自分の語 5 で id 0xE（カットイン）
+            let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
+            let mut st = crate::rollback_testkit::play_state();
+            st.set_hit_se(hit);
+            st.set_cutin_se(cutin);
+            rb.begin_seg(1);
+            let feed = feed_one_by_one(remote_steps);
+            for k in 0..60 {
+                feed(&mut rb, k);
+                let (f, p) = frame(&mut rb, &mut st, &mut g, if k >= 25 { 5 } else { 0 });
+                assert!(matches!(f, ScanFrame::Ran { .. }), "{k}: {f:?}");
+                assert!(matches!(p, PostFrame::Done(_)), "{k}: {p:?}");
+            }
+            assert_eq!(st.fault(), None);
+            assert!(
+                rb.stats().resims > 10,
+                "進め直しが起きていない（検査の前提）"
+            );
+            let draw_of = |id: u32| {
+                let at: Vec<u32> = g.se_log.iter().filter(|e| e.1 == id).map(|e| e.0).collect();
+                assert_eq!(
+                    at.len(),
+                    1,
+                    "id {id:#X} が {} 回鳴った: {:?}",
+                    at.len(),
+                    g.se_log
+                );
+                at[0]
+            };
+            let (hit_at, cutin_at) = (draw_of(SE_ID_HIT), draw_of(SE_ID_CUTIN));
+            let mut ids = g.played_ids();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![1, 4, 6, SE_ID_CUTIN],
+                "ほかの SE の回数が変わった"
+            );
+            (hit_at, cutin_at, st.stats().se)
+        };
+        let (live_hit, live_cutin, se) = run(L, L);
+        assert_eq!(
+            (se.hit_waited, se.cutin_waited, se.live_ids),
+            (0, 0, 4),
+            "{se:?}"
+        );
+        let (hit_c, cutin_l, se) = run(C, L);
+        assert_eq!((se.hit_waited, se.cutin_waited), (1, 0), "{se:?}");
+        assert_eq!(se.cutin_late_max, 0, "{se:?}");
+        assert_eq!(cutin_l, live_cutin, "被弾音の設定がカットインの音に効いた");
+        assert!(hit_c > live_hit, "被弾音が待たされていない");
+        let (hit_l, cutin_c, se) = run(L, C);
+        assert_eq!((se.hit_waited, se.cutin_waited), (0, 1), "{se:?}");
+        assert_eq!((se.cutin_matched, se.replayed_cutin), (1, 1), "{se:?}");
+        assert!(
+            se.cutin_late_max >= 1 && u64::from(se.cutin_late_max) <= se.cutin_late_sum,
+            "{se:?}"
+        );
+        assert_eq!(hit_l, live_hit, "カットインの音の設定が被弾音に効いた");
+        assert!(cutin_c > live_cutin, "カットインの音が待たされていない");
+        let (hit_cc, cutin_cc, se) = run(C, C);
+        assert_eq!((se.hit_waited, se.cutin_waited), (1, 1), "{se:?}");
+        assert_eq!((hit_cc, cutin_cc), (hit_c, cutin_c));
     }
 
     fn tick_with(
@@ -4004,7 +4360,7 @@ pub(crate) mod tests {
     fn boundaries_follow_the_scene_the_scan_and_unconfirmed_list_changes() {
         for ret in [2, 30, 1] {
             let mut g = FakeGame::new();
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             g.ret = ret;
             assert!(
                 !tick_with(&mut g, &mut st, TickKind::Predicted, 1, 0),
@@ -4013,7 +4369,7 @@ pub(crate) mod tests {
         }
         for ret in [0, -1] {
             let mut g = FakeGame::new();
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             g.ret = ret;
             assert!(
                 tick_with(&mut g, &mut st, TickKind::Confirmed, 1, 0),
@@ -4022,17 +4378,17 @@ pub(crate) mod tests {
             assert_eq!(st.stats().abnormal_ticks, 1);
         }
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.consume = false;
         assert!(tick_with(&mut g, &mut st, TickKind::Confirmed, 1, 0));
         for kind in [TickKind::Confirmed, TickKind::Predicted] {
             let mut g = FakeGame::new();
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             g.scene_on_p2 = Some(9);
             assert!(tick_with(&mut g, &mut st, kind, 1, 9), "{kind:?}");
         }
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.list_on_p2 = Some(4);
         assert!(tick_with(&mut g, &mut st, TickKind::Predicted, 1, 4));
         assert!(!tick_with(&mut g, &mut st, TickKind::Confirmed, 1, 4));
@@ -4045,7 +4401,7 @@ pub(crate) mod tests {
     #[test]
     fn a_live_tick_is_confirmed_only_on_the_front_with_a_real_word() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         g.list_on_p2 = Some(4);
         st.front = 5;
         st.hint = Hint {
@@ -4076,7 +4432,7 @@ pub(crate) mod tests {
     #[test]
     fn the_scan_point_reads_the_local_word_once_and_orders_the_scan() {
         let mut rb = Rollback::new(Config::rollback(Seat::P2, 1, 2));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         let mut reads = 0u32;
         let mut sent = Vec::new();
@@ -4163,7 +4519,7 @@ pub(crate) mod tests {
     #[test]
     fn outside_allocations_are_counted_only_while_predicting() {
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 0, 8));
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         g.alloc_on_p2 = Some(0);
         for _ in 0..3 {
@@ -4217,7 +4573,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         setup(&mut g);
         let before: Vec<u32> = (0..16).map(|i| g.get(x + 4 * i)).collect();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4261,7 +4617,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         setup(&mut g);
         g.refuse_node_writes = true;
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4279,7 +4635,7 @@ pub(crate) mod tests {
     }
 
     /// 更新の節 `x`（fn = 種類 5 の更新 `0x4224F0`）と描画の節 `d`（fn = `0x422C10`）が同じ本体 `body`（0x38 B。`+0x08` が `x`、
-    /// `+0x0C` が `d`）を指す形を、偽のゲームへ置く。節も本体もコピーの範囲の外のヒープ。
+    /// `+0x0C` が `d`）を指す形を、偽のゲームへ用意する。節も本体もコピーの範囲の外のヒープ。
     fn screen_effect_scene(g: &mut FakeGame, x: u32, d: u32, body: u32) {
         let reg = UPDATE_REGISTRY;
         let draw = UPDATE_REGISTRY + UPDATE_DRAW_HEAD;
@@ -4326,7 +4682,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         screen_effect_scene(&mut g, x, d, body);
         let before = words_at(&g, body, BODY_WORDS);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4374,7 +4730,7 @@ pub(crate) mod tests {
         let inside = ARENA_BASE + 0x100;
         let mut g = FakeGame::new();
         screen_effect_scene(&mut g, x, d, inside);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4388,7 +4744,7 @@ pub(crate) mod tests {
         screen_effect_scene(&mut g, x, d, heap);
         g.mem.insert(x + UPDATE_FN, 0x0042_0190);
         g.mem.insert(d + UPDATE_FN, 0x0043_1540);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4402,7 +4758,7 @@ pub(crate) mod tests {
         assert_eq!(g.body_reads, 0, "別の関数の this を読んだ");
         let mut g = FakeGame::new();
         screen_effect_scene(&mut g, x, d, heap);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4416,7 +4772,7 @@ pub(crate) mod tests {
         let (x, d, body) = (0x0BAB_0FD8u32, 0x0BAB_1050u32, 0x0BAC_0000u32);
         let mut g = FakeGame::new();
         screen_effect_scene(&mut g, x, d, body);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4470,7 +4826,7 @@ pub(crate) mod tests {
         let cap = OUTSIDE_BODIES_CAP as u32;
         let mut g = FakeGame::new();
         let v = chain(&mut g, cap);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4486,7 +4842,7 @@ pub(crate) mod tests {
         assert_eq!(g.body_writes, cap);
         let mut g = FakeGame::new();
         let v2 = chain(&mut g, cap + 1);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4510,7 +4866,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         let v = chain(&mut g, 1);
         g.mem.insert(v[0].1 + SCREEN_EFFECT_UPDATE_NODE, 0x1234);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4534,7 +4890,7 @@ pub(crate) mod tests {
         let mut g = FakeGame::new();
         let v = chain(&mut g, 1);
         g.refuse_body_writes = true;
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4595,7 +4951,7 @@ pub(crate) mod tests {
     #[test]
     fn restore_moves_a_block_back_when_its_free_was_held() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -4630,7 +4986,7 @@ pub(crate) mod tests {
         assert_eq!((reg.start, reg.end), (0x004A_CFC8, 0x004A_D008));
         assert_eq!(ROLLBACK_PLAY_DATA.len(), ROLLBACK_DATA.len() + 1);
         assert!(!ROLLBACK_DATA.iter().any(|d| d.start == 0x004A_CFC8));
-        let st = play_state();
+        let st = play_state_cutin_live();
         let n_data = st
             .plan()
             .regions()
@@ -4657,6 +5013,7 @@ pub(crate) mod tests {
         assert_eq!(check_table(&all, FORBIDDEN), Ok(()));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn play_values_appear_in_the_note() {
         let start = NOTE.find("## 30. ").expect("ノートに §30 が無い");
@@ -4885,7 +5242,7 @@ pub(crate) mod tests {
                         def.name
                     );
                     assert!(h.tramps.is_empty() && h.scan_original.is_none(), "{i}");
-                    assert!(log.contains("どこにも書かない"), "{log}");
+                    assert!(log.contains("どこにも書きません"), "{log}");
                 }
             }
         }
@@ -5038,7 +5395,7 @@ pub(crate) mod tests {
     /// （本物の表が空になったら、直した側の検査が落ちるように）。
     fn state_for(fixed: bool) -> PlayState {
         if fixed {
-            play_state()
+            play_state_cutin_live()
         } else {
             PlayState::new_with_resets(Tables::th09_play(), &[], ARENA_BASE, ARENA_BYTES).unwrap()
         }
@@ -5238,7 +5595,10 @@ pub(crate) mod tests {
         );
         assert!(mk(&MANY).is_err());
         assert_eq!(mk(RENDER_RESETS).unwrap().stats().reset_rows, 2);
-        assert_eq!(play_state().stats().reset_rows, RENDER_RESETS.len() as u32);
+        assert_eq!(
+            play_state_cutin_live().stats().reset_rows,
+            RENDER_RESETS.len() as u32
+        );
     }
 
     #[test]
@@ -5464,7 +5824,7 @@ pub(crate) mod tests {
             confirmed: true,
         };
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut m = Scripted {
             steps: [Step::Wait(Wait::Ahead), Step::Wait(Wait::Boundary), ran].into(),
             input_points: 0,
@@ -5486,7 +5846,7 @@ pub(crate) mod tests {
         assert_eq!(g.scans.len(), 1);
         for why in [Wait::Fault, Wait::NotCaptured, Wait::Sync] {
             let mut g = FakeGame::new();
-            let mut st = play_state();
+            let mut st = play_state_cutin_live();
             let mut m = Scripted {
                 steps: [Step::Wait(why)].into(),
                 input_points: 0,
@@ -5505,7 +5865,7 @@ pub(crate) mod tests {
     #[test]
     fn words_keep_ctrl_and_are_masked_before_they_reach_the_game_and_the_recorded_rows() {
         let mut g = FakeGame::new();
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         {
             let mut w = GameWindow {
                 mem: &mut g,
@@ -5534,7 +5894,7 @@ pub(crate) mod tests {
         assert_eq!(rows, vec![(3, 0x0135, 0x0134)]);
     }
 
-    /// 直す前の製品の経路の .data の表（7 行 ＋ つなぎ。`globals_c` が fps の計測の 6 語を含む）。対照の実行だけが使う。
+    /// 直す前の製品の経路の .data の表（7 行 ＋ リンク。`globals_c` が fps の計測の 6 語を含む）。対照の実行だけが使う。
     static OLD_PLAY_DATA: [RbData; 8] = [
         ROLLBACK_DATA[0],
         ROLLBACK_DATA[1],
@@ -5565,7 +5925,7 @@ pub(crate) mod tests {
     fn fps_words_are_left_out_of_the_play_copy() {
         for fixed in [true, false] {
             let mut st = if fixed {
-                play_state()
+                play_state_cutin_live()
             } else {
                 PlayState::new(
                     Tables {
@@ -5723,7 +6083,7 @@ pub(crate) mod tests {
             vm_array_shape(&t, v, &mut AsLayout(&mut g), 7),
             Err(LayoutError::Null(7))
         );
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         let mut g = FakeGame::new();
         g.set_bg(BG_VM_MAX + 1);
         run_late_remote(&mut st, &mut g, 120);
@@ -5778,7 +6138,7 @@ pub(crate) mod tests {
     fn a_background_array_that_changed_shape_is_not_put_back() {
         let mut g = FakeGame::new();
         g.set_bg(10);
-        let mut st = play_state();
+        let mut st = play_state_cutin_live();
         GameWindow {
             mem: &mut g,
             st: &mut st,
@@ -5830,6 +6190,7 @@ pub(crate) mod tests {
         assert_eq!(FPS_LABELS[fps_bucket(60)], "60");
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn m8_7_values_appear_in_the_note() {
         use crate::th09_addr::{

@@ -1,41 +1,12 @@
 //! 遅れの量を選ぶ形の純粋な部分: 推奨値の式・初めの値・数字キーの押下の記録。両者が数字キーで変える（ゲストの押下はホストへの要求）。
 //!
-//! ## 推奨値（`recommend`）
-//!
-//! 片道 ≈ RTT / 2 を 1 フレーム（1000 / 60 ms）で割ったフレーム数を元にする。範囲は両方式とも `RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。
-//! - delay 方式: 片道を切り上げる（相手の入力ワードが使うフレームまでに届く遅れの最小。これより小さいと毎フレーム待つ）。
-//! - rollback: 片道の半分を D で吸い、残りを予測で埋める（半分を四捨五入し、ちょうど半分は遅れの少ない低い側）。片道を全部 D で吸うと
-//!   遠い相手で入力の遅れが大きすぎる（往復 約 280 ms の実回線で D 8 より D 4 の方が遊びやすかった。1 組の体感）。
-//!
-//! 0 を推すのは、直近の往復の窓の最大が方式ごとのしきい値（`ZERO_MAX_ROLLBACK_MS` / `ZERO_MAX_DELAY_MS`）以下のときだけ
-//! （`recommend_with_max`）。1 回でも揺れた回線では 0 にしない（D 0 は毎フレーム予測し、delay 方式の 0 は毎フレーム 1 往復を待つ）。
-//! 最大が無い（窓が 3 個に満たない・往復を持たない呼び手）ときは 0 を推さない。
-//!
-//! RTT は生存の測り（`liveness::Liveness::rtt_ms`。受信スレッドが PONG を受けた時刻で測る）で、測れていなければ推奨は出さない（`None`）。
-//!
-//! ## 両者が選ぶ（`DelayPick`）
-//!
-//! - 押した瞬間ごとに 1 つ値を作る。作った値は `Connected::press_delay` へ渡し、ネットワーク側がホストなら予定（rollback）・切替（delay 方式）に、
-//!   ゲストならホストへの要求にする。値を持ち続けて毎フレーム比べると、両者が変えたとき古い値を要求し続けて上書きし合う。
-//! - delay 方式の初めの値は推奨値: マッチの始まり（`begin_match`）で、ホストがまだ何も押していなければ 1 回だけ作る。rollback の
-//!   初めの値は AGREE の D（明示の選択）。ゲストは推奨値を出さない（2 つの値が競う）。
-//! - 範囲は `bounds`（両形式とも 0〜`mode_pick::MAX_PICK_DELAY` = 8）。ホストはゲストの要求も同じ範囲に詰める。
-//!
-//! ## 数字キーと auto
-//!
-//! Ctrl+上段の数字の押下は `Connected::press_delay(x)` へ渡る。0〜8 はその値、9 は `AUTO`。auto は接続ごとの 1 つの旗でホストが持つ:
-//! 9 で立ち、0〜8（ホストの押下もゲストの要求も）で降りる（後勝ち）。立っている間、ホストは 9 を押した瞬間・ゲストが auto を
-//! 要求したとき・seg の最初の取得のときだけ D を `recommend`（直近 8 回の往復の中央値）にする。マッチの途中では追わない。
-//! ゲストの auto の要求は INPUT の lat の delay の欄に `AUTO` を載せる。
-//! seg の始まりの見直しだけは変わりにくくする（往復が境目で揺れてマッチごとに D が替わるのを避ける）: 上げるのは「往復 − `UP_MARGIN_MS`」で
-//! 引いた推奨値が今の D より大きいときだけ（最大も同じ余裕で引く。0 から上がるのは最大がしきい値 + `UP_MARGIN_MS` を越えたとき）、
-//! 下げるのは素の推奨値が今の D より小さい seg の始まりが `DOWN_RUN` 回続いたときだけ。規則は `AutoHold` に 1 つ。
-//!
-//! ## 並び
-//!
-//! メニューの「ディレイ」の ← → の並びは auto, 0F, 1F, …, 8F（auto が左端。端で止まり折り返さない）。動かし方は `DelayChoice::step` に 1 つ。
-//!
-//! 遅延の増分: 0（値は既存の INPUT の lat の欄で運ぶ）。
+//! - 推奨値（`recommend`）: 片道 ≈ RTT / 2 を 1 フレームで割った数が元。範囲は `RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。delay 方式は片道を切り上げ、rollback は片道の半分を D で吸って残りを予測で埋める。
+//!   0 を推すのは、直近の往復のウィンドウの最大がしきい値以下のときだけ（`recommend_with_max`）。RTT が測れていなければ推奨は出さない（`None`）。
+//! - 両者が選ぶ（`DelayPick`）: 押した瞬間ごとに 1 つ値を作って `Connected::press_delay` へ渡す。値を持ち続けて毎フレーム比べると、両者が変えたとき古い値を要求し続けて上書きし合う。
+//! - 初めの値: delay 方式は推奨値（`begin_match` でホストが 1 回だけ作る）、rollback は AGREE の D。ゲストは推奨値を出さない（2 つの値が競う）。範囲は `bounds`（0〜8）。
+//! - 数字キーと auto: Ctrl+数字の 0〜8 はその値、9 は `AUTO`（接続ごとの旗でホストが持つ。0〜8 で降りる、後勝ち）。立っている間、ホストは 9 を押した瞬間・ゲストが auto を要求したとき・seg の最初の取得のときだけ D を `recommend` にする。
+//!   seg の始まりの見直しを変わりにくくする規則は `AutoHold` に 1 つ。
+//! - メニューの「ディレイ」の並びは auto, 0F, 1F, …, 8F（端で止まり折り返さない。`DelayChoice::step`）。遅延の増分: 0（値は既存の INPUT の lat の欄で運ぶ）。
 #![forbid(unsafe_code)]
 
 use crate::frame::MAX_DELAY;
@@ -54,10 +25,10 @@ const _: () = assert!(
 /// 推奨値の下限は別（`RECOMMEND_MIN`）。
 pub const DELAY_MIN: u8 = 0;
 
-/// 往復から引く推奨値の下限。0 を推すのは往復の窓の最大が下のしきい値以下のときだけ（`recommend_with_max`）。
+/// 往復から引く推奨値の下限。0 を推すのは往復のウィンドウの最大が下のしきい値以下のときだけ（`recommend_with_max`）。
 pub const RECOMMEND_MIN: u8 = 1;
 
-/// 往復の窓の最大がこれ以下なら推奨値を 0 にする（ms）。delay 方式の 0 は毎フレーム相手の語を待つので rollback の半分にした。
+/// 往復のウィンドウの最大がこれ以下なら推奨値を 0 にする（ms）。delay 方式の 0 は毎フレーム相手の語を待つので rollback の半分にした。
 /// どちらも実測の裏付けは無く、決め直してよい値。
 pub const ZERO_MAX_ROLLBACK_MS: u32 = 16;
 pub const ZERO_MAX_DELAY_MS: u32 = 8;
@@ -134,7 +105,7 @@ pub fn recommend(mode: Mode, rtt_ms: Option<u32>) -> Option<u8> {
     Some(frames.clamp(u64::from(RECOMMEND_MIN), u64::from(bounds(mode).1)) as u8)
 }
 
-/// 推奨値。往復の窓の最大 `max_ms` がしきい値（`zero_max_ms`）以下なら 0、そうでなければ `recommend`（中央値 `rtt_ms` で引く）。
+/// 推奨値。往復のウィンドウの最大 `max_ms` がしきい値（`zero_max_ms`）以下なら 0、そうでなければ `recommend`（中央値 `rtt_ms` で引く）。
 /// `max_ms` が `None` なら 0 を推さない。
 pub fn recommend_with_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<u8> {
     let r = recommend(mode, rtt_ms)?;
@@ -179,7 +150,7 @@ impl Recommend {
         Recommend::from_rtt_max(mode, rtt_ms, None)
     }
 
-    /// 往復の中央値と窓の最大（ms）から。測れていなければ `None`。`up` は両方から余裕を引く。引く値は 0 で止める。
+    /// 往復の中央値とウィンドウの最大（ms）から。測れていなければ `None`。`up` は両方から余裕を引く。引く値は 0 で止める。
     pub fn from_rtt_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<Recommend> {
         let raw = recommend_with_max(mode, rtt_ms, max_ms)?;
         let up = recommend_with_max(
@@ -298,7 +269,7 @@ pub struct DelayPick {
     digits: u32,
     /// delay 方式の推奨値を出したか、それより先に数字キーで値を作ったか。
     first_done: bool,
-    /// つなぐ前にメニュー（か ini の auto）で決めた遅延（ホストだけが使う）。
+    /// 接続前にメニュー（か ini の auto）で決めた遅延（ホストだけが使う）。
     start: Option<DelayChoice>,
 }
 
@@ -315,12 +286,12 @@ impl DelayPick {
         }
     }
 
-    /// つなぐ前に決めた遅延を置く（ホストの `begin_match` が使う。ゲストは使わない。両者が決めると 2 つの値が競う）。
+    /// 接続前に決めた遅延を設定する（ホストの `begin_match` が使う。ゲストは使わない。両者が決めると 2 つの値が競う）。
     pub fn set_start(&mut self, c: Option<DelayChoice>) {
         self.start = c;
     }
 
-    /// 形式の切替で作り直す: 形式を替え、渡す前の値とつなぐ前の遅延は捨てる（切替の STEP の D が新しい形式の初めの値になる）。
+    /// 形式の切替で作り直す: 形式を替え、渡す前の値と接続前の遅延は捨てる（切替の STEP の D が新しい形式の初めの値になる）。
     /// 押下の回数はそのまま。
     pub fn switch_mode(&mut self, mode: Mode) {
         self.mode = mode;
@@ -354,7 +325,7 @@ impl DelayPick {
         self.digits
     }
 
-    /// マッチの始まり: ホストで、まだ値を作っていなければ 1 回だけ初めの値を作る。つなぐ前に決めた遅延（`set_start`）があればそれ、
+    /// マッチの始まり: ホストで、まだ値を作っていなければ 1 回だけ初めの値を作る。接続前に決めた遅延（`set_start`）があればそれ、
     /// 無ければ delay 方式だけ今の推奨値（測れていなければ作らず、次のマッチの始まりで見る）。rollback の初めの値は AGREE の D のまま。
     /// ゲストは何もしない。
     pub fn begin_match(&mut self, rtt_ms: Option<u32>) {
@@ -464,7 +435,7 @@ mod tests {
         assert_eq!(dl(2, 9), Some(1));
         assert_eq!(dl(2, 16), Some(1), "rollback のしきい値では 0 にしない");
         assert_eq!(dl(70, 70), Some(3));
-        // 最大が無い（窓が 3 個に満たない・往復を持たない呼び手）なら 0 を推さない。
+        // 最大が無い（ウィンドウが 3 個に満たない・往復を持たない呼び手）なら 0 を推さない。
         for mode in [Mode::Delay, Mode::Rollback] {
             assert_eq!(recommend_with_max(mode, Some(0), None), Some(1), "{mode:?}");
             assert_eq!(recommend_with_max(mode, None, Some(0)), None, "{mode:?}");

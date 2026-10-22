@@ -1,61 +1,9 @@
 //! peer_sim の本体: 1 本のスレッドで、1 ms ごとに受信を取り出し、時計を進め、`higanr_core` の状態機械を呼ぶ。
-//!
-//! 流れ: 接続（`handshake`）→ 選択（`selection`。v0 は画面の模型を持たず、ホストが「決定」を 1 回押し、それを選択を出る押下として
-//! 扱う）→ マッチ（`lockstep`。seg ごとに決めたフレーム数）→ 次の seg（選択は 1 回目だけ）→ 終わったら BYE(終了)。繋がった後は、ずっと
-//! `liveness` を回す。受けたパケットをどの状態機械へ渡すかは `higanr_core::link` のセッション（dll と同じもの）が決め、ここはセッションを、いつ・どの
-//! 語で呼ぶかだけを決める。
-//!
-//! ## 道具としての決め事
-//!
-//! - **時計**: 1 ms 刻みの眠りと、1 フレームの枠（既定 60 fps。`RunOpts::fps`）。枠の中で相手の入力ワードが揃わなければ、その枠を stall として
-//!   数え、次の枠で同じフレームをやり直す。枠の境目は dll のペース B と同じ「基点 + floor(j × 1 秒 ÷ fps)」（`Slots`）。付いていく形の
-//!   マッチは時計の枠を使わない。
-//! - **語**: `word(seed, seg, capture_frame)`。0 を避ける（0 は開始直後の穴埋めの語と区別が付かない）。送るのは `word_mask` を掛けた後。
-//! - **CHECK**: ゲームの乱数とライフが無いので、それまでに使った (1P, 2P) の列のダイジェスト（FNV-1a 64 bit。seg をまたいで続ける）の
-//!   下 16 bit を rng_state、次の 32 bit を rng_count に入れ、ライフは 0 にする（`higanr_core::check`）。
-//! - **いつ終えるか**: 全部の seg を終え、相手の BYE を受けてから `LINGER_MS` 待って終える。待つ間も前の seg のバックアップの返信と、相手の
-//!   PING への BYE の返しを続ける。相手が 60 秒黙れば（`liveness` の Dead）それでも終える。`max_ms`（`--max-sec`）を過ぎたら途中でも
-//!   終え、繋がっていれば BYE(終了) を 1 通出す。
-//! - **繋がるまで待つ長さ**（`RunOpts::wait_ms`。`--wait-sec`）: 接続の手順が時間切れ（10 秒）になってもその長さまではセッションが作り直す
-//!   （`Link::set_retry_window`）。相手の花映塚の起動が遅い回のため。
-//!
-//! ## 付いていく形（`SimConfig::follow`）
-//!
-//! 相手が dll（本物の花映塚）のとき、マッチの長さはゲームが決める。付いていく形では seg の長さを自分で決めず、相手に合わせる:
-//! - **フレームを使う条件**: フレーム x を、相手がフレーム x で取った語（apply_frame x + delay）が届いてから使う（dll は場面を出る tick
-//!   では語を取らないので、dll が使わないフレームを先に使わない）。語は先に届いていても使わずに待ち、その間も 4 ms ごとに送り直す。
-//!   時計の枠は使わず、1 ms ごとに使えるだけ使う（stall は数えない）。
-//! - **seg の終わり**: 相手の次の seg の INPUT（`Recv::NextSeg`。再戦）か、選択の外で届いた今の step の MENU（`Recv::PeerSelecting`。
-//!   メニューへ戻って次の選択）で、使えるだけ使ってから seg を進める。
-//! - **終わり**: 相手の BYE(終了) で、使えるだけ使ってから自分も BYE(終了) を出し、`LINGER_MS` 待って終える。
-//! - 相手の入力ワードが落ちると、最後のフレームの入力ワードが届かず、そのフレームを使わずに seg を進めることがある（CHECK が合わなくなって分かる）。
-//!   dll から peer_sim への向きは、loopback でわざと壊さない。
-//! - **latency の切替**（`--lat`）: ホストなら台本の切替を、そのフレームの取得の前に要求する。**限り**: delay が k 減った切替
-//!   （フレーム a）の後は、相手の取得 a+1〜a+k が捨てられて語を作らないので、その k フレームは相手が取る前に使える。相手がその k
-//!   フレームの中でマッチを出ると、peer_sim は相手の使わなかったフレームを使い、CHECK が合わなくなって分かる。走らせる側が切替を
-//!   マッチの終わりから離して置く。
-//!
-//! ## rollback のモード（`RunOpts::mode`。`--mode rollback`）
-//!
-//! 両者が rollback を望んで取り決めで rollback に決まったら、マッチはセッションの `rollback_input_point` / `rollback_post_present` で回す
-//! （`Sim::play_rollback`）。peer_sim にはゲームが無いので、ウィンドウは状態を持たない `NoGame` で、場面の境目は「seg の最後のフレームの更新が
-//! 次の場面の要求を立てる」とする。記録・観戦・CHECK は**確定した** (frame, 1P, 2P) だけで作る（予測の入力ワードは流さない）ので、列は同じ語の
-//! delay 方式の実行と一致する。latency の切替の台本は delay 方式だけ。相手が delay 方式を望めば、delay 方式で走る。
-//!
-//! 付いていく形の rollback のモード（`--follow --mode rollback`）は、相手が取ったフレームまでを更新する（相手の入力ワードの数 `peer_top` が
-//! N + D + 1 に届いてから N を更新する。予測しない。D は seg の途中で替わりうるので `Rollback::peer_top_for`）。seg の最後のフレーム E を
-//! ワードの数から出す案は採らなかった: 確定した更新は取り消せず、E を知るのは次の seg の INPUT が届いた後なので、それまでに E + 1〜E + D を
-//! 確定させてしまう。dll は待つ間も次のフレームを取る（`rollback_play.rs` の `scan_point_with`）ので、dll が予測で最後のフレームを更新した
-//! 回は、付いていく側の記録に E + 1 の行が 1 つ余分に載りうる（推測。実測は無い）。
-//!
-//! ## 選択の台本（`run_with_menu` の `menu`。`--menu`）
-//!
-//! 台本の形と進み方は `menu_plan.rs`。画面は core の模型 `menu_model::Model` で追う（繋がったら `Model::new(7)`、付いていく形でマッチから
-//! 選択へ戻ったら `Model::new(8)`）。選択のフレームごとに `Runner::frame` → `selection_frame` → 入った押下を全部 `Model::apply` に通す →
-//! `Runner::after_frame`。`Model::apply` が `Err` なら（両者の画面が分かれた）`End::MenuDiverged` でやめ、BYE(取消) を出す。`MapDecided`
-//! なら模型の値で自分の SELECT を置いて揃うのを待つ。`LeftToMode` なら選択を出て、相手が次の選択に入る合図か、台本の `enter` を待つ
-//! （`Phase::Left`）。付いていく形で戻った選択の難易度は模型に無いので、前の選択で決めた値を持ち越して SELECT に載せる。台本なし（`run`）
-//! の実行は v0 のまま。
+//! 流れ: 接続（`handshake`）→ 選択（`selection`）→ マッチ（`lockstep`。seg ごとに決めたフレーム数）→ 次の seg（選択は 1 回目だけ）→ 終わったら BYE(終了)。接続した後は、ずっと `liveness` を回す。
+//! 受けたパケットをどの状態機械へ渡すかは `higanr_core::link` のセッション（dll と同じもの）が決め、ここはセッションを、いつ・どの語で呼ぶかだけを決める。
+//! 時計は 1 ms 刻みの眠りと 1 フレームの枠（既定 60 fps。`RunOpts::fps`）。枠の中で相手の入力ワードが揃わなければ、その枠を stall として数え、次の枠で同じフレームをやり直す（付いていく形は枠を使わない）。
+//! 付いていく形（`SimConfig::follow`）は、相手が dll（本物の花映塚）のとき、seg の長さを自分で決めず相手に合わせる。rollback のモード（`RunOpts::mode`）のマッチは `Sim::play_rollback` で回す。
+//! 選択の台本（`run_with_menu` の `menu`）の形と進み方は `menu_plan.rs`。
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -98,7 +46,7 @@ pub struct RunOpts<'a> {
     pub menu: Option<&'a MenuPlan>,
     /// 1 秒のフレーム数（既定 `DEFAULT_FPS` = 60。範囲は dll の `[pacing] fps` と同じ）。付いていく形のマッチは使わない。
     pub fps: u64,
-    /// 接続の手順を作り直して待ち続ける長さ（ms。`--wait-sec`）。None なら置かない（10 秒でやめる。既定）。
+    /// 接続の手順を作り直して待ち続ける長さ（ms。`--wait-sec`）。None なら設定しない（10 秒でやめる。既定）。
     pub wait_ms: Option<u32>,
     /// ネットワークの範囲（`--scope`。既定 loopback。`higanr_core::guard`）。受信ソケット・相手の候補・STUN の宛先と、送る直前のガードが使う。
     pub scope: Scope,
@@ -111,6 +59,8 @@ pub struct RunOpts<'a> {
     pub ahead: u8,
     /// rollback に決まったときの時刻合わせ（`--rb-sync on|off`）。既定は使う。切った実行と比べるため。
     pub time_sync: bool,
+    /// ホストの決め方（`higanr_core::host_pick`。`Link::set_host_pick` へ）。None なら使わない（既定。役は role_nonce のまま）。
+    pub host_pick: Option<higanr_core::host_pick::Setup>,
 }
 
 impl Default for RunOpts<'_> {
@@ -124,6 +74,7 @@ impl Default for RunOpts<'_> {
             mode: ModeWish::DELAY,
             ahead: rollback::DEFAULT_AHEAD,
             time_sync: true,
+            host_pick: None,
         }
     }
 }
@@ -266,7 +217,7 @@ pub enum End {
         step: Step,
         mismatch: menu_model::Mismatch,
     },
-    /// `max_ms` を過ぎた。繋がっていて、まだ閉じていなければ、BYE(終了) を 1 通出してから終える
+    /// `max_ms` を過ぎた。接続していて、まだ閉じていなければ、BYE(終了) を 1 通出してから終える
     /// （`Report::deadline_bye`。`Sim::finish` の注）。
     Deadline,
 }
@@ -275,13 +226,13 @@ pub enum End {
 pub struct MenuReport {
     pub items: usize,
     pub done: usize,
-    /// ゲストの要求が捨てられて押し直した数（`menu_plan::RETRY_FRAMES` 待ってから）。
+    /// 自分（ゲストの役）の要求が捨てられて押し直した数（`menu_plan::RETRY_FRAMES` 待ってから）。
     pub retries: u32,
-    /// 入った選択の数（繋がったとき・選択の外から入り直したとき・マッチから戻ったとき）。
+    /// 入った選択の数（接続したとき・選択の外から入り直したとき・マッチから戻ったとき）。
     pub selections: u32,
     /// 難易度の画面の取消で選択の外へ出た数。
     pub left_to_mode: u32,
-    /// 終わりの模型（最後に入った選択の。難易度・マップ・両席の決めた値）。繋がらなければ None。
+    /// 終わりの模型（最後に入った選択の。難易度・マップ・両席の決めた値）。接続しなければ None。
     pub model: Option<Model>,
     /// 相手の入力ワード（`FrameOut::remote`）が変わったところ（その入力ワードを使った step, 入力ワード）。
     pub remote_words: Vec<(u16, u16)>,
@@ -297,9 +248,9 @@ pub struct LatResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counts {
-    /// セッションの受信ソケットで数えたもの（相手のアドレス以外・解けない・session_id 違い・繋がる前）。
+    /// セッションの受信ソケットで数えたもの（相手のアドレス以外・解けない・session_id 違い・接続する前）。
     pub recv: link::RecvCounts,
-    /// 繋がった後にセッションが数えたもの（INPUT の扱い・取得の溢れ・CHECK の一致。繋がらなければ 0）。
+    /// 接続した後にセッションが数えたもの（INPUT の扱い・取得の溢れ・CHECK の一致。接続しなければ 0）。
     pub conn: link::ConnCounts,
     pub sends: u64,
     pub send_errors: u64,
@@ -346,12 +297,12 @@ pub struct Report {
     pub one_way_ms: u32,
     /// ネットワークの上で名乗ったバージョン（`FaultConfig::claim_ver`。無ければ今のバージョン `wire::PROTO_VER`）。バージョン違いの要約の「自分」。
     pub proto_ver: u8,
-    /// 接続の手順を作り直して待つ長さ（`RunOpts::wait_ms`。None なら置いていない）と、作り直した回数・直前の 1 回。
+    /// 接続の手順を作り直して待つ長さ（`RunOpts::wait_ms`。None なら設定していない）と、作り直した回数・直前の 1 回。
     pub retry_window_ms: Option<u32>,
     pub restarts: link::Restarts,
     pub max_ms: u32,
     pub spectate: Option<SpectateHostReport>,
-    /// `End::Deadline` で終えたとき、打ち切りの時点で BYE(終了) を出したか（繋がる前と、もう閉じていた・切れていたときは出さない）。
+    /// `End::Deadline` で終えたとき、打ち切りの時点で BYE(終了) を出したか（接続する前と、もう閉じていた・切れていたときは出さない）。
     pub deadline_bye: bool,
     pub elapsed_ms: u32,
 }
@@ -508,7 +459,7 @@ impl Tx {
         }
     }
 
-    /// 1 通を送る。宛先はセッションが候補か送り元から選んだもの（起動時にネットワークの範囲の中かを確かめてある）だが、送る直前にも範囲の中かを見る。
+    /// 1 通を送る。宛先はセッションが候補か送り元から選んだもの（起動時にネットワークの範囲の中かを検証してある）だが、送る直前にも範囲の中かを見る。
     fn raw(&mut self, to: SocketAddr, bytes: &[u8]) {
         if !self.may_send(to) {
             self.send_refused += 1;
@@ -591,7 +542,7 @@ enum Phase {
     Done,
 }
 
-/// 繋がった後の、道具の側の状態（状態機械はセッションの `Connected` が持つ）。
+/// 接続した後の、ツールの側の状態（状態機械はセッションの `Connected` が持つ）。
 struct Play {
     phase: Phase,
     seg_idx: u32,
@@ -625,11 +576,8 @@ struct Play {
     peer_top: u32,
 }
 
-/// rollback のモードのウィンドウ（`rollback::Window`）。ゲームが無いので状態を持たず、コピーも書き戻しも何もしない。場面の境目は「seg の最後の
-/// フレーム（`last`）の更新が次の場面の要求を立てる」とする。
-///
-/// 確定した (frame, 1P, 2P) は `rows` に積み、呼び手が delay 方式と同じ記録・CHECK の入口へ流す（`Sim::record_row`）。状態機械が取る
-/// CHECK（`Window::check`）は使わない（peer_sim の CHECK は使った列のダイジェスト）。
+/// rollback のモードのウィンドウ（`rollback::Window`）。ゲームが無いので状態を持たず、コピーも書き戻しも何もしない。場面の境目は「seg の最後のフレーム（`last`）の更新が次の場面の要求を立てる」とする。
+/// 確定した (frame, 1P, 2P) は `rows` に積み、呼び手が delay 方式と同じ記録・CHECK の入口へ流す（`Sim::record_row`）。状態機械が取る CHECK（`Window::check`）は使わない（peer_sim の CHECK は使った列のダイジェスト）。
 #[derive(Debug, Default)]
 struct NoGame {
     last: u32,
@@ -674,7 +622,7 @@ struct MenuRun {
     difficulty: Option<u8>,
     /// 直前の相手の入力ワード（変わったところだけ記録する）。
     last_remote: u16,
-    /// 自分の席のキャラのカーソル（MENU の末尾で知らせる）。
+    /// 自分の席のキャラのカーソル（MENU の末尾で相手へ知らせる）。
     cursor: SimCursor,
 }
 
@@ -760,7 +708,8 @@ pub fn run_opts(cfg: &SimConfig, sock: UdpSocket, opts: RunOpts) -> Result<Repor
     );
     link.set_mode(opts.mode, opts.ahead);
     link.set_time_sync(opts.time_sync);
-    // 書かなければ置かない（呼ばない形を既定の実行として保つ）。
+    link.set_host_pick(opts.host_pick);
+    // 書かなければ設定しない（呼ばない形を既定の実行として保つ）。
     if let Some(w) = opts.wait_ms {
         link.set_retry_window(w);
     }
@@ -991,7 +940,7 @@ impl Sim<'_> {
         }
     }
 
-    /// 付いていく形で今の seg を終える（相手は先に出ている。前の seg のバックアップの返信は続ける）。
+    /// 付いていく形で今の seg を終える（相手は先に出ている。相手の前の seg の INPUT へのバックアップの返信は続ける）。
     fn end_followed_seg(c: &mut Connected, p: &mut Play) {
         let seg = c.lockstep().seg();
         c.begin_seg(seg.wrapping_add(1));
@@ -1002,7 +951,7 @@ impl Sim<'_> {
         p.seg_idx += 1;
     }
 
-    /// セッションが繋がったら、道具の側の状態を作り、選択に入る（v0 は繋がったらすぐ選択の画面のつもり）。
+    /// セッションが接続したら、ツールの側の状態を作り、選択に入る（v0 は接続したらすぐ選択の画面のつもり）。
     fn maybe_start(&mut self) {
         if self.play.is_some() {
             return;
@@ -1052,7 +1001,7 @@ impl Sim<'_> {
             },
             peer_top: 0,
         };
-        // 観戦者へ: 繋がった seg（最初は 0）の始まり。選択の押下・SELECT・マッチの入力ワードはこの後ろ（dll の繋がった tick と同じ）。
+        // 観戦者へ: 接続した seg（最初は 0）の始まり。選択の押下・SELECT・マッチの入力ワードはこの後ろ（dll の接続した tick と同じ）。
         p.spec_seg(c.seg(), c);
         if p.menu.is_some() {
             Self::enter_menu(c, &mut p, &mut self.rep, SCREEN_DIFFICULTY);
@@ -1605,7 +1554,7 @@ impl Sim<'_> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // 借りを分けるため（セッション・道具の状態・送信側・記録を別々に借りる）
+    #[allow(clippy::too_many_arguments)] // 借りを分けるため（セッション・ツールの状態・送信側・記録を別々に借りる）
     fn applied(
         c: &mut Connected,
         p: &mut Play,
@@ -1663,7 +1612,7 @@ impl Sim<'_> {
 
     fn end_seg(c: &mut Connected, p: &mut Play, cfg: &SimConfig, seg: u16, now: u32) {
         p.seg_idx += 1;
-        // 最後の seg を終えた後も begin_seg して、前の seg のバックアップの返信だけを続ける。
+        // 最後の seg を終えた後も begin_seg して、相手の前の seg の INPUT へのバックアップの返信だけを続ける。
         c.begin_seg(seg.wrapping_add(1));
         p.spec_seg(seg.wrapping_add(1), c);
         p.arrivals.clear();
@@ -1677,10 +1626,8 @@ impl Sim<'_> {
     }
 
     /// 終わり方を決め、状態機械の数をコピーする。ズレ・選択の食い違い・打ち切りでは、BYE をここで 1 通出す。
-    ///
-    /// 打ち切り（`End::Deadline`）の BYE は理由を終了（`Finished`）にする。黙って終えると、dll は 60 秒の沈黙を待って「切断」と見るので、
-    /// 「peer_sim が打ち切った」と「ネットワークが切れた」が分けられない。取消は選択の食い違いと台本の中止に使っているので採らず、新しい理由の値も
-    /// 足さない（プロトコルのバージョンに触るため）。
+    /// 打ち切り（`End::Deadline`）の BYE の理由は終了（`Finished`）にする（黙って終えると dll は 60 秒の沈黙を待って「切断」と見て、打ち切りと回線切れが分けられない）。
+    /// 取消は選択の食い違いと台本の中止に使い、新しい理由の値は足さない（プロトコルのバージョンに触るため）。
     fn finish(mut self, end: End) -> Report {
         let end = match self.rep.end {
             End::Desync { local, remote } => End::Desync { local, remote },

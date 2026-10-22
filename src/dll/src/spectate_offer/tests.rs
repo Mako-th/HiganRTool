@@ -1,5 +1,5 @@
 //! 配る側（`spectate_offer.rs`）の検査。部品は毎回の回、観戦用のルームとの往復（loopback の偽サーバーと本物のスレッド。実時間で数秒）は
-//! `#[ignore]`（全件の回 `build.bat` が `--ignored` で走らせる）。外へは繋がない（`127.0.0.1` と `Proxy::Direct`）。ルーム名・アドレス・コードは合成の値だけ。
+//! `#[ignore]`（全件の回 `build.bat` が `--ignored` で走らせる）。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。ルーム名・アドレス・コードは合成の値だけ。
 use super::*;
 
 use std::time::{Duration, Instant};
@@ -39,10 +39,15 @@ const SESSION: u32 = 0x5EED_0B01;
 const SECRET: Secret = Secret([0x21; 16]);
 
 fn armed(s: &NetSettings, mapped: Option<SocketAddr>) -> Armed {
+    armed_v6(s, mapped, None)
+}
+
+fn armed_v6(s: &NetSettings, mapped: Option<SocketAddr>, v6: Option<SocketAddr>) -> Armed {
     arm_with(
         s,
         lo(47_001),
         mapped,
+        v6,
         None,
         Some(room_opts("ws://127.0.0.1:9")),
         || Ok(SESSION),
@@ -51,7 +56,8 @@ fn armed(s: &NetSettings, mapped: Option<SocketAddr>) -> Armed {
     .unwrap()
 }
 
-fn reply_text(session: u32, secret: Secret, cands: &[SocketAddr], now: u64) -> String {
+/// 期限 `expires` の観戦用のコードへの返し（返しの期限はコードの期限）。
+fn reply_text(session: u32, secret: Secret, cands: &[SocketAddr], expires: u64) -> String {
     let spec = Code {
         side: code::Side::Spectate,
         session_id: session,
@@ -59,13 +65,12 @@ fn reply_text(session: u32, secret: Secret, cands: &[SocketAddr], now: u64) -> S
         name: Name::new("host"),
         nat: higanr_core::nat::NatMark::UNKNOWN,
         candidates: Candidates::from_addrs(&[lo(47_001)]).unwrap(),
-        expires: now + 600,
+        expires,
     };
     code::write_spectate_reply_to(
         &spec,
         Name::new("viewer"),
         Candidates::from_addrs(cands).unwrap(),
-        now,
     )
     .unwrap()
 }
@@ -77,22 +82,114 @@ fn runner(s: &NetSettings) -> (Runner, Arc<Shared>) {
     (Runner::new(a.kit, room, None), shared)
 }
 
+const V4_ONLY: Families = Families {
+    v4: true,
+    v6: false,
+};
+const V6_ONLY: Families = Families {
+    v4: false,
+    v6: true,
+};
+const BOTH: Families = Families { v4: true, v6: true };
+
 #[test]
-fn punch_candidates_keep_only_the_in_scope_addresses_of_the_sockets_family() {
+fn punch_candidates_keep_only_the_in_scope_addresses_of_the_sockets_families() {
     let far: SocketAddr = "203.0.113.5:2000".parse().unwrap();
-    let v6: SocketAddr = "[2001:db8::1]:3000".parse().unwrap();
+    let v6: SocketAddr = "[2606:4700::1]:3000".parse().unwrap();
     let all = Candidates::from_addrs(&[lo(1_000), far, v6]).unwrap();
     let addrs = |c: Candidates| c.as_slice().iter().map(|x| x.addr).collect::<Vec<_>>();
     let has = |c: &[SocketAddr], a: SocketAddr| c.contains(&a);
-    let r = addrs(punch_candidates(&all, Scope::Loopback, true));
-    assert_eq!(r, vec![lo(1_000)], "範囲 loopback は同じ PC のアドレスだけ");
-    let r = addrs(punch_candidates(&all, Scope::Internet, true));
+    let r = addrs(punch_candidates(&all, Scope::Loopback, BOTH));
+    assert_eq!(
+        r,
+        vec![lo(1_000)],
+        "範囲 loopback は同じ PC のアドレスだけ（範囲の外の IPv6 へは穴あけを送らない）"
+    );
+    let r = addrs(punch_candidates(&all, Scope::Internet, V4_ONLY));
     assert!(has(&r, lo(1_000)) && has(&r, far) && !has(&r, v6), "{r:?}");
-    assert_eq!(r.len(), 2, "IPv4 の受信ソケットには IPv6 の候補を残さない");
-    let r = addrs(punch_candidates(&all, Scope::Internet, false));
-    assert_eq!(r, vec![v6], "IPv6 の受信ソケットには IPv6 だけ");
+    assert_eq!(
+        r.len(),
+        2,
+        "IPv6 のソケットが無ければ IPv6 の候補を残さない"
+    );
+    let r = addrs(punch_candidates(&all, Scope::Internet, V6_ONLY));
+    assert_eq!(r, vec![v6], "IPv6 のソケットだけなら IPv6 だけ");
+    let r = addrs(punch_candidates(&all, Scope::Internet, BOTH));
+    assert!(
+        has(&r, lo(1_000)) && has(&r, far) && has(&r, v6) && r.len() == 3,
+        "両方のソケットがあれば全部: {r:?}"
+    );
     let only_far = Candidates::from_addrs(&[far]).unwrap();
-    assert!(punch_candidates(&only_far, Scope::Loopback, true).is_empty());
+    assert!(punch_candidates(&only_far, Scope::Loopback, BOTH).is_empty());
+    let lan_v6: SocketAddr = "[fd00::5]:3000".parse().unwrap();
+    let only_v6 = Candidates::from_addrs(&[v6, lan_v6]).unwrap();
+    let r = addrs(punch_candidates(&only_v6, Scope::Lan, BOTH));
+    assert_eq!(r, vec![lan_v6], "範囲 lan は世界に通じる IPv6 を残さない");
+}
+
+#[test]
+fn the_offer_and_watch_codes_carry_an_ipv6_candidate_only_when_a_v6_socket_exists() {
+    let on = settings("");
+    let v6: SocketAddr = "[2606:4700::10]:47001".parse().unwrap();
+    let addrs = |c: &Candidates| c.as_slice().iter().map(|x| x.addr).collect::<Vec<_>>();
+    let a = armed_v6(&on, None, Some(v6));
+    assert!(
+        addrs(&a.kit.candidates).contains(&v6),
+        "観戦用のルームへ預けるコードに IPv6 が無い: {:?}",
+        addrs(&a.kit.candidates)
+    );
+    assert!(
+        addrs(&a.oneway.candidates).contains(&v6),
+        "観戦コードに IPv6 が無い"
+    );
+    assert_eq!(a.kit.families, BOTH);
+    // 読み戻した観戦用のコードにも載っている（コードの形式が観戦でも IPv6 を運べる）。
+    let text = a.oneway.write(5_000_000).unwrap();
+    let read = code::read_spectate(&text, 5_000_000).unwrap();
+    assert!(addrs(&read.code.candidates).contains(&v6));
+    // IPv6 のソケットが無ければ載せない。
+    let a = armed_v6(&on, None, None);
+    assert!(addrs(&a.kit.candidates).iter().all(SocketAddr::is_ipv4));
+    assert!(addrs(&a.oneway.candidates).iter().all(SocketAddr::is_ipv4));
+    assert_eq!(a.kit.families, V4_ONLY);
+    // 世界に通じない IPv6（文書用・リンクローカル）は、ソケットがあっても載せない（対戦のコードと同じ判定）。
+    for bad in ["[2001:db8::1]:47001", "[fe80::1]:47001"] {
+        let a = armed_v6(&on, None, Some(bad.parse().unwrap()));
+        assert!(
+            addrs(&a.kit.candidates).iter().all(SocketAddr::is_ipv4),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn arming_follows_the_link_so_a_host_both_allow_keeps_the_mapping() {
+    use higanr_core::lockstep::Role as Seat;
+    let link = Arc::new(LinkSlot::new());
+    let (a, note) = arm(&settings(""), lo(47_001), None, None, None, None, &link);
+    let a = a.expect(&note);
+    let offer = &a.kit.shared().offer;
+    assert!(!offer.keeps_mapping(), "接続の前");
+    link.mark_may_list(true);
+    link.mark_role(Seat::Guest);
+    assert!(!offer.keeps_mapping(), "ゲスト");
+    link.mark_role(Seat::Host);
+    assert!(offer.keeps_mapping(), "2 人とも許可したホスト");
+    link.mark_may_list(false);
+    assert!(!offer.keeps_mapping(), "片方が禁止したホスト");
+}
+
+/// 候補が空になる設定（STUN の答えが無い `candidates = mapped`）で用意に失敗したとき、句が簡潔にも出る形になる。
+#[test]
+fn an_arm_failure_note_is_seen_as_a_problem() {
+    let s = settings("scope = internet\ncandidates = mapped\nstun = stun.example.invalid:3478\n");
+    let link = Arc::new(LinkSlot::new());
+    let (a, note) = arm(&s, lo(47_001), None, None, None, None, &link);
+    assert!(a.is_none(), "候補が空なのに用意できた");
+    assert!(
+        note.starts_with(" / 観戦は使いません: ") && spectate_host::note_has_problem(&note),
+        "{note}"
+    );
 }
 
 #[test]
@@ -102,19 +199,22 @@ fn arming_needs_the_spectate_section_and_draws_fresh_values() {
     )
     .unwrap()
     .unwrap();
+    let link = Arc::new(LinkSlot::new());
     let (a, note) = arm(
         &off,
         lo(47_001),
         None,
         None,
+        None,
         Some(room_opts("ws://127.0.0.1:9")),
+        &link,
     );
     assert!(a.is_none() && note.is_empty(), "{note}");
     let on = settings("");
-    // ルームサーバーが無くても用意する（観戦コードの経路だけ）。配る側のスレッドは起こせない。
-    let (a, note) = arm(&on, lo(47_001), None, None, None);
+    // ルームサーバーが無くても用意する（観戦コードの経路だけ）。配る側のスレッドは作れない。
+    let (a, note) = arm(&on, lo(47_001), None, None, None, None, &link);
     let a = a.expect(&note);
-    assert!(note.contains("観戦用のルームへは入らない"), "{note}");
+    assert!(note.contains("観戦用のルームへは入りません"), "{note}");
     let room = RoomName::parse("synth-room").unwrap();
     let err = spawn(a.kit, &room, None).unwrap_err();
     assert!(err.contains("room_server"), "{err}");
@@ -123,11 +223,13 @@ fn arming_needs_the_spectate_section_and_draws_fresh_values() {
         lo(47_001),
         None,
         None,
+        None,
         Some(room_opts("ws://127.0.0.1:9")),
+        &link,
     );
     assert!(a.is_some(), "{note}");
     assert!(
-        note.contains("配る側を用意した") && !note.contains("127.0.0.1"),
+        note.contains("配信側を用意しました") && !note.contains("127.0.0.1"),
         "{note}"
     );
     let mapped: SocketAddr = "203.0.113.7:40000".parse().unwrap();
@@ -152,6 +254,7 @@ fn arming_needs_the_spectate_section_and_draws_fresh_values() {
         lo(47_001),
         None,
         None,
+        None,
         Some(room_opts("ws://127.0.0.1:9")),
         &mut draw,
         || Ok(Secret([1; 16])),
@@ -160,6 +263,7 @@ fn arming_needs_the_spectate_section_and_draws_fresh_values() {
     let a2 = arm_with(
         &on,
         lo(47_001),
+        None,
         None,
         None,
         Some(room_opts("ws://127.0.0.1:9")),
@@ -178,7 +282,10 @@ fn only_a_reply_with_the_right_tag_session_and_expiry_asks_for_a_punch() {
     let now = 5_000_000u64;
     let far: SocketAddr = "203.0.113.5:2000".parse().unwrap();
     let gen0 = shared.punch_generation();
-    r.punch(&reply_text(SESSION, SECRET, &[lo(41_000), far], now), now);
+    r.punch(
+        &reply_text(SESSION, SECRET, &[lo(41_000), far], now + 600),
+        now,
+    );
     assert_eq!(shared.punch_generation(), gen0 + 1, "正しい返しで頼まない");
     let asked = shared.peek_punch().expect("頼みが置かれている");
     assert_eq!(
@@ -189,16 +296,11 @@ fn only_a_reply_with_the_right_tag_session_and_expiry_asks_for_a_punch() {
     let c = shared.get().offer;
     assert_eq!((c.replies, c.punch_requested), (1, 1));
     let bad = [
-        reply_text(SESSION, Secret([0x77; 16]), &[lo(41_001)], now),
-        reply_text(SESSION ^ 1, SECRET, &[lo(41_002)], now),
-        reply_text(
-            SESSION,
-            SECRET,
-            &[lo(41_003)],
-            now - 2 * code::SPECTATE_REPLY_TTL_SECS,
-        ),
+        reply_text(SESSION, Secret([0x77; 16]), &[lo(41_001)], now + 600),
+        reply_text(SESSION ^ 1, SECRET, &[lo(41_002)], now + 600),
+        reply_text(SESSION, SECRET, &[lo(41_003)], now - 1),
         "not-a-code!".to_string(),
-        reply_text(SESSION, SECRET, &[far], now),
+        reply_text(SESSION, SECRET, &[far], now + 600),
     ];
     for t in &bad {
         r.punch(t, now);
@@ -224,23 +326,150 @@ fn only_a_reply_with_the_right_tag_session_and_expiry_asks_for_a_punch() {
     );
 }
 
+/// 観戦者の PC の時計がずれていても、すぐ出した返しはホストの時計で通る（返しの期限はホストのコードの期限）。
+#[test]
+fn a_reply_from_a_viewer_with_a_skewed_clock_still_asks_for_a_punch() {
+    let host_now = 5_000_000u64;
+    let a = armed(&settings(""), None);
+    let shared = Arc::clone(a.kit.shared());
+    let host_code = a.oneway.write(host_now).unwrap();
+    let mut r = Runner::new(
+        a.kit,
+        RoomName::parse("synth-room").unwrap().spectate_of(),
+        None,
+    );
+    for skew in [-600i64, 0, 600] {
+        let viewer_now = host_now.checked_add_signed(skew).unwrap();
+        // 観戦者の側の手順（`spectate_join` と同じ: 自分の時計でコードを読み、返しを書く）。
+        let spec = code::read_spectate(&host_code, viewer_now).unwrap();
+        let reply = code::write_spectate_reply_to(
+            &spec.code,
+            Name::new("viewer"),
+            Candidates::from_addrs(&[lo(41_200)]).unwrap(),
+        )
+        .unwrap();
+        let before = shared.punch_generation();
+        r.punch(&reply, host_now + 1);
+        assert_eq!(
+            shared.punch_generation(),
+            before + 1,
+            "時計が {skew} 秒ずれた観戦者の返しで穴あけを頼まない: {:?}",
+            shared.get().offer
+        );
+        // ホストのコードの期限が本当に過ぎた後の返しは捨てる。
+        let expired = shared.get().offer.expired;
+        r.punch(&reply, host_now + code::DEFAULT_TTL_SECS + 1);
+        assert_eq!(shared.punch_generation(), before + 1, "期限切れで頼んだ");
+        assert_eq!(shared.get().offer.expired, expired + 1);
+    }
+}
+
+/// `follow_mapping` を直に回す（ルームへは接続しない）。
+fn remap_runner(mapped: SocketAddr, upnp: Option<u16>) -> (Runner, OnewayCode, Arc<Shared>) {
+    let a = arm_with(
+        &settings(""),
+        lo(47_001),
+        Some(mapped),
+        None,
+        upnp,
+        Some(room_opts("ws://127.0.0.1:9")),
+        || Ok(SESSION),
+        || Ok(SECRET),
+    )
+    .unwrap();
+    let shared = Arc::clone(a.kit.shared());
+    let room = RoomName::parse("synth-room").unwrap().spectate_of();
+    (Runner::new(a.kit, room, None), a.oneway, shared)
+}
+
+fn addrs_of(c: &Candidates) -> Vec<SocketAddr> {
+    c.as_slice().iter().map(|x| x.addr).collect()
+}
+
+#[test]
+fn a_moved_mapping_rebuilds_both_codes_and_the_same_mapping_does_not() {
+    let first: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+    let moved: SocketAddr = "203.0.113.7:40031".parse().unwrap();
+    let other_ip: SocketAddr = "198.51.100.4:40031".parse().unwrap();
+    let (mut r, oneway, shared) = remap_runner(first, Some(50_000));
+    let before = addrs_of(&r.kit.candidates);
+    assert!(before.contains(&first), "{before:?}");
+    let oneway_addrs = |o: &OnewayCode| {
+        addrs_of(
+            &code::read_spectate(&o.write(5_000_000).unwrap(), 5_000_000)
+                .unwrap()
+                .code
+                .candidates,
+        )
+    };
+    // 聞き直しの答えが最初と同じなら作り直さない。
+    shared.offer.note_mapped(first);
+    r.follow_mapping(0);
+    assert_eq!(shared.get().offer.remapped, 0);
+    assert_eq!(addrs_of(&r.kit.candidates), before);
+    // ポートが動いた: 預ける候補と観戦コードの候補が新しいポートになる。
+    shared.offer.note_mapped(moved);
+    r.follow_mapping(10);
+    let now = addrs_of(&r.kit.candidates);
+    assert!(now.contains(&moved) && !now.contains(&first), "{now:?}");
+    assert_eq!(shared.get().offer.remapped, 1);
+    let w = oneway_addrs(&oneway);
+    assert!(w.contains(&moved) && !w.contains(&first), "{w:?}");
+    assert!(
+        w.contains(&"203.0.113.7:50000".parse().unwrap()),
+        "観戦コードの UPnP の候補が落ちた: {w:?}"
+    );
+    assert_eq!(oneway.candidates_len(), w.len());
+    // 同じ答えが続いても作り直さない。
+    for t in [20, 30, 40] {
+        r.follow_mapping(t);
+    }
+    assert_eq!(shared.get().offer.remapped, 1);
+    // アドレスが変わると UPnP の候補もそのアドレスへ付く。
+    shared.offer.note_mapped(other_ip);
+    r.follow_mapping(50);
+    assert_eq!(shared.get().offer.remapped, 2);
+    let now = addrs_of(&r.kit.candidates);
+    assert!(now.contains(&other_ip), "{now:?}");
+    assert!(now.iter().all(|a| a.ip() != first.ip()), "{now:?}");
+    let w = oneway_addrs(&oneway);
+    assert!(
+        w.contains(&"198.51.100.4:50000".parse().unwrap())
+            && w.iter().all(|a| a.ip() != first.ip()),
+        "{w:?}"
+    );
+    // 最初のアドレスへ戻れば、候補も最初と同じ並びへ戻る。
+    shared.offer.note_mapped(first);
+    r.follow_mapping(60);
+    assert_eq!(shared.get().offer.remapped, 3);
+    assert_eq!(addrs_of(&r.kit.candidates), before);
+    // IPv6 の答えは受けない（NAT の付け替えは IPv4 の話）。
+    shared
+        .offer
+        .note_mapped("[2606:4700::1]:4000".parse().unwrap());
+    assert_eq!(shared.offer.mapped(), Some(first));
+}
+
 #[test]
 fn the_snapshot_line_shows_the_offer_part_only_when_armed_and_never_an_address_or_room() {
     let plain = spectate_host::Snapshot::default();
-    assert!(!plain.text().contains("配る側"), "{}", plain.text());
+    assert!(!plain.text().contains("配信側"), "{}", plain.text());
     let (r, shared) = runner(&settings(""));
     r.stats().bump(Stat::Entered);
     r.stats().bump(Stat::Offered);
     r.stats().bump(Stat::FailRate);
+    r.stats().bump(Stat::Remapped);
+    r.stats().bump(Stat::Remapped);
     let text = shared.get().text();
     assert!(
-        text.contains("配る側")
+        text.contains("配信側")
             && text.contains("入った 1")
             && text.contains("預けた 1")
+            && text.contains("外側のアドレスの変化で作り直し 2")
             && text.contains("混雑 1"),
         "{text}"
     );
-    assert!(text.contains("まだ起こしていない"), "{text}");
+    assert!(text.contains("未作成"), "{text}");
     for secret_like in ["127.0.0.1", "synth-room", "w."] {
         assert!(
             !text.contains(secret_like),
@@ -318,6 +547,7 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
         lo(47_002),
         None,
         None,
+        None,
         Some(room_opts(&base)),
         || Ok(SESSION),
         || Ok(SECRET),
@@ -334,13 +564,11 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
         || shared.get().offer.offered >= 1,
     );
     let gen0 = shared.punch_generation();
-    let now = crate::net_udp::now_unix();
     let spec1 = viewer_answers(&base, &spec_room, |spec| {
         code::write_spectate_reply_to(
             spec,
             Name::new("viewer"),
             Candidates::from_addrs(&[lo(41_100)]).unwrap(),
-            now,
         )
         .unwrap()
     });
@@ -375,7 +603,6 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
             &forged,
             Name::new("forger"),
             Candidates::from_addrs(&[lo(41_101)]).unwrap(),
-            now,
         )
         .unwrap()
     });
@@ -392,7 +619,6 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
             spec,
             Name::new("far"),
             Candidates::from_addrs(&[far]).unwrap(),
-            now,
         )
         .unwrap()
     });
@@ -443,6 +669,195 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
     );
 }
 
+/// 預けたコードを誰も受け取っていない間に外側のポートが動いたら、入り直して新しいポートのコードを預ける。同じアドレスなら入り直さない。
+#[test]
+#[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn a_moved_mapping_enters_again_and_the_viewer_gets_the_new_port() {
+    let srv = FakeServer::start();
+    let base = srv.base();
+    let s = settings(&format!("room_server = {base}\n"));
+    let first: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+    let moved: SocketAddr = "203.0.113.7:40031".parse().unwrap();
+    let a = arm_with(
+        &s,
+        lo(47_004),
+        Some(first),
+        None,
+        None,
+        Some(room_opts(&base)),
+        || Ok(SESSION),
+        || Ok(SECRET),
+    )
+    .unwrap();
+    let shared = Arc::clone(a.kit.shared());
+    let spec_room = RoomName::parse("synth-remap-room").unwrap().spectate_of();
+    let mut r = Runner::new(a.kit, spec_room, None);
+    let t0 = Instant::now();
+    let run_until = |r: &mut Runner, what: &str, limit: Duration, cond: &dyn Fn() -> bool| {
+        let t1 = Instant::now();
+        while !cond() {
+            assert!(t1.elapsed() < limit, "{limit:?} の内に {what} にならない");
+            r.step(
+                u64::try_from(t0.elapsed().as_millis()).unwrap(),
+                crate::net_udp::now_unix(),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    run_until(&mut r, "1 回目の預け", Duration::from_secs(5), &|| {
+        shared.get().offer.offered >= 1
+    });
+    let ups = srv.seen.upgrades.load(Ordering::Acquire);
+    shared.offer.note_mapped(first);
+    let quiet = Instant::now();
+    run_until(
+        &mut r,
+        "同じアドレスの見回り",
+        Duration::from_secs(2),
+        &|| quiet.elapsed() > Duration::from_millis(400),
+    );
+    assert_eq!(
+        srv.seen.upgrades.load(Ordering::Acquire),
+        ups,
+        "同じアドレスで入り直した"
+    );
+    assert_eq!(shared.get().offer.remapped, 0);
+    shared.offer.note_mapped(moved);
+    run_until(
+        &mut r,
+        "入り直しの預け",
+        Duration::from_secs(10),
+        &|| shared.get().offer.offered >= 2,
+    );
+    assert_eq!(shared.get().offer.remapped, 1);
+    let spec = viewer_answers(&base, &spec_room, |spec| {
+        code::write_spectate_reply_to(
+            spec,
+            Name::new("viewer"),
+            Candidates::from_addrs(&[lo(41_300)]).unwrap(),
+        )
+        .unwrap()
+    });
+    let got = addrs_of(&spec.candidates);
+    assert!(got.contains(&moved) && !got.contains(&first), "{got:?}");
+    r.close();
+}
+
+/// 観戦者がコードを受け取った（`matched` が届いている）同じ見回りで外側のポートが動いても、閉じずにその手順を終えさせ、次の入室で新しいポートのコードを預ける。
+#[test]
+#[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（入り直しの 2 秒を含む。数秒）。全件の回（build.bat）で --ignored で走る"]
+fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
+    let srv = FakeServer::start();
+    let base = srv.base();
+    let s = settings(&format!("room_server = {base}\n"));
+    let first: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+    let moved: SocketAddr = "203.0.113.7:40031".parse().unwrap();
+    let a = arm_with(
+        &s,
+        lo(47_005),
+        Some(first),
+        None,
+        None,
+        Some(room_opts(&base)),
+        || Ok(SESSION),
+        || Ok(SECRET),
+    )
+    .unwrap();
+    let shared = Arc::clone(a.kit.shared());
+    let spec_room = RoomName::parse("synth-remap-matched")
+        .unwrap()
+        .spectate_of();
+    let mut r = Runner::new(a.kit, spec_room, None);
+    let t0 = Instant::now();
+    let ms = || u64::try_from(t0.elapsed().as_millis()).unwrap();
+    while shared.get().offer.offered < 1 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "預けない");
+        r.step(ms(), crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 観戦者が入ってコードを受け取る。配る側は回さないので、`matched` は配る側の接続に届いたまま読まれていない。
+    let mut v = RoomConn::start(&room_opts(&base), &spec_room).unwrap();
+    let mut spec = None;
+    let t1 = Instant::now();
+    while spec.is_none() {
+        for e in v.poll() {
+            match e {
+                Event::PeerCode(text) => {
+                    spec = Some(
+                        code::read_spectate(&text, crate::net_udp::now_unix())
+                            .unwrap()
+                            .code,
+                    );
+                }
+                Event::Failed(f) => panic!("観戦者のルームの手順が失敗した: {f:?}"),
+                _ => {}
+            }
+        }
+        assert!(t1.elapsed() < Duration::from_secs(5), "コードが届かない");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    shared.offer.note_mapped(moved);
+    r.step(ms(), crate::net_udp::now_unix());
+    assert_eq!(shared.get().offer.remapped, 1);
+    assert_eq!(
+        r.caster.status(ms()).phase,
+        higanr_core::spectate_room::CasterPhase::Casting,
+        "観戦者が受け取った後に閉じた"
+    );
+    assert!(r.conn.is_some());
+    let reply = code::write_spectate_reply_to(
+        &spec.unwrap(),
+        Name::new("viewer"),
+        Candidates::from_addrs(&[lo(41_400)]).unwrap(),
+    )
+    .unwrap();
+    v.submit_code(&reply).unwrap();
+    let mut done = false;
+    while !done {
+        for e in v.poll() {
+            match e {
+                Event::Done => done = true,
+                Event::Failed(f) => panic!("観戦者の手順が壊れた: {f:?}"),
+                _ => {}
+            }
+        }
+        r.step(ms(), crate::net_udp::now_unix());
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "観戦者の手順が終わらない"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 配る側も同じ接続で返しを受け、穴あけを頼んで手順を終える。
+    while shared.get().offer.done < 1 {
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "配る側が手順を終えない: {:?}",
+            shared.get().offer
+        );
+        r.step(ms(), crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(shared.get().offer.punch_requested, 1);
+    while shared.get().offer.offered < 2 {
+        assert!(t1.elapsed() < Duration::from_secs(15), "入り直さない");
+        r.step(ms(), crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let next = viewer_answers(&base, &spec_room, |spec| {
+        code::write_spectate_reply_to(
+            spec,
+            Name::new("viewer2"),
+            Candidates::from_addrs(&[lo(41_401)]).unwrap(),
+        )
+        .unwrap()
+    });
+    let got = addrs_of(&next.candidates);
+    assert!(got.contains(&moved) && !got.contains(&first), "{got:?}");
+    r.close();
+}
+
 // ---------------- 進行中のランダム対戦の一覧に載せる ----------------
 
 const LIST_BUILD: u32 = 7;
@@ -469,6 +884,7 @@ fn listing_runner(srv: &FakeServer, listing: Option<ListingInfo>) -> (Runner, Ar
     let a = arm_with(
         &s,
         lo(47_003),
+        None,
         None,
         None,
         Some(room_opts(&base)),
@@ -605,7 +1021,7 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
     assert!(srv.watch_items(LIST_BUILD).is_empty());
     r.close();
 
-    // それ以外の失敗（bad_message）は、間隔を置いて入り直す（30 秒・60 秒・…）。時計は見回りに渡す値で進める。
+    // それ以外の失敗（bad_message）は、間隔を空けて入り直す（30 秒・60 秒・…）。時計は見回りに渡す値で進める。
     let srv = FakeServer::start();
     let (mut r, shared) = listing_runner(&srv, Some(listing_info(10)));
     let posts = || srv.seen.watch_post_upgrades.load(Ordering::Acquire);
@@ -648,7 +1064,7 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
         2,
         "2 回目の失敗の後に 30 秒で入り直した（60 秒に倍になるはず）"
     );
-    // 断りを止めると、次の入り直しで載る。
+    // 偽サーバーの一覧の断りを止めると、次の入り直しで載る。
     srv.knobs.list_bad.store(false, Ordering::Release);
     now = failed2_at + 2 * RELIST_FIRST_MS;
     r.step(now, 0);
@@ -684,4 +1100,48 @@ fn the_relist_delay_doubles_from_thirty_seconds_up_to_five_minutes() {
     );
     assert_eq!(relist_delay(0), RELIST_FIRST_MS);
     assert_eq!(relist_delay(u32::MAX), RELIST_MAX_MS);
+}
+
+#[test]
+#[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn an_offer_that_cannot_be_sent_ends_the_entry_and_the_caster_enters_again_later() {
+    use higanr_core::spectate_room::CasterPhase;
+    let srv = FakeServer::start();
+    let (mut r, shared) = listing_runner(&srv, None);
+    r.step(0, crate::net_udp::now_unix());
+    r.conn.as_mut().expect("入っていない").fail_sends_for_test();
+    let t0 = Instant::now();
+    let mut now = 0;
+    while shared.get().offer.fail_unresponsive == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "送りの失敗が届かない: {:?}",
+            shared.get().offer
+        );
+        now = u64::try_from(t0.elapsed().as_millis()).unwrap();
+        r.step(now, crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let c = shared.get().offer;
+    assert_eq!((c.entered, c.offered, c.offer_failed), (1, 0, 1), "{c:?}");
+    assert!(r.conn.is_none());
+    let s = r.caster.status(now);
+    assert_eq!(
+        s.phase,
+        CasterPhase::Waiting,
+        "入り直しを待っていない: {s:?}"
+    );
+    r.close();
+}
+
+/// 開発用の `[spectate] fake_uplink` は、ゲーム内のメニューの経路の観戦のホストにも届く（書かなければ無し）。
+#[test]
+fn the_dev_fake_uplink_reaches_the_sender_of_the_in_game_path() {
+    let with = crate::net_config::from_text(
+        "[netplay]\nenable = 1\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\n[spectate]\nenable = 1\nfake_uplink = 77000\n",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(armed(&with, None).parts.sender.fake_uplink(), Some(77_000));
+    assert_eq!(armed(&settings(""), None).parts.sender.fake_uplink(), None);
 }

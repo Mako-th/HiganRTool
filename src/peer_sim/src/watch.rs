@@ -1,14 +1,8 @@
 //! 観戦者の役（`peer_sim --watch`）。
-//!
-//! 観戦用の接続コード（または対戦のホストの観戦のポートのアドレス＋session・秘密）でホストへ SPECTATE_JOIN を送り、
-//! 流れてくる記録を core の `Watcher` で並べ、マッチの語を CSV に書く。対戦者の `_net_frames.csv` と
-//! 突き合わせる（`compare_spectate`）。プロトコルの決まりは `higanr_core::spectate` にあり、ここは呼ぶだけ。
-//!
-//! - 終わり方: ホストの `Record::End` を受けたら `LINGER_MS` の間ホストの送り直しへ ACK を返し、BYE(終了) を
-//!   1 通出して終える。JOIN を断られた・流れが `silent_end_ms` 途切れた・`max_ms` に達したときも終える。
-//! - CSV は 2 本（回ごとに別名）: マッチの語 `seg,frame,p1,p2` と、SELECT・押下・MENU の語・seg の始まり・終わりを
-//!   記録の番号つきで並べた `index,type,fields`。
-//! - 観戦者の送り（JOIN・ACK・BYE）に `FaultConfig` を掛けられる。`drop_after` は「繋がった後に黙る観戦者」の検査用。
+//! 観戦用の接続コード（または対戦のホストの観戦のポートのアドレス＋session・秘密）でホストへ SPECTATE_JOIN を送り、流れてくる記録を core の `Watcher` で並べ、マッチの語を CSV に書く。対戦する2人の `_net_frames.csv` と突き合わせる（`compare_spectate`）。プロトコルの決まりは `higanr_core::spectate` にあり、ここは呼ぶだけ。
+//! 終わり方: ホストの `Record::End` を受けたら `LINGER_MS` の間ホストの送り直しへ ACK を返し、BYE(終了) を 1 通出して終える。JOIN を断られた・流れが `silent_end_ms` 途切れた・`max_ms` に達したときも終える。
+//! CSV は 2 本（回ごとに別名）: マッチの語 `seg,frame,p1,p2` と、SELECT・押下・MENU の語・seg の始まり・終わりを記録の番号つきで並べた `index,type,fields`。
+//! 観戦者からホストへの送信（JOIN・ACK・BYE）に `FaultConfig` を掛けられる。`drop_after` は「接続した後に黙る観戦者」の検査用。
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
@@ -218,8 +212,8 @@ pub fn run(cfg: &WatchConfig, sock: UdpSocket, scope: Scope) -> Result<WatchRepo
                         },
                     ));
                 }
-                // 対戦の状態は画面の行に出すだけの値で、突き合わせ用の CSV には入れない（ホストが 1 秒ごとに積むため）。
-                Record::Stats { .. } => {}
+                // 対戦の状態は画面の行に出すだけの値、照合は観戦者のゲームと比べる値で、どちらも突き合わせ用の CSV には入れない（ホストが 1 秒ごとに積むため）。
+                Record::Stats { .. } | Record::Check { .. } => {}
                 Record::End(reason) => {
                     rep.events.push((idx, WEvent::End(reason)));
                     if ended.is_none() {

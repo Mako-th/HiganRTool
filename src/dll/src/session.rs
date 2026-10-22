@@ -1,8 +1,8 @@
-//! 読み取りのスレッドの 1 回の実行（pure。unsafe 無し）: 照合（`probe::run`）→ 設置の条件 → ウィンドウのアドレスとコピーの表の確かめ →
+//! 読み取りのスレッドの 1 回の実行（pure。unsafe 無し）: 照合（`probe::run`）→ 設置の条件 → ウィンドウのアドレスとコピーの表の検証 →
 //! 1 地点目のフックの設置（`hook::install_call_hook`）→ 回数と tick ごとの記録の計測（`observe::run`）。
 //!
 //! 同定・image base・表の検査・14 地点の照合が**全部**通ったときだけ設置する（1 地点でも合わなければ何も書かない）。
-//! 条件の判定を Win32 の外に置き、偽物で「欠けたら設置の呼び出しが 0 回」を見る。
+//! 条件の判定を Win32 の外へ分け、偽物で「欠けたら設置の呼び出しが 0 回」を見る。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -30,15 +30,15 @@ use crate::ticks::CopyRow;
 use crate::trial_summary::{self, GameFacts, PaceEnd, PaceKind, Pacing, Setup, Stage, Wrote};
 
 /// 台本のインターフェース（台本のファイルと、ゲームのスレッドが使う静的変数）。本物は `script_win::RealScriptHost`。呼ぶ順は `run` が決める:
-/// 読む → 移す → 置き場を確保 → 台本の状態と関数のアドレスを置く → 2 つのフックを書く → 撮影を有効に → 分岐を開く。
+/// 読む → 移す → バッファを確保 → 台本の状態と関数のアドレスを登録する → 2 つのフックを書く → 撮影を有効に → 分岐を開く。
 pub trait ScriptHost {
     fn read_script(&mut self) -> Result<Option<Vec<u8>>, String>;
     /// `script.txt` を本ログの隣の `<回の名前>_script.txt` へ上書きせずに移す。移した先の名前。
     fn move_script(&mut self) -> Result<String, String>;
-    /// 撮影の置き場 4 枚を確保し、デバイスと present parameters のアドレスを置く（撮影はまだ有効にしない）。
+    /// 撮影のバッファ 4 枚を確保し、デバイスと present parameters のアドレスを保存する（撮影はまだ有効にしない）。
     fn prepare_shots(&mut self) -> Result<(), String>;
     fn arm(&mut self, script: Script, feed_fn: u32, local_fn: u32) -> Result<(), String>;
-    /// 台本の無いネットワーク実行（M2-5）: アドレスと関数のアドレスだけを置き、台本の状態は空にする（分かれ道はまだ開かない）。
+    /// 台本の無いネットワーク実行: アドレスと関数のアドレスだけを登録し、台本の状態は空にする（分かれ道はまだ開かない）。
     fn arm_io(&mut self, _feed_fn: u32, _local_fn: u32) -> Result<(), String> {
         Err("台本の無い走りの口が無い".to_string())
     }
@@ -56,15 +56,15 @@ pub trait ScriptHost {
     ) -> Result<Option<(String, Vec<higanr_core::ini_lenient::IniNote>)>, String> {
         Ok(self.read_net_ini()?.map(|t| (t, Vec::new())))
     }
-    /// ini の置き場の文（本ログの「ini: …」の行）。
+    /// ini の場所の文（本ログの「ini: …」の行）。
     fn ini_origin(&self) -> String {
         format!("DLL のフォルダの {INI_FILE}")
     }
-    /// ローダーの `--script` が渡した台本なら、その置き場の文（`Some` なら読んだ後に移さない）。
+    /// ローダーの `--script` が渡した台本なら、その場所の文（`Some` なら読んだ後に移さない）。
     fn explicit_script(&self) -> Option<String> {
         None
     }
-    /// ネットワークを開いてセッションを置く（ソケット・受信スレッド・入力の地点の判断。まだ動かさない）。開いた受信ソケットの文。
+    /// ネットワークを開いてセッションを組み込む（ソケット・受信スレッド・入力の地点の判断。まだ動かさない）。開いた受信ソケットの文。
     fn arm_net(&mut self, _s: &NetSettings, _set_state_fn: u32) -> Result<String, String> {
         Err("ネットワークの実装が無い".to_string())
     }
@@ -72,13 +72,13 @@ pub trait ScriptHost {
         Err("ネットワークの実装が無い".to_string())
     }
     /// 立ち絵の 3 本の関数の入口（`th09_addr::PORTRAIT_SITES` の順）を渡す。3 本のバイト列を全部照合して合ったときだけ呼ばれる。
-    /// 既定は「置かない」（立ち絵は追わないだけで、選択は動く）。
+    /// 既定は何もしない（立ち絵は追わないだけで、選択は動く）。
     fn arm_portrait(&mut self, _fns: [u32; 3]) {}
     /// 素の poll `0x0042B850` の入口（`th09_addr::POLL_SITES`）を渡す。先頭 8 バイトを照合して合ったときだけ呼ばれる。
-    /// 既定は「置かない」（ローカル入力は今までの `0x0042BE40` で読む）。
+    /// 既定は何もしない（ローカル入力は今までの `0x0042BE40` で読む）。
     fn arm_poll(&mut self, _addr: u32) {}
     /// rollback のモードの入口（確保・解放・calloc・走査の call・Present の後の入口）を書く。ini で rollback を望む実行だけ
-    /// （望まなければ 1 バイトも書かない）。**ネットワークのセッションを置く前に**呼ぶ: HELLO で rollback を名乗るかは入口を全部書けたかで決まる
+    /// （望まなければ 1 バイトも書かない）。**ネットワークのセッションを組み込む前に**呼ぶ: HELLO で rollback を名乗るかは入口を全部書けたかで決まる
     /// （書けなかったのに名乗ると、相手が予測で進めるのにこちらは待つ）。書けたら true。既定は「入れない」。
     fn arm_rollback(
         &mut self,
@@ -113,7 +113,7 @@ pub trait ScriptHost {
         Ok(None)
     }
 
-    /// 以前の版が別ファイルに覚えていた名前・ルーム名を ini へ移す（`load_net` が ini を読む前に 1 回）。本ログに出す文を返す（値は含めない）。
+    /// 以前のバージョンが別ファイルに覚えていた名前・ルーム名を ini へ移す（`load_net` が ini を読む前に 1 回）。本ログに出す文を返す（値は含めない）。
     fn migrate_legacy(&mut self) -> Vec<String> {
         Vec::new()
     }
@@ -124,7 +124,7 @@ pub trait ScriptHost {
     }
 }
 
-/// 画面の言語を決めて置く（ini の `[ui] lang`、`auto` なら OS の UI の言語）。ini の `[ui]` の誤りは本ログに出して自動で続ける。
+/// 画面の言語を決めて保存する（ini の `[ui] lang`、`auto` なら OS の UI の言語）。ini の `[ui]` の誤りは本ログに出して自動で続ける。
 fn decide_lang(host: &mut dyn ScriptHost, text: &str, out: &mut dyn Write) {
     let setting = match higanr_core::ini::parse(text)
         .map_err(|e| e.to_string())
@@ -134,7 +134,7 @@ fn decide_lang(host: &mut dyn ScriptHost, text: &str, out: &mut dyn Write) {
         Err(e) => {
             let _ = writeln!(
                 out,
-                "言語: {INI_FILE} の [ui] を読めない（{e}）。OS の言語に従う"
+                "言語: {INI_FILE} の [ui] 読み込み不能（{e}）。OS の言語に従います。"
             );
             LangSetting::Auto
         }
@@ -159,7 +159,7 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
         Ok(None) => {
             let _ = writeln!(
                 out,
-                "ネットワーク: {INI_FILE} が無い（ネットワークなしで走る）"
+                "ネットワーク: {INI_FILE} が無い（ネットワークなしで実行する）。"
             );
             return None;
         }
@@ -167,7 +167,7 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
         Err(why) => {
             let _ = writeln!(
                 out,
-                "ネットワーク: {INI_FILE} を読めない（{why}）。ネットワークなしで走る"
+                "ネットワーク: {INI_FILE} 読み込み不能（{why}）。ネットワークなしで実行します。"
             );
             return None;
         }
@@ -182,7 +182,7 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
             log_notes(out, &host_notes);
             let _ = writeln!(
                 out,
-                "ネットワーク: {INI_FILE} に [{SECTION}] が無いか enable = 1 でない（ネットワークなしで走る）"
+                "ネットワーク: {INI_FILE} に [{SECTION}] が無いか enable = 1 でない（ネットワークなしで実行する）。"
             );
             None
         }
@@ -197,26 +197,22 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
                 let _ = writeln!(out, "ネットワーク: {note}");
             }
             decide_lang(host, &text, out);
-            let _ = writeln!(
-                detail_out(out),
-                "ネットワーク: 設定を読んだ（{}）",
-                s.text()
-            );
+            let _ = writeln!(out, "ネットワーク: 設定を読み込みました（{}）", s.text());
             Some(s)
         }
         Err(e) => {
             log_notes(out, &host_notes);
             let _ = writeln!(
                 out,
-                "ネットワーク: {INI_FILE} の [{SECTION}] を読めない（{e}）。ネットワークなしで走る"
+                "ネットワーク: {INI_FILE} の [{SECTION}] 読み込み不能（{e}）。ネットワークなしで実行します。"
             );
             None
         }
     }
 }
 
-/// 開始のフックを書き、ネットワークのセッションを置く（まだ動かさない）。どちらかができなければ Err（ネットワークなしで走る）。開始のフックが書けていれば
-/// 残るが、`NET_ON` が 0 の間は回数を数えて元の飛び先へ飛ぶだけ。書けたかは `start_hook` へ置く。
+/// 開始のフックを書き、ネットワークのセッションを組み込む（まだ動かさない）。どちらかができなければ Err（ネットワークなしで走る）。開始のフックが書けていれば
+/// 残るが、`NET_ON` が 0 の間は回数を数えて元の飛び先へ飛ぶだけ。書けたかは `start_hook` に書く。
 fn install_net(
     hook_env: &mut dyn DetourEnv,
     host: &mut dyn ScriptHost,
@@ -230,7 +226,7 @@ fn install_net(
     let (Some(mdef), Some(sdef)) = (find(MATCH_START_SITE), find(SET_STATE_SITE)) else {
         let _ = writeln!(
             out,
-            "ネットワーク: 表に {MATCH_START_SITE} か {SET_STATE_SITE} の行が無いので開かない"
+            "ネットワーク: 表に {MATCH_START_SITE} か {SET_STATE_SITE} の行が無いので開きません。"
         );
         return Err(format!(
             "表に {MATCH_START_SITE} か {SET_STATE_SITE} の行が無い"
@@ -240,11 +236,14 @@ fn install_net(
     hook::write_report(out, mdef, &r);
     if !r.written() {
         *start_hook = Wrote::Refused;
-        let _ = writeln!(out, "ネットワーク: 開始のフックが書けなかったので開かない");
-        return Err("開始のフックを書けなかった".to_string());
+        let _ = writeln!(
+            out,
+            "ネットワーク: 開始のフックが書けなかったので開きません。"
+        );
+        return Err("開始のフックが書けませんでした".to_string());
     }
     *start_hook = Wrote::Written;
-    // rollback のモードの入口。ネットワークのセッション（HELLO で名乗るモード）より先に置く。
+    // rollback のモードの入口。ネットワークのセッション（HELLO で名乗るモード）より先に書く。
     host.arm_rollback(s, hook_env, forbidden, out);
     match host.arm_net(s, sdef.addr) {
         Ok(desc) => {
@@ -256,7 +255,7 @@ fn install_net(
             };
             let _ = writeln!(
                 o,
-                "ネットワーク: {desc}。set_state 0x{:08X}。動かすのは分かれ道を開く直前",
+                "ネットワーク: {desc}。set_state 0x{:08X}。動かすのは分かれ道を開く直前です。",
                 sdef.addr
             );
             Ok(())
@@ -264,14 +263,14 @@ fn install_net(
         Err(why) => {
             let _ = writeln!(
                 out,
-                "ネットワーク: 開けない（{why}）。ネットワークなしで走る"
+                "ネットワーク: 開けませんでした（{why}）。ネットワークなしで実行します。"
             );
             Err(why)
         }
     }
 }
 
-/// 立ち絵の 3 本の関数の入口を照合し、全部合ったときだけ入口へ渡す（ネットワークのセッションを置いた後、ネットワークを動かす前）。1 本でも合わない・
+/// 立ち絵の 3 本の関数の入口を照合し、全部合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後、ネットワークを動かす前）。1 本でも合わない・
 /// 読めないときは何も渡さず理由をログに書く（立ち絵を追わないだけで、選択は今までどおり動く）。別の表（`PORTRAIT_SITES`）に
 /// するのは、`SITES` は 1 行でも合わなければ何も書かない表で、ここで止めたいのは立ち絵だけだから。
 fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
@@ -282,7 +281,7 @@ fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Writ
         PORTRAIT_MARKER_SITE,
     ]) {
         let Some(def) = PORTRAIT_SITES.iter().find(|d| d.name == name) else {
-            let _ = writeln!(out, "立ち絵の追随: 入れない（表に {name} の行が無い）");
+            let _ = writeln!(out, "立ち絵の追随: 入れません（表に {name} の行が無い）。");
             return;
         };
         let actual = env.read(def.addr, def.expected.len());
@@ -291,7 +290,7 @@ fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Writ
             SiteOutcome::Mismatch { actual } => {
                 let _ = writeln!(
                     out,
-                    "立ち絵の追随: 入れない（{name} 0x{:08X} が不一致 実際 = {} / 期待 = {}）。選択そのものは今までどおり",
+                    "立ち絵の追随: 入れません（{name} 0x{:08X} が不一致 実際 = {} / 期待 = {}）。選択そのものは今までどおりです。",
                     def.addr,
                     hex_bytes(&actual),
                     hex_bytes(def.expected)
@@ -301,7 +300,7 @@ fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Writ
             SiteOutcome::Unreadable => {
                 let _ = writeln!(
                     out,
-                    "立ち絵の追随: 入れない（{name} 0x{:08X} が読めない）。選択そのものは今までどおり",
+                    "立ち絵の追随: 入れません（{name} 0x{:08X} が読めない）。選択そのものは今までどおりです。",
                     def.addr
                 );
                 return;
@@ -311,21 +310,21 @@ fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Writ
     host.arm_portrait(fns);
     let _ = writeln!(
         detail_out(out),
-        "立ち絵の追随: 入れた（決定の tick にカーソルを書いたとき、立ち絵 0x{:08X} / 0x{:08X} と席の目印 0x{:08X} を呼ぶ。3 本の入口のバイト列が一致）",
+        "立ち絵の追随: 設置しました（決定の tick にカーソルを書いたとき、立ち絵 0x{:08X} / 0x{:08X} と席の目印 0x{:08X} を呼びます。3 本の入口のバイト列が一致）",
         fns[0],
         fns[1],
         fns[2]
     );
 }
 
-/// 素の poll の入口を照合し、合ったときだけ入口へ渡す（ネットワークのセッションを置いた後、ネットワークを動かす前）。合わない・読めないときは何も渡さず
+/// 素の poll の入口を照合し、合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後、ネットワークを動かす前）。合わない・読めないときは何も渡さず
 /// 理由をログに書く（ローカル入力は今までの `0x0042BE40` で読む。ネットワークは開いたまま: 各自が自分の入力ワードを読んで送るので同期には効かない）。
 /// 別の表（`POLL_SITES`）にする理由は `th09_addr::POLL_SITES` の注。
 fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
     let Some(def) = POLL_SITES.iter().find(|d| d.name == POLL_SITE) else {
         let _ = writeln!(
             out,
-            "poll: 使わない（表に {POLL_SITE} の行が無い）。ローカル入力は 0x0042BE40"
+            "poll: 未使用（表に {POLL_SITE} の行が無い）。ローカル入力は 0x0042BE40 のままです。"
         );
         return;
     };
@@ -335,7 +334,7 @@ fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
             host.arm_poll(def.addr);
             let _ = writeln!(
                 detail_out(out),
-                "poll: 使う（0x{:08X} の先頭 {} バイトが一致）。自分の入力は 1P の設定どおりに、席 0 の poll で読む",
+                "poll: 使用します（0x{:08X} の先頭 {} バイトが一致）。自分の入力は 1P の設定どおりに、席 0 の poll で読みます",
                 def.addr,
                 def.expected.len()
             );
@@ -343,7 +342,7 @@ fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
         SiteOutcome::Mismatch { actual } => {
             let _ = writeln!(
                 out,
-                "poll: 使わない（0x{:08X} が不一致 実際 = {} / 期待 = {}）。ローカル入力は 0x0042BE40",
+                "poll: 未使用（0x{:08X} が不一致 実際 = {} / 期待 = {}）。ローカル入力は 0x0042BE40 のままです。",
                 def.addr,
                 hex_bytes(&actual),
                 hex_bytes(def.expected)
@@ -352,7 +351,7 @@ fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
         SiteOutcome::Unreadable => {
             let _ = writeln!(
                 out,
-                "poll: 使わない（0x{:08X} が読めない）。ローカル入力は 0x0042BE40",
+                "poll: 未使用（0x{:08X} が読めない）。ローカル入力は 0x0042BE40 のままです。",
                 def.addr
             );
         }
@@ -360,17 +359,23 @@ fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
 }
 
 /// 台本を読み、移し、読めたら返す。移せなければ使わない。UTF-8 でない・誤りなら使わない（台本なしで走る）。本文と読んだ結果を
-/// ログに書く。移すのは中身を確かめる前（読めた台本は、誤りでも 1 回で片付け、残った台本が後の実行で押さないようにする）。
+/// ログに書く。移すのは中身を検証する前（読めた台本は、誤りでも 1 回で片付け、残った台本が後の実行で押さないようにする）。
 /// ローダーの `--script` が渡した台本は移さない。
 pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Script> {
     let bytes = match host.read_script() {
         Ok(None) => {
-            let _ = writeln!(detail_out(out), "台本: script.txt が無い（台本なしで走る）");
+            let _ = writeln!(
+                detail_out(out),
+                "台本: script.txt がありません（台本なしで実行します）"
+            );
             return None;
         }
         Ok(Some(b)) => b,
         Err(why) => {
-            let _ = writeln!(out, "台本: script.txt を読めない（{why}）。台本なしで走る");
+            let _ = writeln!(
+                out,
+                "台本: script.txt 読み込み不能（{why}）。台本なしで実行します。"
+            );
             return None;
         }
     };
@@ -378,7 +383,7 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
     if let Some(from) = host.explicit_script() {
         let _ = writeln!(
             detail_out(out),
-            "台本: {from}（{} バイト）を読んだ（ローダーが渡した台本なので移さない）",
+            "台本: {from}（{} バイト）を読み込みました（ローダーが渡した台本なので移動しません）",
             bytes.len()
         );
     } else {
@@ -386,14 +391,14 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
             Ok(name) => {
                 let _ = writeln!(
                     detail_out(out),
-                    "台本: script.txt（{} バイト）を読み、{name} へ移した",
+                    "台本: script.txt（{} バイト）を読み込み、{name} へ移動しました",
                     bytes.len()
                 );
             }
             Err(why) => {
                 let _ = writeln!(
                     out,
-                    "台本: script.txt を移せない（{why}）ので使わない（台本なしで走る）"
+                    "台本: script.txt の移行不能（{why}）。使いません（台本なしで実行する）。"
                 );
                 return None;
             }
@@ -404,7 +409,7 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
         Err(e) => {
             let _ = writeln!(
                 out,
-                "台本: UTF-8 でない（先頭から {} バイトの後）ので使わない（台本なしで走る）",
+                "台本: UTF-8 でない（先頭から {} バイトの後）ので使いません（台本なしで実行する）。",
                 e.utf8_error().valid_up_to()
             );
             return None;
@@ -424,20 +429,20 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
         Ok(s) => {
             let _ = writeln!(
                 detail_out(out),
-                "台本: 読めた（{} 段、settle = {} tick）",
+                "台本: 読み込み成功（{} 段、settle = {} tick）",
                 s.steps.len(),
                 s.settle
             );
             Some(s)
         }
         Err(e) => {
-            let _ = writeln!(out, "台本: 読めない（{e}）。台本なしで走る");
+            let _ = writeln!(out, "台本: 読み込み不能（{e}）。台本なしで実行します。");
             None
         }
     }
 }
 
-/// 台本を置く（設置の前）。置けたら台本の段階の数と、撮影の置き場を確保できたかを返す。
+/// 台本を設定する（設置の前）。設定できたら台本の段階の数と、撮影のバッファを確保できたかを返す。
 fn arm_script(
     host: &mut dyn ScriptHost,
     sites: &[SiteDef],
@@ -449,41 +454,41 @@ fn arm_script(
     let (Some(feed), Some(local)) = (addr_of(FEED_SITE), addr_of(LOCAL_INPUT_SITE)) else {
         let _ = writeln!(
             out,
-            "台本: 表に {FEED_SITE} か {LOCAL_INPUT_SITE} の行が無いので使わない"
+            "台本: 表に {FEED_SITE} か {LOCAL_INPUT_SITE} の行が無いので使いません。"
         );
         return None;
     };
     let shots = match host.prepare_shots() {
         Ok(()) => {
-            let _ = writeln!(detail_out(out), "撮影: 置き場 4 枚を確保した");
+            let _ = writeln!(detail_out(out), "撮影: 保存用のバッファ 4 枚を確保しました");
             true
         }
         Err(why) => {
             let _ = writeln!(
                 out,
-                "撮影: 置き場を用意できない（{why}）。台本は動かすが撮影はしない"
+                "撮影: 置き場の用意不可（{why}）。台本は動かしますが撮影はしません。"
             );
             false
         }
     };
     if let Err(why) = host.arm(script, feed, local) {
-        let _ = writeln!(out, "台本: 置けない（{why}）ので使わない");
+        let _ = writeln!(out, "台本: 用意不可（{why}）、使いません。");
         return None;
     }
     let _ = writeln!(
         detail_out(out),
-        "台本: 箱とアドレスを置いた（feed 0x{feed:08X} / ローカル入力 0x{local:08X}）。分かれ道は 2 つのフックを書いた後に開く"
+        "台本: 入れ物とアドレスを設定しました（feed 0x{feed:08X} / ローカル入力 0x{local:08X}）。分かれ道は 2 つのフックを書いた後に開きます"
     );
     Some((steps, shots))
 }
 
-/// 台本の無いネットワーク実行: 入力の入口が読むアドレスと呼ぶ関数のアドレスだけを置く。置けなければ Err（ネットワークを開かない）。
+/// 台本の無いネットワーク実行: 入力の入口が読むアドレスと呼ぶ関数のアドレスだけを登録する。登録できなければ Err（ネットワークを開かない）。
 fn arm_io(host: &mut dyn ScriptHost, sites: &[SiteDef], out: &mut dyn Write) -> Result<(), String> {
     let addr_of = |name: &str| sites.iter().find(|d| d.name == name).map(|d| d.addr);
     let (Some(feed), Some(local)) = (addr_of(FEED_SITE), addr_of(LOCAL_INPUT_SITE)) else {
         let _ = writeln!(
             out,
-            "ネットワーク: 表に {FEED_SITE} か {LOCAL_INPUT_SITE} の行が無いので開かない"
+            "ネットワーク: 表に {FEED_SITE} か {LOCAL_INPUT_SITE} の行が無いので開きません。"
         );
         return Err(format!("表に {FEED_SITE} か {LOCAL_INPUT_SITE} の行が無い"));
     };
@@ -491,19 +496,22 @@ fn arm_io(host: &mut dyn ScriptHost, sites: &[SiteDef], out: &mut dyn Write) -> 
         Ok(()) => {
             let _ = writeln!(
                 detail_out(out),
-                "ネットワーク: 台本なしで開く（M2-5。自分の語はローカル入力 0x{local:08X}、選択の画面は人の押下を送る）。アドレスを置いた（feed 0x{feed:08X}）"
+                "ネットワーク: 台本なしで開きます（自分の語はローカル入力 0x{local:08X}、選択の画面は人の押下を送ります）。アドレスを設定しました（feed 0x{feed:08X}）"
             );
             Ok(())
         }
         Err(why) => {
-            let _ = writeln!(out, "ネットワーク: アドレスを置けない（{why}）ので開かない");
-            Err(format!("アドレスを置けない（{why}）"))
+            let _ = writeln!(
+                out,
+                "ネットワーク: アドレスの設定不能（{why}）。開きません。"
+            );
+            Err(format!("アドレスの設定不能（{why}）"))
         }
     }
 }
 
 /// 分岐を開く直前の、ネットワークと自動保存（台本の有無によらず同じ順）。ネットワークを動かせたら true。動かせなかったこと・自動保存の入り方は、
-/// 試験のまとめの材料 `game` へ置く。
+/// 試験のまとめの材料 `game` へ書く。
 fn start_net_and_replay(
     host: &mut dyn ScriptHost,
     net: Option<&NetSettings>,
@@ -518,12 +526,12 @@ fn start_net_and_replay(
                 net_on = true;
                 let _ = writeln!(
                     detail_out(out),
-                    "ネットワーク: 動かした（NET_ON = 1）。繋がったら止める地点で SELECT を送り合い、試合は lockstep で進む"
+                    "ネットワーク: 動かしました（NET_ON = 1）。接続したら止める地点で SELECT を送り合い、マッチは lockstep で進みます"
                 );
             }
             Err(why) => {
-                let _ = writeln!(out, "ネットワーク: 動かせない（{why}）");
-                game.net = Setup::Failed(format!("動かせなかった（{why}）"));
+                let _ = writeln!(out, "ネットワーク: 動かせません（{why}）。");
+                game.net = Setup::Failed(format!("動かせませんでした（{why}）"));
             }
         }
     }
@@ -536,12 +544,12 @@ fn start_net_and_replay(
         Ok(None) => {
             let _ = writeln!(
                 detail_out(out),
-                "自動保存: 入れない（ini の [replay] に enable = 1 が無い）"
+                "自動保存: 未設置（ini の [replay] に enable = 1 がありません）"
             );
             game.replay = Setup::NotConfigured;
         }
         Err(why) => {
-            let _ = writeln!(out, "自動保存: 入れられない（{why}）");
+            let _ = writeln!(out, "自動保存: 入れられません（{why}）。");
             game.replay = Setup::Failed(why);
         }
     }
@@ -572,31 +580,31 @@ pub enum End {
 /// 表の全行を読んで全部一致したか。
 pub fn ready_to_install(s: &Summary, sites: &[SiteDef]) -> Result<(), &'static str> {
     if !s.checked_sites {
-        return Err("同定・image base・表の検査のどれかが通っていない");
+        return Err("同定・image base・表の検査が全通過でない");
     }
     if sites.is_empty() || s.total != sites.len() {
         return Err("表の全行を照合していない");
     }
     if s.matched != s.total || s.mismatched != 0 || s.unreadable != 0 {
-        return Err("一致しない地点がある");
+        return Err("一致しないフック地点がある");
     }
     Ok(())
 }
 
-/// ウィンドウのアドレスを、入口に読ませてよいかを確かめる（入口は `+0x2C` と `+0x3C` の 8 バイトずつを読む）。
+/// ウィンドウのアドレスを、入口に読ませてよいかを検証する（入口は `+0x2C` と `+0x3C` の 8 バイトずつを読む）。
 /// 読めなければ 0 を返し（入口はウィンドウを読まずに 0 を書く）、その旨をログに書く。読めれば今の値も書く。
 fn checked_window(env: &mut dyn Env, window: u32, out: &mut dyn Write) -> u32 {
     if window == 0 {
         let _ = writeln!(
             out,
-            "ウィンドウ: アドレスが 0 なので、ウィンドウの 2 欄は 0 を書く"
+            "ウィンドウ: アドレスが 0 です。ウィンドウの 2 欄は 0 を書きます。"
         );
         return 0;
     }
     let Some(b) = env.read(window, WINDOW_SPAN as usize) else {
         let _ = writeln!(
             out,
-            "ウィンドウ: 0x{window:08X} から 0x{WINDOW_SPAN:X} バイトが読めないので、入口にはウィンドウを読ませない（ウィンドウの 2 欄は 0 を書く）"
+            "ウィンドウ: 0x{window:08X} から 0x{WINDOW_SPAN:X} バイトを読めません。入口にはウィンドウを読ませず（ウィンドウの 2 欄は 0 を書く）。"
         );
         return 0;
     };
@@ -608,21 +616,21 @@ fn checked_window(env: &mut dyn Env, window: u32, out: &mut dyn Write) -> u32 {
     };
     let _ = writeln!(
         detail_out(out),
-        "ウィンドウ: 0x{window:08X}（設置の前の値: 今の時刻 +0x{WINDOW_NOW:X} = {:?} / 期限 +0x{WINDOW_DEADLINE:X} = {:?}）",
+        "ウィンドウ: 0x{window:08X}（設置前の値: 現在時刻 +0x{WINDOW_NOW:X} = {:?} / 期限 +0x{WINDOW_DEADLINE:X} = {:?}）",
         f(WINDOW_NOW),
         f(WINDOW_DEADLINE)
     );
     window
 }
 
-/// コピーの表を、入口に使わせてよいかを確かめる。合わなければ 0 行を返し（入口はコピーしない）、ログに大きく書く。フックの設置そのものは
+/// コピーの表を、入口に使わせてよいかを検証する。合わなければ 0 行を返し（入口はコピーしない）、ログに大きく書く。フックの設置そのものは
 /// 続ける（tick ごとの始まりはコピーが無くても取れる）。
 fn checked_copies(env: &mut dyn Env, rows: &[CopyRow], out: &mut dyn Write) -> Vec<CopyRow> {
     match check_copy_table(rows, |a, len| env.read(a, len as usize).is_some()) {
         Ok(()) => {
             let _ = writeln!(
                 detail_out(out),
-                "コピーの表: {} 行（合計 {} バイト）が枠に収まり、元が読めることを設置の前に確かめた: {}",
+                "コピーの表: {} 行（合計 {} バイト）が枠に収まり、元が読めることを設置前にチェックしました: {}",
                 rows.len(),
                 rows.iter().map(|r| r.len).sum::<u32>(),
                 rows.iter().map(row_text).collect::<Vec<_>>().join(" / ")
@@ -632,7 +640,7 @@ fn checked_copies(env: &mut dyn Env, rows: &[CopyRow], out: &mut dyn Write) -> V
         Err(e) => {
             let _ = writeln!(
                 out,
-                "★★★ コピーの表を置かない（{}）。入口は何も写さない（件数 0）。_ticks.csv のコピーの列と _changes.csv は空になる。フックの設置は続ける ★★★",
+                "★★★ コピーの表の作成不能（{}）。入口は何もコピーしません（件数 0）。_ticks.csv のコピーの列と _changes.csv は空になります。フックの設置は続けます。 ★★★",
                 e.text()
             );
             Vec::new()
@@ -643,22 +651,22 @@ fn checked_copies(env: &mut dyn Env, rows: &[CopyRow], out: &mut dyn Write) -> V
 /// 実行に渡す地点の名前。
 #[derive(Debug, Clone, Copy)]
 pub struct Sites<'a> {
-    /// call 先の差し替えの行（入力と待ち。`th09_addr::HOOK_SITE`）。
+    /// call 先の差し替えの行（ゲームの `on_tick` が呼ぶ `poll_all` の差し替え。入力と待ち。`th09_addr::HOOK_SITE`）。
     pub hook_site: &'a str,
     /// inline detour で書く描画の行（`draw_before_endscene`）。
     pub draw_site: &'a str,
-    /// 描画だけのフレームの出口の行（照合だけ。`render_only_exit`）。一致していればそのアドレスを入口に置く。
+    /// 描画だけのフレームの出口の行（照合だけ。`render_only_exit`）。一致していればそのアドレスを入口に渡す。
     pub exit_site: &'a str,
 }
 
 /// 描画だけのフレームの出口のアドレスを決める（`exit_site` 行があり、照合が全部通っていれば そのアドレス。無ければ 0）。
-/// ここに来る前に `ready_to_install` が全地点の一致を確かめているので、行があれば一致している。
+/// ここに来る前に `ready_to_install` が全地点の一致をチェックしているので、行があれば一致している。
 fn render_only_exit(sites: &[SiteDef], exit_site: &str, out: &mut dyn Write) -> u32 {
     match sites.iter().find(|d| d.name == exit_site) {
         Some(d) => {
             let _ = writeln!(
                 detail_out(out),
-                "描画だけのフレームの出口: 0x{:08X}（{} が照合で一致。入口に置く）",
+                "描画だけのフレームの出口: 0x{:08X}（{} が照合で一致。入口に設定します）",
                 d.addr,
                 exit_site
             );
@@ -667,25 +675,18 @@ fn render_only_exit(sites: &[SiteDef], exit_site: &str, out: &mut dyn Write) -> 
         None => {
             let _ = writeln!(
                 out,
-                "描画だけのフレームの出口: 置かない（表に {exit_site} の行が無い。入口は分かれ道を通らない）"
+                "描画だけのフレームの出口: 非設置（表に {exit_site} の行が無い。入口は分かれ道を通らない）。"
             );
             0
         }
     }
 }
 
-/// 1 回の実行。ログの行を `out` に書く（書けなくても続ける）。`sites_used` は使う地点の名前、`window` は入口が tick ごとの記録で
-/// 読むウィンドウのアドレス、`copies` は入口が枠へコピーする表、`seconds` は計測の長さ。
+/// 1 回の実行。ログの行を `out` に書く（書けなくても続ける）。`sites_used` は使う地点の名前、`window` は入口が tick ごとの記録で読むウィンドウのアドレス、`copies` は入口が枠へコピーする表、`seconds` は計測の長さ。
 ///
-/// call 先の差し替え（入力と待ち）を書いた後に、描画の地点へ inline detour を書く。どちらも書けたら計測（`observe::run`）へ進む。
-/// 描画の detour が書けなくても call のフックは残る（描画のリングバッファが空になるだけ）。設置の条件が通ったら台本（`script`）を読み、置く。
-/// 2 つのフックを書いた**後で**撮影を有効にし（detour が書けて置き場を確保できたときだけ）、分岐を開く。call 先の差し替えが
-/// 断られたら開かない。台本のある実行は台本が終わるか止まってから 10 秒で計測を終える（上限 `SCRIPT_MAX_SECONDS`）。
-/// 設置の条件が通らない実行（花映塚でない・自己検査）では `script.txt` に触らない。
-///
-/// ini に `[netplay] enable = 1` があれば、台本が無くてもネットワークを開く（`arm_io` → 開始のフック → ネットワークのセッション → ネットワークを動かす → 自動保存 →
-/// 分かれ道）。長さは `RunLen::Net`（ネットワークが終わってから 10 秒。上限は無い: 人が長く遊ぶと本ログが途中で止まるため）。台本があって
-/// `after_script = keep` なら、台本の後もネットワークを閉じず、長さも `RunLen::Net`（こちらは台本の実行と同じ上限のまま）。
+/// call 先の差し替え（入力と待ち）を書いた後に、描画の地点へ inline detour を書き、どちらも書けたら計測（`observe::run`）へ進む。描画の detour が書けなくても call のフックは残る。設置の条件が通ったら台本（`script`）を読んで設定する。2 つのフックを書いた**後で**撮影を有効にし（detour が書けてバッファを確保できたときだけ）、分岐を開く。call 先の差し替えが断られたら開かない。設置の条件が通らない実行（花映塚でない・自己検査）では `script.txt` に触らない。
+/// 台本のある実行は台本が終わるか止まってから 10 秒で計測を終える（上限 `SCRIPT_MAX_SECONDS`）。
+/// ini に `[netplay] enable = 1` があれば、台本が無くてもネットワークを開く（`arm_io` → 開始のフック → ネットワークのセッション → ネットワークを動かす → 自動保存 → 分かれ道）。長さは `RunLen::Net`（ネットワークが終わってから 10 秒。上限は無い: 人が長く遊ぶと本ログが途中で止まるため）。台本があって `after_script = keep` なら、台本の後もネットワークを閉じず、長さも `RunLen::Net`（こちらは台本の実行と同じ上限のまま）。
 #[allow(clippy::too_many_arguments)] // 実行の入力を 1 か所で渡す
 pub fn run(
     env: &mut dyn Env,
@@ -712,10 +713,10 @@ pub fn run(
         ..GameFacts::default()
     };
     if let Err(why) = ready_to_install(&summary, sites) {
-        let _ = writeln!(out, "フックの設置: しない（{why}）");
+        let _ = writeln!(out, "フックの設置: 未実行（{why}）。");
         let _ = writeln!(
             detail_out(out),
-            "台本: 設置しないので script.txt には触らない"
+            "台本: 非設置のため script.txt には触りません"
         );
         write_final_trial(out, rec, &game, None);
         return End::NotInstalled;
@@ -723,7 +724,7 @@ pub fn run(
     let Some(def) = sites.iter().find(|d| d.name == sites_used.hook_site) else {
         let _ = writeln!(
             out,
-            "フックの設置: しない（表に {} の行が無い）",
+            "フックの設置: 未実行（表に {} の行が無い）。",
             sites_used.hook_site
         );
         // 書き換える行が表に無い（ビルドの誤り）。書いていないので、断ったのと同じく「フックの設置」は ×。
@@ -744,7 +745,7 @@ pub fn run(
         if armed.is_some() {
             let _ = writeln!(
                 out,
-                "台本: フックの設置が断られたので動かさない（分かれ道は開かない）"
+                "台本: フックの設置が断られたので動かしません（分かれ道は開かない）。"
             );
         }
         game.input_hook = Wrote::Refused;
@@ -766,14 +767,14 @@ pub fn run(
             if !dr.written() {
                 let _ = writeln!(
                     out,
-                    "inline detour: 描画の地点は書けなかった（描画のリングバッファは空・描画だけのフレームの集計は 0 件になる。計測は続ける）"
+                    "inline detour: 描画のフック地点が書けませんでした（描画のリングバッファにおいて空・描画だけのフレームの集計は 0 件です。計測は続けます）。"
                 );
             }
         }
         None => {
             let _ = writeln!(
                 out,
-                "inline detour: しない（表に {} の行が無い。描画のリングバッファは空のまま）",
+                "inline detour: 非設置（表に {} の行が無い。描画のリングバッファは空）。",
                 sites_used.draw_site
             );
         }
@@ -783,7 +784,7 @@ pub fn run(
     let overlay_on = overlay
         .as_deref_mut()
         .is_some_and(|o| crate::overlay::install(o, draw_written, out));
-    // ペースと時刻のインターフェース（ini や [pacing] が無ければ既定の auto —— ウィンドウなら b-spin・全画面なら game。`mode = game` なら頭は書かない。
+    // ペースと時刻のインターフェース（ini や [pacing] が無ければ既定の auto —— ウィンドウと垂直同期を取らないフルスクリーンなら wait の方式・垂直同期を取るフルスクリーンなら game。`mode = game` なら先頭のフックは書かない。
     // 書けなくても計測は続ける）。
     let mut pacing = script.pacing_host();
     if let Some(p) = pacing.as_deref_mut() {
@@ -798,7 +799,7 @@ pub fn run(
             used: pi.used.map(|m| m.name()),
         };
     }
-    // ネットワーク: 開始のフックを書き、セッションを置く。台本があれば台本の状態の後に、無ければ入力の関数のアドレスだけを置いてから（台本の無い実行は、
+    // ネットワーク: 開始のフックを書き、セッションを組み込む。台本があれば台本の状態の後に、無ければ入力の関数のアドレスだけを登録してから（台本の無い実行は、
     // 人が選択を押し、マッチの自分の入力ワードはローカル入力）。
     game.net = match &net_settings {
         None => Setup::NotConfigured,
@@ -824,7 +825,7 @@ pub fn run(
             }
         }
     };
-    // ネットワークのセッションを置けたら、立ち絵の 3 本の関数の入口と素の poll の入口を照合して渡す（ネットワークを動かす前。合わなければ立ち絵だけ追わない・
+    // ネットワークのセッションを組み込めたら、立ち絵の 3 本の関数の入口と素の poll の入口を照合して渡す（ネットワークを動かす前。合わなければ立ち絵だけ追わない・
     // ローカル入力は今までの読み方）。台本だけの実行（ネットワークなし）のローカル入力は変えない。
     if game.net == Setup::On {
         arm_portrait(env, script, out);
@@ -840,7 +841,7 @@ pub fn run(
     );
     // ネットワークの設定がある実行の長さ: ネットワークが終わってから（台本があれば台本も終わってから）`SCRIPT_TAIL_SECONDS` 秒で終える。描画だけの
     // フレームの実験（`RunLen::Fixed`）は、ネットワークを開けなかったときもしない（人が遊ぶつもりの実行で、更新を飛ばすフレームを作らない）。
-    // 上限（`max`）は台本のあるネットワーク実行（検査・実機の回）だけ。台本の無いネットワーク実行はネットワークが開いている間は上限で止めない。
+    // 上限（`max`）は台本のあるネットワーク実行（検査・実機の検証）だけ。台本の無いネットワーク実行はネットワークが開いている間は上限で止めない。
     let net_len = |steps: usize, feed_first: u32, max: Option<u32>| RunLen::Net {
         tail: SCRIPT_TAIL_SECONDS,
         max,
@@ -860,17 +861,17 @@ pub fn run(
                     Ok(()) => {
                         let _ = writeln!(
                             detail_out(out),
-                            "ネットワーク: 分かれ道を開いた（SCRIPT_ON = 1）。台本は無い。人の入力で選択を押し、試合をする"
+                            "ネットワーク: 分かれ道を開きました（SCRIPT_ON = 1）。台本はありません。人の入力で選択を押し、マッチをします"
                         );
                     }
                     Err(why) => {
-                        let _ = writeln!(out, "ネットワーク: 分かれ道を開けない（{why}）");
+                        let _ = writeln!(out, "ネットワーク: 分かれ道を開けません（{why}）。");
                     }
                 }
             } else {
                 let _ = writeln!(
                     out,
-                    "ネットワーク: 開けなかったので分かれ道は開かない（描画だけのフレームの実験もしない）"
+                    "ネットワーク: 開けなかったので分かれ道は開きません（描画だけのフレームの実験もしない）。"
                 );
             }
             net_len(0, feed_first, None)
@@ -878,20 +879,23 @@ pub fn run(
         Some((steps, shots_ready)) => {
             if draw_written && shots_ready {
                 script.shots_on();
-                let _ = writeln!(detail_out(out), "撮影: 有効にした（描画の入口で写す）");
+                let _ = writeln!(
+                    detail_out(out),
+                    "撮影: 有効にしました（描画の入口でコピーします）"
+                );
             } else {
                 let _ = writeln!(
                     detail_out(out),
-                    "撮影: しない（描画の detour を{}・置き場を{}）。台本は動かす",
+                    "撮影: 未実行（描画の detour を{}・バッファを{}）。台本は動かします",
                     if draw_written {
-                        "書けた"
+                        "書けました"
                     } else {
-                        "書けなかった"
+                        "書けませんでした"
                     },
                     if shots_ready {
-                        "確保した"
+                        "確保しました"
                     } else {
-                        "確保できなかった"
+                        "確保できませんでした"
                     }
                 );
             }
@@ -902,9 +906,9 @@ pub fn run(
                 Ok(()) => {
                     let _ = writeln!(
                         detail_out(out),
-                        "台本: 分かれ道を開いた（SCRIPT_ON = 1）。ここから台本で押し、人の入力はゲームに届かない{}",
+                        "台本: 分かれ道を開きました（SCRIPT_ON = 1）。ここから台本で押し、人の入力はゲームに届きません{}",
                         if net_on && keep {
-                            "（after_script = keep: 台本が最後の段まで押した後はネットワークを閉じず、人の入力で続く）"
+                            "（after_script = keep: 台本が最後の段まで押した後はネットワークを閉じず、人の入力で続きます）"
                         } else {
                             ""
                         }
@@ -921,7 +925,10 @@ pub fn run(
                     }
                 }
                 Err(why) => {
-                    let _ = writeln!(out, "台本: 分かれ道を開けない（{why}）。台本なしで計測する");
+                    let _ = writeln!(
+                        out,
+                        "台本: 分かれ道を開けません（{why}）。台本なしで計測します。"
+                    );
                     if net_settings.is_some() {
                         net_len(steps, feed_first, Some(SCRIPT_MAX_SECONDS))
                     } else {
@@ -999,13 +1006,13 @@ mod tests {
         pub net_arm_fail: bool,
         /// `arm_net` が返す文（None なら既定の合成の文）。
         pub net_desc: Option<String>,
-        /// ネットワークのセッションを置いたときの設定と set_state のアドレス。
+        /// ネットワークのセッションを組み込んだときの設定と set_state のアドレス。
         pub net_armed: Option<(NetSettings, u32)>,
-        /// ローダーが渡した台本・ini の置き場の文（2 台の走らせ方）。None なら既定（DLL のフォルダ）。
+        /// ローダーが渡した台本・ini の場所の文（2 台の走らせ方）。None なら既定（DLL のフォルダ）。
         pub explicit: Option<String>,
         pub ini_from: Option<String>,
         pub io_fail: bool,
-        /// 台本なしで置いた関数のアドレス（feed, ローカル入力）。
+        /// 台本なしで設定した関数のアドレス（feed, ローカル入力）。
         pub io_armed: Option<(u32, u32)>,
         pub net_start_fail: bool,
         pub portrait_armed: Option<[u32; 3]>,
@@ -1171,7 +1178,7 @@ mod tests {
         assert_eq!(h.set_copies, Some(COPY_TABLE.to_vec()));
         assert!(
             log.contains(
-                "コピーの表: 6 行（合計 548 バイト）が枠に収まり、元が読めることを設置の前に確かめた"
+                "コピーの表: 6 行（合計 548 バイト）が枠に収まり、元が読めることを設置前にチェックしました"
             ),
             "{log}"
         );
@@ -1179,13 +1186,13 @@ mod tests {
         assert_eq!(h.written_at, Some(def.addr + 1));
         assert!(
             log.contains(&format!(
-                "ウィンドウ: 0x{WINDOW_ADDR:08X}（設置の前の値: 今の時刻 +0x2C = Some(1.5) / 期限 +0x3C = Some({:?})）",
+                "ウィンドウ: 0x{WINDOW_ADDR:08X}（設置前の値: 現在時刻 +0x2C = Some(1.5) / 期限 +0x3C = Some({:?})）",
                 1.5f64 + 1.0 / 60.0
             )),
             "{log}"
         );
         let want = format!(
-            "フックの設置: 地点 {HOOK_SITE} 0x{:08X}（call 先の差し替えの予定）の call の飛び先を 0x{original_target:08X} から入口 0x{:08X} へ",
+            "フックの設置: フック地点 {HOOK_SITE} 0x{:08X}（call 先の差し替えの予定）の call の飛び先を 0x{original_target:08X} から入口 0x{:08X} へ向けました。",
             def.addr,
             crate::hook::tests::ENTRY
         );
@@ -1239,7 +1246,8 @@ mod tests {
             "{block}"
         );
         assert!(
-            block.contains("× ネットワークを開けたか: 開けなかった: 開始のフックを書けなかった"),
+            block
+                .contains("× ネットワークを開けたか: 開けなかった: 開始のフックが書けませんでした"),
             "{block}"
         );
         assert!(
@@ -1247,7 +1255,7 @@ mod tests {
             "{block}"
         );
         assert!(
-            block.contains("－ 繋がったか: 対戦の通信を使っていない"),
+            block.contains("－ 接続できたか: 対戦の通信を使っていない"),
             "{block}"
         );
         let block = go(
@@ -1272,7 +1280,9 @@ mod tests {
             },
         );
         assert!(
-            block.contains("× ネットワークを開けたか: 開けなかった: 動かせなかった（合成の失敗）"),
+            block.contains(
+                "× ネットワークを開けたか: 開けなかった: 動かせませんでした（合成の失敗）"
+            ),
             "{block}"
         );
         let block = go(
@@ -1287,7 +1297,7 @@ mod tests {
             "{block}"
         );
         assert!(
-            block.contains("－ 繋がったか: 対戦の通信を使っていない"),
+            block.contains("－ 接続できたか: 対戦の通信を使っていない"),
             "{block}"
         );
     }
@@ -1303,7 +1313,7 @@ mod tests {
         assert_eq!(end, End::Installed);
         assert_eq!(h.set_copies, Some(Vec::new()));
         assert!(
-            log.contains("★★★ コピーの表を置かない（5 行目の元の範囲が読めない）"),
+            log.contains("★★★ コピーの表の作成不能（5 行目の元の範囲が読み取り不能）"),
             "{log}"
         );
     }
@@ -1317,7 +1327,7 @@ mod tests {
         assert_eq!(h.set_window, Some(0));
         assert!(
             log.contains(&format!(
-                "ウィンドウ: 0x{WINDOW_ADDR:08X} から 0x44 バイトが読めないので、入口にはウィンドウを読ませない"
+                "ウィンドウ: 0x{WINDOW_ADDR:08X} から 0x44 バイトを読めません。入口にはウィンドウを読ませず"
             )),
             "{log}"
         );
@@ -1335,7 +1345,7 @@ mod tests {
                     });
                     SITES.to_vec()
                 },
-                "同定・image base・表の検査のどれかが通っていない",
+                "同定・image base・表の検査が全通過でない",
             ),
             (
                 "exe が読めない",
@@ -1343,7 +1353,7 @@ mod tests {
                     e.ident = IdentOutcome::Unreadable("合成".to_string());
                     SITES.to_vec()
                 },
-                "同定・image base・表の検査のどれかが通っていない",
+                "同定・image base・表の検査が全通過でない",
             ),
             (
                 "image base の違い",
@@ -1351,7 +1361,7 @@ mod tests {
                     e.base = 0x0100_0000;
                     SITES.to_vec()
                 },
-                "同定・image base・表の検査のどれかが通っていない",
+                "同定・image base・表の検査が全通過でない",
             ),
             (
                 "表の破損",
@@ -1360,7 +1370,7 @@ mod tests {
                     t[1].addr = t[2].addr;
                     t
                 },
-                "同定・image base・表の検査のどれかが通っていない",
+                "同定・image base・表の検査が全通過でない",
             ),
             (
                 "1 地点の不一致",
@@ -1371,7 +1381,7 @@ mod tests {
                     e.mem.insert(d.addr, b);
                     SITES.to_vec()
                 },
-                "一致しない地点がある",
+                "一致しないフック地点がある",
             ),
             (
                 "1 地点が読めない",
@@ -1380,7 +1390,7 @@ mod tests {
                     e.mem.remove(&d.addr);
                     SITES.to_vec()
                 },
-                "一致しない地点がある",
+                "一致しないフック地点がある",
             ),
             (
                 "差し替える行が表に無い",
@@ -1403,7 +1413,7 @@ mod tests {
             assert_eq!(h.called_any, 0, "{label}: 設置の呼び出しがあった");
             assert_eq!(h.set_original, None, "{label}");
             assert!(
-                log.contains(&format!("フックの設置: しない（{why}）")),
+                log.contains(&format!("フックの設置: 未実行（{why}）。")),
                 "{label}: {log}"
             );
             let head = log
@@ -1507,7 +1517,7 @@ mod tests {
         h
     }
 
-    /// 配るバージョンのビルドでは走らせない（配るバージョンは描画だけのフレームを作らない —— `observe.rs` の `makes_render_only`）。
+    /// 利用者へ配るバージョン（配布版）のビルドでは走らせない（配るバージョンは描画だけのフレームを作らない —— `observe.rs` の `makes_render_only`）。
     #[cfg(not(feature = "dist"))]
     #[test]
     fn no_script_runs_as_before() {
@@ -1518,7 +1528,7 @@ mod tests {
         assert_eq!(end, End::Installed);
         assert_eq!(s.events, vec!["read"]);
         assert!(
-            log.contains("台本: script.txt が無い（台本なしで走る）"),
+            log.contains("台本: script.txt がありません（台本なしで実行します）"),
             "{log}"
         );
         assert!(
@@ -1557,21 +1567,26 @@ mod tests {
             );
             assert_eq!(h.writes, if draw_ok { 2 } else { 1 });
             assert!(
-                log.contains("台本: 読めた（2 段、settle = 5 tick）"),
+                log.contains("台本: 読み込み成功（2 段、settle = 5 tick）"),
                 "{log}"
             );
             assert!(log.contains("     2| scene=1 wait=3 p1=Z note=a"), "{log}");
             assert!(
-                log.contains("描画だけのフレームの予定: 作らない（台本のある走り）"),
+                log.contains("描画だけのフレームの予定: 未作成（台本のある実行）"),
                 "{log}"
             );
             assert!(!log.contains("描画だけのフレーム: "), "{log}");
-            assert!(log.contains("==== 台本（M1d） ===="), "{log}");
-            assert!(log.contains("台本: 1 秒の時点で進まなくなった"), "{log}");
+            assert!(log.contains("==== 台本 ===="), "{log}");
+            assert!(
+                log.contains("台本: 進まなくなりました（1 秒の時点"),
+                "{log}"
+            );
             assert!(log.contains("計測の集計: 11 回"), "{log}");
             if !draw_ok {
                 assert!(
-                    log.contains("撮影: しない（描画の detour を書けなかった・置き場を確保した）"),
+                    log.contains(
+                        "撮影: 未実行（描画の detour を書けませんでした・バッファを確保しました）"
+                    ),
                     "{log}"
                 );
             }
@@ -1633,9 +1648,9 @@ mod tests {
         assert_eq!(settings.peer, Some("127.0.0.1:7002".parse().unwrap()));
         assert_eq!(settings.check, crate::netplay::CheckSource::InputDigest);
         for w in [
-            "ネットワーク: 設定を読んだ",
+            "ネットワーク: 設定を読み込みました",
             "ネットワーク: 受信ソケット",
-            "ネットワーク: 動かした（NET_ON = 1）",
+            "ネットワーク: 動かしました（NET_ON = 1）",
         ] {
             assert!(log.contains(w), "{w}: {log}");
         }
@@ -1690,7 +1705,7 @@ mod tests {
             for k in lines {
                 assert!(
                     log.contains(&format!(
-                        "ネットワーク: 古いキー {k} は読まない。delay を使う\n"
+                        "ネットワーク: 古いキー {k} は読みません。delay を使います。\n"
                     )),
                     "{extra:?}: {log}"
                 );
@@ -1700,7 +1715,7 @@ mod tests {
 
     const DIST_INI: &str = include_str!("../../../scripts/dist/HiganRTool.ini");
 
-    /// 配る ini（`code_side = game`）を `edit` で書き換えて、ネットワークを開くところまで走らせる。
+    /// 利用者へ配る ini（`code_side = game`）を `edit` で書き換えて、ネットワークを開くところまで走らせる。
     fn run_dist_with(edit: impl Fn(&str) -> String) -> (FakeScript, String) {
         let dist = DIST_INI.replace("\r\n", "\n");
         let mut env = Fake::all_match();
@@ -1893,7 +1908,7 @@ mod tests {
             crate::ui_lang::set(Lang::Ja);
             let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
             assert!(
-                log.contains("言語: HiganRTool.ini の [ui] を読めない"),
+                log.contains("言語: HiganRTool.ini の [ui] 読み込み不能"),
                 "{bad}: {log}"
             );
             assert_eq!(
@@ -1916,7 +1931,7 @@ mod tests {
             vec!["read", "move", "prepare", "arm", "shots_on", "start"]
         );
         assert!(
-            log.contains("ネットワーク: 開始のフックが書けなかったので開かない"),
+            log.contains("ネットワーク: 開始のフックが書けなかったので開きません。"),
             "{log}"
         );
         let mut env = Fake::all_match();
@@ -1933,17 +1948,17 @@ mod tests {
             ]
         );
         assert!(
-            log.contains("ネットワーク: 開けない（合成の失敗）"),
+            log.contains("ネットワーク: 開けませんでした（合成の失敗）"),
             "{log}"
         );
         for (ini, want) in [
             (
                 Some(format!("{NET_INI}after_script = 1\n")),
-                "ネットワーク: HiganRTool.ini の [netplay] を読めない",
+                "ネットワーク: HiganRTool.ini の [netplay] 読み込み不能",
             ),
             (
                 None,
-                "ネットワーク: HiganRTool.ini が無い（ネットワークなしで走る）",
+                "ネットワーク: HiganRTool.ini が無い（ネットワークなしで実行する）。",
             ),
             (
                 Some("[netplay]\nenable = 0\n".to_string()),
@@ -2008,7 +2023,7 @@ mod tests {
                 addr_of(PORTRAIT_MARKER_SITE)
             ])
         );
-        assert!(log.contains("立ち絵の追随: 入れた"), "{log}");
+        assert!(log.contains("立ち絵の追随: 設置しました"), "{log}");
         for d in PORTRAIT_SITES {
             for unreadable in [false, true] {
                 let mut env = Fake::all_match();
@@ -2039,7 +2054,7 @@ mod tests {
                     vec!["read", "arm_io", "arm_net", "start_net", "start"],
                     "{why}"
                 );
-                assert!(log.contains("立ち絵の追随: 入れない"), "{why}: {log}");
+                assert!(log.contains("立ち絵の追随: 入れません"), "{why}: {log}");
                 assert!(log.contains(d.name), "{why}: {log}");
             }
         }
@@ -2075,7 +2090,7 @@ mod tests {
             s.events,
             vec!["read", "arm_io", "arm_net", "start_net", "start"]
         );
-        assert!(log.contains("poll: 使う"), "{log}");
+        assert!(log.contains("poll: 使用します"), "{log}");
         for i in 0..d.expected.len() {
             let mut env = Fake::all_match();
             let mut b = d.expected.to_vec();
@@ -2090,7 +2105,7 @@ mod tests {
                 vec!["read", "arm_io", "arm_net", "start_net", "start"],
                 "{i} 番目"
             );
-            assert!(log.contains("poll: 使わない（"), "{i} 番目: {log}");
+            assert!(log.contains("poll: 未使用（"), "{i} 番目: {log}");
             assert!(log.contains("不一致"), "{i} 番目: {log}");
             assert!(log.contains("0x0042BE40"), "{i} 番目: {log}");
         }
@@ -2146,19 +2161,22 @@ mod tests {
         assert_eq!(set_state, site_addr(SET_STATE_SITE));
         assert_eq!(settings.session_id, Some(0x4847_5254));
         for w in [
-            "ネットワーク: 台本なしで開く（M2-5",
-            "ネットワーク: 動かした（NET_ON = 1）",
-            "ネットワーク: 分かれ道を開いた（SCRIPT_ON = 1）。台本は無い",
-            "描画だけのフレームの予定: 作らない（ネットワークの実行）",
-            "ネットワーク: 1 秒の時点で終わっていた（ネットワークのセッションを置いていない）",
+            "ネットワーク: 台本なしで開きます（自分の語は",
+            "ネットワーク: 動かしました（NET_ON = 1）",
+            "ネットワーク: 分かれ道を開きました（SCRIPT_ON = 1）。台本はありません",
+            "描画だけのフレームの予定: 未作成（ネットワークの実行）",
+            "ネットワーク: 終わっていました（1 秒の時点。ネットワークのセッションを置いていない）",
             "計測の集計: 11 回",
-            "ネットワークが開いている間は計測の上限で止めない",
+            "ネットワークが開いている間は計測の上限で止めません",
             "計測 1/上限なし: ",
         ] {
             assert!(log.contains(w), "{w}: {log}");
         }
         assert!(!log.contains("描画だけのフレーム: "), "{log}");
-        assert!(!log.contains("秒。ネットワークは計測の後も続く"), "{log}");
+        assert!(
+            !log.contains("秒。ネットワークは計測の後も続きます"),
+            "{log}"
+        );
     }
 
     #[test]
@@ -2169,25 +2187,25 @@ mod tests {
                 "アドレスを置けない",
                 |s, _| s.io_fail = true,
                 &["read", "arm_io"],
-                "ネットワーク: アドレスを置けない（合成の失敗）ので開かない",
+                "ネットワーク: アドレスの設定不能（合成の失敗）。開きません。",
             ),
             (
                 "開始のフックが書けない",
                 |_, h| *h = fake_hook_both_writable(),
                 &["read", "arm_io"],
-                "ネットワーク: 開始のフックが書けなかったので開かない",
+                "ネットワーク: 開始のフックが書けなかったので開きません。",
             ),
             (
                 "ネットワークのセッションを置けない",
                 |s, _| s.net_arm_fail = true,
                 &["read", "arm_io", "arm_net"],
-                "ネットワーク: 開けない（合成の失敗）",
+                "ネットワーク: 開けませんでした（合成の失敗）",
             ),
             (
                 "ネットワークを動かせない",
                 |s, _| s.net_start_fail = true,
                 &["read", "arm_io", "arm_net", "start_net"],
-                "ネットワーク: 動かせない（合成の失敗）",
+                "ネットワーク: 動かせません（合成の失敗）",
             ),
         ];
         for (label, setup, events, why) in cases {
@@ -2203,7 +2221,7 @@ mod tests {
             assert_eq!(s.events, events.to_vec(), "{label}");
             assert!(log.contains(why), "{label}: {log}");
             assert!(
-                log.contains("ネットワーク: 開けなかったので分かれ道は開かない"),
+                log.contains("ネットワーク: 開けなかったので分かれ道は開きません"),
                 "{label}: {log}"
             );
             assert!(!log.contains("描画だけのフレーム: "), "{label}: {log}");
@@ -2237,15 +2255,15 @@ mod tests {
         assert_eq!(settings.after_script, AfterScript::Keep);
         for w in [
             "after_script = keep: 台本が最後の段まで押した後はネットワークを閉じず",
-            "台本（あれば）とネットワークが終わってから 10 秒で終える",
-            &format!("（上限 {SCRIPT_MAX_SECONDS} 秒。ネットワークは計測の後も続く）"),
+            "台本（あれば）とネットワークが終わってから 10 秒で終了します",
+            &format!("（上限 {SCRIPT_MAX_SECONDS} 秒。ネットワークは計測の後も続きます）"),
             &format!("計測 1/{SCRIPT_MAX_SECONDS}: "),
         ] {
             assert!(log.contains(w), "{w}: {log}");
         }
         assert!(!log.contains("上限なし"), "{log}");
         assert!(
-            !log.contains("台本が終わるか止まってから 10 秒で終える"),
+            !log.contains("台本が終わるか止まってから 10 秒で終了します"),
             "{log}"
         );
         let mut env = Fake::all_match();
@@ -2254,7 +2272,7 @@ mod tests {
         let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
         assert!(
             log.contains(&format!(
-                "台本が終わるか止まってから 10 秒で終える（上限 {SCRIPT_MAX_SECONDS} 秒）"
+                "台本が終わるか止まってから 10 秒で終了します（上限 {SCRIPT_MAX_SECONDS} 秒）"
             )),
             "{log}"
         );
@@ -2287,7 +2305,7 @@ mod tests {
         assert_eq!(end, End::NotInstalled);
         assert_eq!(s.events, vec!["read", "move", "prepare", "arm"]);
         assert!(
-            log.contains("フックの設置が断られたので動かさない"),
+            log.contains("フックの設置が断られたので動かしません"),
             "{log}"
         );
     }
@@ -2300,7 +2318,7 @@ mod tests {
                 "読めない行",
                 |s| s.file = Some(b"scene=1\nscene=1 p1=ENTER\n".to_vec()),
                 &["read", "move"],
-                "台本: 読めない（2行目: p1 に知らないキー名があります: ENTER）",
+                "台本: 読み込み不能（2 行目: p1 に不明なキー名があります: ENTER）",
             ),
             (
                 "移せない",
@@ -2309,13 +2327,13 @@ mod tests {
                     s.move_fail = true;
                 },
                 &["read", "move"],
-                "台本: script.txt を移せない（合成の失敗）ので使わない",
+                "台本: script.txt の移行不能（合成の失敗）。使いません",
             ),
             (
                 "読めないファイル",
                 |s| s.read_fail = true,
                 &["read"],
-                "台本: script.txt を読めない（合成の失敗）",
+                "台本: script.txt 読み込み不能（合成の失敗）",
             ),
             (
                 "UTF-8 でない",
@@ -2330,7 +2348,7 @@ mod tests {
                     s.arm_fail = true;
                 },
                 &["read", "move", "prepare", "arm"],
-                "台本: 置けない（合成の失敗）ので使わない",
+                "台本: 用意不可（合成の失敗）、使いません。",
             ),
         ];
         for (label, setup, events, why) in cases {
@@ -2359,7 +2377,7 @@ mod tests {
         assert_eq!(end, End::NotInstalled);
         assert!(s.events.is_empty(), "{:?}", s.events);
         assert!(
-            log.contains("台本: 設置しないので script.txt には触らない"),
+            log.contains("台本: 非設置のため script.txt には触りません"),
             "{log}"
         );
     }
@@ -2392,9 +2410,9 @@ mod tests {
         );
         for w in [
             r"台本: 環境の変数 HIGANRTOOL_SCRIPT で渡された C:\s\two_01_host.txt（",
-            "を読んだ（ローダーが渡した台本なので移さない）",
+            "を読み込みました（ローダーが渡した台本なので移動しません）",
             r"ini: 環境の変数 HIGANRTOOL_INI で渡された C:\s\two_host.ini",
-            "ネットワーク: 設定を読んだ",
+            "ネットワーク: 設定を読み込みました",
         ] {
             assert!(log.contains(w), "{w}: {log}");
         }
@@ -2417,8 +2435,6 @@ mod tests {
         crate::log_mode::with_detail(true, f)
     }
 
-    /// 壊れたら落ちる: 簡潔なログが、起動の節目（ビルド・時刻・同定・照合の集計・終わりのまとめ）を落とす。または、地点ごとの照合・
-    /// ウィンドウの値・コピーの表・設置の細目を残して簡潔になっていない。詳細が今までの行を失う。
     #[test]
     fn a_brief_run_keeps_the_start_lines_and_the_summary_but_not_the_detail_lines() {
         let run = || {
@@ -2433,24 +2449,22 @@ mod tests {
         let (b, d) = (brief(run), detailed(run));
         for want in [
             "HiganRTool: ビルド",
-            "時刻: ",
             "同定: 一致（花映塚 1.50a）",
-            "集計: 14 地点のうち 一致 14 / 不一致 0 / 読めない 0",
-            "==== 状態の変化（計測 1 秒の時点） ====",
+            "集計: 14 地点のうち 一致 14 / 不一致 0 / 読み取り不能 0",
+            "==== 状態の変化（1 秒の時点） ====",
             "〇 フックの設置: ",
             "==== 試験のまとめ ====",
         ] {
             assert!(b.contains(want), "簡潔に {want:?} が無い:\n{b}");
         }
         for detail_only in [
-            "PID: ",
             "exe: ",
             "image base: ",
-            "表の検査: 通った",
+            "表の検査: 通過",
             "地点 input_wait_call",
             "コピーの表: 6 行",
             "ウィンドウ: 0x",
-            "フックの設置: 地点 ",
+            "フックの設置: フック地点 ",
             "フックの設置の試み: ",
             "読み返し: ",
             "inline detour: ",
@@ -2476,7 +2490,6 @@ mod tests {
         assert!(!b.contains("==== 試験のまとめ（途中経過"));
     }
 
-    /// 壊れたら落ちる: 簡潔なログが、断られた・合わなかった・開けなかった理由の行を落とす。
     #[test]
     fn a_brief_run_still_says_why_something_was_refused_or_failed() {
         // 照合が合わない地点の行と、設置しない理由。
@@ -2492,8 +2505,8 @@ mod tests {
         for want in [
             "地点 fn_set_state",
             "不一致 実際 = ",
-            "集計: 14 地点のうち 一致 13 / 不一致 1 / 読めない 0",
-            "フックの設置: しない（一致しない地点がある）",
+            "集計: 14 地点のうち 一致 13 / 不一致 1 / 読み取り不能 0",
+            "フックの設置: 未実行（一致しないフック地点がある）。",
             "× フックの設置: 照合が合わなかった地点: fn_set_state",
         ] {
             assert!(log.contains(want), "{want:?}:\n{log}");
@@ -2507,9 +2520,9 @@ mod tests {
             let mut h = fake_hook_for_real_row();
             run_both(&mut env, &mut h, SITES).1
         });
-        assert!(log.contains("同定: 不一致（食い違った欄: "), "{log}");
+        assert!(log.contains("同定: 不一致（項目: "), "{log}");
         assert!(
-            log.contains("地点の照合: しない（同定が合わないため）"),
+            log.contains("フック地点の照合: 未実行（同定不能）"),
             "{log}"
         );
         // 書き込みを断った。
@@ -2520,8 +2533,8 @@ mod tests {
             run_both(&mut env, &mut h, SITES).1
         });
         for want in [
-            "フックの設置: 地点 input_wait_call",
-            "フックの設置: 書かない（",
+            "フックの設置: フック地点 input_wait_call",
+            "フックの設置: 書きません（",
             "フックの設置の試み: ",
         ] {
             assert!(log.contains(want), "{want:?}:\n{log}");
@@ -2538,17 +2551,17 @@ mod tests {
             run_with(&mut env, &mut h, SITES, &mut s).1
         });
         assert!(
-            log.contains("ネットワーク: 開けない（合成の失敗）"),
+            log.contains("ネットワーク: 開けませんでした（合成の失敗）"),
             "{log}"
         );
         for (ini, want) in [
             (
                 Some(format!("{NET_INI}after_script = 1\n")),
-                "ネットワーク: HiganRTool.ini の [netplay] を読めない",
+                "ネットワーク: HiganRTool.ini の [netplay] 読み込み不能",
             ),
             (
                 None,
-                "ネットワーク: HiganRTool.ini が無い（ネットワークなしで走る）",
+                "ネットワーク: HiganRTool.ini が無い（ネットワークなしで実行する）。",
             ),
         ] {
             let log = brief(|| {
@@ -2568,7 +2581,7 @@ mod tests {
             run_with(&mut env, &mut h, SITES, &mut net_script()).1
         });
         assert!(
-            log.contains("ネットワーク: 開始のフックが書けなかったので開かない"),
+            log.contains("ネットワーク: 開始のフックが書けなかったので開きません。"),
             "{log}"
         );
         // 壊れた台本。
@@ -2581,10 +2594,9 @@ mod tests {
             };
             run_with(&mut env, &mut h, SITES, &mut s).1
         });
-        assert!(log.contains("台本: 読めない（"), "{log}");
+        assert!(log.contains("台本: 読み込み不能（"), "{log}");
     }
 
-    /// 壊れたら落ちる: ネットワークの名前・IP のアドレス・ユーザー名入りのパスが、簡潔でも詳細でも本ログに出る。
     #[test]
     fn neither_mode_writes_the_net_name_an_ip_address_or_a_user_folder() {
         const INI: &str = "[netplay]\nenable = 1\nscope = internet\nbind = 127.0.0.1:0\npeer = 198.51.100.9:7002\nsession = 0x48475254\ncheck = digest\nname = SecretPlayer\n";
@@ -2627,7 +2639,7 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: ネットワークを開いた文に混ざった観戦の準備の失敗が、簡潔なログから消える。成功の文が簡潔に出る。
+    /// 成功の文は簡潔なログに出ない。
     #[test]
     fn a_spectate_setup_failure_in_the_net_note_reaches_the_brief_log() {
         let run = |desc: &str| {
@@ -2641,12 +2653,12 @@ mod tests {
                 run_with(&mut env, &mut h, SITES, &mut s).1
             })
         };
-        let ok = run("受信ソケットを開いた / 観戦の配る側を起こした");
-        assert!(!ok.contains("観戦の配る側を起こした"), "{ok}");
+        let ok = run("受信ソケットを開いた / 観戦の配信側を用意しました");
+        assert!(!ok.contains("観戦の配信側を用意しました"), "{ok}");
         for bad in [
-            " / 観戦は使わない: 部屋サーバーが無い",
-            " / 観戦: 受信スレッドに置けなかった（もう置いてある）",
-            " / 観戦用の部屋。ただしコードを書けない: 書けない",
+            " / 観戦は使いません: 部屋サーバーが無い",
+            " / 観戦の配信を開始できませんでした（送り手の登録が重複）",
+            " / 観戦用の部屋。ただし、コードを書けませんでした: 書けない",
         ] {
             let log = run(&format!("受信ソケットを開いた{bad}"));
             assert!(log.contains(bad), "{bad}:\n{log}");

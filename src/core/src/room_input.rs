@@ -1,19 +1,16 @@
 //! ゲーム内のメニューの「ルーム名の入力」（pure。確保しない）。
 //!
-//! ルーム名はゲームの中（花映塚のネット対戦のメニュー）でキーボードから打って決め、決めた名は ini の `room` に書き戻す（次の初めの値になる）。
+//! ルーム名はゲームの中でキーボードから打って決め、決めた名は ini の `room` に書き戻す（次の初めの値になる）。
 //! ここは文字の受け方・編集・初めの値だけで、ウィンドウから文字を受けること（`WM_CHAR`）と ini の書き換えは dll（`text_input_win` / `ini_save`）の仕事。
-//!
-//! - 受ける文字は `room::RoomName::accepts_char`（ASCII の英数字・`-`・`_`）。全角の英数字・`－`・`＿` は半角に直して受け、
-//!   ほかの文字は捨てる。32 文字（`room::ROOM_NAME_MAX`）まで。
-//! - Backspace（0x08。Ctrl+Backspace の 0x7F も）で 1 文字消す。Enter（0x0D。0x0A も）で決める。決めるガードは `RoomName::parse`
-//!   （空・`.` の名などは理由つきで断り、メニューが理由の行を出して入力に留まる）。
+//! - 受ける文字は `RoomName::accepts_char`（ASCII の英数字・`-`・`_`。`ROOM_NAME_MAX` = 32 文字まで）。全角の英数字・`－`・`＿` は半角に直して受け、ほかは捨てる。
+//! - Backspace（0x08・Ctrl+Backspace の 0x7F）で 1 文字消し、Enter（0x0D・0x0A）で決める。決めるガードは `RoomName::parse`（空・`.` の名などは理由つきで断り、メニューが理由の行を出して入力に留まる）。
 //! - 文字は UTF-16 の 1 単位で来る。基本面の外の文字（絵文字）は 2 単位に割れて来るが、どちらも `fold_unit` が捨てる。
 //!
 //! ルーム名は本ログに書かないので、`RoomBuf` の `Debug` は中身を書かない。
 
 use crate::room::{ROOM_NAME_MAX, RoomName, RoomNameError};
 
-/// 以前の版がルーム名を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、起動のときに ini の `room` へ移して消す。
+/// 以前のバージョンがルーム名を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、dll が起動のときに ini の `room` へ移して消す。
 pub const ROOM_LAST_FILE: &str = "room_last.txt";
 
 /// `WM_CHAR` の制御文字（Backspace・Enter・改行・Ctrl+Backspace の 0x7F）。
@@ -240,7 +237,7 @@ pub fn initial_from(ini: Option<&str>) -> (RoomBuf, InitialFrom) {
     }
 }
 
-/// 以前の版が覚えたファイル（`ROOM_LAST_FILE`）の中身を読む（引き継ぎ用）。先頭の BOM と前後の空白は除き、最初の 1 行だけを見る。
+/// 以前のバージョンが覚えたファイル（`ROOM_LAST_FILE`）の中身を読む（引き継ぎ用）。先頭の BOM と前後の空白は除き、最初の 1 行だけを見る。
 /// 決まりの外・空・壊れた文字は `None`。
 pub fn parse_last(text: &str) -> Option<RoomBuf> {
     let first = text.trim_start_matches('\u{FEFF}').lines().next()?;

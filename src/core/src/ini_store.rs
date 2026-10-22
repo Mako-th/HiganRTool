@@ -4,7 +4,7 @@
 //! - 書くのは一時ファイル（`<ini>.tmp`）へ書いてから置き換える（途中で落ちても ini が壊れない）。ini が無いときは作らない。
 //! - 読み書きは 1 本の鍵の中で行う。名前・ルーム名・同期方式・言語・ゲームのパスは別々のスレッドが頼むので、
 //!   読んで書く間に別の頼みが入って、片方の書き換えが消えないようにする。
-//! - 以前の版が別ファイルに覚えていた値（`game_path.txt` など）は `migrate` が ini へ移す。
+//! - 以前のバージョンが別ファイルに覚えていた値（`game_path.txt` など）は `migrate` が ini へ移す。
 #![forbid(unsafe_code)]
 
 use std::io::Read;
@@ -42,7 +42,7 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, std::io::Error> {
         .take(max + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
-        return Err(std::io::Error::other("大きすぎる"));
+        return Err(std::io::Error::other("大きすぎます"));
     }
     Ok(bytes)
 }
@@ -63,7 +63,7 @@ fn read_or_initial(path: &Path, initial: Option<&str>) -> Result<Vec<u8>, String
         (Err(e), Some(text)) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(text.as_bytes().to_vec())
         }
-        (r, _) => r.map_err(|e| format!("{} を読めない: {e}", path.display())),
+        (r, _) => r.map_err(|e| format!("{} 読み込み不能: {e}", path.display())),
     }
 }
 
@@ -85,10 +85,10 @@ fn write_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     let tmp = PathBuf::from(name);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{} 書き込み不能: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("{} へ置き換えられない: {e}", path.display())
+        format!("{} へ置き換えられません: {e}", path.display())
     })
 }
 
@@ -116,7 +116,7 @@ pub fn update_creating(path: &Path, initial: &str, edits: &[Edit<'_>]) -> Result
     update_locked(path, Some(initial), edits)
 }
 
-/// `is_latest` が真のときだけ書く。確かめるのは鍵の中なので、確かめた後に別の頼みが入って古い値で上書きする隙間が無い。
+/// `is_latest` が真のときだけ書く。検証するのは鍵の中なので、検証した後に別の頼みが入って古い値で上書きする隙間が無い。
 /// 偽なら何も書かず `Ok(false)`（もっと新しい頼みがある）。
 pub fn update_if(
     path: &Path,
@@ -136,9 +136,9 @@ pub fn update_if(
 pub fn rewrite(path: &Path, make: impl FnOnce(&str) -> Option<String>) -> Result<bool, String> {
     let _g = lock();
     let old =
-        read_capped(path, INI_MAX).map_err(|e| format!("{} を読めない: {e}", path.display()))?;
+        read_capped(path, INI_MAX).map_err(|e| format!("{} 読み込み不能: {e}", path.display()))?;
     let text = decode(&old)
-        .ok_or_else(|| format!("{} は UTF-8 でも Shift_JIS でもない", path.display()))?;
+        .ok_or_else(|| format!("{} は UTF-8 でも Shift_JIS でもありません", path.display()))?;
     let Some(new) = make(&text) else {
         return Ok(false);
     };
@@ -149,7 +149,7 @@ pub fn rewrite(path: &Path, make: impl FnOnce(&str) -> Option<String>) -> Result
     Ok(true)
 }
 
-/// 以前の版が別ファイルに覚えていた値 1 つ。
+/// 以前のバージョンが別ファイルに覚えていた値 1 つ。
 pub struct Legacy<'a> {
     pub file: PathBuf,
     pub section: &'a str,
@@ -179,7 +179,7 @@ pub fn migrate(ini_path: &Path, initial: Option<&str>, items: &[Legacy<'_>]) -> 
         Err(why) => {
             for i in &present {
                 logs.push(format!(
-                    "{} を ini へ移せない（{why}）。ファイルは残す",
+                    "{} を ini へ移せませんでした（{why}）。ファイルは残します。",
                     i.file.display()
                 ));
             }
@@ -199,7 +199,7 @@ pub fn migrate(ini_path: &Path, initial: Option<&str>, items: &[Legacy<'_>]) -> 
             Some(v) => v,
             None => {
                 logs.push(format!(
-                    "{shown} の中身が使えないので移せない。ファイルは残す"
+                    "{shown} の中身が使えないので移せません。ファイルは残します。"
                 ));
                 continue;
             }
@@ -222,7 +222,9 @@ pub fn migrate(ini_path: &Path, initial: Option<&str>, items: &[Legacy<'_>]) -> 
                 bytes = b;
                 moved.push(i);
             }
-            Err(e) => logs.push(format!("{shown} を ini へ移せない（{e}）。ファイルは残す")),
+            Err(e) => logs.push(format!(
+                "{shown} を ini へ移せませんでした（{e}）。ファイルは残します。"
+            )),
         }
     }
     if bytes != orig
@@ -230,21 +232,21 @@ pub fn migrate(ini_path: &Path, initial: Option<&str>, items: &[Legacy<'_>]) -> 
     {
         for i in moved {
             logs.push(format!(
-                "{} を ini へ移せない（{why}）。ファイルは残す",
+                "{} を ini へ移せませんでした（{why}）。ファイルは残します。",
                 i.file.display()
             ));
         }
         moved = Vec::new();
     }
-    for (i, how) in moved.into_iter().map(|i| (i, "ini へ移した")).chain(
+    for (i, how) in moved.into_iter().map(|i| (i, "ini へ移しました")).chain(
         superseded
             .into_iter()
-            .map(|i| (i, "ini に値があるので移さない（ini を優先）")),
+            .map(|i| (i, "ini に値があるので非移行（ini を優先）")),
     ) {
         let shown = i.file.display();
         match std::fs::remove_file(&i.file) {
-            Ok(()) => logs.push(format!("{shown}: {how}。ファイルを消した")),
-            Err(e) => logs.push(format!("{shown}: {how}。ファイルを消せない（{e}）")),
+            Ok(()) => logs.push(format!("{shown}: {how}。ファイルを消しました。")),
+            Err(e) => logs.push(format!("{shown}: {how}。ファイルを消せません（{e}）。")),
         }
     }
     logs
@@ -547,7 +549,7 @@ mod tests {
         let logs = migrate(&p, None, &[item(&t, "a.txt", "a")]);
         assert!(t.file("a.txt").exists(), "移せていないのにファイルを消した");
         assert_eq!(logs.len(), 1, "{logs:?}");
-        assert!(logs[0].contains("移せない"), "{logs:?}");
+        assert!(logs[0].contains("移せません"), "{logs:?}");
         assert!(update(&p, &[set("s", "x", "2")]).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[s]\nx = 1\n");
     }

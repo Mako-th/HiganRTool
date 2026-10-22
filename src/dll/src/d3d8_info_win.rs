@@ -20,7 +20,7 @@ use crate::win::module_path;
 /// バージョン情報のブロックの上限（暴走した値で大きな確保をしない）。
 const MAX_VERSION_BLOCK: u32 = 1 << 20;
 
-/// 翻訳の表に無かったときに試す言語とコードページ（米国英語・日本語。リソースを作る道具が最もよく書く組）。
+/// 翻訳の表に無かったときに試す言語とコードページ（米国英語・日本語。リソースを作るツールが最もよく書く組）。
 const FALLBACK_LANGS: [u32; 4] = [0x0409_04B0, 0x0409_04E4, 0x0411_04B0, 0x0000_04B0];
 
 fn wide_nul(s: &str) -> Vec<u16> {
@@ -132,7 +132,7 @@ fn query(block: &[u8], sub: &str) -> Option<(usize, u32)> {
     let mut ptr: *mut c_void = core::ptr::null_mut();
     let mut len = 0u32;
     // SAFETY: `block` は GetFileVersionInfoW が埋めたブロックで、呼び出しの間生きている。名前は 0 終わりの UTF-16。
-    // 答えのポインタは `block` の中を指す（下で範囲を確かめてから読む）。
+    // 答えのポインタは `block` の中を指す（下で範囲をチェックしてから読む）。
     let ok = unsafe { VerQueryValueW(block.as_ptr().cast(), w.as_ptr(), &mut ptr, &mut len) };
     let start = ptr as usize;
     let base = block.as_ptr() as usize;
@@ -149,7 +149,7 @@ fn query_string(block: &[u8], sub: &str) -> Option<String> {
     let n = (len as usize).min(avail);
     let units: Vec<u16> = (0..n)
         .map(|i| {
-            // SAFETY: `start + 2 * i + 2 <= end` を上の `avail` で確かめた（`block` の中）。揃っていなくてもよい読み。
+            // SAFETY: `start + 2 * i + 2 <= end` を上の `avail` でチェックした（`block` の中）。揃っていなくてもよい読み。
             unsafe { ((start + 2 * i) as *const u16).read_unaligned() }
         })
         .take_while(|&u| u != 0)
@@ -166,7 +166,7 @@ fn translations(block: &[u8]) -> Vec<u32> {
     let n = ((bytes as usize).min(end - start) / 4).min(8);
     (0..n)
         .map(|i| {
-            // SAFETY: `start + 4 * i + 4 <= end` を上の `min` で確かめた（`block` の中）。揃っていなくてもよい読み。
+            // SAFETY: `start + 4 * i + 4 <= end` を上の `min` でチェックした（`block` の中）。揃っていなくてもよい読み。
             let v = unsafe { ((start + 4 * i) as *const u32).read_unaligned() };
             // 表の組は 下位 16 ビットが言語、上位 16 ビットがコードページ。枝の名前は 言語 → コードページの順。
             v.rotate_right(16)
@@ -174,10 +174,10 @@ fn translations(block: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// 本ログの 1 行。読み込まれていなければ「読み込まれていない」。この後の起動の手順を止めないよう、パニックは受けて 1 行にする。
+/// 本ログの 1 行。読み込まれていなければ「読み込まれていません」。この後の起動の手順を止めないよう、パニックは受けて 1 行にする。
 pub fn d3d8_line() -> String {
     std::panic::catch_unwind(|| d3d8_module::line(loaded_d3d8().as_ref()))
-        .unwrap_or_else(|_| "D3D8: d3d8.dll の情報を集められなかった（パニック）".to_string())
+        .unwrap_or_else(|_| "d3d8.dllの情報: 取得不能（パニック）".to_string())
 }
 
 #[cfg(test)]
@@ -190,7 +190,6 @@ mod tests {
         unsafe { GetModuleHandleW(name.as_ptr()) }
     }
 
-    /// 壊れたら落ちる: バージョン情報の読み方（翻訳の表の並び・文字列の長さの単位・VerQueryValueW の呼び方）。
     /// kernel32 は Windows にも Wine にもあり、FileVersion と CompanyName を持つ。
     #[test]
     fn version_fields_of_a_real_system_dll_are_read() {
@@ -203,7 +202,7 @@ mod tests {
         assert!(v.company.as_deref().is_some_and(|s| !s.is_empty()), "{v:?}");
     }
 
-    /// 壊れたら落ちる: 翻訳の表の並び（言語とコードページの入れ替わり）。入れ替わっても既定の組が当たって欄は読めてしまうので、表そのものを見る。
+    /// 入れ替わっても既定の組が当たって欄は読めてしまうので、表そのものを見る。
     #[test]
     fn translation_table_is_language_then_code_page() {
         let p = module_path(kernel32()).expect("kernel32 のパス");
@@ -217,16 +216,14 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: システムのフォルダの判定（本物の `GetSystemDirectoryW` と読み込み元の綴りが合わない）。
     #[test]
     fn a_system_dll_is_placed_in_the_system_folder() {
         let m = module_facts(kernel32());
         let line = d3d8_module::line(Some(&m));
-        assert!(line.contains("システムのフォルダにある"), "{line}");
+        assert!(line.contains("システムフォルダ"), "{line}");
         assert!(m.size.is_some_and(|s| s > 0), "{m:?}");
     }
 
-    /// 壊れたら落ちる: 検査の exe は d3d8.dll を読み込まないのに「読み込まれている」と書く。
     #[test]
     fn a_dll_that_is_not_loaded_is_reported_as_such() {
         let name = wide_nul("d3d8.dll");
@@ -234,7 +231,7 @@ mod tests {
         let loaded = unsafe { !GetModuleHandleW(name.as_ptr()).is_null() };
         if !loaded {
             assert_eq!(loaded_d3d8(), None);
-            assert!(d3d8_line().contains("読み込まれていない"));
+            assert!(d3d8_line().contains("読み込まれていません"));
         }
     }
 

@@ -18,6 +18,8 @@ dist = []
 
 [dependencies]
 higanr_core = { path = "../core" }
+# std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり（古い Wine 向け。自作）。build.rs が /DELAYLOAD を渡す。
+higanr_prng_shim = { path = "../prng_shim" }
 # Win32 の宣言だけ（MIT OR Apache-2.0。dll と loader が使う）。
 # 機能は使う API の分だけ開ける。Win32_Security は CreateMutexW / CreateThread の引数の型
 # （SECURITY_ATTRIBUTES）に要る。Win32_System_Kernel は x86 の CONTEXT（GetThreadContext）の中の
@@ -86,6 +88,8 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 # 配る DLL のバージョン情報（.res）を作る。build.rs だけが使い、成果物には入らない（自作）。
 higanr_build_res = { path = "../build_res" }
+# build.rs が /DELAYLOAD: に渡す DLL の名前（`PRNG_DLL`）を読む。成果物には入らない。
+higanr_prng_shim = { path = "../prng_shim" }
 
 [dev-dependencies]
 # 検査だけ: 撮影の PNG を読み戻して画素を比べる（MIT OR Apache-2.0。core が符号化に使うものと同じ版）。

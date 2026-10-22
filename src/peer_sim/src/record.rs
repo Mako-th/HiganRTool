@@ -1,7 +1,7 @@
 //! 記録: フレームごとの (seg, frame, 1P, 2P) の列と、終わりの要約（総フレーム数、stall の総数と最大連続、「到着 → 適用」の
 //! p50 / p95 / p99 / max、捨てたものの数）。
 //!
-//! 回ごとに別名のファイルを `create_new` で作り、既存のファイルを上書きしない。置き場の中か上に `th09.exe` があれば（ゲームの
+//! 回ごとに別名のファイルを `create_new` で作り、既存のファイルを上書きしない。出力先のフォルダの中か上に `th09.exe` があれば（ゲームの
 //! フォルダ）書かずに断る。
 
 use std::fmt::Write as _;
@@ -219,7 +219,7 @@ pub fn log_text(rep: &Report, args_line: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# peer_sim の記録");
     let _ = writeln!(s, "# 引数: {args_line}");
-    // 入った押下は `#` の行に置く（`#` でない行は (seg frame 1P 2P delay) の列だけにして、dll の
+    // 入った押下は `#` の行に書く（`#` でない行は (seg frame 1P 2P delay) の列だけにして、dll の
     // `_net_frames.csv` や相手の記録と行ごとに突き合わせられる形を保つ）。
     let _ = writeln!(s, "# 押下 step kind value screen（入った順）");
     for st in &rep.presses {

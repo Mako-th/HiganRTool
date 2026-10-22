@@ -6,16 +6,70 @@ Different versions cannot connect to each other.
 Use the same version as your opponent.
 
 
+## v1.2.0
+
+### Added
+
+- Added `rollback_cutin_se` under `[netplay]` in `HiganRTool.ini` (when to play the cut-in sound while using rollback).
+  The default is `confirmed`, which holds the sound until the frame is confirmed, like the hit sound.
+  The more rollback frames, the later your own cut-in sound plays, as it also waits until confirmed (up to about 130 ms). To play it at prediction time, set `live`.
+- Pressing Esc during a match while spectating now opens the game's pause menu.
+  While the pause menu cannot be opened, "Paused" is shown at the top left.
+- When watching random matches and room matches, spectators now relay the match to each other.
+  The host basically sends directly to up to 2 spectators, which reduces the load on the connection.
+  If you do not want to relay to other spectators, set `relay = 0` under `[spectate]` in `HiganRTool.ini`.
+- Added `ff_max` under `[spectate]` in `HiganRTool.ini` (fast-forward speed when you join mid-match; `1`–`16` times, default `8`).
+
+### Changed
+
+- Added `vsync` under `[pacing]` in `HiganRTool.ini`.
+  Choose from `off` (default) / `on` / `game` (the custom.exe setting as is). The custom.exe setting is not rewritten.
+- Renamed `auto_window` under `[pacing]` in `HiganRTool.ini` to `wait` (`passive` / `active`), and made the lighter `passive` the default.
+  Your current setting is carried over on the automatic update.
+- The tool now keeps 60.000 fps in fullscreen without vsync as well.
+- Vsync in fullscreen is now off by default (the tool keeps 60.000 fps).
+  To follow the custom.exe setting, set `vsync = game` under `[pacing]`.
+- The tool now works around a game bug where saving a Story, Extra or Match replay of a long game could crash the game. (Gameplay is unchanged, but the game's behavior when saving a replay is changed.)
+- Replays saved outside 妖怪 対 妖怪 now also carry a mark that the game was started from HiganRTool (the tool's version).
+  Normal modes can be played and their replays saved just as when starting the game on its own, so the mark lets you tell them apart.
+- Stopping spectating is now done by holding Esc for 3 seconds.
+  This is to tell it apart from the Esc that opens the pause menu. You can also stop with "Return to title" in the pause menu.
+- Spectating connections now also use IPv6.
+- Spectators who join mid-match now catch up faster (8x by default).
+- When you cannot watch because the match is full of spectators, this is now shown on screen.
+- The host that sends the match to spectators is now chosen automatically as the player who is easier to connect to and has the faster upload.
+- When the host's sending to spectators could slow down the match traffic, the host now sends less to spectators and gives priority to the match.
+- Spectators keep receiving the match from the host even while the game is stopped, such as while the window is being dragged.
+- Spectating now ends when the records buffered on the spectator's PC reach the limit (about one hour).
+- Reworded the log messages to be shorter and easier to read.
+- The GitHub repository now runs the tests with GitHub Actions on every push and pull request.
+- Dependency updates are now checked weekly with Dependabot and taken in only after the tests pass.
+
+### Fixed
+
+- Fixed a crash that could happen when starting with the fullscreen setting.
+- Fixed the heavy processing load while another window was in front of the game in fullscreen.
+- Fixed thprac not recognizing the game started from HiganRTool.
+- Fixed Discord's game capture treating the game started from HiganRTool and the one registered with vpatch as different games.
+- Fixed HiganRTool.exe not starting on older Wine, such as CrossOver on Mac.
+- Fixed another copy of the game being able to start while the one started from HiganRTool was running.
+- Fixed matches being watchable in room matches, connection-code matches and LAN even when the opponent did not allow watching.
+  If either player has `enable = 0` in `[spectate]`, the match cannot be watched.
+  In a room match, the spectator is now told right away that the match cannot be watched.
+- Fixed spectators not receiving the match over the internet in some cases.
+  This could happen when the match was connected over IPv6, or when the spectator's PC clock was off.
+
+
 ## v1.1.1
 
 ### Fixed
 
 - Fixed LAN play and spectating not working over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
-  On the host's screen, VPN addresses carry the tool's name, such as "(Radmin)".
+  On the host's screen, VPN addresses carry the name of the VPN you use, such as "(Radmin)".
 - The LAN host's waiting screen now also shows the addresses of virtual adapters (such as VMware).
   Real LAN addresses come first, and up to 3 are shown at a time. With 4 or more, use ↑↓ to see the rest.
 - When both players want the same side, it is now decided at random instead of first come, first served.
-- While "Waiting for the opponent" is shown, you now disconnect by holding Esc for 3 seconds.
+- While "Waiting for the opponent" is shown, you now disconnect from the opponent by holding Esc for 3 seconds.
 - Fixed replays recording the delay from before the change in matches where the delay was changed right after connecting.
   It now records the delay used the longest in the match.
 - Fixed the detailed log (`.csv.gz`) sometimes being cut off when the game was closed.
@@ -46,7 +100,7 @@ Use the same version as your opponent.
 - Ctrl now picks characters and maps at random and skips the dialogue after a match is decided.
   It works on online select screens and in matches, as does the skip button on a gamepad.
   The R key for random select has been removed.
-  Note that changing the delay (Ctrl+number) on character select also moves the character at random.
+  Note that changing the delay (Ctrl+number) on character select also triggers the Ctrl random select and moves the character.
 - When a match ends (the connection is closed), you return to 妖怪 対 妖怪 on the title screen.
 - During online play, P / Home take screenshots (nothing is saved on the opponent's PC).
 - The update display has changed.
@@ -62,7 +116,7 @@ Use the same version as your opponent.
 - Keyboard input did not work when Player 1's input device in the game's key config was set to a gamepad.
 - On Linux (Wine), Room Match, Random Match and the spectate list did not work.
 - When the opponent's game froze, your game stayed frozen too.
-  It now disconnects after 60 seconds without a response.
+  The tool now disconnects after 60 seconds without a response from the opponent.
 - Starting `HiganRTool.exe` several times in a row started several copies of the game.
   If the same game is already running, it now exits without starting anything.
 - When connecting, the window frame flashed as well; now only the taskbar button flashes.
@@ -74,7 +128,7 @@ Use the same version as your opponent.
 - Player name, side, netcode, delay and language are now under "Settings" in the menu.
 - With rollback and auto delay, a lower value is picked for the same ping.
   It picks 0F when the ping is low and stable.
-- The wait for the DLL to load was raised from 10 to 60 seconds.
+- The time HiganRTool.exe waits for the DLL to load was raised from 10 to 60 seconds.
 - The logs now record startup crashes (`loader_YYYYMMDD.log`) and which `d3d8.dll` is loaded.
 
 

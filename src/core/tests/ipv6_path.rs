@@ -1,9 +1,9 @@
 //! IPv6 の経路の組み上がりの検査。公開の入口（`Link`）だけを使う。
 //!
-//! 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型）で繋ぐ。各 `Link` は IPv4 のソケットと IPv6 のソケットを 1 つずつ持ち、宛先の族と
+//! 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型）で接続する。各 `Link` は IPv4 のソケットと IPv6 のソケットを 1 つずつ持ち、宛先の族と
 //! 同じ族のソケットから出て、相手の同じ族のソケットへ着く。族ごとに「生きている / 全部捨てる」を切り替えられる。IPv6 の送り元は
 //! OS が返す形をまねて flowinfo と scope_id を付けて渡す（`SocketAddr` の `==` はそれらも比べるので、アドレスとポートだけで
-//! 比べるガードが崩れると繋がらない）。アドレスは文書用の範囲（203.0.113.0/24）と、2400:cb00:: の架空の IPv6。
+//! 比べるガードが崩れると接続できない）。アドレスは文書用の範囲（203.0.113.0/24）と、2400:cb00:: の架空の IPv6。
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
@@ -92,6 +92,9 @@ fn hello(nonce: u64) -> Message {
             [nonce as u8; 32],
         ))
         .public(),
+        host_pick: false,
+        nat: higanr_core::nat::NatMark::UNKNOWN,
+        rollback_delay: 0,
     })
 }
 

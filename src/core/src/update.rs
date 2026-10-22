@@ -1,34 +1,11 @@
 //! 起動前の更新の確認のうち、ネットから来るバイト列を読む部分（pure）。
 //!
-//! 配るバージョンの `HiganRTool.exe` は、花映塚を起こす前に「更新の目録」を 1 つ取り、署名を確かめ、今より新しいバージョンならウィンドウで尋ねる
-//! （流れは `src/loader/src/update.rs`）。ここは目録の形・署名・バージョンの比べ・置き換えてよいファイル名・URL・設定の読みだけを持つ。
+//! 配るバージョンの `HiganRTool.exe` は、花映塚を起動する前に「更新の目録」を 1 つ取り、署名を検証し、今より新しいバージョンならウィンドウで尋ねる（流れは `src/loader/src/update.rs`）。ここは目録の形・署名・バージョンの比べ・置き換えてよいファイル名・URL・設定の読みだけを持つ。
 //! ファイルを書く・通信する層は持たない（検査を本物の通信なしに回すため）。
-//!
-//! ## 目録の形（バージョン 1。UTF-8、行の区切りは LF だけ、1 つの空白で区切る）
-//!
-//! ```text
-//! HiganRTool-manifest 1
-//! version 2400321
-//! display 20261008-6e936b3
-//! file HiganRTool.exe 1234567 <SHA-256 を小文字の 16 進 64 文字で>
-//! file HiganRTool.dll 2345678 <同>
-//! signature <Ed25519 の署名を小文字の 16 進 128 文字で>
-//! ```
-//!
-//! 署名は、最後の `signature` の行を除いた本文のバイト列の前に [`SIGN_CONTEXT`] を付けたものに対して付ける。
-//! 署名を確かめてから本文を読む。
-//!
-//! ## ビルド番号
-//!
-//! `version` と [`BUILD_NUMBER`] は同じ数（単調に増える u32）。配るバージョンのビルドのときだけ `tools/make_dist.py` が
-//! 環境変数 `HIGANR_BUILD_NUMBER` で渡す: **2026-01-01 00:00 UTC からの経過分**（例: 2026-10-08 12:00 UTC は 403,920 前後）。
-//! 開発用のビルド（環境変数なし）は 0 で、0 のときローダーは確かめに行かない。
-//!
-//! ## 差し替える場所（本物の鍵・配り場所）
-//!
-//! - 公開鍵: [`UPDATE_PUBLIC_KEY_HEX`]。検査用の鍵（[`TEST_PUBLIC_KEY_HEX`]）は秘密の種が公開なので、これを載せた exe には
-//!   誰でも更新を署名できる。`tools/make_dist.py` は検査用の鍵に戻っていると止まる。
-//! - 目録の URL: [`UPDATE_SERVER`] ＋ [`MANIFEST_PATH`]。
+//! 目録は UTF-8・LF・1 つの空白区切りの行（`HiganRTool-manifest 1` / `version` / `display` / `file <名前> <大きさ> <SHA-256>` / `signature <Ed25519 の署名>`）。
+//! 署名は最後の `signature` の行を除いた本文の前に [`SIGN_CONTEXT`] を付けたものに付け、署名を検証してから本文を読む。
+//! `version` と [`BUILD_NUMBER`] は同じ数（単調に増える u32）。配るバージョンのビルドのときだけ `tools/make_dist.py` が環境変数 `HIGANR_BUILD_NUMBER` で渡す: **2026-01-01 00:00 UTC からの経過分**。開発用のビルドは 0 で、0 のときローダーはチェックに行かない。
+//! 公開鍵は [`UPDATE_PUBLIC_KEY_HEX`]、目録の URL は [`UPDATE_SERVER`] ＋ [`MANIFEST_PATH`]。検査用の鍵（[`TEST_PUBLIC_KEY_HEX`]）は秘密の種が公開なので、これを載せた exe には誰でも更新を署名できる。`tools/make_dist.py` は検査用の鍵に戻っていると止まる。
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -58,10 +35,10 @@ pub const MAX_MANIFEST_BYTES: usize = 8 * 1024;
 /// 1 ファイルの大きさの上限（バイト）。目録の `size` はこれ以下だけ受ける（署名つきでも）。
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 確かめに行く待ちの上限（ミリ秒。名前の解決から本文の受信まで）。ネットに出られないときも、花映塚の起動をこれ以上遅らせない。
+/// ローダーが目録の取得で待つ上限（ミリ秒。名前の解決から本文の受信まで）。ネットに出られないときも、花映塚の起動をこれ以上遅らせない。
 pub const CHECK_DEADLINE_MS: u64 = 2000;
 
-/// 更新の直後に起こし直した新しい exe へ渡す環境変数の名前。あれば確かめに行かない（更新が終わらずに起こし直しが続く事故を
+/// 更新の直後に、ローダーが起動し直した新しい exe へ渡す環境変数の名前。あればチェックに行かない（更新が終わらずに起動し直しが続く事故を
 /// 止める歯止め）。
 pub const JUST_UPDATED_ENV: &str = "HIGANRTOOL_JUST_UPDATED";
 
@@ -85,7 +62,7 @@ pub const SELF_EXE: &str = "HiganRTool.exe";
 
 /// 名前の長さの上限（文字）。サーバーの `isUpdatableFileName`（`src/server/src/update.ts`）と同じ規則。
 pub const MAX_NAME_LEN: usize = 64;
-/// 更新が置き換えない名前（利用者のもの・道具が自分で作るもの・ゲームの exe）。大文字小文字を区別せずに比べる。
+/// 更新が置き換えない名前（利用者のもの・ツールが自分で作るもの・ゲームの exe）。大文字小文字を区別せずに比べる。
 /// 目録の名前 2 つは配り場所の側の名前（`tools/make_dist.py` の `MANIFEST_ASSET` / `UNSIGNED_MANIFEST`）。
 const RESERVED_NAMES: [&str; 8] = [
     "HiganRTool.ini",
@@ -97,7 +74,7 @@ const RESERVED_NAMES: [&str; 8] = [
     "logs",
     "code",
 ];
-/// 置き換えの途中で道具が作る名前の語尾。
+/// 置き換えの途中でツールが作る名前の語尾。
 const TEMP_SUFFIXES: [&str; 2] = [".old", ".new"];
 
 /// 更新が置き換えてよいファイル名か。普通のファイル名（ASCII の英数字と `.` `_` `-` だけ・1〜[`MAX_NAME_LEN`] 文字）で、
@@ -206,10 +183,10 @@ pub fn is_newer(current: u32, offered: u32) -> bool {
     offered > current
 }
 
-// ---- 起こせた印 ----
+// ---- 起動できた印 ----
 
-/// 新しいバージョンが花映塚を起こせたときに書く印の名前（ローダーの exe のフォルダ）。中身はビルド番号（10 進 1 行）。一つ前のバージョンの
-/// `.old` は、この印が今のバージョンと同じになった次の起動で消す。起こす前に消すと、起こせなかった新しいバージョンから元のバージョンへ戻せなくなる。
+/// 新しいバージョンが花映塚を起動できたときに書く印の名前（ローダーの exe のフォルダ）。中身はビルド番号（10 進 1 行）。一つ前のバージョンの
+/// `.old` は、この印が今のバージョンと同じになった次の起動で消す。起動する前に消すと、起動できなかった新しいバージョンから元のバージョンへ戻せなくなる。
 pub const LAUNCHED_MARK: &str = "update_launched.txt";
 
 pub fn launched_mark_text(build: u32) -> String {
@@ -284,7 +261,7 @@ pub fn signing_message(body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// 本文（LF で終わる）に署名の行を足した、配る目録の全体。署名の道具が使う。
+/// 本文（LF で終わる）に署名の行を足した、配る目録の全体。署名ツールが使う。
 pub fn compose_signed(body: &str, signature: &[u8; 64]) -> Result<String, ManifestError> {
     if !body.ends_with('\n') {
         return Err(bad(1, "本文が LF で終わっていない"));
@@ -312,7 +289,7 @@ fn split_signed(bytes: &[u8]) -> Result<(&[u8], [u8; 64]), ManifestError> {
     Ok((body, sig))
 }
 
-/// 署名を確かめてから本文を読む。`public_key` は 32 バイトの Ed25519 の公開鍵。確かめに通らなければ本文は読まない。
+/// 署名を検証してから本文を読む。`public_key` は 32 バイトの Ed25519 の公開鍵。検証に通らなければ本文は読まない。
 pub fn verify_and_parse(bytes: &[u8], public_key: &[u8; 32]) -> Result<Manifest, ManifestError> {
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(ManifestError::TooLarge);
@@ -326,7 +303,7 @@ pub fn verify_and_parse(bytes: &[u8], public_key: &[u8; 32]) -> Result<Manifest,
     parse_body(text)
 }
 
-/// 本文（署名の行を除いたもの）の形を確かめて読む。署名の道具は署名の前にこれを通す（壊れた目録に署名しない）。
+/// 本文（署名の行を除いたもの）の形を検証して読む。署名ツールは署名の前にこれを通す（壊れた目録に署名しない）。
 pub fn parse_body(text: &str) -> Result<Manifest, ManifestError> {
     if !text.ends_with('\n') {
         return Err(bad(1, "本文が LF で終わっていない"));
@@ -445,7 +422,7 @@ pub fn from_hex_exact(s: &str, out: &mut [u8]) -> Option<()> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         _ => None,
     };
-    // 長さは上で偶数と確かめてある（端数 `_` は空）。
+    // 長さは上で偶数と検証してある（端数 `_` は空）。
     let (pairs, _) = b.as_chunks::<2>();
     for (o, [hi, lo]) in out.iter_mut().zip(pairs) {
         *o = (val(*hi)? << 4) | val(*lo)?;
@@ -514,8 +491,8 @@ pub fn file_url(server: &str, name: &str) -> Option<String> {
 
 // ---- 設定（HiganRTool.ini の [loader] update_check）----
 
-/// ini の `[loader]` の `update_check`。`0` で確かめない、`1` か無記入で確かめる。それ以外の値・読めない ini は `Err` で、
-/// 呼ぶ側は確かめる側に倒す（書き損じで更新が黙って止まらないように）。ini が無ければ確かめる。
+/// ini の `[loader]` の `update_check`。`0` でチェックしない、`1` か無記入でチェックする。それ以外の値・読めない ini は `Err` で、
+/// 呼ぶ側はチェックする側に倒す（書き損じで更新が黙って止まらないように）。ini が無ければチェックする。
 pub fn update_check_enabled(ini_text: Option<&str>) -> Result<bool, String> {
     let Some(text) = ini_text else {
         return Ok(true);

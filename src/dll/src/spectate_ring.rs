@@ -1,26 +1,21 @@
 //! 観戦のリングバッファ: ゲームのスレッド（書き手 1 本）が、使うと決めた語・止める地点の SELECT の結果・選択の画面で入った押下
 //! （`wire::Record`）を書き、受信スレッド（読み手 1 本。`spectate_host.rs`）が取り出して `SpectateHost::push` する。
 //!
-//! - 書き手は確保・ロック待ち・ブロッキング I/O・パニックしうる添字を持たない（枠は固定長の原子変数の配列）。枠の中身を
-//!   `Relaxed` で書いてから書いた数を `Release` で進める。読み手は書いた数を `Acquire` で読んでから枠を読み、読み終えてから
-//!   読んだ数を `Release` で進める。
-//! - リングバッファが溢れても対戦は止めない。書けなかった記録は捨てて数え、次の `Seg` まで捨て続ける（途中が欠けた列を観戦者へ流さない）。
-//!   次に書けた `Seg` には `after_gap` の印が付き、読み手は `Record::End(Cancelled)` を挟んで「ここで切れた」を観戦者に知らせる。
-//! - 1 枠 9 語（36 B）。`Record::Name` が最長で、ほかの記録は先頭の 5 語（`BASE_WORDS`）だけを書く。語の割り付けはリングバッファの中だけの形で、
-//!   ワイヤの形とは無関係。
+//! - 書き手は確保・ロック待ち・ブロッキング I/O・パニックしうる添字を持たない（枠は固定長の原子変数の配列。枠を `Relaxed` で書いてから書いた数を `Release` で進め、読み手は書いた数を `Acquire` で読んでから枠を読む）。
+//! - 溢れても対戦は止めない。書けなかった記録は捨てて数え、次の `Seg` まで捨て続ける（途中が欠けた列を観戦者へ流さない）。次に書けた `Seg` には `after_gap` の印が付き、読み手は `Record::End(Cancelled)` を挟んで「ここで切れた」を観戦者に知らせる。
+//! - 1 枠 9 語（36 B）。`Record::Name` が最長で、ほかの記録は先頭の 5 語（`BASE_WORDS`）だけを書く。語の割り付けはリングバッファの中だけの形で、ワイヤの形とは無関係。
 //!
-//! `RING_LEN` = 4096 記録は、受信スレッドが 1 秒止まっても溢れない見積もり: 書くのは 1 tick に 1〜2 記録（60 tick/秒で
-//! 1〜2 秒ぶんが 120 記録ほど）。受信スレッドは PING・INPUT のたび（約 4 ms〜16 ms）と、観戦者がいる間は 1 ms の待ちの上限ごとに
-//! リングバッファを空にする（見積もりで、測っていない）。
+//! `RING_LEN` = 4096 記録は、受信スレッドが 1 秒止まっても溢れない見積もり: 書くのは 1 tick に 1〜2 記録（60 tick/秒で 1 秒に最大 120 記録ほど）。
+//! 受信スレッドは PING・INPUT のたび（約 4 ms〜16 ms）と、観戦者がいる間は 1 ms の待ちの上限ごとにリングバッファを空にする（見積もりで、測っていない）。
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use higanr_core::wire::{ByeReason, Record, Seat, Select, Step, StepKind};
+use higanr_core::wire::{ByeReason, CheckKind, Record, Seat, Select, Step, StepKind, WatchCheck};
 
 pub const RING_LEN: usize = 4096;
 /// 1 枠の語の数（名前の記録が使う 1 + 8 語）。
-const WORDS: usize = 9;
+pub(crate) const WORDS: usize = 9;
 /// 名前の記録以外が使う語の数（`Record::Select` の 5 語）。書き手はこの数だけ書く。
 const BASE_WORDS: usize = 5;
 /// 語 0 の bit 8: 溢れの後の最初の記録（`Seg`）。
@@ -34,9 +29,11 @@ const K_FRAME: u32 = 5;
 const K_END: u32 = 6;
 const K_NAME: u32 = 7;
 const K_STATS: u32 = 8;
+/// 照合の記録。作り方は語 0 の bit 12〜15（bit 8・9 は溢れの印と受け渡しの飛びの印が使う）。
+const K_CHECK: u32 = 9;
 
 /// 記録を語に詰める（`unpack` の逆）。戻りの 2 つ目は書く語の数。
-fn pack(rec: &Record) -> ([u32; WORDS], usize) {
+pub(crate) fn pack(rec: &Record) -> ([u32; WORDS], usize) {
     let mut w = [0u32; WORDS];
     match rec {
         Record::Seg { seg } => {
@@ -81,6 +78,15 @@ fn pack(rec: &Record) -> ([u32; WORDS], usize) {
             w[0] = K_STATS | u32::from(*latency) << 16 | u32::from(*rollback) << 24;
             w[1] = u32::from(*ping_ms);
         }
+        Record::Check { kind, check } => {
+            w[0] = K_CHECK
+                | (*kind as u32) << 12
+                | u32::from(check.life_1p) << 16
+                | u32::from(check.life_2p) << 24;
+            w[1] = check.frame;
+            w[2] = check.rng_count;
+            w[3] = u32::from(check.rng_state);
+        }
         Record::Name { seat, len, bytes } => {
             w[0] = K_NAME | (*seat as u32) << 16 | u32::from(*len) << 24;
             for (dst, c) in w[1..].iter_mut().zip(bytes.as_chunks::<4>().0) {
@@ -109,16 +115,6 @@ fn kind_of(v: u32) -> Option<StepKind> {
         .filter(|k| *k != StepKind::Format)
 }
 
-fn bye_of(v: u32) -> Option<ByeReason> {
-    match v {
-        1 => Some(ByeReason::Finished),
-        2 => Some(ByeReason::Disconnected),
-        3 => Some(ByeReason::Desync),
-        4 => Some(ByeReason::Cancelled),
-        _ => None,
-    }
-}
-
 fn byte(v: u32, shift: u32) -> u8 {
     (v >> shift) as u8
 }
@@ -128,7 +124,7 @@ fn half(v: u32, shift: u32) -> u16 {
 }
 
 /// 語から記録を戻す。リングバッファの中の値は `pack` しか作らないので `None` は起きないはず（読み手が数える）。
-fn unpack(w: &[u32; WORDS]) -> Option<Record> {
+pub(crate) fn unpack(w: &[u32; WORDS]) -> Option<Record> {
     let kind = w[0] & 0xFF;
     Some(match kind {
         K_SEG => Record::Seg { seg: w[1] as u16 },
@@ -164,11 +160,21 @@ fn unpack(w: &[u32; WORDS]) -> Option<Record> {
             p1: half(w[2], 0),
             p2: half(w[2], 16),
         },
-        K_END => Record::End(bye_of(w[1])?),
+        K_END => Record::End(ByeReason::from_u32(w[1])?),
         K_STATS => Record::Stats {
             ping_ms: half(w[1], 0),
             latency: byte(w[0], 16),
             rollback: byte(w[0], 24),
+        },
+        K_CHECK => Record::Check {
+            kind: CheckKind::from_u8(byte(w[0], 12) & 0xF)?,
+            check: WatchCheck {
+                frame: w[1],
+                rng_state: half(w[3], 0),
+                rng_count: w[2],
+                life_1p: byte(w[0], 16),
+                life_2p: byte(w[0], 24),
+            },
         },
         K_NAME => {
             let len = byte(w[0], 24);
@@ -387,6 +393,18 @@ mod tests {
         v.push(Record::stats(None, 0, None));
         v.push(Record::stats(Some(0), 0, Some(0)));
         v.push(Record::stats(Some(u32::MAX), u8::MAX, Some(u32::MAX)));
+        for (kind, f) in [(CheckKind::Game, u32::MAX), (CheckKind::InputDigest, 0)] {
+            v.push(Record::Check {
+                kind,
+                check: WatchCheck {
+                    frame: f,
+                    rng_state: 0xFEDC,
+                    rng_count: 0x8765_4321,
+                    life_1p: 0xFF,
+                    life_2p: 0x01,
+                },
+            });
+        }
         for kind in [StepKind::Decide, StepKind::Cancel, StepKind::Align] {
             v.push(Record::Step(Step {
                 step: 0xFFFE,

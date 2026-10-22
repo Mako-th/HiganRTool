@@ -1,84 +1,12 @@
-//! 接続のセッション。受けたパケットをどの状態機械へ渡すか・どの順で呼ぶか・何を送り返すかを 1 か所に置く（peer_sim と dll が共有する）。
-//! 各状態機械の中身は `handshake.rs`・`liveness.rs`・`selection.rs`・`lockstep.rs`・`check.rs` にあり、ここは「呼ぶ順」だけを持つ:
+//! 接続のセッション。受けたパケットをどの状態機械へ渡すか・どの順で呼ぶか・何を送り返すかを 1 か所にまとめる（peer_sim と dll が共有する）。
+//! 各状態機械の中身は `handshake.rs`・`liveness.rs`・`selection.rs`・`lockstep.rs`・`check.rs` にあり、ここは「呼ぶ順」だけを持つ。
 //!
-//! - **受けたとき**（`Link::on_datagram`）: STUN の応答は数えて捨てる。相手の候補にない送り元は捨てる（繋がる前の手順の 1 通でタグまで
-//!   通ったものは「学んだ候補」にする）。session_id が違うもの・タグが合わないもの・解けないもの・自分の送った HELLO が返ってきたもの
-//!   （role_nonce が自分のもの）は、状態機械へ渡す前に捨てる。HELLO・HELLO_ACK・AGREE は繋がった後も `handshake` へ渡し、返しを送り、
-//!   その直後に `poll_send` を 1 回呼ぶ。繋がる前のそれ以外は捨てる。繋がった後は、全部を `liveness` へ渡して返しを送り、種類ごとに
-//!   選択・lockstep・CHECK へ渡す。ただし受信スレッドがその場で PONG を返した PING（`on_datagram_marked` の印。`pong.rs`）には PONG を
-//!   重ねない。
-//! - **INPUT**: 受け入れたら `Selection::on_peer_input`（SELECT の送り直しを止める）。前の seg の INPUT で相手がまだ前の seg の最後を
-//!   待っていれば、前の seg のバックアップを送り返す。次の seg の INPUT は捨てて `Recv::NextSeg` を返し、選択の外で届いた今の step の MENU には
-//!   `Recv::PeerSelecting` を返す（相手が今の seg を出た合図。peer_sim の「付いていく」形だけが使う）。
-//! - **時計で**（`Link::poll`。1〜4 ms ごと、フレームの外でも）: 接続の手順の送り直し → 繋がったか → 生存の PING / BYE →
-//!   選択の STEP / STEP_REQ / SELECT の送り直し。
-//! - **マッチの 1 フレーム**（`Connected` のメソッド）: `capture` で取ってすぐ送る → `advance` が使えなければ 4 ms ごとに送り直す →
-//!   CHECK のフレームなら `submit_check` で記録して送る → seg の境目で `begin_seg`。
+//! - 受け（`Link::on_datagram`）: 相手の候補にない送り元・session_id やタグの合わないもの・自分の HELLO の跳ね返りは状態機械へ渡す前に捨てる。接続前の手順の 1 通でタグまで通ったものは「学んだ候補」にする。相手の HELLO で両者がホストの決め方を使うと分かったら、その送り元へだけ PROBE の列を送る（`host_pick.rs`）。
+//! - 時計（`Link::poll`。1〜4 ms ごと、フレームの外でも）: 接続の手順の送り直し → 接続したか → 生存の PING / BYE → 選択の送り直し。マッチの 1 フレームは `Connected` のメソッド。
+//! - モードは `set_mode`、時間切れの後の作り直しは `set_retry_window`。鍵は `Config::key_seed` から作る使い捨ての鍵で、HELLO・HELLO_ACK・PROBE 以外は封じて送る。
+//! - 呼び手は、いつ選択に入るか（`enter_selection`）・いつ seg を進めるか（マッチの場面を出るときと読み込みに入るときに `begin_seg`）・CHECK に何を入れるかを決める。接続したか（`Link::connected`）は `on_datagram` と `poll` の**どちらの後にも**見る。
 //!
-//! ## モード
-//!
-//! `set_mode` で望むモードと D・R を置く（置かなければ delay 方式）。繋がったとき、AGREE で決まったモードが rollback なら `Connected` は
-//! rollback の状態機械（`rollback.rs`）も作り、INPUT の受け・取得・待つ間の送り直し・前の seg のバックアップをそちらへ回す（`lockstep()` は seg
-//! だけ揃えて置く）。マッチの 1 フレームは、delay 方式なら `capture` → `advance`、rollback のモードなら `capture` →
-//! `rollback_input_point` → （Present の後）`rollback_post_present`。rollback のモードでは latency の切替を出さない（`request_delay` が
-//! `RollbackMode`）。D を替えるのは `press_delay`。
-//!
-//! ## 候補と経路
-//!
-//! 相手の候補アドレス（`Config::peers`）を `candidate::Paths` に持つ。経路を決める前、HELLO は全部の候補へ送る。AGREE（ホスト）は相手の
-//! HELLO が届いた送り元へだけ送る（全部へ送ると、自分自身へ返る経路で自分の AGREE が返り、ホストが「ゲストの返し」と取り違えてひとりで
-//! 繋がる）。HELLO_ACK とゲストの AGREE の返しは、受けたものの送り元へ返す。**最初に「相手が自分を聞いた印」（自分の HELLO への
-//! HELLO_ACK か AGREE。どちらもタグが合い、候補のどれかから来たもの）が届いた経路を採る**。以後の送りは全部その経路へ。受けは、決めた
-//! 後も候補のどれかからなら受ける（相手から見た自分の経路と、自分から見た相手の経路は同じとは限らない）。
-//!
-//! ## 学んだ候補
-//!
-//! 相手のルーターが宛先ごと・時間で外側のポートを付け替えると、相手の HELLO は接続コードのアドレスと別のポートから届く。そこで**繋がる前**の
-//! HELLO・HELLO_ACK・AGREE に限り、候補に無い送り元でも、session_id が自分と同じ → タグが通る → 自分の送ったものの跳ね返りでない、の
-//! 全部を満たしたら、送り元を**学んだ候補**として足す（`Paths::learn`。上限 `MAX_LEARNED`。ICE の peer reflexive と同じ考え）。以後
-//! HELLO は学んだ候補へも送る。満たさないもの・繋がった後の 1 通は、学ばずに `foreign` として数えて捨てる（上限を越えたら
-//! `learn_refused`）。学んだ候補は接続コードに載せず、最初からの作り直し（`Restart::Fresh`）で消える。経路の外の第三者は秘密を知らず
-//! タグを作れないので学ばせられない（経路の上の者は本物の 1 通を別のポートから送り直せるが、もともと落とせる位置にいる）。
-//!
-//! ## 自分自身への跳ね返り
-//!
-//! 候補のどれかが自分自身に返る経路だと（同じ PC・NAT の折り返し・相手のコードに自分のアドレスが混じる）、自分の HELLO が自分に届き、
-//! そのまま手順へ渡すと「同じ nonce」で接続を全部やめる。そこで**自分の送ったもの（HELLO と HELLO_ACK のうち role_nonce が自分の
-//! もの）を、状態機械へ渡す前に捨てて数える**（`RecvCounts::self_bounce`）。アドレスで見ないのは、NAT の折り返しでは外側のアドレスで
-//! 返ってくるため。中身の role_nonce なら、どの経路で返っても自分のものと分かる。
-//!
-//! ## 時間切れの後の作り直し
-//!
-//! `set_retry_window` で長さを置くと、手順が時間切れ（10 秒）でやめたとき、`Link::new` の時刻からその長さの間は手順を作り直して待ち続ける
-//! （`Handshake::restart`。相手の HELLO を受けていれば相手の値は引き継ぐ）。最初から作り直すときは、経路の選びもやり直す（相手が
-//! 起こし直して別のポートから来ることがある）。届いたものを手順へ渡す前にも時間切れを見て作り直す（渡してから時間切れになると、その 1 通を
-//! 「やめた後」として捨てるため）。置かなければ作り直さない。
-//!
-//! ## 使い捨ての鍵と封じた便
-//!
-//! セッションは `Config::key_seed` から使い捨ての鍵を作り、公開鍵を HELLO / HELLO_ACK に載せる。相手の HELLO で役割を決めたら向きごとの鍵を
-//! 作る（`refresh_keys`）。以後、HELLO・HELLO_ACK 以外は封じて送り（`Tx::send`）、開いて受ける。鍵が決まる前に届いた封じた便は捨てて
-//! 数える（`before_keys`）。開かない便は `bad_tag` に数える。
-//!
-//! - **秘密鍵の寿命はセッションと同じ**: セッションの中の作り直しでは、Resume も Fresh も秘密鍵を変えない。Fresh で秘密鍵だけ替えると、相手が自分の
-//!   古い公開鍵を覚えたまま鍵が食い違い、封じた便が開かずに繋がらない。
-//! - **通し番号は鍵と同じ寿命**: 送り手 `Link` の番号は `Tx` が `Seq` で 1 つ持つ。繋がったら `Tx` ごと `Connected` へ移し、セッションの送りも
-//!   `live_tx` でそちらを通す（2 つの送りが同じ番号を取らない）。共有の入れ物（`Arc`）にしないのは、dll がゲームのスレッドでセッションを
-//!   作り直す・捨てるので確保も解放もさせないため。受信スレッドの PONG の応答側は別の印（`Sender::Pong`）で、番号は応答側の呼び手が持つ。
-//! - 繋がる前に相手がセッションを作り直したとき（同じ nonce・新しい公開鍵の HELLO）は、手順が相手を覚え直し、`refresh_keys` が向きごとの鍵を
-//!   作り直す。通し番号は続ける。繋がった後は替えない。
-//!
-//! ## セッションが持たないもの・呼び手が守ること
-//!
-//! ソケット・時計・スレッド・ゲームの画面は持たない。送るものは `Outlet` へ宛先とバイト列で渡す。いつ選択に入るか
-//! （`enter_selection`）、いつ seg を進めるか、CHECK に何を入れるかは、呼び手がゲーム（か台本）を見て決める。
-//!
-//! - マッチの場面を出るときと読み込みに入るときに `begin_seg` を呼ぶ。マッチを出た後も seg を進めずにいると、前のマッチの INPUT が遅れて
-//!   届いたときに SELECT の送り直しが止まり、両者が待ち続ける。
-//! - 繋がったか（`Link::connected` が `Some` になったか）は、`on_datagram` と `poll` の**どちらの後にも**見る。
-//!
-//! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字と unwrap を置かない。送るバイト列はスタックの `[u8; MAX_DATAGRAM]` に
-//! 作る。
+//! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字と unwrap を置かない。送るバイト列はスタックの `[u8; MAX_DATAGRAM]` に作る。
 
 use std::net::SocketAddr;
 
@@ -94,6 +22,7 @@ use crate::lockstep::{self, Applied, CaptureError, LatError, Lockstep, RecvOutco
 use crate::match_gate::Gate;
 use crate::pong::PongResponder;
 use crate::rollback::{self, After, Rollback, Window};
+use crate::rtt_probe::{DelayProbe, DelaySnapshot, EchoClock};
 use crate::seal::{DirKeys, Ephemeral, KeySeed, Opener, PUBLIC_LEN, Sealer, Sender, Seq};
 use crate::selection::{FrameOut, PeerCursor, Press, Selection};
 use crate::wire::{
@@ -118,7 +47,7 @@ pub trait Outlet {
     fn send(&mut self, to: SocketAddr, bytes: &[u8]);
 }
 
-/// 送りの道具（HMAC の鍵と、`Sealer` と通し番号）。HELLO・HELLO_ACK は HMAC のタグ、ほかは封じる（`wire::is_signed`）。
+/// 送りの部品（HMAC の鍵と、`Sealer` と通し番号）。HELLO・HELLO_ACK・PROBE は HMAC のタグ、ほかは封じる（`wire::is_signed`）。
 /// コピーできない: コピーが通し番号を数え直すと nonce が重なる。
 #[derive(Debug)]
 struct Tx {
@@ -126,7 +55,7 @@ struct Tx {
     key: AuthKey,
     /// 向きごとの鍵が決まった後だけ Some（送り手の印は `Sender::Link`）。
     seal: Option<Sealer>,
-    /// 送り手 `Link` の通し番号（セッションに 1 つ。繋がったら `Tx` ごと `Connected` へ移し、セッションの送りもそこを通す）。
+    /// 送り手 `Link` の通し番号（セッションに 1 つ。接続したら `Tx` ごと `Connected` へ移し、セッションの送りもそこを通す）。
     seq: Seq,
     /// 封じる便を、鍵が決まる前か通し番号を使い切ったので送らなかった数（手順の上では起きない）。
     unsent: u64,
@@ -176,7 +105,7 @@ pub struct Config {
     pub handshake: handshake::Config,
     /// 接続の秘密（接続を始める側が引き、接続コードで渡す）。
     pub secret: Secret,
-    /// 相手の候補アドレス（優先の順）。これ以外から来たものは捨てる（繋がる前の手順でタグまで通ったものは、学んだ候補にする）。
+    /// 相手の候補アドレス（優先の順）。これ以外から来たものは捨てる（接続前の手順でタグまで通ったものは、学んだ候補にする）。
     pub peers: Candidates,
     /// 使い捨ての鍵の種。**セッションを作るたびに呼び手が OS の乱数で引く**（core は乱数を持たない）。同じ種を 2 つのセッションに使い回さない
     /// （通し番号はセッションごとに 0 から数えるので、同じ相手・同じ session で同じ種を使うと nonce が重なりうる）。
@@ -199,7 +128,7 @@ impl Config {
     }
 }
 
-/// 繋がる前後の受信側で捨てたものの数（ログ用）。
+/// 接続前後の受信側で捨てたものの数（ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecvCounts {
     pub datagrams_in: u64,
@@ -207,7 +136,7 @@ pub struct RecvCounts {
     pub stun: u64,
     /// 相手の候補にない送り元から来て、捨てたもの（学ばなかったもの。上限で断った `learn_refused` もここに入る）。
     pub foreign: u64,
-    /// 候補に無い送り元を、学んだ候補として足した数（繋がる前の HELLO・HELLO_ACK・AGREE でタグまで通ったものだけ）。
+    /// 候補に無い送り元を、学んだ候補として足した数（接続前の HELLO・HELLO_ACK・AGREE でタグまで通ったものだけ）。
     pub learned: u64,
     /// 学ぶはずだったが、上限（`candidate::MAX_LEARNED`）を越えるので断った数（`foreign` の内数）。
     pub learn_refused: u64,
@@ -220,16 +149,20 @@ pub struct RecvCounts {
     pub weak_key: u64,
     /// タグは合ったが解けないもの（と、HGRT でも STUN でもないもの）。バージョン違い（`other_version`）は含まない。
     pub decode_errors: u64,
-    /// タグは合ったが、ヘッダのバージョンが `wire::PROTO_VER` と違ったもの。繋がる前の 1 通目で接続の手順をやめる。
+    /// タグは合ったが、ヘッダのバージョンが `wire::PROTO_VER` と違ったもの。接続前の 1 通目で接続の手順をやめる。
     pub other_version: u64,
     /// session_id の違うもの（別セッションの遅れたパケット）。
     pub wrong_session: u64,
     /// 自分の送った HELLO / HELLO_ACK が返ってきたもの（モジュール doc の「自分自身への跳ね返り」）。
     pub self_bounce: u64,
-    /// 繋がる前に届いた、接続の手順以外のもの（ホストが繋がる前のゲストの MENU は捨ててよい）。
+    /// 接続前に届いた、接続の手順以外のもの（ホストが接続前に受けたゲストの MENU は捨ててよい）。
     pub before_established: u64,
     /// 同じ ms に同じ送り元へ同じ返し（HELLO_ACK・AGREE の返し）を出すところだったので重ねなかった数。
     pub reply_folded: u64,
+    /// 送った PROBE の列の数（送りの数だが、相手の HELLO を受けたときに出すのでここで数える）。
+    pub probe_trains: u32,
+    /// 接続した後に届いた PROBE（タグを比べずに捨てた）。
+    pub late_probes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,16 +224,16 @@ pub enum SelExit {
     Stay,
     /// 選択を出る（難易度の画面の取消でタイトルへ）。
     Leave,
-    /// マップが決まって選択を出る。自分の SELECT を置く。
+    /// マップが決まって選択を出る。自分の SELECT を設定する。
     Decided(Select),
 }
 
-/// 繋がった後の状態（接続ごとに 1 つ。繋がったときにセッションが作る）。コピーできない（コピーすると送りの通し番号が 2 つになり nonce が重なる）。
+/// 接続後の状態（接続ごとに 1 つ。接続したときにセッションが作る）。コピーできない（コピーすると送りの通し番号が 2 つになり nonce が重なる）。
 #[derive(Debug)]
 pub struct Connected {
-    /// 送りの道具（セッションの `Tx` のコピー。`Sealer` の通し番号はセッションと共有）。
+    /// 送りの部品（セッションの `Tx` のコピー。`Sealer` の通し番号はセッションと共有）。
     tx: Tx,
-    /// 採った経路（繋がった後の送りは全部ここへ）。
+    /// 採った経路（接続後の送りは全部ここへ）。
     path: SocketAddr,
     est: Established,
     sel: Selection,
@@ -308,7 +241,7 @@ pub struct Connected {
     /// 両者が rollback ができるときだけ Some（取り決めが delay 方式でも作る。キャラセレクトの Tab で形式を替えられるように）。今の形式が
     /// rollback のとき、INPUT の受け・取得・送り直し・seg のバックアップはこちら。眠っている間も `begin_seg` は呼ぶ。
     rb: Option<Rollback>,
-    /// 今の対戦の形式。繋がったときは `est.mode`（AGREE）で、`switch_format` で替わる。`est.mode` は繋がったときの値のまま。
+    /// 今の対戦の形式。接続したときは `est.mode`（AGREE）で、`switch_format` で替わる。`est.mode` は接続したときの値のまま。
     mode: Mode,
     /// 前の seg を動かした形式（`begin_seg` が呼ばれた時点の `mode`）。前の seg の INPUT へのバックアップの返事の持ち主は、いまの機械ではなく
     /// この機械（形式を替えた後に、前の seg の最後の入力ワードを待っている相手へ返せるように）。
@@ -316,14 +249,17 @@ pub struct Connected {
     fmt: FormatStats,
     chk: CheckLog,
     live: Liveness,
+    /// INPUT の時刻の返しと、その往復と PONG の往復の要約（観戦者へのパケット送信の速さが往復の延びで下がる —— `spectate_rate`）。
+    echo: EchoClock,
+    delay: DelayProbe,
     /// 最後に INPUT を送った時刻（ms）。待ち中の再送の間隔を数える。
     last_input_send: u32,
     counts: ConnCounts,
-    /// 対戦の成立（READY）。`Link::set_match_gate` を置いたセッションだけ Some（`code_side = game`）。None なら繋がったときに成立したことになる。
+    /// 対戦の成立（READY）。`Link::set_match_gate` を呼んだセッションだけ Some（`code_side = game`）。None なら接続したときに成立したことになる。
     gate: Option<Gate>,
-    /// ホスト: 最後に HOST_STATE で送った値と時刻（`poll_host_state`）。まだ送っていなければ None。
+    /// 対戦のホスト: 最後に HOST_STATE で送った値と時刻（`poll_host_state`）。まだ送っていなければ None。
     hs_tx: Option<HostStateTx>,
-    /// ゲスト: 受けた最新の HOST_STATE（古い便は捨てる。`on_host_state`）。まだ受けていなければ None。
+    /// 対戦のゲスト: 受けた最新の HOST_STATE（古い便は捨てる。`on_host_state`）。まだ受けていなければ None。
     hs_rx: Option<HostState>,
 }
 
@@ -356,7 +292,7 @@ impl FormatRec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatStats {
-    /// 入れ替えた数（形式が替わらなかった STEP も含む —— D・旗の置き直しだけの切替）。
+    /// 入れ替えた数（形式が替わらなかった STEP も含む —— D・旗の設定し直しだけの切替）。
     pub applied: u32,
     /// 形式が実際に替わった数。
     pub changed: u32,
@@ -377,9 +313,9 @@ impl FormatStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatSwitch {
-    /// 形式が `from` から `to` に替わった（D・旗は STEP の値で置き直した）。
+    /// 形式が `from` から `to` に替わった（D・旗は STEP の値で設定し直した）。
     Changed { from: Mode, to: Mode },
-    /// 形式は同じで、D・旗だけ STEP の値で置き直した。
+    /// 形式は同じで、D・旗だけ STEP の値で設定し直した。
     Reset,
     /// 断った（この組は rollback へ行けない）。何も変えていない。
     Refused,
@@ -395,7 +331,7 @@ struct HostStateTx {
     auto: bool,
 }
 
-/// HOST_STATE の送り直しの間隔（ms）。値が変わったときはすぐ送る。1 秒ごとの便は、落ちた便の穴埋めと、後から繋がった側への値の知らせを
+/// HOST_STATE の送り直しの間隔（ms）。値が変わったときはすぐ送る。1 秒ごとの便は、落ちた便の穴埋めと、後から接続した側への値の知らせを
 /// 兼ねる（ack は要らない。最新の値だけ持つ）。
 pub const HOST_STATE_EVERY_MS: u32 = 1_000;
 
@@ -422,7 +358,7 @@ pub struct Link {
     /// 作り直せる長さ（ms）。0 なら作り直さない。
     retry_ms: u32,
     restarts: Restarts,
-    /// 繋がったときに作る CHECK の記録の比べ方。
+    /// 接続したときに作る CHECK の記録の比べ方。
     check_rule: CheckRule,
     /// 最後に出した手順の返し（ms・宛先・中身）。同じ ms の重ねを落とす。
     last_reply: Option<(u32, SocketAddr, Message)>,
@@ -430,7 +366,7 @@ pub struct Link {
     ahead: u8,
     /// rollback のモードに決まったときの時刻合わせ（既定は使う。ネットワークに載せない各自の設定）。
     time_sync: bool,
-    /// 繋がった後、READY で対戦の成立を待つか（`set_match_gate`。ネットワークに載せない各自の設定）。
+    /// 接続後、READY で対戦の成立を待つか（`set_match_gate`。ネットワークに載せない各自の設定）。
     match_gate: bool,
     /// 送った HELLO の数（宛先の候補の種類ごと。`kind_slot`）。「1 通も送っていない」か「送ったが届かない」かを見分けるため。
     hello_sent: [u32; KIND_SLOTS],
@@ -449,7 +385,10 @@ fn cur_rb_mut(rb: &mut Option<Rollback>, mode: Mode) -> Option<&mut Rollback> {
 fn is_handshake(msg: &Message) -> bool {
     matches!(
         msg,
-        Message::Hello(_) | Message::HelloAck { .. } | Message::Agree { .. }
+        Message::Hello(_)
+            | Message::HelloAck { .. }
+            | Message::Agree { .. }
+            | Message::ProbeResult { .. }
     )
 }
 
@@ -520,7 +459,7 @@ impl Link {
         }
     }
 
-    /// 繋がった後、両者の READY が揃うまで対戦を成立させない（`code_side = game` の実行だけ）。**繋がる前に**呼ぶ。置かなければ繋がった
+    /// 接続後、両者の READY が揃うまで対戦を成立させない（`code_side = game` の実行だけ）。**接続前に**呼ぶ。置かなければ接続した
     /// ときに成立したことになり、READY を 1 通も送らない。
     pub fn set_match_gate(&mut self, on: bool) {
         self.match_gate = on;
@@ -539,20 +478,25 @@ impl Link {
         self.hs.set_seat_ask(ask);
     }
 
-    /// rollback が**できる**かを置く（HELLO の +3 の bit1）。**最初の `poll` の前に**呼ぶ。呼ばなければ「できる」。両者ができる組だけ、
+    /// 自分が rollback に**対応できる**かを設定する（HELLO の +3 の bit1。相手へ送る）。**最初の `poll` の前に**呼ぶ。呼ばなければ「できる」。両者ができる組だけ、
     /// キャラセレクトの Tab で形式を替えられる。
     pub fn set_can_rollback(&mut self, can: bool) {
         self.hs.set_can_rollback(can);
     }
 
-    /// 進行中のランダムマッチの一覧に載せてよいか（`[spectate] enable = 1`）を置く（HELLO の +3 の bit2）。**最初の `poll` の前に**呼ぶ。
-    /// 呼ばなければ「載せない」。結果は繋がった後の `Established::may_list`。
+    /// 自分が観戦を許可するか（`[spectate] enable = 1`）を設定する（HELLO の +3 の bit2。相手へ送る）。**最初の `poll` の前に**呼ぶ。
+    /// 呼ばなければ「許可しない」。両者の許可（AND）の結果は接続後の `Established::may_list`。
     pub fn set_listable(&mut self, on: bool) {
         self.hs.set_listable(on);
     }
 
     pub fn seat_ask(&self) -> crate::seat_pick::SeatAsk {
         self.hs.seat_ask()
+    }
+
+    /// ホストの決め方を使うか（`host_pick.rs`）。**最初の `poll` の前に**呼ぶ。呼ばなければ使わない（取りまとめ役（role_nonce の大きい方）がそのままホスト）。
+    pub fn set_host_pick(&mut self, p: Option<crate::host_pick::Setup>) {
+        self.hs.set_host_pick(p);
     }
 
     /// 時間切れの後も、`Link::new` の時刻から `window_ms` の間は接続の手順を作り直して待ち続ける。0 なら作り直さない（既定）。
@@ -564,7 +508,7 @@ impl Link {
         self.restarts
     }
 
-    /// 繋がったときに作る CHECK の記録の比べ方。繋がる前に置く（繋がった後に置いても効かない）。
+    /// 接続したときに作る CHECK の記録の比べ方。接続前に設定する（接続後に設定しても効かない）。
     pub fn set_check_rule(&mut self, rule: CheckRule) {
         self.check_rule = rule;
     }
@@ -583,7 +527,7 @@ impl Link {
             return;
         };
         if kind == Restart::Fresh {
-            // 経路の選びもやり直す（相手が起こし直して別のポートから来ることがある）。
+            // 経路の選びもやり直す（相手がセッションを作り直して別のポートから来ることがある）。
             self.paths = Paths::new(*self.paths.candidates());
             self.hello_from = None;
             // 向きごとの鍵も捨てる（手順が相手を忘れたので、次の HELLO の公開鍵で作り直す）。秘密鍵と通し番号はそのまま。
@@ -603,7 +547,7 @@ impl Link {
 
     /// 手順が覚えた相手に向きごとの鍵を合わせる。相手が変わったときだけ作り直し、相手を忘れた（最初から作り直した）なら捨てる。
     fn refresh_keys(&mut self) {
-        // 繋がった後は鍵を替えない（`Connected` へ移した `Sealer` がその鍵で送っている）。
+        // 接続後は鍵を替えない（`Connected` へ移した `Sealer` がその鍵で送っている）。
         if self.conn.is_some() {
             return;
         }
@@ -715,6 +659,20 @@ impl Link {
         pong_sent: bool,
         out: &mut O,
     ) -> Recv {
+        self.on_datagram_rx_us(from, bytes, now, u64::from(rx) * 1_000, pong_sent, out)
+    }
+
+    /// `on_datagram_at` の受けた時刻を µs で渡す形（`rx_us` は `now` と同じ時計）。PROBE の列の幅は ms では潰れるので µs で測る。
+    pub fn on_datagram_rx_us<O: Outlet>(
+        &mut self,
+        from: SocketAddr,
+        bytes: &[u8],
+        now: u32,
+        rx_us: u64,
+        pong_sent: bool,
+        out: &mut O,
+    ) -> Recv {
+        let rx = (rx_us / 1_000) as u32;
         let from = canonical_endpoint(from);
         let r = &mut self.recv;
         r.datagrams_in = r.datagrams_in.saturating_add(1);
@@ -740,6 +698,11 @@ impl Link {
                 return self.drop_foreign(from);
             }
             r.wrong_session = r.wrong_session.saturating_add(1);
+            return Recv::Nothing;
+        }
+        // 接続した後の PROBE は使わないので、1,200 B の HMAC を計算する前に捨てる。
+        if self.conn.is_some() && wire::peek_is_probe(bytes) {
+            r.late_probes = r.late_probes.saturating_add(1);
             return Recv::Nothing;
         }
         let pkt = match wire::decode(&self.key, self.keys.as_ref().map(|k| &k.open), bytes) {
@@ -786,13 +749,21 @@ impl Link {
             r.self_bounce = r.self_bounce.saturating_add(1);
             return Recv::Nothing;
         }
+        if let Message::Probe { seq } = pkt.msg {
+            // 候補の外からの PROBE と接続した後の PROBE は上で捨てている。返しは出さない。
+            self.hs.on_probe(seq, rx_us, now);
+            // 最後の 1 通で列を締めたゲストは、ここで値を送る（次の `poll` を待たない）。
+            self.poll_handshake(now, out);
+            self.maybe_establish(now);
+            return Recv::Nothing;
+        }
         let hs_msg = is_handshake(&pkt.msg);
         if probing && !hs_msg {
             // peek_is_handshake と同じ type なので起きない。学ぶゲートを 1 か所に保つための念のため。
             return self.drop_foreign(from);
         }
         if hs_msg {
-            // 渡す前に時間切れを見て作り直す。学ぶのはその後（作り直しは学んだものを消すので、先に学ぶと消える）。
+            // 受けた 1 通を手順の状態機械へ渡す前に、時間切れを見て作り直す。学ぶのはその後（作り直しは学んだものを消すので、先に学ぶと消える）。
             self.maybe_restart(now);
             if probing && !self.learn_source(from) {
                 return self.drop_foreign(from);
@@ -808,7 +779,7 @@ impl Link {
                 }
                 _ => {}
             }
-            // 繋がった後も渡し続ける（相手の確認が落ちると、相手は送り続けている）。同じ ms に同じ送り元へ同じ返しを出したら重ねない
+            // 接続後も、相手の手順の便を手順の状態機械へ渡し続ける（相手の確認が落ちると、相手は送り続けている）。同じ ms に同じ送り元へ同じ返しを出したら重ねない
             // （受けのリングに溜まった相手の HELLO を 1 度に渡されると、1 通ごとに返して相手の受けのリング（64 枠）を溢れさせた）。
             let reply = self.hs.on_packet(&pkt, now);
             // 相手の HELLO で役割を決めたら、返しと AGREE を送る前に向きごとの鍵を作る。
@@ -824,6 +795,10 @@ impl Link {
             }
             // `handshake.rs` の呼び方: on_packet の直後にも poll_send を 1 回。
             self.poll_handshake(now, out);
+            // 相手の HELLO で両者が決め方を使うと分かったら、その送り元へだけ PROBE の列を間隔を空けずに送る（HELLO の返しの後）。
+            if matches!(pkt.msg, Message::Hello(_)) && self.hs.take_probe() {
+                self.send_probes(from, out);
+            }
             self.maybe_establish(now);
         }
         let Some(c) = self.conn.as_mut() else {
@@ -833,6 +808,14 @@ impl Link {
             return Recv::Nothing;
         };
         c.on_packet(&pkt, now, rx, pong_sent, out)
+    }
+
+    /// PROBE の列（`host_pick::PROBE_COUNT` 通）を `to` へ続けて送る。HMAC のタグの便なので鍵の交換を待たない。
+    fn send_probes<O: Outlet>(&mut self, to: SocketAddr, out: &mut O) {
+        for seq in 0..crate::host_pick::PROBE_COUNT {
+            live_tx(&mut self.tx, &mut self.conn).send(to, &Message::Probe { seq }, out);
+        }
+        self.recv.probe_trains = self.recv.probe_trains.saturating_add(1);
     }
 
     /// 候補に無い送り元から来たものを、学ばずに捨てた（数える。最後の送り元を残す）。
@@ -857,7 +840,7 @@ impl Link {
         }
     }
 
-    /// 受信スレッドの PONG の応答側に渡す値のコピー。繋がる前は None。応答側は相手からの向きの `Opener` と、送り手 `Sender::Pong` の `Sealer` を持つ。
+    /// 受信スレッドの PONG の応答側に渡す値のコピー。接続前は None。応答側は相手からの向きの `Opener` と、送り手 `Sender::Pong` の `Sealer` を持つ。
     /// 通し番号は応答側の呼び手が 1 つだけ持って渡すので、何度作っても・何本コピーしても重ならない。
     pub fn pong_responder(&self) -> Option<PongResponder> {
         let c = self.conn.as_ref()?;
@@ -875,7 +858,7 @@ impl Link {
         )
     }
 
-    /// 時計で動くもの。1〜4 ms ごと（フレームの外でも）に呼ぶ。
+    /// 時計で動くもの。dll（ゲームのスレッド）と peer_sim が 1〜4 ms ごと（フレームの外でも）に呼ぶ。
     pub fn poll<O: Outlet>(&mut self, now: u32, out: &mut O) {
         self.maybe_restart(now);
         self.poll_handshake(now, out);
@@ -927,6 +910,12 @@ impl Link {
             // AGREE は封じる便（ホストは相手の HELLO で役割を決めたときに鍵も作っている）。
             live_tx(&mut self.tx, &mut self.conn).send(to, &m, out);
         }
+        // PROBE_RESULT も封じる便で、AGREE と同じ宛先へ。
+        if let Some(m) = ob.report
+            && let Some(to) = self.paths.chosen().or(self.hello_from)
+        {
+            live_tx(&mut self.tx, &mut self.conn).send(to, &m, out);
+        }
     }
 
     fn maybe_establish(&mut self, now: u32) {
@@ -944,7 +933,7 @@ impl Link {
         else {
             return;
         };
-        // 繋がるのは封じた AGREE を開けたときなので、向きごとの鍵はある。無ければ繋がったことにしない（手順の上では起きない）。
+        // 接続するのは封じた AGREE を開けたときなので、向きごとの鍵はある。無ければ接続したことにしない（手順の上では起きない）。
         if self.tx.seal.is_none() {
             return;
         }
@@ -961,7 +950,7 @@ impl Link {
             path,
             est: e,
             sel: Selection::new(e.role),
-            // 読み込み中と選択の間に届く相手の INPUT も受けられるよう、繋がったときに作っておく。
+            // 読み込み中と選択の間に届く相手の INPUT も受けられるよう、接続したときに作っておく。
             ls: Lockstep::new(e.role, e.delay),
             // 両者が rollback ができるなら、取り決めが delay 方式でも作っておく（キャラセレクトの Tab で替える）。
             rb: e.rollback_able.then(|| {
@@ -976,6 +965,8 @@ impl Link {
             fmt: FormatStats::NEW,
             chk: CheckLog::with_rule(0, self.check_rule),
             live: Liveness::new(self.session_id, now),
+            echo: EchoClock::new(),
+            delay: DelayProbe::new(),
             last_input_send: 0,
             counts: ConnCounts::default(),
             gate: self.match_gate.then(|| Gate::new(now)),
@@ -1011,7 +1002,7 @@ impl Connected {
         &self.ls
     }
 
-    /// 今の対戦の形式（繋がったときは AGREE で決まった値。キャラセレクトの Tab で替わる）。繋がったときの値は `established().mode`。
+    /// 今の対戦の形式（接続したときは AGREE で決まった値。キャラセレクトの Tab で替わる）。接続したときの値は `established().mode`。
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -1053,11 +1044,27 @@ impl Connected {
         &self.live
     }
 
+    /// 対戦の往復の要約（INPUT の時刻の返しと PONG。まだ標本が無ければ None）。dll は観戦者への送信（受信スレッド）へ渡す。
+    pub fn delay_snapshot(&self) -> Option<DelaySnapshot> {
+        self.delay.snapshot()
+    }
+
+    /// 往復の標本の数（INPUT の返し, PONG）。
+    pub fn delay_samples(&self) -> (u64, u64) {
+        self.delay.samples()
+    }
+
+    /// INPUT を送る（時刻の欄はここで入れる。送り直しも、送る時刻の値になる）。
+    fn send_input<O: Outlet>(&mut self, mut inp: Input, now: u32, out: &mut O) {
+        inp.stamp = self.echo.stamp(now);
+        self.tx.send(self.path, &Message::Input(inp), out);
+    }
+
     pub fn check_log(&self) -> &CheckLog {
         &self.chk
     }
 
-    /// 繋がった後の受け。全部を生存へ渡し、種類ごとに振り分ける。
+    /// 接続後の受け。全部を生存へ渡し、種類ごとに振り分ける。
     fn on_packet<O: Outlet>(
         &mut self,
         pkt: &wire::Packet,
@@ -1066,6 +1073,7 @@ impl Connected {
         pong_sent: bool,
         out: &mut O,
     ) -> Recv {
+        let pongs = self.live.rtt_count();
         if let Some(r) = self.live.on_packet_at(pkt, now, rx) {
             if pong_sent && matches!(r, Message::Pong { .. }) {
                 self.counts.pong_by_receiver = self.counts.pong_by_receiver.saturating_add(1);
@@ -1076,6 +1084,17 @@ impl Connected {
         if matches!(pkt.msg, Message::Pong { .. }) {
             // 往復を測り直した（約 1 秒ごと）。ホストが auto のとき使う推奨値を更新する。
             self.refresh_recommend();
+            // INPUT の無い間（メニュー・ポーズ）も往復の要約を続ける。
+            if self.live.rtt_count() != pongs
+                && let Some(r) = self.live.rtt_ms()
+            {
+                self.delay.sample_rtt(rx, r);
+            }
+        }
+        // 時刻の返しは、受け入れなかった INPUT（前の seg・次の seg）でも読む。
+        if let Message::Input(inp) = &pkt.msg {
+            let e = self.echo.on_receive(&inp.stamp, rx);
+            self.delay.sample_input(rx, e);
         }
         if let Some(g) = self.gate.as_mut() {
             match pkt.msg {
@@ -1102,7 +1121,7 @@ impl Connected {
             Message::StepReq(s) => self.sel.on_step_req(&s),
             Message::Step(s) => self.sel.on_step(&s),
             Message::Select(s) => self.sel.on_select(&s),
-            Message::Input(inp) => return self.on_input(&inp, out),
+            Message::Input(inp) => return self.on_input(&inp, now, out),
             Message::Check(r) => match self.chk.on_remote(&r) {
                 Some(CheckResult::Match { .. }) => {
                     self.counts.check_matches = self.counts.check_matches.saturating_add(1);
@@ -1118,7 +1137,7 @@ impl Connected {
         Recv::Nothing
     }
 
-    fn on_input<O: Outlet>(&mut self, inp: &Input, out: &mut O) -> Recv {
+    fn on_input<O: Outlet>(&mut self, inp: &Input, now: u32, out: &mut O) -> Recv {
         let outcome = match cur_rb_mut(&mut self.rb, self.mode) {
             Some(rb) => rb.on_input(inp),
             None => self.ls.on_input(inp),
@@ -1164,7 +1183,7 @@ impl Connected {
                 if reply && let Some(p) = prev {
                     self.counts.input_prev_replies =
                         self.counts.input_prev_replies.saturating_add(1);
-                    self.tx.send(self.path, &Message::Input(p), out);
+                    self.send_input(p, now, out);
                 }
                 Recv::Nothing
             }
@@ -1326,7 +1345,7 @@ impl Connected {
         self.gate.as_ref()
     }
 
-    /// 対戦が成立したか（ゲートの無いセッションは、繋がったときに成立している）。
+    /// 対戦が成立したか（ゲートの無いセッションは、接続したときに成立している）。
     pub fn matched(&self) -> bool {
         self.gate.as_ref().is_none_or(Gate::matched)
     }
@@ -1381,8 +1400,8 @@ impl Connected {
         fo
     }
 
-    /// 自分の SELECT を置く。dll は、マップの決定を入れた tick には `SelExit::Leave` を返し、次の tick（止める地点）でゲームから読んだ値を
-    /// ここで置く。
+    /// 自分の SELECT を設定する。dll は、マップの決定を入れた tick には `SelExit::Leave` を返し、次の tick（止める地点）でゲームから読んだ値を
+    /// ここで設定する。
     pub fn set_local_select(&mut self, s: &Select) {
         self.sel.set_local_select(s);
     }
@@ -1421,8 +1440,7 @@ impl Connected {
         };
         match r {
             Ok(()) => {
-                self.tx
-                    .send(self.path, &Message::Input(self.build_input()), out);
+                self.send_input(self.build_input(), now, out);
                 self.last_input_send = now;
             }
             Err(CaptureError::Full) => {
@@ -1450,7 +1468,7 @@ impl Connected {
         self.rollback().is_none_or(Rollback::delay_known)
     }
 
-    /// D 未定の間の待ち: 数えて、入力ワード 0 個の INPUT を 4 ms ごとに送り直す（ホストに生きていると知らせる）。
+    /// ゲストが D 未定（ホストのその seg の INPUT が届くまで）の間の待ち: 数えて、入力ワード 0 個の INPUT を 4 ms ごとに送り直す（ホストに生きていると知らせる）。
     pub fn wait_delay<O: Outlet>(&mut self, now: u32, out: &mut O) {
         if let Some(rb) = cur_rb_mut(&mut self.rb, self.mode) {
             rb.note_delay_wait();
@@ -1458,11 +1476,9 @@ impl Connected {
         self.resend_if_due(now, out);
     }
 
-    /// 遅れの量の押下（両者）。rollback のモードは `Rollback::press_delay`、delay 方式は `Lockstep::press_delay`。範囲は呼び手が詰める
-    /// （`delay_pick::DelayPick`）。ホストはゲストの要求を同じ範囲に詰める。
+    /// 遅れの量の押下（両者）。rollback のモードは `Rollback::press_delay`、delay 方式は `Lockstep::press_delay`。範囲は呼び手が詰める（`delay_pick::DelayPick`）。ホストはゲストの要求を同じ範囲に詰める。
     ///
-    /// `x` が `delay_pick::AUTO`（数字キーの 9）なら auto: ホストは旗を立てて今の推奨値にし、ゲストはホストへ要求する。0〜8 の値は
-    /// ホストの auto の旗を降ろす（後勝ち）。
+    /// `x` が `delay_pick::AUTO`（数字キーの 9）なら auto: ホストは旗を立てて今の推奨値にし、ゲストはホストへ要求する。0〜8 の値はホストの auto の旗を降ろす（後勝ち）。
     pub fn press_delay(&mut self, x: u8) -> lockstep::DelayPress {
         if x == crate::delay_pick::AUTO {
             self.refresh_recommend();
@@ -1508,7 +1524,7 @@ impl Connected {
 
     /// 形式の切替の STEP を入れた tick に呼ぶ（両者）。新しい形式の機械の seg の始まりを STEP の D・旗で作り直し、前の機械は眠らせる。前の
     /// seg を動かした機械の覚え（`prev_owner`）は変えない。両者が rollback ができる組でなければ断って何も変えない。`by_peer` は、この
-    /// 切替を求めたのが相手か（本ログ）。形式が替わらなくても D・旗は置き直す（`FormatSwitch::Reset`）。
+    /// 切替を求めたのが相手か（本ログ）。形式が替わらなくても D・旗は設定し直す（`FormatSwitch::Reset`）。
     pub fn switch_format(&mut self, v: FormatValue, by_peer: bool) -> FormatSwitch {
         if !self.rollback_able() {
             self.fmt.refused = self.fmt.refused.saturating_add(1);
@@ -1546,7 +1562,7 @@ impl Connected {
     }
 
     /// 今の推奨値（`delay_pick::recommend_with_max`）: 直近の往復の中央値（3 回に満たなければ最後の往復。どちらも無ければ `None`）で引き、
-    /// 窓の最大がしきい値以下なら 0。画面の推奨値も auto もこの入口を通る。
+    /// ウィンドウの最大がしきい値以下なら 0。画面の推奨値も auto もこの入口を通る。
     pub fn recommend_now(&self) -> Option<u8> {
         self.recommend_pair_now().map(|r| r.raw)
     }
@@ -1561,7 +1577,7 @@ impl Connected {
         crate::delay_pick::Recommend::from_rtt_max(mode, median, max)
     }
 
-    /// 推奨値を引く往復 (中央値 ms, 窓の最大 ms)。中央値が無い（3 個に満たない）間は最後の往復で、最大は無い（0 を推さない）。
+    /// 推奨値を引く往復 (中央値 ms, ウィンドウの最大 ms)。中央値が無い（3 個に満たない）間は最後の往復で、最大は無い（0 を推さない）。
     fn rtt_for_recommend_ms(&self) -> (Option<u32>, Option<u32>) {
         let median = self
             .live
@@ -1619,8 +1635,7 @@ impl Connected {
     /// 「付いていく」形）は、`advance` の代わりに呼ぶ。
     pub fn resend_if_due<O: Outlet>(&mut self, now: u32, out: &mut O) {
         if now.wrapping_sub(self.last_input_send) >= lockstep::RESEND_MS {
-            self.tx
-                .send(self.path, &Message::Input(self.build_input()), out);
+            self.send_input(self.build_input(), now, out);
             self.last_input_send = now;
         }
     }
@@ -1655,7 +1670,7 @@ impl Connected {
         }
     }
 
-    /// CHECK のフレームを使った後の自分の値。記録して送る。
+    /// CHECK のフレームを使った後の自分の値。記録し、相手へ送る。
     pub fn submit_check<O: Outlet>(&mut self, c: Check, out: &mut O) -> Option<CheckResult> {
         let r = self.chk.record_local(c);
         if let Some(CheckResult::Match { .. }) = r {
@@ -1683,7 +1698,7 @@ impl Connected {
 
 #[cfg(test)]
 mod tests {
-    //! 組み上がった形（本物の UDP の上で 2 つを繋ぐ）は peer_sim の `tests/loopback.rs`。
+    //! 組み上がった形（本物の UDP の上で 2 つを接続する）は peer_sim の `tests/loopback.rs`。
     use super::*;
     use crate::handshake::Name;
     use crate::match_gate::{MATCH_WAIT_MS, READY_RESEND_MS};
@@ -1851,6 +1866,7 @@ mod tests {
             ack,
             base: 0,
             lat: None,
+            stamp: crate::wire::Stamp::NONE,
             count: 0,
             words: [0; MAX_WORDS],
         })
@@ -1862,9 +1878,9 @@ mod tests {
         qa: Q,
         qb: Q,
         now: u32,
-        /// B が最初に送った HELLO（繋がった後に A へもう一度渡す検査に使う）。
+        /// B が最初に送った HELLO（接続後に A へもう一度渡す検査に使う）。
         b_hello: Option<Vec<u8>>,
-        /// B が最初に送った AGREE（バージョン 5: 繋がった後に A へもう一度渡し、セッションの封じた返しを出させる検査に使う）。
+        /// B が最初に送った AGREE（バージョン 5: 接続後に A へもう一度渡し、セッションの封じた返しを出させる検査に使う）。
         b_agree: Option<Vec<u8>>,
     }
 
@@ -1903,7 +1919,7 @@ mod tests {
             Pair::connect_links(link(PORT_B, 1), link(PORT_A, 2))
         }
 
-        /// 望むモードを置いてから繋ぐ（A はゲスト、B はホスト。R は A 3・B 12 —— R は各自の設定で、揃えない）。
+        /// 望むモードを設定してから接続する（A はゲスト、B はホスト。R は A 3・B 12 —— R は各自の設定で、揃えない）。
         fn connect_modes(wa: ModeWish, wb: ModeWish) -> Pair {
             let (mut a, mut b) = (link(PORT_B, 1), link(PORT_A, 2));
             a.set_mode(wa, 3);
@@ -1945,6 +1961,66 @@ mod tests {
         fn ca(&mut self) -> &mut Connected {
             self.a.connected_mut().expect("A は繋がっている")
         }
+    }
+
+    /// 候補が 3 つあっても、PROBE の列は相手の HELLO の送り元へだけ 10 通行く（HELLO は 3 つ全部へ）。相手が決め方を名乗らなければ送らない。
+    #[test]
+    fn probes_go_only_to_the_source_of_the_peer_hello() {
+        use crate::host_pick::{PROBE_COUNT, Setup};
+        let cands = [addr(40_101), addr(PORT_B), addr(40_103)];
+        for peer_picks in [true, false] {
+            let mut a = Link::new(
+                Config {
+                    handshake: hs_cfg(1),
+                    secret: SECRET,
+                    peers: Candidates::from_addrs(&cands).unwrap(),
+                    key_seed: seed_of(1),
+                },
+                0,
+            );
+            a.set_host_pick(Some(Setup::new(crate::nat::NatMark::UNKNOWN)));
+            let mut q = Q::default();
+            a.poll(1, &mut q);
+            let hello_to: Vec<SocketAddr> = q.1.clone();
+            assert_eq!(hello_to, cands, "効く期間: HELLO は候補の全部へ");
+            q.0.clear();
+            q.1.clear();
+            let Message::Hello(mut h) = hello(2) else {
+                unreachable!("HELLO");
+            };
+            h.host_pick = peer_picks;
+            a.on_datagram(addr(PORT_B), &enc(SID, &Message::Hello(h)), 2, &mut q);
+            let probes: Vec<SocketAddr> =
+                q.0.iter()
+                    .zip(&q.1)
+                    .filter(|(b, _)| wire::peek_is_probe(b))
+                    .map(|(_, to)| *to)
+                    .collect();
+            let want = if peer_picks {
+                vec![addr(PORT_B); usize::from(PROBE_COUNT)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(probes, want, "相手が名乗る: {peer_picks}");
+        }
+    }
+
+    /// 接続した後の PROBE は、タグを比べる前に捨てる（タグの壊れた PROBE が `bad_tag` でなく `late_probes` に入る）。
+    #[test]
+    fn a_probe_after_connecting_is_dropped_before_the_tag() {
+        let mut p = Pair::connect();
+        let mut probe = enc(SID, &Message::Probe { seq: 0 });
+        let last = probe.len() - 1;
+        probe[last] ^= 0xFF;
+        p.a.on_datagram(addr(PORT_B), &probe, p.now + 1, &mut p.qa);
+        let c = p.a.recv_counts();
+        assert_eq!((c.late_probes, c.bad_tag), (1, 0), "{c:?}");
+        // 効く期間: 接続した後の PROBE 以外の壊れた便は `bad_tag`。
+        let mut bad = enc(SID, &hello(2));
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        p.a.on_datagram(addr(PORT_B), &bad, p.now + 2, &mut p.qa);
+        assert_eq!(p.a.recv_counts().bad_tag, 1);
     }
 
     #[test]
@@ -1996,7 +2072,7 @@ mod tests {
         );
         assert_eq!(a.hello_sent(), want);
         // 経路を採った後の HELLO は、採った経路の種類の欄だけに数える。これが起きるのは手順が時間切れで引き継ぎ（`Restart::Resume`）に
-        // なったときだけなので、それを起こす: A の送りのうち B のアドレスへ向いたものだけを B へ渡し、B の返事は AGREE だけ渡さない。
+        // なったときだけなので、その状況を作る: A の送りのうち B のアドレスへ向いたものだけを B へ渡し、B の返事は AGREE だけ渡さない。
         a.set_retry_window(60_000);
         let mut b = link(PORT_A, 2);
         let mut at_restart: Option<([u32; KIND_SLOTS], u32)> = None;
@@ -2231,6 +2307,7 @@ mod tests {
             ack: 0,
             base: c.rollback().unwrap().remote_next(),
             lat: Some(wire::LatChange { frame: 0, delay: 3 }),
+            stamp: crate::wire::Stamp::NONE,
             count: 1,
             words,
         });
@@ -2246,6 +2323,7 @@ mod tests {
             ack: 0,
             base: p.b.connected().unwrap().rollback().unwrap().remote_next(),
             lat: Some(wire::LatChange { frame: 0, delay: 3 }),
+            stamp: crate::wire::Stamp::NONE,
             count: 1,
             words,
         });
@@ -2513,7 +2591,7 @@ mod tests {
 
     #[test]
     fn the_previous_seg_reply_comes_from_the_machine_that_ran_that_seg() {
-        // (繋がったときの形式, 前の seg を動かした形式, 替える先): 3 つ目は 2 つが違う（繋がったときの形式を持ち主と取り違えるのを落とす）。
+        // (接続したときの形式, 前の seg を動かした形式, 替える先): 3 つ目は 2 つが違う（接続したときの形式を持ち主と取り違えるのを落とす）。
         for (initial, from, to) in [
             (Mode::Delay, Mode::Delay, Mode::Rollback),
             (Mode::Rollback, Mode::Rollback, Mode::Delay),
@@ -2557,6 +2635,7 @@ mod tests {
                 ack: 3,
                 base: 0,
                 lat: None,
+                stamp: crate::wire::Stamp::NONE,
                 count: 0,
                 words: [0; MAX_WORDS],
             });
@@ -2572,7 +2651,18 @@ mod tests {
                 before.input_prev_replies + 1,
                 "{tag}: バックアップを返していない"
             );
-            let sent = p.qa.take();
+            // 時刻の欄は送るときに入るので、比べない。
+            let sent: Vec<Message> =
+                p.qa.take()
+                    .into_iter()
+                    .map(|m| match m {
+                        Message::Input(i) => Message::Input(Input {
+                            stamp: crate::wire::Stamp::NONE,
+                            ..i
+                        }),
+                        m => m,
+                    })
+                    .collect();
             assert_eq!(
                 sent,
                 vec![Message::Input(owner_prev)],
@@ -2583,6 +2673,7 @@ mod tests {
                 ack: u32::from(u8::MAX),
                 base: 0,
                 lat: None,
+                stamp: crate::wire::Stamp::NONE,
                 count: 0,
                 words: [0; MAX_WORDS],
             });
@@ -2758,7 +2849,7 @@ mod tests {
         assert_eq!(r, Recv::Nothing);
         let r = a.on_datagram(addr(PORT_B), &enc(SID ^ 1, &ping), 1, &mut q);
         assert_eq!(r, Recv::Nothing);
-        // 繋がる前の、接続の手順以外。封じた便は鍵の交換の前なので、開かずに `before_keys` で落ちる。
+        // 接続前の、接続の手順以外。封じた便は鍵の交換の前なので、開かずに `before_keys` で落ちる。
         let r = a.on_datagram(addr(PORT_B), &enc(SID, &ping), 1, &mut q);
         assert_eq!(r, Recv::Nothing);
         let c = a.recv_counts();
@@ -2798,7 +2889,7 @@ mod tests {
         let mut p = Pair::connect();
         let hello = p.b_hello.clone().expect("B の HELLO を見た");
         let now = p.now;
-        // 相手の確認が落ちて、相手が HELLO を送り直してきた形。繋がった後も返す。
+        // 相手の確認が落ちて、相手が HELLO を送り直してきた形。接続後も返す。
         p.a.on_datagram(addr(PORT_B), &hello, now, &mut p.qa);
         let sent = p.qa.take();
         assert!(
@@ -2910,8 +3001,8 @@ mod tests {
         assert!(!p.ca().auto_on(), "数字の押下で旗が降りない");
     }
 
-    /// 往復の窓の最大が小さいときだけ推奨値が 0 になり、auto の押下と形式の切替の D もその 0 を使う。境目は手で数えた値
-    /// （delay 方式 8 ms で 0・9 ms で 1、rollback 16 ms で 0・17 ms で 1。窓に 3 個無ければ 0 を推さない）。
+    /// 往復のウィンドウの最大が小さいときだけ推奨値が 0 になり、auto の押下と形式の切替の D もその 0 を使う。境目は手で数えた値
+    /// （delay 方式 8 ms で 0・9 ms で 1、rollback 16 ms で 0・17 ms で 1。ウィンドウに 3 個無ければ 0 を推さない）。
     #[test]
     fn a_pong_window_with_a_small_max_recommends_zero() {
         use crate::delay_pick::AUTO;
@@ -2934,7 +3025,7 @@ mod tests {
             p.b.connected_mut().unwrap()
         }
         assert_eq!(host(&mut p).role(), Role::Host, "B がホスト");
-        // 繋がった時の PING の 1 個と合わせて 2 個: 小さくても 0 を推さない。
+        // 接続した時の PING の 1 個と合わせて 2 個: 小さくても 0 を推さない。
         pong(&mut p, 2);
         assert_eq!(p.ca().liveness().rtt_max_ms(), None, "窓は 2 個");
         assert_eq!(
@@ -2960,7 +3051,7 @@ mod tests {
         );
         pong(&mut p, 9);
         assert_eq!(p.ca().recommend_now(), Some(1), "delay 方式: 最大 9 ms");
-        // 同じ窓を rollback の式で引くと 16 ms まで 0、17 ms で 1（形式の切替の D）。
+        // 同じウィンドウを rollback の式で引くと 16 ms まで 0、17 ms で 1（形式の切替の D）。
         let to_rb = |p: &mut Pair| host(p).format_value_for(Mode::Rollback).delay;
         assert_eq!(to_rb(&mut p), 0, "rollback: 最大 9 ms");
         pong(&mut p, 16);
@@ -2968,7 +3059,7 @@ mod tests {
         assert_eq!(to_rb(&mut p), 0, "rollback: 最大 16 ms");
         pong(&mut p, 17);
         assert_eq!(to_rb(&mut p), 1, "rollback: 最大 17 ms");
-        // 窓が 8 個とも小さくなれば 0 に戻る（古い 9・16・17 が窓から外れるまで 0 にしない）。
+        // ウィンドウが 8 個とも小さくなれば 0 に戻る（古い 9・16・17 がウィンドウから外れるまで 0 にしない）。
         for _ in 0..7 {
             assert_eq!(p.ca().recommend_now(), Some(1));
             pong(&mut p, 2);
@@ -3516,6 +3607,9 @@ mod tests {
             arrival: wire::Arrival::Unknown,
             build: crate::update::BUILD_NUMBER,
             public: public_of(nonce),
+            host_pick: false,
+            nat: crate::nat::NatMark::UNKNOWN,
+            rollback_delay: 0,
         })
     }
 
@@ -3594,7 +3688,7 @@ mod tests {
                             b.on_datagram(me, &bytes, t, &mut qb);
                         } else {
                             // 相手でない候補へ送ってよいのは、経路を決める前の HELLO だけ（AGREE が自分自身へ返ると、
-                            // ホストが自分の AGREE を「ゲストの返し」と取り違えてひとりで繋がる）。
+                            // ホストが自分の AGREE を「ゲストの返し」と取り違えてひとりで接続する）。
                             let m = dec(&bytes).expect("A が送ったものは読める").msg;
                             assert!(
                                 matches!(m, Message::Hello(_)),
@@ -3719,11 +3813,12 @@ mod tests {
         now_ver.extend_from_slice(&[0, 0]); // seat_wish = おまかせ・arrival = 名乗らない
         now_ver.extend_from_slice(&crate::update::BUILD_NUMBER.to_le_bytes());
         now_ver.extend_from_slice(&public_of(7));
+        now_ver.extend_from_slice(&[0, 0]); // 回線の型 = 不明・D = 0
         now_ver.extend_from_slice(&[0; wire::TAG_LEN]); // `relabel` が落として付け直す
         let mut b = link(PORT_B, 1);
         b.on_datagram(addr(PORT_B), &relabel(&now_ver, wire::PROTO_VER), 2, &mut q);
         assert_eq!(b.handshake_state(), handshake::State::Connecting);
-        assert_eq!(b.hs.role(), Some(crate::lockstep::Role::Guest));
+        assert_eq!(b.hs.coordinator(), Some(false));
         assert_eq!(b.recv_counts().other_version, 0);
     }
 
@@ -3789,7 +3884,7 @@ mod tests {
         at: SocketAddr,
         peer: SocketAddr,
         nonce: u64,
-        /// 使い捨ての鍵の種（既定は `seed_of(nonce)`。同じ nonce で起こし直した形は別の種にする）。
+        /// 使い捨ての鍵の種（既定は `seed_of(nonce)`。同じ nonce でセッションを作り直した形は別の種にする）。
         seed: KeySeed,
         from: u32,
         until: u32,
@@ -4061,7 +4156,7 @@ mod tests {
     fn check_rule_reaches_the_connected_log() {
         for rule in [CheckRule::All, CheckRule::SkipCountAtFrame0] {
             let mut ns = [node(PORT_A, PORT_B, 9, 0), node(PORT_B, PORT_A, 2, 0)];
-            // A は `sim` に作らせず、作った直後（繋がる前）に比べ方を置いてから渡す。
+            // A は `sim` に作らせず、作った直後（接続前）に比べ方を設定してから渡す。
             let mut a = Link::new(
                 Config::single(hs_cfg(9), SECRET, addr(PORT_B), seed_of(9)),
                 0,
@@ -4395,6 +4490,7 @@ mod tests {
                 host_seat: Seat::P1,
                 delay: 2,
                 mode: Mode::Delay,
+                pick: crate::host_pick::Pick::NONE,
             },
         );
         for t in 1..=3 {
@@ -4487,7 +4583,7 @@ mod tests {
             }
         };
         let hello = p.b_hello.clone().expect("B の HELLO");
-        // B（ホスト）の AGREE。繋がった後に渡すと、A（ゲスト）のセッションが AGREE の返しを封じて送る（セッションの送りが `Connected` の番号を使う経路）。
+        // B（ホスト）の AGREE。接続後に渡すと、A（ゲスト）のセッションが AGREE の返しを封じて送る（セッションの送りが `Connected` の番号を使う経路）。
         let agree = p.b_agree.clone().expect("B の AGREE");
         let mut link_agrees = 0;
         for k in 0..60u32 {
@@ -4559,7 +4655,7 @@ mod tests {
             }
             qa.1.clear();
             for bytes in std::mem::take(&mut qb.0) {
-                // 10 秒の間は B の AGREE の返しを落とす（A は時間切れで引き継ぐ作り直しになる）。
+                // 10 秒の間は B から A への AGREE の返しを落とす（A は時間切れで引き継ぐ作り直しになる）。
                 if t < 10_500 && matches!(dec(&bytes).map(|p| p.msg), Ok(Message::Agree { .. })) {
                     continue;
                 }
@@ -4649,7 +4745,7 @@ mod tests {
     }
 
     /// 荒いネットワーク（落とす・遅らせて順を入れ替える・重ねる）の 1 実行。B1（B2 と同じ nonce・別の種）は `b1_until` で止まり、B2 は
-    /// `b2_from` に起きる（同じポート）。戻りは（A の繋がった時刻, B2 の繋がった時刻, A の送った便の全部, A と B2 のセッション）。
+    /// `b2_from` に起きる（同じポート）。戻りは（A の接続した時刻, B2 の接続した時刻, A の送った便の全部, A と B2 のセッション）。
     #[allow(clippy::too_many_arguments)] // 検査の実行の条件を 1 か所で振る
     fn rough_run(
         rng_seed: u64,

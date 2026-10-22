@@ -1,6 +1,6 @@
 //! ペースと時刻のフックの Win32 の層（unsafe はここにもある。1 つずつ `// SAFETY:`）。
 //!
-//! 置くもの: QPC、先頭の入口 `pacing_head_entry` と Present の入口 `present_entry`（素のアセンブリ）、入口から呼ぶ Rust の関数
+//! ここに含むもの: QPC、先頭の入口 `pacing_head_entry` と Present の入口 `present_entry`（素のアセンブリ）、入口から呼ぶ Rust の関数
 //! （`pace_head` / `pace_input` / `pace_present_begin` / `pace_present_end`。中は全部 `catch_unwind`）、先頭のフック（ペースの状態と
 //! 高分解能の待機タイマー）、本物の `PacingHost`（ini・書き出しのスレッド）。判断・順番・記録のリングバッファは `pacing.rs`、期限の式と集計は
 //! `higanr_core::pacing` にだけ書く。
@@ -37,7 +37,10 @@ use crate::pacing::{
 use crate::record_win::RealRecord;
 use crate::script_win::RealScriptHost;
 use crate::session::ScriptHost;
-use crate::th09_addr::{GAME_FPU_CW, WINDOW_CLOCK_DIVISOR, WINDOW_DEADLINE};
+use crate::th09_addr::{
+    D3D8_PRESENT_PARAMS, GAME_FPU_CW, OPTION_WINDOWED, PP_PRESENT_INTERVAL, WINDOW_CLOCK_DIVISOR,
+    WINDOW_DEADLINE,
+};
 
 pub fn qpc() -> u64 {
     let mut q: i64 = 0;
@@ -112,7 +115,7 @@ pub fn cpu_classes_now() -> Result<CpuClasses, String> {
 
 fn cpu_classes_from(get: Option<CpuSetInformationFn>) -> Result<CpuClasses, String> {
     let get =
-        get.ok_or_else(|| "この Windows には GetSystemCpuSetInformation が無い".to_string())?;
+        get.ok_or_else(|| "この Windows には GetSystemCpuSetInformation がありません".to_string())?;
     let mut need: u32 = 0;
     // SAFETY: 箱を渡さず（null・長さ 0）必要な大きさだけを聞く。プロセスは null（全体の表）。
     unsafe {
@@ -125,7 +128,7 @@ fn cpu_classes_from(get: Option<CpuSetInformationFn>) -> Result<CpuClasses, Stri
         )
     };
     if need == 0 {
-        return Err("必要な大きさが 0 と返った".to_string());
+        return Err("必要な大きさが 0 で返されました".to_string());
     }
     let mut buf = vec![0u64; (need as usize).div_ceil(8)];
     let mut got: u32 = 0;
@@ -192,11 +195,33 @@ pub struct RealClock {
     waiter: Waiter,
     /// `mode = vpatch` の待ちに使う普通の待機タイマー（他の方式では None）。
     plain: Option<PlainTimer>,
-    /// auto の先頭が読む画面の形のアドレス（`th09_addr::OPTION_WINDOWED`）。0 なら読まない（明示の形・読めると確かめられなかった設置・
+    /// auto の先頭が読む画面の形のアドレス（`th09_addr::OPTION_WINDOWED`）。0 なら読まない（明示の形・読めると検証できなかった設置・
     /// 検査のプロセス）。
     screen_flag: u32,
+    /// フルスクリーンのときに読むデバイスの PresentationInterval のアドレス（present parameters のコピーの `+0x30`）。`screen_flag` が `OPTION_WINDOWED`
+    /// のときだけ設定する（同じ頁なので、旗を読めると検証した設置なら読める）。0 なら読まずにフルスクリーンを垂直同期ありとみなす。
+    interval: u32,
     /// ゲーム自身の時計の経路で読むウィンドウの構造体のアドレス（`th09_addr::WINDOW_ADDR`）。0 なら読まない（`game_due` は偽 —— 始まりで待たない）。
     window: u32,
+}
+
+/// 検査だけ: PresentationInterval の代わりのアドレス（0 なら本物と同じ決め方）。
+#[cfg(test)]
+static TEST_INTERVAL_AT: AtomicU32 = AtomicU32::new(0);
+
+fn interval_addr(screen_flag: u32) -> u32 {
+    #[cfg(test)]
+    {
+        let t = TEST_INTERVAL_AT.load(Ordering::SeqCst);
+        if t != 0 {
+            return t;
+        }
+    }
+    if screen_flag == OPTION_WINDOWED {
+        D3D8_PRESENT_PARAMS + PP_PRESENT_INTERVAL
+    } else {
+        0
+    }
 }
 
 impl RealClock {
@@ -209,7 +234,7 @@ impl RealClock {
         }
         let at = |off: u32| (self.window + off) as usize as *const u32;
         // SAFETY: 0 でないアドレスは `pacing::install` が `WINDOW_ADDR`（th09.exe の .data。image base の一致と地点の照合が通った後に
-        // だけ来る）から `WINDOW_SPAN` バイトを設置の時に読めると確かめてから渡したものだけ。読む 3 語は範囲の中で 4 バイト揃え。exe の .data はプロセスが終わるまで読める。
+        // だけ来る）から `WINDOW_SPAN` バイトを設置の時に読めると検証してから渡したものだけ。読む 3 語は範囲の中で 4 バイト揃え。exe の .data はプロセスが終わるまで読める。
         // 書き手（時計の分母は WinMain、期限は do_frame の先頭）はこの先頭と同じゲームのスレッドなので、読む間に変わらない。
         let (divisor, lo, hi) = unsafe {
             (
@@ -252,11 +277,18 @@ impl PaceClock for RealClock {
             return pace::Screen::Unknown;
         }
         // SAFETY: 0 でないアドレスは `pacing::install` が `OPTION_WINDOWED`（th09.exe の .data。image base の一致と地点の照合が通った
-        // 後にだけ来る）を設置の時に 1 バイト読めると確かめてから渡したものだけ。exe の .data はプロセスが終わるまで読める。書き手（設定の読み込み・オプションの画面）は
+        // 後にだけ来る）を設置の時に 1 バイト読めると検証してから渡したものだけ。exe の .data はプロセスが終わるまで読める。書き手（設定の読み込み・オプションの画面）は
         // この先頭と同じゲームのスレッドなので、
         // 読む間に変わらない。確保も待ちもしない。
         let b = unsafe { core::ptr::read_volatile(self.screen_flag as usize as *const u8) };
-        pace::screen_from_flag(b)
+        let s = pace::screen_from_flag(b);
+        if s != pace::Screen::Fullscreen || self.interval == 0 {
+            return s;
+        }
+        // SAFETY: 0 でないアドレスは `interval_addr` が `OPTION_WINDOWED` と同じ頁の present parameters のコピーの `+0x30`（4 バイト揃え。
+        // 同じ頁は `th09_addr` の検査が検証する）を渡したものだけ。書き手（デバイスを作る・作り直す）はこの先頭と同じゲームのスレッド。
+        let v = unsafe { core::ptr::read_volatile(self.interval as usize as *const u32) };
+        pace::fullscreen_screen(v)
     }
 }
 
@@ -276,17 +308,17 @@ pub static HEAD_EARLY_EXIT: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_ORIGINAL: AtomicU32 = AtomicU32::new(0);
 /// `mode = vpatch` のときだけ 1。Present の前の待ちのフックを開ける（他の方式では `pace_present_begin` が原子変数を 1 回読むだけ）。
 static VPATCH_WAIT_ON: AtomicU32 = AtomicU32::new(0);
-/// 始めるときに `fldcw` で置く制御語（下位 16 ビット）。
+/// 始めるときに `fldcw` でセットする制御語（下位 16 ビット）。
 static FPU_CW: AtomicU32 = AtomicU32::new(GAME_FPU_CW as u32);
 /// 先頭でゲーム自身の経路へ任せた回数・パニックを受けた回数。
 static FALLBACKS: AtomicU32 = AtomicU32::new(0);
 static PANICS: AtomicU32 = AtomicU32::new(0);
 
-/// 始まりの中で相手の入力ワードを待つフック（`script_win::head_wait_hook`。delay 方式の lockstep のときだけ待つ）。0 なら何もしない。置くのはネットワークのセッションを
+/// 始まりの中で相手の入力ワードを待つフック（`script_win::head_wait_hook`。delay 方式の lockstep のときだけ待つ）。0 なら何もしない。設定するのはネットワークのセッションを
 /// 動かす実行だけで、それ以外では `pace_head` は原子変数を 1 回読んで戻るだけ。関数のアドレスを切り捨てずに持つので `AtomicUsize`。
 static HEAD_WAIT_FN: AtomicUsize = AtomicUsize::new(0);
 
-/// 始まりの中の待ちのフックを置く・外す（`NET_ON` を 1 にする前後に、`script_win` が置く）。
+/// 始まりの中の待ちのフックを設定する・外す（`NET_ON` を 1 にする前後に、`script_win` が設定する）。
 pub fn set_head_wait(f: Option<fn()>) {
     HEAD_WAIT_FN.store(f.map_or(0, |f| f as usize), Ordering::Release);
 }
@@ -297,7 +329,7 @@ fn run_head_wait() {
     if f == 0 {
         return;
     }
-    // SAFETY: `f` は `set_head_wait` が `fn()` のアドレスを `usize` にして置いた値で、0 でない。切り捨てや加工をしていない。関数のアドレスと `usize` は同じ大きさ。
+    // SAFETY: `f` は `set_head_wait` が `fn()` のアドレスを `usize` にして保存した値で、0 でない。切り捨てや加工をしていない。関数のアドレスと `usize` は同じ大きさ。
     let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f) };
     if catch_unwind(f).is_err() {
         HEAD_WAIT_FN.store(0, Ordering::SeqCst);
@@ -305,18 +337,13 @@ fn run_head_wait() {
     }
 }
 
-/// 先頭の判断（ゲームのスレッド。`pacing_head_entry` が呼ぶ）。錠が取れない・箱が無い・パニックなら `HEAD_FALLBACK`（`FALLBACKS` /
-/// `PANICS` に数える）。`mode = cycle` の game の区間は箱が `HEAD_FALLBACK` を返す（決めた経路なので数えない）。
+/// 先頭の判断（ゲームのスレッド。`pacing_head_entry` が呼ぶ）。錠が取れない・箱が無い・パニックなら `HEAD_FALLBACK`（`FALLBACKS` / `PANICS` に数える）。`mode = cycle` の game の区間は箱が `HEAD_FALLBACK` を返す（決めた経路なので数えない）。
 ///
-/// 始まりの中の待ち（`HEAD_WAIT_FN`）を呼ぶのは次の 2 つのときだけ。返す直前に呼ぶ。
+/// 始まりの中の待ち（`HEAD_WAIT_FN`）を呼ぶのは次の 2 つのときだけで、返す直前に呼ぶ。
 /// - 箱が「始める」（`HEAD_RUN`）と決めたとき（ウィンドウの b-spin / b の格子の待ちの後）。
-/// - 箱がゲーム自身の時計へ任せる（`HEAD_FALLBACK`。全画面・cycle の game の区間）と決め、フックが置かれていて、ゲームがこの 1 回で
-///   フレームを始める見込みのとき（`RealClock::game_due`）。この経路は先頭が 1 フレームに何千回も来る（全画面の実回線で平均
-///   13,000〜21,000 回）ので、期限の前の回で待つと上限を期限の前に使い切って効かない。期限の「早め」
-///   （`pace::GAME_DUE_EARLY_US`）の中に入った回でだけ呼ぶ。同じ tick で 2 度は待たない（フックの側）。
+/// - 箱がゲーム自身の時計へ任せる（`HEAD_FALLBACK`。フルスクリーン・cycle の game の区間）と決め、フックが設定されていて、ゲームがこの 1 回でフレームを始める見込みのとき（`RealClock::game_due`）。この経路は先頭が 1 フレームに何千回も来る（フルスクリーンの実回線で平均 13,000〜21,000 回）ので、期限の前の回で待つと上限を期限の前に使い切って効かない。期限の「早め」（`pace::GAME_DUE_EARLY_US`）の中に入った回でだけ呼ぶ。同じ tick で 2 度は待たない（フックの側）。
 ///
-/// 「まだ」（`HEAD_NOT_YET`）・錠が取れない・箱が無い・パニックの経路では待たない。錠は待つ前に手放す（待つ間、読み取りのスレッドが
-/// 先頭のフックを触れるように）。
+/// 「まだ」（`HEAD_NOT_YET`）・錠が取れない・箱が無い・パニックの経路では待たない。錠は待つ前に手放す（待つ間、読み取りのスレッドが先頭のフックを触れるように）。
 pub extern "C" fn pace_head() -> u32 {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut g) = PACER.try_lock() else {
@@ -348,7 +375,7 @@ pub extern "C" fn pace_head() -> u32 {
 }
 
 /// 入力の入口（`stub::input_wait_entry`）が呼ぶ。引数は on_tick の this の `+0x454`。時刻を先に取り、論理 CPU とスレッドの周期は
-/// 後に取る（周期の窓を QPC の窓の内側に入れる。足した 2 つの呼び出しの重さは「入力 → Present の前」に入る）。
+/// 後に取る（周期の測定区間を QPC の測定区間の内側に入れる。足した 2 つの呼び出しの重さは「入力 → Present の前」に入る）。
 pub extern "C" fn pace_input(sup_frame: u32) {
     let r = catch_unwind(|| {
         let t = qpc();
@@ -390,11 +417,11 @@ pub extern "C" fn pace_present_end() {
     }
 }
 
-/// Present の後のフック（rollback のモードのコピーと進め直し。`script_win::rb_post_present`）。0 なら何もしない。置くのは rollback の入口を
+/// Present の後のフック（rollback のモードのコピーと進め直し。`script_win::rb_post_present`）。0 なら何もしない。設定するのは rollback の入口を
 /// 全部書けた実行だけ。
 static AFTER_PRESENT_FN: AtomicU32 = AtomicU32::new(0);
 
-/// Present の後のフックを置く・外す（読み取りのスレッドが、Present の call を書いた後・ネットワークを動かす前に）。
+/// Present の後のフックを設定する・外す（読み取りのスレッドが、Present の call を書いた後・ネットワークを動かす前に）。
 pub fn set_after_present(f: Option<fn()>) {
     AFTER_PRESENT_FN.store(f.map_or(0, |f| f as usize as u32), Ordering::Release);
 }
@@ -406,7 +433,7 @@ pub extern "C" fn pace_after_present() {
     if f == 0 {
         return;
     }
-    // SAFETY: `f` は `set_after_present` が `fn()` のアドレスを 32 ビットにして置いた値で、0 でない。関数のアドレスと整数は 32 ビットで同じ大きさ。
+    // SAFETY: `f` は `set_after_present` が `fn()` のアドレスを 32 ビットにして保存した値で、0 でない。関数のアドレスと整数は 32 ビットで同じ大きさ。
     let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f as usize) };
     if catch_unwind(f).is_err() {
         AFTER_PRESENT_FN.store(0, Ordering::SeqCst);
@@ -422,12 +449,12 @@ pub extern "C" fn pace_after_present() {
 // - 0 でなければ HEAD_FN（`pace_head`。`extern "C"`、引数なし、戻り値は eax）を呼ぶ。呼ばれた側は cdecl で ebx・esi・edi・ebp と
 //   esp を保ち、x87 を使わない。DF は `cld` で 0。eax・ecx・edx は壊れてよい（着地の `0x0042DC8D` は ecx を読み直し、`0x0042DD81` は
 //   eax を 0 にする）。
-// - 1（始める）: `fldcw` でゲームの制御語 `0x007F` を置き、戻りアドレスを捨てて（`add esp, 4`）`0x0042DC8D` へ `jmp`。飛ばす区間
+// - 1（始める）: `fldcw` でゲームの制御語 `0x007F` をセットし、戻りアドレスを捨てて（`add esp, 4`）`0x0042DC8D` へ `jmp`。飛ばす区間
 //   `0x0042DC49`〜`0x0042DC8C` はスタックを動かさず x87 のスタックを空で終えるので、着地の状態は元と同じ。
 // - 2（まだ）: 戻りアドレスを捨てて `0x0042DD81`（`pop edi; xor eax,eax; pop esi; ret`）へ `jmp`。スタックは do_frame の `push esi; push edi` の直後と同じなので、
 //   do_frame は 0 を返してメインループへ戻る。
 // - それ以外（0 = 任せる）: PACING_ON が 0 のときと同じ経路。
-// - 飛び先のアドレスと HEAD_FN は、この入口へ向く call を書く前に置かれる（`set_head_targets`）。着地のアドレスは照合で一致した行のアドレスだけ。
+// - 飛び先のアドレスと HEAD_FN は、この入口へ向く call を書く前に設定される（`set_head_targets`）。着地のアドレスは照合で一致した行のアドレスだけ。
 /// 先頭の call（`0x0042DC44`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn pacing_head_entry() {
@@ -464,12 +491,12 @@ pub extern "C" fn pacing_head_entry() {
 // [戻りアドレス `0x0042DD72`]…、x87 のスタックは空。ラッパは引数を読まず、ecx・edx も入口で読まない。戻り値は呼ぶ側が使わない。
 // - `pace_present_begin` → `shot_present_begin` → ラッパ（PRESENT_ORIGINAL。自分の戻りアドレスを積んで呼ぶ）→ `shot_present_end` →
 //   `pace_present_end` → `pace_after_present`（フックが 0 なら原子変数を 1 回読んで戻る）→ `ret`。呼ぶ 6 つはどれも cdecl / MSVC の決まりで
-//   ebx・esi・edi・ebp と esp を保つ。Rust の 5 つは x87 を使わない（フックの先で使う x87 は、フックが制御語を置き直して戻す）。DF は `cld` で 0。
+//   ebx・esi・edi・ebp と esp を保つ。Rust の 5 つは x87 を使わない（フックの先で使う x87 は、フックが制御語をセットし直して戻す）。DF は `cld` で 0。
 // - `shot_present_*` はゲームの語（合成の InputManager の押した瞬間）の 1 ビットを、ラッパを呼ぶ間だけ立てて戻す（自分の PC にだけゲーム自身の
-//   スクリーンショットを撮らせる）。ラッパの直前・直後に置くのは、語にビットが立っている時間（他のスレッドの読みに見える窓）をラッパの間だけにするため。
+//   スクリーンショットを撮らせる）。ラッパの直前・直後に呼ぶのは、語にビットが立っている時間（他のスレッドの読みに見える時間）をラッパの間だけにするため。
 //   押下が無いフレームは何も書かない。
 // - `ret` の時点のスタックは入った時と同じなので、呼ぶ側の `0x0042DD72` へ戻る。
-// - PRESENT_ORIGINAL は、この入口へ向く call を書く前に置かれる（`set_present_original`）。
+// - PRESENT_ORIGINAL は、この入口へ向く call を書く前に設定される（`set_present_original`）。
 /// Present の call（`0x0042DD6D`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn present_entry() {
@@ -565,28 +592,29 @@ impl PacingHost for RealPacingHost {
         VPATCH_WAIT_ON.store(0, Ordering::SeqCst);
         // b-spin だけなら待機タイマーは使わないが、cycle の b の区間と同じ箱にするので形を問わず用意する
         // （Windows 11 では作れる。作れない古い OS では、どの形も時刻のフックだけになる）。
-        let ev = Event::new().ok_or("待ちのイベントを作れない")?;
+        let ev = Event::new().ok_or("待ちのイベントの作成不能")?;
         let waiter = Waiter::new(Arc::new(ev));
         let vpatch = cfg.mode == pace::Mode::Vpatch;
         let plain = if vpatch {
-            Some(PlainTimer::new().ok_or("普通の待機タイマーを作れない")?)
+            Some(PlainTimer::new().ok_or("普通の待機タイマーの作成不能")?)
         } else {
             None
         };
         if !vpatch && !waiter.high_resolution() {
             return Err(
-                "高分解能の待機タイマーを作れない（Windows 10 1803 より前？）。ms の待ちでは 1 フレームを刻めない"
+                "高分解能の待機タイマーの作成不能（Windows 10 1803 より前の可能性）。ms の待ちでは 1 フレームを刻めません"
                     .to_string(),
             );
         }
-        let p = Pacer::new(qpf, cfg).ok_or("QPF が小さすぎる（か、先頭を書かない形）")?;
-        let mut g = PACER.lock().map_err(|_| "先頭のフックの錠が壊れている")?;
+        let p = Pacer::new(qpf, cfg).ok_or("QPF が小さすぎます（か、先頭を書かない形）")?;
+        let mut g = PACER.lock().map_err(|_| "先頭のフックのロックが破損")?;
         *g = Some((
             p,
             RealClock {
                 waiter,
                 plain,
                 screen_flag,
+                interval: interval_addr(screen_flag),
                 window,
             },
         ));
@@ -617,7 +645,7 @@ impl PacingHost for RealPacingHost {
         classes: CpuClasses,
     ) -> Result<String, String> {
         if self.writer.is_some() {
-            return Err("もう起こしてある".to_string());
+            return Err("起動済み".to_string());
         }
         PACE_RING.reset();
         let stop = Arc::new(AtomicBool::new(false));
@@ -660,7 +688,7 @@ impl PacingHost for RealPacingHost {
                 );
                 Ok(WriterEnd { file: name, tally })
             })
-            .map_err(|e| format!("書き出しのスレッドを起こせない: {e}"))?;
+            .map_err(|e| format!("書き出しのスレッドの作成不能: {e}"))?;
         match rx.recv_timeout(WRITER_OPEN_WAIT) {
             Ok(Ok(name)) => {
                 self.writer = Some(WriterThread { stop, handle });
@@ -672,7 +700,7 @@ impl PacingHost for RealPacingHost {
             }
             Err(_) => {
                 stop.store(true, Ordering::Release);
-                Err("書き出しのスレッドが CSV を開いたと答えない".to_string())
+                Err("書き出しのスレッドから CSV を開いたとの応答がありません".to_string())
             }
         }
     }
@@ -682,7 +710,7 @@ impl PacingHost for RealPacingHost {
         w.stop.store(true, Ordering::Release);
         Some(match w.handle.join() {
             Ok(r) => r,
-            Err(_) => Err("書き出しのスレッドがパニックで終わった".to_string()),
+            Err(_) => Err("書き出しのスレッドがパニックで終了しました".to_string()),
         })
     }
 
@@ -1012,7 +1040,7 @@ mod tests {
         assert!(
             h2.start_writer(pre(Mode::B), 60, CpuClasses::default())
                 .unwrap_err()
-                .contains("既にある")
+                .contains("既に存在します")
         );
         assert_eq!(std::fs::read(&path).unwrap(), raw, "既存を上書きした");
         let mut h3 = RealPacingHost::new(None, Some(d.join("dll_q.log")), Some(d.clone()));
@@ -1063,7 +1091,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 簡潔なログが `_pacing.csv.gz` を作る。詳細が作らない。
     #[test]
     fn the_pacing_csv_is_created_only_when_detailed() {
         let _g = lock();
@@ -1142,8 +1169,7 @@ mod tests {
         *PACER.lock().unwrap() = None;
     }
 
-    // 何が壊れたら落ちるか: vpatch の箱を置くと Present の前の待ちのフックが開き（B では閉じる）、Present の入口（`pace_present_begin`）が期限まで待つこと。
-    // フックが開かない・錠を取りそこねると、フレームが待たずに続けて進んで落ちる。1 kHz なら先頭の起きる時刻が過去になり、普通の待機タイマーは使わない（寝過ごしで揺れない）。
+    // 1 kHz なら先頭の起きる時刻が過去になり、普通の待機タイマーは使わない（寝過ごしで揺れない）。
     #[test]
     fn vpatch_box_opens_the_present_wait_and_present_entry_waits_for_the_deadline() {
         let _g = lock();
@@ -1193,7 +1219,7 @@ mod tests {
         PACE_RING.reset();
     }
 
-    // 何が壊れたら落ちるか: 普通の待機タイマーが実際に寝て戻ること（即座に戻る・戻らない）。粒度は OS の時計の分解能なので、下限は緩く、上限は歯止めの内。
+    // 粒度は OS の時計の分解能なので、下限は緩く、上限は歯止めの内。
     #[test]
     fn plain_timer_sleeps_at_least_roughly_what_was_asked() {
         let t = PlainTimer::new().expect("普通の待機タイマーを作れる");
@@ -1233,6 +1259,42 @@ mod tests {
         }
         h.arm_pacer(10_000_000, &auto, 0, 0).expect("auto の箱");
         assert_eq!(screen(), Some(Screen::Unknown));
+        *PACER.lock().unwrap() = None;
+    }
+
+    /// IMMEDIATE を見落とさない。本物の旗のアドレスでないときは、本物の PresentationInterval のアドレスを読まない。
+    #[test]
+    fn real_clock_reads_the_present_interval_only_in_fullscreen() {
+        use core::sync::atomic::AtomicU8;
+        use higanr_core::pacing::{PRESENT_INTERVAL_IMMEDIATE, Screen};
+        static FLAG: AtomicU8 = AtomicU8::new(0);
+        static INTERVAL: AtomicU32 = AtomicU32::new(0);
+        let _g = lock();
+        assert_eq!(interval_addr(OPTION_WINDOWED), 0x004B_3480);
+        assert_eq!(interval_addr(FLAG.as_ptr() as usize as u32), 0);
+        assert_eq!(interval_addr(0), 0);
+        let mut h = RealPacingHost::new(None, None, None);
+        let auto = PacingIni {
+            mode: Mode::Auto,
+            ..PacingIni::DEFAULT
+        };
+        let screen = || PACER.lock().unwrap().as_mut().map(|(_, c)| c.screen());
+        TEST_INTERVAL_AT.store(INTERVAL.as_ptr() as usize as u32, Ordering::SeqCst);
+        h.arm_pacer(10_000_000, &auto, FLAG.as_ptr() as usize as u32, 0)
+            .expect("auto の箱");
+        TEST_INTERVAL_AT.store(0, Ordering::SeqCst);
+        for (flag, interval, want) in [
+            (0u8, PRESENT_INTERVAL_IMMEDIATE, Screen::FullscreenImmediate),
+            (0, 1, Screen::Fullscreen),
+            (0, 0, Screen::Fullscreen),
+            (1, PRESENT_INTERVAL_IMMEDIATE, Screen::Windowed),
+            (2, PRESENT_INTERVAL_IMMEDIATE, Screen::Unknown),
+            (0, PRESENT_INTERVAL_IMMEDIATE, Screen::FullscreenImmediate),
+        ] {
+            FLAG.store(flag, Ordering::SeqCst);
+            INTERVAL.store(interval, Ordering::SeqCst);
+            assert_eq!(screen(), Some(want), "{flag} / {interval:#X}");
+        }
         *PACER.lock().unwrap() = None;
     }
 
@@ -1294,7 +1356,7 @@ mod tests {
             runs,
             "始める答えの前に 1 回ずつ（「まだ」{not_yet} 回では呼ばない）"
         );
-        // 錠が取れない経路（読み取りのスレッドが箱を持っている間）: 答えはゲーム自身の経路で、フックは呼ばない。b-spin の箱は上で置いてある
+        // 錠が取れない経路（読み取りのスレッドが箱を持っている間）: 答えはゲーム自身の経路で、フックは呼ばない。b-spin の箱は上で用意してある
         // ので、錠さえ取れれば「始める / まだ」を返す形（対照）。
         {
             let _held = PACER.lock().unwrap();
@@ -1304,7 +1366,7 @@ mod tests {
             assert_eq!(FALLBACKS.load(Ordering::SeqCst), f0 + 1);
             assert_eq!(hits(), h2, "錠が取れない道で口を呼んだ");
         }
-        // 全画面の auto: ゲーム自身の時計へ任せる答え（`HEAD_FALLBACK`）の前では、ウィンドウの構造体のアドレスが無ければ呼ばない（何度来ても）。
+        // フルスクリーンの auto: ゲーム自身の時計へ任せる答え（`HEAD_FALLBACK`）の前では、ウィンドウの構造体のアドレスが無ければ呼ばない（何度来ても）。
         let at = FLAG.as_ptr() as usize as u32;
         FLAG.store(0, Ordering::SeqCst);
         h.arm_pacer(qpf(), &cfg(Mode::Auto), at, 0)
@@ -1351,7 +1413,7 @@ mod tests {
         assert_eq!(pace_head(), HEAD_FALLBACK);
         assert_eq!(hits(), h2, "分母 0 で口を呼んだ");
         WIN[(WINDOW_CLOCK_DIVISOR / 4) as usize].store(divisor, Ordering::SeqCst);
-        // ウィンドウ（b-spin）のフレームではウィンドウの構造体を見ず、今までどおり始める答えの前だけ。箱を置き直す（方式はフレームの最初の始まりでだけ読む）。
+        // ウィンドウ（b-spin）のフレームではウィンドウの構造体を見ず、今までどおり始める答えの前だけ。箱を作り直す（方式はフレームの最初の始まりでだけ読む）。
         FLAG.store(1, Ordering::SeqCst);
         h.arm_pacer(qpf(), &cfg(Mode::Auto), at, WIN.as_ptr() as usize as u32)
             .expect("auto の箱");
@@ -1408,11 +1470,12 @@ mod tests {
         let q = qpf();
         let ev = Event::new().unwrap();
         let waiter = Waiter::new(Arc::new(ev));
-        assert!(waiter.high_resolution(), "高分解能の待機タイマーを作れない");
+        assert!(waiter.high_resolution(), "高分解能の待機タイマーの作成不能");
         let mut clock = RealClock {
             waiter,
             plain: None,
             screen_flag: 0,
+            interval: 0,
             window: 0,
         };
         let mut p = Pacer::new(
@@ -1569,12 +1632,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>(), 32);
     }
 
-    // 何が壊れたら落ちるか: 関数が無い Windows で表なしの経路（Err）を返さず落ちる、または関数を引き当てられない。
     #[test]
     fn a_windows_without_the_cpu_set_function_gives_the_table_less_error() {
         assert!(cpu_set_information_fn().is_some(), "この機械には在るはず");
         let e = cpu_classes_from(None).unwrap_err();
-        assert!(e.contains("GetSystemCpuSetInformation が無い"), "{e}");
+        assert!(e.contains("GetSystemCpuSetInformation がありません"), "{e}");
     }
 
     #[test]

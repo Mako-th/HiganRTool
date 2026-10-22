@@ -1,7 +1,7 @@
-// 更新のエンドポイント。配るバージョンのローダー（HiganRTool.exe）が花映塚を起こす前に、署名つきの目録とファイルを取りに来る。
+// 更新のエンドポイント。配るバージョンのローダー（HiganRTool.exe）が花映塚を起動する前に、署名つきの目録とファイルを取りに来る。
 // このサーバーは中身を持たず、ファイルはいまの配り場所（GitHub の Releases の最新）へ 302 で回す。配り場所は wrangler.jsonc の
 // vars.UPDATE_BASE_URL の 1 値で、変えても配った exe を作り直さずに済む。
-// 目録だけは Worker が配り場所から取り寄せて本文を返す。ローダーの待ちは約 2 秒で、302 を辿ると宿ごとに名前の解決と TLS が要るため。
+// 目録だけは Worker が配り場所から取り寄せて本文を返す。ローダーが目録の応答を待つ時間は約 2 秒で、302 を辿ると宿ごとに名前の解決と TLS が要るため。
 // 取り寄せた目録は MANIFEST_CACHE_MS だけ isolate の中にためる（配り場所への取りに行きが、起動の回数でなく時間あたりになる）。
 // 取り寄せに失敗したら、これまでどおり 302 で回す。
 // 目録は署名つきで、ファイルは目録の SHA-256 と照らされるので、回す先・ためた物が荒らされても署名のない物は使われない。
@@ -11,7 +11,7 @@
 export const MANIFEST_PATH = "/update/manifest";
 /** ファイルのエンドポイントの先頭（Rust の FILES_PATH）。後ろにファイル名が付く。 */
 export const FILES_PREFIX = "/update/files/";
-/** 配り場所に置く目録のファイル名。 */
+/** 配り場所に用意する目録のファイル名。 */
 export const MANIFEST_ASSET = "manifest.txt";
 /** 目録の大きさの上限（Rust の MAX_MANIFEST_BYTES）。越える応答はためも返しもしない。 */
 export const MAX_MANIFEST_BYTES = 8 * 1024;

@@ -1,13 +1,7 @@
-//! マッチの終わりのリプレイの自動保存（pure。unsafe 無し）。ここに置くもの:
-//! - ゲームのスレッドの判断（`Driver::tick`）: 入力の地点で毎 tick、場面とメニューの印を読み、保存を呼ぶか決め、呼ぶ前の確かめ
-//!   （Match か・記録の側か・署名・見積もり）をし、乱数を退避して保存を呼び、書き戻す。ゲームのメモリとゲームの関数は `SaveIo` の向こう
-//!   （本物は `replay_save_win::RealSaveIo`）。確保・ファイル・ロック待ち・パニックしうる添字を置かない。
-//! - 受け渡しの入れ物（`Handoff`。原子変数だけ）: 保管庫のワーカーが準備したパス、ゲームのスレッドが出す対戦の情報（名前のためのもの）と
-//!   保存の記録、呼ばなかった訳の数。
-//! - 保管庫のワーカー（`Worker::step`。ゲームのスレッドの外の 1 本のスレッドで 50 ms ごと）: フォルダを作り、空いている名前を選んで
-//!   0 バイトで押さえ、保存関数と同じ `CreateFileA` の経路で同じファイルに届くかを確かめてからパスを渡す。保存の後に印
-//!   （`higanr_core::replay`）を足す。ファイルは `std::fs`、Win32 が要るもの（ゲームのメモリの exe のフォルダ・`CreateFileA` での
-//!   確かめ）は `VaultOs` の向こう。
+//! マッチの終わりのリプレイの自動保存（pure。unsafe 無し）。ここにあるもの:
+//! - ゲームのスレッドの判断（`Driver::tick`）: 入力の地点で毎 tick、場面とメニューの印を読み、保存を呼ぶか決め、呼ぶ前のチェック（Match か・記録の側か・署名・見積もり）をし、乱数を退避して保存を呼び、書き戻す。ゲームのメモリとゲームの関数は `SaveIo` の向こう（本物は `replay_save_win::RealSaveIo`）。確保・ファイル・ロック待ち・パニックしうる添字を持たない。
+//! - 受け渡しの入れ物（`Handoff`。原子変数だけ）: 保管庫のワーカーが準備したパス、ゲームのスレッドが出す対戦の情報（名前のためのもの）と保存の記録、呼ばなかった訳の数。
+//! - 保管庫のワーカー（`Worker::step`。ゲームのスレッドの外の 1 本のスレッドで 50 ms ごと）: フォルダを作り、空いている名前を選んで 0 バイトで押さえ、保存関数と同じ `CreateFileA` の経路で同じファイルに届くかを検証してからパスを渡す。保存の後に印（`higanr_core::replay`）を足す。ファイルは `std::fs`、Win32 が要るもの（ゲームのメモリの exe のフォルダ・`CreateFileA` での検証）は `VaultOs` の向こう。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
@@ -200,7 +194,7 @@ pub struct MatchInfo {
     pub seat: Seat,
     /// 相手の名前（ネットワークが無ければ空。観戦者も空）。
     pub peer: Name,
-    /// 自分の名前（つながった接続で名乗った値。ネットワークが無ければ空。空の間はワーカーが起動のときの設定の名前を使う）。観戦者は空 ——
+    /// 自分の名前（確立した接続で名乗った値。ネットワークが無ければ空。空の間はワーカーが起動のときの設定の名前を使う）。観戦者は空 ——
     /// 保存は 1P・2P の名前で、印の「自分」だけが起動のときの名前。
     pub own: Name,
     pub watching: Watching,
@@ -282,7 +276,7 @@ pub struct SaveRecord {
     pub manager: u32,
     /// 1P の勝ち数・2P の勝ち数・勝ちに要る数。
     pub wins: [u32; 3],
-    /// 見出しのチャージ型を設定の写しに合わせた結果（保存の直前）。
+    /// 見出しのチャージ型を設定のコピーに合わせた結果（保存の直前）。
     pub charge: ChargeSync,
 }
 
@@ -522,7 +516,7 @@ impl Handoff {
         self.path.as_ptr() as usize as u32
     }
 
-    /// パスを置く（保管庫のワーカー。`ST_PREPARING` の間だけ）。NUL を足して入れ物に収まらなければ false。
+    /// パスを書く（保管庫のワーカー。`ST_PREPARING` の間だけ）。NUL を足して入れ物に収まらなければ false。
     fn put_path(&self, ansi: &[u8]) -> bool {
         if ansi.len() >= PATH_BUF || ansi.contains(&0) {
             return false;
@@ -649,7 +643,7 @@ impl Handoff {
         SaveRecord::from_words(&w)
     }
 
-    /// マッチの記録を置く（ゲームのスレッド。`publish_record` の前に呼ぶ —— ワーカーは `ST_USED` を見てから読む）。
+    /// マッチの記録を書く（ゲームのスレッド。`publish_record` の前に呼ぶ —— ワーカーは `ST_USED` を見てから読む）。
     fn publish_summary(&self, s: &MatchSummary) {
         for (a, v) in self.summary.iter().zip(s.to_words()) {
             a.store(v, Ordering::Relaxed);
@@ -710,7 +704,7 @@ pub trait SaveIo {
     fn completed_rounds(&mut self) -> u32;
     /// いまの tick の値を境目として読む（`completed_rounds` が増えた tick にだけ呼ぶ。席の塊が読めなければその席は `None`）。
     fn read_boundary(&mut self) -> Boundary;
-    /// 保存関数を呼ぶ直前に、見出し `[[0x4A7E64]+8]` のチャージ型（`+0x190` / `+0x191`）を、ゲームの設定の写し `[0x4A7E78]` の
+    /// 保存関数を呼ぶ直前に、見出し `[[0x4A7E64]+8]` のチャージ型（`+0x190` / `+0x191`）を、ゲームの設定のコピー `[0x4A7E78]` の
     /// `+0xB4` / `+0xB5`（生きた試合が使った値）に合わせる。ポインタが 0 か読めないときは書かない。
     fn sync_header_charge(&mut self, rm: u32) -> ChargeSync;
     /// 踏み台で保存関数を呼ぶ。ゲームの見積もりが読む 10 語へ `est.flags`（本当の印）を書いてから見積もりを計算し、`need` より小さければ呼ばない。
@@ -737,7 +731,7 @@ pub enum Attempt {
 const D_BUCKETS: usize = 16;
 
 /// マッチのフレームごとの D の数え。seg の始まりの D は、マッチの途中で D を上げると実際の D と合わない
-/// （つながりの最初に上げたマッチで始まりの D の 1 が `lat` に入った）ので、`lat` はフレームの数が最も多い D にする。
+/// （接続の最初に上げたマッチで始まりの D の 1 が `lat` に入った）ので、`lat` はフレームの数が最も多い D にする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DTally {
     frames: [u32; D_BUCKETS],
@@ -964,7 +958,7 @@ impl Driver {
         let seat = net.map_or(Seat::P1, |n| n.seat);
         let side = side_of(seat);
         let result = result_of(kind, side, wins[0], wins[1], wins[2]);
-        // 見出しは読み込みスレッドが手元の cfg から写したままなので、生きた試合の値に直してから保存する。
+        // 見出しは読み込みスレッドが手元の cfg からコピーしたままなので、生きた試合の値に直してから保存する。
         let charge = io.sync_header_charge(rm);
         let before = io.read_rng();
         let t0 = io.now_us();
@@ -976,7 +970,7 @@ impl Driver {
         let after_call = io.read_rng();
         io.write_rng(&before);
         let after_restore = io.read_rng();
-        // 記録の前に置く: ワーカーは `ST_USED`（`publish_record` が立てる）を見てから読む。
+        // 記録の前に書く: ワーカーは `ST_USED`（`publish_record` が立てる）を見てから読む。
         h.publish_summary(&self.log.summary());
         h.publish_record(&SaveRecord {
             kind,
@@ -1027,9 +1021,9 @@ struct Prepared {
 pub struct Worker {
     pub split: Split,
     /// 起動のときの設定の自分の名前（HELLO と同じく 32 バイトに切ったもの）。ネットワークが無ければ使わない。対戦のフォルダ名と印の「自分」は
-    /// つながった接続で名乗った名前（`MatchInfo::own`）を使い、これはそれが空のときの代わりと観戦者の印の「自分」。
+    /// 確立した接続で名乗った名前（`MatchInfo::own`）を使い、これはそれが空のときの代わりと観戦者の印の「自分」。
     pub self_name: String,
-    /// ネットワークを置いた実行（ini の `[netplay]` が `enable = 1`）。立っていれば、つながっていて相手の名前が分かっている間にだけ名前を
+    /// ネットワークを組み込んだ実行（ini の `[netplay]` が `enable = 1`）。立っていれば、接続していて相手の名前が分かっている間にだけ名前を
     /// 押さえる（`may_reserve`）。単独の実行は今まで通り `1P vs 2P` で押さえる。
     pub net_run: bool,
     out: Box<dyn Write + Send>,
@@ -1099,7 +1093,7 @@ fn hex_bytes(a: &[u8]) -> String {
 }
 
 fn list_names(dir: &Path, dirs: bool) -> Result<Vec<String>, String> {
-    let rd = fs::read_dir(dir).map_err(|e| format!("{} を読めない: {e}", shown_dir(dir)))?;
+    let rd = fs::read_dir(dir).map_err(|e| format!("{} 読み込み不能: {e}", shown_dir(dir)))?;
     let mut out = Vec::new();
     for e in rd.flatten() {
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -1264,7 +1258,7 @@ impl Worker {
         let today = date_of(&os.now());
         let may = self.may_reserve(&info);
         if h.state() == ST_READY {
-            // ネットワークの実行でつながりが終わったときも情報が変わる（net = false・名前が空）ので、ここで使われなかった予約を放す
+            // ネットワークの実行で接続が終わったときも情報が変わる（net = false・名前が空）ので、ここで使われなかった予約を放す
             // （0 バイトのままの、自分が押さえた名前だけを消す）。
             let stale = self.prepared.as_ref().is_none_or(|p| {
                 (p.info_gen != info_gen && p.info != info)
@@ -1274,13 +1268,13 @@ impl Worker {
                 self.release_reservation(if may {
                     "情報が変わった"
                 } else {
-                    "ネットワークの実行で、つながりが終わった（相手の名前が無い）"
+                    "ネットワークの実行で、接続が終わった（相手の名前が無い）"
                 });
                 h.state.store(ST_EMPTY, Ordering::Release);
             }
         }
         self.keep_reservation_fresh(h, os);
-        // ネットワークの実行でつながっていない間は押さえない。つなぎ直しの片づけでネットワークを手放した後に、ゲームのスレッドが「パスが要る」を立て、
+        // ネットワークの実行で接続していない間は押さえない。再接続の片づけでネットワークを手放した後に、ゲームのスレッドが「パスが要る」を立て、
         // 相手の名前の無い情報のまま `1P vs 2P\th9_ud000N.rpy` を 0 バイトで押さえ、マッチが来ずに残ったことがある。
         if h.state() == ST_EMPTY && h.wanted() && may {
             if self.backoff > 0 {
@@ -1298,7 +1292,7 @@ impl Worker {
                 Err(why) => {
                     h.note_outcome(Outcome::PrepFailed);
                     if self.last_error.as_deref() != Some(why.as_str()) {
-                        self.problem(format!("準備: できない（{why}）。2 秒ごとに試し直す"));
+                        self.problem(format!("準備: 不可（{why}）。2 秒ごとに試し直します。"));
                         self.last_error = Some(why);
                     }
                     self.backoff = BACKOFF_STEPS;
@@ -1308,7 +1302,7 @@ impl Worker {
         }
     }
 
-    /// この情報で名前を押さえてよいか。ネットワークの実行では、つながっていて相手の名前が分かっているときだけ（つながっていないマッチは
+    /// この情報で名前を押さえてよいか。ネットワークの実行では、接続していて相手の名前が分かっているときだけ（接続していないマッチは
     /// ネットワークのマッチでないので、保管庫に残さない）。単独の実行はいつでも。観戦者の実行は、観戦しているマッチの 1P・2P の名前を
     /// 受けているときだけ。
     fn may_reserve(&self, info: &MatchInfo) -> bool {
@@ -1319,7 +1313,7 @@ impl Worker {
         }
     }
 
-    /// （自分の名前, 相手の名前）。観戦者の実行では使わない。自分の名前は、つながった接続で名乗った名前（`info.own`）。
+    /// （自分の名前, 相手の名前）。観戦者の実行では使わない。自分の名前は、確立した接続で名乗った名前（`info.own`）。
     /// 空なら起動のときの設定の名前（`self_name`）。
     fn names(&self, info: &MatchInfo) -> (String, String) {
         if info.net {
@@ -1333,8 +1327,8 @@ impl Worker {
         }
     }
 
-    /// （1P の名前, 2P の名前）。フォルダ名（区切り方 `peer` の `<1P> vs <2P>`）の並び。対戦者は自分の席で入れ替え、観戦者は
-    /// 流れの `Name` の記録の 1P・2P のまま。
+    /// （1P の名前, 2P の名前）。フォルダ名（区切り方 `peer` の `<1P> vs <2P>`）の並び。対戦する2人は自分の席で入れ替え、観戦者は
+    /// 観戦の流れで受けた `Name` の記録の 1P・2P のまま。
     fn pair(&self, info: &MatchInfo) -> (String, String) {
         if let Watching::Names([a, b]) = info.watching {
             return (a.as_str().to_string(), b.as_str().to_string());
@@ -1356,12 +1350,12 @@ impl Worker {
     ) -> Result<(), String> {
         let bx = os
             .exe_dir_box()
-            .ok_or("ゲームの exe のフォルダ（0x4ACD08）が読めない")?;
+            .ok_or("ゲームの exe のフォルダ（0x4ACD08）が読み取り不能")?;
         let exe = exe_dir_of(&bx)
-            .map_err(|e| format!("ゲームの exe のフォルダの形が違う（{e:?}）"))?
+            .map_err(|e| format!("ゲームの exe のフォルダの形式が不正（{e:?}）"))?
             .to_vec();
         let exe_str = autosave::decode_cp932(&exe[..exe.len() - 1])
-            .ok_or("exe のフォルダが CP932 で読めない")?;
+            .ok_or("exe のフォルダが CP932 で読み取り不能")?;
         let exe_dir = PathBuf::from(&exe_str);
         let root = exe_dir.join(VAULT_DIR);
         let (p1, p2) = self.pair(&info);
@@ -1378,7 +1372,7 @@ impl Worker {
                 Folder::Sub(s) => (Some(s), None),
                 Folder::Pack50 => {
                     fs::create_dir_all(&root)
-                        .map_err(|e| format!("{} を作れない: {e}", shown_dir(&root)))?;
+                        .map_err(|e| format!("{} の作成不能: {e}", shown_dir(&root)))?;
                     let last = vault::pack50_last_folder(&list_names(&root, true)?);
                     let in_last = match last {
                         Some(n) => {
@@ -1388,14 +1382,14 @@ impl Worker {
                         None => Vec::new(),
                     };
                     let (n, f) = vault::pack50_next(last, &in_last)
-                        .ok_or("pack50 のフォルダの番号が 9999 を越える")?;
+                        .ok_or("pack50 のフォルダの番号が 9999 を超えます")?;
                     (Some(vault::pack50_folder_name(n)), Some(f))
                 }
             };
         if let Some(f) = &folder
             && !autosave::is_single_part(f)
         {
-            return Err("フォルダ名が 1 つの部品でない".to_string());
+            return Err("フォルダ名が 1 つの要素ではありません".to_string());
         }
         let dir = match &folder {
             Some(f) => root.join(f),
@@ -1405,9 +1399,9 @@ impl Worker {
         if !is_same_or_inside(&dir.to_string_lossy(), &root.to_string_lossy())
             || !is_same_or_inside(&root.to_string_lossy(), &exe_dir.to_string_lossy())
         {
-            return Err(format!("{} が保管庫の中でない", shown_dir(&dir)));
+            return Err(format!("{} が保管庫の中ではありません", shown_dir(&dir)));
         }
-        fs::create_dir_all(&dir).map_err(|e| format!("{} を作れない: {e}", shown_dir(&dir)))?;
+        fs::create_dir_all(&dir).map_err(|e| format!("{} の作成不能: {e}", shown_dir(&dir)))?;
         // 前の実行が放さずに残した 0 バイトの予約を先に消す（消さないと番号が 1 つずつ飛び、0 バイトの名前が溜まる）。
         let (gone, failed) = self.sweep_stale(&dir, &root, std::time::SystemTime::now());
         if !gone.is_empty() || failed > 0 {
@@ -1426,7 +1420,7 @@ impl Worker {
             let name = match &fixed_file {
                 Some(f) => f.clone(),
                 None => vault::next_ud_name(&list_names(&dir, false)?)
-                    .ok_or("th9_ud9999.rpy まで埋まっている")?,
+                    .ok_or("th9_ud9999.rpy まで使用済みです")?,
             };
             let path = dir.join(&name);
             match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -1438,32 +1432,32 @@ impl Worker {
                 Err(e) if e.kind() == ErrorKind::AlreadyExists && fixed_file.is_none() => {
                     continue;
                 }
-                Err(e) => return Err(format!("{} を押さえられない: {e}", shown_file(&path))),
+                Err(e) => return Err(format!("{} を確保できません: {e}", shown_file(&path))),
             }
         }
-        let (name, path, file) = reserved.ok_or("空いている名前を押さえられない（5 回）")?;
+        let (name, path, file) = reserved.ok_or("空いている名前を確保できません（5 回）")?;
         let give_up = |why: String| {
             let _ = fs::remove_file(&path);
             Err(why)
         };
         let ansi = match autosave::ansi_vault_path(&exe, folder.as_deref(), &name) {
             Ok(a) => a,
-            Err(e) => return give_up(format!("保存関数へ渡すパスを作れない（{e:?}）")),
+            Err(e) => return give_up(format!("保存関数へ渡すパスを作成できません（{e:?}）")),
         };
         match os.same_file_ansi(&ansi, &file) {
             Ok(true) => {}
             Ok(false) => {
                 return give_up(format!(
-                    "CP932 のパス（{} バイト）で開くと、押さえた {} と別のファイルになる",
+                    "CP932 のパス（{} バイト）で開くと、確保した {} と別のファイルになります",
                     ansi.len(),
                     shown_file(&path)
                 ));
             }
-            Err(e) => return give_up(format!("CP932 のパスで開けない（{e}）")),
+            Err(e) => return give_up(format!("CP932 のパスを開けません（{e}）")),
         }
         drop(file);
         if !h.put_path(&ansi) {
-            return give_up("パスが入れ物に入らない".to_string());
+            return give_up("パスが入れ物に収まりません".to_string());
         }
         let _ = writeln!(
             self.out,
@@ -1493,14 +1487,14 @@ impl Worker {
 
     fn finish_save(&mut self, h: &Handoff) {
         let Some(r) = h.read_record() else {
-            self.problem("★ 保存の記録が読めない（結果の番号が範囲の外）".to_string());
+            self.problem("★ 保存の記録の読み取り不能（結果の番号が範囲の外）".to_string());
             h.state.store(ST_READY, Ordering::Release);
             return;
         };
         self.saves += 1;
         self.log_record(&r, h.attempts());
         let Some(p) = self.prepared.clone() else {
-            self.problem("★ 準備の控えが無いのに記録が来た".to_string());
+            self.problem("★ 準備のデータが無いのに、保存の記録が来ました。".to_string());
             h.state.store(ST_EMPTY, Ordering::Release);
             return;
         };
@@ -1513,7 +1507,7 @@ impl Worker {
         if len == 0 {
             h.note_outcome(Outcome::EmptyFile);
             self.problem(format!(
-                "★ ゲームが {} に書かなかった（0 バイト。開けなかった見込み）。同じ名前を次にも使う",
+                "★ ゲームが {} に書きませんでした（0 バイト。開けなかった見込み）。同じ名前を次にも使います。",
                 shown_file(&p.file)
             ));
             h.state.store(ST_READY, Ordering::Release);
@@ -1536,7 +1530,7 @@ impl Worker {
             }
             Err(why) => {
                 h.note_outcome(Outcome::MarkFailed);
-                self.problem(format!("★ 印を足せない（{why}）: {}", shown_file(&p.file)));
+                self.problem(format!("★ 印の追加不能（{why}）: {}", shown_file(&p.file)));
             }
         }
         self.prepared = None;
@@ -1584,18 +1578,19 @@ impl Worker {
     }
 
     fn append_mark(&mut self, file: &Path, mark: &Mark) -> Result<usize, String> {
-        let bytes = fs::read(file).map_err(|e| format!("読めない: {e}"))?;
+        let bytes = fs::read(file).map_err(|e| format!("読み込み不能: {e}"))?;
         let chunk = replay::chunk_to_append(&bytes, mark).map_err(|e| format!("{e:?}"))?;
         let mut f = OpenOptions::new()
             .append(true)
             .open(file)
-            .map_err(|e| format!("足すファイルを開けない: {e}"))?;
-        f.write_all(&chunk).map_err(|e| format!("書けない: {e}"))?;
+            .map_err(|e| format!("追記するファイルを開けません: {e}"))?;
+        f.write_all(&chunk)
+            .map_err(|e| format!("書き込み不能: {e}"))?;
         drop(f);
-        let back = fs::read(file).map_err(|e| format!("読み戻せない: {e}"))?;
+        let back = fs::read(file).map_err(|e| format!("読み戻し不能: {e}"))?;
         match replay::read_mark(&back) {
             Ok(MarkRead::Found(m)) if &m == mark => Ok(chunk.len()),
-            other => Err(format!("読み戻した印が違う（{other:?}）")),
+            other => Err(format!("読み戻した印が不一致（{other:?}）")),
         }
     }
 
@@ -1734,13 +1729,15 @@ impl Worker {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(dev_assets)]
     use crate::th09_addr::{
-        EXE_DIR, EXE_DIR_LEN, GAME_MODE, LOADING, MATCH_END_MENU, P1_WINS, P2_WINS,
+        EXE_DIR, GAME_MODE, LOADING, MATCH_END_MENU, MENU_SAVE_EST_LOOP, P1_WINS, P2_WINS,
         REPLAY_HEADER_PTR, REPLAY_HEADER_STAGE_FLAGS, REPLAY_MANAGER_PTR, REPLAY_MODE,
         REPLAY_NODE_NEXT, REPLAY_SAVE_FN, REPLAY_SAVE_FRAME_SHIFT, REPLAY_SAVE_SIG,
-        REPLAY_STAGE_NODES, REPLAY_STAGE_STRIDE, ROUNDS_REQUIRED, SAVE_EST_BASE,
-        SAVE_EST_BASE_SITE, SAVE_EST_FLAGS_EBP,
+        REPLAY_STAGE_NODES, REPLAY_STAGE_STRIDE, ROUNDS_REQUIRED, SAVE_EST_BASE_SITE,
+        SAVE_EST_FLAGS_EBP,
     };
+    use crate::th09_addr::{EXE_DIR_LEN, SAVE_EST_BASE};
     use higanr_core::autosave::NAME_LEN;
     use higanr_core::replay_detail::{SyncKind, Winner};
     use std::sync::{Arc, Mutex};
@@ -1960,7 +1957,6 @@ pub(crate) mod tests {
         assert_eq!(g.calls, 1);
     }
 
-    /// 壊れたら落ちる: 保存の前に見出しを直さない・保存の後に直す・パスを取れない tick で直す・記録に結果を残さない。
     #[test]
     fn the_header_charge_is_synced_right_before_the_call_and_only_when_calling() {
         let h = Handoff::new();
@@ -1978,7 +1974,6 @@ pub(crate) mod tests {
         assert_eq!(r.charge, ChargeSync::Written { p1: 1, p2: 0 });
     }
 
-    /// 壊れたら落ちる: 席の入れ替え・書けなかったのに印へ残す・失敗を数えない。
     #[test]
     fn the_mark_keeps_the_charge_that_was_written_and_a_failure_is_counted() {
         for (charge, want, failed) in [
@@ -2468,8 +2463,7 @@ pub(crate) mod tests {
         assert!(t.most_used().is_some());
     }
 
-    // 何が壊れたら落ちるか: `lat` が seg の始まりの D や保存のときの D に戻る（始まりの D が 1 で、すぐ 3 に上げたマッチが `lat = 1` と
-    // 書かれた）。保存の tick の D（5）はマッチの大半（3）と違う値にしてある。
+    // 保存の tick の D（5）はマッチの大半（3）と違う値にしてある。
     #[test]
     fn lat_is_the_d_used_for_most_of_the_match() {
         let h = Handoff::new();
@@ -2545,7 +2539,7 @@ pub(crate) mod tests {
         d
     }
 
-    /// 検査の「exe のフォルダ」（一時ディレクトリ）と、保存関数の `CreateFileA` の代わり。
+    /// 検査の「exe のフォルダ」（一時フォルダ）と、保存関数の `CreateFileA` の代わり。
     pub(crate) struct FakeOs {
         exe_box: Option<Vec<u8>>,
         same: Result<bool, String>,
@@ -2736,7 +2730,11 @@ pub(crate) mod tests {
         os.same = Ok(false);
         w.step(&h, &mut os);
         assert_eq!(h.state(), ST_EMPTY);
-        assert!(log.text().contains("別のファイルになる"), "{}", log.text());
+        assert!(
+            log.text().contains("別のファイルになります"),
+            "{}",
+            log.text()
+        );
         assert_eq!(h.outcome_counts()[Outcome::PrepFailed as usize], 1);
         assert_eq!(h.outcome_counts()[Outcome::Saved as usize], 0);
         assert!(
@@ -2752,7 +2750,7 @@ pub(crate) mod tests {
             os.exe_box = Some(bx);
             w.step(&h, &mut os);
             assert_eq!(h.state(), ST_EMPTY);
-            assert!(log.text().contains("形が違う"), "{}", log.text());
+            assert!(log.text().contains("形式が不正"), "{}", log.text());
             assert!(!d2.join(VAULT_DIR).exists());
             let _ = fs::remove_dir_all(&d2);
         }
@@ -2791,7 +2789,7 @@ pub(crate) mod tests {
         assert_eq!(h.state(), ST_USED);
         w.step(&h, &mut os);
         assert_eq!(h.state(), ST_READY);
-        assert!(log.text().contains("書かなかった"), "{}", log.text());
+        assert!(log.text().contains("書きませんでした"), "{}", log.text());
         assert_eq!(h.path_bytes(), os.asked[0], "同じ名前を次にも使う");
         g.menu = 0;
         g.req = 10;
@@ -2846,7 +2844,6 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 壊れたら落ちる: 保存の失敗の理由が、簡潔なログ（ワーカーのログを捨てる）に流れない。失敗でない行が流れる。
     #[test]
     fn save_failures_go_to_the_problem_sink_as_well_as_the_worker_log() {
         use std::sync::{Arc, Mutex};
@@ -2854,15 +2851,15 @@ pub(crate) mod tests {
         let (w, log) = worker(Split::Peer);
         let sink = Arc::clone(&seen);
         let mut w = w.with_problem_sink(Box::new(move |l| sink.lock().unwrap().push(l)));
-        w.problem("★ 印を足せない（理由）: th9_ud0001.rpy".to_string());
+        w.problem("★ 印の追加不能（理由）: th9_ud0001.rpy".to_string());
         assert!(
-            log.text().contains("★ 印を足せない（理由）"),
+            log.text().contains("★ 印の追加不能（理由）"),
             "{}",
             log.text()
         );
         assert_eq!(
             *seen.lock().unwrap(),
-            vec!["自動保存: ★ 印を足せない（理由）: th9_ud0001.rpy".to_string()]
+            vec!["自動保存: ★ 印の追加不能（理由）: th9_ud0001.rpy".to_string()]
         );
         // 失敗の 5 か所（準備の失敗・記録が読めない・バックアップが無い・0 バイト・印を足せない）が全部この入口を通る。
         let src = include_str!("replay_save.rs");
@@ -3444,7 +3441,7 @@ pub(crate) mod tests {
         assert!(!own.exists(), "使われなかった予約を残した: {}", log.text());
         assert!(
             log.text()
-                .contains("つながりが終わった（相手の名前が無い）ので"),
+                .contains("接続が終わった（相手の名前が無い）ので"),
             "{}",
             log.text()
         );
@@ -3633,7 +3630,7 @@ pub(crate) mod tests {
         let log = run_session(&mut host);
         assert_eq!(host.events.last(), Some(&"start"));
         assert!(
-            log.contains("自動保存: 入れられない（合成の失敗）"),
+            log.contains("自動保存: 入れられません（合成の失敗）"),
             "{log}"
         );
         let mut host = ReplayHost {
@@ -3645,6 +3642,7 @@ pub(crate) mod tests {
         assert_eq!(host.events, vec!["read"]);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn ini_samples_turn_the_saver_on() {
         for text in [
@@ -3803,7 +3801,7 @@ pub(crate) mod tests {
             ..net_view("あいて")
         };
         d.tick(&h, &mut g, Some(nv));
-        // フレームの始まりに見えるのは予測の tick の後の状態。そこで終わっていたラウンドは、書き戻しで消えるかもしれないので積まない。
+        // フレームの始まりに見えるのは予測の tick の後の状態。そこで終わっていたラウンドは、ロールバックの書き戻しで消えるかもしれないので積まない。
         g.round_frames = 500;
         g.completed = 1;
         g.wins = [1, 0, 2];
@@ -3811,13 +3809,13 @@ pub(crate) mod tests {
         d.tick(&h, &mut g, Some(nv));
         assert_eq!(g.boundary_reads, 0, "予測の状態の境目を読んだ");
         assert_eq!(d.summary().rounds[0], None);
-        // 書き戻し。
+        // ロールバックが、予測の状態を確定した状態へ書き戻す。
         g.completed = 0;
         g.wins = [0, 0, 2];
         g.round_frames = 480;
         d.tick(&h, &mut g, Some(nv));
         assert_eq!(d.summary().rounds[0], None);
-        // 確定の語で進め直すと、別の tick（別の勝者）でラウンドが終わった。確定した tick の後で読む。
+        // 確定の入力で進め直すと、別の tick（別の勝者）でラウンドが終わった。確定した tick の後で読む。
         g.round_frames = 503;
         g.completed = 1;
         g.wins = [0, 1, 2];
@@ -4239,7 +4237,6 @@ pub(crate) mod tests {
         assert_eq!(read_sides(&mut m, pp, sp)[0], None);
     }
 
-    /// 壊れたら落ちる: マッチの記録が Handoff を通ってワーカーに届く（語のコピーの取りこぼし）。
     #[test]
     fn the_summary_reaches_the_worker_through_the_handoff() {
         let h = Handoff::new();
@@ -4277,6 +4274,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn addresses_appear_in_the_note() {
         const NOTE: &str = include_str!("../../../analysis/notes/th09_replay_save_M5b.md");
@@ -4297,7 +4295,7 @@ pub(crate) mod tests {
             ),
             format!(
                 "`0x{:X} mov -0x{SAVE_EST_FLAGS_EBP:x}(%ebp,%esi,4),%eax`",
-                0x0042_0CA0
+                MENU_SAVE_EST_LOOP
             ),
             format!("`0x00420CAB add $0x{SAVE_EST_PER_STAGE:x},%ecx`"),
             format!("`0x00420CB7 add $0x{SAVE_EST_PER_CHUNK:x},%ecx`"),

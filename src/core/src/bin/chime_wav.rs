@@ -1,4 +1,4 @@
-//! 繋がった知らせの音（`higanr_core::chime`）を WAV に書き出して試し聴きする道具。
+//! 接続した知らせの音（`higanr_core::chime`）を WAV に書き出して試し聴きするツール。
 //! `cargo run --release -p higanr_core --bin chime_wav -- <出力.wav>`。同名のファイルがあれば断る。
 #![forbid(unsafe_code)]
 

@@ -1,10 +1,7 @@
 //! 画面の右下に文字を描くための pure な部分: 文字の表（アトラス）の割り付け、GDI が描いた面から
 //! テクスチャの画素を作る変換、1 行の頂点（TL の 2D）の組み立て、表示する 1 行の文、ini の `[overlay]` の読み方。
 //! D3D8 を呼ぶ層は `src/dll/src/overlay_win.rs`、受け渡しのバッファと読み取りのスレッドは `src/dll/src/overlay.rs`。
-//!
-//! `layout_line` / `layout_lines` はゲームのスレッドで毎フレーム呼ぶので、確保もパニックもしない
-//! （出力は呼び出し側の固定の配列）。ほかはヒープを使ってよい。
-//!
+//! `layout_line` / `layout_lines` はゲームのスレッドで毎フレーム呼ぶので、確保もパニックもしない（出力は呼び出し側の固定の配列）。ほかはヒープを使ってよい。
 //! 文字の表は半角 1 枠・全角 2 枠（`glyph_cells`）で、文字は `UI_LINES` の文言から作る（`ui_glyphs`）。
 //! 英数字（`0x21`〜`0x7E`、`` ` `` を除く）はゲーム自身の ascii.anm の文字の絵を 1 回だけ読み取って
 //! 「ゲームの文字の枠」（`GameBlock`）へコピーして使う。コピーする前・コピーできない文字は GDI の枠のまま。
@@ -44,7 +41,7 @@ const _: () = assert!(FVF == 0x144);
 /// 改行も 1 単位）。128 の根拠: 画面の 1 行に全角で約 45 文字入るので約 3 行ぶん。バッファは二重で 512 バイトで済み、
 /// 毎フレーム 0 で初期化する頂点の配列（`MAX_VERTS_ALL` × 28 バイト）も約 22 KB に収まる。
 pub const MAX_TEXT: usize = 128;
-/// バッファの文を UTF-8 に直したときのバイト数の上限（1 単位は最大 3 バイト）。ゲームのスレッドがスタックに置く書き先の大きさ。
+/// バッファの文を UTF-8 に直したときのバイト数の上限（1 単位は最大 3 バイト）。ゲームのスレッドがスタックに持つ書き先の大きさ。
 pub const MAX_TEXT_UTF8: usize = MAX_TEXT * 3;
 /// 1 行に要る頂点の数の上限（文字ごとに 2 つの三角形 = 6 頂点、下地の四角形も 6 頂点）。
 pub const MAX_VERTS: usize = (MAX_TEXT + 1) * 6;
@@ -164,7 +161,7 @@ pub const UI_LINES: &[&str] = &[
     "再戦",
     "はい",
     "いいえ",
-    // ローダーのウィンドウ・本ログの「窓の文」。
+    // ローダーのウィンドウ・本ログの「ウィンドウの文」。
     "これは自分の接続コードです。相手から届いたコードを貼ってください。",
     "相手から届くコードを待っています。",
     "相手から返ってくるコードを待っています（自分のコードは30分で使えなくなります）。",
@@ -239,7 +236,7 @@ struct Placed {
 }
 
 /// 文字の表の割り付け。枠の高さは全部同じで、幅は半角 1 枠（`cell_w`）か全角 2 枠。左上から横に `cols` 枠ぶんずつ文字の順に
-/// 詰める（全角が行の終わりに入らなければ次の行へ）。文字の枠の後ろに全面不透明の「塗り」の枠（半角 1 枠）を 1 つ置く
+/// 詰める（全角が行の終わりに入らなければ次の行へ）。文字の枠の後ろに全面不透明の「塗り」の枠（半角 1 枠）を 1 つ付ける
 /// （下地の四角形が貼る。テクスチャを替えずに 1 回の `DrawPrimitiveUP` で下地と文字を描くため）。
 /// ASCII だけの表は、文字 `i` が `i` 番目の枠に入る。
 ///
@@ -310,15 +307,15 @@ impl AtlasSpec {
         reserve_game: bool,
     ) -> Result<AtlasSpec, String> {
         if cell_w == 0 || cell_h == 0 || cell_w > 64 || cell_h > 64 {
-            return Err(format!("文字の枠 {cell_w}×{cell_h} は 1〜64 の外"));
+            return Err(format!("文字の枠 {cell_w}×{cell_h} は 1〜64 の範囲外です"));
         }
         if cols < 2 {
             return Err(format!(
-                "1 行の枠の数 {cols} が 2 未満（全角の文字が入らない）"
+                "1 行の枠の数 {cols} が 2 未満です（全角の文字が入りません）"
             ));
         }
         if glyphs.is_empty() || glyphs.windows(2).any(|w| w[0] >= w[1]) {
-            return Err("文字の表が空か、小さい順に並んでいない".to_string());
+            return Err("文字の表が空か小さい順に並んでいません".to_string());
         }
         let mut placed = Vec::with_capacity(glyphs.len() + 1);
         let (mut col, mut row) = (0u32, 0u32);
@@ -339,7 +336,7 @@ impl AtlasSpec {
             col += cells;
         }
         let rows = row + 1;
-        // ゲームの文字の塊は文字の枠の行の真下に置く。塊の幅が広ければテクスチャの幅を広げる。
+        // ゲームの文字の塊は文字の枠の行の真下に配置する。塊の幅が広ければテクスチャの幅を広げる。
         let block = reserve_game.then_some(GameBlock {
             x: 0,
             y: rows * cell_h,
@@ -357,7 +354,7 @@ impl AtlasSpec {
         let tex_h = (rows * cell_h).max(block_bottom).next_power_of_two();
         if tex_w > MAX_TEX_SIDE || tex_h > MAX_TEX_SIDE {
             return Err(format!(
-                "文字の表のテクスチャ {tex_w}×{tex_h} が上限 {MAX_TEX_SIDE} を越える"
+                "文字の表のテクスチャ {tex_w}×{tex_h} が上限 {MAX_TEX_SIDE} を超えます"
             ));
         }
         Ok(AtlasSpec {
@@ -406,7 +403,7 @@ impl AtlasSpec {
                 }
             }
         }
-        best.ok_or_else(|| first_err.unwrap_or_else(|| "文字の表を割り付けられない".to_string()))
+        best.ok_or_else(|| first_err.unwrap_or_else(|| "文字の表を割り付けられません".to_string()))
     }
 
     pub fn solid_slot(&self) -> u32 {
@@ -459,7 +456,7 @@ impl AtlasSpec {
     pub fn with_game_font(&self, font: GameFont) -> Result<AtlasSpec, String> {
         let b = self
             .game_block
-            .ok_or("ゲームの文字の枠を予約していない表に、絵をコピーできない")?;
+            .ok_or("ゲームの文字の枠を予約していない表に絵をコピーできません")?;
         if font.sizes.len() != GAME_GLYPHS {
             return Err(format!(
                 "ゲームの文字の大きさの表が {} 文字ぶん（{GAME_GLYPHS} 文字ぶんのはず）",
@@ -494,11 +491,11 @@ impl AtlasSpec {
 pub fn coverage_from_bgrx(bits: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     let n = (w as usize)
         .checked_mul(h as usize)
-        .ok_or("面の大きさが大きすぎる")?;
-    let need = n.checked_mul(4).ok_or("面の大きさが大きすぎる")?;
+        .ok_or("面の大きさが大きすぎます")?;
+    let need = n.checked_mul(4).ok_or("面の大きさが大きすぎます")?;
     if bits.len() < need {
         return Err(format!(
-            "面のバイト数 {} が {w}×{h}×4 = {need} に足りない",
+            "面のバイト数 {} が {w}×{h}×4 = {need} に足りません",
             bits.len()
         ));
     }
@@ -514,13 +511,13 @@ pub fn coverage_from_bgrx(bits: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String
 /// （`CreateFontA(2h, …)` —— `0x004364C0`）ので、それに合わせる。割り切れない・長さが合わないときは断る。
 pub fn downscale_coverage(src: &[u8], w: u32, h: u32, factor: u32) -> Result<Vec<u8>, String> {
     if factor == 0 || !w.is_multiple_of(factor) || !h.is_multiple_of(factor) {
-        return Err(format!("面 {w}×{h} を 1/{factor} に縮められない"));
+        return Err(format!("面 {w}×{h} を 1/{factor} に縮められません"));
     }
     let need = (w as usize)
         .checked_mul(h as usize)
-        .ok_or("面の大きさが大きすぎる")?;
+        .ok_or("面の大きさが大きすぎます")?;
     if src.len() != need {
-        return Err(format!("濃さの画素の数 {} が {w}×{h} と違う", src.len()));
+        return Err(format!("濃さの画素の数 {} が {w}×{h} と不一致", src.len()));
     }
     let (ow, oh, f) = (
         (w / factor) as usize,
@@ -548,7 +545,7 @@ pub fn texels(spec: &AtlasSpec, coverage: &[u8]) -> Result<Vec<u32>, String> {
     let n = spec.texel_count();
     if coverage.len() != n {
         return Err(format!(
-            "濃さの画素の数 {} がテクスチャ {}×{} と違う",
+            "濃さの画素の数 {} がテクスチャ {}×{} と不一致",
             coverage.len(),
             spec.tex_w,
             spec.tex_h
@@ -575,7 +572,7 @@ pub fn texels(spec: &AtlasSpec, coverage: &[u8]) -> Result<Vec<u32>, String> {
 pub fn center_narrow_wide_glyphs(spec: &AtlasSpec, coverage: &mut [u8]) -> Result<(), String> {
     if coverage.len() != spec.texel_count() {
         return Err(format!(
-            "濃さの画素の数 {} がテクスチャ {}×{} と違う",
+            "濃さの画素の数 {} がテクスチャ {}×{} と不一致",
             coverage.len(),
             spec.tex_w,
             spec.tex_h
@@ -772,7 +769,7 @@ pub fn extract_rect_argb(
 pub fn resample_argb(src: &[u32], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u32>, String> {
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() != sw as usize * sh as usize {
         return Err(format!(
-            "縮尺の元 {sw}×{sh}（画素 {}）か先 {dw}×{dh} が変",
+            "縮小の元 {sw}×{sh}（画素 {}）か先 {dw}×{dh} が不正です",
             src.len()
         ));
     }
@@ -827,7 +824,7 @@ fn game_draw_size(g: &GameGlyphSrc, b: &GameBlock) -> (u32, u32) {
 }
 
 /// 予約した表 `spec`（と画素 `texels`）に、読み取った文字の絵をコピーした表と画素を返す（元は変えない）。絵が描く大きさ
-/// と違えば `resample_argb` で合わせて枠へ置く。塊の全面は先に透明にする。範囲の外の文字・同じ文字が 2 つ・
+/// と違えば `resample_argb` で合わせて枠へ書く。塊の全面は先に透明にする。範囲の外の文字・同じ文字が 2 つ・
 /// 画素の数が合わない・枠より大きい・1 文字も無いときは断る。
 pub fn apply_game_font(
     spec: &AtlasSpec,
@@ -837,10 +834,10 @@ pub fn apply_game_font(
 ) -> Result<(AtlasSpec, Vec<u32>), String> {
     let b = spec
         .game_block
-        .ok_or("ゲームの文字の枠を予約していない表に、絵をコピーできない")?;
+        .ok_or("ゲームの文字の枠を予約していない表に絵をコピーできません")?;
     if texels.len() != spec.texel_count() {
         return Err(format!(
-            "画素の数 {} が文字の表 {}×{} と違う",
+            "画素の数 {} が文字の表 {}×{} と不一致",
             texels.len(),
             spec.tex_w,
             spec.tex_h
@@ -857,13 +854,13 @@ pub fn apply_game_font(
     let mut sizes = vec![(0u32, 0u32); GAME_GLYPHS];
     for g in glyphs {
         let i =
-            game_index(g.c).ok_or_else(|| format!("文字 {:?} はゲームの文字の範囲の外", g.c))?;
+            game_index(g.c).ok_or_else(|| format!("文字 {:?} はゲームの文字の範囲外です", g.c))?;
         if sizes[i].0 != 0 {
-            return Err(format!("文字 {:?} が 2 つある", g.c));
+            return Err(format!("文字 {:?} が重複しています", g.c));
         }
         if g.w == 0 || g.h == 0 || g.pixels.len() != g.w as usize * g.h as usize {
             return Err(format!(
-                "文字 {:?} の絵 {}×{}（画素 {}）が変",
+                "文字 {:?} の絵 {}×{}（画素 {}）が不正です",
                 g.c,
                 g.w,
                 g.h,
@@ -873,7 +870,7 @@ pub fn apply_game_font(
         let (dw, dh) = game_draw_size(g, &b);
         if dw > b.slot_w || dh > b.slot_h {
             return Err(format!(
-                "文字 {:?} の絵 {dw}×{dh} が枠 {}×{} より大きい",
+                "文字 {:?} の絵 {dw}×{dh} が枠 {}×{} より大きいです",
                 g.c, b.slot_w, b.slot_h
             ));
         }
@@ -886,12 +883,12 @@ pub fn apply_game_font(
         };
         let (ox, oy) = spec
             .game_slot_origin(i)
-            .ok_or("ゲームの文字の枠の位置を出せない")?;
+            .ok_or("ゲームの文字の枠の位置を算出できません")?;
         for row in 0..dh as usize {
             let at = (oy as usize + row) * tw + ox as usize;
             let dst = out
                 .get_mut(at..at + dw as usize)
-                .ok_or("ゲームの文字の枠が文字の表の外")?;
+                .ok_or("ゲームの文字の枠が文字の表の範囲外です")?;
             dst.copy_from_slice(&px[row * dw as usize..][..dw as usize]);
         }
         sizes[i] = (dw, dh);
@@ -1001,9 +998,9 @@ pub(crate) fn resolve(spec: &AtlasSpec, c: char, fallback: Option<u32>) -> (u32,
     }
 }
 
-/// ゲームの文字の絵を置く左端。絵は送り（`GameFont::advance`）より広く、左端を送りの枠に合わせると墨が右へ寄る
+/// ゲームの文字の絵を描く左端。絵は送り（`GameFont::advance`）より広く、左端を送りの枠に合わせると墨が右へ寄る
 /// （GDI の文字と並べると「◀ 値 ▶」の値が右へ寄って見える）ので、絵の横の真ん中を送りの枠の真ん中に揃える。
-/// ずらす量は整数の画素に切り捨てる（半端な位置に置くと文字の絵が画素の境目で崩れる）。
+/// ずらす量は整数の画素に切り捨てる（半端な位置に描くと文字の絵が画素の境目で崩れる）。
 pub(crate) fn game_glyph_left(spec: &AtlasSpec, gx: f32, g: &GameGlyph) -> f32 {
     let advance = spec.game.as_ref().map_or(g.w, |f| f.advance);
     gx - (g.w.saturating_sub(advance) / 2) as f32
@@ -1048,11 +1045,11 @@ pub(crate) fn resolve_small(spec: &AtlasSpec, c: char, _fallback: Option<u32>) -
     }
 }
 
-/// 1 行 `text` を画面（`screen_w` × `screen_h`）の右下に置き、下地と文字の四角形の頂点を `out` に書いて、
+/// 1 行 `text` を画面（`screen_w` × `screen_h`）の右下に配置し、下地と文字の四角形の頂点を `out` に書いて、
 /// 書いた頂点の数（6 の倍数）を返す。`D3DPT_TRIANGLELIST` で描く。改行は扱わない（複数行は `layout_lines`）。
 ///
 /// - 文字の数は `MAX_TEXT`・`out` に入る数・画面の幅に入る数のうち小さい方で切る（後ろを落とす）。
-/// - 空白は四角形を置かずに 1 枠ぶん進む。表に無い文字は `?` で描く（進む幅は 1 枠）。
+/// - 空白は四角形を作らずに 1 枠ぶん進む。表に無い文字は `?` で描く（進む幅は 1 枠）。
 /// - 画面が狭くて下地が収まらない・`out` に下地も入らない・文字が 0 文字なら 0 を返す。
 ///
 /// 確保もパニックもしない（毎フレーム呼ぶ）。
@@ -1391,7 +1388,7 @@ pub fn enabled_in_ini(ini: &Ini) -> Result<bool, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -1399,7 +1396,7 @@ pub fn enabled_in_ini(ini: &Ini) -> Result<bool, String> {
     match ini.get(SECTION, "enable") {
         Some("1") => Ok(true),
         Some("0") | None => Ok(false),
-        Some(v) => Err(format!("enable の値 {v:?} は 0 か 1")),
+        Some(v) => Err(format!("enable の値 {v:?} は 0 か 1 にしてください")),
     }
 }
 
@@ -1410,14 +1407,14 @@ pub fn game_ui_in_ini(ini: &Ini) -> bool {
     ini.get("netplay", "enable") == Some("1") && ini.get("netplay", "code_side") == Some("game")
 }
 
-/// `[overlay] preview = 1`（実機で見本を撮る旗）。読み方は `enabled_in_ini` と同じ。立っていると、ゲームの文字をコピーした後の
+/// `[overlay] preview = 1`（実機で見本を撮る旗）。読み方は `enabled_in_ini` と同じ。立っていると、呼び出し元（DLL）が、ゲームの文字をコピーした後の
 /// 文字の表と見本の行を PNG にして本ログの隣へ書き、右下に `PREVIEW_SCREEN_TEXT` を出す。
 pub fn preview_in_ini(ini: &Ini) -> Result<bool, String> {
     enabled_in_ini(ini)?;
     match ini.get(SECTION, "preview") {
         Some("1") => Ok(true),
         Some("0") | None => Ok(false),
-        Some(v) => Err(format!("preview の値 {v:?} は 0 か 1")),
+        Some(v) => Err(format!("preview の値 {v:?} は 0 か 1 にしてください")),
     }
 }
 
@@ -1755,7 +1752,7 @@ mod tests {
         AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap()
     }
 
-    /// 枠 `slot` の行 `y` に、枠の左から `x0..x1` の列だけ濃さ 200 を置く。
+    /// 枠 `slot` の行 `y` に、枠の左から `x0..x1` の列だけ濃さ 200 を書く。
     fn ink(s: &AtlasSpec, cov: &mut [u8], slot: u32, y: u32, x0: u32, x1: u32) {
         let (ox, oy) = s.cell_origin(slot);
         for x in x0..x1 {
@@ -2409,7 +2406,7 @@ mod tests {
         (s, t)
     }
 
-    /// 全部の文字を `w` × `h` の一色（`0xFF000000 | 字`）で写した表。
+    /// 全部の文字を `w` × `h` の一色（`0xFF000000 | 文字`）で作った表。
     fn game_atlas(w: u32, h: u32) -> (AtlasSpec, Vec<u32>) {
         let (s, t) = game_base();
         let px: Vec<(char, Vec<u32>)> = (0x21u8..=0x7E)

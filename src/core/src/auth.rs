@@ -5,12 +5,8 @@
 //! - タグ: `HMAC-SHA256(K, ヘッダ ‖ 本文)` の先頭 16 バイト。比べは crate の定数時間の検証（`Mac::verify_truncated_left`）。
 //!
 //! 暗号は自作しない: RustCrypto の `hmac` 0.13 と `sha2` 0.11（どちらも MIT OR Apache-2.0）を呼ぶ形をここにまとめる。
-//!
-//! ヒープを使わない: タグはゲームスレッドで 1 通ごとに作る・比べる。鍵を入れ終えた HMAC の状態（数百バイト）を
-//! `AuthKey` に持ち、1 通ごとにそれをスタックの上でコピーしてから本文を足す。鍵から作り直すと圧縮が 2 回余計にかかる。
-//!
-//! 鍵の長さ: HMAC は 64 バイト（SHA-256 のブロック長）より短い鍵を 0 で足して使う（RFC 2104）。ここで入れる鍵は
-//! 16 B と 32 B だけなので、自分で 64 B の配列にして `KeyInit::new` に渡す（`new_from_slice` を通さず、失敗の枝も unwrap も要らない）。
+//! ヒープを使わない: タグはゲームスレッドで 1 通ごとに作る・比べる。鍵を入れ終えた HMAC の状態（数百バイト）を `AuthKey` に持ち、1 通ごとにスタックの上でコピーしてから本文を足す（鍵から作り直すと圧縮が 2 回余計にかかる）。
+//! 鍵は 16 B と 32 B だけ（HMAC は 64 B 未満の鍵を 0 で足す。RFC 2104）なので、64 B の配列にして `KeyInit::new` に渡す（失敗の枝も unwrap も要らない）。
 
 use hmac::digest::Key;
 use hmac::{Hmac, KeyInit, Mac};
@@ -18,9 +14,9 @@ use sha2::Sha256;
 
 pub const SECRET_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
-/// 鍵を作るときに秘密の後ろに置く文字。プロトコルのバージョン（`wire::PROTO_VER`）を上げても変えない。
+/// 鍵を作るときに秘密の後ろに付ける文字。プロトコルのバージョン（`wire::PROTO_VER`）を上げても変えない。
 /// 文字をバージョンごとに変えると、違うバージョンの相手のパケットはタグ違いで落ち、「コードの取り違え」と「相手のバージョンが違う」を見分けられない。
-/// 保てば、タグの合ったパケットのヘッダのバージョンを読んで繋がる前に「相手のバージョンが違う」と言える（`wire::decode` の `BadVersion`）。
+/// 保てば、タグの合ったパケットのヘッダのバージョンを読んで接続前に「相手のバージョンが違う」と言える（`wire::decode` の `BadVersion`）。
 /// 文字の中の "v0" は鍵の作り方のバージョンで、プロトコルのバージョンではない。
 pub const KEY_LABEL: &[u8] = b"HGRT v0 auth";
 
@@ -44,7 +40,7 @@ impl Secret {
         let b = s.as_bytes();
         if b.len() != SECRET_LEN * 2 {
             return Err(format!(
-                "秘密は 16 進 {} 桁（いま {} 文字）",
+                "秘密は 16 進 {} 桁にしてください（現在 {} 文字）",
                 SECRET_LEN * 2,
                 b.len()
             ));
@@ -55,7 +51,12 @@ impl Secret {
             let lo = hex_val(b[2 * i + 1]);
             match (hi, lo) {
                 (Some(h), Some(l)) => *o = (h << 4) | l,
-                _ => return Err(format!("秘密の {} 文字目の辺りが 16 進でない", 2 * i + 1)),
+                _ => {
+                    return Err(format!(
+                        "秘密の {} 文字目の辺りが 16 進ではありません",
+                        2 * i + 1
+                    ));
+                }
             }
         }
         Ok(Secret(out))
@@ -257,7 +258,7 @@ pub(crate) mod tests {
         assert!(!AuthKey::derive(&s2, 0x1122_3344).verify(&PING_SIGNED, &tag));
     }
 
-    /// 1 通あたりのタグの所要を測る道具なので `#[ignore]`。走らせ方: `cargo test -p higanr_core --release --lib -- --ignored --nocapture measure_tag`。
+    /// 1 通あたりのタグの所要を測るツールなので `#[ignore]`。走らせ方: `cargo test -p higanr_core --release --lib -- --ignored --nocapture measure_tag`。
     /// 落ちるのは 1 通が 1 ms を越えたとき（建て方の取り違え）だけ。
     #[test]
     #[ignore = "所要を測るだけ。手で --release --ignored --nocapture で走らせる"]

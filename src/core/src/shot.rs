@@ -134,7 +134,7 @@ pub fn to_rgb(
     }
     // 最後の行だけは pitch の詰め物まで要らない（1 行ぶんで足りる）ので、
     // 必要な長さは `(height-1)*pitch + row_needed`。
-    let full_rows = height - 1; // height != 0 を上で確かめ済み
+    let full_rows = height - 1; // height != 0 を上で検証済み
     let required = (full_rows as usize)
         .checked_mul(pitch as usize)
         .and_then(|v| v.checked_add(row_needed as usize))
@@ -153,7 +153,7 @@ pub fn to_rgb(
     let mut rgb = Vec::with_capacity(out_len);
 
     for y in 0..height {
-        // 理屈のうえではあふれないが、添字と同じく確かめてから使うため `checked_mul` を通す。
+        // 理屈のうえではあふれないが、添字と同じく検証してから使うため `checked_mul` を通す。
         let row_start = (y as usize)
             .checked_mul(pitch as usize)
             .ok_or(ShotError::Overflow)?;
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn pitch_padding_is_skipped_not_read_as_pixels() {
-        // width=1, bpp=4 だが pitch=8。詰め物に、間違えて読むと別の色になる値を置く。
+        // width=1, bpp=4 だが pitch=8。詰め物に、間違えて読むと別の色になる値を入れる。
         let data: [u8; 16] = [
             0x00, 0x00, 0xFF, 0x00, /*詰め物*/ 0xAA, 0xBB, 0xCC, 0xDD, // 行0: 赤
             0xFF, 0x00, 0x00, 0x00, /*詰め物*/ 0xAA, 0xBB, 0xCC, 0xDD, // 行1: 青

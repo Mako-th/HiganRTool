@@ -1,4 +1,4 @@
-//! 回線の型の印（接続コードに 1 B で載せる）と、つながらなかったときの文の選び分け（pure）。
+//! 回線の型の印（接続コードに 1 B で載せる）と、接続できなかったときの文の選び分け（pure）。
 //!
 //! 印は 2 つ: 宛先ごとに外側のポートが変わる型（シンメトリック NAT）か（2 か所目の STUN の比べ）と、UPnP で待ち受けの
 //! ポートを割り当てられたか。相手の印は相手のコードから読み、自分の印は開くときに決めて自分のコードに載せる。
@@ -87,13 +87,26 @@ impl NatMark {
         )
     }
 
-    /// 直接つなぐ経路が塞がっている型か。シンメトリックでも、UPnP でポートを開けていれば相手の HELLO はそのポートに届くので塞がっていない。
+    /// 直接接続する経路が塞がっている型か。シンメトリックでも、UPnP でポートを開けていれば相手の HELLO はそのポートに届くので塞がっていない。
     fn blocked(self) -> bool {
-        self.symmetry == Symmetry::Yes && !self.upnp
+        self.reachable() == Some(false)
+    }
+
+    /// 相手から届くか（ホストの決め方 `host_pick::decide` と `blocked` が使う）。UPnP でポートを開けていれば型に依らず届く。
+    /// 型が分からず UPnP も使っていなければ `None`。
+    pub fn reachable(self) -> Option<bool> {
+        if self.upnp {
+            return Some(true);
+        }
+        match self.symmetry {
+            Symmetry::Unknown => None,
+            Symmetry::No => Some(true),
+            Symmetry::Yes => Some(false),
+        }
     }
 }
 
-/// つながらなかったときに出す文の種類（番号は README「接続できないとき」の項と同じ）。
+/// 接続できなかったときに出す文の種類（番号は README「接続できないとき」の項と同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailKind {
     /// 1: 型が分からない（下の 3 つに当たらない）。
@@ -110,7 +123,7 @@ pub enum FailKind {
 /// `peer` は相手のコードの印（まだ読んでいなければ `None`）。
 ///
 /// 自分か相手が UPnP でポートを開けているなら、そちら側はシンメトリックでも塞がっているとは見なさない
-/// （開けたポートへは相手から届くので、それでもつながらないなら原因は型でなく不明）。
+/// （開けたポートへは相手から届くので、それでも接続できないなら原因は型でなく不明）。
 pub fn choose(own: NatMark, peer: Option<NatMark>) -> FailKind {
     let peer = peer.unwrap_or(NatMark::UNKNOWN);
     match (own.blocked(), peer.blocked()) {

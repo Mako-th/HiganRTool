@@ -12,7 +12,7 @@ use crate::wire::NAME_MAX;
 /// 名前の長さの上限（バイト）。HELLO の name の欄（`wire::NAME_MAX`）と同じ。
 pub const PLAYER_NAME_MAX: usize = NAME_MAX;
 
-/// 以前の版が名前を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、起動のときに ini の `name` へ移して消す。
+/// 以前のバージョンが名前を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、起動のときに DLL の `ini_save::migrate_legacy` が ini の `name` へ移して消す。
 pub const PLAYER_NAME_FILE: &str = "player_name.txt";
 
 /// `NameBuf` を原子変数の語に詰めた長さ（32 バイトを 4 バイトずつ ＋ 長さ 1 語）。
@@ -22,7 +22,7 @@ const _: () = assert!(PLAYER_NAME_MAX.is_multiple_of(4));
 /// 利用者が名前を決めていない間の名前（配る ini の `name` の値）。メニューは、これのままの間「設定」でプレイヤー名を決めるよう案内する。
 pub const DEFAULT_NAME: &str = "HiganRTool";
 
-/// 名前に打てる文字か（ASCII の英数字・`-`・`_`・`@`）。文字の表はルーム名の `RoomName::accepts_char` の 1 か所に置く。
+/// 名前に打てる文字か（ASCII の英数字・`-`・`_`・`@`）。文字の表はルーム名の `RoomName::accepts_char` の 1 か所で定義する。
 pub fn accepts_char(c: char) -> bool {
     RoomName::accepts_char(c)
 }
@@ -210,7 +210,7 @@ impl NameInput {
     pub const BACKSPACE: u16 = UNIT_BACKSPACE;
 }
 
-/// 以前の版が覚えたファイル（`PLAYER_NAME_FILE`）の中身を読む（引き継ぎ用）。BOM と前後の空白を除き、最初の 1 行だけを見る。空・制御文字を含む行は `None`。
+/// 以前のバージョンが覚えたファイル（`PLAYER_NAME_FILE`）の中身を読む（引き継ぎ用）。BOM と前後の空白を除き、最初の 1 行だけを見る。空・制御文字を含む行は `None`。
 /// 手書きの日本語の名前も通し、`PLAYER_NAME_MAX` バイトを越える分は文字の境で切る。
 pub fn parse_file(text: &str) -> Option<String> {
     let first = text.trim_start_matches('\u{FEFF}').lines().next()?.trim();
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
     use crate::room_input::{UNIT_ENTER, UNIT_LINE_FEED};
 
-    /// 壊れたら落ちる: 名前の文字の表がルーム名の表から離れる、または表が名前の仕様（英数字・`-`・`_`・`@`）から外れる。
+    /// ルーム名の表との一致に加え、名前の仕様（英数字・`-`・`_`・`@`）そのものも見る。
     #[test]
     fn the_name_chars_are_the_room_name_chars() {
         for u in 0..0x3100u32 {

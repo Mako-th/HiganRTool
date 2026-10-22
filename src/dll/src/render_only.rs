@@ -1,7 +1,7 @@
 //! 描画だけのフレームの実験の予定と集計（pure）。読み取りのスレッドで走る（ゲームのスレッドではない）。
 //! - 予定: 設置の後 20 秒は作らない（基準）。その後 3 秒ごとに N = 1, 2, 3, 10, 60 を順に繰り返し、設置から 180 秒で終える。
 //!   0 から N にするのは読み取りのスレッドだけ（`stub::try_start_render_only`。compare-exchange で 0 のときだけ）、減らすのは入口だけ。
-//!   判定は時刻から決まる純粋な計算で、`RENDER_ONLY_LEFT` を置くのは `observe.rs`。
+//!   判定は時刻から決まる純粋な計算で、`RENDER_ONLY_LEFT` を書くのは `observe.rs`。
 //! - 集計: 描画だけのフレームの件 k と次の件 k+1 を比べ、`+0x454` が進んでいないか / 抽選回数 `0x4ACE10` が同じか /
 //!   コピーの範囲（548 バイト）の中で変わったアドレスと回数 / 番号 k を持つ描画の件の数 / 前後の件との間隔（TSC）。
 //!   デモの間（`0x4A7EC4` の bit1）とそれ以外に分けて数える。
@@ -45,7 +45,7 @@ pub fn burst_at(second: u32) -> Option<u32> {
 ///
 /// 入力の入口（`stub.rs` の `input_wait_entry`）は `lock xadd` で `SEQ` の値 k を自分の番号として取り `SEQ` を k+1 へ進め、
 /// 描画の入口（`draw.rs` の `draw_entry`）は `SEQ` をそのまま書く。tick k と同じ do_frame の描画は k+1 を書くので、
-/// k で引くと前のフレームの描画を数えて、いつも 1 回に見える。この関係はここ 1 か所に置く。
+/// k で引くと前のフレームの描画を数えて、いつも 1 回に見える。この関係はここ 1 か所に書く。
 pub fn draw_tag_after_tick(k: u32) -> u32 {
     k.wrapping_add(1)
 }
@@ -303,13 +303,13 @@ pub fn write_summary(out: &mut dyn Write, s: &RenderOnlySummary, draw_calls: u32
     );
     let _ = writeln!(
         out,
-        "描画だけのフレーム: +0x454 が進んだ {} 件（0 のはず）/ 抽選回数が変わった {} 件（0 のはず）/ tick k と k+1 の間に描画がちょうど 1 回走った {} 件・そうでない {} 件",
+        "描画だけのフレーム: +0x454 が進んだ {} 件（0 のはず）/ 抽選回数が変わった {} 件（0 のはず）/ tick k と k+1 の間に描画がちょうど 1 回実行された {} 件・そうでない {} 件",
         s.frame_advanced_count, s.rng_changed_count, s.draws_one_count, s.draws_not_one
     );
     if s.changed_addr_hist.is_empty() {
         let _ = writeln!(
             out,
-            "描画だけのフレーム: コピーの範囲（{} 語）で変わったアドレスは無い（決定的）",
+            "描画だけのフレーム: コピーの範囲（{} 語）で変わったアドレスはありません（決定的）",
             changed_words_total()
         );
     } else {

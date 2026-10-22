@@ -1,23 +1,8 @@
-//! わざと壊す: 送るものを、固定の seed で落とす・遅らせる・重ねる。割合と遅らせる幅は起動の引数で。受ける側では何もしない
-//! （受けた後の扱いは本物と同じにするため）。
-//!
-//! 決め打ちの落とし方（`drop_every` と `drop_run`）も持つ: 送った n 通目が `drop_every` の倍数なら、そこから `drop_run` 通を続けて
-//! 落とす。乱数を使わないので、何通目が落ちるかは送った順だけで決まる。
-//!
-//! **一定の遅れ**（`one_way_ms`）: 全部の送りを同じ ms だけ遅らせる（相手から見た片道が長くなる。RTT を模す）。乱数の遅れ
-//! （`delay_pct`）はパケットごとに違う遅れを引くので、同じ語を 4 ms ごとに送り直す INPUT では一番早く着いたコピーが使われ、遅れが
-//! 打ち消される（実測: `--delay 100 --delay-max 60` で dll の stall 0）。一定の遅れは送り直しのコピーにも同じだけ乗るので打ち消されない。
-//! 遅らせる・重ねるの運命の遅れには、この遅れを足す（`sim.rs` の `Tx::send`）。
-//!
-//! **揺らぐ遅れ**（`jitter_ms`）: 送るコピー 1 通ごとに 0〜N ms の乱数の遅れを、一定の遅れに足す。送り直しのコピーも別々に引くので、
-//! 一番早いコピーでも打ち消されず、送った順と届く順が入れ替わる（実回線のジッタを模す）。運命（落とす・遅らせる・重ねる）の乱数とは
-//! 別の乱数で引くので、ジッタの有無で運命の列は変わらない。
-//!
-//! **別のバージョンを名乗る**（`claim_ver`。`--proto-ver`）: 自分のバージョン `wire::PROTO_VER` と名乗るバージョン `claim_ver` を、送るものと**受けるもの**の
-//! 両方で入れ替えて（ヘッダのバージョンと HELLO の本文のバージョン）、タグを付け直す（`Relabel`）。セッション（`Link`）は今のバージョンのまま動き、ネットワークの上では
-//! `claim_ver` のバージョンの HiganRTool に見える。相手が今のバージョンなら、相手は「相手のバージョンが `claim_ver`」で、こちらのセッションは（入れ替えた後の）
-//! 「相手のバージョンが `claim_ver`」で手順をやめる。バージョン違いで断る経路を、古いバージョンの物を建てずに loopback で確かめるためのもので、壊し方の中で
-//! ここだけは受ける側にも掛かる。
+//! わざと壊す: 送るものを、固定の seed で落とす・遅らせる・重ねる。割合と遅らせる幅は起動の引数で。受ける側では何もしない（受けた後の扱いは本物と同じにするため）。
+//! 決め打ちの落とし方（`drop_every` と `drop_run`）: 送った n 通目が `drop_every` の倍数なら、そこから `drop_run` 通を続けて落とす。乱数を使わないので、何通目が落ちるかは送った順だけで決まる。
+//! 一定の遅れ（`one_way_ms`）: 全部の送りを同じ ms だけ遅らせて RTT を模す。乱数の遅れ（`delay_pct`）は INPUT の送り直しの一番早いコピーに打ち消されるので別に持つ（実測: `--delay 100 --delay-max 60` で dll の stall 0）。運命の遅れにはこの遅れを足す（`sim.rs` の `Tx::send`）。
+//! 揺らぐ遅れ（`jitter_ms`）: コピー 1 通ごとに 0〜N ms の乱数の遅れを足す（実回線のジッタを模す）。運命とは別の乱数で引くので、ジッタの有無で運命の列は変わらない。
+//! 別のバージョンを名乗る（`claim_ver`。`--proto-ver`）: 送るものと**受けるもの**の両方でバージョンを入れ替えてタグを付け直し、バージョン違いで断る経路を loopback で検証する（壊し方の中でここだけ受ける側にも掛かる）。
 
 use higanr_core::auth::{AuthKey, Secret};
 use higanr_core::wire::{HEADER_LEN, MAGIC, PROTO_VER, TAG_LEN};
@@ -56,7 +41,7 @@ pub struct FaultConfig {
     pub drop_every: u32,
     /// 決め打ち: 落とし始めたら続けて落とす通数（0 は 1 と同じ）。
     pub drop_run: u32,
-    /// 決め打ち: 送った通番がこれを越えたら全部落とす（0 なら使わない）。「繋がった後に相手が黙る」形を作る。
+    /// 決め打ち: 送った通番がこれを越えたら全部落とす（0 なら使わない）。「接続した後に相手が黙る」形を作る。
     pub drop_after: u64,
     /// 全部の送りに足す一定の遅れ（ms。0 なら足さない。上限 `MAX_ONE_WAY_MS`）。
     pub one_way_ms: u32,
@@ -71,7 +56,7 @@ pub struct FaultConfig {
 pub const MAX_JITTER_MS: u32 = 1_000;
 
 /// 一定の遅れの上限（ms）。delay の上限 9 フレーム（60 fps で 150 ms）を片道で大きく越える値まで。これより長い片道は
-/// 遅延の検査ではなく沈黙の検査（接続の手順と生存の 10 秒）になるので断る（道具の決め事）。
+/// 遅延の検査ではなく沈黙の検査（接続の手順と生存の 10 秒）になるので断る（ツールの決め事）。
 pub const MAX_ONE_WAY_MS: u32 = 1_000;
 
 #[derive(Debug, Clone)]
@@ -105,7 +90,7 @@ impl Relabel {
 
     /// 1 データグラムのヘッダのバージョン（と HELLO なら本文のバージョン）を入れ替えてタグを付け直す。HGRT でない・短い（タグまで無い）・
     /// バージョンが入れ替わらないものは None（そのまま使う）。タグを付け直すので、タグの合わない物（別の鍵）を入れ替えると合う物に
-    /// 化けるが、受ける向きでは入れ替える前にセッションと同じ鍵でタグを確かめ、合わない物は触らない（毒の検査を化けさせない）。
+    /// 化けるが、受ける向きでは入れ替える前にセッションと同じ鍵でタグを検証し、合わない物は触らない（毒の検査を化けさせない）。
     pub fn apply(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         if bytes.len() < HEADER_LEN + TAG_LEN || !bytes.starts_with(&MAGIC) {
             return None;
@@ -516,6 +501,9 @@ mod tests {
             arrival: wire::Arrival::Unknown,
             build: higanr_core::update::BUILD_NUMBER,
             public: [0x09; 32],
+            host_pick: false,
+            nat: higanr_core::nat::NatMark::UNKNOWN,
+            rollback_delay: 0,
         });
         let n = wire::encode(&key, sid, &hello, &mut buf);
         let now_ver = buf[..n].to_vec();
@@ -533,8 +521,8 @@ mod tests {
         assert_eq!(back, now_ver);
         assert_eq!(wire::decode(&key, None, &back).map(|p| p.msg), Ok(hello));
         assert_eq!(
-            (rl.swap_ver(PROTO_VER), rl.swap_ver(0), rl.swap_ver(9)),
-            (0, PROTO_VER, 9)
+            (rl.swap_ver(PROTO_VER), rl.swap_ver(0), rl.swap_ver(8)),
+            (0, PROTO_VER, 8)
         );
         let mut bad = now_ver.clone();
         let last = bad.len() - 1;

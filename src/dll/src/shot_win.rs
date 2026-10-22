@@ -1,13 +1,12 @@
 //! 撮影の D3D8 の層（unsafe はここにもある。1 つずつ `// SAFETY:`）: 描画の入口（`draw.rs` の `draw_entry`）が撮影の要求を見て呼ぶ
-//! `shot_on_draw`、要求の置き場、コピーの置き場 4 枚、読み取りのスレッドの受け取りの入口。
+//! `shot_on_draw`、要求の登録、コピー用のバッファ 4 枚、読み取りのスレッドが、できたバッファを受け取る入口（`take_done`）。
 //!
 //! 読み方: デバイス `[0x4B3108]` の GetBackBuffer（vtable `+0x40`。引数 0, 0）→ 面の GetDesc（`+0x20`）→ LockRect（`+0x24`。全面、フラグ 0）→
 //! 行ごとにコピーする → UnlockRect（`+0x28`）→ Release（`+0x08`）。ゲーム自身の撮影 `0x0042F540` と同じ関数。コピーしてよいかの判断
-//! （幅・高さ・形式・置き場に収まるか）は `shots::plan_copy`（pure）にだけ書き、ここは呼ぶ順とコピーだけを持つ。
+//! （幅・高さ・形式・バッファに収まるか）は `shots::plan_copy`（pure）にだけ書き、ここは呼ぶ順とコピーだけを持つ。
 //!
-//! ゲームのスレッドの経路（`shot_on_draw` と `place_request`）では、確保・ファイル・ロック待ちをしない。中は全部 `catch_unwind` で、
-//! パニックを受けたら撮影を止める。置き場の受け渡しは状態の原子変数（空き → 書いている → できた → 空き）で、各遷移の書き手は 1 人だけ
-//! （空き → 書いている → できた はゲームのスレッド、できた → 空き は読み取りのスレッド）。
+//! ゲームのスレッドの経路（`shot_on_draw` と `place_request`）では、確保・ファイル・ロック待ちをしない。中は全部 `catch_unwind` で、パニックを受けたら撮影を止める。
+//! バッファの受け渡しは状態の原子変数（空き → 書いている → できた → 空き）で、各遷移の書き手は 1 人だけ（空き → 書いている → できた はゲームのスレッド、できた → 空き は読み取りのスレッド）。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -34,14 +33,14 @@ use crate::win::read_own_memory;
 /// 撮影の要求（理由のビット。0 なら要求なし）。描画の入口のアセンブリが `cmp dword ptr [SHOT_REQ], 0` で見て、0 でなければ
 /// `shot_on_draw` を呼ぶ。書くのも取り出すのもゲームのスレッドだけ。
 pub static SHOT_REQ: AtomicU32 = AtomicU32::new(0);
-/// 要求を置いた tick の番号・段階・まとめた回数（ゲームのスレッドだけが触る）。
+/// 要求を出した tick の番号・段階・まとめた回数（ゲームのスレッドだけが触る）。
 static REQ_K: AtomicU32 = AtomicU32::new(0);
 static REQ_STEP: AtomicU32 = AtomicU32::new(0);
 static REQ_MERGED: AtomicU32 = AtomicU32::new(0);
 
-/// 撮影が有効か。読み取りのスレッドが置き場を確保し、描画の detour が書けた後で 1 にする。ゲームのスレッドがパニックを受けたら 0 にする。
+/// 撮影が有効か。読み取りのスレッドがバッファを確保し、描画の detour が書けた後で 1 にする。ゲームのスレッドがパニックを受けたら 0 にする。
 pub static SHOT_ON: AtomicU32 = AtomicU32::new(0);
-/// デバイスへのポインタの置き場（花映塚では `D3D8_DEVICE_PTR`）と present parameters のコピー（`D3D8_PRESENT_PARAMS`）。`prepare` が読めると確かめてから置く。
+/// デバイスへのポインタが入っているアドレス（花映塚では `D3D8_DEVICE_PTR`）と present parameters のコピー（`D3D8_PRESENT_PARAMS`）。`prepare` が読めると検証してから保存する。
 static DEVICE_PTR_ADDR: AtomicU32 = AtomicU32::new(0);
 static PP_ADDR: AtomicU32 = AtomicU32::new(0);
 
@@ -49,7 +48,7 @@ const FREE: u32 = 0;
 const BUSY: u32 = 1;
 const DONE: u32 = 2;
 
-/// 置き場の画素（`SHOT_CAP` バイトずつ。`prepare` が確保し、プロセスが終わるまで返さない）。
+/// バッファの画素（`SHOT_CAP` バイトずつ。`prepare` が確保し、プロセスが終わるまで返さない）。
 static BUFS: [AtomicUsize; SHOT_SLOTS] = [const { AtomicUsize::new(0) }; SHOT_SLOTS];
 static STATES: [AtomicU32; SHOT_SLOTS] = [const { AtomicU32::new(FREE) }; SHOT_SLOTS];
 struct Head([AtomicU32; HEAD_WORDS]);
@@ -68,18 +67,18 @@ static PANICKED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PANIC_NEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// 読み取りのスレッドが、設置の前に置き場 4 枚を確保しアドレスを置く。撮影はまだ有効にしない（`set_on`）。アドレスが読めなければ断る。
+/// 読み取りのスレッドが、設置の前にバッファ 4 枚を確保しアドレスを保存する。撮影はまだ有効にしない（`set_on`）。アドレスが読めなければ断る。
 pub fn prepare(device_ptr_addr: u32, pp_addr: u32) -> Result<(), String> {
     if SHOT_ON.load(Ordering::SeqCst) != 0 {
-        return Err("撮影がもう有効になっている".to_string());
+        return Err("撮影は既に有効です".to_string());
     }
     if device_ptr_addr == 0 || read_own_memory(device_ptr_addr, 4).is_none() {
         return Err(format!(
-            "デバイスの置き場 0x{device_ptr_addr:08X} が読めない"
+            "デバイスのアドレス 0x{device_ptr_addr:08X} が読み取り不能"
         ));
     }
     if pp_addr == 0 || read_own_memory(pp_addr, (PP_FORMAT + 4) as usize).is_none() {
-        return Err(format!("present parameters 0x{pp_addr:08X} が読めない"));
+        return Err(format!("present parameters 0x{pp_addr:08X} が読み取り不能"));
     }
     DEVICE_PTR_ADDR.store(device_ptr_addr, Ordering::SeqCst);
     PP_ADDR.store(pp_addr, Ordering::SeqCst);
@@ -105,7 +104,7 @@ pub fn set_off() {
     SHOT_REQ.store(0, Ordering::SeqCst);
 }
 
-/// 撮影の要求を置く（ゲームのスレッドの台本の入口から。確保しない）。同じ描画の前に 2 回置かれたら理由を OR し、tick の番号と段階は後のものにし、
+/// 撮影の要求を出す（ゲームのスレッドの台本の入口から。確保しない）。同じ描画の前に 2 回出されたら理由を OR し、tick の番号と段階は後のものにし、
 /// まとめた回数を数える。撮影が無効なら捨てて数える。
 pub fn place_request(reason: u8, step: u16, k: u32) {
     if reason == 0 {
@@ -237,7 +236,7 @@ fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
     if dev_at == 0 || pp_at == 0 {
         return Fail::NoDevice;
     }
-    // SAFETY: どちらも `prepare` が読めると確かめてから置いたアドレス（th09.exe の .data の `0x4B3108` と `0x4B3450`。プロセスが終わるまで読める）。
+    // SAFETY: どちらも `prepare` が読めると検証してから保存したアドレス（th09.exe の .data の `0x4B3108` と `0x4B3450`。プロセスが終わるまで読める）。
     let (device, pp) = unsafe {
         (
             read_u32(dev_at),
@@ -336,8 +335,8 @@ fn with_surface(
     } else {
         let t = rdtsc();
         for y in 0..plan.height as usize {
-            // SAFETY: 元は LockRect が返した画素で、行 y は `bits + y * pitch` から `row` バイト（pitch >= row を確かめ済み。y < Height）。
-            // 先は `prepare` が確保した置き場で、`y * row + row <= total <= SHOT_CAP`（`plan_copy` が確かめた）。「書いている」の間は読み取りのスレッドが触らない。
+            // SAFETY: 元は LockRect が返した画素で、行 y は `bits + y * pitch` から `row` バイト（pitch >= row を検証済み。y < Height）。
+            // 先は `prepare` が確保したバッファで、`y * row + row <= total <= SHOT_CAP`（`plan_copy` が検証した）。「書いている」の間は読み取りのスレッドが触らない。
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (bits as usize).wrapping_add(y * pitch as usize) as *const u8,
@@ -367,7 +366,7 @@ fn with_surface(
     fail
 }
 
-/// 「できた」置き場のうち、撮った順の番号がいちばん小さいものの番号と先頭（無ければ `None`）。
+/// 「できた」バッファのうち、撮った順の番号がいちばん小さいものの番号と先頭（無ければ `None`）。
 pub fn take_done() -> Option<(usize, ShotHead)> {
     (0..SHOT_SLOTS)
         .filter(|&i| STATES[i].load(Ordering::Acquire) == DONE)
@@ -379,7 +378,7 @@ pub fn take_done() -> Option<(usize, ShotHead)> {
         .min_by_key(|(_, h)| h.0[H_SERIAL])
 }
 
-/// 「できた」置き場 `slot` の画素の先頭 `len` バイトをコピーして返す（読み取りのスレッド）。置き場が無い・範囲の外なら空。
+/// 「できた」バッファ `slot` の画素の先頭 `len` バイトをコピーして返す（読み取りのスレッド）。バッファが無い・範囲の外なら空。
 pub fn copy_pixels(slot: usize, len: usize) -> Vec<u8> {
     let Some(b) = BUFS.get(slot) else {
         return Vec::new();
@@ -389,7 +388,7 @@ pub fn copy_pixels(slot: usize, len: usize) -> Vec<u8> {
         return Vec::new();
     }
     let len = len.min(SHOT_CAP);
-    // SAFETY: `p` は `prepare` が確保して返さない `SHOT_CAP` バイトの置き場で `len <= SHOT_CAP`。状態が「できた」の間はゲームのスレッドは書かず、
+    // SAFETY: `p` は `prepare` が確保して返さない `SHOT_CAP` バイトのバッファで `len <= SHOT_CAP`。状態が「できた」の間はゲームのスレッドは書かず、
     // Acquire の読みで、Release で書かれた画素が見える。
     unsafe { core::slice::from_raw_parts(p as *const u8, len) }.to_vec()
 }

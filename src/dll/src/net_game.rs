@@ -1,20 +1,11 @@
-//! 入力の地点の判断（`netplay.rs`）が見るゲームのウィンドウの本物（pure。unsafe 無し）: 場面・自分の入力ワード・feed・自分の SELECT・
-//! 揃った値の書き込み・チャージ型・CHECK の値を、ゲームのメモリと関数（`NetIo` の向こう）で行う。
+//! 入力の地点の判断（`netplay.rs`）が見るゲームのウィンドウの本物（pure。unsafe 無し）: 場面・自分の入力ワード・feed・自分の SELECT・揃った値の書き込み・チャージ型・CHECK の値を、
+//! ゲームのメモリと関数（`NetIo` の向こう。本物は `script_win::RealTickIo`、検査では偽物）で行う。ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を使わない。
 //!
-//! ゲームのメモリの読み書きと関数の呼び出しは `NetIo` の向こうに置く（本物は `script_win::RealTickIo`、検査では偽物）。
-//! ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を置かない。
-//!
-//! - **自分の入力ワード**: 台本があれば、lockstep のフレームごとに台本を 1 tick 進め、自分の席の入力ワードを使う（相手の席の入力ワードは捨てる）。
-//!   台本が終わっていれば（か無ければ）ローカル入力（素の poll `0x0042B850` の席 0。照合が合わなかった実行は `0x0042BE40`）。
-//!   台本の無い実行（人の入力）は、選択の画面でもマッチでもこの経路（`script` が `None`）で、人の押下は選択の画面では
-//!   `NetPlay::menu_tick` が押した瞬間から STEP_REQ / STEP にする（台本の押下と同じ経路）。
-//! - **選択の画面**: MainMenu の欄（画面・substate・移る途中・カーソル・キャラのカーソルと席の旗）は落ちない読み方で、
-//!   人対人の印 `0x4A7EA4` とマップの一覧 `0x4AC8C4` は直に読む（`net_select::MenuView`）。押下を入れる tick に
-//!   カーソルを MainMenu へ落ちない書き方で書く。
-//! - **書く**のは相手の席のキャラ・色・初期ライフ、合意したマップ・難易度、シード（`set_state`）と、開始のフックの中の
-//!   コピーのチャージ型、選択の画面のカーソルだけ。書く前に範囲を見て（`check_agreed`）、1 つでも外れていれば 1 つも書かない。
-//!   CPU レベルは書かない（読み込みスレッドが難易度から書き直す）。オプションブロック `0x004B3488` には書かない
-//!   （終了時に th09.cfg へ書き出される）。
+//! - **自分の入力ワード**: 台本があれば、lockstep のフレームごとに台本を 1 tick 進め、自分の席の入力ワードを使う（相手の席の入力ワードは捨てる）。台本が終わっていれば（か無ければ）ローカル入力（素の poll `0x0042B850` の席 0。照合が合わなかった実行は `0x0042BE40`）。
+//!   台本の無い実行（人の入力）は、選択の画面でもマッチでもこの経路（`script` が `None`）で、人の押下は選択の画面では `NetPlay::menu_tick` が押した瞬間から STEP_REQ / STEP にする（台本の押下と同じ経路）。
+//! - **選択の画面**: MainMenu の欄（画面・substate・移る途中・カーソル・キャラのカーソルと席の旗）は落ちない読み方で、人対人の印 `0x4A7EA4` とマップの一覧 `0x4AC8C4` は直に読む（`net_select::MenuView`）。押下を入れる tick にカーソルを MainMenu へ落ちない書き方で書く。
+//! - **書く**のは相手の席のキャラ・色・初期ライフ、合意したマップ・難易度、シード（`set_state`）と、開始のフックの中のコピーのチャージ型、選択の画面のカーソルだけ。書く前に範囲を見て（`check_agreed`）、1 つでも外れていれば 1 つも書かない。
+//!   CPU レベルは書かない（読み込みスレッドが難易度から書き直す）。オプションブロック `0x004B3488` には書かない（終了時に th09.cfg へ書き出される）。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::{InputState, MATCH_SEND_MASK, keys};
@@ -59,7 +50,7 @@ pub trait NetIo: TickIo {
     fn typed_units(&mut self, _out: &mut [u16]) -> usize {
         0
     }
-    /// ゲームの .data の 4 バイトを直に書く（設置の前に読めると確かめた `direct_ranges` のアドレスだけ）。
+    /// ゲームの .data の 4 バイトを直に書く（設置の前に読めると検証した `direct_ranges` のアドレスだけ）。
     fn write_data_u32(&mut self, addr: u32, v: u32);
     /// 落ちない書き方（自分のプロセスへの `WriteProcessMemory`）で 1 バイト。書けなければ false。
     fn safe_write_u8(&mut self, addr: u32, v: u8) -> bool;
@@ -109,7 +100,7 @@ impl PortraitEnv for PortraitGate<'_> {
     }
 }
 
-/// 設置の前に「直に読める・書ける」と確かめる .data の範囲（アドレス, 長さ）。花映塚ではどれも th09.exe の .data。
+/// 設置の前に「直に読める・書ける」と検証する .data の範囲（アドレス, 長さ）。花映塚ではどれも th09.exe の .data。
 pub fn direct_ranges() -> [(u32, u32); 19] {
     [
         (SUPERVISOR + SUP_SCENE_CUR, 4),
@@ -429,7 +420,7 @@ impl Game for NetGame<'_> {
         // 台本が動いていれば、ここで 1 tick 進める（この期間で 1 回だけ。結果は `peeked` に残り、`Local` を返した tick の feed が使う）。
         // 返すのは、本物のデバイスの入力ワードに、台本の入力ワードの ESC ビットだけを足したもの: 観戦中の tick は台本の入力ワードをゲームへ入れない
         // （記録の列だけを入れる）ので、台本の Esc 以外のビットは読みに要らない。台本の Esc を読みに入れるのは、
-        // 実機で台本から観戦者の Esc の経路を確かめられるようにするため。
+        // 実機で台本から観戦者の Esc の経路を検証できるようにするため。
         let device = self.io.local_input() as u16;
         let script = self.step_script_once().and_then(|s| s.word()).unwrap_or(0);
         device | (script & keys::ESC)
@@ -485,7 +476,7 @@ impl Game for NetGame<'_> {
 
     fn apply_watched(&mut self, p1: &Select, p2: &Select) -> Result<(), BadValue> {
         // 先に 2 席とも範囲を見る（1 つでも外れていれば 1 つも書かない）。共通の欄（マップ・難易度・シード）は両席で同じ
-        // （ホストの値を両方に入れて積まれる）ので、1 席目の値を 1 回だけ書く。
+        // （対戦のホストの値を両方に入れて積まれる）ので、1 席目の値を 1 回だけ書く。
         let (a1, a2) = (watched_agreed(p1), watched_agreed(p2));
         check_agreed(&a1)?;
         check_agreed(&a2)?;
@@ -576,7 +567,7 @@ impl Game for NetGame<'_> {
     }
 
     fn play_view(&mut self) -> Option<PlayView> {
-        // 戻り道の間だけ読む（つながっている試合の tick には呼ばれない）ので、どれも落ちない読み方でよい。
+        // 読むのは戻り道の間と、観戦者の Esc の tick・ゲームのポーズの間だけ（ふだんの試合の tick には呼ばれない）なので、どれも落ちない読み方でよい。
         let loading = self.io.safe_u32(LOADING)? != 0;
         // どちらも 1 バイトの欄（`movb`）。隣の 3 バイトは見ない。
         let paused = self.io.safe_u32(PAUSE)? & 0xFF != 0;
@@ -892,8 +883,7 @@ mod tests {
         assert_eq!(g.digit_script(), None);
     }
 
-    /// 壊れたら落ちる: `copy=1` の段で数字・Tab の押下が出る、`digit=` の段で Ctrl+C が出る、同じ tick に 2 回取り出せる、
-    /// 呼ぶ順（コピーが先・数字が先）で結果が変わる。
+    /// `copy=1` の段で数字・Tab の押下が出ない、`digit=` の段で Ctrl+C が出ないことも見る。
     #[test]
     fn a_script_step_with_copy_gives_it_once_and_the_call_order_does_not_matter() {
         use higanr_core::script::{Engine, Obs, parse};
@@ -1255,7 +1245,7 @@ mod tests {
         assert_eq!(got, Followed::Refused, "署名が合わなければ呼ばない");
     }
 
-    /// 壊れたら落ちる: カーソルの音の id・パンがゲームのカーソルの移動 `0x0042474A`（`push $0x0`・`push $0xc`）と違う。
+    /// ゲームのカーソルの移動 `0x0042474A`（`push $0x0`・`push $0xc`）と同じ id・パン。
     #[test]
     fn the_cursor_sound_is_the_games_cursor_move_sound() {
         let mut f = fake();

@@ -50,7 +50,7 @@ function post(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
-/** 載せる口に繋いで post を送り、`listed` を受けるところまで。 */
+/** 載せる口に接続して post を送り、`listed` を受けるところまで。 */
 async function listed(build: number, over: Record<string, unknown> = {}, ip?: string): Promise<{ c: Client; room: string }> {
   const c = await connectWatch(build, "post", ip);
   const m = post(over);
@@ -59,7 +59,7 @@ async function listed(build: number, over: Record<string, unknown> = {}, ip?: st
   return { c, room: m.room as string };
 }
 
-/** 見る口に繋ぎ、最初の `list` を返す。 */
+/** 見る口に接続し、最初の `list` を返す。 */
 async function view(build: number, ip?: string): Promise<{ v: Client; items: any[] }> {
   const v = await connectWatch(build, "view", ip);
   const m = await v.next();

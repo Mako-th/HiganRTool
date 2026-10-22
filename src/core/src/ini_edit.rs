@@ -2,8 +2,7 @@
 //!
 //! メニューで決めた設定を ini に戻すためのもの。利用者が書いたコメント・空行・並び・ほかの行は 1 バイトも変えない。
 //!
-//! - 行単位で、書き換える行以外は元のバイト列をそのまま持つ（Shift_JIS の ini でも、触らない行は再符号化しない）。
-//! - 値の後ろの「空白 + `;`」の注は残す。改行は元のファイルの最初の改行（CRLF / LF）に合わせる。
+//! - 行単位で、書き換える行以外は元のバイト列をそのまま持つ（Shift_JIS の ini でも、触らない行は再符号化しない）。値の後ろの「空白 + `;`」の注は残す。改行は元のファイルの最初の改行（CRLF / LF）に合わせる。
 //! - キーの行が無ければ、その節の最後のキーの行の後ろ（キーが無ければ見出しの後ろ）に足す。節が無ければ末尾に節ごと足す。
 //! - 同じ節に同じキーが 2 回あるときは書き換えず断る（どちらを読み手が採るかを、書き手が決めない）。
 //! - 読めない行（`ini::parse_lenient` が捨てる行）には触らない。読めない見出しの下の行は、どの節にも数えない。
@@ -52,7 +51,7 @@ pub enum EditError {
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EditError::Undecodable => write!(f, "UTF-8 でも Shift_JIS でもない"),
+            EditError::Undecodable => write!(f, "UTF-8 でも Shift_JIS でもありません"),
             EditError::Duplicate {
                 section,
                 key,
@@ -60,12 +59,12 @@ impl fmt::Display for EditError {
                 line,
             } => write!(
                 f,
-                "[{section}] の {key} が {first} 行目と {line} 行目の 2 回ある"
+                "[{section}] の {key} が {first} 行目と {line} 行目に重複しています"
             ),
-            EditError::BadValue(why) => write!(f, "値を書けない（{why}）"),
-            EditError::BadName => write!(f, "節かキーの名前が書けない形"),
-            EditError::Unencodable => write!(f, "値が Shift_JIS で表せない"),
-            EditError::NotReadBack => write!(f, "書いた結果を読み直すと値が合わない"),
+            EditError::BadValue(why) => write!(f, "値を書けません（{why}）"),
+            EditError::BadName => write!(f, "カテゴリかキーの名前が書けない形式です"),
+            EditError::Unencodable => write!(f, "値が Shift_JIS で表せません"),
+            EditError::NotReadBack => write!(f, "書いた結果を読み直すと値が一致しません"),
         }
     }
 }
@@ -125,13 +124,13 @@ fn check_value(v: &str) -> Result<(), EditError> {
         return Err(EditError::BadValue("空"));
     }
     if v.chars().any(char::is_control) {
-        return Err(EditError::BadValue("制御文字・改行がある"));
+        return Err(EditError::BadValue("制御文字・改行を含みます"));
     }
     if v != v.trim() {
-        return Err(EditError::BadValue("前後に空白がある"));
+        return Err(EditError::BadValue("前後に空白があります"));
     }
     if strip_comment(v) != v {
-        return Err(EditError::BadValue("空白 + ; が注に読まれる"));
+        return Err(EditError::BadValue("空白 + ; がコメントとして読まれます"));
     }
     Ok(())
 }
@@ -400,7 +399,7 @@ pub fn apply(bytes: &[u8], edits: &[Edit<'_>]) -> Result<Vec<u8>, EditError> {
         })
         .collect();
     let read = ini::parse_lenient(&text).ini;
-    // 後の編集で消した・書き直したキーは、最後の編集だけを確かめる。
+    // 後の編集で消した・書き直したキーは、最後の編集だけを検証する。
     let target = |e: &Edit<'_>| match *e {
         Edit::Set { section, key, .. } | Edit::Remove { section, key } => {
             (section.to_ascii_lowercase(), key.to_ascii_lowercase())

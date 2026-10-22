@@ -8,7 +8,7 @@
 /// 欄が取れなかったときに書く語。
 pub const NONE_TEXT: &str = "無し";
 
-/// 1 つの欄の最大の文字数（版の文字列に長い説明が入っていても行が伸びないように）。
+/// 1 つの欄の最大の文字数（バージョンの文字列に長い説明が入っていても行が伸びないように）。
 const FIELD_MAX_CHARS: usize = 64;
 
 /// 場所の種類。
@@ -25,9 +25,9 @@ pub enum Place {
 impl Place {
     fn text(self) -> &'static str {
         match self {
-            Place::Game => "ゲームのフォルダにある",
-            Place::System => "システムのフォルダにある",
-            Place::Other => "その他のフォルダにある",
+            Place::Game => "ゲームフォルダ",
+            Place::System => "システムフォルダ",
+            Place::Other => "その他のフォルダ",
         }
     }
 }
@@ -110,20 +110,20 @@ fn field(v: Option<&str>) -> String {
 /// 本ログの 1 行。`module` が `None` なら d3d8.dll が読み込まれていない。
 pub fn line(module: Option<&D3d8Module>) -> String {
     let Some(m) = module else {
-        return "D3D8: d3d8.dll はこのプロセスに読み込まれていない".to_string();
+        return "d3d8.dll: このプロセスには読み込まれていません".to_string();
     };
     let (place, name) = match m.path.as_deref() {
         Some(p) => (
             place_of(p, m.game_dir.as_deref(), &m.system_dirs).text(),
             field(Some(file_name(p))),
         ),
-        None => ("場所が取れなかった", NONE_TEXT.to_string()),
+        None => ("場所の取得不能", NONE_TEXT.to_string()),
     };
     let size = m
         .size
         .map_or(NONE_TEXT.to_string(), |s| format!("{s} バイト"));
     format!(
-        "D3D8: 読み込まれている d3d8.dll は{place}（ファイル名: {name} / 大きさ: {size} / FileDescription: {} / ProductName: {} / FileVersion: {} / CompanyName: {}）",
+        "d3d8.dllの場所: {place}（ファイル名: {name} / 大きさ: {size} / FileDescription: {} / ProductName: {} / FileVersion: {} / CompanyName: {}）",
         field(m.version.description.as_deref()),
         field(m.version.product.as_deref()),
         field(m.version.version.as_deref()),
@@ -157,7 +157,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 場所の種類の取り違え（差し替えをシステムのものと書く、または逆）。
     #[test]
     fn place_distinguishes_game_system_and_other() {
         let g = Some("D:\\Games\\th09");
@@ -182,7 +181,6 @@ mod tests {
         assert_eq!(place_of("d3d8.dll", g, &sys()), Place::Other);
     }
 
-    /// 壊れたら落ちる: 大文字小文字・区切り・`\\?\` の接頭・末尾の `\` の違いで場所が外れる。
     #[test]
     fn place_ignores_case_separators_prefix_and_trailing_slash() {
         let s = vec!["c:\\windows\\syswow64\\".to_string()];
@@ -204,7 +202,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 空のフォルダ名が「どのパスにも一致する」扱いになる。
     #[test]
     fn empty_directories_match_nothing() {
         let s = vec![String::new()];
@@ -215,12 +212,11 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 欄の並びと語（FileDescription / ProductName / FileVersion / CompanyName）の入れ替わり。
     #[test]
     fn system_line_has_every_field_in_order() {
         assert_eq!(
             line(Some(&full("C:\\Windows\\SysWOW64\\d3d8.dll"))),
-            "D3D8: 読み込まれている d3d8.dll はシステムのフォルダにある（ファイル名: d3d8.dll / 大きさ: 1234567 バイト / FileDescription: Direct3D 8 Runtime / ProductName: Example OS / FileVersion: 6.1.7601.17514 / CompanyName: Example Corp.）"
+            "d3d8.dllの場所: システムフォルダ（ファイル名: d3d8.dll / 大きさ: 1234567 バイト / FileDescription: Direct3D 8 Runtime / ProductName: Example OS / FileVersion: 6.1.7601.17514 / CompanyName: Example Corp.）"
         );
     }
 
@@ -231,11 +227,10 @@ mod tests {
         m.version = VersionFields::default();
         assert_eq!(
             line(Some(&m)),
-            "D3D8: 読み込まれている d3d8.dll はゲームのフォルダにある（ファイル名: d3d8.dll / 大きさ: 98304 バイト / FileDescription: 無し / ProductName: 無し / FileVersion: 無し / CompanyName: 無し）"
+            "d3d8.dllの場所: ゲームフォルダ（ファイル名: d3d8.dll / 大きさ: 98304 バイト / FileDescription: 無し / ProductName: 無し / FileVersion: 無し / CompanyName: 無し）"
         );
     }
 
-    /// 壊れたら落ちる: ユーザー名を含むフォルダ名がそのまま行に出る。
     #[test]
     fn line_never_contains_the_folder_names() {
         let mut m = full("D:\\Home\\alice\\Games\\th09\\d3d8.dll");
@@ -245,7 +240,7 @@ mod tests {
             !l.contains("alice") && !l.contains("Home") && !l.contains("Games"),
             "{l}"
         );
-        assert!(l.contains("ゲームのフォルダ"), "{l}");
+        assert!(l.contains("ゲームフォルダ"), "{l}");
         let mut other = full("D:\\Home\\alice\\Desktop\\d3d8.dll");
         other.game_dir = None;
         let l = line(Some(&other));
@@ -253,13 +248,13 @@ mod tests {
         assert!(l.contains("その他のフォルダ"), "{l}");
     }
 
-    /// 壊れたら落ちる: 取れない欄が空のまま・欠けたまま行に出る（読む側が「0 件」と取り違える）。
+    /// 取れない欄が空のままだと、読む側が「0 件」と取り違える。
     #[test]
     fn missing_pieces_are_written_as_none() {
         let m = D3d8Module::default();
         assert_eq!(
             line(Some(&m)),
-            "D3D8: 読み込まれている d3d8.dll は場所が取れなかった（ファイル名: 無し / 大きさ: 無し / FileDescription: 無し / ProductName: 無し / FileVersion: 無し / CompanyName: 無し）"
+            "d3d8.dllの場所: 場所の取得不能（ファイル名: 無し / 大きさ: 無し / FileDescription: 無し / ProductName: 無し / FileVersion: 無し / CompanyName: 無し）"
         );
         let mut blank = full("C:\\Windows\\SysWOW64\\d3d8.dll");
         blank.version.description = Some("   ".to_string());
@@ -271,13 +266,9 @@ mod tests {
 
     #[test]
     fn not_loaded_is_its_own_line() {
-        assert_eq!(
-            line(None),
-            "D3D8: d3d8.dll はこのプロセスに読み込まれていない"
-        );
+        assert_eq!(line(None), "d3d8.dll: このプロセスには読み込まれていません");
     }
 
-    /// 壊れたら落ちる: 版の文字列の改行・制御文字・長い文字列で行が崩れる（ログの 1 行が複数行になる）。
     #[test]
     fn fields_stay_on_one_line_and_are_cut() {
         let mut m = full("C:\\Windows\\SysWOW64\\d3d8.dll");

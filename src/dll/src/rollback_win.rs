@@ -1,18 +1,10 @@
 //! rollback の Win32 とゲームのメモリと入口のアセンブリの層。判断は `rollback_probe.rs`（pure）。
 //!
-//! - 確保・解放の入口 3 つ（`rb_malloc_entry` / `rb_new_entry` / `rb_free_entry`）。`ALLOC_SITES` の 2・3・4 行（CRT の malloc `0x47B151`・
-//!   operator new `0x47B24E`・free `0x47B163`）に `alloc_count::install_all` で detour を書く。同じ地点を使うので、数える入口とは ini で排他。
+//! - 確保・解放の入口 3 つ（`rb_malloc_entry` / `rb_new_entry` / `rb_free_entry`）。`ALLOC_SITES` の 2・3・4 行（CRT の malloc `0x47B151`・operator new `0x47B24E`・free `0x47B163`）に `alloc_count::install_all` で detour を書く。同じ地点を使うので、数える入口とは ini で排他。
 //! - `RealProbeIo`: `ProbeIo` の本物。設置（`arm`）と終わり（`finish`）は `alloc_win::on_step` から、入力の地点からは `on_tick` / `after_feed`。
 //!
-//! 確保を DLL の領域へ向ける条件（全部満たすときだけ。外れたら元の CRT へ素通し）: `REDIRECT` が 1・ゲームのスレッド（`ALLOC_MAIN_TID`）・
-//! 呼び出し元がゲームのコード `GAME_CODE_START..GAME_CODE_END` の中で `ROLLBACK_EXCLUDED_CALLERS` の外（確保の包みの中からなら、包みを呼んだ所で見る）。
-//! 解放は、ポインタが領域の中なら領域へ返す（別のスレッドからなら返さずに数えるだけ）。領域の外は CRT へ素通し（見張りの間は数える）。
-//! 塊の先頭には呼び出し元を札として置き、比べるときに記録の処理の fps の塊を見分ける。
-//!
-//! フレームの形（ini の `resim = frame`）: do_frame の走査の call（`0x0042DCA9`）も `rb_scan_entry` へ向ける（配るバージョンでは書かない）。
-//! 書き戻しのあったフレームだけ走査を k 回呼び（`rollback_resim::run_scan`）、途中の回が積んだ SE・BGM・文字の数は進め直しの前にバックアップ、最後の回の前に戻す（`RawOutputs`）。
-//!
-//! 書くのはプロセスのメモリ（detour の 5 地点と、コピーした範囲の書き戻し）だけ。
+//! 確保を DLL の領域へ向ける条件（全部満たすときだけ。外れたら元の CRT へ素通し）: `REDIRECT` が 1・ゲームのスレッド（`ALLOC_MAIN_TID`）・呼び出し元がゲームのコード `GAME_CODE_START..GAME_CODE_END` の中で `ROLLBACK_EXCLUDED_CALLERS` の外（確保の包みの中からなら、包みを呼んだ所で見る）。解放は、ポインタが領域の中なら領域へ返す（別のスレッドからなら返さずに数えるだけ）。領域の外は CRT へ素通し（見張りの間は数える）。塊の先頭には呼び出し元を札として書き、比べるときに記録の処理の fps の塊を見分ける。
+//! フレームの形（ini の `resim = frame`）: do_frame の走査の call（`0x0042DCA9`）も `rb_scan_entry` へ向ける（配るバージョンでは書かない）。書き戻しのあったフレームだけ走査を k 回呼び（`rollback_resim::run_scan`）、途中の回が積んだ SE・BGM・文字の数は進め直しの前にバックアップ、最後の回の前に戻す（`RawOutputs`）。書くのはプロセスのメモリ（detour の 5 地点と、コピーした範囲の書き戻し）だけ。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -94,9 +86,9 @@ static RESULT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // SAFETY（`#[unsafe(naked)]`。3 つの入口に共通）: 本体は `naked_asm!` だけ。関数の先頭（`[esp]` が戻りアドレス、`[esp + 4]` が cdecl の引数 1 つ）に書いた `E9` から飛んでくる。
 // - 素通しの経路: eax・ecx・edx を push / pop で戻し、esp を入った時と同じにしてトランポリンへ `jmp`。ebx・esi・edi・ebp には書かない。
-// - 配った経路（malloc / new）と領域へ返した経路（free）: eax に戻り値を置き、ecx・edx を戻して `ret`（cdecl なので引数は呼んだ側が片付ける）。元の関数も eax・ecx・edx を壊してよい。
+// - 配った経路（malloc / new）と領域へ返した経路（free）: eax に戻り値を入れ、ecx・edx を戻して `ret`（cdecl なので引数は呼んだ側が片付ける）。元の関数も eax・ecx・edx を壊してよい。
 //   フラグは戻さない（呼び出し規約で当てにされない。DF は変えない）。
-// - バックアップする経路（ゲームのスレッド・`rb_alloc` が 0・見張りが 1）: 大きさを積み直してトランポリンを `call` し、戻り値を `rb_out_alloc` に渡してから eax に置いて `ret`。
+// - バックアップする経路（ゲームのスレッド・`rb_alloc` が 0・見張りが 1）: 大きさを積み直してトランポリンを `call` し、戻り値を `rb_out_alloc` に渡してから eax に入れて `ret`。
 //   operator new が例外を投げたら、この入口の枠は SEH の鎖に載っていないので飛び越され、捕まえた側がスタックを戻す。
 // - 呼ぶ Rust の関数は cdecl で、ebx・esi・edi・ebp を保つ。読むのは自分のスタック・TEB（`fs:[0x24]`）・DLL の静的変数だけ。
 //   `[esp + … + ALLOC_WRAP_OUTER]` は確保の包みの中から呼ばれたときの包みの呼び出し元で、自分のスレッドのスタックの中を読むだけ。
@@ -268,14 +260,14 @@ const SITE_FREE: usize = crate::rollback_play::SITE_FREE;
 const _: () = assert!(SITE_COUNT == 5 && SITE_MALLOC == 2 && SITE_NEW == 3 && SITE_FREE == 4);
 
 // ---- calloc の見張り（`th09_addr::CALLOC_SITES`）----
-/// calloc の入口のトランポリン（`install_detour` が JMP を書く前に置く。0 の間はこの入口へ向く JMP は無い）。
+/// calloc の入口のトランポリン（`install_detour` が JMP を書く前に設定する。0 の間はこの入口へ向く JMP は無い）。
 pub static RB_CALLOC_TRAMP: AtomicU32 = AtomicU32::new(0);
 /// 見張りの間にゲームのスレッドで calloc を通った確保の数（`RB_OUT_ALLOCS` にも数える。内訳を見るため別にも持つ）。
 pub static RB_OUT_CALLOCS: AtomicU32 = AtomicU32::new(0);
 
 // SAFETY（`#[unsafe(naked)]`）: calloc `0x0047DE66` の先頭（`[esp]` が戻りアドレス、`[esp + 4]` が個数、`[esp + 8]` が大きさ。cdecl）に書いた `E9` から飛んでくる。
 // - 素通しの経路（見張りの外・別のスレッド）: esp と eax・ecx・edx を入った時と同じにしてトランポリンへ `jmp`（盗んだ 2 命令は即値の push）。
-// - 見張りの経路（`RB_WATCH` が 1 でゲームのスレッド）: 引数を積み直してトランポリンを `call` し、戻り値を `rb_out_calloc` に渡してから eax に置いて `ret`。ecx・edx は元の関数と `rb_out_calloc` が壊したまま（どちらも cdecl で ebx・esi・edi・ebp を保つ）。
+// - 見張りの経路（`RB_WATCH` が 1 でゲームのスレッド）: 引数を積み直してトランポリンを `call` し、戻り値を `rb_out_calloc` に渡してから eax に入れて `ret`。ecx・edx は元の関数と `rb_out_calloc` が壊したまま（どちらも cdecl で ebx・esi・edi・ebp を保つ）。
 // - 読むのは自分のスタック・TEB・DLL の静的変数だけ。DLL の領域へは向けない（呼ぶ所 8 か所はどれも `GAME_CODE_END` の外）。ラベルは 4 だけ。
 /// calloc の入口（`CALLOC_SITES` の行）。Rust からは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
@@ -337,13 +329,13 @@ pub(crate) fn in_arena(addr: u32) -> bool {
     (RB_BASE.load(Ordering::Relaxed)..RB_END.load(Ordering::Relaxed)).contains(&addr)
 }
 
-/// 領域を確保して置く（読み取りのスレッドで 1 回。E1 がもう置いていたら置かない）。置けたら領域の先頭。
+/// 領域を確保して設定する（読み取りのスレッドで 1 回。巻き戻しの実験がもう設定していたら設定しない）。設定できたら領域の先頭。
 pub(crate) fn place_play_arena(bytes: u32) -> Option<u32> {
     if armed() || RB_BASE.load(Ordering::SeqCst) != 0 {
         return None;
     }
     let base = virtual_alloc(bytes)?;
-    // SAFETY: 置くのは読み取りのスレッドの 1 回だけ。まだ `RB_BASE` を立てておらず入口の detour も書いていないので、ゲームのスレッドは入れ物に触らない。
+    // SAFETY: 設定するのは読み取りのスレッドの 1 回だけ。まだ `RB_BASE` を立てておらず入口の detour も書いていないので、ゲームのスレッドは入れ物に触らない。
     unsafe {
         *ARENA.0.get() = Some(Arena {
             state: ArenaState::new(),
@@ -383,7 +375,7 @@ impl ArenaMem for RawMem {
             RB_UNZEROED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // SAFETY: `[base + off, base + off + len)` は上で確かめたとおり領域の中。u8 の書きなので境界の制約は無い。領域は `arm` が VirtualAlloc で確保し、プロセスが終わるまで返さない。
+        // SAFETY: `[base + off, base + off + len)` は上で検証したとおり領域の中。u8 の書きなので境界の制約は無い。領域は `arm` が VirtualAlloc で確保し、プロセスが終わるまで返さない。
         unsafe { core::ptr::write_bytes((self.base + off) as usize as *mut u8, 0, len as usize) }
     }
 }
@@ -393,9 +385,9 @@ struct Arena {
     mem: RawMem,
 }
 
-/// ゲームのスレッドだけが触る入れ物。`arm` が読み取りのスレッドで 1 回だけ置き、以後は入口と入力の地点だけが触る。
+/// ゲームのスレッドだけが触る入れ物。`arm` が読み取りのスレッドで 1 回だけ設定し、以後は入口と入力の地点だけが触る。
 pub(crate) struct GameCell<T>(pub(crate) UnsafeCell<Option<T>>);
-// SAFETY: 中身に触るのは、置く前の 1 回と、その後のゲームのスレッドだけ。ゲームのスレッドは 1 本（実測）。別のスレッドの解放は中身に触らず数える。
+// SAFETY: 中身に触るのは、設定する前の 1 回と、その後のゲームのスレッドだけ。ゲームのスレッドは 1 本（実測）。別のスレッドの解放は中身に触らず数える。
 unsafe impl<T> Sync for GameCell<T> {}
 
 static ARENA: GameCell<Arena> = GameCell(UnsafeCell::new(None));
@@ -434,11 +426,11 @@ fn alloc_inner(ret: u32, outer: u32, size: u32) -> u32 {
         }
         return 0;
     }
-    // SAFETY: ゲームのスレッド（入口が確かめた）。`ARENA` を置いた後にしか `RB_REDIRECT` は 1 にならない。
+    // SAFETY: ゲームのスレッド（入口が検証した）。`ARENA` を設定した後にしか `RB_REDIRECT` は 1 にならない。
     let Some(a) = (unsafe { (*ARENA.0.get()).as_mut() }) else {
         return 0;
     };
-    // 塊の先頭に呼び出し元を札として置く（比べるときに記録の処理の fps の塊を見分ける）。
+    // 塊の先頭に呼び出し元を札として書く（比べるときに記録の処理の fps の塊を見分ける）。
     match a
         .state
         .alloc_tagged(&mut a.mem, size, caller_of(ret, outer))
@@ -460,7 +452,7 @@ fn free_inner(ptr: u32, main: u32) {
         RB_FOREIGN_FREES.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    // SAFETY: ゲームのスレッド（入口が確かめた）。ポインタが領域の中なら `ARENA` は置かれている。
+    // SAFETY: ゲームのスレッド（入口が検証した）。ポインタが領域の中なら `ARENA` は設定されている。
     let Some(a) = (unsafe { (*ARENA.0.get()).as_mut() }) else {
         RB_BAD_FREES.fetch_add(1, Ordering::Relaxed);
         return;
@@ -518,7 +510,7 @@ static STRAY_BODY_HIT: AtomicU32 = AtomicU32::new(0);
 // 印は 1 つの AtomicU32 のビットで持つ（本体の枠が 32 を越えたらビットが足りない）。
 const _: () = assert!(OUTSIDE_BODIES_CAP <= 32);
 
-/// コピーのたびに、見張りの外の解放がだれのものかを見分ける表を置き直す。表より長い分は切る。`bodies` はバックアップした ScreenEffect の本体のアドレス（印を消してから置く）。
+/// コピーのたびに、見張りの外の解放がだれのものかを見分ける表を作り直す。表より長い分は切る。`bodies` はバックアップした ScreenEffect の本体のアドレス（印を消してから設定する）。
 pub(crate) fn set_stray_refs(frame: u32, nodes: &[u32], blocks: &[u32], bodies: &[u32]) {
     STRAY_BODY_HIT.store(0, Ordering::Relaxed);
     let nb = bodies.len().min(STRAY_BODIES.len());
@@ -807,7 +799,7 @@ impl ProbeIo for RealProbeIo<'_> {
     }
 }
 
-/// 範囲を置き場 `buf` へコピーする（割り当て器の状態を含む）。`l` は書ける頁と確かめた表、`buf` は `l.buffer_bytes()` バイト以上のコピーの置き場のときだけ呼ぶ。
+/// 範囲をバッファ `buf` へコピーする（割り当て器の状態を含む）。`l` は書ける頁と検証した表、`buf` は `l.buffer_bytes()` バイト以上のコピーのバッファのときだけ呼ぶ。
 pub(crate) fn save_regions(l: &Layout, buf: u32) {
     // SAFETY: ゲームのスレッドだけが触る入れ物（`GameCell` の Sync の注）。確保の入口も同じスレッドなので、この参照と重ならない（コピーしている間はゲームは動かない）。
     let Some(a) = (unsafe { (*ARENA.0.get()).as_mut() }) else {
@@ -818,7 +810,7 @@ pub(crate) fn save_regions(l: &Layout, buf: u32) {
         match r.kind {
             RegionKind::ArenaState => {
                 let w = a.state.to_words();
-                // SAFETY: 置き場の `[buf_off, buf_off + cap)` は呼び手が確保したコピーの置き場の中（cap = STATE_BYTES）。元はスタックで、重ならない。
+                // SAFETY: バッファの `[buf_off, buf_off + cap)` は呼び手が確保したコピーのバッファの中（cap = STATE_BYTES）。元はスタックで、重ならない。
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         w.as_ptr().cast::<u8>(),
@@ -833,14 +825,14 @@ pub(crate) fn save_regions(l: &Layout, buf: u32) {
                 if n == 0 {
                     continue;
                 }
-                // SAFETY: 元の `[addr, addr + len)` は `fill` が書ける頁と確かめた範囲か DLL の領域の `[base, base + top)`。先は置き場の中（len ≤ cap）。ゲームは動かない。
+                // SAFETY: 元の `[addr, addr + len)` は `fill` が書ける頁と検証した範囲か DLL の領域の `[base, base + top)`。先はバッファの中（len ≤ cap）。ゲームは動かない。
                 unsafe { core::ptr::copy_nonoverlapping(r.addr as usize as *const u8, dst, n) };
             }
         }
     }
 }
 
-/// 置き場 `buf` から書き戻す（領域は `[0, コピーしたときの top)` を戻し、`[コピーしたときの top, 今の top)` を 0 にし、割り当て器の状態を戻す）。`l` はコピーしたときの表（アドレスが変わっていないことを確かめてから呼ぶ）。
+/// バッファ `buf` から書き戻す（領域は `[0, コピーしたときの top)` を戻し、`[コピーしたときの top, 今の top)` を 0 にし、割り当て器の状態を戻す）。`l` はコピーしたときの表（アドレスが変わっていないことを検証してから呼ぶ）。
 pub(crate) fn restore_regions(l: &Layout, buf: u32) {
     // SAFETY: `save_regions` と同じ。
     let Some(a) = (unsafe { (*ARENA.0.get()).as_mut() }) else {
@@ -853,7 +845,7 @@ pub(crate) fn restore_regions(l: &Layout, buf: u32) {
         match r.kind {
             RegionKind::ArenaState => {
                 let mut w = [0u32; STATE_WORDS];
-                // SAFETY: 置き場の中の STATE_BYTES バイトを、スタックの語の配列へコピーするだけ。
+                // SAFETY: バッファの中の STATE_BYTES バイトを、スタックの語の配列へコピーするだけ。
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         src,
@@ -865,7 +857,7 @@ pub(crate) fn restore_regions(l: &Layout, buf: u32) {
             }
             RegionKind::Arena => {
                 let n = r.len.min(r.cap);
-                // SAFETY: 先は DLL の領域の `[base, base + n)`（n はコピーしたときの top ≤ 領域の長さ）。元は置き場の中。
+                // SAFETY: 先は DLL の領域の `[base, base + n)`（n はコピーしたときの top ≤ 領域の長さ）。元はバッファの中。
                 unsafe {
                     core::ptr::copy_nonoverlapping(src, r.addr as usize as *mut u8, n as usize)
                 };
@@ -885,7 +877,7 @@ pub(crate) fn restore_regions(l: &Layout, buf: u32) {
                 if n == 0 {
                     continue;
                 }
-                // SAFETY: 先は `fill` が書ける頁と確かめた範囲（コピーしたときと同じアドレスと長さ。呼び手がアドレスが変わっていないことを確かめてから書き戻す）。元は置き場の中。ゲームは動いていない。
+                // SAFETY: 先は `fill` が書ける頁と検証した範囲（コピーしたときと同じアドレスと長さ。呼び手がアドレスが変わっていないことを検証してから書き戻す）。元はバッファの中。ゲームは動いていない。
                 unsafe { core::ptr::copy_nonoverlapping(src, r.addr as usize as *mut u8, n) };
             }
         }
@@ -896,7 +888,7 @@ pub(crate) fn restore_regions(l: &Layout, buf: u32) {
 }
 
 impl RealProbeIo<'_> {
-    /// D1 の置き場と今の状態を範囲ごとに比べる。`diag` が `Some` なら診断を数え、`skip` が `Dead` なら描画用の欄を外す（純粋な判断は `rollback_draw`）。
+    /// D1 のバッファと今の状態を範囲ごとに比べる。`diag` が `Some` なら診断を数え、`skip` が `Dead` なら描画用の欄を外す（純粋な判断は `rollback_draw`）。
     fn compare_impl(
         &mut self,
         t: &Tables,
@@ -918,7 +910,7 @@ impl RealProbeIo<'_> {
             .find(|r| r.kind == RegionKind::ArenaState)
             .map_or_else(ArenaState::new, |r| {
                 let mut w = [0u32; STATE_WORDS];
-                // SAFETY: 置き場の `[buf_off, buf_off + STATE_BYTES)` は `arm` が確保したコピーの置き場の中。先はスタックの語の配列。重ならない。
+                // SAFETY: バッファの `[buf_off, buf_off + STATE_BYTES)` は `arm` が確保したコピーのバッファの中。先はスタックの語の配列。重ならない。
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         (buf + r.buf_off) as usize as *const u8,
@@ -931,7 +923,7 @@ impl RealProbeIo<'_> {
         for (r, o) in l.regions().iter().zip(out.iter_mut()) {
             let len1 = r.len.min(r.cap);
             let len2 = current_len(r.kind, r.len, a);
-            // SAFETY: `a1` は置き場の中の `[buf_off, buf_off + len1)`。`a2` は今の状態（割り当て器の状態はスタック、領域は `[base, base + top)`、ほかは D1 と同じ範囲）。ゲームは動いていない（別のスレッドが .data を書く所はコピーする範囲に入れていない）。
+            // SAFETY: `a1` はバッファの中の `[buf_off, buf_off + len1)`。`a2` は今の状態（割り当て器の状態はスタック、領域は `[base, base + top)`、ほかは D1 と同じ範囲）。ゲームは動いていない（別のスレッドが .data を書く所はコピーする範囲に入れていない）。
             let a1 = unsafe {
                 core::slice::from_raw_parts((buf + r.buf_off) as usize as *const u8, len1 as usize)
             };
@@ -977,12 +969,12 @@ pub fn armed() -> bool {
     ARMED.load(Ordering::Acquire) != 0
 }
 
-/// 入力の地点（台本の経路の先頭。ゲームのスレッド）。`Some(r)` なら入口へ `r` を返す（記録した語を feed した）。`feed` は「ローカル入力を 1 回読み、3 本へ feed」。
+/// 入力の地点（台本の経路の先頭。ゲームのスレッド）。`Some(r)` なら入口へ `r` を返す（記録した語を feed した）。`feed` は「ローカル入力を 1 回読み、InputManager の 3 本（1P・2P・合成）へ feed」。
 pub fn on_tick(feed: &mut dyn FnMut(u16, u16)) -> Option<u32> {
     if !armed() {
         return None;
     }
-    // SAFETY: `ARMED` を Acquire で 1 と読んだので、`arm` が置いた入れ物が見える。触るのはゲームのスレッドだけ。
+    // SAFETY: `ARMED` を Acquire で 1 と読んだので、`arm` が設定した入れ物が見える。触るのはゲームのスレッドだけ。
     let pb = unsafe { (*PROBE.0.get()).as_mut() }?;
     let mut io = RealProbeIo {
         feed,
@@ -1013,7 +1005,7 @@ pub fn after_feed(p1: u16, p2: u16) {
 }
 
 // ---- 走査の入口（判断は `rollback_resim.rs`）----
-/// 元の走査（`RESIM_SITES` の行の元の飛び先 `0x0042C700`）。この入口へ向く call を書く前に `install_call_hook_at` の `prepare` が置く。
+/// 元の走査（`RESIM_SITES` の行の元の飛び先 `0x0042C700`）。この入口へ向く call を書く前に `install_call_hook_at` の `prepare` が設定する。
 static SCAN_ORIGINAL: AtomicU32 = AtomicU32::new(0);
 /// 追加の走査 1 回ごとの時間（マイクロ秒）の標本。書き手はゲームのスレッドだけで、標本を書いてから Release で数を進める。
 static SAMPLES: [AtomicU32; MAX_SAMPLES] = [const { AtomicU32::new(0) }; MAX_SAMPLES];
@@ -1027,7 +1019,8 @@ static SAVED: SavedCell = SavedCell(UnsafeCell::new(SavedOutputs::EMPTY));
 
 // SAFETY（`#[unsafe(naked)]`）: `0x0042DCA9` の `call 0x42c700` の差し替え先。入った時は ecx = 更新の列のレジストリ `0x4ACFC8`（thiscall の this）、引数は無く、元の走査は `ret`。
 // ecx を積んで Rust の `rb_scan_wrapper`（cdecl、引数 1 つ、戻り値 eax）を呼び、`add esp, 4` で片付けて `ret`。ebx・esi・edi・ebp と esp は cdecl の決まりで保たれる
-// （do_frame は esi = ウィンドウ・edi を走査をまたいで使う）。DF は `cld` で 0。x87 のスタックは call の境目で空で、制御語は変えない。読むのは自分のスタックだけ。
+// （do_frame は esi = ウィンドウ・edi を走査をまたいで使う）。eax・ecx・edx は壊れてよい（呼ぶ側は戻り値の eax だけを読み、ecx は `0x0042DCAE` で設定し直す）。
+// DF は `cld` で 0。x87 のスタックは call の境目で空で、制御語は変えない。読むのは自分のスタックだけ。
 /// 走査の call（`0x0042DCA9`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn rb_scan_entry() {
@@ -1043,24 +1036,24 @@ pub extern "C" fn rb_scan_entry() {
 
 fn call_original(this: u32) -> i32 {
     let f = SCAN_ORIGINAL.load(Ordering::Relaxed);
-    // SAFETY: `f` は `RESIM_SITES` の行の元の飛び先 `0x0042C700`（thiscall）で、この入口へ向く call を書く前に置かれるので、呼ばれるときは 0 でない。
+    // SAFETY: `f` は `RESIM_SITES` の行の元の飛び先 `0x0042C700`（thiscall）で、この入口へ向く call を書く前に設定されるので、呼ばれるときは 0 でない。
     let f: unsafe extern "thiscall" fn(u32) -> i32 = unsafe { core::mem::transmute(f as usize) };
     // SAFETY: 上と同じ。走査の中のパニックはゲームのコード（Rust ではない）の外へは出ない。
     unsafe { f(this) }
 }
 
-/// 走査の包みで先に聞くフック（rollback のモードの配線が置く）。`Some(ret)` なら、そのフックが走査を呼び終えて `ret` を do_frame へ返す。0 は置いていない。
+/// 走査の包みで先に聞くフック（rollback のモードの配線が設定する）。`Some(ret)` なら、そのフックが走査を呼び終えて `ret` を do_frame へ返す。0 は設定していない。
 static SCAN_HANDLER: AtomicU32 = AtomicU32::new(0);
 
 /// 走査の包みで先に聞くフックの型（ゲームのスレッドで呼ばれる。`this` は走査の this = 更新の列のレジストリ）。
 pub type ScanHandler = fn(this: u32) -> Option<i32>;
 
-/// 走査の包みで先に聞くフックを置く・外す（`script_win::install_rollback_wiring` が呼ぶ。`None` で外す）。
+/// 走査の包みで先に聞くフックを設定する・外す（`script_win::install_rollback_wiring` が呼ぶ。`None` で外す）。
 pub fn set_scan_handler(h: Option<ScanHandler>) {
     SCAN_HANDLER.store(h.map_or(0, |f| f as usize as u32), Ordering::Release);
 }
 
-/// 走査の包みのフックが置かれているか（検査が、観戦者の設置がフックまで置いたことを見る）。
+/// 走査の包みのフックが設定されているか（検査が、観戦者の設置がフックまで設定したことを見る）。
 #[cfg(test)]
 pub(crate) fn scan_handler_is_set() -> bool {
     SCAN_HANDLER.load(Ordering::Acquire) != 0
@@ -1075,7 +1068,7 @@ pub(crate) fn scan_hooked() -> bool {
     SCAN_ORIGINAL.load(Ordering::Acquire) != 0
 }
 
-/// 走査の元の飛び先を置く（設置が、走査の call を書く前に呼ぶ —— `install_call_hook_at` の `prepare`）。
+/// 走査の元の飛び先を設定する（設置が、走査の call を書く前に呼ぶ —— `install_call_hook_at` の `prepare`）。
 pub(crate) fn set_scan_original(addr: u32) {
     SCAN_ORIGINAL.store(addr, Ordering::SeqCst);
 }
@@ -1087,7 +1080,7 @@ pub(crate) fn scan_entry_address() -> u32 {
 extern "C" fn rb_scan_wrapper(this: u32) -> i32 {
     let h = SCAN_HANDLER.load(Ordering::Acquire);
     if h != 0 {
-        // SAFETY: `h` は `set_scan_handler` が `ScanHandler` のアドレスを 32 ビットにして置いた値で、0 でない。関数のアドレスと整数は 32 ビットで同じ大きさ。
+        // SAFETY: `h` は `set_scan_handler` が `ScanHandler` のアドレスを 32 ビットにして保存した値で、0 でない。関数のアドレスと整数は 32 ビットで同じ大きさ。
         let f: ScanHandler = unsafe { core::mem::transmute::<usize, ScanHandler>(h as usize) };
         match catch_unwind(AssertUnwindSafe(|| f(this))) {
             Ok(Some(r)) => return r,
@@ -1105,7 +1098,7 @@ extern "C" fn rb_scan_wrapper(this: u32) -> i32 {
     if !armed() {
         return call_original(this);
     }
-    // SAFETY: `ARMED` を Acquire で 1 と読んだので、`arm` が置いた入れ物が見える。触るのはゲームのスレッド（ここ）だけ。
+    // SAFETY: `ARMED` を Acquire で 1 と読んだので、`arm` が設定した入れ物が見える。触るのはゲームのスレッド（ここ）だけ。
     let Some(qpf) = (unsafe { (*PROBE.0.get()).as_ref() }).map(|pb| pb.qpf) else {
         return call_original(this);
     };
@@ -1174,7 +1167,7 @@ pub(crate) fn ff_drop_outputs(ascii0: u32) -> bool {
     RawOutputs.write_u32(ASCII_COUNT, ascii0)
 }
 
-/// 出力（SE・BGM・文字の数）を語で読み書きする本物。`OUTPUT_RANGES` の外は断る（`arm` がその 3 つの範囲が書ける頁と確かめた）。
+/// 出力（SE・BGM・文字の数）を語で読み書きする本物。`OUTPUT_RANGES` の外は断る（`arm` がその 3 つの範囲が書ける頁と検証した）。
 struct RawOutputs;
 
 impl OutputMem for RawOutputs {
@@ -1182,7 +1175,7 @@ impl OutputMem for RawOutputs {
         if !rollback_resim::output_addr_allowed(addr) {
             return None;
         }
-        // SAFETY: `addr` は `OUTPUT_RANGES` の中の 4 バイト境界の語で、`arm` が読み書きできる頁と確かめた。ゲームのスレッドで、ゲームは動いていない（入力の地点か走査の間）。
+        // SAFETY: `addr` は `OUTPUT_RANGES` の中の 4 バイト境界の語で、`arm` が読み書きできる頁と検証した。ゲームのスレッドで、ゲームは動いていない（入力の地点か走査の間）。
         Some(unsafe { (addr as usize as *const u32).read() })
     }
     fn write_u32(&mut self, addr: u32, v: u32) -> bool {
@@ -1199,9 +1192,17 @@ impl OutputMem for RawOutputs {
 #[cfg(test)]
 pub(crate) static TEST_OUTPUT_RANGES_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// 検査の入口（`output_ranges_rw` を頁を見ずに偽にする）。検査のプロセスの配置によっては同じアドレスが書ける頁に当たる。
+#[cfg(test)]
+pub(crate) static TEST_OUTPUT_RANGES_NG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn output_ranges_rw() -> bool {
-    // 検査のプロセスには th09.exe の .data の頁が無いので、検査が設置の配線を通すときだけ頁を見ずに真にする。
+    // 検査のプロセスには th09.exe の .data の頁が無いので、検査が設置の配線を通すときだけ頁を見ずに決める。
+    #[cfg(test)]
+    if TEST_OUTPUT_RANGES_NG.load(Ordering::SeqCst) {
+        return false;
+    }
     #[cfg(test)]
     if TEST_OUTPUT_RANGES_OK.load(Ordering::SeqCst) {
         return true;
@@ -1273,28 +1274,28 @@ fn install_resim_hook(env: &mut dyn HookEnv, forbidden: &[AddrRange], out: &mut 
     if cfg!(feature = "dist") {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: resim = frame は配るバージョンでは書かない。realtime のまま動く"
+            "巻き戻しの実験: resim = frame は配るバージョンでは書きません。realtime のまま動きます。"
         );
         return false;
     }
     if let Err(e) = check_table(RESIM_SITES, forbidden) {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 走査の call の表が検査に落ちた（{e:?}）ので書かない。realtime のまま動く"
+            "巻き戻しの実験: 走査の call の表が検査に失敗した（{e:?}）ので書きません。realtime のまま動きます。"
         );
         return false;
     }
     let Some(def) = RESIM_SITES.iter().find(|d| d.name == RESIM_SCAN_SITE) else {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 表に {RESIM_SCAN_SITE} の行が無いので書かない。realtime のまま動く"
+            "巻き戻しの実験: 表に {RESIM_SCAN_SITE} の行が無いので書きません。realtime のまま動きます。"
         );
         return false;
     };
     if !output_ranges_rw() {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: SE・BGM・文字の数の欄が読み書きできる頁でないので書かない。realtime のまま動く"
+            "巻き戻しの実験: SE・BGM・文字の数の欄が読み書きできるページでないので書きません。realtime のまま動きます。"
         );
         return false;
     }
@@ -1306,7 +1307,7 @@ fn install_resim_hook(env: &mut dyn HookEnv, forbidden: &[AddrRange], out: &mut 
     if !r.written() {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 走査の call を書けなかったので realtime のまま動く"
+            "巻き戻しの実験: 走査の call が書けなかったので realtime のまま動きます。"
         );
     }
     r.written()
@@ -1332,7 +1333,7 @@ pub(crate) fn set_rb_trampoline(site: usize, addr: u32) {
     }
 }
 
-/// 設置の入口（`alloc_count::install_all` へ渡す AllocHost。入口のアドレスとトランポリンの置き場だけを使う）。
+/// 設置の入口（`alloc_count::install_all` へ渡す AllocHost。入口のアドレスとトランポリンの保存先だけを使う）。
 struct RbHost;
 
 impl AllocHost for RbHost {
@@ -1397,35 +1398,35 @@ pub fn arm(
         Ok(None) => return Armed::NotConfigured,
         Ok(Some(s)) => s,
         Err(e) => {
-            let _ = writeln!(out, "巻き戻しの実験: ini が読めない（{e}）ので入れない");
+            let _ = writeln!(out, "巻き戻しの実験: ini が読めない（{e}）ので入れません");
             return Armed::Handled;
         }
     };
     if matches!(alloc_count::settings_from_text(text), Ok(Some(_))) {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: [alloc_count] と同時には入れない（同じ 5 地点を使う）。どちらかを enable = 0 に"
+            "巻き戻しの実験: [alloc_count] と同時には入れません（同じ 5 フック地点を使う）。どちらかを enable = 0 にしてください。"
         );
         return Armed::Handled;
     }
     if crate::rollback_play_win::armed() || RB_BASE.load(Ordering::SeqCst) != 0 {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: rollback のモードの製品の経路がもう入っている（同じ入口と領域を使う）ので入れない"
+            "巻き戻しの実験: rollback のモードの製品の処理フローがもう入っている（同じ入口と領域を使う）ので入れません"
         );
         return Armed::Handled;
     }
     let Some(tid) = main_tid else {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: ゲームのスレッドの ID が取れないので入れない"
+            "巻き戻しの実験: ゲームのスレッドの ID が取れないので入れません"
         );
         return Armed::Handled;
     };
     let Some(base) = virtual_alloc(s.arena_bytes) else {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 領域 {} バイトを確保できないので入れない",
+            "巻き戻しの実験: 領域 {} バイトが確保できないので入れません",
             s.arena_bytes
         );
         return Armed::Handled;
@@ -1433,7 +1434,7 @@ pub fn arm(
     let mut probe = match Probe::new(s, Tables::th09(), base) {
         Ok(p) => p,
         Err(e) => {
-            let _ = writeln!(out, "巻き戻しの実験: 範囲の表を作れない（{e}）ので入れない");
+            let _ = writeln!(out, "巻き戻しの実験: 範囲の表の作成不能（{e}）。入れません");
             return Armed::Handled;
         }
     };
@@ -1443,14 +1444,14 @@ pub fn arm(
     let (Some(snap), Some(d1)) = (virtual_alloc(buf_bytes), virtual_alloc(buf_bytes)) else {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: コピーの置き場 {buf_bytes} バイト × 2 を確保できないので入れない"
+            "巻き戻しの実験: コピー用の領域 {buf_bytes} バイト × 2 が確保できないので入れません"
         );
         return Armed::Handled;
     };
     let mut qpf: i64 = 0;
     // SAFETY: 書く先は自分の変数。
     unsafe { QueryPerformanceFrequency(&mut qpf) };
-    // SAFETY: 置くのは読み取りのスレッドの 1 回だけ。まだ `ARMED` も `RB_BASE` も立てておらず、ゲームのスレッドは入れ物に触らない。
+    // SAFETY: 設定するのは読み取りのスレッドの 1 回だけ。まだ `ARMED` も `RB_BASE` も立てておらず、ゲームのスレッドは入れ物に触らない。
     unsafe {
         *ARENA.0.get() = Some(Arena {
             state: ArenaState::new(),
@@ -1478,7 +1479,7 @@ pub fn arm(
     host.prepare_counters(tid);
     let _ = writeln!(
         out,
-        "巻き戻しの実験: 領域 0x{base:08X}（{} MiB）、コピーの置き場 {buf_bytes} バイト × 2、範囲 {} 個、k = {:?}、各 {} 回、最初は試合の {} tick 目、間 {} tick、進め直しの形 {}",
+        "巻き戻しの実験: 領域 0x{base:08X}（{} MiB）、コピー用の領域 {buf_bytes} バイト × 2、範囲 {} 個、k = {:?}、各 {} 回、最初はマッチの {} tick 目、間 {} tick、進め直しの形 {}",
         s.arena_bytes >> 20,
         probe_regions(),
         s.ks(),
@@ -1496,7 +1497,7 @@ pub fn arm(
     if written[SITE_MALLOC] && written[SITE_NEW] && written[SITE_FREE] {
         // フレームの形は走査の call も書く。書けなければ realtime へ戻す。
         if s.resim == ResimMode::Frame && !install_resim_hook(hook_env, forbidden, out) {
-            // SAFETY: 置いた後・`ARMED` を立てる前なので、ゲームのスレッドはまだ入れ物に触らない。
+            // SAFETY: 設定した後・`ARMED` を立てる前なので、ゲームのスレッドはまだ入れ物に触らない。
             if let Some(pb) = unsafe { (*PROBE.0.get()).as_mut() } {
                 pb.probe.set_resim(ResimMode::Realtime);
             }
@@ -1505,13 +1506,13 @@ pub fn arm(
         ARMED.store(1, Ordering::Release);
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 入れた（malloc・new・free の 3 地点を DLL の入口へ。包み 2 つは数えるだけ。calloc の見張り {}）",
+            "巻き戻しの実験: 入れました（malloc・new・free の 3 フック地点を DLL の入口へ。包み 2 つは数えるだけ。calloc の見張り {}）。",
             if calloc { "あり" } else { "なし" }
         );
     } else {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: 3 地点のどれかが書けなかったので、確保は向けない（{written:?}）"
+            "巻き戻しの実験: 3 フック地点のどれかが書けなかったので確保は向けません（{written:?}）。"
         );
     }
     Armed::Handled
@@ -1529,7 +1530,7 @@ fn install_calloc(
     if let Err(e) = check_table(CALLOC_SITES, forbidden) {
         let _ = writeln!(
             out,
-            "巻き戻しの実験: calloc の表が検査に落ちた（{e:?}）ので書かない"
+            "巻き戻しの実験: calloc の表が検査に失敗した（{e:?}）ので書きません"
         );
         return false;
     }
@@ -1545,19 +1546,19 @@ fn install_calloc(
 }
 
 fn probe_regions() -> usize {
-    // SAFETY: `arm` の中（置いた直後、ゲームのスレッドがまだ触らない）からだけ呼ぶ。
+    // SAFETY: `arm` の中（設定した直後、ゲームのスレッドがまだ触らない）からだけ呼ぶ。
     unsafe { (*PROBE.0.get()).as_ref() }.map_or(0, |p| p.probe.plan().n)
 }
 
 pub fn finish(out: &mut dyn Write) {
-    // SAFETY: 読むだけ（`Probe` の設定と範囲の表は置いた後に変わらない）。
+    // SAFETY: 読むだけ（`Probe` の設定と範囲の表は設定した後に変わらない）。
     let Some(pb) = (unsafe { (*PROBE.0.get()).as_ref() }) else {
         return;
     };
     STOP.store(1, Ordering::Release);
     std::thread::sleep(std::time::Duration::from_millis(200));
     let n = RESULT_COUNT.load(Ordering::Acquire) as usize;
-    let _ = writeln!(out, "==== 巻き戻しの実験（E1-2） ====");
+    let _ = writeln!(out, "==== 巻き戻しの実験 ====");
     // SAFETY: `[0, n)` はゲームのスレッドが書き終えて数を進めた記録（Acquire で数を読んだ）。
     let Some(rs) = (unsafe { (*RESULTS.0.get()).as_ref() }) else {
         return;
@@ -1664,7 +1665,7 @@ mod tests {
 
     static SEEN_ECX: AtomicU32 = AtomicU32::new(0);
 
-    // SAFETY（`#[unsafe(naked)]`）: 元の走査の代わり（検査だけ）。入った時の ecx を書いて、eax に 0x1234 を置き、ecx・edx を壊して `ret` する。
+    // SAFETY（`#[unsafe(naked)]`）: 元の走査の代わり（検査だけ）。入った時の ecx を書いて、eax に 0x1234 を入れ、ecx・edx を壊して `ret` する。
     #[unsafe(naked)]
     extern "C" fn fake_scan() {
         core::arch::naked_asm!(

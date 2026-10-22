@@ -1,13 +1,11 @@
-//! 自分の PC にだけゲーム自身のスクリーンショットを撮らせる仕組みの Win32 の層（unsafe はこの中だけ）。押した瞬間の取り方と持ち越しの規則は
-//! `shot_key.rs`。
+//! 自分の PC にだけゲーム自身のスクリーンショットを撮らせる仕組みの Win32 の層（unsafe はこの中だけ）。押した瞬間の取り方と持ち越しの規則は `shot_key.rs`。
 //!
-//! - 毎 tick（`script_win::tick_inner` の終わり。ツールが入力を握った tick かどうかを渡される）: ゲームのウィンドウが前面で文字の入力中でないときだけ
-//!   P・Home を `GetAsyncKeyState` で読み（読むだけ。OS への入力の注入も前面の操作もしない）、押した瞬間を覚える。台本の付いた実行では読まない。
+//! - 毎 tick（`script_win::tick_inner` の終わり。ツールが入力を握った tick かどうかを渡される）: ゲームのウィンドウが前面で文字の入力中でないときだけ P・Home を `GetAsyncKeyState` で読み（読むだけ。OS への入力の注入も前面の操作もしない）、押した瞬間を覚える。台本の付いた実行では読まない。
 //! - Present のラッパ `0x0042DB50` を呼ぶ間（`pacing_win::present_entry` が `shot_present_begin` / `shot_present_end` で挟む）: 覚えた押下があれば
 //!   `SHOT_WORD`（合成の InputManager の押した瞬間の語）の `SHOT_BIT` を立て、戻ったらそのビットだけを落とす。ゲームがラッパの中の `0x0042DBAA` で
 //!   ビットを見て、自分の `snapshot\` に BMP を書く。DLL はファイルを書かず、ゲームのコードも書き換えない（データの 1 語を一時的に書くだけ）。
 //!
-//! 遅延の増分: 毎 tick に旗の直読み 1 回・前面の問い合わせ 3 回・`GetAsyncKeyState` 最大 2 回（前面のときだけ）。押した PC のそのフレームだけ、
+//! 遅延の増分: 毎 tick に旗の直読み 1 回・前面の問い合わせ 3 回・`GetAsyncKeyState` 最大 2 回（前面のときだけ）。押したフレームだけ、
 //! ゲーム自身の BMP の書き込み（約 0.9 MB。ミリ秒は測っていない）が Present のラッパの中で走る。ゲームのスレッドで、確保しない・待たない。
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -36,7 +34,7 @@ static TEST_WORD: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16:
 #[cfg(test)]
 static TEST_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// 毎 tick の読みと Present の挟みを動かしてよいか: Present のラッパの差し替え口が置けた実行だけ（置けなかった実行は撮れない・何も書かない）。
+/// 毎 tick の読みと Present の挟みを動かしてよいか: Present のラッパの差し替え口を設置できた実行だけ（できなかった実行は撮れない・何も書かない）。
 /// 検査では、他の検査が `PRESENT_ORIGINAL` を触るので、この旗を立てた検査だけが動かす。
 pub fn armed() -> bool {
     #[cfg(test)]
@@ -103,7 +101,7 @@ fn on_tick_with(held: bool, scripted: bool, read: impl FnOnce() -> Option<bool>)
     }
 }
 
-/// 検査だけ: `script_win` の検査が、入力の入口の戻り値と台本の有無から押下を取れているかを見るための窓。`on` で毎 tick の読みを動かす
+/// 検査だけ: `script_win` の検査が、入力の入口の戻り値と台本の有無から押下を取れているかを見るための入口。`on` で毎 tick の読みを動かす
 /// （状態は最初に戻す）。
 #[cfg(test)]
 pub(crate) fn test_enable(on: bool) {
@@ -124,7 +122,7 @@ pub(crate) fn test_pending() -> bool {
     ShotKeys::from_bits(STATE.load(Ordering::SeqCst)).pending()
 }
 
-/// ゲームの語を置く場所。製品では `SHOT_WORD` 固定。検査では検査用の 1 語を指す（未設定なら `None` で何もしない）。
+/// ゲームの語の場所。製品では `SHOT_WORD` 固定。検査では検査用の 1 語を指す（未設定なら `None` で何もしない）。
 #[cfg(not(test))]
 fn word_addr() -> Option<usize> {
     Some(crate::th09_addr::SHOT_WORD as usize)
@@ -137,7 +135,7 @@ fn word_addr() -> Option<usize> {
 
 fn read_word(addr: usize) -> u16 {
     // SAFETY: 製品の `addr` は `SHOT_WORD`（th09.exe の .data の中。起動から終わりまでコミット済みで読み書きできる頁。偶数で u16 の整列）。ここへ来るのは、
-    // Present のラッパの差し替え口が置けた実行で、ゲームのスレッド（書き手の feed / poll と同じスレッド）が持ち越しの押下を持っているときだけ。検査では検査用の 1 語。
+    // Present のラッパの差し替え口を設置できた実行で、ゲームのスレッド（書き手の feed / poll と同じスレッド）が持ち越しの押下を持っているときだけ。検査では検査用の 1 語。
     unsafe { (addr as *const u16).read_volatile() }
 }
 
@@ -165,7 +163,7 @@ fn begin() {
     let Some(raised) = shot_key::raise(read_word(addr)) else {
         return;
     };
-    // 先に印を置いてから書く（書いた後に戻せなくなる順を作らない）。
+    // 先に印を立ててから書く（書いた後に戻せなくなる順を作らない）。
     RAISED.store(1, Ordering::Relaxed);
     write_word(addr, raised);
 }

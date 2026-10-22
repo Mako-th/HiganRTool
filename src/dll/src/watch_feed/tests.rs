@@ -1,5 +1,5 @@
 //! 一覧の接続のスレッド（`watch_feed.rs`）の検査。偽のルームサーバー（loopback）と本物の WinHTTP で実時間に回すものは `#[ignore]`。
-//! 外へは繋がない（`127.0.0.1` と `Proxy::Direct`）。名前・ルーム名は合成の値だけ。
+//! 外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。名前・ルーム名は合成の値だけ。
 use super::*;
 
 use std::time::Instant;
@@ -92,7 +92,7 @@ fn host(srv: &FakeServer, p1: &str, q: &str) -> HostListConn {
         c.poll();
         std::thread::sleep(Duration::from_millis(5));
     }
-    // 載った知らせ（listed）を受けて、観戦者の数を送れる状態にする。
+    // 載った知らせ（listed）を受けて、観戦者の数をルームサーバーへ送れる状態にする。
     std::thread::sleep(Duration::from_millis(100));
     c.poll();
     c
@@ -115,7 +115,7 @@ fn a_stopped_feed_can_no_longer_write_the_box_and_a_new_one_can() {
     publish(&link, old, ListStatus::Ready, &[row]);
     r.poll();
     assert_eq!(r.snap.len(), 1, "いまの世代は書ける");
-    // 世代が進んだ（止めた・次を起こした）ら、古い世代は書けない。
+    // 世代が進んだ（止めた・次を作った）ら、古い世代は書けない。
     link.next_watch_generation();
     publish(&link, old, ListStatus::Ready, &[]);
     r.poll();
@@ -229,7 +229,7 @@ fn the_feed_says_failed_when_the_server_refuses_or_is_unreachable_and_never_rows
     rd.wait("失敗が届く", |s| s.status == ListStatus::Failed);
     assert!(rd.snap.is_empty());
     feed.join();
-    // 繋がらない（閉じた loopback の番号）。
+    // 接続できない（閉じた loopback の番号）。
     let link = Arc::new(UiLink::new());
     let mut rd = Reader::new(&link);
     let feed = WatchFeed::start(Arc::clone(&link), opts("ws://127.0.0.1:9"), BUILD).unwrap();

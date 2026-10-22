@@ -9,6 +9,7 @@ Cloudflare WorkersとDurable Objectで動く、TypeScriptの小さなサーバ�
 - **ルームマッチ**: 同じルーム名を入れた2人の間で、接続コードを1往復だけ受け渡します。渡し終えたらルームを閉じ、その後の通信は2人のPCの間で直接行います。
 - **ランダムマッチ**: 待っている人を来た順に2人ずつ組にし、推測できないルーム名を2人へ返します。その後はルームマッチと同じです。
 - **観戦の一覧**: 進行中のランダムマッチを観戦者に見せます。
+- **観戦の断り**: 観戦を許可していないホストは、観戦用のルームで`refuse`を送ります。ルームに残り、入ってくる観戦者を`refused`（4403）で閉じ続けます。
 - **アップデート**: ローダーが起動の前に取りに来る署名つきの目録とファイルを、配布している場所（GitHubのReleasesの最新）へ回します。
 
 試合の通信はこのサーバーを通りません。
@@ -18,7 +19,7 @@ Cloudflare WorkersとDurable Objectで動く、TypeScriptの小さなサーバ�
 ## 中身
 
 - `src/index.ts`: 入口のWorkerです。パス・バージョン・ルーム名の文字・WebSocketか・繋ぐ回数を見て、それぞれのDurable Objectへ渡します。
-- `src/room.ts`: ルーム（1つのルームが1つのDurable Object）。役割（host / guest）・接続コードの受け渡し・期限・相手の切断。
+- `src/room.ts`: ルーム（1つのルームが1つのDurable Object）。役割（host / guest）・接続コードの受け渡し・観戦の断り・期限・相手の切断。
 - `src/random_queue.ts`: ランダムマッチの待ち列（ビルド番号ごとに1つ）。
 - `src/watch_list.ts`: 観戦の一覧（ビルド番号ごとに1つ）。
 - `src/connect_limiter.ts`: IPアドレス（IPv6は/64）ごとに、繋ぐ回数を数えます。前段にCloudflareのRate Limitingも置いています。

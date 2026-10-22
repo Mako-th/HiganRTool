@@ -1,4 +1,4 @@
-// 更新のエンドポイント（src/update.ts）の検査。外へは繋がない。
+// 更新のエンドポイント（src/update.ts）の検査。外へは接続しない。
 import { exports } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -94,8 +94,8 @@ function get(path: string, init: RequestInit = {}): Promise<Response> {
   });
 }
 
-// 目録を取り寄せる Worker の fetch は、この検査では必ず偽物に差し替える（配り場所へ本当に繋がない）。
-// 差し替えを忘れた回が外へ出ないよう、既定は「繋がらない」。
+// 目録を取り寄せる Worker の fetch は、この検査では必ず偽物に差し替える（配り場所へ本当に接続しない）。
+// 差し替えを忘れた回が外へ出ないよう、既定は「接続しない」。
 let outbound: string[] = [];
 let outboundReply: (url: string) => Promise<Response> = () => Promise.reject(new TypeError("blocked in test"));
 

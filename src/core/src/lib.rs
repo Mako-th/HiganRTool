@@ -1,5 +1,5 @@
 //! HiganRTool の中核。Win32 にもゲームのメモリにも触らない純粋な処理（プロトコル・lockstep・入力語・リプレイの解析）だけを
-//! 置き、`cargo test` でそのまま検査する。unsafe は使えない（下の `forbid`）。
+//! 入れ、`cargo test` でそのまま検査する。unsafe は使えない（下の `forbid`）。
 
 #![forbid(unsafe_code)]
 
@@ -7,6 +7,7 @@ pub mod adapter_pick;
 pub mod arena;
 pub mod auth;
 pub mod autosave;
+pub mod bits512;
 pub mod candidate;
 pub mod check;
 pub mod chime;
@@ -22,6 +23,7 @@ pub mod game_running;
 pub mod guard;
 pub mod gzlog;
 pub mod handshake;
+pub mod host_pick;
 pub mod ini;
 pub mod ini_edit;
 pub mod ini_lenient;
@@ -61,6 +63,7 @@ pub mod replay_compare;
 pub mod replay_decode;
 pub mod replay_detail;
 pub mod replay_mark_cmp;
+pub mod replay_menu_path;
 pub mod replay_playcheck;
 pub mod replay_rewrite;
 pub mod replay_rounds;
@@ -71,6 +74,7 @@ pub mod room;
 pub mod room_input;
 pub mod room_queue;
 pub mod room_rejoin;
+pub mod rtt_probe;
 pub mod runfile;
 pub mod save_skip;
 pub mod script;
@@ -80,6 +84,7 @@ pub mod selection;
 pub mod shot;
 pub mod spectate;
 pub mod spectate_pace;
+pub mod spectate_rate;
 pub mod spectate_room;
 pub mod stun;
 pub mod ui_entry;

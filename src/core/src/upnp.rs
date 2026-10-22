@@ -32,7 +32,7 @@ pub enum UpnpError {
     Refused(&'static str),
     /// 機器が断った（HTTP の状態と、SOAP の errorCode が読めればその数）。
     Fault { status: u16, code: Option<u32> },
-    /// 通信の誤り（つなげない・時間切れ。中は OS の誤りの文）。
+    /// 通信の誤り（接続できない・時間切れ。中は OS の誤りの文）。
     Io(String),
 }
 
@@ -64,7 +64,7 @@ impl UpnpError {
 
 /// 外側のポートがほかの割り当てと重なった（別のポートで頼み直せる）。
 pub const FAULT_CONFLICT: u32 = 718;
-/// 指定の割り当てが無い（Get / Delete で、消えているのを確かめるときの答え）。
+/// 指定の割り当てが無い（Get / Delete で、消えているのをチェックするときの答え）。
 pub const FAULT_NO_SUCH_ENTRY: u32 = 714;
 /// 期限なしの割り当てしか受けない（期限つきで頼んだら断られた）。
 pub const FAULT_ONLY_PERMANENT: u32 = 725;
@@ -642,7 +642,7 @@ mod tests {
         ] {
             assert!(base.join(rel).is_err(), "{rel:?}");
         }
-        // 前後の空白は取る（機器の記述の XML の改行・字下げ）。
+        // 前後の空白は取る（機器の記述の XML の改行・インデント）。
         assert_eq!(base.join("\n  /ctl/IPConn\n").unwrap().path, "/ctl/IPConn");
     }
 

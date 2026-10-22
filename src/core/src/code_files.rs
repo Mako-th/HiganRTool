@@ -1,13 +1,9 @@
-//! 接続コードの受け渡しに使うファイルの名前と置き場の決まり。dll の `net_code` とローダーの `code_relay` で同じでなければ
-//! ならない（食い違うとローダーは誰も読まない所へ書く）ので、両方から引ける core に置く。
+//! 接続コードの受け渡しに使うファイルの名前と置き場の決まり。dll の `net_code` とローダーの `code_relay` で同じでなければならない（食い違うとローダーは誰も読まない所へ書く）ので、両方から引ける core に定義する。
 //!
 //! - 置き場は DLL のフォルダの `code\`（ini の `code_dir` で変えられる。絶対パスならそのまま、相対なら DLL のフォルダから）。
-//! - `my_code.txt` … 自分のコード（dll が書き、繋がったら消す）。
-//! - `peer_code.txt` … 相手のコード（人かローダーが貼る。dll は読むだけ）。
-//! - `status.txt` … いまの状態（dll が書き直す。ローダーのウィンドウが「状態」の行に出す）。
-//! - `mode.txt` … ウィンドウで選んだ対戦の形（ローダーが書き、dll の見張りが読む。対象のゲームの pid つき）。
-//! - `clip_out.txt` / `clip_in.txt` … `clipboard = file`（開発用）のときのクリップボードの代わり。dll が `clip_out.txt` へ
-//!   「コピーする文字」を書き、`clip_in.txt` から「貼る文字」を読む。
+//! - `my_code.txt` … 自分のコード（dll が書き、接続したら消す）。`peer_code.txt` … 相手のコード（人かローダーが貼る。dll は読むだけ）。
+//! - `status.txt` … いまの状態（dll が書き直す。ローダーのウィンドウが「状態」の行に出す）。`mode.txt` … ウィンドウで選んだ対戦の形（ローダーが書き、dll の見張りが読む。対象のゲームの pid つき）。
+//! - `clip_out.txt` / `clip_in.txt` … `clipboard = file`（開発用）のときのクリップボードの代わり。dll が `clip_out.txt` へ「コピーする文字」を書き、`clip_in.txt` から「貼る文字」を読む。
 //! - 書き直しは一時の名前（`<名前>.tmp`）に書いてから置き換える（読み手が書きかけを見ない）。
 #![forbid(unsafe_code)]
 
@@ -28,10 +24,10 @@ pub const MODE_TMP_FILE: &str = "mode.txt.tmp";
 
 pub const CLIP_OUT_FILE: &str = "clip_out.txt";
 pub const CLIP_IN_FILE: &str = "clip_in.txt";
-/// クリップボードの形式 `CF_UNICODETEXT`（UTF-16 の終端 0 つき。`winuser.h` の値 13）。windows-sys の定義は Ole の feature が要るので、ここに置く。
+/// クリップボードの形式 `CF_UNICODETEXT`（UTF-16 の終端 0 つき。`winuser.h` の値 13）。windows-sys の定義は Ole の feature が要るので、ここに定義する。
 pub const CF_UNICODETEXT: u32 = 13;
 
-/// 相手のファイルを読む間隔。人が貼ってから繋ぎ始めるまでの待ちの上限になる。
+/// ローダーと DLL が相手のファイルを読む間隔。人が貼ってから DLL が接続し始めるまでの待ちの上限になる。
 pub const POLL: Duration = Duration::from_millis(250);
 
 /// 読むファイルの上限（B）。いちばん長いコードは 354 文字で、BOM と空行を足しても 1 KB に届かない。越えた分は読まない。

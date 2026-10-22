@@ -1,29 +1,17 @@
 //! 対戦の成立（READY。type 20）の状態機械（pure。確保しない）。
 //!
-//! 成立は「両者が『妖怪 対 妖怪』を選んだ」とき。成立の前は lockstep・選択の同期（MENU / STEP_REQ / STEP / SELECT）・CHECK に
-//! 入らない（待っている間に別のモードで遊べる）。繋がってから `MATCH_WAIT_MS` の間に成立しなければ閉じる。
-//! `code_side = game` の実行だけが使う（`link::Link::set_match_gate`）。それ以外（`offer` / `answer`・観戦・peer_sim の既定）は
-//! 繋がったときに成立したことになり、READY を 1 通も送らない。
-//!
-//! ## 決まり
-//!
+//! 成立は「両者が『妖怪 対 妖怪』を選んだ」とき。成立の前は lockstep・選択の同期（MENU / STEP_REQ / STEP / SELECT）・CHECK に入らない（待っている間に別のモードで遊べる）。接続してから `MATCH_WAIT_MS` の間に成立しなければ閉じる。
+//! `code_side = game` の実行だけが使う（`link::Link::set_match_gate`）。それ以外は接続したときに成立したことになり、READY を 1 通も送らない。
 //! - 単調: 自分の「選んだ」も相手の「選んだ」も一度立ったら戻らない。取り消したいときは「抜ける」（BYE）だけ。
-//!   戻せると「片方が取り消した READY が遅れて届き、もう片方だけが成立する」筋を閉じる決まりが要る。
-//! - 送り直し: 自分が選んでいる間、`READY_RESEND_MS` ごとに READY を送る（選んだ瞬間に 1 通目）。成立した後も、相手から
-//!   成立後の通信（MENU・STEP_REQ・STEP・SELECT・INPUT・CHECK）を 1 通受けるまでは送り続ける（相手が自分の READY を落としたとき、
-//!   相手だけが成立しないまま残らないため）。受け側は重複の READY を数えるだけで何も変えない。
-//! - 時間切れ: 繋がった時刻から `MATCH_WAIT_MS` 経っても成立していなければ一度だけ「切れた」と言う（呼び手が BYE(取消) で閉じる。
-//!   `link::Connected::poll`）。成立した後は切れない。
-//! - ゲートの無い相手: 相手から成立後の通信を受けたのに相手の READY を 1 通も受けていない状態が `NO_GATE_MS` 続いたら、一度だけ
-//!   「相手にゲートが無い」と言う（閉じ方は時間切れと同じ）。ゲートの無い相手 = 古いバージョンの `code_side = game` か、同じバージョンの `offer` / `answer`。
-//!   READY を送らずこちらの READY は捨てるので、待ち続けると相手だけが難易度の画面で止まる。ゲートのある相手は READY の 1 通目を
-//!   成立後の通信より先に出すので、1 通目が落ちても `NO_GATE_MS` の間に送り直しが 2 回ある。
+//! - 送り直し: 自分が選んでいる間、`READY_RESEND_MS` ごとに READY を送る。成立した後も、相手から成立後の通信を 1 通受けるまでは送り続ける（相手が自分の READY を落としたとき、相手だけが成立しないまま残らないため）。
+//! - 時間切れ: 接続した時刻から `MATCH_WAIT_MS` 経っても成立していなければ一度だけ「切れた」と言う（呼び手が BYE(取消) で閉じる）。成立した後は切れない。
+//! - ゲートの無い相手: 相手から成立後の通信を受けたのに相手の READY を 1 通も受けていない状態が `NO_GATE_MS` 続いたら、一度だけ「相手にゲートが無い」と言う（閉じ方は時間切れと同じ。待ち続けると相手だけが難易度の画面で止まるため）。
 //!
 //! 時刻は u32 の ms で、差は `wrapping_sub` で取る（`liveness.rs` と同じ）。
 
 use crate::liveness::PING_INTERVAL_MS;
 
-/// 繋がってから成立を待つ長さ（ms）。10 分。画面の文（`net_menu`）もここから作る。
+/// 接続してから成立を待つ長さ（ms）。10 分。画面の文（`net_menu`）もここから作る。
 pub const MATCH_WAIT_MS: u32 = 10 * 60 * 1000;
 
 /// READY を送り直す間隔（ms）。生存の PING と同じ間隔（`liveness::PING_INTERVAL_MS`）。
@@ -34,7 +22,7 @@ pub const READY_RESEND_MS: u32 = PING_INTERVAL_MS;
 pub const NO_GATE_MS: u32 = 3 * READY_RESEND_MS;
 
 /// 成立しないまま閉じた理由。`Gate::check_close` が返すのは `TimedOut` と `PeerHasNoGate` だけ。`PeerLeft` は呼び手（dll）が
-/// 成立の前に相手の BYE(取消) を受けたときに使う（同じ画面の行と終わりの種類に載せるため、ここに置く）。
+/// 成立の前に相手の BYE(取消) を受けたときに使う（同じ画面の行と終わりの種類に載せるため、ここに定義する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoMatch {
     TimedOut,
@@ -51,7 +39,7 @@ pub struct GateCounts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gate {
-    /// 繋がった時刻（時間切れの起点）。
+    /// 接続した時刻（時間切れの起点）。
     since: u32,
     local: bool,
     peer: bool,

@@ -1,12 +1,12 @@
-//! 合成の最小の PE32（見出しだけ）を作る。`cargo test` の偽物のファイルと、自己検査の行 8（`pe::parse` は通るが
-//! Windows のローダーは読めない DLL で `LoadLibraryW` に 0 を返させる）に使う。`pe::parse` が読む範囲だけ正しく置き、残りは 0。
+//! 合成の最小の PE32（見出しだけ）を作る。`cargo test` の偽物のファイルと、自己検査（`selftest.rs`）の行 8（`pe::parse` は通るが
+//! Windows のローダーは読めない DLL で `LoadLibraryW` に 0 を返させる）に使う。`pe::parse` が読む範囲だけ正しく書き、残りは 0。
 
 const E_LFANEW: usize = 0x40;
 const FILE_HEADER: usize = E_LFANEW + 4;
 const OPTIONAL_HEADER: usize = FILE_HEADER + 20;
 const SIZE_OF_OPTIONAL_HEADER: usize = 0xE0;
 const SECTION_TABLE: usize = OPTIONAL_HEADER + SIZE_OF_OPTIONAL_HEADER;
-/// `.text` の中身を置くファイル上の位置。
+/// `.text` の中身を入れるファイル上の位置。
 const TEXT_FILE_OFFSET: usize = 0x200;
 const TEXT_RVA: u32 = 0x1000;
 

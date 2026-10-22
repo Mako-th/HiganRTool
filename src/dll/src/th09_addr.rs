@@ -1,4 +1,4 @@
-//! 花映塚 1.50a（th09.exe）のアドレスと期待バイト列。**この値はここ 1 か所にだけ置く**（同定の値だけは `higanr_core::pe::TH09_V150A`）。
+//! 花映塚 1.50a（th09.exe）のアドレスと期待バイト列。**この値はここ 1 か所にだけ書く**（同定の値だけは `higanr_core::pe::TH09_V150A`）。
 //! 各行の `source` に、解析のノートの節と逆アセンブルの行を書く。ノートに無い値は書かない
 //! （転記ミスは `every_site_appears_in_the_note_with_its_address` が見る）。アドレスはすべて image base `0x400000` の VA（ASLR 無し）。
 #![forbid(unsafe_code)]
@@ -10,7 +10,7 @@ use crate::rollback_play::RbRenderReset;
 use crate::rollback_probe::{RbBlock, RbCallers, RbData, RbEffect, RbSkip, RbSkipKind, RbVmArray};
 use crate::sites::{SiteDef, Use};
 
-/// 地点の表の `source`（ノートの節と逆アセンブルの行）を置く。配布のビルド（feature `dist`）では `""` にする（配るバイナリに解析の跡を残さないため）。
+/// 地点の表の `source`（ノートの節と逆アセンブルの行）を持たせる。配布のビルド（feature `dist`）では `""` にする（配るバイナリに解析の跡を残さないため）。
 /// `macro_rules!` の定義を 2 つに分けるのは、配布のビルドでは文字列が展開の段階で消え、成果物に残るかをコンパイラの作りに頼らずに済むため。
 #[cfg(not(feature = "dist"))]
 macro_rules! site_source {
@@ -37,7 +37,7 @@ pub const HOOK_SITE: &str = "input_wait_call";
 /// ウィンドウの構造体（do_frame `0x0042DC40` の this）。`0x0042E6A1 mov $0x4b30b0,%ecx` の直後に `0x0042E6A6 call 0x42dc40`。
 /// 入口は静的変数（`stub::WINDOW`）から読むので、検査では偽のウィンドウを指せる。
 pub const WINDOW_ADDR: u32 = 0x004B_30B0;
-/// ウィンドウの今の時刻（double）。do_frame の先頭で時計 `0x0042CC90` の値を `0x0042DC4C fstl 0x2c(%esi)` で置く。同じ do_frame の中では変わらない。
+/// ウィンドウの今の時刻（double）。do_frame の先頭で時計 `0x0042CC90` の値を `0x0042DC4C fstl 0x2c(%esi)` で書く。同じ do_frame の中では変わらない。
 pub const WINDOW_NOW: u32 = 0x2C;
 /// ウィンドウの期限（double）。`0x0042DC59 fcoml 0x3c(%esi)` で今の時刻と比べ、過ぎていれば `0x0042DC74`〜`0x0042DC7D` で 1 周期ずつ進める。
 pub const WINDOW_DEADLINE: u32 = 0x3C;
@@ -86,8 +86,9 @@ pub const IM_UP: u32 = 0x08;
 pub const IM_CHARGE: u32 = 0x2A;
 pub const IM_GAME: u32 = 0x2C;
 /// ゲーム自身のスクリーンショットが見る語（合成 `[2]` の押した瞬間 `+0x06` = `0x004ACF3A`）と、P・Home のビット。
-/// 読むのは Present のラッパ `0x0042DB50` の中の `0x0042DBAA`（`[2]+0x06 & 0x0800`。ノート `th09_title_and_d3d8.md` §2-6・`th09_input_and_wait_A0.md` §2。
+/// 読むのは Present のラッパ `0x0042DB50` の中の `0x0042DBAA`（`[2]+0x06 & 0x0800`。
 /// 逆アセンブルの読みで実機とは未照合）。`shot_key_win` が、自分の PC で P/Home を押した tick の Present のラッパを呼ぶ間だけ立てて戻す。
+#[cfg_attr(all(test, not(dev_assets)), allow(dead_code))] // 製品の経路だけが使う。使う検査は開発側の資料を読むものだけ
 pub const SHOT_WORD: u32 = INPUT_MANAGERS[2] + IM_DOWN;
 pub const SHOT_BIT: u16 = 0x0800;
 
@@ -101,7 +102,7 @@ pub const P2_CHAR: u32 = 0x004A_7DE8;
 pub const P1_CONTROL: u32 = 0x004A_7DB8;
 pub const P2_CONTROL: u32 = 0x004A_7DF0;
 pub const BACKGROUND: u32 = 0x004A_7E84;
-/// ゲームのウィンドウが前面（アクティブ）か（WM_ACTIVATEAPP の wParam をウィンドウの手続き `0x0042D425` が `mov %ebx,0x4b30b8` で置く）。0 ならゲーム自身が
+/// ゲームのウィンドウが前面（アクティブ）か（WM_ACTIVATEAPP の wParam をウィンドウの手続き `0x0042D425` が `mov %ebx,0x4b30b8` で書く）。0 ならゲーム自身が
 /// キーボードを読まない（入力の関数 `0x0042B850` が先頭の `0x0042B859` で読み、`0x0042B873 test` の後の `je` で飛ぶ。`0x0042BE40` も同じ）。
 /// 数字キーの読み（`digit_keys`）が、ウィンドウが前面にあるときだけ読むために同じ旗を見る。
 pub const APP_ACTIVE: u32 = 0x004B_30B8;
@@ -133,13 +134,13 @@ pub const PLAYER_SPELL_ATTACKS: u32 = 0xB0;
 pub const PLAYER_BOSS_ATTACKS: u32 = 0xB4;
 /// リバーサルの数（ボスアタックの内数）: `0x00403ED3 incl 0xb8(%eax)`。
 pub const PLAYER_BOSS_REVERSALS: u32 = 0xB8;
-/// 1P / 2P のスコアなどを持つ塊（0xA0 バイト）へのポインタ。読み込みスレッドが `0x0041B069 mov $0x4a7dac,%esi` から 0x38 刻みで置く。
+/// 1P / 2P のスコアなどを持つ塊（0xA0 バイト）へのポインタ。読み込みスレッドが `0x0041B069 mov $0x4a7dac,%esi` から 0x38 刻みで書く。
 pub const P1_STATS_PTR: u32 = 0x004A_7DAC;
 pub const P2_STATS_PTR: u32 = 0x004A_7DE4;
 /// 塊の中のスコア（u32。画面に出る値の 1/10 —— 隣リポ `th09_monitor.py` の `STATS["score"]`、`s1a*10`）。
 pub const STATS_SCORE: u32 = 0x04;
 
-// ---- 台本の状態の操作（無敵・ライフ・ゲージ。検査の道具）----
+// ---- 台本の状態の操作（無敵・ライフ・ゲージ。検査のツール）----
 // 書くのは台本が動いている実行だけで、`P1_PLAYER_PTR` / `P2_PLAYER_PTR` が 0 でなく `LOADING` が 0 の tick に、入力の地点で書く（`state_ops.rs`）。
 // Player へのポインタの欄はマッチの片付け（`0x0041B82A`）の中で、Player の解放 `0x0041B934 call 0x41ced0` の直後の `0x0041B93B mov %edi,-0x4(%esi)` で 0 に戻るので、
 // 0 でなければ生きた Player を指す（片付けがどのスレッドで走るかは未確認で、読み書きが競合しうる）。書き込みは自分のプロセスへの
@@ -148,7 +149,7 @@ pub const STATS_SCORE: u32 = 0x04;
 pub const PLAYER_INV_TIMER_F: u32 = 0x1B78;
 /// 同じ zTimer の今の値（int）。被弾の判定の入口 `0x0041E8BC` が「0 以下なら判定へ」で読む。
 pub const PLAYER_INV_TIMER_I: u32 = 0x1B7C;
-/// 無敵のために毎 tick 置く値（float は 2.0、int は 2）。減算の後も 1 > 0 で判定を通らず、やめれば次の tick の減算で 0 に戻る。
+/// 無敵のために毎 tick 書く値（float は 2.0、int は 2）。減算の後も 1 > 0 で判定を通らず、やめれば次の tick の減算で 0 に戻る。
 pub const INV_TIMER_VALUE: u32 = 2;
 /// Player のカードアタックのゲージ（float。0〜400）。溜める関数 `0x0041BC90` の `flds` / `fadds` / `fsts 0x30388(%esi)` と頭打ち
 /// `0x0041BCF6 movl $0x43c80000,0x30388(%esi)`（= 400.0f）、クイックの処理 `0x0041CAB4`〜`0x0041CABF` の `mov $0x42c80000`（= 100.0f）から
@@ -185,14 +186,12 @@ pub const GUI_PTR: u32 = 0x004A_7E38;
 /// Gui の会話の状態。`0x00404980` が `mov 0xe94c(%ecx),%eax` で読み、0 以上か −2 なら 1（会話中）を返す。
 pub const GUI_TALK: u32 = 0xE94C;
 
-// ---- D3D8 のデバイスの下見（読むだけ）----
-// `[0x004B3108]` が IDirect3DDevice8、vtable の `0x3C Present` / `0x8C EndScene`。読み取りのスレッドがアドレスとモジュールのパスをログに書くだけで、
-// デバイスの関数は呼ばない（ゲームのスレッドの外から呼ぶのは安全でない）。
-/// IDirect3DDevice8 へのポインタ（描画の入口が読む `mov eax,[0x4B3108]` と同じアドレス）。
+// ---- D3D8 のデバイス ----
+/// IDirect3DDevice8 へのポインタ（描画の入口が読む `mov eax,[0x4B3108]` と同じアドレス）。vtable の `0x3C Present` / `0x8C EndScene`。
 pub const D3D8_DEVICE_PTR: u32 = 0x004B_3108;
-/// vtable の中の EndScene / Present のスロット（バイト）。
-pub const D3D8_ENDSCENE_SLOT: u32 = 0x8C;
-pub const D3D8_PRESENT_SLOT: u32 = 0x3C;
+/// vtable の中の TestCooperativeLevel / BeginScene のスロット（ゲームの `0x0042E69A call *0xc(%ecx)` / `0x0042F1E1 call *0x88(%ecx)`）。
+pub const D3D8_TESTCOOP_SLOT: u32 = 0x0C;
+pub const D3D8_BEGINSCENE_SLOT: u32 = 0x88;
 
 // ---- 撮影（描画の入口の中で、ゲームのスレッドがバックバッファをコピーする）----
 // ゲーム自身の撮影 `0x0042F540` の読み方に合わせる。検査 `shot_addresses_appear_in_the_note` がノートの本文と突き合わせる。
@@ -207,15 +206,17 @@ pub const D3D8_SURF_UNLOCKRECT_SLOT: u32 = 0x28;
 pub const D3D8_SURF_GETDESC_SLOT: u32 = 0x20;
 /// 面の Release（IUnknown の 3 番目。SDK の並びからの推定）。
 pub const D3D8_SURF_RELEASE_SLOT: u32 = 0x08;
-/// present parameters のコピー（デバイスを作った後、`0x0042E089` の `rep movsl` で 13 語をコピーする先 `0x4B3450`。Reset もここを渡す）。
+/// present parameters のコピー（デバイスを作った後、`0x0042E089` の `rep movsl` で 13 語をコピーする先 `0x4B3450`。ゲームの Reset（`0x0042DB88`）もここを渡す）。
 /// 幅 `+0` / 高さ `+4` / 形式 `+8`（D3DPRESENT_PARAMETERS の並び。ゲームの撮影は `[Supervisor+0x358]` = `0x4B3458` で形式を読む）。
 pub const D3D8_PRESENT_PARAMS: u32 = 0x004B_3450;
 pub const PP_WIDTH: u32 = 0x0;
 pub const PP_HEIGHT: u32 = 0x4;
 pub const PP_FORMAT: u32 = 0x8;
+/// PresentationInterval（`+0x30`。デバイスを作る関数の `-0x14(%ebp)`。フルスクリーンの IMMEDIATE は `0x0042DE4A` が書く）。
+pub const PP_PRESENT_INTERVAL: u32 = 0x30;
 
 // ---- 既定の形（`mode = auto`）が先頭で読む画面の形（読むだけ）----
-/// 設定のブロック `0x004B3488` の `+0xB1`（u8。0 = 全画面・1 = ウィンドウモード）。デバイスを作る関数の `0x0042DDC2 cmp %bl,0x4b3539` → 0 でなければ `0x0042DEA1` で Windowed = 1。
+/// 設定のブロック `0x004B3488` の `+0xB1`（u8。0 = フルスクリーン・1 = ウィンドウモード）。デバイスを作る関数の `0x0042DDC2 cmp %bl,0x4b3539` → 0 でなければ `0x0042DEA1` で Windowed = 1。
 /// 値の読み分けは `higanr_core::pacing::screen_from_flag`。present parameters のコピーの Windowed（`D3D8_PRESENT_PARAMS` の `+0x1C`）の方が
 /// 「いまのデバイス」に近いが、そのアドレスは資料に無く足し算で作ることになるので使わない。
 pub const OPTION_WINDOWED: u32 = 0x004B_3539;
@@ -229,7 +230,7 @@ pub const GLOBAL_STATE_DEMO: u32 = 0x2;
 pub const IM_REPEAT_COUNTERS: u32 = 0x0A;
 /// feed `0x0042ACE0` が書く範囲の長さ（`+0x00`〜`+0x29`。`+0x2A` 以降には書かない）。`+0x2A` は次の欄（`IM_CHARGE`）の始まりなので、その値を使う。
 pub const IM_FEED_LEN: u32 = IM_CHARGE;
-// 16 本のカウンタの終わりが、feed が書く範囲の終わりと一致する（建てるときに確かめる）。
+// 16 本のカウンタの終わりが、feed が書く範囲の終わりと一致する（建てるときに検証する）。
 const _: () = assert!(IM_REPEAT_COUNTERS + 16 * 2 == IM_FEED_LEN);
 /// 台本が呼ぶゲームの関数の行（地点の表の「照合だけ」の行。アドレスはこの名前の行から引き、ここには転記しない）。
 /// feed は fastcall（ecx = 番号、edx = 語）、ローカル入力は引数なし・戻り値 ax。
@@ -239,7 +240,7 @@ pub const LOCAL_INPUT_SITE: &str = "fn_local_input";
 pub const POLL_SITE: &str = "fn_poll";
 
 /// 素の poll の入口の照合の表（1 行）。`SITES` に入れない: `SITES` は全行の一致が設置の条件の表で、足すとネットワークを使わない実行までフックが止まる。
-/// `session::run` がネットワークのセッションを置けた実行で照合し、合ったときだけ入口へ渡す。合わなければローカル入力は `fn_local_input`（`0x0042BE40`）で読む。
+/// `session::run` がネットワークのセッションを組み込めた実行で照合し、合ったときだけ入口へ渡す。合わなければローカル入力は `fn_local_input`（`0x0042BE40`）で読む。
 pub const POLL_SITES: &[SiteDef] = &[SiteDef {
     name: POLL_SITE,
     addr: 0x0042_B850,
@@ -270,7 +271,7 @@ pub const INPUT_DEVICE_P1: u32 = OPTIONS_BLOCK + OPT_INPUT_DEVICE;
 /// SELECT のダイジェストに入れる、意味の分からない欄（ブロックの中の `[始め, 終わり)`。`+0x6C`〜`+0xA3`・`+0xB3`・`+0xB6`・`+0xB9`）。
 pub const OPTION_DIGEST_RANGES: [(u32, u32); 4] =
     [(0x6C, 0xA4), (0xB3, 0xB4), (0xB6, 0xB7), (0xB9, 0xBA)];
-/// 開始のフックの行（call 先の差し替え。`0x0041AB2B`）とシードを置く関数の行（照合だけ。thiscall、ecx = 乱数 `RNG_ADDR`、引数 u16 を 1 つ。
+/// 開始のフックの行（call 先の差し替え。`0x0041AB2B`）とシードを設定する関数の行（照合だけ。thiscall、ecx = 乱数 `RNG_ADDR`、引数 u16 を 1 つ。
 /// `0x00420160`〜`0x0042016B` は `[ecx]` に u16 を書くだけで、抽選回数は変えない）。アドレスはこの名前の行から引く。
 pub const MATCH_START_SITE: &str = "match_start_call";
 pub const SET_STATE_SITE: &str = "fn_set_state";
@@ -317,7 +318,7 @@ pub const PORTRAIT_SLIDE_SITE: &str = "fn_portrait_slide";
 pub const PORTRAIT_SLIDE_BACK_SITE: &str = "fn_portrait_slide_back";
 pub const PORTRAIT_MARKER_SITE: &str = "fn_portrait_marker";
 
-/// 立ち絵の 3 本の関数の入口の照合の表。`SITES` に入れない（ここが合わないときに止めたいのは立ち絵の追随だけ）。`session::run` がネットワークを置いた実行で
+/// 立ち絵の 3 本の関数の入口の照合の表。`SITES` に入れない（ここが合わないときに止めたいのは立ち絵の追随だけ）。`session::run` がネットワークを組み込んだ実行で
 /// 全行を照合し、全部合ったときだけアドレスを入口へ渡す。スライドの 2 本は先頭 32 バイトまで同じで 33 バイト目（`jge` の飛び幅。`0x62` と `0x4E`）で分かれる。
 pub const PORTRAIT_SITES: &[SiteDef] = &[
     SiteDef {
@@ -530,7 +531,7 @@ pub const FORBIDDEN: &[AddrRange] = &[
 // ini で有効にした実行だけで書く実験なので、設置の判定も別に持つ（`alloc_count::install_all`）。ノートとの突き合わせは
 // `alloc_count` の tests（`alloc_sites_appear_in_the_note`）。
 
-/// E1-1 で inline detour を書く確保・解放の入口 5 つ。どれも関数の先頭（呼ばれた直後で `[esp]` が戻りアドレス）なので、
+/// 巻き戻しの実験で inline detour を書く確保・解放の入口 5 つ。どれも関数の先頭（呼ばれた直後で `[esp]` が戻りアドレス）なので、
 /// 入口は `[esp]` を呼び出し元として数える。並びは入口のアセンブリの地点の番号（0〜4）と同じ。
 pub const ALLOC_SITES: &[SiteDef] = &[
     // 確保の包み（ecx = 0x4AD018、引数は大きさとタグ、`ret 8`）。中で 0x47B151 を呼ぶので、その分は crt_malloc でも
@@ -595,7 +596,7 @@ pub const MATCH_END_MENU: u32 = 0x004A_7ECE;
 // ---- 対戦が終わった後の戻り道（`higanr_core::return_flow`）が読むだけのメニューの状態 ----
 // AsciiManager（`0x4CE458`）の on_tick `0x00435B00` が、一時停止のバイト `PAUSE` が 0 でなければ `0x00435BA8 lea 0x82a0(%esi),%ecx` →
 // `call 0x434740`、`MATCH_END_MENU` が 0 でなければ `0x00435BD4 lea 0xa7a8(%esi),%ecx` → `call 0x4355F0`。どちらも状態が `+0x00`、
-// フレームの数えが `+0x04`（関数の先頭の `mov %ecx,%esi` の後の `(%esi)` / `0x4(%esi)`）。実機で値を確かめていない。
+// フレームの数えが `+0x04`（関数の先頭の `mov %ecx,%esi` の後の `(%esi)` / `0x4(%esi)`）。実機で値を検証していない。
 /// 一時停止のメニュー（`0x4D66F8`）。
 pub const PAUSE_MENU: u32 = 0x004C_E458 + 0x82A0;
 /// マッチの終わりのメニュー（`0x4D8C00`）。
@@ -614,7 +615,7 @@ const _: () = assert!(
 // 入口のアドレスと期待バイト列は上の `ALLOC_SITES` の `crt_malloc` / `op_new` / `crt_free` の行をそのまま使う（転記しない）。
 // 転記ミスは `rollback_probe` の検査 `rollback_values_appear_in_the_note` が見る。
 
-/// 決まった塊（読み込みスレッドが陣ごとに 1 回 operator new で取り、ポインタを zGameManager の陣の欄へ置く）。陣の欄は
+/// 決まった塊（読み込みスレッドが陣ごとに 1 回 operator new で取り、ポインタを zGameManager の陣の欄へ書く）。陣の欄は
 /// `0x0041B209 mov $0x4a7dc4,%esi` から `add $0x38` で回る（`esi-0x34`〜`esi-0x1C`）。大きさは各 new の `push $imm32`。
 pub const ROLLBACK_BLOCKS: &[RbBlock] = &[
     RbBlock {
@@ -906,7 +907,7 @@ pub const ROLLBACK_COMPARE_SKIPS: &[RbSkip] = &[
         ),
     },
     // 正体その 2: AnmManager の SPRITE_TEMP_BUFFER（`zRenderVertex144[4]`、0x1C × 4 = 0x70 B、`0x4DC558`）。`0x43A950` が `0x43A9B8`〜`0x43AA3D` で
-    // 頂点を置く、描画用だけの作業場。
+    // 頂点を書く、描画用だけの作業場。
     RbSkip {
         name: "sprite_temp",
         kind: RbSkipKind::Range {
@@ -948,7 +949,7 @@ pub const ROLLBACK_ARENA_VM_TAGS: &[u32] = &[0x0040_CB17, 0x0044_0DB9];
 /// Ex の配列の札（`ROLLBACK_ARENA_VM_TAGS` の 2 つ目。`n × 0x2A4 + 追加` バイトなので、VM の本数は大きさの floor では出ない）。
 pub const ROLLBACK_ARENA_EX_TAG: u32 = 0x0044_0DB9;
 /// Ex の配列（`0x00440D90(n, 追加)`）の（求められた大きさ, VM の本数 n）。`0x00440D90` は `n × 0x2A4 + 追加` を確保し、全体を `0x00440DC9 rep stos` で 0 にして、
-/// `base + n × 0x2A4` を状態ブロックとして `+0x34` に置く。追加が 0x2A4 以上だと、大きさの floor は VM の本数より多く、状態ブロックを「幻の VM」に数えてしまう。
+/// `base + n × 0x2A4` を状態ブロックとして `+0x34` に書く。追加が 0x2A4 以上だと、大きさの floor は VM の本数より多く、状態ブロックを「幻の VM」に数えてしまう。
 /// 呼び出し元 25 か所の全部の組: 追加 0x4C・0x50・0x58・0x5C（`0x440E4D` `0x440FBD` `0x44191D` `0x443448` `0x4455DD` `0x44BCDD` `0x44C35D` / `0x44772D` `0x447AFD` `0x448329` / `0x444F09` `0x445059` /
 /// `0x445ECD` `0x44632D` `0x4467CD` `0x446C1D` `0x446D89` `0x44AC2D`）はどれも n = 1。ほか: 追加 0x190・n = 5（`0x442592`）、追加 0x158・n = 4（`0x449080` `0x449800`）、追加 0xF48（`0x443C80` `0x444572`）、
 /// 追加 0x688（`0x44A042`）、追加 0x68C（`0x44B232`）。表に無い大きさは本数 0（知らない塊は隠さない向き）。
@@ -1094,8 +1095,8 @@ pub const ROLLBACK_SLOT_ARRAYS: &[RbSlotArray] = &[
         source: site_source!("p1_enemies と同じ（陣ごとの塊）"),
     },
     // 自機ショット（自機の塊 `p?_player` の中）: `+0xC11C`・stride 0x484・128 枠（`0x0041F689 lea 0xc11c(%edi),%esi` / `0x0041F68F movl $0x80,-0x4(%ebp)` / `0x0041F73C add $0x484,%esi`）。
-    // 状態は `+0x462`（u16）: 0 が空き（出す側 `0x0041F4F0 cmpw $0x0,0x462(%esi)` → 空きなら 1 を置く `0x0041F525`。更新 `0x0041F5B0` は空きを飛ばす）、1 と 2 が使用中
-    // （描画は `0x0041F6A0 cmpw $0x1` と `0x0041F770 cmpw $0x2`。2 を置くのは `0x0041FE5A mov %si,0x462(%edi)`）。VM は枠の先頭（`0x0041F6D7 fstps 0x208(%esi)`）。世界座標は `+0x2A4`（`0x0041F6C6`。これは比べる）。
+    // 状態は `+0x462`（u16）: 0 が空き（出す側 `0x0041F4F0 cmpw $0x0,0x462(%esi)` → 空きなら 1 を書く `0x0041F525`。更新 `0x0041F5B0` は空きを飛ばす）、1 と 2 が使用中
+    // （描画は `0x0041F6A0 cmpw $0x1` と `0x0041F770 cmpw $0x2`。2 を書くのは `0x0041FE5A mov %si,0x462(%edi)`）。VM は枠の先頭（`0x0041F6D7 fstps 0x208(%esi)`）。世界座標は `+0x2A4`（`0x0041F6C6`。これは比べる）。
     RbSlotArray {
         label: "p1_player_shots",
         region: "p1_player",
@@ -1159,7 +1160,7 @@ pub const ROLLBACK_EXCLUDED_CALLERS: &[RbCallers] = &[
     },
     // ゲームのスクリーンショット `0x42F540` は確保の包み `0x401340` を 2 回呼ぶ（`0x42F5D2` 0x2C B・`0x42F60E` 0xE1000 B）。転送が有効な間は DLL の領域へ入り、
     // 片側の PC だけ領域の top と空きの並びが変わる（P/Home の 0x800 は試合の語のマスクの外なので相手へは送らない。自分の側では `shot_key_win` が
-    // Present のラッパを呼ぶ間だけ立てて撮る）。終わりは `0x0042F75C ret $0x4`（3 B）の次。
+    // Present のラッパを呼ぶ間だけ `SHOT_WORD` の `SHOT_BIT` を立てて撮る）。終わりは `0x0042F75C ret $0x4`（3 B）の次。
     RbCallers {
         start: 0x0042_F540,
         end: 0x0042_F75F,
@@ -1193,7 +1194,7 @@ pub struct ScreenEffectKind {
 }
 
 /// ScreenEffect の種類の表。`0x422D85 jmp *0x422ee0(,%edi,4)` の 8 つ組（`0x422EE0` の 4 バイト × 8）が指す枝 `0x422D8C` / `0x422D93` / `0x422D9D` / `0x422DED` / `0x422DC5` / `0x422E12` /
-/// `0x422E37` / `0x422E5C` が、更新の関数（`0x42B300` へ push）と描画の関数（同じく push。種類 1・7 は無し）を決める。描画の関数は `th09_draw_and_renderonly_M1c.md` の表と一致
+/// `0x422E37` / `0x422E5C` が、更新の関数（`0x42B300` へ push）と描画の関数（同じく push。種類 1・7 は無し）を決める。描画の関数は 解析のノートの表と一致
 /// （検査 `screen_effect_draws_appear_in_the_m1c_note`）。上の 11 個の関数のアドレスは、`.text` では `0x422D20` の中の `push $imm32` だけが参照する（`.rdata` の表は未確認）。
 pub const SCREEN_EFFECT_KINDS: [ScreenEffectKind; 8] = [
     ScreenEffectKind {
@@ -1307,7 +1308,7 @@ pub const SND_BGM_SLOTS: u32 = 31;
 pub const ASCII_COUNT: u32 = 0x004D_66BC;
 
 // ---- rollback のモードの製品の経路の部品 ----
-// E1 の表（`ALLOC_SITES`・`ROLLBACK_DATA`）は変えず、足す分だけをここに置く（E1 の実験の入口の挙動を変えないため）。
+// 実験の表（`ALLOC_SITES`・`ROLLBACK_DATA`）は変えず、足す分だけをここに書く（実験の入口の挙動を変えないため）。
 // 値の転記ミスは `rollback_play` の検査 `play_values_appear_in_the_note` が見る。
 
 /// calloc の行の名前。
@@ -1325,7 +1326,7 @@ pub const CALLOC_SITES: &[SiteDef] = &[SiteDef {
     source: site_source!("ノート §30（th09_disasm.txt L168927〜168928）"),
 }];
 
-/// 更新の列のつなぎ（レジストリの先頭の 2 つの節）の大きさ。先頭の 0x20 B が更新の列の先頭の節（`0x0042C716 mov -0x4(%ebp),%esi`）、`+0x20` の 0x20 B が描画の列の先頭の節（`0x0042C7EB lea 0x20(%ecx),%esi`）。
+/// 更新の列のリンク（レジストリの先頭の 2 つの節）の大きさ。先頭の 0x20 B が更新の列の先頭の節（`0x0042C716 mov -0x4(%ebp),%esi`）、`+0x20` の 0x20 B が描画の列の先頭の節（`0x0042C7EB lea 0x20(%ecx),%esi`）。
 /// 予測の tick でラウンドの終わりが列に節を足し得るので、コピーの範囲に足す。残りの `+0x40`〜`+0x4F`（`0x4AD008`〜`0x4AD018`）は列ではなく別の物（`REGISTRY_TAIL_OBJ`）なので、コピーするのは先頭の 0x40 B だけ。
 pub const UPDATE_REGISTRY_BYTES: u32 = 0x40;
 /// レジストリの後ろの 16 B（`0x4AD008`）。`mov $0x4ad008,%ecx` で this にして `0x433290` / `0x4331C0` / `0x4335E0` / `0x4333B0` を呼ぶ所が 6 か所。`0x4333B0` は `+0x08` を import `*0x48e05c` へ渡して 0 に、
@@ -1333,8 +1334,8 @@ pub const UPDATE_REGISTRY_BYTES: u32 = 0x40;
 pub const REGISTRY_TAIL_OBJ: u32 = 0x004A_D008;
 const _: () = assert!(UPDATE_REGISTRY + UPDATE_REGISTRY_BYTES == REGISTRY_TAIL_OBJ);
 
-/// 製品の経路でコピーする .data の範囲（E1 の `ROLLBACK_DATA` の 7 行 ＋ 更新の列のつなぎ。ただし `globals_c` は fps の計測の 6 語 `FPS_TIMING_START`〜`FPS_TIMING_END` の後から）。
-/// E1 の表は変えない。
+/// 製品の経路でコピーする .data の範囲（実験の `ROLLBACK_DATA` の 7 行 ＋ 更新の列のリンク。ただし `globals_c` は fps の計測の 6 語 `FPS_TIMING_START`〜`FPS_TIMING_END` の後から）。
+/// 実験の表は変えない。
 pub const ROLLBACK_PLAY_DATA: &[RbData] = &ROLLBACK_PLAY_DATA_ROWS;
 const ROLLBACK_PLAY_DATA_ROWS: [RbData; ROLLBACK_DATA.len() + 1] = {
     let mut rows = [RbData {
@@ -1360,7 +1361,7 @@ const ROLLBACK_PLAY_DATA_ROWS: [RbData; ROLLBACK_DATA.len() + 1] = {
     };
     rows
 };
-// つなぎは `rng_input` の終わりから始まり、E1 が「除いた」隙間（`rng_input` の終わり〜`globals_b` の始まりの 0x50 B）のうち、後ろの 16 B（`REGISTRY_TAIL_OBJ`）だけを残す。
+// リンクは `rng_input` の終わりから始まり、実験の表が「除いた」隙間（`rng_input` の終わり〜`globals_b` の始まりの 0x50 B）のうち、後ろの 16 B（`REGISTRY_TAIL_OBJ`）だけを残す。
 const _: () = assert!(
     ROLLBACK_DATA[2].end == UPDATE_REGISTRY && ROLLBACK_DATA[3].start == REGISTRY_TAIL_OBJ + 0x10
 );
@@ -1371,20 +1372,20 @@ const _: () = assert!(
 /// fps の計測の 6 語（`[FPS_TIMING_START, FPS_TIMING_END)`）。fps の計測と表示 `0x4316B0`（描画の優先度 31 のノード `0x431B30` から。読み込みのスレッドの `0x41B566` からも呼ぶ）だけが読み書きする
 /// （`0x4b42b8`〜`0x4b42cf` を即値で引く 22 行は全部 `0x004316C2`〜`0x004317F3` の中）。中身は描画の回数 `0x4B42CC`・基準の時刻 `0x4B42C4`（timeGetTime）・`0x4B42C8` の初回の印・
 /// `0x4B42BC`〜`0x4B42C0`（`[0x4B3844]` ≠ 0 のときのもう 1 つの時計の経路。import `*0x48e098`）・`0x4B42B8`（その経路で計算し直した回数）。
-/// E1 ではコピーと書き戻しをし、比べからだけ外していた（`ROLLBACK_COMPARE_SKIPS` の `fps_timing`）。製品の経路では書き戻しからも外す: 書き戻すと描画の回数がコピーの時の値に戻り、基準の時刻も古いまま残るので、
+/// 実験の表ではコピーと書き戻しをし、比べからだけ外していた（`ROLLBACK_COMPARE_SKIPS` の `fps_timing`）。製品の経路では書き戻しからも外す: 書き戻すと描画の回数がコピーの時の値に戻り、基準の時刻も古いまま残るので、
 /// `0x43171D cmp $0x1f4`（500 ms）が毎フレーム成り立って fps を少ない回数で計算し直し、右下の表示と、記録の処理 `0x420348` がリプレイへコピーする丸めた値 `FPS_SHOWN` が狂う。
 /// 更新（走査）の側は 6 語を読まないので、書き戻さなくてもマッチの決定性は変わらない（更新が読む `FPS_SHOWN` はコピーの外 —— ウィンドウと Supervisor の範囲 `0x4B30B0`〜`0x4B38B0`）。
 pub const FPS_TIMING_START: u32 = 0x004B_42B8;
 pub const FPS_TIMING_END: u32 = 0x004B_42D0;
 /// 描画の回数（u32。`0x4316C2 mov 0x4b42cc,%ecx` / `0x4316D5 mov %edx,0x4b42cc` / `0x4317F3 movl $0x0,0x4b42cc`）。書き戻しの
-/// 確かめ（`PlayStats::fps_words_restored`）が読む。
+/// チェック（`PlayStats::fps_words_restored`）が読む。
 pub const FPS_DRAWS: u32 = 0x004B_42CC;
 /// fps の表示の丸めた値（i16。`0x4318C3 mov %ax,0x4b36c8`。記録の処理 `0x00420348 mov 0x4b36c8,%al` がリプレイへコピーする）。
 pub const FPS_SHOWN: u32 = 0x004B_36C8;
-/// 基準の時刻（timeGetTime の値。`0x4316FA` / `0x43170D` / `0x43173F mov %eax,0x4b42c4`）。偽のゲームの fps の真似だけが使う。
+/// 基準の時刻（timeGetTime の値。`0x4316FA` / `0x43170D` / `0x43173F mov %eax,0x4b42c4`）。検査の偽のゲーム（`FakeGame`）の fps の真似だけが使う。
 #[cfg(test)]
 pub const FPS_BASE_MS: u32 = 0x004B_42C4;
-/// E1 の `ROLLBACK_DATA` の `globals_c` の行の番号（製品の経路では始まりを `FPS_TIMING_END` にする）。
+/// 実験の `ROLLBACK_DATA` の `globals_c` の行の番号（製品の経路では始まりを `FPS_TIMING_END` にする）。
 const GLOBALS_C_ROW: usize = 5;
 const _: () = assert!(
     ROLLBACK_DATA[GLOBALS_C_ROW].start == FPS_TIMING_START
@@ -1399,7 +1400,7 @@ const _: () = assert!(
 pub const STAGE_BG_VMS: u32 = 0x24;
 pub const STAGE_BG_VM_COUNT: u32 = 0x824;
 /// コピーする VM の本数の上限（陣ごと）。th09.dat の std 15 本の本数は 6〜54（world00.std が最大。先頭の i16 と、読み込みと同じ歩き方で数え直した数が 15 本とも一致）。
-/// 約 2.4 倍の 128 本（86,528 B）を置き場に取る。
+/// 約 2.4 倍の 128 本（86,528 B）を領域に取る。
 pub const BG_VM_MAX: u32 = 128;
 /// VM の時計（`zAnmVm.current_time_in_script` の `current`。zTimer `+0x38` の `+0x08`）。run_vm の先頭 `0x436F86 lea 0x38(%edi),%ebx` → `0x436F8B call 0x435F00`
 /// （`mov 0x8(%ecx),%eax`）で読み、尻 `0x43939E lea 0x38(%edi),%ecx` → `0x4393A1 call 0x401510`（→ `0x4014B0`。前の値を `+0x00` へコピー、Supervisor の速さで進める）で 1 tick 進める。
@@ -1407,7 +1408,7 @@ pub const VM_CLOCK: u32 = 0x40;
 /// VM の今の命令（`zAnmVm.current_instr`）。0 なら run_vm は何もせず 1 を返す（`0x436F3D`〜`0x436F56`）—— 終わった VM。
 pub const VM_CUR_INSTR: u32 = 0x220;
 
-/// 製品の経路でコピーする VM の配列（陣ごとに 1 行。`Tables::th09_play` が使う。E1 の表には入れない）。
+/// 製品の経路でコピーする VM の配列（陣ごとに 1 行。`Tables::th09_play` が使う。実験の表には入れない）。
 pub const ROLLBACK_VM_ARRAYS: &[RbVmArray] = &[
     RbVmArray {
         name: "p1_bgscroll",
@@ -1448,7 +1449,7 @@ pub const STAGE_TINT: u32 = 0x642C;
 /// 尽きたら模様と残りを 0 に（`0x40236A` / `0x40236D`）。立てるのはスペルカードの始まり `0x403E50` の `0x404155 movl $0x1`（片方の陣）/ `0x40416E movl $0x2`
 /// （もう片方）で、残りは 0x1E tick（`0x404161`）。
 pub const STAGE_TINT_MODE: u32 = 0x1C;
-// 模様の欄（と残り `+0x20`）は色の欄と重ならない（書き戻しの直後の確かめが色の欄を模様と読まない）。
+// 模様の欄（と残り `+0x20`）は色の欄と重ならない（書き戻しの直後のチェックが色の欄を模様と読まない）。
 const _: () = assert!(STAGE_TINT_MODE + 8 <= STAGE_TINT);
 /// 描画 `0x403680` が Stage の色を戻す命令（`0x4036EB mov $0x80,%al` / `0x4036ED movb $0x0,0x642f(%edi)` / `0x4036F4`・`0x4036FA`・
 /// `0x403700 mov %al,0x642e / 0x642d / 0x642c(%edi)`）。照合だけで書かない。
@@ -1461,11 +1462,11 @@ pub const STAGE_TINT_RESET_CODE: &[u8] = &[
     0x88, 0x87, 0x2C, 0x64, 0x00, 0x00, // mov %al,0x642c(%edi)
 ];
 /// `STAGE_TINT_RESET_CODE` の命令の長さ（検査が 1 命令ずつ読み、ノートからの転記と突き合わせる）。
-#[cfg(test)]
+#[cfg(all(test, dev_assets))]
 pub const STAGE_TINT_RESET_LENS: &[usize] = &[2, 7, 6, 6, 6];
 /// 描画の後の Stage の色（`+0x642C`〜`+0x642F` の順）。
 pub const STAGE_TINT_AFTER: [u8; 4] = [0x80, 0x80, 0x80, 0x00];
-/// Stage の塊の名前（`ROLLBACK_BLOCKS` の `name`。1P・2P の順）。書き戻しの直後の確かめ（`PlayStats::tint_stale`）もこの 2 つを見る。
+/// Stage の塊の名前（`ROLLBACK_BLOCKS` の `name`。1P・2P の順）。書き戻しの直後のチェック（`PlayStats::tint_stale`）もこの 2 つを見る。
 pub const STAGE_BLOCKS: [&str; 2] = ["p1_stage", "p2_stage"];
 
 /// 描画が消す欄の表（コピーを取るたびにコピーの中だけで置き換える）。**入れる条件**: 更新が立て、描画だけが使って消す欄（描画が世界の欄へ流さない）。
@@ -1505,7 +1506,7 @@ pub const REPLAY_SAVE_SIG: [u8; 12] = [
 /// 保存関数の中の ebp は、呼ぶ `call` の時点の esp より 8 小さい（戻りアドレスと `0x00420C60 push ebp`）。
 pub const REPLAY_SAVE_FRAME_SHIFT: u32 = 8;
 // マッチの終わりのメニューが出ている間 1 の 1 バイトの欄 `MATCH_END_MENU`（Match だけ。Story / Extra は `0x4A7ECD`）と、席ごとの勝ち数 `P1_WINS` / `P2_WINS` は、
-// 上の確保・解放の段階に 1 つだけ置く。
+// 上の確保・解放の節に 1 つだけ書く。
 /// exe のフォルダ（`char[0x104]`。起動時に `0x0042E3C9` の `GetModuleFileNameA` で埋まり、最後の区切りを `/` にする）。
 pub const EXE_DIR: u32 = 0x004A_CD08;
 pub const EXE_DIR_LEN: u32 = 0x104;
@@ -1514,7 +1515,7 @@ pub const GAME_MODE_MATCH: u32 = 2;
 /// 勝ちに要るラウンドの数と席ごとの勝ち数（u32）。ラウンドの終わり `0x00415D8A mov 0x4a7e98(,%edi,4),%edx` →
 /// `0x00415D92` で 1 増やして書き戻し → `0x00415D99 mov 0x4a7e94,%ecx` と比べる。
 pub const ROUNDS_REQUIRED: u32 = 0x004A_7E94;
-/// 作業領域の見積もり: 初めの値を置く `mov $imm32,%ecx`（`B9 EC 01 01 00`）の位置と、その値。
+/// 作業領域の見積もり: 初めの値を入れる `mov $imm32,%ecx`（`B9 EC 01 01 00`）の位置と、その値。
 pub const SAVE_EST_BASE_SITE: u32 = 0x0042_0C8F;
 pub const SAVE_EST_BASE: u32 = 0x0001_01EC;
 /// 見積もりのループが面ごとの印を読むローカルの位置（`0x00420CA0 mov -0x1f8(%ebp,%esi,4),%eax`。ebp から引く値）。
@@ -1529,8 +1530,8 @@ pub const SAVE_EST_PER_CHUNK: u32 = 0x54D9;
 pub const REPLAY_HEADER_PTR: u32 = 0x08;
 pub const REPLAY_HEADER_LEN: u32 = 0x1EC;
 pub const REPLAY_HEADER_STAGE_FLAGS: u32 = 0x20;
-/// 見出しの中のオプションの塊の位置（読み込みスレッドが `th09.cfg` 由来のオプションを 1 回だけ写す。0xCC バイトで、並びは `OPTIONS_BLOCK` と同じ）。
-/// 値は `higanr_core::replay_rewrite::OPTIONS_OFFSET`、写す箇所は `0x00421266`〜`0x00421271`。
+/// 見出しの中のオプションの塊の位置（読み込みスレッドが `th09.cfg` 由来のオプションを 1 回だけコピーする。0xCC バイトで、並びは `OPTIONS_BLOCK` と同じ）。
+/// 値は `higanr_core::replay_rewrite::OPTIONS_OFFSET`、コピーする箇所は `0x00421266`〜`0x00421271`。
 pub const REPLAY_HEADER_OPTIONS: u32 = 0xDC;
 /// 見出しの中のチャージ型（1P が `+0x190`、2P が `+0x191`）。ここが生きた試合の値と違うと、素の花映塚の再生がずれる。
 pub const REPLAY_HEADER_CHARGE: u32 = REPLAY_HEADER_OPTIONS + OPT_CHARGE;
@@ -1539,6 +1540,151 @@ pub const REPLAY_HEADER_CHARGE: u32 = REPLAY_HEADER_OPTIONS + OPT_CHARGE;
 pub const REPLAY_STAGE_NODES: u32 = 0x1C;
 pub const REPLAY_STAGE_STRIDE: u32 = 0x18;
 pub const REPLAY_NODE_NEXT: u32 = 0x14;
+
+// ---- ゲームのメニューが保存関数を呼ぶ 2 か所 ----
+// ゲームのメニュー（Story・Extra・Match の保存の画面と、内蔵のネット対戦の自動保存）が直に呼ぶ。`SITES` に入れない。`menu_save_win::on_attach` が別に照合して、
+// 全部合えば 2 つの rel32 を入口へ向ける（1 行でも合わなければ 1 バイトも書かない）。検査 `menu_save_rows_match_the_note_and_the_exe_shape`。
+/// 保存の画面の呼び出し（`0x004297F1 call 0x420c60`）。ecx = `[0x4A7E64]`、edx = `replay/th9_%.2d.rpy` のパス、`push %edi` が名前。
+pub const MENU_SAVE_CALL_UI: u32 = 0x0042_97F1;
+/// 内蔵のネット対戦の自動保存の呼び出し（`0x00429BF6 call 0x420c60`）。edx = `./replay/th9_udn%.3d.rpy` のパス、`push $0x4a8174` が名前。
+pub const MENU_SAVE_CALL_UDN: u32 = 0x0042_9BF6;
+/// 保存関数の見積もりのループが面ごとの印を読む命令（`0x00420CA0 mov -0x1f8(%ebp,%esi,4),%eax`）。DLL の踏み台はこれが読む場所に本当の印を書く。
+pub const MENU_SAVE_EST_LOOP: u32 = 0x0042_0CA0;
+
+/// 呼び出し 2 行と、呼び先の先頭・見積もりのループの照合 2 行。
+pub const MENU_SAVE_SITES: &[SiteDef] = &[
+    SiteDef {
+        name: "menu_save_call_ui",
+        addr: MENU_SAVE_CALL_UI,
+        expected: &[0xE8, 0x6A, 0x74, 0xFF, 0xFF],
+        kind: Use::CallRel32 {
+            original_target: REPLAY_SAVE_FN,
+        },
+        source: site_source!("ノート th09_replay_save_M5b.md §12（th09_disasm.txt L52418）"),
+    },
+    SiteDef {
+        name: "menu_save_call_udn",
+        addr: MENU_SAVE_CALL_UDN,
+        expected: &[0xE8, 0x65, 0x70, 0xFF, 0xFF],
+        kind: Use::CallRel32 {
+            original_target: REPLAY_SAVE_FN,
+        },
+        source: site_source!("ノート th09_replay_save_M5b.md §12（th09_disasm.txt L52701）"),
+    },
+    SiteDef {
+        name: "menu_save_fn_head",
+        addr: REPLAY_SAVE_FN,
+        expected: &REPLAY_SAVE_SIG,
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[1, 2, 6, 1, 2]),
+        },
+        source: site_source!(
+            "ノート th09_replay_save_M5b.md §1 / §12（th09_disasm.txt L41565〜L41571）"
+        ),
+    },
+    SiteDef {
+        name: "menu_save_est_loop",
+        addr: MENU_SAVE_EST_LOOP,
+        expected: &[0x8B, 0x84, 0xB5, 0x08, 0xFE, 0xFF, 0xFF],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[7]),
+        },
+        source: site_source!("ノート th09_replay_save_M5b.md §5 / §12（th09_disasm.txt L41579）"),
+    },
+];
+
+#[cfg(test)]
+mod menu_save_tests {
+    use super::*;
+    use crate::sites::check_table;
+
+    #[cfg(dev_assets)]
+    const NOTE: &str = include_str!("../../../analysis/notes/th09_replay_save_M5b.md");
+
+    #[cfg(dev_assets)]
+    #[test]
+    fn menu_save_rows_match_the_note_and_the_exe_shape() {
+        assert_eq!(MENU_SAVE_SITES.len(), 4);
+        let mut calls = 0;
+        for d in MENU_SAVE_SITES {
+            let hex = d
+                .expected
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let want = format!("| {} | `0x{:08X}` | `{hex}` |", d.name, d.addr);
+            assert!(
+                NOTE.lines().any(|l| l.starts_with(&want)),
+                "ノート §12 に {want} の行が無い"
+            );
+            if let Use::CallRel32 { original_target } = d.kind {
+                calls += 1;
+                let bytes: [u8; 5] = d.expected.try_into().expect("E8 rel32 の 5 バイト");
+                assert_eq!(
+                    higanr_core::patch::call_target(d.addr, &bytes),
+                    Some(REPLAY_SAVE_FN),
+                    "{} の rel32 が保存関数を指さない",
+                    d.name
+                );
+                assert_eq!(original_target, REPLAY_SAVE_FN);
+            }
+        }
+        assert_eq!(calls, 2);
+        let head = MENU_SAVE_SITES
+            .iter()
+            .find(|d| d.name == "menu_save_fn_head")
+            .expect("menu_save_fn_head");
+        assert_eq!(head.expected, &REPLAY_SAVE_SIG[..]);
+        // ループの命令の変位が、踏み台が書く位置（`SAVE_EST_FLAGS_EBP`）と同じ。
+        let lp = MENU_SAVE_SITES
+            .iter()
+            .find(|d| d.name == "menu_save_est_loop")
+            .expect("menu_save_est_loop");
+        let disp = u32::from_le_bytes([
+            lp.expected[3],
+            lp.expected[4],
+            lp.expected[5],
+            lp.expected[6],
+        ]);
+        assert_eq!(disp.wrapping_neg(), SAVE_EST_FLAGS_EBP);
+        // 書式の文字列のアドレスと、読み手が受ける 2 つの形の元。
+        for w in [
+            "0x0048FA84",
+            "0x0048FA68",
+            "replay/th9_%.2d.rpy",
+            "./replay/th9_udn%.3d.rpy",
+        ] {
+            assert!(NOTE.contains(w), "ノートに {w} が無い");
+        }
+    }
+
+    #[test]
+    fn menu_save_rows_overlap_nothing_and_pass_check_table() {
+        assert_eq!(check_table(MENU_SAVE_SITES, FORBIDDEN), Ok(()));
+        assert!(
+            SITES.iter().all(|s| !s.name.starts_with("menu_save_")),
+            "SITES に入れない"
+        );
+        let all: Vec<SiteDef> = SITES
+            .iter()
+            .chain(POLL_SITES)
+            .chain(PORTRAIT_SITES)
+            .chain(PACING_SITES)
+            .chain(ALLOC_SITES)
+            .chain(RESIM_SITES)
+            .chain(CALLOC_SITES)
+            .chain(PAD_SITES)
+            .chain(MENU_SAVE_SITES)
+            .copied()
+            .collect();
+        assert_eq!(check_table(&all, FORBIDDEN), Ok(()));
+        // 保存の画面を飛ばす分かれ道とも重ならない（別の行として照合する）。
+        for d in MENU_SAVE_SITES {
+            assert!(!d.range().overlaps(&SAVE_SKIP_SITE.range()), "{}", d.name);
+        }
+    }
+}
 
 // ---- ネットワークの対戦の「リプレイを保存して終了」で保存の画面を飛ばす ----
 // 地点の表（`SITES`）には入れない。書かずに照合だけする行で、立てる tick に `script_win` が読んで合わなければ印を立てない（いつもの保存の画面になる）。検査 `save_skip_values_appear_in_the_note`。
@@ -1556,7 +1702,7 @@ pub const SAVE_SKIP_SITE: SiteDef = SiteDef {
 /// （`0x00435268 orl $0x2000,0x4a7ec4`）だけ、読むのは上の分かれ道だけ。
 pub const CONTINUED_BIT: u32 = 0x2000;
 
-#[cfg(test)]
+#[cfg(all(test, dev_assets))]
 mod save_skip_tests {
     use super::*;
     use crate::sites::hex_bytes;
@@ -1594,11 +1740,12 @@ mod save_skip_tests {
 mod tests {
     //! 表そのものの検査。花映塚は使わない。期待バイト列の転記ミスは、表と同じ出所から作った値ではなく、ノートの本文（`include_str!`）と突き合わせて見る。
     use super::*;
-    #[cfg(not(feature = "dist"))]
+    #[cfg(all(not(feature = "dist"), dev_assets))]
     use crate::sites::hex_bytes;
     use crate::sites::{TableError, check_table};
     use higanr_core::patch::{DisjointError, SiteError, check_site};
 
+    #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_hook_sites_M1a.md");
 
     fn find(name: &str) -> SiteDef {
@@ -1669,6 +1816,7 @@ mod tests {
     /// ② アドレスが節の見出しの行と合うか（本文のどこかにあるかで見ると、隣のアドレスで ±1 のずれを見逃す）、③ 見出しにアドレスが無い節は、バイト列を含む表の行にこの行のアドレスがあるか、を見る。
     /// call 先の差し替えの行は、見出しがオペコードの位置か rel32 の位置のどちらかで書かれている。rel32 の位置なら、見出しに addr+1 があり、それがノートで rel32 の位置と名指しされ、ノートに addr もある、を求める。
     /// 配るバージョンのビルドでは走らせない（`source` の欄は配るバージョンでは空）。
+    #[cfg(dev_assets)]
     #[cfg(not(feature = "dist"))]
     #[test]
     fn every_site_appears_in_the_note_with_its_address() {
@@ -1737,6 +1885,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn record_offsets_appear_in_the_design() {
         const DESIGN: &str = include_str!("../../../docs/Design_Architecture.md");
@@ -1763,6 +1912,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn observation_addresses_appear_in_the_design() {
         const DESIGN: &str = include_str!("../../../docs/Design_Architecture.md");
@@ -1881,12 +2031,14 @@ mod tests {
         assert!((RNG_ADDR..RNG_ADDR + RNG_LEN - 3).contains(&RNG_COUNT));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn risk17_gui_pointer_appears_in_the_note() {
         let sec9 = note_top_section("## 9. ").expect("ノートに §9 が無い");
         assert!(sec9.contains(&format!("0x404980([0x{GUI_PTR:X}])")));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn shot_addresses_appear_in_the_note() {
         const D3D: &str = include_str!("../../../analysis/notes/th09_title_and_d3d8.md");
@@ -1936,6 +2088,7 @@ mod tests {
         assert_eq!((PP_WIDTH, PP_HEIGHT, PP_FORMAT), (0, 4, 8));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn script_function_rows_and_counter_offset() {
         for name in [FEED_SITE, LOCAL_INPUT_SITE] {
@@ -1953,6 +2106,7 @@ mod tests {
         )));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn shot_word_is_the_pressed_word_of_the_composite_input_manager() {
         const A0: &str = include_str!("../../../analysis/notes/th09_input_and_wait_A0.md");
@@ -1968,6 +2122,7 @@ mod tests {
         assert!(A0.contains("Present の包みの中"));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn poll_row_matches_the_note_and_overlaps_nothing() {
         const A0: &str = include_str!("../../../analysis/notes/th09_input_and_wait_A0.md");
@@ -2008,6 +2163,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     fn note_top_section(heading: &str) -> Option<&'static str> {
         let start = NOTE.find(heading)?;
         let rest = &NOTE[start + heading.len()..];
@@ -2015,6 +2171,7 @@ mod tests {
         Some(&rest[..end])
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn call_targets_appear_in_the_note() {
         let mut n = 0;
@@ -2034,6 +2191,7 @@ mod tests {
         assert_eq!(n, 3);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn forbidden_ranges_appear_in_the_note() {
         let sec21 = note_section("### 2-1 ").expect("§2-1");
@@ -2078,6 +2236,7 @@ mod tests {
         }));
     }
 
+    #[cfg(dev_assets)]
     fn note_section(heading: &str) -> Option<&'static str> {
         let start = NOTE.find(heading)?;
         let rest = &NOTE[start + heading.len()..];
@@ -2232,6 +2391,7 @@ mod tests {
         assert_eq!(INPUT_DEVICE_P1, 0x004B_353F);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn netplay_addresses_appear_in_the_design() {
         const DESIGN: &str = include_str!("../../../docs/Design_Architecture.md");
@@ -2270,6 +2430,7 @@ mod tests {
         assert_eq!(find(MATCH_START_SITE).addr, 0x0041_AB2B);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn select_ranges_appear_in_the_note() {
         const NOTE: &str = include_str!("../../../analysis/notes/th09_select_ranges_M2.md");
@@ -2300,6 +2461,7 @@ mod tests {
         assert!(row("マップ").contains(&format!("`0x{MAP:X}`")));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn select_screen_offsets_appear_in_the_note() {
         const NOTE: &str = include_str!("../../../analysis/notes/th09_select_screens_M2-3.md");
@@ -2322,6 +2484,7 @@ mod tests {
         assert_eq!(MAP_LIST_LEN, 16);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn state_control_offsets_appear_in_the_note() {
         const NOTE: &str = include_str!("../../../analysis/notes/th09_state_controls.md");
@@ -2358,9 +2521,9 @@ mod tests {
 
 // ---- ペース B と時刻の記録 ----
 // 地点の表 `SITES` とは別に持つ: `SITES` は全行の一致を設置の条件にするので、ここへ足すと vpatch が `0x0042DC44` を書き換えた実行でほかのフックまで全部止まる。
-// ペースの行は、ペースと時刻の記録を置くとき（ini の `[pacing]`）だけ `pacing::install` が照合する。検査 `pacing_sites_appear_in_the_m7_note`。
+// ペースの行は、ペースと時刻の記録を組み込むとき（ini の `[pacing]`）だけ `pacing::install` が照合する。検査 `pacing_sites_appear_in_the_m7_note`。
 
-/// ゲームの計算が前提にする x87 の制御語（精度 24 ビット・最近接・例外は全部隠す）。B の始まりで「始める」ときに `fldcw` で置き直す（vpatch の FpuPatch・rev5 #20 と同じ値）。
+/// ゲームの計算が前提にする x87 の制御語（精度 24 ビット・最近接・例外は全部隠す）。B の始まりで「始める」ときに `fldcw` でセットし直す（vpatch の FpuPatch・rev5 #20 と同じ値）。
 /// 実機の入口の `fnstcw` は 3,579 件とも `0x007F`。D3D8 の CreateDevice が FPU_PRESERVE 無しで呼ばれるので D3D がこの値にする。
 pub const GAME_FPU_CW: u16 = 0x007F;
 
@@ -2446,9 +2609,9 @@ pub const PACING_SITES: &[SiteDef] = &[
 // ---- 画面の文字を花映塚の ascii.anm の文字の絵にする（読むだけ。ゲームには 1 バイトも書かない）----
 // 参照する関数: `0x004344E0`〜`0x00434538`（AsciiManager の初期化）・`0x00434540`〜（文字の列を描く）・`0x00434390`（文字の番号 → スプライト）・`0x0043C610` / `0x0043C7A0`（読み込みスロットを返す・読み込みを待つ）・
 // `0x0043BCB0`（スプライトの UV と大きさ）・`0x0043C4C0`〜`0x0043C58B`（テクスチャを作る）・`0x0043A0F0` / `0x0043A950`（スプライトを描く）。数値の読み方（実行時）は `overlay.rs` の `probe_game_font`、画素の変換は `higanr_core::overlay`。
-/// 読み込みスロット `L`（ascii.anm）へのポインタの置き場 = AsciiManager（`0x004CE458`）の `+0x8288`。`0x004344ED push $0x490f2c`（`"ascii.anm"`）→ `0x004344FA push $1` → `0x004344FC call 0x43c7a0` → `0x00434503 mov %eax,0x8288(%esi)`。
+/// 読み込みスロット `L`（ascii.anm）へのポインタが入っている欄 = AsciiManager（`0x004CE458`）の `+0x8288`。`0x004344ED push $0x490f2c`（`"ascii.anm"`）→ `0x004344FA push $1` → `0x004344FC call 0x43c7a0` → `0x00434503 mov %eax,0x8288(%esi)`。
 pub const ASCII_ANM_LOADED_PTR: u32 = 0x004C_E458 + 0x8288;
-/// AnmManager へのポインタの置き場（`mov 0x4dc550,%ecx` が `0x004344F4` ほか多数）。
+/// AnmManager へのポインタが入っているアドレス（`mov 0x4dc550,%ecx` が `0x004344F4` ほか多数）。
 pub const ANM_MANAGER_PTR: u32 = 0x004D_C550;
 /// AnmManager の中の読み込みスロットの枠の刻み（`0x0043C640` `lea (%ebx,%ebx,8),%eax; shl $5,%eax` = 番号 × 0x120）と、
 /// 枠の中で読み込みスロットが始まる位置（`0x0043C682 add $0x24,%esi`）。ascii.anm は番号 1（`push $1`）なので `L = [ANM_MANAGER_PTR] + 0x144`。
@@ -2494,7 +2657,7 @@ pub const SURFACE_DESC_HEIGHT: usize = 7;
 // （`0x00417447` の DrawPrimitiveUP → `0x00417453 call 0x40e380`）。読み方は `overlay::stream0_to_restore`。
 /// AnmManager の頂点の形の覚え（1 バイト。`0x0043B449 cmpb $0x2,0x12886(%esi)`・`0x0043B4A6 movb $0x2`・`0x0040E380 movb $0xff`）。
 pub const ANM_VTX_FORMAT: u32 = 0x12886;
-/// 覚えがこの値なら、ゲームは流れ 0 に `[AnmManager + ANM_QUAD_VB]` が置いてあるものとして描く。
+/// 覚えがこの値なら、ゲームは流れ 0 に `[AnmManager + ANM_QUAD_VB]` が入っているものとして描く。
 pub const ANM_VTX_FORMAT_QUAD_VB: u8 = 2;
 /// ゲームの頂点バッファ（`0x0043BB4E` の CreateVertexBuffer（長さ 0x50・FVF 0x102・MANAGED）の書き先。`0x0043B465` が読み、
 /// `0x0043B478` で SetStreamSource。`0x0042F3D0` が Release して 0 にする）。
@@ -2508,11 +2671,16 @@ const _: () = assert!(ANM_VTX_FORMAT < ANM_QUAD_VB && ANM_QUAD_VB.is_multiple_of
 mod pacing_tests {
     //! 表の検査（花映塚は使わない）。転記ミスはノートの本文（`include_str!`）と突き合わせる。
     use super::*;
-    use crate::sites::{TableError, check_table, hex_bytes};
+    #[cfg(dev_assets)]
+    use crate::sites::hex_bytes;
+    use crate::sites::{TableError, check_table};
 
+    #[cfg(dev_assets)]
     const M7: &str = include_str!("../../../analysis/notes/th09_frame_pacing_M7.md");
+    #[cfg(dev_assets)]
     const M1A: &str = include_str!("../../../analysis/notes/th09_hook_sites_M1a.md");
 
+    #[cfg(dev_assets)]
     fn m7_section_8_1() -> &'static str {
         let head = "### 8-1 ";
         let start = M7.find(head).expect("M7 のノートに §8-1 が無い");
@@ -2520,6 +2688,7 @@ mod pacing_tests {
         &rest[..rest.find("\n### ").unwrap_or(rest.len())]
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn pacing_sites_appear_in_the_m7_note() {
         let sec = m7_section_8_1();
@@ -2555,6 +2724,7 @@ mod pacing_tests {
         )));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn screen_flag_appears_in_the_m7_note() {
         let head = "## 12-2. ";
@@ -2621,16 +2791,21 @@ mod pacing_tests {
 mod resim_tests {
     //! 表と定数の検査（花映塚は使わない）。転記ミスは、ノートの本文（`include_str!`）と突き合わせる。
     use super::*;
-    use crate::sites::{TableError, check_table, hex_bytes};
+    #[cfg(dev_assets)]
+    use crate::sites::hex_bytes;
+    use crate::sites::{TableError, check_table};
 
+    #[cfg(dev_assets)]
     const E1: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
 
+    #[cfg(dev_assets)]
     fn section_15() -> &'static str {
         let head = "## 15. ";
         let start = E1.find(head).expect("ノートに §15 が無い");
         &E1[start..]
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn resim_values_appear_in_the_note() {
         let sec = section_15();
@@ -2680,6 +2855,7 @@ mod resim_tests {
         assert_eq!(ASCII_COUNT, 0x004C_E458 + 0x8264);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn se_values_appear_in_the_note() {
         let start = E1.find("## 32. ").expect("ノートに §32 が無い");
@@ -2793,7 +2969,6 @@ mod game_font_tests {
         );
     }
 
-    /// 壊れたら落ちる: 頂点の形の覚え・頂点バッファ・stride のどれかを書き写し損ねる（ゲームの頂点バッファでない値を流れ 0 に置く）。
     #[test]
     fn stream0_addresses_match_the_disassembly() {
         assert_eq!(
@@ -2808,7 +2983,7 @@ mod game_font_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, dev_assets))]
 mod screen_effect_tests {
     //! ScreenEffect の種類の表の検査。花映塚は使わない。
     use super::*;
@@ -2857,6 +3032,7 @@ mod render_reset_tests {
     //! 描画が消す欄の表の検査。花映塚は使わない。
     use super::*;
 
+    #[cfg(dev_assets)]
     fn instrs() -> Vec<(u32, &'static [u8])> {
         let mut v = Vec::new();
         let mut at = 0usize;
@@ -2875,6 +3051,7 @@ mod render_reset_tests {
         v
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn stage_tint_reset_matches_the_draw_code() {
         const NOTE: &str = include_str!("../../../analysis/notes/th09_draw_and_renderonly_M1c.md");
@@ -2942,7 +3119,7 @@ mod render_reset_tests {
     }
 }
 
-// ---- 被弾音を確定まで待つ（rollback の SE）----
+// ---- 被弾音を rollback の確定まで DLL が待たせる（rollback の SE）----
 
 /// 被弾の SE の id。被弾処理 `0x41E420` の中の `0x0041E449 push $0x4` → `0x0041E450 call 0x43e380`（`0x43E380` も `0x43E2F0` と同じ待ち行列 `SOUND_MANAGER +0x620` へ積む）。
 /// id を変数で渡す呼び出し（`0x40ACC5`・`0x41F45A`）から id 4 が鳴らないとは言い切れない。
@@ -2952,7 +3129,7 @@ pub const SE_ID_LAST_LIFE: u32 = 0x30;
 
 // ---- ウィンドウモードのウィンドウを作る呼び出し（ini の `[window]` で大きさ・位置・枠・最前面を決める）----
 // 実物 th09.exe の `0x42D597`〜`0x42D5C8` の 49 バイトと突き合わせた。`SITES` には入れない: DllMain の中（メインスレッドが走り出す前。`window_win::install`）で独立に照合して書く。合わなければ何も書かず、ウィンドウは今のまま。
-// 全画面の呼び出し `0x42D56E` は触らない。
+// フルスクリーンの呼び出し `0x42D56E` は触らない。
 
 /// ウィンドウモードの枝の `call *0x48e1fc`（`CreateWindowExA`。6 バイト `FF 15 FC E1 48 00`）。
 pub const WINDOW_CREATE_CALL: u32 = 0x0042_D5C2;
@@ -2977,7 +3154,7 @@ pub const WINDOW_CREATE_SITES: &[SiteDef] = &[SiteDef {
     },
     source: site_source!("ノート th09_window_size.md §2（th09_disasm.txt L57870〜L57883）"),
 }];
-// 照合する範囲の終わりの 6 バイトが、差し替える call そのもの（建てるときに確かめる）。
+// 照合する範囲の終わりの 6 バイトが、差し替える call そのもの（建てるときに検証する）。
 const _: () =
     assert!(WINDOW_CREATE_SITES[0].addr + WINDOW_CREATE_CALL_OFFSET as u32 == WINDOW_CREATE_CALL);
 const _: () = assert!(WINDOW_CREATE_SITES[0].expected.len() == WINDOW_CREATE_CALL_OFFSET + 6);
@@ -2987,8 +3164,10 @@ mod window_size_tests {
     //! ウィンドウを作る呼び出しの表の検査（花映塚は使わない）。転記ミスはノートの本文（`include_str!`）と突き合わせる。
     use super::*;
 
+    #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_window_size.md");
 
+    #[cfg(dev_assets)]
     #[test]
     fn window_create_rows_appear_in_the_note() {
         let s = &WINDOW_CREATE_SITES[0];
@@ -3046,6 +3225,290 @@ mod window_size_tests {
             end: 0x0042_D574,
         };
         assert!(!r.overlaps(&fullscreen));
+    }
+}
+
+// ---- 起動直後のリフレッシュレートの計測（`0x42F1A0`）の BeginScene ----
+// 計測は Present が失敗すると Reset の戻り値を見ずに次の BeginScene へ進むので、デバイスが失われていると system の d3d8.dll の中で落ちる。
+// BeginScene の呼びを「デバイスが失われていたら計測の終わりの判定へ抜ける」14 バイトに替える。`SITES` には入れない: DllMain の中で独立に照合して書く
+// （`calib_guard_win::install`）。合わなければ何も書かず、計測は今のまま。
+
+/// 計測の BeginScene の呼びの行の名前。
+pub const CALIB_GUARD_SITE: &str = "calib_begin_scene";
+/// 抜け先（計測の終わりの判定。`0x42F2A8 mov $0x4b3100,%ecx`）。esi はサンプルの数のまま入る。
+pub const CALIB_ABORT_TARGET: u32 = 0x0042_F2A8;
+/// 照合して書く範囲の長さ（`call rel32` 5 + `test eax,eax` 2 + `jnz rel32` 6 + `nop` 1）。
+pub const CALIB_GUARD_LEN: usize = 14;
+/// 計測の BeginScene の呼びの照合の表（1 行。14 バイト）。
+pub const CALIB_GUARD_SITES: &[SiteDef] = &[SiteDef {
+    name: CALIB_GUARD_SITE,
+    addr: 0x0042_F1D9,
+    expected: &[
+        0xA1, 0x08, 0x31, 0x4B, 0x00, 0x8B, 0x08, 0x50, 0xFF, 0x91, 0x88, 0x00, 0x00, 0x00,
+    ],
+    kind: Use::VerifyOnly {
+        instr_lens: Some(&[5, 2, 1, 6]),
+    },
+    source: site_source!("ノート th09_calib_guard.md §2（th09_disasm.txt L60261〜L60264）"),
+}];
+const _: () = assert!(CALIB_GUARD_SITES[0].expected.len() == CALIB_GUARD_LEN);
+
+#[cfg(test)]
+mod calib_guard_tests {
+    //! 計測の守りの表の検査（花映塚は使わない）。転記ミスはノートの本文（`include_str!`）と突き合わせる。
+    use super::*;
+
+    #[cfg(dev_assets)]
+    const NOTE: &str = include_str!("../../../analysis/notes/th09_calib_guard.md");
+
+    #[cfg(dev_assets)]
+    #[test]
+    fn calib_guard_row_appears_in_the_note() {
+        let s = &CALIB_GUARD_SITES[0];
+        assert_eq!(s.expected.len(), 14);
+        let lens = match s.kind {
+            Use::VerifyOnly {
+                instr_lens: Some(l),
+            } => l,
+            _ => panic!("境目つきの照合だけの行のはず"),
+        };
+        assert_eq!(
+            lens.iter().map(|&n| usize::from(n)).sum::<usize>(),
+            s.expected.len()
+        );
+        let mut at = 0usize;
+        for &n in lens {
+            let b = &s.expected[at..at + usize::from(n)];
+            let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+            let line = format!("{:x}: {}", s.addr + at as u32, hex.join(" "));
+            assert!(NOTE.contains(&line), "ノート §2 に「{line}」が無い");
+            at += usize::from(n);
+        }
+        // 次の命令は 0x42F1E7（nop の次）。
+        assert_eq!(s.addr + CALIB_GUARD_LEN as u32, 0x0042_F1E7);
+        for needle in ["0x42F2A8", "0x42F1E7", "0x4B3108", "call *0x88(%ecx)"] {
+            assert!(NOTE.contains(needle), "ノートに {needle} が無い");
+        }
+        assert!(
+            NOTE.contains(&format!("`+0x{:02X}`", D3D8_BEGINSCENE_SLOT))
+                && NOTE.contains(&format!("`+0x{:02X}`", D3D8_TESTCOOP_SLOT)),
+            "ノートに vtable のスロットが無い"
+        );
+        assert_eq!(s.name, CALIB_GUARD_SITE);
+        // 先頭の 5 バイトは `mov 0x4b3108,%eax`（デバイスのポインタが入っているアドレス。別の表の定数と同じ値）。
+        assert_eq!(&s.expected[..1], &[0xA1]);
+        assert_eq!(
+            u32::from_le_bytes([s.expected[1], s.expected[2], s.expected[3], s.expected[4]]),
+            D3D8_DEVICE_PTR
+        );
+        // 最後の命令は `call *0x88(%ecx)`（BeginScene のスロット）。
+        assert_eq!(&s.expected[8..10], &[0xFF, 0x91]);
+        assert_eq!(
+            u32::from_le_bytes([
+                s.expected[10],
+                s.expected[11],
+                s.expected[12],
+                s.expected[13]
+            ]),
+            D3D8_BEGINSCENE_SLOT
+        );
+    }
+
+    #[test]
+    fn calib_guard_range_overlaps_nothing() {
+        assert_eq!(
+            crate::sites::check_table(CALIB_GUARD_SITES, FORBIDDEN),
+            Ok(())
+        );
+        let r = CALIB_GUARD_SITES[0].range();
+        for tables in [
+            SITES,
+            POLL_SITES,
+            PORTRAIT_SITES,
+            ALLOC_SITES,
+            PACING_SITES,
+            RESIM_SITES,
+            CALLOC_SITES,
+            PAD_SITES,
+            WINDOW_CREATE_SITES,
+        ] {
+            for other in tables {
+                assert!(!r.overlaps(&other.range()), "{} と重なる", other.name);
+            }
+        }
+        for f in FORBIDDEN {
+            assert!(!r.overlaps(f), "{f:?} と重なる");
+        }
+        // 抜け先は書く範囲の外（書いた後の命令へ飛ぶ）。
+        assert!(
+            CALIB_ABORT_TARGET >= r.end || CALIB_ABORT_TARGET < r.start,
+            "抜け先が書く範囲の中"
+        );
+    }
+}
+
+// ---- フルスクリーンの垂直同期（`[pacing] vsync`）と、デバイスが失われている間のメインループ ----
+// どちらも `SITES` には入れない: DllMain の中で独立に照合して書く（`vsync_answer_win::install`・`lost_sleep_win::install`）。合わなければ何も書かない。
+
+/// custom.exe の「垂直同期を取らない」を読む関数（ecx = Supervisor。`[ecx+0x450]` の bit 5 を返す）。
+pub const VSYNC_FLAG_FN: u32 = 0x0042_ED50;
+/// その旗の語（Supervisor `0x4B3100` の `+0x450`）と bit。
+#[cfg_attr(all(test, not(dev_assets)), allow(dead_code))] // 製品の経路だけが使う。使う検査は開発側の資料を読むものだけ
+pub const VSYNC_OFF_WORD: u32 = 0x004B_3550;
+pub const VSYNC_OFF_BIT: u32 = 0x20;
+/// `call 0x42ed50` の 2 か所の照合の表（起動の設定の読み込み・起動の計測の終わりの判定）。書くのは各行の `VSYNC_ANSWER_CALL_AT` の 5 バイトだけ。
+pub const VSYNC_ANSWER_SITES: &[SiteDef] = &[
+    SiteDef {
+        name: "vsync_answer_startup",
+        addr: 0x0042_FB4B,
+        expected: &[
+            0x8B, 0xCB, 0xE8, 0xFE, 0xF1, 0xFF, 0xFF, 0x85, 0xC0, 0x74, 0x1C,
+        ],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[2, 5, 2, 2]),
+        },
+        source: site_source!(
+            "ノート th09_fullscreen_vsync.md §2（th09_disasm.txt L61017〜L61020）"
+        ),
+    },
+    SiteDef {
+        name: "vsync_answer_calib",
+        // 起動の計測の守りの抜け先と同じ命令（`mov $0x4b3100,%ecx`）。
+        addr: CALIB_ABORT_TARGET,
+        expected: &[
+            0xB9, 0x00, 0x31, 0x4B, 0x00, 0xE8, 0x9E, 0xFA, 0xFF, 0xFF, 0x85, 0xC0, 0x0F, 0x85,
+            0xE2, 0x00, 0x00, 0x00,
+        ],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[5, 5, 2, 6]),
+        },
+        source: site_source!(
+            "ノート th09_fullscreen_vsync.md §2（th09_disasm.txt L60327〜L60330）"
+        ),
+    },
+];
+/// 各行の `call 0x42ed50` のアドレス（`VSYNC_ANSWER_SITES` と同じ順）。
+pub const VSYNC_ANSWER_CALL_AT: [u32; 2] = [0x0042_FB4D, 0x0042_F2AD];
+
+/// メインループの TestCooperativeLevel（`mov 0x4b3108,%eax` 〜 `call *0xc(%ecx)` の 11 バイト）。`call 入口` ＋ `nop` × 6 に替える。
+pub const LOST_SLEEP_LEN: usize = 11;
+pub const LOST_SLEEP_SITES: &[SiteDef] = &[SiteDef {
+    name: "lost_sleep_testcoop",
+    addr: 0x0042_E692,
+    expected: &[
+        0xA1, 0x08, 0x31, 0x4B, 0x00, 0x8B, 0x08, 0x50, 0xFF, 0x51, 0x0C,
+    ],
+    kind: Use::VerifyOnly {
+        instr_lens: Some(&[5, 2, 1, 3]),
+    },
+    source: site_source!("ノート th09_fullscreen_vsync.md §3（th09_disasm.txt L59184〜L59187）"),
+}];
+const _: () = assert!(LOST_SLEEP_SITES[0].expected.len() == LOST_SLEEP_LEN);
+
+#[cfg(test)]
+mod fullscreen_vsync_tests {
+    //! フルスクリーンの垂直同期の答えとメインループの表の検査（花映塚は使わない）。転記ミスはノートの本文（`include_str!`）と突き合わせる。
+    use super::*;
+
+    #[cfg(dev_assets)]
+    const NOTE: &str = include_str!("../../../analysis/notes/th09_fullscreen_vsync.md");
+
+    #[cfg(dev_assets)]
+    fn rows_in_note(s: &SiteDef) {
+        let lens = match s.kind {
+            Use::VerifyOnly {
+                instr_lens: Some(l),
+            } => l,
+            _ => panic!("{}: 境目つきの照合だけの行のはず", s.name),
+        };
+        assert_eq!(
+            lens.iter().map(|&n| usize::from(n)).sum::<usize>(),
+            s.expected.len(),
+            "{}",
+            s.name
+        );
+        let mut at = 0usize;
+        for &n in lens {
+            let b = &s.expected[at..at + usize::from(n)];
+            let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+            let line = format!("{:x}: {}", s.addr + at as u32, hex.join(" "));
+            assert!(NOTE.contains(&line), "ノートに「{line}」が無い");
+            at += usize::from(n);
+        }
+    }
+
+    #[cfg(dev_assets)]
+    #[test]
+    fn rows_match_the_note_and_the_constants() {
+        for s in VSYNC_ANSWER_SITES.iter().chain(LOST_SLEEP_SITES) {
+            rows_in_note(s);
+        }
+        for (s, at) in VSYNC_ANSWER_SITES.iter().zip(VSYNC_ANSWER_CALL_AT) {
+            let off = (at - s.addr) as usize;
+            let call: [u8; 5] = s.expected[off..off + 5].try_into().unwrap();
+            assert_eq!(call[0], 0xE8, "{}", s.name);
+            assert_eq!(
+                higanr_core::patch::call_target(at, &call),
+                Some(VSYNC_FLAG_FN),
+                "{}",
+                s.name
+            );
+        }
+        assert_eq!(VSYNC_OFF_WORD, SUPERVISOR + 0x450);
+        assert!(NOTE.contains("`+0x450` = `[0x4B3550]` の bit `0x20`"));
+        let t = LOST_SLEEP_SITES[0].expected;
+        assert_eq!(
+            u32::from_le_bytes([t[1], t[2], t[3], t[4]]),
+            D3D8_DEVICE_PTR
+        );
+        assert_eq!(&t[8..10], &[0xFF, 0x51]);
+        assert_eq!(u32::from(t[10]), D3D8_TESTCOOP_SLOT);
+        assert_eq!(D3D8_PRESENT_PARAMS + PP_PRESENT_INTERVAL, 0x004B_3480);
+        assert!(NOTE.contains("`[0x4B3480]`（写しの `+0x30`）"));
+        // 先頭は画面の形の 1 バイトを設置で読めると検証しただけで PresentationInterval も読む（`pacing_win::RealClock::screen`）。この検査は、その 2 つが同じ頁にあることを検証する。
+        assert_eq!(
+            OPTION_WINDOWED / 4096,
+            (D3D8_PRESENT_PARAMS + PP_PRESENT_INTERVAL) / 4096
+        );
+        assert_eq!((D3D8_PRESENT_PARAMS + PP_PRESENT_INTERVAL) % 4, 0);
+    }
+
+    #[test]
+    fn ranges_overlap_nothing() {
+        let mine: Vec<&SiteDef> = VSYNC_ANSWER_SITES.iter().chain(LOST_SLEEP_SITES).collect();
+        for (i, s) in mine.iter().enumerate() {
+            let r = s.range();
+            assert_eq!(
+                crate::sites::check_table(core::slice::from_ref(*s), FORBIDDEN),
+                Ok(()),
+                "{}",
+                s.name
+            );
+            for other in &mine[i + 1..] {
+                assert!(!r.overlaps(&other.range()), "{} と {}", s.name, other.name);
+            }
+            for tables in [
+                SITES,
+                POLL_SITES,
+                PORTRAIT_SITES,
+                ALLOC_SITES,
+                PACING_SITES,
+                RESIM_SITES,
+                CALLOC_SITES,
+                PAD_SITES,
+                WINDOW_CREATE_SITES,
+                CALIB_GUARD_SITES,
+            ] {
+                for other in tables {
+                    assert!(
+                        !r.overlaps(&other.range()),
+                        "{} と {} が重なる",
+                        s.name,
+                        other.name
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3128,8 +3591,10 @@ mod pad_tests {
     use super::*;
     use crate::sites::check_table;
 
+    #[cfg(dev_assets)]
     const PAD_NOTE: &str = include_str!("../../../analysis/notes/th09_pad_pov.md");
 
+    #[cfg(dev_assets)]
     #[test]
     fn pad_rows_match_the_note_and_the_exe_shape() {
         assert_eq!(PAD_SITES.len(), 6);

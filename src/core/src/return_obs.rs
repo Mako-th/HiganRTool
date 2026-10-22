@@ -1,20 +1,9 @@
-//! 戻り道（`return_flow`）が読む番地を、戻り道を動かさない実機の回の `_menu.csv` で照らす（pure）。
+//! 戻り道（`return_flow`）が読むアドレスを、戻り道を動かさない実機の検証の `_menu.csv` で照らす（pure）。
 //!
 //! 読むのは一時停止のメニュー（`0x4D66F8`）と終わりのメニュー（`0x4D8C00`）の状態・フレームの数え、一時停止の旗、終わりのメニューの印。
-//! DLL の読み取りのスレッドが約 1 ms ごとに読み、変わったときだけ（開発用のビルドはフレームの数えが変わるたびに）1 行書く
-//! （`higanrtool_dll::menu`）。行の `seq_after` は、読んだ直後までに入力の地点が通った数（= ゲームの tick の通し番号）。
-//!
-//! 照らすこと（`Finding::check` の名前の前半が一時停止 `pause` / 終わりのメニュー `end`）:
-//! - 状態が `return_flow::pause::STATES` / `end_menu::STATES` の範囲内（`*.state_range`）。
-//! - 状態の移り方が逆アセンブルで読んだ表（`PAUSE_MOVES` / `END_MOVES`）の中（`*.transitions`）。
-//! - 入力で動く移りは、前の行のフレームの数えが `MENU_READ_FRAMES` 以上（`*.gate`）。リセットする移りは新しい状態の数えが 0 から、
-//!   しない移りは数えが続く（`*.frames_reset`）。
-//! - 再開の確定（状態 3）・タイトルへ（状態 8）から旗が下りるまでが `CLOSE_FRAMES` tick（`pause.close_delay`）。
-//! - 数えが tick より速く進まない（`*.frames_vs_ticks`）。
-//! - 求めた移りが全部見えた（`*.coverage`。台本が押したものが届いたか）。
-//! - 1 回目の一時停止の移りの列が `PAUSE_FIRST_MOVES` と一致する（`pause.first_moves`。読み始め前の入力が効かなかった裏づけ）。
-//!
-//! 母数 0 は「測れていない」: 求めたのに一時停止・終わりのメニューの区間が 1 つも無いときは `Status::NotMeasured` で、合格に数えない。
+//! DLL の読み取りのスレッドが約 1 ms ごとに読み、変わったときだけ（開発用のビルドはフレームの数えが変わるたびに）`_menu.csv` に 1 行書く（`higanrtool_dll::menu`）。行の `seq_after` は、読んだ直後までに入力の地点が通った数（= ゲームの tick の通し番号）。
+//! 照らすことは `Finding::check` の名前（前半が一時停止 `pause` / 終わりのメニュー `end`）のとおり: 状態の範囲（`state_range`）・移り方が逆アセンブルで読んだ表（`PAUSE_MOVES` / `END_MOVES`）の中か（`transitions`）・入力のゲートと数えのリセット（`gate` / `frames_reset`）・閉じるまでの `CLOSE_FRAMES` tick（`pause.close_delay`）・数えが tick より速く進まないこと（`frames_vs_ticks`）・求めた移りが全部見えたか（`coverage`）・1 回目の一時停止の移りの列（`pause.first_moves`）。
+//! 母数 0 は「測れていない」: 求めたのに区間が 1 つも無いときは `Status::NotMeasured` で、合格に数えない。
 //! 合否（`Report::not_all_passed`）を決めるのは、求めた区間・求めた検査の結果だけ。求めていない区間の結果は照らして出すが数えない。
 #![forbid(unsafe_code)]
 
@@ -26,9 +15,7 @@ use crate::return_flow::{MENU_READ_FRAMES, end_menu, pause};
 /// 末尾の 6 欄が一時停止と終わりのメニュー（`parse_menu_csv` が列の名前で引く）。書き手は `higanrtool_dll::menu`。
 pub const MENU_CSV_HEADER: &str = "seq_before,seq_after,t_us,menu_ptr,screen_id,substate,cursor,prev_screen,transitioning,anim,p1_ptr,p1_life,p2_ptr,p2_life,replay_ptr,replay_counter,replay_mode,gui_ptr,gui_talk,pause_flag,pause_state,pause_frames,end_flag,end_state,end_frames";
 
-/// 再開の確定（一時停止の状態 3）・タイトルへ（同 8）・終わりのメニューの決定（同 4・5・6）から次へ進むまでのフレーム
-/// （`cmpl $0x14,0x4(%esi)`: `0x00434ACC` / `0x00434D74` / `0x00434D9A` / `0x004359F8` / `0x00435A14` / `0x00435A30`）。
-pub const CLOSE_FRAMES: u32 = 20;
+pub use crate::return_flow::CLOSE_FRAMES;
 /// tick の数えの許容（読むのは 1 ms ごとで、1 tick の途中で読みうる）。
 const TICK_SLACK: u32 = 1;
 
@@ -74,7 +61,7 @@ const END_MOVES: [(u32, u32, bool); 13] = [
     (6, end_menu::INIT, false),
 ];
 
-/// 台本が通すと求める移り（`Expect`）。一時停止: 再開と「タイトルへ戻る」の往復・確かめの枠の「いいえ」「はい」の往復と「いいえ」の決定・再開の確定。
+/// 台本が通すと求める移り（`Expect`）。一時停止: 再開と「タイトルへ戻る」の往復・確認の枠の「いいえ」「はい」の往復と「いいえ」の決定・再開の確定。
 pub const PAUSE_REQUIRED: [(u32, u32); 8] = [
     (pause::INIT, pause::RESUME),
     (pause::RESUME, pause::TITLE),
@@ -129,7 +116,7 @@ pub struct Row {
 pub enum ParseError {
     /// 見出しの行が無い。
     NoHeader,
-    /// 要る列が見出しに無い（古い版の `_menu.csv`）。
+    /// 要る列が見出しに無い（古いバージョンの `_menu.csv`）。
     MissingColumn(&'static str),
     /// 行 `line`（1 から）の列 `column` が数として読めない。
     BadNumber { line: usize, column: &'static str },

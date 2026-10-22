@@ -1,13 +1,9 @@
 //! 素の花映塚でリプレイを再生したとき、生きた試合どおりに再生できたかを、印（`HGRT`）の `rN` と再生中に読んだ同じ tick の値で突き合わせる
-//! （pure。道具は `src/bin/replay_playcheck.rs`、再生中の値を積む側は dll の `replay_watch`）。
+//! （pure。ツールは `src/bin/replay_playcheck.rs`、再生中の値を積む側は dll の `replay_watch`）。
 //!
 //! 再生の側は、各ラウンドの決着の tick（`completed_rounds` が増えた tick）の値を生きた試合と同じ読み方（`MatchLog`）で積み、再生を出たときに
-//! ログへ 1 行を書く（`format_line`）。書式は印の `rN` の値と同じ 12 欄（`replay_detail::RoundRec`）。
-//!
-//! ```text
-//! 再生の照合: 最後まで再生 end=complete date=26/10/14 name=12:34:56 rounds=2 r1=<12 欄> r2=<12 欄>
-//! ```
-//!
+//! ログへ 1 行を書く（`format_line`）。書式は印の `rN` の値と同じ 12 欄（`replay_detail::RoundRec`）で、
+//! `再生の照合: 最後まで再生 end=complete date=26/10/14 name=12:34:56 rounds=2 r1=<12 欄> r2=<12 欄>` の形。
 //! 行ごとにまとまっているので、別のスレッドの行が間に入っても読める。`date` / `name` は再生した見出し（`+0xC4` / `+0xCE`）の文字で、読めなかった
 //! ときは書かない。
 #![forbid(unsafe_code)]
@@ -18,7 +14,7 @@ use crate::replay_decode;
 use crate::replay_detail::{MAX_ROUND_KEYS, RoundRec, Winner};
 use crate::replay_mark_cmp;
 
-/// 再生の行の目印。ログの行の先頭に別の字（時刻など）が付いても、この語から後ろを読む。
+/// 再生の行の目印。ログの行の先頭に別の文字（時刻など）が付いても、この語から後ろを読む。
 pub const PLAY_MARK: &str = "再生の照合:";
 /// 展開した本体（`replay_decode::decode_image`）の中の、見出しの日付（`yy/mm/dd` + NUL の 9 バイト）と名前（9 バイト）の位置。
 /// 形式は保存関数（th09.exe）が書くもの。
@@ -26,8 +22,8 @@ pub const HEADER_DATE_OFFSET: usize = 0xC4;
 pub const HEADER_NAME_OFFSET: usize = 0xCE;
 pub const HEADER_FIELD_LEN: usize = 9;
 
-/// 見出しの 9 バイトの欄を行に書ける字にする。NUL で終わる 1〜8 字の ASCII の見える字（空白は `_`）だけを受け、
-/// NUL が無い・空・見えない字や ASCII 以外（Shift-JIS の名前）を含むものは `None`。
+/// 見出しの 9 バイトの欄を行に書ける文字にする。NUL で終わる 1〜8 文字の ASCII の見える文字（空白は `_`）だけを受け、
+/// NUL が無い・空・見えない文字や ASCII 以外（Shift-JIS の名前）を含むものは `None`。
 pub fn header_field(raw: &[u8]) -> Option<String> {
     let end = raw.iter().position(|&b| b == 0)?;
     if end == 0 || end >= HEADER_FIELD_LEN {
@@ -90,7 +86,7 @@ pub fn format_line(
         if complete {
             "最後まで再生"
         } else {
-            "途中で終わった"
+            "途中終了"
         },
         if complete { "complete" } else { "partial" }
     );
@@ -188,7 +184,7 @@ pub fn parse_log(text: &str) -> ParsedLog {
 /// 比べる側のリプレイ（印の `rN` と見出しの文字）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefReplay {
-    /// ファイル名だけ（フォルダ名には対戦者の名前が入る）。
+    /// ファイル名だけ（フォルダ名には相手の名前が入る）。
     pub file: String,
     pub ident: Ident,
     pub rounds: Vec<RoundRec>,
@@ -382,7 +378,7 @@ pub struct Report {
     pub equal: bool,
 }
 
-/// 道具の本体: ログの全文とリプレイから、選んで・比べて・文にする。再生の行が 1 つも読めなければ `Err`（測れていない）。
+/// ツールの本体: ログの全文とリプレイから、選んで・比べて・文にする。再生の行が 1 つも読めなければ `Err`（測れていない）。
 pub fn run(r: &RefReplay, log: &str) -> Result<Report, String> {
     let parsed = parse_log(log);
     let mut text = String::new();
@@ -540,7 +536,7 @@ mod tests {
         let line = format_line(true, &id, &two_rounds(), 0);
         assert!(line.starts_with(PLAY_MARK));
         assert!(line.contains(" r1=9781.1.2.0.29.32.13.13.12.13.10654030.9296590"));
-        // 別の字が先頭に付いても読める（ログの書き手が時刻などを足す場合）。
+        // 別の文字が先頭に付いても読める（ログの書き手が時刻などを足す場合）。
         let p = parse_log(&format!("noise\n[00:01] {line}\nnoise\n"));
         assert!(p.bad.is_empty());
         assert_eq!(
@@ -554,7 +550,7 @@ mod tests {
             }]
         );
         let partial = format_line(false, &Ident::default(), &two_rounds()[..1], 3);
-        assert!(partial.contains("途中で終わった end=partial"));
+        assert!(partial.contains("途中終了 end=partial"));
         let p = parse_log(&partial);
         assert_eq!(p.blocks.len(), 1);
         assert!(!p.blocks[0].complete);

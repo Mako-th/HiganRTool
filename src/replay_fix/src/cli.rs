@@ -1,4 +1,4 @@
-//! 引数の読み方と、窓を出さない `--batch`（検査と手順の自動化用）。
+//! 引数の読み方と、ウィンドウを出さない `--batch`（検査と手順の自動化用）。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -82,7 +82,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     }
 }
 
-/// `--batch`: 窓を出さずに、見つけたリプレイ全部へ同じ値で作る。(終了コード, 結果の文)。
+/// `--batch`: ウィンドウを出さずに、見つけたリプレイ全部へ同じ値で作る。(終了コード, 結果の文)。
 pub fn run_batch(pair: Pair, inputs: &[PathBuf], lang: Lang) -> (i32, String) {
     let text = Text(lang);
     let found = collect(inputs);

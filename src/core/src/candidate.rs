@@ -15,7 +15,7 @@ pub const MAX_CANDIDATES: usize = 8;
 /// 候補の種別（接続コードのバイトの値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandKind {
-    /// 同じ PC の中（127.0.0.0/8 と `::1`）。検査用（既定の `scope = loopback` ではこれだけで繋ぐ）。
+    /// 同じ PC の中（127.0.0.0/8 と `::1`）。検査用（既定の `scope = loopback` ではこれだけで接続する）。
     Loopback = 1,
     Host = 2,
     External = 3,
@@ -37,7 +37,7 @@ impl CandKind {
         self as u8
     }
 
-    /// 優先（小さい方が先）。IPv6 → LAN → 外側 IPv4。loopback は検査用で、本物の候補と並ぶことは無いので先頭に置く。
+    /// 優先（小さい方が先）。IPv6 → LAN → 外側 IPv4。loopback は検査用で、本物の候補と並ぶことは無いので先頭にする。
     pub fn priority(self) -> u8 {
         match self {
             CandKind::Loopback => 0,
@@ -56,9 +56,8 @@ fn is_lan_v4(ip: Ipv4Addr) -> bool {
 
 /// 世界の相手に通じる IPv6 のアドレスか（自分の接続コードの候補に載せてよいか）。
 ///
-/// 2000::/3（グローバルユニキャスト）だけを通し、その中の通じない枠を外す: 2001::/23（IETF の特別用途。Teredo・ベンチマークなど。
-/// 通常の割り当ては 2001:200::/23 から）、2001:db8::/32（文書用）、2002::/16（6to4。経路が相手の中継に依る）、
-/// 3fff::/20（文書用）。外すのは自分が載せる側だけで、相手のコードの候補を読むガード（`Candidate::new`・`guard`）は変えない。
+/// 2000::/3（グローバルユニキャスト）だけを通し、通じない枠を外す: 2001::/23（IETF の特別用途。通常の割り当ては 2001:200::/23 から）、2001:db8::/32 と 3fff::/20（文書用）、2002::/16（6to4。経路が相手の中継に依る）。
+/// 外すのは自分が載せる側だけで、相手のコードの候補を読むガード（`Candidate::new`・`guard`）は変えない。
 pub fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     let [s0, s1, ..] = ip.segments();
     if s0 & 0xE000 != 0x2000 {
@@ -223,6 +222,86 @@ impl Candidates {
     }
 }
 
+/// 候補 1 つのバイト列の最大（種別 1・family 1・IPv6 16・ポート 2）。
+pub const CAND_WIRE_MAX: usize = 20;
+/// 候補の並び（個数 1 B ＋ 候補）のバイト列の最大。
+pub const LIST_WIRE_MAX: usize = 1 + MAX_CANDIDATES * CAND_WIRE_MAX;
+
+/// 候補の並びを読めなかった理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListError {
+    /// バイトが足りない（`need` は読もうとした所の終わり。並びの先頭から数える）。
+    Short { need: usize },
+    /// 個数が `MAX_CANDIDATES` を越える（中は個数）。
+    TooMany(u8),
+    /// 候補 `index` の中身がおかしい（知らない種別・family は `err` が None）。
+    Bad { index: u8, err: Option<CandError> },
+}
+
+/// 候補の並びを、接続コードと観戦者へのパケットに共通の形で `out` へ書き、書いたバイト数を返す。
+/// 形: 個数 u8 ‖ 候補ごとに 種別 u8・family u8（4 か 6）・アドレス 4 か 16 B・ポート u16 LE。確保しない。
+pub fn write_list(c: &Candidates, out: &mut [u8; LIST_WIRE_MAX]) -> usize {
+    // 個数は `MAX_CANDIDATES` 以下（`Candidates` が保つ）なので、`LIST_WIRE_MAX` の中に収まる。
+    out[0] = c.len() as u8;
+    let mut at = 1;
+    for cand in c.as_slice() {
+        out[at] = cand.kind.to_u8();
+        at += 1;
+        match cand.addr.ip() {
+            IpAddr::V4(ip) => {
+                out[at] = 4;
+                out[at + 1..at + 5].copy_from_slice(&ip.octets());
+                at += 5;
+            }
+            IpAddr::V6(ip) => {
+                out[at] = 6;
+                out[at + 1..at + 17].copy_from_slice(&ip.octets());
+                at += 17;
+            }
+        }
+        out[at..at + 2].copy_from_slice(&cand.addr.port().to_le_bytes());
+        at += 2;
+    }
+    at
+}
+
+/// [`write_list`] の形の並びを `b` の先頭から読み、並びと読んだバイト数を返す（後ろの余りは呼び手が見る）。個数 0 は通す。
+/// 重なり・種別とアドレスの食い違いは `Candidates::push`・`Candidate::new` と同じに断る。確保しない。
+pub fn read_list(b: &[u8]) -> Result<(Candidates, usize), ListError> {
+    let take = |at: usize, n: usize| b.get(at..at + n).ok_or(ListError::Short { need: at + n });
+    let count = take(0, 1)?[0];
+    if usize::from(count) > MAX_CANDIDATES {
+        return Err(ListError::TooMany(count));
+    }
+    let mut list = Candidates::EMPTY;
+    let mut at = 1;
+    for index in 0..count {
+        let bad = |err| ListError::Bad { index, err };
+        let kind = CandKind::from_u8(take(at, 1)?[0]).ok_or(bad(None))?;
+        let ip = match take(at + 1, 1)?[0] {
+            4 => {
+                let mut o = [0u8; 4];
+                o.copy_from_slice(take(at + 2, 4)?);
+                at += 6;
+                IpAddr::V4(Ipv4Addr::from(o))
+            }
+            6 => {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(take(at + 2, 16)?);
+                at += 18;
+                IpAddr::V6(Ipv6Addr::from(o))
+            }
+            _ => return Err(bad(None)),
+        };
+        let p = take(at, 2)?;
+        let port = u16::from_le_bytes([p[0], p[1]]);
+        at += 2;
+        let c = Candidate::new(kind, SocketAddr::new(ip, port)).map_err(|e| bad(Some(e)))?;
+        list.push(c).map_err(|e| bad(Some(e)))?;
+    }
+    Ok((list, at))
+}
+
 /// 学んでよい送り元の数の上限。学ぶのは、相手のルーターがポートを付け替えたときの「コードに無いアドレス」で、普通は 1、
 /// 続いても 2〜3。4 あれば足り、固定長のまま小さく保てる。学んだアドレスへも HELLO を 20 ms ごとに送るので送る量の天井にもなる。
 /// 越えたら学ばずに数える（`link::RecvCounts::learn_refused`）。
@@ -292,13 +371,10 @@ impl Learned {
 
 /// 経路の選び方: 相手の候補の列と、最初に返しが来た経路。
 ///
-/// - 受けるのは候補のどれかから来たものだけ（`accepts`）。例外: 繋がる前の接続の手順の 1 通（HELLO・HELLO_ACK・AGREE）で
-///   タグまで通ったものは、その送り元を学んだ候補として足す（`learn`。ICE の peer reflexive と同じ考え。相手のルーターがポートを
-///   付け替えると HELLO はコードのアドレスと別のポートから届く）。学んだアドレスへも HELLO を送り、受けにも PONG の宛先にも使う。
-///   経路の外の第三者はタグを作れず学ばせられない。経路の上にいる者が本物の HELLO を別の送り元から送り直せば学ばせられる（ICE と同じ性質）。
+/// - 受けるのは候補のどれかから来たものだけ（`accepts`）。例外: 接続前の手順の 1 通（HELLO・HELLO_ACK・AGREE）でタグまで通ったものは、その送り元を学んだ候補として足す
+///   （`learn`。ICE の peer reflexive と同じ考え。相手のルーターがポートを付け替えると HELLO はコードのアドレスと別のポートから届く）。学んだアドレスへも HELLO を送る。
 /// - 経路を決める前は全部の候補（学んだものを含む）へ送り、決めた後はその経路へだけ送る（決めるのは `heard_back` の最初の 1 回）。
-/// - 決めた後も候補のどれかから来たものは受ける。相手から見た経路と自分から見た経路は同じとは限らず、決めた経路以外を捨てると
-///   片方だけ届かなくなる筋がある。
+/// - 決めた後も候補のどれかから来たものは受ける。相手から見た経路と自分から見た経路は同じとは限らず、決めた経路以外を捨てると片方だけ届かなくなることがある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Paths {
     cands: Candidates,
@@ -328,7 +404,7 @@ impl Paths {
         self.cands.contains(from) || self.learned.contains(from)
     }
 
-    /// 候補に無い送り元 `from` を、学んだ候補として足す。繋がる前の接続の手順の 1 通がタグまで通った後だけ呼ぶ（ガードは `link.rs`）。
+    /// 候補に無い送り元 `from` を、学んだ候補として足す。接続前の手順の 1 通がタグまで通った後だけ呼ぶ（ガードは `link.rs`）。
     pub fn learn(&mut self, from: SocketAddr) -> Result<(), LearnError> {
         if self.accepts(from) {
             return Ok(());
@@ -340,7 +416,7 @@ impl Paths {
         self.chosen.is_some_and(|c| self.learned.contains(c))
     }
 
-    /// 採った経路が学んだ候補なら、経路の選びだけ戻す（学んだ列は残す）。手順を引き継いで作り直す（`Restart::Resume`）ときに呼ぶ:
+    /// 採った経路が学んだ候補なら、経路の選びだけ戻す（学んだ列は残す）。手順を引き継いで作り直す（`Restart::Resume`）ときに、接続のセッション（`link.rs`）が呼ぶ:
     /// 学んだアドレスはルーターが付け替えるアドレスで、時間切れになったならもう死んでいることがあり、戻さないと死んだアドレスへだけ送り続ける。
     pub fn unchoose_learned(&mut self) -> bool {
         if self.chosen_is_learned() {

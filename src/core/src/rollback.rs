@@ -1,22 +1,11 @@
 //! rollback のモードの状態機械。入力ワードの交換は `lockstep.rs` と同じ形で、違うのは、相手の入力ワードが無い tick を予測で進め、後で確定の入力ワードで進め直すところだけ。
-//! ソケットも時計もゲームのメモリも持たず、ゲームの側は [`Window`] で受ける。ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を置かない。
+//! ソケットも時計もゲームのメモリも持たず、ゲームの側は [`Window`] で受ける。ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を使わない。
 //!
-//! N = これから更新するフレーム、F = 確定の前線（F より前は両者の入力ワードが本物）、S_F = F の始まりの状態のコピー（1 つだけ）、R = 予測の上限、
-//! D = 自分の入力の遅れ（`apply_frame = capture_frame + D`）。
-//! - 入力の地点（`capture` → `input_point`、Present の後に `post_present`）は、N の相手の入力ワードが届いていればそれで、無ければ相手の直前の確定の入力ワードの繰り返しで進める。
-//!   `N − F ≥ R` なら、入力ワードが届いていても待つ（進め直しの費用の上限を守るため）。
-//! - 予測の tick が場面の要求を立てたら使わず、F が越えるまで待つ（[`Wait::Boundary`]）。予測で場面の境目を跨がない。
-//! - コピーは Present の後。N > F で相手の入力ワードが届いていれば F を進める: 書き戻し → 確定の入力ワードで更新 → コピー → 予測の入力ワードで N まで更新（前後で `resim_begin` / `resim_end`）。
-//! - 外へ流すのは確定した (frame, p1, p2) と、確定の tick の始まりで取る CHECK（30 フレームごと）だけ。
-//! - 時刻合わせ（[`Wait::Sync`]）: 相手の INPUT から自分が何フレーム先にいるかを見積もり、見積もりが閾値を越えたら描画だけの 1 フレームを入れ、
-//!   その後 [`SYNC_GAP`] 更新は待たない。
-//!
-//! seg の始まりの D（D_start。`seg_delay`）はホストが `begin_seg` で決め、その seg の全部の INPUT に lat を載せる。seg 1 以降のゲストは D 未定で、ホストの INPUT を
-//! 1 通受けるまで `capture` が `CaptureError::NoDelay` を返す（seg 0 は AGREE の D を両者が知っている）。seg の途中の D はホストの lat {frame: F, delay: x}（「取得のフレーム F 以降は D = x」という予定）で替える。
-//! ホストは `press_delay`（自分の Ctrl＋数字、またはゲストの要求）で出し、F > 0 の予定はゲストが D を知ったと分かってから出す（ゲート。D 未定のゲストは
-//! frame 0 しか受けないので、ゲートが無いとゲストが D_start を知る経路が無くなる）。ゲストの要求は INPUT の lat に
-//! {frame: seq, delay: x} で載せる。穴埋め（`is_prefill`）の境目と予測の「まだ何も確定していない」は D_start で読み、今の D（`cur_delay`）は時刻合わせの閾値・格子の寄せ・表示・記録だけに使う。
-
+//! N = これから更新するフレーム、F = 確定の前線（F より前は両者の入力ワードが本物）、S_F = F の始まりの状態のコピー（1 つだけ）、R = 予測の上限、D = 自分の入力の遅れ（`apply_frame = capture_frame + D`）。
+//! - N の相手の入力ワードが届いていればそれで、無ければ相手の直前の確定の入力ワードの繰り返しで進める。`N − F ≥ R` なら、入力ワードが届いていても待つ（進め直しの費用の上限を守るため）。予測の tick が場面の要求を立てたら使わず、F が越えるまで待つ（[`Wait::Boundary`]）。
+//! - コピーは Present の後。N > F で相手の入力ワードが届いていれば F を進める: 書き戻し → 確定の入力ワードで更新 → コピー → 予測の入力ワードで N まで更新。外へ流すのは確定した (frame, p1, p2) と、確定の tick の始まりで取る CHECK（30 フレームごと）だけ。
+//! - 時刻合わせ（[`Wait::Sync`]）: 相手の INPUT から自分が何フレーム先にいるかを見積もり、見積もりが閾値を越えたら描画だけの 1 フレームを入れ、その後 [`SYNC_GAP`] 更新は待たない。
+//! - seg の始まりの D（D_start。`seg_delay`）はホストが `begin_seg` で決め、その seg の全部の INPUT に lat を載せる。seg 1 以降のゲストは D 未定で、ホストの INPUT を 1 通受けるまで `capture` が `CaptureError::NoDelay` を返す。
 use crate::check::is_check_frame;
 use crate::delay_pick::{AUTO, AutoHold, Recommend};
 use crate::frame::{MAX_DELAY, is_prefill};
@@ -62,7 +51,7 @@ pub struct Config {
     delay: u8,
     max_ahead: u8,
     seat: Seat,
-    /// 役（role_nonce の大きい方がホスト）。rollback のモードで seg の D を決めて INPUT に載せるのはホストだけ。
+    /// 役（接続の手順で決まる）。rollback のモードで seg の D を決めて INPUT に載せるのはホストだけ。
     role: Role,
     /// 時刻合わせを使うか。ネットワークに載せない各自の設定。
     time_sync: bool,
@@ -81,7 +70,7 @@ impl Config {
         }
     }
 
-    /// 役を置く。delay 方式では効かない。
+    /// 役を設定する。delay 方式では効かない。
     pub fn with_role(mut self, role: Role) -> Self {
         self.role = role;
         self
@@ -318,10 +307,10 @@ fn note_seg_delay(stats: &mut Stats, seg: u16, d: u8) {
 /// 標本の近くで止まり、閾値に届かなくなる。
 pub const SYNC_UNIT: i32 = 256;
 /// 標本（`wl − 2·top + ack`）の偏りの補正。床で数えた 2 つの差の和なので、位相が一様なら 2L より平均 1 小さい。
-/// 補正しないと先の側の標本が閾値に届かず、予測するのに待たない帯ができる（実測: D 1 の 29,602 フレームで書き戻し A 17,527・B 487）。
+/// 補正しないと先の側の標本が閾値に届かず、予測するのに待たない帯ができる。
 const SYNC_BIAS: i64 = 1;
 /// 移動平均の重み（新しい標本を 1/16 ずつ混ぜる）。軽いと揺れで標本が 1 つ跳ねただけで閾値を越える
-/// （実測: ALPHA 4 → 16 で揺れの大きいネットワークの余計な待ちが約 226 万更新のうち 9,272 → 718 回）。
+/// （ALPHA 4 では揺れの大きいネットワークで余計な待ちが多かった）。
 const SYNC_ALPHA: i32 = 16;
 /// 標本がこの数たまるまでは待たない。平均が 0 から混ざり始めるので実質は働かず、初期値や重みを変えたときの保険。
 const SYNC_MIN_SAMPLES: u8 = 3;
@@ -329,7 +318,7 @@ const SYNC_MIN_SAMPLES: u8 = 3;
 /// 1.5 にすると帯の縁で平均が届かず、先の側が 3 割ほど予測したまま待たない。1.0 以下だと帯の手前でも待つ。
 const SYNC_THRESHOLD: i32 = 5 * SYNC_UNIT / 4;
 /// D = 0 の seg の閾値（補正後の 2L で 2.5）。D = 0 で待って得をするのは φ ≥ T + w_AB のときだけ。
-/// D ≥ 1 の閾値のままだと、後ろの側の予測が 4.4% → 78.4% になった（sim: 片道 7 ms・時計差 4 µs）。
+/// D ≥ 1 の閾値のままだと、後ろの側の予測が大きく増える（模型で確認）。
 const SYNC_THRESHOLD_D0: i32 = 5 * SYNC_UNIT / 2;
 /// 1 回待った後、次に待つまでに進める更新の数。1 回に 1 フレームだけ待ち、急に止めず少しずつ揃える。
 pub const SYNC_GAP: u8 = 3;
@@ -358,7 +347,7 @@ pub struct GlideParams {
     /// 相手の INPUT が標本にならないまま過ぎたフレームの数がこれを越えたら寄せない（途切れたネットワークで古い平均のまま動かさない）。
     pub stale_frames: u8,
     /// 寄せてよいネットワークの上限（往復の長さが `2·D·T` のこの割合（%）まで。一度寄せ始めたら `rtt_off_pct` まで）。
-    /// RTT が `2·D·T` に近いと寄せても予測が消えず、止まりの方が予測の合計が小さい（模型 D 1: 片道 18 ms で後ろの側の予測 11% → 97.5%）。
+    /// RTT が `2·D·T` に近いと寄せても予測が消えず、止まりの方が予測の合計が小さい（模型 D 1 で確認）。
     pub rtt_on_pct: u32,
     pub rtt_off_pct: u32,
 }
@@ -380,7 +369,7 @@ pub struct Rollback {
     cfg: Config,
     seg: u16,
     /// この seg の始まりの D（D_start。seg の途中では変わらない）。apply_frame がこれより小さいフレームは両者とも 0（`is_prefill`）。
-    /// 予測の「まだ何も確定していない」もこれで読む。ゲストが D 未定の間は前の seg の最後の D を仮に置いてあるだけ。
+    /// 予測の「まだ何も確定していない」もこれで読む。ゲストが D 未定の間は前の seg の最後の D を仮に入れてあるだけ。
     seg_start_delay: u8,
     /// この seg の D が決まっているか。rollback のゲストは `begin_seg` の後 false で、ホストの lat 付き INPUT を受けたら true。
     delay_known: bool,
@@ -530,7 +519,7 @@ impl Rollback {
     /// seg の始まりの形を `last`（始まりの D。ゲストが待つなら仮の値）で作る。`guest_waits` は、rollback のゲストが D を知らない形で作るか。
     fn place_head(&mut self, last: u8, guest_waits: bool) {
         if self.rollback_mode() && self.cfg.role == Role::Guest && guest_waits {
-            // 入力ワードの置き場の起点は仮の値。ホストの INPUT で D を知ったとき `adopt_delay` が置き直す。
+            // 入力ワードの置き場の起点は仮の値。ホストの INPUT で D を知ったとき `adopt_delay` が直す。
             self.seg_start_delay = last;
             self.delay_known = false;
         } else {
@@ -941,7 +930,7 @@ impl Rollback {
             // D を下げた後: この apply_frame の入力ワードはもう送ってある（書き換えると遅れて届いた古い INPUT と見分けられない）。
             bump(&mut self.stats.d_dropped);
         } else {
-            // 相手がまだ持っていない入力ワードと、進め直しで使う入力ワード（F 以降）を上書きしない。埋める隙間も含めて一番先の apply_frame で確かめる。
+            // 相手がまだ持っていない入力ワードと、進め直しで使う入力ワード（F 以降）を上書きしない。埋める隙間も含めて一番先の apply_frame で検証する。
             let oldest_needed = self.f.min(self.peer_ack);
             if apply - oldest_needed >= RING as u32 {
                 return Err(CaptureError::Full);
@@ -983,6 +972,7 @@ impl Rollback {
                 ack: 0,
                 base: 0,
                 lat: None,
+                stamp: crate::wire::Stamp::NONE,
                 count: 0,
                 words: [0u16; MAX_WORDS],
             };
@@ -1011,6 +1001,7 @@ impl Rollback {
                     }),
                 }
             },
+            stamp: crate::wire::Stamp::NONE,
             count: n as u8,
             words,
         }
@@ -1021,7 +1012,7 @@ impl Rollback {
     }
 
     /// 届いた INPUT を受ける。捨てるときは中身を 1 つも使わない。判定は `Lockstep::on_input` と同じで、違いは lat と、
-    /// 先の入力ワードを置ける範囲が「F + 枠の数」の手前までなこと。rollback のホストが受けた frame 0 は `GuestLat`、frame ≥ 1 は要求として取る。
+    /// 先の入力ワードを保持できる範囲が「F + 枠の数」の手前までなこと。rollback のホストが受けた frame 0 は `GuestLat`、frame ≥ 1 は要求として取る。
     /// ゲストが受けたホストの INPUT で、lat が無い・delay が 0〜9 の外・D 未定なのに frame ≠ 0・frame 0 で D_start と違う値・
     /// 知っている予定と同じ F で違う値、は `BadLat`。D 未定のゲストは、ここで D にして入力ワードの置き場を作る。
     pub fn on_input(&mut self, inp: &Input) -> RecvOutcome {
@@ -1033,9 +1024,9 @@ impl Rollback {
             }
             return RecvOutcome::OtherSeg;
         }
-        // この INPUT で D を知る（ゲストが D 未定のとき）。確かめが全部通ってから置くので、確かめは「D を知った後」の起点で行う。
+        // この INPUT で D を知る（ゲストが D 未定のとき）。検証が全部通ってから確定するので、検証は「D を知った後」の起点で行う。
         let mut adopt = None;
-        // ゲストが受けた新しい予定 / ホストが受けたゲストの要求（確かめが全部通ってから使う）。
+        // ゲストが受けた新しい予定 / ホストが受けたゲストの要求（検証が全部通ってから使う）。
         let mut sched_in = None;
         let mut wish_in = None;
         if self.rollback_mode() {
@@ -1193,8 +1184,8 @@ impl Rollback {
         self.sync_idle = 0;
         let two_l = i64::from(self.local_next) - 2 * i64::from(top) + i64::from(ack) + SYNC_BIAS;
         let x = (two_l.clamp(-1000, 1000) as i32) * SYNC_UNIT;
-        // 平均は 0（釣り合い）から始める。最初の標本をそのまま平均にすると、seg の始まりの標本（最初の 1 往復は相手の ack が動いていない。
-        // 実測: 最初の 3 標本が 2・1・0）が閾値を越えたまま数十標本残り、釣り合った 2 台がどちらも seg の始まりで 1 回余計に待つ。
+        // 平均は 0（釣り合い）から始める。最初の標本をそのまま平均にすると、seg の始まりの標本（最初の 1 往復は相手の ack が動いていない）が
+        // 閾値を越えたまま数十標本残り、釣り合った 2 台がどちらも seg の始まりで 1 回余計に待つ。
         self.sync_avg += (x - self.sync_avg) / SYNC_ALPHA;
         self.sync_samples = self.sync_samples.saturating_add(1);
         let lead = self.sync_avg / 2;
@@ -1221,10 +1212,10 @@ impl Rollback {
     pub fn glide_ppm_with(&mut self, p: &GlideParams, rtt_us: Option<u32>, frame_us: u32) -> i32 {
         self.sync_idle = self.sync_idle.saturating_add(1);
         // D = 0 は寄せない。先の側は後ろの側の予測を減らすために先にいたいので、平均を 0 へ寄せると後ろの側の予測が増える
-        // （模型: 片道 7 ms・揺れ 〜4 ms で 12.2% → 27.5%）。両側が予測しない位置の幅 `2·D·T − RTT` は今の D で決まる。
+        // （模型で確認）。両側が予測しない位置の幅 `2·D·T − RTT` は今の D で決まる。
         let d = u64::from(self.cur_delay());
         // D 未定・往復が測れていない間は 0 を返すだけで、判定の状態（`glide_ok`）は変えない。落とすと seg の始まりのたびに上限側で
-        // 判定し直し、往復が上限と戻りの間（32〜35 ms）にあるネットワークでホストは寄せ続けゲストだけが切れる。
+        // 判定し直し、往復が上限と戻りの間（32〜35 ms）にあるネットワークで対戦のホストは寄せ続け、対戦のゲストだけが切れる。
         let known = if self.delay_known { rtt_us } else { None };
         if self.delay_known && d == 0 {
             self.glide_ok = false;
@@ -1646,6 +1637,7 @@ mod tests {
             ack,
             base,
             lat: None,
+            stamp: crate::wire::Stamp::NONE,
             count: words.len() as u8,
             words: w,
         }
@@ -1933,7 +1925,7 @@ mod tests {
         );
     }
 
-    // ---- 格子の寄せ ----
+    // ---- 格子の寄せ（1 フレームの長さを、先にいるフレーム数の平均が 0 へ戻るように変える） ----
 
     fn glide_rb(d: u8, avg: i32) -> Rollback {
         let mut rb = Rollback::new(Config::rollback(Seat::P2, d, 8));

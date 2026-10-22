@@ -1,16 +1,11 @@
-//! 配る ini の雛形を土台に、今の ini の値を移して新しい形の ini を作る（pure。ファイルは触らない）。
+//! 配る ini の雛形を土台に、今の ini の値を移して新しい形の ini を作る（pure。ファイルは触らない）。更新で増えたキーや説明を、利用者が変えた値を残したまま古い ini に入れるためのもの。
 //!
-//! 更新で増えたキーや説明を、利用者が変えた値を残したまま古い ini に入れるためのもの。
-//! - 今の ini で行として書かれているキー（節とキーは `ini` と同じ扱い。大文字・小文字を区別しない）は、雛形の同じキーの行に
-//!   今の値で置く。雛形で注になっている行（`; key = v`）は、注を外してから置く。
-//! - 雛形に無いキーは、その節の最後のキーの行の後ろへ残す（節も無ければ末尾に節ごと）。値は消さない。
-//! - 雛形の `; [window]` のように見出しごと注の節は、今の ini にその節のキーがあれば見出しの注を外す。
+//! - 今の ini で行として書かれているキー（節とキーは `ini` と同じ扱い。大文字・小文字を区別しない）は、雛形の同じキーの行に今の値で入れる。雛形で注になっている行（`; key = v`）は、注を外してから入れる。
+//! - 雛形に無いキーは、その節の最後のキーの行の後ろへ残す（節も無ければ末尾に節ごと）。値は消さない。雛形の `; [window]` のように見出しごと注の節は、今の ini にその節のキーがあれば見出しの注を外す。
 //! - 注は雛形のものになる（今の ini にあった注は残らない）。改行は雛形に合わせる。値の中身は見ない。
-//! - 値が、知っている古い配る ini（`OLD_TEMPLATES`）の同じ節・キーの値と同じなら、利用者が変えていない既定値とみなして移さず、
-//!   新しい雛形の値にする（新しい版で既定値を変えても、既存の利用者が古い既定値のままにならないように）。値は `ini` の読み手が返す形
-//!   （前後の空白と行末の注を除いたもの。大文字・小文字は区別する）で比べる。古い雛形で注だった行は比べない。
-//! - 読めない行（`ini::parse_lenient` が捨てる行）があるときは、捨てずに済ませられないので `Upgraded::is_safe` を偽にする。
-//!   作った結果を読み直して値が合わないキーがあるときも同じ。
+//! - 値が、知っている古い配る ini（`OLD_TEMPLATES`）の同じ節・キーの値と同じなら、利用者が変えていない既定値とみなして移さず新しい雛形の値にする（新しいバージョンで既定値を変えても、既存の利用者が古い既定値のままにならないように）。
+//!   比べるのは `ini` の読み手が返す形（前後の空白と行末の注を除く。大文字・小文字は区別する）で、古い雛形で注だった行は比べない。
+//! - 読めない行（`ini::parse_lenient` が捨てる行）があるときと、作った結果を読み直して値が合わないキーがあるときは、`Upgraded::is_safe` を偽にする。
 
 #![forbid(unsafe_code)]
 
@@ -18,12 +13,48 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::ini::{self, Ini, strip_comment};
 
-/// これまでに配った版の配る ini（値の比べ先）。配る版を上げるときは、直前に配った版の `scripts/dist/HiganRTool.ini` を
+/// これまでに配ったバージョンの配る ini（値の比べ先）。配る zip を作るときに、そのバージョンの `scripts/dist/HiganRTool.ini` を
 /// `ini_templates/` へ足して、ここへ 1 行足す（足し忘れは `every_old_template_file_is_listed` が落とす）。
-pub const OLD_TEMPLATES: [&str; 2] = [
+pub const OLD_TEMPLATES: [&str; 4] = [
     include_str!("ini_templates/v1.0.0.ini"),
     include_str!("ini_templates/v1.1.0.ini"),
+    include_str!("ini_templates/v1.1.1.ini"),
+    include_str!("ini_templates/v1.2.0.ini"),
 ];
+
+/// 名前を替えたキー: (節, 古いキー, 新しいキー, 値の読み替え)。表に無い値はそのまま移す（読めない値なら dll がその行を使わない）。
+/// 今の ini に新しいキーもあれば、新しいキーの値を使い、古いキーは移さない。
+pub type Renamed = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+pub const RENAMED: [Renamed; 1] = [(
+    "pacing",
+    "auto_window",
+    "wait",
+    &[("b-hybrid", "passive"), ("b-spin", "active")],
+)];
+
+/// `entry` の古いキーを新しいキーと値に読み替える。名前を替えたキーでなければそのまま。
+fn renamed(entry: (String, String, String)) -> (String, String, String) {
+    let (section, key, value) = entry;
+    match RENAMED
+        .iter()
+        .find(|(s, old, _, _)| *s == section && *old == key)
+    {
+        Some((_, _, new, values)) => {
+            let v = values
+                .iter()
+                .find(|(o, _)| *o == value)
+                .map_or(value.clone(), |(_, n)| n.to_string());
+            (section, new.to_string(), v)
+        }
+        None => (section, key, value),
+    }
+}
 
 /// 節とキー（どちらも小文字）。値は持たない（名前・ゲームのパスを文に出さないため）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,7 +250,7 @@ pub fn upgrade(template: &str, user: &str) -> Upgraded {
     upgrade_over(template, user, &[])
 }
 
-/// `upgrade` に、これまでに配った版の配る ini（`OLD_TEMPLATES`）との比べを足したもの。更新の本番はこちら。
+/// `upgrade` に、これまでに配ったバージョンの配る ini（`OLD_TEMPLATES`）との比べを足したもの。更新の本番はこちら。
 pub fn upgrade_known(template: &str, user: &str) -> Upgraded {
     upgrade_over(template, user, &OLD_TEMPLATES)
 }
@@ -235,8 +266,9 @@ pub fn upgrade_over(template: &str, user: &str, old_templates: &[&str]) -> Upgra
 
     let mut lines = classify(template);
     let mut defaulted = Vec::new();
-    let mut entries = Vec::new();
-    for entry in entries_of(&lenient.ini) {
+    let mut entries: Vec<(String, String, String)> = Vec::new();
+    let all = entries_of(&lenient.ini);
+    for entry in all.iter().cloned() {
         let same_in_new = find_line(&lines, &entry.0, &entry.1, false)
             .is_some_and(|i| line_value(&lines[i].text) == entry.2);
         if old_defaults.contains(&entry) && !same_in_new {
@@ -244,9 +276,14 @@ pub fn upgrade_over(template: &str, user: &str, old_templates: &[&str]) -> Upgra
                 section: entry.0,
                 key: entry.1,
             });
-        } else {
-            entries.push(entry);
+            continue;
         }
+        let is_old = entry.1 != renamed(entry.clone()).1;
+        let entry = renamed(entry);
+        if is_old && all.iter().any(|e| e.0 == entry.0 && e.1 == entry.1) {
+            continue;
+        }
+        entries.push(entry);
     }
 
     // 注の見出しの節に今の ini のキーがあれば、見出しの注を外す。
@@ -377,7 +414,6 @@ lang = auto
         }
     }
 
-    // 壊れたら落ちる: 利用者が変えた値が新しい ini に残らない（更新のたびに設定が消える）。
     #[test]
     fn the_users_values_replace_the_template_values_in_place() {
         let user = "[netplay]\nenable = 0\ndelay = 4\n[ui]\nlang = en\n";
@@ -409,7 +445,6 @@ lang = auto
         assert!(r.carried.is_empty());
     }
 
-    // 壊れたら落ちる: 雛形が注にしている行に値を書いていた利用者の値が、注のまま（効かない）になる。
     #[test]
     fn a_commented_template_line_becomes_a_real_line_with_the_users_value() {
         let r = upgrade(T, "[netplay]\nroom = my-room\nmode = delay\n");
@@ -423,7 +458,6 @@ lang = auto
         assert_eq!(r.kept, vec![who("netplay", "room"), who("netplay", "mode")]);
     }
 
-    // 壊れたら落ちる: 雛形に無い（古い・利用者が足した）キーが消える、または別の節に入る。
     #[test]
     fn keys_the_template_does_not_have_are_kept_at_the_end_of_their_section() {
         let user =
@@ -455,7 +489,6 @@ lang = auto
         );
     }
 
-    // 壊れたら落ちる: 見出しごと注の節に書いていた値（ウィンドウの大きさ）が効かないまま残る。
     #[test]
     fn a_section_commented_out_in_the_template_is_opened_when_the_user_has_it() {
         let r = upgrade(T, "[window]\nwidth = 1500\n");
@@ -478,7 +511,7 @@ lang = auto
         assert!(r.text.contains("\n; [window]\n"), "{}", r.text);
         assert!(!ini::parse(&r.text).unwrap().has_section("window"));
 
-        // 雛形に無いキーだけでも節を開き、その節の最後の行の後ろへ置く。
+        // 雛形に無いキーだけでも節を開き、その節の最後の行の後ろへ足す。
         let r = upgrade(T, "[window]\nfoo = 1\n");
         assert!(r.is_safe(), "{r:?}");
         assert!(
@@ -495,7 +528,6 @@ lang = auto
         assert_eq!(got.get("window", "extra"), None);
     }
 
-    // 壊れたら落ちる: 雛形と今の ini が同じなのに書き換わる（更新のたびに ini が揺れる）。
     #[test]
     fn upgrading_a_file_made_from_the_template_gives_the_template_back() {
         let r = upgrade(T, T);
@@ -506,7 +538,6 @@ lang = auto
         assert_eq!(r.text, T.replace('\n', "\r\n"));
     }
 
-    // 壊れたら落ちる: ini が空でも新しい形が出ない。
     #[test]
     fn an_empty_or_comment_only_ini_becomes_the_template() {
         for user in ["", "\n\n", "; 注だけ\n; もう 1 行\n", "\u{FEFF}"] {
@@ -516,7 +547,7 @@ lang = auto
         }
     }
 
-    // 壊れたら落ちる: 改行が雛形とそろわない（古いメモ帳で 1 行に潰れる）。
+    // 改行が雛形とそろわないと、古いメモ帳で 1 行に潰れる。
     #[test]
     fn line_endings_follow_the_template() {
         let crlf = T.replace('\n', "\r\n");
@@ -532,7 +563,6 @@ lang = auto
         assert!(!r.text.contains('\r'), "{:?}", r.text);
     }
 
-    // 壊れたら落ちる: 名前・節の大文字小文字の違いで値が移らない。
     #[test]
     fn names_are_matched_without_case_and_values_keep_theirs() {
         let r = upgrade(T, "[NetPlay]\nENABLE = 0\nName = Aa Bb\n[UI]\nLang = En\n");
@@ -544,7 +574,6 @@ lang = auto
         assert!(r.text.contains("\nenable = 0\n"), "{}", r.text);
     }
 
-    // 壊れたら落ちる: 値の中身（空・`;`・`=`・全角）が、移すときに変わる。
     #[test]
     fn odd_values_survive() {
         let user = "[netplay]\nenable =\ndelay = a;b=c\nupnp = 花映塚 ; 注\n[mine]\ng = C:\\x y\\th09.exe\n";
@@ -559,7 +588,6 @@ lang = auto
         assert!(!r.text.contains("花映塚 ;"), "{}", r.text);
     }
 
-    // 壊れたら落ちる: 雛形の行の後ろの注が、値を変えると消える。
     #[test]
     fn a_comment_after_a_template_value_stays() {
         let tpl = "[a]\nk = 1 ; 既定\nj=2\n; z = 3 ; 説明\n";
@@ -568,7 +596,6 @@ lang = auto
         assert!(r.is_safe());
     }
 
-    // 壊れたら落ちる: 読めない行のある ini を黙って書き換えて、その行を失う。
     #[test]
     fn an_ini_with_unreadable_lines_is_not_safe_to_replace() {
         let r = upgrade(T, "[netplay]\nenable = 0\nthis line has no equals\n");
@@ -584,7 +611,6 @@ lang = auto
         assert_eq!(ini::parse(&r.text).unwrap().get("ui", "lang"), Some("ja"));
     }
 
-    // 壊れたら落ちる: 移した結果を読み直す確かめが無く、値が合わなくても安全と言う。
     #[test]
     fn a_result_that_does_not_read_back_is_not_safe() {
         // 雛形の読めない見出しの下にキーがあると、書いても読まれない。
@@ -601,7 +627,6 @@ lang = auto
         upgrade_over(NEW, user, &[OLD])
     }
 
-    // 壊れたら落ちる: 古い配る ini の既定値のままの値が移り、新しい版で既定値を変えても既存の利用者が古い既定値のままになる。
     #[test]
     fn a_value_equal_to_the_old_template_takes_the_new_templates_value() {
         let r = over("[a]\nk = 1\nj = 2\nm = x\nq = 7\n[b]\nz = 5\n");
@@ -619,7 +644,6 @@ lang = auto
         assert_eq!(r.carried, vec![who("a", "q")]);
     }
 
-    // 壊れたら落ちる: 利用者が変えた値まで新しい既定値に戻る。古い雛形に無いキーの値を捨てる。
     #[test]
     fn a_changed_value_or_a_key_the_old_template_lacks_is_kept() {
         let r = over("[a]\nk = 3\nm = z\nnew = 1\n[b]\nz = 50\n");
@@ -636,7 +660,6 @@ lang = auto
         assert!(r.defaulted.is_empty(), "{r:?}");
     }
 
-    // 壊れたら落ちる: 古い雛形で注だった行（c = 5）まで既定値として比べ、利用者が外して書いた値を消す。
     #[test]
     fn a_commented_line_of_the_old_template_is_not_a_default() {
         let r = over("[a]\nc = 5\n");
@@ -644,7 +667,6 @@ lang = auto
         assert!(r.defaulted.is_empty(), "{r:?}");
     }
 
-    // 壊れたら落ちる: 空白や注の違い・キーと節の大文字小文字の違いで、変えていない既定値が既定値と見なされない。
     // 値の大文字小文字は読み手が保つので区別する（変えた値を消さない）。
     #[test]
     fn values_are_compared_in_the_form_the_ini_reader_returns() {
@@ -659,7 +681,6 @@ lang = auto
         assert_eq!(r.defaulted, vec![who("a", "u")], "{r:?}");
     }
 
-    // 壊れたら落ちる: 既定値だけだった節の見出しが、値を移さないのに注から外れて空の節が残る。
     #[test]
     fn a_commented_section_stays_commented_when_all_its_values_are_old_defaults() {
         let r = over("[w]\nwidth = 1\n");
@@ -670,7 +691,6 @@ lang = auto
         assert!(r.text.contains("\n[w]\nwidth = 3\n"), "{}", r.text);
     }
 
-    // 壊れたら落ちる: 古い雛形を渡さない呼び出し（upgrade）まで既定値を落とす／結果を読み直す確かめから既定値が漏れる。
     #[test]
     fn upgrade_without_old_templates_moves_every_value() {
         let r = upgrade(NEW, "[a]\nk = 1\n");
@@ -680,7 +700,6 @@ lang = auto
         assert!(r.is_safe() && r.lost.is_empty(), "{r:?}");
     }
 
-    // 壊れたら落ちる: これまでに配った配る ini の値のままの ini が、新しい配る ini の形・値にならない。
     #[test]
     fn every_shipped_ini_upgrades_to_the_current_shipped_ini() {
         let v100 = OLD_TEMPLATES[0];
@@ -692,7 +711,7 @@ lang = auto
             assert!(r.carried.is_empty(), "{r:?}");
             assert!(!r.kept.is_empty(), "{r:?}");
         }
-        // 新しい版が既定値を変えたとして、v1.0.0 のままの値が新しい値になる。
+        // 新しいバージョンが既定値を変えたとして、v1.0.0 のままの値が新しい値になる。
         let changed = dist.replace("\r\nupnp = on\r\n", "\r\nupnp = off\r\n");
         assert_ne!(changed, dist);
         let r = upgrade_known(&changed, v100);
@@ -707,7 +726,42 @@ lang = auto
         assert!(r.defaulted.is_empty(), "{r:?}");
     }
 
-    // 壊れたら落ちる: ini_templates に足したファイルを一覧に入れ忘れる（次の更新で古い既定値が固定される）。
+    // 新しいキーも書いてあるときは、古いキーの値で上書きしない。読み替えた行は雛形の `wait` の行に入る。
+    #[test]
+    fn auto_window_is_carried_over_as_wait() {
+        let dist = crate::ini_store::dist_ini_text();
+        let v111 = OLD_TEMPLATES[2];
+        assert!(
+            v111.contains("\n; auto_window = b-hybrid\n"),
+            "v1.1.1 の配る ini"
+        );
+        for (old, new) in [
+            ("b-hybrid", "passive"),
+            ("b-spin", "active"),
+            ("bogus", "bogus"),
+        ] {
+            let user = v111.replace(
+                "\n; auto_window = b-hybrid\n",
+                &format!("\nauto_window = {old}\n"),
+            );
+            let r = upgrade_known(&dist, &user);
+            assert!(r.is_safe(), "{r:?}");
+            let got = ini::parse(&r.text).unwrap();
+            assert_eq!(got.get("pacing", "wait"), Some(new), "{old}");
+            assert_eq!(got.get("pacing", "auto_window"), None, "{old}");
+            assert!(r.kept.contains(&who("pacing", "wait")), "{r:?}");
+            assert!(r.carried.is_empty(), "{r:?}");
+        }
+        let both = "[pacing]\nauto_window = b-spin\nwait = passive\n";
+        let r = upgrade_known(&dist, both);
+        let got = ini::parse(&r.text).unwrap();
+        assert_eq!(got.get("pacing", "wait"), Some("passive"));
+        assert_eq!(got.get("pacing", "auto_window"), None);
+        let both = "[pacing]\nwait = passive\nauto_window = b-spin\n";
+        let got = ini::parse(&upgrade_known(&dist, both).text).unwrap();
+        assert_eq!(got.get("pacing", "wait"), Some("passive"), "順番に依らない");
+    }
+
     #[test]
     fn every_old_template_file_is_listed() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ini_templates");
@@ -736,7 +790,7 @@ lang = auto
             r.text
         );
         assert_eq!(r.carried, vec![who("", "top")]);
-        // 雛形の最初が見出しなら、見出しの前に置いて空行を挟む。
+        // 雛形の最初が見出しなら、見出しの前に入れて空行を挟む。
         let r = upgrade("[a]\nk = 1\n", "top = 1\n");
         assert_eq!(r.text, "top = 1\n\n[a]\nk = 1\n");
         assert!(r.is_safe());
@@ -791,7 +845,6 @@ lang = auto
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // 壊れたら落ちる: 配る ini 自体を土台にしても値が移らない・揺れる（雛形の書き方が移し方の想定から外れた）。
     #[test]
     fn the_shipped_template_is_a_fixed_point_and_takes_a_users_values() {
         let shipped = crate::ini_store::dist_ini_text();

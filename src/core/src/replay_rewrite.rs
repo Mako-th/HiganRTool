@@ -1,4 +1,4 @@
-//! リプレイ（`.rpy`）の見出しの 1P / 2P のチャージ型を書き換えた写しを作る（再生のずれを直す）。
+//! リプレイ（`.rpy`）の見出しの 1P / 2P のチャージ型を書き換えたコピーを作る（再生のずれを直す）。
 //!
 //! 見出しのオプションの塊（`+0xDC` から 0xCC バイト。`th09.cfg` と同じ並び）の `+0xB4` / `+0xB5` が 1P / 2P のチャージ型で、
 //! 展開した本体の座標では `+0x190` / `+0x191`。再生はこの塊から試合の設定を作る。
@@ -35,7 +35,7 @@ pub fn charge(image: &[u8]) -> Option<(u8, u8)> {
     Some((*image.get(CHARGE_OFFSET)?, *image.get(CHARGE_OFFSET + 1)?))
 }
 
-/// `file` のチャージ型を (`p1`, `p2`) に書き換えた写し。読めないリプレイは `decode_image` の理由で断る。
+/// `file` のチャージ型を (`p1`, `p2`) に書き換えたコピー。読めないリプレイは `decode_image` の理由で断る。
 pub fn with_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, DecodeError> {
     let mut image = decode_image(file)?;
     image[CHARGE_OFFSET] = p1;
@@ -73,7 +73,7 @@ fn reencode(file: &[u8], image: &[u8]) -> Vec<u8> {
 pub struct FixPlan {
     /// 保存した人の側。観戦者のリプレイは `None`。
     pub side: Option<Side>,
-    /// (1P, 2P) の名前（印から。対戦者のリプレイは自分と相手を `side` で並べる）。
+    /// (1P, 2P) の名前（印から。対戦した側のリプレイは自分と相手を `side` で並べる）。
     pub names: (String, String),
     /// 見出しの今の (1P, 2P) のチャージ型。
     pub current: (u8, u8),
@@ -83,6 +83,8 @@ pub struct FixPlan {
 pub enum PlanError {
     /// 印 `HGRT` が無い（このツールが保存したものでない）か、読めない。
     NoMark,
+    /// ゲームのメニューから保存したリプレイの印（ネット対戦の記録が無く、チャージ型を直す対象ではない）。
+    MenuMark,
     /// 印に `charge` がある（見出しを生きた試合の値に直して保存したバージョンか、直し済み）。直すものは無い。
     Recorded([u8; 2]),
     /// 印のビルド番号が `LAST_UNFIXED_BUILD` より新しい（見出しを直して保存するバージョン）。
@@ -91,13 +93,14 @@ pub enum PlanError {
 }
 
 /// 見出しのチャージ型を直さずに保存した最後の配るビルド（v1.0.0）。これより新しい配るビルドのリプレイは直さない。
-/// 開発版のビルド番号は 0 なので対象に残る。
+/// 開発バージョンのビルド番号は 0 なので対象に残る。
 pub const LAST_UNFIXED_BUILD: u32 = 411_272;
 
 /// 印と見出しから、名前・側・今の値を出す。
 pub fn plan(file: &[u8]) -> Result<FixPlan, PlanError> {
     let mark = match read_mark(file) {
         Ok(MarkRead::Found(m)) => m,
+        Ok(MarkRead::Menu(_)) => return Err(PlanError::MenuMark),
         _ => return Err(PlanError::NoMark),
     };
     if let Some(c) = mark.detail.as_ref().and_then(|d| d.charge) {
@@ -142,7 +145,7 @@ pub enum MarkEditError {
     Mark(MarkError),
 }
 
-/// 印の `charge` を (`p1`, `p2`) にした写し。印の他の項目と、他の USER チャンクはそのまま。見出しは触らない。
+/// 印の `charge` を (`p1`, `p2`) にしたコピー。印の他の項目と、他の USER チャンクはそのまま。見出しは触らない。
 pub fn with_mark_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, MarkEditError> {
     let layout = parse(file).map_err(MarkEditError::Replay)?;
     for chunk in layout.chunks.iter().filter(|c| c.is_mark()) {
@@ -151,7 +154,8 @@ pub fn with_mark_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, MarkEdit
         };
         let mut mark = match parse_mark_body(body) {
             Ok(BodyRead::Mark(m)) => m,
-            Ok(BodyRead::UnknownVersion) => continue,
+            // メニューの保存の印は、直す対象のネット対戦の印ではない。
+            Ok(BodyRead::UnknownVersion | BodyRead::Menu(_)) => continue,
             Err(_) => return Err(MarkEditError::NoMark),
         };
         mark.detail.get_or_insert_with(Default::default).charge = Some([p1, p2]);
@@ -173,7 +177,7 @@ pub enum FixError {
     Mark(MarkEditError),
 }
 
-/// 見出しのチャージ型を (`p1`, `p2`) にし、印にも `charge=<p1>.<p2>`（直し済みの印）を入れた写し。
+/// 見出しのチャージ型を (`p1`, `p2`) にし、印にも `charge=<p1>.<p2>`（直し済みの印）を入れたコピー。
 /// 印に `charge` があるリプレイ・印が読めないリプレイ・値が今と同じリプレイは断る。
 pub fn fixed_copy(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, FixError> {
     let plan = plan(file).map_err(FixError::Plan)?;
@@ -432,7 +436,7 @@ mod tests {
         };
         assert_eq!(m.detail.unwrap().charge, Some([1, 0]));
         assert_eq!(m.peer, "Peer");
-        // 直した写しは「直し済み」なので、もう一度直そうとしても断る（反転が戻る事故を防ぐ）。
+        // 直したコピーは「直し済み」なので、もう一度直そうとしても断る（反転が戻る事故を防ぐ）。
         assert_eq!(
             fixed_copy(&g, 0, 0),
             Err(FixError::Plan(PlanError::Recorded([1, 0])))
@@ -464,7 +468,7 @@ mod tests {
             charge: Some([1, 0]),
             ..Default::default()
         };
-        // 新しい版のゲストのリプレイ: 見出しは直してあり (1, 0)。1P の枠を自分の値と読むと 1 になり、壊す。
+        // 新しいバージョンのゲストのリプレイ: 見出しは直してあり (1, 0)。1P の枠を自分の値と読むと 1 になり、壊す。
         let f = marked_with(1, 0, Side::P2, MarkRole::Play, Some(d));
         assert_eq!(plan(&f), Err(PlanError::Recorded([1, 0])));
         let without = marked_with(1, 0, Side::P2, MarkRole::Play, Some(Default::default()));
@@ -494,5 +498,28 @@ mod tests {
     fn a_replay_without_the_mark_is_not_planned() {
         assert_eq!(plan(&sample()), Err(PlanError::NoMark));
         assert!(matches!(read_mark(&sample()), Ok(MarkRead::Absent)));
+    }
+
+    #[test]
+    fn a_menu_saved_replay_is_not_planned_nor_edited() {
+        let base = sample();
+        let mut f = base.clone();
+        f.extend_from_slice(
+            &crate::replay::chunk_to_append_menu(
+                &base,
+                &crate::replay::MenuMark {
+                    ver: "1.1.1".into(),
+                    build: 1,
+                },
+            )
+            .unwrap(),
+        );
+        assert!(matches!(read_mark(&f), Ok(MarkRead::Menu(_))));
+        assert_eq!(plan(&f), Err(PlanError::MenuMark));
+        assert_eq!(with_mark_charge(&f, 1, 0), Err(MarkEditError::NoMark));
+        assert_eq!(
+            fixed_copy(&f, 1, 0),
+            Err(FixError::Plan(PlanError::MenuMark))
+        );
     }
 }

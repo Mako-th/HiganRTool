@@ -1,7 +1,7 @@
 //! 花映塚の th09.exe の場所を、初回だけ人に選ばせて覚える（`--game` をリンク先に足させる方式は不慣れな人には難しいため）。
 //!
-//! 判断だけをここに置き、ウィンドウ・ファイル・画面は `Host` の向こうへ出す。覚える場所は ini の `[loader] game`（th09.exe のフルパス）。
-//! 以前の版の `game_path.txt` は起動のとき ini へ移して消す。`--game` を付けた起動は読み書きしない。
+//! 判断だけをここに書き、ウィンドウ・ファイル・画面は `Host` の向こうへ出す。覚える場所は ini の `[loader] game`（th09.exe のフルパス）。
+//! 以前のバージョンの `game_path.txt` は起動のとき ini へ移して消す。`--game` を付けた起動は読み書きしない。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,9 @@ use higanr_core::pe::{self, Ident, IdentField, TH09_V150A};
 
 use crate::ui_lang::by_lang;
 
-/// 以前の版が th09.exe の場所を覚えていたファイル（HiganRTool.exe と同じフォルダ）。今は読まず、起動のとき ini へ移して消す。
+/// 以前のバージョンが th09.exe の場所を覚えていたファイル（HiganRTool.exe と同じフォルダ）。今は読まず、起動のとき ini へ移して消す。
 pub const LEGACY_FILE: &str = "game_path.txt";
-/// 覚える場所の ini の節とキー。
+/// 覚える場所の ini のカテゴリとキー。
 pub const INI_SECTION: &str = "loader";
 pub const INI_KEY: &str = "game";
 
@@ -105,17 +105,17 @@ pub fn saved_text(exe: &Path) -> Option<String> {
     exe.to_str().map(str::to_string)
 }
 
-/// 以前の版のファイル（`LEGACY_FILE`）の中身を、ini に書く値にする（引き継ぎ用）。
+/// 以前のバージョンのファイル（`LEGACY_FILE`）の中身を、ini に書く値にする（引き継ぎ用）。
 pub fn parse_legacy(text: &str) -> Option<String> {
     parse_saved(text).and_then(|p| saved_text(&p))
 }
 
-/// 食い違った欄の名前は原因の切り分けに使うのでそのまま出す。
+/// 食い違った項目の名前は原因の切り分けに使うのでそのまま出す。
 pub fn ident_mismatch_text(fields: &[IdentField], lang: Lang) -> String {
     by_lang!(
         lang,
-        ja: "選んだexeが東方花映塚ver.1.50aのth09.exeと一致しません。花映塚のth09.exeを選んでいるか（custom.exeやvpatch.exeではないか）、ver.1.50aの修正パッチを当ててあるかを確かめてください（食い違った欄: {fields:?}）",
-        en: "The chosen exe does not match th09.exe of Touhou 9 ver.1.50a. Check that you chose th09.exe of Touhou 9 (not custom.exe or vpatch.exe) and that the ver.1.50a patch is applied (mismatched fields: {fields:?})"
+        ja: "選んだexeが東方花映塚ver.1.50aのth09.exeと一致しません。花映塚のth09.exeを選んでいるか（custom.exeやvpatch.exeではないか）、ver.1.50aの修正パッチを当ててあるかをチェックしてください（項目: {fields:?}）",
+        en: "The chosen exe does not match th09.exe of Touhou 9 ver.1.50a. Check that you chose th09.exe of Touhou 9 (not custom.exe or vpatch.exe) and that the ver.1.50a patch is applied (mismatched items: {fields:?})"
     )
 }
 
@@ -187,7 +187,7 @@ fn ident_details_against(path: &Path, bytes: &[u8], want: &Ident<'_>, lang: Lang
     lines
 }
 
-/// ドライブ名の後に `\` や `/` が無い形（`D:原作\th09.exe`）か。起こした場所で指す先が変わる。
+/// ドライブ名の後に `\` や `/` が無い形（`D:原作\th09.exe`）か。起動した場所で指す先が変わる。
 pub fn is_drive_relative(p: &Path) -> bool {
     let s = p.to_string_lossy();
     let b = s.as_bytes();
@@ -477,8 +477,7 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: ウィンドウを出す覚え（無い・壊れた exe・別のバージョン）をそのまま使えると見なす、または使える覚えを見落とす。
-    /// ウィンドウを出す回に先に決めたゲームのフォルダと、実際に選ばれるフォルダが食い違うと、ログを置く場所の判断が狂う。
+    /// 事前に決めたゲームのフォルダと、実際に選ばれるフォルダが食い違うと、ログの場所の判断が狂う。
     #[test]
     fn a_remembered_exe_is_known_up_front_only_when_resolve_would_use_it_as_is() {
         let (mut f, exe) = with_exe("X:\\game", good_exe());

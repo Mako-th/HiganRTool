@@ -1,18 +1,12 @@
 //! Ctrl+上段の数字（0〜9）でディレイを替える入口の「押した瞬間」の取り方（pure。unsafe 無し）。
-//! 0〜8 がその値、9 が auto（`higanr_core::delay_pick::AUTO`）。Ctrl+Tab は同期方式の切替（キャラセレクトの間）。
-//! Ctrl+C は観戦コードのコピーの頼み（つながっている間。`net_ui::NetUi::copy_tick` が同じ取り方で読む）。
-//! キーボードの読み（`GetAsyncKeyState`）は `digit_keys_win.rs`、「読んでよい間」の判断は `net_game::NetGame::digit_keys`（ゲートの式は `may_read`）、
-//! 押下の行き先は `NetPlay::digit_tick`。
+//! 0〜8 がその値、9 が auto（`higanr_core::delay_pick::AUTO`）。Ctrl+Tab は同期方式の切替（キャラセレクトの間）、Ctrl+C は観戦コードのコピーの頼み（接続している間）。
+//! キーボードの読み（`GetAsyncKeyState`）は `digit_keys_win.rs`、「読んでよい間」の判断は `net_game::NetGame::digit_keys`（`may_read`）、押下の行き先は `NetPlay::digit_tick`。
 //!
-//! 数字と Tab を使うのは、ゲームの入力の関数 `0x0042B850` が `GetKeyboardState` の表から読むキーに上段の数字 0〜9 と Tab が無いため
-//! （表の添字 `-0xd4`〜`-0xcb` と `-0xfb` の参照が 0 件）。テンキーは方向と衝突するので読まない。
-//! ゲームは Ctrl（VK_CONTROL。`0x0042BAAB`）を入力ワードの `0x0100` として読む（キャラ・マップ選択の「ランダム」）ので、
-//! 選択の画面で Ctrl+数字・Ctrl+Tab を押すと「ランダム」も回る（`0x0100` は落とさず、そのままゲームと相手へ届く）。
+//! 数字と Tab は、ゲームの入力の関数 `0x0042B850` が読む `GetKeyboardState` の表に上段の数字 0〜9 と Tab が無い（添字 `-0xd4`〜`-0xcb` と `-0xfb` の参照が 0 件）ので衝突しない。テンキーは方向と衝突するので読まない。
+//! ゲームは Ctrl（VK_CONTROL。`0x0042BAAB`）を入力ワードの `0x0100`（キャラ・マップ選択の「ランダム」）として読むので、選択の画面で Ctrl+数字・Ctrl+Tab を押すと「ランダム」も回る（`0x0100` は落とさず、ゲームと相手へそのまま届く）。
 //!
-//! 1 tick に 1 回、押下の集合（bit `d` = 数字 `d`・Tab・C・Ctrl・Alt/Win）を渡され、前の tick に離れていて今押されている数字・Tab・C だけを取る
-//! （押し続けは 1 回）。取るのは、その押した瞬間に Ctrl が押されていて Alt・Win が押されていないときだけ: Ctrl を後から押しても押したままの
-//! 数字は取らず、Alt+Tab・Win+Tab でウィンドウを切り替えて戻った後に押しっぱなしの Tab も取らない。読んでよくない tick（`None`）が挟まると、
-//! 次に読めた tick で押されたままのキーを押下と取らない（前面に戻ったとき・文字の入力を閉じたときの誤爆を防ぐ）。
+//! 1 tick に 1 回、押下の集合（bit `d` = 数字 `d`・Tab・C・Ctrl・Alt/Win）を渡され、前の tick に離れていて今押されている数字・Tab・C だけを取る（押し続けは 1 回）。
+//! 取るのは押した瞬間に Ctrl が押されていて Alt・Win が押されていないときだけ。読んでよくない tick（`None`）が挟まると、次に読めた tick で押されたままのキーを押下と取らない。
 #![forbid(unsafe_code)]
 
 use higanr_core::delay_pick::{AUTO, bounds};
@@ -28,8 +22,7 @@ pub const MOD_BIT: u16 = 1 << 11;
 pub const CTRL_BIT: u16 = 1 << 12;
 
 /// 読んだ集合の bit13: C（Ctrl+C で観戦コードをコピーする）。ゲームの入力の関数 `0x0042B850` は C を読まない
-/// （Z・X・Shift・Esc・矢印・Ctrl・Q・S・P・Home・Enter・D・R だけ）ので、Ctrl の
-/// 扱いは Ctrl+数字と同じで足りる。
+/// （Z・X・Shift・Esc・矢印・Ctrl・Q・S・P・Home・Enter・D・R だけ）ので、Ctrl の扱いは Ctrl+数字と同じで足りる。
 pub const C_BIT: u16 = 1 << 13;
 
 /// 押した瞬間を取る対象のキー（数字 0〜9・Tab・C）の bit。

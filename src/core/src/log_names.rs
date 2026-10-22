@@ -139,7 +139,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 区切りでない行（前置きつき・形の崩れ）を区切りと見る、または区切りの PID を読み違える。
     #[test]
     fn header_pid_reads_only_a_whole_header_line() {
         assert_eq!(header_pid(&run_header(4242, "t", STEM)), Some(4242));

@@ -1,11 +1,8 @@
 //! フックを書く Win32 の層（unsafe はここと `stub.rs`・`win.rs` に閉じ込める。1 つずつ `// SAFETY:`）。
 //!
-//! `hook::HookEnv` の本物: 自分のプロセスのスレッドの一覧（ToolHelp）、停止と再開、EIP の読み取り（`GetThreadContext`）、
-//! コードの読み直し（ヒープを使わない）、保護の一時的な変更と rel32 の書き込みと命令キャッシュの流し、時計。手順と判定
-//! （どの順に呼び、何があれば書かないか）は `hook.rs` にだけ書く。
-//!
-//! **書く先は自分のプロセスのコードだけ**（他のプロセスのメモリに書く API は使わない）。書くのは `hook.rs` が期待バイト列の
-//! 照合を通した 4 バイトだけ。ゲームのファイル・設定には触らない。
+//! `hook::HookEnv` の本物: 自分のプロセスのスレッドの一覧（ToolHelp）、停止と再開、EIP の読み取り（`GetThreadContext`）、コードの読み直し（ヒープを使わない）、保護の一時的な変更と rel32 の書き込みと命令キャッシュの流し、時計。
+//! 手順と判定（どの順に呼び、何があれば書かないか）は `hook.rs` にだけ書く。
+//! **書く先は自分のプロセスのコードだけ**（他のプロセスのメモリに書く API は使わない）。書くのは `hook.rs` が期待バイト列の照合を通した 4 バイトだけ。ゲームのファイル・設定には触らない。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!("hook_win.rs は 32 ビット（i686）専用（EIP・32 ビットのアドレスを前提にしている）");
@@ -132,12 +129,12 @@ impl HookEnv for RealHook {
     }
 
     fn close(&mut self, t: ThreadRef) {
-        // SAFETY: `open_other_threads` が開いたハンドルを 1 回だけ閉じる。
+        // SAFETY: `open_other_threads` が開いたハンドルを 1 回だけ閉じる（`hook::Stopped` が閉じた後に一覧を空にする）。
         unsafe { CloseHandle(handle(t)) };
     }
 
     fn eip(&mut self, t: ThreadRef) -> Option<u32> {
-        // 制御レジスタ（EIP・ESP など）だけを求める。x86 の CONTEXT は固定長でスタックに置く。
+        // 制御レジスタ（EIP・ESP など）だけを求める。x86 の CONTEXT は固定長でスタックに確保する。
         let mut ctx = CONTEXT {
             ContextFlags: CONTEXT_CONTROL_X86,
             ..Default::default()
@@ -157,8 +154,8 @@ impl HookEnv for RealHook {
         let len = bytes.len();
         let mut old: u32 = 0;
         // SAFETY: アドレスと長さと新しい保護を渡し、元の保護を `old` に受け取るだけ。アドレスが確保されていなければ失敗して 0 が返る
-        // （そのときは何も書かない）。範囲が頁の境をまたいでも全部の頁に効き、`old` は先頭の頁のもの（0x0043112E〜0x00431131 と
-        // 検査の領域は、どちらも 1 頁の中）。
+        // （そのときは何も書かない）。範囲がページの境をまたいでも全部のページに効き、`old` は先頭のページのもの（0x0043112E〜0x00431131 と
+        // 検査の領域は、どちらも 1 ページの中）。
         let ok =
             unsafe { VirtualProtect(at as *const c_void, len, PAGE_EXECUTE_READWRITE, &mut old) };
         if ok == 0 {
@@ -167,7 +164,8 @@ impl HookEnv for RealHook {
         for (i, &b) in bytes.iter().enumerate() {
             // SAFETY: 直前の VirtualProtect で `[addr, addr + len)` を書ける保護にした。呼び出し元（`hook::attempt_while_stopped`）は、
             // 自分以外のスレッドを全部止め、どの EIP もこの命令の 5 バイトに無いことと、止めたまま読み直した 5 バイトが期待どおり
-            // であることを確かめてから呼ぶ。書くのは call の rel32 の 4 バイトだけで、オペコードは変えない。
+            // であることを検証してから呼ぶ。書くのは call の rel32 の 4 バイトだけで、オペコードは変えない。
+            // DllMain から書く呼び出し元（`window_win`・`calib_guard_win`）は別の前提で、主スレッドがまだ走っていない間に書く。
             unsafe { core::ptr::write_volatile(at.add(i), b) };
         }
         let mut dummy: u32 = 0;
@@ -191,7 +189,7 @@ impl HookEnv for RealHook {
     }
 
     fn set_copy_table(&mut self, rows: &[CopyRow]) {
-        // 枠の側の確かめに通らなければ stub が件数 0 のまま置く。どちらになったかは計測の始まりで読み返してログに書く
+        // stub 側で表を検査し、通らなければ stub が件数 0 のままにする。どちらになったかは計測の始まりで読み返してログに書く
         // （`RecordEnv::copy_table`）。
         let _ = stub::set_copy_table(rows);
     }
@@ -229,7 +227,7 @@ impl HookEnv for RealHook {
 impl DetourEnv for RealHook {
     fn alloc_trampoline(&mut self, len: usize) -> Result<u32, u32> {
         // SAFETY: アドレスは OS に任せ（NULL）、長さぶんを予約 ＋ コミットして読み書きできる保護にする。失敗すれば NULL が返る。
-        // トランポリンはこの DLL が生きている間 解放しないので、ゲームのスレッドがいつ飛んできても頁はある。
+        // トランポリンはこの DLL が生きている間 解放しないので、ゲームのスレッドがいつ飛んできてもページはある。
         let p = unsafe {
             VirtualAlloc(
                 core::ptr::null(),
@@ -248,12 +246,12 @@ impl DetourEnv for RealHook {
     fn write_and_seal_trampoline(&mut self, addr: u32, bytes: &[u8]) -> Result<(), u32> {
         let at = addr as usize as *mut u8;
         for (i, &b) in bytes.iter().enumerate() {
-            // SAFETY: `addr` はいま `alloc_trampoline` が確保した読み書きできる頁の先頭で、`bytes` はその長さに収まる
+            // SAFETY: `addr` はいま `alloc_trampoline` が確保した読み書きできるページの先頭で、`bytes` はその長さに収まる
             // （確保した len は `盗んだ長さ + 5`）。
             unsafe { core::ptr::write_volatile(at.add(i), b) };
         }
         let mut old: u32 = 0;
-        // SAFETY: いま確保した頁を、盗んだ命令を実行できる保護（実行 ＋ 読み）にする。
+        // SAFETY: いま確保したページを、盗んだ命令を実行できる保護（実行 ＋ 読み）にする。
         let ok = unsafe {
             VirtualProtect(
                 at as *const c_void,
@@ -271,7 +269,7 @@ impl DetourEnv for RealHook {
     }
 
     fn free_trampoline(&mut self, addr: u32) {
-        // SAFETY: `alloc_trampoline` が確保した頁を 1 回だけ返す。この頁へ飛ぶ JMP はまだ書いていない。
+        // SAFETY: `alloc_trampoline` が確保したページを 1 回だけ返す。このページへ飛ぶ JMP はまだ書いていない。
         unsafe { VirtualFree(addr as usize as *mut c_void, 0, MEM_RELEASE) };
     }
 
@@ -286,7 +284,7 @@ impl DetourEnv for RealHook {
 
 #[cfg(test)]
 mod tests {
-    //! 本物の Win32 を、検査のプロセス自身に当てる（花映塚は使わない）。自分で確保した実行できる領域に `E8 rel32; C3` を置き、
+    //! 本物の Win32 を、検査のプロセス自身に当てる（花映塚は使わない）。自分で確保した実行できる領域に `E8 rel32; C3` を書き、
     //! 本物の入口と本物のスレッドの停止で差し替える。入口は esi（on_tick の this）を読むので、差し替えた後の領域は
     //! `stub::testkit::call_with_regs` で呼ぶ。
     use super::*;
@@ -314,7 +312,7 @@ mod tests {
         f as *const () as usize as u32
     }
 
-    /// 実行できる 1 頁。`at` に `E8 rel32(→ to); C3` を置き、保護を PAGE_EXECUTE_READ にする。
+    /// 実行できる 1 ページ。`at` に `E8 rel32(→ to); C3` を書き、保護を PAGE_EXECUTE_READ にする。
     struct Region {
         base: *mut c_void,
         at: u32,
@@ -322,7 +320,7 @@ mod tests {
 
     impl Region {
         fn with_call_to(to: u32) -> Self {
-            // SAFETY: 新しく 1 頁を確保する（アドレスは OS に任せる）。失敗は下で見る。
+            // SAFETY: 新しく 1 ページを確保する（アドレスは OS に任せる）。失敗は下で見る。
             let base = unsafe {
                 VirtualAlloc(
                     core::ptr::null(),
@@ -337,18 +335,18 @@ mod tests {
             code[..5].copy_from_slice(&patch::call_rel32(at, to));
             code[5] = 0xC3;
             for (i, &b) in code.iter().enumerate() {
-                // SAFETY: いま確保した読み書きのできる頁の中（0x40〜0x45）。
+                // SAFETY: いま確保した読み書きのできるページの中（0x40〜0x45）。
                 unsafe { core::ptr::write_volatile((at as usize + i) as *mut u8, b) };
             }
             let mut old = 0;
-            // SAFETY: いま確保した頁の保護を変えるだけ。
+            // SAFETY: いま確保したページの保護を変えるだけ。
             let ok = unsafe { VirtualProtect(base, 4096, PAGE_EXECUTE_READ, &mut old) };
             assert_ne!(ok, 0, "VirtualProtect");
             Region { base, at }
         }
 
         fn call(&self) {
-            // SAFETY: `at` は PAGE_EXECUTE_READ の頁に置いた `call rel32; ret` で、飛び先は引数も戻り値も無い `extern "C" fn()`。
+            // SAFETY: `at` は PAGE_EXECUTE_READ のページに書いた `call rel32; ret` で、飛び先は引数も戻り値も無い `extern "C" fn()`。
             // スタックは call / ret で釣り合う。入口へ差し替えた後の領域はここで呼ばない（入口は esi を on_tick の this として読むので、`call_with_regs` で呼ぶ）。
             let f: extern "C" fn() = unsafe { core::mem::transmute(self.at as usize) };
             f();
@@ -377,7 +375,7 @@ mod tests {
 
     impl Drop for Region {
         fn drop(&mut self) {
-            // SAFETY: `with_call_to` で確保した頁を 1 回だけ返す。この頁へ飛ぶ call は検査の中にしか無い。
+            // SAFETY: `with_call_to` で確保したページを 1 回だけ返す。このページへ飛ぶ call は検査の中にしか無い。
             unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
         }
     }

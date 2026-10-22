@@ -8,8 +8,8 @@
 
 use std::fmt;
 
-/// ローダー（`--ini`）が子の環境ブロックにだけ置き、DLL は在ればそのパスを、無ければ DLL のフォルダの ini を読む。
-/// 同じ PC で 2 つのゲームを起こすとき ini を別々に持たせるため。
+/// ローダー（`--ini`）が子の環境ブロックにだけ設定し、DLL は在ればそのパスを、無ければ DLL のフォルダの ini を読む。
+/// 同じ PC で 2 つのゲームを起動するとき ini を別々に持たせるため。
 pub const PATH_ENV: &str = "HIGANRTOOL_INI";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -59,11 +59,14 @@ impl IniError {
 impl fmt::Display for IniError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IniError::NoEquals { line } => write!(f, "{line} 行目に = が無い"),
+            IniError::NoEquals { line } => write!(f, "{line} 行目に = がありません"),
             IniError::BadSection { line } => {
-                write!(f, "{line} 行目の節の書き方が違う（[名前] の形でない）")
+                write!(
+                    f,
+                    "{line} 行目のカテゴリの記法が不適切です（[名前] の形ではありません）"
+                )
             }
-            IniError::EmptyKey { line } => write!(f, "{line} 行目のキーが空"),
+            IniError::EmptyKey { line } => write!(f, "{line} 行目のキーが空です"),
             IniError::Duplicate {
                 section,
                 key,
@@ -71,7 +74,7 @@ impl fmt::Display for IniError {
                 line,
             } => write!(
                 f,
-                "[{section}] の {key} が {first} 行目と {line} 行目の 2 回ある"
+                "[{section}] の {key} が {first} 行目と {line} 行目に重複しています"
             ),
         }
     }

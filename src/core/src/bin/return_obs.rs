@@ -1,5 +1,5 @@
-//! 戻り道を動かさない実機の回の `_menu.csv`（DLL が `build\bin\logs\` に書く）を、戻り道が読む番地の想定
-//! （`higanr_core::return_flow` の定数）と照らす道具。読むだけで、どのファイルにも書かない。
+//! 戻り道を動かさない実機の検証の `_menu.csv`（DLL が `build\bin\logs\` に書く）を、戻り道が読むアドレスの想定
+//! （`higanr_core::return_flow` の定数）と照らすツール。読むだけで、どのファイルにも書かない。
 //!
 //! 使い方: `cargo run --release -p higanr_core --bin return_obs -- <_menu.csv> [--pause] [--pause-first] [--end] [--final-screen 画面:カーソル]`
 //! - `--pause` / `--end`: 台本が通すはずの一時停止 / 終わりのメニューの移り（`PAUSE_REQUIRED` / `END_REQUIRED`）が全部見えることを求める。

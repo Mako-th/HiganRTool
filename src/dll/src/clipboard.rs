@@ -1,10 +1,8 @@
-//! 接続コードの受け渡しの入口（ゲームの中のメニュー `code_side = game`）: クリップボードの型と、開発用のファイル版・
-//! 検査用の偽物（pure。unsafe 無し）。
+//! 接続コードの受け渡しの入口（ゲームの中のメニュー `code_side = game`）: クリップボードの型と、開発用のファイル実装・検査用の偽物（pure。unsafe 無し）。
 //!
-//! 見張りのスレッド（`net_code`）がメニューの指示で呼ぶ（ゲームのスレッドは触らない）。本物は
-//! `clipboard_win::SystemClipboard`（unsafe はそこ）、開発用は `FileClipboard`（ini の `clipboard = file`。置き場の
-//! `clip_out.txt` / `clip_in.txt`）、検査は `FakeClipboard`。検査と実機の回は利用者のクリップボードを書き換えてはいけないので、
-//! 本物のクリップボードを呼ぶ検査は書かない。
+//! 見張りのスレッド（`net_code`）がメニューの指示で呼ぶ（ゲームのスレッドは触らない）。本物は `clipboard_win::SystemClipboard`（unsafe はそこ）、
+//! 開発用は `FileClipboard`（ini の `clipboard = file`。`clip_out.txt` / `clip_in.txt`）、検査は `FakeClipboard`。
+//! 検査と実機の検証は利用者のクリップボードを書き換えてはいけないので、本物を呼ぶ検査は書かない。
 #![forbid(unsafe_code)]
 
 use std::io::{ErrorKind, Read};
@@ -39,16 +37,17 @@ impl Clipboard for FileClipboard {
         let f = match std::fs::File::open(&p) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("{} を開けない: {e}", p.display())),
+            Err(e) => return Err(format!("{} を開けません: {e}", p.display())),
         };
         let mut b = Vec::new();
         f.take(MAX_FILE_BYTES)
             .read_to_end(&mut b)
-            .map_err(|e| format!("{} を読めない: {e}", p.display()))?;
+            .map_err(|e| format!("{} 読み込み不能: {e}", p.display()))?;
         if b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]) {
-            return Err(format!("{} が UTF-16 で保存されている", p.display()));
+            return Err(format!("{} が UTF-16 で保存されています", p.display()));
         }
-        let text = String::from_utf8(b).map_err(|_| format!("{} が UTF-8 でない", p.display()))?;
+        let text =
+            String::from_utf8(b).map_err(|_| format!("{} が UTF-8 ではありません", p.display()))?;
         let text = text.trim_start_matches('\u{FEFF}');
         Ok((!text.trim().is_empty()).then(|| text.to_string()))
     }

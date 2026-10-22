@@ -11,8 +11,8 @@
 
 use crate::replay_detail::{CommSummary, MatchDetail, RoundRec, SyncKind, Winner};
 
-/// 記録するラウンドの上限。ゲームは Match の勝ちに要る数を 2 に決める（`0x0041AFBA`。隣リポ TR）ので 3 ラウンドが最大で、
-/// 他の道具が要る数を変えても 7（4 本先取）まで収まる。越えた分は捨てて数える。
+/// 記録するラウンドの上限。ゲームは Match の勝ちに要る数を 2 に決める（`0x0041AFBA`）ので 3 ラウンドが最大で、
+/// 他のツールが要る数を変えても 7（4 本先取）まで収まる。越えた分は捨てて数える。
 pub const MAX_ROUNDS: usize = 7;
 /// ping の度数表の目盛り（1 ms ごと。最後の目盛りは 255 ms 以上）。
 pub const PING_BUCKETS: usize = 256;
@@ -167,7 +167,7 @@ impl CommTally {
     }
 }
 
-/// ネットワークのセッションの累計の数え（接続の始まりからの合計。マッチの分は差で出す）。
+/// ネットワークのセッションの累計の数え（接続の始まりからの合計。マッチの分は `MatchLog::start` で取った `NetSample` との差で出す）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetTotals {
     /// 相手の入力ワードを待って止まった数（delay 方式は描画だけにしたフレーム、rollback は入力の地点が待った数）。
@@ -405,7 +405,7 @@ pub fn round_records(bs: &[Boundary]) -> Vec<RoundRec> {
     out
 }
 
-/// 画面に出るスコアは内部の値の 10 倍（隣リポ Memory_Map「表示スコア = 内部値×10」、`th09_monitor.py` の `s1a*10`）。
+/// 画面に出るスコアは内部の値の 10 倍。
 pub const SCORE_FACTOR: u64 = 10;
 
 // ---- 固定長の語へのコピー（`Handoff` の原子変数の列に載せる） ----

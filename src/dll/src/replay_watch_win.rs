@@ -26,12 +26,12 @@ pub const PUSH_PERIOD_MS: u64 = 100;
 /// 入れる（読み取りのスレッド。入力の入口を開く前）。直に読むアドレスが読めなければ入れない。
 pub fn arm() -> Result<(), String> {
     if ON.load(Ordering::SeqCst) != 0 {
-        return Err("もう入っている".to_string());
+        return Err("設置済み".to_string());
     }
     for (addr, len) in SaveAddrs::th09().direct_ranges() {
         if read_own_memory(addr, len as usize).is_none() {
             return Err(format!(
-                "直に読むアドレス 0x{addr:08X}（{len} バイト）が読めない"
+                "直接読むアドレス 0x{addr:08X}（{len} バイト）が読み取り不能"
             ));
         }
     }
@@ -45,7 +45,7 @@ pub fn arm() -> Result<(), String> {
                     let lost = HANDOFF.drain(&mut read, |r| crate::main_log::push(r.line()));
                     if lost > 0 {
                         crate::main_log::push(format!(
-                            "再生の見張り: {lost} 回分の再生の行を落とした（{PLAY_MARK} の行が間に合わなかった）"
+                            "再生の見張り: {lost} 回分の再生の行を落としました（{PLAY_MARK} の行が間に合わなかった）。"
                         ));
                     }
                 }
@@ -55,7 +55,7 @@ pub fn arm() -> Result<(), String> {
                 win::debug_out("HiganRTool: 再生の見張りの書き出しでパニックを受けた。見張りを止める");
             }
         })
-        .map_err(|e| format!("再生の見張りのスレッドを起こせない: {e}"))?;
+        .map_err(|e| format!("再生の見張りのスレッドの作成不能: {e}"))?;
     ON.store(1, Ordering::Release);
     Ok(())
 }

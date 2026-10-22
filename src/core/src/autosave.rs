@@ -1,7 +1,7 @@
 //! マッチの終わりのリプレイの自動保存の判断のうち、ゲームのアドレスに依らないもの（pure）。
 //! - いつ保存を呼ぶか（`SaveGate`。場面・メニューの印・読み込みの 3 つを dll が真偽にして渡す）
 //! - 印の結果（`result_of`。勝ち数から）と、保存関数に渡す名前（`clock_name`。8 バイトの `HH:MM:SS`）
-//! - exe のフォルダの形の確かめ（`exe_dir_of`）と、保存関数へ渡す CP932 のパス（`ansi_vault_path`）
+//! - exe のフォルダの形の検証（`exe_dir_of`）と、保存関数へ渡す CP932 のパス（`ansi_vault_path`）
 //! - `HiganRTool.ini` の `[replay]` の読み方（`settings_from_ini`）
 //!
 //! ゲームのアドレス・場面の番号・フォルダの中身はここに無い（dll が読んで渡す）。
@@ -19,7 +19,7 @@ pub const SECTION: &str = "replay";
 /// 保存関数に渡す名前の文字数。ゲームは長さを見ない strcpy でヘッダの 9 バイトの欄へコピーするので、NUL を入れて収まる 8 文字まで
 /// （9 文字以上は隣の難易度の欄を壊す）。
 pub const NAME_LEN: usize = 8;
-/// 名前を置くバッファの大きさ（8 文字 ＋ NUL ＋ 詰め物の 0。4 の倍数）。
+/// 名前を入れるバッファの大きさ（8 文字 ＋ NUL ＋ 詰め物の 0。4 の倍数）。
 pub const NAME_BUF: usize = 12;
 /// 保存関数に渡すパスの長さの上限（NUL を除く B）。保存は `CreateFileA` を通るので `MAX_PATH`（260）から NUL の 1 を引く。
 pub const ANSI_PATH_MAX: usize = 259;
@@ -43,12 +43,11 @@ pub struct GateScene {
     pub loading: bool,
 }
 
-/// いつ保存を呼ぶかを決める構造体（ゲームのスレッドが tick ごとに `tick` を呼ぶ）。
+/// いつ保存を呼ぶかを決める（ゲームのスレッドが tick ごとに `tick` を呼ぶ）。
 ///
-/// - seg（場面 2 に入ってから抜ける・作り直すまで）ごとに 1 回だけ。呼んだ（か呼ばないと決めた）ら `finish`。
-/// - メニューの印が `settle` tick 続いたら `MenuShown` を返し、`finish` まで毎 tick 返す（パスの準備が間に合わなければ再試行できる）。
-/// - 場面 2 を抜ける・入り直す tick で、まだなら 1 回だけ `Leaving` を返す（描画だけのフレームで同じ tick が繰り返されても 2 回は返さない）。
-/// - その次に場面 2 のまま次の要求も 2 に戻ったら（「再戦」）、新しい seg として数え直す。
+/// - seg（場面 2 に入ってから抜ける・作り直すまで）ごとに保存は 1 回だけ。メニューの印が `settle` tick 続いたら `MenuShown`（`finish` まで毎 tick 返す。パスの準備が間に合わなければ再試行できる）、
+///   場面 2 を抜ける・入り直す tick で未保存なら 1 回だけ `Leaving` を返す（描画だけのフレームで同じ tick が繰り返されても 2 回は返さない）。
+/// - 呼んだ（か呼ばないと決めた）ら `finish`。場面 2 のまま次の要求も 2 に戻ったら（「再戦」）、新しい seg として数え直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveGate {
     settle: u32,
@@ -146,7 +145,7 @@ impl SaveGate {
 }
 
 /// 印の結果（自分から見た）。勝ち数は席ごと、`required` は勝ちに要る数（ゲームは勝ち数を 1 増やした後に `required` と
-/// 比べてラウンドの演出を決める）。メニューを見ずに抜けたマッチは abort。どちらも届いた・どちらも届いていない
+/// 比べてラウンドの演出を決める）。メニューを見ずに抜けたマッチは abort。両席の勝ち数が required に届いた・両席とも届いていない
 /// （メニューが出ていれば起きないはず）は draw にする。
 pub fn result_of(
     kind: SaveKind,
@@ -192,7 +191,7 @@ pub enum ExeDirError {
     Empty,
     /// 最後が `/` でない（ゲームは最後の区切りを `/` にして直後で切る）。
     NotSlash,
-    /// 絶対パスでない（`GetModuleFileNameA` が失敗したときの `"./"` など）。作業ディレクトリに依るので使わない。
+    /// 絶対パスでない（`GetModuleFileNameA` が失敗したときの `"./"` など）。作業フォルダに依るので使わない。
     Relative,
     NotCp932,
 }
@@ -285,7 +284,7 @@ pub fn settings_from_ini(ini: &Ini) -> Result<Option<ReplaySettings>, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -293,18 +292,19 @@ pub fn settings_from_ini(ini: &Ini) -> Result<Option<ReplaySettings>, String> {
     match ini.get(SECTION, "enable") {
         Some("1") => {}
         Some("0") | None => return Ok(None),
-        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1")),
+        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1 にしてください")),
     }
     let split = match ini.get(SECTION, "layout") {
         None => Split::Peer,
-        Some(v) => Split::parse(v)
-            .ok_or_else(|| format!("layout の値 {v:?} は peer / date / flat / pack50 のどれか"))?,
+        Some(v) => Split::parse(v).ok_or_else(|| {
+            format!("layout の値 {v:?} は peer / date / flat / pack50 のどれかにしてください")
+        })?,
     };
     Ok(Some(ReplaySettings { split }))
 }
 
-/// 保存の直前に、見出しのチャージ型をゲームの設定の写し（生きた試合が使った値）に合わせた結果。見出しは読み込みスレッドがその PC の
-/// `th09.cfg` から写したままなので、そのまま保存すると、相手と設定が違う試合を素の花映塚で再生したときにずれる。
+/// 保存の直前に、見出しのチャージ型をゲームの設定のコピー（生きた試合が使った値）に合わせた結果。見出しは読み込みスレッドがその PC の
+/// `th09.cfg` からコピーしたままなので、そのまま保存すると、相手と設定が違う試合を素の花映塚で再生したときにずれる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChargeSync {
     /// 試みていない（保存の記録の初期値）。
@@ -314,11 +314,11 @@ pub enum ChargeSync {
         p1: u8,
         p2: u8,
     },
-    /// 写しのポインタが 0 か読めない（書かない）。
+    /// コピーのポインタが 0 か読めない（書かない）。
     NoCopy,
     /// 見出しのポインタが 0 か読めない（書かない）。
     NoHeader,
-    /// 写しの中のチャージ型が読めない（書かない）。
+    /// コピーの中のチャージ型が読めない（書かない）。
     CopyUnreadable,
     /// 見出しへ書けなかった。
     WriteFailed,
@@ -353,7 +353,7 @@ impl ChargeSync {
     }
 }
 
-/// 設定の写しのチャージ型 2 バイト（`copy + copy_off`、1P・2P の順）を、見出しの同じ並びの 2 バイト（`header + header_off`）へ写す。
+/// 設定のコピーのチャージ型 2 バイト（`copy + copy_off`、1P・2P の順）を、見出しの同じ並びの 2 バイト（`header + header_off`）へコピーする。
 /// ポインタが 0 のとき・読めないときは 1 バイトも書かない。席は入れ替えない（1P は 1P へ、2P は 2P へ）。
 /// `read` / `write` は落ちない読み書き（読めない・書けないアドレスは `None` / false を返す）。
 pub fn sync_header_charge(
@@ -694,7 +694,7 @@ mod tests {
         assert!(settings_from_ini(&ini("[replay]\nenable = 0\nx = 1\n")).is_err());
     }
 
-    /// 偽のメモリ: 写し（0x1000 から）と見出し（0x2000 から）。書けない範囲は `ro` で指定する。
+    /// 偽のメモリ: 設定のコピー（0x1000 から）と見出し（0x2000 から）。書けない範囲は `ro` で指定する。
     struct Mem {
         bytes: std::collections::BTreeMap<u32, u8>,
         ro: Vec<u32>,
@@ -704,7 +704,7 @@ mod tests {
     impl Mem {
         fn new() -> Mem {
             let mut bytes = std::collections::BTreeMap::new();
-            // 写し: +0xB4 = 1P、+0xB5 = 2P。見出しは cfg 由来の 0 / 0。
+            // コピー側: +0xB4 = 1P、+0xB5 = 2P。見出しは cfg 由来の 0 / 0。
             bytes.insert(0x1000 + 0xB4, 1);
             bytes.insert(0x1000 + 0xB5, 0);
             bytes.insert(0x2000 + 0x190, 0);
@@ -720,7 +720,7 @@ mod tests {
             let bytes = &mut self.bytes;
             let ro = &self.ro;
             let writes = &mut self.writes;
-            // 読みと書きが同じ偽のメモリを触るので、読みは呼ぶ前の写しから引く。
+            // 読みと書きが同じ偽のメモリを触るので、読みは呼ぶ前のコピーから引く。
             let snapshot = bytes.clone();
             sync_header_charge(
                 copy,
@@ -740,7 +740,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 書かない・席を入れ替える・違う欄へ書く。
     #[test]
     fn charge_goes_to_the_same_seat_in_the_header() {
         let mut m = Mem::new();

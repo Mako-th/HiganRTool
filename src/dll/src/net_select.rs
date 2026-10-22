@@ -1,7 +1,7 @@
 //! ネットの選択で、選択の画面のゲームの状態から「自分の押下」「届いた押下をこの tick に入れられるか」
 //! 「押下を入れる tick の feed とカーソル」を決める（pure。unsafe 無し）。押下の結果の模型と value の詰め方は
 //! `higanr_core::menu_model`。ゲームのメモリの読み書きは呼び手。ここはゲームのスレッドで走るので、確保・
-//! パニックしうる添字を置かない（添字はいつも `& 15` か `get`）。
+//! パニックしうる添字を使わない（添字はいつも `& 15` か `get`）。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::keys;
@@ -72,7 +72,7 @@ pub fn reads(v: &MenuView, kind: StepKind, value: u8) -> bool {
     true
 }
 
-/// 届いた押下（ホスト: 受けたゲストの要求 / ゲスト: 届いた STEP）を、この tick に入れられるか。押下の画面が今の画面と
+/// 届いた押下（対戦のホスト: 受けたゲストの要求 / 対戦のゲスト: 届いた STEP）を、この tick に入れられるか。押下の画面が今の画面と
 /// 同じで、ゲームがその押下を処理する状態のときだけ。画面を持たない押下（screen 0。peer_sim の v0）は入れない。
 pub fn reads_step(v: &MenuView, st: &Step) -> bool {
     st.screen != 0 && u32::from(st.screen) == v.screen && reads(v, st.kind, st.value)
@@ -89,7 +89,7 @@ fn map_item_at_cursor(v: &MenuView) -> Option<u8> {
     })
 }
 
-/// ホスト: 今の画面の合わせの押下（value は `menu_model::uses_align` の注）。合わせを使う画面（難易度・マップ）でなければ None。
+/// 対戦のホスト: 今の画面で、ゲストのカーソルをホストの値へ合わせるための押下（value は `menu_model::uses_align` の注）。合わせを使う画面（難易度・マップ）でなければ None。
 pub fn align_press(v: &MenuView) -> Option<Press> {
     let screen = u8::try_from(v.screen).ok()?;
     let value = match screen {
@@ -177,7 +177,7 @@ pub fn normal_words(my_seat: Seat, local: u16, remote: u16) -> [u16; 3] {
 /// `[0x4B3538]` へコピーするので、相手の値を自分の設定に残さないため）。
 pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u16) -> ApplyPlan {
     if st.kind == StepKind::Align {
-        // 合わせは `align_plan`。ここへ来たら、ホストの形（書かない）にしておく。
+        // 合わせは `align_plan`。ここへ来たら、ホストと同じ扱い（ゲストへ書かない）にしておく。
         return align_plan(v, st, my_seat, local, remote, false);
     }
     if st.kind == StepKind::Format {
@@ -635,8 +635,7 @@ mod tests {
         })
     }
 
-    /// 壊れたら落ちる: 自分の席へ書く・相手の席が決めた後も書く・押下を読まない間に書く・同じ位置へ書く・音の旗を落とす、
-    /// 見ない条件のときに相手の位置を取ってしまう（`moved` が消えて音が鳴らない）。
+    /// 見ない条件のとき相手の位置を取ると `moved` が消えて音が鳴らないことも見る。
     #[test]
     fn peer_sync_writes_the_other_seat_only_when_it_may_move() {
         let v = view(8);

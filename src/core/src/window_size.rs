@@ -1,16 +1,13 @@
 //! ウィンドウモードの起動時のウィンドウの大きさ・位置・タイトルバー・最前面（ini の `[window]`）を決める（unsafe 無し）。
 //!
-//! 「ウィンドウだけ大きくする」作り: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。ここは ini の読みと
-//! `CreateWindowExA` に渡す値の計算だけで、Win32 は呼ばない（呼ぶ側は `src/dll/src/window_win.rs`）。
-//!
-//! ini（adonis rev4 / rev5 と vpatch の `[Window]` に寄せた名前。キーの大文字・小文字は区別されない）:
+//! 「ウィンドウだけ大きくする」作り: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。ここは ini の読みと `CreateWindowExA` に渡す値の計算だけで、Win32 は呼ばない（呼ぶ側は `src/dll/src/window_win.rs`）。
+//! キーの名前は adonis rev4 / rev5 と vpatch の `[Window]` に合わせ、大文字・小文字は区別しない:
 //! - `[window]` が無ければ何もしない（`from_ini` が `None`）。今のゲームのウィンドウのまま。
 //! - `width` / `height`: client 領域（枠を除いた中身）の画素数。既定 640 / 480。整数倍でなくてよい。
 //! - `x` / `y`: ウィンドウの左上（枠を含む外側の位置）。両方書いたときだけ使う。書かなければ `CW_USEDEFAULT`。
-//! - `titlebar`: 1（既定）= 今の枠のまま、0 = 枠なし。
-//! - `alwaysontop`: 1 = 最前面、0（既定）= 通常。
+//! - `titlebar`: 1（既定）= 今の枠のまま、0 = 枠なし。`alwaysontop`: 1 = 最前面、0（既定）= 通常。
 //!
-//! 知らないキー・読めない値・範囲外の値があれば、その節を丸ごと使わない（`Err`。`[netplay]` / `[pacing]` と同じ）。
+//! 知らないキー・読めない値・範囲外の値があれば、そのカテゴリを丸ごと使わない（`Err`。`[netplay]` / `[pacing]` と同じ）。
 #![forbid(unsafe_code)]
 
 use crate::ini::Ini;
@@ -27,11 +24,11 @@ pub const MIN_WIDTH: i32 = 160;
 pub const MIN_HEIGHT: i32 = 120;
 pub const MAX_WIDTH: i32 = 7680;
 pub const MAX_HEIGHT: i32 = 4320;
-/// x / y の範囲。複数のモニターで左や上に置く負の値を通す。
+/// x / y の範囲。複数のモニターで左や上へ出す負の値を通す。
 pub const MIN_POS: i32 = -32768;
 pub const MAX_POS: i32 = 32767;
 
-/// `CreateWindowExA` の x / y に置くと「システムが決める」になる値（`0x80000000`）。ゲームも `0x42D5A7` / `0x42D5AC` で置く。
+/// `CreateWindowExA` の x / y に渡すと「システムが決める」になる値（`0x80000000`）。ゲームも `0x42D5A7` / `0x42D5AC` で渡す。
 pub const CW_USEDEFAULT: i32 = i32::MIN;
 /// ウィンドウスタイルの `WS_POPUP`（枠も title も無い）と `WS_VISIBLE`。
 pub const WS_POPUP: u32 = 0x8000_0000;
@@ -76,7 +73,7 @@ impl WindowConfig {
     }
 }
 
-/// 整数（`-` は先頭に 1 つだけ。`+` や小数点や単位は断る）を読み、`[min, max]` を確かめる。
+/// 整数（`-` は先頭に 1 つだけ。`+` や小数点や単位は断る）を読み、`[min, max]` を検証する。
 fn parse_int(key: &str, v: &str, min: i32, max: i32) -> Result<i32, String> {
     let t = v.trim();
     let digits = t.strip_prefix('-').unwrap_or(t);
@@ -86,7 +83,7 @@ fn parse_int(key: &str, v: &str, min: i32, max: i32) -> Result<i32, String> {
     match n {
         Some(n) if (min..=max).contains(&n) => Ok(n),
         _ => Err(format!(
-            "[{SECTION}] の {key} の値 {v:?} は {min}〜{max} の整数"
+            "[{SECTION}] の {key} の値 {v:?} は {min}〜{max} の整数にしてください"
         )),
     }
 }
@@ -95,7 +92,9 @@ fn parse_flag(key: &str, v: &str) -> Result<bool, String> {
     match v.trim() {
         "0" => Ok(false),
         "1" => Ok(true),
-        _ => Err(format!("[{SECTION}] の {key} の値 {v:?} は 0 か 1")),
+        _ => Err(format!(
+            "[{SECTION}] の {key} の値 {v:?} は 0 か 1 にしてください"
+        )),
     }
 }
 
@@ -107,7 +106,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<WindowConfig>, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -130,7 +129,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<WindowConfig>, String> {
         // 片方だけでは、書かなかった側を「今のまま」にできない（x が既定値だと y は無視される）。
         _ => {
             return Err(format!(
-                "[{SECTION}] の x と y は両方書いたときだけ使う（片方だけでは位置を決めない）"
+                "[{SECTION}] の x と y は両方書いたときだけ使います（片方だけでは位置を決めません）"
             ));
         }
     };

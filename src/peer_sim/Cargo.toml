@@ -17,3 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 higanr_core = { path = "../core" }
+
+[build-dependencies]
+# 開発側の資料を読む検査の cfg を出す（自作。成果物には入らない）。
+higanr_build_res = { path = "../build_res" }

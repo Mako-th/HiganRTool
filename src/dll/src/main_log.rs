@@ -1,12 +1,9 @@
 //! 本ログへ行を頼む入口（pure）。
 //!
-//! ウィンドウの差し替え（`window_win.rs`）とパッドの十字キー（`pad_extra_win.rs`）は本ログの書き手（`win.rs` の読み取りのスレッド）ではなく、
-//! `DllMain` の下でも走る。`logs\` の中を増やさないよう別ファイルは作らず、行をここへ頼み、本ログの書き手が書く。
-//! 頼む側はメモリに積むだけ（ファイルを開かない・書かない・待たない）。
-//!
-//! 書き手は `Draining` で本ログを包み、書き込みが行の先頭から始まるたびに積んだ行を先に書く（`writeln!` は文字列を何度かに分けて書くので、
-//! 「直前が改行か」で行の先頭を見分ける）。包みの下の `ScrubWrite` が 1 行を 1 回の書き込みにまとめてファイルへ渡す
-//! （書き込み中のファイルをローダーが読んでも、行の途中で切れにくいように）。書き出しの順は「書き手が次に書いた時刻」なので、各行の先頭には出どころ（`ウィンドウ:`・`pad:`）を付ける。
+//! ウィンドウの差し替え（`window_win.rs`）とパッドの十字キー（`pad_extra_win.rs`）は本ログの書き手（`win.rs` の読み取りのスレッド）ではなく、`DllMain` の下でも走る。
+//! `logs\` の中を増やさないよう別ファイルは作らず、行をここへ頼み、本ログの書き手が書く。頼む側はメモリに積むだけ（ファイルを開かない・書かない・待たない）。
+//! 書き手は `Draining` で本ログを包み、書き込みが行の先頭から始まるたびに積んだ行を先に書く（`writeln!` は文字列を何度かに分けて書くので「直前が改行か」で行の先頭を見分ける）。
+//! 包みの下の `ScrubWrite` が 1 行を 1 回の書き込みにまとめる（ローダーが読んでも行の途中で切れにくいように）。各行の先頭には出どころ（`ウィンドウ:`・`pad:`）を付ける。
 //! 最後の 1 回は書き手が終わるときに `Draining::drain_now` で流す。ゲームのプロセスが先に終わると、その間に積んだ行は残らない。
 
 #![forbid(unsafe_code)]
@@ -14,7 +11,7 @@
 use std::io::{self, Write};
 use std::sync::Mutex;
 
-/// 積んでおける行の数。書き手が先に終わった後も頼む側は走り続けるので上限を置く。溢れたら捨てて数える（次の書き出しの 1 行に出る）。
+/// 積んでおける行の数。書き手が先に終わった後も頼む側は走り続けるので上限を設ける。溢れたら捨てて数える（次の書き出しの 1 行に出る）。
 pub const MAX_QUEUED_LINES: usize = 64;
 
 struct Inner {
@@ -62,7 +59,7 @@ impl LineQueue {
         }
     }
 
-    /// 積んである行を足した順に `out` へ書く。書けなかった行は戻さない。錠は取り出す間だけ持つ（頼む側を待たせない）。
+    /// 積んである行を足した順に `out` へ書く。書けなかった行は戻さない。ロックは取り出す間だけ持つ（頼む側を待たせない）。
     pub fn drain_into(&self, out: &mut dyn Write) {
         let (lines, dropped) = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -77,7 +74,7 @@ impl LineQueue {
         if dropped > 0 {
             let _ = writeln!(
                 out,
-                "本ログへ頼まれた行が多すぎて {dropped} 行を捨てた（上限 {MAX_QUEUED_LINES} 行）"
+                "本ログへ一度に書き込む行が多すぎます、{dropped} 行を捨てました（上限 {MAX_QUEUED_LINES} 行）。"
             );
         }
     }
@@ -89,6 +86,19 @@ impl LineQueue {
             .unwrap_or_else(|e| e.into_inner())
             .lines
             .iter()
+            .map(|(_, l)| l.clone())
+            .collect()
+    }
+
+    /// 簡潔のログにも書かれる行（詳細だけの行を除く）。
+    #[cfg(test)]
+    pub fn peek_brief(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lines
+            .iter()
+            .filter(|(detail_only, _)| !detail_only)
             .map(|(_, l)| l.clone())
             .collect()
     }
@@ -124,6 +134,11 @@ pub fn wrap<W: Write>(inner: W) -> Draining<'static, W> {
 #[cfg(test)]
 pub fn peek() -> Vec<String> {
     QUEUE.peek()
+}
+
+#[cfg(test)]
+pub fn peek_brief() -> Vec<String> {
+    QUEUE.peek_brief()
 }
 
 pub struct Draining<'a, W: Write> {
@@ -207,7 +222,6 @@ mod tests {
         assert_eq!(text(log.inner), "A\n後から 1\n後から 2\nB\nC\n後から 3\n");
     }
 
-    /// 壊れたら落ちる: 簡潔なログ（1 秒ごとの行が無い）で、別のスレッドが頼んだ行が次の書き込みまで残る。
     #[test]
     fn flush_writes_the_queued_lines_when_at_a_line_start() {
         let q = LineQueue::new();
@@ -245,7 +259,7 @@ mod tests {
         q.drain_into(&mut out);
         let t = text(out);
         assert_eq!(t.lines().count(), MAX_QUEUED_LINES + 1);
-        assert!(t.contains("3 行を捨てた"), "{t}");
+        assert!(t.contains("3 行を捨てました"), "{t}");
         assert!(q.peek().is_empty(), "流した行を残している");
     }
 
@@ -262,7 +276,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 失敗の行が詳細だけに回る（簡潔で消える）、または成功の行が簡潔に出る。
     #[test]
     fn push_when_routes_problems_to_brief_and_the_rest_to_detail_only() {
         for (detail, want) in [(true, "問題\nうまくいった\n"), (false, "問題\n")] {
@@ -330,8 +343,7 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 簡潔 / 詳細を決める前にログへ書き始める、既定がビルドの種類に結び付いていない、
-    /// 本ログの行が伏せる処理を通らずにファイルへ行く。
+    /// 本ログの行が伏せる処理を通ってファイルへ行くことも見る。
     #[test]
     fn the_mode_is_decided_from_the_ini_and_the_build_default_before_the_first_line() {
         let src = include_str!("win.rs");

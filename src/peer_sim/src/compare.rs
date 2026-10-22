@@ -1,12 +1,9 @@
 //! 突き合わせ（`peer_sim --compare`）: dll の `_net_frames.csv` と peer_sim の記録を読み、使ったフレームの列 (seg, frame, 1P, 2P) が同じかを
 //! 見て、dll の余裕と待ちの分布（p50 / p95 / p99 / max）と delay の変わり目を出す。
-//!
-//! 一致の決まり: dll の行は全部、peer_sim の同じ番目の行と (seg, frame, 1P, 2P) が同じ（`same_key`）。delay は条件に入れない: 使った後の
-//! delay は書き出す時点の今の D なので、マッチの途中で D を替えた後は同じ語でも両者の delay が違いうる。違った行の数は別に出す
-//! （`Outcome::delay_only`。`compare2.rs` も同じ）。peer_sim は末尾に 1 行まで多くてよい（dll が最後の語を取ってから閉じた分）。
+//! 一致の決まり: dll の行は全部、peer_sim の同じ番目の行と (seg, frame, 1P, 2P) が同じ（`same_key`）。delay は条件に入れず、
+//! 違った行の数だけ別に出す（`Outcome::delay_only`。`compare2.rs` も同じ）。peer_sim は末尾に 1 行まで多くてよい（dll が最後の語を取ってから閉じた分）。
 //! どちらかが 0 行なら、比べられていないので食い違いとする（0 行を一致と言ってしまわないため。`--compare2` と同じ扱い）。
-//!
-//! 読むだけの道具（ファイルは `main.rs` が読む）。ここは文字列を受けて文字列を返す。
+//! 読むだけのツール（ファイルは `main.rs` が読む）。ここは文字列を受けて文字列を返す。
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

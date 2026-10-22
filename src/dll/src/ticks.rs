@@ -23,7 +23,7 @@ pub const SLOT_BYTES: u32 = 1024;
 pub const SLOT_SHIFT: u32 = 10;
 pub const SLOT_WORDS: usize = (SLOT_BYTES / 4) as usize;
 /// 先頭の大きさ。前のバージョンの 64 バイトの枠と同じ配置で、札は `+48`、`+52` は描画だけのフレームの印、`+56`〜`+63` は予備。
-/// コピーはこの後ろにだけ置く。
+/// コピーはこの後ろにだけ書く。
 pub const HEAD_BYTES: u32 = 64;
 // 札（と先頭の欄）は先頭の中にある（コピーがどれも先頭の後ろなら、コピーが札を潰さない）。
 const _: () = assert!(OFF_TICKET + 4 <= HEAD_BYTES);
@@ -39,7 +39,7 @@ pub struct CopyRow {
 /// コピーの表の行の上限。このバージョンは 6 行を使い、2 行は予備。
 pub const COPY_MAX_ROWS: usize = 8;
 
-// コピーの置き場（枠の中の位置）。先頭の直後から、4 バイト境界にそろえて順に詰める（合計 548 バイトで 612 まで。
+// コピー先の位置（枠の中）。先頭の直後から、4 バイト境界にそろえて順に詰める（合計 548 バイトで 612 まで。
 // 612〜1023 は予備の 2 行のための空き）。
 /// 席のブロックからマップ・一時停止までの範囲（320 バイト）。
 pub const OFF_COPY_SEATS: u32 = HEAD_BYTES;
@@ -54,7 +54,7 @@ pub const OFF_COPY_INPUT: [u32; 3] = [
     OFF_COPY_RNG + RNG_LEN + 2 * INPUT_COPY_LEN,
 ];
 
-/// このバージョンのコピーの表（6 行）。アドレスは `th09_addr`、置き場は上の `OFF_COPY_*` から作る。
+/// このバージョンのコピーの表（6 行）。アドレスは `th09_addr`、位置は上の `OFF_COPY_*` から作る。
 pub const COPY_TABLE: [CopyRow; 6] = [
     CopyRow {
         src: SEATS_RANGE,
@@ -537,7 +537,7 @@ pub fn write_summary(out: &mut dyn Write, s: &TickSummary) {
         None => {
             let _ = writeln!(
                 out,
-                "tick の集計: 間隔は出せない（TSC の周波数が求まらない、または番号が隣り合う 2 件が無い）"
+                "tick の集計: 間隔は出せません（TSC の周波数が求まらない、または番号が隣り合う 2 件がありません）"
             );
         }
         Some(i) => {
@@ -588,7 +588,7 @@ pub fn write_summary(out: &mut dyn Write, s: &TickSummary) {
     if s.per_second.is_empty() {
         let _ = writeln!(
             out,
-            "tick の集計: TSC で区切った 1 秒ごとの件数は出せない（周波数が求まらないか、件が無い）"
+            "tick の集計: TSC で区切った 1 秒ごとの件数は出せません（周波数が求まらないか、件がありません）"
         );
     } else {
         let list: Vec<String> = s.per_second.iter().map(u32::to_string).collect();
@@ -599,7 +599,7 @@ pub fn write_summary(out: &mut dyn Write, s: &TickSummary) {
         );
     }
     let _ = match s.longest {
-        None => writeln!(out, "出口の判定: 件が無い（満たさない）"),
+        None => writeln!(out, "出口の判定: 件がありません（満たしません）"),
         Some(r) => writeln!(
             out,
             "出口の判定: 番号が 1 ずつ・読み落とし 0・+0x454 が 1 ずつ・ウィンドウ +0x2C が前より進む、が続いた最長 {} 件（seq {} から）。{} 件以上で出口 → {}",
@@ -617,7 +617,7 @@ pub fn write_summary(out: &mut dyn Write, s: &TickSummary) {
 
 pub const CSV_HEADER: &str = "seq,t_us,dt_us,game_now,game_deadline,sup454,d454,scene_cur,scene_req,esi,tid,fpucw,same_frame";
 
-/// tick ごとの行（先頭の 13 列）を流して作る。1 秒ごとの追記で呼ばれるので、最初の件の TSC と前の件を呼び出しをまたいで持つ。
+/// tick ごとの行（先頭の 13 列）を、記録を 1 件ずつ渡して作る。1 秒ごとの追記で呼ばれるので、最初の件の TSC と前の件を呼び出しをまたいで持つ。
 /// `t_us` は最初の件の TSC からの µs、`dt_us` と `d454` と `same_frame` は前の行（番号が飛んでいても前に採った件）との差。
 /// 最初の行は空。周波数が分からなければ時刻の 2 列は空。
 #[derive(Debug, Clone, Default)]
@@ -1027,8 +1027,11 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         write_summary(&mut out, &e);
         let log = String::from_utf8(out).unwrap();
-        assert!(log.contains("出口の判定: 件が無い（満たさない）"), "{log}");
-        assert!(log.contains("間隔は出せない"), "{log}");
+        assert!(
+            log.contains("出口の判定: 件がありません（満たしません）"),
+            "{log}"
+        );
+        assert!(log.contains("間隔は出せません"), "{log}");
     }
 
     #[test]

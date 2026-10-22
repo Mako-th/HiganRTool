@@ -1,11 +1,10 @@
 //! メニューで決めた設定（プレイヤー名・ルーム名・同期方式・ディレイ・サイド）を `HiganRTool.ini` の該当の 1 行へ書き戻す（unsafe 無し）。
 //!
 //! - 設定の原本は ini 1 つ。決まった時点で書くので、ini とメニューはいつも同じ値になり、「どちらが優先」の規則は無い。
-//! - 書くのは決めた tick で起こした別のスレッド。ゲームのスレッドはスレッドを 1 本起こすだけで、確保・ファイルの I/O を足さない。
-//! - 続けて決めたとき、古い頼みが新しい値を上書きしないよう、頼みごとに番号を振り、書く直前（ini の鍵の中）で最新かを確かめる。
-//! - 行の書き換えは `higanr_core::ini_edit`、ファイルの出し入れは `ini_store`。サイドの「おまかせ」は `host_seat` の行を消す
-//!   （読み手は行が無ければおまかせ）。
-//! - 以前の版が別ファイルに覚えていた名前・ルーム名は、起動のとき `migrate_legacy` が ini へ移して消す。
+//! - 書くのは決めた tick で作った別のスレッド。ゲームのスレッドはスレッドを 1 本作るだけで、確保・ファイルの I/O を足さない。
+//! - 続けて決めたとき、古い頼みが新しい値を上書きしないよう、頼みごとに番号を振り、書く直前（ini のロックの中）で最新かをチェックする。
+//! - 行の書き換えは `higanr_core::ini_edit`、ファイルの出し入れは `ini_store`。サイドの「おまかせ」は `host_seat` の行を消す（読み手は行が無ければおまかせ）。
+//! - 以前のバージョンが別ファイルに覚えていた名前・ルーム名は、起動のとき `migrate_legacy` が ini へ移して消す。
 
 #![forbid(unsafe_code)]
 
@@ -24,14 +23,14 @@ use higanr_core::wire::SeatWish;
 
 use crate::net_config::{DEFAULT_NAME, SECTION};
 
-/// 起動のときに読んだ ini のパス（メニューを置くとき 1 回だけ置く）。無ければ（ini なしの実行）書かずに本ログへ出す。
+/// 起動のときに読んだ ini のパス（メニューを組み込むとき 1 回だけ設定する）。無ければ（ini なしの実行）書かずに本ログへ出す。
 static TARGET: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn set_target(path: Option<PathBuf>) {
     let _ = TARGET.set(path);
 }
 
-/// 頼みの番号。取るのはゲームのスレッド、見るのは書くスレッドの ini の鍵の中。
+/// 頼みの番号。取るのはゲームのスレッド、見るのは書くスレッドの ini のロックの中。
 struct Seq(AtomicU32);
 
 impl Seq {
@@ -57,7 +56,7 @@ static LAN_SEQ: Seq = Seq::new();
 /// 失敗の文には値（名前・ルーム名）を含めない。
 fn report(what: &str, r: Result<bool, String>) {
     if let Err(e) = r {
-        crate::main_log::push(format!("設定: {what}を ini へ書けなかった（{e}）"));
+        crate::main_log::push(format!("設定: {what}を ini へ書けませんでした（{e}）。"));
     }
 }
 
@@ -70,7 +69,7 @@ fn ask(
 ) -> Option<std::thread::JoinHandle<()>> {
     let Some(path) = target else {
         crate::main_log::push(format!(
-            "設定: {what}を ini へ書けない（ini の置き場が分からない）"
+            "設定: {what}を ini へ書けません（ini の場所の取得不能）。"
         ));
         return None;
     };
@@ -81,7 +80,7 @@ fn ask(
     match spawned {
         Ok(h) => Some(h),
         Err(e) => {
-            crate::main_log::push(format!("設定: {what}を書くスレッドを起こせなかった（{e}）"));
+            crate::main_log::push(format!("設定: {what}を書くスレッドの作成不能（{e}）。"));
             None
         }
     }
@@ -285,7 +284,7 @@ fn room_is_default(_v: &str) -> bool {
     false
 }
 
-/// 以前の版が置き場（`code_dir`）に覚えていた名前とルーム名を ini へ移す（起動のとき 1 回、ini を読む前に）。
+/// 以前のバージョンが保存先（`code_dir`）に覚えていた名前とルーム名を ini へ移す（起動のとき 1 回、ini を読む前に）。
 /// 返すのは本ログ用の文。
 pub fn migrate_legacy(ini_path: &Path, code_dir: &Path) -> Vec<String> {
     ini_store::migrate(
@@ -389,7 +388,6 @@ mod tests {
         assert_eq!(settings(&p).room.unwrap().0, "joined");
     }
 
-    /// 壊れたら落ちる: 打った LAN のホストのアドレスが `lan_host` の行に書かれない（既定のポートは省く）、書いた行を次の起動が読めない。
     #[test]
     fn a_typed_lan_host_lands_in_its_line_and_a_restart_reads_it() {
         use higanr_core::lan_addr::LanAddr;
@@ -565,7 +563,6 @@ mod tests {
         assert!(migrate_legacy(&p, &code).is_empty(), "2 回目は何もしない");
     }
 
-    /// 壊れたら落ちる: 配る ini で `;` を外した行（ルーム名・LAN のホスト・同期方式）にメニューの値が書かれず、行が増える。
     #[test]
     fn the_menu_values_land_in_the_shipped_lines_without_adding_lines() {
         let t = Tmp::new("dist");

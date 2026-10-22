@@ -1,24 +1,12 @@
-//! rollback のモードのマッチの経路（pure。unsafe 無し）。`NetPlay` の Lockstep の phase を、delay 方式の `lockstep_tick`
-//! （取得 → 待ち → 使う）の代わりに、走査の包み（`0x0042DCA9`）のフックから rollback の状態機械（`Rollback`）で進める。
+//! rollback のモードのマッチの経路（pure。unsafe 無し）。`NetPlay` の Lockstep の phase を、delay 方式の `lockstep_tick`（取得 → 待ち → 使う）の代わりに、走査の包み（`0x0042DCA9`）のフックから rollback の状態機械（`Rollback`）で進める。呼び出しは `script_win.rs` が配線する。
 //!
-//! ## 呼ばれ方（`script_win.rs` が繋ぐ）
-//!
-//! - 走査の包みのフック（[`NetPlay::rollback_scan`]）: do_frame の走査の call の直前。受けと生存の手入れ → 自分の入力ワードの取得と送信 →
-//!   入力の地点（止まっていれば書き戻しと進め直しもここ）→ 更新 1 回か描画だけのフレーム（どちらもフックが走査を呼ぶ）。
+//! - 走査の包みのフック（[`NetPlay::rollback_scan`]）: do_frame の走査の call の直前。相手から届いた便の受けと生存の手入れ → 自分の入力ワードの取得と送信 → 入力の地点（止まっていれば書き戻しと進め直しもここ）→ 更新 1 回か描画だけのフレーム（どちらもフックが走査を呼ぶ）。
 //!   [`RbScan::Ran`] ならフックが走査を呼び終えたので `ret` を do_frame へ返し、[`RbScan::Pass`] なら走査を普段どおり 1 回呼ぶ。
 //! - Present の後（[`NetPlay::rollback_post_present`]）: コピーする / 届いた語で F を進める。先に受けを 1 回回す（進め直しが 1 フレーム遅れないように）。
-//! - 出るたびに、確定した (frame, p1, p2) だけを観戦・記録・CHECK へ流す（[`NetPlay::rb_drain`]）。予測の入力ワードはここを通らない。
-//!
-//! ## 場面の出入り
-//!
-//! 場面の境目が確定するとフックは `Pass` を返し、走査の中の `on_input` → `lockstep_tick` が再戦・退出の要求を見て `leave_seg`
-//! （`Connected::begin_seg` と `rb_epoch` を進める）。次の入口が `rb_epoch` の差を見て `PlayState::begin_seg` を呼ぶ。
-//! `lockstep_tick` が rollback の接続で下まで来たら、`rb_abort` でマッチをやめる。
-//!
-//! ## 遅延
-//!
-//! delay 方式の実行では [`NetPlay::rollback_ready`] が false で、フックは何も触らない。rollback のモードで入力 → Present の間に
-//! 足すのは、走査の包み 1 段と受けの手入れだけ。止まっている間は delay 方式と同じ予算つきの待ちをフックが行う（`Machine::wait`）。
+//!   出るたびに、確定した (frame, p1, p2) だけを観戦・記録・CHECK へ流す（[`NetPlay::rb_drain`]）。予測の入力ワードはここを通らない。
+//! - 場面の境目が確定するとフックは `Pass` を返し、走査の中の `on_input` → `lockstep_tick` が再戦・退出の要求を見て `leave_seg`（`Connected::begin_seg` と `rb_epoch` を進める）。次の入口が `rb_epoch` の差を見て `PlayState::begin_seg` を呼ぶ。
+//!   `lockstep_tick` が rollback の接続で下まで来たら、`rb_abort` でマッチをやめる。
+//! - delay 方式の実行では [`NetPlay::rollback_ready`] が false で、フックは何も触らない。rollback のモードで入力 → Present の間に足すのは、走査の包み 1 段と受けの手入れだけ。止まっている間は delay 方式と同じ予算つきの待ちをフックが行う（`Machine::wait`）。
 #![forbid(unsafe_code)]
 
 use higanr_core::rollback::{After, GlideParams, SYNC_HEAD_FRAMES, Step, Wait, Window};
@@ -274,7 +262,7 @@ impl NetPlay {
             (out, m.timed_out, waited.min(u64::from(u32::MAX)) as u32)
         };
         self.rb_drain(net, st, waited_us, sink);
-        // 時刻合わせの寄せ幅を、次の枠の始まり（ウィンドウの b-spin の格子）へ渡す。1 フレームに 1 回。全画面（ゲーム自身の時計）の区間では頭が捨てる。
+        // 時刻合わせの寄せ幅を、次の枠の始まり（ウィンドウの b-spin の格子）へ渡す。1 フレームに 1 回。フルスクリーン（ゲーム自身の時計）の区間では頭が捨てる。
         if let Some(c) = self.link.connected_mut() {
             let ppm = c.rollback_glide_ppm(&GlideParams::DEFAULT, glide().frame_us());
             let open = c.rollback().is_some_and(|r| r.glide_on());
@@ -369,6 +357,7 @@ impl NetPlay {
             link,
             cfg,
             digest,
+            spec_digest,
             stats,
             spec,
             arrivals,
@@ -391,6 +380,7 @@ impl NetPlay {
             if source == CheckSource::InputDigest {
                 *digest = input_digest_push(*digest, p1, p2);
             }
+            NetPlay::spec_digest_push(spec, spec_digest, frame, p1, p2);
             NetPlay::spec_to(spec, Record::Frame { frame, p1, p2 });
             stats.played = stats.played.saturating_add(1);
             let slot = arrivals
@@ -413,6 +403,7 @@ impl NetPlay {
             sink(&FrameRec { seg, frame, p1, p2 }, &t);
             if source == CheckSource::InputDigest && is_check_frame(frame) {
                 let chk = check_from_input_digest(seg, frame, *digest);
+                NetPlay::spec_check(spec, source, &chk, *spec_digest);
                 #[cfg(test)]
                 sent_checks.push(chk);
                 if let Some(CheckResult::Mismatch { local, remote }) = c.submit_check(chk, net) {
@@ -423,6 +414,8 @@ impl NetPlay {
         st.drain_checks(&mut |chk| {
             // 確定した行を使った後のダイジェストで作るときは、確定の tick の始まりの値は使わない。
             if source == CheckSource::Game {
+                // 確定の tick の始まりの値（予測で進めた状態の値ではない）。観戦の照合にもこれを積む。
+                NetPlay::spec_check(spec, source, chk, 0);
                 #[cfg(test)]
                 sent_checks.push(*chk);
                 if let Some(CheckResult::Mismatch { local, remote }) = c.submit_check(*chk, net) {

@@ -1,5 +1,4 @@
-//! 起動の最初に、ツールのフォルダへ書き込めるかを確かめる（配るバージョンだけ）。
-//!
+//! 起動の最初に、ツールのフォルダへ書き込めるかをチェックする（配るバージョンだけ）。
 //! Program Files のような管理者しか書けない場所では、更新もログの保存もできない。マニフェストの無い 32bit の exe は
 //! Windows が書き込みを `%LOCALAPPDATA%\VirtualStore` へ逃がし、作成は成功して見える（実測では、作ったファイルを開いた
 //! ハンドルのパスも VirtualStore を指し、存在の確認は逃がされた側を本来の場所の存在として答えた）。そこで、逃がし先に
@@ -184,7 +183,6 @@ mod tests {
         d
     }
 
-    /// 壊れたら落ちる: 書けないのに知らせない・待たない・ログに残さない、または書けるのに知らせる。
     #[test]
     fn an_unwritable_folder_is_announced_logged_and_waited_for_then_the_launch_goes_on() {
         let dir = Path::new("C:\\Tool");
@@ -221,7 +219,6 @@ mod tests {
         assert_eq!(ok.probed, [dir.to_path_buf()]);
     }
 
-    /// 壊れたら落ちる: 開発用のビルドで試す（作業ツリーの中から動かすときに余計な知らせと待ちが出る）。
     #[test]
     fn a_non_dist_build_does_not_probe() {
         let mut site = Fake {
@@ -238,7 +235,6 @@ mod tests {
         assert!(site.probed.is_empty() && site.said.is_empty() && site.waited.is_empty());
     }
 
-    /// 壊れたら落ちる: ゲームのフォルダで一時ファイルを作る。
     #[test]
     fn the_game_folder_is_never_probed() {
         let mut site = Fake {
@@ -288,7 +284,6 @@ mod tests {
         assert_eq!(c, Path::new("C:\\L\\VirtualStore\\a\\b.tmp"));
     }
 
-    /// 壊れたら落ちる: 書ける場所で一時ファイルを残す・書けると見なさない、または書けない場所を書けると見なす。
     #[test]
     fn a_real_writable_folder_passes_and_leaves_nothing_behind() {
         let dir = temp_dir("ok");
@@ -330,8 +325,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 壊れたら落ちる: 作れたのに逃がし先に現れたファイルを見逃す（Program Files で何も知らせない）、または元から逃がし先にあった
-    /// ファイルを逃がされたと誤る。
     #[test]
     fn a_file_that_appears_in_the_virtual_store_is_redirected_and_cleaned() {
         let dir = temp_dir("redir");

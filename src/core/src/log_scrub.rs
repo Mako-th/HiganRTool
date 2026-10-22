@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(hide_addrs("0.0.0.0:1"), "使えないアドレス:1");
     }
 
-    /// 壊れたら落ちる: かな・漢字の直後のアドレスやフォルダが語の途中に見えて伏せられない（日本語の文は空白なしで続く）。
+    /// 日本語の文は空白なしで続くので、かな・漢字の直後でも伏せる。
     #[test]
     fn an_address_or_folder_right_after_japanese_text_is_hidden() {
         assert_eq!(hide_addrs("候補198.51.100.9:40000へ"), "候補外:40000へ");
@@ -498,7 +498,7 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 行の本文と改行が別の書き込みになる（書き込み中のファイルを読む側が行の途中で切れた形を見うる）。
+    /// 本文と改行を別の書き込みにすると、書き込み中のファイルを読む側が行の途中で切れた形を見うる。
     #[test]
     fn writer_hands_each_line_to_the_inner_writer_in_one_write() {
         struct Calls(Vec<Vec<u8>>);

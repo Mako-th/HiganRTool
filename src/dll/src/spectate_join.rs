@@ -1,33 +1,11 @@
-//! 観戦者のルームの見張り（インターネット越しの観戦）: ゲーム内のメニューの観戦の「ルームマッチ」を決めた人のゲームが、観戦用のルーム
-//! （`RoomName::spectate_of`）に役 guest で入り、配る側（マッチのホストの dll）が預けた観戦用のコード（種別 3）を受けて、
-//! 観戦者の返し（種別 4）を answer で返し、ホストへ JOIN を送り始めさせる。
+//! 観戦者のルームの見張り（インターネット越しの観戦）: ゲーム内のメニューの観戦の「ルームマッチ」を決めた人のゲームが、観戦用のルーム（`RoomName::spectate_of`）に役 guest で入り、配る側（マッチのホストの dll）が預けた観戦用のコード（種別 3）を受けて、観戦者の返し（種別 4）を answer で返し、ホストへ JOIN を送り始めさせる。
 //!
-//! ```text
-//! 開くスレッド（script_win::open_watch_net）: 受信ソケット・STUN・受信スレッド・WatchPlay を作り、ここの Runner を起こす
-//! 観戦者のルームのスレッド（higanr-spectate。ここ）: core の Joiner を 50 ms ごとに回す
-//!    Connect      → RoomConn::start（観戦用のルームへ）
-//!    Close        → 接続を手放す（役が逆 = 配る側がまだいない・失敗・終わり。次の入り直しは Joiner が決めてある）
-//!    SpectateCode → 観戦用のコードを読み（spectate_watch_code::Reader のガード）、返し（自分の受信ソケット ＋ STUN のアドレス）を answer し、
-//!                   WatchSlot へ設定を置く（WatchPlay が次の tick で取り、ホストへ JOIN を送り始める）
-//!    以後         → ホストの最初の STREAM（WatchSlot::is_joined）を待つ → 観戦の終わり（WatchSlot::is_done）を待つ
-//! ```
+//! - 開くスレッド（`script_win::open_watch_net`）が受信ソケット・STUN・受信スレッド・`WatchPlay` を作り、ここの `Runner` を作る。観戦者のルームのスレッド（`higanr-spectate`。ここ）は core の `Joiner` を 50 ms ごとに回し、観戦用のルームへの接続・観戦用のコードの読み（`spectate_watch_code::Reader` のガード）・返し（自分の受信ソケット ＋ STUN のアドレス）の answer・`WatchSlot` への設定の書き込み（`WatchPlay` が次の tick で取り、ホストへ JOIN を送り始める）・ホストの最初の STREAM（`WatchSlot::is_joined`）と観戦の終わり（`WatchSlot::is_done`）の待ちを受け持つ。
+//! - **ゲームのスレッドは何も呼ばない。** 確保・ブロッキング I/O は全部このスレッドと `RoomConn` の受信スレッドの側（相手のマッチへの遅延の増分 0）。ゲームのスレッドとの受け渡しは、指示のリングバッファと状態の入れ物（`net_ui::UiLink`）・`WatchSlot` の原子変数・`RUN`（動いているか）だけ。
+//! - **状態を `UiLink` へ書く**（左上の行と項目の元）。終わった後の状態は、観戦者のセッションを手放すゲームのスレッドが消さない（`NetUi::after_watch_teardown`）。指示のリングバッファの読み手はこのスレッドで、`Order::SpectateCancel` で取りやめ、それ以外は読み捨てる。
+//! - **ルーム名は本ログに書かない。** `Debug` はルーム名・秘密・コード・アドレスを出さない。返しを出してから 30 秒（`LINK_TIMEOUT_MS`）ホストの最初の STREAM が来なければ「接続できなかった」で終える（穴あけ 5 回 × 200 ms と JOIN の送り直し 250 ms で足りる長さに、NAT が厳しい相手を待ち続けない上限を足したもので、実回線では検証していない）。
 //!
-//! - **ゲームのスレッドは何も呼ばない。** 確保・ブロッキング I/O は全部このスレッドと `RoomConn` の受信スレッドの側
-//!   （対戦者のマッチへの遅延の増分 0）。ゲームのスレッドとの受け渡しは、指示のリングバッファと状態の入れ物（`net_ui::UiLink`）・`WatchSlot` の
-//!   原子変数・`RUN`（動いているか）だけ。
-//! - **状態を `UiLink` へ書く**（左上の行と項目の元。`net_menu::spectate_state_of` / `spectate_failure_event`）: 入る・配る側を
-//!   待つ・つなぎに行く・つながった（`SpectateIdle` ＋ 出来事なし）・終わった（`Idle` ＋ 理由）。終わった後の状態は、
-//!   観戦者のセッションを手放すゲームのスレッドが消さない（`NetUi::after_watch_teardown`）。
-//! - **指示のリングバッファの読み手はこのスレッド**（観戦者のセッションがある間）: `Order::SpectateCancel` で取りやめ、それ以外は読み捨てる。
-//!   対戦者の見張り（`net_code_game::GameWatcher`）は観戦者のセッションがある間は居ない（`script_win::request_spectate` が観戦者のセッションを
-//!   置く前に対戦者のネットワークの組を片づける）。
-//! - **ルーム名は本ログに書かない。** 観戦用のルームの名は元のルーム名のハッシュだが、書かない。`Debug` はルーム名・秘密・コード・アドレスを出さない。
-//! - 返しを出してから 30 秒（`LINK_TIMEOUT_MS`）ホストの最初の STREAM が来なければ「つながらなかった」で終える
-//!   （穴あけ 5 回 × 200 ms と JOIN の送り直し 250 ms で足りる長さに、NAT が厳しい相手を待ち続けない上限を足したもので、実回線では確かめていない）。
-//!
-//! **観戦コードの経路**（`JoinSource::Code`。メニューの「観戦コード入力」）: ルームへは入らない。開くスレッドが読んだクリップボードの観戦コード
-//! （種別 3）を同じ `Reader` で読み、`WatchSlot` へ設定を置いてホストへ JOIN を送らせる。返しは出さず、ホストは穴をあけないので、ホストのポートへ
-//! 外から届く場合（同じ LAN・UPnP で開けたポート）だけ繋がる。`CODE_LINK_TIMEOUT_MS` で答えが無ければ終える。
+//! **観戦コードの経路**（`JoinSource::Code`。メニューの「観戦コード入力」）: ルームへは入らない。開くスレッドが読んだクリップボードの観戦コード（種別 3）を同じ `Reader` で読み、`WatchSlot` へ設定を書いてホストへ JOIN を送らせる。返しは出さず、ホストは穴をあけないので、ホストのポートへ外から届く場合（同じ LAN・UPnP で開けたポート）だけ接続できる。`CODE_LINK_TIMEOUT_MS` で答えが無ければ終える。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -56,7 +34,7 @@ use crate::trial_summary::Refusal;
 /// 見張り（`net_code_game::GAME_POLL`）と同じ 50 ms。
 const POLL: Duration = Duration::from_millis(50);
 
-/// 返しを出してから、ホストの最初の STREAM が来るまで待ってよい長さ（ms）。越えたら「つながらなかった」で終える。
+/// 返しを出してから、ホストの最初の STREAM が来るまで待ってよい長さ（ms）。越えたら「接続できなかった」で終える。
 pub const LINK_TIMEOUT_MS: u64 = 30_000;
 
 /// 観戦コードの経路で、JOIN を送り始めてからホストの最初の STREAM を待つ長さ（ms）。穴あけを待たないので、届く形（LAN・開いたポート）なら
@@ -82,13 +60,15 @@ enum Stat {
     FailExpired,
     FailPeerLeft,
     FailBadName,
+    /// 配る側が観戦を断っていた（4403）。観戦者はこれで終わる。
+    FailRefused,
     /// 30 分待っても配る側に会えなかった。
     GaveUp,
     /// 返しを出した後、ホストの最初の STREAM が来ないまま `LINK_TIMEOUT_MS` 経った。
     LinkTimeout,
     Cancelled,
     Linked,
-    /// 観戦が終わった（`WatchPlay` が `Ended`。対戦者の BYE・自分の Esc・流れが切れた）。
+    /// 観戦が終わった（`WatchPlay` が `Ended`。相手の BYE・自分の Esc・流れが切れた）。
     Ended,
     ConnectErrors,
     /// ルームの運びの記録（WinHTTP の失敗・サーバーのバイナリ）。
@@ -99,11 +79,17 @@ enum Stat {
     Panicked,
     /// 観戦コードの経路で始めた（ルームへは入らない）。
     ByCode,
-    /// 観戦コードの期限は切れていたが、時計のずれを見込んで繋ぎに行った。
+    /// 観戦コードの期限は切れていたが、時計のずれを見込んで接続しに行った。
     ExpiredButTried,
+    /// `Linked` のうち、最初の STREAM が IPv6 の送り元から来たもの。
+    LinkedV6,
+    /// `LinkTimeout` のうち、ホストから何の返事も無かったもの（ホストに届かず観戦できなかった）。
+    Unreached,
+    /// `LinkTimeout` のうち、ホストに満員で断られ続けたもの。
+    FullBeforeJoin,
 }
 
-const STAT_COUNT: usize = Stat::ExpiredButTried as usize + 1;
+const STAT_COUNT: usize = Stat::FullBeforeJoin as usize + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JoinCounts {
@@ -119,10 +105,16 @@ pub struct JoinCounts {
     pub fail_expired: u32,
     pub fail_peer_left: u32,
     pub fail_bad_name: u32,
+    pub fail_refused: u32,
     pub gave_up: u32,
     pub link_timeout: u32,
+    /// `link_timeout` のうち、ホストから何の返事も無かった数と、満員で断られ続けた数。
+    pub unreached: u32,
+    pub full_before_join: u32,
     pub cancelled: u32,
     pub linked: u32,
+    /// `linked` のうち IPv6 の経路で接続した数（残りは IPv4）。
+    pub linked_v6: u32,
     pub ended: u32,
     pub connect_errors: u32,
     pub transport: u32,
@@ -136,15 +128,15 @@ impl JoinCounts {
     pub fn text(&self) -> String {
         let head = if self.by_code > 0 {
             format!(
-                "観戦者（観戦コードでホストへ直に繋ぐ。ルームへは入らない。期限切れでも繋ぎに行った {}）",
+                "観戦者（観戦コードでホストへ直に接続する。ルームへは入らない。期限切れでも接続しに行った {}）",
                 self.expired_but_tried
             )
         } else {
-            "観戦者のルーム（観戦用のルームへ入り、対戦者の観戦用のコードを受けて返しを出す）"
+            "観戦者のルーム（観戦用のルームへ入り、相手の観戦コードを受けて返答コードを出す）"
                 .to_string()
         };
-        format!(
-            "{head}: 入った {}（役が逆で閉じて入り直した {}）・観戦用のコードを受けた {}・返しを出した {}（コードを読めず {}・返せず {}）・ルームの失敗（応答なし {}・混雑 {}・満員 {}・期限 {}・相手が抜けた {}・ルーム名 {}）・30 分待って諦めた {}・つながらず終えた {}・取りやめた {}・つながった {}・観戦が終わった {}・繋げなかった {}・運びの記録 {}・読み捨てた指示 {}{}",
+        let mut t = format!(
+            "{head}: 入った {}（役が逆で閉じて入り直した {}）・観戦コードを受けた {}・返答コードを出した {}（コードを読めず {}・返せず {}）・ルームの失敗（応答なし {}・混雑 {}・満員 {}・期限 {}・相手が抜けた {}・ルーム名 {}・観戦拒否 {}）・30 分待って諦めた {}・接続できずに終えた {}・取りやめた {}・接続した {}（うち IPv6 のアドレスで接続 {}）・観戦が終わった {}・接続できなかった {}・運びの記録 {}・読み捨てた指示 {}{}",
             self.entered,
             self.wrong_role,
             self.codes_received,
@@ -157,20 +149,36 @@ impl JoinCounts {
             self.fail_expired,
             self.fail_peer_left,
             self.fail_bad_name,
+            self.fail_refused,
             self.gave_up,
             self.link_timeout,
             self.cancelled,
             self.linked,
+            self.linked_v6,
             self.ended,
             self.connect_errors,
             self.transport,
             self.ignored_orders,
             if self.panicked > 0 {
-                "・パニックでこのスレッドを止めた"
+                "・パニックでこの処理を停止"
             } else {
                 ""
             },
-        )
+        );
+        // サーバーの中継を作るかを決める材料（ホストに直接届かない観戦者がどれだけいるか）。
+        if self.unreached > 0 {
+            t.push_str(&format!(
+                "\n観戦者: ホストに届かず観戦できなかった {} 回（JOIN にホストの返事なし）",
+                self.unreached
+            ));
+        }
+        if self.full_before_join > 0 {
+            t.push_str(&format!(
+                "\n観戦者: ホストの観戦者が満員で入れなかった {} 回（JOIN に満員の BYE）",
+                self.full_before_join
+            ));
+        }
+        t
     }
 }
 
@@ -237,10 +245,14 @@ impl JoinShared {
             fail_expired: g(Stat::FailExpired),
             fail_peer_left: g(Stat::FailPeerLeft),
             fail_bad_name: g(Stat::FailBadName),
+            fail_refused: g(Stat::FailRefused),
             gave_up: g(Stat::GaveUp),
             link_timeout: g(Stat::LinkTimeout),
+            unreached: g(Stat::Unreached),
+            full_before_join: g(Stat::FullBeforeJoin),
             cancelled: g(Stat::Cancelled),
             linked: g(Stat::Linked),
+            linked_v6: g(Stat::LinkedV6),
             ended: g(Stat::Ended),
             connect_errors: g(Stat::ConnectErrors),
             transport: g(Stat::Transport),
@@ -276,7 +288,7 @@ impl JoinShared {
 
 // ---------------- 動いているスレッド（プロセスで 1 本）----------------
 
-/// 動いているか: 0 = 起こしていない（か、片づけた）/ 1 = 動いている / 2 = 最後の状態を書き終えて終わった。
+/// 動いているか: 0 = 作っていない（か、片づけた）/ 1 = 動いている / 2 = 最後の状態を書き終えて終わった。
 static RUN: AtomicU32 = AtomicU32::new(0);
 /// 動いている（か、片づける前の）スレッドの共有。読み取りのスレッドとワーカーのスレッドが見る。ゲームのスレッドは触らない。
 static ACTIVE: Mutex<Option<Arc<JoinShared>>> = Mutex::new(None);
@@ -285,13 +297,13 @@ pub fn finished() -> bool {
     RUN.load(Ordering::Acquire) == 2
 }
 
-/// 検査だけ: 動いている印を直に置く（`tests::TEST_LOCK` の下で）。
+/// 検査だけ: 動いている印を直に設定する（`tests::TEST_LOCK` の下で）。
 #[cfg(test)]
 pub(crate) fn set_run_for_test(v: u32) {
     RUN.store(v, Ordering::SeqCst);
 }
 
-/// 観戦者のルームのスレッドを止めて待ち、最後の数の行を返す。起こしていなければ `None`。返した行は呼び手
+/// 観戦者のルームのスレッドを止めて待ち、最後の数の行を返す。作っていなければ `None`。返した行は呼び手
 /// （`script_win::close_watch`）が節に入れる。ここでは控えない（控える場所が 2 つあると同じ行が 2 回並ぶ）。
 pub fn stop_and_join() -> Option<String> {
     let shared = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -311,7 +323,7 @@ pub fn active_line() -> Option<String> {
         .map(|sh| sh.line())
 }
 
-/// 本ログの行。いま動いている（か、片づける前の）分だけ。片づけた分は `stop_and_join` が返す。起こしたことが無ければ空。
+/// 本ログの行。いま動いている（か、片づける前の）分だけ。片づけた分は `stop_and_join` が返す。作ったことが無ければ空。
 pub fn stats_text() -> String {
     active_line().map_or_else(String::new, |l| format!("\n{l}"))
 }
@@ -369,13 +381,20 @@ pub enum JoinSource {
     Code(Result<Option<String>, String>),
 }
 
+impl JoinSource {
+    /// 中継の配る側（約 9.4 MB）を確保する経路か。ルームの経路だけ。
+    pub fn can_relay(&self) -> bool {
+        matches!(self, JoinSource::Room { .. })
+    }
+}
+
 /// 観戦者のルームのスレッドの材料。`Debug` は書かない（候補・名前を含む）。
 pub struct JoinKit {
     pub source: JoinSource,
     /// 観戦用のコードを読んで `WatcherConfig` にするガード（ネットワークの範囲・観戦者の名前と nonce）。
     pub reader: Reader,
     pub reply_name: Name,
-    /// 観戦者の返しに載せる候補（自分の受信ソケット ＋ STUN で見えたアドレス。IPv4 だけ —— 受信スレッドの観戦は IPv4 の受信ソケットだけ）。
+    /// 観戦者の返しに載せる候補（自分の受信ソケット ＋ STUN で見えたアドレス ＋ 開けた IPv6 のソケット）。
     pub own: Candidates,
     pub slot: Arc<WatchSlot>,
     /// 状態を書く者（開くスレッドが先に書き始めたものの続き）。指示のリングバッファを読む側は `publisher.link`。
@@ -403,7 +422,7 @@ pub(crate) struct Runner {
     replied_at: Option<u64>,
     shared: Arc<JoinShared>,
     t0: Instant,
-    /// このスレッドを起こした観戦の「ルームマッチ」の指示を、もう 1 回読み捨てたか（起こした指示は数えない）。
+    /// このスレッドを作った観戦の「ルームマッチ」の指示を、もう 1 回読み捨てたか（作った指示は数えない）。
     start_order_seen: bool,
     /// JOIN を送り始めてから最初の STREAM を待つ長さ（ms）と、来なかったときの出来事（ルームの経路と観戦コードの経路で違う）。
     link_limit_ms: u64,
@@ -504,17 +523,17 @@ impl Runner {
             self.conn = None;
         }
         if self.link_timed_out(now_ms) {
-            return self.fail_link(Stat::LinkTimeout);
+            return self.time_out();
         }
         self.refresh(now_ms);
     }
 
     fn step_linking(&mut self, now_ms: u64) {
         if self.link_timed_out(now_ms) {
-            return self.fail_link(Stat::LinkTimeout);
+            return self.time_out();
         }
         if self.kit.slot.is_done() {
-            // 繋がらないまま `WatchPlay` が終わった（検査・想定外の終わり）。
+            // 接続できないまま `WatchPlay` が終わった（検査・想定外の終わり）。
             return self.fail_link(Stat::LinkTimeout);
         }
         self.kit
@@ -525,11 +544,33 @@ impl Runner {
     fn step_watching(&mut self) {
         if self.kit.slot.is_done() {
             self.bump(Stat::Ended);
-            self.kit
-                .publisher
-                .publish(CodeState::Idle, Event::SpectateEnded);
+            let ev = if self.kit.slot.buffer_full() {
+                Event::SpectateBufferFull
+            } else if self.kit.slot.refused_full() {
+                Event::SpectateFullEnded
+            } else {
+                Event::SpectateEnded
+            };
+            self.kit.publisher.publish(CodeState::Idle, ev);
             self.phase = Phase::Done;
         }
+    }
+
+    /// JOIN を送り始めてから、ホストの最初の STREAM が来ないまま待ちの上限が来た。満員の断りを受けていたかで分けて数える。
+    fn time_out(&mut self) {
+        let full = self.kit.slot.full_before_join();
+        self.bump(if full {
+            Stat::FullBeforeJoin
+        } else {
+            Stat::Unreached
+        });
+        if full {
+            self.link_fail = match self.kit.source {
+                JoinSource::Code(_) => Event::SpectateCodeFull,
+                JoinSource::Room { .. } => Event::SpectateFull,
+            };
+        }
+        self.fail_link(Stat::LinkTimeout);
     }
 
     fn link_timed_out(&self, now_ms: u64) -> bool {
@@ -546,7 +587,7 @@ impl Runner {
         self.phase = Phase::Done;
     }
 
-    /// 観戦コードを読み、読めたら `WatchSlot` へ設定を置いて JOIN を送らせる（返しは出さない）。読めなければ理由を状態に書いて終える。
+    /// 観戦コードを読み、読めたら `WatchSlot` へ設定を書いて JOIN を送らせる（返しは出さない）。読めなければ理由を状態に書いて終える。
     fn step_code(&mut self, now_ms: u64, unix: u64) {
         self.bump(Stat::ByCode);
         let read = match &self.kit.source {
@@ -562,7 +603,7 @@ impl Runner {
         let trimmed = text.trim().trim_start_matches('\u{FEFF}');
         let bytes = trimmed.as_bytes();
         // 期限は書いた側の時計で決まり、読む側の時計で比べる。LAN の会場の PC は時計がずれていることがあるので、期限の切れた観戦コードでも
-        // 繋ぎに行く（ホストが同じ観戦のホストを動かしている間だけ繋がる。次のつながりのホストは session と秘密が違うので断る）。
+        // 接続しに行く（同じ観戦のホストが動いている間だけ接続できる。次の接続は session と秘密が違う別の観戦のホストなので断る）。
         let (step, expired) = match self.kit.reader.clone().on_peer_file(Some(bytes), unix) {
             Step::Refused(_, _, Some(Refusal::Expired)) => {
                 (self.kit.reader.clone().on_peer_file(Some(bytes), 0), true)
@@ -630,6 +671,9 @@ impl Runner {
         let _ = self.joiner.stop();
         self.close();
         self.bump(Stat::Linked);
+        if self.kit.slot.via_v6() {
+            self.bump(Stat::LinkedV6);
+        }
         self.kit
             .publisher
             .publish(CodeState::SpectateIdle, Event::None);
@@ -655,7 +699,7 @@ impl Runner {
         match started {
             Some(c) => self.conn = Some(c),
             None => {
-                // スレッドを起こせない。`Joiner` に「繋げなかった」の入口が無いので、応答しない扱い（観戦者は失敗で終わる）。
+                // スレッドを作れない。`Joiner` に「接続できなかった」の入口が無いので、応答しない扱い（観戦者は失敗で終わる）。
                 self.bump(Stat::ConnectErrors);
                 self.joiner
                     .on_failed(now_ms, Failure::Unresponsive(Why::NoAnswer));
@@ -691,6 +735,7 @@ impl Runner {
                     Failure::Expired => Stat::FailExpired,
                     Failure::PeerLeft => Stat::FailPeerLeft,
                     Failure::BadRoomName => Stat::FailBadName,
+                    Failure::Refused => Stat::FailRefused,
                 });
                 self.joiner.on_failed(now_ms, f);
                 self.close();
@@ -698,7 +743,7 @@ impl Runner {
         }
     }
 
-    /// 観戦用のコードを受けた: 読み、返しを answer で出し、`WatchSlot` へ設定を置く。読めない・返せないなら
+    /// 観戦用のコードを受けた: 読み、返しを answer で出し、`WatchSlot` へ設定を書く。読めない・返せないなら
     /// `Joiner::abort`（失敗で終わる）。
     fn on_spectate_code(&mut self, text: &str, unix: u64) {
         self.bump(Stat::CodesReceived);
@@ -719,15 +764,11 @@ impl Runner {
                 return self.abort(JoinerFailure::ReplyNotSent, Stat::ReplyFailed);
             }
         };
-        let reply = match code::write_spectate_reply_to(
-            &spec.code,
-            self.kit.reply_name,
-            self.kit.own,
-            unix,
-        ) {
-            Ok(r) => r,
-            Err(_) => return self.abort(JoinerFailure::ReplyNotSent, Stat::ReplyFailed),
-        };
+        let reply =
+            match code::write_spectate_reply_to(&spec.code, self.kit.reply_name, self.kit.own) {
+                Ok(r) => r,
+                Err(_) => return self.abort(JoinerFailure::ReplyNotSent, Stat::ReplyFailed),
+            };
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
@@ -804,7 +845,7 @@ pub fn spawn(kit: JoinKit) -> Result<Arc<JoinShared>, String> {
     let shared = Arc::new(JoinShared::default());
     let sh = Arc::clone(&shared);
     let mut runner = Runner::new(kit, Arc::clone(&shared));
-    // 先に印を置く（スレッドが速く終わって `finished` を書いた後に、起こした側が 1 に戻さない）。
+    // 先に印を立てる（スレッドが速く終わって `finished` を書いた後に、作った側が 1 に戻さない）。
     RUN.store(1, Ordering::Release);
     *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&shared));
     let spawned = std::thread::Builder::new()
@@ -831,7 +872,7 @@ pub fn spawn(kit: JoinKit) -> Result<Arc<JoinShared>, String> {
         Err(e) => {
             *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
             RUN.store(0, Ordering::Release);
-            Err(format!("観戦者のルームのスレッドを起こせない: {e}"))
+            Err(format!("観戦者のルームのスレッドの作成不能: {e}"))
         }
     }
 }

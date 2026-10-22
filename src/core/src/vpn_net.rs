@@ -170,8 +170,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// 壊れたら落ちる: 長さの範囲（8〜30）の端の取り違え、先頭のアドレスに丸めない、ホスト部が全部 0 / 全部 1 のアドレスを 1 台と数える、
-    /// ネットワークの外の隣を中と数える。
+    /// 長さの範囲（8〜30）の端と、先頭アドレスへの丸めを見る。
     #[test]
     fn a_net_holds_the_hosts_between_its_network_and_broadcast_addresses() {
         for p in [0, 1, 7, 31, 32, 255] {
@@ -221,7 +220,6 @@ mod tests {
         assert_eq!(Net4::unpack(1 << 40 | 7 << 32 | 0x1A00_0000), None);
     }
 
-    /// 壊れたら落ちる: 説明か接続の名前のどちらかだけに名前があるときに見逃す、大文字を見逃す、名前の無いアダプターをツールと決める。
     #[test]
     fn a_tool_is_known_by_the_description_or_the_connection_name() {
         for (d, n, want) in [
@@ -262,7 +260,6 @@ mod tests {
         assert_eq!(VpnTool::from_code(4), None);
     }
 
-    /// 壊れたら落ちる: ツールの名前が空・別の綴り・アドレスの形（数字と `.`）になる（本ログの VPN の行に書く名前）。
     #[test]
     fn the_tool_names_are_the_product_names_without_an_address() {
         assert_eq!(VpnTool::Radmin.name(), "Radmin VPN");
@@ -273,7 +270,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 重なりを数えて枠を食う、上限を越えて入れる、集まりの外のアドレスや網のアドレスを見つける、語の往復で落ちる。
     #[test]
     fn a_set_dedupes_caps_finds_and_survives_words() {
         let a = Net4::new(ip("26.0.0.1"), 8).unwrap();

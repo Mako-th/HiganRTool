@@ -85,7 +85,7 @@ impl Adapter {
         }
         let d = self.description.to_ascii_lowercase();
         // Hyper-V の外部スイッチを作った PC は、物理の NIC のアドレスが vEthernet（説明は Hyper-V の仮想の Ethernet）へ移る。ゲートウェイを
-        // 持つものは本物の LAN とみなす（既定のスイッチ・内部のスイッチ・WSL の vEthernet はゲートウェイを持たない。推定で、実物では確かめていない）。
+        // 持つものは本物の LAN とみなす（既定のスイッチ・内部のスイッチ・WSL の vEthernet はゲートウェイを持たない。推定で、実物では検証していない）。
         if self.gateway && HYPERV_WORDS.iter().any(|w| d.contains(w)) {
             return false;
         }
@@ -146,14 +146,14 @@ impl Adapter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostAddr {
     pub ip: Ipv4Addr,
-    /// VPN のツールのアダプターのアドレスなら、そのツール（待機の画面でアドレスに名前を添える）。
+    /// VPN のツールのアダプターのアドレスなら、そのツール（ホストの待機の画面でアドレスに名前を添える）。
     pub tool: Option<VpnTool>,
     /// 私設でない VPN のアドレスなら、そのネットワーク（受け口は同じネットワークから来た申し込みだけを読み、ゲームのネットワークはこれを足した範囲で開く）。
     /// 私設のアドレスは `None` で、今までどおり範囲 lan の送り元を読む。
     pub net: Option<Net4>,
 }
 
-/// 自分の PC の、私設でない VPN のアドレス 1 つ（クライアントが打たれたアドレスを受けるか決める材料）。
+/// 自分の PC の、私設でない VPN のアドレス 1 つ（申し込む側が、利用者の打ったアドレスに申し込んでよいかを決める材料）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VpnLink {
     pub ip: Ipv4Addr,
@@ -192,12 +192,12 @@ impl Refusal {
     pub fn text(&self) -> String {
         match self {
             Refusal::NoCandidate => {
-                "アダプターの一覧に LAN で使える IPv4 アドレスが無い".to_string()
+                "アダプターの一覧に LAN で使える IPv4 アドレスがありません".to_string()
             }
             Refusal::Tie(v) => {
                 let list: Vec<String> = v.iter().map(Ipv4Addr::to_string).collect();
                 format!(
-                    "アダプターの一覧に同じ優先のアドレスが複数あって決められない（{}）",
+                    "アダプターの一覧に同じ優先度のアドレスが複数あり、決められません（{}）",
                     list.join("・")
                 )
             }
@@ -230,7 +230,7 @@ pub fn host_addresses(all: &[Adapter]) -> Vec<HostAddr> {
 }
 
 /// `bind = auto` が経路を引けないときの、LAN で使う自分のアドレスの選び方。ゲートウェイを持つものを先に、次にメトリックの小さいもの。
-/// いちばん優先のものが複数あれば選ばない（間違った側で待つより、手で書いてもらう）。
+/// いちばん優先のものが複数あれば選ばない（間違ったアドレスで待ち受けるより、利用者に手で書いてもらう）。
 pub fn choose(all: &[Adapter]) -> Result<Ipv4Addr, Refusal> {
     let mut c: Vec<&Adapter> = all.iter().filter(|a| a.is_lan_candidate()).collect();
     let Some(best) = c.iter().map(|a| a.rank()).max() else {
@@ -398,8 +398,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: Hyper-V の外部スイッチを作った PC（本物の LAN のアドレスが vEthernet に載る）でホストのアドレスが 1 つも出ない、
-    /// ゲートウェイの無い vEthernet（既定のスイッチ・WSL）やほかの製品の仮想 NIC までゲートウェイで候補になる。
     #[test]
     fn a_hyperv_external_switch_with_a_gateway_counts_as_the_real_lan() {
         let external = Adapter {
@@ -437,8 +435,7 @@ mod tests {
         assert!(vpn.is_virtual());
     }
 
-    /// 壊れたら落ちる: 仮想マシンの中（NIC が VMware の 1 つだけ）でホストのアドレスが 0 個になる、ホストの PC の VMnet のアドレスが
-    /// 一覧に出ない・本物より先に出る、仮想のアダプターが `choose`（`bind = auto` の代わり）に選ばれる。
+    /// NIC が VMware の 1 つだけの仮想マシンでも、ホストのアドレスは 0 個にならない。
     #[test]
     fn virtual_adapters_are_listed_after_the_real_ones_but_never_chosen() {
         let guest_nic = Adapter {
@@ -579,8 +576,7 @@ mod tests {
         Net4::new(ip(addr), prefix).unwrap()
     }
 
-    /// 壊れたら落ちる: Radmin VPN の 26/8・Hamachi の 25/8・私設でない ZeroTier のネットワークを受け口に出さない、ツールとネットワークを
-    /// 付けない、並びが本物の LAN → VPN のツール → ほかの仮想にならない（VMnet が VPN より前に出て、上限の 8 個から VPN が落ちる）。
+    /// VMnet が VPN より前に出ると、上限の 8 個から VPN が落ちる。
     #[test]
     fn vpn_tools_are_listed_with_their_network_between_the_real_lan_and_other_virtual_adapters() {
         let vmnet = Adapter {
@@ -639,9 +635,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 名前の分からない仮想のアダプターの 25.x（会社の VPN など）を受け口にする、ネットワークの長さが 8〜30 の外のものを使う、
-    /// Down・重複検出の途中のものを使う、物理のアダプターの世界のアドレスを使う、Tailscale を使う、
-    /// ネットワークの長さが取れないツール（0）を使う。
+    /// Tailscale・Down・重複検出の途中・物理の世界のアドレスは使わない。
     #[test]
     fn only_named_vpn_tools_with_a_usable_network_are_listed_outside_the_private_ranges() {
         let corp = vpn_adapter(
@@ -696,8 +690,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 私設のアドレスを持つ ZeroTier からツールの名前が落ちる（画面にツールの名前が付かない）、私設のアドレスにネットワークが付く
-    /// （受け口が lan 全体でなく、狭いネットワークの送り元だけを読み、今までの振る舞いが変わる）。
+    /// 私設のアドレスにネットワークが付くと、受け口が lan 全体でなく狭い送り元だけを読み、今までの振る舞いが変わる。
     #[test]
     fn a_private_vpn_address_keeps_its_tool_name_but_no_network() {
         let got = host_addresses(&[zerotier("10.147.17.5", 24), wired("192.168.0.10")]);
@@ -725,8 +718,6 @@ mod tests {
         assert!(vpn_links(&[zerotier("10.147.17.5", 24)]).is_empty());
     }
 
-    /// 壊れたら落ちる: クライアントが受けるネットワークの材料に、私設のアドレス・Down・名前の分からない仮想・長さの外が混ざる、
-    /// 同じアドレスが重なる、集まりに入らない。
     #[test]
     fn vpn_links_are_the_up_non_private_tool_addresses_and_make_the_set() {
         let corp = vpn_adapter("Acme Corporate VPN", "Acme", "25.1.2.3", 8, 1);

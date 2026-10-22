@@ -1,15 +1,11 @@
 //! `mode = vpatch`: vpatch の通常のペース（Vsync=0・SleepType=1・AutoBltPrepareTime=1・AllowShortDelay=0）の形を再現した、測定専用の方式（pure）。
 //!
-//! 遅延の表の「vpatch 相当」の列を本ツールの中で測るためのもの。既定ではなく、`auto_window` や `cycle_phases` にも入れない。
+//! 遅延の表の「vpatch 相当」の列を本ツールの中で測るためのもの。既定ではなく、`wait` や `cycle_phases` にも入れない。
 //! 形は 2010-02-06 バージョンの vpatch_th09.dll の逆アセンブルで読んだもの（コードはコピーしていない）。
-//!
-//! - 期限 `T_n = 基点 + floor(n × QPF ÷ fps)`（`Grid::at`）。フレームの始まりで n を 1 進め、`T_n` を作る。
-//! - 起きる時刻は `T_n − 準備時間`。フレームはそこで始まり、Present の直前で `T_n` まで待ってから Present を呼ぶ。
+//! - 期限 `T_n = 基点 + floor(n × QPF ÷ fps)`（`Grid::at`）。フレームの始まりで n を 1 進めて `T_n` を作り、`T_n − 準備時間 ` に起きる。Present の直前で `T_n` まで待つ。
 //! - 待ちは「(目標 − 回し読みの幅) まで普通の待機タイマーで寝る → 目標まで QPC を読み続ける」（`sleep_ticks`）。
-//! - 始まりで `T_n` を既に過ぎていたら待たず、基点を今に置き直して n を 0 に戻す（本ツールの B / b-spin は位相を保つ。ここは意図して違う）。
-//!   Present で n が 0 なら基点をその時刻に置き直し、待たない。
-//! - 準備時間（`Prep`）= 「起きてから Present の直前まで」の直近 64 本の標本から決める。64 本そろうまでは上位 5%（添字 `(95n − 1) ÷ 100`）、
-//!   そろってからは上位 2 位と 4 位の差が 2 ms 以下なら 2 位、超えたら 4 位（外れ値を避ける）に 1 ms を足した値。どちらも 3 ms〜30 ms に収める。
+//! - 始まりで `T_n` を既に過ぎていたら待たず、基点を今に取り直して n を 0 に戻す（本ツールの B / b-spin は位相を保つ。ここは意図して違う）。Present で n が 0 なら基点をその時刻に取り直し、待たない。
+//! - 準備時間（`Prep`）= 「起きてから Present の直前まで」の直近 64 本の標本から決める。64 本そろうまでは上位 5%（添字 `(95n − 1) ÷ 100`）、そろってからは上位 2 位と 4 位の差が 2 ms 以下なら 2 位、超えたら 4 位（外れ値を避ける）に 1 ms を足した値。どちらも 3 ms〜30 ms に収める。
 //!
 //! 本ツールが違うところ: FPU の制御語は B の始まりの入口と同じ（`fldcw 0x007F`）、SwapEffect は替えない。
 #![forbid(unsafe_code)]
@@ -105,11 +101,11 @@ impl Prep {
 pub enum Begin {
     /// 期限 `deadline` に Present する。`wake_at`（= `deadline − 準備時間`）に起きて始める。
     At { deadline: u64, wake_at: u64 },
-    /// 始まりで期限を過ぎていた（か最初の 1 回）。待たずに始め、基点を今に置き直した。
+    /// 始まりで期限を過ぎていた（か最初の 1 回）。待たずに始め、基点を今に取り直した。
     Rebased,
 }
 
-/// 期限の作り方・基点の置き直し・準備時間の標本をまとめたもの。ゲームのスレッドだけが触る。
+/// 期限の作り方・基点の取り直し・準備時間の標本をまとめたもの。ゲームのスレッドだけが触る。
 #[derive(Debug, Clone)]
 pub struct Vpatch {
     qpf: u64,
@@ -151,7 +147,7 @@ impl Vpatch {
         }
     }
 
-    /// フレームの始まり。n を 1 進めて期限を作り、過ぎていなければ起きる時刻を返す。過ぎていたら基点を今に置き直す。
+    /// フレームの始まり。n を 1 進めて期限を作り、過ぎていなければ起きる時刻を返す。過ぎていたら基点を今に取り直す。
     pub fn begin(&mut self, now: u64) -> Begin {
         self.n += 1;
         if let Some(g) = self.grid {
@@ -176,7 +172,7 @@ impl Vpatch {
         self.wake = Some(t);
     }
 
-    /// Present の直前に呼ぶ。標本を足し、待つべき時刻（`Some(期限)`。過ぎていれば `None`）を返す。n が 0 なら基点をいまに置き直して待たない。
+    /// Present の直前に呼ぶ。標本を足し、待つべき時刻（`Some(期限)`。過ぎていれば `None`）を返す。n が 0 なら基点をいまに取り直して待たない。
     pub fn before_present(&mut self, now: u64) -> Option<u64> {
         self.sample(now);
         if self.n == 0 {
@@ -214,7 +210,6 @@ mod tests {
         p
     }
 
-    // 何が壊れたら落ちるか: 標本が無いときの下限 3 ms と、標本が小さくても 3 ms を下回らないこと（下限の clamp を外すと落ちる）。
     #[test]
     fn prep_floor_is_three_ms() {
         assert_eq!(Prep::new(QPF).value(), ms(3));
@@ -228,7 +223,6 @@ mod tests {
         );
     }
 
-    // 何が壊れたら落ちるか: 上限 30 ms の clamp（上限を外す・値を間違えると落ちる）。
     #[test]
     fn prep_ceiling_is_thirty_ms() {
         assert_eq!(prep_with(&[ms(500); 10]).value(), ms(30));
@@ -240,7 +234,7 @@ mod tests {
         );
     }
 
-    // 何が壊れたら落ちるか: 64 本そろう前の順位の選び方（添字 (95n − 1) ÷ 100）。n = 1 は添字 0、n = 20 は添字 18、n = 63 は添字 59。
+    // n = 1 は添字 0、n = 20 は添字 18、n = 63 は添字 59。
     #[test]
     fn prep_before_full_uses_the_95_percentile_without_margin() {
         assert_eq!(prep_with(&[ms(7)]).value(), ms(7));
@@ -260,7 +254,6 @@ mod tests {
         );
     }
 
-    // 何が壊れたら落ちるか: 64 本そろった後の上位の選び方。2 位と 4 位の差が 2 ms 以下なら 2 位、超えたら 4 位。どちらも 1 ms を足す。
     #[test]
     fn prep_full_picks_top2_or_top4_by_spread() {
         // 昇順の 60 本は 4 ms、上位 4 本を指定する。
@@ -279,7 +272,6 @@ mod tests {
         assert_eq!(build([ms(4), ms(4), ms(4), ms(25)]).value(), ms(5));
     }
 
-    // 何が壊れたら落ちるか: 65 本目以降に古い標本が外れること（外さないと、昔の大きい標本がいつまでも準備時間を引き上げる）。
     #[test]
     fn prep_forgets_samples_older_than_64() {
         let mut p = Prep::new(QPF);
@@ -294,7 +286,6 @@ mod tests {
         assert_eq!(p.count(), 128);
     }
 
-    // 何が壊れたら落ちるか: 並びの差し替え（重複する値・端の値を外すとき並びが壊れる）。ランダムに近い列を入れて、毎回 直近 64 本の並べ直しと一致するか。
     #[test]
     fn prep_sorted_window_matches_a_plain_sort() {
         let mut p = Prep::new(QPF);
@@ -324,7 +315,7 @@ mod tests {
         }
     }
 
-    // 何が壊れたら落ちるか: 期限の式。T_n = 基点 + floor(n × QPF ÷ fps)（Grid::at と同じ。足し算で作ると QPF が割り切れない PC でずれる）。
+    // 足し算で作ると QPF が割り切れない PC でずれる。
     #[test]
     fn deadline_is_base_plus_n_periods_from_the_grid() {
         let qpf = 3_579_545;
@@ -347,7 +338,6 @@ mod tests {
         }
     }
 
-    // 何が壊れたら落ちるか: 始まりで期限を過ぎていたら基点を今に置き直す（位相を保つ B と違う点）。置き直さず格子点を飛ばすと、次の期限が元の格子の上に載って落ちる。
     #[test]
     fn late_head_moves_the_base_to_now_not_the_grid() {
         let mut v = Vpatch::new(QPF, 60).unwrap();
@@ -362,7 +352,7 @@ mod tests {
         let late = 5_000_000 + period + 1;
         assert_eq!(v.begin(late), Begin::Rebased);
         assert_eq!(v.rebased(), 2);
-        // Present でも基点を置き直す（始まりの時刻でなく Present の時刻）。
+        // Present でも基点を取り直す（始まりの時刻でなく Present の時刻）。
         let p = late + 30_000;
         assert_eq!(v.before_present(p), None);
         let Begin::At { deadline, .. } = v.begin(p + 100) else {
@@ -373,7 +363,7 @@ mod tests {
         assert_ne!(deadline, 5_000_000 + 2 * period);
     }
 
-    // 何が壊れたら落ちるか: 始まりの置き直しがそれだけで基点を今に動かすこと（Present を待たずに次の始まりが来ても、期限は置き直した時刻から 1 周期。始まりの置き直しを外すと古い格子の過去の点になり、また置き直しになる）。
+    // Present を待たずに次の始まりが来ても、期限は取り直した時刻から 1 周期。
     #[test]
     fn head_rebase_alone_sets_the_base_to_now() {
         let mut v = Vpatch::new(QPF, 60).unwrap();
@@ -388,7 +378,6 @@ mod tests {
         assert_eq!(v.rebased(), 2, "最初の 1 回と遅れた 1 回だけ");
     }
 
-    // 何が壊れたら落ちるか: ちょうど期限の始まりは遅れではない（<= と < の取り違え）。
     #[test]
     fn head_exactly_on_deadline_is_not_late() {
         let mut v = Vpatch::new(QPF, 60).unwrap();
@@ -402,7 +391,6 @@ mod tests {
         assert_eq!(w.begin(d + 1), Begin::Rebased);
     }
 
-    // 何が壊れたら落ちるか: 準備時間の標本が「起きてから Present の直前まで」であること。起きた時刻を入れず、始まりに来た時刻を使うと待ちの長さまで入って上限に張り付く。
     #[test]
     fn prep_sample_is_wake_to_before_present() {
         let mut v = Vpatch::new(QPF, 60).unwrap();
@@ -428,7 +416,6 @@ mod tests {
         assert_eq!(v.before_present(wake_at + 1_000), Some(deadline));
     }
 
-    // 何が壊れたら落ちるか: 待ちの計画。目標の `spin` 手前まで寝る長さ。残りが spin 以下なら寝ない。
     #[test]
     fn sleep_plan_stops_one_spin_before_the_target() {
         let spin = ms(1);

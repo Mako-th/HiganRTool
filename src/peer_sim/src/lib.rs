@@ -1,24 +1,8 @@
-//! peer_sim —— 偽の対戦相手。花映塚を使わず、HiganRTool のプロトコルだけを話す。
-//!
-//! peer_sim 同士を同じ PC の loopback で繋ぎ、`higanr_core` の状態機械（接続 → 選択 → lockstep ＋ CHECK、
-//! 繋がった後の生存）が本物の UDP の上で通しで動くかを見る。
-//!
-//! - プロトコルの決まりはここに書かない。決まりは `higanr_core` にあり、受けたパケットの振り分けと呼ぶ順も
-//!   `higanr_core::link`（dll と同じセッション）。ここは道具としての決め事（時計のペース・台本の語・わざと壊す・記録・いつ終えるか）だけ。
-//! - ネットワークの範囲（`--scope`。既定 loopback = 127.0.0.0/8 と ::1）の外の宛先と受信ソケットは断る（`higanr_core::guard`）。
-//! - unsafe は使わない。
-//!
-//! 周辺の入口: 選択の台本（`--menu`）は `menu_plan`、dll の記録との突き合わせ（`--compare` / `--compare2`）は
-//! `compare` / `compare2`、ルーター外側のポートが宛先ごとに変わるかの測定（`--stun-probe`）は `stun_probe`、
-//! 本物の花映塚 2 台の間に挟む遅延・ロスの中継（`--shape`。loopback だけ）は `shape`。
-//! 観戦は、ホストの役（`--spectate-host`）が `spectate_host`、観戦者の役（`--watch`）が `watch`、
-//! 観戦者の列と対戦者の列の突き合わせ（`--compare-spectate`）が `compare_spectate`。観戦用のコードの候補の書き換え
-//! （`--rewrite-spectate-code`。観戦者の dll を中継越しに繋ぐため）は `spectate_code`。
-//!
-//! 本体は `sim::run`（台本つきは `sim::run_with_menu`）。exe（`main.rs`）は引数を読み（`cli`）、ソケットを開き、
-//! 走らせ、記録を書く（`record`）。
-//! 本体は `sim::run`（台本つきは `sim::run_with_menu`）。exe（`main.rs`）は引数を読み（`cli`）、ソケットを開き、
-//! `run_with_menu` を呼び、記録を書く（`record`）。
+//! peer_sim —— 偽の相手。花映塚を使わず、HiganRTool のプロトコルだけを話す。
+//! peer_sim 同士を同じ PC の loopback で接続し、`higanr_core` の状態機械（接続 → 選択 → lockstep ＋ CHECK、接続した後の生存）が本物の UDP の上で通しで動くかを見る。
+//! プロトコルの決まりはここに書かない（決まりは `higanr_core`、受けたパケットの振り分けと呼ぶ順は `higanr_core::link`）。ここはツールとしての決め事（時計のペース・台本の語・わざと壊す・記録・いつ終えるか）だけ。
+//! ネットワークの範囲（`--scope`。既定 loopback）の外の宛先と受信ソケットは断る（`higanr_core::guard`）。unsafe は使わない。
+//! 本体は `sim::run`（台本つきは `sim::run_with_menu`）。exe（`main.rs`）は引数を読み（`cli`）、ソケットを開き、`run_with_menu` を呼び、記録を書く（`record`）。
 
 #![forbid(unsafe_code)]
 
@@ -38,3 +22,19 @@ pub mod spectate_host;
 pub mod stun_fake;
 pub mod stun_probe;
 pub mod watch;
+
+#[cfg(test)]
+mod dev_assets_guard {
+    use std::path::Path;
+
+    /// 資料の有無は判定の関数とは別に、解析のメモのフォルダだけで見る（判定が常に偽でも通らないように）。
+    #[test]
+    fn dev_asset_checks_are_compiled_when_the_dev_files_exist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(
+            cfg!(dev_assets),
+            root.join("analysis").join("notes").is_dir(),
+            "cfg dev_assets と資料の有無が食い違う"
+        );
+    }
+}

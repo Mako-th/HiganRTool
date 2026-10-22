@@ -1,4 +1,4 @@
-//! 道具 `pacing_sum` を本物のプロセスで走らせる検査（合成の `_pacing.csv` だけ）。平文でも `.csv.gz` でも読む・
+//! ツール `pacing_sum` を本物のプロセスで走らせる検査（合成の `_pacing.csv` だけ）。平文でも `.csv.gz` でも読む・
 //! 切れた gzip は読めた所まで使って知らせる、の配線を見る。
 
 use std::io::Write;

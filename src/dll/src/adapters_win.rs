@@ -1,7 +1,7 @@
 //! ネットワークアダプターの一覧を OS から引く（Win32 の層。unsafe はここにもある。1 つずつ `// SAFETY:`）。選び方は core の `adapter_pick`。
 //!
 //! `GetAdaptersAddresses` で IPv4 のアドレスを持つアダプターを引き、アドレスごとに `Adapter` を作る。開くスレッド（`bind = auto` の解決・LAN の
-//! ホストの待ち）でだけ呼ぶ。ゲームのスレッドでは呼ばない（確保とカーネルの呼び出しがある）。
+//! ホストが相手の接続を待つ）でだけ呼ぶ。ゲームのスレッドでは呼ばない（確保とカーネルの呼び出しがある）。
 
 use std::net::Ipv4Addr;
 
@@ -20,7 +20,7 @@ use windows_sys::Win32::Networking::WinSock::{
 const START_BYTES: u32 = 16 * 1024;
 /// 引き直す回数の上限（アダプターが増えた直後の競合に備える）。
 const RETRIES: usize = 4;
-/// つながりをたどる数の上限（壊れた一覧で終わらなくならないように）。
+/// リストをたどる数の上限（壊れた一覧で終わらなくならないように）。
 const WALK_MAX: usize = 512;
 /// `Description` と `FriendlyName` を読む長さの上限（UTF-16 の単位）。
 const DESCRIPTION_MAX: usize = 256;
@@ -33,7 +33,7 @@ pub fn list() -> Result<Vec<Adapter>, String> {
         | GAA_FLAG_INCLUDE_GATEWAYS;
     let mut bytes = START_BYTES;
     for _ in 0..RETRIES {
-        // 8 バイト境界に置く（`IP_ADAPTER_ADDRESSES_LH` は u64 を含む）。
+        // 8 バイト境界に確保する（`IP_ADAPTER_ADDRESSES_LH` は u64 を含む）。
         let mut buf = vec![0u64; (bytes as usize).div_ceil(8)];
         let mut size = bytes;
         // SAFETY: `buf` は `size` バイト以上の書き込み先で、8 バイト境界。AF_INET = IPv4 だけ・予約は NULL。戻りの `size` は OS が必要な大きさを書く。
@@ -52,13 +52,13 @@ pub fn list() -> Result<Vec<Adapter>, String> {
         }
         if r != 0 {
             return Err(format!(
-                "アダプターの一覧を引けない（GetAdaptersAddresses が {r}）"
+                "アダプターの一覧を取得できません（GetAdaptersAddresses が {r}）"
             ));
         }
         // SAFETY: 成功したので、`buf` の先頭から `Next` でたどる連結リストが `buf` の中に作られている（OS が書いた。`buf` はこの関数の間生きる）。
         return Ok(unsafe { collect(buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()) });
     }
-    Err("アダプターの一覧を引けない（書き込み先の大きさが決まらない）".to_string())
+    Err("アダプターの一覧を取得できません（書き込み先の大きさが決まりません）".to_string())
 }
 
 /// 連結リスト全体をたどって `Adapter` にする。
@@ -152,7 +152,7 @@ unsafe fn ipv4_of(s: &SOCKET_ADDRESS) -> Option<Ipv4Addr> {
     {
         return None;
     }
-    // SAFETY: NULL でなく、`SOCKADDR_IN` 以上の長さがある（上で確かめた）。ファミリーは先頭の 2 バイトで、`SOCKADDR` から読める。
+    // SAFETY: NULL でなく、`SOCKADDR_IN` 以上の長さがある（上でチェックした）。ファミリーは先頭の 2 バイトで、`SOCKADDR` から読める。
     let family = unsafe { (*s.lpSockaddr.cast_const()).sa_family };
     if family != AF_INET {
         return None;
@@ -188,8 +188,7 @@ unsafe fn read_wide(p: *const u16) -> String {
 mod tests {
     use super::*;
 
-    /// 壊れたら落ちる: 本物の OS の一覧を引けない・空で返る（どの Windows にも loopback の 127.0.0.1 がある）・引いた項目が IPv4 の
-    /// ユニキャストでない・loopback が仮想と判定されない。値は PC ごとに違うので、形（引けること・loopback の扱い）だけ見る。
+    /// 値は PC ごとに違うので、形（引けること・loopback の扱い）だけ見る。
     #[test]
     fn the_os_list_comes_back_with_ipv4_entries_and_loopback_counts_as_virtual() {
         let list = list().expect("OS の一覧が引ける");

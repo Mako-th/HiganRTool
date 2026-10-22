@@ -1,13 +1,9 @@
-//! ネットの選択の組み上がりの検査（pure）: 選択の画面を持つ偽のゲーム 2 つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク（`FakeNet`）で繋ぎ、
-//! 両者が同じ画面を同じ順に通って、同じ値でマッチに入るかを見る。
+//! ネットの選択の組み上がりの検査（pure）: 選択の画面を持つ偽のゲーム 2 つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク（`FakeNet`）で接続し、両者が同じ画面を同じ順に通って、同じ値でマッチに入るかを見る。
 //!
-//! 偽のゲーム `MenuGame` は、ゲームの決まり（選択の 3 画面の表）を `netplay.rs` / `net_select.rs` /
-//! `menu_model.rs` とは別に転記したもの: feed された 3 本の押した瞬間を読み、substate 0 の間（入る演出）は押下を読まず、難易度 7・キャラ 8・
-//! マップ 16 の画面を移る。読まれなかった画面を移る押下は数える（押下を入れる tick を dll が誤ると、ここが 0 でなくなる）。
+//! 偽のゲーム `MenuGame` は、ゲームの決まり（選択の 3 画面の表）を `netplay.rs` / `net_select.rs` / `menu_model.rs` とは別に転記したもの: feed された 3 本の押した瞬間を読み、substate 0 の間（入る演出）は押下を読まず、難易度 7・キャラ 8・マップ 16 の画面を移る。読まれなかった画面を移る押下は数える（押下を入れる tick を dll が誤ると、ここが 0 でなくなる）。
 //!
-//! 台本の無いネットワーク実行: `MenuGame` の台本（`Act` の列）は dll の台本ではなく人の手の語の列の真似で、`Game::local_input`（本物ではローカル入力。
-//! 素の poll `0x0042B850` の席 0、照合が合わなければ `0x0042BE40`）から入る。押し続け（`hold` > 1）は画面が移っても押したまま、
-//! マッチの中の語は `match_words`、再戦は `rematches`、CHECK のゲームの値は `load_draws`（frame 0 の抽選回数だけが両者で違う形）で作る。
+//! 台本の無いネットワーク実行: `MenuGame` の台本（`Act` の列）は dll の台本ではなく人の手の語の列の真似で、`Game::local_input`（本物ではローカル入力。素の poll `0x0042B850` の席 0、照合が合わなければ `0x0042BE40`）から入る。
+//! 押し続け（`hold` > 1）は画面が移っても押したまま、マッチの中の語は `match_words`、再戦は `rematches`、CHECK のゲームの値は `load_draws`（frame 0 の抽選回数だけが両者で違う形）で作る。
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -185,9 +181,9 @@ pub struct MenuGame {
     pub demos: u32,
     /// デモの要求からデモの終わりまでで、判断が `Local` 以外を返した tick（ネットワークが触った）。
     pub demo_not_local: u32,
-    /// デモの要求を書いた tick のネットワークの段階（`Selecting` なら繋がった後にデモが来た —— 直す前に止まった期間）。
+    /// デモの要求を書いた tick のネットワークの段階（`Selecting` なら接続した後にデモが来た —— 直す前に止まった期間）。
     pub demo_req_phase: Option<super::Phase>,
-    // ---- 繋がる前の決定 ----
+    // ---- 接続する前の決定 ----
     /// `Some((画面, 語, 周期))`: その画面にいる間、台本とは別に `周期` tick ごとに語を押す（人が決定を叩き続ける形。押した
     /// 画面が移れば止まり、台本の続きが動く）。
     pub spam: Option<(u32, u16, u32)>,
@@ -221,13 +217,13 @@ pub struct MenuGame {
     pub changes: Vec<(u32, u32, u32, [u32; 2])>,
     last_view: (u32, u32, [u32; 2]),
     // ---- 観戦者の観測 ----
-    /// `Game::local_input` が呼ばれた回数（観戦者は繋がった後に読まない —— 自分の入力が届かない証拠）。
+    /// `Game::local_input` が呼ばれた回数（観戦者は接続した後に読まない —— 自分の入力が届かない証拠）。
     pub local_input_calls: u32,
     /// `Game::peek_local_input`（観戦者の Esc の読み）が呼ばれた回数。
     pub peek_calls: u32,
     /// 人が押す語（`Press`）。
     pub presses: Vec<Press>,
-    /// dll の台本の語（`Press` の形で書く。空なら台本は無い）。台本は繋がっている間も 1 tick に 1 回進む（`peek_local_input` が進める）。
+    /// dll の台本の語（`Press` の形で書く。空なら台本は無い）。台本は接続している間も 1 tick に 1 回進む（`peek_local_input` が進める）。
     /// 読みに足されるのは台本の語の ESC だけで、`Action::Local` を返した tick の feed は台本の語を全部入れる。
     pub script_presses: Vec<Press>,
     /// 台本を進めた回数（`peek_local_input` は呼ぶたびに進める。`local_input` と `Local` の feed は、その tick にもう進めていれば進めない）。
@@ -362,7 +358,7 @@ impl MenuGame {
             digit_held: None,
             scripted: false,
         };
-        // 画面 6（人対人を選ぶ画面）から始める。台本が 6 で決めて 7 へ入る（繋がった後に選択の画面へ入る形）。
+        // 画面 6（人対人を選ぶ画面）から始める。台本が 6 で決めて 7 へ入る（接続した後に選択の画面へ入る形）。
         g.set_screen(6, true);
         g
     }
@@ -1001,7 +997,7 @@ impl Game for MenuGame {
         cursor: u32,
         locked: Locked,
     ) -> Followed {
-        /// 署名・MainMenu・部品の門を開けた偽物（それらは本物の窓の検査 `net_game.rs` が見る）。解放はこの台の表。
+        /// 署名・MainMenu・部品の門を開けた偽物（それらは本物のウィンドウの検査 `net_game.rs` が見る）。解放はこの台の表。
         struct Open([bool; 16]);
         impl PortraitEnv for Open {
             fn unlocked(&mut self, chara: u8) -> bool {
@@ -1080,10 +1076,30 @@ pub(super) fn run_with_ring(
     run_with_rings(a, b, delay_us, drop_a, drop_b, ticks, (ring, None), false)
 }
 
-/// `run_with_ring` の、両者にリングバッファを付けられる形。`host_only` が真なら、ゲーム内のメニューの経路と同じ `NetPlay::set_spectate_for_host` で置く。
-// 検査の道具。引数を束ねる型を足しても読み手は増えない。
+/// `run_with_ring` の、両者にリングバッファを付けられる形。`host_only` が真なら、ゲーム内のメニューの経路と同じ `NetPlay::set_spectate_for_host` で設定する。
+// 検査のツール。引数を束ねる型を足しても読み手は増えない。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_with_rings(
+    a: MenuGame,
+    b: MenuGame,
+    delay_us: u64,
+    drop_a: u32,
+    drop_b: u32,
+    ticks: u32,
+    rings: (
+        Option<std::sync::Arc<crate::spectate_ring::SpectateRing>>,
+        Option<std::sync::Arc<crate::spectate_ring::SpectateRing>>,
+    ),
+    host_only: bool,
+) -> Run {
+    run_with_rings_as(
+        a, b, delay_us, drop_a, drop_b, ticks, rings, host_only, true,
+    )
+}
+
+/// `run_with_rings` の、両者が HELLO で名乗る観戦の許可を `listable` にする形（`host_only` のときだけ名乗る）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_with_rings_as(
     mut a: MenuGame,
     mut b: MenuGame,
     delay_us: u64,
@@ -1095,6 +1111,7 @@ pub(super) fn run_with_rings(
         Option<std::sync::Arc<crate::spectate_ring::SpectateRing>>,
     ),
     host_only: bool,
+    listable: bool,
 ) -> Run {
     let ring = rings.0;
     let (mut na, mut nb, clock) = FakeNet::pair(addr(1), addr(2), delay_us);
@@ -1115,6 +1132,11 @@ pub(super) fn run_with_rings(
         }
     }
     let mut npb = NetPlay::new(link_cfg(1, 1), cfg, &mut nb);
+    if host_only {
+        // ゲーム内のメニューの経路と同じく、HELLO で観戦の許可を名乗る。
+        npa.link.set_listable(listable);
+        npb.link.set_listable(listable);
+    }
     if let Some(r) = rings.1 {
         if host_only {
             npb.set_spectate_for_host(r);
@@ -1648,7 +1670,7 @@ fn a_title_demo_is_left_alone_and_the_net_match_still_works() {
             }
             for (who, g, np, demo) in [("A", &a, &npa, demo_a), ("B", &b, &npb, demo_b)] {
                 if demo.is_some() {
-                    // 効く期間: 繋がった後（選択の段階）にデモが来た。直す前はここで止まった。
+                    // 効く期間: 接続した後（選択の段階）にデモが来た。直す前はここで止まった。
                     assert_eq!(
                         g.demo_req_phase,
                         Some(Phase::Selecting),
@@ -1719,7 +1741,7 @@ fn a_title_demo_is_left_alone_and_the_net_match_still_works() {
     assert_eq!(runs, 9);
 }
 
-// ---- 繋がる前の選択の画面 ----
+// ---- 接続する前の選択の画面 ----
 
 struct Alone {
     g: MenuGame,
@@ -1804,11 +1826,11 @@ fn dropped_decides_reach_the_log_line() {
     let st = NetStatus::new();
     st.publish(&t.np, false);
     let line = st.menu_text();
-    assert!(line.contains("繋がる前に落とした決定 1 回"), "{line}");
+    assert!(line.contains("接続前に落とした決定 1 回"), "{line}");
     let fresh = Alone::new(7, Vec::new());
     let st = NetStatus::new();
     st.publish(&fresh.np, false);
-    assert!(st.menu_text().contains("繋がる前に落とした決定 0 回"));
+    assert!(st.menu_text().contains("接続前に落とした決定 0 回"));
 }
 
 #[test]
@@ -1970,7 +1992,7 @@ fn a_host_that_mashes_decide_before_the_link_does_not_run_ahead() {
         let mut npa = NetPlay::new(link_cfg(2, 0xF000), cfg, &mut na);
         let mut npb = NetPlay::new(link_cfg(1, 1), cfg, &mut nb);
         let ctx = format!("片道 {delay_ms} ms");
-        // B が動き出す tick（それまで A は繋がらない。A は tick 31 で 7 へ入る）。
+        // B が動き出す tick（それまで A は接続できない。A は tick 31 で 7 へ入る）。
         const B_STARTS: u32 = 120;
         let mut slot = clock.get();
         let mut done = false;
@@ -2343,9 +2365,6 @@ fn unlock_duo(delay_ms: u64, drop_a: u32, drop_b: u32) -> Duo {
     Duo::new(a, b, delay_ms, drop_a, drop_b)
 }
 
-/// 壊れたら落ちる: 相手の席を相手の語で動かす（未解放の飛ばしとランダムの乱数が両者で違い、相手の席が相手の位置からずれる）・位置を書かない
-/// tick がある・相手が取ったことの無い位置を見せる・キャラ選択で合わせを出す・カーソルの音を鳴らさない・ランダムでも鳴らす・
-/// 未解放のキャラの上で立ち絵を追わせない。
 #[test]
 fn the_peer_seat_follows_the_peers_own_cursor_with_different_unlocks_and_the_random() {
     let (mut checked_total, mut on_locked_total, mut random_writes) = (0u32, 0u32, 0u32);
@@ -3202,4 +3221,46 @@ fn a_quiet_peer_on_the_chara_screen_brings_the_notice_before_the_silence_limit()
         d.npa.end()
     );
     assert!(!d.npa.peer_wait_shown());
+}
+
+/// 接続した行の材料の `watch_off` は、自分が観戦を許可し相手が許可していないときだけ立つ。`may_list` は両者で同じ値になる。
+#[test]
+fn only_a_player_whose_opponent_refuses_watching_gets_watch_off() {
+    use std::sync::Arc;
+    for (wish_a, wish_b) in [(true, true), (true, false), (false, true), (false, false)] {
+        let tag = format!("A {wish_a}・B {wish_b}");
+        let (mut na, mut nb, clock) = FakeNet::pair(addr(1), addr(2), 5_000);
+        let cfg = Config::default();
+        let (sa, sb) = (
+            Arc::new(super::LinkSlot::new()),
+            Arc::new(super::LinkSlot::new()),
+        );
+        let mut npa = NetPlay::with_code_slot(sa.clone(), cfg, &mut na);
+        let mut npb = NetPlay::with_code_slot(sb.clone(), cfg, &mut nb);
+        sa.set_list_wish(wish_a);
+        sb.set_list_wish(wish_b);
+        sa.offer(link_cfg(2, 0xF000));
+        sb.offer(link_cfg(1, 1));
+        // 接続した行を最初に出す tick から正しい値か（1 tick でも今までの案内を出さない）。
+        let off = |np: &NetPlay| match np.ui_conn(0).0 {
+            higanr_core::net_menu::Conn::Connected { watch_off, .. } => Some(watch_off),
+            _ => None,
+        };
+        let (mut first_a, mut first_b) = (None, None);
+        for _ in 0..2_000 {
+            clock.set(clock.get() + FRAME_US / 2);
+            npa.tend(&mut na);
+            first_a = first_a.or(off(&npa));
+            npb.tend(&mut nb);
+            first_b = first_b.or(off(&npb));
+            if first_a.is_some() && first_b.is_some() {
+                break;
+            }
+        }
+        assert!(sa.is_connected() && sb.is_connected(), "{tag}: 繋がらない");
+        assert_eq!(first_a, Some(wish_a && !wish_b), "{tag}: A");
+        assert_eq!(first_b, Some(wish_b && !wish_a), "{tag}: B");
+        let both = Some(wish_a && wish_b);
+        assert_eq!((sa.may_list(), sb.may_list()), (both, both), "{tag}");
+    }
 }

@@ -2,7 +2,7 @@
 //!
 //! 更新は利用者の設定を守るため ini を置き換えない（配布の更新の置き場に ini を入れない）ので、更新の置き場のコピーだけを渡された
 //! 環境では ini が無く、ネットワークなしで走ってしまう。書くのは起動のときの 1 回だけ（読み取りのスレッド。ゲームのスレッドの経路には入らない）。
-//! 既にある ini は読みも書きもしない。書けなければ、埋めた中身を読み手へ返して動かす（`fallback`）。
+//! 既にある ini は読みも書きもしない。書けなければ、埋めた中身を ini を読む処理へ返して動かす（`fallback`）。
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use crate::net_config::Located;
 
-/// 書き出す中身（配る ini の原本と同じ。ローダーが先に作るときと同じ中身にするため core に置く）。
+/// 書き出す中身（配る ini の原本と同じ。ローダーが先に作るときと同じ中身にするため core にある）。
 pub fn dist_ini_text() -> String {
     higanr_core::ini_store::dist_ini_text()
 }
@@ -39,16 +39,16 @@ impl Seed {
         match self {
             Seed::Skipped | Seed::Present => None,
             Seed::Written => {
-                Some("ini: HiganRTool.ini が無かったので配布用の既定を書き出した".to_string())
+                Some("ini: HiganRTool.ini がありません。配布時の既定で書き出しました。".to_string())
             }
             Seed::Failed(why) => Some(format!(
-                "ini: HiganRTool.ini が無く、配布用の既定を書き出せなかった（{why}）。埋めた既定の中身で走る"
+                "ini: HiganRTool.ini が無く、配布時の既定を書き出せませんでした（{why}）。既定の設定で実行します。"
             )),
         }
     }
 }
 
-/// ini が無く、書き出せなかったときに読み手へ返す中身。
+/// ini が無く、書き出せなかったときに ini を読む処理へ返す中身。
 static FALLBACK: OnceLock<String> = OnceLock::new();
 
 pub fn fallback() -> Option<&'static str> {
@@ -65,7 +65,7 @@ pub fn seed_process(loc: &Located, default: Option<&str>) -> Seed {
 }
 
 /// `default` があり、ローダーが ini を渡しておらず（渡された ini が無いのは渡し方の誤り）、置き場に ini が無いときだけ書く。
-/// 一時ファイルへ書いてから「あれば移さない」移し方で置くので、同時に起きた別の起動に半端な中身を読ませず、先にあった ini も潰さない。
+/// 一時ファイルへ書いてから「あれば移さない」移し方で書き込むので、同時に起きた別の起動に半端な中身を読ませず、先にあった ini も潰さない。
 pub fn seed(loc: &Located, default: Option<&str>) -> Seed {
     let Some(text) = default else {
         return Seed::Skipped;
@@ -76,7 +76,12 @@ pub fn seed(loc: &Located, default: Option<&str>) -> Seed {
     match loc.path.try_exists() {
         Ok(true) => return Seed::Present,
         Ok(false) => {}
-        Err(e) => return Seed::Failed(format!("{} を確かめられない: {e}", loc.path.display())),
+        Err(e) => {
+            return Seed::Failed(format!(
+                "{} の存在をチェックできません: {e}",
+                loc.path.display()
+            ));
+        }
     }
     let tmp = temp_path(&loc.path);
     let wrote = std::fs::OpenOptions::new()
@@ -84,7 +89,7 @@ pub fn seed(loc: &Located, default: Option<&str>) -> Seed {
         .create_new(true)
         .open(&tmp)
         .and_then(|mut f| f.write_all(text.as_bytes()))
-        .map_err(|e| format!("{} を書けない: {e}", tmp.display()));
+        .map_err(|e| format!("{} 書き込み不能: {e}", tmp.display()));
     if let Err(why) = wrote {
         let _ = std::fs::remove_file(&tmp);
         return Seed::Failed(why);
@@ -93,10 +98,10 @@ pub fn seed(loc: &Located, default: Option<&str>) -> Seed {
     let _ = std::fs::remove_file(&tmp);
     match moved {
         Ok(()) => Seed::Written,
-        // 移す間に別の起動が置いたなら、それが正。
+        // 移す間に別の起動が書いたなら、それが正。
         Err(_) if loc.path.exists() => Seed::Present,
         Err(code) => Seed::Failed(format!(
-            "{} へ置けない（GetLastError = {code}）",
+            "{} へ移動不能（GetLastError = {code}）",
             loc.path.display()
         )),
     }
@@ -190,7 +195,7 @@ mod tests {
             .unwrap();
         let s = crate::net_config::from_text(&read).unwrap();
         assert!(s.is_some(), "書き出した ini でネットワークが開かない");
-        assert!(Seed::Written.log_line().unwrap().contains("書き出した"));
+        assert!(Seed::Written.log_line().unwrap().contains("書き出しました"));
     }
 
     #[test]
@@ -207,7 +212,7 @@ mod tests {
 
     #[test]
     fn a_race_lost_after_the_check_does_not_replace() {
-        // 確かめた後に別の起動が置いた ini を、移し方が潰さない。
+        // チェックした後に別の起動が書いた ini を、移し方が潰さない。
         let t = Tmp::new("race");
         let tmp = temp_path(&t.loc().path);
         std::fs::write(&tmp, "既定").unwrap();
@@ -247,7 +252,7 @@ mod tests {
         let Seed::Failed(why) = &r else {
             panic!("{r:?}");
         };
-        assert!(why.contains("書けない"), "{why}");
+        assert!(why.contains("書き込み不能"), "{why}");
         assert!(r.log_line().unwrap().contains(why.as_str()));
         assert_eq!(crate::script_win::read_ini_at(&loc, None), Ok(None));
         let read = crate::script_win::read_ini_at(&loc, Some(&text)).unwrap();

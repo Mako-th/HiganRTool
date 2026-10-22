@@ -106,7 +106,7 @@ pub const INV_P1: u8 = 1;
 pub const INV_P2: u8 = 2;
 
 /// `life1=` / `life2=` の範囲。ゲームが初期ライフに選べる 1〜10（DLL の `th09_addr::LIFE_MIN` / `LIFE_MAX`）。
-/// 0 は断る: ゲームがライフを 0 にするのは負けの処理（`0x0041E5CE`）の中だけで、通さずに 0 を置くとラウンドの終わりが呼ばれない恐れがある。
+/// 0 は断る: ゲームがライフを 0 にするのは負けの処理（`0x0041E5CE`）の中だけで、通さずに 0 にするとラウンドの終わりが呼ばれない恐れがある。
 pub const LIFE_SET_MIN: u32 = 1;
 pub const LIFE_SET_MAX: u32 = 10;
 /// `gauge1=` / `gauge2=` の上限。ゲーム自身が溜めるときの頭打ち 400.0（`0x0041BCF6 movl $0x43c80000`。DLL の `th09_addr::GAUGE_MAX`）。
@@ -186,7 +186,7 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}行目: {}", self.line, self.msg)
+        write!(f, "{} 行目: {}", self.line, self.msg)
     }
 }
 
@@ -215,11 +215,11 @@ impl<'a> Fields<'a> {
         for tok in tokens {
             let eq = tok
                 .find('=')
-                .ok_or_else(|| err(line, format!("`=` が無い欄です: {tok}")))?;
+                .ok_or_else(|| err(line, format!("`=` がない欄です: {tok}")))?;
             let name = &tok[..eq];
             let value = &tok[eq + 1..];
             if map.insert(name, value).is_some() {
-                return Err(err(line, format!("{name} を 2 回書いています")));
+                return Err(err(line, format!("{name} が重複しています")));
             }
         }
         Ok(Self { map })
@@ -247,7 +247,7 @@ fn get_opt_u32(fields: &Fields, line: u32, name: &str) -> Result<Option<u32>, Pa
         None => Ok(None),
         Some(v) => parse_u32(v)
             .map(Some)
-            .ok_or_else(|| err(line, format!("{name} の値が数として読めない: {v}"))),
+            .ok_or_else(|| err(line, format!("{name} の値が数値として読み取り不能: {v}"))),
     }
 }
 
@@ -256,7 +256,7 @@ fn get_opt_bool01(fields: &Fields, line: u32, name: &str) -> Result<Option<bool>
         None => Ok(None),
         Some("0") => Ok(Some(false)),
         Some("1") => Ok(Some(true)),
-        Some(v) => Err(err(line, format!("{name} は 0 か 1 だけ: {v}"))),
+        Some(v) => Err(err(line, format!("{name} は 0 か 1 だけです: {v}"))),
     }
 }
 
@@ -270,14 +270,13 @@ fn get_u32_ranged(
 ) -> Result<u32, ParseError> {
     let v = match fields.get(name) {
         None => default,
-        Some(s) => {
-            parse_u32(s).ok_or_else(|| err(line, format!("{name} の値が数として読めない: {s}")))?
-        }
+        Some(s) => parse_u32(s)
+            .ok_or_else(|| err(line, format!("{name} の値が数値として読み取り不能: {s}")))?,
     };
     if v < min || v > max {
         return Err(err(
             line,
-            format!("{name} の値が範囲の外（{min}〜{max}）: {v}"),
+            format!("{name} の値が範囲外です（{min}〜{max}）: {v}"),
         ));
     }
     Ok(v)
@@ -299,19 +298,19 @@ pub fn key_by_name(name: &str) -> Option<u16> {
     }
 }
 
-/// `p1=`/`p2=`: `0x` の 16 進、またはキー名を `+` でつないだもの。`MATCH_SEND_MASK` の外のビットが立てば誤り。
+/// `p1=`/`p2=`: `0x` の 16 進、またはキー名を `+` で連結したもの。`MATCH_SEND_MASK` の外のビットが立てば誤り。
 fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
     let Some(v) = fields.get(name) else {
         return Ok(0);
     };
     let value = if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
         u16::from_str_radix(hex, 16)
-            .map_err(|_| err(line, format!("{name} の値が 16 進として読めない: {v}")))?
+            .map_err(|_| err(line, format!("{name} の値が 16 進として読み取り不能: {v}")))?
     } else {
         let mut acc: u16 = 0;
         for part in v.split('+') {
             let bit = key_by_name(part)
-                .ok_or_else(|| err(line, format!("{name} に知らないキー名があります: {part}")))?;
+                .ok_or_else(|| err(line, format!("{name} に不明なキー名があります: {part}")))?;
             acc |= bit;
         }
         acc
@@ -319,7 +318,7 @@ fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
     if value & !MATCH_SEND_MASK != 0 {
         return Err(err(
             line,
-            format!("{name} が MATCH_SEND_MASK（{MATCH_SEND_MASK:#06x}）の外です: {v}"),
+            format!("{name} が MATCH_SEND_MASK（{MATCH_SEND_MASK:#06x}）の範囲外です: {v}"),
         ));
     }
     Ok(value)
@@ -344,7 +343,7 @@ fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseE
             _ => {
                 return Err(err(
                     line,
-                    format!("digit は 0〜9 の 1 桁だけ（0〜8 が遅れの値・9 が auto）: {v}"),
+                    format!("digit は 0〜9 の 1 桁だけです（0〜8 が遅れの値・9 が auto）: {v}"),
                 ));
             }
         }
@@ -352,12 +351,12 @@ fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseE
     match fields.get("tab") {
         None => {}
         Some("1") => k.tab = true,
-        Some(v) => return Err(err(line, format!("tab は 1 だけ: {v}"))),
+        Some(v) => return Err(err(line, format!("tab は 1 だけです: {v}"))),
     }
     match fields.get("copy") {
         None => {}
         Some("1") => k.copy = true,
-        Some(v) => return Err(err(line, format!("copy は 1 だけ: {v}"))),
+        Some(v) => return Err(err(line, format!("copy は 1 だけです: {v}"))),
     }
     Ok(Some(k))
 }
@@ -374,13 +373,13 @@ fn get_typed(fields: &Fields, line: u32) -> Result<Option<Typed>, ParseError> {
         if !(1..=TYPED_TEXT_MAX).contains(&n) {
             return Err(err(
                 line,
-                format!("type の長さが範囲の外（1〜{TYPED_TEXT_MAX} 文字）: {n}"),
+                format!("type の長さが範囲外です（1〜{TYPED_TEXT_MAX} 文字）: {n}"),
             ));
         }
         if let Some(bad) = v.chars().find(|&c| !crate::room::RoomName::accepts_char(c)) {
             return Err(err(
                 line,
-                format!("type に入力が受けない文字があります（英数字と - _ だけ）: {bad:?}"),
+                format!("type に入力できない文字があります（英数字と - _ だけ）: {bad:?}"),
             ));
         }
         for (d, s) in t.text.iter_mut().zip(v.bytes()) {
@@ -394,7 +393,7 @@ fn get_typed(fields: &Fields, line: u32) -> Result<Option<Typed>, ParseError> {
     match fields.get("enter") {
         None => {}
         Some("1") => t.enter = true,
-        Some(v) => return Err(err(line, format!("enter は 1 だけ: {v}"))),
+        Some(v) => return Err(err(line, format!("enter は 1 だけです: {v}"))),
     }
     Ok(Some(t))
 }
@@ -448,12 +447,12 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
     if fields.contains("settle") {
         return Err(err(
             line,
-            "settle はほかの欄と同じ行に書けない（全体の設定は settle だけの行にする）",
+            "settle はほかの欄と同じ行に書けません（全体の設定は settle だけの行にしてください）",
         ));
     }
     for name in fields.map.keys() {
         if !KNOWN_STEP_FIELDS.contains(name) {
-            return Err(err(line, format!("知らない名前です: {name}")));
+            return Err(err(line, format!("不明な名前です: {name}")));
         }
     }
 
@@ -477,7 +476,7 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
     let has_keys = p1 != 0 || p2 != 0;
 
     if fields.contains("hold") && !has_keys {
-        return Err(err(line, "p1 も p2 も無い行に hold は書けない"));
+        return Err(err(line, "p1 も p2 もない行に hold は書けません"));
     }
 
     let wait = get_u32_ranged(&fields, line, "wait", DEFAULT_WAIT, 1, MAX_TICK)?;
@@ -493,7 +492,7 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
         "post" => (false, true),
         "both" => (true, true),
         "none" => (false, false),
-        other => return Err(err(line, format!("shot の値が知らないものです: {other}"))),
+        other => return Err(err(line, format!("shot の値が不明です: {other}"))),
     };
 
     let note = match fields.get("note") {
@@ -503,7 +502,7 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
             if !(1..=64).contains(&len) {
                 return Err(err(
                     line,
-                    format!("note の長さが範囲の外（1〜64 バイト）: {len}"),
+                    format!("note の長さが範囲外です（1〜64 バイト）: {len}"),
                 ));
             }
             v.to_string()
@@ -552,10 +551,14 @@ pub fn parse(text: &str) -> Result<Script, ParseError> {
 
         if tokens.len() == 1 && tokens[0].starts_with("settle=") {
             let value = &tokens[0]["settle=".len()..];
-            let v = parse_u32(value)
-                .ok_or_else(|| err(line, format!("settle の値が数として読めない: {value}")))?;
+            let v = parse_u32(value).ok_or_else(|| {
+                err(
+                    line,
+                    format!("settle の値が数値として読み取り不能: {value}"),
+                )
+            })?;
             if settle.is_some() {
-                return Err(err(line, "settle を 2 回書いています"));
+                return Err(err(line, "settle が重複しています"));
             }
             settle = Some(v);
             continue;
@@ -571,7 +574,7 @@ pub fn parse(text: &str) -> Result<Script, ParseError> {
     if steps.is_empty() {
         return Err(ParseError {
             line: 0,
-            msg: "台本に段が 1 つも無い".to_string(),
+            msg: "台本に段が 1 つもありません".to_string(),
         });
     }
 
@@ -1667,7 +1670,6 @@ mod tests {
         assert_eq!(eng.take_keys(), None, "台本が終わった後に出た");
     }
 
-    /// 壊れたら落ちる: `copy=1` が読めない・数字や Tab と同じ段で一緒に取れない・段が効き始める前に出る・2 回取れる・`copy=0` を通す。
     #[test]
     fn copy_field_parses_and_is_taken_once_with_the_other_keys() {
         let s = parse("scene=1 wait=2 copy=1\nscene=1 wait=1 digit=3 copy=1\nscene=1 wait=1\n")
@@ -1700,6 +1702,6 @@ mod tests {
         assert_eq!(eng.take_keys(), None, "2 回取り出せた");
     }
 
-    // `Engine::step` が確保しないことの検査は `src/core/tests/alloc_check.rs` に置く。割り当てを数えるには `unsafe impl GlobalAlloc`
-    // が要るが、このクレートは `forbid(unsafe_code)` で、integration test は別クレートなので置ける。
+    // `Engine::step` が確保しないことの検査は `src/core/tests/alloc_check.rs` にある。割り当てを数えるには `unsafe impl GlobalAlloc`
+    // が要るが、このクレートは `forbid(unsafe_code)` で、integration test は別クレートなので書ける。
 }

@@ -1,4 +1,4 @@
-//! 道具 `replay_mark_cmp` を本物のプロセスで走らせる検査（合成のリプレイと合成の印だけ）。
+//! ツール `replay_mark_cmp` を本物のプロセスで走らせる検査（合成のリプレイと合成の印だけ）。
 //! 「引数 → フォルダをたどる → 印を読む → 並べる → 終了コード」の配線を見る。比べ方そのものは `replay_mark_cmp` の単体検査。
 
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ fn replay_bytes_with(
     f
 }
 
-/// 台のフォルダに「相手の名前のフォルダ」を 1 段挟んで、マッチごとのリプレイを置く（保管庫と同じ形）。
+/// 台のフォルダに「相手の名前のフォルダ」を 1 段挟んで、マッチごとのリプレイを書き出す（保管庫と同じ形）。
 fn put(dir: &Path, n: usize, bytes: &[u8]) {
     let sub = dir.join("x vs y");
     std::fs::create_dir_all(&sub).unwrap();

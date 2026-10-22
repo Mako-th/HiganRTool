@@ -1,14 +1,7 @@
-//! コマンドラインの読み取り（pure）。
-//!
-//! ```text
-//! HiganRTool.exe [--choose-game] [--dll <DLL のパス>]
-//! HiganRTool.exe --game <th09.exe のパス> [--dll <DLL のパス>] [--ini <ini のパス>] [--script <台本のパス>]
-//! HiganRTool.exe --selftest [--dll <DLL のパス>]    （feature `dist` なしのビルドだけ）
-//! ```
-//!
+//! コマンドラインの読み取り（pure）。使い方の全文は `USAGE`。
 //! `--game` なしは覚えた th09.exe の場所を使い、無い・使えないときだけウィンドウで選ばせる（`--choose-game` なら常にウィンドウ）。
 //! `--ini` / `--script` は DLL が読む場所を環境変数で子へ渡す（同じ PC の 2 つのゲームに別々のポートと台本を持たせる）。
-//! `--selftest-target` は自己検査の内部の入口。自己検査は配るビルド（feature `dist`）には入れない。
+//! 自己検査（`--selftest`・`--selftest-target`）は配るビルド（feature `dist`）には入れない。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -58,7 +51,7 @@ macro_rules! selftest_usage_ja {
     () => {
         "
   HiganRTool.exe --selftest [--dll <DLL のパス>]
-      花映塚は起動しない。この exe 自身をターゲットにして、起動と読み込みの経路を確かめる。"
+      花映塚は起動しない。この exe 自身をターゲットにして、起動と読み込みの経路をチェックする。"
     };
 }
 #[cfg(feature = "dist")]
@@ -100,7 +93,7 @@ pub const USAGE: Tx = Tx {
       --no-clipboardは、接続コードをウィンドウに出すだけでクリップボードへコピーしない（開発で2台を起こすとき、自分の
       クリップボードを書き換えないため。付けなければコピーする）。
       --chooseの後の0〜8かdelayは、接続コードのウィンドウが開いた直後に、その文字を打ったのと同じ経路で同期方式を選ぶ
-      （開発の実機の回用。人はウィンドウに打つ）。
+      （開発の実機の検証用。人はウィンドウに打つ）。
       --backgroundは、起こした花映塚のウィンドウを前面に出さない（作業中のウィンドウから入力を奪わない。台本なしの開発の起動用。
       --scriptを付けた起動は、付けなくても同じ。付けない普通の起動は今までどおり前面に出る）。",
         selftest_usage_ja!()
@@ -301,7 +294,7 @@ fn only_one_of(lang: Lang) -> String {
     .to_string()
 }
 
-/// 起こしたウィンドウを前面にしないか。`--script` か `--background` ならしない。台本の無い普通の起動は前面に出す。
+/// 起動したウィンドウを前面にしないか。`--script` か `--background` ならしない。台本の無い普通の起動は前面に出す。
 pub fn launches_in_background(background: bool, script: Option<&PathBuf>) -> bool {
     background || script.is_some()
 }
@@ -554,8 +547,6 @@ mod tests {
         assert!(USAGE.ja.contains("--choose-game"));
     }
 
-    // 何が壊れたら落ちるか: 使い方の連結（`concat!`）が崩れて本体の説明が欠ける・消える、
-    // または自己検査の行が dist の有無と逆に出る。
     #[test]
     fn usage_lists_selftest_only_without_dist() {
         for t in [USAGE.ja, USAGE.en] {
@@ -565,7 +556,6 @@ mod tests {
         }
     }
 
-    // 何が壊れたら落ちるか: 配るビルドで自己検査の引数が受け付けられる・内部の入口が残る。
     // `dist` の有無は cfg なので、この検査が見るのは今のビルドの側だけ（dist なしでは「受け付ける」側）。
     #[test]
     fn selftest_arguments_exist_only_without_dist() {

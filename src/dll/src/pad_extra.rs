@@ -1,16 +1,11 @@
 //! パッドの十字キー（POV ハット）を方向のビットに足す判断と設置の手順（pure。unsafe 無し）。
 //!
-//! 花映塚はパッド 1 台を読む関数 `0x0042B410` で lX・lY（winmm は X・Y）しか読まず、十字キーが POV で報告されるパッドでは
-//! 方向が立たない。そこで、その関数への 4 つの呼び出しの rel32 を自前の入口（`pad_extra_win::pad_entry`）へ向け、入口は
-//! 元の関数を同じ引数で呼んだ後で、`finish` が POV から作った方向を戻り値に OR する。ここは「戻り値にどう足すか」
-//! （`finish`。デバイスは `PadIo` の向こう）と「6 行を照合して 4 つの rel32 を書く」（`install`。書く手順は
-//! `hook::install_call_hook_at`）。ゲームのメモリ・Win32・COM の呼び出しは `pad_extra_win.rs`。
+//! 花映塚はパッド 1 台を読む関数 `0x0042B410` で lX・lY（winmm は X・Y）しか読まず、十字キーが POV で報告されるパッドでは方向が立たない。
+//! そこで、その関数への 4 つの呼び出しの rel32 を自前の入口（`pad_extra_win::pad_entry`）へ向け、入口は元の関数を同じ引数で呼んだ後で、`finish` が POV から作った方向を戻り値に OR する。
+//! ここは「戻り値にどう足すか」（`finish`）と「6 行を照合して 4 つの rel32 を書く」（`install`。書く手順は `hook::install_call_hook_at`）。ゲームのメモリ・Win32・COM の呼び出しは `pad_extra_win.rs`。
 //!
-//! 遅延: 読む時点は元の関数が返った直後（同じ tick の同じ地点）なので、入力が 1 フレーム遅れることは無い。足すのは入口 1 回
-//! あたり原子変数の読み書きが数回と、winmm の経路なら `joyGetPosEx` 1 回（DirectInput の経路なら `GetDeviceState` 1 回）。
-//! 1 tick に最大 5 回呼ばれるが、デバイスごとに 1 tick 1 回へはまとめない: 呼び出しごとに今の状態を読めば止まった値を返す
-//! 恐れが無く、まとめるには tick を見分ける印が要る（候補の `SUP_FRAME` は、待ちの間に返す描画だけのフレームでは on_tick の
-//! 途中から直に戻るので進まない）。
+//! 遅延: 読む時点は元の関数が返った直後なので、入力は遅れない。足すのは入口 1 回あたり原子変数の読み書きが数回と、winmm の経路なら `joyGetPosEx` 1 回（DirectInput の経路なら `GetDeviceState` 1 回）。
+//! デバイスごとに 1 tick 1 回へはまとめない: 呼び出しごとに今の状態を読めば止まった値を返す恐れが無く、まとめるには tick を見分ける印が要る（候補の `SUP_FRAME` は、描画だけのフレームでは on_tick の途中から直に戻るので進まない）。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -33,10 +28,10 @@ pub trait PadIo {
     fn winmm_pov(&self, joy_id: u32) -> Option<u32>;
 }
 
-/// ゲームのスレッドが足す数えと、別のスレッドが置く旗。全部原子変数（ロックも確保も無い）。
+/// ゲームのスレッドが足す数えと、別のスレッドが立てる旗。全部原子変数（ロックも確保も無い）。
 pub struct PadState {
     enabled: AtomicU32,
-    /// winmm の経路で `dwPOV` を読んでよいデバイス（添字 = デバイス番号）。ハットの有無を引き直すスレッドが置く
+    /// winmm の経路で `dwPOV` を読んでよいデバイス（添字 = デバイス番号）。ハットの有無を引き直すスレッドが書く
     /// （`higanr_core::pad_dirs::winmm_may_read`）。
     winmm_gate: [AtomicU32; 2],
     di: AtomicU32,
@@ -160,8 +155,14 @@ impl InstallReport {
 
 /// 表の全行を照合し、**全部一致したときだけ**、`CallRel32` の行の rel32 を `entry` へ向ける。1 行でも合わない・読めないときは
 /// 1 バイトも書かない。書く手順（全スレッドを止めて EIP を見て、止めたまま読み直して書く）は `hook::install_call_hook_at`。
-/// 書く途中で失敗したときは書けた分だけ残る（4 つの呼び出しはどれも単独で正しい。書けなかった呼び出しは元の関数を呼ぶだけ）。
-pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallReport {
+/// 書く途中で失敗したときは書けた分だけ残る（呼び出しはどれも単独で正しい。書けなかった呼び出しは元の関数を呼ぶだけ）。
+/// `label` は本ログの各行の頭に付ける出どころ。
+pub fn install_as(
+    env: &mut dyn HookEnv,
+    rows: &[SiteDef],
+    entry: u32,
+    label: &str,
+) -> InstallReport {
     let call_rows = rows
         .iter()
         .filter(|d| matches!(d.kind, Use::CallRel32 { .. }))
@@ -188,7 +189,7 @@ pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallRe
             SiteOutcome::Mismatch { actual } => {
                 refused = true;
                 r.lines.push(format!(
-                    "pad: 設置しない（{} 0x{:08X} が不一致 実際 = {} / 期待 = {}）",
+                    "{label}: 非設置（{} 0x{:08X} が不一致 実際 = {} / 期待 = {}）。",
                     d.name,
                     d.addr,
                     hex_bytes(&actual),
@@ -198,7 +199,7 @@ pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallRe
             SiteOutcome::Unreadable => {
                 refused = true;
                 r.lines.push(format!(
-                    "pad: 設置しない（{} 0x{:08X} が読めない）",
+                    "{label}: 非設置（{} 0x{:08X} が読めない）。",
                     d.name, d.addr
                 ));
             }
@@ -206,14 +207,14 @@ pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallRe
     }
     if refused {
         r.lines.push(format!(
-            "pad: 照合 {}/{} 行が一致。1 バイトも書いていない",
+            "{label}: 照合 {}/{} 行が一致。1 バイトも書いていません。",
             r.verified, r.rows
         ));
         return r;
     }
     // 全部書けて、読み返した飛び先が全部入口と一致したときは 1 行にまとめる。1 つでも欠けたら、どの呼び出しがどうだったかを全部残す。
     let mut detail = vec![format!(
-        "pad: 照合 {}/{} 行が一致（呼び出し {} 行と、呼び先 0x{:08X} の頭と最後の ret 4）。呼び出しの rel32 を入口 0x{entry:08X} へ向ける",
+        "{label}: 照合 {}/{} 行が一致（呼び出し {} 行と呼び先 0x{:08X} を検証する行）。呼び出しの rel32 を入口 0x{entry:08X} へ向けます。",
         r.verified,
         r.rows,
         call_rows,
@@ -240,7 +241,7 @@ pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallRe
                 targets_ok += 1;
             }
             detail.push(format!(
-                "pad: {} 0x{:08X}: 書いた（読み返した飛び先 {}）",
+                "{label}: {} 0x{:08X}: 書きました（読み返した飛び先 {}）。",
                 d.name,
                 d.addr,
                 match target {
@@ -254,21 +255,28 @@ pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallRe
             let mut text = Vec::new();
             hook::write_report(&mut text, d, &rep);
             for l in String::from_utf8_lossy(&text).lines() {
-                detail.push(format!("pad: {l}"));
+                detail.push(format!("{label}: {l}"));
             }
         }
     }
     if r.complete() && targets_ok == r.call_rows {
         r.lines.push(format!(
-            "pad: 設置 {}/{} 地点（照合 {}/{} 行が一致。読み返した飛び先は {} 地点とも入口 0x{entry:08X} と一致）",
+            "{label}: 設置 {}/{} フック地点（照合 {}/{} 行が一致。読み返した飛び先は {} フック地点とも入口 0x{entry:08X} と一致）",
             r.written, r.call_rows, r.verified, r.rows, targets_ok
         ));
     } else {
         r.lines.extend(detail);
-        r.lines
-            .push(format!("pad: 設置 {}/{} 地点", r.written, r.call_rows));
+        r.lines.push(format!(
+            "{label}: 設置 {}/{} フック地点",
+            r.written, r.call_rows
+        ));
     }
     r
+}
+
+/// パッドの 4 つの呼び出しの設置（`install_as` の接頭辞が `pad`）。
+pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallReport {
+    install_as(env, rows, entry, "pad")
 }
 
 /// `DllMain` で本ログへ頼む設置の行。全部書けたときは設定の行と設置の 1 行を 1 行にまとめ、書けなかったときは
@@ -289,7 +297,7 @@ pub fn attach_lines(settings: &str, report: &InstallReport) -> Vec<String> {
 /// 本ログの 1 行: 数えのコピー。`when` は「初めて」「終わり」。
 pub fn counts_line(when: &str, c: &Counts, skipped: u32, gate: [bool; 2]) -> String {
     format!(
-        "pad: 数え（{when}）: 経路は DirectInput {} 回 / winmm {} 回（winmm でハットが無いので読まなかった {} 回。ハットあり: 0 番 {} / 1 番 {}）、十字キーで方向を足した回数 {}、読めなかった回数 {}",
+        "pad: 数え（{when}）: 処理フローは DirectInput {} 回 / winmm {} 回（winmm でハットが無いので読まなかった {} 回。ハットあり: 0 番 {} / 1 番 {}）、十字キーで方向を足した回数 {}、読めなかった回数 {}",
         c.di,
         c.mm,
         skipped,
@@ -337,22 +345,22 @@ impl LogPlan {
     }
 }
 
-/// winmm の `joyGetDevCaps` の結果の行（添字 = デバイス番号。`None` = つながっていない）。ハット（POV）の有無は、
+/// winmm の `joyGetDevCaps` の結果の行（添字 = デバイス番号。`None` = 接続されていない）。ハット（POV）の有無は、
 /// 効かなかったときにまず見る事実。2 台分を 1 行にして本ログの行を増やさない。
 pub fn caps_line(caps: [Option<u32>; 2]) -> String {
     let one = |dev: usize, c: Option<u32>| match c {
-        None => format!("{dev} 番 つながっていない（joyGetDevCaps が失敗）"),
+        None => format!("{dev} 番 接続していない（joyGetDevCaps が失敗）"),
         Some(c) => format!(
             "{dev} 番 wCaps = 0x{c:04X}、ハット（POV）{}",
             if c & JOYCAPS_HASPOV != 0 {
                 "あり"
             } else {
-                "なし（十字キーは足さない。always にすると確かめを外せる）"
+                "なし（十字キーは足さない。always にすると検証を外せる）"
             }
         ),
     };
     format!(
-        "pad: winmm の確かめ: {}／{}",
+        "pad: winmm の検証: {}／{}",
         one(0, caps[0]),
         one(1, caps[1])
     )
@@ -365,8 +373,10 @@ fn yes_no(b: bool) -> &'static str {
 pub fn settings_line(mode: PovMode, source: &str) -> String {
     let m = match mode {
         PovMode::Off => "切る（[pad] pov = 0）",
-        PovMode::Auto => "入り（winmm の経路は Windows が「ハットあり」と答えたデバイスだけ読む）",
-        PovMode::Always => "入り・ハットの確かめなし（[pad] pov = always）",
+        PovMode::Auto => {
+            "入り（winmm の処理フローは Windows が「ハットあり」と答えたデバイスだけ読む）"
+        }
+        PovMode::Always => "入り・ハットの検証なし（[pad] pov = always）",
     };
     format!("pad: 十字キー（POV）を方向に足す: {m}。設定 = {source}")
 }
@@ -546,7 +556,7 @@ mod tests {
 
     // ---- 設置 ----
 
-    /// 偽のコードの置き場（アドレス → バイト列）。書いた回数を数え、止めている間だけ書けることを見る。
+    /// 偽のコードのメモリ（アドレス → バイト列）。書いた回数を数え、止めている間だけ書けることを見る。
     struct FakeCode {
         mem: RefCell<Vec<(u32, Vec<u8>)>>,
         writes: Cell<u32>,
@@ -674,7 +684,7 @@ mod tests {
         }
         assert_ne!(before, env.snapshot());
         assert!(
-            r.lines.iter().any(|l| l.contains("設置 4/4 地点")),
+            r.lines.iter().any(|l| l.contains("設置 4/4 フック地点")),
             "{:?}",
             r.lines
         );
@@ -727,7 +737,7 @@ mod tests {
         for want in [
             "十字キー（POV）を方向に足す",
             "HiganRTool.ini",
-            "設置 4/4 地点",
+            "設置 4/4 フック地点",
             "照合 6/6 行",
             "入口 0x10005000",
         ] {
@@ -742,15 +752,15 @@ mod tests {
         assert_eq!(v[0], settings);
         assert!(v.iter().any(|l| l.contains("不一致")), "{v:?}");
         assert!(
-            v.iter().any(|l| l.contains("1 バイトも書いていない")),
+            v.iter().any(|l| l.contains("1 バイトも書いていません")),
             "{v:?}"
         );
         let mut env = FakeCode::exe_like();
         env.write_fail_at = Some(PAD_SITES[1].addr + 1);
         let part = install(&mut env, PAD_SITES, ENTRY);
         let v = attach_lines(&settings, &part);
-        assert!(v.iter().any(|l| l.contains("頁の保護")), "{v:?}");
-        assert!(v.iter().any(|l| l.contains("設置 3/4 地点")), "{v:?}");
+        assert!(v.iter().any(|l| l.contains("ページの保護")), "{v:?}");
+        assert!(v.iter().any(|l| l.contains("設置 3/4 フック地点")), "{v:?}");
     }
 
     #[test]
@@ -805,12 +815,12 @@ mod tests {
             "書けなかった行は元のまま"
         );
         assert!(
-            r.lines.iter().any(|l| l.contains("設置 3/4 地点")),
+            r.lines.iter().any(|l| l.contains("設置 3/4 フック地点")),
             "{:?}",
             r.lines
         );
         assert!(
-            r.lines.iter().any(|l| l.contains("頁の保護")),
+            r.lines.iter().any(|l| l.contains("ページの保護")),
             "{:?}",
             r.lines
         );
@@ -852,7 +862,7 @@ mod tests {
         let c = caps_line([Some(0x0013), None]);
         assert_eq!(c.lines().count(), 1);
         assert!(c.contains("0 番 wCaps = 0x0013、ハット（POV）あり"), "{c}");
-        assert!(c.contains("1 番 つながっていない"), "{c}");
+        assert!(c.contains("1 番 接続していない"), "{c}");
         assert!(caps_line([Some(0x0003), Some(0x0003)]).contains("ハット（POV）なし"));
         assert!(settings_line(PovMode::Off, "x").contains("切る"));
         assert!(settings_line(PovMode::Always, "x").contains("always"));

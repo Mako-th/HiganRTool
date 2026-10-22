@@ -1,6 +1,7 @@
 // 純粋な決まり（src/rules.ts）の検査。通るものと通らないものをガードの境目の両側で並べる。
 import { describe, expect, it } from "vitest";
 import {
+  CLOSE_NAME,
   CODE_MAX_CHARS,
   Close,
   CLIENT_ID_LEN,
@@ -8,6 +9,7 @@ import {
   ROOM_NAME_MAX,
   ROOM_NAME_MAX_BYTES,
   decodeRoomName,
+  isWatchRoomPath,
   normalizeRoomName,
   parseClientId,
   parseClientMessage,
@@ -146,6 +148,27 @@ describe("文の形", () => {
     ];
     for (const b of bad) {
       expect(parseClientMessage(b), String(b)).toEqual({ kind: "error", close: Close.BadMessage });
+    }
+  });
+});
+
+describe("観戦の断り（refuse）の決まり", () => {
+  it("refuse は本文なしの文として読む（コードは読まない）", () => {
+    expect(parseClientMessage(JSON.stringify({ t: "refuse" }))).toEqual({ kind: "refuse" });
+  });
+
+  it("閉じる番号 4403 は refused（下 3 桁は 403 に揃えた）", () => {
+    expect(Close.Refused).toBe(4403);
+    expect(CLOSE_NAME[Close.Refused]).toBe("refused");
+  });
+
+  it("観戦用のルームは引く形の名で見る: w. で始まる名（大文字・全角の W. も同じ部屋）だけ。q.・人の名・符号の悪いものは false", () => {
+    const hex = "0123456789abcdef";
+    for (const p of [`/v0/rooms/w.${hex}`, `/v0/rooms/W.${hex}`, `/v0/rooms/%EF%BC%B7.${hex}`]) {
+      expect(isWatchRoomPath(p), p).toBe(true);
+    }
+    for (const p of [`/v0/rooms/q.${hex}`, "/v0/rooms/room", "/v0/rooms/w", "/v0/rooms/xw.abc", `/v0/rooms/a/w.${hex}`, "/v0/rooms/%ZZw.abc", "/v0/rooms/%2Fw.abc"]) {
+      expect(isWatchRoomPath(p), p).toBe(false);
     }
   });
 });

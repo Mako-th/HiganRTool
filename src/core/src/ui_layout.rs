@@ -1,10 +1,10 @@
-//! ゲーム内 UI の頂点の置き方（pure。D3D8 は触らない）。
+//! ゲーム内 UI の頂点の配置（pure。D3D8 は触らない）。
 //!
-//! 右下に 1 行を置く `overlay::layout_line` では、画面の中央のメニュー・左上の行・上の枠の左の行は置けない。
-//! ここは「左上の座標（画素）を渡して置く」下の層（四角形と 1 行の文字）と、中央の枠の大きさの決め方を持つ。
-//! 文字の幅・フォールバック（表に無い文字は `?`）・ゲームの文字の置き方は `overlay::resolve` を使う（`layout_line` と同じ幅になる）。
+//! 右下に 1 行を配置する `overlay::layout_line` では、画面の中央のメニュー・左上の行・上の枠の左の行は配置できない。
+//! ここは「左上の座標（画素）を渡して配置する」下の層（四角形と 1 行の文字）と、中央の枠の大きさの決め方を持つ。
+//! 文字の幅・フォールバック（表に無い文字は `?`）・ゲームの文字の配置は `overlay::resolve` を使う（`layout_line` と同じ幅になる）。
 //!
-//! ゲームのスレッドで毎フレーム呼ぶので、確保もパニックもしない（出力は呼び手の配列。添字は範囲を確かめてから使う）。
+//! ゲームのスレッドで毎フレーム呼ぶので、確保もパニックもしない（出力は呼び手の配列。添字は範囲を検証してから使う）。
 //! メニューは行ごとに `DrawPrimitiveUP` を呼ぶ（1 行は最大 `MAX_TEXT` 文字 = `MAX_VERTS` 頂点で、スタックの配列が小さく済む。
 //! 状態の保存と戻しは 1 回にまとめる。`overlay_win::draw_with_saved_state`）。
 #![forbid(unsafe_code)]
@@ -54,18 +54,18 @@ const _: () = assert!(
     HUD_RIGHT - PAD + crate::overlay::GAME_ADVANCE < TIMER_LEFT,
     "行の文字の終わりとタイマーの間に、英数字 1 文字ぶんより広い隙間を置く"
 );
-/// マッチ中の行の文字を置ける幅（画素）。下地の右端 `HUD_X + 幅 + PAD` が `HUD_RIGHT` を越えない幅。越える文字は描く側
+/// マッチ中の行の文字を配置できる幅（画素）。下地の右端 `HUD_X + 幅 + PAD` が `HUD_RIGHT` を越えない幅。越える文字は描く側
 /// （`push_text_plain` の `max_w`）が落とす。この行は GDI の文字（半角 7 画素）で描く（`text_width_plain`）。
 pub const HUD_TEXT_MAX_W: u32 = HUD_RIGHT - HUD_X - PAD;
 
 /// マッチ中の帯の文字（GDI の文字）の枠の幅（画素）。`overlay_win` が文字の高さ 14 から `cell_w = 高さ / 2 切り上げ` = 7 で作る。
 pub const HUD_CELL_W: u32 = 7;
 
-/// 対戦中の名前の帯と下の通信の状態の行の文字の左端（画素の x）。帯は画面の端に接し、文字は端から `PAD` ずつ内側。
+/// 試合中の名前の帯と下の通信の状態の行の文字の左端（画素の x）。帯は画面の端に接し、文字は端から `PAD` ずつ内側。
 /// 下地は文字の左右に `PAD` ずつ広げる（左の帯は x = 0 から、右の帯は画面の右端まで）。
 pub const HUD_EDGE_X: u32 = PAD;
 
-/// 対戦中の名前の帯: 上の枠の左に「1P 名前」、右に「名前 2P」（右寄せ）。幅の上限は左右とも、
+/// 試合中の名前の帯: 上の枠の左に「1P 名前」、右に「名前 2P」（右寄せ）。幅の上限は左右とも、
 /// 中央のタイマーに届かない `HUD_RIGHT` までの幅。
 pub const HUD_NAME_MAX_W: u32 = HUD_RIGHT - HUD_EDGE_X - PAD;
 /// 名前の帯の文字の枠の数の上限（半角 1 枠。全角は 2 枠）。ラベル「1P 」「 2P」の 3 枠を引いた残り。
@@ -73,7 +73,7 @@ pub const HUD_NAME_MAX_W: u32 = HUD_RIGHT - HUD_EDGE_X - PAD;
 pub const HUD_NAME_CELLS: u32 = HUD_NAME_MAX_W / HUD_CELL_W - 3;
 const _: () = assert!(HUD_NAME_CELLS >= 32, "半角 32 文字の名前は切らずに収まる");
 
-/// 通信の状態の行を下の枠の左へ置く。帯は y = `screen_h - HUD_BAND_H` から、文字の枠の上端はその `HUD_Y` 下。
+/// 通信の状態の行を下の枠の左へ配置する。帯は y = `screen_h - HUD_BAND_H` から、文字の枠の上端はその `HUD_Y` 下。
 pub fn hud_bottom_y(screen_h: u32) -> u32 {
     screen_h.saturating_sub(HUD_BAND_H)
 }
@@ -82,7 +82,7 @@ pub const FPS_LEFT: u32 = 284;
 /// 通信の状態の行の下地の右端（この x は含まない）の上限。fps の文字の縁まで半角 1 文字ぶんあける。
 /// 実際に出るいちばん広い形（39 文字 = 273 画素）がちょうど収まる。
 pub const HUD_BOTTOM_RIGHT: u32 = FPS_LEFT - HUD_CELL_W;
-/// 通信の状態の行の文字を置ける幅（画素）。越える文字は描く側（`push_text_plain` の `max_w`）が落とす。
+/// 通信の状態の行の文字を配置できる幅（画素）。越える文字は描く側（`push_text_plain` の `max_w`）が落とす。
 pub const HUD_BOTTOM_TEXT_MAX_W: u32 = HUD_BOTTOM_RIGHT - HUD_EDGE_X - PAD;
 
 /// 右寄せの帯の文字の左端（画素の x）。画面の右端から `HUD_EDGE_X` あけ、文字の幅 `w` ぶん左へ。
@@ -179,7 +179,7 @@ pub fn text_width_small(spec: &AtlasSpec, text: &str) -> u32 {
     width_by(spec, text, resolve_small)
 }
 
-/// 帯（上端 `band_y`・高さ `HUD_BAND_H`）の真ん中に小さい文字を置くときの、文字の枠の上端の y（`push_text_small` に渡す）。
+/// 帯（上端 `band_y`・高さ `HUD_BAND_H`）の真ん中に小さい文字を配置するときの、文字の枠の上端の y（`push_text_small` に渡す）。
 /// 小さい文字の絵は枠の下端に揃う（`Face::Game`）ので、枠の上端は「絵の下端 − 枠の高さ」。
 pub fn small_text_y(spec: &AtlasSpec, band_y: u32) -> u32 {
     (band_y + HUD_BAND_H.div_ceil(2) + SMALL_CELL_H.div_ceil(2)).saturating_sub(spec.cell_h)
@@ -223,7 +223,7 @@ pub fn push_rect(
 }
 
 /// 1 行 `text` の文字を、左上 `(x, y)`（文字の枠の左上）から `out[at..]` へ書く。幅が `max_w` を越える文字・`MAX_TEXT` 文字を越える文字・
-/// `out` に入らない文字は落とす。戻りは（次の位置, 描いた幅）。下地は置かない（呼び手が `push_rect` で）。
+/// `out` に入らない文字は落とす。戻りは（次の位置, 描いた幅）。下地は含まない（呼び手が `push_rect` で）。
 pub fn push_text(
     out: &mut [Vertex],
     at: usize,
@@ -318,14 +318,14 @@ pub struct MenuBox {
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// 文字を置く左端と、1 行目の文字の枠の上端。行 `i` の文字の枠の上端は `text_y + i * row_h`（`row_h` = `row_height`）。
+    /// 文字を配置する左端と、1 行目の文字の枠の上端。行 `i` の文字の枠の上端は `text_y + i * row_h`（`row_h` = `row_height`）。
     pub text_x: u32,
     pub text_y: u32,
-    /// 文字を置ける幅（これを越える文字は `push_text` が落とす）。
+    /// 文字を配置できる幅（これを越える文字は `push_text` が落とす）。
     pub text_w: u32,
 }
 
-/// 高さ `rows_h` 画素（`rows_height`）の行・いちばん広い行の幅 `max_text_w` の枠を、画面（`screen_w` × `screen_h`）の中央に置く。画面に入りきらなければ
+/// 高さ `rows_h` 画素（`rows_height`）の行・いちばん広い行の幅 `max_text_w` の枠を、画面（`screen_w` × `screen_h`）の中央に配置する。画面に入りきらなければ
 /// 画面の余白（`SCREEN_MARGIN`）まで縮める（文字は `text_w` で切れる）。
 pub fn menu_box(screen_w: u32, screen_h: u32, rows_h: u32, max_text_w: u32) -> MenuBox {
     let want_w = max_text_w.saturating_add(2 * (BOX_MARGIN + BORDER));

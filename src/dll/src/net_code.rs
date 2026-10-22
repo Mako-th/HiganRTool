@@ -1,35 +1,13 @@
 //! 接続コードの受け渡し（ini の `code_side = offer | answer`）。
 //!
-//! 人が接続コードをファイルで受け渡す。置き場は DLL のフォルダの `code\`（ini の `code_dir` で変えられる。
-//! 同じ PC で 2 台を起こすときにゲームごとに分けるため）:
-//! - `my_code.txt` … 自分のコード（dll が書く。人がこれを相手へ渡す）。始める側（offer）はネットワークを開くときに、返す側（answer）は
-//!   相手の始める側のコードが読めたときに書く。繋がったら消す（始める側のコードは秘密 16 B を含む）。ネットワークが繋がらずに終わったとき・
-//!   諦めたときも消す（期限 30 分を過ぎたコードは使えない）。
+//! 人が接続コードをファイルで受け渡す。置き場は DLL のフォルダの `code\`（ini の `code_dir` で変えられる。同じ PC で 2 台を起動するときにゲームごとに分けるため）:
+//! - `my_code.txt` … 自分のコード（dll が書く。人がこれを相手へ渡す）。始める側（offer）はネットワークを開くときに、返す側（answer）は相手の始める側のコードが読めたときに書く。接続したら消す（始める側のコードは秘密 16 B を含む）。接続できずに終わったとき・諦めたときも消す（期限 30 分を過ぎたコードは使えない）。
 //! - `peer_code.txt` … 相手のコード（人が貼って保存する。dll は読むだけで、消さない）。
-//! - `status.txt` … いまの状態（dll が書き直す。ローダーのウィンドウが「状態」の行に 1 行で出す）。文は 2 本に分ける（`Say`）:
-//!   本ログの「ネットワークの外」の行へはファイル名・アドレス・内部の語のままの詳しい文、`status.txt` へは接続コードを受け取った人が読む文
-//!   （内部の語を使わず、次にすることを 1 つ）。人はファイルでなくウィンドウで貼るので、`peer_code.txt` の名前はウィンドウに出さない。
+//! - `status.txt` … いまの状態（dll が書き直す。ローダーのウィンドウが「状態」の行に 1 行で出す）。文は 2 本に分ける（`Say`）: 本ログへはファイル名・アドレス・内部の語のままの詳しい文、`status.txt` へは接続コードを受け取った人が読む文（内部の語を使わず、次にすることを 1 つ）。
 //!
-//! 見張りのスレッド（`higanr-code`）が `POLL`（250 ms）ごとに `peer_code.txt` を読み、中身が前に見たものと違えば読み直す
-//! （更新の時刻ではなく中身で見るので、起動の前に貼っておいたコードも読む。保存の途中の半端なファイルは文字の誤りになるが、
-//! 保存し終われば中身が替わるので次の回に読み直す）。読めたら繋がりのセッションの設定を `netplay::LinkSlot` に置く。
-//! ゲームのスレッドはファイルに触らない（`LinkSlot` の原子変数と待たない錠だけ）。
-//!
-//! 取り違え（自分のコードを貼った・2 人とも offer か answer を選んだ）は、文字の誤りと分けてログと `status.txt` に出す
-//! （`higanr_core::code::read_peer`）。相手の候補はネットワークのガード（`guard::check_peer`。ini の `scope` の範囲。既定は loopback）を
-//! 通したものだけをセッションへ渡す（送る直前のガード `net_udp` の `Outlet::send` と 2 か所）。
-//!
-//! 繋がったのを見たら、ウィンドウの文を「つながりました。あなたは 1P です。」（席は繋がったセッションが決めた自分の席。`LinkSlot::seat`）に
-//! 書き直した後で知らせ（`Notify`。本物は `notify_win::connected` —— ゲームのウィンドウのタスクバーの点滅と音）を 1 回呼んで終わる。
-//!
-//! ウィンドウで選んだ対戦の形: ローダーのウィンドウで相手のコードを貼る前に `0` `1` `2` `delay` と打つと、ローダーが `mode.txt`
-//! （`code_files::MODE_FILE`。対象のゲームの pid つき。形は `higanr_core::mode_pick`）を書く。見張りはセッションの設定を置く直前に
-//! これを読み（`ModeCtx::choose`）、pid が自分の実行と合うときだけ、HELLO で名乗る形を ini より先に採って設定と一緒に
-//! `LinkSlot::offer_with_mode` で置く。rollback を名乗れるのは今までと同じ条件のときだけ（`NetSettings::mode_choice`）。
-//! 繋がった後のウィンドウの文には、AGREE で決まった形をつける（`connected_say`）。
-//!
-//! 遅延への影響: 繋がる前のファイルの見張りだけで、繋がった後のフレームには 0。始める側は返す側のコードを読むまでセッションを作らない
-//! （相手の HELLO は捨てる）ので、繋がるまでの時間は「人がコードを貼るまで ＋ 最大 `POLL` ＋ 1 tick」。
+//! 見張りのスレッド（`higanr-code`）が `POLL`（250 ms）ごとに `peer_code.txt` を読み、中身が前に見たものと違えば読み直す。読めたら接続のセッションの設定を `netplay::LinkSlot` に設定する。ゲームのスレッドはファイルに触らない（`LinkSlot` の原子変数と待たないロックだけ）。取り違え（自分のコードを貼った・2 人とも offer か answer を選んだ）は、文字の誤りと分けてログと `status.txt` に出す（`higanr_core::code::read_peer`）。
+//! 相手の候補はネットワークのガード（`guard::check_peer`。ini の `scope` の範囲。既定は loopback）を通したものだけをセッションへ渡す。接続したのを見たら、ウィンドウの文を書き直した後で知らせ（`Notify`。本物は `notify_win::connected`）を 1 回呼んで終わる。ローダーのウィンドウで選んだ対戦の形（`mode.txt`。`code_files::MODE_FILE`）は、セッションの設定を登録する直前に読み（`ModeCtx::choose`）、pid が自分の実行と合うときだけ HELLO で名乗る形を ini より先に採る。
+//! 遅延への影響: 接続する前のファイルの見張りだけで、接続した後のフレームには 0。接続するまでの時間は「人がコードを貼るまで ＋ 最大 `POLL` ＋ 1 tick」。
 #![forbid(unsafe_code)]
 
 use std::io::{ErrorKind, Read};
@@ -63,7 +41,7 @@ use crate::trial_summary::{CodeFacts, Refusal, Stun};
 use crate::ui_lang;
 
 // ファイルの名前・置き場・見る間隔・読む上限は、ローダーのウィンドウ（`src/loader/src/code_relay.rs`）と同じでなければならないので
-// core の `higanr_core::code_files` に置く。ここは同じ名前で使うための再公開。
+// core の `higanr_core::code_files` にある。ここは同じ名前で使うための再公開。
 pub use higanr_core::code_files::{
     MAX_FILE_BYTES as MAX_PEER_FILE, MODE_FILE, MY_CODE_FILE, PEER_CODE_FILE, POLL, STATUS_FILE,
 };
@@ -72,7 +50,7 @@ const NOTES_MAX: usize = 64;
 /// 置き場（pure）。決め方は core の `code_files::code_dir`。
 pub fn code_dir(dll_dir: Option<&Path>, setting: Option<&str>) -> Result<PathBuf, String> {
     code_files::code_dir(dll_dir, setting)
-        .ok_or_else(|| "DLL のフォルダが分からないので、接続コードの置き場が決まらない".to_string())
+        .ok_or_else(|| "DLL のフォルダが不明なので接続コードの場所が決まりません".to_string())
 }
 
 /// 見張りの文。`log` は本ログへ（詳しいまま）、`show` は `status.txt` へ（ウィンドウで人が読む）。
@@ -113,7 +91,7 @@ impl Say {
 pub enum Step {
     Same,
     Refused(Say),
-    /// 読めた: セッションに置く設定、書く自分のコード（返す側だけ）、ログと `status.txt` の文。
+    /// 読めた: セッションに登録する設定、書く自分のコード（返す側だけ）、ログと `status.txt` の文。
     Ready {
         link: Box<link::Config>,
         my_code: Option<String>,
@@ -181,7 +159,7 @@ impl Swapper {
             expires: now.saturating_add(code::DEFAULT_TTL_SECS),
         };
         let text =
-            code::write_initiator(&own).map_err(|e| format!("接続コードを書けない: {e:?}"))?;
+            code::write_initiator(&own).map_err(|e| format!("接続コードを書けません: {e:?}"))?;
         let mut sw = Swapper::new(CodeSide::Offer, s, role_nonce, own_cands);
         sw.nat = nat;
         sw.offer = Some((own, text));
@@ -246,7 +224,7 @@ impl Swapper {
 
     /// 相手のファイルの中身（無ければ None）を見る。中身が前に見たものと同じなら何もしない。
     pub fn on_peer_file(&mut self, bytes: Option<&[u8]>, now: u64) -> Step {
-        // ファイルが消えた（人が消した）だけなら前に見た中身は忘れない（同じ文字を貼り直しても繋ぎ直さない）。
+        // ファイルが消えた（人が消した）だけなら前に見た中身は忘れない（同じ文字を貼り直しても再接続しない）。
         let Some(b) = bytes else {
             return Step::Same;
         };
@@ -259,7 +237,7 @@ impl Swapper {
             Err(why) => {
                 return Step::Refused(
                     Say::new(
-                        format!("{PEER_CODE_FILE} を読めない: {why}"),
+                        format!("{PEER_CODE_FILE} 読み込み不能（{why}）。"),
                         st::PEER_UNREADABLE.get(ui_lang::current()),
                     )
                     .kind(Kind::Refused(Refusal::Unreadable)),
@@ -292,7 +270,7 @@ impl Swapper {
             Ok(c) => c,
             Err(e) => {
                 let (log, show) = peer_error_text(e);
-                let say = Say::new(format!("{PEER_CODE_FILE} を読めない: {log}"), show);
+                let say = Say::new(format!("{PEER_CODE_FILE} を読めませんでした: {log}"), show);
                 return Step::Refused(match refusal_of(e) {
                     Some(r) => say.kind(Kind::Refused(r)),
                     None => say,
@@ -310,10 +288,10 @@ impl Swapper {
         match self.side {
             CodeSide::Offer => {
                 let Some((own, _)) = &self.offer else {
-                    return Step::Refused(internal("自分のコードが無い"));
+                    return Step::Refused(internal("自分のコードがありません"));
                 };
                 let Some(secret) = own.secret else {
-                    return Step::Refused(internal("自分のコードに秘密が無い"));
+                    return Step::Refused(internal("自分のコードに秘密がありません"));
                 };
                 let link = match self.link_config(own.session_id, secret, peers) {
                     Ok(l) => l,
@@ -324,7 +302,7 @@ impl Swapper {
                     my_code: None,
                     note: Say::new(
                         format!(
-                            "{PEER_CODE_FILE} の返すコードを読んだ。相手の候補 {addrs} へ繋いでいる（相手の回線の型の印: {}）",
+                            "{PEER_CODE_FILE} の返すコードを読みました。相手の候補 {addrs} へ接続しています（相手の NAT の型: {}）。",
                             peer.nat.text()
                         ),
                         st::reply_read(ui_lang::current(), &who),
@@ -334,14 +312,16 @@ impl Swapper {
             }
             CodeSide::Answer => {
                 let Some(secret) = peer.secret else {
-                    // 読めた始める側のコードには必ず秘密がある（`code::read_peer` が確かめる）。来たら作りの誤り。
-                    return Step::Refused(internal("相手の始める側のコードに秘密が無い"));
+                    // 読めた始める側のコードには必ず秘密がある（`code::read_peer` が検証する）。来たら作りの誤り。
+                    return Step::Refused(internal("相手の始める側のコードに秘密がありません"));
                 };
                 let reply =
                     match code::write_reply_to(&peer, self.name, self.nat, self.own_cands, now) {
                         Ok(t) => t,
                         Err(e) => {
-                            return Step::Refused(internal(format!("返すコードを書けない: {e:?}")));
+                            return Step::Refused(internal(format!(
+                                "返すコードを書けません: {e:?}"
+                            )));
                         }
                     };
                 let link = match self.link_config(peer.session_id, secret, peers) {
@@ -354,7 +334,7 @@ impl Swapper {
                     my_code: Some(reply),
                     note: Say::new(
                         format!(
-                            "{PEER_CODE_FILE} の始める側のコードを読み、返すコードを {MY_CODE_FILE} に書いた（相手へ渡す）。相手の候補 {addrs} へ繋いでいる（相手の回線の型の印: {}）",
+                            "{PEER_CODE_FILE} の始める側のコードを読み、返すコードを {MY_CODE_FILE} に書きました（相手へ渡す分）。相手の候補 {addrs} へ接続しています（相手の NAT の型: {}）。",
                             peer.nat.text()
                         ),
                         st::offer_read(ui_lang::current(), &who),
@@ -364,13 +344,13 @@ impl Swapper {
             }
             // 上の `read` で断っている（ここへは来ない）。
             CodeSide::Spectate | CodeSide::Game => {
-                Step::Refused(internal("見るだけの側・ゲーム内の側に Swapper は要らない"))
+                Step::Refused(internal("見るだけの側・ゲーム内の側に Swapper は不要です"))
             }
         }
     }
 
-    /// 繋がりのセッションの設定。使い捨ての鍵の種はここで OS の乱数で引く（セッションの設定を作るたびに新しく）。引けなければ断る
-    /// （決まった値の種で繋ぐと、ルームサーバーの持ち主にも読める便になる）。
+    /// 接続のセッションの設定。使い捨ての鍵の種はここで OS の乱数で引く（セッションの設定を作るたびに新しく）。引けなければ断る
+    /// （決まった値の種で接続すると、ルームサーバーの持ち主にも読める便になる）。
     fn link_config(
         &self,
         session_id: u32,
@@ -393,9 +373,9 @@ impl Swapper {
 /// ファイルの中身 → 文字。メモ帳の「Unicode」（UTF-16）で保存したものは読まずに直し方を言う（UTF-8 の BOM は `code` が除く）。
 pub(crate) fn text_of(b: &[u8]) -> Result<&str, String> {
     if b.starts_with(&[0xFF, 0xFE]) || b.starts_with(&[0xFE, 0xFF]) {
-        return Err("UTF-16 で保存されている（UTF-8 で保存し直す）".to_string());
+        return Err("UTF-16 で保存されています（UTF-8 で保存し直してください）".to_string());
     }
-    std::str::from_utf8(b).map_err(|_| "UTF-8 として読めない".to_string())
+    std::str::from_utf8(b).map_err(|_| "UTF-8 として読み取れません".to_string())
 }
 
 fn offer_waiting(ttl_secs: u64) -> Say {
@@ -408,17 +388,21 @@ fn offer_waiting(ttl_secs: u64) -> Say {
     )
 }
 
-/// 繋がったときの文。`seat` は繋がったセッションが決めた自分の席（`LinkSlot::seat`）。席は画面から読めない値なのでウィンドウに出す。
-/// 本ログには「繋がった」だけを残す（ローダーのウィンドウの検査と本ログの文は、この語で終わりを見ている）。
+/// 接続したときの文。`seat` は接続したセッションが決めた自分の席（`LinkSlot::seat`）。席は画面から読めない値なのでウィンドウに出す。
+/// 本ログには「接続しました」だけを残す（ローダーのウィンドウの検査と本ログの文は、この語で終わりを見ている）。
 ///
-/// `shape` は繋がったセッションの AGREE で決まった形（モードと、rollback なら D・delay 方式なら始めの遅れ。`LinkSlot::shape`）。
+/// `shape` は接続したセッションの AGREE で決まった形（モードと、rollback なら D・delay 方式なら始めの遅れ。`LinkSlot::shape`）。
 /// ウィンドウで選んだ形や ini の形ではなく決まった形を言う —— 両者が rollback を望んだときだけ rollback になるので、
 /// 自分が rollback を選んでも相手次第で delay 方式になる。
 pub(crate) fn connected_say(seat: Option<Seat>, shape: Option<(Mode, u8)>) -> Say {
-    Say::new("繋がった", st::connected(ui_lang::current(), seat, shape)).kind(Kind::Connected)
+    Say::new(
+        "接続しました",
+        st::connected(ui_lang::current(), seat, shape),
+    )
+    .kind(Kind::Connected)
 }
 
-/// 繋がったときに本ログへ 1 行残す、AGREE で決まった形。ウィンドウの文は本ログに残らないので、実機の回の合格条件が
+/// 接続したときに本ログへ 1 行残す、AGREE で決まった形。ウィンドウの文は本ログに残らないので、実機の検証の合格条件が
 /// 「決まった形が rollback か delay か」を本ログで見られるように別の行にする。「対戦の形: …で名乗る」の行（ini やウィンドウの選択）とは語が違う。
 pub(crate) fn decided_shape_log(shape: Option<(Mode, u8)>) -> String {
     match shape {
@@ -454,26 +438,26 @@ fn peer_error_text(e: PeerError) -> (String, String) {
     let lang = ui_lang::current();
     let (log, show) = match e {
         PeerError::Empty => (
-            "空（相手のコードを貼って保存する）".to_string(),
+            "空です（相手のコードを貼って保存してください）".to_string(),
             st::PEER_EMPTY.get(lang),
         ),
         PeerError::OwnCode => (
-            format!("自分の {MY_CODE_FILE} と同じ字（相手から受け取ったコードを貼る）"),
+            format!("自分の {MY_CODE_FILE} と同じ文字です（相手から受け取ったコードを貼ってください）"),
             st::OWN_CODE.get(lang),
         ),
         PeerError::BothOffer => (
-            "2 人とも始める側（code_side = offer）。どちらか一方の ini を code_side = answer にして起こし直す"
+            "2 人とも始める側（code_side = offer）です。どちらか一方の ini を code_side = answer にして起動し直してください"
                 .to_string(),
             st::BOTH_OFFER.get(lang),
         ),
         PeerError::BothAnswer => (
-            "2 人とも返す側（code_side = answer）。どちらか一方の ini を code_side = offer にして起こし直す"
+            "2 人とも返す側（code_side = answer）です。どちらか一方の ini を code_side = offer にして起動し直してください"
                 .to_string(),
             st::BOTH_ANSWER.get(lang),
         ),
         PeerError::Code(CodeError::Expired { .. }) => {
             return (
-                "期限切れ（相手に新しいコードを頼む）".to_string(),
+                "期限切れです（相手に新しいコードを頼んでください）".to_string(),
                 st::expired(lang, code::DEFAULT_TTL_SECS),
             );
         }
@@ -499,21 +483,21 @@ fn peer_error_text(e: PeerError) -> (String, String) {
             return (log, show);
         }
         PeerError::Code(CodeError::WrongSession { .. }) => (
-            format!("別の接続への返しのコード（今の {MY_CODE_FILE} を相手へ渡し直す）"),
+            format!("別の接続への返答コードです（今の {MY_CODE_FILE} を相手へ渡し直してください）"),
             st::WRONG_SESSION.get(lang),
         ),
         PeerError::Code(e @ CodeError::WrongSide(_)) => (
-            format!("相手のコードの種別かタグが合わない（{e:?}。相手に今のコードを頼む）"),
+            format!("相手のコードの種別かタグが一致しません（{e:?}。相手に今のコードを頼んでください）"),
             st::WRONG_KIND.get(lang),
         ),
         // タグが合わないのは、途中で切れた・文字をコピーし間違えたときがいちばん多い（半分だけ貼ると検算で落ちる）ので、
         // ウィンドウでは文字の誤りと同じ文にする。
         PeerError::Code(e @ CodeError::BadTag) => (
-            format!("相手のコードの種別かタグが合わない（{e:?}。相手に今のコードを頼む）"),
+            format!("相手のコードの種別かタグが一致しません（{e:?}。相手に今のコードを頼んでください）"),
             st::BROKEN.get(lang),
         ),
         PeerError::Code(e) => (
-            format!("字が壊れている（{e:?}。保存の途中なら、保存し終わったときに読み直す）"),
+            format!("文字が壊れています（{e:?}。保存の途中なら、保存し終わったときに読み直します）"),
             st::BROKEN.get(lang),
         ),
     };
@@ -521,13 +505,13 @@ fn peer_error_text(e: PeerError) -> (String, String) {
 }
 
 /// 相手の候補のうちネットワークのガード（範囲 `scope`）を通るものだけ。1 つも無ければ断る。範囲の外の候補は黙って落とす
-/// （相手は自分のアドレスを全部載せるので、LAN のアドレスと外のアドレスが混ざるのは普通。通るものが 1 つでもあれば繋ぎに行く）。
+/// （相手は自分のアドレスを全部載せるので、LAN のアドレスと外のアドレスが混ざるのは普通。通るものが 1 つでもあれば接続しに行く）。
 pub(crate) fn gate(cands: &Candidates, scope: Scope) -> Result<Candidates, Say> {
     let mut ok = Candidates::EMPTY;
     let mut refused = Vec::new();
     for c in cands.as_slice() {
         if guard::check_peer(c.addr, scope).is_ok() {
-            // 読んだコードの候補は重ならず数の上限の中（`code` が確かめた）ので、足せないことは無い。
+            // 読んだコードの候補は重ならず数の上限の中（`code` が検証した）ので、足せないことは無い。
             let _ = ok.push(*c);
         } else {
             refused.push(c.addr);
@@ -536,7 +520,7 @@ pub(crate) fn gate(cands: &Candidates, scope: Scope) -> Result<Candidates, Say> 
     if ok.is_empty() {
         return Err(Say::new(
             format!(
-                "相手の候補 {} にネットワークの範囲のガードを通るアドレスが無い（ネットワークの範囲 scope = {}。LAN の相手なら lan、外の相手なら internet を ini に書く）",
+                "相手の候補 {} にネットワークの範囲のガードを通るアドレスがありません（ネットワークの範囲 scope = {}。LAN の相手なら lan、外の相手なら internet を ini に書いてください）。",
                 refused
                     .iter()
                     .map(ToString::to_string)
@@ -655,9 +639,9 @@ impl ModeCtx {
         Some((choice, notes))
     }
 
-    /// つなぐ前に決めた遅延（接続の始まりにホストが押下にする初めの値。`DelayPick::set_start`）: メニューの「対戦の遅延」で選んだ値
+    /// 接続する前に決めた遅延（接続の始まりに対戦のホストの初めの値になる。`DelayPick::set_start`）: メニューの「対戦の遅延」で選んだ値
     /// `menu` があればそれ、無ければ ini の `delay`（auto か数。名乗る形 `named` の方式の値を見るが、両方とも同じ `delay` から作る）。
-    /// 数も初めの値にするのは、メニューに出した数のまま始めるため（置かないと delay 方式は最初のマッチで推奨値へ替わる）。
+    /// 数も初めの値にするのは、メニューに出した数のまま始めるため（設定しないと delay 方式は最初のマッチで推奨値へ替わる）。
     /// ウィンドウの選択を見ない形はメニューの値だけ。
     pub(crate) fn start_delay(
         &self,
@@ -700,12 +684,12 @@ pub(crate) fn status_text(side: CodeSide, secs: f32, show: &str) -> String {
     format!("{head}\r\n{show}\r\n")
 }
 
-/// ネットワークを開けなかった（見張りを起こす前に断った）ときのウィンドウの文。見張りが止められたときの文（`Watcher::run`）と同じ。
+/// ネットワークを開けなかった（見張りを開始する前に断った）ときのウィンドウの文。見張りが止められたときの文（`Watcher::run`）と同じ。
 pub fn show_not_started() -> &'static str {
     st::NOT_STARTED.get(ui_lang::current())
 }
 
-/// 見張りを起こす前にネットワークを開けなかった（`bind = auto` でアドレスを決められない・受信ソケットを開けない等）ときに、`status.txt` へウィンドウの文を書く。
+/// 見張りを開始する前にネットワークを開けなかった（`bind = auto` でアドレスを決められない・受信ソケットを開けない等）ときに、`status.txt` へウィンドウの文を書く。
 /// 書かないと、ローダーのウィンドウは `my_code.txt` も `status.txt` も来ないまま黙って待ち続け、利用者は何が起きたか分からない。
 /// 書けなくてもネットワークの結果は変えない。
 pub fn say_not_started(dir: &Path, side: CodeSide) {
@@ -729,7 +713,7 @@ pub fn write_my_code(dir: &Path, text: &str) -> Result<(), String> {
     replace_file(dir, MY_CODE_FILE, &format!("{text}\r\n"))
 }
 
-/// `my_code.txt` を消す。中身が `own`（自分の書いたコード）でなければ消さない（人が別のものを置いた）。戻りは消したか。
+/// `my_code.txt` を消す。中身が `own`（自分の書いたコード）でなければ消さない（人が別のものを書いた）。戻りは消したか。
 pub fn remove_my_code(dir: &Path, own: Option<&str>) -> Result<bool, String> {
     let p = dir.join(MY_CODE_FILE);
     let b = match std::fs::read(&p) {
@@ -775,7 +759,7 @@ impl Shared {
         n.push(line);
     }
 
-    /// 数の入れ物を書き換える（ゲーム内のメニューの見張りが、選んだ項目・待ち列の順・自分の側を置く）。
+    /// 数の入れ物を書き換える（ゲーム内のメニューの見張りが、選んだ項目・ランダムマッチの待ち列の順・自分の側を設定する）。
     pub(crate) fn update(&self, f: impl FnOnce(&mut CodeFacts)) {
         f(&mut self.facts.lock().unwrap_or_else(|e| e.into_inner()));
     }
@@ -805,7 +789,7 @@ impl Shared {
 }
 
 /// 見張りの持ち手。落とすと止めて待つ（本物の経路では落とさない —— `script_win` がプロセスの終わりまで持つ。見張りは
-/// 繋がった・ネットワークが終わった・諦めたときに自分で終わる）。
+/// 接続した・ネットワークが終わった・諦めたときに自分で終わる）。
 pub struct Watch {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
@@ -840,8 +824,8 @@ impl Watch {
         self.join.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// 止めて待つ（ゲーム内のメニューのつなぎ直しの片づけ。`net_code_game::close_parts`）。見張りの文と数は残る
-    /// （試験のまとめが、次のつながりを開くまで最後のつながりの値を読む）。2 回目からは何もしない。
+    /// 止めて待つ（ゲーム内のメニューの再接続の片づけ。`net_code_game::close_parts`）。見張りの文と数は残る
+    /// （試験のまとめが、次の接続を開くまで最後の接続の値を読む）。2 回目からは何もしない。
     pub fn stop(&mut self) {
         self.halt();
     }
@@ -860,14 +844,14 @@ impl Drop for Watch {
     }
 }
 
-/// 繋がったのを見た 1 回だけ見張りのスレッドが呼ぶ知らせ（本物は `notify_win::connected` —— ウィンドウの点滅と音）。
+/// 接続したのを見た 1 回だけ見張りのスレッドが呼ぶ知らせ（本物は `notify_win::connected` —— ウィンドウの点滅と音）。
 /// 戻りの文は本ログの「ネットワークの外」の行へ足す。検査は数えるだけの偽物を渡す。
 pub type Notify = fn() -> String;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub poll: Duration,
-    /// セッションの設定を 1 度も置けないまま、これだけ経ったら諦める（ゲームのスレッドのネットワークは「1 通も届かない」で終わる）。
+    /// セッションの設定を 1 度も設定できないまま、これだけ経ったら諦める（ゲームのスレッドのネットワークは「1 通も届かない」で終わる）。
     pub window: Duration,
 }
 
@@ -882,9 +866,9 @@ impl Default for Timing {
 
 /// 開く（読み取りのスレッド。`script_win::open_net` から。ネットワークを動かす前）: 置き場を作り、自分の候補（受信ソケットと、ini の `stun` があれば
 /// 見えたアドレス）を決め、始める側なら秘密と session（ini に無ければ OS の乱数）で自分のコードを `my_code.txt` に書き、
-/// 見張りのスレッドを起こす。戻りの文は本ログの「ネットワーク: 開いた」の行に足す（コードの文字は書かない。秘密を含むので、ファイルだけに置く）。
+/// 見張りのスレッドを作る。戻りの文は本ログの「ネットワーク: 開いた」の行に足す（コードの文字は書かない。秘密を含むので、ファイルだけに書く）。
 /// `mode` はウィンドウで選んだ対戦の形を採るための材料（`ModeCtx`）。
-// 検査が個別に差し替える部品（見張りの間隔・繋がった知らせ・ウィンドウの選択）を引数で受ける入口で、本物は 1 回しか呼ばない。
+// 検査が個別に差し替える部品（見張りの間隔・接続した知らせ・ウィンドウの選択）を引数で受ける入口で、本物は 1 回しか呼ばない。
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     s: &NetSettings,
@@ -898,11 +882,11 @@ pub fn start(
 ) -> Result<(Watch, String), String> {
     let side = s
         .code_side
-        .ok_or("code_side が無い（接続コードで受け渡す形でない）")?;
+        .ok_or("code_side がありません（接続コードで受け渡す形ではありません）")?;
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("接続コードの置き場 {} を作れない: {e}", dir.display()))?;
+        .map_err(|e| format!("接続コードの場所 {} の作成不能: {e}", dir.display()))?;
     let mut note = String::new();
-    let local = net.local_addr().ok_or("受信ソケットが分からない")?;
+    let local = net.local_addr().ok_or("受信ソケットが不明")?;
     // UPnP は STUN と並行に走らせる（結果は `nat_settle` で待つ）。
     net_udp::upnp_begin(s, net, &mut note);
     let (mapped, stun) = net_udp::stun_state(s, net, &mut note);
@@ -950,7 +934,7 @@ pub fn start(
             match std::fs::remove_file(dir.join(MY_CODE_FILE)) {
                 Ok(()) => note.push_str(&format!(" / 前の回の {MY_CODE_FILE} を消した")),
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("前の回の {MY_CODE_FILE} を消せない: {e}")),
+                Err(e) => return Err(format!("前回の {MY_CODE_FILE} を削除できません: {e}")),
             }
             note.push_str(&format!(
                 " / 接続コード（返す側 answer）: {} に相手のコードが貼られるのを待つ",
@@ -960,13 +944,13 @@ pub fn start(
         }
         CodeSide::Spectate => {
             return Err(
-                "見るだけの側（code_side = spectate）は接続コードの受け渡しの見張りを使わない"
+                "見るだけの側（code_side = spectate）は接続コードの受け渡しの見張りを使いません"
                     .to_string(),
             );
         }
         CodeSide::Game => {
             return Err(
-                "ゲーム内のメニューの側（code_side = game）は `start_game` の見張りを使う"
+                "ゲーム内のメニューの側（code_side = game）は `start_game` の見張りを使います"
                     .to_string(),
             );
         }
@@ -1001,7 +985,7 @@ pub fn start(
             // パニックは受けて外へ出さない（スレッドの入口）。受けたら見張りをやめる（ネットワークは相手の沈黙か時間切れで終わる）。
             let _ = catch_unwind(AssertUnwindSafe(|| w.run()));
         })
-        .map_err(|e| format!("接続コードの見張りのスレッドを起こせない: {e}"))?;
+        .map_err(|e| format!("接続コードの見張りのスレッドの作成不能: {e}"))?;
     Ok((
         Watch {
             shared,
@@ -1014,7 +998,7 @@ pub fn start(
 pub(crate) fn draw_session() -> Result<u32, String> {
     let mut b = [0u8; 4];
     if !os_random(&mut b) {
-        return Err("session を OS の乱数で引けない".to_string());
+        return Err("session を OS の乱数で決められません".to_string());
     }
     Ok(u32::from_le_bytes(b))
 }
@@ -1047,7 +1031,7 @@ impl Watcher {
     fn run(&mut self) {
         loop {
             if self.shared.stop.load(Ordering::Relaxed) {
-                // 持ち手が落とされた（本物の経路では、ネットワークのセッションを置けずに `open_net` が断ったときだけ）。コードは使われない
+                // 持ち手が落とされた（本物の経路では、ネットワークのセッションを登録できずに `open_net` が断ったときだけ）。コードは使われない
                 // ので、秘密の載った `my_code.txt` を残さない。
                 self.finish(Say::new(
                     "見張りを止めた（ネットワークを開けなかった）",
@@ -1072,7 +1056,7 @@ impl Watcher {
             if self.slot.is_done() {
                 self.finish(
                     Say::new(
-                        "ネットワークが終わった（繋がらずに終えた）",
+                        "ネットワークが終了しました（接続できずに終了）",
                         st::ENDED_UNCONNECTED.get(ui_lang::current()),
                     )
                     .kind(Kind::EndedUnconnected),
@@ -1125,8 +1109,8 @@ impl Watcher {
                 {
                     self.say(&reply_write_say(ui_lang::current(), &e));
                 }
-                // 名乗る形は、セッションの設定を置く直前にここで決める。ウィンドウで選んだ形のファイルを読むのはこのスレッドだけで、
-                // ゲームのスレッドは置かれた値を取るだけ。
+                // 名乗る形は、セッションの設定を登録する直前にここで決める。ウィンドウで選んだ形のファイルを読むのはこのスレッドだけで、
+                // ゲームのスレッドは設定された値を取るだけ。
                 let wish = match self.mode.choose(&self.dir) {
                     Some((choice, lines)) => {
                         let secs = self.t0.elapsed().as_secs_f32();
@@ -1168,8 +1152,8 @@ fn reply_write_say(lang: Lang, e: &str) -> Say {
 /// 終わりの文（`why`）に、`my_code.txt` を消した結果を足す。消せなかった誤り `e` は本ログに必ず残し、ウィンドウには言語に合う文だけを足す。
 fn finished_say(lang: Lang, why: Say, removed: Result<bool, String>) -> Say {
     let (removed, show) = match removed {
-        Ok(true) => (format!("{MY_CODE_FILE} を消した"), why.show),
-        Ok(false) => (format!("{MY_CODE_FILE} は無い"), why.show),
+        Ok(true) => (format!("{MY_CODE_FILE} を消しました"), why.show),
+        Ok(false) => (format!("{MY_CODE_FILE} はありません"), why.show),
         Err(e) => {
             let show = st::my_code_not_deleted(lang, &why.show, &e);
             (e, show)
@@ -1180,7 +1164,7 @@ fn finished_say(lang: Lang, why: Say, removed: Result<bool, String>) -> Say {
 
 #[cfg(test)]
 mod tests {
-    //! ファイルは一時ディレクトリだけ（ゲームのフォルダは使わない）。接続コード・秘密・名前・アドレスは合成の値だけ。
+    //! ファイルは一時フォルダだけ（ゲームのフォルダは使わない）。接続コード・秘密・名前・アドレスは合成の値だけ。
     use super::*;
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicU32;
@@ -1288,7 +1272,7 @@ mod tests {
         let ok = finished_say(Lang::En, Say::new("l", "shown"), Ok(true));
         assert_eq!(
             (ok.log.as_str(), ok.show.as_str()),
-            ("l。my_code.txt を消した", "shown")
+            ("l。my_code.txt を消しました", "shown")
         );
     }
 
@@ -1332,7 +1316,7 @@ mod tests {
         let say = connected_say(Some(Seat::P1), Some((Mode::Rollback, 2)));
         assert_eq!(say.show, "Connected. You are 1P. (rollback, delay 2)");
         assert_eq!(
-            say.log, "繋がった",
+            say.log, "接続しました",
             "ローダーの窓の検査と本ログはこの語で終わりを見ている"
         );
         let head_and_line = status_text(CodeSide::Offer, 1.0, "x");
@@ -1442,7 +1426,7 @@ mod tests {
         };
         let half = &reply[..reply.len() / 2];
         let why = refused(off.on_peer_file(Some(half.as_bytes()), NOW));
-        assert!(why.log.contains("を読めない"), "{why:?}");
+        assert!(why.log.contains("を読めませんでした"), "{why:?}");
         assert!(why.show.contains("欠けている"), "{why:?}");
         for_people(&why.show);
         assert_eq!(off.on_peer_file(Some(half.as_bytes()), NOW), Step::Same);
@@ -1500,7 +1484,7 @@ mod tests {
         shows.push(why.show);
         let own = off.own_text().unwrap().to_string();
         let why = refused(off.on_peer_file(Some(format!("{own}\r\n").as_bytes()), NOW));
-        assert!(why.log.contains("自分の my_code.txt と同じ字"), "{why:?}");
+        assert!(why.log.contains("自分の my_code.txt と同じ文字"), "{why:?}");
         assert!(why.show.contains("自分の接続コード"), "{why:?}");
         kinds.push(why.kind);
         shows.push(why.show);
@@ -1606,7 +1590,7 @@ mod tests {
         ] {
             let say = connected_say(seat, None);
             assert_eq!(say.show, want);
-            assert_eq!(say.log, "繋がった");
+            assert_eq!(say.log, "接続しました");
             for_people(&say.show);
             // 本ログの 1 行（実機の合格条件が読む文字列。変えたら scripts/runs/m8_4_*.run も直す）。
             assert_eq!(
@@ -1624,7 +1608,7 @@ mod tests {
             ] {
                 let say = connected_say(seat, Some(shape));
                 assert_eq!(say.show, format!("{want}{tail}"));
-                assert_eq!(say.log, "繋がった");
+                assert_eq!(say.log, "接続しました");
                 for_people(&say.show);
             }
         }
@@ -1684,6 +1668,60 @@ mod tests {
             nb,
             clock,
             alloc_a: 0,
+        }
+    }
+
+    /// 見張りが `set_host_pick` で決め方を使うと決めた接続だけ、ゲームのスレッドのセッションが PROBE を交わして決め、決まった役と材料が見張りへ渡る。
+    /// A（接続コードの形・nonce が大きい）は検査用の値を持たず、B は A を細いと測る（検査用の値）。偽のネットワークは同じ時刻に届けるので、
+    /// A は B の列を上限の値（`UP_CAP`）と見て、決め方を使えば B がホスト、使わなければ nonce で A がホスト。
+    #[test]
+    fn the_slot_turns_on_host_pick_and_hands_the_result_to_the_watcher() {
+        use higanr_core::host_pick::{Basis, Setup, UP_CAP};
+        use higanr_core::nat::NatMark;
+        const THIN: u32 = 90_000;
+        for on in [true, false] {
+            let slot = Arc::new(LinkSlot::new());
+            let (mut na, mut nb, clock) = FakeNet::pair(lo(1), lo(2), 2_000);
+            let cfg = |p| netplay::Config {
+                check: CheckSource::InputDigest,
+                wait_budget_us: WAIT_BUDGET_US,
+                host_pick: p,
+                ..netplay::Config::default()
+            };
+            let mut ga = FakeGame::new(0xA, 30, 1, 1);
+            let mut gb = FakeGame::new(0xB, 30, 1, 1);
+            ga.menu_before_decide = u32::MAX;
+            gb.menu_before_decide = u32::MAX;
+            let b_pick = Setup {
+                nat: NatMark::UNKNOWN,
+                fake_up: Some(THIN),
+            };
+            let mut d = Duo {
+                a: NetPlay::with_code_slot(Arc::clone(&slot), cfg(None), &mut na),
+                ga,
+                na,
+                b: NetPlay::new(lc(1, 1, SECRET), cfg(Some(b_pick)), &mut nb),
+                gb,
+                nb,
+                clock,
+                alloc_a: 0,
+            };
+            slot.set_host_pick(on.then_some(NatMark::UNKNOWN));
+            slot.offer(lc(2, 0xF000, SECRET));
+            d.run(240);
+            assert!(slot.is_connected(), "on={on}: 繋がらない {:?}", d.a.end());
+            let note = slot.pick_note().expect("材料が見張りへ渡らない");
+            assert_eq!(note.active, on, "on={on}");
+            let want = if on {
+                (Basis::Uplink, THIN, UP_CAP, Some(false))
+            } else {
+                (Basis::Nonce, 0, 0, Some(true))
+            };
+            assert_eq!(
+                (note.basis, note.own_up, note.peer_up, slot.is_host()),
+                want,
+                "{note:?}"
+            );
         }
     }
 
@@ -1964,7 +2002,7 @@ mod tests {
             wait_until("セッションの設定が置かれる", 10, || {
                 slot.generation() > 0
             });
-            // 見張りはセッションに置いてから「状態」の行を書く。置かれたのを見た直後に読むと書く前の行を読みうるので、読んだ旨の行が出るまで待つ。
+            // 見張りはセッションに登録してから「状態」の行を書く。設定されたのを見た直後に読むと書く前の行を読みうるので、読んだ旨の行が出るまで待つ。
             wait_until("状態の行が書かれる", 10, || {
                 std::fs::read_to_string(d.join(STATUS_FILE))
                     .is_ok_and(|s| s.contains("コードを読みました"))
@@ -2078,9 +2116,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: VPN のネットワークを足した範囲（LAN の接続が開く範囲）で、相手のコードの候補のうち VPN のネットワークの中が落ちる、
-    /// ネットワークの外（隣の /8・ネットワークのアドレス・世界のアドレス）が残る、lan の分（私設）が落ちる、範囲 lan のままの接続が VPN の候補を通す、
-    /// VPN の候補しか無い範囲 lan の接続が断られない。
     #[test]
     fn a_vpn_scope_keeps_the_candidates_inside_its_network_and_lan_only() {
         let their = [
@@ -2270,7 +2305,7 @@ mod tests {
         d.a.close(ByeReason::Cancelled);
         d.run(2);
         assert!(slot.is_done());
-        // セッションを作る前に捨てる・設定を取る・作り直す・繋がる、のどの tick でも確保しない（ゲームのスレッドの経路）。
+        // セッションを作る前に捨てる・設定を取る・作り直す・接続する、のどの tick でも確保しない（ゲームのスレッドの経路）。
         assert_eq!(d.alloc_a, 0, "ゲームのスレッドの経路で確保した");
     }
 
@@ -2718,7 +2753,10 @@ mod tests {
         assert_ne!(seat_a, seat_b);
         for (w, d, seat) in [(&wa, &da, seat_a), (&wb, &db, seat_b)] {
             let notes = w.notes().join("\n");
-            assert!(notes.contains("繋がった。my_code.txt を消した"), "{notes}");
+            assert!(
+                notes.contains("接続しました。my_code.txt を消しました"),
+                "{notes}"
+            );
             assert!(
                 notes.contains("対戦の形が決まった: delay 方式（遅れ 3 フレーム）"),
                 "決まった形が本ログに無い: {notes}"
@@ -2743,7 +2781,9 @@ mod tests {
             let told = notes
                 .find("（検査の知らせ）")
                 .expect("知らせが本ログに無い");
-            let said = notes.find("繋がった。my_code.txt を消した").unwrap();
+            let said = notes
+                .find("接続しました。my_code.txt を消しました")
+                .unwrap();
             assert!(said < told, "窓の文より前に知らせた\n{notes}");
         }
         assert_eq!(
@@ -2752,12 +2792,15 @@ mod tests {
             "繋がった知らせの数（2 台で 1 回ずつ）"
         );
         let notes_b = wb.notes().join("\n");
-        assert!(notes_b.contains("peer_code.txt を読めない"), "{notes_b}");
         assert!(
-            notes_b.contains("返すコードを my_code.txt に書いた"),
+            notes_b.contains("peer_code.txt を読めませんでした"),
             "{notes_b}"
         );
-        // 試験のまとめ（本ログの最後の節）: 繋がってマッチを終えた実行は、両側とも ネットワーク・接続コード・繋がったか・選択・マッチ・同期・終わりの理由が 〇 になる。
+        assert!(
+            notes_b.contains("返すコードを my_code.txt に書きました"),
+            "{notes_b}"
+        );
+        // 試験のまとめ（本ログの最後の節）: 接続してマッチを終えた実行は、両側とも ネットワーク・接続コード・接続したか・選択・マッチ・同期・終わりの理由が 〇 になる。
         for (who, np, w, net) in [("A", &npa, &wa, &na), ("B", &npb, &wb, &nb)] {
             use crate::net_watch::NetStatus;
             use crate::trial_summary::{self as ts, Facts, HostFacts, OpenInfo, Stage, Stun};

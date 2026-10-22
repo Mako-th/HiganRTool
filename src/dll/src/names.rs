@@ -51,8 +51,8 @@ pub fn daily_log_file_name(t: &LocalTime) -> String {
     format!("{LOG_PREFIX}{:04}{:02}{:02}.log", t.year, t.month, t.day)
 }
 
-/// 台本・検査の実行か（本ログを回ごとの名前にする）: ローダーの `--ini` / `--script` が環境の変数を置いた、または DLL のフォルダに
-/// `script.txt` がある。この実行は同じ PC で複数を重ねて起こし、回ごとに本ログを読み分けるので、日ごとにまとめない。
+/// 台本・検査の実行か（本ログを回ごとの名前にする）: ローダーの `--ini` / `--script` が環境変数を設定した、または DLL のフォルダに
+/// `script.txt` がある。この実行は同じ PC で複数を同時に起動し、回ごとに本ログを読み分けるので、日ごとにまとめない。
 pub fn is_scripted_run(
     ini_env: Option<&OsStr>,
     script_env: Option<&OsStr>,
@@ -196,7 +196,6 @@ mod tests {
         assert_eq!(side_file_name("x", "_ticks.csv"), "x_ticks.csv");
     }
 
-    /// 壊れたら落ちる: 日ごとの名前に時刻・PID が入る（起動ごとに別ファイルへ戻る）。
     #[test]
     fn daily_log_name_is_the_date_only() {
         assert_eq!(daily_log_file_name(&t(9, 7)), "dll_20260905.log");

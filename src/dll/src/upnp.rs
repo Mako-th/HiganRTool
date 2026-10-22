@@ -1,26 +1,18 @@
 //! UPnP（IGD）でソケットの UDP ポートの割り当てを家のルーターに頼む（dll の側。文面の読み書きは `higanr_core::upnp`）。
 //!
-//! ネットワークを開くとき別のスレッド（`Handle::spawn`）で、SSDP の探索 → 機器の記述 → AddPortMapping の順に問い合わせ、割り当てた
-//! 外側のポートを自分の候補に載せる（`NetSettings::candidates_for_upnp`）。開く側は上限の時間（`OPEN_BUDGET`）だけ待ち、
-//! 過ぎたら「使用不可」として進む（遅れて割り当てられても、誰も使わないので自分で消す）。割り当ては期限つき
-//! （`LEASE_SECS`）で、スレッドは期限の半分ごとに頼み直し、止められたら DeletePortMapping で消す。プロセスごと落ちても期限で消える。
-//! 期限つきを 725（期限なししか受けない）で断られたら、期限なし（リース 0）で 1 回だけ頼み直す。期限なしは頼み直さず、落ちると
-//! 残るので、説明（`MAPPING_DESCRIPTION`）を印にして次の起動が引き継ぐ。
-//! 足す前に GetSpecificPortMappingEntry で同じ外側のポートを引く。この PC・このソケット向けで期限なしかつ説明が印でない
-//! （手で開けた形）なら足さず、頼み直しも削除もしない。期限つき、または期限なしで説明が印のものは前の起動の消し残りと見て
-//! 自分のものにする（期限つきは足し直して期限を延ばす。どちらも閉じるとき消す）。
-//! 足した後はルーターの外側のアドレスを引き、STUN で見えたアドレスと突き合わせるのは
-//! 開く側（`net_udp::nat_settle`）。
+//! ネットワークを開くとき別のスレッド（`Handle::spawn`）で、SSDP の探索 → 機器の記述 → AddPortMapping の順に問い合わせ、割り当てた外側のポートを自分の候補に載せる（`NetSettings::candidates_for_upnp`）。開く側は上限の時間（`OPEN_BUDGET`）だけ待ち、過ぎたら「使用不可」として進む（遅れて割り当てられても、誰も使わないので自分で消す）。
+//! 割り当ては期限つき（`LEASE_SECS`）で、スレッドは期限の半分ごとに頼み直し、止められたら DeletePortMapping で消す。プロセスごと落ちても期限で消える。期限つきを 725（期限なししか受けない）で断られたら、期限なし（リース 0）で 1 回だけ頼み直す。期限なしは頼み直さず、落ちると残るので、説明（`MAPPING_DESCRIPTION`）を印にして次の起動が引き継ぐ。
+//! 足す前に GetSpecificPortMappingEntry で同じ外側のポートを引く。この PC・このソケット向けで期限なしかつ説明が印でない（手で開けた形）なら足さず、頼み直しも削除もしない。期限つき、または期限なしで説明が印のものは前の起動の消し残りと見て自分のものにする（期限つきは足し直して期限を延ばす。どちらも閉じるとき消す）。
+//! 足した後にルーターの外側のアドレスを引き、STUN で見えたアドレスと突き合わせるのは開く側（`net_udp::nat_settle`）。
 //!
-//! 通信は LAN の中だけ（SSDP はマルチキャスト TTL 2、HTTP の宛先は LAN のアドレスに限る。`higanr_core::upnp::Url`）。ゲームのスレッドでは
-//! 呼ばない（ブロッキング I/O）。本ログに出すのは結果とポートだけで、ルーターのアドレスは書かない。
+//! 通信は LAN の中だけ（SSDP はマルチキャスト TTL 2、HTTP の宛先は LAN のアドレスに限る。`higanr_core::upnp::Url`）。ゲームのスレッドでは呼ばない（ブロッキング I/O）。本ログに出すのは結果とポートだけで、ルーターのアドレスは書かない。
 #![forbid(unsafe_code)]
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -47,7 +39,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 /// 外側のポートが他の割り当てと重なったとき、頼み直す別のポートの数。
 pub const ALT_PORTS: usize = 3;
 
-/// 通信の道具。本物は std の UDP / TCP（`NetWire`）、検査は偽のルーター。
+/// 通信の差し替え口。本物は std の UDP / TCP（`NetWire`）、検査は偽のルーター。
 pub trait Wire: Send {
     /// M-SEARCH を `local` のソケットから出し、返事のあった機器の記述の URL を返す（最初の返事で返してよい）。返事が無ければ空。
     fn discover(
@@ -70,7 +62,7 @@ fn io_err(e: std::io::Error) -> UpnpError {
 
 pub struct NetWire;
 
-/// SSDP が答えなかったソケットの記録（0 は無し）。答えない機器に、繋ぎ直すたびに探索の上限まで待たないための、プロセスの中の記憶。
+/// SSDP が答えなかったソケットの記録（0 は無し）。答えない機器に、接続し直すたびに探索の上限まで待たないための、プロセスの中の記憶。
 /// ソケットのアドレスごとに覚えるので、別のネットワークへ移れば探し直す。誤りと断りは覚えない。
 struct SsdpMemo(AtomicU32);
 
@@ -465,6 +457,10 @@ pub enum State {
     OuterBehind,
     /// 割り当てたが、外側のアドレスを突き合わせられない（ルーターが答えない・STUN の IPv4 のアドレスが無い）ので使わない。
     OuterUnchecked,
+    /// 割り当てたが、自分の候補の並びに足せないので使わない。
+    NoRoom,
+    /// 割り当てたが、中継する観戦者の中継の配る側を作れなかったので使わない。
+    NoRelay,
 }
 
 /// 本ログ・診断に出す数（アドレスは持たない）。
@@ -534,6 +530,14 @@ impl Stats {
                 "UPnP: 使えない（ルーターの外側のアドレスを STUN のアドレスと突き合わせられない。割り当ては取り下げた・後始末: {}）",
                 self.release.text()
             ),
+            State::NoRoom => format!(
+                "UPnP: 使用不能（アドレス候補の空きなし。割り当てを取り下げ。後始末: {}）",
+                self.release.text()
+            ),
+            State::NoRelay => format!(
+                "UPnP: 不使用（中継の配信側なし。割り当てを取り下げ。後始末: {}）",
+                self.release.text()
+            ),
         }
     }
 }
@@ -587,6 +591,19 @@ impl Shared {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.m.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// 結果を待たずに覗いたもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peek {
+    /// まだ出ていない（錠を取れなかったときも）。
+    Pending,
+    Mapped {
+        external: u16,
+        outer_ip: Option<Ipv4Addr>,
+    },
+    /// 割り当てられなかった。
+    NotMapped,
 }
 
 /// 別のスレッドで割り当てを頼み、持ち続け、止められたら消す持ち手。
@@ -681,6 +698,24 @@ impl Handle {
         Outcome::TimedOut
     }
 
+    /// 結果を待たずに覗く（受信スレッドの周回から呼ぶ。錠を待たない）。`wait_until` と違って諦めの印を立てないので、遅れて出た
+    /// 割り当ても残る。
+    pub fn peek(&self) -> Peek {
+        let g = match self.shared.m.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Peek::Pending,
+        };
+        match &g.outcome {
+            None => Peek::Pending,
+            Some(Outcome::Mapped { external, outer_ip }) => Peek::Mapped {
+                external: *external,
+                outer_ip: *outer_ip,
+            },
+            Some(_) => Peek::NotMapped,
+        }
+    }
+
     pub fn stats(&self) -> Stats {
         self.shared.lock().stats
     }
@@ -767,7 +802,7 @@ fn worker(mut w: Box<dyn Wire>, shared: &Shared, ports: &[u16], plan: &Plan, sta
     };
     let mut g = shared.lock();
     if g.abandoned || g.stop {
-        // 誰も待っていない。割り当てを使わないので、その場で消す。
+        // 開く側が待つのをやめた（または止める印が立った）。割り当てを使わないので、その場で消す。
         drop(g);
         let r = finish(&mut *w);
         let mut g = shared.lock();
@@ -1389,6 +1424,36 @@ mod tests {
     }
 
     #[test]
+    fn peeking_never_waits_or_gives_up_so_a_late_mapping_stays_until_stopped() {
+        let r = router();
+        r.lock().unwrap().delay = Duration::from_millis(80);
+        let h = handle(&r, RENEW_EVERY);
+        let t0 = Instant::now();
+        assert_eq!(h.peek(), Peek::Pending);
+        assert!(t0.elapsed() < Duration::from_millis(40), "覗くだけで待った");
+        let want = Peek::Mapped {
+            external: 47001,
+            outer_ip: Some(PUBLIC),
+        };
+        assert!(wait_for(|| h.peek() == want), "{:?}", h.peek());
+        assert_eq!(h.stats().state, State::Mapped);
+        {
+            let g = r.lock().unwrap();
+            assert!(
+                g.mappings.contains_key(&47001),
+                "覗いた後の割り当てを消した"
+            );
+            assert_eq!(g.deletes, 0);
+        }
+        h.stop();
+        assert_eq!(r.lock().unwrap().deletes, 1);
+        let refusing = router();
+        refusing.lock().unwrap().refuse = Some((500, 501));
+        let h = handle(&refusing, RENEW_EVERY);
+        assert!(wait_for(|| h.peek() == Peek::NotMapped), "{:?}", h.peek());
+    }
+
+    #[test]
     fn stopping_during_the_query_leaves_nothing_behind() {
         let r = router();
         r.lock().unwrap().delay = Duration::from_millis(40);
@@ -1640,7 +1705,7 @@ mod tests {
     #[test]
     fn discovery_uses_a_reply_only_when_the_sender_is_the_machine_it_names() {
         let local = Ipv4Addr::LOCALHOST;
-        // 送り手（127.0.0.1）と LOCATION のアドレス（127.0.0.2）が違う返事は使わない。
+        // 返事を送った機器（127.0.0.1）と LOCATION のアドレス（127.0.0.2）が違う返事は使わない。
         let (dest, j) = ssdp_responder("http://127.0.0.2:5000/d.xml");
         let found = NetWire::search(local, Duration::from_millis(400), dest).unwrap();
         j.join().unwrap();
@@ -1655,7 +1720,7 @@ mod tests {
 
     // ---- 本物のルーターの検査のガード ----
 
-    /// 呼ばれたら数える偽の道具。
+    /// 呼ばれたら数える偽の `Wire`。
     #[derive(Default)]
     struct CountingWire(u32);
 
@@ -1708,6 +1773,8 @@ mod tests {
             State::Mapped,
             State::OuterBehind,
             State::OuterUnchecked,
+            State::NoRoom,
+            State::NoRelay,
         ];
         let mut seen = std::collections::HashSet::new();
         for state in states {
@@ -1908,7 +1975,7 @@ mod tests {
         assert!(matches!(r, Err(UpnpError::Io(_))), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(2));
         drop(l);
-        // 閉じたポートへ: つなげない。
+        // 閉じたポートへ: 接続できない。
         let r = NetWire.exchange(&to, b"GET /x HTTP/1.1\r\n\r\n", Duration::from_millis(150));
         assert!(matches!(r, Err(UpnpError::Io(_))), "{r:?}");
     }

@@ -2,20 +2,18 @@
 //! クライアントが返すコードを返す。観戦は申し込みに観戦の印を付け、ホストが観戦コードを返す。ルームサーバーが運ぶ接続コードの代わりに
 //! LAN の UDP が運ぶだけで、コードの中身も、そのあとの接続（HELLO・鍵の交換）も、インターネットの経路と同じ。
 //!
-//! - 1 通 = マジック `HGLN`（4 B）・版（1 B）・種類（1 B）・申し込みの番号（4 B。クライアントが引く乱数で、返事に写す）・種類ごとの本文。
-//!   ゲームの受信ソケットとは別のソケットで受ける（ゲームの受信ループには入れない）ので、ゲームの通信の `HGRT` とは混ざらない。
+//! - 1 通 = マジック `HGLN`（4 B）・バージョン（1 B）・種類（1 B）・申し込みの番号（4 B。クライアントが引く乱数で、返事にコピーする）・種類ごとの本文。ゲームの受信ソケットとは別のソケットで受ける（ゲームの受信ループには入れない）ので、ゲームの通信の `HGRT` とは混ざらない。
 //! - 本文のコードは ASCII の表示できる文字だけ・`code::MAX_CODE_CHARS` まで。長さは 2 B で持ち、1 通の長さと合わなければ捨てる。
 //! - 守るのは LAN の中の取り違えと再送だけ（秘密は載せない。コードの中の秘密は LAN の中を平文で渡る）。ホストは先着 1 人（`Host`）。
 //!
-//! 状態機械 `Host` / `Client` / `Watcher` は時刻を引数で受ける（ms）。送る・開く・待つ副作用は呼び手（dll の `lan_link`）の仕事で、ここは
-//! 「何を返すか・次に何をさせるか」だけを決める。
+//! 状態機械 `Host` / `Client` / `Watcher` は時刻を引数で受ける（ms）。送る・開く・待つ副作用は呼び手（dll の `lan_link`）の仕事で、ここは「何を返すか・次に何をさせるか」だけを決める。
 
 use core::net::SocketAddrV4;
 
 use crate::code::MAX_CODE_CHARS;
 
 pub const MAGIC: [u8; 4] = *b"HGLN";
-/// 申し込みのやりとりの版。通信の `PROTO_VER` とは別（このやりとりの形が変わるときだけ上げる）。
+/// 申し込みのやりとりのバージョン。通信の `PROTO_VER` とは別（このやりとりの形が変わるときだけ上げる）。
 pub const LAN_VER: u8 = 1;
 const HEADER_LEN: usize = 10;
 
@@ -45,7 +43,7 @@ pub const HOST_WAIT_REPLY_MS: u64 = 30_000;
 pub enum Why {
     /// もう別の人が参加している（先着 1 人）。
     Busy,
-    /// 観戦の申し込みだが、まだ対戦が始まっていない（観戦コードは対戦がつながってから出せる）。
+    /// 観戦の申し込みだが、まだ対戦が始まっていない（観戦コードは対戦が接続してから出せる）。
     NotYet,
     /// 観戦を受けない設定（`[spectate] enable = 0`）か、観戦の用意ができていない。
     WatchOff,
@@ -96,7 +94,7 @@ pub enum Msg<'a> {
 pub enum DecodeError {
     TooShort,
     BadMagic,
-    /// このやりとりの版が違う（中は相手の版）。
+    /// このやりとりのバージョンが違う（中は相手のバージョン）。
     BadVersion(u8),
     BadKind(u8),
     /// 本文の長さが種類と合わない。
@@ -268,7 +266,7 @@ pub enum HostAct {
     Accepted { src: SocketAddrV4 },
     /// クライアントの返すコードが届いた（1 回だけ）。呼び手はこれを読んで接続を始める。
     DeliverReply { code: String },
-    /// 観戦コードを頼まれた（対戦がつながっている間）。呼び手は観戦コードを用意して `Host::watch_code_ready` へ渡す。
+    /// 観戦コードを頼まれた（対戦が接続している間）。呼び手は観戦コードを用意して `Host::watch_code_ready` へ渡す。
     WatchWanted { src: SocketAddrV4, id: u32 },
     /// 返すコードが届かないまま上限が過ぎたので、待機へ戻った（次の参加者を受ける）。
     Rewait,
@@ -293,9 +291,9 @@ enum HostState {
         code: String,
         since: u64,
     },
-    /// 返すコードを渡した（確認を返した）。
+    /// 返すコードを呼び手へ渡した（確認をクライアントへ返した）。
     Replied { src: SocketAddrV4, id: u32 },
-    /// 対戦がつながった。
+    /// 対戦が接続した。
     Linked,
     /// 待つ上限が過ぎた。
     Dead,
@@ -450,7 +448,7 @@ impl Host {
         acts
     }
 
-    /// 対戦がつながった（以後、観戦の申し込みを受ける）。
+    /// 対戦が接続した（以後、観戦の申し込みを受ける）。
     pub fn linked(&mut self) {
         if !matches!(self.state, HostState::Dead) {
             self.state = HostState::Linked;
@@ -504,7 +502,7 @@ pub enum ClientAct {
     Send(Vec<u8>),
     /// ホストの始める側のコードが届いた（1 回だけ）。呼び手はこれを読んで返すコードを作り、`Client::reply_ready` へ渡す。
     DeliverOffer { code: String },
-    /// 返すコードの受け取りを確かめた。
+    /// 返すコードの受け取りを検証した。
     Done,
     /// ホストが断った。
     Refused(Why),
@@ -526,7 +524,7 @@ enum ClientState {
         since: u64,
         last: u64,
     },
-    /// コードを呼び手へ渡した。返すコードを待っている。
+    /// ホストの始める側のコードを呼び手へ渡した。返すコードを待っている。
     Offered,
     Replying {
         code: String,
@@ -809,7 +807,6 @@ mod tests {
         assert!(b.len() <= crate::wire::MAX_DATAGRAM, "{}", b.len());
     }
 
-    /// 壊れたら落ちる: 切れた 1 通・余りのある 1 通・種類や版や理由の壊れた 1 通を、読んでしまう。
     #[test]
     fn truncated_padded_and_bad_messages_are_refused() {
         for m in msgs() {
@@ -907,7 +904,6 @@ mod tests {
             .collect()
     }
 
-    /// 壊れたら落ちる: 先着 1 人でなくなる、2 人目に断りを返さない、同じ人の再送で状態や返事が崩れる。
     #[test]
     fn the_host_takes_the_first_joiner_only_and_repeats_its_answers() {
         let mut h = Host::new(ME, true);
@@ -1066,7 +1062,7 @@ mod tests {
             .unwrap()
         };
         let mut h = Host::new(ME, true);
-        // 対戦がつながる前: まだ。
+        // 対戦の接続前: まだ。
         assert_eq!(
             sent(&h.on_datagram(a, &watch(1), 0)),
             vec![(
@@ -1136,15 +1132,13 @@ mod tests {
                 }
             )]
         );
-        // つながった後の参加の申し込みは断る。
+        // 接続後の参加の申し込みは断る。
         assert!(matches!(
             sent(&h.on_datagram(addr(30, 1), &join(77), 9))[0].1,
             Msg::Refuse { why: Why::Busy, .. }
         ));
     }
 
-    /// 壊れたら落ちる: 同じ PC がやり直した申し込み（同じアドレス・別のポートと番号）を断る、置き換えた後に前の申し込みの返すコードを読む、
-    /// 返すコードを受け取った後や別のアドレスの申し込みまで置き換える。
     #[test]
     fn a_new_request_from_the_same_address_replaces_the_unanswered_one() {
         let mut h = Host::new(ME, true);
@@ -1196,8 +1190,6 @@ mod tests {
         ));
     }
 
-    /// 壊れたら落ちる: コードの用意の時間切れを言わない、返すコードの時間切れで待機へ戻らない（打ち間違えた 1 通で待機が終わる）、待機へ戻った後に
-    /// 次の参加者を受けない。
     #[test]
     fn the_host_gives_up_when_the_code_or_the_reply_does_not_come() {
         let a = addr(10, 50000);
@@ -1281,7 +1273,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: クライアントの手順（申し込みの再送・コードの受け取り・返すコードの再送と確認・断り・時間切れ）が崩れる。
     #[test]
     fn the_client_repeats_join_until_the_offer_comes_then_repeats_reply_until_acked() {
         let mut c = Client::new(ME, 42, 1000);

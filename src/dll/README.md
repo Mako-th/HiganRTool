@@ -28,12 +28,12 @@
 - **ネットワーク**: `net_udp.rs`（UDPのソケット・受信スレッド・接続してよいアドレスの範囲）・`net_ring.rs`（受信スレッドからゲームのスレッドへの受け渡し）・`net_win.rs`（相手を待つ待ち）・`upnp.rs`・`adapters_win.rs`・`lan_link.rs`・`vpn_snap.rs`（自分のPCのVPNのネットワークの控え）。
 - **対戦**: `netplay.rs`と`netplay/`（入力の地点の判断。delay方式とrollback方式・相手を待つ間の切断）・`net_game.rs`（ゲームのメモリの読み書き）・`net_select.rs`と`net_portrait.rs`（キャラ選択などの画面の同期）・`rollback_play.rs`と`rollback_play_win.rs`と`rollback_resim.rs`と`rollback_draw.rs`（rollbackのための状態の保存と進め直し）・`digit_keys.rs`と`digit_keys_win.rs`（Ctrl＋数字などのキー）・`shot_key.rs`と`shot_key_win.rs`（ネット対戦の間も自分のPCにだけ撮るスクリーンショット）・`match_events.rs`。
 - **接続コードとルームサーバー**: `net_code.rs`・`net_code_game.rs`・`clipboard.rs`と`clipboard_win.rs`・`net_room.rs`と`room_win.rs`（WinHTTPのWebSocket）・`watch_feed.rs`（観戦の一覧）。
-- **観戦**: `spectate_host.rs`と`spectate_ring.rs`と`spectate_offer.rs`（配る側）・`spectate_watch.rs`と`spectate_join.rs`と`spectate_watch_code.rs`（観戦者の側）。
+- **観戦**: `spectate_host.rs`と`spectate_ring.rs`と`spectate_offer.rs`（配る側）・`spectate_refuse.rs`（2人のどちらかが観戦を許可していないルームマッチで、観戦者に断りを返す側）・`spectate_watch.rs`と`spectate_join.rs`と`spectate_watch_code.rs`（観戦者の側）。
 - **ゲーム内のメニューと描画**: `net_ui.rs`（メニューのゲームのスレッドの側。状態機械は`higanr_core::net_menu`）・`overlay.rs`と`overlay_win.rs`（文字の描画）・`draw.rs`・`text_input_win.rs`（ルーム名の入力）・`ui_lang.rs`と`ui_lang_win.rs`・`notify_win.rs`（接続したときの音とタスクバーの点滅。前面は奪いません）・`window_win.rs`（ウィンドウの大きさ）・`pad_extra.rs`と`pad_extra_win.rs`（パッドの十字キー）。
-- **リプレイ**: `replay_save.rs`と`replay_save_win.rs`（自動保存と印）・`replay_watch.rs`と`replay_watch_win.rs`（素の花映塚での再生を見張り、照合のための1行をログに書く）。
+- **リプレイ**: `replay_save.rs`と`replay_save_win.rs`（自動保存と印）・`menu_save.rs`（ゲームのメニューから保存したリプレイへ印を足す判断）と`menu_save_win.rs`（その保存の入口。長い試合の保存で落ちる不具合の避け方）・`replay_watch.rs`と`replay_watch_win.rs`（素の花映塚での再生を見張り、照合のための1行をログに書く）。
 - **ペース**: `pacing.rs`と`pacing_win.rs`（フレームのペース）。
 - **設定とログ**: `net_config.rs`（`HiganRTool.ini`。誤りのある行は既定値で読みます）・`ini_seed.rs`・`ini_save.rs`・`main_log.rs`・`log_mode.rs`・`names.rs`・`observe.rs`・`crash_win.rs`（落ちたときの記録）・`show_text.rs`（ローダーのウィンドウに出す文）。
-- **開発用の計測と検査**: `script_win.rs`と`scripted.rs`と`script_watch.rs`（開発用の台本で入力を流す）・`state_ops.rs`・`menu.rs`と`menu_win.rs`・`ticks.rs`・`copies.rs`・`feeds.rs`・`render_only.rs`・`shots.rs`と`shot_win.rs`・`alloc_count.rs`と`alloc_win.rs`・`rollback_probe.rs`と`rollback_win.rs`・`trial_summary.rs`・`test_alloc.rs`・`rollback_testkit.rs`・`spectate_testkit.rs`。
+- **開発用の計測と検査**: `script_win.rs`と`scripted.rs`と`script_watch.rs`（開発用の台本で入力を流す）・`state_ops.rs`・`menu.rs`と`menu_win.rs`・`ticks.rs`・`copies.rs`・`feeds.rs`・`render_only.rs`・`shots.rs`と`shot_win.rs`・`alloc_count.rs`と`alloc_win.rs`・`rollback_probe.rs`と`rollback_win.rs`・`trial_summary.rs`・`test_alloc.rs`・`rollback_testkit.rs`・`spectate_testkit.rs`・`test_code.rs`（検査用の機械語の置き場）。
 
 ## ビルド
 

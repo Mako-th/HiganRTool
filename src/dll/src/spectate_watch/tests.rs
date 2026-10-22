@@ -20,6 +20,12 @@ fn cfg(session: u32) -> WatcherConfig {
     }
 }
 
+/// `cfg(session)` の観戦者の公開鍵（鍵の種は session の値で埋めてある）。
+fn public_of(session: u32) -> [u8; 32] {
+    higanr_core::seal::Ephemeral::from_seed(&higanr_core::seal::KeySeed([session as u8; 32]))
+        .public()
+}
+
 #[test]
 fn the_slot_hands_over_only_the_newest_config_once_and_never_waits() {
     let slot = WatchSlot::new();
@@ -36,48 +42,23 @@ fn the_slot_hands_over_only_the_newest_config_once_and_never_waits() {
         assert_eq!(seen, 0, "取れなかったのに世代を進めた");
     }
     let got = slot.take_newer(&mut seen).expect("新しい設定");
-    assert_eq!(got.session_id, 2, "古い設定を取った");
+    assert_eq!(got.watcher.public_key(), public_of(2), "古い設定を取った");
     assert_eq!(seen, 2);
     assert!(
         slot.take_newer(&mut seen).is_none(),
         "同じ設定を 2 回取った"
     );
     slot.offer(cfg(3));
-    assert_eq!(slot.take_newer(&mut seen).map(|c| c.session_id), Some(3));
+    assert_eq!(
+        slot.take_newer(&mut seen).map(|o| o.watcher.public_key()),
+        Some(public_of(3))
+    );
     assert!(!slot.is_joined() && !slot.is_done() && !slot.gave_up());
     slot.mark_joined();
     assert!(slot.is_joined() && !slot.is_done() && !slot.gave_up());
     slot.mark_done();
     slot.give_up();
     assert!(slot.is_done() && slot.gave_up());
-}
-
-#[test]
-fn arrival_stamps_cover_exactly_the_records_that_became_available() {
-    let mut a = [NO_ARRIVAL; ARRIVAL_SLOTS];
-    stamp_arrivals(&mut a, 5, 5, 111);
-    stamp_arrivals(&mut a, 7, 3, 111);
-    assert!(
-        a.iter().all(|x| x.idx == u32::MAX),
-        "進んでいないのに付けた"
-    );
-    stamp_arrivals(&mut a, 5, 8, 1_000);
-    for idx in 0..12u32 {
-        let x = a[idx as usize % ARRIVAL_SLOTS];
-        let want = (5..8).contains(&idx);
-        assert_eq!(x.idx == idx, want, "idx {idx}");
-        if want {
-            assert_eq!(x.t_us, 1_000);
-        }
-    }
-    // 溜まりが枠より多く進んだ（遅れて JOIN した）: 新しい方の枠数だけ付け、それより古い番号は付けない。
-    let mut b = [NO_ARRIVAL; ARRIVAL_SLOTS];
-    stamp_arrivals(&mut b, 0, 3 * ARRIVAL_SLOTS as u32, 5);
-    let stamped = b.iter().filter(|x| x.idx != u32::MAX).count();
-    assert_eq!(stamped, ARRIVAL_SLOTS);
-    let last = 3 * ARRIVAL_SLOTS as u32 - 1;
-    assert_eq!(b[last as usize % ARRIVAL_SLOTS].idx, last);
-    assert!(b.iter().all(|x| x.idx >= 2 * ARRIVAL_SLOTS as u32));
 }
 
 #[test]
@@ -91,6 +72,7 @@ fn the_log_line_appears_only_after_a_watcher_published() {
             wait_budget_us: 16_000,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     s.publish(&wp);
@@ -98,7 +80,7 @@ fn the_log_line_appears_only_after_a_watcher_published() {
     let t = s.text();
     for want in [
         "観戦者: 段階 コードか返事を待つ",
-        "終わり まだ",
+        "終わり 未終了",
         "観戦者の遅れ",
         "観戦者の受け",
     ] {
@@ -125,14 +107,16 @@ fn every_end_has_its_own_code_and_a_word() {
         WatchEnd::HoldTimeout,
         WatchEnd::Lost,
         WatchEnd::Quit,
+        WatchEnd::BufferFull,
+        WatchEnd::Broken,
     ];
     let codes: Vec<u32> = ends.iter().map(|e| end_code(Some(*e)).0).collect();
-    assert_eq!(codes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(codes, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert_eq!(end_code(None), (0, 0));
-    assert_eq!(ENDS.len(), 9);
+    assert_eq!(ENDS.len(), 11);
     assert!(
-        ENDS[end_code(Some(WatchEnd::Quit)).0 as usize].contains("自分で抜けた（Esc）"),
-        "本ログの終わりの理由に「自分で抜けた（Esc）」が出る"
+        ENDS[end_code(Some(WatchEnd::Quit)).0 as usize].contains("自分で抜けた"),
+        "本ログの終わりの理由に「自分で抜けた」が出る"
     );
     assert_eq!(end_code(Some(ends[4])).1, 3, "持ち越した押下の step");
 }
@@ -198,6 +182,69 @@ fn shot_step_code_carries_phase_and_screen_above_script_steps() {
 }
 
 #[test]
+fn the_join_carries_the_ff_max_of_the_watch_config() {
+    use crate::netplay::fake::FakeNet;
+    use crate::netplay::{Game, Net};
+    use higanr_core::wire::{self, MAX_DATAGRAM, Message};
+    struct Idle;
+    impl Game for Idle {
+        fn scenes(&mut self) -> (u32, u32) {
+            (1, 0)
+        }
+        fn local_input(&mut self, _s: higanr_core::wire::Seat) -> u16 {
+            0
+        }
+        fn feed(&mut self, _i: u32, _w: u16) {}
+        fn own_select(
+            &mut self,
+            _s: higanr_core::wire::Seat,
+            _r: higanr_core::lockstep::Role,
+        ) -> higanr_core::wire::Select {
+            unreachable!()
+        }
+        fn apply_agreed(
+            &mut self,
+            _p: higanr_core::wire::Seat,
+            _a: &higanr_core::selection::Agreed,
+        ) -> Result<(), crate::netplay::BadValue> {
+            unreachable!()
+        }
+        fn write_charge(&mut self, _p1: u8, _p2: u8) -> bool {
+            true
+        }
+        fn check_values(&mut self) -> (u16, u32, u8, u8) {
+            (0, 0, 0, 0)
+        }
+    }
+    // 既定（8）と違う値で、範囲の両端も。
+    for ff_max in [3u32, 1, 16] {
+        let a = std::net::SocketAddr::from(([127, 0, 0, 1], 41_302));
+        let h = std::net::SocketAddr::from(([127, 0, 0, 1], 47_001));
+        let (mut net, mut host, _clock) = FakeNet::pair(a, h, 0);
+        let slot = Arc::new(WatchSlot::new());
+        let c = cfg(6);
+        slot.offer(c);
+        let mut wp = WatchPlay::new(
+            Arc::clone(&slot),
+            WatchConfig {
+                wait_budget_us: 16_000,
+                margin_frames: 3,
+                require_net_selection: false,
+                ff_max,
+            },
+        );
+        wp.on_input(&mut Idle, &mut net);
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (_, n, _) = host.recv(&mut buf).expect("JOIN が届いていない");
+        let key = higanr_core::auth::AuthKey::derive(&c.secret, c.session_id);
+        match wire::decode(&key, None, &buf[..n]).map(|p| p.msg) {
+            Ok(Message::SpectateJoin(j)) => assert_eq!(u32::from(j.ff_max), ff_max),
+            other => panic!("JOIN でない: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
     use crate::netplay::fake::FakeNet;
     use crate::netplay::{Game, Phase};
@@ -212,6 +259,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
             wait_budget_us: 16_000,
             margin_frames: 3,
             require_net_selection: false,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     struct Idle;
@@ -253,7 +301,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
     assert_eq!(wp.phase(), Phase::Ended);
     assert!(slot.is_done());
     assert!(wp.bye.is_none(), "繋がっていないのに BYE を積んだ");
-    // 繋がった後の `give_up` は観戦を切らない（別の slot・別の WatchPlay で、`Watcher` が繋がった形を作れないので、段階で見る）。
+    // 接続した後の `give_up` は観戦を切らない（別の slot・別の WatchPlay で、`Watcher` が接続した形を作れないので、段階で見る）。
     let slot2 = Arc::new(WatchSlot::new());
     let mut wp2 = WatchPlay::new(
         Arc::clone(&slot2),
@@ -261,6 +309,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
             wait_budget_us: 16_000,
             margin_frames: 3,
             require_net_selection: false,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     wp2.set_phase_for_test(Phase::Selecting);
@@ -320,6 +369,7 @@ fn a_watcher_asks_to_skip_the_save_screen_only_when_its_game_leaves_by_save_and_
                 wait_budget_us: 16_000,
                 margin_frames: 3,
                 require_net_selection: true,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         )
     };
@@ -435,6 +485,7 @@ fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
             wait_budget_us: 0,
             margin_frames: 3,
             require_net_selection: true,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
         },
     );
     wp.set_phase_for_test(Phase::Lockstep);

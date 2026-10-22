@@ -1,9 +1,9 @@
-//! 候補に無い送り元を学ぶ経路（NAT 越えの対策。ルーターが外側のポートを付け替えた相手に繋ぐ）の検査。
+//! 候補に無い送り元を学ぶ経路（NAT 越えの対策。ルーターが外側のポートを付け替えた相手に接続する）の検査。
 //! 公開の API（`Link` と `PongResponder`）だけを使う。
 //!
 //! 前半は 1 つの `Link`（A。ゲスト側の nonce 1）に、相手 B のつもりの 1 通ずつを手で渡して、学ぶ・学ばないのゲートを 1 つずつ見る。
-//! 後半は 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型。core は pure なので実際の UDP・時計は使わない）で繋ぎ、
-//! 組み上がりで繋がることを見る。
+//! 後半は 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型。core は pure なので実際の UDP・時計は使わない）で接続し、
+//! 組み上がりで接続することを見る。
 //!
 //! アドレス: `B_CODE` は A が持つ接続コードの中の B のアドレス（候補）。`B_REAL` は B のルーターが付け替えた実際の送り元（コードに無い）。
 //! `A_ADDR` は A のアドレス（B のコードの中の A の候補と実際が同じ）。
@@ -134,6 +134,9 @@ fn hello(nonce: u64) -> Message {
         arrival: wire::Arrival::Unknown,
         build: higanr_core::update::BUILD_NUMBER,
         public: public_of(nonce),
+        host_pick: false,
+        nat: higanr_core::nat::NatMark::UNKNOWN,
+        rollback_delay: 0,
     })
 }
 
@@ -150,6 +153,7 @@ fn agree() -> Message {
         host_seat: Seat::P1,
         delay: 2,
         mode: Mode::Delay,
+        pick: higanr_core::host_pick::Pick::NONE,
     }
 }
 
@@ -277,7 +281,7 @@ fn an_agree_from_an_unlisted_source_decides_the_path_there() {
 }
 
 /// 学ぶゲートの 1 つずつ。各行は「この 1 つだけが違う」標本: タグの誤り・別の秘密・別の session・バージョン違い（タグは合う）・手順の外の型・
-/// 自分の跳ね返り・STUN・でたらめは学ばず、「候補に無い送り元」として数えて捨てる。隣に、同じ送り元からの正しい HELLO は学ぶことを置く。
+/// 自分の跳ね返り・STUN・でたらめは学ばず、「候補に無い送り元」として数えて捨てる。隣に、同じ送り元からの正しい HELLO は学ぶことを見る対照を並べる。
 #[test]
 fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
     let from = B_REAL;
@@ -310,6 +314,7 @@ fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
             ack: 2,
             base: 2,
             lat: None,
+            stamp: higanr_core::wire::Stamp::NONE,
             count: 1,
             words,
         }),
@@ -682,8 +687,8 @@ impl Net {
 }
 
 /// 組み上がり: A の候補が全部外れても（コードのアドレスへ送っても届かない）、どちらの役割でも HELLO・HELLO_ACK・AGREE の全部が
-/// 学んだアドレスから来る形で繋がり、経路が学んだアドレスになり、PONG で RTT が測れる。
-/// 対照: 「候補に無い送り元を捨てる」ゲートをネットワーク側に置くと繋がらない（セッションの側の変異は変異検査で見る）。
+/// 学んだアドレスから来る形で接続し、経路が学んだアドレスになり、PONG で RTT が測れる。
+/// 対照: 「候補に無い送り元を捨てる」ゲートをネットワーク側に入れると接続できない（セッションの側の変異は変異検査で見る）。
 #[test]
 fn two_links_connect_when_one_side_candidates_are_all_wrong() {
     for (a_nonce, b_nonce) in [(1u64, 2u64), (9, 2)] {
@@ -733,7 +738,7 @@ fn two_links_connect_when_one_side_candidates_are_all_wrong() {
     assert!(old.refused_by_gate > 0, "A へ 1 通も着いていない");
 }
 
-/// `Route::PeerBehindMovedPort` のネットワークで、A の受信側の手前に「候補に無い送り元は捨てる」ゲートを置いた対照。セッションは学べない。
+/// `Route::PeerBehindMovedPort` のネットワークで、A の受信側の手前に「候補に無い送り元は捨てる」ゲートを入れた対照。セッションは学べない。
 struct OldGate {
     a: Link,
     b: Link,

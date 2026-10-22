@@ -1,4 +1,4 @@
-//! 入力の地点の判断の検査（pure。仮の時計と仮のネットワークで、偽のゲーム 2 つを繋ぐ）。
+//! 入力の地点の判断の検査（pure。仮の時計と仮のネットワークで、偽のゲーム 2 つを接続する）。
 //!
 //! 両者の (seg, frame, 1P, 2P) の列が揃うこと（席・seg・読み込みの長さ・再戦の切替の tick に依らない）、列が偽のゲームが読んだ語の順から
 //! 手で組んだ参照と合うこと、描画だけのフレームの後にローカル入力を読み直さないこと、止める地点で相手の SELECT を待つこと、CHECK の
@@ -139,7 +139,6 @@ fn games(frames: u32, segs: u32, sessions: u32) -> (FakeGame, FakeGame) {
     (ga, gb)
 }
 
-/// 壊れたら落ちる: VPN の印が `NetStatus` の語に載らない（VPN の実行の外側の欄が「外側」のまま）、VPN でない実行に印が残る。
 #[test]
 fn the_vpn_mark_of_the_session_reaches_the_snapshot() {
     const F: u32 = 60;
@@ -172,8 +171,6 @@ fn the_log_line_carries_the_input_counts_in_delay_mode() {
     }
 }
 
-/// 壊れたら落ちる: 内訳・選択の食い違い・PONG の数が `NetStatus` の語に載らない（語の位置のずれ・書き忘れ）、
-/// 食い違いを数えない / 両者で数が違う / 食い違ったマップでホストの値を採らない。
 #[test]
 fn the_snapshot_carries_the_stall_split_the_selection_counts_and_the_pong_count() {
     const F: u32 = 60;
@@ -526,7 +523,7 @@ fn a_desync_leaves_both_checks_in_the_status_and_the_summary() {
             &format!("抽選回数 {}", local.rng_count),
             &format!("1P ライフ {}", local.life_1p),
             &format!("2P ライフ {}", local.life_2p),
-            "食い違った欄: 乱数の状態",
+            "項目: 乱数の状態",
         ] {
             assert!(line.contains(want), "{who}: {want} が無い: {line}");
         }
@@ -832,7 +829,7 @@ fn save_and_quit_after_the_net_ended_does_not_ask() {
     }
     for s in [&mut a, &mut b] {
         assert_eq!(s.np.phase(), Phase::Ended, "検査の前提");
-        // ローカルのマッチの終わりのメニューで「保存して終了」（偽のゲームはローカルの入力ではフレームを数えないので、要求を直に置く）。
+        // ローカルのマッチの終わりのメニューで「保存して終了」（偽のゲームはローカルの入力ではフレームを数えないので、要求を直に書く）。
         s.g.cur = SCENE_MATCH;
         s.g.next = REQ_SAVE_AND_QUIT;
         s.g.do_frame(&mut s.np, &mut s.net);
@@ -917,7 +914,7 @@ fn on_input_never_allocates() {
 /// 期間 1 はホスト、期間 2 はゲストが押す）。
 const PICK_WINDOWS: [(usize, usize, u8, usize); 2] = [(100, 112, 4, 0), (460, 468, 2, 1)];
 
-/// `run` と同じ回し方で、各 tick の前に期間を置く（両者とも、ホストの使ったフレームの数で決める）。期間の中でマッチの phase にいれば、マッチ中の
+/// `run` と同じ回し方で、各 tick の前に期間を設定する（両者とも、ホストの使ったフレームの数で決める）。期間の中でマッチの phase にいれば、マッチ中の
 /// 行の材料（`hud_facts`）の印を見る。`on_input` の確保も数える。戻りは確保の数。
 fn run_pick(a: &mut Side, b: &mut Side, clock: &std::cell::Cell<u64>, max_ticks: u32) -> u64 {
     let mut slot = clock.get();
@@ -950,7 +947,7 @@ fn run_pick(a: &mut Side, b: &mut Side, clock: &std::cell::Cell<u64>, max_ticks:
         if a.np.cfg.delay_pick && a.np.phase() == Phase::Lockstep && b.np.phase() == Phase::Lockstep
         {
             let (ha, hb) = (a.np.hud_facts().unwrap(), b.np.hud_facts().unwrap());
-            // 対戦中の名前（HELLO で交換した値。A は "a"、B は "b"）: それぞれの画面が、自分の席に自分の名前、相手の席に相手の名前を置き、
+            // 試合中の名前（HELLO で交換した値。A は "a"、B は "b"）: それぞれの画面が、自分の席に自分の名前、相手の席に相手の名前を出し、
             // 両者の画面で同じ席に同じ名前が出る（席を取り違えると左右が入れ替わる）。
             {
                 use crate::net_ui::HudNames;
@@ -1238,8 +1235,8 @@ fn digit_keys_set_the_delay_in_the_match_and_in_the_selection_for_both_sides() {
 }
 
 /// 台本の実行の 1 回分。ホスト（A）だけに台本の印と、本物の数字 3 の押し（`real_keys`。マッチの 5〜14 tick 目だけ押す。読めない間から
-/// 持ち越したキーは押下にならない —— `DigitEdge::feed` の規則）を置く。台本の段階（数字 5）は、台本の実行（`scripted`）で A がマッチに入った
-/// 最初の tick に 1 回だけ置く。返す: A の tick ごとの D・A の押下の数（`digit_presses`）・A が `digit_keys` を読んだ回数。
+/// 持ち越したキーは押下にならない —— `DigitEdge::feed` の規則）を設定する。台本の段階（数字 5）は、台本の実行（`scripted`）で A がマッチに入った
+/// 最初の tick に 1 回だけ設定する。返す: A の tick ごとの D・A の押下の数（`digit_presses`）・A が `digit_keys` を読んだ回数。
 fn run_with_real_digit_keys(scripted: bool, real_keys: bool) -> (Vec<u8>, u32, u64) {
     const F: u32 = 300;
     const K3: u16 = (1 << 3) | crate::digit_keys::CTRL_BIT;
@@ -1351,6 +1348,7 @@ fn the_plan_wins_over_the_pick_and_the_connected_line_shows_the_role_and_the_liv
                         seat: Seat::P2,
                         host: true,
                         shape: Some((higanr_core::wire::Mode::Delay, d)),
+                        watch_off: false,
                     }),
                 "{ca:?} / 今 {live} / 使う前の切替 {:?}",
                 ls.pending_switch()
@@ -1377,6 +1375,25 @@ fn the_plan_wins_over_the_pick_and_the_connected_line_shows_the_role_and_the_liv
         vec![6],
         "{ch:?}"
     );
+}
+
+#[test]
+fn the_match_hands_the_input_round_trip_to_the_net_without_the_peers_hold() {
+    // 片道 2 ms の偽のネットワーク: 相手が次のフレームまで持った時間を引いた往復は 4 ms 前後（ms の切り捨てで ±1）。
+    let (mut a, mut b, clock) = pair(CheckSource::InputDigest, games(120, 1, 1));
+    run(&mut a, &mut b, &clock, 4_000);
+    for s in [&a, &b] {
+        let d = s.net.delay_last.expect("往復の要約を渡していない");
+        assert!(s.net.delay_notes > 100, "渡した回数 {}", s.net.delay_notes);
+        assert!(d.queue_ms <= 2, "詰まっていないのに延びた: {d:?}");
+        assert!((3..=5).contains(&d.base_ms), "ふだんの往復 {d:?}");
+        // 往復の基準は相手が返した INPUT の時刻から取れている（この偽のネットワークの PONG は相手の手入れまで待つので 4 ms にならない）。
+        let (inputs, pongs) = s.np.connected().expect("接続").delay_samples();
+        assert!(
+            inputs > 100 && inputs > pongs * 10,
+            "INPUT {inputs}・PONG {pongs}"
+        );
+    }
 }
 
 #[test]
@@ -1424,7 +1441,7 @@ fn the_ping_is_the_round_trip_even_when_the_pump_is_late() {
     );
 }
 
-// ---- フレームの始まりの待ち（`NetPlay::head_wait`）----
+// ---- フレームの始まりの待ち（相手の入力ワードを待つ。`NetPlay::head_wait`）----
 
 /// 始まりの待ちの呼び出しの数え（1 側ぶん）。
 #[derive(Debug, Default)]
@@ -1499,7 +1516,7 @@ fn head_run(
 /// B → A の片道の遅れ。B を先に回し（同じ slot の中で B の tick → A の tick）、A → B は速いままにすると、A だけが毎フレーム 3 ms 待ち、
 /// B は待たない形になる（2 台は 1 本のスレッドで順に回すので、先に回す側の送る時刻は、後に回す側の待ちに引きずられない。双方向に遅らせたり
 /// A を先に回したりすると、待ちが毎フレーム積み上がって上限に当たる —— 仮のネットワークの作りの癖）。5 フレーム + 3 ms の根拠: delay 3 で A → B が
-/// 速いと B は A の 2 フレーム先で釣り合い、A が使うフレーム f の語は B の tick f − 3（= B の slot では 5 slot 前）の送りなので、片道が
+/// 速いと B は A の 2 フレーム先で釣り合い、A が使うフレーム f の語は B の tick f − 3（= B の slot では 5 slot 前）に B が送った語なので、片道が
 /// 5 フレームより 3 ms 長ければ、A の slot の 3 ms 後に着く。
 const LATE_ONE_WAY_US: u64 = 5 * FRAME_US + 3_000;
 
@@ -1585,7 +1602,7 @@ fn head_wait_moves_the_wait_before_the_input_and_never_changes_the_frames() {
     on_log.publish(&a1.np, false);
     off_log.publish(&a0.np, false);
     let want = format!(
-        "先頭で待つ: 有効（上限 {HEAD_WAIT_CAP_US} µs。ウィンドウ（b-spin / b）は格子の後、全画面（ゲーム自身の時計）はゲームがフレームを始める見込みの回だけ。rollback のモードでは待たない）/ 先頭で待った回 {} / 合計 {} µs / 上限に当たった回 0",
+        "先頭で待つ: 有効（上限 {HEAD_WAIT_CAP_US} µs。ウィンドウ（b-spin / b）は格子の後、フルスクリーン（ゲーム自身の時計）はゲームがフレームを始める見込みの回だけ。rollback のモードでは待たない）/ 先頭で待った回 {} / 合計 {} µs / 上限に当たった回 0",
         st.head_waits, st.head_wait_us_total
     );
     assert!(
@@ -1598,7 +1615,7 @@ fn head_wait_moves_the_wait_before_the_input_and_never_changes_the_frames() {
         "{}",
         off_log.timing_text()
     );
-    // 待たなくてよい側（B）は、入れても待たない（遅延の増分 0）。使ったフレームの欄は 0。B が待った 1 回は、マッチの最初に A が読み込みで
+    // 待たなくてよい側（B）は、始まりの待ちを入れても待たない（遅延の増分 0）。使ったフレームの欄は 0。B が待った 1 回は、マッチの最初に A が読み込みで
     // 遅れている間（B は先に始まり、A の最初の語を待つ。上限で戻り、以後は描画だけのフレームなので重ねて待たない）。
     let tb = &t1[1];
     assert_eq!((tb.arrived, tb.ended), (0, 0), "{tb:?}");
@@ -1980,12 +1997,16 @@ fn a_check_mismatch_stops_the_match_on_both_sides_and_the_game_stays_frozen() {
     let snap = st.snapshot();
     let line = snap.stop_line().expect("止めた行が無い");
     assert!(
-        line.contains("試合を止めた")
+        line.contains("マッチを止めました")
             && line.contains("delay 方式")
             && line.contains("まだ止めている"),
         "{line}"
     );
-    assert!(snap.text().contains("試合を止めた"), "{}", snap.text());
+    assert!(
+        snap.text().contains("マッチを止めました"),
+        "{}",
+        snap.text()
+    );
 }
 
 #[test]
@@ -2187,7 +2208,7 @@ fn a_peer_that_stays_alive_but_sends_no_input_is_cut_after_the_limit_with_a_noti
     let (mut a, mut b, clock, _) = mid_match(2);
     let mut stall_at_ms = None;
     let mut shown_at_run = None;
-    // 切れるまでの tick の数は時計の進み方（1 tick で FRAME_US 以上）で変わるので、上限は FRAME_US で割った数に余白を足して置く。
+    // 切れるまでの tick の数は時計の進み方（1 tick で FRAME_US 以上）で変わるので、上限は FRAME_US で割った数に余白を足して決める。
     let max_ticks = u64::from(peer_wait::LIMIT_MS) * 1_000 / FRAME_US + 2_000;
     for _ in 0..max_ticks {
         let before = clock.get();
@@ -2294,7 +2315,7 @@ fn esc_cuts_only_while_the_notice_is_shown_and_after_it_was_seen_up() {
 #[test]
 fn the_notice_goes_away_and_nothing_is_cut_when_the_peer_comes_back() {
     let (mut a, mut b, clock, _) = mid_match(2);
-    // B は丸ごと止める（何も送らない。届いたものは受けのリングが溢れた形で捨てる）。知らせが出るまでは沈黙の 60 秒より短い。
+    // B は丸ごと止める（何も送らない。届いたものは B の受けのリングが溢れた形で捨てる）。知らせが出るまでは沈黙の 60 秒より短い。
     let mut buf = [0u8; MAX_DATAGRAM];
     for _ in 0..1_000 {
         clock.set(clock.get() + FRAME_US);

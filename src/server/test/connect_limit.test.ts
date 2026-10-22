@@ -1,4 +1,4 @@
-// 繋ぐ回数の制限（src/connect_limiter.ts）の検査。純粋な部分は境目の両側を並べ、組み上がりは本物の Durable Object（miniflare）で見る。
+// 接続の回数の制限（src/connect_limiter.ts）の検査。純粋な部分は境目の両側を並べ、組み上がりは本物の Durable Object（miniflare）で見る。
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";

@@ -1,12 +1,10 @@
-//! 組み上がりの検査: 偽のゲームを回すスレッドと peer_sim（`sim::run`）のスレッドを同じプロセスで loopback に繋ぐ。dll の側は
+//! 組み上がりの検査: 偽のゲームを回すスレッドと peer_sim（`sim::run`）のスレッドを同じプロセスで loopback に接続する。dll の側は
 //! 本物の通信層（`net_udp`: ソケット・受信スレッド・リング・受信のイベントと高分解能の待機タイマー）と `NetPlay`。
-//!
 //! 本物の UDP の上で、接続 → 止める地点 → SELECT → lockstep（再戦で seg を進める）→ BYE を通し、dll と peer_sim の
 //! (seg, frame, 1P, 2P) の列と CHECK（入力の列のダイジェスト）が一致すること、ローカル入力を描画だけのフレームの後に読み直さないこと、
 //! ゲームスレッドの `on_input` が確保しないことを見る。付いていく形の 2 本（`peer_sim_follows_*`）は、マッチごとに長さの違う偽のゲーム
 //! （peer_sim は長さを知らない）で、再戦とメニューへ戻っての次の選択を通す。`peer_sim_menu_plan_walks_*` は選択の画面を持つ偽のゲーム
 //! （`menu_tests::MenuGame`）と選択の台本で動く peer_sim で、ネットの選択を 2 回通す。
-//!
 //! 実時間で走る（1 本 10 秒ほど）ので `#[ignore]`。全件の回（`build.bat`）が `--ignored` で走らせる。
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
@@ -37,18 +35,24 @@ struct Case {
     sessions: u32,
     /// dll の latency の切替の予定（ホストのとき）。
     dll_lat_plan: Vec<(u64, u8)>,
-    /// peer_sim の切替の台本（ホストのとき）と、送りの壊し方。
+    /// peer_sim の切替の台本（ホストのとき）と、peer_sim が送るパケットの壊し方。
     sim_lat: Vec<LatStep>,
     sim_fault: FaultConfig,
     /// dll は ini に秘密を書かずに開き（`net_udp::prepare_link` が OS の乱数で引き、偽の STUN に問い合わせ、自分の接続コードを作る）、
     /// peer_sim はそのコードから session・秘密・候補を取る（peer_sim の `--code` と同じ読み方）。
     via_code: bool,
-    /// dll の受信ソケットに繋ぐ観戦者（空なら観戦のホストを置かない）。
+    /// dll の受信ソケットに接続する観戦者（空なら観戦のホストを設定しない）。
     spectators: Vec<Behavior>,
     /// 遅れの量の選び: 空でなければ dll の `Config::delay_pick` を立て、dll の使ったフレームの数がこの範囲の間だけ、
     /// Ctrl+その数字を押し続ける（範囲の始まりで 1 回の押下）。
     pick_windows: Vec<(usize, usize, u8)>,
+    /// ホストの決め方: 両者が使い、`dll_is_host` の側を検査用の値で太く見せる。role_nonce は逆にする（nonce のままならもう片方がホスト）。
+    host_pick: bool,
 }
+
+/// ホストの決め方の検査で、太く見せる側と細く見せる側の見積もり（B/s）。差は 100 倍。
+const FAT_UP: u32 = 10_000_000;
+const THIN_UP: u32 = 100_000;
 
 fn lo() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
@@ -67,11 +71,19 @@ fn run(case: Case) -> Outcome {
         "高分解能の待機タイマーが作れない"
     );
     let daddr = net.local_addr().unwrap();
-    let (dll_nonce, sim_nonce) = if dll_is_host {
+    let (dll_nonce, sim_nonce) = if dll_is_host != case.host_pick {
         (0xF000, 0x0001)
     } else {
         (0x0001, 0xF000)
     };
+    // 各台の見積もりは相手の上り: ホストに決まるべき側を、相手から見て太く見せる。
+    let pick = |peer_is_host: bool| {
+        case.host_pick.then_some(higanr_core::host_pick::Setup {
+            nat: higanr_core::nat::NatMark::UNKNOWN,
+            fake_up: Some(if peer_is_host { FAT_UP } else { THIN_UP }),
+        })
+    };
+    let (dll_pick, sim_pick) = (pick(!dll_is_host), pick(dll_is_host));
     let dll_link = link::Config {
         handshake: handshake::Config {
             session_id: SID,
@@ -98,7 +110,10 @@ fn run(case: Case) -> Outcome {
             "ini の値がセッションへ届いていない"
         );
         assert!(
-            note.contains(&format!("見えた自分のアドレス {daddr}")),
+            note.contains(&format!(
+                "見えた自分のアドレス {}",
+                higanr_core::log_scrub::hide_addrs(&daddr.to_string())
+            )),
             "{note}"
         );
         let text = note.rsplit(": ").next().unwrap_or("");
@@ -155,7 +170,16 @@ fn run(case: Case) -> Outcome {
         fault: case.sim_fault,
         max_ms: 60_000,
     };
-    let sim_thread = thread::spawn(move || sim::run(&scfg, psock));
+    let sim_thread = thread::spawn(move || {
+        sim::run_opts(
+            &scfg,
+            psock,
+            sim::RunOpts {
+                host_pick: sim_pick,
+                ..sim::RunOpts::default()
+            },
+        )
+    });
 
     let mut np = NetPlay::new(
         dll_link,
@@ -165,6 +189,7 @@ fn run(case: Case) -> Outcome {
             lat_plan: LatPlan::new(&case.dll_lat_plan).expect("予定"),
             require_net_selection: false,
             delay_pick: !case.pick_windows.is_empty(),
+            host_pick: dll_pick,
             ..Config::default()
         },
         &mut net,
@@ -366,6 +391,25 @@ fn run(case: Case) -> Outcome {
         "{role}: loopback で聞き直しを置いた"
     );
     let dll_role = np.connected().expect("繋がった").role();
+    assert_eq!(dll_role == Role::Host, dll_is_host, "{role}");
+    let pick = np.connected().expect("繋がった").established().pick;
+    if case.host_pick {
+        assert!(
+            pick.active && pick.basis == higanr_core::host_pick::Basis::Uplink,
+            "{role}: {pick:?}"
+        );
+        assert_eq!(
+            (pick.own_up, pick.peer_up),
+            if dll_is_host {
+                (FAT_UP, THIN_UP)
+            } else {
+                (THIN_UP, FAT_UP)
+            },
+            "{role}"
+        );
+    } else {
+        assert!(!pick.active, "{role}: {pick:?}");
+    }
     for (b, seen) in &spectated {
         if *b == Behavior::Normal {
             assert_normal_observer(role, seen, &mut g, dll_role, &theirs);
@@ -381,6 +425,7 @@ fn run(case: Case) -> Outcome {
         snapshot.map(|s| s.text())
     );
     Outcome {
+        connect_ms: np.connect_wait_ms().expect("繋がった"),
         dll_stalls: np.stats().stalls,
         dll_max_stall_run: np.stats().max_stall_run,
         played: g.recs.clone(),
@@ -394,6 +439,8 @@ fn run(case: Case) -> Outcome {
 struct Outcome {
     /// 一致した CHECK の数（dll の側）。
     checks: u32,
+    /// dll がセッションを作ってから接続するまで（ms）。
+    connect_ms: u32,
     dll_stalls: u64,
     dll_max_stall_run: u32,
     played: Vec<FrameRec>,
@@ -476,7 +523,7 @@ fn dll_as_guest_plays_against_peer_sim() {
 }
 
 /// 組み上がり: ini に秘密が無いとき、dll が OS の乱数で秘密を引き、自分の接続コードに秘密・session・受信ソケット（STUN で見えたアドレス）を載せ、
-/// peer_sim がそのコードから dll と繋がれる。マッチの列は `dll_as_host_plays_against_peer_sim` と同じ形で見る。
+/// peer_sim がそのコードから dll に接続できる。マッチの列は `dll_as_host_plays_against_peer_sim` と同じ形で見る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn dll_initiates_with_an_os_secret_and_peer_sim_joins_by_its_code() {
@@ -486,8 +533,8 @@ fn dll_initiates_with_an_os_secret_and_peer_sim_joins_by_its_code() {
     });
 }
 
-/// 相手が後から起きても繋がる: dll の接続の手順が 10 秒の時間切れでやめたまま作り直さない、作り直しを数えない、相手のポートがまだ開いていない
-/// 間の送り（ICMP の port unreachable が `WSAECONNRESET` で返る）で受信スレッドが止まる、を見る。peer_sim のポートは起きるまで閉じておく
+/// 相手が後から起きても接続する: dll の接続の手順が 10 秒の時間切れでやめたまま作り直さない、作り直しを数えない、相手のポートがまだ開いていない
+/// 間の送信（ICMP の port unreachable が `WSAECONNRESET` で返る）で受信スレッドが止まる、を見る。peer_sim のポートは起きるまで閉じておく
 /// （番号だけ先に取って離し、15 秒後に同じ番号で開き直す）。実時間で約 20 秒。逆向き（peer_sim が先に起きて dll が遅れる）は peer_sim の側に作り直しの入口が要る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
@@ -630,6 +677,7 @@ fn fixed_case(dll_is_host: bool) -> Case {
         via_code: false,
         spectators: vec![],
         pick_windows: vec![],
+        host_pick: false,
     }
 }
 
@@ -646,7 +694,61 @@ fn follow_case(dll_is_host: bool) -> Case {
         via_code: false,
         spectators: vec![],
         pick_windows: vec![],
+        host_pick: false,
     }
+}
+
+/// ホストの決め方: role_nonce では peer_sim がホストになる組で、dll を検査用の値で太く見せると dll がホストになり、マッチの列が一致する
+/// （席・delay も dll の側の値。`run` が見る）。peer_sim も同じ値で決める（決め方の材料が入れ違いで同じ —— `run` の `pick`）。
+#[test]
+#[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+fn the_side_shown_fatter_hosts_against_peer_sim() {
+    run(Case {
+        host_pick: true,
+        ..fixed_case(true)
+    });
+}
+
+/// 逆の向き: role_nonce では dll がホストになる組で、peer_sim を太く見せると peer_sim がホストになり、マッチの列が一致する。
+#[test]
+#[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+fn peer_sim_shown_fatter_hosts_against_the_dll() {
+    run(Case {
+        host_pick: true,
+        ..fixed_case(false)
+    });
+}
+
+/// 近い相手（loopback）で、接続までの時間がホストの決め方でどれだけ増えるか（本ログ用の実測。合否は増分が待つ上限を越えないことだけ）。
+/// 短いマッチ 1 つを、決め方を使う組と使わない組で 3 回ずつ（1 回約 4.5 秒）。
+#[test]
+#[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+fn host_pick_connect_time_on_loopback() {
+    const N: usize = 3;
+    let short = |pick: bool| Case {
+        follow: true,
+        lengths: vec![30],
+        segs_per_session: 1,
+        sessions: 1,
+        host_pick: pick,
+        ..follow_case(false)
+    };
+    let mut on = Vec::new();
+    let mut off = Vec::new();
+    for _ in 0..N {
+        on.push(run(short(true)).connect_ms);
+        off.push(run(short(false)).connect_ms);
+    }
+    on.sort_unstable();
+    off.sort_unstable();
+    eprintln!(
+        "接続までの ms（{N} 回ずつ、小さい順）: 決め方あり {on:?} / なし {off:?}。中央値の差 {} ms",
+        i64::from(on[N / 2]) - i64::from(off[N / 2])
+    );
+    assert!(
+        on[N / 2] <= off[N / 2] + higanr_core::host_pick::REPORT_WAIT_MS,
+        "{on:?} / {off:?}"
+    );
 }
 
 /// 遅れの量をホストが決める: dll がホストで、Ctrl+数字で delay 方式の遅れを変えたとき、peer_sim（ゲスト。付いていく形・
@@ -669,7 +771,7 @@ fn peer_sim_follows_the_dll_host_digit_keys() {
 }
 
 /// dll がホストで予定どおりに latency を切り替えたとき（増やす・減らす・次の seg で増やす）、peer_sim（付いていく形）と使った後の delay の列・
-/// マッチの列が一致する。固定 seed の乱れの下でも止まらない。切替はマッチの終わりから離して置く。
+/// マッチの列が一致する。固定 seed の乱れの下でも止まらない。切替はマッチの終わりから離して設定する。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_follows_dll_host_latency_switches_under_seeded_losses() {
@@ -755,9 +857,9 @@ fn spectators_of_the_dll_guest_see_the_same_match_as_the_dll_and_peer_sim() {
     });
 }
 
-/// 対戦者への遅延の増分 0: 観戦者が黙る・ACK を返さない・途中で消えるとき、dll の使った列・delay の列が観戦者なしの実行と変わらず、
+/// 対戦する側への遅延の増分 0: 観戦者が黙る・ACK を返さない・途中で消えるとき、dll の使った列・delay の列が観戦者なしの実行と変わらず、
 /// stall が観戦者なしより増えない（ゲームのスレッドが観戦者を待たない・受信スレッドが詰まらない）。普通の観戦者は巻き込まれず、
-/// 黙った観戦者への送り直しはある。観戦者なしの実行と観戦者 4 人（普通・ACK なし・黙る・40 記録で消える）の実行を続けて走らせて比べる。
+/// dll からの、黙った観戦者への送り直しはある。観戦者なしの実行と観戦者 4 人（普通・ACK なし・黙る・40 記録で消える）の実行を続けて走らせて比べる。
 /// stall は実時間の値（peer_sim の読み込み 300 ms を待つ分が大半）なので、増えた分が読み込みの揺らぎより大きいかで見る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
@@ -790,11 +892,9 @@ fn silent_slow_and_vanishing_spectators_do_not_change_the_dll_or_its_stalls() {
     for (b, seen) in &spec.spectated {
         match b {
             Behavior::Normal => {}
-            Behavior::NoAck => assert!(
-                (1..=crate::spectate_testkit::NOACK_WINDOW).contains(&seen.recs.len()),
-                "ACK を返さない観戦者が送りのウィンドウを越えて受けた: {}",
-                seen.recs.len()
-            ),
+            // ウィンドウちょうどで止まることは `spectate_host::tests` が見る。ここはマッチがウィンドウより短く、長くしても記録は
+            // 実時間で積まれるので、ウィンドウぶん積まれる前に黙った観戦者として外れる（`SILENT_MS`）。
+            Behavior::NoAck => assert!(!seen.recs.is_empty(), "ACK を返さない観戦者が何も受けない"),
             Behavior::Silent => assert_eq!(seen.datagrams, 0),
             Behavior::Vanish(n) => assert!(seen.recs.len() >= *n),
         }
@@ -809,7 +909,7 @@ const FULL_HOUSE: usize = 10;
 
 /// 観戦者が上限の 10 人全員普通に観戦しても、対戦が観戦者なしの実行と変わらない: dll の使った列・delay の列が同じで、
 /// CHECK が一致し続け（ずれれば BYE で終わる）、stall が増えない。全員がマッチの語・SELECT・
-/// 再戦をまたぐ seg を対戦者と全行一致で受ける（`run` の中の `assert_normal_observer`）。
+/// 再戦をまたぐ seg を対戦する側と全行一致で受ける（`run` の中の `assert_normal_observer`）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn a_full_house_of_spectators_does_not_change_the_dll_or_its_stalls() {
@@ -839,7 +939,7 @@ fn a_full_house_of_spectators_does_not_change_the_dll_or_its_stalls() {
     assert_eq!(snap.host.joined, FULL_HOUSE as u64);
     assert_eq!(snap.host.refused_full, 0, "{snap:?}");
     assert_eq!((snap.ring.gaps, snap.ring.dropped_full), (0, 0), "{snap:?}");
-    // 再戦と選択をまたぐ実行でも、全員が対戦者と全行一致する。
+    // 再戦と選択をまたぐ実行でも、全員が対戦する側と全行一致する。
     let full = run(Case {
         spectators: vec![Behavior::Normal; FULL_HOUSE],
         ..follow_case(true)
@@ -1257,19 +1357,35 @@ fn the_dll_as_guest_walks_the_selection_with_a_host_peer_sim() {
     assert_eq!(rs.ring.dropped_full, 0);
 }
 
+fn wait_until(at: Instant) {
+    while let Some(d) = at.checked_duration_since(Instant::now()) {
+        if d > Duration::from_millis(2) {
+            thread::sleep(d - Duration::from_millis(1));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 struct HeadRun {
     recs: Vec<FrameRec>,
     timings: Vec<FrameTiming>,
     stats: Stats,
 }
 
-fn two_dll_run(cap: u32, phase_us: u64, frames: u32) -> [HeadRun; 2] {
+/// dll が相手の入力を待つ予算と始まりの待ちの上限。本物の値（1 フレーム）だと、負荷で 1 回遅れただけで止まりが起き、その側のフレームが格子から 1 つずれて
+/// 待ちの起きない形に移る。
+const HEAD_RUN_BUDGET_US: u32 = 200_000;
+
+fn two_dll_run(head_wait: bool, phase_us: u64, frames: u32) -> [HeadRun; 2] {
     let (s1, s2) = (
         UdpSocket::bind(lo()).unwrap(),
         UdpSocket::bind(lo()).unwrap(),
     );
     let (pa, pb) = (s1.local_addr().unwrap(), s2.local_addr().unwrap());
     drop((s1, s2));
+    // 両者の格子を同じ基準の時刻から刻む。スレッドの起動や通信層を開く時間のずれが位相の差に混ざらない。
+    let base = Instant::now() + Duration::from_millis(200);
     let spawn = |me: SocketAddr, peer: SocketAddr, nonce: u64, start_us: u64, seed: u64| {
         thread::spawn(move || {
             let (mut net, rx) = net_udp::open(me, &[peer]).expect("通信層を開ける");
@@ -1289,15 +1405,16 @@ fn two_dll_run(cap: u32, phase_us: u64, frames: u32) -> [HeadRun; 2] {
                 lc,
                 Config {
                     check: CheckSource::InputDigest,
-                    head_wait_cap_us: cap,
+                    wait_budget_us: HEAD_RUN_BUDGET_US,
+                    head_wait_cap_us: if head_wait { HEAD_RUN_BUDGET_US } else { 0 },
                     ..Config::default()
                 },
                 &mut net,
             );
             let mut g = FakeGame::new(seed, frames, 1, 1);
             g.menu_before_decide = 30;
-            thread::sleep(Duration::from_micros(start_us));
-            let t0 = Instant::now();
+            let t0 = base + Duration::from_micros(start_us);
+            wait_until(t0);
             let mut next = t0;
             let (mut closed, mut after_end) = (false, 0u32);
             loop {
@@ -1323,13 +1440,7 @@ fn two_dll_run(cap: u32, phase_us: u64, frames: u32) -> [HeadRun; 2] {
                     np.stats()
                 );
                 next += Duration::from_micros(FRAME_US);
-                while let Some(d) = next.checked_duration_since(Instant::now()) {
-                    if d > Duration::from_millis(2) {
-                        thread::sleep(d - Duration::from_millis(1));
-                    } else {
-                        std::hint::spin_loop();
-                    }
-                }
+                wait_until(next);
             }
             rx.stop();
             HeadRun {
@@ -1355,10 +1466,15 @@ fn two_dll_run(cap: u32, phase_us: u64, frames: u32) -> [HeadRun; 2] {
 fn head_wait_moves_the_leading_dlls_wait_before_its_input_over_real_udp() {
     const F: u32 = 120;
     let phase_us = FRAME_US + 8_000;
-    let off = two_dll_run(0, phase_us, F);
-    let on = two_dll_run(HEAD_WAIT_CAP_US, phase_us, F);
+    let off = two_dll_run(false, phase_us, F);
+    let on = two_dll_run(true, phase_us, F);
     for r in off.iter().chain(on.iter()) {
         assert_eq!(r.recs.len(), F as usize, "{:?}", r.stats);
+        assert_eq!(
+            r.stats.stalls, 0,
+            "止まりが起きた（待ちの形が変わる）: {:?}",
+            r.stats
+        );
     }
     assert_eq!(off[0].recs, off[1].recs, "切った実行で両者の列が違う");
     assert_eq!(on[0].recs, on[1].recs, "入れた実行で両者の列が違う");

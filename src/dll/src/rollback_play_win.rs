@@ -1,13 +1,8 @@
-//! Win32 とゲームのメモリの層（unsafe はここと `rollback_win.rs`）。判断は `rollback_play.rs`（pure）。確保の入口のアセンブリ・DLL の領域・
-//! コピーのコピー方法・走査の包みは `rollback_win.rs` を共に使う。入口の関数は `arm` 以外どれもゲームのスレッドから呼ぶ:
+//! Win32 とゲームのメモリの層（unsafe はここと `rollback_win.rs`）。判断は `rollback_play.rs`（pure）。確保の入口のアセンブリ・DLL の領域・コピーのコピー方法・走査の包みは `rollback_win.rs` を共に使う。入口の関数は `arm` 以外どれもゲームのスレッドから呼ぶ:
 //! - `arm`: 読み取りのスレッドで、入力のフックを書いた後に 1 回。rollback を望んだ実行だけ書く（`rollback_play::install_wanted`）。
-//! - [`with_play`]: 入れ物（`PlayState` と本物の `PlayMem`）を貸す。走査の包み（`0x0042DCA9`）のフックと Present の後のフックが、`NetPlay` の
-//!   rollback の経路（`netplay/rollback.rs`。状態機械は `Connected` の中にあり外から `&mut` で借りられないので、pure な経路が入れ物を借りて進める）を
-//!   この中で呼ぶ。
-//! - [`input_hook`]（入力の地点 `0x0043112D` の入口から）: `Some(r)` なら入口へ `r` を返す（1 = feed した、2 = 描画だけ）。`None` なら今までの経路。
-//!   feed のフックはローカル入力を読まずに 3 本へ入れる（自分の語は走査の包みのフックが 1 フレームに 1 回だけ読む）。
-//! - [`resim_active`]: 進め直しの回か（`_ticks.csv` の記録・ペースの時刻の取得・台本の時計が見る旗。`stub.rs` の入口のアセンブリも
-//!   `RESIM_TICK` を直に見る）。[`with_game_fpu`]: 進め直しの間の x87 の制御語。
+//! - [`with_play`]: 入れ物（`PlayState` と本物の `PlayMem`）を貸す。走査の包み（`0x0042DCA9`）のフックと Present の後のフックが、`NetPlay` の rollback の経路（`netplay/rollback.rs`。状態機械は `Connected` の中にあり外から `&mut` で借りられないので、pure な経路が入れ物を借りて進める）をこの中で呼ぶ。
+//! - [`input_hook`]（入力の地点 `0x0043112D` の入口から）: `Some(r)` なら入口へ `r` を返す（1 = feed した、2 = 描画だけ）。`None` なら今までの経路。feed のフックはローカル入力を読まずに InputManager の 3 本へ入れる（自分の語は走査の包みのフックが 1 フレームに 1 回だけ読む）。
+//! - [`resim_active`]: 進め直しの回か（`_ticks.csv` の記録・ペースの時刻の取得・台本の時計が見る旗。`stub.rs` の入口のアセンブリも `RESIM_TICK` を直に見る）。[`with_game_fpu`]: 進め直しの間の x87 の制御語。
 //! - 数えと食い違い: [`publish_summary`]（ゲームのスレッド）/ [`summary_text`]（読み取りのスレッド）。
 
 #[cfg(not(target_arch = "x86"))]
@@ -49,7 +44,7 @@ use crate::th09_addr::{
 /// SE を積む `0x43E2F0`（thiscall: ecx = SoundManager、引数 (id, パン)、`ret $0x8`）。
 type SeFn = unsafe extern "thiscall" fn(u32, u32, i32);
 
-/// アドレス `f` の thiscall の関数を `(this, id, pan)` で呼ぶ（検査が偽の関数で引数の並びを確かめるためにアドレスを引数にした）。
+/// アドレス `f` の thiscall の関数を `(this, id, pan)` で呼ぶ（検査が偽の関数で引数の並びをチェックするためにアドレスを引数にした）。
 ///
 /// # Safety
 /// `f` は thiscall で ecx = this・スタックの引数 2 つ（`id`, `pan`）・`ret $0x8` の関数の入口で、呼ぶ時点で `this` が指す物と
@@ -81,7 +76,7 @@ pub(crate) fn push_se_checked(id: u32, pan: i32) -> bool {
 /// 1 なら設置が全部済んでいて、入口の関数が入れ物に触ってよい。
 static PLAY_ARMED: AtomicU32 = AtomicU32::new(0);
 
-/// 入れ物（ゲームのスレッドだけが触る。`arm` が `PLAY_ARMED` を立てる前に 1 回だけ置く）。
+/// 入れ物（ゲームのスレッドだけが触る。`arm` が `PLAY_ARMED` を立てる前に 1 回だけ設定する）。
 struct PlayBox {
     st: PlayState,
     snap_buf: u32,
@@ -89,8 +84,8 @@ struct PlayBox {
 }
 static PLAY: GameCell<PlayBox> = GameCell(core::cell::UnsafeCell::new(None));
 
-// 走査の中の入力の地点への指図（`RealPlayMem::run_scan` が置き、`input_hook` が 1 回だけ取る）。どちらもゲームのスレッドで、
-// 原子変数にするのは `static` に置くため。
+// 走査の中の入力の地点への指図（`RealPlayMem::run_scan` が書き、`input_hook` が 1 回だけ取る）。どちらもゲームのスレッドで、
+// 原子変数にするのは `static` にするため。
 /// 0 = 指図なし、1 = feed、2 = 描画だけ。
 static ORDER: AtomicU32 = AtomicU32::new(0);
 /// feed の語（下位 16 ビットが p1、上位が p2）。
@@ -116,7 +111,7 @@ fn play_box() -> Option<&'static mut PlayBox> {
     if !armed() || PANICKED.load(Ordering::Acquire) != 0 {
         return None;
     }
-    // SAFETY: `PLAY_ARMED` を Acquire で 1 と読んだので、`arm` が置いた入れ物が見える。触るのはゲームのスレッドだけで、
+    // SAFETY: `PLAY_ARMED` を Acquire で 1 と読んだので、`arm` が設定した入れ物が見える。触るのはゲームのスレッドだけで、
     // 入口の関数は入れ子にならない（`input_hook` は入れ物に触らない）。
     unsafe { (*PLAY.0.get()).as_mut() }
 }
@@ -153,7 +148,7 @@ impl PlayMem for RealPlayMem {
             return false;
         }
         // SAFETY: 書くのは Supervisor の 2 欄（`0x4B368C` / `0x4B3690`）か `OUTPUT_RANGES` の中の語だけで、どれも th09.exe の .data
-        // （`arm` が `output_ranges_rw` で確かめた）。ゲームのスレッドで、ゲームは動いていない（走査の外）。
+        // （`arm` が `output_ranges_rw` で検証した）。ゲームのスレッドで、ゲームは動いていない（走査の外）。
         unsafe { (addr as usize as *mut u32).write_unaligned(v) };
         true
     }
@@ -176,9 +171,9 @@ impl PlayMem for RealPlayMem {
 
     fn reset_in_snap(&mut self, r: &Region, fields: &[ResetField<'_>]) -> Result<u32, Refused> {
         let len = r.len.min(r.cap) as usize;
-        // SAFETY: `[snap_buf + buf_off, + len)` はコピーの置き場の中（置き場は `arm` が `buffer_bytes()` バイト以上を VirtualAlloc で取り、
+        // SAFETY: `[snap_buf + buf_off, + len)` はコピーのバッファの中（バッファは `arm` が `buffer_bytes()` バイト以上を VirtualAlloc で取り、
         // プロセスが終わるまで返さない。範囲の表の `buf_off + cap ≤ buffer_bytes`、`len ≤ cap`）。触るのはゲームのスレッドだけで、
-        // この置き場への参照はほかに無い。ゲームのメモリではなくコピーの中。
+        // このバッファへの参照はほかに無い。ゲームのメモリではなくコピーの中。
         let block = unsafe {
             core::slice::from_raw_parts_mut((self.snap_buf + r.buf_off) as usize as *mut u8, len)
         };
@@ -350,7 +345,7 @@ impl PlayMem for RealPlayMem {
             return false;
         }
         // SAFETY: 書くのは、コピーのときに ScreenEffect の節の this として記録した本体の 0x38 B だけ。記録したのは `0x422D20`
-        // （`push 0x38` → operator new。他に作る所は無い）が作った本体だと戻りの欄（+0x08 / +0x0C が節を指す）で確かめた物で、
+        // （`push 0x38` → operator new。他に作る所は無い）が作った本体だと戻りの欄（+0x08 / +0x0C が節を指す）で検証した物で、
         // 大きさは決め打ち。呼び手（`GameWindow::restore`）は書く前に `body_freed` が偽（コピーの後に見張りの外で CRT へ解放を渡して
         // いない。書き戻し待ちの前の期間も `rb_body_free` が印を立てる）ことを見ている。予測の tick の解放は CRT へ渡さず保留する（`RB_HOLD_FREES`）ので、塊はまだ確保されたまま。
         // 頁は上の `is_rw` で見た。ゲームのスレッドで、ゲームは動いていない。
@@ -381,7 +376,7 @@ pub fn with_play<R>(f: impl FnOnce(&mut PlayState, &mut dyn PlayMem) -> R) -> Op
 }
 
 /// 入力の地点の入口から（走査の中）。指図があれば取り、feed して 1、描画だけなら 2。無ければ `None`。`feed` はローカル入力を
-/// 読まずに 3 本へ入れる関数（自分の入力ワードは走査の包みのフックが 1 フレームに 1 回だけ読む）。
+/// 読まずに InputManager の 3 本へ入れる関数（自分の入力ワードは走査の包みのフックが 1 フレームに 1 回だけ読む）。
 pub fn input_hook(feed: &mut dyn FnMut(u16, u16)) -> Option<u32> {
     match ORDER.swap(0, Ordering::Relaxed) {
         ORDER_FEED => {
@@ -402,7 +397,7 @@ pub fn input_hook(feed: &mut dyn FnMut(u16, u16)) -> Option<u32> {
 /// 制御語が更新の中と同じとは限らず、進め直しは更新を何度も再現するので、違えば両者の状態が食い違う。例外の保留は無い。
 pub fn with_game_fpu<R>(f: impl FnOnce() -> R) -> R {
     let mut old: u16 = 0;
-    // SAFETY: `fnstcw` は制御語を 2 バイトの変数に書くだけ（待ちも例外の確かめもしない）。書く先は自分のスタックの `old`。
+    // SAFETY: `fnstcw` は制御語を 2 バイトの変数に書くだけ（待ちも例外のチェックもしない）。書く先は自分のスタックの `old`。
     unsafe {
         core::arch::asm!("fnstcw word ptr [{}]", in(reg) &mut old as *mut u16, options(nostack))
     };
@@ -433,7 +428,7 @@ fn panicked() {
 
 static PANICKED: AtomicU32 = AtomicU32::new(0);
 
-/// 数えと食い違いのコピー（ゲームのスレッドが `publish_summary` で置き、読み取りのスレッドが `summary_text` で読む）。
+/// 数えと食い違いのコピー（ゲームのスレッドが `publish_summary` で書き、読み取りのスレッドが `summary_text` で読む）。
 /// ゲームのスレッドは `try_lock` だけで取る（待たない）。
 static SUMMARY: Mutex<Option<Summary>> = Mutex::new(None);
 
@@ -481,14 +476,14 @@ pub fn summary_text() -> Option<String> {
     let mut lines = rollback_play::summary_lines(&s.play, fault);
     if let Some(d) = &s.list_diag {
         lines.push(format!(
-            "巻き戻し（製品の経路）: 並びの食い違いの所 {}",
+            "巻き戻し（製品の処理フロー）: 並びの食い違いの所 {}",
             d.text()
         ));
     }
     if let Some(d) = &s.place_diag {
         // 範囲の名前は製品の経路の表（`PlayState::new` に渡したものと同じ `Tables::th09_play`）から引く。
         lines.push(format!(
-            "巻き戻し（製品の経路）: アドレスが変わった範囲 {}",
+            "巻き戻し（製品の処理フロー）: アドレスが変わった範囲 {}",
             d.text(&Tables::th09_play())
         ));
     }
@@ -526,11 +521,9 @@ impl PlayHooks for RealHooks {
     }
 }
 
-/// 観戦者の実行で、早送りのために走査の call だけを書く（確保の入口と領域は要らない —— 観戦者は巻き戻さない。判断と書き方は
-/// `rollback_play::install_watch_scan`）。呼ぶのは観戦者のネットワークを開くときの 2 か所（起動のとき `RealScriptHost::arm_rollback` の
-/// 観戦者の実行・ゲーム内のメニューの観戦の「ルームマッチ」を開くスレッド）。**どちらも対戦者の実行では呼ばない**。走査の call が既に
-/// 書かれていれば何もしない。書いたか、既に書かれていれば true。早送りは文字の数の欄（`ASCII_COUNT`）を直に読み書きする
-/// （`ff_read_ascii`）ので、その欄が読み書きできる頁だとここで確かめる。
+/// 観戦者の実行で、早送りのために走査の call だけを書く（確保の入口と領域は要らない —— 観戦者は巻き戻さない。判断と書き方は `rollback_play::install_watch_scan`）。
+/// 呼ぶのは観戦者のネットワークを開くときの 2 か所（起動のとき `RealScriptHost::arm_rollback` の観戦者の実行・ゲーム内のメニューの観戦の「ルームマッチ」を開くスレッド）で、**どちらも対戦の実行では呼ばない**。
+/// 走査の call が既に書かれていれば何もしない。書いたか、既に書かれていれば true。早送りは文字の数の欄（`ASCII_COUNT`）を直に読み書きする（`ff_read_ascii`）ので、その欄が読み書きできる頁だと検証する。
 pub fn arm_watch_scan(
     hook_env: &mut dyn crate::hook::HookEnv,
     forbidden: &[AddrRange],
@@ -539,14 +532,14 @@ pub fn arm_watch_scan(
     if rollback_win::scan_hooked() {
         let _ = writeln!(
             detail_out(out),
-            "観戦者の早送り: 走査の call は書いてある（rollback の設置などが先に書いた）ので、何もしない"
+            "観戦者の早送り: 走査の call は書き込み済み（rollback の設置などが先に書きました）なので何もしません"
         );
         return true;
     }
     if !rollback_win::output_ranges_rw() {
         let _ = writeln!(
             out,
-            "観戦者の早送り: SE・BGM・文字の数の欄が読み書きできる頁でないので、走査の call を書かない（早送りは効かない）"
+            "観戦者の早送り: SE・BGM・文字の数の欄が読み書きできるページでないので走査の call を書きません（早送りは効かない）。"
         );
         return false;
     }
@@ -555,7 +548,7 @@ pub fn arm_watch_scan(
     if wrote {
         let _ = writeln!(
             detail_out(out),
-            "観戦者の早送り: 走査の call だけを書いた（確保・解放の入口は書かない。試合の方式に関わらず早送りが効く）"
+            "観戦者の早送り: 走査の call だけを書きました（確保・解放の入口は書きません。マッチの方式に関わらず早送りが効きます）"
         );
     }
     wrote
@@ -565,7 +558,7 @@ pub fn arm_watch_scan(
 pub const DEFAULT_ARENA_BYTES: u32 = 16 << 20;
 
 /// 設置（読み取りのスレッドで 1 回。入力のフックを書いた後）。`wish` は ini の望むモード（rollback を望まなければ 1 バイトも
-/// 書かない）。E1 の実験の仕組み（`[rollback_probe]`）・`[alloc_count]` とは同じ入口を使うので並べない（呼び手がどちらか 1 つだけを
+/// 書かない）。巻き戻しの実験の仕組み（`[rollback_probe]`）・`[alloc_count]` とは同じ入口を使うので並べない（呼び手がどちらか 1 つだけを
 /// 入れる）。書けたら true。
 pub fn arm(
     wish: Mode,
@@ -578,39 +571,39 @@ pub fn arm(
     if !rollback_play::install_wanted(wish) {
         let _ = writeln!(
             detail_out(out),
-            "巻き戻し（製品の経路）: rollback を望んでいない走り（delay 方式）なので、何も書かない"
+            "巻き戻し（製品の処理フロー）: rollback を望んでいない実行（delay 方式）なので何も書きません"
         );
         return false;
     }
     if armed() || rollback_win::armed() {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: もう入っているか、E1 の実験の口が入っているので入れない"
+            "巻き戻し（製品の処理フロー）: もう入っているか、E1 の実験の入口が入っているので入れません。"
         );
         return false;
     }
     let Some(tid) = main_tid else {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: ゲームのスレッドの ID が取れないので入れない"
+            "巻き戻し（製品の処理フロー）: ゲームのスレッドの ID が取れないので入れません。"
         );
         return false;
     };
     if !rollback_win::output_ranges_rw() {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: SE・BGM・文字の数の欄が読み書きできる頁でないので入れない"
+            "巻き戻し（製品の処理フロー）: SE・BGM・文字の数の欄が読み書きできるページでないので入れません。"
         );
         return false;
     }
     let Some(base) = rollback_win::place_play_arena(arena_bytes) else {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: 領域 {arena_bytes} バイトを置けないので入れない"
+            "巻き戻し（製品の処理フロー）: 領域 {arena_bytes} バイトが確保できないので入れません。"
         );
         return false;
     };
-    // 描画が消す欄: 描画の後の値を作る命令が想定のバイト列か、本物を読むだけで確かめる。違えば表を使わない（巻き戻しは入れる。
+    // 描画が消す欄: 描画の後の値を作る命令が想定のバイト列か、本物を読むだけで検証する。違えば表を使わない（巻き戻しは入れる。
     // 色が残る不具合が戻るだけで、コピーと書き戻しの正しさには関わらない）。
     let made = match rollback_play::render_reset_code_matches(RENDER_RESETS, &mut |a| {
         OwnProcess.u32_at(a)
@@ -618,7 +611,7 @@ pub fn arm(
         Ok(()) => {
             let _ = writeln!(
                 detail_out(out),
-                "巻き戻し（製品の経路）: 描画が消す欄 {} 行をコピーの中で描画の後の値に置き換える（描画の命令の照合が合った）",
+                "巻き戻し（製品の処理フロー）: 描画が消す欄 {} 行をコピーの中で描画後の値に置き換えます（描画の命令の照合が一致）",
                 RENDER_RESETS.len()
             );
             PlayState::new(Tables::th09_play(), base, arena_bytes)
@@ -626,7 +619,7 @@ pub fn arm(
         Err(e) => {
             let _ = writeln!(
                 out,
-                "巻き戻し（製品の経路）: 描画が消す欄を置き換えない（{e}）。カットインの色が残る不具合が出うる"
+                "巻き戻し（製品の処理フロー）: 描画が消す欄を置き換えません（{e}）。カットインの色が残る不具合が出るおそれがあります。"
             );
             PlayState::new_with_resets(Tables::th09_play(), &[], base, arena_bytes)
         }
@@ -636,7 +629,7 @@ pub fn arm(
         Err(e) => {
             let _ = writeln!(
                 out,
-                "巻き戻し（製品の経路）: 範囲の表を作れない（{e}）ので入れない"
+                "巻き戻し（製品の処理フロー）: 範囲の表の作成不能（{e}）。入れません。"
             );
             return false;
         }
@@ -645,7 +638,7 @@ pub fn arm(
     let Some(snap_buf) = rollback_win::alloc_pages(buf_bytes) else {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: コピーの置き場 {buf_bytes} バイトを確保できないので入れない"
+            "巻き戻し（製品の処理フロー）: コピー用の領域 {buf_bytes} バイトが確保できないので入れません。"
         );
         return false;
     };
@@ -653,7 +646,7 @@ pub fn arm(
     // SAFETY: 書く先は自分の変数。
     unsafe { QueryPerformanceFrequency(&mut qpf) };
     let regions = st.plan().n;
-    // SAFETY: 置くのはここの 1 回だけ。まだ `PLAY_ARMED` を立てていないので、ゲームのスレッドは入れ物に触らない。
+    // SAFETY: 設定するのはここの 1 回だけ。まだ `PLAY_ARMED` を立てていないので、ゲームのスレッドは入れ物に触らない。
     unsafe {
         *PLAY.0.get() = Some(PlayBox {
             st,
@@ -664,7 +657,7 @@ pub fn arm(
     ALLOC_MAIN_TID.store(tid, Ordering::SeqCst);
     let _ = writeln!(
         detail_out(out),
-        "巻き戻し（製品の経路）: 領域 0x{base:08X}（{} MiB）、コピーの置き場 {buf_bytes} バイト × 1、範囲 {regions} 個（更新の列のつなぎ 0x40 B と陣の背景の VM の配列 2 本を含み、fps の計測の 6 語は書き戻さない）",
+        "巻き戻し（製品の処理フロー）: 領域 0x{base:08X}（{} MiB）、コピー用の領域 {buf_bytes} バイト × 1、範囲 {regions} 個（更新の列のつなぎ 0x40 B と陣の背景の VM の配列 2 本を含み、fps の計測の 6 語は書き戻しません）",
         arena_bytes >> 20
     );
     let r = rollback_play::install_play(wish, hook_env, &mut RealHooks, forbidden, out);
@@ -672,13 +665,13 @@ pub fn arm(
         PLAY_ARMED.store(1, Ordering::Release);
         let _ = writeln!(
             detail_out(out),
-            "巻き戻し（製品の経路）: 入れた（確保・解放・calloc・走査の call）。確保の向け先は rollback のモードの試合の間だけ開く"
+            "巻き戻し（製品の処理フロー）: 設置しました（確保・解放・calloc・走査の call）。確保の向け先は rollback のモードのマッチの間だけ開きます"
         );
         true
     } else {
         let _ = writeln!(
             out,
-            "巻き戻し（製品の経路）: 5 地点が全部は書けなかったので入れない（書けた入口は素通しのまま残る）"
+            "巻き戻し（製品の処理フロー）: 5 フック地点が全部は書けなかったので入れません（書けた入口は素通しのまま残る）。"
         );
         false
     }
@@ -686,7 +679,7 @@ pub fn arm(
 
 #[cfg(test)]
 mod tests {
-    //! 指図の受け渡し（`input_hook`）と x87 の制御語の置き直し（`with_game_fpu`）。静的変数を触るので 1 本ずつ走らせる。
+    //! 指図の受け渡し（`input_hook`）と x87 の制御語のセットし直し（`with_game_fpu`）。静的変数を触るので 1 本ずつ走らせる。
     use super::*;
 
     static LOCK: Mutex<()> = Mutex::new(());

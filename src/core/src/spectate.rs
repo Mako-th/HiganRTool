@@ -1,78 +1,70 @@
-//! 観戦の core の部分（SPECTATE_JOIN・SPECTATE_STREAM・SPECTATE_ACK）。
+//! 観戦の core の部分（SPECTATE_JOIN・SPECTATE_STREAM・SPECTATE_ACK。中継の木は `tree`、中継役を選ぶ上りの測りは `uplink`）。
 //!
-//! 観戦者はホストだけに繋ぐ。ホストは「使うと決まったもの」を**記録**（`wire::Record`）として 1 本の通し番号（u32）に並べ、観戦者へ流す。
-//! 観戦者は連続で受け取れた所までを ack で返す。
-//!
-//! ```text
-//! ホスト（ゲームのスレッド）→ push(記録) → [SpectateHost のリングバッファ] ← poll / on_datagram（受信スレッド）
-//!                                                 │ SPECTATE_STREAM（ウィンドウで詰める・送り直す）
-//!                                                 ▼                    ▲ SPECTATE_ACK / JOIN
-//!                                            [Watcher: Assembler] → pop() → 観戦者のゲーム
-//! ```
-//!
-//! **seg**: dll の並びは「`Seg(0)` → 名前（`Name` × 2）→ 選択の記録 → マッチの語 → `Seg(1)` → … → `End`」で、`Seg(k)` は「この後の記録は
-//! seg k のもの」の宣言（[`seg_head`]）。**seg の始まり**は「最後の `Frame`・`End`・`Seg` の次」。遅れて JOIN した観戦者は、最後に選択の
-//! 記録（`Menu`・`Step`・`Select`）があった seg の始まりから流す（再戦の seg には選択が無く、そこから始めると観戦者のゲームが次の選択まで
-//! 何も映せない）。その seg がリングバッファから落ちたか `REWIND_MAX` より前なら、いまの seg の始まりから。
-//! リングバッファが埋まったときだけ、いまの seg の始まりより前を捨て、捨てられた所にいた観戦者はいまの seg の始まりへ**飛ぶ**（`SpectateStream::reset`）。
-//! 1 つの seg だけでリングバッファが埋まると、その seg は諦める（観戦者を全員外し、次の `Seg` まで記録を受けない）。
-//!
-//! **送り**: 観戦者ごとに `ack`（次に要る番号）・`sent_to`（どこまで送ったか）・`sack`（`ack` の後ろで受け取れたと分かっている記録）を持ち、
-//! ウィンドウは `ack` から `SEND_WINDOW` 記録。新しい分はすぐ送る。ACK は `next` に加えて、その後ろで受け取れた記録をビットで載せ
-//! （`wire::SACK_BITS` = 63 個）、ホストは**届いていない記録だけ**を送り直す。送り直しは記録ごとの時計で、1 回目は `rto` × 倍率、
-//! 2 回目からは `rto` × 2^(送った回数 − 1)（上限は往復の見積もりを `RESEND_CAP_MIN_MS`〜`RESEND_MAX_MS` に収めた値）の間届かなければ
-//! 行う。それより前でも、後から送った記録が届いたのに、その往復 ＋ 入れ替わりの幅（4 × ばらつき。ACK のペース 2 回ぶん以上）を
-//! 過ぎても届かない穴は、時計を待たずに送り直す（RFC 8985 の RACK の考え方）。観戦者が消費を待って `ack` を止めている（流れの制御）
-//! 間は `ack` の番号の記録が届いていても ack に入らないので、その記録は `ack` がそこで止まってからの時間でも数える。
-//! **黙った観戦者**（ACK も JOIN も送り直しの上限の間聞こえない）と、往復の標本がまだ無い観戦者へは、先頭の穴の時計だけで先最初から
-//! 1 通ぶんを送る（記録ごとだとウィンドウの 64 記録が連打になる）。`rto` は ACK から取った往復の見積もり（RFC 6298）に ACK のペースを
-//! 足したもので、送り直した記録と、前の ACK で後ろの記録が先に届いていた記録は標本にしない（Karn）。倍率は、標本の取れない間の
-//! 時計の時間切れで倍にし、標本で 1 に戻す。未確認が無いまま `HEARTBEAT_MS` 経ったら空の STREAM を送り、何も聞かない時間が
-//! `SILENT_MS` を越えた観戦者と BYE を送った観戦者は外す。
-//!
-//! **送りの上限**: 追いついていない観戦者への送りは、`poll` 1 回あたりの通数（`CATCHUP_PACKETS_PER_POLL`・`CATCHUP_PACKETS_PER_WATCHER`）と
-//! 観戦の送り全体の量（`SEND_RATE_BPS`）で止め、残りは次の `poll` へ回す。追いついた観戦者を先に回し、追いついていない観戦者は
-//! `poll` ごとに始める枠をずらして順に回す。
-//!
-//! **受け入れと穴あけ**: 観戦者は、最初の STREAM を受けるまでは観戦用のコードの候補から来たものを受け、候補に無い送り元からは
-//! 「タグ・session の合う STREAM」だけを受けて以後そのアドレスをホストとする（`learned_host`。ホストの NAT が宛先ごとに外側のポートを
-//! 変える型への備え。代償: コードの秘密を知る者は偽の記録を最初に送れるが、対戦者には届かない）。**穴あけ**（[`PunchPlan`]）:
-//! ホストが観戦者の候補のアドレスへ 4 B のパケット（[`PUNCH_PACKET`]）を送り、ホスト側の NAT に経路を作って観戦者の JOIN を通す。
-//!
-//! **ゲームスレッド**: 1 つのスレッドから呼ぶ前提（`&mut self`）。`push`・`on_datagram`・`poll`・`Watcher` の各関数はヒープを確保せず、
-//! パニックしうる添字を置かない（`tests/alloc_check.rs`）。確保するのは `new` だけ。時刻 `now` は ms（折り返しは `wrapping_sub`）。
-//!
-//! **鍵**: ホストは観戦を開くときに使い捨ての鍵を引いて公開鍵を観戦用の接続コードに載せ、観戦者は JOIN ごとに引いて JOIN に載せる。
-//! 鍵は対戦と同じ式（`seal::Ephemeral::dir_keys`。「ホスト → 観戦者」が前）で観戦者ごとに違い、JOIN の後の STREAM・ACK・BYE は全部封じる。
-//! **通し番号はホストに 1 本**（`Sender::SpectateHost`）: 観戦者ごとに数えると、同じ公開鍵の観戦者が入り直したとき nonce が重なる。
-//! ビルド番号が違う JOIN は捨てて数える（`DropReason::OtherBuild`）。
+//! 観戦者はホストか、ホストが紹介した中継役（同じ `SpectateHost` の中継の形）に接続する。ホストは「使うと決まったもの」を**記録**（`wire::Record`）として 1 本の通し番号（u32）に並べ、観戦者へ流す。観戦者は連続で受け取れた所までを ack で返す。
+//! **seg**: dll の並びは「`Seg(0)` → 名前（`Name` × 2）→ 選択の記録 → マッチの語 → `Seg(1)` → … → `End`」で、`Seg(k)` は「この後の記録は seg k のもの」の宣言（[`seg_head`]）。遅れて JOIN した観戦者は、最後に選択の記録（`Menu`・`Step`・`Select`）があった seg の始まりから流す（再戦の seg には選択が無く、そこから始めると観戦者のゲームが次の選択まで何も映せない）。その seg がリングバッファから落ちたか `REWIND_MAX` より前なら、いまの seg の始まりから。リングバッファが埋まったときだけ、いまの seg の始まりより前を捨て、捨てられた所にいた観戦者はいまの seg の始まりへ**飛ぶ**（`SpectateStream::reset`）。1 つの seg だけで埋まると、その seg は諦める（観戦者を全員外し、次の `Seg` まで記録を受けない）。
+//! **送り**: 観戦者ごとに `ack`・`sent_to`・`sack` を持ち、ウィンドウは `ack` から `SEND_WINDOW` 記録。新しい分はすぐ送り、ホストは**届いていない記録だけ**を送り直す（記録ごとの時計と、後から送った記録が届いたのに届かない穴の速い送り直し。RFC 8985 の RACK・往復の見積もりは RFC 6298 と Karn）。追いついていない観戦者（積んだ終わりから `BEHIND_RECORDS` より後ろ）への送りは通数と量の上限（`CATCHUP_PACKETS_PER_POLL`・`CATCHUP_PACKETS_PER_WATCHER`・`spectate_rate` の観戦者ごとと全体の上限）で止め、残りは次の `poll` へ回す。全体の上限は対戦の往復の延び（`note_delay`）で下げる。未確認が無いまま `HEARTBEAT_MS` 経ったら空の STREAM を送り、何も聞かない時間が `SILENT_MS` を越えた観戦者と BYE を送った観戦者は外す。
+//! **受け入れと穴あけ**: 観戦者は、最初の STREAM を受けるまでは観戦用のコードの候補から来たものを受け、候補に無い送り元からは「タグ・session の合う STREAM」だけを受けて以後そのアドレスをホストとする（`learned_host`。ホストの NAT が宛先ごとに外側のポートを変える型への備え）。**穴あけ**（[`PunchPlan`]）: ホストが観戦者の候補のアドレスへ 4 B のパケット（[`PUNCH_PACKET`]）を送り、ホスト側の NAT に経路を作って観戦者の JOIN を通す。ACK を返した送り元が観戦者の選んだ経路で、同じ観戦者のほかの枠は外す（`drop_twins`・`twin_is_live`）。
+//! **ゲームスレッド**: 1 つのスレッドから呼ぶ前提（`&mut self`）。`push`・`on_datagram`・`poll`・`Watcher` の各関数はヒープを確保せず、パニックしうる添字を使わない（`tests/alloc_check.rs`）。確保するのは `new` だけ。時刻 `now` は ms（折り返しは `wrapping_sub`）。
+//! **鍵**: 鍵は対戦と同じ式（`seal::Ephemeral::dir_keys`。「ホスト → 観戦者」が前）で観戦者ごとに違い、JOIN の後の STREAM・ACK・BYE は全部封じる。通し番号はホストに 1 本（`Sender::SpectateHost`）。ビルド番号が違う JOIN は捨てて数える（`DropReason::OtherBuild`）。
 
 use std::net::SocketAddr;
 
 use crate::auth::{AuthKey, Secret};
+use crate::bits512::{self, Bits512};
 use crate::candidate::{Candidates, MAX_CANDIDATES, same_endpoint};
 use crate::handshake::{Established, Name};
 use crate::link::Outlet;
+use crate::nat::NatMark;
+use crate::rtt_probe::{DelaySnapshot, elapsed};
 use crate::seal::{DirKeys, Ephemeral, KeySeed, PUBLIC_LEN, Sender, Seq};
+use crate::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX, FF_UPDATES_MIN};
+use crate::spectate_rate::{self, Throttle, ThrottleCounts};
 use crate::wire::{
-    self, ByeReason, Datagram, DecodeError, MAX_DATAGRAM, MAX_STREAM_RECORDS, Message, NAME_MAX,
-    Record, SACK_BITS, Seat, SpectateJoin, SpectateStream,
+    self, ByeReason, Datagram, DecodeError, JoinTree, MAX_DATAGRAM, MAX_STREAM_RECORDS, Message,
+    NAME_MAX, PeekedType, Record, RelayState, SACK_BITS, Seat, SpectateJoin, SpectateStream,
 };
 
-/// 観戦者の数の上限。観戦の送りは受信スレッドが観戦者ごとに 1 通ずつ行い（loopback の実測で 1 周 p95 約 0.2 ms）、ホストの上りは
-/// 1 人あたり約 3 KB/s（本文。IPv4 のヘッダ込みで約 4.6 KB/s）。10 人でも対戦の相手の便の受け取りの遅れに差が出なかった
+/// 中継の木（紹介・受け入れの依頼・取り置き・中継役が子へ配る側・観戦者の親の付け替え）。
+mod tree;
+/// 試合中の観戦者 → ホストの上りの太さの測り（MEASURE・PAIR）。
+mod uplink;
+
+pub use tree::{
+    ADMIT_QUEUE, ADMIT_TTL_MS, PREPAID_MS, RELAY_CHILDREN, RELAY_HEARTBEAT_MS, RELAY_QUIET_MS,
+    RELAYS, RESERVE_MS, RelayKey, TreeCounts, leave_tree, tend_relay,
+};
+pub use uplink::{
+    MEASURE_CLOSE_MS, MEASURE_MIN_PAIRS, MEASURE_PAIRS, MEASURE_RESEND_MS, MEASURE_RETRY_MS,
+    MEASURE_ROUNDS, MEASURE_SENDS, PAIR_CAP, PAIR_GAP_MS, PAIR_LEN,
+};
+
+/// 観戦者の数の上限。観戦者への送信は受信スレッドが観戦者ごとに 1 通ずつ行い、ホストの上りは
+/// 1 人あたり約 3 KB/s（本文。IPv4 のヘッダ込みで約 4.6 KB/s）。10 人でも相手の便の受け取りの遅れに差が出なかった
 /// （`dll` の `spectate_host::load` の測り）。
 pub const MAX_SPECTATORS: usize = 10;
+/// 観戦者の枠の数。同じ観戦者が IPv4 と IPv6 の両方から JOIN すると送り元ごとに 1 枠ずつ使う（ACK を返した方が決まるまで）ので、人数の上限の 2 倍を持つ。
+/// 人数は枠でなく別人の数で `MAX_SPECTATORS` に止める（`SpectateHost::spectator_count`）。
+const SLOT_CAP: usize = 2 * MAX_SPECTATORS;
 /// リングバッファの大きさ（記録の数）。1 seg 60 分のマッチの語（216,000 個）＋ 選択の画面の MENU の語と余白で 2^18。1 記録 36 B
 /// （名前の記録が最大。`wire::tests::a_record_stays_within_36_bytes` が見る）なので約 9.4 MB（起動時に 1 回確保）。
 pub const RING_CAP: usize = 262_144;
 /// 遅れて JOIN した観戦者を、いまの seg の始まりより前の選択の seg まで遡らせてよい記録の数（60 fps で 20 分）。観戦者の早送りは
-/// 最大 17 倍速なので、遡った分を追うのに 70 秒余りと再戦ごとの読み込みがかかる（外挿）。越えたら遡らず、観戦者は次の選択を待つ。
+/// 既定 8 倍（`ff_max`）なので、遡った分を追うのに 3 分近く（16 倍で 80 秒ほど）と再戦ごとの読み込みがかかる（外挿）。越えたら
+/// 遡らず、観戦者は次の選択を待つ。
 pub const REWIND_MAX: u32 = 72_000;
-/// ホストが、観戦者の ack より先へ送ってよい記録の数（ウィンドウ）。
-pub const SEND_WINDOW: u32 = 64;
+/// ホストが、観戦者の ack より先へ送ってよい記録の数（ウィンドウ）。往復 300 ms の回線で、早送りの最大の速さ（1 秒に約 1,000 記録）を
+/// 切らさず運べる数（ウィンドウ ÷ 往復 ≧ 速さ）。送り直しの表と ACK の受け取れた範囲のビット数もこれ。
+pub const SEND_WINDOW: u32 = 512;
 // ウィンドウは ack の番号そのものを含むので、ack の後ろで受け取っていてよいのは `SEND_WINDOW - 1` 個まで（ACK の受け取れた範囲の幅）。
 const _: () = assert!(SEND_WINDOW - 1 == SACK_BITS);
+const _: () = assert!(SEND_WINDOW == bits512::BITS);
+/// ack が積んだ終わりからこの数より後ろの観戦者を、追いついていないとみなす（送りの上限 `CATCHUP_PACKETS_PER_*` を掛け、追いついた
+/// 観戦者を先に送る）。ウィンドウとは別: ふだんの流れ（1 往復で数記録）と、遅れて入ったときの溜まりを分ける境目。
+pub const BEHIND_RECORDS: u32 = 64;
+// 往復の延びで止めた送りを戻すまでに、追いついていた観戦者はこの境目より遅れる（戻した後は追いつきの上限の下で送る）。
+const _: () = assert!(
+    spectate_rate::RESUME_HOLD_MS * spectate_rate::RECORDS_PER_SEC / 1_000 > BEHIND_RECORDS
+);
 /// 観戦者の ACK が返るペース（ms）。dll の観戦者は入力の地点（ゲームのスレッド）で 1 フレームに 1 回だけ ACK を返す
 /// （60 Hz = 16.7 ms を切り上げ）。
 pub const ACK_TICK_MS: u32 = 17;
@@ -88,23 +80,19 @@ pub const RESEND_MAX_MS: u32 = 1_000;
 /// ない）。
 pub const RESEND_CAP_MIN_MS: u32 = 250;
 /// 先頭の穴から 1 通ぶん（`MAX_STREAM_RECORDS` 個）を指すビット（`Watching::resend_due` の `due` と同じ並び）。
-const FIRST_PACKET: u64 = (1 << MAX_STREAM_RECORDS) - 1;
+const FIRST_PACKET: Bits512 = Bits512::low(MAX_STREAM_RECORDS as u32);
 /// `Watching::rto_scale` の上限。下限の間隔 × これ が `RESEND_MAX_MS` に届く値（見積もりが短すぎるまま往復が延びても、倍々で往復を越えて
 /// 標本が取れるようにする —— Karn）。
 const RTO_SCALE_MAX: u32 = 32;
 const _: () = assert!(RESEND_MIN_MS * RTO_SCALE_MAX >= RESEND_MAX_MS);
-/// 追いついていない観戦者（ack が積んだ終わりから `SEND_WINDOW` より後ろ）への送りの、`poll` 1 回あたりの通数の上限（全員で）。
+/// 追いついていない観戦者（ack が積んだ終わりから `BEHIND_RECORDS` より後ろ）への送りの、`poll` 1 回あたりの通数の上限（全員で）。
 /// `poll` は受信スレッドが対戦の相手の便を受けた後に回すので、1 回の仕事（封じて送る通の数に比例する）とネットワークへ一度に出す量を
 /// 抑える。追いついた観戦者への送り（1 記録ずつの新しい分と、その送り直し）は止めない。
-pub const CATCHUP_PACKETS_PER_POLL: u32 = 4;
-/// 同じく観戦者 1 人あたり（ウィンドウ 1 つぶん = 64 記録 ÷ 1 通 16 記録）。
-pub const CATCHUP_PACKETS_PER_WATCHER: u32 = 4;
-/// 観戦の送り全体の量の上限（B/s。封じた便の長さ。IP・UDP のヘッダは含まない）。追いついていない観戦者への送りだけを止める。
-/// 追いついた観戦者 10 人の流れ（1 人あたり約 3 KB/s）と、往復 30 ms で遅れて入った観戦者 3 人ぶんの追いつき（core の模型で 1 人
-/// 1 秒あたり最大 17,950 B）が入る値。上り 1 Mbps の回線でも 4 割ほどを対戦の便に残す（ヘッダ込みで約 0.57 Mbps。外挿）。
-pub const SEND_RATE_BPS: u32 = 64_000;
-/// 量の上限の、貯められる分（B。追いつきの通 16 通ほど）。
-pub const SEND_BURST_BYTES: u32 = 4_096;
+/// 8 通は、落としのある長い回線でも既定の早送り（8 倍）を切らさず、受信スレッドの 1 周を短く保つ数（`dll` の `spectate_host::load`
+/// が見る）。
+pub const CATCHUP_PACKETS_PER_POLL: u32 = 8;
+/// 同じく観戦者 1 人あたり（1 人が 1 回の `poll` で全部使える。ウィンドウ 512 記録 = 32 通の 1/4）。
+pub const CATCHUP_PACKETS_PER_WATCHER: u32 = 8;
 /// 未確認が無いときに、生きている合図（空の STREAM）を送る間隔（ms）。
 pub const HEARTBEAT_MS: u32 = 1_000;
 /// この間、何も聞かない観戦者を外す（ms）。合図（`HEARTBEAT_MS`）10 回ぶん。
@@ -124,11 +112,6 @@ pub const AGREE_BURST: usize = 8;
 pub const AGREE_WINDOW_MS: u32 = 1_000;
 /// 流れが途切れて（何も聞かないまま）この時間を越えたら、観戦者が JOIN を送り直す（ホストが外した場合に戻る）。
 pub const REJOIN_MS: u32 = 3_000;
-
-fn elapsed(now: u32, then: u32) -> u32 {
-    let d = now.wrapping_sub(then);
-    if d > u32::MAX / 2 { 0 } else { d }
-}
 
 /// 鍵を交換する便（JOIN）を作って（HMAC のタグを付けて）送る。
 fn emit_signed<O: Outlet>(
@@ -165,7 +148,7 @@ fn emit_sealed<O: Outlet>(
 
 // ============================ ホスト ============================
 
-/// 新しい seg の始まりとして観戦の流れへ積む 3 つの記録: `Seg(seg)` と、その直後の席ごとの名前（1P → 2P）。名前は繋がった 2 人の
+/// 新しい seg の始まりとして観戦の流れへ積む 3 つの記録: `Seg(seg)` と、その直後の席ごとの名前（1P → 2P）。名前は接続した 2 人の
 /// HELLO の名前（自分の席で 1P・2P に並べる）で、観戦者が手元のリプレイのフォルダ（`<1P> vs <2P>`）と印に使う。
 /// 遅れて入った観戦者も seg の始まりから受けるので毎 seg 積む。dll のホストと peer_sim のホスト役が同じ関数を呼ぶ。
 pub fn seg_head(seg: u16, est: &Established) -> [Record; 3] {
@@ -225,6 +208,8 @@ pub enum DropReason {
     UnknownSpectator,
     /// リングバッファが溢れて次の `Seg` を待っている間の JOIN。
     Broken,
+    /// 中継役が、受け入れの依頼で名指しされていない JOIN を受けた（子へ記録を流すのをやめた・上が黙っている間も）。
+    NotAdmitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +229,10 @@ pub enum HostEvent {
     },
     /// 観戦者が BYE を送って抜けた。
     Left,
+    /// 中継役を観戦者へ紹介した（返事待ちの紹介の JOIN の再送には、その観戦者へ紹介を送り直した）。
+    Introduced,
+    /// 中継役が、子の続きを持っていないので REHOME を返した。
+    Rehomed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,13 +277,48 @@ pub struct HostCounts {
     pub weak_key: u64,
     pub unexpected: u64,
     pub unknown_spectator: u64,
+    /// 同じ観戦者が IPv4 と IPv6 の両方から JOIN して 2 枠になったとき、返事の無い方を外した数（ACK を返した経路が決まった後に届いた、もう片方の
+    /// 経路の JOIN を入れなかった数も含む）。
+    pub twins_dropped: u64,
+    /// 中継役を紹介した数（紹介の送り直しは `intro_resends`）。
+    pub intros: u64,
+    pub intro_resends: u64,
+    /// ホストが中継役へ送る受け入れの依頼の送り直しの数。
+    pub admit_resends: u64,
+    /// 返事待ちの紹介のうち、`ADMIT_TTL_MS` の内に中継役が受け取らず数えなくなったもの。
+    pub intros_expired: u64,
+    pub not_admitted: u64,
+    /// 中継役が子へ送った REHOME の数。
+    pub rehomes_sent: u64,
+    /// 戻る観戦者の取り置きを使って入れた数。
+    pub reserved_used: u64,
+    /// 子孫の数が `RELAY_CHILDREN` を越えた ACK（嘘。詰めて数えた）。
+    pub descendants_clamped: u64,
+    /// 中継役が、自分の受けた番号の飛びでリングを積み直した回数。
+    pub relay_jumps: u64,
+    /// 直接の観戦者へ上りの測りの番を渡した数（MEASURE の送り直しは `measure_resends`）。
+    pub measures: u64,
+    pub measure_resends: u64,
+    /// 番を締めて上りの見積もりが決まった数と、決まらなかった数（使える組が足りない・番の途中で抜けた）。
+    pub uplinks_measured: u64,
+    pub uplinks_unmeasured: u64,
+    /// 番の組として受けた PAIR の通数。
+    pub pairs: u64,
+    /// 捨てた PAIR（番を持つ観戦者の送り元でない・開かない・番号が違う・重なった）。
+    pub pairs_dropped: u64,
+    /// 木の穴あけの印を送った数。中継役は受け入れる子の候補へ、ホストは外した中継役の子孫へ送る。
+    pub punches_sent: u64,
+    /// マッチの切れ目に、直接の葉を中継役へ紹介した数（入れ替え。`intros` には数えない）。
+    pub swaps: u64,
+    /// 入れ替えで、中継役が依頼を受け取ったので空けた直接の枠の数（`silenced` には数えない）。
+    pub swap_freed: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Watching {
     addr: SocketAddr,
     nonce: u64,
-    /// JOIN の公開鍵（同じ送り元・同じ nonce でも、公開鍵が違えば観戦者が起こし直したと見る）。
+    /// JOIN の公開鍵（同じ送り元・同じ nonce でも、公開鍵が違えば観戦者が起動し直したと見る）。
     public: [u8; PUBLIC_LEN],
     keys: DirKeys,
     /// 次に要る番号（観戦者が連続で受け取った所。`ack` 以降を送り直す）。
@@ -313,8 +337,8 @@ struct Watching {
     /// 観戦者が `ack` の後ろで受け取れた記録（ACK の `sack` を重ねたもの）。ビット i = 番号 `ack + 1 + i`。`ack` が進めば右へ
     /// 詰める。観戦者は受け取った記録を捨てない（`Assembler::on_stream`）ので、遅れて着いた古い ACK の方が少なく見えても
     /// 多い方を残す。
-    sack: u64,
-    /// ウィンドウの中の記録（番号 % `SEND_WINDOW`。ウィンドウは ack から 64 なので重ならない）を最後に送った時刻と送った回数。
+    sack: Bits512,
+    /// ウィンドウの中の記録（番号 % `SEND_WINDOW`。ウィンドウは ack から `SEND_WINDOW` なので重ならない）を最後に送った時刻と送った回数。
     sent: [Sent; SEND_WINDOW as usize],
     /// 届いたと分かった記録のうち（1 回しか送っていないもの）、最も後に送った記録の（送った時刻, 番号）と、送ってから届いたと
     /// 分かるまでの ms。これより前に送ってまだ届かない穴は、この ms ＋ 入れ替わりの幅を過ぎたら送り直す（`resend_due`）。
@@ -325,9 +349,52 @@ struct Watching {
     /// 最後に往復の標本を取った時刻（`rto_scale` を倍にするのは、標本の取れない間の時間切れだけ）。
     sampled_at: Option<u32>,
     last_heard: u32,
+    /// ACK を 1 通でも受けた（観戦者がこの送り元の経路を選んだ印。`drop_twins`・`twin_is_live`）。
+    acked: bool,
     /// 鍵を作った時刻（`REKEY_GAP_MS` の起点）。
     keyed_at: u32,
     name: Name,
+    /// JOIN の早送りの速さ（追いついていない観戦者への送りの上限 `spectate_rate::watcher_cap_bps`）。
+    ff_max: u8,
+    /// この観戦者への追いつきの送りの桶。
+    cap: Bucket,
+    /// JOIN の中継の木の欄。
+    tree: JoinTree,
+    /// 最後に受けた ACK の中継の状態（ACK を受けるまでは「紹介しないで」）。
+    relay: RelayState,
+    /// 最後に受けた ACK の、観戦者が受け取った受け入れの依頼の番号。
+    admit_ack: u16,
+    /// 上りの太さの見積もり（B/s。0 は測っていない。`SpectateHost::note_uplink`）。
+    uplink: u32,
+    /// 中継役に選んだ（`RELAYS` 人まで。外すまで続く）。
+    relay_role: bool,
+    /// 最後に ACK を受けた時刻（JOIN の再送では進めない。流れを受けている印）。
+    last_ack_at: u32,
+    /// この観戦者へ最後に送った受け入れの依頼の番号。
+    admit_next: u16,
+    /// 黙った中継役の子孫のうち、ホストへ戻って入り直した数（子孫の数から引いて二重に数えない）。
+    owed: u8,
+    /// 中継役の子孫の減りのうち、まだ戻っていない子の分（戻った子はこれを先に使い、`owed` を足さない）。`prepaid_until` まで。
+    prepaid: u8,
+    prepaid_until: u32,
+    /// 上りの測りの番を渡した回数（`uplink::MEASURE_ROUNDS` まで）と、測れなかった後に次の番を渡してよい時刻。
+    measure_rounds: u8,
+    measure_after: u32,
+    /// 黙った中継役の子孫へ穴あけを送った（次の ACK まで繰り返さない）。
+    quiet_punched: bool,
+    /// 中継役の下から戻ってきた観戦者の、元の中継役の nonce（入れ替えでその中継役へは回さない）。
+    avoid_relay: Option<u64>,
+}
+
+// 受信スレッドのスタックにも作られる。i686 での大きさをチェック（cargo check）だけで見る。
+const _: () = assert!(std::mem::size_of::<Watching>() <= 5_000);
+
+/// ホストが観戦者ごとに持つ、中継の木の欄（[`SpectateHost::tree_of`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeView {
+    pub join: JoinTree,
+    pub relay: RelayState,
+    pub admit_ack: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -357,42 +424,85 @@ fn sent_before(a_at: u32, a_idx: u32, b_at: u32, b_idx: u32) -> bool {
     (d != 0 && d <= u32::MAX / 2) || (d == 0 && a_idx < b_idx)
 }
 
-/// 観戦の送り全体の量の上限（`SEND_RATE_BPS` の桶。ms ごとに貯まり、送った分を引く）。
+/// 送りの量の桶（ms ごとに上限の速さで貯まり、送った分を引く。貯めは `burst` B まで、借りも `burst` B まで）。量は 1/1000 B で持つ
+/// （1 ms に貯まる 1 B 未満の端数を捨てない）。
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
-    tokens: i64,
+    milli: i64,
     at: Option<u32>,
 }
 
 impl Bucket {
-    const FULL: Bucket = Bucket {
-        tokens: SEND_BURST_BYTES as i64,
+    /// 最初の `refill` で上限の貯めまで満ちる。
+    const NEW: Bucket = Bucket {
+        milli: i64::MAX / 2,
         at: None,
     };
 
-    fn refill(&mut self, now: u32) {
+    fn refill(&mut self, now: u32, bps: u32, burst: u32) {
         let dt = self.at.map_or(0, |t| elapsed(now, t));
         self.at = Some(now);
-        self.tokens = (self.tokens + i64::from(dt) * i64::from(SEND_RATE_BPS) / 1_000)
-            .min(i64::from(SEND_BURST_BYTES));
+        self.milli = self
+            .milli
+            .saturating_add(i64::from(dt) * i64::from(bps))
+            .min(i64::from(burst) * 1_000);
+    }
+
+    fn spend(&mut self, bytes: usize, burst: u32) {
+        self.milli = (self.milli - bytes as i64 * 1_000).max(-i64::from(burst) * 1_000);
+    }
+
+    fn has_room(&self) -> bool {
+        self.milli > 0
     }
 }
 
-/// `poll` 1 回の送りの門。追いついていない観戦者（`capped`）への送りだけを、通数と桶で止める（桶が正なら 1 通送ってよい）。
-/// 追いついた観戦者への送りも桶から引く（量は全体で数える）が止めず、借りは `SEND_BURST_BYTES` までにする。
+/// 全体の上限の決め方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateMode {
+    /// `spectate_rate` の観戦者ごとと全体の上限。全体は対戦の往復の延びで下げる。追いついた観戦者への送りは数えない。
+    Adaptive,
+    /// 固定の全体の上限（B/s）だけ。追いついた観戦者への送りも全体から引く（比べの測りのため）。
+    Fixed(u32),
+}
+
+/// `poll` 1 回の送りの門。追いついていない観戦者（`capped`）への送りだけを、通数と桶（全体と、その観戦者の分）で止める（桶が正なら
+/// 1 通送ってよい）。`paused` の間は誰にも送らない（生きている合図は門を通らない）。
 struct Gate<'a> {
     capped: bool,
+    paused: bool,
     poll_left: &'a mut u32,
     watcher_left: u32,
     bucket: &'a mut Bucket,
+    burst: u32,
+    /// この観戦者の桶のコピー（`poll` が送った後に枠へ戻す）。`None` は観戦者ごとの上限なし（`RateMode::Fixed`）。
+    own: Option<(Bucket, u32)>,
+    /// 追いついた観戦者への送りも全体の桶から引く（`RateMode::Fixed`）。
+    live_spends: bool,
     held: bool,
+    /// 門を通った送りがあった（生きている合図は門を通らないので数えない）。
+    passed: bool,
 }
 
 impl Gate<'_> {
+    /// 門が開いているか（見るだけ。止めた印 `held` を付けない）。
+    fn is_open(&self) -> bool {
+        if self.paused {
+            return false;
+        }
+        !self.capped
+            || (*self.poll_left > 0
+                && self.watcher_left > 0
+                && self.bucket.has_room()
+                && self.own.is_none_or(|(b, _)| b.has_room()))
+    }
+
+    /// 1 通送ってよいか。よければ通った印を、だめなら止めた印を付ける。
     fn open(&mut self) -> bool {
-        let ok = !self.capped
-            || (*self.poll_left > 0 && self.watcher_left > 0 && self.bucket.tokens > 0);
-        if !ok {
+        let ok = self.is_open();
+        if ok {
+            self.passed = true;
+        } else {
             self.held = true;
         }
         ok
@@ -402,8 +512,13 @@ impl Gate<'_> {
         if self.capped {
             *self.poll_left = self.poll_left.saturating_sub(1);
             self.watcher_left = self.watcher_left.saturating_sub(1);
+            if let Some((b, burst)) = self.own.as_mut() {
+                b.spend(bytes, *burst);
+            }
         }
-        self.bucket.tokens = (self.bucket.tokens - bytes as i64).max(-i64::from(SEND_BURST_BYTES));
+        if self.capped || self.live_spends {
+            self.bucket.spend(bytes, self.burst);
+        }
     }
 }
 
@@ -416,7 +531,7 @@ struct Joiner {
     keys: DirKeys,
 }
 
-/// 往復の見積もり（RFC 6298 の SRTT / RTTVAR。整数の ms）。標本は ACK のペースの待ち（`ACK_TICK_MS`）を含む。
+/// 往復の見積もり（RFC 6298 の SRTT / RTTVAR。整数の ms）。標本は観戦者が ACK を返すペースの待ち（`ACK_TICK_MS`）を含む。
 #[derive(Debug, Clone, Copy)]
 struct Rtt {
     srtt: u32,
@@ -485,12 +600,26 @@ pub struct SpectateHost {
     /// 直近の鍵の計算の時刻（古い順に上書きする輪。`AGREE_BURST` 個）。
     agree_log: [Option<u32>; AGREE_BURST],
     agree_next: usize,
-    slots: [Option<Watching>; MAX_SPECTATORS],
-    /// 送り全体の量の桶。
+    /// 観戦者の枠（`SLOT_CAP` 個）。1 枠が約 4.8 KB（大半は `sent` の表）なので、スタックに一時の配列を作らず、作るときだけ確保して以後は
+    /// 1 枠ずつ書き換える。
+    slots: Vec<Option<Watching>>,
+    /// 観戦者への送信全体の量の桶。
     bucket: Bucket,
-    /// 追いついていない観戦者を回し始める枠（`poll` ごとに 1 つずらす。上限で後ろの枠ばかり待たせない）。
+    rate: RateMode,
+    /// 対戦の往復の延びで全体の上限を下げる決まりと、最後に受けた往復の要約（`note_delay`）。
+    throttle: Throttle,
+    delay: Option<DelaySnapshot>,
+    /// 時刻の違う往復の要約を受けた数（ログ用）。
+    delay_seen: u64,
+    /// 最後に追いつきの送り（`capped` の門を通った送り）をした時刻。
+    last_capped_send: Option<u32>,
+    /// 追いついていない観戦者を回し始める枠（最後に追いつきの送りが届いた枠の次。上限で後ろの枠ばかり待たせない）。
     rr: usize,
     counts: HostCounts,
+    /// 中継の木（ホストの紹介と取り置き、または中継役が子へ配る側）。
+    tree: tree::Tree,
+    /// 上りの測り（元のホストだけが使う）。
+    meter: uplink::Meter,
 }
 
 impl SpectateHost {
@@ -501,11 +630,29 @@ impl SpectateHost {
 
     /// 検査の小さいリングバッファ（0 は 1 に上げる）。
     pub fn with_capacity(cfg: HostConfig, cap: usize) -> Self {
+        Self::build(
+            cfg.session_id,
+            &cfg.secret,
+            Ephemeral::from_seed(&cfg.key_seed),
+            Seq::new(),
+            cap,
+            tree::Tree::host(),
+        )
+    }
+
+    fn build(
+        session_id: u32,
+        secret: &Secret,
+        eph: Ephemeral,
+        seq: Seq,
+        cap: usize,
+        tree: tree::Tree,
+    ) -> Self {
         Self {
-            session_id: cfg.session_id,
-            key: AuthKey::derive(&cfg.secret, cfg.session_id),
-            eph: Ephemeral::from_seed(&cfg.key_seed),
-            seq: Seq::new(),
+            session_id,
+            key: AuthKey::derive(secret, session_id),
+            eph,
+            seq,
             build: crate::update::BUILD_NUMBER,
             ring: vec![Record::FILLER; cap.max(1)],
             head: 0,
@@ -519,10 +666,17 @@ impl SpectateHost {
             last_refusal: None,
             agree_log: [None; AGREE_BURST],
             agree_next: 0,
-            slots: [None; MAX_SPECTATORS],
-            bucket: Bucket::FULL,
+            slots: vec![None; SLOT_CAP],
+            bucket: Bucket::NEW,
+            rate: RateMode::Adaptive,
+            throttle: Throttle::new(),
+            delay: None,
+            delay_seen: 0,
+            last_capped_send: None,
             rr: 0,
             counts: HostCounts::default(),
+            tree,
+            meter: uplink::Meter::new(),
         }
     }
 
@@ -574,6 +728,29 @@ impl SpectateHost {
         }
     }
 
+    /// JOIN した観戦者が流れ始める番号: JOIN の続きの番号 `resume` がリングにある（`head` ≤ それ ≤ 積んだ終わり）ならそこ、
+    /// 無ければ [`join_start`](Self::join_start)。続きから流すと、最初の STREAM の `first` は観戦者の連続の終わりと同じなので、
+    /// `reset` が付いても観戦者は飛ばない。
+    fn flow_start(&self, resume: Option<u32>) -> u32 {
+        match resume {
+            Some(r) if (self.head..=self.next).contains(&r) => r,
+            _ => self.join_start(),
+        }
+    }
+
+    /// 送り元 `addr` の観戦者の、中継の木の欄（JOIN と最後の ACK の値）。
+    pub fn tree_of(&self, addr: SocketAddr) -> Option<TreeView> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|w| w.addr == addr)
+            .map(|w| TreeView {
+                join: w.tree,
+                relay: w.relay,
+                admit_ack: w.admit_ack,
+            })
+    }
+
     /// 遡りの上限（記録の数。既定 `REWIND_MAX`）。検査が遡れない形を作るため。
     pub fn set_rewind_max(&mut self, n: u32) {
         self.rewind_max = n;
@@ -583,8 +760,30 @@ impl SpectateHost {
         self.broken
     }
 
+    /// 観戦者の数: 直接の観戦者 ＋ 中継役の子孫 ＋ 返事待ちの紹介。同じ観戦者（nonce・公開鍵が同じ）が経路ごとに 2 枠あっても 1 人と数える。
     pub fn spectator_count(&self) -> usize {
+        self.direct_count() + self.tree_count()
+    }
+
+    /// 直接の観戦者の数（代表の枠）。
+    fn direct_count(&self) -> usize {
+        (0..SLOT_CAP).filter(|&i| self.is_representative(i)).count()
+    }
+
+    /// 使っている枠の数(経路ごとの枠を別に数える。検査用)。
+    pub fn slot_count(&self) -> usize {
         self.slots.iter().flatten().count()
+    }
+
+    /// 枠 `i` が、その観戦者を代表する枠か。同じ観戦者の枠が複数あれば、番号の小さい方 1 つだけが真。
+    fn is_representative(&self, i: usize) -> bool {
+        let Some(w) = self.slots.get(i).and_then(Option::as_ref) else {
+            return false;
+        };
+        !self.slots.iter().enumerate().any(|(j, v)| {
+            v.as_ref()
+                .is_some_and(|v| j < i && v.nonce == w.nonce && v.public == w.public)
+        })
     }
 
     /// 送り元 `addr` の観戦者の、次に要る番号。
@@ -597,7 +796,7 @@ impl SpectateHost {
     }
 
     /// 送り元 `addr` の観戦者が、`ack_of` の後ろで受け取れていると分かっている記録（ビット i = 番号 `ack + 1 + i`。ログと検査用）。
-    pub fn sack_of(&self, addr: SocketAddr) -> Option<u64> {
+    pub fn sack_of(&self, addr: SocketAddr) -> Option<Bits512> {
         self.slots
             .iter()
             .flatten()
@@ -623,12 +822,48 @@ impl SpectateHost {
             .map(Watching::resend_cap)
     }
 
+    /// 観戦者ごとに 1 つ(経路が 2 枠あれば代表の枠)。
     pub fn spectators(&self) -> impl Iterator<Item = (SocketAddr, Name, u32)> + '_ {
-        self.slots.iter().flatten().map(|w| (w.addr, w.name, w.ack))
+        (0..SLOT_CAP)
+            .filter(|&i| self.is_representative(i))
+            .filter_map(|i| self.slots.get(i).and_then(Option::as_ref))
+            .map(|w| (w.addr, w.name, w.ack))
     }
 
     pub fn counts(&self) -> HostCounts {
         self.counts
+    }
+
+    /// 対戦の往復の要約（`rtt_probe::DelayProbe::snapshot`。ゲームスレッドが測って渡す）。次の `poll` から使う。
+    pub fn note_delay(&mut self, snap: Option<DelaySnapshot>) {
+        if let Some(s) = snap
+            && self.delay.is_none_or(|d| d.at != s.at)
+        {
+            self.delay_seen = self.delay_seen.saturating_add(1);
+        }
+        self.delay = snap;
+    }
+
+    /// 時刻の違う往復の要約を受けた数（ログ用）。
+    pub fn delay_seen(&self) -> u64 {
+        self.delay_seen
+    }
+
+    /// 往復の延びで全体の上限を下げた・止めた数。
+    pub fn throttle_counts(&self) -> ThrottleCounts {
+        self.throttle.counts()
+    }
+
+    /// 全体の上限に今掛けている割合（ppm）と、追いついた観戦者への送りも止めているか（ログと検査用）。
+    pub fn throttle_state(&self) -> (u32, bool) {
+        (self.throttle.level_ppm(), self.throttle.paused())
+    }
+
+    /// **検査と比べの測りのためだけ**: 全体の上限を固定の `bps` にし、観戦者ごとの上限と往復の延びによる下げをやめる（追いついた観戦者への
+    /// 送りも全体から引く）。ウィンドウ・送り直しの仕組みを、送りの量の上限に依らずに見るため。
+    #[doc(hidden)]
+    pub fn use_fixed_rate(&mut self, bps: u32) {
+        self.rate = RateMode::Fixed(bps);
     }
 
     /// `head` を進め（古い記録を捨て）、捨てた所にいた観戦者を新しい `head` へ飛ばす。
@@ -640,7 +875,7 @@ impl SpectateHost {
                 w.base = new_head;
                 // 送ったつもりの分（リングバッファから落ちた古い記録）は捨てて、先最初から送り直す（`reset` 付きの 1 通目）。
                 w.sent_to = new_head;
-                w.sack = 0;
+                w.sack = Bits512::EMPTY;
                 w.rto_scale = 1;
                 w.rack = None;
                 self.counts.jumps += 1;
@@ -679,7 +914,7 @@ impl SpectateHost {
                 self.broken = true;
                 self.counts.overflows += 1;
                 self.counts.push_dropped += 1;
-                self.slots = [None; MAX_SPECTATORS];
+                self.slots.iter_mut().for_each(|s| *s = None);
                 return Err(PushError::Full);
             }
         }
@@ -734,6 +969,7 @@ impl SpectateHost {
                 DropReason::WeakKey => c.weak_key += 1,
                 DropReason::Unexpected => c.unexpected += 1,
                 DropReason::UnknownSpectator => c.unknown_spectator += 1,
+                DropReason::NotAdmitted => c.not_admitted += 1,
                 DropReason::Broken => {}
             }
             HostEvent::Dropped(r)
@@ -744,8 +980,12 @@ impl SpectateHost {
         if wire::peek_session(bytes).is_some_and(|s| s != self.session_id) {
             return refuse(&mut self.counts, DropReason::WrongSession);
         }
-        let slot_of = |slots: &[Option<Watching>; MAX_SPECTATORS]| {
-            // 観戦者の枠は 600 B ほどある。コピーせず参照で見る。
+        // 測りの組は µs の時刻の口（`on_pair`）で受ける。ここでは 1,200 B を開かない。
+        if wire::peek_type(bytes) == PeekedType::SpectatePair {
+            return refuse(&mut self.counts, DropReason::Unexpected);
+        }
+        let slot_of = |slots: &[Option<Watching>]| {
+            // 観戦者の枠は 4.8 KB ほどある。コピーせず参照で見る。
             slots
                 .iter()
                 .position(|w| w.as_ref().is_some_and(|w| w.addr == from))
@@ -772,8 +1012,11 @@ impl SpectateHost {
                 if j.build != self.build {
                     return refuse(&mut self.counts, DropReason::OtherBuild(j.build));
                 }
+                self.tree.stop_punch(from);
                 let known = slot_of(&self.slots);
-                // 同じ観戦者の JOIN の再送は、鍵の計算（X25519）の前に返す。ここは対戦相手の便も渡す受信スレッドの上なので、
+                let mut twin = false;
+                let start = self.flow_start(j.tree.resume_from);
+                // 同じ観戦者の JOIN の再送は、鍵の計算（X25519）の前に返す。ここは相手の便も渡す受信スレッドの上なので、
                 // HMAC を通った JOIN を何度送られても重い計算を繰り返さない。
                 if let Some(w) = known
                     .and_then(|i| self.slots.get_mut(i))
@@ -782,9 +1025,34 @@ impl SpectateHost {
                     && w.public == j.public
                 {
                     w.last_heard = now;
+                    // 親を替えて戻った（epoch が進んだ）なら、観戦者の連続の終わりから流し直す（ack が観戦者の手元と食い違うと
+                    // 穴が埋まらない）。木の欄は読み直すが、遅れて着いた古い epoch の JOIN は読まない。中継役は子の起点を依頼で
+                    // 決めるので流し直さない。
+                    let back =
+                        tree::epoch_after(j.tree.epoch, w.tree.epoch) && !self.tree.is_relay();
+                    if back {
+                        w.restart(start, now);
+                    }
+                    if !tree::epoch_after(w.tree.epoch, j.tree.epoch) {
+                        w.tree = j.tree;
+                    }
+                    if back {
+                        // 入れ替えの紹介を受けた観戦者が、元の枠が残っている間にホストへ戻った。
+                        self.back_while_direct(j.nonce, &j.public, now);
+                    }
                     return HostEvent::Refreshed;
                 }
-                // 起こし直しの連打は鍵の計算の前に断る。`last_heard` は延ばさない（重複の JOIN で枠を握り続けさせない）。
+                if self.tree.is_relay() {
+                    return match self.relay_join(from, &j, known, now, out) {
+                        Ok(ev) => ev,
+                        Err(r) => refuse(&mut self.counts, r),
+                    };
+                }
+                if let Some(ev) = self.intro_rejoin(from, &j, now, out) {
+                    return ev;
+                }
+                let mut room = tree::Room::Free;
+                // 起動し直しの連打は鍵の計算の前に断る。`last_heard` は延ばさない（重複の JOIN で枠を握り続けさせない）。
                 if known
                     .and_then(|i| self.slots.get(i))
                     .and_then(Option::as_ref)
@@ -794,10 +1062,20 @@ impl SpectateHost {
                     return HostEvent::Throttled;
                 }
                 if known.is_none() {
+                    // 同じ観戦者の別の経路（IPv4 と IPv6）が先に ACK を返している: こちらは観戦者が選ばなかった経路なので入れない。
+                    if self.twin_is_live(from, j.nonce, &j.public, now) {
+                        self.counts.twins_dropped += 1;
+                        return HostEvent::Refreshed;
+                    }
                     if self.broken {
                         return refuse(&mut self.counts, DropReason::Broken);
                     }
-                    if self.slots.iter().all(Option::is_some) {
+                    // 同じ観戦者の別の経路の枠は、人数の上限の手前でなくても入れる(ACK を返した方が決まれば片方は外れる)。
+                    twin = self.has_twin(from, j.nonce, &j.public);
+                    if !twin {
+                        room = self.room(&j, now);
+                    }
+                    if room == tree::Room::Full {
                         // 満杯の断り。BYE を封じる鍵の計算が要るので、ホスト全体で `REFUSE_GAP_MS` に 1 回だけ答える
                         // （観戦者は 250 ms ごとに JOIN を送り直すので次の機会に BYE を受ける）。送り元ごとにせず全体に
                         // したのは、送り元を変えながら送られても計算の上限が変わらないため。
@@ -848,29 +1126,47 @@ impl SpectateHost {
                     public: j.public,
                     keys,
                 };
-                let start = self.join_start();
+                let ff_max = j.ff_max;
                 if let Some(w) = known
                     .and_then(|i| self.slots.get_mut(i))
                     .and_then(Option::as_mut)
                 {
-                    // 観戦者が起こし直した: 流れを JOIN の始まりからやり直す（鍵も新しい公開鍵で作り直した）。
-                    *w = Self::fresh(id, name, start, now);
+                    // 観戦者が起動し直した: 流れを JOIN の始まりからやり直す（鍵も新しい公開鍵で作り直した）。
+                    *w = Self::fresh(id, name, ff_max, j.tree, start, now);
                     self.counts.joined += 1;
                     return HostEvent::Joined;
                 }
+                // 戻った子の席の入れ替えは、紹介の表を書き換える前に済ませる（紹介が表の空きを作り直すため）。
+                let avoid = self.came_from(room);
+                self.take_room(room, now);
+                if !twin && self.introduce(id, &j, start, avoid, now, out) {
+                    return HostEvent::Introduced;
+                }
                 match self.slots.iter_mut().find(|w| w.is_none()) {
                     Some(free) => {
-                        *free = Some(Self::fresh(id, name, start, now));
-                        self.counts.joined += 1;
+                        let mut w = Self::fresh(id, name, ff_max, j.tree, start, now);
+                        w.avoid_relay = avoid;
+                        *free = Some(w);
+                        // 同じ観戦者の 2 つ目の経路は、入った人数に足さない。
+                        if !twin {
+                            self.counts.joined += 1;
+                        }
                         HostEvent::Joined
                     }
                     // 満杯は上で返してある（ここへは来ない）。
                     None => HostEvent::Refused,
                 }
             }
-            Message::SpectateAck { nonce, next, sack } => {
+            Message::SpectateAck {
+                nonce,
+                next,
+                relay,
+                admit_ack,
+                sack,
+            } => {
                 let tail = self.next;
-                let Some(w) = slot_of(&self.slots)
+                let at = slot_of(&self.slots);
+                let Some(w) = at
                     .and_then(|i| self.slots.get_mut(i))
                     .and_then(Option::as_mut)
                     .filter(|w| w.nonce == nonce)
@@ -878,6 +1174,10 @@ impl SpectateHost {
                     return refuse(&mut self.counts, DropReason::UnknownSpectator);
                 };
                 w.last_heard = now;
+                w.last_ack_at = now;
+                w.quiet_punched = false;
+                w.acked = true;
+                let (twin_nonce, twin_public) = (w.nonce, w.public);
                 self.counts.acks += 1;
                 // 積んだより先は嘘（受け取れるはずが無い）。積んだ所へ詰める。範囲（`sack`）も当てにならないので読まない。
                 let lied = next > tail;
@@ -891,12 +1191,16 @@ impl SpectateHost {
                 let progress = next > w.ack;
                 let (old_ack, old_sack) = (w.ack, w.sack);
                 if progress {
-                    w.sack = w.sack.checked_shr(next - w.ack).unwrap_or(0);
+                    w.sack.shr(next - w.ack);
                     w.ack = next;
                     w.ack_moved_at = now;
                     w.sent_to = w.sent_to.max(next);
                 }
-                // 戻った ack（順が入れ替わって遅れて着いた古い ACK）の範囲は、今の `ack` の後ろの番号と合わない。読まない。
+                // 戻った ack（順が入れ替わって遅れて着いた古い ACK）の中継の状態は古いかもしれないので持たない。
+                if !stale {
+                    tree::settle_relay(w, relay, admit_ack, now, &mut self.counts);
+                }
+                // 戻った ack の範囲は、今の `ack` の後ろの番号と合わない。読まない。
                 if !stale && !lied {
                     // 送っていない記録を観戦者が受け取れているはずは無い。そのビットは捨てる（嘘か、壊れた実装）。
                     let sent = w
@@ -904,20 +1208,23 @@ impl SpectateHost {
                         .saturating_sub(w.ack)
                         .saturating_sub(1)
                         .min(SACK_BITS);
-                    let valid = (1u64 << sent) - 1;
-                    if sack & !valid != 0 {
+                    let valid = Bits512::low(sent);
+                    if !sack.andn(&valid).is_empty() {
                         self.counts.sacks_clamped += 1;
                     }
-                    w.sack |= sack & valid;
+                    w.sack = w.sack.or(&sack.and(&valid));
                 }
-                w.sample_new(old_ack, old_sack, now);
+                w.sample_new(old_ack, &old_sack, now);
+                let moved = w.admit_ack;
+                if let Some(i) = at {
+                    self.drop_admitted(i, twin_nonce, moved, now);
+                }
+                self.drop_twins(from, twin_nonce, &twin_public, now);
                 HostEvent::Acked { progress }
             }
             Message::Bye(_) => match slot_of(&self.slots) {
                 Some(i) => {
-                    if let Some(w) = self.slots.get_mut(i) {
-                        *w = None;
-                    }
+                    self.release(i, now);
                     self.counts.left += 1;
                     HostEvent::Left
                 }
@@ -927,6 +1234,52 @@ impl SpectateHost {
         }
     }
 
+    /// 観戦者は候補の全部（IPv4 と IPv6）へ JOIN するので、同じ観戦者が送り元ごとに 2 枠になる。ACK を返した送り元 `keep` が観戦者の選んだ
+    /// 経路なので、同じ nonce・公開鍵のほかの枠は外す（残すと枠と追いつきの送りの量を、返事のない経路に使い続ける）。中継役の枠は
+    /// `release` で外す（子孫の席の取り置きを消さない）。
+    fn drop_twins(&mut self, keep: SocketAddr, nonce: u64, public: &[u8; PUBLIC_LEN], now: u32) {
+        for i in 0..SLOT_CAP {
+            let Some(w) = self.slots.get(i).and_then(Option::as_ref) else {
+                continue;
+            };
+            if w.addr == keep || w.nonce != nonce || w.public != *public {
+                continue;
+            }
+            if w.relay_role {
+                self.release(i, now);
+            } else if let Some(slot) = self.slots.get_mut(i) {
+                *slot = None;
+            }
+            self.counts.twins_dropped += 1;
+        }
+    }
+
+    /// 別の送り元に、同じ観戦者(nonce・公開鍵が同じ)の枠があるか。
+    fn has_twin(&self, from: SocketAddr, nonce: u64, public: &[u8; PUBLIC_LEN]) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|w| w.addr != from && w.nonce == nonce && w.public == *public)
+    }
+
+    /// 別の送り元の同じ観戦者（nonce・公開鍵が同じ）が ACK を返していて、`REJOIN_MS` の内に何か聞いているか。観戦者の NAT が付け替わって
+    /// 同じ観戦者が新しい送り元から入り直すときは、古い送り元が黙ってから（観戦者は `REJOIN_MS` 黙った後に JOIN を送り直す）なので当たらない。
+    fn twin_is_live(
+        &self,
+        from: SocketAddr,
+        nonce: u64,
+        public: &[u8; PUBLIC_LEN],
+        now: u32,
+    ) -> bool {
+        self.slots.iter().flatten().any(|w| {
+            w.addr != from
+                && w.nonce == nonce
+                && w.public == *public
+                && w.acked
+                && elapsed(now, w.last_heard) < REJOIN_MS
+        })
+    }
+
     /// 観戦者の公開鍵との向きごとの鍵（ホストが「前」）。計算（X25519）の回数を数える。
     fn agree(&mut self, public: &[u8; PUBLIC_LEN]) -> Option<DirKeys> {
         self.counts.key_agreements += 1;
@@ -934,7 +1287,7 @@ impl SpectateHost {
     }
 
     /// 入ったばかりの観戦者。すぐ 1 通目（記録か空の合図）が出るよう、`last_send` を合図の間隔だけ前にする。
-    fn fresh(id: Joiner, name: Name, start: u32, now: u32) -> Watching {
+    fn fresh(id: Joiner, name: Name, ff_max: u8, tree: JoinTree, start: u32, now: u32) -> Watching {
         Watching {
             addr: id.addr,
             nonce: id.nonce,
@@ -946,14 +1299,31 @@ impl SpectateHost {
             last_send: now.wrapping_sub(HEARTBEAT_MS),
             rtt: Rtt::NEW,
             rto_scale: 1,
-            sack: 0,
+            sack: Bits512::EMPTY,
             sent: [Sent::NEVER; SEND_WINDOW as usize],
             rack: None,
             ack_moved_at: now,
             sampled_at: None,
             last_heard: now,
+            acked: false,
             keyed_at: now,
             name,
+            ff_max,
+            cap: Bucket::NEW,
+            tree,
+            relay: RelayState::NO_INTRO,
+            admit_ack: 0,
+            uplink: 0,
+            relay_role: false,
+            last_ack_at: now,
+            admit_next: 0,
+            owed: 0,
+            prepaid: 0,
+            prepaid_until: now,
+            measure_rounds: 0,
+            measure_after: now,
+            quiet_punched: false,
+            avoid_relay: None,
         }
     }
 
@@ -973,7 +1343,41 @@ impl SpectateHost {
     /// 送るものがあれば送る（外す観戦者も決める）。受信スレッドの周回で 1 ms ごとくらいに呼ぶ。追いついていない観戦者への送りは
     /// 上限（モジュール doc の「送りの上限」）で止め、残りは次の呼び出しで送る。
     pub fn poll<O: Outlet>(&mut self, now: u32, out: &mut O) {
-        self.bucket.refill(now);
+        if !self.tree_poll(now, out) {
+            return;
+        }
+        let (rate, live_spends) = match self.rate {
+            RateMode::Adaptive => {
+                let catching_up = self
+                    .last_capped_send
+                    .is_some_and(|t| elapsed(now, t) < spectate_rate::CATCHUP_RECENT_MS);
+                self.throttle.update(now, self.delay, catching_up);
+                // 同じ観戦者の 2 つ目の経路の枠は数えない（代表の枠だけ）。
+                let cap = spectate_rate::total_cap_bps(
+                    (0..SLOT_CAP)
+                        .filter(|&i| self.is_representative(i))
+                        .filter_map(|i| self.slots.get(i).and_then(Option::as_ref))
+                        .map(|w| w.ff_max),
+                );
+                (self.throttle.scale(cap), false)
+            }
+            RateMode::Fixed(bps) => (bps, true),
+        };
+        let burst = spectate_rate::burst_bytes(rate);
+        let paused = self.rate == RateMode::Adaptive && self.throttle.paused();
+        self.bucket.refill(now, rate, burst);
+        for i in 0..SLOT_CAP {
+            if self
+                .slots
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|w| elapsed(now, w.last_heard) >= SILENT_MS)
+            {
+                self.release(i, now);
+                self.counts.silenced += 1;
+            }
+        }
+        self.measure_poll(now, out);
         // 観戦者の枠を書き換えながら記録を読めるよう、ホストの側の読み取りだけの部品を枠から分けて借りる。
         let feed = Feed {
             ring: &self.ring,
@@ -983,44 +1387,65 @@ impl SpectateHost {
             session_id: self.session_id,
         };
         let counts = &mut self.counts;
-        for slot in self.slots.iter_mut() {
-            if slot
-                .as_ref()
-                .is_some_and(|w| elapsed(now, w.last_heard) >= SILENT_MS)
-            {
-                *slot = None;
-                counts.silenced += 1;
-            }
-        }
+        let relay_form = self.tree.is_relay();
         let mut poll_left = CATCHUP_PACKETS_PER_POLL;
         let start = self.rr;
-        self.rr = (self.rr + 1) % MAX_SPECTATORS;
+        let mut served = None;
         // 追いついた観戦者を先に回す（対戦に付いて見ている観戦者の遅れを、追いつきの送りで増やさない）。
         for behind_pass in [false, true] {
-            for j in 0..MAX_SPECTATORS {
-                let Some(w) = self
-                    .slots
-                    .get_mut((start + j) % MAX_SPECTATORS)
-                    .and_then(Option::as_mut)
-                else {
+            for j in 0..SLOT_CAP {
+                let at = (start + j) % SLOT_CAP;
+                let Some(w) = self.slots.get_mut(at).and_then(Option::as_mut) else {
                     continue;
                 };
-                let behind = feed.next.saturating_sub(w.ack) > SEND_WINDOW;
+                let behind = feed.next.saturating_sub(w.ack) > BEHIND_RECORDS;
                 if behind != behind_pass {
                     continue;
                 }
+                let own = match self.rate {
+                    RateMode::Adaptive => {
+                        let bps = spectate_rate::watcher_cap_bps(w.ff_max);
+                        let b = spectate_rate::burst_bytes(bps);
+                        w.cap.refill(now, bps, b);
+                        Some((w.cap, b))
+                    }
+                    RateMode::Fixed(_) => None,
+                };
                 let mut gate = Gate {
                     capped: behind,
+                    paused,
                     poll_left: &mut poll_left,
                     watcher_left: CATCHUP_PACKETS_PER_WATCHER,
                     bucket: &mut self.bucket,
+                    burst,
+                    own,
+                    live_spends,
                     held: false,
+                    passed: false,
                 };
-                w.serve(&feed, now, out, counts, &mut gate);
+                // 中継役とその子は親の沈黙を `REJOIN_MS` で見るので、記録の無い間も短い間隔で合図する。
+                let heartbeat = if relay_form || w.relay_role {
+                    RELAY_HEARTBEAT_MS
+                } else {
+                    HEARTBEAT_MS
+                };
+                w.serve(&feed, now, heartbeat, out, counts, &mut gate);
+                if let Some((b, _)) = gate.own {
+                    w.cap = b;
+                }
                 if gate.held {
                     counts.deferred += 1;
                 }
+                if behind && gate.passed {
+                    served = Some(at);
+                    self.last_capped_send = Some(now);
+                }
             }
+        }
+        // 次は、追いつきの送りが最後に届いた観戦者の次から回す。量の桶が空く周期と枠の回りが重なって、同じ観戦者がいつまでも後回しに
+        // ならない。
+        if let Some(at) = served {
+            self.rr = (at + 1) % SLOT_CAP;
         }
     }
 }
@@ -1076,36 +1501,28 @@ impl Feed<'_> {
     fn resend<O: Outlet>(
         &self,
         w: &mut Watching,
-        due: u64,
+        due: &Bits512,
         now: u32,
         out: &mut O,
         counts: &mut HostCounts,
         gate: &mut Gate<'_>,
-    ) -> u64 {
-        let mut sent = 0u64;
-        let mut k = 0u32;
-        while k < SEND_WINDOW {
-            if (due >> k) & 1 == 0 {
-                k += 1;
-                continue;
-            }
+    ) -> Bits512 {
+        let mut sent = Bits512::EMPTY;
+        let mut from = 0u32;
+        while let Some(k) = due.next_set(from) {
             if !gate.open() {
                 break;
             }
-            let mut n = 1;
-            while n < MAX_STREAM_RECORDS as u32 && k + n < SEND_WINDOW && (due >> (k + n)) & 1 == 1
-            {
-                n += 1;
-            }
+            let n = due.run_len(k, MAX_STREAM_RECORDS as u32);
             let bytes = self.send(w, w.ack + k, n, out);
             gate.spend(bytes);
             w.mark_resent(k, n, now);
-            sent |= ((1u64 << n) - 1) << k;
+            sent.set_range(k, n);
             counts.packets_sent += 1;
             counts.records_sent += u64::from(n);
             counts.records_resent += u64::from(n);
             counts.resends += 1;
-            k += n;
+            from = k + n;
         }
         sent
     }
@@ -1123,16 +1540,44 @@ impl Watching {
         }
     }
 
-    /// 新しい分を送り、送り直しの時期の来た記録を送り直し、何も無ければ生きている合図を送る。
+    /// 流れを `start` から始め直す（鍵・往復の見積もり・名前はそのまま。`reset` 付きの 1 通目をすぐ送る）。
+    fn restart(&mut self, start: u32, now: u32) {
+        self.ack = start;
+        self.base = start;
+        self.sent_to = start;
+        self.last_send = now.wrapping_sub(HEARTBEAT_MS);
+        self.rto_scale = 1;
+        self.sack = Bits512::EMPTY;
+        self.sent.fill(Sent::NEVER);
+        self.rack = None;
+        self.ack_moved_at = now;
+    }
+
+    /// 新しい分を送り、送り直しの時期の来た記録を送り直し、何も無ければ `heartbeat` ms ごとに生きている合図を送る。
     fn serve<O: Outlet>(
         &mut self,
         feed: &Feed<'_>,
         now: u32,
+        heartbeat: u32,
         out: &mut O,
         counts: &mut HostCounts,
         gate: &mut Gate<'_>,
     ) {
         let end = feed.next.min(self.ack.saturating_add(SEND_WINDOW));
+        if gate.paused {
+            // 往復の延びで止めている間も、観戦者が「ホストが黙った」と見て抜けないよう、生きている合図だけは送る。
+            if self.sent_to < end || self.ack < self.sent_to {
+                gate.held = true;
+            }
+            if elapsed(now, self.last_send) >= heartbeat {
+                let bytes = feed.send(self, self.ack, 0, out);
+                gate.spend(bytes);
+                counts.packets_sent += 1;
+                counts.heartbeats += 1;
+                self.last_send = now;
+            }
+            return;
+        }
         let mut sent_new = false;
         while self.sent_to < end && gate.open() {
             let at = self.sent_to;
@@ -1150,7 +1595,7 @@ impl Watching {
         }
         if self.ack < self.sent_to {
             self.resend_due(feed, now, out, counts, gate);
-        } else if elapsed(now, self.last_send) >= HEARTBEAT_MS {
+        } else if elapsed(now, self.last_send) >= heartbeat {
             // 何も無いまま静か: 生きている合図（空の STREAM）。
             let bytes = feed.send(self, self.ack, 0, out);
             gate.spend(bytes);
@@ -1164,23 +1609,27 @@ impl Watching {
     /// （`old_ack` / `old_sack` は ACK を重ねる前の値）。送り直した記録は取らない（どの送りへの返事か分からない —— Karn）。
     /// 前の ACK で後ろの記録が届いていた記録も取らない（観戦者が消費を待って ack を止めた・順が入れ替わった。往復より長い）。
     /// あわせて、届いた記録のうち最も後に送ったもの（`rack`）を進める。
-    fn sample_new(&mut self, old_ack: u32, old_sack: u64, now: u32) {
+    fn sample_new(&mut self, old_ack: u32, old_sack: &Bits512, now: u32) {
         let top = self.sent_to.min(old_ack.saturating_add(SEND_WINDOW));
         // 前の ACK までに届いていたと分かる最も後の番号の次。
-        let frontier = if old_sack == 0 {
-            old_ack
-        } else {
-            old_ack + 2 + (63 - old_sack.leading_zeros())
-        };
+        let frontier = old_sack.highest().map_or(old_ack, |h| old_ack + 2 + h);
+        // 以下のビット k は番号 `old_ack + k`。前の ACK で届いていたもの（k = 0 は `old_ack` で、届いていない）と、いま届いているもの
+        // （`ack` より前は全部・後ろは `sack`）の差が、この ACK で初めて分かった記録。
+        let mut was = *old_sack;
+        was.shl(1);
+        let moved = self.ack.saturating_sub(old_ack);
+        let mut is = self.sack;
+        is.shl(moved.saturating_add(1));
+        let is = is.or(&Bits512::low(moved));
+        let new = is
+            .andn(&was)
+            .and(&Bits512::low(top.saturating_sub(old_ack)));
         let mut oldest: Option<u32> = None;
-        let mut idx = old_ack;
-        while idx < top {
-            let was = idx > old_ack && (old_sack >> (idx - old_ack - 1)) & 1 == 1;
-            let is =
-                idx < self.ack || (idx > self.ack && (self.sack >> (idx - self.ack - 1)) & 1 == 1);
-            if is
-                && !was
-                && let Some(sent) = self.sent.get(Sent::index(idx)).copied()
+        let mut from = 0u32;
+        while let Some(k) = new.next_set(from) {
+            from = k + 1;
+            let idx = old_ack + k;
+            if let Some(sent) = self.sent.get(Sent::index(idx)).copied()
                 && sent.times == 1
             {
                 let age = elapsed(now, sent.at);
@@ -1198,7 +1647,6 @@ impl Watching {
                     });
                 }
             }
-            idx += 1;
         }
         if let Some(age) = oldest {
             self.rtt.sample(age);
@@ -1235,17 +1683,31 @@ impl Watching {
         counts: &mut HostCounts,
         gate: &mut Gate<'_>,
     ) {
+        // 門が閉じていれば何も送れない。ウィンドウ（最大 512 ビット）を走査しない。
+        if !gate.is_open() {
+            return;
+        }
         let span = self.sent_to.saturating_sub(self.ack).min(SEND_WINDOW);
-        let received = self.sack << 1; // ビット k = 番号 ack + k（k = 0 は連続の終わり = 受け取れていない）
+        // ビット k = 番号 ack + k（k = 0 は連続の終わり = 受け取れていない）。送ったのに返事の無い記録だけを数える。
+        let mut received = self.sack;
+        received.shl(1);
+        let missing = Bits512::low(span).andn(&received);
         let rto = self.rtt.rto();
         let cap = self.resend_cap();
         let reorder = (4 * self.rtt.var).max(2 * ACK_TICK_MS);
-        let (mut missing, mut due, mut fresh, mut fast) = (0u64, 0u64, 0u64, 0u64);
-        for k in 0..span {
-            if (received >> k) & 1 == 1 {
-                continue;
-            }
-            missing |= 1 << k;
+        // 返事（ACK）が送り直しの上限と送り直しの間隔の長い方の間聞こえない間は、記録ごとの時計をやめ、先頭の穴の時計だけで先最初から
+        // 1 通ぶん送る（連打を避ける。モジュール doc）。往復の標本がまだ無い間も同じ（往復が `RESEND_INIT_MS` より長い回線で、入った
+        // 直後のウィンドウ全部を送り直さない）。返事が戻れば記録ごとの時計に戻る。見る記録も先頭の 1 通ぶんだけ。
+        let quiet = elapsed(now, self.last_heard) >= cap.max(rto) || !self.rtt.sampled;
+        let scan = if quiet {
+            missing.and(&FIRST_PACKET)
+        } else {
+            missing
+        };
+        let (mut due, mut fresh, mut fast) = (Bits512::EMPTY, Bits512::EMPTY, Bits512::EMPTY);
+        let mut from = 0u32;
+        while let Some(k) = scan.next_set(from) {
+            from = k + 1;
             let idx = self.ack + k;
             let sent = self
                 .sent
@@ -1269,9 +1731,9 @@ impl Watching {
                 u32::MAX
             };
             if waited.min(stuck) >= timeout {
-                due |= 1 << k;
+                due.set(k);
                 if tries == 1 {
-                    fresh |= 1 << k;
+                    fresh.set(k);
                 }
             } else if stuck >= 2 * ACK_TICK_MS
                 && self.rack.is_some_and(|r| {
@@ -1279,34 +1741,28 @@ impl Watching {
                         && waited >= r.rtt.saturating_add(reorder)
                 })
             {
-                due |= 1 << k;
-                fast |= 1 << k;
+                due.set(k);
+                fast.set(k);
             }
         }
-        // 返事（ACK）が送り直しの上限と送り直しの間隔の長い方の間聞こえない間は、記録ごとの時計をやめ、先頭の穴の時計だけで先最初から
-        // 1 通ぶん送る（連打を避ける。モジュール doc）。往復の標本がまだ無い間も同じ（往復が `RESEND_INIT_MS` より長い回線で、入った
-        // 直後のウィンドウ全部を送り直さない）。返事が戻れば記録ごとの時計に戻る。
-        if elapsed(now, self.last_heard) >= cap.max(rto) || !self.rtt.sampled {
-            due = if due & 1 == 1 {
-                missing & FIRST_PACKET
-            } else {
-                0
-            };
-            fresh &= due;
-            fast &= due;
+        if quiet {
+            // 先頭の穴の時計が来たときだけ、先頭の 1 通ぶんの穴を全部送る。
+            due = if due.get(0) { scan } else { Bits512::EMPTY };
+            fresh = fresh.and(&due);
+            fast = fast.and(&due);
         }
-        if due == 0 {
+        if due.is_empty() {
             return;
         }
-        let sent = feed.resend(self, due, now, out, counts, gate);
-        if sent == 0 {
+        let sent = feed.resend(self, &due, now, out, counts, gate);
+        if sent.is_empty() {
             return;
         }
         self.last_send = now;
-        counts.records_fast += u64::from((sent & fast).count_ones());
+        counts.records_fast += u64::from(sent.and(&fast).count_ones());
         // 見積もりが短すぎる印は、時計で送り直した（速い送り直しでない）1 回目の時間切れが、往復の標本の取れない間に起きたこと。標本が
         // 取れている間の時間切れはただの落とし（倍にすると、ウィンドウの最後の通が落ちたときの回復が遅れる）。
-        if fresh & sent != 0 && self.sampled_at.is_none_or(|t| elapsed(now, t) >= rto) {
+        if !fresh.and(&sent).is_empty() && self.sampled_at.is_none_or(|t| elapsed(now, t) >= rto) {
             self.rto_scale = self.rto_scale.saturating_mul(2).min(RTO_SCALE_MAX);
         }
     }
@@ -1343,6 +1799,8 @@ pub struct Assembler {
     head: u32,
     /// 連続で受け取った終わり（`head` ≤ これ ≤ `head + cap`）。次に要る番号（ack）。
     run_end: u32,
+    /// 置き場に入れたことのある最も先の番号の次（`sack` が、何も持っていない先を数えないための上限）。
+    top: u32,
     counts: AsmCounts,
 }
 
@@ -1361,6 +1819,7 @@ impl Assembler {
             cap: cap as u32,
             head: 0,
             run_end: 0,
+            top: 0,
             counts: AsmCounts::default(),
         }
     }
@@ -1370,11 +1829,11 @@ impl Assembler {
     }
 
     /// 受け取れた範囲（ACK の `sack`）: `ack()` の後ろで受け取った記録。ビット i = 番号 `ack() + 1 + i`。確保しない。
-    pub fn sack(&self) -> u64 {
+    pub fn sack(&self) -> Bits512 {
         let store = self.store_len();
-        // 置き場が持てるのは head から store 個。それより先は置いていない（`on_stream` が捨てる）。
-        let limit = self.head.saturating_add(store);
-        let mut bits = 0u64;
+        // 置き場が持てるのは head から store 個。それより先は持っていない（`on_stream` が捨てる）。`top` より先も何も無い。
+        let limit = self.head.saturating_add(store).min(self.top);
+        let mut bits = Bits512::EMPTY;
         for i in 0..SACK_BITS {
             let idx = self.run_end.saturating_add(1 + i);
             if idx >= limit {
@@ -1386,7 +1845,7 @@ impl Assembler {
                 .copied()
                 .unwrap_or(false)
             {
-                bits |= 1 << i;
+                bits.set(i);
             }
         }
         bits
@@ -1394,6 +1853,12 @@ impl Assembler {
 
     pub fn pending(&self) -> usize {
         (self.run_end - self.head) as usize
+    }
+
+    /// 置き場にある最も先の記録の番号 ＋ 1（連続の後ろの飛び飛びの記録も数える。無ければ `ack()`）。`ack()` より先の記録は
+    /// 捨てずに残るので、`top` が `ack()` より先なら、その手前の記録は置き場にある。
+    pub fn stored_end(&self) -> u32 {
+        self.top.max(self.run_end)
     }
 
     pub fn counts(&self) -> AsmCounts {
@@ -1469,6 +1934,7 @@ impl Assembler {
             if let (Some(slot), Some(p)) = (self.slots.get_mut(i), self.present.get_mut(i)) {
                 *slot = *rec;
                 *p = true;
+                self.top = self.top.max(idx + 1);
                 r.stored = r.stored.saturating_add(1);
                 self.counts.stored += 1;
             }
@@ -1528,6 +1994,8 @@ pub struct WatcherCounts {
     pub streams: u64,
     pub foreign: u64,
     pub not_hgrt: u64,
+    /// `not_hgrt` のうち IPv6 から来たもの（ホストの穴あけの印が IPv6 で届いたかを見る）。
+    pub not_hgrt_v6: u64,
     pub wrong_session: u64,
     pub bad_tag: u64,
     pub undecodable: u64,
@@ -1545,17 +2013,25 @@ pub struct Watcher {
     session_id: u32,
     key: AuthKey,
     public: [u8; PUBLIC_LEN],
-    /// ホストとの向きごとの鍵（観戦者は「後ろ」。ホストの公開鍵が弱い点なら None）。
+    /// 使い捨ての鍵（紹介された中継役との鍵を作る）。
+    eph: Ephemeral,
+    /// 元のホストとの向きごとの鍵（観戦者は「後ろ」。ホストの公開鍵が弱い点なら None）。
     keys: Option<DirKeys>,
     /// 送り手 `Sender::Spectator` の通し番号（秘密鍵と同じ寿命）。
     seq: Seq,
     /// 自分のビルド番号（JOIN に載せる。既定は `update::BUILD_NUMBER`）。
     build: u32,
+    /// 早送りの速さ（JOIN に載せる。既定 `FF_UPDATES_DEFAULT`）。
+    ff_max: u8,
+    /// 回線の型（JOIN に載せる。既定は不明）。
+    nat: NatMark,
     nonce: u64,
     name: Name,
     host: Candidates,
-    /// 最初の STREAM を送ってきた送り元（以後はここだけ）。
+    /// 元のホストのうち、最初の STREAM を送ってきた送り元（以後はここだけ）。
     host_addr: Option<SocketAddr>,
+    /// 元のホストから最後に STREAM か BYE を聞いた時刻（親がホストの間の JOIN の送り直し）。
+    home_heard: Option<u32>,
     asm: Assembler,
     last_join: Option<u32>,
     last_heard: Option<u32>,
@@ -1564,6 +2040,10 @@ pub struct Watcher {
     /// ホストの最後の BYE（上限のときの取消など）。次の STREAM が来たら消す。
     host_bye: Option<ByeReason>,
     counts: WatcherCounts,
+    /// 中継の木（いまの親・epoch・受け入れの依頼の控え）。
+    tree: tree::WatchTree,
+    /// 上りの測りの番。
+    meter: uplink::WatchMeter,
 }
 
 impl Watcher {
@@ -1580,24 +2060,31 @@ impl Watcher {
             session_id: cfg.session_id,
             key,
             public: eph.public(),
+            eph,
             keys,
             seq: Seq::new(),
             build: crate::update::BUILD_NUMBER,
+            ff_max: FF_UPDATES_DEFAULT as u8,
+            nat: NatMark::UNKNOWN,
             nonce: cfg.nonce,
             name: cfg.name,
             host: cfg.host,
             host_addr: None,
+            home_heard: None,
             asm,
             last_join: None,
             last_heard: None,
             last_ack_sent: 0,
             host_bye: None,
             counts: WatcherCounts::default(),
+            tree: tree::WatchTree::new(),
+            meter: uplink::WatchMeter::new(),
         }
     }
 
+    /// 一度でも親（ホストか中継役）から STREAM を受けた。親を替える間も偽に戻らない。
     pub fn is_joined(&self) -> bool {
-        self.host_addr.is_some()
+        self.tree.joined_once
     }
 
     /// 検査が違うビルドの観戦者を作るため。既定は `update::BUILD_NUMBER`。
@@ -1605,11 +2092,25 @@ impl Watcher {
         self.build = build;
     }
 
+    /// JOIN に載せる早送りの速さ（ini の `[spectate] ff_max`。1〜16 に収める）。ホストはこれで追いつきの送りの上限を決める。
+    pub fn set_ff_max(&mut self, ff_max: u32) {
+        self.ff_max = ff_max.clamp(FF_UPDATES_MIN, FF_UPDATES_MAX) as u8;
+    }
+
+    pub fn ff_max(&self) -> u8 {
+        self.ff_max
+    }
+
+    /// JOIN に載せる回線の型（ホストが中継役を選ぶのに読む）。
+    pub fn set_nat(&mut self, nat: NatMark) {
+        self.nat = nat;
+    }
+
     pub fn public_key(&self) -> [u8; PUBLIC_LEN] {
         self.public
     }
 
-    /// ホストとの向きごとの鍵（**検査と診断のためだけ**。観戦者が送った便を外から開く・ホスト役の検査が封じて渡す）。
+    /// ホストとの向きごとの鍵（**検査と診断のためだけ**。観戦者が送った便を外から開く・ホスト役の検査が、観戦者へ渡すために封じる）。
     #[doc(hidden)]
     pub fn dir_keys(&self) -> Option<DirKeys> {
         self.keys
@@ -1619,8 +2120,10 @@ impl Watcher {
         self.seq.next()
     }
 
+    /// いまの親（元のホストか、紹介された中継役）のうち、STREAM を送ってきた送り元。親を替えた直後は、新しい親から STREAM が
+    /// 来るまで None。
     pub fn host_addr(&self) -> Option<SocketAddr> {
-        self.host_addr
+        self.parent_link().0
     }
 
     /// ホストが最後に送った BYE（JOIN を断られたときなど）。次の STREAM を受けると消える。
@@ -1633,16 +2136,26 @@ impl Watcher {
         self.last_heard.map(|t| elapsed(now, t))
     }
 
+    /// 最後に何かを聞いた時刻（ms。何も聞いていなければ `None`）。受信スレッドが、別のスレッドの時計で沈黙を測らせるために渡す。
+    pub fn last_heard(&self) -> Option<u32> {
+        self.last_heard
+    }
+
     pub fn ack(&self) -> u32 {
         self.asm.ack()
     }
 
-    pub fn sack(&self) -> u64 {
+    pub fn sack(&self) -> Bits512 {
         self.asm.sack()
     }
 
     pub fn pending(&self) -> usize {
         self.asm.pending()
+    }
+
+    /// `Assembler::stored_end`。
+    pub fn stored_end(&self) -> u32 {
+        self.asm.stored_end()
     }
 
     pub fn counts(&self) -> WatcherCounts {
@@ -1661,10 +2174,10 @@ impl Watcher {
         self.asm.pop()
     }
 
-    /// 観戦を抜ける（BYE を 1 通。ホストは観戦者の枠を空ける）。dll の観戦者が、見終わった・続けられなくなったときに
-    /// 枠を返す。最初の STREAM を受けるまで（ホストのアドレスが定まるまで）は何も送らない。
+    /// 観戦を抜ける（BYE を 1 通。親は観戦者の枠を空ける）。dll の観戦者が、見終わった・続けられなくなったときに
+    /// 枠を返す。いまの親から最初の STREAM を受けるまで（親のアドレスが定まるまで）は何も送らない。
     pub fn bye<O: Outlet>(&mut self, reason: ByeReason, out: &mut O) {
-        if let (Some(a), Some(k)) = (self.host_addr, self.keys) {
+        if let (Some(a), Some(k)) = self.parent_addr_keys() {
             emit_sealed(
                 &k,
                 Sender::Spectator,
@@ -1677,9 +2190,25 @@ impl Watcher {
         }
     }
 
+    /// いまの親の（アドレス, 鍵）。
+    fn parent_addr_keys(&self) -> (Option<SocketAddr>, Option<DirKeys>) {
+        match &self.tree.parent {
+            Some(p) => (p.addr, Some(p.keys)),
+            None => (self.host_addr, self.keys),
+        }
+    }
+
+    /// いまの親の（アドレス, 最後に聞いた時刻）。
+    fn parent_link(&self) -> (Option<SocketAddr>, Option<u32>) {
+        match &self.tree.parent {
+            Some(p) => (p.addr, p.heard),
+            None => (self.host_addr, self.home_heard),
+        }
+    }
+
     fn send_ack<O: Outlet>(&mut self, to: SocketAddr, out: &mut O) {
         let next = self.asm.ack();
-        let Some(k) = self.keys else {
+        let Some(k) = self.parent_addr_keys().1 else {
             return;
         };
         emit_sealed(
@@ -1691,6 +2220,8 @@ impl Watcher {
             &Message::SpectateAck {
                 nonce: self.nonce,
                 next,
+                relay: self.ack_relay_state(),
+                admit_ack: self.tree.admit_no,
                 sack: self.asm.sack(),
             },
             out,
@@ -1699,7 +2230,8 @@ impl Watcher {
         self.counts.acks_sent += 1;
     }
 
-    /// 受信ソケットに来た 1 データグラムを処理する。STREAM を組み立てに入れ、すぐ ack を返す。
+    /// 受信ソケットに来た 1 データグラムを処理する。STREAM を組み立てに入れ、すぐ ack を返す。紹介（INTRO）・受け入れの依頼（ADMIT）・
+    /// 測りの番（MEASURE）は元のホストの鍵で開けたものだけを、送り元に依らず受ける。
     pub fn on_datagram<O: Outlet>(
         &mut self,
         from: SocketAddr,
@@ -1707,18 +2239,34 @@ impl Watcher {
         now: u32,
         out: &mut O,
     ) {
-        let c = &mut self.counts;
         if wire::classify(bytes) != Datagram::Hgrt {
-            c.not_hgrt += 1;
+            self.counts.not_hgrt += 1;
+            if from.is_ipv6() {
+                self.counts.not_hgrt_v6 += 1;
+            }
             return;
         }
-        // ホストのアドレスが決まったあとは、そのアドレスだけ。決まる前は、観戦用のコードの候補から来たものを受け、候補に無い送り元
-        // （`probation`）はタグの合う STREAM だけを受けてそのアドレスをホストに採る。それ以外は `foreign` で捨てる。
-        if self.host_addr.is_some_and(|a| a != from) {
+        if matches!(
+            wire::peek_type(bytes),
+            PeekedType::SpectateIntro | PeekedType::SpectateAdmit | PeekedType::SpectateMeasure
+        ) {
+            self.on_home_control(bytes, now);
+            return;
+        }
+        let home = self.tree.parent.is_none();
+        let (paddr, keys) = self.parent_addr_keys();
+        let known = match &self.tree.parent {
+            Some(p) => p.cands.contains(from),
+            None => self.host.contains(from),
+        };
+        let c = &mut self.counts;
+        // 親のアドレスが決まったあとは、そのアドレスだけ。決まる前は、親の候補から来たものを受け、候補に無い送り元（`probation`）は
+        // タグの合う STREAM だけを受けてそのアドレスを親に採る。それ以外は `foreign` で捨てる。
+        if paddr.is_some_and(|a| a != from) {
             c.foreign += 1;
             return;
         }
-        let probation = self.host_addr.is_none() && !self.host.contains(from);
+        let probation = paddr.is_none() && !known;
         if wire::peek_session(bytes).is_some_and(|s| s != self.session_id) {
             if probation {
                 c.foreign += 1;
@@ -1727,7 +2275,7 @@ impl Watcher {
             }
             return;
         }
-        let open = self.keys.map(|k| k.opener());
+        let open = keys.map(|k| k.opener());
         let pkt = match wire::decode(&self.key, open.as_ref(), bytes) {
             Ok(p) => p,
             Err(e) => {
@@ -1747,29 +2295,52 @@ impl Watcher {
         match pkt.msg {
             Message::SpectateStream(s) => {
                 c.streams += 1;
-                if probation {
+                if probation && home {
                     c.learned_host += 1;
                 }
-                self.host_addr = Some(from);
+                match self.tree.parent.as_mut() {
+                    Some(p) => {
+                        p.addr = Some(from);
+                        p.heard = Some(now);
+                    }
+                    None => {
+                        self.host_addr = Some(from);
+                        self.home_heard = Some(now);
+                    }
+                }
+                self.tree.joined_once = true;
                 self.last_heard = Some(now);
                 self.host_bye = None;
+                self.tree.refused = false;
                 self.asm.on_stream(&s);
                 self.send_ack(from, out);
             }
             _ if probation => c.foreign += 1,
-            Message::Bye(r) => {
+            Message::Bye(r) if home => {
                 c.byes += 1;
                 self.last_heard = Some(now);
+                self.home_heard = Some(now);
                 self.host_bye = Some(r);
+                // 一度接続した後の取消は、ホストが満杯で入れ直せなかった印（入る前の取消は満杯の待ちで、JOIN を送り続ける）。
+                if r == ByeReason::Cancelled && self.tree.joined_once {
+                    self.tree.refused = true;
+                }
+            }
+            Message::SpectateRehome if !home => {
+                self.tree.counts.rehomes += 1;
+                self.go_home(false, now);
             }
             _ => c.unexpected += 1,
         }
     }
 
-    /// JOIN の送り直しと、消費で進んだ ack の通知。使う側の周回で 1 ms ごとくらいに呼ぶ。
+    /// JOIN の送り直しと、消費で進んだ ack の通知。使う側の周回で 1 ms ごとくらいに呼ぶ。親が中継役なら、紹介から `REJOIN_MS` の内に
+    /// STREAM が来ないか、流れが `REJOIN_MS` 途切れたら元のホストへ戻る。測りの番の間は、上りの測りの組を送る。
     pub fn poll<O: Outlet>(&mut self, now: u32, out: &mut O) {
-        // JOIN: まだ流れが来ない間と、来ていたのが途切れた間（ホストが外したかもしれない）。
-        let wants_join = match (self.host_addr, self.last_heard) {
+        self.check_parent(now);
+        let (paddr, heard) = self.parent_link();
+        // JOIN: まだ流れが来ない間と、来ていたのが途切れた間（親が外したかもしれない）。
+        let wants_join = match (paddr, heard) {
             (Some(_), Some(t)) => elapsed(now, t) >= REJOIN_MS,
             _ => true,
         };
@@ -1778,22 +2349,15 @@ impl Watcher {
                 .last_join
                 .is_none_or(|t| elapsed(now, t) >= JOIN_RESEND_MS)
         {
-            let mut name = [0u8; NAME_MAX];
-            let bytes = self.name.as_bytes();
-            for (d, s) in name.iter_mut().zip(bytes.iter()) {
-                *d = *s;
-            }
-            let join = Message::SpectateJoin(SpectateJoin {
-                name_len: bytes.len().min(NAME_MAX) as u8,
-                nonce: self.nonce,
-                name,
-                build: self.build,
-                public: self.public,
-            });
-            match self.host_addr {
+            let join = self.join_message();
+            let cands = match &self.tree.parent {
+                Some(p) => &p.cands,
+                None => &self.host,
+            };
+            match paddr {
                 Some(a) => emit_signed(&self.key, self.session_id, a, &join, out),
                 None => {
-                    for c in self.host.as_slice() {
+                    for c in cands.as_slice() {
                         emit_signed(&self.key, self.session_id, c.addr, &join, out);
                     }
                 }
@@ -1802,11 +2366,12 @@ impl Watcher {
             self.counts.joins_sent += 1;
         }
         // 消費で置き場が空き、ack が進んだ（流れの制御で止めていた分）。
-        if let Some(a) = self.host_addr
+        if let Some(a) = paddr
             && self.asm.ack() != self.last_ack_sent
         {
             self.send_ack(a, out);
         }
+        self.send_pairs(now, out);
     }
 }
 
@@ -1871,13 +2436,15 @@ impl PunchPlan {
         sent
     }
 
-    /// アドレス `from` から JOIN が来た: そのアドレスへの穴あけを止める。止めた（予定にあった）なら true。
+    /// アドレス `from` から JOIN が来た: そのアドレスへの穴あけを止める。送っている途中の予定にあって止めたなら true
+    /// （回数を送り終えた後の JOIN は、止めたことにならない）。
     pub fn stop_for(&mut self, from: SocketAddr) -> bool {
+        let running = self.round < PUNCH_ROUNDS;
         let mut stopped = false;
         for t in self.targets.iter_mut() {
             if t.is_some_and(|a| same_endpoint(a, from)) {
                 *t = None;
-                stopped = true;
+                stopped |= running;
             }
         }
         stopped
@@ -1897,5 +2464,18 @@ impl PunchPlan {
 
     pub fn rounds_sent(&self) -> u8 {
         self.round
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 観戦者の枠（`Copy`）は受信スレッドのスタックでも作られる。表を足して 5 KB を越えたら（20 枠で 100 KB）枠の持ち方を見直す。
+    #[test]
+    fn a_watching_slot_stays_under_5kb() {
+        let n = std::mem::size_of::<Watching>();
+        assert!(n > SEND_WINDOW as usize * 8, "送りの表より小さい: {n}");
+        assert!(n <= 5_000, "観戦者の枠が {n} B");
     }
 }

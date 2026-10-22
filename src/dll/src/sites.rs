@@ -1,11 +1,8 @@
 //! 地点の表の型と、表そのものの検査・実物のバイト列の判定（pure。unsafe 無し）。
 //!
-//! 実物の値（アドレス・期待バイト列）は `th09_addr.rs` にだけ置く。ここは「表をどう確かめるか」だけで、照合の芯は
-//! `higanr_core::patch`（`check_site` / `check_disjoint` / `verify`）を呼ぶ。
-//!
-//! `check_site` は「相対の分岐を含む地点」を断るので、`E8 rel32` そのものを照合する call 先の差し替えの地点や、命令の途中で
-//! 切れる関数の入口の 8 バイトに当てると必ず落ちる。そこで地点を使い方で 3 つに分け、`check_site` を当てるのは inline detour
-//! で書く地点だけにする。他は「call 先の差し替え」の規則（`E8` と元の飛び先）と、禁止の範囲・地点どうしの重なりで確かめる。
+//! 実物の値（アドレス・期待バイト列）は `th09_addr.rs` にだけ書く。照合の芯は `higanr_core::patch`（`check_site` / `check_disjoint` / `verify`）。
+//! `check_site` は相対の分岐を含む地点を断るので、地点を使い方で 3 つに分け、当てるのは inline detour で書く地点だけにする。
+//! 他は「call 先の差し替え」の規則（`E8` と元の飛び先）と、禁止の範囲・地点どうしの重なりで検証する。
 #![forbid(unsafe_code)]
 
 use higanr_core::patch::{self, AddrRange, DisjointError, Site, SiteError};
@@ -16,7 +13,7 @@ pub enum Use {
     /// （命令の境目の和・5 バイト以上・相対の分岐なし・禁止の範囲）を通す。
     Detour { instr_lens: &'static [u8] },
     /// call 先の差し替え。`addr` は **オペコード `E8` の位置**で、期待バイト列は `E8 rel32` の 5 バイト。書き換えるのは
-    /// rel32（`addr + 1` から 4 バイト）だけ。`original_target` は rel32 から計算した元の飛び先がこれと一致することを確かめる値。
+    /// rel32（`addr + 1` から 4 バイト）だけ。`original_target` は rel32 から計算した元の飛び先がこれと一致することを検証する値。
     CallRel32 { original_target: u32 },
     /// 書かない。照合だけ（観測・戻りアドレス・呼ぶ前の関数の入口）。`instr_lens` は期待バイト列の末尾が命令の境目で終わるときだけ
     /// 持つ（関数の入口の先頭 8 バイトは命令の途中で切れるので `None`）。

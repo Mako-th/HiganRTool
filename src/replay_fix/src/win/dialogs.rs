@@ -166,7 +166,7 @@ fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 出さずに用意するところまで（検査が窓を出さずに vtable の並びを確かめるため）。
+/// 出さずに用意するところまで（検査がウィンドウを出さずに vtable の並びをチェックするため）。
 fn make_dialog(
     title: &str,
     extra_options: u32,
@@ -245,7 +245,7 @@ fn item_path(item: &Com<ItemVtbl>) -> Result<PathBuf, String> {
 
 /// 出して、閉じるまで待つ。取り消しは `Ok(false)`。
 fn show(dlg: &Com<DialogVtbl>, owner: *mut c_void) -> Result<bool, String> {
-    // SAFETY: `dlg` は生きている。`owner` は呼び出し側の窓（null でもよい）。Show は人が閉じるまで戻らない。
+    // SAFETY: `dlg` は生きている。`owner` は呼び出し側のウィンドウ（null でもよい）。Show は人が閉じるまで戻らない。
     let hr = unsafe { (dlg.vtbl().show)(dlg.raw, owner) };
     if hr == HRESULT_CANCELLED {
         return Ok(false);

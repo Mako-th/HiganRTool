@@ -235,7 +235,7 @@ pub enum Parsed {
     RewriteSpectateCode(Box<RewriteCli>),
     /// `--watch ...`（観戦者の役）。
     Watch(Box<WatchCli>),
-    /// `--compare-spectate WATCH_CSV PLAYER [EVENTS_CSV]`（観戦者の列と対戦者の列の突き合わせ）。
+    /// `--compare-spectate WATCH_CSV PLAYER [EVENTS_CSV]`（観戦者の列と対戦する2人の列の突き合わせ）。
     CompareSpectate(PathBuf, PathBuf, Option<PathBuf>),
     Help,
     /// `--compare DLL_CSV PEER_LOG`（走らせずに 2 つの記録を突き合わせる）。
@@ -244,7 +244,7 @@ pub enum Parsed {
     Compare2(PathBuf, PathBuf),
     /// `--stun-probe A B`（2 か所の STUN へ 1 つの受信ソケットから問い合わせて見え方を比べる）。
     StunProbe(Box<stun_probe::Args>),
-    /// `--stun-fake ADDR`（偽の STUN の応答役を起こして待つ。LAN の回）。
+    /// `--stun-fake ADDR`（偽の STUN の応答役を起動して待つ。LAN の回）。
     StunFake(Box<stun_fake::Args>),
     /// `--shape ...`（遅延とロスを揺らす UDP の中継）。
     Shape(Box<shape::Args>),
@@ -254,7 +254,7 @@ pub enum Parsed {
 pub const FOLLOW_MAX_MS: u64 = 30 * 60 * 1_000;
 
 /// `--wait-sec` の上限（秒。1 時間）。dll が待つ 30 分（`netplay::HANDSHAKE_RETRY_MS` = 接続コードの期限）より長く取れるので、
-/// dll の側を何度起こし直しても peer_sim の側が先に諦めずに済む。下限 1 は、0 を「待たない」と読ませず断るため。
+/// dll の側を何度起動し直しても peer_sim の側が先に諦めずに済む。下限 1 は、0 を「待たない」と読ませず断るため。
 pub const MAX_WAIT_SEC: u32 = 3_600;
 
 /// 既定の session_id（`"HGRT"` のリトルエンディアン。両者が引数を省いたときに同じ値になればよい）。
@@ -618,7 +618,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
                 bind: sb,
                 session_id: sid,
                 secret: ssec,
-                // 既定は走るたびに新しい種（起こし直しで同じ鍵・番号 0 から数え直しにならない）。固定は明示したときだけ。
+                // 既定は走るたびに新しい種（起動し直しで同じ鍵・番号 0 から数え直しにならない）。固定は明示したときだけ。
                 key_seed: if spectate_fixed_key {
                     crate::keys::spectate_host_seed(&ssec, sid)
                 } else {
@@ -665,7 +665,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
     };
     // 既定の打ち切り: マッチのフレームの 3 倍の時間 ＋ 60 秒（接続・読み込み・終わりの待ちの分）。
     // 付いていく形はマッチの長さが分からないので `FOLLOW_MAX_MS`。マッチの時間はペース（`--fps`）で決まる。
-    // `--wait-sec` を書いたら、既定にはその分を足す（繋がるのが待つ長さの終わり近くでも、マッチの分が残るように）。
+    // `--wait-sec` を書いたら、既定にはその分を足す（接続できるのが待つ長さの終わり近くでも、マッチの分が残るように）。
     let play_ms = u64::from(segs) * u64::from(frames) * 1_000 / fps;
     let wait_ms = wait_sec.map(|w| u64::from(w) * 1_000);
     let max_ms = match max_sec {
@@ -836,7 +836,7 @@ fn parse_watch(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Par
         )
     } else {
         // コードを使わない経路（配る側が `--spectate-fixed-key` の検査）: 配る側と同じ式で公開鍵を作る（`keys::spectate_host_public`）。
-        // 配る側が既定（走るたびの種）だとこの公開鍵は合わず、流れを開けない。
+        // 配る側が既定（走るたびの種）だとこの公開鍵は合わず、観戦者が流れを開けない。
         let session_id = session_id.unwrap_or(DEFAULT_SPECTATE_SESSION);
         let secret = secret.unwrap_or(DEFAULT_SPECTATE_SECRET);
         (
@@ -931,7 +931,7 @@ fn parse_rewrite(args: &[String]) -> Result<Parsed, String> {
     })))
 }
 
-/// `--stun-probe A B` の形（`--bind` と `--scope internet` だけと一緒に書ける）。外の STUN サーバーへ問い合わせる道具なので、
+/// `--stun-probe A B` の形（`--bind` と `--scope internet` だけと一緒に書ける）。外の STUN サーバーへ問い合わせるツールなので、
 /// 範囲を広げたことを引数に書かせ（既定の loopback のままでは動かさない）、走らせる引数（--peer など）は受けない
 /// （書いたつもりの引数が黙って使われないのを避ける）。
 fn parse_stun_probe(args: &[String]) -> Result<Parsed, String> {
@@ -1883,7 +1883,7 @@ mod tests {
         );
         assert_ne!(s.session_id, c.sim.session_id, "既定が対戦と同じ session");
         assert_ne!(s.secret, c.sim.secret, "既定が対戦と同じ秘密");
-        // 配る側の鍵の種: 既定は起こすたびに違う（同じ秘密・session で起こし直しても鍵が変わる）。固定は明示したときだけで、
+        // 配る側の鍵の種: 既定は起動するたびに違う（同じ秘密・session で起動し直しても鍵が変わる）。固定は明示したときだけで、
         // そのときは式の種（観戦者が式で公開鍵を作る経路）。
         let again = run_of(&format!("{base} --spectate-host 127.0.0.1:7100"))
             .spectate
@@ -1942,7 +1942,7 @@ mod tests {
         let text = spectate_code(&s, "host", 1_000).unwrap();
         let sc = code::read_spectate(&text, 1_000).unwrap();
         // コードの公開鍵は配る側のセッションが使う種（`SpectateCli::key_seed`）の公開鍵と同じ。式で決めた固定の鍵（観戦用の秘密と session から）
-        // とは別 —— 既定は走るたびの種なので、同じ引数で 2 回起こしても公開鍵が違う。
+        // とは別 —— 既定は走るたびの種なので、同じ引数で 2 回起動しても公開鍵が違う。
         assert_eq!(sc.host_public, Ephemeral::from_seed(&s.key_seed).public());
         assert_ne!(
             sc.host_public,

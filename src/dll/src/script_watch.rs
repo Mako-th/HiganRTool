@@ -1,5 +1,5 @@
-//! M1d の台本のある実行で、読み取りのスレッドが 100 ms ごとにすること（pure。unsafe 無し）: feed のリングバッファを読んで模型と照らし
-//! `_feed.csv` へ、「できた」撮影の置き場を取って PNG と `_shots.csv` へ。終わりに集計をログへ。リングバッファ・置き場・進み具合は
+//! 台本のある実行で、読み取りのスレッドが 100 ms ごとにすること（pure。unsafe 無し）: feed のリングバッファを読んで模型と照らし
+//! `_feed.csv` へ、「できた」撮影のバッファを取って PNG と `_shots.csv` へ。終わりに集計をログへ。リングバッファ・撮影のバッファ・進み具合は
 //! `RecordEnv` 越しに読み、ファイルは `RecordEnv::open_output`（本ログの隣に回ごとに別名。既存を上書きしない）で開く。
 //! 読み取りのスレッドで走る（確保もファイルも構わない）。
 #![forbid(unsafe_code)]
@@ -17,7 +17,7 @@ pub const SHOTS_SUFFIX: &str = "_shots.csv";
 /// 平文と `.gz` の両方を読む。
 pub const NET_FRAMES_SUFFIX: &str = "_net_frames.csv.gz";
 /// 観戦者の実行だけ: `_net_frames.csv` と同じフレームを、`peer_sim --compare-spectate` が読む形（見出し `seg,frame,p1,p2` の
-/// 4 列。`peer_sim::watch::frames_csv` と同じ）で書いたもの。`_net_frames.csv` の delay の列は観戦者に無い（ホストの delay と
+/// 4 列。`peer_sim::watch::frames_csv` と同じ）で書いたもの。`_net_frames.csv` の delay の列は観戦者に無い（対戦のホストの delay と
 /// 比べられない）ので、観戦者との突き合わせはこちらで行う。
 pub const WATCH_FRAMES_SUFFIX: &str = "_watch_frames.csv.gz";
 pub const WATCH_FRAMES_CSV_HEADER: &str = "seg,frame,p1,p2";
@@ -37,7 +37,7 @@ pub struct ScriptWatch {
     stats: ShotStats,
     batch: Vec<FeedRecord>,
     write_error: Option<String>,
-    /// ネットワークを置いた実行だけ: 使ったフレームのリングバッファを読んで `_net_frames.csv` へ。
+    /// ネットワークを組み込んだ実行だけ: 使ったフレームのリングバッファを読んで `_net_frames.csv` へ。
     net: Option<NetFrames>,
 }
 
@@ -67,9 +67,9 @@ impl NetFrames {
         n
     }
 
-    /// 観戦者のコピーを、まだ開いていなければ開く（`armed` = 観戦者のセッションを置いた）。ゲーム内のメニューの実行は観戦者のセッションを
-    /// **後から**置く（`script_win::install_placed`）ので、`_net_frames.csv` を開いた後に観戦者になりうる。置いた後の最初の
-    /// 読みで開く（置く前の対戦者としてのフレームはコピーに入らない）。
+    /// 観戦者のコピーを、まだ開いていなければ開く（`armed` = 観戦者のセッションを組み込んだ）。ゲーム内のメニューの実行は観戦者のセッションを
+    /// **後から**組み込む（`script_win::install_placed`）ので、`_net_frames.csv` を開いた後に観戦者になりうる。組み込んだ後の最初の
+    /// 読みで開く（組み込む前の相手としてのフレームはコピーに入らない）。
     fn ensure_mirror(&mut self, rec: &mut dyn RecordEnv, armed: bool) {
         if armed && self.mirror.is_none() {
             let mut m = Sink::open(rec, WATCH_FRAMES_SUFFIX);
@@ -85,8 +85,8 @@ fn wants_net_frames(rec: &dyn RecordEnv) -> bool {
 }
 
 impl ScriptWatch {
-    /// `_feed.csv` と `_shots.csv`（ネットワークを置いた実行では `_net_frames.csv` も）を開く（開けなくても計測は続ける。理由は集計に出る）。
-    /// `feed_first` は台本を動かす前の feed のリングバッファの次の番号。ネットワークのリングバッファは始めから読む。`files` が false（配るバージョン。
+    /// `_feed.csv` と `_shots.csv`（ネットワークを組み込んだ実行では `_net_frames.csv` も）を開く（開けなくても計測は続ける。理由は集計に出る）。
+    /// `feed_first` は台本を動かす前の feed のリングバッファの次の番号。ネットワークのリングバッファは始めから読む。`files` が false（利用者へ配るバージョン。
     /// `observe::writes_script_files`）なら feed と shots は開かない（台本の実行でしか中身が入らず、見出しだけの空のファイルが残るため）。
     pub fn open(rec: &mut dyn RecordEnv, steps: usize, feed_first: u32, files: bool) -> Self {
         let sink = |rec: &mut dyn RecordEnv, suffix: &str| {
@@ -121,7 +121,7 @@ impl ScriptWatch {
         if self.net.is_none() && wants_net_frames(rec) {
             self.net = Some(NetFrames::open(rec));
         }
-        // 観戦者のセッションを後から置いた実行: コピーを遅れて開く（リングバッファを読む前に。置いたセッションの最初のフレームからコピーに入る）。
+        // 観戦者のセッションを後から組み込んだ実行: コピーを遅れて開く（リングバッファを読む前に。組み込んだセッションの最初のフレームからコピーに入る）。
         if let Some(n) = self.net.as_mut() {
             n.ensure_mirror(rec, crate::spectate_watch::armed());
         }
@@ -192,13 +192,13 @@ impl ScriptWatch {
     }
 
     pub fn write_summary(&self, rec: &dyn RecordEnv, out: &mut dyn Write, freq: Option<f64>) {
-        let _ = writeln!(out, "==== 台本（M1d） ====");
+        let _ = writeln!(out, "==== 台本 ====");
         let _ = writeln!(
             out,
             "台本: {}",
             rec.script_progress().text(Some(self.steps))
         );
-        // 台本のマッチの状態の操作（無敵・ライフ・ゲージ）の記録は、ネットワークを置いた実行では「ネットワークの外」の文に入る（`script_win::net_status`）。
+        // 台本のマッチの状態の操作（無敵・ライフ・ゲージ）の記録は、ネットワークを組み込んだ実行では「ネットワークの外」の文に入る（`script_win::net_status`）。
         // ここではネットワークの無い実行だけ。ゲーム内のメニューの実行はネットワークのセッションが無くても「ネットワークの外」の行を出し、その文に状態の操作の記録も
         // 入っているので、別に書かない。
         if self.net.is_none() && !write_outside_net(rec, out) {
@@ -216,7 +216,7 @@ impl ScriptWatch {
             self.shots.status("行")
         );
         if let Some(n) = &self.net {
-            let _ = writeln!(out, "==== ネットワーク（M2-2） ====");
+            let _ = writeln!(out, "==== ネットワーク ====");
             if let Some((snap, other)) = rec.net_status() {
                 let _ = writeln!(out, "ネットワーク: {}", snap.text());
                 let _ = writeln!(out, "ネットワークの外: {other}");
@@ -234,7 +234,7 @@ impl ScriptWatch {
     }
 }
 
-/// ネットワークのセッションを置いていない実行で、「ネットワークの外」の行を書く（書いたら true）。ゲーム内のメニューの実行はネットワークを開く前でもネットワークの外の文
+/// ネットワークのセッションを組み込んでいない実行で、「ネットワークの外」の行を書く（書いたら true）。ゲーム内のメニューの実行はネットワークを開く前でもネットワークの外の文
 /// （メニューの数え・ネットワークを開く仕事の文）を持つ（`RecordEnv::net_status`）。ネットワークを使わない実行は None で何も書かない。
 pub fn write_outside_net(rec: &dyn RecordEnv, out: &mut dyn Write) -> bool {
     let Some((_, other)) = rec.net_status() else {
@@ -260,7 +260,7 @@ fn write_png(
 
 #[cfg(test)]
 mod tests {
-    //! 読み取りのスレッドの側を、偽の `RecordEnv`（feed のリングバッファ・撮影の置き場・書き出し先）で通す。
+    //! 読み取りのスレッドの側を、偽の `RecordEnv`（feed のリングバッファ・撮影のバッファ・書き出し先）で通す。
     use super::*;
     use crate::feeds::tests::good_record;
     use crate::feeds::{FeedRead, im_from_bytes, im_to_bytes};
@@ -278,7 +278,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
 
-    /// 偽の記録側。feed のリングバッファは `feeds[seq]`（`visible` 件まで見える）、撮影の置き場は `shots`（置き場の番号・始まり・
+    /// 偽の記録側。feed のリングバッファは `feeds[seq]`（`visible` 件まで見える）、撮影のバッファは `shots`（バッファの番号・始まり・
     /// 画素。`release_shot` で消える）。
     #[derive(Default)]
     struct WatchRec {
@@ -286,7 +286,7 @@ mod tests {
         visible: u32,
         overwritten: HashSet<u32>,
         shots: Vec<(usize, ShotHead, Vec<u8>)>,
-        /// `take_shot` の回数（置き場を空きに戻し忘れる変異で、検査が止まらずに落ちるための上限に使う）。
+        /// `take_shot` の回数（バッファを空きに戻し忘れる変異で、検査が止まらずに落ちるための上限に使う）。
         takes: Cell<u32>,
         copied: RefCell<Vec<(usize, usize)>>,
         released: Vec<usize>,
@@ -386,7 +386,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 簡潔なログが `_net_frames.csv.gz` を開く（リングバッファを読み続ける）。詳細が開かない。
     #[test]
     fn the_net_frames_file_is_opened_only_when_detailed() {
         for (detail, want_file) in [(false, false), (true, true)] {
@@ -536,9 +535,9 @@ mod tests {
         let log = String::from_utf8(out).unwrap();
         for want in [
             "台本: 最後の段まで終わった（全 5 段）。入口を通った tick 20 / feed した tick 4 / 分かれ道は閉じた",
-            "feed の確かめ: リングバッファから読んだ件 4（台本で feed した tick）、3 本とも一致 3 件 / 食い違いのあった件 1 件、リングバッファの読み落とし 1 件",
-            "feed の確かめ: im1（2P） の食い違い 合計 1（repeat 1）",
-            "feed の確かめ: im0（1P） の食い違い 合計 0\n",
+            "feed の検証: リングバッファから読んだ件 4（台本で feed した tick）、3 本とも一致 3 件 / 食い違いのあった件 1 件、リングバッファの読み落とし 1 件",
+            "feed の検証: im1（2P） の食い違い 合計 1（repeat 1）",
+            "feed の検証: im0（1P） の食い違い 合計 0\n",
             "feed の続き: 続けて feed した組 2、前の後と次の前が違った組（間にゲームが書いた）0、k が飛んだ所 1",
             "撮影: 読み取りのスレッドが受け取った 3 / 撮れた 2 / 書いた 1 / 書けなかった 1 / 上限（400 枚）で書かなかった 0 / 撮れなかった（理由ごと）lockrect 1",
             "撮影: PNG を書けなかった最初の理由: 合成の失敗",
@@ -567,7 +566,7 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("ネットワークの外: 受信スレッドなし"), "{log}");
-        assert!(!log.contains("==== ネットワーク（M2-2） ===="), "{log}");
+        assert!(!log.contains("==== ネットワーク ===="), "{log}");
         assert_eq!(
             log.matches(stats.as_str()).count(),
             1,

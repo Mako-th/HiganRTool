@@ -26,8 +26,6 @@ mod tests {
     const XML: &str = include_str!("manifest/loader.manifest");
     const BUILD_RS: &str = include_str!("build.rs");
 
-    // 何が壊れたら落ちるか: 引数の綴り・昇格の指定が変わる（asInvoker 以外・uiAccess が true になる）、
-    // 入力ファイルの指定が落ちる。
     #[test]
     fn link_args_embed_with_as_invoker_and_the_xml_input() {
         let a = link_args("C:\\x\\loader.manifest");
@@ -37,15 +35,12 @@ mod tests {
         assert!(!UAC.contains("requireAdministrator") && !UAC.contains("true"));
     }
 
-    // 何が壊れたら落ちるか: ファイルの移動・改名で、build.rs が指す先が無くなる。
     #[test]
     fn the_xml_file_build_rs_points_at_exists_and_is_the_one_checked_here() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SUPPORTED_OS_FILE);
         assert_eq!(std::fs::read_to_string(path).unwrap(), XML);
     }
 
-    // 何が壊れたら落ちるか: 対応 OS の GUID の欠け・綴りの崩れ（Windows 7 / 8 / 8.1 / 10・11）、
-    // 実行レベルの二重書き、昇格を求める記述の混入。
     #[test]
     fn xml_lists_the_supported_os_and_asks_for_no_elevation() {
         for guid in [
@@ -69,7 +64,6 @@ mod tests {
         }
     }
 
-    // 何が壊れたら落ちるか: build.rs がマニフェストの引数を出さなくなる・MSVC 以外へ出す。
     // build.rs の文面を読む検査なので、実際に link.exe へ渡った引数までは見ていない。
     #[test]
     fn build_rs_passes_the_args_to_the_msvc_linker_bins_only() {

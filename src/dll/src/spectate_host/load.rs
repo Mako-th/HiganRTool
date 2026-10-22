@@ -1,5 +1,5 @@
 //! 観戦者の数と受信スレッドの負荷の実測（実時間。`#[ignore]`）。観戦者を 0・4・10 人にして、同じ受信スレッドへ対戦の相手の便
-//! （100 Hz）が届く遅れ、受信スレッドが観戦に使った時間、ホストの送りの量、観戦者の遅れを比べる。
+//! （100 Hz）が届く遅れ、受信スレッドが観戦に使った時間、ホストが観戦者へ送る量、観戦者の遅れを比べる。
 use super::*;
 use crate::net_udp;
 use crate::netplay::Net;
@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use super::tests::{MATCH_SESSION, match_ping};
 const FRAME: Duration = Duration::from_nanos(16_666_667);
+/// 受信スレッドが観戦に使う 1 周の p99 の上限（µs）。対戦の相手の便の間隔（`PEER_GAP` 10 ms）の 1 割。
+const ROUND_P99_LIMIT_US: f64 = 1_000.0;
 const PEER_GAP: Duration = Duration::from_millis(10);
 
 fn lo() -> SocketAddr {
@@ -186,11 +188,20 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     let sent = sender.join().unwrap();
     assert!(ring.push(Record::End(ByeReason::Finished)));
     let elapsed = base.elapsed();
+    // 終わりまで受けるのを待つ長さ: 全員の記録を全体の上限（観戦者は既定の早送り）で送り切る見込みの 1.5 倍 ＋ 10 秒（見込みは測りの間に
+    // 送った分も含む多めの値）。
+    let records = 3 + u64::from(late) + u64::from(frames);
+    let cap = higanr_core::spectate_rate::total_cap_bps(std::iter::repeat_n(
+        higanr_core::spectate_pace::FF_UPDATES_DEFAULT as u8,
+        n,
+    ))
+    .max(1);
+    let per = higanr_core::wire::MAX_STREAM_RECORDS as u64;
+    let bytes =
+        n as u64 * records * higanr_core::wire::sealed_frame_stream_len(per as usize) as u64 / per;
+    let wait = Duration::from_millis(bytes * 1_000 / u64::from(cap) * 3 / 2 + 10_000);
     for o in &observers {
-        assert!(
-            o.wait_end(Duration::from_secs(10)),
-            "観戦者が終わりまで受けない"
-        );
+        assert!(o.wait_end(wait), "観戦者が {wait:?} で終わりまで受けない");
     }
     // 送った量の秒は、観戦者が終わりまで受けた時まで（遅れて入った観戦者は、測りの終わりの後も追いつきを受けている）。
     let xfer = base.elapsed();
@@ -320,8 +331,8 @@ fn env(k: &str, d: u64) -> u64 {
 }
 
 /// 条件（観戦者の数, 先に積む記録の数）を交互に `passes` 回ずつ回し、実行ごとの要約の中央値を標準エラーに出す。戻りは条件ごとの
-/// （相手の便が受信スレッドの印を受けるまでの遅れの平均の中央値, 観戦の 1 周の最大の中央値）（µs）。
-fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64)> {
+/// （相手の便が受信スレッドの印を受けるまでの遅れの平均の中央値, 観戦の 1 周の最大の中央値, 観戦の 1 周の p99 の中央値）（µs）。
+fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64, f64)> {
     // 条件ごとの実行の要約: 印までの遅れ・ゲームが取るまでの遅れ・観戦の 1 周・観戦者が使えるまでの遅れ・リングバッファへ書く所要。
     let mut runs: Vec<Vec<[[u64; 5]; 5]>> = vec![vec![]; cases.len()];
     let mut duty: Vec<Vec<f64>> = vec![vec![]; cases.len()];
@@ -377,6 +388,7 @@ fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64)> {
         out.push((
             median(runs[slot].iter().map(|r| r[0][0] as f64).collect()),
             median(runs[slot].iter().map(|r| r[2][4] as f64).collect()),
+            median(runs[slot].iter().map(|r| r[2][3] as f64).collect()),
         ));
         eprintln!(
             "  観戦の仕事の割合（中央値）{:.3}% / 相手の便が観戦の仕事に当たって待つ時間の期待値（Σ周² / 2 / 実時間。µs）{:.2}",
@@ -389,8 +401,9 @@ fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64)> {
 
 /// 観戦者の数が 0・4・10 のとき、同じ受信スレッドで対戦の相手の便が届く遅れがどう変わるかを実測する。値は標準エラーに出す
 /// （条件を交互に何回も回し、実行ごとの要約の中央値で比べる。この PC は他の仕事で揺れるので、標本を合わせず実行ごとに見る）。
+/// 観戦者の ACK は STREAM ごとに返る（core の `Watcher`）ので、受信スレッドの 1 周は ACK 1 通ごと。
 /// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う・観戦者 10 人で相手の便の遅れ（受信スレッドの印まで）の平均の
-/// 中央値が 0 人より 0.5 ms を越えて増える。
+/// 中央値が 0 人より 0.5 ms を越えて増える・観戦の 1 周の p99 の中央値が `ROUND_P99_LIMIT_US` を越える。
 #[test]
 #[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 9 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
 fn measure_receive_thread_load_with_0_4_and_10_spectators() {
@@ -400,18 +413,29 @@ fn measure_receive_thread_load_with_0_4_and_10_spectators() {
         r[2].0 <= r[0].0 + 500.0,
         "観戦者 10 人で相手の便の遅れの平均が 0.5 ms を越えて増えた"
     );
+    assert!(
+        r[2].2 <= ROUND_P99_LIMIT_US,
+        "観戦者 10 人で観戦の 1 周の p99 が {:.0} µs（上限 {ROUND_P99_LIMIT_US}）",
+        r[2].2
+    );
 }
 
 /// 試合の頭から 135 秒ぶん（8,100 記録）遅れて入った観戦者 10 人が、測りの 1 秒目にそろって追いつきを始めるとき、同じ受信スレッドで
-/// 対戦の相手の便が届く遅れと、観戦の 1 周の最悪を、観戦者 0 人と比べる。値は標準エラーに出す。落ちる条件: 相手の便が欠ける・
-/// 観戦者の列が書いた列と違う（全員が先に積んだ記録から最後まで受ける）。
+/// 対戦の相手の便が届く遅れと、観戦の 1 周の最悪を、観戦者 0 人と比べる。値は標準エラーに出す。観戦者の ACK は STREAM ごと。
+/// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う（全員が先に積んだ記録から最後まで受ける）・観戦の 1 周の p99 の
+/// 中央値が `ROUND_P99_LIMIT_US` を越える。
 #[test]
 #[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 6 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
 fn measure_receive_thread_load_with_ten_late_spectators() {
     let (secs, passes) = (env("HIGANR_LOAD_SECS", 10), env("HIGANR_LOAD_PASSES", 3));
     let r = compare(&[(0, 0), (10, 135 * 60)], secs, passes);
     eprintln!(
-        "相手の便の遅れの平均: 0 人 {:.0} µs・遅れて入った 10 人 {:.0} µs / 観戦の 1 周の最大: {:.0} µs",
-        r[0].0, r[1].0, r[1].1
+        "相手の便の遅れの平均: 0 人 {:.0} µs・遅れて入った 10 人 {:.0} µs / 観戦の 1 周の最大: {:.0} µs・p99: {:.0} µs",
+        r[0].0, r[1].0, r[1].1, r[1].2
+    );
+    assert!(
+        r[1].2 <= ROUND_P99_LIMIT_US,
+        "遅れて入った 10 人で観戦の 1 周の p99 が {:.0} µs（上限 {ROUND_P99_LIMIT_US}）",
+        r[1].2
     );
 }

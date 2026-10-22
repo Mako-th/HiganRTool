@@ -1,10 +1,12 @@
-//! つながり（相手との 1 回の接続）ごとの本ログの行（pure。unsafe 無し）。
+//! 相手との 1 回の接続ごとの本ログの行（pure。unsafe 無し）。
 //!
-//! - 接続したときの 1 行（`connect_line`）: 選んだ項目・自分の側・待った秒数。書くのは接続コードの見張りのスレッド（ゲームのスレッドではない）。
-//! - つながりの間とその終わりの行（`LinkLog`）: 観戦者の出入り・stall の内訳・RTT の中央値と最大。読み取りのスレッドが 1 秒ごとに
-//!   `NetSnapshot` から作る。ゲームのスレッドは数を原子変数へ置くだけで、ここで確保するのは読み取りのスレッドの中だけ。
+//! - 接続したときの 1 行（`connect_line`）: 選んだ項目・自分の側・待った秒数。どちらがホストに決まったかの 1 行（`pick_line`）。書くのは接続コードの見張りのスレッド（ゲームのスレッドではない）。
+//! - 接続の間とその終わりの行（`LinkLog`）: 観戦者の出入り・stall の内訳・RTT の中央値と最大。読み取りのスレッドが 1 秒ごとに
+//!   `NetSnapshot` から作る。ゲームのスレッドは数を原子変数へ書くだけで、ここで確保するのは読み取りのスレッドの中だけ。
 #![forbid(unsafe_code)]
 
+use higanr_core::host_pick::{Basis, PickNote};
+use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::net_menu::{T_CREATE, T_GROUP_LAN, T_PASTE, T_RANDOM, T_ROOM};
 
 use crate::net_config::CodeSide;
@@ -104,7 +106,7 @@ pub fn waits(c: &CodeFacts) -> Vec<String> {
 /// 接続した 1 行（見張りが接続を見た 1 回だけ）。
 pub fn connect_line(c: &CodeFacts) -> String {
     let Some(r) = c.route else {
-        return "接続した（メニューで選んだ項目は分からない）".to_string();
+        return "メニューで選んだ項目は分からないまま、接続しました。".to_string();
     };
     let host = match c.host {
         Some(true) => "・対戦のホスト",
@@ -112,19 +114,60 @@ pub fn connect_line(c: &CodeFacts) -> String {
         None => "",
     };
     let waits = waits(c);
-    let tail = if waits.is_empty() {
-        String::new()
-    } else {
-        format!("。{}", waits.join(" / "))
-    };
     format!(
-        "接続した: {}（{}{host}）{tail}",
+        "{}（{}{host}）で接続しました。{}",
         route_name(r),
-        side_words(c, r)
+        side_words(c, r),
+        waits.join(" / ")
     )
 }
 
-/// 接続できないまま待ちが終わった 1 行。`what` は終わり方（取りやめた・時間切れ・ネットワークが終わった）、`now` は見張りを起こしてからの秒。
+fn up_words(bps: u32) -> String {
+    if bps == 0 {
+        "測定不能".to_string()
+    } else {
+        format!("{:.2} Mbps", f64::from(bps) * 8.0 / 1_000_000.0)
+    }
+}
+
+fn nat_words(m: NatMark) -> String {
+    let kind = match m.symmetry {
+        Symmetry::Unknown => "不明",
+        Symmetry::No => "非シンメトリック",
+        Symmetry::Yes => "シンメトリック",
+    };
+    if m.upnp {
+        format!("{kind}・UPnP")
+    } else {
+        kind.to_string()
+    }
+}
+
+/// どちらがホストに決まったかの 1 行（接続した 1 回だけ）。`host` は自分がホストか（分からなければ None）。
+pub fn pick_line(p: &PickNote, host: Option<bool>) -> String {
+    let who = match host {
+        Some(true) => "自分",
+        Some(false) => "相手",
+        None => "不明",
+    };
+    if !p.active {
+        return format!("対戦のホスト: {who}（理由: 乱数の比較。上り回線速度の測定は未実行）。");
+    }
+    let basis = match p.basis {
+        Basis::Nat => "NAT の種類",
+        Basis::Uplink => "上り回線速度",
+        Basis::Nonce => "乱数",
+    };
+    format!(
+        "対戦のホスト: {who}（理由: {basis}）。上り: 自分 {}／相手 {}。NAT: 自分 {}／相手 {}。",
+        up_words(p.own_up),
+        up_words(p.peer_up),
+        nat_words(p.own_nat),
+        nat_words(p.peer_nat)
+    )
+}
+
+/// 接続できないまま待ちが終わった 1 行。`what` は終わり方（取りやめました・時間切れ・ネットワークが終わりました）、`now` は見張りを起動してからの秒。
 pub fn unconnected_line(c: &CodeFacts, what: &str, now: f32) -> String {
     let Some(label) = route_label(c) else {
         return format!("{what}（メニューで選んだ項目は分からない）");
@@ -132,14 +175,14 @@ pub fn unconnected_line(c: &CodeFacts, what: &str, now: f32) -> String {
     let waited = c
         .chosen_at
         .and_then(|a| (now >= a).then_some(now - a))
-        .map_or(String::new(), |s| format!("。選んでから {s:.1} 秒"));
+        .map_or(String::new(), |s| format!("を選んでから {s:.1} 秒"));
     let waits = waits(c);
     let tail = if waits.is_empty() {
         String::new()
     } else {
         format!("（{}）", waits.join(" / "))
     };
-    format!("{what}: {label}{waited}{tail}")
+    format!("{what}。{label}{waited}{tail}")
 }
 
 // ---- 読み取りのスレッド（1 秒ごと）----
@@ -147,7 +190,7 @@ pub fn unconnected_line(c: &CodeFacts, what: &str, now: f32) -> String {
 /// RTT の標本の枠の数（1 ms 刻み。最後の枠は「その値以上」）。
 const RTT_BUCKETS: usize = 1024;
 
-/// つながりの間の RTT の標本（1 秒ごとに読んだ最後の測定値）。同じ PONG を 2 度採らないよう PONG の数で見る。
+/// 接続の間の RTT の標本（1 秒ごとに読んだ最後の測定値）。同じ PONG を 2 度採らないよう PONG の数で見る。
 #[derive(Debug, Clone)]
 struct RttTally {
     hist: Vec<u32>,
@@ -208,7 +251,7 @@ impl RttTally {
     }
 }
 
-/// 読み取りのスレッドが持つ、つながり 1 本分の状態。接続が替わったら（`link_started_ms` が変わる）作り直す。
+/// 読み取りのスレッドが持つ、接続 1 本分の状態。接続が替わったら（`link_started_ms` が変わる）作り直す。
 #[derive(Debug, Clone)]
 pub struct LinkLog {
     link: u32,
@@ -244,7 +287,7 @@ impl LinkLog {
         let mut lines = Vec::new();
         if now.joined > before.joined {
             lines.push(format!(
-                "観戦: 観戦者が来た（{} 人。いま {} 人、計測 {k} 秒の時点）",
+                "観戦: 自分に観戦者が入りました（{} 人。いま {} 人、{k} 秒の時点）。",
                 d(now.joined, before.joined),
                 now.now
             ));
@@ -252,20 +295,20 @@ impl LinkLog {
         let (left, silenced) = (d(now.left, before.left), d(now.silenced, before.silenced));
         if left + silenced > 0 {
             lines.push(format!(
-                "観戦: 観戦者が抜けた（自分で抜けた {left} 人・黙って外した {silenced} 人。いま {} 人、計測 {k} 秒の時点）",
+                "観戦: 観戦者が抜けました（自分で抜けた {left} 人・応答が無く外した {silenced} 人。いま {} 人、{k} 秒の時点）。",
                 now.now
             ));
         }
         if now.refused_full > before.refused_full {
             lines.push(format!(
-                "観戦: 上限で観戦者を断った（{} 人、計測 {k} 秒の時点）",
+                "観戦: 上限で観戦者を断りました（{} 人、{k} 秒の時点）。",
                 d(now.refused_full, before.refused_full)
             ));
         }
         lines
     }
 
-    /// つながりの終わりに足す行（stall の内訳・RTT・観戦者）。`snap` はこのつながりの最後の数。
+    /// 接続の終わりに足す行（stall の内訳・RTT・観戦者）。`snap` はこの接続の最後の数。
     pub fn end_lines(&self, snap: &NetSnapshot) -> Vec<String> {
         let mut v = Vec::new();
         if let Some(l) = stall_line(snap) {
@@ -287,12 +330,12 @@ impl LinkLog {
         let t = &self.rtt;
         let Some(median) = t.median() else {
             return Some(format!(
-                "つながり: RTT は測れていない（測れた PONG {} 個のうち、読み取りで採れた標本 0 個）",
+                "接続: RTT は測れていない（測れた PONG {} 個のうち、読み取りで採れた標本 0 個）",
                 snap.rtt_pongs
             ));
         };
         Some(format!(
-            "つながり: RTT 中央値 {median} ms / 最大 {} ms（測れた PONG {} 個のうち、1 秒ごとの読み取りで採れた標本 {} 個。見逃し {} 個）",
+            "接続: RTT 中央値 {median} ms / 最大 {} ms（測れた PONG {} 個のうち、1 秒ごとの読み取りで採れた標本 {} 個。見逃し {} 個）",
             t.max, snap.rtt_pongs, t.n, t.missed
         ))
     }
@@ -323,7 +366,7 @@ pub fn stall_line(s: &NetSnapshot) -> Option<String> {
         format!("（読み出しの途中で stall の数が {} になった）", s.stalls)
     };
     Some(format!(
-        "つながり: stall の内訳（フレーム数）: 時刻合わせ {} / 先に行き過ぎ {} / 境目 {} / 相手の入力待ち {} / ほか {}（合計 {sum}{note}）{rate}",
+        "接続: stall の内訳（フレーム数）: 時刻合わせ {} / 先に行き過ぎ {} / 境目 {} / 相手の入力待ち {} / ほか {}（合計 {sum}{note}）{rate}",
         s.stalls_sync, s.stalls_ahead, s.stalls_boundary, s.stalls_peer, s.stalls_other
     ))
 }
@@ -331,7 +374,7 @@ pub fn stall_line(s: &NetSnapshot) -> Option<String> {
 fn spectators_line(s: &NetSnapshot) -> Option<String> {
     let c = s.spectators?;
     Some(format!(
-        "つながり: 観戦者 入った {} 人 / 自分で抜けた {} 人 / 黙って外した {} 人 / 上限で断った {} 人（終わりにいた {} 人）",
+        "接続: 観戦者 入った {} 人 / 自分で抜けた {} 人 / 応答が無く外した {} 人 / 上限で断った {} 人（終わりにいた {} 人）",
         c.joined, c.left, c.silenced, c.refused_full, c.now
     ))
 }
@@ -356,7 +399,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: ランダムマッチの行が、待ち列・ルーム・接続の手順の 3 つの秒数と、待ち列での順・対戦のホストを出さない。
     #[test]
     fn a_random_match_line_names_the_route_side_and_each_wait() {
         let c = CodeFacts {
@@ -370,11 +412,10 @@ mod tests {
         };
         assert_eq!(
             connect_line(&c),
-            "接続した: ランダムマッチ（待ち列に先に入った側・対戦のホスト）。待ち列で組になるまで 75.6 秒 / 割り当てのルームで相手のコードを受け取るまで 1.3 秒 / 接続の手順を始めてから接続できるまで 0.3 秒"
+            "ランダムマッチ（待ち列に先に入った側・対戦のホスト）で接続しました。待ち列で組になるまで 75.6 秒 / 割り当てのルームで相手のコードを受け取るまで 1.3 秒 / 接続の手順を始めてから接続できるまで 0.3 秒"
         );
     }
 
-    /// 壊れたら落ちる: 項目ごとの側の言い方が入れ替わる（ルームは入った順、コードは始める側 / 返す側、LAN はホスト / クライアント）。
     #[test]
     fn each_route_says_its_own_side() {
         let mk = |route, side, first| CodeFacts {
@@ -406,7 +447,6 @@ mod tests {
         assert_eq!(route_label(&CodeFacts::new(CodeSide::Game)), None);
     }
 
-    /// 壊れたら落ちる: まだ着いていない区間や逆転した時刻を 0 秒・負の秒として出す。
     #[test]
     fn waits_skip_sections_that_have_not_been_reached() {
         let c = CodeFacts {
@@ -421,7 +461,6 @@ mod tests {
         assert!(waits(&c).is_empty(), "{:?}", waits(&c));
     }
 
-    /// 壊れたら落ちる: 接続できないまま終わった行が、取りやめた理由・項目・選んでからの秒数を落とす。
     #[test]
     fn an_unconnected_line_says_how_it_ended_and_how_long() {
         let c = CodeFacts {
@@ -429,17 +468,17 @@ mod tests {
             queue_first: Some(false),
             ..facts(Route::Random)
         };
-        let l = unconnected_line(&c, "待ちを取りやめた", 41.0);
+        let l = unconnected_line(&c, "待ちを取りやめました", 41.0);
         assert!(
             l.starts_with(
-                "待ちを取りやめた: ランダムマッチ（待ち列に後から入った側）。選んでから 40.0 秒"
+                "待ちを取りやめました。ランダムマッチ（待ち列に後から入った側）を選んでから 40.0 秒"
             ),
             "{l}"
         );
         assert!(l.contains("待ち列で組になるまで 30.0 秒"), "{l}");
         assert_eq!(
-            unconnected_line(&CodeFacts::new(CodeSide::Game), "待ちを取りやめた", 3.0),
-            "待ちを取りやめた（メニューで選んだ項目は分からない）"
+            unconnected_line(&CodeFacts::new(CodeSide::Game), "待ちを取りやめました", 3.0),
+            "待ちを取りやめました（メニューで選んだ項目は分からない）"
         );
     }
 
@@ -451,7 +490,6 @@ mod tests {
         t
     }
 
-    /// 壊れたら落ちる: 中央値が偶数個で平均にならない・最大が外れ値を落とす・同じ PONG を 2 度標本にする・見逃した数が合わない。
     #[test]
     fn rtt_median_and_max_come_from_every_distinct_pong() {
         let t = sampled(&[20, 18, 105, 18]);
@@ -472,7 +510,7 @@ mod tests {
         assert_eq!((big.max, big.median()), (5_000, Some(1_023)));
     }
 
-    /// 壊れたら落ちる: stall の内訳の和が stall の数と食い違ったまま黙る・観戦者の実行に出る・使ったフレームに対する割合の分母が無い。
+    /// 観戦者の実行に出ない・使ったフレームに対する割合の分母があることも見る。
     #[test]
     fn the_stall_split_adds_up_to_the_stall_count() {
         let s = NetSnapshot {
@@ -510,7 +548,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 終わりの行が RTT の標本の数と PONG の数を並べない（母数なしの中央値）・測れていないのに 0 ms と書く。
     #[test]
     fn end_lines_carry_rtt_with_its_denominator_and_never_invent_one() {
         let mut log = LinkLog::default();
@@ -530,11 +567,10 @@ mod tests {
         let rtt = lines.iter().find(|l| l.contains("RTT 中央値")).unwrap();
         assert_eq!(
             rtt,
-            "つながり: RTT 中央値 176 ms / 最大 186 ms（測れた PONG 5 個のうち、1 秒ごとの読み取りで採れた標本 4 個。見逃し 0 個）"
+            "接続: RTT 中央値 176 ms / 最大 186 ms（測れた PONG 5 個のうち、1 秒ごとの読み取りで採れた標本 4 個。見逃し 0 個）"
         );
     }
 
-    /// 壊れたら落ちる: 接続が替わっても前の接続の標本・観戦者の数を引き継ぐ。
     #[test]
     fn a_new_link_starts_the_tally_over() {
         let mut log = LinkLog::default();
@@ -556,7 +592,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 観戦者が来た・抜けた・断った行が出ない / 毎秒同じ行を出す / 接続の最初の数を差分でなく累計として出す。
     #[test]
     fn spectator_arrivals_and_departures_are_logged_once_each() {
         let mut log = LinkLog::default();
@@ -577,7 +612,10 @@ mod tests {
         assert!(log.step(&mk(0, 0, 0, 0, 0), 2).is_empty());
         let l = log.step(&mk(2, 0, 0, 0, 2), 3);
         assert_eq!(l.len(), 1, "{l:?}");
-        assert!(l[0].contains("観戦者が来た（2 人。いま 2 人"), "{l:?}");
+        assert!(
+            l[0].contains("自分に観戦者が入りました（2 人。いま 2 人"),
+            "{l:?}"
+        );
         assert!(
             log.step(&mk(2, 0, 0, 0, 2), 4).is_empty(),
             "同じ数は書かない"
@@ -585,16 +623,53 @@ mod tests {
         let l = log.step(&mk(2, 1, 1, 1, 0), 5);
         assert_eq!(l.len(), 2, "{l:?}");
         assert!(
-            l[0].contains("自分で抜けた 1 人・黙って外した 1 人。いま 0 人"),
+            l[0].contains("自分で抜けた 1 人・応答が無く外した 1 人。いま 0 人"),
             "{l:?}"
         );
-        assert!(l[1].contains("上限で観戦者を断った（1 人"), "{l:?}");
+        assert!(l[1].contains("上限で観戦者を断りました（1 人"), "{l:?}");
         let end = log.end_lines(&mk(2, 1, 1, 1, 0));
         assert!(
             end.iter().any(|x| x.contains(
-                "観戦者 入った 2 人 / 自分で抜けた 1 人 / 黙って外した 1 人 / 上限で断った 1 人"
+                "観戦者 入った 2 人 / 自分で抜けた 1 人 / 応答が無く外した 1 人 / 上限で断った 1 人"
             )),
             "{end:?}"
+        );
+    }
+
+    #[test]
+    fn the_pick_line_names_the_host_the_basis_and_both_sides() {
+        let p = PickNote {
+            active: true,
+            basis: Basis::Uplink,
+            own_up: 100_000,
+            peer_up: 0,
+            own_nat: NatMark {
+                symmetry: Symmetry::No,
+                upnp: true,
+            },
+            peer_nat: NatMark::UNKNOWN,
+        };
+        assert_eq!(
+            pick_line(&p, Some(false)),
+            "対戦のホスト: 相手（理由: 上り回線速度）。上り: 自分 0.80 Mbps／相手 測定不能。NAT: 自分 非シンメトリック・UPnP／相手 不明。"
+        );
+        assert_eq!(
+            pick_line(&PickNote::NONE, Some(true)),
+            "対戦のホスト: 自分（理由: 乱数の比較。上り回線速度の測定は未実行）。"
+        );
+        let nat = PickNote {
+            basis: Basis::Nat,
+            peer_nat: NatMark {
+                symmetry: Symmetry::Yes,
+                upnp: false,
+            },
+            ..p
+        };
+        assert!(
+            pick_line(&nat, None).contains("不明（理由: NAT の種類）")
+                && pick_line(&nat, None).contains("相手 シンメトリック。"),
+            "{}",
+            pick_line(&nat, None)
         );
     }
 }

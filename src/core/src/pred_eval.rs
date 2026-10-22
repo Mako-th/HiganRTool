@@ -1,16 +1,12 @@
-//! rollback の「相手の入力ワードの予測」を、ゲームを動かさずに人の入力の記録で採点する部品（道具 `pred_eval` が使う）。
+//! rollback の「相手の入力ワードの予測」を、ゲームを動かさずに人の入力の記録で採点する部品（ツール `pred_eval` が使う）。
 //!
 //! 採点のしかた（`rollback.rs` の `predicted_word` との対応）:
-//! - 片道 k tick・入力の遅れ D のとき、相手のフレーム f の入力ワードは tick f − D に取られて tick f − D + k に届く。
-//!   フレーム f を進める tick f に確定しているのは f − m まで（m = max(k − D, 0)）で、`predicted_word` は
-//!   `remote_next - 1`（= f − m）の語を繰り返すので、幅 m の予測は「m フレーム前の語の繰り返し」と同じ。
-//! - 見える状態は、確定した最新の語（c = t − m）の後の m フレームを予測の語で進めたもの。tick ごとに進め直すので、
-//!   窓（c+1..=t）の予測はその tick の確定の最新から引き直す（`post_present` の進め直しと同じ）。
-//! - 外れ: tick t で使った予測（窓の最後の語）が本物の語と違う。見た目のずれ: 窓の予測の語と本物の語で位置を積分した差。
+//! - 片道 k tick・入力の遅れ D のとき、相手のフレーム f の入力ワードは tick f − D に取られて tick f − D + k に届く。フレーム f を進める tick f に確定しているのは f − m まで（m = max(k − D, 0)）なので、`predicted_word` の予測は幅 m の「m フレーム前の語の繰り返し」と同じ。
+//! - 見える状態は、確定した最新の語（c = t − m）の後の m フレームを予測の語で進めたもの。tick ごとにウィンドウ（c+1..=t）の予測をその tick の確定の最新から引き直す（`post_present` の進め直しと同じ）。
+//! - 外れ: tick t で使った予測（ウィンドウの最後の語）が本物の語と違う。見た目のずれ: ウィンドウの予測の語と本物の語で位置を積分した差。
 //!
-//! 予測の方法 `Predictor` はゲームスレッドに置ける形（確保なし・固定の大きさの配列と整数だけ。`tests/alloc_check.rs` で確かめる）。
-//! 採点側の `eval_stream` / `Pool` は道具の側で、ヒープと浮動小数を使う。
-//! 語は `WORD_MASK`（送る語。`input_model::SEND_MASK`）を掛けて渡す。
+//! 予測の方法 `Predictor` はゲームスレッドで動かせる形（確保なし・固定の大きさの配列と整数だけ。`tests/alloc_check.rs` で検証する）。
+//! 採点側の `eval_stream` / `Pool` はツールの側で、ヒープと浮動小数を使う。語は `WORD_MASK`（送る語。`input_model::SEND_MASK`）を掛けて渡す。
 
 use crate::input_model::SEND_MASK;
 use crate::pad_dirs::{DIR_DOWN, DIR_LEFT, DIR_MASK, DIR_RIGHT, DIR_UP};
@@ -272,7 +268,7 @@ impl Predictor for HazardRelease {
     }
 }
 
-/// 表の 1 マス: 文脈の確かめ（ハッシュの別の部分）・いちばん多い次の語の候補・その勢い（多数派の候補を 1 つだけ持つ数え方）。
+/// 表の 1 マス: 文脈の検証用（ハッシュの別の部分）・いちばん多い次の語の候補・その勢い（多数派の候補を 1 つだけ持つ数え方）。
 #[derive(Clone, Copy, Default)]
 struct Slot {
     check: u16,
@@ -407,7 +403,7 @@ impl Predictor for Context {
     }
 }
 
-/// 道具の側で方法を並べて扱うための入れ物（表の大きいものは `Box`。ゲームスレッドの側は上の構造体を直に使う）。
+/// ツールの側で方法を並べて扱うための入れ物（表の大きいものは `Box`。ゲームスレッドの側は上の構造体を直に使う）。
 #[derive(Clone)]
 pub enum Method {
     Repeat(Repeat),
@@ -479,7 +475,7 @@ impl Predictor for Method {
 pub struct FrameEval {
     /// 使った予測の語が本物と違う。
     pub miss: Vec<bool>,
-    /// 窓の予測と本物で積分した位置の差の大きさ（px）。
+    /// ウィンドウの予測と本物で積分した位置の差の大きさ（px）。
     pub err: Vec<f32>,
     /// 前の tick からのずれの変化の大きさ（px。見た目と本物の動きの食い違い）。先頭の tick は 0。
     pub snap: Vec<f32>,
@@ -642,7 +638,7 @@ fn nearest<T: Copy + Default>(sorted: &[T], q: f64) -> T {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-/// 予測の幅 m（待ちの上限 R で打ち切った後）と、R を超えて待つ tick の割合（%）。
+/// 予測の幅 m（相手の入力を待つ上限 R で打ち切った後）と、R を超えて待つ tick の割合（%）。
 ///
 /// 片道 k tick・遅れ D の対称な 2 台で、tick ごとの先頭 N が `N ≤ F + R` に縛られるとき、F は相手の取得（N_peer + D）に k tick 遅れて追うので、
 /// 長く見た進み方は `(D + R) / k` tick あたり 1（k > D + R のとき）。待つ割合 = `1 − (D + R) / k`（揺れの無い一定の片道での定常の見積もり）。

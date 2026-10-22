@@ -1,11 +1,11 @@
 //! 署名の照合と detour の組み立て（pure）。
 //!
 //! フック地点は「アドレス・期待バイト列・命令の境目」を持ち、逆アセンブラを持たずに「長さの和が期待バイト列と同じ」
-//! 「5 バイト以上」「どの命令も相対の分岐・呼び出しでない」「禁止の範囲と重ならない」を確かめる。
-//! 実物の地点の表はここに置かない（アドレスの定数は `src/dll/th09_addr.rs`）。ゲームのメモリへ書く処理は `src/dll/` の
+//! 「5 バイト以上」「どの命令も相対の分岐・呼び出しでない」「禁止の範囲と重ならない」を検証する。
+//! 実物の地点の表はここに書かない（アドレスの定数は `src/dll/th09_addr.rs`）。ゲームのメモリへ書く処理は `src/dll/` の
 //! unsafe な層で、ここは書くべきバイト列を組み立てるだけ。
 
-/// 地点 1 つぶんの記述。`expected` の長さと `instr_lens` の和は一致しなければならない（`check_site` が確かめる）。
+/// 地点 1 つぶんの記述。`expected` の長さと `instr_lens` の和は一致しなければならない（`check_site` が検証する）。
 pub struct Site {
     pub name: &'static str,
     pub addr: u32,
@@ -162,7 +162,7 @@ pub fn verify(actual: &[u8], expected: &[u8]) -> Result<(), VerifyError> {
     Ok(())
 }
 
-/// `at` に置く `E9 rel32`（jmp）。rel32 は `to - (at + 5)`（wrapping）。
+/// `at` に書く `E9 rel32`（jmp）。rel32 は `to - (at + 5)`（wrapping）。
 pub fn jmp_rel32(at: u32, to: u32) -> [u8; 5] {
     encode_rel32(0xE9, at, to)
 }
@@ -178,7 +178,7 @@ fn encode_rel32(opcode: u8, at: u32, to: u32) -> [u8; 5] {
     [opcode, b[0], b[1], b[2], b[3]]
 }
 
-/// `at` に置かれた `E8 rel32` の飛び先。先頭が `E8` でなければ `None`。
+/// `at` にある `E8 rel32` の飛び先。先頭が `E8` でなければ `None`。
 pub fn call_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     if bytes[0] != 0xE8 {
         return None;
@@ -188,7 +188,7 @@ pub fn call_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     Some(at.wrapping_add(5).wrapping_add(rel as u32))
 }
 
-/// `at` に置かれた `E9 rel32` の飛び先（`call_target` の JMP バージョン）。先頭が `E9` でなければ `None`。
+/// `at` にある `E9 rel32` の飛び先（`call_target` の JMP バージョン）。先頭が `E9` でなければ `None`。
 pub fn jmp_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     if bytes[0] != 0xE9 {
         return None;
@@ -197,7 +197,7 @@ pub fn jmp_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     Some(at.wrapping_add(5).wrapping_add(rel as u32))
 }
 
-/// 5 バイト JMP を置くときの最大の書き込み長。
+/// 5 バイト JMP を書くときの最大の書き込み長。
 pub const MAX_PATCH_LEN: usize = 16;
 /// トランポリン（盗んだバイト ＋ 戻りの JMP）の最大長。
 pub const MAX_TRAMPOLINE_LEN: usize = 32;
@@ -227,7 +227,7 @@ pub fn patch_bytes(site: &Site, hook: u32) -> Option<PatchBuf> {
     Some(PatchBuf { bytes, len: total })
 }
 
-/// `tramp_at` に置くトランポリン: 盗んだバイト（`site.expected`）＋戻りの `E9 rel32`（`site.addr + 盗んだ長さ` へ）。
+/// `tramp_at` に書くトランポリン: 盗んだバイト（`site.expected`）＋戻りの `E9 rel32`（`site.addr + 盗んだ長さ` へ）。
 /// 合計が `MAX_TRAMPOLINE_LEN` を超えるなら `None`。
 pub fn trampoline_bytes(site: &Site, tramp_at: u32) -> Option<TrampolineBuf> {
     let stolen_len = site.expected.len();

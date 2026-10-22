@@ -1,4 +1,4 @@
-//! 画面の状態。Win32 にもファイルにも触らない（窓は `win`、ファイルは `work` と `scan`）。
+//! 画面の状態。Win32 にもファイルにも触らない（ウィンドウは `win`、ファイルは `work` と `scan`）。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -64,13 +64,13 @@ pub fn parse_pair(s: &str) -> Option<Pair> {
     Some((Kind::from_name(a)?, Kind::from_name(b)?))
 }
 
-/// 出力先のフォルダ名（4 通り）と同じ名前か。たどるときに読まない（作った写しをもう一度直すと戻ってしまう）。
+/// 出力先のフォルダ名（4 通り）と同じ名前か。たどるときに読まない（作ったコピーをもう一度直すと戻ってしまう）。
 pub fn is_pair_dir(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|s| parse_pair(&s.to_ascii_lowercase()).is_some())
 }
 
-/// 直した写しをまとめるフォルダの名前。
+/// 直したコピーをまとめるフォルダの名前。
 pub const FIX_DIR: &str = "fix_replay";
 
 /// `fix_replay`（大文字小文字は区別しない）か。たどるときに読まない。
@@ -79,7 +79,7 @@ pub fn is_fix_dir(name: &OsStr) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case(FIX_DIR))
 }
 
-/// 直した写しの置き場所: `<元のフォルダの1つ上>\fix_replay\<元のフォルダ名>\<1P の型>-<2P の型>\<同じ名前>`。
+/// 直したコピーの出力先: `<元のフォルダの1つ上>\fix_replay\<元のフォルダ名>\<1P の型>-<2P の型>\<同じ名前>`。
 /// 1つ上が無いとき（ドライブの直下など）は `<元のフォルダ>\fix_replay\<型>-<型>\<名前>`。
 /// 元が `fix_replay` の下にあるときは `fix_replay\fix_replay` を作らず、元のフォルダの中に型のフォルダを作る。
 /// どの場合も元のファイルとは別の場所になる。
@@ -105,6 +105,8 @@ pub enum Analysis {
     Recorded,
     /// HiganRTool が保存したリプレイではない（印が無い・読めない）。
     NoMark,
+    /// ゲームのメニューから保存したリプレイ（HiganRTool の印はあるが、直す対象ではない）。
+    MenuMark,
     /// 見出しの値が 0 / 1 のどちらでもない。
     OddValue(u8, u8),
     Unreadable(String),
@@ -119,7 +121,7 @@ pub struct Fixable {
     pub current: Pair,
 }
 
-/// 名前は印から来る任意の文字列なので、制御文字を空白に替えて窓に出せる形にする。
+/// 名前は印から来る任意の文字列なので、制御文字を空白に替えてウィンドウに出せる形にする。
 fn clean_name(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -140,6 +142,7 @@ impl Analysis {
                 _ => Analysis::OddValue(p.current.0, p.current.1),
             },
             Err(PlanError::NoMark) => Analysis::NoMark,
+            Err(PlanError::MenuMark) => Analysis::MenuMark,
             Err(PlanError::Recorded(_) | PlanError::Newer(_)) => Analysis::Recorded,
             Err(PlanError::Decode(e)) => Analysis::Unreadable(format!("{e:?}")),
         }
@@ -156,7 +159,7 @@ pub enum MakeState {
     Ready(Pair),
 }
 
-/// 窓の下の知らせの行に出す内容（言語は出すときに決める）。
+/// ウィンドウの下の知らせの行に出す内容（言語は出すときに決める）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     NothingFound,
@@ -443,6 +446,7 @@ mod tests {
         for a in [
             Analysis::Recorded,
             Analysis::NoMark,
+            Analysis::MenuMark,
             Analysis::OddValue(2, 0),
             Analysis::Unreadable("x".into()),
         ] {

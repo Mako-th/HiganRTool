@@ -1,34 +1,12 @@
 //! ゲーム内メニューの見張り（ini の `code_side = game`）。
 //!
-//! `offer` / `answer` の見張り（`net_code.rs` の `Watcher`）は、起動のときに側が決まり、ファイルを 250 ms ごとに読む。こちらは
-//! **側を決めずに待ち**、ゲームのスレッドのメニューからの指示（`net_ui::UiLink`）で動く。ファイルは使わず、コードは
-//! クリップボード（`clipboard::Clipboard`。開発用は `clipboard = file`）で受け渡す:
-//! - **対戦コード作成**: 始める側として自分のコード（秘密と session は作るたびに OS の乱数で引く）を作り、クリップボードへコピーする。
-//! - **対戦コード入力**: クリップボードを読む。文字数が短すぎれば（`code::MIN_CODE_CHARS` 未満）読まずに断る。自分のコードがまだ無ければ
-//!   返す側として読み（返すコードをクリップボードへコピーする）、あれば相手の返すコードとして読む（`Swapper::on_peer_file`。
-//!   コードの正しさの判定は `higanr_core::code::read_peer`）。読めたらセッションの設定を `LinkSlot` へ置く（ゲームのスレッドが
-//!   次の tick でセッションを作り、繋ぎ始める）。
-//! - **取りやめる**: 待ちをやめる。セッションをもう作っていたら、候補の無い設定を置いて繋がらないセッションに替える。
-//! - **ルームマッチ**: メニューの入力で決めたルーム名（`UiLink::room_name`）で、ルームサーバーへ繋ぐ（`net_room::RoomConn`。受信は
-//!   専用のスレッド `higanr-room`、送りと手順の判断はこの見張り）。決めた名は ini の `room` に書く（`ini_save`）。
-//!   始める側で相手がまだ来ていない間にルームの期限が切れたら、同じ名で自動で入り直す（`room_rejoin`）。ルームに先に入った側
-//!   （`room::Role::Offer`）は「対戦コード作成」と同じに `Swapper::offer` でコードを作ってルームへ渡し、相手のコードを受けたらセッションの設定を置く。
-//!   後に入った側（`Answer`）は相手のコードを読み、返すコードをルームへ渡せた時点（`submit_code` の `Ok`）でセッションの設定を置く
-//!   （サーバーの 1000 は待たない）。**どちらの側もクリップボードへはコピーしない**（人のクリップボードの中身を黙って替えない）。
-//!   ルームマッチで待つ間の諦めはルームの期限（10 分。サーバーが 4408 で切る）に任せ、`check_window` の 30 分は数えない。
-//!   ルーム名は画面にだけ出し、本ログには書かない。
-//! - **ランダムマッチ**: 待ち列（`net_room::QueueConn`）に入り、組になったら割り当てのルームへ入り直す。あとはルームマッチと同じ手順
-//!   （席の順は待ち列に入った順）。割り当てのルーム名も本ログには書かない。
-//! - 対戦の形の値（`UiLink::shape`）は、セッションの設定を置く直前に読んで HELLO で名乗る形に使う（`ModeCtx::choose_pick`）。
-//!   置いた後に変えられたら「この接続では変わりません」の出来事（`Event::ShapeLate`）を返す。
-//!
-//! 見張り → メニューは、文字列でなく「種類（`Event` / `CodeState`）＋数」の `Note` を `UiLink::publish` で渡す。
-//! 相手の名前だけは文字の表に無い文字を `?` に直してから載せる（`sanitize_name`）。
-//!
-//! 選んだ項目・自分の側・待った秒数は `Shared` の数（`CodeFacts`）に置き、繋がったとき（と繋がらずに終わったとき）に `link_log` が本ログの 1 行にする。
-//! 繋がったのを見たら、本ログへその行と決まった形を残し、知らせ（`Notify`。音と点滅）を 1 回呼ぶ。その後はネットワークが終わるまで
-//! 「観戦コードをコピー」の頼み（`Order::SpectateCopy`）だけを受ける（`serve_linked`。ホストなら観戦コードをクリップボードへ書く）。
-//! ゲームのスレッドはこのスレッドに触らない（指示のリングバッファと状態の入れ物だけ）。遅延の増分は 0（繋がる前のメニューの間だけ動く）。
+//! `offer` / `answer` の見張り（`net_code.rs` の `Watcher`）は、起動のときに側が決まり、ファイルを 250 ms ごとに読む。こちらは**側を決めずに待ち**、ゲームのスレッドのメニューからの指示（`net_ui::UiLink`）で動く。
+//! ファイルは使わず、コードはクリップボード（`clipboard::Clipboard`。開発用は `clipboard = file`）で受け渡す。指示は対戦コード作成・対戦コード入力・取りやめる・ルームマッチ・ランダムマッチ。
+//! ルームマッチとランダムマッチ（`net_room::RoomConn` / `QueueConn`）では**どちらの側もクリップボードへコピーしない**（人のクリップボードの中身を黙って替えない）。ルーム名と、ルームサーバーが割り当てたルーム名は画面にだけ出し、本ログには書かない。
+//! 対戦の形の値（`UiLink::shape`）は、セッションの設定を登録する直前に読んで HELLO で名乗る形に使う（`ModeCtx::choose_pick`）。設定した後に利用者がメニューで変えたら「この接続では変わりません」の出来事（`Event::ShapeLate`）を返す。
+//! 見張り → メニューは、文字列でなく「種類（`Event` / `CodeState`）＋数」の `Note` を `UiLink::publish` で渡す。相手の名前だけは文字の表に無い文字を `?` に直してから載せる（`sanitize_name`）。
+//! 選んだ項目・自分の側・待った秒数は `Shared` の数（`CodeFacts`）に記録し、接続したとき（と接続できずに終わったとき）に `link_log` が本ログの 1 行にする。接続したのを見たら、本ログへその行と決まった形を残し、知らせ（`Notify`。音と点滅）を 1 回呼ぶ。
+//! ゲームのスレッドはこのスレッドに触らない（指示のリングバッファと状態の入れ物だけ）。遅延の増分は 0（接続する前のメニューの間だけ動く）。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -57,7 +35,7 @@ use higanr_core::update::BUILD_NUMBER;
 use higanr_core::watch_list::{Posting, WatchName};
 use higanr_core::wire::{Arrival, Mode, Seat};
 
-/// メニューの形式・遅延の値（`UiLink::shape` と `UiLink::start_delay`）。セッションの設定を置いたときの値と今の値を比べて、置いた後に変えられたかを見る。
+/// メニューの形式・遅延の値（`UiLink::shape` と `UiLink::start_delay`）。セッションの設定を登録したときの値と今の値を比べて、設定した後に変えられたかを見る。
 type MenuShape = (Option<Pick>, Option<DelayChoice>);
 
 use crate::clipboard::Clipboard;
@@ -74,6 +52,7 @@ use crate::net_udp::{self, GameNet, RecvThread};
 use crate::net_ui::{Order, UiLink};
 use crate::netplay::{LinkSlot, NetPlay};
 use crate::spectate_offer::{self, ListingInfo, OfferKit, OnewayCode, Parts};
+use crate::spectate_refuse::{self, Refuser};
 use crate::trial_summary::{Refusal, Route};
 
 /// 見張りが指示を見に来る間隔（指示が無い間は原子変数を 1 つ読むだけ）。
@@ -82,13 +61,13 @@ const GAME_POLL: Duration = Duration::from_millis(50);
 pub struct GameUi {
     pub link: Arc<UiLink>,
     pub clip: Box<dyn Clipboard>,
-    /// ルームサーバーへ繋ぐ設定（ini の `room_server` から）。None なら対戦の「ルームマッチ」の指示は来ない（メニューが項目を出さない）。
+    /// ルームサーバーへ接続する設定（ini の `room_server` から）。None なら対戦の「ルームマッチ」の指示は来ない（メニューが項目を出さない）。
     pub room: Option<RoomOptions>,
     /// 入ったルーム名を `room` に書く ini（None なら書かない）。書くのは見張りのスレッドだけ。
     pub ini_path: Option<PathBuf>,
-    /// この起動の前のつながりの session。同じ session のコードを貼られたら読まない（`Event::Spent`）: 片づけた後もクリップボードには
-    /// 前の相手のコードが残りうるので、そのまま貼ると前の相手（もう別の受信ソケット・別のコードで待っている）へつなぎに行き、
-    /// 30 分の期間まで待ち続ける。最初のつながりは空。
+    /// この起動の前の接続の session。同じ session のコードを貼られたら読まない（`Event::Spent`）: 片づけた後もクリップボードには
+    /// 前の相手のコードが残りうるので、そのまま貼ると前の相手（もう別の受信ソケット・別のコードで待っている）へ接続しに行き、
+    /// 30 分の期間まで待ち続ける。最初の接続は空。
     pub spent: Vec<u32>,
     /// LAN の接続のときの、運び手との受け渡し（`lan_link`）。あれば、コードの受け渡し先はクリップボードでなく運び手（`clip` が `LanClip`）で、
     /// 作成・入力・観戦コードの頼みは指示のリングバッファでなく運び手から来る。
@@ -119,7 +98,7 @@ struct RoomRun {
     peer_came: bool,
     /// 始める側: ルームへ渡した自分のコード（相手の返すコードをこれで読む）。
     sw: Option<Swapper>,
-    /// セッションの設定を置いた（以後のルームの手順の失敗は画面に出さず、繋がるかは P2P の側に任せる）。
+    /// セッションの設定を登録した（以後のルームの手順の失敗は画面に出さず、接続するかは P2P の側に任せる）。
     placed: bool,
 }
 
@@ -129,7 +108,7 @@ pub(crate) struct GameWatcher {
     own_cands: Candidates,
     /// 作った（始める側）か、返す側として読み始めた後の状態。無ければまだどちらでもない。
     sw: Option<Swapper>,
-    /// 最後に読めた（セッションの設定を置いた）相手のコードの文字列。同じ文字列がもう一度貼られたら読み直さない。
+    /// 最後に読めた（セッションの設定を登録した）相手のコードの文字列。同じ文字列がもう一度貼られたら読み直さない。
     accepted: Option<String>,
     slot: Arc<LinkSlot>,
     shared: Arc<Shared>,
@@ -148,30 +127,32 @@ pub(crate) struct GameWatcher {
     room_gen: u32,
     /// 前の自動の入り直しの時刻（`room_rejoin::should_rejoin` の 60 秒の間隔。人が対戦の「ルームマッチ」を選び直すと忘れる）。
     last_rejoin: Option<Instant>,
-    /// 観戦の配る側の材料（`[spectate] enable = 1` で、用意できたときだけ。つながったら `start_casting` が使って空にする）。
+    /// 観戦の配る側の材料（`[spectate] enable = 1` で、用意できたときだけ。接続したら `start_casting` が使って空にする）。
     spectate: Option<OfferKit>,
-    /// 観戦コードの材料（`spectate` と同じ観戦のホストのもの。つながった後も持ち、頼まれるたびに書く）。
+    /// 観戦コードの材料（`spectate` と同じ観戦のホストのもの。接続した後も持ち、頼まれるたび（LAN の観戦の申し込み・観戦コードのコピー）に書く）。
     oneway: Option<OnewayCode>,
     /// 自分のコードに載せる回線の型の印（ネットワークを開いたときに決まる。`start_game`）。
     nat: NatMark,
-    /// 対戦の「ルームマッチ」で相手のコードを読んでセッションの設定を置いたときのルーム名（観戦用のルームの名を導く元。`Debug` に名が出るので
+    /// 対戦の「ルームマッチ」で相手のコードを読んでセッションの設定を登録したときのルーム名（観戦用のルームの名を導く元。`Debug` に名が出るので
     /// 本ログに `{:?}` で書かない）。ルームの経路でない操作では持たない。
     met_room: Option<RoomName>,
     /// 相手の名前（相手のコードに載っていたもの。一覧に載せる 1P・2P の名前に使う）。コードを読んだ後だけ。
     peer_name: Option<higanr_core::handshake::Name>,
     /// ランダムマッチの待ち列の手順（待ち列にいる間だけ。組になったら割り当てのルームの `room` へ替わる）。
     queue: Option<QueueConn>,
-    /// ランダムマッチの経路にいる間（待ち列から、セッションの設定を置いた後まで）の、待ち列に入った順。待ち列にいる間と、まだ順が届かない間は
+    /// ランダムマッチの経路にいる間（待ち列から、セッションの設定を登録した後まで）の、待ち列に入った順。待ち列にいる間と、まだ順が届かない間は
     /// `Unknown`。席の希望がぶつかったとき、先に待ち列に入った側を優先するのに使う（`place`）。
     random_order: Option<Arrival>,
     /// 前の待ち列の入り直しの時刻（`room_rejoin::should_requeue` の最短の間隔を見る。人が「ランダムマッチ」を選び直すと忘れる）。
     last_requeue: Option<Instant>,
-    /// 今のつながりがランダムマッチで会った相手。ホストなら、割り当てたルーム名から観戦用のルームの名を導いて観戦の一覧に載せる（`start_casting`）。
+    /// 今の接続がランダムマッチで会った相手。ホストなら、割り当てたルーム名から観戦用のルームの名を導いて観戦の一覧に載せる（`start_casting`）。
     random_met: bool,
     /// 待ち列の鍵のビルド番号（製品は `update::BUILD_NUMBER`。検査が替える）。
     build: u32,
     /// LAN で、相手のコードを読み始めた時刻（`LAN_LINK_LIMIT` の起点）。
     lan_started: Option<Instant>,
+    /// 観戦用のルームで観戦者に断りを返すスレッド（`start_refusing`）。接続の後の見回りを終えるときに手放して止める。
+    refuser: Option<Refuser>,
 }
 
 impl GameWatcher {
@@ -187,7 +168,7 @@ impl GameWatcher {
         mode: ModeCtx,
         ui: GameUi,
     ) -> GameWatcher {
-        // 状態の札はメニューとのインターフェースに残っている値の続きから数える（つなぎ直しの 2 本目の見張りが前の見張りの札と同じ数を書かない）。
+        // 状態の札はメニューとのインターフェースに残っている値の続きから数える（再接続の 2 本目の見張りが前の見張りの札と同じ数を書かない）。
         let note = Note {
             seq: ui.link.note().map_or(0, |n| n.seq),
             ..Note::default()
@@ -223,6 +204,7 @@ impl GameWatcher {
             random_met: false,
             build: BUILD_NUMBER,
             lan_started: None,
+            refuser: None,
         }
     }
 
@@ -238,40 +220,53 @@ impl GameWatcher {
         self.oneway = Some(oneway);
     }
 
-    /// つながった: マッチのホストで、そのつながりが対戦の「ルームマッチ」かランダムマッチで会った相手で、観戦の用意があれば、観戦用のルームで観戦者を待つ
-    /// スレッドを起こす（`spectate_offer`）。ランダムマッチのホストは、進行中のランダムマッチの一覧にも載せる（両者が `[spectate] enable = 1`
-    /// のときだけ。`LinkSlot::may_list`）。どれかが欠けたら起こさず、理由を本ログへ
-    /// （ルーム名は書かない）。見張りのスレッドで呼ぶ。
+    /// 接続した: マッチのホストで、その接続が対戦の「ルームマッチ」かランダムマッチで会った相手で、2 人とも観戦を許可していれば
+    /// （`LinkSlot::may_list`）、観戦用のルームで観戦者を待つスレッドを作る（`spectate_offer`。ランダムマッチは一覧にも載せる）。
+    /// ルームマッチで許可がそろわなければ、観戦用のルームで観戦者に断りを返すスレッドを作る（`spectate_refuse`。ランダムマッチは
+    /// 一覧に載らなければ観戦用のルームの名を知る人がいないので作らない）。理由は本ログへ（ルーム名は書かない）。見張りのスレッドで呼ぶ。
     pub(crate) fn start_casting(&mut self) {
-        let Some(kit) = self.spectate.take() else {
-            return;
-        };
+        let kit = self.spectate.take();
         let Some(room) = self.met_room else {
-            self.log_event("観戦の配る側は起こさない（対戦のルームマッチ・ランダムマッチで会った相手ではない。観戦用のルームの名を導けない）");
+            if kit.is_some() {
+                self.log("観戦の受付: 未作成（対戦のルームマッチ・ランダムマッチで会った相手ではない。観戦用のルームの名を導けない）。");
+            }
             return;
         };
         match self.slot.is_host() {
             Some(true) => {}
             Some(false) => {
-                self.log_event("観戦の配る側は起こさない（この試合のゲストなので、ホストが配る）");
+                if kit.is_some() {
+                    self.log("観戦の受付: 未作成（このマッチのゲストなのでホストが配る）。");
+                }
                 return;
             }
             None => {
-                self.log_event("観戦の配る側は起こさない（試合の役が分からない）");
+                if kit.is_some() {
+                    self.log_event("観戦の受付: 未作成（マッチの役が分からない）。");
+                }
                 return;
             }
         }
-        let listing = if self.random_met {
-            // ランダムマッチは一覧に載らなければ観戦用のルームの名を知る人がいないので、相手が断ったら配る側も起こさない。
-            if self.slot.may_list() != Some(true) {
-                self.log_event("観戦の配る側は起こさない（ランダムマッチの相手が一覧に載せない設定。[spectate] enable = 0）");
-                return;
+        if self.slot.may_list() != Some(true) {
+            if self.random_met {
+                if kit.is_some() {
+                    self.log("このマッチは観戦を受け付けていません。");
+                }
+            } else {
+                self.start_refusing(&room);
             }
+            return;
+        }
+        // 2 人とも許可しているのに材料が無いのは、用意に失敗したとき（理由はネットワークを開いた行にある）。
+        let Some(kit) = kit else {
+            return;
+        };
+        let listing = if self.random_met {
             match self.listing_info(&room) {
                 Some(l) => Some(l),
                 None => {
                     self.log_event(
-                        "観戦の配る側は起こさない（ランダムマッチの割り当てのルーム名を読めない）",
+                        "観戦の受付: 未作成（ランダムマッチの割り当てのルーム名を読めない）。",
                     );
                     return;
                 }
@@ -282,11 +277,28 @@ impl GameWatcher {
         let listed = listing.is_some();
         match spectate_offer::spawn(kit, &room, listing) {
             Ok(()) => self.log_event(if listed {
-                "観戦の配る側を起こした・進行中のランダムマッチの一覧に載せる（観戦用のルームの名は割り当てのルーム名から導く。名は記録しない）"
+                "観戦の受付を作りました。進行中のランダムマッチの一覧に載せます（観戦用のルームの名は割り当てのルーム名から導きます。名は記録しない）。"
             } else {
-                "観戦の配る側を起こした（観戦用のルームの名はルーム名から導く。名は記録しない）"
+                "観戦の受付を作りました（観戦用のルームの名はルーム名から導きます。名は記録しない）。"
             }),
-            Err(e) => self.log_problem(format!("{e}（観戦だけを使わない。対戦は続く）")),
+            Err(e) => self.log_problem(format!("{e}（観戦だけを使わない。対戦は続く）。")),
+        }
+    }
+
+    /// ルームマッチで 2 人のどちらかが観戦を許可していない: 観戦用のルームで観戦者に断りを返す（観戦者が断りの文を見ないまま待ち続けないため）。
+    fn start_refusing(&mut self, room: &RoomName) {
+        let Some(opts) = self.ui.room.clone() else {
+            self.log("このマッチは観戦を受け付けていません。ルームサーバーが無いので観戦拒否も返しません。");
+            return;
+        };
+        match spectate_refuse::spawn(opts, room) {
+            Ok(r) => {
+                self.refuser = Some(r);
+                self.log_event("このマッチは観戦を受け付けていません。観戦者には観戦拒否を返します（ルーム名は記録しません）。");
+            }
+            Err(e) => self.log_problem(format!(
+                "{e}（観戦者に観戦拒否が届きません。対戦は続きます）。"
+            )),
         }
     }
 
@@ -330,7 +342,7 @@ impl GameWatcher {
     fn say(&mut self, s: &Say) {
         let secs = self.t0.elapsed().as_secs_f32();
         self.shared.count(s.kind, secs);
-        let line = format!("{}（{secs:.1} 秒）: {}", self.tag(), s.log);
+        let line = format!("{}（{secs:.1} 秒の時点）: {}", self.tag(), s.log);
         // 断った・受けない（`Kind::Refused`）は簡潔なログにも残す。
         if matches!(s.kind, Kind::Refused(_)) {
             crate::main_log::push(line.clone());
@@ -341,26 +353,29 @@ impl GameWatcher {
     /// 失敗の文。「ネットワークの外」の行（詳細）に加えて、簡潔なログにもその場で 1 行出す。
     fn log_problem(&self, line: impl Into<String>) {
         let secs = self.t0.elapsed().as_secs_f32();
-        let line = format!("{}（{secs:.1} 秒）: {}", self.tag(), line.into());
+        let line = format!("{}（{secs:.1} 秒の時点）: {}", self.tag(), line.into());
         crate::main_log::push(line.clone());
         self.shared.note(line);
     }
 
     fn log(&self, line: impl Into<String>) {
         let secs = self.t0.elapsed().as_secs_f32();
-        self.shared
-            .note(format!("{}（{secs:.1} 秒）: {}", self.tag(), line.into()));
+        self.shared.note(format!(
+            "{}（{secs:.1} 秒の時点）: {}",
+            self.tag(),
+            line.into()
+        ));
     }
 
-    /// 失敗ではないが簡潔なログにも残す出来事（待ち列に入った・相手が決まった・観戦の配る側を起こしたか）。つながり 1 本あたり数行。
+    /// 失敗ではないが簡潔なログにも残す出来事（待ち列に入った・相手が決まった・観戦の配る側を開始したか）。接続 1 本あたり数行。
     fn log_event(&self, line: impl Into<String>) {
         let secs = self.t0.elapsed().as_secs_f32();
-        let line = format!("{}（{secs:.1} 秒）: {}", self.tag(), line.into());
+        let line = format!("{}（{secs:.1} 秒の時点）: {}", self.tag(), line.into());
         crate::main_log::push(line.clone());
         self.shared.note(line);
     }
 
-    /// つながりごとの 1 行（頭は `link_log` が付ける）。簡潔なログにも残す。
+    /// 接続ごとの 1 行（頭は `link_log` が付ける）。簡潔なログにも残す。
     fn log_link(&self, line: String) {
         crate::main_log::push(line.clone());
         self.shared.note(line);
@@ -379,13 +394,13 @@ impl GameWatcher {
         });
     }
 
-    /// 繋がらないまま待ちが終わったときの 1 行。項目を選んでいない実行（観戦だけの起動など）は書かない。
+    /// 接続できないまま待ちが終わったときの 1 行。項目を選んでいない実行（観戦だけの起動など）は書かない。
     fn log_unconnected(&self, what: &str) {
         let facts = self.shared.facts_now();
         if facts.route.is_some() {
             let now = self.t0.elapsed().as_secs_f32();
             self.log_link(format!(
-                "つながり: {}",
+                "接続: {}",
                 link_log::unconnected_line(&facts, what, now)
             ));
         }
@@ -404,7 +419,7 @@ impl GameWatcher {
         let mut e = e;
         if let Some(b) = self.ui.lan.clone() {
             e = lan_event(e);
-            // LAN の待ちの状態は 1 つにまとめる（作った・返した・つないでいる）。
+            // LAN の待ちの状態は 1 つにまとめる（作った・返した・接続している）。
             if matches!(
                 self.note.state,
                 CodeState::Offered | CodeState::Replied | CodeState::Linking
@@ -467,32 +482,34 @@ impl GameWatcher {
         }
     }
 
-    /// LAN の待ちを失敗として終える（置いたセッションは候補の無いものに替える）。
+    /// LAN の待ちを失敗として終える（登録したセッションは候補の無いものに替える）。
     fn lan_fail(&mut self, ev: Event) {
         self.forget_code();
         self.event(ev);
     }
 
-    /// LAN の観戦の申し込みに観戦コードを答える（ホストなら作って答え、ほかは断る）。クリップボードには書かない。
+    /// LAN の観戦の申し込みに観戦コードを答える（対戦のホストなら作って答え、ほかは断る）。クリップボードには書かない。
     fn lan_watch_code(&mut self, src: std::net::SocketAddrV4, id: u32) {
         let Some(b) = self.ui.lan.clone() else {
             return;
         };
+        let allowed = self.slot.may_list() == Some(true);
         let answer = match (self.slot.is_host(), self.oneway.as_ref()) {
-            (Some(true), Some(oneway)) => oneway
+            (Some(true), Some(oneway)) if allowed => oneway
                 .write(net_udp::now_unix())
-                .map_err(|e| format!("観戦コードを作れない: {e:?}")),
-            (Some(true), None) => Err("観戦の用意が無い".to_string()),
-            (Some(false), _) => Err("この試合のゲストなので配らない".to_string()),
-            (None, _) => Err("試合の役が分からない".to_string()),
+                .map_err(|e| format!("観戦コードの作成不能: {e:?}")),
+            (Some(true), Some(_)) => Err("2 人のどちらかが観戦を許可していません".to_string()),
+            (Some(true), None) => Err("観戦の用意がありません".to_string()),
+            (Some(false), _) => Err("このマッチのゲストなので配信しません".to_string()),
+            (None, _) => Err("マッチの役が不明".to_string()),
         };
         match answer {
             Ok(text) => {
-                self.log("LAN: 観戦の申し込みに観戦コードを答えた（コードは記録しない）");
+                self.log("LAN: 観戦の申し込みに観戦コードで答えました（コードは記録しません）。");
                 b.post_watch_answer(src, id, Ok(text));
             }
             Err(why) => {
-                self.log(format!("LAN: 観戦の申し込みを断った（{why}）"));
+                self.log(format!("LAN: 観戦の申し込みを拒否しました（{why}）。"));
                 b.post_watch_answer(src, id, Err(higanr_core::lan_proto::Why::WatchOff));
             }
         }
@@ -506,39 +523,51 @@ impl GameWatcher {
             Order::Cancel => self.cancel(),
             Order::Room => self.room_start(),
             Order::Random => self.random_start(),
-            // 観戦者の入口。観戦者のネットワークを開く・観戦用のルームへ入るのは、この見張り（対戦者のネットワークの見張り）ではない: メニューの決定は
-            // `UiOut::spectate_open` として入力の入口が受け（`script_win::request_spectate`。待っているだけの対戦者のネットワークはそこで
+            // 観戦者の入口。観戦者のネットワークを開く・観戦用のルームへ入るのは、この見張り（対戦する側のネットワークの見張り）ではない: メニューの決定は
+            // `UiOut::spectate_open` として入力の入口が受け（`script_win::request_spectate`。待っているだけの対戦する側のネットワークはそこで
             // 片づけてから開く）、観戦者のルームのスレッド（`spectate_join`）が自分の指示のリングバッファの読み手になる。この指示が届くのは
             // 観戦者のネットワークを開く前の短い間だけなので、読み捨てる。
             Order::Spectate | Order::SpectateCancel => {}
-            // 観戦コードは試合の役が決まってから配る（つながった後の見回り `serve_linked` が受ける）。
+            // 観戦コードは試合の役が決まってから配る（接続した後の見回り `serve_linked` が受ける）。
             Order::SpectateCopy => {
-                self.log("つながる前に観戦コードを頼まれたので、コピーしない");
+                self.log("観戦コードをコピーしません（接続前に頼まれました）。");
             }
         }
     }
 
-    /// 観戦コードをコピー: ホストなら、いまから新しい期限の観戦コードをクリップボードへ書く。ゲスト・役が分からない・観戦の用意が無いときは書かない
-    /// （人のクリップボードの中身を、配れないコードで替えない）。コードの文字は本ログへ書かない。見張りのスレッドで呼ぶ。
+    /// 観戦コードをコピー: 2 人とも観戦を許可している対戦のホストなら、いまから新しい期限の観戦コードをクリップボードへ書く。自分が許可していない
+    /// （画面には何も出さない）・相手が許可していない・ゲスト・役が分からない・観戦の用意が無いときは書かない（人のクリップボードの中身を、
+    /// 配れないコードで替えない）。コードの文字は本ログへ書かない。見張りのスレッドで呼ぶ。
     fn copy_spectate_code(&mut self) {
+        let allowed = self.slot.may_list() == Some(true);
+        // 自分が許可していなければ、左上の案内と同じく画面には何も出さない。
+        if !self.slot.list_wish() {
+            self.log("観戦コードを作成しません（自分が観戦を許可していません）。");
+            return;
+        }
+        if self.slot.watch_off() {
+            self.log("観戦コードを作成しません（相手が観戦を許可していません）。");
+            self.copy_event(Event::SpectateCodePeerOff);
+            return;
+        }
         match self.slot.is_host() {
             Some(true) => {}
             Some(false) => {
                 self.log(
-                    "観戦コードを頼まれたが、この試合のゲストなのでコピーしない（ホストが配る）",
+                    "観戦コードをコピーしません（このマッチのゲストです。ホストが配信します）。",
                 );
                 self.copy_event(Event::SpectateCodeHostOnly);
                 return;
             }
             None => {
-                self.log("観戦コードを頼まれたが、試合の役が分からないのでコピーしない");
+                self.log("観戦コードをコピーしません（マッチの役が不明）。");
                 self.copy_event(Event::SpectateCodeHostOnly);
                 return;
             }
         }
-        let Some(oneway) = self.oneway.as_ref() else {
+        let Some(oneway) = self.oneway.as_ref().filter(|_| allowed) else {
             self.log_problem(
-                "観戦コードを頼まれたが、観戦の用意が無い（[spectate] enable = 0 か、用意に失敗した）",
+                "観戦コードを作成できません（観戦者を受け付ける準備がありません。準備の失敗か、観戦の許可が未確定）。",
             );
             self.copy_event(Event::Internal);
             return;
@@ -546,7 +575,7 @@ impl GameWatcher {
         let text = match oneway.write(net_udp::now_unix()) {
             Ok(t) => t,
             Err(e) => {
-                self.log_problem(format!("観戦コードを作れない: {e:?}"));
+                self.log_problem(format!("観戦コードの作成不能（{e:?}）。"));
                 self.copy_event(Event::Internal);
                 return;
             }
@@ -554,19 +583,19 @@ impl GameWatcher {
         let cands = oneway.candidates_len();
         let written = match self.spectate_clip() {
             Some(c) => c.write(&text),
-            None => Err("LAN の接続で、人のクリップボードを開けていない".to_string()),
+            None => Err("LAN の接続で利用者のクリップボードを開けていません".to_string()),
         };
         match written {
             Ok(()) => {
                 self.log(format!(
-                    "観戦コードをクリップボードへコピーした（{} 文字・候補 {cands} 件・期限 {}）",
+                    "観戦コードをクリップボードへコピーしました（{} 文字・候補 {cands} 件・期限 {}）。",
                     text.chars().count(),
                     code::span_text(code::DEFAULT_TTL_SECS)
                 ));
                 self.copy_event(Event::SpectateCodeCopied);
             }
             Err(e) => {
-                self.log_problem(format!("観戦コードをクリップボードへコピーできない: {e}"));
+                self.log_problem(format!("観戦コードのクリップボードへのコピー不能（{e}）。"));
                 self.copy_event(Event::SpectateCodeClipWrite);
             }
         }
@@ -582,8 +611,8 @@ impl GameWatcher {
         }
     }
 
-    /// つながった後の見回り: ネットワークが終わるか止められるまで、観戦コードの頼みだけを受ける。この間メニューは他の指示を出さない
-    /// （つながっている間は開かない）ので、他の指示は読み捨てて数を本ログに残す。
+    /// 接続した後の見回り: ネットワークが終わるか止められるまで、観戦コードの頼みだけを受ける。この間メニューは他の指示を出さない
+    /// （接続している間は開かない）ので、他の指示は読み捨てて数を本ログに残す。
     fn serve_linked(&mut self) {
         let mut ignored = 0u32;
         loop {
@@ -601,12 +630,15 @@ impl GameWatcher {
             std::thread::sleep(GAME_POLL);
         }
         if ignored > 0 {
-            self.log(format!("つながった後に読み捨てた指示 {ignored}"));
+            self.log(format!("接続後に読み捨てた指示 {ignored} 件"));
+        }
+        if let Some(r) = self.refuser.take() {
+            self.log(r.finish().text());
         }
     }
 
     /// メニューで名前を決めていれば、以後に作る接続コード・ルームの HELLO はその名前で名乗る。名前は指示のリングバッファを通さず `UiLink` の入れ物に
-    /// 置かれるので、指示を 1 つ行う前にここで読み直す。まだ決めていなければ ini の名前のまま。名前を変えられるのは
+    /// 設定されるので、指示を 1 つ行う前にここで読み直す。まだ決めていなければ ini の名前のまま。名前を変えられるのは
     /// 何も待っていない間だけなので、待ちの途中で名乗る名前が替わることは無い。
     fn refresh_player_name(&mut self) {
         if let Some(n) = self.ui.link.player_name()
@@ -660,7 +692,7 @@ impl GameWatcher {
                 self.event(Event::Made);
             }
             Err(e) => {
-                self.log_problem(format!("クリップボードへコピーできない: {e}"));
+                self.log_problem(format!("クリップボードへのコピー不能（{e}）。"));
                 self.event(Event::ClipWrite);
             }
         }
@@ -706,7 +738,7 @@ impl GameWatcher {
                 return;
             }
             Err(e) => {
-                self.log_problem(format!("クリップボードを読めない: {e}"));
+                self.log_problem(format!("クリップボードの読み取り不能（{e}）。"));
                 self.event(Event::Unreadable);
                 return;
             }
@@ -756,9 +788,9 @@ impl GameWatcher {
                 my_code: _,
                 note: _,
             } if self.ui.spent.contains(&link.handshake.session_id) => {
-                // 前のつながりで使ったコード（session が同じ）。セッションの設定は置かない。この貼り付けで作った返す側は捨てる。
+                // 前の接続で使ったコード（session が同じ）。セッションの設定は登録しない。この貼り付けで作った返す側は捨てる。
                 self.log(format!(
-                    "前のつながりで使ったコード（session 0x{:08X}）を貼られたので読まない",
+                    "前回の接続で使ったコード（session 0x{:08X}）が貼られたので読みません。",
                     link.handshake.session_id
                 ));
                 if !created_answer {
@@ -792,7 +824,7 @@ impl GameWatcher {
                     self.event(Event::ReplyMade);
                 }
                 Err(e) => {
-                    self.log_problem(format!("クリップボードへコピーできない: {e}"));
+                    self.log_problem(format!("クリップボードへのコピー不能（{e}）。"));
                     self.event(Event::ClipWrite);
                 }
             },
@@ -804,7 +836,7 @@ impl GameWatcher {
     }
 
     fn place(&mut self, sw: &Swapper, link: link::Config) {
-        // 名乗る形は、セッションの設定を置く直前にここ（見張りのスレッド）で決める。メニューで選んだ形は原子変数から読むだけ。
+        // 名乗る形は、セッションの設定を登録する直前にここ（見張りのスレッド）で決める。メニューで選んだ形は原子変数から読むだけ。
         let pick = self.ui.link.shape();
         let wish = match self.mode.choose_pick(pick) {
             Some((choice, lines)) => {
@@ -838,16 +870,20 @@ impl GameWatcher {
             "席の希望を名乗る: {:?}（{:?}。First = ルームに先にいた・コードを作った側）",
             seat.wish, seat.arrival
         ));
-        // つなぐ前に決めた遅延（メニューか ini の auto）は、セッションの設定の前に置く（ゲームのスレッドが繋がった tick に読む）。
+        // 接続する前に決めた遅延（メニューか ini の auto）は、セッションの設定の前に設定する（ゲームのスレッドが接続した tick に読む）。
         let named = wish.map_or(Mode::Delay, |w| w.mode);
         let start = self.mode.start_delay(self.ui.link.start_delay(), named);
         self.slot.set_start(start);
-        self.log(format!("つなぐ前の遅延: {start:?}（None は決めていない）"));
+        self.log(format!("接続前の遅延: {start:?}（None は未決定）"));
         self.slot.set_peer_nat(sw.peer_nat());
         let side = sw.side();
         self.shared.update(|f| f.placed_side = Some(side));
-        // 一覧に載せてよいかを HELLO で名乗る（ランダムマッチのホストは両者が載せてよいときだけ載せる —— `start_casting`）。
+        // 観戦を許可するかを HELLO で名乗る（2 人とも許可したときだけ観戦の受付を作る —— `start_casting`・`copy_spectate_code`・`lan_watch_code`）。
         self.slot.set_list_wish(self.s.spectate.is_some());
+        // ホストを穴あけしやすく上りの太い方にする（`higanr_core::host_pick`）。役割の乱数を ini で決めた実行（LAN の接続と台本の実行）は、
+        // その乱数で役を決めるので使わない。
+        self.slot
+            .set_host_pick(self.s.role_nonce.is_none().then_some(self.nat));
         self.slot.offer_with_seat(link, wish, Some(seat));
         self.placed_shape = Some((pick, self.ui.link.start_delay()));
         let glyphs = &self.glyphs;
@@ -879,7 +915,7 @@ impl GameWatcher {
                 match self.ui.clip.write(&reply) {
                     Ok(()) => self.event(Event::ReplyMade),
                     Err(e) => {
-                        self.log_problem(format!("クリップボードへコピーできない: {e}"));
+                        self.log_problem(format!("クリップボードへのコピー不能（{e}）。"));
                         self.event(Event::ClipWrite);
                     }
                 }
@@ -891,8 +927,8 @@ impl GameWatcher {
         }
     }
 
-    /// 待っているコード（作った・読んだ）を忘れる。セッションをもう作ってあれば、候補の無い設定で置き直して繋がらないセッションに替える
-    /// （繋ぎ始めたセッションは止められない）。
+    /// 待っているコード（作った・読んだ）を忘れる。セッションをもう作ってあれば、候補の無い設定で設定し直して接続できないセッションに替える
+    /// （接続し始めたセッションは止められない）。
     fn forget_code(&mut self) {
         let had_link = self.slot.generation() > 0;
         self.slot.set_peer_nat(None);
@@ -923,14 +959,14 @@ impl GameWatcher {
         self.note.state = CodeState::Idle;
         self.note.name = [0; NAME_UNITS];
         self.log("待ちを取りやめた");
-        self.log_unconnected("待ちを取りやめた");
+        self.log_unconnected("待ちを取りやめました");
         self.event(Event::Cancelled);
     }
 
     // ---- ルームの経路 ----
 
     /// ルームの経路をやめる（作成・入力・取りやめるの始まり）。ルームの状態だったら `Idle` へ戻す（その後の操作が状態を決める）。
-    /// 置いたセッションの設定はそのまま（作成・入力が置き直すか、取りやめるが繋がらないセッションに替える）。
+    /// 登録したセッションの設定はそのまま（作成・入力が設定し直すか、取りやめるが接続できないセッションに替える）。
     fn leave_room(&mut self) {
         // ルームで会った相手ではなくなる（作成・入力・取りやめる・別のルーム名）。観戦の配る側は元のルーム名を失う。
         self.met_room = None;
@@ -977,17 +1013,17 @@ impl GameWatcher {
         }
     }
 
-    /// 対戦の「ルームマッチ」: メニューの入力で決めたルーム名で、ルームサーバーへ繋ぎ始める（待たない）。
+    /// 対戦の「ルームマッチ」: メニューの入力で決めたルーム名で、ルームサーバーへ接続し始める（待たない）。
     fn room_start(&mut self) {
         let Some(opts) = self.ui.room.clone() else {
             self.log_problem(
-                "ルームサーバーの設定（room_server）が無いのに、対戦のルームマッチが選ばれた",
+                "ルームサーバーの設定（room_server）が無いのに、対戦のルームマッチが選ばれました。",
             );
             self.event(Event::Internal);
             return;
         };
         let Some(buf) = self.ui.link.room_name() else {
-            // メニューは名を置いてから指示を積む（`UiLink::send`）ので、来ない見込み。
+            // メニューは名を設定してから指示を積む（`UiLink::send`）ので、来ない見込み。
             return self.room_name_bad(RoomNameWhy::Empty, "ルーム名が置かれていない");
         };
         // メニューも同じガード（`RoomName::parse`）で見て渡すが、ここでも見直す（断った理由は名を含まない）。
@@ -1005,10 +1041,10 @@ impl GameWatcher {
             self.leave_room();
         }
         if self.queue.is_some() || self.random_order.is_some() {
-            // ランダムマッチの待ち（待ち列・割り当てのルーム・置いた後）から、名前つきのルームへ移る。
+            // ランダムマッチの待ち（待ち列・割り当てのルーム・設定した後）から、名前つきのルームへ移る。
             self.leave_room();
         }
-        // コードの経路からルームの経路へ移る: 作った・読んだコードを忘れ、置いたセッションがあれば繋がらないセッションに替える。
+        // コードの経路からルームの経路へ移る: 作った・読んだコードを忘れ、登録したセッションがあれば接続できないセッションに替える。
         self.forget_code();
         let conn = match RoomConn::start(&opts, &name) {
             Ok(c) => c,
@@ -1018,7 +1054,7 @@ impl GameWatcher {
                 return;
             }
         };
-        // 名を覚えるのは、サーバーへつなぎ始められた後（つなぎ始められなかった名＝打ち間違い・始められない設定の名を、次の入力の
+        // 名を覚えるのは、サーバーへ接続し始められた後（接続し始められなかった名＝打ち間違い・始められない設定の名を、次の入力の
         // 初めの値にしない）。
         self.remember_room(&buf);
         let glyphs = &self.glyphs;
@@ -1038,7 +1074,7 @@ impl GameWatcher {
             placed: false,
         });
         self.choose(Route::Room);
-        self.log("ルームサーバーへつなぎ始めた（ルーム名はメニューで打った名。名は記録しない）");
+        self.log("ルームサーバーへの接続を開始しました（ルーム名は記録しません）。");
         self.event(Event::RoomJoining);
     }
 
@@ -1082,11 +1118,11 @@ impl GameWatcher {
     // （offer / answer の受け渡し → セッションの設定）。割り当てられたルーム名は画面にもログにも出さず、ini の `room` にも書かず、
     // 観戦用のルームの名の元にもしない。
 
-    /// 「ランダムマッチ」: 待ち列へ繋ぎ始める（待たない）。
+    /// 「ランダムマッチ」: 待ち列へ接続し始める（待たない）。
     fn random_start(&mut self) {
         let Some(opts) = self.ui.room.clone() else {
             self.log_problem(
-                "ルームサーバーの設定（room_server）が無いのに、ランダムマッチが選ばれた",
+                "ルームサーバーの設定（room_server）が無いのに、ランダムマッチが選ばれました。",
             );
             self.event(Event::Internal);
             return;
@@ -1121,7 +1157,7 @@ impl GameWatcher {
         self.note.state = CodeState::RoomJoining;
         self.room_gen = self.room_gen.wrapping_add(1);
         self.log(
-            "ランダムマッチの待ち列へつなぎ始めた（ルーム名は割り当てられる。名は記録しない）",
+            "ランダムマッチの待ち列への接続を開始しました（ルーム名は割り当てられるため、記録しません）。",
         );
         self.event(Event::RoomJoining);
     }
@@ -1175,7 +1211,7 @@ impl GameWatcher {
         let notes = q.take_notes();
         let gen_now = self.room_gen;
         for n in notes {
-            self.log_problem(format!("ランダムマッチの待ち列の運び: {n:?}"));
+            self.log_problem(format!("ランダムマッチの待ち列との通信: {n:?}"));
         }
         for e in evs {
             if self.room_gen != gen_now {
@@ -1202,7 +1238,9 @@ impl GameWatcher {
             .filter(|l| *l > 0 && *l <= ttl)
             .unwrap_or(ttl);
         self.note.state = CodeState::RoomWaiting;
-        self.log_event(format!("待ち列に入った（待ち列の期限まで {left} 秒）"));
+        self.log_event(format!(
+            "待ち列に入りました（待ち列の期限まで {left} 秒）。"
+        ));
         self.event(Event::RoomWaiting);
     }
 
@@ -1234,7 +1272,7 @@ impl GameWatcher {
                     f.queue_first = Some(first);
                 });
                 self.log_event(format!(
-                    "相手が決まった（待ち列に{}入った側）。割り当てのルームへ入る（ルーム名は記録しない）",
+                    "相手が決まりました（待ち列に{}入った側）。割り当てのルームへ入ります（ルーム名は記録しない）。",
                     if first { "先に" } else { "後から" }
                 ));
             }
@@ -1253,7 +1291,7 @@ impl GameWatcher {
         if let Failure::RateLimited { retry_after_secs } = f {
             self.note.retry_secs = u16::try_from(retry_after_secs).unwrap_or(u16::MAX);
         }
-        self.log_problem(format!("ランダムマッチの待ち列で待てなかった: {f:?}"));
+        self.log_problem(format!("ランダムマッチの待ち列で待てませんでした: {f:?}"));
         self.random_end(room_failure_event(f));
     }
 
@@ -1265,7 +1303,7 @@ impl GameWatcher {
         let notes = r.conn.take_notes();
         let gen_now = self.room_gen;
         for n in notes {
-            self.log_problem(format!("ルームの運び: {n:?}"));
+            self.log_problem(format!("ルームサーバーとの通信: {n:?}"));
         }
         for e in evs {
             if self.room_gen != gen_now {
@@ -1309,7 +1347,7 @@ impl GameWatcher {
             r.side = Some(side);
         }
         self.log_event(format!(
-            "ルームに入った（{}。ルームの期限まで {left} 秒）",
+            "ルームに入りました（{}。ルームの期限まで {left} 秒）。",
             side_text(side)
         ));
         self.event(Event::RoomWaiting);
@@ -1348,21 +1386,24 @@ impl GameWatcher {
             }
             // 送れなかった: 失敗の出来事は次の見回りで届く（そこで終える）。
             Err(SubmitRefused::NotSent) => {
-                self.log_problem("始める側のコードをルームへ送れなかった")
+                self.log_problem("自分（始める側）のコードをルームサーバーへ送れませんでした。")
             }
             Err(SubmitRefused::Core(e)) => {
                 self.say(
-                    &Say::new(format!("始める側のコードをルームが受けない: {e:?}"), "")
-                        .kind(Kind::Refused(Refusal::Internal)),
+                    &Say::new(
+                        format!("始める側のコードをルームが受け付けませんでした: {e:?}"),
+                        "",
+                    )
+                    .kind(Kind::Refused(Refusal::Internal)),
                 );
                 self.room_end(Event::Internal);
             }
         }
     }
 
-    /// ルームで相手のコードを受けた: 始める側は返すコードとして読んでセッションの設定を置く。返す側は読んで返すコードをルームへ渡し、
-    /// 渡せた時点でセッションの設定を置く（サーバーの 1000 の前に切れても始める側にはコードが届いているかもしれないので、
-    /// 繋がるかは P2P の側の時間切れに任せる）。
+    /// ルームで相手のコードを受けた: 始める側は返すコードとして読んでセッションの設定を登録する。返す側は読んで返すコードをルームへ渡し、
+    /// 渡せた時点でセッションの設定を登録する（サーバーの 1000 の前に切れても始める側にはコードが届いているかもしれないので、
+    /// 接続するかは P2P の側の時間切れに任せる）。
     fn room_peer_code(&mut self, text: &str) {
         let now = net_udp::now_unix();
         let Some(r) = self.room.as_mut() else {
@@ -1373,7 +1414,9 @@ impl GameWatcher {
             (Some(CodeSide::Offer), Some(sw)) => sw,
             (Some(CodeSide::Answer), _) => self.answer_swapper(),
             _ => {
-                self.log_problem("ルームで相手のコードを受けたが、自分の側かコードが無い");
+                self.log_problem(
+                    "ルームで相手のコードを受けましたが自分の側のコードがありません。",
+                );
                 return self.room_end(Event::Internal);
             }
         };
@@ -1381,7 +1424,7 @@ impl GameWatcher {
             Step::Ready { link, my_code, .. } => {
                 if side == Some(CodeSide::Answer) {
                     let Some(reply) = my_code else {
-                        self.log_problem("返す側なのに返すコードができていない");
+                        self.log_problem("返す側なのに、返すコードができていません。");
                         return self.room_end(Event::Internal);
                     };
                     let Some(r) = self.room.as_mut() else {
@@ -1393,14 +1436,14 @@ impl GameWatcher {
                             reply.chars().count()
                         )),
                         Err(SubmitRefused::NotSent) => {
-                            // 渡せていないのでセッションの設定は置かない（相手は返すコードを受けない）。失敗は次の見回りで届く。
+                            // 渡せていないのでセッションの設定は登録しない（相手は返すコードを受けない）。失敗は次の見回りで届く。
                             self.log_problem(
-                                "返すコードをルームへ送れなかった（セッションの設定は置かない）",
+                                "自分（返す側）のコードをルームサーバーへ送れませんでした（セッションの設定は適用しない）。",
                             );
                             return;
                         }
                         Err(SubmitRefused::Core(e)) => {
-                            self.log_problem(format!("返すコードをルームが受けない: {e:?}"));
+                            self.log_problem(format!("返すコードをルームが受け付けませんでした: {e:?}"));
                             return self.room_end(Event::Internal);
                         }
                     }
@@ -1410,7 +1453,7 @@ impl GameWatcher {
             Step::Refused(say) => {
                 self.say(
                     &Say::new(
-                        format!("ルームで受けた相手のコードを読めない: {}", say.log),
+                        format!("ルームで受けた相手のコードを読めませんでした: {}", say.log),
                         "",
                     )
                     .kind(say.kind),
@@ -1437,14 +1480,14 @@ impl GameWatcher {
             r.placed = true;
             r.side
         });
-        // 観戦用のルームの名の元（ルームの経路を終えた後も、つながったときに使う）。ランダムマッチは割り当てのルーム名（画面・ログ・ini には出さない）。
+        // 観戦用のルームの名の元（ルームの経路を終えた後も、接続したときに使う）。ランダムマッチは割り当てのルーム名（画面・ログ・ini には出さない）。
         self.random_met = self.random_order.is_some();
         self.met_room = self.room.as_ref().map(|r| r.name);
         self.note.state = CodeState::RoomLinking;
         self.say(
             &Say::new(
                 format!(
-                    "ルームで相手のコードを読み、セッションの設定を置いた（{}）。相手の候補 {addrs} へ繋いでいる",
+                    "ルームで相手のコードを読み、セッションの設定を登録しました（{}）。相手の候補 {addrs} へ接続しています。",
                     side.map_or("側が分からない", side_text)
                 ),
                 "",
@@ -1454,11 +1497,11 @@ impl GameWatcher {
         self.event(Event::RoomPeer);
     }
 
-    /// ルームの手順が終わらなかった。セッションの設定を置いた後なら画面には出さない（P2P の側に任せる）。
+    /// ルームの手順が終わらなかった。セッションの設定を登録した後なら画面には出さない（P2P の側に任せる）。
     fn room_failed(&mut self, f: Failure) {
         if self.room.as_ref().is_some_and(|r| r.placed) {
             self.log(format!(
-                "ルームの手順は終わらなかった（{f:?}）が、相手のコードはもう読んでセッションの設定を置いた（繋がるかは P2P の側に任せる）"
+                "ルームの手順は終わりませんでしたが（{f:?}）、相手のコードはもう読んでセッションの設定を登録しました。接続できるかは P2P の側に任せます。"
             ));
             return;
         }
@@ -1484,7 +1527,7 @@ impl GameWatcher {
         if let Failure::RateLimited { retry_after_secs } = f {
             self.note.retry_secs = u16::try_from(retry_after_secs).unwrap_or(u16::MAX);
         }
-        self.log_problem(format!("ルームで待てなかった: {f:?}"));
+        self.log_problem(format!("ルームで待てませんでした: {f:?}"));
         self.room_end(room_failure_event(f));
     }
 
@@ -1527,7 +1570,7 @@ impl GameWatcher {
             )
             .kind(Kind::GaveUp),
         );
-        self.log_unconnected("使えるコードを読めないまま待ちをやめた");
+        self.log_unconnected("使えるコードを読めないまま待ちをやめました");
         self.event(Event::GaveUp);
     }
 
@@ -1549,11 +1592,14 @@ impl GameWatcher {
                 self.shared.update(|f| f.host = host);
                 self.say(&connected_say(self.slot.seat(), shape));
                 self.log_link(format!(
-                    "つながり: {}",
+                    "接続: {}",
                     link_log::connect_line(&self.shared.facts_now())
                 ));
+                if let Some(p) = self.slot.pick_note() {
+                    self.log_link(format!("接続: {}", link_log::pick_line(&p, host)));
+                }
                 self.log(decided_shape_log(shape));
-                // 観戦の配る側は、知らせ（音は鳴り終わるまで待つ）より先に起こす（観戦者を待たせない）。
+                // 観戦の配る側は、知らせ（音は鳴り終わるまで待つ）より先に開始する（観戦者を待たせない）。
                 self.start_casting();
                 // 本ログへ知らせの結果を残す（音は鳴り終わるまで待つが、待つのはこのスレッドだけ）。
                 let n = (self.notify)();
@@ -1563,10 +1609,10 @@ impl GameWatcher {
             }
             if self.slot.is_done() {
                 self.say(
-                    &Say::new("ネットワークが終わった（繋がらずに終えた）", "")
+                    &Say::new("ネットワークが終了しました（接続できずに終了）", "")
                         .kind(Kind::EndedUnconnected),
                 );
-                self.log_unconnected("繋がらずにネットワークが終わった");
+                self.log_unconnected("接続できずにネットワークが終わった");
                 self.event(Event::Ended);
                 return;
             }
@@ -1606,6 +1652,8 @@ fn room_failure_event(f: Failure) -> Event {
         Failure::BadRoomName => Event::RoomRefused,
         Failure::Expired => Event::RoomExpired,
         Failure::PeerLeft => Event::RoomPeerLeft,
+        // 対戦のルームでは来ない（サーバーは観戦用のルームの観戦者にだけ返す）。
+        Failure::Refused => Event::RoomUnresponsive,
     }
 }
 
@@ -1641,8 +1689,8 @@ fn event_of(kind: Kind) -> Event {
     }
 }
 
-/// 見張りを起こす（開くスレッドから。`script_win::open_game_net`）: 自分の候補（受信ソケットと、ini の `stun` があれば見えたアドレス）を
-/// 決め、見張りのスレッドを起こす。戻りの文は本ログの「ネットワーク: 開いた」の行に足す。
+/// 見張りを開始する（開くスレッドから。`script_win::open_game_net`）: 自分の候補（受信ソケットと、ini の `stun` があれば見えたアドレス）を
+/// 決め、見張りのスレッドを作る。戻りの文は本ログの「ネットワーク: 開いた」の行に足す。
 // 検査が個別に差し替える部品を引数で受ける入口。
 #[allow(clippy::too_many_arguments)]
 pub fn start_game(
@@ -1656,7 +1704,7 @@ pub fn start_game(
     ui: GameUi,
 ) -> Result<(Watch, String, Option<Parts>), String> {
     let mut note = String::new();
-    let local = net.local_addr().ok_or("受信ソケットが分からない")?;
+    let local = net.local_addr().ok_or("受信ソケットが不明")?;
     // UPnP は STUN と並行に走らせ、結果は `nat_settle` で待つ（上限つき。出なければ使えないものとして進む）。
     net_udp::upnp_begin(s, net, &mut note);
     let (mapped, stun) = net_udp::stun_state(s, net, &mut note);
@@ -1670,7 +1718,7 @@ pub fn start_game(
     // 観戦の配る側（`[spectate] enable = 1`）。観戦用のコードの候補は自分の受信ソケットと STUN で見えたアドレス（観戦コードは UPnP のポートも）。
     // ルームサーバーが無くても観戦コードの経路のために用意する。用意できなくても対戦は開く（理由は note に足す）。
     let (armed, spectate_note) =
-        spectate_offer::arm(s, local, mapped, nat.upnp_port, ui.room.clone());
+        spectate_offer::arm(s, local, mapped, v6, nat.upnp_port, ui.room.clone(), &slot);
     note.push_str(&spectate_note);
     let (kit, parts, oneway) = match armed {
         Some(a) => (Some(a.kit), Some(a.parts), Some(a.oneway)),
@@ -1720,19 +1768,16 @@ pub fn start_game(
                 b.close();
             }
         })
-        .map_err(|e| format!("接続コードの見張りのスレッドを起こせない: {e}"))?;
+        .map_err(|e| format!("接続コードの見張りのスレッドの作成不能: {e}"))?;
     Ok((Watch::from_parts(shared, join), note, parts))
 }
 
-// ---- ネットワークの組の開け閉め（つなぎ直し）----
+// ---- ネットワークの組の開け閉め（再接続）----
 //
-// 1 回のつながりに 1 組: 受信ソケットと受信スレッド（`net_udp`）・見張りのスレッドとつながりのセッションの受け渡し（`LinkSlot`）・ネットワークのセッション
-// （`NetPlay`）。つながりが終わってマッチの外へ戻ったら、ゲームのスレッドはネットワークのセッションを手放すだけで、重い仕事（スレッドを止めて待つ・
-// 受信ソケットを閉じる）はワーカースレッドが `close_parts` で行う。次の「対戦コード作成」「対戦コード入力」「ルームマッチ」で `open_set` が新しい組を作る。
-// 受信ソケットも作り直す（使い回さない）: 自分のコードは開いた後の受信ソケットと STUN の答えから作るので、ポートを取り直してもコードと
-// 受信ソケットは食い違わない。使い回すと、前の相手の送り直し・受信スレッドの PONG の口・リングの数が次のつながりへ持ち越される。
-// 秘密・session は「対戦コード作成」のたびに、役割の乱数（nonce）は開くたびに引き直す。前のつながりのコードは貼られても読まない
-// （`GameUi::spent`）。
+// 1 回の接続に 1 組: 受信ソケットと受信スレッド（`net_udp`）・見張りのスレッドと接続のセッションの受け渡し（`LinkSlot`）・ネットワークのセッション（`NetPlay`）。接続が終わってマッチの外へ戻ったら、ゲームのスレッドはネットワークのセッションを手放すだけで、
+// 重い仕事（スレッドを止めて待つ・受信ソケットを閉じる）はワーカースレッドが `close_parts` で行う。次の「対戦コード作成」「対戦コード入力」「ルームマッチ」で `open_set` が新しい組を作る。
+// 受信ソケットも作り直す（使い回さない）: 自分のコードは開いた後の受信ソケットと STUN の答えから作るので、ポートを取り直してもコードと受信ソケットは食い違わない。使い回すと、前の相手の送り直し・受信スレッドの PONG の口・リングの数が次の接続へ持ち越される。
+// 秘密・session は「対戦コード作成」のたびに、役割の乱数（nonce）は開くたびに引き直す。前の接続のコードは貼られても読まない（`GameUi::spent`）。
 
 /// 開いたネットワークの組（`open_set` の戻り）。ネットワークのセッション（`np`・`net`）はゲームのスレッドへ渡し、見張りと受信スレッドの持ち手はワーカーが持つ。
 pub struct Opened {
@@ -1748,7 +1793,7 @@ pub struct Opened {
 }
 
 /// ネットワークの組を開く（開くスレッドかワーカースレッド。ゲームのスレッドでは呼ばない —— 受信ソケット・STUN の問い合わせは待つ）。`cfg` はマッチのパスの
-/// 設定（`script_win::play_config`）、`nonce` は役割を決める乱数。`ui` のクリップボード・ルームの設定・前のつながりの session は
+/// 設定（`script_win::play_config`）、`nonce` は役割を決める乱数。`ui` のクリップボード・ルームの設定・前の接続の session は
 /// 呼び手が決める（製品は本物のクリップボード、検査は偽物）。
 #[allow(clippy::too_many_arguments)] // `start_game` と同じ材料を 1 か所で受ける（検査が部品を差し替える入口）
 pub fn open_set(
@@ -1765,7 +1810,7 @@ pub fn open_set(
     let local = net.local_addr();
     let timer = net.high_resolution_wait();
     let slot = Arc::new(LinkSlot::new());
-    // 見張りを起こせなければ、ここで `net` と `recv` が落ちて受信ソケットが閉じる（次の「対戦コード作成」でやり直せる）。
+    // 見張りを開始できなければ、ここで `net` と `recv` が落ちて受信ソケットが閉じる（次の「対戦コード作成」でやり直せる）。
     let (watch, mut note, parts) = start_game(
         s,
         &mut net,
@@ -1777,13 +1822,13 @@ pub fn open_set(
         ui,
     )?;
     let mut np = NetPlay::with_code_slot(slot, cfg, &mut net);
-    // 観戦のリングバッファと送り手（開くたびに新しい組）。送り手を受信スレッドが取れたときだけリングバッファをセッションに置く（読み手のいないリングバッファへ書かない）。
+    // 観戦のリングバッファと、観戦者へ送る送り手（開くたびに新しい組）。送り手を受信スレッドが取れたときだけリングバッファをセッションに設定する（読み手のいないリングバッファへ書かない）。
     // リングバッファはマッチのホストのときだけ書く（`NetPlay::set_spectate_for_host`）。
     if let Some(p) = parts {
         if recv.install_spectate(p.sender) {
             np.set_spectate_for_host(p.ring);
         } else {
-            note.push_str(" / 観戦: 受信スレッドに置けなかった（観戦は使わない）");
+            note.push_str(crate::spectate_host::NOT_INSTALLED);
         }
     }
     Ok(Opened {
@@ -1799,7 +1844,7 @@ pub fn open_set(
 
 /// ネットワークの組を片づける（ワーカースレッド。ゲームのスレッドがネットワークのセッションを手放した後）。順は ネットワークのセッション → 見張り（止めて待つ）→ 受信スレッド
 /// （止めて待つ。最後の持ち手が落ちて受信ソケットが閉じる）→ メニューとのインターフェースの前の見張りの残り。見張りの持ち手は止めるだけで残す
-/// （文と数は試験のまとめ・本ログが読む）。戻りは受信スレッドの最後の数（本ログ）。
+/// （文と数は試験のまとめ・本ログが読む）。戻りは受信スレッドの最後の数と、観戦のホストの最後の集計（本ログ）。
 pub fn close_parts(
     np: NetPlay,
     net: GameNet,
@@ -1807,18 +1852,18 @@ pub fn close_parts(
     recv: RecvThread,
     link: &UiLink,
     mark: u32,
-) -> net_udp::RecvStats {
+) -> (net_udp::RecvStats, Option<crate::spectate_host::Snapshot>) {
     drop(np);
     drop(net);
     watch.stop();
-    let stats = recv.stop();
+    let stopped = recv.stop_with_spectate();
     link.reset_for_next_watcher(mark);
-    stats
+    stopped
 }
 
 #[cfg(test)]
 mod tests {
-    //! 偽のクリップボードと、スレッドを起こさない `handle` の直の呼び出しで、メニューからの指示への答えを見る。
+    //! 偽のクリップボードと、スレッドを作らない `handle` の直の呼び出しで、メニューからの指示への答えを見る。
     //! 接続コード・秘密・名前・アドレスは合成の値だけ。
     use super::*;
     use std::net::SocketAddr;
@@ -1845,7 +1890,7 @@ mod tests {
         side_with(name, port, nonce, timing, "", None)
     }
 
-    /// `extra` は ini の `[netplay]` に足す行（`room_server` / `room`）、`room` は見張りがルームへ繋ぐ設定。
+    /// `extra` は ini の `[netplay]` に足す行（`room_server` / `room`）、`room` は見張りがルームへ接続する設定。
     fn side_with(
         name: &str,
         port: u16,
@@ -1933,6 +1978,8 @@ mod tests {
                 spectate_clip: Some(Box::new(human.clone())),
             },
         );
+        // ini の `[spectate] enable = 1` を `place` と同じく名乗る。
+        w.slot.set_list_wish(true);
         LanSide {
             w,
             bridge,
@@ -1946,8 +1993,6 @@ mod tests {
         (n.state, n.event)
     }
 
-    /// 壊れたら落ちる: LAN の見張りが、作成・入力の頼みを運び手から受けず、コードを運び手の入れ物へ渡さない、状態が LAN のものにならない
-    /// （「コピーしました」の文が出る、接続コードの待ちの状態のままになる）、返したコードが相手の見張りに読まれない。
     #[test]
     fn a_lan_watcher_trades_codes_through_the_bridge_and_never_says_copied() {
         let mut a = lan_side("alice", 41_201, 0xF000);
@@ -1984,7 +2029,6 @@ mod tests {
         assert!(!a.bridge.is_aborted() && !b.bridge.is_aborted());
     }
 
-    /// 壊れたら落ちる: 取りやめが運び手に届かない（運び手が務めを続ける）、取りやめの札が LAN の文にならない。
     #[test]
     fn cancelling_a_lan_wait_aborts_the_carrier_and_clears_the_menu() {
         let mut a = lan_side("alice", 41_203, 0xF000);
@@ -1995,7 +2039,6 @@ mod tests {
         assert!(a.bridge.is_aborted());
     }
 
-    /// 壊れたら落ちる: 運び手が決めた失敗（時間切れ）を画面へ出して待ちをやめない、断られた貼り付けで運び手が止まらない。
     #[test]
     fn a_failure_from_the_carrier_or_a_refused_code_ends_the_lan_wait() {
         let mut a = lan_side("alice", 41_204, 0xF000);
@@ -2033,7 +2076,7 @@ mod tests {
         assert_eq!(lan_note(&d).0, CodeState::Idle);
     }
 
-    /// 壊れたら落ちる: コードを受け渡した後、成立しないまま上限が過ぎても待ちが続く。成立していれば上限で切らない。
+    /// 成立していれば上限で切らないことも見る。
     #[test]
     fn a_lan_link_that_never_forms_gives_up_with_no_link() {
         let mut a = lan_side("alice", 41_208, 0xF000);
@@ -2070,8 +2113,6 @@ mod tests {
         assert_ne!(lan_note(&c).1, Event::LanNoLink);
     }
 
-    /// 壊れたら落ちる: LAN の接続の Ctrl+C の観戦コードが人のクリップボードへ書かれない（運び手へ渡って捨てられるのに「コピーしました」と出る）、
-    /// 観戦の用意が無い・コピーできないときの Ctrl+C で運び手が止まる（以後その試合の LAN の観戦を受けない）・待ちの状態が「何も無い」になる。
     #[test]
     fn a_lan_host_copies_the_watch_code_to_the_human_clipboard_and_keeps_the_carrier() {
         use higanr_core::lockstep::Role;
@@ -2080,6 +2121,7 @@ mod tests {
         a.w.lan_tick();
         let _ = a.bridge.take_outgoing();
         a.w.slot.mark_role(Role::Host);
+        a.w.slot.mark_may_list(true);
         a.w.slot.mark_connected(Seat::P1, Mode::Delay, 2);
         a.w.copy_spectate_code();
         let (state, ev) = lan_note(&a);
@@ -2089,6 +2131,7 @@ mod tests {
         let armed = arm_with(
             &a.w.s,
             "127.0.0.1:41212".parse().unwrap(),
+            None,
             None,
             None,
             None,
@@ -2112,7 +2155,7 @@ mod tests {
         assert!(!a.bridge.is_aborted());
     }
 
-    /// 壊れたら落ちる: 運び手が札を書いた後（ホストが待機へ戻った）に、見張りが同じ数の札を書く（メニューが変化を見落とし、取りやめの文が出ない）。
+    /// 同じ数の札だとメニューが変化を見落とす。
     #[test]
     fn the_watcher_counts_on_from_the_note_the_carrier_wrote() {
         let mut a = lan_side("alice", 41_213, 0xF000);
@@ -2130,7 +2173,6 @@ mod tests {
         assert_eq!((n.state, n.event), (CodeState::Idle, Event::LanCancelled));
     }
 
-    /// 壊れたら落ちる: 対戦の成立の前（試合の役が決まっていない）の観戦コードの頼みに観戦コードを答える、答えない（運び手が待ち続ける）。
     #[test]
     fn a_watch_code_request_before_the_match_is_refused_through_the_bridge() {
         let mut a = lan_side("alice", 41_210, 0xF000);
@@ -2233,9 +2275,6 @@ mod tests {
         assert_eq!(c.w.s.handshake_config(1, 1).name.as_str(), "carol");
     }
 
-    /// 壊れたら落ちる: 選んだ項目と自分の側が数（`CodeFacts`）に載らない / 作った後に返答を貼ると項目が「対戦コード入力」に替わる /
-    /// 返す側が貼ったのに項目が「対戦コード作成」のまま / 取りやめの行に項目と待った秒数が出ない / 項目を選んでいない実行（観戦だけの起動）に
-    /// 取りやめの行が出る。
     #[test]
     fn the_chosen_item_and_side_are_recorded_for_the_log() {
         let (mut a, mut b) = pair();
@@ -2261,18 +2300,17 @@ mod tests {
         );
         let mut c = side("carol", 41_103, 0x00F0, T);
         c.w.handle(Order::Cancel);
-        assert!(!log_of(&c).contains("つながり:"), "{}", log_of(&c));
+        assert!(!log_of(&c).contains("接続: "), "{}", log_of(&c));
         c.w.handle(Order::Create);
         c.w.handle(Order::Cancel);
         assert!(
             log_of(&c)
-                .contains("つながり: 待ちを取りやめた: 対戦コード作成（始める側）。選んでから "),
+                .contains("接続: 待ちを取りやめました。対戦コード作成（始める側）を選んでから "),
             "{}",
             log_of(&c)
         );
     }
 
-    /// 壊れたら落ちる: 行の頭が選んだ項目の名前に替わらない（ランダムマッチ・ルームマッチ・LAN の行に「接続コード」と出る）。
     #[test]
     fn the_log_line_head_follows_the_chosen_item() {
         let c = side("carol", 41_104, 0x00F0, T);
@@ -2345,7 +2383,7 @@ mod tests {
         assert_eq!(a.slot.peer_nat(), None, "読む前は無い");
         a.w.handle(Order::Create);
         let offer = a.clip.text().unwrap();
-        // 始める側のコードに自分の印が載っている（読み戻して確かめる）。
+        // 始める側のコードに自分の印が載っている（読み戻して検証する）。
         let read = higanr_core::code::read_initiator(&offer, net_udp::now_unix()).unwrap();
         assert_eq!(read.nat, mark_a);
         b.clip.set(&offer);
@@ -2372,6 +2410,37 @@ mod tests {
             None,
             "取りやめたのに前の相手の印が残った"
         );
+    }
+
+    /// ホストの決め方は、役割の乱数を ini で決めていない接続だけで使い、自分の回線の型の印を名乗る。
+    #[test]
+    fn host_pick_is_offered_only_when_the_nonce_is_not_fixed() {
+        use higanr_core::nat::{NatMark, Symmetry};
+        let mut a = side("alice", 41_111, 0xF000, T);
+        let mut b = side_with("bob", 41_112, 0x0F00, T, "nonce = 7\n", None);
+        let mark_a = NatMark {
+            symmetry: Symmetry::No,
+            upnp: true,
+        };
+        a.w.set_nat(mark_a);
+        b.w.set_nat(mark_a);
+        a.w.handle(Order::Create);
+        b.clip.set(&a.clip.text().unwrap());
+        b.w.handle(Order::Paste);
+        assert_eq!(
+            b.slot.generation(),
+            1,
+            "効く期間: b はセッションの設定を登録した"
+        );
+        assert_eq!(
+            b.slot.host_pick(),
+            None,
+            "nonce を決めた実行が決め方を名乗った"
+        );
+        a.clip.set(&b.clip.text().unwrap());
+        a.w.handle(Order::Paste);
+        assert_eq!(a.slot.generation(), 1);
+        assert_eq!(a.slot.host_pick(), Some(mark_a));
     }
 
     #[test]
@@ -2491,7 +2560,6 @@ mod tests {
     }
 
     #[test]
-    // 何が壊れたら落ちるか: メニューの「サイド」を変えていない側が、表示（おまかせ）と違う席（host_seat の既定の 1P）を名乗る。
     fn the_menu_seat_and_the_code_side_reach_the_link_settings() {
         use higanr_core::seat_pick::SeatAsk;
         use higanr_core::wire::{Arrival, SeatWish};
@@ -2523,8 +2591,7 @@ mod tests {
     }
 
     #[test]
-    // 何が壊れたら落ちるか: ini に host_seat = 2 を書いた側が、メニューの「サイド」を変えていなくても、その席（2P）の希望を名乗らない
-    // （おまかせのまま、または既定の 1P を名乗る）。`initial_seat` を常におまかせにすると落ちる。
+    // `initial_seat` を常におまかせにすると落ちる。
     fn an_untouched_menu_names_the_host_seat_from_the_ini() {
         use higanr_core::seat_pick::SeatAsk;
         use higanr_core::wire::{Arrival, SeatWish};
@@ -2680,8 +2747,8 @@ mod tests {
 
     // ---- ルームの経路 ----
     //
-    // 部品の検査（毎回の回）: ルーム名の断り・失敗のコピー・項目の出し分け。繋ぐ検査は loopback の偽サーバー（`net_room::fake`）と
-    // 本物の WinHTTP・実時間で走るので `#[ignore]`（全件の回が `--ignored` で走らせる）。外へは繋がない（`127.0.0.1` と
+    // 部品の検査（毎回の回）: ルーム名の断り・失敗のコピー・項目の出し分け。接続する検査は loopback の偽サーバー（`net_room::fake`）と
+    // 本物の WinHTTP・実時間で走るので `#[ignore]`（全件の回が `--ignored` で走らせる）。外へは接続しない（`127.0.0.1` と
     // `Proxy::Direct`）。ルーム名は合成の文字だけ。
 
     use crate::net_room::fake::FakeServer;
@@ -2749,7 +2816,7 @@ mod tests {
 
     #[test]
     fn room_names_are_refused_before_connecting_and_never_logged() {
-        // 繋ぐ先は使われない（断るので）。万一繋いでも loopback の閉じた番号。
+        // 接続する先は使われない（断るので）。万一接続しても loopback の閉じた番号。
         let opts = || Some(room_opts("ws://127.0.0.1:9"));
         let mut a = side_with(
             "alice",
@@ -2929,7 +2996,7 @@ mod tests {
         assert_eq!(a.link.note().unwrap().state, CodeState::RoomWaiting);
         // 後から入る側（大小だけ違う名。サーバーが揃えて同じルームにする）。
         choose(&mut b, "synth-room-7");
-        // 置いた瞬間の（ルームの状態, 側）。ルームはその後のサーバーの 1000 で終わって手放すので、後からは読めない。
+        // 設定した瞬間の（ルームの状態, 側）。ルームはその後のサーバーの 1000 で終わって手放すので、後からは読めない。
         type AtPlace = Option<(RoomState, Option<CodeSide>)>;
         let mut b_state_at_place: Option<AtPlace> = None;
         let t0 = Instant::now();
@@ -2991,7 +3058,7 @@ mod tests {
         // ルーム名は本ログに出ない（パスには打った文字のまま載る）。
         let logs = format!("{}\n{}", log_of(&a), log_of(&b));
         assert!(!logs.to_lowercase().contains("synth-room"), "{logs}");
-        assert!(logs.contains("ルームに入った"), "{logs}");
+        assert!(logs.contains("ルームに入りました"), "{logs}");
         let paths = srv.seen.paths.lock().unwrap().clone();
         assert!(
             paths.contains(&"/v0/rooms/Synth-Room-7".to_string()),
@@ -3050,7 +3117,7 @@ mod tests {
         let mut s = watcher("", &dead);
         let (_, l0) = ends(&mut s, Event::RoomUnresponsive);
         assert_eq!(l0, "サーバーが応答しません。");
-        // つなぎ直し: ルームの失敗の後も同じ見張りのまま、接続コードの経路でつなげる。
+        // 再接続: ルームの失敗の後も同じ見張りのまま、接続コードの経路で接続できる。
         s.w.handle(Order::Create);
         let n = s.link.note().unwrap();
         assert_eq!((n.event, n.state), (Event::Made, CodeState::Offered));
@@ -3276,7 +3343,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
-        // 取りやめる・別のつなぎ方を選ぶ: 入り直さない（ルームの状態を手放しているので、期限が来ても何も起きない）。
+        // 取りやめる・別の接続方法を選ぶ: 入り直さない（ルームの状態を手放しているので、期限が来ても何も起きない）。
         for (i, stop) in [Order::Cancel, Order::Create].into_iter().enumerate() {
             let mut c = mk(41_153, 0xF000);
             srv.knobs
@@ -3302,7 +3369,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: ルーム・コードの失敗の文が簡潔なログに出なくなる（配線の検査。文の中身はここでは作れない）。
+    /// 配線の検査（文の中身はここでは作れない）。
     #[test]
     fn room_and_code_failures_are_pushed_to_the_main_log() {
         let src = include_str!("net_code_game.rs");
@@ -3330,7 +3397,7 @@ mod tests {
         Vec<crate::net_room::fake::ListedItem>,
     );
 
-    /// 2 台の見張り（偽サーバー経由）が `cmd_a`・`cmd_b` で相手を見つけてセッションの設定を置いて繋がり、偽のゲームのマッチを 60 フレーム回して、
+    /// 2 台の見張り（偽サーバー経由）が `cmd_a`・`cmd_b` で相手を見つけてセッションの設定を登録して接続、偽のゲームのマッチを 60 フレーム回して、
     /// 両者の列が同じ（同期ズレ 0）なことを見る。A が先に待つ。戻りは両者の本ログの文（検査ごとに名が出ていないかを見る）。
     fn play_two_games(srv: &FakeServer, extra: &str, cmd_a: Cmd, cmd_b: Cmd) -> TwoGames {
         play_two_games_with(srv, extra, extra, cmd_a, cmd_b)
@@ -3460,7 +3527,7 @@ mod tests {
                 std::thread::sleep(d);
             }
         }
-        // 一覧に載るのはつながった後の見張りの見回り 1 回ぶん遅れる。載るはずの実行は少し待つ。
+        // 一覧に載るのは接続した後の見張りの見回り 1 回ぶん遅れる。載るはずの実行は少し待つ。
         let t_list = Instant::now();
         while expect_listing && listed.is_empty() && t_list.elapsed() < Duration::from_secs(3) {
             listed = srv.watch_items(BUILD_NUMBER);
@@ -3484,7 +3551,7 @@ mod tests {
         assert!(clip_a.writes().is_empty() && clip_b.writes().is_empty());
         let logs = format!("{}\n{}", wa.notes().join("\n"), wb.notes().join("\n"));
         assert!(logs.contains("ルームで相手のコード"), "{logs}");
-        assert!(logs.contains("繋がった"), "{logs}");
+        assert!(logs.contains("接続しました"), "{logs}");
         // 相手の名前は本ログ向けの文に書かない。
         let lower = logs.to_lowercase();
         assert!(!lower.contains("alice") && !lower.contains("bob"), "{logs}");
@@ -3502,10 +3569,9 @@ mod tests {
             Cmd::Room(RoomBuf::from_name("SYNTH-P2P").unwrap()),
         );
         assert!(!logs.to_lowercase().contains("synth-p2p"), "{logs}");
-        // つながりごとの 1 行: 選んだ項目・ルームに入った順・対戦のホスト / ゲスト。
+        // 接続ごとの 1 行: 選んだ項目・ルームに入った順・対戦のホスト / ゲスト。
         assert_eq!(
-            logs.matches("つながり: 接続した: ルームマッチ（ルームに")
-                .count(),
+            logs.matches("接続: ルームマッチ（ルームに").count(),
             2,
             "{logs}"
         );
@@ -3534,6 +3600,12 @@ mod tests {
                 .all(|p| !p.starts_with("/v0/watch/")),
             "ルームマッチが一覧のエンドポイントへ触った"
         );
+        // 2 人とも観戦を許可していないので、ホストは観戦用のルームで断りを返す（観戦用のコードは預けない）。
+        assert!(logs.contains("観戦者には観戦拒否を返します"), "{logs}");
+        assert!(
+            srv.texts_matching(|t| t == higanr_core::room::REFUSE_TEXT) >= 1,
+            "断りが届いていない"
+        );
     }
 
     #[test]
@@ -3555,11 +3627,10 @@ mod tests {
             !logs.to_lowercase().contains(&assigned[0][2..]),
             "割り当てたルーム名の乱数部分が本ログにある: {logs}"
         );
-        assert!(logs.contains("相手が決まった（待ち列に"), "{logs}");
-        // つながりごとの 1 行: 選んだ項目・待ち列の順・対戦のホスト / ゲスト・待ち列で待った秒数。
+        assert!(logs.contains("相手が決まりました（待ち列に"), "{logs}");
+        // 接続ごとの 1 行: 選んだ項目・待ち列の順・対戦のホスト / ゲスト・待ち列で待った秒数。
         assert_eq!(
-            logs.matches("つながり: 接続した: ランダムマッチ（待ち列に")
-                .count(),
+            logs.matches("接続: ランダムマッチ（待ち列に").count(),
             2,
             "{logs}"
         );
@@ -3576,19 +3647,23 @@ mod tests {
         assert_eq!(logs.matches("・対戦のホスト）").count(), 1, "{logs}");
         assert_eq!(logs.matches("・対戦のゲスト）").count(), 1, "{logs}");
         assert_eq!(logs.matches("待ち列で組になるまで ").count(), 2, "{logs}");
-        assert!(logs.contains("待ち列に入った（待ち列の期限まで"), "{logs}");
+        assert!(
+            logs.contains("待ち列に入りました（待ち列の期限まで"),
+            "{logs}"
+        );
         assert_eq!(
-            logs.matches("進行中のランダムマッチの一覧に載せる").count(),
+            logs.matches("進行中のランダムマッチの一覧に載せます")
+                .count(),
             1,
             "ホストだけが一覧に載せる: {logs}"
         );
         assert!(
-            !logs.contains("観戦の配る側は起こさない（ランダムマッチの相手"),
+            !logs.contains("観戦の受付: 未作成（ランダムマッチの相手"),
             "古い断りの文が残っている: {logs}"
         );
         assert!(
-            !logs.contains("一覧に載せない設定"),
-            "両者が載せてよいのに断った: {logs}"
+            !logs.contains("このマッチは観戦を受け付けていません"),
+            "2 人とも許可しているのに断った: {logs}"
         );
         let w = RoomName::parse_server_rules(&assigned[0])
             .unwrap()
@@ -3679,7 +3754,7 @@ mod tests {
 
     const INI_TEXT: &str = "[netplay]\nenable = 1\n";
 
-    /// `dir` を作り直し、中に ini を置く（ルーム名を書き戻す先）。
+    /// `dir` を作り直し、中に ini を作る（ルーム名を書き戻す先）。
     fn ini_in(dir: &std::path::Path) -> PathBuf {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -3688,7 +3763,7 @@ mod tests {
         p
     }
 
-    /// `ini_in` で置いた ini の `room`。
+    /// `ini_in` で作った ini の `room`。
     fn room_of(dir: &std::path::Path) -> Option<RoomBuf> {
         higanr_core::ini_store::get(&dir.join("HiganRTool.ini"), "netplay", "room")
             .and_then(|v| RoomBuf::from_name(&v))
@@ -3725,7 +3800,7 @@ mod tests {
 
     #[test]
     fn picking_random_names_no_room_and_leaving_it_for_a_named_room_or_cancel_forgets_it() {
-        // 繋ぐ先は閉じた loopback の番号（繋ぎ始めの状態だけ見る）。
+        // 接続する先は閉じた loopback の番号（接続し始めの状態だけ見る）。
         let base = "ws://127.0.0.1:9";
         let mut a = random_side("alice", 41_142, 0xF000, base, 7);
         let dir = std::env::temp_dir().join(format!("higanr_random_last_{}", std::process::id()));
@@ -3787,7 +3862,7 @@ mod tests {
     fn a_random_match_host_starts_the_offer_thread_only_for_an_assigned_room_and_never_as_a_guest()
     {
         use higanr_core::lockstep::Role;
-        // 割り当ての形でない名（人が打つ名の経路の残り）: ランダムマッチの印があっても配る側を起こさない。
+        // 割り当ての形でない名（人が打つ名の経路の残り）: ランダムマッチの印があっても配る側を開始しない。
         let typed = RoomName::parse("synth-meet-room").unwrap();
         let (mut s, a) = spectate_side(0xF000);
         let shared = Arc::clone(a.kit.shared());
@@ -3814,11 +3889,11 @@ mod tests {
         s.w.start_casting();
         assert!(shared.get().offer.running, "{}", log_of(&s));
         let log = log_of(&s);
-        assert!(log.contains("一覧に載せる"), "{log}");
+        assert!(log.contains("一覧に載せます"), "{log}");
         assert!(!log.contains(&ASSIGNED_Q[2..]), "{log}");
         assert!(!log.contains(q.spectate_of().as_str()), "{log}");
         shared.stop_offer();
-        // ゲストは起こさない（ホストだけが配る・載せる）。
+        // ゲストは開始しない（ホストだけが配る・載せる）。
         let (mut s, a) = spectate_side(0x0F00);
         let shared = Arc::clone(a.kit.shared());
         s.w.set_spectate(a.kit);
@@ -3828,7 +3903,7 @@ mod tests {
         s.w.start_casting();
         assert!(!shared.get().offer.running, "ゲストが配る側を起こした");
         assert!(log_of(&s).contains("ゲストなので"), "{}", log_of(&s));
-        // 観戦を使わない設定（`[spectate]` なし）のホストは起こさず、載せない。
+        // 観戦を使わない設定（`[spectate]` なし）のホストは開始せず、載せない。
         let mut s = side_with(
             "alice",
             41_132,
@@ -3841,14 +3916,18 @@ mod tests {
         s.w.random_met = true;
         mark(&s, Some(Role::Host));
         s.w.start_casting();
-        assert!(!log_of(&s).contains("起こした"), "{}", log_of(&s));
+        assert!(
+            !log_of(&s).contains("観戦の受付を作りました"),
+            "{}",
+            log_of(&s)
+        );
     }
 
     #[test]
     fn a_random_match_host_neither_lists_nor_casts_when_the_peer_refuses_listing() {
         use higanr_core::lockstep::Role;
         let q = RoomName::parse_server_rules(ASSIGNED_Q).unwrap();
-        // ランダムマッチ: 相手が断った（`may_list` が偽）・まだ分からない（印なし）のどちらも起こさない。
+        // ランダムマッチ: 相手が断った（`may_list` が偽）・まだ分からない（印なし）のどちらも開始しない。
         for refused in [true, false] {
             let (mut s, a) = spectate_side(0xF000);
             let shared = Arc::clone(a.kit.shared());
@@ -3865,21 +3944,132 @@ mod tests {
             s.w.start_casting();
             assert!(!shared.get().offer.running, "{}", log_of(&s));
             let log = log_of(&s);
-            assert!(log.contains("一覧に載せない設定"), "{log}");
-            assert!(!log.contains("起こした"), "{log}");
+            assert!(
+                log.contains("このマッチは観戦を受け付けていません"),
+                "{log}"
+            );
+            assert!(!log.contains("観戦の受付を作りました"), "{log}");
             assert!(s.w.spectate.is_none(), "材料を使い切っていない");
+            assert!(s.w.refuser.is_none(), "ランダムマッチで断りを返し始めた");
         }
-        // ルームマッチはホストの設定だけで決まる（相手が断っても起こす）。
-        let room = RoomName::parse("synth-meet-room").unwrap();
+    }
+
+    fn no_spectate_side() -> Side {
+        side_with(
+            "alice",
+            41_132,
+            0xF000,
+            T,
+            "room_server = ws://127.0.0.1:9\n",
+            Some(room_opts("ws://127.0.0.1:9")),
+        )
+    }
+
+    /// 4 つの入口とも、観戦の受付を作るのは 2 人とも観戦を許可しているときだけ（`may_list` は接続の手順で `自分 && 相手` に決まる）。
+    /// ルームマッチで許可がそろわなければ、ホストは観戦用のルームで観戦者に断りを返す。
+    #[test]
+    fn every_route_opens_watching_only_when_both_players_allow_it() {
+        use higanr_core::lockstep::Role;
+        let q = RoomName::parse_server_rules(ASSIGNED_Q).unwrap();
+        let named = RoomName::parse("synth-meet-room").unwrap();
+        for (own, peer) in [(true, true), (true, false), (false, true), (false, false)] {
+            let both = own && peer;
+            let tag = format!("自分 {own}・相手 {peer}");
+            // ランダムマッチ・ルームマッチ（ホスト）。
+            for random in [true, false] {
+                let (mut s, shared) = if own {
+                    let (mut s, a) = spectate_side(0xF000);
+                    let sh = Arc::clone(a.kit.shared());
+                    s.w.set_spectate(a.kit);
+                    (s, Some(sh))
+                } else {
+                    (no_spectate_side(), None)
+                };
+                s.w.met_room = Some(if random { q } else { named });
+                s.w.random_met = random;
+                mark_listing(&s, Some(Role::Host), both);
+                s.w.start_casting();
+                let running = shared.as_ref().is_some_and(|sh| sh.get().offer.running);
+                assert_eq!(running, both, "{tag} ランダム {random}: {}", log_of(&s));
+                assert_eq!(
+                    s.w.refuser.is_some(),
+                    !random && !both,
+                    "{tag} ランダム {random}: {}",
+                    log_of(&s)
+                );
+                if let Some(sh) = shared {
+                    sh.stop_offer();
+                }
+                drop(s.w.refuser.take());
+            }
+            // ルームマッチのゲストは、許可がそろわなくても断りを返さない（ホストが返す）。
+            let mut g = no_spectate_side();
+            g.w.met_room = Some(named);
+            mark_listing(&g, Some(Role::Guest), both);
+            g.w.start_casting();
+            assert!(g.w.refuser.is_none(), "{tag}: ゲストが断りを返し始めた");
+            // 接続コード（どの入口でも Ctrl+C の観戦コード）。
+            for role in [Role::Host, Role::Guest] {
+                let (mut s, a) = if own {
+                    spectate_side(0xF000)
+                } else {
+                    // 観戦コードの材料が残っていても（ふつうは用意しない）、許可がそろわなければ書かない。
+                    let (_, a) = spectate_side(0xF000);
+                    (side("alice", 41_134, 0xF000, T), a)
+                };
+                s.w.set_oneway(a.oneway);
+                mark_listing(&s, Some(role), both);
+                s.w.copy_spectate_code();
+                // 自分が許可していなければ、ホストでもゲストでも画面には何も出さない。
+                let want = match (both, own, role) {
+                    (true, _, Role::Host) => Some(Event::SpectateCodeCopied),
+                    (true, _, Role::Guest) => Some(Event::SpectateCodeHostOnly),
+                    (false, true, _) => Some(Event::SpectateCodePeerOff),
+                    (false, false, _) => None,
+                };
+                assert_eq!(s.link.note().map(|n| n.event), want, "{tag} {role:?}");
+                assert_eq!(
+                    s.clip.writes().len(),
+                    usize::from(both && role == Role::Host),
+                    "{tag} {role:?}"
+                );
+            }
+            // LAN の観戦の申し込み（ホストが観戦コードで答えるか断る）。
+            let mut l = lan_side("alice", 41_214, 0xF000);
+            if own {
+                let a = arm_with(
+                    &l.w.s,
+                    "127.0.0.1:41214".parse().unwrap(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    || Ok(0x5EED_0C04),
+                    || Ok(Secret([0x34; 16])),
+                )
+                .unwrap();
+                l.w.set_oneway(a.oneway);
+            }
+            l.w.slot.mark_role(Role::Host);
+            l.w.slot.mark_may_list(both);
+            l.w.slot.mark_connected(Seat::P1, Mode::Delay, 2);
+            let src: std::net::SocketAddrV4 = "127.0.0.1:50001".parse().unwrap();
+            l.bridge.post_cmd(BridgeCmd::WatchCode { src, id: 9 });
+            l.w.lan_tick();
+            let (_, _, answer) = l.bridge.take_watch_answer().expect("答えが無い");
+            assert_eq!(answer.is_ok(), both, "{tag} LAN: {answer:?}");
+            if !both {
+                assert_eq!(answer, Err(higanr_core::lan_proto::Why::WatchOff), "{tag}");
+            }
+        }
+        // 許可がまだ分からない（接続の印より前）ホストも観戦コードを書かない。
         let (mut s, a) = spectate_side(0xF000);
-        let shared = Arc::clone(a.kit.shared());
-        s.w.set_spectate(a.kit);
-        s.w.met_room = Some(room);
-        mark_listing(&s, Some(Role::Host), false);
-        s.w.start_casting();
-        assert!(shared.get().offer.running, "{}", log_of(&s));
-        assert!(!log_of(&s).contains("一覧に載せる"), "{}", log_of(&s));
-        shared.stop_offer();
+        s.w.set_oneway(a.oneway);
+        s.slot.mark_role(Role::Host);
+        s.slot.mark_connected(Seat::P1, Mode::Delay, 2);
+        s.w.copy_spectate_code();
+        assert_eq!(last_event(&s), Event::Internal);
+        assert!(s.clip.writes().is_empty());
     }
 
     #[test]
@@ -4236,7 +4426,7 @@ mod tests {
         .unwrap()
     }
 
-    /// 1 回のつながり: A が作り、B が貼って返し、A が貼る → 両者が選ぶ（READY）→ 偽のゲームのマッチ `frames` フレーム → B が終えて BYE
+    /// 1 回の接続: A が作り、B が貼って返し、A が貼る → 両者が選ぶ（READY）→ 偽のゲームのマッチ `frames` フレーム → B が終えて BYE
     /// → A は相手の BYE で終わる → 両者がマッチの外で片づけてよくなるまで回す。戻りは（A の列、B の列、A のコードの session）。
     fn relink_round(
         a: &mut Relinker,
@@ -4315,7 +4505,7 @@ mod tests {
         (ga.recs, gb.recs, session)
     }
 
-    /// LAN の運び手（`lan_link`）が申し込みを運び、見張りがコードを受け渡して、2 台が loopback でつながり最後まで遊べる。成立した後は観戦の申し込みに
+    /// LAN の運び手（`lan_link`）が申し込みを運び、見張りがコードを受け渡して、2 台が loopback で接続最後まで遊べる。成立した後は観戦の申し込みに
     /// ホストの見張りが観戦コードを返し、読める観戦コードである。ネットワークの設定（範囲 lan で開く・STUN なし）とコードの運び先（運び手へ運び、
     /// 人のクリップボードへは観戦コードだけ）は、この検査では自分で組んで渡している。製品の組み立て（`lan_net_settings`・`code_clips`）は
     /// `script_win::lan_tests` が見る。
@@ -4520,12 +4710,12 @@ mod tests {
             matches!(step, crate::spectate_watch_code::Step::Ready(..)),
             "{step:?}"
         );
-        // 観戦コードは運び手の頼みにホストの見張りが答えたもの（本ログで確かめる）。
+        // 観戦コードは運び手の頼みにホストの見張りが答えたもの（本ログで検証する）。
         let notes = opened_h.lock().unwrap().as_ref().unwrap().watch.notes();
         assert!(
             notes
                 .iter()
-                .any(|l| l.contains("観戦の申し込みに観戦コードを答えた")),
+                .any(|l| l.contains("観戦の申し込みに観戦コードで答えました")),
             "{notes:?}"
         );
         host_stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4563,7 +4753,7 @@ mod tests {
         a.open(0xF000);
         b.open(0x0F00);
         assert_eq!(a.port(), port_a);
-        // B のクリップボードには前の相手のコードが残っている: 貼っても読まない（前の相手へつなぎに行かない）。
+        // B のクリップボードには前の相手のコードが残っている: 貼っても読まない（前の相手へ接続しに行かない）。
         b.clip.set(&first_offer.0);
         b.order(higanr_core::net_menu::Cmd::Paste, Event::Spent);
         assert_eq!(
@@ -4603,15 +4793,18 @@ mod tests {
             "127.0.0.1:41131".parse().unwrap(),
             None,
             None,
+            None,
             Some(room_opts("ws://127.0.0.1:9")),
             || Ok(0x5EED_0C01),
             || Ok(Secret([0x31; 16])),
         )
         .unwrap();
+        // `place` と同じく、自分の観戦の許可を名乗る。
+        s.slot.set_list_wish(true);
         (s, a)
     }
 
-    /// 繋がった印を置く（両者が一覧に載せてよいと名乗った形）。
+    /// 接続した印を設定する（2 人とも観戦を許可した形）。
     fn mark(s: &Side, role: Option<higanr_core::lockstep::Role>) {
         mark_listing(s, role, true);
     }
@@ -4625,18 +4818,18 @@ mod tests {
         s.slot.mark_connected(Seat::P1, Mode::Delay, 2);
     }
 
-    /// 「観戦コードをコピー」: ホストだけが書き、書くたびに新しい期限のコードになる。ゲスト・役が分からない・つながる前・観戦の用意が無い・
+    /// 「観戦コードをコピー」: ホストだけが書き、書くたびに新しい期限のコードになる。ゲスト・役が分からない・接続する前・観戦の用意が無い・
     /// クリップボードへ書けないは、それぞれの出来事で答えてクリップボードを替えない。
     #[test]
     fn only_the_host_copies_a_fresh_watch_code() {
         use higanr_core::lockstep::Role;
         let (mut s, a) = spectate_side(0xF000);
         s.w.set_oneway(a.oneway);
-        // つながる前の頼みは読み捨てる（役が決まっていない）。
+        // 接続する前の頼みは読み捨てる（役が決まっていない）。
         s.w.handle(Order::SpectateCopy);
         assert!(s.clip.writes().is_empty());
         assert!(
-            log_of(&s).contains("つながる前に観戦コード"),
+            log_of(&s).contains("観戦コードをコピーしません（接続前に頼まれました）"),
             "{}",
             log_of(&s)
         );
@@ -4677,17 +4870,17 @@ mod tests {
             assert_eq!(last_event(&g), Event::SpectateCodeHostOnly, "{role:?}");
             assert!(g.clip.writes().is_empty(), "{role:?}");
         }
-        // 観戦の用意が無いホスト（`[spectate] enable = 0`）: 書かない。
+        // 観戦を許可していないホスト（`[spectate] enable = 0`）: 書かず、画面にも何も出さない。
         let mut h = side("alice", 41_133, 0xF000, T);
         mark(&h, Some(Role::Host));
         h.w.copy_spectate_code();
-        assert_eq!(last_event(&h), Event::Internal);
+        assert_eq!(h.link.note().map(|n| n.event), None);
         assert!(h.clip.writes().is_empty());
     }
 
-    /// 観戦コードの候補は、観戦用のルームへ預けるコードの候補に UPnP で開けたポートを足したもの（IPv6 は載せない）。
+    /// 観戦コードの候補は、観戦用のルームへ預けるコードの候補に UPnP で開けたポートを足したもの（IPv6 のソケットが無ければ IPv6 は載せない）。
     #[test]
-    fn the_watch_code_carries_the_upnp_port_and_no_ipv6() {
+    fn the_watch_code_carries_the_upnp_port_and_no_ipv6_without_a_v6_socket() {
         use higanr_core::lockstep::Role;
         let (mut s, _) = spectate_side(0xF000);
         let mapped: std::net::SocketAddr = "203.0.113.9:50000".parse().unwrap();
@@ -4695,6 +4888,7 @@ mod tests {
             &s.w.s,
             "127.0.0.1:41131".parse().unwrap(),
             Some(mapped),
+            None,
             Some(51_000),
             None,
             || Ok(0x5EED_0C02),
@@ -4758,7 +4952,7 @@ mod tests {
         s.w.start_casting();
         assert!(shared.get().offer.running, "{}", log_of(&s));
         assert!(
-            log_of(&s).contains("観戦の配る側を起こした"),
+            log_of(&s).contains("観戦の受付を作りました"),
             "{}",
             log_of(&s)
         );
@@ -4828,7 +5022,11 @@ mod tests {
         };
         let mut oa = open(&sa, 0xF000, &link_a);
         let mut ob = open(&sb, 0x0F00, &link_b);
-        assert!(oa.note.contains("観戦の配る側を用意した"), "{}", oa.note);
+        assert!(
+            oa.note.contains("観戦の配信側を用意しました"),
+            "{}",
+            oa.note
+        );
         let shared_a = oa.recv.spectate_shared().expect("ホストの観戦の共有");
         let shared_b = ob.recv.spectate_shared().expect("ゲストの観戦の共有");
         let wait = |what: &str, mut cond: Box<dyn FnMut() -> bool>| {
@@ -4886,7 +5084,6 @@ mod tests {
                             &spec.code,
                             higanr_core::handshake::Name::new("viewer"),
                             Candidates::from_addrs(&[viewer_addr]).unwrap(),
-                            net_udp::now_unix(),
                         )
                         .unwrap();
                         c.submit_code(&reply).unwrap();
@@ -4953,7 +5150,7 @@ mod tests {
         );
         assert_eq!(b_snap.host.pushed, 0, "ゲストのリングバッファに積まれた");
         let (la, lb) = (oa.watch.notes().join("\n"), ob.watch.notes().join("\n"));
-        assert!(la.contains("観戦の配る側を起こした"), "{la}");
+        assert!(la.contains("観戦の受付を作りました"), "{la}");
         assert!(lb.contains("ゲストなので"), "{lb}");
         for l in [&la, &lb, &a_snap.text(), &b_snap.text()] {
             let low = l.to_lowercase();
@@ -5003,9 +5200,9 @@ mod tests {
 
     // ---- 観戦者の組み上がり ----
 
-    /// 観戦者を含む 3 台の組み上がりの共通の部分: 偽のルームサーバー ＋ 対戦者 2 台（A がホスト。ルームで会う。`[spectate] enable = 1`）
+    /// 観戦者を含む 3 台の組み上がりの共通の部分: 偽のルームサーバー ＋ 対戦する 2 台（A がホスト。ルームで会う。`[spectate] enable = 1`）
     /// ＋ 観戦者（偽のゲーム W ＋ 本物の `WatchPlay` ＋ 観戦者のルームのスレッド `spectate_join`）。`viewer_first` なら観戦者のルームの
-    /// スレッドを対戦者より先に起こす（配る側がまだいない → 役 host → 閉じて 12 秒後に入り直し）。戻りは観戦者の状態の変わり目と、
+    /// スレッドを対戦する側より先に開始する（配る側がまだいない → 役 host → 閉じて 12 秒後に入り直し）。戻りは観戦者の状態の変わり目と、
     /// 各台の結果。
     struct Watched3 {
         ga: crate::netplay::fake::FakeGame,
@@ -5029,7 +5226,7 @@ mod tests {
         watch_through(viewer_first, false, frames, limit_secs)
     }
 
-    /// `random` なら、対戦者 2 台はランダムマッチで会い、観戦者は進行中のランダムマッチの一覧（偽サーバー）から行を選んで入る。そうでなければルームで会い、観戦者は
+    /// `random` なら、対戦する 2 台はランダムマッチで会い、観戦者は進行中のランダムマッチの一覧（偽サーバー）から行を選んで入る。そうでなければルームで会い、観戦者は
     /// ルーム名から観戦用のルームを導く。
     fn watch_through(viewer_first: bool, random: bool, frames: u32, limit_secs: u64) -> Watched3 {
         use crate::netplay::fake::{FRAME_US, FakeGame};
@@ -5104,6 +5301,7 @@ mod tests {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let typed = "Synth-Watch-ROOM";
@@ -5114,7 +5312,7 @@ mod tests {
             net_udp::now_unix() as u32,
         );
         publisher.publish(CodeState::SpectateJoining, Event::RoomJoining);
-        // 最初の状態（開くスレッドが書く `SpectateJoining`）。見張りを起こす前に控える。
+        // 最初の状態（開くスレッドが書く `SpectateJoining`）。見張りを開始する前に控える。
         let first_note = link_w.note().map(|n| (n.state, n.event));
         let kit = move |watch_room: RoomName| JoinKit {
             source: crate::spectate_join::JoinSource::Room {
@@ -5309,7 +5507,7 @@ mod tests {
         }
     }
 
-    /// 3 台の組み上がりの共通の合格: 観戦者の列がホスト（と対戦者）の列と全行一致・状態の変わり目の順・対戦者の名前・本ログにルーム名が出ない。
+    /// 3 台の組み上がりの共通の合格: 観戦者の列がホスト（と対戦する側）の列と全行一致・状態の変わり目の順・対戦する側の名前・本ログにルーム名が出ない。
     fn assert_watched3(w: &Watched3, frames: u32) {
         assert_eq!(
             w.ga.recs.len(),
@@ -5397,7 +5595,7 @@ mod tests {
     #[ignore = "見張りのスレッド・偽サーバー・本物の UDP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
     fn a_spectator_picks_a_random_match_from_the_list_and_follows_the_hosts_match() {
         let w = watch_through(false, true, 420, 40);
-        // 観戦者の列がホスト（と対戦者）の列と全行一致・状態の変わり目の順・ホストの名前が観戦者の左上の行の材料になる。
+        // 観戦者の列がホスト（と対戦する側）の列と全行一致・状態の変わり目の順・ホストの名前が観戦者の左上の行の材料になる。
         assert_watched3(&w, 420);
         assert_eq!(w.counts.wrong_role, 0, "配る側が先にいたのに役が逆になった");
         let row = w.picked.expect("一覧から行を選んでいない");
@@ -5425,9 +5623,9 @@ mod tests {
         assert!(!low.contains(q.spectate_of().as_str()), "{}", w.logs);
     }
 
-    /// 観戦コードの組み上がり: ルームサーバーの無い設定（オフラインの LAN の会場）で、対戦者 2 台が接続コード（コード作成・コード入力）で繋がり、
-    /// つながった後に両者が「観戦コードをコピー」を頼む。ホストだけがクリップボードへ観戦コードを書き、観戦者（偽のゲーム ＋ 本物の
-    /// `WatchPlay` ＋ 観戦者のスレッドの観戦コードの経路）はそのコードだけでホストへ繋ぎ、最初のキャラ選択から最後まで対戦者と同じ列を受ける。
+    /// 観戦コードの組み上がり: ルームサーバーの無い設定（オフラインの LAN の会場）で、対戦する 2 台が接続コード（コード作成・コード入力）で接続、
+    /// 接続した後に両者が「観戦コードをコピー」を頼む。ホストだけがクリップボードへ観戦コードを書き、観戦者（偽のゲーム ＋ 本物の
+    /// `WatchPlay` ＋ 観戦者のスレッドの観戦コードの経路）はそのコードだけでホストへ接続し、最初のキャラ選択から最後まで対戦する側と同じ列を受ける。
     #[test]
     #[ignore = "見張りのスレッド・本物の UDP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
     fn a_spectator_follows_a_code_match_with_only_the_hosts_watch_code() {
@@ -5515,6 +5713,7 @@ mod tests {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let glyphs = ui_glyphs();
@@ -5617,7 +5816,7 @@ mod tests {
         drop(wnet);
         let _ = wrecv.stop();
 
-        // 対戦と観戦の列: 観戦者はホストの最初のキャラ選択から最後まで、対戦者と同じ列を受けた。
+        // 対戦と観戦の列: 観戦者はホストの最初のキャラ選択から最後まで、対戦する側と同じ列を受けた。
         assert_eq!(
             ga.recs.len(),
             FRAMES as usize,
@@ -5707,12 +5906,12 @@ mod tests {
         );
         assert!(!logs.contains(&watch_code[..40]), "{logs}");
         assert!(
-            logs.contains("観戦コードをクリップボードへコピーした"),
+            logs.contains("観戦コードをクリップボードへコピーしました"),
             "{logs}"
         );
-        assert!(logs.contains("ゲストなのでコピーしない"), "{logs}");
+        assert!(logs.contains("このマッチのゲストです"), "{logs}");
         assert!(
-            join_line.contains("観戦コードでホストへ直に繋ぐ"),
+            join_line.contains("観戦コードでホストへ直に接続する"),
             "{join_line}"
         );
         for o in [oa, ob] {
@@ -5756,7 +5955,7 @@ mod tests {
     #[ignore = "見張りのスレッド・偽サーバー・本物の UDP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
     fn a_random_match_host_does_not_list_when_only_the_guest_disables_spectate() {
         let srv = FakeServer::start();
-        // A（nonce の大きい側 = ホスト）だけが `[spectate] enable = 1`。ゲストの HELLO の印で、ホストは載せず配る側も起こさない。
+        // A（nonce の大きい側 = ホスト）だけが `[spectate] enable = 1`。ゲストの HELLO の印で、ホストは載せず配る側も開始しない。
         let (logs, _, _, listed) = play_two_games_with(
             &srv,
             "[spectate]\nenable = 1\n",
@@ -5766,7 +5965,7 @@ mod tests {
         );
         // ホストが決める所を通った（通らずに載らなかったのではない）。
         assert!(
-            logs.contains("ランダムマッチの相手が一覧に載せない設定"),
+            logs.contains("このマッチは観戦を受け付けていません"),
             "{logs}"
         );
         assert!(listed.is_empty(), "ゲストが断ったのに載った: {listed:?}");
@@ -5781,6 +5980,6 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
-        assert!(!logs.contains("観戦の配る側を起こした"), "{logs}");
+        assert!(!logs.contains("観戦の受付を作りました"), "{logs}");
     }
 }

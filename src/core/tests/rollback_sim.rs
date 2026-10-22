@@ -1,15 +1,12 @@
 //! rollback の状態機械（`src/core/src/rollback.rs`）の検査。
-//!
-//! - **偽のゲーム**（`FakeGame`）: 入力の履歴で決まる状態（ハッシュの鎖・ライフ・一時停止）、コピー 1 枠と書き戻し、
-//!   「ライフが 0 になったら次の場面の要求が立ち、更新の列が変わる」場面の境目、一時停止（走査は進まないが入力は読む tick）、
+//! - **偽のゲーム**（`FakeGame`）: 入力の履歴で決まる状態、コピー 1 枠と書き戻し、ライフ 0 で更新の列が変わる場面の境目、一時停止（走査は進まないが入力は読む tick）、
 //!   状態の外の欄（つなぎ・場面の要求。書き戻しで戻す）、戻せない副作用、進め直しの間の出力（SE の数）。
-//! - **偽のネットワーク**（`run`）: 1 ms 刻みの時計、片道の遅れ、決め打ちの列と固定 seed の乱れ（落とす・遅らせる・重ねる）。
-//!   送るものは wire の encode → decode を通す。両端に rollback の状態機械 ＋ 偽のゲーム（片端を delay 方式にした形も）。
-//! - **参照**（`reference`）: 同じ入力を本物の `Lockstep`（delay 方式）で回した実行。合格は、rollback の両端が流した確定の
-//!   (seg, frame, p1, p2) の列と、30 フレームごとの確定の始まりの状態（CHECK の値）が参照と一致すること。
+//! - **偽のネットワーク**（`run`）: 1 ms 刻みの時計、片道の遅れ、決め打ちの列と固定 seed の乱れ（落とす・遅らせる・重ねる）。送るものは wire の encode → decode を通す。
+//!   両端は rollback の状態機械 ＋ 偽のゲーム（片端を delay 方式にした形も）。
+//! - **参照**（`reference`）: 同じ入力を本物の `Lockstep`（delay 方式）で回した実行。合格は、rollback の両端が流した確定の (seg, frame, p1, p2) の列と、
+//!   30 フレームごとの確定の始まりの状態（CHECK の値）が参照と一致すること。
 //!
-//! 期待値は参照の実行から取る（rollback の式から作らない）。式の検査（⑤）は、ゲームの側が数えた更新・コピー・書き戻しの回数と、
-//! 状態機械の `stats()` と、参照の seg の長さを突き合わせる。
+//! 期待値は参照の実行から取る（rollback の式から作らない）。式の検査（⑤）は、ゲームの側が数えた更新・コピー・書き戻しの回数と、状態機械の `stats()`、参照の seg の長さを突き合わせる。
 
 use higanr_core::auth::{AuthKey, Secret};
 use higanr_core::check::is_check_frame;
@@ -382,7 +379,7 @@ struct SendInfo {
     from: usize,
     #[allow(dead_code)] // 乱れの決め方に使いたいとき用（いまは使う検査が無い）
     kind: Kind,
-    /// その送り手がその seg の INPUT を送った通し番号（0 から。前の seg のバックアップの返信は数えない）。乱れの決め方に使う。
+    /// その送り手がその seg の INPUT を送った通し番号（0 から。前の seg の INPUT への返信（バックアップ）は数えない）。乱れの決め方に使う。
     nth: u32,
     /// 送る INPUT の seg（前の seg のバックアップの返信ではその前の seg）。
     seg: u16,
@@ -425,7 +422,7 @@ struct Scenario {
     period_us: [u64; 2],
     life: u8,
     max_ms: u64,
-    /// 台ごとに、格子を寄せられるか（b-spin のウィンドウ = true、ゲーム自身の時計の全画面 = false）。寄せられる台は、枠の始まりで
+    /// 台ごとに、格子を寄せられるか（b-spin のウィンドウ = true、ゲーム自身の時計のフルスクリーン = false）。寄せられる台は、枠の始まりで
     /// `Rollback::glide_ppm_with(&glide_params)` が返した量だけ次の枠までの長さを変える。
     glide: [bool; 2],
     glide_params: GlideParams,
@@ -511,7 +508,7 @@ struct Node {
     /// そのうち、seg の始まりの 300 フレームを過ぎてからの数。
     sync_steps_steady: u32,
     since_sync: u32,
-    /// 取り合いの最悪: 直近 `RECENT_UPDATES` 更新の中の時刻合わせの待ちの数の、seg をまたいだ最大。数を出すだけで合否は付けない。
+    /// 台ごとの時刻合わせの待ちの最悪: 直近 `RECENT_UPDATES` 更新の中の時刻合わせの待ちの数の、seg をまたいだ最大。数を出すだけで合否は付けない。
     updates_run: u32,
     recent_waits: Vec<u32>,
     worst_recent_waits: u32,
@@ -692,7 +689,7 @@ fn game_period_us(m: u64) -> u64 {
     }
 }
 
-/// 取り合いの最悪を数える期間（更新の数。60 更新 = 約 1 秒）。
+/// 台ごとの時刻合わせの待ちの数の最大を数える期間（更新の数。60 更新 = 約 1 秒）。
 const RECENT_UPDATES: u32 = 60;
 
 fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
@@ -908,7 +905,7 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
                 n.sync_skip = false;
             }
             // 取得は枠の始まりに 1 回。ゲストは seg の D を知るまで断られるので、知るまでは毎 ms 試す（本物の dll は D 未定の間、入力を
-            // 読まずに待つ）。D 未定の間も 4 ms ごとに語 0 個の INPUT を送り直す。
+            // 読まずに待つ）。D 未定の間も相手へ 4 ms ごとに語 0 個の INPUT を送り直す。
             if matches!(n.phase, Phase::Play)
                 && !n.rb.captured()
                 && (new_slot || !n.rb.delay_known())
@@ -1163,7 +1160,7 @@ impl Totals {
     }
 }
 
-/// 出口の ①〜⑤。落ちたら `Err` に理由を返す（否定の検査が「落ちること」を確かめるため、assert にしない）。
+/// 出口の ①〜⑤。落ちたら `Err` に理由を返す（否定の検査が「落ちること」を検証するため、assert にしない）。
 fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), String> {
     let e = |m: String| Err(format!("[{label}] {m}"));
     if !out.finished {
@@ -1631,7 +1628,7 @@ fn rollback_and_delay_mode_peers_refuse_each_others_inputs() {
             rbs.config().role() == Role::Host,
             "swap={swap}: rollback のホストだけが lat を載せる"
         );
-        // delay 方式の端: lat 付き（ホストの rollback）は BadLat。lat 無し（ゲストの rollback）は普通に受かる（その向きは下で押さえる）。
+        // delay 方式の端が受けると、lat 付き（ホストの rollback）は BadLat。lat 無し（ゲストの rollback）は普通に受かる（その向きは下で押さえる）。
         if from_rb.lat.is_some() {
             assert_eq!(dl.on_input(&from_rb), RecvOutcome::BadLat, "swap={swap}");
         }
@@ -2251,7 +2248,7 @@ fn d_changes_mid_match_by_both_sides_match_the_schedule_reference() {
         }
     }
     // ゲストが R いっぱい先にいるネットワーク（時刻合わせを切り、ゲストが 400 ms 先に始める。R 16・片道 50 ms）: 予定が届くときゲストは
-    // F を過ぎて取っているので、受けた後の取得から替える。
+    // F を過ぎて取っているので、受けた後のゲストの取得から替える。
     for seed in [None, Some(3u64)] {
         let mut sc = mid_match_scenario(16, mid_match_presses());
         sc.cfg = [
@@ -2356,7 +2353,7 @@ fn a_guest_wish_is_clamped_by_the_host_and_expires_without_its_value() {
         out.nodes[0].rb.cur_delay(),
         "D が食い違う"
     );
-    // 取得 1 回に 1 通以上送るので、諦めるまでに WISH_FRAMES − 1 通以上。諦めた後は載せない（数が上限の数倍で止まる）。
+    // 取得 1 回に 1 通以上送るので、ゲストが要求を諦めるまでに WISH_FRAMES − 1 通以上。諦めた後は、ゲストが lat を載せない（数が上限の数倍で止まる）。
     let lim = u32::from(higanr_core::lockstep::WISH_FRAMES);
     assert!(with_lat >= lim - 1 && with_lat < 4 * lim, "{with_lat}");
 }
@@ -2782,6 +2779,7 @@ fn feed(rb: &mut Rollback, base: u32, ack: u32, words: &[u16]) {
         ack,
         base,
         lat: None,
+        stamp: higanr_core::wire::Stamp::NONE,
         count: words.len() as u8,
         words: w,
     };
@@ -3239,7 +3237,7 @@ fn predicted_share(n: &Node) -> (u32, u32) {
     )
 }
 
-/// 周期（µs）の組: 台 0 が速い。`fast` は 1 分で約 98 ms ずれる誇張、`real` は花映塚の全画面（ゲーム自身の時計 60.0146 fps）と
+/// 周期（µs）の組: 台 0 が速い。`fast` は 1 分で約 98 ms ずれる誇張、`real` は花映塚のフルスクリーン（ゲーム自身の時計 60.0146 fps）と
 /// ウィンドウ（60.000 fps）の差（実測、1 分に約 14.6 ms）に近い 4 µs の差、`same` は同じ速さ。
 const PERIODS: [(&str, [u64; 2]); 3] = [
     ("fast", [16_640, 16_667]),

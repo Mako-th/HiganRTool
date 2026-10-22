@@ -1,6 +1,8 @@
 # HiganRTool
 
 <!-- zip:skip -->
+[![tests](https://github.com/Mako-th/HiganRTool/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Mako-th/HiganRTool/actions/workflows/tests.yml)
+
 [日本語](./README.md)
 <!-- /zip:skip -->
 
@@ -21,7 +23,7 @@ It also has rollback netcode, which earlier tools for this game did not have, so
 
 - **Random match**: Play someone who chose Random match at the same time, without deciding on a room name.
 - **Room match**: Both players enter the same room name to play. It works much like the rooms in Ju.N.Owen.
-- **Spectating**: Watch a random match by choosing it from the list, or a room match by entering its room name. When the server is unavailable, you can also watch with a watch code from the host. Up to 10 people can watch. Spectators who join mid-match catch up from the start of the match in fast-forward.
+- **Spectating**: Watch a random match by choosing it from the list, or a room match by entering its room name. When the server is unavailable, you can also watch with a watch code from the host. Up to 10 people can watch. When there are many spectators, a spectator relays the match to other spectators. Spectators who join mid-match catch up from the start of the match in fast-forward.
 - **Connection codes**: If rooms are not available, you can connect by sending connection codes to each other over Discord or similar. This works like Pure P2P in Ju.N.Owen.
 - **LAN**: Play someone on the same LAN. Spectating is also possible. It also works over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
 - **Rollback netcode**: When the opponent's input is late, the game predicts it and keeps going, and goes back and re-runs the frames if the prediction was wrong. It rarely stops even on an unstable connection, and you can play with about 1-2 frames (F) less delay than with adonis. You can also switch to the delay netcode, which waits for the opponent's input like adonis.
@@ -146,7 +148,7 @@ Use it at an offline venue, or for two PCs joined by a LAN cable.
    The address you entered last time is remembered.
 3. When connected, a sound plays (→ "After connecting").
 
-Only the first player to join is accepted.
+The host accepts only the first player to join.
 With different hosts, any number of pairs can play on the same LAN at the same time (an experimental feature, not checked on real machines).
 
 **Notes**
@@ -158,8 +160,8 @@ With different hosts, any number of pairs can play on the same LAN at the same t
 
 LAN play and spectating also work over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
 After both players join the same network, connect with the same steps as above.
-On the host's screen, VPN addresses carry the tool's name, as in `26.12.34.56:17723 (Radmin)`.
-Tell your opponent the address with the name of the tool you both use.
+On the host's screen, an address on the VPN carries the name of the VPN you use, as in `26.12.34.56:17723 (Radmin)`.
+Tell your opponent the address with the name of the VPN you both use.
 When the VPN tool connects through its relay, the delay increases by that much.
 Windows may treat the VPN network as public. Then also allow "Public networks" in the firewall prompt for `th09.exe` (→ "Troubleshooting").
 
@@ -170,23 +172,28 @@ Windows may treat the VPN network as public. Then also allow "Public networks" i
 - To disconnect, press Cancel on the Match Mode or difficulty screen and choose "Yes".
 - When you choose "Save replay and quit" at the end of a match, the connection ends (the replay is already saved automatically).
 - When the connection closes after a match, you return to 妖怪 対 妖怪 on the title screen. To connect again, choose it there.
-- If the opponent does not respond for 60 seconds, the connection is closed (your game does not stay frozen either).
+- If the opponent does not respond for 60 seconds, the tool closes the connection (your game does not stay frozen either).
 - When the opponent stops responding for about 2 seconds, "Waiting for the opponent" appears at the top left. Hold Esc for 3 seconds while it is shown to disconnect yourself.
 
 ### During a match
 
-- **Change the delay**: Ctrl+number key on the top row. 0-8 set the value and 9 sets auto. Both players can change it at any time.
-- **Change the netcode**: Ctrl+Tab on the character select screen. Both players can change it.
+- **Change the delay**: Ctrl+number key on the top row. 0-8 set the value and 9 sets auto. Either player can press it at any time to change the delay for both players.
+- **Change the netcode**: Ctrl+Tab on the character select screen. Either player can press it to change the netcode for both players.
 - **Copy the watch code**: Ctrl+C. The host presses it once the two players have connected. Whether it was copied is shown at the top left for a few seconds.
 - **Random character / map, skip dialogue**: Ctrl, or the skip button on a gamepad (as in the game). Ctrl+number and Ctrl+Tab also count as pressing Ctrl. If either player presses Ctrl, the dialogue is skipped for both.
 
 ### Spectating
 
 Up to 10 people can watch each random match and each room match.
-If you join mid-match, you catch up from the start of the match in fast-forward.
+If you join mid-match, you catch up from the start of the match in fast-forward (8x by default; the speed is `ff_max` under `[spectate]`).
 Spectators do not change the delay of the two players.
+In random matches and room matches, the host sends the match directly to basically up to 2 spectators, and the other spectators receive it from a spectator who relays it to them (when relaying is not possible, the host sends directly).
+When spectators relay to each other, the relaying spectator and the spectator receiving the relay can see each other's global IP addresses.
+If you do not want to relay, see "Do not relay while watching" under "Settings" below.
 If you watch a match to the end, the replay is saved on your side too.
-Press Esc to stop watching.
+Press Esc during a match to open the game's pause menu (when it cannot be opened, "Paused" is shown at the top left).
+To stop watching, hold Esc for 3 seconds.
+You can also stop watching with "Return to title" in the pause menu.
 To refuse spectators, see "Refuse spectators" under "Settings" below.
 
 **Random match**
@@ -264,9 +271,14 @@ Settings you change in the menu and the game location you choose are written to 
 `HiganRTool.ini` and the menu always show the same value; neither takes priority.
 For settings not in the menu, edit `HiganRTool.ini`.
 
-- **Lower the processing load**: Add `auto_window = b-hybrid` under `[pacing]` to cut the processing load to about a quarter, at the cost of a tiny bit more delay (about 0.2 ms).
-  Try this if you play in windowed mode while streaming, or when your PC is busy.
-- **Refuse spectators**: Both players set `enable = 0` under `[spectate]` (some spectating follows the host's setting, and which player is the host is not decided in advance). Random matches are not listed either.
+- **Cut the delay a little more**: Set `wait = active` under `[pacing]` to reduce the median delay by a tiny bit (about 0.2 ms), at the cost of about four times the processing load.
+  If you stream while playing or your PC is busy, keep the default `passive`.
+- **Turn on vsync**: With the default `vsync = off` under `[pacing]`, vsync is off and the tool keeps 60.000 fps. Set `on` to use vsync, or `game` to follow the custom.exe setting. The custom.exe setting is not rewritten.
+  The game never uses vsync in windowed mode, so only fullscreen changes.
+- **Refuse spectators**: Set `enable = 0` under `[spectate]`.
+  If either player has `0`, no match can be watched (random matches are not listed).
+- **Do not relay while watching**: Set `relay = 0` under `[spectate]`.
+  You no longer relay to other spectators. You may still receive the match from a relaying spectator.
 - **Turn off automatic updates**: Set `update_check = 0` under `[loader]`.
 
 **How to edit `HiganRTool.ini`**
@@ -300,16 +312,20 @@ All settings are listed in the table below.
 | | delay | Delay. `0`-`8` / `auto` (default; shared by rollback and the delay netcode) |
 | | host_seat | The Side. `1` / `2` (Any if there is no line) |
 | | rollback_hit_se | Hit sound with rollback. `confirmed` (only when confirmed; default) / `live` (already when predicted) |
+| | rollback_cutin_se | Cut-in sound with rollback. `confirmed` (only when confirmed; default) / `live` (already when predicted) |
 | | ipv6 | Whether to use IPv6. `on` (default) / `off` (do not use) |
 | | stun / stun2 | Servers asked for your outside address. Empty means no query |
 | | enable / scope / code_side / room_server / check | Basic network settings. Do not change |
 | | bind | The UDP port to listen on (default `auto:17723`; `auto:` tells the tool to pick your own address automatically). You may change it to a port you can open (forward). The two players do not need to use the same value |
-| | upnp | Whether to ask the router (UPnP) to open the bind port. `on` (default; only while waiting and during a match, closed afterwards) / `off` (do not use) |
-| [pacing] | mode | How frames advance. `auto` (in windowed mode, the tool keeps 60.000 fps) / `game` (left to the game) |
-| | auto_window | How the wait is done in windowed mode. `b-spin` (default) / `b-hybrid` (lighter processing load; see "Lower the processing load" above) |
+| | upnp | Whether to ask the router (UPnP) to open the listening port (`bind`). `on` (default; only while waiting, during a match and while relaying as a spectator, closed afterwards) / `off` (do not use) |
+| [pacing] | mode | How frames advance. `auto` (default; in windowed mode and in fullscreen without vsync, the tool keeps 60.000 fps) / `game` (left to the game) |
+| | wait | How the wait is done while the tool keeps 60.000 fps. `passive` (default; rests until just before each deadline, lighter processing load) / `active` (always busy-waits; see "Cut the delay a little more" above) |
+| | vsync | Vsync. `off` (default) / `on` / `game` (the custom.exe setting as is). Only fullscreen changes |
 | [replay] | enable | Automatic replay saving. `1` (save each match) / `0` (do not save). The save location is under "How it works", "Replays" |
 | | layout | How the save folder is split. `peer` (`<1P> vs <2P>` folders) / `date` (by date) / `flat` (not split) / `pack50` (50 per folder, with names you can copy straight into the game's `replay` folder) |
-| [spectate] | enable | Accept spectators. `1` (accept; default) / `0` (refuse). Room match, watch code and LAN spectating follow the host's value. Random matches are not listed if either player has `0` |
+| [spectate] | enable | Accept spectators. `1` (accept; default) / `0` (refuse). If either player has `0`, no match can be watched |
+| | relay | Relaying while watching. `1` (relay to other spectators; default) / `0` (do not relay). Used only when watching random matches and room matches |
+| | ff_max | Fast-forward speed when you join mid-match. `1`–`16` (times; default `8`) |
 | [window] | width / height | Window size in pixels of the game image |
 | | x / y | Position of the window's top-left corner (only when both are written) |
 | | titlebar | Frame and title bar. `1` (show) / `0` (hide) |
@@ -382,13 +398,13 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
 
 - **Impersonation**: All match traffic carries an authentication tag made with a secret key for each connection. If someone who does not know the connection code sends fake inputs or disconnects, they are dropped without being read.
 - **Contents**: The contents of match and spectator traffic (inputs and names) are encrypted with a one-time key made for each connection. Even the developer, who runs the room server, cannot read them.
-- **What your opponent sees**: Your global IP address (spectators see the host's; anyone can watch a random match from the list, so spectators you do not know can see it too). It is also inside the connection code. Play only with people you trust, and do not give connection codes or logs to people you do not know.
+- **What your opponent sees**: Your global IP address (in a match between the two players, each sees the other's; spectators see the host's; when spectators relay, the relaying spectator and the spectator receiving the relay see each other's; anyone can watch a random match from the list, so unknown spectators can see the host's too). It is also inside the connection code. Play only with people you trust, and do not give connection codes or logs to people you do not know.
 - **The room server**: Run by the developer on Cloudflare. It receives room names and connection codes over encrypted traffic (HTTPS), passes them to the other player and keeps no records. However, since connection codes pass through the server, the design cannot stop the server from handing over a fake code and sitting in between. If that worries you, send connection codes to each other by hand.
-- **UPnP**: While waiting and during a match only, the tool asks your home router to open the bind port (inside your home network only).
+- **UPnP**: Only while waiting, during a match and while relaying to other spectators, the tool asks your home router to open the listening port (`bind`) (only the router inside your home is asked).
   - It closes the port afterwards. If closing fails, the mapping expires after 1 hour.
-  - For routers that refuse mappings with a time limit, it asks for one without a limit. If the tool crashes then, a mapping named "HiganRTool" stays, but the next start takes it over and removes it when the tool next exits. You may also remove it by hand in the router settings.
+  - For routers that refuse mappings with a time limit, it asks for one without a limit. If the tool crashes then, a mapping named "HiganRTool" stays on the router, but the tool takes it over at the next start and removes it when the tool next exits. You may also remove it by hand in the router settings.
   - While open, traffic from outside can reach that port, but anything with a wrong authentication tag is dropped (→ "Impersonation"). To turn this off, set `upnp = off` in `HiganRTool.ini`.
-- **Outgoing queries**: Once per start, the update check (the room server, and the GitHub download source it points to; only a query is sent). On the first connection, one query each to STUN (Cloudflare and Google). Otherwise, if you only play without opening the menu, nothing is sent.
+- **Outgoing queries**: Once per start, the update check (the room server, and the GitHub download source it points to; only a query is sent). When connecting, one query each to STUN (Cloudflare and Google), repeated every 15 seconds until connected (if both players allow watching and you are the host, also during the match). Otherwise, if you only play without opening the menu, nothing is sent.
 - **Updates**: The hash list of the update files is signed by the developer. A list with a wrong signature, a version older than the current one, or a file whose hash (SHA-256) differs from the list is not used.
 
 
@@ -407,24 +423,26 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
 If you cannot connect, the cause and a number appear at the top left.
 
 A **symmetric NAT** is a router that uses a different outside port for each destination (common in university and company networks and some mobile connections).
-From behind this type of router, you cannot connect unless the other side's port is open.
+With this type of router you cannot open a port explicitly from your side, so you cannot connect unless the other side's port is open.
+If both players have IPv6, you can connect regardless of the NAT type (`ipv6` in `[netplay]` is `on` by default).
 
 1. **UDP packets from the opponent do not arrive, for an unknown reason**: Record detailed logs by following the steps under "Logs" below, try again, then both players attach the logs and tell the developer. You also see this when the network blocks UDP (some universities, etc.).
 2. **Your opponent is behind a symmetric NAT and your UPnP is not available**: Open your port. Do one of these:
    - (a) Turn on UPnP in the router settings (this also lets other apps in your home open ports).
    - (b) Forward a UDP port on the router and set `bind` in `HiganRTool.ini` to that number. Example: for `bind = auto:17723`, forward UDP 17723 to this PC. You may close it after playing.
 3. **You are behind a symmetric NAT**: It cannot be fixed on your side. Ask your opponent to do 2 (a) or (b). If your opponent is also behind a symmetric NAT, you cannot connect (same as 4).
-4. **Both players are behind symmetric NATs**: There is no way to connect directly. One of you should connect from another network (a home connection, etc.).
-5. **Packets arrive from the opponent but you cannot connect**: If one connection code is old, packets may arrive in one direction only. Both players choose "Stop waiting", and one creates a new code and sends it at once (in a room match or a random match, stop waiting and switch to "Create play code" under Connect code). If it still does not connect, send the logs as in 1.
+4. **Both players are behind symmetric NATs**: There is no way to connect directly over IPv4. If both players have IPv6, you can connect.
+   If not, one of you should connect from another network (a home connection, etc.), or both of you can join a virtual LAN and play over LAN (see "LAN").
+5. **Packets arrive from the opponent but you cannot connect**: If one connection code is old, packets may arrive in one direction only. Both players choose "Stop waiting", and one creates a new code and sends it to the opponent at once (in a room match or a random match, stop waiting first, then choose "Create play code" under Connect code). If it still does not connect, send the logs as in 1.
 
 
 ## Logs
 
 - Logs are kept in the `logs` folder, one file per day (`dll_YYYYMMDD.log`). Starting several times on the same day adds to the same file, with a "==== 起動 ..." line at each start. Files older than 3 days are deleted automatically.
-- Send only that day's `dll_YYYYMMDD.log` (normally the brief log, just this one file).
+- Send only that day's `dll_YYYYMMDD.log` to the developer (normally the brief log, just this one file).
 - If the game crashes at start-up or the window closes immediately, also attach `loader_YYYYMMDD.log` (a record of the start-up steps) from the `logs` folder.
 - Only when asked for a detailed record, change `detail = 0` under `[log]` in `HiganRTool.ini` to `detail = 1` (in an old `HiganRTool.ini` without `[log]`, add the two lines `[log]` and `detail = 1`), and play again.
-  Also send the file ending in `_net_frames.csv.gz` (`_watch_frames.csv.gz` when watching). This file gets a separate name for each start. Send the .gz as it is, without opening it.
+  Also send the file ending in `_net_frames.csv.gz` (`_watch_frames.csv.gz` when watching) to the developer. This file gets a separate name for each start. Send the .gz as it is, without opening it.
 - Logs do not contain names, Windows user names or raw IP addresses (only the kind of IP, such as "outside" or "home", and port numbers). Even so, please send them only as part of a bug report (contacts are in "Troubleshooting"), and avoid posting them as-is where anyone can see them.
 
 
@@ -487,7 +505,9 @@ Rename them to `HiganRTool.exe` and `HiganRTool.dll` and put them in the same fo
 
 - Your own builds cannot connect to the released zip (the build number is compared before connecting). Your own builds can connect to each other.
 - The room server (`src/server`) runs on Cloudflare Workers.
-- The tests in the source are run in the development environment (some data they read is not in this repository).
+- This repository runs tests with GitHub Actions on every push and pull request (the Rust tests, the release build and the server tests).
+  Some tests, such as verification on the actual game, run only in the development environment (the data they read is not in this repository).
+- Updates of dependencies (Rust crates, the server's npm packages and GitHub Actions) are checked weekly by Dependabot and are taken in after the tests pass.
 <!-- /zip:skip -->
 
 

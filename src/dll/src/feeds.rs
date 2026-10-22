@@ -1,12 +1,9 @@
-//! feed の記録（リングバッファ）と、読み取りのスレッドでの確かめ（pure）。
+//! feed の記録（リングバッファ）と、読み取りのスレッドでのチェック（pure）。
 //!
-//! ゲームのスレッド（`script_win::script_on_tick`）は、台本で feed した tick ごとに、feed の前と後の InputManager 3 本の
-//! `+0x00`〜`+0x29`（0x2A バイト）を、tick の番号・段階・p1・p2・ローカル入力と一緒にこのリングバッファへ 1 件書く（書き手はゲームのスレッド
-//! だけ）。読み取りのスレッドは、「前」を模型（`higanr_core::input_model`）で feed した結果と「後」を 3 本とも欄ごとに比べ、
-//! 続けて feed した 2 件では「前の件の後」と「次の件の前」も比べる（間にゲームが書いていないか）。
-//!
-//! リングバッファの書き方と読み方は tick のリングバッファ（`stub.rs`）と同じ seqlock: 札を 0 → 中身 → 札 = 番号 + 1 の順に書き、読み手は札・中身・札の
-//! 順に読み、2 回の札がどちらも番号 + 1 のときだけ採る。書き手（`FeedRing::push`）は確保もパニックもしない。
+//! ゲームのスレッド（`script_win::script_on_tick`）は、台本で feed した tick ごとに、feed の前と後の InputManager 3 本の `+0x00`〜`+0x29`（0x2A バイト）を、
+//! tick の番号・段階・p1・p2・ローカル入力と一緒にこのリングバッファへ 1 件書く（書き手はゲームのスレッドだけ）。
+//! 読み取りのスレッドは、「前」を模型（`higanr_core::input_model`）で feed した結果と「後」を 3 本とも欄ごとに比べ、続けて feed した 2 件では「前の件の後」と「次の件の前」も比べる（間にゲームが書いていないか）。
+//! 書き方と読み方は tick のリングバッファ（`stub.rs`）と同じ seqlock: 札を 0 → 中身 → 札 = 番号 + 1 の順に書き、読み手は札・中身・札の順に読んで 2 回の札がどちらも番号 + 1 のときだけ採る。書き手（`FeedRing::push`）は確保もパニックもしない。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -49,7 +46,7 @@ pub struct FeedRecord {
     pub step: u16,
     pub p1: u16,
     pub p2: u16,
-    /// ローカル入力の下位 16 ビット（記録だけ。feed しない）。台本だけの実行では `0x0042BE40` の読み。
+    /// ローカル入力の下位 16 ビット（記録だけ。feed しない）。台本だけの実行では DLL が `0x0042BE40` で読んだ値。
     pub local: u16,
     pub before: [[u8; IM_BYTES]; 3],
     pub after: [[u8; IM_BYTES]; 3],
@@ -195,7 +192,7 @@ pub fn drain_feeds(
     }
 }
 
-// ---- 確かめ ----
+// ---- チェック ----
 
 /// 比べる欄の数（cur・prev・リピート・押した瞬間・離した瞬間・カウンタ 16 個。0x2A バイトを全部覆う）。
 pub const FIELD_COUNT: usize = 5 + 16;
@@ -289,7 +286,7 @@ pub enum Cont {
     Pair([u32; 3]),
 }
 
-/// 1 件の確かめの結果。`im[i]` は、InputManager `[i]` の「前を模型で feed した結果」と「後」で違う欄。
+/// 1 件のチェックの結果。`im[i]` は、InputManager `[i]` の「前を模型で feed した結果」と「後」で違う欄。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckRow {
     pub im: [u32; 3],
@@ -389,7 +386,7 @@ impl FeedChecker {
     pub fn write_summary(&self, out: &mut dyn Write, lost: u64) {
         let _ = writeln!(
             out,
-            "feed の確かめ: リングバッファから読んだ件 {}（台本で feed した tick）、3 本とも一致 {} 件 / 食い違いのあった件 {} 件、リングバッファの読み落とし {} 件",
+            "feed の検証: リングバッファから読んだ件 {}（台本で feed した tick）、3 本とも一致 {} 件 / 食い違いのあった件 {} 件、リングバッファの読み落とし {} 件",
             self.records,
             self.records - self.mismatched_records,
             self.mismatched_records,
@@ -398,7 +395,7 @@ impl FeedChecker {
         for (i, name) in ["im0（1P）", "im1（2P）", "im2（合成）"].iter().enumerate() {
             let _ = writeln!(
                 out,
-                "feed の確かめ: {name} の食い違い 合計 {}{}",
+                "feed の検証: {name} の食い違い 合計 {}{}",
                 self.mismatch[i].iter().sum::<u64>(),
                 counts_text(&self.mismatch[i])
             );

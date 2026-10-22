@@ -1,11 +1,8 @@
-//! 開発の形で、`build\bin\` の成果物がソースより古ければ起動を断る（建て直さずに古い DLL で実機を起こす取り違えを止める）。
-//!
-//! - 開発の形 = この exe が `<R>\build\bin\` にあり、`<R>\Cargo.toml` と `<R>\src\` があるとき。配る形では何も調べない。
-//! - 比べるソースは、cargo が成果物の隣に書く dep-info（`<出力>.d`）から取る。`src\` を歩くと、`#[cfg(test)]` の中だけの
-//!   ファイルを変えても cargo は DLL を作り直さず、build.bat を回しても直らない断りになる。Cargo.toml / Cargo.lock も同じ理由で見ない。
-//! - 相手は `build\bin\` の成果物の更新時刻（build.bat の `copy` は時刻を保つ）。
-//! - dep-info が無い・読めない・崩れているときは**断る**。通すと「ソース 0 本 ⇒ 新しいものは無い」の合格になり、ガードが黙って効かなくなる。
-//! - 抜け道の引数は作らない。古い成果物で起こしたいときは `build\bin\` の外へコピーする。
+//! 開発の形で、`build\bin\` の成果物がソースより古ければ起動を断る（建て直さずに古い DLL で実機を起動する取り違えを止める）。
+//! 開発の形 = この exe が `<R>\build\bin\` にあり、`<R>\Cargo.toml` と `<R>\src\` があるとき。配る形では何も調べない。
+//! 比べるソースは cargo が成果物の隣に書く dep-info（`<出力>.d`）から取り、相手は成果物の更新時刻とする。
+//! dep-info が無い・読めない・崩れているときは**断る**（通すと「ソース 0 本 ⇒ 新しいものは無い」で合格し、ガードが効かなくなる）。
+//! 抜け道の引数は作らない。古い成果物で起動したいときは `build\bin\` の外へコピーする。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -196,7 +193,7 @@ fn check_one(root: &Path, artifact: &Path, dep_info: &Path) -> Result<(), Stale>
         path: artifact.to_path_buf(),
         why: e.to_string(),
     })?;
-    // 相対パスは `<R>` 基準に直す（`build.dep-info-basedir` を置いたときの形）。
+    // 相対パスは `<R>` 基準に直す（`build.dep-info-basedir` を指定したときの形）。
     let sources: Vec<(PathBuf, Option<SystemTime>)> = deps
         .into_iter()
         .map(|p| if p.is_absolute() { p } else { root.join(p) })

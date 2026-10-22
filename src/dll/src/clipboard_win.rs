@@ -1,9 +1,7 @@
 //! 本物のクリップボード（Win32）。ゲームの中のメニューが接続コードをコピーする・貼るときだけ、見張りのスレッドから呼ぶ。
-//! unsafe はこのファイルだけ。形式は `CF_UNICODETEXT`（UTF-16。値 13）。ウィンドウの持ち主は付けない（`OpenClipboard(NULL)`）ので、
-//! 他のプロセスのウィンドウ・入力・前面には触らない。
-//!
+//! unsafe はこのファイルだけ。形式は `CF_UNICODETEXT`（UTF-16）。ウィンドウの持ち主は付けず（`OpenClipboard(NULL)`）、他のプロセスのウィンドウ・入力・前面には触らない。
 //! 別のアプリが開いている間は `OpenClipboard` が失敗するので、数回だけ短く待ち直す。
-//! 変換は pure な関数に分けて検査する。本物のクリップボードを呼ぶ検査は書かない（利用者のクリップボードを書き換えるため）。
+//! 変換は pure な関数に分けて検査する（本物を呼ぶ検査は利用者のクリップボードを書き換えるので書かない）。
 
 use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::System::DataExchange::{
@@ -49,7 +47,7 @@ impl Open {
                 std::thread::sleep(OPEN_GAP);
             }
         }
-        Err("クリップボードを開けなかった（別のアプリが使っている）".to_string())
+        Err("クリップボードを開けませんでした（別のアプリが使用中）".to_string())
     }
 }
 
@@ -78,7 +76,7 @@ impl Clipboard for SystemClipboard {
         let p = unsafe { GlobalLock(h) }.cast::<u16>();
         if p.is_null() {
             return Err(
-                "クリップボードの文字列を固定できなかった（GlobalLock が NULL）".to_string(),
+                "クリップボードの文字列を固定できませんでした（GlobalLock が NULL）".to_string(),
             );
         }
         // SAFETY: 同上。
@@ -100,7 +98,8 @@ impl Clipboard for SystemClipboard {
         let h = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
         if h.is_null() {
             return Err(
-                "クリップボードに置く入れ物を取れなかった（GlobalAlloc が NULL）".to_string(),
+                "クリップボードに入れるメモリを確保できませんでした（GlobalAlloc が NULL）"
+                    .to_string(),
             );
         }
         // SAFETY: 今取った `h` を固定する。
@@ -109,7 +108,8 @@ impl Clipboard for SystemClipboard {
             // SAFETY: 誰にも渡していない `h` を返す。
             unsafe { GlobalFree(h) };
             return Err(
-                "クリップボードに置く入れ物を固定できなかった（GlobalLock が NULL）".to_string(),
+                "クリップボードに入れるメモリを固定できませんでした（GlobalLock が NULL）"
+                    .to_string(),
             );
         }
         // SAFETY: `p` は `bytes` バイト書ける。`wide` と重ならない。
@@ -120,7 +120,7 @@ impl Clipboard for SystemClipboard {
         if unsafe { EmptyClipboard() } == 0 {
             // SAFETY: 渡していない `h` を返す。
             unsafe { GlobalFree(h) };
-            return Err("クリップボードを空にできなかった（EmptyClipboard が 0）".to_string());
+            return Err("クリップボードを空にできませんでした（EmptyClipboard が 0）".to_string());
         }
         // SAFETY: `h` は `CF_UNICODETEXT` の形（0 で終わる UTF-16）を入れた全域メモリ。成功したら持ち主はクリップボードになり、こちらは触らない。
         // 失敗したらこちらのものなので返す。
@@ -129,7 +129,7 @@ impl Clipboard for SystemClipboard {
             // SAFETY: 渡せなかった `h` を返す。
             unsafe { GlobalFree(h) };
             return Err(
-                "クリップボードへコピーできなかった（SetClipboardData が NULL）".to_string(),
+                "クリップボードへコピーできませんでした（SetClipboardData が NULL）".to_string(),
             );
         }
         Ok(())

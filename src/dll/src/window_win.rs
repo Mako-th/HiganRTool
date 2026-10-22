@@ -1,15 +1,11 @@
-//! ウィンドウモードのウィンドウを作る呼び出し（`CreateWindowExA`。`0x42D5C2`）の差し替え。ini の `[window]` でウィンドウの大きさ・位置・タイトルバー・最前面を
-//! 決める。作り方は「ウィンドウだけ大きくする」: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。アドレスと期待バイト列は
-//! `th09_addr.rs` の「ウィンドウを作る呼び出し」の節、読みと計算は `higanr_core::window_size`（pure）。
+//! ウィンドウモードのウィンドウを作る呼び出し（`CreateWindowExA`。`0x42D5C2`）の差し替え。ini の `[window]` でウィンドウの大きさ・位置・タイトルバー・最前面を決める。
+//! 作り方は「ウィンドウだけ大きくする」: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。アドレスと期待バイト列は `th09_addr.rs` の「ウィンドウを作る呼び出し」の節、読みと計算は `higanr_core::window_size`（pure）。
 //!
-//! **時期**: 差し替えは DllMain の中（`win::on_process_attach`）で書く。ローダーは `CREATE_SUSPENDED` で作ったゲームに `LoadLibraryW` を
-//! 呼ばせてから `ResumeThread` するので、ゲームのメインスレッドはウィンドウを作る地点まで一歩も走っていない（読み取りのスレッドが置く他のフックは
-//! ウィンドウに間に合う保証が無いので、ここだけ別にした）。DllMain はローダーロックの下なので **ini はここで読まない**: 差し替えた関数が最初に
-//! 呼ばれたとき（ウィンドウを作る前の 1 回）に読む。マッチ中に走るコードは無い。
+//! **時期**: 差し替えは DllMain の中（`win::on_process_attach`）で書く。ローダーは `CREATE_SUSPENDED` で作ったゲームに `LoadLibraryW` を呼ばせてから `ResumeThread` するので、ゲームのメインスレッドはウィンドウを作る地点まで走っていない（読み取りのスレッドが書く他のフックはウィンドウに間に合う保証が無いので、ここだけ別にした）。
+//! DllMain はローダーロックの下なので **ini はここで読まない**: 差し替えた関数が最初に呼ばれたとき（ウィンドウを作る前の 1 回）に読む。マッチ中に走るコードは無い。
 //!
-//! 書く前に、地点の前後 49 バイトを実バイトで照合し、1 バイトでも違えば何も書かない。ini が無い・`[window]` が無い・読めない値のときは、
-//! 差し替えた関数は元の `CreateWindowExA` へ引数をそのまま渡すだけ。ログの行は `main_log::push` で頼む（別のファイルは作らず、ファイルを
-//! 開かない・書かないので DllMain の中でもゲームのメインスレッドでも待たない）。行は設置 1・設定 1・ウィンドウを作った結果 1。
+//! 書く前に、地点の前後 49 バイトを実バイトで照合し、1 バイトでも違えば何も書かない。ini が無い・`[window]` が無い・読めない値のときは、差し替えた関数は元の `CreateWindowExA` へ引数をそのまま渡すだけ。
+//! ログの行は `main_log::push` で頼む（ファイルを開かない・書かないので、DllMain の中でもゲームのメインスレッドでも待たない）。行は設置 1・設定 1・ウィンドウを作った結果 1。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -56,7 +52,7 @@ type CreateWindowFn = unsafe extern "system" fn(
     *const c_void,
 ) -> *mut c_void;
 
-/// 自分の DLL のハンドル（DllMain が置く。ini の置き場 = DLL のフォルダを引くため）。
+/// 自分の DLL のハンドル（DllMain が保存する。ini の場所 = DLL のフォルダを引くため）。
 static MODULE: AtomicUsize = AtomicUsize::new(0);
 
 /// ini から読んだ設定（初めて呼ばれたときに 1 回だけ読む）。`None` は「ウィンドウは今のまま」。
@@ -70,7 +66,7 @@ thread_local! {
     static TEST_SKIP_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 検査だけ: この検査のスレッドが頼んだ行（本ログの待ち行列は全検査で 1 つなので、行の中身はこちらで見る）。
     static TEST_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// 検査だけ: 本物の待ち行列にも頼むか（行の数に上限があるので、本物へ届くことを確かめる 1 本だけが立てる）。
+    /// 検査だけ: 本物の待ち行列にも頼むか（行の数に上限があるので、本物へ届くことを検証する 1 本だけが立てる）。
     static TEST_TO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -126,9 +122,9 @@ pub fn install(module: HMODULE) {
 fn install_line(r: std::thread::Result<Result<String, String>>) -> String {
     let summary = match r {
         Ok(Ok(s)) => s,
-        Ok(Err(why)) => format!("差し替えない（ウィンドウは今のまま）: {why}"),
+        Ok(Err(why)) => format!("非差し替え（ウィンドウは今のまま）: {why}"),
         Err(_) => {
-            "パニックを受けた（ウィンドウは今のまま。書いたかどうかは分からない）".to_string()
+            "パニックを受けました（ウィンドウは今のまま。書いたかどうかは分からない）。".to_string()
         }
     };
     format!("設置: {summary}")
@@ -139,7 +135,7 @@ fn entry_address() -> u32 {
 }
 
 /// `site` の範囲を読んで期待バイト列と照合し、全部合ったときだけ、`site.addr + call_off` の 6 バイト（`FF 15 abs32`）を
-/// `E8 rel32 90`（`target` への call）に替える。書いた後に読み直して確かめる。書かなかったときは理由を `Err` で返す。
+/// `E8 rel32 90`（`target` への call）に替える。書いた後に読み直して検証する。書かなかったときは理由を `Err` で返す。
 fn install_at(
     env: &mut dyn HookEnv,
     site: &SiteDef,
@@ -149,14 +145,14 @@ fn install_at(
     let mut seen = vec![0u8; site.expected.len()];
     if !env.read_code(site.addr, &mut seen) {
         return Err(format!(
-            "{:#010X} から {} バイトを読めない（th09.exe が無いプロセス？）",
+            "{:#010X} から {} バイトの読み取り不能（th09.exe のないプロセスの可能性）",
             site.addr,
             seen.len()
         ));
     }
     patch::verify(&seen, site.expected).map_err(|e| {
         format!(
-            "{:#010X} の命令が期待と違う（{e:?}）。別のバージョンの th09.exe か、vpatch の [Window] enabled がこの地点を書き換えている",
+            "{:#010X} の命令が期待と不一致（{e:?}）。別のバージョンの th09.exe か、vpatch の [Window] enabled がこのフック地点を書き換えています",
             site.addr
         )
     })?;
@@ -164,15 +160,15 @@ fn install_at(
     let new = window_size::call_patch(at, target);
     let done = env
         .write_code(at, &new)
-        .map_err(|code| format!("{at:#010X} へ書けない（GetLastError = {code}）"))?;
+        .map_err(|code| format!("{at:#010X} へ書き込み不能（GetLastError = {code}）"))?;
     let mut back = [0u8; 6];
     if !env.read_code(at, &mut back) || back != new {
         return Err(format!(
-            "{at:#010X} へ書いた後の読み直しが合わない: {back:02X?}"
+            "{at:#010X} へ書いた後の読み直しが不一致: {back:02X?}"
         ));
     }
     Ok(format!(
-        "{at:#010X} の call *{WINDOW_CREATE_IAT:#010X} を {target:#010X} への call に差し替えた（保護を戻せた: {}、命令キャッシュを流せた: {}）",
+        "{at:#010X} の call *{WINDOW_CREATE_IAT:#010X} を {target:#010X} への call に差し替えました（保護を戻せた: {}、命令キャッシュを流せた: {}）",
         done.protect_restored, done.flushed
     ))
 }
@@ -197,7 +193,7 @@ fn config() -> Option<WindowConfig> {
     *CONFIG.get_or_init(load_config)
 }
 
-/// 検査だけが置く設定（製品のビルドでは常に `None` で、呼びは消える）。
+/// 検査だけが指定する設定（製品のビルドでは常に `None` で、呼びは消える）。
 #[cfg(test)]
 fn test_config() -> Option<Option<WindowConfig>> {
     TEST_CONFIG.with(|c| c.get())
@@ -219,44 +215,55 @@ fn load_config() -> Option<WindowConfig> {
     let text = match host.read_net_ini() {
         Ok(Some(t)) => t,
         Ok(None) => {
-            log_detail(format!("ini が無い（{origin}）。ウィンドウは今のまま"));
+            log_detail(format!(
+                "ini がありません（{origin}）。ウィンドウは今のままです"
+            ));
             return None;
         }
         Err(why) => {
-            log(format!("ini を読めない（{why}）。ウィンドウは今のまま"));
+            log(format!(
+                "ini 読み込み不能（{why}）。ウィンドウは今のままです。"
+            ));
             return None;
         }
     };
     let ini = match higanr_core::ini::parse(&text) {
         Ok(i) => i,
         Err(e) => {
-            log(format!("ini の書き方が違う（{e}）。ウィンドウは今のまま"));
+            log(format!(
+                "ini の書き方が違います（{e}）。ウィンドウは今のままです。"
+            ));
             return None;
         }
     };
     match window_size::from_ini(&ini) {
         Ok(None) => {
             log_detail(format!(
-                "ini（{origin}）に [window] が無い。ウィンドウは今のまま"
+                "ini（{origin}）に [window] がありません。ウィンドウは今のままです"
             ));
             None
         }
         Ok(Some(c)) => {
-            log_detail(format!("[window] を読んだ（{origin}）: {}", c.describe()));
+            log_detail(format!(
+                "[window] を読み込みました（{origin}）: {}",
+                c.describe()
+            ));
             Some(c)
         }
         Err(why) => {
-            log(format!("{why}。[window] は使わず、ウィンドウは今のまま"));
+            log(format!(
+                "{why}。[window] は使わずウィンドウは今のままです。"
+            ));
             None
         }
     }
 }
 
-/// 元の `CreateWindowExA`: 呼ぶ時点のゲームの IAT の値（他の道具が IAT を替えていてもそちらを通す）。読めない・どの
+/// 元の `CreateWindowExA`: 呼ぶ時点のゲームの IAT の値（他のツールが IAT を替えていてもそちらを通す）。読めない・どの
 /// モジュールにも入っていない値なら、この DLL が import した `CreateWindowExA`。
 #[cfg(test)]
 fn original() -> CreateWindowFn {
-    // 検査のプロセスの `0x48E1FC` は th09.exe の IAT ではない（読めても別の値）ので、読まずに置いた関数か import を使う。
+    // 検査のプロセスの `0x48E1FC` は th09.exe の IAT ではない（読めても別の値）ので、読まずに、検査が指定した関数か import を使う。
     TEST_ORIG.with(|c| c.get()).unwrap_or(CreateWindowExA)
 }
 
@@ -266,7 +273,7 @@ fn original() -> CreateWindowFn {
     if read_own_into(WINDOW_CREATE_IAT, &mut b) {
         let v = u32::from_le_bytes(b);
         if v != 0 && module_of_addr(v).is_some() {
-            // SAFETY: IAT の欄には、ローダーが user32 の `CreateWindowExA`（stdcall、12 引数）のアドレスを書いている。値はいずれかのモジュールの中のアドレスと確かめた。ゲーム自身が同じ欄を同じ型で呼んでいる。
+            // SAFETY: IAT の欄には、ローダーが user32 の `CreateWindowExA`（stdcall、12 引数）のアドレスを書いている。値はいずれかのモジュールの中のアドレスと検証した。ゲーム自身が同じ欄を同じ型で呼んでいる。
             return unsafe { core::mem::transmute::<usize, CreateWindowFn>(v as usize) };
         }
     }
@@ -290,7 +297,7 @@ fn decide(orig_style: u32) -> Option<Decision> {
     })
 }
 
-/// 決めた引数の一文。ウィンドウを作る前には書かず、作った結果（`after_create`）と同じ 1 行にまとめる（行を増やさない）。
+/// 決めた引数の一文。ウィンドウを作る前にはログへ書かず、作った結果（`after_create`）と同じ 1 行にまとめる（行を増やさない）。
 fn plan_text(d: &Decision) -> String {
     format!(
         "ゲームの style {:#010X} → {:#010X}、外寸 {}×{}、位置 {}",
@@ -345,7 +352,7 @@ extern "system" fn create_window_entry(
     if hwnd.is_null() {
         let plan = decision.map_or(String::new(), |d| format!("。計画: {}", plan_text(&d)));
         log(format!(
-            "ウィンドウを作れなかった（元の CreateWindowExA が NULL を返した）{plan}"
+            "作成不能（元の CreateWindowExA が NULL を返した）{plan}"
         ));
     } else if after_create_enabled() {
         let _ = catch_unwind(AssertUnwindSafe(|| match decision {
@@ -373,7 +380,7 @@ fn log_unchanged(hwnd: HWND) {
     // SAFETY: ウィンドウのハンドルと定数の索引だけを渡す。無効なら 0 が返る。
     let style = unsafe { GetWindowLongA(hwnd, GWL_STYLE) } as u32;
     log_detail(format!(
-        "ウィンドウを作った（設定なし。引数はそのまま）: style {style:#010X}、外 {:?}、client {:?}",
+        "ウィンドウを作成しました（設定なし。引数はそのまま）: style {style:#010X}、外 {:?}、client {:?}",
         window_rect(hwnd).as_ref().map(rect_size),
         client_size(hwnd)
     ));
@@ -402,10 +409,10 @@ fn after_create(hwnd: HWND, d: &Decision) {
     let style = unsafe { GetWindowLongA(hwnd, GWL_STYLE) } as u32;
     let client = client_size(hwnd);
     let outer = window_rect(hwnd);
-    // 1 回のウィンドウで 1 行にする。直し・最前面が失敗したら簡潔なログにも残す。
+    // 1 回のウィンドウで 1 行にする。外寸の直し（指定の client に合わせる）・最前面が失敗したら簡潔なログにも残す。
     let mut failed = false;
     let mut text = format!(
-        "ウィンドウを作った: {}。結果 style {style:#010X}、外 {:?}、client {:?}（指定 {}×{}）",
+        "ウィンドウを作りました: {}。結果 style {style:#010X}、外 {:?}、client {:?}（指定 {}×{}）",
         plan_text(d),
         outer.as_ref().map(rect_size),
         client,
@@ -429,7 +436,7 @@ fn after_create(hwnd: HWND, d: &Decision) {
         } != 0;
         failed |= !ok;
         text.push_str(&format!(
-            "。client が指定と違ったので外寸を {w}×{h} に直した（成功: {ok}）。直した後の client {:?}",
+            "。client が指定と違ったので外寸を {w}×{h} に直しました（成功: {ok}）。直した後の client {:?}",
             client_size(hwnd)
         ));
     }
@@ -447,7 +454,7 @@ fn after_create(hwnd: HWND, d: &Decision) {
             )
         } != 0;
         failed |= !ok;
-        text.push_str(&format!("。最前面にした（成功: {ok}）"));
+        text.push_str(&format!("。最前面にしました（成功: {ok}）"));
     }
     // 直しや最前面が失敗したときだけ簡潔にも残す。
     if failed {
@@ -545,7 +552,7 @@ mod tests {
             0x1234_5678,
         )
         .expect("全部合えば書く");
-        assert!(msg.contains("差し替えた"), "{msg}");
+        assert!(msg.contains("差し替えました"), "{msg}");
         let now = page.get(0, 49);
         assert_eq!(&now[..43], &ctx[..43]);
         let at = site.addr + 43;
@@ -598,7 +605,7 @@ mod tests {
     }
 
     /// 書き換えた機械語を呼べる形に組む。ゲームの `0x42D597` 以降と同じ並び（引数の積み込みと call）を、ebx = hInstance・
-    /// edi = 幅・eax = 高さ・ecx の元の値を置いてから実行し、戻ったあとで esi / ebx / edi が呼ぶ前と同じかを `flag` に残す。
+    /// edi = 幅・eax = 高さ・ecx の元の値を入れてから実行し、戻ったあとで esi / ebx / edi が呼ぶ前と同じかを `flag` に残す。
     fn build_harness(page: &Page, flag_addr: u32) -> usize {
         const EBX: u32 = 0xB1B1_B1B1;
         const ESI: u32 = 0xE5E5_E5E5;
@@ -634,7 +641,7 @@ mod tests {
     }
 
     fn run_harness(page: &Page) -> usize {
-        // SAFETY: `build_harness` が置いた機械語（cdecl の引数なし関数と同じ形で、戻り値は eax）を、確保した実行できる頁の
+        // SAFETY: `build_harness` が書いた機械語（cdecl の引数なし関数と同じ形で、戻り値は eax）を、確保した実行できる頁の
         // 先頭から呼ぶ。ebx / esi / edi は入口で保存して出口で戻す。
         let f: extern "C" fn() -> usize = unsafe { core::mem::transmute(page.0) };
         f()
@@ -826,7 +833,7 @@ mod tests {
         assert!(
             logged()
                 .iter()
-                .any(|l| l.contains("最前面にした（成功: true）")),
+                .any(|l| l.contains("最前面にしました（成功: true）")),
             "最前面の要求を出していない"
         );
         assert_eq!(
@@ -878,7 +885,7 @@ mod tests {
         assert!(
             logged()
                 .iter()
-                .any(|l| l.contains("外寸を 1001×563 に直した")),
+                .any(|l| l.contains("外寸を 1001×563 に直しました")),
             "直したことがログに残る: {:?}",
             logged()
         );
@@ -906,7 +913,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         let l = &lines[0];
         for want in [
-            "ウィンドウ: ウィンドウを作った: ",
+            "ウィンドウ: ウィンドウを作りました: ",
             "ゲームの style 0x000A0000 → ",
             "外寸 ",
             "位置 -30000,-30000",
@@ -959,7 +966,7 @@ mod tests {
         let lines = logged();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].contains("ウィンドウを作れなかった")
+            lines[0].contains("ウィンドウ: 作成不能（元の CreateWindowExA")
                 && lines[0].contains("計画: ゲームの style"),
             "{lines:?}"
         );
@@ -975,7 +982,7 @@ mod tests {
             .expect_err("読めないアドレスは断る");
         let line = install_line(Ok(Err(why.clone())));
         assert!(
-            line.starts_with("設置: 差し替えない（ウィンドウは今のまま）: ") && line.contains(&why),
+            line.starts_with("設置: 非差し替え（ウィンドウは今のまま）: ") && line.contains(&why),
             "{line}"
         );
         assert!(install_line(Ok(Ok("書いた".into()))).contains("書いた"));

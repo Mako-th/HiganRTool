@@ -5,7 +5,7 @@
 //! - ゲームのメモリの読み書きと保存関数の呼び出し（`RealSaveIo`）。保存関数は素のアセンブリの踏み台 `save_call` で呼ぶ: `call` の直前に、
 //!   ゲームの見積もりのループ（`0x00420CA0`）が読む 10 語を読んで記録し、そこへヘッダの本当の印を書いてから（自分のスタックの esp より下だけ）、
 //!   書いた後の 10 語で見積もりを計算して、要る上限より小さければ呼ばない
-//! - 保管庫のスレッド（`arm` が起こす）と、その Win32 のインターフェース（`RealVaultOs`: ゲームの exe のフォルダを読む・CP932 のパスを `CreateFileA` で
+//! - 保管庫のスレッド（`arm` が作る）と、その Win32 のインターフェース（`RealVaultOs`: ゲームの exe のフォルダを読む・CP932 のパスを `CreateFileA` で
 //!   開いて押さえたファイルと同じかを見る）
 
 #[cfg(not(target_arch = "x86"))]
@@ -60,18 +60,18 @@ use crate::trial_summary::ReplayFacts;
 use crate::win::{self, read_own_into, read_own_memory};
 use higanr_core::replay_rounds::Boundary;
 
-/// 自動保存が入っているか。0 から 1 にするのは `arm`（アドレスを置き、保管庫のスレッドを起こした後）、1 から 0 にするのはパニックを受けたとき。
+/// 自動保存が入っているか。0 から 1 にするのは `arm`（アドレスを保存し、保管庫のスレッドを作った後）、1 から 0 にするのはパニックを受けたとき。
 pub static ARMED: AtomicU32 = AtomicU32::new(0);
 pub static PANICKED: AtomicU32 = AtomicU32::new(0);
 pub static HANDOFF: Handoff = Handoff::new();
 /// ゲームのスレッドの状態。触るのはゲームのスレッドの `on_tick` だけ（`try_lock` で、取れなければ何もしない）。
 static DRIVER: Mutex<Driver> = Mutex::new(Driver::new());
-/// QueryPerformanceFrequency（`arm` が置く。0 なら所要は 0 と書く）。
+/// QueryPerformanceFrequency（`arm` が設定する。0 なら所要は 0 と書く）。
 static QPC_FREQ: AtomicU64 = AtomicU64::new(0);
 /// 今の seg（マッチ）で保存関数を呼んだか（`Driver::saved_this_seg` のコピー。`on_tick` が毎 tick 書く）。錠を取らずに読むためのコピー。
 static SEG_SAVED: AtomicU32 = AtomicU32::new(0);
 
-/// ゲームのスレッドが直に読むアドレス（`arm` が読めると確かめてから置く。検査では自分の静的変数）。
+/// ゲームのスレッドが直に読むアドレス（`arm` が読めると検証してから保存する。検査では自分の静的変数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveAddrs {
     pub supervisor: u32,
@@ -90,8 +90,8 @@ pub struct SaveAddrs {
     /// 1P・2P の Player へのポインタの欄、スコアを持つ塊へのポインタの欄（欄そのものは直に読み、先は落ちない読み方でたどる）。
     pub players: [u32; 2],
     pub stats: [u32; 2],
-    /// ゲームの設定の写しへのポインタの欄（`[欄]+0xB4` / `+0xB5` が生きた試合の 1P / 2P のチャージ型）。欄そのものは `arm` が読めると
-    /// 確かめ、先は落ちない読み方でたどる。
+    /// ゲームの設定のコピーへのポインタの欄（`[欄]+0xB4` / `+0xB5` が生きた試合の 1P / 2P のチャージ型）。欄そのものは `arm` が読めると
+    /// 検証し、先は落ちない読み方でたどる。
     pub options_copy: u32,
 }
 
@@ -272,13 +272,13 @@ pub fn on_confirmed_tick() {
     }
 }
 
-/// この道具の自動保存が、今のマッチ（seg）で保存関数を呼んだか。入れていない実行・パニックで止めた後・この seg で呼んでいない
+/// このツールの自動保存が、今のマッチ（seg）で保存関数を呼んだか。入れていない実行・パニックで止めた後・この seg で呼んでいない
 /// （見積もりで呼ばなかった・準備が間に合わなかった・試みていない）は false。同じ tick の `on_tick` の後に読むこと。
 pub fn saved_this_seg() -> bool {
     ARMED.load(Ordering::Acquire) != 0 && SEG_SAVED.load(Ordering::Relaxed) != 0
 }
 
-/// 検査の入口: `ARMED` と `SEG_SAVED` を直に置く。`REAL_HOOK_TESTS` の錠を持つ間だけ呼び、戻すときは両方 false。
+/// 検査の入口: `ARMED` と `SEG_SAVED` を直に設定する。`REAL_HOOK_TESTS` の錠を持つ間だけ呼び、戻すときは両方 false。
 #[cfg(test)]
 pub(crate) fn set_seg_saved_for_test(armed: bool, saved: bool) {
     SEG_SAVED.store(u32::from(saved), Ordering::SeqCst);
@@ -286,10 +286,10 @@ pub(crate) fn set_seg_saved_for_test(armed: bool, saved: bool) {
 }
 
 /// `[addr, addr + N)` を直に読む（1 バイトずつ）。呼んでよいのは `SaveAddrs::direct_ranges` の範囲の中（`arm` が読めると
-/// 確かめた th09.exe の .data と .text）と、保存関数の先頭の署名の 12 バイトだけ。
+/// 検証した th09.exe の .data と .text）と、保存関数の先頭の署名の 12 バイトだけ。
 fn rd<const N: usize>(addr: u32) -> [u8; N] {
     core::array::from_fn(|i| {
-        // SAFETY: 呼び出し元が `arm` の確かめた範囲のアドレスだけを渡す。volatile はゲームのスレッドが書き換える欄の読みを畳ませないため。
+        // SAFETY: 呼び出し元が `arm` が検証した範囲のアドレスだけを渡す。volatile はゲームのスレッドが書き換える欄の読みを畳ませないため。
         unsafe { core::ptr::read_volatile((addr as usize + i) as *const u8) }
     })
 }
@@ -376,23 +376,11 @@ impl SaveIo for RealSaveIo {
             return None;
         }
         let mut flags = [0u32; STAGES];
-        let mut chunks = [0u32; STAGES];
         for i in 0..STAGES as u32 {
             let at = hdr.checked_add(REPLAY_HEADER_STAGE_FLAGS + 4 * i)?;
             flags[i as usize] = m.u32_at(at)?;
-            // 先頭の塊は ReplayManager の中に埋め込まれていて、そこから次をたどる（0x00420CB0〜0x00420CBF）。
-            let head = rm.checked_add(REPLAY_STAGE_NODES + REPLAY_STAGE_STRIDE * i)?;
-            let mut n = 1u32;
-            let mut p = m.u32_at(head.checked_add(REPLAY_NODE_NEXT)?)?;
-            while p != 0 {
-                n += 1;
-                if n > CHAIN_LIMIT {
-                    return None;
-                }
-                p = m.u32_at(p.checked_add(REPLAY_NODE_NEXT)?)?;
-            }
-            chunks[i as usize] = n;
         }
+        let chunks = count_chunks(&mut m, rm)?;
         Some(EstimateReal {
             base,
             flags,
@@ -407,7 +395,7 @@ impl SaveIo for RealSaveIo {
     }
     fn write_rng(&mut self, v: &[u8; RNG_BYTES]) {
         for (i, b) in v.iter().enumerate() {
-            // SAFETY: `[rng, rng + 12)` は `arm` が読めると確かめた th09.exe の .data（乱数の状態と抽選回数 —— `th09_addr::RNG_ADDR`）。
+            // SAFETY: `[rng, rng + 12)` は `arm` が読めると検証した th09.exe の .data（乱数の状態と抽選回数 —— `th09_addr::RNG_ADDR`）。
             // 書くのは同じスレッドが直前に読んだ値だけ（保存が引いた 3 回を無かったことにする）。
             unsafe { core::ptr::write_volatile((self.a.rng as usize + i) as *mut u8, *b) };
         }
@@ -464,7 +452,7 @@ impl SaveIo for RealSaveIo {
         let mut written = [0u32; STAGES];
         let mut game_est = 0u32;
         // SAFETY（`save_call` の約束）: `save_fn` は `arm` の照合とこの tick の `signature_ok` で、先頭の 12 バイトが花映塚の保存関数と
-        // 同じと確かめたアドレス。`rm` は `[0x4A7E64]` の 0 でない値で `+0x114` が 0（記録の側）の ReplayManager（場面 2 の読み込み中でない tick。読み込みのスレッドは触っていない）。`path_addr` は
+        // 同じと検証したアドレス。`rm` は `[0x4A7E64]` の 0 でない値で `+0x114` が 0（記録の側）の ReplayManager（場面 2 の読み込み中でない tick。読み込みのスレッドは触っていない）。`path_addr` は
         // `Handoff` のパスのバッファ（NUL で終わる CP932。この呼び出しの間、持ち主はゲームのスレッド）、`name` は NUL で終わる 8 文字。`seen`・`written`・`game_est` はこのスタックの
         // 書けるバッファ、`est.flags` と `est.chunks` は読める 10 語。踏み台が書くのは自分のスタックの esp より下の 40 バイトだけ。
         // ゲームのスレッドから呼ぶ（ゲーム自身の保存も同じスレッド）。
@@ -492,6 +480,26 @@ impl SaveIo for RealSaveIo {
     }
 }
 
+/// 面ごとの塊の数（先頭の塊を含む）。先頭の塊は ReplayManager `rm` の中に埋め込まれていて、そこから次をたどる（`0x00420CB0`〜`0x00420CBF`）。
+/// 読めない・`CHAIN_LIMIT` を超えるなら `None`。確保しない。ゲームのスレッドで使える。
+pub(crate) fn count_chunks<M: MemRead>(m: &mut M, rm: u32) -> Option<[u32; STAGES]> {
+    let mut chunks = [0u32; STAGES];
+    for (i, slot) in chunks.iter_mut().enumerate() {
+        let head = rm.checked_add(REPLAY_STAGE_NODES + REPLAY_STAGE_STRIDE * i as u32)?;
+        let mut n = 1u32;
+        let mut p = m.u32_at(head.checked_add(REPLAY_NODE_NEXT)?)?;
+        while p != 0 {
+            n += 1;
+            if n > CHAIN_LIMIT {
+                return None;
+            }
+            p = m.u32_at(p.checked_add(REPLAY_NODE_NEXT)?)?;
+        }
+        *slot = n;
+    }
+    Some(chunks)
+}
+
 /// 自分のプロセスへ 1 バイトを落ちない書き方で書く（アドレスが確保されていない・書けないなら false。例外は出ない）。
 fn write_own_u8(addr: u32, v: u8) -> bool {
     let mut n: usize = 0;
@@ -517,7 +525,7 @@ const SNAP_BELOW: u32 = REPLAY_SAVE_FRAME_SHIFT + SAVE_EST_FLAGS_EBP;
 //   `-0x1F8(%ebp,%esi,4)`（`0x00420CA0`）と同じアドレス（ebp = E − 8）。保存関数の先頭から `0x00420CA0` までにそこへ書く命令は無い。
 // - 順に: ① その 10 語を `before` へコピーする。② 本当の印（ヘッダ `[this+8]` の `+0x20` の 10 語のコピー `flags`）をそこへ書く。③ 読み戻して
 //   `after` へコピーする。④ `after` で見積もりを計算する。ゲームのループは印が 0 かどうかしか見ない（`0x00420CA7 test %eax,%eax`）ので、
-//   本当の印を置けば、ゲームが確保の後 `0x00420CEB` でヘッダをコピーしてから使うのと同じ面を数える。コピーは確保の後に同じ値で上書きされるので、
+//   本当の印を書けば、ゲームが確保の後 `0x00420CEB` でヘッダをコピーしてから使うのと同じ面を数える。コピーは確保の後に同じ値で上書きされるので、
 //   書いた値がゲームのその後に残ることは無い。
 // - 書くのはこのスレッドのスタックの、esp より 0x200〜0x1DC バイト下の 40 バイトだけ（ゲームのメモリにもコードにも書かない）。
 //   esp より下は保存関数の枠になる所で呼び手の値は無く、1 頁（4 KiB）の内側なのでスタックの見張りの頁を越えない。割り込みはユーザーモードの
@@ -527,11 +535,11 @@ const SNAP_BELOW: u32 = REPLAY_SAVE_FRAME_SHIFT + SAVE_EST_FLAGS_EBP;
 // - 呼ぶときは ecx = this、edx = path、`[esp]` = 名前（fastcall。保存関数は `ret $0x4` で名前を片付ける）。保存関数は ebx・esi・edi・ebp を保つ
 //   （`0x00420C69`・`0x00420C7F`〜`0x00420C80` の push と `0x0042112B`〜`0x00421132` の pop。早い出口 `0x0042112D` は ebx・esi に触らない）。
 //   DF は呼ぶ側の Rust の決まりで 0。
-/// 保存関数を呼ぶ踏み台（`RealSaveIo::call_save` と検査からだけ呼ぶ）。
+/// 保存関数を呼ぶ踏み台（`RealSaveIo::call_save`・メニューの保存の入口 `menu_save_win` と検査からだけ呼ぶ）。
 #[allow(clippy::too_many_arguments)]
 // 引数の並びは素のアセンブリの `[ebp + 8]`〜`[ebp + 48]` と 1 対 1（構造体にするとアドレスの計算が増える）
 #[unsafe(naked)]
-unsafe extern "C" fn save_call(
+pub(crate) unsafe extern "C" fn save_call(
     _func: u32,
     _this: u32,
     _path: u32,
@@ -643,7 +651,7 @@ fn file_id(h: HANDLE) -> Result<(u32, u32, u32), String> {
 /// ファイルの番号が同じ）か。開くのは属性を読むためだけ。
 pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
     if ansi.contains(&0) {
-        return Err("パスに NUL がある".to_string());
+        return Err("パスに NUL が含まれています".to_string());
     }
     let mut z = ansi.to_vec();
     z.push(0);
@@ -663,7 +671,7 @@ pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
     if h == INVALID_HANDLE_VALUE {
         // SAFETY: 引数の無い呼び出し。直前の CreateFileA の結果を指す。
         return Err(format!(
-            "CreateFileA が開けない（GetLastError = {}）",
+            "CreateFileA で開けません（GetLastError = {}）",
             unsafe { GetLastError() }
         ));
     }
@@ -727,8 +735,8 @@ fn open_worker_log(
     )))
 }
 
-/// `HiganRTool.ini` の本文から `[replay]` を読み、`enable = 1` なら自動保存を入れる（保存関数の署名とアドレスを確かめ、保管庫のスレッドのログを
-/// 開き、保管庫のスレッドを起こし、`ARMED` = 1）。入れたらその文、設定に無ければ `Ok(None)`。台本の分かれ道を開く前に呼ぶ。
+/// `HiganRTool.ini` の本文から `[replay]` を読み、`enable = 1` なら自動保存を入れる（保存関数の署名とアドレスを検証し、保管庫のスレッドのログを
+/// 開き、保管庫のスレッドを作り、`ARMED` = 1）。入れたら、入れた旨の 1 行を `Ok(Some(...))` で返し、設定に無ければ `Ok(None)`。台本の分かれ道を開く前に呼ぶ。
 pub fn arm(
     ini_text: Option<&str>,
     net: Option<&NetSettings>,
@@ -743,13 +751,14 @@ pub fn arm(
         return Ok(None);
     };
     if ARMED.load(Ordering::SeqCst) != 0 {
-        return Err("もう入っている".to_string());
+        return Err("設置済み".to_string());
     }
-    let sig = read_own_memory(REPLAY_SAVE_FN, REPLAY_SAVE_SIG.len())
-        .ok_or(format!("保存関数 0x{REPLAY_SAVE_FN:08X} の先頭が読めない"))?;
+    let sig = read_own_memory(REPLAY_SAVE_FN, REPLAY_SAVE_SIG.len()).ok_or(format!(
+        "保存関数 0x{REPLAY_SAVE_FN:08X} の先頭が読み取り不能"
+    ))?;
     if sig != REPLAY_SAVE_SIG {
         return Err(format!(
-            "保存関数 0x{REPLAY_SAVE_FN:08X} の先頭が署名と違う（{:02X?}）ので呼ばない",
+            "保存関数 0x{REPLAY_SAVE_FN:08X} の先頭が署名と不一致（{:02X?}）なので呼びません",
             sig
         ));
     }
@@ -757,22 +766,22 @@ pub fn arm(
     for (addr, len) in a.direct_ranges() {
         if read_own_memory(addr, len as usize).is_none() {
             return Err(format!(
-                "直に読むアドレス 0x{addr:08X}（{len} バイト）が読めない"
+                "直接読むアドレス 0x{addr:08X}（{len} バイト）が読み取り不能"
             ));
         }
     }
-    let log = run_path.ok_or("本ログの置き場が決まっていない")?;
-    let dir = log.parent().ok_or("本ログのフォルダが分からない")?;
-    let exe = exe_dir.ok_or("exe のフォルダが分からない")?;
+    let log = run_path.ok_or("本ログの場所が未決定")?;
+    let dir = log.parent().ok_or("本ログのフォルダが不明")?;
+    let exe = exe_dir.ok_or("exe のフォルダが不明")?;
     if is_same_or_inside(&dir.to_string_lossy(), &exe.to_string_lossy()) {
         return Err(format!(
-            "{} が exe のフォルダの中なので書かない",
+            "{} が exe のフォルダの中なので書きません",
             dir.display()
         ));
     }
     let name = side_file_name(
         &log.file_name()
-            .ok_or("本ログの名前が分からない")?
+            .ok_or("本ログの名前が不明")?
             .to_string_lossy(),
         LOG_SUFFIX,
     );
@@ -789,7 +798,7 @@ pub fn arm(
     unsafe { QueryPerformanceFrequency(&mut f) };
     QPC_FREQ.store(f.max(0) as u64, Ordering::SeqCst);
     a.store();
-    // ネットワークを置いた実行では、つながっている間にだけ名前を押さえる（`Worker::may_reserve`）。
+    // ネットワークを組み込んだ実行では、接続している間にだけ名前を押さえる（`Worker::may_reserve`）。
     let mut worker = Worker::new(settings.split, self_name, net.is_some(), file)
         .with_problem_sink(Box::new(crate::main_log::push));
     std::thread::Builder::new()
@@ -808,16 +817,16 @@ pub fn arm(
                 win::debug_out("HiganRTool: 保管庫のスレッドでパニックを受けた。自動保存を止める");
             }
         })
-        .map_err(|e| format!("保管庫のスレッドを起こせない: {e}"))?;
+        .map_err(|e| format!("保管庫のスレッドの作成不能: {e}"))?;
     ARMED.store(1, Ordering::Release);
     Ok(Some(if detail {
         format!(
-            "入れた（区切り方 {:?}。保管庫のスレッドのログは {name}）",
+            "設置しました（区切り方 {:?}。保管庫のスレッドのログは {name}）",
             settings.split
         )
     } else {
         format!(
-            "入れた（区切り方 {:?}。保管庫のスレッドのログは書かない）",
+            "設置しました（区切り方 {:?}。保管庫のスレッドのログは書きません）",
             settings.split
         )
     }))
@@ -1037,6 +1046,39 @@ mod tests {
         r
     }
 
+    struct MapMem(std::collections::BTreeMap<u32, u32>);
+
+    impl MemRead for MapMem {
+        fn u32_at(&mut self, addr: u32) -> Option<u32> {
+            self.0.get(&addr).copied()
+        }
+    }
+
+    #[test]
+    fn count_chunks_walks_each_stage_chain_and_refuses_unreadable_or_endless_ones() {
+        const RM: u32 = 0x1000;
+        let next_of = |head: u32| head + REPLAY_NODE_NEXT;
+        let head = |i: u32| RM + REPLAY_STAGE_NODES + REPLAY_STAGE_STRIDE * i;
+        let mut m = MapMem((0..STAGES as u32).map(|i| (next_of(head(i)), 0)).collect());
+        assert_eq!(count_chunks(&mut m, RM), Some([1; STAGES]));
+        m.0.insert(next_of(head(3)), 0x9000);
+        m.0.insert(next_of(0x9000), 0xA000);
+        m.0.insert(next_of(0xA000), 0);
+        let mut want = [1; STAGES];
+        want[3] = 3;
+        assert_eq!(count_chunks(&mut m, RM), Some(want));
+        // 連鎖の途中が読めない。
+        m.0.insert(next_of(0xA000), 0xB000);
+        assert_eq!(count_chunks(&mut m, RM), None);
+        // 終わらない連鎖。
+        m.0.insert(next_of(0xA000), 0xA000);
+        assert_eq!(count_chunks(&mut m, RM), None);
+        // 先頭の塊が読めない。
+        m.0.remove(&next_of(head(9)));
+        m.0.insert(next_of(0xA000), 0);
+        assert_eq!(count_chunks(&mut m, RM), None);
+    }
+
     #[test]
     fn save_call_writes_the_real_flags_where_the_game_loop_reads() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1126,7 +1168,7 @@ mod tests {
     static SUP: Words<{ 0x600 / 4 }> = Words([const { AtomicU32::new(0) }; 0x600 / 4]);
     /// menu, loading, game_mode, manager_ptr, p1 wins, p2 wins, required, completed_rounds, round_frames, 1P / 2P の Player のポインタ、1P / 2P の stats のポインタ
     static GLOBALS: Words<14> = Words([const { AtomicU32::new(0) }; 14]);
-    /// 偽の設定の写し（`+0xB5` まで）。`GLOBALS` の 13 番目が、これを指すポインタの欄。
+    /// 偽の設定のコピー（`+0xB5` まで）。`GLOBALS` の 13 番目が、これを指すポインタの欄。
     static OPT_COPY: Words<{ 0xC0 / 4 }> = Words([const { AtomicU32::new(0) }; 0xC0 / 4]);
     static MENU_BYTE: AtomicU8 = AtomicU8::new(0);
     /// 偽の ReplayManager（+0x114 まで）と偽のヘッダ（+0x48 まで）と、面 9 の次の塊（2 つ。長いマッチの検査では 3 つ）。
@@ -1163,7 +1205,7 @@ mod tests {
         }
     }
 
-    /// 偽の設定の写しのチャージ型（1P・2P）と、偽の見出しの `+0x190` / `+0x191`（下位 2 バイト）。
+    /// 偽の設定のコピーのチャージ型（1P・2P）と、偽の見出しの `+0x190` / `+0x191`（下位 2 バイト）。
     fn set_copy_charge(p1: u8, p2: u8) {
         let w = u32::from(p1) | u32::from(p2) << 8;
         OPT_COPY.0[(OPT_CHARGE / 4) as usize].store(w << ((OPT_CHARGE % 4) * 8), Ordering::SeqCst);
@@ -1280,7 +1322,7 @@ mod tests {
         assert_eq!(SEEN_PATH.load(Ordering::SeqCst), h.path_addr());
         assert_eq!(r.wins, [0, 2, 2]);
         assert!(r.duration_us < 10_000_000);
-        // 見出しは保存関数が呼ばれた時点で、設定の写しの値（1P = 1 / 2P = 0）になっている。
+        // 見出しは保存関数が呼ばれた時点で、設定のコピーの値（1P = 1 / 2P = 0）になっている。
         assert_eq!(r.charge, ChargeSync::Written { p1: 1, p2: 0 });
         assert_eq!(
             SEEN_CHARGE.load(Ordering::SeqCst),
@@ -1290,7 +1332,6 @@ mod tests {
         assert_eq!(header_charge(), [1, 0]);
     }
 
-    /// 壊れたら落ちる: 席の入れ替え・写しの別の欄を読む・ポインタが 0 でも書く・見出しの別の欄へ書く。
     #[test]
     fn real_io_copies_the_charge_into_the_header_seat_for_seat_and_refuses_bad_pointers() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1327,7 +1368,7 @@ mod tests {
         HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].store(0, Ordering::SeqCst);
         let good = a32(&OPT_COPY, 0);
         for (cell, cell_value, rm_arg, want) in [
-            // 写しのポインタの欄が読めない・値が 0・値が読めない場所を指す
+            // コピーのポインタの欄が読めない・値が 0・値が読めない場所を指す
             (0x10, good, rm, ChargeSync::NoCopy),
             (a32(&GLOBALS, 13), 0, rm, ChargeSync::NoCopy),
             (a32(&GLOBALS, 13), 0x10, rm, ChargeSync::CopyUnreadable),
@@ -1358,7 +1399,6 @@ mod tests {
         assert_eq!(io.sync_header_charge(rm), ChargeSync::WriteFailed);
     }
 
-    /// 壊れたら落ちる: 日付と名前の位置の取り違え・見出しが 0 や読めない場所のときに値を返す。
     #[test]
     fn real_io_reads_the_header_date_and_name_from_their_offsets_and_refuses_bad_pointers() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1692,7 +1732,7 @@ mod tests {
             ),
             (0xB0, 0xB4, 0xB8, 0x04)
         );
-        // 起動のとき読めると確かめる範囲に、新しい欄が全部入っている（入っていないと直読みが外れる）。
+        // 起動のとき読めると検証する範囲に、新しい欄が全部入っている（入っていないと直読みが外れる）。
         let ranges = a.direct_ranges();
         for addr in [
             a.completed_rounds,
@@ -1705,7 +1745,7 @@ mod tests {
         ] {
             assert!(ranges.contains(&(addr, 4)), "0x{addr:08X}");
         }
-        // 設定の写しのポインタの欄と、チャージ型の位置は、ゲーム側の名前と同じ値（`net_game::write_charge` が生きた試合で書く先）。
+        // 設定のコピーのポインタの欄と、チャージ型の位置は、ゲーム側の名前と同じ値（`net_game::write_charge` が生きた試合で書く先）。
         assert_eq!(a.options_copy, 0x004A_7E78);
         assert_eq!(OPT_CHARGE, 0xB4);
         // 見出しの位置は、リプレイを書き換える側（core）の位置 `+0x190` と同じ。

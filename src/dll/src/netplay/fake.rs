@@ -1,12 +1,10 @@
 //! 検査だけの偽物: ゲームのウィンドウの模型（`FakeGame`）と、仮の時計で動くネットワーク（`FakeNet`）。
 //!
 //! `FakeGame` が持つゲームの動き:
-//! - 入力の地点の後、同じ tick の優先度 0 の後半で場面の切替が走る（今 1・次 2 → 場面 2 と読み込み、今 2・次 10 → 場面 2 を作り直して
-//!   読み込み、今 2・次 1 → メニュー）。**描画だけのフレームでは、切替も更新も走らない。**
+//! - 入力の地点の後、同じ tick の優先度 0 の後半で場面の切替が走る（今 1・次 2 → 場面 2 と読み込み、今 2・次 10 → 場面 2 を作り直して読み込み、今 2・次 1 → メニュー）。**描画だけのフレームでは、切替も更新も走らない。**
 //! - 読み込みは `load_*` tick。読み込みを終えた後の最初の更新の中で開始のフック（`on_match_start`）が実行、次の tick が frame 0。
-//! - マッチの中の更新は feed された 3 本から「乱数」を進める（CHECK をゲームから読むときの値）。seg の決めたフレーム数（`seg_frames`）を使うと、
-//!   最後のフレームの更新が次の要求を書く（再戦 10、最後なら 1）。
-//! - メニューでは、繋がって選択に入ってから `menu_before_decide` tick で「マップの決定」（次の要求 2）を書く。
+//! - マッチの中の更新は feed された 3 本から「乱数」を進める（CHECK をゲームから読むときの値）。seg の決めたフレーム数（`seg_frames`）を使うと、最後のフレームの更新が次の要求を書く（再戦 10、最後なら 1）。
+//! - メニューでは、接続して選択に入ってから `menu_before_decide` tick で「マップの決定」（次の要求 2）を書く。
 //!
 //! 偽物の中で起きた食い違い（feed した 3 本が返しと合わない、など）は、その場で落とす。
 #![forbid(unsafe_code)]
@@ -28,6 +26,7 @@ use super::{
 use crate::scripted::SCENE_MENU;
 
 use super::SCENE_MATCH;
+use crate::spectate_watch::WatchRecv;
 
 pub const FRAME_US: u64 = 16_667;
 
@@ -92,13 +91,13 @@ pub struct FakeGame {
     pub esc_down: bool,
     /// `local_input` の語に足すビット（既定 0）。マスクの内外のビットを人が押した形の検査用。
     pub local_or: u16,
-    /// 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`Game::digit_keys`。bit の並びは `digit_keys`）。`None` は読んではいけない間。検査が tick の合間に置く。
+    /// 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`Game::digit_keys`。bit の並びは `digit_keys`）。`None` は読んではいけない間。検査が tick の合間に設定する。
     pub digit_held: Option<u16>,
     /// `digit_keys` を呼ばれた回数（1 tick に 1 回、読んでよい phase だけ —— マッチの外は `dispatch`、マッチの間は取得で）。
     pub digit_reads: u64,
     /// 台本の付いている実行（`Game::scripted_run`）の印。検査が立てる（既定は false = 台本の無い実行）。
     pub scripted: bool,
-    /// 台本の段階の押下（`Game::digit_script`）。検査が置き、取り出したら空になる（1 回だけ）。既定は `None`。
+    /// 台本の段階の押下（`Game::digit_script`）。検査が設定し、取り出したら空になる（1 回だけ）。既定は `None`。
     pub script_press: Option<u16>,
 }
 
@@ -377,6 +376,11 @@ pub struct FakeNet {
     pub varies: Option<bool>,
     /// `own_nat` が返す UPnP の割り当ての有無（偽。既定は割り当てなし）。
     pub upnp: bool,
+    /// `note_delay` で受けた往復の要約のうち、最後の「標本あり」と、その回数。
+    pub delay_last: Option<higanr_core::rtt_probe::DelaySnapshot>,
+    pub delay_notes: u32,
+    /// 観戦者の受け取り（`watch_install`）。設定されたら、届いた便は全部これが受ける（本物の受信スレッドの代わりに `run_watch` が回す）。
+    watch: Option<WatchRecv>,
 }
 
 const INBOX_CAP: usize = 512;
@@ -402,6 +406,9 @@ impl FakeNet {
             link_ups: 0,
             varies: None,
             upnp: false,
+            delay_last: None,
+            delay_notes: 0,
+            watch: None,
         };
         let na = mk(a, b, &ia, &ib);
         let nb = mk(b, a, &ib, &ia);
@@ -424,6 +431,20 @@ impl FakeNet {
 
     fn next_due(&self) -> Option<u64> {
         self.inbox.borrow().front().map(|p| p.due)
+    }
+
+    /// 受信スレッドの代わりの 1 周: 届いている便を観戦者の受け取りへ渡し、周回の仕事をする。ゲームのスレッドが時計を読む・待つたびに回るので、
+    /// 本物の受信スレッドと同じく、ゲームのスレッドの tick の間にも受ける。ゲームのスレッドが止まっている形は、検査がこれを直に呼ぶ。
+    pub fn run_watch(&mut self) {
+        let Some(mut r) = self.watch.take() else {
+            return;
+        };
+        let mut buf = [0u8; MAX_DATAGRAM];
+        while let Some((from, n, t_us)) = self.recv(&mut buf) {
+            r.on_datagram(from, buf.get(..n).unwrap_or(&[]), t_us, self);
+        }
+        r.service(self.clock.get(), self);
+        self.watch = Some(r);
     }
 }
 
@@ -465,6 +486,7 @@ impl Outlet for FakeNet {
 
 impl Net for FakeNet {
     fn now_us(&mut self) -> u64 {
+        self.run_watch();
         self.clock.get()
     }
 
@@ -488,11 +510,27 @@ impl Net for FakeNet {
             _ => (until, true),
         };
         self.clock.set(t);
+        self.run_watch();
         timed_out
+    }
+
+    fn watch_install(&mut self, r: WatchRecv) -> Result<(), WatchRecv> {
+        if self.watch.is_some() {
+            return Err(r);
+        }
+        self.watch = Some(r);
+        Ok(())
     }
 
     fn link_up(&mut self) {
         self.link_ups += 1;
+    }
+
+    fn note_delay(&mut self, snap: Option<higanr_core::rtt_probe::DelaySnapshot>) {
+        if snap.is_some() {
+            self.delay_last = snap;
+            self.delay_notes += 1;
+        }
     }
 
     fn own_port_varies(&mut self) -> Option<bool> {

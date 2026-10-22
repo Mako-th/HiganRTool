@@ -19,7 +19,7 @@ pub const BROKEN: Tx = Tx {
     en: "The opponent's code is incomplete or wrong. Copy the whole code again and paste it into this window.",
 };
 
-/// ネットワークを開けなかった（見張りを起こす前に断った・見張りが止められた）ときの文。
+/// ネットワークを開けなかった（見張りを作る前に断った・見張りが止められた）ときの文。
 pub const NOT_STARTED: Tx = Tx {
     ja: "通信を始められませんでした（理由はログにあります）。logsフォルダのファイルを添えて、開発者に伝えてください。",
     en: "Could not start networking (the reason is in the log). Please report this on GitHub Issues with the files in the logs folder.",
@@ -117,7 +117,7 @@ pub const ROLLBACK_NOT_READY: Tx = Tx {
     en: "The rollback you chose in the window cannot be used (rollback was not ready in this start; the reason is in the log). Connecting in delay mode.",
 };
 
-/// 相手のコードの期限切れ。長さは `ttl_secs` から作る（数字を字に写すと、期限を変えたときにウィンドウの文だけ古いままになる）。
+/// 相手のコードの期限切れ。長さは `ttl_secs` から作る（数字を文に直書きすると、期限を変えたときにウィンドウの文だけ古いままになる）。
 pub fn expired(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
@@ -141,7 +141,7 @@ pub fn watch_expired(lang: Lang, ttl_secs: u64) -> String {
     }
 }
 
-/// 始める側が返しのコードを待つ間。
+/// 始める側が、返す側から届く返しのコードを待つ間。
 pub fn offer_waiting(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
@@ -195,7 +195,7 @@ pub fn watch_read(lang: Lang, who: &str) -> String {
     }
 }
 
-/// 今の設定では相手へつなぎに行けない（ネットワークの範囲 `scope` の外）。アドレスはウィンドウに出さない。
+/// 今の設定では相手へ接続しに行けない（ネットワークの範囲 `scope` の外）。アドレスはウィンドウに出さない。
 pub fn no_route(lang: Lang, scope: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -207,7 +207,7 @@ pub fn no_route(lang: Lang, scope: &str) -> String {
     }
 }
 
-/// つながった。席は画面から読めない値なので出す。形は繋がったセッションの AGREE で決まった形（モードと遅れ）。
+/// 接続した。自分の席（1P か 2P か）は画面から読めない値なので出す。形は接続したセッションの AGREE で決まった形（モードと遅れ）。
 pub fn connected(
     lang: Lang,
     seat: Option<higanr_core::wire::Seat>,
@@ -254,7 +254,7 @@ pub fn watch_file_unreadable(lang: Lang, what: &str) -> String {
     }
 }
 
-/// 返すコードをファイルに書けなかった。`what` の扱いは `peer_file_unreadable` と同じ。
+/// 相手へ返すコードをファイルに書けなかった。`what` の扱いは `peer_file_unreadable` と同じ。
 pub fn reply_not_written(lang: Lang, what: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -347,7 +347,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 公開した後の利用者に「この道具を渡してくれた人」へ送るよう案内する（報告先は開発者・GitHub の Issues）。
     #[test]
     fn the_failure_text_points_at_the_developer_not_at_whoever_handed_over_the_tool() {
         assert!(

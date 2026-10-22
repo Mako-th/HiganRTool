@@ -1,21 +1,10 @@
 //! 台本の、ゲームのスレッドの層と台本のファイルの層（unsafe はここにもある。1 つずつ `// SAFETY:`）。
 //!
-//! - 入力の入口（`stub.rs` の `input_wait_entry`）は、`SCRIPT_ON` が 0 でなければ、tick の記録を書いた後に `script_on_tick(k)` を呼ぶ。
-//!   戻り値が 0 なら元の飛び先（poll_all）へ、1 なら poll_all を呼ばずに戻る。中は全部 `catch_unwind`。判断は `scripted::tick`（pure）に
-//!   だけ書き、ここはゲームのメモリの読み・ゲームの関数の呼び出し・台本の入れ物・進み具合の原子変数・feed のリングバッファへの書き・撮影の要求だけを持つ。
-//!   ゲームのスレッドの経路で、確保・ファイル・ロック待ち・`unwrap` をしない。
-//! - 台本の置き場: DLL のフォルダの `script.txt`。読んだら本ログの隣の `<回の名前>_script.txt` へ上書きせずに移す（`MoveFileExW` を旗 0 で。
-//!   `std::fs::rename` は上書きの旗で呼ぶので使わない）。ローダーの `--script` / `--ini` が環境の変数で渡したパスがあればそちらを読み、
-//!   渡された台本は移さない（2 つのゲームがそれぞれのコピーを持てるように）。
-//! - **ネットワーク**: ネットワークを置いた実行では、入口の分岐は台本とネットワークの両方の入口になる。`script_on_tick` はまずネットワークの判断（`netplay::NetPlay::on_input`）を
-//!   呼び、`Local` なら台本の経路（終わっていれば 0）、`Zero` / `Played` なら 1、`RenderOnly` なら 2 を返す。ネットワークのセッション（`NET`）に触るのは
-//!   ゲームのスレッドだけ。台本が無くてもネットワークは開ける（`arm_io`）。`after_script = keep` なら、台本が最後の段階まで押してもネットワークを閉じない。
-//! - **観戦者の側**: 「ルームで観戦」で、開くスレッドが観戦者のネットワークを作り（`open_watch_net`）、ゲームのスレッドが郵便受け `PENDING` から取って
-//!   **後から**置く（`install_placed`）。待っているだけの対戦者のセッションの上から決めたときは、先にセッションを手放して（`release_slot`）ワーカーのスレッドが
-//!   片づけ、続けて開く（`SPECTATE_AFTER`）。観戦が終わり、マッチの外へ戻り、ルームのスレッドが書き終えたらセッションを手放す（`watch_teardown`）。
-//! - **マッチの状態の操作**: `tick_inner` は、どの経路を通った tick でも最後に `state_tick` で台本の無敵・ライフ・ゲージを書く（判断は
-//!   `state_ops::apply`）。Player はヒープなので落ちない手段（`OwnProcess` / `WriteProcessMemory`）で読み書きし、ネットワークか巻き戻しの実験が
-//!   動いている実行では書かずに断る（`state_ops::Refuse`）。
+//! - 入力の入口（`stub.rs` の `input_wait_entry`）は、`SCRIPT_ON` が 0 でなければ、tick の記録を書いた後に `script_on_tick(k)` を呼ぶ。戻り値が 0 なら元の飛び先（poll_all）へ、1 なら poll_all を呼ばずに戻る。中は全部 `catch_unwind`。判断は `scripted::tick`（pure）にだけ書き、ここはゲームのメモリの読み・ゲームの関数の呼び出し・台本の入れ物・進み具合の原子変数・feed のリングバッファへの書き・撮影の要求だけを持つ。ゲームのスレッドの経路で、確保・ファイル・ロック待ち・`unwrap` をしない。
+//! - 台本のファイル: DLL のフォルダの `script.txt`。読んだら本ログの隣の `<回の名前>_script.txt` へ上書きせずに移す（`MoveFileExW` を旗 0 で。`std::fs::rename` は上書きの旗で呼ぶので使わない）。ローダーの `--script` / `--ini` が環境の変数で渡したパスがあればそちらを読み、渡された台本は移さない（2 つのゲームがそれぞれのコピーを持てるように）。
+//! - **ネットワーク**: ネットワークを組み込んだ実行では、入口の分岐は台本とネットワークの両方の入口になる。`script_on_tick` はまずネットワークの判断（`netplay::NetPlay::on_input`）を呼び、`Local` なら台本の経路（終わっていれば 0）、`Zero` / `Played` なら 1、`RenderOnly` なら 2 を返す。ネットワークのセッション（`NET`）に触るのはゲームのスレッドだけ。台本が無くてもネットワークは開ける（`arm_io`）。`after_script = keep` なら、台本が最後の段階まで押してもネットワークを閉じない。
+//! - **観戦者の側**: 「ルームで観戦」で、開くスレッドが観戦者のネットワークを作り（`open_watch_net`）、ゲームのスレッドが郵便受け `PENDING` から取って**後から**組み込む（`install_placed`）。待っているだけの対戦のセッションの上から決めたときは、先にセッションを手放して（`release_slot`）ワーカーのスレッドが片づけ、続けて開く（`SPECTATE_AFTER`）。観戦が終わり、マッチの外へ戻り、ルームのスレッドが書き終えたらセッションを手放す（`watch_teardown`）。
+//! - **マッチの状態の操作**: `tick_inner` は、どの経路を通った tick でも最後に `state_tick` で台本の無敵・ライフ・ゲージを書く（判断は `state_ops::apply`）。Player はヒープなので落ちない手段（`OwnProcess` / `WriteProcessMemory`）で読み書きし、ネットワークか巻き戻しの実験が動いている実行では書かずに断る（`state_ops::Refuse`）。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -67,7 +56,7 @@ use crate::net_config::{
 use crate::net_game::{self, NetGame, NetIo};
 use crate::net_portrait::PortraitCall;
 use crate::net_room::RoomOptions;
-use crate::net_udp::{self, GameNet, RecvThread};
+use crate::net_udp::{self, GameNet, RecvThread, WatchUpnpPlan};
 use crate::net_ui::{self, BOARD, HudFacts, LanAsk, NetPhase, NetUi, UiFacts, UiLink, UiOut};
 use crate::net_watch::{NET_FRAMES, NET_STATUS, NetSnapshot};
 use crate::netplay::{self, Action, NetPlay};
@@ -92,15 +81,15 @@ use crate::win::read_own_memory;
 pub static SCRIPT_ON: AtomicU32 = AtomicU32::new(0);
 
 /// ゲームのスレッドが読むアドレス（`GameAddrs` の並び）と、呼ぶ関数のアドレス（feed・ローカル入力）。`arm` が
-/// `SCRIPT_ON` を 1 にする前に置く。
+/// `SCRIPT_ON` を 1 にする前に設定する。
 static ADDRS: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
 static FEED_FN: AtomicU32 = AtomicU32::new(0);
 static LOCAL_FN: AtomicU32 = AtomicU32::new(0);
-/// 台本の状態の操作がたどる Player へのポインタの欄（1P, 2P）。`arm_io` が花映塚のアドレスを置く（検査は偽の欄へ置き直す）。
+/// 台本の状態の操作がたどる Player へのポインタの欄（1P, 2P）。`arm_io` が花映塚のアドレスを設定する（検査は偽の欄へ設定し直す）。
 static STATE_SLOTS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 
 struct EngineCell(UnsafeCell<Option<Engine>>);
-// SAFETY: 中身に触るのは 2 か所だけで、同時には触らない。読み取りのスレッドの `arm` は `SCRIPT_ON` が 0 の間だけ置き
+// SAFETY: 中身に触るのは 2 か所だけで、同時には触らない。読み取りのスレッドの `arm` は `SCRIPT_ON` が 0 の間だけ設定し
 // （本番では 2 つのフックを書く前に 1 回だけ。検査では `REAL_HOOK_TESTS` のロックの下で 1 本ずつ）、以後はゲームのスレッドだけが触る。`start` は Release、
 // ゲームのスレッドは Acquire で読んでから触る。
 unsafe impl Sync for EngineCell {}
@@ -132,9 +121,9 @@ pub(crate) static MATCH_ON_CALLS: AtomicU32 = AtomicU32::new(0);
 pub static NET_ON: AtomicU32 = AtomicU32::new(0);
 static SET_STATE_FN: AtomicU32 = AtomicU32::new(0);
 /// 立ち絵の 3 本の関数の入口（`net_portrait::PortraitFn::index` の順）。`session::run` が 3 本のバイト列を全部照合して合ったときだけ
-/// `arm_portrait` が置く（0 のままなら呼ばない）。
+/// `arm_portrait` が設定する（0 のままなら呼ばない）。
 static PORTRAIT_FNS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
-/// 素の poll `0x0042B850` の入口。起動のときに `session::run` が先頭 8 バイトを照合して合ったときだけ `arm_poll` が置く
+/// 素の poll `0x0042B850` の入口。起動のときに `session::run` が先頭 8 バイトを照合して合ったときだけ `arm_poll` が設定する
 /// （0 のままなら、ローカル入力は `LOCAL_FN` = `0x0042BE40` で読む）。
 static POLL_FN: AtomicU32 = AtomicU32::new(0);
 static GAME_TID: AtomicU32 = AtomicU32::new(0);
@@ -173,7 +162,7 @@ fn rb_note_abort(np: &netplay::NetPlay) {
     RB_ABORTS.store(n, Ordering::Relaxed);
     crate::rollback_play_win::publish_summary(np.rollback_core_stats());
 }
-/// 台本が最後の段階まで押した後もネットワークを閉じない（ini の `after_script = keep`）。`open_net` が置き、ゲームのスレッドが `net_tick` で読む。
+/// 台本が最後の段階まで押した後もネットワークを閉じない（ini の `after_script = keep`）。`open_net` が設定し、ゲームのスレッドが `net_tick` で読む。
 static KEEP_AFTER_SCRIPT: AtomicU32 = AtomicU32::new(0);
 
 pub struct NetSlot {
@@ -181,7 +170,7 @@ pub struct NetSlot {
     pub net: GameNet,
 }
 
-/// 観戦者のセッション（ini の `code_side = spectate`。対戦のセッション `NetSlot` の代わりに置く）。
+/// 観戦者のセッション（ini の `code_side = spectate`。対戦のセッション `NetSlot` の代わりに組み込む）。
 pub struct WatchNetSlot {
     pub wp: WatchPlay,
     pub net: GameNet,
@@ -194,7 +183,7 @@ enum Slot {
 }
 
 struct NetCell(UnsafeCell<Option<Slot>>);
-// SAFETY: 読み取りのスレッドの `arm_net` / `arm_watch` は `NET_ON` と `SCRIPT_ON` が 0 の間だけ置き（本番では 3 つのフックを書く前に 1 回だけ）、以後はゲームのスレッドだけが触る
+// SAFETY: 読み取りのスレッドの `arm_net` / `arm_watch` は `NET_ON` と `SCRIPT_ON` が 0 の間だけ設定し（本番では 3 つのフックを書く前に 1 回だけ）、以後はゲームのスレッドだけが触る
 // （入れ子にならない。開始のフックが別のスレッドから来たら触らない —— `GAME_TID`）。`start_net` は Release、ゲームのスレッドは Acquire で
 // 読んでから触る。
 unsafe impl Sync for NetCell {}
@@ -202,30 +191,23 @@ static NET: NetCell = NetCell(UnsafeCell::new(None));
 
 // ---- ゲーム内のメニュー（ini の `code_side = game`）----
 //
-// - 起動のとき（`arm_game_ui`）: 受信ソケット・STUN・見張りは**開かない**。メニューの入れ物（`UI`）と、ネットワークを開くのに要るもの（`LAZY`）だけを置く。
-//   入力の入口は開く（`UI_ON`）が、画面 6 でメニューが入力を握るだけで、描くものは無い。「妖怪 対 妖怪」が選ばれない限り、ゲームの動作に
-//   何も影響しない。
-// - 最初の「作る」「貼る」（`UiOut::open_net`）で、別のスレッドがネットワークを開く（`request_open` → `open_game_net`）。ゲームのスレッドは待たず、
-//   開く間のメニューに「準備しています」を出す。開き終わったら、ゲームのスレッドが次の tick でネットワークのセッションを `NET` へ置いて `NET_ON` を立てる
-//   （`poll_pending` → `install_slot`）。
-// - つなぎ直し: つながりが終わり、`RELINK_GRACE` 経って場面がマッチの外にあれば、ゲームのスレッドはネットワークの経路の tick の終わりにネットワークのセッションを手放す
-//   （`relink_teardown`。`NET_ON` を 0 にしてセッションを郵便受け `CLOSING` へ置き、メニューを「つなぐ前」へ戻すだけ。確保・待ち・スレッドの起こしは
-//   無い）。ワーカーのスレッド（`higanr-relink`）が `relink_tick` でネットワークの組を片づける。次の「作る」「貼る」「ルームで待つ」で新しい組を開く。
-//   マッチの中では片づけない。`offer` / `answer`・観戦・ini の相手の形はメニューを置かないので片づけない。
+// - 起動のとき（`arm_game_ui`）: 受信ソケット・STUN・見張りは**開かない**。メニューの入れ物（`UI`）と、ネットワークを開くのに要るもの（`LAZY`）だけを用意する。入力の入口は開く（`UI_ON`）が、画面 6 でメニューが入力を握るだけで、描くものは無い。「妖怪 対 妖怪」が選ばれない限り、ゲームの動作に何も影響しない。
+// - 最初の「作る」「貼る」（`UiOut::open_net`）で、別のスレッドがネットワークを開く（`request_open` → `open_game_net`）。ゲームのスレッドは待たず、開く間のメニューに「準備しています」を出す。開き終わったら、ゲームのスレッドが次の tick でネットワークのセッションを `NET` へ組み込んで `NET_ON` を立てる（`poll_pending` → `install_slot`）。
+// - 再接続: 接続が終わり、`RELINK_GRACE` 経って場面がマッチの外にあれば、ゲームのスレッドはネットワークの経路の tick の終わりにネットワークのセッションを手放す（`relink_teardown`。`NET_ON` を 0 にしてセッションを郵便受け `CLOSING` へ移し、メニューを「接続する前」へ戻すだけ。確保・待ち・スレッドの作成は無い）。ワーカーのスレッド（`higanr-relink`）が `relink_tick` でネットワークの組を片づける。次の「作る」「貼る」「ルームで待つ」で新しい組を開く。マッチの中では片づけない。`offer` / `answer`・観戦・ini の相手の形はメニューを組み込まないので片づけない。
 
 /// ゲーム内のメニューが動いているか。入力の入口の `route` が見る。0 → 1 にするのは読み取りのスレッド（`arm_game_ui`。メニューの入れ物を
-/// 置いた後）だけ、1 → 0 にするのはゲームのスレッド（パニック）。
+/// 設定した後）だけ、1 → 0 にするのはゲームのスレッド（パニック）。
 pub static UI_ON: AtomicU32 = AtomicU32::new(0);
 
 struct UiCell(UnsafeCell<Option<NetUi>>);
-// SAFETY: 読み取りのスレッドの `arm_game_ui` は `UI_ON` が 0 の間だけ置き（起動の 1 回。入力の入口の分岐を開く前）、以後はゲームのスレッドだけが `game_ui` を通して触る。
+// SAFETY: 読み取りのスレッドの `arm_game_ui` は `UI_ON` が 0 の間だけ設定し（起動の 1 回。入力の入口の分岐を開く前）、以後はゲームのスレッドだけが `game_ui` を通して触る。
 // `UI_ON` は Release で 1 にし、Acquire で読んでから触る。
 unsafe impl Sync for UiCell {}
 static UI: UiCell = UiCell(UnsafeCell::new(None));
 
 struct LazyNet {
     settings: NetSettings,
-    /// 接続コードの置き場（開発用の `clipboard = file` のときだけ使う）。ゲームのフォルダの外であることは置く前に確かめた。
+    /// 接続コードのフォルダ（開発用の `clipboard = file` のときだけ使う）。ゲームのフォルダの外であることは設定する前に検証した。
     code_dir: Option<PathBuf>,
     /// 起動のときに読んだ ini のパス。メニューで言語を替えたとき、この ini の `[ui] lang` を書き換える。
     ini_path: Option<PathBuf>,
@@ -256,13 +238,13 @@ fn play_lost_chime() {
             .spawn(|| {
                 if !crate::notify_win::lost() {
                     game_net_problem(
-                        "戻り道: 切れた知らせの音を鳴らせなかった（PlaySoundW が 0 を返した）"
+                        "戻り道: 切れた知らせの音を鳴らせませんでした（PlaySoundW が 0 を返した）。"
                             .to_string(),
                     );
                 }
             });
         if let Err(e) = spawned {
-            game_net_problem(format!("戻り道: 音を鳴らすスレッドを起こせなかった（{e}）"));
+            game_net_problem(format!("戻り道: 音を鳴らすスレッドの作成不能（{e}）。"));
         }
     }
 }
@@ -275,15 +257,15 @@ fn save_ui_lang(l: Lang) {
     apply_ui_lang(l, spawn_write_ui_lang);
 }
 
-/// 今の言語を置き（原子変数 1 回の書き。見張り・ウィンドウの文を書くスレッドも読む）、ini へ書く仕事を頼む。頼み方は差し込める
+/// 今の言語を設定し（原子変数 1 回の書き。見張り・ウィンドウの文を書くスレッドも読む）、ini へ書く仕事を頼む。頼み方は差し込める
 /// （検査は記録するだけの関数を渡す）。
 fn apply_ui_lang(l: Lang, ask_write: impl FnOnce()) {
     crate::ui_lang::set(l);
     ask_write();
 }
 
-/// ini の `[ui] lang` の書き換えを別のスレッドに頼む（ゲームのスレッドではファイルに触らない。走るのはスレッドを 1 本起こすことだけ）。
-/// 書くのは**そのとき置いてある最後の言語**。書けない・ini の置き場が無いときは本ログへ書く。
+/// ini の `[ui] lang` の書き換えを別のスレッドに頼む（ゲームのスレッドではファイルに触らない。走るのはスレッドを 1 本作ることだけ）。
+/// 書くのは**そのとき設定されている最後の言語**。書けない・ini の場所が無いときは本ログへ書く。
 fn spawn_write_ui_lang() {
     let Some(lazy) = LAZY.get() else {
         return;
@@ -295,11 +277,11 @@ fn spawn_write_ui_lang() {
             let _g = LANG_WRITE.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = crate::ui_lang::save_to_ini(path.as_deref(), crate::ui_lang::current())
             {
-                game_net_problem(format!("言語: ini へ書けなかった（{e}）"));
+                game_net_problem(format!("言語: ini へ書けませんでした（{e}）。"));
             }
         });
     if let Err(e) = spawned {
-        game_net_problem(format!("言語: 書くスレッドを起こせなかった（{e}）"));
+        game_net_problem(format!("言語: 書くスレッドの作成不能（{e}）。"));
     }
 }
 
@@ -307,8 +289,8 @@ fn spawn_write_ui_lang() {
 static WATCH_FEED: std::sync::Mutex<Option<crate::watch_feed::WatchFeed>> =
     std::sync::Mutex::new(None);
 
-/// メニューが観戦の「ランダムマッチ」の一覧の画面に入った（`true`）・出た（`false`）。入るときに一覧の接続のスレッドを起こし、出るときに止める
-/// （ゲームのスレッド。人が画面を操作した tick に 1 回。確保・待ちは起こすスレッドの側）。
+/// メニューが観戦の「ランダムマッチ」の一覧の画面に入った（`true`）・出た（`false`）。入るときに一覧の接続のスレッドを作り、出るときに止める
+/// （ゲームのスレッド。人が画面を操作した tick に 1 回。確保・待ちは作ったスレッドの側）。
 fn feed_watch_list(on: bool) {
     let mut g = WATCH_FEED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut f) = g.take() {
@@ -341,11 +323,11 @@ fn feed_watch_list(on: bool) {
 
 // ---- LAN ----
 //
-// メニューの LAN の項目（「ホスト」「クライアント」「観戦」）は、ゲームのスレッドが運び手のスレッド（`lan_link`）を 1 本起こすだけ（`request_lan`）。運び手が
+// メニューの LAN の項目（「ホスト」「クライアント」「観戦」）は、ゲームのスレッドが運び手のスレッド（`lan_link`）を 1 本作るだけ（`request_lan`）。運び手が
 // ホストの受け口・申し込みを行い、ゲームのネットワークは参加を受けてから運び手が開く（`lan_open_net` → 開くスレッド → 見張り）。ゲームのスレッドに足すのは、
 // 項目を決めた tick の `request_lan` と、毎 tick の原子変数 1 つの読み（`lan_watch_poll`）だけ。
 
-/// LAN の接続でゲームのネットワークを開く頼み（運び手が置き、開くスレッドが 1 度だけ取る）。
+/// LAN の接続でゲームのネットワークを開く頼み（運び手が出し、開くスレッドが 1 度だけ取る）。
 struct LanOpen {
     /// ゲームの受信ソケットを開く自分の LAN のアドレス（ホストは申し込みが届いたアドレス、クライアントは申し込み先へ届くアドレス）。
     ip: Ipv4Addr,
@@ -356,7 +338,7 @@ struct LanOpen {
 }
 static LAN_OPEN: std::sync::Mutex<Option<LanOpen>> = std::sync::Mutex::new(None);
 
-/// LAN の観戦コード（運び手が置き、観戦者のネットワークを開くスレッドが 1 度だけ取る）と、置いた時刻。古いものは使わない。
+/// LAN の観戦コード（運び手が出し、観戦者のネットワークを開くスレッドが 1 度だけ取る）と、出した時刻。古いものは使わない。
 static LAN_WATCH: std::sync::Mutex<Option<LanWatch>> = std::sync::Mutex::new(None);
 
 struct LanWatch {
@@ -365,9 +347,9 @@ struct LanWatch {
     scope: Scope,
     at: std::time::Instant,
 }
-/// 1 = 運び手が観戦コードを受けた（ゲームのスレッドが観戦者のネットワークを開く頼みにする）。
+/// 1 = 運び手が試合のホストから観戦コードを受けた（ゲームのスレッドが観戦者のネットワークを開く頼みにする）。
 static LAN_WATCH_READY: AtomicU32 = AtomicU32::new(0);
-/// 観戦コードを置いてから、観戦者のネットワークを開くスレッドが取るまでの上限。越えたものは使わない（別の観戦に混ざらないように）。
+/// 観戦コードを出してから、観戦者のネットワークを開くスレッドが取るまでの上限。越えたものは使わない（別の観戦に混ざらないように）。
 const LAN_WATCH_FRESH: std::time::Duration = std::time::Duration::from_secs(20);
 /// LAN の頼みを受けた回数（`request_lan` を呼んだ数。本ログ用）。
 static LAN_REQUESTS: AtomicU32 = AtomicU32::new(0);
@@ -403,8 +385,6 @@ fn lan_net_settings(
 mod lan_tests {
     use super::*;
 
-    /// 壊れたら落ちる: LAN の接続が範囲 lan を外れる、自分の LAN のアドレス以外で開く、STUN・UPnP・IPv6・ルームサーバーを使う、ホストが
-    /// 役割の乱数で負ける（観戦コードを出す側になれない）、クライアントが勝つ。
     #[test]
     fn lan_connections_open_on_the_lan_address_with_no_internet_helpers() {
         let base = crate::net_config::from_text(
@@ -455,8 +435,7 @@ mod lan_tests {
         }
     }
 
-    /// 壊れたら落ちる: 前回打った LAN のアドレス（ini の `lan_host`）が入力の初めの値に出ない、LAN の外のアドレスが VPN のネットワークの確認なしで
-    /// 初めの値になる（VPN のネットワークは実機の一覧で決まるので、LAN の中の値と無いときだけを見る）。
+    // VPN のネットワークは実機の一覧で決まるので、LAN の中の値と無いときだけを見る。
     #[test]
     fn the_remembered_lan_address_starts_the_input_only_when_it_is_usable() {
         let at = |s: &str| {
@@ -475,8 +454,6 @@ mod lan_tests {
         assert!(initial_lan_addr(at("8.8.8.8")).is_empty());
     }
 
-    /// 壊れたら落ちる: LAN の接続で、接続コードが人のクリップボードへ書かれる（運び手へ渡らない）、観戦コード（Ctrl+C）の書き先が人の
-    /// クリップボードでない（運び手へ渡って捨てられる）、LAN でない接続が人のクリップボードを使わない。
     #[test]
     fn a_lan_connection_trades_codes_through_the_carrier_and_copies_the_watch_code_for_people() {
         use crate::clipboard::fake::FakeClipboard;
@@ -554,7 +531,7 @@ fn lan_note(line: String) {
     game_net_note(line);
 }
 
-/// 運び手の頼み: ゲームのネットワークを LAN の設定で開く（開くスレッドを起こして返る。開き終わるとゲームのスレッドが次の tick で置く）。
+/// 運び手の頼み: ゲームのネットワークを LAN の設定で開く（開くスレッドを作って返る。開き終わるとゲームのスレッドが次の tick で組み込む）。
 fn lan_open_net(
     ip: Ipv4Addr,
     scope: Scope,
@@ -581,7 +558,7 @@ fn lan_open_net(
     Ok(())
 }
 
-/// 運び手の頼み: 観戦コードを受けた。置いて、ゲームのスレッドに観戦者のネットワークを開かせる（`lan_watch_poll`）。
+/// 運び手の頼み: 試合のホストから観戦コードを受けた。保存して、ゲームのスレッドに観戦者のネットワークを開かせる（`lan_watch_poll`）。
 fn lan_start_watch(code: String, ip: Ipv4Addr, scope: Scope) -> Result<(), String> {
     *LAN_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(LanWatch {
         code,
@@ -606,7 +583,7 @@ fn lan_done(end: lan_link::End) {
     game_net_note(format!("LAN: 運び手の務めを終えた（{end:?}）"));
 }
 
-/// メニューの LAN の項目が決まった（ゲームのスレッド）。運び手のスレッドを起こす。待っているだけのセッションが残っていれば手放す（ホストの受け口のポートを
+/// メニューの LAN の項目が決まった（ゲームのスレッド）。運び手（LAN の接続コードを運ぶスレッド）を作る。待っているだけのセッションが残っていれば手放す（対戦のホストの受け口のポートを
 /// 空けるため。運び手は片づけが済むのを待ってから受け口を開く）。動いている運び手があれば読み捨てる。
 fn request_lan(ask: LanAsk) {
     LAN_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -653,9 +630,9 @@ fn request_lan(ask: LanAsk) {
     }
 }
 
-/// ネットワークの開き: 0 = まだ（か、開けなかった・片づけ終えたのでやり直せる）/ 1 = 別のスレッドが開いている最中 / 2 = ネットワークのセッションを置いた /
-/// 3 = つながりが終わってゲームのスレッドがネットワークのセッションを手放し、ワーカーのスレッドが片づけている最中 / 4 = 片づけている最中に人が「作る」
-/// 「貼る」「ルームで待つ」を選んだ（つなぎ直しのスレッドが片づけ終えたらそのまま開く）。
+/// ネットワークの開き: 0 = まだ（か、開けなかった・片づけ終えたのでやり直せる）/ 1 = 別のスレッドが開いている最中 / 2 = ネットワークのセッションを組み込んだ /
+/// 3 = 接続が終わってゲームのスレッドがネットワークのセッションを手放し、ワーカーのスレッドが片づけている最中 / 4 = 片づけている最中に人が「作る」
+/// 「貼る」「ルームで待つ」を選んだ（再接続のスレッドが片づけ終えたらそのまま開く）。
 static OPEN_STATE: AtomicU32 = AtomicU32::new(0);
 const OPEN_IDLE: u32 = 0;
 const OPEN_BUSY: u32 = 1;
@@ -663,7 +640,7 @@ const OPEN_DONE: u32 = 2;
 const OPEN_CLOSING: u32 = 3;
 const OPEN_REOPEN: u32 = 4;
 
-/// 開くスレッドが作ったネットワークのセッション（ゲームのスレッドが次の tick で取って置く）。対戦者のセッションか、観戦者のセッション（「ルームで観戦」）。
+/// 開くスレッドが作ったネットワークのセッション（ゲームのスレッドが次の tick で取って組み込む）。対戦のセッションか、観戦者のセッション（「ルームで観戦」）。
 enum Pending {
     Play(Box<NetSlot>),
     Watch(Box<WatchNetSlot>),
@@ -673,7 +650,7 @@ enum Pending {
 // （スレッドのローカル・`Rc`）を持たない（`open_net` は読み取りのスレッドで作って、ゲームのスレッドへ渡している）。
 unsafe impl Send for Pending {}
 static PENDING: std::sync::Mutex<Option<Result<Pending, ()>>> = std::sync::Mutex::new(None);
-/// ゲームのスレッドがネットワークのセッションを置けなかった回数（準備が壊れているときだけ。理由の文はゲームのスレッドでは作らず、数だけ本ログへ出す）。
+/// ゲームのスレッドがネットワークのセッションを組み込めなかった回数（準備が壊れているときだけ。理由の文はゲームのスレッドでは作らず、数だけ本ログへ出す）。
 static INSTALL_FAILS: AtomicU32 = AtomicU32::new(0);
 /// ネットワークを開く仕事を始めた回数（開くスレッドが数える。試験のまとめが「頼みが来たか」を見る）。
 static OPEN_TRIES: AtomicU32 = AtomicU32::new(0);
@@ -686,6 +663,15 @@ fn game_net_problem(line: String) {
     game_net_note(line);
 }
 
+/// ネットワークを開いた行。観戦の準備の失敗の句が混ざっていれば簡潔にも出す（成功の文は詳細だけ）。
+fn game_net_open_note(line: String) {
+    if crate::spectate_host::note_has_problem(&line) {
+        game_net_problem(line);
+    } else {
+        game_net_note(line);
+    }
+}
+
 fn game_net_note(line: String) {
     if let Ok(mut g) = GAME_NET_NOTES.lock() {
         if g.len() >= 32 {
@@ -695,7 +681,7 @@ fn game_net_note(line: String) {
     }
 }
 
-// ---- つなぎ直し ----
+// ---- 再接続 ----
 
 enum Released {
     Play(Box<NetSlot>),
@@ -708,15 +694,15 @@ struct Closing {
     /// 手放した tick までに送られた指示の数（`UiLink::order_mark`）。これより前の指示は前の見張りの残りとして捨てる。
     mark: u32,
 }
-// SAFETY: ゲームのスレッドが置いた後はゲームのスレッドは触らず（`NET` からは取り出し済み・`NET_ON` は 0）、ワーカーのスレッドだけが取り出して
+// SAFETY: ゲームのスレッドが移した後はゲームのスレッドは触らず（`NET` からは取り出し済み・`NET_ON` は 0）、ワーカーのスレッドだけが取り出して
 // 落とす。中身は `Pending` と同じく、作ったスレッドに縛られる物を持たない。
 unsafe impl Send for Closing {}
-/// 郵便受け（ゲームのスレッドは `try_lock` だけ。取れなければ次の tick に手放す）。
+/// 手放したセッションを片づけのスレッドへ渡す郵便受け（ゲームのスレッドは `try_lock` だけ。取れなければ次の tick に手放す）。
 static CLOSING: std::sync::Mutex<Option<Closing>> = std::sync::Mutex::new(None);
 /// 1 = 手放したネットワークのセッションを片づけたら、続けて観戦者のネットワークを開く。ゲームのスレッドが書き、ワーカーのスレッドが読んで 0 に戻す。「作る」「貼る」
-/// 「ルームで待つ」が後から選ばれたら 0 に戻す（最後に選んだ方が勝つ）。
+/// 「ルームで待つ」が後から選ばれたら、ゲームのスレッドが 0 に戻す（最後に選んだ方が勝つ）。
 static SPECTATE_AFTER: AtomicU32 = AtomicU32::new(0);
-/// ワーカーのスレッドを起こしたか（1 = 起こした。0 の実行では手放さない —— 片づける者が居ないので、今までどおりネットワークは残る）。
+/// ワーカーのスレッドを作ったか（1 = 作った。0 の実行では手放さない —— 片づける者が居ないので、今までどおりネットワークは残る）。
 static RELINK_STARTED: AtomicU32 = AtomicU32::new(0);
 /// ネットワークが終わってから手放すまでの待ち（ms。`netplay::RELINK_GRACE_MS`。検査は短くする）。
 static RELINK_GRACE: AtomicU32 = AtomicU32::new(netplay::RELINK_GRACE_MS);
@@ -724,18 +710,18 @@ static RELINK_GRACE: AtomicU32 = AtomicU32::new(netplay::RELINK_GRACE_MS);
 const RELINK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 static LINKS_CLOSED: AtomicU32 = AtomicU32::new(0);
 static PAST_LINKS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-/// 本ログに残す片づけたつながりの数の上限（古い方から捨てる。1 つ数 KB）。
+/// 本ログに残す片づけた接続の数の上限（古い方から捨てる。1 つ数 KB）。
 const PAST_LINKS_MAX: usize = 16;
 /// 片づけた観戦者のセッションの数と、その節（本ログの「ネットワークの外」の終わりに足す。観戦者の集計 `WATCH_STATUS` は次の観戦で上書きされる）。
 static WATCHES_CLOSED: AtomicU32 = AtomicU32::new(0);
 static PAST_WATCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// 片づけた観戦の節のうち、まだ本ログの途中に書いていないもの（`take_watch_ends` が取り出して空にする）。観戦者はゲーム内のメニューの
-/// 実行で計測が締まらないので、片づけた次の 1 秒の見回りで書く。上限は `PAST_LINKS_MAX`。
+/// 実行で計測が締まらないので、片づけた次の 1 秒の見回りで読み取りのスレッドが書く。上限は `PAST_LINKS_MAX`。
 static UNLOGGED_WATCHES: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
 /// 今 `CODE_WATCH` に残っている見張りの文は、片づけたときに `PAST_LINKS` へコピー済み（二重に出さない）。
 static CODE_NOTES_ARCHIVED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-/// つながった（ことがある）接続の session（ゲームのスレッドが手放すときに書き、開くスレッドが `GameUi::spent` へコピーする）。
+/// 接続した（ことがある）接続の session（ゲームのスレッドが手放すときに書き、開くスレッドが `GameUi::spent` へコピーする）。
 const SPENT_MAX: usize = 16;
 static SPENT: [AtomicU32; SPENT_MAX] = [const { AtomicU32::new(0) }; SPENT_MAX];
 static SPENT_N: AtomicU32 = AtomicU32::new(0);
@@ -754,8 +740,8 @@ fn spent_sessions() -> Vec<u32> {
         .collect()
 }
 
-/// ネットワークのセッションを手放す（ゲームのスレッド。`route` がネットワークの経路の tick の後に、`NetPlay::relink_due` が真のときだけ呼ぶ）。対戦者のセッションだけ。
-/// 確保しない（セッションは `Box` のまま郵便受けへ移す）・待たない（`try_lock`。取れなければ次の tick）・スレッドを起こさない。手放した後は
+/// ネットワークのセッションを手放す（ゲームのスレッド。`route` がネットワークの経路の tick の後に、`NetPlay::relink_due` が真のときだけ呼ぶ）。対戦のセッションだけ。
+/// 確保しない（セッションは `Box` のまま郵便受けへ移す）・待たない（`try_lock`。取れなければ次の tick）・スレッドを作らない。手放した後は
 /// 次の tick からメニューだけの経路（`ui_only_tick`）。
 fn relink_teardown() {
     release_slot(|s| matches!(s, Slot::Play(_)));
@@ -767,7 +753,7 @@ fn watch_teardown() {
     release_slot(|s| matches!(s, Slot::Watch(w) if w.wp.is_ended() && spectate_join::finished()));
 }
 
-/// ネットワークのセッション（対戦者・観戦者）を手放す共通の部分（ゲームのスレッド）。`allow` がセッションの状態を見て真のときだけ、セッションを郵便受けへ移す。
+/// ネットワークのセッション（対戦・観戦）を手放す共通の部分（ゲームのスレッド）。`allow` がセッションの状態を見て真のときだけ、セッションを郵便受けへ移す。
 /// 手放せたら true。確保しない・待たない（`relink_teardown` の規律）。
 fn release_slot(allow: impl FnOnce(&Slot) -> bool) -> bool {
     if RELINK_STARTED.load(Ordering::Acquire) == 0
@@ -796,7 +782,7 @@ fn release_slot(allow: impl FnOnce(&Slot) -> bool) -> bool {
             if let Some(s) = slot.np.spent_session() {
                 spend(s);
             }
-            // 片づける直前のつながりの状態（終わりの状態なので、成立の前の残りの時計は使わない）。
+            // 片づける直前の接続の状態（終わりの状態なので、成立の前の残りの時計は使わない）。
             let (last, _) = slot.np.ui_conn(0);
             ui.after_teardown(last);
             Released::Play(slot)
@@ -822,7 +808,7 @@ fn release_slot(allow: impl FnOnce(&Slot) -> bool) -> bool {
 /// ワーカーのスレッドの 1 回（`RELINK_POLL` ごと）。片づけている間に人が選んでいたら、最初のネットワークと同じ仕事（`open_game_net`）で開く。
 fn relink_tick() {
     relink_tick_with(|| {
-        // 「ルームで観戦」が決まって手放した（か、片づけている間に選ばれた）なら観戦者のネットワーク、そうでなければ対戦者のネットワーク。予定は開く前に消す
+        // 「ルームで観戦」が決まって手放した（か、片づけている間に選ばれた）なら観戦者のネットワーク、そうでなければ対戦のネットワーク。予定は開く前に消す
         // （開けなくても次の片づけへ持ち越さない）。
         let watch = SPECTATE_AFTER.swap(0, Ordering::SeqCst) != 0;
         LAZY.get().map(|lazy| {
@@ -835,7 +821,7 @@ fn relink_tick() {
     });
 }
 
-/// `relink_tick` の中身（検査は開く仕事を偽物にして直に呼ぶ）: 手放されたネットワークのセッションがあれば、前のつながりのネットワークの行を書き留めてからネットワークの組を片づけ、
+/// `relink_tick` の中身（検査は開く仕事を偽物にして直に呼ぶ）: 手放されたネットワークのセッションがあれば、前の接続のネットワークの行を書き留めてからネットワークの組を片づけ、
 /// 片づけている間に人が選んでいた（`OPEN_REOPEN`）なら `reopen` で新しい組を開いてゲームのスレッドへ渡す（`PENDING`）。
 fn relink_tick_with(reopen: impl FnOnce() -> Option<Result<Pending, ()>>) {
     let st = OPEN_STATE.load(Ordering::Acquire);
@@ -867,13 +853,13 @@ fn relink_tick_with(reopen: impl FnOnce() -> Option<Result<Pending, ()>>) {
     }
 }
 
-/// 手放した対戦者のセッションを片づける（ワーカーのスレッド）: 前のつながりのネットワークの行を本ログ用に控えてから、ネットワークの組（見張り・受信スレッド・受信ソケット）を
+/// 手放した対戦のセッションを片づける（ワーカーのスレッド）: 前の接続のネットワークの行を本ログ用に控えてから、ネットワークの組（見張り・受信スレッド・受信ソケット）を
 /// 止めて閉じる。
 fn close_play(slot: NetSlot, link: &Arc<UiLink>, mark: u32) {
     let n = LINKS_CLOSED.fetch_add(1, Ordering::SeqCst) + 1;
-    // ゲームのスレッドはもうネットワークの数をコピーしない（`NET_ON` が 0）ので、ここで読む値が前のつながりの最後の値。
+    // ゲームのスレッドはもうネットワークの数をコピーしない（`NET_ON` が 0）ので、ここで読む値が前の接続の最後の値。
     let mut text = format!(
-        "\n==== {n} 回目のつながり（片づけた。この節の数はこのつながりのぶん）====\nネットワーク: {}\n{}\n{}{}",
+        "\n==== {n} 回目の接続（片づけ済み。この節の数はこの接続のぶん）====\nネットワーク: {}\n{}\n{}{}",
         NET_STATUS.snapshot().text(),
         NET_STATUS.menu_text(),
         NET_STATUS.timing_text(),
@@ -885,21 +871,23 @@ fn close_play(slot: NetSlot, link: &Arc<UiLink>, mark: u32) {
         let mut watch = CODE_WATCH.lock().unwrap_or_else(|e| e.into_inner());
         match (watch.as_mut(), recv) {
             (Some(w), Some(r)) => {
-                let stats = net_code_game::close_parts(np, net, w, r, link, mark);
+                let (stats, spectate) = net_code_game::close_parts(np, net, w, r, link, mark);
                 text += &format!("\n受信 {stats:?}");
+                text += &closed_spectate_text(spectate.as_ref());
                 for l in w.notes() {
                     text += &format!("\n{l}");
                 }
             }
             (w, r) => {
-                // 来ない見込み（ゲーム内のメニューの実行は、開くときに見張りと受信スレッドを必ず置く）。在るものだけ止める。
+                // 来ない見込み（ゲーム内のメニューの実行は、開くときに見張りと受信スレッドを必ず作る）。在るものだけ止める。
                 drop((np, net));
                 if let Some(w) = w {
                     w.stop();
                 }
-                drop(r);
+                let spectate = r.and_then(|r| r.stop_with_spectate().1);
                 link.reset_for_next_watcher(mark);
                 text += "\n（片づけ: 見張りか受信スレッドが無かった）";
+                text += &closed_spectate_text(spectate.as_ref());
             }
         }
     }
@@ -912,8 +900,15 @@ fn close_play(slot: NetSlot, link: &Arc<UiLink>, mark: u32) {
         past.push(text);
     }
     game_net_note(format!(
-        "ネットワーク: {n} 回目のつながりを片づけた（見張り・受信スレッドを止め、受信ソケットを閉じた。メニューは「つなぐ前」）"
+        "ネットワーク: {n} 回目の接続を片づけました（見張りと受信の処理を停止し、受信ソケットを閉じました。メニューは「接続前」）。"
     ));
+}
+
+/// 片づけた対戦の節に足す、止めた時点の観戦のホストの集計（観戦・観戦者のツリー・上り回線速度の測定の行）。受信スレッドが無くなると
+/// `net_status` はこれらを読めないので、止めた直後に控える。観戦のホストを使っていなければ空。
+fn closed_spectate_text(spec: Option<&spectate_host::Snapshot>) -> String {
+    spec.map(|s| format!("\n{}", s.lines(crate::log_mode::detail())))
+        .unwrap_or_default()
 }
 
 /// 手放した観戦者のセッションを片づける（ワーカーのスレッド）: 観戦者のルームのスレッドと受信スレッドを止めて受信ソケットを閉じ、観戦者の集計の行を書き留める。
@@ -949,7 +944,7 @@ fn close_watch(w: WatchNetSlot, link: &Arc<UiLink>, mark: u32) {
         unlogged.push((n, body));
     }
     game_net_note(format!(
-        "観戦: {n} 回目の観戦者のセッションを片づけた（ルームのスレッド・受信スレッドを止め、受信ソケットを閉じた。メニューは「つなぐ前」）"
+        "観戦: {n} 回目の観戦者のセッションを片づけました（ルームと受信の処理を停止し、受信ソケットを閉じました。メニューは「接続前」）。"
     ));
 }
 
@@ -983,7 +978,7 @@ pub fn watch_live_text() -> Option<String> {
     })
 }
 
-/// ワーカーのスレッドを起こす（開くスレッドから。実行で 1 回だけ）。起こせなければ手放さない（ネットワークはつながりが終わっても残り、起動し直すまで
+/// ワーカーのスレッドを作る（開くスレッドから。実行で 1 回だけ）。作れなければ手放さない（ネットワークは接続が終わっても残り、起動し直すまで
 /// 開き直せない）。
 fn start_relink_thread() {
     if RELINK_STARTED.swap(1, Ordering::SeqCst) != 0 {
@@ -997,7 +992,7 @@ fn start_relink_thread() {
                 // パニックは受けて外へ出さない（スレッドの入口）。片づけの途中でパニックしたら、開き直せる形に戻す。
                 if catch_unwind(relink_tick).is_err() {
                     game_net_problem(
-                        "ネットワーク: 片づけのワーカーでパニックした（開き直せる形に戻した）"
+                        "ネットワーク: 片づけのワーカーでパニックしました（開き直せる形に戻した）。"
                             .to_string(),
                     );
                     OPEN_STATE.store(OPEN_IDLE, Ordering::SeqCst);
@@ -1007,13 +1002,13 @@ fn start_relink_thread() {
     if let Err(e) = spawned {
         RELINK_STARTED.store(0, Ordering::SeqCst);
         game_net_problem(format!(
-            "ネットワーク: 片づけのワーカーのスレッドを起こせない（{e}）。つながりが終わった後は起動し直すまで開き直せない"
+            "ネットワーク: 片づけのワーカーのスレッドの作成不能（{e}）。接続が終わった後は起動し直すまで開き直せません。"
         ));
     }
 }
 
-/// ゲーム内のメニューを置く（読み取りのスレッド。`SCRIPT_ON` と `NET_ON` が 0 の間だけ）。ネットワークは開かない。メニューのセッションと、ネットワークを開くのに
-/// 要るものを置き、`arm_net` と同じ準備の確かめをする。
+/// ゲーム内のメニューを組み込む（読み取りのスレッド。`SCRIPT_ON` と `NET_ON` が 0 の間だけ）。ネットワークは開かない。メニューのセッションと、ネットワークを開くのに
+/// 要るものを用意し、`arm_net` と同じ準備のチェックをする。
 pub fn arm_game_ui(
     s: &NetSettings,
     set_state_fn: u32,
@@ -1053,11 +1048,11 @@ fn arm_game_ui_with(
     ranges: &[(u32, u32)],
 ) -> Result<String, String> {
     if SCRIPT_ON.load(Ordering::SeqCst) != 0 || NET_ON.load(Ordering::SeqCst) != 0 {
-        return Err("入口の分岐がもう開いている".to_string());
+        return Err("入口の分岐が既に開いています".to_string());
     }
     check_ready(set_state_fn, ranges)?;
     if UI_ON.load(Ordering::SeqCst) != 0 || LAZY.get().is_some() {
-        return Err("ゲーム内のメニューはもう置いてある".to_string());
+        return Err("ゲーム内のメニューは設定済み".to_string());
     }
     SET_STATE_FN.store(set_state_fn, Ordering::SeqCst);
     GAME_TID.store(0, Ordering::SeqCst);
@@ -1073,10 +1068,10 @@ fn arm_game_ui_with(
         ini_path,
         link: Arc::clone(&link),
     })
-    .map_err(|_| "ゲーム内のメニューはもう置いてある".to_string())?;
+    .map_err(|_| "ゲーム内のメニューは設定済み".to_string())?;
     let room = room_item(s, initial);
     // 「名前」の項目: 今の名前（打てない文字は `?` に直した表示用の形）。メニューで決めた名前・ルーム名・同期方式・ディレイ・サイドは、
-    // 決めたとき別のスレッドが ini の該当の行へ書く（`ini_save`）。
+    // 決めたとき、ゲームのスレッドが作った別のスレッドが ini の該当の行へ書く（`ini_save`）。
     // 「サイド」の初めの値は「おまかせ」（ini に `host_seat` があればその席）。
     let ui = NetUi::new(ini, link, &BOARD)
         .with_start_auto(start_auto)
@@ -1187,7 +1182,7 @@ fn return_stats_text() -> String {
     )
 }
 
-/// 本ログの「ネットワークの外」の行へ足すメニューの数え（メニューを置いていない実行は空）。
+/// 本ログの「ネットワークの外」の行へ足すメニューの数え（メニューが無い実行は空）。
 fn ui_stats_text() -> String {
     if LAZY.get().is_none() {
         return String::new();
@@ -1210,22 +1205,22 @@ fn ui_stats_text() -> String {
 }
 
 /// 台本の `type=` / `bs=` / `enter=` の文字を、ルーム名の入力欄へ入れた・入力欄が閉じていて捨てた単位の数（ゲームのスレッドが書き、本ログが読む。
-/// 実機の回で台本の文字が届いたかを見る）。
+/// 実機の検証で台本の文字が届いたかを見る）。
 static TYPED_PUSHED: AtomicU32 = AtomicU32::new(0);
 static TYPED_DROPPED: AtomicU32 = AtomicU32::new(0);
 
-/// ゲーム内のメニューが置かれていて、ネットワークをまだ開いていないか（計測が「ネットワークが終わるのを待つ」判定で使う）。
+/// ゲーム内のメニューが組み込まれていて、ネットワークをまだ開いていないか（計測が「ネットワークが終わるのを待つ」判定で使う）。
 pub fn net_pending() -> bool {
     UI_ON.load(Ordering::SeqCst) != 0 && NET_ARMED.load(Ordering::SeqCst) == 0
 }
 
 /// ネットワークを開く頼み（ゲームのスレッド）。別のスレッドに開かせる（受信ソケット・STUN の問い合わせは待つので）。すでに開いている最中・開いた後は
-/// 何もしない。ゲームのスレッドで走るのはスレッドを 1 本起こすことだけで、人が「作る」「貼る」を決めた tick に 1 回。その tick はマッチも
+/// 何もしない。ゲームのスレッドで走るのはスレッドを 1 本作ることだけで、人が「作る」「貼る」を決めた tick に 1 回。その tick はマッチも
 /// lockstep も動いていない（ネットワークのセッションがまだ無い）ので遅延に効かない。起動のときに待たせておく案は「選ばれるまで何も起こさない」に反する
 /// ので採らない。
 fn request_open() {
-    // 前のつながりをつなぎ直しのスレッドが片づけている最中（`OPEN_CLOSING`）なら、片づけ終えたスレッドがそのまま開く（`OPEN_REOPEN`。ここではスレッドを
-    // 起こさない）。片づけ終えた瞬間と重なったら、もう一度見て `OPEN_IDLE` からの経路へ行く（3 回まで）。
+    // 前の接続を再接続のスレッドが片づけている最中（`OPEN_CLOSING`）なら、片づけ終えたスレッドがそのまま開く（`OPEN_REOPEN`。ここではスレッドを
+    // 作らない）。片づけ終えた瞬間と重なったら、もう一度見て `OPEN_IDLE` からの経路へ行く（3 回まで）。
     let mut won = false;
     for _ in 0..3 {
         match OPEN_STATE.load(Ordering::SeqCst) {
@@ -1268,7 +1263,7 @@ fn request_open() {
     spawn_open(lazy, false);
 }
 
-/// ネットワーク（対戦者のネットワークか観戦者のネットワーク）を開くスレッドを起こす（ゲームのスレッド。`OPEN_BUSY` に変えた後に 1 回だけ呼ぶ）。起こせなければ
+/// ネットワーク（対戦のネットワークか観戦者のネットワーク）を開くスレッドを作る（ゲームのスレッド。`OPEN_BUSY` に変えた後に 1 回だけ呼ぶ）。作れなければ
 /// 本ログに書き、メニューへ「内部の不具合」を知らせて、やり直せる形（`OPEN_IDLE`）に戻す。
 fn spawn_open(lazy: &'static LazyNet, watch: bool) {
     let spawned = std::thread::Builder::new()
@@ -1283,7 +1278,7 @@ fn spawn_open(lazy: &'static LazyNet, watch: bool) {
             *g = Some(r);
         });
     if let Err(e) = spawned {
-        game_net_problem(format!("ネットワークを開くスレッドを起こせない: {e}"));
+        game_net_problem(format!("ネットワーク: 開くスレッドの作成不能（{e}）。"));
         let n = Note {
             event: Event::Internal,
             seq: 1,
@@ -1294,9 +1289,9 @@ fn spawn_open(lazy: &'static LazyNet, watch: bool) {
     }
 }
 
-/// 「ルームで観戦」が決まった（ゲームのスレッド）。**対戦者のネットワークは開かない。** 状態ごとの扱い:
-/// - `OPEN_IDLE`: 開くスレッドを起こす。`OPEN_CLOSING`: 片づけ終えたワーカーのスレッドが続けて開く（`SPECTATE_AFTER`）。
-/// - `OPEN_DONE`: つながっていないセッション（待っているだけの対戦者のセッション・終わった観戦者のセッション）は手放して、続けて開く。使っているセッションは手放さず、
+/// 「ルームで観戦」が決まった（ゲームのスレッド）。**対戦のネットワークは開かない。** 状態ごとの扱い:
+/// - `OPEN_IDLE`: 開くスレッドを作る。`OPEN_CLOSING`: 片づけ終えたワーカーのスレッドが続けて開く（`SPECTATE_AFTER`）。
+/// - `OPEN_DONE`: 接続していないセッション（待っているだけの対戦のセッション・終わった観戦者のセッション）は手放して、続けて開く。使っているセッションは手放さず、
 ///   指示を読み捨てる（来ない見込み）。
 /// - `OPEN_BUSY` / `OPEN_REOPEN`: 読み捨てる。
 fn request_spectate() {
@@ -1308,7 +1303,7 @@ fn request_spectate() {
                     .compare_exchange(OPEN_IDLE, OPEN_BUSY, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    // 片づけ終えた瞬間と重なった（`OPEN_CLOSING` の枝で予定を置いた後に `OPEN_IDLE` へ戻された）なら、予定は要らない
+                    // 片づけ終えた瞬間と重なった（`OPEN_CLOSING` の枝で予定を書いた後に `OPEN_IDLE` へ戻された）なら、予定は要らない
                     // （ここで直に開く）。残すと次の片づけで 2 本目を開く。
                     SPECTATE_AFTER.store(0, Ordering::SeqCst);
                     match LAZY.get() {
@@ -1335,7 +1330,7 @@ fn request_spectate() {
             OPEN_DONE => {
                 SPECTATE_AFTER.store(1, Ordering::SeqCst);
                 let released = release_slot(|s| match s {
-                    // 対戦者のセッション: まだ誰ともつながっていない（待っているだけ。メニューが「ルームで観戦」を出すのはこのときだけ）。
+                    // 対戦のセッション: まだ誰とも接続していない（待っているだけ。メニューが「ルームで観戦」を出すのはこのときだけ）。
                     Slot::Play(p) => matches!(p.np.ui_conn(0).0, Conn::Waiting),
                     // 観戦者のセッション: 終わっていて、ルームのスレッドが最後の状態を書き終えた。
                     Slot::Watch(w) => w.wp.is_ended() && spectate_join::finished(),
@@ -1370,9 +1365,9 @@ fn spectate_asked(out: &UiOut) -> bool {
     out.spectate_open
 }
 
-/// 起動のときに rollback の入口を書くかを決める「望み」。**対戦者は望みによらず `Rollback`**（ini が delay 方式でも、キャラセレクトの Tab で
+/// 起動のときに rollback の入口を書くかを決める「望み」。**対戦は望みによらず `Rollback`**（ini が delay 方式でも、キャラセレクトの Tab で
 /// rollback へ替えられるように）。観戦者はマッチを動かさないので、ini が delay 方式の実行は 1 バイトも書かない（走査の call だけを
-/// `arm_watch_scan` が置く）。
+/// `arm_watch_scan` が設定する）。
 fn install_wish(s: &NetSettings) -> higanr_core::wire::Mode {
     if s.code_side == Some(CodeSide::Spectate) {
         s.mode_wish().mode
@@ -1397,7 +1392,7 @@ fn play_config(s: &NetSettings, rb_wired: bool) -> netplay::Config {
         // キャラセレクトの Tab で rollback へ替えられる。
         rollback_able: rb_wired,
         // 対戦の成立を READY で待つのは、ゲーム内のメニューの実行だけ（両者が「妖怪 対 妖怪」を選んだら成立。`match_gate`）。
-        // `offer` / `answer` は繋がったときに成立する。
+        // `offer` / `answer` は接続したときに成立する。
         match_gate: s.code_side == Some(CodeSide::Game),
         // 遅れの量をホストが決める（`delay_pick`）のも、ゲーム内のメニューの実行だけ。ini の `lat_plan` を書いた実行は予定のほうを使う。
         delay_pick: s.code_side == Some(CodeSide::Game) && s.lat_plan.is_empty(),
@@ -1407,19 +1402,21 @@ fn play_config(s: &NetSettings, rb_wired: bool) -> netplay::Config {
         } else {
             0
         },
+        // ホストの決め方はゲーム内のメニューの見張りが接続ごとに決める（`LinkSlot::set_host_pick`）。
+        host_pick: None,
     }
 }
 
-/// コードを受け渡すクリップボード（ini の `clipboard`。開発用の `file` は置き場の下のファイル）。
+/// 人とゲームの間でコードを受け渡すクリップボード（ini の `clipboard`。開発用の `file` はコードのフォルダの下のファイル）。
 fn open_clipboard(s: &NetSettings, lazy: &LazyNet) -> Result<Box<dyn Clipboard>, String> {
     Ok(match (s.clipboard, lazy.code_dir.as_deref()) {
         (ClipboardKind::System, _) => Box::new(SystemClipboard),
         (ClipboardKind::File, Some(d)) => {
             std::fs::create_dir_all(d)
-                .map_err(|e| format!("置き場 {} を作れない: {e}", d.display()))?;
+                .map_err(|e| format!("場所 {} の作成不能: {e}", d.display()))?;
             Box::new(FileClipboard::new(d.to_path_buf()))
         }
-        (ClipboardKind::File, None) => return Err("接続コードの置き場が決まっていない".to_string()),
+        (ClipboardKind::File, None) => return Err("接続コードの場所が未決定".to_string()),
     })
 }
 
@@ -1445,17 +1442,17 @@ fn code_clips(
     Ok((Box::new(LanClip(Arc::clone(bridge))), spectate))
 }
 
-/// ネットワークを開く（開くスレッド。`code_side = game`）: 受信ソケット・STUN・見張り・ネットワークのセッション。`open_net` の接続コードの形と同じ手順で、置き場へは触らない
-/// （`clipboard = file` のときだけ置き場の下のファイルを使う）。戻りは置くネットワークのセッション。
+/// ネットワークを開く（開くスレッド。`code_side = game`）: 受信ソケット・STUN・見張り・ネットワークのセッション。`open_net` の接続コードの形と同じ手順で、コードのフォルダへは触らない
+/// （`clipboard = file` のときだけコードのフォルダの下のファイルを使う）。戻りは組み込むネットワークのセッション。
 fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
-    // LAN の接続の頼みがあれば（運び手が置いた）、その設定とコードの運び先で開く。ほかの接続は今までどおり。
+    // LAN の接続の頼みがあれば（運び手が出した）、その設定とコードの運び先で開く。ほかの接続は今までどおり。
     let lan = LAN_OPEN.lock().unwrap_or_else(|e| e.into_inner()).take();
     let named = match &lan {
         Some(l) => lan_net_settings(lazy.settings_now(), l.ip, l.scope, Some(l.role)),
         None => lazy.settings_now(),
     };
     let s = &named;
-    // 役割の乱数は開くたびに引く（ini に書いてあればその値。つなぎ直しでも同じ値）。
+    // 役割の乱数は開くたびに引く（ini に書いてあればその値。再接続でも同じ値）。
     let nonce = s.role_nonce.unwrap_or_else(default_nonce);
     let rb_wired = crate::rollback_play_win::armed();
     let cfg = play_config(s, rb_wired);
@@ -1480,11 +1477,11 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
         GameUi {
             link: Arc::clone(&lazy.link),
             clip,
-            // ルームサーバー: OS のプロキシの設定に従う製品の待ち。
+            // ルームサーバー: OS のプロキシの設定に従う製品用の既定（`RoomOptions::product`）。
             room: s.room_server.clone().map(RoomOptions::product),
             // ルームへ入った名を `room` に書く ini。
             ini_path: lazy.ini_path.clone(),
-            // つなぎ直し: 前のつながりで使ったコードは読まない。
+            // 再接続: 前の接続で使ったコードは読まない。
             spent: spent_sessions(),
             lan: lan_bridge,
             spectate_clip,
@@ -1492,7 +1489,7 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
     )?;
     let local = local_addr.map_or("（分からない）".to_string(), |a| a.to_string());
     let stun = watch.facts().stun;
-    // 前のつながりの見張り（止めてある。文は片づけたときに本ログへコピーしてある）と置き換える。
+    // 前の接続の見張り（止めてある。文は片づけたときに本ログへコピーしてある）と置き換える。
     *CODE_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(watch);
     CODE_NOTES_ARCHIVED.store(false, Ordering::SeqCst);
     *OPEN_INFO.lock().unwrap_or_else(|e| e.into_inner()) = Some(OpenInfo {
@@ -1509,11 +1506,11 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
     // 1 回目の行の文字は今までどおり。
     let nth = LINKS_CLOSED.load(Ordering::SeqCst) + 1;
     let how = if nth == 1 {
-        "最初の操作で開いた".to_string()
+        "最初の操作で開きました".to_string()
     } else {
-        format!("操作で開き直した（{nth} 回目のつながり）")
+        format!("操作で開き直しました（{nth} 回目の接続）")
     };
-    game_net_note(format!(
+    game_net_open_note(format!(
         "ネットワーク: ゲーム内のメニューの{how}。受信ソケット {local}（role_nonce {nonce}。待ちは{}）{note}",
         if timer {
             "高分解能の待機タイマー"
@@ -1529,12 +1526,12 @@ fn open_game_net(lazy: &'static LazyNet) -> Result<Box<NetSlot>, String> {
 fn open_job(open: impl FnOnce() -> Result<Box<NetSlot>, String>) -> Result<Pending, ()> {
     OPEN_TRIES.fetch_add(1, Ordering::Relaxed);
     let r = catch_unwind(AssertUnwindSafe(open))
-        .unwrap_or_else(|_| Err("ネットワークを開く仕事でパニックした".to_string()));
+        .unwrap_or_else(|_| Err("ネットワークを開く処理でパニックしました".to_string()));
     match r {
         Ok(slot) => Ok(Pending::Play(slot)),
         Err(why) => {
             game_net_problem(format!(
-                "ネットワーク: 開けなかった（{why}）。メニューからやり直せる"
+                "ネットワーク: 開けませんでした（{why}）。メニューからやり直せます。"
             ));
             Err(())
         }
@@ -1546,12 +1543,12 @@ fn open_job(open: impl FnOnce() -> Result<Box<NetSlot>, String>) -> Result<Pendi
 fn open_watch_job(open: impl FnOnce() -> Result<Box<WatchNetSlot>, String>) -> Result<Pending, ()> {
     OPEN_TRIES.fetch_add(1, Ordering::Relaxed);
     let r = catch_unwind(AssertUnwindSafe(open))
-        .unwrap_or_else(|_| Err("観戦者のネットワークを開く仕事でパニックした".to_string()));
+        .unwrap_or_else(|_| Err("観戦者のネットワークを開く処理でパニックしました".to_string()));
     match r {
         Ok(slot) => Ok(Pending::Watch(slot)),
         Err(why) => {
             game_net_problem(format!(
-                "観戦: 観戦者のネットワークを開けなかった（{why}）。メニューからやり直せる"
+                "観戦: 観戦者のネットワークが開けませんでした（{why}）。メニューからやり直せます。"
             ));
             Err(())
         }
@@ -1564,23 +1561,23 @@ fn watch_target(link: &UiLink) -> Result<(higanr_core::room::RoomName, String), 
     if let Some(row) = link.spectate_pick() {
         let room = row
             .room_name()
-            .ok_or("一覧から選んだ行の観戦用のルーム名が決まりの外")?;
+            .ok_or("一覧から選んだ行の観戦用のルーム名が規則の範囲外")?;
         return Ok((room, format!("{} vs {}", row.p1.as_str(), row.p2.as_str())));
     }
     let buf = link
         .spectate_name()
-        .ok_or("ルーム名が置かれていない（メニューは名を置いてから指示を送る）")?;
+        .ok_or("ルーム名が未設定（メニューは名を設定してから指示を送る）")?;
     // メニューも同じガード（`RoomName::parse`）で見て渡すが、ここでも見直す（`RoomNameError` の Debug は位置と数だけで、名の文字を含まない）。
     let name = buf
         .parse()
-        .map_err(|e| format!("ルーム名が決まりの外: {e:?}"))?;
+        .map_err(|e| format!("ルーム名が規則の範囲外: {e:?}"))?;
     Ok((name.spectate_of(), name.as_str().to_string()))
 }
 
 /// 観戦者のネットワークを開く（開くスレッド）: 受信ソケット・STUN・受信スレッド・観戦者のセッション・観戦者のルームのスレッド。接続コードの見張りは作らない
 /// （観戦用のコードはルームが運ぶ）。決めたルーム名は `UiLink::spectate_name` から読み、**本ログには書かない**。
 fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
-    // LAN の観戦: 運び手が受けた観戦コードを使い、LAN の設定（範囲 lan・自分の LAN のアドレス・STUN なし）で開く。古い（別の観戦のために置いた）ものは使わない。
+    // LAN の観戦: 運び手が受けた観戦コードを使い、LAN の設定（範囲 lan・自分の LAN のアドレス・STUN なし）で開く。古い（別の観戦のために出した）ものは使わない。
     let lan = LAN_WATCH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1603,7 +1600,7 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
         let base = s
             .room_server
             .clone()
-            .ok_or("ルームサーバー（room_server）が無い（観戦用のルームへ入れない）")?;
+            .ok_or("ルームサーバー（room_server）がありません（観戦用のルームへ入れません）")?;
         (
             JoinSource::Room {
                 room: RoomOptions::product(base),
@@ -1631,35 +1628,48 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
     let (bind, bind_note) = net_udp::resolve_bind(s)?;
     let (mut net, recv) = net_udp::open_for_code_scoped(s.scope, bind)?;
     let local_addr = net.local_addr();
-    let local = local_addr.ok_or("受信ソケットが分からない")?;
+    let local = local_addr.ok_or("受信ソケットが不明")?;
     let timer = net.high_resolution_wait();
-    // 観戦者の候補（返しに載せる）: 自分の受信ソケットと、ini の `stun` があれば見えたアドレス。IPv4 だけ（受信スレッドの観戦は IPv4 の受信ソケットだけ
-    // —— `net_udp::recv_loop_v6`）。
+    // 観戦者の候補（返しに載せる）: 自分の受信ソケットと、ini の `stun` があれば見えたアドレス、開けた IPv6 のソケット。観戦の相手（対戦のホストか中継役）の IPv4・IPv6 の候補の
+    // 全部へ JOIN を送り、最初に STREAM が返った経路に決める（`Watcher`）。
     let mut note = String::new();
+    // 中継する観戦者は UPnP で受信ポートの割り当ても頼む（中継役からの穴あけの補助）。STUN と並行に走らせ、結果は待たない
+    // （受信スレッドが周回で覗く）。
+    let relay = s.relay && source.can_relay();
+    let upnp = relay && net_udp::upnp_begin(s, &net, &mut note);
     let (mapped, stun) = net_udp::stun_state(s, &mut net, &mut note);
+    let v6 = net_udp::open_ipv6(s, &net, &mut note);
     let own = s
-        .candidates_for(local, mapped, None)
+        .candidates_for(local, mapped, v6)
         .map_err(|e| format!("{e}{note}"))?;
     net.note_own_candidates(own.as_slice());
+    if upnp {
+        net.plan_watch_upnp(WatchUpnpPlan::new(s.candidates, local, mapped, v6));
+        note.push_str(" / 観戦者は UPnP の結果を待たずに接続します（結果は接続の後に確認）");
+    }
     let slot = Arc::new(WatchSlot::new());
-    let wp = WatchPlay::new(
+    if relay {
+        slot.enable_relay(own);
+    }
+    let wp = WatchPlay::try_new(
         Arc::clone(&slot),
         WatchConfig {
             wait_budget_us: s.wait_budget_us,
             margin_frames: WATCH_MARGIN_FRAMES,
             // 本物のゲームは選択の画面を持つ。
             require_net_selection: true,
+            ff_max: s.ff_max,
         },
-    );
+    )?;
     let kit = JoinKit {
         source,
-        reader: Reader::new(s, nonce),
+        reader: Reader::new(s, nonce).with_v6(v6.is_some()),
         reply_name: higanr_core::handshake::Name::new(&s.name),
         own,
         slot,
         publisher,
     };
-    // 起こせなければ `net`・`recv` がここで落ちて受信ソケットが閉じる。
+    // 作れなければ `net`・`recv` がここで落ちて受信ソケットが閉じる。
     spectate_join::spawn(kit)?;
     *OPEN_INFO.lock().unwrap_or_else(|e| e.into_inner()) = Some(OpenInfo {
         local: local_addr,
@@ -1668,7 +1678,7 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
     });
     *RECV.lock().unwrap_or_else(|e| e.into_inner()) = Some(recv);
     start_relink_thread();
-    // 観戦者の早送り: 観戦するマッチの方式は繋がるまで分からず、早送りは方式に依らないので、観戦者のネットワークを開くときに走査の call を置く。
+    // 観戦者の早送り: 観戦するマッチの方式は接続するまで分からず、早送りは方式に依らないので、観戦者のネットワークを開くときに走査の call を書く。
     // 書けなくても観戦は続く（早送りが効かないだけ）。
     game_net_note(format!("観戦: 早送り: {}", arm_watch_scan_at_open()));
     let nth = WATCHES_CLOSED.load(Ordering::SeqCst) + 1;
@@ -1692,8 +1702,8 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
     }))
 }
 
-/// 開き終わったネットワークのセッションがあれば取って置く（ゲームのスレッド。ネットワークを開いている最中だけ呼ぶ）。取れる錠でなければ次の tick（待たない）。
-/// 置けなかった・開けなかったら、メニューへ知らせて `OPEN_IDLE` に戻す。ゲームのスレッドの規律: `try_lock`、文字列を作らない、確保しない
+/// 開き終わったネットワークのセッションがあれば取って組み込む（ゲームのスレッド。ネットワークを開いている最中だけ呼ぶ）。取れる錠でなければ次の tick（待たない）。
+/// 組み込めなかった・開けなかったら、メニューへ知らせて `OPEN_IDLE` に戻す。ゲームのスレッドの規律: `try_lock`、文字列を作らない、確保しない
 /// （例外は失敗したネットワークのセッションの解放）。失敗の文は開くスレッド（`open_job`）が書く。
 fn poll_pending() {
     if OPEN_STATE.load(Ordering::Acquire) != OPEN_BUSY {
@@ -1707,9 +1717,16 @@ fn poll_pending() {
     let Some(r) = taken else {
         return;
     };
+    let mut handed = false;
     let placed = match r {
         Ok(Pending::Play(slot)) => install_slot(slot),
-        Ok(Pending::Watch(w)) => install_placed(Slot::Watch(w)),
+        Ok(Pending::Watch(w)) => match install_placed(Slot::Watch(w)) {
+            Ok(()) => true,
+            Err(slot) => {
+                handed = hand_off_unplaced(slot);
+                false
+            }
+        },
         Err(()) => false,
     };
     if placed {
@@ -1722,28 +1739,59 @@ fn poll_pending() {
             ..Note::default()
         });
     }
-    OPEN_STATE.store(OPEN_IDLE, Ordering::SeqCst);
+    if !handed {
+        OPEN_STATE.store(OPEN_IDLE, Ordering::SeqCst);
+    }
 }
 
-/// ネットワークのセッションを `NET` へ置いて動かす（ゲームのスレッド。`NET_ON` が 0 のとき）。置けたら true。原子変数だけで決まる確かめ（`not_ready`）を
-/// 先にする。直に読むアドレスの確かめは `arm_game_ui` が起動のときに済ませてある。
+/// 組み込めなかった観戦者のセッションを、ワーカーのスレッドの片づけ（`relink_tick` → `close_watch`）へ回す（受け渡しのリングの約 8.8 MB を
+/// ゲームのスレッドで解放しない）。回せたら true（状態は `OPEN_CLOSING`）。郵便受けが塞がっているときは、ここで落とす。確保しない・待たない。
+fn hand_off_unplaced(slot: Slot) -> bool {
+    let Slot::Watch(w) = slot else {
+        return false;
+    };
+    if RELINK_STARTED.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let Some(lazy) = LAZY.get() else {
+        return false;
+    };
+    let Ok(mut mailbox) = CLOSING.try_lock() else {
+        return false;
+    };
+    if mailbox.is_some() {
+        return false;
+    }
+    let link = Arc::clone(&lazy.link);
+    let mark = link.order_mark();
+    *mailbox = Some(Closing {
+        slot: Released::Watch(w),
+        link,
+        mark,
+    });
+    OPEN_STATE.store(OPEN_CLOSING, Ordering::SeqCst);
+    true
+}
+
+/// ネットワークのセッションを `NET` へ組み込んで動かす（ゲームのスレッド。`NET_ON` が 0 のとき）。組み込めたら true。原子変数だけで決まるチェック（`not_ready`）を
+/// 先にする。直に読むアドレスのチェックは `arm_game_ui` が起動のときに済ませてある。
 fn install_slot(slot: Box<NetSlot>) -> bool {
-    install_placed(Slot::Play(slot))
+    install_placed(Slot::Play(slot)).is_ok()
 }
 
-/// `install_slot` の中身（対戦者のセッションも観戦者のセッションも同じ手順）。観戦者のセッションは、読み取りのスレッドが `_watch_frames.csv` を開く印
-/// （`spectate_watch::set_armed`）を先に立て、先頭のフックは置かない。
-fn install_placed(slot: Slot) -> bool {
+/// `install_slot` の中身（対戦のセッションも観戦者のセッションも同じ手順）。観戦者のセッションは、読み取りのスレッドが `_watch_frames.csv` を開く印
+/// （`spectate_watch::set_armed`）を先に立て、先頭のフックは設定しない。
+fn install_placed(slot: Slot) -> Result<(), Slot> {
     if NET_ON.load(Ordering::SeqCst) != 0
         || not_ready(SET_STATE_FN.load(Ordering::SeqCst)).is_some()
     {
         INSTALL_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
+        return Err(slot);
     }
     // SAFETY: 引数の無い呼び出し。
     GAME_TID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
-    // ネットワークの数を 0 から（つなぎ直しの 2 本目から意味がある）。`publish` は CHECK のズレの欄を上書きしないので、消さないと次のつながりの行に
-    // 残る。マッチをやめた数もセッションごとに 0 から。確保も待ちも無い（ネットワークのセッションを置く tick に 1 回。マッチの外）。
+    // ネットワークの数を 0 から（再接続の 2 本目から意味がある）。`publish` は CHECK のズレの欄を上書きしないので、消さないと次の接続の行に
+    // 残る。マッチをやめた数もセッションごとに 0 から。確保も待ちも無い（ネットワークのセッションを組み込む tick に 1 回。マッチの外）。
     NET_STATUS.reset();
     for a in [&RB_ABORTS, &RB_ABORT_FIRST, &RB_ABORT_FRAME] {
         a.store(0, Ordering::Relaxed);
@@ -1763,15 +1811,15 @@ fn install_placed(slot: Slot) -> bool {
     }
     NET_ON.store(1, Ordering::Release);
     OPEN_STATE.store(OPEN_DONE, Ordering::SeqCst);
-    true
+    Ok(())
 }
 
-/// メニューの入れ物（ゲームのスレッドだけが触る。メニューを置いていない実行は `None`）。tick の中で借りて、その tick の中で返す。
+/// メニューの入れ物（ゲームのスレッドだけが触る。メニューが無い実行は `None`）。tick の中で借りて、その tick の中で返す。
 fn game_ui() -> Option<&'static mut NetUi> {
     if UI_ON.load(Ordering::Acquire) == 0 {
         return None;
     }
-    // SAFETY: `UI_ON` を Acquire で 1 と読んだので、`arm_game_ui` が置いた入れ物が見える。触るのはゲームのスレッドだけで、借りた参照は
+    // SAFETY: `UI_ON` を Acquire で 1 と読んだので、`arm_game_ui` が設定した入れ物が見える。触るのはゲームのスレッドだけで、借りた参照は
     // 呼び出した tick の中で使い終える。
     unsafe { (*UI.0.get()).as_mut() }
 }
@@ -1798,7 +1846,7 @@ fn ui_only_step(game: &mut NetGame<'_>) -> UiOut {
     let Some(ui) = game_ui() else {
         return UiOut::default();
     };
-    // 片づけている最中（`OPEN_CLOSING`）は「閉じている」と見せる（人が「作る」を選べば開く頼みになり、つなぎ直しのスレッドが片づけ終えてから開く）。
+    // 片づけている最中（`OPEN_CLOSING`）は「閉じている」と見せる（人が「作る」を選べば開く頼みになり、再接続のスレッドが片づけ終えてから開く）。
     let net = match OPEN_STATE.load(Ordering::Relaxed) {
         OPEN_BUSY | OPEN_REOPEN => NetPhase::Opening,
         _ => NetPhase::Closed,
@@ -1830,7 +1878,7 @@ fn ui_only_step(game: &mut NetGame<'_>) -> UiOut {
 }
 
 /// マッチ中の行を更新する（ゲームのスレッド。`h` が `None` なら消す）。材料（`NetPlay::hud_facts`。進め直しの数の差を取るので呼ぶと状態が動く）は
-/// **メニューを置いている実行（`UI_ON`）の中だけ**で作る: offer / answer の実行に 0 の上乗せをしない。
+/// **メニューを組み込んでいる実行（`UI_ON`）の中だけ**で作る: offer / answer の実行に 0 の上乗せをしない。
 fn ui_hud_tick(np: &mut NetPlay) {
     let Some(ui) = game_ui() else {
         return;
@@ -1844,11 +1892,11 @@ fn ui_hud_tick(np: &mut NetPlay) {
 
 /// ネットワークをまだ開いていない実行の 1 tick。画面 6 以外・メニューが握らない tick は台本があれば台本、無ければ 0 = poll_all へ返す。画面 6 は
 /// メニューが必ず握る（`NetUi::tick` は画面 6 では常に action を返す）ので、画面 6・カーソル 4 の決定がゲームへ漏れる経路は無い。
-/// ネットワークのセッションを置いた tick もここへ来ない（`route` が先に置いてネットワークの経路へ回す）。
+/// ネットワークのセッションを組み込んだ tick もここへ来ない（`route` が先に組み込んでネットワークの経路へ回す）。
 fn ui_only_tick(mut engine: Option<&mut Engine>, io: &mut RealTickIo, k: u32) -> u32 {
     if NET_ON.load(Ordering::Acquire) != 0 {
         // 来ない見込み（`route` が `NET_ON` を見てから呼ぶ）。来たら、ゲーム自身の poll へ任せず（画面 6・カーソル 4 の決定が漏れうる）、
-        // 0 を 3 本流して poll_all を呼ばずに戻る。
+        // 0 を 3 本（席 0〜2）ゲームの入力へ流して poll_all を呼ばずに戻る。
         for i in 0..3 {
             io.feed(i, 0);
         }
@@ -1875,8 +1923,8 @@ fn ui_only_tick(mut engine: Option<&mut Engine>, io: &mut RealTickIo, k: u32) ->
     }
 }
 
-/// 台本の入れ物とアドレスを置く（読み取りのスレッド。`SCRIPT_ON` が 0 の間だけ）。直に読むアドレスが読めない・関数のアドレスが
-/// 0 なら断る（置いたものは使われない）。
+/// 台本の入れ物とアドレスを設定する（読み取りのスレッド。`SCRIPT_ON` が 0 の間だけ）。直に読むアドレスが読めない・関数のアドレスが
+/// 0 なら断る（設定したものは使われない）。
 pub fn arm(script: Script, addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), String> {
     arm_io(addrs, feed_fn, local_fn)?;
     // SAFETY: `SCRIPT_ON` が 0 なので、ゲームのスレッドは入れ物に触らない（`EngineCell` の Sync の注。`arm_io` が見た）。
@@ -1886,11 +1934,11 @@ pub fn arm(script: Script, addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Res
     Ok(())
 }
 
-/// アドレスと関数のアドレスだけを置き、台本の入れ物は空にする（台本の無いネットワークの実行。`SCRIPT_ON` が 0 の間だけ）。断る条件は `arm` と同じ。
-/// 入力の入口は、この後にネットワークのセッションを置いて動かしたときだけ開ける（`start`）。
+/// アドレスと関数のアドレスだけを設定し、台本の入れ物は空にする（台本の無いネットワークの実行。`SCRIPT_ON` が 0 の間だけ）。断る条件は `arm` と同じ。
+/// 入力の入口は、この後にネットワークのセッションを組み込んで動かしたときだけ開ける（`start`）。
 pub fn arm_io(addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), String> {
     if SCRIPT_ON.load(Ordering::SeqCst) != 0 {
-        return Err("台本がもう動いている".to_string());
+        return Err("台本が既に動作中".to_string());
     }
     if feed_fn == 0 || local_fn == 0 {
         return Err(format!(
@@ -1900,7 +1948,7 @@ pub fn arm_io(addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), Strin
     for (a, len) in addrs.direct_ranges() {
         if a == 0 || read_own_memory(a, len as usize).is_none() {
             return Err(format!(
-                "直に読むアドレス 0x{a:08X}（{len} バイト）が読めない"
+                "直接読むアドレス 0x{a:08X}（{len} バイト）が読み取り不能"
             ));
         }
     }
@@ -1917,7 +1965,7 @@ pub fn arm_io(addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), Strin
     u.store(addrs.gui_ptr, Ordering::SeqCst);
     FEED_FN.store(feed_fn, Ordering::SeqCst);
     LOCAL_FN.store(local_fn, Ordering::SeqCst);
-    // 前の実行の poll のアドレスを持ち越さない（置くのは、この後に照合が合ったときの `arm_poll` だけ）。
+    // 前の実行の poll のアドレスを持ち越さない（設定するのは、この後に照合が合ったときの `arm_poll` だけ）。
     POLL_FN.store(0, Ordering::SeqCst);
     for (a, v) in STATE_SLOTS.iter().zip(PLAYER_SLOTS) {
         a.store(v, Ordering::SeqCst);
@@ -1934,11 +1982,11 @@ pub fn arm_io(addrs: GameAddrs, feed_fn: u32, local_fn: u32) -> Result<(), Strin
     Ok(())
 }
 
-/// 入口の分岐を開く（`SCRIPT_ON` = 1）。関数のアドレスが置かれていなければ開かない。台本の入れ物が空なら、ネットワークが動いているときだけ開く
+/// 入口の分岐を開く（`SCRIPT_ON` = 1）。関数のアドレスが設定されていなければ開かない。台本の入れ物が空なら、ネットワークが動いているときだけ開く
 /// （台本もネットワークも無いのに開くと、入口は毎 tick Rust を呼ぶだけになる）。
 pub fn start() -> Result<(), String> {
     if FEED_FN.load(Ordering::SeqCst) == 0 || LOCAL_FN.load(Ordering::SeqCst) == 0 {
-        return Err("関数のアドレスが置かれていない（arm / arm_io の前）".to_string());
+        return Err("関数のアドレスが未設定（arm / arm_io の前）".to_string());
     }
     // SAFETY: 読むだけ。`SCRIPT_ON` を 1 にする前なので、ゲームのスレッドは入れ物に触らない。
     if unsafe { (*ENGINE.0.get()).is_none() }
@@ -1946,7 +1994,7 @@ pub fn start() -> Result<(), String> {
         && UI_ON.load(Ordering::SeqCst) == 0
     {
         return Err(
-            "台本の入れ物が空で、ネットワークもメニューも動いていない（arm か start_net の前）"
+            "台本の入れ物が空で、ネットワークもメニューも動作していません（arm か start_net の前）"
                 .to_string(),
         );
     }
@@ -1961,13 +2009,13 @@ pub fn stop() {
     NET_ON.store(0, Ordering::SeqCst);
 }
 
-/// ネットワークのセッションと、シードを置く関数のアドレスを置く（読み取りのスレッド。`SCRIPT_ON` と `NET_ON` が 0 の間だけ）。入力の関数のアドレス・描画だけの
-/// フレームの出口が置かれていない、直に読み書きするアドレスが読めない、関数のアドレスが 0 なら断る。
+/// ネットワークのセッションと、シードを設定する関数のアドレスを設定する（読み取りのスレッド。`SCRIPT_ON` と `NET_ON` が 0 の間だけ）。入力の関数のアドレス・描画だけの
+/// フレームの出口が設定されていない、直に読み書きするアドレスが読めない、関数のアドレスが 0 なら断る。
 pub fn arm_net(slot: NetSlot, set_state_fn: u32) -> Result<(), String> {
     arm_net_with(slot, set_state_fn, &net_game::direct_ranges())
 }
 
-/// 観戦者のセッションを置く（`arm_net` の観戦者バージョン。断る条件は同じ）。
+/// 観戦者のセッションを組み込む（`arm_net` の観戦者バージョン。断る条件は同じ）。
 pub fn arm_watch(slot: WatchNetSlot, set_state_fn: u32) -> Result<(), String> {
     arm_slot(
         Slot::Watch(Box::new(slot)),
@@ -1981,8 +2029,8 @@ fn arm_net_with(slot: NetSlot, set_state_fn: u32, ranges: &[(u32, u32)]) -> Resu
     arm_slot(Slot::Play(Box::new(slot)), set_state_fn, ranges)
 }
 
-/// ネットワークのセッションを置いてよい準備が整っているか（関数のアドレス・描画だけのフレームの出口・直に読み書きするアドレス）。`arm_slot` と
-/// `arm_game_ui`（ネットワークを開く前にメニューを置くとき）と `install_slot`（後からセッションを置くとき）が同じ確かめをする。
+/// ネットワークのセッションを組み込んでよい準備が整っているか（関数のアドレス・描画だけのフレームの出口・直に読み書きするアドレス）。`arm_slot` と
+/// `arm_game_ui`（ネットワークを開く前にメニューを組み込むとき）と `install_slot`（後からセッションを組み込むとき）が同じチェックをする。
 fn check_ready(set_state_fn: u32, ranges: &[(u32, u32)]) -> Result<(), String> {
     match not_ready(set_state_fn) {
         None => {}
@@ -1990,13 +2038,13 @@ fn check_ready(set_state_fn: u32, ranges: &[(u32, u32)]) -> Result<(), String> {
             return Err("関数のアドレスが 0（set_state か、arm / arm_io の前）".to_string());
         }
         Some(NotReady::Exit) => {
-            return Err("描画だけのフレームの出口が入口に置かれていない".to_string());
+            return Err("描画だけのフレームの出口が入口に設定されていません".to_string());
         }
     }
     for &(a, len) in ranges {
         if read_own_memory(a, len as usize).is_none() {
             return Err(format!(
-                "直に読み書きするアドレス 0x{a:08X}（{len} バイト）が読めない"
+                "直接読み書きするアドレス 0x{a:08X}（{len} バイト）が読み取り不能"
             ));
         }
     }
@@ -2009,7 +2057,7 @@ enum NotReady {
     Exit,
 }
 
-/// 関数のアドレスと出口が置かれていなければ、その理由。確保しない・待たない（ゲームのスレッドの `install_slot` が使う。直に読むアドレスの確かめは
+/// 関数のアドレスと出口が設定されていなければ、その理由。確保しない・待たない（ゲームのスレッドの `install_slot` が使う。直に読むアドレスのチェックは
 /// 起動のときの `arm_game_ui` と、ネットワークを開くスレッドの `open_game_net` が済ませる）。
 fn not_ready(set_state_fn: u32) -> Option<NotReady> {
     if set_state_fn == 0
@@ -2026,7 +2074,7 @@ fn not_ready(set_state_fn: u32) -> Option<NotReady> {
 
 fn arm_slot(slot: Slot, set_state_fn: u32, ranges: &[(u32, u32)]) -> Result<(), String> {
     if SCRIPT_ON.load(Ordering::SeqCst) != 0 || NET_ON.load(Ordering::SeqCst) != 0 {
-        return Err("入口の分岐がもう開いている".to_string());
+        return Err("入口の分岐が既に開いています".to_string());
     }
     check_ready(set_state_fn, ranges)?;
     SET_STATE_FN.store(set_state_fn, Ordering::SeqCst);
@@ -2036,14 +2084,14 @@ fn arm_slot(slot: Slot, set_state_fn: u32, ranges: &[(u32, u32)]) -> Result<(), 
     Ok(())
 }
 
-/// 素の poll の入口を置く（読み取りのスレッド。`arm_io` の後、`SCRIPT_ON` を 1 にする前。0 なら「置かない」）。
+/// 素の poll の入口を設定する（読み取りのスレッド。`arm_io` の後、`SCRIPT_ON` を 1 にする前。0 なら「設定しない」）。
 /// 呼ぶのは `session::run` が `POLL_SITES` の先頭 8 バイトを th09.exe の実バイトと照合して合ったときだけ。
 pub fn arm_poll(addr: u32) {
     POLL_FN.store(addr, Ordering::SeqCst);
 }
 
-/// 立ち絵の 3 本の関数の入口を置く（読み取りのスレッド。`arm_net` の後、`NET_ON` を 1 にする前。3 本とも 0 でないときだけ
-/// 置き、1 本でも 0 なら全部 0 に戻す —— 一部だけ呼ぶ形を作らない）。
+/// 立ち絵の 3 本の関数の入口を設定する（読み取りのスレッド。`arm_net` の後、`NET_ON` を 1 にする前。3 本とも 0 でないときだけ
+/// 設定し、1 本でも 0 なら全部 0 に戻す —— 一部だけ呼ぶ形を作らない）。
 pub fn arm_portrait(fns: [u32; 3]) {
     let ok = fns.iter().all(|&a| a != 0);
     for (slot, a) in PORTRAIT_FNS.iter().zip(fns) {
@@ -2051,12 +2099,12 @@ pub fn arm_portrait(fns: [u32; 3]) {
     }
 }
 
-/// 受信スレッド（開いたら閉じない。プロセスの終わりまで残す）。ゲーム内のメニューの実行だけは、つながりが終わったらワーカーのスレッドが取り出して
-/// 止め（`relink_tick`）、次のつながりを開くスレッドが新しいものを置く。ゲームのスレッドが触るのは、パニックを受けたときの `try_lock` 1 回だけ
+/// 受信スレッド（開いたら閉じない。プロセスの終わりまで残す）。ゲーム内のメニューの実行だけは、接続が終わったらワーカーのスレッドが取り出して
+/// 止め（`relink_tick`）、次の接続を開くスレッドが新しいものを設定する。ゲームのスレッドが触るのは、パニックを受けたときの `try_lock` 1 回だけ
 /// （`bye_after_panic`）。
 static RECV: std::sync::Mutex<Option<RecvThread>> = std::sync::Mutex::new(None);
 
-/// ゲームスレッドの経路でパニックを受けた後、受信スレッドに BYE を出させる（相手は 60 秒の沈黙を待たずに切れる）。錠は待たない: 取れなければ
+/// ゲームスレッドの経路でパニックを受けた後、受信スレッドに BYE を出させる（つながっている相手は 60 秒の沈黙を待たずに切れる）。錠は待たない: 取れなければ
 /// 何もせず、相手は心拍の古さで PONG が止まってから切れる。
 fn bye_after_panic() {
     #[cfg(test)]
@@ -2084,7 +2132,7 @@ pub(crate) fn net_panicked() {
     }
 }
 
-/// ネットワークのセッションを置いた（読み取りのスレッドが `_net_frames.csv` を開くかの印）。
+/// ネットワークのセッションを組み込んだ（読み取りのスレッドが `_net_frames.csv` を開くかの印）。
 static NET_ARMED: AtomicU32 = AtomicU32::new(0);
 
 /// 役割を決める乱数の既定（ini に `nonce` が無いとき。時刻とプロセス番号から。peer_sim の既定と同じ考え方）。
@@ -2097,16 +2145,16 @@ fn default_nonce() -> u64 {
     z ^ (z >> 31)
 }
 
-/// 接続コードの見張り（ini の `code_side` の形だけ）。プロセスの終わりまで持つ（繋がった・ネットワークが終わった・諦めたときに自分で終わる）。
-/// ゲーム内のメニューの実行は、つながりを片づけるときに止め（文と数は残す）、次のつながりを開くときに置き換える。
+/// 接続コードの見張り（ini の `code_side` の形だけ）。プロセスの終わりまで持つ（接続した・ネットワークが終わった・諦めたときに自分で終わる）。
+/// ゲーム内のメニューの実行は、接続を片づけるときに止め（文と数は残す）、次の接続を開くときに置き換える。
 static CODE_WATCH: std::sync::Mutex<Option<net_code::Watch>> = std::sync::Mutex::new(None);
-/// 観戦用のコードの見張り（ini の `code_side = spectate` の形だけ。M6-3。`WATCH_CODE` も終わりまで持つ）。
+/// 観戦用のコードの見張り（ini の `code_side = spectate` の形だけ。`WATCH_CODE` も終わりまで持つ）。
 static WATCH_CODE: OnceLock<spectate_watch_code::WatchCode> = OnceLock::new();
-/// ネットワークを開いたときに分かったこと（受信ソケットのアドレス・範囲・STUN の結果。試験のまとめ）。ゲーム内のメニューの実行は、つながりを開くたびに
-/// 置き換える（最後のつながりの値）。
+/// ネットワークを開いたときに分かったこと（受信ソケットのアドレス・範囲・STUN の結果。試験のまとめ）。ゲーム内のメニューの実行は、接続を開くたびに
+/// 置き換える（最後の接続の値）。
 static OPEN_INFO: std::sync::Mutex<Option<OpenInfo>> = std::sync::Mutex::new(None);
 
-/// ネットワークを開いてセッションを置く（読み取りのスレッド）。まだ動かさない（`start_net`）。開いた受信ソケットの文を返す。`code_dir` は接続コードの置き場
+/// ネットワークを開いてセッションを組み込む（読み取りのスレッド）。まだ動かさない（`start_net`）。開いた受信ソケットの文を返す。`code_dir` は接続コードのフォルダ
 /// （`RealScriptHost::arm_net` がゲームのフォルダの外かを見てから渡す）。
 pub fn open_net(
     s: &NetSettings,
@@ -2115,10 +2163,10 @@ pub fn open_net(
     spectate_dir: Option<PathBuf>,
 ) -> Result<String, String> {
     if RECV.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-        return Err("ネットワークはもう開いている".to_string());
+        return Err("ネットワークは既に開いています".to_string());
     }
     let nonce = s.role_nonce.unwrap_or_else(default_nonce);
-    // 接続コードの形で、見張りを起こす前に断ったときは、ウィンドウの「状態」の行に出す文を置き場へ書く（`net_code::say_not_started`）。
+    // 接続コードの形で、見張りを作る前に断ったときは、ウィンドウの「状態」の行に出す文をコードのフォルダへ書く（`net_code::say_not_started`）。
     let status_dir = code_dir.clone();
     let not_started = |e: String| {
         if let (Some(side), Some(d)) = (s.code_side, status_dir.as_deref()) {
@@ -2141,11 +2189,9 @@ pub fn open_net(
     let local = local_addr.map_or("（分からない）".to_string(), |a| a.to_string());
     let timer = net.high_resolution_wait();
     if s.code_side == Some(CodeSide::Spectate) {
-        // 観戦者: 対戦のセッションは作らず、観戦用のコードの見張りと `WatchPlay` を置く。
+        // 観戦者: 対戦のセッションは作らず、観戦用のコードの見張りと `WatchPlay` を組み込む。
         let Some(dir) = code_dir else {
-            return Err(not_started(
-                "接続コードの置き場が決まっていない".to_string(),
-            ));
+            return Err(not_started("接続コードの場所が未決定".to_string()));
         };
         let slot = std::sync::Arc::new(WatchSlot::new());
         let (w, note) = spectate_watch_code::start(
@@ -2156,15 +2202,17 @@ pub fn open_net(
             net_code::Timing::default(),
         )
         .map_err(not_started)?;
-        let wp = WatchPlay::new(
+        let wp = WatchPlay::try_new(
             slot,
             WatchConfig {
                 wait_budget_us: s.wait_budget_us,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 // 本物のゲームは選択の画面を持つ。
                 require_net_selection: true,
+                ff_max: s.ff_max,
             },
-        );
+        )
+        .map_err(not_started)?;
         // 断られたら `th` と見張り（`w`）はここで落ちて止まる。
         arm_watch(
             WatchNetSlot {
@@ -2197,7 +2245,7 @@ pub fn open_net(
     let rb_wired = crate::rollback_play_win::armed();
     let cfg = play_config(s, rb_wired);
     // 秘密（ini か OS の乱数）・STUN・セッションの設定は通信層で作る（`net_udp::prepare_link`）。接続コードの形では、セッションの設定は見張りのスレッドが
-    // 相手のコードを読んでから置く。
+    // 相手のコードを読んでから書く。
     let (np, note, watch, stun) = match (s.code_side, code_dir) {
         (None, _) => {
             let (link_cfg, note, stun) = net_udp::prepare_link_stun(s, &mut net, nonce)?;
@@ -2226,9 +2274,9 @@ pub fn open_net(
                 stun,
             )
         }
-        (Some(_), None) => return Err("接続コードの置き場が決まっていない".to_string()),
+        (Some(_), None) => return Err("接続コードの場所が未決定".to_string()),
     };
-    // 観戦のホスト（ini の `[spectate] enable = 1`）: リングバッファをセッションに置き、観戦用のコードを用意する。使わない設定なら何もしない。
+    // 観戦のホスト（ini の `[spectate] enable = 1`）: リングバッファをセッションに付け、観戦用のコードを用意する。使わない設定なら何もしない。
     let mut np = np;
     let (spectate, spectate_note) = spectate_host::arm(s, spectate_dir, local_addr, &mut np);
     // 断られたら `th` と見張り（`watch`）はここで落ちて止まる。
@@ -2282,7 +2330,7 @@ pub fn trial_host() -> HostFacts {
 }
 
 /// ゲーム内のメニューの実行の、ネットワークの開き方の段階（読み取りのスレッド）。頼みが来たかは、開くスレッドの数（`OPEN_TRIES`）か、スレッドを
-/// 起こせなかった文（`game_net_note`）で見る。
+/// 作れなかった文（`game_net_note`）で見る。
 fn menu_net() -> MenuNet {
     let noted = GAME_NET_NOTES
         .lock()
@@ -2312,7 +2360,8 @@ pub fn net_status() -> (NetSnapshot, String) {
             g.as_ref().map_or("受信スレッドなし".to_string(), |t| {
                 format!("受信 {:?}", t.stats())
             }),
-            host.map(|s| format!("\n{}", s.text())).unwrap_or_default(),
+            host.map(|s| format!("\n{}", s.lines(crate::log_mode::detail())))
+                .unwrap_or_default(),
             host.map(|s| {
                 let c = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
                 crate::net_watch::SpectatorCounts {
@@ -2323,11 +2372,11 @@ pub fn net_status() -> (NetSnapshot, String) {
                     refused_full: c(s.host.refused_full),
                 }
             }),
-            // 受信側が持つ診断（STUN の聞き直し・送りの誤り・自分の候補。受信スレッドが無ければ全部 0 / なし）。
+            // 受信側が持つ診断（STUN の聞き直し・送信の誤り・自分の候補。受信スレッドが無ければ全部 0 / なし）。
             g.as_ref().map(RecvThread::diag).unwrap_or_default(),
         )
     };
-    // 片づけたつながりの見張りの文は、片づけたときに「n 回目のつながり」の節へコピーしたので、ここでは出さない。
+    // 片づけた接続の見張りの文は、片づけたときに「n 回目の接続」の節へコピーしたので、ここでは出さない。
     let code = if CODE_NOTES_ARCHIVED.load(Ordering::SeqCst) {
         String::new()
     } else {
@@ -2366,20 +2415,20 @@ pub fn net_status() -> (NetSnapshot, String) {
         } else {
             String::new()
         }
-        // 観戦者のルーム（「ルームで観戦」。観戦用のルームの出来事の数。起こしたことが無ければ空）。
+        // 観戦者のルーム（「ルームで観戦」。観戦用のルームの出来事の数。作ったことが無ければ空）。
         + &spectate_requests_text()
         + &spectate_join::stats_text()
         + &PAST_WATCHES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .concat();
-    // ゲーム内のメニューの実行は、つながりが終わってもネットワークを開き直せる（`NetSnapshot::ended` は「この起動ではもう開かない」の意味になり、
+    // ゲーム内のメニューの実行は、接続が終わってもネットワークを開き直せる（`NetSnapshot::ended` は「この起動ではもう開かない」の意味になり、
     // 計測はネットワークの 1 本の終わりで締めない）。パニックでネットワークとメニューを止めた実行は開き直せない。
     let mut snap = NET_STATUS.snapshot();
     snap.relink = UI_ON.load(Ordering::SeqCst) != 0;
     snap.diag = diag;
     snap.spectators = spectators;
-    // 繋がらなかった理由を読むための診断（セッションを作った後・STUN を使った実行だけ。人を特定する値は書かない）。
+    // 接続できなかった理由を読むための診断（セッションを作った後・STUN を使った実行だけ。人を特定する値は書かない）。
     let diag_line = if snap.has_link_box() || diag.keep.installed || diag.port_kept.is_some() {
         format!("\n{}", snap.diag_text())
     } else {
@@ -2424,7 +2473,7 @@ fn spectate_requests_text() -> String {
     )
 }
 
-/// 片づけたつながりの節（つなぎ直した実行だけ。本ログの「ネットワークの外」の終わりに足す）と、上のネットワークの行が何回目のつながりかの 1 行。
+/// 片づけた接続の節（再接続した実行だけ。本ログの「ネットワークの外」の終わりに足す）と、上のネットワークの行が何回目の接続かの 1 行。
 fn past_links_text() -> String {
     let past = PAST_LINKS.lock().unwrap_or_else(|e| e.into_inner());
     if past.is_empty() {
@@ -2433,11 +2482,11 @@ fn past_links_text() -> String {
     let closed = LINKS_CLOSED.load(Ordering::SeqCst);
     let now = if CODE_NOTES_ARCHIVED.load(Ordering::SeqCst) {
         format!(
-            "（上の「ネットワーク:」の行とネットワークの数は {closed} 回目のつながりの最後の値。次のつながりはまだ開いていない）"
+            "（上の「ネットワーク:」の行とネットワークの数は {closed} 回目の接続の最後の値です。次の接続はまだ開いていません）"
         )
     } else {
         format!(
-            "（上の「ネットワーク:」の行とネットワークの数は {} 回目のつながりのぶん。前のつながりは下の節）",
+            "（上の「ネットワーク:」の行とネットワークの数は {} 回目の接続のぶんです。前回の接続は下の節）",
             closed + 1
         )
     };
@@ -2493,7 +2542,7 @@ fn abort_of_code(c: u32) -> Option<netplay::RbAbort> {
 }
 
 /// マッチをやめた回数の行の先頭（`rollback_text_with` が書き、読み取りのスレッドが簡潔なログへコピーする）。
-pub const ROLLBACK_ABORT_HEAD: &str = "巻き戻し（配線）: 試合をやめた";
+pub const ROLLBACK_ABORT_HEAD: &str = "巻き戻し（フック）: マッチをやめた";
 
 fn rollback_text_with(summary: Option<String>, c: RbCounts) -> String {
     let RbCounts {
@@ -2516,17 +2565,17 @@ fn rollback_text_with(summary: Option<String>, c: RbCounts) -> String {
     }
     if bypass != 0 {
         s += &format!(
-            "\n巻き戻し（配線）: rollback の試合の間に、フックが入れ物を借りられず走査を普段どおりに回した {bypass} 回"
+            "\n巻き戻し（フック）: rollback の試合の間に、フックが入れ物を借りられず走査を普段どおりに回した {bypass} 回"
         );
     }
     if nested != 0 {
         s += &format!(
-            "\n巻き戻し（製品の経路）: フックが入れ物を持っている間に来た開始のフック {nested} 回（触らなかった）"
+            "\n巻き戻し（製品の処理フロー）: フックが入れ物を持っている間に来た開始のフック {nested} 回（触らなかった）"
         );
     }
     if stray != 0 {
         s += &format!(
-            "\n巻き戻し（製品の経路）: フックが入れ物を持っている間に、指図が無いまま来た入力の入口 {stray} 回（poll_all を呼ばずに戻した）"
+            "\n巻き戻し（製品の処理フロー）: フックが入れ物を持っている間に、指図が無いまま来た入力の入口 {stray} 回（poll_all を呼ばずに戻した）"
         );
     }
     s
@@ -2537,7 +2586,7 @@ pub fn start_net() -> Result<(), String> {
     // SAFETY: 読むだけ。`NET_ON` を 1 にする前なので、ゲームのスレッドはネットワークのセッションに触らない。
     if unsafe { (*NET.0.get()).is_none() } {
         if UI_ON.load(Ordering::SeqCst) != 0 {
-            // ゲーム内のメニューだけの実行（ネットワークは最初の作る・貼るで開く）。`NET_ON` はネットワークのセッションを置くときに立てる。
+            // ゲーム内のメニューだけの実行（ネットワークは最初の作る・貼るで開く）。`NET_ON` はネットワークのセッションを組み込むときに立てる。
             return Ok(());
         }
         return Err("ネットワークのセッションが空（arm_net の前）".to_string());
@@ -2641,7 +2690,7 @@ pub(crate) mod fake_mem {
 
     static DEVICE: AtomicU32 = AtomicU32::new(u32::MAX);
 
-    /// 1P の入力機器の偽の読み。置いていなければ読めなかったことにする（検査のプロセスの `0x004B353F` には別のものが入っているため）。
+    /// 1P の入力機器の偽の読み。設定していなければ読めなかったことにする（検査のプロセスの `0x004B353F` には別のものが入っているため）。
     pub fn input_device() -> Option<u32> {
         match DEVICE.load(Ordering::SeqCst) {
             u32::MAX => None,
@@ -2690,7 +2739,7 @@ impl TickIo for RealTickIo {
         if let Some(v) = fake_mem::get(addr) {
             return v;
         }
-        // SAFETY: `addr` は `GameAddrs::direct_ranges` のアドレス（`arm` が読めると確かめた。花映塚では th09.exe の .data で、プロセスが終わるまでコミット済みで読める）。
+        // SAFETY: `addr` は `GameAddrs::direct_ranges` のアドレス（`arm` が読めると検証した。花映塚では th09.exe の .data で、プロセスが終わるまでコミット済みで読める）。
         // `scripted::read_obs` はそれ以外を直には読まない。
         unsafe { (addr as usize as *const u32).read_unaligned() }
     }
@@ -2714,7 +2763,7 @@ impl TickIo for RealTickIo {
             }
             return;
         }
-        // SAFETY: `addr` は InputManager の 3 本のアドレス（`arm` が `IM_BYTES` バイト読めると確かめた。花映塚では .data）。
+        // SAFETY: `addr` は InputManager の 3 本のアドレス（`arm` が `IM_BYTES` バイト読めると検証した。花映塚では .data）。
         // 先はスタックの配列で重ならない。
         unsafe {
             core::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), IM_BYTES)
@@ -2726,14 +2775,14 @@ impl TickIo for RealTickIo {
         if let Some(poll) = self.poll
             && self.ims[0] != 0
         {
-            // SAFETY: `poll` は `POLL_SITES` の `fn_poll` 行（`session::arm_poll` が実バイトと照合して一致したときだけ置いた入口）。
-            // `ims[0]` は `arm_io` が置いた InputManager[0]。ゲームのスレッドから呼ぶ。
+            // SAFETY: `poll` は `POLL_SITES` の `fn_poll` 行（`session::arm_poll` が実バイトと照合して一致したときだけ設定した入口）。
+            // `ims[0]` は `arm_io` が設定した InputManager[0]。ゲームのスレッドから呼ぶ。
             let own = unsafe { poll_seat_keeping_im(poll, 0, self.ims[0] as usize as *mut u8) };
             // 1P がパッドのとき、席 0 はキーボードの移動・ショットを読まない。席 2 は FULL の配置のキーボードと両方のパッドを足した語なので、
             // 足してキーボードでも動かせるようにする。2P の入力機器もパッドなら、その分も混ざる。
             // 設定は毎 tick 読む（遊びながらキー設定を変えても効く）。読めなければ席 0 だけ。
             if self.ims[2] != 0 && keyboard_joins_pad(input_device_word()) {
-                // SAFETY: 席 0 と同じ約束。席 2 は `poll_all` も呼ぶ席で、`ims[2]` は `arm_io` が置いた InputManager[2]。
+                // SAFETY: 席 0 と同じ約束。席 2 は `poll_all` も呼ぶ席で、`ims[2]` は `arm_io` が設定した InputManager[2]。
                 return own
                     | unsafe { poll_seat_keeping_im(poll, 2, self.ims[2] as usize as *mut u8) };
             }
@@ -2757,7 +2806,7 @@ impl NetIo for RealTickIo {
             return None;
         }
         // SAFETY: `poll` と `ims` は `local_input` と同じ（席 0 の代わりに 0・1・2。`poll_all` `0x0042E9C0` も同じ 3 つの席で呼ぶ）。
-        // 3 本とも `IM_BYTES` バイト読めると確かめてある。ゲームのスレッドから呼ぶ。
+        // 3 本とも `IM_BYTES` バイト読めると検証してある。ゲームのスレッドから呼ぶ。
         Some([0u32, 1, 2].map(|s| unsafe {
             poll_seat_keeping_im(poll, s, self.ims[s as usize] as usize as *mut u8)
         }))
@@ -2769,8 +2818,9 @@ impl NetIo for RealTickIo {
         crate::text_input_win::drain(out)
     }
     fn write_data_u32(&mut self, addr: u32, v: u32) {
-        // SAFETY: `addr` は `net_game::direct_ranges` のアドレス（`arm_net` が読めると確かめた th09.exe の .data）。`NetGame` はそれ以外へは
-        // 直に書かない。ゲームのスレッド（ゲーム自身がその欄を書くのと同じスレッド）から書く。
+        // SAFETY: `addr` は `net_game::direct_ranges` のアドレス（`arm_net` が読めると検証した th09.exe の .data。検証は読みだけで、書けるのは
+        // .data が起動から終わりまでコミット済みで読み書きできる頁のため）。`NetGame` はそれ以外へは直に書かない。ゲームのスレッド（ゲーム自身が
+        // その欄を書くのと同じスレッド）から書く。
         unsafe { (addr as usize as *mut u32).write_unaligned(v) }
     }
     fn safe_write_u8(&mut self, addr: u32, v: u8) -> bool {
@@ -2813,7 +2863,7 @@ impl NetIo for RealTickIo {
             }
             return;
         }
-        // SAFETY: `[addr, addr + out.len())` は `net_game::direct_ranges` の範囲の中（`arm_net` が読めると確かめた .data）。
+        // SAFETY: `[addr, addr + out.len())` は `net_game::direct_ranges` の範囲の中（`arm_net` が読めると検証した .data）。
         // 先はスタックの配列で重ならない。
         unsafe {
             core::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len())
@@ -2828,8 +2878,8 @@ impl NetIo for RealTickIo {
             return;
         }
         let [a0, a1, a2, a3] = call.args;
-        // SAFETY: `a` は `PORTRAIT_FNS` の 1 本（`session::arm_portrait` が実バイトと照合して合ったときだけ置いた）。thiscall で
-        // ecx = MainMenu `[0x4AC8C0]`（`PortraitGate::ready` が 0 でないことと、`[m+0x11B98]`（部品の配列）が 0 でないことを確かめた直後）、スタックの引数 4 つ、`ret $0x10` で自分で片付ける
+        // SAFETY: `a` は `PORTRAIT_FNS` の 1 本（`session::arm_portrait` が実バイトと照合して合ったときだけ設定した）。thiscall で
+        // ecx = MainMenu `[0x4AC8C0]`（`PortraitGate::ready` が 0 でないことと、`[m+0x11B98]`（部品の配列）が 0 でないことを検証した直後）、スタックの引数 4 つ、`ret $0x10` で自分で片付ける
         // （`0x00424FAD` / `0x0042505C` / `0x0042538D`）。ebx・esi・edi・ebp は保存して戻る。ゲームのスレッド（ゲーム自身が MainMenu のハンドラでこの 3 本を呼ぶのと同じスレッド）から呼ぶ。
         // 引数は `net_portrait::plan` が作った 4 つで、カーソル（0〜15 に絞り済み）から表で引いたキャラと、ゲーム自身が渡すのと同じ定数。
         // 関数のアドレスと整数は 32 ビットで同じ大きさ。
@@ -2849,7 +2899,7 @@ impl NetIo for RealTickIo {
 
 impl StateMem for RealTickIo {
     fn loading(&mut self) -> bool {
-        // 読み込みのアドレスは `GameAddrs::loading`（`arm_io` が 4 バイト読めると確かめた .data）。
+        // 読み込みのアドレスは `GameAddrs::loading`（`arm_io` が 4 バイト読めると検証した .data）。
         let a = ADDRS[2].load(Ordering::Relaxed);
         TickIo::data_u32(self, a) != 0
     }
@@ -2917,7 +2967,7 @@ fn real_io() -> Option<RealTickIo> {
     if f == 0 || l == 0 {
         return None;
     }
-    // SAFETY: `f` と `l` は `arm` が置いた関数の入口のアドレス（0 でないことを上で見た）。`p` は `arm_poll` が照合の後に置いた poll の入口で、
+    // SAFETY: `f` と `l` は `arm` が設定した関数の入口のアドレス（0 でないことを上で見た）。`p` は `arm_poll` が照合の後に設定した poll の入口で、
     // 0 なら `None`。関数のアドレスと整数は 32 ビットで同じ大きさ。呼ぶときの約束は `RealTickIo` の各関数の注。
     Some(unsafe {
         let p = POLL_FN.load(Ordering::Acquire);
@@ -2968,7 +3018,7 @@ fn tick_body(k: u32) -> u32 {
             return r - 1;
         }
     }
-    // rollback のモードのフックが走査を呼んでいる tick は、フックが置いた指図（feed する入力ワードか描画だけ）に従う。台本・ネットワーク・自動保存・状態の操作には
+    // rollback のモードのフックが走査を呼んでいる tick は、フックが出した指図（feed する入力ワードか描画だけ）に従う。台本・ネットワーク・自動保存・状態の操作には
     // 触らない（フックが持っている入れ物と重なる —— `RB_HELD`）。
     if let Some(r) = rb_tick(&mut io) {
         return r;
@@ -2984,7 +3034,7 @@ fn tick_body(k: u32) -> u32 {
     r
 }
 
-/// rollback のモードのフックが置いた指図を取って feed する（指図が無ければ `None` —— 今までの経路）。feed はローカル入力を読まない
+/// rollback のモードのフックが出した指図を取って feed する（指図が無ければ `None` —— 今までの経路）。feed はローカル入力を読まない
 /// （自分の入力ワードはフックが 1 フレームに 1 回だけ読む）。進め直しの回は台本の時計（`TICKS`）を進めない。
 fn rb_tick(io: &mut RealTickIo) -> Option<u32> {
     if !crate::rollback_play_win::armed() {
@@ -3003,12 +3053,12 @@ fn rb_tick(io: &mut RealTickIo) -> Option<u32> {
 
 /// 台本のマッチの状態の操作を書く（どの経路の tick でも、入口へ戻る直前に 1 回）。台本の入れ物が空・分岐が閉じた後は何もしない。
 fn state_tick(io: &mut RealTickIo, k: u32) {
-    // この tick の中で台本が終わって分岐を閉じたなら、入れ物に触らない（閉じた後は読み取りのスレッドが `arm` で置き直しうる）。
-    // 1 と読めれば、閉じるのはゲームのスレッド（ここ）だけなので、この関数の間は置き直されない。
+    // この tick の中で台本が終わって分岐を閉じたなら、入れ物に触らない（閉じた後は読み取りのスレッドが `arm` で設定し直しうる）。
+    // 1 と読めれば、閉じるのはゲームのスレッド（ここ）だけなので、この関数の間は設定し直されない。
     if SCRIPT_ON.load(Ordering::Acquire) == 0 {
         return;
     }
-    // SAFETY: `SCRIPT_ON` を Acquire で 1 と読んだので、`arm` が置いた入れ物が見える。ここはゲームのスレッドで、`route` の中の借用は
+    // SAFETY: `SCRIPT_ON` を Acquire で 1 と読んだので、`arm` が設定した入れ物が見える。ここはゲームのスレッドで、`route` の中の借用は
     // もう終わっている。
     let Some(engine) = (unsafe { (*ENGINE.0.get()).as_mut() }) else {
         return;
@@ -3038,12 +3088,8 @@ fn state_tick(io: &mut RealTickIo, k: u32) {
 
 // ---- ネットワークの対戦の「リプレイを保存して終了」で保存の画面を飛ばす ----
 //
-// ネットワーク（`NetPlay::take_save_quit`）が「保存して終了」で閉じた tick に、自動保存がそのマッチで保存関数を呼んでいて
-// （`replay_save_win::saved_this_seg`）、分岐 `SAVE_SKIP_SITE` の 9 バイトが合えば、グローバル状態語の `CONTINUED_BIT` を立てる。
-// ゲームは画面 15 の最初のフレームでそれを見てタイトルへ移る。立てた印は、画面 14 / 15 を通った後のタイトルか、次に場面 2 へ入った tick に
-// 落とす（入力の入口の始まりで毎 tick 見る）。ゲームのスレッドで読み書きし、確保しない・待たない。判断は `higanr_core::save_skip`。
-// 観戦者の経路も同じ印を立てる（観戦者のゲームはホストの押下を辿って同じ「保存して終了」を決め、保存の画面が出てしまうため。
-// 自動保存の成否に依らない）。
+// ネットワーク（`NetPlay::take_save_quit`）が「保存して終了」で閉じた tick に、自動保存がそのマッチで保存関数を呼んでいて（`replay_save_win::saved_this_seg`）、分岐 `SAVE_SKIP_SITE` の 9 バイトが合えば、グローバル状態語の `CONTINUED_BIT` を立てる。ゲームは画面 15 の最初のフレームでそれを見てタイトルへ移る。立てた印は、画面 14 / 15 を通った後のタイトルか、次に場面 2 へ入った tick に落とす（入力の入口の始まりで毎 tick 見る）。ゲームのスレッドで読み書きし、確保しない・待たない。判断は `higanr_core::save_skip`。
+// 観戦者の経路も同じ印を立てる（観戦者のゲームは対戦のホストの押下を辿って同じ「保存して終了」を決め、保存の画面が出てしまうため。自動保存の成否に依らない）。
 
 /// 見張りの状態（`save_skip::Watch` の番号 `watch_code`）。書くのも読むのもゲームのスレッドだけ（パニックの受けも同じスレッド）。
 static SKIP_WATCH: AtomicU32 = AtomicU32::new(0);
@@ -3112,7 +3158,7 @@ fn skip_own() -> SkipOwn {
 /// ネットワークが「保存して終了」で閉じた tick に 1 回（`net_tick`）。`saved` はこのマッチで自動保存が保存関数を呼んだか。
 fn save_skip_mark(saved: bool) -> Marked {
     let mut own = skip_own();
-    // 書く語のアドレス（`arm` が置いた `global_state`）を、照合する 9 バイトの `testb` に埋まったアドレスと結び付ける
+    // 書く語のアドレス（`arm` が設定した `global_state`）を、照合する 9 バイトの `testb` に埋まったアドレスと結び付ける
     // （合わなければ `mark` が書かずに断る）。
     let at = own.state;
     let m = save_skip::mark(&mut own, saved, SAVE_SKIP_SITE.expected, at, CONTINUED_BIT);
@@ -3157,8 +3203,8 @@ fn return_save_quit_tick(out: &UiOut) {
     }
 }
 
-/// 観戦者の経路の 1 tick（`watch_tick`）: 観戦者のゲームがホストの押下を辿って「リプレイを保存して終了」でマッチを出た tick なら、保存の画面を
-/// 飛ばす印を立てる。対戦者と違い、自動保存が呼んだかに依らない（`save_skip::may_skip`）。
+/// 観戦者の経路の 1 tick（`watch_tick`）: 観戦者のゲームが対戦のホストの押下を辿って「リプレイを保存して終了」でマッチを出た tick なら、保存の画面を
+/// 飛ばす印を立てる。対戦と違い、自動保存が呼んだかに依らない（`save_skip::may_skip`）。
 fn watch_save_quit_tick(wp: &mut WatchPlay) {
     if wp.take_save_quit() {
         save_skip_mark(save_skip::may_skip(
@@ -3282,21 +3328,21 @@ fn save_view(slot: Option<&Slot>) -> (Option<&NetPlay>, crate::replay_save::Watc
 
 /// 入口の 1 tick の経路（ネットワーク・巻き戻し・台本）を選んで進める。戻り値は入口への戻り値。
 fn route(io: &mut RealTickIo, k: u32) -> u32 {
-    // SAFETY: `SCRIPT_ON` を Acquire で 1 と読んだので（`tick_inner`）、`arm` が置いた入れ物が見える。以後はゲームのスレッド（ここ）だけが触る。
+    // SAFETY: `SCRIPT_ON` を Acquire で 1 と読んだので（`tick_inner`）、`arm` が設定した入れ物が見える。以後はゲームのスレッド（ここ）だけが触る。
     // 入口を呼ぶゲームのスレッドは 1 本（実機でスレッド ID 1 種類）。
     let engine = unsafe { (*ENGINE.0.get()).as_mut() };
     // 観戦者の早送りの余分な回（`RESIM_TICK`）は台本の時計を進めない（進め直しの回と同じ。`rb_tick`）。
     if !crate::rollback_play_win::resim_active() {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
-    // ネットワークの対戦の「保存して終了」で立てた印を、ゲームが使い終えたら落とす。ネットワークを手放した後（つなぎ直し）・ネットワークの外の経路でも見るので、
-    // ネットワークの経路より前に置く。
+    // ネットワークの対戦の「保存して終了」で立てた印を、ゲームが使い終えたら落とす。ネットワークを手放した後（再接続）・ネットワークの外の経路でも見るので、
+    // ネットワークの経路より前に呼ぶ。
     save_skip_tick(io);
     // マッチの終わりのリプレイの自動保存（入っていなければ原子変数を 1 つ読むだけ）。ネットワークが動いていれば、印とフォルダの名前のために
     // ネットワークのセッションを見せる（読むだけ）。
     if crate::replay_save_win::armed() {
         let (np, watching) = if NET_ON.load(Ordering::Acquire) != 0 {
-            // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が置いたセッションが見える。触るのはゲームのスレッド（ここ）だけで、
+            // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が組み込んだセッションが見える。触るのはゲームのスレッド（ここ）だけで、
             // この参照は `on_tick` の中で終わる。
             save_view(unsafe { (*NET.0.get()).as_ref() })
         } else {
@@ -3306,29 +3352,29 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
     }
     // 素の花映塚でのリプレイの再生の見張り（再生の側でなければ場面の 2 語を読んで戻る。自動保存の設定に依らない）。
     crate::replay_watch_win::on_tick();
-    // ゲーム内のメニューが頼んだ「ネットワークを開く仕事」が終わっていれば、セッションを置く。**置いた tick もそのまま下のネットワークの経路へ流す**（置いた tick だけ
-    // ゲーム自身の poll に任せると、決定キーを押したままのとき、画面 6・カーソル 4 の決定が内蔵ネット対戦へ漏れる）。置くのは `UI_ON` の実行の、
+    // ゲーム内のメニューが頼んだ「ネットワークを開く仕事」が終わっていれば、セッションを組み込む。**組み込んだ tick もそのまま下のネットワークの経路へ流す**（組み込んだ tick だけ
+    // ゲーム自身の poll に任せると、決定キーを押したままのとき、画面 6・カーソル 4 の決定が内蔵ネット対戦へ漏れる）。組み込むのは `UI_ON` の実行の、
     // ネットワークがまだ無い間だけ。
     if UI_ON.load(Ordering::Acquire) != 0 && NET_ON.load(Ordering::Acquire) == 0 {
         poll_pending();
     }
     if NET_ON.load(Ordering::Acquire) != 0 {
-        // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` / `arm_watch` が置いたセッションが見える。以後はゲームのスレッドだけが触る。
+        // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` / `arm_watch` が組み込んだセッションが見える。以後はゲームのスレッドだけが触る。
         match unsafe { (*NET.0.get()).as_mut() } {
             Some(Slot::Play(slot)) => {
                 let (mut relink, mut spectate, mut lan) = (false, false, None);
                 let r = net_tick(slot, engine, io, k, &mut relink, &mut spectate, &mut lan);
                 if relink {
-                    // つながりが終わってマッチの外へ戻った（ゲーム内のメニューの実行だけ）。この tick の戻り値はネットワークの経路の判断のまま、
+                    // 接続が終わってマッチの外へ戻った（ゲーム内のメニューの実行だけ）。この tick の戻り値はネットワークの経路の判断のまま、
                     // ネットワークのセッションを手放す（次の tick からメニューだけの経路）。
                     relink_teardown();
                 }
                 if spectate {
-                    // 待っているだけの対戦者のセッションの上から「ルームで観戦」が決まった: セッションを手放し、続けて観戦者のネットワークを開く。
+                    // 待っているだけの対戦のセッションの上から「ルームで観戦」が決まった: セッションを手放し、続けて観戦者のネットワークを開く。
                     request_spectate();
                 }
                 if let Some(ask) = lan {
-                    // 待っているだけの対戦者のセッションの上から LAN の項目が決まった: 運び手を起こす（セッションは手放す）。
+                    // 待っているだけの対戦のセッションの上から LAN の項目が決まった: 運び手（LAN で接続コードを相手と運ぶスレッド）を作る（セッションは手放す）。
                     request_lan(ask);
                 }
                 lan_watch_poll();
@@ -3378,7 +3424,7 @@ fn route(io: &mut RealTickIo, k: u32) -> u32 {
     script_tick(engine, io, k, crate::replay_save_win::armed())
 }
 
-/// 台本の 1 tick（両方の席を台本が押す。M1d と同じ）。`keep_open` なら、台本が終わっても分岐を閉じない（ネットワークの経路）。
+/// 台本の 1 tick（両方の席を台本が押す）。`keep_open` なら、台本が終わっても分岐を閉じない（ネットワークの経路）。
 fn script_tick(engine: &mut Engine, io: &mut RealTickIo, k: u32, keep_open: bool) -> u32 {
     if !matches!(engine.status(), Status::Running { .. }) {
         return 0;
@@ -3412,7 +3458,7 @@ fn script_commit(
     out.ret
 }
 
-/// ネットワークの経路の 1 tick（入力の地点の判断 → 入口への戻り値）。`relink` は、つながりが終わってネットワークのセッションを手放してよくなったか（ゲーム内の
+/// ネットワークの経路の 1 tick（入力の地点の判断 → 入口への戻り値）。`relink` は、接続が終わってネットワークのセッションを手放してよくなったか（ゲーム内の
 /// メニューの実行だけ。`NetPlay::relink_due`。呼び手がセッションの借用を終えてから `relink_teardown` を呼ぶ）。
 fn net_tick(
     slot: &mut NetSlot,
@@ -3428,7 +3474,7 @@ fn net_tick(
     let _ = GAME_TID.compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst);
     let (action, step) = {
         let mut game = NetGame::new(io, engine.as_deref_mut(), load_addrs());
-        // ゲーム内のメニュー（`code_side = game` の実行だけ）が、画面 6（と、つながった後の画面 7 の取消）で入力を握る。ネットワークの手入れ
+        // ゲーム内のメニュー（`code_side = game` の実行だけ）が、画面 6（と、接続した後の画面 7 の取消）で入力を握る。ネットワークの手入れ
         // （受信・セッションづくり・終わりの印）は握る tick も毎 tick 先に行う（`net_ui::net_input`）。
         let ui = game_ui();
         let menu_run = ui.is_some();
@@ -3442,7 +3488,7 @@ fn net_tick(
         {
             publish_ui_stats(ui);
         }
-        // つなぎ直し: ネットワークが終わった後だけ場面を読む（つながっている間・offer / answer の実行は何も足さない —— マッチの中の遅延の増分 0）。
+        // 再接続: ネットワークが終わった後だけ場面を読む（接続している間・offer / answer の実行は何も足さない —— マッチの中の遅延の増分 0）。
         if menu_run && slot.np.phase() == netplay::Phase::Ended {
             let scenes = netplay::Game::scenes(&mut game);
             let now_ms = (netplay::Net::now_us(&mut slot.net) / 1_000) as u32;
@@ -3463,7 +3509,7 @@ fn net_tick(
         .as_deref()
         .and_then(|e| net_game::script_end_bye(e.status(), after))
     {
-        // 台本が終わった（終わりに BYE。2 回目からは何もしない）。台本が無い実行と `after_script = keep` の最後の段階の後は閉じない
+        // 台本が終わった（終わりに相手へ BYE。2 回目からは何もしない）。台本が無い実行と `after_script = keep` の最後の段階の後は閉じない
         // （人の入力で続く）。
         slot.np.close(r);
     }
@@ -3478,7 +3524,7 @@ fn net_tick(
     if let Action::Played(r) = action {
         NET_FRAMES.push(&r, &slot.np.last_timing());
     }
-    // 2（描画だけのフレーム）の出口が置かれていることは `arm_net` が確かめた（入口は出口が 0 なら戻りアドレスを替えない）。
+    // 2（描画だけのフレーム）の出口が設定されていることは `arm_net` が検証した（入口は出口が 0 なら戻りアドレスを替えない）。
     match net_game::entry_return(action) {
         Some(ret) => ret,
         None => match engine {
@@ -3499,14 +3545,9 @@ struct WatchFollow {
     lan: Option<LanAsk>,
 }
 
-/// 観戦者の経路の 1 tick（`net_tick` の観戦者バージョン）: 台本が終わってもネットワークは閉じない（観戦者の台本はタイトルから 7 の画面までを進め、以後は
-/// 記録の列がゲームを動かす）。台本は**繋がっている間も 1 tick に 1 回進む**（`WatchPlay` の Esc の読みが進める）: 観戦中の台本の入力ワードは
-/// ゲームへ入れず、ESC ビットだけが観戦をやめる読みに効く。繋がる前・タイトルなど観戦者のゲーム自身の入力で進む tick は、台本と撮影を
-/// `net_tick` と同じに進める。
+/// 観戦者の経路の 1 tick（`net_tick` の観戦者バージョン）: 台本が終わってもネットワークは閉じない（観戦者の台本はタイトルから 7 の画面までを進め、以後は記録の列がゲームを動かす）。台本は**接続している間も 1 tick に 1 回進む**（`WatchPlay` の Esc の読みが進める）: 観戦中の台本の入力ワードはゲームへ入れず、ESC ビットだけが観戦をやめる読みに効く。接続する前・タイトルなど観戦者のゲーム自身の入力で進む tick は、台本と撮影を `net_tick` と同じに進める。
 ///
-/// ゲーム内のメニューを置いた実行（「ルームで観戦」）は、画面 6・カーソル 4 の決定を奪う入口の判定・観戦の待ちの間の項目・左上の行・つながった
-/// 後の画面 7 までの自動の前進を、観戦者のセッションでも続ける（`net_ui::watch_input`）。続けないと決定が内蔵ネット対戦へ漏れ、入力の地点が
-/// 呼ばれなくなる。
+/// ゲーム内のメニューを組み込んだ実行（「ルームで観戦」）は、画面 6・カーソル 4 の決定を奪う入口の判定・観戦者が接続を待つ間の項目・左上の行・接続した後の画面 7 までの自動の前進を、観戦者のセッションでも続ける（`net_ui::watch_input`）。続けないと決定が内蔵ネット対戦へ漏れ、入力の地点が呼ばれなくなる。
 fn watch_tick(
     slot: &mut WatchNetSlot,
     mut engine: Option<&mut Engine>,
@@ -3554,7 +3595,7 @@ fn watch_tick(
         }
         publish(s.status);
     }
-    // 観戦者の絵: 台本の段階は画面 6 で終わるので、7 以降は段階と画面の変わり目・マッチの定期で頼む。頼むだけ（撮るのは描画の入口）。
+    // 観戦者の絵（観戦者の画面の撮影）: 台本の段階は画面 6 で終わるので、7 以降は段階と画面の変わり目・マッチの定期で描画の入口へ頼む。頼むだけ（撮るのは描画の入口）。
     let (phase, screen) = (slot.wp.phase(), slot.wp.menu_screen());
     let reason = slot.shots.tick(phase, screen);
     if reason != 0 {
@@ -3570,8 +3611,8 @@ fn watch_tick(
     (watch_return(action, engine, io, k, peeked), follow)
 }
 
-/// 観戦者の経路の戻り値。`peeked` は、繋がっている間の Esc の読みが進めた台本の結果。`Local` 以外（記録の列がゲームを動かす tick）は、台本は
-/// 進んでもその入力ワードをゲームへ入れない。`Local` は、読みで進めていればその結果を feed し（二重に進めない）、進めていなければ（繋がる前・
+/// 観戦者の経路の戻り値。`peeked` は、接続している間の Esc の読みが進めた台本の結果。`Local` 以外（記録の列がゲームを動かす tick）は、台本は
+/// 進んでもその入力ワードをゲームへ入れない。`Local` は、読みで進めていればその結果を feed し（二重に進めない）、進めていなければ（接続する前・
 /// 終わった後）ここで台本を進める。
 fn watch_return(
     action: Action,
@@ -3665,7 +3706,7 @@ fn rb_slot() -> Option<&'static mut NetSlot> {
     if GAME_TID.load(Ordering::SeqCst) != tid {
         return None;
     }
-    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が置いたセッションが見える。触るのはゲームのスレッドだけで、このフックは走査の包みと
+    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が組み込んだセッションが見える。触るのはゲームのスレッドだけで、このフックは走査の包みと
     // Present の後から順に呼ばれ、入れ子にならない。走査の中から来る入力の入口と開始のフックは、フックが持っている間（`RB_HELD`）は入れ物に触らない。
     match unsafe { (*NET.0.get()).as_mut() } {
         Some(Slot::Play(s)) => Some(&mut **s),
@@ -3684,7 +3725,7 @@ fn head_wait_slot() -> Option<&'static mut NetSlot> {
     if GAME_TID.load(Ordering::SeqCst) != tid {
         return None;
     }
-    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が置いたセッションが見える。触るのはゲームのスレッドだけで、先頭のフックは do_frame の最初
+    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_net` が組み込んだセッションが見える。触るのはゲームのスレッドだけで、先頭のフックは do_frame の最初
     // （入力の入口・走査の包み・開始のフックの外）なのでどの借用とも入れ子にならない。
     match unsafe { (*NET.0.get()).as_mut() } {
         Some(Slot::Play(s)) => Some(&mut **s),
@@ -3693,7 +3734,7 @@ fn head_wait_slot() -> Option<&'static mut NetSlot> {
 }
 
 /// フレームの先頭のフック（`pacing_win::set_head_wait`）。delay 方式の lockstep のとき、自分の入力を読む前に、この tick で要る相手の入力ワードが届くまで
-/// 待つ（`NetPlay::head_wait`）。`pace_head`（do_frame の先頭 `0x0042DC44` の入口）が、格子の待ちの後と、全画面のゲーム自身の時計の経路で
+/// 待つ（`NetPlay::head_wait`）。`pace_head`（do_frame の先頭 `0x0042DC44` の入口）が、格子の待ちの後と、フルスクリーンのゲーム自身の時計の経路で
 /// ゲームがその回にフレームを始める見込みのときにだけ呼ぶ。
 pub fn head_wait_hook() {
     if let Some(slot) = head_wait_slot() {
@@ -3701,7 +3742,7 @@ pub fn head_wait_hook() {
     }
 }
 
-/// 先頭のフックを置く（ネットワークのセッションを動かす `NET_ON = 1` の前後。置いても `NET_ON` が 0 の間は `head_wait_hook` が何もしない）。
+/// 先頭のフックを設定する（ネットワークのセッションを動かす `NET_ON = 1` の前後。設定しても `NET_ON` が 0 の間は `head_wait_hook` が何もしない）。
 fn install_head_wait() {
     crate::pacing_win::set_head_wait(Some(head_wait_hook));
 }
@@ -3717,7 +3758,7 @@ fn watch_slot_for_scan() -> Option<&'static mut WatchNetSlot> {
     if GAME_TID.load(Ordering::SeqCst) != tid {
         return None;
     }
-    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_watch` / `install_slot` が置いたセッションが見える。触るのはゲームのスレッドだけ。
+    // SAFETY: `NET_ON` を Acquire で 1 と読んだので、`arm_watch` / `install_slot` が組み込んだセッションが見える。触るのはゲームのスレッドだけ。
     // この参照は呼び手が入れ物を使い終えるまでしか持たず、走査を呼ぶ間は持たない。
     match unsafe { (*NET.0.get()).as_mut() } {
         Some(Slot::Watch(s)) => Some(&mut **s),
@@ -3768,7 +3809,7 @@ impl crate::spectate_watch::FfHost for RealFfHost {
     }
 
     fn boundary(&mut self) -> bool {
-        // 余分な走査ごとに呼ぶので syscall の無い直読みバージョン（対戦者の経路は変えない）。
+        // 余分な走査ごとに呼ぶので syscall の無い直読みバージョン（対戦の経路は変えない）。
         crate::rollback_win::scene_request_pending_fast()
     }
 }
@@ -3790,7 +3831,7 @@ fn watch_scan(this: u32) -> Option<i32> {
 /// 包みは do_frame へ `ret` を返し、`None` なら走査を普段どおり 1 回呼ぶ（delay 方式・場面の境目・マッチをやめた後・ネットワークの外）。
 pub fn rb_scan_handler(this: u32) -> Option<i32> {
     let Some(slot) = rb_slot() else {
-        // 対戦者のセッションが無い。観戦者のセッションがあれば、早送りの経路（遅れて入った観戦者を追いつかせる）。
+        // 対戦のセッションが無い。観戦者のセッションがあれば、早送りの経路（遅れて入った観戦者を追いつかせる）。
         return watch_scan(this);
     };
     // 前のフレームの後半でマッチをやめていたら、ここでコピーする（やめた後は `active` が false で下の数えのコピーが回らない）。
@@ -3893,15 +3934,15 @@ pub fn rb_post_present() {
     rb_note_abort(&slot.np);
 }
 
-/// 走査の包みのフックと Present の後のフックを置く（`arm_rollback` が入口を全部書けた後に 1 回）。フックは `NET_ON` が 1 になるまで何もしない。
+/// 走査の包みのフックと Present の後のフックを設定する（`arm_rollback` が入口を全部書けた後に 1 回）。フックは `NET_ON` が 1 になるまで何もしない。
 fn install_rollback_wiring() {
     crate::rollback_win::set_scan_handler(Some(rb_scan_handler));
     crate::pacing_win::set_after_present(Some(rb_post_present));
 }
 
-/// 観戦者のネットワークを開くときに、走査の call だけを書いてフックを置く（観戦者の早送り）。観戦者がどの方式のマッチを見るかは繋がるまで分からず、
-/// 早送りは方式に依らないので、マッチの方式に関わらず置く。**対戦者の実行からは呼ばない**（delay 方式の対戦者は 1 バイトも書かない約束）。
-/// Present の後のフックは置かない（観戦者は巻き戻さない）。書いた（か、既に書いてあった）ら true。
+/// 観戦者のネットワークを開くときに、走査の call だけを書いてフックを設定する（観戦者を追いつかせる早送り）。観戦者がどの方式のマッチを見るかは接続するまで分からず、
+/// 早送りは方式に依らないので、マッチの方式に関わらず設定する。**対戦の実行からは呼ばない**（delay 方式の対戦の実行は 1 バイトも書かない約束）。
+/// Present の後のフックは設定しない（観戦者は巻き戻さない）。書いた（か、既に書いてあった）ら true。
 pub fn arm_watch_scan(
     hook_env: &mut dyn crate::hook::HookEnv,
     forbidden: &[higanr_core::patch::AddrRange],
@@ -3909,7 +3950,7 @@ pub fn arm_watch_scan(
 ) -> bool {
     let ok = crate::rollback_play_win::arm_watch_scan(hook_env, forbidden, out);
     if ok {
-        // フックは走査の call を書いた後に置く（フックが先でも、呼ばれるのは call を書いた後）。観戦者のセッションが無い間は何もしない（`watch_scan` が `None`）。
+        // フックは走査の call を書いた後に設定する（フックが先でも、呼ばれるのは call を書いた後）。観戦者のセッションが無い間は何もしない（`watch_scan` が `None`）。
         crate::rollback_win::set_scan_handler(Some(rb_scan_handler));
     }
     ok
@@ -3966,17 +4007,17 @@ impl RealScriptHost {
         let exe = self
             .exe_dir
             .as_ref()
-            .ok_or("exe のフォルダが分からないので、ゲームのフォルダの外か確かめられない")?;
+            .ok_or("exe のフォルダが不明なのでゲームのフォルダの外かチェックできません")?;
         if is_same_or_inside(&dir.to_string_lossy(), &exe.to_string_lossy()) {
             return Err(format!(
-                "{} が exe のフォルダの中なので触らない",
+                "{} が exe のフォルダの中なので触りません",
                 dir.display()
             ));
         }
         Ok(())
     }
 
-    /// 台本の置き場（ローダーの `--script` が環境の変数で渡したパスか、DLL のフォルダの `script.txt`）。
+    /// 台本の場所（ローダーの `--script` が環境の変数で渡したパスか、DLL のフォルダの `script.txt`）。
     fn script_location(&self) -> Result<crate::net_config::Located, String> {
         let env = higanr_core::script::PATH_ENV;
         crate::net_config::locate(
@@ -3987,7 +4028,7 @@ impl RealScriptHost {
         )
     }
 
-    /// 対戦者の rollback の設置（`ScriptHost::arm_rollback` の本体。観戦者の走査の call はその呼び手が足す）。
+    /// 対戦の rollback の設置（`ScriptHost::arm_rollback` の本体。観戦者の走査の call はその呼び手が足す）。
     fn arm_rollback_play(
         &mut self,
         s: &NetSettings,
@@ -3999,15 +4040,11 @@ impl RealScriptHost {
         if wish != higanr_core::wire::Mode::Rollback {
             return crate::rollback_play_win::arm(wish, 0, hook_env, forbidden, None, out);
         }
-        // E1 の実験（`[rollback_probe]`・`[alloc_count]`）が同じ入口を使うので、実験が有効な実行では入れない。
+        // 巻き戻しの実験（`[rollback_probe]`・`[alloc_count]`）が同じ入口を使うので、実験が有効な実行では入れない。
         if let Ok(Some(text)) = self.read_net_ini() {
             let probe = !matches!(crate::rollback_probe::settings_from_text(&text), Ok(None));
             let count = !matches!(crate::alloc_count::settings_from_text(&text), Ok(None));
             if probe || count {
-                let _ = writeln!(
-                    out,
-                    "巻き戻し（製品の経路）: 実験（[rollback_probe] か [alloc_count]）が有効なので入れない。HELLO には delay 方式を載せる"
-                );
                 return false;
             }
         }
@@ -4024,21 +4061,24 @@ impl RealScriptHost {
         if !armed {
             return false;
         }
-        // 被弾音の鳴らし方（ini の `rollback_hit_se`）。マッチの前に 1 回。
-        let _ = crate::rollback_play_win::with_play(|st, _| st.set_hit_se(s.rollback_hit_se));
+        // 被弾音・カットインの音の鳴らし方（ini の `rollback_hit_se`・`rollback_cutin_se`）。マッチの前に 1 回。
+        let _ = crate::rollback_play_win::with_play(|st, _| {
+            st.set_hit_se(s.rollback_hit_se);
+            st.set_cutin_se(s.rollback_cutin_se);
+        });
         // Present の後のフックは、ペースの設置が Present の call を書いたときだけ届く。書けていなければ、コピーと進め直しは入力の地点
         // （止まっている間）でしか起きない —— 正しさは変わらず、止まる回数と費用が増える。
         if crate::pacing_win::PRESENT_ORIGINAL.load(Ordering::Acquire) == 0 {
             let _ = writeln!(
                 out,
-                "巻き戻し（製品の経路）: Present の call が書かれていない（[pacing] が入っていない）ので、Present の後の手順は呼ばれない。進め直しは止まっている間の入力の地点だけになる"
+                "巻き戻し（製品の処理フロー）: Present の call が書かれていない（[pacing] が入っていない）ので Present の後の手順は呼ばれません。進め直しは止まっている間の入力のフック地点だけになります。"
             );
         }
         install_rollback_wiring();
         true
     }
 
-    /// ini の置き場（ローダーの `--ini` が環境の変数で渡したパスか、DLL のフォルダの `HiganRTool.ini`）。ネットワーク・ペース・自動保存・確保の数えの
+    /// ini の場所（ローダーの `--ini` が環境の変数で渡したパスか、DLL のフォルダの `HiganRTool.ini`）。ネットワーク・ペース・自動保存・確保の数えの
     /// 全部がここを通る。
     fn ini_location(&self) -> Result<crate::net_config::Located, String> {
         let env = higanr_core::ini::PATH_ENV;
@@ -4050,7 +4090,7 @@ impl RealScriptHost {
         )
     }
 
-    /// 配るバージョンで ini が無ければ既定を書き出す（起動のとき 1 回。`ini_seed`）。置き場が決まらないなら何もしない
+    /// 利用者へ配布するバージョンで ini が無ければ既定を書き出す（起動のとき 1 回。`ini_seed`）。場所が決まらないなら何もしない
     /// （読む側が同じ理由で断る）。
     pub(crate) fn seed_default_ini(&self, default: Option<&str>) -> crate::ini_seed::Seed {
         match self.ini_location() {
@@ -4061,29 +4101,26 @@ impl RealScriptHost {
 
     fn source(&self) -> Result<PathBuf, String> {
         let loc = self.script_location()?;
-        let dir = loc.path.parent().ok_or("台本のフォルダが分からない")?;
+        let dir = loc.path.parent().ok_or("台本のフォルダが不明")?;
         self.guard(dir)?;
         Ok(loc.path)
     }
 
     fn dest(&self) -> Result<(PathBuf, String), String> {
-        let log = self
-            .run_path
-            .as_ref()
-            .ok_or("本ログの置き場が決まっていない")?;
-        let dir = log.parent().ok_or("本ログのフォルダが分からない")?;
+        let log = self.run_path.as_ref().ok_or("本ログの場所が未決定")?;
+        let dir = log.parent().ok_or("本ログのフォルダが不明")?;
         self.guard(dir)?;
         let log_name = log
             .file_name()
-            .ok_or("本ログの名前が分からない")?
+            .ok_or("本ログの名前が不明")?
             .to_string_lossy();
         let name = side_file_name(&log_name, SCRIPT_SUFFIX);
         Ok((dir.join(&name), name))
     }
 }
 
-/// 置き場の ini を読む。DLL のフォルダの ini が無ければ `Ok(None)`（ネットワークなしで走る）。ローダーが渡した ini が無いのは渡し方の誤りなので、
-/// 「無い ⇒ ネットワークなし」に丸めず、読めないとして返す。`fallback` は DLL のフォルダに ini が無いときに返す中身（配るバージョンで書き出せなかったとき）。
+/// 場所の ini を読む。DLL のフォルダの ini が無ければ `Ok(None)`（ネットワークなしで走る）。ローダーが渡した ini が無いのは渡し方の誤りなので、
+/// 「無い ⇒ ネットワークなし」に丸めず、読めないとして返す。`fallback` は DLL のフォルダに ini が無いときに返す中身（利用者へ配布するバージョンで書き出せなかったとき）。
 #[cfg(test)]
 pub(crate) fn read_ini_at(
     loc: &crate::net_config::Located,
@@ -4105,7 +4142,7 @@ fn read_ini_raw(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && loc.from_env.is_none() => {
             Ok(fallback.map(|t| (t.to_string(), false)))
         }
-        Err(e) => Err(format!("{} を読めない: {e}", path.display())),
+        Err(e) => Err(format!("{} 読み込み不能: {e}", path.display())),
     }
 }
 
@@ -4131,7 +4168,7 @@ fn decode_ini(bytes: Vec<u8>) -> Result<(String, bool), String> {
         Ok(s) => Ok((s, false)),
         Err(e) => cp932_to_string(e.as_bytes())
             .map(|s| (s, true))
-            .ok_or_else(|| "が UTF-8 でも Shift_JIS でもない".to_string()),
+            .ok_or_else(|| "が UTF-8 でも Shift_JIS でもありません".to_string()),
     }
 }
 
@@ -4196,20 +4233,20 @@ impl ScriptHost for RealScriptHost {
         match std::fs::read(&src) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{} を読めない: {e}", src.display())),
+            Err(e) => Err(format!("{} 読み込み不能: {e}", src.display())),
         }
     }
 
     fn move_script(&mut self) -> Result<String, String> {
         // ローダーが渡した台本は移さない（`session::load_script` はこの関数を呼ばない。呼ばれたら断る）。
         if self.script_location()?.from_env.is_some() {
-            return Err("ローダーが渡した台本は移さない".to_string());
+            return Err("ローダーが渡した台本は移動しません".to_string());
         }
         let src = self.source()?;
         let (to, name) = self.dest()?;
         move_no_replace(&src, &to).map_err(|code| {
             format!(
-                "{} を {} へ移せない（GetLastError = {code}）",
+                "{} を {} へ移動不能（GetLastError = {code}）",
                 src.display(),
                 to.display()
             )
@@ -4259,13 +4296,13 @@ impl ScriptHost for RealScriptHost {
     fn explicit_script(&self) -> Option<String> {
         match self.script_location() {
             Ok(l) if l.from_env.is_some() => Some(l.text()),
-            // 置き場が決まらないなら、先に呼ばれる `read_script` が同じ理由で断っている（ここへは来ない）。
+            // 場所が決まらないなら、先に呼ばれる `read_script` が同じ理由で断っている（ここへは来ない）。
             Ok(_) | Err(_) => None,
         }
     }
 
     fn arm_net(&mut self, s: &NetSettings, set_state_fn: u32) -> Result<String, String> {
-        // 接続コードの置き場（DLL のフォルダの `code\` か ini の `code_dir`）。ゲームのフォルダの中なら開かない。
+        // 接続コードのフォルダ（DLL のフォルダの `code\` か ini の `code_dir`）。ゲームのフォルダの中なら開かない。
         let code_dir = match s.code_side {
             None => None,
             Some(_) => {
@@ -4274,13 +4311,13 @@ impl ScriptHost for RealScriptHost {
                 Some(d)
             }
         };
-        // ゲーム内のメニューの実行は、ネットワークを開かずにメニューだけを置く。観戦用のコードの置き場の確かめ（下）はこの経路では要らない
-        // （観戦のホストはルームで配り、ファイルを使わない）ので、この分岐の後ろに置く。
+        // ゲーム内のメニューの実行は、ネットワークを開かずにメニューだけを組み込む。観戦用のコードのフォルダのチェック（下）はこの経路では要らない
+        // （観戦のホストは観戦者へルームで配り、ファイルを使わない）ので、この分岐の後ろに書く。
         if s.code_side == Some(CodeSide::Game) {
             let ini_path = self.ini_location().ok().map(|l| l.path);
             return arm_game_ui(s, set_state_fn, code_dir, ini_path);
         }
-        // 観戦用のコードの置き場（`[spectate] code_dir`、無ければ `[netplay]` の `code_dir`、無ければ DLL のフォルダの `code`）。
+        // 観戦用のコードのフォルダ（`[spectate] code_dir`、無ければ `[netplay]` の `code_dir`、無ければ DLL のフォルダの `code`）。
         // 同じくゲームのフォルダの中なら開かない。
         let spectate_dir = match s.spectate.as_ref() {
             None => None,
@@ -4295,7 +4332,7 @@ impl ScriptHost for RealScriptHost {
     }
 
     fn migrate_legacy(&mut self) -> Vec<String> {
-        // 以前の版が接続コードの置き場に覚えていた名前とルーム名を ini へ移す。置き場がゲームのフォルダの中なら触らない（`arm_net` と同じガード）。
+        // 以前のバージョンが接続コードのフォルダに覚えていた名前とルーム名を ini へ移す。フォルダがゲームのフォルダの中なら触らない（`arm_net` と同じガード）。
         let Ok(loc) = self.ini_location() else {
             return Vec::new();
         };
@@ -4334,9 +4371,9 @@ impl ScriptHost for RealScriptHost {
         out: &mut dyn std::io::Write,
     ) -> bool {
         let played = self.arm_rollback_play(s, hook_env, forbidden, out);
-        // 観戦者の実行は、マッチの方式に関わらず走査の call を置く（観戦者の早送り）。rollback の設置が済んでいれば何もしない。ゲーム内のメニューの
-        // 実行が後から「ルームで観戦」を選ぶ場合は、ネットワークを開くとき（`open_watch_net`）に置く（起動のときは観戦者か対戦者か分からず、
-        // 対戦者の delay 方式の実行には 1 バイトも書かない）。
+        // 観戦者の実行は、マッチの方式に関わらず走査の call を書く（観戦者の早送り）。rollback の設置が済んでいれば何もしない。ゲーム内のメニューの
+        // 実行が後から「ルームで観戦」を選ぶ場合は、ネットワークを開くとき（`open_watch_net`）に書く（起動のときは観戦か対戦か分からず、
+        // 対戦の delay 方式の実行には 1 バイトも書かない）。
         if s.code_side == Some(CodeSide::Spectate) {
             arm_watch_scan(hook_env, forbidden, out);
         }
@@ -4373,9 +4410,9 @@ impl ScriptHost for RealScriptHost {
         // 再生の見張りは自動保存の設定（`[replay]`）に依らず入れる。入れられない理由は本ログに残す（見張りが無いと比べる材料が無い）。
         match crate::replay_watch_win::arm() {
             Ok(()) => crate::main_log::push_detail(
-                "再生の見張り: 入れた（再生した試合の決着の値を1行ずつ書く）",
+                "再生の見張り: 設置しました（再生したマッチの決着の値を1行ずつ書きます）",
             ),
-            Err(why) => crate::main_log::push(format!("再生の見張り: 入れられない（{why}）")),
+            Err(why) => crate::main_log::push(format!("再生の見張り: 入れられません（{why}）。")),
         }
         // `[replay]` はネットワークと同じ ini（DLL のフォルダ）にある。読むだけ。
         let text = self.read_net_ini()?;
@@ -4654,7 +4691,7 @@ pub(crate) mod tests {
         let in_resim = press(1);
         crate::rollback_play_win::RESIM_TICK.store(0, Ordering::SeqCst);
         assert!(!in_resim, "進め直しの回で読んだ");
-        // 差し替え口が置けなかった実行（PRESENT_ORIGINAL が 0）は読まない。
+        // 差し替え口を設定できなかった実行（PRESENT_ORIGINAL が 0）は読まない。
         crate::shot_key_win::test_enable(true);
         PRESENT_ORIGINAL.store(0, Ordering::SeqCst);
         assert!(!press(1), "Present の差し替え口が無いのに読んだ");
@@ -4734,11 +4771,14 @@ pub(crate) mod tests {
         set_render_only_exit(crate::stub::testkit::fake_exit_addr());
         start().unwrap();
         let (s, _t) = slot();
-        assert!(arm_net(s, 0x1234).unwrap_err().contains("開いている"));
+        assert!(arm_net(s, 0x1234).unwrap_err().contains("既に開いています"));
         stop();
         let (s, _t) = slot();
         let e = arm_net_with(s, 0x1234, &[(0x10, 4)]).unwrap_err();
-        assert!(e.contains("0x00000010") && e.contains("読めない"), "{e}");
+        assert!(
+            e.contains("0x00000010") && e.contains("読み取り不能"),
+            "{e}"
+        );
         // SAFETY: 読むだけ。分岐は閉じている。
         assert!(unsafe { (*NET.0.get()).is_none() });
         assert!(start_net().is_err(), "セッションが無いのに動かした");
@@ -5072,14 +5112,14 @@ pub(crate) mod tests {
             mode: higanr_core::wire::Mode::Rollback,
             delay: 1,
         };
-        // SAFETY: 検査は `REAL_HOOK_TESTS` の下で 1 本ずつ。`UI_ON` が 0 の間に置く（ゲームのスレッドは触らない）。
+        // SAFETY: 検査は `REAL_HOOK_TESTS` の下で 1 本ずつ。`UI_ON` が 0 の間に設定する（ゲームのスレッドは触らない）。
         unsafe { *UI.0.get() = Some(NetUi::new(ini, link, board)) };
         UI_ON.store(1, Ordering::Release);
         board
     }
 
-    /// 入口を「メニューを置いた実行」の形にする: 偽の feed・ローカル入力・poll（席ごとの入力ワード `words`。席 0・1・2）・描画だけのフレームの
-    /// 出口を置き、`SET_STATE_FN` を置いて、分岐を開く。
+    /// 入口を「メニューを組み込んだ実行」の形にする: 偽の feed・ローカル入力・poll（席ごとの入力ワード `words`。席 0・1・2）・描画だけのフレームの
+    /// 出口を用意し、`SET_STATE_FN` を設定して、分岐を開く。
     fn arm_menu_run(words: [u32; 3]) {
         arm_io(fake_addrs(), feed_fn_addr(), local_fn_addr()).expect("arm_io");
         set_render_only_exit(crate::stub::testkit::fake_exit_addr());
@@ -5529,6 +5569,9 @@ pub(crate) mod tests {
         .expect("ネットワークの組を開けない");
         let port = local.expect("受信ソケット").port();
         np.close(higanr_core::wire::ByeReason::Cancelled);
+        // 観戦のホストを置いて、片づけの後の節に集計の行が残るかを見る。
+        let host = spectate_host::prepare(&s, local.expect("受信ソケット")).expect("観戦のホスト");
+        assert!(recv.install_spectate(host.sender));
         *CODE_WATCH.lock().unwrap() = Some(watch);
         *RECV.lock().unwrap() = Some(recv);
         OPEN_STATE.store(OPEN_BUSY, Ordering::SeqCst);
@@ -5628,7 +5671,7 @@ pub(crate) mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            past.contains(&format!("{} 回目のつながり（片づけた", closed0 + 1))
+            past.contains(&format!("{} 回目の接続（片づけ済み", closed0 + 1))
                 && past.contains("ネットワーク: 段階 終えた"),
             "{past}"
         );
@@ -5636,9 +5679,13 @@ pub(crate) mod tests {
             past.contains("CHECK のズレ"),
             "前のつながりのネットワークの行: {past}"
         );
+        assert!(
+            past.contains("\n観戦: 観戦者 0 人（"),
+            "止めた後の観戦のホストの集計の行: {past}"
+        );
         let (snap, other) = net_status();
         assert!(
-            other.contains("回目のつながり（片づけた"),
+            other.contains("回目の接続（片づけ済み"),
             "本ログのネットワークの外の文に出ない"
         );
         assert!(
@@ -5680,6 +5727,27 @@ pub(crate) mod tests {
         assert!(!net_status().0.relink);
     }
 
+    #[test]
+    fn a_closed_link_section_keeps_the_stopped_host_tree_and_measure_rows() {
+        assert_eq!(closed_spectate_text(None), "");
+        let s = spectate_host::Snapshot {
+            host: higanr_core::spectate::HostCounts {
+                intros: 2,
+                uplinks_measured: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let t = closed_spectate_text(Some(&s));
+        for want in [
+            "\n観戦: 観戦者 0 人（",
+            "\n観戦者のツリー: 中継役 0 人 / 中継役への振り分け 2（",
+            "\n上り回線速度の測定: 観戦者へ測定依頼を送った 0（測定依頼の再送 0） / 速度の確定 3・測定不能 0",
+        ] {
+            assert!(t.contains(want), "{want}\n---\n{t}");
+        }
+    }
+
     fn watch_box() -> (Box<WatchNetSlot>, RecvThread) {
         let (net, th) =
             net_udp::open_for_code(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
@@ -5689,6 +5757,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         (
@@ -6259,6 +6328,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let here = &FAKE_DATA as *const _ as usize as u32;
@@ -6319,6 +6389,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let mut slot = Slot::Watch(Box::new(WatchNetSlot {
@@ -6491,7 +6562,7 @@ pub(crate) mod tests {
             );
             assert!(
                 t.contains(&format!(
-                    "試合をやめた 1 回。最初は「{}」（確定したフレーム 1259 の後）",
+                    "マッチをやめた 1 回。最初は「{}」（確定したフレーム 1259 の後）",
                     a.text()
                 )),
                 "{t}"
@@ -6879,7 +6950,7 @@ pub(crate) mod tests {
             path: d.join(name),
             from_env: None,
         };
-        // 配る ini の「〜」（U+301C）は Shift_JIS に無い（全角チルダ U+FF5E が同じ区点）ので、検査用に直してから符号化する。
+        // 利用者へ配布する ini の「〜」（U+301C）は Shift_JIS に無い（全角チルダ U+FF5E が同じ区点）ので、検査用に直してから符号化する。
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini")
             .replace("\r\n", "\n")
             .replace('\u{301C}', "\u{FF5E}")
@@ -6933,7 +7004,7 @@ pub(crate) mod tests {
         );
         std::fs::write(d.join(SCRIPT_FILE), b"scene=2\n").unwrap();
         let e = h.move_script().unwrap_err();
-        assert!(e.contains("移せない"), "{e}");
+        assert!(e.contains("移動不能"), "{e}");
         assert_eq!(
             std::fs::read(d.join("logs").join("dll_x_script.txt")).unwrap(),
             b"scene=1\n"
@@ -6995,7 +7066,7 @@ pub(crate) mod tests {
             run_path: Some(d.join("logs").join("dll_x.log")),
             exe_dir: Some(exe_dir),
         };
-        // ゲームのフォルダの中の置き場には触らない。
+        // ゲームのフォルダの中のフォルダには触らない。
         assert!(host(d.clone()).migrate_legacy().is_empty());
         assert!(code.join("player_name.txt").exists());
         assert!(
@@ -7010,7 +7081,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("name = saved-synth")
         );
-        // ini の code_dir の置き場も見る。
+        // ini の code_dir のフォルダも見る。
         std::fs::write(&ini, "[netplay]\nenable = 1\ncode_dir = other\n").unwrap();
         std::fs::create_dir_all(d.join("other")).unwrap();
         std::fs::write(d.join("other").join("player_name.txt"), "other-synth\n").unwrap();
@@ -7129,6 +7200,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let wslot = Box::new(WatchNetSlot {
@@ -7178,7 +7250,7 @@ pub(crate) mod tests {
             exe_dir: None,
         };
         let forbidden = crate::th09_addr::FORBIDDEN;
-        // rollback のときはどの役でも書く望み（対照: 観戦者の rollback の実行は今までどおり）。
+        // rollback のときは対戦のどの形（offer・answer・game）でも書く望み（対照: 観戦者の rollback の実行は今までどおり）。
         use higanr_core::wire::Mode as M;
         for side in ["offer", "answer", "game"] {
             assert_eq!(install_wish(&settings(side)), M::Rollback, "{side}");
@@ -7213,8 +7285,10 @@ pub(crate) mod tests {
         assert!(crate::rollback_win::scan_handler_is_set());
         reset();
         crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(false, Ordering::SeqCst);
+        crate::rollback_win::TEST_OUTPUT_RANGES_NG.store(true, Ordering::SeqCst);
         let mut f = FakeCode::new();
         let note = arm_watch_scan_at_open_with(&mut f);
+        crate::rollback_win::TEST_OUTPUT_RANGES_NG.store(false, Ordering::SeqCst);
         assert!(note.starts_with("走査の call を書けなかった"), "{note}");
         assert!(f.writes.is_empty(), "文字の数の欄の頁を確かめずに書いた");
         reset();
@@ -7245,7 +7319,7 @@ pub(crate) mod tests {
         // SAFETY: 引数の無い呼び出し。
         let tid = unsafe { GetCurrentThreadId() };
         let lent = || head_wait_slot().is_some();
-        // 対照: 4 つがそろえば貸す。
+        // 対照: 4 つがそろえば、対戦のネットワークのセッションを先頭のフックへ貸す。
         NET_ON.store(1, Ordering::SeqCst);
         GAME_TID.store(tid, Ordering::SeqCst);
         RB_HELD.store(0, Ordering::SeqCst);
@@ -7460,6 +7534,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
+                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
             },
         );
         let word = || fake_mem::get(FAKE_STATE).unwrap();
@@ -7536,7 +7611,7 @@ pub(crate) mod tests {
         ADDRS[3].store(addrs_before, Ordering::SeqCst);
     }
 
-    /// 組み上がり: ネットワークを片づけた後のメニューだけの経路（入口 → `ui_only_tick`）で、戻り道が試合の場面を止め、
+    /// 組み上がり: ネットワークを片づけた後のメニューだけの経路（入口 → `ui_only_tick`）で、接続が終わった後の戻り道が試合の場面を止め、
     /// 「保存して終了」の切替を見た tick に保存の画面を飛ばす印を立てる。
     #[test]
     fn the_menu_only_path_freezes_the_match_and_marks_the_save_skip_for_the_return_flow() {
@@ -7732,7 +7807,7 @@ pub(crate) mod tests {
         let (room, shown) = watch_target(&link).unwrap();
         assert_eq!(room, typed.parse().unwrap().spectate_of());
         assert_eq!(shown, "Typed-Room");
-        // 一覧から選んだ行: ハッシュから観戦用のルーム名を戻し、左上の名は「1P vs 2P」。ホストが割り当ての名から導く名と同じ。
+        // 一覧から選んだ行: ハッシュから観戦用のルーム名を戻し、左上の名は「1P vs 2P」。対戦のホストが割り当てた名から導く名と同じ。
         let q = RoomName::parse_server_rules("q.0123456789abcdef0123456789abcd").unwrap();
         let row = WatchRow {
             hash: [0x60, 0x4d, 0x50, 0x2a, 0x39, 0x81, 0x06, 0x5f],
@@ -7754,14 +7829,44 @@ pub(crate) mod tests {
         assert_eq!(room, typed.parse().unwrap().spectate_of());
     }
 
-    /// 壊れたら落ちる: 運び手の行が本ログ（簡潔なログにも出る）と「ネットワーク」の詳細の一覧の両方に入らない。
     #[test]
     fn a_lan_line_reaches_the_simple_log_and_the_detail_list() {
-        let line = "LAN: 検査の行（/8）を足した範囲で開く".to_string();
+        let line = "LAN: 検査の行（/8）を足した範囲で開きます。".to_string();
         lan_note(line.clone());
         assert!(crate::main_log::peek().contains(&line), "本ログに無い");
         assert!(
             GAME_NET_NOTES.lock().unwrap().contains(&line),
+            "詳細の一覧に無い"
+        );
+    }
+
+    #[test]
+    fn an_open_line_reaches_the_simple_log_only_when_the_spectate_setup_failed() {
+        let failed = [
+            " / 観戦は使いません: 検査の理由 A",
+            " / 観戦の配信を開始できませんでした（送り手の登録が重複）",
+            " / 検査 C。ただし、コードを書けませんでした: 検査の理由",
+        ];
+        for (i, tail) in failed.iter().enumerate() {
+            let line = format!("ネットワーク: 検査の開いた行 {i}（失敗）{tail}");
+            game_net_open_note(line.clone());
+            assert!(
+                crate::main_log::peek_brief().contains(&line),
+                "本ログに無い: {line}"
+            );
+            assert!(
+                GAME_NET_NOTES.lock().unwrap().contains(&line),
+                "詳細の一覧に無い: {line}"
+            );
+        }
+        let fine = "ネットワーク: 検査の開いた行（成功） / 観戦の配信側を用意しました（観戦用の session 0x00000001）".to_string();
+        game_net_open_note(fine.clone());
+        assert!(
+            !crate::main_log::peek_brief().contains(&fine),
+            "成功の文が簡潔にも出た"
+        );
+        assert!(
+            GAME_NET_NOTES.lock().unwrap().contains(&fine),
             "詳細の一覧に無い"
         );
     }

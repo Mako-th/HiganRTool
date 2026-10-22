@@ -1,16 +1,7 @@
 //! `--stun-probe <宛先1> <宛先2>`（開発用。走らせずに STUN の 2 か所へ 1 つの受信ソケットから問い合わせて終わる）。
-//!
-//! 家庭のルーターが、外へ出る通信の外側のポートを宛先ごとに変えるか（RFC 4787 の endpoint-dependent mapping）を、本物のゲームを
-//! 起こさずに見る。同じ受信ソケットから 2 か所の STUN へ聞いて、見えたアドレスのポートが同じなら「宛先に依らない割り当て」（STUN で見えた
-//! アドレスを接続コードに載せる方法が成り立つ）、違えば「宛先ごとに変わる割り当て」（STUN で見えたアドレスは相手に使えない）。
-//!
-//! 走らせ方は cli の `--stun-probe`（範囲 `internet` と一緒にだけ書ける。外の STUN サーバーへ問い合わせる道具なので、範囲を広げた
-//! ことを引数に書かせる。本物の STUN サーバーへ問い合わせてよいのは許可を得た後だけ）。検査は loopback の偽の STUN（`stun_fake`）
-//! 2 つだけへ問い合わせる。
-//!
-//! STUN の読み書きと送り直しは core の `stun::Query`、宛先のガードと名前の文字の形は `guard`。名前を引く待ちの上限は dll の
-//! `net_udp::lookup_with_timeout` と同じ考え方（OS の名前引きは中断できないので、別のスレッドで引いて上限までしか待たない。dll は
-//! cdylib なのでここから呼べず、同じ形を持つ）。
+//! 家庭のルーターが、外へ出る通信の外側のポートを宛先ごとに変えるか（RFC 4787 の endpoint-dependent mapping）を、本物のゲームを起動せずに見る。同じ受信ソケットから 2 か所の STUN へ聞いて、見えたアドレスのポートが同じなら「宛先に依らない割り当て」（STUN で見えたアドレスを接続コードに載せる方法が成り立つ）、違えば「宛先ごとに変わる割り当て」（STUN で見えたアドレスは相手に使えない）。
+//! 範囲 `internet` と一緒にだけ書ける（外の STUN サーバーへ問い合わせるツールなので、範囲を広げたことを引数に書かせる。本物の STUN サーバーへ問い合わせてよいのは許可を得た後だけ）。検査は loopback の偽の STUN（`stun_fake`）2 つだけへ問い合わせる。
+//! STUN の読み書きと送り直しは core の `stun::Query`、宛先のガードと名前の文字の形は `guard`。名前を引く待ちの上限は dll の `net_udp::lookup_with_timeout` と同じ考え方（OS の名前引きは中断できないので、別のスレッドで引いて上限までしか待たない。dll は cdylib なのでここから呼べず、同じ形を持つ）。
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -145,7 +136,7 @@ pub enum Verdict {
 }
 
 /// 2 つの「見えたアドレス」を比べる。判定そのものは core の `stun::compare_mappings`（dll の診断と同じ）。ここはその 4 通りを、この
-/// 道具の 3 通りの言い方にコピーするだけ。族が違えば None。
+/// ツールの 3 通りの言い方にコピーするだけ。族が違えば None。
 pub fn verdict(a: SocketAddr, b: SocketAddr) -> Option<Verdict> {
     Some(match stun::compare_mappings(a, b)? {
         Mapping::Same => Verdict::Same,
@@ -215,7 +206,7 @@ pub fn query(
 }
 
 /// transaction id（96 bit）。宛先の番号ごとに変える。peer_sim は OS の乱数を持たない（std だけ）ので、時刻とプロセス番号から作る。
-/// この道具の問い合わせは推し量られて偽の応答を差し込まれても、見えたアドレスの表示が違うだけで害は無い。
+/// この問い合わせは推し量られて偽の応答を差し込まれても、見えたアドレスの表示が違うだけで害は無い。
 fn probe_txn(index: u64) -> TransactionId {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -229,7 +220,7 @@ fn probe_txn(index: u64) -> TransactionId {
 }
 
 /// 1 つの受信ソケット `sock`（`args.bind` で開いたもの）から 2 か所へ順に問い合わせ、見えたアドレスを比べる。片方でも答えが
-/// 無ければ Err（比べられないので、黙って「同じ」にしない）。`lookup` は名前を引く道具（検査は注入する）。
+/// 無ければ Err（比べられないので、黙って「同じ」にしない）。`lookup` は名前を引く関数（検査は注入する）。
 pub fn run(
     args: &Args,
     sock: &UdpSocket,

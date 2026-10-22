@@ -1,20 +1,12 @@
-//! 大きい CSV（`_net_frames.csv`・`_pacing.csv`・`_watch_frames.csv`）を gzip で書く・読む（unsafe 無し）。
-//! 配布バージョンのログが大きすぎた（1 起動で `_net_frames.csv` 5〜12 MB・`_pacing.csv` 7〜15 MB）ので、CSV だけ gzip にする。
-//!
+//! 大きい CSV（`_net_frames.csv`・`_pacing.csv`・`_watch_frames.csv`）を gzip で書く・読む（unsafe 無し）。配布バージョンのログが大きすぎた（1 起動で `_net_frames.csv` 5〜12 MB・`_pacing.csv` 7〜15 MB）ので、CSV だけ gzip にする。
 //! 圧縮は読み取りのスレッド（`_net_frames.csv`）と書き出しのスレッド（`_pacing.csv`）で走り、ゲームのスレッドはリングバッファへ書くだけ。
 //!
-//! # ゲームを閉じる・強制終了・落ちたとき
-//!
-//! ゲームを閉じるとプロセスごと消える（ライターの `Drop` は走らない。計測のスレッドは閉じるまで終わらない）ので、閉じる経路に
-//! 頼らず次の 3 つで備える。
-//! - 書く側: `flush` のうち `SYNC_INTERVAL` ごとの 1 回だけを deflate の sync flush（空の stored ブロックで境を byte に
-//!   揃える。辞書は捨てない）にする。毎回入れると圧縮率が落ちる。
-//! - 書く側（`Seek` できる書き先）: sync flush のたびに終わりの印の仮（最終ブロック 2 B ＋ CRC32 と長さの 8 B）を書いて位置を
-//!   戻す。次の書き込みが仮の上に重なるので、ファイルはいつ止まっても最後の sync flush までを持つ完全な gzip になる。
+//! ゲームを閉じるとプロセスごと消える（ライターの `Drop` は走らない）ので、閉じる経路に頼らず次の 3 つで備える。
+//! - 書く側: `flush` のうち `SYNC_INTERVAL` ごとの 1 回だけを deflate の sync flush（空の stored ブロックで境を byte に揃える。辞書は捨てない）にする。毎回入れると圧縮率が落ちる。
+//! - 書く側（`Seek` できる書き先）: sync flush のたびに終わりの印の仮（最終ブロック 2 B ＋ CRC32 と長さの 8 B）を書いて位置を戻す。次の書き込みが仮の上に重なるので、ファイルはいつ止まっても最後の sync flush までを持つ完全な gzip になる。
 //! - 読む側: `decode_lenient` は終わりの印が無くても最後の sync flush までの中身を返す（`LogText::cut` が立つ）。
 //!
-//! 失う行は最後の sync flush より後の約 1 秒分（60 fps で約 60 行）。間隔を 2 秒にすると圧縮後の大きさは約 2% 増に収まる
-//! （1 秒は約 5% 増。`sync_flush_costs_little`）が、失う行が倍になるので 1 秒にした。
+//! 失う行は最後の sync flush より後の約 1 秒分（60 fps で約 60 行）。2 秒にすると圧縮後の大きさは約 2% 増に収まる（1 秒は約 5% 増。`sync_flush_costs_little`）が、失う行が倍になるので 1 秒にした。
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;

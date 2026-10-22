@@ -1,10 +1,7 @@
-//! peer_sim.exe —— 偽の対戦相手。引数を読み（`cli`）、ネットワークの範囲（`--scope`。既定 loopback）の中の受信ソケットにソケットを開き、`sim::run` を回し、
-//! 記録を書く（`record`）。使い方は `src/peer_sim/README.md`。
-//!
-//! パニックしない作り: 失敗は全部 Result で受け、文と終了コードで返す。終了コード: 0 = 全部の seg を終えた（`--follow` では相手の BYE(終了) を
-//! 受けて終えた）/ 1 = 走ったが終えられなかった / 2 = 引数・ソケット・記録の失敗。`--compare` と `--compare2` と `--compare-spectate` は
-//! 0 = 一致 / 1 = 食い違い（どちらかが 0 行で比べられていないときも）/ 2 = 読めない。`--watch`（観戦者の役）は 0 = ホストが BYE(終了) の
-//! 記録を流すところまで受けた / 1 = それ以外の終わり（ホストが黙った・断られた・打ち切り・別の理由の BYE）/ 2 = 引数・ソケット・記録の失敗。
+//! peer_sim.exe —— 偽の相手。引数を読み（`cli`）、ネットワークの範囲（`--scope`。既定 loopback）の中の受信ソケットを開き、`sim::run` を回し、記録を書く（`record`）。使い方は `src/peer_sim/README.md`。
+//! パニックしない作り: 失敗は全部 Result で受け、文と終了コードで返す。終了コード: 0 = 全部の seg を終えた（`--follow` では相手の BYE(終了) を受けて終えた）/ 1 = 走ったが終えられなかった / 2 = 引数・ソケット・記録の失敗。
+//! `--compare` / `--compare2` / `--compare-spectate` は 0 = 一致 / 1 = 食い違い（どちらかが 0 行で比べられていないときも）/ 2 = 読めない。
+//! `--watch` は 0 = ホストが BYE(終了) の記録を流すところまで受けた / 1 = それ以外の終わり（ホストが黙った・断られた・打ち切り・別の理由の BYE）/ 2 = 引数・ソケット・記録の失敗。
 //! `--stun-probe` は走らせずに 2 か所の STUN へ聞いて終わる: 0 = 2 か所とも答えた / 2 = 答えが無い・引数の誤り。
 
 use std::net::UdpSocket;
@@ -28,7 +25,7 @@ use peer_sim::stun_fake::{self, StunFake};
 use peer_sim::stun_probe;
 use peer_sim::watch::{self, WatchEnd};
 
-/// 引数で渡さなかったときの role_nonce（接続ごとに 1 回引く乱数の代わり。暗号には使わない）。同じ PC で 2 つを同時に起こしても重ならないよう、
+/// 引数で渡さなかったときの role_nonce（接続ごとに 1 回引く乱数の代わり。暗号には使わない）。同じ PC で 2 つを同時に起動しても重ならないよう、
 /// 時刻（ns）とプロセス番号を混ぜる。
 fn default_nonce() -> u64 {
     let t = SystemTime::now()
@@ -47,7 +44,7 @@ fn default_log_dir() -> Result<PathBuf, String> {
     Ok(dir.join("logs"))
 }
 
-/// `--stun-fake`: 偽の STUN を立て、`max_sec` 秒か落とされるまで待つ。答えが増えたときに相手の送り元を 1 行出す
+/// `--stun-fake`: 偽の STUN を立て、`max_sec` 秒か落とされるまで待つ。答えが増えたときに問い合わせた相手の送り元を 1 行出す
 /// （LAN の回で「LAN のアドレスから来た」ことの証拠）。何も記録のファイルには書かない。
 fn serve_stun_fake(a: &stun_fake::Args) -> Result<(), String> {
     let f = StunFake::spawn_in(a.bind, a.scope, 0)?;
@@ -145,7 +142,7 @@ fn compare_spectate_main(
     let ptext = read(player)?;
     let p =
         compare_spectate::parse_player(&ptext).map_err(|e| format!("{}: {e}", player.display()))?;
-    // 押下は、観戦者の記録の CSV があり、対戦者が peer_sim の記録（`# 押下` の行を持つ）のときだけ比べる。
+    // 押下は、観戦者の記録の CSV があり、対戦する2人の側が peer_sim の記録（`# 押下` の行を持つ）のときだけ比べる。
     let steps = match events {
         Some(e) => {
             let ws =
@@ -239,9 +236,9 @@ fn real_main() -> Result<bool, String> {
         Some(d) => d.clone(),
         None => default_log_dir()?,
     };
-    // 走らせる前に置き場を確かめる（実行し終えてから書けないと分かるのを避ける）。
+    // 走らせる前に出力先のフォルダをチェックする（実行し終えてから書けないと分かるのを避ける）。
     record::refuse_game_folder(&log_dir)?;
-    // 選択の台本は繋ぐ前に読む（誤りがあれば 1 通も送らずに断る）。
+    // 選択の台本は接続する前に読む（誤りがあれば 1 通も送らずに断る）。
     let menu = match &c.menu {
         Some(p) => Some(menu_plan::load(p)?),
         None => None,
@@ -319,6 +316,8 @@ fn real_main() -> Result<bool, String> {
             mode: c.mode,
             ahead: c.ahead,
             time_sync: c.time_sync,
+            // 偽の相手はホストの決め方を名乗らない（相手が使っても役は role_nonce のまま。検査は `run_opts` で直に設定する）。
+            host_pick: None,
         },
     )
     .map_err(|e| e.to_string())?;

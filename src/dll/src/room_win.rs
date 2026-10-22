@@ -1,24 +1,10 @@
-//! ルームサーバーへの WebSocket の運び（WinHTTP の同期の形）。unsafe はここだけ（1 つずつ `// SAFETY:`）。手順の判断は core の
-//! `room::RoomClient`、スレッドの分け方は `net_room.rs`。ここは WinHTTP の関数を Rust の型で包むだけ。
+//! ルームサーバーへの WebSocket の運び（WinHTTP の同期の形）。unsafe はここだけ（1 つずつ `// SAFETY:`）。手順の判断は core の `room::RoomClient`、スレッドの分け方は `net_room.rs`。ここは WinHTTP の関数を Rust の型で包むだけ。
 //!
-//! WinHTTP を使うのは、OS の TLS（Schannel）とプロキシの設定（`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`）をそのまま使え、クレートを足さずに
-//! 済むため（windows-sys の機能 `Win32_Networking_WinHttp` だけ。WebSocket の関数は Windows 8 から）。手順は `WinHttpOpen` →
-//! `WinHttpConnect` → `WinHttpOpenRequest`（`wss` は `WINHTTP_FLAG_SECURE`）→ `WinHttpSetOption(WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET)` →
-//! `WinHttpSendRequest` → `WinHttpReceiveResponse` → 状態の番号が 101 なら `WinHttpWebSocketCompleteUpgrade`、101 でなければ本文を上限まで読んで返す。
+//! WinHTTP を使うのは、OS の TLS（Schannel）とプロキシの設定（`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`）をそのまま使え、クレートを足さずに済むため（windows-sys の機能 `Win32_Networking_WinHttp` だけ。WebSocket の関数は Windows 8 から）。手順は `WinHttpOpen` → `WinHttpConnect` → `WinHttpOpenRequest`（`wss` は `WINHTTP_FLAG_SECURE`）→ `WinHttpSetOption(WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET)` → `WinHttpSendRequest` → `WinHttpReceiveResponse` → 状態の番号が 101 なら `WinHttpWebSocketCompleteUpgrade`、101 でなければ本文を上限まで読んで返す。
 //!
-//! loopback で測ったこと（Windows 11 Pro 10.0.26200、i686。`net_room::tests::winhttp_facts_*` が毎回の全件の回で確かめ直す）:
-//! - 受信の上限（`WINHTTP_OPTION_RECEIVE_TIMEOUT`）は 101 の後の WebSocket の受信に効かない（セッション・要求のどちらに置いても戻らず、
-//!   WebSocket のハンドルへ置くと 12018 で断られる）。Upgrade の前には効く（応答の先頭を待つ `WinHttpReceiveResponse` と、101 でない応答の
-//!   本文の受信）。なので WebSocket の受信は文が来るまで止まったままで、待ちを解くのは `close` だけ。
-//! - `WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT` は応答の先頭の待ちに効かなかったので置かない。
-//! - 時間切れは約 4 秒おきに見回られる（6 回の測りからの推定）ため、置いた値より最大 4 秒ほど遅れて切れる（製品の 10 秒は 10〜14 秒）。
-//! - 受信で止まっている間に、別のスレッドから `send_text`・`shutdown`・`close` を呼べる。`shutdown` の後に相手が閉じ返せば、
-//!   止まっている受信が close を受けて戻る。
-//! - `close` を呼ぶと止まっている受信はその場で 12017 で戻る。`close` 自身は、相手が閉じ返せば約 0.2 ms、答えなければ
-//!   `WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`（単位は ms）の後に 12002 で戻る。
-//! - 番号の無い close を受けると `WinHttpWebSocketQueryCloseStatus` は 1005 を返す。
-//! - 別のスレッドからの `WinHttpCloseHandle` でも受信は戻るが採らない。閉じたハンドルの値が使い回されない保証が WinHTTP に無く、
-//!   受け側が閉じたかを見てから呼ぶまでの隙も消せない。受信を解くのは `close`、ハンドルを閉じるのは両方のスレッドが手放した後の `Drop` の 1 回だけ。
+//! 受信の上限（`WINHTTP_OPTION_RECEIVE_TIMEOUT`）は 101 の後の WebSocket の受信に効かない（Upgrade の前には効く）。なので WebSocket の受信は文が来るまで止まったままで、待ちを解くのは `close` だけ（止まっている受信は 12017 で戻る）。
+//! 時間切れは約 4 秒おきに見回られるため、設定した値より最大 4 秒ほど遅れて切れる（製品の 10 秒は 10〜14 秒。6 回の測りからの推定）。別のスレッドからの `WinHttpCloseHandle` でも受信は戻るが採らない（閉じたハンドルの値が使い回されない保証が WinHTTP に無い）。ハンドルを閉じるのは両方のスレッドが手放した後の `Drop` の 1 回だけ。
+//! ほかの実測（Windows 11 Pro 10.0.26200、i686、loopback）は `net_room::tests::winhttp_facts_*` が毎回の全件の回で検証し直す。
 
 use core::ffi::c_void;
 
@@ -88,7 +74,7 @@ pub enum Step {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenError {
-    /// WinHTTP の関数が失敗した（名前が引けない・繋がらない・時間切れ・TLS の誤り）。`code` は `GetLastError`。
+    /// WinHTTP の関数が失敗した（名前が引けない・接続できない・時間切れ・TLS の誤り）。`code` は `GetLastError`。
     Transport { step: Step, code: u32 },
     /// 101 でない応答。`body` は上限まで読んだ本文（UTF-8 として読めない文字は置き換える）。
     Refused { status: u16, body: String },
@@ -147,19 +133,19 @@ fn set_u32_option(h: *mut c_void, option: u32, value: u32) -> bool {
     }
 }
 
-/// 開いた WebSocket。送り（`send_text` / `shutdown` / `close`）と受け（`receive`）は別のスレッドから同時に呼んでよい。
+/// 開いた WebSocket。送信（`send_text` / `shutdown` / `close`）と受信（`receive`）は別のスレッドから同時に呼んでよい。
 /// `Arc` で両方のスレッドが持ち、最後に手放した側の `Drop` でハンドルを閉じる。
 pub struct WebSocket {
     // 閉じる順は宣言の順（子から親へ）。
     ws: Handle,
     _connect: Handle,
     _session: Handle,
-    /// close の待ちの上限を置けなかったときの `GetLastError`。Wine の winhttp はこの設定を断る（12009）が通信はできるので、
+    /// close の待ちの上限を設定できなかったときの `GetLastError`。Wine の winhttp はこの設定を断る（12009）が通信はできるので、
     /// 接続は捨てず、close の待ちが既定の長さになるだけにする。
     close_timeout_error: Option<u32>,
 }
 
-/// WebSocket のハンドルへ close の待ちの上限（ms）を置く。
+/// WebSocket のハンドルへ close の待ちの上限（ms）を設定する。
 type CloseTimeoutSetter = fn(*mut c_void, u32) -> Result<(), u32>;
 
 fn set_close_timeout(ws: *mut c_void, ms: u32) -> Result<(), u32> {
@@ -170,15 +156,15 @@ fn set_close_timeout(ws: *mut c_void, ms: u32) -> Result<(), u32> {
     }
 }
 
-// SAFETY: WinHTTP のハンドルはどのスレッドから使ってもよい。WebSocket のハンドルは送り 1 本と受け 1 本を同時に持てる
+// SAFETY: WinHTTP のハンドルはどのスレッドから使ってもよい。WebSocket のハンドルは送信の呼び出し 1 本と受信の呼び出し 1 本を同時に持てる
 // （loopback で確認）。閉じるのは `Drop` の 1 回だけ。
 unsafe impl Send for WebSocket {}
 // SAFETY: 同上。`&self` のメソッドはどれもハンドルを閉じない。同じ向きの呼び出しを同時にしないのは使う側が守る
-// （`net_room.rs`: 受けは受信スレッドだけ、送りの向きは錠 `send_lock` で 1 本に絞る）。
+// （`net_room.rs`: 受信の呼び出しは受信スレッドだけ、送信の呼び出しは錠 `send_lock` で 1 本に絞る）。
 unsafe impl Sync for WebSocket {}
 
 impl WebSocket {
-    /// 繋いで Upgrade する。`body_max` は 101 でないときに本文を読む上限（バイト）。ブロッキングなので受信スレッドからだけ呼ぶ。
+    /// 接続して Upgrade する。`body_max` は 101 でないときに本文を読む上限（バイト）。ブロッキングなので受信スレッドからだけ呼ぶ。
     pub fn open(
         ep: &Endpoint,
         proxy: Proxy,
@@ -226,7 +212,7 @@ impl WebSocket {
             Step::Open,
         )?;
         let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
-        // SAFETY: 開いたセッションのハンドルに 4 つの ms を置くだけ。
+        // SAFETY: 開いたセッションのハンドルに 4 つの ms を設定するだけ。
         let ok = unsafe {
             WinHttpSetTimeouts(
                 session.0,
@@ -251,7 +237,7 @@ impl WebSocket {
         let verb = wide("GET");
         let path = wide(&ep.path);
         let flags = if ep.secure { WINHTTP_FLAG_SECURE } else { 0 };
-        // SAFETY: 開いた繋ぎ・0 終わりの動詞とパス。バージョン・参照元・受ける型は null（既定の HTTP/1.1）。
+        // SAFETY: 開いた接続・0 終わりの動詞とパス。バージョン・参照元・受ける型は null（既定の HTTP/1.1）。
         let request = Handle::new(
             unsafe {
                 WinHttpOpenRequest(
@@ -321,7 +307,7 @@ impl WebSocket {
         })
     }
 
-    /// close の待ちの上限を置けなかったときの番号（置けていれば `None`）。
+    /// close の待ちの上限を設定できなかったときの番号（設定できていれば `None`）。
     pub fn close_timeout_error(&self) -> Option<u32> {
         self.close_timeout_error
     }
@@ -412,7 +398,7 @@ impl WebSocket {
         if r == 0 { status } else { NO_STATUS }
     }
 
-    /// 検査だけ: WebSocket のハンドルへ受信の上限を置こうとする（WinHTTP が断ることを確かめる）。断られたらその番号。
+    /// 検査だけ: WebSocket のハンドルへ受信の上限を設定しようとする（WinHTTP が断ることを検証する）。断られたらその番号。
     #[cfg(test)]
     pub fn try_set_receive_timeout(&self, ms: u32) -> Result<(), u32> {
         use windows_sys::Win32::Networking::WinHttp::WINHTTP_OPTION_RECEIVE_TIMEOUT;

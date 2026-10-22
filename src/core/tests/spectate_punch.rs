@@ -1,5 +1,5 @@
 //! インターネット越しの観戦の穴あけ: 配る側（`SpectateHost`）が観戦者の候補へ `PunchPlan` で穴あけのパケットを送り、観戦者
-//! （`Watcher`）の JOIN が NAT を通って流れが始まるところまでを、偽の NAT（宛先のアドレスで絞る型）を両側に置いて組み上げて見る。
+//! （`Watcher`）の JOIN が NAT を通って流れが始まるところまでを、偽の NAT（宛先のアドレスで絞る型）を両側に付けて組み上げて見る。
 //! あわせて `PunchPlan` の予定（200 ms おき・5 回・JOIN が来たら止める）と、観戦者の「候補に無い送り元の STREAM」の受け入れ
 //! （`learned_host`）を直に見る。
 //!
@@ -62,10 +62,12 @@ fn join_of(nonce: u64) -> Message {
     name[0] = b'v';
     Message::SpectateJoin(SpectateJoin {
         name_len: 1,
+        ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT as u8,
         nonce,
         name,
         build: higanr_core::update::BUILD_NUMBER,
         public: Ephemeral::from_seed(&wseed(nonce)).public(),
+        tree: wire::JoinTree::NONE,
     })
 }
 
@@ -201,9 +203,11 @@ fn a_join_from_a_candidate_stops_only_that_candidates_punches() {
         let c = sink.0.iter().filter(|(to, _)| to == a).count();
         assert_eq!(c, 4, "残りの 4 周 {a}");
     }
-    assert!(plan.stop_for(addrs[1]));
-    assert!(plan.stop_for(addrs[2]));
     assert!(plan.is_done());
+    assert!(
+        !plan.stop_for(addrs[1]),
+        "送り終えた後の JOIN を止めたことにした"
+    );
 }
 
 #[test]
@@ -363,7 +367,7 @@ enum Inbound {
     AddrOnly,
 }
 
-/// 内側の 1 台の前に置く NAT。外側のアドレスは `ext_ip`、外から受けるポートは `ext_port`（外へ出すとき使うポート `out_port` が違えば、
+/// 内側の 1 台の前に付ける NAT。外側のアドレスは `ext_ip`、外から受けるポートは `ext_port`（外へ出すとき使うポート `out_port` が違えば、
 /// 外へ出すときだけ外側のポートが変わる型）。外から来た通は、宛先のポートが `ext_port` か `out_port` で、`inbound` の絞りを通ったものだけが内側へ入る。
 struct Nat {
     ext_ip: IpAddr,

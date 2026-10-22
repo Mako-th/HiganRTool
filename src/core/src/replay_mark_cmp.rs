@@ -1,4 +1,4 @@
-//! 複数台のリプレイの印（`HGRT`）のラウンドの記録を並べて比べる道具の中身（pure。道具は `src/bin/replay_mark_cmp.rs`）。
+//! 複数台のリプレイの印（`HGRT`）のラウンドの記録を並べて比べるツールの中身（pure。ツールは `src/bin/replay_mark_cmp.rs`）。
 //!
 //! 印のラウンドの記録（`rN`）は、保存した台がマッチの間に生きたゲームの状態から境目の tick で読んだ値で、リプレイを再生して出した値ではない
 //! （`replay_detail`）。rollback の 2 台（a・b）と、確定した入力の列だけで進む観戦者（c。素の花映塚と同じ道を通る）の印を並べると、
@@ -25,7 +25,7 @@ pub struct StageWords {
 /// 1 台・1 マッチ分の、比べる材料。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// ファイル名だけ（フォルダ名には対戦者の名前が入るので持たない）。
+    /// ファイル名だけ（フォルダ名には相手の名前が入るので持たない）。
     pub file: String,
     pub start_utc: Option<u64>,
     pub sync: Option<SyncKind>,
@@ -72,6 +72,11 @@ pub fn entry_from_bytes(file: &str, bytes: &[u8], with_inputs: bool) -> Result<E
             return Err(format!("{file}: 知らないバージョンの印だけがある"));
         }
         MarkRead::Broken(e) => return Err(format!("{file}: 印が壊れている（{e:?}）")),
+        MarkRead::Menu(_) => {
+            return Err(format!(
+                "{file}: ゲームのメニューから保存した印で、ネット対戦のラウンドの記録が無い"
+            ));
+        }
     };
     let Some(detail) = mark.detail else {
         return Err(format!(
@@ -762,5 +767,21 @@ mod tests {
         let e = entry_from_bytes("y.rpy", &replay_with(&m), false).unwrap_err();
         assert!(e.contains("マッチの記録"), "{e}");
         assert!(entry_from_bytes("z.rpy", b"not a replay", false).is_err());
+        // メニューの保存の印は「ラウンドの記録が無い」と分かる文言で断り、0 ラウンドとして一致させない。
+        let mut menu = build_replay(&BuildSpec::match_replay(0x52, vec![1], vec![2]));
+        let chunk = replay::chunk_to_append_menu(
+            &menu,
+            &replay::MenuMark {
+                ver: "1.1.1".into(),
+                build: 0,
+            },
+        )
+        .unwrap();
+        menu.extend(chunk);
+        let e = entry_from_bytes("m.rpy", &menu, false).unwrap_err();
+        assert!(
+            e.contains("メニュー") && e.contains("ラウンドの記録が無い"),
+            "{e}"
+        );
     }
 }

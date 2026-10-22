@@ -1,11 +1,9 @@
 //! 描画の地点（`0x0042DD51`）の素のアセンブリの入口と、描画のリングバッファ（unsafe はアセンブリだけ）。
 //!
-//! EndScene の直前の `mov eax,[0x4B3108]` を inline detour（`detour.rs`）で差し替え、この入口へ飛ばす。入口は回数を `lock inc` し、描画のリングバッファ
-//! （1 件 16 バイト: TSC 8 / その時点の tick の番号 `SEQ` の値 4 / 札 4）に 1 件書いて、トランポリンへ `jmp` する。トランポリンは盗んだ
-//! `mov eax,[0x4B3108]` を実行して `0x0042DD56` へ戻る。**ゲームのスレッドで Rust のコードは走らない**: ただし `overlay_win::OVERLAY_ON` が
-//! 0 でないときは `overlay_on_draw`（右下に 1 行を描く）、`shot_win::SHOT_REQ` が 0 でないときは `shot_on_draw`（バックバッファの撮影）を、
-//! 全部のレジスタとフラグを保って呼ぶ（文字の描画が先。撮った絵に文字が写る）。描画のリングバッファの読み方は tick のリングバッファと同じ seqlock
-//! （`ticks::classify`）。
+//! EndScene の直前の `mov eax,[0x4B3108]` を inline detour（`detour.rs`）で差し替え、この入口へ飛ばす。入口は回数を `lock inc` し、リングバッファ
+//! （1 件 16 バイト: TSC 8 / その時点の tick の番号 `SEQ` の値 4 / 札 4）に 1 件書いて、盗んだ `mov eax,[0x4B3108]` を実行して `0x0042DD56` へ戻るトランポリンへ `jmp` する。
+//! **ゲームのスレッドで Rust のコードは走らない**: ただし `overlay_win::OVERLAY_ON` が 0 でないときは `overlay_on_draw`（右下に 1 行）、`shot_win::SHOT_REQ` が 0 でないときは
+//! `shot_on_draw`（バックバッファの撮影）を、全部のレジスタとフラグを保って呼ぶ（文字の描画が先。撮った絵に文字が写る）。読み方は tick のリングバッファと同じ seqlock（`ticks::classify`）。
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
@@ -22,15 +20,15 @@ pub const DOFF_TSC_LO: u32 = 0;
 pub const DOFF_TSC_HI: u32 = 4;
 /// その時点の tick の番号（`stub::SEQ`。描画がどの更新の後に走ったかを結びつける）。
 pub const DOFF_TICK_SEQ: u32 = 8;
-/// 番号札（seq + 1）。0 は「書いている途中」。中身の後ろに置く（tick のリングバッファと同じ seqlock）。
+/// 番号札（seq + 1）。0 は「書いている途中」。中身の後ろに書く（tick のリングバッファと同じ seqlock）。
 pub const DOFF_TICKET: u32 = 12;
 
 /// 描画の地点を通った回数。入口が `lock inc`、読み取りのスレッドが読む。
 pub static DRAW_CALLS: AtomicU32 = AtomicU32::new(0);
 /// 描画のリングバッファの次の番号。入口が `lock xadd` で 1 つずつ取る。
 pub static DRAW_SEQ: AtomicU32 = AtomicU32::new(0);
-/// 入口がトランポリンへ飛ぶためのアドレス。`detour::install_detour` が JMP を書く前に置く（0 の間はこの入口へ向く
-/// JMP はまだ無い）。**0 なら入口は 0 アドレスへ飛ぶので、置く前に JMP を書いてはならない。**
+/// 入口がトランポリンへ飛ぶためのアドレス。`detour::install_detour` が JMP を書く前に設定する（0 の間はこの入口へ向く
+/// JMP はまだ無い）。**0 なら入口は 0 アドレスへ飛ぶので、設定する前に JMP を書いてはならない。**
 pub static DRAW_TRAMPOLINE: AtomicU32 = AtomicU32::new(0);
 
 /// 描画のリングバッファの 1 件（16 バイト）。
@@ -58,7 +56,7 @@ const _: () = assert!(DRAW_RING_MASK == RING_MASK);
 
 // SAFETY（`#[unsafe(naked)]`）: 本体は `naked_asm!` だけ。差し替えた `mov eax,[0x4B3108]`（`A1 08 31 4B 00`）の代わりに呼ばれ、
 // 最後にトランポリンへ飛ぶ。フラグと eax・ecx・edx・ebx を push して逆順に pop し、esi・edi・ebp・esp は変えない。
-// 書くのは DLL の静的変数だけで、ゲームのメモリは読まない。DRAW_TRAMPOLINE は JMP を書く前に置かれる（`detour::install_detour`）。
+// 書くのは DLL の静的変数だけで、ゲームのメモリは読まない。DRAW_TRAMPOLINE は JMP を書く前に設定される（`detour::install_detour`）。
 // 枠の番号は `and DRAW_RING_MASK` でリングバッファの中に収まる。
 // 文字の描画・撮影の経路は `pushad` → `cld`（Rust の関数が前提にする DF = 0。フラグは先頭の `pushfd` で取ってあり最後の `popfd` で
 // 戻る）→ `extern "C"` の呼び出し（中は全部 `catch_unwind`）→ `popad`（スタックは `pushad` の 32 バイトだけ使い、`popad` の後は入った時と同じ位置）。`0x0042DD51` は `SetTexture` の call の直後で x87 の
@@ -140,7 +138,7 @@ pub fn draw_next_seq() -> u32 {
     DRAW_SEQ.load(Ordering::Acquire)
 }
 
-/// トランポリンのアドレスを置く（JMP を書く前に呼ぶこと。0 なら入口は 0 アドレスへ飛ぶ）。
+/// トランポリンのアドレスを設定する（JMP を書く前に呼ぶこと。0 なら入口は 0 アドレスへ飛ぶ）。
 pub fn set_draw_trampoline(addr: u32) {
     DRAW_TRAMPOLINE.store(addr, Ordering::SeqCst);
 }

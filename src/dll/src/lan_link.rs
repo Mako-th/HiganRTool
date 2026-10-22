@@ -1,19 +1,12 @@
 //! LAN 対戦の申し込みの運び手（std のソケットだけ。unsafe 無し）。
-//!
-//! 接続コードの受け渡しをクリップボードやルームサーバーでなく LAN の UDP でやる（判断と手順は core の `lan_proto`）。ここは
-//! ソケットを開き、状態機械に受けたバイト列を渡し、出てきた「送る」「開く」「読ませる」を行うだけ。コードの中身も接続の手順も、
-//! インターネットの経路と同じ（ホストが `Swapper::offer` で作ったコードをクライアントへ返し、クライアントが返すコードを返す）。
-//!
-//! - **別のスレッド・別のソケット**: 申し込みの受け口はゲームの受信ソケット（`net_udp` の受信ループ）とは別。ゲームのスレッドには何も足さない。
-//!   ホストの受け口は、LAN の自分のアドレスごとに 1 つずつ（`bind(アドレス:ポート)`）。全部のアドレスで受ける未指定アドレスの待ち受けにしない:
-//!   WAN 側のアドレスで待たず、どのアドレスに申し込みが届いたか（＝その相手に届く自分のアドレス）がそのまま分かる。
-//! - **ゲームのネットワークは参加を受けてから開く**: ホストは申し込みが届いたアドレスで、クライアントは申し込み先へ届く自分のアドレスで
-//!   ゲームのネットワークを開き（`LanEnv::open_net`。`scope = lan`（VPN のアドレスでは、そのネットワークを足した範囲）・STUN・UPnP・IPv6 なし）、見張り（`net_code_game::GameWatcher`）が
-//!   `LanBridge` を通してコードを受け渡す。見張りは「作る」「貼る」と同じ手順を踏むが、コードの運び先がクリップボードでなく `LanBridge`。
-//! - **見張りとの受け渡し**: 運び手と見張りの間は `LanBridge`（錠で守った小さな入れ物）。見張りは指示のリングバッファの読み手のまま
-//!   （運び手は、ネットワークを開く前の取りやめの指示だけを自分で読み、開く頼みを出したら読まない）。
-//!
-//! 申し込みの文脈（ホスト・クライアント・観戦の 3 つ）ごとに 1 本のスレッドで、終われば（取りやめ・失敗・成立して務めを終えた）スレッドも終わる。
+//! 接続コードの受け渡しをクリップボードやルームサーバーでなく LAN の UDP でやる（判断と手順は core の `lan_proto`）。ここはソケットを開き、状態機械に受けたバイト列を渡し、出てきた「送る」「開く」「読ませる」を行うだけ。
+//! コードの中身も接続の手順も、インターネットの経路と同じ（ホストが `Swapper::offer` で作ったコードをクライアントへ返し、クライアントが返すコードを返す）。
+//! - **別のスレッド・別のソケット**: 申し込みの受け口はゲームの受信ソケット（`net_udp` の受信ループ）とは別で、ゲームのスレッドには何も足さない。ホストの受け口は、LAN の自分のアドレスごとに 1 つずつ（`bind(アドレス:ポート)`）。
+//!   全部のアドレスで受ける未指定アドレスの待ち受けにしないのは、WAN 側のアドレスで待たず、どのアドレスに申し込みが届いたか（＝その相手に届く自分のアドレス）をそのまま分かるようにするため。
+//! - **ゲームのネットワークは参加を受けてから開く**: ホストは申し込みが届いたアドレスで、クライアントは申し込み先へ届く自分のアドレスでゲームのネットワークを開き（`LanEnv::open_net`。`scope = lan`（VPN のアドレスでは、そのネットワークを足した範囲）・STUN・UPnP・IPv6 なし）、
+//!   見張り（`net_code_game::GameWatcher`）が `LanBridge` を通してコードを受け渡す。見張りは「作る」「貼る」と同じ手順を踏むが、コードの運び先がクリップボードでなく `LanBridge`。
+//! - **見張りとの受け渡し**: 運び手と見張りの間は `LanBridge`（ロックで守った小さな入れ物）。見張りは指示のリングバッファの読み手のまま（運び手は、ネットワークを開く前の取りやめの指示だけを自分で読み、開く頼みを出したら読まない）。
+//!   申し込みの文脈（ホスト・クライアント・観戦の 3 つ）ごとに 1 本のスレッドで、終われば（取りやめ・失敗・成立して務めを終えた）スレッドも終わる。
 
 #![forbid(unsafe_code)]
 
@@ -69,7 +62,7 @@ struct Inner {
     aborted: bool,
     /// 見張りが書いたコード（運び手が取って相手へ送る）。
     outgoing: Option<String>,
-    /// 運び手が置いたコード（見張りが `read` で読む。読んでも消さない）。
+    /// 運び手が書いたコード（見張りが `read` で読む。読んでも消さない）。
     incoming: Option<String>,
     cmds: VecDeque<BridgeCmd>,
     watch_answers: VecDeque<(SocketAddrV4, u32, Result<String, Why>)>,
@@ -107,7 +100,7 @@ impl LanBridge {
         self.with(|i| i.closed = true);
     }
 
-    /// 対戦が成立した（観戦の申し込みを受け始める）。
+    /// 対戦が成立した（ホストが観戦者からの申し込みを受け始める）。
     pub fn set_connected(&self) {
         self.with(|i| i.connected = true);
     }
@@ -225,13 +218,13 @@ pub struct LanEnv {
     pub reply_wait_ms: u64,
     /// ホストの自分の LAN のアドレス（本物の LAN → VPN → ほかの仮想の順）。
     pub addresses: Box<dyn Fn() -> Result<Vec<HostAddr>, String> + Send + Sync>,
-    /// クライアント・観戦の自分の PC の VPN のアドレス（打たれたアドレスが LAN の外のとき、この中のネットワークなら受ける）。
+    /// クライアント・観戦の自分の PC の VPN のアドレス（利用者が打ったアドレスが LAN の外のとき、この中のネットワークなら受ける）。
     pub vpn_links: Box<dyn Fn() -> Vec<VpnLink> + Send + Sync>,
     /// 前のネットワークの片づけが済んで、ホストの受け口のポートが空いたか。
     pub net_free: Box<dyn Fn() -> bool + Send + Sync>,
-    /// ゲームのネットワークを `ip` で開く頼み（開くスレッドを起こして返る。見張りは動き出したら `LanBridge::attach` を呼ぶ）。
+    /// ゲームのネットワークを `ip` で開く頼み（開くスレッドを作って返る。見張りは動き出したら `LanBridge::attach` を呼ぶ）。
     pub open_net: OpenNet,
-    /// 観戦コードを受けた。観戦者のネットワークを `ip`・範囲 `scope` で開く頼みを出す（観戦者のセッションを置くのはゲームのスレッド）。
+    /// 観戦コードを受けた。観戦者のネットワークを `ip`・範囲 `scope` で開く頼みを出す（観戦者のセッションを作るのはゲームのスレッド）。
     pub start_watch: Box<dyn Fn(String, Ipv4Addr, Scope) -> Result<(), String> + Send + Sync>,
     /// 本ログへ 1 行頼む（製品は `script_win` が本ログと「ネットワーク」の詳細へ書く。検査は記録する）。
     pub note: Box<dyn Fn(String) + Send + Sync>,
@@ -265,10 +258,10 @@ fn note_vpn_open(env: &LanEnv, ip: Ipv4Addr, scope: Scope) {
 fn vpn_open_line(tool: Option<VpnTool>, prefix: u8) -> String {
     match tool {
         Some(t) => format!(
-            "LAN: {} のネットワーク（/{prefix}）を足した範囲で開く",
+            "LAN: {} のネットワーク（/{prefix}）を足した範囲で開きます。",
             t.name()
         ),
-        None => format!("LAN: VPN のネットワーク（/{prefix}）を足した範囲で開く"),
+        None => format!("LAN: VPN のネットワーク（/{prefix}）を足した範囲で開きます。"),
     }
 }
 
@@ -337,7 +330,7 @@ fn why_event(why: Why, say: &mut Say<'_>) -> Event {
     match why {
         Why::Busy => Event::LanBusy,
         Why::NotYet => Event::LanNoMatch,
-        Why::WatchOff => Event::LanWatchOff,
+        Why::WatchOff => Event::WatchRefused,
         Why::OtherVersion { theirs } => {
             say.note.peer_ver = theirs;
             Event::OtherVersion
@@ -412,7 +405,7 @@ fn host_receive(
     host.on_datagram(src, bytes, now)
 }
 
-/// ホストの務め。自分の LAN のアドレスの受け口を開いて参加者を待ち、先着 1 人を受けたらゲームのネットワークを開いてコードを受け渡し、
+/// ホストの務め。自分の LAN のアドレスの受け口を開いて参加者を待ち、先着 1 人を受けたらゲームのネットワークを開いてその人とコードを受け渡し、
 /// 対戦が成立した後は観戦の申し込みに観戦コードを答える。参加者が返すコードを返さないまま上限が過ぎたら、開いたネットワークのまま待機へ戻る。
 pub fn run_host(env: &LanEnv) -> End {
     let mut say = Say::new(&env.link);
@@ -525,7 +518,7 @@ pub fn run_host(env: &LanEnv) -> End {
                     let ip = on.map_or(Ipv4Addr::LOCALHOST, |l| l.ip);
                     let scope = Scope::lan_via(ip, on.and_then(|l| l.net));
                     match (&bridge, net_ip) {
-                        // 待機へ戻った後: 開いたままのネットワークで、新しいコードを作らせる（前のコードは前の参加者に渡した）。
+                        // 待機へ戻った後: 開いたままのネットワークで、見張りに新しいコードを作らせる（前のコードは前の参加者に渡した）。
                         (Some(b), Some(on)) if on == ip => {
                             say.note.name = [0; NAME_UNITS];
                             say.put(CodeState::LanLinking, Event::LanPeer);
@@ -609,7 +602,7 @@ fn send_host_act(socks: &[Listener], routes: &Routes, a: HostAct) {
 
 // ---- 申し込む側の下ごしらえ ----
 
-/// 打たれたアドレスに申し込んでよいか。範囲 lan の中ならよい（`Ok(None)`）。外なら、自分の PC の VPN のネットワークの中の 1 台のときだけよい
+/// 利用者が打ったアドレスに申し込んでよいか。範囲 lan の中ならよい（`Ok(None)`）。外なら、自分の PC の VPN のネットワークの中の 1 台のときだけよい
 /// （`Ok(Some(その VPN のアドレス))`）。それ以外は断る。
 fn admit_host(addr: LanAddr, links: &[VpnLink]) -> Result<Option<VpnLink>, String> {
     if guard::allows(Scope::Lan, SocketAddr::V4(addr.socket())) {
@@ -807,7 +800,7 @@ pub fn run_watch(env: &LanEnv, addr: LanAddr) -> End {
 /// 同時に動かす運び手は 1 本まで（動いている間に次の頼みが来たら断る）。
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// 運び手のスレッドを起こす。動いている運び手があれば起こさず `false`（呼び手は読み捨てる）。終わりに `done` を呼ぶ。
+/// 運び手のスレッドを作る。動いている運び手があれば作らず `false`（呼び手は読み捨てる）。終わりに `done` を呼ぶ。
 pub fn spawn(
     name: &str,
     env: LanEnv,
@@ -830,7 +823,7 @@ pub fn spawn(
         Ok(_) => Ok(true),
         Err(e) => {
             ACTIVE.store(false, Ordering::SeqCst);
-            Err(format!("LAN の運び手のスレッドを起こせない: {e}"))
+            Err(format!("LAN の運び手のスレッドの作成不能: {e}"))
         }
     }
 }
@@ -1043,8 +1036,6 @@ mod tests {
         })
     }
 
-    /// 壊れたら落ちる: ホストとクライアントの間で、始める側のコードと返すコードが渡らない、ネットワークを開く役・アドレスが違う、
-    /// ホストの画面に待機のアドレスが出ない、成立した後の観戦の申し込みに観戦コードが返らない。
     #[test]
     fn host_client_and_watcher_exchange_the_codes_over_loopback() {
         let port = port_free();
@@ -1115,8 +1106,6 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 運び手の受け取り（`run_host` が受けた 1 通ごとに呼ぶ `host_receive`）が、LAN の外・ポート 0・マルチキャスト・IPv6 の
-    /// 送り元の申し込みを状態機械へ渡す（WAN から届いた申し込みで先着が埋まる）、LAN の送り元を受けない・受け口を覚えない。
     #[test]
     fn only_lan_sources_are_answered() {
         let join = encode(&Msg::Join {
@@ -1170,8 +1159,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: ホストの画面の待機のアドレスが受け口を開けた全部でない、申し込みが届いたアドレスと違うアドレスでゲームのネットワークを開く
-    /// （返事が申し込みの届いたアドレスから出ない — 直結の相手に届かない）。127.0.0.2 は 127.0.0.1 と別のアドレス（有線と無線の両方がある PC の見立て）。
+    /// 127.0.0.2 は 127.0.0.1 と別のアドレス（有線と無線の両方がある PC の見立て）。
     #[test]
     fn the_network_opens_on_the_address_the_request_arrived_at() {
         let port = port_free();
@@ -1188,7 +1176,7 @@ mod tests {
             (2, [127, 0, 0, 1], [127, 0, 0, 2]),
             "有線と無線の両方のアドレスを出す"
         );
-        // 2 つ目のアドレスへ申し込む。返事がそのアドレスから出なければ、つないだソケットは受け取らず「返事がない」で終わる。
+        // 2 つ目のアドレスへ申し込む。返事がそのアドレスから出なければ、接続したソケットは受け取らず「返事がない」で終わる。
         let c = rig(0, 31, true);
         let end = client_bg(c, LanAddr { ip: second, port }).wait(DONE);
         assert_eq!(end, End::Done);
@@ -1200,7 +1188,6 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 画面に出すアドレスと受け口を開くアドレスが食い違う（上限を越える分の受け口を開く・画面に出した最後のアドレスで受けられない）。
     #[test]
     fn the_addresses_on_screen_are_exactly_the_ones_listening() {
         let port = port_free();
@@ -1234,8 +1221,6 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 先着の参加者と別のアドレスに届いた申し込みへの返事（観戦コード・断り）が、先着の参加者を受けた受け口から出る
-    /// （申し込んだ側の `connect` 済みのソケットが受け取らず、観戦できない・断りの理由が出ない）。
     #[test]
     fn each_answer_leaves_from_the_address_its_request_arrived_at() {
         let port = port_free();
@@ -1278,9 +1263,7 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 返すコードを返さない参加者（打ち間違えて取りやめた人）のせいで待機が終わる、待機の画面へ戻らない、次の参加者のために
-    /// ネットワークを開き直す（開いたままのネットワークがあるので開けない）、前と同じコードを渡す、ネットワークと別のアドレスに届いた参加者を受ける
-    /// （その相手には届かないアドレスのコードを渡す）。
+    /// ネットワークと別のアドレスに届いた参加者を受けないことも見る。
     #[test]
     fn a_silent_joiner_sends_the_host_back_to_waiting_and_the_next_one_gets_a_new_code() {
         let port = port_free();
@@ -1361,7 +1344,6 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 見張りが待ちをやめた（取りやめ・失敗）のに、ホストの運び手が務めを続ける（次のホストを始められない）。
     #[test]
     fn the_host_carrier_ends_when_the_watcher_gives_up_or_closes() {
         for how in ["abort", "close"] {
@@ -1398,7 +1380,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 2 人目の参加者が断られない、断られたクライアントが理由を画面へ出さない。
     #[test]
     fn the_second_client_is_told_the_host_is_busy() {
         let port = port_free();
@@ -1419,7 +1400,6 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 観戦の申し込みが対戦の成立の前に観戦コードを受け取る、観戦を受けない設定でも通る。
     #[test]
     fn a_watch_request_before_the_match_or_with_watching_off_is_refused() {
         let port = port_free();
@@ -1448,11 +1428,10 @@ mod tests {
             port,
         };
         let w = rig(0, 6, true);
-        assert_eq!(run_watch(&w.env, addr), End::Failed(Ev::LanWatchOff));
+        assert_eq!(run_watch(&w.env, addr), End::Failed(Ev::WatchRefused));
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: バージョンやビルドの違うクライアントを、ネットワークを開く前に断らない。
     #[test]
     fn a_different_build_is_refused_before_any_network_is_opened() {
         let port = port_free();
@@ -1484,8 +1463,7 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: LAN の外のアドレスへの申し込みをソケットの段で断らない（`dial` のガード。外したら最初の確かめで落ち、何も送らない —
-    /// UDP の `connect` はパケットを出さない）、アドレスが無いホストが待ちを始める、使われているポートで待つ。
+    /// `dial` のガードを外すと最初のチェックで落ち、何も送らない（UDP の `connect` はパケットを出さない）。
     #[test]
     fn an_outside_address_no_address_and_a_busy_port_end_with_their_own_events() {
         // 文書用のアドレス（TEST-NET-3）。LAN の外。
@@ -1518,8 +1496,6 @@ mod tests {
         assert_eq!(last_note(&h.env.link).lan_port, port);
     }
 
-    /// 壊れたら落ちる: クライアントが前のネットワークの片づけを待たずに申し込む（片づけの前に始める側のコードが届くと、ゲームのネットワークを
-    /// 開けずに失敗する）、片づけが済んでも申し込まない。
     #[test]
     fn the_client_joins_only_after_the_previous_network_is_cleared() {
         let fake_host = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1555,7 +1531,6 @@ mod tests {
         assert_eq!(cl.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: ネットワークを開く前の取りやめの指示を運び手が読まない（ホストの待ちが終わらない）。
     #[test]
     fn cancel_before_the_network_opens_ends_the_wait_and_clears_the_menu() {
         let port = port_free();
@@ -1584,8 +1559,6 @@ mod tests {
         .unwrap()
     }
 
-    /// 壊れたら落ちる: VPN の受け口が同じネットワークの外（私設の LAN・loopback・隣の /8・ネットワークのアドレスとブロードキャスト・ポート 0・
-    /// IPv6）の申し込みを読む、VPN でない受け口が VPN の送り元を読む（今までの振る舞いが変わる）、VPN の受け口が自分のネットワークの中を読まない。
     #[test]
     fn a_vpn_listener_reads_only_its_own_network_and_a_plain_one_never_reads_a_vpn_source() {
         let radmin = Some(net("26.0.0.1", 8));
@@ -1628,7 +1601,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: ネットワークが予約の範囲（240/4）に掛かっていても、VPN の受け口がどの範囲でも使えない送り元を読む。
+    /// ネットワークが予約の範囲（240/4）に掛かっていても同じ。
     #[test]
     fn a_vpn_listener_never_reads_a_source_that_no_scope_can_use() {
         let join = join_msg(2);
@@ -1650,8 +1623,6 @@ mod tests {
         assert!(!acts.is_empty(), "同じ表で、使える送り元は読む");
     }
 
-    /// 壊れたら落ちる: クライアントが LAN の外のアドレスのうち自分の VPN のネットワークの外にも申し込む、VPN のネットワークの中のアドレスを断る、
-    /// 私設のアドレスが VPN の指定に引きずられる、アドレスが VPN を通らない経路（OS が別のアダプターを選んだ）でも通す。
     #[test]
     fn the_client_dials_a_non_lan_address_only_inside_one_of_my_vpn_networks_and_over_that_adapter()
     {
@@ -1691,7 +1662,7 @@ mod tests {
         }
         // VPN のネットワークが無ければ、今までどおり LAN の外。
         assert!(admit_host(at("26.200.0.1"), &[]).is_err());
-        // 広いネットワーク（172/8 など）が私設のアドレスを含んでいても、私設の宛先は VPN の扱いにしない（LAN のアダプターを通るので、VPN の経路の確かめで断らない）。
+        // 広いネットワーク（172/8 など）が私設のアドレスを含んでいても、私設の宛先は VPN の扱いにしない（LAN のアダプターを通るので、VPN の経路のチェックで断らない）。
         let wide = link("172.99.1.1", 8);
         assert_eq!(admit_host(at("172.16.0.5"), &[wide]), Ok(None));
         assert_eq!(admit_host(at("172.200.0.5"), &[wide]), Ok(Some(wide)));
@@ -1720,9 +1691,7 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: VPN の受け口が、同じネットワークの外から来た申し込みに応じる（先着が埋まりゲームのネットワークを開く）、
-    /// 同じネットワークの中の申し込みに応じない、ゲームのネットワークを VPN のネットワークを足した範囲で開かない（VPN でない受け口は範囲 lan のまま）、
-    /// 待機の札のツールの名前が別のアドレスに付く。
+    /// 待機の札のツールの名前が別のアドレスに付かないことも見る。
     #[test]
     fn a_vpn_listener_answers_inside_its_network_only_and_opens_the_game_network_in_the_widened_scope()
      {
@@ -1784,22 +1753,22 @@ mod tests {
         assert_eq!(*scopes.lock().unwrap(), vec![Scope::LanVpn(vpn_net)]);
         assert_eq!(
             *notes.lock().unwrap(),
-            vec!["LAN: Radmin VPN のネットワーク（/30）を足した範囲で開く".to_string()],
+            vec!["LAN: Radmin VPN のネットワーク（/30）を足した範囲で開きます。".to_string()],
             "VPN の範囲で開いた行（ツールの名前と長さだけ）"
         );
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// 壊れたら落ちる: 本ログの VPN の行にツールの名前が無い・アドレスの形が混ざる・ネットマスクの長さが違う。ツールが引けない時は名前だけを省く。
+    /// ツールが引けない時は名前だけを省く。
     #[test]
     fn the_vpn_line_names_the_tool_and_the_prefix_only() {
         assert_eq!(
             vpn_open_line(Some(VpnTool::Radmin), 8),
-            "LAN: Radmin VPN のネットワーク（/8）を足した範囲で開く"
+            "LAN: Radmin VPN のネットワーク（/8）を足した範囲で開きます。"
         );
         assert_eq!(
             vpn_open_line(None, 30),
-            "LAN: VPN のネットワーク（/30）を足した範囲で開く"
+            "LAN: VPN のネットワーク（/30）を足した範囲で開きます。"
         );
         for t in [VpnTool::Hamachi, VpnTool::ZeroTier] {
             let line = vpn_open_line(Some(t), 24);
@@ -1813,7 +1782,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 範囲 lan の申し込みに VPN の行を書く、VPN の範囲の申し込みに行を書かない。
     #[test]
     fn only_a_vpn_scope_writes_the_vpn_line() {
         let mut r = rig(0, 0, true);
@@ -1824,7 +1792,7 @@ mod tests {
         note_vpn_open(&r.env, ip, Scope::LanVpn(vpn_net));
         assert_eq!(
             *r.notes.lock().unwrap(),
-            vec!["LAN: VPN のネットワーク（/30）を足した範囲で開く".to_string()],
+            vec!["LAN: VPN のネットワーク（/30）を足した範囲で開きます。".to_string()],
             "ツールが引けないときは名前だけを省く"
         );
         r.notes.lock().unwrap().clear();
@@ -1838,11 +1806,10 @@ mod tests {
         note_vpn_open(&r.env, ip, Scope::LanVpn(vpn_net));
         assert_eq!(
             *r.notes.lock().unwrap(),
-            vec!["LAN: ZeroTier のネットワーク（/30）を足した範囲で開く".to_string()]
+            vec!["LAN: ZeroTier のネットワーク（/30）を足した範囲で開きます。".to_string()]
         );
     }
 
-    /// 壊れたら落ちる: VPN でない LAN の接続が範囲 lan から替わる（ホストもクライアントも観戦も）。
     #[test]
     fn a_plain_lan_connection_keeps_the_lan_scope_for_host_client_and_watcher() {
         let port = port_free();
@@ -1907,7 +1874,7 @@ mod tests {
             .load(Ordering::SeqCst)
             == 1));
         assert!(wait_until(Duration::from_secs(5), || !is_active()));
-        // パニックは受けて、次を起こせる。
+        // パニックは受けて、次を作れる。
         let r3 = spawn(
             "t3",
             rig(0, 0, true).env,

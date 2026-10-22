@@ -1,6 +1,6 @@
 //! LAN のホストのアドレス（`IPv4:ポート`）の入力と読み方（pure。確保しない）。
 //!
-//! メニューの「クライアント」「観戦」で、ホストが画面に出したアドレスをキーボードで打つ。文字の受け方はルーム名・プレイヤー名の入力と同じ
+//! メニューの「クライアント」「観戦」で、対戦のホストが画面に出したアドレスをキーボードで打つ。文字の受け方はルーム名・プレイヤー名の入力と同じ
 //! （`room_input::classify_by`。全角の数字・記号は半角に直して受ける）で、受ける文字だけが違う（数字・`.`・`:`）。決めたアドレスは ini の
 //! `[netplay] lan_host` に書き戻し、次に打つときの初めの値にする（書き戻すのは dll の仕事）。
 
@@ -186,8 +186,8 @@ pub fn parse_with(s: &str, vpn: &VpnSet) -> Result<LanAddr, AddrWhy> {
     }
 }
 
-/// 形とポートだけを確かめ、範囲は見ない（どの範囲でも使えないアドレス = 未指定・マルチキャスト・ブロードキャスト・0.x は `NotLan`）。
-/// ini の `lan_host` は VPN の範囲のアドレスも書かれるが、VPN がつながっているかは起動のときに分からないので、これで読む。
+/// 形とポートだけを検証し、範囲は見ない（どの範囲でも使えないアドレス = 未指定・マルチキャスト・ブロードキャスト・0.x は `NotLan`）。
+/// ini の `lan_host` は VPN の範囲のアドレスも書かれるが、VPN が接続しているかは起動のときに分からないので、これで読む。
 pub fn parse_form(s: &str) -> Result<LanAddr, AddrWhy> {
     let t = s.trim();
     if t.is_empty() {
@@ -330,9 +330,6 @@ mod tests {
         )
     }
 
-    /// 壊れたら落ちる: 自分の PC の VPN のネットワークの中のアドレスを断る、ネットワークの外（隣の /8・同じ /8 の別の /24・ネットワークのアドレス・
-    /// ブロードキャスト）を通す、VPN のネットワークが無いときに世界のアドレスを通す（今までの `parse` と変わる）、LAN の外の理由が替わる、
-    /// 形・ポートの断りが範囲の断りに負ける。
     #[test]
     fn an_address_inside_my_vpn_network_is_a_lan_address_and_nothing_else_outside_is() {
         let set = vpn(&[("26.1.2.3", 8), ("25.9.9.9", 8), ("28.7.7.9", 24)]);
@@ -377,8 +374,6 @@ mod tests {
         assert_eq!(i.text().parse_with(&set).map(|a| a.port), Ok(DEFAULT_PORT));
     }
 
-    /// 壊れたら落ちる: ini の `lan_host` に書かれた VPN のアドレスが、VPN がつながる前の起動で断られる（読めない行の注が出る）、
-    /// 形・ポート・どの範囲でも使えないアドレス（未指定・マルチキャスト・ブロードキャスト）まで通る。
     #[test]
     fn the_form_check_keeps_any_usable_address_for_the_ini_and_refuses_the_rest() {
         assert_eq!(parse_form("26.12.34.56:19000").map(|a| a.port), Ok(19000));

@@ -21,7 +21,7 @@ use crate::th09_addr::{
 pub(crate) const ARENA_BASE: u32 = 0x2000_0000;
 pub(crate) const ARENA_BYTES: u32 = 1 << 20;
 pub(crate) const STATE: u32 = 0x004A_8000;
-/// 列の並びに入るがコピーの範囲の外にある語（Supervisor の中。コピーの外の節のつなぎの代わり）。
+/// 列の並びに入るがコピーの範囲の外にある語（Supervisor の中。コピーの外の節のリンクの代わり）。
 pub(crate) const LIST_OUTSIDE: u32 = SUPERVISOR + 0x10;
 
 pub(crate) struct FakeGame {
@@ -44,7 +44,7 @@ pub(crate) struct FakeGame {
     pub(crate) consume: bool,
     /// p2 がこの値の tick で次の場面の要求を立てる・列の並びを変える・外の塊を取る。
     pub(crate) scene_on_p2: Option<u16>,
-    /// 数えた tick（`RNG_COUNT`。進め直しで戻る）がこの数の倍数になる tick で次の場面の要求を立てる（両者で同じ tick になる）。
+    /// 数えた tick（`RNG_COUNT`。進め直しで戻る）がこの数の倍数になる tick で次の場面の要求を立てる（対戦の両側で同じ tick になる）。
     pub(crate) scene_every_ticks: Option<u32>,
     pub(crate) list_on_p2: Option<u16>,
     pub(crate) alloc_on_p2: Option<u16>,
@@ -71,7 +71,7 @@ pub(crate) struct FakeGame {
     pub(crate) tint_on_p2: Option<u16>,
     pub(crate) reset_calls: u32,
     /// fps の計測 `0x4316B0` の真似: 描画のたびに描画の回数を 1 足し、基準の時刻から 500 ms 以上なら fps を計算し直して
-    /// 丸めた値を `FPS_SHOWN` に置く。時刻は描画の回数 × 50 / 3 ms（60 fps）。偽なら fps の欄に触らない。
+    /// 丸めた値を `FPS_SHOWN` に書く。時刻は描画の回数 × 50 / 3 ms（60 fps）。偽なら fps の欄に触らない。
     pub(crate) fps_model: bool,
     pub(crate) draws: u32,
     /// 毎 tick に `s & 0x3F` の id の SE を積む雑音（既定 true）。SE の検査は false にして、決まった出来事だけを積む。
@@ -244,7 +244,7 @@ impl FakeGame {
         self.se_log.iter().map(|&(_, id, _)| id).collect()
     }
 
-    /// 両陣の Stage に陣の背景の VM の配列（`n` 本。どれも動いている —— 今の命令が 0 でない）を置く（本物は読み込みが置く）。
+    /// 両陣の Stage に陣の背景の VM の配列（`n` 本。どれも動いている —— 今の命令が 0 でない）を用意する（本物は読み込みが用意する）。
     pub(crate) fn set_bg(&mut self, n: u32) {
         for (side, &arr) in BG_ARRAY.iter().enumerate() {
             let s = self.stage(side);
@@ -262,7 +262,7 @@ impl FakeGame {
         self.get(BG_ARRAY[side] + i * VM_BYTES + VM_CLOCK)
     }
 
-    /// 更新 `Stage::on_tick 0x402350` → `0x4011D0` の真似（feed の走査の中）: 置いた VM の時計を 1 進める（run_vm の尻
+    /// 更新 `Stage::on_tick 0x402350` → `0x4011D0` の真似（feed の走査の中）: 用意した VM の時計を 1 進める（run_vm の末尾
     /// `0x4393A1`）。本数は Stage の欄から読む（コピーの書き戻しで戻った値で回る）。
     fn bg_tick(&mut self) {
         for side in 0..2 {
@@ -423,7 +423,7 @@ impl PlayMem for FakeGame {
         self.arena_top = top;
     }
     /// コピー（語の表）の範囲 `r` の中を塊のバイト列に組み直して本物と同じ `render_reset::apply` を掛け、欄に掛かる語だけを
-    /// コピーへ戻す（偽のゲームの語は 4 の倍数のアドレスに置く）。
+    /// コピーへ戻す（偽のゲームの語は 4 の倍数のアドレスに割り当てる）。
     fn reset_in_snap(&mut self, r: &Region, fields: &[ResetField<'_>]) -> Result<u32, Refused> {
         self.reset_calls += 1;
         let len = r.len.min(r.cap);

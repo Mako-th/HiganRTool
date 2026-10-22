@@ -1,0 +1,26 @@
+[package]
+name = "higanr_prng_shim"
+description = "std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり。loader と dll が使う"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# Win32 の宣言だけ（MIT OR Apache-2.0。dll・loader と同じ版）。
+#   Foundation            HMODULE
+#   System_LibraryLoader  GetModuleHandleW / GetProcAddress / LoadLibraryW
+#   System_Performance    QueryPerformanceCounter（乱数が引けないときの最後の手の種）
+#   System_SystemInformation  GetTickCount64（同上）
+#   System_Threading      GetCurrentProcessId / GetCurrentThreadId（同上）
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]

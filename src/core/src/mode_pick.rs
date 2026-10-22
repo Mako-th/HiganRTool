@@ -1,25 +1,8 @@
 //! 対戦の形（rollback か delay 方式か・rollback の入力の遅れ D）を、接続コードのウィンドウで選ぶための決まり。
 //!
-//! ウィンドウ（ローダー）は打たれた文字を読んで `mode.txt` を書き、dll の見張りがそれを読む。文字の読み方・ファイルの形・
-//! ini の `mode` / `delay` の読み方は両者で同じでなければならず（食い違うとウィンドウは「delay 方式」と言うのに
-//! dll は rollback を名乗る）、dll のクレートはローダーから引けないので core に置く。Win32 にもゲームのメモリにも触らない。
-//!
-//! ## ウィンドウで選べるもの（`Pick`）
-//!
-//! 打つ文字は `0`〜`8`（rollback の入力の遅れ D のフレーム数。範囲は `delay_pick::bounds`）と `delay`（delay 方式）だけ。
-//! 前後の空白は落とし、`delay` は大文字・小文字を問わず、数字は全角（`０`〜`８`）も受ける。`9` は auto の印
-//! （`delay_pick::AUTO`）でウィンドウの選択ではない。
-//! 接続コードは 100 文字を越える base64url なので、これらの文字と一致しえない。
-//!
-//! ## 受け渡しのファイル `mode.txt`（`code_files::MODE_FILE`）
-//!
-//! ```text
-//! pid = 1234
-//! pick = 1
-//! ```
-//!
-//! `pid` は**対象のゲームのプロセス番号**。dll は自分の番号と一致するときだけ使う。置き場（`code\`）は実行を
-//! またいで残るので、前の実行の選択を今の実行が黙って使わないため。書式は ini と同じ（`ini::parse`）。
+//! ウィンドウ（ローダー）は打たれた文字を読んで `mode.txt` を書き、dll の見張りがそれを読む。文字の読み方・ファイルの形・ini の `mode` / `delay` の読み方は両者で同じでなければならず（食い違うとウィンドウは「delay 方式」と言うのに dll は rollback を名乗る）、dll のクレートはローダーから引けないので core に定義する。Win32 にもゲームのメモリにも触らない。
+//! - 選べるもの（`Pick`）: 打つ文字は `0`〜`8`（rollback の入力の遅れ D のフレーム数。範囲は `delay_pick::bounds`）と `delay`（delay 方式）だけ。前後の空白は落とし、`delay` は大文字・小文字を問わず、数字は全角（`０`〜`８`）も受ける。`9`（`delay_pick::AUTO`）はウィンドウの選択ではない。接続コードは 100 文字を越える base64url なので、これらの文字と一致しえない。
+//! - 受け渡しのファイル `mode.txt`（`code_files::MODE_FILE`）は `pid = <対象のゲームのプロセス番号>` と `pick = <選択>` の 2 行（書式は ini と同じ。`ini::parse`）。dll は自分の番号と一致するときだけ使う（置き場 `code\` は実行をまたいで残るので、前の実行の選択を今の実行が黙って使わないため）。
 
 #![forbid(unsafe_code)]
 
@@ -59,7 +42,7 @@ pub fn ini_delay(v: Option<&str>) -> Result<DelayChoice, String> {
     match u8::try_from(n) {
         Ok(d) if d <= MAX_PICK_DELAY => Ok(DelayChoice::Fixed(d)),
         _ => Err(format!(
-            "{DELAY_KEY} の値 {n} は auto か 0〜{MAX_PICK_DELAY}"
+            "{DELAY_KEY} の値 {n} は auto か 0〜{MAX_PICK_DELAY} にしてください"
         )),
     }
 }
@@ -70,7 +53,7 @@ fn num(s: &str, key: &str) -> Result<u64, String> {
         Some(h) => u64::from_str_radix(h, 16),
         None => s.parse::<u64>(),
     };
-    r.map_err(|_| format!("{key} の値 {s:?} が数として読めない"))
+    r.map_err(|_| format!("{key} の値 {s:?} が数値として読み取り不能"))
 }
 
 /// ini の `mode` と `delay` を読む。`get` はキー → 値。値の誤りは理由つきで断る。
@@ -79,7 +62,11 @@ pub fn ini_shape<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Result<Shape, Str
         None => DEFAULT_MODE,
         Some("rollback") => Mode::Rollback,
         Some("delay") => Mode::Delay,
-        Some(v) => return Err(format!("mode の値 {v:?} は rollback か delay")),
+        Some(v) => {
+            return Err(format!(
+                "mode の値 {v:?} は rollback か delay にしてください"
+            ));
+        }
     };
     let delay = match ini_delay(get(DELAY_KEY))? {
         DelayChoice::Auto => rollback::DEFAULT_DELAY,

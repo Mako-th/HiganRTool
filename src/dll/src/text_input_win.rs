@@ -2,17 +2,11 @@
 //!
 //! ゲームのウィンドウの手続きを、文字（`WM_CHAR`）だけを横取りする手続きに差し替える（サブクラス化。自分のプロセスのウィンドウだけ）:
 //! - 入力の受信ソケット（`TextRing`）が閉じている間は何も貯めず、全部のメッセージを元の手続きへ素通しする。
-//! - 開いている間は `WM_CHAR` を貯め（ゲームへは渡さない）、入力の地点が 1 tick に 1 回 `drain` で取る。
-//!   開いている間だけ、ウィンドウから IME を切り離す（IME が開いたままだと、打った文字が変換の途中の文字になって `WM_CHAR` に来ない）。
+//! - 開いている間は `WM_CHAR` を貯め（ゲームへは渡さない）、入力の地点が 1 tick に 1 回 `drain` で取る。ウィンドウから IME も切り離す（開いたままだと、打った文字が変換の途中の文字になって `WM_CHAR` に来ない）。
 //!
-//! ウィンドウの手続きも入力の地点もゲームのスレッドで走るので、リングバッファの書き手も読み手も同じスレッド。それでも `head` / `tail` は Release / Acquire で進める。
-//! 確保しない・待たない・パニックしない（ウィンドウの手続きは `catch_unwind` で包む）。
-//!
-//! 花映塚のメインループは `PeekMessageA`（`0x0042E672`）で取ったメッセージを必ず `TranslateMessage`（`0x0042E680`）→
-//! `DispatchMessageA`（`0x0042E68A`）へ流すので `WM_CHAR` は生成され、打った文字は同じ frame の入力の地点より前に届く。
-//! ウィンドウの手続き `0x0042D3D0` は `WM_CLOSE`・`WM_ACTIVATEAPP`・`WM_ERASEBKGND`・`WM_SETCURSOR`・`0x3C9` を扱い、ほかは
-//! `DefWindowProcA` へ流す（`WM_CHAR` は何もされない）。ウィンドウは ANSI のウィンドウなので、`SetWindowLongPtrW` で Unicode の手続きに替えると
-//! `WM_CHAR` は UTF-16 の 1 単位で来る（元の手続きへは `CallWindowProcW` が ANSI に直して渡す）。
+//! ウィンドウの手続きも入力の地点もゲームのスレッドで走るので、リングバッファの書き手も読み手も同じスレッド。それでも `head` / `tail` は Release / Acquire で進める。確保しない・待たない・パニックしない（ウィンドウの手続きは `catch_unwind` で包む）。
+//! 花映塚のメインループは `PeekMessageA`（`0x0042E672`）で取ったメッセージを必ず `TranslateMessage`（`0x0042E680`）→ `DispatchMessageA`（`0x0042E68A`）へ流すので `WM_CHAR` は作られ、打った文字は同じ frame の入力の地点より前に届く。
+//! ウィンドウの手続き `0x0042D3D0` は `WM_CLOSE`・`WM_ACTIVATEAPP`・`WM_ERASEBKGND`・`WM_SETCURSOR`・`0x3C9` を扱い、ほかは `DefWindowProcA` へ流す（`WM_CHAR` は何もされない）。ウィンドウは ANSI のウィンドウなので、`SetWindowLongPtrW` で Unicode の手続きに替えると `WM_CHAR` は UTF-16 の 1 単位で来る（元の手続きへは `CallWindowProcW` が ANSI に直して渡す）。
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::panic::catch_unwind;
@@ -115,8 +109,8 @@ fn consume(ring: &TextRing, msg: u32, wparam: usize) -> bool {
 /// 差し替える前のウィンドウの手続き（`SetWindowLongPtrW` が返したもの。0 = 差し替えていない）。
 static PREV_PROC: AtomicUsize = AtomicUsize::new(0);
 static HOOKED: AtomicUsize = AtomicUsize::new(0);
-/// 差し替えの結果: 0 = まだ試していない（ウィンドウが見つからなかったときも 0。次に開くときに探し直す）、1 = 置いた、
-/// 2 = 置けなかった（ウィンドウは見つかったが断られた。同じウィンドウへ何度やっても同じなので二度は試さない）。
+/// 差し替えの結果: 0 = まだ試していない（ウィンドウが見つからなかったときも 0。次に開くときに探し直す）、1 = 差し替えた、
+/// 2 = 差し替えられなかった（ウィンドウは見つかったが断られた。同じウィンドウへ何度やっても同じなので二度は試さない）。
 static INSTALL: AtomicU32 = AtomicU32::new(INSTALL_NOT_TRIED);
 /// 直近の探索でゲームのウィンドウが見つからなかった（`install_text` が本ログの 1 行に書き分ける）。
 static NO_WINDOW: AtomicBool = AtomicBool::new(false);
@@ -148,7 +142,7 @@ unsafe extern "system" fn subclass_proc(
         // SAFETY: 引数は Windows が渡した、この手続きの引数そのもの。
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    // SAFETY: `prev` は `install_on` が置いた元のウィンドウの手続き（0 でない）。`CallWindowProcW` は ANSI の元の手続きへ必要な変換をして渡す。
+    // SAFETY: `prev` は `install_on` が保存した元のウィンドウの手続き（0 でない）。`CallWindowProcW` は ANSI の元の手続きへ必要な変換をして渡す。
     unsafe {
         CallWindowProcW(
             core::mem::transmute::<usize, WNDPROC>(prev),
@@ -174,7 +168,7 @@ fn install_on(hwnd: HWND) -> bool {
     true
 }
 
-/// 差し替えを済ませる（初めて受信ソケットを開けるときに 1 回）。置けたら true。ウィンドウが見つからないときは何も覚えず（起動の直後など、次に探し直す）、
+/// 差し替えを済ませる（初めて受信ソケットを開けるときに 1 回）。差し替えられたら true。ウィンドウが見つからないときは何も覚えず（起動の直後など、次に探し直す）、
 /// 見つかったのに断られたときだけ覚えて二度は試さない。`find` はウィンドウの探し方。
 fn ensure_installed_with(find: impl FnOnce() -> Option<HWND>) -> bool {
     match INSTALL.load(Ordering::Acquire) {
@@ -238,7 +232,7 @@ fn ime_restore() {
 // ---- ゲームのスレッドから使う関数 ----
 
 /// 入力の受信ソケットを開ける・閉じる（ルーム名の入力に入った・出た tick に 1 回）。開けるときウィンドウの手続きをまだ差し替えていなければ差し替える
-/// （人の操作で 1 回だけの重い所）。置けなければ受信ソケットは開けず false。
+/// （人の操作で 1 回だけの重い所）。差し替えられなければ受信ソケットは開けず false。
 pub fn set_gate(open: bool) -> bool {
     if open {
         if !ensure_installed() {
@@ -319,7 +313,7 @@ mod tests {
         assert_eq!(r.drain(&mut out), 0, "閉じても文字が残った");
         r.set_open(true);
         assert_eq!(r.drain(&mut out), 0);
-        // tail を 2^32 の手前に置いて 1 周させても、番号の桁あふれで壊れない。
+        // tail を 2^32 の手前に設定して 1 周させても、番号の桁あふれで壊れない。
         r.head.store(u32::MAX - 3, Ordering::Release);
         r.tail.store(u32::MAX - 3, Ordering::Release);
         for u in 1..=10u16 {

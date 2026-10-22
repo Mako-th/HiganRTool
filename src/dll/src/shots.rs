@@ -1,6 +1,6 @@
-//! 撮影の、置き場の先頭の並び・コピーしてよいかの判断・読み取りのスレッドでの PNG と `_shots.csv` と集計（pure）。
-//! ゲームのスレッド（`shot_win::shot_on_draw`。描画の入口 `0x0042DD51` の中）がバックバッファを置き場（640×480×4 バイトを 4 枚）へコピー、
-//! 置き場の先頭に各 HRESULT・desc の 8 語・present parameters の 3 語などを書く。形式の変換・PNG への符号化・書き込みは読み取りのスレッド（ここ）。
+//! 撮影の、共有バッファの先頭の並び・コピーしてよいかの判断・読み取りのスレッドでの PNG と `_shots.csv` と集計（pure）。
+//! ゲームのスレッド（`shot_win::shot_on_draw`。描画の入口 `0x0042DD51` の中）がバックバッファを共有バッファ（640×480×4 バイトを 4 枚）へコピー、
+//! 共有バッファの先頭に各 HRESULT・desc の 8 語・present parameters の 3 語などを書く。形式の変換・PNG への符号化・書き込みは読み取りのスレッド（ここ）。
 //! 画素の変換と PNG は `higanr_core::shot`（`to_rgb`・`encode_png`）。
 #![forbid(unsafe_code)]
 
@@ -16,18 +16,18 @@ pub const SHOT_SLOTS: usize = 4;
 pub const SHOT_CAP: usize = 640 * 480 * 4;
 pub const SHOT_FILE_LIMIT: u32 = 400;
 
-// ---- 置き場の先頭（u32 の語。ゲームのスレッドが書き、読み取りのスレッドが読む）----
+// ---- 共有バッファの先頭（u32 の語。ゲームのスレッドが書き、読み取りのスレッドが読む）----
 pub const HEAD_WORDS: usize = 32;
 /// 撮った順の番号（1 始まり。ゲームのスレッドが振る）。
 pub const H_SERIAL: usize = 0;
 /// 撮影の理由のビット（`higanr_core::script` の `START`〜`WAIT`）。
 pub const H_REASON: usize = 1;
 pub const H_STEP: usize = 2;
-/// 要求を置いた tick の番号 k。
+/// 要求を出した tick の番号 k。
 pub const H_K: usize = 3;
 /// 描画のときの `stub::SEQ`（tick k の後の描画なら k + 1。`render_only::draw_tag_after_tick`）。
 pub const H_DRAW_SEQ: usize = 4;
-/// 描画の前に要求がまとめられた回数（同じ描画の前に 2 つの tick が要求を置いたら 1）。
+/// 描画の前に要求がまとめられた回数（同じ描画の前に 2 つの tick が要求を出したら 1）。
 pub const H_MERGED: usize = 5;
 /// 失敗の理由（`Fail::code`。0 はコピーできた）。
 pub const H_FAIL: usize = 6;
@@ -45,7 +45,7 @@ pub const H_DESC: usize = 13;
 pub const H_PP: usize = 21;
 /// LockRect が返した pitch。
 pub const H_PITCH: usize = 24;
-/// コピーした幅・高さ・形式・バイト数（コピーできたときだけ。置き場の画素は幅 × 1 画素のバイト数で詰めてある）。
+/// コピーした幅・高さ・形式・バイト数（コピーできたときだけ。共有バッファの画素は幅 × 1 画素のバイト数で詰めてある）。
 pub const H_WIDTH: usize = 25;
 pub const H_HEIGHT: usize = 26;
 pub const H_FORMAT: usize = 27;
@@ -64,7 +64,7 @@ pub const C_LOCKRECT: u32 = 4;
 pub const C_UNLOCKRECT: u32 = 8;
 pub const C_RELEASE: u32 = 16;
 
-/// 撮れなかった理由（`H_FAIL`）。どれでも置き場は「できた」にして出す（先頭だけが意味を持つ）。
+/// 撮れなかった理由（`H_FAIL`）。どれでもゲームのスレッドが共有バッファを「できた」にして出す（先頭だけが意味を持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fail {
     Ok,
@@ -80,9 +80,9 @@ pub enum Fail {
     ZeroSize,
     /// 読めない画素の形式。
     UnknownFormat,
-    /// 置き場に収まらない。
+    /// 共有バッファに収まらない。
     TooBig,
-    /// 置き場が用意されていない（設置の前に確保していない）。
+    /// 共有バッファが用意されていない（設置の前に確保していない）。
     NoBuffer,
     LockRect,
     /// LockRect は通ったが、pBits が NULL か pitch が 1 行ぶんに満たない。
@@ -148,13 +148,13 @@ pub struct CopyPlan {
     pub width: u32,
     pub height: u32,
     pub format: u32,
-    /// 1 行のバイト数（幅 × 1 画素のバイト数。置き場ではこの幅で詰める）。
+    /// 1 行のバイト数（幅 × 1 画素のバイト数。共有バッファではこの幅で詰める）。
     pub row: u32,
     pub total: u32,
 }
 
 /// GetDesc の 8 語と present parameters の 3 語から、コピーしてよいかを決める（幅・高さが present parameters と同じで、形式が分かり、
-/// 置き場に収まるときだけ）。
+/// 共有バッファに収まるときだけ）。
 pub fn plan_copy(desc: &[u32; 8], pp: &[u32; 3], cap: usize) -> Result<CopyPlan, Fail> {
     let (format, width, height) = (desc[0], desc[6], desc[7]);
     if (width, height) != (pp[0], pp[1]) {
@@ -178,7 +178,7 @@ pub fn plan_copy(desc: &[u32; 8], pp: &[u32; 3], cap: usize) -> Result<CopyPlan,
     })
 }
 
-/// 撮影の理由の名前（ファイル名と `_shots.csv`）。ビットの小さい順に `+` でつなぐ（`pre+post`）。
+/// 撮影の理由の名前（ファイル名と `_shots.csv`）。ビットの小さい順に `+` で連結する（`pre+post`）。
 pub fn reason_name(bits: u32) -> String {
     let names = [
         (START as u32, "start"),
@@ -230,7 +230,7 @@ impl ShotHead {
         released == (gbb_ok && !null_surface)
     }
 
-    /// 置き場の画素（`pixels`。幅 × 1 画素のバイト数で詰めたもの）を PNG へ。コピーできていない先頭なら `Err`。
+    /// 共有バッファの画素（`pixels`。幅 × 1 画素のバイト数で詰めたもの）を PNG へ。コピーできていない先頭なら `Err`。
     pub fn to_png(self, pixels: &[u8]) -> Result<Vec<u8>, String> {
         if self.fail() != Some(Fail::Ok) {
             return Err("コピーできていない".to_string());
@@ -267,7 +267,7 @@ fn us_text(tsc: u32, freq: Option<f64>) -> String {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShotStats {
-    /// 取り出した置き場（撮れた・撮れなかったの両方）の数。`_shots.csv` の通し番号。
+    /// 取り出した共有バッファ（撮れた・撮れなかったの両方）の数。`_shots.csv` の通し番号。
     pub taken: u32,
     pub ok: u32,
     pub written: u32,
@@ -285,7 +285,7 @@ pub struct ShotStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Taken {
-    /// 撮れたので PNG に書く（本ログの名前の先頭に付ける尻）。
+    /// 撮れたので PNG に書く（本ログの名前の先頭に付ける接尾辞）。
     Write(String),
     /// 撮れたが上限（400 枚）を超えたので書かない。
     OverLimit,
@@ -404,7 +404,7 @@ impl ShotStats {
             ),
             (None, false) => writeln!(
                 out,
-                "撮影: コピーにかかった時間は TSC の周波数が求まらないので出さない（撮れた {} 枚）",
+                "撮影: コピーにかかった時間は TSC の周波数が求まらないので出しません（撮れた {} 枚）",
                 self.total_tsc.len()
             ),
             (Some(f), false) => {

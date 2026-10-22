@@ -1,12 +1,11 @@
 //! 観戦者の接続コードの見張り（ini の `code_side = spectate`）。
 //!
-//! 置き場の `peer_code.txt` を `POLL`（250 ms）ごとに見て、中身が前に見たものと違えば観戦用のコード（ホストが `spectate_code.txt` に
-//! 書いたもの。種別 3）として読み、読めたら `WatchSlot` に観戦者の設定（session・秘密・ホストの候補）を置く。返しのコードは書かない
+//! コードのフォルダの `peer_code.txt` を `POLL`（250 ms）ごとに見て、中身が前に見たものと違えば観戦用のコード（ホストが `spectate_code.txt` に
+//! 書いたもの。種別 3）として読み、読めたら `WatchSlot` に観戦者の設定（session・秘密・ホストの候補）を書く。返しのコードは書かない
 //! （観戦者はホストへ JOIN を送るだけ）。`status.txt` にウィンドウの文を書く（ローダーのウィンドウが「状態」に出す）。
-//! - 対戦用のコード（種別 1・2）を貼られたら、種別で断って `status.txt` に言う（`CodeError::WrongSide`）。
-//! - ホストの候補はネットワークのガード（`guard::check_peer`。ini の `scope`）を通ったものだけを渡す。
-//! - ゲームのスレッドはファイルに触らない（`WatchSlot` の原子変数と待たない錠だけ）。繋がった・観戦が終わったら見張りも終わる。
-//!   期間（`HANDSHAKE_RETRY_MS` = 30 分）の間に使えるコードが貼られなければ諦める。
+//! - 対戦用のコード（種別 1・2）は種別で断って `status.txt` に言う（`CodeError::WrongSide`）。ホストの候補はネットワークのガード（`guard::check_peer`。ini の `scope`）を通ったものだけを `WatchSlot` へ渡す。
+//! - ゲームのスレッドはファイルに触らない（`WatchSlot` の原子変数と待たない錠だけ）。接続した・観戦が終わったら見張りも終わる。
+//!   期間（`HANDSHAKE_RETRY_MS` = 30 分）の間に観戦者が使えるコードを貼らなければ、見張りは諦める。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -16,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use higanr_core::candidate::Candidates;
 use higanr_core::code::{self, CodeError};
 use higanr_core::handshake::Name;
 use higanr_core::spectate::WatcherConfig;
@@ -63,7 +63,7 @@ impl Shared {
     }
 }
 
-/// 見張りの持ち手。落とすと止めて待つ。
+/// 見張りの持ち手。落とすと見張りを止め、そのスレッドが終わるのを待つ。
 pub struct WatchCode {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
@@ -135,6 +135,8 @@ pub struct Reader {
     scope: higanr_core::guard::Scope,
     name: Name,
     nonce: u64,
+    /// IPv6 のソケットを開いているか(既定は開いていない。開く `script_win::open_watch_net` だけが `with_v6` で立てる)。開いていなければ、IPv4 の候補が残るかぎり IPv6 の候補へは JOIN を送らない（送っても誤りになるだけ）。
+    v6: bool,
     seen: Option<Vec<u8>>,
 }
 
@@ -144,8 +146,26 @@ impl Reader {
             scope: s.scope,
             name: Name::new(&s.name),
             nonce,
+            v6: false,
             seen: None,
         }
+    }
+
+    pub fn with_v6(mut self, v6: bool) -> Reader {
+        self.v6 = v6;
+        self
+    }
+
+    /// ホストの候補から、自分が送れない族を除く。除くと空になるなら、そのまま（届かないことを時間切れで知る）。
+    fn sendable(&self, cands: &Candidates) -> Candidates {
+        if self.v6 {
+            return *cands;
+        }
+        let mut out = Candidates::EMPTY;
+        for c in cands.as_slice().iter().filter(|c| c.addr.is_ipv4()) {
+            let _ = out.push(*c);
+        }
+        if out.is_empty() { *cands } else { out }
     }
 
     pub fn on_peer_file(&mut self, bytes: Option<&[u8]>, now: u64) -> Step {
@@ -181,19 +201,19 @@ impl Reader {
                 return Step::Refused(format!("{PEER_CODE_FILE} を読めない: {log}"), show, why);
             }
         };
-        let host = match gate(&c.candidates, self.scope) {
+        let host = match gate(&self.sendable(&c.candidates), self.scope) {
             Ok(h) => h,
             Err(say) => return Step::Refused(say.log, say.show, Some(Refusal::NoRoute)),
         };
         let Some(secret) = c.secret else {
-            // 観戦用のコードは必ず秘密を持つ（`code::read_spectate` が確かめる）。来たら作りの誤り。
+            // 観戦用のコードは必ず秘密を持つ（`code::read_spectate` が検証する）。来たら作りの誤り。
             return Step::Refused(
                 "観戦用のコードに秘密が無い".to_string(),
                 st::INTERNAL.get(ui_lang::current()).to_string(),
                 Some(Refusal::Internal),
             );
         };
-        // 観戦者の使い捨ての鍵: JOIN ごとに OS の乱数で引く。引けなければ繋がない。
+        // 観戦者の使い捨ての鍵: JOIN ごとに OS の乱数で引く。引けなければ接続しない。
         let key_seed = match crate::net_udp::draw_key_seed() {
             Ok(k) => k,
             Err(e) => {
@@ -276,7 +296,7 @@ fn refusal(e: CodeError) -> (String, String, Option<Refusal>) {
     }
 }
 
-/// 開く（`script_win::open_net` から。ネットワークを動かす前）: 置き場を作り、見張りのスレッドを起こす。戻りの文は本ログの「ネットワーク: 開いた」の行に足す。
+/// 開く（`script_win::open_net` から。ネットワークを動かす前）: コードのフォルダを作り、見張りのスレッドを作る。戻りの文は本ログの「ネットワーク: 開いた」の行に足す。
 pub fn start(
     s: &NetSettings,
     dir: PathBuf,
@@ -285,7 +305,7 @@ pub fn start(
     timing: Timing,
 ) -> Result<(WatchCode, String), String> {
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("接続コードの置き場 {} を作れない: {e}", dir.display()))?;
+        .map_err(|e| format!("接続コードの場所 {} の作成不能: {e}", dir.display()))?;
     let shared = Arc::new(Shared {
         notes: Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
@@ -317,7 +337,7 @@ pub fn start(
             // パニックは受けて外へ出さない（スレッドの入口）。受けたら見張りをやめる。
             let _ = catch_unwind(AssertUnwindSafe(|| w.run()));
         })
-        .map_err(|e| format!("観戦用のコードの見張りのスレッドを起こせない: {e}"))?;
+        .map_err(|e| format!("観戦用のコードの見張りのスレッドの作成不能: {e}"))?;
     Ok((
         WatchCode {
             shared,
@@ -380,7 +400,31 @@ impl Runner {
     }
 
     fn run(&mut self) {
+        let mut connected = false;
         loop {
+            if connected {
+                // 接続した後は終わりだけを見る。溜めた記録の上限で終えたときだけ、理由を「状態」に出す。
+                if self.shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if self.slot.is_done() {
+                    if self.slot.buffer_full() {
+                        self.say(
+                            &Line {
+                                log: "観戦を終了しました（手元に溜めた試合の記録が上限に到達。約 1 時間分）"
+                                    .to_string(),
+                                show: higanr_core::net_menu::T_SPECTATE_BUFFER_FULL
+                                    .get(ui_lang::current())
+                                    .to_string(),
+                            },
+                            Kind::Info,
+                        );
+                    }
+                    return;
+                }
+                std::thread::sleep(self.timing.poll);
+                continue;
+            }
             if self.shared.stop.load(Ordering::Relaxed) {
                 self.say(
                     &Line {
@@ -394,17 +438,18 @@ impl Runner {
             if self.slot.is_joined() {
                 self.say(
                     &Line {
-                        log: "繋がった（ホストの最初の STREAM を受けた）".to_string(),
+                        log: "接続しました（ホストの最初の STREAM を受信）".to_string(),
                         show: st::WATCH_CONNECTED.get(ui_lang::current()).to_string(),
                     },
                     Kind::Connected,
                 );
-                return;
+                connected = true;
+                continue;
             }
             if self.slot.is_done() {
                 self.say(
                     &Line {
-                        log: "観戦が終わった（繋がらずに終えた）".to_string(),
+                        log: "観戦が終わりました（接続できずに終了）".to_string(),
                         show: st::WATCH_ENDED_UNCONNECTED
                             .get(ui_lang::current())
                             .to_string(),

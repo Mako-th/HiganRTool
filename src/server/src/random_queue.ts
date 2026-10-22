@@ -4,7 +4,7 @@
 // 2 人目が来た時点で組にするので、待っている人は同じビルドにつき高々 1 人。組になった 2 人は、返されたルーム名で
 // 今までのルーム（room.ts。/v0/rooms/<名>）へ入り直し、そこで接続コードを渡し合う。
 //
-// 状態は room.ts と同じく WebSocket の attachment にだけ置く。ログ（console）には何も書かない（ルーム名・IP・cid を出さない）。
+// 状態は room.ts と同じく WebSocket の attachment にだけ保存する。ログ（console）には何も書かない（ルーム名・IP・cid を出さない）。
 
 import { DurableObject } from "cloudflare:workers";
 import {

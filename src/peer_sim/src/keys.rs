@@ -1,10 +1,7 @@
-//! 使い捨ての鍵の種を peer_sim の道具としてどう用意するか。鍵の式・封じ方は `higanr_core::seal` にあり、ここは種の出どころだけ。
-//!
-//! - 対戦のセッション・観戦者の種は走るたびに新しい値（`fresh_seed`）。dll は OS の乱数で引くが、peer_sim は std だけで書く（unsafe も Win32 も使わない）ので、
-//!   std の `RandomState` から 32 B を作る。検査の相手役なので、本物より弱くてよい。
-//! - 観戦の配る側の種も既定は `fresh_seed`。観戦用のコードの公開鍵はその種の公開鍵で、同じ秘密・session で起こし直しても鍵が変わり、nonce が重ならない。
-//! - 固定の種（`spectate_host_seed`）は、観戦用のコードを使わない経路（`--watch --peer`・loopback の検査）のためだけ。`--spectate-fixed-key` を付けたとき
-//!   と、検査が `SpectateHostOpts::key_seed` に渡すときに使う。**起こし直しに使わない**（同じ鍵で通し番号が 0 から数え直され、同じ観戦者との間で nonce が重なる）。
+//! 使い捨ての鍵の種を peer_sim のツールとしてどう用意するか。鍵の式・封じ方は `higanr_core::seal` にあり、ここは種の出どころだけ。
+//! 対戦のセッション・観戦者の種は走るたびに新しい値（`fresh_seed`）。peer_sim は std だけで書く（unsafe も Win32 も使わない）ので、std の `RandomState` から 32 B を作る。検査の相手役なので、本物（dll は OS の乱数）より弱くてよい。
+//! 観戦者へ配る側の種も既定は `fresh_seed`。同じ秘密・session で起動し直しても鍵が変わり、nonce が重ならない。
+//! 固定の種（`spectate_host_seed`）は、観戦用のコードを使わない経路（`--watch --peer`・loopback の検査）のためだけ。**起動し直しに使わない**（同じ鍵で通し番号が 0 から数え直され、同じ観戦者との間で nonce が重なる）。
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -29,7 +26,7 @@ pub fn fresh_seed() -> KeySeed {
     KeySeed(out)
 }
 
-/// 観戦の配る側の固定の種（観戦用の秘密と session から。**起こし直しに使わない**）。鍵で 2 つの札に付けたタグ（16 B ずつ）を並べる。
+/// 観戦の配る側の固定の種（観戦用の秘密と session から。**起動し直しに使わない**）。鍵で 2 つの札に付けたタグ（16 B ずつ）を並べる。
 pub fn spectate_host_seed(secret: &Secret, session_id: u32) -> KeySeed {
     let k = AuthKey::derive(secret, session_id);
     let mut out = [0u8; 32];

@@ -1,8 +1,8 @@
 //! 観戦者のルームの見張り（`spectate_join.rs`）の検査。ルーム名・名前・アドレス・秘密は合成の値だけ。
 //!
-//! 毎回の回: `Runner::step` を仮の時刻で直に回して、状態の書き方・取りやめ・つながらない・失敗の理由ごとの出来事を見る（ルームサーバーへ
-//! 繋がない）。繋ぐ検査は loopback の偽サーバー（`net_room::fake`）と本物の WinHTTP で実時間に回すので `#[ignore]`（全件の回が
-//! `--ignored` で走らせる）。外へは繋がない（`127.0.0.1` と `Proxy::Direct`）。
+//! 毎回の回: `Runner::step` を仮の時刻で直に回して、状態の書き方・取りやめ・接続できない・失敗の理由ごとの出来事を見る（ルームサーバーへ
+//! 接続しない）。接続する検査は loopback の偽サーバー（`net_room::fake`）と本物の WinHTTP で実時間に回すので `#[ignore]`（全件の回が
+//! `--ignored` で走らせる）。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。
 use super::*;
 
 use std::net::SocketAddr;
@@ -14,7 +14,7 @@ use higanr_core::code::{Code, CodeError, Side};
 use higanr_core::net_menu::Cmd;
 use higanr_core::overlay::ui_glyphs;
 use higanr_core::room::{Event as RoomEv, Role};
-use higanr_core::spectate_room::JOINER_GIVE_UP_MS;
+use higanr_core::spectate_room::{JOINER_GIVE_UP_MS, JOINER_RETRY_MS};
 
 use crate::net_config::NetSettings;
 use crate::net_room::fake::FakeServer;
@@ -29,7 +29,7 @@ pub(crate) fn reset_globals() {
     *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// 検査だけ: スレッドを起こさずに、「動いているルームのスレッド」を置く。数は `entered` を 1 にして返す。`TEST_LOCK` の下で、後で
+/// 検査だけ: スレッドを作らずに、「動いているルームのスレッド」を仮に登録する。数は `entered` を 1 にして返す。`TEST_LOCK` の下で、後で
 /// `reset_globals`。
 pub(crate) fn plant_active_for_test() -> Arc<JoinShared> {
     let shared = Arc::new(JoinShared::default());
@@ -160,6 +160,15 @@ fn units_text(units: &[u16]) -> String {
 }
 
 #[test]
+fn only_the_room_route_allocates_a_relay_side() {
+    let (room, _, _) = kit_parts("ws://127.0.0.1:9");
+    assert!(room.source.can_relay());
+    for read in [Ok(Some(String::new())), Ok(None), Err(String::new())] {
+        assert!(!JoinSource::Code(read).can_relay());
+    }
+}
+
+#[test]
 fn the_publisher_writes_only_changes_and_continues_the_sequence() {
     let link = Arc::new(UiLink::new());
     link.publish(&Note {
@@ -231,7 +240,46 @@ fn once_watching_a_cancel_is_dropped_and_the_end_is_told() {
     assert!(!k.slot.gave_up(), "終わりを取りやめと取り違えた");
 }
 
-/// 観戦コードの経路: 読めたら JOIN を始めさせ（ルームへは繋がない）、ホストの名前を左上の材料に載せる。答えが無ければ
+#[test]
+fn a_watch_that_ended_on_a_full_buffer_says_so_instead_of_finished() {
+    let mut k = kit("ws://127.0.0.1:9");
+    k.slot.mark_joined();
+    k.runner.step(0, 0);
+    k.slot.mark_buffer_full();
+    k.slot.mark_done();
+    k.runner.step(20, 0);
+    assert!(k.runner.is_done());
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::Idle, Event::SpectateBufferFull)
+    );
+    assert_eq!(k.shared.counts().ended, 1);
+}
+
+#[test]
+fn the_linked_count_tells_which_family_the_stream_came_over() {
+    let mut k = kit("ws://127.0.0.1:9");
+    k.slot.mark_joined();
+    k.runner.step(0, 0);
+    let c = k.shared.counts();
+    assert_eq!((c.linked, c.linked_v6), (1, 0), "IPv4 の経路");
+    assert!(
+        c.text()
+            .contains("接続した 1（うち IPv6 のアドレスで接続 0）")
+    );
+    let mut k = kit("ws://127.0.0.1:9");
+    k.slot.set_via_v6(true);
+    k.slot.mark_joined();
+    k.runner.step(0, 0);
+    let c = k.shared.counts();
+    assert_eq!((c.linked, c.linked_v6), (1, 1), "IPv6 の経路");
+    assert!(
+        c.text()
+            .contains("接続した 1（うち IPv6 のアドレスで接続 1）")
+    );
+}
+
+/// 観戦コードの経路: 読めたら JOIN を始めさせ（ルームへは接続しない）、ホストの名前を左上の材料に載せる。答えが無ければ
 /// `CODE_LINK_TIMEOUT_MS` で「ホストに接続できませんでした」で終える。
 #[test]
 fn a_watch_code_starts_the_join_without_a_room_and_gives_up_after_ten_seconds() {
@@ -264,10 +312,47 @@ fn a_watch_code_starts_the_join_without_a_room_and_gives_up_after_ten_seconds() 
     );
     assert!(k.slot.gave_up());
     assert_eq!(k.shared.counts().link_timeout, 1);
-    assert!(k.shared.line().contains("観戦コードでホストへ直に繋ぐ"));
+    assert!(k.shared.line().contains("観戦コードでホストへ直に接続する"));
 }
 
-/// 期限の切れた観戦コード: 時計のずれを見込んで繋ぎに行き、答えが無ければ期限切れの文で終える。答えが来れば観戦になる。
+/// 観戦コードの経路でも、満員で断られ続けたなら「ホストに接続できませんでした」でなく満員の文で終える（期限切れの試みでも）。
+#[test]
+fn a_watch_code_that_met_a_full_host_ends_with_the_full_sentence() {
+    let now = 5_000_000u64;
+    for expires in [now + 1_800, now - 1] {
+        let text = watch_code(expires, higanr_core::update::BUILD_NUMBER);
+        let mut k = code_kit(Ok(Some(text)));
+        k.runner.step(0, now);
+        k.slot.mark_full_before_join();
+        k.runner.step(CODE_LINK_TIMEOUT_MS, now);
+        assert!(k.runner.is_done());
+        assert_eq!(
+            state_of(&k.link),
+            (CodeState::Idle, Event::SpectateCodeFull),
+            "期限 {expires}"
+        );
+        assert_eq!(k.shared.counts().full_before_join, 1);
+    }
+}
+
+/// 接続した後に満員で断られて終えた観戦は、満員の文で終える（溜めた記録の上限・ふつうの終わりとは別）。
+#[test]
+fn a_watch_that_was_refused_full_after_joining_says_so_instead_of_finished() {
+    let mut k = kit("ws://127.0.0.1:9");
+    k.slot.mark_joined();
+    k.runner.step(0, 0);
+    k.slot.mark_refused_full();
+    k.slot.mark_done();
+    k.runner.step(20, 0);
+    assert!(k.runner.is_done());
+    assert_eq!(
+        state_of(&k.link),
+        (CodeState::Idle, Event::SpectateFullEnded)
+    );
+    assert_eq!(k.shared.counts().ended, 1);
+}
+
+/// 期限の切れた観戦コード: 時計のずれを見込んで接続しに行き、答えが無ければ期限切れの文で終える。答えが来れば観戦になる。
 #[test]
 fn an_expired_watch_code_still_tries_and_names_the_expiry_only_when_nobody_answers() {
     let now = 5_000_000u64;
@@ -361,7 +446,7 @@ fn an_unusable_watch_code_ends_with_its_own_event_and_never_joins() {
     }
 }
 
-/// 観戦コードの経路でも、つなぎに行く間は「観戦をやめる」で取りやめられる。
+/// 観戦コードの経路でも、接続しに行く間は「観戦をやめる」で取りやめられる。
 #[test]
 fn a_watch_code_link_can_be_cancelled() {
     let now = 5_000_000u64;
@@ -395,6 +480,57 @@ fn a_link_that_never_answers_ends_as_no_link_at_the_timeout() {
     assert_eq!(state_of(&k.link), (CodeState::Idle, Event::SpectateNoLink));
     assert!(k.slot.gave_up());
     assert_eq!(k.shared.counts().link_timeout, 1);
+}
+
+#[test]
+fn a_timeout_is_logged_as_unreached_unless_the_host_answered_full() {
+    for full in [false, true] {
+        let mut k = kit("ws://127.0.0.1:9");
+        let _ = k.runner.joiner.stop();
+        if full {
+            k.slot.mark_full_before_join();
+        }
+        k.runner.replied_at = Some(5_000);
+        k.runner.step(5_000 + LINK_TIMEOUT_MS, 0);
+        let c = k.shared.counts();
+        assert_eq!(
+            (c.link_timeout, c.unreached, c.full_before_join),
+            (1, u32::from(!full), u32::from(full)),
+            "満員の断り {full}"
+        );
+        assert_eq!(
+            state_of(&k.link),
+            (
+                CodeState::Idle,
+                if full {
+                    Event::SpectateFull
+                } else {
+                    Event::SpectateNoLink
+                }
+            ),
+            "ルームの経路の画面の文（満員の断り {full}）"
+        );
+        let line = k.shared.line();
+        assert_eq!(
+            line.contains("ホストに届かず観戦できなかった 1 回"),
+            !full,
+            "{line}"
+        );
+        assert_eq!(
+            line.contains("ホストの観戦者が満員で入れなかった 1 回"),
+            full,
+            "{line}"
+        );
+    }
+    // 接続した観戦は、届かなかった行を出さない。
+    let mut k = kit("ws://127.0.0.1:9");
+    k.runner.replied_at = Some(5_000);
+    k.slot.mark_joined();
+    k.runner.step(5_100, 0);
+    k.runner.step(5_000 + LINK_TIMEOUT_MS, 0);
+    let c = k.shared.counts();
+    assert_eq!((c.linked, c.unreached, c.full_before_join), (1, 0, 0));
+    assert!(!k.shared.line().contains("ホストに届かず"));
 }
 
 #[test]
@@ -453,7 +589,13 @@ fn every_failure_ends_with_its_own_event_and_gives_the_game_up() {
         assert_eq!(k.runner.joiner.on_joined(0, Role::Answer), None);
     };
     type Setup = fn(&mut Runner);
-    let cases: [(&str, Setup, Event, u8); 5] = [
+    let cases: [(&str, Setup, Event, u8); 6] = [
+        (
+            "配る側の断り（4403）",
+            |r| r.joiner.on_failed(5, Failure::Refused),
+            Event::WatchRefused,
+            0,
+        ),
         (
             "応答しない",
             |r| r.joiner.on_failed(5, Failure::Unresponsive(Why::NoAnswer)),
@@ -761,6 +903,101 @@ fn a_spectator_that_arrives_first_closes_retries_then_meets_the_caster_and_repli
         !paths.is_empty() && paths.iter().all(|p| p.starts_with(&want)),
         "{paths:?}"
     );
+}
+
+/// 観戦者の PC の時計がホストより 10 分遅れても進んでも、すぐ出した返しはホストの時計で期限内に読める（期限はホストのコードの期限）。
+#[test]
+#[ignore = "偽サーバーと本物の WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn a_viewer_whose_clock_is_ten_minutes_off_sends_a_reply_the_caster_can_read() {
+    for skew in [-600i64, 600] {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        let mut k = kit(&base);
+        let spec_room = RoomName::parse(NAME).unwrap().spectate_of();
+        let host_now = unix();
+        let mut caster = FakeCaster::enter(&base, &spec_room, &SECRET, host_now);
+        let mut now = 0u64;
+        let t0 = Instant::now();
+        while caster.replies.is_empty() {
+            k.runner.step(now, unix().checked_add_signed(skew).unwrap());
+            caster.poll();
+            now += 10;
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "{skew}: 返しが届かない: {:?}",
+                k.shared.counts()
+            );
+        }
+        let reply = code::read_spectate_reply(&caster.replies[0], &SECRET, SESSION, unix())
+            .unwrap_or_else(|e| panic!("{skew}: ホストの時計で返しを読めない: {e:?}"));
+        assert_eq!(reply.expires, host_now + 1_800, "{skew}");
+        assert!(
+            matches!(
+                code::read_spectate_reply(&caster.replies[0], &SECRET, SESSION, host_now + 1_801),
+                Err(CodeError::Expired { .. })
+            ),
+            "{skew}: ホストのコードの期限の後も読めた"
+        );
+    }
+}
+
+/// 観戦を断るホスト（`spectate_refuse`）のルームへ、先に・後から入った観戦者が、どちらも 30 分待たずに断りの文で終わる。
+#[test]
+#[ignore = "偽サーバーと本物の WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn a_spectator_of_a_refusing_host_ends_with_the_refusal_at_once() {
+    for spectator_first in [false, true] {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        let mut k = kit(&base);
+        let mut now = 0u64;
+        let t0 = Instant::now();
+        let tick = |k: &mut Kit, now: &mut u64| {
+            k.runner.step(*now, unix());
+            *now += 10;
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(t0.elapsed() < Duration::from_secs(40), "終わらない");
+        };
+        if spectator_first {
+            // 観戦者が先に入ると役 host なので閉じて 12 秒後に入り直す。
+            while k.shared.counts().wrong_role == 0 {
+                tick(&mut k, &mut now);
+            }
+        }
+        let refuser =
+            crate::spectate_refuse::spawn(room_opts(&base), &RoomName::parse(NAME).unwrap())
+                .unwrap();
+        // 断りがサーバーに届くまで待つ（観戦者が先に入り直して役 host を取らないように）。観戦者の接続が片づく前に入ると、
+        // 断る側は役 guest で `CASTER_WRONG_ROLE_MS`（5 秒）待ってから入り直すので、上限に余裕を持たせる。
+        let t1 = Instant::now();
+        while srv.texts_matching(|t| t == higanr_core::room::REFUSE_TEXT) == 0 {
+            assert!(t1.elapsed() < Duration::from_secs(15), "断りが届かない");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if spectator_first {
+            now += JOINER_RETRY_MS;
+        }
+        let started = now;
+        while !k.runner.is_done() {
+            tick(&mut k, &mut now);
+        }
+        assert_eq!(
+            state_of(&k.link),
+            (CodeState::Idle, Event::WatchRefused),
+            "先に入った {spectator_first}"
+        );
+        assert!(
+            now - started < 5_000,
+            "断りまで {} ms（先に入った {spectator_first}）",
+            now - started
+        );
+        assert!(k.slot.gave_up(), "WatchPlay を終わらせていない");
+        assert_eq!(k.slot.generation(), 0, "断られたのに設定を置いた");
+        let c = k.shared.counts();
+        assert_eq!((c.fail_refused, c.codes_received), (1, 0), "{c:?}");
+        let r = refuser.finish();
+        assert!(r.refused >= 1 && r.entered >= 1, "{r:?}");
+    }
 }
 
 #[test]

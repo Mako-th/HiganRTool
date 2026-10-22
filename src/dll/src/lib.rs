@@ -1,43 +1,19 @@
 //! HiganRTool.dll —— th09.exe に注入される DLL の入口。
 //!
-//! 注入されたら別スレッドで自分の exe の同定と、地点の表（`th09_addr.rs`）の各地点の期待バイト列の照合（読むだけ）をし、
-//! **全部が通ったときだけ** `0x0043112D` の call の rel32 の 4 バイトを自前の入口（`stub.rs`）へ向ける。入口は回数を数え、
-//! tick ごとの記録を 1 件（1024 バイト。先頭 64 バイトとコピーの表の範囲）DLL の中のリングバッファに書いて元の飛び先へ飛ぶ（素のアセンブリ。
-//! ゲームのスレッドで Rust のコードは走らない）。設置の後は最大 15 分、100 ms ごとにリングバッファを読み、1 秒ごとに `_ticks.csv` /
-//! `_changes.csv` / `_snap.bin` へ追記し、1 秒ごとの回数と 60 秒ごとの集計をログに書いてスレッドを終える（フックは残る）。
-//! 別のスレッドが約 1 ms ごとにメニューとライフを読み、変化を `_menu.csv` へ追記する。ログとほかのファイルは DLL と同じ
-//! フォルダの `logs\` に 1 回ごとに別名で書く。
+//! 注入されたら別スレッドで自分の exe の同定と、地点の表（`th09_addr.rs`）の各地点の期待バイト列の照合（読むだけ）をし、**全部が通ったときだけ** `0x0043112D` の call の rel32 の 4 バイトを自前の入口（`stub.rs`）へ向ける。
+//! 入口は回数を数え、tick ごとの記録を DLL の中のリングバッファに書いて元の飛び先へ飛ぶ（素のアセンブリ。ゲームのスレッドで Rust のコードは走らない）。設置の後は読み取りのスレッドがリングバッファを読み、`_ticks.csv` などへ追記してログに書く。
+//! ログとほかのファイルは DLL と同じフォルダの `logs\` に 1 回ごとに別名で書く。
 //!
-//! DllMain はローダーロックの下で走るので、ミューテックスを取ってスレッドを起こすだけで待たない。フックの設置も
-//! ネットワークもウィンドウの作成もしない。例外はパッドの十字キーの入口（`pad_extra_win::on_attach`）で、ここで 4 つの rel32 を書く。
-//! ローダーはゲームを `CREATE_SUSPENDED` で作り `LoadLibraryW` が戻るまで主スレッドを走らせないので、ゲームのコードを
-//! 誰も実行していない唯一の時点で、読み取りのスレッドの設置と互いのスレッドを止め合うこともない。
-//!
-//! DLL のフォルダに `script.txt` があれば、設置の条件が通った後で読み、`logs\` へ移し、台本として置く。2 つのフックを
-//! 書いた後で入力の入口の分かれ経路を開き、ゲームのスレッドで台本を 1 tick ずつ進めて feed する（`script_win.rs` →
-//! `scripted.rs`）。描画の入口は撮影の要求があればバックバッファを置き場へコピーする（`shot_win.rs`）。読み取りのスレッドは
-//! feed の記録を模型と照らし（`feeds.rs`）、コピーした絵を PNG にする（`shots.rs`・`script_watch.rs`）。
-//!
-//! ネットワークは、受信のリングが `net_ring.rs`、ソケット・受信スレッド・ガードが `net_udp.rs`、入力の地点の判断が `netplay.rs`。
-//!
-//! unsafe は次のモジュールに閉じ込める: `win.rs`（Win32 とメモリの読み取り）・`hook_win.rs`（スレッドの停止と書き込み）・
-//! `record_win.rs`（TSC・QPC・CPUID）・`menu_win.rs`（`ReadProcessMemory` と待機タイマー）・`script_win.rs`（台本の入れ物・
-//! ゲームのメモリの直の読み・feed とローカル入力の呼び出し・`MoveFileExW`）・`shot_win.rs`（D3D8 の vtable の呼び出し・
-//! 撮影の置き場）・`stub.rs` と `draw.rs`（入口のアセンブリ）・`alloc_win.rs`（確保・解放の数えの入口のアセンブリ）・
-//! `net_win.rs`（受信のイベントと待機タイマー・SSDP を送るインターフェースの指定）・`replay_save_win.rs`（保存関数を呼ぶ素のアセンブリ・ゲームのメモリの
-//! 読み書き・`CreateFileA` でのファイルの同一性の確かめ）・`notify_win.rs`（自分のプロセスのウィンドウを探す・`FlashWindowEx`・
-//! `PlaySoundW`）・`clipboard_win.rs`（クリップボード）・`room_win.rs`（WinHTTP の WebSocket・検査の SHA-1）・
-//! `text_input_win.rs`（ゲームのウィンドウの手続きの差し替えと IME の切り離し）・`digit_keys_win.rs`（`GetAsyncKeyState`）・
-//! `shot_key_win.rs`（P・Home の読みと、Present のラッパの間だけゲームの語を立てる書き込み）・`pad_extra_win.rs`（ゲームが呼ぶ入口・DirectInput と winmm の読み）・`ui_lang_win.rs`（`GetUserDefaultUILanguage`）・
-//! `crash_win.rs`（致命的な例外の VEH・DLL の固定・アドレスからモジュールを引く・生のハンドルへの書き込み）・
-//! `adapters_win.rs`（ネットワークアダプターの一覧を引く）。
-//! 検査のときだけ `test_alloc.rs` も。
-//! 他のモジュールは `#![forbid(unsafe_code)]`。
+//! DllMain はローダーロックの下で走るので、ミューテックスを取ってスレッドを作るだけで待たない。フックの設置もネットワークもウィンドウの作成もしない。例外はパッドの十字キーの入口（`pad_extra_win::on_attach`）などで、ここで rel32 を書く。
+//! ローダーはゲームを `CREATE_SUSPENDED` で作り `LoadLibraryW` が戻るまで主スレッドを走らせないので、ゲームのコードを誰も実行していない唯一の時点で書ける。
+//! unsafe は `*_win.rs`・`stub.rs`・`draw.rs` など Win32 とアセンブリの層に閉じ込め、他のモジュールは `#![forbid(unsafe_code)]`。
 
 // ネットワークアダプターの一覧（`bind = auto` が経路を引けないとき・LAN のホストが自分のアドレスを見せるとき。unsafe はこの中だけ）。
 mod adapters_win;
 mod alloc_count;
 mod alloc_win;
+// 起動直後のリフレッシュレートの計測の BeginScene の呼びの差し替え（デバイスが失われていたら計測を打ち切る。DllMain の中で書くので、unsafe はこの中だけ）。
+mod calib_guard_win;
 // ゲームの中のメニューが接続コードをコピーする・貼る部分（本物のクリップボードの unsafe は `clipboard_win.rs` の中だけ）。
 mod clipboard;
 mod clipboard_win;
@@ -55,9 +31,13 @@ mod hook;
 mod hook_win;
 // LAN 対戦の申し込みの運び手（std のソケットだけ。unsafe 無し）。
 mod lan_link;
-// つながりごとの本ログの行（接続した行・stall の内訳・RTT・観戦者の出入り。pure）。
+// 接続ごとの本ログの行（接続した行・stall の内訳・RTT・観戦者の出入り。pure）。
 mod link_log;
 mod menu;
+// ゲームのメニューから保存するリプレイ（長い試合で落ちる不具合の避け方と、HiganRTool の印）。判断は `menu_save.rs`（pure）、入口と設置と印を足すスレッドは
+// `menu_save_win.rs`（unsafe はこの中だけ）。
+mod menu_save;
+mod menu_save_win;
 mod menu_win;
 mod names;
 mod net_code;
@@ -67,7 +47,7 @@ mod net_config;
 mod net_game;
 mod net_portrait;
 mod net_ring;
-// ルームサーバーの運び。unsafe は `room_win.rs`（WinHTTP の WebSocket）の中だけ。見張り（`net_code_game`）から対戦の「ルームマッチ」で使う。
+// ルームサーバーとの送受信を受け持つ部分。unsafe は `room_win.rs`（WinHTTP の WebSocket）の中だけ。見張り（`net_code_game`）から対戦の「ルームマッチ」で使う。
 // 製品のビルドで使わない関数が残るので dead_code を許す。
 #[cfg_attr(not(test), allow(dead_code))]
 mod net_room;
@@ -78,7 +58,7 @@ mod net_ui;
 mod net_watch;
 mod net_win;
 mod netplay;
-// 繋がった知らせ（音と点滅。unsafe はこの中だけ）。
+// 接続した知らせ（音と点滅。unsafe はこの中だけ）。
 mod notify_win;
 mod observe;
 // 文字の描画（unsafe は `overlay_win.rs`: D3D8 の vtable の呼び出し・GDI・文字の表の置き場）。
@@ -90,6 +70,8 @@ mod pacing_win;
 // パッドの十字キー（POV ハット）を方向に足す入口。判断と設置の手順は `pad_extra.rs`（pure）、本物の読み・ゲームが呼ぶ入口・
 // `DllMain` からの設置は `pad_extra_win.rs`（unsafe はこの中だけ）。
 mod log_mode;
+// メインループの TestCooperativeLevel の差し替え（デバイスが失われている間は 10 ms ずつ寝る。DllMain の中で書くので、unsafe はこの中だけ）。
+mod lost_sleep_win;
 mod main_log;
 mod match_events;
 mod pad_extra;
@@ -120,9 +102,9 @@ mod rollback_win;
 // ルームサーバーの WebSocket（WinHTTP。unsafe はこの中だけ）。`net_room` から使う（製品で使わない関数が残るので dead_code を許す）。
 #[cfg_attr(not(test), allow(dead_code))]
 mod room_win;
-// 配るバージョンで ini が無いとき、配る ini と同じ中身を DLL のフォルダへ書き出す（起動のとき 1 回）。
+// 利用者へ配るバージョンで ini が無いとき、配る ini と同じ中身を DLL のフォルダへ書き出す（起動のとき 1 回）。
 mod ini_seed;
-// メニューで決めた設定を ini の該当の 1 行へ書き戻す（別のスレッド）と、以前の版の別ファイルの引き継ぎ（pure。unsafe 無し）。
+// メニューで決めた設定を ini の該当の 1 行へ書き戻す（別のスレッド）と、以前のバージョンの別ファイルの引き継ぎ（pure。unsafe 無し）。
 mod ini_save;
 mod script_watch;
 mod script_win;
@@ -137,17 +119,19 @@ mod shot_win;
 mod shots;
 mod show_text;
 mod sites;
-// 観戦のホストの側: ゲームのスレッドが書くリングバッファと、受信スレッドが送る側。
+// 観戦のホストの側: ゲームのスレッドが書くリングバッファと、受信スレッドが観戦者へ送る側。
 mod spectate_host;
 // インターネット越しの観戦（観戦者の側）: ゲーム内のメニューの観戦の「ルームマッチ」を決めた人のゲームが、観戦用のルームへ入って
-// 対戦者の観戦用のコードを受け、返しを出して JOIN を始めさせる。
+// 対戦するホストの観戦用のコードを受け、そのホストへ返しを出して JOIN を始めさせる。
 mod spectate_join;
-// インターネット越しの観戦（配る側）: マッチのホストが観戦用のルームで観戦者を待ち、返しを受けて穴あけを頼む。
+// インターネット越しの観戦（配る側）: マッチのホストが観戦用のコードを観戦用のルームへ預けて観戦者を待ち、観戦者の返しを受けて受信スレッドに穴あけを頼む。
 mod spectate_offer;
+// 観戦を断る配る側: 2 人のどちらかが観戦を許可していないルームマッチのホストが、観戦用のルームで観戦者に断りを返す。
+mod spectate_refuse;
 mod spectate_ring;
 #[cfg(test)]
 mod spectate_testkit;
-// 観戦者の側: ホストの記録を組み立てて観戦者のゲームへ入れる判断と、観戦用のコードを読む見張り。
+// 観戦者の側: 対戦のホストから受けた試合の記録を組み立てて観戦者のゲームへ入れる判断と、観戦用のコードを読む見張り。
 mod spectate_watch;
 mod spectate_watch_code;
 // 台本のマッチの状態の操作（無敵・ライフ・ゲージ。pure。書き込みの部分は `script_win.rs`）。
@@ -155,6 +139,9 @@ mod state_ops;
 mod stub;
 #[cfg(test)]
 mod test_alloc;
+// 検査用: 実行できるメモリの偽のコードへ書く `HookEnv`。
+#[cfg(test)]
+mod test_code;
 // ルーム名の入力がウィンドウから文字を受ける仕組み（ウィンドウの手続きの差し替えと IME。unsafe はこの中だけ）。
 mod text_input_win;
 mod th09_addr;
@@ -166,6 +153,8 @@ mod ui_lang_win;
 mod trial_summary;
 // 家のルーターへ UPnP でポートの割り当てを頼む（通信は LAN の中だけ。SSDP を送るインターフェースの指定だけ `net_win.rs` の unsafe）。
 mod upnp;
+// ゲームが custom.exe の「垂直同期を取らない」を読む 2 か所の答えの差し替え（ini の `[pacing] vsync`。DllMain の中で書くので、unsafe はこの中だけ）。
+mod vsync_answer_win;
 mod watch_feed;
 mod win;
 // ウィンドウモードのウィンドウを作る呼び出しの差し替え（ini の `[window]`。DllMain の中で書くので、unsafe はこの中だけ）。
@@ -195,8 +184,26 @@ pub extern "system" fn DllMain(module: HINSTANCE, reason: u32, _reserved: *mut c
             // 十字キーの入口は、ゲームの主スレッドがまだ走っていない今に書く。失敗しても読み取りのスレッドは起きているので、
             // DLL の読み込みは成功のまま返す（パッドの十字キーが効かないだけ）。
             let _ = catch_unwind(AssertUnwindSafe(|| pad_extra_win::on_attach(module)));
+            // ゲームのメニューの保存を呼ぶ 2 か所も、主スレッドが走る前に書く（書けなくても DLL の読み込みは成功のまま）。
+            let _ = catch_unwind(AssertUnwindSafe(|| menu_save_win::on_attach(module)));
             TRUE
         }
         Ok(false) | Err(_) => FALSE,
+    }
+}
+
+#[cfg(test)]
+mod dev_assets_guard {
+    use std::path::Path;
+
+    /// 資料の有無は判定の関数とは別に、解析のメモの置き場だけで見る（判定が常に偽でも通らないように）。
+    #[test]
+    fn dev_asset_checks_are_compiled_when_the_dev_files_exist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(
+            cfg!(dev_assets),
+            root.join("analysis").join("notes").is_dir(),
+            "cfg dev_assets と資料の有無が食い違う"
+        );
     }
 }

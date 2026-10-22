@@ -1,29 +1,11 @@
-//! 観戦者の早送り（遅れて入った観戦者を、小さな遅れまで追いつかせる）。判断は pure（unsafe 無し）。ゲームの走査を呼ぶ本物は
-//! `script_win.rs`（`RealFfHost`）、検査は偽のゲーム。
+//! 観戦者の早送り（遅れて入った観戦者を、小さな遅れまで追いつかせる）。判断は pure（unsafe 無し）。ゲームの走査を呼ぶ本物は `script_win.rs`（`RealFfHost`）、検査は偽のゲーム。
 //!
-//! 観戦者はマッチの途中で入ると、その seg の始まりから同じ速さで再生するので、入るまでの時間の分だけずっと遅れる（実機で記録が届いてから
-//! 使うまで 平均 16.2 秒・最大 17.9 秒）。使っていないマッチのフレームが閾値より溜まっている間、1 回の表示（do_frame）の中で
-//! ゲームの更新（走査 `0x42C700`）を余分に回して進める。溜まりが戻る閾値まで減ったら普段の速さに戻す（入る閾値と戻る閾値を分ける）。
-//! 1 表示に余分に回す数は core の `spectate_pace::Pace` が決める（届く平均の速さに合わせる。往復が長い回線で往復ごとにまとまって
-//! 届く間も、最大の速さで溜まりを使い切って止まらない）。
+//! 観戦者はマッチの途中で入ると、その seg の始まりから同じ速さで再生するので、入るまでの時間の分だけずっと遅れる。
+//! 使っていないマッチのフレームが閾値より溜まっている間、1 回の表示（do_frame）の中でゲームの更新（走査 `0x42C700`）を余分に回して進め、溜まりが戻る閾値まで減ったら普段の速さに戻す。1 表示に余分に回す数は core の `spectate_pace::Pace` が決める。
 //!
-//! ## 更新の経路
-//!
-//! do_frame の走査の call（`0x0042DCA9`）の包み（`rollback_win::rb_scan_entry`）で、走査を続けて何度も呼ぶ。rollback の進め直しが
-//! 「1 回の描画の中で更新だけを k 回回す」形（`rollback_resim::run_scan`。k = 1・8・60 で元の実行とバイト一致）で確かめてある経路を、
-//! 前へ進めるだけに使う。違いは 3 つ:
-//! - コピーも書き戻しも要らない（観戦者は巻き戻さない。記録の語は確定した語）。
-//! - 余分な回の入力の地点（`0x0043112D`）は普段の tick と同じ経路（`WatchPlay::on_input`）で次の記録を使う。`RESIM_TICK` だけを立てて、
-//!   `_ticks.csv`・ペースの時刻のフックに余分な回を積まない（積むと「入力 → Present」の計測が崩れる）。
-//! - 出力は文字の数だけ整える: 余分な回の前に、文字の数を最初の走査の前の値へ戻す（戻さないと古い数字が重なる）。SE と BGM の
-//!   待ち行列は触らない（ゲームが積んだとおりに鳴らす。BGM は、飛ばした tick の命令が本物なので消すと曲が替わらない）。
-//!
-//! 余分な回はマッチのフレーム（`Frame`）の間だけ（選択の画面の押下・止める地点・読み込みは普段のまま）。次の記録が `Frame` でないとき・
-//! 直前の回がマッチのフレームを使わなかったとき・走査が打ち切りの値（0・1・負）を返したとき・場面の要求が立ったときはそこで止める。
-//! 1 表示あたりの余分な回の数と時間に上限を置く（ゲームの画面が止まって見えないように）。
-//!
-//! 通るのは観戦者のセッションがある実行（`Slot::Watch`）だけ。対戦者の経路（`rb_scan_handler` の `Slot::Play`）と delay 方式の実行は通らず、
-//! 対戦者の遅延の増分は 0。
+//! 経路は do_frame の走査の call（`0x0042DCA9`）の包み（`rollback_win::rb_scan_entry`）。rollback の進め直しと同じ「1 回の描画の中で更新だけを k 回回す」形（`rollback_resim::run_scan`）を、前へ進めるだけに使う。
+//! 余分な回の入力の地点（`0x0043112D`）は普段の tick と同じ経路（`WatchPlay::on_input`）で次の記録を使い、`RESIM_TICK` だけを立てて `_ticks.csv`・ペースの時刻のフックに余分な回を積まない（積むと「入力 → Present」の計測が崩れる）。余分な回の前に文字の数を最初の走査の前の値へ戻し、SE と BGM の待ち行列は触らない。
+//! 余分な回はマッチのフレーム（`Frame`）の間だけで、条件が外れたらそこで止め、1 表示あたりの回数と時間に上限を設ける。通るのは観戦者のセッションがある実行（`Slot::Watch`）だけで、対戦の経路（`Slot::Play`）と delay 方式の実行は通らず、対戦相手への遅延の増分は 0。
 #![forbid(unsafe_code)]
 
 use higanr_core::wire::Record;
@@ -32,7 +14,7 @@ use super::WatchPlay;
 use crate::netplay::Phase;
 use crate::rollback_resim::abort_of;
 
-/// 入る閾値・戻る閾値・1 表示の余分の上限（観戦者の模型と同じ値を使うため core に置く）。
+/// 入る閾値・戻る閾値・1 表示の余分の上限（観戦者の模型と同じ値を使うため core にある）。
 pub use higanr_core::spectate_pace::{FF_ENTER_FRAMES, FF_EXIT_FRAMES, FF_MAX_EXTRA};
 /// 1 回の表示の中で余分な更新に使う時間の上限（µs。8 ms）。越えたらその表示では打ち切る（60 Hz の 1 フレーム 16.7 ms の半分を
 /// 越えて描画とメッセージ処理を遅らせない）。遅い PC では上の回数に届く前にここで止まり、PC が回せる速さまで自然に落ちる。
@@ -112,13 +94,20 @@ pub(super) fn decide(
 }
 
 impl WatchPlay {
-    /// 表示の始まり。前の表示の間に使えるようになった記録の数（組み立ての `ack` の進み）を `Pace` へ入れる。
+    /// 早送りの速さ（1 表示あたりの更新の数。ini の `ff_max` を `Pace` が範囲に収めたもの）。
+    pub fn ff_updates(&self) -> u32 {
+        self.pace.updates()
+    }
+
+    /// 表示の始まり。前の表示の間に使えるようになった記録の数（受信スレッドがリングへ移した数）を `Pace` へ入れる。
     pub fn ff_begin(&mut self, _now_us: u64) {
         self.ff.seen_played = self.stats.played;
         self.ff.extra = 0;
         self.ff.allow = 0;
         self.stats.ff.begun = self.stats.ff.begun.saturating_add(1);
-        self.pace.on_display(std::mem::take(&mut self.pace_arrived));
+        let written = self.feed.timed_written();
+        let arrived = written.wrapping_sub(std::mem::replace(&mut self.seen_written, written));
+        self.pace.on_display(arrived);
     }
 
     /// 走査を 1 回呼んだ後に聞く: もう 1 回、余分に更新を回してよいか。真を返したら呼び手は必ず回す（数えている）。
@@ -177,6 +166,11 @@ impl WatchPlay {
                 true
             }
         }
+    }
+
+    /// いま早送りの余分な更新の中か（`ff_more` が真を返してから表示の終わりまで）。
+    pub(super) fn ff_in_extra(&self) -> bool {
+        self.ff.extra > 0
     }
 
     /// `ff_more` が真を返したのに、余分な更新を回せなかった（SE・文字の数を整えられなかった）。
@@ -261,14 +255,20 @@ mod tests {
 
     use super::*;
     use crate::spectate_watch::{WatchConfig, WatchSlot};
+    use higanr_core::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX};
 
     fn wp() -> WatchPlay {
+        wp_with(FF_UPDATES_DEFAULT)
+    }
+
+    fn wp_with(ff_max: u32) -> WatchPlay {
         WatchPlay::new(
             Arc::new(WatchSlot::new()),
             WatchConfig {
                 wait_budget_us: 16_000,
                 margin_frames: 3,
                 require_net_selection: false,
+                ff_max,
             },
         )
     }
@@ -334,7 +334,12 @@ mod tests {
         }
 
         fn in_match(backlog: u32) -> Stub {
+            Stub::in_match_with(backlog, FF_UPDATES_DEFAULT)
+        }
+
+        fn in_match_with(backlog: u32, ff_max: u32) -> Stub {
             let mut s = Stub::new();
+            s.wp = wp_with(ff_max);
             s.wp.set_phase_for_test(Phase::Lockstep);
             s.wp.started = true;
             s.wp.look[0] = Some((
@@ -422,19 +427,27 @@ mod tests {
 
     #[test]
     fn a_large_backlog_runs_extra_scans_up_to_the_caps_and_stops_at_every_guard() {
-        // 溜まりが多い: 1 表示 = 最初の走査 ＋ 余分 FF_MAX_EXTRA 回。余分の前に必ず SE・文字の数を整える。
-        let mut s = Stub::in_match(50);
+        // 溜まりが多い: 1 表示 = 最初の走査 ＋ 余分（`ff_max` − 1）回。余分の前に必ず SE・文字の数を整える。
+        for ff_max in [FF_UPDATES_DEFAULT, FF_UPDATES_MAX] {
+            let extra = ff_max - 1;
+            let mut s = Stub::in_match_with(50, ff_max);
+            assert_eq!(run_display(&mut s), 2);
+            let mut want = vec![false];
+            want.extend(std::iter::repeat_n(true, extra as usize));
+            assert_eq!(s.scans, want, "ff_max {ff_max}");
+            assert_eq!(s.drops, extra);
+            let ff = s.wp.stats().ff;
+            assert_eq!(
+                (ff.begun, ff.displays, ff.extra_ticks, ff.episodes),
+                (1, 1, u64::from(extra), 1)
+            );
+            assert_eq!((ff.first_enter_backlog, ff.active), (Some(50), true));
+        }
+        // ff_max 1 は余分に回さない（溜まりが多くても早送りに入らない）。
+        let mut s = Stub::in_match_with(50, 1);
         assert_eq!(run_display(&mut s), 2);
-        let mut want = vec![false];
-        want.extend(std::iter::repeat_n(true, FF_MAX_EXTRA as usize));
-        assert_eq!(s.scans, want);
-        assert_eq!(s.drops, FF_MAX_EXTRA);
-        let ff = s.wp.stats().ff;
-        assert_eq!(
-            (ff.begun, ff.displays, ff.extra_ticks, ff.episodes),
-            (1, 1, u64::from(FF_MAX_EXTRA), 1)
-        );
-        assert_eq!((ff.first_enter_backlog, ff.active), (Some(50), true));
+        assert_eq!(s.scans, vec![false]);
+        assert_eq!(s.wp.stats().ff.episodes, 0);
         for (name, mutate) in [
             (
                 "直前の走査が試合のフレームを使わない",

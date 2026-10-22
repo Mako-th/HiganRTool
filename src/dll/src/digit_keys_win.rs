@@ -1,10 +1,9 @@
 //! Ctrl+上段の数字（0〜9）・Ctrl+Tab・Ctrl+C のキーの読み（`GetAsyncKeyState` の層。unsafe はこの中だけ）。押した瞬間の取り方は `digit_keys.rs`、
 //! 読んでよい間の判断は `net_game::NetGame::digit_keys`。
 //!
-//! **読むだけ**: OS への入力の注入も、前面を奪う呼び出しもしない。`GetAsyncKeyState` はキーが今押されているかの問い合わせで、
-//! ゲームの入力の関数が読む表（`GetKeyboardState`）とは別の経路。IME が開いていてもキーそのものの状態を返す（公開資料の仕様から。実機では確かめていない）。
-//! 1 tick に 1 回、12 回の問い合わせ（数字 10 個 ＋ Tab ＋ C。どれかが押されている tick だけ、Ctrl・Alt・左右の Win の 4 回が足される）。
-//! ゲームのスレッドで、確保しない。
+//! 読むだけ: OS への入力の注入も、前面を奪う呼び出しもしない。`GetAsyncKeyState` はゲームの入力の関数が読む表（`GetKeyboardState`）とは別の経路で、
+//! IME が開いていてもキーそのものの状態を返す（公開資料の仕様から。実機では検証していない）。
+//! 1 tick に 12 回の問い合わせ（数字 10 個 ＋ Tab ＋ C。どれかが押されている tick だけ、Ctrl・Alt・左右の Win の 4 回が足される）。ゲームのスレッドで、確保しない。
 
 use crate::digit_keys::{ALL_HELD, C_BIT, CTRL_BIT, MOD_BIT, TAB_BIT};
 
@@ -27,7 +26,7 @@ pub(crate) fn test_set_foreground(mine: bool) {
 }
 
 /// Windows の前面のウィンドウがこのプロセス（ゲーム）のウィンドウか。ほかのアプリが前面なら false、前面のウィンドウが無いときも false。
-/// HWND でなく持ち主のプロセス ID で比べる: `notify_win::game_window` は `EnumWindows` で全部のウィンドウを舐めるので 1 tick ごとには
+/// HWND でなく持ち主のプロセス ID で比べる: `notify_win::game_window` は `EnumWindows` で全部のウィンドウを走査するので 1 tick ごとには
 /// 重く、`text_input_win` の差し替えたウィンドウは最初の文字の入力まで無い。ゲームの主ウィンドウは 1 つなので、同じプロセスのウィンドウが前面＝
 /// ゲームのウィンドウが前面とみなす。読むだけで、前面は変えない。
 #[cfg(not(test))]

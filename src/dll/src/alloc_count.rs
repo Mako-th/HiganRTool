@@ -1,13 +1,9 @@
-//! 花映塚の確保・解放を、呼び出し元ごと・スレッドの別ごとに数える観測の表と集計（pure。入口のアセンブリと Win32 は `alloc_win.rs`）。
-//! 確保を呼び出し元ごとに数える考えは giuroll を参考にした（コードはコピーしていない）。
+//! 花映塚の確保・解放を、呼び出し元ごと・スレッドの別ごとに数える観測の表と集計（pure。入口のアセンブリと Win32 は `alloc_win.rs`）。確保を呼び出し元ごとに数える考えは giuroll を参考にした（コードはコピーしていない）。
 //!
-//! - 入口は 5 つ（`th09_addr::ALLOC_SITES`）。どれも関数の先頭に inline detour を書き（`detour::install_detour` を、トランポリンの置き場と
-//!   入口のアドレスだけ差し替えた `SiteDetourEnv` で呼ぶ）、入口のアセンブリは `[esp]`（呼び出し元の戻りアドレス）を数える。
-//! - 表は「入口 × スレッドの別（ゲームのスレッド / それ以外）」の 10 本。1 本は開アドレス法の 1024 枠（鍵 = 戻りアドレス、値 = 回数）。
-//!   入口はロックを取らず、空きの枠を `lock cmpxchg` で取り、回数を `lock inc` で足す。64 枠たどっても入れなければ溢れを数える。
-//!   鍵は一度置いたら変えないので、読み手は鍵 → 回数の順に読めばよい。
-//! - 書き出しのスレッドが 1 秒ごとに表を読み、前の秒との差を `_alloc_sec.csv`・`_alloc_calls.csv` へ書く。終わりに
-//!   `_alloc_callers.csv` と `_alloc_table.csv`（場面ごとの 1 秒あたりの中央値・最大・総数・母数の秒数）を書く。
+//! - 入口は 5 つ（`th09_addr::ALLOC_SITES`）。どれも関数の先頭に inline detour を書き（`detour::install_detour` を、トランポリンの置き場と入口のアドレスだけ差し替えた `SiteDetourEnv` で呼ぶ）、入口のアセンブリは `[esp]`（呼び出し元の戻りアドレス）を数える。
+//! - 表は「入口 × スレッドの別（ゲームのスレッド / それ以外）」の 10 本。1 本は開アドレス法の 1024 枠（鍵 = 戻りアドレス、値 = 回数）。入口はロックを取らず、空きの枠を `lock cmpxchg` で取り、回数を `lock inc` で足す。
+//!   64 枠たどっても入れなければ溢れを数える。鍵は一度書いたら変えないので、読み手は鍵 → 回数の順に読めばよい。
+//! - 書き出しのスレッドが 1 秒ごとに表を読み、前の秒との差を `_alloc_sec.csv`・`_alloc_calls.csv` へ書く。終わりに `_alloc_callers.csv` と `_alloc_table.csv`。
 //! - 「0 件」を静かに出さない: 書けなかった入口は `installed` の列が 0、場面の秒が 0 なら `seconds` が 0 の行を出す。
 #![forbid(unsafe_code)]
 
@@ -42,7 +38,7 @@ pub const SLOT_MASK: u32 = (SLOTS as u32) - 1;
 pub const SLOT_WORDS: usize = 2;
 /// 1 本の表のバイト数の `shl` の値（1024 枠 × 8 バイト = 8192 = 1 << 13）。
 pub const TABLE_SHIFT: u32 = SLOT_BITS + 3;
-/// 空きを探してたどる枠の上限。越えたら溢れに数える（入口の 1 回の手間に上限を置くため）。
+/// 空きを探してたどる枠の上限。越えたら溢れに数える（入口の 1 回の手間に上限を設けるため）。
 pub const PROBES: u32 = 64;
 /// 鍵（戻りアドレス）→ 最初に見る枠の掛け算（黄金比の 2^32 倍を奇数にした値。Knuth の乗算ハッシュ）。戻りアドレスは近いので、
 /// 下位ビットをそのまま使うと固まる。入口の `imul` は符号つきの即値なので `i32`。
@@ -53,7 +49,7 @@ pub const HASH_SHIFT: u32 = 32 - SLOT_BITS;
 const _: () = assert!(1usize << TABLE_SHIFT == SLOTS * SLOT_WORDS * 4);
 const _: () = assert!(TABLE_COUNT == 10);
 
-/// 表 10 本（80 KiB）。DLL の .bss に置かれ、入口のアセンブリが `[ALLOC_TABLES + 表の番号 << TABLE_SHIFT + 枠 * 8]` で触る。
+/// 表 10 本（80 KiB）。DLL の .bss にあり、入口のアセンブリが `[ALLOC_TABLES + 表の番号 << TABLE_SHIFT + 枠 * 8]` で触る。
 #[repr(C, align(64))]
 pub struct AllocTables {
     pub words: [AtomicU32; TABLE_COUNT * SLOTS * SLOT_WORDS],
@@ -66,9 +62,9 @@ pub static ALLOC_TABLES: AllocTables = AllocTables {
 pub static ALLOC_TOTALS: [AtomicU32; TABLE_COUNT] = [const { AtomicU32::new(0) }; TABLE_COUNT];
 /// 表ごとの溢れ（`PROBES` 枠たどっても入れなかった回数）。
 pub static ALLOC_OVERFLOW: [AtomicU32; TABLE_COUNT] = [const { AtomicU32::new(0) }; TABLE_COUNT];
-/// ゲームのスレッドの ID。入口は `fs:[0x24]` とこれを比べる。**inline detour を書く前に置く**（0 のままなら全部が「それ以外」に入る）。
+/// ゲームのスレッドの ID。入口は `fs:[0x24]` とこれを比べる。***inline detour を書く前に設定する**（0 のままなら全部が「それ以外」に入る）。
 pub static ALLOC_MAIN_TID: AtomicU32 = AtomicU32::new(0);
-/// 入口ごとのトランポリンのアドレス（`SiteDetourEnv::set_trampoline` が JMP を書く前に置く）。
+/// 入口ごとのトランポリンのアドレス（`SiteDetourEnv::set_trampoline` が JMP を書く前に設定する）。
 pub static ALLOC_TRAMPS: [AtomicU32; SITE_COUNT] = [const { AtomicU32::new(0) }; SITE_COUNT];
 
 pub const CLASS_NAMES: [&str; CLASS_COUNT] = ["main", "other"];
@@ -158,7 +154,7 @@ pub fn settings_from_text(text: &str) -> Result<Option<AllocSettings>, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -166,16 +162,18 @@ pub fn settings_from_text(text: &str) -> Result<Option<AllocSettings>, String> {
     match ini.get(SECTION, "enable") {
         Some("1") => {}
         Some("0") | None => return Ok(None),
-        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1")),
+        Some(v) => return Err(format!("enable の値 {v:?} は 0 か 1 にしてください")),
     }
     let seconds = match ini.get(SECTION, "seconds") {
         None => DEFAULT_SECONDS,
         Some(v) => v
             .parse::<u32>()
-            .map_err(|_| format!("seconds の値 {v:?} が数として読めない"))?,
+            .map_err(|_| format!("seconds の値 {v:?} が数値として読み取り不能"))?,
     };
     if seconds == 0 || seconds > MAX_SECONDS {
-        return Err(format!("seconds の値 {seconds} は 1〜{MAX_SECONDS}"));
+        return Err(format!(
+            "seconds の値 {seconds} は 1〜{MAX_SECONDS} にしてください"
+        ));
     }
     Ok(Some(AllocSettings { seconds }))
 }
@@ -699,24 +697,24 @@ pub trait AllocHost {
     fn game_thread_id(&mut self) -> Option<u32>;
     /// 書き出しのファイルを開く（回ごとに別名。既存を上書きしない）。開けなければ数えない。
     fn open_outputs(&mut self) -> Result<String, String>;
-    /// 表を 0 に戻し、ゲームのスレッドの ID を置く（detour を書く前）。
+    /// 表を 0 に戻し、ゲームのスレッドの ID を設定する（detour を書く前）。
     fn prepare_counters(&mut self, main_tid: u32);
     /// 入口 `site` のアセンブリのアドレス。
     fn entry_address(&self, site: usize) -> u32;
-    /// 入口 `site` のトランポリンのアドレスを置く（JMP を書く前）。
+    /// 入口 `site` のトランポリンのアドレスを設定する（JMP を書く前）。
     fn set_trampoline(&mut self, site: usize, addr: u32);
-    /// 書き出しのスレッドを起こす（detour を書いた後）。
+    /// 書き出しのスレッドを開始する（detour を書いた後）。
     fn start_writer(
         &mut self,
         s: &AllocSettings,
         installed: [bool; SITE_COUNT],
     ) -> Result<(), String>;
-    /// 書き出しのスレッドを止めて待ち、終わりの集計の文を返す（起こしていなければ `None`）。
+    /// 書き出しのスレッドを止めて待ち、終わりの集計の文を返す（開始していなければ `None`）。
     fn finish(&mut self) -> Option<Vec<String>>;
 }
 
-/// `detour::install_detour` に渡す、入口 1 つぶんの `DetourEnv`。スレッドの停止・読み書き・トランポリンの頁は包んだ本物へ渡し、
-/// トランポリンの置き場と入口のアドレスだけを差し替える。入力の入口の静的変数を置く口は何もしない（入力のフックを書き換えないように）。
+/// `detour::install_detour` に渡す、入口 1 つぶんの `DetourEnv`。スレッドの停止・読み書き・トランポリンのページは包んだ本物へ渡し、
+/// トランポリンの置き場と入口のアドレスだけを差し替える。入力の入口の静的変数を設定する口は何もしない（入力のフックを書き換えないように）。
 pub struct SiteDetourEnv<'a> {
     pub inner: &'a mut dyn DetourEnv,
     pub host: &'a mut dyn AllocHost,
@@ -798,13 +796,16 @@ pub fn install_all(
     if sites.len() != SITE_COUNT {
         let _ = writeln!(
             out,
-            "確保の数え: 表の行が {} 行で、入口の数 {SITE_COUNT} と違うので書かない",
+            "確保の数え: 表の行が {} 行で、入口の数 {SITE_COUNT} と違うので書きません。",
             sites.len()
         );
         return written;
     }
     if let Err(e) = check_table(sites, forbidden) {
-        let _ = writeln!(out, "確保の数え: 表の検査に落ちた（{e:?}）ので書かない");
+        let _ = writeln!(
+            out,
+            "確保の数え: 表の検査に失敗した（{e:?}）ので書きません。"
+        );
         return written;
     }
     let mut all_match = true;
@@ -832,7 +833,7 @@ pub fn install_all(
     if !all_match {
         let _ = writeln!(
             out,
-            "確保の数え: 5 地点のうち一致しない地点があるので、どこにも書かない"
+            "確保の数え: 5 フック地点のうち一致しないフック地点があるのでどこにも書きません。"
         );
         return written;
     }
@@ -852,7 +853,7 @@ pub fn install_all(
 /// 数える処理の入口（`session::ScriptHost::alloc_count`）の 2 つの呼び時。
 pub enum AllocStep<'a> {
     /// 入力のフックを書いた後・台本の分岐を開く前。ini を読み、有効なら 5 つの入口に detour を書いて、
-    /// 書き出しのスレッドを起こす。
+    /// 書き出しのスレッドを作る。
     Arm {
         hook_env: &'a mut dyn DetourEnv,
         forbidden: &'a [AddrRange],
@@ -871,25 +872,31 @@ pub fn arm(
 ) -> bool {
     let settings = match host.read_ini() {
         Ok(None) => {
-            let _ = writeln!(detail_out(out), "確保の数え: ini が無い（数えない）");
+            let _ = writeln!(
+                detail_out(out),
+                "確保の数え: ini がありません（数えません）"
+            );
             return false;
         }
         Ok(Some(text)) => match settings_from_text(&text) {
             Ok(None) => {
                 let _ = writeln!(
                     detail_out(out),
-                    "確保の数え: [{SECTION}] が無いか enable = 1 でない（数えない）"
+                    "確保の数え: [{SECTION}] がないか enable = 1 ではありません（数えません）"
                 );
                 return false;
             }
             Ok(Some(s)) => s,
             Err(e) => {
-                let _ = writeln!(out, "確保の数え: [{SECTION}] を読めない（{e}）。数えない");
+                let _ = writeln!(
+                    out,
+                    "確保の数え: [{SECTION}] 読み込み不能（{e}）。数えません。"
+                );
                 return false;
             }
         },
         Err(why) => {
-            let _ = writeln!(out, "確保の数え: ini を読めない（{why}）。数えない");
+            let _ = writeln!(out, "確保の数え: ini 読み込み不能（{why}）。数えません。");
             return false;
         }
     };
@@ -897,7 +904,7 @@ pub fn arm(
     let Some(tid) = host.game_thread_id() else {
         let _ = writeln!(
             out,
-            "確保の数え: ゲームのスレッドの ID が tick の記録から取れない（入力のフックを通っていない）。スレッドの別を分けられないので書かない"
+            "確保の数え: ゲームのスレッドの ID が tick の記録から取れません（入力のフックを通っていない）。スレッドの別を分けられないので書きません。"
         );
         return false;
     };
@@ -906,20 +913,23 @@ pub fn arm(
             let _ = writeln!(out, "確保の数え: 書き出し先 {desc}");
         }
         Err(why) => {
-            let _ = writeln!(out, "確保の数え: 書き出し先を開けない（{why}）。書かない");
+            let _ = writeln!(
+                out,
+                "確保の数え: 書き出し先を開けません（{why}）。書きません。"
+            );
             return false;
         }
     }
     host.prepare_counters(tid);
     let _ = writeln!(
         out,
-        "確保の数え: 表を 0 にし、ゲームのスレッドの ID {tid} を置いた"
+        "確保の数え: 表を 0 にし、ゲームのスレッドの ID {tid} を設定しました。"
     );
     let written = install_all(hook_env, host, sites, forbidden, out);
     let n = written.iter().filter(|&&w| w).count();
     let _ = writeln!(
         out,
-        "確保の数え: 5 地点のうち {n} 地点に書いた（{}）",
+        "確保の数え: 5 フック地点のうち {n} フック地点に書きました（{}）。",
         sites
             .iter()
             .zip(written)
@@ -934,7 +944,7 @@ pub fn arm(
         Ok(()) => {
             let _ = writeln!(
                 out,
-                "確保の数え: 書き出しのスレッドを起こした（1 秒ごと、最大 {} 秒）",
+                "確保の数え: 書き出しのスレッドを作りました（1 秒ごと、最大 {} 秒）。",
                 settings.seconds
             );
             true
@@ -942,7 +952,7 @@ pub fn arm(
         Err(why) => {
             let _ = writeln!(
                 out,
-                "確保の数え: 書き出しのスレッドを起こせない（{why}）。入口は数え続けるが、ファイルには書かない"
+                "確保の数え: 書き出しのスレッドの作成不能（{why}）。入口は数え続けますがファイルには書きません。"
             );
             false
         }
@@ -999,6 +1009,7 @@ mod tests {
     use super::*;
     use crate::th09_addr::{ALLOC_SITES, FORBIDDEN, SITES};
 
+    #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
 
     // ---- 表（th09_addr::ALLOC_SITES）----
@@ -1019,6 +1030,7 @@ mod tests {
         }
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn alloc_sites_appear_in_the_note() {
         let start = NOTE.find("## 9. ").expect("ノートに §9 が無い");
@@ -1081,6 +1093,7 @@ mod tests {
         assert!(settings_from_text("[alloc_count]\nenable = 1\nseconds = x\n").is_err());
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn sample_ini_enables_counting_without_the_net() {
         const SAMPLE: &str = include_str!("../../../scripts/e1_01_alloc.ini");
@@ -1091,6 +1104,7 @@ mod tests {
         assert_eq!(crate::net_config::from_text(SAMPLE), Ok(None));
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn script_never_moves_the_end_menu_cursor() {
         use higanr_core::input_model::keys;
@@ -1627,7 +1641,7 @@ mod tests {
                 );
                 assert!(h.tramps.iter().all(|&t| t == 0));
                 assert_eq!(h.writer, None);
-                assert!(log.contains("どこにも書かない"), "{log}");
+                assert!(log.contains("どこにも書きません"), "{log}");
             }
         }
     }

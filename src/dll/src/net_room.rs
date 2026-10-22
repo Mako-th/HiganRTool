@@ -1,20 +1,12 @@
-//! ルームサーバーのクライアントの運び: 受信だけの専用スレッド `higanr-room` と、見張りのスレッドから呼ぶ入口（ルームの [`RoomConn`]・
-//! ランダム対戦の待ち列の [`QueueConn`]。どちらも [`Conn`] で、回す手順の機械だけが違う）。
+//! ルームサーバーのクライアントの運び: 受信だけの専用スレッド `higanr-room` と、見張りのスレッドから呼ぶ入口（ルームの [`RoomConn`]・ランダム対戦の待ち列の [`QueueConn`]。どちらも [`Conn`] で、回す手順の機械だけが違う）。
 //!
-//! - **受信スレッド**（`higanr-room`）: 繋ぐ → Upgrade → 受信を繰り返し、届いたものを channel で積むだけ。止まってよいのは
-//!   このスレッドだけ（名前の解決・TCP・TLS・HTTP の往復・届くまでの受信）。
-//! - **見張りのスレッド**（呼び手。`net_code_game` の `GameWatcher`）: [`RoomConn::poll`] で channel を取り出し、core の
-//!   `room::RoomClient` を回し、送る文（offer / answer / 30 秒ごとの ping）を送り、出来事を返す。止まらない（送りは
-//!   小さな文を TCP の送信側へ渡すだけ。閉じる途中なら送らずに戻る）。
-//! - **閉じるスレッド**（`higanr-room-close`。終わりのときに 1 本だけ、短く）: `WinHttpWebSocketClose` を呼ぶ。止まっている
-//!   受信はそれでその場で戻る（12017）。`close` 自身は相手が閉じ返さなければ閉じる待ち（[`CLOSE_WAIT_MS`]）まで止まるので
-//!   見張りから外した。別のスレッドからハンドルを閉じて受信を解く形は採らない（`room_win.rs`）。
-//! - ゲームのスレッドからは何も呼ばない（確保・ブロッキング I/O がある）。遅延の増分はマッチの中で 0（P2P が繋がる前に
-//!   WebSocket はサーバーが閉じている）。
-//!
-//! 手順の判断（何をいつ送るか・届いた文の意味・期限・ping・pong が来ないこと）は全部 core の `room.rs`（待ち列は `room_queue.rs`）。ここは
-//! 「届いたものを順に渡す」「返ってきた送る文を送る」「終わったら閉じる」だけを持つ。core の `room::Role` は [`code_side`] で
-//! `net_config::CodeSide` へコピーする（host / guest の語は使わない）。
+//! - **受信スレッド**（`higanr-room`）: 接続 → Upgrade → 受信を繰り返し、届いたものを channel で積むだけ。止まってよいのはこのスレッドだけ（名前の解決・TCP・TLS・HTTP の往復・届くまでの受信）。
+//! - **見張りのスレッド**（呼び手。`net_code_game` の `GameWatcher`）: [`RoomConn::poll`] で channel を取り出し、core の `room::RoomClient` を回し、送る文（offer / answer / 30 秒ごとの ping）を送り、出来事を返す。止まらない（送りは小さな文を、サーバーへの TCP の送信側へ渡すだけ。閉じる途中なら送らずに戻る）。
+//! - **閉じるスレッド**（`higanr-room-close`。終わりのときに 1 本だけ、短く）: `WinHttpWebSocketClose` を呼ぶ。止まっている受信はそれでその場で戻る（12017）。`close` 自身は相手が閉じ返さなければ閉じる待ち（[`CLOSE_WAIT_MS`]）まで止まるので見張りから外した。
+//!   別のスレッドからハンドルを閉じて受信を解く形は採らない（`room_win.rs`）。
+//! - ゲームのスレッドからは何も呼ばない（確保・ブロッキング I/O がある）。遅延の増分はマッチの中で 0（P2P の接続前に WebSocket はサーバー側が閉じている）。
+//! - 手順の判断（何をいつ送るか・届いた文の意味・期限・ping・pong が来ないこと）は全部 core の `room.rs`（待ち列は `room_queue.rs`）。ここは「届いたものを順に渡す」「返ってきた送る文を送る」「終わったら閉じる」だけを持つ。
+//!   core の `room::Role` は [`code_side`] で `net_config::CodeSide` へコピーする（host / guest の語は使わない）。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -42,7 +34,7 @@ use crate::room_win::{Endpoint, OpenError, Proxy, Received, Step, Timeouts, WebS
 /// 10 秒（人がメニューの前で待てる長さ）。
 pub const OPEN_TIMEOUT_MS: u32 = 10_000;
 
-// Upgrade の後の受信には上限を置かない（置けない）: `WINHTTP_OPTION_RECEIVE_TIMEOUT` は WebSocket の受信に効かない
+// Upgrade の後の受信には上限を設けない（設けられない）: `WINHTTP_OPTION_RECEIVE_TIMEOUT` は WebSocket の受信に効かない
 // （loopback で測った。検査 `winhttp_facts_receive_timeout_*`）。生きているかは core の ping / pong（`room::PONG_TIMEOUT_MS`）が見て、
 // 終わりは閉じるスレッドの `close` が受信を解く。
 
@@ -157,14 +149,14 @@ impl Base {
 
 #[derive(Debug)]
 enum Incoming {
-    /// 101 を受けた（WebSocket は `Shared::ws` に置いた）。
+    /// 101 を受けた（WebSocket は `Shared::ws` に格納した）。
     Upgraded,
     /// 101 でない応答。
     Refused {
         status: u16,
         body: String,
     },
-    /// 繋げなかった（WinHTTP の段階と番号）。
+    /// 接続できなかった（WinHTTP の段階と番号）。
     OpenFailed {
         step: Step,
         code: u32,
@@ -180,12 +172,12 @@ enum Incoming {
 
 struct Shared {
     ws: Mutex<Option<Arc<WebSocket>>>,
-    /// 送りの向き（`send_text` / `close`）を 1 本に絞る錠。WinHTTP の WebSocket は送り 1 本と受け 1 本までなので、見張りの送りと
+    /// 送りの向き（`send_text` / `close`）を 1 本に絞るロック。WinHTTP の WebSocket は送り 1 本と受け 1 本までなので、見張りの送りと
     /// 閉じるスレッド・受信スレッドの `close` を重ねない。見張りは `try_lock` で取り、取れなければ（閉じる途中）送らない。
     send_lock: Mutex<()>,
     /// `close` を 1 回だけ呼ぶための印（受信スレッドが相手の close に答えるのと、閉じるスレッドが閉じるのとが重なるため）。
     closing: AtomicBool,
-    /// 見張りが終えた（取りやめ・手順の終わり）。Upgrade の前なら、受信スレッドは繋がった直後に自分で閉じる。
+    /// 見張りが終えた（取りやめ・手順の終わり）。Upgrade の前なら、受信スレッドは接続した直後に自分で閉じる。
     ended: AtomicBool,
 }
 
@@ -200,12 +192,12 @@ impl Shared {
     }
 }
 
-/// close の待ちの上限を置けなかったこと（Wine など）を、接続ごとでなく起動ごとに 1 回だけ本ログへ出す。
+/// close の待ちの上限を設定できなかったこと（Wine など）を、接続ごとでなく起動ごとに 1 回だけ本ログへ出す。
 fn log_close_timeout_once(code: u32) {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::AcqRel) {
         crate::main_log::push(format!(
-            "ルームの運び: WebSocket の close の待ちの上限を置けなかった（{code}）。既定の長さで続ける"
+            "ルームサーバーとの通信: WebSocket の close の待ちの上限が設定できませんでした（{code}）。既定の長さで続けます。"
         ));
     }
 }
@@ -234,7 +226,7 @@ fn recv_main(
         log_close_timeout_once(code);
     }
     *shared.ws.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&ws));
-    // 見張りが先に終えていた（繋ぐ途中の取りやめ）か、もう見張りがいない: 閉じて終わる。
+    // 見張りが先に終えていた（接続する途中の取りやめ）か、もう見張りがいない: 閉じて終わる。
     if shared.ended.load(Ordering::Acquire) || tx.send(Incoming::Upgraded).is_err() {
         shared.close_once(&ws);
         return;
@@ -287,7 +279,7 @@ impl RoomOptions {
 pub enum SubmitRefused {
     /// core が断った（番でない・文字が悪い）。状態は変わらない。
     Core(SubmitError),
-    /// 送れなかった（繋がりが切れた・閉じる途中）。失敗の出来事は次の `poll` で返る。
+    /// 送れなかった（接続が切れた・閉じる途中）。失敗の出来事は次の `poll` で返る。
     NotSent,
 }
 
@@ -316,7 +308,7 @@ pub trait Machine {
     }
 }
 
-/// 機械が返す 1 つの仕事: 文を送る・出来事を上へ渡す。
+/// 機械が返す 1 つの仕事: 文を送る・出来事を上（呼び手の見張り）へ渡す。
 pub enum Act<E> {
     Send(String),
     Notify(E),
@@ -473,7 +465,7 @@ impl Machine for ViewClient {
     }
 }
 
-/// ルームサーバーとの 1 回の手順（繋ぐ → ルームに入る → コードを渡し合う → 閉じる）。見張りのスレッドが持ち、
+/// ルームサーバーとの 1 回の手順（接続する → ルームに入る → コードを渡し合う → 閉じる）。見張りのスレッドが持ち、
 /// [`Conn::poll`] を [`Conn::next_poll_in`] より短い間隔で呼ぶ。手放す（`Drop`）と閉じ始める（待たない）。
 /// 手順の機械 `M` がルーム（[`RoomConn`]）とランダム対戦の待ち列（[`QueueConn`]）で違うだけで、運びは同じ。
 pub struct Conn<M: Machine> {
@@ -488,6 +480,9 @@ pub struct Conn<M: Machine> {
     notes: Vec<TransportNote>,
     /// `submit_code` の中で起きた出来事（送れなかった失敗）。次の `poll` の始まりで返す。
     pending: Vec<M::Event>,
+    /// 検査だけ: 以後の送りを WinHTTP の送りの失敗と同じに扱う。
+    #[cfg(test)]
+    fail_sends: bool,
 }
 
 /// ルームの手順。
@@ -500,7 +495,7 @@ pub type HostListConn = Conn<HostClient>;
 pub type ViewListConn = Conn<ViewClient>;
 
 impl Conn<RoomClient> {
-    /// 受信スレッドを起こして繋ぎ始める（待たない）。スレッドを起こせなければ誤りの文。
+    /// 受信スレッドを作って接続し始める（待たない）。スレッドを作れなければ誤りの文。
     pub fn start(opts: &RoomOptions, room: &RoomName) -> Result<RoomConn, String> {
         let path = match client_id() {
             Some(id) => room.path_with_client(&id),
@@ -515,7 +510,21 @@ impl Conn<RoomClient> {
         if self.cancelled {
             return Err(SubmitRefused::NotSent);
         }
-        let acts = acts_of_room(self.client.submit_code(code).map_err(SubmitRefused::Core)?);
+        let acts = self.client.submit_code(code).map_err(SubmitRefused::Core)?;
+        self.send_acts(acts)
+    }
+
+    /// 観戦を断る（観戦用のルームの始める側が `Joined` の後、`offer` の代わりに）。以後ルームの期限まで残る。
+    pub fn refuse(&mut self) -> Result<(), SubmitRefused> {
+        if self.cancelled {
+            return Err(SubmitRefused::NotSent);
+        }
+        let acts = self.client.refuse().map_err(SubmitRefused::Core)?;
+        self.send_acts(acts)
+    }
+
+    fn send_acts(&mut self, acts: Vec<Action>) -> Result<(), SubmitRefused> {
+        let acts = acts_of_room(acts);
         let mut out = Vec::new();
         let sent = self.run(acts, &mut out);
         // 送れなかったときに `run` が積んだ失敗の出来事は、core が終わった後の `poll` からは出てこないので、持っておいて
@@ -537,7 +546,7 @@ impl Conn<RoomClient> {
 }
 
 impl Conn<QueueClient> {
-    /// ランダム対戦の待ち列へ繋ぎ始める（待たない）。`build` は `update::BUILD_NUMBER`（同じビルドの人どうしだけが組になる）。
+    /// ランダム対戦の待ち列へ接続し始める（待たない）。`build` は `update::BUILD_NUMBER`（同じビルドの人どうしだけが組になる）。
     /// 組になると [`QueueEvent::Paired`] で割り当てのルーム名が届き、手順はそこで終わる（ルームへは [`RoomConn::start`] で入り直す）。
     pub fn start_queue(opts: &RoomOptions, build: u32) -> Result<QueueConn, String> {
         let id = client_id();
@@ -547,7 +556,7 @@ impl Conn<QueueClient> {
 }
 
 impl Conn<HostClient> {
-    /// 一覧の載せるエンドポイントへ繋ぎ始める（待たない）。繋がったら `posting` を送り、`HostEvent::Listed` で載ったと分かる。
+    /// 一覧の載せるエンドポイントへ接続し始める（待たない）。接続したら `posting` を送り、`HostEvent::Listed` で載ったと分かる。
     pub fn start_post(
         opts: &RoomOptions,
         build: u32,
@@ -574,7 +583,7 @@ impl Conn<HostClient> {
 }
 
 impl Conn<ViewClient> {
-    /// 一覧の見るエンドポイントへ繋ぎ始める（待たない）。一覧は `ViewEvent::List` で全体が届く。
+    /// 一覧の見るエンドポイントへ接続し始める（待たない）。一覧は `ViewEvent::List` で全体が届く。
     pub fn start_view(opts: &RoomOptions, build: u32) -> Result<ViewListConn, String> {
         Conn::start_at(opts, watch_view_path(build), ViewClient::new())
     }
@@ -599,7 +608,7 @@ impl<M: Machine> Conn<M> {
                 // パニックは受けて外へ出さない。受けたら channel が切れ、見張りは「切れた」と読む。
                 let _ = catch_unwind(AssertUnwindSafe(|| recv_main(ep, proxy, t, sh, tx, max)));
             })
-            .map_err(|e| format!("ルームの受信スレッドを起こせない: {e}"))?;
+            .map_err(|e| format!("ルームの受信スレッドの作成不能: {e}"))?;
         Ok(Conn {
             client,
             rx,
@@ -611,7 +620,15 @@ impl<M: Machine> Conn<M> {
             cancelled: false,
             notes: Vec::new(),
             pending: Vec::new(),
+            #[cfg(test)]
+            fail_sends: false,
         })
+    }
+
+    /// 検査だけ: 以後の送りを失敗させる（upgrade の後に WinHTTP の送りが誤りを返した形）。
+    #[cfg(test)]
+    pub fn fail_sends_for_test(&mut self) {
+        self.fail_sends = true;
     }
 
     pub fn now(&self) -> Now {
@@ -752,6 +769,10 @@ impl<M: Machine> Conn<M> {
     }
 
     fn send(&mut self, text: &str) -> Sent {
+        #[cfg(test)]
+        if self.fail_sends {
+            return Sent::Failed;
+        }
         let Some(ws) = self.ws.as_ref() else {
             return Sent::Failed;
         };
@@ -773,7 +794,7 @@ impl<M: Machine> Conn<M> {
         }
     }
 
-    /// 閉じ始める（1 回だけ）。Upgrade の前なら受信スレッドが繋がった直後に閉じる。後なら閉じるスレッドを 1 本起こす。
+    /// 閉じ始める（1 回だけ）。Upgrade の前なら受信スレッドが接続した直後に閉じる。後なら閉じるスレッドを 1 本作る。
     fn begin_close(&mut self) {
         if self.shared.ended.swap(true, Ordering::AcqRel) {
             return;
@@ -804,7 +825,7 @@ impl<M: Machine> Conn<M> {
             && let Ok(_g) = self.shared.send_lock.try_lock()
             && !self.shared.closing.swap(true, Ordering::AcqRel)
         {
-            // スレッドを起こせない: 待たない `shutdown` だけ送る（サーバーが閉じ返せば受信スレッドはそれで終わる）。
+            // スレッドを作れない: 待たない `shutdown` だけ送る（サーバーが閉じ返せば受信スレッドはそれで終わる）。
             let _ = ws.shutdown(CLOSE_NORMAL);
         }
     }
@@ -814,7 +835,7 @@ enum Sent {
     Yes,
     /// 閉じる途中で送らなかった（相手の close の番号が channel にある）。
     Closing,
-    /// 送れなかった（繋がっていない・WinHTTP の誤り）。
+    /// 送れなかった（接続していない・WinHTTP の誤り）。
     Failed,
 }
 
@@ -827,15 +848,13 @@ impl<M: Machine> Drop for Conn<M> {
 #[cfg(test)]
 pub(crate) mod fake {
     //! loopback の偽のルームサーバー。`src/server/src/index.ts`（入口の断り）と `room.ts`（2 人の役割・offer / peer / matched /
-    //! answer・閉じる番号と直前の error の文・期限・片方が抜けたとき）の振る舞いのコピー。値は全部 `tests/fixtures/room/rules.json`
-    //! から読み、自前の定数を持たない。`127.0.0.1:0` で受け、外へは繋がない。
-    //!
-    //! コピーしていないもの: 同じ cid の入り直しの置き換え（検査の一部は 1 つのプロセスから 2 人分を繋ぐ。問いは受けて `seen` に残すだけ）・
-    //! Hibernation・Durable Object の記憶・IP ごとの数え（1 本にまとめ、通す数は検査が `limit` で置く）。
-    //! クライアントの文は JSON.parse でなく、こちらのクライアントが送る 3 つの形（offer・answer・ping の 12 文字）の文字の一致で
+    //! answer・観戦の断り refuse と 4403・閉じる番号と直前の error の文・期限・片方が抜けたとき）の振る舞いのコピー。値は全部 `tests/fixtures/room/rules.json`
+    //! から読み、自前の定数を持たない。`127.0.0.1:0` で受け、外へは接続しない。
+    //! コピーしていないもの: 同じ cid の入り直しの置き換え（検査の一部は 1 つのプロセスから 2 人分を接続する。問いは受けて `seen` に残すだけ）・
+    //! Hibernation・Durable Object の記憶・IP ごとの数え（1 本にまとめ、通す数は検査が `limit` で設定する）。
+    //! クライアントの文は JSON.parse でなく、こちらのクライアントが送る 4 つの形（offer・answer・refuse・ping の 12 文字）の文字の一致で
     //! 読む（ほかは room.ts と同じく 4400）。WebSocket の握手の SHA-1 は OS の BCrypt（`room_win::sha1`）。枠組みとマスク解きは
     //! RFC 6455 §5 を読んで手で書いた。
-    //!
     //! 役割の名は room.ts の文字（`"host"` / `"guest"`）を文にだけ書き、Rust の名前は `Side::Offer` / `Side::Answer`。
 
     use std::collections::HashMap;
@@ -885,6 +904,7 @@ pub(crate) mod fake {
         pub watch_cap_max: i64,
         pub watch_delay_max: i64,
         pub watch_modes: Vec<String>,
+        pub watch_room_prefix: String,
     }
 
     enum Val {
@@ -1054,6 +1074,7 @@ pub(crate) mod fake {
                 watch_cap_max: n("watch_cap_max"),
                 watch_delay_max: n("watch_delay_max"),
                 watch_modes: s("watch_modes").split(',').map(str::to_owned).collect(),
+                watch_room_prefix: s("watch_room_prefix"),
             }
         }
 
@@ -1092,7 +1113,7 @@ pub(crate) mod fake {
             (!rest.is_empty() && !rest.contains('/')).then_some(rest)
         }
 
-        /// rules.ts の `decodeRoomName` と `normalizeRoomName`（パスの区切りを受け、符号化を戻して確かめ、揃えた文字を返す）。
+        /// rules.ts の `decodeRoomName` と `normalizeRoomName`（パスの区切りを受け、符号化を戻して検証し、揃えた文字を返す）。
         /// 揃え方は NFKC を除いたコピー（[`Rules::load`] の注釈）。
         fn normalize(&self, segment: &str) -> Option<String> {
             // 区切りの前置きのガード（1 B は 3 文字まで）と、戻せない符号（`%` の後が 16 進 2 桁でない・UTF-8 として壊れている）。
@@ -1157,7 +1178,7 @@ pub(crate) mod fake {
         pub list_bad: AtomicBool,
         /// 回数の歯止めまでに通す要求の数（0 なら数えない）。
         pub limit: AtomicUsize,
-        /// 入口で必ずこの応答を返す（状態の番号・本文）。Cloudflare 自身の誤りの頁などのコピー。
+        /// 入口で必ずこの応答を返す（状態の番号・本文）。Cloudflare 自身の誤りのページなどのコピー。
         pub forced: Mutex<Option<(u16, String)>>,
     }
 
@@ -1172,12 +1193,12 @@ pub(crate) mod fake {
         pub upgrades: AtomicUsize,
         /// ランダム対戦の待ち列に入った数（Upgrade した数）。
         pub queue_upgrades: AtomicUsize,
-        /// 待ち列が割り当てたルーム名（検査が「ログや画面に出ていない」を確かめる元）。
+        /// 待ち列が割り当てたルーム名（検査が「ログや画面に出ていない」を検証する元）。
         pub assigned: Mutex<Vec<String>>,
         /// 一覧の載せるエンドポイント・見るエンドポイントに入った数（Upgrade した数）。
         pub watch_post_upgrades: AtomicUsize,
         pub watch_view_upgrades: AtomicUsize,
-        /// 一覧の載せるエンドポイントへ届いた post の文（検査が 1P・2P の名前・方式を確かめる）。
+        /// 一覧の載せるエンドポイントへ届いた post の文（検査が 1P・2P の名前・方式を検証する）。
         pub posts: Mutex<Vec<String>>,
     }
 
@@ -1204,6 +1225,8 @@ pub(crate) mod fake {
         code: Option<String>,
         got_peer: bool,
         done: bool,
+        /// host だけ: 観戦を断った（room.ts の `refused`）。
+        refused: bool,
         w: Arc<Mutex<TcpStream>>,
     }
 
@@ -1643,6 +1666,7 @@ pub(crate) mod fake {
                 code: None,
                 got_peer: false,
                 done: false,
+                refused: false,
                 w: Arc::new(Mutex::new(w)),
             };
             inner.seen.upgrades.fetch_add(1, Ordering::AcqRel);
@@ -1660,8 +1684,15 @@ pub(crate) mod fake {
                 m.done = true;
                 write_frame(&m.w, 0x8, &[]);
             }
+            // 観戦を断っている host のルームへ入った guest は、コードを渡さずに断りの印で閉じる（host は残す）。
+            let host_refused = room
+                .iter()
+                .any(|h| !h.done && h.side == Side::Offer && h.refused);
+            if side == Side::Answer && host_refused {
+                close_with(inner, &mut m, "refused", true);
+            }
             room.push(m);
-            if side == Side::Answer {
+            if side == Side::Answer && !host_refused {
                 try_match(inner, room, now);
             }
         }
@@ -1687,7 +1718,7 @@ pub(crate) mod fake {
 
     // ---- ランダム対戦の待ち列（random_queue.ts のコピー）----
     //
-    // コピーしていないもの: 同じ cid の入り直しの置き換え（ルームのコピーと同じ理由。検査は 1 つのプロセスから 2 人分を繋ぐので cid が同じ）。
+    // コピーしていないもの: 同じ cid の入り直しの置き換え（ルームのコピーと同じ理由。検査は 1 つのプロセスから 2 人分を接続するので cid が同じ）。
 
     /// index.ts の待ち列のエンドポイントと `RandomQueue.fetch`: ビルド番号ごとの待ち列に入れ、2 人そろえば割り当てたルーム名を返して閉じる。
     fn serve_queue(inner: &Inner, mut s: TcpStream, head: &Head, path: &str) {
@@ -2093,7 +2124,7 @@ pub(crate) mod fake {
         }
     }
 
-    /// 載せるエンドポイントの 1 通: 最初の post なら一覧へ載せて listed を返す。count なら数を替える。断るなら閉じる名を返す。
+    /// 載せるエンドポイントの 1 通: 最初の post なら一覧へ載せ、載せてきた接続へ listed を送る。count なら載せた項目の観戦者数を替える。断るなら error の名を返す（呼び手が載せてきた接続へ送る）。
     fn on_post_text(
         inner: &Inner,
         book: &mut WatchBook,
@@ -2196,7 +2227,7 @@ pub(crate) mod fake {
             return;
         };
         let Some(i) = idx(room, id) else { return };
-        // `setWebSocketAutoResponse`: 文字の完全一致だけ。Durable Object を起こさない（done でも返す）。
+        // `setWebSocketAutoResponse`: 文字の完全一致だけ。Durable Object を起動しない（done でも返す）。
         if text == rules.ping_text {
             if !inner.knobs.no_pong.load(Ordering::Acquire) {
                 send_text(&room[i], &rules.pong_text);
@@ -2208,6 +2239,24 @@ pub(crate) mod fake {
         }
         if text.len() > rules.message_max_bytes {
             return fail(inner, room, id, "too_large");
+        }
+        // room.ts の refuse: 観戦用のルームの host が offer の前に 1 回だけ。待っている guest は断りの印で閉じ、host は残す。
+        if text == higanr_core::room::REFUSE_TEXT {
+            let ok = room[i].side == Side::Offer
+                && room[i].code.is_none()
+                && !room[i].refused
+                && name.starts_with(rules.watch_room_prefix.as_str());
+            if !ok {
+                return fail(inner, room, id, "bad_message");
+            }
+            room[i].refused = true;
+            for g in room
+                .iter_mut()
+                .filter(|m| !m.done && m.side == Side::Answer)
+            {
+                close_with(inner, g, "refused", true);
+            }
+            return;
         }
         let parsed = [("offer", Side::Offer), ("answer", Side::Answer)]
             .into_iter()
@@ -2226,7 +2275,7 @@ pub(crate) mod fake {
         let now = Instant::now();
         match kind {
             Side::Offer => {
-                if room[i].side != Side::Offer || room[i].code.is_some() {
+                if room[i].side != Side::Offer || room[i].code.is_some() || room[i].refused {
                     return fail(inner, room, id, "bad_message");
                 }
                 room[i].code = Some(code);
@@ -2375,7 +2424,8 @@ pub(crate) mod fake {
             assert_eq!(r.close("too_large"), 4413);
             assert_eq!(r.close("bad_code"), 4422);
             assert_eq!(r.close("list_full"), 4429);
-            assert_eq!(r.closes.len(), 7);
+            assert_eq!(r.close("refused"), 4403);
+            assert_eq!(r.closes.len(), 8);
             assert_eq!(r.room_ttl_ms, 600_000);
             assert_eq!(r.answer_ttl_ms, 60_000);
             assert_eq!(r.ping_text, r#"{"t":"ping"}"#);
@@ -2425,7 +2475,7 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     //! 部品の検査（毎回の回）は `Base` と役割のコピーだけ。組み上がりの検査（loopback の偽サーバー `fake` と、本物の WinHTTP・
-    //! 本物のスレッド）は実時間で走るので `#[ignore]` で、全件の回が `--ignored` で走らせる。外へは繋がない（`127.0.0.1` と `Proxy::Direct`）。
+    //! 本物のスレッド）は実時間で走るので `#[ignore]` で、全件の回が `--ignored` で走らせる。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。
     use super::fake::FakeServer;
     use super::*;
     use higanr_core::room::{
@@ -2505,7 +2555,7 @@ mod tests {
         );
     }
 
-    // ---- 組み上がり: 道具 ----
+    // ---- 組み上がり: ツール ----
 
     fn test_timeouts() -> Timeouts {
         Timeouts {
@@ -2525,7 +2575,7 @@ mod tests {
         }
     }
 
-    /// 検査のルーム名はサーバーの決まり（`parse_server_rules`）で確かめる。dll の本番（`parse`）は ASCII の英数字と `-` `_` だけだが、
+    /// 検査のルーム名はサーバーの決まり（`parse_server_rules`）で検証する。dll の本番（`parse`）は ASCII の英数字と `-` `_` だけだが、
     /// サーバーは日本語も受け付けたままなので、その受け入れ（符号化・400）はこの入口で見る。
     fn start(f: &FakeServer, room: &str) -> RoomConn {
         RoomConn::start(
@@ -2824,7 +2874,7 @@ mod tests {
         assert_eq!(wait_failure(&mut c), Failure::RoomFull);
         assert!(!a.is_finished() && !b.is_finished());
 
-        // 回数の歯止め: 1 回だけ通し、次は 429 と見本の待ちの秒（index.ts と同じ本文と Retry-After ヘッダー）。
+        // 回数の歯止め: 1 回だけ通し、次は 429 と、クライアントが待つ秒の見本（index.ts と同じ本文と Retry-After ヘッダー）。
         let f2 = FakeServer::start();
         f2.knobs.limit.store(1, Ordering::Release);
         let mut d = start(&f2, "limited");
@@ -2837,7 +2887,7 @@ mod tests {
             }
         );
 
-        // 誰も受けていない番号: 繋がらない（WinHTTP の誤り）→ 応答しません。
+        // 誰も受けていない番号: 接続できない（WinHTTP の誤り）→ 応答しません。
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -3047,8 +3097,8 @@ mod tests {
             "閉じる待ちの分は止まる: {took:?}"
         );
 
-        // 繋ぐ途中（TCP は受けるが HTTP に答えない）: 応答の先頭の待ちの上限で終わる（取りやめでは解けない。見張りは待たない）。
-        // 上限は 300 ms に置き、WinHTTP の見回りの間隔（約 4 秒）の分を見込む。相手が切る 9 秒より前。
+        // 接続する途中（TCP は受けるが HTTP に答えない）: 応答の先頭の待ちの上限で終わる（取りやめでは解けない。見張りは待たない）。
+        // 上限は 300 ms に設定し、WinHTTP の見回りの間隔（約 4 秒）の分を見込む。相手が切る 9 秒より前。
         let (port, hold) = raw_server(None, Duration::from_secs(9));
         let t0 = Instant::now();
         let mut o = opts_for(&format!("ws://127.0.0.1:{port}"));
@@ -3121,7 +3171,7 @@ mod tests {
     #[test]
     #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
     fn winhttp_facts_receive_timeout_does_not_bound_ws_receive() {
-        // WinHTTP の時間切れは粗い間隔（約 4 秒）で見回るので、300 ms を置いても切れるのは最大 4 秒余り後。相手が切る（8 秒）より前に切れたこと・
+        // WinHTTP の時間切れは粗い間隔（約 4 秒）で見回るので、300 ms を設定しても切れるのは最大 4 秒余り後。相手が切る（8 秒）より前に切れたこと・
         // WebSocket の受信がその間隔を越えても戻らないことを見る。3 つは同時に走らせる（待ちを重ねない）。
         let t = Timeouts {
             response_ms: 300,
@@ -3278,7 +3328,7 @@ mod tests {
         );
         assert_eq!(ws.close(CLOSE_NORMAL), Ok(()));
 
-        // 通常の経路は置けて、印が付かない。
+        // 通常の経路は設定できて、印が付かない。
         let ws = open_ws(&f, "normal", test_timeouts());
         assert_eq!(ws.close_timeout_error(), None);
     }

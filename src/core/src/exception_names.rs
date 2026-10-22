@@ -38,7 +38,6 @@ pub fn name(code: u32) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// 壊れたら落ちる: 落ちうるコードの取りこぼし、または普段から投げられるコードを記録の対象にする。
     #[test]
     fn only_codes_that_can_kill_the_process_are_fatal() {
         for code in [

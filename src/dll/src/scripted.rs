@@ -1,8 +1,8 @@
 //! 台本を 1 tick 進める判断（pure）: 画面の組（`Obs`）を読み、`Engine::step` を呼び、feed する tick では InputManager 3 本の
 //! 前後をコピーして feed を 3 回呼ぶ。
 //!
-//! ゲームのメモリの読み・ゲームの関数の呼び出しは `TickIo` の向こうに置く（本物は `script_win::RealTickIo`、検査では偽物）。
-//! ここはゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を置かない（`FeedRecord` はスタックに置く）。
+//! ゲームのメモリの読み・ゲームの関数の呼び出しは `TickIo` の向こうへ分ける（本物は `script_win::RealTickIo`、検査では偽物）。
+//! ここはゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を使わない（`FeedRecord` はスタックに作る）。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::MATCH_SEND_MASK;
@@ -26,12 +26,12 @@ pub struct GameAddrs {
     pub pause: u32,
     pub loading: u32,
     pub global_state: u32,
-    /// MainMenu へのポインタの置き場（落ちない読み方でだけたどる）。
+    /// MainMenu へのポインタが入っているアドレス（落ちない読み方でだけたどる）。
     pub main_menu_ptr: u32,
     pub input_managers: [u32; 3],
     /// マッチの終わりのメニューの印（1 バイトの欄。4 バイトで読んで下位 1 バイトだけ見る）。
     pub match_end_menu: u32,
-    /// Gui へのポインタの置き場（会話の状態を落ちない読み方でたどる）。
+    /// Gui へのポインタが入っているアドレス（会話の状態を落ちない読み方でたどる）。
     pub gui_ptr: u32,
 }
 
@@ -90,22 +90,22 @@ fn read_talk(io: &mut dyn TickIo, a: &GameAddrs, scene: u32) -> Option<bool> {
 /// 押せない側に倒す（読めない間に押して会話を送らないため）。
 ///
 /// 印を 1 にするのは `0x4170A8` と `0x4178BE` の 2 か所だけ。後者は直前の `0x417854`（`mov 0xe94c(%esi),%eax; test; jge 0x417bf1`）で、
-/// 会話が走っている（0 以上）間は通らない。前者の経路（`0x41705B`〜`0x4170A8`）には会話の確認を読み取れなかった（見つからなかった
-/// だけで、無いとは確かめていない）。印は決定の 20 フレーム後に `0x435A4A` / `0x43560C` が 0 に戻す。会話の状態を重ねて見るのは、
-/// 順序を逆アセンブルだけに頼らないため（撮影ではメニューと会話のウィンドウが同時に写っていたが、会話のウィンドウは会話が終わった後も描かれたままかもしれない。推定）。メニューは出てから 4 フレーム入力を見ないので、真になってから 10 tick 以上待って押すこと。
+/// 会話が走っている（0 以上）間は通らない。前者の経路（`0x41705B`〜`0x4170A8`）には会話の確認を読み取れなかった（見つからなかっただけで、無いとは検証していない）。
+/// 印は決定の 20 フレーム後に `0x435A4A` / `0x43560C` が 0 に戻す。会話の状態を重ねて見るのは、順序を逆アセンブルだけに頼らないため（会話のウィンドウは会話が終わった後も描かれたままかもしれない。推定）。
+/// メニューは出てから 4 フレーム入力を見ないので、真になってから 10 tick 以上待って押すこと。
 fn end_menu_pressable(menu_flag: bool, talk: Option<bool>) -> bool {
     menu_flag && talk == Some(false)
 }
 
 /// ゲームのスレッドが外から得るもの。本物は `script_win::RealTickIo`。どれも確保しない・パニックしない。
 pub trait TickIo {
-    /// ゲームの .data の 4 バイトを直に読む（設置の前に読めると確かめたアドレスだけ）。
+    /// ゲームの .data の 4 バイトを直に読む（設置の前に読めると検証したアドレスだけ）。
     fn data_u32(&mut self, addr: u32) -> u32;
     /// 落ちない読み方（自分のプロセスへの `ReadProcessMemory`）で 4 バイト。読めなければ `None`。
     fn safe_u32(&mut self, addr: u32) -> Option<u32>;
     fn read_im(&mut self, addr: u32, out: &mut [u8; IM_BYTES]);
     /// ローカル入力を 1 回読む（戻り値の下位 16 ビットが語）。台本だけの実行（ネットワークなし）は `0x0042BE40`（InputManager に書かない）。
-    /// ネットワークのセッションを置けた実行で poll の入口の照合が合っていれば、素の poll `0x0042B850` を席 0 で呼ぶ（InputManager[0] は呼ぶ前後で
+    /// ネットワークのセッションを組み込めた実行で poll の入口の照合が合っていれば、素の poll `0x0042B850` を席 0 で呼ぶ（InputManager[0] は呼ぶ前後で
     /// コピーして戻す）。
     fn local_input(&mut self) -> u32;
     /// feed `0x0042ACE0`（ecx = 番号、edx = 語）を 1 回呼ぶ。
@@ -185,7 +185,7 @@ impl Stepped {
     }
 }
 
-/// 台本を 1 tick 進めるだけ（画面を読んで `Engine::step`。feed はしない）。観戦者の経路が、繋がっている間の台本の Esc を読むために
+/// 台本を 1 tick 進めるだけ（画面を読んで `Engine::step`。feed はしない）。観戦者の経路が、接続している間の台本の Esc を読むために
 /// 使う: 観戦中の tick は台本の語をゲームへ入れないが、台本は 1 tick に 1 回ずつ進めたい。`Local` を返す tick は、同じ結果を
 /// `commit` に渡して feed する（二重に進めない）。
 pub fn advance(engine: &mut Engine, io: &mut dyn TickIo, a: &GameAddrs) -> Stepped {

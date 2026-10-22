@@ -56,7 +56,7 @@ fn llvm_rc_res(dir: &Path, rc: &str) -> Option<Vec<u8>> {
     let rc_path = dir.join("v.rc");
     let res_path = dir.join("v.res");
     std::fs::write(&rc_path, rc).unwrap();
-    // windows.h の代わりに最小の定義を置く（llvm-rc は SDK が無くても動く）。
+    // windows.h の代わりに最小の定義を書く（llvm-rc は SDK が無くても動く）。
     std::fs::write(
         dir.join("windows.h"),
         "#define LANG_ENGLISH 0x09\n#define SUBLANG_ENGLISH_US 0x01\n\

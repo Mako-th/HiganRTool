@@ -1,4 +1,4 @@
-//! リプレイを読み、直した写しをファイルに書く。元のファイルには書かない。
+//! リプレイを読み、直したコピーをファイルに書く。元のファイルには書かない。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,8 @@ pub enum MakeResult {
     /// 印に `charge` がある。
     Recorded,
     NoMark,
+    /// ゲームのメニューから保存したリプレイ。
+    MenuMark,
     /// 見出しの値が 0 / 1 のどちらでもない。
     OddValue(u8, u8),
     /// 書く先に同じ名前のファイルが既にある（上書きしない）。
@@ -49,7 +51,7 @@ enum WriteError {
     Other(String),
 }
 
-/// 既にあれば書かない。`create_new` なので、確かめてから書く間に作られても上書きしない。
+/// 既にあれば書かない。`create_new` なので、存在をチェックしてから書く間に作られても上書きしない。
 fn write_new(dst: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     if let Some(d) = dst.parent() {
         std::fs::create_dir_all(d)
@@ -67,7 +69,7 @@ fn write_new(dst: &Path, bytes: &[u8]) -> Result<(), WriteError> {
         .map_err(|e| WriteError::Other(format!("{} に書けない: {e}", dst.display())))
 }
 
-/// `src` の写しを、見出しと印のチャージ型を `pair` にして `output_path` に書く。
+/// `src` のコピーを、見出しと印のチャージ型を `pair` にして `output_path` に書く。
 pub fn make(src: &Path, pair: Pair) -> MakeResult {
     let bytes = match read(src) {
         Ok(b) => b,
@@ -79,6 +81,7 @@ pub fn make(src: &Path, pair: Pair) -> MakeResult {
         }
         Ok(_) => {}
         Err(PlanError::NoMark) => return MakeResult::NoMark,
+        Err(PlanError::MenuMark) => return MakeResult::MenuMark,
         Err(PlanError::Recorded(_) | PlanError::Newer(_)) => return MakeResult::Recorded,
         Err(PlanError::Decode(e)) => return MakeResult::Failed(format!("{e:?}")),
     }
@@ -109,6 +112,8 @@ pub struct Report {
     pub recorded: Vec<(usize, PathBuf)>,
     pub exists: usize,
     pub no_mark: usize,
+    /// ゲームのメニューから保存したもの（直す対象ではないので、問題には数えない）。
+    pub menu_mark: usize,
     pub odd_value: usize,
     pub failed: Vec<(PathBuf, String)>,
 }
@@ -122,6 +127,7 @@ impl Report {
             MakeResult::Recorded => self.recorded.push((index, src.to_path_buf())),
             MakeResult::Exists(_) => self.exists += 1,
             MakeResult::NoMark => self.no_mark += 1,
+            MakeResult::MenuMark => self.menu_mark += 1,
             MakeResult::OddValue(..) => self.odd_value += 1,
             MakeResult::Failed(e) => self.failed.push((src.to_path_buf(), e)),
         }
@@ -132,7 +138,7 @@ impl Report {
         self.made.len() + self.skipped()
     }
 
-    /// 作った写しのフォルダ（`<型>-<型>`）。重ならない順。
+    /// 作ったコピーのフォルダ（`<型>-<型>`）。重ならない順。
     pub fn output_dirs(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = Vec::new();
         for d in self.made.iter().filter_map(|p| p.parent()) {
@@ -149,6 +155,7 @@ impl Report {
             + self.recorded.len()
             + self.exists
             + self.no_mark
+            + self.menu_mark
             + self.odd_value
             + self.failed.len()
     }
@@ -172,7 +179,8 @@ pub fn make_all(paths: &[PathBuf], pair: Pair) -> Report {
 pub(crate) mod tests {
     use super::*;
     use higanr_core::replay::{
-        Mark, MarkRead, MarkRole, MatchResult, Side, Timestamp, chunk_to_append, read_mark,
+        Mark, MarkRead, MarkRole, MatchResult, MenuMark, Side, Timestamp, chunk_to_append,
+        chunk_to_append_menu, read_mark,
     };
     use higanr_core::replay_build::{BuildSpec, build_replay};
     use higanr_core::replay_decode::decode_image;
@@ -269,7 +277,7 @@ pub(crate) mod tests {
             MakeResult::Exists(dst.clone())
         );
         assert_eq!(std::fs::read(&dst).unwrap(), written);
-        // 直した写しは「直し済み」なので、もう一度直せない。
+        // 直したコピーは「直し済み」なので、もう一度直せない。
         assert_eq!(
             analyze(&dst),
             Analysis::Recorded,
@@ -305,6 +313,17 @@ pub(crate) mod tests {
         let plain = write("plain.rpy", replay(0, 1, Side::P1, None, false));
         let odd = write("odd.rpy", replay(7, 1, Side::P1, None, true));
         let not_replay = write("not_replay.rpy", b"not a replay".to_vec());
+        let mut menu_bytes = replay(0, 1, Side::P1, None, false);
+        let chunk = chunk_to_append_menu(
+            &menu_bytes,
+            &MenuMark {
+                ver: "1.1.1".into(),
+                build: 1,
+            },
+        )
+        .unwrap();
+        menu_bytes.extend_from_slice(&chunk);
+        let menu = write("menu.rpy", menu_bytes);
         let mut damaged_bytes = replay(0, 1, Side::P1, None, true);
         damaged_bytes[0x40] ^= 0xFF;
         let damaged = write("damaged.rpy", damaged_bytes);
@@ -317,6 +336,12 @@ pub(crate) mod tests {
         assert_eq!(make(&plain, pair), MakeResult::NoMark);
         assert_eq!(make(&odd, pair), MakeResult::OddValue(7, 1));
         assert_eq!(make(&not_replay, pair), MakeResult::NoMark);
+        assert_eq!(make(&menu, pair), MakeResult::MenuMark);
+        assert_eq!(analyze(&menu), Analysis::MenuMark);
+        let mut r = Report::default();
+        r.add(0, &menu, make(&menu, pair));
+        assert_eq!((r.menu_mark, r.skipped()), (1, 1));
+        assert!(!r.has_problem(), "メニューの保存は問題に数えない");
         assert!(matches!(make(&damaged, pair), MakeResult::Failed(_)));
         assert!(matches!(
             make(&rep.join("missing.rpy"), pair),

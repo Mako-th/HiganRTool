@@ -201,7 +201,7 @@ impl Sim {
     }
 }
 
-/// 台本どおりの一時停止 2 回（開いた直後の下は効かず、再開と「タイトルへ戻る」の往復で再開 / 確かめの枠を一周して「いいえ」の決定 → 再開）。
+/// 台本どおりの一時停止 2 回（開いた直後の下は効かず、再開と「タイトルへ戻る」の往復で再開 / 確認の枠を一周して「いいえ」の決定 → 再開）。
 fn pause_plan(s: &mut Sim) {
     s.idle(40);
     s.open_pause();
@@ -257,7 +257,6 @@ fn status(r: &Report, check: &str) -> Status {
         .status
 }
 
-/// 壊れたら落ちる: 逆アセンブルの順の模型が出した台本どおりの記録が、全部の照らしを通らない（表・ゲート・リセット・閉じるまでの tick・求めた移り）。
 #[test]
 fn a_model_trace_of_the_planned_script_passes_every_check() {
     let t = full_trace().text();
@@ -284,7 +283,6 @@ fn a_model_trace_of_the_planned_script_passes_every_check() {
     }
 }
 
-/// 壊れたら落ちる: 表に無い移り（再開から確かめの「はい」へ飛ぶ）を見逃す。
 #[test]
 fn a_move_outside_the_table_fails() {
     let mut s = Sim::new();
@@ -304,7 +302,6 @@ fn a_move_outside_the_table_fails() {
     );
 }
 
-/// 壊れたら落ちる: 範囲の外の状態（STATES 以上）を見逃す。
 #[test]
 fn a_state_out_of_range_fails() {
     let mut t = full_trace().text();
@@ -326,7 +323,7 @@ fn a_state_out_of_range_fails() {
     );
 }
 
-/// 壊れたら落ちる: 読み始めの数え（`MENU_READ_FRAMES`）より前に入力が効いた移りを見逃す。実物が 4 でなく 2 から読む模型で起こす。
+/// 実物が 4 でなく 2 から読む模型で再現する。
 #[test]
 fn an_input_taken_before_the_read_frames_fails_the_gate() {
     let mut s = Sim::new();
@@ -357,7 +354,6 @@ fn an_input_taken_before_the_read_frames_fails_the_gate() {
     );
 }
 
-/// 壊れたら落ちる: 決定で数えがリセットされない（確かめの枠が出てすぐ読まれる）のを見逃す。
 #[test]
 fn a_decide_that_does_not_reset_the_frames_fails() {
     let mut s = Sim::new();
@@ -376,7 +372,7 @@ fn a_decide_that_does_not_reset_the_frames_fails() {
     );
 }
 
-/// 壊れたら落ちる: 確定から旗が下りるまでが 20 tick でない（長い・短い）のを見逃す。±1 は許す。
+/// ±1 tick は許す。
 #[test]
 fn the_close_delay_must_be_twenty_ticks() {
     for (frames, ok) in [(20, true), (19, true), (21, true), (30, false), (10, false)] {
@@ -396,8 +392,6 @@ fn the_close_delay_must_be_twenty_ticks() {
     }
 }
 
-/// 壊れたら落ちる: 閉じるところまで読めていない（旗が立ったまま終わる）のに、一時停止を求めた回を合格にする。求めていない回の「測れていない」で
-/// 終了コードを落とす（求めた検査だけで合否を決める）。
 #[test]
 fn an_unclosed_pause_is_not_measured_for_the_close_only_when_the_pause_was_asked_for() {
     let mut s = Sim::new();
@@ -420,7 +414,6 @@ fn an_unclosed_pause_is_not_measured_for_the_close_only_when_the_pause_was_asked
     );
 }
 
-/// 壊れたら落ちる: 求めていない区間の本物の不合格（表に無い移り）を黙って消す、または求めていない区間の不合格で求めたものの合否を決める。
 /// 結果は出すが数えず、同じ記録を一時停止を求めて読めば落ちる。
 #[test]
 fn a_failure_in_a_section_nobody_asked_for_is_shown_but_does_not_decide() {
@@ -452,8 +445,7 @@ fn a_failure_in_a_section_nobody_asked_for_is_shown_but_does_not_decide() {
     assert!(r.failed(), "{}", r.render());
 }
 
-/// 壊れたら落ちる: 開いた直後の下が効いた（読み始めの数えより前に入力を読んだ）のに、1 回目の移りの列が台本どおりだと言う。
-/// 効いた版は 1→2 の後に 2→1・1→2・2→3 と続いて列が変わる。効かなかった版は、下を押さない記録と同じ列になる。
+/// 効いたバージョンは 1→2 の後に 2→1・1→2・2→3 と続いて列が変わる。効かなかったバージョンは、下を押さない記録と同じ列になる。
 #[test]
 fn an_early_input_that_took_effect_changes_the_first_pause_moves() {
     let first = Expect {
@@ -508,7 +500,6 @@ fn an_early_input_that_took_effect_changes_the_first_pause_moves() {
     );
 }
 
-/// 壊れたら落ちる: 1 回目の区間が無い（開かなかった）のに「1 回目の移りが台本どおり」を通す。閉じる呼びの途中で読んだ 3→0 の行は列に混ぜない。
 #[test]
 fn the_first_pause_moves_need_an_episode_and_ignore_a_closing_race_row() {
     let first = Expect {
@@ -544,7 +535,6 @@ fn the_first_pause_moves_need_an_episode_and_ignore_a_closing_race_row() {
     );
 }
 
-/// 壊れたら落ちる: 終わりのメニューの決定（4・5・6）の後、閉じる呼びの途中で読んだ行（旗が立ったまま状態が 0）を表の外の移りとして落とす。
 #[test]
 fn a_closing_race_row_of_the_end_menu_is_not_a_failure() {
     for state in [4u32, 5, 6] {
@@ -577,7 +567,7 @@ fn a_closing_race_row_of_the_end_menu_is_not_a_failure() {
     }
 }
 
-/// 壊れたら落ちる: 求めた移りが 1 つ欠けても通る（台本の押しが届かなかったのを見逃す）。確かめの枠で「はい」へ行かない記録で起こす。
+/// 確認の枠で「はい」へ行かない記録で再現する。
 #[test]
 fn a_missing_required_move_fails_the_coverage_and_names_it() {
     // 2 回目の一時停止の「はい」の往復を省いた記録。
@@ -609,7 +599,6 @@ fn a_missing_required_move_fails_the_coverage_and_names_it() {
     assert!(!f.detail.contains("1→2"), "{}", f.detail);
 }
 
-/// 壊れたら落ちる: 終わりのメニューの上下が循環しない記録（下を 1 周しか通っていない）を、全部見えたことにする。
 #[test]
 fn the_end_menu_needs_both_cycles() {
     let mut s = Sim::new();
@@ -633,7 +622,6 @@ fn the_end_menu_needs_both_cycles() {
     assert!(!f.detail.contains("1→2"), "{}", f.detail);
 }
 
-/// 壊れたら落ちる: 区間が 1 つも無いのに「求めた」を通す（母数 0 の合格）。
 #[test]
 fn a_trace_without_any_menu_is_not_measured() {
     let mut s = Sim::new();
@@ -647,7 +635,6 @@ fn a_trace_without_any_menu_is_not_measured() {
     assert!(!r.not_all_passed(), "{}", r.render());
 }
 
-/// 壊れたら落ちる: 数えが tick より速く進む（1 tick に 2 回の更新）のを見逃す。
 #[test]
 fn frames_faster_than_ticks_fail() {
     let mut s = Sim::new();
@@ -671,7 +658,6 @@ fn frames_faster_than_ticks_fail() {
     );
 }
 
-/// 壊れたら落ちる: 最後の画面・カーソルが違う（戻り道が着いていない）のを通す。
 #[test]
 fn the_final_screen_must_match() {
     let mut s = full_trace();
@@ -682,7 +668,6 @@ fn the_final_screen_must_match() {
     assert_eq!(status(&r, "final_screen"), Status::Fail, "{}", r.render());
 }
 
-/// 壊れたら落ちる: 確かめの枠の「はい」（状態 4 → 8）からタイトルへ出るまでの閉じ方（旗が下りるまで 20 tick・状態 0）を見ない。
 #[test]
 fn leaving_by_the_confirm_box_closes_after_twenty_ticks_too() {
     let mut s = Sim::new();
@@ -719,7 +704,6 @@ fn leaving_by_the_confirm_box_closes_after_twenty_ticks_too() {
     );
 }
 
-/// 壊れたら落ちる: 閉じる呼びの途中で読んだ行（旗が立ったまま状態が 0）や、旗が立った直後の前の値が残る行を、表の外の移りとして落とす。
 #[test]
 fn a_race_row_while_closing_and_a_stale_first_row_are_not_failures() {
     let mut s = Sim::new();
@@ -753,7 +737,6 @@ fn a_race_row_while_closing_and_a_stale_first_row_are_not_failures() {
     );
 }
 
-/// 壊れたら落ちる: 読めない行（空の欄）を無視して合格にする。
 #[test]
 fn unreadable_rows_fail() {
     let t = full_trace().text();
@@ -765,7 +748,7 @@ fn unreadable_rows_fail() {
     assert_eq!(status(&r, "pause.readable"), Status::Fail, "{}", r.render());
 }
 
-/// 壊れたら落ちる: 見出しから照らすのに要る列が消える、見出しの欄の数とこの検査の模型の行の欄の数（25）がずれる。
+/// 見出しの欄の数とこの検査の模型の行の欄の数（25）がずれても落ちる。
 #[test]
 fn the_header_names_every_column_the_reader_needs() {
     let names: Vec<&str> = MENU_CSV_HEADER.split(',').collect();

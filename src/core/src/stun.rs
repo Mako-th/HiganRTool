@@ -1,6 +1,5 @@
 //! STUN の Binding だけ（RFC 5389 / RFC 8489）: Binding Request の組み立てと Binding Success Response の解析。
 //! 候補アドレスの選び方・STUN サーバー・ソケット・乱数は net の層の仕事（`link.rs` と同じ「セッションは持たない」流儀）。
-//!
 //! - 属性は付けない（MESSAGE-INTEGRITY / FINGERPRINT も送らない）。transaction id は呼び手が渡す（core は乱数を持たない）。
 //! - 解析は XOR-MAPPED-ADDRESS（0x0020）を優先し、無ければ MAPPED-ADDRESS（0x0001）。知らない属性は 4 バイト境界の
 //!   パディングごと読み飛ばす。MESSAGE-INTEGRITY / FINGERPRINT は検証しない。
@@ -8,7 +7,7 @@
 //!   2 か所の STUN の答えの比べ（`compare_mappings`・`Mapping`・`SecondProbe`）も持つ。
 //!   受信ソケットで HGRT と STUN を分けるのは `wire::classify`。
 //!
-//! 接続の手順でだけ呼ぶ想定だが、unsafe 禁止・パニックしうる添字と unwrap は置かない。
+//! 接続の手順でだけ呼ぶ想定だが、unsafe 禁止・パニックしうる添字と unwrap は使わない。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -357,7 +356,7 @@ impl Query {
 
 /// 待っている間の聞き直しの間隔（ms）。家庭用ルーターの UDP の対応づけの寿命は機種で違い、短いものは 30 秒前後と言われる
 /// （RFC 4787 §4.3 は 2 分以上を求めるが守らない機種がある）ので、その半分にした（ルーターごとの実際の寿命は測っていない）。
-/// マッチ中は聞かない（繋がったら止める）。外へ出るのは待っている間だけで、同じ STUN サーバーへ 20 B が 15 秒に 1 回。
+/// 接続したら止める（観戦を配っている間だけは続ける）。同じ STUN サーバーへ 20 B が 15 秒に 1 回。
 pub const KEEP_INTERVAL_MS: u32 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +461,11 @@ impl Keep {
 
     pub fn counts(&self) -> KeepCounts {
         self.counts
+    }
+
+    /// 直近の答えの外側のアドレス（まだ答えが無ければ作ったときの `mapped`）。
+    pub fn seen(&self) -> SocketAddr {
+        self.seen
     }
 }
 
@@ -1005,6 +1009,7 @@ mod tests {
             let n = encode_binding_success(txn, a, &mut out);
             out[..n].to_vec()
         };
+        assert_eq!(k.seen(), code, "答えの前はコードのアドレス");
         assert!(!k.due(1_000));
         assert!(!k.due(1_000 + KEEP_INTERVAL_MS - 1));
         assert!(k.due(1_000 + KEEP_INTERVAL_MS));
@@ -1036,6 +1041,7 @@ mod tests {
             k.on_datagram(&answer(TXN2, moved_port)),
             Some(Remap::PortOnly)
         );
+        assert_eq!(k.seen(), moved_port);
         let t3 = t2 + KEEP_INTERVAL_MS;
         k.send(t3, TXN1);
         assert_eq!(k.on_datagram(&answer(TXN1, moved_port)), Some(Remap::Same));
@@ -1052,7 +1058,9 @@ mod tests {
         );
         let t5 = t4 + KEEP_INTERVAL_MS;
         k.send(t5, TXN1);
+        assert_eq!(k.seen(), moved_addr);
         assert_eq!(k.on_datagram(&answer(TXN1, code)), Some(Remap::Address));
+        assert_eq!(k.seen(), code);
         let c = k.counts();
         assert_eq!((c.sent, c.answered), (5, 5));
         assert_eq!(

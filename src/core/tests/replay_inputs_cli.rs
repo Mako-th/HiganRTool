@@ -1,4 +1,4 @@
-//! 道具 `replay_inputs` を本物のプロセスで走らせる検査（合成のリプレイと合成の `_net_frames.csv` だけ）。
+//! ツール `replay_inputs` を本物のプロセスで走らせる検査（合成のリプレイと合成の `_net_frames.csv` だけ）。
 //! 「引数 → 読む → 出す → 終了コード」の配線と、出力ファイルを上書きしないことを見る。
 
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use higanr_core::replay_build::{BuildSpec, build_replay};
 
 const BIN: &str = env!("CARGO_BIN_EXE_replay_inputs");
 
-/// 検査ごとに別の一時ディレクトリ（終わったら消す）。
+/// 検査ごとに別の一時フォルダ（終わったら消す）。
 struct Tmp(PathBuf);
 
 impl Tmp {

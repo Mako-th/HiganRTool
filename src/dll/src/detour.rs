@@ -3,7 +3,7 @@
 //! 表の `Use::Detour` の行に `E9 rel32`（命令の全長が 5 バイトより長ければ残りは NOP）を書く。トランポリン（元の命令列 ＋ 戻りの `E9`）は
 //! 止める前に確保して書き、実行できる保護にしておく（止めている間はヒープも確保も使わない）。止める → EIP を全長で見る →
 //! 止めたまま全長を読み直す → 全長を書く → 再開する、の手順と 50 回の上限は call 先の差し替えと同じ（`hook::run_attempts`）。
-//! トランポリンのアドレスは JMP を書く前に入口の静的変数に置く。書いた後に読み返し、飛び先が入口と一致するかをログに書く。外す手順は作らない。
+//! トランポリンのアドレスは JMP を書く前に入口の静的変数に設定する。書いた後に読み返し、飛び先が入口と一致するかをログに書く。外す手順は作らない。
 //! バイトの組み立てと署名の照合は `higanr_core::patch`、Win32 は `DetourEnv` の向こう（本物は `hook_win::RealHook`）。
 #![forbid(unsafe_code)]
 
@@ -17,16 +17,16 @@ use crate::hook::{
 };
 use crate::sites::{SiteDef, Use, hex_bytes};
 
-/// inline detour が外から得るもの（`HookEnv` に、トランポリンの頁の確保・書き・実行できる保護・解放と、入口の静的変数を足したもの）。
+/// inline detour が外から得るもの（`HookEnv` に、トランポリンのページの確保・書き・実行できる保護・解放と、入口の静的変数を足したもの）。
 pub trait DetourEnv: HookEnv {
-    /// トランポリンの頁を `len` バイトぶん確保する（**止める前に**呼ぶ）。返すのは頁の先頭。確保できなければ `Err(GetLastError)`。
+    /// トランポリンのページを `len` バイトぶん確保する（**止める前に**呼ぶ）。返すのはページの先頭。確保できなければ `Err(GetLastError)`。
     fn alloc_trampoline(&mut self, len: usize) -> Result<u32, u32>;
     /// 確保したトランポリンに `bytes` を書き、実行できる保護にする。アドレスが決まってから戻りの `E9` の rel32 を作るので、
     /// `alloc_trampoline` の後に呼ぶ。
     fn write_and_seal_trampoline(&mut self, addr: u32, bytes: &[u8]) -> Result<(), u32>;
-    /// 確保したトランポリンの頁を返す（まだ誰も指していない頁だけ）。
+    /// 確保したトランポリンのページを返す（まだ誰も指していないページだけ）。
     fn free_trampoline(&mut self, addr: u32);
-    /// 入口がトランポリンへ飛ぶためのアドレスを置く（JMP を書く前に呼ぶ。0 の間はこの入口へ向く JMP は無い）。
+    /// 入口がトランポリンへ飛ぶためのアドレスを設定する（JMP を書く前に呼ぶ。0 の間はこの入口へ向く JMP は無い）。
     fn set_trampoline(&mut self, addr: u32);
     /// 差し替え先の入口。`HookEnv::entry_address` は call 先の差し替えの入口なので、別に持つ。
     fn detour_entry_address(&self) -> u32;
@@ -34,7 +34,7 @@ pub trait DetourEnv: HookEnv {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrampError {
-    /// 頁を確保できない（`GetLastError`）。
+    /// ページを確保できない（`GetLastError`）。
     Alloc(u32),
     /// 書けない・実行できる保護にできない（`GetLastError`）。
     Commit(u32),
@@ -46,7 +46,7 @@ pub enum DetourRefusal {
     NotDetourRow,
     /// 署名の照合（`check_site`）に落ちた（長さ不足・相対の分岐・禁止の範囲・境目の和）。
     Site(SiteError),
-    /// `E9 rel32` を置けない（全長が 5..=16 でない）。
+    /// `E9 rel32` を設定できない（全長が 5..=16 でない）。
     PatchShape,
     /// トランポリンが長すぎる（盗んだ命令 ＋ 5 が上限を越える）。
     TrampolineTooLong,
@@ -125,7 +125,7 @@ pub fn plan_detour(
     };
     patch::check_site(&site, forbidden).map_err(DetourRefusal::Site)?;
     let patch = patch::patch_bytes(&site, entry).ok_or(DetourRefusal::PatchShape)?;
-    // トランポリンの長さはアドレスに依らない（盗んだ長さ ＋ 5）ので、アドレス 0 で置けるかだけ先に見る。
+    // トランポリンの長さはアドレスに依らない（盗んだ長さ ＋ 5）ので、アドレス 0 で作れるかだけ先に見る。
     if patch::trampoline_bytes(&site, 0).is_none() {
         return Err(DetourRefusal::TrampolineTooLong);
     }
@@ -153,7 +153,7 @@ impl DetourReport {
     }
 }
 
-/// inline detour を 1 地点に設置する。条件（同定・image base・表・全地点の照合）は呼び出し側が先に確かめる。
+/// inline detour を 1 地点に設置する。条件（同定・image base・表・全地点の照合）は呼び出し側が先にチェックする。
 pub fn install_detour(
     env: &mut dyn DetourEnv,
     def: &SiteDef,
@@ -221,7 +221,7 @@ pub fn install_detour(
         }
         Tried::Aborted(a) => {
             report.outcome = DetourOutcome::Aborted(a);
-            // まだ誰も指していないトランポリンは返す（設置の JMP を書いていないので、この頁へは飛べない）。
+            // まだ誰も指していないトランポリンは返す（設置の JMP を書いていないので、このページへは飛べない）。
             env.free_trampoline(tramp_at);
         }
         Tried::GaveUp { last_eip } => {
@@ -235,7 +235,7 @@ pub fn install_detour(
 fn refusal_text(e: &DetourRefusal, expected: &[u8]) -> String {
     match e {
         DetourRefusal::NotDetourRow => "表の行が inline detour ではない".to_string(),
-        DetourRefusal::Site(s) => format!("署名の照合に落ちた（{s:?}）"),
+        DetourRefusal::Site(s) => format!("署名の照合に失敗した（{s:?}）"),
         DetourRefusal::PatchShape => {
             "全長が 5〜16 バイトでないので E9 rel32 を置けない".to_string()
         }
@@ -247,7 +247,7 @@ fn refusal_text(e: &DetourRefusal, expected: &[u8]) -> String {
             hex_bytes(expected)
         ),
         DetourRefusal::Trampoline(TrampError::Alloc(code)) => {
-            format!("トランポリンの頁を確保できない（GetLastError = {code}）")
+            format!("トランポリンのページを確保できない（GetLastError = {code}）")
         }
         DetourRefusal::Trampoline(TrampError::Commit(code)) => {
             format!("トランポリンに書けない・実行できる保護にできない（GetLastError = {code}）")
@@ -280,7 +280,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &DetourReport) {
     let _ = match (&r.plan, r.trampoline) {
         (Some(p), Some(t)) => writeln!(
             out,
-            "inline detour: 地点 {} 0x{:08X}（{}）に E9 で入口 0x{:08X} へ。トランポリン 0x{t:08X}（盗んだ {} バイト ＋ 戻り）",
+            "inline detour: フック地点 {} 0x{:08X}（{}）に E9 で入口 0x{:08X} へ向けました。トランポリン 0x{t:08X}（盗んだ {} バイト ＋ 戻り）",
             def.name,
             def.addr,
             def.use_label(),
@@ -289,7 +289,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &DetourReport) {
         ),
         _ => writeln!(
             out,
-            "inline detour: 地点 {} 0x{:08X}（{}）",
+            "inline detour: フック地点 {} 0x{:08X}（{}）",
             def.name,
             def.addr,
             def.use_label()
@@ -297,7 +297,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &DetourReport) {
     };
     let head = match &r.outcome {
         DetourOutcome::Refused(e) => format!(
-            "書かない（止める前に断った: {}）",
+            "書きません（止める前に断った: {}）",
             refusal_text(e, def.expected)
         ),
         DetourOutcome::Aborted(a) => abort_text(a, def.expected),
@@ -337,7 +337,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &DetourReport) {
                     ),
                 }
             }
-            None => writeln!(out, "読み返し: 読めない"),
+            None => writeln!(out, "読み返し: 読み取り不能"),
         };
     }
 }
@@ -465,7 +465,7 @@ mod tests {
     // ---- 手順（偽物） ----
 
     /// どの経路でも守ること: 止めた数と再開した数が同じ、開いたハンドルを全部閉じた、止めている間にヒープ・確保をしていない、
-    /// トランポリンのアドレスを JMP より前に置いた。
+    /// トランポリンのアドレスを JMP より前に設定した。
     fn assert_detour_balanced(f: &FakeHook, r: &DetourReport) {
         assert_eq!(f.suspends, f.resumes, "止めた数と再開した数");
         assert!(f.all_resumed(), "止めたままのスレッドがある");
@@ -609,5 +609,5 @@ mod tests {
         assert_eq!(f.tramp_released, vec![f.tramp_addr]);
         assert_detour_balanced(&f, &r);
     }
-    // 本物の Win32 で detour を付ける検査は `hook_win.rs` の tests に置く（`real_install_detour_redirects_through_draw_entry`）。
+    // 本物の Win32 で detour を付ける検査は `hook_win.rs` の tests にある（`real_install_detour_redirects_through_draw_entry`）。
 }

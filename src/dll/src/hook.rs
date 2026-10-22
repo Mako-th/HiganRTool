@@ -1,22 +1,8 @@
-//! 自分のプロセスのコードを書き換える手順（pure。unsafe 無し）: call 先の差し替え（1 地点）と、inline detour（`detour.rs`）が共に
-//! 使う「止める → EIP を見る → 止めたまま読み直す → 書く → 再開する」。Win32（スレッドの一覧・停止・EIP・コードの読み書き・時計）は
-//! `HookEnv` の向こうに置く（本物は `hook_win::RealHook`、検査では偽物）。ここは順番と判定だけを持つ。
+//! 自分のプロセスのコードを書き換える手順（pure。unsafe 無し）: call 先の差し替え（1 地点）と、inline detour（`detour.rs`）が共に使う「止める → EIP を見る → 止めたまま読み直す → 書く → 再開する」。
+//! Win32（スレッドの一覧・停止・EIP・コードの読み書き・時計）は `HookEnv` の向こう側にあり（本物は `hook_win::RealHook`、検査では偽物）、ここは順番と判定だけを持つ。
 //!
-//! call 先の差し替えの手順:
-//! 1. 止める前に: 表の行が `E8 rel32` の形で、rel32 から計算した飛び先が表の元の飛び先と一致するか。いまのバイト列が期待バイト列と
-//!    一致するか。一致したら元の飛び先・ウィンドウのアドレス・コピーの表・描画だけのフレームの出口（どれも入口が読む）を入口の静的変数に置く。
-//! 2. 試み（最大 `RETRY_LIMIT` 回。`run_attempts`。inline detour も同じ）: スレッドの一覧を取って開く（ヒープはここで使う）→
-//!    自分以外を全部止める → 各スレッドの EIP が書き換える命令の全長 `[addr, addr + 長さ)` に無いか（あれば全部再開して
-//!    `RETRY_WAIT_MS` 待って次の試み。EIP が取れないスレッドがあれば書かない）→ 止めたまま全長を読み直して期待と一致か →
-//!    書く（保護の変更・戻し・命令キャッシュは `HookEnv::write_code` の中）→ 全部再開。call 先の差し替えの全長は 5、書くのは
-//!    rel32 の 4 バイトだけ。
-//! 3. 再開の後に読み返し、飛び先が入口と一致するかを報告に入れる。
-//!
-//! 止めている間はヒープを使わない（止めたスレッドがヒープのロックを持っていると自分が止まる）。止めている間の経路は、固定長の配列
-//! （`CodeBytes`）と数だけで書き、`format!`・`Vec` の伸長・`unwrap`・範囲外になりうる添字を置かない。止めたスレッドの再開は
-//! `Stopped` の `Drop` に置き、パニックでも戻す。
-//!
-//! 全スレッドを止めて EIP を確かめてから書く作りは、MinHook など一般のフックの道具と同じ仕組みを参考にした（コードはコピーしていない）。
+//! 止めている間はヒープを使わない（止めたスレッドがヒープのロックを持っていると自分が止まる）。この間の経路は、固定長の配列（`CodeBytes`）と数だけで書き、`format!`・`Vec` の伸長・`unwrap`・範囲外になりうる添字を使わない。
+//! 止めたスレッドの再開は `Stopped` の `Drop` で行い、パニックでも戻す。全スレッドを止めて EIP をチェックしてから書く作りは、MinHook など一般のフックのツールと同じ仕組みを参考にした（コードはコピーしていない）。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -71,7 +57,7 @@ impl CodeBytes {
         self.len as usize
     }
 
-    // clippy の `len_without_is_empty` のため `len` と対で置く（検査でだけ使う読み取り）。
+    // clippy の `len_without_is_empty` のため `len` と対にして用意する（検査でだけ使う読み取り）。
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -118,19 +104,19 @@ pub trait HookEnv {
     /// 止めたスレッドの EIP。取れなければ `None`。
     fn eip(&mut self, t: ThreadRef) -> Option<u32>;
     /// 自分のプロセスのコード `[addr, addr + buf.len())` を `buf` に読む（ヒープを使わない）。
-    /// コミット済みで読める頁でなければ false（`buf` の中身は当てにしない）。
+    /// コミット済みで読めるページでなければ false（`buf` の中身は当てにしない）。
     fn read_code(&mut self, addr: u32, buf: &mut [u8]) -> bool;
-    /// コード `[addr, addr + bytes.len())` に書く: 頁の保護を一時的に書ける形にし、書き、保護を戻し、
+    /// コード `[addr, addr + bytes.len())` に書く: ページの保護を一時的に書ける形にし、書き、保護を戻し、
     /// 命令キャッシュを流す。保護を変えられなければ 1 バイトも書かずに `Err(GetLastError)`。
     fn write_code(&mut self, addr: u32, bytes: &[u8]) -> Result<WriteDone, u32>;
-    /// 入口が飛ぶ先（元の飛び先）を置く。rel32 を書く前に呼ぶ。
+    /// 入口が飛ぶ先（元の飛び先）を設定する。rel32 を書く前に呼ぶ。
     fn set_original_target(&mut self, target: u32);
-    /// 入口が tick ごとの記録で読むウィンドウのアドレスを置く（0 なら入口はウィンドウを読まない）。rel32 を書く前に呼ぶ。
+    /// 入口が tick ごとの記録で読むウィンドウのアドレスを設定する（0 なら入口はウィンドウを読まない）。rel32 を書く前に呼ぶ。
     fn set_window(&mut self, addr: u32);
-    /// 入口が枠の先頭の後ろへコピーする表を置く（0 行なら入口はコピーしない）。rel32 を書く前に呼ぶ。元が読めるかは
-    /// 呼び出し側（`session`）が先に確かめる。
+    /// 入口が枠の先頭の後ろへコピーする表を設定する（0 行なら入口はコピーしない）。rel32 を書く前に呼ぶ。元が読めるかは
+    /// 呼び出し側（`session`）が先にチェックする。
     fn set_copy_table(&mut self, rows: &[CopyRow]);
-    /// 描画だけのフレームの出口（花映塚では `0x00431259`）を置く（0 なら入口は分かれ道を通らない）。rel32 を書く前に呼ぶ。
+    /// 描画だけのフレームの出口（花映塚では `0x00431259`）を設定する（0 なら入口は分かれ道を通らない）。rel32 を書く前に呼ぶ。
     /// 呼び出し側が、14 地点の照合で `render_only_exit` 行が一致したときだけそのアドレスを渡す。
     fn set_render_only_exit(&mut self, addr: u32);
     fn entry_address(&self) -> u32;
@@ -404,7 +390,7 @@ fn attempt_while_stopped(s: &mut Stopped<'_>, rw: &Rewrite) -> Attempt {
     }
     let len = rw.expected.len();
     // SuspendThread は相手が本当に止まるのを待たずに戻る。GetThreadContext は相手が止まってから文脈を
-    // 返すので、全部のスレッドの EIP を読むことが「全部止まった」の確かめも兼ねる。
+    // 返すので、全部のスレッドの EIP を読むことが「全部止まった」のチェックも兼ねる。
     for (index, &t) in s.threads.iter().enumerate() {
         match s.env.eip(t) {
             None => return Attempt::Stop(Abort::EipUnavailable { index }),
@@ -429,7 +415,7 @@ fn attempt_while_stopped(s: &mut Stopped<'_>, rw: &Rewrite) -> Attempt {
     }
 }
 
-/// 止めて書く試みを最大 `RETRY_LIMIT` 回。止める前の確かめ（表の形・いまのバイト列・入口の静的変数）は
+/// 止めて書く試みを最大 `RETRY_LIMIT` 回。止める前のチェック（表の形・いまのバイト列・入口の静的変数）は
 /// 呼び出し側が済ませてから呼ぶ（call 先の差し替えと inline detour で共通）。数えは `tries` に足す。
 pub fn run_attempts(env: &mut dyn HookEnv, rw: &Rewrite, tries: &mut Tries) -> Tried {
     let mut last_eip = 0;
@@ -454,8 +440,8 @@ pub fn run_attempts(env: &mut dyn HookEnv, rw: &Rewrite, tries: &mut Tries) -> T
                     env.sleep_ms(RETRY_WAIT_MS);
                 }
             }
-            // 止められない・文脈が読めないスレッドは、一覧を取った後に終わったスレッドのことがある（実機の回で、18 本のうち 17 本目を
-            // 止められず crt_free の detour が書けなかった）。止めた分は再開してあるので、一覧を取り直して試し直す（最後の試みでも同じなら諦める）。
+            // 止められない・文脈が読めないスレッドは、一覧を取った後に終わったスレッドのことがある。
+            // 止めた分は再開してあるので、一覧を取り直して試し直す（最後の試みでも同じなら諦める）。
             Attempt::Stop(Abort::SuspendFailed { .. } | Abort::EipUnavailable { .. })
                 if attempt < RETRY_LIMIT =>
             {
@@ -468,9 +454,9 @@ pub fn run_attempts(env: &mut dyn HookEnv, rw: &Rewrite, tries: &mut Tries) -> T
     Tried::GaveUp { last_eip }
 }
 
-/// call 先の差し替えを 1 地点に設置する。条件（同定・image base・表・全地点の照合）は呼び出し側が先に確かめる
+/// call 先の差し替えを 1 地点に設置する。条件（同定・image base・表・全地点の照合）は呼び出し側が先にチェックする
 /// （`session::ready_to_install`）。`window` は入口が tick ごとの記録で読むウィンドウのアドレス、`copies` は入口が枠へコピーする表、
-/// `render_only_exit` は描画だけのフレームの出口（0 なら分かれ道を通らない）で、どれも元の飛び先と一緒に rel32 を書く前に置く。
+/// `render_only_exit` は描画だけのフレームの出口（0 なら分かれ道を通らない）で、どれも元の飛び先と一緒に rel32 を書く前に設定する。
 pub fn install_call_hook(
     env: &mut dyn HookEnv,
     def: &SiteDef,
@@ -479,8 +465,8 @@ pub fn install_call_hook(
     render_only_exit: u32,
 ) -> InstallReport {
     let entry = env.entry_address();
-    // 元の飛び先・ウィンドウのアドレス・コピーの表・出口は、この入口へ向く call を書くより前に置く
-    // （置く前に入口へ来ると、0 アドレスへ飛ぶ・前のウィンドウを読む・前の表でコピーする・前の出口へ戻る）。
+    // 元の飛び先・ウィンドウのアドレス・コピーの表・出口は、この入口へ向く call を書くより前に設定する
+    // （設定する前に入口へ来ると、0 アドレスへ飛ぶ・前のウィンドウを読む・前の表でコピーする・前の出口へ戻る）。
     install_call_hook_at(env, def, entry, &mut |e, original| {
         e.set_original_target(original);
         e.set_window(window);
@@ -490,7 +476,7 @@ pub fn install_call_hook(
 }
 
 /// 開始のフック（`0x0041AB2B`）を設置する。手順は `install_call_hook` と同じで、差し替え先は `HookEnv::match_entry_address`、
-/// 書く前に置くのは元の飛び先だけ。
+/// 書く前に設定するのは元の飛び先だけ。
 pub fn install_match_hook(env: &mut dyn HookEnv, def: &SiteDef) -> InstallReport {
     let entry = env.match_entry_address();
     install_call_hook_at(env, def, entry, &mut |e, original| {
@@ -499,7 +485,7 @@ pub fn install_match_hook(env: &mut dyn HookEnv, def: &SiteDef) -> InstallReport
 }
 
 /// call 先の差し替えを 1 地点に設置する共通の手順。`prepare` は止める前・書く前に、入口が読む静的変数（少なくとも
-/// 元の飛び先）を置く。
+/// 元の飛び先）を設定する。
 pub fn install_call_hook_at(
     env: &mut dyn HookEnv,
     def: &SiteDef,
@@ -529,7 +515,7 @@ pub fn install_call_hook_at(
         report.outcome = Outcome::Refused(Refusal::Mismatch(CodeBytes::from(now)));
         return report;
     }
-    // 入口が読む静的変数は、この入口へ向く call を書くより前の、止める前に置く（止めている間の手順を増やさない）。
+    // 入口が読む静的変数は、この入口へ向く call を書くより前の、止める前に設定する（止めている間の手順を増やさない）。
     prepare(env, plan.original_target);
 
     let tried = run_attempts(env, &plan.rewrite(), &mut report.tries);
@@ -561,40 +547,40 @@ fn plan_error_text(e: &PlanError) -> String {
 pub fn abort_text(a: &Abort, expected: &[u8]) -> String {
     match a {
         Abort::ListFailed(code) => {
-            format!("書かない（スレッドの一覧が取れない。GetLastError = {code}）")
+            format!("書きません（スレッドの一覧が取れない。GetLastError = {code}）")
         }
         Abort::SuspendFailed { index } => format!(
-            "書かない（{} 本目のスレッドを止められない。止めた分は再開した）",
+            "書きません（{} 本目のスレッドを止められない。止めた分は再開した）",
             index + 1
         ),
         Abort::EipUnavailable { index } => format!(
-            "書かない（{} 本目のスレッドの EIP が取れない。全部再開した）",
+            "書きません（{} 本目のスレッドの EIP が取れない。全部再開した）",
             index + 1
         ),
         Abort::RereadUnreadable => {
-            "書かない（止めた後の読み直しが読めない。全部再開した）".to_string()
+            "書きません（止めた後の読み直しが読めない。全部再開した）".to_string()
         }
         Abort::RereadMismatch(now) => format!(
-            "書かない（止めた後の読み直し {} が期待 {} と違う。全部再開した）",
+            "書きません（止めた後の読み直し {} が期待 {} と違う。全部再開した）",
             hex_bytes(now.as_slice()),
             hex_bytes(expected)
         ),
         Abort::WriteFailed(code) => {
-            format!("書かない（頁の保護を変えられない。GetLastError = {code}。全部再開した）")
+            format!("書きません（ページの保護を変えられない。GetLastError = {code}。全部再開した）")
         }
     }
 }
 
 pub fn gave_up_text(last_eip: u32) -> String {
     format!(
-        "書かない（{RETRY_LIMIT} 回とも EIP が書き換える範囲にあった。最後の EIP = 0x{last_eip:08X}）"
+        "書きません（{RETRY_LIMIT} 回とも EIP が書き換える範囲にあった。最後の EIP = 0x{last_eip:08X}）"
     )
 }
 
 /// 書いたときの文。`what` は書いた中身の説明。
 pub fn written_text(done: &WriteDone, what: &str) -> String {
     format!(
-        "書いた（{what}。保護の戻し = {}、命令キャッシュ = {}）",
+        "書きました（{what}。保護の戻し = {}、命令キャッシュ = {}）",
         if done.protect_restored {
             "できた"
         } else {
@@ -641,7 +627,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &InstallReport) {
     let _ = match &r.plan {
         Some(p) => writeln!(
             out,
-            "フックの設置: 地点 {} 0x{:08X}（{}）の call の飛び先を 0x{:08X} から入口 0x{:08X} へ",
+            "フックの設置: フック地点 {} 0x{:08X}（{}）の call の飛び先を 0x{:08X} から入口 0x{:08X} へ向けました。",
             def.name,
             def.addr,
             def.use_label(),
@@ -650,7 +636,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &InstallReport) {
         ),
         None => writeln!(
             out,
-            "フックの設置: 地点 {} 0x{:08X}（{}）",
+            "フックの設置: フック地点 {} 0x{:08X}（{}）",
             def.name,
             def.addr,
             def.use_label()
@@ -658,13 +644,13 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &InstallReport) {
     };
     let head = match &r.outcome {
         Outcome::Refused(Refusal::Plan(e)) => {
-            format!("書かない（止める前に断った: {}）", plan_error_text(e))
+            format!("書きません（止める前に断った: {}）", plan_error_text(e))
         }
         Outcome::Refused(Refusal::Unreadable) => {
-            "書かない（止める前に断った: いまの 5 バイトが読めない）".to_string()
+            "書きません（止める前に断った: いまの 5 バイトが読めない）".to_string()
         }
         Outcome::Refused(Refusal::Mismatch(now)) => format!(
-            "書かない（止める前に断った: いまの 5 バイト {} が期待 {} と違う）",
+            "書きません（止める前に断った: いまの 5 バイト {} が期待 {} と違う）",
             hex_bytes(now.as_slice()),
             hex_bytes(def.expected)
         ),
@@ -676,7 +662,7 @@ fn write_report_all(out: &mut dyn Write, def: &SiteDef, r: &InstallReport) {
     let _ = writeln!(out, "{}", tries_line("フックの設置", &r.tries));
     if let (Outcome::Written(_), Some(p)) = (r.outcome, &r.plan) {
         let _ = match r.readback {
-            None => writeln!(out, "読み返し: 読めない"),
+            None => writeln!(out, "読み返し: 読み取り不能"),
             Some(back) => {
                 let target = back.head5().and_then(|b| patch::call_target(p.addr, &b));
                 let verdict = if target == Some(p.entry) {
@@ -753,7 +739,7 @@ pub(crate) mod tests {
         /// 2 つ目のウィンドウ。call 先の差し替えと inline detour を 1 回の実行で両方書く検査用。
         pub mem2_base: u32,
         pub mem2: [u8; 16],
-        /// 3 つ目のウィンドウ。開始のフックを同じ実行で書く検査用。ここへの 4 バイトの書きは、元の飛び先（`set_match`）を置いた後でなければならない。
+        /// 3 つ目のウィンドウ。開始のフックを同じ実行で書く検査用。ここへの 4 バイトの書きは、元の飛び先（`set_match`）を設定した後でなければならない。
         pub mem3_base: u32,
         pub mem3: [u8; 16],
         pub match_entry: u32,
@@ -781,7 +767,7 @@ pub(crate) mod tests {
         pub set_window: Option<u32>,
         pub set_copies: Option<Vec<CopyRow>>,
         pub set_exit: Option<u32>,
-        /// 入口の静的変数を置く前に書いた回数（手順の順の誤り）。
+        /// 入口の静的変数を設定する前に書いた回数（手順の順の誤り）。
         pub writes_before_setup: u32,
         pub tramp_addr: u32,
         pub tramp_alloc_fail: Option<u32>,
@@ -881,7 +867,7 @@ pub(crate) mod tests {
             None
         }
 
-        /// 書く前に置くべき入口の静的変数が置かれているか（`bytes_len` が 4 なら call 先の差し替え、5 以上なら inline detour。3 つ目のウィンドウは開始のフック）。
+        /// 書く前に設定すべき入口の静的変数が設定されているか（`bytes_len` が 4 なら call 先の差し替え、5 以上なら inline detour。3 つ目のウィンドウは開始のフック）。
         fn setup_done(&self, addr: u32, bytes_len: usize) -> bool {
             if self.mem3_base != 0 && addr.wrapping_sub(self.mem3_base) < 16 {
                 self.set_match.is_some()
@@ -1148,7 +1134,7 @@ pub(crate) mod tests {
         assert_balanced(&f, &r);
         let log = log_of(&def, &r);
         assert!(
-            log.contains("フックの設置: 書いた（rel32 の 4 バイト。保護の戻し = できた、命令キャッシュ = 流した）"),
+            log.contains("フックの設置: 書きました（rel32 の 4 バイト。保護の戻し = できた、命令キャッシュ = 流した）"),
             "{log}"
         );
         assert!(
@@ -1242,7 +1228,7 @@ pub(crate) mod tests {
         assert_eq!(f.mem[..5], *def.expected);
         assert_balanced(&f, &r);
         assert!(log_of(&def, &r).contains(&format!(
-            "書かない（50 回とも EIP が書き換える範囲にあった。最後の EIP = 0x{SITE_ADDR:08X}）"
+            "書きません（50 回とも EIP が書き換える範囲にあった。最後の EIP = 0x{SITE_ADDR:08X}）"
         )));
     }
 
@@ -1262,7 +1248,7 @@ pub(crate) mod tests {
         assert_balanced(&f, &r);
         assert!(
             log_of(&def, &r)
-                .contains("書かない（3 本目のスレッドの EIP が取れない。全部再開した）")
+                .contains("書きません（3 本目のスレッドの EIP が取れない。全部再開した）")
         );
     }
 
@@ -1281,7 +1267,7 @@ pub(crate) mod tests {
         assert_eq!(f.mem[..5], other);
         assert_balanced(&f, &r);
         assert!(log_of(&def, &r).contains(&format!(
-            "書かない（止めた後の読み直し {} が期待 {} と違う。全部再開した）",
+            "書きません（止めた後の読み直し {} が期待 {} と違う。全部再開した）",
             hex_bytes(&other),
             hex_bytes(def.expected)
         )));

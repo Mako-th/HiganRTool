@@ -1,30 +1,9 @@
-//! 入力の地点（`0x0043112D` の入口）の判断（pure。unsafe 無し）: 繋がりのセッション（`higanr_core::link`）を持ち、tick ごとに
-//! 「lockstep の外か / 3 本とも 0 を feed するか / lockstep のフレームを feed するか / 描画だけのフレームにするか」を決める。
-//! ゲームのメモリとゲームの関数は `Game` の向こう、ソケット・時計・待ちは `Net` の向こうに置く（本物は `net_udp::GameNet`、検査では偽物）。
+//! 入力の地点（`0x0043112D` の入口）の判断（pure。unsafe 無し）: 接続のセッション（`higanr_core::link`）を持ち、tick ごとに「lockstep の外か / 3 本とも 0 を feed するか / lockstep のフレームを feed するか / 描画だけのフレームにするか」を決める。
+//! ゲームのメモリとゲームの関数は `Game` の向こう、ソケット・時計・待ちは `Net` の向こう側にある（本物は `net_udp::GameNet`、検査では偽物）。
 //!
-//! 1 tick の流れ（`NetPlay::on_input`）:
-//! 1. リングを空にしてセッションへ渡し、セッションの `poll` を呼ぶ。終わりの印（接続の失敗・CHECK のズレ・相手の BYE・相手の沈黙）を見る。相手の BYE(終了) だけは、
-//!    マッチの中なら届いた入力ワードを使い切り、待ちの予算が切れたときかマッチの場面を出るときにやめる（相手の最後の入力ワードは BYE より先に届く）。
-//! 2. `phase` ごと:
-//!    - Unconnected / Ended: `Local`（いつもの poll_all か台本）。
-//!    - Selecting: 「今の場面 1 かつ次の要求 2」（マップが決まった）を見たら Holding へ。選択の画面（人対人の Match の 7・8・16）なら `menu_tick`
-//!      （`net_select.rs`）: 自分の入力ワードを自分の席に、相手の入力ワードを相手の席に、合成（3 本目）へは OR で feed し、画面を移る押下はホストが順番を決めてから
-//!      両者のゲームへ入れる。それ以外は `Local`。
-//!      `Config::require_net_selection` でネットワークの選択を通っていない場面 2 はデモ・リプレイの再生などなので `Local`。
-//!    - Holding（止める地点）: 3 本とも 0 を feed。自分の SELECT を置き、両者の SELECT が揃うまで `RenderOnly`（待ちが `peer_wait::LIMIT_MS`
-//!      続いたら BYE(切断) で閉じる）。揃ったら値をゲームへ書き、LOADING へ。
-//!    - Loading: 3 本とも 0 を feed して `Zero`。開始のフック（`on_match_start`）で Lockstep へ。
-//!    - Lockstep: 次の要求が 3 / 10 / 11 / 12 / 13（再戦ほか）なら 0 を feed して LOADING へ。1 / 6 / 7 / 9（マッチを出る）なら Selecting へ。ただし 6
-//!      （「リプレイを保存して終了」）は接続を終え（`close(Finished)`）、保存の画面を飛ばす印を頼む（`take_save_quit`）。それ以外は、取っていなければ
-//!      ローカル入力を 1 回取ってすぐ送り、相手の入力ワードを予算まで待つ。揃えば 3 本を feed して `Played`、揃わなければ `RenderOnly`（次の tick で同じフレームをやり直す）。
-//! 3. 相手を待つ tick（描画だけのフレーム・止める地点・選択の画面で相手が黙っている間）が続いたら画面に知らせ、Esc か 60 秒で閉じる（`peer_wait`）。
-//!
-//! latency の切替: ホストは `Config::lat_plan` の予定どおり、使ったフレームの数が `at` に達した後の最初の取得の前に `request_delay` する
-//! （`Busy` なら次のフレームで出し直す）。`FrameTiming` の余裕は、相手の入力ワードがそれより前の入力ワードと途切れなく揃った時刻（受信スレッドが受けた時刻）から、
-//! そのフレームを使うまで。seg は、最初のマッチは繋がったときの seg 0 を使い、以後、マッチが始まった seg を出るとき 1 回だけ `begin_seg(seg + 1)`。
-//!
-//! `on_input`・`tend`・`dispatch`・`head_wait`（`pacing_win` から毎フレーム）・`on_match_start` はゲームスレッドで走るので、
-//! 確保・ブロッキング I/O・ロック待ち・パニックしうる添字と unwrap を置かない。
+//! 1 tick の流れ（`NetPlay::on_input`）: (1) リングを空にしてセッションへ渡し、セッションの `poll` を呼んで終わりの印（接続の失敗・CHECK のズレ・相手の BYE・相手の沈黙）を見る。相手の BYE(終了) だけは、マッチの中なら届いた入力ワードを使い切り、待ちの予算が切れたときかマッチの場面を出るときにやめる（相手の最後の入力ワードは BYE より先に届く）。
+//! (2) `phase`（Unconnected / Ended / Selecting / Holding / Loading / Lockstep）ごとの動き。(3) 相手を待つ tick（描画だけのフレーム・止める地点・選択の画面で相手が黙っている間）が続いたら画面に知らせ、Esc か 60 秒で閉じる（`peer_wait`）。
+//! `on_input`・`tend`・`dispatch`・`head_wait`（`pacing_win` から毎フレーム）・`on_match_start` はゲームスレッドで走るので、確保・ブロッキング I/O・ロック待ち・パニックしうる添字と unwrap を使わない。
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -35,11 +14,12 @@ use higanr_core::auth::Secret;
 use higanr_core::candidate::Candidates;
 use higanr_core::check::{
     CheckResult, CheckRule, INPUT_DIGEST_INIT, check_from_input_digest, input_digest_push,
-    is_check_frame,
+    is_check_frame, is_watch_check_frame,
 };
 use higanr_core::code::DEFAULT_TTL_SECS;
 use higanr_core::delay_pick::{self, DelayChoice, DelayPick};
 use higanr_core::handshake::{self, FailReason, ModeWish, Restart};
+use higanr_core::host_pick::{Basis, PickNote};
 use higanr_core::input_model::keys::ESC;
 use higanr_core::input_model::{InputState, MATCH_SEND_MASK};
 use higanr_core::link::{self, Connected, FormatSwitch, Link, Outlet, Recv, SelExit};
@@ -57,7 +37,8 @@ use higanr_core::return_flow::{PlayView, Why};
 use higanr_core::seat_pick::SeatAsk;
 use higanr_core::selection::{Agreed, Press};
 use higanr_core::wire::{
-    ByeReason, Check, FormatValue, MAX_DATAGRAM, Mode, Record, Seat, Select, Step, StepKind,
+    ByeReason, Check, CheckKind, FormatValue, MAX_DATAGRAM, Mode, Record, Seat, Select, Step,
+    StepKind,
 };
 
 use crate::digit_keys::{self, DigitEdge};
@@ -71,7 +52,7 @@ pub const SCENE_MATCH: u32 = 2;
 /// 場面 2 を作り直す次の要求（表 `0x004314B8`。「再戦」は 10）。
 pub const REQ_REBUILD_MATCH: [u32; 5] = [3, 10, 11, 12, 13];
 pub const REQ_LEAVE_MATCH: [u32; 4] = [1, 6, 7, 9];
-/// マッチの終わりのメニューの「リプレイを保存して終了」が置く次の要求（`0x00435A40 movl $0x6,0x4b3690`。「キャラを変更」は `0x00435A08` の 1、
+/// マッチの終わりのメニューの「リプレイを保存して終了」が書く次の要求（`0x00435A40 movl $0x6,0x4b3690`。「キャラを変更」は `0x00435A08` の 1、
 /// 「再戦」は `0x00435A24` の 10）。
 pub const REQ_SAVE_AND_QUIT: u32 = 6;
 const _: () = assert!(
@@ -80,64 +61,96 @@ const _: () = assert!(
 );
 /// 相手の入力ワードを待つ予算（µs）。1 フレーム（16 ms）。
 pub const WAIT_BUDGET_US: u32 = 16_000;
-/// フレームの始まり（自分の入力を読む前）で相手の入力ワードを待つ上限（µs。ini の `[netplay] head_wait = 1` の既定。`NetPlay::head_wait`）。
-/// 2 台の 60 Hz の格子の位相の差（最大 16.7 ms）の分だけ、先に進む側が毎フレーム入力の地点の後で相手の入力ワードを待っていた（実測: ゲストの
-/// 「入力 → Present の前」の p50 が 8,058 / 14,104 / 7,649 µs）。始まりで待てば入力の読みがその分後ろへ寄る。入力の地点の予算と同じにしたのは、
-/// 位相の差が約 13.4 ms の実機で上限 10 ms だと残りの約 3.1 ms を入力の後で待ったから。始まりで待った分は入力の地点の予算から引くので、待ちの合計の
-/// 最大は `WAIT_BUDGET_US` のまま。遅延の増分: 待った tick の Present は約 0.2 ms 後ろへずれる。待たない側は 0。ウィンドウ（b-spin / b）の格子の後と、
-/// 全画面でゲームがその回にフレームを始める見込みのときだけ待つ（`pacing_win::pace_head`）。
+/// フレームの始まり（自分の入力を読む前）で相手の入力ワードを待つ上限（µs。ini の `[netplay] head_wait = 1` の既定。`NetPlay::head_wait`）。2 台の 60 Hz の格子の位相の差（最大 16.7 ms）の分だけ、先に進む側が毎フレーム入力の地点の後で相手の入力ワードを待っていた。始まりで待てば入力の読みがその分後ろへ寄る。
+/// 入力の地点の予算と同じにしたのは、位相の差が約 13.4 ms の実機で上限 10 ms だと残りの約 3.1 ms を入力の後で待ったから。始まりで待った分は入力の地点の予算から引くので、待ちの合計の最大は `WAIT_BUDGET_US` のまま。
+/// 遅延の増分: 待った tick の Present は約 0.2 ms 後ろへずれる。待たない側は 0。ウィンドウ（b-spin / b）の格子の後と、フルスクリーンでゲームがその回にフレームを始める見込みのときだけ待つ（`pacing_win::pace_head`）。
 pub const HEAD_WAIT_CAP_US: u32 = WAIT_BUDGET_US;
 /// 届いた押下を持ち越し続けてよいフレームの数（10 秒）。入る演出は 8〜9 tick なので、これを越えて持ち越すのは両者の画面が
-/// 分かれたとき（手順の外）。越えたら BYE(中止) でやめる。
+/// 分かれたとき（手順の外）。越えたら自分から相手へ BYE(中止) を出してやめる。
 pub const MENU_HOLD_LIMIT: u32 = 600;
 pub const STEP_LOG_LEN: usize = 32;
 /// 自分の押下（画面を移る押下）が入らずに捨てられたとき、押し直してよい tick の数（1 秒）。キャラの画面で両者がほぼ同時に決定を押すと、
 /// ホストの決定が step 1 を取り、ゲストの要求は step の食い違いで捨てられる（`selection.rs`）。ゲームも同じ tick の両席の決定を両方読む
 /// （`0x00428D40` / `0x00428E0B`）ので、捨てられた押下は同じ画面のまま・ゲームがその押下を読む状態のときだけ押し直す。
-/// 1 秒は、人が「入らなかった」と見て押し直すまでの間より短く、ネットワークの 1 往復より長い値として置いた（測っていない）。
+/// 1 秒は、人が「入らなかった」と見て押し直すまでの間より短く、ネットワークの 1 往復より長い値として決めた（測っていない）。
 pub const MENU_RETRY_TICKS: u32 = 60;
 /// 接続の手順を作り直して待ち続ける長さ（ms。`Link::set_retry_window`）。接続コードの期限 `code::DEFAULT_TTL_SECS`（30 分）と同じ:
 /// dll は自分のコードをネットワークを開くときに作るので、コードが使える間は待つ。
 pub const HANDSHAKE_RETRY_MS: u32 = (DEFAULT_TTL_SECS * 1000) as u32;
 const _: () = assert!(DEFAULT_TTL_SECS * 1000 <= u32::MAX as u64);
-/// ネットワークが終わってからネットワークの組を片づけてよくなるまで（ms。`NetPlay::relink_due`）。片づけるとセッションが消えて、落ちた BYE を相手の PING（1 秒ごと）への
-/// 返しで届け直せなくなるので、PING 2 回ぶんはセッションを残す（残さないと、BYE が落ちた相手は 60 秒の沈黙を待って終わる）。待つのはマッチの外だけ。
+/// ネットワークが終わってからネットワークの組を片づけてよくなるまで（ms。`NetPlay::relink_due`）。片づけるとセッションが消えて、落ちた自分の BYE を相手の PING（1 秒ごと）への
+/// 返信で届け直せなくなるので、PING 2 回ぶんはセッションを残す（残さないと、BYE が落ちた相手は 60 秒の沈黙を待って終わる）。待つのはマッチの外だけ。
 pub const RELINK_GRACE_MS: u32 = 2_000;
 
-/// `LinkSlot` に置く 1 組: セッションの設定と、名乗る形の上書き（None なら `Config::mode_wish` のまま）と、席の希望と先にいたかの名乗り
+/// `LinkSlot` に渡す 1 組: セッションの設定と、名乗る形の上書き（None なら `Config::mode_wish` のまま）と、席の希望と先にいたかの名乗り
 /// （None ならセッションの設定の `host_seat` を希望として名乗り、先かどうかは名乗らない —— `SeatAsk::plain`）。
 type Offered = (link::Config, Option<ModeWish>, Option<SeatAsk>);
 
-/// 接続コードの受け渡し（ini の `code_side`。`net_code`）で、見張りのスレッドが作った繋がりのセッションの設定をゲームのスレッドへ渡す経路。
-/// 繋がりのセッションには作った後に相手の候補を足す手段が無いので、始める側（offer）は返す側のコードが読めるまでセッションを作らず、受信ソケットだけを開いておく
+/// 接続コードの受け渡し（ini の `code_side`。`net_code`）で、見張りのスレッドが作った接続のセッションの設定をゲームのスレッドへ渡す経路。
+/// 接続のセッションには作った後に相手の候補を足す手段が無いので、始める側（offer）は返す側のコードが読めるまでセッションを作らず、受信ソケットだけを開いておく
 /// （届いたものは捨てる）。返す側（answer）は始める側のコードが読めてからセッションを作る。ゲームのスレッドはファイルに触らず、ここの原子変数と
 /// `Mutex::try_lock`（取れなければ次の tick）しか見ない。見張りが新しいコードを読むたびに `offer` で設定を置き換え（世代を 1 進める）、
-/// ゲームのスレッドは繋がる前なら新しい世代でセッションを作り直す。繋がった後・終えた後は置き換えない。
+/// ゲームのスレッドは接続する前なら新しい世代でセッションを作り直す。接続した後・終えた後は置き換えない。
 #[derive(Debug, Default)]
 pub struct LinkSlot {
     stamp: AtomicU32,
     cfg: Mutex<(u32, Option<Offered>)>,
-    /// ゲームのスレッドが繋がったのを見た（見張りは `my_code.txt` を消して終える）。
+    /// ゲームのスレッドが接続したのを見た（見張りは `my_code.txt` を消して終える）。
     connected: AtomicBool,
     seat: AtomicU8,
-    /// 繋がったときに AGREE で決まった形（0 = 未定。それ以外は `(モード + 1) << 8 | D`）。`connected` より先に書く。
+    /// 接続したときに AGREE で決まった形（0 = 未定。それ以外は `(モード + 1) << 8 | D`）。`connected` より先に書く。
     shape: AtomicU32,
-    /// 繋がったときのマッチの役（0 = 未定、1 = ホスト、2 = ゲスト）。`connected` より先に書く。観戦の配る側（`spectate_offer`）を
-    /// 起こすかを見張りが決めるのに使う。
+    /// 接続したときのマッチの役（0 = 未定、1 = ホスト、2 = ゲスト）。`connected` より先に書く。観戦者へ試合の記録を配る側（`spectate_offer`）を
+    /// 開始するかを見張りが決めるのに使う。
     host_role: AtomicU8,
-    /// HELLO で「一覧に載せてよい」を名乗るか（自分の `[spectate] enable = 1`）。見張りがセッションの設定を置く前に書き、ゲームのスレッドが
+    /// HELLO で観戦の許可を名乗るか（自分の `[spectate] enable = 1`）。見張りがセッションの設定を登録する前に書き、ゲームのスレッドが
     /// セッションを作るときに読む。
     list_wish: AtomicBool,
-    /// 繋がったときの `Established::may_list`（0 = 未定、1 = 両者が載せてよい、2 = どちらかが断った）。`connected` より先に書く。
+    /// 接続したときの `Established::may_list`（0 = 未定、1 = 2 人とも観戦を許可、2 = どちらかが許可していない）。`connected` より先に書く。
+    /// どの入口でも、これが 1 のときだけ観戦の受付を作る（ランダムマッチの一覧・観戦用のルーム・観戦コード・LAN の観戦）。
     may_list: AtomicU8,
     done: AtomicBool,
     gave_up: AtomicBool,
-    /// つなぐ前に決めた遅延（メニューの「対戦の遅延」か ini の `auto`。0 = 決めていない、それ以外は 1 + `DelayChoice::raw`）。
-    /// 見張りがセッションの設定を置くときに書き、ゲームのスレッドが繋がった tick に `DelayPick::set_start` へ渡す（ホストの初めの値になる）。
+    /// 接続する前に決めた遅延（メニューの「対戦の遅延」か ini の `auto`。0 = 決めていない、それ以外は 1 + `DelayChoice::raw`）。
+    /// 見張りがセッションの設定を登録するときに書き、ゲームのスレッドが接続した tick に `DelayPick::set_start` へ渡す（ホストの初めの値になる）。
     start: AtomicU32,
     /// 相手のコードの回線の型の印（0 = まだ読んでいない、それ以外は 0x80 | 印の 1 B）。見張りが相手のコードを読んだときに書き、
     /// ゲームのスレッドが「つながらない」の文を選ぶのに読む。
     peer_nat: AtomicU8,
+    /// ホストの決め方を使うか（0 = 使わない、それ以外は 0x80 | 自分の回線の型の印の 1 B）。見張りが `offer_with_seat` の前に書き、
+    /// ゲームのスレッドがセッションを作るときに読む。
+    host_pick: AtomicU8,
+    /// 接続したときの `Established::pick`（見張りが本ログに 1 行書く）。`connected` より先に書く。`pick_flags` の 0 は未定。
+    pick_flags: AtomicU32,
+    pick_own_up: AtomicU32,
+    pick_peer_up: AtomicU32,
+}
+
+/// `LinkSlot::pick_flags` の並び: bit31 = 書いた、bit0 = 両者が決め方を使った、bit1〜2 = 決め手、bit8〜15 = 自分の回線の型、bit16〜23 = 相手の回線の型。
+const PICK_SET: u32 = 1 << 31;
+
+/// 回線の型の印を原子変数の 1 B に詰める（0 = 無い、それ以外は 0x80 | 印の 1 B）。
+fn nat_to_slot(m: Option<NatMark>) -> u8 {
+    m.map_or(0, |m| 0x80 | m.to_byte())
+}
+
+fn nat_from_slot(v: u8) -> Option<NatMark> {
+    match v {
+        0 => None,
+        v => NatMark::from_byte(v & 0x7F),
+    }
+}
+
+/// 接続したことを見張りへ 1 回知らせる（`connected` より先に役・観戦の許可・決め方を書く）。
+fn notify_code_connected(slot: &LinkSlot, st: &mut CodeState, c: &Connected) {
+    if st.notified_connected {
+        return;
+    }
+    slot.mark_role(c.role());
+    slot.mark_may_list(c.established().may_list);
+    slot.mark_pick(c.established().pick);
+    slot.mark_connected(c.seat(), c.mode(), c.established().delay);
+    st.notified_connected = true;
 }
 
 impl LinkSlot {
@@ -145,17 +158,61 @@ impl LinkSlot {
         Self::default()
     }
 
-    /// 相手のコードの印を置く（`None` は読んでいない状態に戻す）。
+    /// 相手のコードの印を設定する（`None` は読んでいない状態に戻す）。
     pub fn set_peer_nat(&self, m: Option<NatMark>) {
-        self.peer_nat
-            .store(m.map_or(0, |m| 0x80 | m.to_byte()), Ordering::Release);
+        self.peer_nat.store(nat_to_slot(m), Ordering::Release);
     }
 
     pub fn peer_nat(&self) -> Option<NatMark> {
-        match self.peer_nat.load(Ordering::Acquire) {
-            0 => None,
-            v => NatMark::from_byte(v & 0x7F),
+        nat_from_slot(self.peer_nat.load(Ordering::Acquire))
+    }
+
+    /// ホストの決め方を使うか（`Some` は自分の回線の型の印）。見張りが `offer_with_seat` の前に書く。
+    pub fn set_host_pick(&self, m: Option<NatMark>) {
+        self.host_pick.store(nat_to_slot(m), Ordering::Relaxed);
+    }
+
+    pub fn host_pick(&self) -> Option<NatMark> {
+        nat_from_slot(self.host_pick.load(Ordering::Relaxed))
+    }
+
+    /// 接続したときの決め方の材料（接続した tick に 1 回。`mark_connected` より前に呼ぶ）。
+    pub fn mark_pick(&self, p: PickNote) {
+        let basis = match p.basis {
+            Basis::Nat => 0,
+            Basis::Uplink => 1,
+            Basis::Nonce => 2,
+        };
+        self.pick_own_up.store(p.own_up, Ordering::Relaxed);
+        self.pick_peer_up.store(p.peer_up, Ordering::Relaxed);
+        self.pick_flags.store(
+            PICK_SET
+                | u32::from(p.active)
+                | (basis << 1)
+                | (u32::from(p.own_nat.to_byte()) << 8)
+                | (u32::from(p.peer_nat.to_byte()) << 16),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// 接続した後の決め方の材料。接続する前は None。
+    pub fn pick_note(&self) -> Option<PickNote> {
+        let f = self.pick_flags.load(Ordering::Relaxed);
+        if f & PICK_SET == 0 {
+            return None;
         }
+        Some(PickNote {
+            active: f & 1 != 0,
+            basis: match (f >> 1) & 3 {
+                0 => Basis::Nat,
+                1 => Basis::Uplink,
+                _ => Basis::Nonce,
+            },
+            own_up: self.pick_own_up.load(Ordering::Relaxed),
+            peer_up: self.pick_peer_up.load(Ordering::Relaxed),
+            own_nat: NatMark::from_byte((f >> 8) as u8)?,
+            peer_nat: NatMark::from_byte((f >> 16) as u8)?,
+        })
     }
 
     pub fn set_start(&self, c: Option<DelayChoice>) {
@@ -179,7 +236,7 @@ impl LinkSlot {
         self.offer_with_seat(c, wish, None);
     }
 
-    /// `offer_with_mode` に、席の希望と先にいたかの名乗り `seat` を添えて置く（`net_code_game`）。
+    /// `offer_with_mode` に、席の希望と先にいたかの名乗り `seat` を添えて設定する（`net_code_game`）。
     pub fn offer_with_seat(&self, c: link::Config, wish: Option<ModeWish>, seat: Option<SeatAsk>) {
         let mut g = self.cfg.lock().unwrap_or_else(|e| e.into_inner());
         let next = g.0.wrapping_add(1).max(1);
@@ -217,7 +274,7 @@ impl LinkSlot {
         self.stamp.load(Ordering::Acquire)
     }
 
-    /// 繋がったことと自分の席と決まった形（`mode`・`delay`）を見張りへ知らせる（繋がった tick に 1 回）。先に書いてから `connected` を
+    /// 接続したことと自分の席と決まった形（`mode`・`delay`）を見張りへ知らせる（接続した tick に 1 回）。先に書いてから `connected` を
     /// Release で書くので、見張りは `is_connected` を見た後の値を必ず読める。
     pub fn mark_connected(&self, seat: Seat, mode: Mode, delay: u8) {
         self.seat.store(
@@ -246,7 +303,7 @@ impl LinkSlot {
         );
     }
 
-    /// 自分の「一覧に載せてよい」を置く（見張りが `offer_with_seat` の前に）。`offer_with_seat` の Release の後にゲームのスレッドが読む。
+    /// 自分の観戦の許可を設定する（見張りが `offer_with_seat` の前に）。`offer_with_seat` の Release の後にゲームのスレッドが読む。
     pub fn set_list_wish(&self, on: bool) {
         self.list_wish.store(on, Ordering::Relaxed);
     }
@@ -255,13 +312,18 @@ impl LinkSlot {
         self.list_wish.load(Ordering::Relaxed)
     }
 
-    /// 両者が一覧に載せてよいと名乗ったか（繋がった tick に 1 回。`mark_connected` より前に呼ぶ）。
+    /// 2 人とも観戦を許可したか（接続した tick に 1 回。`mark_connected` より前に呼ぶ）。
     pub fn mark_may_list(&self, on: bool) {
         self.may_list
             .store(if on { 1 } else { 2 }, Ordering::Relaxed);
     }
 
-    /// 繋がった後の `Established::may_list`。繋がる前は None。
+    /// 自分は観戦を許可し、相手が許可していない（接続した後だけ真）。
+    pub fn watch_off(&self) -> bool {
+        self.list_wish() && self.may_list() == Some(false)
+    }
+
+    /// 接続した後の `Established::may_list`。接続する前は None。
     pub fn may_list(&self) -> Option<bool> {
         match self.may_list.load(Ordering::Relaxed) {
             1 => Some(true),
@@ -330,14 +392,25 @@ pub trait Net: Outlet {
     ) -> Option<(SocketAddr, usize, u64, bool)> {
         self.recv(buf).map(|(a, n, t)| (a, n, t, false))
     }
-    /// 受信スレッドに PONG の口を置く。置けたら（か、置く先が無ければ）true。待たない（錠が取れなければ false）。
+    /// 受信スレッドに PONG の口を設定する。設定できたら（か、設定先が無ければ）true。待たない（ロックが取れなければ false）。
     fn pong_install(&mut self, _r: &PongResponder) -> bool {
         true
     }
     fn pong_enable(&mut self, _on: bool) {}
+    /// 観戦者が試合の記録を受ける口を、受信スレッドに設定する（観戦者の `WatchPlay` が最初の tick に 1 回）。設定できなければ返す（待たない。
+    /// 次の tick にもう一度）。設定先の無いネットワークは返すだけ。
+    fn watch_install(
+        &mut self,
+        r: crate::spectate_watch::WatchRecv,
+    ) -> Result<(), crate::spectate_watch::WatchRecv> {
+        Err(r)
+    }
     /// ゲームスレッドの心拍（`now_us` と同じ時計の ms。tick ごとに 1 回）。本物は原子変数へ 1 回書くだけで、受信スレッドはこれが古いと PONG を返さない。
     fn heartbeat(&mut self, _now_ms: u32) {}
-    /// 接続の手順が成り立った（繋がったのを最初に見た tick に 1 回）。本物は、待っている間だけ続ける STUN の聞き直しを止める。
+    /// 対戦の往復の要約（`Connected::delay_snapshot`。受けた便をセッションへ渡す `pump` ごとに 1 回）。本物は原子変数へ 1 回書くだけで、観戦者へのパケット送信（受信スレッド）が
+    /// 往復が延びたら送信を減らす。
+    fn note_delay(&mut self, _snap: Option<higanr_core::rtt_probe::DelaySnapshot>) {}
+    /// 接続の手順が成り立った（接続したのを最初に見た tick に 1 回）。本物は、待っている間だけ続ける STUN の聞き直しを止める。
     fn link_up(&mut self) {}
     /// 自分の回線が宛先ごとに外側のポートを変える型か（2 か所目の STUN の比べ）。比べられていなければ `None`。左上の「つながらない」の
     /// 2 行目の選び（`net_ui::net_input`）が、作り直しが始まった後にだけ読む。
@@ -366,7 +439,7 @@ pub trait Game {
         let w = self.local_input(seat);
         [w, 0, w]
     }
-    /// 観戦者（Esc で観戦をやめる）: 自分の Esc の読み。1 tick に 1 回だけ呼ぶ。本物は `local_input` と同じ読みに台本の入力ワードの ESC ビットだけを足して返し、
+    /// 観戦者（Esc でポーズ・3 秒長押しで観戦をやめる）: 自分の Esc の読み。1 tick に 1 回だけ呼ぶ。本物は `local_input` と同じ読みに台本の入力ワードの ESC ビットだけを足して返し、
     /// 台本を 1 tick 進める。`Local` を返した tick の feed は、ここで進めた結果を使う（台本が二重に進まない。`net_game::NetGame::peeked`）。
     fn peek_local_input(&mut self) -> u16 {
         self.local_input(Seat::P1)
@@ -448,7 +521,7 @@ pub trait Game {
     fn cursor_se(&mut self) -> bool {
         false
     }
-    /// 試合の場面の読み込み・一時停止・終わりのメニューの状態（対戦が終わった後の戻り道だけが読む）。読めなければ None。
+    /// 試合の場面の読み込み・一時停止・終わりのメニューの状態（対戦が終わった後の戻り道と、観戦者の Esc・ゲームのポーズの間が読む）。読めなければ None。
     fn play_view(&mut self) -> Option<PlayView> {
         None
     }
@@ -539,7 +612,7 @@ impl LatPlan {
     pub fn new(items: &[(u64, u8)]) -> Result<Self, String> {
         if items.len() > LAT_PLAN_MAX {
             return Err(format!(
-                "latency の切替の予定は {LAT_PLAN_MAX} 個まで（{} 個）",
+                "latency の切替の予定は {LAT_PLAN_MAX} 個までです（{} 個）",
                 items.len()
             ));
         }
@@ -548,13 +621,13 @@ impl LatPlan {
         for (i, &(at, delay)) in items.iter().enumerate() {
             if delay > higanr_core::frame::MAX_DELAY {
                 return Err(format!(
-                    "latency の切替の delay {delay} は 0〜{}",
+                    "latency の切替の delay {delay} は 0〜{} にしてください",
                     higanr_core::frame::MAX_DELAY
                 ));
             }
             if prev.is_some_and(|p| at <= p) {
                 return Err(format!(
-                    "latency の切替のフレームの数 {at} が前の値以下（小さい順に書く）"
+                    "latency の切替のフレームの数 {at} が前の値以下です（小さい順に書いてください）"
                 ));
             }
             prev = Some(at);
@@ -588,30 +661,32 @@ pub struct Config {
     pub check: CheckSource,
     pub wait_budget_us: u32,
     pub lat_plan: LatPlan,
-    /// 止める地点へは、ネットワークの選択でマップの決定が両者に入ったときだけ入る。選択を通らずに場面 2 へ移るのはネットワークのマッチではない（デモ・リプレイの再生・
-    /// ストーリーなど）ので、ネットワークは何もせず `Local` のまま流す。本物のゲームは true（台本なしの実機で、タイトルで約 27 秒待つとデモが始まり、
-    /// ネットワークが相手の SELECT を待ち続けてゲームが止まったことがある）。
+    /// 止める地点へは、ネットワークの選択でマップの決定が両者に入ったときだけ入る。選択を通らずに場面 2 へ移るのはネットワークのマッチではない（デモ・リプレイの再生・ストーリーなど）ので、ネットワークは何もせず `Local` のまま流す（流さないと、タイトルのデモで相手の SELECT を待ち続けてゲームが止まる）。本物のゲームは true。
     /// false は v0 の形（選択の画面を持たない偽物と peer_sim の v0 の選択）: 選択を通らずに来ても止める地点で選択の状態機械を動かす。
     /// 既定が false なのは、`..Config::default()` で作る検査が v0 の形でしかマッチに入れないから。
-    /// 繋がる前の選択の画面で決定を落とす経路（`unconnected_tick`）も、この欄が true のときだけ動く（false は、ゲームのメモリの無いプロセスで場面のアドレスを読むと落ちるため、
-    /// 繋がる前にゲームの場面を読まない）。
+    /// 接続する前の選択の画面で決定を落とす経路（`unconnected_tick`）も、この欄が true のときだけ動く（false は、ゲームのメモリの無いプロセスで場面のアドレスを読むと落ちるため、
+    /// 接続する前にゲームの場面を読まない）。
     pub require_net_selection: bool,
     /// HELLO で名乗る望むモードと D（`net_config::NetSettings::mode_wish`）と、rollback に決まったときの R。セッションを作るたびに `Link::set_mode` へ渡す。
     /// 既定は delay 方式。本物の実行で rollback を名乗るのは、マッチの経路の入口（`rollback_play_win::arm`）が全部書けたときだけ（`NetSettings::mode_wish_if`）。
     pub mode_wish: ModeWish,
     pub rollback_ahead: u8,
     /// rollback が「できる」か（HELLO の +3 の bit1 で名乗る）。望み（`mode_wish`）とは別: 望まなくても、確保の向け先などの入口を全部書けていれば
-    /// （`rollback_play_win::armed`）できる。両者ができる組だけ、キャラセレクトの Tab で形式を替えられる。本物の設定は `script_win::play_config` が置く。
+    /// （`rollback_play_win::armed`）できる。両者ができる組だけ、キャラセレクトの Tab で形式を替えられる。本物の設定は `script_win::play_config` が設定する。
     pub rollback_able: bool,
-    /// 繋がった後、両者の READY（type 20）が揃うまで対戦を成立させない（`higanr_core::match_gate`。`code_side = game` の実行だけ true）。
-    /// 成立の前は `Unconnected` のまま、ネットワークは入力に触らない（`Local`）。false は、繋がったときに `Selecting` へ移る。
+    /// 接続した後、両者の READY（type 20）が揃うまで対戦を成立させない（`higanr_core::match_gate`。`code_side = game` の実行だけ true）。
+    /// 成立の前は `Unconnected` のまま、ネットワークは入力に触らない（`Local`）。false は、接続したときに `Selecting` へ移る。
     pub match_gate: bool,
-    /// 遅れの量の選び（`higanr_core::delay_pick`）: 繋がったら `DelayPick` を持ち、delay 方式では最初のマッチの始まりでホストが推奨値へ切り替える。
+    /// 遅れの量の選び（`higanr_core::delay_pick`）: 接続したら `DelayPick` を持ち、delay 方式では最初のマッチの始まりでホストが推奨値へ切り替える。
     /// rollback のモードでは推奨値で置き換えない。数字キーで選んだ値は両者ともマッチのうちに効く（`NetPlay::digit_tick`）。
     /// `code_side = game` の実行で `lat_plan` が空のときだけ true。
     pub delay_pick: bool,
     /// フレームの始まりで相手の入力ワードを待つ上限（µs。0 なら待たない。ini の `head_wait`。`HEAD_WAIT_CAP_US`）。delay 方式の lockstep のときだけ効く。
     pub head_wait_cap_us: u32,
+    /// ホストの決め方（`higanr_core::host_pick`）を使うか。ゲーム内のメニューの接続は見張りが `LinkSlot::set_host_pick` で決めるので、
+    /// ここは検査が直に使う口（`Setup::fake_up` で片方を太く見せる）。接続コードの受け渡しの形では、見張りが使うと決めたときの
+    /// 回線の型は見張りの値、`fake_up` はここの値。
+    pub host_pick: Option<higanr_core::host_pick::Setup>,
 }
 
 impl Default for Config {
@@ -627,6 +702,7 @@ impl Default for Config {
             match_gate: false,
             delay_pick: false,
             head_wait_cap_us: 0,
+            host_pick: None,
         }
     }
 }
@@ -717,7 +793,7 @@ pub enum End {
     BadSelect(BadValue),
     /// 届いた押下を `MENU_HOLD_LIMIT` フレームより長く入れられなかった（両者の画面が分かれた。BYE(中止) を出す）。
     MenuStuck(Step),
-    /// 繋がったが、対戦が成立しないまま閉じた（`Config::match_gate`。理由は `NoMatch`）。成立の後の BYE(取消) は `PeerBye`。
+    /// 接続したが、対戦が成立しないまま閉じた（`Config::match_gate`。理由は `NoMatch`）。成立の後の BYE(取消) は `PeerBye`。
     Unmatched(NoMatch),
 }
 
@@ -758,7 +834,7 @@ pub struct Stats {
     pub menu_cursor_se_failed: u32,
     /// 相手の入力ワードに「ランダム」（Ctrl）が立っていた選択の tick の数（キャラ選択では相手の席へ入れずに落とす）。
     pub menu_peer_random: u32,
-    /// 繋がる前に選択の画面（7・8・16）で、ゲームへ入れずに落とした決定の押下（押した瞬間）の回数（`unconnected_tick`）。
+    /// 接続する前に選択の画面（7・8・16）で、ゲームへ入れずに落とした決定の押下（押した瞬間）の回数（`unconnected_tick`）。
     pub menu_pre_link_decides: u32,
     /// 選択が両者で揃った回数と、そのうちホストの値と食い違った欄ごとの回数（食い違ってもマップ・難易度はホストの値を採って続ける。
     /// オプションのダイジェストは記録だけ。一度の合意で複数の欄が食い違うことがある）。
@@ -770,7 +846,7 @@ pub struct Stats {
     pub lat_busy: u32,
     pub lat_refused: u32,
     pub switches: u32,
-    /// 初めの値（マッチの始まりの推奨値・つなぐ前に決めた遅延）をネットワークの側へ渡した回数と、そのうち今の値と同じで何もしなかった数。
+    /// 初めの値（マッチの始まりの推奨値・接続する前に決めた遅延）をネットワークの側へ渡した回数と、そのうち今の値と同じで何もしなかった数。
     pub delay_presses: u32,
     pub delay_presses_unchanged: u32,
     /// 数字キーの押下をネットワークの側へ渡した回数と、そのうち今の値・旗と同じで何もしなかった数。
@@ -875,10 +951,10 @@ struct Decisions {
 /// 入力の地点の判断の本体（接続ごとに 1 つ。ゲームスレッドだけが持つ）。
 pub struct NetPlay {
     link: Link,
-    /// 今のセッションを作った時刻と、繋がったのを最初に見た時刻（どちらも `Net::now_us` の ms）。セッションを作り直したら前者を置き直す。
+    /// 今のセッションを作った時刻と、接続したのを最初に見た時刻（どちらも `Net::now_us` の ms）。セッションを作り直したら前者を設定し直す。
     link_started_ms: u32,
     connected_ms: Option<u32>,
-    /// ネットワークが終わったのを手入れ（`tend`）が最初に見た時刻（ms）。つなぎ直しの片づけの待ち（`RELINK_GRACE_MS`）はここから数える。
+    /// ネットワークが終わったのを手入れ（`tend`）が最初に見た時刻（ms）。再接続の前にネットワークの組を片づけるまでの待ち（`RELINK_GRACE_MS`）はここから数える。
     ended_seen_ms: Option<u32>,
     cfg: Config,
     phase: Phase,
@@ -897,6 +973,8 @@ pub struct NetPlay {
     /// 成立した後に終わり、まだ `take_lost` が取っていない。
     lost_pending: bool,
     digest: u64,
+    /// 観戦の照合の記録（ダイジェストの作り方）の、seg の frame 0 からのダイジェスト。
+    spec_digest: u64,
     stall_run: u32,
     stats: Stats,
     menu_net: bool,
@@ -921,12 +999,12 @@ pub struct NetPlay {
     code_state: CodeState,
     pong_installed: bool,
     pong_enabled: bool,
-    /// 観戦のリングバッファ（ini の `[spectate] enable = 1` のときだけ）。ゲームのスレッドは記録をリングバッファへ書くだけで、送りは受信スレッドが行う。
+    /// 観戦のリングバッファ（ini の `[spectate] enable = 1` のときだけ）。ゲームのスレッドは記録をリングバッファへ書くだけで、観戦者への送信は受信スレッドが行う。
     spec: Option<Arc<SpectateRing>>,
-    /// 観戦のリングバッファを、マッチのホストのときだけ使う形（ゲーム内のメニューの経路。`set_spectate_for_host`）。繋がった tick で役がゲストならリングバッファを
+    /// 観戦のリングバッファを、マッチのホストのときだけ使う形（ゲーム内のメニューの経路。`set_spectate_for_host`）。接続した tick で役がゲストか、2 人とも観戦を許可していなければリングバッファを
     /// `spec_parked` へ移して書かない（ゲストは配らない）。ini の `[spectate]` はどちらの役でも書く。
     spec_host_only: bool,
-    /// 外したリングバッファの置き場（リングバッファの持ち主は受信スレッドの送り手と共有で、`NetPlay` の手放しまで解放しない。ゲームのスレッドで大きい配列を解放しないため）。
+    /// 外したリングバッファの置き場（リングバッファの持ち主は受信スレッドの送信側と共有で、`NetPlay` の手放しまで解放しない。ゲームのスレッドで大きい配列を解放しないため）。
     spec_parked: Option<Arc<SpectateRing>>,
     /// seg を出た回数（`leave_seg` が rollback の状態機械の `begin_seg` と同時に数える）と、`PlayState` が見終えた回数。差があれば
     /// 次の入口がコピーとアドレスの表を捨てる。
@@ -961,7 +1039,7 @@ pub struct NetPlay {
 pub struct CodeState {
     pub seen_gen: u32,
     pub links: u32,
-    /// 今のセッションを作った設定の session。つながった後に片づけたら「使った」コードとして記録し、次のつながりで同じ session のコードを貼られても読まない。
+    /// 今のセッションを作った設定の session。接続した後に片づけたら「使った」コードとして記録し、次の接続で同じ session のコードを貼られても読まない。
     pub session: u32,
     pub dropped_before_link: u64,
     notified_connected: bool,
@@ -988,14 +1066,14 @@ fn value_mode(v: u8) -> Mode {
 }
 
 impl NetPlay {
-    /// 繋ぎ始める（`Link::new` を `net` の時計で作る）。CHECK をゲームの値で作るなら、frame 0 の抽選回数は比べない（`CheckRule`）。
+    /// 接続し始める（`Link::new` を `net` の時計で作る）。CHECK をゲームの値で作るなら、frame 0 の抽選回数は比べない（`CheckRule`）。
     pub fn new<N: Net>(link_cfg: link::Config, cfg: Config, net: &mut N) -> Self {
         let now = ms(net.now_us());
         Self::with_link(Self::build_link(link_cfg, &cfg, None, None, now), cfg, now)
     }
 
-    /// 接続コードの受け渡しの形（`LinkSlot`）: 見張りのスレッドが設定を置くまでセッションを作らず、届いたものは捨てる。
-    /// 設定が置かれた次の tick の始まりでセッションを作り、すぐ HELLO を送り始める。
+    /// 接続コードの受け渡しの形（`LinkSlot`）: 見張りのスレッドが設定を登録するまでセッションを作らず、届いたものは捨てる。
+    /// 設定が設定された次の tick の始まりでセッションを作り、すぐ HELLO を送り始める。
     pub fn with_code_slot<N: Net>(slot: Arc<LinkSlot>, cfg: Config, net: &mut N) -> Self {
         let now = ms(net.now_us());
         // セッションを作るまでの仮のセッション。候補が空なので何も送らず何も受けず、`pump` はこれを呼ばない（`code_tick`）。
@@ -1034,6 +1112,7 @@ impl NetPlay {
         }
         link.set_retry_window(HANDSHAKE_RETRY_MS);
         link.set_match_gate(cfg.match_gate);
+        link.set_host_pick(cfg.host_pick);
         link.set_check_rule(match cfg.check {
             CheckSource::Game => CheckRule::SkipCountAtFrame0,
             CheckSource::InputDigest => CheckRule::All,
@@ -1061,6 +1140,7 @@ impl NetPlay {
             left_by_save_quit: false,
             lost_pending: false,
             digest: INPUT_DIGEST_INIT,
+            spec_digest: INPUT_DIGEST_INIT,
             stall_run: 0,
             stats: Stats::default(),
             menu_net: false,
@@ -1111,8 +1191,8 @@ impl NetPlay {
         self.spec = Some(ring);
     }
 
-    /// 観戦のリングバッファを、マッチのホストのときだけ書く形で置く（ゲーム内のメニューの経路）。つなぎ直しごとに開くので、リングバッファは 1 本の接続のものになる。
-    /// 繋がった tick に役がゲストと分かればリングバッファを外す（`tend`。配る側のスレッドは見張りがマッチのホストのときだけ起こす）。
+    /// 観戦のリングバッファを、マッチのホストのときだけ書く形で設定する（ゲーム内のメニューの経路）。再接続ごとに開くので、リングバッファは 1 本の接続のものになる。
+    /// 接続した tick に役がゲストか、2 人とも観戦を許可していないと分かればリングバッファを外す（`tend`。配る側のスレッドは見張りがマッチのホストのときだけ開始する）。
     pub fn set_spectate_for_host(&mut self, ring: Arc<SpectateRing>) {
         self.spec = Some(ring);
         self.spec_host_only = true;
@@ -1140,6 +1220,44 @@ impl NetPlay {
         for rec in higanr_core::spectate::seg_head(seg, est) {
             Self::spec_to(spec, rec);
         }
+    }
+
+    /// 観戦: 使った (1P, 2P) を、照合の記録のダイジェスト（seg の frame 0 から）へ足す。観戦のリングバッファが無ければ何もしない。
+    fn spec_digest_push(
+        spec: &Option<Arc<SpectateRing>>,
+        d: &mut u64,
+        frame: u32,
+        p1: u16,
+        p2: u16,
+    ) {
+        if spec.is_none() {
+            return;
+        }
+        if frame == 0 {
+            *d = INPUT_DIGEST_INIT;
+        }
+        *d = input_digest_push(*d, p1, p2);
+    }
+
+    /// 観戦: 照合の記録を積む（`is_watch_check_frame` の frame だけ。約 1 秒に 1 記録）。ゲームの値の作り方は対戦の CHECK と同じ値、
+    /// ダイジェストの作り方は seg ごとのダイジェスト（途中から入った観戦者も作れる）。`chk` は確定した状態の値。
+    fn spec_check(
+        spec: &Option<Arc<SpectateRing>>,
+        source: CheckSource,
+        chk: &Check,
+        spec_digest: u64,
+    ) {
+        if spec.is_none() || !is_watch_check_frame(chk.frame) {
+            return;
+        }
+        let rec = match source {
+            CheckSource::Game => Record::check(CheckKind::Game, chk),
+            CheckSource::InputDigest => Record::check(
+                CheckKind::InputDigest,
+                &check_from_input_digest(chk.seg, chk.frame, spec_digest),
+            ),
+        };
+        Self::spec_to(spec, rec);
     }
 
     /// 選択が揃った回を数える（欄ごとの食い違いも）。1 回の合意につき 1 回だけ呼ぶ。
@@ -1261,7 +1379,7 @@ impl NetPlay {
 
     /// 成立した後にネットワークが終わったとき 1 回だけ、「妖怪 対 妖怪」へ戻す理由を返す（`net_ui::NetUi::on_lost`）。戻さない終わり方は
     /// `None`: 同期ズレ（止めて Esc を待つ別の経路）・「保存して終了」（タイトルのまま）・自分から終えた BYE(終了)（台本の終わり）。
-    /// 確かめの枠で抜けた BYE(取消) は呼び手が見分ける（ゲームが自分で画面 6 へ戻る）。
+    /// 確認の枠で抜けた BYE(取消) は呼び手が見分ける（ゲームが自分で画面 6 へ戻る）。
     pub fn take_lost(&mut self) -> Option<Why> {
         if !core::mem::take(&mut self.lost_pending)
             || self.left_by_save_quit
@@ -1285,7 +1403,7 @@ impl NetPlay {
         }
     }
 
-    /// 検査用: 「保存して終了」で閉じた tick と同じ印だけを置く。
+    /// 検査用: 「保存して終了」で閉じた tick と同じ印だけを設定する。
     #[cfg(test)]
     pub fn set_save_quit(&mut self) {
         self.save_quit = true;
@@ -1307,11 +1425,17 @@ impl NetPlay {
     }
 
     /// ネットワークの手入れ（入力の地点の tick の始まり。ゲームの入力・場面には触れず、feed もしない）: 受信をセッションへ渡して `poll` する・終わりの印を見る・PONG を合わせる・
-    /// 繋がったのを見たら `Unconnected → Selecting` にする。ゲーム内のメニューが入力を握って `dispatch` を呼ばない tick でも毎 tick 要る
-    /// （止まるとセッションが作られずつながらない）。1 tick に 1 回だけ呼ぶこと。
+    /// 接続したのを見たら `Unconnected → Selecting` にする。ゲーム内のメニューが入力を握って `dispatch` を呼ばない tick でも毎 tick 要る
+    /// （止まるとセッションが作られず接続できない）。1 tick に 1 回だけ呼ぶこと。
     pub fn tend<N: Net>(&mut self, net: &mut N) {
         self.stats.ticks = self.stats.ticks.saturating_add(1);
         self.pump(net);
+        // 接続した tick のうちに見張りへ知らせる（`ui_conn` の `watch_off` が同じ tick に `LinkSlot` から読めるように）。
+        if self.phase != Phase::Ended
+            && let (Some(slot), Some(c)) = (self.code.as_deref(), self.link.connected())
+        {
+            notify_code_connected(slot, &mut self.code_state, c);
+        }
         self.watch_end();
         self.sync_pong(net);
         if self.phase == Phase::Ended && self.ended_seen_ms.is_none() {
@@ -1320,19 +1444,20 @@ impl NetPlay {
         if self.phase == Phase::Unconnected
             && let Some(c) = self.link.connected()
         {
-            // 繋がったのを最初に見た時刻（試験のまとめの「繋がるまで」と `Conn::Finished` の印）。成立を待つ実行でも、成立ではなく繋がった時刻。
+            // 接続したのを最初に見た時刻（試験のまとめの「繋がるまで」と `Conn::Finished` の印）。成立を待つ実行でも、成立ではなく接続した時刻。
             if self.connected_ms.is_none() {
                 self.connected_ms = Some(ms(net.now_us()));
                 net.link_up();
-                // 観戦をマッチのホストだけが配る形で、役がゲストならリングバッファを外す（`Seg` を積む前に外すので、ゲストのリングバッファには何も積まれない）。外したリングバッファは解放せず置き場へ移すだけ。
-                if self.spec_host_only && c.role() == Role::Guest {
+                // 観戦の記録をマッチのホストだけが観戦者へ配る形で、役がゲストならリングバッファを外す（`Seg` を積む前に外すので、ゲストのリングバッファには何も積まれない）。外したリングバッファは解放せず置き場へ移すだけ。
+                // 2 人とも観戦を許可していなければ、ホストも配らないので書かない。
+                if self.spec_host_only && (c.role() == Role::Guest || !c.established().may_list) {
                     self.spec_parked = self.spec.take();
                 }
             }
             if c.matched() {
-                // 成立した（ゲートの無いセッションは繋がった tick）。ここから選択の同期・lockstep・CHECK に入れる。
+                // 成立した（ゲートの無いセッションは接続した tick）。ここから選択の同期・lockstep・CHECK に入れる。
                 self.phase = Phase::Selecting;
-                // 観戦: 繋がった seg（最初は 0）の始まり。
+                // 観戦: 接続した seg（最初は 0）の始まり。
                 let seg = c.lockstep().seg();
                 Self::spec_seg(&self.spec, seg, &c.established());
             } else if let Some(why) = c.match_gate().and_then(|g| g.closed()) {
@@ -1343,18 +1468,13 @@ impl NetPlay {
         self.ensure_pick();
     }
 
-    /// フレームの始まり（自分の入力を読む前）で、この tick の入力の地点で要る相手の入力ワードを待つ（delay 方式の lockstep だけ）。
-    /// 2 台の 60 Hz の格子の位相の差の分だけ先に進んでいる側が入力を読んだ後で待っていた待ちを、フレームの始まりへ移す（`HEAD_WAIT_CAP_US` の由来）。
-    /// 始まりで待った分は入力の地点の予算から引く。呼ぶのはウィンドウ（b-spin / b）の格子の後と、全画面でゲームがその回にフレームを始める見込みのときだけ
-    /// （`pacing_win::pace_head`）。全画面の経路は 1 フレームに何度も呼ばれうるので、2 度目から `Off`。
+    /// フレームの始まり（自分の入力を読む前）で、この tick の入力の地点で要る相手の入力ワードを待つ（delay 方式の lockstep だけ）。2 台の 60 Hz の格子の位相の差の分だけ先に進んでいる側が入力を読んだ後で待っていた待ちを、フレームの始まりへ移す（`HEAD_WAIT_CAP_US` の由来）。始まりで待った分は入力の地点の予算から引く。
+    /// 呼ぶのはウィンドウ（b-spin / b）の格子の後と、フルスクリーンでゲームがその回にフレームを始める見込みのときだけ（`pacing_win::pace_head`）。フルスクリーンの経路は 1 フレームに何度も呼ばれうるので、2 度目から `Off`。
     ///
-    /// 次の全部が成り立つときだけ待つ（外れれば `Off`。時計にもセッションにも触らない）: `Config::head_wait_cap_us` が 0 でない・`phase` が Lockstep でセッションが繋がっていて
-    /// rollback でない・今の遅れが 1 以上で使う前の切替も 0 への切替でない（遅れ 0 では相手の取得が相手の始まりの後なので、両者が始まりで待って上限まで固まる）・
-    /// 直前の tick が描画だけのフレームでない（入力の地点が予算まで待って来た後なので、止まった相手に 1 tick ごと待ちを足さない）・
-    /// 相手がマッチを終えていない・この tick でまだ待っていない。
+    /// 次の全部が成り立つときだけ待つ（外れれば `Off`。時計にもセッションにも触らない）: `Config::head_wait_cap_us` が 0 でない・`phase` が Lockstep でセッションが接続していて rollback でない・今の遅れが 1 以上で使う前の切替も 0 への切替でない（遅れ 0 では相手の取得が相手の始まりの後なので、両者が始まりで待って上限まで固まる）・
+    /// 直前の tick が描画だけのフレームでない（入力の地点が予算まで待って来た後なので、止まった相手に 1 tick ごと待ちを足さない）・相手がマッチを終えていない・この tick でまだ待っていない。
     ///
-    /// 待ち方は入力の地点の待ちと同じ（`Net::wait` を最大 `RESEND_MS` ずつ。受信で起き、起きるたびに受信をセッションへ渡し、送り直しの期限だけ見る）。
-    /// 上限で届かなければ `Capped`、待つ間にネットワークが終わる・相手がマッチを終えたら `Ended` で戻る。確定する入力の列は変わらない。
+    /// 待ち方は入力の地点の待ちと同じ（`Net::wait` を最大 `RESEND_MS` ずつ。受信で起き、起きるたびに受信をセッションへ渡し、送り直しの期限だけ見る）。上限で届かなければ `Capped`、待つ間にネットワークが終わる・相手がマッチを終えたら `Ended` で戻る。確定する入力の列は変わらない。
     pub fn head_wait<N: Net>(&mut self, net: &mut N) -> HeadWait {
         let cap = self.cfg.head_wait_cap_us;
         if cap == 0
@@ -1423,7 +1543,7 @@ impl NetPlay {
         }
     }
 
-    /// 始まりで待つ形か。`None` = 待つ形でない（繋がっていない・rollback・遅れ 0 か 0 への切替）、`Some(true)` = 待つ形で、相手の入力ワードは
+    /// 始まりで待つ形か。`None` = 待つ形でない（接続していない・rollback・遅れ 0 か 0 への切替）、`Some(true)` = 待つ形で、相手の入力ワードは
     /// もう届いている、`Some(false)` = 待つ形で、まだ届いていない。
     fn head_wait_state(&self) -> Option<bool> {
         let c = self.link.connected()?;
@@ -1437,8 +1557,8 @@ impl NetPlay {
         Some(ls.remote_ready())
     }
 
-    /// 繋がっていて、遅れの量の選びをまだ持っていなければ作る（`Config::delay_pick` が true で `lat_plan` が空のときだけ）。
-    /// 役とモードは AGREE で決まっているので、繋がりごとに 1 つ。
+    /// 接続していて、遅れの量の選びをまだ持っていなければ作る（`Config::delay_pick` が true で `lat_plan` が空のときだけ）。
+    /// 役とモードは AGREE で決まっているので、接続ごとに 1 つ。
     fn ensure_pick(&mut self) {
         if self.pick.is_some() || !self.cfg.delay_pick || !self.cfg.lat_plan.is_empty() {
             return;
@@ -1572,7 +1692,7 @@ impl NetPlay {
         self.stats.segs_started = self.stats.segs_started.saturating_add(1);
     }
 
-    /// 接続コードの受け渡しの 1 回（`pump` の始まり）。見張りへ「繋がった」「終えた」を知らせ、繋がる前なら新しい設定でセッションを作る（作り直す）。
+    /// 接続コードの受け渡しの 1 回（`pump` の始まり）。見張りへ「繋がった」「終えた」を知らせ、接続する前なら新しい設定でセッションを作る（作り直す）。
     /// セッションをまだ一度も作っていなければ、届いたものをリングから出して捨て、false を返す（`pump` は仮のセッションを呼ばない）。ファイルには触らない。
     fn code_tick<N: Net>(&mut self, net: &mut N) -> bool {
         let Some(slot) = self.code.as_deref() else {
@@ -1585,17 +1705,18 @@ impl NetPlay {
                 st.notified_done = true;
             }
         } else if let Some(c) = self.link.connected() {
-            if !st.notified_connected {
-                slot.mark_role(c.role());
-                slot.mark_may_list(c.established().may_list);
-                slot.mark_connected(c.seat(), c.mode(), c.established().delay);
-                st.notified_connected = true;
-            }
+            notify_code_connected(slot, st, c);
         } else if let Some((c, wish, seat)) = slot.take_newer(&mut st.seen_gen) {
             let now = ms(net.now_us());
             st.session = c.handshake.session_id;
             self.link = Self::build_link(c, &self.cfg, wish, seat, now);
             self.link.set_listable(slot.list_wish());
+            if let Some(nat) = slot.host_pick() {
+                self.link.set_host_pick(Some(higanr_core::host_pick::Setup {
+                    nat,
+                    fake_up: self.cfg.host_pick.and_then(|p| p.fake_up),
+                }));
+            }
             self.link_started_ms = now;
             st.links = st.links.saturating_add(1);
         }
@@ -1623,12 +1744,12 @@ impl NetPlay {
             let now = ms(net.now_us());
             let before = self.remote_mark();
             // 受信スレッドが PONG を返した PING には、セッションは PONG を重ねない（`sync_pong`）。PONG の往復は受信スレッドが受けた時刻 `t_us` で測る
-            // （`now` で測ると最大 1 フレーム大きく出る）。
-            let r = self.link.on_datagram_at(
+            // （`now` で測ると最大 1 フレーム大きく出る）。PROBE の列の幅も µs のまま渡す（ms に丸めると太い回線の列が潰れる）。
+            let r = self.link.on_datagram_rx_us(
                 from,
                 buf.get(..n).unwrap_or(&[]),
                 now,
-                ms(t_us),
+                t_us,
                 pong_sent,
                 net,
             );
@@ -1640,6 +1761,7 @@ impl NetPlay {
         let now = ms(net.now_us());
         self.link.poll(now, net);
         net.heartbeat(now);
+        net.note_delay(self.link.connected().and_then(|c| c.delay_snapshot()));
         let r = self.link.restarts();
         self.stats.hs_restarts = r.count;
         self.stats.hs_restart_last = r.last;
@@ -1657,7 +1779,7 @@ impl NetPlay {
             return;
         }
         if want && !self.pong_installed {
-            // 繋がった tick に 1 回。錠が取れなければ次の tick にやり直す（その間はセッションが返す）。
+            // 接続した tick に 1 回。ロックが取れなければ次の tick にやり直す（その間はセッションが返す）。
             let Some(r) = self.link.pong_responder() else {
                 return;
             };
@@ -1671,7 +1793,7 @@ impl NetPlay {
     }
 
     fn remote_mark(&self) -> Option<(u16, u32)> {
-        // rollback のモードでは INPUT を状態機械が受ける（`lockstep()` は seg だけを揃えて置いてある —— `link.rs`）。
+        // rollback のモードでは INPUT を状態機械が受ける（`lockstep()` は seg だけを揃えて設定してある —— `link.rs`）。
         self.link.connected().map(|c| match c.rollback() {
             Some(rb) => (rb.seg(), rb.remote_next()),
             None => (c.lockstep().seg(), c.lockstep().remote_next()),
@@ -1716,8 +1838,8 @@ impl NetPlay {
             if r == ByeReason::Finished && self.phase == Phase::Lockstep {
                 self.peer_finished = true;
             } else if r == ByeReason::Cancelled && !c.matched() {
-                // 成立の前に相手が閉じた（相手の 10 分が先に切れた・相手が確かめの枠で抜けた）。遊んだ後に終わったのと見分けられないので、成立しないまま
-                // 閉じた理由に載せる。ゲートの無いセッションは繋がったときに成立しているので、ここへ来ない。
+                // 成立の前に相手が閉じた（相手の 10 分が先に切れた・相手が確認の枠で抜けた）。遊んだ後に終わったのと見分けられないので、成立しないまま
+                // 閉じた理由に載せる。ゲートの無いセッションは接続したときに成立しているので、ここへ来ない。
                 self.finish(End::Unmatched(NoMatch::PeerLeft));
             } else {
                 self.finish(End::PeerBye(r));
@@ -1749,7 +1871,7 @@ impl NetPlay {
             self.lost_pending = self.phase != Phase::Unconnected;
             self.phase = Phase::Ended;
             self.end = Some(end);
-            // 観戦: 流れの終わり。繋がっていなかった（接続の失敗）なら積まない。
+            // 観戦: 流れの終わり。接続していなかった（接続の失敗）なら積まない。
             if let Some(r) = Self::spec_end_reason(&end)
                 && self.link.connected().is_some()
             {
@@ -1860,6 +1982,7 @@ impl NetPlay {
                     seat: c.seat(),
                     host: c.role() == Role::Host,
                     shape: Some((c.mode(), self.shown_delay(c))),
+                    watch_off: self.code.as_deref().is_some_and(LinkSlot::watch_off),
                 },
                 c.seat(),
             ),
@@ -1867,7 +1990,7 @@ impl NetPlay {
         }
     }
 
-    /// ネットワークの組を片づけてよいか（ゲーム内のメニューの実行のつなぎ直し）: ネットワークが終わっていて、終わりを手入れが見てから `grace_ms` 経ち、場面がマッチの外。
+    /// ネットワークの組を片づけてよいか（ゲーム内のメニューの実行の再接続）: ネットワークが終わっていて、終わりを手入れが見てから `grace_ms` 経ち、場面がマッチの外。
     /// マッチの中で切れたときは `Local` で続け、マッチの外へ戻ってから片づける。
     pub fn relink_due(&self, now_ms: u32, scenes: (u32, u32), grace_ms: u32) -> bool {
         let (cur, next) = scenes;
@@ -1880,15 +2003,15 @@ impl NetPlay {
             && next != SCENE_MATCH
     }
 
-    /// つながった（ことがある）接続の session。片づけるときに「使った」コードとして記録し（`net_code_game` の `GameUi::spent`）、次のつながりで
-    /// 同じコードを貼られても読まない。つながらないまま終わった session は記録しない（相手がまだ待っていれば、同じコードで繋ぎ直せる）。
+    /// 接続した（ことがある）接続の session。片づけるときに「使った」コードとして記録し（`net_code_game` の `GameUi::spent`）、次の接続で
+    /// 同じコードを貼られても読まない。接続できないまま終わった session は記録しない（相手がまだ待っていれば、同じコードで再接続できる）。
     pub fn spent_session(&self) -> Option<u32> {
         (self.code.is_some() && self.connected_ms.is_some() && self.code_state.links > 0)
             .then_some(self.code_state.session)
     }
 
-    /// 自分が「妖怪 対 妖怪」を選んだ（`net_ui::net_input`）。繋がっていて成立の前なら、READY の 1 通目をすぐ送る（`link::Connected::set_ready`）。
-    /// 成立を待たない実行・繋がる前・終えた後は何もしない。
+    /// 自分が「妖怪 対 妖怪」を選んだ（`net_ui::net_input`）。接続していて成立の前なら、READY の 1 通目をすぐ送る（`link::Connected::set_ready`）。
+    /// 成立を待たない実行・接続する前・終えた後は何もしない。
     pub(crate) fn set_ready<N: Net>(&mut self, net: &mut N) {
         if self.phase != Phase::Unconnected {
             return;
@@ -1962,7 +2085,7 @@ impl NetPlay {
         })
     }
 
-    /// 観戦: 対戦の状態（ping・Latency・Rollback）を、マッチの中で 60 回の呼びに 1 回（約 1 秒）観戦のリングバッファへ積む。値は `hud_facts` が作る対戦者の左下の行と同じ。
+    /// 観戦: 対戦の状態（ping・Latency・Rollback）を、マッチの中で 60 回の呼びに 1 回（約 1 秒）観戦のリングバッファへ積む。値は `hud_facts` が作る対戦する側の左下の行と同じ。
     /// リングバッファが無ければ何もしない。遅延の増分: 1 秒に 1 回のリングバッファへの書き（確保なし・待ちなし）と、毎フレームのウィンドウの更新。
     fn spec_stats(&mut self, latency: u8, rtt_ms: Option<u32>, rewound: Option<u32>) {
         if self.spec.is_none() {
@@ -1979,7 +2102,7 @@ impl NetPlay {
         }
     }
 
-    /// 画面に出す遅れ: ネットワークの側の「目標」（`Connected::shown_delay`）。まだ渡していない初めの値があればそれ。
+    /// 画面に出す遅れ: ネットワークの側の「目標」（`Connected::shown_delay`）。ネットワークの側へまだ渡していない初めの値があればそれ。
     fn shown_delay(&self, c: &Connected) -> u8 {
         self.pick
             .and_then(|p| p.pending())
@@ -1998,7 +2121,7 @@ impl NetPlay {
     }
 
     /// Ctrl+数字キー（上段の 0〜9。0〜8 がその値、9 が auto）と Ctrl+Tab の押した瞬間を読んで、ネットワークの側（`Connected::press_delay`）へ渡す。1 tick に 1 回。
-    /// ネットワークが繋がっていて遅れの量の選び `pick` を持つ間だけ読む（ウィンドウが前面にない・文字の入力中は `Game::digit_keys` が `None`）。台本の付いている実行は、
+    /// ネットワークが接続していて遅れの量の選び `pick` を持つ間だけ読む（ウィンドウが前面にない・文字の入力中は `Game::digit_keys` が `None`）。台本の付いている実行は、
     /// 台本の段階（`digit_script`）の押下だけを使い、本物のキーを読まない。押した値は、マッチの途中なら D の予定・切替、マッチの外ならホストは次の seg の始まりの D、
     /// ゲストはホストへの要求になる。auto（9）はホストが旗を持つ。遅延の増分: マッチ中の 1 tick に数字キーの読み 10 回と比べ数回。
     fn digit_tick<G: Game>(&mut self, game: &mut G) {
@@ -2068,19 +2191,16 @@ impl NetPlay {
         self.held_local = None;
     }
 
-    /// まだ繋がっていない間の 1 tick。選択の画面（人対人の Match の 7・8・16）では、ローカルの入力から決定のビットだけを落としてゲームへ入れる
-    /// （`Action::Menu`）。取消は通す（決定を止めれば 8 より先へ進めないので、取消で 6 へ戻るのは害が無い）。席は繋がる前は決まらないので 1P の入力ワードとして
-    /// 入れる（キーボードの入力ワードは席に依らず、台本の入力ワードは 1P 側を読む）。2P の別の入力機器は読まない。それ以外は `Local`。繋がる前にホストの台本が難易度の画面で決定を押すと、
-    /// ホストのゲームだけがキャラ選択へ進んで画面が食い違ったまま戻らなかったため、繋がるまでは決定を通さず、2 台が同じ所から始められるようにする。
-    /// 諦めた後は止めない（`phase` が `Ended` になり、`Local`）。期間の中の作り直しはまだ繋がる前なので、その間は決定を落とし続ける。遅延の増分は 0。
+    /// まだ接続していない間の 1 tick。選択の画面（人対人の Match の 7・8・16）では、ローカルの入力から決定のビットだけを落としてゲームへ入れる（`Action::Menu`）。取消は通す（決定を止めれば 8 より先へ進めないので、取消で 6 へ戻るのは害が無い）。席は接続する前は決まらないので 1P の入力ワードとして入れる（キーボードの入力ワードは席に依らず、台本の入力ワードは 1P 側を読む）。2P の別の入力機器は読まない。それ以外は `Local`。
+    /// 接続する前にホストの台本が難易度の画面で決定を押すと、ホストのゲームだけがキャラ選択へ進んで画面が食い違ったまま戻らなかったため、接続するまでは決定を通さず、2 台が同じ所から始められるようにする。接続を諦めた後は止めない（`phase` が `Ended` になり、`Local`）。期間の中の作り直しはまだ接続する前なので、その間は決定を落とし続ける。遅延の増分は 0。
     fn unconnected_tick<G: Game>(&mut self, game: &mut G) -> Action {
-        // 成立を待つ実行（`code_side = game`。`Config::match_gate`）は、繋がる前も成立する前も入力に触らない: 試合へは両者が「妖怪 対 妖怪」を選び、
+        // 成立を待つ実行（`code_side = game`。`Config::match_gate`）は、接続する前も成立する前も入力に触らない: 試合へは両者が「妖怪 対 妖怪」を選び、
         // 成立してから自動の前進で入るので、決定を落とす理由が無く、落とすと待っている間にローカルの人間 対 人間を遊べなくなる。
         if self.cfg.match_gate {
             self.pre_link_decide_held = false;
             return Action::Local;
         }
-        // 選択の画面を持たないゲームのウィンドウ（`require_net_selection` が false）では、繋がる前にゲームの場面を読まない。
+        // 選択の画面を持たないゲームのウィンドウ（`require_net_selection` が false）では、接続する前にゲームの場面を読まない。
         if !self.cfg.require_net_selection {
             return Action::Local;
         }
@@ -2138,7 +2258,7 @@ impl NetPlay {
         let pressed = if entering { 0 } else { raw & !self.menu_prev };
         self.menu_prev = raw;
         let my = net_select::seat_index(seat);
-        // 合わせ（難易度・マップの画面。`selection.rs`）。ゲストは、この画面の合わせが届くまで動かず、押下も要求しない（相手が来る前の動きが
+        // 合わせ（難易度・マップの画面。`selection.rs`）。ゲストは、ホストが出すこの画面の合わせが届くまで動かず、押下も要求しない（相手が来る前の動きが
         // 捨てられて、カーソルの値だけ食い違う形を無くす）。ホストは止めない。キャラ選択は合わせない（相手の席は位置で書く。下の `peer_sync`）。
         let screen8 = u8::try_from(v.screen).unwrap_or(0);
         let mute = role == Role::Guest && !c.selection().is_aligned(screen8);
@@ -2314,7 +2434,7 @@ impl NetPlay {
                 }
                 self.steps.push(StepRec { step: st, own });
                 if !is_fmt {
-                    // 観戦: 入った押下。この tick の `Record::Menu`（下）より先に積む。形式の切替は積まない: 観戦者のマッチは対戦者の形式に依らず
+                    // 観戦: 入った押下。この tick の `Record::Menu`（下）より先に積む。形式の切替は積まない: 観戦者のマッチは対戦する側の形式に依らず
                     // 入力ワードの列だけで動くので、積むと観戦者が押下として入れてしまう。
                     Self::spec_to(&self.spec, Record::Step(st));
                 }
@@ -2582,7 +2702,7 @@ impl NetPlay {
         }
     }
 
-    /// latency の切替の予定（ホスト）。取得の前に要求すると、この取得に結び付く。rollback のモードではセッションが断る（`LatError::RollbackMode`）ので、
+    /// latency の切替の予定（ホスト）。取得の前にネットワークの側へ要求すると、この取得に結び付く。rollback のモードではセッションが断る（`LatError::RollbackMode`）ので、
     /// 予定は `lat_refused` に数えて飛ばす。
     fn lat_plan_step(c: &mut Connected, cfg: &Config, lat_next: &mut usize, stats: &mut Stats) {
         while let Some((at, delay)) = cfg.lat_plan.get(*lat_next) {
@@ -2643,6 +2763,7 @@ impl NetPlay {
         if self.cfg.check == CheckSource::InputDigest {
             self.digest = input_digest_push(self.digest, p1, p2);
         }
+        Self::spec_digest_push(&self.spec, &mut self.spec_digest, a.frame, p1, p2);
         let mut mismatch = None;
         if is_check_frame(a.frame) {
             let chk = match self.cfg.check {
@@ -2659,6 +2780,8 @@ impl NetPlay {
                 }
                 CheckSource::InputDigest => check_from_input_digest(seg, a.frame, self.digest),
             };
+            // 観戦の照合は `Frame` より前に積む（観戦者は feed の前の自分の値と比べる）。
+            Self::spec_check(&self.spec, self.cfg.check, &chk, self.spec_digest);
             if let Some(CheckResult::Mismatch { local, remote }) = c.submit_check(chk, net) {
                 mismatch = Some((local, remote));
             }
@@ -2707,7 +2830,7 @@ impl NetPlay {
         self.link.connected()
     }
 
-    /// AGREE で決まったモードと delay（rollback のモードなら D）。繋がる前は None。ゲームのスレッドから読む（値のコピーで、確保しない）。
+    /// AGREE で決まったモードと delay（rollback のモードなら D）。接続する前は None。ゲームのスレッドから読む（値のコピーで、確保しない）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn agreed_mode(&self) -> Option<(Mode, u8)> {
         self.link

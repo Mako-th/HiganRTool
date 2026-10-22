@@ -1,33 +1,8 @@
 //! 選択の台本（`--menu <ファイル>`）: ネットの選択で、peer_sim が「決めた MENU の語」と「画面を移る押下」を台本どおりに出す形。
-//!
-//! ゲームが無いので、画面は core の模型 `higanr_core::menu_model::Model` で追う（dll と共用）。この台本が決めるのは「どの画面で・何フレーム
-//! 待って・何を出すか」だけで、押下がいつ入るか（ホストが順番を決める）は core の `selection.rs`。
-//!
-//! ## 台本の形
-//!
-//! 1 行 1 項目。`#` から行末までは注。空の行は読み飛ばす。項目は上から順に 1 つずつ行う。
-//!
-//! ```text
-//! screen=S [wait=N] 動作
-//! ```
-//!
-//! - `screen=S`（必須）: 模型の画面がこれになってから行う。7 = 難易度・8 = キャラ・16 = マップ・6 = 選択の外
-//!   （難易度の画面の取消で出た後。動作は `enter` だけ）。
-//! - `wait=N`（既定 0。0〜36000）: 画面が `S` と同じになってから N フレーム待つ。待つ間に画面が変わったら数え直す。
-//! - 動作（どれか 1 つ）:
-//!   - `word=キー[+キー…] [hold=N]`: MENU の自分の語を N フレーム（既定 1。1〜36000）の間これにする。キー名は
-//!     `higanr_core::script::key_by_name`（`Z` `X` `SHIFT` `ESC` `UP` `DOWN` `LEFT` `RIGHT`）か `0x` の 16 進（`SEND_MASK` の中）。
-//!     送るときに `--mask` を掛け、画面を移るビット（`menu_model::TRANSITION_BITS`。Z・X・Esc）を落とす（画面を移るのは STEP でだけ）。
-//!     画面を移るビットだけの語は、落とすと 0 になるので断る。
-//!   - `press=decide|cancel`: 画面を移る押下。難易度・マップの画面は `value=V`（既定 0。難易度 0〜3・マップの一覧の値 0〜15。
-//!     14 = −1、15 = −2）。キャラの画面は、決定なら `cursor=C`（既定 0。0〜15）と `shift=0|1`（既定 0）から自分の席で
-//!     `menu_model::chara_value` を作り、取消はカーソル 0（`cursor` と `shift` は書けない）。押下が入ったら（`FrameOut::apply` に
-//!     同じ kind・value・画面が来たら）項目を終える。入るまで、ホストは相手が来ていれば毎フレーム押し直し、ゲストは要求が
-//!     捨てられたら `RETRY_FRAMES` フレーム後に押し直す。
-//!   - `enter`: 選択の外（画面 6）から、自分で次の選択に入る（模型は難易度 7 から）。相手が先に入った（`Recv::PeerSelecting`）ら、
-//!     この項目は行わずに終える（peer_sim 同士で両者が待ち合って止まらないように）。
-//! - 知らない名前・範囲の外・同じ名前の 2 回目・動作の無い行・動作が 2 つある行は、行の番号を添えて断り、台本全体を使わない
-//!   （`higanr_core::script::parse` と同じ `ParseError`）。
+//! ゲームが無いので、画面は core の模型 `higanr_core::menu_model::Model` で追う（dll と共用）。この台本が決めるのは「どの画面で・何フレーム待って・何を出すか」だけで、押下がいつ入るか（ホストが順番を決める）は core の `selection.rs`。
+//! 1 行 1 項目（`#` から行末は注）。形は `screen=S [wait=N] 動作`、動作は `word=キー[+キー…] [hold=N]` / `press=decide|cancel [value=V | cursor=C shift=0|1]` / `enter` のどれか 1 つ。
+//! `word` は送るときに `--mask` を掛け、画面を移るビット（`menu_model::TRANSITION_BITS`。Z・X・Esc）を落とす（画面を移るのは STEP でだけ）。
+//! 知らない名前・範囲の外・同じ名前の 2 回目・動作の無い行・動作が 2 つある行は、行の番号を添えて断り、台本全体を使わない（`higanr_core::script::parse` と同じ `ParseError`）。
 
 use std::collections::HashMap;
 
@@ -149,36 +124,35 @@ fn ranged(
 ) -> Result<u32, ParseError> {
     let v = match fields.get(name) {
         None => default,
-        Some(s) => {
-            parse_u32(s).ok_or_else(|| err(line, format!("{name} の値が数として読めない: {s}")))?
-        }
+        Some(s) => parse_u32(s)
+            .ok_or_else(|| err(line, format!("{name} の値が数値として読み取り不能: {s}")))?,
     };
     if v < min || v > max {
         return Err(err(
             line,
-            format!("{name} の値が範囲の外（{min}〜{max}）: {v}"),
+            format!("{name} の値が範囲外です（{min}〜{max}）: {v}"),
         ));
     }
     Ok(v)
 }
 
-/// `word=` の値: キー名を `+` でつないだものか `0x` の 16 進。`SEND_MASK` の外は誤り。
+/// `word=` の値: キー名を `+` で区切ったものか `0x` の 16 進。`SEND_MASK` の外は誤り。
 fn parse_keys(line: u32, v: &str) -> Result<u16, ParseError> {
     let keys = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
         u16::from_str_radix(h, 16)
-            .map_err(|_| err(line, format!("word の値が 16 進として読めない: {v}")))?
+            .map_err(|_| err(line, format!("word の値が 16 進として読み取り不能: {v}")))?
     } else {
         let mut acc = 0u16;
         for part in v.split('+') {
             acc |= key_by_name(part)
-                .ok_or_else(|| err(line, format!("word に知らないキー名があります: {part}")))?;
+                .ok_or_else(|| err(line, format!("word に不明なキー名があります: {part}")))?;
         }
         acc
     };
     if keys & !SEND_MASK != 0 {
         return Err(err(
             line,
-            format!("word が SEND_MASK（{SEND_MASK:#06x}）の外です: {v}"),
+            format!("word が SEND_MASK（{SEND_MASK:#06x}）の範囲外です: {v}"),
         ));
     }
     if keys & !TRANSITION_BITS == 0 {
@@ -209,12 +183,12 @@ fn parse_line(line: u32, tokens: &[&str]) -> Result<Item, ParseError> {
         }
         let (name, value) = tok
             .split_once('=')
-            .ok_or_else(|| err(line, format!("`=` が無い欄です: {tok}")))?;
+            .ok_or_else(|| err(line, format!("`=` がない欄です: {tok}")))?;
         if !KNOWN.contains(&name) {
-            return Err(err(line, format!("知らない名前です: {name}")));
+            return Err(err(line, format!("不明な名前です: {name}")));
         }
         if fields.insert(name, value).is_some() {
-            return Err(err(line, format!("{name} を 2 回書いています")));
+            return Err(err(line, format!("{name} が重複しています")));
         }
     }
     let screen_raw = fields
@@ -595,6 +569,7 @@ mod tests {
     const D: StepKind = StepKind::Decide;
     const C: StepKind = StepKind::Cancel;
 
+    #[cfg(dev_assets)]
     #[test]
     fn the_m2_3_plan_in_the_repository_reads() {
         let p = parse(include_str!("../../../scripts/m2_02_peer_menu.plan"))
@@ -668,29 +643,29 @@ mod tests {
     #[test]
     fn refused_forms() {
         let cases: &[(&str, u32, &str)] = &[
-            ("screen=7 press=decide foo=1", 1, "知らない名前"),
-            ("\nscreen=7 press=decide value=4", 2, "範囲の外"),
-            ("screen=16 press=decide value=16", 1, "範囲の外"),
-            ("screen=7 press=decide wait=1 wait=2", 1, "2 回"),
+            ("screen=7 press=decide foo=1", 1, "不明な名前"),
+            ("\nscreen=7 press=decide value=4", 2, "範囲外"),
+            ("screen=16 press=decide value=16", 1, "範囲外"),
+            ("screen=7 press=decide wait=1 wait=2", 1, "重複"),
             ("screen=7 wait=3", 1, "ちょうど 1 つ"),
             ("screen=7 word=LEFT press=decide", 1, "ちょうど 1 つ"),
             ("screen=7 press=push", 1, "decide か cancel"),
             ("screen=9 press=decide", 1, "6・7・8・16"),
             ("press=decide", 1, "screen= が要る"),
             ("screen=8 press=decide value=3", 1, "value= を書かない"),
-            ("screen=8 press=decide cursor=16", 1, "範囲の外"),
-            ("screen=8 press=decide shift=2", 1, "範囲の外"),
+            ("screen=8 press=decide cursor=16", 1, "範囲外"),
+            ("screen=8 press=decide shift=2", 1, "範囲外"),
             ("screen=8 press=cancel cursor=1", 1, "取消はカーソル 0"),
             ("screen=7 press=decide cursor=1", 1, "キャラの画面"),
             ("screen=7 enter", 1, "enter は screen=6"),
             ("screen=6 press=decide", 1, "enter は screen=6"),
             ("screen=7 word=Z+X", 1, "画面を移るキー"),
             ("screen=7 word=0x100", 1, "SEND_MASK"),
-            ("screen=7 word=LEFT+JUMP", 1, "知らないキー名"),
-            ("screen=7 word=LEFT hold=0", 1, "範囲の外"),
+            ("screen=7 word=LEFT+JUMP", 1, "不明なキー名"),
+            ("screen=7 word=LEFT hold=0", 1, "範囲外"),
             ("screen=7 press=decide hold=2", 1, "hold は word="),
             ("screen=7 word=LEFT value=1", 1, "value は press="),
-            ("screen=7 press", 1, "`=` が無い"),
+            ("screen=7 press", 1, "`=` がない"),
             ("# 注だけ\n\n", 0, "1 つも無い"),
         ];
         for (text, line, want) in cases {
@@ -862,6 +837,7 @@ mod tests {
         assert_eq!(r.done_items(), 1);
     }
 
+    #[cfg(dev_assets)]
     #[test]
     fn every_plan_in_scripts_parses() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
@@ -879,8 +855,7 @@ mod tests {
         assert!(n >= 2, "scripts/*.plan が {n} 本");
     }
 
-    /// 壊れたら落ちる: 押し続けで毎フレーム動く・Shift 付きで動く・キャラの画面の外でも位置を送る・自分の決定の値へ合わせない・
-    /// 相手の席の決定で動く。
+    /// 押し続け・Shift 付き・キャラの画面の外・相手の席の決定では動かない。
     #[test]
     fn sim_cursor_moves_on_edges_and_takes_its_own_decide() {
         use keys::{DOWN, LEFT, RIGHT, SHIFT, UP};

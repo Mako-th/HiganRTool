@@ -1,22 +1,10 @@
 //! ウィンドウモードのペースの第 3 の待ち方 b-hybrid の判断（pure）。期限の手前までは寝て、最後の短い間だけ b-spin と同じく回る。
 //!
-//! b-spin は期限の前ずっと `Sleep(0)` で回って論理コア 1 つを使い続ける。寝る方式 b は入力 → Present の前が b-spin より
-//! p99 で約 +500 µs 悪かった（実測。原因は寝ることまでで、電源まわりの副作用と推定）。b-hybrid は寝るのを「期限 −（回し読みの幅 + 余裕）」までにとどめ、その後は b-spin と
-//! 同じに回る。余裕の間に CPU が起き直す見込み（実機で測っていない）。既定は b-spin のまま。数値は ini の `[pacing]` で変えられる（`HybridParams`。名前・範囲・既定は `HYBRID_KEYS`）。
-//!
-//! フレームの始まりの 3 つの区間（期限 D、いま t、残り r = D − t。`spin` は `hybrid_spin_us`）:
-//!
-//! | 残り r | 始まりでのこと | 戻り |
-//! |---|---|---|
-//! | r > spin + 余裕 | 高分解能の待機タイマーで寝る。長さ = min(r − spin − 余裕, `hybrid_chunk_us`) を µs に切り捨て | まだ（メッセージループへ） |
-//! | spin < r ≤ spin + 余裕 | b-spin と同じく `Sleep(0)` で譲る | まだ |
-//! | r ≤ spin | QPC を読み続けて期限ちょうどに始める（`Pace::decide` の `Head::Spin`） | 始める |
-//!
+//! b-spin は期限の前ずっと `Sleep(0)` で回って論理コア 1 つを使い続ける。寝る方式 b は入力 → Present の前が b-spin より p99 で約 +500 µs 悪かった（実測。原因は寝ることまでで、電源まわりの副作用と推定）。b-hybrid は寝るのを「期限 −（回し読みの幅 + 余裕）」までにとどめ、その後は b-spin と同じに回る。余裕の間に CPU が起き直す見込み（実機で測っていない）。auto の既定の待ち方（`[pacing] wait = passive`）。数値は ini の `[pacing]` で変えられる（`HybridParams`。名前・範囲・既定は `HYBRID_KEYS`）。
+//! フレームの始まり（期限 D、いま t、残り r = D − t。`spin` は `hybrid_spin_us`）: r > spin + 余裕 は高分解能の待機タイマーで寝る（長さ = min(r − spin − 余裕, `hybrid_chunk_us`) を µs に切り捨て）、r ≤ spin + 余裕 は `Sleep(0)` で譲る、r ≤ spin は QPC を読み続けて期限ちょうどに始める（`Pace::decide` の `Head::Spin`）。
 //! **余裕**（`Doze::margin`）= max(`hybrid_margin_us`, 寝過ごしの山 + `hybrid_guard_us`) を `hybrid_margin_max_us` で抑えたもの。
 //! 寝過ごし = 実際に寝た長さ − 頼んだ長さ。山は寝るたびに減り、新しい寝過ごしがそれより大きければその値になる。
-//!
-//! 寝る長さは `us ≤ r − spin − 余裕` で決めるので、寝過ごしが「余裕 + spin」以下なら期限を越えない。越えたフレームは
-//! `late = 1` になり、越え続ける PC では `hybrid_fallback_*` の数に達した時点でその実行の残りを b-spin に戻す（`Doze::fell_back`）。
+//! 寝る長さは `us ≤ r − spin − 余裕 ` で決めるので、寝過ごしが「余裕 + spin」以下なら期限を越えない。越えたフレームは `late = 1` になり、越え続ける PC では `hybrid_fallback_*` の数に達した時点でその実行の残りを b-spin に戻す（`Doze::fell_back`）。
 //! 遅延: 入力 → Present の間は変えない。増えうるのは、寝過ごしが余裕 + spin を越えたフレームの開始の遅れだけ。
 #![forbid(unsafe_code)]
 
@@ -70,7 +58,7 @@ impl HybridParams {
         fallback_frames: FALLBACK_FRAMES,
     };
 
-    /// ini のキーに値を置く（`HYBRID_KEYS` の範囲で確かめる）。知らないキーは `Ok(false)`。
+    /// ini のキーに値を設定する（`HYBRID_KEYS` の範囲で検証する）。知らないキーは `Ok(false)`。
     pub fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
         let Some(k) = HYBRID_KEYS.iter().find(|k| k.name == key) else {
             return Ok(false);
@@ -82,7 +70,7 @@ impl HybridParams {
             .flatten()
             .filter(|n| (k.min..=k.max).contains(n))
             .ok_or(format!(
-                "{} の値 {value:?} は {}〜{} の整数（{}。既定 {}）",
+                "{} の値 {value:?} は {}〜{} の整数にしてください（{}。既定 {}）",
                 k.name, k.min, k.max, k.unit, k.default
             ))?;
         *(k.field)(self) = n;
@@ -93,7 +81,7 @@ impl HybridParams {
     pub fn check(&self) -> Result<(), String> {
         if self.margin_us > self.margin_max_us {
             return Err(format!(
-                "hybrid_margin_us = {} が hybrid_margin_max_us = {} より大きい（下限 ≤ 上限）",
+                "hybrid_margin_us = {} が hybrid_margin_max_us = {} より大きいです（下限 ≤ 上限）",
                 self.margin_us, self.margin_max_us
             ));
         }

@@ -1,7 +1,10 @@
 //! Win32 の層（unsafe はこのファイルに閉じ込める。1 つずつ `// SAFETY:`）。
-//! 自分のモジュールのパス・exe の位置・自分のプロセスのメモリの読み取り（`VirtualQuery` で頁を確かめてから読む）・時刻・
-//! 二重注入のミューテックス・スレッドを 1 本起こすこと・デバッガへの一言。ゲームのメモリに書く API はここに無い（書く層は `hook_win.rs`）。
+//! 自分のモジュールのパス・exe の位置・自分のプロセスのメモリの読み取り（`VirtualQuery` で頁をチェックしてから読む）・時刻・
+//! 二重注入のミューテックス・スレッドを 1 本作ること・デバッガへの一言。ゲームのメモリに書く API はここに無い（書く層は `hook_win.rs`）。
 //! ウィンドウも作らず、ネットワークにも出ない。
+
+// std の ProcessPrng の遅延読み込みが失敗したときのフック（build.rs の /DELAYLOAD と対）。
+higanr_prng_shim::install_delay_load_hook!();
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -70,8 +73,9 @@ pub fn module_path(module: HMODULE) -> Option<PathBuf> {
     }
 }
 
-/// アドレス `addr` が入っているモジュールのパス（D3D8 の EndScene / Present が d3d8.dll かラッパーかを見るため。参照カウントは増やさない）。
+/// アドレス `addr` が入っているモジュールのパス（参照カウントは増やさない）。
 /// どのモジュールにも入っていなければ `None`。
+#[cfg_attr(test, allow(dead_code))] // 使うのは `window_win::original`（検査の構成には無い）だけ
 pub fn module_of_addr(addr: u32) -> Option<PathBuf> {
     let mut module: HMODULE = core::ptr::null_mut();
     // SAFETY: 旗は「アドレスから引く」＋「参照カウントを増やさない」（閉じなくてよい）。第 2 引数はアドレスを指す疑似ポインタで、中身は読まれない。
@@ -88,7 +92,7 @@ pub fn module_of_addr(addr: u32) -> Option<PathBuf> {
     module_path(module)
 }
 
-/// Wine の版（`ntdll.dll` が `wine_get_version` を持つときだけ）。Windows では `None`。ログの 1 行のためで、ゲームのスレッドでは呼ばない。
+/// Wine のバージョン（`ntdll.dll` が `wine_get_version` を持つときだけ）。Windows では `None`。ログの 1 行のためで、ゲームのスレッドでは呼ばない。
 pub fn wine_version() -> Option<String> {
     let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
     // SAFETY: 0 終わりの UTF-16 の名前。ntdll は全プロセスに読み込み済みで、参照カウントを増やさない。
@@ -176,13 +180,13 @@ pub fn read_own_memory(addr: u32, len: usize) -> Option<Vec<u8>> {
     read_own_into(addr, &mut out).then_some(out)
 }
 
-/// `[addr, addr + buf.len())` を `buf` に読む。**ヒープを使わない**（スレッドを止めている間の読み直し用）。
-/// 頁がすべてコミット済みで読める保護でなければ false（確かめ終わるまで 1 バイトも書かない）。
+/// `[addr, addr + buf.len())` を `buf` に読む。**ヒープを使わない**（フックの手順が、スレッドを止めている間に読み直すため）。
+/// 頁がすべてコミット済みで読める保護でなければ false（検証し終わるまで 1 バイトも書かない）。
 pub fn read_own_into(addr: u32, buf: &mut [u8]) -> bool {
     readable_range(addr as usize, buf.len()) && {
         for (i, b) in buf.iter_mut().enumerate() {
-            // SAFETY: 範囲の頁を直前に VirtualQuery でコミット済み・読める保護と確かめた。th09.exe のイメージの頁は解放されず、
-            // この DLL が保護を変えるのは `hook_win` だけで、それも読める保護の間を行き来するだけ。確かめてから読むまでに別の DLL が保護を外すことは起きない
+            // SAFETY: 範囲の頁を直前に VirtualQuery でコミット済み・読める保護と検証した。th09.exe のイメージの頁は解放されず、
+            // この DLL が保護を変えるのは `hook_win` だけで、それも読める保護の間を行き来するだけ。検証してから読むまでに別の DLL が保護を外すことは起きない
             // 前提（ローダーがサスペンドで起動して読ませるので、他の注入物は並んでいない）。
             // volatile なのは、ゲームのスレッドが書き換えうるアドレスの読みを最適化で畳ませないため。
             *b = unsafe { core::ptr::read_volatile((addr as usize + i) as *const u8) };
@@ -278,7 +282,7 @@ pub fn close_handle(h: HANDLE) {
     unsafe { CloseHandle(h) };
 }
 
-/// DLL_PROCESS_ATTACH でやること（ローダーロックの下）: ミューテックスを取り、読み取りのスレッドを起こすだけ。待たない。
+/// DLL_PROCESS_ATTACH でやること（ローダーロックの下）: ミューテックスを取り、読み取りのスレッドを作るだけ。待たない。
 /// false を返すと DllMain が FALSE を返し、DLL は読まれない。
 pub fn on_process_attach(module: HMODULE) -> bool {
     let name = mutex_name(std::process::id());
@@ -289,7 +293,7 @@ pub fn on_process_attach(module: HMODULE) -> bool {
             return false;
         }
         Err(MutexRefusal::Failed(code)) => {
-            // 1 本目と確かめられないので読まない（2 本が同じ地点を見張るより、始めない方が安全）。
+            // 1 本目と判定できないので読まない（2 本が同じ地点を見張るより、始めない方が安全）。
             debug_out(&format!(
                 "HiganRTool: 二重注入のミューテックスを作れない（GetLastError = {code}）"
             ));
@@ -299,6 +303,11 @@ pub fn on_process_attach(module: HMODULE) -> bool {
     // ウィンドウモードのウィンドウを作る呼び出しの差し替え（ini の `[window]`）。ゲームのメインスレッドが走り出す前のここでしか間に合わない。
     // ini はここで読まない（ローダーロック）。失敗しても DLL の読み込みは止めない。
     crate::window_win::install(module);
+    // 起動の計測の BeginScene の守り。同じく DllMain の中でしか間に合わず、失敗しても読み込みは止めない。
+    crate::calib_guard_win::install();
+    // フルスクリーンの垂直同期の答え（ini の `[pacing] vsync`。ini は最初に答えるときに読む）と、デバイスが失われている間のメインループの寝。
+    crate::vsync_answer_win::install(module);
+    crate::lost_sleep_win::install();
     // SAFETY: `probe_thread` は LPTHREAD_START_ROUTINE の形。引数は自分の DLL のハンドルで、この DLL は自分を解放しない。
     // 属性 NULL・スタックの大きさ既定・すぐ走らせる・スレッド ID は不要。
     let thread = unsafe {
@@ -370,7 +379,7 @@ fn run_probe_thread(module: HMODULE) {
     ));
     // tick ごとの行などは本ログの隣に、回ごとの名前の先頭で。
     let exe_dir = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    // 台本の読み込み（DLL のフォルダの script.txt を読み、本ログの隣へ移す。ゲームのフォルダの中には触らない）。
+    // 台本の読み込み（DLL のフォルダの script.txt を読み、そのファイルを本ログの隣へ移す。ゲームのフォルダの中には触らない）。
     let mut script = RealScriptHost {
         dll_dir: dll.as_deref().and_then(Path::parent).map(Path::to_path_buf),
         run_path: Some(run_path.clone()),
@@ -390,12 +399,13 @@ fn run_probe_thread(module: HMODULE) {
     let (sse2, avx2) = cpu_features();
     let _ = writeln!(file, "{}", probe::system_line(os_version(), sse2, avx2));
     let _ = match &veh {
-        Ok(()) => writeln!(detail_out(&mut file), "例外の記録: 入れた"),
-        Err(why) => writeln!(file, "例外の記録: 入れられなかった（{why}）"),
+        Ok(()) => writeln!(detail_out(&mut file), "例外: ハンドラ登録済み"),
+        Err(why) => writeln!(file, "例外: ハンドラ登録不能（{why}）"),
     };
     if let Some(v) = wine_version() {
         let _ = writeln!(file, "環境: Wine {v}");
     }
+    log_prng_fallback_once(&mut file);
     // 落ちたときの `d3d8.dll+RVA` が OS のものか差し替えかを読めるように。
     let _ = writeln!(file, "{}", crate::d3d8_info_win::d3d8_line());
     if let Some(line) = &seed_line {
@@ -404,18 +414,21 @@ fn run_probe_thread(module: HMODULE) {
     if let Some(note) = &choice.note {
         let _ = writeln!(file, "{note}");
     }
-    // 配るバージョンだけ、`logs\` の古いログを消す（このスレッドはゲームのスレッドではない。フックを置く前の数 ms）。
+    // 配るバージョンだけ、`logs\` の古いログを消す（このスレッドはゲームのスレッドではない。フックを設置する前の数 ms）。
     if cfg!(feature = "dist")
         && let Some(dir) = run_path.parent()
     {
         let (removed, failed) = prune_old_logs(dir, &local_time(), KEEP_LOG_DAYS);
-        let line = format!(
-            "古いログ: 名前の日付が {KEEP_LOG_DAYS} 日より前のものを {removed} 個消した（消せなかった {failed} 個）"
-        );
         if failed > 0 {
-            let _ = writeln!(file, "{line}");
+            let _ = writeln!(
+                file,
+                "過去のログ: 名前の日付が {KEEP_LOG_DAYS} 日より前のものを {removed} 個消しました（ {failed} 個が消せませんでした）。"
+            );
         } else {
-            let _ = writeln!(detail_out(&mut file), "{line}");
+            let _ = writeln!(
+                detail_out(&mut file),
+                "過去のログ: 名前の日付が {KEEP_LOG_DAYS} 日より前のものを {removed} 個消しました（消せなかったもの {failed} 個）"
+            );
         }
     }
     let mut rec = RealRecord::new(Some(run_path), exe_dir);
@@ -444,16 +457,19 @@ fn run_probe_thread(module: HMODULE) {
     }));
     // パッドの終わりの数えの 1 行を頼む。次の本ログへの書き込みの始まりで本ログへ入る。
     crate::pad_extra_win::push_final_counts();
+    log_prng_fallback_once(&mut file);
     let _ = match r {
-        Ok(End::NotInstalled) => writeln!(file, "終了: スレッドを終える（フックは設置していない）"),
+        Ok(End::NotInstalled) => {
+            writeln!(file, "終了: スレッドを終えます（フックは設置していない）。")
+        }
         Ok(End::Installed) => writeln!(
             detail_out(&mut file),
-            "終了: スレッドを終える（フックは残る。外す手順は無い）"
+            "終了: スレッドを終了します（フックは残ります。外す手順はありません）"
         ),
         // パニックがどこで起きたかで、書いたかどうかは変わる。止めたスレッドは `hook::Stopped` の Drop が戻している。
         Err(p) => writeln!(
             file,
-            "終了: パニックを受けて止めた（{}）。スレッドを終える（書いたかどうかは上の行を見る）",
+            "終了: パニックを受けて止めました（{}）。スレッドを終えます（書いたかどうかは上の行を見てください）。",
             panic_text(p.as_ref())
         ),
     };
@@ -462,6 +478,17 @@ fn run_probe_thread(module: HMODULE) {
     }
     // 「終了」の行の後に頼まれた分も本ログの最後へ流す。
     file.drain_now();
+}
+
+/// `ProcessPrng` の代わりが使われていれば 1 回だけ書く。乱数は引かず数を読むだけなので、ログの先頭の時点で標準ライブラリの種が
+/// まだ引かれていなければ書かれない。終わりの前にもう一度呼ぶ。
+fn log_prng_fallback_once(file: &mut impl Write) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if higanr_prng_shim::fallback_in_use()
+        && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = writeln!(file, "{}", higanr_prng_shim::fallback_log_line());
+    }
 }
 
 /// ログに書く行から伏せるフォルダ（ゲームと DLL）。名前が出ない形に替えて書く。
@@ -481,7 +508,7 @@ fn mode_line(detail: bool) -> String {
     if detail {
         format!("{DETAIL_MARK}（ini の [log] detail = 1 か開発用の既定。CSV も書く）")
     } else {
-        format!("{BRIEF_MARK}（本ログだけ。詳しく調べるときは ini の [log] の detail を 1 に）")
+        format!("{BRIEF_MARK}（ini で [log] detail = 1にすると詳細）")
     }
 }
 
@@ -515,7 +542,7 @@ fn open_log(dll: Option<&Path>, exe: Option<&Path>) -> Result<MainLog, String> {
         .join("logs");
     let exe_dir = exe
         .and_then(Path::parent)
-        .ok_or("exe のフォルダが分からないので、ゲームのフォルダの外か確かめられない")?;
+        .ok_or("exe のフォルダが不明なのでゲームのフォルダの外かチェックできません")?;
     if is_same_or_inside(&dir.to_string_lossy(), &exe_dir.to_string_lossy()) {
         return Err(format!(
             "ログの置き場 {} が exe のフォルダの中なので書かない",
@@ -534,8 +561,7 @@ struct MainLog {
     fallback_note: Option<&'static str>,
 }
 
-const FALLBACK_NOTE: &str =
-    "日ごとの本ログを別の起動が開いていて使えなかったので、この起動は起動ごとのファイルに書く";
+const FALLBACK_NOTE: &str = "同日のログが他のプログラムに使われていて開けませんでした。\n起動ごとに別のファイルへ書きます。";
 
 /// 日ごとの本ログを開くときの共有の指定（`FILE_SHARE_READ | FILE_SHARE_DELETE`）。読みと削除だけ許し、書き込みは 1 つの起動に限る
 /// （同じ日の 2 つの起動が同じファイルへ書くと、区切りの行の範囲が崩れる）。
@@ -622,18 +648,12 @@ struct RealEnv {
 }
 
 impl Env for RealEnv {
-    fn now(&self) -> LocalTime {
-        local_time()
-    }
-    fn pid(&self) -> u32 {
-        std::process::id()
-    }
     fn exe_path(&self) -> Option<String> {
         self.exe.as_ref().map(|p| p.display().to_string())
     }
     fn ident(&self) -> IdentOutcome {
         match &self.exe {
-            None => IdentOutcome::Unreadable("exe のパスが取れない".to_string()),
+            None => IdentOutcome::Unreadable("exe のパス取得不能".to_string()),
             Some(p) => probe::ident_of_file(std::fs::read(p), &TH09_V150A),
         }
     }
@@ -652,7 +672,26 @@ mod tests {
 
     static SAMPLE: [u8; 8] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
 
-    /// Windows では `wine_get_version` が無く `None`。Wine で走らせたときは版の文字列（空でない ASCII）になる。
+    // 変数の綴りが違う・変数を設定する呼びが消えても、リンクは通り、`delayimp.lib` の既定の何もしない hook が選ばれてしまう。
+    #[test]
+    fn delay_load_hook_variables_are_ours() {
+        higanr_prng_shim::assert_delay_load_hooks_installed!();
+    }
+
+    // 文面を読む検査なので、リンクされた DLL は見ていない（配布のビルドの `check_pe` が通常の import を見る）。
+    #[test]
+    fn build_rs_passes_the_delay_load_flags() {
+        let build_rs = include_str!("../build.rs");
+        for flag in [
+            "cargo:rustc-link-arg-cdylib=/DELAYLOAD:{}",
+            "higanr_prng_shim::PRNG_DLL",
+            "cargo:rustc-link-arg-cdylib=delayimp.lib",
+        ] {
+            assert!(build_rs.contains(flag), "{flag}");
+        }
+    }
+
+    /// Windows では `wine_get_version` が無く `None`。Wine で走らせたときはバージョンの文字列（空でない ASCII）になる。
     #[test]
     fn wine_version_is_none_or_a_plain_string() {
         if let Some(v) = wine_version() {
@@ -663,7 +702,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: RtlGetVersion の呼び方（構造体の大きさ・呼び出し規約）を誤って値が取れない・0 になる。
     #[test]
     fn os_version_and_cpu_features_are_read() {
         let v = os_version().expect("RtlGetVersion が値を返す");
@@ -761,8 +799,6 @@ mod tests {
         v
     }
 
-    /// 壊れたら落ちる: 日ごとの本ログが起動ごとに別ファイルになる・上書き（前の起動の行が消える）・
-    /// 隣のファイルの名前の元が日ごとの名前になる（別の起動の CSV と同じ名前になる）。
     #[test]
     fn the_daily_main_log_is_appended_across_launches_and_side_names_stay_per_run() {
         let d = temp_logs("daily");
@@ -793,7 +829,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: DLL のフォルダの `script.txt` を見ずに、台本の実行を日ごとの 1 ファイルへ混ぜる。
     #[test]
     fn a_script_file_next_to_the_dll_makes_the_run_scripted() {
         let d = temp_logs("scripted");
@@ -808,7 +843,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 台本の実行が日ごとの 1 ファイルに混ざる、または既存の回ごとのログを上書きする。
     #[test]
     fn the_per_run_main_log_is_a_new_file_each_launch() {
         let d = temp_logs("per_run");
@@ -828,9 +862,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: 同じ日に 2 つの起動が同じ日ごとの本ログへ書き込みで開く（区切りの行の範囲が崩れる）、
-    /// または共有違反のときに起動ごとのファイルへ逃げず失敗する・理由の 1 行が付かない、
-    /// 書き込み中の日ごとの本ログを既定の共有で読めない。
+    /// 共有違反のときの理由の 1 行・書き込み中の日ごとの本ログを既定の共有で読めないことも見る。
     #[test]
     fn a_second_launch_on_the_same_day_falls_back_to_its_own_file() {
         let d = temp_logs("share");

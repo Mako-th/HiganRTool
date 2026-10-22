@@ -1,4 +1,4 @@
-// 検査の道具: ルームへ WebSocket で繋ぐ関数と、届いた文を順に待つ入れ物。送り元の IP は文書用のアドレスだけを使う。
+// 検査のツール: ルームへ WebSocket で接続する関数と、届いた文を順に待つ入れ物。送り元の IP は文書用のアドレスだけを使う。
 import { env, exports } from "cloudflare:workers";
 import { normalizeRoomName } from "../src/rules";
 
@@ -102,7 +102,7 @@ export class Client {
   }
 }
 
-/** ルーム名（打った文字のまま）で繋ぐ。dll と同じく UTF-8 をパーセント符号化してパスに載せる。 */
+/** ルーム名（打った文字のまま）で接続する。dll と同じく UTF-8 をパーセント符号化してパスに載せる。 */
 export async function connect(room: string, ip?: string, cid?: string): Promise<Client> {
   const query = cid === undefined ? "" : `?cid=${cid}`;
   const res = await rawConnect(`/v0/rooms/${encodeURIComponent(room)}${query}`, { ip });
@@ -119,7 +119,7 @@ export function freshBuild(): number {
   return 1_000_000 + parseInt(fileTag, 16) * 1000 + buildSeq;
 }
 
-/** ランダム対戦の待ち列へ繋ぐ（パス `/v0/random/<ビルド番号>`）。 */
+/** ランダム対戦の待ち列へ接続する（パス `/v0/random/<ビルド番号>`）。 */
 export async function connectRandom(build: number, ip?: string, cid?: string): Promise<Client> {
   const query = cid === undefined ? "" : `?cid=${cid}`;
   const res = await rawConnect(`/v0/random/${build}${query}`, { ip });
@@ -129,7 +129,7 @@ export async function connectRandom(build: number, ip?: string, cid?: string): P
   return new Client(res.webSocket);
 }
 
-/** 進行中のランダム対戦の一覧へ繋ぐ（post = 載せる口・view = 見る口。パス `/v0/watch/<ビルド番号>/<post|view>`）。 */
+/** 進行中のランダム対戦の一覧へ接続する（post = 載せる口・view = 見る口。パス `/v0/watch/<ビルド番号>/<post|view>`）。 */
 export async function connectWatch(build: number, kind: "post" | "view", ip?: string): Promise<Client> {
   const res = await rawConnect(`/v0/watch/${build}/${kind}`, { ip });
   if (res.status !== 101 || res.webSocket === null) {

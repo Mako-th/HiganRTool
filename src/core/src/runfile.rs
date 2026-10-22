@@ -1,32 +1,10 @@
-//! 実機の回の定義ファイル `scripts/runs/<回>.run` の読み方と、組（台本 × ini × peer_sim の引数 × ゲーム）の検査（pure）。
+//! 実機の検証の定義ファイル `scripts/runs/<回>.run` の読み方と、組（台本 × ini × peer_sim の引数 × ゲーム）の検査（pure）。
 //!
-//! 古い台本や引数の組み合わせで回を起こして止まるのを防ぐため、組を 1 つの定義にまとめ、今の決まりから言える組の誤りを
+//! 古い台本や引数の組み合わせで回を実行して止まるのを防ぐため、組を 1 つの定義にまとめ、今の決まりから言える組の誤りを
 //! `cargo test`（`src/core/tests/runs_consistency.rs`）で落とす。
-//!
-//! ## 形
-//!
-//! 1 行 1 項目の `key = value`。`#` から行末までは注、空の行は読み飛ばす。知らないキー・同じキーの 2 回目・
-//! 値の無い行は、行の番号を添えて断る（綴りの誤りで既定のまま走らないように）。
-//!
-//! | key | 要るか | 値 |
-//! |---|---|---|
-//! | `script` | 要る | 台本のパス（リポジトリの直下から。`scripts/` で始まる。`build/bin/script.txt` へコピーするもの）。台本を置かない回（人が操作する回など）は `none` |
-//! | `ini` | 要る | DLL の ini のパス（同上。`build/bin/HiganRTool.ini` へコピーするもの） |
-//! | `peer_sim` | ネットワークの回だけ | peer_sim の引数の列（空白で区切る。引用符は使えない）。無ければネットワークなし。観戦者の回（ini が `code_side = spectate`）では、対戦のホスト役の peer_sim |
-//! | `peer_sim2` | 観戦者の回だけ | 観戦者の回で、対戦のゲスト役の peer_sim の引数の列（対戦は peer_sim の 2 つが行うため） |
-//! | `game` | 要る | `a` / `b` / `c`（検査用のコピー `th09_a` / `th09_b` / `th09_c` の記号。パスそのものは書かない。`c` は観戦者が 3 台目のとき） |
-//! | `second` | 無くてよい | 相手が本物の花映塚の 2 台の回: 相手の定義のパス `scripts/runs/<回>.run`（peer_sim の代わり）か `none`。相手の定義も自分を指し、ゲームのコピーと role が互いに違うこと |
-//! | `watcher` | 無くてよい | 3 台の回のホストの定義だけ: 観戦者（本物の花映塚）の定義のパス。`second` と一緒に書き、ホストの ini に `[spectate] enable = 1` が要る。観戦者の定義は `watching` で自分を指す |
-//! | `watching` | 無くてよい | 3 台の回の観戦者の定義だけ: 観戦するホストの定義のパス。ini は `code_side = spectate`（観戦用のコードをファイルで貼る形）か `code_side = game`（ゲーム内のメニューの「ルームで観戦」）。`peer_sim`・`second`・`role` は書かない。`watcher` と一緒には書けない |
-//! | `limit_min` | 要る | 起動から何分で集計が出なければ止めるか（1〜60） |
-//! | `purpose` | 要る | 何を見る回か（1 行） |
-//! | `role` | 無くてよい | ネットワークの回での dll の役割 `host` / `guest`。書けば nonce の大小と合うかを見る |
-//! | `allow_updown` | 無くてよい | マッチに入った後に上・下を押す段階のうち、マッチの終わりのメニューに届かないと分かっている段階の `note`（空白で区切る） |
-//! | `choose` | 無くてよい | 接続コードのウィンドウ（ローダー）が開いた直後に、`0` `1` `2` `delay` と打ったのと同じ経路で対戦の形を選ぶ（ローダーの `--choose` に渡す）。ini が `code_side = offer / answer` の回だけ（ウィンドウが開かないと打つ先が無い）。`second` の相手の定義にも別に書ける |
-//! | `own_clock` | 無くてよい | peer_sim を付いていかない形（自分の格子）で回す理由の 1 行。書けば `--follow` の決まりの代わりに `--segs 1` と「`--frames` が `limit_min` 分のフレーム数以上」を見る。台本はマッチの途中で終える（dll が BYE(終了) を出す） |
-//!
-//! パスはリポジトリの直下からの相対で、`/` で区切る。絶対パス・ドライブ名・`..`・`\` は断る（ゲームのフォルダを
-//! 指す定義を作らないため）。peer_sim の `--menu` のパスも同じ（peer_sim はリポジトリの直下で起こす）。
+//! 形は 1 行 1 項目の `key = value`。`#` から行末までは注、空の行は読み飛ばす。知らないキー・同じキーの 2 回目・値の無い行は、
+//! 行の番号を添えて断る（綴りの誤りで既定のまま走らないように）。//! パスはリポジトリの直下からの相対で、`/` で区切る。絶対パス・ドライブ名・`..`・`\` は断る（ゲームのフォルダを
+//! 指す定義を作らないため）。peer_sim の `--menu` のパスも同じ（peer_sim はリポジトリの直下で起動する）。
 
 #![forbid(unsafe_code)]
 
@@ -48,11 +26,14 @@ pub enum Game {
     B,
     /// 3 台目（観戦者）。中身は a と同じコピー。
     C,
+    /// 4・5 台目（観戦者。中継の木の実機のテストで子の観戦者を足す）。中身は a と同じコピー。
+    D,
+    E,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunDef {
-    /// 台本のパス。`None` なら台本を置かない回（`script = none`）。
+    /// 台本のパス。`None` なら台本を持たない回（`script = none`）。
     pub script: Option<String>,
     pub ini: String,
     /// peer_sim の引数の列。`None` ならネットワークなし。
@@ -214,7 +195,15 @@ pub fn parse(text: &str) -> Result<RunDef, ParseError> {
         "a" => Game::A,
         "b" => Game::B,
         "c" => Game::C,
-        _ => return Err(perr(l, "game", format!("値 {g:?} は a・b・c のどれか"))),
+        "d" => Game::D,
+        "e" => Game::E,
+        _ => {
+            return Err(perr(
+                l,
+                "game",
+                format!("値 {g:?} は a・b・c・d・e のどれか"),
+            ));
+        }
     };
 
     let second = match get("second") {
@@ -394,7 +383,7 @@ fn read_def(
 }
 
 /// 2 台の回の相手の定義を見る: 読めて、相手も 2 台の回で peer_sim を持たず、自分（`path`。分かるときだけ）を指し返し、
-/// ゲームのコピーが違い（同じコピーを 2 つ起こすと設定・リプレイの書き先を取り合う）、role が両方書かれて互いに違う。
+/// ゲームのコピーが違い（同じコピーを 2 つ起動すると設定・リプレイの書き先を取り合う）、role が両方書かれて互いに違う。
 fn check_second(
     path: Option<&str>,
     def: &RunDef,
@@ -601,15 +590,20 @@ fn check_mask(pa: &PeerArgs, key: &'static str, out: &mut Vec<Problem>) {
     }
 }
 
+/// 観戦者の手元のポーズで台本が押してよいキー。メニュー `0x00434740` が読むのは Esc・Z・上・下（X は読まないが害も無いので通す）。
+/// 左右・Shift は `[2]` へは入るがメニューが読まないので、押す意味が無い段階として断る。
+const PAUSE_STEP_KEYS: u16 = keys::ESC | keys::Z | keys::X | keys::UP | keys::DOWN;
+
 /// 観戦者の定義（ini が `code_side = spectate`）に共通の決まり:
 /// - ini: ネットワークが有効・`after_script = keep`（無いと台本が終わって 10 秒で計測が終わり、`_watch_frames.csv` の書き出しが止まる）・`code_dir`
-///   （3 台を同じ PC で起こすときにゲームごとに分ける）。
+///   （3 台を同じ PC で起動するときにゲームごとに分ける）。
 /// - 定義: `second`・`role` を書かない。
-/// - 台本: 観戦者のゲームは、繋がった後の選択の画面（7・8・16）とマッチではネットワークの記録の列が入力になり、台本の入力ワードはゲームへ入らない
+/// - 台本: 観戦者のゲームは、接続した後の選択の画面（7・8・16）とマッチではネットワークの記録の列が入力になり、台本の入力ワードはゲームへ入らない
 ///   （Esc だけは観戦をやめる読みに効く。`net_game::NetGame::peek_local_input`）。観戦中に効く段階（条件に `scene=2`・`screen=7/8/16`・`loading`・
 ///   `pause`・`endmenu`・`menuflag`・`talk` のどれかを書いた段階と、その後ろの段階全部）は Esc だけ押してよい。それ以外のキーは feed されず黙って
-///   捨てられ、押したつもりの画面が進まないので断る（Esc で観戦が終わった後ろの段階は、どのキーも押してよい）。それ以外の段階
-///   （タイトルから画面 6 まで。繋がる前にゲームへ届く段階）で Esc を押すのは断る（タイトルの Esc はゲームの終了などに届く）。
+///   捨てられ、押したつもりの画面が進まないので断る。例外は条件に `scene=2 pause=1` を持つ段階の 1P の語（`PAUSE_STEP_KEYS`）: 観戦者の手元のポーズは
+///   メニューを手元の入力で動かす（`spectate_watch/pause.rs`）。Esc を押した後ろの段階も、この規則のまま（マッチの中の Esc はポーズを開くだけで観戦は終わらない）。
+///   それ以外の段階（タイトルから画面 6 まで。接続する前にゲームへ届く段階）で Esc を押すのは断る（タイトルの Esc はゲームの終了などに届く）。
 fn watcher_common(
     def: &RunDef,
     ini: &Ini,
@@ -663,7 +657,6 @@ fn watcher_script_rules(def: &RunDef, script: Option<&Script>, out: &mut Vec<Pro
         // 観戦中に効く段階に入ったか。一度入ったら後ろの段階は条件が無くても観戦中とみなす
         // （`wait=1 p1=ESC` のように条件を書かない段階が `scene=2 wait=600` の直後に来る書き方を許すため）。
         let mut watching = false;
-        let mut left = false;
         let name = def.script.as_deref().unwrap_or("none");
         for st in &s.steps {
             let c = &st.cond;
@@ -674,27 +667,28 @@ fn watcher_script_rules(def: &RunDef, script: Option<&Script>, out: &mut Vec<Pro
                 || c.end_menu.is_some()
                 || c.menu_flag.is_some()
                 || c.talk.is_some();
-            let word = st.p1 | st.p2;
-            if watching && !left && word & !keys::ESC != 0 {
+            // 観戦者の手元のポーズ（`scene=2 pause=1`）の中だけ、メニューが読むキーが 1P の語から `[2]` へ届く。
+            // 2P の語はポーズのメニューへ届かない（`local_input(Seat::P1)`）ので Esc だけ。
+            let in_pause = c.scene == Some(2) && c.pause == Some(true);
+            let p1_ok = if in_pause { PAUSE_STEP_KEYS } else { keys::ESC };
+            if watching && (st.p1 & !p1_ok != 0 || st.p2 & !keys::ESC != 0) {
                 out.push(watch(
                     "script",
                     format!(
-                        "{name} の {} 行目: 観戦中に効く段階（scene=2・screen=7/8/16 などの条件の段階と、その後ろの段階）が Esc 以外のキーを押す（観戦中は記録の列が入力になり、台本のワードは Esc 以外ゲームへ入らない。押しても捨てられる）",
+                        "{name} の {} 行目: 観戦中に効く段階（scene=2・screen=7/8/16 などの条件の段階と、その後ろの段階）が押せないキーを押す（観戦中は記録の列が入力になり、台本のワードは Esc 以外ゲームへ入らない。押しても捨てられる。\
+                         例外は条件に scene=2 pause=1 を持つ段階の 1P の語で、Esc・Z・X・上・下だけ手元のポーズのメニューへ届く）",
                         st.line
                     ),
                 ));
             }
-            if !watching && word & keys::ESC != 0 {
+            if !watching && (st.p1 | st.p2) & keys::ESC != 0 {
                 out.push(watch(
                     "script",
                     format!(
-                        "{name} の {} 行目: 観戦中に効く段階でない段階（タイトルから画面 6 まで。繋がる前にゲームへ届く）が Esc を押す（観戦をやめる Esc は、scene=2 か screen=7/8/16 を条件にした段で押す）",
+                        "{name} の {} 行目: 観戦中に効く段階でない段階（タイトルから画面 6 まで。繋がる前にゲームへ届く）が Esc を押す（観戦中の Esc は、scene=2 か screen=7/8/16 を条件にした段で押す）",
                         st.line
                     ),
                 ));
-            }
-            if watching && word & keys::ESC != 0 {
-                left = true;
             }
         }
     }
@@ -703,7 +697,7 @@ fn watcher_script_rules(def: &RunDef, script: Option<&Script>, out: &mut Vec<Pro
 /// 観戦者の回（ini が `code_side = spectate`）の組を見る。本物の花映塚は観戦者、対戦は peer_sim のホスト役（`peer_sim`）とゲスト役（`peer_sim2`）。
 /// 対戦の回の決まりは当てず、代わりに: ini と台本は `watcher_common` の規則。peer_sim の 2 つは、ホストだけが `--spectate-host`、`--segs 1`
 /// （観戦者のゲームは自分では再戦を選べず、マッチの途中に次の seg の始まりが来ると流れが切れる）、`--follow` は付けない、ホストの nonce が大きい、
-/// 受信ポートが互いを向く、`--wait-sec`（ホストは観戦者のゲームが画面 7 に着いた後で起こすゲストを待つ）、`--mask`・`--menu` は対戦の回と同じ、
+/// 受信ポートが互いを向く、`--wait-sec`（ホストは観戦者のゲームが画面 7 に着いた後で起動するゲストを待つ）、`--mask`・`--menu` は対戦の回と同じ、
 /// session・秘密は書くなら 2 つで同じ。アドレスは、観戦者の ini の bind・観戦のポート・2 つの受信ポートが全部別。
 fn check_watch(
     def: &RunDef,
@@ -902,8 +896,8 @@ fn typed_room(script: Option<&Script>, ini: Option<&Ini>) -> Option<String> {
         .map(|t| t.to_ascii_lowercase())
 }
 
-/// ゲーム内のメニューで繋ぐ 3 台の回の ini の 3 台をまたぐ決まり（指し合い・役割・コピー・時間は `check_triple` が先に見た）: 3 台とも `code_side = game`
-/// （観戦者の ini は `[spectate]` を開かない。対戦者は持ってよい）・`room_server` が同じ・台本が打つ（か ini の `room`）ルーム名が小文字にそろえて同じ
+/// ゲーム内のメニューで接続する 3 台の回の ini の 3 台をまたぐ決まり（指し合い・役割・コピー・時間は `check_triple` が先に見た）: 3 台とも `code_side = game`
+/// （観戦者の ini は `[spectate]` を開かない。対戦する 2 人は持ってよい）・`room_server` が同じ・台本が打つ（か ini の `room`）ルーム名が小文字にそろえて同じ
 /// （観戦用のルームの名は対戦のルーム名から導くので、違えば会えない）・`code_dir` が別・`bind` が別・ホストの `nonce` がゲストより大きい。
 // 引数は 3 つの定義とその ini。束ねる型を足しても読み手は増えない。
 #[allow(clippy::too_many_arguments)]
@@ -1022,7 +1016,7 @@ fn check_game_inis(
 /// 3 台の回のホストの定義（`watcher` を持つ側）の関係を見る。観戦者の定義の中身（ini・台本）は `check_real_watcher` が見るので、3 つの定義をまたぐ決まりだけ:
 /// 指し合い（観戦者の `watching` がこの定義を指す）・役割（`watcher` を持つのはホスト）・コピーが 3 台とも別（同じコピーは設定・リプレイ・`th09.cfg` の書き先を取り合う）・
 /// ini（ゲストに `[spectate]` が無い・観戦者が `code_side = spectate`・観戦用のコードの置き場が観戦者と別・ホストの nonce がゲストより大きい・session と秘密が同じ）・
-/// アドレス（3 台の受信ポートが全部別。ホストとゲストは直に向き合うか、中継を挟む。観戦者は中継を通らない）・時間（`limit_min` が対戦者以上）。
+/// アドレス（3 台の受信ポートが全部別。ホストとゲストは直に向き合うか、中継を挟む。観戦者は中継を通らない）・時間（`limit_min` が対戦する 2 人以上）。
 fn check_triple(
     path: Option<&str>,
     def: &RunDef,
@@ -1305,7 +1299,7 @@ fn check_game_watcher(
 }
 
 /// 3 台の回の観戦者の定義（`watching` を持つ。ini が `code_side = spectate`）を見る。共通の決まりは `watcher_common`。
-/// ここは: peer_sim を書かない（対戦者は本物の花映塚 2 台）、指す先がホストの定義で、ゲームのコピーが違う。
+/// ここは: peer_sim を書かない（対戦する 2 人は本物の花映塚）、指す先がホストの定義で、ゲームのコピーが違う。
 fn check_real_watcher(
     path: Option<&str>,
     def: &RunDef,
@@ -1560,10 +1554,10 @@ pub fn check_at(
             return out;
         }
         check_second(path, def, other, read, &mut out);
-        // 観戦のポートはホストの定義（`watcher` を持つ）の ini にだけ開く。それ以外が開くと、観戦者を起こさない回でも
-        // 観戦のポートだけ開いた形になり、対戦者の stall の測りが観戦者の有無で違ってしまう。
+        // 観戦のポートはホストの定義（`watcher` を持つ）の ini にだけ開く。それ以外が開くと、観戦者を起動しない回でも
+        // 観戦のポートだけ開いた形になり、対戦する 2 人の stall の測りが観戦者の有無で違ってしまう。
         match (spectate_enabled(&ini), def.watcher.as_deref()) {
-            // `code_side = game` は、配る zip の形の ini（対戦者 2 人が `[spectate]` を持つ）のまま観戦者を起こさない対照と
+            // `code_side = game` は、配る zip の形の ini（対戦する 2 人が `[spectate]` を持つ）のまま観戦者を起動しない対照と
             // ゲスト自身の定義があるので、watcher が無くてもよい。
             (true, None) if ini.get("netplay", "code_side") == Some("game") => {}
             (true, None) => out.push(prob(
@@ -1722,7 +1716,7 @@ pub fn check_at(
 
     check_mask(&pa, "peer_sim", &mut out);
 
-    // ④ 役割（role_nonce の大きい方がホスト —— `handshake.rs` の on_hello）。どちらも書かれていなければ起動のたびに乱数で決まり、
+    // ④ 役割（nonce を書いた実行は role_nonce の大きい方がホスト —— `handshake.rs` の on_hello）。どちらも書かれていなければ起動のたびに乱数と回線の測りで決まり、
     // 席も lat_plan も読めないので、ネットワークの回は両方を書く。
     let dll_nonce = net_get("nonce").map(|v| (v, num(v)));
     let peer_nonce = pa.get("--nonce").map(|v| (v, num(v)));
@@ -1871,7 +1865,7 @@ pub fn check_at(
         }
     }
 
-    // session と秘密。peer_sim が値を書いたときだけ比べる（peer_sim の既定の値は `cli.rs` にだけ置く）。
+    // session と秘密。peer_sim が値を書いたときだけ比べる（peer_sim の既定の値は `cli.rs` にだけ書く）。
     if let Some(v) = pa.get("--session") {
         let ini_s = net_get("session").and_then(num);
         if num(v).is_none() || num(v) != ini_s {
@@ -1995,7 +1989,8 @@ mod tests {
             ),
             ("script = scripts/a.txt", "script = a.txt", "script"),
             ("ini = scripts/a.ini", "ini = /scripts/a.ini", "ini"),
-            ("game = a", "game = d", "game"),
+            ("game = a", "game = f", "game"),
+            ("game = a", "game = D", "game"),
             ("game = a", "game = C", "game"),
             ("limit_min = 10", "limit_min = 0", "limit_min"),
             ("limit_min = 10", "limit_min = 61", "limit_min"),
@@ -2030,6 +2025,10 @@ mod tests {
     fn parse_the_three_game_keys() {
         let d = parse(&MIN.replace("game = a", "game = c")).unwrap();
         assert_eq!((d.game, d.watcher, d.watching), (Game::C, None, None));
+        for (v, want) in [("d", Game::D), ("e", Game::E)] {
+            let d = parse(&MIN.replace("game = a", &format!("game = {v}"))).unwrap();
+            assert_eq!(d.game, want, "game = {v}");
+        }
         let h = parse(&format!("{MIN}watcher = scripts/runs/w.run\n")).unwrap();
         assert_eq!(
             (h.watcher.as_deref(), h.watching.as_deref()),

@@ -55,7 +55,7 @@ pub fn choose(text: Option<&str>, default_detail: bool) -> LogChoice {
     let fallback = |why: String| LogChoice {
         detail: default_detail,
         note: Some(format!(
-            "ログ: {why}。既定の{}にする",
+            "ログ: {why}。既定の{}にします。",
             mode_word(default_detail)
         )),
     };
@@ -67,7 +67,7 @@ pub fn choose(text: Option<&str>, default_detail: bool) -> LogChoice {
     };
     let ini = match ini::parse(text) {
         Ok(i) => i,
-        Err(e) => return fallback(format!("ini を読めない（{e}）")),
+        Err(e) => return fallback(format!("ini 読み込み不能（{e}）")),
     };
     if !ini.has_section(SECTION) {
         return LogChoice {
@@ -78,7 +78,7 @@ pub fn choose(text: Option<&str>, default_detail: bool) -> LogChoice {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return fallback(format!(
-                "[{SECTION}] の {line} 行目のキー {:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {:?} の記法が不適切です（使用可能なキー: {}）",
                 echo(k),
                 KEYS.join(" / ")
             ));
@@ -98,7 +98,7 @@ pub fn choose(text: Option<&str>, default_detail: bool) -> LogChoice {
             note: None,
         },
         Some(v) => fallback(format!(
-            "[{SECTION}] detail の値 {:?} は 0（簡潔）か 1（詳細）",
+            "[{SECTION}] detail の値 {:?} は 0（簡潔）か 1（詳細）にしてください",
             echo(v)
         )),
     }
@@ -161,10 +161,9 @@ mod tests {
     fn unreadable_ini_falls_back_with_a_note() {
         let c = choose(Some("[log]\ndetail 1\n"), true);
         assert!(c.detail);
-        assert!(c.note.unwrap().contains("読めない"));
+        assert!(c.note.unwrap().contains("読み込み不能"));
     }
 
-    /// 壊れたら落ちる: 配る ini から `[log] detail = 0` が消える・書き方が崩れて既定に戻る（開発用の既定は詳細）。
     #[test]
     fn the_distributed_ini_asks_for_the_brief_log_whichever_the_default() {
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini");
@@ -176,7 +175,6 @@ mod tests {
         assert!(dist.contains("[log]") && dist.contains("detail = 0"));
     }
 
-    /// 壊れたら落ちる: 案内どおりの手で ini が誤りになる（`[log]` が 2 回・`detail` が 2 回）、または詳細にならない。
     #[test]
     fn the_hint_steps_make_a_valid_ini_with_the_detailed_log() {
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini");

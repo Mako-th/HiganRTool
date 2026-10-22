@@ -119,7 +119,7 @@ pub struct Seen<'a> {
 /// （UTF-8 の途中で切らない。後ろの部品だけが残って読み違えることもない）。
 pub fn format_seen(out: &mut [u8], s: &Seen<'_>) -> usize {
     let mut b = Buf::new(out);
-    b.put("例外を見た（落ちたとは限らない・".as_bytes());
+    b.put("例外を見ました（落ちたとは限らない・".as_bytes());
     b.dec(s.nth);
     b.put(" 件目".as_bytes());
     if s.nth == MAX_LINES {
@@ -290,12 +290,12 @@ mod tests {
         String::from_utf8(buf[..n].to_vec()).expect("UTF-8 の途中で切らない")
     }
 
-    /// 壊れたら落ちる: 欄の順・16 進の桁・RVA・アクセスの種類・時刻の 0 埋め・回数の文のどれか。
+    /// 欄の順・16 進の桁・時刻の 0 埋め・回数の文も見る。
     #[test]
     fn an_access_violation_line_names_module_rva_and_target() {
         assert_eq!(
             text(&sample(b"th09.exe"), 512),
-            "例外を見た（落ちたとは限らない・1 件目）: 09:05:07.042 0xC0000005 アクセス違反（0x00000010 の書き込み） / 場所 0x0042A1B3 th09.exe+0x0002A1B3 / スレッド 4321\n"
+            "例外を見ました（落ちたとは限らない・1 件目）: 09:05:07.042 0xC0000005 アクセス違反（0x00000010 の書き込み） / 場所 0x0042A1B3 th09.exe+0x0002A1B3 / スレッド 4321\n"
         );
     }
 
@@ -321,7 +321,7 @@ mod tests {
         };
         assert_eq!(
             text(&s, 512),
-            "例外を見た（落ちたとは限らない・2 件目）: 0xC00000FD スタックオーバーフロー / 場所 0x00401000（モジュールは引かない） / スレッド 7\n"
+            "例外を見ました（落ちたとは限らない・2 件目）: 0xC00000FD スタックオーバーフロー / 場所 0x00401000（モジュールは引かない） / スレッド 7\n"
         );
         let u = Seen {
             place: Place::Unknown,
@@ -334,7 +334,6 @@ mod tests {
         assert!(t.contains("（モジュールの外）"), "{t}");
     }
 
-    /// 壊れたら落ちる: 短いバッファで書き過ぎる・UTF-8 の途中で切る・改行が無い・途中の部品を抜かして後ろを書く。
     #[test]
     fn short_buffers_never_overflow_and_end_with_a_newline() {
         let s = sample("ハイガン.dll".as_bytes());
@@ -357,7 +356,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: DLL だけが別の名前の表を持つ（ローダーのログと同じコードが違う名前で書かれる）。
     #[test]
     fn the_code_names_come_from_the_shared_table() {
         for code in [0xC000_0094u32, 0xC000_0409, 0xC000_0374] {
@@ -382,7 +380,6 @@ mod tests {
         assert!(text(&s, 512).ends_with("スレッド 4294967295\n"));
     }
 
-    /// 壊れたら落ちる: フォルダ（ユーザー名を含みうる）を書く・文字の途中で切る・置き換えずに落ちる。
     #[test]
     fn file_name_drops_folders_and_cuts_on_char_boundaries() {
         let wide: Vec<u16> = format!("C:{0}Users{0}someone{0}ゲーム{0}HiganRTool.dll", '\\')
@@ -402,7 +399,6 @@ mod tests {
         assert_eq!(file_name_utf8(&[], &mut [0u8; 8]), 0);
     }
 
-    /// 壊れたら落ちる: 同じ（コード, 場所）の繰り返しで枠を使う、別の組を同じとみなして行にしない、上限を超えて枠を取る。
     #[test]
     fn a_repeat_of_the_same_code_and_place_does_not_use_a_line() {
         let k = Kinds::new();

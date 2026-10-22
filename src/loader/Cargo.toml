@@ -17,6 +17,8 @@ dist = []
 
 [dependencies]
 higanr_core = { path = "../core" }
+# std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり（古い Wine 向け。自作）。build.rs が /DELAYLOAD を渡す。
+higanr_prng_shim = { path = "../prng_shim" }
 
 # Win32 の宣言だけのパッケージ（MIT / Apache-2.0）。
 # features は使う関数の置き場所だけに絞る（ビルドの時間を増やさないため）:
@@ -65,6 +67,8 @@ features = [
 [build-dependencies]
 # 配る exe のバージョン情報（.res）を作る。build.rs だけが使い、成果物には入らない（自作）。
 higanr_build_res = { path = "../build_res" }
+# build.rs が /DELAYLOAD: に渡す DLL の名前（`PRNG_DLL`）を読む。成果物には入らない。
+higanr_prng_shim = { path = "../prng_shim" }
 
 [dev-dependencies]
 # 検査だけ: 更新の目録に検査用の鍵で署名する（配る exe には入らない）。

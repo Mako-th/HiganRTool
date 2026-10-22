@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.rpy binary
+*.dll binary
+*.exe binary
+*.zip binary

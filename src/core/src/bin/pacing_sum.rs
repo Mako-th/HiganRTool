@@ -1,13 +1,11 @@
-//! `_pacing.csv.gz`（DLL が `build\bin\logs\` に書く。平文の `_pacing.csv` も読む）をあとから集計する道具。
-//! gzip が強制終了で切れていたら、読めた所までを使って標準エラーに知らせる。読むだけで、どのファイルにも書かない。
+//! `_pacing.csv.gz`（DLL が `build\bin\logs\` に書く。平文の `_pacing.csv` も読む）をあとから集計するツール。読むだけで、どのファイルにも書かない。
+//! gzip が強制終了で切れていたら、読めた所までを使って標準エラーに知らせる。
 //!
 //! 使い方: `cargo run --release -p higanr_core --bin pacing_sum -- [--fps N] [--frames A-B] <_pacing.csv.gz> [...]`
 //! ファイルごとに、形（game / b / b-spin / b-hybrid / vpatch / cycle / auto）と、周期・起床の遅れ・入力 → Present の前 / 後・
-//! Present の長さの p50 / p95 / p99 / max と母数を出す（集計の式は DLL と同じ `higanr_core::pacing::Splitter`）。
-//! 方式や効率クラスが複数あれば、その別にも出す。
-//! 列 `glide_req_ppm` `glide_moved_us` に 0 でない要求があれば「格子の寄せ」の行を、b-hybrid の列があれば
-//! 使用率の見込みと寝過ごしの行も出す。その列の無い古い CSV では出ない。
-//! `--fps` は長い周期の閾値に使うペース（既定 60）。CSV には書いていないので、本ログの「ペース: B を入れた…」（vpatch では「ペース: vpatch の先頭のフックを入れた…」）の N を渡す。
+//! Present の長さの p50 / p95 / p99 / max と母数を出す（集計の式は DLL と同じ `higanr_core::pacing::Splitter`）。方式や効率クラスが複数あれば、その別にも出す。
+//! 列 `glide_req_ppm` `glide_moved_us` に 0 でない要求があれば「格子の寄せ」の行を、b-hybrid の列があれば使用率の見込みと寝過ごしの行も出す。
+//! `--fps` は長い周期の閾値に使うペース（既定 60。CSV には書かれていないので、本ログの「ペース:」の N を渡す）。
 //! `--frames A-B` は Present の番号（CSV の `frame`）の範囲（両端を含む）の行だけを集計する。場面の境目は人が決めて渡す。
 #![forbid(unsafe_code)]
 
@@ -44,7 +42,7 @@ fn parse_frames(v: &str) -> Result<(u32, u32), String> {
     Ok((a, b))
 }
 
-/// `--fps N` と `--frames A-B` はどこに置いてもよく、どちらも 1 回だけ。
+/// `--fps N` と `--frames A-B` はどこに書いてもよく、どちらも 1 回だけ。
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut fps = None;
     let mut frames = None;

@@ -1,14 +1,8 @@
 //! 受信のイベントと、ゲームスレッドが相手を待つ待ち（Win32 の層。unsafe はここにもある。1 つずつ `// SAFETY:`）。
 //!
-//! 受信スレッドは 1 通書くたびにイベント（自動リセット）を立てる。ゲームスレッドは、イベントと高分解能の待機タイマー
-//! （`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`。Windows 10 1803 から）を `WaitForMultipleObjects` で待つ。届けばすぐ起き、
-//! 届かなければタイマーの時刻に起きる。`WaitForSingleObject` の待ち時間だけで待つと OS の時計の分解能（既定 15.6 ms）に
-//! 丸められ、4 ms の送り直しと 1 フレームの予算が崩れる。タイマーが作れなければ、イベントだけを ms で待つ
-//! （`high_resolution()` が false。ログに出す）。
-//!
-//! ここは待ち方だけを持つ。何を待つか・いつまで待つかは `netplay.rs`。OS の乱数（`os_random`）もここに置く: 接続の秘密と
-//! STUN の transaction id に使う。暗号は自作しないので、Windows の `BCryptGenRandom`
-//! （`BCRYPT_USE_SYSTEM_PREFERRED_RNG` なのでアルゴリズムのハンドルは要らない）を呼ぶだけ。
+//! 受信スレッドは 1 通書くたびにイベント（自動リセット）を立てる。ゲームスレッドは、イベントと高分解能の待機タイマー（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`。Windows 10 1803 から）を `WaitForMultipleObjects` で待つ。
+//! 届けばすぐ起き、届かなければタイマーの時刻に起きる。`WaitForSingleObject` の待ち時間だけで待つと OS の時計の分解能（既定 15.6 ms）に丸められ、4 ms の送り直しと 1 フレームの予算が崩れる。タイマーが作れなければ、イベントだけを ms で待つ（`high_resolution()` が false。ログに出す）。
+//! ここは待ち方だけを持つ。何を待つか・いつまで待つかは `netplay.rs`。OS の乱数（`os_random`）もここにある: 接続の秘密と STUN の transaction id に使う。暗号は自作しないので、Windows の `BCryptGenRandom`（`BCRYPT_USE_SYSTEM_PREFERRED_RNG` なのでアルゴリズムのハンドルは要らない）を呼ぶだけ。
 
 use std::sync::Arc;
 
@@ -117,7 +111,7 @@ impl Waiter {
             // 100 ns 単位。負は「今から」の相対。
             let due: i64 = -(i64::from(us) * 10);
             // SAFETY: `t.0` は作ってまだ閉じていないタイマー。`due` はこの呼び出しの間生きている。周期 0（1 回だけ）、
-            // 完了ルーチンなし、電源の復帰なし。前の待ちで残っていた時刻は、ここで置き直される。
+            // 完了ルーチンなし、電源の復帰なし。前の待ちで残っていた時刻は、ここで設定し直される。
             let ok = unsafe { SetWaitableTimer(t.0, &due, 0, None, core::ptr::null(), 0) };
             if ok != 0 {
                 let hs = [self.event.0, t.0];
@@ -228,7 +222,7 @@ mod tests {
         let (_e, w) = waiter();
         assert!(
             w.high_resolution(),
-            "高分解能の待機タイマーを作れない（Windows 10 1803 より前？）"
+            "高分解能の待機タイマーの作成不能（Windows 10 1803 より前の可能性）"
         );
         // 4 ms を 20 回待ち、中央の値が 4〜8 ms に収まること（丸められれば 15.6 ms 前後）。
         let mut took: Vec<Duration> = (0..20)

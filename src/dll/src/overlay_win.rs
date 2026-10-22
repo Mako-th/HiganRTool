@@ -1,22 +1,10 @@
-//! D3D8 と GDI の層（unsafe はここにもある。1 つずつ `// SAFETY:`）: 描画の入口（`draw.rs` の `draw_entry`）が `OVERLAY_ON` を見て呼ぶ
-//! `overlay_on_draw`、文字の表の置き場、読み取りのスレッドで GDI が文字の表を描く `gdi_atlas`、本物の実装 `RealOverlayHost`。
+//! D3D8 と GDI の層（unsafe はここにもある。1 つずつ `// SAFETY:`）: 描画の入口（`draw.rs` の `draw_entry`）が `OVERLAY_ON` を見て呼ぶ `overlay_on_draw`、文字の表、読み取りのスレッドで GDI が文字の表を描く `gdi_atlas`、本物の実装 `RealOverlayHost`。
 //!
-//! - 文字の表は読み取りのスレッドが GDI で 1 回だけメモリの面に描く。ゲームのスレッドは最初の 1 回だけ D3D8 のテクスチャ
-//!   （`D3DPOOL_MANAGED`。デバイスの Reset を越えて残る）を作ってコピー、以後は毎フレーム頂点をスタックの固定の配列に作って
-//!   `DrawPrimitiveUP` で出す。
-//! - **ゲームの描画の状態は、描く前に自分で読み（Get*）、描いた後に読んだ値へ戻す。** ただし段 0 のテクスチャと頂点の流れ 0 は読まない。
-//!   GetTexture / GetStreamSource は参照を 1 つ足して返すので Release が要るが、d3d8.dll を差し替える ENBSeries の DX8 to DX9 Convertor は、
-//!   何も置かれていないときも中身が NULL の包みを返し、その Release で落ちる。テクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で置く
-//!   NULL へ戻す。流れ 0 は、ゲームの頂点の形の覚えから置き直す（`overlay::stream0_to_restore`）。参照を受け取る所は無い。
-//!   state block は使わない: (1) 取り込んだテクスチャ・
-//!   頂点バッファへの参照を次に取り込むまで持ち続けるので、ゲームが Reset する（`0x0042DB88`。戻り値を見ずに毎フレームやり直す）ときに
-//!   D3DPOOL_DEFAULT の物を生かしたままにして Reset を失敗させうる。(2) Reset の前に消す流儀があるが、ゲームの Reset はこちらの入口の後
-//!   （Present のラッパの中）で起きるので消す機会が無い。(3) ゲームは自分の描画の状態を覚えていて、同じなら Set を飛ばす（頂点の形の覚え
-//!   `[AnmManager+0x12886]`、霧の覚え `[Supervisor+0x794]`）ので、戻し漏れはゲームの絵を壊す。戻す一覧は目で数えられる形にした。
-//! - デバイスは `D3DCREATE_PUREDEVICE` 無しで作られている（behavior flags は `0x40` か `0x20`。`0x0042DF04` / `0x0042DF41` / `0x0042DF7E`）
-//!   ので Get* は使える。`D3DCREATE_MULTITHREADED` も無いので、ゲームのスレッド以外から呼んではならない。
-//! - `TestCooperativeLevel` が D3D_OK でない間は描かない。描けない・作れないときは描くのをやめ、理由と HRESULT を 1 つだけ残す。
-//!   ゲームのスレッドでは確保・ファイル・ロック待ちをしない。中は全部 `catch_unwind`。
+//! - 文字の表は読み取りのスレッドが GDI で 1 回だけメモリの面に描く。ゲームのスレッドは最初の 1 回だけ D3D8 のテクスチャ（`D3DPOOL_MANAGED`。デバイスの Reset を越えて残る）を作ってコピー、以後は毎フレーム頂点をスタックの固定の配列に作って `DrawPrimitiveUP` で出す。
+//! - **ゲームの描画の状態は、描く前に自分で読み（Get*）、描いた後に読んだ値へ戻す。** ただし段 0 のテクスチャと頂点の流れ 0 は読まない（GetTexture / GetStreamSource は参照を 1 つ足して返すので Release が要るが、d3d8.dll を差し替える ENBSeries の DX8 to DX9 Convertor は何も設定されていないときも中身が NULL の包みを返し、その Release で落ちる）。テクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で設定する NULL へ戻す。流れ 0 は、ゲームの頂点の形の覚えから戻す（`overlay::stream0_to_restore`）。
+//! - state block は使わない: 取り込んだテクスチャ・頂点バッファへの参照を持ち続けるので、ゲームが Reset する（`0x0042DB88`。戻り値を見ずに毎フレームやり直す）ときに失敗させうる。ゲームの Reset はこちらの入口の後（Present のラッパの中）で起きるので消す機会が無い。ゲームは自分の描画の状態を覚えていて同じなら Set を飛ばす（頂点の形の覚え `[AnmManager+0x12886]`、霧の覚え `[Supervisor+0x794]`）ので、戻し漏れはゲームの絵を壊す。
+//! - デバイスは `D3DCREATE_PUREDEVICE` 無しで作られている（behavior flags は `0x40` か `0x20`。`0x0042DF04` / `0x0042DF41` / `0x0042DF7E`）ので Get* は使える。`D3DCREATE_MULTITHREADED` も無いので、ゲームのスレッド以外から呼んではならない。
+//! - `TestCooperativeLevel` が D3D_OK でない間は描かない。描けない・作れないときは描くのをやめ、理由と HRESULT を 1 つだけ残す。ゲームのスレッドでは確保・ファイル・ロック待ちをしない。中は全部 `catch_unwind`。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -49,7 +37,7 @@ use crate::win::{read_own_into, read_own_memory};
 
 // ---- D3D8 の決まり（SDK の d3d8.h / d3d8types.h の値）----
 //
-// vtable の番号（バイト）は IDirect3DDevice8 の並び（SDK）。花映塚の自分の呼び出しで要所を確かめた: Reset `0x38`（`0x0042DB88`）/
+// vtable の番号（バイト）は IDirect3DDevice8 の並び（SDK）。花映塚の自分の呼び出しで要所を検証した: Reset `0x38`（`0x0042DB88`）/
 // Present `0x3C` / GetBackBuffer `0x40` / CreateTexture `0x50`（`0x00452D52` の 7 引数）/ BeginScene `0x88` / EndScene `0x8C` /
 // SetRenderState `0xC8`（`0x0042FF2C` で FOGENABLE = 0x1C を 0 に）/ SetTexture `0xF4`（`0x0042DD4B`）/ SetTextureStageState `0xFC` /
 // DrawPrimitiveUP `0x120`（`0x00417447`: 種類 5・数 2・stride 0x14）/ SetVertexShader `0x130`（`0x004396E2` で `0x144`）/
@@ -126,7 +114,7 @@ const D3DTADDRESS_CLAMP: u32 = 3;
 const D3DTEXF_NONE: u32 = 0;
 const D3DTEXF_POINT: u32 = 1;
 
-/// 描く間だけ置くレンダーステート（番号, 値）。深さ・ステンシル・霧・カリングを切り、α で重ねる。ゲームの値と
+/// 描く間だけ設定するレンダーステート（番号, 値）。深さ・ステンシル・霧・カリングを切り、α で重ねる。ゲームの値と
 /// 同じものは Set しない（戻しもしない）。
 const RS: [(u32, u32); 12] = [
     (D3DRS_ZENABLE, 0),
@@ -143,7 +131,7 @@ const RS: [(u32, u32); 12] = [
     (D3DRS_BLENDOP, D3DBLENDOP_ADD),
 ];
 
-/// 描く間だけ置くテクスチャステージの状態（段, 番号, 値）。段 0 はテクスチャの α × 頂点の色、点で拾う（文字の表を
+/// 描く間だけ設定するテクスチャステージの状態（段, 番号, 値）。段 0 はテクスチャの α × 頂点の色、点で拾う（文字の表を
 /// 1 対 1 で貼るので補間しない）。段 1 は切る（ゲームが段 1 を使っていても、この描画には混ぜない）。
 const TSS: [(u32, u32, u32); 15] = [
     (0, D3DTSS_COLOROP, D3DTOP_MODULATE),
@@ -175,10 +163,10 @@ pub const FONT_SCALE: u32 = 2;
 // ---- 静的変数（ゲームのスレッドと読み取りのスレッドの受け渡し）----
 
 /// 文字の描画が有効か。描画の入口のアセンブリが `cmp dword ptr [OVERLAY_ON], 0` で見て、0 でなければ `overlay_on_draw` を呼ぶ。
-/// 読み取りのスレッドが文字の表とアドレスを置いた後で 1 にし、ゲームのスレッドが描けない理由を見つけたら 0 にする。
+/// 読み取りのスレッドが文字の表とアドレスを設定した後で 1 にし、ゲームのスレッドが描けない理由を見つけたら 0 にする。
 pub static OVERLAY_ON: AtomicU32 = AtomicU32::new(0);
-/// デバイスへのポインタの置き場（花映塚では `D3D8_DEVICE_PTR`）と present parameters のコピー（`D3D8_PRESENT_PARAMS`）。
-/// 検査では検査の静的変数のアドレス。`prepare` が読めると確かめてから置く。
+/// デバイスへのポインタが入っているアドレス（花映塚では `D3D8_DEVICE_PTR`）と present parameters のコピー（`D3D8_PRESENT_PARAMS`）。
+/// 検査では検査の静的変数のアドレス。`prepare` が読めると検証してから保存する。
 static DEVICE_PTR_ADDR: AtomicU32 = AtomicU32::new(0);
 static PP_ADDR: AtomicU32 = AtomicU32::new(0);
 
@@ -210,14 +198,9 @@ static SETUP_TICKS: AtomicU32 = AtomicU32::new(0);
 static UPDATER_STARTED: AtomicU32 = AtomicU32::new(0);
 
 // ---- ゲームの文字（ascii.anm の絵）を 1 回だけコピーする ----
-//
-// 1. ゲームのスレッド（描画の入口）が、自分のテクスチャを作った後、30 フレームに 1 回 `probe_game_font` で ascii.anm の読み込みを
-//    確かめる。通ったら、ゲームのテクスチャを `LockRect(READONLY)` で開き、英数字の絵を作業場 `SCRATCH`（読み取りのスレッドが先に
-//    確保した物）へ ARGB でコピーして閉じる（`GF_STATE` = `GF_CAPTURED`）。ゲームのメモリには 1 バイトも書かない。
-// 2. 文の更新スレッド（読み取りのスレッド）が、作業場から「ゲームの文字をコピーした文字の表」を作り、`ATLAS` を差し替える
-//    （`GF_STATE` = `GF_APPLIED`）。ヒープを使う仕事は全部ここ。
-// 3. ゲームのスレッドが、`ATLAS` が変わったのを見て自分のテクスチャを作り直す（`TEX_ATLAS`）。以後の毎フレームの描画は今までと同じ。
-//    コピーした後はゲームのテクスチャに触らない。
+// 1. ゲームのスレッド（描画の入口）が、自分のテクスチャを作った後、30 フレームに 1 回 `probe_game_font` で ascii.anm の読み込みをチェックする。通ったら、ゲームのテクスチャを `LockRect(READONLY)` で開き、英数字の絵を作業場 `SCRATCH`（読み取りのスレッドが先に確保した物）へ ARGB でコピーして閉じる（`GF_STATE` = `GF_CAPTURED`）。ゲームのメモリには 1 バイトも書かない。
+// 2. 文の更新スレッド（読み取りのスレッド）が、作業場から「ゲームの文字をコピーした文字の表」を作り、`ATLAS` を差し替える（`GF_STATE` = `GF_APPLIED`）。ヒープを使う仕事は全部ここ。
+// 3. ゲームのスレッドが、`ATLAS` が変わったのを見て自分のテクスチャを作り直す（`TEX_ATLAS`）。コピーした後はゲームのテクスチャに触らない。
 /// いまの `TEX` を作った文字の表（`Atlas` のアドレス）。`ATLAS` が違う値になったら作り直す。
 static TEX_ATLAS: AtomicUsize = AtomicUsize::new(0);
 /// 状態: 試し中 / コピーした（更新スレッドが文字の表を作る前）/ 文字の表に反映した / 断った（もう試さない）/ 更新スレッドが文字の表を作れなかった。
@@ -253,7 +236,7 @@ static SWAP_TICKS: AtomicU32 = AtomicU32::new(0);
 static GF_NOTE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static GF_LOADED_PTR: AtomicU32 = AtomicU32::new(ASCII_ANM_LOADED_PTR);
 static GF_MGR_PTR: AtomicU32 = AtomicU32::new(ANM_MANAGER_PTR);
-/// 描いた後に頂点の流れ 0 を戻すときに読む AnmManager のポインタの置き場（検査は偽のメモリ）。
+/// 描いた後に頂点の流れ 0 を戻すときに読む AnmManager のポインタが入っているアドレス（検査は偽のメモリ）。
 static STREAM_MGR_PTR: AtomicU32 = AtomicU32::new(ANM_MANAGER_PTR);
 
 /// 作業場: 文字 1 つあたり `SLOT_PX` 画素の ARGB（幅 `GAME_SLOT_W` の行）＋ 大きさの 4 語（絵の幅・高さ・画面の幅・高さ。幅 0 は
@@ -286,18 +269,18 @@ struct UpdaterCfg {
 pub(crate) static PANIC_NEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// 読み取りのスレッドが、文字の表を置く（`prepare` の前でも後でもよい。1 回だけ。2 回目は断る）。
+/// 読み取りのスレッドが、文字の表を設定する（`prepare` の前でも後でもよい。1 回だけ。2 回目は断る）。
 pub fn place_atlas(spec: AtlasSpec, texels: Vec<u32>) -> Result<(), String> {
     if texels.len() != spec.texel_count() {
         return Err(format!(
-            "文字の表の画素の数 {} がテクスチャ {}×{} と違う",
+            "文字の表の画素の数 {} がテクスチャ {}×{} と不一致",
             texels.len(),
             spec.tex_w,
             spec.tex_h
         ));
     }
     if ATLAS.load(Ordering::SeqCst) != 0 {
-        return Err("文字の表はもう置いてある".to_string());
+        return Err("文字の表は設定済み".to_string());
     }
     let a: &'static Atlas = Box::leak(Box::new(Atlas { spec, texels }));
     ATLAS.store(a as *const Atlas as usize, Ordering::Release);
@@ -306,22 +289,22 @@ pub fn place_atlas(spec: AtlasSpec, texels: Vec<u32>) -> Result<(), String> {
     Ok(())
 }
 
-/// 読み取りのスレッドが、デバイスと present parameters のアドレスを置く（読めなければ断る。ゲームのスレッドが読めない
+/// 読み取りのスレッドが、デバイスと present parameters のアドレスを設定する（読めなければ断る。ゲームのスレッドが読めない
 /// アドレスを読まないため）。描くのはまだ有効にしない（`set_on`）。
 pub fn prepare(device_ptr_addr: u32, pp_addr: u32) -> Result<(), String> {
     if OVERLAY_ON.load(Ordering::SeqCst) != 0 {
-        return Err("文字の描画がもう有効になっている".to_string());
+        return Err("文字の描画は既に有効です".to_string());
     }
     if device_ptr_addr == 0 || read_own_memory(device_ptr_addr, 4).is_none() {
         return Err(format!(
-            "デバイスの置き場 0x{device_ptr_addr:08X} が読めない"
+            "デバイスのアドレス 0x{device_ptr_addr:08X} が読み取り不能"
         ));
     }
     if pp_addr == 0 || read_own_memory(pp_addr, (PP_HEIGHT + 4) as usize).is_none() {
-        return Err(format!("present parameters 0x{pp_addr:08X} が読めない"));
+        return Err(format!("present parameters 0x{pp_addr:08X} が読み取り不能"));
     }
     if ATLAS.load(Ordering::Acquire) == 0 {
-        return Err("文字の表がまだ置かれていない".to_string());
+        return Err("文字の表が未設定です".to_string());
     }
     DEVICE_PTR_ADDR.store(device_ptr_addr, Ordering::SeqCst);
     PP_ADDR.store(pp_addr, Ordering::SeqCst);
@@ -358,7 +341,7 @@ fn stop(f: Fail, hr: u32) {
     stop_with(f, hr, 0);
 }
 
-/// 描くのを止め、最初の理由だけ残す。ゲームのスレッドから呼ぶので、原子の値を置くだけ（ログは書かない。書くのは `take_stop_report` を呼ぶ読み取りのスレッド）。
+/// 描くのを止め、最初の理由だけ残す。ゲームのスレッドから呼ぶので、原子変数へ値を書くだけ（ログは書かない。書くのは `take_stop_report` を呼ぶ読み取りのスレッド）。
 fn stop_with(f: Fail, hr: u32, detail: u32) {
     OVERLAY_ON.store(0, Ordering::Release);
     if FAIL
@@ -422,7 +405,7 @@ fn overlay_inner() {
         stop(Fail::NoAtlas, 0);
         return;
     }
-    // SAFETY: どちらも `prepare` が読めると確かめてから置いたアドレス（花映塚では th09.exe の .data の `0x4B3108` と `0x4B3450`。プロセスが終わるまで読める）。
+    // SAFETY: どちらも `prepare` が読めると検証してから保存したアドレス（花映塚では th09.exe の .data の `0x4B3108` と `0x4B3450`。プロセスが終わるまで読める）。
     let (device, screen_w, screen_h) = unsafe {
         (
             read_u32(dev_at),
@@ -442,7 +425,7 @@ fn overlay_inner() {
         LOST.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    // SAFETY: `atlas_at` は `place_atlas` が `Box::leak` で作って返さない `Atlas` のアドレス（Release で置き、上の Acquire で読んだので
+    // SAFETY: `atlas_at` は `place_atlas` が `Box::leak` で作って返さない `Atlas` のアドレス（Release で書き、上の Acquire で読んだので
     // 中身の書きは見えている）。以後だれも書かない。
     let atlas: &'static Atlas = unsafe { &*(atlas_at as *const Atlas) };
     let mut setup = false;
@@ -470,7 +453,7 @@ fn overlay_inner() {
     };
     // 更新スレッドがゲームの文字をコピーした文字の表に差し替えたら、テクスチャを作り直す（1 回だけ）。作り直せなければ、**描くのは止めずに**
     // 差し替え前のテクスチャと、それを作った文字の表（`TEX_ATLAS`）で描き続ける（組を崩さない。GDI の文字のまま見えるだけ）。
-    // 失敗は数えて本ログに残し、間を置いて `SWAP_MAX_TRIES` 回まで試し直す（`swap_should_try`）。最初の 1 回（`TEX` が無い）だけは、
+    // 失敗は数えて本ログに残し、間を空けて `SWAP_MAX_TRIES` 回まで試し直す（`swap_should_try`）。最初の 1 回（`TEX` が無い）だけは、
     // 描ける絵がまだ無いので、理由を残して描くのを止める。
     let mut draw_atlas = atlas;
     if TEX_ATLAS.load(Ordering::Relaxed) != atlas_at {
@@ -485,7 +468,7 @@ fn overlay_inner() {
             let t1 = qpc();
             match create_texture(d, atlas) {
                 Ok(new_tex) => {
-                    // SAFETY: 古い `TEX` は自分が作った参照を持つテクスチャで、描く間だけデバイスの段 0 に置き、描いた後に NULL へ
+                    // SAFETY: 古い `TEX` は自分が作った参照を持つテクスチャで、描く間だけデバイスの段 0 に設定し、描いた後に NULL へ
                     // 戻している（`draw_with_saved_state`）ので、いまデバイスは掴んでいない。
                     unsafe { Dev(tex).release() };
                     tex = new_tex;
@@ -514,7 +497,7 @@ fn overlay_inner() {
                 stop(Fail::NoAtlas, 0);
                 return;
             }
-            // SAFETY: `old_at` は `TEX` を作ったときに `TEX_ATLAS` へ置いた `Atlas` のアドレス（返さない物。以後だれも書かない）。
+            // SAFETY: `old_at` は `TEX` を作ったときに `TEX_ATLAS` へ保存した `Atlas` のアドレス（返さない物。以後だれも書かない）。
             draw_atlas = unsafe { &*(old_at as *const Atlas) };
         }
     }
@@ -575,10 +558,10 @@ struct Saved {
     vp: [u32; 6],
 }
 
-/// 描く側の入口。状態を置いた後に 1 回だけ呼ばれ、渡された「頂点を出す関数」を何度でも呼んでよい（盤の行ごとの塊）。
+/// 頂点を組んで描く側（overlay_inner）の入口。状態を設定した後に 1 回だけ呼ばれ、渡された「頂点を出す関数」を何度でも呼んでよい（盤の行ごとの塊）。
 type DrawFn<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&[Vertex]));
 
-/// 状態を読み、自分の状態を置き、描き、読んだ値へ戻す。Get* が 1 つでも失敗したら、何も置かずに `Err`。Set* と
+/// 状態を読み、自分の状態を設定し、描き、読んだ値へ戻す。Get* が 1 つでも失敗したら、何も設定せずに `Err`。Set* と
 /// DrawPrimitiveUP の失敗は数えるだけで、戻しは全部やる。呼ぶのは描画の地点（`0x0042DD51`）の入口だけ（テクスチャの戻しがその地点の前提に頼る）。
 fn draw_with_saved_state(
     d: Dev,
@@ -593,7 +576,7 @@ fn draw_with_saved_state(
         vs: 0,
         vp: [0; 6],
     };
-    // SAFETY: `d` は `overlay_inner` が確かめた生きているデバイスで、ゲームのスレッドから呼んでいる（以下の `d.*` も同じ）。
+    // SAFETY: `d` は `overlay_inner` が検証した生きているデバイスで、ゲームのスレッドから呼んでいる（以下の `d.*` も同じ）。
     if let Err((hr, detail)) = unsafe { save(d, &mut s) } {
         return Err((Fail::GetState, hr as u32, detail));
     }
@@ -643,13 +626,13 @@ fn draw_with_saved_state(
         }
     };
     draw(&mut emit);
-    // 戻す（置いたのと逆の順）。段 0 のテクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で置いた NULL へ戻す。
+    // 戻す（設定したのと逆の順）。段 0 のテクスチャは、ゲームがこの地点の直前（`0x0042DD4B`）で設定した NULL へ戻す。
     // DrawPrimitiveUP は頂点の流れ 0 を NULL にするので、ゲームが SetStreamSource を飛ばす場面（頂点の形の覚えが 2）だけ、
-    // ゲームの頂点バッファを置き直す（`stream0_to_restore`）。
+    // ゲームの頂点バッファを設定し直す（`stream0_to_restore`）。
     let mut read = |a: u32, b: &mut [u8]| read_own_into(a, b);
     let vb = stream0_to_restore(&mut read, STREAM_MGR_PTR.load(Ordering::Relaxed));
-    // SAFETY: 同上。戻す値は `save` が読んだ値そのもの。`vb` はゲームが `[AnmManager+0x12890]` に持ち、流れ 0 に置いていた頂点バッファ
-    // （ゲームが参照を持ち、Release するときは 0 を書く。ゲームのスレッドなので、読んでから置くまでに変わらない）。
+    // SAFETY: 同上。戻す値は `save` が読んだ値そのもの。`vb` はゲームが `[AnmManager+0x12890]` に持ち、流れ 0 に設定していた頂点バッファ
+    // （ゲームが参照を持ち、Release するときは 0 を書く。ゲームのスレッドなので、読んでから設定するまでに変わらない）。
     unsafe {
         if s.vp != vp {
             chk(d.set_viewport(&s.vp));
@@ -731,8 +714,8 @@ fn create_texture(d: Dev, atlas: &Atlas) -> Result<u32, (Fail, u32)> {
     let ok = bits != 0 && pitch >= row;
     if ok {
         for y in 0..h as usize {
-            // SAFETY: 元は `place_atlas` が長さを `tex_w × tex_h` と確かめた画素の行 y（`row` バイト）。先は LockRect が返した段 0 の
-            // 行 y（`bits + y * pitch` から `row` バイト。pitch >= row を上で確かめた。高さは作った h）。2 つは別の領域。
+            // SAFETY: 元は `place_atlas` が長さを `tex_w × tex_h` と検証した画素の行 y（`row` バイト）。先は LockRect が返した段 0 の
+            // 行 y（`bits + y * pitch` から `row` バイト。pitch >= row を上で検証した。高さは作った h）。2 つは別の領域。
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (atlas.texels.as_ptr() as *const u8).add(y * row),
@@ -762,7 +745,7 @@ fn gf_refuse(w: GameFontWhy) {
 }
 
 /// ゲームの文字をコピーする試し（ゲームのスレッド。描画の入口の中）。30 フレームに 1 回だけ、`probe_game_font` で ascii.anm が読み込み済みと
-/// 確かめ、通ったらゲームのテクスチャを READONLY で開いて英数字の絵を作業場へ ARGB でコピーする。**確保しない・待たない・ゲームのメモリへ
+/// チェックし、通ったらゲームのテクスチャを READONLY で開いて英数字の絵を作業場へ ARGB でコピーする。**確保しない・待たない・ゲームのメモリへ
 /// 書かない**。コピーする仕事（LockRect を含む）をしたら true（その回は描画の上乗せの記録から外す）。
 fn game_font_step(own_tex: u32) -> bool {
     match gf_gate(
@@ -798,7 +781,7 @@ fn game_font_step(own_tex: u32) -> bool {
             return false;
         }
     };
-    // ゲームのテクスチャの先頭（vtable へのアドレス）が自分のテクスチャと同じであること（ポインタが本当にテクスチャかを、COM の関数を呼ぶ前に確かめる）。
+    // ゲームのテクスチャの先頭（vtable へのアドレス）が自分のテクスチャと同じであること（ポインタが本当にテクスチャかを、COM の関数を呼ぶ前にチェックする）。
     let (mut theirs, mut ours) = ([0u8; 4], [0u8; 4]);
     if !(read_own_into(probed.texture, &mut theirs)
         && read_own_into(own_tex, &mut ours)
@@ -811,7 +794,7 @@ fn game_font_step(own_tex: u32) -> bool {
     let t0 = qpc();
     let t = Dev(probed.texture);
     let mut desc = [0u32; 8];
-    // SAFETY: `t` は今確かめた IDirect3DTexture8（vtable が自分のテクスチャと同じで、ゲームが作って持っている）。描画のスレッド = ゲームのスレッド。
+    // SAFETY: `t` は今チェックした IDirect3DTexture8（vtable が自分のテクスチャと同じで、ゲームが作って持っている）。描画のスレッド = ゲームのスレッド。
     // `desc` は書ける 8 語。
     let hr = unsafe { t.tex_get_level_desc(0, &mut desc) };
     if hr < 0 {
@@ -1141,7 +1124,7 @@ impl Drop for Gdi {
 const FACE_ALIASES: [&[&str]; 1] = [&["ＭＳ ゴシック", "MS Gothic"]];
 
 /// 頼んだ字体 `wanted` と、GDI が実際に選んだ字体 `actual` が同じか（大文字小文字は問わない。`FACE_ALIASES` の同じ組の名前も同じ）。
-/// 頼んだ字体が無いと GDI は黙って別の字体を選ぶので、`GetTextFaceW` の名前で確かめる。
+/// 頼んだ字体が無いと GDI は黙って別の字体を選ぶので、`GetTextFaceW` の名前でチェックする。
 fn same_face(wanted: &str, actual: &str) -> bool {
     let eq = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
     eq(wanted, actual)
@@ -1187,12 +1170,9 @@ impl GdiAtlas {
     }
 }
 
-/// 字体を `faces` の順に試し（`CreateFontW`・`SHIFTJIS_CHARSET`。`GetTextFaceW` で実際に選ばれた名前が頼んだ名前と同じものを採る）、
-/// 文字の表（`ov::ui_glyphs`）を GDI でメモリの面に描いて、割り付けとテクスチャの画素を返す（読み取りのスレッド）。半角 1 枠は
-/// `ceil(height / 2)` × `height` 画素、全角はその 2 枠ぶん。`scale` が 2 以上なら、その倍の大きさで描いて縮める（ゲームは文字を
-/// 2 倍で描いて縮めている —— `CreateFontA(2h, …)`、`0x004364C0`。縮めるのは `ov::downscale_coverage`）。文字は 1 つずつ自分の枠に
-/// 切り取って（`ETO_CLIPPED`）描くので、枠より広い文字を持つ字体でも隣の枠を汚さない。頼んだ字体がどれも無いときは、GDI が選んだ
-/// 代わりの字体で作る（`matched` = false）。字体の順は呼び出し側が決める（thprac の日本語の字体の順を参考にした）。
+/// 字体を `faces` の順に試し（`CreateFontW`・`SHIFTJIS_CHARSET`。`GetTextFaceW` で実際に選ばれた名前が頼んだ名前と同じものを採る）、文字の表（`ov::ui_glyphs`）を GDI でメモリの面に描いて、割り付けとテクスチャの画素を返す（読み取りのスレッド）。半角 1 枠は `ceil(height / 2)` × `height` 画素、全角はその 2 枠ぶん。
+/// `scale` が 2 以上なら、その倍の大きさで描いて縮める（ゲームは文字を 2 倍で描いて縮めている —— `CreateFontA(2h, …)`、`0x004364C0`。縮めるのは `ov::downscale_coverage`）。文字は 1 つずつ自分の枠に切り取って（`ETO_CLIPPED`）描くので、枠より広い文字を持つ字体でも隣の枠を汚さない。
+/// 頼んだ字体がどれも無いときは、GDI が選んだ代わりの字体で作る（`matched` = false）。字体の順は呼び出し側が決める（thprac の日本語の字体の順を参考にした）。
 #[cfg(test)] // 本物は `gdi_atlas_with` を呼ぶ。ゴシックの字体の検査は予約なしの表で見る
 pub fn gdi_atlas(faces: &[&str], height: i32, scale: u32) -> Result<GdiAtlas, String> {
     gdi_atlas_with(faces, height, scale, false)
@@ -1222,7 +1202,7 @@ pub fn gdi_atlas_with(
     };
     if height <= 0 || !(1..=4).contains(&scale) || faces.is_empty() {
         return Err(format!(
-            "文字の表の指定が違う（高さ {height}・倍率 {scale}・字体 {} 個）",
+            "文字の表の指定が不正です（高さ {height}・倍率 {scale}・フォント {} 個）",
             faces.len()
         ));
     }
@@ -1245,7 +1225,7 @@ pub fn gdi_atlas_with(
     // SAFETY: NULL は「画面と同じ形のメモリの DC」を作る決まり。
     g.dc = unsafe { CreateCompatibleDC(core::ptr::null_mut()) };
     if g.dc.is_null() {
-        return Err("CreateCompatibleDC が失敗した".to_string());
+        return Err("CreateCompatibleDC が失敗しました".to_string());
     }
     let (mut face, mut matched) = (String::new(), false);
     for want in faces {
@@ -1292,7 +1272,7 @@ pub fn gdi_atlas_with(
         }
     }
     if g.font.is_null() {
-        return Err("CreateFontW が全部の候補で失敗した".to_string());
+        return Err("CreateFontW が全候補で失敗しました".to_string());
     }
     // 基準線をＭＳ ゴシックに揃える: ＭＳ ゴシックは文字の高さ（em）の 6/7 のところが基準線（高さ 14 で ascent 12）。全角の文字の墨は
     // 基準線の上に約 0.88 em 乗るので、字体の ascent がそれより大きい字体（Yu Gothic UI・Meiryo UI は em 14 で ascent 15）は、その差だけ
@@ -1332,7 +1312,7 @@ pub fn gdi_atlas_with(
         )
     };
     if g.dib.is_null() || bits.is_null() {
-        return Err(format!("CreateDIBSection（{w}×{h}）が失敗した"));
+        return Err(format!("CreateDIBSection（{w}×{h}）が失敗しました"));
     }
     let len = w as usize * h as usize * 4;
     // SAFETY: `bits` は CreateDIBSection が返した `w × h × 4` バイトの面（32 ビット・詰め物なし）。黒で埋める。
@@ -1461,7 +1441,7 @@ pub fn gdi_atlas_with(
 
 // ---- 読み取りのスレッド: 文の更新スレッド ----
 
-/// 文の更新スレッドを起こす（1 本だけ）。250 ms ごとに描画の回数から fps を出し、文を入れ物に書く。パニックしたら止まる（描画は最後に書いた文の
+/// 文の更新スレッドを作る（1 本だけ）。250 ms ごとに描画の回数から fps を出し、文を入れ物に書く。パニックしたら止まる（描画は最後に書いた文の
 /// まま続く）。ゲームの文字をコピーした後（`GF_CAPTURED`）は、ここで文字の表を作り直して差し替える（`apply_captured_game_font`。ヒープを使う仕事は
 /// 全部このスレッド）。文の更新の失敗と文字の表の作り直しの失敗は別々に受けて、片方が止まってももう片方は続ける。
 fn start_updater(cfg: UpdaterCfg) -> Result<(), String> {
@@ -1504,7 +1484,7 @@ fn start_updater(cfg: UpdaterCfg) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| {
             UPDATER_STARTED.store(0, Ordering::SeqCst);
-            format!("文の更新スレッドを起こせない: {e}")
+            format!("文の更新スレッドの作成不能: {e}")
         })
 }
 
@@ -1539,7 +1519,7 @@ fn apply_captured_game_font(cfg: &UpdaterCfg) {
         set_apply_failed("作業場か文字の表が無い".to_string());
         return;
     }
-    // SAFETY: `atlas_at` は `place_atlas` / この関数が `Box::leak` で作って返さない `Atlas`（Release で置いた）。
+    // SAFETY: `atlas_at` は `place_atlas` / この関数が `Box::leak` で作って返さない `Atlas`（Release で書いた）。
     let before: &'static Atlas = unsafe { &*(atlas_at as *const Atlas) };
     // SAFETY: `scratch` は `ensure_scratch` の `SCRATCH_WORDS` 語。`GF_CAPTURED` を Acquire で見たので、ゲームのスレッドの書きは見えていて、
     // 以後だれも書かない。
@@ -1591,7 +1571,7 @@ fn apply_captured_game_font(cfg: &UpdaterCfg) {
 
 /// 見本の PNG を本ログの隣へ書く（`<本ログの名前の先頭>_glyphs_lines.png`（GDI だけの表とゲームの文字の表を並べた、日本語と英数字の混ざった行・
 /// ASCII 全部。3 倍に拡大）と `_glyphs_atlas.png`（コピーした後の文字の表そのもの。3 倍）と `_glyphs.txt`（`game_font_text`）。本ログは回ごとに
-/// 別名で、開くのは `create_new`（既存を上書きしない）、置き場がゲームのフォルダの中なら書かない —— `RealRecord`）。失敗は本ログには書けない
+/// 別名で、開くのは `create_new`（既存を上書きしない）、出力先がゲームのフォルダの中なら書かない —— `RealRecord`）。失敗は本ログには書けない
 /// （更新スレッドは本ログを持たない）ので、`GF_NOTE` に残して本ログの集計が読む。
 fn write_previews(cfg: &UpdaterCfg, before: &Atlas, spec: &AtlasSpec, texels: &[u32]) {
     use crate::observe::RecordEnv;
@@ -1729,7 +1709,7 @@ fn game_font_text_with(state: u32) -> String {
 
 pub struct RealOverlayHost {
     ini: Result<Option<String>, String>,
-    /// 見本の PNG の置き場（本ログのパスと exe のフォルダ）と、見本の旗。
+    /// 見本の PNG の出力先（本ログのパスと exe のフォルダ）と、見本の旗。
     cfg: UpdaterCfg,
 }
 
@@ -1846,7 +1826,7 @@ pub(crate) mod tests {
     static GAME_VB_REFS: AtomicU32 = AtomicU32::new(0);
 
     /// GetTexture / GetStreamSource の番号（SDK の並び）。本体は呼ばないので定数を持たない。偽のデバイスは ENBSeries の変換と同じく、
-    /// 何も置かれていなくても中身の無い包み（`ENB_EMPTY`）を返し、その Release を数える。
+    /// 何も設定されていなくても中身の無い包み（`ENB_EMPTY`）を返し、その Release を数える。
     const DEV_GETTEXTURE: u32 = 0xF0;
     const DEV_GETSTREAMSOURCE: u32 = 0x150;
     static ENB_EMPTY: Obj = Obj(AtomicU32::new(0));
@@ -1885,7 +1865,7 @@ pub(crate) mod tests {
     static AT_DRAW: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
     static AT_DRAW_V0: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
 
-    /// 自分のテクスチャの画素の置き場。pitch は 1 行（幅 × 4 バイト）＋ 詰め物 16 バイト（`pitch()`。128 幅なら 528）。
+    /// 自分のテクスチャの画素の領域。pitch は 1 行（幅 × 4 バイト）＋ 詰め物 16 バイト（`pitch()`。128 幅なら 528）。
     /// 日本語の文字の表（幅・高さとも 512 まで）が入る大きさ。
     const BITS_WORDS: usize = (512 * 4 + 16) * 512 / 4;
     static TEX_BITS: [AtomicU32; BITS_WORDS] = [const { AtomicU32::new(0) }; BITS_WORDS];
@@ -2231,8 +2211,8 @@ pub(crate) mod tests {
         (spec, texels)
     }
 
-    /// `slot` に覚えてある文字の表のアドレスを返す。無ければ `make` で作って置く（`place_atlas` は `ATLAS` が空でなければ断るので、いったん
-    /// 空にしてから置く）。呼ぶのは `REAL_HOOK_TESTS` の錠を持つ間だけ。
+    /// `slot` に覚えてある文字の表のアドレスを返す。無ければ `make` で作って保存する（`place_atlas` は `ATLAS` が空でなければ断るので、いったん
+    /// 空にしてから設定する）。呼ぶのは `REAL_HOOK_TESTS` の錠を持つ間だけ。
     fn kept_atlas(slot: &AtomicUsize, make: fn() -> (AtlasSpec, Vec<u32>)) -> usize {
         match slot.load(Ordering::SeqCst) {
             0 => {
@@ -2308,8 +2288,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// 偽のゲームの物を「読み込み済み・文字の絵が 128×128 の一枚に並んでいる」形に置く。文字 c（`0x21`〜`0x7E`）の絵は幅 7 × 高さ 9、
-    /// `(k % 16) × 8`, `(k / 16) × 10`（k = c − 0x21）。`` ` `` のスプライトも置く（使わないことを見る）。画素は A8R8G8B8
+    /// 偽のゲームの物を「読み込み済み・文字の絵が 128×128 の一枚に並んでいる」形にする。文字 c（`0x21`〜`0x7E`）の絵は幅 7 × 高さ 9、
+    /// `(k % 16) × 8`, `(k / 16) × 10`（k = c − 0x21）。`` ` `` のスプライトも用意する（使わないことを見る）。画素は A8R8G8B8
     /// （B = x, G = y, R = 0xAA, A = 0xFF）で、`fmt` を変えるなら `fill_glyph_pixels` で入れ直す。
     fn game_world() {
         let l = addr_of(&FAKE_L);
@@ -2423,7 +2403,7 @@ pub(crate) mod tests {
         for (i, a) in TSS_STATE.iter().enumerate() {
             a.store(0x2000 + i as u32, Ordering::SeqCst);
         }
-        // 段 0 のテクスチャは、描画の地点の直前（`0x0042DD4B`）でゲームが置く NULL。流れ 0 はゲームの頂点バッファで、覚えは 2。
+        // 段 0 のテクスチャは、描画の地点の直前（`0x0042DD4B`）でゲームが設定する NULL。流れ 0 はゲームの頂点バッファで、覚えは 2。
         TEX0.store(0, Ordering::SeqCst);
         VS.store(GAME_VS, Ordering::SeqCst);
         VB0.store(addr_of(&GAME_VB), Ordering::SeqCst);
@@ -2436,13 +2416,13 @@ pub(crate) mod tests {
         GAME_VB_REFS.store(1, Ordering::SeqCst);
     }
 
-    /// 偽の AnmManager の覚えと頂点バッファを置き、`STREAM_MGR_PTR` をそこへ向ける。
+    /// 偽の AnmManager の覚えと頂点バッファを用意し、`STREAM_MGR_PTR` をそこへ向ける。
     fn fake_anm(flag: u8, vb: u32) {
         FAKE_ANM_PTR.store(
             addr_of(&FAKE_ANM_TAIL).wrapping_sub(0x12884),
             Ordering::SeqCst,
         );
-        // `+0x12884` の語の 3 バイト目が `+0x12886`。隣の 3 バイトにも値を置き、1 バイトだけ読むことを見る。
+        // `+0x12884` の語の 3 バイト目が `+0x12886`。隣の 3 バイトにも値を入れ、1 バイトだけ読むことを見る。
         FAKE_ANM_TAIL[0].store(
             0xA5A5_A5A5 & !0x00FF_0000 | u32::from(flag) << 16,
             Ordering::SeqCst,
@@ -2582,7 +2562,7 @@ pub(crate) mod tests {
     }
 
     fn atlas() -> &'static Atlas {
-        // SAFETY: `setup` が置いた、返さない文字の表。
+        // SAFETY: `setup` が用意した、返さない文字の表。
         unsafe { &*(ATLAS.load(Ordering::SeqCst) as *const Atlas) }
     }
 
@@ -2903,7 +2883,6 @@ pub(crate) mod tests {
         teardown();
     }
 
-    /// 壊れたら落ちる: GetTexture か GetStreamSource を呼ぶ（ENBSeries の変換の上では、返った中身の無い包みの Release で落ちる）。
     #[test]
     fn reference_returning_gets_are_never_called() {
         use crate::net_ui::SHOW_MENU;
@@ -2930,8 +2909,6 @@ pub(crate) mod tests {
         teardown();
     }
 
-    /// 壊れたら落ちる: 段 0 を NULL へ戻さない・覚えが 2 なのに流れ 0 を置き直さない（ゲームが空の流れで DrawPrimitive を呼ぶ）・
-    /// 覚えが 2 でないのに置き直す・AnmManager が無い / 読めないときに何かを置く・ゲームのメモリに書く。
     #[test]
     fn stream0_is_put_back_only_when_the_game_skips_setstreamsource() {
         let _g = setup();
@@ -2952,7 +2929,7 @@ pub(crate) mod tests {
         assert_eq!(device_state(), before);
         assert_eq!(fake_anm_words(), anm0, "ゲームのメモリに書いた");
 
-        // 覚えが 2 でなければ、ゲームが描く前に自分で置くので、DrawPrimitiveUP が NULL にしたまま。
+        // 覚えが 2 でなければ、ゲームが描く前に自分で戻すので、DrawPrimitiveUP が NULL にしたまま。
         for flag in [0u8, 1, 3, 4, 0xFF] {
             fake_anm(flag, game_vb);
             VB0.store(game_vb, Ordering::SeqCst);
@@ -2970,7 +2947,7 @@ pub(crate) mod tests {
             );
         }
 
-        // AnmManager がまだ無い・置き場が読めない・バッファが 0。
+        // AnmManager がまだ無い・ポインタの欄が読めない・バッファが 0。
         let none = [
             Box::new(|| {
                 fake_anm(2, game_vb);
@@ -2999,7 +2976,6 @@ pub(crate) mod tests {
         teardown();
     }
 
-    /// 壊れたら落ちる: 止める前に理由を返す・理由が組になる前に返す・同じ理由を 2 回返す（本ログに同じ行が並ぶ）。
     #[test]
     fn stop_report_is_given_once_and_only_after_a_stop() {
         let _g = setup();
@@ -3680,7 +3656,7 @@ pub(crate) mod tests {
         );
 
         let old_at = ATLAS.load(Ordering::SeqCst);
-        // SAFETY: `use_game_atlas` が置いた、返さない文字の表。
+        // SAFETY: `use_game_atlas` が用意した、返さない文字の表。
         let old: &Atlas = unsafe { &*(old_at as *const Atlas) };
         apply_captured_game_font(&UpdaterCfg::default());
         assert_eq!(GF_STATE.load(Ordering::SeqCst), GF_APPLIED);
@@ -4042,7 +4018,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// 描いた最初の頂点（下地の左上）の x 座標 + 0.5。文 "AB" の下地は、旧い表（送り 7）なら 620、ゲームの文字をコピーした表（送り 9）なら 616（右端 638 から引く）。
+    /// 描いた最初の頂点（下地の左上）の x 座標 + 0.5。文 "AB" の下地は、旧い表（文字の送り 7）なら 620、ゲームの文字をコピーした表（文字の送り 9）なら 616（右端 638 から引く）。
     fn box_left() -> f32 {
         f32::from_bits(AT_DRAW_V0[0].load(Ordering::SeqCst)) + 0.5
     }
@@ -4548,7 +4524,7 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(dir.join(&names[0])).unwrap(), before);
         let note = GF_NOTE.lock().unwrap().clone();
         assert!(
-            note.contains("見本のファイル") && note.contains("既にある"),
+            note.contains("見本のファイル") && note.contains("既に存在します"),
             "{note}"
         );
         let inside = temp_case("prev_inside");

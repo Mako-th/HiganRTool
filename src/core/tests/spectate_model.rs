@@ -1,11 +1,12 @@
 //! 観戦の 2 つの模型（ホストの送りウィンドウ `SpectateHost` ↔ 観戦者の組み立て `Watcher`）を、落とす・重ねる・順を入れ替える・
-//! 遅れて JOIN する・観戦者が黙る の乱れのネットワークで繋ぎ、観戦者が受け取った記録の列がホストの積んだ列と一致することを見る。
+//! 遅れて JOIN する・観戦者が黙る の乱れのネットワークで接続し、観戦者が受け取った記録の列がホストの積んだ列と一致することを見る。
 //! あわせて、ウィンドウ・リングバッファ・観戦者の数の境目と、JOIN のガードを直に見る。
 //!
 //! ネットワークは 1 ms ごとに進む固定 seed の模型（実際の UDP・時計は使わない）。ホストは 60 fps くらい（16 ms に 1 記録）で記録を積み、
 //! 両側が毎 ms `poll` を呼ぶ。
 
 use higanr_core::auth::{AuthKey, Secret};
+use higanr_core::bits512::Bits512;
 use higanr_core::candidate::Candidates;
 use higanr_core::handshake::Name;
 use higanr_core::link::Outlet;
@@ -22,9 +23,15 @@ use higanr_core::wire::{
 };
 use std::net::SocketAddr;
 
+/// 上りの帯域が限られた出口を対戦の便と観戦の便が共有する模型（観戦者への送信が対戦の便を待たせる長さ）。
+#[path = "spectate_model/bandwidth.rs"]
+mod bandwidth;
 /// 遅れて入った観戦者の追いつき（往復・落とし・観戦者の早送り）の模型。
 #[path = "spectate_model/catchup.rs"]
 mod catchup;
+/// 続きから受ける JOIN と、ホストが持つ中継の木の欄。
+#[path = "spectate_model/resume.rs"]
+mod resume;
 /// ホストの送り直しの時計・速い送り直し・送りの上限を直に見る検査。
 #[path = "spectate_model/sending.rs"]
 mod sending;
@@ -147,6 +154,8 @@ struct Net {
     reordered: u64,
     /// ホストが送ったバイト数の 1 秒ごとの合計（添字 = 秒）。
     host_sec: Vec<u64>,
+    /// 有れば、ホストの送り（対戦の便と観戦者への送信）は全部この上りの出口（帯域と列）を通る（`bandwidth`）。
+    uplink: Option<bandwidth::Uplink>,
 }
 
 impl Net {
@@ -169,6 +178,7 @@ impl Net {
             max_seq: std::collections::HashMap::new(),
             reordered: 0,
             host_sec: Vec::new(),
+            uplink: None,
         }
     }
 
@@ -186,6 +196,17 @@ impl Net {
             self.watcher_pkts += 1;
             self.watcher_bytes += bytes.len() as u64;
         }
+        // 上りの出口を出る時刻（列が溢れたら落ちる）。出口が無ければ送ったその ms。
+        let sent_at = match self.uplink.as_mut().filter(|_| from == HOST) {
+            Some(u) => match u.enqueue(now, to, bytes.len()) {
+                Some(t) => t,
+                None => {
+                    self.dropped += 1;
+                    return;
+                }
+            },
+            None => now,
+        };
         if self.dead.contains(&from)
             || self.dead.contains(&to)
             || self.rng.below(100) < self.drop_pct
@@ -199,7 +220,7 @@ impl Net {
             1
         };
         for _ in 0..copies {
-            let at = now + self.base + self.rng.below(u64::from(self.jitter) + 1) as u32;
+            let at = sent_at + self.base + self.rng.below(u64::from(self.jitter) + 1) as u32;
             self.seq += 1;
             self.q.push(InFlight {
                 at,
@@ -260,6 +281,8 @@ struct Sim {
     host_poll_every: u32,
     /// `poll` 1 回でホストが送った通数の最大。
     max_poll_pkts: u64,
+    /// 有れば、ホストと対戦の相手が INPUT を送り合い、ホストはその往復を観戦者への送信へ渡す（`bandwidth`）。
+    duel: Option<Box<bandwidth::Duel>>,
 }
 
 impl Sim {
@@ -277,6 +300,7 @@ impl Sim {
             push_at: Vec::new(),
             host_poll_every: 1,
             max_poll_pkts: 0,
+            duel: None,
         }
     }
 
@@ -305,6 +329,9 @@ impl Sim {
 
     /// ホストの `poll` を 1 回回し、その 1 回で送った通数の最大を覚える（受信スレッドの 1 周の仕事の目安）。
     fn poll_host(&mut self, now: u32) {
+        if let Some(d) = &self.duel {
+            self.host.note_delay(d.snapshot());
+        }
         let before = self.net.host_pkts;
         let mut tx = Tx {
             net: &mut self.net,
@@ -345,6 +372,19 @@ impl Sim {
             } else {
                 *m = p.seq;
             }
+            if let Some(d) = self.duel.as_mut()
+                && d.owns(&p)
+            {
+                d.on_packet(&p, now);
+                // dll の受信スレッドは、対戦の相手の便を受けるたびに観戦者への送信を回す。
+                if p.to == HOST {
+                    host_got = true;
+                    if self.host_poll_every > 1 {
+                        self.poll_host(now);
+                    }
+                }
+                continue;
+            }
             if p.to == HOST {
                 host_got = true;
                 let mut tx = Tx {
@@ -380,6 +420,10 @@ impl Sim {
         }
         if (host_got && self.host_poll_every == 1) || now.is_multiple_of(self.host_poll_every) {
             self.poll_host(now);
+        }
+        // 対戦の便は、同じ ms の観戦者への送信の後ろに並ぶ（列で待つ長さを少なく見積もらない）。
+        if let Some(d) = self.duel.as_mut() {
+            d.send_due(now, &mut self.net);
         }
         for w in &mut self.watchers {
             if now < w.start_at {
@@ -952,6 +996,14 @@ impl Sink {
     }
 }
 
+/// ウィンドウ・受け取れた範囲・送り直しの仕組みだけを見る検査のホスト。送りの量の上限（`spectate_rate`）に依らないよう、固定の全体の上限
+/// （64,000 B/s。512 記録のウィンドウを 0.1 秒で出し切る）で回す。
+fn window_test_host(cap: usize) -> SpectateHost {
+    let mut h = SpectateHost::with_capacity(host_cfg(), cap);
+    h.use_fixed_rate(higanr_core::spectate_rate::FIXED_COMPARE_BPS);
+    h
+}
+
 fn frame(f: u32) -> Record {
     Record::Frame {
         frame: f,
@@ -1003,15 +1055,21 @@ fn to_host(msg: &Message) -> Vec<u8> {
 }
 
 fn join_msg(nonce: u64) -> Message {
+    join_msg_ff(nonce, higanr_core::spectate_pace::FF_UPDATES_DEFAULT as u8)
+}
+
+fn join_msg_ff(nonce: u64, ff_max: u8) -> Message {
     remember(nonce);
     let mut name = [0u8; 32];
     name[0] = b'x';
     Message::SpectateJoin(SpectateJoin {
         name_len: 1,
+        ff_max,
         nonce,
         name,
         build: higanr_core::update::BUILD_NUMBER,
         public: Ephemeral::from_seed(&wseed(nonce)).public(),
+        tree: wire::JoinTree::NONE,
     })
 }
 
@@ -1025,8 +1083,20 @@ fn join(
     host.on_datagram(from, &to_host(&join_msg(nonce)), now, sink)
 }
 
+/// `join` の、早送りの速さ `ff_max` を名乗る形。
+fn join_ff(
+    host: &mut SpectateHost,
+    from: SocketAddr,
+    nonce: u64,
+    ff_max: u8,
+    now: u32,
+    sink: &mut Sink,
+) -> HostEvent {
+    host.on_datagram(from, &to_host(&join_msg_ff(nonce, ff_max)), now, sink)
+}
+
 fn ack(host: &mut SpectateHost, from: SocketAddr, nonce: u64, next: u32, now: u32) -> HostEvent {
-    ack_sack(host, from, nonce, next, 0, now)
+    ack_sack(host, from, nonce, next, Bits512::EMPTY, now)
 }
 
 fn ack_sack(
@@ -1034,24 +1104,32 @@ fn ack_sack(
     from: SocketAddr,
     nonce: u64,
     next: u32,
-    sack: u64,
+    sack: Bits512,
     now: u32,
 ) -> HostEvent {
     let mut sink = Sink::default();
     host.on_datagram(
         from,
-        &to_host(&Message::SpectateAck { nonce, next, sack }),
+        &to_host(&Message::SpectateAck {
+            nonce,
+            next,
+            relay: wire::RelayState::NO_INTRO,
+            admit_ack: 0,
+            sack,
+        }),
         now,
         &mut sink,
     )
 }
 
 /// 番号 `next` が連続の終わりで、`have` の記録を受け取れている観戦者の ACK の範囲（`wire` の配置どおり: ビット i = `next + 1 + i`）。
-fn sack_of_have(next: u32, have: &[u32]) -> u64 {
-    have.iter().fold(0u64, |acc, &r| {
+fn sack_of_have(next: u32, have: &[u32]) -> Bits512 {
+    let mut bits = Bits512::EMPTY;
+    for &r in have {
         assert!(r > next && r - next - 1 < wire::SACK_BITS, "範囲の外: {r}");
-        acc | 1 << (r - next - 1)
-    })
+        bits.set(r - next - 1);
+    }
+    bits
 }
 
 fn indices(streams: &[SpectateStream]) -> Vec<u32> {
@@ -1063,9 +1141,9 @@ fn indices(streams: &[SpectateStream]) -> Vec<u32> {
 
 #[test]
 fn the_send_window_stops_at_ack_plus_window() {
-    let mut host = SpectateHost::with_capacity(host_cfg(), 1_000);
+    let mut host = window_test_host(1_000);
     host.push(Record::Seg { seg: 0 }).unwrap();
-    for f in 0..199 {
+    for f in 0..SEND_WINDOW + 99 {
         host.push(frame(f)).unwrap();
     }
     let mut sink = Sink::default();
@@ -1073,12 +1151,8 @@ fn the_send_window_stops_at_ack_plus_window() {
         join(&mut host, addr(1), 7, 100, &mut sink),
         HostEvent::Joined
     );
-    host.poll(100, &mut sink);
-    let streams = sink.streams();
-    let sent: Vec<u32> = streams
-        .iter()
-        .flat_map(|s| (0..u32::from(s.count)).map(move |k| s.first + k))
-        .collect();
+    let streams = poll_for(&mut host, &mut sink, 100, 100);
+    let sent = indices(&streams);
     assert_eq!(
         sent,
         (0..SEND_WINDOW).collect::<Vec<_>>(),
@@ -1090,16 +1164,19 @@ fn the_send_window_stops_at_ack_plus_window() {
     );
     assert!(streams[0].reset && streams[0].first == 0);
     assert_eq!(
-        ack(&mut host, addr(1), 7, 10, 101),
+        ack(&mut host, addr(1), 7, 10, 200),
         HostEvent::Acked { progress: true }
     );
-    host.poll(101, &mut sink);
-    let sent: Vec<u32> = sink
-        .streams()
-        .iter()
-        .flat_map(|s| (0..u32::from(s.count)).map(move |k| s.first + k))
-        .collect();
+    let sent = indices(&poll_for(&mut host, &mut sink, 200, 20));
     assert_eq!(sent, (SEND_WINDOW..10 + SEND_WINDOW).collect::<Vec<_>>());
+}
+
+/// 追いついていない観戦者への送りは 1 `poll` に通数と量の上限があるので、`ms` ms の間 1 ms ごとに `poll` して出た STREAM を集める。
+fn poll_for(host: &mut SpectateHost, sink: &mut Sink, from: u32, ms: u32) -> Vec<SpectateStream> {
+    for t in from..from + ms {
+        host.poll(t, sink);
+    }
+    sink.streams()
 }
 
 #[test]
@@ -1610,6 +1687,9 @@ fn a_silent_spectator_is_not_hammered_with_one_record_packets() {
     let mut sink = Sink::default();
     join(&mut host, addr(1), 1, 0, &mut sink);
     let (mut packets, mut records) = (0u64, 0u64);
+    // 送り直しの通（最初の番号が、新しく送った所の終わりより前）の数と記録の数。
+    let (mut resent_packets, mut resent_records) = (0u64, 0u64);
+    let mut fresh_end = 0u32;
     let mut f = 0;
     for t in 0..7_000u32 {
         if t % 16 == 0 {
@@ -1620,17 +1700,31 @@ fn a_silent_spectator_is_not_hammered_with_one_record_packets() {
         for s in sink.streams() {
             packets += 1;
             records += u64::from(s.count);
+            if s.first < fresh_end {
+                resent_packets += 1;
+                resent_records += u64::from(s.count);
+            } else {
+                fresh_end = s.first + u32::from(s.count);
+            }
         }
     }
     let c = host.counts();
     eprintln!(
-        "黙った観戦者へ 7 秒: 送った {packets} 通・{records} 記録（送り直し {} 通・{} 記録）",
-        c.resends, c.records_resent
+        "黙った観戦者へ 7 秒: 送った {packets} 通・{records} 記録（送り直し {resent_packets} 通・{resent_records} 記録）"
     );
     assert_eq!(host.spectator_count(), 1, "7 秒ではまだ外れない");
-    assert!(c.resends > 0, "黙った観戦者へ送り直しが無い（効く期間）");
-    assert!(packets < 150, "黙った観戦者へ 7 秒で {packets} 通");
-    assert!(c.resends < 60, "うち送り直し {} 通", c.resends);
+    assert!(
+        resent_packets > 0,
+        "黙った観戦者へ送り直しが無い（効く期間）"
+    );
+    assert_eq!(resent_packets, c.resends);
+    assert!(resent_packets < 60, "送り直し {resent_packets} 通");
+    // 送り直しは先頭の 1 通ぶんの穴をまとめて送る（1 記録ずつの通を重ねない）。
+    assert!(
+        resent_records * 2 >= resent_packets * MAX_STREAM_RECORDS as u64,
+        "送り直し 1 通あたり {:.1} 記録（{resent_packets} 通・{resent_records} 記録）",
+        resent_records as f64 / resent_packets as f64
+    );
 }
 
 #[test]
@@ -1647,7 +1741,7 @@ fn silence_boundary_is_exactly_silent_ms() {
 #[test]
 fn spectator_limit_refusal_and_rejoin() {
     let mut host = SpectateHost::with_capacity(host_cfg(), 100);
-    // いまの seg の始まり（3）がリングバッファの先頭（0）と違うリングバッファ（起こし直しの行き先が始まりと混ざらないように）。
+    // いまの seg の始まり（3）がリングバッファの先頭（0）と違うリングバッファ（再起動の行き先が始まりと混ざらないように）。
     for r in [
         Record::Seg { seg: 0 },
         frame(0),
@@ -1696,13 +1790,13 @@ fn spectator_limit_refusal_and_rejoin() {
     );
     assert_eq!(host.ack_of(addr(2)), Some(host.seg_start()));
     assert_eq!(host.spectator_count(), MAX_SPECTATORS);
-    // 起こし直す前の nonce の ack は聞かない。バージョン 5 では、起こし直す前の観戦者の鍵（JOIN し直した公開鍵とは別）で封じてあるので、
+    // 再起動する前の nonce の ack は聞かない。バージョン 5 では、再起動する前の観戦者の鍵（JOIN し直した公開鍵とは別）で封じてあるので、
     // 開く前にタグで落ちる。
     assert_eq!(
         ack(&mut host, addr(2), 2, 5, 2_008),
         HostEvent::Dropped(DropReason::BadTag)
     );
-    // 起こし直した後の鍵で封じても、中の nonce が前のものなら聞かない（nonce のガードは鍵のガードと別に残る）。
+    // 再起動した後の鍵で封じても、中の nonce が前のものなら聞かない（nonce のガードは鍵のガードと別に残る）。
     assert_eq!(
         host.on_datagram(
             addr(2),
@@ -1711,7 +1805,9 @@ fn spectator_limit_refusal_and_rejoin() {
                 &Message::SpectateAck {
                     nonce: 2,
                     next: 5,
-                    sack: 0
+                    relay: wire::RelayState::NO_INTRO,
+                    admit_ack: 0,
+                    sack: Bits512::EMPTY
                 }
             ),
             2_008,
@@ -1902,7 +1998,9 @@ fn streams_are_sealed_per_spectator_and_the_host_never_reuses_a_nonce() {
                 &Message::SpectateAck {
                     nonce: 1,
                     next: 1,
-                    sack: 0
+                    relay: wire::RelayState::NO_INTRO,
+                    admit_ack: 0,
+                    sack: Bits512::EMPTY
                 }
             ),
             2,
@@ -1926,7 +2024,7 @@ fn streams_are_sealed_per_spectator_and_the_host_never_reuses_a_nonce() {
         );
     }
     assert!(host.next_seq() > before);
-    // 同じ送り元・同じ nonce でも公開鍵が違う JOIN は、起こし直しとして入り直させる（古い鍵で送り続けない）。
+    // 同じ送り元・同じ nonce でも公開鍵が違う JOIN は、再起動として入り直させる（古い鍵で送り続けない）。
     let Message::SpectateJoin(mut j) = join_msg(1) else {
         unreachable!("JOIN");
     };
@@ -2047,7 +2145,7 @@ fn a_resent_join_and_a_full_refusal_do_not_repeat_the_key_exchange() {
     assert_eq!(host.counts().key_agreements, base + 3);
 }
 
-/// `nonce` の JOIN の公開鍵だけを `key_seed` の鍵に替えて送る（nonce を替えず公開鍵だけ変えた起こし直し）。
+/// `nonce` の JOIN の公開鍵だけを `key_seed` の鍵に替えて送る（nonce を替えず公開鍵だけ変えた再起動）。
 fn rekey_join(
     host: &mut SpectateHost,
     from: SocketAddr,
@@ -2152,7 +2250,7 @@ fn the_host_wide_agree_budget_holds_across_senders_and_a_legit_spectator_gets_in
     assert_eq!(host.counts().key_agreements, AGREE_BURST as u64);
     assert_eq!(host.counts().join_throttled, 100);
     assert_eq!(host.spectator_count(), AGREE_BURST);
-    // 正当な観戦者は 250 ms ごとの再送の、窓が空いた回で入る。
+    // 正当な観戦者は 250 ms ごとの再送の、ウィンドウが空いた回で入る。
     let legit = 500u16;
     let mut joined_at = None;
     for k in 1..=8u32 {
@@ -2185,7 +2283,7 @@ fn a_rekey_and_a_full_refusal_share_the_agree_budget() {
     assert!(sink.0.is_empty());
     assert_eq!(host.counts().key_agreements, MAX_SPECTATORS as u64);
     assert_eq!(host.counts().join_throttled, 2);
-    // 窓が空いたら断りの BYE も出せる。
+    // ウィンドウが空いたら断りの BYE も出せる。
     assert_eq!(
         join(
             &mut host,
@@ -2198,7 +2296,7 @@ fn a_rekey_and_a_full_refusal_share_the_agree_budget() {
     );
     assert_eq!(sink.0.len(), 1);
     assert_eq!(host.counts().key_agreements, MAX_SPECTATORS as u64 + 1);
-    // 窓が空いたら作り直せる（上の断りで 1 枠使ったので、そのぶん 1 回後ろ）。
+    // ウィンドウが空いたら作り直せる（上の断りで 1 枠使ったので、そのぶん 1 回後ろ）。
     assert_eq!(
         rekey_join(
             &mut host,
@@ -2330,7 +2428,9 @@ fn the_join_gate_accepts_only_the_spectate_code_key_and_session() {
         Message::SpectateAck {
             nonce: 1,
             next: 0,
-            sack: 0,
+            relay: wire::RelayState::NO_INTRO,
+            admit_ack: 0,
+            sack: Bits512::EMPTY,
         },
         stream,
         Message::Ping { send_time: 1 },
@@ -2459,7 +2559,7 @@ fn the_sack_accumulates_shifts_with_ack_and_ignores_stale_acks() {
     ack_sack(&mut host, a, 1, 5, sack_of_have(5, &[10]), 3);
     assert_eq!(host.sack_of(a), Some(sack_of_have(5, &[6, 7, 10])));
     assert_eq!(
-        ack_sack(&mut host, a, 1, 3, u64::MAX >> 1, 4),
+        ack_sack(&mut host, a, 1, 3, wire::SACK_MASK, 4),
         HostEvent::Acked { progress: false }
     );
     assert_eq!(host.ack_of(a), Some(5));
@@ -2467,21 +2567,54 @@ fn the_sack_accumulates_shifts_with_ack_and_ignores_stale_acks() {
     ack_sack(&mut host, a, 1, 8, sack_of_have(8, &[12]), 5);
     assert_eq!(host.ack_of(a), Some(8));
     assert_eq!(host.sack_of(a), Some(sack_of_have(8, &[10, 12])));
-    ack_sack(&mut host, a, 1, 39, 0, 6);
-    assert_eq!(host.sack_of(a), Some(0));
-    let mut host = SpectateHost::with_capacity(host_cfg(), 200);
+    ack_sack(&mut host, a, 1, 39, Bits512::EMPTY, 6);
+    assert_eq!(host.sack_of(a), Some(Bits512::EMPTY));
+    // ウィンドウの外へ進む ACK: 一度に ack がウィンドウの幅だけ進んでも、範囲は空になって詰められる（語をまたぐ位置のビットも消える）。
+    let mut host = window_test_host(1_000);
     host.push(Record::Seg { seg: 0 }).unwrap();
-    for f in 0..129 {
+    for f in 0..SEND_WINDOW + 20 {
         host.push(frame(f)).unwrap();
     }
     let mut sink = Sink::default();
     join(&mut host, a, 1, 0, &mut sink);
     host.poll(0, &mut sink);
-    ack_sack(&mut host, a, 1, 2, sack_of_have(2, &[5, 60]), 1);
-    assert_eq!(host.sack_of(a), Some(sack_of_have(2, &[5, 60])));
-    ack_sack(&mut host, a, 1, 2 + SEND_WINDOW, 0, 2);
+    let have = [5, 60, 66, 100, 127];
+    ack_sack(&mut host, a, 1, 2, sack_of_have(2, &have), 1);
+    assert_eq!(host.sack_of(a), Some(sack_of_have(2, &have)));
+    ack_sack(&mut host, a, 1, 2 + SEND_WINDOW, Bits512::EMPTY, 2);
     assert_eq!(host.ack_of(a), Some(2 + SEND_WINDOW));
-    assert_eq!(host.sack_of(a), Some(0));
+    assert_eq!(host.sack_of(a), Some(Bits512::EMPTY));
+}
+
+/// ACK の範囲は 512 ビット全体で重なり、ack が語をまたいで進むと（64 の倍数とそうでない数）正しい位置へ詰まる。
+#[test]
+fn the_sack_keeps_its_bits_across_words_when_the_ack_jumps() {
+    let mut host = window_test_host(1_000);
+    let mut sink = Sink::default();
+    let a = addr(1);
+    join(&mut host, a, 1, 0, &mut sink);
+    for f in 0..SEND_WINDOW + 50 {
+        host.push(frame(f)).unwrap();
+    }
+    let sent = indices(&poll_for(&mut host, &mut sink, 0, 100));
+    assert_eq!(sent.len(), SEND_WINDOW as usize);
+    let have = [10, 70, 129, 200, 300, 448, 505];
+    ack_sack(&mut host, a, 1, 3, sack_of_have(3, &have), 101);
+    assert_eq!(host.sack_of(a), Some(sack_of_have(3, &have)));
+    // 重ねる: 別の位置の ACK が先の ACK のビットを消さない。
+    ack_sack(&mut host, a, 1, 3, sack_of_have(3, &[11, 506]), 102);
+    let all: Vec<u32> = have.iter().copied().chain([11, 506]).collect();
+    assert_eq!(host.sack_of(a), Some(sack_of_have(3, &all)));
+    // ack が 64 の倍数・そうでない数・ほぼウィンドウの幅だけ進む。進んだ先より前のビットは落ち、後ろは新しい位置に残る。
+    for next in [3 + 64, 3 + 100, 3 + 450] {
+        ack_sack(&mut host, a, 1, next, Bits512::EMPTY, 103);
+        let kept: Vec<u32> = all.iter().copied().filter(|&r| r > next).collect();
+        assert_eq!(
+            host.sack_of(a),
+            Some(sack_of_have(next, &kept)),
+            "ack {next}"
+        );
+    }
 }
 
 #[test]
@@ -2507,9 +2640,9 @@ fn a_sack_naming_records_not_sent_yet_is_clamped() {
     assert!(resent.contains(&45), "45 を送り直さなかった: {resent:?}");
     assert!(!resent.contains(&10), "範囲の中の 10 を送り直した");
     let (mut host, _) = host_with_40_sent();
-    ack_sack(&mut host, a, 1, 999, u64::MAX >> 1, 1);
+    ack_sack(&mut host, a, 1, 999, wire::SACK_MASK, 1);
     assert_eq!(host.ack_of(a), Some(40));
-    assert_eq!(host.sack_of(a), Some(0));
+    assert_eq!(host.sack_of(a), Some(Bits512::EMPTY));
     assert_eq!(host.counts().acks_clamped, 1);
     assert_eq!(host.counts().sacks_clamped, 0, "範囲は読んでいない");
 }
@@ -2610,25 +2743,34 @@ fn the_assembler_bounds_its_store_and_stalls_ack_at_cap() {
 
 #[test]
 fn the_assembler_reports_what_it_holds_beyond_the_run_in_the_ack_bit_layout() {
-    let mut a = Assembler::with_capacity(8); // 置き場は 8 + 64 = 72
-    assert_eq!(a.sack(), 0, "何も持っていない");
+    let mut a = Assembler::with_capacity(8); // 置き場は 8 + 512 = 520
+    assert_eq!(a.sack(), Bits512::EMPTY, "何も持っていない");
     a.on_stream(&stream_of(0, false, 3));
     a.on_stream(&stream_of(5, false, 2));
     assert_eq!((a.ack(), a.sack()), (3, sack_of_have(3, &[5, 6])));
-    a.on_stream(&stream_of(66, false, 1));
-    a.on_stream(&stream_of(67, false, 1));
-    assert_eq!(a.sack(), sack_of_have(3, &[5, 6, 66]));
-    assert_eq!(a.sack() >> wire::SACK_BITS, 0, "予約ビットは立てない");
+    // 語をまたぐ位置（ビット 62 / 63 / 296 / 496）。
+    for at in [66, 67, 300, 500] {
+        a.on_stream(&stream_of(at, false, 1));
+    }
+    assert_eq!(a.sack(), sack_of_have(3, &[5, 6, 66, 67, 300, 500]));
+    assert_eq!(
+        a.sack().andn(&wire::SACK_MASK),
+        Bits512::EMPTY,
+        "予約ビットは立てない"
+    );
     a.on_stream(&stream_of(3, false, 2));
-    assert_eq!((a.ack(), a.sack()), (7, sack_of_have(7, &[66, 67])));
+    assert_eq!(
+        (a.ack(), a.sack()),
+        (7, sack_of_have(7, &[66, 67, 300, 500]))
+    );
     assert!(a.pop().is_some());
-    assert_eq!(a.sack(), sack_of_have(7, &[66, 67]));
+    assert_eq!(a.sack(), sack_of_have(7, &[66, 67, 300, 500]));
 
     // 流れの制御: cap 4 で 10 個来ると、ack は 4 で止まり、置き場には 0..10 が残る。4 自身は連続の終わりで、範囲は 5 から。
     let cap = 4u32;
     let mut a = Assembler::with_capacity(cap as usize);
     a.on_stream(&stream_of(0, false, 10));
-    a.on_stream(&stream_of(cap + SEND_WINDOW - 1, false, 1)); // 置き場の最後（head + 置き場の大きさ - 1 = 67）
+    a.on_stream(&stream_of(cap + SEND_WINDOW - 1, false, 1)); // 置き場の最後（head + 置き場の大きさ - 1）。ビット 510
     assert_eq!(a.ack(), cap);
     assert_eq!(
         a.sack(),
@@ -2659,6 +2801,26 @@ fn a_late_reset_keeps_what_arrived_ahead_of_it_and_drops_what_is_behind() {
     for (idx, rec) in got {
         assert_eq!(rec, frame(idx), "番号 {idx} の中身");
     }
+}
+
+#[test]
+fn the_stored_end_counts_records_held_beyond_a_gap_and_falls_back_to_the_ack() {
+    let mut a = Assembler::with_capacity(8);
+    assert_eq!(a.stored_end(), 0);
+    a.on_stream(&stream_of(0, false, 3));
+    assert_eq!((a.ack(), a.stored_end()), (3, 3));
+    a.on_stream(&stream_of(7, false, 2));
+    assert_eq!((a.ack(), a.stored_end()), (3, 9), "抜けの後ろの 7・8");
+    drain(&mut a);
+    assert_eq!(a.stored_end(), 9, "連続を渡しても後ろの記録は残る");
+    a.on_stream(&stream_of(3, false, 4));
+    assert_eq!((a.ack(), a.stored_end()), (9, 9));
+    drain(&mut a);
+    assert_eq!(a.stored_end(), 9);
+    // 飛んだ先が置き場の記録より先なら、連続の終わり。
+    a.on_stream(&stream_of(40, false, 1));
+    a.on_stream(&stream_of(60, true, 2));
+    assert_eq!((a.ack(), a.stored_end()), (62, 62));
 }
 
 fn watcher(n: u16, hosts: &[SocketAddr]) -> Watcher {
@@ -2707,7 +2869,9 @@ fn the_watcher_joins_to_all_candidates_then_only_to_the_host_and_rejoins() {
             Message::SpectateAck {
                 nonce: 0xA001,
                 next: 3,
-                sack: 0
+                relay: wire::RelayState::NO_INTRO,
+                admit_ack: 0,
+                sack: Bits512::EMPTY
             }
         )]
     );
@@ -2866,7 +3030,7 @@ fn frame_paced_run(base: u32, phase: u32) -> (u64, u64, u64) {
     frame_paced_run_with(base, 0, phase, 0)
 }
 
-/// 1 フレーム 1 回受ける観戦者へ 60 秒流したときの（ホストが送った記録 / 積んだ記録, ホストの送りの B/s, 観戦者が捨てた重複）。
+/// 1 フレーム 1 回受ける観戦者へ 60 秒流したときの（ホストが送った記録 / 積んだ記録, 観戦者への送信の B/s, 観戦者が捨てた重複）。
 /// 観戦者の列がホストの列と全行一致することも見る（`assert_matches_host`）。
 fn lossy_cost(base: u32, jitter: u32, drop_pct: u64, seed: u64) -> (f64, f64, u64) {
     let r = lossy_run(base, jitter, drop_pct, seed);
@@ -3062,6 +3226,7 @@ fn established(seat: Seat, own: &str, peer: &str) -> higanr_core::handshake::Est
         peer_mode: wire::Mode::Delay,
         rollback_able: false,
         may_list: false,
+        pick: higanr_core::host_pick::PickNote::NONE,
     }
 }
 

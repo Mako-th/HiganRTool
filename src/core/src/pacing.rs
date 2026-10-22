@@ -1,15 +1,12 @@
 //! フレームのペース（取り込みの形 B「フレームの始まりで待つだけ」）の期限の計算と、1 フレームの記録の行・集計（pure）。
-//!
 //! Win32 に触らない: 時刻は QueryPerformanceCounter の値（整数のカウント）として受け取り、待つかどうか・どこまで待つかを返すだけ。待つのは `src/dll/src/pacing_win.rs`。
-//!
 //! - 期限の式: 基点 `base`（最初にフレームの始まりへ来た時刻）から `G_j = base + floor(j × QPF ÷ fps)`（fps は既定 60）。64 ビット（掛け算は 128 ビット）の整数で毎回ここから作り、
 //!   前の期限に 1 周期を足して作らない。足して作ると、QPF が 60 で割り切れない PC（例 3,579,545 Hz）で毎フレーム切り捨てた端数が積もってずれる。
 //!   花映塚自身は QPC の下位 32 ビットを単精度で割った時計に 1/60 を足すので、周期が 0.0166626 秒などに丸められ、429.5 秒ごとに折り返す。
 //! - 遅れたとき: ゲーム自身と同じく「取り戻さない」。遅れて始めたフレームの次の期限は、始めた時刻より後の最初の格子点（`first_after`）。格子（位相）はそのままで、
-//!   過ぎた格子点は飛ばす（数を返す）。花映塚の `0x0042DC74`〜`0x0042DC8B` も「期限 < 今 の間 1/60 ずつ足す」ので同じ形。vpatch の `AllowShortDelay=0`（基点を今に置き直す）とは違う（測定専用の `mode = vpatch` は `pacing_vpatch` で置き直す側を再現する）。
-//! - ペース（fps）: vpatch の `GameFPS` と同じく ini（`[pacing] fps`）で変えられる（仕組みだけ参考）。検査の回を速く回すため（例 240 で長いマッチを 4 倍の速さで作る）。
-//!   ゲームの 1 フレームの中身はペースに依らない見込み: ゲーム自身の時計 `0x0042CC90` を呼ぶのは do_frame の始まり `0x0042DC44` と尻 `0x0042DD65` の 2 か所だけで、B は始まりを置き換える。
-//!   既定の 60 なら製品の遅延の増分は 0。
+//!   過ぎた格子点は飛ばす（数を返す）。花映塚の `0x0042DC74`〜`0x0042DC8B` も「期限 < 今 の間 1/60 ずつ足す」ので同じ形。vpatch の `AllowShortDelay=0`（基点を今に取り直す）とは違う。
+//! - ペース（fps）: vpatch の `GameFPS` と同じく ini（`[pacing] fps`）で変えられる（仕組みだけ参考）。検査の回を速く回すため。ゲームの 1 フレームの中身はペースに依らない見込み:
+//!   ゲーム自身の時計 `0x0042CC90` を呼ぶのは do_frame の始まり `0x0042DC44` と尻 `0x0042DD65` の 2 か所だけで、B は始まりを置き換える。既定の 60 なら製品の遅延の増分は 0。
 #![forbid(unsafe_code)]
 
 use crate::ini::Ini;
@@ -83,7 +80,7 @@ pub struct Pace {
     fps: u64,
     grid: Option<Grid>,
     next: u64,
-    /// 期限が今より 2 周期より先にあったので基点を置き直した回数（QPC が戻ったときの守り）。
+    /// 期限が今より 2 周期より先にあったので基点を取り直した回数（QPC が戻ったときの守り）。
     rebased: u64,
     nudge_rem: i32,
 }
@@ -133,7 +130,7 @@ impl Pace {
         self.qpf.div_ceil(self.fps)
     }
 
-    /// いま待っているフレームの期限。最初の呼び出しで基点を `now` に置く。期限が `now` より 2 周期より先なら（QPC は戻らないので作りの誤りか時計の異常）、基点を `now` に置き直す（待ち続けて止まらないための守り）。
+    /// いま待っているフレームの期限。最初の呼び出しで基点を `now` にする。期限が `now` より 2 周期より先なら（QPC は戻らないので作りの誤りか時計の異常）、基点を `now` に取り直す（待ち続けて止まらないための守り）。
     pub fn deadline(&mut self, now: u64) -> u64 {
         let grid = match self.grid {
             Some(g) => g,
@@ -208,7 +205,7 @@ pub fn us_to_ticks_ceil(us: u64, qpf: u64) -> u64 {
 
 pub const SECTION: &str = "pacing";
 /// 節の中で読むキー（これと `pacing_hybrid::HYBRID_KEYS` の `hybrid_*` 以外は断る。綴りの誤りで既定のまま走らないように）。
-const KEYS: [&str; 5] = ["mode", "fps", "cycle_secs", "cycle_phases", "auto_window"];
+const KEYS: [&str; 6] = ["mode", "fps", "cycle_secs", "cycle_phases", "wait", "vsync"];
 
 /// `mode = cycle` の 1 区間の長さ（秒）の既定。6 分のマッチなら 1 方式あたり 4 区間になる。
 pub const DEFAULT_CYCLE_SECS: u64 = 30;
@@ -216,10 +213,10 @@ pub const DEFAULT_CYCLE_SECS: u64 = 30;
 pub const MIN_CYCLE_SECS: u64 = 1;
 pub const MAX_CYCLE_SECS: u64 = 3_600;
 
-/// `[pacing]` の節が無いとき（ini が無いときも）・`mode` を書かないときの形。ウィンドウなら b-spin、全画面なら game の `Mode::Auto`。
-/// 切り分けの実測（同じ実行で 30 秒ごとに入れ替え）で、入力 → Present の前が game p50 271.4 / p99 541.9 µs（10,813 フレーム）、b p50 308.5 / p99 1,052.9 µs（10,238）、
-/// b-spin p50 272.8 / p99 539.3 µs（9,004）だった。b の遅れの原因は寝ることで、b-spin は game と同じ。b-spin は論理コア 1 つを回し続ける（素の花映塚と同じ）。
-/// ただし全画面の素の花映塚は Present が垂直同期を待つので、全画面で 60.000 fps の格子を刻むと走査線と干渉する見込みがあり、全画面は game に任せる。
+/// `[pacing]` の節が無いとき（ini が無いときも）・`mode` を書かないときの形。ウィンドウと垂直同期を取らないフルスクリーンは `wait` の方式、垂直同期を取るフルスクリーンは game の `Mode::Auto`。
+/// 切り分けの実測（同じ実行で 30 秒ごとに入れ替え。各方式 9,000〜10,800 フレーム）で、入力 → Present の前の p99 は b だけが約 +500 µs 悪く、b-spin は game と同じだった。
+/// b の遅れの原因は寝ることで、b-spin は論理コア 1 つを回し続ける（素の花映塚と同じ）。
+/// 垂直同期を取るフルスクリーンの素の花映塚は Present が垂直同期を待つので、60.000 fps の格子を刻むと走査線と干渉する見込みがあり、game に任せる。
 pub const DEFAULT_MODE: Mode = Mode::Auto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,12 +227,12 @@ pub enum Mode {
     BSpin,
     /// game → b → b-spin を `cycle_secs` ごとに入れ替える（切り分け用）。並びは `cycle_phases` で変えられる。
     Cycle,
-    /// B と同じ格子で、期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後は b-spin と同じに `Sleep(0)` で回る（処理の重さを下げるため。`crate::pacing_hybrid`）。既定ではない。
+    /// B と同じ格子で、期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後は b-spin と同じに `Sleep(0)` で回る（処理の重さを下げるため。`crate::pacing_hybrid`）。auto の既定の待ち方。
     BHybrid,
-    /// vpatch の通常のペースの形の再現（`crate::pacing_vpatch`）。遅延の表の「vpatch 相当」を測るための測定専用で、既定でも `auto_window` / `cycle_phases` の候補でもない。
+    /// vpatch の通常のペースの形の再現（`crate::pacing_vpatch`）。遅延の表の「vpatch 相当」を測るための測定専用で、既定でも `wait` / `cycle_phases` の候補でもない。
     Vpatch,
-    /// フレームごとに画面の形（`Screen`）を読み、ウィンドウなら b-spin、全画面・読めないなら game の経路（始まりの入口がゲーム自身の時計へ任せる）。既定（`DEFAULT_MODE`）。
-    /// 設置の時でなくフレームごとに読むのは、設置が花映塚の設定の読み込み（WinMain の `0x0042E4D0`）より前に走りうり、読んだ値が起動前の 0 = 全画面に見えるため。
+    /// フレームごとに画面の形（`Screen`）を読み、ウィンドウと垂直同期を取らないフルスクリーンなら `wait` の方式、垂直同期を取るフルスクリーン・読めないなら game の経路（始まりの入口がゲーム自身の時計へ任せる）。既定（`DEFAULT_MODE`）。
+    /// DLL の設置（`install`）の時でなくフレームごとに読むのは、設置が花映塚の設定の読み込み（WinMain の `0x0042E4D0`）より前に走りうり、読んだ値が起動前の 0 = フルスクリーンに見えるため。
     Auto,
 }
 
@@ -266,7 +263,7 @@ impl Mode {
         .find(|m| m.name().eq_ignore_ascii_case(s))
     }
 
-    /// 始まりの call（`0x0042DC44`）を書くか。game だけが書かない（auto は全画面のフレームでも書いたまま、始まりの入口がゲーム自身の経路へ任せる）。
+    /// DLL がゲームの `0x0042DC44` に始まりの call を書くか。game だけが書かない（auto はフルスクリーンのフレームでも書いたまま、始まりの入口がゲーム自身の経路へ任せる）。
     pub fn uses_head(self) -> bool {
         self != Mode::Game
     }
@@ -287,16 +284,32 @@ impl Mode {
 pub enum Screen {
     Windowed,
     Fullscreen,
+    /// フルスクリーンで、デバイスの PresentationInterval が IMMEDIATE（垂直同期を取らない）。
+    FullscreenImmediate,
     Unknown,
+}
+
+/// D3DPRESENT_INTERVAL_IMMEDIATE。
+pub const PRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
+
+/// フルスクリーンのときの形を、デバイスの present parameters のコピー（`0x004B3450`。CreateDevice の後に `0x0042E089` の `rep movsl` で 13 語をコピーし、
+/// Reset もこれを渡す）の PresentationInterval（`+0x30`）で分ける。デバイスを作る関数は、フルスクリーンで `[0x4B30CC]` か `[0x4B36AC]` が立てば
+/// IMMEDIATE（`0x0042DE4A`）、立たなければ 1（`0x0042DE74`）を設定し、IMMEDIATE で作れなければ 1 に替えて作り直す（`0x0042DFE4`）。
+pub fn fullscreen_screen(interval: u32) -> Screen {
+    if interval == PRESENT_INTERVAL_IMMEDIATE {
+        Screen::FullscreenImmediate
+    } else {
+        Screen::Fullscreen
+    }
 }
 
 /// 設定のブロック `0x004B3488` の `+0xB1`（= `0x004B3539`）の 1 バイトを読み分ける（原本の逆アセンブルで確認）:
 /// - デバイスを作る関数 `0x0042DD90` の `0x0042DDC2` `cmp %bl,0x4b3539`（bl = 0）→ 0 でなければ `0x0042DE94` へ飛び、`0x0042DEA1` で Windowed = 1・SwapEffect 3（COPY）。
-///   0 なら全画面の経路（Windowed は `rep stos` の 0 のまま。`[0x4B30CC]` / `[0x4B36AC]` が立たなければリフレッシュ 60・PresentationInterval 1）。
-/// - 既定値は 0（`0x0041A8EE` `mov %al,0xb1(%edx)`、al = 0）= 全画面。読み込みの照合 `0x0042F84B` が 2 以上を断る。
+///   0 ならフルスクリーンの経路（Windowed は `rep stos` の 0 のまま。`[0x4B30CC]` / `[0x4B36AC]` が立たなければリフレッシュ 60・PresentationInterval 1）。
+/// - 既定値は 0（`0x0041A8EE` `mov %al,0xb1(%edx)`、al = 0）= フルスクリーン。読み込みの照合 `0x0042F84B` が 2 以上を断る。
 /// - オプションの画面は 0 と 1 を行き来する（`0x00427A0D`〜`0x00427A1F` / `0x00427C5D`〜`0x00427C6E`）。
 ///
-/// 2 以上は花映塚の作りでは起きない値なので、ゲームの `jne`（0 以外はウィンドウ）に合わせず「読めない」として扱う（全画面と同じ game の経路に倒す）。
+/// 2 以上は花映塚の作りでは起きない値なので、ゲームの `jne`（0 以外はウィンドウ）に合わせず「読めない」として扱う（フルスクリーンと同じ game の経路に倒す）。
 pub fn screen_from_flag(b: u8) -> Screen {
     match b {
         0 => Screen::Fullscreen,
@@ -305,36 +318,77 @@ pub fn screen_from_flag(b: u8) -> Screen {
     }
 }
 
-/// `mode = auto` のフレームの方式。ウィンドウは b-spin、全画面と読めないときは game（ゲーム自身の待ちと垂直同期のまま）。
+/// `mode = auto` のフレームの方式。ウィンドウと垂直同期を取らないフルスクリーンは既定の `wait` の方式、垂直同期を取るフルスクリーンと読めないときは game（ゲーム自身の待ちと垂直同期のまま）。
 pub fn auto_phase(s: Screen) -> Phase {
-    auto_phase_with(s, DEFAULT_AUTO_WINDOW)
+    auto_phase_with(s, DEFAULT_WAIT)
 }
 
-pub fn auto_phase_with(s: Screen, window: Phase) -> Phase {
+pub fn auto_phase_with(s: Screen, wait: Phase) -> Phase {
     match s {
-        Screen::Windowed => window,
+        Screen::Windowed | Screen::FullscreenImmediate => wait,
         Screen::Fullscreen | Screen::Unknown => Phase::Game,
     }
 }
 
-/// `mode = auto` のウィンドウの方式の既定（ini の `auto_window` を書かないとき）。b-hybrid は処理が軽いが入力 → Present の前の p50 が長いので既定にしない。
-pub const DEFAULT_AUTO_WINDOW: Phase = Phase::BSpin;
-/// `auto_window` に書ける方式（ウィンドウで格子を刻む方式のうち、寝ずに回る 2 つ。b は寝ることで遅れた方式なので入れない）。
-pub const AUTO_WINDOW_PHASES: [Phase; 2] = [Phase::BSpin, Phase::BHybrid];
+/// `mode = auto` で格子を刻むときの待ち方の既定（ini の `wait` を書かないとき）。b-hybrid は b-spin より処理が軽く、入力 → Present の前の p50 が少し長い。
+pub const DEFAULT_WAIT: Phase = Phase::BHybrid;
+/// `wait` に書ける値と方式（格子を刻む方式のうち、寝ずに回る区間を持つ 2 つ。b は寝ることで遅れた方式なので入れない）。
+pub const WAIT_CHOICES: [(&str, Phase); 2] =
+    [("passive", Phase::BHybrid), ("active", Phase::BSpin)];
 
-/// ゲーム自身の時計の経路（全画面・cycle の game の区間）で、始まりのこの 1 回がフレームを始める見込みか。始まりの中の待ち（delay 方式の「相手の語を始まりで待つ」）を、
-/// 始める 1 回の直前でだけ呼ぶために使う。整数だけで比べる（ゲームのスレッドの始まりから呼ぶので x87 に触らない）。
+pub fn wait_name(p: Phase) -> &'static str {
+    WAIT_CHOICES
+        .iter()
+        .find(|(_, q)| *q == p)
+        .map_or(p.name(), |(n, _)| n)
+}
+
+/// `[pacing] vsync`: ゲームが custom.exe の「垂直同期を取らない」（Supervisor `+0x450` = `[0x4B3550]` の bit `0x20`。`0x0042ED50`）を
+/// 読む 2 か所 —— 起動の設定の読み込み `0x0042FB4D`（立っていれば `[0x4B36AC] = 1` で計測を飛ばし、フルスクリーンを IMMEDIATE で作る）と、
+/// 計測の終わりの判定 `0x0042F2AD`（立っていれば計測の結果を見ない）—— の答えを替える。保存されている値（`th09.cfg`）は替えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vsync {
+    /// custom.exe の設定のまま。
+    Game,
+    /// 垂直同期を取る（答えは「取らなくない」）。計測とその結果の判定はゲーム自身のまま。
+    On,
+    /// 垂直同期を取らない（答えは「取らない」）。
+    Off,
+}
+
+pub const DEFAULT_VSYNC: Vsync = Vsync::Off;
+
+impl Vsync {
+    pub const ALL: [Vsync; 3] = [Vsync::Game, Vsync::On, Vsync::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Vsync::Game => "game",
+            Vsync::On => "on",
+            Vsync::Off => "off",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Vsync> {
+        Vsync::ALL.into_iter().find(|f| f.name() == s)
+    }
+
+    /// ゲームが聞く「垂直同期を取らないか」の答え。`saved` は custom.exe の保存値（bit `0x20` が立っているか）。
+    pub fn vsync_off(self, saved: bool) -> bool {
+        match self {
+            Vsync::Game => saved,
+            Vsync::On => false,
+            Vsync::Off => true,
+        }
+    }
+}
+
+/// ゲーム自身の時計の経路（フルスクリーン・cycle の game の区間）で、始まりのこの 1 回がフレームを始める見込みか。始まりの中の待ち（delay 方式の「相手の語を始まりで待つ」）を、始める 1 回の直前でだけ呼ぶために使う。整数だけで比べる（ゲームのスレッドの始まりから呼ぶので x87 に触らない）。
 ///
-/// ゲームの判断（原本の逆アセンブルで確認）: 時計 `0x0042CC90` は QPC の下位 32 ビット `qpc_low` を `[0x4B30C4]`（`divisor`。QPF の下位 32 ビット）で割り、
-/// 制御語 `0x007F`（単精度）の下で丸める。do_frame の `0x0042DC59` `fcoml 0x3c(%esi)` → `0x0042DC64` `jne 0x42dd77` で、今が期限 `+0x3C`（double。`deadline_bits` はそのビット列）
-/// 以下なら `Sleep(0)` して戻り、越えていれば始める。今が前の今 `+0x34` より小さい（時計の折り返し）ときは `0x0042DC56` で期限を今に置き直すので始めない。
+/// ゲームの判断（原本の逆アセンブルで確認）: 時計 `0x0042CC90` は QPC の下位 32 ビット `qpc_low` を `[0x4B30C4]`（`divisor`。QPF の下位 32 ビット）で割り、制御語 `0x007F`（単精度）の下で丸める。do_frame の `0x0042DC59` `fcoml 0x3c(%esi)` → `0x0042DC64` `jne 0x42dd77` で、今が期限 `+0x3C`（double。`deadline_bits` はそのビット列）以下なら `Sleep(0)` して戻り、越えていれば始める。今が前の今 `+0x34` より小さい（時計の折り返し）ときは `0x0042DC56` で期限を今に書き換えるので始めない。
 ///
-/// ここでは丸めの前の値 `qpc_low / divisor` が「期限 − `early_ticks`」を越えたら真にする。`early_ticks` を単精度の丸め（256〜512 秒で半カウント約 15 µs）と、
-/// こちらが QPC を読んでからゲームが読むまでの間より大きく取れば、「ゲームが始める 1 回」は必ず真に入る（真が早すぎる側にだけ外れる。早すぎた 1 回で待っても同じ tick で 2 度は待たない ——
-/// `NetPlay::head_wait`）。折り返しの直後は期限が大きいまま今が小さいので偽になり、ゲームが期限を今に置き直した次の回で真になる。
-/// `divisor` が 0（timeGetTime の経路）・期限が負・数でない（NaN・無限）なら偽（待たない）。
-/// `GAME_DUE_EARLY_US` は `game_frame_due` の早め（µs）。丸め（最大で半カウント約 15 µs ＋ 2^31 を越えた QPC の丸め約 13 µs）と、こちらの QPC の読みからゲームの読みまでの間を足しても余る幅。
-/// 早めた分は「始まりで待ち始めるのが期限の最大この幅だけ前」になるだけで、入力の読みはゲームの期限より前にならない。
+/// ここでは丸めの前の値 `qpc_low / divisor` が「期限 − `early_ticks`」を越えたら真にする。`early_ticks` を単精度の丸め（256〜512 秒で半カウント約 15 µs）とこちらが QPC を読んでからゲームが読むまでの間より大きく取れば、「ゲームが始める 1 回」は必ず真に入る（真が早すぎる側にだけ外れる。早すぎた 1 回で待っても同じ tick で 2 度は待たない —— `NetPlay::head_wait`）。折り返しの直後は偽になり、ゲームが期限を書き換えた次の回で真になる。`divisor` が 0（timeGetTime の経路）・期限が負・数でない（NaN・無限）なら偽（待たない）。
+/// `GAME_DUE_EARLY_US` は早めの幅（µs）で、丸め（最大で半カウント約 15 µs ＋ 2^31 を越えた QPC の丸め約 13 µs）と QPC の読みからゲームの読みまでの間を足しても余る。早めた分は「始まりで待ち始めるのが期限の最大この幅だけ前」になるだけで、入力の読みはゲームの期限より前にならない。
 pub const GAME_DUE_EARLY_US: u32 = 200;
 
 pub fn game_due_early_ticks(divisor: u32) -> u32 {
@@ -469,11 +523,11 @@ pub fn parse_cycle_phases(v: &str) -> Result<CyclePhases, String> {
         // vpatch は測定専用の mode = vpatch だけで走らせる（区間の入れ替えに載せると、Present の待ちの状態が区間をまたぐ）。
         let p = Phase::from_name(n).filter(|p| *p != Phase::Vpatch);
         phases.push(p.ok_or(format!(
-            "cycle_phases の {n:?} は game / b / b-spin / b-hybrid のどれでもない"
+            "cycle_phases の {n:?} は game / b / b-spin / b-hybrid のどれでもありません"
         ))?);
     }
     CyclePhases::new(&phases).ok_or(format!(
-        "cycle_phases の値 {v:?} は 2〜4 個の重ならない方式（例 b-spin, b-hybrid）"
+        "cycle_phases の値 {v:?} は 2〜4 個の重複しない方式にしてください（例 b-spin, b-hybrid）"
     ))
 }
 
@@ -511,7 +565,7 @@ impl Cycle {
         self.switches
     }
 
-    /// フレームの最初の始まりで呼ぶ。いまの区間が `len` カウント以上続いていれば次の方式へ進め、区間の始まりを `now` に置く（遅れても区間を取り戻さない）。返すのは（このフレームの方式、入れ替えたか）。
+    /// フレームの最初の始まりで呼ぶ。いまの区間が `len` カウント以上続いていれば次の方式へ進め、区間の始まりを `now` にする（遅れても区間を取り戻さない）。返すのは（このフレームの方式、入れ替えたか）。
     pub fn at_frame(&mut self, now: u64) -> (Phase, bool) {
         let Some(since) = self.since else {
             self.since = Some(now);
@@ -534,7 +588,9 @@ pub struct PacingIni {
     pub fps: u64,
     pub cycle_secs: u64,
     pub cycle_phases: CyclePhases,
-    pub auto_window: Phase,
+    /// `mode = auto` で格子を刻むフレームの方式（`wait`。b-hybrid か b-spin）。ほかの mode では使わない。
+    pub wait: Phase,
+    pub vsync: Vsync,
     pub hybrid: HybridParams,
 }
 
@@ -545,14 +601,15 @@ impl PacingIni {
         fps: DEFAULT_FPS,
         cycle_secs: DEFAULT_CYCLE_SECS,
         cycle_phases: CyclePhases::DEFAULT,
-        auto_window: DEFAULT_AUTO_WINDOW,
+        wait: DEFAULT_WAIT,
+        vsync: DEFAULT_VSYNC,
         hybrid: HybridParams::DEFAULT,
     };
 
     pub fn uses_hybrid(&self) -> bool {
         match self.mode {
             Mode::BHybrid => true,
-            Mode::Auto => self.auto_window == Phase::BHybrid,
+            Mode::Auto => self.wait == Phase::BHybrid,
             Mode::Cycle => self.cycle_phases.as_slice().contains(&Phase::BHybrid),
             Mode::Game | Mode::B | Mode::BSpin | Mode::Vpatch => false,
         }
@@ -569,7 +626,7 @@ pub fn parse_fps(v: &str) -> Result<u64, String> {
     match n {
         Some(n) if (MIN_FPS..=MAX_FPS).contains(&n) => Ok(n),
         _ => Err(format!(
-            "fps の値 {v:?} は {MIN_FPS}〜{MAX_FPS} の整数（既定 {DEFAULT_FPS}）"
+            "fps の値 {v:?} は {MIN_FPS}〜{MAX_FPS} の整数にしてください（既定 {DEFAULT_FPS}）"
         )),
     }
 }
@@ -582,15 +639,16 @@ pub fn parse_cycle_secs(v: &str) -> Result<u64, String> {
     match n {
         Some(n) if (MIN_CYCLE_SECS..=MAX_CYCLE_SECS).contains(&n) => Ok(n),
         _ => Err(format!(
-            "cycle_secs の値 {v:?} は {MIN_CYCLE_SECS}〜{MAX_CYCLE_SECS} の整数（既定 {DEFAULT_CYCLE_SECS}）"
+            "cycle_secs の値 {v:?} は {MIN_CYCLE_SECS}〜{MAX_CYCLE_SECS} の整数にしてください（既定 {DEFAULT_CYCLE_SECS}）"
         )),
     }
 }
 
 /// `[pacing]` の節を読む（形とペース）。節が無ければ `PacingIni::DEFAULT`（auto・60 fps）、`mode` を書かなければ `DEFAULT_MODE`。
 /// `fps` は b・b-spin・b-hybrid・vpatch でだけ効く。game・cycle・auto（`mode` を書かないときも）で 60 以外を書いたら誤りとして断る
-/// （ゲーム自身のペースはこの道具が変えないので、書いたのに効かない実行・区間ごとに速さの違う実行を作らない）。
-/// `cycle_secs` と `cycle_phases` は cycle でだけ、`auto_window` は auto でだけ、`hybrid_*` は b-hybrid のフレームがありうる形（`PacingIni::uses_hybrid`）でだけ書ける。
+/// （ゲーム自身のペースはこのツールが変えないので、書いたのに効かない実行・区間ごとに速さの違う実行を作らない）。
+/// `cycle_secs` と `cycle_phases` は cycle でだけ、`hybrid_*` は b-hybrid のフレームがありうる形（`PacingIni::uses_hybrid`）でだけ書ける。
+/// `wait` と `vsync` はどの mode でも書ける（配る ini に行として書くので、`mode` を手で替えても断らない）。`wait` が効くのは auto だけ。
 pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     if !ini.has_section(SECTION) {
         return Ok(PacingIni::DEFAULT);
@@ -603,7 +661,7 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
                 .chain(HYBRID_KEYS.iter().map(|h| h.name))
                 .collect();
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 all.join(" / ")
             ));
         }
@@ -611,7 +669,7 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     let mode = match ini.get(SECTION, "mode") {
         None => DEFAULT_MODE,
         Some(v) => Mode::from_name(v).ok_or(format!(
-            "[{SECTION}] の mode の値 {v:?} は game / b / b-spin / b-hybrid / vpatch / cycle / auto のどれか"
+            "[{SECTION}] の mode の値 {v:?} は game / b / b-spin / b-hybrid / vpatch / cycle / auto のどれかにしてください"
         ))?,
     };
     let fps = match ini.get(SECTION, "fps") {
@@ -620,14 +678,14 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     };
     if matches!(mode, Mode::Game | Mode::Cycle | Mode::Auto) && fps != DEFAULT_FPS {
         return Err(format!(
-            "[{SECTION}] の fps = {fps} は mode = b / b-spin / b-hybrid / vpatch のときだけ効く（mode = {} はゲーム自身の {DEFAULT_FPS} fps の区間を含む）",
+            "[{SECTION}] の fps = {fps} は mode = b / b-spin / b-hybrid / vpatch のときだけ有効です（mode = {} はゲーム自身の {DEFAULT_FPS} fps の区間を含みます）",
             mode.name()
         ));
     }
     let only_for = |key: &str, ok: bool, want: &str| -> Result<(), String> {
         if ini.get(SECTION, key).is_some() && !ok {
             return Err(format!(
-                "[{SECTION}] の {key} は {want} のときだけ書ける（mode = {}）",
+                "[{SECTION}] の {key} は {want} のときだけ書けます（mode = {}）",
                 mode.name()
             ));
         }
@@ -635,7 +693,6 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     };
     only_for("cycle_secs", mode == Mode::Cycle, "mode = cycle")?;
     only_for("cycle_phases", mode == Mode::Cycle, "mode = cycle")?;
-    only_for("auto_window", mode == Mode::Auto, "mode = auto")?;
     let cycle_secs = match ini.get(SECTION, "cycle_secs") {
         None => DEFAULT_CYCLE_SECS,
         Some(v) => parse_cycle_secs(v).map_err(|e| format!("[{SECTION}] の {e}"))?,
@@ -644,28 +701,36 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
         None => CyclePhases::DEFAULT,
         Some(v) => parse_cycle_phases(v).map_err(|e| format!("[{SECTION}] の {e}"))?,
     };
-    let auto_window = match ini.get(SECTION, "auto_window") {
-        None => DEFAULT_AUTO_WINDOW,
-        Some(v) => AUTO_WINDOW_PHASES
+    let wait = match ini.get(SECTION, "wait") {
+        None => DEFAULT_WAIT,
+        Some(v) => WAIT_CHOICES
             .into_iter()
-            .find(|p| p.name() == v.trim())
+            .find(|(n, _)| *n == v.trim())
+            .map(|(_, p)| p)
             .ok_or(format!(
-                "[{SECTION}] の auto_window の値 {v:?} は b-spin / b-hybrid のどちらか"
+                "[{SECTION}] の wait の値 {v:?} は passive / active のどちらかにしてください"
             ))?,
+    };
+    let vsync = match ini.get(SECTION, "vsync") {
+        None => DEFAULT_VSYNC,
+        Some(v) => Vsync::from_name(v.trim()).ok_or(format!(
+            "[{SECTION}] の vsync の値 {v:?} は game / on / off のどれかにしてください"
+        ))?,
     };
     let mut cfg = PacingIni {
         mode,
         fps,
         cycle_secs,
         cycle_phases,
-        auto_window,
+        wait,
+        vsync,
         hybrid: HybridParams::DEFAULT,
     };
     for k in &HYBRID_KEYS {
         only_for(
             k.name,
             cfg.uses_hybrid(),
-            "b-hybrid のフレームがある形（mode = b-hybrid、mode = auto で auto_window = b-hybrid、mode = cycle で cycle_phases に b-hybrid）",
+            "b-hybrid のフレームがある形（mode = b-hybrid、mode = auto で wait = passive、mode = cycle で cycle_phases に b-hybrid）",
         )?;
         if let Some(v) = ini.get(SECTION, k.name) {
             cfg.hybrid
@@ -750,12 +815,12 @@ pub fn parse_cpu_sets(bytes: &[u8]) -> Result<CpuClasses, String> {
     let mut off = 0usize;
     while off < bytes.len() {
         if off + 8 > bytes.len() {
-            return Err(format!("{off} バイト目の件の先頭が切れている"));
+            return Err(format!("{off} バイト目の項目の先頭が欠落"));
         }
         let size = u32_at(off + CPU_SET_OFF_SIZE) as usize;
         if size < 8 || off + size > bytes.len() {
             return Err(format!(
-                "{off} バイト目の件の大きさ {size} が合わない（残り {}）",
+                "{off} バイト目の項目の大きさ {size} が不一致（残り {}）",
                 bytes.len() - off
             ));
         }
@@ -1218,7 +1283,7 @@ pub fn parse_preamble(line: &str) -> Option<Preamble> {
     })
 }
 
-/// `_pacing.csv` の本文を集計する（あとから集計する道具 `pacing_sum` が使う）。最初の `#` の行が無い・読めない行があれば誤り（行の番号つき）。`fps` はその回のペース（CSV には書かない）。
+/// `_pacing.csv` の本文を集計する（あとから集計するツール `pacing_sum` が使う）。最初の `#` の行が無い・読めない行があれば誤り（行の番号つき）。`fps` はその回のペース（CSV には書かない）。
 /// `frames` を渡せば、その番号の範囲（両端を含む）の行だけを集計する（マッチの中だけを見るとき）。
 pub fn summarize_csv(
     text: &str,
@@ -2349,7 +2414,11 @@ mod tests {
                 .unwrap_err()
                 .contains("game / b / b-spin / b-hybrid / vpatch / cycle / auto のどれか")
         );
-        assert!(m("[pacing]\nmdoe = b\n").unwrap_err().contains("知らない"));
+        assert!(
+            m("[pacing]\nmdoe = b\n")
+                .unwrap_err()
+                .contains("の記法が不適切です")
+        );
         assert_eq!(m("[pacing]\nmode = b\nfps = 240\n"), Ok(b(240)));
         assert_eq!(m("[pacing]\nFPS = 240\nmode = b\n"), Ok(b(240)));
         assert_eq!(m("[pacing]\nmode = b\nfps = 1\n"), Ok(b(1)));
@@ -2375,7 +2444,7 @@ mod tests {
         ] {
             let e = m(text).unwrap_err();
             assert!(
-                e.contains("mode = b / b-spin / b-hybrid / vpatch のときだけ効く"),
+                e.contains("mode = b / b-spin / b-hybrid / vpatch のときだけ有効です"),
                 "{text:?}: {e}"
             );
         }
@@ -2418,16 +2487,16 @@ mod tests {
         for text in ["[pacing]\nfps = 240\n", "[pacing]\nmode = auto\nfps = 1\n"] {
             let e = m(text).unwrap_err();
             assert!(
-                e.contains("mode = b / b-spin / b-hybrid / vpatch のときだけ効く"),
+                e.contains("mode = b / b-spin / b-hybrid / vpatch のときだけ有効です"),
                 "{text:?}: {e}"
             );
         }
         let e = m("[pacing]\ncycle_secs = 30\n").unwrap_err();
-        assert!(e.contains("mode = cycle のときだけ書ける"), "{e}");
+        assert!(e.contains("mode = cycle のときだけ書けます"), "{e}");
         assert!(
             m("[pacing]\nmdoe = game\n")
                 .unwrap_err()
-                .contains("知らない")
+                .contains("の記法が不適切です")
         );
         assert!(
             m("[pacing]\nfps = 0\n")
@@ -2667,7 +2736,10 @@ mod tests {
             "[pacing]\ncycle_secs = 30\n",
         ] {
             let e = m(text).unwrap_err();
-            assert!(e.contains("mode = cycle のときだけ書ける"), "{text:?}: {e}");
+            assert!(
+                e.contains("mode = cycle のときだけ書けます"),
+                "{text:?}: {e}"
+            );
         }
         let e = m("[pacing]\nmode = cycle\nfps = 240\n").unwrap_err();
         assert!(e.contains("mode = cycle はゲーム自身の 60 fps"), "{e}");
@@ -2699,13 +2771,21 @@ mod tests {
         for b in [2u8, 3, 0x80, 0xFF] {
             assert_eq!(screen_from_flag(b), Screen::Unknown, "{b}");
         }
-        assert_eq!(auto_phase(Screen::Windowed), Phase::BSpin);
+        assert_eq!(auto_phase(Screen::Windowed), Phase::BHybrid);
+        assert_eq!(auto_phase(Screen::FullscreenImmediate), Phase::BHybrid);
         assert_eq!(auto_phase(Screen::Fullscreen), Phase::Game);
         assert_eq!(auto_phase(Screen::Unknown), Phase::Game);
-        let spin: Vec<u8> = (0..=255u8)
-            .filter(|&b| auto_phase(screen_from_flag(b)) == Phase::BSpin)
+        let grid: Vec<u8> = (0..=255u8)
+            .filter(|&b| auto_phase(screen_from_flag(b)) != Phase::Game)
             .collect();
-        assert_eq!(spin, vec![1]);
+        assert_eq!(grid, vec![1]);
+        assert_eq!(
+            fullscreen_screen(PRESENT_INTERVAL_IMMEDIATE),
+            Screen::FullscreenImmediate
+        );
+        for v in [0u32, 1, 2, 4, 8, 0x7FFF_FFFF, 0x8000_0001, u32::MAX] {
+            assert_eq!(fullscreen_screen(v), Screen::Fullscreen, "{v:#X}");
+        }
         let pre = Preamble::new(10_000_000, Mode::Auto);
         assert_eq!(csv_preamble(&pre), "# qpf=10000000 mode=auto");
         assert_eq!(parse_preamble(&csv_preamble(&pre)), Some(pre));
@@ -3162,18 +3242,20 @@ mod tests {
     }
 
     #[test]
-    fn b_hybrid_is_a_phase_but_not_the_default() {
+    fn b_hybrid_is_the_default_wait_of_auto() {
         assert_eq!(DEFAULT_MODE, Mode::Auto);
-        assert_eq!(PacingIni::DEFAULT.auto_window, Phase::BSpin);
-        assert_eq!(auto_phase(Screen::Windowed), Phase::BSpin);
-        assert_eq!(
-            auto_phase_with(Screen::Windowed, Phase::BHybrid),
-            Phase::BHybrid
-        );
+        assert_eq!(PacingIni::DEFAULT.wait, Phase::BHybrid);
+        assert_eq!(auto_phase(Screen::Windowed), Phase::BHybrid);
+        for s in [Screen::Windowed, Screen::FullscreenImmediate] {
+            assert_eq!(auto_phase_with(s, Phase::BSpin), Phase::BSpin);
+        }
         for s in [Screen::Fullscreen, Screen::Unknown] {
             assert_eq!(auto_phase_with(s, Phase::BHybrid), Phase::Game);
+            assert_eq!(auto_phase_with(s, Phase::BSpin), Phase::Game);
         }
-        assert!(!PacingIni::DEFAULT.uses_hybrid());
+        assert!(PacingIni::DEFAULT.uses_hybrid());
+        assert_eq!(wait_name(Phase::BHybrid), "passive");
+        assert_eq!(wait_name(Phase::BSpin), "active");
         assert_eq!(
             ALL_PHASES.map(Phase::code),
             [1, 2, 3, 4, 5],
@@ -3190,8 +3272,6 @@ mod tests {
         assert_eq!(CyclePhases::DEFAULT.as_slice(), &CYCLE_ORDER[..]);
     }
 
-    // 何が壊れたら落ちるか: `mode = vpatch` が読めること（名前の表から外すと落ちる）、読めても既定は auto のままで vpatch が候補に紛れ込まないこと、
-    // fps は効くこと、cycle / auto_window には書けないこと、CSV の札として読み戻せること。
     #[test]
     fn mode_vpatch_is_read_but_stays_out_of_defaults_and_candidates() {
         let m = |t: &str| mode_from_ini(&crate::ini::parse(t).unwrap());
@@ -3204,12 +3284,12 @@ mod tests {
         assert!(!c.uses_hybrid());
         assert_eq!(PacingIni::DEFAULT.mode, Mode::Auto);
         assert_eq!(DEFAULT_MODE, Mode::Auto);
-        assert!(!AUTO_WINDOW_PHASES.contains(&Phase::Vpatch));
+        assert!(!WAIT_CHOICES.iter().any(|(_, p)| *p == Phase::Vpatch));
         assert!(!CYCLE_ORDER.contains(&Phase::Vpatch));
         let e = m("[pacing]\nmode = cycle\ncycle_phases = b-spin, vpatch\n").unwrap_err();
         assert!(e.contains("cycle_phases の \"vpatch\""), "{e}");
-        let e = m("[pacing]\nauto_window = vpatch\n").unwrap_err();
-        assert!(e.contains("auto_window の値"), "{e}");
+        let e = m("[pacing]\nwait = vpatch\n").unwrap_err();
+        assert!(e.contains("wait の値"), "{e}");
         let e = m("[pacing]\nmode = vpatch\ncycle_secs = 30\n").unwrap_err();
         assert!(e.contains("cycle_secs は mode = cycle"), "{e}");
         assert_eq!(Phase::from_name("vpatch"), Some(Phase::Vpatch));
@@ -3289,21 +3369,31 @@ mod tests {
             "[pacing]\nmode = b-hybrid\nhybrid_margin_us = 9000\n",
             "hybrid_margin_us = 9000 が hybrid_margin_max_us = 8000 より大きい",
         );
-        let c = ok("[pacing]\nauto_window = b-hybrid\n");
-        assert_eq!((c.mode, c.auto_window), (Mode::Auto, Phase::BHybrid));
+        let c = ok("[pacing]\nwait = passive\n");
+        assert_eq!((c.mode, c.wait), (Mode::Auto, Phase::BHybrid));
         assert!(c.uses_hybrid());
-        let c = ok("[pacing]\nmode = auto\nauto_window = b-hybrid\nhybrid_margin_us = 4000\n");
+        let c = ok("[pacing]\nmode = auto\nwait = passive\nhybrid_margin_us = 4000\n");
         assert_eq!(c.hybrid.margin_us, 4_000);
         assert_eq!(
-            ok("[pacing]\nauto_window = b-spin\n").auto_window,
-            Phase::BSpin
+            ok("[pacing]\nhybrid_margin_us = 4000\n").hybrid.margin_us,
+            4_000
         );
-        for v in ["b", "game", "B-HYBRID", "hybrid"] {
-            err(
-                &format!("[pacing]\nauto_window = {v}\n"),
-                "auto_window の値",
-            );
+        let c = ok("[pacing]\nwait = active\n");
+        assert_eq!(c.wait, Phase::BSpin);
+        assert!(!c.uses_hybrid());
+        for v in [
+            "b", "game", "PASSIVE", "hybrid", "spin", "b-hybrid", "b-spin", "",
+        ] {
+            err(&format!("[pacing]\nwait = {v}\n"), "wait の値");
         }
+        // wait と vsync は、どの mode でも書ける（auto 以外では wait は効かない）。
+        for mode in ["game", "b", "b-spin", "b-hybrid", "vpatch", "cycle", "auto"] {
+            let c = ok(&format!(
+                "[pacing]\nmode = {mode}\nwait = active\nvsync = off\n"
+            ));
+            assert_eq!((c.wait, c.vsync), (Phase::BSpin, Vsync::Off));
+        }
+        assert!(!ok("[pacing]\nmode = game\nwait = passive\n").uses_hybrid());
         let c = ok("[pacing]\nmode = cycle\ncycle_phases = b-spin, b-hybrid\n");
         assert_eq!(c.cycle_phases.as_slice(), &[Phase::BSpin, Phase::BHybrid]);
         assert!(c.uses_hybrid());
@@ -3327,7 +3417,8 @@ mod tests {
         for k in &HYBRID_KEYS {
             for head in [
                 "[pacing]\nmode = b-spin\n",
-                "[pacing]\n",
+                "[pacing]\nwait = active\n",
+                "[pacing]\nmode = game\nwait = passive\n",
                 "[pacing]\nmode = cycle\n",
             ] {
                 err(
@@ -3338,28 +3429,55 @@ mod tests {
         }
         for (t, want) in [
             (
-                "[pacing]\nmode = b-hybrid\nauto_window = b-hybrid\n",
-                "auto_window は mode = auto のときだけ書ける",
+                "[pacing]\nauto_window = b-hybrid\n",
+                "キー \"auto_window\" の記法が不適切です",
             ),
             (
                 "[pacing]\nmode = b\ncycle_phases = b, b-spin\n",
-                "cycle_phases は mode = cycle のときだけ書ける",
+                "cycle_phases は mode = cycle のときだけ書けます",
             ),
             (
                 "[pacing]\nmode = b-hybrid\ncycle_secs = 30\n",
-                "cycle_secs は mode = cycle のときだけ書ける",
+                "cycle_secs は mode = cycle のときだけ書けます",
             ),
             (
-                "[pacing]\nauto_window = b-hybrid\nfps = 240\n",
-                "mode = b / b-spin / b-hybrid / vpatch のときだけ効く",
+                "[pacing]\nwait = passive\nfps = 240\n",
+                "mode = b / b-spin / b-hybrid / vpatch のときだけ有効です",
             ),
         ] {
             err(t, want);
         }
         err(
             "[pacing]\nmode = b-hybrid\nhybrid_margin = 2000\n",
-            "を知らない（読めるのは mode / fps / cycle_secs / cycle_phases / auto_window / hybrid_margin_us /",
+            "の記法が不適切です（使用可能なキー: mode / fps / cycle_secs / cycle_phases / wait / vsync / hybrid_margin_us /",
         );
+    }
+
+    #[test]
+    fn vsync_overrides_only_the_answer_to_vsync_off() {
+        let m = |t: &str| mode_from_ini(&crate::ini::parse(t).unwrap());
+        assert_eq!(PacingIni::DEFAULT.vsync, Vsync::Off);
+        assert_eq!(m("[pacing]\n").unwrap().vsync, Vsync::Off);
+        for f in Vsync::ALL {
+            let c = m(&format!("[pacing]\nvsync = {}\n", f.name())).unwrap();
+            assert_eq!(c.vsync, f);
+            assert_eq!(c.mode, Mode::Auto);
+        }
+        for v in [
+            "On",
+            "OFF",
+            "vsync",
+            "immediate",
+            "fullscreen",
+            "1",
+            "0",
+            "",
+        ] {
+            let e = m(&format!("[pacing]\nvsync = {v}\n")).unwrap_err();
+            assert!(e.contains("vsync の値"), "{v:?}: {e}");
+        }
+        let table = Vsync::ALL.map(|f| (f.vsync_off(false), f.vsync_off(true)));
+        assert_eq!(table, [(false, true), (false, false), (true, true)]);
     }
 
     #[test]

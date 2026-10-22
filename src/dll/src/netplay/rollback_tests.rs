@@ -1,5 +1,5 @@
 //! rollback のモードのマッチの経路（`netplay/rollback.rs`）の検査（pure）。`NetPlay` を 2 つ、仮のネットワーク（片道の遅れ）と偽のゲーム
-//! （`netplay::fake::FakeGame` は場面と自分の語、`rollback_testkit::FakeGame` は世界の状態とコピー）で繋ぎ、走査の包みのフックと Present の後のフックを交互に回す。
+//! （`netplay::fake::FakeGame` は場面と自分の語、`rollback_testkit::FakeGame` は世界の状態とコピー）で接続し、走査の包みのフックと Present の後のフックを交互に回す。
 //! 世界の状態は feed された語の並びだけで決まるので、両者の最後の状態が「確定した行」から手で組んだ参照と一致すれば、予測の入力ワードが確定に混ざっておらず進め直しが正しい。
 #![forbid(unsafe_code)]
 
@@ -50,7 +50,7 @@ fn pair(
     pair_with_ring(wish_a, wish_b, check, ahead, one_way_frames, lat_plan, None)
 }
 
-/// `pair` に、ホスト（A）へ観戦のリングバッファを付ける関数（繋がる前に置く。リングバッファの最初の記録は繋がった tick の `Seg { 0 }`）。
+/// `pair` に、ホスト（A）へ観戦のリングバッファを付ける関数（接続する前に設定する。リングバッファの最初の記録は接続した tick の `Seg { 0 }`）。
 fn pair_with_ring(
     wish_a: ModeWish,
     wish_b: ModeWish,
@@ -207,7 +207,7 @@ fn drain_ring(ring: &crate::spectate_ring::SpectateRing) -> Vec<higanr_core::wir
     v
 }
 
-/// 検査の道具: 記録の列を、ホストの `SpectateHost` → 観戦者の `Watcher` へメモリの上で順に渡して、観戦者が受けた記録の列を返す。
+/// 検査のツール: 記録の列を、ホストの `SpectateHost` → 観戦者の `Watcher` へメモリの上で順に渡して、観戦者が受けた記録の列を返す。
 /// 観戦者は先に入っておく（遅れて入ると今の seg の始まりから流れる）。時刻は 1 記録ごとに 1 ms 進める。
 fn through_core(recs: &[higanr_core::wire::Record]) -> Vec<higanr_core::wire::Record> {
     use higanr_core::auth::Secret;
@@ -270,7 +270,7 @@ fn through_core(recs: &[higanr_core::wire::Record]) -> Vec<higanr_core::wire::Re
     got
 }
 
-/// rollback と観戦の組み合わせ: ホストがリングバッファへ積む列が対戦者の確定した列と一致し（予測の入力ワードが混ざらない）、seg の境目の並び
+/// rollback と観戦の組み合わせ: ホストがリングバッファへ積む列が対戦する側の確定した列と一致し（予測の入力ワードが混ざらない）、seg の境目の並び
 /// （`Frame(seg k の最後)` の後に `Seg(k + 1)`）が崩れず、観戦者の組み立てを通しても変わらない。片道 1・3・6 フレーム × 境目の frame 2 通りで再戦を 1 回跨ぐ。
 #[test]
 fn a_rollback_hosts_spectate_ring_holds_exactly_the_confirmed_rows_across_a_rematch() {
@@ -526,7 +526,7 @@ fn the_replay_mark_view_reports_the_rollback_state_and_totals() {
         let v = crate::replay_save::NetView::of(&s.np).expect("つながっていた接続");
         assert_eq!((v.rollback, v.rb_ready), (true, s.np.rollback_ready()));
         assert!(v.rb_ready, "試合の最中");
-        // この部品は開始のフックを通さず Lockstep に置く（本物は `on_match_start` が数える）ので、数は入れ物の値のまま。
+        // この部品は開始のフックを通さず Lockstep にする（本物は `on_match_start` が数える）ので、数は入れ物の値のまま。
         assert_eq!(v.match_no, s.np.stats().segs_started);
         assert_eq!(
             v.totals.stalls,
@@ -601,6 +601,132 @@ fn the_game_check_reads_the_confirmed_state_at_the_head_of_the_tick() {
     }
 }
 
+/// rollback のホストが観戦の流れへ積む照合は、確定した値（対戦の CHECK と同じ値。予測で進めた状態の値ではない）。ゲームの値の作り方は
+/// 送った CHECK のうち約 1 秒ごとのもの、ダイジェストの作り方は確定した行の seg の frame 0 からのダイジェスト。片道 3 フレームで戻しが起きる形。
+#[test]
+fn a_rollback_hosts_watch_checks_are_the_confirmed_values() {
+    use crate::spectate_testkit::fold;
+    use higanr_core::check::{check_from_input_digest, input_digest_push, is_watch_check_frame};
+    use higanr_core::wire::{CheckKind, WatchCheck};
+    for source in [CheckSource::Game, CheckSource::InputDigest] {
+        let ring = Arc::new(crate::spectate_ring::SpectateRing::with_len(1 << 16));
+        let (mut a, mut b, clock) = pair_with_ring(
+            ModeWish::rollback(1),
+            ModeWish::rollback(1),
+            source,
+            12,
+            3,
+            LatPlan::default(),
+            Some(Arc::clone(&ring)),
+        );
+        run(&mut a, &mut b, &clock, 200);
+        settle(&mut a, &mut b, &clock, 60);
+        assert_eq!(
+            a.np.phase(),
+            Phase::Lockstep,
+            "{source:?}: {:?}",
+            a.np.end()
+        );
+        let recs = drain_ring(&ring);
+        let f = fold(&recs);
+        let want: Vec<(CheckKind, WatchCheck)> = match source {
+            CheckSource::Game => {
+                a.np.sent_checks
+                    .iter()
+                    .filter(|c| is_watch_check_frame(c.frame))
+                    .map(|c| (CheckKind::Game, WatchCheck::from(c)))
+                    .collect()
+            }
+            CheckSource::InputDigest => {
+                let mut d = INPUT_DIGEST_INIT;
+                let mut v = Vec::new();
+                for &(_, frame, p1, p2) in &f.frames {
+                    d = input_digest_push(d, p1, p2);
+                    if is_watch_check_frame(frame) {
+                        v.push((
+                            CheckKind::InputDigest,
+                            WatchCheck::from(&check_from_input_digest(0, frame, d)),
+                        ));
+                    }
+                }
+                v
+            }
+        };
+        assert!(want.len() >= 3, "{source:?}: 照合が少ない {}", want.len());
+        assert_eq!(f.checks, want, "{source:?}: 観戦の照合が確定した値と違う");
+        let rb = a.np.rollback_core_stats().expect("rollback の接続");
+        assert!(
+            rb.resims > 0,
+            "{source:?}: 戻しが起きていない（予測の値と区別できない）"
+        );
+        // 観戦者がこの流れを使うと、照合が全部合う（rollback のホストは確定の後に積むので、自分の値が先にできる順）。
+        let s = watch_through(&recs);
+        assert_eq!(s.played as usize, f.frames.len(), "{source:?}");
+        assert_eq!(
+            (s.checks_matched as usize, s.checks_mismatched),
+            (want.len(), 0),
+            "{source:?}: {:?}",
+            s.first_mismatch
+        );
+    }
+}
+
+/// 検査のツール: 記録の列を観戦者（`WatchPlay`）に試合の中から使わせ、集計を返す。観戦者のゲームの値は、検査の rollback のゲーム
+/// （`rollback_testkit`）と同じ作り（使った行の `chain`・frame 0 は種の値・抽選回数はフレームの数・ライフ 0）。
+fn watch_through(recs: &[higanr_core::wire::Record]) -> crate::spectate_watch::WatchStats {
+    use crate::spectate_watch::{WatchConfig, WatchPlay, WatchSlot};
+    struct W {
+        rows: Vec<(u16, u16)>,
+    }
+    impl Game for W {
+        fn scenes(&mut self) -> (u32, u32) {
+            (SCENE_MATCH, 0)
+        }
+        fn local_input(&mut self, _s: Seat) -> u16 {
+            0
+        }
+        fn feed(&mut self, _i: u32, _w: u16) {}
+        fn own_select(&mut self, _s: Seat, _r: higanr_core::lockstep::Role) -> Select {
+            unreachable!()
+        }
+        fn apply_agreed(&mut self, _p: Seat, _a: &Agreed) -> Result<(), BadValue> {
+            unreachable!()
+        }
+        fn write_charge(&mut self, _p1: u8, _p2: u8) -> bool {
+            true
+        }
+        fn check_values(&mut self) -> (u16, u32, u8, u8) {
+            let state = if self.rows.is_empty() {
+                0x1234
+            } else {
+                chain(&self.rows) & 0xFFFF
+            };
+            (state as u16, self.rows.len() as u32, 0, 0)
+        }
+    }
+    let (mut net, _peer, _clock) = FakeNet::pair(addr(7_101), addr(7_102), 0);
+    let mut wp = WatchPlay::new(
+        Arc::new(WatchSlot::new()),
+        WatchConfig {
+            wait_budget_us: 0,
+            margin_frames: 0,
+            require_net_selection: false,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+        },
+    );
+    wp.set_phase_for_test(Phase::Lockstep);
+    for r in recs {
+        assert!(wp.push_for_test(r));
+    }
+    let mut g = W { rows: Vec::new() };
+    for _ in 0..recs.len() * 2 {
+        if let Action::Played(r) = wp.on_input(&mut g, &mut net) {
+            g.rows.push((r.p1, r.p2));
+        }
+    }
+    wp.stats()
+}
+
 #[test]
 fn latency_switches_are_refused_in_the_rollback_mode() {
     let plan = LatPlan::new(&[(5, 4)]).unwrap();
@@ -624,7 +750,7 @@ fn latency_switches_are_refused_in_the_rollback_mode() {
     assert_eq!(a.rows, b.rows);
 }
 
-/// 遅れの量を両者が変える: Ctrl+数字を両者が押すと D がマッチの途中で替わり、両者の確定の列が一致する。押下があった証拠（両者の `digit_presses`）を隣に置く。
+/// 遅れの量を両者が変える: Ctrl+数字を両者が押すと D がマッチの途中で替わり、両者の確定の列が一致する。押下があった証拠（両者の `digit_presses`）を隣に並べる。
 #[test]
 fn both_sides_pick_d_with_digit_keys_and_it_switches_in_the_same_match() {
     use higanr_core::delay_pick;
@@ -762,7 +888,7 @@ fn the_input_count_phrase_names_every_reason() {
 }
 
 /// マッチの途中の切替: ホストが Ctrl+数字を押しても、ゲストが押しても、D がそのマッチのうちに替わり、両台が同じフレームで替える。
-/// 窓の側へ渡す穴埋めの D（`PlayState` の hint）は seg の始まりの D、確定した行に添える D は今の D、次の seg の始まりの D は前の seg の最後の値。
+/// ウィンドウの側へ渡す穴埋めの D（`PlayState` の hint）は seg の始まりの D、確定した行に添える D は今の D、次の seg の始まりの D は前の seg の最後の値。
 /// ホストが 2 を押して 1 → 2、ゲストが 1 を押して 2 → 1。どちらも 4 tick 押し続け、ちょうど 1 回の押下。
 #[test]
 fn a_host_press_and_a_guest_wish_switch_d_mid_match_on_both_sides() {
@@ -1142,7 +1268,7 @@ fn a_stalled_side_waits_for_words_within_the_budget_and_still_agrees() {
     }
 }
 
-/// つなぎ直し: 実行の間ずっと生きるコピーの担当（`PlayState`）とゲームのメモリを、終わった 1 本目の接続から新しい 2 本目へそのまま渡したとき、
+/// 再接続: 実行の間ずっと生きるコピーの担当（`PlayState`）とゲームのメモリを、終わった 1 本目の接続から新しい 2 本目へそのまま渡したとき、
 /// 1 本目の後に確保の向け先が閉じ、2 本目が frame 0 から確定して、コピーの担当の数えが 2 本目で 0 に戻らない。
 #[test]
 fn a_second_connection_reuses_the_play_state_left_by_the_first() {
@@ -1538,7 +1664,7 @@ fn the_guest_follows_the_hosts_auto_flag_in_a_rollback_match_without_flicker() {
     );
 }
 
-/// 往復がほぼ 0 の回線（片道 0 フレーム）で測れた窓の最大が小さいとき auto は D 0 を選び、片道 3 フレームの回線では 1 を選ぶ（両者へ揃う）。
+/// 往復がほぼ 0 の回線（片道 0 フレーム）で測れたウィンドウの最大が小さいとき auto は D 0 を選び、片道 3 フレームの回線では 1 を選ぶ（両者へ揃う）。
 #[test]
 fn auto_picks_d_zero_only_on_a_fast_link() {
     use higanr_core::delay_pick::AUTO;

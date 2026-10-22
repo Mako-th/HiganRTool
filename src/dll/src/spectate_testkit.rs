@@ -1,4 +1,4 @@
-//! 観戦のホストの検査の道具（検査のときだけ）: 観戦者を別のスレッドで走らせる（core の `Watcher` を直接回す）ことと、観戦者が
+//! 観戦のホストの検査ツール（検査のときだけ）: 観戦者を別のスレッドで走らせる（core の `Watcher` を直接回す）ことと、観戦者が
 //! 受けた記録の列をマッチの語・押下・SELECT に畳むこと。`spectate_host.rs` の検査、`netplay/loopback.rs`、`netplay/spectate_tests.rs` が使う。
 #![forbid(unsafe_code)]
 
@@ -18,13 +18,13 @@ use higanr_core::wire::{ByeReason, Record, Seat, Select, Step};
 use crate::net_udp::RecvThread;
 use crate::netplay::NetPlay;
 
-/// ホストのウィンドウ（`core::spectate::SEND_WINDOW`）。ACK を返さない観戦者が受けられる記録の数の上限。
+/// ホストの送信ウィンドウ（`core::spectate::SEND_WINDOW`）。ACK を返さない観戦者が受けられる記録の数の上限。
 pub const NOACK_WINDOW: usize = higanr_core::spectate::SEND_WINDOW as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Behavior {
     Normal,
-    /// JOIN は送るが、届いた STREAM に ACK を返さない（ウィンドウの 64 記録で止まる）。
+    /// JOIN は送るが、届いた STREAM に ACK を返さない（ウィンドウの 512 記録で止まる）。
     NoAck,
     /// JOIN を 1 回送った後は何も聞かず何も送らない（ソケットは開いたまま）。
     Silent,
@@ -192,8 +192,8 @@ fn observe(
     seen
 }
 
-/// 本物の経路（`spectate_host::arm` と `commit` と同じ部品）で観戦のホストを用意し、リングバッファをゲームのセッション `np` に付け、送り手を受信スレッド `rx` に置き、
-/// `behaviors` の観戦者を起こして全員が入る（ホストが JOIN を受ける）まで待つ。`local` はゲームの受信ソケット、`session` は対戦の session
+/// 本物の経路（`spectate_host::arm` と `commit` と同じ部品）で観戦のホストを用意し、リングバッファをゲームのセッション `np` に付け、観戦のホストの送り手を受信スレッド `rx` に渡し、
+/// `behaviors` の観戦者を作って全員が入る（ホストが JOIN を受ける）まで待つ。`local` はゲームの受信ソケット、`session` は対戦の session
 /// （観戦用の session はそれと別に引かれる）。
 pub fn attach(
     np: &mut NetPlay,
@@ -205,7 +205,7 @@ pub fn attach(
     attach_with_code(np, rx, local, session, behaviors).0
 }
 
-/// `attach` に、観戦用のコードの文字（`spectate_code.txt` の中身）も返す関数（dll の観戦者を別に起こす検査が使う）。
+/// `attach` に、観戦用のコードの文字（`spectate_code.txt` の中身）も返す関数（dll の観戦者を別に作る検査が使う）。
 pub fn attach_with_code(
     np: &mut NetPlay,
     rx: &RecvThread,
@@ -280,6 +280,7 @@ pub struct Folded {
     pub ends: Vec<ByeReason>,
     pub names: Vec<(Seat, String)>,
     pub stats: Vec<(u16, u8, u8)>,
+    pub checks: Vec<(higanr_core::wire::CheckKind, higanr_core::wire::WatchCheck)>,
 }
 
 /// 畳む。最初の記録が `Seg` でなければ panic（流れは seg の始まりから始まる）。
@@ -312,6 +313,7 @@ pub fn fold(recs: &[Record]) -> Folded {
                 latency,
                 rollback,
             } => f.stats.push((ping_ms, latency, rollback)),
+            Record::Check { kind, check } => f.checks.push((kind, check)),
         }
     }
     f

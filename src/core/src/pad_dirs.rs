@@ -102,7 +102,7 @@ pub enum PovMode {
     Off,
     /// 既定。winmm の経路では Windows が「ハットあり」と答えたデバイスだけ読む。
     Auto,
-    /// winmm の経路でも「ハットあり」の確かめをしない（診断用）。
+    /// winmm の経路でも「ハットあり」の検証をしない（診断用）。
     Always,
 }
 
@@ -112,14 +112,14 @@ pub struct PadSettings {
 }
 
 impl Default for PadSettings {
-    /// 節も ini も無ければ入り（後から ini で切れる）。
+    /// カテゴリも ini も無ければ入り（後から ini で切れる）。
     fn default() -> Self {
         PadSettings { pov: PovMode::Auto }
     }
 }
 
 /// ini の本文から読む。`[pad]` が無ければ既定（入り）。知らないキー・値は断る（綴りの誤りで切ったつもりが入りの
-/// まま走らないように）。値は `0` / `off`（切る）、`1` / `on`（入り）、`always`（確かめを外す）。
+/// まま走らないように）。値は `0` / `off`（切る）、`1` / `on`（入り）、`always`（検証を外す）。
 pub fn settings_from_text(text: &str) -> Result<PadSettings, String> {
     let ini = ini::parse(text).map_err(|e| e.to_string())?;
     if !ini.has_section(SECTION) {
@@ -128,7 +128,7 @@ pub fn settings_from_text(text: &str) -> Result<PadSettings, String> {
     for (k, line) in ini.keys(SECTION) {
         if !KEYS.contains(&k) {
             return Err(format!(
-                "[{SECTION}] の {line} 行目のキー {k:?} を知らない（読めるのは {}）",
+                "[{SECTION}] の {line} 行目のキー {k:?} の記法が不適切です（使用可能なキー: {}）",
                 KEYS.join(" / ")
             ));
         }
@@ -141,7 +141,7 @@ pub fn settings_from_text(text: &str) -> Result<PadSettings, String> {
             "always" => PovMode::Always,
             _ => {
                 return Err(format!(
-                    "pov の値 {v:?} は 0 / off / 1 / on / always のどれか"
+                    "pov の値 {v:?} は 0 / off / 1 / on / always のどれかにしてください"
                 ));
             }
         },
@@ -150,7 +150,7 @@ pub fn settings_from_text(text: &str) -> Result<PadSettings, String> {
 }
 
 /// winmm の経路でデバイス `dev` の `dwPOV` を読んでよいか。`wcaps` は `joyGetDevCaps` の `wCaps`（引けなければ `None` =
-/// つながっていない）。
+/// 接続されていない）。
 pub fn winmm_may_read(mode: PovMode, wcaps: Option<u32>) -> bool {
     match mode {
         PovMode::Off => false,

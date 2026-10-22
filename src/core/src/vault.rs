@@ -1,11 +1,12 @@
 //! 保管庫（`Replay_HiganRTool\`）の名前を決める。ファイルには触らない（フォルダの中の名前の一覧は dll が渡し、
 //! 作るのも書くのも dll）。保存はゲーム自身の `CreateFileA` を通るので、名前は CP932（Shift-JIS）で書ける文字だけにする。
 //! 判定と変換は `encoding_rs`。その `SHIFT_JIS` は WHATWG の定義で、Windows の CP932 の表に合わせたもの
-//! （NEC・IBM の重複の文字などの細部の一致は確かめていない）。
+//! （NEC・IBM の重複の文字などの細部の一致は検証していない）。
 
 use encoding_rs::SHIFT_JIS;
 
 use crate::replay::Timestamp;
+use crate::replay_menu_path::{SLOTS, slot_file_name};
 
 /// 無害化した名前の上限（CP932 のバイト数）。
 pub const NAME_MAX_CP932: usize = 32;
@@ -13,8 +14,9 @@ pub const NAME_MAX_CP932: usize = 32;
 pub const NONAME: &str = "noname";
 pub const UD_MAX: u16 = 9999;
 pub const PACK50_FOLDER_MAX: u16 = 9999;
-/// pack50 の 1 フォルダの半分（`th9_01`〜`th9_25` と `th9_ud0001`〜`th9_ud0025`）。25 はゲームの一覧の上限（`0x00426DAB` の `cmp $0x19`）。
-pub const PACK50_HALF: u16 = 25;
+/// pack50 の 1 フォルダの半分（`th9_01`〜`th9_25` と `th9_ud0001`〜`th9_ud0025`）。25 はゲームの一覧の枠の数
+/// （`replay_menu_path::SLOTS`。ゲームの保存の画面の枠と同じ名前を使うので、同じ値を共有する）。
+pub const PACK50_HALF: u16 = SLOTS as u16;
 
 /// `_` に置き換える文字（制御文字は別に見る）。
 const FORBIDDEN_CHARS: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
@@ -27,7 +29,7 @@ fn is_control(c: char) -> bool {
 }
 
 /// Windows の予約名（大小文字を問わない。最初の `.` の前がこれなら同じ扱い）。`COM0` と `LPT0` と `CONIN$` `CONOUT$` も入れる
-/// （`COM0` が予約かは確かめていないが、足して困るのは名前が `COM0` の人だけで、`_` が 1 文字付くだけなので疑わしい側へ倒した）。
+/// （`COM0` が予約かは検証していないが、足して困るのは名前が `COM0` の人だけで、`_` が 1 文字付くだけなので疑わしい側へ倒した）。
 fn is_reserved_stem(stem: &str) -> bool {
     const FIXED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
     if FIXED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
@@ -103,7 +105,7 @@ fn fix_reserved(s: &mut String) {
 /// 名前の無害化。入力は UTF-8 の名前、出力は CP932 で往復できる文字だけの、フォルダ名に使える名前。
 ///
 /// 順序: 文字の置き換え → 末尾の空白と `.` を落とす → 32 バイトに切る → もう一度末尾を落とす → 空なら `noname` →
-/// 予約名なら `_` → `_` で 32 バイトを超えたらもう一度切って末尾を落とす。予約名の確かめを切った後に置くのは、
+/// 予約名なら `_` → `_` で 32 バイトを超えたらもう一度切って末尾を落とす。予約名の判定を切った後に行うのは、
 /// 切って末尾を落とした結果が予約名になることがあるため（例: `COM1` ＋ 空白 28 個 ＋ `x`）。
 pub fn sanitize_name(name: &str) -> String {
     let mut s: String = name
@@ -218,10 +220,6 @@ fn ud_name(n: u16) -> String {
     format!("th9_ud{n:04}.rpy")
 }
 
-fn slot_name(n: u16) -> String {
-    format!("th9_{n:02}.rpy")
-}
-
 /// `names` で使われていない一番小さい番号の `th9_udNNNN.rpy`。形でない名前は数えない。9999 まで埋まっていたら `None`。
 pub fn next_ud_name<S: AsRef<str>>(names: &[S]) -> Option<String> {
     let mut used = vec![false; UD_MAX as usize + 1];
@@ -245,7 +243,7 @@ pub fn pack50_last_folder<S: AsRef<str>>(dir_names: &[S]) -> Option<u16> {
 /// 次の番号のフォルダの `th9_01.rpy`（フォルダが 1 つも無ければ `0001`）。フォルダ番号が 9999 を超えるなら `None`。
 pub fn pack50_next<S: AsRef<str>>(last: Option<u16>, names_in_last: &[S]) -> Option<(u16, String)> {
     let Some(folder) = last else {
-        return Some((1, slot_name(1)));
+        return Some((1, slot_file_name(1)));
     };
     let mut slots = [false; PACK50_HALF as usize + 1];
     let mut uds = [false; PACK50_HALF as usize + 1];
@@ -259,13 +257,13 @@ pub fn pack50_next<S: AsRef<str>>(last: Option<u16>, names_in_last: &[S]) -> Opt
         }
     }
     if let Some(n) = (1..=PACK50_HALF).find(|&n| !slots[n as usize]) {
-        return Some((folder, slot_name(n)));
+        return Some((folder, slot_file_name(n)));
     }
     if let Some(n) = (1..=PACK50_HALF).find(|&n| !uds[n as usize]) {
         return Some((folder, ud_name(n)));
     }
     let next = folder.checked_add(1).filter(|&n| n <= PACK50_FOLDER_MAX)?;
-    Some((next, slot_name(1)))
+    Some((next, slot_file_name(1)))
 }
 
 #[cfg(test)]

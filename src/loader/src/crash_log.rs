@@ -1,9 +1,7 @@
-//! ローダーの段階ログ（`logs\loader_YYYYMMDD.log`）と、パニック・未処理例外の記録。
-//! 起動の途中で落ちたときに原因が残るようにするためのもので、書けなくても起動は続ける。
-//! 個人を特定できる字は `Scrub` を通して伏せる（ゲームのパスは書かない）。
-//!
-//! ツールをゲームのフォルダの中に置いた人のゲームのフォルダへは何も作らない。そのためログのファイルは、ゲームのフォルダが
-//! 分かって「外」と確かめるまで開かず、それまでの行はメモリに貯める（`StageLog::decide`）。
+//! ローダーの段階ログ（`logs\loader_YYYYMMDD.log`）と、パニック・未処理例外の記録。書けなくても起動は続ける。
+//! 個人を特定できる文字は `Scrub` を通して伏せる（ゲームのパスは書かない）。
+//! ツールをゲームのフォルダの中に置いた人のゲームのフォルダには何も作らない。そのためログのファイルは、ゲームのフォルダが
+//! 分かって「外」と判定するまで開かず、それまでの行はメモリに貯める（`StageLog::decide`）。
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -102,13 +100,13 @@ enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Opened,
-    /// ログの置き場がゲームのフォルダの中なので、ファイルを作らない。
+    /// ログのフォルダがゲームのフォルダの中なので、ファイルを作らない。
     InGameFolder,
     /// フォルダを作れない・ファイルを開けない。
     OpenFailed,
 }
 
-/// ツールのフォルダ `tool_dir` がゲームのフォルダ `game_dir` と同じか、その下か。ログの置き場（`tool_dir\logs`）の判定に使う。
+/// ツールのフォルダ `tool_dir` がゲームのフォルダ `game_dir` と同じか、その下か。ログのフォルダ（`tool_dir\logs`）の判定に使う。
 /// `..` や別名のパス（ジャンクション・8.3）を解いた形でも比べ、どれか 1 つでも「中」なら中とする
 /// （ゲームのフォルダに書く誤りより、書かない誤りを選ぶ）。
 pub fn is_inside_game(tool_dir: &Path, game_dir: &Path) -> bool {
@@ -164,7 +162,7 @@ impl StageLog {
         }
     }
 
-    /// ログの置き場がゲームのフォルダの中でなければ、フォルダとファイルを作って貯めた行を書く。中なら以後も何も書かない。
+    /// ログのフォルダがゲームのフォルダの中でなければ、フォルダとファイルを作って貯めた行を書く。中なら以後も何も書かない。
     /// 決めた後に呼んでも結果は変わらない。
     pub fn decide(&mut self, inside_game_folder: bool) -> Decision {
         if !self.is_waiting() {
@@ -223,7 +221,7 @@ impl StageLog {
         matches!(self.state, State::Waiting { .. })
     }
 
-    /// 以降の行で、`path` で始まる字を `label` に替える。貯めた行にも、書き出すときに効く。
+    /// 以降の行で、`path` で始まる文字列を `label` に替える。貯めた行にも、書き出すときに効く。
     pub fn hide_dir(&mut self, path: &str, label: &str) {
         self.scrub = std::mem::take(&mut self.scrub).dir(path, label);
     }
@@ -363,7 +361,7 @@ pub fn panic_text(thread: &str, message: &str, location: Option<(&str, u32, u32)
 type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 
 /// パニックの文と場所を `sink` に渡し、元のフック（`default`）を呼ぶ。主スレッドのパニックなら、その後 `hold` を呼ぶ
-/// （窓が消える前に読めるようにする。他のスレッドは呼び元が続くので待たない）。
+/// （ウィンドウが消える前に読めるようにする。他のスレッドは呼び元が続くので待たない）。
 pub fn panic_hook(default: Hook, sink: fn(&str), hold: fn()) -> Hook {
     Box::new(move |info| {
         let payload = info.payload();
@@ -503,7 +501,7 @@ mod tests {
         d
     }
 
-    /// 置き場がゲームのフォルダの外と分かった後の状態にして返す。
+    /// ログのフォルダがゲームのフォルダの外と分かった後の状態にして返す。
     fn opened(dir: &Path, scrub: Scrub) -> StageLog {
         let mut log = StageLog::new(dir, fixed_clock, scrub);
         assert_eq!(log.decide(false), Decision::Opened);
@@ -661,7 +659,6 @@ mod tests {
         out
     }
 
-    /// 壊れたら落ちる: ゲームのフォルダが分かる前にフォルダやファイルを作る。
     #[test]
     fn nothing_is_created_while_the_game_folder_is_unknown() {
         let tool = temp_dir("waiting");
@@ -674,8 +671,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tool);
     }
 
-    /// 壊れたら落ちる: ゲームのフォルダの中（同じ・下の階層）にログを作る、または外なのに作らない・貯めた行を落とす・
-    /// 区切りの行を先頭に置かない・貯めた行の伏せ字を効かせない。ゲームのフォルダは合成の一時フォルダ。
+    /// 貯めた行の書き出し・先頭の区切りの行・伏せ字も見る。ゲームのフォルダは合成の一時フォルダ。
     #[test]
     fn the_log_is_created_only_outside_the_game_folder() {
         let root = temp_dir("placement");
@@ -740,7 +736,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 壊れたら落ちる: 貯めている間に行が溢れても無限に貯める、または溢れたことを残さない。
     #[test]
     fn the_waiting_lines_have_a_limit_and_the_overflow_is_reported() {
         let d = temp_dir("overflow");
@@ -759,7 +754,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 壊れたら落ちる: `..` や別の綴りのパスでゲームのフォルダの中を外と見誤る。
     #[test]
     fn a_path_that_climbs_back_into_the_game_folder_is_inside() {
         let root = temp_dir("climb");
@@ -827,7 +821,7 @@ mod tests {
     #[test]
     fn the_panic_hook_logs_the_message_and_place_and_waits_only_on_the_main_thread() {
         let before = std::panic::take_hook();
-        // 並んで走る他の検査がパニックしても数えないよう、このテストが起こすスレッドの分だけ数える。
+        // 並んで走る他の検査がパニックしても数えないよう、このテストが作るスレッドの分だけ数える。
         let default: Hook = Box::new(|_| {
             let t = std::thread::current();
             if matches!(t.name(), Some("worker" | "main")) {
@@ -907,7 +901,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: ローダーだけが別の名前の表を持つ（DLL のログと同じコードが違う名前で書かれる）。
     #[test]
     fn exception_names_come_from_the_table_the_dll_log_also_uses() {
         use higanr_core::exception_names::{BREAKPOINT, fatal_name};

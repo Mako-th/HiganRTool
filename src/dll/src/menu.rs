@@ -1,15 +1,10 @@
 //! メニューとライフの約 1 ms ごとの読み取りの、判定と行と間隔の集計（pure。unsafe 無し）。
 //!
-//! MainMenu `[0x4AC8C0]` は解放された後も 0 に戻らないので、入口ではたどらない。別のスレッドが約 1 ms ごとに、落ちない読み方
-//! （自分のプロセスへの `ReadProcessMemory`。本物は `menu_win.rs`）で読み、変わったときだけ、読む前と読んだ後の番号（`stub::SEQ`）を
-//! 添えて 1 行書く。`anim` は毎フレーム変わるので値だけ残す。ReplayManager のカウンタ（値だけ）・Live / Replay・Gui の会話の状態と、
-//! その 2 つのポインタも読む。
-//!
-//! `seq_before` は読む直前に入口が取った番号の数（= 次に取られる番号）、`seq_after` は読んだ直後のそれ。2 つが同じなら読んでいる間に
-//! 入口は通っていない。違えばその間に入口が通ったので、フレームの判定が ±1 になる。
-//!
+//! MainMenu `[0x4AC8C0]` は解放された後も 0 に戻らないので、入口ではたどらない。別のスレッドが約 1 ms ごとに、落ちない読み方（自分のプロセスへの `ReadProcessMemory`。本物は `menu_win.rs`）で読み、
+//! 変わったときだけ、読む前と読んだ後の番号（`stub::SEQ`）を添えて `_menu.csv` に 1 行書く。`anim` は毎フレーム変わるので値だけ残す。ReplayManager のカウンタ（値だけ）・Live / Replay・Gui の会話の状態と、その 2 つのポインタも読む。
+//! `seq_before` は読む直前に入口が取った番号の数（= 次に取られる番号）、`seq_after` は読んだ直後のそれ。2 つが同じなら読んでいる間に入口は通っていない。違えばその間に入口が通ったので、フレームの判定が ±1 になる。
 //! 一時停止（`PAUSE` のバイトと `PAUSE_MENU` の状態・フレームの数え）と終わりのメニュー（`MATCH_END_MENU` のバイトと `END_MENU`）も読む。
-//! 戻り道（`higanr_core::return_flow`）が読む番地を、戻り道を動かさない実機の回で確かめる材料（照らす側は `higanr_core::return_obs`）。
+//! 戻り道（`higanr_core::return_flow`）が読むアドレスを、戻り道を動かさない実機の検証で検証する材料（照らす側は `higanr_core::return_obs`）。
 //! フレームの数えは毎フレーム変わるので、開発用のビルドだけが変化の判定に入れる（`MenuWatch::new(true)`）。
 #![forbid(unsafe_code)]
 
@@ -201,7 +196,7 @@ pub enum TimerMode {
 /// 間隔（前の読みから今の読みまで）の区分の境目（ミリ秒）。1 ms と `Sleep(1)` の既定の間隔（約 15.6 ms）の前後を細かく分ける。
 pub const TICK_EDGES_MS: [f64; 10] = [0.5, 0.9, 1.1, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0, 17.0];
 
-/// 間隔の集計（道具の精度）。区分ごとの数と最小・最大・和だけ持つ（15 分で約 90 万回）。
+/// 間隔の集計（ツールの精度）。区分ごとの数と最小・最大・和だけ持つ（15 分で約 90 万回）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TickStats {
     pub mode: TimerMode,
@@ -281,7 +276,7 @@ impl TickStats {
         if let Some(e) = &self.write_error {
             let _ = writeln!(
                 out,
-                "メニューとライフ（{label}）: _menu.csv に書けなくなった（{e}）"
+                "メニューとライフ（{label}）: _menu.csv に書けなくなりました（{e}）"
             );
         }
     }
@@ -366,7 +361,6 @@ mod tests {
         assert_eq!((s.gui_ptr, s.gui_talk), (None, None));
     }
 
-    /// 壊れたら落ちる: 一時停止・終わりのメニューの旗が 4 バイト丸ごと読まれる（隣の欄が混ざる）、状態とフレームの数えの番地が入れ替わる。
     #[test]
     fn pause_and_end_menu_are_read_from_their_own_addresses() {
         let mut m = mem();
@@ -461,7 +455,6 @@ mod tests {
         assert_eq!(w.samples, 29);
     }
 
-    /// 壊れたら落ちる: DLL が書く `_menu.csv` の見出しと行を、照らす側（`higanr_core::return_obs`）が読めなくなる（列の名前・数の食い違い）。
     #[test]
     fn a_row_written_here_is_read_by_the_checker() {
         let mut m = mem();
@@ -480,8 +473,7 @@ mod tests {
         assert_eq!(report.episodes, (1, 0));
     }
 
-    /// 壊れたら落ちる: フレームの数えが変わるだけで配るバージョンの行が増える（ログが膨らむ）、開発用のビルドで 1 フレームごとの行が出ない
-    /// （戻り道の照らしが「前の行のフレーム数」を引けない）。旗の上位バイトだけの変化は、どちらでも行にならない。
+    /// 旗の上位バイトだけの変化は、どちらでも行にならない。
     #[test]
     fn frame_counts_make_lines_only_when_asked() {
         let bump = |m: &mut FakeMem| {

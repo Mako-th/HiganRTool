@@ -148,7 +148,7 @@ fn hr_text(what: &str, hr: Hresult) -> String {
     format!("{what}、HRESULT 0x{:08X}", hr as u32)
 }
 
-/// ウィンドウの用意まで。出さない（検査が出さずに vtable の並びを確かめるため）。
+/// ウィンドウの用意まで。出さない（検査が出さずに vtable の並びをチェックするため）。
 fn make_dialog(title: &str, initial: Option<&Path>) -> Result<Com<DialogVtbl>, String> {
     let mut raw: *mut c_void = ptr::null_mut();
     // SAFETY: CLSID と IID は定数、`raw` は書ける 1 語。成功すれば参照を 1 つ得る。

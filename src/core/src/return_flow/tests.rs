@@ -159,7 +159,7 @@ impl Sim {
             self.paused = false;
             self.end_menu = false;
             if self.auto_walk {
-                // 1 → 6 → 7 → 8 を 2 フレームで（実機の記録 M1d §7-1）。最初のフレームは画面 1 の作る途中。
+                // 1 → 6 → 7 → 8 を 2 フレームで。最初のフレームは画面 1 の作る途中。
                 self.screen = 1;
                 self.sub = 0;
                 self.trans = 1;
@@ -968,7 +968,6 @@ fn while_the_pause_cannot_open_the_players_decide_passes_and_keeps_the_flow() {
     assert!(passed >= 4, "決定を通した回数 {passed}");
 }
 
-/// 壊れたら落ちる: 諦めた理由の印が理由を取り違える（種類の入れ替え・番号の欠け）か、全部の理由が別々の印にならない。
 #[test]
 fn every_give_up_reason_has_its_own_code_and_a_sentence() {
     let all = [

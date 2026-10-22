@@ -127,7 +127,7 @@ describe("rules.json と rules.ts", () => {
     expect(text("room_name_bad_names").split(",")).toEqual([...ROOM_NAME_BAD_NAMES]);
     expect(text("room_name_fold").split(",")).toEqual([...ROOM_NAME_FOLD]);
 
-    // 全コードポイント（代理を除く）で、`a<字>b` を断るかが見本の範囲と `/` の和に一致すること。
+    // 全コードポイント（代理を除く）で、`a<文字>b` を断るかが見本の範囲と `/` の和に一致すること。
     const ranges = parseRanges(text("room_name_controls"));
     const bad = new Set(ROOM_NAME_BAD_CHARS);
     let rejected = 0;

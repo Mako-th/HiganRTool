@@ -1,15 +1,9 @@
 //! ゲーム内メニューの状態機械と、画面に出す固定の文の表（pure。確保しない）。入口は `ui_entry`（Match の「妖怪 対 妖怪」の決定を借りる）。
-//!
-//! - 状態機械 `Menu`: ゲームのスレッドで 1 tick に 1 回進める（カーソルの反応を遅らせないため）。入力はゲームへ流さない（呼び手が 0 を feed する）。
-//!   自分の語（`0x0042BE40` / poll の席 0 の値）の押した瞬間で動く。閉じるときはローカルの語が 0 になるまで 0 を流し続けてからゲームへ返す
-//!   （押したままのキーをゲームが「押した瞬間」と読まないため）。
-//! - 見張りのスレッドから来る状態 `Note`: 文字列でなく「種類（`Event` / `CodeState`）＋数」。メニューが下の固定の文から文を選ぶので、画面に出る文字は
-//!   全部この表の文字と数字・ASCII だけになる（文字の表 `overlay::ui_glyphs` に無い文字を出さない）。相手の名前だけは表に無い文字がありうるので、書き手（見張り）が
-//!   `sanitize_name` で `?` に直してから渡す。
+//! - 状態機械 `Menu`: ゲームのスレッドで 1 tick に 1 回進める（カーソルの反応を遅らせないため）。入力はゲームへ流さない（呼び手が 0 を feed する）。自分の語（`0x0042BE40` / poll の席 0 の値）の押した瞬間で動く。閉じるときはローカルの語が 0 になるまで 0 を流し続けてからゲームへ返す（押したままのキーをゲームが「押した瞬間」と読まないため）。
+//! - 見張りのスレッドから来る状態 `Note`: 文字列でなく「種類（`Event` / `CodeState`）＋数」。メニューが下の固定の文から文を選ぶので、画面に出る文字は全部この表の文字と数字・ASCII だけになる（文字の表 `overlay::ui_glyphs` に無い文字を出さない）。相手の名前だけは表に無い文字がありうるので、書き手（見張り）が `sanitize_name` で `?` に直してから渡す。
 //! - 描く行 `LineBuf`: スタックの固定の配列（確保しない）。
 //!
-//! 文言の規律: この道具が何をどう描いたか・画面から読めない数値（文字数・時間・席・形）は書く。ゲームの仕様は説明しない。状態の文には次にすることを 1 つ添える。
-//! adonis の語（「同期ズレ」）に合わせる。
+//! 文言の規律: このツールが何をどう描いたか・画面から読めない数値（文字数・時間・席・形）は書く。ゲームの仕様は説明しない。状態の文には次にすることを 1 つ添える。adonis の語（「同期ズレ」）に合わせる。
 #![forbid(unsafe_code)]
 
 use crate::code::DEFAULT_TTL_SECS;
@@ -74,21 +68,22 @@ texts! {
     T_LAN_PEER_OPEN = "相手「", "Connecting to \"";
     T_LAN_PEER_CLOSE = "」に接続しています。", "\".";
     T_LAN_NO_ADDRESS = "LANのアドレスが見つかりません。", "No LAN address was found.";
-    T_LAN_NO_ADDRESS_NEXT = "ケーブルかWi-Fiの接続を確かめてください。", "Check the cable or the Wi-Fi connection.";
+    T_LAN_NO_ADDRESS_NEXT = "ケーブルかWi-Fiの接続をチェックしてください。", "Check the cable or the Wi-Fi connection.";
     /// 「ポート 17723 を使えません（ほかのプログラムが使用しています）。」。数は待ち受けのポート。
     T_LAN_PORT_BUSY_OPEN = "ポート", "Port ";
     T_LAN_PORT_BUSY_CLOSE = "を使えません（ほかのプログラムが使用しています）。", " is in use by another program.";
-    T_LAN_PORT_BUSY_NEXT = "ほかのHiganRToolがLANで待機していないか確かめてください。", "Check that no other HiganRTool is waiting on the LAN.";
+    T_LAN_PORT_BUSY_NEXT = "ほかのHiganRToolがLANで待機していないかチェックしてください。", "Check that no other HiganRTool is waiting on the LAN.";
     T_LAN_NO_HOST = "ホストから返事がありません。", "The host did not answer.";
-    T_LAN_NO_HOST_NEXT = "アドレスと、ホストが待機中かを確かめてください。", "Check the address and that the host is waiting.";
+    T_LAN_NO_HOST_NEXT = "アドレスと、ホストが待機中かをチェックしてください。", "Check the address and that the host is waiting.";
     T_LAN_BUSY = "ホストにはもう相手がいます。", "The host already has an opponent.";
     T_LAN_BUSY_NEXT = "ホストに待機し直してもらってください。", "Ask the host to start waiting again.";
     T_LAN_NO_MATCH = "ホストとクライアントがまだ接続していません。", "The host and the client have not connected yet.";
     T_LAN_NO_MATCH_NEXT = "2人が接続してから、もう一度「観戦」を選んでください。", "Choose \"Watch\" again after they have connected.";
-    T_LAN_WATCH_OFF = "ホストは観戦を受け付けていません。", "The host does not allow watching.";
-    T_LAN_WATCH_OFF_NEXT = "ホストのHiganRTool.iniの[spectate]を確かめてください。", "Check [spectate] in the host's HiganRTool.ini.";
+    /// 観戦者（LAN・ルームマッチ）: 対戦する 2 人のどちらかが観戦を許可していない。どちらかは出さない。
+    T_WATCH_REFUSED = "この試合は観戦できません（2人のどちらかが観戦を許可していません）。", "This match cannot be watched (one player does not allow watching).";
+    T_WATCH_REFUSED_NEXT = "2人にHiganRTool.iniの[spectate]のenableを1にしてもらってください。", "Ask both players to set [spectate] enable to 1 in HiganRTool.ini.";
     T_LAN_NO_LINK = "相手と接続できませんでした。", "Could not connect to the opponent.";
-    T_LAN_NO_LINK_NEXT = "ファイアウォールでth09.exeが許可されているか確かめてください。", "Check that th09.exe is allowed in the firewall.";
+    T_LAN_NO_LINK_NEXT = "ファイアウォールでth09.exeが許可されているかチェックしてください。", "Check that th09.exe is allowed in the firewall.";
     T_LAN_CANCELLED_NEXT = "もう一度接続するときは「LAN」の項目を選んでください。", "To connect again, choose an item under LAN.";
     /// プレイヤー名が既定のままの間、メニューの下に出す案内（設定の項目名は `T_GROUP_SETTINGS`）。
     T_NAME_FIRST = "はじめに「設定」でプレイヤー名を決めてください。", "Set your player name under \"Settings\" first.";
@@ -115,7 +110,7 @@ texts! {
     T_CANCEL = "待機をやめる", "Stop waiting";
     T_BACK = "もどる", "Back";
     T_ARROWS = "◀▶", "◀▶";
-    /// つながった後の左上の行（`connected_line`）の文字: 「rollback・delay 1」「delay 方式」。
+    /// 接続した後の左上の行（`connected_line`）の文字: 「rollback・delay 1」「delay 方式」。
     T_ROLLBACK = "rollback・delay ", "rollback, delay ";
     T_DELAY = "delay方式・delay ", "delay mode, delay ";
     /// キーの行。パッドだけでも操作できるので、キーボードのキーの名前（Z・X）は出さず「決定」「キャンセル」と書く。
@@ -128,7 +123,7 @@ texts! {
     T_MADE = "クリップボードにコピーしました。相手に送ってください。", "Copied to the clipboard. Send it to your opponent.";
     T_REPLY_MADE = "返答コードをクリップボードにコピーしました。相手に送ってください。", "Copied the reply code. Send it to your opponent.";
     T_LINKING = "接続しています。接続するまでお待ちください。", "Connecting. Please wait.";
-    T_GOT = "受け取った文字数 ", "Received ";
+    T_GOT = "貼り付けたコードの文字数 ", "Pasted code: ";
     T_CHARS = " 文字", " chars";
     T_CODE_LEN_OPEN = "（", " (";
     T_CODE_LEN_CLOSE = " 文字）", " chars)";
@@ -168,15 +163,15 @@ texts! {
     T_INI_PART = "HiganRTool.iniの一部を読み込めません。", "Part of HiganRTool.ini could not be read.";
     T_INI_MANY_A = "HiganRTool.iniの", "Could not read ";
     T_INI_MANY_B = "か所を読み込めません。", " places in HiganRTool.ini.";
-    T_INI_DEFAULT = "読み込めなかった部分は既定値で動かしています。", "The default is used for that part.";
-    T_INI_DEFAULT_MANY = "読み込めなかった部分は既定値で動かしています（詳細はログを確認してください）。", "Those lines are ignored; defaults are used (see the log).";
+    T_INI_DEFAULT = "読み込めなかった部分は既定の設定で動かしています。", "The default is used for that part.";
+    T_INI_DEFAULT_MANY = "読み込めなかった部分は既定の設定で動かしています（詳細はログを確認してください）。", "Those lines are ignored; defaults are used (see the log).";
     T_INI_SJIS = "HiganRTool.iniはUTF-8でないので、Shift_JISとして読みました。", "HiganRTool.ini is not UTF-8, so it was read as Shift_JIS.";
-    /// 起動し直さないと直らないとき（準備に失敗した）だけの次にすること。つながりが終わっただけなら、この道具がネットワークの組を片づけて「つなぐ前」へ戻すので `T_AGAIN`。
+    /// 起動し直さないと直らないとき（準備に失敗した）だけの次にすること。接続が終わっただけなら、このツールがネットワークの組を片づけて「接続する前」へ戻すので `T_AGAIN`。
     T_RESTART = "ゲームを閉じて起動し直してください。", "Close the game and start it again.";
-    /// つながりが終わった・成立しないまま閉じた・つながらないまま終わった後の次にすること（ゲーム内のメニューの実行だけ。マッチの外へ戻るとネットワークの組を片づけ、メニューが「つなぐ前」に戻る）。キーの名前は出さない。
+    /// 接続が終わった・成立しないまま閉じた・接続できないまま終わった後の次にすること（ゲーム内のメニューの実行だけ。マッチの外へ戻るとネットワークの組を片づけ、メニューが「接続する前」に戻る）。キーの名前は出さない。
     /// ゲームの項目の名前は、どの言語でもゲームの画面の文字のまま書く。
     T_AGAIN = "もう一度接続するときは「妖怪 対 妖怪」を選んでください。", "To connect again, choose 妖怪 対 妖怪 in Match Mode.";
-    /// 前のつながり（この起動の中でつながった回）で使ったコードを貼った（`Event::Spent`。次にすることは `T_EXPIRED_NEXT`）。
+    /// 前の接続（この起動の中で接続した回）で使ったコードを貼った（`Event::Spent`。次にすることは `T_EXPIRED_NEXT`）。
     T_SPENT = "このコードは前回の接続で使ったものです。", "This code was used for a previous connection.";
     T_UNREADABLE = "クリップボードが読み込めません。", "Could not read the clipboard text.";
     T_UNREADABLE_NEXT = "もう一度コピー＆ペーストしてください。", "Copy it again, then paste.";
@@ -217,7 +212,7 @@ texts! {
     /// 待ちを始めた項目の右に出す印（「ランダムマッチ  待機中 0:42」）。時計は待った時間。
     T_WAITING_MARK = "  待機中 ", "  waiting ";
     T_NEXT_LINKING = "接続するまでお待ちください。", "Please wait until connected.";
-    /// つながったが、対戦はまだ成立していない（`Conn::Found`。両者が「妖怪 対 妖怪」を選ぶまで）。閉じるまでの残りは画面から読めない数なので出す。
+    /// 接続したが、対戦はまだ成立していない（`Conn::Found`。両者が「妖怪 対 妖怪」を選ぶまで）。閉じるまでの残りは画面から読めない数なので出す。
     T_FOUND = "相手が見つかりました（閉じるまで ", "Opponent found (closes in ";
     T_FOUND_READY = "相手が「妖怪 対 妖怪」を選ぶのを待っています（閉じるまで ", "Waiting for the opponent to start (closes in ";
     T_FOUND_CLOSE = "）", ")";
@@ -240,7 +235,7 @@ texts! {
     /// 相手の HiganRTool のビルド（`update::BUILD_NUMBER`。配った zip ごとの数）が違う（`Conn::OtherBuild`・`Event::OtherBuild`・`Event::SpectateOtherBuild`）。
     /// プロトコルのバージョンの違いと並べ、2 行目・区切り・閉じは同じ文字を使う。2 つのビルドは画面から読めないので出す（書き方は `push_build`）。
     T_OTHER_BUILD_OPEN = "相手とバージョンが違います（自分 ", "Version mismatch (you ";
-    /// 開発用のビルド（ビルド番号 0。配布用の道具を通さずに建てた物）の書き方（`push_build`）。
+    /// 開発用のビルド（ビルド番号 0。配布用のツールを通さずに建てた物）の書き方（`push_build`）。
     T_BUILD_DEV = "開発版", "dev";
     /// マッチ中の行の語（`hud_line`）。全部 ASCII。項目の区切りは空白 2 つ。
     /// 行は上の枠の左（タイマーの手前。`ui_layout::HUD_TEXT_MAX_W`）に収める必要があるが、ゲームの文字（9 画素送り）では 2 つ空けの形が収まらないので、
@@ -256,10 +251,10 @@ texts! {
     T_HUD_AUTO_MARK = "A", "A";
     /// キャラセレクトの左下の行の先頭に出す「形式・」の区切り（`hud_line` の `format`。マッチ中の行にはこれは付かない）。
     T_HUD_FORMAT_SEP = "・", ", ";
-    /// 対戦中の上の枠の左右の名前の帯の席の文字（`name_band_line`。左は「1P 名前」、右は「名前 2P」）。
+    /// 試合中の上の枠の左右の名前の帯の席の文字（`name_band_line`。左は「1P 名前」、右は「名前 2P」）。
     T_HUD_SEAT_1 = "1P", "1P";
     T_HUD_SEAT_2 = "2P", "2P";
-    /// 観戦者のマッチ中の通信の状態の行の語（`watch_hud_line`: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」）。前半の「ping・Delay・Rollback」は対戦者 2 人の間の値
+    /// 観戦者のマッチ中の通信の状態の行の語（`watch_hud_line`: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」）。前半の「ping・Delay・Rollback」は対戦する 2 人の間の値
     /// （ホストが 1 秒ごとに観戦の流れの `Stats` の記録で流す。定義は `hud_line` と同じ。ping は観戦者からホストへの往復ではない）、後半の「Watch delay」は観戦者自身の遅れ
     /// （手元に届いてまだ使っていないマッチのフレームの数。画面から読めない数）。区切りは空白 1 つで、ふつうの文字では収まらないので観戦者の行だけ小さい文字で描く（`overlay::SMALL_CELL_H`）。
     /// 全部 ASCII。「>>」は遅れて入った観戦者が溜まりを追いつく間（画面が速く進む）。
@@ -281,7 +276,7 @@ texts! {
     T_ROOM_INPUT_KEYS = "使用可能な文字は「英数字」「-」「_」「@」です　Enterで決定　Escでもどる", "Allowed: A-Z 0-9 - _ @   Enter: Confirm   Esc: Back";
     /// 空のまま Enter（`RoomNameWhy::Empty`。文字の決まりの外はほかの `T_ROOM_NAME_*`）。
     T_ROOM_INPUT_EMPTY = "ルーム名が空です。", "The room name is empty.";
-    /// ウィンドウから文字を受ける仕組み（`text_input_win`）が置けなかった（ゲームのウィンドウが見つからない・差し替えを断られた）。ルームの入力は何も打てないので、次の 1 手（接続コード）を添える。
+    /// ウィンドウから文字を受ける仕組み（`text_input_win`）が設定できなかった（ゲームのウィンドウが見つからない・差し替えを断られた）。ルームの入力は何も打てないので、次の 1 手（接続コード）を添える。
     T_ROOM_INPUT_NO_KEYS = "キーボードの文字が受け取れません（詳細はログを確認してください）。", "Cannot receive keyboard input (details in the log).";
     T_ROOM_INPUT_NO_KEYS_NEXT = "Escでもどり、「接続コード」から接続してください。", "Press Esc and use \"Connect code\".";
     /// 使えない文字（半角カナ・記号・日本語など）を打って捨てたとき（`Edit::Rejected`）。文字の表に無い文字は `?` で描かれるので、何が起きたかをここで言う。
@@ -347,7 +342,7 @@ texts! {
     T_ROOM_NAME_ASCII = "ルーム名に使用可能な文字は「英数字」「-」「_」「@」です。", "Room names can use only A-Z, 0-9, -, _ and @.";
     T_ROOM_FIX = "ルーム名を直して、「ルームマッチ」を選び直してください。", "Fix the room name and choose \"Room match\" again.";
     /// 観戦者の入口。観戦の「ルームマッチ」は対戦の「ルームマッチ」と同じルーム名の入力へ入る（題だけがこの文字）。待ちの間の項目は「観戦をやめる」だけ。
-    /// つなぐ途中は `T_ROOM_JOINING`、失敗の 1 行目のうち応答しない・400 は `T_ROOM_UNRESPONSIVE`・`T_ROOM_REFUSED`、バージョン違いは `other_version_line` を使い、次にすることだけ「観戦」に替える。
+    /// 接続する途中は `T_ROOM_JOINING`、失敗の 1 行目のうち応答しない・400 は `T_ROOM_UNRESPONSIVE`・`T_ROOM_REFUSED`、バージョン違いは `other_version_line` を使い、次にすることだけ「観戦」に替える。
     T_SPECTATE = "観戦", "Watch";
     T_SPECTATE_CANCEL = "観戦をやめる", "Stop watching";
     /// 観戦の「ランダムマッチ」（進行中のランダムマッチの一覧から選ぶ画面）。題は「観戦 ─ ランダムマッチ」。1 行は「1P 名 vs 2P 名　観戦者の数/上限」で、
@@ -363,7 +358,7 @@ texts! {
     T_KEYS_WATCH = "↑↓ メニューの移動　決定で観戦　キャンセルでもどる", "↑↓ Move   Confirm: Watch   Cancel: Back";
     /// 「観戦 名前 で待機中 12:34」（`T_SPECTATE_OPEN` ＋ 名前 ＋ `T_ROOM_WAITING_CLOSE` ＋ 時計）。配る側がルームに来るまでの入り直しの間（`JoinerStatus::waiting_for_caster`）。時計は待った時間。
     T_SPECTATE_OPEN = "観戦 ", "Watch ";
-    /// 「相手「名前」に接続しています。」。観戦用のコードを受け、対戦者へつなぎに行く間。
+    /// 「相手「名前」に接続しています。」。観戦用のコードを受け、対戦する側へ接続しに行く間。
     T_SPECTATE_PEER_OPEN = "相手「", "Connecting to player \"";
     T_SPECTATE_PEER_CLOSE = "」に接続しています。", "\".";
     T_SPECTATE_UNRESPONSIVE_NEXT = "時間をおいて観戦の「ルームマッチ」を選び直してください。", "Wait a while, then choose \"Room match\" under Watch again.";
@@ -373,27 +368,41 @@ texts! {
     /// 「30分経ちましたが相手がルームに来ませんでした。」（「30分」は `spectate_room::JOINER_GIVE_UP_MS` から作る）。
     T_SPECTATE_GAVE_UP_OPEN = "", "No player came to the room in ";
     T_SPECTATE_GAVE_UP_TAIL = "経ちましたが相手がルームに来ませんでした。", ".";
-    T_SPECTATE_GAVE_UP_NEXT = "ルーム名を確かめて、観戦の「ルームマッチ」を選び直してください。", "Check the room name and choose \"Room match\" under Watch again.";
-    /// 返しを送れなかった・つなぎに行って届かない。原因は画面から読めないので、次にすることはログを GitHub の Issues へ送ること。
+    T_SPECTATE_GAVE_UP_NEXT = "ルーム名をチェックして、観戦の「ルームマッチ」を選び直してください。", "Check the room name and choose \"Room match\" under Watch again.";
+    /// 観戦者が対戦する側へ返しを送れなかった・接続しに行って届かない。原因は画面から読めないので、次にすることはログを GitHub の Issues へ送ること。
     T_SPECTATE_NO_LINK = "相手と接続できませんでした。", "Could not connect to the player.";
     T_SPECTATE_NO_LINK_NEXT = "logsフォルダのログを添えて、開発者に伝えてください。", "Please post the log to GitHub Issues.";
-    /// 再戦が続いている間に入り、ホストが最後のキャラ選択まで遡れなかったとき（`WatchPlay::awaiting_select`）。
-    T_SPECTATE_NEXT_SELECT = "次のキャラ選択から映ります。", "Spectating will start from the next character select.";
+    /// 再戦が続いている間に入り、対戦のホストが最後のキャラ選択まで遡れなかったとき（`WatchPlay::awaiting_select`）。
+    T_SPECTATE_NEXT_SELECT = "次のキャラ選択から試合が映ります。", "Spectating will start from the next character select.";
+    /// 観戦者がマッチの中で、ゲームのポーズを開けない間（ホストのポーズの再現中・マッチの終わりのメニュー）に Esc で止めた（描画だけのフレーム）。
+    T_SPECTATE_PAUSED = "一時停止中（Escで再開・3秒長押しで観戦を終了）", "Paused (Esc to resume, hold 3s to stop watching)";
+    /// 観戦者がマッチの外で Esc を押している間と、離してから 3 秒（3 秒押し続けると観戦をやめる）。
+    T_SPECTATE_ESC_HOLD = "Escを3秒長押しすると観戦を終了します。", "Hold Esc for 3 seconds to stop watching.";
     T_SPECTATE_ENDED = "観戦を終えました。", "Finished watching.";
     T_SPECTATE_CANCELLED = "観戦をやめました。", "Stopped watching.";
-    /// 観戦コード（ルームを使わない観戦。種別 3 のコードをクリップボードで渡す）の項目の名前と、ホストの側の文。
+    /// 観戦者の手元に溜めた記録（ゲームが止まっている間も受け続ける分）が上限に達して、観戦をやめた。
+    T_SPECTATE_BUFFER_FULL = "手元に溜めた試合の記録が上限（約1時間分）に達したため、観戦を終了しました。", "Stopped watching: your match buffer is full (about 1 hour).";
+    /// 接続した後、ホストの観戦者が満員になって断られ、観戦を終えた。
+    T_SPECTATE_FULL_ENDED = "観戦者が満員になったため、観戦を終了しました。", "The spectator slots became full, so watching ended.";
+    /// 接続する前に、ホストの観戦者が満員で入れないまま待ちの上限が来た（ルームの経路・観戦コードの経路とも）。
+    T_SPECTATE_FULL = "観戦者が満員のため、観戦できませんでした。", "The spectator slots are full, so you could not watch.";
+    T_SPECTATE_CODE_FULL_NEXT = "時間をおいて「観戦コード入力」を選び直してください。", "Wait a while, then choose \"Paste watch code\" again.";
+    /// 観戦コード（ルームを使わない観戦。種別 3 のコードをクリップボードで渡す）の項目の名前と、対戦のホストの側の文。
     T_SPECTATE_CODE_PASTE = "観戦コード入力", "Paste watch code";
-    /// ホストへの案内（つながった直後の左上）。コピーはメニューの項目でなく Ctrl+C で頼む。
+    /// ホストへの案内（接続した直後の左上）。コピーはメニューの項目でなく Ctrl+C で頼む。
     T_SPECTATE_CODE_HINT = "Ctrl+Cで観戦コードをコピーできます。", "Press Ctrl+C to copy the watch code.";
+    /// 自分は観戦を許可し、相手が許可していない対戦者へ、`T_SPECTATE_CODE_HINT` の代わりに出す案内と、Ctrl+C の結果。
+    T_SPECTATE_PEER_OFF = "相手が観戦を許可していないので、この試合は観戦できません。", "Your opponent does not allow watching this match.";
+    T_SPECTATE_CODE_PEER_OFF = "相手が観戦を許可していないので、観戦コードは作成できません。", "Your opponent does not allow watching, so no watch code was made.";
     T_SPECTATE_CODE_COPIED = "観戦コードをコピーしました。", "Copied the watch code.";
     T_SPECTATE_CODE_HOST_ONLY = "観戦コードはホストの画面でコピーできます。", "Only the host can copy the watch code.";
     /// 観戦コードをクリップボードへ書けなかった（1 行目は `T_CLIP_WRITE`）。
     T_SPECTATE_CODE_CLIP_WRITE_NEXT = "もう一度Ctrl+Cを押してください。", "Press Ctrl+C again.";
-    /// 同じ失敗を左上の 1 行に収めた形（つながっている間の知らせ。`copy_notice`）。
+    /// 同じ失敗を左上の 1 行に収めた形（接続している間の知らせ。`copy_notice`）。
     T_SPECTATE_CODE_COPY_FAILED = "コピーできませんでした。もう一度Ctrl+Cを押してください。", "Could not copy. Press Ctrl+C again.";
-    /// 観戦コードで繋ぎに行って届かない。理由は画面から読めないので、届かない形（LAN の外・ポートが閉じている）を確かめさせる。
+    /// 観戦コードで接続しに行って届かない。理由は画面から読めないので、届かない形（LAN の外・ポートが閉じている）をチェックさせる。
     T_SPECTATE_CODE_NO_LINK = "ホストに接続できませんでした。", "Could not connect to the host.";
-    T_SPECTATE_CODE_NO_LINK_NEXT = "同じLANにいるか、ホストのポートが開いているかを確かめてください。", "Check you are on the same LAN or the host's port is open.";
+    T_SPECTATE_CODE_NO_LINK_NEXT = "同じLANにいるか、ホストのポートが開いているかをチェックしてください。", "Check you are on the same LAN or the host's port is open.";
     T_SPECTATE_CODE_EMPTY_NEXT = "ホストの観戦コードをコピーしてから、「観戦コード入力」を選んでください。", "Copy the host's watch code, then choose \"Paste watch code\".";
     T_SPECTATE_CODE_BROKEN = "観戦コードが欠けているか、間違っているようです。", "The watch code is incomplete or wrong.";
     T_SPECTATE_CODE_BROKEN_NEXT = "全部をコピーし直して、「観戦コード入力」を選び直してください。", "Copy the whole code again and choose \"Paste watch code\".";
@@ -405,7 +414,7 @@ texts! {
     /// 時間の長さの単位（`push_span`）。
     T_SPAN_MIN = "分", " min";
     T_SPAN_SEC = "秒", " s";
-    /// 接続の手順が時間切れで作り直された後、相手から届いているのにつながらないときの左上の 3 行（`stall_pair`）。1 行目は理由＋「待機時間 0:42」
+    /// 接続の手順が時間切れで作り直された後、相手から届いているのに接続できないときの左上の 3 行（`stall_pair`）。1 行目は理由＋「待機時間 0:42」
     /// （接続コードの経路は「・残り 29:18」も。ルームの経路はルームの期限が自動で入り直すので残りが無い）。2 行目は次にすること 1 つ、3 行目は README の項。
     T_STALL_NO_HANDSHAKE = "相手からパケットは届いていますが、接続できません（", "Receiving from opponent, cannot connect (";
     T_STALL_REMAIN = "・残り ", ", left ";
@@ -413,7 +422,7 @@ texts! {
     T_STALL_NEXT_CODE = "2人とも待機をやめ、片方が新しいコードを作って、すぐ送ってください。", "Both stop waiting; one creates a new code and sends it at once.";
     T_STALL_NEXT_ROOM = "待機をやめ、「接続コード」の「対戦コード作成」に切り替えてください。", "Stop waiting and switch to \"Create play code\" under \"Connect code\".";
     T_STALL_REF = "（README「接続できないとき」5）", "(README \"When you cannot connect\" 5)";
-    /// つながらなかったときの複数行の文（`fail_block`。回線の型は `nat::FailKind`）。文字は日本語の文面を変えない。最後の行の番号は README の「接続できないとき」の項。
+    /// 接続できなかったときの複数行の文（`fail_block`。回線の型は `nat::FailKind`）。文字は日本語の文面を変えない。最後の行の番号は README の「接続できないとき」の項。
     T_FAIL_HEAD = "接続失敗：", "Connection failed:";
     T_FAIL_HEAD_NO = "接続不可：", "Cannot connect:";
     T_FAIL1_A = "不明な原因で相手からのUDPパケットが届きません。", "UDP packets from the opponent do not arrive (unknown cause).";
@@ -571,21 +580,21 @@ pub enum CodeState {
     Idle,
     /// 始める側: 自分のコードを作って、相手の返すコードを待っている。
     Offered,
-    /// 返す側: 相手のコードを読んで、返すコードを渡した。つながるのを待っている。
+    /// 返す側: 相手のコードを読んで、返すコードをクリップボードへコピーした（利用者が相手へ送る）。接続するのを待っている。
     Replied,
-    /// 始める側: 相手の返すコードを読んで、つないでいる。
+    /// 始める側: 相手の返すコードを読んで、接続している。
     Linking,
     RoomJoining,
     /// ルームに入って、相手を待っている（期限は `Note::until`）。
     RoomWaiting,
-    /// ルームで相手のコードを受け取り、セッションの設定を置いた（つながるのを待っている）。始める側も返す側もこれ。
+    /// ルームで相手のコードを受け取り、セッションを設定した（接続するのを待っている）。始める側も返す側もこれ。
     RoomLinking,
     SpectateJoining,
-    /// 観戦用のルームで、配る側（対戦者）が来るのを待っている（期限は 30 分）。
+    /// 観戦用のルームで、配る側（対戦する側）が来るのを待っている（期限は 30 分）。
     SpectateWaiting,
     SpectateLinking,
-    /// 観戦者のセッションを置いたまま、待ちは終わっている（取りやめた・失敗した・観戦を終えた後で、セッションを対戦のセッションへ戻さない実行）。項目は「観戦」と「戻る」だけ。
-    /// セッションを元へ戻せた実行は `Idle` を置く。どちらにするかは観戦者のセッションを置く側が決める。
+    /// 観戦者のセッションを設定したまま、待ちは終わっている（取りやめた・失敗した・観戦を終えた後で、セッションを対戦のセッションへ戻さない実行）。項目は「観戦」と「戻る」だけ。
+    /// セッションを元へ戻せた実行は `Idle` にする。どちらにするかは観戦者のセッションを設定する側が決める。
     SpectateIdle,
     /// LAN のホスト: 参加者を待っている（`Note::lan_*` に自分の LAN のアドレスとポート）。
     LanWaiting,
@@ -652,7 +661,7 @@ impl CodeState {
         matches!(self, CodeState::LanWaiting | CodeState::LanLinking)
     }
 
-    /// 観戦の待ちの間か（つなぐ途中・配る側を待つ・つなぎに行く。`SpectateIdle` は含まない）。この間のメニューの項目は「観戦をやめる」だけ。
+    /// 観戦の待ちの間か（接続する途中・配る側を待つ・接続しに行く。`SpectateIdle` は含まない）。この間のメニューの項目は「観戦をやめる」だけ。
     pub fn is_spectate_busy(self) -> bool {
         matches!(
             self,
@@ -731,19 +740,19 @@ pub enum Event {
     Internal,
     Unreadable,
     ClipWrite,
-    /// 対戦の形を、つなぎ始めた後に変えた（この接続では変わらない）。
+    /// 対戦の形を、接続し始めた後に変えた（この接続では変わらない）。
     ShapeLate,
     /// 使えるコードが届かないまま待つ長さが切れた。
     GaveUp,
-    /// 相手とつながらないままネットワークが終わった。
+    /// 相手と接続できないままネットワークが終わった。
     Ended,
     Cancelled,
     /// 相手のコードのバージョンが違う。相手のバージョンは `Note::peer_ver`。
     OtherVersion,
-    /// ルームサーバーへつなぎ始めた（以下 `Room*` はルームの経路）。
+    /// ルームサーバーへ接続し始めた（以下 `Room*` はルームの経路）。
     RoomJoining,
     RoomWaiting,
-    /// ルームで相手のコードを受け取り、つなぎ始めた（相手の名前は `Note::name`）。
+    /// ルームで相手のコードを受け取り、接続し始めた（相手の名前は `Note::name`）。
     RoomPeer,
     /// ルーム名をこちらの文字の決まりで断った（理由は `Note::room_why`）。
     RoomNameBad,
@@ -755,9 +764,9 @@ pub enum Event {
     RoomExpired,
     RoomPeerLeft,
     RoomBadCode,
-    /// 貼られたコードは、この起動の前のつながりで使ったもの（session が同じ）。読まない（クリップボードに残った前の相手のコードを貼っても前の相手へつなぎに行かない）。
+    /// 貼られたコードは、この起動の前の接続で使ったもの（session が同じ）。読まない（クリップボードに残った前の相手のコードを貼っても前の相手へ接続しに行かない）。
     Spent,
-    /// 観戦者: 観戦用のコードを受け、対戦者へつなぎに行く（対戦者の名前は `Note::name`）。
+    /// 観戦者: 観戦用のコードを受け、対戦する側へ接続しに行く（対戦する側の名前は `Note::name`）。
     SpectatePeer,
     SpectateUnresponsive,
     SpectateRefused,
@@ -765,7 +774,7 @@ pub enum Event {
     /// 観戦者: 観戦用のコードのバージョンが違う（相手のバージョンは `Note::peer_ver`）。
     SpectateOtherVersion,
     SpectateGaveUp,
-    /// 観戦者: 返しを送れなかった・つなぎに行って届かなかった。
+    /// 観戦者: 対戦する側への返しを送れなかった・接続しに行って届かなかった。
     SpectateNoLink,
     SpectateEnded,
     SpectateCancelled,
@@ -773,7 +782,7 @@ pub enum Event {
     OtherBuild,
     /// 観戦者: 観戦用のコードのビルドが違う（相手のビルドは `Note::peer_build`）。
     SpectateOtherBuild,
-    /// ホスト: 観戦コードをクリップボードへ書いた。
+    /// 対戦のホスト: 観戦コードをクリップボードへ書いた。
     SpectateCodeCopied,
     /// ゲスト: 観戦コードを頼まれたが、配るのはホスト。
     SpectateCodeHostOnly,
@@ -785,9 +794,9 @@ pub enum Event {
     SpectateCodeBroken,
     /// 観戦コードの経路の観戦者: 貼られたのは対戦用の接続コード（種別 1・2）。
     SpectateCodeWrongKind,
-    /// 観戦コードの経路の観戦者: 期限の切れた観戦コードで繋ぎに行き、答えが来なかった。
+    /// 観戦コードの経路の観戦者: 期限の切れた観戦コードで接続しに行き、答えが来なかった。
     SpectateCodeExpired,
-    /// ホスト: 観戦コードをクリップボードへ書けなかった。
+    /// 対戦のホスト: 観戦コードをクリップボードへ書けなかった。
     SpectateCodeClipWrite,
     /// LAN: 申し込み・参加を受けて接続の手順に入った（相手の名前が分かれば `Note::name`）。
     LanPeer,
@@ -801,16 +810,26 @@ pub enum Event {
     LanBusy,
     /// LAN の観戦: ホストの対戦がまだ始まっていない。
     LanNoMatch,
-    /// LAN の観戦: ホストが観戦を受け付けていない。
-    LanWatchOff,
+    /// 観戦者（LAN・ルームマッチ）: 対戦する 2 人のどちらかが観戦を許可していないので断られた。
+    WatchRefused,
     /// LAN: 手順は済んだが、接続が成立しなかった（時間切れ）。
     LanNoLink,
     /// LAN の待ち・接続の途中をやめた。
     LanCancelled,
+    /// 観戦コードを頼まれたが、自分は観戦を許可し、相手が許可していない。
+    SpectateCodePeerOff,
+    /// 観戦者: 溜めた記録が上限（約 1 時間分）に達したので観戦をやめた。
+    SpectateBufferFull,
+    /// 観戦者: 接続した後、ホストの観戦者が満員で断られて観戦を終えた。
+    SpectateFullEnded,
+    /// 観戦者（ルームの経路）: 接続する前に、ホストの観戦者が満員で入れないまま待ちの上限が来た。
+    SpectateFull,
+    /// 観戦コードの経路の観戦者: 同上。
+    SpectateCodeFull,
 }
 
 /// 出来事の番号の表（番号 = 並びの位置。原子変数で渡すので、足すときは末尾に足す）。
-const EVENTS: [Event; 63] = [
+const EVENTS: [Event; 68] = [
     Event::None,
     Event::Made,
     Event::ReplyMade,
@@ -871,9 +890,14 @@ const EVENTS: [Event; 63] = [
     Event::LanNoHost,
     Event::LanBusy,
     Event::LanNoMatch,
-    Event::LanWatchOff,
+    Event::WatchRefused,
     Event::LanNoLink,
     Event::LanCancelled,
+    Event::SpectateCodePeerOff,
+    Event::SpectateBufferFull,
+    Event::SpectateFullEnded,
+    Event::SpectateFull,
+    Event::SpectateCodeFull,
 ];
 
 impl Event {
@@ -922,8 +946,11 @@ impl Event {
                 | Event::SpectatePeer
                 | Event::SpectateEnded
                 | Event::SpectateCancelled
+                | Event::SpectateBufferFull
+                | Event::SpectateFullEnded
                 | Event::SpectateCodeCopied
                 | Event::SpectateCodeHostOnly
+                | Event::SpectateCodePeerOff
                 | Event::LanPeer
                 | Event::LanCancelled
         )
@@ -950,6 +977,10 @@ impl Event {
                 | Event::SpectateGaveUp
                 | Event::SpectateNoLink
                 | Event::SpectateEnded
+                | Event::SpectateBufferFull
+                | Event::SpectateFullEnded
+                | Event::SpectateFull
+                | Event::SpectateCodeFull
                 | Event::SpectateCodeNoLink
                 | Event::SpectateCodeExpired
                 | Event::LanNoAddress
@@ -957,21 +988,24 @@ impl Event {
                 | Event::LanNoHost
                 | Event::LanBusy
                 | Event::LanNoMatch
-                | Event::LanWatchOff
+                | Event::WatchRefused
                 | Event::LanNoLink
         )
     }
 
-    /// つながっている間の観戦コードのコピー（Ctrl+C）の結果か。メニューの状況の行ではなく左上の知らせ（`copy_notice`）に出す。
+    /// 接続している間の観戦コードのコピー（Ctrl+C）の結果か。メニューの状況の行ではなく左上の知らせ（`copy_notice`）に出す。
     pub fn is_copy_result(self) -> bool {
         matches!(
             self,
-            Event::SpectateCodeCopied | Event::SpectateCodeHostOnly | Event::SpectateCodeClipWrite
+            Event::SpectateCodeCopied
+                | Event::SpectateCodeHostOnly
+                | Event::SpectateCodeClipWrite
+                | Event::SpectateCodePeerOff
         )
     }
 }
 
-/// つながっている間（見つかった・つながった・マッチの中）に左上へ出す、観戦コードのコピーの結果の 1 行。結果でない出来事は `None`。
+/// 接続している間（見つかった・接続した・マッチの中）に左上へ出す、観戦コードのコピーの結果の 1 行。結果でない出来事は `None`。
 pub fn copy_notice(event: Event, lang: Lang) -> Option<(&'static str, RowStyle)> {
     match event {
         Event::SpectateCodeCopied => Some((T_SPECTATE_CODE_COPIED.get(lang), RowStyle::Normal)),
@@ -981,6 +1015,7 @@ pub fn copy_notice(event: Event, lang: Lang) -> Option<(&'static str, RowStyle)>
         Event::SpectateCodeClipWrite => {
             Some((T_SPECTATE_CODE_COPY_FAILED.get(lang), RowStyle::Warn))
         }
+        Event::SpectateCodePeerOff => Some((T_SPECTATE_CODE_PEER_OFF.get(lang), RowStyle::Normal)),
         _ => None,
     }
 }
@@ -988,6 +1023,11 @@ pub fn copy_notice(event: Event, lang: Lang) -> Option<(&'static str, RowStyle)>
 /// ホストへの案内の 1 行（「Ctrl+C で観戦コードをコピーできます。」）。
 pub fn copy_hint(lang: Lang) -> &'static str {
     T_SPECTATE_CODE_HINT.get(lang)
+}
+
+/// 自分は観戦を許可し、相手が許可していない対戦者へ、`copy_hint` の代わりに出す 1 行（`Conn::Connected::watch_off`）。
+pub fn watch_off_hint(lang: Lang) -> &'static str {
+    T_SPECTATE_PEER_OFF.get(lang)
 }
 
 /// ルーム名を画面に出す文字数（UTF-16 の単位）。ルーム名は揃えて 32 文字までだが、左上の行の幅に収めるため 16 文字で切り、切ったら最後の文字を `…` にする（`sanitize_room`）。
@@ -1317,30 +1357,32 @@ impl IniNotice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conn {
-    /// まだつながっていない。
+    /// まだ接続していない。
     Waiting,
-    /// つながった（対戦が成立した。`code_side = game` 以外の実行は、つながったときに成立している）。席と、ホスト役か（遅れの量を決める側）と、形（モードと、rollback なら D・delay 方式なら今の遅れ。ホストの画面ではホストが選んだ値。無ければ None）。
+    /// 接続した（対戦が成立した。`code_side = game` 以外の実行は、接続したときに成立している）。席と、ホスト役か（遅れの量を決める側）と、形（モードと、rollback なら D・delay 方式なら今の遅れ。ホストの画面ではホストが選んだ値。無ければ None）。
+    /// `watch_off` は、自分は観戦を許可しているが相手が許可していない（この試合は観戦できない）。
     Connected {
         seat: Seat,
         host: bool,
         shape: Option<(Mode, u8)>,
+        watch_off: bool,
     },
-    /// つながったが、対戦はまだ成立していない（両者が「妖怪 対 妖怪」を選ぶまで。`match_gate`。`code_side = game` の実行だけ）。`ready` は自分がもう選んだか、`left_secs` は成立しないまま閉じるまでの残り（秒）。
+    /// 接続したが、対戦はまだ成立していない（両者が「妖怪 対 妖怪」を選ぶまで。`match_gate`。`code_side = game` の実行だけ）。`ready` は自分がもう選んだか、`left_secs` は成立しないまま閉じるまでの残り（秒）。
     Found {
         seat: Seat,
         shape: Option<(Mode, u8)>,
         ready: bool,
         left_secs: u32,
     },
-    /// つながらないままネットワークが終わった。マッチの外へ戻るとネットワークの組を片づけて「つなぐ前」（`Waiting`）へ戻る（起動し直さずにつなぎ直せる。下の 3 つも同じ）。
+    /// 接続できないままネットワークが終わった。マッチの外へ戻るとネットワークの組を片づけて「接続する前」（`Waiting`）へ戻る（起動し直さずに接続し直せる。下の 3 つも同じ）。
     Ended,
-    /// つながって遊んだ後、ネットワークが終わった（相手が抜けた・沈黙）。
+    /// 接続して遊んだ後、ネットワークが終わった（相手が抜けた・沈黙）。
     Finished,
-    /// つながったが、成立しないまま閉じた。理由は `match_gate::NoMatch`。
+    /// 接続したが、成立しないまま閉じた。理由は `match_gate::NoMatch`。
     Unmatched(NoMatch),
-    /// 相手の HiganRTool のバージョンが違うので、つながる前にネットワークが終わった（`handshake::FailReason::OtherVersion`。`theirs` は相手のバージョン、自分のバージョンは `wire::PROTO_VER`）。
+    /// 相手の HiganRTool のバージョンが違うので、接続する前にネットワークが終わった（`handshake::FailReason::OtherVersion`。`theirs` は相手のバージョン、自分のバージョンは `wire::PROTO_VER`）。
     OtherVersion { theirs: u8 },
-    /// 相手のビルドが違うので、つながる前にネットワークが終わった（`handshake::FailReason::OtherBuild`。`theirs` は相手のビルド番号、自分は `update::BUILD_NUMBER`）。
+    /// 相手のビルドが違うので、接続する前にネットワークが終わった（`handshake::FailReason::OtherBuild`。`theirs` は相手のビルド番号、自分は `update::BUILD_NUMBER`）。
     OtherBuild { theirs: u32 },
     /// マッチの最中に CHECK が食い違い（自分が見つけた・相手の BYE(同期ズレ) を受けた）、そのマッチを止めている間。ゲームの更新を進めず、Esc を待つ（Esc で止めたままネットワークを閉じてゲームの入力へ戻す。戻った後は `Finished`）。
     /// `is_end` は偽: 片づけた後のメニューの場面に「Esc でメニューへ」を残さない。
@@ -1352,7 +1394,7 @@ impl Conn {
         matches!(self, Conn::Connected { .. } | Conn::Found { .. })
     }
 
-    /// ネットワークが終わった状態か（つながらないまま・遊んだ後・成立しないまま・バージョン違い）。ゲーム内のメニューは、ネットワークの組を片づけた後もこの行を左上に残す。
+    /// ネットワークが終わった状態か（接続できないまま・遊んだ後・成立しないまま・バージョン違い）。ゲーム内のメニューは、ネットワークの組を片づけた後もこの行を左上に残す。
     pub fn is_end(self) -> bool {
         matches!(
             self,
@@ -1372,7 +1414,7 @@ const FORMATS: [Mode; 2] = [Mode::Rollback, Mode::Delay];
 pub struct ShapeSel {
     pub mode: Mode,
     pub delay: DelayChoice,
-    /// ini の `delay` から作った D（auto なら `rollback::DEFAULT_DELAY`）。遅延が auto のとき rollback の AGREE の D になる（auto はつなぐ前に D を決めない。接続の始まりにホストが旗を立てて、最初の取得で推奨値にする）。
+    /// ini の `delay` から作った D（auto なら `rollback::DEFAULT_DELAY`）。遅延が auto のとき rollback の AGREE の D になる（auto は接続する前に D を決めない。接続の始まりにホストが旗を立てて、最初の取得で推奨値にする）。
     ini_delay: u8,
     /// メニューで変えたか（変えていなければ見張りへ指示を出さず、ini の形のまま）。
     pub touched: bool,
@@ -1439,7 +1481,7 @@ pub enum Item {
     Room,
     /// 観戦の「ランダムマッチ」（進行中のランダムマッチの一覧の画面へ入る。観戦の先頭。待ちが何も動いていない間だけ）。
     SpectateRandom,
-    /// 観戦の「観戦コード入力」（ルームサーバーを使わず、クリップボードの観戦コードでホストへ直に繋ぐ。`room_server` が無くても出す）。
+    /// 観戦の「観戦コード入力」（ルームサーバーを使わず、クリップボードの観戦コードでホストへ直に接続する。`room_server` が無くても出す）。
     SpectateCode,
     /// 観戦の「ルームマッチ」（待ちが何も動いていない間だけ）。
     Spectate,
@@ -1453,9 +1495,9 @@ pub enum Item {
     Format,
     /// 「ディレイ　◀ auto ▶」（設定。並びは auto, 0F, 1F, …, 8F）。
     Delay,
-    /// 「サイド　◀ 1P ▶」（席の希望。待ち・つながりの最中は出さない: 名乗る希望は相手のコードを読んだときに決まるので、待ちの最中に変えると効くか効かないかが相手の来る時刻で揺れる）。
+    /// 「サイド　◀ 1P ▶」（席の希望。待ち・接続の最中は出さない: 名乗る希望は相手のコードを読んだときに決まるので、待ちの最中に変えると効くか効かないかが相手の来る時刻で揺れる）。
     Seat,
-    /// 「プレイヤー名　<今の名前>」（プレイヤー名の入力へ入る。待ち・つながりの最中は出さない）。
+    /// 「プレイヤー名　<今の名前>」（プレイヤー名の入力へ入る。待ち・接続の最中は出さない）。
     Name,
     /// 「言語　◀ 日本語 ▶」（設定。← → で替わると、その tick から画面の文字が替わる）。
     Lang,
@@ -1533,7 +1575,7 @@ impl Item {
     }
 }
 
-/// 「ランダムマッチ」「ルームマッチ」の項目を出すか（ini の `room_server` から決まる。呼び手が `Menu::with_room` で置く）。
+/// 「ランダムマッチ」「ルームマッチ」の項目を出すか（ini の `room_server` から決まる。呼び手が `Menu::with_room` で渡す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoomItem {
     #[default]
@@ -1548,9 +1590,9 @@ pub enum Cmd {
     Random,
     /// ルームサーバーのルームで相手を待つ（ルーム名は入力で決めた名。文字の決まり `RoomName::parse` を通っている）。
     Room(RoomBuf),
-    /// 観戦者として、観戦用のルーム（対戦者が同じ名で対戦の「ルームマッチ」を選んで繋いだマッチの配る側が入るルーム）で待つ。観戦者のセッションを置く・ルームへ入るのは受け取る側。
+    /// 観戦者として、観戦用のルーム（対戦する側が同じ名で対戦の「ルームマッチ」を選んで接続したマッチの配る側が入るルーム）で待つ。観戦者のセッションを設定する・ルームへ入るのは受け取る側。
     Spectate(RoomBuf),
-    /// 観戦の「ランダムマッチ」の一覧から選んだ行。観戦用のルーム名は行のハッシュから導く。受け取る側は一覧の接続を閉じ、`Spectate` と同じに観戦者のセッションを置く。
+    /// 観戦の「ランダムマッチ」の一覧から選んだ行。観戦用のルーム名は行のハッシュから導く。受け取る側は一覧の接続を閉じ、`Spectate` と同じに観戦者のセッションを設定する。
     SpectateListed(WatchRow),
     /// 設定の「ルーム名」を決めた（ルームへは入らない）。受け取る側は、ini の `room` へ書く（次の起動のルーム名の初めの値になる。ゲームのスレッドでは書かない）。
     RoomSet(RoomBuf),
@@ -1560,11 +1602,11 @@ pub enum Cmd {
     LanClient(LanAddr),
     /// LAN の観戦: 打ったホストのアドレスへ観戦を申し込む（`LanClient` と同じに ini へ書く）。
     LanWatch(LanAddr),
-    /// 観戦の待機をやめる。受け取る側は観戦の待ちをやめ、セッションを元へ戻せるなら `CodeState::Idle`、戻さないなら `CodeState::SpectateIdle` を状態に置く。
+    /// 観戦の待機をやめる。受け取る側は観戦の待ちをやめ、セッションを元へ戻せるなら `CodeState::Idle`、戻さないなら `CodeState::SpectateIdle` を状態にする。
     SpectateCancel,
-    /// 観戦コード入力: クリップボードの観戦コード（種別 3）を読み、ルームを使わずにホストへ直に繋ぐ。観戦者のセッションを置くのは受け取る側。
+    /// 観戦コード入力: クリップボードの観戦コード（種別 3）を読み、ルームを使わずにホストへ直に接続する。観戦者のセッションを設定するのは受け取る側。
     SpectateCode,
-    /// 観戦コードをコピー（Ctrl+C。見つかった・つながった間に、`NetUi::copy_tick` が押した瞬間に 1 回送る）: ホストなら観戦コードを作り直してクリップボードへ書く。ゲストは書かない（`Event::SpectateCodeHostOnly`）。
+    /// 観戦コードをコピー（Ctrl+C。見つかった・接続した間に、`NetUi::copy_tick` が押した瞬間に 1 回送る）: ホストなら観戦コードを作り直してクリップボードへ書く。ゲストは書かない（`Event::SpectateCodeHostOnly`）。
     CopySpectateCode,
     Create,
     /// クリップボードを読む（自分のコードがまだ無ければ返す側として、あれば相手の返すコードとして）。
@@ -1572,9 +1614,9 @@ pub enum Cmd {
     Cancel,
     /// プレイヤー名を決めた（文字の決まり `NameBuf::parse` を通っている）。受け取る側は、次に開くネットワーク・次に作る接続コードからこの名前で名乗り、ini の `name` へ書く（ゲームのスレッドでは書かない）。
     Name(NameBuf),
-    /// 同期方式か遅延を変えた（つなぎ始める前なら次の接続に効く）。前半は名乗る形（rollback の D も入る）、後半は遅延の選び（auto か 0〜8。接続の始まりにホストが押下にする）。どちらの行を変えても両方を送る（指示は 1 tick に 1 つ）。
+    /// 同期方式か遅延を変えた（接続し始める前なら次の接続に効く）。前半は名乗る形（rollback の D も入る）、後半は遅延の選び（auto か 0〜8。接続の始まりにホストが押下にする）。どちらの行を変えても両方を送る（指示は 1 tick に 1 つ）。
     Shape(Pick, DelayChoice),
-    /// 席の希望を変えた（次の接続に効く。受け取る側は相手のコードを読んでセッションの設定を置くときに読む）。
+    /// 席の希望を変えた（次の接続に効く。受け取る側は相手のコードを読んでセッションを設定するときに読む）。
     Seat(SeatWish),
     /// 画面の言語を替えた。受け取る側は今の言語を更新し、次の起動のために ini の `[ui] lang` へ書く（ゲームのスレッドでは書かない）。
     Lang(Lang),
@@ -1616,7 +1658,7 @@ pub struct TickIn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
-    /// はい: 対戦を終える（呼び手が BYE を送る）。取消はメニューを閉じた後でゲームへ通す（`Menu::take_pending_cancel`）。
+    /// はい: 対戦を終える（呼び手が BYE を相手へ送る）。取消はメニューを閉じた後でゲームへ通す（`Menu::take_pending_cancel`）。
     Leave,
     Stay,
 }
@@ -1633,7 +1675,7 @@ pub struct TickOut {
 enum State {
     Closed,
     Open,
-    /// 確かめの枠「対戦から抜けますか？」（`open_confirm`。つながった後、難易度の画面より前へ戻ろうとしたとき）。
+    /// 確認の枠「対戦から抜けますか？」（`open_confirm`。接続した後、難易度の画面より前へ戻ろうとしたとき）。
     Confirm,
     /// 「設定」の画面（プレイヤー名・サイド・同期方式・ディレイ・言語。入口のメニューの 1 つ下の階層）。
     Settings,
@@ -1641,7 +1683,7 @@ enum State {
     RoomName,
     /// 観戦の「ランダムマッチ」の一覧（進行中のランダムマッチから選ぶ。一覧は呼び手が毎 tick 渡す）。
     WatchList,
-    /// 閉じ始めた。語が 0 になるまで（か `CLOSE_MAX_TICKS`）ゲームへ 0 を流す。数は経った tick。
+    /// 閉じ始めた。語が 0 になるまで（か `CLOSE_MAX_TICKS`）呼び手がゲームへ 0 を流す。数は経った tick。
     Closing(u32),
 }
 
@@ -1671,12 +1713,12 @@ pub struct Menu {
     state: State,
     cursor: usize,
     shape: ShapeSel,
-    /// 席の希望（`with_seat`。置かなければ「サイド」の項目を出さない）。
+    /// 席の希望（`with_seat`。渡さなければ「サイド」の項目を出さない）。
     seat: Option<SeatWish>,
     prev: u16,
-    /// 確かめの枠で「はい」と答えた後、メニューを閉じ終えたらゲームへ通す取消が残っている。
+    /// 確認の枠で「はい」と答えた後、メニューを閉じ終えたらゲームへ通す取消が残っている。
     pending_cancel: bool,
-    /// 見張りのネットワークがまだ開いていない（最初の操作で開く。開く間は「準備しています」を出す。呼び手が毎 tick 置く）。
+    /// 見張りのネットワークがまだ開いていない（最初の操作で開く。開く間は「準備しています」を出す。呼び手が毎 tick 設定する）。
     opening: bool,
     /// 「ルームマッチ」の項目（`with_room`。`On` の中身は入力の初めの値）。
     room: RoomItem,
@@ -1688,7 +1730,7 @@ pub struct Menu {
     /// Enter の文字（`WM_CHAR` の 0x0D）を決定として読んでよいか。入力を開いたときは false で、ゲームの語の決定のビット（`DECIDE_BITS`）が 0 の tick を 1 回見たら true（決めた Enter を離したのを見てから）。
     /// 「ルームマッチ」を決めた Enter の文字が遅れて届くのも、押したままのキーの自動繰り返しの文字も、その Enter が押されている間に来るので、tick の数の猶予でなく離したことを条件にして 1 つで塞ぐ。文字そのもの（Enter 以外）は armed でなくても受ける。
     enter_armed: bool,
-    /// ウィンドウから文字を受ける仕組みが使えない（呼び手が置く。入力の画面に断りの行を出す）。
+    /// ウィンドウから文字を受ける仕組みが使えない（呼び手が設定する。入力の画面に断りの行を出す）。
     text_unavailable: bool,
     /// 入力から戻った後、ゲームの語が全部離れるまで押下を読まない（決めた Enter の語の立ち上がりが遅れて届いて、戻った先の項目「ルームマッチ」をもう一度決めてしまわないため）。数は待った tick（`CLOSE_MAX_TICKS` で切る）。
     quiet: Option<u32>,
@@ -1700,13 +1742,13 @@ pub struct Menu {
     lan_addr: AddrBuf,
     addr_edit: AddrInput,
     addr_err: Option<AddrWhy>,
-    /// 自分の PC の VPN のネットワーク。打ったアドレスがこの中なら LAN のアドレスとして受ける（呼び手が入力の間に置く）。
+    /// 自分の PC の VPN のネットワーク。打ったアドレスがこの中なら LAN のアドレスとして受ける（呼び手が入力の間に設定する）。
     vpn: VpnSet,
-    /// 画面の言語（呼び手が `with_lang` で置く。「言語」の行で替えると自分で更新し、`Cmd::Lang` を返す）。
+    /// 画面の言語（呼び手が `with_lang` で渡す。「言語」の行で替えると自分で更新し、`Cmd::Lang` を返す）。
     lang: Lang,
-    /// 開いた直後で、カーソルをまだ初めの項目（先頭の「ランダムマッチ」。ルームサーバーが無ければ「コード作成」）へ置いていない。
+    /// 開いた直後で、カーソルをまだ初めの項目（先頭の「ランダムマッチ」。ルームサーバーが無ければ「コード作成」）へ合わせていない。
     home: bool,
-    /// `home` のとき、カーソルを初めの項目でなく「設定」へ置く（プレイヤー名が既定のまま、起動して最初に開いたときだけ）。
+    /// `home` のとき、カーソルを初めの項目でなく「設定」へ合わせる（プレイヤー名が既定のまま、起動して最初に開いたときだけ）。
     land_on_settings: bool,
     /// 一度でも開いた（`open` を呼んだ）か。
     opened_before: bool,
@@ -1839,7 +1881,7 @@ impl Menu {
         self
     }
 
-    /// 自分の PC の VPN のネットワークを置く（打ったアドレスを受けるかの判定が使う）。
+    /// 自分の PC の VPN のネットワークを設定する（打ったアドレスを受けるかの判定が使う）。
     pub fn set_vpn(&mut self, vpn: VpnSet) {
         self.vpn = vpn;
     }
@@ -1957,7 +1999,7 @@ impl Menu {
         self.cursor = 0;
     }
 
-    /// 「設定」の画面から入口のメニューへ戻る。カーソルは「設定」の行に置く。
+    /// 「設定」の画面から入口のメニューへ戻る。カーソルは「設定」の行に合わせる。
     fn leave_settings(&mut self) {
         self.state = State::Open;
         self.home = false;
@@ -1969,7 +2011,7 @@ impl Menu {
         self.name.is_some_and(|n| n.is_default())
     }
 
-    /// 確かめの枠を開く（つながった後、難易度の画面より前へ戻ろうとした取消を飲み込んだとき）。初めの項目は「いいえ」（間違えて決定しても何も起きない側）。`held` は開く tick の語。
+    /// 確認の枠を開く（接続した後、難易度の画面より前へ戻ろうとした取消を飲み込んだとき）。初めの項目は「いいえ」（間違えて決定しても何も起きない側）。`held` は開く tick の語。
     pub fn open_confirm(&mut self, held: u16) {
         self.state = State::Confirm;
         self.cursor = 1;
@@ -2012,7 +2054,7 @@ impl Menu {
         self.state != State::Closed
     }
 
-    /// 入口のメニューが開いている（閉じ始め・確かめの枠は含まない）。つながった瞬間にこれが真の側は「妖怪 対 妖怪」を選んだものとして待つ。
+    /// 入口のメニューが開いている（閉じ始め・確認の枠は含まない）。接続した瞬間にこれが真の側は「妖怪 対 妖怪」を選んだものとして待つ。
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
@@ -2256,7 +2298,7 @@ impl Menu {
         }
         push(Item::Create);
         push(Item::Paste);
-        // 観戦コードと LAN はルームサーバーを使わない（サーバーに繋がらないときの口）ので、`room_server` が無くても出す。
+        // 観戦コードと LAN はルームサーバーを使わない（サーバーに接続できないときの口）ので、`room_server` が無くても出す。
         if state == CodeState::Idle {
             push(Item::SpectateCode);
         }
@@ -2274,7 +2316,7 @@ impl Menu {
         (v, n)
     }
 
-    /// 今の項目の並びに合わせたカーソルの位置。開いた直後は先頭の項目へ置く（プレイヤー名が既定のまま最初に開いたときだけ「設定」）。
+    /// 今の項目の並びに合わせたカーソルの位置。開いた直後は先頭の項目へ合わせる（プレイヤー名が既定のまま最初に開いたときだけ「設定」）。
     /// 行が出入りしたときは、前に指していた項目の今の位置へ動かして、同じ項目に残す（その項目が消えたら元の位置の近く）。
     fn settled_cursor(&self, items: &Items) -> usize {
         let (list, n) = items;
@@ -2958,7 +3000,7 @@ fn lan_scroll_len(conn: Conn, note: &Note) -> usize {
     }
 }
 
-/// アドレス `n` 個の窓の先頭の行。カーソルの行が窓に入るようにする。
+/// アドレス `n` 個のウィンドウの先頭の行。カーソルの行がウィンドウに入るようにする。
 fn lan_view(n: usize, row: Option<usize>, top: usize) -> usize {
     let mut top = top.min(n.saturating_sub(LAN_VISIBLE));
     if let Some(r) = row {
@@ -3033,7 +3075,7 @@ fn wait_origin(note: &Note, now: u64) -> Option<(Item, u64)> {
     }
 }
 
-/// 「ラベル」の後ろに、見出しの中でいちばん長いラベル（`widest` 枠）との差を空白で埋め、区切りを置く。
+/// 「ラベル」の後ろに、見出しの中でいちばん長いラベル（`widest` 枠）との差を空白で埋め、区切りを入れる。
 /// 全角の文字のラベルは全角の空白（2 枠）、半角のラベルは半角の空白（1 枠）で埋める: どちらも文字と同じ幅で進むので、
 /// ゲームの文字（半角 9 画素）でも GDI の文字（半角 7 画素）でも値の始まりが揃う。
 fn push_label(line: &mut LineBuf, lang: Lang, label: Tx, widest: u32) {
@@ -3430,11 +3472,36 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
         Event::SpectateCancelled => line(&mut |l| {
             l.push_str(T_SPECTATE_CANCELLED.get(lang));
         }),
+        Event::SpectateBufferFull => line(&mut |l| {
+            l.push_str(T_SPECTATE_BUFFER_FULL.get(lang));
+        }),
+        Event::SpectateFullEnded => line(&mut |l| {
+            l.push_str(T_SPECTATE_FULL_ENDED.get(lang));
+        }),
+        Event::SpectateFull => {
+            line(&mut |l| {
+                l.push_str(T_SPECTATE_FULL.get(lang));
+            });
+            line(&mut |l| {
+                l.push_str(T_SPECTATE_UNRESPONSIVE_NEXT.get(lang));
+            });
+        }
+        Event::SpectateCodeFull => {
+            line(&mut |l| {
+                l.push_str(T_SPECTATE_FULL.get(lang));
+            });
+            line(&mut |l| {
+                l.push_str(T_SPECTATE_CODE_FULL_NEXT.get(lang));
+            });
+        }
         Event::SpectateCodeCopied => line(&mut |l| {
             l.push_str(T_SPECTATE_CODE_COPIED.get(lang));
         }),
         Event::SpectateCodeHostOnly => line(&mut |l| {
             l.push_str(T_SPECTATE_CODE_HOST_ONLY.get(lang));
+        }),
+        Event::SpectateCodePeerOff => line(&mut |l| {
+            l.push_str(T_SPECTATE_CODE_PEER_OFF.get(lang));
         }),
         Event::SpectateCodeNoLink => {
             line(&mut |l| {
@@ -3519,13 +3586,13 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
         Event::LanNoHost
         | Event::LanBusy
         | Event::LanNoMatch
-        | Event::LanWatchOff
+        | Event::WatchRefused
         | Event::LanNoLink => {
             let (first, next) = match ev {
                 Event::LanNoHost => (T_LAN_NO_HOST, T_LAN_NO_HOST_NEXT),
                 Event::LanBusy => (T_LAN_BUSY, T_LAN_BUSY_NEXT),
                 Event::LanNoMatch => (T_LAN_NO_MATCH, T_LAN_NO_MATCH_NEXT),
-                Event::LanWatchOff => (T_LAN_WATCH_OFF, T_LAN_WATCH_OFF_NEXT),
+                Event::WatchRefused => (T_WATCH_REFUSED, T_WATCH_REFUSED_NEXT),
                 _ => (T_LAN_NO_LINK, T_LAN_NO_LINK_NEXT),
             };
             line(&mut |l| {
@@ -3700,14 +3767,14 @@ const _: () = {
     }
 };
 
-/// 「対戦者「名前」につないでいます。」（メニューの状況の行と左上の行が同じ文字）。
+/// 「相手「名前」に接続しています。」（メニューの状況の行と左上の行が同じ文字）。
 fn spectate_peer_line(line: &mut LineBuf, lang: Lang, note: &Note) {
     line.clear().push_str(T_SPECTATE_PEER_OPEN.get(lang));
     push_name(line, &note.name);
     line.push_str(T_SPECTATE_PEER_CLOSE.get(lang));
 }
 
-/// 「観戦 名前 で待機中 12:34」（観戦者が、配る側がルームに来るのを待つ間。時計は待った時間 `Note::since` から）。名前の切り方は `room_waiting_line` と同じ。
+/// 「観戦 名前 で待機中 12:34」（観戦者が、配る側（対戦する側）がルームに来るのを待つ間。時計は待った時間 `Note::since` から）。名前の切り方は `room_waiting_line` と同じ。
 fn spectate_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, name_cells: u32) {
     line.clear().push_str(T_SPECTATE_OPEN.get(lang));
     push_units_within(line, &note.room, name_cells);
@@ -3716,8 +3783,8 @@ fn spectate_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, 
         .push_clock(room_waited(note, now).min(SPECTATE_CLOCK_MAX_SECS));
 }
 
-/// 観戦者の状態（`spectate_room::Joiner::status`）を、メニューが読む状態にする（見張りが `Note::state` に置く）。配る側がまだルームにいなくて入り直しを待つ間は `SpectateWaiting`、
-/// 観戦用のコードを受けて返しを出した後と成功（セッションが対戦者へつなぎに行く間）は `SpectateLinking`、それまでは `SpectateJoining`。終わった（失敗・やめた）後は `SpectateIdle`（セッションを元へ戻せたなら呼び手が `Idle` に置き直す）。
+/// 観戦者の状態（`spectate_room::Joiner::status`）を、メニューが読む状態にする（見張りが `Note::state` に書く）。配る側（対戦する側）がまだルームにいなくて入り直しを待つ間は `SpectateWaiting`、
+/// 観戦用のコードを受けて配る側へ返しを出した後と成功（セッションが対戦する側へ接続しに行く間）は `SpectateLinking`、それまでは `SpectateJoining`。終わった（失敗・やめた）後は `SpectateIdle`（セッションを元へ戻せたなら呼び手が `Idle` に戻す）。
 pub fn spectate_state_of(s: &JoinerStatus) -> CodeState {
     if s.waiting_for_caster() {
         return CodeState::SpectateWaiting;
@@ -3731,7 +3798,7 @@ pub fn spectate_state_of(s: &JoinerStatus) -> CodeState {
     }
 }
 
-/// 観戦者が失敗で終わった理由を、画面の出来事と、バージョン違いのときの相手のバージョン（`Note::peer_ver`）・ビルド違いのときの相手のビルド（`Note::peer_build`）にする（違い以外は 0）。見張りが `Note::event` に置く。
+/// 観戦者が失敗で終わった理由を、画面の出来事と、バージョン違いのときの相手のバージョン（`Note::peer_ver`）・ビルド違いのときの相手のビルド（`Note::peer_build`）にする（違い以外は 0）。見張りが `Note::event` に書く。
 pub fn spectate_failure_event(f: JoinerFailure) -> (Event, u8, u32) {
     use crate::code::CodeError;
     match f {
@@ -3746,6 +3813,7 @@ pub fn spectate_failure_event(f: JoinerFailure) -> (Event, u8, u32) {
         JoinerFailure::CodeUnreadable(_) => (Event::SpectateBadCode, 0, 0),
         JoinerFailure::ReplyNotSent => (Event::SpectateNoLink, 0, 0),
         JoinerFailure::GaveUp => (Event::SpectateGaveUp, 0, 0),
+        JoinerFailure::Refused => (Event::WatchRefused, 0, 0),
     }
 }
 
@@ -3858,7 +3926,7 @@ fn unmatched_line(line: &mut LineBuf, lang: Lang, why: NoMatch) {
     }
 }
 
-/// メニューの下半分の状況の行（最大 `STATUS_ROWS`）。つながった・終わった状態は、その行だけ。戻りは行数。
+/// メニューの下半分の状況の行（最大 `STATUS_ROWS`）。接続した・終わった状態は、その行だけ。戻りは行数。
 fn status_lines(
     conn: Conn,
     note: &Note,
@@ -3869,7 +3937,9 @@ fn status_lines(
     warn: &mut [bool; STATUS_ROWS],
 ) -> usize {
     match conn {
-        Conn::Connected { seat, host, shape } => {
+        Conn::Connected {
+            seat, host, shape, ..
+        } => {
             connected_line(&mut out[0], lang, seat, host, shape);
             warn[0] = false;
             1
@@ -4037,14 +4107,14 @@ pub fn corner_is_band(conn: Conn, note: &Note, stall: Option<Stall>) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallWhy {
-    /// 10 秒のあいだ 1 通も届かなかった（`FailReason::NothingReceived`）。自分のコードへの跳ね返り（`FailReason::SameNonce`）も、相手からは何も届いていないので同じ扱いにする。
+    /// 10 秒のあいだ相手から 1 通も届かなかった（`FailReason::NothingReceived`）。自分のコードへの跳ね返り（`FailReason::SameNonce`）も、相手からは何も届いていないので同じ扱いにする。
     NothingReceived,
     NoHandshake,
-    /// 作り直しの前に、相手のコードを読んだ時点で両方が直接つなげない型と分かった予告（`Stall::predicted`）。手順は止めずに続ける（予測が外れることがある）。
+    /// 作り直しの前に、相手のコードを読んだ時点で両方が直接接続できない型と分かった予告（`Stall::predicted`）。手順は止めずに続ける（予測が外れることがある）。
     Predicted,
 }
 
-/// 接続の手順が 1 回以上時間切れになって作り直されている間（か、両方が直接つなげない型と分かった間）の、左上の警告の材料（`stall_block`）。
+/// 接続の手順が 1 回以上時間切れになって作り直されている間（か、両方が直接接続できない型と分かった間）の、左上の警告の材料（`stall_block`）。
 /// 作り直しが 0 回の間は `None`（今の小さい文字の 1 行のまま）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stall {
@@ -4082,14 +4152,14 @@ enum StallRoute {
     Room,
 }
 
-/// 警告を出す場面か。セッションが今の相手へつなぎに行っている場面だけ（接続コードの経路は `Replied`・`Linking`、ルームの経路は `RoomLinking`）。コードを作って返事を待つ間（`Offered`）・ルームで相手を待つ間（`RoomWaiting`）は、
-/// セッションは今の相手につなぎに行っていない（候補の無いセッションや、前の相手のセッションの作り直しの数が残っているだけ）ので、偽の警告を出さず帯の 1 行のまま。取りやめた後（`Idle`）・ルームに入る前（`RoomJoining`）も出さない。
+/// 警告を出す場面か。セッションが今の相手へ接続しに行っている場面だけ（接続コードの経路は `Replied`・`Linking`、ルームの経路は `RoomLinking`）。コードを作って返事を待つ間（`Offered`）・ルームで相手を待つ間（`RoomWaiting`）は、
+/// セッションは今の相手に接続しに行っていない（候補の無いセッションや、前の相手のセッションの作り直しの数が残っているだけ）ので、偽の警告を出さず帯の 1 行のまま。取りやめた後（`Idle`）・ルームに入る前（`RoomJoining`）も出さない。
 fn stall_route(note: &Note, stall: Option<Stall>) -> Option<(Stall, StallRoute)> {
     let st = stall?;
     match note.state {
         CodeState::Replied | CodeState::Linking => Some((st, StallRoute::Code)),
         CodeState::RoomLinking => Some((st, StallRoute::Room)),
-        // 観戦者は対戦者のセッションの「作り直しの数」を持たない。
+        // 観戦者は対戦する側のセッションの「作り直しの数」を持たない。
         CodeState::Offered
         | CodeState::RoomWaiting
         | CodeState::LanWaiting
@@ -4103,7 +4173,7 @@ fn stall_route(note: &Note, stall: Option<Stall>) -> Option<(Stall, StallRoute)>
     }
 }
 
-/// 相手から届いているのにつながらないとき（`StallWhy::NoHandshake`）で、型からは原因が言えないときの 3 行（理由・次にすること・README の項）。
+/// 相手から届いているのに接続できないとき（`StallWhy::NoHandshake`）で、型からは原因が言えないときの 3 行（理由・次にすること・README の項）。
 fn stall_pair(out: &mut [LineBuf], lang: Lang, note: &Note, now: u64, route: StallRoute) -> usize {
     let [l0, l1, l2, ..] = out else {
         return 0;
@@ -4131,7 +4201,7 @@ fn stall_pair(out: &mut [LineBuf], lang: Lang, note: &Note, now: u64, route: Sta
     3
 }
 
-/// つながらなかったときの文（見出し・理由・次にすること・README の項の行）。戻りは行数。
+/// 接続できなかったときの文（見出し・理由・次にすること・README の項の行）。戻りは行数。
 fn fail_block(out: &mut [LineBuf; STALL_ROWS], lang: Lang, fail: FailKind) -> usize {
     let (head, lines, reference): (Tx, [Option<Tx>; 3], Tx) = match fail {
         FailKind::Unknown => (
@@ -4169,10 +4239,10 @@ fn fail_block(out: &mut [LineBuf; STALL_ROWS], lang: Lang, fail: FailKind) -> us
 /// 警告の最大の行数（見出し・理由・次にすること 2 行・README の項）。
 pub const STALL_ROWS: usize = 5;
 
-/// 接続の手順が時間切れで作り直されている間（か、両方が直接つなげないと分かった間）の左上の警告。ゲームの文字の最大 `STALL_ROWS` 行で、全部 `RowStyle::Warn`。
+/// 接続の手順が時間切れで作り直されている間（か、両方が直接接続できないと分かった間）の左上の警告。ゲームの文字の最大 `STALL_ROWS` 行で、全部 `RowStyle::Warn`。
 /// 戻りは行数。警告の場面でなければ 0 で、そのとき左上は `corner_lines` が決める（`corner_lines` はこの場面で 0 を返す）。
 ///
-/// 文は `nat::FailKind` の 4 通り。ただし相手から届いているのにつながらない（`StallWhy::NoHandshake`）で型から原因が言えないときは、
+/// 文は `nat::FailKind` の 4 通り。ただし相手から届いているのに接続できない（`StallWhy::NoHandshake`）で型から原因が言えないときは、
 /// 「届きません」と言うと事実と違うので、別の 3 行（理由・待った時間と次にすること・README の 5）。
 pub fn stall_block(
     conn: Conn,
@@ -4224,8 +4294,8 @@ pub fn return_lines(
     2
 }
 
-/// 左上に出す行（メニューを閉じている間。最大 2 行）。戻りは行数。成立していれば 1 行（つながった行。成立したら両者が自動で難易度の画面まで進む（`ui_entry::advance`）ので次にすることは出さない）、
-/// つながったが成立の前なら 2 行（見つかった・待っている行と、次にすること）、待っているなら 1 行（待った時間。置き場は `corner_is_band`）、終わっていれば 2 行。何も無ければ 0。
+/// 左上に出す行（メニューを閉じている間。最大 2 行）。戻りは行数。成立していれば 1 行（接続した行。成立したら両者が自動で難易度の画面まで進む（`ui_entry::advance`）ので次にすることは出さない）、
+/// 接続したが成立の前なら 2 行（見つかった・待っている行と、次にすること）、待っているなら 1 行（待った時間。置き場は `corner_is_band`）、終わっていれば 2 行。何も無ければ 0。
 /// 待っている間でも、接続の手順が時間切れで作り直されていれば（`stall` が `Some`）警告の 2 行（`stall_lines`）。
 pub fn corner_lines(
     conn: Conn,
@@ -4239,7 +4309,9 @@ pub fn corner_lines(
     out[0].clear();
     out[1].clear();
     match conn {
-        Conn::Connected { seat, host, shape } => {
+        Conn::Connected {
+            seat, host, shape, ..
+        } => {
             connected_line(&mut out[0], lang, seat, host, shape);
             styles[0] = RowStyle::Normal;
             1
@@ -4437,7 +4509,7 @@ pub fn hud_line(line: &mut LineBuf, lang: Lang, h: &HudView) {
     }
 }
 
-/// 観戦者の行に出す、対戦者 2 人の間の状態（観戦の流れの `Stats` の記録の最新の値）。
+/// 観戦者の行に出す、対戦する 2 人の間の状態（観戦の流れの `Stats` の記録の最新の値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerStats {
     pub ping_ms: Option<u16>,
@@ -4457,7 +4529,7 @@ impl PeerStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WatchHudView {
-    /// ホストが流した対戦者 2 人の間の状態（最新の値。まだ受けていなければ `None` で、前半を出さない）。
+    /// ホストが流した対戦する 2 人の間の状態（最新の値。まだ受けていなければ `None` で、前半を出さない）。
     pub stats: Option<PeerStats>,
     /// 使う直前に溜まっていたマッチのフレームの数（直近の期間の最大）。
     pub delay_frames: u32,
@@ -4501,7 +4573,7 @@ pub fn watch_hud_line(line: &mut LineBuf, lang: Lang, h: &WatchHudView) {
         line.push_str(T_HUD_WATCH_FF.get(lang));
     }
 }
-/// 対戦中の名前の帯の 1 行: 1P は「1P 名前」（上の枠の左）、2P は「名前 2P」（上の枠の右。右寄せ）。`name` は HELLO で交換した名前（UTF-8 の 32 バイトまで）。制御文字は `?` にする。
+/// 試合中の名前の帯の 1 行: 1P は「1P 名前」（上の枠の左）、2P は「名前 2P」（上の枠の右。右寄せ）。`name` は HELLO で交換した名前（UTF-8 の 32 バイトまで）。制御文字は `?` にする。
 /// 長さは文字の枠の数（半角 1・全角 2。`overlay::glyph_cells`）で `HUD_NAME_CELLS` までに切る（ラベルは残す: 右の帯は右寄せなので、後ろ（ラベル）を切ると席が読めなくなる）。
 /// 表に無い全角の文字は描くと 1 枠の `?` になるので、枠の数は多めに見積もる向き。
 pub fn name_band_line(line: &mut LineBuf, lang: Lang, seat: Seat, name: &[u8]) {
@@ -4755,6 +4827,7 @@ mod tests {
             seat: Seat::P1,
             host: false,
             shape: Some((Mode::Rollback, 1)),
+            watch_off: false,
         };
         let out = d.m.tick(&input(Z, quiet(), d.conn));
         assert!(out.hold_game, "つながった tick もゲームへ返さない");
@@ -4812,6 +4885,7 @@ mod tests {
                 seat: Seat::P1,
                 host: false,
                 shape: None,
+                watch_off: false,
             },
             Conn::Found {
                 seat: Seat::P1,
@@ -4841,7 +4915,11 @@ mod tests {
         let got: Vec<&str> = lines[..k].iter().map(LineBuf::as_str).collect();
         assert_eq!(
             got,
-            ["受け取った文字数 77 文字", T_SPENT.ja, T_EXPIRED_NEXT.ja],
+            [
+                "貼り付けたコードの文字数 77 文字",
+                T_SPENT.ja,
+                T_EXPIRED_NEXT.ja
+            ],
             "前のつながりのコードの断り"
         );
         assert!(warn[..k].iter().all(|w| *w));
@@ -5132,10 +5210,37 @@ mod tests {
             )
         );
         assert_eq!(
+            lines(Event::SpectateCodePeerOff, Lang::Ja),
+            (
+                vec!["相手が観戦を許可していないので、観戦コードは作成できません。".to_string()],
+                vec![false]
+            )
+        );
+        // 観戦者への断り（LAN・ルームマッチで同じ文。どちらが許可していないかは出さない）。
+        assert_eq!(
+            lines(Event::WatchRefused, Lang::Ja),
+            (
+                vec![
+                    "この試合は観戦できません（2人のどちらかが観戦を許可していません）。"
+                        .to_string(),
+                    "2人にHiganRTool.iniの[spectate]のenableを1にしてもらってください。"
+                        .to_string()
+                ],
+                vec![true, true]
+            )
+        );
+        assert_eq!(
+            lines(Event::WatchRefused, Lang::En).0,
+            [
+                "This match cannot be watched (one player does not allow watching).",
+                "Ask both players to set [spectate] enable to 1 in HiganRTool.ini."
+            ]
+        );
+        assert_eq!(
             lines(Event::SpectateCodeNoLink, Lang::Ja).0,
             [
                 "ホストに接続できませんでした。",
-                "同じLANにいるか、ホストのポートが開いているかを確かめてください。"
+                "同じLANにいるか、ホストのポートが開いているかをチェックしてください。"
             ]
         );
         assert_eq!(
@@ -5167,7 +5272,7 @@ mod tests {
                 assert!(l[1].contains(item.get(lang)), "{ev:?} {lang:?}: {l:?}");
             }
         }
-        // 繋ぎに行った後の失敗だけを、待ちが終わった後の左上へ残す（貼った直後の断りはメニューの中で読める）。
+        // 接続しに行った後の失敗だけを、待ちが終わった後の左上へ残す（貼った直後の断りはメニューの中で読める）。
         assert!(Event::SpectateCodeNoLink.is_room_trouble());
         assert!(Event::SpectateCodeExpired.is_room_trouble());
         assert!(!Event::SpectateCodeBroken.is_room_trouble());
@@ -5185,7 +5290,10 @@ mod tests {
         n.paste_len = 7;
         d.note = n;
         let t = d.text();
-        assert!(t.contains(&"受け取った文字数 7 文字".to_string()), "{t:?}");
+        assert!(
+            t.contains(&"貼り付けたコードの文字数 7 文字".to_string()),
+            "{t:?}"
+        );
         assert!(t.iter().any(|l| l.contains("短すぎます")), "{t:?}");
         let mut troubles = 0;
         for ev in EVENTS {
@@ -5206,7 +5314,7 @@ mod tests {
         }
         // 出来事の数。足したら `EVENTS` と合わせて直す。
         assert_eq!(
-            troubles, 47,
+            troubles, 49,
             "断り・失敗の出来事の数（増減したら文を見直す）"
         );
         let name = sanitize_name("テスト名".as_bytes(), |c| c != '名');
@@ -5221,7 +5329,7 @@ mod tests {
             t.contains(&"相手「テスト?」のコードを読みました。".to_string()),
             "{t:?}"
         );
-        assert!(t.contains(&"受け取った文字数 100 文字".to_string()));
+        assert!(t.contains(&"貼り付けたコードの文字数 100 文字".to_string()));
     }
 
     #[test]
@@ -5260,6 +5368,7 @@ mod tests {
             seat: Seat::P1,
             host: true,
             shape: Some((Mode::Rollback, 1)),
+            watch_off: false,
         };
         let n = corner_lines(conn, &quiet(), 0, None, Lang::Ja, &mut out, &mut st);
         assert_eq!(n, 1);
@@ -5272,6 +5381,7 @@ mod tests {
             seat: Seat::P2,
             host: false,
             shape: Some((Mode::Delay, 3)),
+            watch_off: false,
         };
         corner_lines(conn2, &quiet(), 0, None, Lang::Ja, &mut out, &mut st);
         assert_eq!(
@@ -5282,6 +5392,7 @@ mod tests {
             seat: Seat::P2,
             host: true,
             shape: Some((Mode::Delay, 2)),
+            watch_off: false,
         };
         corner_lines(conn3, &quiet(), 0, None, Lang::Ja, &mut out, &mut st);
         assert_eq!(
@@ -5991,16 +6102,19 @@ mod tests {
                 seat: Seat::P1,
                 host: true,
                 shape: Some((Mode::Rollback, 2)),
+                watch_off: false,
             },
             Conn::Connected {
                 seat: Seat::P2,
                 host: false,
                 shape: Some((Mode::Delay, 9)),
+                watch_off: false,
             },
             Conn::Connected {
                 host: true,
                 seat: Seat::P2,
                 shape: None,
+                watch_off: false,
             },
             Conn::Found {
                 seat: Seat::P1,
@@ -6144,7 +6258,7 @@ mod tests {
         let limit = 640
             - 2 * crate::ui_layout::SCREEN_MARGIN
             - 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
-        for theirs in [0u8, 9] {
+        for theirs in [0u8, 8] {
             assert_ne!(theirs, PROTO_VER);
             let (want, next) = match lang {
                 Lang::Ja => (
@@ -6372,7 +6486,7 @@ mod tests {
             notice_text(&one, Lang::Ja),
             [
                 "HiganRTool.iniの12行目（[netplay]のupnp）を読み込めません。",
-                "読み込めなかった部分は既定値で動かしています。"
+                "読み込めなかった部分は既定の設定で動かしています。"
             ]
         );
         assert_eq!(
@@ -6411,7 +6525,7 @@ mod tests {
             notice_text(&many, Lang::Ja),
             [
                 "HiganRTool.iniの3か所を読み込めません。",
-                "読み込めなかった部分は既定値で動かしています（詳細はログを確認してください）。"
+                "読み込めなかった部分は既定の設定で動かしています（詳細はログを確認してください）。"
             ]
         );
         assert_eq!(
@@ -6420,8 +6534,6 @@ mod tests {
         );
     }
 
-    // 壊れたら落ちる: 1 か所の注の 1 行目が「を」で終わる形（2 行目の「読み込めなかった部分は…」と続けて読むとねじれる）に戻る、
-    // または複数のときと違う閉じ方（「読み込めません。」でない）になる。
     #[test]
     fn the_one_place_ini_notice_ends_its_first_line_like_the_many_places_one() {
         let close = T_INI_MANY_B.ja.split_once("か所").unwrap().1;
@@ -6574,6 +6686,7 @@ mod tests {
             seat: Seat::P2,
             host: false,
             shape: Some((Mode::Rollback, 1)),
+            watch_off: false,
         }
     }
 
@@ -7524,9 +7637,34 @@ mod tests {
             let (failed, style) = copy_notice(Event::SpectateCodeClipWrite, lang).unwrap();
             assert_eq!(style, RowStyle::Warn);
             assert!(failed.contains("Ctrl+C"), "やり直す手段を言う: {failed}");
+            let off = watch_off_hint(lang);
+            assert!(crate::ui_layout::text_width(&game, off) <= limit, "{off}");
         }
         assert_eq!(copy_hint(Lang::Ja), "Ctrl+Cで観戦コードをコピーできます。");
         assert_eq!(copy_hint(Lang::En), "Press Ctrl+C to copy the watch code.");
+        assert_eq!(
+            watch_off_hint(Lang::Ja),
+            "相手が観戦を許可していないので、この試合は観戦できません。"
+        );
+        assert_eq!(
+            watch_off_hint(Lang::En),
+            "Your opponent does not allow watching this match."
+        );
+        for (lang, want) in [
+            (
+                Lang::Ja,
+                "相手が観戦を許可していないので、観戦コードは作成できません。",
+            ),
+            (
+                Lang::En,
+                "Your opponent does not allow watching, so no watch code was made.",
+            ),
+        ] {
+            assert_eq!(
+                copy_notice(Event::SpectateCodePeerOff, lang),
+                Some((want, RowStyle::Normal))
+            );
+        }
     }
 
     #[test]
@@ -7687,7 +7825,7 @@ mod tests {
             tx(event_text(Event::SpectateGaveUp, none)),
             [
                 "30分経ちましたが相手がルームに来ませんでした。",
-                "ルーム名を確かめて、観戦の「ルームマッチ」を選び直してください。"
+                "ルーム名をチェックして、観戦の「ルームマッチ」を選び直してください。"
             ]
         );
         assert_eq!(
@@ -7734,6 +7872,69 @@ mod tests {
             event_text(Event::RoomJoining, none),
             [("ルームのサーバーに接続しています。".to_string(), false)]
         );
+    }
+
+    /// 満員の断りは、接続した後（1 行・断りの色でない）と、接続する前（ルームの経路・観戦コードの経路とも理由と次にすること）で文が違う。
+    #[test]
+    fn a_full_host_is_told_apart_before_and_after_joining() {
+        let none = |_: &mut Note| {};
+        let tx = |v: Vec<(String, bool)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+        assert_eq!(
+            event_text(Event::SpectateFullEnded, none),
+            [(
+                "観戦者が満員になったため、観戦を終了しました。".to_string(),
+                false
+            )]
+        );
+        assert!(!Event::SpectateFullEnded.is_trouble());
+        assert!(Event::SpectateFullEnded.is_room_trouble());
+        assert_eq!(
+            tx(event_text(Event::SpectateFull, none)),
+            [
+                "観戦者が満員のため、観戦できませんでした。",
+                "時間をおいて観戦の「ルームマッチ」を選び直してください。"
+            ]
+        );
+        assert_eq!(
+            tx(event_text(Event::SpectateCodeFull, none)),
+            [
+                "観戦者が満員のため、観戦できませんでした。",
+                "時間をおいて「観戦コード入力」を選び直してください。"
+            ]
+        );
+        for ev in [Event::SpectateFull, Event::SpectateCodeFull] {
+            assert!(ev.is_trouble() && ev.is_room_trouble(), "{ev:?}");
+            assert!(event_text(ev, none).iter().all(|(_, warn)| *warn), "{ev:?}");
+        }
+        for (ev, first) in [
+            (
+                Event::SpectateFullEnded,
+                "The spectator slots became full, so watching ended.",
+            ),
+            (
+                Event::SpectateFull,
+                "The spectator slots are full, so you could not watch.",
+            ),
+            (
+                Event::SpectateCodeFull,
+                "The spectator slots are full, so you could not watch.",
+            ),
+        ] {
+            let mut n = spectate_note(CodeState::SpectateIdle, ev);
+            n.room = sanitize_room("abc", |_| true);
+            let mut out = [LineBuf::new(); STATUS_ROWS];
+            let mut w = [false; STATUS_ROWS];
+            let k = event_lines(&n, Lang::En, &mut out, &mut w);
+            assert!(k >= 1, "{ev:?}");
+            assert_eq!(out[0].as_str(), first, "{ev:?}");
+        }
+        for ev in [
+            Event::SpectateFullEnded,
+            Event::SpectateFull,
+            Event::SpectateCodeFull,
+        ] {
+            assert_eq!(Event::from_code(ev.code()), ev);
+        }
     }
 
     #[test]
@@ -7802,7 +8003,7 @@ mod tests {
                 (
                     2,
                     "30分経ちましたが相手がルームに来ませんでした。",
-                    "ルーム名を確かめて、観戦の「ルームマッチ」を選び直してください。",
+                    "ルーム名をチェックして、観戦の「ルームマッチ」を選び直してください。",
                     [RowStyle::Warn, RowStyle::Warn]
                 ),
                 "{st:?}"
@@ -8012,6 +8213,7 @@ mod tests {
             ),
             (JoinerFailure::ReplyNotSent, (Event::SpectateNoLink, 0, 0)),
             (JoinerFailure::GaveUp, (Event::SpectateGaveUp, 0, 0)),
+            (JoinerFailure::Refused, (Event::WatchRefused, 0, 0)),
         ] {
             assert_eq!(spectate_failure_event(f), want, "{f:?}");
         }
@@ -8757,7 +8959,7 @@ mod tests {
         FailKind::BothSymmetric,
     ];
 
-    /// つながらなかったときの文（日本語）。複数行の区切りと文字は決まった文面のまま（README の項の番号を末尾の行に持つ）。
+    /// 接続できなかったときの文（日本語）。複数行の区切りと文字は決まった文面のまま（README の項の番号を末尾の行に持つ）。
     fn want_fail_ja(fail: FailKind) -> Vec<&'static str> {
         match fail {
             FailKind::Unknown => vec![
@@ -9128,6 +9330,7 @@ mod tests {
                 seat: Seat::P1,
                 host: true,
                 shape: Some((Mode::Rollback, 1)),
+                watch_off: false,
             },
             Conn::Found {
                 seat: Seat::P2,
@@ -9159,7 +9362,7 @@ mod tests {
     fn the_stall_block_fits_the_screen_and_uses_known_glyphs() {
         let game = game_font_spec("");
         let glyphs = ui_glyphs();
-        // ゲームの文字で左上に置く（`net_ui::draw_board` の左上の行）: 画面の幅から左右の余白を引いた幅に収まる。
+        // ゲームの文字で左上に描く（`net_ui::draw_board` の左上の行）: 画面の幅から左右の余白を引いた幅に収まる。
         let limit = 640 - 2 * 6;
         let mut checked = 0u32;
         let mut widest = (0u32, String::new());
@@ -9315,8 +9518,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: LAN の項目が決める指示と入力の流れ。「ホスト」は入力なしで指示、「クライアント」「観戦」はアドレスの入力を経て、
-    /// 読めたアドレスだけを指示にする（断った理由を出して入力に留まる）。
     #[test]
     fn the_lan_rows_send_the_host_order_at_once_and_ask_for_an_address_for_the_others() {
         let mut d = Driver::new();
@@ -9380,7 +9581,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 前回のアドレス（ini の `lan_host`）が入力の初めの値にならない、決まりの外の値でも入力が壊れる。
     #[test]
     fn the_address_input_starts_from_the_remembered_address_and_esc_leaves_it_alone() {
         let mut d = Driver::new();
@@ -9412,9 +9612,7 @@ mod tests {
         )
     }
 
-    /// 壊れたら落ちる: 自分の PC の VPN のネットワーク（`set_vpn`）の中のアドレスをクライアント・観戦の入力が受けない、ネットワークが無い・
-    /// 外のアドレス（隣の /8・ブロードキャスト）を受ける、断る理由が今までの「LANのものではありません」と替わる、入力の間かの印（`wants_lan_addr`）が
-    /// ルーム名・名前の入力でも立つ（呼び手が関係の無い入力の間にアダプターの一覧を引く）。
+    /// 断る理由は今までの「LANのものではありません」のまま・`wants_lan_addr` はルーム名・名前の入力では立たない。
     #[test]
     fn the_address_input_takes_a_vpn_address_only_inside_the_set_network() {
         for item in [Item::LanClient, Item::LanWatch] {
@@ -9428,7 +9626,7 @@ mod tests {
                 d.tick_text(0, typed);
                 d.tick_text(0, ENTER)
             };
-            // ネットワークを置く前: 今までどおり断る。
+            // ネットワークを設定する前: 今までどおり断る。
             let out = enter(&mut d, "26.12.34.56");
             assert_eq!(out.cmd, None);
             assert!(d.text().iter().any(|l| l == T_LAN_ADDR_NOT_LAN.ja));
@@ -9460,9 +9658,6 @@ mod tests {
         assert!(d.m.wants_text() && !d.m.wants_lan_addr());
     }
 
-    /// 壊れたら落ちる: アドレスごとのツールの名前が、別のアドレスの行に付く（添字のずれ）・付かない・本物の LAN の行に付く、
-    /// 日英で書式が替わらない（日本語は全角の括弧でポートに続け、英語は半角の空白と括弧）、スクロールの形（4 つ以上）の行に付かない、
-    /// 札の語の往復でツールが落ちる。
     #[test]
     fn the_lan_address_rows_name_the_vpn_tool_of_that_address_in_both_layouts_and_languages() {
         // ツールの並びは、アドレスの並びとわざと食い違わせる（0 番は無し・1 番は ZeroTier・2 番は Radmin・3 番は Hamachi）。
@@ -9502,7 +9697,7 @@ mod tests {
             for n in 0..3 {
                 assert_eq!(t[from + 1 + n], format!("  {}", at(n)), "{lang:?} {n}");
             }
-            // 札の語は 2 bit ずつ: 4 番目のアドレス（Hamachi）を見るために、スクロールの窓を動かす。
+            // 札の語は 2 bit ずつ: 4 番目のアドレス（Hamachi）を見るために、スクロールのウィンドウを動かす。
             d.note = note;
             for _ in 0..6 {
                 d.tap(DOWN);
@@ -9538,8 +9733,6 @@ mod tests {
         assert!(Note::from_words(&w).lan_tools.iter().all(Option::is_none));
     }
 
-    /// 壊れたら落ちる: ツールの名前を付けた最長のアドレスの行（255.255.255.255:65535 ＋ 最長のツール名）が枠を越える、
-    /// 8 つ全部に付けると枠の高さを越える（日英とも）。
     #[test]
     fn the_longest_labelled_lan_address_row_fits_the_box() {
         let spec = game_font_spec("");
@@ -9576,7 +9769,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: LAN の待ち・接続の途中の項目、状況の行（自分のアドレスの並び）、左上の行、待機の印。
     #[test]
     fn lan_states_show_only_settings_cancel_and_back_with_the_addresses_in_the_status() {
         let waiting = lan_note(CodeState::LanWaiting, Event::None);
@@ -9665,8 +9857,6 @@ mod tests {
         t[from + 1..from + 6].to_vec()
     }
 
-    /// 壊れたら落ちる: アドレスが 4 つ以上のとき、先頭の 3 つだけが出て「ほか N 件」の行が付かない、↓で残りが出ない、
-    /// 上下の「ほか N 件」の件数が窓に合わない（観戦の一覧と同じ形）。
     #[test]
     fn more_than_three_lan_addresses_scroll_like_the_watch_list() {
         let mut d = name_driver("Alice");
@@ -9742,8 +9932,6 @@ mod tests {
         );
     }
 
-    /// 壊れたら落ちる: アドレスの行で決定・左右が何かを起こす（指示が出る・メニューが閉じる・設定へ入る）、
-    /// 3 つ以下でスクロールの行が付く・↓が項目の外へ出る。
     #[test]
     fn the_lan_address_rows_decide_nothing_and_three_or_fewer_do_not_scroll() {
         let mut d = name_driver("Alice");
@@ -9778,7 +9966,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: スクロールの行が枠を越える・長いアドレスで幅が枠を越える（アドレス 8 つ・最長の行）。
     #[test]
     fn eight_lan_addresses_fit_the_box() {
         let spec = AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap();
@@ -9799,7 +9986,6 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: LAN の出来事が断りの色・2 行（理由と次にすること）で出ない、左上に残らない、番号の往復で値が落ちる。
     #[test]
     fn every_lan_event_has_a_reason_and_a_next_step_and_survives_the_note_box() {
         let all = [
@@ -9809,7 +9995,7 @@ mod tests {
             Event::LanNoHost,
             Event::LanBusy,
             Event::LanNoMatch,
-            Event::LanWatchOff,
+            Event::WatchRefused,
             Event::LanNoLink,
             Event::LanCancelled,
         ];
@@ -9887,7 +10073,7 @@ mod tests {
         assert!(!hint_shown(&name_driver("Alice")), "決めた名前で案内が出た");
         // 名前の項目を持たない呼び手には、決める場所が無いので出さない。
         assert!(!hint_shown(&Driver::new()));
-        // 状況の行（出来事・準備中・つながった後）があればそちらを優先する。
+        // 状況の行（出来事・準備中・接続した後）があればそちらを優先する。
         let mut d = default_name_driver();
         d.note.event = Event::Empty;
         assert!(!hint_shown(&d));
@@ -9939,7 +10125,7 @@ mod tests {
         let d = Driver::new();
         let (v, n) = d.m.items(d.conn, d.note.state);
         assert_eq!(v[d.m.settled_cursor(&(v, n))], Item::Create);
-        // 最初に開いたときが「設定」の無い状態（つながった後）なら、そのまま先頭で、次に開くときも先頭。
+        // 最初に開いたときが「設定」の無い状態（接続した後）なら、そのまま先頭で、次に開くときも先頭。
         let mut m =
             Menu::new(ini()).with_player_name(NameBuf::lossy(crate::player_name::DEFAULT_NAME));
         m.open(0);
@@ -10532,7 +10718,7 @@ mod tests {
         assert_eq!(
             en(Event::ReplyMade, &|n| n.paste_len = 7),
             [
-                "Received 7 chars",
+                "Pasted code: 7 chars",
                 "Read the code from \"Bob\".",
                 "Copied the reply code. Send it to your opponent."
             ]
@@ -10625,11 +10811,13 @@ mod tests {
                 seat: Seat::P2,
                 host: true,
                 shape: Some((Mode::Rollback, 8)),
+                watch_off: false,
             },
             Conn::Connected {
                 seat: Seat::P2,
                 host: true,
                 shape: Some((Mode::Delay, 8)),
+                watch_off: false,
             },
             Conn::Found {
                 seat: Seat::P2,
@@ -10898,7 +11086,7 @@ mod tests {
                 assert_eq!(got, [want], "{state:?} {random} {lang:?}");
             }
         }
-        // 待っていない・観戦の待ち・つながった後は、どの行にも付かない。
+        // 待っていない・観戦の待ち・接続した後は、どの行にも付かない。
         for state in [
             CodeState::Idle,
             CodeState::SpectateJoining,

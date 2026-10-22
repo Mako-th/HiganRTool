@@ -1,42 +1,17 @@
 //! 接続コード。接続を始める側が作り、相手へコピペ（かルームサーバー）で渡す。相手も自分のコードを返す。
 //!
-//! 中身: proto_ver・種別・session_id・名前・有効期限（UNIX 秒）・候補の列。**始める側のコードだけが秘密 16 B を持つ**。
-//! 末尾は、始める側はコピーの間違いを見つける 4 B の検算（SHA-256 の先頭）、返す側は `HMAC-SHA256(K, 本文)` の
-//! 先頭 16 B（K は秘密と session から導く鍵。第三者が返す側のコードを偽って候補を差し替えるのを防ぐ）。
+//! 中身: proto_ver・build・種別・session_id・名前・有効期限（UNIX 秒）・候補の列。**始める側のコードだけが秘密 16 B を持つ**。
+//! 末尾は、始める側はコピーの間違いを見つける 4 B の検算（SHA-256 の先頭）、返す側は `HMAC-SHA256(K, 本文)` の先頭 16 B（K は秘密と session から導く鍵。第三者が返す側のコードを偽って候補を差し替えるのを防ぐ）。
 //! 文字は自前の base64url（RFC 4648 §5、`=` なし）。中身の大半が乱数の秘密とアドレスなので圧縮はしない。
-//!
-//! ## バイトの配置（リトルエンディアン）
-//!
-//! | オフセット | 幅 | 中身 |
-//! |---:|---:|---|
-//! | 0 | 1 | proto_ver（`wire::PROTO_VER`。パケットのバージョンと同じ数） |
-//! | 1 | 4 | build（ビルド番号 `update::BUILD_NUMBER`） |
-//! | 5 | 1 | 種別（1 始める側 / 2 返す側 / 3 観戦用 / 4 観戦者の返し。観戦用は始める側と同じ形、観戦者の返しは返す側と同じ形） |
-//! | 6 | 4 | session_id |
-//! | 10 | 8 | 有効期限（UNIX 秒。この秒までは使える） |
-//! | 18 | 1 | name_len（0〜32） |
-//! | 19 | name_len | name（UTF-8） |
-//! | … | 16 | 秘密（始める側・観戦用だけ） |
-//! | … | 32 | ホストの観戦用の公開鍵（観戦用だけ） |
-//! | … | 1 | 回線の型の印（`nat::NatMark`。下位 2 bit = シンメトリックか（0 不明 / 1 違う / 2 そう）、bit 2 = UPnP で割り当てた。残りは 0） |
-//! | … | 1 | 候補の数（1〜`MAX_CANDIDATES`） |
-//! | … | 各 8 か 20 | 候補: 種別 u8（`CandKind`）・family u8（4 / 6）・IP（4 か 16 B。ネットワークの順）・port u16 |
-//! | 末尾 | 4 / 16 | 始める側・観戦用: SHA-256(ここまで) の先頭 4 B / 返す側・観戦者の返し: HMAC-SHA256(K, ここまで) の先頭 16 B |
-//!
 //! 読む順: 文字 → 長さ → バージョン → 種別 →（返す側: session_id）→ 検算かタグ → **ビルド** → 中身 → 長さの過不足 → 有効期限。
-//! 検算かタグを中身より先に見るのはコピーの間違いを「候補のアドレスが変」と取り違えないため、ビルドを検算の後に見るのは
-//! 「相手のバージョンが違う」と取り違えないため、有効期限を最後に見るのは壊れたコードを「期限切れ」と言わないため。
-//! ビルドは自分の `update::BUILD_NUMBER` と比べる（0 と 0 は同じ）。
+//! 検算かタグを先に見るのはコピーの間違いを「候補のアドレスが変」と取り違えないため、ビルドを検算の後に見るのは「相手のバージョンが違う」と取り違えないため、有効期限を最後に見るのは壊れたコードを「期限切れ」と言わないため。
 //!
-//! コピペの読み書きでしか使わないので `String` / `Vec` を使う（ゲームスレッドでは呼ばない）。
-//! ネットや人から来た文字を読むので、パニックしうる添字は置かない。
-
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+//! コピペの読み書きでしか使わないので `String` / `Vec` を使う（ゲームスレッドでは呼ばない）。ネットや人から来た文字を読むので、パニックしうる添字は置かない。
 
 use sha2::{Digest, Sha256};
 
 use crate::auth::{self, AuthKey, SECRET_LEN, Secret};
-use crate::candidate::{CandError, CandKind, Candidate, Candidates, MAX_CANDIDATES};
+use crate::candidate::{self, CandError, Candidates, LIST_WIRE_MAX, ListError};
 use crate::handshake::Name;
 use crate::lang::Lang;
 use crate::nat::NatMark;
@@ -59,8 +34,6 @@ pub const MAX_CODE_CHARS: usize = 512;
 pub const MIN_CODE_CHARS: usize = 60;
 /// 有効期限の既定の長さ（秒）。コピペで渡して読むまでに切れず、古いコードが何日も使えないように 30 分。
 pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
-/// 観戦者の返し（種別 4）の有効期限の長さ（秒）。コピペを挟まず配る側がすぐ読むので 5 分。
-pub const SPECTATE_REPLY_TTL_SECS: u64 = 5 * 60;
 
 /// 秒数を人が読む長さの文字にする（60 の倍数なら「30 分」、そうでなければ「45 秒」）。
 /// ウィンドウの文の数字を定数から作り、`DEFAULT_TTL_SECS` を変えても古いままにならないようにする。
@@ -99,7 +72,7 @@ pub struct Code {
     /// 始める側だけ Some。
     pub secret: Option<Secret>,
     pub name: Name,
-    /// 書いた側の回線の型の印（相手が、つながらなかったときの文を選ぶのに読む）。
+    /// 書いた側の回線の型の印（相手が、接続できなかったときの文を選ぶのに読む）。
     pub nat: NatMark,
     pub candidates: Candidates,
     /// 有効期限（UNIX 秒。この秒までは使える）。
@@ -134,7 +107,7 @@ pub enum CodeError {
     BadName,
     /// 回線の型の印が定義の外（中はそのバイト）。
     BadNat(u8),
-    /// 候補の数が 0（繋げない）。
+    /// 候補の数が 0（接続できない）。
     NoCandidates,
     /// 候補の数が `MAX_CANDIDATES` を越える。
     TooManyCandidates(u8),
@@ -214,21 +187,6 @@ pub fn b64_decode(text: &str) -> Result<Vec<u8>, CodeError> {
 
 // ---------------- バイト列 ----------------
 
-fn put_candidate(v: &mut Vec<u8>, c: &Candidate) {
-    v.push(c.kind.to_u8());
-    match c.addr.ip() {
-        IpAddr::V4(ip) => {
-            v.push(4);
-            v.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            v.push(6);
-            v.extend_from_slice(&ip.octets());
-        }
-    }
-    v.extend_from_slice(&c.addr.port().to_le_bytes());
-}
-
 /// 末尾（検算かタグ）の前までを作る。`build` はふつう `BUILD_NUMBER`、`host_public` は観戦用だけ
 /// （他の種別は None。合わなければ `Inconsistent`）。
 fn body_bytes(
@@ -263,10 +221,9 @@ fn body_bytes(
         v.extend_from_slice(p);
     }
     v.push(c.nat.to_byte());
-    v.push(c.candidates.len() as u8);
-    for cand in c.candidates.as_slice() {
-        put_candidate(&mut v, cand);
-    }
+    let mut list = [0u8; LIST_WIRE_MAX];
+    let n = candidate::write_list(&c.candidates, &mut list);
+    v.extend_from_slice(list.get(..n).unwrap_or(&[]));
     Ok(v)
 }
 
@@ -449,35 +406,17 @@ fn parse_body(
     };
     let nat_byte = r.u8()?;
     let nat = NatMark::from_byte(nat_byte).ok_or(CodeError::BadNat(nat_byte))?;
-    let count = r.u8()?;
-    if count == 0 {
+    let rest = r.b.get(r.at..).unwrap_or(&[]);
+    // 並びを読む関数は 0 個を通すので、0 個はここで断る。
+    if rest.first() == Some(&0) {
         return Err(CodeError::NoCandidates);
     }
-    if usize::from(count) > MAX_CANDIDATES {
-        return Err(CodeError::TooManyCandidates(count));
-    }
-    let mut candidates = Candidates::EMPTY;
-    for index in 0..count {
-        let bad = |err| CodeError::BadCandidate { index, err };
-        let kind = CandKind::from_u8(r.u8()?).ok_or(bad(None))?;
-        let ip = match r.u8()? {
-            4 => {
-                let mut o = [0u8; 4];
-                o.copy_from_slice(r.take(4)?);
-                IpAddr::V4(Ipv4Addr::from(o))
-            }
-            6 => {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(r.take(16)?);
-                IpAddr::V6(Ipv6Addr::from(o))
-            }
-            _ => return Err(bad(None)),
-        };
-        let p = r.take(2)?;
-        let port = u16::from_le_bytes([p[0], p[1]]);
-        let c = Candidate::new(kind, SocketAddr::new(ip, port)).map_err(|e| bad(Some(e)))?;
-        candidates.push(c).map_err(|e| bad(Some(e)))?;
-    }
+    let (candidates, used) = candidate::read_list(rest).map_err(|e| match e {
+        ListError::Short { .. } => CodeError::TooShort,
+        ListError::TooMany(n) => CodeError::TooManyCandidates(n),
+        ListError::Bad { index, err } => CodeError::BadCandidate { index, err },
+    })?;
+    r.at += used;
     if r.at != body.len() {
         return Err(CodeError::LengthMismatch {
             expected: r.at,
@@ -594,14 +533,11 @@ fn code_tag_ok(key: &AuthKey, body: &[u8], tag: &[u8]) -> bool {
 }
 
 // ---------------- 相手のコードのファイル ----------------
-//
-// dll は接続コードを DLL のフォルダの `code\` のファイルで受け渡し、人が相手のコードを `peer_code.txt` に貼る。
-// ここは貼られた文字を自分の側から読むところで、取り違え（自分のコードを貼った・2 人とも同じ側を選んだ）を
-// 文字の誤りと分けて返す。
+// dll は接続コードを DLL のフォルダの `code\` のファイルで受け渡し、人が相手のコードを `peer_code.txt` に貼る。ここは貼られた文字を読み、取り違え（自分のコードを貼った・2 人とも同じ側を選んだ）を文字の誤りと分けて返す。
 
 #[derive(Debug, Clone, Copy)]
 pub enum Mine<'a> {
-    /// 自分が始める側（offer）。自分のコードの中身（返す側のタグを確かめる）と文字（自分のコードを貼った取り違えを見分ける）。
+    /// 自分が始める側（offer）。自分のコードの中身（返す側のタグを検証する）と文字（自分のコードを貼った取り違えを見分ける）。
     Offer { own: &'a Code, own_text: &'a str },
     /// 自分が返す側（answer）。返す側のコードをもう書いたならその文字。
     Answer { own_text: Option<&'a str> },
@@ -626,7 +562,7 @@ pub enum PeerError {
 ///
 /// 「両方が始める側」は、種別 1 が来て始める側のコードとして検算まで合うときだけ言う（期限切れも含める。
 /// 種別の取り違えの方が先に直すこと）。検算が合わない種別 1 はコピーの間違いと見て `Code(WrongSide(1))` のまま返す。
-/// 返す側のコードは秘密が無いと確かめられないので、「両方が返す側」は種別 2 を見ただけで言う。
+/// 返す側のコードは秘密が無いと検証できないので、「両方が返す側」は種別 2 を見ただけで言う。
 pub fn read_peer(text: &str, mine: Mine<'_>, now: u64) -> Result<Code, PeerError> {
     let t = bare(text);
     if t.is_empty() {
@@ -693,12 +629,12 @@ pub fn write_reply_to(
 }
 
 /// 観戦用のコード `spec` への、観戦者の返し（種別 4）を書く。session とタグの鍵は `spec` のもの。
-/// 有効期限は `now` から [`SPECTATE_REPLY_TTL_SECS`]。
+/// 有効期限は `spec` の期限をそのまま使う。配る側は返しの期限を自分の時計で比べるので、配る側の時計で付いた値にしておけば、
+/// 観戦者の PC の時計がずれていても期限切れで捨てられない。
 pub fn write_spectate_reply_to(
     spec: &Code,
     name: Name,
     candidates: Candidates,
-    now: u64,
 ) -> Result<String, CodeError> {
     let (Side::Spectate, Some(secret)) = (spec.side, spec.secret) else {
         return Err(CodeError::Inconsistent);
@@ -711,7 +647,7 @@ pub fn write_spectate_reply_to(
             name,
             nat: NatMark::UNKNOWN,
             candidates,
-            expires: now.saturating_add(SPECTATE_REPLY_TTL_SECS),
+            expires: spec.expires,
         },
         &secret,
     )
@@ -721,7 +657,9 @@ pub fn write_spectate_reply_to(
 mod tests {
     //! 期待値は crate の外（Python 3 の `hashlib` / `hmac` / `base64`）で計算した。
     use super::*;
+    use crate::candidate::{CandKind, Candidate, MAX_CANDIDATES};
     use crate::nat::Symmetry;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn secret() -> Secret {
         crate::auth::tests::golden_secret()
@@ -763,7 +701,7 @@ mod tests {
     /// golden の読みはビルド違いで落ちる）。
     #[rustfmt::skip]
     const INIT_BODY: [u8; 67] = [
-        0x08,                   // バージョン 8（`PROTO_VER`）
+        0x09,                   // バージョン 9（`PROTO_VER`）
         0x00, 0x00, 0x00, 0x00, // build 0（開発用）
         0x01,                   // 始める側
         0x44, 0x33, 0x22, 0x11, // session 0x11223344
@@ -776,12 +714,14 @@ mod tests {
         0x04, 0x06, 0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58, 0x1B, // IPv6 [2001:db8::1]:7000
     ];
     /// 検算（Python: `hashlib.sha256(INIT_BODY).digest()[:4]`）。
-    const INIT_CHECK: [u8; 4] = [0xB2, 0xFB, 0x0F, 0xBB];
+    const INIT_CHECK: [u8; 4] = [0x7E, 0xF0, 0xB0, 0x53];
     /// 文字（Python: `base64.urlsafe_b64encode(INIT_BODY + INIT_CHECK).rstrip(b"=")`）。
-    const INIT_TEXT: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7L7D7s";
-    /// バージョン 7 の始める側のコードの文字（形はバージョン 8 と同じで、先頭の 1 B と検算だけが違う）。
+    const INIT_TEXT: &str = "CQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG37wsFM";
+    /// バージョン 8 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
+    const INIT_TEXT_V8: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7L7D7s";
+    /// バージョン 7 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
     const INIT_TEXT_V7: &str = "BwAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG6w7Or0";
-    /// バージョン 6 の始める側のコードの文字（形はバージョン 8 と同じで、先頭の 1 B と検算だけが違う）。
+    /// バージョン 6 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
     const INIT_TEXT_V6: &str = "BgAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7UpLvs";
     /// バージョン 5 の始める側のコードの文字（回線の型の印の 1 B が無い形）。
     const INIT_TEXT_V5: &str = "BQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgb7NLang";
@@ -789,7 +729,7 @@ mod tests {
     const INIT_TEXT_V4: &str =
         "BAFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtTz18H";
     /// ビルド 403920 の始める側のコードの文字（`INIT_BODY` の build だけを変えて検算を付け直した）。
-    const INIT_TEXT_B403920: &str = "CNApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG3mwXng";
+    const INIT_TEXT_B403920: &str = "CdApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG32XwGY";
     /// バージョン 3 の始める側のコードの文字。
     const INIT_TEXT_V3: &str =
         "AwFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtQIsU3";
@@ -806,7 +746,7 @@ mod tests {
     /// 返す側の golden の本文（31 B）。
     #[rustfmt::skip]
     const REPLY_BODY: [u8; 31] = [
-        0x08, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン 8・build 0・返す側
+        0x09, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン 9・build 0・返す側
         0x44, 0x33, 0x22, 0x11,
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00,
         0x02, b'c', b'd',
@@ -816,10 +756,12 @@ mod tests {
     ];
     /// タグ（Python: `hmac.new(K, REPLY_BODY, sha256).digest()[:16]`。K は `auth.rs` の `K_GOLDEN`）。
     const REPLY_TAG: [u8; 16] = [
-        0xE0, 0x9B, 0x07, 0xA7, 0x2E, 0x34, 0x8E, 0x3D, 0xF7, 0x78, 0xBC, 0xAD, 0x91, 0xE1, 0xA6,
-        0x2C,
+        0xE2, 0x9F, 0x0D, 0x56, 0x93, 0x43, 0xBE, 0xCF, 0x7B, 0x7D, 0xDB, 0x87, 0xA3, 0xEE, 0x2A,
+        0xE1,
     ];
-    const REPLY_TEXT: &str = "CAAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-CbB6cuNI4993i8rZHhpiw";
+    const REPLY_TEXT: &str = "CQAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-KfDVaTQ77Pe33bh6PuKuE";
+    /// バージョン 8 の返す側のコードの文字。
+    const REPLY_TEXT_V8: &str = "CAAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-CbB6cuNI4993i8rZHhpiw";
     /// バージョン 7 の返す側のコードの文字。
     const REPLY_TEXT_V7: &str = "BwAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6ShM8nFqtf1BSjgkXrB2Y8";
     /// バージョン 6 の返す側のコードの文字。
@@ -950,7 +892,7 @@ mod tests {
     /// 候補の並びは優先の順（IPv6 → LAN → 外側）。
     #[rustfmt::skip]
     const DUAL_BODY: [u8; 75] = [
-        0x08, 0x00, 0x00, 0x00, 0x00, // バージョン 8・build 0
+        0x09, 0x00, 0x00, 0x00, 0x00, // バージョン 9・build 0
         0x01, 0x44, 0x33, 0x22, 0x11, 0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 始める側・session・期限
         0x02, 0x61, 0x62,                                                                   // 名前 "ab"
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密
@@ -961,9 +903,9 @@ mod tests {
         0x03, 0x04, 0xCB, 0x00, 0x71, 0x05, 0x99, 0xB7,                                     // 種別 3・203.0.113.5:47001
     ];
     /// 検算（Python: `hashlib.sha256(DUAL_BODY).digest()[:4]`）。
-    const DUAL_CHECK: [u8; 4] = [0x76, 0xCF, 0x51, 0x57];
+    const DUAL_CHECK: [u8; 4] = [0x62, 0x1F, 0x8A, 0x80];
     /// 文字（Python: `base64.urlsafe_b64encode(DUAL_BODY + DUAL_CHECK).rstrip(b"=")`）。
-    const DUAL_TEXT: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3ds9RVw";
+    const DUAL_TEXT: &str = "CQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3Yh-KgA";
 
     #[test]
     fn a_code_with_a_global_ipv6_candidate_keeps_the_version_2_shape_and_round_trips() {
@@ -1075,7 +1017,7 @@ mod tests {
         }
     }
 
-    /// 本文と検算をつなげて末尾の `n` B を落とした文字（文字の切り口が正準のまま、検算だけが合わなくなる）。
+    /// 本文と検算を連結して末尾の `n` B を落とした文字（文字の切り口が正準のまま、検算だけが合わなくなる）。
     fn without_last_bytes(body: &[u8], check: &[u8], n: usize) -> String {
         let mut v = body.to_vec();
         v.extend_from_slice(check);
@@ -1224,7 +1166,9 @@ mod tests {
     ];
     /// 観戦用のコードの文字（Python: INIT_BODY の種別の 1 B を 3 にし、秘密の後ろに `HOST_PUBLIC` の 32 B を挟んで
     /// 検算を付け、`base64.urlsafe_b64encode(..).rstrip(b"=")`）。
-    const SPECTATE_TEXT: &str = "CAAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbbnxN_Q";
+    const SPECTATE_TEXT: &str = "CQAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbOURr3g";
+    /// バージョン 8 の観戦用のコードの文字。
+    const SPECTATE_TEXT_V8: &str = "CAAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbbnxN_Q";
     /// バージョン 7 の観戦用のコードの文字。
     const SPECTATE_TEXT_V7: &str = "BwAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbhcFBcQ";
     /// バージョン 6 の観戦用のコードの文字。
@@ -1318,6 +1262,15 @@ mod tests {
             read_peer(REPLY_TEXT_V7, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(7)))
         );
+        // バージョン 8 も形は同じだが、観戦の ACK の形（受け取れた範囲の長さ）が違う相手なのでバージョンで断る。
+        let v8 = Err(CodeError::BadVersion(8));
+        assert_eq!(read_initiator(INIT_TEXT_V8, EXPIRES), v8);
+        assert_eq!(read_reply(REPLY_TEXT_V8, &secret(), SID, EXPIRES), v8);
+        assert_eq!(read_spectate(SPECTATE_TEXT_V8, EXPIRES), v8);
+        assert_eq!(
+            read_peer(REPLY_TEXT_V8, mine_offer(), EXPIRES),
+            Err(PeerError::Code(CodeError::BadVersion(8)))
+        );
         assert_eq!(read_initiator(INIT_TEXT, EXPIRES), Ok(init_code()));
         assert_eq!(read_spectate(SPECTATE_TEXT, EXPIRES), Ok(spectate_code()));
     }
@@ -1391,6 +1344,9 @@ mod tests {
             arrival: crate::wire::Arrival::Unknown,
             build: BUILD_NUMBER,
             public: [0; PUBLIC_LEN],
+            host_pick: false,
+            nat: crate::nat::NatMark::UNKNOWN,
+            rollback_delay: 0,
         });
         let key = AuthKey::derive(&secret(), SID);
         let n = crate::wire::encode(&key, SID, &hello, &mut buf);
@@ -1412,8 +1368,8 @@ mod tests {
                 "{what}のコードのバージョンとパケットのバージョン"
             );
         }
-        // 書いた物のバージョンが今の数（8）である。数を上げるなら golden も一緒に直す。
-        assert_eq!(packet_ver, 8);
+        // 書いた物のバージョンが今の数（9）である。数を上げるなら golden も一緒に直す。
+        assert_eq!(packet_ver, 9);
         // ビルド番号も、コードと HELLO で同じ数（`BUILD_NUMBER`）。コードは offset 1、HELLO は本文の +46。
         for (what, b) in [
             ("始める側", &code),
@@ -1530,7 +1486,7 @@ mod tests {
     /// 観戦者の返し（種別 4）の golden の本文（`REPLY_BODY` の種別の 1 B だけを 4 にした 31 B）。
     #[rustfmt::skip]
     const SPECTATE_REPLY_BODY: [u8; 31] = [
-        0x08, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン 8・build 0・観戦者の返し
+        0x09, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン 9・build 0・観戦者の返し
         0x44, 0x33, 0x22, 0x11, // 観戦用のコードの session 0x11223344
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 期限 1800000000
         0x02, b'c', b'd',       // 名前 "cd"
@@ -1541,12 +1497,12 @@ mod tests {
     /// タグ（Python: `hmac.new(K, SPECTATE_REPLY_BODY, sha256).digest()[:16]`。K は観戦用のコードの秘密と
     /// session から導く。`auth.rs` の `K_GOLDEN`）。
     const SPECTATE_REPLY_TAG: [u8; 16] = [
-        0x60, 0x3A, 0x6F, 0xFA, 0xF9, 0x51, 0x13, 0xAB, 0x00, 0x3A, 0x81, 0x5A, 0x72, 0xA8, 0x69,
-        0x9C,
+        0x67, 0x30, 0x20, 0x5A, 0x37, 0xA9, 0x84, 0x15, 0x3B, 0x25, 0xAE, 0x31, 0x41, 0xE9, 0x04,
+        0x2F,
     ];
     /// 文字（Python: `base64.urlsafe_b64encode(SPECTATE_REPLY_BODY + SPECTATE_REPLY_TAG).rstrip(b"=")`）。
     const SPECTATE_REPLY_TEXT: &str =
-        "CAAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG2A6b_r5UROrADqBWnKoaZw";
+        "CQAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG2cwIFo3qYQVOyWuMUHpBC8";
 
     fn spectate_reply_code() -> Code {
         Code {
@@ -1695,7 +1651,7 @@ mod tests {
             Err(CodeError::BadTag)
         );
         // バージョン違い（タグも合わなくなるが、バージョンが先）。
-        for ver in [0u8, 1, 2, 3, 4, 5, 6, 7, 9] {
+        for ver in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
             let mut v = SPECTATE_REPLY_BODY.to_vec();
             v[0] = ver;
             v.extend_from_slice(&SPECTATE_REPLY_TAG);
@@ -1746,24 +1702,31 @@ mod tests {
     fn spectate_reply_to_a_spectate_code_reads_back_on_the_casters_side() {
         let cands = Candidates::from_addrs(&[sa("127.0.0.1:47002")]).unwrap();
         let spec = spectate_code();
-        let t = write_spectate_reply_to(&spec, Name::new("ef"), cands, 1_000).unwrap();
+        let t = write_spectate_reply_to(&spec, Name::new("ef"), cands).unwrap();
         let c = read_spectate_reply(&t, &secret(), SID, 1_000).unwrap();
         assert_eq!(
             (c.side, c.session_id, c.secret, c.candidates, c.expires),
-            (
-                Side::SpectateReply,
-                SID,
-                None,
-                cands,
-                1_000 + SPECTATE_REPLY_TTL_SECS
-            )
+            (Side::SpectateReply, SID, None, cands, EXPIRES)
         );
-        assert_eq!(SPECTATE_REPLY_TTL_SECS, 300, "メインが決めた 5 分");
         assert_eq!(c.name, Name::new("ef"));
-        assert!(matches!(
-            read_spectate_reply(&t, &secret(), SID, 1_000 + SPECTATE_REPLY_TTL_SECS + 1),
-            Err(CodeError::Expired { .. })
-        ));
+        // 期限は配る側の時計で付いた値（配る側のコードの期限）なので、配る側の時計で比べて期限まで通り、過ぎたら捨てる。
+        assert!(read_spectate_reply(&t, &secret(), SID, EXPIRES).is_ok());
+        assert_eq!(
+            read_spectate_reply(&t, &secret(), SID, EXPIRES + 1),
+            Err(CodeError::Expired {
+                expires: EXPIRES,
+                now: EXPIRES + 1
+            })
+        );
+        let later = Code {
+            expires: EXPIRES + 777,
+            ..spec
+        };
+        let t2 = write_spectate_reply_to(&later, Name::new("ef"), cands).unwrap();
+        assert_eq!(
+            read_spectate_reply(&t2, &secret(), SID, 0).unwrap().expires,
+            EXPIRES + 777
+        );
         let mut other = secret();
         other.0[1] ^= 1;
         assert_eq!(
@@ -1776,14 +1739,12 @@ mod tests {
             c
         }] {
             assert_eq!(
-                write_spectate_reply_to(&bad, Name::new("ef"), cands, 0),
+                write_spectate_reply_to(&bad, Name::new("ef"), cands),
                 Err(CodeError::Inconsistent),
                 "{:?}",
                 bad.side
             );
         }
-        // 期限の足し算は飽和する（時計が壊れていてもパニックしない）。
-        assert!(write_spectate_reply_to(&spec, Name::new("ef"), cands, u64::MAX).is_ok());
     }
 
     /// 本文を少し変え、末尾を付け直して文字にする（毒が狙ったガードまで届くように）。
@@ -1799,8 +1760,8 @@ mod tests {
         let mut t = INIT_TEXT.to_string();
         t.replace_range(10..11, "+");
         assert_eq!(read_initiator(&t, now), Err(CodeError::BadChar { pos: 10 }));
-        // バージョンの 1 B だけ合う先頭（"CAAA"）は、バージョン違いでなく短い。
-        assert_eq!(read_initiator("CAAA", now), Err(CodeError::TooShort));
+        // バージョンの 1 B だけ合う先頭（"CQAA"）は、バージョン違いでなく短い。
+        assert_eq!(read_initiator("CQAA", now), Err(CodeError::TooShort));
         // バージョン 0 の先頭（"AAFE"）は、短くてもバージョン違いが先。
         assert_eq!(read_initiator("AAFE", now), Err(CodeError::BadVersion(0)));
         assert_eq!(read_initiator("", now), Err(CodeError::TooShort));
@@ -1822,7 +1783,7 @@ mod tests {
             Err(CodeError::TooShort)
         );
         // バージョン違い（検算は付け直してあるので、バージョンのガードだけが落とす）。
-        for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 9] {
+        for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
             let mut b = INIT_BODY;
             b[0] = v;
             assert_eq!(

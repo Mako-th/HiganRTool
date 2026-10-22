@@ -1,16 +1,8 @@
-//! 組み上がったものが動くかの検査: 同じプロセスに 2 つの peer_sim を 2 本のスレッドで loopback に立て、ロス無し・決め打ちのロス・
-//! 固定 seed のロス（落とす・遅らせる・重ねる）で走らせる。部品の検査は `higanr_core` の中にある。
-//!
-//! 合格の不変量:
-//! - 両者が全部の seg を終える（接続 → 選択 → lockstep → BYE(終了)）
-//! - 両者の (seg, frame, 1P, 2P, delay) の列が一致し、ロス無しの走行の列とも一致する
-//! - 列の先頭（各 seg の最初の切替を使うまで）が、台本のワードから手で組み立てた参照と一致する
-//!   （両者が同じ誤りをしても、ロスの有無で変わらない誤りでも落ちるように）
-//! - latency の切替の要求が全部受け入れられ、壊し方が本当に効いている（落とした・遅らせた・重ねた数が 0 でない）
-//! - 選択の台本（`menu_*`）: 両者に入った押下の列が台本から手で書いた列と一致し、揃った SELECT が模型の値で、
-//!   マッチの列が一致する（乱れの下でも）。模型に合わない押下では BYE(取消) でやめる
-//!
-//! 実時間で走る（1 本 5〜10 秒）。検査どうしは並んで実行され、ロス無しの走行は `OnceLock` で 1 回だけ回す。
+//! 組み上がったものが動くかの検査: 同じプロセスに 2 つの peer_sim を 2 本のスレッドで loopback に立て、ロス無し・決め打ちのロス・固定 seed のロス（落とす・遅らせる・重ねる）で走らせる。部品の検査は `higanr_core` の中にある。
+//! 合格の不変量: 両者が全部の seg を終える（接続 → 選択 → lockstep → BYE(終了)）。両者の (seg, frame, 1P, 2P, delay) の列が一致し、ロス無しの走行の列とも一致する。
+//! 列の先頭（各 seg の最初の切替を使うまで）が、台本のワードから手で組み立てた参照と一致する（両者が同じ誤りをしても、ロスの有無で変わらない誤りでも落ちるように）。
+//! latency の切替の要求が全部受け入れられ、壊し方が本当に効いている（落とした・遅らせた・重ねた数が 0 でない）。
+//! 選択の台本（`menu_*`）: 両者に入った押下の列が台本から手で書いた列と一致し、揃った SELECT が模型の値で、マッチの列が一致する（乱れの下でも）。模型に合わない押下では BYE(取消) でやめる。
 
 use std::net::UdpSocket;
 use std::sync::OnceLock;
@@ -33,7 +25,7 @@ use peer_sim::sim::{self, End, LatStep, Rec, Report, SimConfig, SimError};
 use peer_sim::stun_fake::StunFake;
 
 // 観戦の組み上がりの検査。`build.bat` が走らせる `--test loopback --ignored` に載せるため、このファイルの子モジュールにしてある
-// （`tests/` の直下に別のファイルを置くと、`build.bat` に足すまで回らない）。
+// （`tests/` の直下に別のファイルを作ると、`build.bat` に足すまで回らない）。
 #[path = "loopback/spectate.rs"]
 mod spectate;
 
@@ -154,7 +146,6 @@ fn assert_pair_ok(ra: &Report, rb: &Report, tag: &str) {
 }
 
 /// 台本のワードから手で組み立てた参照と、各 seg の最初の切替を使うフレームまでを比べる。比べた数を返す。
-///
 /// 切替を使うまでは delay がその seg の始めの値 d のまま（使ったフレームの後の delay で見分ける）なので、フレーム f のワードは
 /// capture_frame f − d で取ったもの（f < d なら両者とも 0）。切替を使うフレームそのもの（delay が変わった行）も、
 /// 取ったのは古い d のときなので同じ式で比べられる。
@@ -279,7 +270,7 @@ fn random_loss_seed_2_matches_lossless_run() {
     assert_eq!(ra.recs, baseline().0.recs, "ロス無しの走行と食い違う");
 }
 
-/// 付いていく側（`follow`）と、決めたフレーム数で seg を終える側（先に立つ側）を繋ぐ。
+/// 付いていく側（`follow`）と、決めたフレーム数で seg を終える側（先に立つ側）を接続する。
 /// 先に立つ側は latency を切り替えない（付いていく形の条件。`sim.rs` のモジュール doc）。
 fn run_follow(follower_is_host: bool, ff: FaultConfig, poll_ms: u32) -> (Report, Report) {
     let (mut lead, mut fol, sl, sf) = configs(FaultConfig::default(), ff);
@@ -364,7 +355,7 @@ fn follower_ends_each_seg_where_the_leader_does() {
     assert!(rf.faults.dropped > 100, "{:?}", rf.faults);
 }
 
-/// 先に立つ側（自分の時計で進む。dll の役）と、付いていく側（`--follow`。実機の回の peer_sim の役）を delay 2 で繋ぎ、
+/// 先に立つ側（自分の時計で進む。dll の役）と、付いていく側（`--follow`。実機の検証の peer_sim の役）を delay 2 で接続し、
 /// 付いていく側の送りを全部 `one_way_ms` だけ遅らせる。先に立つ側の stall は、付いていく側のワードが枠に間に合わなかった数。
 fn run_lagging_follower(one_way_ms: u32) -> (Report, Report) {
     let (mut lead, mut fol, sl, sf) = configs(
@@ -404,10 +395,9 @@ fn assert_lag_ok(rl: &Report, rf: &Report, n: u32) {
             sum(r)
         );
         assert_eq!(r.delay_start, Some(2), "{n} ms {who}");
-        // RTT は片道の遅れ（付いていく側の送り）を 1 回だけ含む: 先に立つ側の PING への PONG、付いていく側の PING。上は 1 ms ごとの
-        // 取り出しと送り出しの間隔の分（loopback の実測は数 ms。枠は広めに 60 ms —— 30 ms では、別の建て直しが走る負荷の下で 20 ms の
-        // 実行が RTT 59 ms になって落ちた）。遅れが両向きに掛かる壊れ方（RTT が 2 倍）を捕まえるのは 120 ms の実行
-        // （2 倍なら 240 ms で枠 120〜180 の外）。
+        // RTT は片道の遅れ（付いていく側の送り）を 1 回だけ含む: 先に立つ側の PING への PONG、付いていく側の PING。上は 1 ms ごとの取り出しと
+        // 送り出しの間隔の分で、枠は広めの 60 ms（別の建て直しが走る負荷の下で 30 ms だと落ちた）。遅れが両向きに掛かる壊れ方（RTT が 2 倍）は
+        // 120 ms の実行で捕まえる（240 ms になり枠 120〜180 の外）。
         let rtt = r.rtt_ms.expect("PONG が返った");
         assert!((n..=n + 60).contains(&rtt), "{n} ms {who}: RTT {rtt} ms");
     }
@@ -420,9 +410,8 @@ fn assert_lag_ok(rl: &Report, rf: &Report, n: u32) {
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn one_way_delay_beyond_the_delay_window_stalls_the_leader() {
-    // 下: 付いていく側のワードは枠に間に合う。stall は OS の起こし遅れの分だけ。枠は 180 フレームのうち 30 まで（別の建て直しが走る
-    // 負荷の下で 15 が出て落ちた）。上の側（120 ms）は半分（90）以上を求めるので、30 でも両者は離れている。遅れが両向きに掛かる
-    // 壊れ方は RTT の枠が捕まえる。
+    // 下: 付いていく側のワードは枠に間に合う。stall は OS のスレッドの起床の遅れの分だけで、枠は 180 フレームのうち 30 まで。上の側（120 ms）は半分（90）以上を
+    // 求めるので両者は離れている。遅れが両向きに掛かる壊れ方は RTT の枠が捕まえる。
     let (rl, rf) = run_lagging_follower(20);
     assert_lag_ok(&rl, &rf, 20);
     assert!(
@@ -501,7 +490,7 @@ fn run_refuses_non_loopback_peer_before_sending() {
             other => panic!("{p}: 断らなかった: {:?}", other.map(|r| r.end)),
         }
     }
-    // 対照: 同じ設定で宛先だけ loopback にすると断らない（ガードが全部を断っているのではない）。相手がいないので繋がらないが、
+    // 対照: 同じ設定で宛先だけ loopback にすると断らない（ガードが全部を断っているのではない）。相手がいないので接続できないが、
     // 打ち切りを短くして実行を始めることだけを見る。
     ca.peer = "127.0.0.1:9".parse().unwrap();
     ca.max_ms = 50;
@@ -514,7 +503,7 @@ fn run_refuses_non_loopback_peer_before_sending() {
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_going_silent_after_connecting_ends_with_disconnect() {
-    // B の送りを 120 通目の後から全部落とす（繋がってマッチに入った後。ロス無しの走行で B が送るのは全部で 350 通ほど、
+    // B の送りを 120 通目の後から全部落とす（接続してマッチに入った後。ロス無しの走行で B が送るのは全部で 350 通ほど、
     // 接続と選択は数十通で済む）。
     let fb = FaultConfig {
         drop_after: 120,
@@ -585,7 +574,7 @@ B（{} ms）: {sb}",
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn unanswered_peer_times_out_in_handshake() {
     // B は A へ何も届けない（100% 落とす）。A は何も受けないので「1 通も届かない」、B は A の HELLO を受けて役割を決めるが、
-    // 返しが全部落ちるので「届いたが繋がらない」。
+    // 返しが全部落ちるので「届いたが接続できない」。
     let fb = FaultConfig {
         drop_pct: 100,
         ..FaultConfig::default()
@@ -757,6 +746,9 @@ fn poison_set(
         arrival: wire::Arrival::Unknown,
         build: higanr_core::update::BUILD_NUMBER,
         public: [0x77; 32],
+        host_pick: false,
+        nat: higanr_core::nat::NatMark::UNKNOWN,
+        rollback_delay: 0,
     });
     let n = wire::encode(key, sid, &hello, &mut buf);
     let good_hello = buf[..n].to_vec();
@@ -1401,7 +1393,7 @@ fn relay_dropping_only_b_to_a_leaves_a_deaf_and_b_unanswered() {
 
 // ================= rollback のモード（`--mode rollback`） =================
 //
-// 取り決めで rollback に決まった 2 本を、揺らぐ遅れとロスの中継（`--shape`）越しに繋ぐ。latency の切替の台本は持たない
+// 取り決めで rollback に決まった 2 本を、揺らぐ遅れとロスの中継（`--shape`）越しに接続する。latency の切替の台本は持たない
 // （rollback のモードでは切替を出さない）。確定した列は、同じ語の delay 方式（delay = D）の列と同じはず。
 
 fn run_mode_pair_via_relay(
@@ -1624,8 +1616,8 @@ fn rollback_wish_against_a_delay_peer_plays_delay() {
 
 // ================= 付いていく形の rollback のモード（`--follow --mode rollback`） =================
 //
-// seg の長さを決める側（`--frames`。dll の役）と、付いていく側（`--follow`。実機の回の peer_sim の役）を、両者が rollback を望んで
-// 繋ぐ。壊すのは付いていく側の送りだけ（決める側から付いていく側への向きは dll → peer_sim の向きで、delay 方式の付いていく形の
+// seg の長さを決める側（`--frames`。dll の役）と、付いていく側（`--follow`。実機の検証の peer_sim の役）を、両者が rollback を望んで
+// 接続する。壊すのは付いていく側の送りだけ（決める側から付いていく側への向きは dll → peer_sim の向きで、delay 方式の付いていく形の
 // 検査もそうしている）。
 
 struct RbFollow {
@@ -1671,12 +1663,8 @@ fn run_rollback_follow(o: &RbFollow) -> (Report, Report) {
     (rl, rf)
 }
 
-/// 両者が終え、確定の列が一致し、台本のワードから手で組んだ参照（D = 1。決める側 = A = 2P・SEED_A、付いていく側 = 1P・SEED_B）と
-/// 一致し、付いていく側が次の seg の INPUT で 2 回 seg を進めたこと。`lead_holds` は、決める側が「最後のフレームの更新を予測で
-/// 進めて待ち、確定して seg を出た」数（`Stats::holds_ended`）の下限。全部の seg の終わりがこの形になった実行だけを見る。
-///
-/// 形（`holds_ended >= lead_holds`）は、ここでは確かめず決める側の Stats を返す。決める側のスレッドが約 13 ms 遅れると最後の
-/// フレームの待ちが出ない実行があるので、形の判定は `run_rb_follow_until_shape` が実行し直しで行う（表明は緩めない）。
+/// 両者が終え、確定の列が一致し、台本のワードから手で組んだ参照（D = 1。決める側 = A = 2P・SEED_A、付いていく側 = 1P・SEED_B）と一致し、付いていく側が次の seg の INPUT で 2 回 seg を進めたこと。
+/// `lead_holds` は、決める側が「最後のフレームの更新を予測で進めて待ち、確定して seg を出た」数（`Stats::holds_ended`）の下限。この形の判定は、決める側のスレッドが約 13 ms 遅れると最後のフレームの待ちが出ない実行があるので、ここでは行わず `run_rb_follow_until_shape` が実行し直しで行う（表明は緩めない）。
 fn assert_rb_follow_ok(
     rl: &Report,
     rf: &Report,
@@ -1764,7 +1752,7 @@ fn assert_rb_follow_ok(
 const RB_FOLLOW_ATTEMPTS: u32 = 3;
 
 /// `run_rollback_follow` を、決める側が全部の seg の最後のフレームを予測で更新して待つ形（`holds_ended >= RB_FOLLOW_SEGS`）が出るまで
-/// 最大 `RB_FOLLOW_ATTEMPTS` 回走らせる。毎回の実行で `assert_rb_follow_ok` と `extra`（行の一致以外の表明）を全部確かめる。
+/// 最大 `RB_FOLLOW_ATTEMPTS` 回走らせる。毎回の実行で `assert_rb_follow_ok` と `extra`（行の一致以外の表明）を全部チェックする。
 /// 3 回とも足りなければ 3 回分の holds_* を出して落とす。
 fn run_rb_follow_until_shape(o: &RbFollow, tag: &str, extra: impl Fn(&Report, &Report)) {
     let mut seen: Vec<String> = Vec::new();

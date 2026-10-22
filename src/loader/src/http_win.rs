@@ -1,10 +1,8 @@
-//! WinHTTP で GET を 1 本する（更新の目録とファイルを取る）。判断は `update.rs`。
-//! ローダーの unsafe は `real.rs`・`folder_dialog.rs` とここにだけ置く。
-//!
+//! WinHTTP で GET を 1 本する（更新の目録とファイルを取る）。判断は `update.rs`。ローダーの unsafe は `real.rs`・`folder_dialog.rs` とここにだけある。
 //! dll がルームサーバーで使うのと同じ API（OS の TLS・プロキシ設定をそのまま使う）。
-//! - 302 は WinHTTP が辿る（https から http への転送は断る）。本文は `max` バイトまで（ネットから来る長さを信じない）。
-//! - `Content-Length` と受けた長さが違えば `Truncated`（WinHTTP は閉じられた繋ぎを「読み終わり」と返すことがある）。
-//! - 待ちの上限は `Timeouts` の 4 つ（操作ごと）。全体の上限は呼ぶ側が決める。
+//! 302 は WinHTTP が辿る（https から http への転送は断る）。本文は `max` バイトまで（ネットから来る長さを信じない）。
+//! `Content-Length` と受けた長さが違えば `Truncated`（WinHTTP は閉じられた接続を「読み終わり」と返すことがある）。
+//! 待ちの上限は `Timeouts` の 4 つ（操作ごと）。全体の上限は呼ぶ側が決める。
 
 use core::ffi::c_void;
 
@@ -148,7 +146,7 @@ pub fn get(
         "WinHttpOpen",
     )?;
     let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
-    // SAFETY: 開いたセッションのハンドルに 4 つの ms を置くだけ。
+    // SAFETY: 開いたセッションのハンドルに 4 つの ms を設定するだけ。
     let ok = unsafe {
         WinHttpSetTimeouts(
             session.0,
@@ -173,7 +171,7 @@ pub fn get(
     let verb = wide("GET");
     let path = wide(&ep.path);
     let flags = if ep.secure { WINHTTP_FLAG_SECURE } else { 0 };
-    // SAFETY: 開いた繋ぎ・終端 0 の動詞とパス。バージョン・参照元・受ける型は null。
+    // SAFETY: 開いた接続・終端 0 の動詞とパス。バージョン・参照元・受ける型は null。
     let request = Handle::new(
         unsafe {
             WinHttpOpenRequest(
@@ -231,7 +229,7 @@ pub fn get(
             )
         };
         if ok == 0 {
-            // 途中で切られた繋ぎは、ここで失敗として返ることがある（読み終わりと区別して「切れた」と言う）。
+            // 途中で切られた接続は、ここで失敗として返ることがある（読み終わりと区別して「切れた」と言う）。
             return match declared {
                 Some(want) => Err(HttpError::Truncated {
                     got: body.len(),

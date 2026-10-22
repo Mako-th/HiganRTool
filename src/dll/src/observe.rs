@@ -1,14 +1,10 @@
-//! 設置の後の計測（pure）: 100 ms ごとにリングバッファから tick ごとの記録を読み、1 秒ごとにファイルへ追記し、1 秒ごとに入口を通った回数を、
-//! 60 秒ごとに「始めからここまで」の集計を本ログに書く。読み取りのスレッド（ゲームのスレッドではない）で走るので、待ちもログの I/O も構わない。
+//! 設置の後の計測（pure）: 100 ms ごとにリングバッファから tick ごとの記録を読み、1 秒ごとにファイルへ追記し、1 秒ごとに入口を通った回数を、60 秒ごとに「始めからここまで」の集計を本ログに書く。読み取りのスレッド（ゲームのスレッドではない）で走るので、待ちもログの I/O も構わない。
 //!
-//! - 計測の長さは `render_only::TOTAL_SECONDS`（180 秒）。ゲームを途中で閉じても残るよう、1 秒ごとに追記する
-//!   （`_ticks.csv` / `_changes.csv` / `_snap.bin`。メニューとライフの `_menu.csv` は別のスレッドが自分で追記する）。
-//! - TSC の周波数は始めの 1 秒の QueryPerformanceCounter との対で決め（CSV の時刻の列はこれで流して書く）、集計のたびに
-//!   「始めから今まで」の対との差を ppm で書く。
-//! - 集計（`ticks::summarize`）は 60 秒ごとに始めからここまでを本ログへ追記する。
+//! - 計測の長さは `render_only::TOTAL_SECONDS`（180 秒）。ゲームを途中で閉じても残るよう、1 秒ごとに追記する（`_ticks.csv` / `_changes.csv` / `_snap.bin`。メニューとライフの `_menu.csv` は別のスレッドが自分で追記する）。
+//! - TSC の周波数は始めの 1 秒の QueryPerformanceCounter との対で決め（CSV の時刻の列は TSC の差をこれで換算して書く）、集計のたびに「始めから今まで」の対との差を ppm で書く。集計（`ticks::summarize`）は 60 秒ごとに始めからここまでを本ログへ追記する。
 //! - メモリには全件の 1024 バイトを貯めない。持つのは集計に要る先頭（`Record`）と、次の追記までの 1 秒ぶんだけ。
 //!
-//! Win32 は `RecordEnv` の向こうに置く（本物は `record_win::RealRecord`）。時計・待ち・回数は `HookEnv` のもの。
+//! Win32 は `RecordEnv` の向こうへ分ける（本物は `record_win::RealRecord`）。時計・待ち・回数は `HookEnv` のもの。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -49,36 +45,6 @@ pub const MENU_SUFFIX: &str = "_menu.csv";
 pub const DRAWS_SUFFIX: &str = "_draws.csv";
 pub const RENDERONLY_SUFFIX: &str = "_renderonly.csv";
 
-/// D3D8 のデバイスの下見（読むだけ）。`[0x4B3108]`・その vtable・EndScene `[vtable+0x8C]`・Present `[vtable+0x3C]` のアドレスと、
-/// EndScene / Present が入っているモジュールのパス。読めなかった欄は `None`。デバイスの関数は呼ばない。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct D3d8Probe {
-    pub device: Option<u32>,
-    pub vtable: Option<u32>,
-    pub endscene: Option<u32>,
-    pub present: Option<u32>,
-    pub endscene_module: Option<String>,
-    pub present_module: Option<String>,
-}
-
-impl D3d8Probe {
-    fn field(addr: Option<u32>) -> String {
-        addr.map_or("読めない".to_string(), |a| format!("0x{a:08X}"))
-    }
-
-    pub fn lines(&self) -> String {
-        format!(
-            "D3D8 の下見: デバイス [0x4B3108] = {} / vtable = {} / EndScene [vtable+0x8C] = {} / Present [vtable+0x3C] = {}\nD3D8 の下見: EndScene のモジュール = {} / Present のモジュール = {}（デバイスの関数は呼ばない。M1c-2 の材料）",
-            Self::field(self.device),
-            Self::field(self.vtable),
-            Self::field(self.endscene),
-            Self::field(self.present),
-            self.endscene_module.as_deref().unwrap_or("分からない"),
-            self.present_module.as_deref().unwrap_or("分からない"),
-        )
-    }
-}
-
 /// 観戦者のセッションの本ログの材料（`RecordEnv::watch_log`）。観戦者の実行は計測が締まらず、閉じたときに書く経路も無い（`write_link_end` の注）ので、
 /// 数は途中で本ログへ残す。ルーム名・アドレス・接続コードは含まない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,7 +61,7 @@ fn write_watch_log(out: &mut dyn Write, k: u32, log: &WatchLog, interim: bool) {
     for (n, body) in &log.ended {
         let _ = writeln!(
             out,
-            "==== {n} 回目の観戦の終わり（計測 {k} 秒の時点。計測は続ける） ===="
+            "==== {n} 回目の観戦の終わり（観戦者として。{k} 秒の時点。計測は続ける） ===="
         );
         // 簡潔には、観戦の終わりの理由とルームの数の行を残し、受信の数の dump（`受信 …`）は詳細だけにする。
         for l in body.lines() {
@@ -109,7 +75,7 @@ fn write_watch_log(out: &mut dyn Write, k: u32, log: &WatchLog, interim: bool) {
     if let (true, Some(live)) = (interim, &log.live) {
         let _ = writeln!(
             detail_out(out),
-            "---- 観戦の途中経過（計測 {k} 秒の時点までの合計） ----\n{live}"
+            "---- 観戦の途中経過（{k} 秒の時点までの合計） ----\n{live}"
         );
     }
 }
@@ -129,12 +95,12 @@ pub trait RecordEnv {
     /// 本ログの隣に、本ログの名前の先頭 ＋ `suffix` のファイルを開く（回ごとに別名。既存を上書きしない）。
     /// 表示用の名前と書き込み先。
     fn open_output(&mut self, suffix: &str) -> Result<(String, Box<dyn Write>), String>;
-    /// メニューとライフの読み取りのスレッドを起こす（`_menu.csv` に自分で追記する）。表示用のファイル名。
+    /// メニューとライフの読み取りのスレッドを作る（`_menu.csv` に自分で追記する）。表示用のファイル名。
     fn start_menu(&mut self) -> Result<String, String>;
     fn menu_stats(&mut self) -> Option<TickStats>;
     fn stop_menu(&mut self) -> Option<TickStats>;
 
-    // ---- 描画のリングバッファ・描画だけのフレーム・D3D8 の下見。既定は「何もしない」。
+    // ---- 描画のリングバッファ・描画だけのフレーム。既定は「何もしない」。
     fn draw_next_seq(&self) -> u32 {
         0
     }
@@ -144,7 +110,7 @@ pub trait RecordEnv {
     fn draw_calls(&self) -> u32 {
         0
     }
-    /// 描画だけのフレームを `n` 回作るよう入口に頼む（残りが 0 のときだけ置ける）。置けたら true。既定は「頼めない」。
+    /// 描画だけのフレームを `n` 回作るよう入口に頼む（残りが 0 のときだけセットできる）。セットできたら true。既定は「頼めない」。
     fn start_render_only(&mut self, _n: u32) -> bool {
         false
     }
@@ -152,15 +118,12 @@ pub trait RecordEnv {
     fn render_only_left(&self) -> u32 {
         0
     }
-    fn d3d8_probe(&mut self) -> D3d8Probe {
-        D3d8Probe::default()
-    }
-    /// 文字の描画が止まった理由の本ログの行。止めたあと最初に呼んだ 1 回だけ返す（ゲームのスレッドは原子の値を置くだけで、書くのはこの側）。
+    /// 文字の描画が止まった理由の本ログの行。止めたあと最初に呼んだ 1 回だけ返す（ゲームのスレッドは原子変数へ値を書くだけで、書くのはこの側）。
     fn overlay_stop_line(&mut self) -> Option<String> {
         None
     }
 
-    // ---- 台本の feed のリングバッファ・進み具合・撮影の置き場。既定は「台本なし」で何も返さない。
+    // ---- 台本の feed のリングバッファ・進み具合・撮影のバッファ。既定は「台本なし」で何も返さない。
     fn feed_next_seq(&self) -> u32 {
         0
     }
@@ -170,11 +133,11 @@ pub trait RecordEnv {
     fn script_progress(&self) -> Progress {
         Progress::default()
     }
-    /// 「できた」撮影の置き場（撮った順で最も古いもの）の番号と先頭。
+    /// 「できた」撮影のバッファ（撮った順で最も古いもの）の番号と先頭。
     fn take_shot(&mut self) -> Option<(usize, ShotHead)> {
         None
     }
-    /// 「できた」置き場の画素の先頭 `len` バイトのコピー。
+    /// 「できた」バッファの画素の先頭 `len` バイトのコピー。
     fn copy_shot(&self, _slot: usize, _len: usize) -> Vec<u8> {
         Vec::new()
     }
@@ -202,7 +165,7 @@ pub trait RecordEnv {
     }
 }
 
-/// 試験のまとめの材料を集める。`net` はその回のネットワークの数（ネットワークのセッションを置いていなければ None）。
+/// 試験のまとめの材料を集める。`net` はその回のネットワークの数（ネットワークのセッションを組み込んでいなければ None）。
 pub fn trial_facts(
     game: &GameFacts,
     rec: &mut dyn RecordEnv,
@@ -234,7 +197,7 @@ fn write_rollback_interim(out: &mut dyn Write, k: u32, net_text: &str, last: &mu
     *last = Some(body);
 }
 
-/// 巻き戻しの要約の行だけを改行でつないだもの（途中経過が前と同じかを比べる）。
+/// 巻き戻しの要約の行だけを改行で連結したもの（途中経過が前と同じかを比べる）。
 fn rollback_body(net_text: &str) -> String {
     net_text
         .lines()
@@ -243,7 +206,7 @@ fn rollback_body(net_text: &str) -> String {
         .join("\n")
 }
 
-/// 巻き戻しの要約の見出しと行（途中経過と、つながりの終わりの節が使う）。`what` は見出しの括弧の先頭。
+/// 巻き戻しの要約の見出しと行（途中経過と、接続の終わりの節が使う）。`what` は見出しの括弧の先頭。
 fn write_rollback_lines(out: &mut dyn Write, what: &str, k: u32, net_text: &str) {
     let mut lines = net_text
         .lines()
@@ -254,18 +217,15 @@ fn write_rollback_lines(out: &mut dyn Write, what: &str, k: u32, net_text: &str)
     }
     let _ = writeln!(
         out,
-        "---- 巻き戻しの要約（{what}。計測 {k} 秒の時点までの合計。終わりの要約と同じ形） ----"
+        "---- 巻き戻しの要約（{what}。{k} 秒の時点までの合計。終わりの要約と同じ形） ----"
     );
     for l in lines {
         let _ = writeln!(out, "{l}");
     }
 }
 
-/// つなぎ直せる実行（ゲーム内のメニューの実行。`NetSnapshot::relink`）で、つながりが 1 本終わった時点の「終わり」相当のまとめ
-/// （つながりが終わったのを初めて見た秒に 1 回）。この実行の計測はゲームを閉じるまで締まらず、閉じたときに書く経路も無い（`DllMain` は ATTACH だけ）
-/// ので、つながりごとに同じ中身をここで書く。ネットワークが終わってから 10 秒待たずに見た秒で書くのは、人が次のつながりを開くとネットワークの数が 0 から
-/// 置き直され（`NetStatus::reset`）、待つと次のつながりの数を書いてしまうため。試験のまとめは終わりの節（`Stage::Final`）で判じ、
-/// 見出しだけ差し替える（終わりの節の見出しは計測の終わりの 1 回だけにしておく。検査がその見出しで終わりの節を探す）。
+/// 再接続できる実行（ゲーム内のメニューの実行。`NetSnapshot::relink`）で、接続が 1 本終わった時点の「終わり」相当のまとめ（接続が終わったのを初めて見た秒に 1 回）。この実行の計測はゲームを閉じるまで締まらず、閉じたときに書く経路も無い（`DllMain` は ATTACH だけ）ので、接続ごとに同じ中身をここで書く。
+/// ネットワークが終わってから 10 秒待たずに見た秒で書くのは、人が次の接続を開くとネットワークの数が 0 から作り直され（`NetStatus::reset`）、待つと次の接続の数を書いてしまうため。試験のまとめは終わりの節（`Stage::Final`）で判じ、見出しだけ差し替える（終わりの節の見出しは計測の終わりの 1 回だけにしておく。検査がその見出しで終わりの節を探す）。
 #[allow(clippy::too_many_arguments)] // 終わりの段階と同じ材料を 1 か所で渡す
 fn write_link_end(
     out: &mut dyn Write,
@@ -282,10 +242,10 @@ fn write_link_end(
     streams: &Streams,
     link_log: &crate::link_log::LinkLog,
 ) {
-    let what = format!("{n} 回目のつながりの終わり");
+    let what = format!("{n} 回目の接続の終わり");
     let _ = writeln!(
         out,
-        "==== {what}（計測 {k} 秒の時点。計測は続ける。次のつながりを待つ） ===="
+        "==== {what}（{k} 秒の時点。計測は続ける。次の接続を待つ） ===="
     );
     let pair = rec.tsc_qpc();
     let menu = rec.menu_stats();
@@ -307,13 +267,25 @@ fn write_link_end(
     let body = text.split_once('\n').map_or("", |(_, b)| b);
     let _ = write!(
         out,
-        "==== 試験のまとめ（{what}。計測 {k} 秒の時点） ====\n{body}"
+        "==== 試験のまとめ（{what}。{k} 秒の時点） ====\n{body}"
     );
     for l in link_log.end_lines(&snap) {
         let _ = writeln!(out, "{l}");
     }
+    // 接続が終わった時点ではまだ受信スレッドが生きているので、観戦者のツリー・観戦者の上り回線速度の測定の行はここで読める。片づけた後の値は終わりの全文の「回目の接続（片づけ済み」の節に出る。
+    for l in net_text
+        .lines()
+        .filter(|l| TREE_LINE_HEADS.iter().any(|h| l.starts_with(h)))
+    {
+        let _ = writeln!(out, "{l}");
+    }
     write_rollback_lines(&mut detail_out(out), &what, k, net_text);
 }
+
+const TREE_LINE_HEADS: [&str; 2] = [
+    crate::spectate_host::TREE_ROW_HEAD,
+    crate::spectate_host::MEASURE_ROW_HEAD,
+];
 
 /// 台本が終わるか止まってから計測を終えるまで（秒）。台本のある実行の上限は 1200 秒（10 分の台本は、マッチまでの段階と読み込みを足すと
 /// 600 秒を越える。上限に着くと読み取りのスレッドが先に終わり、`_net_frames.csv` の終わりが欠ける）。台本の無いネットワークの実行（人が遊ぶ実行）は
@@ -333,7 +305,7 @@ pub enum RunLen {
         steps: usize,
         feed_first: u32,
     },
-    /// ネットワークの実行（台本の無いネットワーク、か `after_script = keep` の台本のネットワーク）: 台本が終わり、かつネットワークが終わってから（ネットワークのセッションを置いていなければ
+    /// ネットワークの実行（台本の無いネットワーク、か `after_script = keep` の台本のネットワーク）: 台本が終わり、かつネットワークが終わってから（ネットワークのセッションを組み込んでいなければ
     /// 終わっているとみる）`tail` 秒で終える（上限 `max` 秒）。描画だけのフレームは作らない。欄の意味は `Script` と同じ。
     /// `max` が `None` なのは台本の無いネットワークの実行（人が遊ぶ実行）だけで、ネットワークが開いている間は上限で止めない
     /// （約 26 分の 7 マッチで上限 1200 秒に着き、後半のマッチの記録が残らなかった）。
@@ -346,7 +318,7 @@ pub enum RunLen {
 }
 
 /// この実行で描画だけのフレームを作るか。作るのは台本なしの実行（`Fixed`）だけで、配るバージョン（feature `dist`）ではそれも作らない
-/// （ネットワークなしで起こした配布版の花映塚が 3 秒ごとに止まって見えるため）。`dist` を引数で受けるのは、配るバージョンの形を開発用のビルドの検査でも見るため。
+/// （ネットワークなしで起動した配布バージョンの花映塚が 3 秒ごとに止まって見えるため）。`dist` を引数で受けるのは、配るバージョンの形を開発用のビルドの検査でも見るため。
 fn makes_render_only(len: RunLen, dist: bool) -> bool {
     matches!(len, RunLen::Fixed(_)) && !dist
 }
@@ -530,7 +502,7 @@ struct Streams {
 /// `_snap.bin` に書く件の上限（計測の上限 `SCRIPT_MAX_SECONDS` × 60 tick。約 70 MB）。
 const SNAP_MAX_RECORDS: u64 = SCRIPT_MAX_SECONDS as u64 * 60;
 
-/// 観測用の 4 つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くか。配るバージョンでは書かない（配った版を使う人の 1 回の起動のログの約 88% がこの 4 つだった）。
+/// 観測用の 4 つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くか。配るバージョンでは書かない（配ったバージョンを使う人の 1 回の起動のログの約 88% がこの 4 つだった）。
 /// 集計（本ログ）・`_net_frames.csv`・`_pacing.csv`・`_menu.csv` は、配るバージョンでも詳細なログ（ini の `[log] detail = 1`）なら書く。
 fn writes_observe_files(dist: bool) -> bool {
     !dist
@@ -670,7 +642,7 @@ impl Streams {
 
 /// 途中経過の集計で、前に書いた節と変わらない行を繰り返さないための覚え。tick の集計は取れた件が上限（`MAX_RECORDS`）に達すると
 /// 中身が変わらなくなり（1 時間 13 分で 262,144 件。以後 60 秒ごとに同じ行が並んだ）、書き出しの行は書かない設定だと毎回同じになる。
-/// 持ちきれなかった件数のように増え続ける値は、比べから外して終わりの節に書く。終わりの集計とつながりの終わりの節は覚えを使わず全部書く。
+/// 持ちきれなかった件数のように増え続ける値は、比べから外して終わりの節に書く。終わりの集計と接続の終わりの節は覚えを使わず全部書く。
 #[derive(Default)]
 struct ProgressEcho {
     ticks: Option<crate::ticks::TickSummary>,
@@ -745,7 +717,7 @@ fn write_progress(
             e.noted = true;
             let _ = writeln!(
                 out,
-                "集計: tick の集計と書き出しの行は、前の節から変わらないときは書かない（持ちきれなかった件数など増え続ける値は終わりの節に書く）"
+                "集計: tick の集計と書き出しの行は、前の節から変わらないときは書きません（持ちきれなかった件数など増え続ける値は終了時の節に書きます）"
             );
         }
         if !same_ticks {
@@ -756,7 +728,10 @@ fn write_progress(
     match menu {
         Some(m) => m.write_summary(out, label),
         None => {
-            let _ = writeln!(out, "メニューとライフ（{label}）: 読み取りのスレッドが無い");
+            let _ = writeln!(
+                out,
+                "メニューとライフ（{label}）: 読み取りのスレッドがありません"
+            );
         }
     }
     ticks
@@ -808,7 +783,7 @@ pub fn run(
     )
 }
 
-/// 設置の後の計測（長さは `len`）。台本のある実行（`RunLen::Script`）では、100 ms ごとに feed のリングバッファと撮影の置き場も読み
+/// 設置の後の計測（長さは `len`）。台本のある実行（`RunLen::Script`）では、100 ms ごとに feed のリングバッファと撮影のバッファも読み
 /// （`script_watch::ScriptWatch`）、描画だけのフレームの予定は作らず、台本が終わるか止まってから `tail` 秒で終える（上限 `max` 秒）。
 ///
 /// 試験のまとめ（`trial_summary`）: 1 秒ごとに材料を集め、項目の印の並びが変わったとき（と、60 秒ごと）に「途中経過」の節を本ログへ書く。
@@ -832,7 +807,7 @@ pub fn run_len(
     let _ = match rec.game_clock_divisor() {
         Some(d) => writeln!(
             detail_out(out),
-            "時計: プロセスの QueryPerformanceFrequency = {qpf} / ゲームの [0x{divisor_addr:08X}]（ウィンドウ +0x{WINDOW_CLOCK_DIVISOR:X}。時計の分母。0 なら timeGetTime の経路）= {d}（QPC の周波数の下位 32 ビットと{}）",
+            "時計: プロセスの QueryPerformanceFrequency = {qpf} / ゲームの [0x{divisor_addr:08X}]（ウィンドウ +0x{WINDOW_CLOCK_DIVISOR:X}。時計の分母。0 なら timeGetTime の処理フロー）= {d}（QPC の周波数の下位 32 ビットと{}）",
             if d == qpf as u32 {
                 "一致"
             } else {
@@ -841,7 +816,7 @@ pub fn run_len(
         ),
         None => writeln!(
             detail_out(out),
-            "時計: プロセスの QueryPerformanceFrequency = {qpf} / ゲームの [0x{divisor_addr:08X}] は読めない"
+            "時計: プロセスの QueryPerformanceFrequency = {qpf} / ゲームの [0x{divisor_addr:08X}] は読み取り不能"
         ),
     };
 
@@ -849,7 +824,7 @@ pub fn run_len(
     if rows.is_empty() {
         let _ = writeln!(
             out,
-            "★★ コピーの表: 入口は 0 行（何も写していない）。_ticks.csv のコピーの列と _changes.csv は空になる ★★"
+            "★★ コピーの表: 入口は 0 行（何もコピーしていない）。_ticks.csv のコピーの列と _changes.csv は空になります。 ★★"
         );
     } else {
         let _ = writeln!(
@@ -865,21 +840,20 @@ pub fn run_len(
         rows,
         writes_observe_files(cfg!(feature = "dist")) && crate::log_mode::detail(),
     );
-    let _ = writeln!(detail_out(out), "{}", rec.d3d8_probe().lines());
-    // 簡潔なログでは `_menu.csv` を書かないので、1 ms ごとに読むこのスレッドも起こさない。
+    // 簡潔なログでは `_menu.csv` を書かないので、1 ms ごとに読むこのスレッドも作らない。
     if crate::log_mode::detail() {
         let _ = match rec.start_menu() {
             Ok(name) => writeln!(
                 detail_out(out),
-                "メニューとライフ: 別のスレッドで約 1 ms ごとに読み、変わったときだけ {name} へ追記する"
+                "メニューとライフ: 別のスレッドで約 1 ms ごとに読み、変わったときだけ {name} へ追記します"
             ),
             Err(why) => writeln!(
                 out,
-                "メニューとライフ: 読み取りのスレッドを起こせない（{why}）"
+                "メニューとライフ: 読み取りのスレッドの作成不能（{why}）"
             ),
         };
     }
-    // 台本のある実行だけ、feed のリングバッファと撮影の置き場を読む処理（`_feed.csv` / `_shots.csv`）。
+    // 台本のある実行だけ、feed のリングバッファと撮影のバッファを読む処理（`_feed.csv` / `_shots.csv`）。
     // 計測の上限（秒）。None は台本の無いネットワークの実行で、ネットワークが終わるまで回す（`RunLen::Net` の注）。
     let max_seconds: Option<u32> = match len {
         RunLen::Fixed(s) => Some(s),
@@ -908,11 +882,11 @@ pub fn run_len(
     let _ = match len {
         RunLen::Fixed(seconds) => writeln!(
             detail_out(out),
-            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録を読み（seq {first_seq} から）、1000 ms ごとに {seconds} 回、入口を通った回数を読んでファイルへ追記する。{SUMMARY_EVERY} 秒ごとに集計（始めの値 {first}）"
+            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録を読み（seq {first_seq} から）、1000 ms ごとに {seconds} 回、入口を通った回数を読んでファイルへ追記します。{SUMMARY_EVERY} 秒ごとに集計します（始めの値 {first}）"
         ),
         RunLen::Script { tail, max, .. } => writeln!(
             detail_out(out),
-            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記する。台本が終わるか止まってから {tail} 秒で終える（上限 {max} 秒）。{SUMMARY_EVERY} 秒ごとに集計（始めの値 {first}）"
+            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記します。台本が終わるか止まってから {tail} 秒で終了します（上限 {max} 秒）。{SUMMARY_EVERY} 秒ごとに集計します（始めの値 {first}）"
         ),
         RunLen::Net {
             tail,
@@ -920,37 +894,37 @@ pub fn run_len(
             ..
         } => writeln!(
             detail_out(out),
-            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記する。台本（あれば）とネットワークが終わってから {tail} 秒で終える（上限 {max} 秒。ネットワークは計測の後も続く）。{SUMMARY_EVERY} 秒ごとに集計（始めの値 {first}）"
+            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記します。台本（あれば）とネットワークが終わってから {tail} 秒で終了します（上限 {max} 秒。ネットワークは計測の後も続きます）。{SUMMARY_EVERY} 秒ごとに集計します（始めの値 {first}）"
         ),
         RunLen::Net {
             tail, max: None, ..
         } => writeln!(
             detail_out(out),
-            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記する。ネットワークが終わってから {tail} 秒で終える（台本の無い走りなので、ネットワークが開いている間は計測の上限で止めない。ネットワークは計測の後も続く）。{SUMMARY_EVERY} 秒ごとに集計（始めの値 {first}）"
+            "計測: {POLL_MS} ms ごとにリングバッファから tick ごとの記録・feed の記録・撮影を読み（seq {first_seq} から）、1000 ms ごとに入口を通った回数を読んでファイルへ追記します。ネットワークが終わってから {tail} 秒で終了します（台本のない実行なので、ネットワークが開いている間は計測の上限で止めません。ネットワークは計測の後も続きます）。{SUMMARY_EVERY} 秒ごとに集計します（始めの値 {first}）"
         ),
     };
     let render_only_on = makes_render_only(len, cfg!(feature = "dist"));
     let _ = match len {
         RunLen::Fixed(_) if render_only_on => writeln!(
             detail_out(out),
-            "描画だけのフレームの予定: 設置の後 {} 秒は作らず（基準）、その後 3 秒ごとに N = 1, 2, 3, 10, 60 を繰り返し、{} 秒で終える",
+            "描画だけのフレームの予定: 設置の後 {} 秒は作らず（基準）、その後 3 秒ごとに N = 1, 2, 3, 10, 60 を繰り返し、{} 秒で終了します",
             render_only::BASELINE_SECONDS,
             render_only::TOTAL_SECONDS
         ),
         RunLen::Fixed(_) => writeln!(
             detail_out(out),
-            "描画だけのフレームの予定: 作らない（配布バージョン）"
+            "描画だけのフレームの予定: 未作成（配布バージョン）"
         ),
         RunLen::Script { .. } => {
             writeln!(
                 detail_out(out),
-                "描画だけのフレームの予定: 作らない（台本のある走り）"
+                "描画だけのフレームの予定: 未作成（台本のある実行）"
             )
         }
         RunLen::Net { .. } => {
             writeln!(
                 detail_out(out),
-                "描画だけのフレームの予定: 作らない（ネットワークの実行）"
+                "描画だけのフレームの予定: 未作成（ネットワークの実行）"
             )
         }
     };
@@ -968,22 +942,22 @@ pub fn run_len(
     let mut restarts_logged = 0u32;
     // CHECK のズレを本ログへ書いたか（1 回だけ。全部の欄を書く）と、最後に書いた試験のまとめの印の並び。
     let mut desync_logged = false;
-    // 同期ズレでマッチを止めたことを本ログへ書いたか（止めた秒に 1 回と、Esc で戻った秒に 1 回）。
+    // 同期ズレでマッチを止めたことを本ログへ書いたか（止めた秒に 1 回と、自分の Esc で戻った秒に 1 回）。
     let mut stop_logged = (false, false);
     let mut last_marks: Option<Vec<trial_summary::Mark>> = None;
     // 簡潔なログの「状態の変化」は、前に判じた項目との差で書く。マッチの始まりと終わりの 1 行ずつは `MatchWatch`。
     let mut last_items: Option<Vec<trial_summary::Item>> = None;
-    // rollback のマッチをやめた行（回数が変わるたびに 1 回。簡潔なログにも残す）。
+    // rollback がマッチをやめた行（回数が変わるたびに 1 回。簡潔なログにも残す）。
     let mut last_abort_line: Option<String> = None;
     let mut matches = crate::match_events::MatchWatch::default();
-    // つながりごとの観戦者の出入り・RTT の標本（終わりの節に stall の内訳と一緒に書く）。
+    // 接続ごとの観戦者の出入り・RTT の標本（終わりの節に stall の内訳と一緒に書く）。
     let mut link_log = crate::link_log::LinkLog::default();
     let mut last_net: Option<NetSnapshot> = None;
     // 途中経過の集計・巻き戻しの要約で、前と変わらないものを繰り返さないための覚え。
     let mut echo = ProgressEcho::default();
     let mut last_rollback_interim: Option<String> = None;
-    // つなぎ直せる実行で、前の秒に見たつながりが終わっていたか（終わりの節を 1 本に 1 回だけ書くための縁の検出）と、書いた本数。
-    // ネットワークの数を読めなかった秒は前の値のまま（片づけの後は、次のセッションを置くまでネットワークの数が前のつながりの終わりのまま残る）。
+    // 再接続できる実行で、前の秒に見た接続が終わっていたか（終わりの節を 1 本に 1 回だけ書くための縁の検出）と、書いた本数。
+    // ネットワークの数を読めなかった秒は前の値のまま（片づけの後は、次のセッションを組み込むまでネットワークの数が前の接続の終わりのまま残る）。
     let mut link_end_seen = false;
     let mut links_ended = 0u32;
     // 上限の無い実行もリングバッファの回数は u32 に収める（1 秒 10 回で約 13 年。終わりは下の `last` が決める）。
@@ -1005,16 +979,16 @@ pub fn run_len(
         }
         let k = p / POLLS_PER_SECOND;
         measured = k;
-        // 描画だけのフレームの予定: この秒の区切りで N を頼む（残りが 0 のときだけ置ける）。台本・ネットワークの実行と配るバージョンでは作らない。
+        // 描画だけのフレームの予定: この秒の区切りで N を頼む（残りが 0 のときだけセットできる）。台本・ネットワークの実行と配るバージョンでは作らない。
         if let (true, Some(n)) = (render_only_on, burst_at(k)) {
             let placed = rec.start_render_only(n);
             let _ = writeln!(
                 detail_out(out),
                 "描画だけのフレーム: {k} 秒で N={n} を{}（残り {}）",
                 if placed {
-                    "頼んだ"
+                    "頼みました"
                 } else {
-                    "頼めない（前の分が残っている）"
+                    "頼めませんでした（前の分が残っている）"
                 },
                 rec.render_only_left()
             );
@@ -1033,7 +1007,7 @@ pub fn run_len(
                 ),
                 None => writeln!(
                     detail_out(out),
-                    "TSC の周波数: 始めの 1 秒では求まらない（始め {start_pair:?} / 1 秒 {pair:?} / QPC の周波数 {qpf}）。時刻の列と間隔は出さない"
+                    "TSC の周波数: 始めの 1 秒では求まりません（始め {start_pair:?} / 1 秒 {pair:?} / QPC の周波数 {qpf}）。時刻の列と間隔は出しません"
                 ),
             };
         }
@@ -1055,11 +1029,11 @@ pub fn run_len(
             hook.now_ms().saturating_sub(start)
         );
         if let Some(l) = rec.overlay_stop_line() {
-            let _ = writeln!(out, "{l}（{k} 秒の時点で見た）");
+            let _ = writeln!(out, "{l}（{k} 秒の時点）。");
         }
         // 別のスレッドが本ログへ頼んだ行を、簡潔なログでも 1 秒以内に書く。
         let _ = out.flush();
-        // ネットワークの数は 1 秒ごとに読む（作り直しの行と、ネットワークの実行の終わりの判定）。ネットワークのセッションを置いていなければ None。
+        // ネットワークの数は 1 秒ごとに読む（作り直しの行と、ネットワークの実行の終わりの判定）。ネットワークのセッションを組み込んでいなければ None。
         let net_now = rec.net_status();
         let net_snap = net_now.as_ref().map(|(snap, _)| *snap);
         if let Some(snap) = net_snap {
@@ -1074,7 +1048,7 @@ pub fn run_len(
                 restarts_logged += 1;
                 let _ = writeln!(
                     out,
-                    "{}（{k} 秒の時点で見た）",
+                    "{}（{k} 秒の時点）",
                     snap.restart_line(restarts_logged)
                 );
             }
@@ -1082,16 +1056,16 @@ pub fn run_len(
                 desync_logged = true;
                 let _ = writeln!(
                     out,
-                    "ネットワーク: {l}（{k} 秒の時点で見た。{}）",
+                    "ネットワーク: {l}（{k} 秒の時点。{}）",
                     trial_summary::compare_frames_hint()
                 );
             }
-            // 止めた行は止めた秒に 1 回、Esc で戻った秒にもう 1 回（途中の秒は描画だけのフレームの数が増えるだけで書かない）。
+            // 止めた行は止めた秒に 1 回、自分の Esc で戻った秒にもう 1 回（途中の秒は描画だけのフレームの数が増えるだけで書かない）。
             if let Some(l) = snap.stop_line() {
                 let released = snap.stop & 2 != 0;
                 if !stop_logged.0 || (released && !stop_logged.1) {
                     stop_logged = (true, stop_logged.1 || released);
-                    let _ = writeln!(out, "ネットワーク: {l}（{k} 秒の時点で見た）");
+                    let _ = writeln!(out, "ネットワーク: {l}（{k} 秒の時点）");
                 }
             }
         }
@@ -1101,7 +1075,7 @@ pub fn run_len(
                 .find(|l| l.starts_with(crate::script_win::ROLLBACK_ABORT_HEAD))
             && last_abort_line.as_deref() != Some(l)
         {
-            let _ = writeln!(out, "{l}（{k} 秒の時点で見た）");
+            let _ = writeln!(out, "{l}（{k} 秒の時点）");
             last_abort_line = Some(l.to_string());
         }
         let last = match len {
@@ -1114,7 +1088,7 @@ pub fn run_len(
                     script_ended = Some(k);
                     let _ = writeln!(
                         out,
-                        "ネットワーク: {k} 秒の時点で終わっていた（{}）。{tail} 秒後に計測を終える",
+                        "ネットワーク: 終わっていました（{k} 秒の時点。{}）。{tail} 秒後に計測を終えます。",
                         net_snap.map_or(
                             "ネットワークのセッションを置いていない".to_string(),
                             |s| s.text()
@@ -1133,7 +1107,7 @@ pub fn run_len(
                         script_ended = Some(k);
                         let _ = writeln!(
                             out,
-                            "台本: {k} 秒の時点で進まなくなった（{}）。{tail} 秒後に計測を終える",
+                            "台本: 進まなくなりました（{k} 秒の時点。{}）。{tail} 秒後に計測を終えます。",
                             pr.text(Some(steps))
                         );
                     }
@@ -1141,7 +1115,7 @@ pub fn run_len(
                 k >= max || script_ended.is_some_and(|e| k >= e.saturating_add(tail))
             }
         };
-        // つなぎ直せる実行で、つながりが 1 本終わったのを初めて見た秒（`write_link_end`）。計測は締めない。この秒で計測を終えるなら書かない
+        // 再接続できる実行で、接続が 1 本終わったのを初めて見た秒（`write_link_end`）。計測は締めない。この秒で計測を終えるなら書かない
         // （すぐ後の終わりの段階が同じ中身を書く）。
         let mut link_end_written = false;
         if let Some(s) = net_snap {
@@ -1168,7 +1142,7 @@ pub fn run_len(
             }
             link_end_seen = ended_now;
         }
-        // つながりの終わりの節を書いた秒は、途中経過（集計・試験のまとめ・巻き戻しの要約）を重ねて書かない（同じ秒の同じ数が
+        // 接続の終わりの節を書いた秒は、途中経過（集計・試験のまとめ・巻き戻しの要約）を重ねて書かない（同じ秒の同じ数が
         // 2 回並ぶだけ）。印の並びは覚えておき、次の秒からは変わったときだけ書く。
         if k.is_multiple_of(SUMMARY_EVERY) && !last && !link_end_written {
             let pair = rec.tsc_qpc();
@@ -1246,15 +1220,11 @@ pub fn run_len(
         menu,
         None,
     );
-    // つなぎ直せない実行（つながりが終わると計測も終わる）の、つながりの終わりの行。つなぎ直せる実行は終わりを見た秒に `write_link_end` が書いている。
+    // 再接続できない実行（接続が終わると計測も終わる）の、接続の終わりの行。再接続できる実行は終わりを見た秒に `write_link_end` が書いている。
     if let Some(s) = last_net.filter(|s| !s.relink) {
         for l in link_log.end_lines(&s) {
             let _ = writeln!(out, "{l}");
         }
-    }
-    // D3D8 のデバイスの下見をもう一度読む（設置の直後は主スレッドがまだデバイスを作っていないことがあるので、描画の地点を通った後の値を見る）。
-    for l in rec.d3d8_probe().lines().lines() {
-        let _ = writeln!(detail_out(out), "（終わりに読み直し）{l}");
     }
     // 描画だけのフレームの実験の集計（`_renderonly.csv` と本ログ）。台本のある実行では作っていないので、描画の
     // 回数だけを書く（撮影の描画の番号と突き合わせるため）。
@@ -1267,7 +1237,7 @@ pub fn run_len(
         Some(w) => {
             let _ = writeln!(
                 detail_out(out),
-                "描画: 描画の地点を通った回数 {}、描画のリングバッファに書いた件 {}（台本のある走りなので描画だけのフレームは作っていない）",
+                "描画: 描画のフック地点を通った回数 {}、描画のリングバッファに書いた件 {}（台本のある実行なので描画だけのフレームは作っていません）",
                 rec.draw_calls(),
                 rec.draw_next_seq()
             );
@@ -1362,11 +1332,7 @@ pub(crate) mod tests {
         pub(crate) menu_fail: bool,
         pub(crate) menu_started: bool,
         pub(crate) menu_stopped: bool,
-        /// `d3d8_probe` を呼んだ回数（1 回目と 2 回目で違う値を返す検査に使う）。
-        pub(crate) d3d8_calls: Cell<u32>,
-        /// `d3d8_calls` が指す回数ごとに返す下見（無ければ既定の `D3d8Probe::default()`）。
-        pub(crate) d3d8_by_call: HashMap<u32, D3d8Probe>,
-        /// ネットワークの数（`net_status` を呼んだ回数 → 数）。None ならネットワークのセッションを置いていない。
+        /// ネットワークの数（`net_status` を呼んだ回数 → 数）。None ならネットワークのセッションを組み込んでいない。
         pub(crate) net: Option<fn(u32) -> NetSnapshot>,
         /// ネットワークの外の文（`net_status` を呼んだ回数 → 文）。None なら空の文。
         pub(crate) net_text: Option<fn(u32) -> String>,
@@ -1415,8 +1381,6 @@ pub(crate) mod tests {
                 menu_fail: false,
                 menu_started: false,
                 menu_stopped: false,
-                d3d8_calls: Cell::new(0),
-                d3d8_by_call: HashMap::new(),
                 net: None,
                 net_text: None,
                 net_calls: Cell::new(0),
@@ -1498,11 +1462,6 @@ pub(crate) mod tests {
             self.menu_stopped = true;
             self.menu_stats()
         }
-        fn d3d8_probe(&mut self) -> D3d8Probe {
-            let n = self.d3d8_calls.get() + 1;
-            self.d3d8_calls.set(n);
-            self.d3d8_by_call.get(&n).cloned().unwrap_or_default()
-        }
         fn net_status(&self) -> Option<(NetSnapshot, String)> {
             let f = self.net?;
             let n = self.net_calls.get();
@@ -1524,7 +1483,7 @@ pub(crate) mod tests {
             self.watch
                 .map_or_else(WatchLog::default, |f| f(self.watch_calls))
         }
-        /// 頼まれた N を覚えておく（置けたかは「頼めない」のまま。既存の検査の本ログの文を変えない）。
+        /// 計測の回しから頼まれた N を覚えておく（セットできたかは「頼めない」のまま。既存の検査の本ログの文を変えない）。
         fn start_render_only(&mut self, n: u32) -> bool {
             self.render_only_asks.push(n);
             false
@@ -1659,7 +1618,7 @@ pub(crate) mod tests {
         use crate::net_watch::restart_code;
         use higanr_core::handshake::{FailReason, Restart};
         fn snap(i: u32) -> NetSnapshot {
-            // 0・1 回目: 繋がる前（作り直し 0 → 1）。2・3 回目: 作り直し 3（2 回ぶんまとめて増えた）。4 回目から: 終えた。
+            // 0・1 回目: 接続する前（作り直し 0 → 1）。2・3 回目: 作り直し 3（2 回ぶんまとめて増えた）。4 回目から: 終えた。
             let (phase, restarts) = match i {
                 0 => (0, 0),
                 1 => (0, 1),
@@ -1693,25 +1652,25 @@ pub(crate) mod tests {
         );
         let log = String::from_utf8(out).unwrap();
         for n in 1..=3 {
-            let line = format!("ネットワーク: 接続の手順を作り直した（{n} 回目。");
+            let line = format!("ネットワーク: 接続の手順を作り直しました（{n} 回目。");
             assert_eq!(log.matches(&line).count(), 1, "{n} 回目: {log}");
         }
         assert!(!log.contains("（4 回目。"), "{log}");
         for n in [2, 3] {
             assert!(
                 log.contains(&format!(
-                    "{n} 回目。10 秒のあいだ相手から 1 通も届かなかった。最初から作り直した）（受信ソケットに届いた 0 通。捨てた受信: 候補に無い送り元 0 通 / タグの誤り 0 通 / 別のセッション 0 通）（3 秒の時点で見た）"
+                    "{n} 回目。10 秒のあいだ相手から 1 通も届かなかった。最初から作り直した）（受信ソケットに届いた 0 通。捨てた受信: 候補に無い送り元 0 通 / タグの誤り 0 通 / 別のセッション 0 通）（3 秒の時点）"
                 )),
                 "{n} 回目: {log}"
             );
         }
         assert!(
-            log.contains("ネットワーク: 5 秒の時点で終わっていた"),
+            log.contains("ネットワーク: 終わっていました（5 秒の時点。"),
             "{log}"
         );
         assert!(log.contains("計測の集計: 8 回"), "{log}");
         assert!(
-            log.contains("描画だけのフレームの予定: 作らない（ネットワークの実行）"),
+            log.contains("描画だけのフレームの予定: 未作成（ネットワークの実行）"),
             "{log}"
         );
         assert!(!log.contains("描画だけのフレーム: "), "{log}");
@@ -1729,7 +1688,7 @@ pub(crate) mod tests {
         let log = String::from_utf8(out).unwrap();
         assert!(
             log.contains(
-                "ネットワーク: 1 秒の時点で終わっていた（ネットワークのセッションを置いていない）"
+                "ネットワーク: 終わっていました（1 秒の時点。ネットワークのセッションを置いていない）"
             ),
             "{log}"
         );
@@ -1743,7 +1702,7 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         run_len(&mut h, &mut rec, 0, &mut out, len(6), &GameFacts::default());
         let log = String::from_utf8(out).unwrap();
-        assert!(!log.contains("終わっていた"), "{log}");
+        assert!(!log.contains("終わっていました"), "{log}");
         assert!(log.contains("計測の集計: 6 回"), "{log}");
     }
 
@@ -1780,7 +1739,9 @@ pub(crate) mod tests {
         let log = run_with(None);
         let ended_at = END + 1;
         assert!(
-            log.contains(&format!("ネットワーク: {ended_at} 秒の時点で終わっていた")),
+            log.contains(&format!(
+                "ネットワーク: 終わっていました（{ended_at} 秒の時点。"
+            )),
             "{}",
             &log[log.len().saturating_sub(3000)..]
         );
@@ -1789,17 +1750,17 @@ pub(crate) mod tests {
             "{}",
             &log[log.len().saturating_sub(3000)..]
         );
-        assert!(log.contains("ネットワークが開いている間は計測の上限で止めない"));
+        assert!(log.contains("ネットワークが開いている間は計測の上限で止めません"));
         assert!(log.contains(&format!("計測 {}/上限なし: ", SCRIPT_MAX_SECONDS + 1)));
         assert!(log.contains(&format!(
             "==== 試験のまとめ（途中経過。計測 {} 秒の時点） ====",
             SCRIPT_MAX_SECONDS + SUMMARY_EVERY
         )));
         let log = run_with(Some(SCRIPT_MAX_SECONDS));
-        assert!(!log.contains("終わっていた"));
+        assert!(!log.contains("終わっていました"));
         assert!(log.contains(&format!("計測の集計: {SCRIPT_MAX_SECONDS} 回")));
         assert!(log.contains(&format!(
-            "（上限 {SCRIPT_MAX_SECONDS} 秒。ネットワークは計測の後も続く）"
+            "（上限 {SCRIPT_MAX_SECONDS} 秒。ネットワークは計測の後も続きます）"
         )));
         assert!(!log.contains("上限なし"));
     }
@@ -1882,14 +1843,14 @@ pub(crate) mod tests {
             last.contains("乱数の状態 0x1111") && last.contains("乱数の状態 0x2222"),
             "{last}"
         );
-        assert!(last.contains("〇 繋がったか: 繋がった"), "{last}");
+        assert!(last.contains("〇 接続できたか: 接続した"), "{last}");
         assert_eq!(
             log.matches("ネットワーク: CHECK のズレ: 自分の CHECK: seg 0 frame 60 乱数の状態 0x1111 抽選回数 9 1P ライフ 10 2P ライフ 10 / 相手の CHECK: seg 0 frame 60 乱数の状態 0x2222")
                 .count(),
             1,
             "{log}"
         );
-        assert!(log.contains("（5 秒の時点で見た。"), "{log}");
+        assert!(log.contains("（5 秒の時点。"), "{log}");
         let mut h = clock_hook();
         let mut rec = FakeRecord::new(Vec::new(), 0);
         let mut out = Vec::new();
@@ -1910,7 +1871,7 @@ pub(crate) mod tests {
         assert_eq!(log.matches("==== 試験のまとめ").count(), 1, "{log}");
     }
 
-    /// 簡潔なログ用のネットワークの数: 繋がる → マッチが始まる → マッチが終わる → CHECK がずれる。
+    /// 簡潔なログ用のネットワークの数: 接続 → マッチが始まる → マッチが終わる → CHECK がずれる。
     fn brief_snap(i: u32) -> NetSnapshot {
         use higanr_core::wire::Check;
         let chk = |rng| Check {
@@ -1976,7 +1937,6 @@ pub(crate) mod tests {
         (String::from_utf8(out).unwrap(), rec)
     }
 
-    /// 壊れたら落ちる: 簡潔なログが、毎秒の行・集計の節・全文の途中経過を書く。または、同期のズレ・マッチの節目・状態の変化を落とす。
     #[test]
     fn brief_log_keeps_events_and_anomalies_but_not_the_per_second_noise() {
         let (log, rec) = brief_run(brief_snap);
@@ -2001,14 +1961,14 @@ pub(crate) mod tests {
         assert_eq!(
             heads,
             [
-                "==== 状態の変化（計測 1 秒の時点） ====",
-                "==== 状態の変化（計測 3 秒の時点） ====",
-                "==== 状態の変化（計測 6 秒の時点） ====",
+                "==== 状態の変化（1 秒の時点） ====",
+                "==== 状態の変化（3 秒の時点） ====",
+                "==== 状態の変化（6 秒の時点） ====",
             ],
             "{log}"
         );
-        // 最初は 〇 と × だけ、次は繋がった／マッチが始まった項目だけ、最後は同期のズレ。
-        let first = log.split("==== 状態の変化（計測 3 秒").next().unwrap();
+        // 最初は 〇 と × だけ、次は接続した／マッチが始まった項目だけ、最後は同期のズレ。
+        let first = log.split("==== 状態の変化（3 秒").next().unwrap();
         assert!(first.contains("〇 花映塚のバージョン: "), "{first}");
         assert!(!first.contains("－ "), "最初の節に － が出た:\n{first}");
         let last = &log[log.rfind("==== 状態の変化").unwrap()..];
@@ -2020,8 +1980,8 @@ pub(crate) mod tests {
             !last.contains("〇 花映塚のバージョン"),
             "変わらない項目を繰り返した:\n{last}"
         );
-        assert!(log.contains("試合: 1 試合目が始まった"), "{log}");
-        assert!(log.contains("試合: 1 試合目が終わった"), "{log}");
+        assert!(log.contains("マッチ: 1 マッチ目が始まりました"), "{log}");
+        assert!(log.contains("マッチ: 1 マッチ目が終わりました"), "{log}");
         assert_eq!(
             log.matches("ネットワーク: CHECK のズレ: 自分の CHECK: seg 0 frame 60")
                 .count(),
@@ -2030,20 +1990,18 @@ pub(crate) mod tests {
         );
         // 書いていない CSV を見比べろとは案内しない。詳細で再現する案内になる。
         assert!(!log.contains("_net_frames"), "{log}");
-        assert!(log.contains("detail を 1 にして再現する"), "{log}");
-        // 開いたファイルは無く、1 ms ごとのスレッドも起こさない。
+        assert!(log.contains("detail を 1 にして再現してください"), "{log}");
+        // 開いたファイルは無く、1 ms ごとのスレッドも作らない。
         assert!(rec.outputs.is_empty(), "{:?}", rec.outputs.keys());
         assert!(!rec.menu_started);
     }
 
-    /// 壊れたら落ちる: rollback のマッチをやめた理由（経路と確定したフレーム）が簡潔なログから消える。やめていない実行に出る。
-    /// 同じ行を毎秒書く。
     #[test]
     fn brief_log_says_once_per_change_why_a_rollback_match_was_abandoned() {
         use crate::script_win::ROLLBACK_ABORT_HEAD;
         fn text(i: u32) -> String {
             match i {
-                0..=2 => "受信 …\n巻き戻し（配線）: ふつうの行".to_string(),
+                0..=2 => "受信 …\n巻き戻し（フック）: ふつうの行".to_string(),
                 3..=4 => format!(
                     "受信 …\n{ROLLBACK_ABORT_HEAD} 1 回。最初は「x」（確定したフレーム 1259 の後）"
                 ),
@@ -2076,14 +2034,13 @@ pub(crate) mod tests {
             String::from_utf8(out).unwrap()
         };
         let log = run(text);
-        assert_eq!(log.matches("試合をやめた 1 回").count(), 1, "{log}");
-        assert_eq!(log.matches("試合をやめた 2 回").count(), 1, "{log}");
+        assert_eq!(log.matches("マッチをやめた 1 回").count(), 1, "{log}");
+        assert_eq!(log.matches("マッチをやめた 2 回").count(), 1, "{log}");
         assert!(log.contains("確定したフレーム 1259 の後）（"), "{log}");
-        let quiet = run(|_| "受信 …\n巻き戻し（配線）: ふつうの行".to_string());
-        assert!(!quiet.contains("試合をやめた"), "{quiet}");
+        let quiet = run(|_| "受信 …\n巻き戻し（フック）: ふつうの行".to_string());
+        assert!(!quiet.contains("マッチをやめた"), "{quiet}");
     }
 
-    /// 壊れたら落ちる: 観戦の終わりの理由（ルームの失敗・終わりの記録）が簡潔なログから消える。受信の dump が簡潔に出る。
     #[test]
     fn brief_log_keeps_the_reason_a_watch_ended_but_not_the_receive_dump() {
         fn watch(i: u32) -> WatchLog {
@@ -2091,7 +2048,7 @@ pub(crate) mod tests {
                 WatchLog {
                     ended: vec![(
                         1,
-                        "観戦者のルーム: 入った 1・ルームの失敗 2\n観戦者: 段階 終えた / 終わり 相手が黙った\n受信 Some(RecvStats { x })"
+                        "観戦者のルーム: 入った 1・ルームの失敗 2\n観戦者: 段階 終えた / 終わり 相手の沈黙\n受信 Some(RecvStats { x })"
                             .to_string(),
                     )],
                     live: None,
@@ -2123,11 +2080,10 @@ pub(crate) mod tests {
         let log = String::from_utf8(out).unwrap();
         assert!(log.contains("==== 1 回目の観戦の終わり"), "{log}");
         assert!(log.contains("ルームの失敗 2"), "{log}");
-        assert!(log.contains("終わり 相手が黙った"), "{log}");
+        assert!(log.contains("終わり 相手の沈黙"), "{log}");
         assert!(!log.contains("RecvStats"), "{log}");
     }
 
-    /// 壊れたら落ちる: ネットワークの無い実行（`RunLen::Fixed`）が、簡潔なのに `_renderonly.csv` などを作る。詳細が作らない。
     #[test]
     fn a_fixed_run_writes_the_render_only_csv_only_when_detailed() {
         for (detail, want) in [(false, false), (true, true)] {
@@ -2147,7 +2103,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// 壊れたら落ちる: ネットワークの経路のパニックの行が、簡潔なログから消える。
     #[test]
     fn brief_log_reports_a_panic_in_the_net_path() {
         let mut h = clock_hook();
@@ -2177,7 +2132,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// 壊れたら落ちる: 簡潔と詳細で、書く行の数が逆転する・詳細が今までの行を失う。
     #[test]
     fn detail_log_still_has_the_per_second_lines_and_the_files() {
         let mut h = clock_hook();
@@ -2235,7 +2189,7 @@ pub(crate) mod tests {
                 return head.to_string();
             }
             format!(
-                "{head}\n巻き戻し（製品の経路）: コピー {i}0\nネットワークの外の別の行 {i}\n巻き戻し（状態機械）: 書き戻し {i}1"
+                "{head}\n巻き戻し（製品の処理フロー）: コピー {i}0\nネットワークの外の別の行 {i}\n巻き戻し（状態機械）: 書き戻し {i}1"
             )
         }
         let mut h = clock_hook();
@@ -2257,7 +2211,7 @@ pub(crate) mod tests {
             &trial_summary::installed_game_facts(),
         );
         let log = String::from_utf8(out).unwrap();
-        // 試験のまとめの途中経過は 1 秒目（繋がる前）・3 秒目（印が変わる）・60 秒目。巻き戻しの要約は 60 秒目だけ。
+        // 試験のまとめの途中経過は 1 秒目（接続する前）・3 秒目（印が変わる）・60 秒目。巻き戻しの要約は 60 秒目だけ。
         let heads: Vec<_> = log
             .lines()
             .filter(|l| l.starts_with("==== 試験のまとめ（途中経過"))
@@ -2269,13 +2223,13 @@ pub(crate) mod tests {
             "{log}"
         );
         let at = log
-            .find("---- 巻き戻しの要約（途中経過。計測 60 秒の時点までの合計")
+            .find("---- 巻き戻しの要約（途中経過。60 秒の時点までの合計")
             .expect("60 秒目の巻き戻しの要約が無い");
         let tail: Vec<_> = log[at..].lines().skip(1).take(3).collect();
         assert_eq!(
             tail[..2],
             [
-                "巻き戻し（製品の経路）: コピー 590",
+                "巻き戻し（製品の処理フロー）: コピー 590",
                 "巻き戻し（状態機械）: 書き戻し 591"
             ],
             "{log}"
@@ -2289,8 +2243,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// つなぎ直せる実行（`relink`）のネットワークの数: 呼んだ回数 `i`（1 秒に 1 回）で決める。1 本目は 0〜2 回目に繋がって進み、3〜7 回目は終わったまま、
-    /// 8〜10 回目は次のセッションで 0 から置き直されて繋がり、11 回目から 2 本目も終わる。`ends` が偽なら 1 本も終わらない。
+    /// 再接続できる実行（`relink`）のネットワークの数: 呼んだ回数 `i`（1 秒に 1 回）で決める。1 本目は 0〜2 回目に接続して進み、3〜7 回目は終わったまま、
+    /// 8〜10 回目は次のセッションで 0 から作り直されて接続し、11 回目から 2 本目も終わる。`ends` が偽なら 1 本も終わらない。
     fn relink_snap(i: u32, ends: bool) -> NetSnapshot {
         let ended = ends && ((3..8).contains(&i) || i >= 11);
         NetSnapshot {
@@ -2308,7 +2262,9 @@ pub(crate) mod tests {
 
     /// ネットワークの外の文: 巻き戻しの行の数をその回の番号にする（どの時点の文を書いたかを見る）。
     fn relink_text(i: u32) -> String {
-        format!("受信 合成\n巻き戻し（製品の経路）: コピー {i}0\nネットワークの外の別の行 {i}")
+        format!(
+            "受信 合成\n巻き戻し（製品の処理フロー）: コピー {i}0\nネットワークの外の別の行 {i}"
+        )
     }
 
     fn run_relink(net: fn(u32) -> NetSnapshot) -> String {
@@ -2338,39 +2294,37 @@ pub(crate) mod tests {
         let log = run_relink(|i| relink_snap(i, true));
         let heads: Vec<_> = log
             .lines()
-            .filter(|l| l.contains("回目のつながりの終わり（計測"))
+            .filter(|l| l.contains("回目の接続の終わり（"))
             .collect();
         assert_eq!(
             heads,
             [
-                "==== 1 回目のつながりの終わり（計測 4 秒の時点。計測は続ける。次のつながりを待つ） ====",
-                "==== 2 回目のつながりの終わり（計測 12 秒の時点。計測は続ける。次のつながりを待つ） ====",
+                "==== 1 回目の接続の終わり（4 秒の時点。計測は続ける。次の接続を待つ） ====",
+                "==== 2 回目の接続の終わり（12 秒の時点。計測は続ける。次の接続を待つ） ====",
             ],
             "{log}"
         );
         for (n, k, i) in [(1, 4, 3), (2, 12, 11)] {
-            let at = log
-                .find(&format!("==== {n} 回目のつながりの終わり（"))
-                .unwrap();
+            let at = log.find(&format!("==== {n} 回目の接続の終わり（")).unwrap();
             let sec = &log[at..];
             let sec = &sec[..sec.find(&format!("計測 {}/", k + 1)).expect(sec)];
             assert!(
                 sec.contains(&format!(
-                    "==== 集計（{n} 回目のつながりの終わり。始めからここまで） ===="
+                    "==== 集計（{n} 回目の接続の終わり。始めからここまで） ===="
                 )),
                 "{sec}"
             );
             assert!(sec.contains("書き出し"), "{sec}");
             assert!(
                 sec.contains(&format!(
-                    "==== 試験のまとめ（{n} 回目のつながりの終わり。計測 {k} 秒の時点） ====\n"
+                    "==== 試験のまとめ（{n} 回目の接続の終わり。{k} 秒の時点） ====\n"
                 )),
                 "{sec}"
             );
-            assert!(sec.contains("〇 繋がったか: 繋がった"), "{sec}");
+            assert!(sec.contains("〇 接続できたか: 接続した"), "{sec}");
             assert!(
                 sec.contains(&format!(
-                    "---- 巻き戻しの要約（{n} 回目のつながりの終わり。計測 {k} 秒の時点までの合計。終わりの要約と同じ形） ----\n巻き戻し（製品の経路）: コピー {i}0\n"
+                    "---- 巻き戻しの要約（{n} 回目の接続の終わり。{k} 秒の時点までの合計。終わりの要約と同じ形） ----\n巻き戻し（製品の処理フロー）: コピー {i}0\n"
                 )),
                 "{sec}"
             );
@@ -2378,28 +2332,28 @@ pub(crate) mod tests {
             assert!(!sec.contains("途中経過"), "{sec}");
         }
         assert!(!log.contains("==== 試験のまとめ ====\n"), "{log}");
-        assert!(!log.contains("終わっていた"), "{log}");
+        assert!(!log.contains("終わっていました"), "{log}");
         assert!(log.contains("計測の集計: 20 回"), "{log}");
     }
 
     #[test]
     fn link_end_sections_only_when_a_relinkable_link_ends() {
         let log = run_relink(|i| relink_snap(i, false));
-        assert!(!log.contains("つながりの終わり"), "{log}");
+        assert!(!log.contains("接続の終わり"), "{log}");
         assert!(log.contains("計測の集計: 20 回"), "{log}");
         let log = run_relink(|i| NetSnapshot {
             relink: false,
             ..relink_snap(i, true)
         });
-        assert!(!log.contains("つながりの終わり"), "{log}");
+        assert!(!log.contains("接続の終わり"), "{log}");
         assert!(
-            log.contains("ネットワーク: 4 秒の時点で終わっていた"),
+            log.contains("ネットワーク: 終わっていました（4 秒の時点。"),
             "{log}"
         );
         assert!(log.contains("計測の集計: 7 回"), "{log}");
     }
 
-    /// 1 本目は 0〜2 回目の読みで繋がって進み、3 回目から終わる。観戦者が 1 人入り（1 回目）、抜ける（終わり）。RTT の測定は 1 秒に 1 個。
+    /// 1 本目は 0〜2 回目の読みで接続して進み、3 回目から終わる。観戦者が 1 人入り（1 回目）、抜ける（終わり）。RTT の測定は 1 秒に 1 個。
     fn ending_link_snap(i: u32) -> NetSnapshot {
         let ended = i >= 3;
         NetSnapshot {
@@ -2429,8 +2383,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// 壊れたら落ちる: つながりの終わりの節に stall の内訳・RTT の中央値と最大（標本の数と PONG の数つき）・観戦者の数が出ない、
-    /// 観戦者が来た・抜けた行が本ログに出ない / 毎秒出る、試合の終わりの行に接続が終わった理由が付かない。
     #[test]
     fn the_link_end_section_carries_the_stall_split_rtt_and_spectator_counts() {
         let mut h = clock_hook();
@@ -2453,36 +2405,77 @@ pub(crate) mod tests {
         );
         let log = String::from_utf8(out).unwrap();
         assert_eq!(
-            log.matches("観戦: 観戦者が来た（1 人。いま 1 人").count(),
-            1,
-            "{log}"
-        );
-        assert_eq!(
-            log.matches("観戦: 観戦者が抜けた（自分で抜けた 1 人・黙って外した 0 人。いま 0 人")
+            log.matches("観戦: 自分に観戦者が入りました（1 人。いま 1 人")
                 .count(),
             1,
             "{log}"
         );
-        let at = log.find("==== 1 回目のつながりの終わり（").expect(&log);
+        assert_eq!(
+            log.matches(
+                "観戦: 観戦者が抜けました（自分で抜けた 1 人・応答が無く外した 0 人。いま 0 人"
+            )
+            .count(),
+            1,
+            "{log}"
+        );
+        let at = log.find("==== 1 回目の接続の終わり（").expect(&log);
         let sec = &log[at..];
         let sec = &sec[..sec.find("計測 5/").expect(sec)];
         for want in [
-            "つながり: stall の内訳（フレーム数）: 時刻合わせ 6 / 先に行き過ぎ 3 / 境目 1 / 相手の入力待ち 0 / ほか 0（合計 10）。使ったフレーム 600 のうち 1.67%",
-            "つながり: RTT 中央値 176 ms / 最大 180 ms（測れた PONG 4 個のうち、1 秒ごとの読み取りで採れた標本 4 個。見逃し 0 個）",
-            "つながり: 観戦者 入った 1 人 / 自分で抜けた 1 人 / 黙って外した 0 人 / 上限で断った 0 人（終わりにいた 0 人）",
+            "接続: stall の内訳（フレーム数）: 時刻合わせ 6 / 先に行き過ぎ 3 / 境目 1 / 相手の入力待ち 0 / ほか 0（合計 10）。使ったフレーム 600 のうち 1.67%",
+            "接続: RTT 中央値 176 ms / 最大 180 ms（測れた PONG 4 個のうち、1 秒ごとの読み取りで採れた標本 4 個。見逃し 0 個）",
+            "接続: 観戦者 入った 1 人 / 自分で抜けた 1 人 / 応答が無く外した 0 人 / 上限で断った 0 人（終わりにいた 0 人）",
         ] {
             assert!(sec.contains(want), "{want}\n---\n{sec}");
         }
-        assert_eq!(log.matches("つながり: stall の内訳").count(), 1, "{log}");
+        assert_eq!(log.matches("接続: stall の内訳").count(), 1, "{log}");
         // 試合の始まりと終わりの番号が揃い、終わりに接続の終わりの理由が付く。
-        assert!(log.contains("試合: 1 試合目が始まった"), "{log}");
+        assert!(log.contains("マッチ: 1 マッチ目が始まりました"), "{log}");
         assert!(
-            log.contains("試合: 1 試合目が終わった（接続が終わったため（自分から終えた）"),
+            log.contains("マッチ: 1 マッチ目が終わりました（接続が終わったため（自分から終えた）"),
             "{log}"
         );
     }
 
-    /// 壊れたら落ちる: 前の節と変わらない巻き戻しの要約・tick の集計・書き出しの行を、途中経過のたびに繰り返す。
+    #[test]
+    fn the_link_end_section_carries_the_host_tree_and_measure_rows() {
+        let mut h = clock_hook();
+        let mut rec = FakeRecord::new(Vec::new(), 0);
+        rec.net = Some(ending_link_snap);
+        rec.net_text = Some(|i| {
+            format!(
+                "{}\n観戦: 観戦者 {i} 人（合成）\n観戦者のツリー: 中継役 1 人 / 中継役への振り分け {i}（合成）\n上り回線速度の測定: 観戦者へ測定依頼を送った 1（合成） / 速度の確定 {i}・測定不能 0",
+                relink_text(i)
+            )
+        });
+        let mut out = Vec::new();
+        run_len(
+            &mut h,
+            &mut rec,
+            0,
+            &mut out,
+            RunLen::Net {
+                tail: 3,
+                max: Some(12),
+                steps: 0,
+                feed_first: 0,
+            },
+            &trial_summary::installed_game_facts(),
+        );
+        let log = String::from_utf8(out).unwrap();
+        let at = log.find("==== 1 回目の接続の終わり（").expect(&log);
+        let sec = &log[at..];
+        let sec = &sec[..sec.find("計測 5/").expect(sec)];
+        for want in [
+            "\n観戦者のツリー: 中継役 1 人 / 中継役への振り分け 3（合成）\n",
+            "\n上り回線速度の測定: 観戦者へ測定依頼を送った 1（合成） / 速度の確定 3・測定不能 0\n",
+        ] {
+            assert_eq!(sec.matches(want).count(), 1, "{want}\n---\n{sec}");
+        }
+        // 長い集計の行（観戦: …）はこの節に写さない。
+        assert!(!sec.contains("観戦: 観戦者 3 人（合成）"), "{sec}");
+    }
+
     #[test]
     fn unchanged_interim_lines_are_not_repeated() {
         let mut h = clock_hook();
@@ -2494,7 +2487,7 @@ pub(crate) mod tests {
             agreed_mismatch: Some(0),
             ..NetSnapshot::default()
         });
-        rec.net_text = Some(|_| "受信 合成\n巻き戻し（製品の経路）: コピー 7".to_string());
+        rec.net_text = Some(|_| "受信 合成\n巻き戻し（製品の処理フロー）: コピー 7".to_string());
         let mut out = Vec::new();
         run_len(
             &mut h,
@@ -2524,14 +2517,13 @@ pub(crate) mod tests {
             "{log}"
         );
         assert_eq!(
-            log.matches("集計: tick の集計と書き出しの行は、前の節から変わらないときは書かない")
+            log.matches("集計: tick の集計と書き出しの行は、前の節から変わらないときは書きません")
                 .count(),
             1,
             "{log}"
         );
     }
 
-    /// 壊れたら落ちる: 持ちきれなかった件数が増えるだけの節を別の中身と見て毎回書く / 件数以外の変わりを同じと見て書かない。
     #[test]
     fn a_tick_summary_that_only_grew_its_overflow_counts_as_unchanged() {
         let base = Collected::default();
@@ -2615,7 +2607,7 @@ pub(crate) mod tests {
             }),
             130,
         );
-        let head = "==== 1 回目の観戦の終わり（計測 5 秒の時点。計測は続ける） ====";
+        let head = "==== 1 回目の観戦の終わり（観戦者として。5 秒の時点。計測は続ける） ====";
         assert_eq!(log.matches("回目の観戦の終わり").count(), 1, "{log}");
         let at = log.find(head).expect(&log);
         assert!(log.find("計測 5/130:").unwrap() < at, "{log}");
@@ -2642,8 +2634,8 @@ pub(crate) mod tests {
         assert_eq!(
             heads,
             [
-                "---- 観戦の途中経過（計測 60 秒の時点までの合計） ----",
-                "---- 観戦の途中経過（計測 120 秒の時点までの合計） ----",
+                "---- 観戦の途中経過（60 秒の時点までの合計） ----",
+                "---- 観戦の途中経過（120 秒の時点までの合計） ----",
             ],
             "{log}"
         );
@@ -2669,9 +2661,9 @@ pub(crate) mod tests {
             70,
         );
         let a = log
-            .find("==== 2 回目の観戦の終わり（計測 60 秒")
+            .find("==== 2 回目の観戦の終わり（観戦者として。60 秒")
             .expect(&log);
-        let b = log.find("---- 観戦の途中経過（計測 60 秒").expect(&log);
+        let b = log.find("---- 観戦の途中経過（60 秒").expect(&log);
         assert!(a < b, "{log}");
     }
 
@@ -2858,7 +2850,7 @@ pub(crate) mod tests {
         let log = String::from_utf8(out).unwrap();
         assert_eq!(t.interval, None);
         assert!(
-            log.contains("TSC の周波数: 始めの 1 秒では求まらない"),
+            log.contains("TSC の周波数: 始めの 1 秒では求まりません"),
             "{log}"
         );
         assert!(
@@ -2866,54 +2858,19 @@ pub(crate) mod tests {
             "{log}"
         );
         assert!(log.contains("synthetic_changes.csv に 92 行"), "{log}");
-        assert!(log.contains("[0x004B30C4] は読めない"), "{log}");
+        assert!(log.contains("[0x004B30C4] は読み取り不能"), "{log}");
         assert!(
             log.contains("分からない（CPUID に 0x80000007 の葉が無い）"),
             "{log}"
         );
         assert!(
-            log.contains("メニューとライフ: 読み取りのスレッドを起こせない（合成の失敗）"),
+            log.contains("メニューとライフ: 読み取りのスレッドの作成不能（合成の失敗）"),
             "{log}"
         );
-        assert!(log.contains("メニューとライフ（終わり）: 読み取りのスレッドが無い"));
+        assert!(log.contains("メニューとライフ（終わり）: 読み取りのスレッドがありません"));
         assert!(log.contains("計測の集計: 3 回"), "{log}");
     }
 
-    #[test]
-    fn d3d8_probe_is_read_again_at_the_end() {
-        let mut h = clock_hook();
-        let mut r = FakeRecord::new(sixty_fps(6), 6);
-        r.d3d8_by_call.insert(
-            2,
-            D3d8Probe {
-                device: Some(0x1234_5678),
-                vtable: Some(0x1000),
-                endscene: Some(0x2000),
-                present: Some(0x3000),
-                endscene_module: Some("th09.exe".to_string()),
-                present_module: Some("th09.exe".to_string()),
-            },
-        );
-        let mut out = Vec::new();
-        run(&mut h, &mut r, 0, &mut out, 1);
-        let log = String::from_utf8(out).unwrap();
-        assert_eq!(r.d3d8_calls.get(), 2, "始めと終わりの 2 回だけ読む");
-        assert!(
-            log.contains("D3D8 の下見: デバイス [0x4B3108] = 読めない"),
-            "{log}"
-        );
-        assert!(
-            log.contains("（終わりに読み直し）D3D8 の下見: デバイス [0x4B3108] = 0x12345678"),
-            "{log}"
-        );
-        assert!(
-            log.contains("（終わりに読み直し）D3D8 の下見: EndScene のモジュール = th09.exe"),
-            "{log}"
-        );
-    }
-
-    /// 壊れたら落ちる: 見張りが文字の描画の止まった理由を問わない・問っても本ログへ書かない・秒の時点を付けない。
-    /// 落ちた後の調べで描画が止まっていたかが読めなくなる。
     #[test]
     fn overlay_stop_line_is_asked_every_second_and_written_to_the_brief_log() {
         let mut h = clock_hook();
@@ -2924,7 +2881,7 @@ pub(crate) mod tests {
         let log = String::from_utf8(out).unwrap();
         assert_eq!(r.overlay_stop_calls, 5, "1 秒ごとに問う");
         assert_eq!(
-            log.matches("文字の描画: 描画を止めた（合成）（3 秒の時点で見た）")
+            log.matches("文字の描画: 描画を止めた（合成）（3 秒の時点）。")
                 .count(),
             1,
             "{log}"
@@ -2976,14 +2933,14 @@ pub(crate) mod tests {
         if dist {
             assert!(r.render_only_asks.is_empty(), "{:?}", r.render_only_asks);
             assert!(
-                log.contains("描画だけのフレームの予定: 作らない（配布バージョン）"),
+                log.contains("描画だけのフレームの予定: 未作成（配布バージョン）"),
                 "{log}"
             );
             assert!(!log.contains("秒で N="), "{log}");
         } else {
             assert_eq!(r.render_only_asks, vec![1, 2, 3], "{log}");
             assert!(log.contains("描画だけのフレームの予定: 設置の後"), "{log}");
-            assert!(!log.contains("作らない"), "{log}");
+            assert!(!log.contains("未作成"), "{log}");
         }
     }
 }

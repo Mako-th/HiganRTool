@@ -1,9 +1,9 @@
 //! 素の花映塚でのリプレイの再生を見張り、各ラウンドの決着の tick の値をログへ 1 行残す（pure。unsafe 無し）。リプレイの印の `rN` と
-//! 突き合わせて、生きた試合どおりに再生できたかを機械で確かめるため（道具は `higanr_core::replay_playcheck`）。
+//! 突き合わせて、生きた試合どおりに再生できたかを機械で検証するため（ツールは `higanr_core::replay_playcheck`）。
 //! - ゲームのスレッドの判断（`PlayWatch::tick`）: 入力の地点で毎 tick、Match の場面・再生の側（`+0x114` が 0 でない）かを見て、
-//!   生きた試合と同じ `MatchLog` / `read_boundary` で境目の値を積む。再生を出たら（場面を出る・生きた側になる）1 回分を `PlayHandoff` に置く。
-//!   確保・ファイル・ロック待ち・パニックしうる添字を置かない。生きた試合とネットワークの経路の状態には触らない。
-//!   1 ラウンドも決着しなかった再生（タイトルのデモなど）と、直前と同じ中身の再生は置かない。
+//!   生きた試合と同じ `MatchLog` / `read_boundary` で境目の値を積む。再生を出たら（場面を出る・生きた側になる）1 回分を `PlayHandoff` に書く。
+//!   確保・ファイル・ロック待ち・パニックしうる添字を持たない。生きた試合とネットワークの経路の状態には触らない。
+//!   1 ラウンドも決着しなかった再生（タイトルのデモなど）と、直前と同じ中身の再生は書かない。
 //! - 受け渡し（`PlayHandoff`。原子変数の小さなリング）: 書き手はゲームのスレッド 1 本、読み手は本ログへ行を頼むスレッド 1 本。
 #![forbid(unsafe_code)]
 
@@ -16,7 +16,7 @@ use crate::netplay::SCENE_MATCH;
 use crate::replay_save::SaveIo;
 use crate::th09_addr::GAME_MODE_MATCH;
 
-/// 再生した見出しの日付と名前の生のバイト（`+0xC4` / `+0xCE` の各 9 バイト）。行に書ける字にするのは読み手（`Ident::from_header`）。
+/// 再生した見出しの日付と名前の生のバイト（`+0xC4` / `+0xCE` の各 9 バイト）。行に書ける文字にするのは読み手（`Ident::from_header`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderIdent {
     pub date: [u8; HEADER_FIELD_LEN],
@@ -93,7 +93,7 @@ fn from_words(w: &[u32; SLOT_WORDS]) -> PlayReport {
 
 /// ゲームのスレッド（書き手 1 本）から本ログへ頼むスレッド（読み手 1 本）への受け渡し。
 pub struct PlayHandoff {
-    /// 置いた回数（枠は `written % SLOTS`）。書き手だけが進める。
+    /// 書いた回数（枠は `written % SLOTS`）。書き手だけが進める。
     written: AtomicU32,
     slots: [[AtomicU32; SLOT_WORDS]; SLOTS],
 }
@@ -106,7 +106,7 @@ impl PlayHandoff {
         }
     }
 
-    /// 1 回分を置く（書き手）。枠を埋めてから回数を `Release` で進める。
+    /// 1 回分を書く（書き手）。枠を埋めてから回数を `Release` で進める。
     pub fn publish(&self, r: &PlayReport) {
         let n = self.written.load(Ordering::Relaxed);
         let slot = &self.slots[n as usize % SLOTS];
@@ -116,7 +116,7 @@ impl PlayHandoff {
         self.written.store(n.wrapping_add(1), Ordering::Release);
     }
 
-    /// 置かれた分を古い順に `f` へ渡す（読み手）。`read` は読み終えた回数（呼び手が持つ）。書き手に追い越された分は数えて返す。
+    /// 書かれた分を古い順に `f` へ渡す（読み手）。`read` は読み終えた回数（呼び手が持つ）。書き手に追い越された分は数えて返す。
     pub fn drain(&self, read: &mut u32, mut f: impl FnMut(PlayReport)) -> u32 {
         let mut lost = 0u32;
         let w = self.written.load(Ordering::Acquire);
@@ -235,7 +235,7 @@ impl PlayWatch {
         }
     }
 
-    /// 再生の側でなくなった（場面を出た・生きた試合になった）。見張っていたなら 1 回分を置く。
+    /// 再生の側でなくなった（場面を出た・生きた試合になった）。見張っていたなら 1 回分を `PlayHandoff` に書く（本ログへは読み手のスレッドが書く）。
     fn leave(&mut self, h: &PlayHandoff) {
         if !self.active {
             return;
@@ -344,7 +344,7 @@ mod tests {
         // 出た後の tick は何も足さない。
         w.tick(&h, &mut g);
         assert!(lines(&h, &mut read).is_empty());
-        // 行は道具が読める形。
+        // 行はツールが読める形。
         let p = parse_log(&l[0]);
         assert!(p.bad.is_empty());
         assert_eq!(p.blocks[0].rounds.len(), 2);
@@ -417,7 +417,7 @@ mod tests {
         w.tick(&h, &mut g);
         let l = lines(&h, &mut read);
         assert_eq!(l.len(), 1);
-        assert!(l[0].contains("途中で終わった end=partial"), "{}", l[0]);
+        assert!(l[0].contains("途中終了 end=partial"), "{}", l[0]);
         assert!(l[0].contains("rounds=1 r1=5000.2."), "{}", l[0]);
     }
 
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(h.drain(&mut read, |_| panic!("もう無い")), 0);
     }
 
-    /// 書き手が読み手より速く回っても、渡された 1 件は 1 回分の中身のまま（別の回の語が混ざらない）で、渡した数 + 落とした数 = 置いた数。
+    /// 書き手が読み手より速く回っても、渡された 1 件は 1 回分の中身のまま（別の回の語が混ざらない）で、渡した数 + 落とした数 = 書いた数。
     #[test]
     fn a_fast_writer_never_hands_over_a_torn_report() {
         use std::sync::atomic::AtomicBool;

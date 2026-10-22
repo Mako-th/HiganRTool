@@ -1,21 +1,11 @@
 //! 受信スレッドがその場で返す PONG の応答役。
 //!
-//! 以前は PING への PONG もゲームのスレッド側のセッション（`link.rs` → `liveness.rs`）が返していた。ゲームのスレッドが
-//! リングを空にするのは tick の始まりだけなので、マッチの外では PING が最大 1 tick（16.7 ms）待ち、相手の測る RTT が
-//! その分大きく出た。PONG は PING の send_time をそのまま返すだけでゲームの状態も自分の時計も要らないので、
-//! 受信スレッドが受けたその場で返す。マッチの入力への遅延の増分は 0（PING でない 1 通は type の 1 バイトを見て素通り）。
-//!
-//! 応答役が持つのは、繋がった後にセッションが作る値のコピー（session_id・鍵・相手の候補・採った経路。`Link::pong_responder`）だけで、
-//! 生存の状態は持たない。**返してよいかは呼び手が生存の状態から決め、「生きている」の間だけ呼ぶ**
-//! （dll は `NetPlay` が tick ごとに見て、受信スレッドへ原子変数で渡す）。
-//!
-//! 受信のガードはセッション（`Link::on_datagram`）と同じ順と条件: type が PING → 候補（繋がる前に学んだ候補を含む）のどれかから
-//! 来た → session_id が同じ → タグが合う → 解ける。外れたら何も返さない。返した 1 通も受信スレッドはリングへ積み
-//! （生存の「届いた」の印を失わないため）、「PONG を返した」の印を添えてセッションが PONG を重ねないようにする
-//! （`Link::on_datagram_marked`）。
-//!
-//! 受信スレッドで 1 通ごとに呼ぶので、ヒープを使わず、パニックしうる添字と unwrap を置かない（パニックすると以後
-//! 何も受けない）。返すバイト列は呼び手のスタックの `[u8; MAX_DATAGRAM]` に作る。
+//! PING への PONG をゲームのスレッド側のセッション（`link.rs` → `liveness.rs`）が返すと、ゲームのスレッドがリングを空にするのは tick の始まりだけなので、マッチの外では PING が最大 1 tick（16.7 ms）待ち、相手の測る RTT がその分大きく出た。PONG は PING の send_time を返すだけでゲームの状態も自分の時計も要らないので、受信スレッドが受けたその場で返す（マッチの入力への遅延の増分は 0。
+//! PING でない 1 通は type の 1 バイトを見て素通り）。
+//! 応答役が持つのは、接続した後にセッションが作る値のコピー（session_id・鍵・相手の候補・採った経路。`Link::pong_responder`）だけで、生存の状態は持たない。**返してよいかは呼び手が生存の状態から決め、「生きている」の間だけ呼ぶ**（dll は `NetPlay` が tick ごとに見て、受信スレッドへ原子変数で渡す）。
+//! 受信のガードはセッション（`Link::on_datagram`）と同じ順と条件: type が PING → 候補（接続する前に学んだ候補を含む）のどれかから来た →session_id が同じ → タグが合う → 解ける。外れたら何も返さない。返した 1 通も受信スレッドはリングへ積み（生存の「届いた」の印を失わないため）、「PONG を返した」の印を添えて、セッションが PONG を重ねないようにする（`Link::on_datagram_marked`）。
+//! 受信スレッドで 1 通ごとに呼ぶので、ヒープを使わず、パニックしうる添字と unwrap を使わない（パニックすると以後何も受けない）。
+//! 返すバイト列は呼び手のスタックの `[u8; MAX_DATAGRAM]` に作る。
 
 use std::net::SocketAddr;
 
@@ -24,11 +14,11 @@ use crate::candidate::{Candidates, Learned};
 use crate::seal::{Opener, Sealer, Seq};
 use crate::wire::{self, ByeReason, MAX_DATAGRAM, Message};
 
-/// 受信スレッドの PONG の応答役（繋がった後のセッションの値のコピー）。接続ごとに 1 つ。
+/// 受信スレッドの PONG の応答役（接続した後のセッションの値のコピー）。接続ごとに 1 つ。
 ///
 /// PING も PONG も封じた便なので、相手からの向きの `Opener` と、送り手の印 `Sender::Pong` の `Sealer` を持つ。
-/// 通し番号は応答役に持たせず、返すたびに呼び手が渡す（[`PongResponder::answer`]）。dll では受信スレッドの受け渡しの
-/// 入れ物が `Seq` を 1 つだけ持ち 0 に戻さない（2 本の受信スレッドと置き直した応答役が全部使う）ので、同じ番号を
+/// 通し番号は応答役に持たせず、返すたびに呼び手が渡す（[`PongResponder::answer`]）。dll では、ゲームのスレッドから受信スレッドへ応答役を渡す
+/// 入れ物が `Seq` を 1 つだけ持ち 0 に戻さない（2 本の受信スレッドと差し替えた応答役が全部使う）ので、同じ番号を
 /// 2 回使わない。ゲームのスレッド側のセッションとは送り手の印が違うので重ならない。
 #[derive(Debug, Clone)]
 pub struct PongResponder {
@@ -39,9 +29,9 @@ pub struct PongResponder {
     seal: Sealer,
     /// 受ける送り元（セッションの `Paths::accepts` と同じ: 候補のどれか）。
     peers: Candidates,
-    /// 繋がる前に学んだ候補（`Paths::learn`）。繋がった経路が学んだアドレスのことがあるので受けにも含める（セッションと同じガード）。
+    /// 接続する前に学んだ候補（`Paths::learn`）。接続した経路が学んだアドレスのことがあるので受けにも含める（セッションと同じガード）。
     learned: Learned,
-    /// 返す先（セッションが繋がった後の送りに使う経路と同じ）。
+    /// 返す先（セッションが接続した後の送りに使う経路と同じ）。
     path: SocketAddr,
 }
 
@@ -65,7 +55,7 @@ impl PongResponder {
         }
     }
 
-    /// 繋がる前に学んだ候補も受ける送り元に加える（`Link::pong_responder` が `Paths::learned` を渡す）。
+    /// 接続する前に学んだ候補も受ける送り元に加える（`Link::pong_responder` が `Paths::learned` を渡す）。
     #[must_use]
     pub fn with_learned(mut self, learned: Learned) -> Self {
         self.learned = learned;
@@ -343,7 +333,7 @@ mod tests {
     fn nothing_is_returned_for_anything_but_a_real_ping() {
         let r = responder();
         let good = ping(42);
-        // 隣に「同じ標本の正しい形なら返す」を置く（下の否定が、応答役が壊れて何も返さないだけで通らないように）。
+        // 隣に「同じ標本の正しい形なら返す」を並べる（下の否定が、応答役が壊れて何も返さないだけで通らないように）。
         assert!(ans(&r, "127.0.0.1:4001", &good).is_some());
 
         for i in HEADER_LEN..good.len() {
@@ -450,6 +440,7 @@ mod tests {
                 ack: 2,
                 base: 2,
                 lat: None,
+                stamp: crate::wire::Stamp::NONE,
                 count: 1,
                 words,
             }),
@@ -485,7 +476,7 @@ mod tests {
         for _ in 0..20_000 {
             let len = (next() % 1300) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            // 半分は PING のヘッダ 12 B を先頭に置く（type のガードを越えて `Opener` のガードまで届かせる）。
+            // 半分は PING のヘッダ 12 B を先頭に付ける（type のガードを越えて `Opener` のガードまで届かせる）。
             if next() % 2 == 0 {
                 for (d, s) in b.iter_mut().zip(head.iter().take(HEADER_LEN)) {
                     *d = *s;

@@ -43,13 +43,13 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// 本ログ `log` の複製へ書くハンドラを入れる（プロセスで 1 回）。ゲームのスレッドでは呼ばない。
 pub fn install(log: &File) -> Result<(), String> {
     if INSTALLED.swap(true, Ordering::AcqRel) {
-        return Err("既に入れてある".to_string());
+        return Err("既に登録済み".to_string());
     }
     // 本ログの書き手は自分のスレッドが終わると閉じるので、ハンドラには閉じない複製を持たせる（同じファイルオブジェクトなので、
     // 書く位置は通常の書き手と共有され、上書きし合わない）。
     let dup = log
         .try_clone()
-        .map_err(|e| format!("ログのハンドルを複製できない: {e}"))?;
+        .map_err(|e| format!("ログのハンドルが複製不可: {e}"))?;
     let mut pinned: HMODULE = core::ptr::null_mut();
     // SAFETY: 旗は「アドレスから引く」＋「固定する」。第 2 引数はこの DLL の中の関数のアドレスを指す疑似ポインタで、中身は読まれない。
     let ok = unsafe {
@@ -60,13 +60,13 @@ pub fn install(log: &File) -> Result<(), String> {
         )
     };
     if ok == 0 {
-        return Err("DLL を固定できない（外さないハンドラを入れられない）".to_string());
+        return Err("DLL 固定不能（外さないハンドラを登録できません）".to_string());
     }
     LOG.store(dup.into_raw_handle(), Ordering::Release);
     // SAFETY: 渡す関数は PVECTORED_EXCEPTION_HANDLER の形で、上で固定した DLL の中にあり、プロセスの終わりまで呼べる。
     let handle = unsafe { AddVectoredExceptionHandler(0, Some(on_exception)) };
     if handle.is_null() {
-        return Err("AddVectoredExceptionHandler が失敗した".to_string());
+        return Err("AddVectoredExceptionHandler が失敗しました".to_string());
     }
     Ok(())
 }
@@ -84,14 +84,14 @@ pub fn summary_line() -> Option<String> {
     }
     let (lines, repeats, dropped) = (KINDS.lines(), KINDS.repeats(), KINDS.dropped());
     let mut text = format!(
-        "例外: ここまでに致命的なコードの例外を {seen} 回見た（行にしたのは別々の {lines} 件。同じ例外（コードと場所が同じ）の繰り返し {repeats} 回は行にしていない"
+        "例外: ここまでに致命的なコードの例外を {seen} 回見ました（行にしたのは別々の {lines} 件。同じ例外（コードと場所が同じ）の繰り返し {repeats} 回は行にしていません"
     );
     if dropped > 0 {
         text.push_str(&format!(
             "。{MAX_LINES} 件の上限を超えて行にしなかった別の例外 {dropped} 回"
         ));
     }
-    text.push('）');
+    text.push_str("）。");
     Some(text)
 }
 
@@ -110,7 +110,7 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// 数えて、初めての（コード, 場所）なら 1 行書く。大きなバッファは下の関数の中に置き、ここのフレームは小さく保つ。
+/// 数えて、初めての（コード, 場所）なら 1 行書く。大きなバッファは下の関数の中に確保し、ここのフレームは小さく保つ。
 fn observe(code: u32, addr: u32, params: &[usize]) {
     if fatal_name(code).is_none() {
         return;
@@ -288,9 +288,6 @@ mod tests {
             .collect()
     }
 
-    /// 壊れたら落ちる: 致命的でないコードを書く・数える、致命的なコードを書かない、アクセスの対象や場所のモジュールを落とす、
-    /// 同じ（コード, 場所）の繰り返しで行を使う、別の組を行にしない、32 件の上限を超えて書く・上限で数えるのをやめる、
-    /// スタックオーバーフローでモジュールを引く。
     #[test]
     fn the_handler_writes_each_distinct_place_once_and_stops_after_thirty_two_lines() {
         let dir = std::env::temp_dir().join(format!("higanr_crash_{}", std::process::id()));
@@ -319,7 +316,7 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         let l = &got[0];
         assert!(
-            l.starts_with("例外を見た（落ちたとは限らない・1 件目）: "),
+            l.starts_with("例外を見ました（落ちたとは限らない・1 件目）: "),
             "{l}"
         );
         assert!(
@@ -339,11 +336,11 @@ mod tests {
             "{l}"
         );
 
-        // スタックオーバーフローの経路は、本物を起こさずに直に通す。
+        // スタックオーバーフローの経路は、本物を発生させずに直に通す。
         observe(STACK_OVERFLOW, 0x0040_1000, &[]);
         let l = &lines(&path)[1];
         assert!(
-            l.starts_with("例外を見た（落ちたとは限らない・2 件目）")
+            l.starts_with("例外を見ました（落ちたとは限らない・2 件目）")
                 && l.contains(
                     "0xC00000FD スタックオーバーフロー / 場所 0x00401000（モジュールは引かない）"
                 ),
@@ -388,7 +385,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 壊れたら落ちる: イメージの先頭と名前の引き方。実行ファイル・システムの DLL の名前と RVA が合い、イメージの外（スタック）は引けない。
     #[test]
     fn the_module_of_an_address_comes_from_the_mapping_without_the_loader_lock() {
         let mut name = [0u8; 96];

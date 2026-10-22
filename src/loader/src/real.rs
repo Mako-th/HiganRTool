@@ -1,5 +1,8 @@
-//! 本物の Win32（`windows-sys`）。ローダーの unsafe は `folder_dialog.rs`・`http_win.rs` とここにだけ置く。
-//! 判断はしない（手順は `launch.rs`。ここに置くと偽物の検査が本物の経路を見なくなる）。
+//! 本物の Win32（`windows-sys`）。ローダーの unsafe は `folder_dialog.rs`・`http_win.rs` とここにだけある。
+//! 判断はしない（手順は `launch.rs`。ここに書くと偽物の検査が本物の経路を見なくなる）。
+
+// std の ProcessPrng の遅延読み込みが失敗したときのフック（build.rs の /DELAYLOAD と対）。
+higanr_prng_shim::install_delay_load_hook!();
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -87,6 +90,16 @@ fn push_quoted(out: &mut Vec<u16>, arg: &OsStr) -> Option<()> {
     Some(())
 }
 
+/// 子に渡すコマンドライン。引数が無ければ None（`lpCommandLine` を NULL にし、Windows が実行ファイルのパスを引用符なしで
+/// そのまま使う）。vpatch と同じ形で、Discord は花映塚をコマンドラインの文字列で見分けるため、vpatch で登録した Discord の
+/// 項目がそのまま当たる。花映塚はコマンドラインの中身を使わない（vpatch の起動で遊べている）。
+pub fn command_line_or_null(spawn: &Spawn) -> Result<Option<Vec<u16>>, ()> {
+    if spawn.args.is_empty() {
+        return Ok(None);
+    }
+    command_line(spawn).map(Some).ok_or(())
+}
+
 pub fn command_line(spawn: &Spawn) -> Option<Vec<u16>> {
     let mut out = Vec::new();
     push_quoted(&mut out, spawn.exe.as_os_str())?;
@@ -99,7 +112,7 @@ pub fn command_line(spawn: &Spawn) -> Option<Vec<u16>> {
 }
 
 /// `no_activate` なら、子の最初の `ShowWindow` の `nCmdShow` を `SW_SHOWNOACTIVATE` にする。
-/// 前面のアプリの子孫として起こしたプロセスの最初のウィンドウには Windows が前面を渡し、起こした花映塚が約 1.4 秒後に
+/// 前面のアプリの子孫として起動したプロセスの最初のウィンドウには Windows が前面を渡し、起動した花映塚が約 1.4 秒後に
 /// 前面を取ってキー入力を奪った（実測）ため。
 pub fn startup_info(no_activate: bool) -> STARTUPINFOW {
     let mut si = STARTUPINFOW {
@@ -137,7 +150,7 @@ impl Win32 for RealWin32 {
 
     fn create_process_suspended(&mut self, spawn: &Spawn) -> Result<ProcessInfo, ErrorCode> {
         let app = wide_nul(spawn.exe.as_os_str()).ok_or(ERROR_INVALID_PARAMETER)?;
-        let mut cmd = command_line(spawn).ok_or(ERROR_INVALID_PARAMETER)?;
+        let mut cmd = command_line_or_null(spawn).map_err(|()| ERROR_INVALID_PARAMETER)?;
         let cwd = wide_nul(spawn.cwd.as_os_str()).ok_or(ERROR_INVALID_PARAMETER)?;
         // 足す変数が無ければ親の環境を継がせる（NULL）。有れば親の環境に重ねたブロックを渡す。
         let env_block = if spawn.env.is_empty() {
@@ -159,12 +172,13 @@ impl Win32 for RealWin32 {
             .map_or(ptr::null(), |b| b.as_ptr().cast());
         let si = startup_info(spawn.no_activate);
         let mut pi = PROCESS_INFORMATION::default();
-        // SAFETY: 文字列は終端 0 つきで生きている。lpCommandLine は書き換えられうるので自分の `Vec` を渡す。
+        let cmd_ptr = cmd.as_mut().map_or(ptr::null_mut(), |c| c.as_mut_ptr());
+        // SAFETY: 文字列は終端 0 つきで生きている。lpCommandLine は書き換えられうるので自分の `Vec` か NULL を渡す。
         // ハンドルは継承させない。環境は null か、生きている `env_block`（CREATE_UNICODE_ENVIRONMENT を立てた）。
         let ok = unsafe {
             CreateProcessW(
                 app.as_ptr(),
-                cmd.as_mut_ptr(),
+                cmd_ptr,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -416,7 +430,7 @@ pub fn quiet_error_mode() {
     }
 }
 
-/// 黒いウィンドウに付いているプロセスの数。ショートカット起動なら 1、コマンドプロンプトや検査の道具からなら 2 以上。取れなければ None。
+/// 黒いウィンドウに付いているプロセスの数。ショートカット起動なら 1、コマンドプロンプトや検査のツールからなら 2 以上。取れなければ None。
 pub fn console_process_count() -> Option<u32> {
     use windows_sys::Win32::System::Console::GetConsoleProcessList;
     let mut ids = [0u32; 4];
@@ -524,6 +538,23 @@ impl crate::single::Host for RealSingle {
         unsafe { CloseHandle(p) };
         (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
+
+    fn mutex_exists(&mut self, name: &str) -> bool {
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        // 標準のアクセス権の SYNCHRONIZE（待てるだけ）。
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let Some(wide) = wide_nul(OsStr::new(name)) else {
+            return false;
+        };
+        // SAFETY: `wide` は終端 0 つきで生きている。開くだけで、作らない・取らない。
+        let m = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
+        if m.is_null() {
+            return false;
+        }
+        // SAFETY: 上で開いた `m` を閉じる（1 回だけ）。
+        unsafe { CloseHandle(m) };
+        true
+    }
 }
 
 /// OS の UI の言語（`GetUserDefaultUILanguage`。LANGID）。画面の言語の既定に使う。
@@ -542,7 +573,7 @@ const CLIPBOARD_GAP_MS: u64 = 20;
 
 /// `text` をクリップボードへコピーする。検査からは呼ばない（使っている人のクリップボードを書き換えるため。`code_relay::Host` の偽物で差し替える）。
 ///
-/// 開き手のウィンドウは NULL。文書は「EmptyClipboard すると持ち主が NULL になり SetClipboardData が失敗する」と書くが、実物では確かめていない。
+/// 開き手のウィンドウは NULL。文書は「EmptyClipboard すると持ち主が NULL になり SetClipboardData が失敗する」と書くが、実物では検証していない。
 /// 失敗したら理由を返す。
 pub fn set_clipboard_text(text: &str, lang: Lang) -> Result<(), String> {
     use windows_sys::Win32::Foundation::GlobalFree;
@@ -699,7 +730,7 @@ pub fn is_wine() -> bool {
 
 const ERROR_MOD_NOT_FOUND: ErrorCode = 126;
 
-/// import の引き当てを、このプロセスに実際に DLL を読んで確かめる本物。読んだ DLL は覚えておき、最後に手放す。
+/// import の引き当てを、このプロセスに実際に DLL を読んでチェックする本物。読んだ DLL は覚えておき、最後に手放す。
 #[derive(Default)]
 pub struct RealProbe {
     loaded: HashMap<String, Result<usize, ErrorCode>>,
@@ -761,16 +792,16 @@ impl Drop for RealProbe {
 
 // ---- 未処理の例外 ----
 
-/// 書いた後は OS の普通の異常終了の扱い（報告の窓・イベントログ）に任せる。
+/// 書いた後は OS の普通の異常終了の扱い（報告のウィンドウ・イベントログ）に任せる。
 pub const EXCEPTION_PASS_ON: i32 = EXCEPTION_CONTINUE_SEARCH;
 
 static EXCEPTION_FILE: OnceLock<File> = OnceLock::new();
 static EXCEPTION_VERDICT: AtomicI32 = AtomicI32::new(EXCEPTION_CONTINUE_SEARCH);
 static FILTER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// 未処理の例外（アクセス違反など）の場所を 1 行書くフィルターを置く。書いた後は `verdict` を返す
+/// 未処理の例外（アクセス違反など）の場所を 1 行書くフィルターを登録する。書いた後は `verdict` を返す
 /// （本番は `EXCEPTION_CONTINUE_SEARCH`: 普通の異常終了の扱いを変えない）。書き先は `attach_exception_file` で渡されるまで標準エラー
-/// （ログのファイルを、ゲームのフォルダの外と確かめる前に作らないため）。置くのは最初の 1 回だけ。
+/// （ログのファイルを、ゲームのフォルダの外と判定する前に作らないため）。登録は最初の 1 回だけ。
 pub fn install_exception_filter(verdict: i32) {
     EXCEPTION_VERDICT.store(verdict, Ordering::Relaxed);
     if FILTER_INSTALLED.swap(true, Ordering::AcqRel) {
@@ -967,6 +998,22 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_without_args_passes_a_null_command_line() {
+        assert_eq!(
+            command_line_or_null(&spawn("C:\\Program Files (x86)\\x\\th09.exe", &[])),
+            Ok(None)
+        );
+        let with = command_line_or_null(&spawn("C:\\x.exe", &["a b"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(with), command_line(&spawn("C:\\x.exe", &["a b"])));
+        assert_eq!(
+            command_line_or_null(&spawn("C:\\x.exe", &["a\"b"])),
+            Err(())
+        );
+    }
+
+    #[test]
     fn os_version_and_local_time_are_read() {
         let v = os_version();
         let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
@@ -998,7 +1045,6 @@ mod tests {
         );
     }
 
-    // 何が壊れたら落ちるか: import 表の読み取りか引き当てが誤ると、実際に動いているこの exe の import が「無い」と出る。
     #[test]
     fn every_import_of_this_running_exe_is_found() {
         let me = std::env::current_exe().unwrap();
@@ -1033,7 +1079,6 @@ mod tests {
         assert!(report.unchecked.is_empty(), "{:?}", report.unchecked);
     }
 
-    // 何が壊れたら落ちるか: イメージの先頭（RVA の基準）か名前の引き方が誤ると、実行ファイル・システムの DLL の名前か RVA が合わない。
     // イメージの外（スタック・小さい値）を引けたことにすると落ちる。
     #[test]
     fn module_of_names_the_exe_and_the_offset_inside_it() {
@@ -1125,7 +1170,7 @@ mod tests {
 
     const CHILD_ENV: &str = "HIGANR_TEST_EXCEPTION_LOG";
 
-    // 親の検査（下）が別プロセスとして起こす。単独で走らせても何もしない。
+    // 親の検査（下）が別プロセスとして起動する。単独で走らせても何もしない。
     #[test]
     #[ignore = "親の検査が別プロセスで起こす（落ちるため）"]
     fn exception_filter_child() {
@@ -1135,7 +1180,7 @@ mod tests {
         let Some(path) = std::env::var_os(CHILD_ENV) else {
             return;
         };
-        // SAFETY: 自分のプロセスのエラー表示の設定を変えるだけ（検査が落ちたときの報告の窓を出さない）。
+        // SAFETY: 自分のプロセスのエラー表示の設定を変えるだけ（検査が落ちたときの報告のウィンドウを出さない）。
         unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS) };
         install_exception_filter(EXCEPTION_EXECUTE_HANDLER);
         // "-" はファイルを渡さない回（標準エラーに書かれるはず）。
@@ -1151,7 +1196,6 @@ mod tests {
         unsafe { (0x10 as *mut u32).write_volatile(1) };
     }
 
-    // 何が壊れたら落ちるか: フィルターが置かれない・例外の情報を読み違えると、実際に落ちたプロセスのログにこの 1 行が残らない。
     #[test]
     fn the_exception_filter_logs_a_real_access_violation() {
         let dir = std::env::temp_dir().join(format!("HiganRTool_loader_av_{}", std::process::id()));
@@ -1188,7 +1232,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // 何が壊れたら落ちるか: ログのファイルを渡す前の未処理の例外が画面（標準エラー）に出ない、または渡していないのにファイルを作る。
     #[test]
     fn without_a_log_file_the_filter_writes_to_the_screen_only() {
         let dir = std::env::temp_dir().join(format!(

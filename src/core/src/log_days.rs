@@ -61,7 +61,7 @@ mod tests {
         }
     }
 
-    /// 壊れたら落ちる: 日数の境目（3 日前は残す・4 日前から消す）、未来の日付を消す、月をまたぐ数え違い。
+    /// 未来の日付は消さず、月をまたいでも日数を数え違えない。
     #[test]
     fn the_fourth_day_back_is_the_first_to_expire() {
         assert_eq!(KEEP_LOG_DAYS, 3);

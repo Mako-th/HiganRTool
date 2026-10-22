@@ -1,12 +1,9 @@
-//! E1-1 の入口（素のアセンブリ）と、書き出しのスレッド・ファイルの層（unsafe は入口のアセンブリだけ）。表の形・集計・設置の手順は
-//! `alloc_count.rs`（pure）。
+//! 入口（素のアセンブリ）と、書き出しのスレッド・ファイルの層（unsafe は入口のアセンブリだけ）。表の形・集計・設置の手順は `alloc_count.rs`（pure）。
 //!
-//! - 入口 5 つ（`alloc_entry_0`〜`alloc_entry_4`。`th09_addr::ALLOC_SITES` の並び）。関数の先頭に書いた `E9` から飛んでくる。
-//!   `[esp]`（呼び出し元の戻りアドレス）を鍵に、スレッドの別ごとの表へ数えてから、その入口のトランポリン（盗んだ命令 ＋ 元の続きへの
-//!   `E9`）へ飛ぶ。**ゲームのスレッドで Rust のコードは走らない**（呼ぶ関数も無い）。
-//! - 書き出しのスレッド: 1 秒ごとに表を読み、ゲームの場面の値を読み、`_alloc_sec.csv` と `_alloc_calls.csv` に 1 秒ぶんを足す。
-//!   終わりに `_alloc_callers.csv` と `_alloc_table.csv`。ファイルは本ログの隣（`logs\`）に、本ログの名前の先頭で `create_new`
-//!   （既存を上書きしない）。
+//! - 入口 5 つ（`alloc_entry_0`〜`alloc_entry_4`。`th09_addr::ALLOC_SITES` の並び）。関数の先頭に書いた `E9` から飛んでくる。`[esp]`（呼び出し元の戻りアドレス）を鍵に、スレッドの別ごとの表へ数えてから、
+//!   その入口のトランポリン（盗んだ命令 ＋ 元の続きへの `E9`）へ飛ぶ。**ゲームのスレッドで Rust のコードは走らない**（呼ぶ関数も無い）。
+//! - 書き出しのスレッド: 1 秒ごとに表を読み、ゲームの場面の値を読み、`_alloc_sec.csv` と `_alloc_calls.csv` に 1 秒ぶんを足す。終わりに `_alloc_callers.csv` と `_alloc_table.csv`。
+//!   ファイルは本ログの隣（`logs\`）に、本ログの名前の先頭で `create_new`（既存を上書きしない）。
 //!
 //! ゲームには、`alloc_count::install_all` が照合を通した 5 地点の detour（6〜7 バイト）のほかは何も書かない。
 
@@ -48,11 +45,11 @@ use crate::win::read_own_memory;
 //   （`[esp + 24]` は自分のスレッドのスタック、`fs:[0x24]` は自分の TEB）。
 // - 表の番号 edi = 地点 × 2 ＋ スレッドの別（0..TABLE_COUNT）、枠の番号 edx は `and SLOT_MASK` で表の中に収まり、
 //   `[ebx + edx*8]` は自分の表の中だけ。鍵（戻りアドレス）は 0 にならない。空きの枠は `lock cmpxchg` で取り、たどるのは PROBES 枠までなのでループは必ず終わる。
-// - トランポリンのアドレスは、この入口へ向く `E9` を書く前に置かれる（`alloc_count::SiteDetourEnv::set_trampoline`）。
+// - トランポリンのアドレスは、この入口へ向く `E9` を書く前に設定される（`alloc_count::SiteDetourEnv::set_trampoline`）。
 // - 静的変数は絶対アドレスで指す（再配置で直る）。ラベルは 2〜6（0 と 1 だけの名前は Intel 記法で 2 進の数と紛れる）。
 macro_rules! alloc_entry {
     ($name:ident, $site:expr) => {
-        /// E1-1 の入口（`ALLOC_SITES` の地点の番号の行）。Rust からは呼ばない（アドレスを取るだけ）。
+        /// 計測の入口（`ALLOC_SITES` の地点の番号の行）。Rust からは呼ばない（アドレスを取るだけ）。
         #[unsafe(naked)]
         pub extern "C" fn $name() {
             core::arch::naked_asm!(
@@ -85,7 +82,7 @@ macro_rules! alloc_entry {
                 "je 5f",
                 "test eax, eax",
                 "jnz 4f",
-                // 空き（eax = 0）: 鍵を置く。取れたら ZF = 1。別のスレッドが先に置いたら eax = その鍵。
+                // 空き（eax = 0）: 鍵を書く。取れたら ZF = 1。別のスレッドが先に書いたら eax = その鍵。
                 "lock cmpxchg dword ptr [ebx + edx*8], esi",
                 "je 5f",
                 "cmp eax, esi",
@@ -167,7 +164,7 @@ static WRITER: Mutex<Option<JoinHandle<Vec<String>>>> = Mutex::new(None);
 /// ゲームのスレッドの ID を tick の記録から探す上限（ゲームが動いていれば 1 フレーム（約 16.7 ms）で記録が出る）。
 const TID_WAIT_MS: u64 = 2000;
 
-/// ゲームのスレッドの ID を、入力のフックが書く tick の記録から `wait_ms` の間探す（見つからなければ `None`）。E1-1 の数えと
+/// ゲームのスレッドの ID を、入力のフックが書く tick の記録から `wait_ms` の間探す（見つからなければ `None`）。alloc の数えと
 /// rollback の設置が共に使う。
 pub fn wait_game_thread_id(wait_ms: u64) -> Option<u32> {
     let t0 = Instant::now();
@@ -200,7 +197,7 @@ fn open_new(dir: &Path, log_name: &str, suffix: &str) -> Result<(BufWriter<File>
         .create_new(true)
         .open(&path)
         .map(|f| (BufWriter::new(f), name))
-        .map_err(|e| format!("{} を開けない: {e}", path.display()))
+        .map_err(|e| format!("{} を開けません: {e}", path.display()))
 }
 
 impl AllocHost for RealAllocHost {
@@ -213,14 +210,11 @@ impl AllocHost for RealAllocHost {
     }
 
     fn open_outputs(&mut self) -> Result<String, String> {
-        let log = self
-            .run_path
-            .as_ref()
-            .ok_or("本ログの置き場が決まっていない")?;
-        let dir = log.parent().ok_or("本ログのフォルダが分からない")?;
+        let log = self.run_path.as_ref().ok_or("本ログの場所が未決定")?;
+        let dir = log.parent().ok_or("本ログのフォルダが不明")?;
         let log_name = log
             .file_name()
-            .ok_or("本ログの名前が分からない")?
+            .ok_or("本ログの名前が不明")?
             .to_string_lossy()
             .into_owned();
         let (sec, n1) = open_new(dir, &log_name, SEC_SUFFIX)?;
@@ -259,13 +253,13 @@ impl AllocHost for RealAllocHost {
         let outs = self
             .outputs
             .take()
-            .ok_or("書き出しのファイルを開いていない")?;
+            .ok_or("書き出しのファイルを開いていません")?;
         let seconds = s.seconds;
         STOP.store(false, Ordering::SeqCst);
         let h = std::thread::Builder::new()
             .name("higanr_alloc_writer".to_string())
             .spawn(move || writer(outs, seconds, installed))
-            .map_err(|e| format!("スレッドを起こせない: {e}"))?;
+            .map_err(|e| format!("スレッドの作成不能: {e}"))?;
         match WRITER.lock() {
             Ok(mut g) => *g = Some(h),
             Err(p) => *p.into_inner() = Some(h),
@@ -282,7 +276,7 @@ impl AllocHost for RealAllocHost {
         Some(match h.join() {
             Ok(lines) => lines,
             Err(_) => vec![
-                "書き出しのスレッドがパニックで終わった（書けた行までがファイルに残る）"
+                "書き出しのスレッドがパニックで終了しました（書けた行までがファイルに残ります）"
                     .to_string(),
             ],
         })
@@ -307,7 +301,7 @@ pub fn on_step(
             hook_env,
             forbidden,
         } => {
-            // E1-2（巻き戻しの実験）: ini に [rollback_probe] があればそちらを入れ、E1-1 の数えへは進まない（同じ地点を使う）。
+            // 巻き戻しの実験: ini に [rollback_probe] があればそちらを入れ、alloc の数えへは進まない（同じ地点を使う）。
             if let Some(Ok(Some(text))) = host.ini.as_ref()
                 && !matches!(crate::rollback_probe::settings_from_text(text), Ok(None))
             {
@@ -335,7 +329,7 @@ fn read_u8(addr: u32) -> Option<u8> {
     read_own_memory(addr, 1).and_then(|b| b.first().copied())
 }
 
-/// ゲームの場面の値を読む（読めない頁は読まない）。どれも 4 バイト以下の 1 つの値なので、書いている最中でも前か後のどちらかの
+/// ゲームの場面の値を読む（読めないページは読まない）。どれも 4 バイト以下の 1 つの値なので、書いている最中でも前か後のどちらかの
 /// 値が読める。
 fn read_obs() -> SceneObs {
     SceneObs {
@@ -479,11 +473,11 @@ mod tests {
             let code = fill(base as usize as u32);
             assert!(code.len() <= len);
             for (i, &b) in code.iter().enumerate() {
-                // SAFETY: いま確保した読み書きのできる頁の中（`code.len() <= len`）。
+                // SAFETY: いま確保した読み書きのできるページの中（`code.len() <= len`）。
                 unsafe { core::ptr::write_volatile((base as usize + i) as *mut u8, b) };
             }
             let mut old = 0;
-            // SAFETY: いま確保した頁の保護を変えるだけ。
+            // SAFETY: いま確保したページの保護を変えるだけ。
             let ok = unsafe { VirtualProtect(base, len, PAGE_EXECUTE_READ, &mut old) };
             assert_ne!(ok, 0);
             Page { base }
@@ -498,7 +492,7 @@ mod tests {
 
     impl Drop for Page {
         fn drop(&mut self) {
-            // SAFETY: `build` で確保した頁を 1 回だけ返す。この頁へ飛ぶものは検査の中にしか無い。
+            // SAFETY: `build` で確保したページを 1 回だけ返す。このページへ飛ぶものは検査の中にしか無い。
             unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
         }
     }
@@ -579,8 +573,8 @@ mod tests {
         clear();
     }
 
-    /// `call [slot]`（`FF 15 abs32`）を `n` 個並べて最後に `ret` を置いた頁（`n` 個の違う戻りアドレス = 頁 + 6(i+1) から
-    /// 入口を呼ぶ）と、トランポリンの代わりの `ret` のアドレス。`slot` は頁の終わりに置き、入口のアドレスを入れる。
+    /// `call [slot]`（`FF 15 abs32`）を `n` 個並べて最後に `ret` を書いたページ（`n` 個の違う戻りアドレス = ページ + 6(i+1) から
+    /// 入口を呼ぶ）と、トランポリンの代わりの `ret` のアドレス。`slot` はページの終わりに取り、入口のアドレスを入れる。
     fn call_page(entry: u32, n: usize) -> (Page, u32) {
         let ret_off = n * 6;
         let slot_off = ret_off + 4; // [call ×n][ret][int3 ×3][slot 4]
@@ -601,7 +595,7 @@ mod tests {
     }
 
     fn run_page(p: &Page) {
-        // SAFETY: 頁は `call [slot]` の列と `ret`。入口は全部のレジスタを戻してトランポリン（頁の `ret`）へ飛ぶので、各 `call` は次の
+        // SAFETY: ページは `call [slot]` の列と `ret`。入口は全部のレジスタを戻してトランポリン（ページの `ret`）へ飛ぶので、各 `call` は次の
         // 命令へ戻る。
         let f: extern "C" fn() = unsafe { core::mem::transmute(p.addr() as usize) };
         f();
@@ -625,7 +619,7 @@ mod tests {
                 let b = start.clone();
                 std::thread::spawn(move || {
                     b.wait();
-                    // SAFETY: `run_page` と同じ（頁は検査の終わりまで生きている。join の後で返す）。
+                    // SAFETY: `run_page` と同じ（ページは検査の終わりまで生きている。join の後で返す）。
                     let f: extern "C" fn() = unsafe { core::mem::transmute(addr as usize) };
                     for _ in 0..ROUNDS {
                         f();
@@ -805,7 +799,7 @@ mod tests {
         }
         for t in ALLOC_TRAMPS.iter() {
             let a = t.load(Ordering::SeqCst);
-            // SAFETY: `RealHook::alloc_trampoline` が確保した頁。この頁へ飛ぶ E9 は下の `drop(page)` で消える頁の中だけ。
+            // SAFETY: `RealHook::alloc_trampoline` が確保したページ。このページへ飛ぶ E9 は下の `drop(page)` で消えるページの中だけ。
             unsafe { VirtualFree(a as usize as *mut c_void, 0, MEM_RELEASE) };
         }
         drop(page);

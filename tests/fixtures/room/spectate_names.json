@@ -1,0 +1,11 @@
+{
+  "about": "ランダム対戦の割り当てルーム名 q.… から観戦用のルーム名 w.… を導く見本。w. ＋ SHA-256(ルーム名の ASCII 小文字) の先頭 8 B の 16 進。検査対象のコードとは別の実装（標準の SHA-256）で作った値。サーバー（src/server/src/rules.ts の spectateRoomName）と core（src/core/src/room.rs の RoomName::spectate_of）が同じ値を出すことを、両方の検査が見る。",
+  "q0": "q.000000000000000000000000000000",
+  "w0": "w.f3fac66478f9c120",
+  "q1": "q.ffffffffffffffffffffffffffffff",
+  "w1": "w.58618eb583699a4b",
+  "q2": "q.0123456789abcdef0123456789abcd",
+  "w2": "w.604d502a3981065f",
+  "q3": "q.a1b2c3d4e5f60718293a4b5c6d7e8f",
+  "w3": "w.82f8cda334aebfcb"
+}

@@ -1,17 +1,10 @@
 //! ランダム対戦の待ち列（`src/server/src/random_queue.ts`）のクライアントの純粋な部品。
 //!
-//! 待ち列に入ると、サーバーが来た順に 2 人ずつ組にし、組ごとに推測できない新しいルーム名を割り当てて 2 人へ返す。
-//! 組になった後は今のルームの手順（`room.rs`）へ、その名で入り直す。ここは待ち列の手順だけを持つ（ソケットも時計も持たない）。
-//!
-//! ## 順番
-//!
-//! `queue`（待ち列に入った。期限つき）→ `paired`（割り当てたルーム名と、待ち列に先に入った側か）→ サーバーが 1000 で閉じる。
+//! 待ち列に入ると、サーバーが来た順に 2 人ずつ組にし、組ごとに推測できない新しいルーム名を割り当てて 2 人へ返す。組になった後は
+//! 今のルームの手順（`room.rs`）へ、その名で入り直す。ここは待ち列の手順だけを持つ（ソケットも時計も持たない）。
+//! 順番は `queue`（待ち列に入った。期限つき）→ `paired`（割り当てたルーム名と、待ち列に先に入った側か）→ サーバーが 1000 で閉じる。
 //! 待つ間の ping / pong、期限の切れ方、閉じる番号と直前の error の文はルームと同じ（`room.rs`）。
-//!
-//! ## 秘密
-//!
 //! 割り当てられたルーム名は画面にもログにも出さない（人がそのルームへ割り込めないための秘密）。[`AssignedRoom`] の `Debug` は名を伏せる。
-//!
 //! 見張りのスレッドで回す。ゲームのスレッドでは呼ばない。
 
 use crate::room::{CLIENT_ID_BYTES, CLIENT_ID_PARAM};
@@ -36,7 +29,7 @@ pub const RANDOM_ROOM_HEX_LEN: usize = 30;
 
 const _: () = assert!(RANDOM_ROOM_PREFIX.len() + RANDOM_ROOM_HEX_LEN == ROOM_NAME_MAX);
 
-/// 待ち列へ繋ぐパス（`/v0/random/<ビルド番号>`、`id` があれば問い `?cid=…` を付ける。問いの書き方はルームのパスと同じ）。
+/// 待ち列へ接続するパス（`/v0/random/<ビルド番号>`、`id` があれば問い `?cid=…` を付ける。問いの書き方はルームのパスと同じ）。
 /// ビルド番号は 10 進で先頭に 0 を付けない（サーバーが 1 通りの書き方だけを受ける）。
 pub fn random_path(build: u32, id: Option<&[u8; CLIENT_ID_BYTES]>) -> String {
     let mut out = format!("{RANDOM_PATH_PREFIX}{build}");
@@ -63,7 +56,7 @@ impl core::fmt::Debug for AssignedRoom {
 }
 
 impl AssignedRoom {
-    /// サーバーから届いた名を確かめる。形が違えば `None`。
+    /// サーバーから届いた名を検証する。形が違えば `None`。
     pub fn parse(raw: &str) -> Option<AssignedRoom> {
         let hex = raw.strip_prefix(RANDOM_ROOM_PREFIX)?;
         let shape_ok = hex.len() == RANDOM_ROOM_HEX_LEN
@@ -76,7 +69,7 @@ impl AssignedRoom {
         RoomName::parse_server_rules(raw).ok().map(AssignedRoom)
     }
 
-    /// 繋ぐためのルーム名。
+    /// 接続するためのルーム名。
     pub fn name(&self) -> RoomName {
         self.0
     }
@@ -86,7 +79,7 @@ impl AssignedRoom {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMsg {
-    /// 繋いだ直後に 1 回。`expires_at` は待ち列の期限（UNIX 秒）。
+    /// 接続した直後に 1 回。`expires_at` は待ち列の期限（UNIX 秒）。
     Queue { expires_at: u64 },
     /// 組になった。割り当てたルーム名と、待ち列に先に入った側か。
     Paired { room: AssignedRoom, first: bool },
@@ -156,7 +149,7 @@ pub enum QueueState {
 }
 
 /// 待ち列のクライアントの手順。I/O をせず、送る文と出来事の列を返す。使い方は [`crate::room::RoomClient`] と同じ
-/// （繋ぐ前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、繋がらなければ `on_transport_failed`。
+/// （接続する前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、接続できなければ `on_transport_failed`。
 /// 以後、受けた文を `on_text`、閉じる番号を `on_close` へ。`next_wake` の時刻か、それより前に `poll` を呼ぶ）。
 #[derive(Debug, Clone)]
 pub struct QueueClient {
@@ -242,7 +235,7 @@ impl QueueClient {
         self.fail(classify_http(status, body))
     }
 
-    /// 繋がらない・繋がった後に閉じる番号なしに切れた。
+    /// 接続できない・接続した後に閉じる番号なしに切れた。
     pub fn on_transport_failed(&mut self) -> Vec<QueueAction> {
         match self.state {
             QueueState::Done | QueueState::Failed(_) => Vec::new(),
@@ -333,7 +326,7 @@ impl QueueClient {
     }
 }
 
-// 予備の期限の長さは、サーバーの期限の後ろに `DEADLINE_GRACE_MS` を足す（`backstop`）。ここで使う定数の取り込みを検査が確かめる。
+// 予備の期限の長さは、サーバーの期限の後ろに `DEADLINE_GRACE_MS` を足す（`backstop`）。ここで使う定数の取り込みを検査が検証する。
 const _: () = assert!(DEADLINE_GRACE_MS > 0);
 
 #[cfg(test)]
@@ -672,7 +665,7 @@ mod tests {
             c.poll(t(PING_INTERVAL_MS + PONG_TIMEOUT_MS)),
             failed(Why::NoPong)
         );
-        // 繋がらない・429・受信の誤り。
+        // 接続できない・429・受信の誤り。
         let mut c = QueueClient::new();
         assert_eq!(c.on_transport_failed(), failed(Why::NoAnswer));
         let mut c = QueueClient::new();

@@ -1,7 +1,7 @@
 //! PE32 の見出しを読む（pure）。
 //!
 //! 32bit の PE32 だけを受け付ける（`MZ`・`PE\0\0`・machine `0x014C`・optional header の magic `0x10B`）。
-//! PE32+ や x64 は `Err`。どの読み取りも長さを確かめてから行い、壊れたバイト列でもパニックしない。
+//! PE32+ や x64 は `Err`。どの読み取りも長さを検証してから行い、壊れたバイト列でもパニックしない。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeError {
@@ -70,7 +70,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeInfo, PeError> {
         return Err(PeError::NotPeSignature);
     }
 
-    let file_header_off = e_lfanew + 4; // e_lfanew は上で境界内と確かめた u32 の値
+    let file_header_off = e_lfanew + 4; // e_lfanew は上で境界内と検証した u32 の値
     if get_range(bytes, file_header_off, 20).is_none() {
         return Err(PeError::TooShortForFileHeader);
     }

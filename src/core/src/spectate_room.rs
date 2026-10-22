@@ -1,51 +1,11 @@
-//! 観戦用のルーム（インターネット越しの観戦）の**入り直しの判断**の状態機械 2 つ: 配る側 [`Caster`]（マッチのホストの dll）と
-//! 観戦者 [`Joiner`]（観戦者の dll）。
+//! 観戦用のルーム（インターネット越しの観戦）の**入り直しの判断**の状態機械 2 つ: 配る側 [`Caster`]（マッチのホストの dll）と観戦者 [`Joiner`]（観戦者の dll）。
 //!
-//! ルームサーバーの手順は対戦と同じ（2 人・先に入った方が `host`、後からが `guest`）。ルーム名は `RoomName::spectate_of`。
-//! 配る側が先に入って観戦用のコード（種別 3）を offer し、観戦者が後から入って `peer` で受け、返し（種別 4）を answer で返す。
-//! 1 回のルームのやり取りは `room::RoomClient` と dll の `net_room::RoomConn` が持ち、**ここはその外側**:
-//! いつ繋ぎ直すか・何回まで繋ぐか・いつ諦めるかだけを決める。
-//!
+//! ルームサーバーの手順は対戦と同じ（2 人・先に入った方が `host`、後からが `guest`。ルーム名は `RoomName::spectate_of`）。配る側が先に入って観戦用のコード（種別 3）を offer し、観戦者が後から入って `peer` で受け、返し（種別 4）を answer で返す。1 回のルームのやり取りは `room::RoomClient` と dll の `net_room::RoomConn` が持ち、**ここはその外側**: いつ接続し直すか・何回まで接続するか・いつ諦めるかだけを決める。
 //! ソケットも時計も持たない（`now` は単調な ms を呼び手が渡す）。確保しない。見張りのスレッドで回す（ゲームのスレッドでは呼ばない）。
-//!
-//! ## 使い方
-//!
-//! 両方とも「`poll` が `Connect` を返したら、新しい `RoomConn` を開く」で始まる。接続の出来事（`room::Event`）を該当の
-//! `on_*` へ渡し、返った指示（`*Action`）を実行する。`Close` を返された接続と、`on_done` / `on_failed` を渡した接続は、
-//! dll が閉じて手放す。
-//!
-//! | 出来事（`room::Event`） | 配る側 | 観戦者 |
-//! |---|---|---|
-//! | `Joined { role: Offer }`（サーバーの `host`） | `MakeOffer`: 観戦用のコードを**その場で新しい期限で**作って offer する | 配る側がまだいない: `Close`、12 秒後に入り直す |
-//! | `Joined { role: Answer }`（サーバーの `guest`） | 観戦者が一瞬いた: `Close`、5 秒後に入り直す | ルームに入れた（`peer` を待つ） |
-//! | `PeerCode(text)` | `Punch(text)`: 観戦者の返しを読み、`PunchPlan` を作れ | `SpectateCode(text)`: 観戦用のコードを読み、返しを作って answer せよ |
-//! | `Done`（サーバーの 1000） | 2 秒後に入り直す | 成功（終わり） |
-//! | `Failed(f)` | 下の表 | 下の表 |
-//!
-//! 配る側が入るたびに新しい期限のコードを作らせる（`MakeOffer`）のは、`code::DEFAULT_TTL_SECS`（30 分）より長くルームに
-//! いても期限切れのコードを預けたままにしないため。
-//!
-//! ## 失敗の扱い（`room::Failure`）
-//!
-//! | 失敗 | 配る側（止められるまで続く） | 観戦者 |
-//! |---|---|---|
-//! | `Expired`（4408 ルームの期限 10 分 / answer の期限） | **すぐ**入り直す（0 ms） | 12 秒後 |
-//! | `PeerLeft`（4410） | 2 秒後 | 12 秒後 |
-//! | `RoomFull`（409） | 10 秒後 | 12 秒後 |
-//! | `RateLimited { retry_after_secs }`（429） | `retry_after`（下限 1 秒・上限 5 分） | 同じ |
-//! | `Unresponsive(_)`（応答しない） | 30 秒後。続けるたびに倍（60・120・240・上限 300 秒）。ほかの失敗か 1000 を見ると 30 秒へ戻る | **失敗で終わる**（理由 `Why` つき） |
-//! | `BadRoomName`（400。導いた名は決まりの内なので来ないはず） | 応答しない扱い（ゆっくり繰り返す） | 失敗で終わる |
-//!
-//! 観戦者は別に、**全体で 30 分**（[`JOINER_GIVE_UP_MS`]）待っても会えなければ諦める（`JoinerFailure::GaveUp`）。
-//! 観戦用のコードが読めない・返しを作れない・answer を出せない（`Joiner::abort`）も失敗で終わる。
-//!
-//! ## 入る回数の歯止め
-//!
-//! サーバーは 1 IP（IPv6 は /64）あたり 60 秒に 30 回までで 429 を返し、対戦のルームの入室や同じ家の別の PC も数える。
-//! そこで**どの 60 秒の期間でも、この機械が入る回数は [`ENTRY_WINDOW_MAX`]（8）回を越えない**ことを保証する: 直前の 8 回の
-//! うち一番古いものから 60 秒経つまで、次の入室を出さない。表の待ちより歯止めが長ければ、歯止めに合わせて待つ（`window_limited`）。
-//!
-//! `now` は単調（戻らない）。`poll` は [`Caster::next_wake`] / [`Joiner::next_wake`] の時刻か、それより前に呼ぶ。
+//! `poll` は [`Caster::next_wake`] / [`Joiner::next_wake`] の時刻か、それより前に呼ぶ。
+//! **入る回数の歯止め**: サーバーは 1 IP（IPv6 は /64）あたり 60 秒に 30 回までで 429 を返し、対戦のルームの入室や同じ家の別の PC も数える。
+//! そこでどの 60 秒の期間でも、この機械が入る回数は [`ENTRY_WINDOW_MAX`]（8）回を越えないことを保証する（`window_limited`）。
+//! 観戦者は別に、全体で 30 分（[`JOINER_GIVE_UP_MS`]）待っても会えなければ諦める（`JoinerFailure::GaveUp`）。配る側が観戦を断っていれば（4403）すぐ終わる。
 
 use crate::code::CodeError;
 use crate::room::{Failure, Role, Why};
@@ -58,6 +18,8 @@ pub const ENTRY_WINDOW_MS: u64 = 60_000;
 /// 分の余裕を残した値。
 pub const ENTRY_WINDOW_MAX: usize = 8;
 
+/// 配る側: 自分の外側のアドレスが変わって観戦用のコードを作り直すとき、入り直すまで（ms）。サーバーは同じ cid の前の入室を閉じるので待たない。
+pub const CASTER_REMAP_MS: u64 = 0;
 /// 配る側: 1000（手順を終えた）の後、入り直すまでの最短（ms）。観戦者が答えを預けてから穴あけを始めるまでの間を空けず、
 /// 連続した入室で期間内の回数を使い切らない間隔。
 pub const CASTER_REJOIN_MS: u64 = 2_000;
@@ -79,7 +41,7 @@ pub const JOINER_RETRY_MS: u64 = 12_000;
 /// 観戦者: 始めてから、配る側に会えないまま諦めるまでの全体の長さ（ms。30 分）。
 pub const JOINER_GIVE_UP_MS: u64 = 30 * 60 * 1000;
 
-/// 429 の `retry_after` を待つ長さの下限（ms）。0 秒と言われても、休まずに繋ぎ続けない。
+/// 429 の `retry_after` を待つ長さの下限（ms）。0 秒と言われても、休まずに接続し続けない。
 pub const RETRY_AFTER_MIN_MS: u64 = 1_000;
 /// 429 の `retry_after` を待つ長さの上限（ms）。サーバーの値が壊れていても何年も待たない。
 pub const RETRY_AFTER_MAX_MS: u64 = 5 * 60 * 1000;
@@ -157,6 +119,8 @@ pub enum WaitReason {
     RateLimited { retry_after_secs: u32 },
     /// サーバーが応答しない（`consecutive` は続けて何回目か）。配る側だけ。
     Unresponsive { consecutive: u32 },
+    /// 配る側: 外側のアドレスが変わり、預けたコードを作り直す。
+    Remapped,
 }
 
 // ---------------- 配る側 ----------------
@@ -174,7 +138,7 @@ pub enum CasterAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CasterPhase {
-    /// 繋いでいない。次の入室を待っている（`CasterStatus::next_entry_at`）。
+    /// 接続していない。次の入室を待っている（`CasterStatus::next_entry_at`）。
     Waiting,
     Joining,
     /// 役 `host` でルームにいる。観戦者を待っている（offer を預けた後）。
@@ -206,6 +170,8 @@ pub struct Caster {
     last_wait: Option<WaitReason>,
     window: EntryWindow,
     streak: u32,
+    /// この入室で観戦者が来た（`matched`）。来た後は預けたコードで手順を終えさせる。
+    matched: bool,
 }
 
 impl Caster {
@@ -216,6 +182,7 @@ impl Caster {
             last_wait: Some(WaitReason::Start),
             window: EntryWindow::NEW,
             streak: 0,
+            matched: false,
         }
     }
 
@@ -234,6 +201,7 @@ impl Caster {
         if self.phase == CasterPhase::Waiting && now >= self.next_entry() {
             self.window.record(now);
             self.phase = CasterPhase::Joining;
+            self.matched = false;
             return Some(CasterAction::Connect);
         }
         None
@@ -242,6 +210,24 @@ impl Caster {
     /// 次に `poll` を呼ぶべき時刻（ms）。待っていなければ `None`（出来事が来るまで）。
     pub fn next_wake(&self) -> Option<u64> {
         (self.phase == CasterPhase::Waiting).then(|| self.next_entry())
+    }
+
+    /// サーバーの `matched`（観戦者が預けたコードを受け取った）。
+    pub fn on_matched(&mut self) {
+        if self.phase == CasterPhase::Casting {
+            self.matched = true;
+        }
+    }
+
+    /// 自分の外側のアドレスが変わり、観戦用のコードの候補を作り直した。預けたコードを誰も受け取っていなければ、閉じて
+    /// 入り直す（`Close`。新しい入室で新しいコードを預ける）。観戦者が受け取った後は、閉じずにその手順を観戦者に終えさせる（次の入室で新しいコード）。
+    /// 入る前・入っている途中は何もしない（入ったときに作るコードがもう新しい）。
+    pub fn on_remapped(&mut self, now: u64) -> Option<CasterAction> {
+        if self.phase != CasterPhase::Casting || self.matched {
+            return None;
+        }
+        self.wait(now, CASTER_REMAP_MS, WaitReason::Remapped);
+        Some(CasterAction::Close)
     }
 
     pub fn on_joined(&mut self, now: u64, role: Role) -> Option<CasterAction> {
@@ -275,7 +261,11 @@ impl Caster {
         if !matches!(self.phase, CasterPhase::Joining | CasterPhase::Casting) {
             return;
         }
-        if matches!(f, Failure::Unresponsive(_) | Failure::BadRoomName) {
+        // 4403 は観戦者にしか来ない。来たら応答しないときと同じに、ゆっくり入り直す。
+        if matches!(
+            f,
+            Failure::Unresponsive(_) | Failure::BadRoomName | Failure::Refused
+        ) {
             self.streak = self.streak.saturating_add(1);
             // 30 秒 → 60 → 120 → 240 → 300（上限）。倍にする回数は 10 で頭打ちにして溢れさせない。
             let shift = self.streak.saturating_sub(1).min(10);
@@ -301,11 +291,11 @@ impl Caster {
                 retry_after_ms(retry_after_secs),
                 WaitReason::RateLimited { retry_after_secs },
             ),
-            Failure::Unresponsive(_) | Failure::BadRoomName => {}
+            Failure::Unresponsive(_) | Failure::BadRoomName | Failure::Refused => {}
         }
     }
 
-    /// 止める（つながりの片づけ）。以後 `poll` は何も返さず、出来事は無視する。
+    /// 止める（接続の片づけ）。以後 `poll` は何も返さず、出来事は無視する。
     pub fn stop(&mut self) {
         self.phase = CasterPhase::Stopped;
     }
@@ -344,11 +334,13 @@ pub enum JoinerFailure {
     CodeUnreadable(CodeError),
     ReplyNotSent,
     GaveUp,
+    /// 配る側が観戦を断っている（4403。2 人のどちらかが観戦を許可していない）。
+    Refused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinerPhase {
-    /// 繋いでいない。次の入室を待っている（`last_wait` が `WrongRole` なら「配る側を待っている」）。
+    /// 接続していない。次の入室を待っている（`last_wait` が `WrongRole` なら「配る側を待っている」）。
     Waiting,
     Joining,
     /// 役 `guest` でルームにいる。観戦用のコードを待っている（または読んで返しを作っている）。
@@ -374,7 +366,7 @@ pub struct JoinerStatus {
 }
 
 impl JoinerStatus {
-    /// 「対戦者（配る側）を待っています」と出せる状態か: 配る側がまだルームにいなかったので入り直しを待っている間。
+    /// 「相手（配る側）を待っています」と出せる状態か: 配る側がまだルームにいなかったので入り直しを待っている間。
     pub fn waiting_for_caster(&self) -> bool {
         self.last_wait == Some(WaitReason::WrongRole)
             && matches!(self.phase, JoinerPhase::Waiting | JoinerPhase::Joining)
@@ -493,6 +485,7 @@ impl Joiner {
                 self.phase = JoinerPhase::Failed(JoinerFailure::Unresponsive(why));
             }
             Failure::BadRoomName => self.phase = JoinerPhase::Failed(JoinerFailure::BadRoomName),
+            Failure::Refused => self.phase = JoinerPhase::Failed(JoinerFailure::Refused),
             Failure::RateLimited { retry_after_secs } => self.wait(
                 now,
                 retry_after_ms(retry_after_secs),
@@ -505,7 +498,7 @@ impl Joiner {
     }
 
     /// dll が続けられなくなった（コードを読めない・返しを作れない・answer を出せない）。失敗で終わり、接続を閉じさせる。
-    /// 終わっている・繋いでいない機械には何もしない。
+    /// 終わっている・接続していない機械には何もしない。
     pub fn abort(&mut self, why: JoinerFailure) -> Option<JoinerAction> {
         if matches!(self.phase, JoinerPhase::InRoom | JoinerPhase::AnswerSent) {
             self.phase = JoinerPhase::Failed(why);
@@ -514,7 +507,7 @@ impl Joiner {
         None
     }
 
-    /// 利用者がやめた。繋いでいれば `Close`。終わっていた機械の結果は書き換えない。
+    /// 利用者がやめた。接続していれば `Close`。終わっていた機械の結果は書き換えない。
     pub fn stop(&mut self) -> Option<JoinerAction> {
         let connected = matches!(
             self.phase,
@@ -582,6 +575,7 @@ mod tests {
     fn the_decided_values_are_pinned() {
         assert_eq!(ENTRY_WINDOW_MAX, 8);
         assert_eq!(ENTRY_WINDOW_MS, 60_000);
+        assert_eq!(CASTER_REMAP_MS, 0);
         assert_eq!(CASTER_REJOIN_MS, 2_000);
         assert_eq!(CASTER_WRONG_ROLE_MS, 5_000);
         assert_eq!(CASTER_EXPIRED_MS, 0);
@@ -627,6 +621,63 @@ mod tests {
             t += 2_000;
         }
         assert_eq!(c.status(t).entries_total, 3);
+    }
+
+    #[test]
+    fn a_remap_rejoins_only_while_the_offer_waits_unclaimed() {
+        // 待っている・入っている途中は閉じない（入ったときに作るコードがもう新しい）。
+        let mut c = Caster::new(NOW);
+        assert_eq!(c.on_remapped(NOW), None);
+        assert_eq!(c.poll(NOW), Some(CasterAction::Connect));
+        assert_eq!(c.on_remapped(NOW + 5), None);
+        assert_eq!(c.status(NOW + 5).phase, CasterPhase::Joining);
+        // 預けたコードを誰も受け取っていなければ、閉じてすぐ入り直す。
+        assert_eq!(
+            c.on_joined(NOW + 10, Role::Offer),
+            Some(CasterAction::MakeOffer)
+        );
+        assert_eq!(c.on_remapped(NOW + 20), Some(CasterAction::Close));
+        let s = c.status(NOW + 20);
+        assert_eq!(s.phase, CasterPhase::Waiting);
+        assert_eq!(s.last_wait, Some(WaitReason::Remapped));
+        assert_eq!(s.next_entry_at, Some(NOW + 20));
+        assert_eq!(c.poll(NOW + 20), Some(CasterAction::Connect));
+        assert_eq!(
+            c.on_joined(NOW + 30, Role::Offer),
+            Some(CasterAction::MakeOffer)
+        );
+        // 観戦者が受け取った後は、その手順を壊さない。
+        c.on_matched();
+        assert_eq!(c.on_remapped(NOW + 40), None);
+        assert_eq!(c.status(NOW + 40).phase, CasterPhase::Casting);
+        assert_eq!(
+            c.on_peer_code("ReplyText".to_string()),
+            Some(CasterAction::Punch("ReplyText".to_string()))
+        );
+        c.on_done(NOW + 50);
+        // 次の入室では、また閉じて入り直せる（前の入室の matched を持ち越さない）。
+        assert_eq!(
+            c.poll(NOW + 50 + CASTER_REJOIN_MS),
+            Some(CasterAction::Connect)
+        );
+        c.on_joined(NOW + 2_060, Role::Offer);
+        assert_eq!(c.on_remapped(NOW + 2_070), Some(CasterAction::Close));
+        // 止めた後は何もしない。
+        c.stop();
+        assert_eq!(c.on_remapped(NOW + 2_080), None);
+        // 入る回数の歯止めは入り直しにも効く。
+        let mut c = Caster::new(NOW);
+        let mut entries = Vec::new();
+        let mut t = NOW;
+        while t < NOW + 3 * ENTRY_WINDOW_MS {
+            if c.poll(t) == Some(CasterAction::Connect) {
+                entries.push(t);
+                c.on_joined(t, Role::Offer);
+            }
+            let _ = c.on_remapped(t);
+            t += 100;
+        }
+        assert_eq!(busiest_window(&entries), ENTRY_WINDOW_MAX, "{entries:?}");
     }
 
     #[test]
@@ -969,6 +1020,28 @@ mod tests {
     }
 
     #[test]
+    fn a_joiner_refused_by_the_caster_ends_at_once_and_never_reenters() {
+        for in_room in [false, true] {
+            let mut j = joiner_joining(NOW);
+            if in_room {
+                j.on_joined(NOW, Role::Answer);
+            }
+            j.on_failed(NOW + 10, Failure::Refused);
+            assert_eq!(
+                j.status(NOW + 10).phase,
+                JoinerPhase::Failed(JoinerFailure::Refused),
+                "{in_room}"
+            );
+            assert_eq!(j.next_wake(), None);
+            assert_eq!(j.poll(NOW + JOINER_GIVE_UP_MS), None, "入り直した");
+        }
+        // 配る側には来ない筋。来ても止まらず、ゆっくり入り直す。
+        let mut c = caster_joining(NOW);
+        c.on_failed(NOW, Failure::Refused);
+        assert_eq!(c.status(NOW).next_entry_at, Some(NOW + 30_000));
+    }
+
+    #[test]
     fn a_joiner_aborts_on_unusable_codes_and_the_deadline_closes_the_connection() {
         let mut j = joiner_joining(NOW);
         j.on_joined(NOW, Role::Answer);
@@ -1090,6 +1163,7 @@ mod tests {
                 retry_after_secs: r.below(4) as u32,
             },
             4 => Failure::BadRoomName,
+            5 => Failure::Refused,
             _ => Failure::Unresponsive(Why::NoAnswer),
         }
     }

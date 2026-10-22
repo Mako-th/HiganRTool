@@ -1,16 +1,12 @@
-//! 同じ th09.exe（同じパス）が動いている間は、もう 1 つ起動しない。
-//!
-//! 起動する花映塚は名前つきの二重起動の印を持たない（`launch::ISOLATED_INSTANCE`）ので、何も見ないと Enter のキーリピートなどで
-//! 何個でも起動する。起動の前に、プロセスの一覧から同じパスの th09.exe を探す。別のフォルダのコピーは断らない。
-//!
-//! 2 つのローダーがほぼ同時に走ると、互いの th09.exe がまだ一覧に無い瞬間がある。そこで確認から起動の終わりまでを、
-//! ゲームのパスから決めた名前のミューテックスで 1 つずつにする。取れなかった（別のローダーが起動の途中の）ときも断る。
-//! 一覧もミューテックスも取れなければ、断らずに起動する（ここで起動できなくなるより、多重起動の方がまし）。
-//! unsafe は無い（Win32 は `Host` トレイト越し）。
+//! 花映塚が動いている間は、もう 1 つ起動しない。
+//! 起動の前に、花映塚の二重起動の印（`GAME_MUTEX`。素の起動・vpatch・普段の HiganRTool の起動が作る）があれば断る。
+//! 台本などの開発用の起動は印を名前なしにする（`launch::ISOLATED_INSTANCE`）ので、プロセスの一覧から同じパスの th09.exe も探す。別のフォルダのコピーは、印が無ければ断らない。
+//! 2 つのローダーがほぼ同時に走ると互いの th09.exe がまだ一覧に無い瞬間があるので、確認から起動の終わりまでを、ゲームのパスから決めた名前のミューテックスで 1 つずつにする（取れなかったときも断る）。
+//! 一覧もミューテックスも取れなければ、断らずに起動する（起動できなくなるより多重起動の方がまし）。unsafe は無い（Win32 は `Host` トレイト越し）。
 
 use std::path::Path;
 
-use higanr_core::game_running::{lock_name, same_name_pids, same_path};
+use higanr_core::game_running::{GAME_MUTEX, lock_name, same_name_pids, same_path};
 use higanr_core::lang::Tx;
 
 pub type ErrorCode = u32;
@@ -32,6 +28,8 @@ pub trait Host {
     fn processes(&mut self) -> Result<Vec<(u32, String)>, ErrorCode>;
     /// 権限などで開けなければ None。
     fn image_path(&mut self, pid: u32) -> Option<String>;
+    /// 名前つきのミューテックスが今あるか（開くだけで、作らない）。
+    fn mutex_exists(&mut self, name: &str) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +38,8 @@ pub enum Refusal {
     Running(u32),
     /// 別のローダーが同じパスの th09.exe を起動している途中。
     Starting,
+    /// 花映塚（か永夜抄）の二重起動の印がある。
+    Marker,
 }
 
 /// 取っているミューテックス（取れなかったときは None）。`leave` で放す。
@@ -51,16 +51,24 @@ pub const ALREADY_RUNNING: Tx = Tx {
     en: "Touhou 9 is already running.",
 };
 
-/// 確認する起動か。`--second` と台本の起動（`--script`）は開発用で、同じ花映塚を続けて起こすので確認しない。
+/// 確認する起動か。`--second` と台本の起動（`--script`）は開発用で、同じ花映塚を続けて起動するので確認しない。
 pub fn is_checked(second: bool, script: Option<&Path>) -> bool {
     !second && script.is_none()
 }
 
+/// 起動する花映塚の二重起動の印を名前なしにする（使っている人の花映塚と独立させる）起動か。開発用の起動（`--second`・
+/// `--script`・`--background`）だけ。普段の起動は印の名前を残す（thprac がこの名前で花映塚を見つけ、素の花映塚の二重起動も止まる）。
+pub fn is_isolated(second: bool, script: Option<&Path>, background: bool) -> bool {
+    !is_checked(second, script) || background
+}
+
 /// `game` は絶対パス。`log` は段階ログへ書く関数。
+/// `check_marker` は花映塚の二重起動の印を見るか（印を名前なしにする開発用の起動は、使っている人の花映塚の印で断らないよう見ない）。
 pub fn enter<H: Host>(
     h: &mut H,
     game: &Path,
     own_pid: u32,
+    check_marker: bool,
     log: &dyn Fn(&str),
 ) -> Result<Held, Refusal> {
     // 短い名前（8.3）や大文字・小文字を、実際のファイルの綴りにそろえる。ファイルが無ければ渡されたまま。
@@ -80,6 +88,16 @@ pub fn enter<H: Host>(
             None
         }
     };
+
+    if check_marker && h.mutex_exists(GAME_MUTEX) {
+        if let Some(t) = held {
+            h.unlock(t);
+        }
+        log(&format!(
+            "多重起動の確認: 二重起動の印「{GAME_MUTEX}」がある（花映塚か永夜抄が動いている）ので、起動しない"
+        ));
+        return Err(Refusal::Marker);
+    }
 
     let running = match h.processes() {
         Ok(list) => same_name_pids(&list, &target, own_pid)
@@ -132,6 +150,7 @@ mod tests {
         lock: Option<Lock>,
         locked: Vec<String>,
         unlocked: Vec<usize>,
+        mutexes: Vec<String>,
     }
 
     impl Fake {
@@ -161,17 +180,71 @@ mod tests {
         fn image_path(&mut self, pid: u32) -> Option<String> {
             self.images.get(&pid).cloned()
         }
+        fn mutex_exists(&mut self, name: &str) -> bool {
+            self.mutexes.iter().any(|m| m == name)
+        }
+    }
+
+    #[test]
+    fn the_game_marker_refuses_even_for_a_copy_in_another_folder() {
+        let mut h = Fake {
+            mutexes: vec!["Touhou 08 App".to_string()],
+            ..Fake::default()
+        };
+        let (r, lines) = enter_logged(&mut h, GAME);
+        assert_eq!(r, Err(Refusal::Marker));
+        assert_eq!(h.unlocked, vec![7]);
+        assert!(
+            lines.iter().any(|l| l.contains("Touhou 08 App")),
+            "{lines:?}"
+        );
+        let mut h = Fake {
+            mutexes: vec!["Touhou 07 App".to_string(), "Touhou 08 App2".to_string()],
+            ..Fake::default()
+        };
+        assert_eq!(enter_logged(&mut h, GAME).0, Ok(Held(Some(7))));
     }
 
     fn enter_logged(h: &mut Fake, game: &str) -> (Result<Held, Refusal>, Vec<String>) {
+        enter_with(h, game, true)
+    }
+
+    fn enter_with(
+        h: &mut Fake,
+        game: &str,
+        check_marker: bool,
+    ) -> (Result<Held, Refusal>, Vec<String>) {
         let lines = RefCell::new(Vec::new());
-        let r = enter(h, Path::new(game), 1, &|s| {
+        let r = enter(h, Path::new(game), 1, check_marker, &|s| {
             lines.borrow_mut().push(s.to_string())
         });
         (r, lines.into_inner())
     }
 
-    // 何が壊れたら落ちるか: 同じパスの比べが無くなる・名前だけで断る・自分を数える、のどれでも。
+    #[test]
+    fn only_dev_launches_are_isolated() {
+        let s = Path::new("x.txt");
+        assert!(!is_isolated(false, None, false), "普段の起動");
+        assert!(is_isolated(true, None, false), "--second");
+        assert!(is_isolated(false, Some(s), false), "--script");
+        assert!(is_isolated(false, None, true), "--background");
+    }
+
+    #[test]
+    fn a_launch_that_does_not_check_the_marker_ignores_it() {
+        let mut h = Fake {
+            mutexes: vec!["Touhou 08 App".to_string()],
+            ..Fake::default()
+        };
+        assert_eq!(enter_with(&mut h, GAME, false).0, Ok(Held(Some(7))));
+        let mut h = Fake::default().with(50, "th09.exe", Some(GAME));
+        assert_eq!(
+            enter_with(&mut h, GAME, false).0,
+            Err(Refusal::Running(50)),
+            "同じパスは見る"
+        );
+    }
+
     #[test]
     fn the_same_path_is_refused_and_a_copy_in_another_folder_is_not() {
         let mut h = Fake::default().with(50, "th09.exe", Some(GAME));
@@ -269,7 +342,6 @@ mod tests {
         assert!(h.unlocked.is_empty());
     }
 
-    // 何が壊れたら落ちるか: 台本の回・`--second` まで断る（検査の回が止まる）・普通の起動を確認しない（多重起動が戻る）。
     #[test]
     fn only_a_plain_launch_is_checked() {
         assert!(is_checked(false, None));
@@ -286,7 +358,6 @@ mod tests {
         assert_eq!(h.unlocked, vec![7]);
     }
 
-    // 何が壊れたら落ちるか: 本物の一覧に自分が載らない・自分のパスが読めない・パスの比べが本物の形（`C:\...`）とずれる。
     #[test]
     fn the_real_list_finds_this_test_process_by_path() {
         let mut real = crate::real::RealSingle;
@@ -303,7 +374,6 @@ mod tests {
         assert!(same_path(&image, &exe.to_string_lossy()), "{image}");
     }
 
-    // 何が壊れたら落ちるか: 取れなかった側が Busy にならない（同時に起動した 2 つのローダーが両方通る）・放しても取れない。
     #[test]
     fn the_real_mutex_lets_only_one_thread_in_until_it_is_released() {
         let name = lock_name(&format!(r"C:\single_test\{}\th09.exe", std::process::id()));

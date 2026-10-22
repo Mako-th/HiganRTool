@@ -1,7 +1,7 @@
 //! 断って終わるときに、黒いウィンドウをすぐ閉じず Enter まで残すか。
-//! ショートカット等で起こしたウィンドウが一瞬で閉じると、断った理由の 1 行が読めないため。
+//! ショートカット等で起動したウィンドウが一瞬で閉じると、断った理由の 1 行が読めないため。
 //!
-//! 残すのは終了コードが 0 でなく、かつウィンドウがこの exe だけのものとき。コマンドプロンプトや検査の道具から起こしたときは
+//! 残すのは終了コードが 0 でなく、かつウィンドウがこの exe だけのものとき。コマンドプロンプトや検査のツールから起動したときは
 //! 親のウィンドウに理由が残るので待たない（検査が止まらない）。
 
 use higanr_core::lang::Tx;
@@ -38,7 +38,7 @@ pub const PANIC_HOLD_TEXT: Tx = Tx {
     en: "HiganRTool: Stopped by an unexpected error. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with the log file starting with loader_ (.log) in the logs folder next to the tool. Press Enter to close.",
 };
 
-/// 主スレッドがパニックしたとき（`crash_log::install_panic_hook`）に、窓が消える前に読めるよう Enter まで待つ。
+/// 主スレッドがパニックしたとき（`crash_log::install_panic_hook`）に、ウィンドウが消える前に読めるよう Enter まで待つ。
 /// 待つ条件は断って終わるときと同じ（この exe だけの黒いウィンドウのとき）。
 pub fn wait_after_panic() {
     if should_hold(PANIC_EXIT_CODE, crate::real::console_process_count()) {
@@ -70,12 +70,11 @@ mod tests {
             assert!(!t.contains("渡して") && !t.contains("gave you"), "{t}");
         }
         assert!(!higanr_core::lang::has_japanese(PANIC_HOLD_TEXT.en));
-        // パニックは失敗なので、窓を持つときは待つ。
+        // パニックは失敗なので、ウィンドウを持つときは待つ。
         assert!(should_hold(PANIC_EXIT_CODE, Some(1)));
         assert!(!should_hold(PANIC_EXIT_CODE, Some(2)));
     }
 
-    // 何が壊れたら落ちるか: 多重起動を断った回に「不具合として報告を」の文が出る・待たずに閉じて理由が読めない。
     #[test]
     fn a_refusal_for_a_running_game_holds_without_asking_for_a_report() {
         assert!(should_hold(ALREADY_RUNNING_EXIT_CODE, Some(1)));

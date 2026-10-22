@@ -1,29 +1,27 @@
 //! 観戦者の早送りの速さと、止まった後に余裕を作り直す決まり（pure。確保しない）。dll の観戦者（`spectate_watch/ff.rs`・`lockstep_tick`）と
 //! core の模型（`tests/spectate_model.rs`）が同じものを使う。
 //!
-//! 遅れて入った観戦者には、ホストの送りのウィンドウ（`spectate::SEND_WINDOW` = 64 記録）が往復ごとにまとまって届く。溜まりだけを見て
-//! 「越えたら最大の速さ・減ったら止める」と決めると、往復が長い回線では「最大の速さ → 溜まりが尽きて止まる」を往復ごとに繰り返す。
-//! ここでは次の 2 つで、届く平均の速さに合わせて途切れず進める:
+//! 遅れて入った観戦者には、ホストの送り（ウィンドウ `spectate::SEND_WINDOW`）が往復ごとにまとまって届く。溜まりだけを見て早送りを決めると、
+//! 往復が長い回線では「最大の速さ → 溜まりが尽きて止まる」を往復ごとに繰り返すので、届く平均の速さに合わせて途切れず進める:
+//! - **取っておく数**（`reserve`）= 余裕 ＋ 届く平均の速さ × 直近 `PACE_WINDOW` 表示で何も届かなかった表示の最長の続き。
+//! - **速さ** = 届く平均の速さ（1 が普段の速さ）＋（溜まり − 取っておく数）÷ `PACE_GAIN`（取っておく数より少なければ `PACE_SHORT_DAMP` 倍で割る）。
+//!   取っておく数を 1 ウィンドウぶん越えた溜まりと、まとまりで届いていないときの越えた分は、遅れそのものなので最大の速さで減らす。
 //!
-//! - **取っておく数**（`reserve`）= 余裕 ＋ 届く平均の速さ × 直近 `PACE_WINDOW` 表示で何も届かなかった表示の最長の続き。往復ごとに
-//!   まとめて届く間は、次のまとまりまで平均の速さで進んでも尽きない分を残す。1 表示ごとに届く（追いついた）間は余裕のまま。
-//! - **速さ** = 届く平均の速さ（直近 `PACE_WINDOW` 表示。1 が普段の速さ）＋（溜まり − 取っておく数）÷ `PACE_GAIN`（取っておく数より
-//!   少なければその `PACE_SHORT_DAMP` 倍で割る）。端数は次の表示へ持ち越す（2.5 倍なら余分 1 回と 2 回を交互に）。取っておく数を
-//!   1 ウィンドウぶん越えた溜まりと、まとまりで届いていない（追いついた）ときの越えた分は、遅れそのものなので最大の速さで減らす。
-//!
-//! 止まった（使う記録が無かった）後は、溜まりが戻るまで（`REFILL_HOLD_DISPLAYS` まで）待ってから使い始める。待たずに 1 記録ずつ
-//! 使うと、すぐまた止まる。戻す数は、まとまりで届いている間は `reserve`（往復が長いほど何も届かない続きが長く、多く溜める）、1 表示に
-//! 1 つずつ届いている間は余裕だけ（ホストの一時停止や落ちた便の待ちは往復ごとにくり返さないので、止まった長さぶん待ち足さない）。
+//! 止まった（使う記録が無かった）後は、溜まりが戻るまで（`REFILL_HOLD_DISPLAYS` まで）待ってから使い始める。待たずに 1 記録ずつ使うと、すぐまた止まる。
 
 /// 早送りに入る溜まり: 使っていない記録がこの数を越えたら入る。ふだんの溜まりは余裕（3）前後で、ホストの送りが 1 フレーム強ぶれても
 /// 5 を越えない。6 は、100 ms 以上遅れたときだけ入る値。
 pub const FF_ENTER_FRAMES: u32 = 6;
 /// 早送りから戻る溜まり: この数以下になったら普段の速さに戻す。余裕と同じ 3 にして、戻った後も記録を待たずに続けられるようにする。
 pub const FF_EXIT_FRAMES: u32 = 3;
-/// 1 回の表示の中で余分に回す更新の数の上限（最大 17 倍速 = 普段の 1 回 ＋ 余分 16 回 ≒ 毎秒 1,020 更新）。ペースの格子の上限
-/// `MAX_FPS`（1000）に寄せた。遅い PC では dll の時間の上限（`FF_BUDGET_US`）が先に効き、回せる速さまで自然に落ちる。更新 1 回は
-/// p50 0.04 / p99 0.07 ms（n = 660。弾の多い場面は重い見込み）なので、16 回で 1 ms 前後の見込み（外挿）。
+/// 1 回の表示の中で余分に回す更新の数の天井（配列の長さ。実行時の上限は ini の `ff_max` から決まる `Pace::with_updates`）。遅い PC では
+/// dll の時間の上限（`FF_BUDGET_US`）が先に効き、回せる速さまで自然に落ちる。更新 1 回は p50 0.04 / p99 0.07 ms（n = 660。弾の多い
+/// 場面は重い見込み）なので、16 回で 1 ms 前後の見込み（外挿）。
 pub const FF_MAX_EXTRA: u32 = 16;
+/// 早送りの速さ（1 表示あたりの更新の数。普段の 1 回 ＋ 余分）の範囲と既定。8 は毎秒 480 更新（8 倍）。
+pub const FF_UPDATES_MIN: u32 = 1;
+pub const FF_UPDATES_MAX: u32 = FF_MAX_EXTRA;
+pub const FF_UPDATES_DEFAULT: u32 = 8;
 /// 届いた速さと何も届かない続きを見る表示の数（60 Hz で約 1.07 秒）。往復 1 秒までの回線で、往復ごとのまとまりを 1 つ以上含む。
 pub const PACE_WINDOW: usize = 64;
 /// 取っておく数を越えた溜まりを、何表示かけて減らすか（約 0.13 秒）。小さいと速さが表示ごとに大きく揺れ、大きいと溜まりを減らすのが
@@ -35,7 +33,9 @@ pub const PACE_SHORT_DAMP: u32 = 4;
 /// 止まった後、溜まりが戻るのを待ってよい表示の数（1 秒）。往復 600 ms の回線でも、まとまりが 1 つ届く長さ。
 pub const REFILL_HOLD_DISPLAYS: u32 = 60;
 
-use crate::spectate::SEND_WINDOW;
+/// 取っておく数を越えた溜まりがこれより多いとき、それはまとまりの揺れでなく遅れそのものとして、最大の速さで減らす（ホストの
+/// 1 回の送りのまとまりに合わせた値。ウィンドウ `spectate::SEND_WINDOW` とは別）。
+const FULL_SPEED_EXCESS: u32 = 64;
 
 /// 速さの単位（1 表示に普段の 1 回 = 1,000）。
 const MILLI: u32 = 1_000;
@@ -58,6 +58,8 @@ pub struct Pace {
     active: bool,
     /// 止まった後、溜まりが戻るのを待った表示の数（待っていなければ `None`）。
     refill: Option<u32>,
+    /// 1 表示に余分に回す更新の数の上限（1 表示の更新の数 − 1。0 は早送りしない）。
+    max_extra: u32,
 }
 
 impl Default for Pace {
@@ -68,6 +70,18 @@ impl Default for Pace {
 
 impl Pace {
     pub const fn new() -> Self {
+        Self::with_updates(FF_UPDATES_DEFAULT)
+    }
+
+    /// 1 表示あたりの更新の数の上限 `updates`（`FF_UPDATES_MIN`〜`FF_UPDATES_MAX` に収める）で作る。
+    pub const fn with_updates(updates: u32) -> Self {
+        let updates = if updates < FF_UPDATES_MIN {
+            FF_UPDATES_MIN
+        } else if updates > FF_UPDATES_MAX {
+            FF_UPDATES_MAX
+        } else {
+            updates
+        };
         Self {
             arrived: [0; PACE_WINDOW],
             pos: 0,
@@ -76,7 +90,13 @@ impl Pace {
             credit: 0,
             active: false,
             refill: None,
+            max_extra: updates - 1,
         }
+    }
+
+    /// 1 表示あたりの更新の数の上限（`with_updates` が範囲に収めた値）。
+    pub const fn updates(&self) -> u32 {
+        self.max_extra + 1
     }
 
     /// 表示の始まりに、前の表示の間に使えるようになった記録の数（組み立ての連続の終わりが進んだ数）を入れる。
@@ -97,7 +117,7 @@ impl Pace {
         self.sum.saturating_mul(MILLI) / self.seen.max(1)
     }
 
-    /// 使わずに取っておく記録の数（`margin` は余裕の記録の数）: 余裕 ＋ 平均の速さ × 直近の窓で何も届かなかった表示の最長の続き。
+    /// 使わずに取っておく記録の数（`margin` は余裕の記録の数）: 余裕 ＋ 平均の速さ × 直近のウィンドウで何も届かなかった表示の最長の続き。
     /// 往復ごとにまとめて届く間は、何も届かない間を平均の速さで進んでも尽きない分を残す。1 表示ごとに届く（追いついた）間は余裕のまま。
     /// ただし、続けて `BURST_SPAN` 表示に届いた最大の数（1 つのまとまり）を越えては取っておかない（長く止まった後の 1 回きりの
     /// まとまりで、まとまりより多くを待たない）。
@@ -140,6 +160,10 @@ impl Pace {
     /// この表示で余分に回す更新の数（`backlog` はこの表示の普段の 1 回を使った後の、使っていない記録の数）。早送りでなければ溜まりが
     /// `FF_ENTER_FRAMES` を越えたら入り、`FF_EXIT_FRAMES` 以下で戻る。溜まりを `FF_EXIT_FRAMES` より下へは減らさない。
     pub fn extras(&mut self, backlog: u32, margin: u32) -> u32 {
+        if self.max_extra == 0 {
+            self.leave();
+            return 0;
+        }
         if self.active {
             if backlog <= FF_EXIT_FRAMES {
                 self.leave();
@@ -157,11 +181,11 @@ impl Pace {
         } else {
             PACE_GAIN
         };
-        let top = i64::from(MILLI * (1 + FF_MAX_EXTRA));
+        let top = i64::from(MILLI * (1 + self.max_extra));
         // 取っておく数を 1 ウィンドウぶん越えた溜まりは、まとまりの揺れ（最大 1 ウィンドウ）ではなく遅れそのもの。届くのが普段の速さ
         // （まとまりで届いていない）なら、越えた分はどれも遅れ。どちらも最大の速さで減らす（追いつきの終わり・ホストが止まった後）。
         let live = rate <= LIVE_RATE_MILLI;
-        let speed = if excess > i64::from(SEND_WINDOW) || (live && excess > 0) {
+        let speed = if excess > i64::from(FULL_SPEED_EXCESS) || (live && excess > 0) {
             top
         } else {
             i64::from(rate) + excess * i64::from(MILLI) / i64::from(gain)
@@ -169,7 +193,7 @@ impl Pace {
         let speed = speed.clamp(i64::from(MILLI), top) as u32;
         self.credit = self.credit.saturating_add(speed - MILLI);
         let n = (self.credit / MILLI)
-            .min(FF_MAX_EXTRA)
+            .min(self.max_extra)
             .min(backlog - FF_EXIT_FRAMES);
         self.credit -= n * MILLI;
         // 上限で切った分は持ち越さない（後でまとめて回さない）。
@@ -229,7 +253,7 @@ mod tests {
 
     #[test]
     fn the_reserve_covers_the_longest_silence_at_the_mean_rate() {
-        // 19 表示ごとに 64（表示 0・19・…・133）。表示 151 の時点の窓（表示 88〜151）には 95・114・133 の 3 つで平均 192/64 = 3 / 表示、
+        // 19 表示ごとに 64（表示 0・19・…・133）。表示 151 の時点のウィンドウ（表示 88〜151）には 95・114・133 の 3 つで平均 192/64 = 3 / 表示、
         // 何も届かない最長の続きは 18 表示（96〜113・115〜132・134〜151）。取っておく数 = 余裕 3 ＋ 3 × 18 = 57。
         let mut p = Pace::new();
         for d in 0..(19 * 8) {
@@ -239,8 +263,8 @@ mod tests {
         assert_eq!(p.reserve(3), 57);
         // 普段の観戦（1 表示に 1 つ）: 何も届かない表示が無いので余裕のまま。
         assert_eq!(fed(&[1; PACE_WINDOW]).reserve(3), 3);
-        // まとまりが来なくなって 1 表示に 1 つずつになったら、まとまりの間の空きが窓を出るまで残す（16 表示ごとに 64 → 表示 0〜63 の
-        // 後に 1 ずつ 40 表示: 窓は 40〜63 と 1 × 40、空きの最長 15、平均 (64 + 40) / 64）。
+        // まとまりが来なくなって 1 表示に 1 つずつになったら、まとまりの間の空きがウィンドウを出るまで残す（16 表示ごとに 64 → 表示 0〜63 の
+        // 後に 1 ずつ 40 表示: ウィンドウは 40〜63 と 1 × 40、空きの最長 15、平均 (64 + 40) / 64）。
         let mut p = Pace::new();
         for d in 0..64 {
             p.on_display(if d % 16 == 0 { 64 } else { 0 });
@@ -253,7 +277,7 @@ mod tests {
             p.on_display(1);
         }
         assert_eq!(p.reserve(3), 3, "空きが窓を出たら余裕だけ");
-        // 40 表示止まった後に 30 がまとめて届いた（1 回きり）: 窓は 1 × 23・0 × 40・30 で、平均 53/64 × 空き 40 = 33 だが、
+        // 40 表示止まった後に 30 がまとめて届いた（1 回きり）: ウィンドウは 1 × 23・0 × 40・30 で、平均 53/64 × 空き 40 = 33 だが、
         // 4 表示のまとまりの最大 30 までしか取っておかない。
         let mut p = fed(&[1; PACE_WINDOW]);
         for _ in 0..40 {
@@ -319,10 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_line_runs_at_the_cap() {
+    fn a_fast_line_runs_at_the_cap_set_by_ff_max_and_no_faster() {
+        for updates in [2, FF_UPDATES_DEFAULT, FF_UPDATES_MAX] {
+            let mut p = Pace::with_updates(updates);
+            for _ in 0..PACE_WINDOW {
+                p.on_display(64);
+            }
+            let cap = updates - 1;
+            assert_eq!(p.extras(1_000, 3), cap, "updates={updates}");
+            assert_eq!(p.extras(1_000, 3), cap, "上限の端数を貯めない: {updates}");
+        }
         let mut p = fed(&[64; PACE_WINDOW]);
-        assert_eq!(p.extras(1_000, 3), FF_MAX_EXTRA);
-        assert_eq!(p.extras(1_000, 3), FF_MAX_EXTRA, "上限の端数を貯めない");
+        assert_eq!(p.extras(1_000, 3), FF_UPDATES_DEFAULT - 1);
+        assert_eq!(Pace::with_updates(0).max_extra, 0, "範囲の下は余分なし");
+        assert_eq!(Pace::with_updates(99).max_extra, FF_MAX_EXTRA - 1);
+    }
+
+    #[test]
+    fn ff_max_one_never_enters_fast_forward() {
+        let mut p = Pace::with_updates(1);
+        assert_eq!(p.extras(10_000, 3), 0);
+        assert!(!p.is_active());
     }
 
     #[test]

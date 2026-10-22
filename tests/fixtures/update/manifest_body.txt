@@ -1,0 +1,6 @@
+HiganRTool-manifest 1
+version 399360
+display 20261008-abcdef0
+file HiganRTool.exe 25 018822b705b79ff215946fdf06c72c50bd7bc30d9937ac954f75b1d89bc8f71d
+file HiganRTool.dll 25 27e76aa0248888d2f5df3769ccfacd95368b974024b05c418b578e4cdd01aca4
+file README.txt 21 a93a1147ed3fae1f3929852ae80e45e09bb8d625f7fe3c14ec27c1fee9386517
