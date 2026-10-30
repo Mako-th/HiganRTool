@@ -1,9 +1,9 @@
-//! ゲーム内メニューの状態機械と、画面に出す固定の文の表（pure。確保しない）。入口は `ui_entry`（Match の「妖怪 対 妖怪」の決定を借りる）。
-//! - 状態機械 `Menu`: ゲームのスレッドで 1 tick に 1 回進める（カーソルの反応を遅らせないため）。入力はゲームへ流さない（呼び手が 0 を feed する）。自分の語（`0x0042BE40` / poll の席 0 の値）の押した瞬間で動く。閉じるときはローカルの語が 0 になるまで 0 を流し続けてからゲームへ返す（押したままのキーをゲームが「押した瞬間」と読まないため）。
-//! - 見張りのスレッドから来る状態 `Note`: 文字列でなく「種類（`Event` / `CodeState`）＋数」。メニューが下の固定の文から文を選ぶので、画面に出る文字は全部この表の文字と数字・ASCII だけになる（文字の表 `overlay::ui_glyphs` に無い文字を出さない）。相手の名前だけは表に無い文字がありうるので、書き手（見張り）が `sanitize_name` で `?` に直してから渡す。
-//! - 描く行 `LineBuf`: スタックの固定の配列（確保しない）。
+//! ゲーム内メニューのステートマシンと画面に出す固定の文の表（pure。確保しない）。入口は`ui_entry`（Matchの「妖怪 対 妖怪」の決定を借りる）。
+//! - ステートマシン`Menu`: ゲームのスレッドで1 tickに1回進める（カーソルの反応を遅らせないため）。入力はゲームへ渡さない（呼び手が0をfeedする）。自分のワード（`0x0042BE40` / pollのサイド0の値）の押した瞬間で動く。閉じるときはローカルのワードが0になるまで0を渡し続けてからゲームへ返す（押したままのキーをゲームが「押した瞬間」と読まないため）。
+//! - 監視のスレッドから来る状態`Note`: 文字列でなく「種類（`Event` / `CodeState`）＋数」。メニューが下の固定の文から文を選ぶので画面に出る文字は全部この表の文字と数字・ASCIIだけになる（文字の表`overlay::ui_glyphs`に無い文字を出さない）。相手の名前だけは表に無い文字がありうるので書き手（監視のスレッド）が`sanitize_name`で`?`に直してから渡す。
+//! - 描く行`LineBuf`: スタックの固定の配列（確保しない）。
 //!
-//! 文言の規律: このツールが何をどう描いたか・画面から読めない数値（文字数・時間・席・形）は書く。ゲームの仕様は説明しない。状態の文には次にすることを 1 つ添える。adonis の語（「同期ズレ」）に合わせる。
+//! 文言の規律: このツールが何をどう描いたか・画面から読めない数値（文字数・時間・サイド・形）は書く。ゲームの仕様は説明しない。状態の文には次にすることを1つ添える。adonisの語（「同期ズレ」）に合わせる。
 #![forbid(unsafe_code)]
 
 use crate::code::DEFAULT_TTL_SECS;
@@ -23,16 +23,17 @@ use crate::room_input::{Edit, RoomBuf, RoomInput};
 use crate::spectate_room::{JOINER_GIVE_UP_MS, JoinerFailure, JoinerPhase, JoinerStatus};
 use crate::ui_layout::RowStyle;
 use crate::update::BUILD_NUMBER;
+use crate::update_notice::{Found, Version};
 use crate::vpn_net::{VpnSet, VpnTool};
 use crate::watch_list::{ListStatus, WATCH_NAME_MAX, WatchRow, WatchSnapshot};
 use crate::wire::{Mode, PROTO_VER, Seat, SeatWish};
 
-/// 文の定数と、その全部を並べた表 `TEXTS` を 1 つの書き方から作る（定数を足して表に入れ忘れることが無い）。
-/// 1 項目は日本語と英語の組（`lang::Tx`）。語順が違うので、数や名前を挟む文は前後の片方が空のことがある。
+/// 文の定数とその全部を並べた表`TEXTS`を1つの書き方から作る（定数を足して表に入れ忘れることが無い）。
+/// 1項目は日本語と英語のペア（`lang::Tx`）。語順が違うので数や名前を挟む文は前後の片方が空のことがある。
 macro_rules! texts {
     ($($(#[$m:meta])* $name:ident = $ja:expr, $en:expr;)*) => {
         $($(#[$m])* pub const $name: Tx = Tx { ja: $ja, en: $en };)*
-        /// 画面に出す固定の文の全部（両方の言語）。ここに無い文字は文字の表に無く、`?` で描かれる。
+        /// 画面に出す固定の文の全部（両方の言語）。ここに無い文字は文字の表に無く、`?`で描かれる。
         pub const TEXTS: &[Tx] = &[$($name),*];
     };
 }
@@ -43,11 +44,11 @@ texts! {
     T_GROUP_CODE = "接続コード", "Connect code";
     T_GROUP_LAN = "LAN", "LAN";
     T_GROUP_SETTINGS = "設定", "Settings";
-    /// LAN の見出しの下の 3 項目（対戦のホスト・クライアントと、観戦）。
+    /// LANの見出しの下の3項目（対戦のホスト・クライアントと観戦）。
     T_LAN_HOST = "ホスト", "Host";
     T_LAN_CLIENT = "クライアント", "Client";
     T_LAN_WATCH = "観戦", "Watch";
-    /// LAN のホストのアドレスの入力の画面（「クライアント」「観戦」を決めた後。ルーム名の入力と同じ作り）。題は `T_GROUP_LAN` ＋ 項目名。
+    /// LANのホストのアドレスの入力の画面（「クライアント」「観戦」を決めた後。ルーム名の入力と同じ作り）。題は`T_GROUP_LAN` ＋ 項目名。
     T_LAN_ADDR_LABEL = "ホストのアドレス: ", "Host address: ";
     T_LAN_ADDR_KEYS = "使用可能な文字は「数字」「.」「:」です　Enterで決定　Escでもどる", "Allowed: 0-9 . :   Enter: Confirm   Esc: Back";
     T_LAN_ADDR_EMPTY = "アドレスが空です。", "The address is empty.";
@@ -55,9 +56,9 @@ texts! {
     T_LAN_ADDR_PORT = "ポートは1から65535の数で入力してください。", "The port must be a number from 1 to 65535.";
     T_LAN_ADDR_NOT_LAN = "入力されたアドレスはLANのものではありません。", "That is not a LAN address.";
     T_LAN_ADDR_DROPPED = "アドレスに使用可能な文字は「数字」「.」「:」です。", "Only 0-9, . and : can be used.";
-    /// LAN のホストの待機。1 行目の後ろに、自分の LAN のアドレスとポートを 1 行ずつ並べる（全部。4 つ以上は↑↓でスクロール）。
+    /// LANのホストの待機。1行目の後ろに自分のLANのアドレスとポートを1行ずつ並べる（全部。4つ以上は↑↓でスクロール）。
     T_LAN_WAITING = "待機しています。相手に次のアドレスを入力してもらってください。", "Waiting. Ask your opponent to enter one of these addresses:";
-    /// 待機のアドレスの行の、ポートの後ろに添える VPN のツールの名前。
+    /// 待機のアドレスの行のポートの後ろに添えるVPNのツールの名前。
     T_LAN_VPN_RADMIN = "（Radmin）", " (Radmin)";
     T_LAN_VPN_HAMACHI = "（Hamachi）", " (Hamachi)";
     T_LAN_VPN_ZEROTIER = "（ZeroTier）", " (ZeroTier)";
@@ -79,31 +80,36 @@ texts! {
     T_LAN_BUSY_NEXT = "ホストに待機し直してもらってください。", "Ask the host to start waiting again.";
     T_LAN_NO_MATCH = "ホストとクライアントがまだ接続していません。", "The host and the client have not connected yet.";
     T_LAN_NO_MATCH_NEXT = "2人が接続してから、もう一度「観戦」を選んでください。", "Choose \"Watch\" again after they have connected.";
-    /// 観戦者（LAN・ルームマッチ）: 対戦する 2 人のどちらかが観戦を許可していない。どちらかは出さない。
+    /// 観戦者（LAN・ルームマッチ）: 対戦する2人のどちらかが観戦を許可していない。どちらかは出さない。
     T_WATCH_REFUSED = "この試合は観戦できません（2人のどちらかが観戦を許可していません）。", "This match cannot be watched (one player does not allow watching).";
     T_WATCH_REFUSED_NEXT = "2人にHiganRTool.iniの[spectate]のenableを1にしてもらってください。", "Ask both players to set [spectate] enable to 1 in HiganRTool.ini.";
     T_LAN_NO_LINK = "相手と接続できませんでした。", "Could not connect to the opponent.";
     T_LAN_NO_LINK_NEXT = "ファイアウォールでth09.exeが許可されているかチェックしてください。", "Check that th09.exe is allowed in the firewall.";
     T_LAN_CANCELLED_NEXT = "もう一度接続するときは「LAN」の項目を選んでください。", "To connect again, choose an item under LAN.";
-    /// プレイヤー名が既定のままの間、メニューの下に出す案内（設定の項目名は `T_GROUP_SETTINGS`）。
+    /// プレイヤー名が既定のままの間メニューの下に出す案内（設定の項目名は`T_GROUP_SETTINGS`）。
     T_NAME_FIRST = "はじめに「設定」でプレイヤー名を決めてください。", "Set your player name under \"Settings\" first.";
+    /// 新しいバージョンの知らせの2行（`update_notice_lines`）。1行目は「新しいバージョンがリリースされています（v1.2.3）」の前後（バージョンが読めなければ`T_UPDATE_NEW_NO_VER`）。
+    T_UPDATE_NEW_OPEN = "新しいバージョンがリリースされています（v", "A new version has been released (v";
+    T_UPDATE_NEW_CLOSE = "）", ")";
+    T_UPDATE_NEW_NO_VER = "新しいバージョンがリリースされています", "A new version has been released";
+    T_UPDATE_HOW = "更新する場合は開いている花映塚を閉じ、HiganRTool.exeから起動しなおしてください。", "To update, close the game and restart it from HiganRTool.exe.";
     T_CREATE = "対戦コード作成", "Create play code";
     T_PASTE = "対戦コード入力", "Paste play code";
     T_PASTE_REPLY = "返答コード入力", "Paste reply code";
-    /// 設定の 2 行「同期方式 ◀ rollback ▶」（rollback が既定・← → で delay）と「ディレイ ◀ auto ▶」（並びは auto, 0F, 1F, …, 8F）。
+    /// 設定の2行「同期方式 ◀ rollback ▶」（rollbackが既定・← → でdelay）と「ディレイ ◀ auto ▶」（並びはauto, 0F, 1F, …, 8F）。
     T_FORMAT = "同期方式", "Netcode";
     T_DELAY_ROW = "ディレイ", "Delay";
-    /// フレーム数の値の後ろに付ける 1 文字（ディレイの値と左下の行）。日英で同じ。
+    /// フレーム数の値の後ろに付ける1文字（ディレイの値と左下の行）。日英で同じ。
     T_FRAMES_MARK = "F", "F";
-    /// 「同期方式」の値。マッチ中の行の語（`T_HUD_*`）と同じ ASCII。
+    /// 「同期方式」の値。マッチ中の行の語（`T_HUD_*`）と同じASCII。
     T_FORMAT_ROLLBACK = "rollback", "rollback";
     T_FORMAT_DELAY = "delay", "delay";
-    /// キャラセレクトの左下の行の形式の語: この組は rollback へ替えられない（片方が rollback ができない）ので、Ctrl+Tab を押しても効かない。画面から読み取れない事実なので delay の語に添えて出す。
+    /// キャラセレクトの左下の行の形式の語: このペアはrollbackへ替えられない（片方がrollbackを使えない）のでCtrl+Tabを押しても効かない。画面から読み取れない事実なのでdelayの語に添えて出す。
     T_FORMAT_DELAY_ONLY = "delay only", "delay only";
     T_DELAY_AUTO = "auto", "auto";
     /// 設定の「言語」の行。値は言語ごとの自分の名前（`T_LANG_JA` / `T_LANG_EN`）で、どちらの言語でも同じ文字。
     T_LANG = "言語", "Language";
-    /// 「ラベル　◀ 値 ▶」の行のラベルと矢印の間（日本語は全角の空白、英語は同じ幅の半角 2 つ）。
+    /// 「ラベル　◀ 値 ▶」の行のラベルと矢印の間（日本語は全角の空白、英語は同じ幅の半角2つ）。
     T_ROW_SEP = "　", "  ";
     T_LANG_JA = "日本語", "日本語";
     T_LANG_EN = "English", "English";
@@ -113,7 +119,7 @@ texts! {
     /// 接続した後の左上の行（`connected_line`）の文字: 「rollback・delay 1」「delay 方式」。
     T_ROLLBACK = "rollback・delay ", "rollback, delay ";
     T_DELAY = "delay方式・delay ", "delay mode, delay ";
-    /// キーの行。パッドだけでも操作できるので、キーボードのキーの名前（Z・X）は出さず「決定」「キャンセル」と書く。
+    /// キーの行。パッドだけでも操作できるのでキーボードのキーの名前（Z・X）は出さず「決定」「キャンセル」と書く。
     T_KEYS = "↑↓ メニューの移動　← → 値の変更　決定で確定　キャンセルでもどる", "↑↓ Move   ← → Change value   Confirm: Select   Cancel: Back";
     T_KEYS_CONFIRM = "↑↓ メニューの移動　決定で確定　キャンセルでいいえ", "↑↓ Move   Confirm: Select   Cancel: No";
     T_OPENING = "ネットワークの準備をしています。しばらくお待ちください。", "Preparing the network. Please wait.";
@@ -152,7 +158,7 @@ texts! {
     T_NO_ROUTE = "今の設定では相手に接続できません。", "Cannot reach the opponent with the current settings.";
     T_NO_ROUTE_NEXT = "HiganRTool.iniのscopeを直して、起動し直してください。", "Fix scope in HiganRTool.ini and restart the game.";
     T_INTERNAL = "接続の準備に失敗しました（詳細はログを確認してください）。", "Failed to prepare the connection (details in the log).";
-    /// HiganRTool.ini の読めない行の注（`IniNotice`）。1 か所は「HiganRTool.ini の 12 行目（[netplay] の upnp）を読み込めません。」+「読み込めなかった部分は既定値で動かしています。」の 2 行（1 行にすると上限の幅を越えうる）、複数は件数。
+    /// HiganRTool.iniの読めない行の注（`IniNotice`）。1か所は「HiganRTool.ini の 12 行目（[netplay] の upnp）を読み込めません。」+「読み込めなかった部分は既定値で動かしています。」の2行（1行にすると上限の幅を越えうる）、複数は件数。
     T_INI_LINE_A = "HiganRTool.iniの", "HiganRTool.ini line ";
     T_INI_LINE_B = "行目", " ";
     T_INI_WHERE_A = "（[", "([";
@@ -166,12 +172,12 @@ texts! {
     T_INI_DEFAULT = "読み込めなかった部分は既定の設定で動かしています。", "The default is used for that part.";
     T_INI_DEFAULT_MANY = "読み込めなかった部分は既定の設定で動かしています（詳細はログを確認してください）。", "Those lines are ignored; defaults are used (see the log).";
     T_INI_SJIS = "HiganRTool.iniはUTF-8でないので、Shift_JISとして読みました。", "HiganRTool.ini is not UTF-8, so it was read as Shift_JIS.";
-    /// 起動し直さないと直らないとき（準備に失敗した）だけの次にすること。接続が終わっただけなら、このツールがネットワークの組を片づけて「接続する前」へ戻すので `T_AGAIN`。
+    /// 起動し直さないと直らないとき（準備に失敗した）だけの次にすること。接続が終わっただけならこのツールがネットワーク一式を後始末して「接続する前」へ戻すので`T_AGAIN`。
     T_RESTART = "ゲームを閉じて起動し直してください。", "Close the game and start it again.";
-    /// 接続が終わった・成立しないまま閉じた・接続できないまま終わった後の次にすること（ゲーム内のメニューの実行だけ。マッチの外へ戻るとネットワークの組を片づけ、メニューが「接続する前」に戻る）。キーの名前は出さない。
+    /// 接続が終わった・成立しないまま閉じた・接続できないまま終わった後の次にすること（ゲーム内のメニューの実行だけ。マッチの外へ戻るとネットワーク一式を後始末し、メニューが「接続する前」に戻る）。キーの名前は出さない。
     /// ゲームの項目の名前は、どの言語でもゲームの画面の文字のまま書く。
     T_AGAIN = "もう一度接続するときは「妖怪 対 妖怪」を選んでください。", "To connect again, choose 妖怪 対 妖怪 in Match Mode.";
-    /// 前の接続（この起動の中で接続した回）で使ったコードを貼った（`Event::Spent`。次にすることは `T_EXPIRED_NEXT`）。
+    /// 前の接続（この起動の中で接続した回）で使ったコードを貼った（`Event::Spent`。次にすることは`T_EXPIRED_NEXT`）。
     T_SPENT = "このコードは前回の接続で使ったものです。", "This code was used for a previous connection.";
     T_UNREADABLE = "クリップボードが読み込めません。", "Could not read the clipboard text.";
     T_UNREADABLE_NEXT = "もう一度コピー＆ペーストしてください。", "Copy it again, then paste.";
@@ -184,15 +190,15 @@ texts! {
     T_GAVE_UP_NEXT = "「対戦コード作成」を選び直してください。", "Choose \"Create play code\" again.";
     T_ENDED = "相手と接続できないまま終わりました。", "Ended without connecting.";
     T_FINISHED = "接続が終わりました。", "The connection has ended.";
-    /// 対戦の後に接続が終わり、「妖怪 対 妖怪」へ戻す間とその後の左上の 1 行目（`return_lines`。理由は `return_flow::Why`）。
+    /// 対戦の後に接続が終わり、「妖怪 対 妖怪」へ戻す間とその後の左上の1行目（`return_lines`。理由は`return_flow::Why`）。
     T_RETURN_PEER_LEFT = "相手が対戦をやめました。", "The opponent left the match.";
     T_RETURN_LOST = "相手との接続が切れました。", "The connection to the opponent was lost.";
     T_RETURN_SELF_CUT = "切断しました。", "Disconnected.";
-    /// 同期ズレ（CHECK の食い違い）でマッチを止めている間の左上の 2 行（`Conn::Desynced`）。次にすること 1 つは「ログを GitHub の Issues へ送る」で、戻り方は括弧に添える。
-    /// 2 行目は左上の幅（ゲームの文字で描く幅は 640 − 2 × 6 = 628 画素）に収まるよう「メニューへ」に縮めた。
+    /// 同期ズレ（CHECKの食い違い）でマッチを止めている間の左上の2行（`Conn::Desynced`）。次にすること1つは「ログを GitHub の Issues へ送る」で、戻り方は括弧に添える。
+    /// 2行目は左上の幅（ゲームの文字で描く幅は 640 − 2 × 6 = 628画素）に収まるよう「メニューへ」に縮めた。
     T_DESYNC = "同期がずれたため、試合を終了しました。", "Desync detected. This match was stopped.";
-    T_DESYNC_NEXT = "logsフォルダのログを添えて、開発者に伝えてください（Escでメニューへ）。", "Post the logs in the logs folder to GitHub Issues (Esc: menu).";
-    /// 選択・止める地点・マッチで、相手の入力が届かないまま約 2 秒たった間の左上の 1 行（`NetPlay::peer_wait_shown`）。届けば消える。
+    T_DESYNC_NEXT = "zipにしたlogsフォルダを添えて、開発者に伝えてください（Escでメニューへ）。", "Post the logs folder as a zip to GitHub Issues (Esc: menu).";
+    /// 選択・止める地点・マッチで相手の入力が届かないまま約2秒たった間の左上の1行（`NetPlay::peer_wait_shown`）。届けば消える。
     T_PEER_WAIT = "相手の応答を待っています（Escを3秒長押しで切断）。", "Waiting for the opponent... (hold Esc for 3 s to disconnect)";
     T_CANCELLED = "待機をやめました。", "Stopped waiting.";
     T_CANCELLED_NEXT = "接続し直すときは「対戦コード作成」か「対戦コード入力」を選んでください。", "Connect again with \"Create play code\" or \"Paste play code\".";
@@ -201,12 +207,12 @@ texts! {
     T_NAME_CLOSE_CODE = "」のコードを読みました。", "\".";
     T_NAME_CLOSE_REPLY = "」の返答コードを読みました。", "\" (reply).";
     T_CONNECTED_PRE = "接続しました。あなたは", "Connected. You are ";
-    /// 席の後ろに添える（ホスト役の側だけ）。遅れの量はホストが決めるので、どちらが決める側かを画面に出す。
+    /// サイドの後ろに添える（ホスト役の側だけ）。遅れの量はホストが決めるのでどちらが決める側かを画面に出す。
     T_HOST = "（ホスト）", " (host)";
     T_CONNECTED_POST = "です。", ".";
     T_CONNECTED_SHAPE_OPEN = "（", " (";
     T_CONNECTED_SHAPE_CLOSE = "）", ")";
-    /// 接続コードで待つ間の左上の行（`corner_is_band`）: 「接続コードで待機中 0:42 残り 29:18」。マッチ中の行と同じ GDI の小さい文字の 1 行。次にすることの 2 行目は付けない（メニューを開けば項目が並ぶ）。
+    /// 接続コードで待つ間の左上の行（`corner_is_band`）: 「接続コードで待機中 0:42 残り 29:18」。マッチ中の行と同じGDIの小さい文字の1行。次にすることの2行目は付けない（メニューを開けば項目が並ぶ）。
     T_WAITING = "接続コードで待機中 ", "Waiting with code ";
     T_WAITING_REMAIN = " 残り ", "  left ";
     /// 待ちを始めた項目の右に出す印（「ランダムマッチ  待機中 0:42」）。時計は待った時間。
@@ -218,85 +224,87 @@ texts! {
     T_FOUND_CLOSE = "）", ")";
     T_NEXT_FOUND = "「妖怪 対 妖怪」を選んでください。", "Choose 妖怪 対 妖怪 in Match Mode.";
     T_NEXT_FOUND_READY = "やめるときはキャンセルで抜けてください。", "To quit, press Cancel.";
-    /// 成立しないまま時間切れで閉じた（`Conn::Unmatched(NoMatch::TimedOut)`）。長さは `match_gate::MATCH_WAIT_MS` から作る（`push_span`）。
+    /// 成立しないまま時間切れで閉じた（`Conn::Unmatched(NoMatch::TimedOut)`）。長さは`match_gate::MATCH_WAIT_MS`から作る（`push_span`）。
     T_UNMATCHED_OPEN = "対戦が始まらないまま", "No match started for ";
     T_UNMATCHED_CLOSE = "たったので、接続を閉じました。", ", so the connection was closed.";
-    /// 相手に成立のゲートが無いと見て閉じた（`NoMatch::PeerHasNoGate`）。相手が古いバージョンか、`offer` / `answer` でつないだ。キーの名前・内部の語は出さない。
-    /// 画面の幅（全角 45 文字ぶん）に近いので「メニューからつないでいない」を「メニューを使っていない」に縮めた（幅は `each_unmatched_reason_has_its_own_line_and_fits` が見る）。
+    /// 相手に成立のゲートが無いと見て閉じた（`NoMatch::PeerHasNoGate`）。相手が古いバージョンか、`offer` / `answer`でつないだ。キーの名前・内部の語は出さない。
+    /// 画面の幅（全角45文字ぶん）に近いので「メニューからつないでいない」を「メニューを使っていない」に縮めた（幅は`each_unmatched_reason_has_its_own_line_and_fits`が見る）。
     T_NO_GATE = "相手のHiganRToolが古いか、ゲーム内のメニューを使っていないので接続を閉じました。", "Closed: the opponent's HiganRTool is old or not in the game menu.";
-    /// 成立の前に、相手が BYE(取消) で閉じた（`NoMatch::PeerLeft`。相手の 10 分が先に切れた・相手が抜けた）。
+    /// 成立の前に、相手がBYE(取消)で閉じた（`NoMatch::PeerLeft`。相手の10分が先に切れた・相手が抜けた）。
     T_PEER_LEFT = "相手が対戦を始めないまま抜けたので、接続を閉じました。", "The opponent closed the connection before starting.";
-    /// 相手の HiganRTool のバージョン（プロトコルのバージョン `wire::PROTO_VER`）が違う（`Conn::OtherVersion`・`Event::OtherVersion`）。2 つのビルド番号は画面から読めないので出す。
+    /// 相手のHiganRToolのバージョン（プロトコルのバージョン`wire::PROTO_VER`）が違う（`Conn::OtherVersion`・`Event::OtherVersion`）。2つのビルド番号は画面から読めないので出す。
     /// 内部の語は出さない。本ログと試験のまとめも同じ文字（`other_version_text`）。
     T_OTHER_VER_OPEN = "相手とHiganRToolのバージョンが違います（自分 ", "HiganRTool version differs from the opponent (you ";
-    T_OTHER_VER_MID = "・相手 ", ", opponent ";
+    T_OTHER_VER_MID = "・相手 ", ", them ";
     T_OTHER_VER_CLOSE = "）。", ").";
     T_OTHER_VER_NEXT = "相手と同じzipのHiganRToolを使ってください。", "Use the same HiganRTool zip as your opponent.";
-    /// 相手の HiganRTool のビルド（`update::BUILD_NUMBER`。配った zip ごとの数）が違う（`Conn::OtherBuild`・`Event::OtherBuild`・`Event::SpectateOtherBuild`）。
-    /// プロトコルのバージョンの違いと並べ、2 行目・区切り・閉じは同じ文字を使う。2 つのビルドは画面から読めないので出す（書き方は `push_build`）。
+    /// 相手のHiganRToolのビルド（`update::BUILD_NUMBER`。配ったzipごとの数）が違う（`Conn::OtherBuild`・`Event::OtherBuild`・`Event::SpectateOtherBuild`）。
+    /// プロトコルのバージョンの違いと並べ、2行目・区切り・閉じは同じ文字を使う。2つのビルドは画面から読めないので出す（書き方は`push_build`）。
     T_OTHER_BUILD_OPEN = "相手とバージョンが違います（自分 ", "Version mismatch (you ";
-    /// 開発用のビルド（ビルド番号 0。配布用のツールを通さずに建てた物）の書き方（`push_build`）。
+    /// 開発用のビルド（ビルド番号0。配布用のツールを通さずに建てた物）の書き方（`push_build`）。
     T_BUILD_DEV = "開発版", "dev";
-    /// マッチ中の行の語（`hud_line`）。全部 ASCII。項目の区切りは空白 2 つ。
-    /// 行は上の枠の左（タイマーの手前。`ui_layout::HUD_TEXT_MAX_W`）に収める必要があるが、ゲームの文字（9 画素送り）では 2 つ空けの形が収まらないので、
-    /// この行だけ GDI の文字（半角 7 画素。`ui_layout::push_text_plain`）で描く。幅は `every_match_line_fits_before_the_timer` が数える。
+    /// マッチ中の行の語（`hud_line`）。全部ASCII。項目の区切りは空白2つ。
+    /// 行は上の枠の左（タイマーの手前。`ui_layout::HUD_TEXT_MAX_W`）に収める必要がある。
+    /// ゲームの文字（9画素送り）では2つ空けの形が収まらない。
+    /// そのためこの行だけGDIの文字（半角7画素。`ui_layout::push_text_plain`）で描く。幅は`every_match_line_fits_before_the_timer`が数える。
     T_HUD_DELAY = "Delay", "Delay";
     T_HUD_PING = "  ping ", "  ping ";
     T_HUD_MS = "ms", "ms";
     T_HUD_REWIND = "  rollback ", "  rollback ";
-    /// 遅れの推奨値（`Connected::recommend_now`。RTT から決まる、画面から読めない数）を、今の遅れの値の横に括弧で添える。「推奨」の文字は出さない。RTT が測れていなければ括弧ごと出さない。
+    /// 遅れの推奨値（`Connected::recommend_now`。RTTから決まる、画面から読めない数）を今の遅れの値の横に括弧で添える。「推奨」の文字は出さない。RTTが測れていなければ括弧ごと出さない。
     T_HUD_RECOMMEND_OPEN = " (", " (";
     T_HUD_RECOMMEND_CLOSE = ")", ")";
-    /// auto のとき、推奨値の代わりに括弧の中へ出す 1 文字（「Delay 2F (A)」）。auto の間は遅れの値そのものが推奨値なので、括弧の推奨値と並べない。
+    /// autoのとき推奨値の代わりに括弧の中へ出す1文字（「Delay 2F (A)」）。autoの間は遅れの値そのものが推奨値なので括弧の推奨値と並べない。
     T_HUD_AUTO_MARK = "A", "A";
-    /// キャラセレクトの左下の行の先頭に出す「形式・」の区切り（`hud_line` の `format`。マッチ中の行にはこれは付かない）。
+    /// キャラセレクトの左下の行の先頭に出す「形式・」の区切り（`hud_line`の`format`。マッチ中の行にはこれは付かない）。
     T_HUD_FORMAT_SEP = "・", ", ";
-    /// 試合中の上の枠の左右の名前の帯の席の文字（`name_band_line`。左は「1P 名前」、右は「名前 2P」）。
+    /// 試合中の上の枠の左右の名前の帯のサイドの文字（`name_band_line`。左は「1P 名前」、右は「名前 2P」）。
     T_HUD_SEAT_1 = "1P", "1P";
     T_HUD_SEAT_2 = "2P", "2P";
-    /// 観戦者のマッチ中の通信の状態の行の語（`watch_hud_line`: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」）。前半の「ping・Delay・Rollback」は対戦する 2 人の間の値
-    /// （ホストが 1 秒ごとに観戦の流れの `Stats` の記録で流す。定義は `hud_line` と同じ。ping は観戦者からホストへの往復ではない）、後半の「Watch delay」は観戦者自身の遅れ
-    /// （手元に届いてまだ使っていないマッチのフレームの数。画面から読めない数）。区切りは空白 1 つで、ふつうの文字では収まらないので観戦者の行だけ小さい文字で描く（`overlay::SMALL_CELL_H`）。
-    /// 全部 ASCII。「>>」は遅れて入った観戦者が溜まりを追いつく間（画面が速く進む）。
+    /// 観戦者のマッチ中の通信の状態の行の語（`watch_hud_line`: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」）。
+    /// 前半の「ping・Delay・Rollback」は対戦する2人の間の値（ホストが1秒ごとに観戦の流れの`Stats`の記録で送る。定義は`hud_line`と同じ。pingは観戦者からホストへの往復ではない）。
+    /// 後半の「Watch delay」は観戦者自身の遅れ（手元に届いてまだ使っていないマッチのフレームの数。画面から読めない数）。
+    /// 区切りは空白1つ。ふつうの文字では収まらないので、観戦者の行だけ小さい文字で描く（`overlay::SMALL_CELL_H`）。
+    /// 全部ASCII。「>>」は遅れて入った観戦者が溜まりを追いつく間（画面が速く進む）。
     T_HUD_WATCH_PING = "ping ", "ping ";
     T_HUD_WATCH_DELAY = " Delay ", " Delay ";
     T_HUD_WATCH_ROLLBACK = " Rollback ", " Rollback ";
     T_HUD_WATCH = " Watch delay ", " Watch delay ";
     T_HUD_WATCH_FF = " >>", " >>";
-    /// ルームサーバーの項目。ini の `room_server` があるときだけ出す（`RoomItem`）。選ぶとルーム名の入力になる。
+    /// ルームサーバーの項目。iniの`room_server`があるときだけ出す（`RoomItem`）。選ぶとルーム名の入力になる。
     T_ROOM = "ルームマッチ", "Room match";
     /// 「ルーム名　<今のルーム名>」（対戦の中）。決めてあれば「ルームマッチ」はその名で入力なしに始まる（空なら入力の画面から）。
     T_ROOM_NAME = "ルーム名", "Room name";
     T_ROOM_UNSET = "未設定", "(not set)";
-    /// ルーム名の入力の画面（`Menu::render`。打った文字の後ろに `T_ROOM_CURSOR`）。この画面だけキーの名前（Enter・Esc）を出す:
-    /// ルーム名はキーボードで打つので、文字を打つキーと決めるキーの名前を書かないと何を押すのか読めない。
+    /// ルーム名の入力の画面（`Menu::render`。打った文字の後ろに`T_ROOM_CURSOR`）。この画面だけキーの名前（Enter・Esc）を出す:
+    /// ルーム名はキーボードで打つので文字を打つキーと決めるキーの名前を書かないと何を押すのか読み取れない。
     T_ROOM_INPUT_LABEL = "ルーム名: ", "Room name: ";
-    /// 打つ文字の位置の印。`_` はルーム名に使える文字なので、文字と見間違えない `|` にする。
+    /// 打つ文字の位置の印。
     T_ROOM_CURSOR = "|", "|";
-    T_ROOM_INPUT_KEYS = "使用可能な文字は「英数字」「-」「_」「@」です　Enterで決定　Escでもどる", "Allowed: A-Z 0-9 - _ @   Enter: Confirm   Esc: Back";
-    /// 空のまま Enter（`RoomNameWhy::Empty`。文字の決まりの外はほかの `T_ROOM_NAME_*`）。
+    T_ROOM_INPUT_KEYS = "英数字と記号が使えます（「`」「;」「/」は使えません）　Enterで決定　Escでもどる", "Letters, digits, symbols except ` ; /   Enter: Confirm   Esc: Back";
+    /// 空のままEnter（`RoomNameWhy::Empty`。文字の決まりの外はほかの`T_ROOM_NAME_*`）。
     T_ROOM_INPUT_EMPTY = "ルーム名が空です。", "The room name is empty.";
-    /// ウィンドウから文字を受ける仕組み（`text_input_win`）が設定できなかった（ゲームのウィンドウが見つからない・差し替えを断られた）。ルームの入力は何も打てないので、次の 1 手（接続コード）を添える。
+    /// ウィンドウから文字を受ける仕組み（`text_input_win`）が設定できなかった（ゲームのウィンドウが見つからない・差し替えを断られた）。ルームの入力は何も打てないので次の1手（接続コード）を添える。
     T_ROOM_INPUT_NO_KEYS = "キーボードの文字が受け取れません（詳細はログを確認してください）。", "Cannot receive keyboard input (details in the log).";
     T_ROOM_INPUT_NO_KEYS_NEXT = "Escでもどり、「接続コード」から接続してください。", "Press Esc and use \"Connect code\".";
-    /// 使えない文字（半角カナ・記号・日本語など）を打って捨てたとき（`Edit::Rejected`）。文字の表に無い文字は `?` で描かれるので、何が起きたかをここで言う。
-    T_ROOM_INPUT_DROPPED = "ルーム名に使用可能な文字は「英数字」「-」「_」「@」です。", "Only A-Z, 0-9, -, _ and @ can be used.";
-    /// プレイヤー名の項目と入力の画面（`Item::Name`）。項目の行は「名前　<今の名前>」（全角の空白で区切る）。入力の画面の題は項目と同じ文字、
-    /// 打つ文字の組はルーム名に空白を足したもの（`player_name::accepts_char`）。この画面もキーの名前を出す（ルーム名の入力と同じ理由）。
+    /// 使えない文字（半角カナ・日本語・`` ` `` `;` `/` など）を打って捨てたとき（`Edit::Rejected`）。文字の表に無い文字は `?` で描かれるので何が起きたかをここで言う。
+    T_ROOM_INPUT_DROPPED = "ルーム名に「`」「;」「/」は使えません。", "` ; / cannot be used in room names.";
+    /// プレイヤー名の項目と入力の画面（`Item::Name`）。項目の行は「名前　<今の名前>」（全角の空白で区切る）。入力の画面の題は項目と同じ文字。
+    /// 打てる文字はルーム名と同じ（`player_name::accepts_char`）。この画面もキーの名前を出す（ルーム名の入力と同じ理由）。
     T_NAME = "プレイヤー名", "Player name";
-    /// 「サイド」の行（席の希望。`seat_pick.rs`）。1P・2P は `T_HUD_SEAT_1` / `T_HUD_SEAT_2` を使う。
+    /// 「サイド」の行（サイドの希望。`seat_pick.rs`）。1P・2Pは`T_HUD_SEAT_1` / `T_HUD_SEAT_2`を使う。
     T_SEAT = "サイド", "Side";
-    /// 「サイド」の値の「おまかせ」。片方だけなら相手の希望に合わせ、両方のときだけ乱数なので、「ランダム」と書くと片方のときに読み違える。
+    /// 「サイド」の値の「おまかせ」。片方だけなら相手の希望に合わせる。両方のときだけ乱数。「ランダム」と書くと片方のときに読み違える。
     T_SEAT_ANY = "おまかせ", "Any";
     T_NAME_INPUT_LABEL = "プレイヤー名: ", "Player name: ";
-    T_NAME_INPUT_KEYS = "使用可能な文字は「英数字」「-」「_」「@」です　Enterで決定　Escでもどる", "Allowed: A-Z 0-9 - _ @   Enter: Confirm   Esc: Back";
+    T_NAME_INPUT_KEYS = "英数字と記号が使えます（「`」「;」「/」は使えません）　Enterで決定　Escでもどる", "Letters, digits, symbols except ` ; /   Enter: Confirm   Esc: Back";
     T_NAME_INPUT_EMPTY = "プレイヤー名が空です。", "The player name is empty.";
-    T_NAME_INPUT_DROPPED = "プレイヤー名に使用可能な文字は「英数字」「-」「_」「@」です。", "Only A-Z, 0-9, -, _ and @ can be used.";
-    /// ウィンドウから文字を受けられないとき（`T_ROOM_INPUT_NO_KEYS` の次の 1 手）。名前は変えなくても使える。
+    T_NAME_INPUT_DROPPED = "プレイヤー名に「`」「;」「/」は使えません。", "` ; / cannot be used in player names.";
+    /// ウィンドウから文字を受けられないとき（`T_ROOM_INPUT_NO_KEYS`の次の1手）。名前は変えなくても使える。
     T_NAME_INPUT_NO_KEYS_NEXT = "Escでもどってください。", "Press Esc to go back.";
     T_ROOM_JOINING = "ルームのサーバーに接続しています。", "Connecting to the room server.";
-    /// 「ルーム 名前 で待機中 12:34」。時計は待った時間（期限が切れると自動で入り直して待ち続けるので、残りでなく待った時間を出す）。
-    /// 左上ではマッチ中の行と同じ GDI の小さい文字の 1 行なので、鉤括弧（全角で 2 枠）は使わず空白で区切る。
+    /// 「ルーム 名前 で待機中 12:34」。時計は待った時間（期限が切れると自動で入り直して待ち続けるので残りでなく待った時間を出す）。
+    /// 左上ではマッチ中の行と同じGDIの小さい文字の1行なので鉤括弧（全角で2枠）は使わず空白で区切る。
     T_ROOM_OPEN = "ルーム ", "Room ";
     T_ROOM_WAITING_CLOSE = " で待機中", "  waiting";
     T_NEXT_ROOM_WAITING = "相手に同じルーム名で「ルームマッチ」を選んでもらってください。", "Ask your opponent to choose \"Room match\" with the same room name.";
@@ -307,22 +315,23 @@ texts! {
     /// サーバーが応答しない（`room::FailureKind::Unresponsive`）。
     T_ROOM_UNRESPONSIVE = "サーバーが応答しません。", "The server is not responding.";
     T_ROOM_UNRESPONSIVE_NEXT = "「対戦コード作成」か「対戦コード入力」で接続してください。", "Connect with \"Create play code\" or \"Paste play code\".";
-    /// 429（`FailureKind::WaitThenRetry`）。待つ秒はサーバーの `retry_after`（画面から読めない数）から作る。
+    /// 429（`FailureKind::WaitThenRetry`）。待つ秒はサーバーの`retry_after`（画面から読めない数）から作る。
     T_ROOM_BUSY = "サーバーが混み合っています。", "The server is busy.";
     /// 秒の数（`retry_after`）の前と後ろ。分に直さない（文字の表に入る文字を固定するため）。
     T_ROOM_BUSY_NEXT_OPEN = "", "Wait about ";
     T_ROOM_BUSY_NEXT = "秒ほど待ってから、「ルームマッチ」を選び直してください。", " seconds, then choose \"Room match\" again.";
-    T_ROOM_FULL = "ルームが満員です。", "The room is full.";
+    /// 409（`room_in_use`。同じルーム名で2人が待っているか試合中）。
+    T_ROOM_IN_USE = "このルーム名は使用されています。", "This room name is in use.";
     /// 400（`FailureKind::ChangeRoomName`。文字の決まりは通ったが、サーバーが揃えた後の長さなどで断った）。
     T_ROOM_REFUSED = "サーバーがこのルーム名を受け付けませんでした。", "The server did not accept this room name.";
     T_ROOM_RENAME = "別のルーム名で「ルームマッチ」を選び直してください。", "Choose \"Room match\" again with another room name.";
-    /// 4408（`FailureKind::Expired`。ルームの期限 10 分か、相手のコードを返す期限 60 秒。どちらかは分からないので長さは書かない）。
+    /// 4408（`FailureKind::Expired`。ルームの期限10分か、相手のコードを返す期限60秒。どちらかは分からないので長さは書かない）。
     T_ROOM_EXPIRED = "ルームの期限が切れました。", "The room has expired.";
     T_ROOM_PEER_LEFT = "ルームの相手が途中で抜けました。", "The opponent left the room.";
-    /// ルームで受けた相手のコードが読めなかった（バージョン違い・範囲の外・作りの誤りは `Event::OtherVersion` ほかの既存の文）。
+    /// ルームで受けた相手のコードが読めなかった（バージョン違い・範囲の外・作りの誤りは`Event::OtherVersion`ほかの既存の文）。
     T_ROOM_BAD_CODE = "ルームの相手から届いたコードを読めませんでした。", "Could not read the code from the opponent in the room.";
     T_ROOM_AGAIN = "「ルームマッチ」を選び直してください。", "Choose \"Room match\" again.";
-    /// ランダムマッチ（メニューの一番上。ルーム名を決めずに、来た人どうしで対戦する）。ルーム名は割り当てられるが、画面にもログにも出さない。
+    /// ランダムマッチ（メニューの一番上。ルーム名を決めずに来た人どうしで対戦する）。ルーム名は割り当てられるが、画面にもログにも出さない。
     /// 待機の間はルームの待機と同じ状態・同じ左上の行の形（「ランダムマッチで待機中 12:34」）。時計は待ち始めてからの時間で、期限が切れて自動で入り直しても変えない。
     T_RANDOM = "ランダムマッチ", "Random match";
     T_RANDOM_WAITING = "ランダムマッチで待機中", "Random match  waiting";
@@ -333,20 +342,22 @@ texts! {
     T_RANDOM_LINKING = "見つかった相手と接続しています。", "Connecting to the opponent.";
     T_RANDOM_BUSY_NEXT = "秒ほど待ってから、「ランダムマッチ」を選び直してください。", " seconds, then choose \"Random match\" again.";
     T_RANDOM_AGAIN = "「ランダムマッチ」を選び直してください。", "Choose \"Random match\" again.";
-    /// こちらの文字の決まり（`room::RoomName::parse`）で断ったルーム名。名そのものは出さない（断った文字は表に無いことがある）。入力の画面は決まりの内だけを受けるので、ふつうは来ない。
+    /// こちらの文字の決まり（`room::RoomName::parse`）で断ったルーム名。名そのものは出さない（断った文字は表に無いことがある）。入力の画面は使える文字だけを受けるので文字の断りはふつうは来ない（`w.` `q.`の断りは来る）。
     T_ROOM_NAME_LONG_OPEN = "ルーム名が長すぎます（", "The room name is too long (max ";
     T_ROOM_NAME_LONG_CLOSE = "文字まで）。", " chars).";
     T_ROOM_NAME_CHAR = "ルーム名に使えない文字（改行や / など）があります。", "The room name has a character not allowed (newline, / etc.).";
     T_ROOM_NAME_DOT = "ルーム名を「.」や「..」にはできません。", "The room name cannot be \".\" or \"..\".";
-    /// ASCII の英数字と - _ 以外（日本語・全角・空白・記号）。文字の表に無い漢字は「?」で描かれ、相手と同じ名かを画面で見分けられないため。
-    T_ROOM_NAME_ASCII = "ルーム名に使用可能な文字は「英数字」「-」「_」「@」です。", "Room names can use only A-Z, 0-9, -, _ and @.";
+    /// 使える文字（`RoomName::accepts_char`）の外（`` ` `` `;` と日本語・全角）。文字の表に無い漢字は「?」で描かれ、相手と同じ名かを画面で見分けられないため。
+    T_ROOM_NAME_ASCII = "ルーム名に「`」「;」「/」は使えません。", "` ; / cannot be used in room names.";
+    /// 前後の空白を除いた名が`w.`か`q.`で始まる（観戦用のルームとランダムマッチの割り当ての名と重なる）。
+    T_ROOM_NAME_RESERVED = "「w.」か「q.」で始まるルーム名は使えません。", "Room names starting with \"w.\" or \"q.\" cannot be used.";
     T_ROOM_FIX = "ルーム名を直して、「ルームマッチ」を選び直してください。", "Fix the room name and choose \"Room match\" again.";
     /// 観戦者の入口。観戦の「ルームマッチ」は対戦の「ルームマッチ」と同じルーム名の入力へ入る（題だけがこの文字）。待ちの間の項目は「観戦をやめる」だけ。
-    /// 接続する途中は `T_ROOM_JOINING`、失敗の 1 行目のうち応答しない・400 は `T_ROOM_UNRESPONSIVE`・`T_ROOM_REFUSED`、バージョン違いは `other_version_line` を使い、次にすることだけ「観戦」に替える。
+    /// 接続する途中は`T_ROOM_JOINING`、失敗の1行目のうち応答しない・400は`T_ROOM_UNRESPONSIVE`・`T_ROOM_REFUSED`、バージョン違いは`other_version_line`を使い、次にすることだけ「観戦」に替える。
     T_SPECTATE = "観戦", "Watch";
     T_SPECTATE_CANCEL = "観戦をやめる", "Stop watching";
-    /// 観戦の「ランダムマッチ」（進行中のランダムマッチの一覧から選ぶ画面）。題は「観戦 ─ ランダムマッチ」。1 行は「1P 名 vs 2P 名　観戦者の数/上限」で、
-    /// 8 行を越える分は上下の「ほか N 件」で知らせる。満員の行は灰色で選べない。
+    /// 観戦の「ランダムマッチ」（進行中のランダムマッチの一覧から選ぶ画面）。題は「観戦 ─ ランダムマッチ」。1行は「1P 名 vs 2P 名　観戦者の数/上限」の形。
+    /// 8行を越える分は上下の「ほか N 件」で知らせる。満員の行は灰色で選べない。
     T_WATCH_DASH = " ─ ", " ─ ";
     T_WATCH_VS = " vs ", " vs ";
     T_WATCH_EMPTY = "いま観戦できるランダムマッチはありません。", "There are no random matches to watch";
@@ -356,7 +367,7 @@ texts! {
     T_WATCH_MORE_DOWN = "▼ ほか ", "▼ ";
     T_WATCH_MORE_CLOSE = " 件", " more";
     T_KEYS_WATCH = "↑↓ メニューの移動　決定で観戦　キャンセルでもどる", "↑↓ Move   Confirm: Watch   Cancel: Back";
-    /// 「観戦 名前 で待機中 12:34」（`T_SPECTATE_OPEN` ＋ 名前 ＋ `T_ROOM_WAITING_CLOSE` ＋ 時計）。配る側がルームに来るまでの入り直しの間（`JoinerStatus::waiting_for_caster`）。時計は待った時間。
+    /// 「観戦 名前 で待機中 12:34」（`T_SPECTATE_OPEN` ＋ 名前 ＋ `T_ROOM_WAITING_CLOSE` ＋ 時計）。配信する側がルームに来るまでの入り直しの間（`JoinerStatus::waiting_for_caster`）。時計は待った時間。
     T_SPECTATE_OPEN = "観戦 ", "Watch ";
     /// 「相手「名前」に接続しています。」。観戦用のコードを受け、対戦する側へ接続しに行く間。
     T_SPECTATE_PEER_OPEN = "相手「", "Connecting to player \"";
@@ -365,42 +376,42 @@ texts! {
     T_SPECTATE_RENAME = "別のルーム名で観戦の「ルームマッチ」を選び直してください。", "Choose \"Room match\" under Watch again with another room name.";
     T_SPECTATE_BAD_CODE = "相手から届いたコードを読めませんでした。", "Could not read the code from the player.";
     T_SPECTATE_AGAIN = "観戦の「ルームマッチ」を選び直してください。", "Choose \"Room match\" under Watch again.";
-    /// 「30分経ちましたが相手がルームに来ませんでした。」（「30分」は `spectate_room::JOINER_GIVE_UP_MS` から作る）。
+    /// 「30分経ちましたが相手がルームに来ませんでした。」（「30分」は`spectate_room::JOINER_GIVE_UP_MS`から作る）。
     T_SPECTATE_GAVE_UP_OPEN = "", "No player came to the room in ";
     T_SPECTATE_GAVE_UP_TAIL = "経ちましたが相手がルームに来ませんでした。", ".";
     T_SPECTATE_GAVE_UP_NEXT = "ルーム名をチェックして、観戦の「ルームマッチ」を選び直してください。", "Check the room name and choose \"Room match\" under Watch again.";
-    /// 観戦者が対戦する側へ返しを送れなかった・接続しに行って届かない。原因は画面から読めないので、次にすることはログを GitHub の Issues へ送ること。
+    /// 観戦者が対戦する側へ返答を送れなかった・接続しに行って届かない。原因は画面から読めないので次にすることはログをGitHubのIssuesへ送ること。
     T_SPECTATE_NO_LINK = "相手と接続できませんでした。", "Could not connect to the player.";
-    T_SPECTATE_NO_LINK_NEXT = "logsフォルダのログを添えて、開発者に伝えてください。", "Please post the log to GitHub Issues.";
+    T_SPECTATE_NO_LINK_NEXT = "zipにしたlogsフォルダを添えて、開発者に伝えてください。", "Please post the logs folder as a zip to GitHub Issues.";
     /// 再戦が続いている間に入り、対戦のホストが最後のキャラ選択まで遡れなかったとき（`WatchPlay::awaiting_select`）。
     T_SPECTATE_NEXT_SELECT = "次のキャラ選択から試合が映ります。", "Spectating will start from the next character select.";
-    /// 観戦者がマッチの中で、ゲームのポーズを開けない間（ホストのポーズの再現中・マッチの終わりのメニュー）に Esc で止めた（描画だけのフレーム）。
+    /// 観戦者がマッチの中でゲームのポーズを開けない間（ホストのポーズの再現中・マッチ終了時のメニュー）にEscで止めた（描画だけのフレーム）。
     T_SPECTATE_PAUSED = "一時停止中（Escで再開・3秒長押しで観戦を終了）", "Paused (Esc to resume, hold 3s to stop watching)";
-    /// 観戦者がマッチの外で Esc を押している間と、離してから 3 秒（3 秒押し続けると観戦をやめる）。
+    /// 観戦者がマッチの外でEscを押している間と、離してから3秒（3秒押し続けると観戦をやめる）。
     T_SPECTATE_ESC_HOLD = "Escを3秒長押しすると観戦を終了します。", "Hold Esc for 3 seconds to stop watching.";
     T_SPECTATE_ENDED = "観戦を終えました。", "Finished watching.";
     T_SPECTATE_CANCELLED = "観戦をやめました。", "Stopped watching.";
-    /// 観戦者の手元に溜めた記録（ゲームが止まっている間も受け続ける分）が上限に達して、観戦をやめた。
+    /// 観戦者の手元に溜めた記録（ゲームが止まっている間も受け続ける分）が上限に達して観戦をやめた。
     T_SPECTATE_BUFFER_FULL = "手元に溜めた試合の記録が上限（約1時間分）に達したため、観戦を終了しました。", "Stopped watching: your match buffer is full (about 1 hour).";
-    /// 接続した後、ホストの観戦者が満員になって断られ、観戦を終えた。
+    /// 接続した後ホストの観戦者が満員になって断られ、観戦を終えた。
     T_SPECTATE_FULL_ENDED = "観戦者が満員になったため、観戦を終了しました。", "The spectator slots became full, so watching ended.";
-    /// 接続する前に、ホストの観戦者が満員で入れないまま待ちの上限が来た（ルームの経路・観戦コードの経路とも）。
+    /// 接続する前にホストの観戦者が満員で入れないまま待ちの上限が来た（ルームの経路・観戦コードの経路とも）。
     T_SPECTATE_FULL = "観戦者が満員のため、観戦できませんでした。", "The spectator slots are full, so you could not watch.";
     T_SPECTATE_CODE_FULL_NEXT = "時間をおいて「観戦コード入力」を選び直してください。", "Wait a while, then choose \"Paste watch code\" again.";
-    /// 観戦コード（ルームを使わない観戦。種別 3 のコードをクリップボードで渡す）の項目の名前と、対戦のホストの側の文。
+    /// 観戦コード（ルームを使わない観戦。種別3のコードをクリップボードで渡す）の項目の名前と、対戦のホストの側の文。
     T_SPECTATE_CODE_PASTE = "観戦コード入力", "Paste watch code";
-    /// ホストへの案内（接続した直後の左上）。コピーはメニューの項目でなく Ctrl+C で頼む。
+    /// ホストへの案内（接続した直後の左上）。コピーはメニューの項目でなくCtrl+Cで頼む。
     T_SPECTATE_CODE_HINT = "Ctrl+Cで観戦コードをコピーできます。", "Press Ctrl+C to copy the watch code.";
-    /// 自分は観戦を許可し、相手が許可していない対戦者へ、`T_SPECTATE_CODE_HINT` の代わりに出す案内と、Ctrl+C の結果。
+    /// 自分は観戦を許可し、相手が許可していない対戦者へ`T_SPECTATE_CODE_HINT`の代わりに出す案内とCtrl+Cの結果。
     T_SPECTATE_PEER_OFF = "相手が観戦を許可していないので、この試合は観戦できません。", "Your opponent does not allow watching this match.";
     T_SPECTATE_CODE_PEER_OFF = "相手が観戦を許可していないので、観戦コードは作成できません。", "Your opponent does not allow watching, so no watch code was made.";
     T_SPECTATE_CODE_COPIED = "観戦コードをコピーしました。", "Copied the watch code.";
     T_SPECTATE_CODE_HOST_ONLY = "観戦コードはホストの画面でコピーできます。", "Only the host can copy the watch code.";
-    /// 観戦コードをクリップボードへ書けなかった（1 行目は `T_CLIP_WRITE`）。
+    /// 観戦コードをクリップボードへ書けなかった（1行目は`T_CLIP_WRITE`）。
     T_SPECTATE_CODE_CLIP_WRITE_NEXT = "もう一度Ctrl+Cを押してください。", "Press Ctrl+C again.";
-    /// 同じ失敗を左上の 1 行に収めた形（接続している間の知らせ。`copy_notice`）。
+    /// 同じ失敗を左上の1行に収めた形（接続している間の知らせ。`copy_notice`）。
     T_SPECTATE_CODE_COPY_FAILED = "コピーできませんでした。もう一度Ctrl+Cを押してください。", "Could not copy. Press Ctrl+C again.";
-    /// 観戦コードで接続しに行って届かない。理由は画面から読めないので、届かない形（LAN の外・ポートが閉じている）をチェックさせる。
+    /// 観戦コードで接続しに行って届かない。理由は画面から読めないので届かない形（LANの外・ポートが閉じている）をチェックさせる。
     T_SPECTATE_CODE_NO_LINK = "ホストに接続できませんでした。", "Could not connect to the host.";
     T_SPECTATE_CODE_NO_LINK_NEXT = "同じLANにいるか、ホストのポートが開いているかをチェックしてください。", "Check you are on the same LAN or the host's port is open.";
     T_SPECTATE_CODE_EMPTY_NEXT = "ホストの観戦コードをコピーしてから、「観戦コード入力」を選んでください。", "Copy the host's watch code, then choose \"Paste watch code\".";
@@ -408,25 +419,26 @@ texts! {
     T_SPECTATE_CODE_BROKEN_NEXT = "全部をコピーし直して、「観戦コード入力」を選び直してください。", "Copy the whole code again and choose \"Paste watch code\".";
     T_SPECTATE_CODE_WRONG_KIND = "貼られたのは対戦用の接続コードです。", "This is a code for playing, not for watching.";
     T_SPECTATE_CODE_WRONG_KIND_NEXT = "ホストにCtrl+Cで観戦コードをコピーしてもらってください。", "Ask the host to copy the watch code with Ctrl+C.";
-    /// 「観戦コードの期限（30 分）が切れています。」（閉じは `T_EXPIRED_CLOSE`）。
+    /// 「観戦コードの期限（30 分）が切れています。」（閉じは`T_EXPIRED_CLOSE`）。
     T_SPECTATE_CODE_EXPIRED_OPEN = "観戦コードの期限（", "The watch code has expired (";
     T_SPECTATE_CODE_EXPIRED_NEXT = "ホストに新しい観戦コードをコピーしてもらってください。", "Ask the host to copy a new watch code.";
     /// 時間の長さの単位（`push_span`）。
     T_SPAN_MIN = "分", " min";
     T_SPAN_SEC = "秒", " s";
-    /// 接続の手順が時間切れで作り直された後、相手から届いているのに接続できないときの左上の 3 行（`stall_pair`）。1 行目は理由＋「待機時間 0:42」
-    /// （接続コードの経路は「・残り 29:18」も。ルームの経路はルームの期限が自動で入り直すので残りが無い）。2 行目は次にすること 1 つ、3 行目は README の項。
+    /// 接続の手順が時間切れで作り直された後、相手から届いているのに接続できないときの左上の3行（`stall_pair`）。
+    /// 1行目は理由＋「待機時間 0:42」（接続コードの経路は「・残り 29:18」も。ルームの経路はルームの期限が自動で入り直すので残りが無い）。
+    /// 2行目は次にすること1つ。3行目はREADMEの項。
     T_STALL_NO_HANDSHAKE = "相手からパケットは届いていますが、接続できません（", "Receiving from opponent, cannot connect (";
     T_STALL_REMAIN = "・残り ", ", left ";
     T_STALL_CLOSE = "）", ")";
     T_STALL_NEXT_CODE = "2人とも待機をやめ、片方が新しいコードを作って、すぐ送ってください。", "Both stop waiting; one creates a new code and sends it at once.";
     T_STALL_NEXT_ROOM = "待機をやめ、「接続コード」の「対戦コード作成」に切り替えてください。", "Stop waiting and switch to \"Create play code\" under \"Connect code\".";
     T_STALL_REF = "（README「接続できないとき」5）", "(README \"When you cannot connect\" 5)";
-    /// 接続できなかったときの複数行の文（`fail_block`。回線の型は `nat::FailKind`）。文字は日本語の文面を変えない。最後の行の番号は README の「接続できないとき」の項。
+    /// 接続できなかったときの複数行の文（`fail_block`。ネットワーク種別は`nat::FailKind`）。文字は日本語の文面を変えない。最後の行の番号はREADMEの「接続できないとき」の項。
     T_FAIL_HEAD = "接続失敗：", "Connection failed:";
     T_FAIL_HEAD_NO = "接続不可：", "Cannot connect:";
     T_FAIL1_A = "不明な原因で相手からのUDPパケットが届きません。", "UDP packets from the opponent do not arrive (unknown cause).";
-    T_FAIL1_B = "iniをdetail=1に書き換えてもう一度試し、ログを添えて開発者に伝えてください。", "Set detail=1 in the ini, retry, and post the log to GitHub Issues.";
+    T_FAIL1_B = "iniをdetail=1にして再度試し、zipにしたlogsフォルダを添えて開発者に伝えてください。", "Set detail=1 in the ini, retry and post zipped logs to GitHub Issues.";
     T_FAIL1_REF = "（README「接続できないとき」1）", "(README \"When you cannot connect\" 1)";
     T_FAIL2_A = "相手がシンメトリックNATであり、こちらはUPnPが使用不可です。", "The opponent is on a symmetric NAT and UPnP is unavailable here.";
     T_FAIL2_B = "ルーターのUPnPをオンにするか、ポート開放してください。", "Turn on UPnP on your router, or open a port.";
@@ -437,12 +449,72 @@ texts! {
     T_FAIL3_REF = "（README「接続できないとき」3）", "(README \"When you cannot connect\" 3)";
     T_FAIL4_A = "こちらも相手もシンメトリックNATのため、直接接続できません。", "Both sides are symmetric NATs, so a direct connection is impossible.";
     T_FAIL4_REF = "（README「接続できないとき」4）", "(README \"When you cannot connect\" 4)";
+    /// 人間 対 人間でキーボード2台を分けるときの左上の案内（`split_ask_lines`）。
+    T_SPLIT_1P_Z = "1PのキーボードでZを押してください。（1/7）", "Press Z on the 1P keyboard. (1/7)";
+    T_SPLIT_1P_X = "1PのキーボードでXを押してください。（2/7）", "Press X on the 1P keyboard. (2/7)";
+    T_SPLIT_1P_SHIFT = "1PのキーボードでShiftを押してください。（3/7）", "Press Shift on the 1P keyboard. (3/7)";
+    T_SPLIT_1P_UP = "1Pのキーボードで↑を押してください。（4/7）", "Press ↑ on the 1P keyboard. (4/7)";
+    T_SPLIT_1P_DOWN = "1Pのキーボードで↓を押してください。（5/7）", "Press ↓ on the 1P keyboard. (5/7)";
+    T_SPLIT_1P_LEFT = "1Pのキーボードで←を押してください。（6/7）", "Press ← on the 1P keyboard. (6/7)";
+    T_SPLIT_1P_RIGHT = "1Pのキーボードで→を押してください。（7/7）", "Press → on the 1P keyboard. (7/7)";
+    T_SPLIT_2P_Z = "2PのキーボードでZを押してください。（1/7）", "Press Z on the 2P keyboard. (1/7)";
+    T_SPLIT_2P_X = "2PのキーボードでXを押してください。（2/7）", "Press X on the 2P keyboard. (2/7)";
+    T_SPLIT_2P_SHIFT = "2PのキーボードでShiftを押してください。（3/7）", "Press Shift on the 2P keyboard. (3/7)";
+    T_SPLIT_2P_UP = "2Pのキーボードで↑を押してください。（4/7）", "Press ↑ on the 2P keyboard. (4/7)";
+    T_SPLIT_2P_DOWN = "2Pのキーボードで↓を押してください。（5/7）", "Press ↓ on the 2P keyboard. (5/7)";
+    T_SPLIT_2P_LEFT = "2Pのキーボードで←を押してください。（6/7）", "Press ← on the 2P keyboard. (6/7)";
+    T_SPLIT_2P_RIGHT = "2Pのキーボードで→を押してください。（7/7）", "Press → on the 2P keyboard. (7/7)";
+    T_SPLIT_SKIP = "パッドのボタンかEscでキーボードを分けずに遊ぶ", "Pad button or Esc to play without splitting the keyboards";
+    T_SPLIT_RELEASE = "キーを離してください。", "Release the keys.";
 }
 
-/// `LineBuf` の大きさ（バイト）。全角 1 文字 3 バイトで 53 文字、半角だけなら 160 文字。1 行は画面の幅（640 画素 = 全角 45 文字）に収まる。
+/// 1P・2Pに押してもらうキーの案内。順は`split_kb::ASK_KEYS`。
+const SPLIT_ASK_1P: [Tx; 7] = [
+    T_SPLIT_1P_Z,
+    T_SPLIT_1P_X,
+    T_SPLIT_1P_SHIFT,
+    T_SPLIT_1P_UP,
+    T_SPLIT_1P_DOWN,
+    T_SPLIT_1P_LEFT,
+    T_SPLIT_1P_RIGHT,
+];
+const SPLIT_ASK_2P: [Tx; 7] = [
+    T_SPLIT_2P_Z,
+    T_SPLIT_2P_X,
+    T_SPLIT_2P_SHIFT,
+    T_SPLIT_2P_UP,
+    T_SPLIT_2P_DOWN,
+    T_SPLIT_2P_LEFT,
+    T_SPLIT_2P_RIGHT,
+];
+
+/// キーボード2台を分ける間の左上の行とその行数。1行目は1P・2Pに押してもらうキーを聞く文（何番目か付き）か離す案内、2行目（聞く間だけ）は分けずに遊ぶ操作。
+pub fn split_ask_lines(
+    prompt: crate::split_kb::Prompt,
+    lang: Lang,
+) -> (usize, [(&'static str, RowStyle); 2]) {
+    let ask = match prompt {
+        crate::split_kb::Prompt::P1(i) => SPLIT_ASK_1P.get(usize::from(i)),
+        crate::split_kb::Prompt::P2(i) => SPLIT_ASK_2P.get(usize::from(i)),
+        crate::split_kb::Prompt::Release => {
+            let line = (T_SPLIT_RELEASE.get(lang), RowStyle::Normal);
+            return (1, [line, line]);
+        }
+    };
+    let ask = ask.map_or("", |t| t.get(lang));
+    (
+        2,
+        [
+            (ask, RowStyle::Normal),
+            (T_SPLIT_SKIP.get(lang), RowStyle::Hint),
+        ],
+    )
+}
+
+/// `LineBuf`の大きさ（バイト）。全角1文字3バイトで53文字、半角だけなら160文字。1行は画面の幅（640画素 = 全角45文字）に収まる。
 pub const LINE_BYTES: usize = 160;
 
-/// 固定の長さの 1 行（UTF-8）。確保しない・パニックしない: 入りきらない分は文字の境で落とす。
+/// 固定の長さの1行（UTF-8）。確保しない・パニックしない: 入りきらない分は文字の境界で切り捨てる。
 #[derive(Clone, Copy)]
 pub struct LineBuf {
     buf: [u8; LINE_BYTES],
@@ -487,7 +559,7 @@ impl LineBuf {
     }
 
     pub fn as_str(&self) -> &str {
-        // 書くのは `push_char` だけで、文字の境で入れるので常に正しい UTF-8。
+        // 書くのは`push_char`だけ。文字の境界で追加するので常に正しいUTF-8。
         core::str::from_utf8(self.buf.get(..self.len).unwrap_or(&[])).unwrap_or("")
     }
 
@@ -541,7 +613,7 @@ impl LineBuf {
         self.push_u32(s)
     }
 
-    /// ASCII のバイト列（接続コードの先頭と末尾）。ASCII でないバイトは `?`。
+    /// ASCIIのバイト列（接続コードの先頭と末尾）。ASCIIでないバイトは`?`。
     pub fn push_ascii(&mut self, bytes: &[u8]) -> &mut Self {
         for &b in bytes {
             self.push_char(if (0x20..0x7F).contains(&b) {
@@ -556,8 +628,8 @@ impl LineBuf {
 
 pub const NAME_UNITS: usize = 12;
 
-/// 相手の名前（接続コードの `name`。UTF-8 の 0〜32 B）を画面に出せる形にする: 文字の表に無い文字（`in_table` が偽）・基本面の外の文字・制御文字は `?` にして、
-/// `NAME_UNITS` 文字までを UTF-16 の単位で返す（0 は「ここで終わり」）。書き手（見張りのスレッド）が呼ぶ。
+/// 相手の名前（接続コードの`name`。UTF-8の0〜32 B）を画面に出せる形にする: 文字の表に無い文字（`in_table`が偽）・基本面の外の文字・制御文字は`?`にする。
+/// `NAME_UNITS`文字までをUTF-16の単位で返す（0は「ここで終わり」）。書き手（監視のスレッド）が呼ぶ。
 pub fn sanitize_name(raw: &[u8], in_table: impl Fn(char) -> bool) -> [u16; NAME_UNITS] {
     let mut out = [0u16; NAME_UNITS];
     let text = String::from_utf8_lossy(raw);
@@ -578,25 +650,25 @@ fn push_name(line: &mut LineBuf, name: &[u16; NAME_UNITS]) {
 pub enum CodeState {
     #[default]
     Idle,
-    /// 始める側: 自分のコードを作って、相手の返すコードを待っている。
+    /// 始める側: 自分のコードを作って相手の返すコードを待っている。
     Offered,
-    /// 返す側: 相手のコードを読んで、返すコードをクリップボードへコピーした（利用者が相手へ送る）。接続するのを待っている。
+    /// 返す側: 相手のコードを読んで返すコードをクリップボードへコピーした（利用者が相手へ送る）。接続するのを待っている。
     Replied,
-    /// 始める側: 相手の返すコードを読んで、接続している。
+    /// 始める側: 相手の返すコードを読んで接続している。
     Linking,
     RoomJoining,
-    /// ルームに入って、相手を待っている（期限は `Note::until`）。
+    /// ルームに入って相手を待っている（期限は`Note::until`）。
     RoomWaiting,
     /// ルームで相手のコードを受け取り、セッションを設定した（接続するのを待っている）。始める側も返す側もこれ。
     RoomLinking,
     SpectateJoining,
-    /// 観戦用のルームで、配る側（対戦する側）が来るのを待っている（期限は 30 分）。
+    /// 観戦用のルームで配信する側（対戦する側）が来るのを待っている（期限は30分）。
     SpectateWaiting,
     SpectateLinking,
-    /// 観戦者のセッションを設定したまま、待ちは終わっている（取りやめた・失敗した・観戦を終えた後で、セッションを対戦のセッションへ戻さない実行）。項目は「観戦」と「戻る」だけ。
-    /// セッションを元へ戻せた実行は `Idle` にする。どちらにするかは観戦者のセッションを設定する側が決める。
+    /// 観戦者のセッションを設定したまま待ちは終わっている（取りやめた・失敗した・観戦を終えた後で、セッションを対戦のセッションへ戻さない実行）。項目は「観戦」と「戻る」だけ。
+    /// セッションを元へ戻せた実行は`Idle`にする。どちらにするかは観戦者のセッションを設定する側が決める。
     SpectateIdle,
-    /// LAN のホスト: 参加者を待っている（`Note::lan_*` に自分の LAN のアドレスとポート）。
+    /// LANのホスト: 参加者を待っている（`Note::lan_*`に自分のLANのアドレスとポート）。
     LanWaiting,
     /// LAN: 参加の申し込みから接続の成立まで（ホストの参加者を受けた後・クライアントの申し込み・観戦の申し込み）。
     LanLinking,
@@ -656,12 +728,12 @@ impl CodeState {
         )
     }
 
-    /// LAN の待ち・接続の途中か。この間のメニューの項目は「設定」「待機をやめる」「もどる」だけ。
+    /// LANの待ち・接続の途中かどうか。この間のメニューの項目は「設定」「待機をやめる」「もどる」だけ。
     pub fn is_lan(self) -> bool {
         matches!(self, CodeState::LanWaiting | CodeState::LanLinking)
     }
 
-    /// 観戦の待ちの間か（接続する途中・配る側を待つ・接続しに行く。`SpectateIdle` は含まない）。この間のメニューの項目は「観戦をやめる」だけ。
+    /// 観戦の待ちの間かどうか（接続する途中・配信する側を待つ・接続しに行く。`SpectateIdle`は含まない）。この間のメニューの項目は「観戦をやめる」だけ。
     pub fn is_spectate_busy(self) -> bool {
         matches!(
             self,
@@ -670,7 +742,7 @@ impl CodeState {
     }
 }
 
-/// こちらの文字の決まりでルーム名を断った理由（`Note::room_why`。`room::RoomNameError` を画面の文の種類へ寄せたもの）。
+/// こちらの文字の決まりでルーム名を断った理由（`Note::room_why`。`room::RoomNameError`を画面の文の種類へ寄せたもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoomNameWhy {
     #[default]
@@ -678,17 +750,20 @@ pub enum RoomNameWhy {
     Long,
     BadChar,
     Dot,
-    /// ASCII の英数字と `-` `_` 以外の文字がある（日本語・全角・空白・記号）。
+    /// 使える文字の外の文字がある（`` ` `` `;` と日本語・全角）。
     NotAscii,
+    /// `w.`か`q.`で始まる。
+    Reserved,
 }
 
 impl RoomNameWhy {
-    const ALL: [RoomNameWhy; 5] = [
+    const ALL: [RoomNameWhy; 6] = [
         RoomNameWhy::Empty,
         RoomNameWhy::Long,
         RoomNameWhy::BadChar,
         RoomNameWhy::Dot,
         RoomNameWhy::NotAscii,
+        RoomNameWhy::Reserved,
     ];
 
     fn code(self) -> u32 {
@@ -713,6 +788,7 @@ impl RoomNameWhy {
             E::BadChar { .. } => RoomNameWhy::BadChar,
             E::DotName => RoomNameWhy::Dot,
             E::NotAscii { .. } => RoomNameWhy::NotAscii,
+            E::ReservedPrefix => RoomNameWhy::Reserved,
         }
     }
 }
@@ -724,7 +800,7 @@ pub enum Event {
     Made,
     ReplyMade,
     PeerRead,
-    /// 貼った文字が短すぎる（`code::MIN_CODE_CHARS` より少ない）。
+    /// 貼った文字が短すぎる（`code::MIN_CODE_CHARS`より少ない）。
     Short,
     Empty,
     /// 同じコードをもう読んでいる。
@@ -747,78 +823,79 @@ pub enum Event {
     /// 相手と接続できないままネットワークが終わった。
     Ended,
     Cancelled,
-    /// 相手のコードのバージョンが違う。相手のバージョンは `Note::peer_ver`。
+    /// 相手のコードのバージョンが違う。相手のバージョンは`Note::peer_ver`。
     OtherVersion,
-    /// ルームサーバーへ接続し始めた（以下 `Room*` はルームの経路）。
+    /// ルームサーバーへ接続し始めた（以下`Room*`はルームの経路）。
     RoomJoining,
     RoomWaiting,
-    /// ルームで相手のコードを受け取り、接続し始めた（相手の名前は `Note::name`）。
+    /// ルームで相手のコードを受け取り、接続し始めた（相手の名前は`Note::name`）。
     RoomPeer,
-    /// ルーム名をこちらの文字の決まりで断った（理由は `Note::room_why`）。
+    /// ルーム名をこちらの文字の決まりで断った（理由は`Note::room_why`）。
     RoomNameBad,
     RoomUnresponsive,
-    /// 429（待つ秒は `Note::retry_secs`）。
+    /// 429（待つ秒は`Note::retry_secs`）。
     RoomBusy,
-    RoomFull,
+    /// 409。ルーム名を2人が使っている（`room_in_use`。古いサーバーの`room_full`も）。
+    RoomInUse,
     RoomRefused,
     RoomExpired,
     RoomPeerLeft,
     RoomBadCode,
-    /// 貼られたコードは、この起動の前の接続で使ったもの（session が同じ）。読まない（クリップボードに残った前の相手のコードを貼っても前の相手へ接続しに行かない）。
+    /// 貼られたコードはこの起動の前の接続で使ったもの（sessionが同じ）。読まない（クリップボードに残った前の相手のコードを貼っても前の相手へ接続しに行かない）。
     Spent,
-    /// 観戦者: 観戦用のコードを受け、対戦する側へ接続しに行く（対戦する側の名前は `Note::name`）。
+    /// 観戦者: 観戦用のコードを受け、対戦する側へ接続しに行く（対戦する側の名前は`Note::name`）。
     SpectatePeer,
     SpectateUnresponsive,
     SpectateRefused,
     SpectateBadCode,
-    /// 観戦者: 観戦用のコードのバージョンが違う（相手のバージョンは `Note::peer_ver`）。
+    /// 観戦者: 観戦用のコードのバージョンが違う（相手のバージョンは`Note::peer_ver`）。
     SpectateOtherVersion,
     SpectateGaveUp,
-    /// 観戦者: 対戦する側への返しを送れなかった・接続しに行って届かなかった。
+    /// 観戦者: 対戦する側への返答を送れなかった・接続しに行って届かなかった。
     SpectateNoLink,
     SpectateEnded,
     SpectateCancelled,
-    /// 相手のコードのビルドが違う（相手のビルドは `Note::peer_build`）。
+    /// 相手のコードのビルドが違う（相手のビルドは`Note::peer_build`）。
     OtherBuild,
-    /// 観戦者: 観戦用のコードのビルドが違う（相手のビルドは `Note::peer_build`）。
+    /// 観戦者: 観戦用のコードのビルドが違う（相手のビルドは`Note::peer_build`）。
     SpectateOtherBuild,
     /// 対戦のホスト: 観戦コードをクリップボードへ書いた。
     SpectateCodeCopied,
     /// ゲスト: 観戦コードを頼まれたが、配るのはホスト。
     SpectateCodeHostOnly,
-    /// 観戦コードの経路の観戦者: ホストへ JOIN を送ったが、答えが来ないまま `spectate_join::CODE_LINK_TIMEOUT_MS` が過ぎた。
+    /// 観戦コードの経路の観戦者: ホストへJOINを送ったが、答えが来ないまま`spectate_join::CODE_LINK_TIMEOUT_MS`が過ぎた。
     SpectateCodeNoLink,
     /// 観戦コードの経路の観戦者: クリップボードが空。
     SpectateCodeEmpty,
     /// 観戦コードの経路の観戦者: 観戦コードとして読めない（欠け・検算の誤り・短すぎる）。
     SpectateCodeBroken,
-    /// 観戦コードの経路の観戦者: 貼られたのは対戦用の接続コード（種別 1・2）。
+    /// 観戦コードの経路の観戦者: 貼られたのは対戦用の接続コード（種別1・2）。
     SpectateCodeWrongKind,
     /// 観戦コードの経路の観戦者: 期限の切れた観戦コードで接続しに行き、答えが来なかった。
     SpectateCodeExpired,
     /// 対戦のホスト: 観戦コードをクリップボードへ書けなかった。
     SpectateCodeClipWrite,
-    /// LAN: 申し込み・参加を受けて接続の手順に入った（相手の名前が分かれば `Note::name`）。
+    /// LAN: 申し込み・参加を受けて接続の手順に入った（相手の名前が分かれば`Note::name`）。
     LanPeer,
-    /// LAN のホスト: 待ち受けられる LAN のアドレスが無い。
+    /// LANのホスト: 待ち受けられるLANのアドレスが無い。
     LanNoAddress,
-    /// LAN のホスト: 待ち受けのポートが使えない（`Note::lan_port`）。
+    /// LANのホスト: 待ち受けのポートが使えない（`Note::lan_port`）。
     LanPortBusy,
-    /// LAN のクライアント・観戦: ホストが返事をしない。
+    /// LANのクライアント・観戦: ホストが返事をしない。
     LanNoHost,
-    /// LAN のクライアント: ホストにはもう相手がいる。
+    /// LANのクライアント: ホストにはもう相手がいる。
     LanBusy,
-    /// LAN の観戦: ホストの対戦がまだ始まっていない。
+    /// LANの観戦: ホストの対戦がまだ始まっていない。
     LanNoMatch,
-    /// 観戦者（LAN・ルームマッチ）: 対戦する 2 人のどちらかが観戦を許可していないので断られた。
+    /// 観戦者（LAN・ルームマッチ）: 対戦する2人のどちらかが観戦を許可していないので断られた。
     WatchRefused,
     /// LAN: 手順は済んだが、接続が成立しなかった（時間切れ）。
     LanNoLink,
-    /// LAN の待ち・接続の途中をやめた。
+    /// LANの待ち・接続の途中をやめた。
     LanCancelled,
     /// 観戦コードを頼まれたが、自分は観戦を許可し、相手が許可していない。
     SpectateCodePeerOff,
-    /// 観戦者: 溜めた記録が上限（約 1 時間分）に達したので観戦をやめた。
+    /// 観戦者: 溜めた記録が上限（約1時間分）に達したので観戦をやめた。
     SpectateBufferFull,
     /// 観戦者: 接続した後、ホストの観戦者が満員で断られて観戦を終えた。
     SpectateFullEnded,
@@ -828,7 +905,7 @@ pub enum Event {
     SpectateCodeFull,
 }
 
-/// 出来事の番号の表（番号 = 並びの位置。原子変数で渡すので、足すときは末尾に足す）。
+/// イベントの番号の表（番号 = 並びの位置。アトミック変数で渡すので足すときは末尾に足す）。
 const EVENTS: [Event; 68] = [
     Event::None,
     Event::Made,
@@ -859,7 +936,7 @@ const EVENTS: [Event; 68] = [
     Event::RoomNameBad,
     Event::RoomUnresponsive,
     Event::RoomBusy,
-    Event::RoomFull,
+    Event::RoomInUse,
     Event::RoomRefused,
     Event::RoomExpired,
     Event::RoomPeerLeft,
@@ -909,7 +986,7 @@ impl Event {
         EVENTS.get(c as usize).copied().unwrap_or(Event::None)
     }
 
-    /// 貼った文字数を最初の行に出す出来事（貼って、読もうとした結果。読めたときも出す）。
+    /// 貼った文字数を最初の行に出すイベント（貼って読もうとした結果。読めたときも出す）。
     fn shows_got(self) -> bool {
         matches!(
             self,
@@ -956,15 +1033,15 @@ impl Event {
         )
     }
 
-    /// ルームの経路の断り・失敗か。左上の行は、待ちが終わった（状態が `Idle`）後もこれを出す（ルームで待つ間に別のモードで遊んでいた側が、なぜ待ちが終わったかを知る）。
-    /// コードの経路の断りはメニューを開いて操作した直後にしか起きないので出さない。観戦の失敗と「観戦を終えました。」も同じ。観戦を取りやめた行は、取りやめたのは自分なので左上へは残さない（メニューの状況の行にだけ出る）。
+    /// ルームの経路の断り・失敗かどうか。左上の行は待ちが終わった（状態が`Idle`）後もこれを出す（ルームで待つ間に別のモードで遊んでいた側がなぜ待ちが終わったかを知る）。
+    /// コードの経路の断りはメニューを開いて操作した直後にしか起きないので出さない。観戦の失敗と「観戦を終えました。」も同じ。観戦を取りやめた行は取りやめたのが自分なので左上へは残さない（メニューの状況の行にだけ出る）。
     fn is_room_trouble(self) -> bool {
         matches!(
             self,
             Event::RoomNameBad
                 | Event::RoomUnresponsive
                 | Event::RoomBusy
-                | Event::RoomFull
+                | Event::RoomInUse
                 | Event::RoomRefused
                 | Event::RoomExpired
                 | Event::RoomPeerLeft
@@ -993,7 +1070,7 @@ impl Event {
         )
     }
 
-    /// 接続している間の観戦コードのコピー（Ctrl+C）の結果か。メニューの状況の行ではなく左上の知らせ（`copy_notice`）に出す。
+    /// 接続している間の観戦コードのコピー（Ctrl+C）の結果かどうか。メニューの状況の行ではなく左上の知らせ（`copy_notice`）に出す。
     pub fn is_copy_result(self) -> bool {
         matches!(
             self,
@@ -1005,7 +1082,7 @@ impl Event {
     }
 }
 
-/// 接続している間（見つかった・接続した・マッチの中）に左上へ出す、観戦コードのコピーの結果の 1 行。結果でない出来事は `None`。
+/// 接続している間（見つかった・接続した・マッチの中）に左上へ出す観戦コードのコピーの結果の1行。結果でないイベントは`None`。
 pub fn copy_notice(event: Event, lang: Lang) -> Option<(&'static str, RowStyle)> {
     match event {
         Event::SpectateCodeCopied => Some((T_SPECTATE_CODE_COPIED.get(lang), RowStyle::Normal)),
@@ -1020,20 +1097,20 @@ pub fn copy_notice(event: Event, lang: Lang) -> Option<(&'static str, RowStyle)>
     }
 }
 
-/// ホストへの案内の 1 行（「Ctrl+C で観戦コードをコピーできます。」）。
+/// ホストへの案内の1行（「Ctrl+C で観戦コードをコピーできます。」）。
 pub fn copy_hint(lang: Lang) -> &'static str {
     T_SPECTATE_CODE_HINT.get(lang)
 }
 
-/// 自分は観戦を許可し、相手が許可していない対戦者へ、`copy_hint` の代わりに出す 1 行（`Conn::Connected::watch_off`）。
+/// 自分は観戦を許可し、相手が許可していない対戦者へ`copy_hint`の代わりに出す1行（`Conn::Connected::watch_off`）。
 pub fn watch_off_hint(lang: Lang) -> &'static str {
     T_SPECTATE_PEER_OFF.get(lang)
 }
 
-/// ルーム名を画面に出す文字数（UTF-16 の単位）。ルーム名は揃えて 32 文字までだが、左上の行の幅に収めるため 16 文字で切り、切ったら最後の文字を `…` にする（`sanitize_room`）。
+/// ルーム名を画面に出す文字数（UTF-16の単位）。ルーム名は揃えて32文字までだが左上の行の幅に収めるため16文字で切り、切ったら最後の文字を`…`にする（`sanitize_room`）。
 pub const ROOM_UNITS: usize = 16;
 
-/// ルーム名を画面に出せる形にする（`sanitize_name` と同じく、文字の表に無い文字・制御文字は `?`）。`ROOM_UNITS` 文字より長ければ最後の文字を `…` にする。書き手（見張り）が呼ぶ。ルーム名は画面にだけ出し、本ログには書かない。
+/// ルーム名を画面に出せる形にする（`sanitize_name`と同じく、文字の表に無い文字・制御文字は`?`）。`ROOM_UNITS`文字より長ければ最後の文字を`…`にする。書き手（監視のスレッド）が呼ぶ。ルーム名は画面にだけ出し、本ログには書かない。
 pub fn sanitize_room(raw: &str, in_table: impl Fn(char) -> bool) -> [u16; ROOM_UNITS] {
     let mut out = [0u16; ROOM_UNITS];
     let n = raw.chars().count();
@@ -1057,7 +1134,7 @@ fn push_units(line: &mut LineBuf, units: &[u16]) {
     }
 }
 
-/// `push_units` の、文字の枠の数（`overlay::glyph_cells`）が `max_cells` を越えるなら、収まるところまでで切って末尾に「…」（2 枠）を付ける形。名前は `max_cells` 枠に収まる。
+/// `push_units`の別の形。文字の枠の数（`overlay::glyph_cells`）が`max_cells`を越えるなら収まるところまでで切り、末尾に「…」（2枠）を付ける。名前は`max_cells`枠に収まる。
 fn push_units_within(line: &mut LineBuf, units: &[u16], max_cells: u32) {
     let chars = || {
         units
@@ -1083,13 +1160,13 @@ fn push_units_within(line: &mut LineBuf, units: &[u16], max_cells: u32) {
     line.push_char(ellipsis);
 }
 
-/// LAN のホストが受け口を開き、画面に出す自分のアドレスの数の上限。有線・無線に仮想アダプター（VMware の VMnet など）が加わっても足りる数。
+/// LANのホストが受付用受信ソケットを開き、画面に出す自分のアドレスの数の上限。有線・無線に仮想アダプター（VMwareのVMnetなど）が加わっても足りる数。
 pub const LAN_IPS_MAX: usize = 8;
 /// 待機の画面に一度に出すアドレスの行の数。これを越える分は↑↓でスクロールする。
 pub const LAN_VISIBLE: usize = 3;
 
-/// `Note` を原子変数の語に詰めた長さ（`to_words`）。先頭の 7 語・名前・ルームの 1 語（断りの理由と待つ秒）・ルーム名・相手のビルド・LAN の 1 語（数とポート）・
-/// アドレス `LAN_IPS_MAX` 語と、アドレスごとの VPN のツールの 1 語。
+/// `Note`をアトミック変数のワードに詰めた長さ（`to_words`）。
+/// 内訳は先頭の7ワード・名前・ルームの1ワード（断りの理由と待つ秒）・ルーム名・相手のビルド・LANの1ワード（数とポート）・アドレス`LAN_IPS_MAX`ワードと、アドレスごとのVPNのツールの1ワード。
 pub const NOTE_WORDS: usize = 7 + NAME_UNITS / 2 + 1 + ROOM_UNITS / 2 + 1 + 1 + LAN_IPS_MAX + 1;
 const _: () = assert!(NAME_UNITS.is_multiple_of(2));
 const _: () = assert!(ROOM_UNITS.is_multiple_of(2));
@@ -1097,7 +1174,7 @@ const W_ROOM_DETAIL: usize = 7 + NAME_UNITS / 2;
 const W_ROOM_NAME: usize = W_ROOM_DETAIL + 1;
 const W_PEER_BUILD: usize = W_ROOM_NAME + ROOM_UNITS / 2;
 const W_LAN: usize = W_PEER_BUILD + 1;
-/// アドレスごとの VPN のツールの番号（2 bit ずつ。`VpnTool::code`）を詰めた語。
+/// アドレスごとのVPNのツールの番号（2 bitずつ。`VpnTool::code`）を詰めたワード。
 const W_LAN_TOOLS: usize = W_LAN + 1 + LAN_IPS_MAX;
 const _: () = assert!(LAN_IPS_MAX * 2 <= 32);
 
@@ -1107,27 +1184,30 @@ pub struct Note {
     pub event: Event,
     pub state: CodeState,
     pub paste_len: u32,
-    /// 自分のコードの文字数と、先頭・末尾の 4 文字（ASCII）。
+    /// 自分のコードの文字数と、先頭・末尾の4文字（ASCII）。
     pub code_len: u32,
     pub head: [u8; 4],
     pub tail: [u8; 4],
-    /// 自分のコードを作った時刻（UNIX 秒の下位 32 ビット。有効期限 `DEFAULT_TTL_SECS` はここから）。ルームの経路では、ルームで待ち始めた時刻（自動で入り直しても変えない。左上の「待った時間」の起点）。
+    /// 自分のコードを作った時刻（UNIX秒の下位32ビット。有効期限`DEFAULT_TTL_SECS`はここから）。
+    /// ルームの経路ではルームで待ち始めた時刻（自動で入り直しても変えない。左上の「待った時間」の起点）。
     pub since: u32,
     pub name: [u16; NAME_UNITS],
-    /// 貼られた相手のコードのバージョン（`Event::OtherVersion` のときだけ意味がある。語 1 の bit 16〜23 に詰める）。
+    /// 貼られた相手のコードのバージョン（`Event::OtherVersion`のときだけ意味がある。ワード1のbit 16〜23に詰める）。
     pub peer_ver: u8,
-    /// ルーム名を断った理由（`Event::RoomNameBad` のときだけ）。
+    /// ルーム名を断った理由（`Event::RoomNameBad`のときだけ）。
     pub room_why: RoomNameWhy,
-    /// 429 で待つ秒（`Event::RoomBusy` のときだけ。サーバーの `retry_after`）。
+    /// 429で待つ秒（`Event::RoomBusy`のときだけ。サーバーの`retry_after`）。
     pub retry_secs: u16,
     pub room: [u16; ROOM_UNITS],
-    /// 貼られた・ルームで受けた相手のコードのビルド番号（`Event::OtherBuild`・`Event::SpectateOtherBuild` のときだけ）。
+    /// 貼られた・ルームで受けた相手のコードのビルド番号（`Event::OtherBuild`・`Event::SpectateOtherBuild`のときだけ）。
     pub peer_build: u32,
-    /// ランダムマッチの経路にいる（待ち列でも、割り当てられたルームでも）。ルーム名は画面に出さず（`room` は空）、文の次にすることが「ランダムマッチ」になる。語 1 の bit 24。
+    /// ランダムマッチの経路にいる（待ち列でも割り当てられたルームでも）。
+    /// ルーム名は画面に出さない（`room`は空）。文の次にすることが「ランダムマッチ」になる。
+    /// ワード1のbit 24。
     pub random: bool,
-    /// LAN のホストが待つ自分の LAN のアドレス（IPv4 の 4 B。使うのは先頭の `lan_n` 個）と、待ち受けのポート。
+    /// LANのホストが待つ自分のLANのアドレス（IPv4の4 B。使うのは先頭の`lan_n`個）と待ち受けのポート。
     pub lan_ips: [[u8; 4]; LAN_IPS_MAX],
-    /// `lan_ips` のアドレスごとの VPN のツール（画面のアドレスの行に名前を添える。本物の LAN のアドレスは `None`）。
+    /// `lan_ips`のアドレスごとのVPNのツール（画面のアドレスの行に名前を添える。本物のLANのアドレスは`None`）。
     pub lan_tools: [Option<VpnTool>; LAN_IPS_MAX],
     pub lan_n: u8,
     pub lan_port: u16,
@@ -1216,7 +1296,7 @@ impl Note {
         }
     }
 
-    /// 自分のコードの先頭と末尾を、メニューへ渡す形に（`code` は ASCII。4 文字に満たなければ空白で埋める）。
+    /// 自分のコードの先頭と末尾をメニューへ渡す形にする（`code`はASCII。4文字に満たなければ空白で埋める）。
     pub fn edges_of(code: &str) -> ([u8; 4], [u8; 4]) {
         let b = code.as_bytes();
         let mut head = [b' '; 4];
@@ -1232,7 +1312,7 @@ impl Note {
     }
 }
 
-/// 節・キーの名前（小文字の英数字と `_` だけ。それ以外の文字が混ざる・長いものは空にして出さない）。
+/// 節・キーの名前（小文字の英数字と`_`だけ。それ以外の文字が混ざる・長いものは空にして出さない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tag {
     buf: [u8; Tag::MAX],
@@ -1265,28 +1345,29 @@ impl Tag {
     }
 }
 
-/// `HiganRTool.ini` の読めない行を捨てて既定値で動かしたことを、メニューの下に 1 か所だけ出すための要約。
+/// `HiganRTool.ini`の読めない行を捨てて既定値で動かしたことを、メニューの下に1か所だけ出すための要約。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IniNotice {
-    /// 捨てた行の数（Shift_JIS として読み直したことは数えない）。
+    /// 捨てた行の数（Shift_JISとして読み直したことは数えない）。
     lines: u32,
-    /// 1 か所のときの行・節・キー。
+    /// 1か所のときの行・節・キー。
     line: u32,
     section: Tag,
     key: Tag,
-    /// UTF-8 でなかったので Shift_JIS として読み直した。
+    /// UTF-8でなかったのでShift_JISとして読み直した。
     sjis: bool,
 }
 
 impl IniNotice {
-    /// 画面に出す行の番号の上限（桁を 5 に収める）。
+    /// 画面に出す行の番号の上限（桁を5に収める）。
     const LINE_MAX: usize = 99_999;
 
-    /// 節とキーを合わせた文字数の上限。1 行目が「…を読み込めません。」で閉じるぶん、2 つとも 15 文字だと箱の幅（ゲームの文字は ASCII が 9 画素）を越える。
-    /// 超えるときはキーを出さない（配る ini の節とキーは全部この中）。
+    /// 節とキーを合わせた文字数の上限。
+    /// 1行目が「…を読み込めません。」で閉じるので、2つとも15文字だと箱の幅（ゲームの文字はASCIIが9画素）を越える。
+    /// 超えるときはキーを出さない（配布するiniの節とキーは全部この中）。
     const TAGS_MAX: usize = 23;
 
-    /// 注が無ければ `None`。
+    /// 注が無ければ`None`。
     pub fn from_notes(notes: &[crate::ini_lenient::IniNote]) -> Option<IniNotice> {
         use crate::ini_lenient::NoteKind;
         let mut ignored = notes.iter().filter(|n| n.kind == NoteKind::Ignored);
@@ -1312,7 +1393,7 @@ impl IniNotice {
         })
     }
 
-    /// メニューの下の行（最大 2 行）。戻りは行数。
+    /// メニューの下の行（最大2行）。戻りは行数。
     fn lines(&self, lang: Lang, out: &mut [LineBuf]) -> usize {
         let [a, b, ..] = out else { return 0 };
         a.clear();
@@ -1359,33 +1440,37 @@ impl IniNotice {
 pub enum Conn {
     /// まだ接続していない。
     Waiting,
-    /// 接続した（対戦が成立した。`code_side = game` 以外の実行は、接続したときに成立している）。席と、ホスト役か（遅れの量を決める側）と、形（モードと、rollback なら D・delay 方式なら今の遅れ。ホストの画面ではホストが選んだ値。無ければ None）。
-    /// `watch_off` は、自分は観戦を許可しているが相手が許可していない（この試合は観戦できない）。
+    /// 接続した（対戦が成立した。`code_side = game`以外の実行は接続したときに成立している）。
+    /// 持つ値はサイド・ホスト役かどうか（遅れの量を決める側）・形（モードと、rollbackならD、delay方式なら今の遅れ。ホストの画面ではホストが選んだ値。無ければNone）。
+    /// `watch_off`は自分は観戦を許可しているが相手が許可していない状態（この試合は観戦できない）。
     Connected {
         seat: Seat,
         host: bool,
         shape: Option<(Mode, u8)>,
         watch_off: bool,
     },
-    /// 接続したが、対戦はまだ成立していない（両者が「妖怪 対 妖怪」を選ぶまで。`match_gate`。`code_side = game` の実行だけ）。`ready` は自分がもう選んだか、`left_secs` は成立しないまま閉じるまでの残り（秒）。
+    /// 接続したが対戦はまだ成立していない（両者が「妖怪 対 妖怪」を選ぶまで。`match_gate`。`code_side = game`の実行だけ）。
+    /// `ready`は自分がもう選んだかどうか。`left_secs`は成立しないまま閉じるまでの残り（秒）。
     Found {
         seat: Seat,
         shape: Option<(Mode, u8)>,
         ready: bool,
         left_secs: u32,
     },
-    /// 接続できないままネットワークが終わった。マッチの外へ戻るとネットワークの組を片づけて「接続する前」（`Waiting`）へ戻る（起動し直さずに接続し直せる。下の 3 つも同じ）。
+    /// 接続できないままネットワークが終わった。マッチの外へ戻るとネットワーク一式を後始末して「接続する前」（`Waiting`）へ戻る（起動し直さずに接続し直せる。下の3つも同じ）。
     Ended,
     /// 接続して遊んだ後、ネットワークが終わった（相手が抜けた・沈黙）。
     Finished,
-    /// 接続したが、成立しないまま閉じた。理由は `match_gate::NoMatch`。
+    /// 接続したが、成立しないまま閉じた。理由は`match_gate::NoMatch`。
     Unmatched(NoMatch),
-    /// 相手の HiganRTool のバージョンが違うので、接続する前にネットワークが終わった（`handshake::FailReason::OtherVersion`。`theirs` は相手のバージョン、自分のバージョンは `wire::PROTO_VER`）。
+    /// 相手のHiganRToolのバージョンが違うので接続する前にネットワークが終わった（`handshake::FailReason::OtherVersion`。`theirs`は相手のバージョン、自分のバージョンは`wire::PROTO_VER`）。
     OtherVersion { theirs: u8 },
-    /// 相手のビルドが違うので、接続する前にネットワークが終わった（`handshake::FailReason::OtherBuild`。`theirs` は相手のビルド番号、自分は `update::BUILD_NUMBER`）。
+    /// 相手のビルドが違うので接続する前にネットワークが終わった（`handshake::FailReason::OtherBuild`。`theirs`は相手のビルド番号、自分は`update::BUILD_NUMBER`）。
     OtherBuild { theirs: u32 },
-    /// マッチの最中に CHECK が食い違い（自分が見つけた・相手の BYE(同期ズレ) を受けた）、そのマッチを止めている間。ゲームの更新を進めず、Esc を待つ（Esc で止めたままネットワークを閉じてゲームの入力へ戻す。戻った後は `Finished`）。
-    /// `is_end` は偽: 片づけた後のメニューの場面に「Esc でメニューへ」を残さない。
+    /// マッチの最中にCHECKが食い違い、そのマッチを止めている状態（自分が見つけた場合と相手のBYE(同期ズレ)を受けた場合）。
+    /// ゲームの更新は進めずEscを待つ。
+    /// Escを押すと止めたままネットワークを閉じてゲームの入力へ戻す（戻った後は`Finished`）。
+    /// `is_end`は偽: 後始末した後のメニューの場面に「Esc でメニューへ」を残さない。
     Desynced,
 }
 
@@ -1394,7 +1479,8 @@ impl Conn {
         matches!(self, Conn::Connected { .. } | Conn::Found { .. })
     }
 
-    /// ネットワークが終わった状態か（接続できないまま・遊んだ後・成立しないまま・バージョン違い）。ゲーム内のメニューは、ネットワークの組を片づけた後もこの行を左上に残す。
+    /// ネットワークが終わった状態かどうか（接続できないまま・遊んだ後・成立しないまま・バージョン違い）。
+    /// ゲーム内のメニューはネットワーク一式を後始末した後もこの行を左上に残す。
     pub fn is_end(self) -> bool {
         matches!(
             self,
@@ -1409,14 +1495,16 @@ impl Conn {
 
 const FORMATS: [Mode; 2] = [Mode::Rollback, Mode::Delay];
 
-/// メニューの「同期方式」と「ディレイ」の今の選び。形式は ini の `mode`・遅延は ini の `delay` から始まり、← → で変える（並びは `DelayChoice::step`）。
+/// メニューの「同期方式」と「ディレイ」の選択中の値。
+/// 形式はiniの`mode`、遅延はiniの`delay`から始まり、← → で変える（並びは`DelayChoice::step`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShapeSel {
     pub mode: Mode,
     pub delay: DelayChoice,
-    /// ini の `delay` から作った D（auto なら `rollback::DEFAULT_DELAY`）。遅延が auto のとき rollback の AGREE の D になる（auto は接続する前に D を決めない。接続の始まりにホストが旗を立てて、最初の取得で推奨値にする）。
+    /// iniの`delay`から作ったD（autoなら`rollback::DEFAULT_DELAY`）。
+    /// 遅延がautoのときrollbackのAGREEのDになる（autoは接続する前にDを決めない。接続の始まりにホストがフラグを立て、最初の取得で推奨値にする）。
     ini_delay: u8,
-    /// メニューで変えたか（変えていなければ見張りへ指示を出さず、ini の形のまま）。
+    /// メニューで変えたかどうか（変えていなければ監視の処理へ指示を出さずiniの形のまま）。
     pub touched: bool,
 }
 
@@ -1431,7 +1519,8 @@ impl ShapeSel {
         }
     }
 
-    /// 見張りへ渡す、名乗る形（`Cmd::Shape` の前半）。delay 方式なら `Pick::Delay`、rollback なら D（遅延が固定ならその値、auto なら ini の値）。
+    /// 監視の処理へ渡す名乗る形（`Cmd::Shape`の前半）。
+    /// delay方式なら`Pick::Delay`。rollbackならD（遅延が固定ならその値、autoならiniの値）。
     pub fn pick(self) -> Pick {
         match self.mode {
             Mode::Delay => Pick::Delay,
@@ -1462,7 +1551,7 @@ impl ShapeSel {
     }
 }
 
-/// メニューの「サイド」で選べる希望（左から 1P・2P・おまかせ。← → で端に止まる）。
+/// メニューの「サイド」で選べる希望（左から1P・2P・おまかせ。← → で端に止まる）。
 const SEATS: [SeatWish; 3] = [SeatWish::P1, SeatWish::P2, SeatWish::Any];
 
 fn seat_text(w: SeatWish, lang: Lang) -> &'static str {
@@ -1481,7 +1570,7 @@ pub enum Item {
     Room,
     /// 観戦の「ランダムマッチ」（進行中のランダムマッチの一覧の画面へ入る。観戦の先頭。待ちが何も動いていない間だけ）。
     SpectateRandom,
-    /// 観戦の「観戦コード入力」（ルームサーバーを使わず、クリップボードの観戦コードでホストへ直に接続する。`room_server` が無くても出す）。
+    /// 観戦の「観戦コード入力」（ルームサーバーを使わずクリップボードの観戦コードでホストへ直に接続する。`room_server`が無くても出す）。
     SpectateCode,
     /// 観戦の「ルームマッチ」（待ちが何も動いていない間だけ）。
     Spectate,
@@ -1493,23 +1582,23 @@ pub enum Item {
     RoomName,
     /// 「同期方式　◀ rollback ▶」（設定）。
     Format,
-    /// 「ディレイ　◀ auto ▶」（設定。並びは auto, 0F, 1F, …, 8F）。
+    /// 「ディレイ　◀ auto ▶」（設定。並びはauto, 0F, 1F, …, 8F）。
     Delay,
-    /// 「サイド　◀ 1P ▶」（席の希望。待ち・接続の最中は出さない: 名乗る希望は相手のコードを読んだときに決まるので、待ちの最中に変えると効くか効かないかが相手の来る時刻で揺れる）。
+    /// 「サイド　◀ 1P ▶」（サイドの希望。待ち・接続の最中は出さない。名乗る希望は相手のコードを読んだときに決まるので、待ちの最中に変えると効くかどうかが相手の来る時刻で揺れる）。
     Seat,
     /// 「プレイヤー名　<今の名前>」（プレイヤー名の入力へ入る。待ち・接続の最中は出さない）。
     Name,
-    /// 「言語　◀ 日本語 ▶」（設定。← → で替わると、その tick から画面の文字が替わる）。
+    /// 「言語　◀ 日本語 ▶」（設定。← → で替わるとそのtickから画面の文字が替わる）。
     Lang,
     Cancel,
     Back,
-    /// LAN の「ホスト」（自分の LAN のアドレスを見せて、来る相手を待つ）。
+    /// LANの「ホスト」（自分のLANのアドレスを見せて来る相手を待つ）。
     LanHost,
-    /// LAN の「クライアント」（ホストのアドレスを打って参加する）。
+    /// LANの「クライアント」（ホストのアドレスを打って参加する）。
     LanClient,
-    /// LAN の「観戦」（ホストのアドレスを打って観戦する）。
+    /// LANの「観戦」（ホストのアドレスを打って観戦する）。
     LanWatch,
-    /// 「設定　<今のプレイヤー名>」（1 つ下の階層の画面へ入る）。
+    /// 「設定　<今のプレイヤー名>」（1つ下の階層の画面へ入る）。
     Settings,
 }
 
@@ -1535,7 +1624,7 @@ impl Group {
 }
 
 impl Item {
-    /// 「ラベル　値」の形の行のラベル（値の列を見出しごとに揃える相手）。値の無い行は `None`。
+    /// 「ラベル　値」の形の行のラベル（値の列を見出しごとに揃える相手）。値の無い行は`None`。
     fn value_label(self) -> Option<Tx> {
         match self {
             Item::RoomName => Some(T_ROOM_NAME),
@@ -1575,60 +1664,74 @@ impl Item {
     }
 }
 
-/// 「ランダムマッチ」「ルームマッチ」の項目を出すか（ini の `room_server` から決まる。呼び手が `Menu::with_room` で渡す）。
+/// 「ランダムマッチ」「ルームマッチ」の項目を出すかどうか（iniの`room_server`から決まる。呼び手が`Menu::with_room`で渡す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoomItem {
     #[default]
     Off,
-    /// 出す。選ぶとルーム名の入力になり、入力は持っている名（初めの値）から始まる（`room_input::initial`: ini の `room` → 空）。
+    /// 出す。選ぶとルーム名の入力になる。
+    /// 入力は持っている名（初めの値）から始まる（`room_input::initial`: iniの`room` → 空）。
     On(RoomBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
-    /// ランダムマッチ: サーバーの待ち列に入り、来た人と組になる（ルーム名は決めない。割り当てられたルームへは受け取る側が入る）。
+    /// ランダムマッチ: サーバーの待ち列に入る。来た人とペアになる（ルーム名は決めない。割り当てられたルームへは受け取る側が入る）。
     Random,
-    /// ルームサーバーのルームで相手を待つ（ルーム名は入力で決めた名。文字の決まり `RoomName::parse` を通っている）。
+    /// ルームサーバーのルームで相手を待つ（ルーム名は入力で決めた名。文字の決まり`RoomName::parse`を通っている）。
     Room(RoomBuf),
-    /// 観戦者として、観戦用のルーム（対戦する側が同じ名で対戦の「ルームマッチ」を選んで接続したマッチの配る側が入るルーム）で待つ。観戦者のセッションを設定する・ルームへ入るのは受け取る側。
+    /// 観戦者として観戦用のルームで待つ。
+    /// 対戦する側が同じ名で対戦の「ルームマッチ」を選んで接続すると、そのマッチを観戦に配信する側がこの観戦用のルームに入る。
+    /// 観戦者のセッションを設定してルームへ入るのは受け取る側。
     Spectate(RoomBuf),
-    /// 観戦の「ランダムマッチ」の一覧から選んだ行。観戦用のルーム名は行のハッシュから導く。受け取る側は一覧の接続を閉じ、`Spectate` と同じに観戦者のセッションを設定する。
+    /// 観戦の「ランダムマッチ」の一覧から選んだ行。観戦用のルーム名は行のハッシュから導く。
+    /// 受け取る側は一覧の接続を閉じる。そして`Spectate`と同じように観戦者のセッションを設定する。
     SpectateListed(WatchRow),
-    /// 設定の「ルーム名」を決めた（ルームへは入らない）。受け取る側は、ini の `room` へ書く（次の起動のルーム名の初めの値になる。ゲームのスレッドでは書かない）。
+    /// 設定の「ルーム名」を決定した（ルームへは入らない）。受け取る側はiniの`room`へ書く（次の起動時のルーム名の初めの値になる。ゲームのスレッドでは書かない）。
     RoomSet(RoomBuf),
-    /// LAN のホストとして待つ（アドレスはホストが自分の LAN のアドレスを全部見せる）。受け取る側は、ネットワークを開かずに申し込みの受け口だけを開く。
+    /// LANのホストとして待つ（アドレスはホストが自分のLANのアドレスを全部見せる）。
+    /// 受け取る側はネットワークを開かず、申し込みの受付用受信ソケットだけを開く。
     LanHost,
-    /// LAN のクライアント: 打ったホストのアドレスへ参加を申し込む。受け取る側は、ini の `lan_host` へ書く（次に打つときの初めの値になる）。
+    /// LANのクライアント: 打ったホストのアドレスへ参加を申し込む。受け取る側はiniの`lan_host`へ書く（次に打つときの初めの値になる）。
     LanClient(LanAddr),
-    /// LAN の観戦: 打ったホストのアドレスへ観戦を申し込む（`LanClient` と同じに ini へ書く）。
+    /// LANの観戦: 打ったホストのアドレスへ観戦を申し込む（`LanClient`と同じにiniへ書く）。
     LanWatch(LanAddr),
-    /// 観戦の待機をやめる。受け取る側は観戦の待ちをやめ、セッションを元へ戻せるなら `CodeState::Idle`、戻さないなら `CodeState::SpectateIdle` を状態にする。
+    /// 観戦の待機をやめる。
+    /// 受け取る側は観戦の待ちをやめる。セッションを元へ戻せるなら`CodeState::Idle`を、戻さないなら`CodeState::SpectateIdle`を状態にする。
     SpectateCancel,
-    /// 観戦コード入力: クリップボードの観戦コード（種別 3）を読み、ルームを使わずにホストへ直に接続する。観戦者のセッションを設定するのは受け取る側。
+    /// 観戦コード入力: クリップボードの観戦コード（種別3）を読んでルームを使わずホストへ直に接続する。観戦者のセッションを設定するのは受け取る側。
     SpectateCode,
-    /// 観戦コードをコピー（Ctrl+C。見つかった・接続した間に、`NetUi::copy_tick` が押した瞬間に 1 回送る）: ホストなら観戦コードを作り直してクリップボードへ書く。ゲストは書かない（`Event::SpectateCodeHostOnly`）。
+    /// 観戦コードをコピーする（Ctrl+C。見つかった・接続した間に`NetUi::copy_tick`が押した瞬間に1回送る）。
+    /// ホストなら観戦コードを作り直してクリップボードへ書く。ゲストは書かない（`Event::SpectateCodeHostOnly`）。
     CopySpectateCode,
     Create,
-    /// クリップボードを読む（自分のコードがまだ無ければ返す側として、あれば相手の返すコードとして）。
+    /// クリップボードを読む。自分のコードがまだ無ければ返答する側として読み、あれば相手の返答コードとして読む。
     Paste,
     Cancel,
-    /// プレイヤー名を決めた（文字の決まり `NameBuf::parse` を通っている）。受け取る側は、次に開くネットワーク・次に作る接続コードからこの名前で名乗り、ini の `name` へ書く（ゲームのスレッドでは書かない）。
+    /// プレイヤー名を決定した（文字の決まり`NameBuf::parse`を通っている）。
+    /// 受け取る側は次に開くネットワークと次に作る接続コードからこの名前で名乗る。そしてiniの`name`へ書く（ゲームのスレッドでは書かない）。
     Name(NameBuf),
-    /// 同期方式か遅延を変えた（接続し始める前なら次の接続に効く）。前半は名乗る形（rollback の D も入る）、後半は遅延の選び（auto か 0〜8。接続の始まりにホストが押下にする）。どちらの行を変えても両方を送る（指示は 1 tick に 1 つ）。
+    /// 同期方式か遅延を変えた（接続し始める前なら次の接続に効く）。
+    /// 前半は名乗る形（rollbackのDも入る）。後半は遅延の選択（autoか0〜8。接続の始まりにホストが押下にする）。
+    /// どちらの行を変えても両方を送る（指示は1 tickに1つ）。
     Shape(Pick, DelayChoice),
-    /// 席の希望を変えた（次の接続に効く。受け取る側は相手のコードを読んでセッションを設定するときに読む）。
+    /// サイドの希望を変えた（次の接続に効く。受け取る側は相手のコードを読んでセッションを設定するときに読む）。
     Seat(SeatWish),
-    /// 画面の言語を替えた。受け取る側は今の言語を更新し、次の起動のために ini の `[ui] lang` へ書く（ゲームのスレッドでは書かない）。
+    /// 画面の言語を替えた。受け取る側は今の言語を更新する。
+    /// 次の起動のためにiniの`[ui] lang`へ書く（ゲームのスレッドでは書かない）。
     Lang(Lang),
 }
 
-/// 閉じ始めてから、ローダーの語が 0 にならなくてもゲームへ返すまでの tick の数（約 2 秒）。押しっぱなしの語（パッドの傾きなど）でゲームが固まらないための上限。上限で返すと、押したままのキーがゲームに「押した瞬間」と読まれうる。
+/// 閉じ始めてからローダーのワードが0にならなくてもゲームへ返すまでのtickの数（約2秒）。
+/// 押しっぱなしのワード（パッドの傾きなど）でゲームが固まらないための上限。
+/// 上限で返すと押したままのキーがゲームに「押した瞬間」と読まれうる。
 pub const CLOSE_MAX_TICKS: u32 = 120;
 
-/// 1 tick に受ける文字（UTF-16 の単位）の数の上限。人が打つ速さに十分で、台本が一度に入れる長い名前と Enter（最大 33 単位）は 3 tick で受けきる。
+/// 1 tickに受ける文字（UTF-16の単位）の数の上限。
+/// 人が打つ速さに十分。台本が一度に入力する長い名前とEnter（最大33単位）は3 tickで受けきる。
 pub const TEXT_PER_TICK: usize = 16;
 
-/// 1 tick の間にウィンドウへ打たれた文字（`WM_CHAR` の `wParam`）。ルーム名の入力の間だけ意味がある。
+/// 1 tickの間にウィンドウへ打たれた文字（`WM_CHAR`の`wParam`）。ルーム名の入力の間だけ意味がある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextIn {
     pub units: [u16; TEXT_PER_TICK],
@@ -1648,17 +1751,18 @@ impl TextIn {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TickIn {
-    /// 自分の語（キーボード・パッドを読んだ生の語。ゲームへ流す語ではない）。
+    /// 自分のワード（キーボード・パッドを読んだ生のワード。ゲームへ渡すワードではない）。
     pub word: u16,
     pub note: Note,
     pub conn: Conn,
-    /// この tick にウィンドウへ打たれた文字（ルーム名の入力の間だけ読む）。
+    /// このtickにウィンドウへ打たれた文字（ルーム名の入力の間だけ読む）。
     pub text: TextIn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
-    /// はい: 対戦を終える（呼び手が BYE を相手へ送る）。取消はメニューを閉じた後でゲームへ通す（`Menu::take_pending_cancel`）。
+    /// はい: 対戦を終える（呼び手がBYEを相手へ送る）。
+    /// 飲み込んでいたキャンセルの入力は、メニューを閉じた後でゲームへ通す（`Menu::take_pending_cancel`）。
     Leave,
     Stay,
 }
@@ -1666,7 +1770,7 @@ pub enum Answer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TickOut {
     pub cmd: Option<Cmd>,
-    /// このメニューがゲームの入力を握っている（呼び手はゲームへ 0 を 3 本 feed する）。
+    /// このメニューがゲームの入力を占有している（呼び手はゲームへ0を3本feedする）。
     pub hold_game: bool,
     pub answer: Option<Answer>,
 }
@@ -1675,30 +1779,30 @@ pub struct TickOut {
 enum State {
     Closed,
     Open,
-    /// 確認の枠「対戦から抜けますか？」（`open_confirm`。接続した後、難易度の画面より前へ戻ろうとしたとき）。
+    /// 確認の枠「対戦から抜けますか？」（`open_confirm`。接続した後に難易度の画面より前へ戻ろうとしたとき）。
     Confirm,
-    /// 「設定」の画面（プレイヤー名・サイド・同期方式・ディレイ・言語。入口のメニューの 1 つ下の階層）。
+    /// 「設定」の画面（プレイヤー名・サイド・同期方式・ディレイ・言語。入口のメニューの1つ下の階層）。
     Settings,
     /// ルーム名の入力（「ルームマッチ」を決めた後。ウィンドウへ打たれた文字を受ける）。
     RoomName,
-    /// 観戦の「ランダムマッチ」の一覧（進行中のランダムマッチから選ぶ。一覧は呼び手が毎 tick 渡す）。
+    /// 観戦の「ランダムマッチ」の一覧（進行中のランダムマッチから選ぶ。一覧は呼び手が毎tick渡す）。
     WatchList,
-    /// 閉じ始めた。語が 0 になるまで（か `CLOSE_MAX_TICKS`）呼び手がゲームへ 0 を流す。数は経った tick。
+    /// 閉じ始めた。ワードが0になるまで（か`CLOSE_MAX_TICKS`まで）呼び手がゲームへ0を渡す。数は経ったtick。
     Closing(u32),
 }
 
-/// ルーム名の入力が何のためか（決めたときの指示と、入力の画面の題が変わる。文字の受け方・初めの値・決まりは同じ）。
+/// ルーム名の入力が何のためか（決定したときの指示と入力の画面の題が変わる。文字の受け方・初めの値・決まりは同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditFor {
     Wait,
     Spectate,
-    /// プレイヤー名（`Cmd::Name`。文字の組はルーム名に空白を足したもの）。
+    /// プレイヤー名（`Cmd::Name`。使える文字はルーム名に空白を足したもの）。
     Name,
     /// 設定の「ルーム名」（決めるだけ。指示は出さない。次の「ルームマッチ」がこの名で始まる）。
     RoomSet,
-    /// LAN の「クライアント」のホストのアドレス（`Cmd::LanClient`）。
+    /// LANの「クライアント」のホストのアドレス（`Cmd::LanClient`）。
     LanClient,
-    /// LAN の「観戦」のホストのアドレス（`Cmd::LanWatch`）。
+    /// LANの「観戦」のホストのアドレス（`Cmd::LanWatch`）。
     LanWatch,
 }
 
@@ -1713,55 +1817,64 @@ pub struct Menu {
     state: State,
     cursor: usize,
     shape: ShapeSel,
-    /// 席の希望（`with_seat`。渡さなければ「サイド」の項目を出さない）。
+    /// サイドの希望（`with_seat`。渡さなければ「サイド」の項目を出さない）。
     seat: Option<SeatWish>,
     prev: u16,
-    /// 確認の枠で「はい」と答えた後、メニューを閉じ終えたらゲームへ通す取消が残っている。
+    /// 確認の枠で「はい」と答えた後、メニューを閉じ終えたらゲームへ通すキャンセルの入力が残っているかどうか。
     pending_cancel: bool,
-    /// 見張りのネットワークがまだ開いていない（最初の操作で開く。開く間は「準備しています」を出す。呼び手が毎 tick 設定する）。
+    /// 監視の処理のネットワークがまだ開いていない（最初の操作で開く。開く間は「準備しています」を出す。呼び手が毎tick設定する）。
     opening: bool,
-    /// 「ルームマッチ」の項目（`with_room`。`On` の中身は入力の初めの値）。
+    /// 「ルームマッチ」の項目（`with_room`。`On`の中身は入力の初めの値）。
     room: RoomItem,
     edit: RoomInput,
     edit_for: EditFor,
     edit_err: Option<RoomNameWhy>,
-    /// 使えない文字を捨てた直後か（入力の画面に `T_ROOM_INPUT_DROPPED` を出す。次に使える文字か Enter・Backspace を受けると消える）。
+    /// 使えない文字を捨てた直後かどうか（入力の画面に`T_ROOM_INPUT_DROPPED`を出す。次に使える文字かEnter・Backspaceを受けると消える）。
     edit_dropped: bool,
-    /// Enter の文字（`WM_CHAR` の 0x0D）を決定として読んでよいか。入力を開いたときは false で、ゲームの語の決定のビット（`DECIDE_BITS`）が 0 の tick を 1 回見たら true（決めた Enter を離したのを見てから）。
-    /// 「ルームマッチ」を決めた Enter の文字が遅れて届くのも、押したままのキーの自動繰り返しの文字も、その Enter が押されている間に来るので、tick の数の猶予でなく離したことを条件にして 1 つで塞ぐ。文字そのもの（Enter 以外）は armed でなくても受ける。
+    /// Enterの文字（`WM_CHAR`の0x0D）を決定として読んでよいかどうか。
+    /// 入力を開いたときはfalse。ゲームのワードの決定のビット（`DECIDE_BITS`）が0のtickを1回見たらtrueにする（決定したEnterを離したのを見てから）。
+    /// 「ルームマッチ」を決定したEnterの文字が遅れて届くのも、押したままのキーの自動繰り返しの文字も、そのEnterが押されている間に来る。
+    /// そこでtickの数の猶予でなく、離したことを1つの条件にして両方を塞ぐ。
+    /// 文字そのもの（Enter以外）はarmedでなくても受ける。
     enter_armed: bool,
     /// ウィンドウから文字を受ける仕組みが使えない（呼び手が設定する。入力の画面に断りの行を出す）。
     text_unavailable: bool,
-    /// 入力から戻った後、ゲームの語が全部離れるまで押下を読まない（決めた Enter の語の立ち上がりが遅れて届いて、戻った先の項目「ルームマッチ」をもう一度決めてしまわないため）。数は待った tick（`CLOSE_MAX_TICKS` で切る）。
+    /// 入力から戻った後はゲームのワードが全部離れるまで押下を読まない。
+    /// 決定したEnterのワードの立ち上がりが遅れて届き、戻った先の項目「ルームマッチ」をもう一度決定してしまうのを避けるため。
+    /// 数は待ったtick（`CLOSE_MAX_TICKS`で切る）。
     quiet: Option<u32>,
-    /// 今のプレイヤー名（`with_player_name`。`None` なら「名前」の項目を出さない）。打てない文字があれば `?` に直した表示用の形（`NameBuf::lossy`）。決めると今決めた名前へ替わる。
+    /// 今のプレイヤー名（`with_player_name`。`None`なら「名前」の項目を出さない）。
+    /// 打てない文字があれば`?`に直した表示用の形（`NameBuf::lossy`）。
+    /// 決定すると今決定した名前へ替わる。
     name: Option<NameBuf>,
     name_edit: NameInput,
     name_err: Option<NameWhy>,
-    /// LAN のホストのアドレスの入力（初めの値は `lan_addr`。決めるたびに今決めたアドレスへ替わる）。
+    /// LANのホストのアドレスの入力（初めの値は`lan_addr`。決定するたびに今決定したアドレスへ替わる）。
     lan_addr: AddrBuf,
     addr_edit: AddrInput,
     addr_err: Option<AddrWhy>,
-    /// 自分の PC の VPN のネットワーク。打ったアドレスがこの中なら LAN のアドレスとして受ける（呼び手が入力の間に設定する）。
+    /// 自分のPCのVPNのネットワーク。打ったアドレスがこの中ならLANのアドレスとして受ける（呼び手が入力の間に設定する）。
     vpn: VpnSet,
-    /// 画面の言語（呼び手が `with_lang` で渡す。「言語」の行で替えると自分で更新し、`Cmd::Lang` を返す）。
+    /// 画面の言語（呼び手が`with_lang`で渡す。「言語」の行で替えると自分で更新して`Cmd::Lang`を返す）。
     lang: Lang,
-    /// 開いた直後で、カーソルをまだ初めの項目（先頭の「ランダムマッチ」。ルームサーバーが無ければ「コード作成」）へ合わせていない。
+    /// 開いた直後でカーソルをまだ初めの項目（先頭の「ランダムマッチ」。ルームサーバーが無ければ「コード作成」）へ合わせていない。
     home: bool,
-    /// `home` のとき、カーソルを初めの項目でなく「設定」へ合わせる（プレイヤー名が既定のまま、起動して最初に開いたときだけ）。
+    /// `home`のときカーソルを初めの項目でなく「設定」へ合わせる（プレイヤー名が既定のまま起動して最初に開いたときだけ）。
     land_on_settings: bool,
-    /// 一度でも開いた（`open` を呼んだ）か。
+    /// 一度でも開いた（`open`を呼んだ）かどうか。
     opened_before: bool,
-    /// カーソルが前の tick に指していた項目。ルーム名・名前・サイドの行が出入りしても、同じ項目に残すために覚える。
+    /// カーソルが前のtickに指していた項目。ルーム名・名前・サイドの行が出入りしても同じ項目に残すために覚える。
     at: Option<Item>,
-    /// 観戦の「ランダムマッチ」の一覧の画面のカーソル（行の中身で覚える。一覧が入れ替わっても、別の行を選ばない）と、表示の先頭の行の番号。
+    /// 観戦の「ランダムマッチ」の一覧の画面のカーソル（行の中身で覚える。一覧が入れ替わっても別の行を選ばない）と表示の先頭の行の番号。
     watch_sel: WatchSel,
     watch_top: usize,
-    /// LAN の待機でアドレスが `LAN_VISIBLE` を越えるとき、カーソルが指しているアドレスの行（項目の並びの次に回る。`None` は項目側）と、表示の先頭の行。
+    /// LANの待機でアドレスが`LAN_VISIBLE`を越えるときの、カーソルが指しているアドレスの行（項目の並びの次に回る。`None`は項目側）と表示の先頭の行。
     lan_row: Option<usize>,
     lan_top: usize,
-    /// ini の読めない行の注。ほかに状況の行が無い間だけ、メニューの下に出す。
+    /// iniの読めない行の注。ほかに状況の行が無い間だけ、メニューの下に出す。
     ini_notice: Option<IniNotice>,
+    /// 見つかった新しいバージョン（呼び手が`set_update`で渡す）。メニューの一番下に知らせる。
+    update: Found,
 }
 
 /// 一覧の画面のカーソルの位置。
@@ -1774,20 +1887,24 @@ enum WatchSel {
     Back,
 }
 
-/// 一覧の画面に出す行の数（これを越える分はスクロールして、上下の「ほか N 件」で知らせる）。
+/// 一覧の画面に出す行の数（これを越える分はスクロールして上下の「ほか N 件」で知らせる）。
 pub const WATCH_VISIBLE: usize = 8;
-/// 一覧の 1 行の名前の欄の幅（文字）。越える名前は切って出す。
+/// 一覧の1行の名前のフィールドの幅（文字）。越える名前は切って出す。
 const WATCH_NAME_CELLS: usize = 12;
 
-/// 項目の数の上限。入口のメニューは最大 13（ランダムマッチ・ルームマッチ・ルーム名・観戦のランダムマッチ・観戦のルームマッチ・対戦コード作成・対戦コード入力・観戦コード入力・ホスト・クライアント・観戦・設定・もどる）。
-/// 待ちの間は観戦・LAN・ルーム名が無く、代わりに待機をやめるが 1 つ入る。設定の画面は最大 6（プレイヤー名・サイド・同期方式・ディレイ・言語・もどる）。余裕を 2 つ足して 15。
+/// 項目の数の上限。入口のメニューは最大13（ランダムマッチ・ルームマッチ・ルーム名・観戦のランダムマッチ・観戦のルームマッチ・対戦コード作成・対戦コード入力・観戦コード入力・ホスト・クライアント・観戦・設定・もどる）。
+/// 待ちの間は観戦・LAN・ルーム名が無く、代わりに「待機をやめる」が1つ加わる。
+/// 設定の画面は最大6（プレイヤー名・サイド・同期方式・ディレイ・言語・もどる）。
+/// 余裕を2つ足して15。
 const ITEMS_MAX: usize = 15;
 
 type Items = ([Item; ITEMS_MAX], usize);
 
-/// メニューの行の数の上限（隙間の行も数える）。待ちの外の Idle で全部の項目が出る組が最大で、見出し 4・項目 13・隙間 4（見出しの前に中 3・設定の前に小）・状況の前後の隙間 2・状況 3（貼った文字数・文 2 行）・キー 1 = 27。
-/// 待ちの間は項目が最大 7（ランダムマッチ・ルームマッチ・対戦コード作成・対戦コード入力・設定・待機をやめる・もどる）・見出し 2・隙間 2・状況 5 行・その前後の隙間 2・キー 1 = 19 で届かない。設定の画面は最大 14 行。
-/// 検査 `every_menu_row_fits_the_box_and_the_screen` が数え、`tallest == MENU_ROWS`（27）で縛る。枠の高さ（隙間は行の高さより低い。見出しの前は中くらい 3 か所、設定の前は小さく詰める）は同じ検査が画面の 480 画素と比べる。
+/// メニューの行の数の上限（隙間の行も数える）。
+/// 待ちの外のIdleで全部の項目が出る組み合わせが最大になる。内訳は見出し4・項目13・隙間4（見出しの前に中3・設定の前に小）・状況の前後の隙間2・状況3（貼った文字数・文2行）・キー 1 = 27。
+/// 待ちの間は項目が最大7（ランダムマッチ・ルームマッチ・対戦コード作成・対戦コード入力・設定・待機をやめる・もどる）・見出し2・隙間2・状況5行・その前後の隙間2・キー 1 = 19 で届かない。設定の画面は最大14行。
+/// 検査`every_menu_row_fits_the_box_and_the_screen`が数えて`tallest == MENU_ROWS`（27）で縛る。
+/// 枠の高さ（隙間は行の高さより低い。見出しの前は中くらいの隙間が3か所。設定の前は小さく詰める）は同じ検査が画面の480画素と比べる。
 pub const MENU_ROWS: usize = 27;
 const STATUS_ROWS: usize = 5;
 
@@ -1827,7 +1944,7 @@ impl Default for MenuRows {
 }
 
 impl Menu {
-    /// `ini` は ini の形（メニューの「同期方式」「ディレイ」の初めの値）。
+    /// `ini`はiniの形（メニューの「同期方式」「ディレイ」の初めの値）。
     pub fn new(ini: Shape) -> Menu {
         Menu {
             state: State::Closed,
@@ -1862,7 +1979,12 @@ impl Menu {
             lan_row: None,
             lan_top: 0,
             ini_notice: None,
+            update: Found::None,
         }
+    }
+
+    pub fn set_update(&mut self, found: Found) {
+        self.update = found;
     }
 
     pub fn with_ini_notice(mut self, notice: Option<IniNotice>) -> Menu {
@@ -1875,18 +1997,18 @@ impl Menu {
         self
     }
 
-    /// LAN のホストのアドレスの入力の初めの値（前回打ったアドレス。ini の `lan_host`）。
+    /// LANのホストのアドレスの入力の初めの値（前回打ったアドレス。iniの`lan_host`）。
     pub fn with_lan_addr(mut self, addr: AddrBuf) -> Menu {
         self.lan_addr = addr;
         self
     }
 
-    /// 自分の PC の VPN のネットワークを設定する（打ったアドレスを受けるかの判定が使う）。
+    /// 自分のPCのVPNのネットワークを設定する（打ったアドレスを受けるかどうかの判定が使う）。
     pub fn set_vpn(&mut self, vpn: VpnSet) {
         self.vpn = vpn;
     }
 
-    /// LAN のホストのアドレスの入力の間か（呼び手がこの間だけ VPN のネットワークを引いて `set_vpn` に渡す）。
+    /// LANのホストのアドレスの入力の間かどうか（呼び手がこの間だけVPNのネットワークを取得して`set_vpn`に渡す）。
     pub fn wants_lan_addr(&self) -> bool {
         self.state == State::RoomName && self.edit_for.is_lan()
     }
@@ -1918,7 +2040,7 @@ impl Menu {
         self.text_unavailable = !ok;
     }
 
-    /// ルーム名の入力の間か（呼び手がこれを見て、ウィンドウから文字を貯めるゲートを開け閉めする）。
+    /// ルーム名の入力の間かどうか（呼び手がこれを見てウィンドウから文字を貯めるゲートを開け閉めする）。
     pub fn wants_text(&self) -> bool {
         self.state == State::RoomName
     }
@@ -1939,7 +2061,9 @@ impl Menu {
         self.enter_armed = false;
     }
 
-    /// 「ルームマッチ」を決めた。ルーム名が決まっていれば（設定の「ルーム名」・ini の `room`）その名で始まる指示を返し、空か文字の決まりの外ならルーム名の入力の画面へ入る（入力で決めると、そのまま始まる）。
+    /// 「ルームマッチ」を決定した。
+    /// ルーム名が決まっていれば（設定の「ルーム名」・iniの`room`）その名で始まる指示を返す。
+    /// 空か文字の決まりの外ならルーム名の入力の画面へ入る（入力で決定するとそのまま始まる）。
     fn start_room(&mut self, for_: EditFor) -> Option<Cmd> {
         match self.room {
             RoomItem::On(name) if name.parse().is_ok() => Some(match for_ {
@@ -1957,7 +2081,7 @@ impl Menu {
         }
     }
 
-    /// LAN のホストのアドレスの入力へ入る（初めの値は前回打ったアドレス）。
+    /// LANのホストのアドレスの入力へ入る（初めの値は前回打ったアドレス）。
     fn begin_addr_input(&mut self, for_: EditFor) {
         self.state = State::RoomName;
         self.edit_for = for_;
@@ -1981,7 +2105,7 @@ impl Menu {
         self.enter_armed = false;
     }
 
-    /// 入力を終えて、入った画面へ戻る（プレイヤー名は「設定」の画面から、ほかは入口のメニューから入る）。
+    /// 入力を終えて入った画面へ戻る（プレイヤー名は「設定」の画面から入り、ほかは入口のメニューから入る）。
     fn end_room_input(&mut self) {
         self.state = if self.edit_for == EditFor::Name {
             State::Settings
@@ -2006,12 +2130,14 @@ impl Menu {
         self.at = Some(Item::Settings);
     }
 
-    /// プレイヤー名が既定のまま（決めていない）か。名前の項目を出さない呼び手（`with_player_name` なし）は決める場所が無いので偽。
+    /// プレイヤー名が既定のまま（未決定）かどうか。名前の項目を出さない呼び手（`with_player_name`なし）は決める場所が無いので偽。
     fn name_is_default(&self) -> bool {
         self.name.is_some_and(|n| n.is_default())
     }
 
-    /// 確認の枠を開く（接続した後、難易度の画面より前へ戻ろうとした取消を飲み込んだとき）。初めの項目は「いいえ」（間違えて決定しても何も起きない側）。`held` は開く tick の語。
+    /// 確認の枠を開く（接続した後に難易度の画面より前へ戻ろうとしたキャンセルの入力を飲み込んだとき）。
+    /// 初めの項目は「いいえ」（間違えて決定しても何も起きない側）。
+    /// `held`は開くtickのワード。
     pub fn open_confirm(&mut self, held: u16) {
         self.state = State::Confirm;
         self.cursor = 1;
@@ -2035,7 +2161,7 @@ impl Menu {
         self.opening = on;
     }
 
-    /// 入口（`ui_entry::leaks`）で呼ぶ。`held` はそのときの自分の語（押したままのキーを押した瞬間と読まない）。
+    /// 入口（`ui_entry::leaks`）で呼ぶ。`held`はそのときの自分のワード（押したままのキーを押した瞬間と読まない）。
     pub fn open(&mut self, held: u16) {
         self.state = State::Open;
         self.cursor = 0;
@@ -2054,7 +2180,7 @@ impl Menu {
         self.state != State::Closed
     }
 
-    /// 入口のメニューが開いている（閉じ始め・確認の枠は含まない）。接続した瞬間にこれが真の側は「妖怪 対 妖怪」を選んだものとして待つ。
+    /// 入口のメニューが開いているかどうか（閉じ始め・確認の枠は含まない）。接続した瞬間にこれが真の側は「妖怪 対 妖怪」を選んだものとして待つ。
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
@@ -2062,7 +2188,8 @@ impl Menu {
         )
     }
 
-    /// 観戦の「ランダムマッチ」の一覧の画面か。呼び手はこれが真の間だけ一覧の接続を持ち（偽になったら閉じ）、毎 tick の一覧を `tick_with` / `render_with` へ渡す。
+    /// 観戦の「ランダムマッチ」の一覧の画面かどうか。
+    /// 呼び手はこれが真の間だけ一覧の接続を持つ（偽になったら閉じる）。毎tickの一覧を`tick_with` / `render_with`へ渡す。
     pub fn wants_watch_list(&self) -> bool {
         self.state == State::WatchList
     }
@@ -2073,7 +2200,8 @@ impl Menu {
         self.watch_top = 0;
     }
 
-    /// 一覧の画面のカーソルの位置（0..行数。行数と同じ値は「もどる」）と、表示の先頭の行。副作用なし（`tick` が結果を覚え、`render` が同じ値を使う）。
+    /// 一覧の画面のカーソルの位置（0..行数。行数と同じ値は「もどる」）と表示の先頭の行。
+    /// 副作用なし（`tick`が結果を覚え`render`が同じ値を使う）。
     fn watch_view(&self, rows: &[WatchRow]) -> (usize, usize) {
         let n = rows.len();
         let cursor = match self.watch_sel {
@@ -2097,8 +2225,8 @@ impl Menu {
         (cursor, top)
     }
 
-    /// 一覧の画面の行を作る。題・（8 行を越えるときだけ）上の「ほか N 件」・行・下の「ほか N 件」・「もどる」・キーの行。
-    /// 8 行を越える一覧は、上下の行を空の行でも残して、スクロールしても枠の高さが変わらないようにする。
+    /// 一覧の画面の行を作る。題・（8行を越えるときだけ）上の「ほか N 件」・行・下の「ほか N 件」・「もどる」・キーの行。
+    /// 8行を越える一覧は上下の行を空の行でも残す。スクロールしても枠の高さが変わらないようにするため。
     fn render_watch_list(&self, rows: &mut MenuRows, watch: &WatchSnapshot) {
         let lang = self.lang;
         let list = watch.rows();
@@ -2165,12 +2293,12 @@ impl Menu {
         rows.next(RowStyle::Hint).push_str(T_KEYS_WATCH.get(lang));
     }
 
-    /// 一覧の画面を 1 tick 進める。↑↓ は選べる行（満員でない行と「もどる」）だけを回る。
+    /// 一覧の画面を1 tick進める。↑↓ は選べる行（満員でない行と「もどる」）だけを回る。
     fn tick_watch_list(&mut self, pressed: u16, rows: &[WatchRow], out: &mut TickOut) {
         let n = rows.len();
         let (cursor, top) = self.watch_view(rows);
         self.watch_top = top;
-        // 動かしていない間は、一覧が変わっても「選べる最初の行」を指し続ける。動かしたら行の中身で覚える。
+        // 動かしていない間は一覧が変わっても「選べる最初の行」を指し続ける。動かしたら行の中身で覚える。
         let sel_of = |idx: usize| match rows.get(idx) {
             Some(r) => WatchSel::Row(r.hash),
             None => WatchSel::Back,
@@ -2218,7 +2346,8 @@ impl Menu {
         self.shape
     }
 
-    /// 遅延の初めの値を auto にする（ini の `delay = auto` か、書いていない）。メニューで変えたことにはしない（見張りへ指示は出さない。名乗る形は ini のまま）。
+    /// 遅延の初めの値をautoにする（iniの`delay = auto`か書いていない）。
+    /// メニューで変えたことにはしない（監視の処理へ指示は出さない。名乗る形はiniのまま）。
     pub fn with_start_auto(mut self, auto: bool) -> Menu {
         if auto {
             self.shape.delay = DelayChoice::Auto;
@@ -2244,7 +2373,7 @@ impl Menu {
                 n += 1;
             }
         };
-        // プレイヤー名・サイドは何も待っていない間だけ（待ちの中に変えても、その待ちには効かない）。ネットワークを開いている最中も出さない。
+        // プレイヤー名・サイドは何も待っていない間だけ（待ちの中に変えてもその待ちには効かない）。ネットワークを開いている最中も出さない。
         let idle = state == CodeState::Idle && !self.opening;
         // 「設定」の画面。並びは プレイヤー名・サイド・同期方式・ディレイ・言語・もどる。待ちの間も開ける。
         if self.state == State::Settings {
@@ -2260,7 +2389,7 @@ impl Menu {
             push(Item::Back);
             return (v, n);
         }
-        // LAN の待ち・接続の途中は「設定」「待機をやめる」「もどる」だけ（待ちを動かしたまま別の経路を始める半端な状態を作らない）。
+        // LANの待ち・接続の途中は「設定」「待機をやめる」「もどる」だけ（待ちを動かしたまま別の経路を始める半端な状態を作らない）。
         if state.is_lan() {
             push(Item::Settings);
             push(Item::Cancel);
@@ -2282,8 +2411,8 @@ impl Menu {
             push(Item::Back);
             return (v, n);
         }
-        // 対戦の「ランダムマッチ」「ルームマッチ」と、観戦の「ルームマッチ」は ini に `room_server` があるときだけ。対戦の2つは待っている間も出して、選び直せる。
-        // 観戦・LAN は何かを待っている間は出さない: 項目が増えて枠が 480 画素の画面を越えるのを避けるのと、待ちを動かしたまま観戦者のセッションへ替わる半端な状態を作らないため。
+        // 対戦の「ランダムマッチ」「ルームマッチ」と観戦の「ルームマッチ」はiniに`room_server`があるときだけ。対戦の2つは待っている間も出すので選び直せる。
+        // 観戦・LANは何かを待っている間は出さない。項目が増えて枠が480画素の画面を越えるのを避けるためと、待ちを動かしたまま観戦者のセッションへ替わる半端な状態を作らないため。
         // ルーム名の行は対戦の「ルームマッチ」の下。何も待っていない間だけ。
         if self.room != RoomItem::Off {
             push(Item::Random);
@@ -2298,11 +2427,11 @@ impl Menu {
         }
         push(Item::Create);
         push(Item::Paste);
-        // 観戦コードと LAN はルームサーバーを使わない（サーバーに接続できないときの口）ので、`room_server` が無くても出す。
+        // 観戦コードとLANはルームサーバーを使わない（サーバーに接続できないときの代わりの手段）ので`room_server`が無くても出す。
         if state == CodeState::Idle {
             push(Item::SpectateCode);
         }
-        // LAN は、ネットワークを開いている最中は出さない（LAN の接続は自分でネットワークを開くので、開き終えるのを待つ）。
+        // LANはネットワークを開いている最中は出さない（LANの接続は自分でネットワークを開くので開き終えるのを待つ）。
         if idle {
             push(Item::LanHost);
             push(Item::LanClient);
@@ -2317,7 +2446,7 @@ impl Menu {
     }
 
     /// 今の項目の並びに合わせたカーソルの位置。開いた直後は先頭の項目へ合わせる（プレイヤー名が既定のまま最初に開いたときだけ「設定」）。
-    /// 行が出入りしたときは、前に指していた項目の今の位置へ動かして、同じ項目に残す（その項目が消えたら元の位置の近く）。
+    /// 行が出入りしたときは前に指していた項目の今の位置へ動かして同じ項目に残す（その項目が消えたら元の位置の近く）。
     fn settled_cursor(&self, items: &Items) -> usize {
         let (list, n) = items;
         let last = n.saturating_sub(1);
@@ -2342,7 +2471,7 @@ impl Menu {
         self.tick_with(i, &WatchSnapshot::EMPTY)
     }
 
-    /// `watch` は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
+    /// `watch`は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
     pub fn tick_with(&mut self, i: &TickIn, watch: &WatchSnapshot) -> TickOut {
         let word = i.word;
         let pressed = word & !self.prev;
@@ -2410,12 +2539,13 @@ impl Menu {
                     self.state = State::Closing(0);
                     return out;
                 }
-                // やめる（Esc。パッドの Esc のボタンも同じ語）。Z・X は文字なので決定・取消にしない。文字（`i.text`）より先に見る: 同じ tick に Esc と文字が来ても、やめるが勝つ。
+                // やめる（Esc。パッドのEscのボタンも同じワード）。Z・Xは文字なので決定にもキャンセルにもしない。
+                // 文字（`i.text`）より先に見る。同じtickにEscと文字が来ても「やめる」が勝つ。
                 if pressed & keys::ESC != 0 {
                     self.end_room_input();
                     return out;
                 }
-                // この tick の文字は、前の tick までに離したのを見た Enter だけを決定にする（離した tick に届く文字は、押している間に生まれた文字の最後の 1 つかもしれない）。
+                // このtickの文字は前のtickまでに離したのを見たEnterだけを決定にする（離したtickに届く文字は押している間に生まれた文字の最後の1つかもしれない）。
                 let armed = self.enter_armed;
                 if word & DECIDE_BITS == 0 {
                     self.enter_armed = true;
@@ -2428,7 +2558,7 @@ impl Menu {
                             self.edit.feed(unit)
                         }
                     };
-                    // 使えない文字の一言は、次に何か受けたら消す。同じ tick の中は後に来たものが勝つ。
+                    // 使えない文字の通知は次に何か受けたら消す。同じtickの中は後に来たものが勝つ。
                     self.edit_dropped = edit == Edit::Rejected;
                     match edit {
                         Edit::Nothing | Edit::Rejected => {}
@@ -2443,7 +2573,7 @@ impl Menu {
                             }
                             match self.addr_edit.text().parse_with(&self.vpn) {
                                 Ok(addr) => {
-                                    // 次に打つときの初めの値は、今決めたアドレス（ini の値より新しい）。
+                                    // 次に打つときの初めの値は今決定したアドレス（iniの値より新しい）。
                                     self.lan_addr = addr.to_buf();
                                     out.cmd = Some(if self.edit_for == EditFor::LanClient {
                                         Cmd::LanClient(addr)
@@ -2472,21 +2602,23 @@ impl Menu {
                         }
                         Edit::Enter => {
                             if !armed {
-                                // 入力を開いた Enter（まだ押されている）の文字、またはその自動繰り返し。
+                                // 入力を開いたEnter（まだ押されている）の文字またはその自動繰り返し。
                                 continue;
                             }
                             match self.edit.text().parse() {
-                                Ok(_) => {
-                                    let name = *self.edit.text();
-                                    // 次の「ルームマッチ」の名は、今決めた名（ini や前回の名より新しい）。
+                                Ok(decided) => {
+                                    // 前後の空白は除いた名を持ち回る（iniにも空白が残らない）。
+                                    let name = RoomBuf::from_name(decided.as_str())
+                                        .unwrap_or(*self.edit.text());
+                                    // 次の「ルームマッチ」の名は今決定した名（iniや前回の名より新しい）。
                                     self.room = RoomItem::On(name);
                                     out.cmd = match self.edit_for {
-                                        // 名前の入力の Enter は上の枠が先に受ける（ここへは来ない）。
+                                        // 名前の入力のEnterは上の枠が先に受ける（ここへは来ない）。
                                         EditFor::Wait | EditFor::Name => Some(Cmd::Room(name)),
-                                        // アドレスの入力の Enter は上の枠が先に受ける（ここへは来ない）。
+                                        // アドレスの入力のEnterは上の枠が先に受ける（ここへは来ない）。
                                         EditFor::LanClient | EditFor::LanWatch => None,
                                         EditFor::Spectate => Some(Cmd::Spectate(name)),
-                                        // 設定の「ルーム名」はルームへは入らない。決めた名を覚える指示だけ出す。
+                                        // 設定の「ルーム名」はルームへは入らない。決定した名を覚える指示だけ出す。
                                         EditFor::RoomSet => Some(Cmd::RoomSet(name)),
                                     };
                                     self.end_room_input();
@@ -2646,12 +2778,12 @@ impl Menu {
         }
     }
 
-    /// 開いているメニューの行を作る（毎 tick か、行が変わりうるときに呼ぶ）。`now` は UNIX 秒。
+    /// 開いているメニューの行を作る（毎tickか行が変わりうるときに呼ぶ）。`now`はUNIX秒。
     pub fn render(&self, conn: Conn, note: &Note, now: u64, rows: &mut MenuRows) {
         self.render_with(conn, note, now, rows, &WatchSnapshot::EMPTY);
     }
 
-    /// `watch` は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
+    /// `watch`は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
     pub fn render_with(
         &self,
         conn: Conn,
@@ -2754,7 +2886,7 @@ impl Menu {
                 EditFor::Spectate => T_SPECTATE.get(lang),
                 EditFor::RoomSet => T_ROOM_NAME.get(lang),
                 EditFor::Name => T_NAME.get(lang),
-                // LAN のアドレスの入力は上で描いて戻る（ここへは来ない）。
+                // LANのアドレスの入力は上で描いて戻る（ここへは来ない）。
                 EditFor::LanClient | EditFor::LanWatch => T_GROUP_LAN.get(lang),
             });
             rows.next(RowStyle::Normal);
@@ -2797,22 +2929,22 @@ impl Menu {
             if item.group() != group {
                 group = item.group();
                 match group {
-                    // 見出しの前は、上に項目があるときだけ中くらいの隙間で離す。
+                    // 見出しの前は上に項目があるときだけ中くらいの隙間で離す。
                     Some(g) => {
                         if i > 0 {
                             rows.next(RowStyle::GapMedium);
                         }
                         rows.next(RowStyle::Title).push_str(g.text(lang));
                     }
-                    // 見出しの付かない項目（待機をやめる・もどる）は、上に項目があるときだけ小さい隙間で離す
-                    // （観戦コードの行を足しても枠が画面の高さに収まるよう、中くらいから詰めた）。
+                    // 見出しの付かない項目（待機をやめる・もどる）は上に項目があるときだけ小さい隙間で離す。
+                    // 観戦コードの行を足しても枠が画面の高さに収まるよう、中くらいから詰めた。
                     None if i > 0 => {
                         rows.next(RowStyle::GapSmall);
                     }
                     None => {}
                 }
             }
-            // 同じ見出しの「ラベル　値」の行は、値の始まりを揃える。
+            // 同じ見出しの「ラベル　値」の行は値の始まりを揃える。
             let label_cells = items
                 .iter()
                 .take(n)
@@ -2939,7 +3071,7 @@ impl Menu {
                 k = n.lines(lang, &mut status);
                 warn.iter_mut().take(k).for_each(|w| *w = true);
             }
-            // 名前を決めていない間は、入口のメニューの下に案内を出し続ける。
+            // 名前が未決定の間は入口のメニューの下に案内を出し続ける。
             if conn == Conn::Waiting
                 && self.state != State::Settings
                 && self.name_is_default()
@@ -2956,7 +3088,7 @@ impl Menu {
                 let style = if w { RowStyle::Warn } else { RowStyle::Normal };
                 rows.next(style).push_str(l.as_str());
             }
-            // スクロールしても枠の高さが変わらないよう、上下の行は 0 件でも空のまま残す。
+            // スクロールしても枠の高さが変わらないよう上下の行は0件でも空のまま残す。
             let n = lan_scroll_len(conn, note);
             if n > 0 {
                 let top = lan_view(n, addr_row, self.lan_top);
@@ -2977,10 +3109,21 @@ impl Menu {
         }
         rows.next(RowStyle::GapMedium);
         rows.next(RowStyle::Hint).push_str(T_KEYS.get(lang));
+        // 行が全部埋まる場合（枠が画面の高さに近い）には出さない。
+        let mut notice = [LineBuf::new(); UPDATE_NOTICE_LINES];
+        if rows.len + 1 + UPDATE_NOTICE_LINES <= MENU_ROWS {
+            let k = update_notice_lines(self.update, lang, &mut notice);
+            if k > 0 {
+                rows.next(RowStyle::GapMedium);
+                for l in notice.iter().take(k) {
+                    rows.next(RowStyle::Notice).push_str(l.as_str());
+                }
+            }
+        }
     }
 }
 
-/// 上下の「▲ ほか N 件」の行（0 件なら空のまま。枠の高さを変えないために、呼び手は行そのものを残す）。
+/// 上下の「▲ ほか N 件」の行（0件なら空のまま。枠の高さを変えないために呼び手は行そのものを残す）。
 fn push_more(line: &mut LineBuf, lang: Lang, open: Tx, count: usize) {
     if count > 0 {
         line.push_str("  ")
@@ -2990,7 +3133,7 @@ fn push_more(line: &mut LineBuf, lang: Lang, open: Tx, count: usize) {
     }
 }
 
-/// LAN の待機のアドレスの行が `LAN_VISIBLE` を越えてスクロールになるときの、アドレスの数。越えなければ 0。
+/// LANの待機のアドレスの行が`LAN_VISIBLE`を越えてスクロールになるときの、アドレスの数。越えなければ0。
 fn lan_scroll_len(conn: Conn, note: &Note) -> usize {
     let n = usize::from(note.lan_n);
     if conn == Conn::Waiting && note.state == CodeState::LanWaiting && n > LAN_VISIBLE {
@@ -3000,7 +3143,7 @@ fn lan_scroll_len(conn: Conn, note: &Note) -> usize {
     }
 }
 
-/// アドレス `n` 個のウィンドウの先頭の行。カーソルの行がウィンドウに入るようにする。
+/// アドレス`n`個のウィンドウの先頭の行。カーソルの行がウィンドウに入るようにする。
 fn lan_view(n: usize, row: Option<usize>, top: usize) -> usize {
     let mut top = top.min(n.saturating_sub(LAN_VISIBLE));
     if let Some(r) = row {
@@ -3018,8 +3161,9 @@ fn watch_first_selectable(rows: &[WatchRow]) -> usize {
     rows.iter().position(|r| !r.is_full()).unwrap_or(rows.len())
 }
 
-/// 一覧の 1 行の本文: 「1P 名 vs 2P 名　観戦者の数/上限」。名前は `WATCH_NAME_CELLS` 文字の欄に左寄せ（越える分は切る）、
-/// 数は右寄せで 5 文字（「10/10」）。名前は英数字と `- _ @ ?` だけ（`WatchName`）なので、欄の幅は文字数のままで揃う。
+/// 一覧の1行の本文: 「1P 名 vs 2P 名　観戦者の数/上限」。名前は`WATCH_NAME_CELLS`文字のフィールドに左寄せ（越える分は切る）。
+/// 数は右寄せで5文字（「10/10」）。
+/// 名前はASCIIだけ（`WatchName`）なので、フィールドの幅は文字数のままで揃う。
 fn watch_row_text(line: &mut LineBuf, r: &WatchRow, lang: Lang) {
     for (i, name) in [r.p1, r.p2].into_iter().enumerate() {
         if i == 1 {
@@ -3051,8 +3195,8 @@ fn watch_row_text(line: &mut LineBuf, r: &WatchRow, lang: Lang) {
         .push_u32(u32::from(r.cap));
 }
 
-/// 待ちを始めた行（その行の右に「待機中 0:42」を出す）と、待った秒。ランダムマッチ・ルームマッチ・コード作成（返す側はコード入力）。
-/// 観戦の待ちは観戦の行が待ちの間は出ないので対象にしない。時計は左上の行と同じ値。
+/// 待ちを始めた行（その行の右に「待機中 0:42」を出す）と待った秒。対象はランダムマッチ・ルームマッチ・コード作成（返答する側はコード入力）。
+/// 観戦の行は待ちの間は出ないので観戦の待ちは対象にしない。時計は左上の行と同じ値。
 fn wait_origin(note: &Note, now: u64) -> Option<(Item, u64)> {
     match note.state {
         CodeState::RoomJoining | CodeState::RoomWaiting | CodeState::RoomLinking => {
@@ -3075,9 +3219,9 @@ fn wait_origin(note: &Note, now: u64) -> Option<(Item, u64)> {
     }
 }
 
-/// 「ラベル」の後ろに、見出しの中でいちばん長いラベル（`widest` 枠）との差を空白で埋め、区切りを入れる。
-/// 全角の文字のラベルは全角の空白（2 枠）、半角のラベルは半角の空白（1 枠）で埋める: どちらも文字と同じ幅で進むので、
-/// ゲームの文字（半角 9 画素）でも GDI の文字（半角 7 画素）でも値の始まりが揃う。
+/// 「ラベル」の後ろに見出しの中でいちばん長いラベル（`widest`枠）との差を空白で埋めて、区切りを追加する。
+/// 全角の文字のラベルは全角の空白（2枠）で埋め、半角のラベルは半角の空白（1枠）で埋める。
+/// どちらも文字と同じ幅で進むので、ゲームの文字（半角9画素）でもGDIの文字（半角7画素）でも値の始まりが揃う。
 fn push_label(line: &mut LineBuf, lang: Lang, label: Tx, widest: u32) {
     let text = label.get(lang);
     line.push_str(text);
@@ -3135,15 +3279,15 @@ fn time_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64) {
         .push_clock(remain);
 }
 
-/// （自分のコードを作ってから経った秒, 有効期限までの残りの秒）。時計が戻っても 0 で止める。
+/// （自分のコードを作ってから経った秒, 有効期限までの残りの秒）。時計が戻っても0で止める。
 fn times(note: &Note, now: u64) -> (u64, u64) {
-    // `since` は UNIX 秒の下位 32 ビット。差は 32 ビットで取る（2106 年の桁あふれを跨いでも差は合う）。
+    // `since`はUNIX秒の下位32ビット。差は32ビットで取る（2106年の桁あふれを跨いでも差は合う）。
     let waited = u64::from((now as u32).wrapping_sub(note.since));
     let waited = if waited > 86_400 { 0 } else { waited };
     (waited, DEFAULT_TTL_SECS.saturating_sub(waited))
 }
 
-/// 出来事の文（最大 3 行。貼った文字数・文・次にすること）を `out` の先最初から書く。戻りは行数。
+/// イベントの文（最大3行。貼った文字数・文・次にすること）を`out`の先頭から書く。戻りは行数。
 fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) -> usize {
     let ev = note.event;
     let mut n = 0;
@@ -3229,7 +3373,7 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
         Event::Expired => {
             line(&mut |l| {
                 l.push_str(T_EXPIRED_OPEN.get(lang));
-                // 期限の長さは `DEFAULT_TTL_SECS` から作る（数字を文字にコピーすると、期限を変えたときに文だけ古いままになる）。
+                // 期限の長さは`DEFAULT_TTL_SECS`から作る（数字を文字にコピーすると期限を変えたときに文だけ古いままになる）。
                 push_span(l, lang, DEFAULT_TTL_SECS);
                 l.push_str(T_EXPIRED_CLOSE.get(lang));
             });
@@ -3383,10 +3527,10 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
                     });
             });
         }
-        Event::RoomFull | Event::RoomRefused => {
+        Event::RoomInUse | Event::RoomRefused => {
             line(&mut |l| {
-                l.push_str(if ev == Event::RoomFull {
-                    T_ROOM_FULL.get(lang)
+                l.push_str(if ev == Event::RoomInUse {
+                    T_ROOM_IN_USE.get(lang)
                 } else {
                     T_ROOM_REFUSED.get(lang)
                 });
@@ -3415,7 +3559,7 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
                 });
             });
         }
-        // 観戦者の失敗は 2 行（理由と、次にすること 1 つ）。ルーム名は出さない。
+        // 観戦者の失敗は2行（理由と次にすること1つ）。ルーム名は出さない。
         Event::SpectatePeer => line(&mut |l| spectate_peer_line(l, lang, note)),
         Event::SpectateUnresponsive => {
             line(&mut |l| {
@@ -3449,7 +3593,7 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
         }
         Event::SpectateGaveUp => {
             line(&mut |l| {
-                // 長さは待つ上限（`JOINER_GIVE_UP_MS`）から作る（数字を文字にコピーすると、上限を変えたときに文だけ古いままになる）。
+                // 長さは待つ上限（`JOINER_GIVE_UP_MS`）から作る（数字を文字にコピーすると上限を変えたときに文だけ古いままになる）。
                 l.push_str(T_SPECTATE_GAVE_UP_OPEN.get(lang));
                 push_span(l, lang, JOINER_GIVE_UP_MS / 1000);
                 l.push_str(T_SPECTATE_GAVE_UP_TAIL.get(lang));
@@ -3614,8 +3758,8 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
     n
 }
 
-/// LAN のホストの待機の状況の行: 説明 1 行と、自分の LAN のアドレス（1 つにつき 1 行）。
-/// アドレスが `LAN_VISIBLE` を越えるときは説明だけで、アドレスの行は `Menu::render_with` がスクロールの形で足す。
+/// LANのホストの待機の状況の行: 説明1行と自分のLANのアドレス（1つにつき1行）。
+/// アドレスが`LAN_VISIBLE`を越えるときは説明だけを出す。アドレスの行は`Menu::render_with`がスクロールの形で足す。
 fn lan_waiting_lines(
     note: &Note,
     lang: Lang,
@@ -3646,7 +3790,7 @@ fn lan_waiting_lines(
     }
 }
 
-/// `192.168.0.10:17723`。VPN のツールのアドレスは、ポートの後ろにツールの名前（`26.1.2.3:17723（Radmin）`）。
+/// `192.168.0.10:17723`。VPNのツールのアドレスはポートの後ろにツールの名前（`26.1.2.3:17723（Radmin）`）。
 fn push_lan_addr(l: &mut LineBuf, ip: &[u8; 4], port: u16, tool: Option<VpnTool>, lang: Lang) {
     for (i, o) in ip.iter().enumerate() {
         if i > 0 {
@@ -3686,10 +3830,13 @@ fn room_name_why_line(l: &mut LineBuf, lang: Lang, why: RoomNameWhy) {
         RoomNameWhy::NotAscii => {
             l.push_str(T_ROOM_NAME_ASCII.get(lang));
         }
+        RoomNameWhy::Reserved => {
+            l.push_str(T_ROOM_NAME_RESERVED.get(lang));
+        }
     }
 }
 
-/// 文字の枠の数（`overlay::glyph_cells` の const の形。ASCII は 1、ほかは 2 と多めに見積もる）。
+/// 文字の枠の数（`overlay::glyph_cells`のconstの形。ASCIIは1・ほかは2と多めに見積もる）。
 const fn cells_of(s: &str) -> u32 {
     let b = s.as_bytes();
     let mut i = 0;
@@ -3705,8 +3852,8 @@ const fn cells_of(s: &str) -> u32 {
     n
 }
 
-/// 左上の「待機中」の行（マッチ中の行と同じ置き場。`ui_layout::HUD_TEXT_MAX_W` = 282 画素 = 半角 40 枠）で、ルーム名に残る文字の枠の数（半角 1・全角 2）。
-/// 固定の文字（先頭 `open`・尾 `close`・空白 1・時計 `clock` 枠）を引いた残りで、言語ごとに違う。
+/// 左上の「待機中」の行（マッチ中の行と同じ置き場。`ui_layout::HUD_TEXT_MAX_W` = 282画素 = 半角40枠）でルーム名に残る文字の枠の数（半角1・全角2）。
+/// 固定の文字（先頭`open`・尾`close`・空白1・時計`clock`枠）を引いた残りで言語ごとに違う。
 const fn band_name_cells(open: Tx, close: Tx, clock: u32, lang: Lang) -> u32 {
     crate::ui_layout::HUD_TEXT_MAX_W / crate::ui_layout::HUD_CELL_W
         - cells_of(open.get(lang))
@@ -3715,14 +3862,16 @@ const fn band_name_cells(open: Tx, close: Tx, clock: u32, lang: Lang) -> u32 {
         - clock
 }
 
-/// 待機中の時計の上限（9999:59。7 文字）。これを越えて待っても、行が幅を越えて時計の末尾が切れない（約 166 時間）。
+/// 待機中の時計の上限（9999:59。7文字）。これを越えて待っても行が幅を越えないので時計の末尾は切れない（約166時間）。
 const WAIT_CLOCK_MAX_SECS: u64 = 9999 * 60 + 59;
-/// 「ルーム 名前 で待機中 12:34」の名前に残る枠の数。ふつうのルーム名（ASCII。`ROOM_UNITS` = 16 文字）は全部出る。
+/// 「ルーム 名前 で待機中 12:34」の名前に残る枠の数。ふつうのルーム名（ASCII。`ROOM_UNITS` = 16文字）は全部出る。
 const fn room_band_cells(lang: Lang) -> u32 {
     band_name_cells(T_ROOM_OPEN, T_ROOM_WAITING_CLOSE, 7, lang)
 }
 
-/// 「ルーム 名前 で待機中 12:34」（ルームで待ち始めてから経った時間 `Note::since` から。時計が戻っても 0 で止める）。名前は `name_cells` 枠を越えるなら末尾を「…」にする（左上の 1 行は幅が狭い。メニューの中は幅に余裕があるので全部出す — `u32::MAX`）。
+/// 「ルーム 名前 で待機中 12:34」（ルームで待ち始めてから経った時間`Note::since`から。時計が戻っても0で止める）。
+/// 名前が`name_cells`枠を越えるときは末尾を「…」にする。
+/// 左上の1行は幅が狭いので切り、メニューの中は幅に余裕があるので全部出す（`u32::MAX`）。
 fn room_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, name_cells: u32) {
     line.clear().push_str(T_ROOM_OPEN.get(lang));
     push_units_within(line, &note.room, name_cells);
@@ -3731,7 +3880,7 @@ fn room_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, name
         .push_clock(room_waited(note, now));
 }
 
-/// 「ランダムマッチで待機中 12:34」（時計は待ち始めてから経った時間 `Note::since`。ルーム名は無いので、左上の幅に収まる）。
+/// 「ランダムマッチで待機中 12:34」（時計は待ち始めてから経った時間`Note::since`。ルーム名は無いので左上の幅に収まる）。
 fn random_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64) {
     line.clear()
         .push_str(T_RANDOM_WAITING.get(lang))
@@ -3739,14 +3888,16 @@ fn random_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64) {
         .push_clock(room_waited(note, now));
 }
 
-/// 観戦の待ちの行の時計の上限（99:59。5 文字）。観戦者は 30 分（`JOINER_GIVE_UP_MS`）で諦めるので越えない。幅を `ROOM_BAND_CELLS` の行より取るので、時計の文字数を 7 から 5 に絞って名前の枠を稼ぐ。
+/// 観戦の待ちの行の時計の上限（99:59。5文字）。観戦者は30分（`JOINER_GIVE_UP_MS`）で諦めるので越えない。
+/// 観戦の行は`ROOM_BAND_CELLS`の行より幅を取る。
+/// そのため時計の文字数を7から5に絞って名前の枠を確保する。
 const SPECTATE_CLOCK_MAX_SECS: u64 = 99 * 60 + 59;
 /// 左上の「観戦 名前 で待機中 m:ss」の行の名前に残る枠の数（長い名前は「…」で切る。メニューの中は全部出す）。
 const fn spectate_band_cells(lang: Lang) -> u32 {
     band_name_cells(T_SPECTATE_OPEN, T_ROOM_WAITING_CLOSE, 5, lang)
 }
 
-/// 言語ごとに、名前の枠がルーム名（`ROOM_UNITS` 文字）を入れられる。
+/// 言語ごとに名前の枠にルーム名（`ROOM_UNITS`文字）が収まる。
 const _: () = {
     let mut i = 0;
     while i < Lang::ALL.len() {
@@ -3774,7 +3925,7 @@ fn spectate_peer_line(line: &mut LineBuf, lang: Lang, note: &Note) {
     line.push_str(T_SPECTATE_PEER_CLOSE.get(lang));
 }
 
-/// 「観戦 名前 で待機中 12:34」（観戦者が、配る側（対戦する側）がルームに来るのを待つ間。時計は待った時間 `Note::since` から）。名前の切り方は `room_waiting_line` と同じ。
+/// 「観戦 名前 で待機中 12:34」（配信側（対戦する側）がルームに来るのを観戦者が待つ間。時計は待った時間`Note::since`から）。名前の切り方は`room_waiting_line`と同じ。
 fn spectate_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, name_cells: u32) {
     line.clear().push_str(T_SPECTATE_OPEN.get(lang));
     push_units_within(line, &note.room, name_cells);
@@ -3783,8 +3934,11 @@ fn spectate_waiting_line(line: &mut LineBuf, lang: Lang, note: &Note, now: u64, 
         .push_clock(room_waited(note, now).min(SPECTATE_CLOCK_MAX_SECS));
 }
 
-/// 観戦者の状態（`spectate_room::Joiner::status`）を、メニューが読む状態にする（見張りが `Note::state` に書く）。配る側（対戦する側）がまだルームにいなくて入り直しを待つ間は `SpectateWaiting`、
-/// 観戦用のコードを受けて配る側へ返しを出した後と成功（セッションが対戦する側へ接続しに行く間）は `SpectateLinking`、それまでは `SpectateJoining`。終わった（失敗・やめた）後は `SpectateIdle`（セッションを元へ戻せたなら呼び手が `Idle` に戻す）。
+/// 観戦者の状態（`spectate_room::Joiner::status`）を、メニューが読む状態にする（監視の処理が`Note::state`に書く）。
+/// 配信側（対戦する側）がまだルームにいなくて入り直しを待つ間は`SpectateWaiting`。
+/// 観戦用のコードを受けて配信側へ返答を出した後と成功（セッションが対戦する側へ接続しに行く間）は`SpectateLinking`。
+/// それまでは`SpectateJoining`。
+/// 終わった後（失敗・中止）は`SpectateIdle`（セッションを元へ戻せたなら呼び手が`Idle`に戻す）。
 pub fn spectate_state_of(s: &JoinerStatus) -> CodeState {
     if s.waiting_for_caster() {
         return CodeState::SpectateWaiting;
@@ -3798,7 +3952,9 @@ pub fn spectate_state_of(s: &JoinerStatus) -> CodeState {
     }
 }
 
-/// 観戦者が失敗で終わった理由を、画面の出来事と、バージョン違いのときの相手のバージョン（`Note::peer_ver`）・ビルド違いのときの相手のビルド（`Note::peer_build`）にする（違い以外は 0）。見張りが `Note::event` に書く。
+/// 観戦者が失敗で終わった理由を、画面のイベントと相手のバージョン・ビルドにする。
+/// バージョン違いのときは相手のバージョン（`Note::peer_ver`）、ビルド違いのときは相手のビルド（`Note::peer_build`）。違い以外は0。
+/// 監視の処理が`Note::event`に書く。
 pub fn spectate_failure_event(f: JoinerFailure) -> (Event, u8, u32) {
     use crate::code::CodeError;
     match f {
@@ -3817,7 +3973,9 @@ pub fn spectate_failure_event(f: JoinerFailure) -> (Event, u8, u32) {
     }
 }
 
-/// ルームで待ち始めてから経った秒（`WAIT_CLOCK_MAX_SECS` で止める）。`since` は UNIX 秒の下位 32 ビットで、差は 32 ビットで取る。待つ長さに上限は無い（自動で入り直して待ち続ける）ので 1 日を越えても 0 にしない。時計が戻った（差が 32 ビットの半分を越える）ときだけ 0。
+/// ルームで待ち始めてから経った秒（`WAIT_CLOCK_MAX_SECS`で止める）。`since`はUNIX秒の下位32ビット。差は32ビットで取る。
+/// 待つ長さに上限は無い（自動で入り直して待ち続ける）。そのため1日を越えても0にしない。
+/// 時計が戻った（差が32ビットの半分を越える）ときだけ0。
 fn room_waited(note: &Note, now: u64) -> u64 {
     let waited = (now as u32).wrapping_sub(note.since);
     let waited = if waited > i32::MAX as u32 {
@@ -3828,7 +3986,40 @@ fn room_waited(note: &Note, now: u64) -> u64 {
     waited.min(WAIT_CLOCK_MAX_SECS)
 }
 
-/// 「相手と HiganRTool のバージョンが違います（自分 2・相手 1）。」（`mine` は自分のバージョン）。
+/// 新しいバージョンの知らせの行数。
+pub const UPDATE_NOTICE_LINES: usize = 2;
+
+/// 新しいバージョンの知らせの文を`out`へ作る。見つかっていなければ0、あれば`UPDATE_NOTICE_LINES`。
+pub fn update_notice_lines(
+    found: Found,
+    lang: Lang,
+    out: &mut [LineBuf; UPDATE_NOTICE_LINES],
+) -> usize {
+    let Found::Newer(version) = found else {
+        return 0;
+    };
+    let [first, second] = out;
+    first.clear();
+    match version.map(Version::parts) {
+        Some((major, minor, patch)) => {
+            first
+                .push_str(T_UPDATE_NEW_OPEN.get(lang))
+                .push_u32(major)
+                .push_char('.')
+                .push_u32(minor)
+                .push_char('.')
+                .push_u32(patch)
+                .push_str(T_UPDATE_NEW_CLOSE.get(lang));
+        }
+        None => {
+            first.push_str(T_UPDATE_NEW_NO_VER.get(lang));
+        }
+    }
+    second.clear().push_str(T_UPDATE_HOW.get(lang));
+    UPDATE_NOTICE_LINES
+}
+
+/// 「相手と HiganRTool のバージョンが違います（自分 2・相手 1）。」（`mine`は自分のバージョン）。
 pub fn other_version_line(line: &mut LineBuf, lang: Lang, mine: u8, theirs: u8) {
     line.clear()
         .push_str(T_OTHER_VER_OPEN.get(lang))
@@ -3838,19 +4029,19 @@ pub fn other_version_line(line: &mut LineBuf, lang: Lang, mine: u8, theirs: u8) 
         .push_str(T_OTHER_VER_CLOSE.get(lang));
 }
 
-/// バージョン違いの 2 行を 1 つの文字列にしたもの。ゲームのスレッドでは呼ばない（`String` を作る）。
+/// バージョン違いの2行を1つの文字列にしたもの。ゲームのスレッドでは呼ばない（`String`を作る）。
 pub fn other_version_text_in(lang: Lang, mine: u8, theirs: u8) -> String {
     let mut l = LineBuf::new();
     other_version_line(&mut l, lang, mine, theirs);
     format!("{}{}", l.as_str(), T_OTHER_VER_NEXT.get(lang))
 }
 
-/// `other_version_text_in` の日本語（本ログ・試験のまとめ・peer_sim の記録。ログは言語を切り替えない）。
+/// `other_version_text_in`の日本語（本ログ・試験のまとめ・peer_simの記録。ログは言語を切り替えない）。
 pub fn other_version_text(mine: u8, theirs: u8) -> String {
     other_version_text_in(Lang::Ja, mine, theirs)
 }
 
-/// ビルド番号を画面の形で足す: 日本の時刻の `YYYYMMDD-HHMM`（`update::build_stamp`）。0（開発用）は「開発版」。確保しない。
+/// ビルド番号を画面の形で足す: 日本の時刻の`YYYYMMDD-HHMM`（`update::build_stamp`）。0（開発用）は「開発版」。確保しない。
 pub fn push_build(line: &mut LineBuf, lang: Lang, build: u32) {
     let Some((y, mo, d, h, mi)) = crate::update::build_stamp(build) else {
         line.push_str(T_BUILD_DEV.get(lang));
@@ -3872,7 +4063,7 @@ pub fn push_build(line: &mut LineBuf, lang: Lang, build: u32) {
     }
 }
 
-/// 「相手とバージョンが違います（自分 20261008-2100・相手 開発版）。」（`mine` は自分のビルド）。
+/// 「相手とバージョンが違います（自分 20261008-2100・相手 開発版）。」（`mine`は自分のビルド）。
 pub fn other_build_line(line: &mut LineBuf, lang: Lang, mine: u32, theirs: u32) {
     line.clear().push_str(T_OTHER_BUILD_OPEN.get(lang));
     push_build(line, lang, mine);
@@ -3881,19 +4072,20 @@ pub fn other_build_line(line: &mut LineBuf, lang: Lang, mine: u32, theirs: u32) 
     line.push_str(T_OTHER_VER_CLOSE.get(lang));
 }
 
-/// ビルド違いの 2 行を 1 つの文字列にしたもの。ゲームのスレッドでは呼ばない。
+/// ビルド違いの2行を1つの文字列にしたもの。ゲームのスレッドでは呼ばない。
 pub fn other_build_text_in(lang: Lang, mine: u32, theirs: u32) -> String {
     let mut l = LineBuf::new();
     other_build_line(&mut l, lang, mine, theirs);
     format!("{}{}", l.as_str(), T_OTHER_VER_NEXT.get(lang))
 }
 
-/// `other_build_text_in` の日本語（`other_version_text` と同じ使い経路）。
+/// `other_build_text_in`の日本語（`other_version_text`と同じ使い方）。
 pub fn other_build_text(mine: u32, theirs: u32) -> String {
     other_build_text_in(Lang::Ja, mine, theirs)
 }
 
-/// 「30 分」（`code::span_text` と同じ文字。ASCII の数字と「分」「秒」）。毎 tick 組む行にも使うので確保しない。2 つが同じ文字を出すことは `the_span_matches_the_code_text` が縛る。
+/// 「30 分」（`code::span_text`と同じ文字。ASCIIの数字と「分」「秒」）。毎tick組む行にも使うので確保しない。
+/// 2つが同じ文字を出すことは`the_span_matches_the_code_text`が検査する。
 fn push_span(line: &mut LineBuf, lang: Lang, secs: u64) {
     if secs >= 60 && secs.is_multiple_of(60) {
         line.push_u32(u32::try_from(secs / 60).unwrap_or(u32::MAX))
@@ -3926,7 +4118,7 @@ fn unmatched_line(line: &mut LineBuf, lang: Lang, why: NoMatch) {
     }
 }
 
-/// メニューの下半分の状況の行（最大 `STATUS_ROWS`）。接続した・終わった状態は、その行だけ。戻りは行数。
+/// メニューの下半分の状況の行（最大`STATUS_ROWS`）。接続済み・終了済みの状態はその行だけ。戻り値は行数。
 fn status_lines(
     conn: Conn,
     note: &Note,
@@ -4080,7 +4272,8 @@ pub fn connected_line(
     }
 }
 
-/// 「相手が見つかりました（閉じるまで 9:59）」か、自分がもう選んでいれば「相手が「妖怪 対 妖怪」を選ぶのを待っています（閉じるまで 9:59）」。
+/// 「相手が見つかりました（閉じるまで 9:59）」。
+/// 自分が選択済みなら「相手が「妖怪 対 妖怪」を選ぶのを待っています（閉じるまで9:59）」。
 fn found_line(line: &mut LineBuf, lang: Lang, ready: bool, left_secs: u32) {
     line.clear().push_str(if ready {
         T_FOUND_READY.get(lang)
@@ -4090,7 +4283,10 @@ fn found_line(line: &mut LineBuf, lang: Lang, ready: bool, left_secs: u32) {
     push_left(line, lang, left_secs);
 }
 
-/// 左上の行のうち、マッチ中の行と同じ置き場・文字（GDI の小さい文字。上の枠の左）で描く 1 行か。待っている間（ルームで待つ・接続コードで待つ）の行がそう。真のとき `corner_lines` は 1 行だけ返し、その行が帯の行。接続の手順が時間切れで作り直されている間（`stall` が `Some`）は偽（ゲームの文字の警告。`stall_block`）。
+/// 左上の行が、マッチ中の行と同じ置き場・文字（GDIの小さい文字。上の枠の左）で描く1行かどうか。
+/// 待っている間（ルームで待つ・接続コードで待つ）の行がそうなる。
+/// 真のとき`corner_lines`は1行だけ返し、その行が帯の行。
+/// 接続の手順が時間切れで作り直されている間（`stall`が`Some`）は偽（ゲームの文字の警告。`stall_block`）。
 pub fn corner_is_band(conn: Conn, note: &Note, stall: Option<Stall>) -> bool {
     conn == Conn::Waiting
         && matches!(
@@ -4107,24 +4303,24 @@ pub fn corner_is_band(conn: Conn, note: &Note, stall: Option<Stall>) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallWhy {
-    /// 10 秒のあいだ相手から 1 通も届かなかった（`FailReason::NothingReceived`）。自分のコードへの跳ね返り（`FailReason::SameNonce`）も、相手からは何も届いていないので同じ扱いにする。
+    /// 10秒のあいだ相手から1通も届かなかった（`FailReason::NothingReceived`）。自分のコードへの跳ね返り（`FailReason::SameNonce`）も相手からは何も届いていないので同じ扱いにする。
     NothingReceived,
     NoHandshake,
-    /// 作り直しの前に、相手のコードを読んだ時点で両方が直接接続できない型と分かった予告（`Stall::predicted`）。手順は止めずに続ける（予測が外れることがある）。
+    /// 作り直しの前に出す予告（`Stall::predicted`）。相手のコードを読んだ時点で両方が直接接続できないネットワーク種別と分かったときに出す。手順は止めずに続ける（予測が外れることがある）。
     Predicted,
 }
 
-/// 接続の手順が 1 回以上時間切れになって作り直されている間（か、両方が直接接続できない型と分かった間）の、左上の警告の材料（`stall_block`）。
-/// 作り直しが 0 回の間は `None`（今の小さい文字の 1 行のまま）。
+/// 接続の手順が1回以上時間切れになって作り直されている間（または両方が直接接続できないネットワーク種別と分かった間）に左上へ出す警告の材料（`stall_block`）。
+/// 作り直しが0回の間は`None`（今の小さい文字の1行のまま）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stall {
     pub why: StallWhy,
-    /// 出す文の種類（自分と相手の回線の型から。`nat::choose`）。
+    /// 出す文の種類（自分と相手のネットワーク種別から。`nat::choose`）。
     pub fail: FailKind,
 }
 
 impl Stall {
-    /// `Link::restarts()` から。作り直しが 1 回以上で、理由が作り直す種類のときだけ `Some`（バージョン違いは作り直さず、`Conn::OtherVersion` の行へ行く）。
+    /// `Link::restarts()`から。作り直しが1回以上で理由が作り直す種類のときだけ`Some`（バージョン違いは作り直さず`Conn::OtherVersion`の行へ行く）。
     pub fn from_restarts(r: Restarts, fail: FailKind) -> Option<Stall> {
         if r.count == 0 {
             return None;
@@ -4137,7 +4333,7 @@ impl Stall {
         Some(Stall { why, fail })
     }
 
-    /// 作り直しの前の予告。両方がシンメトリックと分かったときだけ `Some`（ほかの型は作り直しを待つ）。
+    /// 作り直しの前の予告。両方がシンメトリックと分かったときだけ`Some`（ほかのネットワーク種別は作り直しを待つ）。
     pub fn predicted(fail: FailKind) -> Option<Stall> {
         (fail == FailKind::BothSymmetric).then_some(Stall {
             why: StallWhy::Predicted,
@@ -4152,8 +4348,10 @@ enum StallRoute {
     Room,
 }
 
-/// 警告を出す場面か。セッションが今の相手へ接続しに行っている場面だけ（接続コードの経路は `Replied`・`Linking`、ルームの経路は `RoomLinking`）。コードを作って返事を待つ間（`Offered`）・ルームで相手を待つ間（`RoomWaiting`）は、
-/// セッションは今の相手に接続しに行っていない（候補の無いセッションや、前の相手のセッションの作り直しの数が残っているだけ）ので、偽の警告を出さず帯の 1 行のまま。取りやめた後（`Idle`）・ルームに入る前（`RoomJoining`）も出さない。
+/// 警告を出す場面かどうか。セッションが今の相手へ接続しに行っている場面だけ（接続コードの経路は`Replied`・`Linking`、ルームの経路は`RoomLinking`）。
+/// コードを作って返事を待つ間（`Offered`）とルームで相手を待つ間（`RoomWaiting`）は、セッションが今の相手に接続しに行っていない。
+/// 候補の無いセッションや前の相手のセッションの作り直しの数が残っているだけなので、偽の警告を出さず帯の1行のままにする。
+/// 取りやめた後（`Idle`）とルームに入る前（`RoomJoining`）も出さない。
 fn stall_route(note: &Note, stall: Option<Stall>) -> Option<(Stall, StallRoute)> {
     let st = stall?;
     match note.state {
@@ -4173,7 +4371,7 @@ fn stall_route(note: &Note, stall: Option<Stall>) -> Option<(Stall, StallRoute)>
     }
 }
 
-/// 相手から届いているのに接続できないとき（`StallWhy::NoHandshake`）で、型からは原因が言えないときの 3 行（理由・次にすること・README の項）。
+/// 相手から届いているのに接続できず（`StallWhy::NoHandshake`）ネットワーク種別からは原因が言えないときの3行（理由・次にすること・READMEの項）。
 fn stall_pair(out: &mut [LineBuf], lang: Lang, note: &Note, now: u64, route: StallRoute) -> usize {
     let [l0, l1, l2, ..] = out else {
         return 0;
@@ -4201,7 +4399,7 @@ fn stall_pair(out: &mut [LineBuf], lang: Lang, note: &Note, now: u64, route: Sta
     3
 }
 
-/// 接続できなかったときの文（見出し・理由・次にすること・README の項の行）。戻りは行数。
+/// 接続できなかったときの文（見出し・理由・次にすること・READMEの項の行）。戻り値は行数。
 fn fail_block(out: &mut [LineBuf; STALL_ROWS], lang: Lang, fail: FailKind) -> usize {
     let (head, lines, reference): (Tx, [Option<Tx>; 3], Tx) = match fail {
         FailKind::Unknown => (
@@ -4236,14 +4434,15 @@ fn fail_block(out: &mut [LineBuf; STALL_ROWS], lang: Lang, fail: FailKind) -> us
     n
 }
 
-/// 警告の最大の行数（見出し・理由・次にすること 2 行・README の項）。
+/// 警告の最大の行数（見出し・理由・次にすること2行・READMEの項）。
 pub const STALL_ROWS: usize = 5;
 
-/// 接続の手順が時間切れで作り直されている間（か、両方が直接接続できないと分かった間）の左上の警告。ゲームの文字の最大 `STALL_ROWS` 行で、全部 `RowStyle::Warn`。
-/// 戻りは行数。警告の場面でなければ 0 で、そのとき左上は `corner_lines` が決める（`corner_lines` はこの場面で 0 を返す）。
+/// 接続の手順が時間切れで作り直されている間（または両方が直接接続できないと分かった間）の左上の警告。ゲームの文字の最大`STALL_ROWS`行で、全部`RowStyle::Warn`。
+/// 戻り値は行数。警告の場面でなければ0で、そのとき左上は`corner_lines`が決める（`corner_lines`はこの場面で0を返す）。
 ///
-/// 文は `nat::FailKind` の 4 通り。ただし相手から届いているのに接続できない（`StallWhy::NoHandshake`）で型から原因が言えないときは、
-/// 「届きません」と言うと事実と違うので、別の 3 行（理由・待った時間と次にすること・README の 5）。
+/// 文は`nat::FailKind`の4通り。
+/// ただし相手から届いているのに接続できず（`StallWhy::NoHandshake`）型から原因が言えないときは、「届きません」と言うと事実と違う。
+/// そのため別の3行（理由・待った時間と次にすること・READMEの5）にする。
 pub fn stall_block(
     conn: Conn,
     note: &Note,
@@ -4273,8 +4472,8 @@ pub fn stall_block(
     n
 }
 
-/// 対戦の後に接続が終わって「妖怪 対 妖怪」へ戻す間とその後の左上の 2 行（`Conn::Finished` の 2 行の 1 行目を理由にしたもの）。
-/// 戻した先で次にすることは今までどおり `T_AGAIN`。
+/// 対戦の後に接続が終わって「妖怪 対 妖怪」へ戻す間とその後の左上の2行（`Conn::Finished`の2行の1行目を理由にしたもの）。
+/// 戻した先で次にすることは今までどおり`T_AGAIN`。
 pub fn return_lines(
     why: Why,
     lang: Lang,
@@ -4294,9 +4493,10 @@ pub fn return_lines(
     2
 }
 
-/// 左上に出す行（メニューを閉じている間。最大 2 行）。戻りは行数。成立していれば 1 行（接続した行。成立したら両者が自動で難易度の画面まで進む（`ui_entry::advance`）ので次にすることは出さない）、
-/// 接続したが成立の前なら 2 行（見つかった・待っている行と、次にすること）、待っているなら 1 行（待った時間。置き場は `corner_is_band`）、終わっていれば 2 行。何も無ければ 0。
-/// 待っている間でも、接続の手順が時間切れで作り直されていれば（`stall` が `Some`）警告の 2 行（`stall_lines`）。
+/// 左上に出す行（メニューを閉じている間。最大2行）。戻り値は行数。
+/// 成立していれば1行（接続した行）。成立したら両者が自動で難易度の画面まで進む（`ui_entry::advance`）ので次にすることは出さない。
+/// 接続したが成立の前なら2行（見つかった・待っている行と次にすること）。待っているなら1行（待った時間。置き場は`corner_is_band`）。終わっていれば2行。何も無ければ0。
+/// 待っている間でも接続の手順が時間切れで作り直されていれば（`stall`が`Some`）警告の2行（`stall_lines`）。
 pub fn corner_lines(
     conn: Conn,
     note: &Note,
@@ -4369,13 +4569,13 @@ pub fn corner_lines(
             2
         }
         Conn::Waiting => {
-            // 接続の手順が時間切れで作り直されている間は、小さい 1 行でなくゲームの文字の警告（`stall_block`。複数行なのでここでは返さない）。
+            // 接続の手順が時間切れで作り直されている間は小さい1行でなくゲームの文字の警告になる（`stall_block`。複数行なのでここでは返さない）。
             if stall_route(note, stall).is_some() {
                 return 0;
             }
             match note.state {
                 CodeState::Idle | CodeState::SpectateIdle => {
-                    // ルームの待ちが断り・失敗で終わった後は、その理由と次にすることを出す（ルームで待つ間に別のモードで遊んでいた側が知る）。コードの経路の断りは出さない。観戦が終わった後の理由も同じ。
+                    // ルームの待ちが断り・失敗で終わった後はその理由と次にすることを出す（ルームで待つ間に別のモードで遊んでいた側が知る）。コードの経路の断りは出さない。観戦が終わった後の理由も同じ。
                     if !note.event.is_room_trouble() {
                         return 0;
                     }
@@ -4422,7 +4622,7 @@ pub fn corner_lines(
                     styles[0] = RowStyle::Normal;
                     return 1;
                 }
-                // 待っている間の行は 1 行だけ（次にすることの 2 行目は付けない）。描くときはマッチ中の行と同じ置き場・文字（`corner_is_band`）。
+                // 待っている間の行は1行だけ（次にすることの2行目は付けない）。描くときはマッチ中の行と同じ置き場・文字（`corner_is_band`）。
                 CodeState::RoomWaiting => {
                     if note.random {
                         random_waiting_line(&mut out[0], lang, note, now);
@@ -4448,22 +4648,27 @@ pub fn corner_lines(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HudView {
-    /// 遅れ（rollback なら今の D、delay 方式なら今の遅れ。自分か相手が Ctrl＋数字で変えて決まった値・要求している値があればそれ）。
+    /// 遅れ（rollbackなら今のD・delay方式なら今の遅れ。自分か相手がCtrl＋数字で変えて決まった値・要求している値があればそれ）。
     pub latency: Option<u8>,
     pub rtt_ms: Option<u32>,
-    /// 推奨値（`Connected::recommend_now`。RTT が測れていなければ `None` で、出さない）。
+    /// 推奨値（`Connected::recommend_now`。RTTが測れていなければ`None`で出さない）。
     pub recommend: Option<u8>,
     pub rewind: Option<u32>,
-    /// auto の旗が立っているか。立っていれば括弧の中を推奨値でなく `A` にする。ホストは自分の旗、ゲストはホストの旗か自分の要求（`Connected::shown_auto`）。
+    /// autoのフラグが立っているかどうか。立っていれば括弧の中を推奨値でなく`A`にする。ホストは自分のフラグ・ゲストはホストのフラグか自分の要求（`Connected::shown_auto`）。
     pub auto: bool,
-    /// キャラセレクトの行のとき、先頭に出す同期方式（「rollback・Delay 2F (A)  ping 33ms」）。マッチ中は `None`（形式は右端の `rollback N` で分かる。delay 方式のマッチは出さない）。
+    /// キャラセレクトの行のとき先頭に出す同期方式（「rollback・Delay 2F (A)  ping 33ms」）。マッチ中は `None`（形式は右端の `rollback N` で分かる。delay 方式のマッチは出さない）。
     pub format: Option<Mode>,
-    /// キャラセレクトの行で、この組が rollback へ替えられない（片方が rollback ができない）。`format` が delay 方式のとき、語を「delay only」にする（Tab が効かないことが画面から分かるように）。
+    /// キャラセレクトの行で、このペアがrollbackへ切り替えられない（片方がrollbackができない）。
+    /// `format`がdelay方式のときは表記を「delay only」にする（Tabが効かないことが画面から分かるように）。
     pub delay_only: bool,
 }
 
-/// 「Delay NF (推奨F)  ping NNms  rollback N」。一時停止の間も同じ形。auto の旗が立っていれば括弧の中は `A`（推奨値は出さない。ping が測れていなくても出す）。キャラセレクトの行は先頭に「rollback・」か「delay・」が付き、末尾の `rollback N` は無い。
-/// 推奨は RTT が測れていなければ括弧ごと出さない。`rewind` が `None`（delay 方式）なら `rollback` は出さない。ping が測れていなければ `ping -`。描くときは ASCII だけの行を GDI の文字で描く（`ui_layout::push_text_plain`。幅は `every_match_line_fits_before_the_timer`）。
+/// 「Delay NF (推奨F)  ping NNms  rollback N」。一時停止の間も同じ形。
+/// autoのフラグが立っていれば括弧の中は`A`（推奨値は出さない。pingが測れていなくても出す）。
+/// キャラセレクトの行は先頭に「rollback・」か「delay・」が付き、末尾の`rollback N`は無い。
+/// 推奨はRTTが測れていなければ括弧ごと出さない。
+/// `rewind`が`None`（delay方式）なら`rollback`は出さない。pingが測れていなければ`ping -`。
+/// 描くときはASCIIだけの行をGDIの文字で描く（`ui_layout::push_text_plain`。幅は`every_match_line_fits_before_the_timer`）。
 pub fn hud_line(line: &mut LineBuf, lang: Lang, h: &HudView) {
     line.clear();
     if let Some(m) = h.format {
@@ -4509,7 +4714,7 @@ pub fn hud_line(line: &mut LineBuf, lang: Lang, h: &HudView) {
     }
 }
 
-/// 観戦者の行に出す、対戦する 2 人の間の状態（観戦の流れの `Stats` の記録の最新の値）。
+/// 対戦する2人の間の状態（観戦の流れの`Stats`の記録の最新の値）。観戦者の行に出す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerStats {
     pub ping_ms: Option<u16>,
@@ -4529,20 +4734,22 @@ impl PeerStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WatchHudView {
-    /// ホストが流した対戦する 2 人の間の状態（最新の値。まだ受けていなければ `None` で、前半を出さない）。
+    /// ホストが送信した対戦する2人の間の状態（最新の値。まだ受けていなければ`None`で前半を出さない）。
     pub stats: Option<PeerStats>,
     /// 使う直前に溜まっていたマッチのフレームの数（直近の期間の最大）。
     pub delay_frames: u32,
     pub fast_forward: bool,
 }
 
-/// 画面の行に出す値の頭打ち（桁の数を決め、行の最長の文字数が決まる）。ping は 999 ms まで・ほかは 99 まで。
+/// 画面の行に出す値の頭打ち（これで桁の数が決まり行の最長の文字数も決まる）。pingは999 msまで・ほかは99まで。
 pub const WATCH_PING_MAX: u32 = 999;
 pub const WATCH_COUNT_MAX: u32 = 99;
 
-/// 観戦者のマッチ中の通信の状態の行: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」。`stats` を受けるまでは「Watch delay 3」だけ（先頭の空白は落とす）。
-/// delay 方式のマッチは `Rollback` を出さない・ping が測れていなければ `ping -`（`hud_line` と同じ）。早送りの間は後ろに「 >>」。
-/// 値は桁が増えて行が下の枠の左から溢れないよう頭打ちする（ping 999・ほかは 99）。ふつうの文字では収まらないので、描くときは小さい文字（`ui_layout::push_text_small`）。幅は `the_watch_line_fits_the_bottom_band_in_the_small_font`。
+/// 観戦者のマッチ中の通信の状態の行: 「ping 14ms Delay 1F Rollback 2 Watch delay 3」。`stats`を受けるまでは「Watch delay 3」だけ（先頭の空白は落とす）。
+/// delay方式のマッチは`Rollback`を出さない。pingが測れていなければ`ping -`（`hud_line`と同じ）。早送りの間は後ろに「 >>」。
+/// 値は桁が増えて行が下の枠の左から溢れないよう頭打ちする（ping 999・ほかは99）。
+/// ふつうの文字では収まらないので小さい文字（`ui_layout::push_text_small`）で描く。
+/// 幅の検査は`the_watch_line_fits_the_bottom_band_in_the_small_font`。
 pub fn watch_hud_line(line: &mut LineBuf, lang: Lang, h: &WatchHudView) {
     line.clear();
     if let Some(s) = h.stats {
@@ -4573,9 +4780,10 @@ pub fn watch_hud_line(line: &mut LineBuf, lang: Lang, h: &WatchHudView) {
         line.push_str(T_HUD_WATCH_FF.get(lang));
     }
 }
-/// 試合中の名前の帯の 1 行: 1P は「1P 名前」（上の枠の左）、2P は「名前 2P」（上の枠の右。右寄せ）。`name` は HELLO で交換した名前（UTF-8 の 32 バイトまで）。制御文字は `?` にする。
-/// 長さは文字の枠の数（半角 1・全角 2。`overlay::glyph_cells`）で `HUD_NAME_CELLS` までに切る（ラベルは残す: 右の帯は右寄せなので、後ろ（ラベル）を切ると席が読めなくなる）。
-/// 表に無い全角の文字は描くと 1 枠の `?` になるので、枠の数は多めに見積もる向き。
+/// 試合中の名前の帯の1行: 1Pは「1P 名前」（上の枠の左）、2Pは「名前 2P」（上の枠の右。右寄せ）。`name`はHELLOで交換した名前（UTF-8の32バイトまで）。制御文字は`?`にする。
+/// 長さは文字の枠の数（半角1・全角2。`overlay::glyph_cells`）で数え`HUD_NAME_CELLS`までに切る。
+/// ラベルは残す。右の帯は右寄せなので後ろ（ラベル）を切るとサイドが読めなくなる。
+/// 表に無い全角の文字は描くと1枠の`?`になる。そのため枠の数は多めに見積もる側に寄せている。
 pub fn name_band_line(line: &mut LineBuf, lang: Lang, seat: Seat, name: &[u8]) {
     line.clear();
     let label = match seat {
@@ -4599,7 +4807,20 @@ pub fn name_band_line(line: &mut LineBuf, lang: Lang, seat: Seat, name: &[u8]) {
     }
 }
 
-/// 直近 `REWIND_WINDOW` フレームのうち、1 フレームでいちばん長く巻き戻したフレーム数（「戻し」）。1 フレームごとに `push` する。60 フレーム = 約 1 秒。
+/// `name_band_line`が作った行`line`の中のサイドの表記（「1P」「2P」）のバイトの範囲。1Pの帯は先頭・2Pの帯は末尾。
+/// 色を付ける2文字を描く側が取り出すのに使う。表記は日英で同じ（検査で保証する）ので言語は取らない。
+pub fn name_band_label_range(seat: Seat, line: &str) -> Option<core::ops::Range<usize>> {
+    match seat {
+        Seat::P1 => line
+            .starts_with(T_HUD_SEAT_1.ja)
+            .then(|| 0..T_HUD_SEAT_1.ja.len()),
+        Seat::P2 => line
+            .ends_with(T_HUD_SEAT_2.ja)
+            .then(|| line.len() - T_HUD_SEAT_2.ja.len()..line.len()),
+    }
+}
+
+/// 直近`REWIND_WINDOW`フレームのうち1フレームでいちばん長く巻き戻したフレーム数（「戻し」）。1フレームごとに`push`する。60フレーム = 約1秒。
 pub const REWIND_WINDOW: usize = 60;
 
 #[derive(Debug, Clone, Copy)]
@@ -4654,6 +4875,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn split_ask_lines_name_the_seat_and_the_key_with_the_count_in_both_languages_and_draw_in_the_glyph_table()
+     {
+        use crate::split_kb::Prompt;
+        let glyphs = ui_glyphs();
+        let names = ["Z", "X", "Shift", "↑", "↓", "←", "→"];
+        for lang in [Lang::Ja, Lang::En] {
+            let mut all = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                let i = i as u8;
+                let (n1, p1) = split_ask_lines(Prompt::P1(i), lang);
+                let (n2, p2) = split_ask_lines(Prompt::P2(i), lang);
+                assert_eq!((n1, n2), (2, 2), "聞く間は 2 行");
+                assert!(
+                    p1[0].0.contains("1P") && !p1[0].0.contains("2P"),
+                    "{lang:?}"
+                );
+                assert!(
+                    p2[0].0.contains("2P") && !p2[0].0.contains("1P"),
+                    "{lang:?}"
+                );
+                for line in [p1[0].0, p2[0].0] {
+                    assert!(line.contains(name), "{lang:?}: {line}");
+                    assert!(
+                        line.contains(&format!("({}/7)", i + 1))
+                            || line.contains(&format!("（{}/7）", i + 1)),
+                        "{lang:?}: {line}"
+                    );
+                }
+                assert_eq!(p1[1], p2[1], "2 行目は 1P・2P で同じ");
+                assert!(p1[1].0.contains("Esc"));
+                all.push(p1[0].0);
+                all.push(p2[0].0);
+            }
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), 14, "{lang:?}: 全部の段の文が違う");
+            let (nr, rel) = split_ask_lines(Prompt::Release, lang);
+            assert_eq!(nr, 1, "離す案内は 1 行");
+            assert!(!all.contains(&rel[0].0));
+            all.push(rel[0].0);
+            all.push(split_ask_lines(Prompt::P1(0), lang).1[1].0);
+            for text in all {
+                assert!(
+                    text.chars().all(|c| glyphs.contains(&c)),
+                    "文字の表に無い文字: {text}"
+                );
+            }
+        }
+        assert_eq!(
+            split_ask_lines(Prompt::P1(0), Lang::Ja).1[0].0,
+            "1PのキーボードでZを押してください。（1/7）"
+        );
+        assert_eq!(
+            split_ask_lines(Prompt::P2(6), Lang::Ja).1[0].0,
+            "2Pのキーボードで→を押してください。（7/7）"
+        );
+        assert_eq!(
+            split_ask_lines(Prompt::P1(2), Lang::En).1[0].0,
+            "Press Shift on the 1P keyboard. (3/7)"
+        );
+        assert_eq!(
+            split_ask_lines(Prompt::P1(0), Lang::Ja).1[1].0,
+            "パッドのボタンかEscでキーボードを分けずに遊ぶ"
+        );
+        assert_eq!(
+            split_ask_lines(Prompt::Release, Lang::Ja).1[0].0,
+            "キーを離してください。"
+        );
+        // 範囲外の添字でも例外を出さない。
+        assert_eq!(split_ask_lines(Prompt::P1(9), Lang::Ja).1[0].0, "");
+    }
+
     fn input(word: u16, note: Note, conn: Conn) -> TickIn {
         TickIn {
             word,
@@ -4674,7 +4968,7 @@ mod tests {
         l.as_str().to_string()
     }
 
-    /// 名前の行が無いとき（いちばん長いのが「同期方式」）の `lab`。
+    /// 名前の行が無いとき（いちばん長いのが「同期方式」）の`lab`。
     fn lab8(label: Tx, lang: Lang) -> String {
         let mut l = LineBuf::new();
         push_label(&mut l, lang, label, cells_of(T_FORMAT.get(lang)));
@@ -5178,7 +5472,7 @@ mod tests {
         );
     }
 
-    /// 観戦コードの出来事の文: ホストの側は 1 行（断りの色でない）、観戦者の失敗は 2 行（理由と次にすること。項目の名前は「」で引く）。
+    /// 観戦コードのイベントの文: ホスト側は1行（断りの色でない）。観戦者の失敗は2行（理由と次にすること。項目の名前は「」で囲む）。
     #[test]
     fn the_watch_code_events_say_one_thing_and_the_next_step() {
         let lines = |ev: Event, lang: Lang| {
@@ -5261,7 +5555,7 @@ mod tests {
         for (ev, item) in [
             (Event::SpectateCodeEmpty, T_SPECTATE_CODE_PASTE),
             (Event::SpectateCodeBroken, T_SPECTATE_CODE_PASTE),
-            // ホストがコピーするキー（コピーはメニューの項目でなく Ctrl+C）。
+            // ホストがコピーするキー（コピーはメニューの項目でなくCtrl+C）。
             (Event::SpectateCodeWrongKind, COPY_KEY),
             (Event::SpectateCodeClipWrite, COPY_KEY),
         ] {
@@ -5272,12 +5566,12 @@ mod tests {
                 assert!(l[1].contains(item.get(lang)), "{ev:?} {lang:?}: {l:?}");
             }
         }
-        // 接続しに行った後の失敗だけを、待ちが終わった後の左上へ残す（貼った直後の断りはメニューの中で読める）。
+        // 接続しに行った後の失敗だけを待ちが終わった後の左上へ残す（貼った直後の断りはメニューの中で読める）。
         assert!(Event::SpectateCodeNoLink.is_room_trouble());
         assert!(Event::SpectateCodeExpired.is_room_trouble());
         assert!(!Event::SpectateCodeBroken.is_room_trouble());
         assert!(!Event::SpectateCodeCopied.is_room_trouble());
-        // 番号は末尾に足したもの（原子変数で渡す番号を前の出来事と取り違えない）。
+        // 番号は末尾に足したもの（アトミック変数で渡す番号を前のイベントと取り違えない）。
         assert_eq!(Event::SpectateCodeCopied.code(), 46);
         assert_eq!(Event::from_code(52), Event::SpectateCodeExpired);
     }
@@ -5312,7 +5606,7 @@ mod tests {
                 assert_eq!(k, 0);
             }
         }
-        // 出来事の数。足したら `EVENTS` と合わせて直す。
+        // イベントの数。足したら`EVENTS`と合わせて直す。
         assert_eq!(
             troubles, 49,
             "断り・失敗の出来事の数（増減したら文を見直す）"
@@ -5810,7 +6104,7 @@ mod tests {
         assert!(text_width_plain(&spec, l.as_str()) > HUD_BOTTOM_TEXT_MAX_W);
     }
 
-    /// ゲームの文字（ascii.anm）をコピーした表: 英数字と空白が `GAME_ADVANCE`（9 画素）ずつ進む。文字の絵の大きさは送りに効かないので仮の 8×12 の一色にした。`extra` は文字の表に足す文字。
+    /// ゲームの文字（ascii.anm）をコピーした表: 英数字と空白が`GAME_ADVANCE`（9画素）ずつ進む。文字の絵の大きさは文字送りに効かないので仮の8×12の一色にした。`extra`は文字の表に足す文字。
     fn game_font_spec(extra: &str) -> AtlasSpec {
         use crate::overlay::{GAME_ADVANCE, GameGlyphSrc, apply_game_font, texels};
         let mut glyphs = ui_glyphs();
@@ -6220,11 +6514,11 @@ mod tests {
         let (first, second) = match lang {
             Lang::Ja => (
                 "同期がずれたため、試合を終了しました。",
-                "logsフォルダのログを添えて、開発者に伝えてください（Escでメニューへ）。",
+                "zipにしたlogsフォルダを添えて、開発者に伝えてください（Escでメニューへ）。",
             ),
             Lang::En => (
                 "Desync detected. This match was stopped.",
-                "Post the logs in the logs folder to GitHub Issues (Esc: menu).",
+                "Post the logs folder as a zip to GitHub Issues (Esc: menu).",
             ),
         };
         assert_eq!(out[0].as_str(), first);
@@ -6269,7 +6563,7 @@ mod tests {
                 ),
                 Lang::En => (
                     format!(
-                        "HiganRTool version differs from the opponent (you {PROTO_VER}, opponent {theirs})."
+                        "HiganRTool version differs from the opponent (you {PROTO_VER}, them {theirs})."
                     ),
                     "Use the same HiganRTool zip as your opponent.",
                 ),
@@ -6365,7 +6659,7 @@ mod tests {
                             note.name = sanitize_name(&[b'W'; 32], known);
                             note.room = sanitize_room(&"部".repeat(40), known);
                             note.retry_secs = u16::MAX;
-                            // LAN のホストの待機で並ぶ、いちばん長いアドレスの行（上限の数。3 つを越える分はスクロール）。
+                            // LANのホストの待機でいちばん長くなるアドレスの行（上限の数。3つを越える分はスクロール）。
                             note.lan_ips = [[255; 4]; LAN_IPS_MAX];
                             note.lan_n = LAN_IPS_MAX as u8;
                             note.lan_port = u16::MAX;
@@ -6430,7 +6724,7 @@ mod tests {
             - 2 * crate::ui_layout::SCREEN_MARGIN
             - 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
         assert!(widest <= limit, "いちばん広い行 {widest} 画素 > {limit}");
-        // 実機は英数字がゲームの文字（9 画素送り）になるので、そちらでも枠に収める。
+        // 実機は英数字がゲームの文字（9画素送り）になるので、そちらでも枠に収める。
         for lang in Lang::ALL {
             let g = widest_game[lang.index()];
             assert!(
@@ -6450,11 +6744,165 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_update_notice_text_names_the_version_or_says_only_that_one_is_out() {
+        let lines = |found: Found, lang: Lang| {
+            let mut out = [LineBuf::new(); UPDATE_NOTICE_LINES];
+            let n = update_notice_lines(found, lang, &mut out);
+            (n, out[0].as_str().to_string(), out[1].as_str().to_string())
+        };
+        let v = Found::Newer(Version::new(1, 2, 3));
+        assert_eq!(
+            lines(v, Lang::Ja),
+            (
+                2,
+                "新しいバージョンがリリースされています（v1.2.3）".to_string(),
+                "更新する場合は開いている花映塚を閉じ、HiganRTool.exeから起動しなおしてください。"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            lines(v, Lang::En),
+            (
+                2,
+                "A new version has been released (v1.2.3)".to_string(),
+                "To update, close the game and restart it from HiganRTool.exe.".to_string()
+            )
+        );
+        let big = Found::Newer(Version::new(1023, 0, 17));
+        assert_eq!(
+            lines(big, Lang::En).1,
+            "A new version has been released (v1023.0.17)"
+        );
+        let none = Found::Newer(None);
+        assert_eq!(
+            lines(none, Lang::Ja).1,
+            "新しいバージョンがリリースされています"
+        );
+        assert_eq!(lines(none, Lang::En).1, "A new version has been released");
+        assert_eq!(lines(none, Lang::En).0, 2);
+        assert_eq!(
+            lines(Found::None, Lang::Ja),
+            (0, String::new(), String::new())
+        );
+    }
+
+    fn update_probe_note(st: CodeState, ev: Event) -> Note {
+        let known = |c: char| ui_glyphs().contains(&c);
+        let mut note = made_note();
+        note.event = ev;
+        note.state = st;
+        note.paste_len = 4_294_967_295;
+        note.code_len = 304;
+        note.name = sanitize_name(&[b'W'; 32], known);
+        note.room = sanitize_room(&"部".repeat(40), known);
+        note.retry_secs = u16::MAX;
+        note.lan_ips = [[255; 4]; LAN_IPS_MAX];
+        note.lan_n = LAN_IPS_MAX as u8;
+        note.lan_port = u16::MAX;
+        note.since = 1_000_000u32.wrapping_sub(86_399 * 100);
+        note
+    }
+
+    #[test]
+    fn the_update_notice_sits_under_the_keys_row_and_is_left_out_when_the_menu_is_full() {
+        let spec = AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap();
+        let game = game_font_spec("");
+        let limit = 640
+            - 2 * crate::ui_layout::SCREEN_MARGIN
+            - 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
+        let found = Found::Newer(Version::new(1023, 1023, 1023));
+        let (mut shown, mut left_out, mut tallest_px) = (0u32, 0u32, 0u32);
+        for lang in Lang::ALL {
+            let mut want = [LineBuf::new(); UPDATE_NOTICE_LINES];
+            update_notice_lines(found, lang, &mut want);
+            for ev in EVENTS {
+                for st in ALL_STATES {
+                    for opening in [false, true] {
+                        let note = update_probe_note(st, ev);
+                        let mut m = Menu::new(ini())
+                            .with_lang(lang)
+                            .with_room(RoomItem::On(RoomBuf::new()))
+                            .with_ini_notice(worst_ini_notice())
+                            .with_player_name(NameBuf::lossy(&"W".repeat(32)))
+                            .with_seat(SeatWish::Any);
+                        m.open(0);
+                        m.set_opening(opening);
+                        let mut plain = MenuRows::new();
+                        m.render(Conn::Waiting, &note, 1_000_000, &mut plain);
+                        m.set_update(found);
+                        let mut rows = MenuRows::new();
+                        m.render(Conn::Waiting, &note, 1_000_000, &mut rows);
+                        assert!(rows.len <= MENU_ROWS, "{ev:?} {st:?}");
+                        if plain.len + 1 + UPDATE_NOTICE_LINES <= MENU_ROWS {
+                            shown += 1;
+                            assert_eq!(rows.len, plain.len + 1 + UPDATE_NOTICE_LINES);
+                            assert_eq!(
+                                rows.lines[plain.len - 1].as_str(),
+                                T_KEYS.get(lang),
+                                "知らせはキーの行の下"
+                            );
+                            assert_eq!(rows.styles[plain.len], RowStyle::GapMedium);
+                            for (i, w) in want.iter().enumerate() {
+                                assert_eq!(rows.lines[plain.len + 1 + i], *w);
+                                assert_eq!(rows.styles[plain.len + 1 + i], RowStyle::Notice);
+                            }
+                        } else {
+                            left_out += 1;
+                            assert_eq!(rows.len, plain.len, "{ev:?} {st:?}: 満杯なのに足した");
+                            assert!(plain.len + 1 + UPDATE_NOTICE_LINES > MENU_ROWS);
+                        }
+                        tallest_px = tallest_px.max(crate::ui_layout::rows_height(
+                            &spec,
+                            &rows.styles[..rows.len],
+                        ));
+                        for l in &rows.lines[..rows.len] {
+                            for s in [&spec, &game] {
+                                let w = crate::ui_layout::text_width(s, l.as_str());
+                                assert!(w <= limit, "{lang:?}: {w} 画素 > {limit}: {}", l.as_str());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            shown > 0 && left_out > 0,
+            "足した {shown} 回・見送った {left_out} 回"
+        );
+        let h = tallest_px + 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
+        assert!(
+            h <= 480 - 2 * crate::ui_layout::SCREEN_MARGIN,
+            "枠の高さ {h} 画素"
+        );
+    }
+
+    #[test]
+    fn the_update_notice_is_not_drawn_on_the_sub_screens() {
+        let found = Found::Newer(Version::new(1, 2, 3));
+        let note = made_note();
+        let mut m = Menu::new(ini()).with_player_name(NameBuf::lossy("Name"));
+        m.set_update(found);
+        m.open(0);
+        let mut r = MenuRows::new();
+        m.render(Conn::Waiting, &note, 1_000_000, &mut r);
+        assert!(
+            r.styles[..r.len].contains(&RowStyle::Notice),
+            "入口のメニューに出ない"
+        );
+        m.open_confirm(0);
+        m.render(Conn::Waiting, &note, 1_000_000, &mut r);
+        assert!(
+            !r.styles[..r.len].contains(&RowStyle::Notice),
+            "確認の枠に出た"
+        );
+    }
+
     fn ini_note(line: usize, section: &str, key: &str) -> crate::ini_lenient::IniNote {
         crate::ini_lenient::IniNote::ignored(line, section, key, "理由".to_string())
     }
 
-    /// いちばん長くなる 1 か所の注（行の番号が 5 桁、節とキーが合わせて上限の長さ）。
+    /// いちばん長くなる1か所の注（行の番号が5桁・節とキーが合わせて上限の長さ）。
     fn worst_ini_notice() -> Option<IniNotice> {
         let sec = "a".repeat(IniNotice::TAGS_MAX - Tag::MAX);
         let key = "a".repeat(Tag::MAX);
@@ -6501,7 +6949,7 @@ mod tests {
             notice_text(&no_key, Lang::Ja)[0],
             "HiganRTool.iniの3行目（[pad]）を読み込めません。"
         );
-        // 節もキーも分からない・ASCII の小文字でないキー（読めない文字を出さない）は行の番号だけ。
+        // 節もキーも分からない・ASCIIの小文字でないキー（読めない文字を出さない）は行の番号だけ。
         for (sec, key) in [
             ("", ""),
             ("", "upnp"),
@@ -6538,7 +6986,7 @@ mod tests {
     fn the_one_place_ini_notice_ends_its_first_line_like_the_many_places_one() {
         let close = T_INI_MANY_B.ja.split_once("か所").unwrap().1;
         assert_eq!(close, "を読み込めません。");
-        // 最後の 1 つは行の番号が分からない注（`T_INI_PART`）。
+        // 最後の1つは行の番号が分からない注（`T_INI_PART`）。
         for (line, sec, key) in [
             (12, "netplay", "upnp"),
             (3, "pad", ""),
@@ -6623,7 +7071,7 @@ mod tests {
         let big = IniNotice::LINE_MAX;
         let worst = [
             vec![ini_note(big, &sec, &name)],
-            // 節とキーが合わせて上限を越えるときは、キーを出さずに幅に収める。
+            // 節とキーが合わせて上限を越えるときはキーを出さずに幅に収める。
             vec![ini_note(big, &name, &name)],
             (0..3).map(|_| ini_note(big, &name, &name)).collect(),
             vec![crate::ini_lenient::IniNote::encoding()],
@@ -6923,7 +7371,7 @@ mod tests {
         );
     }
 
-    /// 名前・席・ルーム名（空）が全部ある、待ちの外のメニュー（項目が最大の組）。
+    /// 名前・サイド・ルーム名（空）が全部ある待ちの外のメニュー（項目が最大の組み合わせ）。
     fn full_menu_driver() -> Driver {
         let mut d = Driver::new();
         d.m = Menu::new(ini())
@@ -7026,7 +7474,7 @@ mod tests {
                 T_GROUP_CODE.ja.to_string(),
                 format!("> {}", T_CREATE.ja),
                 format!("  {}", T_PASTE.ja),
-                // サーバーが無くても観戦コードと LAN の行は出る（開いたときのカーソルは接続コードの先頭）。
+                // サーバーが無くても観戦コードとLANの行は出る（開いたときのカーソルは接続コードの先頭）。
                 format!("  {}", T_SPECTATE_CODE_PASTE.ja),
                 String::new(),
                 T_GROUP_LAN.ja.to_string(),
@@ -7392,7 +7840,7 @@ mod tests {
         }
     }
 
-    /// `CodeState` の全部（番号 0〜12）。
+    /// `CodeState`の全部（番号0〜12）。
     const ALL_STATES: [CodeState; 13] = [
         CodeState::Idle,
         CodeState::Offered,
@@ -7440,7 +7888,7 @@ mod tests {
                     && !its.contains(&Item::Random),
                 "{st:?}: {its:?}"
             );
-            // 観戦コード入力はサーバーを使わないので、サーバーが無くても出る（何も待っていない間だけ）。
+            // 観戦コード入力はサーバーを使わないのでサーバーが無くても出る（何も待っていない間だけ）。
             assert_eq!(
                 its.contains(&Item::SpectateCode),
                 matches!(st, CodeState::Idle | CodeState::SpectateIdle),
@@ -7599,7 +8047,7 @@ mod tests {
             assert_eq!(d.cmds, vec![Cmd::SpectateCode], "{room:?}");
             assert!(!d.m.wants_text(), "観戦コードはルーム名を打たない");
         }
-        // ルームの行を決めても観戦コードの指示は出ない（行の取り違え）。
+        // ルームの行を決定しても観戦コードの指示は出ない（行の取り違え）。
         let mut d = Driver::new();
         d.m = Menu::new(ini()).with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()));
         d.m.open(0);
@@ -7611,7 +8059,7 @@ mod tests {
     #[test]
     fn the_copy_notices_are_one_line_each_fit_the_top_left_and_only_results_have_one() {
         let game = game_font_spec("");
-        // 左上の行は画面の幅から左右の余白（6 画素）を除いた幅まで（`net_ui` の `TL_X`）。
+        // 左上の行は画面の幅から左右の余白（6画素）を除いた幅まで（`net_ui`の`TL_X`）。
         let limit = 640 - 2 * 6;
         for lang in Lang::ALL {
             let hint = copy_hint(lang);
@@ -7716,7 +8164,7 @@ mod tests {
         assert_eq!(d.m.edit_for, EditFor::Spectate);
     }
 
-    /// ルーム名が空のメニューで観戦の「ルームマッチ」を決めて入力を開く。
+    /// ルーム名が空のメニューで観戦の「ルームマッチ」を決定して入力を開く。
     fn open_spectate_input() -> Driver {
         let mut d = Driver::new();
         d.m = Menu::new(ini()).with_room(RoomItem::On(RoomBuf::new()));
@@ -7832,7 +8280,7 @@ mod tests {
             tx(event_text(Event::SpectateNoLink, none)),
             [
                 "相手と接続できませんでした。",
-                "logsフォルダのログを添えて、開発者に伝えてください。"
+                "zipにしたlogsフォルダを添えて、開発者に伝えてください。"
             ]
         );
         for ev in [
@@ -7874,7 +8322,7 @@ mod tests {
         );
     }
 
-    /// 満員の断りは、接続した後（1 行・断りの色でない）と、接続する前（ルームの経路・観戦コードの経路とも理由と次にすること）で文が違う。
+    /// 満員の断りは接続した後（1行・断りの色でない）と接続する前（ルームの経路・観戦コードの経路とも理由と次にすること）で文が違う。
     #[test]
     fn a_full_host_is_told_apart_before_and_after_joining() {
         let none = |_: &mut Note| {};
@@ -8123,7 +8571,7 @@ mod tests {
             widest.1,
             widest.0
         );
-        // 全角の名前は 2 枠単位で切れるので、半角の枠の余りが 1 枠まで出る。
+        // 全角の名前は2枠単位で切れるので半角の枠の余りが1枠まで出る。
         assert!(widest.0 + 2 * 7 > HUD_TEXT_MAX_W, "{widest:?}");
         let open = T_SPECTATE_OPEN.get(lang);
         let close = T_ROOM_WAITING_CLOSE.get(lang);
@@ -8167,6 +8615,14 @@ mod tests {
         let t1 = t0 + JOINER_RETRY_MS;
         assert_eq!(j.poll(t1), Some(JoinerAction::Connect));
         assert_eq!(st(&j, t1), CodeState::SpectateWaiting);
+        j.on_failed(t1, Failure::RoomFull);
+        assert_eq!(
+            st(&j, t1),
+            CodeState::SpectateWaiting,
+            "配る側が来る前の観戦用のルームの断り（409 room_full）も待機中"
+        );
+        let t1 = t1 + JOINER_RETRY_MS;
+        assert_eq!(j.poll(t1), Some(JoinerAction::Connect));
         assert_eq!(j.on_joined(t1, Role::Answer), None);
         assert_eq!(st(&j, t1), CodeState::SpectateJoining);
         assert_eq!(
@@ -8314,7 +8770,9 @@ mod tests {
             }
         }
 
-        /// ルーム名が空のメニューで対戦の「ルームマッチ」を決めて入力を開く（ルーム名が決まっていると指示を出すので、空の名から始める。初めの値つきで開けるのは設定の「ルーム名」だけ）。
+        /// ルーム名が空のメニューで対戦の「ルームマッチ」を決定して入力を開く。
+        /// ルーム名が設定済みだと指示を出すので、空の名前から始める。
+        /// 初めの値つきで開けるのは設定の「ルーム名」だけ。
         fn open_room_input() -> Driver {
             let mut d = Driver::new();
             d.m = Menu::new(ini()).with_room(RoomItem::On(RoomBuf::new()));
@@ -8326,7 +8784,7 @@ mod tests {
             d
         }
 
-        /// 項目へカーソルを動かす。「設定」の画面の項目なら、先に「設定」を開く。
+        /// 項目へカーソルを動かす。「設定」の画面の項目なら先に「設定」を開く。
         fn cursor_to(&mut self, item: Item) {
             let in_settings = matches!(
                 item,
@@ -8373,9 +8831,9 @@ mod tests {
         assert_eq!(d.input_line(), "ルーム名: |", "{t:?}");
         assert_eq!(t.last().unwrap(), T_ROOM_INPUT_KEYS.ja);
         d.tick_text(0, "2");
-        d.tick_text(0, "ＡＢ-.あ");
-        assert_eq!(d.input_line(), "ルーム名: 2AB-|");
-        d.tick_text(0, "\u{8}\u{8}\u{8}");
+        d.tick_text(0, "ＡＢ-.あ/;`");
+        assert_eq!(d.input_line(), "ルーム名: 2AB-.|");
+        d.tick_text(0, "\u{8}\u{8}\u{8}\u{8}");
         assert_eq!(d.input_line(), "ルーム名: 2|");
         let out = d.tick_text(0, &format!("x{ENTER}"));
         let want = RoomBuf::from_name("2x").unwrap();
@@ -8394,8 +8852,8 @@ mod tests {
         assert_eq!(t[0], T_ROOM_NAME.ja, "{t:?}");
         assert_eq!(d.input_line(), "ルーム名: last-room|", "{t:?}");
         assert_eq!(t.last().unwrap(), T_ROOM_INPUT_KEYS.ja);
-        d.tick_text(0, "ＡＢ-.あ");
-        assert_eq!(d.input_line(), "ルーム名: last-roomAB-|");
+        d.tick_text(0, "ＡＢ-.あ/");
+        assert_eq!(d.input_line(), "ルーム名: last-roomAB-.|");
     }
 
     #[test]
@@ -8483,7 +8941,7 @@ mod tests {
         let has = |d: &Driver, s: &str| d.text().iter().any(|l| l == s);
         let mut d = Driver::open_room_input();
         assert!(!has(&d, T_ROOM_INPUT_DROPPED.ja), "打つ前から出ている");
-        for dropped in ["ｱ", "あ", "!", "."] {
+        for dropped in ["ｱ", "あ", "/", ";", "`"] {
             d.tick_text(0, dropped);
             assert!(has(&d, T_ROOM_INPUT_DROPPED.ja), "{dropped:?}");
             assert_eq!(d.input_line(), "ルーム名: |", "捨てた文字が名前に入った");
@@ -8609,7 +9067,7 @@ mod tests {
             widest <= limit,
             "{lang:?}: いちばん広い行 {widest} 画素 > {limit}"
         );
-        // 断りの行が 4 つ出る組の高さを測れている（出ていなければ、上の幅・高さの検査が空振り）。
+        // 断りの行が4つ出る組み合わせの高さを測れている（出ていなければ上の幅・高さの検査が空振りになる）。
         assert_eq!(tallest, 9, "見出し・空き・入力・断り 4・空き・キー");
         let mut d = Driver::new();
         d.m.lang = lang;
@@ -8829,9 +9287,9 @@ mod tests {
             "7秒ほど待ってから、「ルームマッチ」を選び直してください。"
         );
         assert_eq!(
-            lines(Event::RoomFull, &none),
+            lines(Event::RoomInUse, &none),
             [
-                "ルームが満員です。",
+                "このルーム名は使用されています。",
                 "別のルーム名で「ルームマッチ」を選び直してください。"
             ]
         );
@@ -8863,7 +9321,11 @@ mod tests {
             (RoomNameWhy::Dot, "ルーム名を「.」や「..」にはできません。"),
             (
                 RoomNameWhy::NotAscii,
-                "ルーム名に使用可能な文字は「英数字」「-」「_」「@」です。",
+                "ルーム名に「`」「;」「/」は使えません。",
+            ),
+            (
+                RoomNameWhy::Reserved,
+                "「w.」か「q.」で始まるルーム名は使えません。",
             ),
         ] {
             let got = lines(Event::RoomNameBad, &|n| n.room_why = why);
@@ -8881,7 +9343,7 @@ mod tests {
             assert_eq!(l.as_str(), want);
         }
         for gone in ["クリップボード", "HiganRTool.ini", "起動し直"] {
-            for ev in [Event::RoomFull, Event::RoomRefused, Event::RoomNameBad] {
+            for ev in [Event::RoomInUse, Event::RoomRefused, Event::RoomNameBad] {
                 assert!(!lines(ev, &none).concat().contains(gone), "{ev:?} {gone}");
             }
         }
@@ -8895,6 +9357,7 @@ mod tests {
             (E::BadChar { pos: 0 }, RoomNameWhy::BadChar),
             (E::DotName, RoomNameWhy::Dot),
             (E::NotAscii { pos: 0 }, RoomNameWhy::NotAscii),
+            (E::ReservedPrefix, RoomNameWhy::Reserved),
         ] {
             assert_eq!(RoomNameWhy::of(e), want, "{e:?}");
         }
@@ -8902,7 +9365,11 @@ mod tests {
 
     #[test]
     fn room_fields_round_trip_and_long_names_are_cut() {
-        for why in [RoomNameWhy::Dot, RoomNameWhy::NotAscii] {
+        for why in [
+            RoomNameWhy::Dot,
+            RoomNameWhy::NotAscii,
+            RoomNameWhy::Reserved,
+        ] {
             let n = Note {
                 seq: 9,
                 event: Event::RoomBusy,
@@ -8959,13 +9426,13 @@ mod tests {
         FailKind::BothSymmetric,
     ];
 
-    /// 接続できなかったときの文（日本語）。複数行の区切りと文字は決まった文面のまま（README の項の番号を末尾の行に持つ）。
+    /// 接続できなかったときの文（日本語）。複数行の区切りと文字は決まった文面のまま（READMEの項の番号を末尾の行に持つ）。
     fn want_fail_ja(fail: FailKind) -> Vec<&'static str> {
         match fail {
             FailKind::Unknown => vec![
                 "接続失敗：",
                 "不明な原因で相手からのUDPパケットが届きません。",
-                "iniをdetail=1に書き換えてもう一度試し、ログを添えて開発者に伝えてください。",
+                "iniをdetail=1にして再度試し、zipにしたlogsフォルダを添えて開発者に伝えてください。",
                 "（README「接続できないとき」1）",
             ],
             FailKind::PeerSymmetricNoUpnp => vec![
@@ -8994,7 +9461,7 @@ mod tests {
             FailKind::Unknown => vec![
                 "Connection failed:",
                 "UDP packets from the opponent do not arrive (unknown cause).",
-                "Set detail=1 in the ini, retry, and post the log to GitHub Issues.",
+                "Set detail=1 in the ini, retry and post zipped logs to GitHub Issues.",
                 "(README \"When you cannot connect\" 1)",
             ],
             FailKind::PeerSymmetricNoUpnp => vec![
@@ -9018,7 +9485,7 @@ mod tests {
         }
     }
 
-    /// `stall_block` を呼んで、出た行を取り出す。
+    /// `stall_block`を呼んで、出た行を取り出す。
     fn block(
         note: &Note,
         stall: Option<Stall>,
@@ -9134,14 +9601,14 @@ mod tests {
                 room,
             ] {
                 for fail in ALL_FAILS {
-                    // 相手から 1 通も届かない・予告は、型で選んだ文。相手から届いている（NoHandshake）でも型が分かっていれば同じ文。
+                    // 相手から1通も届かない場合と予告は、ネットワーク種別で選んだ文。相手から届いている（NoHandshake）場合もネットワーク種別が分かっていれば同じ文。
                     let mut whys = vec![StallWhy::NothingReceived, StallWhy::NoHandshake];
                     if fail == FailKind::BothSymmetric {
                         whys.push(StallWhy::Predicted);
                     }
                     for why in whys {
                         if why == StallWhy::NoHandshake && fail == FailKind::Unknown {
-                            continue; // 別の 3 行（下の別の検査）
+                            continue; // 別の3行（下の別の検査）
                         }
                         let st = stall_of(why, fail);
                         let (n, out, sty) = block(&note, Some(st), lang);
@@ -9165,8 +9632,8 @@ mod tests {
 
     #[test]
     fn the_japanese_texts_are_the_decided_wording() {
-        // 製品の文（`fail_block`）を行を足した 1 つの文字列にして、決まった 4 通りの文と突き合わせる。
-        // 行の区切りは「／」。テストの中の表と比べると、製品の文の空白が変わっても落ちない。
+        // 製品の文（`fail_block`）の行をつないで1つの文字列にし、決まった4通りの文と突き合わせる。
+        // 行の区切りは「／」。
         let joined = |f: FailKind| {
             let mut out = [LineBuf::new(); STALL_ROWS];
             let n = fail_block(&mut out, Lang::Ja, f);
@@ -9178,7 +9645,7 @@ mod tests {
         };
         assert_eq!(
             joined(FailKind::Unknown),
-            "接続失敗：／不明な原因で相手からのUDPパケットが届きません。／iniをdetail=1に書き換えてもう一度試し、ログを添えて開発者に伝えてください。／（README「接続できないとき」1）"
+            "接続失敗：／不明な原因で相手からのUDPパケットが届きません。／iniをdetail=1にして再度試し、zipにしたlogsフォルダを添えて開発者に伝えてください。／（README「接続できないとき」1）"
         );
         assert_eq!(
             joined(FailKind::PeerSymmetricNoUpnp),
@@ -9235,7 +9702,7 @@ mod tests {
         };
         let (_, out, _) = block(&n, st, Lang::Ja);
         assert_eq!(out[0].as_str(), format!("{NO_HS}10:00・残り 20:00）"));
-        // 左上の行の幅（ゲームの文字で 640 − 2 × 6 画素）に、いちばん長い時計の組でも収まる。
+        // 左上の行の幅（ゲームの文字で 640 − 2 × 6画素）にいちばん長い時計の組み合わせでも収まる。
         let game = game_font_spec("");
         let n = Note {
             state: CodeState::Linking,
@@ -9362,7 +9829,7 @@ mod tests {
     fn the_stall_block_fits_the_screen_and_uses_known_glyphs() {
         let game = game_font_spec("");
         let glyphs = ui_glyphs();
-        // ゲームの文字で左上に描く（`net_ui::draw_board` の左上の行）: 画面の幅から左右の余白を引いた幅に収まる。
+        // ゲームの文字で左上に描く（`net_ui::draw_board`の左上の行）: 画面の幅から左右の余白を引いた幅に収まる。
         let limit = 640 - 2 * 6;
         let mut checked = 0u32;
         let mut widest = (0u32, String::new());
@@ -9401,7 +9868,25 @@ mod tests {
         assert!(widest.0 > 0, "{widest:?}");
     }
 
-    /// 「名前」の項目のあるメニュー（ルームサーバーなし）。`now` は今の名前。
+    /// 「zipにしたlogs」を頼む3文（同期ズレ・観戦の接続不能・接続失敗の1行目）を言語ごとに左上の幅（628画素）で測る。
+    /// 上の検査はjaで止まるとenを測らないので、この3文だけ両言語で見る。
+    #[test]
+    fn the_logs_requests_fit_the_corner_in_both_languages() {
+        let game = game_font_spec("");
+        let limit = 640 - 2 * 6;
+        for lang in Lang::ALL {
+            for s in [
+                T_DESYNC_NEXT.get(lang),
+                T_SPECTATE_NO_LINK_NEXT.get(lang),
+                T_FAIL1_B.get(lang),
+            ] {
+                let w = crate::ui_layout::text_width(&game, s);
+                assert!(w <= limit, "{lang:?}: 「{s}」{w} 画素 > {limit}");
+            }
+        }
+    }
+
+    /// 「名前」の項目のあるメニュー（ルームサーバーなし）。`now`は今の名前。
     fn name_driver(now: &str) -> Driver {
         let mut d = Driver::new();
         d.m = Menu::new(ini()).with_player_name(NameBuf::lossy(now));
@@ -9542,7 +10027,7 @@ mod tests {
             assert_eq!(t[0], title, "{t:?}");
             assert_eq!(d.input_line(), "ホストのアドレス: |");
             assert_eq!(t.last().unwrap(), T_LAN_ADDR_KEYS.ja);
-            // 断る: 空・形・ポート・LAN の外。入力に留まり、理由を出す。
+            // 断る: 空・形・ポート・LANの外。入力に留まって理由を出す。
             let out = d.tick_text(0, ENTER);
             assert_eq!((out.cmd, d.m.wants_text()), (None, true));
             assert!(d.text().iter().any(|l| l == T_LAN_ADDR_EMPTY.ja));
@@ -9562,7 +10047,7 @@ mod tests {
             d.tick_text(0, "x");
             assert!(d.text().iter().any(|l| l == T_LAN_ADDR_DROPPED.ja));
             d.tick_text(0, "\u{8}".repeat(TEXT_PER_TICK).as_str());
-            // 1 tick に受ける文字は `TEXT_PER_TICK` 単位までなので 2 回に分ける。
+            // 1 tickに受ける文字は`TEXT_PER_TICK`単位までなので2回に分ける。
             d.tick_text(0, "192.168.0.2:1900");
             d.tick_text(0, "0");
             assert!(!d.text().iter().any(|l| l == T_LAN_ADDR_PORT.ja));
@@ -9573,7 +10058,7 @@ mod tests {
             });
             assert_eq!(out.cmd, Some(want));
             assert!(!d.m.wants_text() && d.m.is_active());
-            // 次に開く入力の初めの値は、今決めたアドレス。
+            // 次に開く入力の初めの値は今決定したアドレス。
             d.idle(3);
             d.cursor_to(item);
             d.tap(Z);
@@ -9612,7 +10097,7 @@ mod tests {
         )
     }
 
-    /// 断る理由は今までの「LANのものではありません」のまま・`wants_lan_addr` はルーム名・名前の入力では立たない。
+    /// 断る理由は今までの「LANのものではありません」のまま・`wants_lan_addr`はルーム名・名前の入力では立たない。
     #[test]
     fn the_address_input_takes_a_vpn_address_only_inside_the_set_network() {
         for item in [Item::LanClient, Item::LanWatch] {
@@ -9653,14 +10138,14 @@ mod tests {
             assert_eq!(out.cmd, Some(want), "{item:?}");
             assert!(!d.m.wants_lan_addr());
         }
-        // 名前の入力は LAN のアドレスの入力ではない。
+        // 名前の入力はLANのアドレスの入力ではない。
         let d = open_name_input("Alice");
         assert!(d.m.wants_text() && !d.m.wants_lan_addr());
     }
 
     #[test]
     fn the_lan_address_rows_name_the_vpn_tool_of_that_address_in_both_layouts_and_languages() {
-        // ツールの並びは、アドレスの並びとわざと食い違わせる（0 番は無し・1 番は ZeroTier・2 番は Radmin・3 番は Hamachi）。
+        // ツールの並びはアドレスの並びとわざと食い違わせる（0番は無し・1番はZeroTier・2番はRadmin・3番はHamachi）。
         let tools = [
             None,
             Some(VpnTool::ZeroTier),
@@ -9680,7 +10165,7 @@ mod tests {
         ] {
             let mut d = name_driver("Alice");
             d.m.lang = lang;
-            // 5 つ: スクロールの形（先頭の 3 つが見え、↓で残りが見える）。
+            // 5つ: スクロールの形（先頭の3つが見え、↓で残りが見える）。
             d.note = note;
             let at = |n: usize| format!("192.168.0.{}:17723{}", n + 1, label[n]);
             let t = d.text();
@@ -9688,7 +10173,7 @@ mod tests {
             for n in 0..3 {
                 assert_eq!(t[from + 2 + n], format!("  {}", at(n)), "{lang:?} {n}");
             }
-            // 3 つ以下: 平らな形。
+            // 3つ以下: 平らな形。
             let mut three = note;
             three.lan_n = 3;
             d.note = three;
@@ -9697,7 +10182,7 @@ mod tests {
             for n in 0..3 {
                 assert_eq!(t[from + 1 + n], format!("  {}", at(n)), "{lang:?} {n}");
             }
-            // 札の語は 2 bit ずつ: 4 番目のアドレス（Hamachi）を見るために、スクロールのウィンドウを動かす。
+            // Noteのワードではツールが2 bitずつ: 4番目のアドレス（Hamachi）を見るためにスクロールのウィンドウを動かす。
             d.note = note;
             for _ in 0..6 {
                 d.tap(DOWN);
@@ -9708,7 +10193,7 @@ mod tests {
                 "{lang:?}: {shown:?}"
             );
         }
-        // 全部のアドレスに別々のツールを載せても、語の往復で落ちない（最後のアドレスまで）。
+        // 全部のアドレスに別々のツールを載せてもワードへ変換して戻すと失われない（最後のアドレスまで）。
         let mut full = note;
         full.lan_n = LAN_IPS_MAX as u8;
         for (i, t) in full.lan_tools.iter_mut().enumerate() {
@@ -9720,7 +10205,7 @@ mod tests {
             ][i % 4];
         }
         assert_eq!(Note::from_words(&full.to_words()), full);
-        // 札に無いツールの番号は「無し」に落とす。
+        // ツールの番号のワードの全ビットが立っていれば全部ZeroTier、どのビットも立っていなければ全部「無し」になる。
         let mut w = full.to_words();
         w[W_LAN_TOOLS] = u32::MAX;
         assert!(
@@ -9790,7 +10275,7 @@ mod tests {
         assert_eq!(t[from + 1], "  192.168.0.10:17723");
         assert_eq!(t[from + 2], "  192.168.0.20:17723");
         assert_eq!(t[from + 3], "", "アドレスは 2 つだけ");
-        // 「ホスト」の項目の印は無い（待ちの間は項目が出ない）。左上は帯の 1 行。
+        // 「ホスト」の項目の印は無い（待ちの間は項目が出ない）。左上は帯の1行。
         let mut o = [LineBuf::new(); 2];
         let mut st = [RowStyle::Normal; 2];
         let n = corner_lines(
@@ -9804,7 +10289,7 @@ mod tests {
         );
         assert_eq!((n, o[0].as_str()), (1, "LANで待機中 0:42"));
         assert!(corner_is_band(Conn::Waiting, &waiting, None));
-        // 接続の途中: 左上は 2 行、帯ではない。
+        // 接続の途中: 左上は帯ではなく2行。
         let linking = lan_note(CodeState::LanLinking, Event::LanPeer);
         let n = corner_lines(
             Conn::Waiting,
@@ -9837,7 +10322,7 @@ mod tests {
         assert!(d.text().iter().any(|l| l == T_LAN_WAITING.en));
     }
 
-    /// `n` 個のアドレス（192.168.0.1〜）を待機で並べる札。
+    /// `n`個のアドレス（192.168.0.1〜）を待機で並べるNote。
     fn lan_waiting_with(n: usize) -> Note {
         let mut note = lan_note(CodeState::LanWaiting, Event::None);
         for i in 0..n {
@@ -9847,7 +10332,7 @@ mod tests {
         note
     }
 
-    /// 待機の説明の次から、上の行・アドレス 3 行・下の行（スクロールの形）。
+    /// 待機の説明の次から上の行・アドレス3行・下の行（スクロールの形）。
     fn lan_block(d: &Driver) -> Vec<String> {
         let t = d.text();
         let from = t
@@ -9871,7 +10356,7 @@ mod tests {
                 "  ▼ ほか 2 件"
             ]
         );
-        // 項目（設定・待機をやめる・もどる）を回りきると、アドレスの行に入る。
+        // 項目（設定・待機をやめる・もどる）を回りきるとカーソルがアドレスの行に入る。
         for _ in 0..3 {
             d.tap(DOWN);
         }
@@ -9947,7 +10432,7 @@ mod tests {
         assert_eq!(d.cmds, vec![], "アドレスの行で何も決まらない");
         assert!(d.m.is_open() && !d.m.wants_watch_list());
         assert_eq!(d.text(), before, "画面が変わらない");
-        // 3 つ以下: 説明・アドレスだけで、↓は項目の中を回る。
+        // 3つ以下: 説明・アドレスだけで、↓は項目の中を回る。
         for n in [1, 2, 3] {
             let mut d = name_driver("Alice");
             d.note = lan_waiting_with(n);
@@ -10010,13 +10495,13 @@ mod tests {
             assert_eq!(w[0], ev.is_trouble(), "{ev:?}");
             if ev.is_trouble() {
                 troubles += 1;
-                // 待っている間にメニューを閉じていても、左上に理由が残る。
+                // 待っている間にメニューを閉じていても左上に理由が残る。
                 assert!(ev.is_room_trouble(), "{ev:?}");
             }
         }
         assert_eq!(troubles, 7);
         assert!(!Event::LanPeer.is_trouble() && !Event::LanCancelled.is_trouble());
-        // 待ちのポートは文に入る。
+        // 待ちのポートは文に含まれる。
         let mut n = lan_note(CodeState::Idle, Event::LanPortBusy);
         n.lan_port = 19000;
         let mut out = [LineBuf::new(); STATUS_ROWS];
@@ -10026,7 +10511,7 @@ mod tests {
             out[0].as_str(),
             "ポート19000を使えません（ほかのプログラムが使用しています）。"
         );
-        // アドレスの並びは語の往復で落ちない。
+        // アドレスの並びはワードへ変換して戻しても失われない。
         let a = lan_note(CodeState::LanWaiting, Event::None);
         assert_eq!(Note::from_words(&a.to_words()), a);
         let mut three = a;
@@ -10071,9 +10556,9 @@ mod tests {
         assert_eq!(r.styles[at], RowStyle::Normal);
         assert_eq!(r.lines[at - 1].as_str(), "", "案内の前は隙間");
         assert!(!hint_shown(&name_driver("Alice")), "決めた名前で案内が出た");
-        // 名前の項目を持たない呼び手には、決める場所が無いので出さない。
+        // 名前の項目を持たない呼び手には設定する場所が無いので出さない。
         assert!(!hint_shown(&Driver::new()));
-        // 状況の行（出来事・準備中・接続した後）があればそちらを優先する。
+        // 状況の行（イベント・準備中・接続した後）があればそちらを優先する。
         let mut d = default_name_driver();
         d.note.event = Event::Empty;
         assert!(!hint_shown(&d));
@@ -10083,7 +10568,7 @@ mod tests {
         let mut d = default_name_driver();
         d.conn = connected();
         assert!(!hint_shown(&d));
-        // 設定の画面の中では案内しない。名前を決めると消える。
+        // 設定の画面の中では案内しない。名前を設定すると消える。
         let mut d = default_name_driver();
         d.cursor_to(Item::Name);
         assert!(!hint_shown(&d));
@@ -10117,7 +10602,7 @@ mod tests {
         d.idle(3);
         d.m.open(0);
         assert_eq!(at(&d), Item::Create, "2 回目は先頭");
-        // 名前を決めてある（既定でない）ときは、最初でも先頭。
+        // 名前が設定済み（既定でない）のときは最初でも先頭。
         let d = name_driver("Alice");
         let (v, n) = d.m.items(d.conn, d.note.state);
         assert_eq!(v[d.m.settled_cursor(&(v, n))], Item::Create);
@@ -10125,7 +10610,7 @@ mod tests {
         let d = Driver::new();
         let (v, n) = d.m.items(d.conn, d.note.state);
         assert_eq!(v[d.m.settled_cursor(&(v, n))], Item::Create);
-        // 最初に開いたときが「設定」の無い状態（接続した後）なら、そのまま先頭で、次に開くときも先頭。
+        // 最初に開いたときが「設定」の無い状態（接続した後）なら先頭のままで、次に開くときも先頭。
         let mut m =
             Menu::new(ini()).with_player_name(NameBuf::lossy(crate::player_name::DEFAULT_NAME));
         m.open(0);
@@ -10143,7 +10628,7 @@ mod tests {
         assert_eq!(d.text()[0], T_GROUP_SETTINGS.ja);
         // 先頭の項目から。
         assert!(d.text()[1].starts_with("> "), "{:?}", d.text());
-        // キャンセルは入口のメニューへ戻り、「設定」の行に残る。
+        // キャンセルすると入口のメニューへ戻り「設定」の行にカーソルが残る。
         d.tap(X);
         assert_eq!(d.m.state, State::Open);
         assert!(
@@ -10151,10 +10636,10 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("> ") && l.contains(T_GROUP_SETTINGS.ja))
         );
-        // 入口のメニューのキャンセルは閉じる。
+        // 入口のメニューでキャンセルを押すと閉じる。
         d.tap(X);
         assert!(!d.m.is_active());
-        // 「もどる」も同じく 1 つ上へ。
+        // 「もどる」も同じく1つ上へ。
         let mut d = name_driver("Alice");
         d.cursor_to(Item::Format);
         d.cursor_to(Item::Back);
@@ -10165,7 +10650,7 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("> ") && l.contains(T_GROUP_SETTINGS.ja))
         );
-        // 設定の画面を開いたまま入口のメニューをもう一度開くと、入口のメニューから始まる。
+        // 設定の画面を開いたまま入口のメニューをもう一度開くと入口のメニューから始まる。
         let mut d = name_driver("Alice");
         d.cursor_to(Item::Format);
         d.m.open(0);
@@ -10228,16 +10713,16 @@ mod tests {
         assert_eq!(d.input_line(), "プレイヤー名: Alice|", "{t:?}");
         assert_eq!(t.last().unwrap(), T_NAME_INPUT_KEYS.ja);
         d.tick_text(0, "_ 2");
-        d.tick_text(0, "ＡＢ-.あ");
+        d.tick_text(0, "ＡＢ-.あ/;`");
         assert_eq!(
             d.input_line(),
-            "プレイヤー名: Alice_2AB-|",
-            "空白は入らない"
+            "プレイヤー名: Alice_ 2AB-.|",
+            "間の空白と . は入り、あ / ; ` は入らない"
         );
-        d.tick_text(0, "\u{8}\u{8}\u{8}");
-        assert_eq!(d.input_line(), "プレイヤー名: Alice_2|");
+        d.tick_text(0, "\u{8}\u{8}\u{8}\u{8}");
+        assert_eq!(d.input_line(), "プレイヤー名: Alice_ 2|");
         let out = d.tick_text(0, &format!("x{ENTER}"));
-        let want = NameBuf::from_name("Alice_2x").unwrap();
+        let want = NameBuf::from_name("Alice_ 2x").unwrap();
         assert_eq!(out.cmd, Some(Cmd::Name(want)));
         assert!(out.hold_game);
         assert!(!d.m.wants_text(), "決めても入力が閉じない");
@@ -10246,13 +10731,13 @@ mod tests {
         assert!(
             d.text()
                 .iter()
-                .any(|l| l == &format!("> {}Alice_2x", lab(T_NAME, Lang::Ja))),
+                .any(|l| l == &format!("> {}Alice_ 2x", lab(T_NAME, Lang::Ja))),
             "{:?}",
             d.text()
         );
         d.tap(Z);
         assert!(d.m.wants_text());
-        assert_eq!(d.input_line(), "プレイヤー名: Alice_2x|");
+        assert_eq!(d.input_line(), "プレイヤー名: Alice_ 2x|");
     }
 
     #[test]
@@ -10272,16 +10757,16 @@ mod tests {
         assert!(d.m.wants_text(), "断った後は入力に留まる");
         assert!(has(&d, T_NAME_INPUT_EMPTY.ja));
         d.tick_text(0, " ");
-        assert_eq!(d.input_line(), "プレイヤー名: |", "空白が入った");
+        assert_eq!(d.input_line(), "プレイヤー名:  |", "空白は打てる");
         let out = d.tick_text(0, ENTER);
         assert_eq!(out.cmd, None, "空白だけの名前で決まった");
         assert!(has(&d, T_NAME_INPUT_EMPTY.ja));
-        d.tick_text(0, "a");
+        d.tick_text(0, "\u{8}a");
         assert!(
             !has(&d, T_NAME_INPUT_EMPTY.ja),
             "文字を打っても断りが消えない"
         );
-        for dropped in [" ", "ｱ", "あ", ".", "!"] {
+        for dropped in ["ｱ", "あ", "/", ";", "`"] {
             d.tick_text(0, dropped);
             assert!(has(&d, T_NAME_INPUT_DROPPED.ja), "{dropped:?}");
             d.tick_text(0, "b");
@@ -10435,8 +10920,40 @@ mod tests {
                 widest = widest.max(w);
             }
         }
-        // 母数が 0 のまま通らないように: いちばん広いのは半角 32 文字（`1P ` ＋ 32 × 7 = 245）。
+        // 母数が0のまま通らないように: いちばん広いのは半角32文字（`1P ` ＋ 32 × 7 = 245）。
         assert_eq!(widest, 35 * 7);
+    }
+
+    #[test]
+    fn the_seat_label_range_is_exactly_the_two_label_characters_at_the_outer_end() {
+        assert_eq!(
+            T_HUD_SEAT_1.ja, T_HUD_SEAT_1.en,
+            "語が日英で違うと範囲がずれる"
+        );
+        assert_eq!(T_HUD_SEAT_2.ja, T_HUD_SEAT_2.en);
+        let mut l = LineBuf::new();
+        let long = "あ".repeat(60);
+        let mut n = 0;
+        for lang in Lang::ALL {
+            for (seat, label) in [(Seat::P1, "1P"), (Seat::P2, "2P")] {
+                for name in ["Alice", "", "1P 2P", "2P", long.as_str()] {
+                    name_band_line(&mut l, lang, seat, name.as_bytes());
+                    let line = l.as_str();
+                    let r = name_band_label_range(seat, line).unwrap();
+                    assert_eq!(&line[r.clone()], label, "{line}");
+                    match seat {
+                        Seat::P1 => assert_eq!(r.start, 0),
+                        Seat::P2 => assert_eq!(r.end, line.len()),
+                    }
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, 2 * 2 * 5);
+        assert_eq!(name_band_label_range(Seat::P1, "Alice 2P"), None);
+        assert_eq!(name_band_label_range(Seat::P2, "1P Alice"), None);
+        assert_eq!(name_band_label_range(Seat::P1, ""), None);
+        assert_eq!(name_band_label_range(Seat::P2, "P"), None);
     }
 
     #[test]
@@ -10449,8 +10966,9 @@ mod tests {
     fn the_status_line_at_the_bottom_stops_before_the_fps_text_in(lang: Lang) {
         use crate::frame::MAX_DELAY;
         use crate::ui_layout::{
-            FPS_LEFT, HUD_BOTTOM_RIGHT, HUD_BOTTOM_TEXT_MAX_W, HUD_CELL_W, HUD_EDGE_X,
-            HUD_TEXT_MAX_W, PAD, text_width_plain,
+            FPS_LEFT, FPS_RIGHT, GAME_SCREEN_W, HUD_BOTTOM_LEFT_MIN, HUD_BOTTOM_RIGHT,
+            HUD_BOTTOM_TEXT_MAX_W, HUD_CELL_W, HUD_EDGE_X, HUD_TEXT_MAX_W, PAD, hud_bottom_cap,
+            hud_right_text_x, text_width_plain,
         };
         const { assert!(HUD_BOTTOM_RIGHT + HUD_CELL_W <= FPS_LEFT) };
         const { assert!(HUD_BOTTOM_TEXT_MAX_W < HUD_TEXT_MAX_W) };
@@ -10543,6 +11061,15 @@ mod tests {
             },
         );
         assert!(text_width_plain(&spec, l.as_str()) > HUD_BOTTOM_TEXT_MAX_W);
+        // 右下（右寄せ）に置いてもいちばん広い行の下地の左端がfpsの文字の右の縁の手前に入らない。
+        for w in [widest.0, widest_select.0] {
+            let left = hud_right_text_x(GAME_SCREEN_W, w).saturating_sub(PAD);
+            assert!(w > 0 && w <= hud_bottom_cap(GAME_SCREEN_W, true));
+            assert!(
+                left >= HUD_BOTTOM_LEFT_MIN,
+                "右下の下地の左端 {left} が fps（右の縁 {FPS_RIGHT}）に近すぎる"
+            );
+        }
     }
 
     // ---- 言語（日本語・英語） ----
@@ -10659,7 +11186,7 @@ mod tests {
 
     #[test]
     fn every_text_has_an_english_that_is_not_a_leftover_japanese() {
-        // 日本語に残る語: ゲームの項目の名前（訳さない）と、言語の行の自分の名前。
+        // 日本語に残る語: ゲームの項目の名前（訳さない）と言語の行の自分の名前。
         let allowed = ["妖怪", "対", "日本語"];
         let mut empty_ja = Vec::new();
         for tx in TEXTS {
@@ -10677,7 +11204,7 @@ mod tests {
                 tx.en
             );
         }
-        // 日本語が空なのは、語順の違いで英語にだけ先頭の文字がある 2 つだけ。
+        // 日本語が空なのは、語順の違いで英語にだけ先頭の文字がある2つだけ。
         assert_eq!(
             empty_ja,
             [T_ROOM_BUSY_NEXT_OPEN.en, T_SPECTATE_GAVE_UP_OPEN.en]
@@ -10776,11 +11303,7 @@ mod tests {
         found_line(&mut line, Lang::En, false, 599);
         assert_eq!(line.as_str(), "Opponent found (closes in 9:59)");
         other_build_line(&mut line, Lang::En, BUILD_NUMBER, 0);
-        assert!(
-            line.as_str().ends_with(", opponent dev)."),
-            "{}",
-            line.as_str()
-        );
+        assert!(line.as_str().ends_with(", them dev)."), "{}", line.as_str());
         hud_line(
             &mut line,
             Lang::En,
@@ -10840,7 +11363,7 @@ mod tests {
             Conn::Desynced,
         ];
         for lang in Lang::ALL {
-            // 配るバージョンでは自分も相手も日付と時刻（20261008-2100 の形）で出るので、いちばん長い組を直に測る。
+            // 配布するバージョンでは自分も相手も日付と時刻（20261008-2100の形）で出るので、いちばん長い組み合わせを直接測る。
             let mut line = LineBuf::new();
             for (mine, theirs) in [(404_000, 404_000), (404_000, 0), (0, 404_000)] {
                 other_build_line(&mut line, lang, mine, theirs);
@@ -10868,7 +11391,7 @@ mod tests {
                     let mut rows = MenuRows::new();
                     m.render(conn, &note, 1_000_000, &mut rows);
                     for l in &rows.lines[..rows.len] {
-                        // 行の入れ物（`LINE_BYTES`）で黙って切れていない（切れるのは満杯のときだけ）。
+                        // 行のバッファ（`LINE_BYTES`）で黙って切れていない（切れるのは満杯のときだけ）。
                         assert!(
                             l.as_str().len() + 4 <= LINE_BYTES,
                             "{lang:?}: 「{}」",
@@ -10921,7 +11444,7 @@ mod tests {
         }
     }
 
-    /// 名前に打てる `@` が、GDI の文字の表にもゲームの文字の表にも入っていて、入力の画面の行が `?` にならずに収まる。
+    /// 名前に打てる`@`がGDIの文字の表にもゲームの文字の表にも入っているので、入力の画面の行が`?`にならずに収まる。
     #[test]
     fn the_at_sign_is_drawn_in_both_glyph_tables() {
         let plain = AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap();
@@ -10940,7 +11463,7 @@ mod tests {
         assert_eq!(d.input_line(), "ルーム名: a@b|");
     }
 
-    /// 値の始まりの x（画素）: 「◀」のある行は◀の手前までの幅、名前の行は `value` の手前までの幅。
+    /// 値の始まりのx（画素）: 「◀」のある行は◀の手前までの幅。名前の行は`value`の手前までの幅。
     fn value_x(spec: &AtlasSpec, row: &str, value: &str) -> Option<u32> {
         let at = row.find('◀').or_else(|| row.find(value))?;
         Some(crate::ui_layout::text_width(spec, &row[..at]))
@@ -11061,7 +11584,7 @@ mod tests {
 
     #[test]
     fn the_waiting_mark_sits_on_the_row_that_started_the_wait_with_the_corner_clock() {
-        // (状態, ランダムの印, 印の付く行)。時計は待った時間（552 秒 = 9:12）で、左上の行と同じ値。
+        // (状態, ランダムの印, 印の付く行)。時計は待った時間（552秒 = 9:12）で左上の行と同じ値。
         for (state, random, row) in [
             (CodeState::RoomJoining, true, T_RANDOM),
             (CodeState::RoomWaiting, true, T_RANDOM),
@@ -11176,7 +11699,7 @@ mod tests {
 
     #[test]
     fn the_cursor_stays_on_the_same_item_when_the_room_name_row_comes_and_goes() {
-        // 待ちの間も残る項目は、ルーム名・観戦・名前・サイドの行が出入りしても同じ項目に残る。
+        // 待ちの間も残る項目はルーム名・観戦・名前・サイドの行が出入りしても同じ項目に残る。
         for start in [
             Item::Random,
             Item::Room,
@@ -11268,7 +11791,7 @@ mod tests {
             );
             assert!(t.contains(&T_NEXT_RANDOM_WAITING.get(lang)), "{t:?}");
             assert!(!t.contains(&T_NEXT_ROOM_WAITING.get(lang)), "{t:?}");
-            // 同じ状態でルームの待機なら、ルーム名の行になる（random の印だけが違いを作る）。
+            // 同じ状態でルームの待機ならルーム名の行になる（randomの印だけが違いを作る）。
             note.random = false;
             note.room = sanitize_room("abc", |_| true);
             let room_line = corner_text(&note, lang);
@@ -11297,7 +11820,7 @@ mod tests {
         for lang in Lang::ALL {
             for ev in [
                 Event::RoomBusy,
-                Event::RoomFull,
+                Event::RoomInUse,
                 Event::RoomRefused,
                 Event::RoomExpired,
                 Event::RoomPeerLeft,
@@ -11377,7 +11900,7 @@ mod tests {
         s
     }
 
-    /// 観戦の「ランダムマッチ」を決めて一覧の画面を開いた状態。
+    /// 観戦の「ランダムマッチ」を決定して一覧の画面を開いた状態。
     struct ListDriver {
         m: Menu,
         w: Box<WatchSnapshot>,
@@ -11397,7 +11920,7 @@ mod tests {
                 cmds: Vec::new(),
                 conn: Conn::Waiting,
             };
-            // 対戦の 3 項目（ランダムマッチ・ルームマッチ・ルーム名）の下が観戦のランダムマッチ。
+            // 対戦の3項目（ランダムマッチ・ルームマッチ・ルーム名）の下が観戦のランダムマッチ。
             for _ in 0..3 {
                 d.tap(DOWN);
             }
@@ -11470,7 +11993,7 @@ mod tests {
         d.m.render(Conn::Waiting, &quiet(), 0, &mut rows);
         let t: Vec<&str> = rows.lines[..rows.len].iter().map(LineBuf::as_str).collect();
         assert!(t.contains(&format!("> {}", T_RANDOM.ja).as_str()), "{t:?}");
-        // 「もどる」の項目を決めても元のメニューへ。
+        // 「もどる」の項目を決定しても元のメニューへ。
         let mut d = ListDriver::new(&[]);
         assert_eq!(d.marked(), [format!("> {}", T_BACK.ja)]);
         d.tap(Z);
@@ -11488,7 +12011,7 @@ mod tests {
         let d = ListDriver::new(&rows);
         let t = d.text();
         assert_eq!(t[1], format!("> {}", row_line(&rows[0])));
-        // 名前の欄は 12 文字まで（越える分は切る）。
+        // 名前のフィールドは12文字まで（越える分は切る）。
         assert_eq!(t[2], format!("  {}", row_line(&rows[1])));
         assert!(t[2].starts_with("  Carol-123456 vs Dave"), "{:?}", t[2]);
         assert_eq!(t[3], format!("  {}", row_line(&rows[2])));
@@ -11523,7 +12046,7 @@ mod tests {
         assert_eq!(t[1], "", "先頭では上の行は空");
         assert_eq!(t[10], "  ▼ ほか 4 件", "{t:?}");
         let len_top = d.rows().len;
-        // 8 行目を越えて下へ: 先頭が送られ、上に ▲ が出る。
+        // 8行目を越えて下へ: 先頭が送られ、上に ▲ が出る。
         for _ in 0..8 {
             d.tap(DOWN);
         }
@@ -11545,13 +12068,13 @@ mod tests {
         let t = d.text();
         assert_eq!(t[1], "  ▲ ほか 4 件");
         assert_eq!(t[10], "");
-        // 折り返して先頭へ・先最初から上で「もどる」へ。
+        // 「もどる」から下へ進むと先頭へ折り返し、先頭から上へ進むと「もどる」へ戻る。
         d.tap(DOWN);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[0]))]);
         assert_eq!(shown(&d)[0], "P0");
         d.tap(UP);
         assert_eq!(d.marked(), [format!("> {}", T_BACK.ja)]);
-        // 8 行以下なら「ほか」の行は出ない。
+        // 8行以下なら「ほか」の行は出ない。
         let d = ListDriver::new(&rows[..8]);
         let t = d.text();
         assert!(!t.iter().any(|l| l.contains("ほか")), "{t:?}");
@@ -11617,7 +12140,7 @@ mod tests {
             "満員の行を飛ばして戻る"
         );
         assert_eq!(d.cmds, vec![]);
-        // 全部満員なら、カーソルは「もどる」で、決定は一覧を出るだけ。
+        // 全部満員ならカーソルは「もどる」にあり、決定すると一覧を出るだけ。
         let all_full = [wrow(1, "A", "B", 10, 10), wrow(2, "C", "D", 5, 5)];
         let mut d = ListDriver::new(&all_full);
         assert_eq!(d.marked(), [format!("> {}", T_BACK.ja)]);
@@ -11635,7 +12158,7 @@ mod tests {
             wrow(2, "Carol", "Dave", 0, 10),
         ];
         let mut d = ListDriver::new(&rows);
-        // 動かした後の（行を覚えた）カーソルは、その行が満員になっても動かない。
+        // 動かした後のカーソルは行を覚えており、その行が満員になっても動かない。
         d.tap(DOWN);
         d.tap(UP);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[0]))]);
@@ -11646,7 +12169,7 @@ mod tests {
         d.tap(Z);
         assert_eq!(d.cmds, vec![], "満員になった行を観戦する指示が出た");
         assert!(d.m.wants_watch_list(), "一覧を出てしまった");
-        // 満員の行の上からも、↓ で次の選べる行へ動ける。
+        // 満員の行の上からも↓ で次の選べる行へ動ける。
         d.tap(DOWN);
         assert_eq!(d.marked(), [format!("> {}", row_line(&full[1]))]);
         d.tap(Z);
@@ -11664,7 +12187,7 @@ mod tests {
         d.tap(DOWN);
         d.tap(DOWN);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[2]))]);
-        // 上の行が消えても、カーソルは同じ行（行の番号が 2 → 1 に変わる）。
+        // 上の行が消えてもカーソルは同じ行（行の番号が2 → 1に変わる）。
         d.w.set(ListStatus::Ready, &rows[1..]);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[2]))]);
         d.tap(Z);
@@ -11675,17 +12198,17 @@ mod tests {
         let fresh = wrow(9, "New", "One", 0, 10);
         d.w.set(ListStatus::Ready, &[fresh, rows[0], rows[1], rows[2]]);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[1]))]);
-        // 選んでいた行そのものが消えたら、別の行を指したままにせず、選べる最初の行へ戻る（動きが見える）。
+        // 選択中の行そのものが消えたら、別の行を指したままにせず選べる最初の行へ戻る（動きが見える）。
         d.w.set(ListStatus::Ready, &[fresh, rows[0], rows[2]]);
         assert_eq!(d.marked(), [format!("> {}", row_line(&fresh))]);
         d.tap(Z);
         assert_eq!(d.cmds, vec![Cmd::SpectateListed(fresh)]);
-        // 動かしていない間は、最初に来た行ではなく「選べる最初の行」を指し続ける。
+        // 動かしていない間は最初に来た行ではなく「選べる最初の行」を指し続ける。
         let mut d = ListDriver::with(Lang::Ja, snap(ListStatus::Loading, &[]));
         assert_eq!(d.marked(), [format!("> {}", T_BACK.ja)]);
         d.w.set(ListStatus::Ready, &rows);
         assert_eq!(d.marked(), [format!("> {}", row_line(&rows[0]))]);
-        // 「もどる」へ動かしたら、一覧が変わっても「もどる」に留まる。
+        // 「もどる」へ動かしたら一覧が変わっても「もどる」に留まる。
         d.tap(UP);
         assert_eq!(d.marked(), [format!("> {}", T_BACK.ja)]);
         d.w.set(ListStatus::Ready, &[fresh, rows[0]]);
@@ -11748,7 +12271,8 @@ mod tests {
             .map(|i| wrow(i + 1, "Alice", "Bob", i % 10, 10))
             .collect();
         let mut d = ListDriver::new(&many);
-        // 満員でない行（10 行に 1 行は 0/10…9/10 のうち 9/10 まで。満員なのは「1/1」ではなく 10/10 だけ）を全部たどって「もどる」へ。
+        // 満員でない行を全部たどって「もどる」へ進む。
+        // 観戦者数は0/10〜9/10を繰り返し、10行に1行は9/10。満員なのは「1/1」ではなく10/10だけ。
         let selectable = many.iter().filter(|r| !r.is_full()).count();
         for _ in 0..selectable {
             d.tap(DOWN);

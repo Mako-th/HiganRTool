@@ -1,9 +1,11 @@
-//! 2 台の突き合わせ（`peer_sim --compare2 A.csv B.csv`）: 同じ PC で本物の花映塚を 2 つ走らせたときの、両方の dll の `_net_frames.csv` を比べる。
-//! 使ったフレームの列 (seg, frame, 1P, 2P) が同じかを見て、両者の余裕と待ちの分布（p50 / p95 / p99 / max）と、待ちを 1 ms の枠で数えた表を出す。分布の書き方は `compare.rs` と同じ。
-//! 一致の決まり: 短い方の行は全部、長い方の同じ番目の行と (seg, frame, 1P, 2P) が同じ（`same_key`）。どちらかが 0 行なら比べられていないので食い違いとする。
-//! 長い方の余りは「最後に一致した行の delay + 1」行まで（lockstep では相手の入力ワードが delay フレーム先まで届いていて、BYE の後に受けた側が使い切ると、その分だけ先へ進みうる。推定で、本物どうしの実測の余りはまだ無い）。
-//! delay は一致の条件に入れず、違う行の数だけ別の 1 行で出す（`Outcome2::delay_only`。書き出す時点の今の D（`netplay/rollback.rs` の `cur_delay()`）なので、マッチの途中で D を替えると両台で違いうる）。
-//! 読むだけのツール（ファイルは `main.rs` が読む）。
+//! 2台の突き合わせ（`peer_sim --compare2 A.csv B.csv`）。同じPCで本物の花映塚を2つ走らせたときの両方のdllの`_net_frames.csv`を比べる。
+//! 使ったフレームの列 (seg, frame, 1P, 2P)が同じかを見る。両者の余裕と待ちの分布（p50 / p95 / p99 / max）と待ちを1 msの枠で数えた表を出す。分布の書き方は`compare.rs`と同じ。
+//! 一致の決まり: 短い方の全部の行について長い方の同じ番目の行と (seg, frame, 1P, 2P)が同じ（`same_key`）。どちらかが0行なら比べられていないので食い違いとする。
+//! 長い方の余りは「最後に一致した行の delay + 1」行まで許す。
+//! lockstepでは相手の入力ワードがdelayフレーム先まで届いている。BYEの後に受けた側が使い切ると、その分だけ先へ進みうる。この説明は推定。本物どうしの実測の余りはまだ無い。
+//! delayは一致の条件に入れない。違う行の数だけ別の1行で出す（`Outcome2::delay_only`）。
+//! delayは書き出す時点の今のD（`netplay/rollback.rs`の`cur_delay()`）なのでマッチの途中でDを替えると両台で違いうる。
+//! 読むだけのツール（ファイルは`main.rs`が読む）。
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -14,14 +16,14 @@ use crate::compare::{DllRow, Row, dist, row_text, same_key, verdict};
 pub struct Outcome2 {
     pub a_rows: usize,
     pub b_rows: usize,
-    /// 先頭から続けて一致した行の数（delay は入らない）。
+    /// 先頭から続けて一致した行の数（delayは入らない）。
     pub matched: usize,
-    /// 先頭から一致した行のうち delay だけが違った行の数（一致の判定には入れない）。
+    /// 先頭から一致した行のうちdelayだけが違った行の数（一致の判定には入れない）。
     pub delay_only: usize,
-    /// 最初に食い違った番目と、そこの両者の行（片方が尽きていれば None）。
+    /// 最初に食い違った番目とそこの両者の行（片方が尽きていればNone）。
     pub first_diff: Option<(usize, Option<Row>, Option<Row>)>,
     pub tail: usize,
-    /// 余りを許す上限（最後に一致した行の両台の delay の大きい方 + 1。一致が 0 行なら 0）。
+    /// 余りを許す上限（最後に一致した行の両台のdelayの大きい方 + 1。一致が0行なら0）。
     pub tail_limit: usize,
     pub ok: bool,
 }
@@ -41,7 +43,7 @@ pub fn compare2(a: &[DllRow], b: &[DllRow]) -> Outcome2 {
         .count();
     let short = a.len().min(b.len());
     let tail = a.len().max(b.len()) - short;
-    // 最後に一致した行の delay は途中の切替で両台が違いうるので、大きい方 + 1。
+    // 最後に一致した行のdelayは途中の切替で両台が違いうるので大きい方 + 1。
     let tail_limit = matched.checked_sub(1).map_or(0, |i| {
         let d = |rows: &[DllRow]| rows.get(i).map_or(0, |r| usize::from(r.row.delay));
         d(a).max(d(b)) + 1
@@ -66,10 +68,10 @@ pub fn compare2(a: &[DllRow], b: &[DllRow]) -> Outcome2 {
     }
 }
 
-/// 待ちを数える枠の数（0 / 1 ms 未満 / 1〜15 ms の 1 ms ごと / 16 ms 以上）。
+/// 待ちを数える枠の数（0 / 1 ms未満 / 1〜15 msの1 msごと / 16 ms以上）。
 const WAIT_BINS: usize = 18;
 
-/// 待ち（µs）を枠に分ける。0 は待たなかった、1 は 1 ms 未満、k + 1 は k ms 以上 k + 1 ms 未満（k = 1〜15）、17 は 16 ms 以上。
+/// 待ち（µs）を枠に分ける。0は待たなかった。1は1 ms未満。k + 1 はk ms以上 k + 1 ms未満（k = 1〜15）。17は16 ms以上。
 fn wait_bin(us: u64) -> usize {
     match us {
         0 => 0,
@@ -159,7 +161,7 @@ fn side(s: &mut String, label: &str, rows: &[DllRow]) {
     );
 }
 
-/// `a_name` / `b_name` は表示に使う名前。
+/// `a_name` / `b_name`は表示に使う名前。
 pub fn report2(a: &[DllRow], b: &[DllRow], a_name: &str, b_name: &str) -> (String, bool) {
     let o = compare2(a, b);
     let mut s = String::new();
@@ -283,13 +285,13 @@ mod tests {
         assert!(!o.ok);
         assert_eq!(o.matched, 2);
         assert_eq!(o.first_diff.map(|x| x.0), Some(2));
-        // delay だけの違いは一致。数だけ別に出す。
+        // delayだけの違いは一致。数だけ別に出す。
         let mut b2 = b.clone();
         b2[4].row.delay = 3;
         let o = compare2(&a, &b2);
         assert!(o.ok, "{o:?}");
         assert_eq!((o.matched, o.delay_only), (5, 1));
-        // 欄の違いは食い違い。delay が同じでも違っても。
+        // フィールドの違いは食い違い（delayが同じでも違っても）。
         for (what, edit) in [
             ("seg", (|r: &mut Row| r.seg = 7) as fn(&mut Row)),
             ("frame", |r| r.frame = 9),
@@ -306,14 +308,14 @@ mod tests {
                 assert_eq!(o.delay_only, 0, "{what}");
             }
         }
-        // 食い違いより前の delay だけの違いは一致の行として数える（後ろは数えない）。
+        // 食い違いより前のdelayだけの違いは一致の行として数える（後ろは数えない）。
         let mut b5 = b.clone();
         b5[1].row.delay = 9;
         b5[3].row.p2 = 0x44;
         let o = compare2(&a, &b5);
         assert!(!o.ok);
         assert_eq!((o.matched, o.delay_only), (3, 1));
-        // 余りは最後の delay + 1 = 3 行まで。B が 3 行多い ⇒ 一致、4 行多い ⇒ 食い違い。
+        // 余りは最後の delay + 1 = 3行まで。Bが3行多いと一致。4行多いと食い違い。
         let mut b3 = b.clone();
         for f in 1..=3 {
             b3.push(extra(1, f, 2));
@@ -323,7 +325,7 @@ mod tests {
         assert_eq!(o.tail, 3);
         b3.push(extra(1, 4, 2));
         assert!(!compare2(&a, &b3).ok);
-        // 最後に一致した行の delay が両台で違う（A 2・B 4）: 上限は大きい方 + 1 = 5。
+        // 最後に一致した行のdelayが両台で違う（A 2・B 4）: 上限は大きい方 + 1 = 5。
         let mut b6 = b.clone();
         b6[4].row.delay = 4;
         let mut long_b = b6.clone();
@@ -345,7 +347,7 @@ mod tests {
         assert!(compare2(&a3, &b).ok);
         let (text, _) = report2(&a3, &b, "a", "b");
         assert!(text.contains("余り 3 行（Aの側"), "{text}");
-        // 0 行は比べられていない。
+        // 0行は比べられていない。
         assert!(!compare2(&[], &[]).ok);
         assert!(!compare2(&a, &[]).ok);
         let (text, ok) = report2(&[], &b, "a", "b");

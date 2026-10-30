@@ -1,7 +1,8 @@
-//! ローダーの段階ログ（`logs\loader_YYYYMMDD.log`）と、パニック・未処理例外の記録。書けなくても起動は続ける。
-//! 個人を特定できる文字は `Scrub` を通して伏せる（ゲームのパスは書かない）。
-//! ツールをゲームのフォルダの中に置いた人のゲームのフォルダには何も作らない。そのためログのファイルは、ゲームのフォルダが
-//! 分かって「外」と判定するまで開かず、それまでの行はメモリに貯める（`StageLog::decide`）。
+//! ローダーの段階ログ（`logs\loader_YYYYMMDD.log`）とパニック・未処理例外の記録。書けなくても起動は続ける。
+//! 個人を特定できる文字は`Scrub`を通して伏せる（ゲームのパスは書かない）。
+//! ツールをゲームのフォルダの中に置いた人のゲームのフォルダには何も作らない。
+//! そのためログのファイルはゲームのフォルダが分かって「外」と判定するまで開かない。
+//! それまでの行はメモリに貯める（`StageLog::decide`）。
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -36,8 +37,8 @@ pub fn log_file_name(t: &LocalStamp) -> String {
     format!("{LOG_PREFIX}{:04}{:02}{:02}.log", t.year, t.month, t.day)
 }
 
-/// `loader_YYYYMMDD.log` で、その日が今日から `keep_days` 日より前なら true。名前の形が違うものと、
-/// 今日より先の日付（時計を戻した）は消さない。
+/// `loader_YYYYMMDD.log`でその日が今日から`keep_days`日より前ならtrue。
+/// 名前の形が違うものと今日より先の日付（時計を戻した）は消さない。
 pub fn is_expired(name: &str, today: &LocalStamp, keep_days: i64) -> bool {
     let Some(date) = name
         .strip_prefix(LOG_PREFIX)
@@ -54,7 +55,7 @@ pub fn is_expired(name: &str, today: &LocalStamp, keep_days: i64) -> bool {
     date_is_expired(today, date, keep_days)
 }
 
-/// `dir` の直下の古い `loader_…log` を消す。（消した数, 消せなかった数）。
+/// `dir`の直下の古い`loader_…log`を消す。（消した数, 消せなかった数）。
 pub fn prune(dir: &Path, today: &LocalStamp, keep_days: i64) -> (usize, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (0, 0);
@@ -77,10 +78,10 @@ pub fn prune(dir: &Path, today: &LocalStamp, keep_days: i64) -> (usize, usize) {
     (removed, failed)
 }
 
-/// ログのファイルを開く前に貯める行数の上限。起動の手順の行は数十行なので、これを超えるのは異常で、超えた分は捨てる。
+/// ログのファイルを開く前に貯める行数の上限。起動の手順の行は数十行なのでこれを超えるのは異常。超えた分は捨てる。
 const MAX_PENDING: usize = 400;
 
-/// 開く前に貯めた 1 行。区切りの行は時刻も伏せ字も付けずに書く。
+/// 開く前に貯めた1行。区切りの行は時刻も伏せ字も付けずに書く。
 enum Pending {
     Header(String),
     Line(LocalStamp, String),
@@ -106,15 +107,15 @@ pub enum Decision {
     OpenFailed,
 }
 
-/// ツールのフォルダ `tool_dir` がゲームのフォルダ `game_dir` と同じか、その下か。ログのフォルダ（`tool_dir\logs`）の判定に使う。
-/// `..` や別名のパス（ジャンクション・8.3）を解いた形でも比べ、どれか 1 つでも「中」なら中とする
-/// （ゲームのフォルダに書く誤りより、書かない誤りを選ぶ）。
+/// ツールのフォルダ`tool_dir`がゲームのフォルダ`game_dir`と同じかその下かどうか。ログのフォルダ（`tool_dir\logs`）の判定に使う。
+/// `..`や別名のパス（ジャンクション・8.3）を解いた形でも比べる。
+/// どれか1つでも「中」なら中とする（ゲームのフォルダに書く誤りより書かない誤りを選ぶ）。
 pub fn is_inside_game(tool_dir: &Path, game_dir: &Path) -> bool {
     is_same_or_inside(tool_dir, game_dir)
         || is_same_or_inside(&resolved(tool_dir), &resolved(game_dir))
 }
 
-/// 存在する所までを `canonicalize` で解く。無い部分はそのまま足す。`\\?\` の接頭辞は外す（外さないと素のパスと比べられない）。
+/// 存在する所までを`canonicalize`で解く。無い部分はそのまま足す。`\\?\`の接頭辞は外す（外さないと素のパスと比べられない）。
 fn resolved(p: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(p) {
         return strip_verbatim(c);
@@ -140,7 +141,7 @@ fn stamp_text(t: &LocalStamp) -> String {
     )
 }
 
-/// 1 行ずつ追記して、そのたびに OS へ渡す。開けなかったときは何もしない。
+/// 1行ずつ追記してそのたびにOSへ渡す。開けなかったときは何もしない。
 pub struct StageLog {
     dir: PathBuf,
     state: State,
@@ -149,7 +150,7 @@ pub struct StageLog {
 }
 
 impl StageLog {
-    /// ファイルにもフォルダにも触らない。`decide` までの行はメモリに貯める。
+    /// ファイルにもフォルダにも触らない。`decide`までの行はメモリに貯める。
     pub fn new(dir: &Path, clock: fn() -> LocalStamp, scrub: Scrub) -> StageLog {
         StageLog {
             dir: dir.to_path_buf(),
@@ -162,8 +163,8 @@ impl StageLog {
         }
     }
 
-    /// ログのフォルダがゲームのフォルダの中でなければ、フォルダとファイルを作って貯めた行を書く。中なら以後も何も書かない。
-    /// 決めた後に呼んでも結果は変わらない。
+    /// ログのフォルダがゲームのフォルダの中でなければフォルダとファイルを作って貯めた行を書く。中なら以後も何も書かない。
+    /// 決定後に呼んでも結果は変わらない。
     pub fn decide(&mut self, inside_game_folder: bool) -> Decision {
         if !self.is_waiting() {
             return self.decision();
@@ -216,12 +217,12 @@ impl StageLog {
         matches!(self.state, State::Writing(_))
     }
 
-    /// まだゲームのフォルダが分からず、行を貯めている間。
+    /// まだゲームのフォルダが分からず行を貯めている間。
     pub fn is_waiting(&self) -> bool {
         matches!(self.state, State::Waiting { .. })
     }
 
-    /// 以降の行で、`path` で始まる文字列を `label` に替える。貯めた行にも、書き出すときに効く。
+    /// 以降の行で`path`で始まる文字列を`label`に替える。貯めた行にも効く（書き出すときに替える）。
     pub fn hide_dir(&mut self, path: &str, label: &str) {
         self.scrub = std::mem::take(&mut self.scrub).dir(path, label);
     }
@@ -234,7 +235,7 @@ impl StageLog {
         }
     }
 
-    /// 起動の区切り。同じ日の起動は同じファイルに続くので、どこからが今回かを見分ける。
+    /// 起動の区切り。同じ日の起動は同じファイルに続くのでどこからが今回かを見分ける。
     pub fn begin_run(&mut self, pid: u32) {
         let t = (self.clock)();
         let head = format!(
@@ -272,7 +273,7 @@ impl StageLog {
         let State::Writing(f) = &mut self.state else {
             return;
         };
-        // 1 行を 1 回の書き込みにする（2 つ起動しても行の途中で混ざらない）。
+        // 1行を1回の書き込みにする（2つ起動しても行の途中で混ざらない）。
         let mut bytes = Vec::with_capacity(line.len() + 2);
         bytes.extend_from_slice(line.as_bytes());
         bytes.extend_from_slice(b"\r\n");
@@ -287,7 +288,7 @@ pub fn install(log: StageLog) {
     *LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(log);
 }
 
-/// ログが入っていれば 1 行書く（開く前なら貯める。ゲームのフォルダの中なら捨てる）。
+/// ログが入っていれば1行書く（開く前なら貯める。ゲームのフォルダの中なら捨てる）。
 pub fn stage(text: &str) {
     if let Some(l) = LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         l.line(text);
@@ -324,7 +325,7 @@ pub fn clone_file() -> Option<File> {
         .and_then(StageLog::clone_file)
 }
 
-/// パニックのフックから書く用。錠が取れなければ（書き込み中のスレッドがパニックした）諦める。
+/// パニックのフックから書く用。ロックが取れなければ（書き込み中のスレッドがパニックした）諦める。
 fn stage_try(text: &str) {
     if let Ok(mut g) = LOG.try_lock()
         && let Some(l) = g.as_mut()
@@ -360,8 +361,9 @@ pub fn panic_text(thread: &str, message: &str, location: Option<(&str, u32, u32)
 
 type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 
-/// パニックの文と場所を `sink` に渡し、元のフック（`default`）を呼ぶ。主スレッドのパニックなら、その後 `hold` を呼ぶ
-/// （ウィンドウが消える前に読めるようにする。他のスレッドは呼び元が続くので待たない）。
+/// パニックの文と場所を`sink`に渡し、元のフック（`default`）を呼ぶ。
+/// 主スレッドのパニックならその後`hold`を呼ぶ（ウィンドウが消える前に読めるようにする）。
+/// 他のスレッドは呼び元が続くので待たない。
 pub fn panic_hook(default: Hook, sink: fn(&str), hold: fn()) -> Hook {
     Box::new(move |info| {
         let payload = info.payload();
@@ -381,7 +383,7 @@ pub fn panic_hook(default: Hook, sink: fn(&str), hold: fn()) -> Hook {
     })
 }
 
-/// 本番用: ログへ書き、主スレッドなら `hold` で待つ。
+/// 本番用: ログへ書き、主スレッドなら`hold`で待つ。
 pub fn install_panic_hook(hold: fn()) {
     let default = std::panic::take_hook();
     std::panic::set_hook(panic_hook(default, stage_try, hold));
@@ -433,7 +435,7 @@ pub struct ExceptionFacts<'a> {
     /// アドレスが入っているモジュールのファイル名（フォルダを含まない。ASCII）。
     pub module: &'a [u8],
     pub rva: u32,
-    /// アクセス違反のときの（種類 0 読み / 1 書き / 8 実行, 触ったアドレス）。
+    /// アクセス違反のときの（種類0読み / 1書き / 8実行, 触ったアドレス）。
     pub access: Option<(usize, usize)>,
 }
 
@@ -441,7 +443,7 @@ fn exception_name(code: u32) -> &'static str {
     higanr_core::exception_names::name(code).unwrap_or("")
 }
 
-/// 例外の 1 行。確保しない（`fmt::Write` の先が固定長のときだけ使う）。
+/// 例外の1行。確保しない（`fmt::Write`の先が固定長のときだけ使う）。
 pub fn format_exception(out: &mut impl fmt::Write, f: &ExceptionFacts<'_>) -> fmt::Result {
     write!(
         out,
@@ -516,7 +518,7 @@ mod tests {
     fn the_log_is_named_by_day_and_only_old_loader_logs_are_pruned() {
         assert_eq!(log_file_name(&stamp(2026, 1, 9)), "loader_20260109.log");
         let today = stamp(2026, 10, 14);
-        // 3 日前は残し、4 日前から消す。月をまたいでも日数で数える。
+        // 3日前は残し、4日前から消す。月をまたいでも日数で数える。
         assert!(!is_expired("loader_20261011.log", &today, KEEP_LOG_DAYS));
         assert!(is_expired("loader_20261010.log", &today, KEEP_LOG_DAYS));
         assert!(is_expired("loader_20260930.log", &today, KEEP_LOG_DAYS));
@@ -767,7 +769,7 @@ mod tests {
         assert!(is_inside_game(&upper, &game));
         assert!(!is_inside_game(&root.join("other"), &game));
         assert!(!is_inside_game(&root.join("game2").join("x"), &game));
-        // ゲームのフォルダが無い（まだ存在しない）ときも、綴りが中なら中。
+        // ゲームのフォルダが無い（まだ存在しない）ときも綴りが中なら中。
         assert!(is_inside_game(
             &root.join("nogame").join("logs"),
             &root.join("nogame")
@@ -817,11 +819,11 @@ mod tests {
         HOLDS.fetch_add(1, Ordering::SeqCst);
     }
 
-    // パニックのフックは全体で 1 つなので、このテストだけが差し替える。元のフックは戻す。
+    // パニックのフックは全体で1つなのでこのテストだけが差し替える。元のフックは戻す。
     #[test]
     fn the_panic_hook_logs_the_message_and_place_and_waits_only_on_the_main_thread() {
         let before = std::panic::take_hook();
-        // 並んで走る他の検査がパニックしても数えないよう、このテストが作るスレッドの分だけ数える。
+        // このテストが作るスレッドの分だけ数える。並んで走る他の検査がパニックしても数えないため。
         let default: Hook = Box::new(|_| {
             let t = std::thread::current();
             if matches!(t.name(), Some("worker" | "main")) {

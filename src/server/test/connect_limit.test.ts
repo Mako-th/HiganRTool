@@ -1,4 +1,4 @@
-// 接続の回数の制限（src/connect_limiter.ts）の検査。純粋な部分は境目の両側を並べ、組み上がりは本物の Durable Object（miniflare）で見る。
+// 接続の回数の制限（src/connect_limiter.ts）の検査。純粋な部分は境目の両側を並べて見る。組み上がったものは本物のDurable Object（miniflare）で見る。
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,8 +12,8 @@ import {
   slideConnectWindow,
 } from "../src/rules";
 import { connect, freshIp, freshRoom, rawConnect, sameSlash64 } from "./helpers";
-// 前段の上限を wrangler.jsonc の値と読み比べるため、設定ファイルを文字のまま読む（vite の ?raw）。
-// @ts-expect-error 型の宣言は無い（検査は esbuild で型を剥がして走らせる）
+// 前段の上限をwrangler.jsoncの値と読み比べるために設定ファイルを文字のまま読む（viteの ?raw）。
+// @ts-expect-error型の宣言は無い（検査はesbuildで型を剥がして走らせる）
 import wranglerText from "../wrangler.jsonc?raw";
 
 describe("滑る窓（slideConnectWindow）", () => {
@@ -102,7 +102,7 @@ function limiterFor(ip: string): DurableObjectStub {
   return env.CONNECT_LIMITER.get(env.CONNECT_LIMITER.idFromName(connectLimitKey(ip)));
 }
 
-/** ルームを毎回分けて（409 を避け）n 回つなぎ、状態コードを返す。 */
+/** ルームを毎回分けて（409を避ける）n回接続して状態コードを返す。 */
 async function connectTimes(n: number, ip: string): Promise<number[]> {
   const codes: number[] = [];
   for (let i = 0; i < n; i++) {
@@ -207,7 +207,7 @@ describe("組み上がり（入口 → 数え役 → 部屋）", () => {
     await connectTimes(5, ip);
     const after = await runInDurableObject(limiterFor(ip), (_i, s) => s.storage.get<number[]>("t"));
     expect(after).toEqual(before);
-    // 同じ値の書き直しは中身では見分けられないので、書く呼び出しの回数でも見る。
+    // 同じ値の書き直しは中身では見分けられないので書き込みの呼び出し回数でも見る。
     const writes = await runInDurableObject(limiterFor(ip), async (inst: any, s) => {
       const put = vi.spyOn(s.storage, "put");
       const alarm = vi.spyOn(s.storage, "setAlarm");
@@ -272,7 +272,7 @@ describe("粗い前段（Rate Limiting の束縛）→ 通ったものだけ数�
     expect(res.headers.get("Retry-After")).toBe(String(RETRY_AFTER_SECS));
     expect(await res.json()).toEqual({ error: "rate_limited", retry_after: RETRY_AFTER_SECS });
     expect(calls.n).toBe(0);
-    // 前段の鍵は数え役と同じ（/64 でまとめた鍵）。IP のまま渡すと IPv6 の逃げ道になる。
+    // 前段の鍵は数え役と同じ（/64でまとめた鍵）。IPのまま渡すとIPv6の逃げ道になる。
     expect(limit).toHaveBeenCalledWith({ key: connectLimitKey(ip) });
   });
 

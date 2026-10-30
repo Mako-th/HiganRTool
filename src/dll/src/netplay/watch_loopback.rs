@@ -1,10 +1,9 @@
-//! 観戦者の側の組み上がりの検査のうち、本物の UDP の上（loopback）で実時間に走るもの。dll の観戦者（`WatchPlay` ＋
-//! 本物の通信層 `net_udp`）を、
-//! - peer_sim のホスト（`--spectate-host`。選択の台本つき）と peer_sim のゲストに接続する（`a_dll_watcher_follows_peer_sim_players_*`）、
-//! - dll のホスト（偽のゲーム）と peer_sim のゲストの対戦に接続し、観戦者への遅れを測り、観戦者がいても対戦する側の stall が
-//!   増えないかを見る（`the_watch_lag_*`・`a_watcher_does_not_add_stalls_to_the_players`）。
+//! 観戦者の側の組み上がりの検査のうち本物のUDPの上（loopback）で実時間に走るもの。
+//! dllの観戦者（`WatchPlay` ＋本物の通信層`net_udp`）を次のように動かす。
+//! - peer_simのホスト（`--spectate-host`。選択の台本つき）とpeer_simのゲストに接続する（`a_dll_watcher_follows_peer_sim_players_*`）。
+//! - dllのホスト（偽のゲーム）とpeer_simのゲストの対戦に接続して、観戦者への遅れを測る。観戦者がいても対戦する側のstallが増えないかも見る（`the_watch_lag_*`・`a_watcher_does_not_add_stalls_to_the_players`）。
 //!
-//! 実時間で走る（1 本 10〜30 秒）ので `#[ignore]`。全件の回（`build.bat`）が `--ignored` で走らせる。
+//! 実時間で走る（1本10〜30秒）ので`#[ignore]`にしてある。全件の検査（`build.bat`）が`--ignored`で走らせる。
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::thread;
@@ -38,7 +37,7 @@ fn lo() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-/// 選択の台本（peer_sim の `tests/loopback.rs` の `MENU_HOST` / `MENU_GUEST` と同じ。あちらは exe の外へ出していないのでコピーした）。
+/// 選択の台本（peer_simの`tests/loopback.rs`の`MENU_HOST` / `MENU_GUEST`と同じ。あちらはexeの外へ出していないのでコピーした）。
 const MENU_HOST: &str = "\
 screen=7 press=cancel                    # step 0: 難易度の画面の取消で選択の外へ（両者とも）
 screen=8 word=RIGHT+X hold=5             # X は画面を移るビットなので落ち、RIGHT（0x80）だけが届く
@@ -57,13 +56,13 @@ screen=8 wait=180 press=decide cursor=9  # step 5: 2P が決める（ホスト�
 struct Watched {
     wg: MenuGame,
     wp: WatchPlay,
-    /// 接続した後の tick の確保（0 のはず）。
+    /// 接続した後のtickの確保（0のはず）。
     allocs_joined: u64,
     local_at_join: Option<u32>,
     leaks: u32,
 }
 
-/// 観戦者（偽のゲーム W ＋ 本物の通信層）を、終わる（か 60 秒）まで 60 Hz で回す。
+/// 観戦者（偽のゲームW ＋ 本物の通信層）を、終わる（か60秒）まで60 Hzで回す。
 fn drive_menu_watcher(host: SocketAddr, mut wg: MenuGame, wait_budget_us: u32) -> Watched {
     let (mut net, rx) = net_udp::open_for_code(lo()).expect("通信層を開ける");
     let slot = Arc::new(WatchSlot::new());
@@ -155,7 +154,7 @@ fn a_dll_watcher_follows_peer_sim_players_through_selection_and_rematches() {
         host_seat: Seat::P1,
         seed: SEED_A,
         follow: false,
-        word_mask: 0xFFFF,
+        word_mask: MATCH_SEND_MASK,
         life: 10,
         poll_ms: 1,
         segs: 3,
@@ -180,7 +179,7 @@ fn a_dll_watcher_follows_peer_sim_players_through_selection_and_rematches() {
             sock: spec_sock,
             session_id: SPEC_SESSION,
             secret: SPEC_SECRET,
-            // 観戦者が式で公開鍵を作る検査（上の `host_public`）なので、固定の種。
+            // 観戦者が式で公開鍵を作る検査（上の`host_public`）なので、固定の種。
             key_seed: peer_sim::keys::spectate_host_seed(&SPEC_SECRET, SPEC_SESSION),
             fault: FaultConfig::default(),
         };
@@ -225,7 +224,7 @@ fn a_dll_watcher_follows_peer_sim_players_through_selection_and_rematches() {
     assert_eq!(w.wg.played, rows(&ra.recs), "観戦者の列とホストの列");
     let steps: Vec<_> = w.wp.step_log().iter().map(|s| s.step).collect();
     assert_eq!(steps, ra.presses, "入った押下の列\n{summary}");
-    // キャラ選択（8）は合わせない（難易度・マップの合わせだけが入る）。
+    // キャラ選択（8）は合わせない。難易度とマップの合わせだけが含まれる。
     assert_eq!(steps.len(), 10);
     assert_eq!(w.wg.watched.len(), 1);
     let [s1, s2] = w.wg.watched[0];
@@ -298,7 +297,7 @@ fn a_dll_watcher_still_in_a_match_ends_as_host_ended_when_the_host_leaves_the_la
         host_seat: Seat::P1,
         seed: SEED_A,
         follow: false,
-        word_mask: 0xFFFF,
+        word_mask: MATCH_SEND_MASK,
         life: 10,
         poll_ms: 1,
         segs: 1,
@@ -323,7 +322,7 @@ fn a_dll_watcher_still_in_a_match_ends_as_host_ended_when_the_host_leaves_the_la
             sock: spec_sock,
             session_id: SPEC_SESSION,
             secret: SPEC_SECRET,
-            // 観戦者が式で公開鍵を作る検査（上の `host_public`）なので、固定の種。
+            // 観戦者が式で公開鍵を作る検査（上の`host_public`）なので、固定の種。
             key_seed: peer_sim::keys::spectate_host_seed(&SPEC_SECRET, SPEC_SESSION),
             fault: FaultConfig::default(),
         };
@@ -363,7 +362,7 @@ fn a_dll_watcher_still_in_a_match_ends_as_host_ended_when_the_host_leaves_the_la
 
 const SID: u32 = 0x5EED_3001;
 const FRAMES: u32 = 120;
-/// 付いていく形のマッチの長さ（`loopback.rs` の `FOLLOW_LENGTHS` と同じ）。
+/// 付いていく形のマッチの長さ（`loopback.rs`の`FOLLOW_LENGTHS`と同じ）。
 const LENGTHS: [u32; 4] = [150, 45, 200, 90];
 
 struct Play {
@@ -372,7 +371,7 @@ struct Play {
     stalls: u64,
     max_stall_run: u32,
     watch: Option<WatchRun>,
-    /// 観戦のホストの数（送った通数・送り直し。観戦者を付けた実行だけ）。
+    /// 観戦のホストのカウンタ（送った通数・再送の数。観戦者を付けた実行だけ）。
     spec: Option<higanr_core::spectate::HostCounts>,
 }
 
@@ -384,9 +383,9 @@ struct WatchRun {
     end: Option<WatchEnd>,
 }
 
-/// 走らせ方。`follow` = peer_sim が dll に付いていく形（マッチごとに長さが違い、メニューへ戻って次の選択に入る。485 フレーム。
-/// dll の側はいつも語が揃っているので stall は 0）。偽 = peer_sim が先に進む形（3 マッチ 360 フレーム。peer_sim の読み込み
-/// 300 ms を dll が待つので stall が出る）。
+/// 走らせ方。
+/// `follow` = peer_sim がdllに付いていく形。マッチごとに長さが違い、メニューへ戻って次の選択に入る（485フレーム）。dllの側はいつもワードが揃っているのでstallは0。
+/// 偽 = peer_sim が先に進む形（3マッチ360フレーム）。peer_simの読み込み300 msをdllが待つのでstallが出る。
 #[derive(Clone, Copy)]
 struct Scenario {
     follow: bool,
@@ -410,8 +409,8 @@ fn fake(seed: u64, sc: Scenario) -> FakeGame {
     g
 }
 
-/// dll のホスト（席は 2P）と peer_sim のゲスト（付いていく形）を実時間で回す。`with_watcher` なら、ホストの観戦のポートに
-/// dll の観戦者（別のスレッド。偽のゲームは選択の画面を持たない v0）を接続する。
+/// dllのホスト（サイドは2P）とpeer_simのゲスト（付いていく形）を実時間で回す。
+/// `with_watcher`なら、ホストの観戦のポートにdllの観戦者（別のスレッド。偽のゲームは選択の画面を持たないv0）を接続する。
 fn play(with_watcher: bool, sc: Scenario) -> Play {
     let psock = UdpSocket::bind(lo()).expect("loopback に bind できる");
     let paddr = psock.local_addr().unwrap();
@@ -551,7 +550,7 @@ fn play(with_watcher: bool, sc: Scenario) -> Play {
     }
 }
 
-/// dll の観戦者を偽のゲーム（v0。マッチごとの長さもホストと同じ）で終わりまで回す。
+/// dllの観戦者を偽のゲーム（v0。マッチごとの長さもホストと同じ）で終わりまで回す。
 fn watch_fake(slot: Arc<WatchSlot>, sc: Scenario) -> WatchRun {
     let (mut net, rx) = net_udp::open_for_code(lo()).expect("通信層を開ける");
     let mut wp = WatchPlay::new(
@@ -653,7 +652,7 @@ fn the_watch_lag_is_a_margin_of_frames_and_the_columns_match() {
         "遅れの中央値が大きい: {} µs",
         pct(&lag, 0.5)
     );
-    // 実時間の loopback の 1 走行の値（変える前は観戦者へ送った 1,369 通のうち送り直し 877、変えた後は 492 通のうち 0。観戦者 1 人・494 記録）。
+    // 実時間のloopbackの1走行の値（変える前は、観戦者へ送った1,369通のうち再送が877。変えた後は492通のうち0。観戦者1人・494記録）。
     let h = p.spec.expect("観戦のホストの数");
     eprintln!(
         "ホストの観戦の送り（loopback、観戦者 1 人・{} 記録）: 送った {} 通・送り直し {}（送り直し / 送った通数 = {:.3}）",
@@ -713,7 +712,8 @@ fn a_watcher_does_not_add_stalls_to_the_players() {
     );
 }
 
-/// stall の回数の揺らぎとして許す幅。`loopback.rs` の `STALL_JITTER`（12）と同じ考え方: 観戦者を対戦する側のゲームのスレッドが
-/// 待てば 1 フレームごとに stall が出て数百回増えるので、揺らぎの最大の差を越える値。実測では観戦者なし・ありとも
-/// 6 走行ずつ全部 24 回（最長 15）で揺れは 0、観戦者なしの別の測定は 24〜35 回で、12 はその最大の差（11）を越える値。
+/// stallの回数の揺らぎとして許す幅。`loopback.rs`の`STALL_JITTER`（12）と同じ考え方。
+/// 観戦者を対戦する側のゲームのスレッドが待てば、1フレームごとにstallが出て数百回増える。そのため揺らぎの最大の差を越える値にする。
+/// 実測では観戦者なし・ありとも6走行ずつ全部24回（最長15）で、揺れは0。
+/// 観戦者なしの別の測定は24〜35回で、12はその最大の差（11）を越える値。
 const STALL_JITTER: u64 = 12;

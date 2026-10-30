@@ -1,5 +1,5 @@
-//! 受信スレッドの受け取り（`recv.rs`・`feed.rs`）の組み上がりの検査: 仮の時計の模型（core の `SpectateHost` ＋ 仮のネットワーク ＋
-//! `WatchPlay`。受信スレッドの代わりは `FakeNet::run_watch`）と、本物の通信層（`net_udp`。loopback）。
+//! 受信スレッドの受け取り（`recv.rs`・`feed.rs`）の組み上がりの検査。
+//! 仮の時計の模型（coreの`SpectateHost` ＋ 仮のネットワーク ＋ `WatchPlay`。受信スレッドの代わりは`FakeNet::run_watch`）と本物の通信層（`net_udp`。loopback）を使う。
 use std::cell::Cell;
 use std::net::{SocketAddr, UdpSocket};
 use std::rc::Rc;
@@ -24,7 +24,7 @@ const SESSION: u32 = 0x5EC7_0A3A;
 const SECRET: Secret = Secret(*b"feed-model-0001!");
 const HOST_SEED: KeySeed = KeySeed([0x61; 32]);
 const WATCHER_SEED: KeySeed = KeySeed([0x62; 32]);
-/// 模型の 1 歩（µs）。仮のネットワークの片道は 1 ms なので、ACK は 2 歩でホストへ戻る。
+/// 模型の1歩（µs）。仮のネットワークの片道は1 msなのでACKは2歩でホストへ戻る。
 const STEP_US: u64 = 4_000;
 const FRAME_US: u64 = 16_667;
 
@@ -65,7 +65,7 @@ fn frame(n: u32) -> Record {
     }
 }
 
-/// マッチの中の偽のゲーム（場面 2・次の要求 0）。
+/// マッチの中の偽のゲーム（場面2・次の要求0）。
 struct InMatch;
 
 impl Game for InMatch {
@@ -98,7 +98,7 @@ impl Game for InMatch {
     }
 }
 
-/// 仮の時計の模型。観戦者のゲームのスレッド（`WatchPlay` の tick）は検査が回したときだけ動き、受信スレッドの代わりは歩ごとに回る。
+/// 仮の時計の模型。観戦者のゲームのスレッド（`WatchPlay`のtick）は検査が回したときだけ動く。受信スレッドの代わりは歩ごとに回る。
 struct Model {
     host: SpectateHost,
     hnet: FakeNet,
@@ -137,7 +137,7 @@ impl Model {
         self.pushed.push(r);
     }
 
-    /// 1 歩: 時計を進め、ホストが受けて送り（`host_on` の間）、受信スレッドの代わりが回る。
+    /// 1歩: 時計を進める。`host_on`の間はホストが受信と送信をする。受信スレッドの代わりも回る。
     fn step(&mut self, host_on: bool) {
         self.clock.set(self.clock.get() + STEP_US);
         if host_on {
@@ -152,7 +152,7 @@ impl Model {
         self.wnet.run_watch();
     }
 
-    /// 1 フレームぶん（60 Hz）歩く。
+    /// 1フレームぶん（60 Hz）歩く。
     fn frame_time(&mut self, host_on: bool) {
         let until = self.clock.get() + FRAME_US;
         while self.clock.get() < until {
@@ -198,7 +198,7 @@ fn ten_minutes_without_a_game_tick_keep_the_host_from_resending_and_the_feed_kee
 
 #[test]
 fn a_silent_host_does_not_end_the_watch_until_the_buffered_records_are_used() {
-    // 25 秒ぶん溜める（`HOST_SILENT_END_MS` の 20 秒より長い）。
+    // 25秒ぶん溜める（`HOST_SILENT_END_MS`の20秒より長い）。
     const N: u32 = 25 * 60;
     let mut m = Model::new(1 << 12, 1 << 12, 0);
     m.push(Record::Seg { seg: 0 });
@@ -210,7 +210,7 @@ fn a_silent_host_does_not_end_the_watch_until_the_buffered_records_are_used() {
         m.frame_time(true);
     }
     assert_eq!(m.wp.feed().len(), N + 1);
-    // ここからホストは黙る。観戦者のゲームのスレッドが動き出し、1 tick に 1 フレームずつ使う。
+    // ここからホストは黙る。観戦者のゲームのスレッドが動き出す。1 tickに1フレームずつ使う。
     let mut g = InMatch;
     let _ = m.wp.on_input(&mut g, &mut m.wnet);
     assert_eq!(m.wp.phase(), Phase::Selecting, "接続を見ていない");
@@ -286,7 +286,7 @@ fn a_full_feed_ends_the_watch_with_its_own_reason_and_says_bye() {
 fn a_jump_after_records_were_used_ends_lost_but_the_first_jump_does_not() {
     let mut m = Model::new(64, 1 << 12, 16_000);
     let f = Arc::clone(m.wp.feed());
-    // 受信スレッドの代わりにリングへ直に書く（最初の記録は遅れた JOIN の飛びの後）。
+    // 受信スレッドの代わりにリングへ直接書く（最初の記録は遅れたJOINの飛びの後）。
     assert!(f.push(&Record::Seg { seg: 0 }, true, 0));
     for n in 0..3 {
         assert!(f.push(&frame(n), false, 0));
@@ -297,7 +297,7 @@ fn a_jump_after_records_were_used_ends_lost_but_the_first_jump_does_not() {
     let mut played = Vec::new();
     for t in 0..8 {
         if t == 1 {
-            // 記録を使った後に、流れが飛んだ（ホストのリングバッファから落ちた）。
+            // 記録を使った後に流れが飛んだ（ホストのリングバッファから落ちた）。
             assert!(f.push(&Record::Seg { seg: 0 }, true, 0));
             assert!(f.push(&frame(3), false, 0));
         }
@@ -319,7 +319,7 @@ fn a_jump_after_records_were_used_ends_lost_but_the_first_jump_does_not() {
 
 #[test]
 fn a_reset_from_the_host_after_records_were_used_ends_lost_after_the_records_before_it() {
-    // ホストのリングバッファを小さくし、観戦者に届く前に古い seg を捨てさせる（ホストが `reset` 付きで送り直す）。
+    // ホストのリングバッファを小さくする。観戦者に届く前に古いマッチを捨てさせる（ホストが`reset`付きで送り直す）。
     let mut m = Model::new(1 << 12, 64, 16_000);
     m.push(Record::Seg { seg: 0 });
     for f in 0..5 {
@@ -329,7 +329,7 @@ fn a_reset_from_the_host_after_records_were_used_ends_lost_after_the_records_bef
         m.frame_time(true);
     }
     assert_eq!(m.wp.feed().len(), 6, "最初の 6 記録が届いていない");
-    // ここからは届ける前に積む（ネットワークが詰まった形）。seg 1 で埋まり、seg 0 の残りが捨てられる。
+    // ここからは届ける前に積む（ネットワークが詰まった形）。マッチ1で埋まる。マッチ0の残りは捨てられる。
     for f in 5..10 {
         m.push(frame(f));
     }
@@ -381,7 +381,7 @@ fn an_unreadable_cell_is_counted_on_the_log_line() {
     );
 }
 
-/// タイトルの偽のゲーム（場面 1・選択の画面の外。記録を使わない）。
+/// タイトルの偽のゲーム（場面1・選択の画面の外。記録を使わない）。
 struct AtTitle;
 
 impl Game for AtTitle {
@@ -428,7 +428,7 @@ fn a_watcher_left_on_a_screen_that_uses_no_records_ends_20_seconds_after_the_hos
     }
     assert_eq!(m.wp.phase(), Phase::Selecting);
     assert!(m.wp.feed().len() > 100, "記録が溜まっていない");
-    // ここからホストは黙る。観戦者はタイトルに留まり、記録を使わない。
+    // ここからホストは黙る。観戦者はタイトルに留まる。記録は使わない。
     let silent_at = m.clock.get();
     for _ in 0..(HOST_SILENT_END_MS as u64 * 1_000 / FRAME_US + 120) {
         m.frame_time(false);
@@ -462,7 +462,7 @@ fn a_game_thread_that_resumes_after_30_seconds_with_a_silent_host_uses_the_buffe
     let _ = m.wp.on_input(&mut g, &mut m.wnet);
     let mut played = Vec::new();
     let mut next = 0u32;
-    // 5 秒は追いついて見る。
+    // 5秒は追いついて見る。
     for _ in 0..300 {
         m.push(frame(next));
         next += 1;
@@ -475,7 +475,7 @@ fn a_game_thread_that_resumes_after_30_seconds_with_a_silent_host_uses_the_buffe
         }
     }
     assert!(played.len() > 250, "追いついて見ていない: {}", played.len());
-    // ゲームのスレッドが 30 秒止まる。最初の 5 秒はホストが送り続け、その後は黙る。
+    // ゲームのスレッドが30秒止まる。最初の5秒はホストが送り続ける。その後は黙る。
     for t in 0..30 * 60 {
         let host_on = t < 5 * 60;
         if host_on {
@@ -525,7 +525,7 @@ impl Outlet for UdpOut<'_> {
     }
 }
 
-/// 本物の通信層の観戦者と、検査のスレッドで回すホスト（core の `SpectateHost` ＋ loopback のソケット）。
+/// 本物の通信層の観戦者と検査のスレッドで回すホスト（coreの`SpectateHost` ＋ loopbackのソケット）。
 struct Real {
     host: SpectateHost,
     sock: UdpSocket,
@@ -557,7 +557,7 @@ impl Real {
         }
     }
 
-    /// ホストの 1 周（受けた便を処理して送る）。
+    /// ホストの1周（受けた便を処理して送る）。
     fn host_round(&mut self) {
         let now = self.t0.elapsed().as_millis() as u32;
         let mut buf = [0u8; 2048];
@@ -572,7 +572,7 @@ impl Real {
         self.host.poll(now, &mut UdpOut(&self.sock));
     }
 
-    /// 接続して、最初の記録（`Seg`）がリングに入るまで回す。
+    /// 接続して最初の記録（`Seg`）がリングに入るまで回す。
     fn join(&mut self) {
         self.host.push(Record::Seg { seg: 0 }).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -679,7 +679,7 @@ fn a_panic_in_the_watchers_receiving_stops_only_the_watching_and_the_receive_thr
     assert_eq!(got, 20, "パニックの後に受信スレッドが受けない");
 }
 
-/// ホストへ届いた BYE（自分で抜けた）の数を、来なくなるまで回して数える。
+/// ホストへ届いたBYE（自分で抜けた）の数を来なくなるまで回して数える。
 fn left_after(r: &mut Real, limit: Duration) -> u64 {
     let deadline = Instant::now() + limit;
     while r.host.counts().left == 0 && Instant::now() < deadline {
@@ -746,7 +746,7 @@ fn the_receive_thread_refuses_to_send_outside_the_scope() {
     let (mut net, rx) =
         net_udp::open_for_code(SocketAddr::from(([127, 0, 0, 1], 0))).expect("通信層を開ける");
     let slot = Arc::new(WatchSlot::new());
-    // 文書用のアドレス（loopback の範囲の外）。
+    // 文書用のアドレス（loopbackの範囲の外）。
     let outside = SocketAddr::from(([192, 0, 2, 1], 47_001));
     slot.offer(watcher_cfg(
         outside,

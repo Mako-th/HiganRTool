@@ -1,8 +1,9 @@
-//! 配るバージョンで `HiganRTool.ini` が無いとき、配る ini と同じ中身を DLL のフォルダへ書き出す（unsafe 無し）。
+//! 配布するバージョンで`HiganRTool.ini`が無いときに配布用のiniと同じ中身をDLLのフォルダへ書き出す（unsafe無し）。
 //!
-//! 更新は利用者の設定を守るため ini を置き換えない（配布の更新の置き場に ini を入れない）ので、更新の置き場のコピーだけを渡された
-//! 環境では ini が無く、ネットワークなしで走ってしまう。書くのは起動のときの 1 回だけ（読み取りのスレッド。ゲームのスレッドの経路には入らない）。
-//! 既にある ini は読みも書きもしない。書けなければ、埋めた中身を ini を読む処理へ返して動かす（`fallback`）。
+//! 更新は利用者の設定を守るためiniを置き換えない（配布の更新の置き場にiniを含めない）。
+//! そのため更新の置き場のコピーだけを渡された環境ではiniが無く、ネットワークなしで走ってしまう。
+//! 書くのは起動時の1回だけ（読み取りのスレッド。ゲームのスレッドの経路には入らない）。
+//! 既にあるiniは読みも書きもしない。書けなければ埋めた中身をiniを読む処理へ返して動かす（`fallback`）。
 
 #![forbid(unsafe_code)]
 
@@ -12,19 +13,19 @@ use std::sync::OnceLock;
 
 use crate::net_config::Located;
 
-/// 書き出す中身（配る ini の原本と同じ。ローダーが先に作るときと同じ中身にするため core にある）。
+/// 書き出す中身（配布用のiniの原本と同じ。ローダーが先に作るときと同じ中身にするためcoreにある）。
 pub fn dist_ini_text() -> String {
     higanr_core::ini_store::dist_ini_text()
 }
 
-/// そのビルドで書き出す中身。配るバージョンだけ（開発用のビルドは ini が無ければネットワークなし、のまま）。
+/// そのビルドで書き出す中身。配布するバージョンだけ（開発用のビルドはiniが無ければネットワークなしのまま）。
 pub fn default_for_build(dist: bool) -> Option<String> {
     dist.then(dist_ini_text)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Seed {
-    /// 書かない経路（開発用のビルド・ローダーが ini を渡した）。
+    /// 書かない経路（開発用のビルド・ローダーがiniを渡した）。
     Skipped,
     /// 既にある。触らない。
     Present,
@@ -34,7 +35,7 @@ pub enum Seed {
 }
 
 impl Seed {
-    /// 本ログに出す 1 行（書かなかったなら `None`）。
+    /// 本ログに出す1行（書かなかったなら`None`）。
     pub fn log_line(&self) -> Option<String> {
         match self {
             Seed::Skipped | Seed::Present => None,
@@ -48,14 +49,14 @@ impl Seed {
     }
 }
 
-/// ini が無く、書き出せなかったときに ini を読む処理へ返す中身。
+/// iniが無くて書き出せなかったときにiniを読む処理へ返す中身。
 static FALLBACK: OnceLock<String> = OnceLock::new();
 
 pub fn fallback() -> Option<&'static str> {
     FALLBACK.get().map(String::as_str)
 }
 
-/// `seed` を呼び、書けなかったら中身を `fallback` に残す（プロセスで 1 回）。
+/// `seed`を呼び、書けなかったら中身を`fallback`に残す（プロセスで1回）。
 pub fn seed_process(loc: &Located, default: Option<&str>) -> Seed {
     let r = seed(loc, default);
     if let (Seed::Failed(_), Some(text)) = (&r, default) {
@@ -64,8 +65,9 @@ pub fn seed_process(loc: &Located, default: Option<&str>) -> Seed {
     r
 }
 
-/// `default` があり、ローダーが ini を渡しておらず（渡された ini が無いのは渡し方の誤り）、置き場に ini が無いときだけ書く。
-/// 一時ファイルへ書いてから「あれば移さない」移し方で書き込むので、同時に起きた別の起動に半端な中身を読ませず、先にあった ini も潰さない。
+/// 次が全部揃ったときだけ書く: `default`がある・ローダーがiniを渡していない（渡されたiniが無いのは渡し方の誤り）・置き場にiniが無い。
+/// 一時ファイルへ書いてから「あれば移さない」移し方で書き込む。
+/// そのため同時に起きた別の起動に半端な中身を読ませず、先にあったiniも潰さない。
 pub fn seed(loc: &Located, default: Option<&str>) -> Seed {
     let Some(text) = default else {
         return Seed::Skipped;
@@ -153,7 +155,7 @@ mod tests {
             .collect()
     }
 
-    /// 埋めた中身が、配る ini の原本を make_dist と同じに CRLF へ直したものと 1 バイトずつ同じ。
+    /// 埋めた中身が、配布用のiniの原本をmake_distと同じにCRLFへ変換したものと1バイトずつ同じ。
     #[test]
     fn embedded_text_is_the_dist_ini_with_crlf() {
         let raw = std::fs::read(concat!(
@@ -212,7 +214,7 @@ mod tests {
 
     #[test]
     fn a_race_lost_after_the_check_does_not_replace() {
-        // チェックした後に別の起動が書いた ini を、移し方が潰さない。
+        // チェックした後に別の起動が書いたiniを移し方が潰さない。
         let t = Tmp::new("race");
         let tmp = temp_path(&t.loc().path);
         std::fs::write(&tmp, "既定").unwrap();

@@ -1,10 +1,12 @@
-//! 設置の後の計測（pure）: 100 ms ごとにリングバッファから tick ごとの記録を読み、1 秒ごとにファイルへ追記し、1 秒ごとに入口を通った回数を、60 秒ごとに「始めからここまで」の集計を本ログに書く。読み取りのスレッド（ゲームのスレッドではない）で走るので、待ちもログの I/O も構わない。
+//! 設置の後の計測（pure）。100 msごとにリングバッファからtickごとの記録を読む。
+//! 1秒ごとにファイルへ追記し、入口を通った回数も1秒ごとに本ログへ書く。「始めからここまで」の集計は60秒ごとに本ログへ書く。
+//! 読み取りのスレッド（ゲームのスレッドではない）で走るので待ちもログのI/Oも構わない。
 //!
-//! - 計測の長さは `render_only::TOTAL_SECONDS`（180 秒）。ゲームを途中で閉じても残るよう、1 秒ごとに追記する（`_ticks.csv` / `_changes.csv` / `_snap.bin`。メニューとライフの `_menu.csv` は別のスレッドが自分で追記する）。
-//! - TSC の周波数は始めの 1 秒の QueryPerformanceCounter との対で決め（CSV の時刻の列は TSC の差をこれで換算して書く）、集計のたびに「始めから今まで」の対との差を ppm で書く。集計（`ticks::summarize`）は 60 秒ごとに始めからここまでを本ログへ追記する。
-//! - メモリには全件の 1024 バイトを貯めない。持つのは集計に要る先頭（`Record`）と、次の追記までの 1 秒ぶんだけ。
+//! - 計測の長さは`render_only::TOTAL_SECONDS`（180秒）。ゲームを途中で閉じても残るよう1秒ごとに追記する（`_ticks.csv` / `_changes.csv` / `_snap.bin`。メニューとライフの`_menu.csv`は別のスレッドが自分で追記する）。
+//! - TSCの周波数は始めの1秒のQueryPerformanceCounterとのペアで決める（CSVの時刻の列はTSCの差をこの周波数で換算して書く）。集計のたびに「始めから今まで」のペアとの差をppmで書く。集計（`ticks::summarize`）は60秒ごとに始めからここまでを本ログへ追記する。
+//! - メモリには全件の1024バイトを貯めない。持つのは集計に要る先頭（`Record`）と次の追記までの1秒ぶんだけ。
 //!
-//! Win32 は `RecordEnv` の向こうへ分ける（本物は `record_win::RealRecord`）。時計・待ち・回数は `HookEnv` のもの。
+//! Win32は`RecordEnv`の向こうへ分ける（本物は`record_win::RealRecord`）。時計・待ち・回数は`HookEnv`のもの。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -31,9 +33,9 @@ use crate::ticks::{
 };
 use crate::trial_summary::{self, Facts, GameFacts, HostFacts, PaceEnd, Stage};
 
-/// 集計を本ログへ書く間隔（秒）。180 秒の実験では 60 秒・120 秒・終わりの 3 回書く。
+/// 集計を本ログへ書く間隔（秒）。180秒の実験では60秒・120秒・終わりの3回書く。
 pub const SUMMARY_EVERY: u32 = 60;
-/// リングバッファを読む間隔（ms）。4096 件のリングバッファは 60 fps で約 68 秒分なので、上書きは起きない見込み。
+/// リングバッファを読む間隔（ms）。4096件のリングバッファは60 fpsで約68秒分なので上書きは起きない見込み。
 pub const POLL_MS: u32 = 100;
 pub const POLLS_PER_SECOND: u32 = 1000 / POLL_MS;
 
@@ -41,29 +43,30 @@ pub const TICKS_SUFFIX: &str = "_ticks.csv";
 pub const CHANGES_SUFFIX: &str = "_changes.csv";
 pub const SNAP_SUFFIX: &str = "_snap.bin";
 pub const MENU_SUFFIX: &str = "_menu.csv";
-/// 描画のリングバッファと、描画だけのフレームの件ごとの差の CSV。
+/// 描画のリングバッファと、描画だけのフレームの件ごとの差のCSV。
 pub const DRAWS_SUFFIX: &str = "_draws.csv";
 pub const RENDERONLY_SUFFIX: &str = "_renderonly.csv";
 
-/// 観戦者のセッションの本ログの材料（`RecordEnv::watch_log`）。観戦者の実行は計測が締まらず、閉じたときに書く経路も無い（`write_link_end` の注）ので、
-/// 数は途中で本ログへ残す。ルーム名・アドレス・接続コードは含まない。
+/// 観戦者のセッションの本ログの材料（`RecordEnv::watch_log`）。
+/// 観戦者の実行は計測が終了処理に入らず、閉じたときに書く経路も無い（`write_link_end`の注）。
+/// そのため数は途中で本ログへ残す。ルーム名・アドレス・接続コードは含まない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchLog {
-    /// 前の見回りの後に片づけた観戦の節（番号と中身）。
+    /// 前のポーリングの後に終了した観戦の節（番号と中身）。
     pub ended: Vec<(u32, String)>,
-    /// 観戦者のセッションがある間の、いまのルームの数の行と観戦者の集計。セッションが無ければ `None`。
+    /// いまのルームの数の行と観戦者の集計（観戦者のセッションがある間）。セッションが無ければ`None`。
     pub live: Option<String>,
 }
 
-/// 観戦の節と途中経過を本ログへ書く。片づけた節は取り出した次の見回りで 1 回だけ、途中経過は `interim`（`SUMMARY_EVERY` の秒）のときだけ。
-/// セッションが無い実行は何も書かない。
+/// 観戦の節と途中経過を本ログへ書く。終了した節は取り出した次のポーリングで1回だけ書く。
+/// 途中経過は`interim`（`SUMMARY_EVERY`の秒）のときだけ書く。セッションが無い実行は何も書かない。
 fn write_watch_log(out: &mut dyn Write, k: u32, log: &WatchLog, interim: bool) {
     for (n, body) in &log.ended {
         let _ = writeln!(
             out,
             "==== {n} 回目の観戦の終わり（観戦者として。{k} 秒の時点。計測は続ける） ===="
         );
-        // 簡潔には、観戦の終わりの理由とルームの数の行を残し、受信の数の dump（`受信 …`）は詳細だけにする。
+        // 簡潔なログには観戦の終わりの理由とルームの数の行を残す。受信の数のdump（`受信 …`）は詳細なログだけにする。
         for l in body.lines() {
             if l.starts_with("受信 ") {
                 let _ = writeln!(detail_out(out), "{l}");
@@ -82,20 +85,20 @@ fn write_watch_log(out: &mut dyn Write, k: u32, log: &WatchLog, interim: bool) {
 
 pub trait RecordEnv {
     fn next_seq(&self) -> u32;
-    /// 番号の枠を札・中身・札の順に読んだ結果。
+    /// 番号の枠をタグ・中身・タグの順に読んだ結果。
     fn read_slot(&self, seq: u32) -> SlotRead;
-    /// TSC と QueryPerformanceCounter を続けて読んだ対（TSC は QPC の前後で 2 回読んだ中点）。
+    /// TSCとQueryPerformanceCounterを続けて読んだペア（TSCはQPCの前後で2回読んだ中点）。
     fn tsc_qpc(&mut self) -> (u64, i64);
     fn qpc_frequency(&self) -> i64;
-    /// CPUID の invariant TSC（`0x80000007` の EDX bit 8）。その葉が無ければ `None`。
+    /// CPUIDのinvariant TSC（`0x80000007`のEDX bit 8）。その葉が無ければ`None`。
     fn invariant_tsc(&self) -> Option<bool>;
-    /// ゲームの時計の分母 `[0x4B30C4]`（ウィンドウ `+0x14`）。読めなければ `None`。
+    /// ゲームの時計の分母`[0x4B30C4]`（ウィンドウ`+0x14`）。読めなければ`None`。
     fn game_clock_divisor(&mut self) -> Option<u32>;
     fn copy_table(&self) -> Vec<CopyRow>;
-    /// 本ログの隣に、本ログの名前の先頭 ＋ `suffix` のファイルを開く（回ごとに別名。既存を上書きしない）。
+    /// 本ログの隣に本ログの名前の先頭 ＋ `suffix`のファイルを開く（回ごとに別名。既存を上書きしない）。
     /// 表示用の名前と書き込み先。
     fn open_output(&mut self, suffix: &str) -> Result<(String, Box<dyn Write>), String>;
-    /// メニューとライフの読み取りのスレッドを作る（`_menu.csv` に自分で追記する）。表示用のファイル名。
+    /// メニューとライフの読み取りのスレッドを作る（`_menu.csv`に自分で追記する）。表示用のファイル名。
     fn start_menu(&mut self) -> Result<String, String>;
     fn menu_stats(&mut self) -> Option<TickStats>;
     fn stop_menu(&mut self) -> Option<TickStats>;
@@ -110,7 +113,7 @@ pub trait RecordEnv {
     fn draw_calls(&self) -> u32 {
         0
     }
-    /// 描画だけのフレームを `n` 回作るよう入口に頼む（残りが 0 のときだけセットできる）。セットできたら true。既定は「頼めない」。
+    /// 描画だけのフレームを`n`回作るよう入口に頼む（残りが0のときだけセットできる）。セットできたらtrue。既定は「頼めない」。
     fn start_render_only(&mut self, _n: u32) -> bool {
         false
     }
@@ -118,12 +121,12 @@ pub trait RecordEnv {
     fn render_only_left(&self) -> u32 {
         0
     }
-    /// 文字の描画が止まった理由の本ログの行。止めたあと最初に呼んだ 1 回だけ返す（ゲームのスレッドは原子変数へ値を書くだけで、書くのはこの側）。
+    /// 文字の描画が止まった理由の本ログの行。止めたあと最初に呼んだ1回だけ返す（ゲームのスレッドはアトミック変数へ値を書くだけ。本ログへ書くのはこの側）。
     fn overlay_stop_line(&mut self) -> Option<String> {
         None
     }
 
-    // ---- 台本の feed のリングバッファ・進み具合・撮影のバッファ。既定は「台本なし」で何も返さない。
+    // ---- 台本のfeedのリングバッファ・進み具合・撮影のバッファ。既定は「台本なし」で何も返さない。
     fn feed_next_seq(&self) -> u32 {
         0
     }
@@ -137,7 +140,7 @@ pub trait RecordEnv {
     fn take_shot(&mut self) -> Option<(usize, ShotHead)> {
         None
     }
-    /// 「できた」バッファの画素の先頭 `len` バイトのコピー。
+    /// 「できた」バッファの画素の先頭`len`バイトのコピー。
     fn copy_shot(&self, _slot: usize, _len: usize) -> Vec<u8> {
         Vec::new()
     }
@@ -154,18 +157,18 @@ pub trait RecordEnv {
     fn net_status(&self) -> Option<(NetSnapshot, String)> {
         None
     }
-    /// 観戦者のセッションの本ログの材料（1 秒に 1 回）。`ended` は取り出したら空になる（1 つの節は 1 回だけ返る）。観戦者のセッションが無い実行は何も返さない（既定）。
+    /// 観戦者のセッションの本ログの材料（1秒に1回）。`ended`は取り出したら空になる（1つの節は1回だけ返る）。観戦者のセッションが無い実行は何も返さない（既定）。
     fn watch_log(&mut self) -> WatchLog {
         WatchLog::default()
     }
-    /// 試験のまとめの材料のうち、ゲームの中の静的な値から引くもの（ネットワークを開いたときのこと・接続コードの見張りの状態・パニック・自動保存）。
+    /// 試験のまとめの材料のうちゲームの中の静的な値から取得するもの（ネットワークを開いたときのこと・接続コードの監視の状態・パニック・自動保存）。
     /// 既定は「何も無い」。
     fn host_facts(&mut self) -> HostFacts {
         HostFacts::default()
     }
 }
 
-/// 試験のまとめの材料を集める。`net` はその回のネットワークの数（ネットワークのセッションを組み込んでいなければ None）。
+/// 試験のまとめの材料を集める。`net`はその回のネットワークの数（ネットワークのセッションを組み込んでいなければNone）。
 pub fn trial_facts(
     game: &GameFacts,
     rec: &mut dyn RecordEnv,
@@ -182,12 +185,13 @@ pub fn trial_facts(
     }
 }
 
-/// 巻き戻しの要約の行の先頭（`rollback_play::summary_lines` / `hold_lines` / `core_stats_lines` と `script_win::rollback_text` の行はどれもこれで始まる）。
+/// 巻き戻しの要約の行の先頭（`rollback_play::summary_lines` / `hold_lines` / `core_stats_lines`と`script_win::rollback_text`の行はどれもこれで始まる）。
 const ROLLBACK_LINE_HEAD: &str = "巻き戻し（";
 
-/// 途中経過の巻き戻しの要約。`net_text` は `RecordEnv::net_status` の文で、終わりの要約と同じ行をそのまま選んで書く。
-/// 巻き戻しの行が無い実行（delay 方式・rollback の入口を書いていない）は何も書かない。
-/// 前の途中経過と同じ行（数が 1 つも変わらない。マッチの間やメニューにいる間）は書かない。
+/// 途中経過の巻き戻しの要約。`net_text`は`RecordEnv::net_status`の文。
+/// 終わりの要約と同じ行をそのまま選んで書く。
+/// 巻き戻しの行が無い実行（delay方式・rollbackの入口を書いていない）は何も書かない。
+/// 前の途中経過と同じ行（数が1つも変わらない。マッチの間やメニューにいる間）は書かない。
 fn write_rollback_interim(out: &mut dyn Write, k: u32, net_text: &str, last: &mut Option<String>) {
     let body = rollback_body(net_text);
     if last.as_deref() == Some(body.as_str()) {
@@ -206,7 +210,7 @@ fn rollback_body(net_text: &str) -> String {
         .join("\n")
 }
 
-/// 巻き戻しの要約の見出しと行（途中経過と、接続の終わりの節が使う）。`what` は見出しの括弧の先頭。
+/// 巻き戻しの要約のヘッダと行（途中経過と接続の終わりの節が使う）。`what`はヘッダの括弧の先頭。
 fn write_rollback_lines(out: &mut dyn Write, what: &str, k: u32, net_text: &str) {
     let mut lines = net_text
         .lines()
@@ -224,9 +228,14 @@ fn write_rollback_lines(out: &mut dyn Write, what: &str, k: u32, net_text: &str)
     }
 }
 
-/// 再接続できる実行（ゲーム内のメニューの実行。`NetSnapshot::relink`）で、接続が 1 本終わった時点の「終わり」相当のまとめ（接続が終わったのを初めて見た秒に 1 回）。この実行の計測はゲームを閉じるまで締まらず、閉じたときに書く経路も無い（`DllMain` は ATTACH だけ）ので、接続ごとに同じ中身をここで書く。
-/// ネットワークが終わってから 10 秒待たずに見た秒で書くのは、人が次の接続を開くとネットワークの数が 0 から作り直され（`NetStatus::reset`）、待つと次の接続の数を書いてしまうため。試験のまとめは終わりの節（`Stage::Final`）で判じ、見出しだけ差し替える（終わりの節の見出しは計測の終わりの 1 回だけにしておく。検査がその見出しで終わりの節を探す）。
-#[allow(clippy::too_many_arguments)] // 終わりの段階と同じ材料を 1 か所で渡す
+/// 再接続できる実行（ゲーム内のメニューの実行。`NetSnapshot::relink`）で接続が1本終わった時点に「終わり」相当のまとめを書く（接続が終わったのを初めて見た秒に1回）。
+/// この実行の計測はゲームを閉じるまで終了処理に入らず、閉じたときに書く経路も無い（`DllMain`はATTACHだけ）。
+/// そのため接続ごとに同じ中身をここで書く。
+/// ネットワークが終わってから10秒待たずに見た秒で書くのは次の理由による。
+/// 人が次の接続を開くとネットワークの数が0から作り直される（`NetStatus::reset`）。待つと次の接続の数を書いてしまう。
+/// 試験のまとめは終わりの節（`Stage::Final`）で判定し、ヘッダだけ差し替える。
+/// 終わりの節のヘッダは計測の終わりの1回だけにしておく（検査がそのヘッダで終わりの節を探す）。
+#[allow(clippy::too_many_arguments)] // 終わりの段階と同じ材料を1か所で渡す
 fn write_link_end(
     out: &mut dyn Write,
     n: u32,
@@ -263,7 +272,7 @@ fn write_link_end(
     );
     let facts = trial_facts(game, rec, Some(snap), None, Stage::Final);
     let text = trial_summary::render(&facts);
-    // 見出しの行（`render` の 1 行目）を落として、この節の見出しに替える。
+    // ヘッダの行（`render`の1行目）を落としてこの節のヘッダに替える。
     let body = text.split_once('\n').map_or("", |(_, b)| b);
     let _ = write!(
         out,
@@ -272,7 +281,8 @@ fn write_link_end(
     for l in link_log.end_lines(&snap) {
         let _ = writeln!(out, "{l}");
     }
-    // 接続が終わった時点ではまだ受信スレッドが生きているので、観戦者のツリー・観戦者の上り回線速度の測定の行はここで読める。片づけた後の値は終わりの全文の「回目の接続（片づけ済み」の節に出る。
+    // 接続が終わった時点ではまだ受信スレッドが生きているので観戦者のツリー・観戦者の上り回線速度の測定の行はここで読み取れる。
+    // 後始末した後の値は終わりの全文の「回目の接続（片づけ済み」の節に出る。
     for l in net_text
         .lines()
         .filter(|l| TREE_LINE_HEADS.iter().any(|h| l.starts_with(h)))
@@ -287,28 +297,30 @@ const TREE_LINE_HEADS: [&str; 2] = [
     crate::spectate_host::MEASURE_ROW_HEAD,
 ];
 
-/// 台本が終わるか止まってから計測を終えるまで（秒）。台本のある実行の上限は 1200 秒（10 分の台本は、マッチまでの段階と読み込みを足すと
-/// 600 秒を越える。上限に着くと読み取りのスレッドが先に終わり、`_net_frames.csv` の終わりが欠ける）。台本の無いネットワークの実行（人が遊ぶ実行）は
-/// この上限を使わない（`RunLen::Net` の `max` が `None`）。
+/// 台本が終わるか止まってから計測を終えるまでの秒数。
+/// 台本のある実行の上限は1200秒（10分の台本はマッチまでの段階と読み込みを足すと600秒を越える）。
+/// 上限に着くと読み取りのスレッドが先に終わり`_net_frames.csv`の終わりが欠ける。
+/// 台本の無いネットワークの実行（人が遊ぶ実行）はこの上限を使わない（`RunLen::Net`の`max`が`None`）。
 pub const SCRIPT_TAIL_SECONDS: u32 = 10;
 pub const SCRIPT_MAX_SECONDS: u32 = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunLen {
-    /// 決まった秒数（台本なしの実行。本物は `render_only::TOTAL_SECONDS`）。描画だけのフレームの予定を作る。
+    /// 決まった秒数（台本なしの実行。本物は`render_only::TOTAL_SECONDS`）。描画だけのフレームの予定を作る。
     Fixed(u32),
-    /// 台本のある実行: 台本が終わるか止まってから `tail` 秒で終える（上限 `max` 秒）。描画だけのフレームは作らない。
-    /// `steps` は台本の段階の数（ログ用）、`feed_first` は台本を動かす前の feed のリングバッファの次の番号（そこから読む）。
+    /// 台本のある実行: 台本が終わるか止まってから`tail`秒で終える（上限`max`秒）。描画だけのフレームは作らない。
+    /// `steps`は台本の段階の数（ログ用）。`feed_first`は台本を動かす前のfeedのリングバッファの次の番号（そこから読む）。
     Script {
         tail: u32,
         max: u32,
         steps: usize,
         feed_first: u32,
     },
-    /// ネットワークの実行（台本の無いネットワーク、か `after_script = keep` の台本のネットワーク）: 台本が終わり、かつネットワークが終わってから（ネットワークのセッションを組み込んでいなければ
-    /// 終わっているとみる）`tail` 秒で終える（上限 `max` 秒）。描画だけのフレームは作らない。欄の意味は `Script` と同じ。
-    /// `max` が `None` なのは台本の無いネットワークの実行（人が遊ぶ実行）だけで、ネットワークが開いている間は上限で止めない
-    /// （約 26 分の 7 マッチで上限 1200 秒に着き、後半のマッチの記録が残らなかった）。
+    /// ネットワークの実行（台本の無いネットワーク。または`after_script = keep`の台本のネットワーク）。
+    /// 台本が終わり、かつネットワークが終わってから`tail`秒で終える（上限`max`秒）。
+    /// ネットワークのセッションを組み込んでいなければネットワークは終わっているとみる。
+    /// 描画だけのフレームは作らない。フィールドの意味は`Script`と同じ。
+    /// `max`が`None`なのは台本の無いネットワークの実行（人が遊ぶ実行）だけ。ネットワークが開いている間は上限で止めない（約26分の7マッチで上限1200秒に着き、後半のマッチの記録が残らなかった）。
     Net {
         tail: u32,
         max: Option<u32>,
@@ -317,17 +329,17 @@ pub enum RunLen {
     },
 }
 
-/// この実行で描画だけのフレームを作るか。作るのは台本なしの実行（`Fixed`）だけで、配るバージョン（feature `dist`）ではそれも作らない
-/// （ネットワークなしで起動した配布バージョンの花映塚が 3 秒ごとに止まって見えるため）。`dist` を引数で受けるのは、配るバージョンの形を開発用のビルドの検査でも見るため。
+/// この実行で描画だけのフレームを作るかどうか。
+/// 作るのは台本なしの実行（`Fixed`）だけ。配布バージョン（feature `dist`）ではそれも作らない（ネットワークなしで起動した配布バージョンの花映塚が3秒ごとに止まって見えるため）。
+/// `dist`を引数で受けるのは配布バージョンの形を開発用のビルドの検査でも見るため。
 fn makes_render_only(len: RunLen, dist: bool) -> bool {
     matches!(len, RunLen::Fixed(_)) && !dist
 }
 
-/// リングバッファから新しい件を読む。`next` は次に読む番号で、読んだ分だけ進める。採った件は、先頭を `c` に、枠の全部を
-/// `batch`（次の追記まで持つ）に入れる。
-/// - 一周以上遅れていたら（入口が `next` から `RING_LEN` を越えて先まで書いた）、もう上書きされた分を
-///   読まずに飛ばし、読み落としに数える。
-/// - 札が大きい（読む前に上書きされた）件は読み落としに数えて進む。
+/// リングバッファから新しい件を読む。`next`は次に読む番号で、読んだ分だけ進める。
+/// 採った件の先頭を`c`に、枠の全部を`batch`（次の追記まで持つ）に入れる。
+/// - 一周以上遅れていたら（入口が`next`から`RING_LEN`を越えて先まで書いた）、もう上書きされた分は読まずに飛ばして読み落としに数える。
+/// - タグが大きい（読む前に上書きされた）件は読み落としに数えて進む。
 /// - まだ書き終わっていない件で止め、次の読みでその件からやり直す。
 pub fn drain(rec: &dyn RecordEnv, next: &mut u32, c: &mut Collected, batch: &mut Vec<Snap>) {
     let end = rec.next_seq();
@@ -350,8 +362,8 @@ pub fn drain(rec: &dyn RecordEnv, next: &mut u32, c: &mut Collected, batch: &mut
     }
 }
 
-/// 描画のリングバッファから新しい件を読む（`drain` の描画バージョン。読み落としの数え方も同じ）。採った件は `batch` に入れ、
-/// 番号ごとの数えは呼び出し側が `render_only::Collector::feed_draw` でする。
+/// 描画のリングバッファから新しい件を読む（`drain`の描画バージョン。読み落としの数え方も同じ）。採った件は`batch`に入れる。
+/// 番号ごとの集計は呼び出し側が`render_only::Collector::feed_draw`でする。
 pub fn drain_draws(
     rec: &dyn RecordEnv,
     next: &mut u32,
@@ -375,7 +387,7 @@ pub fn drain_draws(
     }
 }
 
-/// 1 秒ごとの回数の集計。増分は「前に読んだときからの増え方」で、1 回の間隔はおよそ 1000 ms（`GetTickCount64` の刻みは約 16 ms）。
+/// 1秒ごとの回数の集計。増分は「前に読んだときからの増え方」。1回の間隔はおよそ1000 ms（`GetTickCount64`の更新間隔は約16 ms）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObserveSummary {
     pub samples: u32,
@@ -393,19 +405,19 @@ fn yes_no(b: Option<bool>) -> &'static str {
     }
 }
 
-/// 追記の書き込み先 1 つ。開けない・書けなくなったら理由を持ち、以後は書かない（計測は続ける）。
+/// 追記の書き込み先1つ。開けない・書けなくなったら理由を持つ。以後は書かない（計測は続ける）。
 pub(crate) struct Sink {
     name: String,
     w: Option<Box<dyn Write>>,
-    /// 書いた行（`_snap.bin` は件）の数。見出しは数えない。
+    /// 書いた行（`_snap.bin`は件）の数。ヘッダは数えない。
     count: u64,
     err: Option<String>,
-    /// 初めから開かない書き込み先（配るバージョンの観測用のファイル。`Sink::off`）。
+    /// 初めから開かない書き込み先（配布バージョンの観測用のファイル。`Sink::off`）。
     off: bool,
 }
 
 impl Sink {
-    /// 開かない書き込み先。ファイルを作らず、書いても何もしない（`write` は false）。
+    /// 開かない書き込み先。ファイルを作らず書いても何もしない（`write`はfalse）。
     pub(crate) fn off(suffix: &str) -> Sink {
         Sink {
             name: suffix.to_string(),
@@ -416,7 +428,7 @@ impl Sink {
         }
     }
 
-    /// 書く先があるか（開けなかった・書けなくなった・開かない書き込み先なら false）。行を組む手間を省くのに使う。
+    /// 書く先があるかどうか（開けなかった・書けなくなった・開かない書き込み先ならfalse）。行を組む手間を省くのに使う。
     pub(crate) fn is_on(&self) -> bool {
         self.w.is_some()
     }
@@ -480,7 +492,7 @@ impl Sink {
     }
 }
 
-/// 追記のファイルと、行を流して作る状態。描画だけのフレームの差 `_renderonly.csv` は最後にまとめて書くので、集める `collector` だけ持つ。
+/// 追記のファイルと、行を渡して作る状態。描画だけのフレームの差`_renderonly.csv`は最後にまとめて書くので集める`collector`だけ持つ。
 struct Streams {
     rows: Vec<CopyRow>,
     csv: TickCsv,
@@ -490,41 +502,42 @@ struct Streams {
     snap: Sink,
     draws: Sink,
     draw_csv: DrawCsv,
-    /// 描画だけのフレームと次の件・描画の番号ごとの数え（最後に `_renderonly.csv` と集計へ）。
+    /// 描画だけのフレームと次の件・描画の番号ごとの数え（最後に`_renderonly.csv`と集計へ）。
     collector: render_only::Collector,
     draw_lost: u64,
-    /// `_snap.bin` に書く件の上限（製品は `SNAP_MAX_RECORDS`。検査は小さくする）。
+    /// `_snap.bin`に書く件の上限（製品は`SNAP_MAX_RECORDS`。検査は小さくする）。
     snap_cap: u64,
-    /// `_snap.bin` の上限を越えて書かなかった件。
+    /// `_snap.bin`の上限を越えて書かなかった件。
     snap_skipped: u64,
 }
 
-/// `_snap.bin` に書く件の上限（計測の上限 `SCRIPT_MAX_SECONDS` × 60 tick。約 70 MB）。
+/// `_snap.bin`に書く件の上限（計測の上限`SCRIPT_MAX_SECONDS` × 60 tick。約70 MB）。
 const SNAP_MAX_RECORDS: u64 = SCRIPT_MAX_SECONDS as u64 * 60;
 
-/// 観測用の 4 つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くか。配るバージョンでは書かない（配ったバージョンを使う人の 1 回の起動のログの約 88% がこの 4 つだった）。
-/// 集計（本ログ）・`_net_frames.csv`・`_pacing.csv`・`_menu.csv` は、配るバージョンでも詳細なログ（ini の `[log] detail = 1`）なら書く。
+/// 観測用の4つ（`_ticks.csv`・`_changes.csv`・`_snap.bin`・`_draws.csv`）を書くかどうか。配布バージョンでは書かない（配布したバージョンを使う人の1回の起動のログの約88%がこの4つだった）。
+/// 集計（本ログ）・`_net_frames.csv`・`_pacing.csv`・`_menu.csv`は、配布バージョンでも詳細なログ（iniの`[log] detail = 1`）なら書く。
 fn writes_observe_files(dist: bool) -> bool {
     !dist
 }
 
-/// 台本の実行の 2 つ（`_feed.csv`・`_shots.csv`）を作るか。配るバージョンでは作らない（台本の実行でしか中身が入らず、見出しだけの空のファイルになる）。
+/// 台本の実行の2つ（`_feed.csv`・`_shots.csv`）を作るかどうか。配布バージョンでは作らない（台本の実行でしか中身が入らずヘッダだけの空のファイルになる）。
 fn writes_script_files(dist: bool) -> bool {
     !dist
 }
 
-/// 途中経過の 1 秒ごとの判断。
+/// 途中経過の1秒ごとの判断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InterimDue {
-    /// 試験のまとめの途中経過の節を書くか。
+    /// 試験のまとめの途中経過の節を書くかどうか。
     trial: bool,
-    /// 巻き戻しの要約の途中経過の節を書くか。
+    /// 巻き戻しの要約の途中経過の節を書くかどうか。
     rollback: bool,
 }
 
-/// 途中経過を書くか。試験のまとめは、RTT 以外の印の並びが変わったときと `SUMMARY_EVERY` 秒ごと。RTT の印は rollback で片道が D の時間を
-/// またいで 〇 ⇄ － と揺れる（1 起動で印の変わり 2,319 回のうち 2,240 回）ので、比べから外す。巻き戻しの要約は累積なので
-/// `SUMMARY_EVERY` 秒ごとだけ（1 節が約 28 KB）。
+/// 途中経過を書くかどうか。
+/// 試験のまとめはRTT以外の印の並びが変わったときと`SUMMARY_EVERY`秒ごとに書く。
+/// RTTの印はrollbackで片道がDの時間をまたいで 〇 ⇄ － と揺れる（1起動で印の変わり2,319回のうち2,240回）。そのため比べから外す。
+/// 巻き戻しの要約は累積なので`SUMMARY_EVERY`秒ごとだけ書く（1節が約28 KB）。
 fn interim_due(
     last: Option<&[trial_summary::Mark]>,
     now: &[trial_summary::Mark],
@@ -577,7 +590,7 @@ impl Streams {
 
     fn write_batch(&mut self, batch: &[Snap], draws: &[DrawRecord]) {
         for s in batch {
-            // 書く先が無いときは行を組まない（配るバージョン。集めの `collector` には下で食わせる）。
+            // 書く先が無いときは行を組まない（配布バージョン。集めの`collector`には下で渡す）。
             if self.ticks.is_on() {
                 let line = format!("{},{}", self.csv.row(&s.rec), csv_columns(&self.rows, s));
                 self.ticks.line(&line);
@@ -589,8 +602,8 @@ impl Streams {
                 }
                 self.prev_words = Some(words);
             }
-            // コピーの生のバイト（1 件 1024 B、約 61 KB/s）は計測の上限と同じ長さぶんで書くのをやめる。台本の無いネットワークの実行は計測が上限を越えて
-            // 続くので、止めないと 1 時間で約 221 MB になる。
+            // コピーの生のバイト（1件1024 B。約61 KB/s）は計測の上限と同じ長さぶんで書くのをやめる。
+            // 台本の無いネットワークの実行は計測が上限を越えて続くので、止めないと1時間で約221 MBになる。
             if self.snap.is_on() {
                 if self.snap.count < self.snap_cap {
                     if self.snap.write(&s.bytes()) {
@@ -640,25 +653,26 @@ impl Streams {
     }
 }
 
-/// 途中経過の集計で、前に書いた節と変わらない行を繰り返さないための覚え。tick の集計は取れた件が上限（`MAX_RECORDS`）に達すると
-/// 中身が変わらなくなり（1 時間 13 分で 262,144 件。以後 60 秒ごとに同じ行が並んだ）、書き出しの行は書かない設定だと毎回同じになる。
-/// 持ちきれなかった件数のように増え続ける値は、比べから外して終わりの節に書く。終わりの集計と接続の終わりの節は覚えを使わず全部書く。
+/// 途中経過の集計で前に書いた節と変わらない行を繰り返さないための覚え。
+/// tickの集計は取れた件が上限（`MAX_RECORDS`）に達すると中身が変わらなくなる（1時間13分で262,144件。以後60秒ごとに同じ行が並んだ）。
+/// 書き出しの行は書かない設定だと毎回同じになる。
+/// 持ちきれなかった件数のように増え続ける値は比べから外して終わりの節に書く。終わりの集計と接続の終わりの節は覚えを使わず全部書く。
 #[derive(Default)]
 struct ProgressEcho {
     ticks: Option<crate::ticks::TickSummary>,
     status: Option<String>,
-    /// 省いたことを言う行を書いたか（1 本の計測で 1 回）。
+    /// 省略したことを示す行を書いたかどうか（1本の計測で1回）。
     noted: bool,
 }
 
-/// `overflow`（持ちきれなかった件数。上限に達した後は増え続ける）以外が同じか。
+/// `overflow`（持ちきれなかった件数。上限に達した後は増え続ける）以外が同じかどうか。
 fn same_but_overflow(a: &crate::ticks::TickSummary, b: &crate::ticks::TickSummary) -> bool {
     let mut a = a.clone();
     a.overflow = b.overflow;
     a == *b
 }
 
-#[allow(clippy::too_many_arguments)] // 集計に要るものを 1 か所で渡す
+#[allow(clippy::too_many_arguments)] // 集計に要るものを1か所で渡す
 fn write_progress(
     out: &mut dyn Write,
     label: &str,
@@ -747,7 +761,7 @@ fn write_render_only(
     let (frames, summary) = render_only::analyze(&streams.collector.frames, &streams.rows, |seq| {
         streams.collector.draws_for(seq)
     });
-    // 簡潔なログでは `_renderonly.csv` を作らない。
+    // 簡潔なログでは`_renderonly.csv`を作らない。
     let mut ro = if crate::log_mode::detail() {
         Sink::open(rec, RENDERONLY_SUFFIX)
     } else {
@@ -763,7 +777,7 @@ fn write_render_only(
     let _ = writeln!(out, "描画だけのフレーム: 書き出し {}", ro.status("行"));
 }
 
-/// 設置の後の計測。`first_seq` は設置の直前に読んだ次の番号（そこから読む）。`seconds` は計測の長さ（検査では短くする）。
+/// 設置の後の計測。`first_seq`は設置の直前に読んだ次の番号（そこから読む）。`seconds`は計測の長さ（検査では短くする）。
 /// 台本の無い実行（`RunLen::Fixed`）。
 #[cfg(test)]
 pub fn run(
@@ -783,12 +797,13 @@ pub fn run(
     )
 }
 
-/// 設置の後の計測（長さは `len`）。台本のある実行（`RunLen::Script`）では、100 ms ごとに feed のリングバッファと撮影のバッファも読み
-/// （`script_watch::ScriptWatch`）、描画だけのフレームの予定は作らず、台本が終わるか止まってから `tail` 秒で終える（上限 `max` 秒）。
+/// 設置の後の計測（長さは`len`）。
+/// 台本のある実行（`RunLen::Script`）では100 msごとにfeedのリングバッファと撮影のバッファも読む（`script_watch::ScriptWatch`）。
+/// 描画だけのフレームの予定は作らず、台本が終わるか止まってから`tail`秒で終える（上限`max`秒）。
 ///
-/// 試験のまとめ（`trial_summary`）: 1 秒ごとに材料を集め、項目の印の並びが変わったとき（と、60 秒ごと）に「途中経過」の節を本ログへ書く。
-/// 使う人がゲームを閉じて終えると、この関数が終わりの節を書く前にプロセスごと消えるため。終わりの節は呼び手（`session::run`）が、
-/// ペースなどの終わりの集計の後（本ログの最後）に書く。`game` は設置までに分かったこと。
+/// 試験のまとめ（`trial_summary`）: 1秒ごとに材料を集める。項目の印の並びが変わったとき（と60秒ごと）に「途中経過」の節を本ログへ書く。
+/// 途中経過を書くのは、使う人がゲームを閉じて終えるとこの関数が終わりの節を書く前にプロセスごと消えるため。
+/// 終わりの節は呼び出し元（`session::run`）がペースなどの終わりの集計の後（本ログの最後）に書く。`game`は設置までに分かったこと。
 pub fn run_len(
     hook: &mut dyn HookEnv,
     rec: &mut dyn RecordEnv,
@@ -840,7 +855,7 @@ pub fn run_len(
         rows,
         writes_observe_files(cfg!(feature = "dist")) && crate::log_mode::detail(),
     );
-    // 簡潔なログでは `_menu.csv` を書かないので、1 ms ごとに読むこのスレッドも作らない。
+    // 簡潔なログでは`_menu.csv`を書かないので1 msごとに読むこのスレッドも作らない。
     if crate::log_mode::detail() {
         let _ = match rec.start_menu() {
             Ok(name) => writeln!(
@@ -853,8 +868,8 @@ pub fn run_len(
             ),
         };
     }
-    // 台本のある実行だけ、feed のリングバッファと撮影のバッファを読む処理（`_feed.csv` / `_shots.csv`）。
-    // 計測の上限（秒）。None は台本の無いネットワークの実行で、ネットワークが終わるまで回す（`RunLen::Net` の注）。
+    // 台本のある実行だけfeedのリングバッファと撮影のバッファを読む処理（`_feed.csv` / `_shots.csv`）。
+    // 計測の上限（秒）。Noneは台本の無いネットワークの実行。ネットワークが終わるまで回す（`RunLen::Net`の注）。
     let max_seconds: Option<u32> = match len {
         RunLen::Fixed(s) => Some(s),
         RunLen::Script { max, .. } => Some(max),
@@ -940,30 +955,30 @@ pub fn run_len(
     let mut measured = 0;
     let mut script_ended: Option<u32> = None;
     let mut restarts_logged = 0u32;
-    // CHECK のズレを本ログへ書いたか（1 回だけ。全部の欄を書く）と、最後に書いた試験のまとめの印の並び。
+    // CHECKのズレを本ログへ書いたかどうか（1回だけ。全部のフィールドを書く）と最後に書いた試験のまとめの印の並び。
     let mut desync_logged = false;
-    // 同期ズレでマッチを止めたことを本ログへ書いたか（止めた秒に 1 回と、自分の Esc で戻った秒に 1 回）。
+    // 同期ズレでマッチを止めたことを本ログへ書いたか（止めた秒に1回と、自分のEscで戻った秒に1回）。
     let mut stop_logged = (false, false);
     let mut last_marks: Option<Vec<trial_summary::Mark>> = None;
-    // 簡潔なログの「状態の変化」は、前に判じた項目との差で書く。マッチの始まりと終わりの 1 行ずつは `MatchWatch`。
+    // 簡潔なログの「状態の変化」は前に判定した項目との差で書く。マッチの始まりと終わりの1行ずつは`MatchWatch`。
     let mut last_items: Option<Vec<trial_summary::Item>> = None;
-    // rollback がマッチをやめた行（回数が変わるたびに 1 回。簡潔なログにも残す）。
+    // rollbackがマッチをやめた行（回数が変わるたびに1回。簡潔なログにも残す）。
     let mut last_abort_line: Option<String> = None;
     let mut matches = crate::match_events::MatchWatch::default();
-    // 接続ごとの観戦者の出入り・RTT の標本（終わりの節に stall の内訳と一緒に書く）。
+    // 接続ごとの観戦者の出入り・RTTのサンプル（終わりの節にstallの内訳と一緒に書く）。
     let mut link_log = crate::link_log::LinkLog::default();
     let mut last_net: Option<NetSnapshot> = None;
-    // 途中経過の集計・巻き戻しの要約で、前と変わらないものを繰り返さないための覚え。
+    // 途中経過の集計・巻き戻しの要約で前と変わらないものを繰り返さないための覚え。
     let mut echo = ProgressEcho::default();
     let mut last_rollback_interim: Option<String> = None;
-    // 再接続できる実行で、前の秒に見た接続が終わっていたか（終わりの節を 1 本に 1 回だけ書くための縁の検出）と、書いた本数。
-    // ネットワークの数を読めなかった秒は前の値のまま（片づけの後は、次のセッションを組み込むまでネットワークの数が前の接続の終わりのまま残る）。
+    // 再接続できる実行で前の秒に見た接続が終わっていたかどうか（終わりの節を1本に1回だけ書くためのエッジ検出）と書いた本数。
+    // ネットワークの数を読めなかった秒は前の値のまま（後始末の後は次のセッションを組み込むまでネットワークの数が前の接続の終わりのまま残る）。
     let mut link_end_seen = false;
     let mut links_ended = 0u32;
-    // 上限の無い実行もリングバッファの回数は u32 に収める（1 秒 10 回で約 13 年。終わりは下の `last` が決める）。
+    // 上限の無い実行もリングバッファの回数はu32に収める（1秒10回で約13年。終わりは下の`last`が決める）。
     let polls = max_seconds.map_or(u32::MAX, |m| m.saturating_mul(POLLS_PER_SECOND));
     for p in 1..=polls {
-        // 予定の時刻は始めの時刻からの倍数で決め、待ちの延びが次の回へ積もらないようにする。
+        // 予定の時刻は始めの時刻からの倍数で決める。これで待ちの延びが次の回へ積もらない。
         let due = start + p as u64 * POLL_MS as u64;
         let now = hook.now_ms();
         if due > now {
@@ -979,7 +994,7 @@ pub fn run_len(
         }
         let k = p / POLLS_PER_SECOND;
         measured = k;
-        // 描画だけのフレームの予定: この秒の区切りで N を頼む（残りが 0 のときだけセットできる）。台本・ネットワークの実行と配るバージョンでは作らない。
+        // 描画だけのフレームの予定: この秒の区切りでNを頼む（残りが0のときだけセットできる）。台本・ネットワークの実行と配布バージョンでは作らない。
         if let (true, Some(n)) = (render_only_on, burst_at(k)) {
             let placed = rec.start_render_only(n);
             let _ = writeln!(
@@ -1018,7 +1033,7 @@ pub fn run_len(
             w.flush();
         }
         let c = hook.counter();
-        // 回数は 32 ビットで回り込むので、増分は wrapping で取る。
+        // 回数は32ビットで回り込むので増分はwrappingで取る。
         let step = c.wrapping_sub(prev);
         prev = c;
         min_step = min_step.min(step);
@@ -1031,9 +1046,9 @@ pub fn run_len(
         if let Some(l) = rec.overlay_stop_line() {
             let _ = writeln!(out, "{l}（{k} 秒の時点）。");
         }
-        // 別のスレッドが本ログへ頼んだ行を、簡潔なログでも 1 秒以内に書く。
+        // 別のスレッドが本ログへ頼んだ行を簡潔なログでも1秒以内に書く。
         let _ = out.flush();
-        // ネットワークの数は 1 秒ごとに読む（作り直しの行と、ネットワークの実行の終わりの判定）。ネットワークのセッションを組み込んでいなければ None。
+        // ネットワークの数は1秒ごとに読む（作り直しの行とネットワークの実行の終わりの判定）。ネットワークのセッションを組み込んでいなければNone。
         let net_now = rec.net_status();
         let net_snap = net_now.as_ref().map(|(snap, _)| *snap);
         if let Some(snap) = net_snap {
@@ -1060,7 +1075,7 @@ pub fn run_len(
                     trial_summary::compare_frames_hint()
                 );
             }
-            // 止めた行は止めた秒に 1 回、自分の Esc で戻った秒にもう 1 回（途中の秒は描画だけのフレームの数が増えるだけで書かない）。
+            // 止めた行は止めた秒に1回と自分のEscで戻った秒にもう1回書く（途中の秒は描画だけのフレームの数が増えるだけなので書かない）。
             if let Some(l) = snap.stop_line() {
                 let released = snap.stop & 2 != 0;
                 if !stop_logged.0 || (released && !stop_logged.1) {
@@ -1115,8 +1130,8 @@ pub fn run_len(
                 k >= max || script_ended.is_some_and(|e| k >= e.saturating_add(tail))
             }
         };
-        // 再接続できる実行で、接続が 1 本終わったのを初めて見た秒（`write_link_end`）。計測は締めない。この秒で計測を終えるなら書かない
-        // （すぐ後の終わりの段階が同じ中身を書く）。
+        // 再接続できる実行で接続が1本終わったのを初めて見た秒に書く（`write_link_end`）。計測は終了しない。
+        // この秒で計測を終えるなら書かない（すぐ後の終わりの段階が同じ中身を書く）。
         let mut link_end_written = false;
         if let Some(s) = net_snap {
             let ended_now = s.relink && s.link_ended();
@@ -1142,8 +1157,8 @@ pub fn run_len(
             }
             link_end_seen = ended_now;
         }
-        // 接続の終わりの節を書いた秒は、途中経過（集計・試験のまとめ・巻き戻しの要約）を重ねて書かない（同じ秒の同じ数が
-        // 2 回並ぶだけ）。印の並びは覚えておき、次の秒からは変わったときだけ書く。
+        // 接続の終わりの節を書いた秒は途中経過（集計・試験のまとめ・巻き戻しの要約）を重ねて書かない（同じ秒の同じ数が2回並ぶだけ）。
+        // 印の並びは覚えておき、次の秒からは変わったときだけ書く。
         if k.is_multiple_of(SUMMARY_EVERY) && !last && !link_end_written {
             let pair = rec.tsc_qpc();
             let menu = rec.menu_stats();
@@ -1174,15 +1189,15 @@ pub fn run_len(
                         let _ = write!(out, "{}", trial_summary::render(&facts));
                     }
                 } else if last_marks.as_deref() != Some(&now_marks) {
-                    // 簡潔なログは印が変わったときだけ、変わった項目の行を書く（60 秒ごとの全文は書かない）。
+                    // 簡潔なログは印が変わったときだけ変わった項目の行を書く（60秒ごとの全文は書かない）。
                     let _ = write!(
                         out,
                         "{}",
                         trial_summary::render_changes(k, &items, last_items.as_deref())
                     );
                 }
-                // 巻き戻しの要約は `SUMMARY_EVERY` 秒ごとだけ（終わりの要約は計測の終わりにしか出ないので、ゲームを閉じると残らない。
-                // 累積なので最後の節があれば足りる）。
+                // 巻き戻しの要約は`SUMMARY_EVERY`秒ごとだけ書く。
+                // 終わりの要約は計測の終わりにしか出ないのでゲームを閉じると残らない。ただし累積なので最後の節があれば足りる。
                 if due.rollback
                     && let Some((_, text)) = &net_now
                 {
@@ -1191,8 +1206,8 @@ pub fn run_len(
                 last_marks = Some(now_marks);
                 last_items = Some(items);
             }
-            // 観戦者のセッションの数（片づけた節と途中経過）。最後の秒は取り出さない: 終わりの全文（ネットワークの外）が片づけた節を全部書くので、
-            // 取り出すと同じ行が 2 回並ぶ。
+            // 観戦者のセッションの数（終了した節と途中経過）。
+            // 最後の秒は取り出さない。終わりの全文（ネットワークの外）が終了した節を全部書くので、取り出すと同じ行が2回並ぶ。
             write_watch_log(out, k, &rec.watch_log(), k.is_multiple_of(SUMMARY_EVERY));
         }
         if last {
@@ -1220,18 +1235,18 @@ pub fn run_len(
         menu,
         None,
     );
-    // 再接続できない実行（接続が終わると計測も終わる）の、接続の終わりの行。再接続できる実行は終わりを見た秒に `write_link_end` が書いている。
+    // 再接続できない実行（接続が終わると計測も終わる）の接続の終わりの行。再接続できる実行は終わりを見た秒に`write_link_end`が書いている。
     if let Some(s) = last_net.filter(|s| !s.relink) {
         for l in link_log.end_lines(&s) {
             let _ = writeln!(out, "{l}");
         }
     }
-    // 描画だけのフレームの実験の集計（`_renderonly.csv` と本ログ）。台本のある実行では作っていないので、描画の
-    // 回数だけを書く（撮影の描画の番号と突き合わせるため）。
+    // 描画だけのフレームの実験の集計（`_renderonly.csv`と本ログ）。
+    // 台本のある実行では作っていないので描画の回数だけを書く（撮影の描画の番号と突き合わせるため）。
     match watch.as_ref() {
         None => {
             write_render_only(&mut detail_out(out), rec, &mut streams, freq0);
-            // 台本の無い実行でも、ゲーム内のメニューの実行は「ネットワークの外」の行（メニューの数え）を出す。
+            // 台本の無い実行でもゲーム内のメニューの実行は「ネットワークの外」の行（メニューの数え）を出す。
             crate::script_watch::write_outside_net(&*rec, &mut detail_out(out));
         }
         Some(w) => {
@@ -1265,7 +1280,7 @@ pub fn run_len(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    // 配るバージョンでは中身の `_ticks.csv` を読む検査を走らせないので、その検査だけが使う文字は開発用だけ。
+    // 配布バージョンでは中身の`_ticks.csv`を読む検査を走らせないのでその検査だけが使うuse宣言は開発用だけ。
     #[cfg(not(feature = "dist"))]
     use crate::copies::tests::snap_with;
     use crate::hook::tests::FakeHook;
@@ -1307,20 +1322,20 @@ pub(crate) mod tests {
         Snap::from_words(r.seq, words)
     }
 
-    /// 偽のリングバッファ: `records[i]` が番号 `base + i`。`next_seq` を呼ぶたびに（= 1 回の読みごとに）
-    /// `per_poll` 件ずつ見えるようになる。
+    /// 偽のリングバッファ。`records[i]`が番号`base + i`。
+    /// `next_seq`を呼ぶたび（= 1回の読みごと）に`per_poll`件ずつ見えるようになる。
     pub(crate) struct FakeRecord {
         pub(crate) records: Vec<Snap>,
         pub(crate) base: u32,
         pub(crate) per_poll: u32,
         pub(crate) polls: Cell<u32>,
-        /// 見えている件数を直に決める（`per_poll` より先に効く）。
+        /// 見えている件数を直接決める（`per_poll`より先に効く）。
         pub(crate) visible: Option<fn(u32) -> u32>,
         pub(crate) overwritten: HashSet<u32>,
-        /// 1 回目だけ「まだ」と答える番号。
+        /// 1回目だけ「まだ」と答える番号。
         pub(crate) not_yet_once: RefCell<HashSet<u32>>,
         pub(crate) reads: RefCell<Vec<u32>>,
-        /// TSC と QPC の対（呼んだ回数 → 対）と、呼んだ回数。
+        /// TSCとQPCのペア（呼んだ回数 → ペア）と呼んだ回数。
         pub(crate) pair_fn: fn(u32) -> (u64, i64),
         pub(crate) pairs_read: u32,
         pub(crate) qpf: i64,
@@ -1332,24 +1347,24 @@ pub(crate) mod tests {
         pub(crate) menu_fail: bool,
         pub(crate) menu_started: bool,
         pub(crate) menu_stopped: bool,
-        /// ネットワークの数（`net_status` を呼んだ回数 → 数）。None ならネットワークのセッションを組み込んでいない。
+        /// ネットワークの数（`net_status`を呼んだ回数 → 数）。Noneならネットワークのセッションを組み込んでいない。
         pub(crate) net: Option<fn(u32) -> NetSnapshot>,
-        /// ネットワークの外の文（`net_status` を呼んだ回数 → 文）。None なら空の文。
+        /// ネットワークの外の文（`net_status`を呼んだ回数 → 文）。Noneなら空の文。
         pub(crate) net_text: Option<fn(u32) -> String>,
         pub(crate) net_calls: Cell<u32>,
-        /// `start_render_only` で頼まれた N の列（呼ばれた順。配線の検査 `run_asks_for_render_only_frames_…`）。
+        /// `start_render_only`で頼まれたNの列（呼ばれた順。配線の検査`run_asks_for_render_only_frames_…`）。
         pub(crate) render_only_asks: Vec<u32>,
-        /// 観戦者のセッションの材料（`watch_log` を呼んだ回数 1, 2, … → 材料）。None なら観戦者のセッションが無い実行（既定の空）。
+        /// 観戦者のセッションの材料（`watch_log`を呼んだ回数1, 2, … → 材料）。Noneなら観戦者のセッションが無い実行（既定の空）。
         pub(crate) watch: Option<fn(u32) -> WatchLog>,
         pub(crate) watch_calls: u32,
-        /// `overlay_stop_line` を呼んだ回数と、その何回目に返すか・返す行（1 回だけ返す本物と同じ）。
+        /// `overlay_stop_line`を呼んだ回数とその何回目に返すか・返す行（1回だけ返す本物と同じ）。
         pub(crate) overlay_stop_calls: u32,
         pub(crate) overlay_stop: Option<(u32, String)>,
         /// 試験のまとめの材料（パニックなど）。
         pub(crate) host: HostFacts,
     }
 
-    /// 3 GHz の TSC と 10 MHz の QPC がそろって進む対（呼ぶたびに 1 秒ずつ進む）。
+    /// 3 GHzのTSCと10 MHzのQPCがそろって進むペア（呼ぶたびに1秒ずつ進む）。
     fn three_ghz(i: u32) -> (u64, i64) {
         let q = i as i64 * 10_000_000;
         (1_000_000 + q as u64 * 300, q)
@@ -1393,7 +1408,7 @@ pub(crate) mod tests {
             }
         }
 
-        // 中身を読むのは `_ticks.csv` などを前提にした検査だけ（配るバージョンでは走らない）。
+        // 中身を読むのは`_ticks.csv`などを前提にした検査だけ（配るバージョンでは走らない）。
         #[cfg(not(feature = "dist"))]
         pub(crate) fn output(&self, suffix: &str) -> String {
             self.outputs
@@ -1483,7 +1498,7 @@ pub(crate) mod tests {
             self.watch
                 .map_or_else(WatchLog::default, |f| f(self.watch_calls))
         }
-        /// 計測の回しから頼まれた N を覚えておく（セットできたかは「頼めない」のまま。既存の検査の本ログの文を変えない）。
+        /// 計測のループから頼まれたNを覚えておく（セットできたかは「頼めない」のまま。既存の検査の本ログの文を変えない）。
         fn start_render_only(&mut self, n: u32) -> bool {
             self.render_only_asks.push(n);
             false
@@ -1618,7 +1633,7 @@ pub(crate) mod tests {
         use crate::net_watch::restart_code;
         use higanr_core::handshake::{FailReason, Restart};
         fn snap(i: u32) -> NetSnapshot {
-            // 0・1 回目: 接続する前（作り直し 0 → 1）。2・3 回目: 作り直し 3（2 回ぶんまとめて増えた）。4 回目から: 終えた。
+            // 0・1回目: 接続する前（作り直し0 → 1）。2・3回目: 作り直し3（2回ぶんまとめて増えた）。4回目から: 終えた。
             let (phase, restarts) = match i {
                 0 => (0, 0),
                 1 => (0, 1),
@@ -1708,7 +1723,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_net_run_without_a_cap_runs_past_the_script_cap_until_the_net_ends() {
-        // ネットワークが終わる回（net_status の呼び出しの番号。0 始まりなので計測 END + 1 秒目に終わったと見える）。
+        // ネットワークが終わるnet_statusの呼び出し番号（0始まりなので計測END + 1秒目に終わったと見える）。
         const END: u32 = SCRIPT_MAX_SECONDS + 300;
         fn snap(i: u32) -> NetSnapshot {
             NetSnapshot {
@@ -1871,7 +1886,7 @@ pub(crate) mod tests {
         assert_eq!(log.matches("==== 試験のまとめ").count(), 1, "{log}");
     }
 
-    /// 簡潔なログ用のネットワークの数: 接続 → マッチが始まる → マッチが終わる → CHECK がずれる。
+    /// 簡潔なログ用のネットワークの数: 接続 → マッチが始まる → マッチが終わる → CHECKがずれる。
     fn brief_snap(i: u32) -> NetSnapshot {
         use higanr_core::wire::Check;
         let chk = |rng| Check {
@@ -1967,7 +1982,7 @@ pub(crate) mod tests {
             ],
             "{log}"
         );
-        // 最初は 〇 と × だけ、次は接続した／マッチが始まった項目だけ、最後は同期のズレ。
+        // 最初は 〇 と × だけ。次は接続した／マッチが始まった項目だけ。最後は同期のズレ。
         let first = log.split("==== 状態の変化（3 秒").next().unwrap();
         assert!(first.contains("〇 花映塚のバージョン: "), "{first}");
         assert!(!first.contains("－ "), "最初の節に － が出た:\n{first}");
@@ -1988,10 +2003,10 @@ pub(crate) mod tests {
             1,
             "{log}"
         );
-        // 書いていない CSV を見比べろとは案内しない。詳細で再現する案内になる。
+        // 書いていないCSVを見比べろとは案内しない。詳細で再現する案内になる。
         assert!(!log.contains("_net_frames"), "{log}");
         assert!(log.contains("detail を 1 にして再現してください"), "{log}");
-        // 開いたファイルは無く、1 ms ごとのスレッドも作らない。
+        // 開いたファイルは無い。1 msごとのスレッドも作らない。
         assert!(rec.outputs.is_empty(), "{:?}", rec.outputs.keys());
         assert!(!rec.menu_started);
     }
@@ -2211,7 +2226,7 @@ pub(crate) mod tests {
             &trial_summary::installed_game_facts(),
         );
         let log = String::from_utf8(out).unwrap();
-        // 試験のまとめの途中経過は 1 秒目（接続する前）・3 秒目（印が変わる）・60 秒目。巻き戻しの要約は 60 秒目だけ。
+        // 試験のまとめの途中経過は1秒目（接続する前）・3秒目（印が変わる）・60秒目。巻き戻しの要約は60秒目だけ。
         let heads: Vec<_> = log
             .lines()
             .filter(|l| l.starts_with("==== 試験のまとめ（途中経過"))
@@ -2243,8 +2258,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// 再接続できる実行（`relink`）のネットワークの数: 呼んだ回数 `i`（1 秒に 1 回）で決める。1 本目は 0〜2 回目に接続して進み、3〜7 回目は終わったまま、
-    /// 8〜10 回目は次のセッションで 0 から作り直されて接続し、11 回目から 2 本目も終わる。`ends` が偽なら 1 本も終わらない。
+    /// 再接続できる実行（`relink`）のネットワークの数。呼んだ回数`i`（1秒に1回）で決める。
+    /// 1本目は0〜2回目に接続して進み、3〜7回目は終わったまま。
+    /// 8〜10回目は次のセッションで0から作り直されて接続する。11回目から2本目も終わる。`ends`が偽なら1本も終わらない。
     fn relink_snap(i: u32, ends: bool) -> NetSnapshot {
         let ended = ends && ((3..8).contains(&i) || i >= 11);
         NetSnapshot {
@@ -2353,7 +2369,7 @@ pub(crate) mod tests {
         assert!(log.contains("計測の集計: 7 回"), "{log}");
     }
 
-    /// 1 本目は 0〜2 回目の読みで接続して進み、3 回目から終わる。観戦者が 1 人入り（1 回目）、抜ける（終わり）。RTT の測定は 1 秒に 1 個。
+    /// 1本目は0〜2回目の読みで接続して進み、3回目から終わる。観戦者が1人入り（1回目）、抜ける（終わり）。RTTの測定は1秒に1個。
     fn ending_link_snap(i: u32) -> NetSnapshot {
         let ended = i >= 3;
         NetSnapshot {
@@ -2472,7 +2488,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(sec.matches(want).count(), 1, "{want}\n---\n{sec}");
         }
-        // 長い集計の行（観戦: …）はこの節に写さない。
+        // 長い集計の行（観戦: …）はこの節にコピーしない。
         assert!(!sec.contains("観戦: 観戦者 3 人（合成）"), "{sec}");
     }
 
@@ -2503,7 +2519,7 @@ pub(crate) mod tests {
             &trial_summary::installed_game_facts(),
         );
         let log = String::from_utf8(out).unwrap();
-        // 途中経過は 60・120・180 秒。同じ中身は最初の 1 回だけ。終わりの集計は毎回の全部を書く。
+        // 途中経過は60・120・180秒。同じ中身は最初の1回だけ。終わりの集計は毎回の全部を書く。
         assert_eq!(
             log.matches("---- 巻き戻しの要約（途中経過。").count(),
             1,
@@ -2667,8 +2683,8 @@ pub(crate) mod tests {
         assert!(a < b, "{log}");
     }
 
-    // 配るバージョンは観測の 4 つを開かないので、中身の `_ticks.csv` を読む検査は開発用だけ（配るバージョンで開かないことは
-    // `the_dist_build_does_not_open_the_four_observe_files` が見る）。
+    // 配布バージョンは観測の4つを開かないので中身の`_ticks.csv`を読む検査は開発用だけ。
+    // 配布バージョンで開かないことは`the_dist_build_does_not_open_the_four_observe_files`が検査する。
     #[cfg(not(feature = "dist"))]
     #[test]
     fn a_hundred_thirty_seconds_of_sixty_fps() {

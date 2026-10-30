@@ -3,8 +3,12 @@ name = "higanrtool_loader"
 description = "起動用の exe。build.bat が build/bin/HiganRTool.exe へ写す"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "higanrtool_loader"
@@ -17,6 +21,8 @@ dist = []
 
 [dependencies]
 higanr_core = { path = "../core" }
+# WinHTTP で GET を 1 本する（更新の目録とファイル。dll も同じものを使う。自作）。
+higanr_http_win = { path = "../http_win" }
 # std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり（古い Wine 向け。自作）。build.rs が /DELAYLOAD を渡す。
 higanr_prng_shim = { path = "../prng_shim" }
 
@@ -40,8 +46,6 @@ higanr_prng_shim = { path = "../prng_shim" }
 #   System_SystemInformation  GetLocalTime（段階ログの時刻と日ごとのファイル名。`real::local_stamp`）
 #   System_Kernel         EXCEPTION_POINTERS / EXCEPTION_RECORD / CONTEXT（未処理例外のフィルターが例外の場所を読む。`real`）
 #   Wdk_Storage_FileSystem  NtQueryVirtualMemory（同フィルターが、例外の場所のモジュール名をローダーロックを取らずに写像から引く。`real::module_of`）
-#   Networking_WinHttp    WinHttpOpen ほか（更新の目録とファイルを GET する。dll が部屋サーバーへの接続で使うのと同じ API。
-#                         OS の TLS とプロキシの設定をそのまま使い、クレートは足さない。`http_win`）
 [dependencies.windows-sys]
 version = "0.61"
 features = [
@@ -58,7 +62,6 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Globalization",
-    "Win32_Networking_WinHttp",
     "Win32_System_SystemInformation",
     "Win32_System_Kernel",
     "Wdk_Storage_FileSystem",

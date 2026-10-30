@@ -1,8 +1,8 @@
-//! ゲームのメニューから保存したリプレイへ印を足す判断（pure。unsafe 無し）。
+//! ゲームのメニューから保存したリプレイへ印を足す判断（pure。unsafe無し）。
 //!
-//! ゲームのスレッドは保存関数が戻った後に `SaveSignal::record` でパス・始めの時刻・`game_mode` を書くだけで、ファイルには触らない。
-//! 別のスレッドが `SaveSignal::take` で拾い、`handle` がパスの形・作業フォルダ・更新時刻・既存の印をチェックしてから、そのファイルの末尾に
-//! 1 つだけ足す（`MarkIo` の向こうが本物のファイル。`menu_save_win.rs`）。
+//! ゲームのスレッドは保存関数が戻った後に`SaveSignal::record`でパス・始めの時刻・`game_mode`を書くだけ。ファイルには触らない。
+//! 別のスレッドが`SaveSignal::take`で拾う。
+//! `handle`がパスの形・作業フォルダ・更新時刻・既存の印をチェックしてから、そのファイルの末尾に1つだけ足す（`MarkIo`の向こうが本物のファイル。`menu_save_win.rs`）。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering, fence};
@@ -12,18 +12,20 @@ use higanr_core::replay_menu_path::{parse_save_path, written_since};
 
 use crate::replay_save::STAGES;
 
-/// 合図に載せるパスの長さの上限（ゲームが `CreateFileA` に渡す相対パスは `MAX_PATH` 未満）。
+/// 保存の通知に載せるパスの長さの上限（ゲームが`CreateFileA`に渡す相対パスは`MAX_PATH`未満）。
 pub const PATH_MAX: usize = 259;
-/// 印を足すスレッドが合図を見る間隔（ミリ秒）。
+/// 印を足すスレッドが保存の通知を見に行く間隔（ミリ秒）。
 pub const STEP_MS: u64 = 200;
 /// 本ログの各行の頭。
 pub const LOG_LABEL: &str = "メニュー保存";
 
-/// 合図の中で「塊が読めなかった」を表す値（塊の合計は 10 面 × `CHAIN_LIMIT` までで、これには届かない）。
+/// 保存の通知の中で「チャンクが読めなかった」を表す値（チャンクの合計は 10面 × `CHAIN_LIMIT` までなのでこれには届かない）。
 const CHUNKS_UNREAD: u32 = u32::MAX;
 
-/// ゲームのスレッド（書き手 1 人）から印を足すスレッド（読み手 1 人）への合図。`seq` が偶数のときだけ中身が確定していて、書いている間は
-/// 奇数になる。読み手は前後で `seq` が同じことをチェックし、書き換えの途中を読んだら捨てる。ロックも確保も無い。
+/// ゲームのスレッド（書き手1人）から印を足すスレッド（読み手1人）への通知。
+/// `seq`が偶数のときだけ中身が確定していて、書いている間は奇数になる。
+/// 読み手は前後で`seq`が同じことをチェックし、書き換えの途中を読んだら捨てる。
+/// ロックも確保も無い。
 pub struct SaveSignal {
     seq: AtomicU32,
     len: AtomicU32,
@@ -41,17 +43,17 @@ pub struct SaveSignal {
 /// 保存の直し（見積もりの直し）が効いたかを示す値。ゲームのスレッドで数え（確保しない）、本ログの行に添える。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SaveDiag {
-    /// 踏み台が本当の印を書く前に、その場所に残っていた 10 語のうち 0 でない数。素の花映塚はこの場所の 0 でない面で見積もる。
+    /// トランポリンが本当の印を書く前にその場所に残っていた10ワードのうち0でない数。素の花映塚はこの場所の0でない面で見積もる。
     pub leftover_stages: u32,
-    /// 本当の印（見出しの 10 語）のうち 0 でない数。
+    /// 本当の印（ヘッダの10ワード）のうち0でない数。
     pub real_stages: u32,
-    /// 書いた後に読み戻した 10 語が本当の印と同じか。
+    /// 書いた後に読み戻した10ワードが本当の印と同じかどうか。
     pub placed: bool,
-    /// 本当の印が 0 でない面の塊の数の合計（見積もりに入る塊）。連鎖が読めない・長すぎるときは `None`（塊 0 個として見積もる）。
+    /// 本当の印が0でない面のチャンクの数の合計（見積もりに入るチャンク）。連鎖が読めない・長すぎるときは`None`（チャンク0個として見積もる）。
     pub chunks: Option<u32>,
-    /// 踏み台が計算した見積もり。
+    /// トランポリンが計算した見積もり。
     pub est: u32,
-    /// `replay_save::need_bound` の要る量の上限。
+    /// `replay_save::need_bound`の要る量の上限。
     pub need: u32,
 }
 
@@ -73,13 +75,13 @@ impl SaveDiag {
     }
 }
 
-/// 拾った合図の中身。
+/// 拾った通知の中身。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Taken {
-    /// 保存関数に渡されたパス（CP932、NUL なし）。長すぎたときは空で `too_long`。
+    /// 保存関数に渡されたパス（ANSI、NULなし）。長すぎたときは空で`too_long`。
     pub path: Vec<u8>,
     pub too_long: bool,
-    /// 保存関数を呼ぶ前の時刻（UNIX 時刻のミリ秒）。
+    /// 保存関数を呼ぶ前の時刻（UNIX時刻のミリ秒）。
     pub started_ms: u64,
     pub game_mode: u32,
     pub diag: SaveDiag,
@@ -102,7 +104,7 @@ impl SaveSignal {
         }
     }
 
-    /// 合図を書く（書き手はゲームのスレッド 1 人だけ。確保しない・待たない）。`path` が `PATH_MAX` を超えるときは長さの印だけを書く。
+    /// 通知を書く（書き手はゲームのスレッド1人だけ。確保しない・待たない）。`path`が`PATH_MAX`を超えるときは長さの印だけを書く。
     pub fn record(&self, path: &[u8], started_ms: u64, game_mode: u32, diag: SaveDiag) {
         let s = self.seq.load(Ordering::Relaxed);
         self.seq.store(s.wrapping_add(1) | 1, Ordering::Relaxed);
@@ -112,7 +114,7 @@ impl SaveSignal {
         for (slot, b) in self.path.iter().zip(&path[..n]) {
             slot.store(*b, Ordering::Relaxed);
         }
-        // 長すぎは `PATH_MAX + 1` で表す（0 〜 `PATH_MAX` は長さそのもの）。
+        // 長すぎは`PATH_MAX + 1`で表す（0 〜 `PATH_MAX`は長さそのもの）。
         let len = if too_long { PATH_MAX + 1 } else { n };
         self.len.store(len as u32, Ordering::Relaxed);
         self.started_ms.store(started_ms, Ordering::Relaxed);
@@ -129,7 +131,7 @@ impl SaveSignal {
             .store(s.wrapping_add(1).wrapping_add(1) & !1, Ordering::Release);
     }
 
-    /// 新しい合図があれば拾う。`last` は前に拾った `seq`（最初は 0）。書き換えの途中・読んでいる間の書き換えは `None`（次の周期に拾い直す）。
+    /// 新しい通知があれば拾う。`last`は前に拾った`seq`（最初は0）。書き換えの途中・読んでいる間の書き換えは`None`（次の周期に拾い直す）。
     pub fn take(&self, last: &mut u32) -> Option<Taken> {
         let s1 = self.seq.load(Ordering::Acquire);
         if s1 == *last || s1 & 1 == 1 {
@@ -173,11 +175,11 @@ impl Default for SaveSignal {
     }
 }
 
-/// 足す相手のファイル 1 つ（開いたまま、チェックと読み書きに使う）。
+/// 足す相手のファイル1つ（開いたままチェックと読み書きに使う）。
 pub trait MarkFile {
-    /// このファイルが、exe のフォルダの下の同じ相対パスのファイルと同じものか（作業フォルダが exe のフォルダであることのチェック）。
+    /// このファイルがexeのフォルダの下の同じ相対パスのファイルと同じものかどうか（作業フォルダがexeのフォルダであることのチェック）。
     fn same_as_exe_dir(&mut self) -> Result<bool, String>;
-    /// 更新時刻（UNIX 時刻のミリ秒）。
+    /// 更新時刻（UNIX時刻のミリ秒）。
     fn modified_ms(&mut self) -> Result<u64, String>;
     /// 先頭から最後まで。
     fn read_all(&mut self) -> Result<Vec<u8>, String>;
@@ -186,7 +188,7 @@ pub trait MarkFile {
 }
 
 pub trait MarkIo {
-    /// exe のフォルダからの相対パス `rel`（`/` 区切り）を、ゲームが開いたのと同じ作業フォルダ基準で、読みと追記の権利で開く。
+    /// exeのフォルダからの相対パス`rel`（`/`区切り）を、ゲームが開いたのと同じ作業フォルダ基準で読みと追記の権利で開く。
     fn open(&mut self, rel: &str) -> Result<Box<dyn MarkFile>, String>;
 }
 
@@ -198,7 +200,7 @@ pub enum Outcome {
         added: usize,
         game_mode: u32,
     },
-    /// 足さなかった。`problem` は意図しない理由（既に印があるだけなら偽）。
+    /// 足さなかった。`problem`は意図しない理由（既に印があるだけなら偽）。
     Skipped {
         rel: Option<String>,
         why: String,
@@ -207,12 +209,12 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// 簡潔なログにも書く行か（足した・意図しない理由で足さなかった）。既に印があるだけなら詳細だけ。
+    /// 簡潔なログにも書く行かどうか（足した・意図しない理由で足さなかった）。既に印があるだけなら詳細だけ。
     pub fn in_brief_log(&self) -> bool {
         !matches!(self, Outcome::Skipped { problem: false, .. })
     }
 
-    /// 本ログの 1 行。
+    /// 本ログの1行。
     pub fn line(&self) -> String {
         match self {
             Outcome::Marked {
@@ -239,15 +241,15 @@ fn skipped(rel: &str, why: impl Into<String>, problem: bool) -> Outcome {
     }
 }
 
-/// パスの先頭 60 バイトまでを、読める形で（形の違うパスをログに出すとき用）。
+/// パスの先頭60バイトまでを読める形にする（形の違うパスをログに出すとき用）。
 fn shown(path: &[u8]) -> String {
     let cut = &path[..path.len().min(60)];
     format!("{:?}", String::from_utf8_lossy(cut))
 }
 
-/// 拾った合図 1 つについて、印を足してよいかをチェックして足す。足す条件（全部満たしたときだけ）:
-/// パスが 2 つの形のどちらか／作業フォルダが exe のフォルダ／更新時刻が今回の保存の始め以降／平文が読めて、既に印が無い。
-/// 足したら読み戻して、前の部分のバイト一致・末尾の一致・印が `Menu` で読めることをチェックする。
+/// 拾った通知1つについて印を足してよいかをチェックして足す。
+/// 足す条件（全部満たしたときだけ）: パスが2つの形のどちらか／作業フォルダがexeのフォルダ／更新時刻が今回の保存の始め以降／平文が読めて既に印が無い。
+/// 足したら読み戻して、前の部分のバイト一致・末尾の一致・印が`Menu`で読めることをチェックする。
 pub fn handle(t: &Taken, build: u32, ver: &str, io: &mut dyn MarkIo) -> Outcome {
     if t.too_long {
         return Outcome::Skipped {
@@ -330,7 +332,7 @@ pub fn handle(t: &Taken, build: u32, ver: &str, io: &mut dyn MarkIo) -> Outcome 
     }
 }
 
-/// 印を足すスレッドの 1 周期ぶん: 合図があれば `handle` で処理して、簡潔なログにも書くかと本ログの行（保存の直しの値を添える）を返す。
+/// 印を足すスレッドの1周期ぶん: 通知があれば`handle`で処理し、簡潔なログにも書くかどうかと本ログの行（保存の直しの値を添える）を返す。
 pub fn step(
     signal: &SaveSignal,
     last: &mut u32,
@@ -346,7 +348,7 @@ pub fn step(
     ))
 }
 
-/// 合成のリプレイ（`T9RP`・`comp_size`・ゲームと同じ形の USER 1 つ）。
+/// 合成のリプレイ（`T9RP`・`comp_size`・ゲームと同じ形のUSER 1つ）。
 #[cfg(test)]
 pub(crate) fn test_replay() -> Vec<u8> {
     let comp_size = 0xC0u32;
@@ -479,7 +481,7 @@ mod tests {
             })
         );
         assert_eq!(d.borrow().opened, vec!["replay/th9_05.rpy".to_string()]);
-        // ゲームの自動保存の形（`./` つき）も同じ相対パスで開く。
+        // ゲームの自動保存の形（`./`つき）も同じ相対パスで開く。
         let d2 = disk(orig);
         let Outcome::Marked { rel, .. } = run(&d2, b"./replay/th9_udn012.rpy") else {
             panic!("udn");
@@ -600,7 +602,7 @@ mod tests {
             run(&d, b"replay/th9_01.rpy"),
             Outcome::Skipped { problem: true, .. }
         ));
-        // 書けない。
+        // 書き込めない。
         let d = disk(orig.clone());
         d.borrow_mut().append_err = true;
         assert!(matches!(
@@ -653,7 +655,7 @@ mod tests {
         let t2 = s.take(&mut last).unwrap();
         assert_eq!(t2.path, b"./replay/th9_udn001.rpy");
         assert_eq!(t2.started_ms, START + 1);
-        // 前より短いパスで、前の残りを拾わない。
+        // 前より短いパスでは前の残りを拾わない。
         s.record(b"a", START, 0, SaveDiag::default());
         assert_eq!(s.take(&mut last).unwrap().path, b"a");
         // 長すぎるパス。
@@ -669,7 +671,7 @@ mod tests {
     fn a_signal_being_written_is_not_taken() {
         let s = SaveSignal::new();
         let mut last = 0;
-        // 書いている間（seq が奇数）を作る。
+        // 書いている間（seqが奇数）を作る。
         s.seq.store(1, Ordering::Relaxed);
         assert_eq!(s.take(&mut last), None);
         assert_eq!(last, 0, "拾えなかったので前の番号は進めない");
@@ -733,7 +735,7 @@ mod tests {
                 assert!(line.contains(w), "{w} が無い: {line}");
             }
         }
-        // 塊が読めなかったときは、そう分かる形にする（塊の数を出さない）。
+        // チャンクが読めなかったときはそう分かる形にする（チャンクの数を出さない）。
         s.record(
             b"replay/th9_03.rpy",
             START,

@@ -1,21 +1,23 @@
-//! 候補アドレスと経路の選び方。候補は host（LAN）/ 外側 IPv4 / IPv6 に分け、優先は IPv6 → LAN → 外側 IPv4。
-//! 全部の候補へ HELLO を送り、最初に返しが来た経路を採る。接続コードには候補の列を載せる。
+//! 候補アドレスと経路の選び方。候補はhost（LAN）/ 外側IPv4 / IPv6に分け、優先はIPv6 → LAN → 外側IPv4。
+//! 全部の候補へHELLOを送り、最初に返答が来た経路を採る。接続コードには候補の列を載せる。
 //!
-//! pure な決まりだけを持つ（候補の種別と優先、列の上限と重なりのガード、最初に返しが来た経路）。ソケットと送信部分は dll
-//! （`net_udp.rs`）と peer_sim、「返し」の判定と `Paths::heard_back` を呼ぶ時機は接続のセッション（`link.rs`）の仕事。
-//! ゲームスレッドで呼ばれるので、ヒープを使わない（列は固定の配列 ＋ 個数）。
+//! pureな決まりだけを持つ（候補の種別と優先・列の上限と重なりのガード・最初に返答が来た経路）。
+//! ソケットと送信部分はdll（`net_udp.rs`）とpeer_simの仕事。
+//! 「返答」の判定と`Paths::heard_back`を呼ぶタイミングは接続のセッション（`link.rs`）の仕事。
+//! ゲームスレッドで呼ばれるのでヒープを使わない（列は固定の配列 ＋ 個数）。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// 1 つの接続コードに載せる候補の上限。普通の PC で出てくる候補は LAN のアドレス 1〜3 ＋ 外側 IPv4 1 ＋ IPv6 1〜2 で 5〜6 個なので
-/// 8 あれば足りる。HELLO を全部の候補へ 20 ms ごとに送っても 1 秒 400 通、コードは base64 で約 300 文字（`code.rs`）。
-/// 読む側のガードにもなる（上限を越える数を書いたコードは、中を読む前に断る）。
+/// 1つの接続コードに載せる候補の上限。
+/// 普通のPCで出てくる候補はLANのアドレス1〜3 ＋ 外側IPv4 1 ＋ IPv6 1〜2で5〜6個なので8あれば足りる。
+/// HELLOを全部の候補へ20 msごとに送っても1秒400通。コードはbase64で約300文字（`code.rs`）。
+/// 読む側のガードにもなる（上限を越える数を書いたコードは中を読む前に断る）。
 pub const MAX_CANDIDATES: usize = 8;
 
 /// 候補の種別（接続コードのバイトの値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandKind {
-    /// 同じ PC の中（127.0.0.0/8 と `::1`）。検査用（既定の `scope = loopback` ではこれだけで接続する）。
+    /// 同じPCの中（127.0.0.0/8と`::1`）。検査用（既定の`scope = loopback`ではこれだけで接続する）。
     Loopback = 1,
     Host = 2,
     External = 3,
@@ -37,7 +39,7 @@ impl CandKind {
         self as u8
     }
 
-    /// 優先（小さい方が先）。IPv6 → LAN → 外側 IPv4。loopback は検査用で、本物の候補と並ぶことは無いので先頭にする。
+    /// 優先（小さい方が先）。IPv6 → LAN → 外側IPv4。loopbackは検査用で本物の候補と並ぶことは無いので先頭にする。
     pub fn priority(self) -> u8 {
         match self {
             CandKind::Loopback => 0,
@@ -48,16 +50,16 @@ impl CandKind {
     }
 }
 
-/// IPv4 の私用・リンクローカル・CGNAT のアドレスか（LAN の候補と見る）。RFC 1918・RFC 3927（169.254/16）・RFC 6598（100.64/10）。
+/// IPv4の私用・リンクローカル・CGNATのアドレスか（LANの候補と見る）。RFC 1918・RFC 3927（169.254/16）・RFC 6598（100.64/10）。
 fn is_lan_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_private() || ip.is_link_local() || (o[0] == 100 && (o[1] & 0xC0) == 64)
 }
 
-/// 世界の相手に通じる IPv6 のアドレスか（自分の接続コードの候補に載せてよいか）。
+/// インターネット上の相手に通じるIPv6のアドレスかどうか（自分の接続コードの候補に載せてよいか）。
 ///
-/// 2000::/3（グローバルユニキャスト）だけを通し、通じない枠を外す: 2001::/23（IETF の特別用途。通常の割り当ては 2001:200::/23 から）、2001:db8::/32 と 3fff::/20（文書用）、2002::/16（6to4。経路が相手の中継に依る）。
-/// 外すのは自分が載せる側だけで、相手のコードの候補を読むガード（`Candidate::new`・`guard`）は変えない。
+/// 2000::/3（グローバルユニキャスト）だけを通し、通じない範囲を外す: 2001::/23（IETFの特別用途。通常の割り当ては2001:200::/23から）、2001:db8::/32と3fff::/20（文書用）、2002::/16（6to4。経路が相手の中継に依る）。
+/// 外すのは自分が載せる側だけ。相手のコードの候補を読むガード（`Candidate::new`・`guard`）は変えない。
 pub fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     let [s0, s1, ..] = ip.segments();
     if s0 & 0xE000 != 0x2000 {
@@ -70,7 +72,7 @@ pub fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     !(special_2001 || doc_2001 || six_to_four || doc_3fff)
 }
 
-/// 自分の IPv6 のアドレスを、`is_global_unicast_v6` を通りポートが 0 でないときだけ候補にする。一時アドレスか固定かは区別しない。
+/// 自分のIPv6のアドレスのうち`is_global_unicast_v6`を通りポートが0でないものだけを候補にする。一時アドレスか固定かは区別しない。
 pub fn own_ipv6_candidate(addr: SocketAddr) -> Option<Candidate> {
     let SocketAddr::V6(v6) = addr else {
         return None;
@@ -81,14 +83,15 @@ pub fn own_ipv6_candidate(addr: SocketAddr) -> Option<Candidate> {
     Candidate::new(CandKind::Ipv6, canonical_endpoint(addr)).ok()
 }
 
-/// アドレスとポートだけを持つ形にする（flowinfo と scope_id を 0 にする）。OS が `recv_from` で返す IPv6 の送り元は
-/// scope_id などを持つことがあり、`SocketAddr` の `==` はそれも比べる。コードの候補と食い違わないよう、受けた送り元はこの形で持つ。
+/// アドレスとポートだけを持つ形にする（flowinfoとscope_idを0にする）。
+/// OSが`recv_from`で返すIPv6の送信元はscope_idなどを持つことがある。`SocketAddr`の`==`はそれも比べる。
+/// コードの候補と食い違わないように、受けた送信元はこの形で持つ。
 pub fn canonical_endpoint(a: SocketAddr) -> SocketAddr {
     SocketAddr::new(a.ip(), a.port())
 }
 
-/// 2 つの送り元・宛先が同じエンドポイントか。アドレスとポートだけを比べる。候補の列・学んだ候補のガードは `==` でなくこれを使う。
-/// IPv4 を埋め込んだ IPv6（`::ffff:a.b.c.d`）は IPv4 とは別のエンドポイントとして扱う。
+/// 2つの送信元・宛先が同じエンドポイントかどうか。アドレスとポートだけを比べる。候補の列・学んだ候補のガードは`==`でなくこれを使う。
+/// IPv4を埋め込んだIPv6（`::ffff:a.b.c.d`）はIPv4とは別のエンドポイントとして扱う。
 pub fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() == b.port() && a.ip() == b.ip()
 }
@@ -108,7 +111,7 @@ pub enum CandError {
     Full,
     Duplicate,
     PortZero,
-    /// 種別とアドレスが合わない（loopback と書いて LAN のアドレス、未指定アドレス、IPv4 を埋め込んだ IPv6 など）。
+    /// 種別とアドレスが合わない（loopbackと書いてLANのアドレス、未指定アドレス、IPv4を埋め込んだIPv6など）。
     KindMismatch,
 }
 
@@ -222,26 +225,26 @@ impl Candidates {
     }
 }
 
-/// 候補 1 つのバイト列の最大（種別 1・family 1・IPv6 16・ポート 2）。
+/// 候補1つのバイト列の最大（種別1・family 1・IPv6 16・ポート2）。
 pub const CAND_WIRE_MAX: usize = 20;
-/// 候補の並び（個数 1 B ＋ 候補）のバイト列の最大。
+/// 候補の並び（個数1 B ＋ 候補）のバイト列の最大。
 pub const LIST_WIRE_MAX: usize = 1 + MAX_CANDIDATES * CAND_WIRE_MAX;
 
 /// 候補の並びを読めなかった理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListError {
-    /// バイトが足りない（`need` は読もうとした所の終わり。並びの先頭から数える）。
+    /// バイトが足りない（`need`は読もうとした所の終わり。並びの先頭から数える）。
     Short { need: usize },
-    /// 個数が `MAX_CANDIDATES` を越える（中は個数）。
+    /// 個数が`MAX_CANDIDATES`を越える（中は個数）。
     TooMany(u8),
-    /// 候補 `index` の中身がおかしい（知らない種別・family は `err` が None）。
+    /// 候補`index`の中身がおかしい（知らない種別・familyは`err`がNone）。
     Bad { index: u8, err: Option<CandError> },
 }
 
-/// 候補の並びを、接続コードと観戦者へのパケットに共通の形で `out` へ書き、書いたバイト数を返す。
-/// 形: 個数 u8 ‖ 候補ごとに 種別 u8・family u8（4 か 6）・アドレス 4 か 16 B・ポート u16 LE。確保しない。
+/// 候補の並びを接続コードと観戦者へのパケットに共通の形で`out`へ書き、書いたバイト数を返す。
+/// 形: 個数u8 ‖ 候補ごとに 種別u8・family u8（4か6）・アドレス4か16 B・ポートu16 LE。確保しない。
 pub fn write_list(c: &Candidates, out: &mut [u8; LIST_WIRE_MAX]) -> usize {
-    // 個数は `MAX_CANDIDATES` 以下（`Candidates` が保つ）なので、`LIST_WIRE_MAX` の中に収まる。
+    // 個数は`MAX_CANDIDATES`以下（`Candidates`が保つ）なので`LIST_WIRE_MAX`の中に収まる。
     out[0] = c.len() as u8;
     let mut at = 1;
     for cand in c.as_slice() {
@@ -265,8 +268,8 @@ pub fn write_list(c: &Candidates, out: &mut [u8; LIST_WIRE_MAX]) -> usize {
     at
 }
 
-/// [`write_list`] の形の並びを `b` の先頭から読み、並びと読んだバイト数を返す（後ろの余りは呼び手が見る）。個数 0 は通す。
-/// 重なり・種別とアドレスの食い違いは `Candidates::push`・`Candidate::new` と同じに断る。確保しない。
+/// [`write_list`]の形の並びを`b`の先頭から読み、並びと読んだバイト数を返す（後ろの余りは呼び出し側が見る）。個数0は通す。
+/// 重なり・種別とアドレスの食い違いは`Candidates::push`・`Candidate::new`と同じに断る。確保しない。
 pub fn read_list(b: &[u8]) -> Result<(Candidates, usize), ListError> {
     let take = |at: usize, n: usize| b.get(at..at + n).ok_or(ListError::Short { need: at + n });
     let count = take(0, 1)?[0];
@@ -302,8 +305,9 @@ pub fn read_list(b: &[u8]) -> Result<(Candidates, usize), ListError> {
     Ok((list, at))
 }
 
-/// 学んでよい送り元の数の上限。学ぶのは、相手のルーターがポートを付け替えたときの「コードに無いアドレス」で、普通は 1、
-/// 続いても 2〜3。4 あれば足り、固定長のまま小さく保てる。学んだアドレスへも HELLO を 20 ms ごとに送るので送る量の天井にもなる。
+/// 学んでよい送信元の数の上限。
+/// 学ぶのは相手のルーターがポートを付け替えたときの「コードに無いアドレス」。普通は1つ。続いても2〜3つ。
+/// 4あれば足りて固定長のまま小さく保てる。学んだアドレスへもHELLOを20 msごとに送るので送る量の天井にもなる。
 /// 越えたら学ばずに数える（`link::RecvCounts::learn_refused`）。
 pub const MAX_LEARNED: usize = 4;
 
@@ -312,11 +316,11 @@ const PLACEHOLDER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALH
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LearnError {
     Full,
-    /// 候補として使えないアドレス（ポート 0・未指定アドレス・IPv4 を埋め込んだ IPv6 など）。
+    /// 候補として使えないアドレス（ポート0・未指定アドレス・IPv4を埋め込んだIPv6など）。
     Unusable,
 }
 
-/// 学んだ送り元の列（入れた順）。コードの候補とは別に持つ: 混ぜると、手順を作り直したときに学んだものだけを消せない。
+/// 学んだ送信元の列（追加した順）。コードの候補とは別に持つ。混ぜると手順を作り直したときに学んだものだけを消せない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Learned {
     addrs: [SocketAddr; MAX_LEARNED],
@@ -351,7 +355,7 @@ impl Learned {
         self.as_slice().iter().any(|a| same_endpoint(*a, addr))
     }
 
-    /// 入れる。候補として使えないアドレスと上限を越えるものは入れない。すでにあるものは Ok。
+    /// 追加する。候補として使えないアドレスと上限を越えるものは追加しない。すでにあるものはOk。
     fn push(&mut self, addr: SocketAddr) -> Result<(), LearnError> {
         if Candidate::guess(addr).is_err() {
             return Err(LearnError::Unusable);
@@ -369,12 +373,16 @@ impl Learned {
     }
 }
 
-/// 経路の選び方: 相手の候補の列と、最初に返しが来た経路。
+/// 経路の選び方: 相手の候補の列と最初に返答が来た経路。
 ///
-/// - 受けるのは候補のどれかから来たものだけ（`accepts`）。例外: 接続前の手順の 1 通（HELLO・HELLO_ACK・AGREE）でタグまで通ったものは、その送り元を学んだ候補として足す
-///   （`learn`。ICE の peer reflexive と同じ考え。相手のルーターがポートを付け替えると HELLO はコードのアドレスと別のポートから届く）。学んだアドレスへも HELLO を送る。
-/// - 経路を決める前は全部の候補（学んだものを含む）へ送り、決めた後はその経路へだけ送る（決めるのは `heard_back` の最初の 1 回）。
-/// - 決めた後も候補のどれかから来たものは受ける。相手から見た経路と自分から見た経路は同じとは限らず、決めた経路以外を捨てると片方だけ届かなくなることがある。
+/// - 受けるのは候補のどれかから来たものだけ（`accepts`）。
+///   例外は接続前の手順の1通のうち、自分の今のセッションのHELLOへのHELLO_ACKと封じたAGREE。
+///   どちらも送信元を学んだ候補として足す（`learn`。ICEのpeer reflexiveと同じ考え）。
+///   相手のルーターがポートを付け替えると相手のパケットはコードのアドレスと別のポートから届く。
+///   HELLOは盗み見たものを誰でも再送できるので学ばず、その送信元へ1回だけ返す（`link.rs`）。学んだアドレスへもHELLOを送る。
+/// - 経路の決定前は全部の候補（学んだものを含む）へ送る。決定後はその経路へだけ送る（決めるのは`heard_back`の最初の1回）。
+///   相手がコードの候補にいると分かれば学んだ送信元より候補を採る（`heard_back`の`peer_at_code`と`prefer_code`）。
+/// - 決定後も候補のどれかから来たものは受ける。相手から見た経路と自分から見た経路は同じとは限らない。決定済みの経路以外を捨てると片方だけ届かなくなることがある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Paths {
     cands: Candidates,
@@ -391,7 +399,7 @@ impl Paths {
         }
     }
 
-    /// 接続コードの候補だけ（学んだものは含まない）。手順を最初から作り直すときの種になる。
+    /// 接続コードの候補だけ（学んだものは含まない）。手順を最初から作り直すときの元になる。
     pub fn candidates(&self) -> &Candidates {
         &self.cands
     }
@@ -404,7 +412,7 @@ impl Paths {
         self.cands.contains(from) || self.learned.contains(from)
     }
 
-    /// 候補に無い送り元 `from` を、学んだ候補として足す。接続前の手順の 1 通がタグまで通った後だけ呼ぶ（ガードは `link.rs`）。
+    /// 候補に無い送信元`from`を学んだ候補として足す。接続前の手順の1通がタグまで通った後だけ呼ぶ（ガードは`link.rs`）。
     pub fn learn(&mut self, from: SocketAddr) -> Result<(), LearnError> {
         if self.accepts(from) {
             return Ok(());
@@ -416,8 +424,9 @@ impl Paths {
         self.chosen.is_some_and(|c| self.learned.contains(c))
     }
 
-    /// 採った経路が学んだ候補なら、経路の選びだけ戻す（学んだ列は残す）。手順を引き継いで作り直す（`Restart::Resume`）ときに、接続のセッション（`link.rs`）が呼ぶ:
-    /// 学んだアドレスはルーターが付け替えるアドレスで、時間切れになったならもう死んでいることがあり、戻さないと死んだアドレスへだけ送り続ける。
+    /// 採った経路が学んだ候補なら経路の選択だけ戻す（学んだ列は残す）。
+    /// 手順を引き継いで作り直す（`Restart::Resume`）ときに接続のセッション（`link.rs`）が呼ぶ。
+    /// 学んだアドレスはルーターが付け替えるアドレスで、時間切れになったならもう死んでいることがある。戻さないと死んだアドレスへだけ送り続ける。
     pub fn unchoose_learned(&mut self) -> bool {
         if self.chosen_is_learned() {
             self.chosen = None;
@@ -426,9 +435,24 @@ impl Paths {
         false
     }
 
-    /// 相手が自分を聞いた印（HELLO への返し・AGREE）が `from` から届いた。まだ決めていなければその経路に決め、true を返す。
-    pub fn heard_back(&mut self, from: SocketAddr) -> bool {
-        if self.chosen.is_none() && self.accepts(from) {
+    /// 相手が自分を聞いた証拠（HELLOへの返答・AGREE）が`from`から届いた。経路がまだ決定していなければその経路に決めてtrueを返す。
+    /// `peer_at_code`は相手のパケットが接続コードの候補から届いていること。そのときは学んだ送信元には決めない。
+    /// 証拠はタグか封で相手のものと分かるが、送信元は分からない（盗み見た証拠を別のアドレスから再送できる）。
+    pub fn heard_back(&mut self, from: SocketAddr, peer_at_code: bool) -> bool {
+        if self.chosen.is_some() || !self.accepts(from) {
+            return false;
+        }
+        if peer_at_code && !self.cands.contains(from) {
+            return false;
+        }
+        self.chosen = Some(from);
+        true
+    }
+
+    /// 経路が学んだ送信元に決定済みのときに接続コードの候補`from`から相手が自分を聞いた証拠が届いたら、候補へ決め直してtrueを返す（学んだ方は盗み見た証拠を再送されたものかもしれない）。
+    /// 接続する前だけ呼ぶ（接続の経路は接続したときに決まる）。
+    pub fn prefer_code(&mut self, from: SocketAddr) -> bool {
+        if self.chosen_is_learned() && self.cands.contains(from) {
             self.chosen = Some(from);
             return true;
         }
@@ -501,33 +525,33 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// 期待値は RFC の区切りから書いた（判定の式から作らない）。表は「通す」「断る」を同じ長さで並べ、全部断る・全部通す実装を落とす。
+    /// 期待値はRFCの区切りから書いた（判定の式から作らない）。表は「通す」「断る」を同じ長さで並べ、全部断る・全部通す実装を落とす。
     #[test]
     fn only_global_unicast_v6_outside_the_special_blocks_is_ours_to_publish() {
         for ok in [
             "2000::1",
-            "2001:200::1",  // 2001::/23 の外の最初（APNIC の 2001:200::/23）
+            "2001:200::1",  // 2001::/23の外の最初（APNICの2001:200::/23）
             "2001:4860::1", // 通常の割り当て
-            "2003::1",      // 2002::/16 の隣
+            "2003::1",      // 2002::/16の隣
             "2400:cb00::1",
             "2a00:1450::1",
-            "3fff:1000::1",                            // 文書用 3fff::/20 の外の最初
-            "3ffe::1",                                 // 3fff の隣
-            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // 2000::/3 の最後
+            "3fff:1000::1",                            // 文書用3fff::/20の外の最初
+            "3ffe::1",                                 // 3fffの隣
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // 2000::/3の最後
         ] {
             assert!(is_global_unicast_v6(v6(ok)), "通すはずの {ok} を断った");
         }
         for ng in [
             "2001::1",                              // Teredo（RFC 4380。2001::/32）
-            "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo の実際の形
-            "2001:2::1",                            // ベンチマーク 2001:2::/48
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredoの実際の形
+            "2001:2::1",                            // ベンチマーク2001:2::/48
             "2001:db8::1",                          // 文書用（RFC 3849）
-            "2001:1ff:ffff::1",                     // 2001::/23 の最後
+            "2001:1ff:ffff::1",                     // 2001::/23の最後
             "2002::1",                              // 6to4（RFC 3056）
             "2002:c000:204::1",
             "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
             "3fff::1",          // 文書用（RFC 9637。3fff::/20）
-            "3fff:fff:ffff::1", // 3fff::/20 の最後
+            "3fff:fff:ffff::1", // 3fff::/20の最後
             "::1",
             "::",
             "fe80::1",
@@ -538,8 +562,8 @@ mod tests {
             "ff0e::1",
             "::ffff:203.0.113.5",
             "::203.0.113.5",
-            "1fff:ffff::1", // 2000::/3 の直前
-            "4000::1",      // 2000::/3 の直後
+            "1fff:ffff::1", // 2000::/3の直前
+            "4000::1",      // 2000::/3の直後
             "5f00::1",
             "8000::1",
         ] {
@@ -642,7 +666,7 @@ mod tests {
             "scope_id 付きの送り元をコードの候補と見ない"
         );
         assert!(
-            p.heard_back(echoed),
+            p.heard_back(echoed, false),
             "コードの候補の返しで経路を決められない"
         );
         assert_eq!(p.learn(echoed), Ok(()));
@@ -718,10 +742,13 @@ mod tests {
         let mut p = Paths::new(c);
         assert!(p.accepts(sa("127.0.0.2:2")));
         assert!(!p.accepts(sa("127.0.0.3:3")));
-        assert!(!p.heard_back(sa("127.0.0.3:3")), "候補にない送り元で決めた");
+        assert!(
+            !p.heard_back(sa("127.0.0.3:3"), false),
+            "候補にない送り元で決めた"
+        );
         assert_eq!(p.chosen(), None);
-        assert!(p.heard_back(sa("127.0.0.2:2")));
-        assert!(!p.heard_back(sa("127.0.0.1:1")), "決め直した");
+        assert!(p.heard_back(sa("127.0.0.2:2"), false));
+        assert!(!p.heard_back(sa("127.0.0.1:1"), false), "決め直した");
         assert_eq!(p.chosen(), Some(sa("127.0.0.2:2")));
         assert!(p.accepts(sa("127.0.0.1:1")));
     }
@@ -733,7 +760,7 @@ mod tests {
         let stranger = sa("203.0.113.9:7001");
         assert!(!p.accepts(stranger));
         assert!(
-            !p.heard_back(stranger),
+            !p.heard_back(stranger, false),
             "学ぶ前は候補に無い送り元で決まらない"
         );
         assert_eq!(p.learn(stranger), Ok(()));
@@ -741,7 +768,10 @@ mod tests {
         assert!(p.learned().contains(stranger));
         assert_eq!(p.candidates().len(), 1, "コードの候補に混ざった");
         assert!(!p.chosen_is_learned());
-        assert!(p.heard_back(stranger), "学んだ送り元で経路を決められない");
+        assert!(
+            p.heard_back(stranger, false),
+            "学んだ送り元で経路を決められない"
+        );
         assert!(p.chosen_is_learned());
         assert_eq!(p.learn(stranger), Ok(()));
         assert_eq!(p.learn(sa("203.0.113.9:7000")), Ok(()));
@@ -762,5 +792,30 @@ mod tests {
         assert!(p.accepts(stranger), "上限で断った後、学んだものを忘れた");
         let fresh = Paths::new(*p.candidates());
         assert!(!fresh.accepts(stranger) && fresh.learned().is_empty());
+    }
+
+    #[test]
+    fn a_code_candidate_wins_over_a_learned_source_once_the_peer_is_seen_at_the_code() {
+        let code = sa("203.0.113.9:7000");
+        let relay = sa("198.51.100.4:9000");
+        let mut p = Paths::new(Candidates::from_addrs(&[code]).unwrap());
+        assert_eq!(p.learn(relay), Ok(()));
+        assert!(
+            !p.heard_back(relay, true),
+            "相手がコードの候補にいるのに学んだ送り元で決めた"
+        );
+        assert_eq!(p.chosen(), None);
+        assert!(p.heard_back(code, true));
+        assert_eq!(p.chosen(), Some(code));
+        assert!(!p.prefer_code(code), "候補に決めた経路を決め直した");
+
+        let mut q = Paths::new(Candidates::from_addrs(&[code]).unwrap());
+        assert_eq!(q.learn(relay), Ok(()));
+        assert!(!q.prefer_code(code), "経路を決める前に決めた");
+        assert!(q.heard_back(relay, false));
+        assert!(!q.prefer_code(relay), "学んだ送り元へ決め直した");
+        assert!(q.prefer_code(code));
+        assert_eq!(q.chosen(), Some(code));
+        assert!(!q.chosen_is_learned());
     }
 }

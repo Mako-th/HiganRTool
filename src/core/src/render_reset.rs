@@ -1,10 +1,12 @@
-//! コピーの中の「描画が消す欄」を、描画の後の値に置き換える（カットインの赤い点滅の直し）。
-//! 花映塚には「更新が毎 tick 立て、描画が使ってから消す」欄があり（Stage の背景の色 `+0x642C`。アドレスは dll の
-//! `th09_addr::RENDER_RESETS`）、描画を通らない進め直しで取ったコピーにはその値が残る。書き戻すたびに戻ると、描画が色を掛け続ける。
-//! コピーを取るたびに、コピーの中のその欄だけを描画の後の値へ置き換える。ゲームのメモリには書かない。
-//! 塊のバイト列と欄の表を受け取るだけの純粋な関数（確保・パニックしない。ゲームスレッドから呼ぶ）。はみ出す欄があれば 1 バイトも書かずに断る。
+//! コピーの中の「描画が消すフィールド」を描画の後の値に置き換える（カットインの赤い点滅の修正）。
+//! 花映塚には「更新が毎tick立て、描画が使ってから消す」フィールドがある（Stageの背景の色`+0x642C`。アドレスはdllの`th09_addr::RENDER_RESETS`）。
+//! 描画を通らない進め直しで取ったコピーにはその値が残る。
+//! 書き戻すたびにその値が戻ると描画が色を掛け続ける。
+//! コピーを取るたびにコピーの中のそのフィールドだけを描画の後の値へ置き換える。ゲームのメモリには書かない。
+//! ブロックのバイト列とフィールドの表を受け取るだけの純粋な関数（確保・パニックしない。ゲームスレッドから呼ぶ）。
+//! はみ出すフィールドがあれば1バイトも書かずに断る。
 
-/// 置き換える欄 1 つ。`off` は塊の先頭からのバイト、`after` は描画の後の値（長さが欄の長さ）。
+/// 置き換えるフィールド1つ。`off`はブロックの先頭からのバイト。`after`は描画の後の値（長さがフィールドの長さ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Field<'a> {
     pub off: u32,
@@ -13,9 +15,9 @@ pub struct Field<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
-    /// 欄の長さが 0（何も置き換えないのに「直した」と数えないため断る）。
+    /// フィールドの長さが0（何も置き換えないのに「直した」と数えないため断る）。
     Empty { index: usize },
-    /// 欄が塊の外へはみ出す（`off + after.len() > block_len`）か、アドレスの計算が溢れる。
+    /// フィールドがブロックの外へはみ出す（`off + after.len() > block_len`）か、アドレスの計算が溢れる。
     OutOfBlock {
         index: usize,
         off: u32,
@@ -24,7 +26,7 @@ pub enum Refused {
     },
 }
 
-/// 表が長さ `block_len` の塊に収まるか（置き換える前と、表を組むとき）。
+/// 表が長さ`block_len`のブロックに収まるかどうか（置き換える前と表を組むとき）。
 pub fn check(block_len: usize, fields: &[Field<'_>]) -> Result<(), Refused> {
     for (index, f) in fields.iter().enumerate() {
         if f.after.is_empty() {
@@ -45,13 +47,13 @@ pub fn check(block_len: usize, fields: &[Field<'_>]) -> Result<(), Refused> {
     Ok(())
 }
 
-/// 塊の中の表の欄を描画の後の値に置き換え、元の値が違っていた欄の数を返す（Present の後のコピーでは 0）。
-/// 1 つでも塊に収まらなければ何も書かずに断る。
+/// ブロックの中の表のフィールドを描画の後の値に置き換え、元の値が違っていたフィールドの数を返す（Presentの後のコピーでは0）。
+/// 1つでもブロックに収まらなければ何も書かずに断る。
 pub fn apply(block: &mut [u8], fields: &[Field<'_>]) -> Result<u32, Refused> {
     check(block.len(), fields)?;
     let mut changed = 0u32;
     for f in fields {
-        // `check` で範囲を見たので塊の中（`get_mut` はパニックしないため）。
+        // `check`で範囲を見たのでブロックの中（`get_mut`はパニックしないため）。
         let start = f.off as usize;
         let Some(dst) = block.get_mut(start..start + f.after.len()) else {
             continue;
@@ -68,7 +70,7 @@ pub fn apply(block: &mut [u8], fields: &[Field<'_>]) -> Result<u32, Refused> {
 mod tests {
     use super::*;
 
-    /// どのバイトも位置で決まる別の値（0 埋めだと「元から 0」と「書いた 0」が見分けられない）。
+    /// どのバイトも位置で決まる別の値（0埋めだと「元から0」と「書いた0」が見分けられない）。
     fn block(len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| (i as u8).wrapping_mul(7).wrapping_add(1))
@@ -117,7 +119,7 @@ mod tests {
         };
         let mut b = block(64);
         assert_eq!(apply(&mut b, &[ok, edge]), Ok(2));
-        // 1 バイトはみ出す欄が後ろにあると、前の欄も書かない。
+        // 1バイトはみ出す欄が後ろにあると、前の欄も書かない。
         let cross = Field {
             off: 61,
             after: &after,

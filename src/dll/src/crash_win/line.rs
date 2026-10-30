@@ -1,35 +1,36 @@
-//! 例外の 1 行を固定長のバッファへ整形する（pure）。例外ハンドラの中から呼ぶので、ヒープを確保せずパニックしない。
+//! 例外の1行を固定長のバッファへ整形する（pure）。例外ハンドラの中から呼ぶのでヒープを確保せずパニックしない。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::names::LocalTime;
 
-/// 行にする別々の例外（コードと場所の組）の上限。以降の別の例外は数えるだけ。
+/// 行にする別々の例外（コードと場所のペア）の上限。以降の別の例外は数えるだけ。
 pub const MAX_LINES: u32 = 32;
 
 pub use higanr_core::exception_names::{
     ACCESS_VIOLATION, IN_PAGE_ERROR, STACK_OVERFLOW, fatal_name,
 };
 
-/// 行にした例外の（コード, 場所）の組を覚えておく固定長の表。ゲームや OS が自分で受けて続ける無害な例外が同じ場所から何度も
-/// 投げられても、行の枠を使い切らないために使う。ハンドラの中から呼ぶので、確保せず、ロックを取らず、パニックしない。
+/// 行にした例外の（コード, 場所）のペアを覚えておく固定長の表。
+/// ゲームやOSが自分で受けて続ける無害な例外が同じ場所から何度も投げられても、行の枠を使い切らないために使う。
+/// ハンドラの中から呼ぶので、確保せず、ロックを取らず、パニックしない。
 pub struct Kinds {
-    /// 上位 32 ビットがコード、下位 32 ビットが場所。0 は空き（記録する例外のコードは 0 でない）。
+    /// 上位32ビットがコード、下位32ビットが場所。0は空き（記録する例外のコードは0でない）。
     slots: [AtomicU64; MAX_LINES as usize],
     claimed: AtomicU32,
     repeats: AtomicU32,
     dropped: AtomicU32,
 }
 
-/// `Kinds::note` の答え。
+/// `Kinds::note`の答え。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Note {
-    /// 初めての組。何件目か（1 から）を添えて、行にする。
+    /// 初めてのペア。何件目か（1から）を添えて行にする。
     Write(u32),
-    /// 行にした組と同じ。数えるだけ。
+    /// 行にしたペアと同じ。数えるだけ。
     Repeat,
-    /// 初めての組だが枠が無い。数えるだけ。
+    /// 初めてのペアだが枠が無い。数えるだけ。
     Dropped,
 }
 
@@ -43,7 +44,7 @@ impl Kinds {
         }
     }
 
-    /// 同じ組が同時に来ると、両方が空きを取って同じ行が 2 回出ることがある（枠は 32 で頭打ちなので害は小さい）。
+    /// 同じペアが同時に来ると両方が空きを確保して同じ行が2回出ることがある（枠は32で頭打ちなので害は小さい）。
     pub fn note(&self, code: u32, addr: u32) -> Note {
         let key = (u64::from(code) << 32) | u64::from(addr);
         let used = (self.claimed.load(Ordering::Acquire) as usize).min(self.slots.len());
@@ -74,12 +75,12 @@ impl Kinds {
         self.claimed.load(Ordering::Acquire).min(MAX_LINES)
     }
 
-    /// 行にした組と同じで、数えただけの回数。
+    /// 行にしたペアと同じで、数えただけの回数。
     pub fn repeats(&self) -> u32 {
         self.repeats.load(Ordering::Relaxed)
     }
 
-    /// 枠が無くて、行にしなかった別の例外の回数。
+    /// 枠が無くて行にしなかった別の例外の回数。
     pub fn dropped(&self) -> u32 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -94,29 +95,29 @@ impl Default for Kinds {
 /// 例外の場所のモジュール。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place<'a> {
-    /// ファイル名（UTF-8）と、モジュールの先頭からの RVA。
+    /// ファイル名（UTF-8）と、モジュールの先頭からのRVA。
     Module(&'a [u8], u32),
-    /// どのモジュールにも入っていない（または引けなかった）。
+    /// どのモジュールにも入っていない（または取得できなかった）。
     Unknown,
-    /// スタックオーバーフローでは API を呼ばないので引かない。
+    /// スタックオーバーフローではAPIを呼ばないので調べない。
     NotLooked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seen<'a> {
-    /// 何件目か（1 から）。
+    /// 何件目か（1から）。
     pub nth: u32,
     pub code: u32,
     pub addr: u32,
     pub thread: u32,
     pub time: Option<LocalTime>,
     pub place: Place<'a>,
-    /// アクセス違反の（種類, 対象のアドレス）。種類は ExceptionInformation[0]（0 読み・1 書き込み・8 実行）。
+    /// アクセス違反の（種類, 対象のアドレス）。種類はExceptionInformation[0]（0読み・1書き込み・8実行）。
     pub access: Option<(usize, u32)>,
 }
 
-/// `s` を 1 行（改行つき）にして `out` の先頭へ書き、書いたバイト数を返す。入らない部品からは丸ごと落とす
-/// （UTF-8 の途中で切らない。後ろの部品だけが残って読み違えることもない）。
+/// `s`を1行（改行つき）にして`out`の先頭へ書き、書いたバイト数を返す。
+/// 入らない部品からは丸ごと省く（UTF-8の途中で切らない。後ろの部品だけが残って読み違えることもない）。
 pub fn format_seen(out: &mut [u8], s: &Seen<'_>) -> usize {
     let mut b = Buf::new(out);
     b.put("例外を見ました（落ちたとは限らない・".as_bytes());
@@ -171,8 +172,8 @@ pub fn format_seen(out: &mut [u8], s: &Seen<'_>) -> usize {
     b.finish()
 }
 
-/// パス（UTF-16）の最後の部分（ファイル名）を UTF-8 で `out` へ書き、書いたバイト数を返す。入らない文字の手前で止める。
-/// 不正な UTF-16 は置き換え文字にする。フォルダはユーザー名を含みうるので書かない。
+/// パス（UTF-16）の最後の部分（ファイル名）をUTF-8で`out`へ書き、書いたバイト数を返す。入らない文字の手前で止める。
+/// 不正なUTF-16は置き換え文字にする。フォルダはユーザー名を含みうるので書かない。
 pub fn file_name_utf8(wide: &[u16], out: &mut [u8]) -> usize {
     let start = wide
         .iter()
@@ -192,7 +193,7 @@ pub fn file_name_utf8(wide: &[u16], out: &mut [u8]) -> usize {
     len
 }
 
-/// 末尾の 1 バイトを改行のために残す書き手。
+/// 末尾の1バイトを改行のために残す書き手。
 struct Buf<'a> {
     out: &'a mut [u8],
     len: usize,
@@ -210,7 +211,7 @@ impl<'a> Buf<'a> {
             return;
         }
         let end = self.len + bytes.len();
-        // 最後の 1 バイトは改行の分。
+        // 最後の1バイトは改行の分。
         let room = self.out.len().saturating_sub(1);
         match self.out.get_mut(self.len..end) {
             Some(dst) if end <= room => {
@@ -234,7 +235,7 @@ impl<'a> Buf<'a> {
         self.dec_pad(v, 1);
     }
 
-    /// 10 進。`width` 桁に満たなければ先頭を 0 で埋める（最大 10 桁）。
+    /// 10進。`width`桁に満たなければ先頭を0で埋める（最大10桁）。
     fn dec_pad(&mut self, mut v: u32, width: usize) {
         let mut s = [b'0'; 10];
         let mut n = 0;
@@ -290,7 +291,7 @@ mod tests {
         String::from_utf8(buf[..n].to_vec()).expect("UTF-8 の途中で切らない")
     }
 
-    /// 欄の順・16 進の桁・時刻の 0 埋め・回数の文も見る。
+    /// フィールドの順・16進の桁・時刻の0埋め・回数の文も見る。
     #[test]
     fn an_access_violation_line_names_module_rva_and_target() {
         assert_eq!(
@@ -406,7 +407,7 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(k.note(ACCESS_VIOLATION, 0x0040_1000), Note::Repeat);
         }
-        // 場所だけ・コードだけが違うものは別の組。
+        // 場所だけ・コードだけが違うものは別のペア。
         assert_eq!(k.note(ACCESS_VIOLATION, 0x0040_1001), Note::Write(2));
         assert_eq!(k.note(0xC000_001D, 0x0040_1000), Note::Write(3));
         assert_eq!((k.lines(), k.repeats(), k.dropped()), (3, 100, 0));
@@ -421,7 +422,7 @@ mod tests {
         for i in 0..5 {
             assert_eq!(k.note(ACCESS_VIOLATION, 0x9000 + i), Note::Dropped);
         }
-        // 上限の後でも、行にした組の繰り返しは繰り返しとして数える。
+        // 上限の後でも行にしたペアの繰り返しは繰り返しとして数える。
         assert_eq!(k.note(ACCESS_VIOLATION, 0x1000), Note::Repeat);
         assert_eq!(
             k.note(ACCESS_VIOLATION, 0x1000 + MAX_LINES - 1),

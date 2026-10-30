@@ -1,10 +1,10 @@
-//! 戻り道を動かさない実機の検証の `_menu.csv`（DLL が `build\bin\logs\` に書く）を、戻り道が読むアドレスの想定
-//! （`higanr_core::return_flow` の定数）と照らすツール。読むだけで、どのファイルにも書かない。
+//! 戻り道を動かさない実機の検証の`_menu.csv`（DLLが`build\bin\logs\`に書く）を戻り道が読むアドレスの想定（`higanr_core::return_flow`の定数）と照らすツール。
+//! 読むだけ。どのファイルにも書かない。
 //!
 //! 使い方: `cargo run --release -p higanr_core --bin return_obs -- <_menu.csv> [--pause] [--pause-first] [--end] [--final-screen 画面:カーソル]`
 //! - `--pause` / `--end`: 台本が通すはずの一時停止 / 終わりのメニューの移り（`PAUSE_REQUIRED` / `END_REQUIRED`）が全部見えることを求める。
-//! - `--pause-first`: 1 回目の一時停止の移りの列が `PAUSE_FIRST_MOVES`（開いた直後の下が効かない台本の流れ）と一致することを求める。
-//! - `--final-screen 6:4`: 最後の行が画面 6・カーソル 4（戻り道の到着）であることを求める。
+//! - `--pause-first`: 1回目の一時停止の移りの列が`PAUSE_FIRST_MOVES`（開いた直後の下が効かない台本の流れ）と一致することを求める。
+//! - `--final-screen 6:4`: 最後の行が画面6・カーソル4（戻り道の到着）であることを求める。
 //!
 //! 終了コード: 0 = 求めたものが全部合格、1 = 求めたものが不合格か測れていない、2 = 使い方かファイルの誤り。求めていない区間の結果は出すが数えない。
 #![forbid(unsafe_code)]

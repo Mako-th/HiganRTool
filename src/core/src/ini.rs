@@ -1,15 +1,15 @@
-//! 設定ファイル `HiganRTool.ini` の読み方。節（`[名前]`）と `キー = 値` の行だけを読み、意味は読む側が決める。
+//! 設定ファイル`HiganRTool.ini`の読み方。節（`[名前]`）と`キー = 値`の行だけを読む。意味は読む側が決める。
 //!
-//! - 行ごとに前後の空白を落とす。空の行と、`;` か `#` で始まる行、先頭の BOM は読まない。
-//! - `[名前]` で節を始める。最初の節より前の `キー = 値` は名前の無い節（`""`）に入る。
-//! - 節の名前とキーは ASCII の大文字・小文字を区別しない（小文字にして持つ）。値の後ろの「空白 + `;`」から行末までは注（`a;b` の `;` は値の一部）。
-//! - 同じ節に同じキーが 2 回、`=` の無い行、閉じない `[` は誤り。`parse` は最初の誤りで断り、`parse_lenient` は誤りの行だけ読み飛ばす。
+//! - 行ごとに前後の空白を落とす。空の行・`;`か`#`で始まる行・先頭のBOMは読まない。
+//! - `[名前]`で節を始める。最初の節より前の`キー = 値`は名前の無い節（`""`）に入る。
+//! - 節の名前とキーはASCIIの大文字・小文字を区別しない（小文字にして持つ）。値の後ろの「空白 + `;`」から行末までは注（`a;b`の`;`は値の一部）。
+//! - 同じ節に同じキーが2回、`=`の無い行、閉じない`[`は誤り。`parse`は最初の誤りで断る。`parse_lenient`は誤りの行だけ読み飛ばす。
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
-/// ローダー（`--ini`）が子の環境ブロックにだけ設定し、DLL は在ればそのパスを、無ければ DLL のフォルダの ini を読む。
-/// 同じ PC で 2 つのゲームを起動するとき ini を別々に持たせるため。
+/// ローダー（`--ini`）が子の環境ブロックにだけ設定する。DLLは在ればそのパスを読み、無ければDLLのフォルダのiniを読む。
+/// 同じPCで2つのゲームを起動するときiniを別々に持たせるため。
 pub const PATH_ENV: &str = "HIGANRTOOL_INI";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -26,16 +26,16 @@ struct Entry {
     line: usize,
 }
 
-/// 読めなかった理由（行の番号は 1 から）。
+/// 読めなかった理由（行の番号は1から）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IniError {
-    /// `=` の無い行。
+    /// `=`の無い行。
     NoEquals { line: usize },
-    /// `[` で始まり `]` で終わらない行、か名前が空。
+    /// `[`で始まり`]`で終わらない行、か名前が空。
     BadSection { line: usize },
     /// キーが空。
     EmptyKey { line: usize },
-    /// 同じキーが 2 回。
+    /// 同じキーが2回。
     Duplicate {
         section: String,
         key: String,
@@ -45,7 +45,7 @@ pub enum IniError {
 }
 
 impl IniError {
-    /// 誤りの行の番号（重複は 2 回目の行）。
+    /// 誤りの行の番号（重複は2回目の行）。
     pub fn line(&self) -> usize {
         match self {
             IniError::NoEquals { line }
@@ -104,12 +104,12 @@ impl Ini {
         self.sections.contains(&s)
     }
 
-    /// 見出しのある節の名前（小文字。初めて現れた順）。見出しより前の名前の無い節（`""`）は含まない。
+    /// ヘッダのある節の名前（小文字。初めて現れた順）。ヘッダより前の名前の無い節（`""`）は含まない。
     pub fn sections(&self) -> &[String] {
         &self.sections
     }
 
-    /// キーと、それを書いた行の番号（書いた順）。知らないキーを読む側が断るのに使う。
+    /// キーとそれを書いた行の番号（書いた順）。知らないキーを読む側が断るのに使う。
     pub fn keys(&self, section: &str) -> Vec<(&str, usize)> {
         let s = section.to_ascii_lowercase();
         self.entries
@@ -132,23 +132,23 @@ pub fn strip_comment(v: &str) -> &str {
     v
 }
 
-/// 読み飛ばした行と、その時いた節。
+/// 読み飛ばした行とその時いた節。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     pub error: IniError,
     pub section: String,
 }
 
-/// `parse_lenient` の結果。
+/// `parse_lenient`の結果。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Lenient {
     pub ini: Ini,
     pub skipped: Vec<Skipped>,
-    /// 読まなかった行の番号（昇順）。`skipped` の行と、読めない `[` の見出しの下で次の見出しまでの行。
+    /// 読まなかった行の番号（昇順）。`skipped`の行と、読めない`[`のヘッダの下で次のヘッダまでの行。
     pub dropped: Vec<usize>,
 }
 
-/// 誤りの行だけ読み飛ばして読む。読めない見出しの下の行は、前の節に入れず次の見出しまで捨てる。
+/// 誤りの行だけ読み飛ばして読む。読めないヘッダの下の行は前の節に追加せず次のヘッダまで捨てる。
 pub fn parse_lenient(text: &str) -> Lenient {
     let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut out = Lenient::default();

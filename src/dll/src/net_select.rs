@@ -1,39 +1,39 @@
-//! ネットの選択で、選択の画面のゲームの状態から「自分の押下」「届いた押下をこの tick に入れられるか」
-//! 「押下を入れる tick の feed とカーソル」を決める（pure。unsafe 無し）。押下の結果の模型と value の詰め方は
-//! `higanr_core::menu_model`。ゲームのメモリの読み書きは呼び手。ここはゲームのスレッドで走るので、確保・
-//! パニックしうる添字を使わない（添字はいつも `& 15` か `get`）。
+//! ネットの選択で、選択の画面のゲームの状態から次を決める（pure。unsafe無し）。
+//! 「自分の押下」「届いた押下をこのtickに渡せるか」「押下を渡すtickのfeedとカーソル」。
+//! 押下の結果のモデルとvalueの詰め方は`higanr_core::menu_model`。ゲームのメモリの読み書きは呼び出し側が行う。
+//! ここはゲームのスレッドで走るので、メモリ確保とパニックしうる添字を使わない（添字はいつも`& 15`か`get`）。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::keys;
 use higanr_core::lockstep::by_seat;
 use higanr_core::menu_model::{
     APPLY_CLEAR_BITS, MAP_ITEM_RANDOM_OF_TWO, MAP_LIST_EMPTY, SCREEN_CHARA, SCREEN_DIFFICULTY,
-    SCREEN_MAP, TRANSITION_BITS, chara_value, chara_value_parts, is_selection_screen,
-    peer_chara_word, press_kind,
+    SCREEN_MAP, TRANSITION_BITS, chara_value, chara_value_parts, is_human_selection,
+    peer_chara_word, press_kind, reads_presses,
 };
 use higanr_core::selection::{PeerCursor, Press};
 use higanr_core::wire::{CURSOR_NONE, Seat, Step, StepKind};
 
 use crate::th09_addr::{MENU_CHARA_CURSOR, MENU_CURSOR};
 
-/// 入力の地点で読んだ選択の画面（今の場面 1 で、次の要求が 2 でないときだけ読む）。
+/// 入力の地点で読んだ選択の画面（今の場面が1で次の要求が2でないときだけ読む）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MenuView {
     /// `[M+0x1B228]`。
     pub screen: u32,
-    /// `[M+0x28]`（1 のときだけ押下を読む）。
+    /// `[M+0x28]`（1のときだけ押下を読む）。
     pub sub: u32,
-    /// `[M+0x1B238]`（0 でなければハンドラが走らない）。
+    /// `[M+0x1B238]`（0でなければハンドラが走らない）。
     pub trans: u32,
     /// `[M+0x00]`（難易度・マップのカーソル）。
     pub cursor: u32,
     /// `[M+0x10]` / `[M+0x14]`（キャラのカーソル。1P・2P）。
     pub chara_cursor: [u32; 2],
-    /// `[M+0x18]` / `[M+0x1C]`（席の旗。1P・2P）。
+    /// `[M+0x18]` / `[M+0x1C]`（サイドの決定済みフラグ。1P・2P）。
     pub decided: [u32; 2],
-    /// `[0x4A7EA4]`（0 = 人対人のキャラ選択）。
+    /// `[0x4A7EA4]`（0 = 人間 対 人間のキャラ選択）。
     pub select_kind: u32,
-    /// マップの一覧 `0x4AC8C4`。
+    /// マップの一覧`0x4AC8C4`。
     pub map_list: [u8; 16],
 }
 
@@ -44,22 +44,23 @@ pub fn seat_index(s: Seat) -> usize {
     }
 }
 
-/// ネットの選択をする画面か（人対人の Match の 7・8・16）。
+/// ネットの選択をする画面かどうか（人間 対 人間のMatchの7・8・16）。
 pub fn in_selection(v: &MenuView) -> bool {
-    v.select_kind == 0 && is_selection_screen(v.screen)
+    is_human_selection(v.screen, v.select_kind)
 }
 
-/// この tick のハンドラが押下を読む状態か（`+0x28 == 1` かつ `+0x1B238 == 0`）。
+/// このtickのハンドラが押下を読む状態かどうか（`+0x28 == 1`かつ`+0x1B238 == 0`）。
 pub fn accepting(v: &MenuView) -> bool {
-    in_selection(v) && v.sub == 1 && v.trans == 0
+    in_selection(v) && reads_presses(v.sub, v.trans)
 }
 
-/// この tick に入れたら、ゲームがその押下を処理するか。キャラ選択の決定は、その席が決めていないときだけ。
-/// 難易度の取消の `[[0x4B42D0]+0xA8] == 0` は見ない（普段は 0 の見込み）。
+/// このtickに渡したらゲームがその押下を処理するかどうか。キャラ選択の決定は、そのサイドが決定済みでないときだけ処理される。
+/// 難易度でキャンセルを押したときの`[[0x4B42D0]+0xA8] == 0`は見ない（普段は0の見込み）。
 pub fn reads(v: &MenuView, kind: StepKind, value: u8) -> bool {
     if kind == StepKind::Format {
-        // 形式の切替はゲームへ何も入れないので、ゲームが押下を読む状態を待たない（待つと、入る演出の間に届いた切替が
-        // 持ち越されて、最初の INPUT より前に揃える順がずれうる）。選択の画面にいればよい。
+        // 形式の切り替えはゲームへ何も渡さないので、ゲームが押下を読む状態を待たない。
+        // 待つと、入る演出の間に届いた切り替えが持ち越されて、最初のINPUTより前に揃える順がずれうる。
+        // 選択の画面にいればよい。
         return in_selection(v);
     }
     if !accepting(v) {
@@ -72,14 +73,16 @@ pub fn reads(v: &MenuView, kind: StepKind, value: u8) -> bool {
     true
 }
 
-/// 届いた押下（対戦のホスト: 受けたゲストの要求 / 対戦のゲスト: 届いた STEP）を、この tick に入れられるか。押下の画面が今の画面と
-/// 同じで、ゲームがその押下を処理する状態のときだけ。画面を持たない押下（screen 0。peer_sim の v0）は入れない。
+/// 届いた押下（対戦のホストでは受け取ったゲストの要求。対戦のゲストでは届いたSTEP）を、このtickに渡せるかどうか。
+/// 押下の画面が今の画面と同じで、ゲームがその押下を処理する状態のときだけ渡せる。
+/// 画面を持たない押下（screen 0。peer_simのv0）は渡さない。
 pub fn reads_step(v: &MenuView, st: &Step) -> bool {
     st.screen != 0 && u32::from(st.screen) == v.screen && reads(v, st.kind, st.value)
 }
 
-/// マップの一覧でカーソルが指す値（0〜15）。空き枠（0xFF）で決めるとゲームは −1 を書く（`0x004264BF` の movsbl）ので、
-/// 14（−1 の項目）に数える。カーソルが一覧の外なら None。
+/// マップの一覧でカーソルが指す値（0〜15）。
+/// 空き枠（0xFF）で決定するとゲームは −1を書く（`0x004264BF`のmovsbl）ので、14（−1の項目）に数える。
+/// カーソルが一覧の外ならNone。
 fn map_item_at_cursor(v: &MenuView) -> Option<u8> {
     let item = v.map_list.get((v.cursor & 15) as usize).copied()?;
     Some(if item == MAP_LIST_EMPTY {
@@ -89,7 +92,8 @@ fn map_item_at_cursor(v: &MenuView) -> Option<u8> {
     })
 }
 
-/// 対戦のホスト: 今の画面で、ゲストのカーソルをホストの値へ合わせるための押下（value は `menu_model::uses_align` の注）。合わせを使う画面（難易度・マップ）でなければ None。
+/// 対戦のホスト用。今の画面で、ゲストのカーソルをホストの値へ合わせるための押下を返す（valueは`menu_model::uses_align`の注）。
+/// 合わせを使う画面（難易度・マップ）でなければNone。
 pub fn align_press(v: &MenuView) -> Option<Press> {
     let screen = u8::try_from(v.screen).ok()?;
     let value = match screen {
@@ -104,14 +108,14 @@ pub fn align_press(v: &MenuView) -> Option<Press> {
     })
 }
 
-/// ホストが合わせをこの tick に出してよいか。ゲームがカーソルを初期化し終えた後（`+0x28 == 1`。8 → 7 は入場の回が
-/// 次の tick なので、入った直後のカーソルは前の画面の値のまま）で、自分の語に方向・Ctrl・Shift が立っていないとき
-/// （押し続けが合わせをまたぐと、ゲストの側でその方向が「押した瞬間」として 1 回余計に数えられ、カーソルが 1 つずれる）。
+/// ホストが合わせをこのtickに出してよいかどうか。次の条件が両方揃ったときだけ出してよい。
+/// - ゲームがカーソルを初期化し終えた後（`+0x28 == 1`）。8 → 7の遷移では入る処理が次のtickに走るので、遷移した直後のカーソルは前の画面の値のまま。
+/// - 自分の入力ワードに方向・Ctrl・Shiftが立っていない。押し続けが合わせをまたぐと、ゲスト側でその方向が「押した瞬間」として1回余計に数えられ、カーソルが1つずれる。
 pub fn can_align_now(v: &MenuView, local: u16) -> bool {
     accepting(v) && local & APPLY_CLEAR_BITS == 0
 }
 
-/// 自分の押下（`pressed` は押した瞬間、`held` は押している間）。ゲームがこの tick に処理する押下だけを押下にする。
+/// 自分の押下（`pressed`は押した瞬間。`held`は押している間）。ゲームがこのtickに処理する押下だけを押下として返す。
 pub fn local_press(v: &MenuView, held: u16, pressed: u16, seat: usize) -> Option<Press> {
     let kind = press_kind(pressed)?;
     let screen = u8::try_from(v.screen).ok()?;
@@ -124,7 +128,7 @@ pub fn local_press(v: &MenuView, held: u16, pressed: u16, seat: usize) -> Option
                 chara_value(seat, held & keys::SHIFT != 0, (cursor & 15) as u8)
             }
             StepKind::Cancel => chara_value(seat, false, 0),
-            // 人の押下は決定か取消だけ（合わせはホストの役が作る。形式の切替は Tab で、ゲームの語ではない）。
+            // 人の押下は決定かキャンセルだけ（合わせはホストの役が作る。形式の切り替えはTabで、ゲームの入力ワードではない）。
             StepKind::Align | StepKind::Format => return None,
         },
         _ => return None,
@@ -136,8 +140,9 @@ pub fn local_press(v: &MenuView, held: u16, pressed: u16, seat: usize) -> Option
     })
 }
 
-/// 押し直す押下を、いまの画面から作り直す（value はカーソルの値なので、押した後に合わせでカーソルが動いていたら、古い
-/// 値のまま入れると画面に見えているカーソルと違う値を決める）。作れなければ元のまま。キャラの決定は元の Shift を残す。
+/// 押し直す押下を、いまの画面から作り直す。
+/// valueはカーソルの値なので押した後に合わせでカーソルが動いていたら、古い値のままでは画面に見えているカーソルと違う値で決定してしまう。
+/// 作れなければ元のまま。キャラの決定は元のShiftを残す。
 pub fn repress(v: &MenuView, p: Press, seat: usize) -> Press {
     let bit = press_bit(p.kind);
     let shift =
@@ -150,14 +155,14 @@ pub fn repress(v: &MenuView, p: Press, seat: usize) -> Press {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyPlan {
-    /// feed の前に MainMenu の欄（オフセット, 値）へ書くカーソル。
+    /// feedの前にMainMenuのフィールド（オフセット, 値）へ書くカーソル。
     pub cursor: Option<(u32, u32)>,
     pub words: [u16; 3],
-    /// キャラ選択の決定で、カーソルを書いた後に立ち絵を追わせる席とカーソル。難易度・マップの画面・取消では `None`。
+    /// キャラ選択の決定で、カーソルを書いた後に立ち絵を追わせるサイドとカーソル。難易度・マップの画面とキャンセルでは`None`。
     pub portrait: Option<(usize, u32)>,
 }
 
-/// 押下の語（決定は Z、取消は X。合わせは画面を移る押下ではないので押さない）。
+/// 押下のワード（決定はZ。キャンセルはX）。合わせは画面を移る押下ではないので押さない。
 fn press_bit(kind: StepKind) -> u16 {
     match kind {
         StepKind::Decide => keys::Z,
@@ -166,22 +171,23 @@ fn press_bit(kind: StepKind) -> u16 {
     }
 }
 
-/// いつもの tick の 3 本（自分の席に自分の語、相手の席に相手の語、合成に OR）。画面を移るビットは両方の語から落とす。
+/// いつものtickの3本（自分のサイドに自分のワード・相手のサイドに相手のワード・合成にOR）。画面を移るビットは両方のワードから落とす。
 pub fn normal_words(my_seat: Seat, local: u16, remote: u16) -> [u16; 3] {
     let (p1, p2) = by_seat(my_seat, local & !TRANSITION_BITS, remote & !TRANSITION_BITS);
     [p1, p2, p1 | p2]
 }
 
-/// 押下を入れる tick の feed とカーソル。押した席の語に方向・Ctrl・Shift が立っていると決定の前にカーソルが動くので落とす。
-/// 決定のときだけカーソルを合わせる（難易度の取消でも合わせないのは、ゲームが取消でもカーソルを th09.cfg の難易度
-/// `[0x4B3538]` へコピーするので、相手の値を自分の設定に残さないため）。
+/// 押下を渡すtickのfeedとカーソル。
+/// 押したサイドのワードに方向・Ctrl・Shiftが立っていると決定の前にカーソルが動くので落とす。
+/// 決定のときだけカーソルを合わせる。難易度でキャンセルを押したときも合わせないのは、ゲームがキャンセルでもカーソルをth09.cfgの難易度`[0x4B3538]`へコピーするので、相手の値を自分の設定に残さないため。
 pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u16) -> ApplyPlan {
     if st.kind == StepKind::Align {
-        // 合わせは `align_plan`。ここへ来たら、ホストと同じ扱い（ゲストへ書かない）にしておく。
+        // 合わせは`align_plan`。ここへ来たらホストと同じ扱い（ゲストへ書かない）にしておく。
         return align_plan(v, st, my_seat, local, remote, false);
     }
     if st.kind == StepKind::Format {
-        // 形式の切替: 押下もカーソルも入れない（value は形式・D・auto の旗）。語はいつもの tick と同じで、step の番号だけが進む。
+        // 形式の切り替えでは押下もカーソルも渡さない（valueは形式・D・autoのフラグ）。
+        // ワードはいつものtickと同じで、stepの番号だけが進む。
         return ApplyPlan {
             cursor: None,
             words: normal_words(my_seat, local, remote),
@@ -195,7 +201,7 @@ pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u1
     let mut portrait = None;
     match st.screen {
         SCREEN_DIFFICULTY | SCREEN_MAP => {
-            // 7・16 は合成 `[2]` だけを読む。3 本とも方向・Ctrl・Shift を落とし、合成に押下を入れる。
+            // 7・16は合成`[2]`だけを読む。3本とも方向・Ctrl・Shiftを落とし、合成に押下を渡す。
             for x in &mut w {
                 *x &= !APPLY_CLEAR_BITS;
             }
@@ -204,7 +210,7 @@ pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u1
                 cursor = if st.screen == SCREEN_DIFFICULTY {
                     Some((MENU_CURSOR, u32::from(st.value & 3)))
                 } else {
-                    // 一覧の値から添字を探す（添字は解放状況で両者ごとに違う）。見つからなければ合わせない（SELECT が揃える）。
+                    // 一覧の値から添字を探す（添字は解放状況で両者ごとに違う）。見つからなければ合わせない（SELECTが揃える）。
                     v.map_list
                         .iter()
                         .position(|&x| x == st.value)
@@ -235,9 +241,10 @@ pub fn apply_plan(v: &MenuView, st: &Step, my_seat: Seat, local: u16, remote: u1
     }
 }
 
-/// 合わせを入れる tick の feed とカーソル。**ゲスト**は、カーソルをホストの値へ書き（マップは自分の一覧から値の添字を探す。
-/// 無ければ書かない）、3 本とも方向・Ctrl・Shift を落とす（書いた値をこの tick に動かさない）。**ホスト**は自分の値なので
-/// 何も書かず、語もそのまま（`is_guest` が偽）。キャラ選択の合わせは無い（届いても書かない。呼び手は書けなかった数に数える）。
+/// 合わせを渡すtickのfeedとカーソル。
+/// **ゲスト**はカーソルをホストの値へ書き（マップは自分の一覧から値の添字を探し、無ければ書かない）、3本とも方向・Ctrl・Shiftを落とす（書いた値をこのtickに動かさない）。
+/// **ホスト**は自分の値なので何も書かず、ワードもそのまま（`is_guest`が偽）。
+/// キャラ選択の合わせは無い（届いても書かない。呼び出し側は書けなかった数に数える）。
 pub fn align_plan(
     v: &MenuView,
     st: &Step,
@@ -273,7 +280,7 @@ pub fn align_plan(
     plan
 }
 
-/// キャラ選択の tick に、相手の席へ feed する相手の入力ワード（`menu_model::peer_chara_word`。カーソルは位置で書く）。ほかの画面はそのまま。
+/// キャラ選択のtickに、相手のサイドへfeedする相手の入力ワード（`menu_model::peer_chara_word`。カーソルは位置で書く）。ほかの画面はそのまま。
 pub fn peer_word(screen: u32, remote: u16) -> u16 {
     if screen == u32::from(SCREEN_CHARA) {
         peer_chara_word(remote)
@@ -282,7 +289,7 @@ pub fn peer_word(screen: u32, remote: u16) -> u16 {
     }
 }
 
-/// 自分の MENU に載せる、自分の画面と自分の席のキャラのカーソル（キャラ選択の外は `CURSOR_NONE`）。
+/// 自分のMENUに載せる自分の画面と自分のサイドのキャラのカーソル（キャラ選択の外は`CURSOR_NONE`）。
 pub fn own_cursor(v: &MenuView, seat: usize) -> (u8, u8) {
     let screen = u8::try_from(v.screen).unwrap_or(0);
     let cursor = match v.chara_cursor.get(seat) {
@@ -292,20 +299,20 @@ pub fn own_cursor(v: &MenuView, seat: usize) -> (u8, u8) {
     (screen, cursor)
 }
 
-/// 相手の席の位置の書き込み（`peer_sync`）。
+/// 相手のサイドの位置の書き込み（`peer_sync`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerSync {
-    /// 書く MainMenu の欄（オフセット, 値）。
+    /// 書くMainMenuのフィールド（オフセット, 値）。
     pub cursor: (u32, u32),
-    /// 立ち絵を追わせる席とカーソル。
+    /// 立ち絵を追わせるサイドとカーソル。
     pub portrait: (usize, u32),
     /// カーソルの音を鳴らす（相手のカーソルの移動。ランダム・入ったときの最初の位置では鳴らさない）。
     pub sound: bool,
 }
 
-/// キャラ選択で、この tick に相手の席のカーソルを相手の位置へ書くか（押下を入れない tick だけ。呼び手が見る）。ゲームが押下を読む状態で、
-/// 相手の席が決めていない（決めた席のカーソルはゲームも動かさない）ときだけ見る。位置が同じなら書かない。
-/// `take` は相手の位置を取る（取ると `moved` が消えるので、見る条件が揃ったときだけ呼ぶ）。
+/// キャラ選択で、このtickに相手のサイドのカーソルを相手の位置へ書くかどうか。押下を渡さないtickだけ、呼び出し側が見る。
+/// ゲームが押下を読む状態で、相手のサイドが決定済みでない（決定済みのサイドのカーソルはゲームも動かさない）ときだけ見る。位置が同じなら書かない。
+/// `take`は相手の位置を取る。取ると`moved`が消えるので、見る条件が揃ったときだけ呼ぶ。
 pub fn peer_sync(
     v: &MenuView,
     my: usize,
@@ -333,8 +340,9 @@ pub fn peer_sync(
     })
 }
 
-/// マップ −2（解放済みから 1 つ）を、ホストが具体の値に置き換える（ゲームの乱数は使わない）。一覧の中の 0〜13 の値
-/// （手元で解放済みのマップ）から `seed % 件数` 番目。1 つも無ければ −1。返すのは SELECT のマップの欄（i8 の下位バイト）。
+/// マップ −2（解放済みから1つ）を、ホストが具体の値に置き換える（ゲームの乱数は使わない）。
+/// 一覧の中の0〜13の値（手元で解放済みのマップ）から`seed % 件数`番目を選ぶ。1つも無ければ −1。
+/// 返すのはSELECTのマップのフィールド（i8の下位バイト）。
 pub fn pick_any_map(list: &[u8; 16], seed: u16) -> u8 {
     let n = list.iter().filter(|&&x| x <= 13).count();
     if n == 0 {
@@ -635,7 +643,7 @@ mod tests {
         })
     }
 
-    /// 見ない条件のとき相手の位置を取ると `moved` が消えて音が鳴らないことも見る。
+    /// 見ない条件のとき相手の位置を取ると`moved`が消えて音が鳴らないことも見る。
     #[test]
     fn peer_sync_writes_the_other_seat_only_when_it_may_move() {
         let v = view(8);

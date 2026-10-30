@@ -1,4 +1,4 @@
-//! 観戦者の側の部品（`spectate_watch.rs`）の検査。ゲームのウィンドウを伴う組み上がりは `netplay/watch_tests.rs`。
+//! 観戦者の側の部品（`spectate_watch.rs`）の検査。ゲームのウィンドウを伴う組み上がりは`netplay/watch_tests.rs`。
 use std::sync::Arc;
 
 use higanr_core::auth::Secret;
@@ -20,7 +20,7 @@ fn cfg(session: u32) -> WatcherConfig {
     }
 }
 
-/// `cfg(session)` の観戦者の公開鍵（鍵の種は session の値で埋めてある）。
+/// `cfg(session)`の観戦者の公開鍵（鍵の種はsessionの値で埋めてある）。
 fn public_of(session: u32) -> [u8; 32] {
     higanr_core::seal::Ephemeral::from_seed(&higanr_core::seal::KeySeed([session as u8; 32]))
         .public()
@@ -35,7 +35,7 @@ fn the_slot_hands_over_only_the_newest_config_once_and_never_waits() {
     slot.offer(cfg(1));
     slot.offer(cfg(2));
     assert_eq!(slot.generation(), 2);
-    // 見張りが錠を持っている間は待たない（取れなければ次の tick）。世代は進めない。
+    // 監視の処理がロックを持っている間は待たない（取れなければ次のtick）。世代は進めない。
     {
         let _held = slot.cfg.lock().unwrap();
         assert!(slot.take_newer(&mut seen).is_none());
@@ -216,7 +216,7 @@ fn the_join_carries_the_ff_max_of_the_watch_config() {
             (0, 0, 0, 0)
         }
     }
-    // 既定（8）と違う値で、範囲の両端も。
+    // 既定（8）と違う値を使い、範囲の両端も含める。
     for ff_max in [3u32, 1, 16] {
         let a = std::net::SocketAddr::from(([127, 0, 0, 1], 41_302));
         let h = std::net::SocketAddr::from(([127, 0, 0, 1], 47_001));
@@ -301,7 +301,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
     assert_eq!(wp.phase(), Phase::Ended);
     assert!(slot.is_done());
     assert!(wp.bye.is_none(), "繋がっていないのに BYE を積んだ");
-    // 接続した後の `give_up` は観戦を切らない（別の slot・別の WatchPlay で、`Watcher` が接続した形を作れないので、段階で見る）。
+    // 接続した後の`give_up`は観戦を切らない（別のslotと別のWatchPlayを使う。`Watcher`が接続した状態を作れないので、段階で見る）。
     let slot2 = Arc::new(WatchSlot::new());
     let mut wp2 = WatchPlay::new(
         Arc::clone(&slot2),
@@ -440,7 +440,145 @@ fn a_watcher_asks_to_skip_the_save_screen_only_when_its_game_leaves_by_save_and_
     assert!(g.fed.is_empty(), "終わった後に feed した");
 }
 
-/// マッチの途中で語が届かず止まったら、次に使う前に溜まりが余裕（3）に戻るのを待つ。止まっていなければ、溜まりが 1 でも待たない。
+#[test]
+fn names_are_fixed_per_seg_by_the_first_complete_pair() {
+    let mut wp = WatchPlay::new(
+        Arc::new(WatchSlot::new()),
+        WatchConfig {
+            wait_budget_us: 0,
+            margin_frames: 3,
+            require_net_selection: true,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+        },
+    );
+    let name = |seat, s: &str| Record::name(seat, s.as_bytes());
+    let names = |wp: &WatchPlay| {
+        wp.names()
+            .map(|[a, b]| (a.as_str().to_string(), b.as_str().to_string()))
+    };
+    let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+    let recs = [
+        Record::Seg { seg: 0 },
+        name(Seat::P1, "p1"),
+        name(Seat::P1, "p1x"),
+        name(Seat::P2, "p2"),
+        name(Seat::P1, "p1y"),
+        name(Seat::P2, "p2y"),
+    ];
+    for r in &recs {
+        assert!(wp.push_for_test(r));
+    }
+    assert!(matches!(
+        wp.watcher_pop(),
+        Some((_, Record::Seg { seg: 0 }))
+    ));
+    assert!(wp.watcher_pop().is_none());
+    assert_eq!(
+        names(&wp),
+        pair("p1x", "p2"),
+        "最初にそろった組から変わった"
+    );
+    for r in [
+        Record::Seg { seg: 1 },
+        name(Seat::P1, "q1"),
+        name(Seat::P2, "q2"),
+        name(Seat::P1, "q1y"),
+    ] {
+        assert!(wp.push_for_test(&r));
+    }
+    assert!(matches!(
+        wp.watcher_pop(),
+        Some((_, Record::Seg { seg: 1 }))
+    ));
+    assert!(wp.watcher_pop().is_none());
+    assert_eq!(names(&wp), pair("q1", "q2"), "次の seg で組が替わらない");
+    // 1サイドぶんしか来ないマッチでは前のペアのまま。
+    for r in [Record::Seg { seg: 2 }, name(Seat::P1, "r1")] {
+        assert!(wp.push_for_test(&r));
+    }
+    assert!(wp.watcher_pop().is_some());
+    assert!(wp.watcher_pop().is_none());
+    assert_eq!(names(&wp), pair("q1", "q2"), "片方の席だけで組が替わった");
+}
+
+#[test]
+fn match_frame_words_are_masked_before_the_game_and_the_pause_memory() {
+    use crate::netplay::fake::FakeNet;
+    use crate::netplay::{Action, Game, Phase};
+    struct Rec(Vec<(u32, u16)>);
+    impl Game for Rec {
+        fn scenes(&mut self) -> (u32, u32) {
+            (SCENE_MATCH, 0)
+        }
+        fn local_input(&mut self, _s: higanr_core::wire::Seat) -> u16 {
+            0
+        }
+        fn feed(&mut self, i: u32, w: u16) {
+            self.0.push((i, w));
+        }
+        fn own_select(
+            &mut self,
+            _s: higanr_core::wire::Seat,
+            _r: higanr_core::lockstep::Role,
+        ) -> higanr_core::wire::Select {
+            unreachable!()
+        }
+        fn apply_agreed(
+            &mut self,
+            _p: higanr_core::wire::Seat,
+            _a: &higanr_core::selection::Agreed,
+        ) -> Result<(), crate::netplay::BadValue> {
+            unreachable!()
+        }
+        fn write_charge(&mut self, _p1: u8, _p2: u8) -> bool {
+            true
+        }
+        fn check_values(&mut self) -> (u16, u32, u8, u8) {
+            (0, 0, 0, 0)
+        }
+    }
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], 41_304));
+    let h = std::net::SocketAddr::from(([127, 0, 0, 1], 47_004));
+    let (mut net, _other, _clock) = FakeNet::pair(a, h, 0);
+    let mut wp = WatchPlay::new(
+        Arc::new(WatchSlot::new()),
+        WatchConfig {
+            wait_budget_us: 0,
+            margin_frames: 3,
+            require_net_selection: true,
+            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+        },
+    );
+    wp.set_phase_for_test(Phase::Lockstep);
+    wp.started = true;
+    let shot = 0x0800;
+    wp.look[0] = Some((
+        0,
+        Record::Frame {
+            frame: 0,
+            p1: shot | Z | 0x0100,
+            p2: shot | 0xA000,
+        },
+    ));
+    wp.test_backlog = Some(3);
+    let mut g = Rec(Vec::new());
+    assert!(matches!(
+        wp.dispatch(&mut g, &mut net, false),
+        Action::Played(_)
+    ));
+    assert_eq!(
+        g.0,
+        vec![(0, Z | 0x0100), (1, 0), (2, Z | 0x0100)],
+        "P/Home などの手元で働くビットがゲームへ渡った"
+    );
+    assert_eq!(
+        wp.last_words,
+        (Z | 0x0100, 0),
+        "ポーズの再開へ持ち越す語に残った"
+    );
+}
+
+/// マッチの途中でワードが届かず止まったら次に使う前に溜まりが余裕（3）に戻るのを待つ。止まっていなければ溜まりが1でも待たない。
 #[test]
 fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
     use crate::netplay::fake::FakeNet;
@@ -481,7 +619,7 @@ fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
     let mut wp = WatchPlay::new(
         Arc::new(WatchSlot::new()),
         WatchConfig {
-            // 語を待たずに止まる（描画だけのフレームにする）。
+            // ワードを待たずに止まる（描画だけのフレームにする）。
             wait_budget_us: 0,
             margin_frames: 3,
             require_net_selection: true,
@@ -501,18 +639,18 @@ fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
         ))
     };
     let mut g = InMatch;
-    // 止まらずに続くなら、溜まり 1 でも使う。
+    // 止まらずに続くなら溜まり1でも使う。
     wp.look[0] = frame(0);
     wp.test_backlog = Some(1);
     assert!(matches!(
         wp.dispatch(&mut g, &mut net, false),
         Action::Played(_)
     ));
-    // 語が無くて止まった。
+    // ワードが無くて止まった。
     wp.test_backlog = None;
     assert_eq!(wp.dispatch(&mut g, &mut net, false), Action::RenderOnly);
     assert_eq!(wp.stats().stalls, 1);
-    // 1 つ届いても、余裕まで溜まるのを待つ。
+    // 1つ届いても余裕まで溜まるのを待つ。
     wp.look[0] = frame(1);
     wp.test_backlog = Some(1);
     assert_eq!(wp.dispatch(&mut g, &mut net, false), Action::RenderOnly);
@@ -524,7 +662,7 @@ fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
         wp.dispatch(&mut g, &mut net, false),
         Action::Played(_)
     ));
-    // 戻った後は、また溜まり 1 でも使う。
+    // 戻った後はまた溜まり1でも使う。
     wp.look[0] = frame(2);
     wp.test_backlog = Some(1);
     assert!(matches!(

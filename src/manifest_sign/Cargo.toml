@@ -3,8 +3,12 @@ name = "higanr_manifest_sign"
 description = "配る側の道具: 更新の目録の署名の鍵を作る・目録に署名する・確かめる。配る exe・dll には入らない"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "manifest_sign"

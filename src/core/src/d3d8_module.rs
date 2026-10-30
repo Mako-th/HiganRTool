@@ -1,22 +1,22 @@
-//! 読み込まれている `d3d8.dll` を本ログの 1 行にする（純粋な文字の組み立て）。
+//! 読み込まれている`d3d8.dll`を本ログの1行にする（純粋な文字の組み立て）。
 //!
-//! 落ちたときに「どの d3d8.dll の上か」（OS のものか、ゲームのフォルダの差し替えか）を、VEH の `d3d8.dll+RVA` と突き合わせて読むため。
-//! フォルダ名にはユーザー名が入りうるので、パスは書かず「場所の種類」だけにする。
+//! 落ちたときに「どのd3d8.dllの上か」（OSのものかゲームのフォルダの差し替えか）をVEHの`d3d8.dll+RVA`と突き合わせて読むため。
+//! フォルダ名にはユーザー名が入りうるのでパスは書かず「場所の種類」だけにする。
 
 #![forbid(unsafe_code)]
 
 /// 欄が取れなかったときに書く語。
 pub const NONE_TEXT: &str = "無し";
 
-/// 1 つの欄の最大の文字数（バージョンの文字列に長い説明が入っていても行が伸びないように）。
+/// 1つのフィールドの最大の文字数（バージョンの文字列に長い説明が入っていても行が伸びないように）。
 const FIELD_MAX_CHARS: usize = 64;
 
 /// 場所の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
-    /// ゲーム（exe）のフォルダ。差し替えの d3d8.dll はここに置かれる。
+    /// ゲーム（exe）のフォルダ。差し替えのd3d8.dllはここに置かれる。
     Game,
-    /// システムのフォルダ（`GetSystemDirectoryW` など）。
+    /// システムのフォルダ（`GetSystemDirectoryW`など）。
     System,
     /// どちらでもない（ゲームのフォルダの下の別のフォルダも含む）。
     Other,
@@ -32,7 +32,7 @@ impl Place {
     }
 }
 
-/// ファイルのバージョン情報の 4 欄。取れなかった欄は `None`。
+/// ファイルのバージョン情報の4つのフィールド。取れなかったフィールドは`None`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionFields {
     pub description: Option<String>,
@@ -41,21 +41,22 @@ pub struct VersionFields {
     pub company: Option<String>,
 }
 
-/// 読み込まれている d3d8.dll の材料。
+/// 読み込まれているd3d8.dllの材料。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct D3d8Module {
-    /// モジュールのパス。取れなければ `None`。
+    /// モジュールのパス。取れなければ`None`。
     pub path: Option<String>,
     /// ゲーム（exe）のフォルダ。
     pub game_dir: Option<String>,
-    /// システムのフォルダ（32 ビットのプロセスから見えるもの。複数あってよい）。
+    /// システムのフォルダ（32ビットのプロセスから見えるもの。複数あってよい）。
     pub system_dirs: Vec<String>,
     /// ファイルの大きさ（バイト）。
     pub size: Option<u64>,
     pub version: VersionFields,
 }
 
-/// パスの比べ方をそろえる: `/` を `\` に、`\\?\` の接頭を外し、末尾の `\` を外し、小文字にする（Windows のパスは大文字小文字を区別しない）。
+/// パスの比べ方をそろえる。
+/// `/`を`\`に変え、`\\?\`の接頭と末尾の`\`を外し、小文字にする（Windowsのパスは大文字小文字を区別しない）。
 fn normalize(p: &str) -> String {
     let p = p.replace('/', "\\");
     let p = p.strip_prefix("\\\\?\\").unwrap_or(&p);
@@ -67,12 +68,12 @@ pub fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// パスのフォルダの部分（最後の区切りより前）。区切りが無ければ `None`。
+/// パスのフォルダの部分（最後の区切りより前）。区切りが無ければ`None`。
 fn parent(path: &str) -> Option<&str> {
     path.rfind(['\\', '/']).map(|i| &path[..i])
 }
 
-/// `path` の置かれているフォルダの種類。ゲームのフォルダとシステムのフォルダは、フォルダが完全に一致するものだけ（その下は `Other`）。
+/// `path`の置かれているフォルダの種類。ゲームのフォルダとシステムのフォルダはフォルダが完全に一致するものだけ（その下は`Other`）。
 pub fn place_of(path: &str, game_dir: Option<&str>, system_dirs: &[String]) -> Place {
     let Some(dir) = parent(path).map(normalize) else {
         return Place::Other;
@@ -89,7 +90,7 @@ pub fn place_of(path: &str, game_dir: Option<&str>, system_dirs: &[String]) -> P
     Place::Other
 }
 
-/// 欄を 1 行に収める: 制御文字は空白にし、前後の空白を落とし、長ければ切って「…」を付ける。空なら `無し`。
+/// フィールドを1行に収める。制御文字は空白にして前後の空白を落とす。長ければ切って「…」を付ける。空なら`無し`。
 fn field(v: Option<&str>) -> String {
     let cleaned: String = v
         .unwrap_or("")
@@ -107,7 +108,7 @@ fn field(v: Option<&str>) -> String {
     cleaned.to_string()
 }
 
-/// 本ログの 1 行。`module` が `None` なら d3d8.dll が読み込まれていない。
+/// 本ログの1行。`module`が`None`ならd3d8.dllが読み込まれていない。
 pub fn line(module: Option<&D3d8Module>) -> String {
     let Some(m) = module else {
         return "d3d8.dll: このプロセスには読み込まれていません".to_string();
@@ -248,7 +249,7 @@ mod tests {
         assert!(l.contains("その他のフォルダ"), "{l}");
     }
 
-    /// 取れない欄が空のままだと、読む側が「0 件」と取り違える。
+    /// 取れないフィールドが空のままだと読む側が「0件」と取り違える。
     #[test]
     fn missing_pieces_are_written_as_none() {
         let m = D3d8Module::default();

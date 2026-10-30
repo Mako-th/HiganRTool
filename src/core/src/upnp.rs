@@ -1,12 +1,12 @@
-//! UPnP の IGD（家のルーター）にポートの割り当てを頼むときの、文面の読み書き（pure。通信は dll の `upnp.rs`）。
+//! UPnPのIGD（家のルーター）にポートの割り当てを頼むときの文面の読み書き（pure。通信はdllの`upnp.rs`）。
 //!
-//! 流れ: SSDP の M-SEARCH を LAN へ送る → 返事の LOCATION から機器の記述（XML）を取る → その中の WANIPConnection か
-//! WANPPPConnection の制御 URL へ SOAP を送る（AddPortMapping / GetSpecificPortMappingEntry / DeletePortMapping）。
+//! 流れ: SSDPのM-SEARCHをLANへ送る → 返事のLOCATIONから機器の記述（XML）を取る → その中のWANIPConnectionか
+//! WANPPPConnectionの制御URLへSOAPを送る（AddPortMapping / GetSpecificPortMappingEntry / DeletePortMapping）。
 //! ここは流れの各段階の文面を作り、返事を読むだけ。
 //!
-//! 外へ出さないための守り: 読む URL は `http://IPv4のアドレス[:ポート]/…` だけで、アドレスは LAN の中（private / link-local / loopback）。
-//! 名前は引かない。LOCATION が外のアドレスを指していても、制御 URL が別のアドレスを指していても断る（LAN の機器の返事に
-//! 釣られて外へ送らないため）。
+//! 外へ出さないための守り: 読むURLは`http://IPv4のアドレス[:ポート]/…`だけで、アドレスはLANの中（private / link-local / loopback）。
+//! 名前は解決しない。
+//! LOCATIONが外のアドレスを指していても、制御URLが別のアドレスを指していても断る（LANの機器の返事に釣られて外へ送らないため）。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -14,25 +14,25 @@ use crate::guard;
 
 pub const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 pub const SSDP_PORT: u16 = 1900;
-/// 探す機器の型。実機（MiniUPnPd）は :1 と :2 の両方に答えた。
+/// 探す機器の型。実機（MiniUPnPd）は :1と :2の両方に答えた。
 pub const SEARCH_TARGETS: [&str; 2] = [
     "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
     "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
 ];
 /// 割り当ての説明（ルーターの管理画面に出る）。
 pub const MAPPING_DESCRIPTION: &str = "HiganRTool";
-/// 読む返事の上限（B）。機器の記述は 数 KB。
+/// 読む返事の上限（B）。機器の記述は 数KB。
 pub const MAX_RESPONSE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpnpError {
     /// 文面が読めない（中は理由の固定の語）。
     Malformed(&'static str),
-    /// 読まない・送らない URL（LAN の外・名前・http でない）。
+    /// 読まない・送らないURL（LANの外・名前・httpでない）。
     Refused(&'static str),
-    /// 機器が断った（HTTP の状態と、SOAP の errorCode が読めればその数）。
+    /// 機器が断った（HTTPの状態と、SOAPのerrorCodeが読めればその数）。
     Fault { status: u16, code: Option<u32> },
-    /// 通信の誤り（接続できない・時間切れ。中は OS の誤りの文）。
+    /// 通信の誤り（接続できない・時間切れ。中はOSの誤りの文）。
     Io(String),
 }
 
@@ -53,7 +53,7 @@ impl UpnpError {
         }
     }
 
-    /// 機器の errorCode（断られたときだけ）。
+    /// 機器のerrorCode（断られたときだけ）。
     pub fn fault_code(&self) -> Option<u32> {
         match self {
             UpnpError::Fault { code, .. } => *code,
@@ -64,7 +64,7 @@ impl UpnpError {
 
 /// 外側のポートがほかの割り当てと重なった（別のポートで頼み直せる）。
 pub const FAULT_CONFLICT: u32 = 718;
-/// 指定の割り当てが無い（Get / Delete で、消えているのをチェックするときの答え）。
+/// 指定の割り当てが無い（Get / Deleteで消えているのをチェックするときの答え）。
 pub const FAULT_NO_SUCH_ENTRY: u32 = 714;
 /// 期限なしの割り当てしか受けない（期限つきで頼んだら断られた）。
 pub const FAULT_ONLY_PERMANENT: u32 = 725;
@@ -75,11 +75,11 @@ pub const FAULT_ONLY_PERMANENT: u32 = 725;
 pub struct Url {
     pub host: Ipv4Addr,
     pub port: u16,
-    /// `/` で始まる経路（問いを含む）。
+    /// `/`で始まるパス（クエリを含む）。
     pub path: String,
 }
 
-/// 空白と制御文字（改行を含む）を含む文字列は HTTP の要求行・Host にコピーできない。
+/// 空白と制御文字（改行を含む）を含む文字列はHTTPの要求行・Hostにコピーできない。
 fn check_plain(s: &str) -> Result<(), UpnpError> {
     if s.chars().any(|c| c.is_control() || c == ' ') {
         return Err(UpnpError::Malformed("URL に空白か制御文字がある"));
@@ -88,8 +88,8 @@ fn check_plain(s: &str) -> Result<(), UpnpError> {
 }
 
 impl Url {
-    /// `http://IPv4[:ポート]/道` だけを読む。名前・https・LAN の外のアドレスは断る。
-    /// アドレスは `guard::is_home_v4`（loopback も通す。検査の偽の機器が 127.0.0.1 で待つため。実際の機器の返事の送り手は LAN のアドレス）。
+    /// `http://IPv4[:ポート]/道`だけを読む。名前・https・LANの外のアドレスは断る。
+    /// アドレスは`guard::is_home_v4`（loopbackも通す。検査の偽の機器が127.0.0.1で待つため。実際の機器の返事の送り手はLANのアドレス）。
     pub fn parse(s: &str) -> Result<Url, UpnpError> {
         let s = s.trim();
         let head = s
@@ -128,12 +128,12 @@ impl Url {
         })
     }
 
-    /// `Host` の欄の値。
+    /// `Host`のフィールドの値。
     pub fn host_header(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 
-    /// 相対の指定 `rel`（絶対 URL・`/` で始まる経路・今の経路の隣）をこの URL を基に解く。解いた先のアドレスがこの URL と違えば断る。
+    /// 相対の指定`rel`（絶対URL・`/`で始まるパス・今のパスの隣）をこのURLを基に解く。解いた先のアドレスがこのURLと違えば断る。
     pub fn join(&self, rel: &str) -> Result<Url, UpnpError> {
         let rel = decode_entities(rel.trim());
         let url = if rel
@@ -167,7 +167,7 @@ impl Url {
 
 // ---------------- SSDP ----------------
 
-/// M-SEARCH の本文。`MX` は 1 秒（返事は 0〜MX 秒のうちのどこかで来る）。
+/// M-SEARCHの本文。`MX`は1秒（返事は0〜MX秒のうちのどこかで来る）。
 pub fn search_request(target: &str) -> Vec<u8> {
     format!(
         "M-SEARCH * HTTP/1.1\r\nHOST: {SSDP_ADDR}:{SSDP_PORT}\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {target}\r\n\r\n"
@@ -175,7 +175,7 @@ pub fn search_request(target: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// M-SEARCH への返事 1 通から機器の記述の URL を読む。`HTTP/1.1 200` で、LOCATION が LAN の中の IPv4 の http だけ通す。
+/// M-SEARCHへの返事1通から機器の記述のURLを読む。`HTTP/1.1 200`でLOCATIONがLANの中のIPv4のhttpのものだけ通す。
 pub fn parse_search_reply(bytes: &[u8]) -> Result<Url, UpnpError> {
     let text = std::str::from_utf8(bytes).map_err(|_| UpnpError::Malformed("UTF-8 でない"))?;
     let mut lines = text.split("\r\n");
@@ -193,8 +193,8 @@ pub fn parse_search_reply(bytes: &[u8]) -> Result<Url, UpnpError> {
     Err(UpnpError::Malformed("LOCATION が無い"))
 }
 
-/// `parse_search_reply` に、返事の送り手 `from` と LOCATION のアドレスが同じという条件を足したもの。違う返事は、別の機器へ
-/// 誘導する形なので使わない。
+/// `parse_search_reply`に返事の送信元`from`とLOCATIONのアドレスが同じという条件を足したもの。
+/// 違う返事は別の機器へ誘導する形なので使わない。
 pub fn parse_search_reply_from(bytes: &[u8], from: IpAddr) -> Result<Url, UpnpError> {
     let url = parse_search_reply(bytes)?;
     if from != IpAddr::V4(url.host) {
@@ -213,7 +213,7 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// GET の本文。
+/// GETの本文。
 pub fn get_request(url: &Url) -> Vec<u8> {
     format!(
         "GET {} HTTP/1.1\r\nHOST: {}\r\nConnection: close\r\n\r\n",
@@ -251,7 +251,7 @@ fn decode_chunked(mut b: &[u8]) -> Result<Vec<u8>, UpnpError> {
     }
 }
 
-/// HTTP の返事を読む（接続を閉じるまで読んだ全部）。chunked と Content-Length に従う。本文が足りなければ断る。
+/// HTTPの返事を読む（接続を閉じるまで読んだ全部）。chunkedとContent-Lengthに従う。本文が足りなければ断る。
 pub fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, UpnpError> {
     if bytes.len() > MAX_RESPONSE + 4096 {
         return Err(UpnpError::Malformed("返事が大きすぎる"));
@@ -303,7 +303,7 @@ pub fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, UpnpError> {
     })
 }
 
-// ---------------- XML（必要な欄だけを読む） ----------------
+// ---------------- XML（必要なフィールドだけを読む） ----------------
 
 fn decode_entities(s: &str) -> String {
     s.replace("&lt;", "<")
@@ -319,7 +319,7 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// `<tag>…</tag>` の最初の 1 つの中身と、その後ろの残り。
+/// `<tag>…</tag>`の最初の1つの中身と、その後ろの残り。
 fn element<'a>(s: &'a str, tag: &str) -> Option<(&'a str, &'a str)> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -336,13 +336,13 @@ fn text_of(s: &str, tag: &str) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
-    /// `urn:schemas-upnp-org:service:WANIPConnection:1` など（SOAP の名前空間と SOAPACTION に使う）。
+    /// `urn:schemas-upnp-org:service:WANIPConnection:1`など（SOAPの名前空間とSOAPACTIONに使う）。
     pub service_type: String,
     pub control: Url,
 }
 
-/// 機器の記述（XML）から WAN の接続のサービスを選ぶ。WANIPConnection を先に、無ければ WANPPPConnection。
-/// 制御 URL は `<URLBase>`（あれば）か記述の URL `location` を基に解く。
+/// 機器の記述（XML）からWANの接続のサービスを選ぶ。WANIPConnectionを先に、無ければWANPPPConnection。
+/// 制御URLは`<URLBase>`（あれば）か記述のURL `location`を基に解く。
 pub fn find_wan_service(xml: &str, location: &Url) -> Result<Service, UpnpError> {
     let base = match text_of(xml, "URLBase") {
         Some(b) if !b.is_empty() => Url::parse(&b)?,
@@ -381,7 +381,7 @@ pub fn find_wan_service(xml: &str, location: &Url) -> Result<Service, UpnpError>
 
 // ---------------- SOAP ----------------
 
-/// SOAP の POST 1 本（本文込み）。`args` は引数の名前と値（仕様の順で渡す）。
+/// SOAPのPOST 1本（本文込み）。`args`は引数の名前と値（仕様の順で渡す）。
 pub fn soap_request(service: &Service, action: &str, args: &[(&str, String)]) -> Vec<u8> {
     let mut inner = String::new();
     for (k, v) in args {
@@ -401,7 +401,7 @@ pub fn soap_request(service: &Service, action: &str, args: &[(&str, String)]) ->
     .into_bytes()
 }
 
-/// AddPortMapping の引数（UDP。外側と内側のポートは同じ値で頼む機器が多い）。`lease_secs` が 0 なら期限なし。
+/// AddPortMappingの引数（UDP。外側と内側のポートは同じ値で頼む機器が多い）。`lease_secs`が0なら期限なし。
 pub fn add_mapping_args(
     external: u16,
     internal: u16,
@@ -420,7 +420,7 @@ pub fn add_mapping_args(
     ]
 }
 
-/// GetSpecificPortMappingEntry / DeletePortMapping の引数。
+/// GetSpecificPortMappingEntry / DeletePortMappingの引数。
 pub fn mapping_key_args(external: u16) -> Vec<(&'static str, String)> {
     vec![
         ("NewRemoteHost", String::new()),
@@ -429,7 +429,7 @@ pub fn mapping_key_args(external: u16) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// SOAP の返事の判定。状態 200 で errorCode が無ければ本文を返す。それ以外は `Fault`（errorCode が読めればその数）。
+/// SOAPの返事の判定。状態200でerrorCodeが無ければ本文を返す。それ以外は`Fault`（errorCodeが読めればその数）。
 pub fn soap_result(r: &HttpResponse) -> Result<&str, UpnpError> {
     let code = text_of(&r.body, "errorCode").and_then(|c| c.trim().parse::<u32>().ok());
     if r.status == 200 && !r.body.contains("<errorCode>") {
@@ -441,27 +441,27 @@ pub fn soap_result(r: &HttpResponse) -> Result<&str, UpnpError> {
     })
 }
 
-/// GetExternalIPAddress の答えから、ルーターの外側のアドレスを読む。
+/// GetExternalIPAddressの答えから、ルーターの外側のアドレスを読む。
 pub fn parse_external_ip(body: &str) -> Result<Ipv4Addr, UpnpError> {
     text_of(body, "NewExternalIPAddress")
         .and_then(|t| t.trim().parse().ok())
         .ok_or(UpnpError::Malformed("NewExternalIPAddress が読めない"))
 }
 
-/// ルーターの外側のアドレスと、STUN で見えた自分のアドレスの突き合わせの結果。
+/// ルーターの外側のアドレスと、STUNで見えた自分のアドレスの突き合わせの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OuterCheck {
-    /// 同じで、世界に通じるアドレス。割り当てたポートは外から届く。
+    /// ルーターの外側のアドレスと自分のアドレスが同じ（世界に通じるアドレス）。割り当てたポートは外から届く。
     Match,
-    /// STUN で見えた IPv4 のアドレスが無い（突き合わせる相手が無い）。
+    /// STUNで見えたIPv4のアドレスが無い（突き合わせる相手が無い）。
     NoStun,
     /// ルーターが外側のアドレスを答えなかった。
     Unknown,
-    /// 違う、または世界に通じないアドレス。ルーターの外側にさらに NAT がある（二重 NAT・DS-Lite など）見込み。
+    /// 違う、または世界に通じないアドレス。ルーターの外側にさらにNATがある（二重NAT・DS-Liteなど）見込み。
     Behind,
 }
 
-/// UPnP で割り当てたポートが外から届くかの見立て。同じアドレスが STUN にも見えていて、それが世界に通じるアドレスのときだけ `Match`。
+/// UPnPで割り当てたポートが外から届くかの見立て。同じアドレスがSTUNにも見えていて、それが世界に通じるアドレスのときだけ`Match`。
 pub fn check_outer(stun: Option<SocketAddr>, router: Option<Ipv4Addr>) -> OuterCheck {
     let Some(SocketAddr::V4(stun)) = stun else {
         return OuterCheck::NoStun;
@@ -476,7 +476,7 @@ pub fn check_outer(stun: Option<SocketAddr>, router: Option<Ipv4Addr>) -> OuterC
     }
 }
 
-/// GetSpecificPortMappingEntry の答え。
+/// GetSpecificPortMappingEntryの答え。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub internal_port: u16,
@@ -484,7 +484,7 @@ pub struct Entry {
     pub enabled: bool,
     /// 割り当ての説明（無ければ空）。
     pub description: String,
-    /// 残りの期限（秒。0 は期限なし）。
+    /// 残りの期限（秒。0は期限なし）。
     pub lease_secs: u32,
 }
 
@@ -642,7 +642,7 @@ mod tests {
         ] {
             assert!(base.join(rel).is_err(), "{rel:?}");
         }
-        // 前後の空白は取る（機器の記述の XML の改行・インデント）。
+        // 前後の空白は取る（機器の記述のXMLの改行・インデント）。
         assert_eq!(base.join("\n  /ctl/IPConn\n").unwrap().path, "/ctl/IPConn");
     }
 
@@ -656,10 +656,10 @@ mod tests {
                 .host,
             Ipv4Addr::new(192, 168, 0, 1)
         );
-        // 同じ LAN の別の機器が、ルーターを指す返事を送ってきた形
+        // 同じLANの別の機器がルーターを指す返事を送ってきた形
         assert!(parse_search_reply_from(&ok, ip("192.168.0.50")).is_err());
         assert!(parse_search_reply_from(&ok, IpAddr::V6("fe80::1".parse().unwrap())).is_err());
-        // 送り手が合っても、中身が使えない返事は断る
+        // 送り手が合っても中身が使えない返事は断る
         let bad = reply(&["HTTP/1.1 200 OK", "LOCATION: http://203.0.113.9/d.xml"]);
         assert!(parse_search_reply_from(&bad, ip("203.0.113.9")).is_err());
     }
@@ -690,7 +690,7 @@ mod tests {
             check_outer(v4("8.8.4.4:50000"), ip("8.8.4.4")),
             OuterCheck::Match
         );
-        // 違うアドレス: ルーターの外側にさらに NAT
+        // 違うアドレス: ルーターの外側にさらにNAT
         assert_eq!(
             check_outer(v4("8.8.4.4:50000"), ip("8.8.8.8")),
             OuterCheck::Behind
@@ -763,7 +763,7 @@ mod tests {
         }
     }
 
-    /// 実機（MiniUPnPd）の記述の形に合わせた合成の XML（入れ子の機器に WANIPConnection が 1 つ・WANPPPConnection が 1 つ）。
+    /// 実機（MiniUPnPd）の記述の形に合わせた合成のXML（入れ子の機器にWANIPConnectionが1つ・WANPPPConnectionが1つ）。
     fn description(base: &str) -> String {
         format!(
             "<?xml version=\"1.0\"?>\n<root xmlns=\"urn:schemas-upnp-org:device-1-0\">{base}<device><deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType><serviceList><service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType><controlURL>/ctl/L3F</controlURL></service></serviceList><deviceList><device><deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType><deviceList><device><deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:1</deviceType><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</serviceType><controlURL>/ctl/PPP</controlURL></service><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType><controlURL>/ctl/IPConn</controlURL></service></serviceList></device></deviceList></device></deviceList></device></root>"
@@ -799,7 +799,7 @@ mod tests {
         assert!(find_wan_service(none, &loc()).is_err());
         assert!(find_wan_service("", &loc()).is_err());
         assert!(find_wan_service("<root><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>", &loc()).is_err());
-        // URLBase / 制御 URL が機器と別のアドレス
+        // URLBase / 制御URLが機器と別のアドレス
         let other_base = description("<URLBase>http://192.168.0.9:5000/</URLBase>");
         assert!(find_wan_service(&other_base, &loc()).is_err());
         let abs = "<root><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>http://192.168.0.9:5000/c</controlURL></service></root>";
@@ -899,9 +899,9 @@ mod tests {
             soap_result(&fault(500, "725")).unwrap_err().fault_code(),
             Some(FAULT_ONLY_PERMANENT)
         );
-        // 状態 200 でも errorCode が入っていれば断りとして扱う。
+        // 状態200でもerrorCodeが入っていれば断りとして扱う。
         assert!(soap_result(&fault(200, "501")).is_err());
-        // 数でない errorCode・本文なし・HTML の断り
+        // 数でないerrorCode・本文なし・HTMLの断り
         for r in [
             fault(500, "abc"),
             HttpResponse {

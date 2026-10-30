@@ -1,12 +1,12 @@
-//! 候補に無い送り元を学ぶ経路（NAT 越えの対策。ルーターが外側のポートを付け替えた相手に接続する）の検査。
-//! 公開の API（`Link` と `PongResponder`）だけを使う。
+//! 候補に無い送り元を学ぶ経路（NAT越えの対策。ルーターが外側のポートを付け替えた相手に接続する）の検査。
+//! 公開のAPI（`Link`と`PongResponder`）だけを使う。
 //!
-//! 前半は 1 つの `Link`（A。ゲスト側の nonce 1）に、相手 B のつもりの 1 通ずつを手で渡して、学ぶ・学ばないのゲートを 1 つずつ見る。
-//! 後半は 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型。core は pure なので実際の UDP・時計は使わない）で接続し、
-//! 組み上がりで接続することを見る。
+//! 前半は1つの`Link`（A。ゲスト側のnonce 1）に相手Bのつもりの1通ずつを手で渡し、学ぶ・学ばないのゲートを1つずつ見る。
+//! 後半は2つの`Link`を偽のネットワーク（1 msごとに進む固定の模型。coreはpureなので実際のUDP・時計は使わない）で接続する。
+//! 組み上がりで接続できることを見る。
 //!
-//! アドレス: `B_CODE` は A が持つ接続コードの中の B のアドレス（候補）。`B_REAL` は B のルーターが付け替えた実際の送り元（コードに無い）。
-//! `A_ADDR` は A のアドレス（B のコードの中の A の候補と実際が同じ）。
+//! アドレス: `B_CODE`はAが持つ接続コードの中のBのアドレス（候補）。`B_REAL`はBのルーターが付け替えた実際の送り元（コードに無い）。
+//! `A_ADDR`はAのアドレス（Bのコードの中のAの候補と実際が同じ）。
 
 use std::net::SocketAddr;
 
@@ -49,7 +49,7 @@ fn hs_cfg(nonce: u64) -> handshake::Config {
     }
 }
 
-/// 相手の候補が `peer` だけのセッション。使い捨ての鍵の種は nonce から決める（本物は dll が OS の乱数で引く）。
+/// 相手の候補が`peer`だけのセッション。使い捨ての鍵の種はnonceから決める（本物はdllがOSの乱数で生成する）。
 fn link(peer: SocketAddr, nonce: u64) -> Link {
     Link::new(
         Config::single(hs_cfg(nonce), SECRET, peer, seed_of(nonce)),
@@ -65,7 +65,7 @@ fn public_of(nonce: u64) -> [u8; PUBLIC_LEN] {
     Ephemeral::from_seed(&seed_of(nonce)).public()
 }
 
-/// 相手 B（nonce 2）の側から見た向きごとの鍵（送る = B → A、受ける = A → B）。A は nonce 1（B の方が大きいので、並びは B が前）。
+/// 相手B（nonce 2）の側から見た向きごとの鍵（送る = B → A、受ける = A → B）。Aはnonce 1（Bの方が大きいので並びはBが前）。
 fn b_keys() -> DirKeys {
     b_keys_for(1)
 }
@@ -86,7 +86,7 @@ fn enc_with(key: &AuthKey, sid: u32, msg: &Message) -> Vec<u8> {
     buf[..n].to_vec()
 }
 
-/// B（nonce 2）が A へ送る 1 通（HELLO・HELLO_ACK は HMAC のタグ、ほかは B の鍵で封じる）。
+/// B（nonce 2）がAへ送る1通（HELLO・HELLO_ACKはHMACのタグ、ほかはBの鍵で封じる）。
 fn enc(msg: &Message) -> Vec<u8> {
     if wire::is_signed(msg) {
         return enc_with(&key(), SID, msg);
@@ -103,7 +103,7 @@ fn enc(msg: &Message) -> Vec<u8> {
     buf[..n].to_vec()
 }
 
-/// A が B へ送った 1 通を読む（B の受ける向きの鍵で開く。A の nonce は 1・3・9 のどれか）。
+/// AがBへ送った1通を読む（Bの受ける向きの鍵で開く。Aのnonceは1・3・9のどれか）。
 fn dec(b: &[u8]) -> Result<wire::Packet, wire::DecodeError> {
     let mut last = wire::decode(&key(), None, b);
     if last != Err(wire::DecodeError::NotKeyed) {
@@ -140,11 +140,18 @@ fn hello(nonce: u64) -> Message {
     })
 }
 
+/// `role`の相手がnonce `echo`のHELLO（公開鍵は`public_of(echo)`）へ返すHELLO_ACK。
 fn ack(echo: u64, role: u64) -> Message {
+    ack_to_key(echo, role, public_of(echo))
+}
+
+/// `echo_public`を指定する形（前のセッションの公開鍵への返答を作る）。
+fn ack_to_key(echo: u64, role: u64, echo_public: [u8; PUBLIC_LEN]) -> Message {
     Message::HelloAck {
         echo_nonce: echo,
         role_nonce: role,
         public: public_of(role),
+        echo_public,
     }
 }
 
@@ -188,7 +195,7 @@ fn is_hello(m: &Message) -> bool {
 }
 
 #[test]
-fn a_hello_with_a_good_tag_from_an_unlisted_source_is_learned_and_answered() {
+fn a_hello_from_an_unlisted_source_is_answered_once_and_learned_only_from_a_current_ack() {
     let mut a = link(B_CODE, 1);
     let mut q = Q::default();
     a.poll(1, &mut q);
@@ -198,62 +205,76 @@ fn a_hello_with_a_good_tag_from_an_unlisted_source_is_learned_and_answered() {
     let r = a.on_datagram(B_REAL, &enc(&hello(2)), 2, &mut q);
     assert_eq!(r, Recv::Nothing);
     let c = a.recv_counts();
-    assert_eq!((c.learned, c.learn_refused, c.foreign), (1, 0, 0), "{c:?}");
-    assert_eq!(c.last_foreign, None, "学んだものは捨てていない");
+    assert_eq!((c.learned, c.learn_refused, c.foreign), (0, 0, 0), "{c:?}");
     let reply = q.take();
     assert_eq!(
-        dests(&reply, |m| matches!(
-            m,
-            Message::HelloAck { echo_nonce: 2, .. }
-        )),
-        [B_REAL],
+        dests(&reply, is_hello)
+            .iter()
+            .filter(|d| **d == B_REAL)
+            .count(),
+        1,
         "{reply:?}"
     );
+    assert!(
+        dests(&reply, |m| matches!(m, Message::HelloAck { .. })).is_empty(),
+        "学んでいない送り元へ HELLO_ACK を返した: {reply:?}"
+    );
+    assert_eq!(a.hello_sent_unlisted(), 1);
 
-    let sent_before: u32 = a.hello_sent().iter().sum();
-    let learned_before = a.hello_sent_learned();
     for t in 3..=60 {
         a.poll(t, &mut q);
     }
-    let later = q.take();
-    let to_code = dests(&later, is_hello)
-        .iter()
-        .filter(|d| **d == B_CODE)
-        .count();
-    let to_real = dests(&later, is_hello)
-        .iter()
-        .filter(|d| **d == B_REAL)
-        .count();
-    assert!(to_code > 0 && to_real > 0, "{later:?}");
-    assert_eq!(to_code, to_real, "全部の候補へ同じ回数ずつ送る");
-    assert_eq!(
-        a.hello_sent().iter().sum::<u32>() - sent_before,
-        to_code as u32
+    let to = dests(&q.take(), is_hello);
+    assert!(
+        !to.is_empty() && to.iter().all(|d| *d == B_CODE),
+        "学んでいない送り元へ送り続けた: {to:?}"
     );
-    assert_eq!(a.hello_sent_learned() - learned_before, to_real as u32);
+    assert_eq!(a.hello_sent_learned(), 0);
 
-    a.on_datagram(B_REAL, &enc(&hello(2)), 61, &mut q);
+    a.on_datagram(B_REAL, &enc(&ack(1, 2)), 61, &mut q);
     let c = a.recv_counts();
     assert_eq!((c.learned, c.foreign), (1, 0), "{c:?}");
+    assert_eq!(a.path(), Some(B_REAL));
+    q.take();
+    a.on_datagram(B_REAL, &enc(&hello(2)), 62, &mut q);
+    assert_eq!(
+        dests(&q.take(), |m| matches!(
+            m,
+            Message::HelloAck { echo_nonce: 2, .. }
+        )),
+        [B_REAL]
+    );
 }
 
-/// 自分の HELLO への返し（echo が自分の nonce）でない HELLO_ACK は経路を決めない（`heard_back` の条件は変えない）。
+/// 今のセッションの自分のHELLOへの返答でないHELLO_ACK（echoが自分のnonceでない・自分の今の公開鍵でない）は、経路を決めず学ばない。
+/// そのときHELLOも止めない。
 #[test]
-fn a_hello_ack_from_an_unlisted_source_decides_the_path_there() {
+fn only_a_current_hello_ack_from_an_unlisted_source_decides_the_path_there() {
     let mut a = link(B_CODE, 1);
     let mut q = Q::default();
     a.poll(1, &mut q);
     q.take();
     a.on_datagram(sa(41_103), &enc(&ack(77, 2)), 2, &mut q);
+    a.on_datagram(sa(41_104), &enc(&ack_to_key(1, 2, public_of(5))), 2, &mut q);
+    a.on_datagram(B_CODE, &enc(&ack_to_key(1, 2, public_of(5))), 2, &mut q);
     assert_eq!(a.path(), None);
     assert!(!a.path_is_learned());
-    a.on_datagram(B_REAL, &enc(&ack(1, 2)), 3, &mut q);
+    let c = a.recv_counts();
+    assert_eq!((c.learned, c.foreign), (0, 2), "{c:?}");
+    assert_eq!(a.handshake_counters().wrong_echo, 1, "候補からの古い返し");
+    a.poll(25, &mut q);
+    assert_eq!(
+        dests(&q.take(), is_hello),
+        [B_CODE],
+        "古い返しで HELLO を止めた"
+    );
+    a.on_datagram(B_REAL, &enc(&ack(1, 2)), 30, &mut q);
     assert_eq!(a.path(), Some(B_REAL));
     assert!(a.path_is_learned());
-    assert_eq!(a.recv_counts().learned, 2);
-    // 経路が決まった後の HELLO は経路へだけ（空でもよい。コードのアドレス・別の学んだアドレスへ送り続けないことを見る）。
+    assert_eq!(a.recv_counts().learned, 1);
+    // 経路が決まった後のHELLOは経路へだけ（空でもよい。コードのアドレス・別の学んだアドレスへ送り続けないことを見る）。
     q.take();
-    for t in 4..=80 {
+    for t in 31..=100 {
         a.poll(t, &mut q);
     }
     let sent = q.take();
@@ -266,8 +287,10 @@ fn an_agree_from_an_unlisted_source_decides_the_path_there() {
     let mut a = link(B_CODE, 1);
     let mut q = Q::default();
     a.poll(1, &mut q);
-    // HELLO_ACK は経路を決めてしまうので渡さない。
-    a.on_datagram(B_CODE, &enc(&hello(2)), 2, &mut q);
+    // HELLO_ACKは渡さない。渡すと経路が決まってしまう。
+    // HELLOもコードの候補から届くと学んだ送り元に経路を決めない。
+    // そこでルーターがポートを付け替えた相手と同じく、AGREEと同じ送り元から渡す。
+    a.on_datagram(B_REAL, &enc(&hello(2)), 2, &mut q);
     assert_eq!(a.path(), None);
     a.on_datagram(B_REAL, &enc(&agree()), 3, &mut q);
     assert_eq!(a.recv_counts().learned, 1, "{:?}", a.recv_counts());
@@ -280,12 +303,15 @@ fn an_agree_from_an_unlisted_source_decides_the_path_there() {
     );
 }
 
-/// 学ぶゲートの 1 つずつ。各行は「この 1 つだけが違う」標本: タグの誤り・別の秘密・別の session・バージョン違い（タグは合う）・手順の外の型・
-/// 自分の跳ね返り・STUN・でたらめは学ばず、「候補に無い送り元」として数えて捨てる。隣に、同じ送り元からの正しい HELLO は学ぶことを見る対照を並べる。
+/// 学ぶゲートを1つずつ見る。各行は「この1つだけが違う」サンプル。
+/// 違いは次のとおり: タグの誤り・別の秘密の乱数・別のsession・バージョン違い（タグは合う）・手順の外の型・自分の跳ね返り・今の公開鍵への返答でないHELLO_ACK・STUN・でたらめ。
+/// これらは学ばず「候補に無い送り元」として数えて捨てる。
+/// 隣に、同じ送り元からの今のセッションのHELLO_ACKは学ぶことを見る対照を並べる。
 #[test]
 fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
     let from = B_REAL;
     let good = enc(&hello(2));
+    let good_ack = enc(&ack(1, 2));
     let mut flip_body = good.clone();
     flip_body[HEADER_LEN + 4] ^= 0x10;
     let mut flip_tag = good.clone();
@@ -329,6 +355,10 @@ fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
         ("自分の HELLO の跳ね返り", enc(&hello(1))),
         ("自分の HELLO_ACK の跳ね返り", enc(&ack(2, 1))),
         (
+            "自分の今の公開鍵への返しでない HELLO_ACK",
+            enc(&ack_to_key(1, 2, public_of(5))),
+        ),
+        (
             "STUN",
             higanr_core::stun::encode_binding_request([1; 12]).to_vec(),
         ),
@@ -349,14 +379,14 @@ fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
         assert_eq!(r, Recv::Nothing, "{what}");
         let c = a.recv_counts();
         assert_eq!(c.learned, 0, "{what}: 学んだ（{c:?}）");
-        // STUN・でたらめ（HGRT で始まらない）は受信側の手前のゲートで数えが別（`stun` / `decode_errors`）。
+        // STUN・でたらめ（HGRTで始まらない）は受信側の手前のゲートで別に数える（`stun` / `decode_errors`）。
         if !matches!(*what, "STUN" | "でたらめ") {
             foreign_expected += 1;
             assert_eq!(c.foreign, foreign_expected, "{what}: {c:?}");
         }
         assert!(q.0.is_empty(), "{what}: 捨てたものに返した {:?}", q.take());
     }
-    // タグの合うバージョン違いは止めずに数える。ほかの毒はバージョン違いに数えない。
+    // タグの合うバージョン違いは止めずに数える。ほかの不正な入力はバージョン違いに数えない。
     assert_eq!(a.recv_counts().other_version, 1, "{:?}", a.recv_counts());
     assert_eq!(a.handshake_state(), State::Connecting);
     assert!(
@@ -377,6 +407,8 @@ fn only_a_well_formed_handshake_packet_with_a_good_tag_is_learned() {
     assert_eq!(a.hello_sent_learned(), 0);
 
     a.on_datagram(from, &good, 61, &mut q);
+    assert_eq!(a.recv_counts().learned, 0, "HELLO で学んだ");
+    a.on_datagram(from, &good_ack, 62, &mut q);
     assert_eq!(a.recv_counts().learned, 1);
 }
 
@@ -403,15 +435,18 @@ fn nothing_new_is_learned_after_connecting() {
 #[test]
 fn learning_stops_at_the_cap_and_counts_the_refusals() {
     let mut a = link(B_CODE, 1);
+    a.set_retry_window(60_000);
     let mut q = Q::default();
     a.poll(1, &mut q);
+    // 相手のHELLOはコードの候補でない送り元から（コードの候補から届くと、学んだ送り元には経路を決めない）。
+    a.on_datagram(B_REAL, &enc(&hello(2)), 2, &mut q);
     q.take();
     let extra = 2usize;
     let ports: Vec<u16> = (0..(MAX_LEARNED + extra) as u16)
         .map(|i| 41_200 + i)
         .collect();
     for (i, p) in ports.iter().enumerate() {
-        a.on_datagram(sa(*p), &enc(&hello(2)), 2 + i as u32, &mut q);
+        a.on_datagram(sa(*p), &enc(&ack(1, 2)), 3 + i as u32, &mut q);
     }
     let c = a.recv_counts();
     assert_eq!(c.learned, MAX_LEARNED as u64, "{c:?}");
@@ -421,17 +456,20 @@ fn learning_stops_at_the_cap_and_counts_the_refusals() {
         "断ったものは候補に無い送り元として数える: {c:?}"
     );
     assert_eq!(c.last_foreign, ports.last().map(|p| sa(*p)));
-    let replies = q.take();
-    let ack_to = dests(&replies, |m| matches!(m, Message::HelloAck { .. }));
     let want: Vec<SocketAddr> = ports[..MAX_LEARNED].iter().map(|p| sa(*p)).collect();
-    assert!(ack_to.iter().all(|d| want.contains(d)), "{replies:?}");
-    a.on_datagram(sa(ports[0]), &enc(&hello(2)), 30, &mut q);
+    assert_eq!(a.path(), Some(want[0]));
+    a.on_datagram(sa(ports[0]), &enc(&ack(1, 2)), 30, &mut q);
     let c2 = a.recv_counts();
     assert_eq!((c2.learned, c2.foreign), (c.learned, c.foreign));
-    q.take();
-    for t in 31..=60 {
+    // 作り直し（引き継ぐ形）で経路の選択を戻すとHELLOはコードの候補と学んだ送り元の全部へ出る。
+    for t in (31..=10_100).step_by(4) {
         a.poll(t, &mut q);
     }
+    assert_eq!(
+        a.restarts().last.map(|(_, k)| k),
+        Some(handshake::Restart::Resume),
+        "引き継ぐ作り直しになっていない（この検査の前提）"
+    );
     let sent = q.take();
     let to = dests(&sent, is_hello);
     for p in &ports[MAX_LEARNED..] {
@@ -479,13 +517,14 @@ fn a_fresh_restart_forgets_what_was_learned_and_a_resume_keeps_it() {
         "作り直しの後も学んだアドレスへ送った: {to:?}"
     );
     let l0 = a.recv_counts().learned;
-    a.on_datagram(sa(41_160), &enc(&hello(2)), 11_101, &mut q);
+    a.on_datagram(sa(41_160), &enc(&ack(1, 2)), 11_101, &mut q);
     assert_eq!(a.recv_counts().learned, l0 + 1);
 
     let mut b = link(B_CODE, 1);
     b.set_retry_window(60_000);
     b.poll(1, &mut q);
-    b.on_datagram(B_REAL, &enc(&hello(2)), 2, &mut q);
+    b.on_datagram(B_CODE, &enc(&hello(2)), 2, &mut q);
+    b.on_datagram(B_REAL, &enc(&ack(1, 2)), 2, &mut q);
     q.take();
     for t in (3..=11_000).step_by(4) {
         b.poll(t, &mut q);
@@ -549,7 +588,7 @@ fn a_resume_forgets_a_learned_path_but_keeps_the_learned_list() {
     );
 }
 
-/// 上の検査はゲストの側で AGREE を送らないので、AGREE の宛先は見ていない。ここはホストの側。
+/// 上の検査はゲストの側でAGREEを送らないのでAGREEの宛先は見ていない。ここはホストの側。
 #[test]
 fn a_resume_on_the_host_side_sends_agree_to_the_new_port_not_the_dead_learned_one() {
     let mut a = link(B_CODE, 3);
@@ -613,7 +652,7 @@ fn the_pong_responder_answers_pings_from_a_learned_address() {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Route {
     Straight,
-    /// B のルーターが外側のポートを付け替えた（B → A の送り元は `B_REAL`。コードの `B_CODE` へ送ると捨てられる）。
+    /// Bのルーターが外側のポートを付け替えた（B → Aの送り元は`B_REAL`。コードの`B_CODE`へ送ると捨てられる）。
     PeerBehindMovedPort,
 }
 
@@ -624,8 +663,11 @@ struct Net {
     qb: Q,
     now: u32,
     route: Route,
-    /// ネットワークが捨てた通数（コードのアドレス `B_CODE` 宛て）。対照の実験で「捨てられていた」ことを見せる。
+    /// ネットワークが捨てた通数（コードのアドレス`B_CODE`宛て）。対照の実験で「捨てられていた」ことを見せる。
     dropped_to_stale: u32,
+    /// B → Aを全部捨てる（片方向の途絶）。捨てた便は`cut_log`に残す（盗み見た人が持つ写し）。
+    cut_b_to_a: bool,
+    cut_log: Vec<Vec<u8>>,
 }
 
 impl Net {
@@ -638,6 +680,8 @@ impl Net {
             now: 0,
             route,
             dropped_to_stale: 0,
+            cut_b_to_a: false,
+            cut_log: Vec::new(),
         }
     }
 
@@ -661,7 +705,9 @@ impl Net {
                 }
             }
             for (to, bytes) in from_b {
-                if to == A_ADDR {
+                if to == A_ADDR && self.cut_b_to_a {
+                    self.cut_log.push(bytes);
+                } else if to == A_ADDR {
                     let src = if self.route == Route::Straight {
                         B_CODE
                     } else {
@@ -686,9 +732,10 @@ impl Net {
     }
 }
 
-/// 組み上がり: A の候補が全部外れても（コードのアドレスへ送っても届かない）、どちらの役割でも HELLO・HELLO_ACK・AGREE の全部が
-/// 学んだアドレスから来る形で接続し、経路が学んだアドレスになり、PONG で RTT が測れる。
-/// 対照: 「候補に無い送り元を捨てる」ゲートをネットワーク側に入れると接続できない（セッションの側の変異は変異検査で見る）。
+/// 組み上がり: Aの候補が全部外れても（コードのアドレスへ送っても届かない）どちらの役割でも接続できる。
+/// そのときHELLO・HELLO_ACK・AGREEの全部が学んだアドレスから来る。
+/// 経路は学んだアドレスになり、PONGでRTTが測れる。
+/// 対照: 「候補に無い送り元を捨てる」ゲートをネットワーク側に追加すると接続できない（セッションの側の変異は変異検査で見る）。
 #[test]
 fn two_links_connect_when_one_side_candidates_are_all_wrong() {
     for (a_nonce, b_nonce) in [(1u64, 2u64), (9, 2)] {
@@ -738,7 +785,7 @@ fn two_links_connect_when_one_side_candidates_are_all_wrong() {
     assert!(old.refused_by_gate > 0, "A へ 1 通も着いていない");
 }
 
-/// `Route::PeerBehindMovedPort` のネットワークで、A の受信側の手前に「候補に無い送り元は捨てる」ゲートを入れた対照。セッションは学べない。
+/// `Route::PeerBehindMovedPort`のネットワークでAの受信側の手前に「候補に無い送り元は捨てる」ゲートを追加した対照。セッションは学べない。
 struct OldGate {
     a: Link,
     b: Link,
@@ -780,4 +827,403 @@ impl OldGate {
             }
         }
     }
+}
+
+fn hello_keyed(nonce: u64, public: [u8; PUBLIC_LEN]) -> Message {
+    let Message::Hello(mut h) = hello(nonce) else {
+        unreachable!("HELLO を作った");
+    };
+    h.public = public;
+    Message::Hello(h)
+}
+
+/// 盗み見た前のセッションのHELLO（Bがメニューを開き直す前のnonce 7か同じnonceの古い公開鍵）を送り元を偽って何度再送しても、Aは今のBと接続する。
+/// Aの時間切れの作り直しは待たない。
+#[test]
+fn replayed_hellos_of_an_earlier_session_do_not_keep_the_live_peer_out() {
+    let other_nonce = enc(&hello(7));
+    let old_key = enc(&hello_keyed(2, public_of(9)));
+    let elsewhere = sa(41_777);
+    for (what, stale, from, first) in [
+        (
+            "別の nonce・候補のアドレス・先に",
+            &other_nonce,
+            B_CODE,
+            true,
+        ),
+        (
+            "別の nonce・候補に無いアドレス・先に",
+            &other_nonce,
+            elsewhere,
+            true,
+        ),
+        (
+            "同じ nonce の古い鍵・候補のアドレス・後に",
+            &old_key,
+            B_CODE,
+            false,
+        ),
+        (
+            "同じ nonce の古い鍵・候補に無いアドレス・後に",
+            &old_key,
+            elsewhere,
+            false,
+        ),
+    ] {
+        let mut net = Net::new(1, 2, Route::Straight);
+        if first {
+            net.a.on_datagram(from, stale, 0, &mut net.qa);
+        }
+        let mut at = None;
+        for t in 1..2_000u32 {
+            if t % 3 == 0 {
+                net.a.on_datagram(from, stale, net.now, &mut net.qa);
+            }
+            net.step();
+            if net.a.connected().is_some() && net.b.connected().is_some() {
+                at = Some(t);
+                break;
+            }
+        }
+        assert!(
+            at.is_some_and(|ms| ms < 500),
+            "{what}: 接続しない（{at:?} ms・A {:?}・{:?}）",
+            net.a.handshake_state(),
+            net.a.handshake_counters()
+        );
+        let c = net.a.recv_counts();
+        assert_eq!(c.learned, 0, "{what}: 偽の送り元を学んだ {c:?}");
+    }
+}
+
+/// 次の場合でもAは時間切れを待たずに接続する。
+/// Bの今のセッションのHELLO_ACKだけがAへ届き（BのHELLOは落ちた）、その直後にBが取りやめて同じコードを貼り直した（同じnonce・新しい公開鍵）。
+#[test]
+fn a_peer_that_restarts_right_after_only_its_ack_arrived_still_connects_at_once() {
+    let mut net = Net::new(1, 2, Route::Straight);
+    net.a.poll(1, &mut net.qa);
+    for (to, bytes) in std::mem::take(&mut net.qa.0) {
+        if to == B_CODE {
+            net.b.on_datagram(A_ADDR, &bytes, 1, &mut net.qb);
+        }
+    }
+    let mut acks = 0;
+    for (to, bytes) in std::mem::take(&mut net.qb.0) {
+        let msg = wire::decode(&key(), None, &bytes).map(|p| p.msg);
+        if to == A_ADDR && matches!(msg, Ok(Message::HelloAck { .. })) {
+            net.a.on_datagram(B_CODE, &bytes, 2, &mut net.qa);
+            acks += 1;
+        }
+    }
+    assert_eq!(acks, 1, "効く期間: B1 の返しが A へ届いた");
+    assert_eq!(net.a.path(), Some(B_CODE));
+    net.qa.0.clear();
+    let b2_seed = KeySeed([0x55; 32]);
+    assert_ne!(
+        Ephemeral::from_seed(&b2_seed).public(),
+        public_of(2),
+        "効く期間: 貼り直した B の公開鍵が前と違う"
+    );
+    net.b = Link::new(Config::single(hs_cfg(2), SECRET, A_ADDR, b2_seed), 3);
+    net.now = 3;
+    let mut at = None;
+    for _ in 0..3_000 {
+        net.step();
+        if net.a.connected().is_some() && net.b.connected().is_some() {
+            at = Some(net.now);
+            break;
+        }
+    }
+    assert!(
+        at.is_some_and(|ms| ms < 500),
+        "接続しない（{at:?} ms・A {:?}・{:?}）",
+        net.a.handshake_state(),
+        net.a.handshake_counters()
+    );
+}
+
+/// 今のBのHELLOを盗み見て送り元を偽って再送しても、Aは偽の送り元を学ばない。
+/// 1通につき1回だけ返し、その後は送らない。
+#[test]
+fn a_replayed_hello_from_spoofed_sources_gets_one_answer_each_and_is_never_learned() {
+    for (a_nonce, per_replay) in [(1u64, 1usize), (3, 2)] {
+        let mut a = link(B_CODE, a_nonce);
+        let mut q = Q::default();
+        a.poll(1, &mut q);
+        q.take();
+        let spoofed: Vec<SocketAddr> = (0..(MAX_LEARNED as u16 + 2))
+            .map(|i| sa(41_400 + i))
+            .collect();
+        for (i, s) in spoofed.iter().enumerate() {
+            a.on_datagram(*s, &enc(&hello(2)), 2 + i as u32, &mut q);
+        }
+        let first = q.take();
+        for s in &spoofed {
+            let to_s: Vec<&Message> = first
+                .iter()
+                .filter(|(to, _)| to == s)
+                .map(|(_, m)| m)
+                .collect();
+            assert_eq!(to_s.len(), per_replay, "A {a_nonce}・{s}: {to_s:?}");
+            assert!(
+                to_s.iter().all(|m| !matches!(m, Message::HelloAck { .. })),
+                "A {a_nonce}・{s}: HELLO_ACK を返した"
+            );
+        }
+        let c = a.recv_counts();
+        assert_eq!((c.learned, c.learn_refused), (0, 0), "A {a_nonce}: {c:?}");
+        for t in 10..=500 {
+            a.poll(t, &mut q);
+        }
+        let later = q.take();
+        assert!(
+            later.iter().all(|(to, _)| !spoofed.contains(to)),
+            "A {a_nonce}: 偽の送り元へ送り続けた"
+        );
+        assert!(
+            !dests(&later, is_hello).is_empty(),
+            "A {a_nonce}: HELLO を止めた（この検査が送りを見ている証拠）"
+        );
+    }
+}
+
+/// 盗み見たBの便を送り直す人のアドレス（候補にもBの実際の送り元にも無い）。
+const X_ADDR: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+    41_900,
+);
+
+fn is_ack_bytes(b: &[u8]) -> bool {
+    matches!(
+        wire::decode(&key(), None, b).map(|p| p.msg),
+        Ok(Message::HelloAck { .. })
+    )
+}
+
+/// 封じた便（ホストの決め方を使わない接続の前ではAGREEだけ）。
+fn is_sealed_bytes(b: &[u8]) -> bool {
+    wire::decode(&key(), None, b) == Err(wire::DecodeError::NotKeyed)
+}
+
+/// Aの送った便のうちBのコードのアドレス宛てをBへ渡す（X宛ては捨てる）。
+fn deliver_a(net: &mut Net, t: u32) {
+    for (to, b) in std::mem::take(&mut net.qa.0) {
+        if to == B_CODE {
+            net.b.on_datagram(A_ADDR, &b, t, &mut net.qb);
+        }
+    }
+}
+
+/// Bの送った便をBの送った順にAへ渡す。`relay`に当たる便は本物の直前にXからも渡す。`lose`に当たる本物は落とす。
+/// Xから渡した通数を返す。
+fn deliver_b(net: &mut Net, t: u32, relay: fn(&[u8]) -> bool, lose: fn(&[u8]) -> bool) -> usize {
+    let mut relayed = 0;
+    for (to, b) in std::mem::take(&mut net.qb.0) {
+        if to != A_ADDR {
+            continue;
+        }
+        if relay(&b) {
+            net.a.on_datagram(X_ADDR, &b, t, &mut net.qa);
+            relayed += 1;
+        }
+        if !lose(&b) {
+            net.a.on_datagram(B_CODE, &b, t, &mut net.qa);
+        }
+    }
+    relayed
+}
+
+/// 両者が接続し、Aの経路・受信スレッドのPONGの宛先がBのコードのアドレスで、その後のAの送信がXへ向かない。
+fn assert_on_code_path(net: &mut Net, what: &str) {
+    assert!(
+        net.a.connected().is_some() && net.b.connected().is_some(),
+        "{what}: 接続しない（A {:?} / B {:?}）",
+        net.a.handshake_state(),
+        net.b.handshake_state()
+    );
+    assert_eq!(net.a.path(), Some(B_CODE), "{what}");
+    assert_eq!(
+        net.a.pong_responder().map(|r| r.path()),
+        Some(B_CODE),
+        "{what}: 接続の経路"
+    );
+    net.qa.0.clear();
+    for _ in 0..1_500 {
+        net.now += 1;
+        net.a.poll(net.now, &mut net.qa);
+    }
+    let sent = std::mem::take(&mut net.qa.0);
+    assert!(!sent.is_empty(), "{what}: 接続の後に何も送っていない");
+    assert!(
+        sent.iter().all(|(to, _)| *to == B_CODE),
+        "{what}: X へ送った"
+    );
+}
+
+#[test]
+fn a_current_ack_relayed_from_another_address_before_the_real_one_does_not_take_the_path() {
+    for (a_nonce, b_nonce) in [(1u64, 2u64), (3, 2)] {
+        let what = format!("A {a_nonce} / B {b_nonce}");
+        let mut net = Net::new(a_nonce, b_nonce, Route::Straight);
+        net.now = 1;
+        net.a.poll(1, &mut net.qa);
+        deliver_a(&mut net, 1);
+        let relayed = deliver_b(&mut net, 2, is_ack_bytes, |_| false);
+        assert_eq!(
+            relayed, 1,
+            "{what}: 効く期間: B の HELLO_ACK を X から送り直した"
+        );
+        assert_eq!(
+            net.a.recv_counts().learned,
+            1,
+            "{what}: 効く期間: X を学んだ"
+        );
+        net.now = 2;
+        net.run_until_connected(2_000);
+        assert_on_code_path(&mut net, &what);
+    }
+}
+
+/// BのHELLOはまだ届かず、HELLO_ACKの写しがXから先に、本物がコードの候補から後に届く。
+#[test]
+fn a_current_ack_from_the_code_takes_the_path_back_from_a_learned_relay_before_connecting() {
+    let mut a = link(B_CODE, 1);
+    let mut q = Q::default();
+    a.poll(1, &mut q);
+    let stored = enc(&ack(1, 2));
+    a.on_datagram(X_ADDR, &stored, 2, &mut q);
+    assert_eq!(a.path(), Some(X_ADDR), "効く期間: X が先に経路を取った");
+    a.on_datagram(B_CODE, &stored, 3, &mut q);
+    assert_eq!(a.path(), Some(B_CODE));
+    a.on_datagram(X_ADDR, &stored, 4, &mut q);
+    assert_eq!(a.path(), Some(B_CODE), "X が経路を取り返した");
+}
+
+/// XがBのHELLO_ACKとHELLOを先に再送して経路とAGREEの宛先を取っても、BのHELLOがコードの候補から届いたらホストのAはAGREEを候補へ送る。
+#[test]
+fn a_hello_from_the_code_takes_the_agree_back_from_a_learned_relay() {
+    let mut a = link(B_CODE, 3);
+    let mut q = Q::default();
+    a.poll(1, &mut q);
+    a.on_datagram(X_ADDR, &enc(&ack(3, 2)), 2, &mut q);
+    a.on_datagram(X_ADDR, &enc(&hello(2)), 3, &mut q);
+    let early = dests(&q.take(), |m| matches!(m, Message::Agree { .. }));
+    assert!(
+        early.contains(&X_ADDR),
+        "効く期間: AGREE が X へ出た: {early:?}"
+    );
+    a.on_datagram(B_CODE, &enc(&hello(2)), 4, &mut q);
+    assert_eq!(a.path(), None, "学んだ経路を戻していない");
+    q.take();
+    for t in 5..=40 {
+        a.poll(t, &mut q);
+    }
+    let later = dests(&q.take(), |m| matches!(m, Message::Agree { .. }));
+    assert!(!later.is_empty(), "AGREE を送っていない");
+    assert!(later.iter().all(|d| *d == B_CODE), "{later:?}");
+}
+
+/// BのHELLO_ACKは落ち、Bの封じたAGREE（ホストのAGREEかゲストの返答）の写しがXから本物より先に届く。
+#[test]
+fn a_sealed_agree_relayed_from_another_address_before_the_real_one_does_not_take_the_path() {
+    for (a_nonce, b_nonce) in [(1u64, 2u64), (3, 2)] {
+        let what = format!("A {a_nonce} / B {b_nonce}");
+        let mut net = Net::new(a_nonce, b_nonce, Route::Straight);
+        net.a.poll(1, &mut net.qa);
+        let mut relayed = 0;
+        for t in 1..=10 {
+            deliver_a(&mut net, t);
+            relayed += deliver_b(&mut net, t + 1, is_sealed_bytes, is_ack_bytes);
+            if net.a.connected().is_some() {
+                break;
+            }
+        }
+        assert!(
+            relayed >= 1,
+            "{what}: 効く期間: B の AGREE を X から送り直した"
+        );
+        assert_eq!(
+            net.a.recv_counts().learned,
+            1,
+            "{what}: 効く期間: X を学んだ"
+        );
+        assert!(
+            net.a.connected().is_some(),
+            "{what}: 効く期間: A が接続した"
+        );
+        net.now = 12;
+        net.run_until_connected(2_000);
+        assert_on_code_path(&mut net, &what);
+    }
+}
+
+/// 最初の回はB → Aが途絶えてAが最初から作り直し（Fresh）、その直後からXが盗み見たBのHELLO_ACKを再送し続ける。
+#[test]
+fn a_stored_ack_resent_from_another_address_after_a_fresh_restart_does_not_keep_the_path() {
+    for (a_nonce, b_nonce) in [(1u64, 2u64), (3, 2)] {
+        let what = format!("A {a_nonce} / B {b_nonce}");
+        let mut net = Net::new(a_nonce, b_nonce, Route::Straight);
+        net.a.set_retry_window(60_000);
+        net.b.set_retry_window(60_000);
+        net.cut_b_to_a = true;
+        while net.a.restarts().count == 0 && net.now < 12_000 {
+            net.step();
+        }
+        assert_eq!(
+            net.a.restarts().last.map(|(_, k)| k),
+            Some(handshake::Restart::Fresh),
+            "{what}: 効く期間: 最初からの作り直し"
+        );
+        let stored = net
+            .cut_log
+            .iter()
+            .find(|b| is_ack_bytes(b))
+            .cloned()
+            .expect("効く期間: B の HELLO_ACK を盗み見た");
+        net.a.on_datagram(X_ADDR, &stored, net.now, &mut net.qa);
+        assert_eq!(
+            net.a.path(),
+            Some(X_ADDR),
+            "{what}: 効く期間: 作り直しの直後に X が経路を取った"
+        );
+        net.cut_b_to_a = false;
+        for _ in 0..3_000 {
+            if net.now.is_multiple_of(3) {
+                net.a.on_datagram(X_ADDR, &stored, net.now, &mut net.qa);
+            }
+            net.step();
+            if net.a.connected().is_some() && net.b.connected().is_some() {
+                break;
+            }
+        }
+        assert_on_code_path(&mut net, &what);
+    }
+}
+
+/// Xを学んだまま引き継ぐ作り直し（Resume）になっても、Xから再送し続ける今のセッションのHELLO_ACKで経路を取り直させない。
+#[test]
+fn a_learned_relay_address_does_not_retake_the_path_after_a_resume() {
+    let mut a = link(B_CODE, 1);
+    a.set_retry_window(60_000);
+    let mut q = Q::default();
+    a.poll(1, &mut q);
+    let stored = enc(&ack(1, 2));
+    a.on_datagram(X_ADDR, &stored, 2, &mut q);
+    assert_eq!(a.path(), Some(X_ADDR), "効く期間: X が先に経路を取った");
+    a.on_datagram(B_CODE, &enc(&hello(2)), 3, &mut q);
+    for t in (4..=11_000).step_by(4) {
+        a.poll(t, &mut q);
+    }
+    assert_eq!(
+        a.restarts().last.map(|(_, k)| k),
+        Some(handshake::Restart::Resume),
+        "効く期間: 引き継ぐ作り直し"
+    );
+    assert_eq!(a.recv_counts().learned, 1, "効く期間: X を学んだまま");
+    for t in 11_001..11_050 {
+        a.on_datagram(X_ADDR, &stored, t, &mut q);
+        assert_ne!(a.path(), Some(X_ADDR), "t={t}");
+    }
+    a.on_datagram(B_CODE, &stored, 11_050, &mut q);
+    assert_eq!(a.path(), Some(B_CODE));
 }

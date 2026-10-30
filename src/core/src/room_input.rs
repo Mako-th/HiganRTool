@@ -1,19 +1,19 @@
 //! ゲーム内のメニューの「ルーム名の入力」（pure。確保しない）。
 //!
-//! ルーム名はゲームの中でキーボードから打って決め、決めた名は ini の `room` に書き戻す（次の初めの値になる）。
-//! ここは文字の受け方・編集・初めの値だけで、ウィンドウから文字を受けること（`WM_CHAR`）と ini の書き換えは dll（`text_input_win` / `ini_save`）の仕事。
-//! - 受ける文字は `RoomName::accepts_char`（ASCII の英数字・`-`・`_`。`ROOM_NAME_MAX` = 32 文字まで）。全角の英数字・`－`・`＿` は半角に直して受け、ほかは捨てる。
-//! - Backspace（0x08・Ctrl+Backspace の 0x7F）で 1 文字消し、Enter（0x0D・0x0A）で決める。決めるガードは `RoomName::parse`（空・`.` の名などは理由つきで断り、メニューが理由の行を出して入力に留まる）。
-//! - 文字は UTF-16 の 1 単位で来る。基本面の外の文字（絵文字）は 2 単位に割れて来るが、どちらも `fold_unit` が捨てる。
+//! ルーム名はゲームの中でキーボードから打って決定する。決定したルーム名はiniの`room`に書き戻す（次の初期値になる）。
+//! ここが持つのは文字の受け方・編集・初期値だけ。ウィンドウから文字を受けること（`WM_CHAR`）とiniの書き換えはdll（`text_input_win` / `ini_save`）の仕事。
+//! - 受ける文字は`RoomName::accepts_char`（`ROOM_NAME_MAX` = 32文字まで）。全角の`！`〜`～`は半角に直して受け、ほかは捨てる。
+//! - Backspace（0x08・Ctrl+Backspaceの0x7F）で1文字消し、Enter（0x0D・0x0A）で決定する。決定の検証は`RoomName::parse`（空・`w.` `q.`で始まる名などは理由つきで断り、メニューが理由の行を出して入力に留まる）。前後の空白は決定時に除く。
+//! - 文字はUTF-16の1単位で来る。基本面の外の文字（絵文字）は2単位に割れて来るが、どちらも`fold_unit`が捨てる。
 //!
-//! ルーム名は本ログに書かないので、`RoomBuf` の `Debug` は中身を書かない。
+//! ルーム名は本ログに書かないので`RoomBuf`の`Debug`は中身を書かない。
 
 use crate::room::{ROOM_NAME_MAX, RoomName, RoomNameError};
 
-/// 以前のバージョンがルーム名を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まず、dll が起動のときに ini の `room` へ移して消す。
+/// 以前のバージョンがルーム名を覚えていたファイルの名前（置き場は接続コードの置き場）。今は読まない。dllが起動時にiniの`room`へ移して消す。
 pub const ROOM_LAST_FILE: &str = "room_last.txt";
 
-/// `WM_CHAR` の制御文字（Backspace・Enter・改行・Ctrl+Backspace の 0x7F）。
+/// `WM_CHAR`の制御文字（Backspace・Enter・改行・Ctrl+Backspaceの0x7F）。
 pub const UNIT_BACKSPACE: u16 = 0x08;
 pub const UNIT_DELETE: u16 = 0x7F;
 pub const UNIT_ENTER: u16 = 0x0D;
@@ -25,7 +25,7 @@ pub struct RoomBuf {
     len: usize,
 }
 
-/// `RoomBuf` を原子変数の語に詰めた長さ（32 バイトを 4 バイトずつ ＋ 長さ 1 語）。
+/// `RoomBuf`をアトミック変数のワードに詰めた長さ（32バイトを4バイトずつ ＋ 長さ1ワード）。
 pub const ROOM_BUF_WORDS: usize = ROOM_NAME_MAX / 4 + 1;
 const _: () = assert!(ROOM_NAME_MAX.is_multiple_of(4));
 
@@ -86,10 +86,11 @@ impl RoomBuf {
         true
     }
 
+    /// 前後の空白を除いた名で作る（`RoomName::parse`を通る名だけ）。
     pub fn from_name(s: &str) -> Option<RoomBuf> {
-        RoomName::parse(s).ok()?;
+        let name = RoomName::parse(s).ok()?;
         let mut b = RoomBuf::new();
-        for c in s.chars() {
+        for c in name.as_str().chars() {
             if !b.push(c) {
                 return None;
             }
@@ -101,7 +102,7 @@ impl RoomBuf {
         RoomName::parse(self.as_str())
     }
 
-    /// 原子変数の語に詰める（見張りのスレッドへ渡す入れ物 `net_ui::RoomNameBox`）。
+    /// アトミック変数のワードに詰める（監視の処理のスレッドへ渡すバッファ`net_ui::RoomNameBox`）。
     pub fn to_words(&self) -> [u32; ROOM_BUF_WORDS] {
         let mut w = [0u32; ROOM_BUF_WORDS];
         for (d, chunk) in w.iter_mut().zip(self.buf.chunks(4)) {
@@ -115,7 +116,7 @@ impl RoomBuf {
         w
     }
 
-    /// `to_words` の逆。文字として受けない値・長すぎる長さは、受けるところまでで切る。
+    /// `to_words`の逆。文字として受けない値・長すぎる長さは受けるところまでで切る。
     pub fn from_words(w: &[u32; ROOM_BUF_WORDS]) -> RoomBuf {
         let len = (w[ROOM_BUF_WORDS - 1] as usize).min(ROOM_NAME_MAX);
         let mut bytes = [0u8; ROOM_NAME_MAX];
@@ -134,8 +135,8 @@ impl RoomBuf {
     }
 }
 
-/// ウィンドウから来た文字 1 単位を、受けられる ASCII の文字にする。半角の ASCII はそのまま、全角の `！`〜`～`（U+FF01〜U+FF5E）は半角（0x21〜0x7E）に直す。
-/// 受けるかどうかは `RoomName::accepts_char` が決めるので、ここでは文字の形を直すだけ。
+/// ウィンドウから来た文字1単位を受けられるASCIIの文字にする。半角のASCIIはそのまま返す。全角の`！`〜`～`（U+FF01〜U+FF5E）は半角（0x21〜0x7E）に直す。
+/// 受けるかどうかは`RoomName::accepts_char`が決める。ここでは文字の形を直すだけ。
 pub fn fold_unit(unit: u16) -> Option<char> {
     match unit {
         0x20..=0x7E => Some(char::from(unit as u8)),
@@ -158,8 +159,8 @@ pub fn classify(unit: u16) -> TextKey {
     classify_by(unit, RoomName::accepts_char)
 }
 
-/// `classify` の、受ける文字の決まり `accepts` を渡す形。プレイヤー名の入力（`player_name`）が、制御文字・全角の直し方・
-/// Backspace / Enter の読みをルーム名と同じにして、受ける文字だけ替えるために使う。
+/// `classify`に受ける文字の決まり`accepts`を渡す形。
+/// プレイヤー名の入力（`player_name`）が使う。制御文字・全角の直し方・Backspace / Enterの読みをルーム名と同じにして、受ける文字だけ替えるため。
 pub fn classify_by(unit: u16, accepts: fn(char) -> bool) -> TextKey {
     match unit {
         UNIT_BACKSPACE | UNIT_DELETE => TextKey::Backspace,
@@ -175,7 +176,7 @@ pub fn classify_by(unit: u16, accepts: fn(char) -> bool) -> TextKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit {
     Nothing,
-    /// 使えない文字が打たれて捨てた（呼び手が「英数字と - _ だけ使えます。」を出す）。
+    /// 使えない文字が打たれたので捨てた（呼び出し元が使えない文字の案内を出す）。
     Rejected,
     Changed,
     Enter,
@@ -218,12 +219,12 @@ impl RoomInput {
     }
 }
 
-/// 入力の初めの値: ini の `room`（文字の決まりを通るもの）→ 空。ini の文字が決まりの外なら黙って空に落とす。
+/// 入力の初期値はiniの`room`（文字の決まりを通るもの）。無ければ空。iniの文字が決まりの外なら黙って空にする。
 pub fn initial(ini: Option<&str>) -> RoomBuf {
     initial_from(ini).0
 }
 
-/// 初めの値の出どころ（本ログの 1 行に出どころだけ書く。名は書かない）。
+/// 初期値の出どころ（本ログの1行に出どころだけ書く。名は書かない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialFrom {
     Ini,
@@ -237,8 +238,8 @@ pub fn initial_from(ini: Option<&str>) -> (RoomBuf, InitialFrom) {
     }
 }
 
-/// 以前のバージョンが覚えたファイル（`ROOM_LAST_FILE`）の中身を読む（引き継ぎ用）。先頭の BOM と前後の空白は除き、最初の 1 行だけを見る。
-/// 決まりの外・空・壊れた文字は `None`。
+/// 以前のバージョンが覚えたファイル（`ROOM_LAST_FILE`）の中身を読む（引き継ぎ用）。先頭のBOMと前後の空白は除いて最初の1行だけを見る。
+/// 決まりの外・空・壊れた文字は`None`。
 pub fn parse_last(text: &str) -> Option<RoomBuf> {
     let first = text.trim_start_matches('\u{FEFF}').lines().next()?;
     RoomBuf::from_name(first.trim())
@@ -264,15 +265,25 @@ mod tests {
         );
         assert_eq!(typed("Synth-Room_7").text().as_str(), "Synth-Room_7");
         assert_eq!(typed("a@b").text().as_str(), "a@b");
-        for dropped in [
-            "！", "．", "　", " ", ".", "/", "\\", "部", "あ", "ｱ", "?", "#", "😀",
-        ] {
+        for kept in [" ", ".", "\\", "?", "#", "\"", "！", "．"] {
+            let want = match kept {
+                "！" => "a!b".to_string(),
+                "．" => "a.b".to_string(),
+                k => format!("a{k}b"),
+            };
+            assert_eq!(
+                typed(&format!("a{kept}b")).text().as_str(),
+                want,
+                "{kept:?}"
+            );
+        }
+        for dropped in ["/", ";", "`", "／", "；", "　", "部", "あ", "ｱ", "😀"] {
             let got = typed(&format!("a{dropped}b"));
             assert_eq!(got.text().as_str(), "ab", "{dropped:?}");
         }
         assert_eq!(typed("ab").text().as_str(), "ab");
         assert_eq!(typed("a\u{7F}xb").text().as_str(), "xb");
-        // 範囲の境目: 全角の `！`（FF01）の手前（FF00）と `～`（FF5E）の後ろ（FF5F）は直さない。
+        // 範囲の境目: 全角の`！`（FF01）の手前（FF00）と`～`（FF5E）の後ろ（FF5F）は直さない。
         assert_eq!(fold_unit(0xFF00), None);
         assert_eq!(fold_unit(0xFF5F), None);
         assert_eq!(fold_unit(0xFF01), Some('!'));
@@ -285,16 +296,17 @@ mod tests {
         for u in 0..=u16::MAX {
             if let TextKey::Char(c) = classify(u) {
                 accepted += 1;
+                // 1文字だけの名は空白（空と同じ）と`.`（`.`の名）で断られるので、前に1文字置く。
                 assert!(
-                    RoomName::parse(&c.to_string()).is_ok(),
+                    RoomName::parse(&format!("x{c}")).is_ok(),
                     "入力は受けるが parse は断る: {u:#06x}"
                 );
             }
         }
-        // 母数が 0 のまま通らないように数で縛る。
-        assert_eq!(accepted, 65 + 65);
+        // 母数が0のまま通らないように数で縛る（半角92 ＋ 全角91。`` ` `` `;` `/` を除く）。
+        assert_eq!(accepted, 92 + 91);
         for c in (0u8..=0x7F).map(char::from) {
-            let parse_ok = RoomName::parse(&c.to_string()).is_ok();
+            let parse_ok = RoomName::parse(&format!("x{c}")).is_ok();
             let input_ok = matches!(classify(u16::from(c as u8)), TextKey::Char(x) if x == c);
             assert_eq!(parse_ok, input_ok, "{c:?}");
         }
@@ -329,7 +341,7 @@ mod tests {
     fn unusable_typed_characters_are_reported_but_control_keys_are_not() {
         let mut i = RoomInput::new(RoomBuf::from_name("ab").unwrap());
         for dropped in [
-            'ｱ', 'ﾝ', '部', 'あ', '！', '．', '　', ' ', '.', '/', '?', '#', '\u{80}',
+            'ｱ', 'ﾝ', '部', 'あ', '／', '；', '　', '/', ';', '`', '\u{80}',
         ] {
             let mut b = [0u16; 2];
             let u = dropped.encode_utf16(&mut b)[0];
@@ -357,12 +369,24 @@ mod tests {
             typed("Synth-Room_7").text().parse().unwrap().as_str(),
             "Synth-Room_7"
         );
-        // `.` は入力が受けないが、覚えたファイルや ini からは来うる: `from_name` が断る。
+        // `.`だけの名は入力が受けるが決定できない。iniや覚えたファイルから来ても`from_name`が断る。
         assert_eq!(RoomBuf::from_name("."), None);
         assert_eq!(RoomBuf::from_name(".."), None);
         assert_eq!(RoomBuf::from_name(""), None);
-        assert_eq!(RoomBuf::from_name("a b"), None);
+        assert_eq!(RoomBuf::from_name("   "), None);
         assert_eq!(RoomBuf::from_name("部屋"), None);
+        for bad in ["a;b", "a`b", "a/b", "w.x", "Q.x", " w.x"] {
+            assert_eq!(RoomBuf::from_name(bad), None, "{bad:?}");
+        }
+        assert_eq!(RoomBuf::from_name("a b").unwrap().as_str(), "a b");
+        assert_eq!(RoomBuf::from_name("a.b").unwrap().as_str(), "a.b");
+        // 前後の空白は除いて持つ（iniに書く名にも空白が残らない）。
+        assert_eq!(RoomBuf::from_name("  a b ").unwrap().as_str(), "a b");
+        assert_eq!(typed("  a b ").text().parse().unwrap().as_str(), "a b");
+        assert_eq!(
+            typed("w.x").text().parse(),
+            Err(RoomNameError::ReservedPrefix)
+        );
         assert_eq!(RoomBuf::from_name(&"a".repeat(33)), None);
         assert_eq!(
             RoomBuf::from_name(&"a".repeat(32)).unwrap().as_str(),
@@ -377,12 +401,14 @@ mod tests {
             None,
             Some(""),
             Some("花 映塚"),
-            Some("bad name"),
+            Some("bad;name"),
+            Some("w.room"),
             Some(".."),
         ] {
             assert_eq!(initial(bad).as_str(), "", "{bad:?}");
             assert_eq!(initial_from(bad).1, InitialFrom::Empty, "{bad:?}");
         }
+        assert_eq!(initial(Some("good name.1")).as_str(), "good name.1");
         assert_eq!(initial_from(Some("x")).1, InitialFrom::Ini);
     }
 
@@ -393,9 +419,10 @@ mod tests {
         assert_eq!(parse_last("\u{FEFF}Room_9-x\r\n"), Some(name));
         assert_eq!(parse_last("  Room_9-x  \n"), Some(name));
         assert_eq!(parse_last("Room_9-x"), Some(name));
-        for bad in ["", "\n", "   \n", "a b\n", "部屋\n", "..\n", "\nRoom_9-x\n"] {
+        for bad in ["", "\n", "   \n", "a;b\n", "部屋\n", "..\n", "\nRoom_9-x\n"] {
             assert_eq!(parse_last(bad), None, "{bad:?}");
         }
+        assert_eq!(parse_last("a b\n").unwrap().as_str(), "a b");
     }
 
     #[test]

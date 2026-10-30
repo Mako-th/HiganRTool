@@ -1,11 +1,21 @@
-//! 描画用の VM の欄の診断と除外（pure。unsafe 無し。呼ぶ側の Win32 は `rollback_win.rs`）。ゲームのスレッドで走り（既に D2 の地点の比べの中）、固定長の表だけを使い、確保・パニックを持ち込まない。
+//! 描画用のVMのフィールドの診断と除外（pure。unsafe無し。呼ぶ側のWin32は`rollback_win.rs`）。
+//! ゲームのスレッドで走る（既にD2の地点の比べの中）。固定長の表だけを使い、確保・パニックを持ち込まない。
 //!
-//! 背景: 1 回の描画の中で走査を k 回呼ぶ形で k = 8・60 の多くが違い、違ったバイトは描画の列が書く「描画用の VM の欄」（ANM の VM の回転 z と画面座標 pos）だった。期間の途中で消えた物の枠には、実時間の形では消える直前の描画の値が、この形では一度も描かれていない値が残る。決定的な状態は動いていない見込み（推定）。
-//! 1. 診断: 違ったバイトを、範囲（弾・敵・自機ショット・arena）・枠・枠の中の欄・その枠が D1 と D2 で生きているか、に分けて数える。比べの結果は変えない。数えるのは「比べる所」だけ（表の `region_skips` が外した所は数えない）。外す前の違いを数えるので、`all` でも「生きている枠の違い」に描画欄が残る。合格を読むのは除外の対象でない欄の違い（`DiagRow::is_spec_draw`）。
-//! 2. 除外 `dead`（ini `skip_draw_fields`）: D1 の時点で生きていない枠の描画用の欄（VM ごとの回転 z の 4 バイトと pos の 12 バイトと補間の始点）を比べから外す。生きている枠の欄は外さない（本物のずれを隠さないため）。「生きているか」は D1 の時点の値で決める。arena は D1 の割り当て器を歩けたときだけ、D1 で空きの VM 大の塊の同じ欄を外す（歩けなければ外さず、そのことを書く）。
-//! 3. 全部の除外 `all`: 生死に関係なく、枠の配列の VM（診断だけの候補 VM の敵 `+0x2AC` も含む）と arena の使用中の VM の配列（札 `0x0040CB17` / `0x00440DB9`）の同じ欄を外す。arena の空きの塊（解放で中身が 0 になるので D1 と D2 で同じはず）と世界の欄（弾 `+0xD4C` / `+0xDBE` など）は外さない。
-//! 4. レーザー（弾の塊の中の `+0x24D424`・0x59C 刻み・48 本）の 0 本目の、描画だけが書く欄が残りの 28 B だった。枠の配列として足し、`all` で `RbSlotArray::draw_only` の欄（`+0x596`・VM 1 の色 α・拡大）も外す。旗の低位 1 B `+0x49C`（描画 0x57 / 生成 0x17）は外し、上位 3 B `+0x49D`〜・世界の欄 `+0x548`〜`+0x599`・生死 `+0x584` は外さない。
-//! 5. 補間の始点: VM の `+0x238`〜`+0x243`（12 B）は補間を始める命令が pos `+0x208` からコピーするだけの欄なので、pos を外している VM では同じ扱いにする（`FIELDS` の 3 つ目）。始点の手前（`+0x228`〜`+0x237`）と終点（`+0x244`〜）は外さない。
+//! 背景: 1回の描画の中で走査をk回呼ぶ形（k = 8・60）の多くで違いが出た。違ったバイトは、描画の列が書く「描画用のVMのフィールド」（ANMのVMの回転zと画面座標pos）だった。
+//! 期間の途中で消えた物の枠に残る値は、実時間の形では消える直前の描画の値だが、この形では一度も描かれていない値になる。
+//! 決定的な状態は動いていない見込み（推定）。
+//! 1. 診断: 違ったバイトを、範囲（弾・敵・自機ショット・arena）・枠・枠の中のフィールド・その枠がD1とD2で生きているかどうかに分けて数える。比べの結果は変えない。
+//!    数えるのは「比べる所」だけ（表の`region_skips`が外した所は数えない）。外す前の違いを数えるので`all`でも「生きている枠の違い」に描画フィールドが残る。
+//!    合格を読むのは除外の対象でないフィールドの違い（`DiagRow::is_spec_draw`）。
+//! 2. 除外`dead`（ini `skip_draw_fields`）: D1の時点で生きていない枠の描画用のフィールド（VMごとの回転zの4バイトとposの12バイトと補間の始点）を比べから外す。
+//!    生きている枠のフィールドは外さない（本物のずれを隠さないため）。「生きているか」はD1の時点の値で判定する。
+//!    arenaはD1のアロケータを歩けたときだけ、D1で空きのVM大のブロックの同じフィールドを外す。歩けなければ外さず、そのことを書く。
+//! 3. 全部の除外`all`: 生死に関係なく、枠の配列のVM（診断だけの候補VMの敵`+0x2AC`も含む）とarenaの使用中のVMの配列（タグ`0x0040CB17` / `0x00440DB9`）の同じフィールドを外す。
+//!    arenaの空きのブロック（解放で中身が0になるのでD1とD2で同じはず）と世界のフィールド（弾`+0xD4C` / `+0xDBE`など）は外さない。
+//! 4. レーザー（弾のブロックの中の`+0x24D424`・0x59C間隔・48本）の0本目は、描画だけが書くフィールドが残りの28 Bだった。
+//!    枠の配列として追加し、`all`で`RbSlotArray::draw_only`のフィールド（`+0x596`・VM 1の色 α・拡大）も外す。
+//!    フラグの低位1 B `+0x49C`（描画0x57 / 生成0x17）は外す。上位3 B `+0x49D`〜・世界のフィールド`+0x548`〜`+0x599`・生死`+0x584`は外さない。
+//! 5. 補間の始点: VMの`+0x238`〜`+0x243`（12 B）は補間を始める命令がpos `+0x208`からコピーするだけのフィールドなので、posを外しているVMでは同じ扱いにする（`FIELDS`の3つ目）。始点の手前（`+0x228`〜`+0x237`）と終点（`+0x244`〜）は外さない。
 #![forbid(unsafe_code)]
 
 use higanr_core::arena::{ArenaMem, ArenaState, BlockInfo, HEADER};
@@ -20,7 +30,7 @@ pub enum SkipDraw {
     #[default]
     None,
     Dead,
-    /// 生死に関係なく、枠の配列の VM（候補 VM を含む）と arena の使用中の VM の配列の描画用の欄を比べから外す。
+    /// 生死に関係なく、枠の配列のVM（候補VMを含む）とarenaの使用中のVMの配列の描画用のフィールドを比べから外す。
     All,
 }
 
@@ -76,28 +86,28 @@ pub struct RbSlotArray {
     pub stride: u32,
     pub count: u32,
     pub alive: AliveRule,
-    /// 描画用の欄（回転 z・pos）を持つ VM の枠の中の位置（小さい順）。除外の対象。
+    /// 描画用のフィールド（回転z・pos）を持つVMの枠の中の位置（小さい順）。除外の対象。
     pub vms: &'static [u32],
-    /// 診断だけで数える VM（除外はしない）。
+    /// 診断だけで数えるVM（除外はしない）。
     pub probe_vms: &'static [u32],
-    /// VM の回転 z・pos のほかに、描画だけが書く欄（枠の中の位置, 長さ。小さい順。VM の欄とも重ならない）。VM の欄と同じ扱いで、`dead` では D1 で死んでいる枠のものだけ、
-    /// `all` では全部の枠のものを比べから外す（レーザーの `+0x596`・色 α・拡大）。
+    /// VMの回転z・posのほかに描画だけが書くフィールド（枠の中の位置, 長さ。小さい順。VMのフィールドとも重ならない）。
+    /// VMのフィールドと同じ扱いで、`dead`ではD1で死んでいる枠のものだけ、`all`では全部の枠のものを比べから外す（レーザーの`+0x596`・色 α・拡大）。
     pub draw_only: &'static [(u32, u32)],
     pub world: &'static [(u32, u32)],
     pub pos_by_vm: bool,
     pub source: &'static str,
 }
 
-/// VM の描画用の欄（VM の先頭からの位置と長さ。小さい順）。回転 z・pos・補間の始点（pos からコピーされるだけの欄）。
+/// VMの描画用のフィールド（VMの先頭からの位置と長さ。小さい順）。回転z・pos・補間の始点（posからコピーされるだけのフィールド）。
 const FIELDS: [(u32, u32); 3] = [
     (a::VM_ROT_Z_OFF, a::VM_ROT_Z_LEN),
     (a::VM_POS_OFF, a::VM_POS_LEN),
     (a::VM_INTERP_START_OFF, a::VM_INTERP_START_LEN),
 ];
 
-/// 行の数の上限（本物は枠の配列 8（レーザーが 2 本）＋ arena = 9）。
+/// 行の数の上限（本物は枠の配列8（レーザーが2本）＋ arena = 9）。
 pub const MAX_ROWS: usize = 10;
-/// 欄の種類の上限（枠は 11・arena は 8）。
+/// フィールドの種類の上限（枠は11・arenaは8）。
 pub const MAX_CATS: usize = 11;
 pub const MAX_SAMPLES: usize = 3;
 pub const NO_SLOT: u32 = u32::MAX;
@@ -111,7 +121,7 @@ pub const CAT_CAND_POS: usize = 5;
 pub const CAT_DRAW_ONLY: usize = 6;
 pub const CAT_WORLD: usize = 7;
 pub const CAT_POS_VM1: usize = 8;
-/// VM の補間の始点 `+0x238`〜`+0x243`（pos からコピーされるだけの欄）と、診断だけの候補 VM のもの。
+/// VMの補間の始点`+0x238`〜`+0x243`（posからコピーされるだけのフィールド）と診断だけの候補VMのもの。
 pub const CAT_INTERP: usize = 9;
 pub const CAT_CAND_INTERP: usize = 10;
 const SLOT_CAT_NAMES: [&str; 11] = [
@@ -250,8 +260,10 @@ impl DiagRow {
         names.get(cat).copied().unwrap_or("?")
     }
 
-    /// 除外の対象になる描画用の欄か。`none`・`dead` では診断だけの候補 VM の欄は含めず、`all` では含める。`all` でも arena の空きの VM 大の塊の欄は含めない
-    /// （0 で埋めるので、違えば本物のずれ）。描画だけの欄は VM の回転 z・pos と同じ扱い。世界の欄は外さないので含めない。
+    /// 除外の対象になる描画用のフィールドかどうか。
+    /// `none`・`dead`では診断だけの候補VMのフィールドは含めず、`all`では含める。
+    /// `all`でもarenaの空きのVM大のブロックのフィールドは含めない（0で埋めるので、違えば本物のずれ）。
+    /// 描画だけのフィールドはVMの回転z・posと同じ扱い。世界のフィールドは外さないので含めない。
     pub fn is_spec_draw(&self, cat: usize) -> bool {
         let all = self.mode == SkipDraw::All;
         match self.kind {
@@ -308,7 +320,7 @@ impl DiagRow {
         self.total = self.total.saturating_add(1);
         let b = &mut self.bytes[cls][cat];
         *b = b.saturating_add(1);
-        // 例は「描画用の欄以外」か「生きている枠の欄」だけ（除外の候補に入る違いは数だけで足りる）。同じ語の 2 バイト目以降は足さない。
+        // 例は「描画用のフィールド以外」か「生きている枠のフィールド」だけ（除外の候補に入る違いは数だけで足りる）。同じワードの2バイト目以降は足さない。
         let interesting = !self.is_spec_draw(cat) || (cls != 0 && cat != CAT_OUTSIDE);
         if !interesting || self.n_samples as usize >= MAX_SAMPLES {
             return;
@@ -410,7 +422,7 @@ impl DrawDiag {
         &self.rows[..self.n as usize]
     }
 
-    /// 枠の配列 `label` の行（同じ範囲を名指す枠の配列が 2 本ある（弾とレーザー）ので、範囲の名前でなく行の名前で引く）。
+    /// 枠の配列`label`の行。同じ範囲を指す枠の配列が2本ある（弾とレーザー）ので、範囲の名前でなく行の名前で取得する。
     fn row_of_label(&mut self, label: &str) -> Option<&mut DiagRow> {
         let n = self.n as usize;
         self.rows[..n]
@@ -432,14 +444,14 @@ fn slot_cat(spec: &RbSlotArray, off: u32) -> usize {
             for (i, &(fo, fl)) in FIELDS.iter().enumerate() {
                 let s = vm + fo;
                 if off >= s && off < s + fl {
-                    // pos だけ VM の順で数え分ける（回転 z は分けない）。診断だけの VM は分けない。
+                    // posだけVMの順で数え分ける（回転zは分けない）。診断だけのVMは分けない。
                     let later = spec.pos_by_vm && n >= 1 && cats[i] == CAT_POS;
                     return if later { CAT_POS_VM1 } else { cats[i] };
                 }
             }
         }
     }
-    // 描画だけの欄を先に引く（世界の欄と重なるレーザーの `+0x596` は描画だけの欄に数える）。
+    // 描画だけのフィールドを先に調べる（世界のフィールドと重なるレーザーの`+0x596`は描画だけのフィールドに数える）。
     let inside = |list: &[(u32, u32)]| list.iter().any(|&(s, l)| off >= s && off < s + l);
     if inside(spec.draw_only) {
         CAT_DRAW_ONLY
@@ -470,7 +482,7 @@ fn unskipped_len(skips: &Skips, lo: u32, hi: u32) -> u32 {
     n + hi.saturating_sub(cur)
 }
 
-/// `[lo, hi)`（両方の長さの中）の違いを、枠の外の違いとして数える。`claimed` は「ほかの枠の配列が占める所」（そちらの行が数える）。
+/// `[lo, hi)`（両方の長さの中）の違いを枠の外の違いとして数える。`claimed`は「ほかの枠の配列が占める所」（そちらの行が数える）。
 fn count_outside(
     row: &mut DiagRow,
     (a1, a2): (&[u8], &[u8]),
@@ -498,8 +510,9 @@ fn count_length_gap(row: &mut DiagRow, a1: &[u8], a2: &[u8], skips: &Skips) {
     }
 }
 
-/// 同じ範囲を 2 本の枠の配列（弾とレーザー）が名指すとき、範囲の「枠の外」を数える担当は表で先に出てくる方（弾）だけ（範囲の全部の違いが行の合計と一致するように）。
-/// `specs` に `spec` の範囲が無い（検査の偽の枠の配列）なら、その 1 本が担当。
+/// 同じ範囲を2本の枠の配列（弾とレーザー）が指すとき、範囲の「枠の外」を数える担当は表で先に出てくる方（弾）だけ。
+/// 範囲の全部の違いが行の合計と一致するようにするため。
+/// `specs`に`spec`の範囲が無い（検査の偽の枠の配列）なら、その1本が担当。
 fn owns_outside(spec: &RbSlotArray, specs: &[RbSlotArray]) -> bool {
     specs
         .iter()
@@ -518,8 +531,8 @@ fn in_sibling_slots(spec: &RbSlotArray, specs: &[RbSlotArray], n: usize, p: usiz
         })
 }
 
-/// 枠の配列 `spec` の範囲（D1 のコピー `a1`・今 `a2`）の違いを `row` へ数える。`specs` は表の全部（同じ範囲を名指すほかの枠の配列が占める所は数えない。
-/// `owns_outside` でなければ、枠の外も数えない）。
+/// 枠の配列`spec`の範囲（D1のコピー`a1`・今`a2`）の違いを`row`へ数える。`specs`は表の全部（同じ範囲を指すほかの枠の配列が占める所は数えない。
+/// `owns_outside`でなければ、枠の外も数えない）。
 pub fn analyze_slots(
     spec: &'static RbSlotArray,
     specs: &[RbSlotArray],
@@ -573,11 +586,12 @@ pub fn analyze_slots(
     }
 }
 
-/// 1 つの枠の中の、除外の対象の欄の最大の数（`slot_ranges` の出力先）。
+/// 1つの枠の中の除外の対象のフィールドの最大の数（`slot_ranges`の出力先）。
 pub const MAX_SLOT_RANGES: usize = 24;
 
-/// `mode` で外す欄を、1 つの枠の中の位置（始まり, 終わり）で小さい順に `out` へ入れ、数を返す。`Dead` は除外の VM の欄と `draw_only`、`All` はそれに診断だけの候補 VM の欄を足す。
-/// `None` は 0。出力先に入りきらない分は入れない。小さい順への並べ替えは挿入（確保しない）。
+/// `mode`で外すフィールドを、1つの枠の中の位置（始まり, 終わり）で小さい順に`out`へ書き込み、数を返す。
+/// `Dead`は除外のVMのフィールドと`draw_only`。`All`はそれに診断だけの候補VMのフィールドを足す。
+/// `None`は0。出力先に入りきらない分は書き込まない。小さい順への並べ替えは挿入（確保しない）。
 fn slot_ranges(
     spec: &RbSlotArray,
     mode: SkipDraw,
@@ -614,7 +628,7 @@ fn slot_ranges(
     n
 }
 
-/// `all` で 1 回の比べに外す、枠の配列の分のバイト数（表から数える）。本ログの内訳の期待値と、`.run` の合格の数の原本。
+/// `all`で1回の比べに外す枠の配列の分のバイト数（表から数える）。本ログの内訳の期待値と`.run`の合格の数の原本。
 pub fn all_skip_bytes_per_compare(specs: &[RbSlotArray]) -> u32 {
     let mut rel = [(0u32, 0u32); MAX_SLOT_RANGES];
     specs.iter().fold(0u32, |sum, spec| {
@@ -624,8 +638,9 @@ pub fn all_skip_bytes_per_compare(specs: &[RbSlotArray]) -> u32 {
     })
 }
 
-/// 枠の配列 `spec` の描画用の欄を、小さい順に `emit` へ渡す。`Dead` なら D1 の時点で死んでいる枠の除外の VM だけ、`All` なら生死に関係なく全部の枠の除外の VM と
-/// 診断だけの候補 VM、`None` は何も渡さない。枠がコピーの中に丸ごと入らないもの・（`Dead` で）生死の欄が読めないものは渡さない（読めない枠は外さない）。
+/// 枠の配列`spec`の描画用のフィールドを、小さい順に`emit`へ渡す。
+/// `Dead`ならD1の時点で死んでいる枠の除外のVMだけ。`All`なら生死に関係なく全部の枠の除外のVMと診断だけの候補VM。`None`は何も渡さない。
+/// 枠がコピーの中に丸ごと入らないもの・（`Dead`で）生死のフィールドが読み取れないものは渡さない（読み取れない枠は外さない）。
 pub fn walk_slot_skips(
     spec: &RbSlotArray,
     a1: &[u8],
@@ -652,7 +667,7 @@ pub fn walk_slot_skips(
     }
 }
 
-/// 読むだけの `ArenaMem`（D1 のコピーのバイト列。`top` の外は 0 を返す）。
+/// 読むだけの`ArenaMem`（D1のコピーのバイト列。`top`の外は0を返す）。
 pub struct SliceMem<'a>(pub &'a [u8]);
 
 impl ArenaMem for SliceMem<'_> {
@@ -667,8 +682,9 @@ impl ArenaMem for SliceMem<'_> {
     }
 }
 
-/// 求められた大きさ（塊の級を越えない範囲）が VM の配列の大きさか（`0x2A4` の 1 倍以上の倍数）。空きの塊の札は失われるので、これで推す。
-/// 先頭が壊れて大きさが級より大きいときに長い繰り返しにならないよう、級で切る。
+/// 求められた大きさ（ブロックのサイズクラスを越えない範囲）がVMの配列の大きさかどうか（`0x2A4`の1倍以上の倍数）。
+/// 空きのブロックのタグは失われるので、これで推測する。
+/// 先頭が壊れて大きさがサイズクラスより大きいときに長い繰り返しにならないよう、サイズクラスで切る。
 fn vm_array_len(size: u32, payload_bytes: u32) -> u32 {
     size.min(payload_bytes)
 }
@@ -678,8 +694,9 @@ fn is_vm_sized(size: u32, payload_bytes: u32) -> bool {
     s >= a::VM_BYTES && s.is_multiple_of(a::VM_BYTES)
 }
 
-/// 塊の VM の本数。使用中で札がある塊は札で決める: Ex（`ROLLBACK_ARENA_EX_TAG`）は `n × 0x2A4 + 追加` なので表（`a::ex_vm_count`。表に無い大きさは 0 本）から引く。
-/// ほかの札と、札を失った空きの塊（`is_vm_sized` で推す）は、大きさを `0x2A4` で割った数。
+/// ブロックのVMの本数。使用中でタグがあるブロックはタグで決まる。
+/// Ex（`ROLLBACK_ARENA_EX_TAG`）は`n × 0x2A4 + 追加`なので、表（`a::ex_vm_count`。表に無い大きさは0本）から取得する。
+/// ほかのタグとタグを失った空きのブロック（`is_vm_sized`で推測する）は、大きさを`0x2A4`で割った数。
 fn vm_count(b: &BlockInfo, vm_tag: Option<u32>) -> u32 {
     let len = vm_array_len(b.size, b.payload_bytes);
     match vm_tag {
@@ -704,8 +721,9 @@ pub fn walk_ok<M: ArenaMem>(st: &ArenaState, mem: &M) -> bool {
     at >= st.top && st.top == mem.len()
 }
 
-/// D1 の割り当て器 `st1`（コピー `mem1`）を歩き、除外の対象の塊の描画用の欄を、小さい順に `emit` へ渡す。`Dead` なら D1 で空きの VM 大の塊、
-/// `All` なら D1 で使用中で札が `vm_tags` に入る塊（空きの塊は 0 で埋まっているので外さない）。`None` は何も渡さない。
+/// D1のアロケータ`st1`（コピー`mem1`）を歩き、除外の対象のブロックの描画用のフィールドを小さい順に`emit`へ渡す。
+/// 対象は`Dead`ならD1で空きのVM大のブロック。`All`ならD1で使用中でタグが`vm_tags`に入るブロック（空きのブロックは0で埋まっているので外さない）。
+/// `None`は何も渡さない。
 pub fn walk_arena_skips<M: ArenaMem>(
     st1: &ArenaState,
     mem1: &M,
@@ -732,7 +750,7 @@ pub fn walk_arena_skips<M: ArenaMem>(
     }
 }
 
-/// arena の違いを `row` へ数える。塊は D1 の割り当て器 `st1` で歩き、D2 の生死は同じ位置の塊を `st2`・`mem2` で引く。歩き終えた先・長さの違いは塊の外。
+/// arenaの違いを`row`へ数える。ブロックはD1のアロケータ`st1`で歩き、D2の生死は同じ位置のブロックを`st2`・`mem2`で取得して調べる。歩き終えた先・長さの違いはブロックの外。
 pub fn analyze_arena<M: ArenaMem>(
     vm_tags: &[u32],
     a1: &[u8],
@@ -792,7 +810,7 @@ fn skipped_len(walk: ExtraSkips) -> u32 {
     n
 }
 
-/// 枠の配列 `spec` 1 本の診断: 違いがあれば行 `row` へ数え、`mode` で外す欄のバイト数を `row.draw_skipped` に書く。診断は外す前の違いを数える。
+/// 枠の配列`spec` 1本の診断: 違いがあれば行`row`へ数え、`mode`で外すフィールドのバイト数を`row.draw_skipped`に書く。診断は外す前の違いを数える。
 pub fn count_slots(
     spec: &'static RbSlotArray,
     specs: &[RbSlotArray],
@@ -810,10 +828,13 @@ pub fn count_slots(
     });
 }
 
-/// 範囲 `region`（弾・敵・自機の塊）の比べ: この範囲を名指す枠の配列（弾の範囲は弾とレーザーの 2 本）の全部について診断を数え、`mode` が `Dead` なら D1 で死んでいる枠の
-/// 描画用の欄を、`All` なら生死に関係なく全部の枠の描画用の欄を外して比べる。`None` なら `RegionResult::of` と同じ結果。名指す枠の配列が表に無い範囲は `None`。
+/// 範囲`region`（弾・敵・自機のブロック）の比べ。
+/// この範囲を指す枠の配列（弾の範囲は弾とレーザーの2本）の全部について診断を数える。
+/// `mode`が`Dead`ならD1で死んでいる枠の描画用のフィールドを、`All`なら生死に関係なく全部の枠の描画用のフィールドを外して比べる。
+/// `None`なら`RegionResult::of`と同じ結果。指す枠の配列が表に無い範囲は`None`。
 ///
-/// 除外の区間は表の順に渡す。同じ範囲の枠の配列は表で `base` の小さい順に並び、占める所が重ならない（表の検査 `slot_table_is_consistent`）ので全体でも小さい順になる。
+/// 除外の区間は表の順に渡す。
+/// 同じ範囲の枠の配列は表で`base`の小さい順に並び、占める所が重ならない（表の検査`slot_table_is_consistent`）。そのため全体でも小さい順になる。
 pub fn compare_region_slots(
     r: &Region,
     (region, specs): (&str, &'static [RbSlotArray]),
@@ -841,7 +862,7 @@ pub fn compare_region_slots(
     Some(RegionResult::of_with(r, a1, a2, skips, &walk))
 }
 
-/// arena の比べ。`st1` は D1 の割り当て器。歩けなければ（`ArenaWalk::Broken`）除外はしない。
+/// arenaの比べ。`st1`はD1のアロケータ。歩けなければ（`ArenaWalk::Broken`）除外はしない。
 pub fn compare_arena<M: ArenaMem>(
     r: &Region,
     vm_tags: &[u32],
@@ -1005,8 +1026,11 @@ pub fn summary_lines(rs: &[TrialRecord], mode: SkipDraw) -> Vec<String> {
     v.push(format!(
         "{head}: 生きている枠の違い {live} バイト / 描画用の欄の違い {draw} バイト / 描画用の欄以外の違い {non_draw} バイト（うち枠・塊の外 {outside}）/ 描画用の欄を比べから外したバイト {skipped}"
     ));
-    // 内訳: 枠の配列の分は状態に依らず一定（`all` なら弾 536 × 5 VM × 2 陣 ＋ 敵 128 × 2 VM × 2 ＋ 自機ショット 128 × 1 × 2 = 6,128 VM × 28 B = 171,584 B / 回、
-    // レーザー 48 本 × (2 VM × 28 B ＋ 描画だけの欄 15 B) × 2 陣 = 6,816 B で 178,400 B / 回）。arena の分は使用中の VM の配列の数で動く。
+    // 内訳: 枠の配列の分は状態に依らず一定（`all`なら次の合計）。
+    // - 弾536 × 5 VM × 2陣 ＋ 敵128 × 2 VM × 2 ＋ 自機ショット128 × 1 × 2 = 6,128 VM × 28 B = 171,584 B / 回。
+    // - レーザー48本 × (2 VM × 28 B ＋ 描画だけのフィールド15 B) × 2陣 = 6,816 B。
+    // - 合わせて178,400 B / 回。
+    // arenaの分は使用中のVMの配列の数で動く。
     let (skipped_slots, skipped_arena) = agg.iter().fold((0u32, 0u32), |(s, r), x| match x.kind {
         RowKind::Slots(_) => (s.saturating_add(x.draw_skipped), r),
         _ => (s, r.saturating_add(x.draw_skipped)),
@@ -1060,12 +1084,12 @@ mod tests {
     #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
 
-    /// VM 1 本あたりに `all` / `dead` が外すバイト数 = 回転 z 4 ＋ pos 12 ＋ 補間の始点 12。
+    /// VM 1本あたりに`all` / `dead`が外すバイト数 = 回転z 4 ＋ pos 12 ＋ 補間の始点12。
     const VM_SKIP: u32 = 4 + 12 + 12;
     const L_SKIP: u32 = 2 * VM_SKIP + 15;
 
     // ---- 偽の枠の配列 ----
-    // 枠 4 つ・stride 0x600・VM は枠の +0x4 と +0x2A8。生死の欄は枠の +0x5E0（u16。0 と 6 が死）。範囲は `[0, 0x40)` が枠の前・`[0x1840, 0x1860)` が枠の後。
+    // 枠4つ・stride 0x600・VMは枠の +0x4と +0x2A8。生死のフィールドは枠の +0x5E0（u16。0と6が死）。範囲は`[0, 0x40)`が枠の前・`[0x1840, 0x1860)`が枠の後。
     const BASE: usize = 0x40;
     const STRIDE: usize = 0x600;
     const COUNT: usize = 4;
@@ -1088,7 +1112,7 @@ mod tests {
         pos_by_vm: false,
         source: "",
     };
-    /// 除外の VM 1 本（`+0x4`）と診断だけの候補 VM 1 本（`+0x2A8`）。VM は 0x2A4 ずつ離す（重なると欄の並びが小さい順にならない）。
+    /// 除外のVM 1本（`+0x4`）と診断だけの候補VM 1本（`+0x2A8`）。VMは0x2A4ずつ離す（重なるとフィールドの並びが小さい順にならない）。
     static SPEC_A: RbSlotArray = RbSlotArray {
         label: "t_bullets",
         region: "t_region",
@@ -1262,7 +1286,7 @@ mod tests {
         for &o in &outside {
             a2[slot(2) + o] = 1;
         }
-        dirty_draw(&mut a2, 2, 0x1A0); // 診断だけの候補 VM
+        dirty_draw(&mut a2, 2, 0x1A0); // 診断だけの候補VM
         let (none, row_none) = run(&SPEC, &a1, &a2, &Skips::EMPTY, SkipDraw::None);
         let (dead, row_dead) = run(&SPEC, &a1, &a2, &Skips::EMPTY, SkipDraw::Dead);
         let all = 2 * 16 + outside.len() as u32 + 16;
@@ -1291,8 +1315,8 @@ mod tests {
         let (a1, mut a2) = pair([0; COUNT], [0; COUNT]);
         a2[3] = 9; // 枠の前
         a2[BASE + STRIDE * COUNT + 4] = 9; // 枠の後
-        a2[slot(1) + 0x100] = 9; // 死んだ枠の中の別の欄
-        set16(&mut a2, slot(3) + FLAG, 6); // 死んだ枠の旗が 0 → 6（同じ「死」の値でも、バイトが違えば食い違い）
+        a2[slot(1) + 0x100] = 9; // 死んだ枠の中の別のフィールド
+        set16(&mut a2, slot(3) + FLAG, 6); // 死んだ枠のフラグが0 → 6（同じ「死」の値でも、バイトが違えば食い違い）
         let (dead, row) = run(&SPEC, &a1, &a2, &Skips::EMPTY, SkipDraw::Dead);
         assert_eq!(dead.diff.bytes, 4);
         assert_eq!(row.outside(), 2);
@@ -1795,11 +1819,11 @@ mod tests {
         let a1 = m1.0.clone();
         let mut a2 = a1.clone();
         for o in pa + 0x238..pa + 0x244 {
-            a2[o as usize] = 0x55; // 使用中の VM の配列 A の始点 12 B
+            a2[o as usize] = 0x55; // 使用中のVMの配列Aの始点12 B
         }
         a2[(pa + 0x237) as usize] = 0x55;
         a2[(pa + 0x244) as usize] = 0x55;
-        a2[(pb + 0x238) as usize] = 0x66; // 空きの VM 大の塊 B の始点 1 B
+        a2[(pb + 0x238) as usize] = 0x66; // 空きのVM大のブロックBの始点1 B
         let mem2 = VecMem(a2.clone());
         let (none, _, _) = run_arena(&a1, &a2, &st1, &st1, &mem2, SkipDraw::None);
         let (dead, row_dead, _) = run_arena(&a1, &a2, &st1, &st1, &mem2, SkipDraw::Dead);
@@ -1884,7 +1908,7 @@ mod tests {
             a2[(ex + vm * a::VM_BYTES + 0x8) as usize] = 1;
             a2[(ex + vm * a::VM_BYTES + 0x208) as usize] = 1;
         }
-        a2[(ex + 5 * a::VM_BYTES + 0x8) as usize] = 1; // 追加（状態ブロック）の欄（6 本目の位置ではあるが、本数に入らない）
+        a2[(ex + 5 * a::VM_BYTES + 0x8) as usize] = 1; // 追加（状態ブロック）のフィールド（6本目の位置ではあるが、本数に入らない）
         a2[(plain + 0x8) as usize] = 1;
         let mem2 = VecMem(a2.clone());
         let (all, row, walk) = run_arena(&a1, &a2, &s, &s, &mem2, SkipDraw::All);
@@ -1963,21 +1987,21 @@ mod tests {
         assert_eq!(a::ROLLBACK_EX_VM_COUNTS.len(), 9);
     }
 
-    /// `p?_bullets` の塊の大きさ（`ROLLBACK_BLOCKS`。`0x004150EB push`）。
+    /// `p?_bullets`のブロックの大きさ（`ROLLBACK_BLOCKS`。`0x004150EB push`）。
     const P_LEN: usize = 0x25E1C0;
     const L_BASE: usize = 0x24D424;
     const L_STRIDE: usize = 0x59C;
-    /// レーザー 1 本の中で、描画だけが書く欄（VM の回転 z・pos と、ほかの描画だけの欄）の（位置, 長さ）。計 71 バイト。
+    /// レーザー1本の中で描画だけが書くフィールド（VMの回転z・posとほかの描画だけのフィールド）の（位置, 長さ）。計71バイト。
     const L_DRAW: [(usize, usize); 10] = [
-        (0x8, 4),    // VM 0 の回転 z
-        (0x208, 12), // VM 0 の pos
-        (0x238, 12), // VM 0 の補間の始点
-        (0x2AC, 4),  // VM 1 の回転 z（0x2A4 + 0x8）
-        (0x2BC, 8),  // VM 1 の拡大
-        (0x494, 4),  // VM 1 の色と α
-        (0x49C, 1),  // VM 1 の旗の低位 1 B（描画 0x57 / 進め直し 0x17。th09_addr.rs の注）
-        (0x4AC, 12), // VM 1 の pos（0x2A4 + 0x208）
-        (0x4DC, 12), // VM 1 の補間の始点（0x2A4 + 0x238）
+        (0x8, 4),    // VM 0の回転z
+        (0x208, 12), // VM 0のpos
+        (0x238, 12), // VM 0の補間の始点
+        (0x2AC, 4),  // VM 1の回転z（0x2A4 + 0x8）
+        (0x2BC, 8),  // VM 1の拡大
+        (0x494, 4),  // VM 1の色と α
+        (0x49C, 1),  // VM 1のフラグの低位1 B（描画0x57 / 進め直し0x17。th09_addr.rsの注）
+        (0x4AC, 12), // VM 1のpos（0x2A4 + 0x208）
+        (0x4DC, 12), // VM 1の補間の始点（0x2A4 + 0x238）
         (0x596, 2),  // u16
     ];
 
@@ -2047,7 +2071,7 @@ mod tests {
     #[test]
     fn laser_all_excludes_exactly_the_draw_only_bytes() {
         let (mut a1, _) = p_pair();
-        set_laser_alive(&mut a1, 1, 1); // レーザー 1 は生きている、0 は死んでいる
+        set_laser_alive(&mut a1, 1, 1); // レーザー1は生きている、0は死んでいる
         let want: Vec<usize> = L_DRAW.iter().flat_map(|&(o, l)| o..o + l).collect();
         assert_eq!(want.len(), 71);
         assert_eq!(want.len() as u32, L_SKIP);
@@ -2061,10 +2085,10 @@ mod tests {
             }
             assert!(excluded_in_laser(&a1, SkipDraw::None, 0, label).is_empty());
         }
-        let kept: Vec<usize> = (0x548..0x596) // 世界の欄（生死 +0x584 を含む）
-            .chain([0x598, 0x599, 0x59A, 0x59B]) // 世界の欄の残りと枠の末尾
-            .chain([0x49D, 0x49E, 0x49F, 0x1F0, 0x0, 0x100, 0x2A4, 0x54]) // VM 1 の旗の上位 3 B・VM 0 の更新の欄・VM の先頭
-            .chain([0x237, 0x244, 0x4DB, 0x4E8]) // 補間の始点のすぐ外（割り込みの控えの末尾・終点の先頭）。VM 0 と VM 1
+        let kept: Vec<usize> = (0x548..0x596) // 世界のフィールド（生死 +0x584を含む）
+            .chain([0x598, 0x599, 0x59A, 0x59B]) // 世界のフィールドの残りと枠の末尾
+            .chain([0x49D, 0x49E, 0x49F, 0x1F0, 0x0, 0x100, 0x2A4, 0x54]) // VM 1のフラグの上位3 B・VM 0の更新のフィールド・VMの先頭
+            .chain([0x237, 0x244, 0x4DB, 0x4E8]) // 補間の始点のすぐ外（割り込みの控えの末尾・終点の先頭）。VM 0とVM 1
             .collect();
         for o in kept {
             assert!(!want.contains(&o), "{o:#x} は外してはいけない欄");
@@ -2075,8 +2099,8 @@ mod tests {
     fn laser_dead_mode_skips_only_dead_lasers() {
         let (mut a1, _) = p_pair();
         set_laser_alive(&mut a1, 1, 1);
-        set_laser_alive(&mut a1, 2, 0x100); // bit0 が無い = 死
-        set_laser_alive(&mut a1, 3, 0x101); // bit0 がある = 生
+        set_laser_alive(&mut a1, 2, 0x100); // bit0が無い = 死
+        set_laser_alive(&mut a1, 3, 0x101); // bit0がある = 生
         let want: Vec<usize> = L_DRAW.iter().flat_map(|&(o, l)| o..o + l).collect();
         for (i, dead) in [(0, true), (1, false), (2, true), (3, false)] {
             let got = excluded_in_laser(&a1, SkipDraw::Dead, i, "p1_lasers");
@@ -2133,11 +2157,11 @@ mod tests {
             set_laser_alive(&mut a2, 3, 1);
             dirty_laser_draw(&mut a2, 3); // 71 B
             for o in [0x548, 0x554, 0x598, 0x599] {
-                a2[laser(3) + o] = 9; // 世界の欄 4 B
+                a2[laser(3) + o] = 9; // 世界のフィールド4 B
             }
-            a2[laser(3) + 0x584] = 3; // 生死の欄も世界の欄（bit0 は立ったまま、値は違う）+1 B
+            a2[laser(3) + 0x584] = 3; // 生死のフィールドも世界のフィールド（bit0は立ったまま、値は違う）+1 B
             for o in [0x49D, 0x1F0, 0x59A] {
-                a2[laser(3) + o] = 9; // 旗の上位 3 B の 1 つ・VM 0 の更新の欄・末尾 = 枠の中のほか 3 B
+                a2[laser(3) + o] = 9; // フラグの上位3 Bの1つ・VM 0の更新のフィールド・末尾 = 枠の中のほか3 B
             }
             let (none, dn) = region_run(region_name, (&a1, &a2), SkipDraw::None);
             let (dead, dd) = region_run(region_name, (&a1, &a2), SkipDraw::Dead);
@@ -2150,7 +2174,7 @@ mod tests {
             );
             assert_eq!(all.diff.bytes, 8, "all で残るのは世界の欄・旗・生死・ほか");
             let row = row_of(&da, lasers);
-            let by = |cat: usize| row.bytes[3][cat]; // 類 3 = D1 生・D2 生
+            let by = |cat: usize| row.bytes[3][cat]; // 類3 = D1生・D2生
             assert_eq!(by(CAT_ROT), 8, "回転 z（2 本の VM）");
             assert_eq!(by(CAT_POS), 12, "VM 0 の pos");
             assert_eq!(by(CAT_POS_VM1), 12, "VM 1 の pos");
@@ -2190,13 +2214,13 @@ mod tests {
     fn diffs_outside_both_arrays_stay_and_are_counted_once() {
         let (a1, mut a2) = p_pair();
         a2[0x10] = 1; // 弾の枠の前
-        a2[0x24C360 + 5] = 1; // 537 枠目の弾（弾の枠 0〜535 の外）
-        a2[0x24D423] = 1; // レーザーの直前の 1 バイト
-        a2[0x25E164] = 1; // レーザーの後ろの最初の 1 バイト
-        a2[0x25E1BF] = 1; // 塊の最後の 1 バイト
-        a2[0x24C360 - 1] = 1; // 弾の枠 535 の最後のバイト = 枠の中のほか
-        a2[laser(47) + L_STRIDE - 1] = 1; // レーザー 47 の最後のバイト = 枠の中のほか
-        a2[laser(0) + 0x100] = 1; // レーザー 0 の中
+        a2[0x24C360 + 5] = 1; // 537枠目の弾（弾の枠0〜535の外）
+        a2[0x24D423] = 1; // レーザーの直前の1バイト
+        a2[0x25E164] = 1; // レーザーの後ろの最初の1バイト
+        a2[0x25E1BF] = 1; // ブロックの最後の1バイト
+        a2[0x24C360 - 1] = 1; // 弾の枠535の最後のバイト = 枠の中のほか
+        a2[laser(47) + L_STRIDE - 1] = 1; // レーザー47の最後のバイト = 枠の中のほか
+        a2[laser(0) + 0x100] = 1; // レーザー0の中
         for region_name in ["p1_bullets", "p2_bullets"] {
             let (bul, lsr) = if region_name == "p1_bullets" {
                 ("p1_bullets", "p1_lasers")
@@ -2579,9 +2603,9 @@ mod tests {
             "{none:?}"
         );
         let (a1, mut a2) = pair([0, 1, 0, 0], [0, 1, 0, 0]);
-        dirty_draw(&mut a2, 0, 0x4); // 死んだ枠の描画欄 16 B
-        dirty_draw(&mut a2, 1, 0x4); // 生きた枠の描画欄 16 B
-        a2[slot(2) + 0x100] = 1; // 死んだ枠の欄の外 1 B
+        dirty_draw(&mut a2, 0, 0x4); // 死んだ枠の描画フィールド16 B
+        dirty_draw(&mut a2, 1, 0x4); // 生きた枠の描画フィールド16 B
+        a2[slot(2) + 0x100] = 1; // 死んだ枠のフィールドの外1 B
         let (_, row) = run(&SPEC, &a1, &a2, &Skips::EMPTY, SkipDraw::None);
         let mut rec = TrialRecord::EMPTY;
         rec.draw.begin(a::ROLLBACK_SLOT_ARRAYS, SkipDraw::None);

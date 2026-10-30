@@ -1,37 +1,41 @@
-//! 描画の地点（`0x0042DD51`）の素のアセンブリの入口と、描画のリングバッファ（unsafe はアセンブリだけ）。
+//! 描画の地点（`0x0042DD51`）の素のアセンブリの入口と、描画のリングバッファ（unsafeはアセンブリだけ）。
 //!
-//! EndScene の直前の `mov eax,[0x4B3108]` を inline detour（`detour.rs`）で差し替え、この入口へ飛ばす。入口は回数を `lock inc` し、リングバッファ
-//! （1 件 16 バイト: TSC 8 / その時点の tick の番号 `SEQ` の値 4 / 札 4）に 1 件書いて、盗んだ `mov eax,[0x4B3108]` を実行して `0x0042DD56` へ戻るトランポリンへ `jmp` する。
-//! **ゲームのスレッドで Rust のコードは走らない**: ただし `overlay_win::OVERLAY_ON` が 0 でないときは `overlay_on_draw`（右下に 1 行）、`shot_win::SHOT_REQ` が 0 でないときは
-//! `shot_on_draw`（バックバッファの撮影）を、全部のレジスタとフラグを保って呼ぶ（文字の描画が先。撮った絵に文字が写る）。読み方は tick のリングバッファと同じ seqlock（`ticks::classify`）。
+//! EndSceneの直前の`mov eax,[0x4B3108]`をinline detour（`detour.rs`）で差し替え、この入口へ飛ばす。
+//! 入口は回数を`lock inc`し、リングバッファ（1件16バイト: TSC 8 / その時点のtickの番号`SEQ`の値4 / チケット4）に1件書く。
+//! その後、盗んだ`mov eax,[0x4B3108]`を実行して`0x0042DD56`へ戻るトランポリンへ`jmp`する。
+//! **ゲームのスレッドでRustのコードは走らない**: ただし次は全部のレジスタとフラグを保って呼ぶ。
+//! `overlay_win::OVERLAY_ON`が0でないときは`overlay_on_draw`（右下に1行）。
+//! `shot_win::SHOT_REQ`が0でないときは`shot_on_draw`（バックバッファの撮影）。
+//! 文字の描画が先で、撮った絵に文字が写る。
+//! 読み方はtickのリングバッファと同じseqlock（`ticks::classify`）。
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use crate::ticks::{RING_MASK, SlotState, classify};
 
-/// 描画のリングバッファの件数（2 の冪）。
+/// 描画のリングバッファの件数（2の冪）。
 pub const DRAW_RING_LEN: u32 = 4096;
 pub const DRAW_SLOT_WORDS: usize = 4;
 pub const DRAW_SLOT_SHIFT: u32 = 4;
 
-// 枠の中のバイトの位置（入口のアセンブリが `const` で使う。値はここだけ）。
+// 枠の中のバイトの位置（入口のアセンブリが`const`で使う。値はここだけ）。
 /// TSC（`rdtsc`）の下位 / 上位。
 pub const DOFF_TSC_LO: u32 = 0;
 pub const DOFF_TSC_HI: u32 = 4;
-/// その時点の tick の番号（`stub::SEQ`。描画がどの更新の後に走ったかを結びつける）。
+/// その時点のtickの番号（`stub::SEQ`。描画がどの更新の後に走ったかを結びつける）。
 pub const DOFF_TICK_SEQ: u32 = 8;
-/// 番号札（seq + 1）。0 は「書いている途中」。中身の後ろに書く（tick のリングバッファと同じ seqlock）。
+/// チケット番号（seq + 1）。0は「書いている途中」。中身の後ろに書く（tickのリングバッファと同じseqlock）。
 pub const DOFF_TICKET: u32 = 12;
 
-/// 描画の地点を通った回数。入口が `lock inc`、読み取りのスレッドが読む。
+/// 描画の地点を通った回数。入口が`lock inc`、読み取りのスレッドが読む。
 pub static DRAW_CALLS: AtomicU32 = AtomicU32::new(0);
-/// 描画のリングバッファの次の番号。入口が `lock xadd` で 1 つずつ取る。
+/// 描画のリングバッファの次の番号。入口が`lock xadd`で1つずつ取る。
 pub static DRAW_SEQ: AtomicU32 = AtomicU32::new(0);
-/// 入口がトランポリンへ飛ぶためのアドレス。`detour::install_detour` が JMP を書く前に設定する（0 の間はこの入口へ向く
-/// JMP はまだ無い）。**0 なら入口は 0 アドレスへ飛ぶので、設定する前に JMP を書いてはならない。**
+/// 入口がトランポリンへ飛ぶためのアドレス。`detour::install_detour`がJMPを書く前に設定する（0の間はこの入口へ向くJMPはまだ無い）。
+/// **0なら入口は0アドレスへ飛ぶので、設定する前にJMPを書いてはならない。**
 pub static DRAW_TRAMPOLINE: AtomicU32 = AtomicU32::new(0);
 
-/// 描画のリングバッファの 1 件（16 バイト）。
+/// 描画のリングバッファの1件（16バイト）。
 #[repr(C)]
 pub struct DrawSlot {
     pub words: [AtomicU32; DRAW_SLOT_WORDS],
@@ -51,17 +55,20 @@ pub static DRAW_RING: DrawRing = DrawRing {
 };
 
 pub const DRAW_RING_MASK: u32 = DRAW_RING_LEN - 1;
-// 描画のリングバッファの番号も tick のリングバッファと同じ大きさ（4096）なので `RING_MASK` と同じ（読み手の分岐を減らす）。
+// 描画のリングバッファの番号もtickのリングバッファと同じ大きさ（4096）なので`RING_MASK`と同じ（読み手の分岐を減らす）。
 const _: () = assert!(DRAW_RING_MASK == RING_MASK);
 
-// SAFETY（`#[unsafe(naked)]`）: 本体は `naked_asm!` だけ。差し替えた `mov eax,[0x4B3108]`（`A1 08 31 4B 00`）の代わりに呼ばれ、
-// 最後にトランポリンへ飛ぶ。フラグと eax・ecx・edx・ebx を push して逆順に pop し、esi・edi・ebp・esp は変えない。
-// 書くのは DLL の静的変数だけで、ゲームのメモリは読まない。DRAW_TRAMPOLINE は JMP を書く前に設定される（`detour::install_detour`）。
-// 枠の番号は `and DRAW_RING_MASK` でリングバッファの中に収まる。
-// 文字の描画・撮影の経路は `pushad` → `cld`（Rust の関数が前提にする DF = 0。フラグは先頭の `pushfd` で取ってあり最後の `popfd` で
-// 戻る）→ `extern "C"` の呼び出し（中は全部 `catch_unwind`）→ `popad`（スタックは `pushad` の 32 バイトだけ使い、`popad` の後は入った時と同じ位置）。`0x0042DD51` は `SetTexture` の call の直後で x87 の
-// スタックは空の見込み。ゲームのコードは XMM を使っていない見込みなので、Rust が XMM を使っても壊さない。x87 の制御語は変えない。
-/// 描画の地点（`0x0042DD51`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
+// SAFETY（`#[unsafe(naked)]`）: 本体は`naked_asm!`だけ。
+// 差し替えた`mov eax,[0x4B3108]`（`A1 08 31 4B 00`）の代わりに呼ばれ、最後にトランポリンへ飛ぶ。
+// フラグとeax・ecx・edx・ebxをpushして逆順にpopし、esi・edi・ebp・espは変えない。
+// 書くのはDLLの静的変数だけで、ゲームのメモリは読まない。
+// DRAW_TRAMPOLINEはJMPを書く前に設定される（`detour::install_detour`）。
+// 枠の番号は`and DRAW_RING_MASK`でリングバッファの中に収まる。
+// 文字の描画・撮影の経路は次の順に進む: `pushad` → `cld`（Rustの関数が前提にする DF = 0。フラグは先頭の`pushfd`で取ってあり最後の`popfd`で戻る）→ `extern "C"`の呼び出し（中は全部`catch_unwind`）→ `popad`。
+// スタックは`pushad`の32バイトだけ使い、`popad`の後は入った時と同じ位置に戻る。
+// `0x0042DD51`は`SetTexture`のcallの直後で、x87のスタックは空の見込み。
+// ゲームのコードはXMMを使っていない見込みなので、RustがXMMを使っても壊さない。x87の制御語は変えない。
+/// 描画の地点（`0x0042DD51`）の差し替え先。Rustからは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn draw_entry() {
     core::arch::naked_asm!(
@@ -83,10 +90,10 @@ pub extern "C" fn draw_entry() {
         "mov dword ptr [{ring} + ebx + {o_tsc_hi}], edx",
         "mov eax, dword ptr [{tick_seq}]",
         "mov dword ptr [{ring} + ebx + {o_tick_seq}], eax",
-        // 札 = seq + 1（中身の書きより後に見える。x86 は書きの順を入れ替えない）。
+        // チケット = seq + 1（中身の書き込みより後に見える。x86は書き込みの順を入れ替えない）。
         "inc ecx",
         "mov dword ptr [{ring} + ebx + {o_ticket}], ecx",
-        // 文字の描画（有効なら）。撮影より先に描く（撮った絵に文字が写る）。0 なら素通り（cmp と je の 2 つだけ）。
+        // 文字の描画（有効なら）。撮影より先に描く（撮った絵に文字が写る）。0なら素通り（cmpとjeの2つだけ）。
         "cmp dword ptr [{ov_on}], 0",
         "je 3f",
         "pushad",
@@ -94,7 +101,7 @@ pub extern "C" fn draw_entry() {
         "call {ov_draw}",
         "popad",
         "3:",
-        // 撮影（要求が 0 でなければ）。0 なら素通り。
+        // 撮影（要求が0でなければ）。0なら素通り。
         "cmp dword ptr [{shot_req}], 0",
         "je 2f",
         "pushad",
@@ -138,7 +145,7 @@ pub fn draw_next_seq() -> u32 {
     DRAW_SEQ.load(Ordering::Acquire)
 }
 
-/// トランポリンのアドレスを設定する（JMP を書く前に呼ぶこと。0 なら入口は 0 アドレスへ飛ぶ）。
+/// トランポリンのアドレスを設定する（JMPを書く前に呼ぶこと。0なら入口は0アドレスへ飛ぶ）。
 pub fn set_draw_trampoline(addr: u32) {
     DRAW_TRAMPOLINE.store(addr, Ordering::SeqCst);
 }

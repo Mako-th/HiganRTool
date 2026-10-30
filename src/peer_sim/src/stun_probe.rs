@@ -1,7 +1,9 @@
-//! `--stun-probe <宛先1> <宛先2>`（開発用。走らせずに STUN の 2 か所へ 1 つの受信ソケットから問い合わせて終わる）。
-//! 家庭のルーターが、外へ出る通信の外側のポートを宛先ごとに変えるか（RFC 4787 の endpoint-dependent mapping）を、本物のゲームを起動せずに見る。同じ受信ソケットから 2 か所の STUN へ聞いて、見えたアドレスのポートが同じなら「宛先に依らない割り当て」（STUN で見えたアドレスを接続コードに載せる方法が成り立つ）、違えば「宛先ごとに変わる割り当て」（STUN で見えたアドレスは相手に使えない）。
-//! 範囲 `internet` と一緒にだけ書ける（外の STUN サーバーへ問い合わせるツールなので、範囲を広げたことを引数に書かせる。本物の STUN サーバーへ問い合わせてよいのは許可を得た後だけ）。検査は loopback の偽の STUN（`stun_fake`）2 つだけへ問い合わせる。
-//! STUN の読み書きと送り直しは core の `stun::Query`、宛先のガードと名前の文字の形は `guard`。名前を引く待ちの上限は dll の `net_udp::lookup_with_timeout` と同じ考え方（OS の名前引きは中断できないので、別のスレッドで引いて上限までしか待たない。dll は cdylib なのでここから呼べず、同じ形を持つ）。
+//! `--stun-probe <宛先1> <宛先2>`（開発用。走らせずにSTUNの2か所へ1つの受信ソケットから問い合わせて終わる）。
+//! 家庭のルーターが外へ出る通信の外側のポートを宛先ごとに変えるか（RFC 4787のendpoint-dependent mapping）を、本物のゲームを起動せずに見る。
+//! 同じ受信ソケットから2か所のSTUNへ聞き、見えたアドレスのポートが同じなら「宛先に依らない割り当て」（STUNで見えたアドレスを接続コードに載せる方法が成り立つ）。違えば「宛先ごとに変わる割り当て」（STUNで見えたアドレスは相手に使えない）。
+//! 範囲`internet`と一緒にだけ書ける（外のSTUNサーバーへ問い合わせるツールなので範囲を広げたことを引数に書かせる。本物のSTUNサーバーへ問い合わせてよいのは許可を得た後だけ）。検査はloopbackの偽のSTUN（`stun_fake`）2つだけへ問い合わせる。
+//! STUNの読み書きと再送はcoreの`stun::Query`。宛先のガードと名前の文字の形は`guard`。
+//! 名前解決の待ちの上限はdllの`net_udp::lookup_with_timeout`と同じ考え方。OSの名前解決は中断できないので別のスレッドで解決し、上限までしか待たない。dllはcdylibなのでここから呼べず、同じ形を持つ。
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -13,7 +15,7 @@ use higanr_core::wire::{self, Datagram};
 
 use crate::sim::mix;
 
-/// 名前を引く待ちの上限（dll の `net_udp::DNS_TIMEOUT` と同じ 2 秒）。
+/// 名前解決の待ちの上限（dllの`net_udp::DNS_TIMEOUT`と同じ2秒）。
 pub const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
 const RECV_POLL: Duration = Duration::from_millis(5);
@@ -22,12 +24,12 @@ const RECV_POLL: Duration = Duration::from_millis(5);
 pub enum Target {
     /// `IP:ポート`。読むときに範囲のガードを通してある。
     Addr(SocketAddr),
-    /// `名前:ポート`（例 `stun.cloudflare.com:3478`）。名前は文字の形だけ見てある。範囲のガードは引いた後のアドレスに掛ける。
+    /// `名前:ポート`（例`stun.cloudflare.com:3478`）。名前は文字の形だけ見てある。範囲のガードは名前解決した後のアドレスに掛ける。
     Name { host: String, port: u16 },
 }
 
 impl Target {
-    /// 引数の値を読む。アドレスは範囲のガード（`guard::check_peer`）、名前は文字の形（`guard::check_host_name`）とポート 1〜65535。
+    /// 引数の値を読む。アドレスは範囲のガード（`guard::check_peer`）、名前は文字の形（`guard::check_host_name`）とポート1〜65535。
     pub fn parse(v: &str, scope: Scope) -> Result<Target, String> {
         if let Ok(a) = v.parse::<SocketAddr>() {
             guard::check_peer(a, scope)?;
@@ -94,8 +96,8 @@ pub fn lookup_with_timeout(
     })
 }
 
-/// 問い合わせ先をアドレスにする。名前は `lookup` で引き、引けたアドレスのうち受信ソケットと同じ族（`want_v4`）で範囲の中の最初の 1 つ。範囲
-/// loopback では `localhost` 以外の名前を引かない（DNS の問い合わせは外への通信）。dll の `net_udp::resolve_stun` と同じ選び方。
+/// 問い合わせ先をアドレスにする。名前は`lookup`で解決し、得られたアドレスのうち受信ソケットと同じアドレスファミリ（`want_v4`）で範囲の中の最初の1つを使う。
+/// 範囲がloopbackのときは`localhost`以外の名前を解決しない（DNSの問い合わせは外への通信）。dllの`net_udp::resolve_stun`と同じ選び方。
 pub fn resolve(
     target: &Target,
     scope: Scope,
@@ -129,14 +131,14 @@ pub fn resolve(
 pub enum Verdict {
     /// アドレスが同じ（宛先に依らない割り当て）。
     Same,
-    /// ポートが違う（宛先ごとに変わる割り当て。IP が違っても、ポートが違えばこれ）。
+    /// ポートが違う（宛先ごとに変わる割り当て。IPが違っても、ポートが違えばこれ）。
     PortDiffers,
-    /// ポートは同じで IP だけ違う（宛先によって出口の IP が変わる回線）。
+    /// ポートは同じでIPだけ違う（宛先によって出口のIPが変わる回線）。
     IpDiffers,
 }
 
-/// 2 つの「見えたアドレス」を比べる。判定そのものは core の `stun::compare_mappings`（dll の診断と同じ）。ここはその 4 通りを、この
-/// ツールの 3 通りの言い方にコピーするだけ。族が違えば None。
+/// 2つの「見えたアドレス」を比べる。判定そのものはcoreの`stun::compare_mappings`（dllの診断と同じ）。
+/// ここはその4通りをこのツールの3通りの言い方にコピーするだけ。アドレスファミリが違えばNone。
 pub fn verdict(a: SocketAddr, b: SocketAddr) -> Option<Verdict> {
     Some(match stun::compare_mappings(a, b)? {
         Mapping::Same => Verdict::Same,
@@ -153,14 +155,15 @@ pub struct Answer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
-    /// 開いた受信ソケット（`--bind` のポートが 0 のとき、OS が選んだアドレス）。
+    /// 開いた受信ソケット（`--bind`のポートが0のとき、OSが選んだアドレス）。
     pub local: SocketAddr,
     pub answers: [Answer; 2],
     pub verdict: Verdict,
 }
 
-/// 1 か所へ問い合わせる（`stun::Query`。250 ms ごとに 8 回、計 2 秒で打ち切る）。`sock` から出し、`server` から来た STUN の
-/// 応答だけを `Query` へ渡す（ほかの送り元・STUN でないものは捨てる）。宛先は範囲の中だけ（送る前にガードを通す）。
+/// 1か所へ問い合わせる（`stun::Query`。250 msごとに8回、計2秒で打ち切る）。
+/// `sock`から送り、`server`から来たSTUNの応答だけを`Query`へ渡す（ほかの送り元・STUNでないものは捨てる）。
+/// 宛先は範囲の中だけ（送る前にガードを通す）。
 pub fn query(
     sock: &UdpSocket,
     server: SocketAddr,
@@ -186,8 +189,8 @@ pub fn query(
                     q.on_datagram(bytes);
                 }
             }
-            // 待ちの上限、または前の送りへの ICMP（Windows は次の受信に WSAECONNRESET で出す）。どちらも次の周回で
-            // 送り直しか打ち切りが決まる。
+            // 待ちの上限か、前の送信へのICMP（Windowsは次の受信でWSAECONNRESETとして返す）。
+            // どちらも次の周回で再送か打ち切りが決まる。
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
             Err(e) => return Err(format!("STUN の応答を受けられない: {e}")),
@@ -205,8 +208,8 @@ pub fn query(
     }
 }
 
-/// transaction id（96 bit）。宛先の番号ごとに変える。peer_sim は OS の乱数を持たない（std だけ）ので、時刻とプロセス番号から作る。
-/// この問い合わせは推し量られて偽の応答を差し込まれても、見えたアドレスの表示が違うだけで害は無い。
+/// transaction id（96 bit）。宛先の番号ごとに変える。peer_simはOSの乱数を持たない（stdだけ）ので時刻とプロセス番号から作る。
+/// この問い合わせは推測されて偽の応答を差し込まれても、見えたアドレスの表示が違うだけで害は無い。
 fn probe_txn(index: u64) -> TransactionId {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -219,8 +222,9 @@ fn probe_txn(index: u64) -> TransactionId {
     out
 }
 
-/// 1 つの受信ソケット `sock`（`args.bind` で開いたもの）から 2 か所へ順に問い合わせ、見えたアドレスを比べる。片方でも答えが
-/// 無ければ Err（比べられないので、黙って「同じ」にしない）。`lookup` は名前を引く関数（検査は注入する）。
+/// 1つの受信ソケット`sock`（`args.bind`で開いたもの）から2か所へ順に問い合わせ、見えたアドレスを比べる。
+/// 片方でも答えが無ければErr（比べられないので黙って「同じ」にしない）。
+/// `lookup`は名前解決の関数（検査は注入する）。
 pub fn run(
     args: &Args,
     sock: &UdpSocket,
@@ -235,7 +239,7 @@ pub fn run(
         resolve(&args.targets[0], args.scope, want_v4, &lookup)?,
         resolve(&args.targets[1], args.scope, want_v4, &lookup)?,
     ];
-    // 同じ宛先へ 2 回聞くと、宛先に依る割り当てでも必ず「同じ」になる（比べる意味が無い）。
+    // 同じ宛先へ2回聞くと宛先に依る割り当てでも必ず「同じ」になる（比べる意味が無い）。
     if servers[0] == servers[1] {
         return Err(format!(
             "2 つの宛先が同じアドレス {}（別々の STUN サーバーを書く。宛先が同じだと割り当てが宛先に依るかを比べられない）",

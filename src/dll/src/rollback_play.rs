@@ -1,21 +1,35 @@
-//! rollback のモードの製品の経路の部品（pure。unsafe 無し。Win32・ゲームのメモリ・入口のアセンブリは `rollback_play_win.rs` と `rollback_win.rs`）。
+//! rollbackのモードの製品の経路の部品（pure。unsafe無し。Win32・ゲームのメモリ・入口のアセンブリは`rollback_play_win.rs`と`rollback_win.rs`）。
 //!
-//! - [`GameWindow`]: 本物の花映塚のための `higanr_core::rollback::Window`。コピー（決まった塊・`.data` の範囲・DLL の領域の使った所・更新の列のリンク（レジストリの先頭の 2 つの節 0x40 B））と、コピーのときにバックアップする Supervisor の `+0x58C` / `+0x590`、書き戻し、更新だけを 1 回回す tick、進め直しの前後の SE・BGM・文字の数のバックアップと戻し。
-//! - 入口の手順 [`scan_point_with`] / [`post_present_with`]: 状態機械を 1 フレームぶん進める。状態機械は [`Machine`] のインターフェースの向こう（本物は `netplay/rollback.rs` の `NpMachine`、検査は `Rollback` そのもの）。設置の手順 [`install_play`]: 確保・解放の 3 入口 ＋ calloc ＋ 走査の call を、期待バイト列が全部合ったときだけ書く。
-//! - 入力の地点は do_frame の走査の call `0x0042DCA9` の包み（走査の直前・走査の外）に設ける。花映塚の入力の地点 `0x0043112D` は更新の走査の中（優先度 0 の Supervisor::on_tick の先頭）にあり、そこから走査を呼び直すと再入するうえ、その tick の残りは入口から戻った後に走るので結果をその場で返せないため。1 回の tick = 「feed する語を指図して走査を 1 回呼ぶ」で、走査の中の入力の地点は指図された語を feed するだけ（[`Order`]）。待つフレームは、語を「描画だけ」にして走査を 1 回呼ぶ（入力の地点が描画だけの出口 `0x431259` へ抜ける）。走査の call と入力の地点の間にあるのは走査の臨界区間と Supervisor の先頭（`0x431116` の `+0x478 = 0` と `0x43111C` の NetworkManager のチェック）だけで、同じフレームの数 µs 前（推定）。
-//! - 境目（`TickReport::boundary`）: 次の場面の要求が立った（Supervisor `+0x590` ≠ `+0x58C`）・走査が 0 か負の値を返した（異常。1 は一時停止の tick を含め普通）・入力の地点が指図の入力ワードを受け取らなかった・確定していない tick で更新の列・描画の列の並びが変わった（確定した tick の並びの変化は境目にしない。ラウンドの終わりは場面の終わりではない）。書き戻しの後は並びがコピーのときと同じかを検証し、違えば [`Fault::ListNotRestored`] で止める。
-//! - 遅延: delay 方式で走る間、この層は何もしない（確保の向け先と 0 埋めは [`redirect_wanted`] が rollback のモードのときだけ開く）。入口は対戦の実行なら望みによらず書く（[`install_wanted`]）ので、確保 1 回あたり `cmp` / `je` / `jmp` の 3 命令と走査の包み 1 段が残る。rollback のモードでは、入力 → Present の間に足すのは走査の包み 1 段と、tick ごとの列の並びの読み（2 回）と場面の要求の読み。コピー・書き戻し・進め直しは Present の後。
+//! - [`GameWindow`]: 本物の花映塚のための`higanr_core::rollback::Window`。
+//!   次の処理を持つ。コピー（決まったブロック・`.data`の範囲・DLLの領域の使った所・更新の列のリンク（レジストリの先頭の2つの節0x40 B））・コピーのときのSupervisorの`+0x58C` / `+0x590`のバックアップ・書き戻し・更新だけを1回回すtick・進め直しの前後のSE・BGM・文字の数のバックアップと復元。
+//! - 入口の手順[`scan_point_with`] / [`post_present_with`]: ステートマシンを1フレーム進める。
+//!   ステートマシンは[`Machine`]のインターフェースの向こうにある（本物は`netplay/rollback.rs`の`NpMachine`。検査は`Rollback`そのもの）。
+//!   設置の手順[`install_play`]: 確保・解放の3入口とcallocと走査のcallを、期待バイト列が全部合ったときだけ書く。
+//! - 入力の地点はdo_frameの走査のcall `0x0042DCA9`の包み（走査の直前・走査の外）に設ける。
+//!   理由は次のとおり。花映塚の入力の地点`0x0043112D`は更新の走査の中（優先度0のSupervisor::on_tickの先頭）にある。そこから走査を呼び直すと再入する。またそのtickの残りは入口から戻った後に走るので、結果をその場で返せない。
+//!   1回のtickは「feedするワードを指図して走査を1回呼ぶ」。走査の中の入力の地点は指図されたワードをfeedするだけ（[`Order`]）。
+//!   待つフレームはワードを「描画だけ」にして走査を1回呼ぶ（入力の地点が描画だけの出口`0x431259`へ抜ける）。
+//!   走査のcallと入力の地点の間にあるのは、走査の臨界区間とSupervisorの先頭（`0x431116`の`+0x478 = 0`と`0x43111C`のNetworkManagerのチェック）だけ。同じフレームの数µs前（推定）。
+//! - 境目（`TickReport::boundary`）: 次のどれかが起きたとき。
+//!   次の場面の要求が立った（Supervisor `+0x590` ≠ `+0x58C`）・走査が0か負の値を返した（異常。1は一時停止のtickを含め普通）・入力の地点が指図の入力ワードを受け取らなかった・確定していないtickで更新の列か描画の列の並びが変わった（確定したtickの並びの変化は境目にしない。ラウンドの終わりは場面の終わりではない）。
+//!   書き戻しの後は並びがコピーのときと同じかを検証する。違えば[`Fault::ListNotRestored`]で止める。
+//! - 遅延: delay方式で走る間はこの層は何もしない（確保の向け先の変更と0埋めは[`redirect_wanted`]がrollbackのモードのときだけ有効にする）。
+//!   入口は対戦の実行なら望みによらず書く（[`install_wanted`]）。そのため確保1回あたり`cmp` / `je` / `jmp`の3命令と走査の包み1段が残る。
+//!   rollbackのモードで入力からPresentの間に足すのは、走査の包み1段と、tickごとの列の並びの読み（2回）と場面の要求の読み。
+//!   コピー・書き戻し・進め直しはPresentの後に行う。
 //!
-//! ゲームのスレッドで走るので、確保・ロック待ち・パニックしうる添字を持たない（バックアップの列は固定長、表は固定長の `Layout`）。
+//! ゲームのスレッドで走るので確保・ロック待ち・パニックしうる添字を持たない（バックアップの列は固定長。表は固定長の`Layout`）。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
 
+use higanr_core::end_pick::{EndPick, Note, Show};
 use higanr_core::frame::is_prefill;
 use higanr_core::input_model::MATCH_SEND_MASK;
 use higanr_core::lockstep::CaptureError;
 use higanr_core::patch::AddrRange;
 use higanr_core::render_reset::{self, Field as ResetField, Refused};
+use higanr_core::return_flow::CLOSE_FRAMES;
 use higanr_core::rollback::{
     After, CheckValues, Mode, Step, Tick, TickKind, TickReport, Wait, Window,
 };
@@ -30,7 +44,7 @@ use crate::alloc_count::{AllocHost, AllocSettings, SITE_COUNT, SiteDetourEnv};
 use crate::detour::{self, DetourEnv};
 use crate::hook;
 use crate::log_mode::detail_out;
-use crate::net_game::{CheckRead, read_check_values};
+use crate::net_game::{CheckRead, read_check_values, read_end_view};
 use crate::rollback_probe::{
     Layout, LayoutError, LayoutIo, MAX_REGIONS, Region, RegionKind, Tables, fill_layout,
     vm_array_shape,
@@ -50,25 +64,31 @@ use crate::th09_addr::{
     is_screen_effect_fn,
 };
 
-/// マッチの中のゲームのスレッドの確保を DLL の領域へ向けるか。rollback のモードで、状態機械がマッチを動かしている間だけ。0 埋めは領域の中の解放に
-/// だけ起き、領域へ配るのはこれが開いている間だけなので、このガードが閉じていれば 0 埋めも起きない。
+// マッチの終わりの選択は確定のtickでだけ決定を差し込む。
+// 決定から次の場面の要求までは`CLOSE_FRAMES`ある。
+// 予測の幅の上限がそれより短いと、要求を立てるtickを予測で進める時点で差し込んだtickがもう確定している。
+const _: () = assert!((higanr_core::rollback::MAX_AHEAD as u32) < CLOSE_FRAMES);
+
+/// マッチの中のゲームのスレッドの確保をDLLの領域へ向けるかどうか。rollbackのモードでステートマシンがマッチを動かしている間だけ向ける。
+/// 0埋めは領域の中の解放でだけ起きる。領域への割り当てはこれが開いている間だけなので、このガードが閉じていれば0埋めも起きない。
 pub fn redirect_wanted(mode: Mode, controlled: bool) -> bool {
     mode == Mode::Rollback && controlled
 }
 
-/// 確保・解放・calloc・走査の call の入口を書くか。呼び手が `Mode::Rollback` を渡した実行だけ。対戦の実行は望みによらず `Rollback` を渡す
-/// （キャラセレクトの Tab で rollback へ替えられるように。入れなければ後から rollback へは行けない）。観戦者の delay 方式の実行だけ `Delay` を
-/// 渡して 1 バイトも書かない。入口は書いてあるが [`redirect_wanted`] が閉じたままの接続では、確保 1 回あたり `cmp` / `je` / `jmp` の 3 命令と
-/// 走査の包み 1 段だけが残る（遅延の増分）。
+/// 確保・解放・calloc・走査のcallの入口を書くかどうか。呼び手が`Mode::Rollback`を渡した実行だけ書く。
+/// 対戦の実行は望みによらず`Rollback`を渡す（キャラセレクトのTabでrollbackへ替えられるように。入口を書いておかないと後からrollbackへは行けない）。
+/// 観戦者のdelay方式の実行だけ`Delay`を渡して1バイトも書かない。
+/// 入口は書いてあるが[`redirect_wanted`]が閉じたままの接続では、確保1回あたり`cmp` / `je` / `jmp`の3命令と走査の包み1段だけが残る（遅延の増分）。
 pub fn install_wanted(wish: Mode) -> bool {
     wish == Mode::Rollback
 }
 
-/// 走査の中の入力の地点への指図（[`PlayMem::run_scan`] が出し、入力の地点の入口が 1 回だけ取る）。
+/// 走査の中の入力の地点への指図（[`PlayMem::run_scan`]が出し、入力の地点の入口が1回だけ取る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
-    /// この (p1, p2) を 3 本へ feed する（0 に p1・1 に p2・2 に p1|p2。台本の経路と同じ順）。ローカル入力は読まない。
-    Feed { p1: u16, p2: u16 },
+    /// 3本へfeedする（0にp1・1にp2・2に`w2`。台本の経路と同じ順）。
+    /// `w2`はマッチの終わりの選択の出力。メニューの外ではp1|p2。ローカル入力は読まない。
+    Feed { p1: u16, p2: u16, w2: u16 },
     /// 描画だけのフレーム（入力の地点が描画だけの出口へ抜ける）。
     RenderOnly,
 }
@@ -76,44 +96,44 @@ pub enum Order {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanRun {
     pub ret: i32,
-    /// 入力の地点が指図を取ったか（取らなければ、その tick は指図の語で進んでいない）。
+    /// 入力の地点が指図を取ったかどうか（取らなければそのtickは指図の語で進んでいない）。
     pub consumed: bool,
 }
 
-/// 見張りの数（`rollback_win` の `RB_OUT_*`。どれも増えるだけで、差で使う）。
+/// 監視の処理で数えた値（`rollback_win`の`RB_OUT_*`。どれも増えるだけなので差で使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OutCounts {
-    /// DLL の領域へ向けなかったゲームのスレッドの確保（malloc・operator new・calloc）。
+    /// DLLの領域へ向けなかったゲームのスレッドの確保（malloc・operator new・calloc）。
     pub allocs: u32,
-    /// 領域の外の塊の解放のうち、見張りの間に生まれた塊でないもの。
+    /// 領域の外のブロックの解放のうち監視の間に生まれたブロックでないもの。
     pub frees_old: u32,
-    /// 領域の外の塊の解放のうち、見張りの間に生まれた塊。
+    /// 領域の外のブロックの解放のうち監視の間に生まれたブロック。
     pub frees_born: u32,
-    /// `frees_old` のうち、CRT へ渡さなかった解放（`set_hold_frees` が開いている間）。
+    /// `frees_old`のうちCRTへ渡さなかった解放（`set_hold_frees`が開いている間）。
     pub frees_held: u32,
 }
 
-/// ゲームの側（本物は `rollback_play_win::RealPlayMem`、検査は偽物）。どれも確保しない・パニックしない。
+/// ゲームの側（本物は`rollback_play_win::RealPlayMem`。検査は偽物）。どれも確保しない・パニックしない。
 pub trait PlayMem {
     fn read_u32(&mut self, addr: u32) -> Option<u32>;
-    /// 4 バイト書く。本物は Supervisor の `+0x58C` / `+0x590` と `rollback_resim::OUTPUT_RANGES` の中だけを書き、ほかは断る。
+    /// 4バイト書く。本物はSupervisorの`+0x58C` / `+0x590`と`rollback_resim::OUTPUT_RANGES`の中だけを書く。ほかは断る。
     fn write_u32(&mut self, addr: u32, v: u32) -> bool;
     fn check_rw(&mut self, addr: u32, len: u32) -> bool;
     fn arena_top(&mut self) -> u32;
-    /// 範囲をコピーのバッファへコピーする（割り当て器の状態を含む。`Layout` は `fill_layout` がアドレスを埋めたもの）。
+    /// 範囲をコピーのバッファへコピーする（アロケータの状態を含む。`Layout`は`fill_layout`がアドレスを埋めたもの）。
     fn copy_out(&mut self, l: &Layout);
-    /// コピーのバッファから書き戻す（領域は `[0, コピーしたときの top)` を戻し、その先を今の top まで 0 に。割り当て器の状態も）。
+    /// コピーのバッファから書き戻す（領域は`[0, コピーしたときの top)`を戻して、その先を今のtopまで0にする。アロケータの状態も戻す）。
     fn copy_in(&mut self, l: &Layout);
-    /// コピーのバッファの中の範囲 `r` の先頭から、`fields` の欄を描画の後の値に置き換える（コピーの中だけ。ゲームのメモリには書かない）。
-    /// 戻り値は置き換える前の値が違っていた欄の数（`higanr_core::render_reset::apply`）。
+    /// コピーのバッファの中の範囲`r`の先頭から`fields`のフィールドを描画の後の値に置き換える（コピーの中だけ。ゲームのメモリには書かない）。
+    /// 戻り値は置き換える前の値が違っていたフィールドの数（`higanr_core::render_reset::apply`）。
     fn reset_in_snap(&mut self, r: &Region, fields: &[ResetField<'_>]) -> Result<u32, Refused>;
     fn list_signature(&mut self) -> u64;
-    /// `list_signature` と同じ値を返し、節のアドレスの並びを `out` にバックアップする（コピーのときと、書き戻しの後の並びのチェック）。並びを持たない偽物はバックアップを空にする。
+    /// `list_signature`と同じ値を返し、節のアドレスの並びを`out`にバックアップする（使うのはコピーのときと書き戻しの後の並びのチェック）。並びを持たない偽物はバックアップを空にする。
     fn list_chain(&mut self, out: &mut ListChain) -> u64 {
         *out = ListChain::EMPTY;
         self.list_signature()
     }
-    /// 指図を出して走査を 1 回呼ぶ。`resim` は進め直しの回か（ペースの入口・tick の記録を分ける旗）。
+    /// 指図を出して走査を1回呼ぶ。`resim`は進め直しかどうか（ペースの入口とtickの記録を分けるフラグ）。
     fn run_scan(&mut self, order: Order, resim: bool) -> ScanRun;
     fn now_us(&mut self) -> u64;
     fn set_redirect(&mut self, on: bool);
@@ -121,15 +141,16 @@ pub trait PlayMem {
     fn out_counts(&mut self) -> OutCounts;
     fn born_len(&mut self) -> u32;
     fn clear_born(&mut self);
-    /// 予測の tick（見張りの間）の、前からある領域の外の塊の解放を CRT へ渡さないか（`RB_HOLD_FREES`）。見張りと同時に開け閉めする。
+    /// 予測のtick（監視の間）に起きる解放のうち前からある領域の外のブロックの解放をCRTへ渡さないかどうか（`RB_HOLD_FREES`）。監視と同時に開け閉めする。
     fn set_hold_frees(&mut self, _on: bool) {}
-    /// コピーの後に確定していない tick を走らせた（書き戻しが来る）印を立てる。`clear_born`（コピー・書き戻し）と向け先を閉じるときに
-    /// 倒れる。立っている間の見張りの外の領域の外の解放を数える（診断）。
+    /// コピーの後に確定していないtickを走らせた（書き戻しが来る）ことを示すフラグを立てる。
+    /// `clear_born`（コピー・書き戻し）と向け先を閉じるときに倒れる。
+    /// 立っている間は監視の外で起きた領域の外の解放を数える（診断）。
     fn set_pending(&mut self) {}
-    /// コピーのときのバックアップ: 確定したフレーム・範囲の外の節のアドレス・コピーの表の塊のアドレス・バックアップした ScreenEffect の本体のアドレス。見張りの外の解放が誰のものかを
-    /// 見分ける（診断）のに加え、本体が見張りの外で本当に解放されたかを [`PlayMem::body_freed`] が答えるための表。
+    /// コピーのときのバックアップ: 確定したフレーム・範囲の外の節のアドレス・コピーの表のブロックのアドレス・バックアップしたScreenEffectの本体のアドレス。
+    /// 監視の外の解放が誰のものかを見分ける診断に使う。さらに、本体が監視の外で本当に解放されたかを[`PlayMem::body_freed`]が答えるための表でもある。
     fn set_stray_refs(&mut self, _frame: u32, _nodes: &[u32], _blocks: &[u32], _bodies: &[u32]) {}
-    /// コピーの後に解放を CRT へ渡さなかった塊か（その塊はまだ確保されたままで、書き戻してよい）。
+    /// コピーの後に解放をCRTへ渡さなかったブロックかどうか（そのブロックはまだ確保されたままなので書き戻してよい）。
     fn freed_held(&mut self, _addr: u32) -> bool {
         false
     }
@@ -140,7 +161,7 @@ pub trait PlayMem {
         }
         Some(w)
     }
-    /// コピーの範囲の外の列の節 1 つ（0x20 B）を書き戻す（コピーのときにバックアップした節だけ）。書けなければ false。
+    /// コピーの範囲の外の列の節1つ（0x20 B）を書き戻す（コピーのときにバックアップした節だけ）。書き込めなければfalse。
     fn write_node(&mut self, _addr: u32, _w: &[u32; NODE_WORDS]) -> bool {
         false
     }
@@ -151,8 +172,8 @@ pub trait PlayMem {
         }
         Some(w)
     }
-    /// `out[i] = [base + i × stride]`（i < `out.len()`）を読む（陣の背景の VM の時計の測る入口）。1 つでも読めなければ false。本物は範囲の頁を
-    /// 1 回だけチェックして直に読む（CRT の塊の語をシステムの呼び出しで 1 語ずつ読むと、Present の後に百回を越える）。
+    /// `out[i] = [base + i × stride]`（i < `out.len()`）を読む。陣の背景のVMの時計を測る入口が使う。1つでも読めなければfalse。
+    /// 本物は範囲のページを1回だけチェックして直接読む（CRTのブロックのワードをシステムコールで1ワードずつ読むとPresentの後に百回を超える）。
     fn read_strided(&mut self, base: u32, stride: u32, out: &mut [u32]) -> bool {
         for (i, o) in out.iter_mut().enumerate() {
             let Some(a) = (i as u32)
@@ -168,30 +189,38 @@ pub trait PlayMem {
         }
         true
     }
-    /// SE を 1 つ積む（ゲームの `0x43E2F0` を thiscall で呼ぶ。進め直しで初めて起きた SE を遅れて鳴らすため）。呼ぶ前に先の先頭のバイト列を照合し、
-    /// 合わなければ呼ばずに false。既定は積まない。
+    /// SEを1つ積む（ゲームの`0x43E2F0`をthiscallで呼ぶ。進め直しで初めて起きたSEを遅れて鳴らすため）。
+    /// 呼ぶ前に呼び先の先頭のバイト列を照合する。合わなければ呼ばずにfalseを返す。既定は積まない。
     fn push_se(&mut self, _id: u32, _pan: i32) -> bool {
         false
     }
+    /// マッチの終わりの選択の縁取りと色の指示を画面へ渡す（生きたtickの後）。
+    fn end_show(&mut self, _show: &Show) {}
+    /// マッチの終わりの選択のイベントを本ログへ記録する（確定のtick。確保しない）。
+    fn end_note(&mut self, _seg: u16, _note: Note, _frame: u32) {}
+    /// マッチの終わりの選択を影の動作にするかどうか（`[debug] end_pick = shadow`）。
+    fn end_shadow(&mut self) -> bool {
+        false
+    }
     fn write_body(&mut self, addr: u32, w: &[u32; BODY_WORDS]) -> bool;
-    /// コピーのときにバックアップした ScreenEffect の本体 `addr` が、コピーの後に見張りの外で本当に解放された（CRT へ渡った）か。**分からなければ
-    /// 真**（書き戻すと解放済みの所へ書くので、証明できないときは書かない側）。
+    /// コピーのときにバックアップしたScreenEffectの本体`addr`がコピーの後に監視の外で本当に解放された（CRTへ渡った）かどうか。
+    /// **分からなければ真を返す**（書き戻すと解放済みの所へ書くので、証明できないときは書かない側に倒す）。
     fn body_freed(&mut self, addr: u32) -> bool;
 }
 
-/// 描画が消す欄の 1 行（表は `th09_addr::RENDER_RESETS`）。コピーを取るたびに、コピーの中のこの欄を `after` に置き換える（`higanr_core::render_reset`）。
+/// 描画が消すフィールドの1行（表は`th09_addr::RENDER_RESETS`）。コピーを取るたびにコピーの中のこのフィールドを`after`に置き換える（`higanr_core::render_reset`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbRenderReset {
     pub block: &'static str,
     pub offset: u32,
     pub after: &'static [u8],
-    /// `after` を作る描画の命令のアドレスとバイト列（照合だけ。書かない）。設置のときに本物のバイト列と比べ、違えば表を使わない（[`render_reset_code_matches`]）。
+    /// `after`を作る描画の命令のアドレスとバイト列（照合だけ。書かない）。設置時に本物のバイト列と比べる。違えば表を使わない（[`render_reset_code_matches`]）。
     pub code_at: u32,
     pub code: &'static [u8],
     pub source: &'static str,
 }
 
-/// 表の行の上限（`PlayState` の固定長の領域。越えると `PlayState::new` が断る）。
+/// 表の行の上限（`PlayState`の固定長の領域。越えると`PlayState::new`が断る）。
 pub const MAX_RENDER_RESETS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,8 +230,8 @@ struct ResetRow {
     after: &'static [u8],
 }
 
-/// 表の各行の `code` が、本物のゲームの `code_at` のバイト列と同じか（設置のとき、読み取りのスレッドから 1 回。読むだけ）。
-/// 違う・読めない行があれば、その行の名前を返す。
+/// 表の各行の`code`が本物のゲームの`code_at`のバイト列と同じかどうか（設置時に読み取りのスレッドから1回呼ぶ。読むだけ）。
+/// 違う行か読み取れない行があれば、その行の名前を返す。
 pub fn render_reset_code_matches(
     rows: &[RbRenderReset],
     read: &mut dyn FnMut(u32) -> Option<u32>,
@@ -231,14 +260,15 @@ pub fn render_reset_code_matches(
 /// 列の節の語の数（0x20 B）。
 pub const NODE_WORDS: usize = 8;
 pub const BODY_WORDS: usize = (SCREEN_EFFECT_BYTES / 4) as usize;
-/// コピーのときにバックアップする、コピーの範囲の外の ScreenEffect の本体の数の上限（同じ本体は 1 回だけ数える）。
+/// コピーの範囲の外にあるScreenEffectの本体のうちコピーのときにバックアップする数の上限（同じ本体は1回だけ数える）。
 pub const OUTSIDE_BODIES_CAP: usize = 16;
-/// コピーのときにバックアップする、コピーの範囲の外の列の節の数の上限（2 本の列の合計）。越えた分はバックアップせず、その数を本ログへ（書き戻しの後の
-/// 並びのチェックが拾う）。
+/// コピーの範囲の外にある列の節のうちコピーのときにバックアップする数の上限（2本の列の合計）。
+/// 越えた分はバックアップせず、その数を本ログへ出す（書き戻しの後の並びのチェックが拾う）。
 pub const OUTSIDE_NODES_CAP: usize = 64;
 
-/// コピーの範囲の外にある列の節のバックアップ（コピーのとき。書き戻しの後にそのまま書き戻す —— 予測の tick で外された節は、欄が 0 に
-/// され解放される。解放は見張りの間は CRT へ渡さないので、書き戻す先はまだ確保されている）。
+/// コピーの範囲の外にある列の節のバックアップ（コピーのとき。書き戻しの後にそのまま書き戻す）。
+/// 予測のtickで外された節は、フィールドが0にされて解放される。
+/// 解放は監視の間はCRTへ渡さないので、書き戻す先はまだ確保されている。
 #[derive(Debug, Clone, Copy)]
 struct OutsideNodes {
     n: usize,
@@ -254,15 +284,16 @@ impl OutsideNodes {
     };
 }
 
-/// コピーの範囲の外にある ScreenEffect の本体のバックアップ（コピーのとき。書き戻しの後にそのまま書き戻す）。後片付け `0x422900` が本体の
-/// `+0x0C` を 0 にして本体を解放するが、予測の tick では解放は CRT へ渡さない（バックアップする）ので書き戻す先はまだ確保されている。
-/// バックアップできなかった本体（上限・読めない・本体と思えない）は `missed` に数え、書き戻しのとき止める（静かに続けない）。
+/// コピーの範囲の外にあるScreenEffectの本体のバックアップ（コピーのとき。書き戻しの後にそのまま書き戻す）。
+/// 後始末`0x422900`は本体の`+0x0C`を0にして本体を解放する。
+/// 予測のtickでは解放をCRTへ渡さずバックアップするので、書き戻す先はまだ確保されている。
+/// バックアップできなかった本体（上限を超えた・読み取れない・本体と思えない）は`missed`に数えて、書き戻しのときに止める（静かに続けない）。
 #[derive(Debug, Clone, Copy)]
 struct OutsideBodies {
     n: usize,
     addr: [u32; OUTSIDE_BODIES_CAP],
     words: [[u32; BODY_WORDS]; OUTSIDE_BODIES_CAP],
-    /// バックアップできなかった本体の数と、その最初のアドレス（アドレスが分からない形は 0）。
+    /// バックアップできなかった本体の数とその最初のアドレス（アドレスが分からない形は0）。
     missed: u32,
     missed_first: u32,
 }
@@ -284,8 +315,8 @@ impl OutsideBodies {
     }
 }
 
-/// 書き戻しのとき中身がコピーのときと違っていた、コピーの範囲の外の列の節の種類（コピーのときの `+0x00` 優先度と旗・`+0x04` 毎フレーム・
-/// `+0x0C` 外すとき・`+0x1C` this）と回数（診断。予測の tick で何が外れているかを見る）。
+/// コピーの範囲の外の列の節のうち書き戻しのとき中身がコピーのときと違っていたものの種類と回数（診断。予測のtickで何が外れているかを見る）。
+/// 種類はコピーのときの`+0x00`優先度とフラグ・`+0x04`毎フレーム・`+0x0C`外すとき・`+0x1C` thisで分ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChangedNode {
     pub head: u32,
@@ -295,11 +326,11 @@ pub struct ChangedNode {
     pub n: u32,
 }
 
-/// `ChangedNode` をバックアップする種類の数（毎フレームの関数で分ける。越えた分は `changed_nodes_other` に数える）。
+/// `ChangedNode`をバックアップする種類の数（毎フレームの関数で分ける。越えた分は`changed_nodes_other`に数える）。
 pub const CHANGED_KINDS: usize = 8;
 
-/// `addr` がコピーの範囲（`layout` のどれか）の中か。VM の配列は今の長さだけ（バッファの大きさ `cap` は上限の本数ぶんで、配列の
-/// 後ろの CRT の塊 —— 範囲の外の節や ScreenEffect の本体でありうる —— を「中」と見るとバックアップし損ねる）。
+/// `addr`がコピーの範囲（`layout`のどれか）の中かどうか。
+/// VMの配列は今の長さだけを範囲とする。バッファの大きさ`cap`は上限の本数ぶんなので、配列の後ろのCRTのブロック（範囲の外の節やScreenEffectの本体でありうる）を「中」と見るとバックアップし損ねる。
 fn in_layout(layout: &Layout, addr: u32) -> bool {
     layout.regions().iter().any(|r| {
         let span = match r.kind {
@@ -310,7 +341,7 @@ fn in_layout(layout: &Layout, addr: u32) -> bool {
     })
 }
 
-/// `PlayMem` を `LayoutIo` として渡す包み（範囲の表を埋める手順は `fill_layout`）。
+/// `PlayMem`を`LayoutIo`として渡す包み（範囲の表を埋める手順は`fill_layout`）。
 struct AsLayout<'a>(&'a mut dyn PlayMem);
 
 impl LayoutIo for AsLayout<'_> {
@@ -322,7 +353,7 @@ impl LayoutIo for AsLayout<'_> {
     }
 }
 
-/// `PlayMem` を `OutputMem` として渡す包み（読むのは `OUTPUT_RANGES` と SE のパンの欄、書くのは `OUTPUT_RANGES` だけ）。
+/// `PlayMem`を`OutputMem`として渡す包み（読むのは`OUTPUT_RANGES`とSEのパンのフィールド。書くのは`OUTPUT_RANGES`だけ）。
 struct AsOutputs<'a>(&'a mut dyn PlayMem);
 
 impl OutputMem for AsOutputs<'_> {
@@ -337,16 +368,16 @@ impl OutputMem for AsOutputs<'_> {
     }
 }
 
-/// 更新の列と描画の列の並び（節のアドレス・関数・this）のダイジェスト。`read` は 4 バイトの読み。列はレジストリ `0x4ACFC8` の先頭の節から
-/// `+0x14`（次）でたどり、描画の列は `+0x20` の先頭の節から。
+/// 更新の列と描画の列の並び（節のアドレス・関数・this）のダイジェスト。`read`は4バイトの読み取り関数。
+/// 更新の列はレジストリ`0x4ACFC8`の先頭の節から`+0x14`（次）でたどる。描画の列は`+0x20`の先頭の節からたどる。
 pub fn list_signature_with(read: &mut dyn FnMut(u32) -> Option<u32>) -> u64 {
     list_walk_with(read, &mut |_, _, _| {})
 }
 
-/// 列の並びの節のアドレスのバックアップの枠（1 本の列あたり。越えた分はバックアップしない —— 書き戻しの後の並びが違ったときの診断だけに使う）。
+/// 列の並びの節のアドレスのバックアップの枠（1本の列あたり。越えた分はバックアップしない —— 書き戻しの後の並びが違ったときの診断だけに使う）。
 pub const CHAIN_CAP: usize = 128;
 
-/// 更新の列・描画の列の節のアドレスの並び（コピーのときのバックアップ。書き戻しの後の並びが違ったとき、どの節から分かれたかを言う）。
+/// 更新の列・描画の列の節のアドレスの並び（コピーのときのバックアップ。書き戻しの後の並びが違ったときにどの節から分かれたかを示す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListChain {
     pub nodes: [[u32; CHAIN_CAP]; 2],
@@ -365,7 +396,7 @@ impl ListChain {
     }
 }
 
-/// [`list_signature_with`] と同じダイジェストを作りながら、節のアドレスを `chain` にバックアップする。
+/// [`list_signature_with`]と同じダイジェストを作りながら、節のアドレスを`chain`にバックアップする。
 pub fn list_chain_with(read: &mut dyn FnMut(u32) -> Option<u32>, chain: &mut ListChain) -> u64 {
     *chain = ListChain::EMPTY;
     list_walk_with(read, &mut |list, i, node| {
@@ -376,7 +407,7 @@ pub fn list_chain_with(read: &mut dyn FnMut(u32) -> Option<u32>, chain: &mut Lis
     })
 }
 
-/// 2 本の列を先頭から `+0x14`（次）でたどってダイジェストを作る。`on_node(列の番号, 列の中の位置, 節のアドレス)` を節ごとに呼ぶ。
+/// 2本の列を先頭から`+0x14`（次）でたどってダイジェストを作る。`on_node(列の番号, 列の中の位置, 節のアドレス)`を節ごとに呼ぶ。
 fn list_walk_with(
     read: &mut dyn FnMut(u32) -> Option<u32>,
     on_node: &mut dyn FnMut(usize, usize, u32),
@@ -406,7 +437,7 @@ fn list_walk_with(
     h
 }
 
-/// Supervisor の 2 欄（今の場面・次の場面の要求）。コピーの範囲の外（`0x4B30B0`〜`0x4B38B0` はコピーしない）なので、コピーのときにバックアップして書き戻しで戻す。
+/// Supervisorの2つのフィールド（今の場面・次の場面の要求）。コピーの範囲の外（`0x4B30B0`〜`0x4B38B0`はコピーしない）なのでコピーのときにバックアップして書き戻しで戻す。
 pub const SUP_FIELDS: [u32; 2] = [SUPERVISOR + SUP_SCENE_CUR, SUPERVISOR + SUP_SCENE_REQ];
 
 fn scene_pending(mem: &mut dyn PlayMem) -> bool {
@@ -416,30 +447,31 @@ fn scene_pending(mem: &mut dyn PlayMem) -> bool {
     }
 }
 
-/// 以後この seg で rollback を続けられない食い違い（入口は [`ScanFrame::Broken`] を返し、配線はマッチをやめる）。
+/// 以後このsegでrollbackを続けられない食い違い（入口は[`ScanFrame::Broken`]を返し、配線はマッチをやめる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-    /// 範囲の表を埋められない（ポインタが 0・読めない・EffectSys の形が違う・書けない頁）。
+    /// 範囲の表を埋められない（ポインタが0・読み取れない・EffectSysの形が違う・書き込めないページ）。
     Layout(LayoutError),
-    /// コピーの後に塊・要素の配列のアドレスが変わった（書き戻すと解放済みの所へ書く）。
+    /// コピーの後にブロック・要素の配列のアドレスが変わった（書き戻すと解放済みの所へ書く）。
     PlacesMoved,
-    /// 書き戻すコピーが無い・フレームが違う（状態機械との食い違い）。
+    /// 書き戻すコピーが無い・フレームが違う（ステートマシンとの食い違い）。
     NoSnapshot { want: u32 },
-    /// Supervisor の 2 欄が読めない・書けない。
+    /// Supervisorの2つのフィールドが読み取れない・書き込めない。
     Supervisor,
     /// 書き戻した後の列の並びが、コピーしたときと違う（コピーの外の節のつなぎが戻らなかった）。
     ListNotRestored,
-    /// コピーの範囲の外の列の節を書き戻せなかった（頁が書けない）。後片付けの欄などが静かに失われるので止める。
+    /// コピーの範囲の外の列の節を書き戻せなかった（ページが書き込めない）。後始末のフィールドなどが静かに失われるので止める。
     NodeNotWritten { addr: u32 },
-    /// コピーのとき、範囲の外の ScreenEffect の本体をバックアップできなかった（上限・読めない・本体と思えない形。`addr` は分かれば本体、
-    /// 無ければ 0）。書き戻しのとき、その本体の `+0x0C` などが戻らず、解放済みの本体を描画の節が指す形になりうるので止める。
+    /// コピーのとき範囲の外のScreenEffectの本体をバックアップできなかった（上限を超えた・読み取れない・本体と思えない形）。
+    /// `addr`は分かれば本体のアドレスで、無ければ0。
+    /// 書き戻しのときその本体の`+0x0C`などが戻らず、解放済みの本体を描画の節が指す形になりうるので止める。
     BodyNotCaptured { addr: u32 },
-    /// バックアップした ScreenEffect の本体が、コピーの後に見張りの外で本当に解放された（CRT へ渡った）か、解放されていないと言い切れない。
-    /// 書き戻すと解放済みの所へ書くので書かずに止める。
+    /// バックアップしたScreenEffectの本体がコピーの後に監視の外で本当に解放された（CRTへ渡った）。または解放されていないと言い切れない。
+    /// 書き戻すと解放済みの所へ書くので、書かずに止める。
     BodyFreed { addr: u32 },
-    /// バックアップした ScreenEffect の本体を書き戻せなかった（頁が書けない）。
+    /// バックアップしたScreenEffectの本体を書き戻せなかった（ページが書き込めない）。
     BodyNotWritten { addr: u32 },
-    /// 状態機械が更新したと言うのに、走査を呼んだ記録が無い。
+    /// ステートマシンが更新したと言っているのに走査を呼んだ記録が無い。
     NoLiveRun,
     /// 入口の中でパニックを受けた（本物の層が出す）。
     Panicked,
@@ -508,45 +540,45 @@ pub struct PlayStats {
     /// 走査の包みを通ったフレーム・描画だけにしたフレーム。
     pub frames: u32,
     pub render_only: u32,
-    /// 本物の tick（入力の地点）・進め直しの確定の入力ワードの tick・予測の入力ワードの tick。
+    /// 本物のtick（入力の地点）・進め直しの確定の入力ワードのtick・予測の入力ワードのtick。
     pub live_ticks: u32,
     pub resim_confirmed_ticks: u32,
     pub resim_predicted_ticks: u32,
-    /// 確定していない tick（本物の予測の tick ＋ 進め直しの予測の tick）。
+    /// 確定していないtick（本物の予測のtick ＋ 進め直しの予測のtick）。
     pub unconfirmed_ticks: u32,
     pub saves: u32,
     pub restores: u32,
-    /// 範囲の表を埋め直した回数（seg の初めと、アドレスが変わったとき）。
+    /// 範囲の表を埋め直した回数（マッチの初めとアドレスが変わったとき）。
     pub layout_fills: u32,
-    /// コピー・書き戻し・進め直しの tick 1 回・Present の後の手順全体（進め直しがあったフレームだけ）の時間。
+    /// コピー・書き戻し・進め直しのtick 1回・Presentの後の手順全体（進め直しがあったフレームだけ）の時間。
     pub save_time: Time,
     pub restore_time: Time,
     pub resim_tick_time: Time,
     pub resim_frame_time: Time,
-    /// 走査が 1 を返した tick（一時停止の間を含む）・0 か負を返した tick・入力の地点が指図を取らなかった tick。
+    /// 走査が1を返したtick（一時停止の間を含む）・0か負を返したtick・入力の地点が指図を取らなかったtick。
     pub stopped_ticks: u32,
     pub abnormal_ticks: u32,
     pub unfed_ticks: u32,
-    /// 次の場面の要求が立った tick・確定していない tick で列の並びが変わった数（境目にした）・確定した tick で変わった数。
+    /// 次の場面の要求が立ったtick・確定していないtickで列の並びが変わった数（境目にした）・確定したtickで変わった数。
     pub scene_ticks: u32,
     pub list_holds: u32,
     pub list_changes_confirmed: u32,
-    /// 予測の間（確定していない tick の中）の、領域の外の確保・解放。
+    /// 予測の間（確定していないtickの中）の領域の外の確保・解放。
     pub pred_out_allocs: u32,
     pub pred_out_frees_old: u32,
     pub pred_out_frees_born: u32,
-    /// 書き戻しの時点で、予測の間に生まれて生きていた領域の外の塊（進め直しのたびに作り直す塊の漏れの目安）。
+    /// 書き戻しの時点で予測の間に生まれて生きていた領域の外のブロック（進め直しのたびに作り直すブロックの漏れの目安）。
     pub pred_out_alive_at_restore: u32,
-    /// 予測の間の、前からある領域の外の塊の解放のうち CRT へ渡さなかったもの（確定の進め直しがもう一度解放する）。
+    /// 予測の間に起きた解放のうち前からある領域の外のブロックの解放でCRTへ渡さなかったもの（確定の進め直しがもう一度解放する）。
     pub pred_out_frees_held: u32,
-    /// コピーの範囲の外にあった列の節の数の最大（1 回のコピーあたり）・バックアップの枠が足りなかった節・読めなかった節・書き戻せなかった節。
+    /// コピーの範囲の外にあった列の節の数の最大（1回のコピーあたり）・バックアップの枠が足りなかった節・読み取れなかった節・書き戻せなかった節。
     pub outside_nodes_max: u32,
     pub nodes_over: u32,
     pub nodes_unreadable: u32,
     pub nodes_unwritten: u32,
-    /// 範囲の外の ScreenEffect の本体: 1 回のコピーでバックアップした数の最大・バックアップの枠が足りなかった本体・読めなかった（本体と思えない形を含む）
-    /// 本体・書き戻した本体（のべ）・うち中身がコピーのときと違っていた本体・書き戻せなかった本体・見張りの外で解放されていて書かず
-    /// に止めた本体。
+    /// 範囲の外のScreenEffectの本体の数を次の順に並べる。
+    /// 1回のコピーでバックアップした数の最大・バックアップの枠が足りなかった本体・読み取れなかった本体（本体と思えない形を含む）。
+    /// さらに書き戻した本体（のべ）・うち中身がコピーのときと違っていた本体・書き戻せなかった本体・監視の外で解放されていて書かずに止めた本体。
     pub bodies_max: u32,
     pub bodies_over: u32,
     pub bodies_unreadable: u32,
@@ -554,7 +586,7 @@ pub struct PlayStats {
     pub bodies_changed: u32,
     pub bodies_unwritten: u32,
     pub bodies_freed: u32,
-    /// アドレスが動いた塊・要素の配列を、元の解放をバックアップしていたので元のアドレスへ書き戻した書き戻し。
+    /// アドレスが動いたブロック・要素の配列のうち元の解放をバックアップしていたので元のアドレスへ書き戻した書き戻しの数。
     pub places_moved_back: u32,
     /// SE・BGM・文字の数をバックアップできなかった・戻せなかった進め直し。
     pub outputs_uncaptured: u32,
@@ -564,40 +596,43 @@ pub struct PlayStats {
     /// バックアップの列が溢れて落とした確定の入力ワード・CHECK。
     pub confirmed_dropped: u32,
     pub checks_dropped: u32,
-    /// 描画が消す欄: 使っている表の行の数（設置で照合が合わなければ 0）・コピーの中で置き換える前の値が描画の後の値と違っていた欄
-    /// （のべ。進め直しの途中のコピーに描画が消すはずの値が残っていた数）・置き換えを断った欄（塊がコピーに無い・はみ出す。0 の見込み）。
+    /// 描画が消すフィールドの数を次の順に並べる。
+    /// 使っている表の行の数（設置で照合が合わなければ0）。
+    /// コピーの中で置き換える前の値が描画の後の値と違っていたフィールド（のべ。進め直しの途中のコピーに描画が消すはずの値が残っていた数）。
+    /// 置き換えを断ったフィールド（ブロックがコピーに無い・はみ出す。0の見込み）。
     pub reset_rows: u32,
     pub reset_changed: u32,
     pub reset_refused: u32,
-    /// 書き戻しの直後に見た Stage の数（書き戻し × 2 陣。読めなかった陣は数えない）と、そのうち色の模様が 0 なのに色の α が 0 でなかった数
-    /// （更新がもう書かないのに描画が色を掛け続ける形 —— カットインの赤い点滅・暗いまま。直した後は 0 の見込み）。
+    /// 書き戻しの直後に見たStageの数（書き戻し × 2陣。読み取れなかった陣は数えない）。
+    /// そのうち色のパターンが0なのに色の α が0でなかった数も数える（更新がもう書かないのに描画が色を掛け続ける形。カットインの赤い点滅・暗いまま。直した後は0の見込み）。
     pub tint_checked: u32,
     pub tint_stale: u32,
-    /// コピーのときに色の α が 0 でなかった Stage の数（コピー × 2 陣のうち。進め直しの途中にカットインの色が立っていたコピー）。
+    /// コピーのときに色の α が0でなかったStageの数（コピー × 2陣のうち。進め直しの途中にカットインの色が立っていたコピー）。
     pub tint_at_save: u32,
-    /// 測る入口。どれも Present の後の入口の始まり（コピー・書き戻しの前 = 描画した状態）で 1 回ずつ読む。fps の表示の丸めた値 `[0x4B36C8]`（i16）の分布
-    /// （添字は [`fps_bucket`]、見出しは [`FPS_LABELS`]）・読んだ回数・値の和。
+    /// 測る入口。どれもPresentの後の入口の始まり（コピー・書き戻しの前 = 描画した状態）で1回ずつ読む。
+    /// 測る値はfpsの表示の丸めた値`[0x4B36C8]`（i16）の分布（添字は[`fps_bucket`]。ヘッダは[`FPS_LABELS`]）・読んだ回数・値の和。
     pub fps_hist: [u32; FPS_BUCKETS],
     pub fps_n: u32,
     pub fps_sum: i64,
-    /// 陣の背景（中の名前は Stage）の VM の時計が、前の Present の後の入口から進んだ tick の数の分布（Present × 陣ごとに 1 つ。
-    /// 生きている VM のうち進みが 0〜0x7FFF のものの最大。添字は [`bg_step_bucket`]、見出しは [`BG_STEP_LABELS`]）。delay 方式と
-    /// 同じく 1 に集まるのが正しい形（描画 1 回に更新 1 回）。2 以上は書き戻しの後の進め直しの tick が背景を先へ進めた署名。
+    /// 陣の背景（中の名前はStage）のVMの時計が前のPresentの後の入口から進んだtickの数の分布。
+    /// Present × 陣ごとに1つ数える。値は生きているVMのうち進みが0〜0x7FFFのものの最大。添字は[`bg_step_bucket`]。ヘッダは[`BG_STEP_LABELS`]。
+    /// delay方式と同じく1に集まるのが正しい形（描画1回に更新1回）。
+    /// 2以上は書き戻しの後の進め直しのtickが背景を先へ進めた署名。
     pub bg_step: [u32; BG_STEP_BUCKETS],
     pub bg_unreadable: u32,
-    /// 範囲の表を埋めたときに見た陣の背景の VM の本数の最大・上限（`BG_VM_MAX`）を越えてコピーしなかった陣（埋めた回 × 陣のうち）。
+    /// 範囲の表を埋めたときに見た陣の背景のVMの本数の最大・上限（`BG_VM_MAX`）を越えてコピーしなかった陣（埋めた回 × 陣のうち）。
     pub bg_count_max: u32,
     pub bg_over: u32,
-    /// 書き戻しで陣の背景の VM の配列を書き戻した数（書き戻し × 陣のうち、長さが 0 でなかったもの）。
+    /// 書き戻しで陣の背景のVMの配列を書き戻した数（書き戻し × 陣のうち長さが0でなかったもの）。
     pub bg_restored: u32,
-    /// 書き戻しの前後で描画の回数 `[0x4B42CC]` が変わった書き戻し（fps の計測の欄を書き戻した署名。直した後は 0）と、見た書き戻し。
+    /// 書き戻しの前後で描画の回数`[0x4B42CC]`が変わった書き戻し（fpsの計測のフィールドを書き戻した署名。直した後は0）と見た書き戻し。
     pub fps_words_restored: u32,
     pub fps_words_checked: u32,
-    /// 進め直しで初めて起きた SE を遅れて積み直す経路の数え（`rollback_resim::SeStats`）。
+    /// 進め直しで初めて起きたSEを遅れて積み直す経路の集計（`rollback_resim::SeStats`）。
     pub se: SeStats,
 }
 
-/// fps の表示の分布の枠の数と見出し（`fps_bucket`）。60 の前後を 1 ずつ、離れた所は粗く分ける。
+/// fpsの表示の分布の枠の数とヘッダ（`fps_bucket`）。60の前後は1ずつ。離れた所は粗く分ける。
 pub const FPS_BUCKETS: usize = 15;
 pub const FPS_LABELS: [&str; FPS_BUCKETS] = [
     "19 以下",
@@ -630,7 +665,7 @@ pub fn fps_bucket(v: i16) -> usize {
     }
 }
 
-/// 陣の背景の VM の時計の進みの分布の枠の数と見出し（`bg_step_bucket`）。
+/// 陣の背景のVMの時計の進みの分布の枠の数とヘッダ（`bg_step_bucket`）。
 pub const BG_STEP_BUCKETS: usize = 7;
 pub const BG_STEP_LABELS: [&str; BG_STEP_BUCKETS] = [
     "0",
@@ -651,7 +686,7 @@ pub fn bg_step_bucket(step: Option<u32>) -> usize {
     }
 }
 
-/// 陣の背景の VM の時計のバックアップ（陣ごと。前の Present の後の入口で読んだ値）。
+/// 陣の背景のVMの時計のバックアップ（陣ごと。前のPresentの後の入口で読んだ値）。
 #[derive(Debug, Clone, Copy)]
 struct BgWatch {
     valid: bool,
@@ -721,9 +756,9 @@ impl<T: Copy, const N: usize> Default for Queue<T, N> {
     }
 }
 
-/// 確定した (frame, p1, p2) のバックアップの枠の数（1 回の進め直しで確定するのは R ≤ 16 フレームまで。配線が入口のたびに汲む）。
+/// 確定した (frame, p1, p2)のバックアップの枠の数（1回の進め直しで確定するのはR ≤ 16フレームまで。配線が入口のたびに取り出す）。
 pub const CONFIRMED_CAP: usize = 64;
-/// CHECK のバックアップの枠の数（30 フレームに 1 つ）。
+/// CHECKのバックアップの枠の数（30フレームに1つ）。
 pub const CHECKS_CAP: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
@@ -736,11 +771,13 @@ struct Snap {
     chain: ListChain,
     /// コピーの範囲の外にある列の節の中身（書き戻しの後に書き戻す）。
     outside: OutsideNodes,
-    /// 上の節のうち ScreenEffect のものが指す、コピーの範囲の外の本体の中身（書き戻しの後に書き戻す）。
+    /// 上の節のうちScreenEffectのものが指すコピーの範囲の外の本体の中身（書き戻しの後に書き戻す）。
     bodies: OutsideBodies,
+    /// マッチの終わりの選択の状態（押した瞬間を取る前の語を含む。戻さないと進め直しで押した瞬間を二重に数える）。
+    end: EndPick,
 }
 
-/// 書き戻した後の列の並びがコピーしたときと違った所（[`Fault::ListNotRestored`] の診断。本ログへ）。
+/// 書き戻した後の列の並びがコピーしたときと違った所（[`Fault::ListNotRestored`]の診断。本ログへ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListDiag {
     /// 0 = 更新の列・1 = 描画の列。
@@ -748,10 +785,10 @@ pub struct ListDiag {
     pub index: u16,
     /// 分かれる直前の節（この節の「次」が戻らなかった）。
     pub before: u32,
-    /// コピーしたときの次の節・今の次の節（列が終わっていれば 0）。
+    /// コピーしたときの次の節・今の次の節（列が終わっていれば0）。
     pub want: u32,
     pub got: u32,
-    /// `before` がコピーの範囲の中か（中なら範囲の書き戻しで戻っているはず）。
+    /// `before`がコピーの範囲の中かどうか（中なら範囲の書き戻しで戻っているはず）。
     pub before_in_snap: bool,
     pub want_len: u16,
     pub got_len: u16,
@@ -773,7 +810,7 @@ impl ListDiag {
     }
 }
 
-/// コピーしたときと今の節の並びを比べ、最初に分かれた所を返す（同じなら `None`。節のアドレスが同じで関数・this だけ違うときも `None`）。
+/// コピーしたときと今の節の並びを比べて最初に分かれた所を返す（同じなら`None`。節のアドレスが同じで関数・thisだけ違うときも`None`）。
 fn list_diverge(layout: &Layout, want: &ListChain, got: &ListChain) -> Option<ListDiag> {
     for list in 0..2 {
         let (w, g) = (want.list(list), got.list(list));
@@ -800,8 +837,8 @@ fn list_diverge(layout: &Layout, want: &ListChain, got: &ListChain) -> Option<Li
     None
 }
 
-/// 入力の地点の直前に状態機械からコピーする値（`tick` が「確定した状態の上の本物の入力ワードの tick か」を決めるのに使う。
-/// 状態機械の `live_tick` の `confirmed = 本物の語 && N == F` と同じ決め方）。
+/// 入力の地点の直前にステートマシンからコピーする値。
+/// `tick`が「確定した状態の上の本物の入力ワードのtickか」を決めるのに使う（ステートマシンの`live_tick`の`confirmed = 本物の語 && N == F`と同じ決め方）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Hint {
     remote_next: u32,
@@ -814,12 +851,12 @@ pub struct PlayState {
     placed: Option<Layout>,
     snap: Option<Snap>,
     outputs: FullOutputs,
-    /// フレームごとの、鳴らした（積まれた）SE の id の集合（seg の中のフレーム番号が印。`begin_seg` で空にする）。
+    /// フレームごとに鳴らした（積まれた）SEのidの集合（マッチの中のフレーム番号をキーにする。`begin_seg`で空にする）。
     se_played: SePlayed,
     se_pending: SePending,
-    /// この進め直しの SE の経路が生きているか（`resim_begin` でバックアップも空にもできたときだけ。`resim_end` で倒す）。
+    /// この進め直しのSEの経路が生きているかどうか（`resim_begin`でバックアップも空にもできたときだけ立てる。`resim_end`で倒す）。
     se_armed: bool,
-    /// 被弾音・カットインの音の鳴らし方（ini の `rollback_hit_se`・`rollback_cutin_se`。既定はどちらも確定まで待つ。`set_hit_se`・`set_cutin_se` で設定する）。
+    /// 被弾音・カットインの音の鳴らし方（iniの`rollback_hit_se`・`rollback_cutin_se`。既定はどちらも確定まで待つ。`set_hit_se`・`set_cutin_se`で設定する）。
     se_hold: SeHold,
     in_resim: bool,
     hint: Hint,
@@ -830,8 +867,8 @@ pub struct PlayState {
     place_diag: Option<PlaceDiag>,
     changed_nodes: [ChangedNode; CHANGED_KINDS],
     changed_nodes_other: u32,
-    /// 確保の向け先を今開けているか（`mem.set_redirect` に最後に渡した値。変わるときだけ渡す —— delay 方式で開いたままの入口を
-    /// 毎フレーム叩かない）。
+    /// 確保の向け先を今開けているかどうか（`mem.set_redirect`に最後に渡した値）。
+    /// 変わるときだけ渡す。delay方式で開いたままの入口を毎フレーム叩かないため。
     redirect: bool,
     confirmed: Queue<(u32, u16, u16), CONFIRMED_CAP>,
     checks: Queue<Check, CHECKS_CAP>,
@@ -840,16 +877,22 @@ pub struct PlayState {
     n_resets: usize,
     stage_blocks: [u8; 2],
     bg: [BgWatch; 2],
+    /// マッチの終わりの選択の状態（コピーと一緒にバックアップして書き戻しで戻す）。
+    /// ほかに本ログのマッチ・最後に画面へ渡したもの（生きたtickだけ）・最後の確定のtickの表示（確定のtickは戻らないので書き戻さない）も持つ。
+    end_pick: EndPick,
+    end_seg: u16,
+    end_shown: Show,
+    end_confirmed: Show,
 }
 
 impl PlayState {
-    /// `arena_base` / `arena_bytes` は DLL の領域（範囲の表の形を決める）。
+    /// `arena_base` / `arena_bytes`はDLLの領域（範囲の表の形を決める）。
     pub fn new(tables: Tables, arena_base: u32, arena_bytes: u32) -> Result<PlayState, String> {
         Self::new_with_resets(tables, RENDER_RESETS, arena_base, arena_bytes)
     }
 
-    /// 描画が消す欄の表を渡して作る（設置で命令の照合が合わなかったときは空の表。検査は小さな表）。表の行の塊が `tables` に
-    /// 無い・欄が塊からはみ出す・行が多すぎるときは断る（ゲームのスレッドで断らずに済むよう、ここで 1 回だけ見る）。
+    /// 描画が消すフィールドの表を渡して作る（設置で命令の照合が合わなかったときは空の表。検査は小さな表）。
+    /// 表の行のブロックが`tables`に無い・フィールドがブロックからはみ出す・行が多すぎるときは断る。ゲームのスレッドで断らずに済むよう、ここで1回だけ見る。
     pub fn new_with_resets(
         tables: Tables,
         resets: &'static [RbRenderReset],
@@ -929,11 +972,20 @@ impl PlayState {
             n_resets: resets.len(),
             stage_blocks,
             bg: [BgWatch::EMPTY; 2],
+            end_pick: EndPick::new(),
+            end_seg: 0,
+            end_shown: Show::NONE,
+            end_confirmed: Show::NONE,
         })
     }
 
-    /// 測る入口（Present の後の入口の始まり。コピー・書き戻しの前 = 描画した状態）: fps の表示の丸めた値と、陣の背景の VM の時計の前の回からの進みを数える。
-    /// 読むだけで、ゲームのメモリには書かない。確保しない。
+    /// マッチの終わりの選択が本ログへ出すseg（配線が入口ごとに今のsegを渡す）。
+    pub fn set_end_seg(&mut self, seg: u16) {
+        self.end_seg = seg;
+    }
+
+    /// 測る入口（Presentの後の入口の始まり。コピー・書き戻しの前 = 描画した状態）: fpsの表示の丸めた値と陣の背景のVMの時計の前の回からの進みを数える。
+    /// 読むだけ。ゲームのメモリには書かない。確保しない。
     fn sample_present(&mut self, mem: &mut dyn PlayMem) {
         let s = &mut self.stats;
         if let Some(w) = mem.read_u32(FPS_SHOWN) {
@@ -942,8 +994,8 @@ impl PlayState {
             s.fps_n = s.fps_n.saturating_add(1);
             s.fps_sum = s.fps_sum.saturating_add(i64::from(v));
         }
-        // 読む配列はコピーする表（`Tables::vm_arrays`）でなく本物の表から引く: 測るのは「コピーしたか」に関わらない背景の進みで、コピーしない
-        // 表（直す前の形）の実行でも同じ入口で比べられるように。
+        // 読む配列はコピーする表（`Tables::vm_arrays`）でなく本物の表から取得する。
+        // 測るのは「コピーしたかどうか」に関わらない背景の進みなので、コピーしない表（直す前の形）の実行でも同じ入口で比べられる。
         let t = self.tables;
         for (i, v) in ROLLBACK_VM_ARRAYS.iter().enumerate().take(self.bg.len()) {
             let shape = vm_array_shape(&t, v, &mut AsLayout(&mut *mem), i as u8).ok();
@@ -970,7 +1022,7 @@ impl PlayState {
                 continue;
             }
             if w.valid && w.addr == shape.addr && w.n == n {
-                // 終わった VM（今の命令が 0）は進まないので外す。台本の飛び（時刻を戻す）で負になった VM も外す。
+                // 終わったVM（今の命令が0）は進まないので外す。台本の飛び（時刻を戻す）で負になったVMも外す。
                 let step = (0..n as usize)
                     .filter(|&j| instrs[j] != 0)
                     .map(|j| clocks[j].wrapping_sub(w.clocks[j]))
@@ -1001,8 +1053,8 @@ impl PlayState {
         }
     }
 
-    /// 確保の向け先を開け閉めする（今と同じ値なら何もしない）。閉じるのは、マッチを動かさなくなった tick（delay 方式・場面の終わり・
-    /// 食い違い・ネットワークが終わった）。
+    /// 確保の向け先を開け閉めする（今と同じ値なら何もしない）。
+    /// 閉じるのはマッチを動かさなくなったtick（delay方式・場面の終わり・食い違い・ネットワークが終わった）。
     pub fn set_redirect(&mut self, mem: &mut dyn PlayMem, on: bool) {
         if self.redirect != on {
             mem.set_redirect(on);
@@ -1044,7 +1096,7 @@ impl PlayState {
         self.place_diag
     }
 
-    /// 書き戻しのとき中身が変わっていた範囲の外の節の種類（数えた分だけ）と、種類の枠に入らなかった数。接続を跨いで数える。
+    /// 書き戻しのとき中身が変わっていた範囲の外の節の種類（数えた分だけ）と種類の枠に入らなかった数。接続を跨いで数える。
     pub fn changed_nodes(&self) -> ([ChangedNode; CHANGED_KINDS], u32) {
         (self.changed_nodes, self.changed_nodes_other)
     }
@@ -1077,14 +1129,14 @@ impl PlayState {
         self.in_resim
     }
 
-    /// 入力の地点の直前に状態機械からコピーした、その seg の D（`is_confirmed_tick` が穴埋めの判定に使う。状態機械の `seg_delay` と
-    /// 食い違うと「確定した状態の上の本物の入力ワード」の見分けが状態機械とずれる）。
+    /// 入力の地点の直前にステートマシンからコピーしたそのマッチのD（`is_confirmed_tick`が穴埋めの判定に使う）。
+    /// ステートマシンの`seg_delay`と食い違うと「確定した状態の上の本物の入力ワード」の見分けがステートマシンとずれる。
     #[cfg(test)]
     pub fn hint_delay(&self) -> u8 {
         self.hint.delay
     }
 
-    /// 新しい seg に入る（配線が `Rollback::begin_seg` と同時に呼ぶ）。コピーとアドレスの表を捨て、次のコピーで埋め直す。食い違いの印は残す（壊れた接続を続けない）。
+    /// 新しいマッチに入る（配線が`Rollback::begin_seg`と同時に呼ぶ）。コピーとアドレスの表を捨てて次のコピーで埋め直す。食い違いのフラグは残す（壊れた接続を続けない）。
     pub fn begin_seg(&mut self) {
         self.placed = None;
         self.snap = None;
@@ -1095,10 +1147,14 @@ impl PlayState {
         self.se_played.clear();
         self.se_pending.clear();
         self.se_armed = false;
+        self.end_pick = EndPick::new();
+        self.end_shown = Show::NONE;
+        self.end_confirmed = Show::NONE;
     }
 
-    /// 新しい接続の最初の入口（配線が `rb_sync_seg` で 1 回だけ呼ぶ）。`PlayState` は静的で接続を跨いで生き残るので、前の接続の食い違いの印と、
-    /// 汲み残した確定の入力ワード・CHECK を捨てる（捨てないと 2 本目の接続が frame 0 から `Broken` になる）。数え（`PlayStats`）は残す。
+    /// 新しい接続の最初の入口（配線が`rb_sync_seg`で1回だけ呼ぶ）。
+    /// `PlayState`は静的で接続を跨いで生き残る。そのため前の接続の食い違いのフラグと、取り出し残した確定の入力ワード・CHECKを捨てる（捨てないと2本目の接続がframe 0から`Broken`になる）。
+    /// 集計（`PlayStats`）は残す。
     pub fn begin_conn(&mut self) {
         self.begin_seg();
         self.fault = None;
@@ -1127,7 +1183,7 @@ impl PlayState {
     }
 }
 
-/// コピーのアドレスが今も同じか（塊と要素の配列のポインタを読み直すだけ。頁のチェックはしない —— 1 フレームに 1 回回すので軽くする）。
+/// コピーのアドレスが今も同じかどうか（ブロックと要素の配列のポインタを読み直すだけ。ページのチェックはしない。1フレームに1回回すので軽くする）。
 fn places_unchanged(l: &Layout, t: &Tables, mem: &mut dyn PlayMem) -> bool {
     first_moved(l, t, mem).is_none()
 }
@@ -1164,7 +1220,7 @@ fn first_moved(l: &Layout, t: &Tables, mem: &mut dyn PlayMem) -> Option<PlaceDia
     l.regions().iter().find_map(|r| region_moved(r, t, mem))
 }
 
-/// 範囲 1 つのアドレスがコピーの後に変わったか（.data・領域・割り当て器の状態はアドレスが変わらないので `None`）。
+/// 範囲1つのアドレスがコピーの後に変わったかどうか（.data・領域・アロケータの状態はアドレスが変わらないので`None`）。
 fn region_moved(r: &Region, t: &Tables, mem: &mut dyn PlayMem) -> Option<PlaceDiag> {
     if let RegionKind::VmArray(v) = r.kind {
         let now = t
@@ -1212,11 +1268,11 @@ pub struct GameWindow<'a> {
 }
 
 impl GameWindow<'_> {
-    /// 2 本の列の節のうち、コピーの範囲の外にあるものの中身（0x20 B）をバックアップする（コピーのとき）。
+    /// 2本の列の節のうちコピーの範囲の外にあるものの中身（0x20 B）をバックアップする（コピーのとき）。
     ///
-    /// ScreenEffect の節（`+0x04` の関数で見分ける）の this（`+0x1C`）がコピーの範囲の外なら、this の本体（0x38 B）も同じ手順でバックアップする
-    /// （同じ本体を指す更新の節と描画の節は 1 回だけ）。後片付け `0x422900` が範囲の外の本体の `+0x0C` を 0 にして解放するので、節だけ戻しても
-    /// 本体の欄が戻らず、確定の進め直しの外しが空振りして描画の節が解放済みの本体を指したまま残る。
+    /// ScreenEffectの節（`+0x04`の関数で見分ける）のthis（`+0x1C`）がコピーの範囲の外なら、thisの本体（0x38 B）も同じ手順でバックアップする。
+    /// 同じ本体を指す更新の節と描画の節は1回だけバックアップする。
+    /// 後始末`0x422900`は範囲の外の本体の`+0x0C`を0にして解放する。節だけ戻しても本体のフィールドが戻らないので、確定の進め直しで節を外す処理が空振りして、描画の節が解放済みの本体を指したまま残る。
     fn capture_outside_nodes(
         &mut self,
         layout: &Layout,
@@ -1227,7 +1283,7 @@ impl GameWindow<'_> {
         let mut seen = 0u32;
         for list in 0..2 {
             for &node in chain.list(list) {
-                // 範囲の中の節は範囲の書き戻しで戻る。節の先頭が範囲の外ならバックアップする（0x20 B が範囲の境を跨ぐ節は無い見込み）。
+                // 範囲の中の節は範囲の書き戻しで戻る。節の先頭が範囲の外ならバックアップする（0x20 Bが範囲の境を跨ぐ節は無い見込み）。
                 if node == 0 || in_layout(layout, node) {
                     continue;
                 }
@@ -1254,9 +1310,9 @@ impl GameWindow<'_> {
         (o, b)
     }
 
-    /// 範囲の外の ScreenEffect の節 `node`（`list` 0 = 更新の列・1 = 描画の列）の this `body` の本体 0x38 B をバックアップする。
-    /// 本体の戻りの欄（更新の節は `+0x08`・描画の節は `+0x0C`）がこの節を指していなければ、`0x422D20` が作った本体ではない
-    /// （大きさを推して書くと隣の塊の先頭を壊す）のでバックアップせず、`missed` に数える。
+    /// 範囲の外のScreenEffectの節`node`（`list` 0 = 更新の列・1 = 描画の列）のthis `body`の本体0x38 Bをバックアップする。
+    /// 本体の戻りのフィールド（更新の節は`+0x08`・描画の節は`+0x0C`）がこの節を指していなければ`0x422D20`が作った本体ではない。
+    /// 大きさを推測して書くと隣のブロックの先頭を壊すので、バックアップせず`missed`に数える。
     fn capture_body(&mut self, b: &mut OutsideBodies, list: usize, node: u32, body: u32) {
         let back_off = if list == 0 {
             SCREEN_EFFECT_UPDATE_NODE
@@ -1289,7 +1345,7 @@ impl GameWindow<'_> {
         }
     }
 
-    /// コピーの後にアドレスが変わった範囲のうち、元のアドレスの解放を CRT へ渡した・分からないもの（書き戻せない）。無ければ `None`。
+    /// コピーの後にアドレスが変わった範囲のうち元のアドレスの解放をCRTへ渡した・分からないもの（書き戻せない）。無ければ`None`。
     fn moved_not_held(&mut self, layout: &Layout) -> Option<PlaceDiag> {
         let (t, mem) = (&self.st.tables, &mut *self.mem);
         for r in layout.regions() {
@@ -1327,8 +1383,10 @@ impl GameWindow<'_> {
         self.mem.now_us().saturating_sub(t0)
     }
 
-    /// コピーの中の描画が消す欄を描画の後の値に置き換える（`copy_out` の直後）。進め直しの途中のコピーは描画を通らないので、更新が立てた値
-    /// （Stage の色）が残っている。置き換えないと、以後の書き戻しのたびにその値が戻る。コピーの範囲の塊ごとに 1 回呼ぶだけで、確保・ロックはしない。
+    /// コピーの中の描画が消すフィールドを描画の後の値に置き換える（`copy_out`の直後）。
+    /// 進め直しの途中のコピーは描画を通らないので、更新が立てた値（Stageの色）が残っている。
+    /// 置き換えないと以後の書き戻しのたびにその値が戻る。
+    /// コピーの範囲のブロックごとに1回呼ぶだけ。確保・ロックはしない。
     fn reset_snap_fields(&mut self, layout: &Layout) {
         for row in self.st.resets.iter().take(self.st.n_resets) {
             let region = layout
@@ -1351,7 +1409,7 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 両陣の Stage の（色の模様, 色の 4 B）をゲームのメモリから読む（`layout` の塊のアドレス。読めない陣は `None`）。
+    /// 両陣のStageの（色のパターン, 色の4 B）をゲームのメモリから読む（`layout`のブロックのアドレス。読み取れない陣は`None`）。
     fn stage_tints(&mut self, layout: &Layout) -> [Option<(u32, u32)>; 2] {
         let mut out = [None; 2];
         for (slot, b) in out.iter_mut().zip(self.st.stage_blocks) {
@@ -1376,8 +1434,8 @@ impl GameWindow<'_> {
         out
     }
 
-    /// コピーのときの数え（`copy_out` の直後）: 色の α が 0 でない Stage の数。Present の後のコピーは描画の後なので必ず 0 で、数えるのは進め直しの途中に
-    /// カットインの色が立っていたコピーだけ（0 ならこの実行は不具合の形を通っていない）。表を空にした実行でも数える。
+    /// コピーのときの集計（`copy_out`の直後）: 色の α が0でないStageの数。
+    /// Presentの後のコピーは描画の後なので必ず0になる。数えるのは進め直しの途中にカットインの色が立っていたコピーだけ（0ならこの実行は不具合の形を通っていない）。表を空にした実行でも数える。
     fn note_tint_at_save(&mut self, layout: &Layout) {
         for (_, tint) in self.stage_tints(layout).into_iter().flatten() {
             if tint >> 24 != 0 {
@@ -1387,26 +1445,29 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 書き戻しの直後のチェック: 両陣の Stage で、色の模様が 0（更新がもう色を書かない）なのに色の α が 0 でない（次の描画が色を掛ける）回数を数える。
-    /// 読むのはゲームのメモリ（書き戻した後の本物の値）で、4 語だけ。
+    /// 書き戻しの直後のチェック: 両陣のStageで色のパターンが0（更新がもう色を書かない）なのに色の α が0でない（次の描画が色を掛ける）回数を数える。
+    /// 読むのはゲームのメモリ（書き戻した後の本物の値）の4ワードだけ。
     fn check_stage_tint(&mut self, layout: &Layout) {
         for (mode, tint) in self.stage_tints(layout).into_iter().flatten() {
             let s = &mut self.st.stats;
             s.tint_checked = s.tint_checked.saturating_add(1);
-            // α は 4 バイトの最上位（`+0x642F`。little endian）。
+            // α は4バイトの最上位（`+0x642F`。little endian）。
             if mode == 0 && tint >> 24 != 0 {
                 s.tint_stale = s.tint_stale.saturating_add(1);
             }
         }
     }
 
-    /// tick の後に、その tick が積んだ SE を読む（走査の直後。`0x43F1F0` はまだ鳴らしていない）。
-    /// - 生きた tick: そのフレームの「鳴らした SE」のバックアップに足す。待ち行列には触らない（次の `0x43F1F0` が鳴らす）。
-    /// - 進め直しの tick: 読んで空にし（次の tick が積んだ分だけを読めるように）、前後 2 フレームのどこにも無い id を積み直しの列へ。
-    ///   積み直しは `resim_end`（書き戻した出力の後）。
+    /// tickの後にそのtickが積んだSEを読む（走査の直後。`0x43F1F0`はまだ鳴らしていない）。
+    /// - 生きたtick: そのフレームの「鳴らしたSE」のバックアップに足す。待ち行列には触らない（次の`0x43F1F0`が鳴らす）。
+    /// - 進め直しのtick: 読んで空にする（次のtickが積んだ分だけを読めるように）。
+    ///   前後2フレームのどこにも無いidは積み直しの列へ追加する。
+    ///   積み直しは`resim_end`（書き戻した出力の後）。
     ///
-    /// 被弾音（`rollback_resim::is_hit_se`）とカットインの音（`is_cutin_se`）は `se_hold` が `Confirmed` の側のとき、未確定の生きた tick（`confirmed` が偽）が積んだ分を
-    /// 待ち行列から抜いて鳴らさない（バックアップの `se_played` にも足さない）。確定の回で初めて出たものとして積み直されて鳴る。進め直しの予測の回で出た分も鳴らさない（`sort_resim_se`）。
+    /// 被弾音（`rollback_resim::is_hit_se`）とカットインの音（`is_cutin_se`）は`se_hold`が`Confirmed`の側のときに次のようにする。
+    /// 未確定の生きたtick（`confirmed`が偽）が積んだ分は、待ち行列から抜いて鳴らさない（バックアップの`se_played`にも足さない）。
+    /// 確定のtickで初めて出たものとして積み直されて鳴る。
+    /// 進め直しの予測のtickで出た分も鳴らさない（`sort_resim_se`）。
     fn note_se(&mut self, t: &Tick, pre: Option<&SeQueue>, confirmed: bool) {
         match (t.kind, pre) {
             (TickKind::Live, Some(pre)) => {
@@ -1428,7 +1489,7 @@ impl GameWindow<'_> {
                         }
                     }
                     if hold.hit == SeTiming::Live {
-                        // 被弾音が `live`: 待ち行列には触らず鳴らすが、確定の回が同じ被弾音を出すかを数えるために覚える。
+                        // 被弾音が`live`: 待ち行列には触らず鳴らす。ただし確定のtickが同じ被弾音を出すかを数えるために覚える。
                         let st = &mut *self.st;
                         note_live_hit(&mut st.se_played, &mut st.stats.se, t.frame, pre, &post);
                     }
@@ -1443,8 +1504,8 @@ impl GameWindow<'_> {
             }
             (TickKind::Confirmed | TickKind::Predicted, _) if self.st.se_armed => {
                 let q = read_se_queue(&mut AsOutputs(&mut *self.mem));
-                // 読めたかに関わらず空にする（残すと次の tick の分に混ざる）。空にできなければ、この進め直しの SE の経路は止める
-                // （`resim_end` の `restore_full` がバックアップの値へ戻す）。
+                // 読み取れたかどうかに関わらず空にする（残すと次のtickの分に混ざる）。
+                // 空にできなければこの進め直しのSEの経路は止める（`resim_end`の`restore_full`がバックアップの値へ戻す）。
                 if !clear_se_queue(&mut AsOutputs(&mut *self.mem)) {
                     self.st.se_armed = false;
                 }
@@ -1463,9 +1524,10 @@ impl GameWindow<'_> {
         }
     }
 
-    /// 生きた tick の待ち行列を `rest` に書き直す（待たせる音を抜いた残り）。パンの欄は書いてよい範囲の外（`output_addr_allowed`）なので、
-    /// 枠を詰めるにはゲーム自身の積む関数（`push_se`）で積み直す: 空にして、残りを回数個ずつ（パンは平均。ゲームが鳴らすのも回数個の
-    /// 平均なので、鳴り方は変わらない）。積む関数の先頭のバイト列が合わなければ積めず、その分は `refused` に数える。
+    /// 生きたtickの待ち行列を`rest`に書き直す（待たせる音を抜いた残り）。
+    /// パンのフィールドは書き込んでよい範囲の外（`output_addr_allowed`）なので、枠を詰めるにはゲーム自身の積む関数（`push_se`）で積み直す。
+    /// 具体的には待ち行列を空にして、残りを回数個ずつ積む（パンは平均。ゲームが鳴らすのも回数個の平均なので鳴り方は変わらない）。
+    /// 積む関数の先頭のバイト列が合わなければ積めない。その分は`refused`に数える。
     fn rewrite_se_queue(&mut self, rest: &SeQueue) {
         if !clear_se_queue(&mut AsOutputs(&mut *self.mem)) {
             let s = &mut self.st.stats.se;
@@ -1482,7 +1544,7 @@ impl GameWindow<'_> {
         }
     }
 
-    /// この tick が確定した状態の上の本物の入力ワードの tick か（状態機械の `live_tick` と同じ決め方。進め直しの種類はそのまま）。
+    /// このtickが確定した状態の上の本物の入力ワードのtickかどうか（ステートマシンの`live_tick`と同じ決め方。進め直しの種類はそのまま）。
     fn is_confirmed_tick(&self, t: &Tick) -> bool {
         match t.kind {
             TickKind::Confirmed => true,
@@ -1517,7 +1579,7 @@ impl Window for GameWindow<'_> {
             return;
         };
         self.mem.copy_out(&layout);
-        // コピーした後に（コピーする前に置き換えても `copy_out` が上書きする）、コピーの中の描画が消す欄を描画の後の値へ。
+        // コピーした後にコピーの中の描画が消すフィールドを描画の後の値へ置き換える（コピーする前に置き換えても`copy_out`が上書きする）。
         self.note_tint_at_save(&layout);
         self.reset_snap_fields(&layout);
         let mut chain = ListChain::EMPTY;
@@ -1531,14 +1593,15 @@ impl Window for GameWindow<'_> {
             chain,
             outside,
             bodies,
+            end: self.st.end_pick,
         });
-        // コピーの後に生まれた外の塊だけを、次の書き戻しで「予測の間に生まれて生きていた」と数える。
+        // コピーの後に生まれた外のブロックだけを次の書き戻しで「予測の間に生まれて生きていた」と数える。
         self.mem.clear_born();
         let mut blocks = [0u32; MAX_REGIONS];
         let mut nb = 0;
         for r in layout.regions() {
-            // 領域（Arena）と割り当て器の状態は CRT の塊ではない。塊・要素の配列・VM の配列・データの範囲の先頭だけバックアップする
-            // （コピーしない VM の配列はアドレス 0 なのでバックアップしない）。
+            // 領域（Arena）とアロケータの状態はCRTのブロックではない。ブロック・要素の配列・VMの配列・データの範囲の先頭だけバックアップする。
+            // コピーしないVMの配列はアドレス0なのでバックアップしない。
             if !matches!(r.kind, RegionKind::Arena | RegionKind::ArenaState) && r.addr != 0 {
                 blocks[nb] = r.addr;
                 nb += 1;
@@ -1565,8 +1628,8 @@ impl Window for GameWindow<'_> {
             self.st.set_fault(Fault::NoSnapshot { want: frame });
             return;
         };
-        // アドレスが動いた塊・要素の配列は、元のアドレスの解放を CRT へ渡していなければ（`freed_held`）元のアドレスへ書き戻してよい（予測の
-        // 間に解放されて作り直された形。元のアドレスを指すポインタは範囲の中で戻る）。渡した・分からないものは書き戻さずに止める。
+        // アドレスが動いたブロック・要素の配列は元のアドレスの解放をCRTへ渡していなければ（`freed_held`）元のアドレスへ書き戻してよい。
+        // 予測の間に解放されて作り直された形で、元のアドレスを指すポインタは範囲の中で戻る。渡した・分からないものは書き戻さずに止める。
         let moved = self.moved_not_held(&snap.layout);
         if let Some(d) = moved {
             if self.st.fault.is_none() {
@@ -1575,9 +1638,10 @@ impl Window for GameWindow<'_> {
             self.st.set_fault(Fault::PlacesMoved);
             return;
         }
-        // 範囲の外の ScreenEffect の本体: 何かを書く前にチェックする。バックアップできなかった本体があれば、その本体の欄（`+0x0C` など）が戻らず
-        // 描画の節が解放済みの本体を指す形が残りうるので止める。バックアップした本体が見張りの外で本当に解放されていれば、書き戻すと
-        // 解放済みの所へ書くので書かずに止める（予測の間の解放は CRT へ渡さずバックアップしている。渡したのは見張りの外の経路だけ）。
+        // 範囲の外のScreenEffectの本体: 何かを書く前にチェックする。
+        // バックアップできなかった本体があると、その本体のフィールド（`+0x0C`など）が戻らず描画の節が解放済みの本体を指す形が残りうるので止める。
+        // バックアップした本体が監視の外で本当に解放されていれば、書き戻すと解放済みの所へ書くので書かずに止める。
+        // 予測の間の解放はCRTへ渡さずバックアップしている。渡したのは監視の外の経路だけ。
         if snap.bodies.missed != 0 {
             self.st.set_fault(Fault::BodyNotCaptured {
                 addr: snap.bodies.missed_first,
@@ -1599,7 +1663,7 @@ impl Window for GameWindow<'_> {
             .pred_out_alive_at_restore
             .saturating_add(alive);
         self.mem.clear_born();
-        // fps の計測の欄を書き戻していないかのチェック: 書き戻しの前後で描画の回数を読む（.data の 1 語ずつ）。
+        // fpsの計測のフィールドを書き戻していないかのチェック: 書き戻しの前後で描画の回数を読む（.dataの1ワードずつ）。
         let draws_before = self.mem.read_u32(FPS_DRAWS);
         self.mem.copy_in(&snap.layout);
         let s = &mut self.st.stats;
@@ -1616,17 +1680,17 @@ impl Window for GameWindow<'_> {
             .filter(|r| matches!(r.kind, RegionKind::VmArray(_)) && r.len != 0)
             .count() as u32;
         s.bg_restored = s.bg_restored.saturating_add(bg);
-        // Supervisor の 2 欄とリンク（レジストリはもう範囲の中で戻った）を戻す。
+        // Supervisorの2つのフィールドとリンク（レジストリはもう範囲の中で戻った）を戻す。
         let ok = self.mem.write_u32(SUP_FIELDS[0], snap.sup[0])
             & self.mem.write_u32(SUP_FIELDS[1], snap.sup[1]);
         if !ok {
             self.st.set_fault(Fault::Supervisor);
             return;
         }
-        // コピーの範囲の外の列の節を書き戻す（予測の tick で外された節は欄が 0 のまま）。
+        // コピーの範囲の外の列の節を書き戻す（予測のtickで外された節はフィールドが0のまま）。
         let o = &snap.outside;
         for (addr, w) in o.addr.iter().zip(o.words.iter()).take(o.n) {
-            // 中身がコピーのときと違う節（予測の tick で外された・隣が挿さった）を種類ごとに数える（診断）。
+            // 中身がコピーのときと違う節（予測のtickで外された・隣が挿さった）を種類ごとに数える（診断）。
             if self.mem.read_node(*addr).is_some_and(|now| now != *w) {
                 self.st.note_changed_node(w);
             }
@@ -1667,6 +1731,7 @@ impl Window for GameWindow<'_> {
             return;
         }
         self.check_stage_tint(&snap.layout);
+        self.st.end_pick = snap.end;
         self.st.front = frame;
         self.st.stats.restores = self.st.stats.restores.saturating_add(1);
         let dt = self.elapsed(t0);
@@ -1675,7 +1740,7 @@ impl Window for GameWindow<'_> {
 
     fn tick(&mut self, t: Tick) -> TickReport {
         if self.st.fault.is_some() {
-            // 壊れた後は走査を呼ばず、境目として状態機械を止める（確定の tick なら場面の終わり、予測なら待ち）。
+            // 壊れた後は走査を呼ばない。境目としてステートマシンを止める（確定のtickなら場面の終わり。予測なら待ち）。
             return TickReport { boundary: true };
         }
         let confirmed = self.is_confirmed_tick(&t);
@@ -1689,24 +1754,46 @@ impl Window for GameWindow<'_> {
             Some(c)
         };
         let sig0 = self.mem.list_signature();
-        // 生きた tick は走査の前の待ち行列も読む（直前の進め直しが遅れて積み直した SE をこの tick の分に数えないため。普段は空で、
-        // 読むのは 1 語）。
+        // 生きたtickは走査の前の待ち行列も読む（直前の進め直しが遅れて積み直したSEをこのtickの分に数えないため）。
+        // 普段は空で読むのは1ワードだけ。
         let se_pre =
             (t.kind == TickKind::Live).then(|| read_se_queue(&mut AsOutputs(&mut *self.mem)));
+        // 相手の入力ワードもMATCH_SEND_MASKの外を落とす（`netplay::play`のdelay方式と同じ）。
+        // 外のビットは自分の側でも効く（P/Homeはゲームのフォルダへスクリーンショットを書く）。
+        // 自分の入力ワードは取るときに落としてある。
+        let (p1, p2) = (t.p1 & MATCH_SEND_MASK, t.p2 & MATCH_SEND_MASK);
+        // マッチの終わりの選択: 状態は書き戻しで戻る。差し込み・音・通知・縁取りは確定のtickだけ（予測のtickの分は書き戻しで消える）。
+        let view = read_end_view(&mut |a| self.mem.read_u32(a));
+        let pick = self.st.end_pick.step(view, p1, p2, confirmed);
+        let shadow = self.mem.end_shadow();
+        let w2 = if shadow { p1 | p2 } else { pick.word2 };
         let t0 = self.mem.now_us();
-        // 相手の入力ワードも MATCH_SEND_MASK の外を落とす（`netplay::play` の delay 方式と同じ。外のビットは自分の側でも効く: P/Home は
-        // ゲームのフォルダへスクリーンショットを書く）。自分の入力ワードは取るときに落としてある。
-        let run = self.mem.run_scan(
-            Order::Feed {
-                p1: t.p1 & MATCH_SEND_MASK,
-                p2: t.p2 & MATCH_SEND_MASK,
-            },
-            t.kind != TickKind::Live,
-        );
+        let run = self
+            .mem
+            .run_scan(Order::Feed { p1, p2, w2 }, t.kind != TickKind::Live);
         let dt = self.elapsed(t0);
         if confirmed {
-            // 確定した状態の上の tick だけ、リプレイの印のためにラウンドの境目をその tick の値のまま読む。
+            // リプレイの印のためにラウンドの境目をそのtickの値のまま読むのは確定した状態の上のtickだけ。
             crate::replay_save_win::on_confirmed_tick();
+        }
+        for n in pick.notes(shadow) {
+            self.mem.end_note(self.st.end_seg, n, t.frame);
+        }
+        if !shadow {
+            // 積むのは走査の後・SEの読みの前（このtickが積んだSEとして、進め直しのtickは確定のtickのSEと同じ扱いになる）。
+            for se in pick.sounds() {
+                let (id, pan) = crate::th09_addr::end_menu_se(se);
+                self.mem.push_se(id, pan);
+            }
+            if confirmed {
+                self.st.end_confirmed = pick.show;
+            }
+            // 画面へ渡すのは確定のtickの表示だけ。生きたtickの後に渡す（自分の縁取りもカーソルの音と同じく相手の入力が届くまで動かさない）。
+            let show = self.st.end_confirmed;
+            if t.kind == TickKind::Live && show != self.st.end_shown {
+                self.mem.end_show(&show);
+                self.st.end_shown = show;
+            }
         }
         self.note_se(&t, se_pre.as_ref(), confirmed);
         let s = &mut self.st.stats;
@@ -1770,7 +1857,7 @@ impl Window for GameWindow<'_> {
     }
 
     fn check_values(&mut self) -> CheckValues {
-        // delay 方式の CHECK と同じ関数（`net_game::read_check_values`。アドレスと読み方は 1 か所。どれも描画だけの欄に当たらない）。
+        // delay方式のCHECKと同じ関数（`net_game::read_check_values`。アドレスと読み方は1か所。どれも描画だけのフィールドに当たらない）。
         struct Read<'a>(&'a mut dyn PlayMem);
         impl CheckRead for Read<'_> {
             fn data(&mut self, addr: u32) -> u32 {
@@ -1794,7 +1881,7 @@ impl Window for GameWindow<'_> {
         self.st.se_pending.clear();
         self.st.se_armed = false;
         if capture_full(&mut AsOutputs(self.mem), &mut self.st.outputs) {
-            // バックアップした後で SE の待ち行列を空にして始める（tick ごとに「その tick が積んだ SE」だけを読むため。バックアップの値は `resim_end` が戻す）。
+            // バックアップした後でSEの待ち行列を空にして始める（tickごとに「そのtickが積んだSE」だけを読むため。バックアップの値は`resim_end`が戻す）。
             self.st.se_armed = clear_se_queue(&mut AsOutputs(self.mem));
         } else {
             self.st.stats.outputs_uncaptured = self.st.stats.outputs_uncaptured.saturating_add(1);
@@ -1802,7 +1889,7 @@ impl Window for GameWindow<'_> {
     }
 
     fn resim_end(&mut self) {
-        // 進め直しの回の SE・BGM・文字の数は全部捨て、進め直しの前の値へ戻す。バックアップが無ければ書かない。
+        // 進め直しの間に出たSE・BGM・文字の数は全部捨てて、進め直しの前の値へ戻す。バックアップが無ければ書かない。
         let restored = self.st.outputs.valid
             && if restore_full(&mut AsOutputs(self.mem), &self.st.outputs) {
                 true
@@ -1811,8 +1898,8 @@ impl Window for GameWindow<'_> {
                     self.st.stats.outputs_unrestored.saturating_add(1);
                 false
             };
-        // 戻した後に、進め直しで初めて起きた SE を積み直す（次の do_frame の `0x43F1F0` が鳴らす）。戻せていなければ
-        // 待ち行列の中身が分からないので積まない。
+        // 戻した後に進め直しで初めて起きたSEを積み直す（次のdo_frameの`0x43F1F0`が鳴らす）。
+        // 戻せていなければ待ち行列の中身が分からないので積まない。
         if restored {
             let mem = &mut *self.mem;
             let st = &mut *self.st;
@@ -1829,7 +1916,7 @@ impl Window for GameWindow<'_> {
 
     fn confirmed(&mut self, frame: u32, p1: u16, p2: u16) {
         self.st.front = frame.saturating_add(1);
-        // 観戦と記録へ流す行は、ゲームへ feed した語と同じ（マスク後。観戦者の側で外のビットが効かないように）。
+        // 観戦と記録へ渡す行はゲームへfeedした語と同じ（マスク後。観戦者の側で外のビットが効かないように）。
         if !self
             .st
             .confirmed
@@ -1846,35 +1933,37 @@ impl Window for GameWindow<'_> {
     }
 }
 
-/// 止まっている間に、入力の地点をもう一度試す前に相手の入力ワードを待ってよい理由か（待ちの予算の中で同じフレームの入力の地点を繰り返す形）。
-/// この判断はここ 1 か所（`scan_point_with` が使う）。`Wait` は理由で分けず、語を待つ理由だけを true にする。
+/// 止まっている間に相手の入力ワードを待ってから、入力の地点をもう一度試してよい理由かどうか（待ちの予算の中で同じフレームの入力の地点を繰り返す形）。
+/// この判断はここ1か所（`scan_point_with`が使う）。`Wait`は理由で分けずに入力ワードを待つ理由だけをtrueにする。
 ///
-/// 時刻合わせ（`Wait::Sync`。自分が先にいるので描画だけの 1 フレームで待つ。相手の入力ワードを待つ待ちではない）は false: 同じフレームの中で入力の地点を
-/// 繰り返してはいけない（待った直後の同じ N の呼び出しは更新まで進むので、予算つきの待ちの中で再試行すると時刻合わせの待ちが時間を取らない）。
+/// 時刻合わせ（`Wait::Sync`）はfalseにする。自分が先にいるので描画だけの1フレームで待つ。相手の入力ワードを待つ待ちではない。
+/// 同じフレームの中で入力の地点を繰り返してはいけない。待った直後の同じNの呼び出しは更新まで進むので、予算つきの待ちの中で再試行すると時刻合わせの待ちが時間を取らなくなる。
 pub fn retry_after_wait(why: Wait) -> bool {
     match why {
         Wait::Ahead | Wait::Boundary => true,
-        // 内部の食い違い（`Fault`）・取得がまだ（`NotCaptured`）は待たずに描画だけのフレーム。時刻合わせ（`Sync`）は相手の入力ワードを待つ待ちではなく、
-        // 同じフレームで試し直すと直後の呼び出しが更新まで進んで待ちが時間を取らない。理由が増えたらここで決める（ワイルドカードを使わない）。
+        // 内部の食い違い（`Fault`）・取得がまだ（`NotCaptured`）は待たずに描画だけのフレームにする。
+        // 時刻合わせ（`Sync`）は相手の入力ワードを待つ待ちではない。同じフレームで試し直すと直後の呼び出しが更新まで進んで、待ちが時間を取らなくなる。
+        // 理由が増えたらここで決める（ワイルドカードを使わない）。
         Wait::NotCaptured | Wait::Fault | Wait::Sync => false,
     }
 }
 
-/// 状態機械のインターフェース。本物は `netplay` の rollback の経路（`Connected` を包む —— 取得と同時に INPUT を送るのはセッションの仕事で、状態機械 `Rollback` だけを
-/// 外から `&mut` で借りるインターフェースは無い）、検査は [`RbMachine`]。入口の手順はこのインターフェースだけを通して状態機械を進める。
+/// ステートマシンのインターフェース。本物は`netplay`のrollbackの経路（`Connected`を包む）。検査は[`RbMachine`]。
+/// 経路が包む形にするのは、取得と同時にINPUTを送るのがセッションの仕事で、ステートマシン`Rollback`だけを外から`&mut`で借りるインターフェースが無いため。
+/// 入口の手順はこのインターフェースだけを通してステートマシンを進める。
 pub trait Machine {
     fn mode(&self) -> Mode;
     fn delay(&self) -> u8;
     fn remote_next(&self) -> u32;
     fn scene_ended(&self) -> bool;
     fn captured(&self) -> bool;
-    /// このフレームの自分の入力ワードを取り（1 フレームに 1 回）、すぐ送る。溢れたら `Full`（読んだ入力ワードはインターフェースが持ち越す）。
+    /// このフレームの自分の入力ワードを取ってすぐ送る（1フレームに1回）。溢れたら`Full`（読んだ入力ワードはインターフェースが持ち越す）。
     fn capture(&mut self) -> Result<(), CaptureError>;
     /// `Rollback::input_point`。本物は待つときの再送もセッションがする。
     fn input_point<W: Window>(&mut self, w: &mut W) -> Step;
-    /// 止まっている間に、相手の入力ワードを待つか。true なら入力の地点をもう一度呼ぶ（待ちの予算を使い切った・ネットワークが終わったときは false）。既定は待たない。
-    /// 呼ばれるのは [`retry_after_wait`] が true の理由のときと、ゲストが seg の D を知るまでの取得の待ち（`CaptureError::NoDelay`。
-    /// `Wait::NotCaptured` で呼ぶ。true なら取得をもう一度試す）。ほかの理由は待たずに描画だけのフレームにする。
+    /// 止まっている間に相手の入力ワードを待つかどうか。trueなら入力の地点をもう一度呼ぶ（待ちの予算を使い切った・ネットワークが終わったときはfalse）。既定は待たない。
+    /// 呼ばれるのは[`retry_after_wait`]がtrueの理由のときと、ゲストがマッチのDを知るまでの取得の待ち（`CaptureError::NoDelay`。`Wait::NotCaptured`で呼ぶ。trueなら取得をもう一度試す）のとき。
+    /// ほかの理由は待たずに描画だけのフレームにする。
     fn wait(&mut self, _why: Wait) -> bool {
         false
     }
@@ -1882,18 +1971,18 @@ pub trait Machine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanFrame {
-    /// このフレームの走査を呼んだ（更新 1 回か、描画だけ）。`ret` を do_frame へ返す。
+    /// このフレームの走査を呼んだ（更新1回か描画だけ）。`ret`をdo_frameへ返す。
     Ran { ret: i32, step: Step },
-    /// 場面の境目が確定した。走査はまだ呼んでいない（配線は `begin_seg` し、走査を普段どおり 1 回呼ぶ）。
+    /// 場面の境目が確定した。走査はまだ呼んでいない（配線は`begin_seg`を呼んでから走査を普段どおり1回呼ぶ）。
     SceneEnd,
-    /// 食い違いで rollback を続けられない。走査はまだ呼んでいない（配線はマッチをやめ、走査を普段どおり 1 回呼ぶ）。
+    /// 食い違いでrollbackを続けられない。走査はまだ呼んでいない（配線はマッチをやめてから走査を普段どおり1回呼ぶ）。
     Broken(Fault),
 }
 
-/// 走査の call の包み（`0x0042DCA9`）から、rollback のモードのマッチの間だけ呼ぶ。自分の入力ワードの取得（1 フレームに 1 回）→ 送信 → 状態機械の
-/// 入力の地点（止まっていれば書き戻しと進め直しもここ）→ 本物の tick か描画だけのフレーム。止まっている間は、語を待つ理由
-/// （`Ahead` / `Boundary`）ならインターフェースが予算まで待ち（[`Machine::wait`]）、届けばもう一度入力の地点で書き戻して進む
-/// （delay 方式の「予算つきの待ち ＋ 描画だけのフレーム」と同じ）。
+/// 走査のcallの包み（`0x0042DCA9`）からrollbackのモードのマッチの間だけ呼ぶ。
+/// 処理の流れは、自分の入力ワードの取得（1フレームに1回）→ 送信 → ステートマシンの入力の地点（止まっていれば書き戻しと進め直しもここ）→ 本物のtickか描画だけのフレーム。
+/// 止まっている間に入力ワードを待つ理由（`Ahead` / `Boundary`）のときは、インターフェースが予算まで待つ（[`Machine::wait`]）。
+/// 届けばもう一度入力の地点で書き戻して進む（delay方式の「予算つきの待ち ＋ 描画だけのフレーム」と同じ）。
 pub fn scan_point_with<M: Machine>(
     m: &mut M,
     st: &mut PlayState,
@@ -1911,8 +2000,8 @@ pub fn scan_point_with<M: Machine>(
     st.set_redirect(mem, redirect_wanted(m.mode(), true));
     if !m.captured() {
         let mut got = m.capture();
-        // ゲストが seg の D をホストの INPUT で知るまで（`NoDelay`）は、インターフェースが予算まで待ってから同じフレームで取り直す
-        // （読み込みの終わりがホストより早いときの、seg の始まりの 1 回だけの待ち）。予算を使い切ったら描画だけのフレーム。
+        // ゲストがマッチのDをホストのINPUTで知るまで（`NoDelay`）は、インターフェースが予算まで待ってから同じフレームで取り直す。
+        // これは読み込みの終わりがホストより早いときの、マッチの始まりの1回だけの待ち。予算を使い切ったら描画だけのフレームにする。
         while got == Err(CaptureError::NoDelay) && m.wait(Wait::NotCaptured) {
             got = m.capture();
         }
@@ -1945,7 +2034,7 @@ pub fn scan_point_with<M: Machine>(
             break step;
         }
         match step {
-            // 語を待つ理由のときだけ、インターフェースが待ってから同じフレームでもう一度試す（`retry_after_wait`）。
+            // 入力ワードを待つ理由のときだけインターフェースが待ってから同じフレームでもう一度試す（`retry_after_wait`）。
             Step::Wait(why) if retry_after_wait(why) && m.wait(why) => {}
             _ => break step,
         }
@@ -1963,7 +2052,7 @@ pub fn scan_point_with<M: Machine>(
                 ScanFrame::Broken(Fault::NoLiveRun)
             }
         },
-        // 待つ理由は分けず、どれも描画だけのフレーム（今後 `Wait` に理由が増えても同じ）。
+        // 待つ理由は分けずにどれも描画だけのフレームにする（今後`Wait`に理由が増えても同じ）。
         Step::Wait(_) => {
             let run = mem.run_scan(Order::RenderOnly, false);
             st.stats.render_only = st.stats.render_only.saturating_add(1);
@@ -2016,8 +2105,8 @@ impl Machine for RbMachine<'_> {
     }
 }
 
-/// [`scan_point_with`] を `Rollback` に直に掛ける形（検査用）。`local` は自分の入力ワードを読む関数（取得が要るフレームだけ呼ぶ）、
-/// `send` は INPUT を送る関数。
+/// [`scan_point_with`]を`Rollback`に直に掛ける形（検査用）。`local`は自分の入力ワードを読む関数（取得が要るフレームだけ呼ぶ）。
+/// `send`はINPUTを送る関数。
 #[cfg(test)]
 pub fn scan_point(
     rb: &mut Rollback,
@@ -2035,9 +2124,9 @@ pub enum PostFrame {
     Broken(Fault),
 }
 
-/// Present の後（Present のラッパの中、描画の後）から呼ぶ。コピーする / F を進める（書き戻し → 確定の入力ワードで更新 → コピー → 予測の入力ワードで
-/// 更新）。delay 方式では状態機械が何もしない。`hint` は (相手から次に要る apply_frame, D)、`run` は状態機械の
-/// `post_present`（ウィンドウを受け取る）。
+/// Presentの後（Presentのラッパの中。描画の後）から呼ぶ。コピーする / Fを進める（書き戻し → 確定の入力ワードで更新 → コピー → 予測の入力ワードで更新）。
+/// delay方式ではステートマシンが何もしない。
+/// `hint`は (相手から次に要るapply_frame, D)。`run`はステートマシンの`post_present`（ウィンドウを受け取る）。
 pub fn post_present_with(
     hint: (u32, u8),
     st: &mut PlayState,
@@ -2188,7 +2277,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
     ]
 }
 
-/// 分布の文（数が 0 の枠は出さない。全部 0 なら「なし」—— 測れていないことを 0 件の分布に見せない）。
+/// 分布の文（数が0の枠は出さない。全部0なら「なし」。測れていないことを0件の分布に見せない）。
 fn hist_text(labels: &[&str], counts: &[u32]) -> String {
     let parts: Vec<String> = labels
         .iter()
@@ -2207,7 +2296,7 @@ pub const STRAY_REC_CAP: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StrayRec {
-    /// 解放を呼んだ側の戻りアドレス（free `0x47B163` の呼び手。operator delete は `jmp` なので delete の呼び手と推定）。
+    /// 解放を呼んだ側の戻りアドレス（free `0x47B163`の呼び手。operator deleteは`jmp`なのでdeleteの呼び手と推定）。
     pub ret: u32,
     pub ptr: u32,
     pub flags: u32,
@@ -2216,17 +2305,18 @@ pub struct StrayRec {
 
 impl StrayRec {
     pub const NODE: u32 = 1;
-    /// ポインタが、予測の間に CRT へ渡さずバックアップした解放のアドレス（`freed_held`）。
+    /// ポインタが予測の間にCRTへ渡さずバックアップした解放のアドレス（`freed_held`）。
     pub const HELD: u32 = 2;
-    /// ポインタが、コピーの表の塊・要素の配列・データの範囲の先頭のアドレス。
+    /// ポインタがコピーの表のブロック・要素の配列・データの範囲の先頭のアドレス。
     pub const BLOCK: u32 = 4;
-    /// ポインタが、コピーのときにバックアップした ScreenEffect の本体のアドレス（これを見張りの外で解放すると、書き戻しは [`Fault::BodyFreed`] で
-    /// 止まる）。
+    /// ポインタがコピーのときにバックアップしたScreenEffectの本体のアドレス。
+    /// これを監視の外で解放すると、書き戻しは[`Fault::BodyFreed`]で止まる。
     pub const BODY: u32 = 8;
 }
 
-/// 解放のバックアップと、範囲の外の節の本ログの文。`stray` は予測の tick の後・書き戻しの前に見張りの外で
-/// 起きたゲームのスレッドの領域の外の解放（0 の見込み）、`held_untracked` / `out_untracked` はアドレスをバックアップできなかった解放・確保。
+/// 解放のバックアップと範囲の外の節の本ログの文。
+/// `stray`は予測のtickの後・書き戻しの前に監視の外で起きたゲームのスレッドの領域の外の解放（0の見込み）。
+/// `held_untracked` / `out_untracked`はアドレスをバックアップできなかった解放・確保。
 pub fn hold_lines(
     changed: &[ChangedNode],
     other: u32,
@@ -2282,8 +2372,8 @@ pub fn hold_lines(
     v
 }
 
-/// rollback の状態機械の数え（`higanr_core::rollback::Stats` の全欄）の本ログの文。`PlayStats`（インターフェース側の数え）とは別の数えで、
-/// 待ち・予測・進め直し・保留・食い違い（`faults` が 0 でなければバグ）を接続の合計で出す。
+/// rollbackのステートマシンの集計（`higanr_core::rollback::Stats`の全フィールド）の本ログの文。
+/// `PlayStats`（インターフェース側の集計）とは別の集計で、待ち・予測・進め直し・保留・食い違い（`faults`が0でなければバグ）を接続の合計で出す。
 pub fn core_stats_lines(c: &higanr_core::rollback::Stats) -> Vec<String> {
     vec![
         format!(
@@ -2320,9 +2410,10 @@ pub fn core_stats_lines(c: &higanr_core::rollback::Stats) -> Vec<String> {
     ]
 }
 
-/// 時刻合わせの見積もりの行（`Stats` の `sync_*`）。見積もり自体は seg の終わりで捨てられるので、標本ごとの平均の値を接続の合計で貯めたもの
-/// （平均・最大・最小）を出す。単位はフレーム（正 = 自分が相手より先）。状態機械が貯めた値をそのまま割るだけ（式の原本は
-/// `higanr_core::rollback::sync_sample`）。本ログの N − F の最大は上の行（`max_ahead_seen`）と並べて読む。
+/// 時刻合わせの見積もりの行（`Stats`の`sync_*`）。
+/// 見積もり自体はマッチの終わりで捨てられるので、サンプルごとの平均の値を接続の合計で貯めたもの（平均・最大・最小）を出す。
+/// 単位はフレーム（正 = 自分が相手より先）。ステートマシンが貯めた値をそのまま割るだけ（式の原本は`higanr_core::rollback::sync_sample`）。
+/// 本ログの N − F の最大は上の行（`max_ahead_seen`）と並べて読む。
 fn sync_lead_line(c: &higanr_core::rollback::Stats) -> String {
     use higanr_core::rollback::SYNC_UNIT;
     if c.sync_samples == 0 {
@@ -2339,8 +2430,8 @@ fn sync_lead_line(c: &higanr_core::rollback::Stats) -> String {
     )
 }
 
-/// 「seg ごとの D」の行: その seg の D が決まった順の (seg 番号 = D)、新しい方から `SEG_D_LOG` 個までを古い順に。
-/// ゲストが D 未定で取得を待った数も添える（seg の始まりで、ホストのその seg の最初の INPUT を待った分）。
+/// 「segごとのD」の行: そのsegのDが決まった順に (seg番号 = D)を、新しい方から`SEG_D_LOG`個まで古い順に並べる。
+/// ゲストがD未定で取得を待った数も添える（segの始まりでホストのそのsegの最初のINPUTを待った分）。
 fn seg_d_line(c: &higanr_core::rollback::Stats) -> String {
     let n = (c.seg_d_count as usize).min(higanr_core::rollback::SEG_D_LOG);
     let start = if (c.seg_d_count as usize) > n {
@@ -2371,11 +2462,11 @@ pub const SITE_CALLOC: usize = SITE_COUNT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayInstall {
-    /// rollback を望んでいない実行（何も書かない）。
+    /// rollbackを望んでいない実行（何も書かない）。
     NotWanted,
-    /// 表の検査か照合に落ちた（1 バイトも書いていない）。
+    /// 表の検査か照合に落ちた（1バイトも書いていない）。
     Refused,
-    /// 書いた（malloc・new・free・calloc・走査の call の順。途中の 1 つが書けなくても書けた所は残る）。
+    /// 書いた（malloc・new・free・calloc・走査のcallの順。途中の1つが書き込めなくても書き込めた所は残る）。
     Written([bool; 5]),
 }
 
@@ -2419,7 +2510,7 @@ impl AllocHost for HooksHost<'_> {
     }
 }
 
-/// 書く地点の一覧（地点の番号・表の行）。並びは `PlayInstall::Written` の並び。
+/// 書く地点の一覧（地点の番号・表の行）。並びは`PlayInstall::Written`の並び。
 fn play_sites() -> [(usize, &'static SiteDef); 5] {
     [
         (SITE_MALLOC, &ALLOC_SITES[SITE_MALLOC]),
@@ -2430,8 +2521,8 @@ fn play_sites() -> [(usize, &'static SiteDef); 5] {
     ]
 }
 
-/// rollback を望んだ実行で、5 地点（確保・解放の 3 入口・calloc・走査の call）を書く。表の検査と 5 地点の今のバイト列の照合が
-/// **全部**通ったときだけ書く（1 つでも合わなければ 1 バイトも書かない）。
+/// rollbackを望んだ実行で5地点（確保・解放の3入口・calloc・走査のcall）を書く。
+/// 書くのは、表の検査と5地点の今のバイト列の照合が**全部**通ったときだけ（1つでも合わなければ1バイトも書かない）。
 pub fn install_play(
     wish: Mode,
     env: &mut dyn DetourEnv,
@@ -2493,7 +2584,7 @@ pub fn install_play(
             def.name, def.addr
         ));
     }
-    // 全部合ったときは詳細だけ。合わなかったときは、どの地点かを簡潔にも残す。
+    // 全部合ったときは詳細だけ。合わなかったときはどの地点かを簡潔にも残す。
     {
         let o: &mut dyn Write = if all_match { &mut detail_out(out) } else { out };
         for l in &checks {
@@ -2546,8 +2637,13 @@ pub fn install_play(
     PlayInstall::Written(written)
 }
 
-/// 観戦者の早送りのために、走査の call（`RESIM_SITES[0]`）の 1 地点だけを書く。早送り（`spectate_watch/ff.rs`）は走査の包みの中で余分に更新を回すだけで観戦するマッチの方式（rollback / delay）と関わらないが、走査の call は `install_play` でしか書かれず ini が delay の実行には書かれなかったため、観戦者の実行（`watching`）は、走査の call がまだ書かれていなければ（`scan_hooked` が偽）そこだけを書く。
-/// 確保・解放・calloc の入口は書かない（観戦者は巻き戻さない）。観戦者でない実行（対戦）は何も書かない —— delay 方式の対戦の実行は 1 バイトも書かない約束（遅延の増分 0）を、この関数の入口で守る。書く前の照合は `install_call_hook_at` が止めた後の再読みまで含めて行い、合わなければ何も書かない。書いたら true。
+/// 観戦者の早送りのために、走査のcall（`RESIM_SITES[0]`）の1地点だけを書く。
+/// 早送り（`spectate_watch/ff.rs`）は走査の包みの中で余分に更新を回すだけで、観戦するマッチの方式（rollback / delay）とは関わらない。
+/// ただし走査のcallは`install_play`でしか書かれず、iniがdelayの実行には書かれなかった。
+/// そのため観戦者の実行（`watching`）は、走査のcallがまだ書かれていなければ（`scan_hooked`が偽）そこだけを書く。
+/// 確保・解放・callocの入口は書かない（観戦者は巻き戻さない）。
+/// 観戦者でない実行（対戦）は何も書かない。delay方式の対戦の実行は1バイトも書かない約束（遅延の増分0）を、この関数の入口で守る。
+/// 書く前の照合は`install_call_hook_at`が止めた後の再読みまで含めて行い、合わなければ何も書かない。書いたらtrueを返す。
 pub fn install_watch_scan(
     watching: bool,
     scan_hooked: bool,
@@ -2584,8 +2680,8 @@ pub fn install_watch_scan(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! 偽のゲーム（`FakeGame`。語のアドレス → 値の表で、コピーは範囲の中の語だけをコピーする）と本物の状態機械 `Rollback` で、ウィンドウと入口の
-    //! 手順を見る。設置は偽の命令の表（`FakeCode`）で見る。
+    //! 偽のゲーム（`FakeGame`。ワードのアドレス → 値の表。コピーは範囲の中のワードだけをコピーする）と本物のステートマシン`Rollback`で、ウィンドウと入口の手順を検証する。
+    //! 設置は偽の命令の表（`FakeCode`）で検証する。
     use super::*;
     use crate::hook::{HookEnv, ThreadRef, WriteDone};
     use crate::rollback_probe::{RbData, RbSkipKind, RegionKind};
@@ -2609,7 +2705,7 @@ pub(crate) mod tests {
     #[cfg(dev_assets)]
     const NOTE: &str = include_str!("../../../analysis/notes/th09_rollback_E1.md");
 
-    /// 既存の検査は進め直しの仕組みをカットインの音で見ているので、カットインは今までどおり（live）にして始める。既定（確定まで待つ）は `the_default_waits_for_both_se_kinds`。
+    /// 既存の検査は進め直しの仕組みをカットインの音で見ている。そのためカットインは今までどおり（live）にして始める。既定（確定まで待つ）は`the_default_waits_for_both_se_kinds`。
     fn play_state_cutin_live() -> PlayState {
         let mut st = crate::rollback_testkit::play_state();
         st.set_cutin_se(SeTiming::Live);
@@ -2945,7 +3041,7 @@ pub(crate) mod tests {
             );
         }
         assert!(FakeGame::in_regions(&placed, UPDATE_REGISTRY + 0x3C));
-        // レジストリの後ろの 16 B（ファイルの読み込みの処理と見られる別の物）はコピーしない（持ち物のハンドルを書き戻さない）。
+        // レジストリの後ろの16 B（ファイルの読み込みの処理と見られる別の物）はコピーしない（持ち物のハンドルを書き戻さない）。
         assert!(!FakeGame::in_regions(&placed, REGISTRY_TAIL_OBJ));
         assert_eq!(
             g.get(REGISTRY_TAIL_OBJ + 8),
@@ -3143,8 +3239,9 @@ pub(crate) mod tests {
             3,
             "進め直しの回が SE を積んでいない（検査の前提）"
         );
-        // 進め直しの回が積んだ SE は捨て、進め直しの前の値へ戻す。ただし進め直しで初めて起きた SE（前後 2 フレームのどこにも無い id）だけは
-        // `resim_end` が戻した後に積み直す。それ以外 —— BGM の待ち行列・文字の数・進め直しの前に積まれていた SE（枠 5 の id 0x33・回数 2）—— は進め直しの前のまま。
+        // 進め直しの間に積まれたSEは捨てて、進め直しの前の値へ戻す。
+        // ただし進め直しで初めて起きたSE（前後2フレームのどこにも無いid）だけは`resim_end`が戻した後に積み直す。
+        // それ以外（BGMの待ち行列・文字の数・進め直しの前に積まれていたSE（枠5のid 0x33・回数2））は進め直しの前のまま。
         let pushed: Vec<u32> = g.se_pushed.iter().map(|&(id, _)| id).collect();
         assert!(
             !pushed.is_empty(),
@@ -3200,16 +3297,17 @@ pub(crate) mod tests {
         assert_ne!(g.outputs(), before);
     }
 
-    /// D = 1・R = 8 の rollback を `loops` フレーム回す（`frame` 1 回 = 走査の包み → 鳴らす → Present の後）。`feed(rb, k)` は k 回目の
-    /// 走査の前に相手の入力ワードを届ける関数、`local(k)` は k 回目に取る自分の入力ワード。戻り値は実行し終わった後の (rb, st)。
+    /// D = 1・R = 8 のrollbackを`loops`フレーム回す（`frame` 1回 = 走査の包み → 鳴らす → Presentの後）。
+    /// `feed(rb, k)`はk回目の走査の前に相手の入力ワードを届ける関数。`local(k)`はk回目に取る自分の入力ワード。
+    /// 戻り値は実行し終わった後の (rb, st)。
     fn run_late(
         g: &mut FakeGame,
         loops: u32,
         feed: &dyn Fn(&mut Rollback, u32),
         local: &dyn Fn(u32) -> u16,
     ) -> (Rollback, PlayState) {
-        // 偽の相手は ack を自分の N のまま返し、語だけ 3 フレーム遅れて届ける（往路だけ遅いネットワーク）。この検査は予測・書き戻し・進め直しが毎フレーム
-        // 起きる実行を見るので、時刻合わせは切る（時刻合わせの検査は `higanr_core` の `tests/rollback_sim.rs`）。
+        // 偽の相手はackを自分のNのまま返し、ワードだけ3フレーム遅れて届ける（往路だけ遅いネットワーク）。
+        // この検査は予測・書き戻し・進め直しが毎フレーム起きる実行を見るので、時刻合わせは切る（時刻合わせの検査は`higanr_core`の`tests/rollback_sim.rs`）。
         let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
         let mut st = play_state_cutin_live();
         rb.begin_seg(1);
@@ -3223,8 +3321,8 @@ pub(crate) mod tests {
         (rb, st)
     }
 
-    /// 相手の入力ワードを 1 ワードずつ 3 フレーム遅れて届ける（k 回目に apply_frame k − 2 の入力ワード。予測は直前の確定の入力ワードの繰り返しなので、変わり目は
-    /// 届いた次の tick で予測に入り、本当の変わり目より 2 フレーム遅れて生きた tick で起きる）。
+    /// 相手の入力ワードを1ワードずつ3フレーム遅れて届ける（k回目にapply_frame k − 2 の入力ワード）。
+    /// 予測は直前の確定の入力ワードの繰り返しなので、変わり目は届いた次のtickで予測に入り、生きたtickでは本当の変わり目より2フレーム遅れて起きる。
     fn feed_one_by_one(words: fn(u32) -> u16) -> impl Fn(&mut Rollback, u32) {
         move |rb, k| {
             if k >= 3 {
@@ -3235,8 +3333,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// 相手の入力ワードを 4 ワードずつまとめて届ける（apply_frame 4j + 1〜4j + 4 を j × 4 + 6 回目に。回線の揺れで 1 つ遅れた形）。まとまりの中で
-    /// 変わって戻る語は、予測（まとまりの最後の語の繰り返し）には現れず、進め直しの確定の回で初めて出る。
+    /// 相手の入力ワードを4ワードずつまとめて届ける（apply_frame 4j + 1〜4j + 4 を j × 4 + 6回目に。回線の揺れで1つ遅れた形）。
+    /// まとまりの中で変わって戻るワードは、予測（まとまりの最後のワードの繰り返し）には現れない。進め直しの確定のtickで初めて出る。
     fn feed_in_bursts(words: fn(u32) -> u16) -> impl Fn(&mut Rollback, u32) {
         move |rb, k| {
             if k >= 6 && (k - 6).is_multiple_of(4) {
@@ -3248,7 +3346,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// 相手の入力ワードは 10 フレームごとに 3 → 5 → 0 と変わる（apply_frame 10・20・30 が変わり目）。
+    /// 相手の入力ワードは10フレームごとに3 → 5 → 0と変わる（apply_frame 10・20・30が変わり目）。
     fn remote_steps(b: u32) -> u16 {
         match b {
             0..=9 => 0,
@@ -3258,8 +3356,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// 相手の入力ワードは 12 フレームごとに 1 フレームだけ 3（apply_frame 10・22・34）。4 ワードずつのまとまり（9〜12・21〜24・33〜36）の中で
-    /// 上がって下がる。
+    /// 相手の入力ワードは12フレームごとに1フレームだけ3になる（apply_frame 10・22・34）。
+    /// 4ワードずつのまとまり（9〜12・21〜24・33〜36）の中で上がって下がる。
     fn remote_pulses(b: u32) -> u16 {
         if matches!(b, 10 | 22 | 34) { 3 } else { 0 }
     }
@@ -3352,7 +3450,7 @@ pub(crate) mod tests {
         assert_eq!((se.new_ids, se.replayed, se.refused), (0, 0, 0), "{se:?}");
     }
 
-    /// 進め直し 1 回（ウィンドウを直に使う）: `ticks` の (種類, フレーム, p2) を順に tick し、`resim_begin` と `resim_end` で挟む。
+    /// 進め直し1回（ウィンドウを直に使う）: `ticks`の (種類, フレーム, p2)を順にtickして`resim_begin`と`resim_end`で挟む。
     fn resim_once(g: &mut FakeGame, st: &mut PlayState, ticks: &[(TickKind, u32, u16)]) {
         GameWindow { mem: g, st }.resim_begin();
         for &(kind, frame, p2) in ticks {
@@ -3384,7 +3482,7 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(calls() - c0, 2, "確定の tick の数だけ呼ぶ");
-        // 生きた tick: 相手の入力ワードが本物で、確定した状態の上（frame == front）のときだけ確定。
+        // 生きたtick: 相手の入力ワードが本物かつ確定した状態の上（frame == front）のときだけ確定。
         st.hint.remote_next = 100;
         st.front = 30;
         let live = |g: &mut FakeGame, st: &mut PlayState, frame| {
@@ -3471,7 +3569,7 @@ pub(crate) mod tests {
             0,
             "積み直した分を生きた tick の分に数えた"
         );
-        g.se_queue_push(0x01, 0); // 後ろの枠に別の SE を足しても、読み方が詰まった枠の順に読むこと
+        g.se_queue_push(0x01, 0); // 後ろの枠に別のSEを足しても、読み方が詰まった枠の順に読むこと
         resim_once(&mut g, &mut st, &[(TickKind::Confirmed, 31, 0x44)]);
         assert_eq!(st.stats().se.new_cutin, 1);
         let mut g = FakeGame::new();
@@ -3931,10 +4029,10 @@ pub(crate) mod tests {
     fn holding_a_hit_leaves_the_other_se_in_the_queue_as_they_were() {
         let mut g = FakeGame::new();
         g.se_noise = false;
-        g.se_p1_change = Some(0); // p1 = 4 で id 4 を積む（被弾音）
-        g.se_p2_eq = Some((0x44, SE_ID_CUTIN)); // 被弾音の後ろに 0xE
+        g.se_p1_change = Some(0); // p1 = 4 でid 4を積む（被弾音）
+        g.se_p2_eq = Some((0x44, SE_ID_CUTIN)); // 被弾音の後ろに0xE
         let mut st = play_state_cutin_live();
-        g.se_queue_push(7, 10); // 走査の前からある SE（7 が 2 回。パンの平均 15）
+        g.se_queue_push(7, 10); // 走査の前からあるSE（7が2回。パンの平均15）
         g.se_queue_push(7, 20);
         g.se_queue_push(SE_ID_HIT, 33); // 走査の前からある被弾音（遅れて積み直した確定の分。抜かない）
         let live = |g: &mut FakeGame, st: &mut PlayState| {
@@ -4274,8 +4372,8 @@ pub(crate) mod tests {
         let run = |hit: SeTiming, cutin: SeTiming| {
             let mut g = FakeGame::new();
             g.se_noise = false;
-            g.se_p2_change = Some(1); // 相手の語 3 で id 4（被弾音）
-            g.se_p1_change = Some(0x0E - 5); // 自分の語 5 で id 0xE（カットイン）
+            g.se_p2_change = Some(1); // 相手の語3でid 4（被弾音）
+            g.se_p1_change = Some(0x0E - 5); // 自分の語5でid 0xE（カットイン）
             let mut rb = Rollback::new(Config::rollback(Seat::P1, 1, 8).with_time_sync(false));
             let mut st = crate::rollback_testkit::play_state();
             st.set_hit_se(hit);
@@ -4453,7 +4551,17 @@ pub(crate) mod tests {
                 ..
             }
         ));
-        assert_eq!(g.scans.last(), Some(&(Order::Feed { p1: 0, p2: 0 }, false)));
+        assert_eq!(
+            g.scans.last(),
+            Some(&(
+                Order::Feed {
+                    p1: 0,
+                    p2: 0,
+                    w2: 0
+                },
+                false
+            ))
+        );
         let _ = post_present(&mut rb, &mut st, &mut g);
         for k in 1..=2u16 {
             let _ = scan_point(
@@ -4469,7 +4577,14 @@ pub(crate) mod tests {
             if k == 1 {
                 assert_eq!(
                     g.scans.last(),
-                    Some(&(Order::Feed { p1: 0, p2: 0x41 }, false))
+                    Some(&(
+                        Order::Feed {
+                            p1: 0,
+                            p2: 0x41,
+                            w2: 0x41
+                        },
+                        false
+                    ))
                 );
             }
             let _ = post_present(&mut rb, &mut st, &mut g);
@@ -4634,8 +4749,8 @@ pub(crate) mod tests {
         assert_eq!(g.get(x + UPDATE_NEXT), 0, "書けないのに書いた");
     }
 
-    /// 更新の節 `x`（fn = 種類 5 の更新 `0x4224F0`）と描画の節 `d`（fn = `0x422C10`）が同じ本体 `body`（0x38 B。`+0x08` が `x`、
-    /// `+0x0C` が `d`）を指す形を、偽のゲームへ用意する。節も本体もコピーの範囲の外のヒープ。
+    /// 更新の節`x`（fn = 種類5の更新`0x4224F0`）と描画の節`d`（fn = `0x422C10`）が同じ本体`body`（0x38 B。`+0x08`が`x`。`+0x0C`が`d`）を指す形を偽のゲームへ用意する。
+    /// 節も本体もコピーの範囲の外のヒープ。
     fn screen_effect_scene(g: &mut FakeGame, x: u32, d: u32, body: u32) {
         let reg = UPDATE_REGISTRY;
         let draw = UPDATE_REGISTRY + UPDATE_DRAW_HEAD;
@@ -4661,8 +4776,8 @@ pub(crate) mod tests {
         (0..n as u32).map(|i| g.get(addr + 4 * i)).collect()
     }
 
-    /// 予測の tick が後片付け `0x422900` を走らせた形（`0x42B350` が節を列から外して欄を 0 にし、`0x422900` が本体の `+0x0C` を 0
-    /// にして、本体の解放は CRT へ渡さずバックアップする）。
+    /// 予測のtickが後始末`0x422900`を走らせた形を再現する。
+    /// `0x42B350`が節を列から外してフィールドを0にする。`0x422900`が本体の`+0x0C`を0にして、本体の解放はCRTへ渡さずバックアップする。
     fn run_screen_effect_teardown(g: &mut FakeGame, x: u32, d: u32, body: u32) {
         let draw = UPDATE_REGISTRY + UPDATE_DRAW_HEAD;
         g.mem.insert(UPDATE_REGISTRY + UPDATE_NEXT, 0);
@@ -5040,7 +5155,7 @@ pub(crate) mod tests {
         assert!(sec.contains(&format!("`0x{:08X}`〜`0x{:08X}`", shot.start, shot.end)));
     }
 
-    /// 偽の命令の表（`HookEnv` と `DetourEnv`）。スレッドは 0 本。
+    /// 偽の命令の表（`HookEnv`と`DetourEnv`）。スレッドは0本。
     pub(crate) struct FakeCode {
         pub(crate) mem: BTreeMap<u32, u8>,
         pub(crate) writes: Vec<(u32, Vec<u8>)>,
@@ -5386,13 +5501,13 @@ pub(crate) mod tests {
         assert!(q.is_empty());
     }
 
-    /// Stage の色の 4 B（ゲームのメモリ）。
+    /// Stageの色の4 B（ゲームのメモリ）。
     fn tint_of(g: &FakeGame, side: usize) -> u32 {
         g.get(g.stage(side) + STAGE_TINT)
     }
 
-    /// 製品の作り方（`PlayState::new` —— 表は `RENDER_RESETS`）か、表を空にした直す前の形。直した側を表の中身で決めない
-    /// （本物の表が空になったら、直した側の検査が落ちるように）。
+    /// 製品の作り方（`PlayState::new`。表は`RENDER_RESETS`）か、表を空にした直す前の形。
+    /// 直した側を表の中身で決めない（本物の表が空になったら直した側の検査が落ちるように）。
     fn state_for(fixed: bool) -> PlayState {
         if fixed {
             play_state_cutin_live()
@@ -5727,8 +5842,8 @@ pub(crate) mod tests {
         ] {
             assert!(l.contains(label), "{label}（欄の値 {v}）が文に無い: {l}");
         }
-        // リングバッファの並び: 18 個決まっていれば、次に上書きされる枠（18 % 16 = 2）が一番古い。古い順は枠 2〜15、続けて枠 0・1。
-        // 欄 `seg_d_log[i]` は seg = 100 + 枠の番号（上の組み立て）なので、並べ直しを間違えると seg の順が崩れる。
+        // リングバッファの並び: 18個決まっていれば次に上書きされる枠（18 % 16 = 2）が一番古い。古い順は枠2〜15に続けて枠0・1。
+        // フィールド`seg_d_log[i]`は seg = 100 + 枠の番号（上の組み立て）なので、並べ直しを間違えるとsegの順が崩れる。
         let want = "seg102=D2 seg103=D0 seg104=D1 seg105=D2 seg106=D0 seg107=D1 seg108=D2 seg109=D0 seg110=D1 seg111=D2 seg112=D0 seg113=D1 seg114=D2 seg115=D0 seg100=D0 seg101=D1";
         assert!(l.contains(want), "{l}");
         let none = core_stats_lines(&higanr_core::rollback::Stats::default()).join("\n");
@@ -5884,7 +5999,8 @@ pub(crate) mod tests {
             vec![(
                 Order::Feed {
                     p1: 0x0135,
-                    p2: 0x0134
+                    p2: 0x0134,
+                    w2: 0x0135,
                 },
                 true
             )]
@@ -5894,7 +6010,7 @@ pub(crate) mod tests {
         assert_eq!(rows, vec![(3, 0x0135, 0x0134)]);
     }
 
-    /// 直す前の製品の経路の .data の表（7 行 ＋ リンク。`globals_c` が fps の計測の 6 語を含む）。対照の実行だけが使う。
+    /// 直す前の製品の経路の .dataの表（7行とリンク。`globals_c`がfpsの計測の6ワードを含む）。対照の実行だけが使う。
     static OLD_PLAY_DATA: [RbData; 8] = [
         ROLLBACK_DATA[0],
         ROLLBACK_DATA[1],

@@ -20,8 +20,8 @@ import { freshIp } from "./helpers";
 
 const BASE = "https://dist.example/releases/latest/download/";
 
-// ファイル名の規則の標本。src/core/src/update.rs の NAME_RULE_ACCEPT / NAME_RULE_REJECT と同じ表
-// （tools/make_dist.py が 2 つの一致を見る。片方だけ直すと止まる）。
+// ファイル名の規則のサンプル。src/core/src/update.rsのNAME_RULE_ACCEPT / NAME_RULE_REJECTと同じ表。
+// tools/make_dist.pyが2つの一致を見る。片方だけ直すと止まる。
 const ACCEPT: readonly string[] = [
   "HiganRTool.exe",
   "HiganRTool.dll",
@@ -85,7 +85,7 @@ const REJECT: readonly string[] = [
   "logs\\x.csv",
 ];
 
-// redirect: "manual" —— 既定の fetch は 302 を辿って外へ出ようとするので、回す先を読むだけにする。
+// redirect: "manual" —— 既定のfetchは302を辿って外へ出ようとするのでリダイレクト先を読むだけにする。
 function get(path: string, init: RequestInit = {}): Promise<Response> {
   return exports.default.fetch(`http://rooms.test${path}`, {
     redirect: "manual",
@@ -94,8 +94,8 @@ function get(path: string, init: RequestInit = {}): Promise<Response> {
   });
 }
 
-// 目録を取り寄せる Worker の fetch は、この検査では必ず偽物に差し替える（配り場所へ本当に接続しない）。
-// 差し替えを忘れた回が外へ出ないよう、既定は「接続しない」。
+// 目録を取得するWorkerのfetchはこの検査では必ず偽物に差し替える（配布元へ本当に接続しない）。
+// 差し替えを忘れた検査が外へ出ないよう、既定は「接続しない」。
 let outbound: string[] = [];
 let outboundReply: (url: string) => Promise<Response> = () => Promise.reject(new TypeError("blocked in test"));
 

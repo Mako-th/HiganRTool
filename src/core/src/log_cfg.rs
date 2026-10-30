@@ -1,24 +1,25 @@
-//! ini の `[log]`（ログを簡潔にするか詳細にするか）の読み方。
+//! iniの`[log]`（ログを簡潔にするか詳細にするか）の読み方。
 //!
-//! `detail = 0` は簡潔（本ログ 1 本だけ）、`1` は詳細（CSV なども書く）。書かなければ呼び手の既定。
-//! 知らないキー・読めない値は、`[netplay]` などと同じく節ごと使わず既定に戻し、その理由を `note` に返す。
+//! `detail = 0`は簡潔（本ログ1本だけ）。`1`は詳細（CSVなども書く）。書かなければ呼び出し側の既定。
+//! 知らないキー・読めない値は`[netplay]`などと同じく節ごと使わず既定に戻す。その理由を`note`に返す。
 
 #![forbid(unsafe_code)]
 
 use crate::ini;
 
 pub const SECTION: &str = "log";
-/// DLL が簡潔なログの先頭近くに書く行の先頭。ローダーがこれで「CSV が無いのは正常」と知る。
+/// DLLが簡潔なログの先頭近くに書く行の先頭。ローダーがこれで「CSVが無いのは正常」と知る。
 pub const BRIEF_MARK: &str = "ログ: 簡潔";
 pub const DETAIL_MARK: &str = "ログ: 詳細";
 
-/// 簡潔なログの本文か（先頭近くに印の行がある）。
+/// 簡潔なログの本文かどうか（先頭近くに印の行がある）。
 pub fn is_brief_log(text: &str) -> bool {
     text.lines().any(|l| l.starts_with(BRIEF_MARK))
 }
 
-/// 簡潔なログに「うまくいかなかった」印の行があるか: 試験のまとめ・状態の変化の × 項目、★の行、読み取りのスレッドのパニック、
-/// CHECK のズレ。ローダーが「詳しい記録の頼み方」を出す回を選ぶのに使う。
+/// 簡潔なログに「うまくいかなかった」印の行があるかどうか。
+/// 該当する行は次のとおり: 試験のまとめ・状態の変化の × 項目、★の行、読み取りのスレッドのパニック、CHECKのズレ。
+/// ローダーが「詳しい記録の頼み方」を出す回を選ぶのに使う。
 pub fn brief_log_has_trouble(text: &str) -> bool {
     text.lines().any(|l| {
         l.starts_with("× ")
@@ -28,13 +29,13 @@ pub fn brief_log_has_trouble(text: &str) -> bool {
     })
 }
 const KEYS: [&str; 1] = ["detail"];
-/// `note` に値をコピーするときの長さの上限（長い値でログが膨らまないように）。
+/// `note`に値をコピーするときの長さの上限（長い値でログが膨らまないように）。
 const ECHO_MAX: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogChoice {
     pub detail: bool,
-    /// 既定へ戻したときの理由（本ログに 1 行書く）。ini を使えた・書いていないときは None。
+    /// 既定へ戻したときの理由（本ログに1行書く）。iniを使えた・書いていないときはNone。
     pub note: Option<String>,
 }
 
@@ -50,7 +51,7 @@ fn echo(v: &str) -> String {
     s
 }
 
-/// ini の本文（読めなければ None）から詳細にするかを決める。`default_detail` は書いていないときの値。
+/// iniの本文（読めなければNone）から詳細にするかどうかを決める。`default_detail`は書いていないときの値。
 pub fn choose(text: Option<&str>, default_detail: bool) -> LogChoice {
     let fallback = |why: String| LogChoice {
         detail: default_detail,
@@ -178,10 +179,10 @@ mod tests {
     #[test]
     fn the_hint_steps_make_a_valid_ini_with_the_detailed_log() {
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini");
-        // [log] がある配る ini: detail = 0 を 1 に変える。
+        // [log]がある配布用のini: detail = 0 を1に変える。
         assert_eq!(dist.matches("detail = 0").count(), 1);
         let changed = dist.replace("detail = 0", "detail = 1");
-        // [log] が無い古い ini: 2 行を足す。
+        // [log]が無い古いini: 2行を足す。
         let old = dist
             .replace("[log]", "[nolog]")
             .replace("detail = 0", "detail_x = 0");
@@ -199,7 +200,7 @@ mod tests {
                 assert_eq!(c.note, None, "{what}");
             }
         }
-        // 古い案内（足すだけ）だと、配る ini では節が 2 回になって ini 全体が読めない。
+        // 古い案内（足すだけ）だと配布用のiniでは節が2回になってini全体が読めない。
         let doubled = format!("{dist}\n[log]\ndetail = 1\n");
         assert!(choose(Some(&doubled), false).note.is_some());
     }

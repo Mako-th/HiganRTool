@@ -1,8 +1,10 @@
-//! 観戦の組み上がりの検査: 同じプロセスに peer_sim のホスト（観戦のポートつき）・ゲスト・観戦者を 3 本のスレッドで loopback の実 UDP に立てて回す。`tests/loopback.rs` の子モジュール（実時間の検査を `build.bat` の `--ignored` の回に載せるため）。部品の検査は `higanr_core::spectate` の中にある。
-//! 合格の不変量: 観戦者のマッチの語の列が、対戦する2人の列と全行一致する（ロス無し・決め打ちのロス・固定 seed の乱れ。観戦者からホストへの送りにも掛ける）。
-//! SELECT（両席）・選択の押下・seg の始まり・終わりが、対戦する2人の側の値と順に一致する。遅れて入った観戦者は、いまの seg の始まり（`Seg(k)`。その後ろにその seg の選択の押下・SELECT が続く。最初の seg はリングバッファの先頭 = `Seg(0)`）から流れる。
-//! 観戦者が黙っても、対戦する2人の列はロス無しの走行と同じで、stall も増えず、走行の終わりを引き延ばされない。ゲストの役の走行は観戦者へ記録を送らない。
-//! 実時間で走る（1 本 7〜30 秒）。
+//! 観戦の組み上がりの検査。同じプロセスにpeer_simのホスト（観戦のポートつき）・ゲスト・観戦者を3本のスレッドで立て、loopbackの実UDPで回す。
+//! `tests/loopback.rs`の子モジュール（実時間の検査を`build.bat`の`--ignored`の実行に載せるため）。部品の検査は`higanr_core::spectate`の中にある。
+//! 合格の不変量は、観戦者のマッチのワードの列が対戦する2人の列と全行一致すること（ロス無し・決め打ちのロス・固定seedの乱れ。観戦者からホストへの送信にも掛ける）。
+//! SELECT（両サイド）・選択の押下・segの始まり・終わりが、対戦する2人の側の値と順に一致する。
+//! 遅れて入った観戦者には、いまのsegの始まり（`Seg(k)`）から流れる。その後ろにそのsegの選択の押下・SELECTが続く。最初のsegはリングバッファの先頭 = `Seg(0)`。
+//! 観戦者が黙っても対戦する2人の列はロス無しの走行と同じ。stallも増えず、走行の終わりを引き延ばされない。ゲストの役の走行は観戦者へ記録を送らない。
+//! 実時間で走る（1本7〜30秒）。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
@@ -18,7 +20,7 @@ use peer_sim::watch::{self, WEvent, WFrame, WatchConfig, WatchEnd, WatchReport};
 
 use super::{FRAMES, SEED_A, SEED_B, SEGS, assert_pair_ok, baseline, configs, random_fault};
 
-/// 観戦用のコードの session・秘密（対戦の `0x5EED_0001`・`cli::DEFAULT_SECRET` とは別の値）。
+/// 観戦用のコードのsession・秘密の乱数（対戦の`0x5EED_0001`・`cli::DEFAULT_SECRET`とは別の値）。
 const SPEC_SESSION: u32 = 0x5EC7_0002;
 const SPEC_SECRET: Secret = Secret(*b"spectate-loop-01");
 
@@ -33,7 +35,7 @@ fn watch_cfg(host: SocketAddr) -> WatchConfig {
         host: vec![host],
         session_id: SPEC_SESSION,
         secret: SPEC_SECRET,
-        // 配る側（peer_sim の `--spectate-host`）の公開鍵（観戦用のコードを使わない経路の式）。
+        // 配信する側（peer_simの`--spectate-host`）の公開鍵（観戦用のコードを使わない経路の式）。
         host_public: peer_sim::keys::spectate_host_public(&SPEC_SECRET, SPEC_SESSION),
         name: "watcher".to_string(),
         nonce: 0x57A7_C4E2,
@@ -44,8 +46,9 @@ fn watch_cfg(host: SocketAddr) -> WatchConfig {
     }
 }
 
-/// ホスト A（観戦のポートつき）・ゲスト B・観戦者 W を回す。`spec_fault` はホストから観戦者への送りに、`wcfg` の `fault` は観戦者からホストへの送りに
-/// 掛かる。`spectate_on_guest` なら観戦のポートはゲスト B に付ける（ホストでない走行が何も流さないことの検査）。
+/// ホストA（観戦のポートつき）・ゲストB・観戦者Wを回す。
+/// `spec_fault`はホストから観戦者への送信に掛かり、`wcfg`の`fault`は観戦者からホストへの送信に掛かる。
+/// `spectate_on_guest`なら観戦のポートはゲストBに付ける（ホストでない走行が何も送らないことの検査）。
 fn run_trio(
     fa: FaultConfig,
     fb: FaultConfig,
@@ -72,7 +75,7 @@ fn run_trio_with(
         sock: spec_sock,
         session_id: SPEC_SESSION,
         secret: SPEC_SECRET,
-        // 観戦者（`watch_cfg`）がコードを使わず式で公開鍵を作る検査なので、固定の種（1 回きりの実行だけ）。
+        // 観戦者（`watch_cfg`）がコードを使わず式で公開鍵を作る検査なので固定の種を使う（1回きりの実行だけ）。
         key_seed: peer_sim::keys::spectate_host_seed(&SPEC_SECRET, SPEC_SESSION),
         fault: spec_fault,
     };
@@ -119,7 +122,7 @@ fn rows(recs: &[Rec]) -> Vec<WFrame> {
         .collect()
 }
 
-/// 観戦者の列が対戦する2人の列と全行同じか。食い違えば、長さと最初の食い違いの行だけを出す（列の全部を出さない）。
+/// 観戦者の列が対戦する2人の列と全行同じかどうか。食い違えば長さと最初の食い違いの行だけを出す（列の全部を出さない）。
 fn assert_same_frames(got: &[WFrame], want: &[WFrame], tag: &str) {
     if got == want {
         return;
@@ -134,7 +137,7 @@ fn assert_same_frames(got: &[WFrame], want: &[WFrame], tag: &str) {
     );
 }
 
-/// マッチの語以外の記録の並び（MENU は数が変わるので、種類の並びから除く）。
+/// マッチのワード以外の記録の並び（MENUは数が変わるので種類の並びから除く）。
 fn kinds(w: &WatchReport) -> Vec<String> {
     w.events
         .iter()
@@ -158,7 +161,7 @@ fn kinds(w: &WatchReport) -> Vec<String> {
         .collect()
 }
 
-/// 全部の seg を先頭から観戦した走行の、共通の合格条件（ロス無し・乱れの下で同じ）。
+/// 全部のsegを先頭から観戦した走行の共通の合格条件（ロス無し・乱れの下で同じ）。
 fn assert_full_watch(t: &Trio, tag: &str) {
     let (a, b, w) = (&t.a, &t.b, &t.w);
     assert_pair_ok(a, b, tag);
@@ -183,8 +186,8 @@ fn assert_full_watch(t: &Trio, tag: &str) {
             "{tag} {who}: {o:?}"
         );
     }
-    // 記録の順と中身（dll と同じ並び: `Seg(k)` の後ろにその seg の押下・SELECT、再戦の seg1 は `Seg` の直後がマッチの語。最後の seg を出る
-    // ときも次の `Seg`（seg2）を積み、その後ろに終わり）。
+    // 記録の順と中身はdllと同じ並び。`Seg(k)`の後ろにそのsegの押下・SELECTが続き、再戦のseg1は`Seg`の直後がマッチのワード。
+    // 最後のsegを出るときも次の`Seg`（seg2）を積み、その後ろに終わりが続く。
     assert_eq!(
         kinds(w),
         [
@@ -273,9 +276,9 @@ fn spectator_sees_both_players_words_lossless() {
         false,
     );
     assert_full_watch(&t, "ロス無し");
-    // ロスが無いので、ホストの送り直しはほぼ要らない（ウィンドウと ACK が噛み合っている）。ホストが BYE を受けて観戦者を外した。上限 40 は、
-    // 別の建て直しが走る負荷の下でスレッドが 4 ms 遅れて 1〜12 回出ても落ちない値で、ACK が噛み合わない場合（ウィンドウが埋まるまでの
-    // 1 秒で約 8 ms ごと、黙った観戦者で 7 秒に約 160 回）より十分下。
+    // ロスが無いのでホストの再送はほぼ要らない（ウィンドウとACKが噛み合っている）。ホストがBYEを受けて観戦者を外した。
+    // 上限40は、別の建て直しが走る負荷の下でスレッドが4 ms遅れて1〜12回出ても検査が失敗しない値。
+    // ACKが噛み合わない場合（ウィンドウが埋まるまでの1秒で約8 msごと、黙った観戦者で7秒に約160回）より十分下。
     let sp = t.a.spectate.as_ref().unwrap();
     assert!(sp.counts.resends <= 40, "{sp:?}");
     assert_eq!(sp.counts.left, 1, "{sp:?}");
@@ -349,21 +352,21 @@ fn late_join_in_a_rematch_starts_at_the_last_select_seg() {
         |c| c.start_after_ms = 4_000,
         false,
     );
-    // 再戦の seg 1 の途中で入っても、選択のある seg 0（`Seg` 0・押下・SELECT）から全部受ける（頭から観戦したのと同じ列）。
+    // 再戦のseg 1の途中で入っても選択のあるseg 0（`Seg` 0・押下・SELECT）から全部受ける（頭から観戦したのと同じ列）。
     assert_full_watch(&t, "再戦の途中の JOIN");
     let sp = t.a.spectate.as_ref().unwrap();
     assert_eq!(sp.counts.joined, 1);
     assert_eq!(t.a.recs, baseline().0.recs);
 }
 
-/// 両者の読み込みの長さを揃える。`configs` の A 30 ms・B 250 ms では、先に読み込みを終えた側の stall が走るたびに 0〜14 フレームぶれる（実測）ので、
-/// 観戦者が stall を増やさないかを見る検査では揃える。
+/// 両者の読み込みの長さを揃える。
+/// `configs`のA 30 ms・B 250 msでは先に読み込みを終えた側のstallが走るたびに0〜14フレームぶれる（実測）。そのため観戦者がstallを増やさないかを見る検査では揃える。
 fn equal_load(a: &mut SimConfig, b: &mut SimConfig) {
     a.load_ms = 100;
     b.load_ms = 100;
 }
 
-/// 両者の読み込みを揃え、マッチの長さを `frames`（1 seg あたり）にする。
+/// 両者の読み込みを揃え、マッチの長さを`frames`（1 segあたり）にする。
 fn equal_load_with(frames: u32) -> impl Fn(&mut SimConfig, &mut SimConfig) {
     move |a, b| {
         equal_load(a, b);
@@ -383,13 +386,15 @@ fn run_pair_with(edit: impl Fn(&mut SimConfig, &mut SimConfig)) -> (Report, Repo
     )
 }
 
-/// 観戦者なしの走行との stall の差の許し（フレーム）。読み込みを揃えても、マッチに入る時刻の位相のぶれで、観戦者なしの走行どうしでも合計が
-/// 0〜13 フレームぶれる（実測）。観戦の仕事が対戦の周回を遅らせる変異は、ぶれの数倍（A 28 → 105）になったので、許しはぶれの倍の 30 にした
-/// （位相のぶれが見えなくなる細かい遅れは、この検査では見つからない）。
+/// 観戦者なしの走行とのstallの差の許容（フレーム）。
+/// 読み込みを揃えても、マッチに入る時刻の位相のぶれで観戦者なしの走行どうしでも合計が0〜13フレームぶれる（実測）。
+/// 観戦の処理が対戦の周回を遅らせる変異は、ぶれの数倍（A 28 → 105）になった。そのため許容はぶれの倍の30にした。
+/// 位相のぶれが見えなくなる細かい遅れは、この検査では見つからない。
 const STALL_SLACK: u32 = 30;
 
-/// 黙った観戦者の検査のマッチの長さ（1 seg あたり）。マッチの語だけでホストの送りのウィンドウ（512 記録）を越え、黙った観戦者が
-/// ウィンドウで止まるのが見える長さ。ウィンドウの定数をコピーせず数で書く（定数を壊す変異で恒真にしない）。
+/// 黙った観戦者の検査のマッチの長さ（1 segあたり）。
+/// マッチのワードだけでホストの送信ウィンドウ（512記録）を越え、黙った観戦者がウィンドウで止まるのが見える長さ。
+/// ウィンドウの定数をコピーせず数で書く（定数を壊す変異で恒真にしない）。
 const SILENT_FRAMES: u32 = 360;
 const SILENT_WINDOW: usize = 512;
 
@@ -443,19 +448,19 @@ fn silent_spectator_does_not_change_the_players() {
         t.w.frames.len(),
         sp.counts
     );
-    // マッチは約 12 秒で、黙ってから 10 秒（`SILENT_MS`）で外れる。ホストは黙った観戦者へ、外れるまで送り続け、外れた後は送らない。
+    // マッチは約12秒。黙ってから10秒（`SILENT_MS`）で外れる。ホストは黙った観戦者へ外れるまで送り続け、外れた後は送らない。
     assert_eq!(sp.counts.silenced, 1, "{sp:?}");
     assert!(sp.spectators.is_empty(), "{sp:?}");
     assert!(sp.counts.resends > 0, "{sp:?}");
-    // 4 ms ごとのまま送り直すと 10 秒で 2,500 通。core は記録ごとの時計で送り直し、黙った観戦者へは先頭の 1 通ぶんの穴だけを、倍々（上限 250 ms）の
-    // 間隔で出す。
+    // 4 msごとのまま再送すると10秒で2,500通。
+    // coreは記録ごとの時計で再送し、黙った観戦者へは先頭の1通ぶんの穴だけを倍々（上限250 ms）の間隔で送る。
     assert!(
         sp.counts.resends < 400,
         "送り直しの間隔が伸びていない: {sp:?}"
     );
-    // ホストが観戦者への渡し終えを待つ上限（`DRAIN_MS` = 1 秒）に余裕を足した値を、定数をコピーせず数で書く（定数を壊す変異で恒真にしない）。
+    // ホストが観戦者への送信の完了を待つ上限（`DRAIN_MS` = 1秒）に余裕を足した値を、定数をコピーせず数で書く（定数を壊す変異で恒真にしない）。
     assert!(sp.drain_ms <= 1_300, "{sp:?}");
-    // ホストはウィンドウを越えて送らない: 観戦者が受けたのはウィンドウの中の記録だけ。
+    // ホストはウィンドウを越えて送らない。観戦者が受けたのはウィンドウの中の記録だけ。
     let fresh = sp.counts.records_sent - sp.counts.records_resent;
     assert!(fresh <= SILENT_WINDOW as u64 + 32, "{sp:?}");
     assert!(
@@ -550,11 +555,11 @@ fn a_guest_run_streams_nothing() {
 
 // ================= 観戦者を中継越しに接続する（`--rewrite-spectate-code` ＋ `--shape`） =================
 //
-// 本物の花映塚の観戦者（dll）は、観戦用のコードの候補（＝ホストの受信ソケット）へ直に JOIN する。中継越しにするには、コードの候補を
-// 中継のポートへ書き換えて観戦者へ渡す。ここは peer_sim のホスト・ゲスト・観戦者で同じ形を回す: ホストの観戦のポートが中継の A（`--a`）、
-// 観戦者の受信ソケットが中継の B（`--b`）で、観戦者の宛先は中継の B 向けのポート（`--via-b`）。
+// 本物の花映塚の観戦者（dll）は、観戦用のコードの候補（＝ホストの受信ソケット）へ直にJOINする。
+// 中継越しにするには、コードの候補を中継のポートへ書き換えて観戦者へ渡す。
+// ここはpeer_simのホスト・ゲスト・観戦者で同じ形を回す。ホストの観戦のポートが中継のA（`--a`）、観戦者の受信ソケットが中継のB（`--b`）で、観戦者の宛先は中継のB向けのポート（`--via-b`）。
 
-/// 観戦者と観戦のポートの間の中継（向きごと）。A→B はホスト→観戦者の記録の流れ（STREAM）、B→A は観戦者の JOIN・ACK。
+/// 観戦者と観戦のポートの間の中継（向きごと）。A→Bはホスト→観戦者の記録の流れ（STREAM）。B→Aは観戦者のJOIN・ACK。
 fn spectator_relay_faults(seed: u64, drop_pct: u8, jitter_ms: u32) -> FaultConfig {
     FaultConfig {
         seed,
@@ -567,15 +572,14 @@ fn spectator_relay_faults(seed: u64, drop_pct: u8, jitter_ms: u32) -> FaultConfi
 
 #[derive(Clone, Copy)]
 enum Aim {
-    /// B 向けのポート（`--via-b`）。観戦者（B）の送り元が「そのポートの相手」なので運ばれる。正しい向き。
+    /// B向けのポート（`--via-b`）。観戦者（B）の送り元が「そのポートの相手」なので運ばれる。正しい向き。
     ViaB,
-    /// A 向けのポート（`--via-a`）。観戦者の送り元は A（ホスト）ではないので、中継が送り元違いとして捨てる。
+    /// A向けのポート（`--via-a`）。観戦者の送り元はA（ホスト）ではないので、中継が送り元違いとして捨てる。
     ViaA,
 }
 
-/// ホスト（観戦のポートつき）・ゲスト・観戦者を回し、観戦者だけを中継越しにする。観戦者の宛先は、ホストの観戦用のコードを
-/// `spectate_code::rewrite` で書き換え（`aim` = 候補にする中継のポート）、観戦者の側の読み（`code::read_spectate`）で読んだ
-/// ものから取る（dll と同じ経路）。
+/// ホスト（観戦のポートつき）・ゲスト・観戦者を回し、観戦者だけを中継越しにする。
+/// 観戦者の宛先は、ホストの観戦用のコードを`spectate_code::rewrite`で書き換え（`aim` = 候補にする中継のポート）、観戦者側の読み取り（`code::read_spectate`）で読んだものから取る（dllと同じ経路）。
 fn run_trio_via_relay(
     a2b: FaultConfig,
     b2a: FaultConfig,
@@ -604,7 +608,7 @@ fn run_trio_via_relay(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    // コードを使う経路: 配る側の種は走るたびの新しい種で、コードの公開鍵がその種の公開鍵（観戦者はコードから読む）。
+    // コードを使う経路では配信する側の種は走るたびの新しい種で、コードの公開鍵がその種の公開鍵（観戦者はコードから読む）。
     let host_seed = peer_sim::keys::fresh_seed();
     let cli_spec = peer_sim::cli::SpectateCli {
         bind: host_addr,
@@ -689,13 +693,13 @@ fn spectator_through_a_relay_with_a_rewritten_code_sees_the_same_words() {
         );
         assert_eq!((c.foreign, c.send_errors), (0, 0), "{dir}: {c:?}");
     }
-    // 落とされた STREAM を、ホストが送り直した（経路が走った）。観戦者は同じ記録を重ねて受けることがある。
+    // 落とされたSTREAMをホストが再送した（経路が走った）。観戦者は同じ記録を重ねて受けることがある。
     assert!(
         sp.counts.resends > 0,
         "中継が落としたのに送り直していない: {sp:?} {:?}",
         rr.a2b
     );
-    // 観戦者が受けた STREAM に、中継が中身を変えたものは無い（タグの誤り・読めない）。
+    // 観戦者が受けたSTREAMに中継が中身を変えたものは無い（タグの誤り・読めない）。
     let wc = t.w.counts;
     assert_eq!(
         (wc.bad_tag, wc.undecodable, wc.foreign, wc.wrong_session),

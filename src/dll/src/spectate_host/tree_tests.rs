@@ -1,6 +1,6 @@
-//! 中継の木のホストの側の配線の検査（loopback）。ホストは本物の受信スレッドに置いた `SpectateSender`、中継役の候補は本物の受信スレッドの
-//! 観戦者（`WatchPlay` ＋ 配る側）、その子は検査のスレッドで回す core の `Watcher`。上りの測り（MEASURE → PAIR の µs の到着 → 見積もり）から
-//! 中継役の選び・紹介・子への記録・中継役が抜けた後の REHOME までを、1 つの実行で通す。
+//! 中継の木のホストの側の配線の検査（loopback）。
+//! 構成は次のとおり。ホストは本物の受信スレッドに置いた`SpectateSender`。中継役の候補は本物の受信スレッドの観戦者（`WatchPlay` ＋ 配信する側）。その子は検査のスレッドで回すcoreの`Watcher`。
+//! 上りの測り（MEASURE → PAIRのµsの到着 → 見積もり）から中継役の選び・紹介・子への記録・中継役が抜けた後のREHOMEまでを、1つの実行で通す。
 use super::tests::{MATCH_SESSION, lo, wait_active};
 use super::*;
 use std::time::{Duration, Instant};
@@ -71,7 +71,7 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// `fake`: ini の `[spectate] fake_uplink`（上りの見積もりを替える。None なら loopback の本物の測り）。
+    /// `fake`: iniの`[spectate] fake_uplink`（上りの見積もりを替える。Noneならloopbackの本物の測り）。
     fn new(fake: Option<u32>) -> Cluster {
         let peer = UdpSocket::bind(lo(0)).unwrap();
         let peer_addr = peer.local_addr().unwrap();
@@ -94,7 +94,7 @@ impl Cluster {
 
         let (relay_net, relay_rx) =
             net_udp::open_for_code(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        // loopback では 2 か所目の STUN を聞かないので、届く側の回線の型を置く。
+        // loopbackでは2か所目のSTUNに問い合わせないので届く側のネットワーク種別のフラグを設定する。
         relay_net.set_second_stun_for_test(SecondStun::Compared(higanr_core::stun::Mapping::Same));
         let raddr = relay_net.local_addr().unwrap();
         let slot = Arc::new(WatchSlot::new());
@@ -158,7 +158,7 @@ impl Cluster {
         self.child.as_ref().expect("子を始めていない")
     }
 
-    /// 1 周: ホストのゲームのスレッドが 16 ms ごとに 1 記録を書く・中継役のゲームのスレッドの手入れ・子が受けて、送り元へ ack を返し、親へ JOIN を送り直す。
+    /// 1周でやること: ホストのゲームのスレッドが16 msごとに1記録を書く・中継役のゲームのスレッドの手入れ・子が記録を受けて送信元へackを返し親へJOINを送り直す。
     fn round(&mut self) {
         let ms = self.t0.elapsed().as_millis() as u32;
         while self.log.len() as u32 <= ms / 16 {
@@ -193,7 +193,7 @@ impl Cluster {
         }
     }
 
-    /// 子が受けた列が、番号の抜け・重なりなしでホストの列と同じ。
+    /// 子が受けた列が番号の抜け・重なりなしでホストの列と同じ。
     fn child_matches_log(&self) -> bool {
         let Some(&(first, _)) = self.child_got.first() else {
             return false;
@@ -230,7 +230,7 @@ fn a_measured_viewer_becomes_the_relay_its_child_follows_it_and_goes_home_when_i
     );
     assert_eq!(c.snap().relays, 0, "子が入る前に中継役の印が付いた");
 
-    // 子への穴あけの予定を先に作る。子へはホストが中継役を紹介し（中継役の下へ回す）、子の JOIN を中継役が受けられるので、穴あけは止まる。
+    // 子への穴あけの予定を先に作る。子へはホストが中継役を紹介する（中継役の下へ回す）。子のJOINを中継役が受けられるので穴あけは止まる。
     let shared = c.host_rx.spectate_shared().expect("共有");
     shared.request_punch(Candidates::from_addrs(&[c.caddr]).unwrap());
     c.until("穴あけの予定を作らない", 5, |c| {
@@ -243,7 +243,7 @@ fn a_measured_viewer_becomes_the_relay_its_child_follows_it_and_goes_home_when_i
     });
     let snap = c.snap();
     assert_eq!((snap.relays, snap.host.intros), (1, 1), "{snap:?}");
-    // 止めた数は送っている途中の予定だけを数える（送り切った後の JOIN は数えない）。
+    // 止めた数は送っている途中の予定だけを数える（送り切った後のJOINは数えない）。
     assert_eq!(
         (snap.punch.started, snap.punch.stopped),
         (1, 1),
@@ -270,7 +270,7 @@ fn a_measured_viewer_becomes_the_relay_its_child_follows_it_and_goes_home_when_i
         assert!(lines.contains(want), "{want:?} が無い: {lines}");
     }
 
-    // 中継役が抜ける: ホストが BYE を受け、子が REHOME で元のホストへ戻り、列が続く。
+    // 中継役が抜ける: ホストがBYEを受け、子がREHOMEで元のホストへ戻り、列が続く。
     let (left, had) = (c.host().left, c.child_got.len());
     c.relay_wp.feed().end(Some(ByeReason::Cancelled));
     let haddr = c.haddr;
@@ -289,7 +289,7 @@ fn a_measured_viewer_becomes_the_relay_its_child_follows_it_and_goes_home_when_i
     assert!(c.child_matches_log(), "戻った後の列に抜けか重なりがある");
 }
 
-/// 受信スレッドを止めた後に、止めた時点の木・上りの測りの数が読める（止めた後は `RecvThread` の持ち手が無く、本ログの終わりの全文では読めない）。
+/// 受信スレッドを止めた後でも止めた時点の木・上りの測りの数を読み取れる（止めた後は`RecvThread`のハンドルが無く、本ログの終わりの全文では読めない）。
 #[test]
 fn the_tree_and_measure_counts_survive_stopping_the_receive_thread() {
     let mut c = Cluster::new(Some(THICK));
@@ -360,7 +360,7 @@ fn a_relay_that_goes_silent_like_a_crash_sends_its_child_home_after_rejoin_ms_an
         c.child().host_addr() == Some(raddr) && c.child_got.len() >= 20
     });
     let (left, had) = (c.host().left, c.child_got.len());
-    // 中継役が子とホストへ送る便を全部捨てる（BYE も REHOME も出ない。強制終了と同じ）。
+    // 中継役が子とホストへ送るパケットを全部捨てる（BYEもREHOMEも出ない。強制終了と同じ）。
     c.relay_net.mute_watch_for_test(true);
     let muted_at = Instant::now();
     c.until("子が元のホストへ戻らない", 10, |c| {
@@ -373,7 +373,7 @@ fn a_relay_that_goes_silent_like_a_crash_sends_its_child_home_after_rejoin_ms_an
         (1, 0),
         "黙った親からでなく戻った: {t:?}"
     );
-    // 最後の記録は黙らせる直前に届いている（記録は 16 ms ごと）。
+    // 最後の記録は黙らせる直前に届いている（記録は16 msごと）。
     assert!(
         waited + Duration::from_millis(200)
             >= Duration::from_millis(u64::from(higanr_core::spectate::REJOIN_MS)),

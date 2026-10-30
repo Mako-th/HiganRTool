@@ -1,23 +1,23 @@
-//! ルームの期限（10 分。閉じる番号 4408）が切れたときに、自動で入り直すかの判断（pure。dll の見張りが呼ぶ）。
+//! ルームの期限（10分。閉じる番号4408）が切れたときに自動で入り直すかどうかの判断（pure。dllの監視の処理が呼ぶ）。
 //!
 //! 入り直すのは全部が当てはまるときだけ:
 //! - 失敗が期限切れ（`Failure::Expired`）。サーバーの誤り・429・満員などは自動で繰り返さない。
-//! - 先に入った側（`Role::Offer`）。返す側の 4408 は相手のコードを返す 60 秒の期限なので、知らせて終える。
-//! - 相手がまだ来ていない。相手のコードを読んでセッションを設定した後は、接続する側に任せる。
-//! - 前の入り直しから `MIN_GAP_SECS` 秒以上空いている（すぐ期限切れになる誤りでサーバーへ接続し続けない）。
+//! - 先に入った側（`Role::Offer`）。返す側の4408は相手のコードを返す60秒の期限なので知らせて終える。
+//! - 相手がまだ来ていない。相手のコードを読んでセッションを設定した後は接続する側に任せる。
+//! - 前の入り直しから`MIN_GAP_SECS`秒以上空いている（すぐ期限切れになる誤りでサーバーへ接続し続けない）。
 
 use crate::room::Failure;
 
-/// 前の入り直しから次の入り直しまでの最短（秒）。ルームの期限（10 分）の間隔なら常に満たす。
+/// 前の入り直しから次の入り直しまでの最短（秒）。ルームの期限（10分）の間隔なら常に満たす。
 pub const MIN_GAP_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Situation {
     pub first_in: bool,
-    /// 相手がルームに来たか（`room::Event::Matched` を見たか）。
+    /// 相手がルームに来たかどうか（`room::Event::Matched`を見たかどうか）。
     pub peer_came: bool,
     pub placed: bool,
-    /// 前の入り直しから経った秒（入り直したことが無ければ `None`）。
+    /// 前の入り直しから経った秒（入り直したことが無ければ`None`）。
     pub since_last_rejoin_secs: Option<u64>,
 }
 
@@ -29,14 +29,16 @@ pub fn should_rejoin(f: Failure, s: &Situation) -> bool {
         && s.since_last_rejoin_secs.is_none_or(|t| t >= MIN_GAP_SECS)
 }
 
-/// ランダム対戦で、待ち列へ入り直す間隔の最短（秒）。相手が入っては抜けるのを繰り返しても、サーバーへ接続し続けない
-/// （1 回の入り直しで 4 回接続するので、10 秒に 1 回なら IP ごとの回数の制限〔1 分に 30 回〕に収まる）。
+/// ランダム対戦で待ち列へ入り直す間隔の最短（秒）。
+/// 相手が入っては抜けるのを繰り返してもサーバーへ接続し続けないための値。
+/// 1回の入り直しで4回接続する。10秒に1回ならIPごとの回数の制限（1分に30回）に収まる。
 pub const REQUEUE_MIN_GAP_SECS: u64 = 10;
 const _: () = assert!(60 / REQUEUE_MIN_GAP_SECS * 4 <= 30);
 
-/// ランダム対戦で失敗したとき、待ち列へ入り直すか。待ち列の期限切れ、割り当てられたルームの期限切れ
-/// （片方が来なかった）、相手がルームで抜けたときに入り直す。相手のコードを読んでセッションを設定した後（`placed`）は、
-/// 接続する側に任せる。サーバーの誤り・429 などは自動で繰り返さない。
+/// ランダム対戦で失敗したとき待ち列へ入り直すかどうか。
+/// 待ち列の期限切れ・割り当てられたルームの期限切れ（片方が来なかった）・相手がルームで抜けたときに入り直す。
+/// 相手のコードを読んでセッションを設定した後（`placed`）は接続する側に任せる。
+/// サーバーの誤り・429などは自動で繰り返さない。
 pub fn should_requeue(f: Failure, placed: bool, since_last_requeue_secs: Option<u64>) -> bool {
     matches!(f, Failure::Expired | Failure::PeerLeft)
         && !placed
@@ -59,6 +61,7 @@ mod tests {
                 retry_after_secs: 60,
             },
             Failure::RoomFull,
+            Failure::RoomInUse,
             Failure::BadRoomName,
         ] {
             assert!(!should_requeue(f, false, None), "{f:?}");
@@ -103,6 +106,7 @@ mod tests {
                 retry_after_secs: 60,
             },
             Failure::RoomFull,
+            Failure::RoomInUse,
             Failure::BadRoomName,
             Failure::PeerLeft,
         ] {

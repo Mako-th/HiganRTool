@@ -1,5 +1,4 @@
-//! 名前を作る処理（pure。unsafe 無し）: ログのファイル名・二重注入のミューテックスの名前・
-//! 「ログの置き場がゲームのフォルダの中でないか」の判定。
+//! 名前を作る処理（pure。unsafe無し）: ログのファイル名・二重注入のミューテックスの名前・「ログの置き場がゲームのフォルダの中でないか」の判定。
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
@@ -7,7 +6,7 @@ use std::ffi::OsStr;
 use higanr_core::log_days::{is_expired, parse_date8};
 use higanr_core::log_names::LOG_PREFIX;
 
-/// 現地時刻（`GetLocalTime` の `SYSTEMTIME` からコピーする。Win32 の型を持ち込まないため）。
+/// 現地時刻（`GetLocalTime`の`SYSTEMTIME`からコピーする。Win32の型を持ち込まないため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalTime {
     pub year: u16,
@@ -28,12 +27,12 @@ impl LocalTime {
     }
 }
 
-/// 同じ秒・同じ PID で名前がぶつかったときに試す回数の上限。
+/// 同じ秒・同じPIDで名前がぶつかったときに試す回数の上限。
 pub const LOG_NAME_ATTEMPTS: u32 = 100;
 
-/// 1 回の注入で 1 つの回ごとの名前。隣のファイルの名前の元で、台本の実行では本ログの名前でもある（既存を上書きしない）:
-/// 時刻（ミリ秒まで）と PID を入れ、それでもぶつかれば `attempt`（0 始まり）を `_2` 以降の接尾辞にする。
-/// Windows のファイル名に使えない文字は入れない。
+/// 1回の注入で1つの回ごとの名前。隣のファイルの名前の元になる。台本の実行では本ログの名前でもある（既存を上書きしない）。
+/// 時刻（ミリ秒まで）とPIDを含める。それでもぶつかれば`attempt`（0始まり）を`_2`以降の接尾辞にする。
+/// Windowsのファイル名に使えない文字は含めない。
 pub fn log_file_name(t: &LocalTime, pid: u32, attempt: u32) -> String {
     let base = format!(
         "{LOG_PREFIX}{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}_pid{}",
@@ -46,13 +45,14 @@ pub fn log_file_name(t: &LocalTime, pid: u32, attempt: u32) -> String {
     }
 }
 
-/// 台本でない実行の本ログの名前: その日の 1 ファイル（`dll_YYYYMMDD.log`）。起動のたびに追記する。開発用のビルドを手で起動したときも日ごと。
+/// 台本でない実行の本ログの名前: その日の1ファイル（`dll_YYYYMMDD.log`）。起動のたびに追記する。開発用のビルドを手で起動したときも日ごと。
 pub fn daily_log_file_name(t: &LocalTime) -> String {
     format!("{LOG_PREFIX}{:04}{:02}{:02}.log", t.year, t.month, t.day)
 }
 
-/// 台本・検査の実行か（本ログを回ごとの名前にする）: ローダーの `--ini` / `--script` が環境変数を設定した、または DLL のフォルダに
-/// `script.txt` がある。この実行は同じ PC で複数を同時に起動し、回ごとに本ログを読み分けるので、日ごとにまとめない。
+/// 台本・検査の実行かどうか（本ログを回ごとの名前にする）。
+/// ローダーの`--ini` / `--script`が環境変数を設定したかDLLのフォルダに`script.txt`があれば真。
+/// この実行は同じPCで複数を同時に起動し、回ごとに本ログを読み分ける。そのため日ごとにまとめない。
 pub fn is_scripted_run(
     ini_env: Option<&OsStr>,
     script_env: Option<&OsStr>,
@@ -61,18 +61,20 @@ pub fn is_scripted_run(
     ini_env.is_some() || script_env.is_some() || script_file_exists
 }
 
-/// 本ログの隣のファイル名: 回ごとの名前（`log_file_name`）から `.log` を外して `suffix` を付ける（`_ticks.csv` など）。
-/// 日ごとの本ログの名前ではなく回ごとの名前から作るので、起動ごとに別名になる。`.log` で終わらない名前にはそのまま付ける。
+/// 本ログの隣のファイル名: 回ごとの名前（`log_file_name`）から`.log`を外して`suffix`を付ける（`_ticks.csv`など）。
+/// 日ごとの本ログの名前ではなく回ごとの名前から作るので起動ごとに別名になる。`.log`で終わらない名前にはそのまま付ける。
 pub fn side_file_name(log_name: &str, suffix: &str) -> String {
     let stem = log_name.strip_suffix(".log").unwrap_or(log_name);
     format!("{stem}{suffix}")
 }
 
-/// 配るバージョンで `logs\` に残す日数（原本は core の `log_days`。ローダーのログと同じ日数。`win::prune_old_logs` と配る README が引く）。
-/// 名前の日付が今日からこの日数より前のログ（`dll_` で始まる本ログと隣のファイル）は起動のたびに消す。開発用のビルドでは消さない。
+/// 配布バージョンで`logs\`に残す日数（原本はcoreの`log_days`。ローダーのログと同じ日数）。
+/// `win::prune_old_logs`と配布用のREADMEが参照する。
+/// 名前の日付が今日からこの日数より前のログ（`dll_`で始まる本ログと隣のファイル）は起動のたびに消す。
+/// 開発用のビルドでは消さない。
 pub use higanr_core::log_days::KEEP_LOG_DAYS;
 
-/// 名前の日付。`dll_YYYYMMDD-…`（回ごと・隣のファイル）か `dll_YYYYMMDD.log`（日ごと）。
+/// 名前の日付。`dll_YYYYMMDD-…`（回ごと・隣のファイル）か`dll_YYYYMMDD.log`（日ごと）。
 fn log_name_date(name: &str) -> Option<(i64, i64, i64)> {
     let rest = name.strip_prefix(LOG_PREFIX)?;
     let tail = rest.get(8..)?;
@@ -82,8 +84,9 @@ fn log_name_date(name: &str) -> Option<(i64, i64, i64)> {
     parse_date8(rest.get(..8)?)
 }
 
-/// 消してよい古いログか: 名前が `dll_YYYYMMDD-` で始まるか `dll_YYYYMMDD.log` で、その日が今日から `keep_days` 日より前。名前の形が違うもの・
-/// 今日より先の日付のもの（時計を戻した）は消さない。日付はファイル名から読む（zip から出すと更新時刻が変わるため）。
+/// 消してよい古いログかどうか。名前が`dll_YYYYMMDD-`で始まるか`dll_YYYYMMDD.log`で、その日が今日から`keep_days`日より前なら真。
+/// 名前の形が違うものと今日より先の日付のもの（時計を戻した）は消さない。
+/// 日付はファイル名から読む（zipから出すと更新時刻が変わるため）。
 pub fn is_expired_log(name: &str, today: &LocalTime, keep_days: i64) -> bool {
     let Some(date) = log_name_date(name) else {
         return false;
@@ -96,13 +99,13 @@ pub fn is_expired_log(name: &str, today: &LocalTime, keep_days: i64) -> bool {
     is_expired(today, date, keep_days)
 }
 
-/// 二重注入を防ぐミューテックスの名前（`Local\HiganRTool.<pid>`）。ローダーが注入の前に同じ名前を開いてみるので、
-/// ローダーと同じ形でなければならない。
+/// 二重注入を防ぐミューテックスの名前（`Local\HiganRTool.<pid>`）。
+/// ローダーが注入の前に同じ名前を開いてみるのでローダーと同じ形でなければならない。
 pub fn mutex_name(pid: u32) -> String {
     format!("Local\\HiganRTool.{pid}")
 }
 
-/// 比べるための形: 区切りを `\` にそろえ、末尾の `\` を落とし、小文字にする（Windows のパスは大文字小文字を区別しない）。
+/// 比べるための形: 区切りを`\`にそろえ、末尾の`\`を落とし、小文字にする（Windowsのパスは大文字小文字を区別しない）。
 fn normalize(p: &str) -> String {
     let mut s: String = p.replace('/', "\\").to_lowercase();
     while s.ends_with('\\') {
@@ -111,9 +114,9 @@ fn normalize(p: &str) -> String {
     s
 }
 
-/// `dir` が `root` と同じか、その下にあるか。部品の境目で比べる（`C:\a\game2` は `C:\a\game` の下ではない）。
-/// ログの置き場がゲームのフォルダの中なら書かない、の判定に使う。`..` や 8.3 形式は解かないので、
-/// 両方とも `GetModuleFileNameW` が返した形のまま渡すこと。
+/// `dir`が`root`と同じかその下にあるかどうか。部品の境目で比べる（`C:\a\game2`は`C:\a\game`の下ではない）。
+/// ログの置き場がゲームのフォルダの中なら書かないという判定に使う。
+/// `..`や8.3形式は解かないので両方とも`GetModuleFileNameW`が返した形のまま渡すこと。
 pub fn is_same_or_inside(dir: &str, root: &str) -> bool {
     let d = normalize(dir);
     let r = normalize(root);
@@ -277,7 +280,7 @@ mod tests {
             "日ごとの本ログも 4 日前は消す"
         );
         assert!(!is_expired_log(&daily(2027, 1, 1), &today, KEEP_LOG_DAYS));
-        // 月・年と閏日をまたぐ: 2028-03-01 から 3 日前は 2028-02-27（2028 年は閏年で 2/29 がある）。
+        // 月・年と閏日をまたぐ: 2028-03-01から3日前は2028-02-27（2028年は閏年で2/29がある）。
         let mar = day(2028, 3, 1);
         assert!(!is_expired_log(&name(2028, 2, 27), &mar, KEEP_LOG_DAYS));
         assert!(is_expired_log(&name(2028, 2, 26), &mar, KEEP_LOG_DAYS));

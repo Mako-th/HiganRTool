@@ -1,12 +1,12 @@
-//! dll の通信層: UDP のソケット・受信スレッド・ガード・ゲームスレッドのインターフェース（`GameNet`）。
+//! dllの通信層: UDPのソケット・受信スレッド・ガード・ゲームスレッドのインターフェース（`GameNet`）。
 //!
-//! - **受信スレッド**は `recv_from` で受けた生のバイト列を `net_ring::RecvRing` へ書き、受信のイベントを立てるだけ。解析と状態機械はゲームスレッド（`netplay.rs`）。例外は PING への PONG で、受信スレッドが受けたその場で返す（`answer_ping`。ゲームのスレッドの tick を待つと PONG が最大 1 tick 遅れ、相手の測る RTT がその分大きく出るため）。
-//!   ゲームスレッドの心拍が古ければ PONG を返さず、ゲームスレッドがパニックで止まった後（`RecvThread::say_bye`）は PONG の代わりに BYE を返す。
-//!   観戦のホスト（`spectate_host`）と観戦者の受け取り（`spectate_watch::WatchRecv`）も受信スレッドで走る（ゲームのスレッドが止まっていても観戦の便を受け続ける）。
-//! - **ゲームスレッドのインターフェース** `GameNet` は `netplay::Net` の本物: 時計（`Instant`。QPC）・リングの取り出し・イベントか高分解能の待機タイマーでの待ち（`net_win.rs`）・送る（std の `UdpSocket::send_to`。アドレスはスタックで詰め、確保しない）。
-//! - **ガード**: 開くときにソケットと相手の候補の全部がネットワークの範囲（ini の `scope`。既定 loopback。`higanr_core::guard`）の中かを見て、違えば 1 通も送らずに断る。送る直前にも宛先が範囲の中かを見る（`Outlet::send` の `to`）。
-//! - **STUN・自動のソケット・外側のアドレスの保ち**: 開いた後、ネットワークを動かす前に、読み取りのスレッドで STUN の Binding を問い合わせる（`GameNet::stun_query`）。`bind = auto:ポート` と `stun = 名前:ポート` の解決（`resolve_bind` / `resolve_stun`）は読み取りのスレッドで 1 回だけで、ゲームのスレッドでは呼ばない（DNS はブロッキング）。
-//!   接続の手順が成り立つまでの間と観戦を配っている間、受信スレッドが同じソケットから同じ STUN へ 15 秒ごとに Binding を送って外側のポートの対応づけを保つ（`GameNet::keep_stun_mapping`）。
+//! - **受信スレッド**は`recv_from`で受けた生のバイト列を`net_ring::RecvRing`へ書き、受信のイベントを立てるだけ。解析とステートマシンはゲームスレッド（`netplay.rs`）が担う。例外はPINGへのPONG。受信スレッドが受けたその場で返す（`answer_ping`。ゲームのスレッドのtickを待つとPONGが最大1 tick遅れ、相手の測るRTTがその分大きく出るため）。
+//!   ゲームスレッドの心拍が古ければPONGを返さず、ゲームスレッドがパニックで止まった後（`RecvThread::say_bye`）はPONGの代わりにBYEを返す。
+//!   観戦のホスト（`spectate_host`）と観戦者の受け取り（`spectate_watch::WatchRecv`）も受信スレッドで走る（ゲームのスレッドが止まっていても観戦のパケットを受け続ける）。
+//! - **ゲームスレッドのインターフェース** `GameNet`は`netplay::Net`の本物: 時計（`Instant`。QPC）・リングの取り出し・イベントか高分解能の待機タイマーでの待ち（`net_win.rs`）・送信（stdの`UdpSocket::send_to`。アドレスはスタックで詰めて確保しない）。
+//! - **ガード**: 開くときにソケットと相手の候補の全部がネットワークの範囲（iniの`scope`。既定loopback。`higanr_core::guard`）の中かを見る。違えば1通も送らずに断る。送る直前にも宛先が範囲の中かを見る（`Outlet::send`の`to`）。
+//! - **STUN・自動のソケット・外側のアドレスの維持**: 開いた後でネットワークを動かす前に読み取りのスレッドでSTUNのBindingを問い合わせる（`GameNet::stun_query`）。`bind = auto:ポート`と`stun = 名前:ポート`の解決（`resolve_bind` / `resolve_stun`）は読み取りのスレッドで1回だけ行い、ゲームのスレッドでは呼ばない（DNSはブロッキング）。
+//!   受信スレッドは同じソケットから同じSTUNへ15秒ごとにBindingを送って外側のポートの対応づけを維持する（`GameNet::keep_stun_mapping`）。対象は接続のハンドシェイクが成立するまでの間と観戦を配信している間。
 //!
 //! 開く・閉じる（スレッドを作る・止めて待つ）はゲームスレッドの外で行う（確保とブロッキングを含む）。
 #![forbid(unsafe_code)]
@@ -43,60 +43,62 @@ use crate::spectate_watch::{UpnpNews, WatchFeed, WatchRecv, WatchUpnp};
 use crate::trial_summary::Stun;
 use crate::upnp;
 
-/// 受信スレッドが止める印を見に戻る間隔（`recv_from` の待ちの上限）。
+/// 受信スレッドが停止フラグを見に戻る間隔（`recv_from`の待ちの上限）。
 ///
-/// **短くしない**: 上限を 1 ms にすると、対戦の相手のパケットが受信スレッドに届かない実行が出た（50 ms では出なかった。打ち切りが減るので起こりにくいだけで、同じ競合は残る（推定））。ICMP の受信誤り（`WSAECONNRESET`）が原因ではない。
-/// 上限が短いほど打ち切りが多く、打ち切りと到着が重なった 1 通が落ちる形に見える（推測。Winsock の中は見ていない）。ゲームのスレッドの待ちは別で、この上限に依らない。
+/// **短くしない**: 上限を1 msにすると対戦の相手のパケットが受信スレッドに届かない実行が出た（50 msでは出なかった）。打ち切りが減るので起こりにくいだけで同じ競合は残る（推定）。ICMPの受信誤り（`WSAECONNRESET`）が原因ではない。
+/// 上限が短いほど打ち切りが多く、打ち切りと到着が重なった1通が落ちる形に見える（推測。Winsockの中は見ていない）。ゲームのスレッドの待ちは別でこの上限に依らない。
 pub(crate) const RECV_POLL: Duration = Duration::from_millis(50);
-/// 受信の作業場所。`MAX_DATAGRAM` より大きいものも 1 回で受けて、リングが「大きすぎる」と数えて捨てる
-/// （小さい場所で受けると Windows は `WSAEMSGSIZE` の誤りを返す）。
+/// 受信バッファ。`MAX_DATAGRAM`より大きいものも1回で受け、リングが「大きすぎる」と数えて捨てる。
+/// 小さいバッファで受けるとWindowsは`WSAEMSGSIZE`の誤りを返す。
 const RECV_BUF: usize = 2048;
 
 struct Shared {
     ring: RecvRing,
-    /// 時計の起点（受信スレッドの受けた時刻と、ゲームスレッドの `now_us` は同じ起点の µs）。
+    /// 時計の起点（受信スレッドの受けた時刻とゲームスレッドの`now_us`は同じ起点のµs）。
     t0: Instant,
     event: Arc<Event>,
     stop: AtomicBool,
     conn_resets: AtomicU32,
     recv_errors: AtomicU32,
     pong: PongSlot,
-    /// 対戦の往復の要約（`DelaySnapshot::pack`）。書き手はゲームのスレッド（`GameNet::note_delay`）、読み手は観戦者への送信（`spectate_service`）。
+    /// 対戦の往復の要約（`DelaySnapshot::pack`）。書き手はゲームのスレッド（`GameNet::note_delay`）。読み手は観戦者への送信（`spectate_service`）。
     delay: AtomicU64,
-    /// 観戦のホスト（ini の `[spectate] enable = 1` のときだけ設定する）。
+    /// 自分の上り（B/s。0は分からない）。書き手と読み手は`delay`と同じ。
+    host_uplink: AtomicU32,
+    /// 観戦のホスト（iniの`[spectate] enable = 1`のときだけ設定する）。
     spectate: SpectateSlot,
-    /// 観戦者の受け取り（観戦者のネットワークだけ。`Net::watch_install` で設定する）。
+    /// 観戦者の受け取り（観戦者のネットワークだけ。`Net::watch_install`で設定する）。
     watch: WatchRxSlot,
-    /// ネットワークの範囲（開くときに決まり、受信スレッドを作る前に設定するので原子変数は要らない）。受信スレッドの PONG の送る直前のガードが使う。
+    /// ネットワークの範囲（開くときに決まり、受信スレッドを作る前に設定するのでアトミック変数は要らない）。受信スレッドがPONGを送る直前のガードで使う。
     scope: Scope,
-    /// 外側のアドレスの保ち（STUN の聞き直し）。設定しなければ受信スレッドは今までどおり。
+    /// 外側のアドレスの維持（STUNの聞き直し）。設定しなければ受信スレッドは今までどおり。
     keep: KeepSlot,
-    /// 2 か所目の STUN（宛先ごとに外側のポートを変える型かの見分け）。設定しなければ受信スレッドは今までどおり。
+    /// 2か所目のSTUN（宛先ごとに外側のポートが変わるかどうかの判別）。設定しなければ受信スレッドは今までどおり。
     second: SecondSlot,
     /// 接続できなかった理由を読むための診断の数（人を特定する値は持たない）。
     diag: DiagSlot,
-    /// IPv6 のソケット（`GameNet::open_ipv6` が開くときに 1 回だけ設定する。設定しなければ IPv4 だけ）。送る側（ゲームのスレッド）は
-    /// 原子的に 1 回読むだけ（確保しない）。
+    /// IPv6のソケット（`GameNet::open_ipv6`が開くときに1回だけ設定する。設定しなければIPv4だけ）。
+    /// 送る側（ゲームのスレッド）はアトミックに1回読むだけ（確保しない）。
     sock6: std::sync::OnceLock<Arc<UdpSocket>>,
-    /// IPv6 のソケットの受信のリング。IPv4 のリング（`ring`）とは別の単一書き手（IPv6 の受信スレッド）・単一読み手（ゲームのスレッド）の組。
+    /// IPv6のソケットの受信のリング。IPv4のリング（`ring`）とは別の単一書き手（IPv6の受信スレッド）・単一読み手（ゲームのスレッド）のペア。
     ring6: RecvRing,
-    /// IPv6 の受信スレッドの持ち手（`RecvThread::halt` が止めて待つ）。
+    /// IPv6の受信スレッドの持ち手（`RecvThread::halt`が止めて待つ）。
     join6: Mutex<Option<JoinHandle<()>>>,
-    /// UPnP の割り当ての持ち手（`GameNet::upnp_attach` が開くときに 1 回だけ設定する。`RecvThread::halt` が止めて、割り当てを消す）。
+    /// UPnPの割り当ての持ち手（`GameNet::upnp_attach`が開くときに1回だけ設定する。`RecvThread::halt`が止めて割り当てを消す）。
     upnp: std::sync::OnceLock<upnp::Handle>,
-    /// 中継の配る側を持つ観戦者の UPnP の突き合わせの材料（`GameNet::plan_watch_upnp`。受信スレッドが結果を待たずに覗く）。
+    /// 中継の配信側を持つ観戦者のUPnPの突き合わせの材料（`GameNet::plan_watch_upnp`。受信スレッドが結果を待たずに確認する）。
     watch_upnp: std::sync::OnceLock<WatchUpnpPlan>,
 }
 
-/// 観戦者の UPnP の結果を、受信スレッドが突き合わせて候補を作り直すための材料（開くときの STUN の結果と候補の材料）。
+/// 観戦者のUPnPの結果を受信スレッドが突き合わせて候補を作り直すための材料（開くときのSTUNの結果と候補の材料）。
 #[derive(Debug)]
 pub struct WatchUpnpPlan {
     pub mode: OwnCandidates,
     pub local: SocketAddr,
-    /// 1 か所目の STUN で見えた自分のアドレス。
+    /// 1か所目のSTUNで見えた自分のアドレス。
     pub mapped: Option<SocketAddr>,
     pub v6: Option<SocketAddr>,
-    /// 0: 頼み始めたことを観戦者の受け取りへまだ渡していない、1: 結果を待っている、2: 結果を観戦者の受け取りへ渡し終えた。受信スレッドだけが書く（観戦者の受け取りの錠の中）。
+    /// 0は未通知（頼み始めたことを観戦者の受け取りへまだ渡していない）。1は結果待ち。2は通知済み（結果を観戦者の受け取りへ渡し終えた）。受信スレッドだけが書く（観戦者の受け取りのロックの中）。
     told: AtomicU32,
 }
 
@@ -117,27 +119,28 @@ impl WatchUpnpPlan {
     }
 }
 
-/// 聞き直しを続ける上限（ms）。接続の手順を作り直して待つ長さ（`HANDSHAKE_RETRY_MS` = コードの期限と同じ 30 分）に、開いてからセッションを
-/// 作るまでの余裕 1 分を足した値。接続できないままネットワークが終わっても、受信スレッドが生きている間は送り続けないための上限。
-/// 観戦を配れる間（`keep_wanted`）は、この上限にも接続にも依らず続ける。
+/// 聞き直しを続ける上限（ms）。
+/// 接続のハンドシェイクを作り直して待つ長さ（`HANDSHAKE_RETRY_MS` = コードの期限と同じ30分）に、開いてからセッションを作るまでの余裕1分を足した値。
+/// 接続できないままネットワークが終わっても受信スレッドが生きている間は送り続けないための上限。観戦を配信できる間（`keep_wanted`）はこの上限にも接続にも依らず続ける。
 const KEEP_MAX_MS: u32 = HANDSHAKE_RETRY_MS + 60_000;
 
 #[derive(Debug, Clone, Copy)]
 struct KeepSetup {
     server: SocketAddr,
-    /// 自分のコードに載せた外側のアドレス（最初の STUN の答え）。
+    /// 自分のコードに載せた外側のアドレス（最初のSTUNの答え）。
     mapped: SocketAddr,
     interval_ms: u32,
 }
 
-/// 読み取りのスレッドから受信スレッドへの、聞き直しの受け渡し。設定は 1 回だけ設定され（`OnceLock`）、受信スレッドが周回ごとに原子変数を 1 つ見て取る。数は受信スレッドが
-/// 書き、読み取りのスレッドがログに読む。
+/// 読み取りのスレッドから受信スレッドへ聞き直しの設定を受け渡す。
+/// 設定は1回だけ書き込まれ（`OnceLock`）、受信スレッドが周回ごとにアトミック変数を1つ読み取る。
+/// 数は受信スレッドが書き、読み取りのスレッドがログに読み出す。
 #[derive(Default)]
 struct KeepSlot {
     setup: std::sync::OnceLock<KeepSetup>,
-    /// 送ってよいか。設定するときに true、接続したら（`Net::link_up`）ゲームのスレッドが false にする。
+    /// 送ってよいかどうか。設定するときにtrueにし、接続したら（`Net::link_up`）ゲームのスレッドがfalseにする。
     run: AtomicBool,
-    /// 受信スレッドが今も聞き直しているか（休んだら false。ログ用）。
+    /// 受信スレッドが今も聞き直しているかどうか（休んだらfalse。ログ用）。
     running: AtomicBool,
     sent: AtomicU32,
     answered: AtomicU32,
@@ -148,8 +151,10 @@ struct KeepSlot {
     differs: AtomicBool,
 }
 
-/// 2 か所目の STUN の受け渡し。読み取りのスレッドが作る名前引きのスレッドが 1 回だけ宛先を設定し（`OnceLock`）、受信スレッドが
-/// 周回ごとに 1 つ見て取る。結果は `DiagSlot::second` に受信スレッドが書く。
+/// 2か所目のSTUNの設定の受け渡し。
+/// 読み取りのスレッドが作る名前解決のスレッドが1回だけ宛先を設定する（`OnceLock`）。
+/// 受信スレッドは周回ごとにそれを1つ読み取る。
+/// 結果は`DiagSlot::second`に受信スレッドが書く。
 #[derive(Default)]
 struct SecondSlot {
     setup: std::sync::OnceLock<SecondSetup>,
@@ -161,36 +166,36 @@ struct SecondSetup {
     first: SocketAddr,
 }
 
-/// 診断の数（ゲームのスレッドは送りの誤りを足すだけ。ほかは読み取りのスレッドが設定する）。
+/// 診断の数（ゲームのスレッドは送信の誤りを足すだけ。ほかは読み取りのスレッドが設定する）。
 #[derive(Default)]
 struct DiagSlot {
     own_cands: [AtomicU32; KIND_SLOTS],
     send_errors: [AtomicU32; KIND_SLOTS],
-    /// 外側のポートがソケットのポートと同じか: 0 = 不明、1 = 同じ、2 = 違う。
+    /// 外側のポートがソケットのポートと同じかどうか。0は不明。1は同じ。2は違う。
     port_kept: AtomicU32,
-    /// STUN で外側のアドレスを得た時刻（ネットワークを開いてからの ms + 1。0 = 得ていない）。
+    /// STUNで外側のアドレスを得た時刻（ネットワークを開いてからの ms + 1。0 = 得ていない）。
     stun_at_ms: AtomicU32,
-    /// 2 か所目の STUN の結果（`SecondStun::code`）。
+    /// 2か所目のSTUNの結果（`SecondStun::code`）。
     second: AtomicU32,
-    /// UPnP でソケットのポートを割り当てられた（自分のコードに載せた印。ゲームのスレッドが `Net::own_nat` で読む）。
+    /// UPnPでソケットのポートを割り当てられたかどうか（自分のコードに載せるフラグ。ゲームのスレッドが`Net::own_nat`で読む）。
     upnp_mapped: AtomicBool,
 }
 
-/// 2 か所目の STUN の結果（診断。1 か所目の答えとの比べ。アドレス・ポートの値は持たない）。画面の左上の文を作るとき
-/// （接続できなかった理由の行）も、この値を読む。
+/// 2か所目のSTUNの結果（診断。1か所目の答えとの比較。アドレス・ポートの値は持たない）。
+/// 画面の左上の文（接続できなかった理由の行）を作るときもこの値を読む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecondStun {
-    /// 聞いていない（ini に `stun2` が無い・scope が internet でない・1 か所目の答えが無かったのどれか）。
+    /// 聞いていない（iniに`stun2`が無い・scopeがinternetでない・1か所目の答えが無かったのどれか）。
     #[default]
     NotAsked,
     Pending,
-    /// 宛先を決められず、聞かなかった（名前を引けない・範囲の外・1 か所目と同じアドレス）。
+    /// 宛先を決められず聞かなかった（名前を解決できない・範囲の外・1か所目と同じアドレス）。
     Skipped,
-    /// 8 回聞いても答えが来なかった。
+    /// 8回聞いても答えが来なかった。
     NoAnswer,
-    /// 答えは来たが、族が 1 か所目と違い比べられなかった。
+    /// 答えは来たがアドレスファミリが1か所目と違うため比較できなかった。
     Incomparable,
-    /// 1 か所目の答えと比べられた。
+    /// 1か所目の答えと比較できた。
     Compared(stun::Mapping),
 }
 
@@ -223,7 +228,7 @@ impl SecondStun {
         }
     }
 
-    /// 宛先ごとに外側のアドレスが変わる型か（比べられたときだけ Some）。画面の左上の文（作り直しの後の 2 行目）が読む。
+    /// 宛先ごとに外側のアドレスが変わるかどうか（比較できたときだけSome）。画面の左上の文（作り直しの後の2行目）が読む。
     pub fn depends_on_destination(self) -> Option<bool> {
         match self {
             SecondStun::Compared(m) => Some(m.depends_on_destination()),
@@ -268,29 +273,29 @@ impl SecondStun {
 /// 接続できなかった理由を読むための診断（アドレス・ポートの値は持たない。数と真偽だけ）。本ログと試験のまとめが読む。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetDiag {
-    /// 自分のコードに載せた候補の種類ごとの数（`link::kind_slot` の並び。記録していなければ全部 0）。
+    /// 自分のコードに載せた候補の種類ごとの数（`link::kind_slot`の並び。記録していなければ全部0）。
     pub own_cands: [u32; KIND_SLOTS],
-    /// 送りの誤り（候補の種類ごと）。
+    /// 送信の誤り（候補の種類ごと）。
     pub send_errors: [u32; KIND_SLOTS],
-    /// 外側のポートがソケットのポートと同じか（STUN の答えが無ければ None）。違えばルーターが付け替えている。
+    /// 外側のポートがソケットのポートと同じかどうか（STUNの答えが無ければNone）。違えばルーターが付け替えている。
     pub port_kept: Option<bool>,
-    /// STUN で外側のアドレスを得た時刻（ネットワークを開いてからの ms。得ていなければ None）。
+    /// STUNで外側のアドレスを得た時刻（ネットワークを開いてからのms。得ていなければNone）。
     pub stun_at_ms: Option<u32>,
     pub keep: KeepDiag,
-    /// 2 か所目の STUN の結果（宛先ごとに外側のポートを変える型かの見分け）。
+    /// 2か所目のSTUNの結果（宛先ごとに外側のポートが変わるかどうかの判別）。
     pub second: SecondStun,
-    /// UPnP の割り当ての結果と数（頼んでいなければ `State::NotTried`）。
+    /// UPnPの割り当ての結果と数（頼んでいなければ`State::NotTried`）。
     pub upnp: upnp::Stats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeepDiag {
-    /// 聞き直しを設定したか（STUN を使わない・範囲が internet でない・答えが無いときは false）。
+    /// 聞き直しを設定したかどうか（STUNを使わない・範囲がinternetでない・答えが無いときはfalse）。
     pub installed: bool,
-    /// 受信スレッドが今も聞き直しているか（接続した・上限に来たら false。観戦を配れる間は true）。
+    /// 受信スレッドが今も聞き直しているかどうか（接続した・上限に来たらfalse。観戦を配信できる間はtrue）。
     pub running: bool,
     pub counts: stun::KeepCounts,
-    /// 送りの誤り・乱数を引けなかったなどで送れなかった数。
+    /// 送信の誤り・乱数を生成できなかったなどで送れなかった数。
     pub send_errors: u32,
 }
 
@@ -339,7 +344,7 @@ impl NetDiag {
 
 enum KeepPhase {
     NotYet,
-    /// 設定を取った後。接続した・上限に来たら休み（`KeepRun::active` が false）、観戦を配り始めたら再び送る。
+    /// 設定を取った後。接続した・上限に来たら休む（`KeepRun::active`がfalse）。観戦を配信し始めたら再び送る。
     Running(Box<KeepRun>),
     /// 宛先がガードの外。もう送らない。
     Done,
@@ -349,7 +354,7 @@ struct KeepRun {
     server: SocketAddr,
     keep: stun::Keep,
     started: u32,
-    /// 前の周回で送ってよかったか（`KeepSlot::running` へは変わったときだけ書く）。
+    /// 前の周回で送ってよかったかどうか（`KeepSlot::running`へは変わったときだけ書く）。
     active: bool,
 }
 
@@ -368,7 +373,7 @@ fn publish_keep(shared: &Shared, k: &stun::Keep) {
     s.differs.store(c.differs_from_code, Ordering::Relaxed);
 }
 
-/// 受信スレッドの 1 周ごとの聞き直し: 設定を取り、送ってよい間かを見て、送る時刻なら 1 通送る。設定していない実行は `OnceLock::get` 1 回だけ。
+/// 受信スレッドの1周ごとの聞き直し: 設定を取り、送ってよい間かどうかを見て、送る時刻なら1通送る。設定していない実行は`OnceLock::get`を1回呼ぶだけ。
 fn keep_step(phase: &mut KeepPhase, sock: &UdpSocket, shared: &Shared) {
     if matches!(phase, KeepPhase::NotYet) {
         let Some(setup) = shared.keep.setup.get() else {
@@ -402,7 +407,7 @@ fn keep_step(phase: &mut KeepPhase, sock: &UdpSocket, shared: &Shared) {
     }
     let mut txn = [0u8; stun::TRANSACTION_ID_LEN];
     if !os_random(&mut txn) {
-        // 乱数を引けなくても聞き直しは続ける（transaction id は答えの取り違えを防ぐだけで、秘密ではない）。
+        // 乱数を取得できなくても聞き直しは続ける（transaction idは答えの取り違えを防ぐだけで秘密ではない）。
         let nanos = shared.t0.elapsed().as_nanos().to_le_bytes();
         for (d, s) in txn.iter_mut().zip(nanos) {
             *d = s;
@@ -415,10 +420,10 @@ fn keep_step(phase: &mut KeepPhase, sock: &UdpSocket, shared: &Shared) {
     publish_keep(shared, &k.keep);
 }
 
-/// 聞き直しを送ってよい間か（設定してから `elapsed_ms`）: 接続するまで（上限 `KEEP_MAX_MS`）と、観戦を配れる間
-/// （`OfferShared::keeps_mapping`。配る側のスレッドが動いているか、2 人とも観戦を許可した試合のホスト）。
-/// 配れる間は、対戦が IPv6 で接続して IPv4 のソケットが黙っていても、観戦用のコードに載せた IPv4 の割り当てを切らさない。
-/// 接続の後に続けるのは STUN の宛先 `server` が IPv4 のときだけ（IPv6 の答えは観戦用のコードの作り直しに使わない）。
+/// 聞き直しを送ってよい間かどうか（設定してから`elapsed_ms`）。
+/// 接続するまで（上限`KEEP_MAX_MS`）と観戦を配信できる間（`OfferShared::keeps_mapping`。配信側のスレッドが動いているか、2人とも観戦を許可した試合のホスト）が対象。
+/// 配信できる間は、対戦がIPv6で接続してIPv4のソケットが黙っていても観戦用のコードに載せたIPv4の割り当てを切らさない。
+/// 接続の後に続けるのはSTUNの宛先`server`がIPv4のときだけ（IPv6の答えは観戦用のコードの作り直しに使わない）。
 fn keep_wanted(shared: &Shared, elapsed_ms: u32, server: SocketAddr) -> bool {
     let waiting = shared.keep.run.load(Ordering::Acquire) && elapsed_ms < KEEP_MAX_MS;
     waiting
@@ -430,8 +435,8 @@ fn keep_wanted(shared: &Shared, elapsed_ms: u32, server: SocketAddr) -> bool {
                 .is_some_and(|s| s.offer.keeps_mapping()))
 }
 
-/// 聞き直しの答え（STUN のサーバーから来た STUN）を受けたとき。セッションへは渡さない。答えの外側のアドレスは観戦者へ配る側（`spectate_offer`）へ渡す
-/// （変わっていれば観戦用のコードを作り直す）。
+/// 聞き直しの答え（STUNのサーバーから来たSTUN）を受けたとき。セッションへは渡さない。
+/// 答えの外側のアドレスは観戦者へ配信する側（`spectate_offer`）へ渡す。変わっていれば観戦用のコードを作り直す。
 fn keep_answer(k: &mut KeepRun, shared: &Shared, bytes: &[u8]) {
     if k.keep.on_datagram(bytes).is_some()
         && let Some(s) = shared.spectate.shared.get()
@@ -444,7 +449,7 @@ fn keep_answer(k: &mut KeepRun, shared: &Shared, bytes: &[u8]) {
 enum SecondPhase {
     NotYet,
     Running(Box<SecondRun>),
-    /// 結論を書いた（または宛先がガードの外）。もう送らない。
+    /// 結論を書き込み済み（または宛先がガードの外）。もう送らない。
     Done,
 }
 
@@ -466,8 +471,8 @@ fn second_result(o: stun::SecondOutcome) -> SecondStun {
     }
 }
 
-/// 受信スレッドの 1 周ごとの 2 か所目の STUN: 宛先を取り、問い合わせを送り直し（最大 8 通。250 ms ごと）、結論が出たら書く。
-/// 設定していない実行は `OnceLock::get` 1 回だけ。
+/// 受信スレッドの1周ごとの2か所目のSTUN: 宛先を取り、問い合わせを送り直し（最大8通。250 msごと）、結論が出たら書く。
+/// 設定していない実行は`OnceLock::get`を1回呼ぶだけ。
 fn second_step(phase: &mut SecondPhase, sock: &UdpSocket, shared: &Shared) {
     if matches!(phase, SecondPhase::NotYet) {
         let Some(setup) = shared.second.setup.get() else {
@@ -475,7 +480,7 @@ fn second_step(phase: &mut SecondPhase, sock: &UdpSocket, shared: &Shared) {
         };
         let mut txn = [0u8; stun::TRANSACTION_ID_LEN];
         if !os_random(&mut txn) {
-            // 乱数を引けなくても続ける（transaction id は答えの取り違えを防ぐだけで、秘密ではない。聞き直しと同じ）。
+            // 乱数を取得できなくても続ける（transaction idは答えの取り違えを防ぐだけで秘密ではない。聞き直しと同じ）。
             let nanos = shared.t0.elapsed().as_nanos().to_le_bytes();
             for (d, s) in txn.iter_mut().zip(nanos) {
                 *d = s;
@@ -494,7 +499,7 @@ fn second_step(phase: &mut SecondPhase, sock: &UdpSocket, shared: &Shared) {
         return;
     }
     if let Some(req) = r.probe.poll_send(now_ms(shared)) {
-        // 送れなくても次の周回で送り直す（8 回の枠は `SecondProbe` が数える）。
+        // 送れなくても次の周回で送り直す（8回の枠は`SecondProbe`が数える）。
         let _ = sock.send_to(&req, r.server);
     }
     if let Some(o) = r.probe.outcome() {
@@ -502,7 +507,7 @@ fn second_step(phase: &mut SecondPhase, sock: &UdpSocket, shared: &Shared) {
     }
 }
 
-/// 2 か所目のサーバーから来た STUN を受けたとき（呼び手が送り元と STUN であることを検証してある）。セッションへは渡さない。
+/// 2か所目のサーバーから来たSTUNを受けたとき（呼び出し元が送信元とSTUNであることを検証してある）。セッションへは渡さない。
 fn second_answer(phase: &mut SecondPhase, shared: &Shared, bytes: &[u8]) {
     let SecondPhase::Running(r) = phase else {
         return;
@@ -513,29 +518,29 @@ fn second_answer(phase: &mut SecondPhase, shared: &Shared, bytes: &[u8]) {
     }
 }
 
-/// 受信スレッドの PONG の口（`higanr_core::pong`）。ゲームのスレッドは接続した tick に口を設定し（`GameNet::pong_install`。ロックは
-/// `try_lock` だけで待たない）、生存の状態が変わった tick に `on` を書く（`NetPlay::sync_pong`）。受信スレッドは `on` の間だけ PING に
-/// PONG を返し、口のコピーを自分で持つ（世代が変わったときだけロックを取ってコピーする）。
+/// 受信スレッドのPONGの応答役（`higanr_core::pong`）の受け渡し。
+/// ゲームのスレッドは接続したtickに応答役を設定する（`GameNet::pong_install`。ロックは`try_lock`だけで待たない）。生存の状態が変わったtickには`on`を書く（`NetPlay::sync_pong`）。
+/// 受信スレッドは`on`の間だけPINGにPONGを返す。応答役のコピーは自分で持ち、世代が変わったときだけロックを取ってコピーする。
 #[derive(Default)]
 struct PongSlot {
-    /// 設定した口の世代（0 = まだ無い）。口を書いた後に Release で進める。
+    /// 設定した応答役の世代（0 = まだ無い）。応答役を書いた後にReleaseで進める。
     generation: AtomicU32,
-    /// 返してよいか（生存が「生きている」の間だけ true）。
+    /// 返してよいかどうか（生存が「生きている」の間だけtrue）。
     on: AtomicBool,
-    /// ゲームスレッドの心拍（`Net::heartbeat` が tick ごとに書く `now_ms`。0 はまだ書いていない）。古ければ PONG を返さない
-    /// （`liveness::heartbeat_fresh`）。
+    /// ゲームスレッドの心拍（`Net::heartbeat`がtickごとに書く`now_ms`。0はまだ書いていない）。
+    /// 古ければPONGを返さない（`liveness::heartbeat_fresh`）。
     beat: AtomicU32,
-    /// 0 でなければ、ゲームスレッドが止まったので受信スレッドが BYE を出す（値は `bye_code` の理由）。立ったら PING には PONG の代わりに BYE を返す。
+    /// 0でなければゲームスレッドが止まったので受信スレッドがBYEを出す（値は`bye_code`の理由）。立ったらPINGにはPONGの代わりにBYEを返す。
     bye: AtomicU32,
     responder: Mutex<Option<PongResponder>>,
-    /// PONG の通し番号。IPv4・IPv6 の 2 本の受信スレッドと、設定し直したどの口も、この 1 つを進める。ネットワークと同じ寿命で 0 に戻さない
-    /// （鍵はセッションごとに替わるので、鍵ごとに 0 からでなくても重ならないことだけが要る）。
+    /// PONGの通し番号。IPv4・IPv6の2本の受信スレッドと設定し直したどの応答役も、この1つを進める。
+    /// ネットワークと同じ寿命で0に戻さない（鍵はセッションごとに替わるので、鍵ごとに0からでなくても重ならないことだけが要る）。
     seq: higanr_core::seal::Seq,
-    /// 返した数 / ガード（宛先がネットワークの範囲 `Shared::scope` の中か）で止めた数 / 送りの誤り（ログと検査用）。
+    /// 返した数 / ガード（宛先がネットワークの範囲`Shared::scope`の中かどうか）で止めた数 / 送信の誤り（ログと検査用）。
     sent: AtomicU32,
     refused: AtomicU32,
     send_errors: AtomicU32,
-    /// 心拍が古いので返さなかった PING の数と、受信スレッドが出した BYE の数（頼まれずに出した 1 通と PING への返し）。
+    /// 心拍が古いので返さなかったPINGの数と受信スレッドが出したBYEの数（頼まれずに出した1通とPINGへの返答）。
     stale: AtomicU32,
     byes_sent: AtomicU32,
 }
@@ -548,22 +553,23 @@ fn bye_of(code: u32) -> Option<ByeReason> {
     ByeReason::from_u32(code)
 }
 
-/// 観戦のホストの置き場。読み取りのスレッドが開くときに 1 回だけ設定する。観戦の便は IPv4・IPv6 のどちらの受信スレッドにも届くので、送り手は
-/// ロックの中に保持して両方が使う。**どちらの受信スレッドもロックを待たない**: 観戦の便は族ごとの列(`q4`・`q6`。書き手は受信スレッド 1 本ずつ)に積み、
-/// ロックを取れた方が(`try_lock`)両方の列を先に処理してから `tick` する。取れなかった方は積んで先へ進む(ロックを持っている側が、離す前に列を見直す)。
-/// 設定していなければ、受信スレッドは今までどおり。
+/// 観戦のホストの置き場。読み取りのスレッドが開くときに1回だけ設定する。
+/// 観戦のパケットはIPv4・IPv6のどちらの受信スレッドにも届くので、送信側はロックの中に保持して両方が使う。
+/// **どちらの受信スレッドもロックを待たない**: 観戦のパケットはアドレスファミリごとのキュー(`q4`・`q6`。書き手は受信スレッド1本ずつ)に積む。
+/// ロックを取れた方が(`try_lock`)両方のキューを先に処理してから`tick`する。取れなかった方は積んで先へ進む(ロックを持っている側が離す前にキューを見直す)。
+/// 設定していなければ受信スレッドは今までどおり。
 #[derive(Default)]
 struct SpectateSlot {
-    /// ロックを取れなかった間に届いた観戦の便。満杯なら新しい方を捨てて数える(観戦者は JOIN を 250 ms ごと・ACK を送り直す)。
+    /// ロックを取れなかった間に届いた観戦のパケット。満杯なら新しい方を捨てて数える(観戦者はJOINを250 msごとに再送し、ACKも再送する)。
     q4: RecvRing,
     q6: RecvRing,
-    /// 列に積んで、まだ処理していない便の数(積む前に足し、処理した後に引く。見直しの印)。
+    /// キューに積んでまだ処理していないパケットの数(積む前に足し、処理した後に引く。見直しのフラグ)。
     queued: AtomicU32,
-    /// 設定した（`session` と `sender` を書いた後に立てる）。この後に届いた観戦の便は観戦のホストが受ける。
+    /// 設定済み（`session`と`sender`を書いた後に立てる）。この後に届いた観戦のパケットは観戦のホストが受ける。
     installed: AtomicBool,
-    /// 観戦用の session。受信スレッドが便の session と比べるだけなので、ロックを取らない。
+    /// 観戦用のsession。受信スレッドがパケットのsessionと比べるだけなのでロックを取らない。
     session: AtomicU32,
-    /// 観戦のホストの中でパニックして、観戦のホストを捨てた（対戦の受信は続く）。
+    /// 観戦のホストの中でパニックして観戦のホストを捨てたかどうか（対戦の受信は続く）。
     stopped: AtomicBool,
     sender: Mutex<Option<SpectateSender>>,
     /// 本ログの集計（設定した後は読み取りのスレッドが読める）。
@@ -571,7 +577,7 @@ struct SpectateSlot {
 }
 
 impl SpectateSlot {
-    /// 観戦のホストが受ける便か（設定してあり、捨てていなくて、session が観戦用のもの）。
+    /// 観戦のホストが受けるパケットかどうか（設定済みで、捨てておらず、sessionが観戦用のもの）。
     fn owns(&self, bytes: &[u8]) -> bool {
         self.installed.load(Ordering::Acquire)
             && !self.stopped.load(Ordering::Acquire)
@@ -579,9 +585,10 @@ impl SpectateSlot {
     }
 }
 
-/// 観戦者の受け取りの置き場（`SpectateSlot` と同じ形）。観戦者のネットワークに届く便は全部観戦者のものなので、設定した後は受けた便を全部
-/// 族ごとの列（`q4`・`q6`）に積み、ロックを取れた受信スレッドが処理する。どちらの受信スレッドもロックを待たない。パニックしたら受け取りを
-/// 捨て（`stopped`）、以後の便は今までどおり受信のリングへ書く。
+/// 観戦者の受け取りの置き場（`SpectateSlot`と同じ形）。
+/// 観戦者のネットワークに届くパケットは全部観戦者のものなので、設定した後は受けたパケットを全部アドレスファミリごとのキュー（`q4`・`q6`）に積む。
+/// 処理するのはロックを取れた受信スレッド。どちらの受信スレッドもロックを待たない。
+/// パニックしたら受け取りを捨て（`stopped`）、以後のパケットは今までどおり受信のリングへ書く。
 #[derive(Default)]
 struct WatchRxSlot {
     q4: RecvRing,
@@ -595,7 +602,7 @@ struct WatchRxSlot {
     sent: AtomicU32,
     refused: AtomicU32,
     send_errors: AtomicU32,
-    /// 検査だけ: 観戦者が子とホストへ送る便を全部捨てる（中継役の強制終了と同じく、何も届かなくする）。
+    /// 検査だけ: 観戦者が子とホストへ送るパケットを全部捨てる（中継役の強制終了と同じく何も届かなくする）。
     #[cfg(test)]
     mute: AtomicBool,
 }
@@ -616,25 +623,25 @@ pub struct WatchRxCounts {
     /// 宛先がネットワークの範囲の外で止めた数。
     pub refused: u32,
     pub send_errors: u32,
-    /// ロック待ちの列が溢れて捨てた便。
+    /// ロック待ちのキューが溢れて捨てたパケット。
     pub queue_dropped: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecvStats {
     pub ring: RingCounts,
-    /// IPv6 のソケットのリング（IPv6 の経路を開いていなければ全部 0）。
+    /// IPv6のソケットのリング（IPv6の経路を開いていなければ全部0）。
     pub ring6: RingCounts,
     pub conn_resets: u32,
     pub recv_errors: u32,
-    /// 受信スレッドがその場で返した PONG / 宛先のガードで止めた PONG / PONG を送るときの誤り（`PongSlot`）。
+    /// 受信スレッドがその場で返したPONG / 宛先のガードで止めたPONG / PONGを送るときの誤り（`PongSlot`）。
     pub pongs_sent: u32,
     pub pongs_refused: u32,
     pub pong_send_errors: u32,
-    /// ゲームスレッドの心拍が古いので返さなかった PING / ゲームスレッドが止まった後に受信スレッドが出した BYE。
+    /// ゲームスレッドの心拍が古いので返さなかったPING / ゲームスレッドが止まった後に受信スレッドが出したBYE。
     pub pongs_stale: u32,
     pub byes_sent: u32,
-    /// 接続できなかった理由を読むための診断（STUN の聞き直し・送りの誤り・候補の数。`NetDiag`）。
+    /// 接続できなかった理由を読むための診断（STUNの聞き直し・送信の誤り・候補の数。`NetDiag`）。
     pub diag: NetDiag,
     pub watch: WatchRxCounts,
 }
@@ -650,14 +657,14 @@ pub struct GameNet {
     waiter: Waiter,
     sends: u64,
     send_errors: u64,
-    /// ネットワークの範囲の外の宛先へ送ろうとして止めた数（セッションは候補と送り元にしか送らず、候補は開くときにガードを通してあるので 0 のはず）。
+    /// ネットワークの範囲の外の宛先へ送ろうとして止めた数（セッションは候補と送信元にしか送らず、候補は開くときにガードを通してあるので0のはず）。
     send_refused: u64,
-    /// ネットワークの範囲（開くときに受けた ini の `scope`）。送る直前のガードと STUN の宛先のガードが使う。
+    /// ネットワークの範囲（開くときに受けたiniの`scope`）。送る直前のガードとSTUNの宛先のガードが使う。
     scope: Scope,
 }
 
-/// 開く。`local` に bind し（ポート 0 なら OS が選ぶ）、受信スレッドを作る。ソケットか相手の候補（`peers`）の
-/// どれかがネットワークの範囲 `scope` の外なら、bind する前に断る。
+/// 開く。`local`にbindし（ポート0ならOSが選ぶ）、受信スレッドを作る。
+/// ソケットか相手の候補（`peers`）のどれかがネットワークの範囲`scope`の外ならbindする前に断る。
 pub fn open_scoped(
     scope: Scope,
     local: SocketAddr,
@@ -673,8 +680,8 @@ pub fn open_scoped(
     open_socket(scope, local)
 }
 
-/// 相手の候補をまだ知らずに開く（接続コードの受け渡しの形。ini の `code_side`）。相手の候補は接続コードから来て、`net_code` がセッションへ
-/// 渡す前にガード（`guard::check_peer`）を通す。
+/// 相手の候補をまだ知らずに開く（接続コードの受け渡しの形。iniの`code_side`）。
+/// 相手の候補は接続コードから来る。`net_code`がセッションへ渡す前にガード（`guard::check_peer`）を通す。
 pub fn open_for_code_scoped(
     scope: Scope,
     local: SocketAddr,
@@ -683,13 +690,13 @@ pub fn open_for_code_scoped(
     open_socket(scope, local)
 }
 
-/// 検査の略記: 範囲 loopback で `open_scoped`。
+/// 検査の略記: 範囲loopbackで`open_scoped`。
 #[cfg(test)]
 pub fn open(local: SocketAddr, peers: &[SocketAddr]) -> Result<(GameNet, RecvThread), String> {
     open_scoped(Scope::Loopback, local, peers)
 }
 
-/// 検査の略記: 範囲 loopback で `open_for_code_scoped`。
+/// 検査の略記: 範囲loopbackで`open_for_code_scoped`。
 #[cfg(test)]
 pub fn open_for_code(local: SocketAddr) -> Result<(GameNet, RecvThread), String> {
     open_for_code_scoped(Scope::Loopback, local)
@@ -697,7 +704,7 @@ pub fn open_for_code(local: SocketAddr) -> Result<(GameNet, RecvThread), String>
 
 fn open_socket(scope: Scope, local: SocketAddr) -> Result<(GameNet, RecvThread), String> {
     let sock = UdpSocket::bind(local).map_err(|e| format!("bind 失敗: {e}"))?;
-    // bind した後の実際のソケットももう一度見る（ガードは 2 か所 —— peer_sim と同じ）。
+    // bindした後の実際のソケットももう一度見る（ガードは2か所 —— peer_simと同じ）。
     let bound = sock
         .local_addr()
         .map_err(|e| format!("受信ソケットが不明: {e}"))?;
@@ -714,6 +721,7 @@ fn open_socket(scope: Scope, local: SocketAddr) -> Result<(GameNet, RecvThread),
         recv_errors: AtomicU32::new(0),
         pong: PongSlot::default(),
         delay: AtomicU64::new(NO_SNAPSHOT),
+        host_uplink: AtomicU32::new(0),
         spectate: SpectateSlot::default(),
         watch: WatchRxSlot::default(),
         scope,
@@ -733,7 +741,7 @@ fn open_socket(scope: Scope, local: SocketAddr) -> Result<(GameNet, RecvThread),
         std::thread::Builder::new()
             .name("higanr-recv".into())
             .spawn(move || {
-                // パニックは受けて外へ出さない（スレッドの入口）。受けたら受信をやめる（相手の沈黙として liveness が扱う）。
+                // パニックは捕捉して外へ出さない（スレッドの入口）。捕捉したら受信をやめる（相手の沈黙としてlivenessが扱う）。
                 let _ = catch_unwind(AssertUnwindSafe(|| recv_loop(&sock, &shared)));
             })
             .map_err(|e| format!("受信スレッドの作成不能: {e}"))?
@@ -763,15 +771,15 @@ fn recv_loop(sock: &UdpSocket, shared: &Shared) {
     let mut second = SecondPhase::NotYet;
     let mut bye_done = false;
     while !shared.stop.load(Ordering::Relaxed) {
-        // 受け待ちの上限（`RECV_POLL`）は変えない（短くすると対戦の相手のパケットを落とす）。リングバッファを空にして送る周回は、対戦の
-        // 相手のパケットと観戦者の ACK が来るたびと、待ちが切れたときに回る。
+        // 受け待ちの上限（`RECV_POLL`）は変えない（短くすると対戦の相手のパケットを落とす）。
+        // リングバッファを空にして送る周回は、対戦の相手のパケットと観戦者のACKが来るたびと待ちが切れたときに回る。
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let t_us = shared.t0.elapsed().as_micros() as u64;
                 let bytes = buf.get(..n).unwrap_or(&[]);
                 let ours = shared.spectate.owns(bytes);
                 let keep_answer_for = match &mut keep {
-                    // 休んでいる間の STUN は今までどおりセッションへ渡す。
+                    // 休んでいる間のSTUNは今までどおりセッションへ渡す。
                     KeepPhase::Running(k)
                         if k.active
                             && from == k.server
@@ -816,14 +824,16 @@ fn recv_loop(sock: &UdpSocket, shared: &Shared) {
         spectate_service(shared, spectate_socks(sock, shared));
         watch_service(shared, spectate_socks(sock, shared));
     }
-    // 止める直前にゲームのスレッドが積んだ観戦者の BYE を出す（ネットワークを閉じる前の最後の周回）。
+    // 止める直前にゲームのスレッドが積んだ観戦者のBYEを出す（ネットワークを閉じる前の最後の周回）。
     watch_service(shared, spectate_socks(sock, shared));
     watch_close(shared, spectate_socks(sock, shared));
 }
 
-/// IPv6 の受信スレッド。IPv4 の `recv_loop` の、対戦の相手の受けと観戦の便だけを残した形: 受けた 1 通を IPv6 のリング（`ring6`）へ積み、PING
-/// ならその場で PONG を返す（返すソケットは `answer_ping` が経路の族で選ぶので、IPv4 のソケット `sock4` も渡す）。観戦者の IPv6 の便
-/// （JOIN・ACK・BYE）は IPv4 と同じ観戦のホストが受け、返事は IPv6 のソケット `sock6` から出す。STUN の聞き直しは IPv4 のソケットの仕事。
+/// IPv6の受信スレッド。IPv4の`recv_loop`から対戦の相手の受信と観戦のパケットの処理だけを残した形。
+/// 受けた1通をIPv6のリング（`ring6`）へ積み、PINGならその場でPONGを返す。
+/// 返すソケットは`answer_ping`が経路のアドレスファミリで選ぶので、IPv4のソケット`sock4`も渡す。
+/// 観戦者のIPv6のパケット（JOIN・ACK・BYE）はIPv4と同じ観戦のホストが受け、返事はIPv6のソケット`sock6`から出す。
+/// STUNの聞き直しはIPv4のソケットの仕事。
 fn recv_loop_v6(sock6: &UdpSocket, sock4: &UdpSocket, shared: &Shared) {
     let mut buf = [0u8; RECV_BUF];
     let mut cache: (u32, Option<PongResponder>) = (0, None);
@@ -860,12 +870,12 @@ fn recv_loop_v6(sock6: &UdpSocket, sock4: &UdpSocket, shared: &Shared) {
     }
 }
 
-/// 自分のアドレスを本ログの文に入れるときの形(種類 + ポート。`log_scrub` の決まり)。ログの出口でも伏せるが、文を作る所で IP アドレスを持ち出さない。
+/// 自分のアドレスを本ログの文に含めるときの形(種類 + ポート。`log_scrub`の決まり)。ログの出口でも伏せるが、文を作る所でIPアドレスを持ち出さない。
 fn kind_port(a: SocketAddr) -> String {
     higanr_core::log_scrub::hide_addrs(&a.to_string())
 }
 
-/// 観戦の返事を出す 2 本のソケット（IPv4 の受信スレッドの側から見たもの。IPv6 のソケットを開いていなければ `v6` は None）。
+/// 観戦の返事を出す2本のソケット（IPv4の受信スレッドの側から見たもの。IPv6のソケットを開いていなければ`v6`はNone）。
 fn spectate_socks<'a>(sock: &'a UdpSocket, shared: &'a Shared) -> Socks<'a> {
     Socks {
         primary: sock,
@@ -873,7 +883,7 @@ fn spectate_socks<'a>(sock: &'a UdpSocket, shared: &'a Shared) -> Socks<'a> {
     }
 }
 
-/// 観戦者の便 1 通を、ロックを待たずに族ごとの列へ積む(書き手は受信スレッド 1 本ずつ)。処理は `spectate_service`。満杯なら捨てて数える。
+/// 観戦者のパケット1通をロックを待たずにアドレスファミリごとのキューへ積む(書き手は受信スレッド1本ずつ)。処理は`spectate_service`。満杯なら捨てて数える。
 fn spectate_enqueue(shared: &Shared, v6: bool, from: SocketAddr, bytes: &[u8], t_us: u64) {
     let slot = &shared.spectate;
     let q = if v6 { &slot.q6 } else { &slot.q4 };
@@ -884,8 +894,8 @@ fn spectate_enqueue(shared: &Shared, v6: bool, from: SocketAddr, bytes: &[u8], t
     }
 }
 
-/// 受信スレッドの周回ごと: ロックを取れたら、列の便を処理してからリングバッファを空にして観戦者へ送る。取れなければ(もう片方の受信スレッドが使っている)
-/// 何もせず先へ進む。ロックを離した後に列が空でなければ、もう一度取る(離す直前に積まれた便を、次の周回まで残さない。数回で打ち切る)。
+/// 受信スレッドの周回ごと: ロックを取れたら、キューのパケットを処理してからリングバッファを空にして観戦者へ送る。
+/// 取れなければ(もう片方の受信スレッドが使っている)何もせず先へ進む。ロックを離した後にキューが空でなければもう一度取る(離す直前に積まれたパケットを次の周回まで残さない。数回で打ち切る)。
 fn spectate_service(shared: &Shared, socks: Socks<'_>) {
     let slot = &shared.spectate;
     if !slot.installed.load(Ordering::Acquire) {
@@ -908,8 +918,10 @@ fn spectate_service(shared: &Shared, socks: Socks<'_>) {
             }
             let now = (shared.t0.elapsed().as_micros() / 1_000) as u32;
             let delay = DelaySnapshot::unpack(shared.delay.load(Ordering::Acquire));
+            let uplink = shared.host_uplink.load(Ordering::Relaxed);
             run_spectate(&mut g, shared, |sp| {
                 sp.note_delay(delay);
+                sp.note_host_uplink(uplink);
                 sp.tick(socks, now);
             });
         }
@@ -919,11 +931,11 @@ fn spectate_service(shared: &Shared, socks: Socks<'_>) {
     }
 }
 
-/// `spectate_service` が、離した後に列が空でなかったときに取り直す回数の上限(便が続けて届く間も、受信スレッドをここに留めない)。
+/// `spectate_service`が、離した後にキューが空でなかったときに取り直す回数の上限(パケットが続けて届く間も受信スレッドをここに留めない)。
 const SERVICE_ROUNDS: usize = 3;
 
-/// 観戦のホストの呼び出し 1 回を包む（設定していなければ何もしない）。パニックしたら観戦のホストを捨てる: 受信スレッド全体が止まると
-/// 対戦の相手のパケットも受けられなくなるので、観戦だけを止めて対戦の受信を続ける。捨てたら `stopped` を立てる。
+/// 観戦のホストの呼び出し1回を包む（設定していなければ何もしない）。
+/// パニックしたら観戦のホストを捨てる。受信スレッド全体が止まると対戦の相手のパケットも受けられなくなるので、観戦だけを止めて対戦の受信を続ける。捨てたら`stopped`を立てる。
 fn run_spectate(
     spectate: &mut Option<SpectateSender>,
     shared: &Shared,
@@ -938,7 +950,7 @@ fn run_spectate(
     }
 }
 
-/// 観戦者の便 1 通を、ロックを待たずに族ごとの列へ積む（`spectate_enqueue` と同じ）。満杯なら捨てて数える（ホストが送り直す）。
+/// 観戦者のパケット1通をロックを待たずにアドレスファミリごとのキューへ積む（`spectate_enqueue`と同じ）。満杯なら捨てて数える（ホストが再送する）。
 fn watch_enqueue(shared: &Shared, v6: bool, from: SocketAddr, bytes: &[u8], t_us: u64) {
     let slot = &shared.watch;
     let q = if v6 { &slot.q6 } else { &slot.q4 };
@@ -948,8 +960,8 @@ fn watch_enqueue(shared: &Shared, v6: bool, from: SocketAddr, bytes: &[u8], t_us
     }
 }
 
-/// 受信スレッドの周回ごと: ロックを取れたら、列の便を観戦者の受け取りへ渡し、周回の仕事（JOIN の送り直し・ACK・BYE）をする。記録を
-/// リングへ移したら、ゲームのスレッドの待ちを起こす。取れなければ（もう片方の受信スレッドが使っている）何もせず先へ進む。
+/// 受信スレッドの周回ごと: ロックを取れたら、キューのパケットを観戦者の受け取りへ渡し、周回の処理（JOINの再送・ACK・BYE）をする。
+/// 記録をリングへ移したら、ゲームのスレッドの待ちを起こす。取れなければ（もう片方の受信スレッドが使っている）何もせず先へ進む。
 fn watch_service(shared: &Shared, socks: Socks<'_>) {
     let slot = &shared.watch;
     if !slot.owns() {
@@ -975,7 +987,7 @@ fn watch_service(shared: &Shared, socks: Socks<'_>) {
                 }
             }
             let now_us = shared.t0.elapsed().as_micros() as u64;
-            // 受け取りがあるときだけ覗く（出た結果は 1 回しか渡さない）。UPnP の印は型の印より先に立てる。
+            // 受け取りがあるときだけ確認する（出た結果は1回しか渡さない）。UPnPのフラグはネットワーク種別のフラグより先に立てる。
             let news = g.as_ref().and_then(|_| watch_upnp_news(shared));
             let nat = nat_of(shared);
             run_watch(&mut g, shared, &mut out, |r, out| {
@@ -998,8 +1010,8 @@ fn watch_service(shared: &Shared, socks: Socks<'_>) {
     }
 }
 
-/// 観戦者の UPnP の結果を待たずに覗き、出ていれば突き合わせて 1 回だけ観戦者の受け取りへ渡す（`nat_settle` と同じ判定。合わなければ割り当てを消す）。
-/// 頼んでいなければ何もしない。確保は結果の出た 1 回の候補の作り直しだけ。
+/// 観戦者のUPnPの結果を待たずに確認し、出ていれば突き合わせて1回だけ観戦者の受け取りへ渡す（`nat_settle`と同じ判定。合わなければ割り当てを消す）。
+/// 頼んでいなければ何もしない。確保は結果の出た1回の候補の作り直しだけ。
 fn watch_upnp_news(shared: &Shared) -> Option<UpnpNews> {
     let plan = shared.watch_upnp.get()?;
     let h = shared.upnp.get()?;
@@ -1047,7 +1059,7 @@ fn watch_upnp_news(shared: &Shared) -> Option<UpnpNews> {
     Some(news)
 }
 
-/// 合った割り当てを、中継の配る側の無い受け取りが接続したので取り下げる（自分の回線の型からも UPnP の印を外す）。
+/// 中継の配信側の無い受け取りが接続したので、合った割り当てを取り下げる（自分のネットワーク種別のフラグからもUPnPのフラグを外す）。
 fn drop_watch_upnp(shared: &Shared) {
     if let Some(h) = shared.upnp.get() {
         h.discard(upnp::State::NoRelay);
@@ -1055,7 +1067,7 @@ fn drop_watch_upnp(shared: &Shared) {
     shared.diag.upnp_mapped.store(false, Ordering::Relaxed);
 }
 
-/// 受信スレッドが止まる直前（最後の周回の後）: 観戦者の受け取りが残っていれば、中継の子を元のホストへ戻す（`WatchRecv::abandon`）。
+/// 受信スレッドが止まる直前（最後の周回の後）: 観戦者の受け取りが残っていれば中継の子を元のホストへ戻す（`WatchRecv::abandon`）。
 fn watch_close(shared: &Shared, socks: Socks<'_>) {
     let slot = &shared.watch;
     if !slot.owns() {
@@ -1066,8 +1078,8 @@ fn watch_close(shared: &Shared, socks: Socks<'_>) {
     run_watch(&mut g, shared, &mut out, |r, out| r.abandon(out));
 }
 
-/// 観戦者の受け取りの呼び出し 1 回を包む。パニックしたら受け取りを捨てて `stopped` を立て、ゲームのスレッドへ知らせる（`run_spectate` と
-/// 同じく、受信スレッドは止めない）。捨てる前に、中継の子を元のホストへ戻す（そこでもパニックしたら戻さずに捨てる）。
+/// 観戦者の受け取りの呼び出し1回を包む。パニックしたら受け取りを捨てて`stopped`を立て、ゲームのスレッドへ知らせる（`run_spectate`と同じく受信スレッドは止めない）。
+/// 捨てる前に中継の子を元のホストへ戻す（そこでもパニックしたら戻さずに捨てる）。
 fn run_watch<'a>(
     recv: &mut Option<WatchRecv>,
     shared: &Shared,
@@ -1089,7 +1101,7 @@ fn run_watch<'a>(
     }
 }
 
-/// 受信スレッドから観戦者の便を送る口。送る直前のガードは `GameNet::may_send` と同じ関数・同じ範囲。
+/// 受信スレッドから観戦者のパケットを送る出口。送る直前のガードは`GameNet::may_send`と同じ関数・同じ範囲。
 struct WatchOut<'a> {
     socks: Socks<'a>,
     shared: &'a Shared,
@@ -1121,8 +1133,8 @@ impl Outlet for WatchOut<'_> {
     }
 }
 
-/// 受信スレッド: `bytes` がこの接続の本物の PING で、返してよい間なら、その場で PONG を返す（返したら true）。PING でない 1 通は
-/// type の 1 バイトを見て素通りする（INPUT の受けにタグの計算を足さない）。送れなかったら false（セッションが返す）。
+/// 受信スレッド: `bytes`がこの接続の本物のPINGで返してよい間なら、その場でPONGを返す（返したらtrue）。
+/// PINGでない1通はtypeの1バイトを見て素通りする（INPUTの受信にタグの計算を足さない）。送れなかったらfalse（セッションが返す）。
 fn answer_ping(
     sock: &UdpSocket,
     shared: &Shared,
@@ -1139,7 +1151,7 @@ fn answer_ping(
         if !slot.on.load(Ordering::Acquire) {
             return false;
         }
-        // 心拍を先に読み、時刻は後で取る（同じ時計なので、書き手が先に進んでいても差は小さい）。
+        // 心拍を先に読んで時刻は後で取る（同じ時計なので書き手が先に進んでいても差は小さい）。
         let beat = slot.beat.load(Ordering::Acquire);
         if !liveness::heartbeat_fresh(beat, now_ms(shared)) {
             slot.stale.fetch_add(1, Ordering::Relaxed);
@@ -1169,7 +1181,7 @@ fn answer_ping(
     true
 }
 
-/// 設定された口のコピー（世代が変わったときだけロックを取ってコピーする。ゲームのスレッドは try_lock しかしないので、ここで待つのは受信スレッドだけ）。
+/// 設定された応答役のコピー（世代が変わったときだけロックを取ってコピーする。ゲームのスレッドはtry_lockしかしないので、ここで待つのは受信スレッドだけ）。
 fn cached_responder<'a>(
     slot: &PongSlot,
     cache: &'a mut (u32, Option<PongResponder>),
@@ -1183,8 +1195,8 @@ fn cached_responder<'a>(
     cache.1.as_ref()
 }
 
-/// 受信スレッドが経路へ 1 通送る。送る直前のガードは `Outlet::send`（`GameNet::may_send`）と同じ関数・同じ範囲。返す先（接続した経路）の族の
-/// ソケットから送る（PING が来たソケットと同じとは限らない。IPv6 のソケットを開いていなければ `sock` のまま）。
+/// 受信スレッドが経路へ1通送る。送る直前のガードは`Outlet::send`（`GameNet::may_send`）と同じ関数・同じ範囲。
+/// 返す先（接続した経路）のアドレスファミリのソケットから送る（PINGが来たソケットと同じとは限らない。IPv6のソケットを開いていなければ`sock`のまま）。
 fn send_to_path(sock: &UdpSocket, shared: &Shared, to: SocketAddr, bytes: &[u8]) -> bool {
     let slot = &shared.pong;
     if !guard::allows(shared.scope, to) {
@@ -1202,8 +1214,8 @@ fn send_to_path(sock: &UdpSocket, shared: &Shared, to: SocketAddr, bytes: &[u8])
     true
 }
 
-/// ゲームスレッドが止まった（`RecvThread::say_bye`）後の最初の 1 回だけ、頼まれずに BYE を出す。口が無い（接続する前）なら何も出さない。
-/// 以後は相手の PING への返しが BYE になる（`answer_ping`）ので、この 1 通が落ちても次の PING で届く。
+/// ゲームスレッドが止まった（`RecvThread::say_bye`）後の最初の1回だけ頼まれずにBYEを出す。応答役が無い（接続する前）なら何も出さない。
+/// 以後は相手のPINGへの返答がBYEになる（`answer_ping`）ので、この1通が落ちても次のPINGで届く。
 fn bye_once(
     sock: &UdpSocket,
     shared: &Shared,
@@ -1301,7 +1313,7 @@ impl RecvThread {
         }
     }
 
-    /// ゲームスレッドが止まった（パニックを受けた）ので、受信スレッドに BYE を出させる。PONG はもう返さない。原子変数を書くだけで待たない。
+    /// ゲームスレッドが止まった（パニックを受けた）ので受信スレッドにBYEを出させる。PONGはもう返さない。アトミック変数を書くだけで待たない。
     /// 最初の理由だけが効く。
     pub fn say_bye(&self, reason: ByeReason) {
         let p = &self.shared.pong;
@@ -1309,13 +1321,13 @@ impl RecvThread {
         let _ = p
             .bye
             .compare_exchange(0, bye_code(reason), Ordering::AcqRel, Ordering::Acquire);
-        // 観戦者のネットワークなら、観戦も終える（受け取りが BYE を出し、以後は ACK を返さない）。
+        // 観戦者のネットワークなら観戦も終える（受け取りがBYEを出し、以後はACKを返さない）。
         if let Some(feed) = self.shared.watch.feed.get() {
             feed.end(Some(reason));
         }
     }
 
-    /// 観戦のホストを設定する（読み取りのスレッド。開くときに 1 回だけ）。2 回目は設定せずに false。
+    /// 観戦のホストを設定する（読み取りのスレッド。開くときに1回だけ）。2回目は設定せずにfalse。
     pub fn install_spectate(&self, sender: SpectateSender) -> bool {
         let slot = &self.shared.spectate;
         if slot.shared.set(Arc::clone(sender.shared())).is_err() {
@@ -1327,14 +1339,14 @@ impl RecvThread {
         true
     }
 
-    /// 観戦のホストを設定したか。設定した後に届く観戦者の便は観戦のホストが受ける（それより前の JOIN は対戦のセッションへ回って捨てられる ——
-    /// 観戦者は JOIN を送り直す）。
+    /// 観戦のホストを設定したかどうか。設定した後に届く観戦者のパケットは観戦のホストが受ける。
+    /// それより前のJOINは対戦のセッションへ回って捨てられる。観戦者はJOINを再送する。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn spectate_active(&self) -> bool {
         self.shared.spectate.installed.load(Ordering::Acquire)
     }
 
-    /// 検査だけ: 観戦のホストのロックを持つ(観戦のホストが忙しい間も、受信スレッドがロックを待たないことを見る)。
+    /// 検査だけ: 観戦のホストのロックを持つ(観戦のホストが忙しい間も受信スレッドがロックを待たないことを見る)。
     #[cfg(test)]
     pub fn hold_spectate_sender(&self) -> std::sync::MutexGuard<'_, Option<SpectateSender>> {
         self.shared
@@ -1354,7 +1366,7 @@ impl RecvThread {
         slot.shared.get().map(|s| {
             let mut snap = s.get();
             snap.stopped = slot.stopped.load(Ordering::Acquire);
-            // ロック待ちの列が溢れて捨てた便(列は受信スレッドの置き場にあり、観戦のホストの集計には入っていない)。
+            // ロック待ちのキューが溢れて捨てたパケット(キューは受信スレッドの置き場にあり、観戦のホストの集計には入っていない)。
             snap.via.queue_dropped =
                 [&slot.q4, &slot.q6]
                     .iter()
@@ -1367,14 +1379,14 @@ impl RecvThread {
         })
     }
 
-    /// 止めて待つ（最大で `RECV_POLL` ほど）。止めた後、ゲームのスレッドのインターフェース（`GameNet`）も落ちていればソケットが閉じる。本物の経路では
-    /// ゲーム内のメニューの再接続の片づけ（`net_code_game::close_parts`）だけが止める。ほかの実行は `script_win::RECV` が
-    /// プロセスの終わりまで持つ。
+    /// 止めて待つ（最大で`RECV_POLL`ほど）。止めた後にゲームのスレッドのインターフェース（`GameNet`）も落ちていればソケットが閉じる。
+    /// 本物の経路で止めるのは、ゲーム内のメニューの再接続の後始末（`net_code_game::close_parts`）だけ。
+    /// ほかの実行では`script_win::RECV`がプロセスの終わりまで持つ。
     pub fn stop(self) -> RecvStats {
         self.stop_with_spectate().0
     }
 
-    /// `stop` に加えて、止めた後の観戦のホストの集計を返す。止めた後は受信スレッドの持ち手が無くなり、本ログの終わりの全文が観戦者のツリー・上り回線速度の測定の行を読めなくなる。
+    /// `stop`に加えて止めた後の観戦のホストの集計を返す。止めた後は受信スレッドの持ち手が無くなるので、本ログの終わりの全文が観戦者のツリー・上り回線速度の測定の行を読めなくなる。
     pub fn stop_with_spectate(mut self) -> (RecvStats, Option<spectate_host::Snapshot>) {
         self.halt();
         (self.stats(), self.spectate_snapshot())
@@ -1394,7 +1406,7 @@ impl RecvThread {
         if let Some(j) = j6 {
             let _ = j.join();
         }
-        // 観戦のホスト(リングバッファ 262,144 記録 ≒ 9.4 MB)は、両方の受信スレッドが終わったここで捨てる。`GameNet` が残っていても持ち続けない。
+        // 観戦のホスト(リングバッファ262,144記録 ≒ 9.4 MB)は両方の受信スレッドが終わったここで捨てる。`GameNet`が残っていても持ち続けない。
         self.shared
             .spectate
             .sender
@@ -1408,12 +1420,12 @@ impl RecvThread {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        // 観戦の配る側のスレッド（`spectate_offer`）も止めて待つ。接続の片づけは見張りを先に止めて待つので、ここより後に
-        // 開始されることは無い。
+        // 観戦の配信側のスレッド（`spectate_offer`）も止めて待つ。
+        // 接続の後始末は監視の処理を先に止めて待つので、ここより後に開始されることは無い。
         if let Some(s) = self.shared.spectate.shared.get() {
             s.stop_offer();
         }
-        // UPnP の割り当てを消す（機器が答えなくても数秒で戻る）。
+        // UPnPの割り当てを消す（機器が答えなくても数秒で戻る）。
         if let Some(h) = self.shared.upnp.get() {
             h.stop();
         }
@@ -1431,7 +1443,7 @@ impl GameNet {
         self.sock.local_addr().ok()
     }
 
-    /// VPN の範囲（`Scope::LanVpn`）で開いたか。外側の候補の欄を「VPN」と書くかの判断に使う。
+    /// VPNの範囲（`Scope::LanVpn`）で開いたかどうか。外側の候補のフィールドを「VPN」と書くかの判断に使う。
     pub fn is_vpn(&self) -> bool {
         matches!(self.scope, Scope::LanVpn(_))
     }
@@ -1450,7 +1462,7 @@ impl GameNet {
         (self.sends, self.send_errors)
     }
 
-    /// 送る直前のガード（`Outlet::send` が使う）。理由の文を作らない `guard::allows`（確保しない）。検査はこれを直に見る。
+    /// 送る直前のガード（`Outlet::send`が使う）。理由の文を作らない`guard::allows`（確保しない）。検査はこれを直接見る。
     fn may_send(&self, to: SocketAddr) -> bool {
         guard::allows(self.scope, to)
     }
@@ -1463,7 +1475,7 @@ impl Outlet for GameNet {
             return;
         }
         self.sends = self.sends.saturating_add(1);
-        // 宛先の族のソケットから出す。IPv6 のソケットを開いていれば IPv6 の宛先はそちら、それ以外はソケットのまま。
+        // 宛先のアドレスファミリのソケットから送る。IPv6のソケットを開いていればIPv6の宛先はそちらから送り、それ以外はソケットのまま。
         let sock: &UdpSocket = match (to.is_ipv6(), self.shared.sock6.get()) {
             (true, Some(s6)) => s6,
             _ => &self.sock,
@@ -1477,13 +1489,14 @@ impl Outlet for GameNet {
     }
 }
 
-/// STUN の問い合わせの間、待ちを刻む長さ（µs）。答えが届けば受信のイベントで早く起きる。
+/// STUNの問い合わせの間の待ちの間隔（µs）。答えが届けば受信のイベントで早く起きる。
 const STUN_POLL_US: u32 = 5_000;
 
 impl GameNet {
-    /// STUN の Binding を `server` へ送り、見えた自分のアドレスを返す（`higanr_core::stun::Query`。250 ms ごとに 8 回、計 2 秒で
-    /// 打ち切る）。**読み取りのスレッドで、ネットワークを動かす前（`start_net` の前）にだけ呼ぶ**（待つ・確保する）。その間に届いた STUN 以外の
-    /// もの（相手の早い HELLO）は捨てる（相手は 20 ms ごとに送り直す）。transaction id は OS の乱数で引く。宛先はネットワークの範囲の中だけ。
+    /// STUNのBindingを`server`へ送り、見えた自分のアドレスを返す（`higanr_core::stun::Query`。250 msごとに8回、計2秒で打ち切る）。
+    /// **読み取りのスレッドでネットワークを動かす前（`start_net`の前）にだけ呼ぶ**（待つ・確保する）。
+    /// その間に届いたSTUN以外のもの（相手の早いHELLO）は捨てる（相手は20 msごとに再送する）。
+    /// transaction idはOSの乱数で生成する。宛先はネットワークの範囲の中だけ。
     pub fn stun_query(&mut self, server: SocketAddr) -> Result<SocketAddr, String> {
         guard::check_peer(server, self.scope)?;
         let mut txn = [0u8; stun::TRANSACTION_ID_LEN];
@@ -1525,10 +1538,10 @@ impl GameNet {
         self.send_refused
     }
 
-    /// 外側のアドレスの保ちを設定する（読み取りのスレッド。開くときに 1 回だけ）: 受信スレッドが `interval` ごとに `server`（最初の STUN と
-    /// 同じサーバー）へ Binding を送り、答えの外側のアドレスを `mapped`（自分のコードに載せたアドレス）と比べて数える。接続したら止める
-    /// （観戦を配っている間は続ける）。
-    /// 2 回目は設定せずに false。
+    /// 外側のアドレスの維持を設定する（読み取りのスレッド。開くときに1回だけ）。
+    /// 受信スレッドが`interval`ごとに`server`（最初のSTUNと同じサーバー）へBindingを送り、答えの外側のアドレスを`mapped`（自分のコードに載せたアドレス）と比べて数える。
+    /// 接続したら止める（観戦を配信している間は続ける）。
+    /// 2回目は設定せずにfalse。
     pub fn keep_stun_mapping(
         &self,
         server: SocketAddr,
@@ -1547,7 +1560,7 @@ impl GameNet {
             .is_ok()
     }
 
-    /// 最初の STUN の答え（外側のアドレス `mapped`）を診断に残す: 得た時刻と、外側のポートがソケットのポートと同じか。値そのものは残さない。
+    /// 最初のSTUNの答え（外側のアドレス`mapped`）を診断に残す: 得た時刻と外側のポートがソケットのポートと同じかどうか。値そのものは残さない。
     pub fn note_stun_answer(&self, mapped: SocketAddr) {
         let d = &self.shared.diag;
         d.stun_at_ms
@@ -1567,13 +1580,13 @@ impl GameNet {
         );
     }
 
-    /// 2 か所目の STUN へ並行に聞き始める（読み取りのスレッド。最初の STUN の答えを得た直後に 1 回だけ）。名前を引くのは別のスレッド
-    /// （引き終えるまで接続コードの作成を待たせない。OS の名前引きは中断できないので、引き終えなくても放っておく）で、引けたら宛先を
-    /// 設定し、問い合わせ（最大 8 通）は受信スレッドが同じソケットから送る（同じソケットから出さないと、宛先ごとに外側のポートが変わるかを
-    /// 見分けられない）。結論は診断（`NetDiag::second`）に出る。答えが来なくても、何も止めない・接続コードの候補にも入れない。
+    /// 2か所目のSTUNへ並行に聞き始める（読み取りのスレッド。最初のSTUNの答えを得た直後に1回だけ）。
+    /// 名前解決は別のスレッドで行う（解決を終えるまで接続コードの作成を待たせない。OSの名前解決は中断できないので、解決を終えなくても放っておく）。
+    /// 解決できたらそのスレッドが宛先を設定する。問い合わせ（最大8通）は受信スレッドが同じソケットから送る。
+    /// 同じソケットから送らないと宛先ごとに外側のポートが変わるかどうかを判別できない。
+    /// 結論は診断（`NetDiag::second`）に出る。答えが来なくても何も止めず、接続コードの候補にも加えない。
     ///
-    /// 戻りは、聞き始めたか（スレッドを作れなければ false）。`first_server` と宛先が同じアドレスなら聞かない（同じ宛先へ 2 回聞くと
-    /// 比べる意味が無い）。
+    /// 戻り値は聞き始めたかどうか（スレッドを作れなければfalse）。`first_server`と宛先が同じアドレスなら聞かない（同じ宛先へ2回聞いても比べる意味が無い）。
     pub fn ask_second_stun(
         &self,
         target: StunTarget,
@@ -1591,7 +1604,7 @@ impl GameNet {
         let job = {
             let shared = Arc::clone(&shared);
             move || {
-                // 名前引きの中のパニックは受けて、聞かなかったことにする（スレッドの入口）。
+                // 名前解決の中のパニックは捕捉して聞かなかったことにする（スレッドの入口）。
                 let found = catch_unwind(AssertUnwindSafe(|| {
                     resolve_stun(&target, scope, want_v4, lookup)
                 }));
@@ -1621,41 +1634,41 @@ impl GameNet {
         spawned.is_ok()
     }
 
-    /// 2 か所目の STUN の今の結果。
+    /// 2か所目のSTUNの今の結果。
     pub fn second_stun(&self) -> SecondStun {
         SecondStun::from_code(self.shared.diag.second.load(Ordering::Relaxed))
     }
 
-    /// 検査だけ: 2 か所目の STUN の結果を置く（loopback では聞かないので、回線の型を作るため）。
+    /// 検査だけ: 2か所目のSTUNの結果を置く（loopbackでは聞かないので、ネットワーク種別のフラグを作るため）。
     #[cfg(test)]
     pub(crate) fn set_second_stun_for_test(&self, s: SecondStun) {
         self.shared.diag.second.store(s.code(), Ordering::Relaxed);
     }
 
-    /// UPnP の割り当ての持ち手を設定する（読み取りのスレッド。開くときに 1 回だけ）。2 回目は設定せずに false（受け取った持ち手は落ちて、
-    /// 割り当てを消す）。
+    /// UPnPの割り当ての持ち手を設定する（読み取りのスレッド。開くときに1回だけ）。2回目は設定せずにfalse。
+    /// 受け取った持ち手は破棄され、割り当てを消す。
     pub fn upnp_attach(&self, h: upnp::Handle) -> bool {
         self.shared.upnp.set(h).is_ok()
     }
 
-    /// 中継の配る側を持つ観戦者の UPnP の材料を置く（開くスレッド。`upnp_begin` で頼み始めた後に 1 回だけ）。結果は待たず、受信
-    /// スレッドが周回で覗く（`watch_upnp_news`）。2 回目は置かずに false。
+    /// 中継の配信側を持つ観戦者のUPnPの材料を置く（開くスレッド。`upnp_begin`で頼み始めた後に1回だけ）。結果は待たない。
+    /// 受信スレッドが周回ごとに確認する（`watch_upnp_news`）。2回目は置かずにfalse。
     pub fn plan_watch_upnp(&self, plan: WatchUpnpPlan) -> bool {
         self.shared.watch_upnp.set(plan).is_ok()
     }
 
-    /// 検査だけ: 観戦者の受け取りが送る便を全部捨てる（中継役が落ちたのと同じく、子にもホストにも何も届かない）。
+    /// 検査だけ: 観戦者の受け取りが送るパケットを全部捨てる（中継役が停止したのと同じく子にもホストにも何も届かない）。
     #[cfg(test)]
     pub fn mute_watch_for_test(&self, on: bool) {
         self.shared.watch.mute.store(on, Ordering::Relaxed);
     }
 
-    /// UPnP の結果を、頼み始めてから `total` まで待つ。頼んでいなければ `None`。
+    /// UPnPの結果を、頼み始めてから`total`まで待つ。頼んでいなければ`None`。
     pub fn upnp_outcome(&self, total: Duration) -> Option<upnp::Outcome> {
         self.shared.upnp.get().map(|h| h.wait_until(total))
     }
 
-    /// 割り当てられたが使わないと決めた UPnP の割り当てを、消すよう知らせる（待たない）。
+    /// 割り当てられたが使わないUPnPの割り当てを消すよう通知する（待たない）。
     pub fn upnp_discard(&self, why: upnp::State) {
         if let Some(h) = self.shared.upnp.get() {
             h.discard(why);
@@ -1674,12 +1687,12 @@ impl GameNet {
         }
     }
 
-    /// IPv6 のソケットを別に 1 本開き、受信スレッドとリングを 1 組足す（読み取りのスレッドで、ネットワークを動かす前に 1 回だけ）。IPv4 の経路は
-    /// 何も変わらない。`bind` は IPv6 のアドレス（全部のインターフェース `::` は断る。ガードは IPv4 と同じ `guard::check_bind`）。戻りは bind した後の
-    /// 実際のアドレス。2 回目は開かずに Err。
+    /// IPv6のソケットを別に1本開き、受信スレッドとリングを1つずつ追加する（読み取りのスレッドで、ネットワークを動かす前に1回だけ）。
+    /// IPv4の経路は何も変わらない。
+    /// `bind`はIPv6のアドレス（全部のインターフェース`::`は断る。ガードはIPv4と同じ`guard::check_bind`）。戻り値はbindした後の実際のアドレス。2回目は開かずにErr。
     ///
-    /// IPv6 のソケットは IPv4 と別のソケット（IPV6_V6ONLY が既定で真の Windows では 1 本で両方は受けられない）。送る側は宛先の族で
-    /// ソケットを選び（`Outlet::send`）、受ける側はゲームのスレッドが 2 つのリングを順に見る（`Net::recv`）。
+    /// IPv6のソケットはIPv4と別のソケット（IPV6_V6ONLYが既定で真のWindowsでは1本で両方は受けられない）。
+    /// 送る側は宛先のアドレスファミリでソケットを選び（`Outlet::send`）、受ける側はゲームのスレッドが2つのリングを順に見る（`Net::recv`）。
     pub fn open_ipv6(&self, bind: SocketAddr) -> Result<SocketAddr, String> {
         if !bind.is_ipv6() {
             return Err(format!(
@@ -1690,7 +1703,7 @@ impl GameNet {
         if self.shared.sock6.get().is_some() {
             return Err("IPv6 の受信ソケットは既に開いています".to_string());
         }
-        // ソケットそのものが IPv6 のとき（ini の `bind` に IPv6 のアドレスを書いた形）は、IPv6 の宛先をそのソケットが受け持つので足さない。
+        // ソケットそのものがIPv6のとき（iniの`bind`にIPv6のアドレスを書いた形）はIPv6の宛先をそのソケットが受け持つので足さない。
         if self.sock.local_addr().is_ok_and(|a| a.is_ipv6()) {
             return Err(
                 "受信ソケットが既に IPv6 です（IPv6 の経路は IPv4 の受信ソケットに足す形）"
@@ -1712,7 +1725,7 @@ impl GameNet {
             std::thread::Builder::new()
                 .name("higanr-recv6".into())
                 .spawn(move || {
-                    // パニックは受けて外へ出さない（スレッドの入口）。受けたら IPv6 の受信だけをやめる（IPv4 の経路は続く）。
+                    // パニックは捕捉して外へ出さない（スレッドの入口）。捕捉したらIPv6の受信だけをやめる（IPv4の経路は続く）。
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         recv_loop_v6(&sock6, &sock4, &shared);
                     }));
@@ -1728,9 +1741,9 @@ impl GameNet {
     }
 }
 
-/// 開いた後、ネットワークを動かす前の用意（読み取りのスレッド。`script_win::open_net` から）: 秘密（ini に無ければ OS の乱数で引く）・STUN の
-/// 問い合わせ（ini の `stun` があるとき）・接続のセッションの設定。戻りの文はログの 1 行に足す（秘密を引いたときは、自分の始める側の接続
-/// コード —— peer_sim の `--code` で読む —— を含む）。STUN が答えなくてもネットワークは開く。
+/// 開いた後、ネットワークを動かす前の用意（読み取りのスレッド。`script_win::open_net`から）。内容は秘密の乱数（iniに無ければOSの乱数で生成する）・STUNの問い合わせ（iniの`stun`があるとき）・接続のセッションの設定。
+/// 戻り値の文はログの1行に追加する（秘密の乱数を生成したときは自分の始める側の接続コード —— peer_simの`--code`で読む —— を含む）。
+/// STUNが答えなくてもネットワークは開く。
 #[cfg(test)]
 pub fn prepare_link(
     s: &NetSettings,
@@ -1740,7 +1753,7 @@ pub fn prepare_link(
     prepare_link_stun(s, net, role_nonce).map(|(c, n, _)| (c, n))
 }
 
-/// `prepare_link` の、STUN の結果の種類も返す形（試験のまとめの「STUN の答え」の行）。
+/// `prepare_link`の、STUNの結果の種類も返す形（試験のまとめの「STUN の答え」の行）。
 pub fn prepare_link_stun(
     s: &NetSettings,
     net: &mut GameNet,
@@ -1754,7 +1767,7 @@ pub fn prepare_link_stun(
         None => {
             let b = draw_secret()?;
             let local = net.local_addr().ok_or("受信ソケットが不明")?;
-            // `peer` の形では、読むときに session を必ず Some にしてある（`net_config::from_ini`）。
+            // `peer`の形では読むときにsessionを必ずSomeにしてある（`net_config::from_ini`）。
             let session = s.session_id.ok_or("session がありません")?;
             let code = s.initiator_code(b, session, local, mapped, v6, now_unix())?;
             note.push_str(&format!(
@@ -1767,15 +1780,16 @@ pub fn prepare_link_stun(
     Ok((s.link_config(role_nonce, secret, key_seed), note, stun))
 }
 
-/// 名前を引く待ちの上限。オフラインの DNS は何秒も返らないことがあり、ネットワークを開くのを止めないため。
+/// 名前解決を待つ上限。オフラインのDNSは何秒も返らないことがあるので、ネットワークを開くのが止まらないようにする。
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 経路表を引くための文書用の宛先（RFC 5737 の TEST-NET-1。実在の相手ではない）。UDP の `connect` は何も送らず、OS が「この宛先へ
-/// 出るときの自分のアドレス」を決めるだけ。
+/// 経路表を調べるための文書用の宛先（RFC 5737のTEST-NET-1。実在の相手ではない）。
+/// UDPの`connect`は何も送らず、OSが「この宛先へ出るときの自分のアドレス」を決めるだけ。
 const ROUTE_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
 
-/// 外へ出る経路の自分の IPv4 のアドレスを、OS の経路表から引く（`Bind::resolve` の `route`）。0.0.0.0:0 のソケットを作って
-/// `ROUTE_PROBE` へ `connect` するだけで、1 通も送らない。経路が無ければ（例: オフライン）`connect` が誤りを返すので、その文を返す。
+/// 外へ出る経路の自分のIPv4のアドレスをOSの経路表から取得する（`Bind::resolve`の`route`）。
+/// 0.0.0.0:0のソケットを作って`ROUTE_PROBE`へ`connect`するだけで、1通も送らない。
+/// 経路が無ければ（例: オフライン）`connect`が誤りを返すので、その文を返す。
 /// 読み取りのスレッドで開くときにだけ呼ぶ。
 pub fn probe_route_ip() -> Result<IpAddr, String> {
     let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
@@ -1784,10 +1798,11 @@ pub fn probe_route_ip() -> Result<IpAddr, String> {
     judge_route(connected, sock.local_addr())
 }
 
-/// 経路を引いた OS の答え（`connect` の結果と、その後の自分のアドレス）から、使える IPv4 のアドレスか誤りの文を決める（pure。OS の状態に
-/// 依らず、決まった入力で判断を検査するため切り出した）。「アドレスが無い」（0.0.0.0）と「マルチキャスト」は経路が無いのと同じ扱いで
-/// 断る。loopback・IPv6・範囲のガードは、呼び手の `Bind::resolve` が決める。リンクローカル 169.254 は、ルーターの無い LAN 直結の相手には
-/// 正しいアドレスなのでここでは断らない。
+/// 経路を調べたOSの答え（`connect`の結果とその後の自分のアドレス）から、使えるIPv4のアドレスか誤りの文を決める（pure）。
+/// OSの状態に依らず決まった入力で判断を検査するために切り出した。
+/// 「アドレスが無い」（0.0.0.0）と「マルチキャスト」は経路が無いのと同じ扱いで断る。
+/// loopback・IPv6・範囲のガードは、呼び出し元の`Bind::resolve`が決める。
+/// リンクローカル169.254はルーターの無いLAN直結の相手には正しいアドレスなので、ここでは断らない。
 fn judge_route(
     connected: std::io::Result<()>,
     local: std::io::Result<SocketAddr>,
@@ -1804,16 +1819,17 @@ fn judge_route(
     Ok(ip)
 }
 
-/// ini の `bind` から、開くソケットのアドレスを決める（`auto:ポート` なら経路表を引く。戻りの文は `auto` から何に決めたか、手で書いた
-/// アドレスなら空）。読み取りのスレッドで開くときにだけ。
+/// iniの`bind`から開くソケットのアドレスを決める（`auto:ポート`なら経路表を調べる）。
+/// 戻り値の文は`auto`から何に決まったかを表す。手で書いたアドレスなら空。
+/// 読み取りのスレッドで開くときにだけ呼ぶ。
 pub fn resolve_bind(s: &NetSettings) -> Result<(SocketAddr, String), String> {
     s.bind.resolve_by(s.scope, || {
         route_or_adapters(probe_route_ip(), adapters_win::list)
     })
 }
 
-/// 経路が引けたらその送り元（今までの動き）。引けなかったときだけ、アダプターの一覧から LAN のアドレスを選ぶ（ルーターなしの直結など、
-/// デフォルト経路の無い PC のため）。選べなければ、経路が引けなかった理由と一覧で選べなかった理由を並べて返す。
+/// 経路が取得できたらその送信元を使う（今までの動き）。取得できなかったときだけアダプターの一覧からLANのアドレスを選ぶ（ルーターなしの直結などデフォルト経路の無いPCのため）。
+/// 選べなければ、経路が取得できなかった理由と一覧で選べなかった理由を並べて返す。
 fn route_or_adapters(
     route: Result<IpAddr, String>,
     adapters: impl FnOnce() -> Result<Vec<Adapter>, String>,
@@ -1828,15 +1844,18 @@ fn route_or_adapters(
         .map_err(|r| format!("{route_err}。{}", r.text()))
 }
 
-/// IPv6 の経路を引くための文書用の宛先（RFC 3849 の 2001:db8::/32。実在の相手ではない）。`ROUTE_PROBE` の IPv6 バージョン。
+/// IPv6の経路を調べるための文書用の宛先（RFC 3849の2001:db8::/32。実在の相手ではない）。`ROUTE_PROBE`のIPv6バージョン。
 const ROUTE_PROBE_V6: SocketAddr = SocketAddr::new(
     IpAddr::V6(Ipv6Addr::new(0x2001, 0x0DB8, 0, 0, 0, 0, 0, 1)),
     9,
 );
 
-/// 外へ出る経路の自分の IPv6 のアドレス（OS の既定の送り元）を、OS の経路表から引く。`[::]:0` のソケットを作って `ROUTE_PROBE_V6` へ `connect` するだけで、1 通も送らない。
-/// OS が決めた送り元をそのまま使うので、Windows の既定どおり一時アドレス（RFC 4941。一定の時間で替わる）が選ばれる。固定のアドレス（EUI-64・安定プライバシー）を自分で選ばないのは、相手に見せるアドレスが長く変わらない値だと同じアドレスで別の機会にも辿れるため。
-/// 接続コードの有効期限は 30 分で、一時アドレスの有効期間より十分短い。接続のたびにソケットを開き直し、そのとき引き直すので、替わったアドレスを持ち越さない。経路が無ければ誤りの文を返す。読み取りのスレッドで開くときにだけ呼ぶ。
+/// 外へ出る経路の自分のIPv6のアドレス（OSの既定の送信元）をOSの経路表から取得する。`[::]:0`のソケットを作って`ROUTE_PROBE_V6`へ`connect`するだけで、1通も送らない。
+/// OSが決めた送信元をそのまま使うので、Windowsの既定どおり一時アドレス（RFC 4941。一定の時間で替わる）が選ばれる。
+/// 固定のアドレス（EUI-64・安定プライバシー）を自分で選ばないのは、相手に見せるアドレスが長く変わらない値だと、同じアドレスで別の機会にも辿れるため。
+/// 接続コードの有効期限は30分で、一時アドレスの有効期間より十分短い。
+/// 接続のたびにソケットを開き直し、そのとき取得し直すので、替わったアドレスを持ち越さない。
+/// 経路が無ければ誤りの文を返す。読み取りのスレッドで開くときにだけ呼ぶ。
 pub fn probe_route_ipv6() -> Result<IpAddr, String> {
     let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
         .map_err(|e| format!("IPv6 の経路表を引くソケットの作成不能: {e}"))?;
@@ -1844,8 +1863,9 @@ pub fn probe_route_ipv6() -> Result<IpAddr, String> {
     judge_route(connected, sock.local_addr())
 }
 
-/// 経路を引いた結果から、IPv6 の経路のソケットに使うアドレスを決める（pure）。世界に通じる 2000::/3（`candidate::is_global_unicast_v6`）
-/// だけを採り、IPv4・リンクローカル・ユニークローカル・Teredo・6to4・文書用は Err（呼び手は IPv6 の経路を開かずに IPv4 だけで続ける）。
+/// 経路を調べた結果から、IPv6の経路のソケットに使うアドレスを決める（pure）。
+/// 採るのは世界に通じる2000::/3（`candidate::is_global_unicast_v6`）だけ。
+/// IPv4・リンクローカル・ユニークローカル・Teredo・6to4・文書用はErr（呼び出し元はIPv6の経路を開かずにIPv4だけで続ける）。
 fn choose_v6_source(route: Result<IpAddr, String>) -> Result<Ipv6Addr, String> {
     match route? {
         IpAddr::V6(ip) if is_global_unicast_v6(ip) => Ok(ip),
@@ -1858,16 +1878,16 @@ fn choose_v6_source(route: Result<IpAddr, String>) -> Result<Ipv6Addr, String> {
     }
 }
 
-/// IPv6 の経路を開く（読み取りのスレッドで、ネットワークを動かす前に 1 回）。開いたときのソケットのアドレスを返す（自分のコードの候補に載せる）。
-/// None は開かなかった（IPv4 だけで続ける。理由は `note` に足す。`scope` が internet でないときは理由も書かない）。
+/// IPv6の経路を開く（読み取りのスレッドでネットワークを動かす前に1回）。開いたときのソケットのアドレスを返す（自分のコードの候補に載せる）。
+/// Noneは開かなかったことを表す（IPv4だけで続ける。理由は`note`に追加する。`scope`がinternetでないときは理由も書かない）。
 ///
-/// 開くアドレスは OS の既定の送り元（`probe_route_ipv6`）。ポートは IPv4 のソケットと同じ番号を先に試し、使えなければ OS に選ばせる
-/// （ファイアウォールの許可やルーターのポート開放が同じ番号で済む）。
+/// 開くアドレスはOSの既定の送信元（`probe_route_ipv6`）。
+/// ポートはIPv4のソケットと同じ番号を先に試し、使えなければOSに選ばせる（ファイアウォールの許可やルーターのポート開放が同じ番号で済む）。
 pub fn open_ipv6(s: &NetSettings, net: &GameNet, note: &mut String) -> Option<SocketAddr> {
     open_ipv6_with(s, net, note, probe_route_ipv6)
 }
 
-/// `open_ipv6` の中身（経路を引くツールを渡す。検査は OS の経路表を引かずにアドレスを注入する）。
+/// `open_ipv6`の中身（経路を調べるツールを渡す。検査はOSの経路表を調べずにアドレスを注入する）。
 fn open_ipv6_with(
     s: &NetSettings,
     net: &GameNet,
@@ -1891,7 +1911,7 @@ fn open_ipv6_with(
     open_ipv6_on(net, ip, note)
 }
 
-/// IPv6 のソケットをアドレス `ip` で開く（ポートの決め方は `open_ipv6` の doc。検査は `::1` を渡す）。
+/// IPv6のソケットをアドレス`ip`で開く（ポートの決め方は`open_ipv6`のdoc。検査は`::1`を渡す）。
 fn open_ipv6_on(net: &GameNet, ip: Ipv6Addr, note: &mut String) -> Option<SocketAddr> {
     let want_port = net.local_addr().map_or(0, |a| a.port());
     let ports: &[u16] = if want_port == 0 {
@@ -1918,16 +1938,16 @@ fn open_ipv6_on(net: &GameNet, ip: Ipv6Addr, note: &mut String) -> Option<Socket
 
 #[derive(Debug, PartialEq, Eq)]
 enum Stalled {
-    /// スレッドを作れなかった（仕事は始まってもいない。文は OS の返した理由）。
+    /// スレッドを作れなかった（仕事は始まってもいない。文はOSの返した理由）。
     NotStarted(String),
     /// 上限の時間内に終わらなかった。
     TimedOut,
-    /// スレッドが結果を送る前に終わった（仕事の中の panic）。
+    /// スレッドが結果を送る前に終わった（仕事の中のpanic）。
     Died,
 }
 
-/// `f` を別のスレッドで走らせ、`timeout` 内に終われば結果を返す（終わらなければ `Stalled`。走っているスレッドは
-/// 放っておく — OS の名前引きは中断できず、終われば結果を捨てて自分で終わる）。
+/// `f`を別のスレッドで走らせ、`timeout`内に終われば結果を返す（終わらなければ`Stalled`）。
+/// 走っているスレッドは放っておく。OSの名前解決は中断できず、終われば結果を捨てて自分で終わる。
 fn run_with_timeout<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
     timeout: Duration,
@@ -1944,7 +1964,7 @@ fn run_with_timeout<T: Send + 'static>(
     )
 }
 
-/// `run_with_timeout` の中身（スレッドを作るツール `spawn` を渡す）。
+/// `run_with_timeout`の中身（スレッドを作るツール`spawn`を渡す）。
 fn run_with_timeout_via<T: Send + 'static>(
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     f: impl FnOnce() -> T + Send + 'static,
@@ -1961,8 +1981,9 @@ fn run_with_timeout_via<T: Send + 'static>(
     })
 }
 
-/// 名前引きが結果を返さなかったときの誤りの文（pure）。打ち切ったのと、スレッドを作れなかったのと、仕事が途中で
-/// 終わったのを取り違えない（作れなかったのに「打ち切った」と書くと、原因を DNS の遅さと読んで的を外す）。
+/// 名前解決が結果を返さなかったときの誤りの文（pure）。
+/// 打ち切った場合・スレッドを作れなかった場合・仕事が途中で終わった場合を取り違えない。
+/// 作れなかったのに「打ち切った」と書くと、原因をDNSの遅さと読んで的を外す。
 fn lookup_stalled_text(name: &str, timeout: Duration, why: &Stalled) -> String {
     match why {
         Stalled::NotStarted(e) => {
@@ -1976,8 +1997,8 @@ fn lookup_stalled_text(name: &str, timeout: Duration, why: &Stalled) -> String {
     }
 }
 
-/// 名前を引く（OS の名前引き。`ToSocketAddrs`）。別のスレッドで `timeout` まで待ち、打ち切ったら誤りの文を返す。
-/// **読み取りのスレッドだけで呼ぶ**（ゲームのスレッドでは絶対に引かない）。
+/// 名前を解決する（OSの名前解決。`ToSocketAddrs`）。別のスレッドで`timeout`まで待ち、打ち切ったら誤りの文を返す。
+/// **読み取りのスレッドだけで呼ぶ**（ゲームのスレッドでは絶対に呼ばない）。
 pub fn lookup_with_timeout(
     host: &str,
     port: u16,
@@ -1989,8 +2010,9 @@ pub fn lookup_with_timeout(
         .unwrap_or_else(|why| Err(lookup_stalled_text(&name, timeout, &why)))
 }
 
-/// 名前を引く（OS の名前引き。上限なしで待つ）。呼ぶスレッドが待たされてよいときだけ: `lookup_with_timeout` の別のスレッドと、
-/// 2 か所目の STUN の名前引きのスレッド（引き終えなくても誰も待たない）。
+/// 名前を解決する（OSの名前解決。上限なしで待つ）。
+/// 呼んでよいのは、呼ぶスレッドが待たされてよいときだけ。
+/// `lookup_with_timeout`の別のスレッドと、2か所目のSTUNの名前解決のスレッド（解決を終えなくても誰も待たない）が該当する。
 fn lookup_blocking(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     (host, port)
         .to_socket_addrs()
@@ -1998,9 +2020,10 @@ fn lookup_blocking(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
         .map_err(|e| format!("名前 {host} の名前解決不能: {e}"))
 }
 
-/// STUN の問い合わせ先をアドレスにする。名前は `lookup` で引き、引けたアドレスのうちソケットと同じ族（今は IPv4 だけ）で `guard::check_peer`
-/// （ネットワークの範囲）を通る最初の 1 つを使う。Err は「STUN を使わない」理由（STUN なしで続ける）。範囲 loopback では `localhost` 以外の名前は
-/// 引かない（DNS の問い合わせは外への通信）。
+/// STUNの問い合わせ先をアドレスにする。名前は`lookup`で解決する。
+/// 解決できたアドレスのうち、ソケットと同じアドレスファミリ（今はIPv4だけ）で`guard::check_peer`（ネットワークの範囲）を通る最初の1つを使う。
+/// Errは「STUNを使わない」理由（STUNなしで続ける）。
+/// 範囲loopbackでは`localhost`以外の名前は解決しない（DNSの問い合わせは外への通信）。
 pub fn resolve_stun(
     target: &StunTarget,
     scope: Scope,
@@ -2030,10 +2053,11 @@ pub fn resolve_stun(
         })
 }
 
-/// ini の `stun` があれば問い合わせ、見えた自分のアドレスを返す（答えの有無は `note` に足す。答えなくてもネットワークは開く。名前が引けなくても、
-/// 引けたアドレスが範囲の外でも、STUN なしで続ける）。読み取りのスレッドで、ネットワークを動かす前だけ。
+/// iniの`stun`があれば問い合わせて、見えた自分のアドレスを返す（答えの有無は`note`に追加する）。
+/// 答えなくてもネットワークは開く。名前が解決できなくても、解決できたアドレスが範囲の外でも、STUNなしで続ける。
+/// 読み取りのスレッドでネットワークを動かす前にだけ呼ぶ。
 ///
-/// 戻りの 2 つ目は結果の種類（試験のまとめの「STUN の答え」の行）。
+/// 戻り値の2つ目は結果の種類（試験のまとめの「STUN の答え」の行）。
 pub fn stun_state(
     s: &NetSettings,
     net: &mut GameNet,
@@ -2049,30 +2073,31 @@ pub fn stun_state(
     )
 }
 
-/// 待っている間に STUN へ聞き直す範囲か。外の相手と接続する範囲（internet）だけ。家の中（lan）の相手とはルーターの対応づけを通らず、
-/// 通っても STUN のサーバーが範囲の外で問い合わせない。同じ PC の中（loopback）は STUN を使うのが検査の偽のサーバーだけで、聞き直しを
-/// 送ると検査の数が揺れる。
+/// 待っている間にSTUNへ聞き直す範囲かどうか。外の相手と接続する範囲（internet）だけが対象。
+/// 家の中（lan）の相手とはルーターの対応づけを通らない。通ってもSTUNのサーバーが範囲の外なので問い合わせない。
+/// 同じPCの中（loopback）でSTUNを使うのは検査の偽のサーバーだけで、聞き直しを送ると検査の数が揺れる。
 pub fn keeps_mapping_fresh(scope: Scope) -> bool {
     scope == Scope::Internet
 }
 
-/// 2 か所目の STUN（`stun2`）へ聞く範囲か。聞き直しと同じガード: internet だけ。lan では STUN のサーバーが範囲の外になり、loopback では
-/// 外へ出ない約束なので、2 か所目へは名前も引かず 1 通も送らない。
+/// 2か所目のSTUN（`stun2`）へ聞く範囲かどうか。聞き直しと同じガードで、internetだけ。
+/// lanではSTUNのサーバーが範囲の外になり、loopbackでは外へ出ない約束なので、2か所目へは名前解決も1通の送信もしない。
 pub fn asks_second_stun(scope: Scope) -> bool {
     scope == Scope::Internet
 }
 
-/// UPnP を頼む範囲か。外の相手と接続する範囲（internet）だけ（lan / loopback の相手とはルーターの割り当てが要らない）。
+/// UPnPを頼む範囲かどうか。外の相手と接続する範囲（internet）だけ（lan / loopbackの相手とはルーターの割り当てが要らない）。
 pub fn asks_upnp(scope: Scope) -> bool {
     scope == Scope::Internet
 }
 
-/// 2 か所目の STUN の結果を待つ上限。出なければ型を「不明」にして先へ進む。
+/// 2か所目のSTUNの結果を待つ上限。出なければネットワーク種別を「不明」にして先へ進む。
 pub const SECOND_STUN_WAIT: Duration = Duration::from_secs(1);
 
-/// 開いたソケットのポートの割り当てを、家のルーターへ UPnP で頼み始める（読み取りのスレッドで、ネットワークを動かす前に 1 回。STUN と並行に
-/// 走らせるため、STUN の問い合わせより前に呼ぶ）。頼まない理由があれば `note` に書く（scope が internet でないときは書かない）。
-/// 戻りは頼み始めたか。
+/// 開いたソケットのポートの割り当てを、家のルーターへUPnPで頼み始める（読み取りのスレッドでネットワークを動かす前に1回）。
+/// STUNと並行に走らせるため、STUNの問い合わせより前に呼ぶ。
+/// 頼まない理由があれば`note`に書く（scopeがinternetでないときは書かない）。
+/// 戻り値は頼み始めたかどうか。
 pub fn upnp_begin(s: &NetSettings, net: &GameNet, note: &mut String) -> bool {
     if !asks_upnp(s.scope) {
         return false;
@@ -2100,7 +2125,7 @@ pub fn upnp_begin(s: &NetSettings, net: &GameNet, note: &mut String) -> bool {
     )
 }
 
-/// `upnp_begin` の中身（通信のツール・順に試す外側のポート・頼み直す間隔を渡す。検査は偽のルーターを渡す）。
+/// `upnp_begin`の中身（通信のツール・順に試す外側のポート・頼み直す間隔を渡す。検査は偽のルーターを渡す）。
 pub fn upnp_begin_with(
     net: &GameNet,
     wire: Box<dyn upnp::Wire>,
@@ -2129,21 +2154,22 @@ pub fn upnp_begin_with(
     }
 }
 
-/// 開くときに決まった自分の回線の情報（`nat_settle` の戻り）。
+/// 開くときに決まった自分の回線の情報（`nat_settle`の戻り値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OwnNat {
-    /// 自分のコードに載せる型の印。
+    /// 自分のコードに載せるネットワーク種別のフラグ。
     pub mark: NatMark,
-    /// UPnP で割り当てた外側のポート（自分の候補に載せる）。
+    /// UPnPで割り当てた外側のポート（自分の候補に載せる）。
     pub upnp_port: Option<u16>,
 }
 
-/// 2 か所目の STUN の結果と UPnP の結果が出るのを待ち、自分の型の印を決める（読み取りのスレッドで、STUN の問い合わせの後・
-/// 自分のコードを作る前に 1 回）。2 か所目の STUN は `SECOND_STUN_WAIT`、UPnP は頼み始めてから `upnp::OPEN_BUDGET` までで、
-/// 出なければ型は「不明」・UPnP は「使えない」にして先へ進む。待った時間は `note`（本ログ）に書く。
+/// 2か所目のSTUNの結果とUPnPの結果が出るのを待って自分のネットワーク種別のフラグを決める（読み取りのスレッドで、STUNの問い合わせの後・自分のコードを作る前に1回）。
+/// 待つ上限は、2か所目のSTUNが`SECOND_STUN_WAIT`、UPnPが頼み始めてから`upnp::OPEN_BUDGET`まで。
+/// 出なければネットワーク種別は「不明」、UPnPは「使えない」にして先へ進む。待った時間は`note`（本ログ）に書く。
 ///
-/// UPnP を使うのは、ルーターの外側のアドレスが `mapped`（1 か所目の STUN で見えた自分のアドレス）と同じ IPv4 で、世界に通じるときだけ。
-/// 違えば（二重 NAT など）割り当てを消し、印も候補も付けない。`mapped` が IPv4 のこのときだけ候補が足されるので、印は候補と同じ条件。
+/// UPnPを使うのは、ルーターの外側のアドレスが`mapped`（1か所目のSTUNで見えた自分のアドレス）と同じIPv4で、世界に通じるときだけ。
+/// 違えば（二重NATなど）割り当てを消し、フラグも候補も付けない。
+/// `mapped`がIPv4のこのときだけ候補が足されるので、フラグは候補と同じ条件。
 pub fn nat_settle(
     s: &NetSettings,
     net: &GameNet,
@@ -2250,12 +2276,12 @@ fn stun_mapped_with(
     stun_state_with(s, net, note, lookup, KEEP_OFF).0
 }
 
-/// 検査の「聞き直しの間隔」: 十分長くして、検査の間に 1 通も送らせない。
+/// 検査の「聞き直しの間隔」: 十分長くして検査の間に1通も送らせない。
 #[cfg(test)]
 const KEEP_OFF: Duration = Duration::from_secs(3_600);
 
-/// `stun_state` の中身（1 か所目の名前を引くツール・聞き直しの間隔・2 か所目の名前を引くツールを渡す。検査は実在の名前を引かずに、
-/// 引けたアドレスを注入し、間隔を短くする）。
+/// `stun_state`の中身（1か所目の名前を解決するツール・聞き直しの間隔・2か所目の名前を解決するツールを渡す）。
+/// 検査は実在の名前を解決せず、解決できたアドレスを注入して間隔を短くする。
 fn stun_state_inner(
     s: &NetSettings,
     net: &mut GameNet,
@@ -2304,9 +2330,9 @@ fn stun_state_inner(
         }
         Err(e) => {
             note.push_str(&format!(" / STUN: {e}"));
-            // 1 か所目が答えないときは 2 か所目に同じように聞き、答えをコードに載せる（1 か所目だけが答えない回線があった）。宛先ごとの
-            // 型の比べは、比べる相手が無いのでしない（診断は「聞いていない」のまま）。待ちが延びるのは 1 か所目が答えないときだけ
-            // （名前引き 2 秒 ＋ 問い合わせ 2 秒まで）。
+            // 1か所目が答えないときは2か所目に同じように聞き、答えをコードに載せる（1か所目だけが答えない回線があった）。
+            // 宛先ごとに外側のポートが変わるかどうかの比較は比べる相手が無いのでしない（診断は「聞いていない」のまま）。
+            // 待ちが延びるのは1か所目が答えないときだけ（名前解決2秒 ＋ 問い合わせ2秒まで）。
             if asks_second_stun(s.scope)
                 && let Some(t2) = s.stun2.as_ref()
             {
@@ -2343,7 +2369,7 @@ fn stun_state_inner(
     }
 }
 
-/// 接続の秘密を OS の乱数で引く（core は乱数を持たない）。
+/// 接続の秘密の乱数をOSの乱数で生成する（coreは乱数を持たない）。
 pub fn draw_secret() -> Result<Secret, String> {
     let mut b = [0u8; SECRET_LEN];
     if !os_random(&mut b) {
@@ -2352,8 +2378,8 @@ pub fn draw_secret() -> Result<Secret, String> {
     Ok(Secret(b))
 }
 
-/// 使い捨ての鍵の種を OS の乱数で引く（core は乱数を持たない）。接続のセッションの設定・観戦の配る側・観戦者を作るたびに 1 回（同じ種を
-/// 2 つのセッションに使い回さない）。ゲームのスレッドでは呼ばない。
+/// 使い捨ての鍵の種をOSの乱数で生成する（coreは乱数を持たない）。
+/// 接続のセッションの設定・観戦の配信側・観戦者を作るたびに1回呼ぶ（同じ種を2つのセッションに使い回さない）。ゲームのスレッドでは呼ばない。
 pub fn draw_key_seed() -> Result<KeySeed, String> {
     let mut b = [0u8; SEED_LEN];
     if !os_random(&mut b) {
@@ -2362,7 +2388,7 @@ pub fn draw_key_seed() -> Result<KeySeed, String> {
     Ok(KeySeed(b))
 }
 
-/// 今の UNIX 秒（接続コードの有効期限。時計が 1970 年より前なら 0）。
+/// 今のUNIX秒（接続コードの有効期限。時計が1970年より前なら0）。
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2446,6 +2472,10 @@ impl Net for GameNet {
             .store(DelaySnapshot::pack(snap), Ordering::Release);
     }
 
+    fn note_host_uplink(&mut self, bps: u32) {
+        self.shared.host_uplink.store(bps, Ordering::Relaxed);
+    }
+
     fn link_up(&mut self) {
         self.shared.keep.run.store(false, Ordering::Release);
     }
@@ -2459,8 +2489,8 @@ impl Net for GameNet {
     }
 }
 
-/// 自分の回線の型の印（2 か所目の STUN の今の結果と、UPnP の割り当て）。ゲームのスレッドの `own_nat` と、観戦者の受け取り（中継役を
-/// 選ぶ JOIN の欄）が読む。
+/// 自分のネットワーク種別のフラグ（2か所目のSTUNの今の結果とUPnPの割り当て）。
+/// ゲームのスレッドの`own_nat`と、観戦者の受け取り（中継役を選ぶJOINのフィールド）が読む。
 fn nat_of(shared: &Shared) -> NatMark {
     NatMark {
         symmetry: Symmetry::from_depends(
@@ -2480,8 +2510,9 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    /// ソケットを使う検査を 1 本ずつ走らせるロック。`connection_reset_is_skipped_*` は閉じたばかりのポートへわざと送るので、同じ時に走る
-    /// 別の検査がそのポートを引き当てると、余計な 3 通を受ける。
+    /// ソケットを使う検査を1本ずつ走らせるロック。
+    /// `connection_reset_is_skipped_*`は閉じたばかりのポートへわざと送る。
+    /// 同じ時に走る別の検査がそのポートを割り当てられると、その検査が余計な3通を受ける。
     fn socket_lock() -> std::sync::MutexGuard<'static, ()> {
         static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())
@@ -2564,7 +2595,7 @@ mod tests {
         }
     }
 
-    /// 通るアドレスへは送らない（`may_send` は判定だけ。26/8 は実在する世界のアドレスで、検査から外へ出さない）。
+    /// 通るアドレスへは送らない（`may_send`は判定だけ。26/8は実在する世界のアドレスなので検査から外へ出さない）。
     #[test]
     fn a_lan_vpn_scope_passes_its_network_on_every_gate_and_a_lan_scope_does_not() {
         let _g = socket_lock();
@@ -2591,7 +2622,7 @@ mod tests {
             open_scoped(Scope::Lan, lo(0), &[vpn]).is_err(),
             "lan が VPN の宛先を通した"
         );
-        // 受信ソケットのアドレスの検査（この PC に 26.x は無いので OS の bind までは行かない。ガードだけ見る）。
+        // 受信ソケットのアドレスの検査（このPCに26.xは無いのでOSのbindまでは行かない。ガードだけ見る）。
         assert!(guard::check_bind(vpn, radmin, "受信ソケット").is_ok());
         assert!(guard::check_bind(vpn, Scope::Lan, "受信ソケット").is_err());
         assert!(guard::check_bind(vpn_lo, radmin, "受信ソケット").is_err());
@@ -2614,7 +2645,7 @@ mod tests {
         );
         lan_net.send(vpn, b"x");
         assert_eq!((lan_net.send_counts(), lan_net.send_refused()), ((0, 0), 1));
-        // 受信スレッドが PING へ返信する前のガード（`answer` の検査は `pong_gate_tests`）が使う範囲も、開いた範囲そのもの。
+        // 受信スレッドがPINGへ返信する前のガード（`answer`の検査は`pong_gate_tests`）が使う範囲も、開いた範囲そのもの。
         let (_net, th) = open_for_code_scoped(radmin, lo(0)).unwrap();
         assert_eq!(th.shared.scope, radmin);
     }
@@ -2820,8 +2851,8 @@ mod tests {
                     }
                     link.poll(now(), &mut Out(&psock));
                 }
-                // 以後はセッションを回さない（PING は自分で作り、返ってきたものは自分で解く）。手で作る PING はセッションの送り（`Sender::Link`）と
-                // 番号が重ならないよう、検査だけ別の印（観戦者の印）で封じる。
+                // 以後はセッションを回さない（PINGは自分で作り、返ってきたものは自分で解く）。
+                // 手で作るPINGはセッションの送信（`Sender::Link`）と番号が重ならないよう、検査だけ別の印（観戦者の印）で封じる。
                 let key = AuthKey::derive(&SECRET, SID);
                 let keys = link.dir_keys().expect("繋がった");
                 let seq = higanr_core::seal::Seq::new();
@@ -3235,7 +3266,7 @@ mod tests {
             Ok((route_ok, AddrSource::Route))
         );
         let no_route = || Err("外へ出る経路が無い: 到達できない".to_string());
-        // 直結: 経路は無く、169.254 が 1 つだけ。
+        // 直結: 経路は無く、169.254が1つだけ。
         let direct = vec![nic("169.254.20.5", false, 25)];
         let (ip, src) = route_or_adapters(no_route(), || Ok(direct)).unwrap();
         assert_eq!(
@@ -3267,7 +3298,7 @@ mod tests {
         );
     }
 
-    /// `scope = internet` でも 169.254 を断る。
+    /// `scope = internet`でも169.254を断る。
     #[test]
     fn bind_auto_names_the_adapter_list_when_it_picks_from_it() {
         use crate::net_config::Bind;
@@ -3279,7 +3310,7 @@ mod tests {
             .unwrap();
         assert_eq!(a, "169.254.20.5:17723".parse::<SocketAddr>().unwrap());
         assert!(note.contains("アダプターの一覧"), "{note}");
-        // scope = internet でも、直結の 169.254 を選べる（ルーターなしの直結はインターネットの設定のままでも使える）。
+        // scope = internet でも直結の169.254を選べる（ルーターなしの直結はインターネットの設定のままでも使える）。
         let (a, note) = Bind::Auto(17723)
             .resolve_by(Scope::Internet, || {
                 route_or_adapters(Err("外へ出る経路が無い: x".to_string()), list)
@@ -3297,7 +3328,7 @@ mod tests {
             note.contains("外へ出る経路の自分のアドレス") && !note.contains("アダプター"),
             "{note}"
         );
-        // 範囲 loopback では一覧を引かない。
+        // 範囲loopbackでは一覧を引かない。
         let (a, _) = Bind::Auto(17723)
             .resolve_by(Scope::Loopback, || -> Result<_, String> {
                 panic!("loopback で引いた")
@@ -3404,9 +3435,9 @@ mod tests {
         assert_ne!(lc3.key_seed, lc.key_seed);
     }
 
-    // ---- 外側のアドレスの保ち（STUN の聞き直し）----
+    // ---- 外側のアドレスの維持（STUNの聞き直し）----
     //
-    // 本物の STUN へは送らない。偽の応答役（peer_sim の `stun_fake`。loopback）へ、短くした間隔で聞かせる。
+    // 本物のSTUNへは送らない。偽の応答役（peer_simの`stun_fake`。loopback）へ短くした間隔で聞かせる。
 
     fn wait_for(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let t = Instant::now();
@@ -3565,7 +3596,7 @@ mod tests {
         );
     }
 
-    /// 観戦の配る側を用意して受信スレッドに置き、この接続の `LinkSlot` を観戦用のコード（`OnewayCode`）へ渡す（配る側のスレッドは作らない）。
+    /// 観戦の配信側を用意して受信スレッドに置き、この接続の`LinkSlot`を観戦用のコード（`OnewayCode`）へ渡す（配信側のスレッドは作らない）。
     fn armed_spectate(
         th: &RecvThread,
         me: SocketAddr,
@@ -3598,8 +3629,9 @@ mod tests {
         (sp, a.oneway, slot)
     }
 
-    /// 本番の組（ルームで配る試合のホスト: 2 人とも許可・配る側のスレッドあり）は、接続の後も続け、止まるのはネットワークを閉じたとき
-    /// （本番で `stop_offer` を呼ぶのは `RecvThread::halt` の中だけ）。STUN の宛先が IPv6 なら、接続の後は続けない。
+    /// 本番の組み合わせ（ルームで配信する試合のホスト: 2人とも許可・配信側のスレッドあり）は、接続の後も続ける。
+    /// 止まるのはネットワークを閉じたときだけ（本番で`stop_offer`を呼ぶのは`RecvThread::halt`の中だけ）。
+    /// STUNの宛先がIPv6なら接続の後は続けない。
     #[test]
     fn a_casting_host_keeps_asking_past_the_link_until_the_network_closes() {
         use higanr_core::lockstep::Role;
@@ -3608,7 +3640,7 @@ mod tests {
         let (sp, _oneway, slot) = armed_spectate(&th, net.local_addr().unwrap(), mapped);
         let v4 = fake.addr();
         let v6: SocketAddr = "[::1]:3478".parse().unwrap();
-        // 接続の前（上限の 31 分は実時間で待てないので、経過を渡して見る）。宛先の族に依らない。
+        // 接続の前（上限の31分は実時間で待てないので経過を渡して見る）。宛先のアドレスファミリに依らない。
         assert!(keep_wanted(&th.shared, KEEP_MAX_MS - 1, v4));
         assert!(keep_wanted(&th.shared, KEEP_MAX_MS - 1, v6));
         assert!(!keep_wanted(&th.shared, KEEP_MAX_MS, v4));
@@ -3625,12 +3657,12 @@ mod tests {
         let at = sent();
         assert!(wait_for(Duration::from_secs(5), || sent() >= at + 4));
         assert!(th.diag().keep.running);
-        // 配る側の印が倒れても、2 人とも許可したホストの間は続ける。
+        // 配信側のフラグが倒れても2人とも許可したホストの間は続ける。
         sp.stop_offer();
         assert!(keep_wanted(&th.shared, 0, v4));
         let at = sent();
         assert!(wait_for(Duration::from_secs(5), || sent() >= at + 2));
-        // ネットワークを閉じたら、STUN へ何も届かない。
+        // ネットワークを閉じたら、STUNへ何も届かない。
         drop(th);
         std::thread::sleep(Duration::from_millis(100));
         let seen = fake.received();
@@ -3638,7 +3670,7 @@ mod tests {
         assert_eq!(fake.received(), seen, "閉じた後も STUN へ届いた");
     }
 
-    /// 観戦コード（Ctrl+C）だけで配る試合: 2 人とも許可したホストだけが接続の後も聞き直しを続け、観戦コードは今の外側のアドレスで書く。
+    /// 観戦コード（Ctrl+C）だけで配信する試合: 2人とも許可したホストだけが接続の後も聞き直しを続け、観戦コードは今の外側のアドレスで書く。
     #[test]
     fn a_host_both_allow_keeps_asking_for_the_watch_code_and_writes_the_new_port() {
         use higanr_core::lockstep::Role;
@@ -3659,7 +3691,7 @@ mod tests {
             n
         };
         net.link_up();
-        // 対戦のゲスト（2 人とも許可）は休む。
+        // 対戦のゲスト（2人とも許可）は休む。
         slot.mark_may_list(true);
         slot.mark_role(Role::Guest);
         resting("ゲスト");
@@ -3667,7 +3699,7 @@ mod tests {
         slot.mark_role(Role::Host);
         slot.mark_may_list(false);
         let rested = resting("片方が禁止のホスト");
-        // 2 人とも許可したホストは、接続の後も上限に依らず続ける。
+        // 2人とも許可したホストは接続の後も上限に依らず続ける。
         slot.mark_may_list(true);
         assert!(keep_wanted(&th.shared, u32::MAX, v4));
         assert!(wait_for(Duration::from_secs(5), || sent() >= rested + 4));
@@ -3707,7 +3739,7 @@ mod tests {
                 "[netplay]\nenable = 1\nscope = {scope}\nbind = 127.0.0.1:0\npeer = 127.0.0.1:7002\nsession = 1\n{stun}\n"
             )
         };
-        // `keeping` が true の行は、聞き直しが 3 通届くまで（最大 5 秒）待つ。false の行は 400 ms 待って、1 通も来ないことを見る。
+        // `keeping`がtrueの行は聞き直しが3通届くまで（最大5秒）待つ。falseの行は400 ms待って、1通も来ないことを見る。
         let run = |scope: Scope, ini: &str, keeping: bool| {
             let s = crate::net_config::from_text(ini).unwrap().unwrap();
             let (mut net, th) = open_for_code_scoped(scope, lo(0)).unwrap();
@@ -3833,10 +3865,10 @@ mod tests {
         assert!(!*looked.lock().unwrap(), "lan で 2 か所目の名前を引いた");
     }
 
-    // ---- 2 か所目の STUN（宛先ごとに外側のポートを変える型かの見分け）----
+    // ---- 2か所目のSTUN（宛先ごとに外側のポートが変わるかどうかの判別）----
     //
-    // 本物の STUN へは送らない。偽の応答役（loopback）を 2 つ立て、1 か所目を `stun`、2 か所目を `stun2`（名前の形。名前引きは検査の
-    // ツールを注入）に指定する。
+    // 本物のSTUNへは送らない。偽の応答役（loopback）を2つ立て、1か所目を`stun`、2か所目を`stun2`に指定する。
+    // 指定は名前の形で行い、名前解決には検査のツールを注入する。
 
     fn second_settings(scope: &str, first: SocketAddr, stun2: &str) -> NetSettings {
         crate::net_config::from_text(&format!(
@@ -3929,7 +3961,7 @@ mod tests {
                 },
             );
             if expect_ask {
-                // 聞く側は別スレッドなので、負荷の下では届くまでに 400 ms を超えることがある。
+                // 聞く側は別スレッドなので負荷の下では届くまでに400 msを超えることがある。
                 wait_for(Duration::from_secs(3), || f2.received() > before);
             } else {
                 std::thread::sleep(Duration::from_millis(400));
@@ -4143,8 +4175,8 @@ mod tests {
             "{:?}",
             th.diag().second
         );
-        // 上限は厳密に、下限は 2 通の取りこぼしを許す: 負荷の下で、送りは 8 回とも Ok なのに偽の STUN が 3 秒待っても 6〜7 通しか
-        // 受けない実行があった（loopback の UDP の取りこぼし）。
+        // 上限は厳密に、下限は2通の取りこぼしを許す。
+        // 負荷の下で、送信は8回ともOkなのに偽のSTUNが3秒待っても6〜7通しか受けない実行があった（loopbackのUDPの取りこぼし）。
         wait_for(Duration::from_secs(3), || {
             f2.received() >= stun::QUERY_TRIES
         });
@@ -4193,14 +4225,14 @@ mod tests {
         assert_eq!(th.diag().port_kept, Some(false));
     }
 
-    // ---- IPv6 の経路 ----
+    // ---- IPv6の経路 ----
 
     fn v6lo(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
     }
 
-    /// この PC で IPv6 の loopback（`::1`）が使えるか。使えなければ標準エラーに「測れなかった」と書いて false（その検査は何も
-    /// 検証していない。通ったように見せない）。
+    /// このPCでIPv6のloopback（`::1`）が使えるかどうか。使えなければ標準エラーに「測れなかった」と書いてfalseを返す。
+    /// その検査は何も検証していない。通ったように見せない。
     fn v6_loopback_or_unmeasured(what: &str) -> bool {
         match UdpSocket::bind(v6lo(0)) {
             Ok(_) => true,
@@ -4518,7 +4550,7 @@ mod tests {
         for s in [&peer6, &peer4] {
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         }
-        // 経路は IPv6（p6）。受けてよい送り元は p6 と p4 の両方（候補）。口の向きの鍵は 0x61…（送る向き）と 0x62…（受ける向き）。
+        // 経路はIPv6（p6）。受けてよい送信元はp6とp4の両方（候補）。向きごとの鍵は0x61…（送る向き）と0x62…（受ける向き）。
         // 相手役はその逆で封じて開く。
         let dir = higanr_core::seal::DirKeys::from_raw([0x61; 32], [0x62; 32]);
         let peer_dir = dir.swapped();
@@ -4748,8 +4780,9 @@ mod tests {
         assert!(lb.path().is_some_and(|p| same(p, a4)), "{:?}", lb.path());
         assert_eq!(atha.stats().ring6.pushed, 0, "A の IPv6 のソケットに届いた");
         assert!(atha.stats().ring.pushed > 0 && bth.stats().ring.pushed > 0);
-        // B の v6 宛ての送りは誤りに数えられ、A 側に誤りは無い。宛先は `[::1]`（世界に通じるアドレスではない）なので `kind_of` は IPv6 の欄
-        // ではなく別の欄（添字 0）へ入れる。欄の合計が送りの誤りの数と一致するかを見る。
+        // Bのv6宛ての送信は誤りに数えられ、A側に誤りは無い。
+        // 宛先は`[::1]`（世界に通じるアドレスではない）なので、`kind_of`はIPv6のフィールドではなく別のフィールド（添字0）へ入れる。
+        // フィールドの合計が送信の誤りの数と一致するかを見る。
         let errs = bn.send_counts().1;
         assert!(errs > 0, "B の送りの誤りが数えられていない");
         assert_eq!(
@@ -4781,6 +4814,7 @@ mod pong_gate_tests {
             recv_errors: AtomicU32::new(0),
             pong: PongSlot::default(),
             delay: AtomicU64::new(NO_SNAPSHOT),
+            host_uplink: AtomicU32::new(0),
             spectate: SpectateSlot::default(),
             watch: WatchRxSlot::default(),
             scope,
@@ -4812,7 +4846,7 @@ mod pong_gate_tests {
         s.pong.beat.store(now_ms(s).max(1), Ordering::Release);
     }
 
-    /// 口の向きの鍵。相手役は入れ替えた鍵で封じる。
+    /// 向きごとの鍵。相手役は入れ替えた鍵で封じる。
     fn test_dir() -> higanr_core::seal::DirKeys {
         higanr_core::seal::DirKeys::from_raw([0x33; 32], [0x34; 32])
     }
@@ -4831,7 +4865,7 @@ mod pong_gate_tests {
         buf[..n].to_vec()
     }
 
-    /// (sent, refused, send_errors) と `answer_ping` の戻り値。
+    /// (sent, refused, send_errors)と`answer_ping`の戻り値。
     fn answer(scope: Scope, path: SocketAddr) -> (bool, u32, u32, u32) {
         let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         let s = shared(scope);
@@ -4866,7 +4900,7 @@ mod pong_gate_tests {
         }
     }
 
-    /// 通る宛先（VPN のネットワークの中）へは外へ出るため送らないので、断る側だけ数える。
+    /// 通る宛先（VPNのネットワークの中）へは外へ出るため送らないので、断る側だけ数える。
     #[test]
     fn the_receive_thread_gate_refuses_outside_a_widened_lan_scope() {
         let radmin =
@@ -4889,7 +4923,7 @@ mod pong_gate_tests {
         );
     }
 
-    /// 相手役の受け（口の向きの逆の鍵で開く）。
+    /// 相手役の受信（向きを逆にした鍵で開く）。
     fn read_at_peer(dest: &UdpSocket) -> Option<Message> {
         let mut buf = [0u8; 2048];
         let (n, _) = dest.recv_from(&mut buf).ok()?;
@@ -4942,7 +4976,7 @@ mod pong_gate_tests {
         install(&s, path);
         let mut cache = (0, None);
         let mut done = false;
-        // 立てる前は何も出さない（下の BYE がいつも出る形でないことの隣）。
+        // 立てる前は何も出さない（下のBYEがいつも出る形でないことの隣）。
         bye_once(&sock, &s, &mut cache, &mut done);
         assert!(!done);
         assert_eq!(read_at_peer(&dest), None);
@@ -4950,7 +4984,7 @@ mod pong_gate_tests {
         s.pong
             .bye
             .store(bye_code(ByeReason::Cancelled), Ordering::Release);
-        // 心拍が古くても BYE は返す（止まった後こそ返す）。
+        // 心拍が古くてもBYEは返す（止まった後こそ返す）。
         s.pong.beat.store(0, Ordering::Release);
         assert!(answer_ping(&sock, &s, &mut cache, path, &ping()));
         assert_eq!(
@@ -4998,7 +5032,7 @@ mod pong_gate_tests {
             "最初の理由で出ない"
         );
         assert!(!th.shared.pong.on.load(Ordering::Acquire));
-        // 数えは送った後に足すので、相手が受けた直後はまだ 0 のことがある。
+        // カウントは送った後に足すので、相手が受けた直後はまだ0のことがある。
         let t = std::time::Instant::now();
         while th.stats().byes_sent == 0 && t.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(5));
@@ -5007,7 +5041,7 @@ mod pong_gate_tests {
     }
 }
 
-/// 開くときの UPnP と回線の型の印（`upnp_begin` / `nat_settle`）。偽のルーターは 2 つの返事（記述・SOAP）を作文で返すだけ。
+/// 開くときのUPnPとネットワーク種別のフラグ（`upnp_begin` / `nat_settle`）。偽のルーターは2つの返答（記述・SOAP）を決まった文面で返すだけ。
 #[cfg(test)]
 pub(crate) mod nat_tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -5028,12 +5062,12 @@ pub(crate) mod nat_tests {
     /// 偽のルーター。数えるものは持ち手（`Arc`）で検査の側へ見せる。
     pub(crate) struct Quick {
         mode: Mode,
-        /// GetExternalIPAddress の答え（None は断る）。
+        /// GetExternalIPAddressの答え（Noneは断る）。
         outer: Option<Ipv4Addr>,
         adds: Arc<AtomicU32>,
         deletes: Arc<AtomicU32>,
         ports: Arc<Mutex<Vec<u16>>>,
-        /// 立っている間は探索の答えを返さない（結果が出る時刻を検査が決める。最長 10 秒）。
+        /// 立っている間は探索の答えを返さない（結果が出る時刻を検査が決める。最長10秒）。
         hold: Option<Arc<AtomicBool>>,
     }
 
@@ -5114,10 +5148,10 @@ pub(crate) mod nat_tests {
         ports: Arc<Mutex<Vec<u16>>>,
     }
 
-    /// 偽のルーターの外側のアドレス（STUN にも同じアドレスが見えている普通の家）。
+    /// 偽のルーターの外側のアドレス（STUNにも同じアドレスが見えている普通の家）。
     pub(crate) const PUBLIC: Ipv4Addr = Ipv4Addr::new(8, 8, 4, 4);
 
-    /// STUN の 1 か所目で見えたアドレス（ポートはルーターが付け替えた値）。
+    /// STUNの1か所目で見えたアドレス（ポートはルーターが付け替えた値）。
     fn stun_seen(ip: &str) -> Option<SocketAddr> {
         Some(SocketAddr::new(ip.parse().unwrap(), 50_000))
     }
@@ -5145,7 +5179,7 @@ pub(crate) mod nat_tests {
         )
     }
 
-    /// `quick_outer` の、`hold` が下りるまで答えない形。
+    /// `quick_outer`の、`hold`が下りるまで答えない形。
     pub(crate) fn held(
         mode: Mode,
         outer: Option<Ipv4Addr>,
@@ -5263,11 +5297,11 @@ pub(crate) mod nat_tests {
     #[test]
     fn the_mark_and_the_candidate_come_from_the_same_outer_address_check() {
         use upnp::State::{Mapped, OuterBehind, OuterUnchecked};
-        // (ルーターの外側のアドレス, STUN で見えたアドレス, 使うか, 最後の状態)
+        // (ルーターの外側のアドレス, STUNで見えたアドレス, 使うか, 最後の状態)
         let cases = [
             (Some("8.8.4.4"), Some("8.8.4.4:50000"), true, Mapped),
             (Some("8.8.8.8"), Some("8.8.4.4:50000"), false, OuterBehind),
-            // 同じでも私設・事業者の中のアドレスは、さらに外側に NAT がある。
+            // 同じでも私設・事業者の中のアドレスはさらに外側にNATがある。
             (
                 Some("192.168.1.2"),
                 Some("192.168.1.2:50000"),
@@ -5309,7 +5343,7 @@ pub(crate) mod nat_tests {
             assert_eq!(nat.mark.upnp, used, "{why}");
             let mut net = net;
             assert_eq!(net.own_nat().upnp, used, "{why}");
-            // 印が真のときだけ、割り当てたポートの候補が自分のコードに載る。
+            // フラグが真のときだけ割り当てたポートの候補が自分のコードに載る。
             let local = SocketAddr::from(([192, 168, 0, 7], 47_001));
             let cands = s
                 .candidates_for_upnp(local, mapped, None, nat.upnp_port)
@@ -5325,7 +5359,7 @@ pub(crate) mod nat_tests {
             }
             let stats = th.stop();
             assert_eq!(stats.diag.upnp.state, state, "{why}");
-            // 使わない割り当ても、足したものはネットワークを閉じるまでに消える。
+            // 使わない割り当ても追加したものはネットワークを閉じるまでに消える。
             assert_eq!(c.deletes.load(Ordering::Relaxed), 1, "{why}");
             assert_eq!(stats.diag.upnp.release, upnp::Release::Done, "{why}");
         }
@@ -5339,14 +5373,14 @@ pub(crate) mod nat_tests {
         assert!(!upnp_begin(&settings(""), &net, &mut note));
         assert_eq!(note, "");
         assert!(net.upnp_outcome(Duration::from_millis(1)).is_none());
-        // scope = internet でも、ソケットが loopback（家の中のアドレスでない）なら頼まない。
+        // scope = internet でもソケットがloopback（家の中のアドレスでない）なら頼まない。
         assert!(!upnp_begin(
             &settings("scope = internet\n"),
             &net,
             &mut note
         ));
         assert!(note.contains("家の中"), "{note}");
-        // ini の upnp = off。
+        // iniの upnp = off。
         let mut note = String::new();
         assert!(!upnp_begin(
             &settings("scope = internet\nupnp = off\n"),
@@ -5354,7 +5388,7 @@ pub(crate) mod nat_tests {
             &mut note
         ));
         assert!(note.contains("upnp = off"), "{note}");
-        // 頼まなかった実行の印: UPnP なし・型は不明。
+        // 頼まなかった実行のフラグ: UPnPなし・ネットワーク種別は不明。
         let nat = nat_settle(&settings(""), &net, None, &mut String::new());
         assert_eq!(nat, OwnNat::default());
         assert_eq!(th.stop().diag.upnp.state, upnp::State::NotTried);
@@ -5386,7 +5420,7 @@ pub(crate) mod nat_tests {
         assert_eq!(nat.mark.symmetry, Symmetry::Yes);
         assert!(note.contains("結果が出た"), "{note}");
         flip.join().unwrap();
-        // 出ないまま: 上限で進む。型は不明。待った時間が本ログに出る。
+        // 出ないまま: 上限で進む。ネットワーク種別は不明。待った時間が本ログに出る。
         net.shared
             .diag
             .second

@@ -1,12 +1,14 @@
-//! 合成の最小の PE32（見出しだけ）を作る。`cargo test` の偽物のファイルと、自己検査（`selftest.rs`）の行 8（`pe::parse` は通るが
-//! Windows のローダーは読めない DLL で `LoadLibraryW` に 0 を返させる）に使う。`pe::parse` が読む範囲だけ正しく書き、残りは 0。
+//! 合成の最小のPE32（ヘッダだけ）を作る。
+//! `cargo test`の偽のファイルと、自己検査（`selftest.rs`）の行8に使う。
+//! その検査では`pe::parse`を通るがWindowsのローダーが読めないDLLを使い、`LoadLibraryW`に0を返させる。
+//! `pe::parse`が読む範囲だけ正しく書き、残りは0。
 
 const E_LFANEW: usize = 0x40;
 const FILE_HEADER: usize = E_LFANEW + 4;
 const OPTIONAL_HEADER: usize = FILE_HEADER + 20;
 const SIZE_OF_OPTIONAL_HEADER: usize = 0xE0;
 const SECTION_TABLE: usize = OPTIONAL_HEADER + SIZE_OF_OPTIONAL_HEADER;
-/// `.text` の中身を入れるファイル上の位置。
+/// `.text`の中身を入れるファイル上の位置。
 const TEXT_FILE_OFFSET: usize = 0x200;
 const TEXT_RVA: u32 = 0x1000;
 
@@ -18,7 +20,7 @@ fn put_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// 入口は `.text` の先頭。`text_size_of_raw_data` は見出しに書くだけでファイルの長さは合わせない。`entry.len()` 以上を渡すこと。
+/// 入口は`.text`の先頭。`text_size_of_raw_data`はヘッダに書くだけでファイルの長さは合わせない。`entry.len()`以上を渡すこと。
 pub fn pe32(time_date_stamp: u32, text_size_of_raw_data: u32, entry: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; TEXT_FILE_OFFSET + entry.len().max(0x10)];
     buf[0..2].copy_from_slice(b"MZ");
@@ -29,7 +31,7 @@ pub fn pe32(time_date_stamp: u32, text_size_of_raw_data: u32, entry: &[u8]) -> V
     put_u16(&mut buf, FILE_HEADER + 2, 1); // 節の数
     put_u32(&mut buf, FILE_HEADER + 4, time_date_stamp);
     put_u16(&mut buf, FILE_HEADER + 16, SIZE_OF_OPTIONAL_HEADER as u16);
-    // Characteristics: EXECUTABLE_IMAGE | 32BIT_MACHINE | DLL。DLL の見た目にしておく。
+    // Characteristics: EXECUTABLE_IMAGE | 32BIT_MACHINE | DLL。DLLの見た目にしておく。
     put_u16(&mut buf, FILE_HEADER + 18, 0x2102);
 
     put_u16(&mut buf, OPTIONAL_HEADER, 0x10B); // PE32

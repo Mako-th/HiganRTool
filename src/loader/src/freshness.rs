@@ -1,17 +1,17 @@
-//! 開発の形で、`build\bin\` の成果物がソースより古ければ起動を断る（建て直さずに古い DLL で実機を起動する取り違えを止める）。
-//! 開発の形 = この exe が `<R>\build\bin\` にあり、`<R>\Cargo.toml` と `<R>\src\` があるとき。配る形では何も調べない。
-//! 比べるソースは cargo が成果物の隣に書く dep-info（`<出力>.d`）から取り、相手は成果物の更新時刻とする。
-//! dep-info が無い・読めない・崩れているときは**断る**（通すと「ソース 0 本 ⇒ 新しいものは無い」で合格し、ガードが効かなくなる）。
-//! 抜け道の引数は作らない。古い成果物で起動したいときは `build\bin\` の外へコピーする。
+//! 開発の形で`build\bin\`の成果物がソースより古ければ起動を断る（建て直さずに古いDLLで実機を起動する取り違えを止める）。
+//! 開発の形 = このexeが`<R>\build\bin\`にあり、`<R>\Cargo.toml`と`<R>\src\`があるとき。配布する形では何も調べない。
+//! 比べるソースはcargoが成果物の隣に書くdep-info（`<出力>.d`）から取り、相手は成果物の更新時刻とする。
+//! dep-infoが無い・読めない・崩れているときは**断る**（通すと「ソース0本 ⇒ 新しいものは無い」で合格し、ガードが効かなくなる）。
+//! 抜け道の引数は作らない。古い成果物で起動したいときは`build\bin\`の外へコピーする。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// `<R>` から release の出力まで（`.cargo\config.toml` の target と build.bat の `RELDIR` に合わせる）。
+/// `<R>`からreleaseの出力まで（`.cargo\config.toml`のtargetとbuild.batの`RELDIR`に合わせる）。
 const RELEASE_DIR: [&str; 3] = ["target", "i686-pc-windows-msvc", "release"];
-/// DLL の dep-info（`[lib] name = "higanrtool"` による）。
+/// DLLのdep-info（`[lib] name = "higanrtool"`による）。
 const DLL_DEP_INFO: &str = "higanrtool.d";
-/// ローダーの dep-info（`[[bin]] name = "higanrtool_loader"` による）。
+/// ローダーのdep-info（`[[bin]] name = "higanrtool_loader"`による）。
 const LOADER_DEP_INFO: &str = "higanrtool_loader.d";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,11 +23,11 @@ pub(crate) enum Verdict {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Stale {
-    /// dep-info が無い・読めない・形が崩れている。
+    /// dep-infoが無い・読めない・形が崩れている。
     DepInfo { path: PathBuf, why: String },
     /// 比べる相手の成果物の時刻が読めない。
     Artifact { path: PathBuf, why: String },
-    /// dep-info に載っているソースが成果物より新しい。
+    /// dep-infoに載っているソースが成果物より新しい。
     Source {
         artifact: PathBuf,
         artifact_time: SystemTime,
@@ -37,7 +37,7 @@ pub(crate) enum Stale {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Violation {
-    /// cargo も作り直すので、新しいのと同じに扱う。
+    /// cargoも作り直すので新しいのと同じに扱う。
     Missing(PathBuf),
     Newer(PathBuf, SystemTime),
 }
@@ -49,7 +49,7 @@ pub(crate) enum DepInfoError {
     NoTarget(usize),
 }
 
-/// `<R>\build\bin\<exe>` の形でなければ `None`。大文字小文字は区別しない。
+/// `<R>\build\bin\<exe>`の形でなければ`None`。大文字小文字は区別しない。
 fn root_of(exe: &Path) -> Option<&Path> {
     let bin = exe.parent()?;
     let build = bin.parent()?;
@@ -65,8 +65,8 @@ fn root_of(exe: &Path) -> Option<&Path> {
     }
 }
 
-/// dep-info（Makefile の規則の形）を読み、全部の規則の入力を返す。続き行・複数の規則・`#` 行・CRLF を読む。
-/// パスの空白は `\ `、ドライブ文字の `C:\` は区切りにならない。
+/// dep-info（Makefileの規則の形）を読み、全部の規則の入力を返す。続き行・複数の規則・`#`行・CRLFを読む。
+/// パスの空白は`\ `、ドライブ文字の`C:\`は区切りにならない。
 pub(crate) fn parse_dep_info(text: &str) -> Result<Vec<PathBuf>, DepInfoError> {
     let mut deps = Vec::new();
     let mut rules = 0usize;
@@ -137,7 +137,7 @@ fn split_words(line: &str) -> Vec<String> {
     words
 }
 
-/// 建て直しが要る理由を 1 つ返す。時刻が読めないソースを先に、次に成果物より真に新しいもののうちいちばん新しいもの（同じ時刻は通す）。
+/// 建て直しが要る理由を1つ返す。時刻が読めないソースがあればそれを先に返す。無ければ成果物より真に新しいもののうちいちばん新しいものを返す（同じ時刻は通す）。
 pub(crate) fn newest_violation(
     artifact: SystemTime,
     sources: &[(PathBuf, Option<SystemTime>)],
@@ -193,7 +193,7 @@ fn check_one(root: &Path, artifact: &Path, dep_info: &Path) -> Result<(), Stale>
         path: artifact.to_path_buf(),
         why: e.to_string(),
     })?;
-    // 相対パスは `<R>` 基準に直す（`build.dep-info-basedir` を指定したときの形）。
+    // 相対パスは`<R>`基準に直す（`build.dep-info-basedir`を指定したときの形）。
     let sources: Vec<(PathBuf, Option<SystemTime>)> = deps
         .into_iter()
         .map(|p| if p.is_absolute() { p } else { root.join(p) })
@@ -252,7 +252,7 @@ pub(crate) fn describe(s: &Stale) -> String {
     }
 }
 
-/// UTC のまま出す（時差を引くには Win32 が要り、比べるのは同じ時計なので読み違えない）。
+/// UTCのまま出す（時差を引くにはWin32が要り、比べるのは同じ時計なので読み違えない）。
 fn fmt_utc(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)
@@ -446,7 +446,7 @@ mod tests {
             }
             tree.file("build/bin/HiganRTool.dll", 100);
             tree.file("build/bin/HiganRTool.exe", 100);
-            // dep-info: DLL は core と dll の lib.rs、ローダーは core と loader（peer_sim はどちらにも載らない）。
+            // dep-info: DLLはcoreとdllのlib.rs、ローダーはcoreとloader（peer_simはどちらにも載らない）。
             tree.dep_info(
                 DLL_DEP_INFO,
                 "higanrtool.dll",
@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(newer_paths(&tree.verdict()).len(), 1);
         tree.touch("build/bin/HiganRTool.dll", 250);
         assert_eq!(tree.verdict(), Verdict::Fresh);
-        // `#[cfg(test)]` の中だけを直しても cargo は DLL を作り直さないが、それでも通る。
+        // `#[cfg(test)]`の中だけを直してもcargoはDLLを作り直さないが、それでも通る。
         tree.touch("src/dll/src/netplay/tests.rs", 300);
         assert_eq!(tree.verdict(), Verdict::Fresh);
     }
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     #[ignore = "build.bat の後に手で回す（build\\bin の実物を読む）"]
     fn built_build_bin_is_fresh() {
-        // `absolute` は `..` を畳む（`canonicalize` と違い `\\?\` を付けない）。
+        // `absolute`は`..`を畳む（`canonicalize`と違い`\\?\`を付けない）。
         let root =
             std::path::absolute(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
         let bin = root.join("build").join("bin");

@@ -1,4 +1,4 @@
-//! 起動の引数。外部のクレートを入れず、手で読む（引数は十数個で、形も単純なため）。
+//! 起動の引数。外部のクレートを使わず手で読む（引数は十数個で形も単純なため）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -179,33 +179,34 @@ peer_sim —— 偽の対戦相手（HiganRTool のプロトコルだけを話�
 pub struct Cli {
     pub bind: SocketAddr,
     pub sim: SimConfig,
-    /// 選択の台本のファイル（`--menu`。読むのは exe の `main.rs`）。
+    /// 選択の台本のファイル（`--menu`。読むのはexeの`main.rs`）。
     pub menu: Option<PathBuf>,
     pub log_dir: Option<PathBuf>,
-    /// 1 秒のフレーム数（`--fps`）。
+    /// 1秒のフレーム数（`--fps`）。
     pub fps: u64,
-    /// 接続の手順を作り直して待ち続ける長さ（ms。`--wait-sec` × 1000）。None なら `Link::set_retry_window` を呼ばない
-    /// （10 秒の時間切れでやめる）。
+    /// 接続の手順を作り直して待ち続ける長さ（ms。`--wait-sec` × 1000）。Noneなら`Link::set_retry_window`を呼ばない
+    /// （10秒の時間切れでやめる）。
     pub wait_ms: Option<u32>,
     pub scope: Scope,
-    /// 観戦のポート（`--spectate-host`。読んで開くのは exe の `main.rs`）。
+    /// 観戦のポート（`--spectate-host`。読んで開くのはexeの`main.rs`）。
     pub spectate: Option<SpectateCli>,
-    /// 望むモードと D（`--mode` / `--rb-delay`）。
+    /// 望むモードとD（`--mode` / `--rb-delay`）。
     pub mode: ModeWish,
-    /// rollback に決まったときの R（`--rb-ahead`）。
+    /// rollbackに決まったときのR（`--rb-ahead`）。
     pub ahead: u8,
-    /// rollback に決まったときの時刻合わせ（`--rb-sync on|off`）。
+    /// rollbackに決まったときの時刻合わせ（`--rb-sync on|off`）。
     pub time_sync: bool,
 }
 
-/// `--spectate-host` の値（観戦者を受けるポートと、観戦用のコードの session・秘密・配る側の鍵の種）。
+/// `--spectate-host`の値（観戦者を受けるポートと、観戦用のコードのsession・秘密の乱数・配信側の鍵の種）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpectateCli {
     pub bind: SocketAddr,
     pub session_id: u32,
     pub secret: Secret,
-    /// 配る側の使い捨ての鍵の種。`parse` は走るたびの新しい種を入れる（`--spectate-fixed-key` のときだけ
-    /// `keys::spectate_host_seed`）。観戦用のコードの公開鍵はこの種の公開鍵。
+    /// 配信側の使い捨ての鍵の種。
+    /// `parse`は走るたびに新しい種を設定する（`--spectate-fixed-key`のときだけ`keys::spectate_host_seed`）。
+    /// 観戦用のコードの公開鍵はこの種の公開鍵。
     pub key_seed: KeySeed,
 }
 
@@ -238,41 +239,43 @@ pub enum Parsed {
     /// `--compare-spectate WATCH_CSV PLAYER [EVENTS_CSV]`（観戦者の列と対戦する2人の列の突き合わせ）。
     CompareSpectate(PathBuf, PathBuf, Option<PathBuf>),
     Help,
-    /// `--compare DLL_CSV PEER_LOG`（走らせずに 2 つの記録を突き合わせる）。
+    /// `--compare DLL_CSV PEER_LOG`（走らせずに2つの記録を突き合わせる）。
     Compare(PathBuf, PathBuf),
-    /// `--compare2 A_CSV B_CSV`（2 台の dll の記録どうしを突き合わせる）。
+    /// `--compare2 A_CSV B_CSV`（2台のdllの記録どうしを突き合わせる）。
     Compare2(PathBuf, PathBuf),
-    /// `--stun-probe A B`（2 か所の STUN へ 1 つの受信ソケットから問い合わせて見え方を比べる）。
+    /// `--stun-probe A B`（2か所のSTUNへ1つの受信ソケットから問い合わせて見え方を比べる）。
     StunProbe(Box<stun_probe::Args>),
-    /// `--stun-fake ADDR`（偽の STUN の応答役を起動して待つ。LAN の回）。
+    /// `--stun-fake ADDR`（偽のSTUNの応答役を起動して待つ。LANの検証で使う）。
     StunFake(Box<stun_fake::Args>),
-    /// `--shape ...`（遅延とロスを揺らす UDP の中継）。
+    /// `--shape ...`（遅延とロスを揺らすUDPの中継）。
     Shape(Box<shape::Args>),
 }
 
-/// 付いていく形の既定の打ち切り（ms。30 分）。
+/// 付いていく形の既定の打ち切り（ms。30分）。
 pub const FOLLOW_MAX_MS: u64 = 30 * 60 * 1_000;
 
-/// `--wait-sec` の上限（秒。1 時間）。dll が待つ 30 分（`netplay::HANDSHAKE_RETRY_MS` = 接続コードの期限）より長く取れるので、
-/// dll の側を何度起動し直しても peer_sim の側が先に諦めずに済む。下限 1 は、0 を「待たない」と読ませず断るため。
+/// `--wait-sec`の上限（秒。1時間）。
+/// dllが待つ30分（`netplay::HANDSHAKE_RETRY_MS` = 接続コードの期限）より長く取れる。そのためdllの側を何度起動し直してもpeer_simの側が先に諦めずに済む。
+/// 下限1は、0を「待たない」と読ませず断るため。
 pub const MAX_WAIT_SEC: u32 = 3_600;
 
-/// 既定の session_id（`"HGRT"` のリトルエンディアン。両者が引数を省いたときに同じ値になればよい）。
+/// 既定のsession_id（`"HGRT"`のリトルエンディアン。両者が引数を省いたときに同じ値になればよい）。
 pub const DEFAULT_SESSION: u32 = 0x4847_5254;
 
-/// 既定の秘密（`"peer_sim default"` の 16 B。両者が引数を省いたときに同じ値になればよい。秘密として守る値ではない —— 本物の秘密は
-/// 接続を始める側の dll が OS の乱数で引く）。
+/// 既定の秘密の乱数（`"peer_sim default"`の16 B）。両者が引数を省いたときに同じ値になればよい。
+/// 秘密として守る値ではない。本物の秘密の乱数は接続を始める側のdllがOSの乱数で生成する。
 pub const DEFAULT_SECRET: Secret = Secret(*b"peer_sim default");
 
-/// 観戦用のコードの既定の session_id（`"SPEC"` の ASCII。対戦の `DEFAULT_SESSION` と別の値にする。同じ値だと観戦者が対戦の鍵を
-/// 作れてしまう）。検査の既定で、本物の値は dll が引く。
+/// 観戦用のコードの既定のsession_id（`"SPEC"`のASCII）。
+/// 対戦の`DEFAULT_SESSION`と別の値にする。同じ値だと観戦者が対戦の鍵を作れてしまう。
+/// 検査の既定。本物の値はdllが生成する。
 pub const DEFAULT_SPECTATE_SESSION: u32 = 0x5350_4543;
 
-/// 観戦用のコードの既定の秘密（`"peer_sim watcher"` の 16 B。`DEFAULT_SECRET` と別の値。守る値ではない）。
+/// 観戦用のコードの既定の秘密の乱数（`"peer_sim watcher"`の16 B。`DEFAULT_SECRET`と別の値。守る値ではない）。
 pub const DEFAULT_SPECTATE_SECRET: Secret = Secret(*b"peer_sim watcher");
 
-/// 観戦者の既定の「ホストが黙った」の長さ（ms）。ホストの合図の間隔（`spectate::HEARTBEAT_MS` = 1 秒）の 10 回ぶん
-/// （ホストが観戦者を外す `SILENT_MS` と同じ）。
+/// 観戦者の既定の「ホストが黙った」の長さ（ms）。
+/// ホストの生存確認（ping）の間隔（`spectate::HEARTBEAT_MS` = 1秒）の10回ぶんで、ホストが観戦者を外す`SILENT_MS`と同じ。
 pub const DEFAULT_SILENT_END_MS: u32 = 10_000;
 
 pub const DEFAULT_WATCH_MAX_MS: u32 = 30 * 60 * 1_000;
@@ -320,8 +323,9 @@ fn lat_step(s: &str) -> Result<LatStep, String> {
     })
 }
 
-/// 引数（プログラム名を除く）を読む。宛先と受信ソケットがネットワークの範囲（`--scope`）の外なら、ここで断る。`--code` の有効期限は
-/// 今の時刻（UNIX 秒）で見る。
+/// 引数（プログラム名を除く）を読む。
+/// 宛先と受信ソケットがネットワークの範囲（`--scope`）の外ならここで断る。
+/// `--code`の有効期限は今の時刻（UNIX秒）で見る。
 pub fn parse(args: &[String], default_nonce: u64) -> Result<Parsed, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -337,7 +341,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
     let mut secret = DEFAULT_SECRET;
     let mut code: Option<String> = None;
     let mut stun = None;
-    // --code と一緒に使えない引数を見たか。
+    // --codeと一緒に使えない引数を見たか。
     let mut explicit_link = false;
     let mut role_nonce = default_nonce;
     let mut latency: u8 = 2;
@@ -534,9 +538,9 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
             "--delay" => fault.delay_pct = pct(v, k)?,
             "--dup" => fault.dup_pct = pct(v, k)?,
             "--delay-max" => fault.delay_max_ms = num_in(v, k)?,
-            // 範囲は `fault.validate()` が見る（上限 `fault::MAX_ONE_WAY_MS`）。
+            // 範囲は`fault.validate()`が見る（上限`fault::MAX_ONE_WAY_MS`）。
             "--one-way-ms" => fault.one_way_ms = num_in(v, k)?,
-            // 範囲は `fault.validate()` が見る（上限 `fault::MAX_JITTER_MS`）。
+            // 範囲は`fault.validate()`が見る（上限`fault::MAX_JITTER_MS`）。
             "--jitter-ms" => fault.jitter_ms = num_in(v, k)?,
             "--jitter-shape" => {
                 fault.jitter_shape = fault::JitterShape::parse(v).ok_or_else(|| {
@@ -548,7 +552,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
                 sim::check_fps(fps).map_err(|e| format!("--fps: {e}"))?;
             }
             "--fault-seed" => fault.seed = num(v, k)?,
-            // 今のバージョンと同じ数は `fault.validate()` が断る。
+            // 今のバージョンと同じ数は`fault.validate()`が断る。
             "--proto-ver" => fault.claim_ver = Some(num_in(v, k)?),
             "--drop-every" => fault.drop_every = num_in(v, k)?,
             "--drop-run" => fault.drop_run = num_in(v, k)?,
@@ -607,7 +611,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
             }
             let sid = spectate_session.unwrap_or(DEFAULT_SPECTATE_SESSION);
             let ssec = spectate_secret.unwrap_or(DEFAULT_SPECTATE_SECRET);
-            // 対戦と同じ session・秘密だと、観戦者が対戦の鍵を作れてしまう（`spectate::HostConfig`）。
+            // 対戦と同じsession・秘密の乱数だと観戦者が対戦の鍵を作れてしまう（`spectate::HostConfig`）。
             if sid == session_id || ssec == secret {
                 return Err(
                     "観戦用の session・秘密が対戦のものと同じ（別の値にする。同じだと観戦者が対戦の鍵を作れる）"
@@ -618,7 +622,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
                 bind: sb,
                 session_id: sid,
                 secret: ssec,
-                // 既定は走るたびに新しい種（起動し直しで同じ鍵・番号 0 から数え直しにならない）。固定は明示したときだけ。
+                // 既定は走るたびに新しい種（起動し直しで同じ鍵・番号0から数え直しにならない）。固定は明示したときだけ。
                 key_seed: if spectate_fixed_key {
                     crate::keys::spectate_host_seed(&ssec, sid)
                 } else {
@@ -642,7 +646,7 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
     if segs == 0 || frames == 0 {
         return Err("--segs と --frames は 1 以上".to_string());
     }
-    // rollback の引数は、書いたつもりで効かない形を断る（`sim::run_opts` も同じ組を断る）。
+    // rollbackの引数は書いたつもりで効かない形を断る（`sim::run_opts`も同じ組み合わせを断る）。
     let mode_wish = match mode {
         Mode::Rollback => {
             if !lat_script.is_empty() {
@@ -663,9 +667,9 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
             ModeWish::DELAY
         }
     };
-    // 既定の打ち切り: マッチのフレームの 3 倍の時間 ＋ 60 秒（接続・読み込み・終わりの待ちの分）。
-    // 付いていく形はマッチの長さが分からないので `FOLLOW_MAX_MS`。マッチの時間はペース（`--fps`）で決まる。
-    // `--wait-sec` を書いたら、既定にはその分を足す（接続できるのが待つ長さの終わり近くでも、マッチの分が残るように）。
+    // 既定の打ち切りはマッチのフレームの3倍の時間 ＋ 60秒（接続・読み込み・終わりの待ちの分）。
+    // マッチの時間はペース（`--fps`）で決まる。付いていく形はマッチの長さが分からないので`FOLLOW_MAX_MS`。
+    // `--wait-sec`を書いたら既定にその分を足す。接続できるのが待つ長さの終わり近くでも、マッチの分が残るようにするため。
     let play_ms = u64::from(segs) * u64::from(frames) * 1_000 / fps;
     let wait_ms = wait_sec.map(|w| u64::from(w) * 1_000);
     let max_ms = match max_sec {
@@ -673,8 +677,9 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
         None if follow => FOLLOW_MAX_MS + wait_ms.unwrap_or(0),
         None => play_ms * 3 + 60_000 + wait_ms.unwrap_or(0),
     };
-    // 待つ長さが打ち切りより長ければ断る。黙って打ち切りで切ると、「長く待つ」つもりの回が 10 秒で手で合わせ損ねた
-    // 回と同じ「打ち切り」の終わり方になり、どちらの引数が効いたのかが記録から分からないため。
+    // 待つ長さが打ち切りより長ければ断る。
+    // 黙って打ち切りで切ると、「長く待つ」つもりの実行が、10秒で手で合わせ損ねた実行と同じ「打ち切り」の終わり方になる。
+    // そうするとどちらの引数が効いたのかが記録から分からなくなるため。
     if let (Some(w), Some(m)) = (wait_sec, max_sec)
         && w > m
     {
@@ -718,8 +723,8 @@ pub fn parse_at(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Pa
     })))
 }
 
-/// 観戦用の接続コードを書く（`--spectate-host` を開いたとき、起動時に 1 行出す）。候補は観戦のポートのアドレス 1 つ、有効期限は
-/// 接続コードの既定（`code::DEFAULT_TTL_SECS`）。
+/// 観戦用の接続コードを書く（`--spectate-host`を開いたとき起動時に1行出す）。
+/// 候補は観戦のポートのアドレス1つ。有効期限は接続コードの既定（`code::DEFAULT_TTL_SECS`）。
 pub fn spectate_code(s: &SpectateCli, name: &str, now_unix: u64) -> Result<String, String> {
     let candidates = Candidates::from_addrs(&[s.bind])
         .map_err(|e| format!("観戦の受信ソケット {} を候補にできない: {e:?}", s.bind))?;
@@ -733,7 +738,7 @@ pub fn spectate_code(s: &SpectateCli, name: &str, now_unix: u64) -> Result<Strin
             candidates,
             expires: now_unix.saturating_add(code::DEFAULT_TTL_SECS),
         },
-        // 観戦の配る側の公開鍵（`s.key_seed` の公開鍵 —— 配る側のセッションが使う秘密鍵と対）。
+        // 観戦の配信側の公開鍵（`s.key_seed`の公開鍵。配信側のセッションが使う秘密鍵とペアになる）。
         &Ephemeral::from_seed(&s.key_seed).public(),
     )
     .map_err(|e| format!("観戦用の接続コードを書けない: {e:?}"))
@@ -753,7 +758,7 @@ fn parse_watch(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Par
     let mut silent_ms: u32 = DEFAULT_SILENT_END_MS;
     let mut max_ms: u32 = DEFAULT_WATCH_MAX_MS;
     let mut log_dir = None;
-    // --code と一緒に使えない引数を見たか。
+    // --codeと一緒に使えない引数を見たか。
     let mut explicit_link = false;
     let mut it = args.iter();
     while let Some(k) = it.next() {
@@ -824,7 +829,7 @@ fn parse_watch(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Par
         if explicit_link {
             return Err("--code は --peer・--session・--secret と一緒に使わない".to_string());
         }
-        // 観戦用のコードだけを読む（対戦用のコードは `WrongSide` で断る。取り違えを通さない）。
+        // 観戦用のコードだけを読む（対戦用のコードは`WrongSide`で断る。取り違えを通さない）。
         let s = code::read_spectate(text, now_unix)
             .map_err(|e| format!("--code の観戦用の接続コードが読めない: {e:?}"))?;
         let c = s.code;
@@ -835,8 +840,8 @@ fn parse_watch(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Par
             s.host_public,
         )
     } else {
-        // コードを使わない経路（配る側が `--spectate-fixed-key` の検査）: 配る側と同じ式で公開鍵を作る（`keys::spectate_host_public`）。
-        // 配る側が既定（走るたびの種）だとこの公開鍵は合わず、観戦者が流れを開けない。
+        // コードを使わない経路（配信側が`--spectate-fixed-key`の検査）: 配信側と同じ式で公開鍵を作る（`keys::spectate_host_public`）。
+        // 配信側が既定（走るたびの種）だとこの公開鍵は合わない。そのため観戦者が流れを開けない。
         let session_id = session_id.unwrap_or(DEFAULT_SPECTATE_SESSION);
         let secret = secret.unwrap_or(DEFAULT_SPECTATE_SECRET);
         (
@@ -872,8 +877,9 @@ fn parse_watch(args: &[String], default_nonce: u64, now_unix: u64) -> Result<Par
     })))
 }
 
-/// `--rewrite-spectate-code IN OUT --candidate ADDR [--scope S] [--overwrite]` の形。走らせる引数は受けない（書いたつもりの引数が
-/// 黙って使われないのを避ける）。コードを読む・書く・ガードは `spectate_code::rewrite`、ファイルの読み書きは `main.rs`。
+/// `--rewrite-spectate-code IN OUT --candidate ADDR [--scope S] [--overwrite]`の形。
+/// 走らせる引数は受けない（書いたつもりの引数が黙って使われないのを避ける）。
+/// コードの読み書きとガードは`spectate_code::rewrite`、ファイルの読み書きは`main.rs`が担う。
 fn parse_rewrite(args: &[String]) -> Result<Parsed, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut candidate: Option<SocketAddr> = None;
@@ -931,9 +937,9 @@ fn parse_rewrite(args: &[String]) -> Result<Parsed, String> {
     })))
 }
 
-/// `--stun-probe A B` の形（`--bind` と `--scope internet` だけと一緒に書ける）。外の STUN サーバーへ問い合わせるツールなので、
-/// 範囲を広げたことを引数に書かせ（既定の loopback のままでは動かさない）、走らせる引数（--peer など）は受けない
-/// （書いたつもりの引数が黙って使われないのを避ける）。
+/// `--stun-probe A B`の形（`--bind`と`--scope internet`だけと一緒に書ける）。
+/// 外のSTUNサーバーへ問い合わせるツールなので、範囲を広げたことを引数に書かせる（既定のloopbackのままでは動かさない）。
+/// 走らせる引数（--peerなど）は受けない（書いたつもりの引数が黙って使われないのを避ける）。
 fn parse_stun_probe(args: &[String]) -> Result<Parsed, String> {
     let mut bind = None;
     let mut scope: Option<Scope> = None;
@@ -1001,9 +1007,10 @@ fn parse_stun_probe(args: &[String]) -> Result<Parsed, String> {
     })))
 }
 
-/// `--stun-fake ADDR` の形（`--scope` と `--max-sec` だけと一緒に書ける）。範囲は `--scope lan` と書いたときだけ広がる
-/// （既定の loopback は今までの偽の STUN と同じ）。受信ソケットは範囲のガードを通す（外のアドレス・未指定アドレスは断る）。走らせる引数
-/// （--peer など）は受けない（書いたつもりの引数が黙って使われないのを避ける）。
+/// `--stun-fake ADDR`の形（`--scope`と`--max-sec`だけと一緒に書ける）。
+/// 範囲は`--scope lan`と書いたときだけ広がる（既定のloopbackは今までの偽のSTUNと同じ）。
+/// 受信ソケットは範囲のガードを通す（外のアドレス・未指定アドレスは断る）。
+/// 走らせる引数（--peerなど）は受けない（書いたつもりの引数が黙って使われないのを避ける）。
 fn parse_stun_fake(args: &[String]) -> Result<Parsed, String> {
     let mut bind = None;
     let mut scope: Option<Scope> = None;
@@ -1072,8 +1079,8 @@ const SHAPE_FAULT_KEYS: [&str; 11] = [
     "drop-after",
 ];
 
-/// B→A の乱数の seed を A→B と別の列にするための混ぜ値（`--b2a-fault-seed` を書かなかったとき）。値に意味は無い。
-/// 両方向が同じ seed だと、同じ通番に同じ運命が出て「両方向が同時に落ちる」形に偏るため。
+/// B→Aの乱数のseedをA→Bと別の列にするための混ぜ値（`--b2a-fault-seed`を書かなかったとき）。値に意味は無い。
+/// 両方向が同じseedだと同じ通番に同じ結果が出て「両方向が同時に落ちる」形に偏るため。
 const B2A_SEED_MIX: u64 = 0x5DEE_CE66_D1CE_4E5B;
 
 fn set_fault(cfg: &mut FaultConfig, key: &str, v: &str) -> Result<(), String> {
@@ -1098,8 +1105,9 @@ fn set_fault(cfg: &mut FaultConfig, key: &str, v: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `--shape`（遅延とロスを揺らす中継。`shape`）の形。`--scope` は受けない（loopback だけ）。書いたつもりの引数が
-/// 黙って使われないよう、知らない引数は断る。乱れは書き順に依らず「両方向の指定 → 向きごとの指定」の順に入れる。
+/// `--shape`（遅延とロスを揺らす中継。`shape`）の形。`--scope`は受けない（loopbackだけ）。
+/// 書いたつもりの引数が黙って使われないよう、知らない引数は断る。
+/// 乱れは書き順に依らず「両方向の指定 → 向きごとの指定」の順に適用する。
 fn parse_shape(args: &[String]) -> Result<Parsed, String> {
     let mut a = None;
     let mut b = None;
@@ -1184,7 +1192,7 @@ fn parse_shape(args: &[String]) -> Result<Parsed, String> {
         b2a,
         max_sec: max_sec.unwrap_or(shape::DEFAULT_MAX_SEC),
     };
-    // アドレスのガード（loopback だけ）・重なり・乱れの範囲・秒数は `Args::check` が見る（走らせるときにも見る）。
+    // アドレスのガード（loopbackだけ）・重なり・乱れの範囲・秒数は`Args::check`が見る（走らせるときにも見る）。
     args.check()?;
     Ok(Parsed::Shape(Box::new(args)))
 }
@@ -1883,8 +1891,8 @@ mod tests {
         );
         assert_ne!(s.session_id, c.sim.session_id, "既定が対戦と同じ session");
         assert_ne!(s.secret, c.sim.secret, "既定が対戦と同じ秘密");
-        // 配る側の鍵の種: 既定は起動するたびに違う（同じ秘密・session で起動し直しても鍵が変わる）。固定は明示したときだけで、
-        // そのときは式の種（観戦者が式で公開鍵を作る経路）。
+        // 配信側の鍵の種: 既定は起動するたびに違う（同じ秘密の乱数・sessionで起動し直しても鍵が変わる）。
+        // 固定は明示したときだけ。そのときは式の種（観戦者が式で公開鍵を作る経路）。
         let again = run_of(&format!("{base} --spectate-host 127.0.0.1:7100"))
             .spectate
             .unwrap();
@@ -1941,8 +1949,8 @@ mod tests {
         };
         let text = spectate_code(&s, "host", 1_000).unwrap();
         let sc = code::read_spectate(&text, 1_000).unwrap();
-        // コードの公開鍵は配る側のセッションが使う種（`SpectateCli::key_seed`）の公開鍵と同じ。式で決めた固定の鍵（観戦用の秘密と session から）
-        // とは別 —— 既定は走るたびの種なので、同じ引数で 2 回起動しても公開鍵が違う。
+        // コードの公開鍵は配信側のセッションが使う種（`SpectateCli::key_seed`）の公開鍵と同じ。
+        // 式で決めた固定の鍵（観戦用の秘密の乱数とsessionから作る鍵）とは別。既定は走るたびの種なので、同じ引数で2回起動しても公開鍵が違う。
         assert_eq!(sc.host_public, Ephemeral::from_seed(&s.key_seed).public());
         assert_ne!(
             sc.host_public,

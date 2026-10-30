@@ -1,10 +1,11 @@
-//! 素の花映塚でのリプレイの再生を見張り、各ラウンドの決着の tick の値をログへ 1 行残す（pure。unsafe 無し）。リプレイの印の `rN` と
-//! 突き合わせて、生きた試合どおりに再生できたかを機械で検証するため（ツールは `higanr_core::replay_playcheck`）。
-//! - ゲームのスレッドの判断（`PlayWatch::tick`）: 入力の地点で毎 tick、Match の場面・再生の側（`+0x114` が 0 でない）かを見て、
-//!   生きた試合と同じ `MatchLog` / `read_boundary` で境目の値を積む。再生を出たら（場面を出る・生きた側になる）1 回分を `PlayHandoff` に書く。
+//! 素の花映塚でのリプレイの再生を監視し、各ラウンドの決着のtickの値をログへ1行残す（pure。unsafe無し）。
+//! リプレイの印の`rN`と突き合わせて、生きた試合どおりに再生できたかを機械的に検証するため（ツールは`higanr_core::replay_playcheck`）。
+//! - ゲームのスレッドの判断（`PlayWatch::tick`）: 入力の地点で毎tick、Matchの場面かどうかと再生の側かどうか（`+0x114`が0でない）を見る。
+//!   生きた試合と同じ`MatchLog` / `read_boundary`で境目の値を積む。
+//!   再生を出たとき（場面を出る・生きた側になる）は1回分を`PlayHandoff`に書く。
 //!   確保・ファイル・ロック待ち・パニックしうる添字を持たない。生きた試合とネットワークの経路の状態には触らない。
-//!   1 ラウンドも決着しなかった再生（タイトルのデモなど）と、直前と同じ中身の再生は書かない。
-//! - 受け渡し（`PlayHandoff`。原子変数の小さなリング）: 書き手はゲームのスレッド 1 本、読み手は本ログへ行を頼むスレッド 1 本。
+//!   1ラウンドも決着しなかった再生（タイトルのデモなど）と直前と同じ中身の再生は書かない。
+//! - 受け渡し（`PlayHandoff`。アトミック変数の小さなリング）: 書き手はゲームのスレッド1本、読み手は本ログへ行を頼むスレッド1本。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -16,24 +17,24 @@ use crate::netplay::SCENE_MATCH;
 use crate::replay_save::SaveIo;
 use crate::th09_addr::GAME_MODE_MATCH;
 
-/// 再生した見出しの日付と名前の生のバイト（`+0xC4` / `+0xCE` の各 9 バイト）。行に書ける文字にするのは読み手（`Ident::from_header`）。
+/// 再生したヘッダの日付と名前の生のバイト（`+0xC4` / `+0xCE`の各9バイト）。行に書き込み可能な文字にするのは読み手（`Ident::from_header`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderIdent {
     pub date: [u8; HEADER_FIELD_LEN],
     pub name: [u8; HEADER_FIELD_LEN],
 }
 
-/// 1 回の再生の結果。
+/// 1回の再生の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayReport {
     pub ident: Option<HeaderIdent>,
-    /// 勝ちに要る数に届いた最後のラウンドまで見た（false は途中で抜けた）。
+    /// 勝ちに要る数に届いた最後のラウンドまで見た（falseは途中で抜けた）。
     pub complete: bool,
     pub summary: MatchSummary,
 }
 
 impl PlayReport {
-    /// 本ログへ書く 1 行（`replay_playcheck::format_line`）。確保する。ゲームのスレッドでは呼ばない。
+    /// 本ログへ書く1行（`replay_playcheck::format_line`）。確保する。ゲームのスレッドでは呼ばない。
     pub fn line(&self) -> String {
         let ident = self
             .ident
@@ -47,7 +48,7 @@ impl PlayReport {
     }
 }
 
-/// リングの枠の数。読み手は 100 ms ごとに空にするので、その間に 3 回再生が終わることは無い。溢れたら読み手が数える。
+/// リングの枠の数。読み手は100 msごとに空にするのでその間に3回再生が終わることは無い。溢れたら読み手が数える。
 pub const SLOTS: usize = 4;
 const IDENT_BYTES: usize = 2 * HEADER_FIELD_LEN;
 const IDENT_WORDS: usize = IDENT_BYTES.div_ceil(4);
@@ -91,9 +92,9 @@ fn from_words(w: &[u32; SLOT_WORDS]) -> PlayReport {
     }
 }
 
-/// ゲームのスレッド（書き手 1 本）から本ログへ頼むスレッド（読み手 1 本）への受け渡し。
+/// ゲームのスレッド（書き手1本）から本ログへ頼むスレッド（読み手1本）への受け渡し。
 pub struct PlayHandoff {
-    /// 書いた回数（枠は `written % SLOTS`）。書き手だけが進める。
+    /// 書いた回数（枠は`written % SLOTS`）。書き手だけが進める。
     written: AtomicU32,
     slots: [[AtomicU32; SLOT_WORDS]; SLOTS],
 }
@@ -106,7 +107,7 @@ impl PlayHandoff {
         }
     }
 
-    /// 1 回分を書く（書き手）。枠を埋めてから回数を `Release` で進める。
+    /// 1回分を書く（書き手）。枠を埋めてから回数を`Release`で進める。
     pub fn publish(&self, r: &PlayReport) {
         let n = self.written.load(Ordering::Relaxed);
         let slot = &self.slots[n as usize % SLOTS];
@@ -116,12 +117,12 @@ impl PlayHandoff {
         self.written.store(n.wrapping_add(1), Ordering::Release);
     }
 
-    /// 書かれた分を古い順に `f` へ渡す（読み手）。`read` は読み終えた回数（呼び手が持つ）。書き手に追い越された分は数えて返す。
+    /// 書かれた分を古い順に`f`へ渡す（読み手）。`read`は読み終えた回数（呼び出し元が持つ）。書き手に追い越された分は数えて返す。
     pub fn drain(&self, read: &mut u32, mut f: impl FnMut(PlayReport)) -> u32 {
         let mut lost = 0u32;
         let w = self.written.load(Ordering::Acquire);
         let behind = w.wrapping_sub(*read);
-        // 書き手が次に書く枠は読めないので、信じるのは新しい `SLOTS - 1` 回分まで。
+        // 書き手が次に書く枠は読めない。そのため信じるのは新しい`SLOTS - 1`回分まで。
         let keep = SLOTS as u32 - 1;
         if behind > keep {
             lost += behind - keep;
@@ -132,7 +133,7 @@ impl PlayHandoff {
             let words: [u32; SLOT_WORDS] =
                 core::array::from_fn(|i| slot[i].load(Ordering::Relaxed));
             fence(Ordering::Acquire);
-            // 書き手が 1 周して同じ枠を書き始めていたら、いま読んだ中身は混ざっている。
+            // 書き手が1周して同じ枠を書き始めていたら、いま読んだ中身は混ざっている。
             let overrun = self.written.load(Ordering::Relaxed).wrapping_sub(*read) >= SLOTS as u32;
             *read = read.wrapping_add(1);
             if overrun {
@@ -155,12 +156,12 @@ impl Default for PlayHandoff {
 #[derive(Debug)]
 pub struct PlayWatch {
     log: MatchLog,
-    /// 再生の試合を見張っている最中。
+    /// 再生の試合を監視している最中。
     active: bool,
-    /// 勝ちに要る数（境目を積むたびに読み直す。0 なら決着の判定をしない）。
+    /// 勝ちに要る数（境目を積むたびに読み直す。0なら決着の判定をしない）。
     required: u32,
     ident: Option<HeaderIdent>,
-    /// この Match の場面で調べた ReplayManager と、再生の側か。場面を出るまで引き直さない（`+0x114` の読みは 1 試合に 1 回）。
+    /// このMatchの場面で調べたReplayManagerと再生の側かどうか。場面を出るまで取得し直さない（`+0x114`の読みは1試合に1回）。
     mode: Option<(u32, bool)>,
     /// 最後に書いた再生（同じ中身を続けて書かないため）。
     last: Option<PlayReport>,
@@ -184,7 +185,7 @@ impl PlayWatch {
         }
     }
 
-    /// 再生の側か。ReplayManager が替われば引き直す。読めなければ偽（次の tick にもう 1 回）。
+    /// 再生の側かどうか。ReplayManagerが替われば取得し直す。読み取れなければ偽（次のtickにもう1回）。
     fn is_playback(&mut self, io: &mut dyn SaveIo, rm: u32) -> bool {
         if rm == 0 {
             self.mode = None;
@@ -204,7 +205,7 @@ impl PlayWatch {
         }
     }
 
-    /// 入力の地点で毎 tick。Match の場面でなければ、場面の 2 語を読んで戻る。
+    /// 入力の地点で毎tick。Matchの場面でなければ場面の2ワードを読んで戻る。
     pub fn tick(&mut self, h: &PlayHandoff, io: &mut dyn SaveIo) {
         let (cur, _) = io.scenes();
         if cur != SCENE_MATCH || io.game_mode() != GAME_MODE_MATCH {
@@ -212,7 +213,7 @@ impl PlayWatch {
             self.leave(h);
             return;
         }
-        // 読み込みの間は始めも終わりもしない（読み込みの途中で ReplayManager の欄は揃っていない）。
+        // 読み込みの間は始めも終わりもしない（読み込みの途中でReplayManagerのフィールドは揃っていない）。
         if io.loading() != 0 {
             return;
         }
@@ -235,7 +236,7 @@ impl PlayWatch {
         }
     }
 
-    /// 再生の側でなくなった（場面を出た・生きた試合になった）。見張っていたなら 1 回分を `PlayHandoff` に書く（本ログへは読み手のスレッドが書く）。
+    /// 再生の側でなくなった（場面を出た・生きた試合になった）。監視していたなら1回分を`PlayHandoff`に書く（本ログへは読み手のスレッドが書く）。
     fn leave(&mut self, h: &PlayHandoff) {
         if !self.active {
             return;
@@ -255,8 +256,8 @@ impl PlayWatch {
             summary,
         };
         self.log.begin_seg();
-        // 1 ラウンドも決着しなかった再生と、直前の行と中身が同じ再生は書かない。タイトルで放っておくと流れるデモは Match の再生なので
-        // （game_mode 2・`+0x114` が 1）、書くと何もしていないログが毎回増える。
+        // 1ラウンドも決着しなかった再生と直前の行と中身が同じ再生は書かない。
+        // タイトルで放っておくと流れるデモはMatchの再生（game_mode 2・`+0x114`が1）なので、書くと何もしていないログが毎回増える。
         if report.summary.rounds[0].is_none() || self.last == Some(report) {
             return;
         }
@@ -294,7 +295,7 @@ mod tests {
         }
     }
 
-    /// ラウンドを 1 つ決着させる（`completed_rounds` と勝ち数が増え、その tick の値が読める）。
+    /// ラウンドを1つ決着させる（`completed_rounds`と勝ち数が増え、そのtickの値が読める）。
     fn decide(g: &mut FakeGame, winner: usize, frames: u32, score1: u32) {
         g.completed += 1;
         g.wins[winner] += 1;
@@ -341,7 +342,7 @@ mod tests {
             "{}",
             l[0]
         );
-        // 出た後の tick は何も足さない。
+        // 出た後のtickは何も足さない。
         w.tick(&h, &mut g);
         assert!(lines(&h, &mut read).is_empty());
         // 行はツールが読める形。
@@ -421,7 +422,7 @@ mod tests {
         assert!(l[0].contains("rounds=1 r1=5000.2."), "{}", l[0]);
     }
 
-    /// タイトルのデモのように 1 ラウンドも決着せずに出る再生と、同じ中身の再生の繰り返しは書かない。
+    /// タイトルのデモのように1ラウンドも決着せずに出る再生と同じ中身の再生の繰り返しは書かない。
     #[test]
     fn a_playback_without_a_decided_round_and_an_exact_repeat_are_not_written() {
         let h = PlayHandoff::new();
@@ -461,7 +462,7 @@ mod tests {
         g.cur = 10;
         w.tick(&h, &mut g);
         assert!(lines(&h, &mut read)[0].contains("end=partial"));
-        // 勝ちに要る数が読めない（0）ときは、届いたとは言わない。
+        // 勝ちに要る数が読み取れない（0）ときは届いたとは言わない。
         let mut g = playback();
         g.wins = [0, 0, 0];
         w.tick(&h, &mut g);
@@ -519,7 +520,7 @@ mod tests {
         w.tick(&h, &mut g);
         decide(&mut g, 0, 100, 1);
         w.tick(&h, &mut g);
-        // 場面を出ずに ReplayManager が別のもの（記録の側）に替わった。
+        // 場面を出ずにReplayManagerが別のもの（記録の側）に替わった。
         g.rm += 0x100;
         g.replay_mode = Some(0);
         w.tick(&h, &mut g);
@@ -573,7 +574,7 @@ mod tests {
         let mut got = Vec::new();
         assert_eq!(h.drain(&mut read, |r| got.push(r.summary.start_utc)), 0);
         assert_eq!(got, vec![Some(0), Some(1), Some(2)]);
-        // 読み手が 7 回分遅れた: 新しい SLOTS - 1 回分だけ残り、追い越された分を数える。
+        // 読み手が7回分遅れた: 新しいSLOTS - 1回分だけ残り、追い越された分を数える。
         for n in 10..17 {
             h.publish(&mk(n));
         }
@@ -584,12 +585,12 @@ mod tests {
         assert_eq!(h.drain(&mut read, |_| panic!("もう無い")), 0);
     }
 
-    /// 書き手が読み手より速く回っても、渡された 1 件は 1 回分の中身のまま（別の回の語が混ざらない）で、渡した数 + 落とした数 = 書いた数。
+    /// 書き手が読み手より速く回っても、渡された1件は1回分の中身のまま（別の回のワードが混ざらない）。渡した数 + 落とした数 = 書いた数。
     #[test]
     fn a_fast_writer_never_hands_over_a_torn_report() {
         use std::sync::atomic::AtomicBool;
         const TOTAL: u32 = 60_000;
-        // n 回目の中身: 見出しの日付 = n の 10 進、開始時刻 = n、落としたラウンド数 = n。どれかが食い違えば混ざっている。
+        // n回目の中身: ヘッダの日付 = n の10進、開始時刻 = n、落としたラウンド数 = n。どれかが食い違えば混ざっている。
         let mk = |n: u32| {
             let mut date = [0u8; HEADER_FIELD_LEN];
             let digits = format!("{n:08}");

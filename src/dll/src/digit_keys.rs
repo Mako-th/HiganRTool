@@ -1,31 +1,32 @@
-//! Ctrl+上段の数字（0〜9）でディレイを替える入口の「押した瞬間」の取り方（pure。unsafe 無し）。
-//! 0〜8 がその値、9 が auto（`higanr_core::delay_pick::AUTO`）。Ctrl+Tab は同期方式の切替（キャラセレクトの間）、Ctrl+C は観戦コードのコピーの頼み（接続している間）。
-//! キーボードの読み（`GetAsyncKeyState`）は `digit_keys_win.rs`、「読んでよい間」の判断は `net_game::NetGame::digit_keys`（`may_read`）、押下の行き先は `NetPlay::digit_tick`。
+//! Ctrl+上段の数字（0〜9）でディレイを替える入口の「押した瞬間」の取り方（pure。unsafe無し）。
+//! 0〜8がその値で9がauto（`higanr_core::delay_pick::AUTO`）。Ctrl+Tabは同期方式の切り替え（キャラセレクトの間）。Ctrl+Cは観戦コードのコピーの要求（接続している間）。
+//! キーボードの読み（`GetAsyncKeyState`）は`digit_keys_win.rs`。「読んでよい間」の判断は`net_game::NetGame::digit_keys`（`may_read`）。押下の行き先は`NetPlay::digit_tick`。
 //!
-//! 数字と Tab は、ゲームの入力の関数 `0x0042B850` が読む `GetKeyboardState` の表に上段の数字 0〜9 と Tab が無い（添字 `-0xd4`〜`-0xcb` と `-0xfb` の参照が 0 件）ので衝突しない。テンキーは方向と衝突するので読まない。
-//! ゲームは Ctrl（VK_CONTROL。`0x0042BAAB`）を入力ワードの `0x0100`（キャラ・マップ選択の「ランダム」）として読むので、選択の画面で Ctrl+数字・Ctrl+Tab を押すと「ランダム」も回る（`0x0100` は落とさず、ゲームと相手へそのまま届く）。
+//! 数字とTabはゲームと衝突しない。ゲームの入力の関数`0x0042B850`が読む`GetKeyboardState`の表に上段の数字0〜9とTabが無い（添字`-0xd4`〜`-0xcb`と`-0xfb`の参照が0件）ため。テンキーは方向と衝突するので読まない。
+//! ゲームはCtrl（VK_CONTROL。`0x0042BAAB`）を入力ワードの`0x0100`（キャラ・マップ選択の「ランダム」）として読む。そのため選択の画面でCtrl+数字・Ctrl+Tabを押すと「ランダム」も回る（`0x0100`は落とさず、ゲームと相手へそのまま届く）。
 //!
-//! 1 tick に 1 回、押下の集合（bit `d` = 数字 `d`・Tab・C・Ctrl・Alt/Win）を渡され、前の tick に離れていて今押されている数字・Tab・C だけを取る（押し続けは 1 回）。
-//! 取るのは押した瞬間に Ctrl が押されていて Alt・Win が押されていないときだけ。読んでよくない tick（`None`）が挟まると、次に読めた tick で押されたままのキーを押下と取らない。
+//! 1 tickに1回、押下の集合（bit `d` = 数字`d`・Tab・C・Ctrl・Alt/Win）を渡される。前のtickに離れていて今押されている数字・Tab・Cだけを取る（押し続けは1回）。
+//! 取るのは押した瞬間にCtrlが押されていてAlt・Winが押されていないときだけ。読んでよくないtick（`None`）が挟まると、次に読めたtickで押されたままのキーを押下とみなさない。
 #![forbid(unsafe_code)]
 
 use higanr_core::delay_pick::{AUTO, bounds};
 use higanr_core::wire::Mode;
 
-/// 読んだ集合の bit10: Tab（仮想キー `VK_TAB`）。ゲームは Tab を読まない（表の添字 `-0xfb` の参照が 0 件）ので衝突しない。
+/// 読んだ集合のbit10: Tab（仮想キー`VK_TAB`）。ゲームはTabを読まない（表の添字`-0xfb`の参照が0件）ので衝突しない。
 pub const TAB_BIT: u16 = 1 << 10;
 
-/// 読んだ集合の bit11: Alt か Win が押されている。押した瞬間の集合には出ない。
+/// 読んだ集合のbit11: AltかWinが押されている。押した瞬間の集合には出ない。
 pub const MOD_BIT: u16 = 1 << 11;
 
-/// 読んだ集合の bit12: Ctrl が押されている。押した瞬間の集合には出ない。
+/// 読んだ集合のbit12: Ctrlが押されている。押した瞬間の集合には出ない。
 pub const CTRL_BIT: u16 = 1 << 12;
 
-/// 読んだ集合の bit13: C（Ctrl+C で観戦コードをコピーする）。ゲームの入力の関数 `0x0042B850` は C を読まない
-/// （Z・X・Shift・Esc・矢印・Ctrl・Q・S・P・Home・Enter・D・R だけ）ので、Ctrl の扱いは Ctrl+数字と同じで足りる。
+/// 読んだ集合のbit13: C（Ctrl+Cで観戦コードをコピーする）。
+/// ゲームの入力の関数`0x0042B850`が読むのはZ・X・Shift・Esc・矢印・Ctrl・Q・S・P・Home・Enter・D・RだけでCは読まない。
+/// そのためCtrlの扱いはCtrl+数字と同じで足りる。
 pub const C_BIT: u16 = 1 << 13;
 
-/// 押した瞬間を取る対象のキー（数字 0〜9・Tab・C）の bit。
+/// 押した瞬間を取る対象のキー（数字0〜9・Tab・C）のbit。
 pub const KEYS_MASK: u16 = 0x07FF | C_BIT;
 
 /// 読んだ集合の全部のビット。
@@ -43,14 +44,15 @@ impl Default for DigitEdge {
 }
 
 impl DigitEdge {
-    /// 最初の読みの前から押されていたキーは押下にしない（`prev` は押されているとみなす）。
+    /// 最初の読みの前から押されていたキーは押下にしない（`prev`は押されているとみなす）。
     pub const fn new() -> Self {
         DigitEdge { prev: KEYS_MASK }
     }
 
-    /// この tick に読んだ集合（読んでよくなければ `None`）を渡し、押した瞬間の集合を返す。`None` の後の最初の読みは押下を作らない。
-    /// 押した瞬間の判断は修飾キーを含まない生のキーで行う（`prev` は生の集合）ので、Ctrl が無い間に押したキーは、後で Ctrl を押しても
-    /// 押下にならず、Alt・Win を先に離しても押したままの Tab は押下にならない。
+    /// このtickに読んだ集合（読んでよくなければ`None`）を渡し、押した瞬間の集合を返す。`None`の後の最初の読みは押下を作らない。
+    /// 押した瞬間の判断は修飾キーを含まない生のキーで行う（`prev`は生の集合）。
+    /// そのためCtrlが無い間に押したキーは後でCtrlを押しても押下にならない。
+    /// Alt・Winを先に離しても押したままのTabは押下にならない。
     pub fn feed(&mut self, held: Option<u16>) -> u16 {
         match held {
             Some(h) => {
@@ -72,8 +74,9 @@ impl DigitEdge {
     }
 }
 
-/// 本物のキーを読んでよい間か: ゲームの前面の旗（`th09_addr::APP_ACTIVE`）が立っていて、かつ Windows の前面のウィンドウがこのゲームのウィンドウのときだけ。
-/// 旗は意味が未照合で、ほかのアプリのウィンドウが前面なのに打った数字を拾った疑いがあったので OS の前面のウィンドウでも縛る。旗が 0 なら前面の問い合わせは呼ばない。
+/// 本物のキーを読んでよい間かどうか: ゲームの前面のフラグ（`th09_addr::APP_ACTIVE`）が立っていて、かつWindowsの前面のウィンドウがこのゲームのウィンドウのときだけ。
+/// フラグは意味が未照合。ほかのアプリのウィンドウが前面なのに打った数字を拾った疑いがあったのでOSの前面のウィンドウでも縛る。
+/// フラグが0なら前面の問い合わせは呼ばない。
 pub fn may_read(app_active: bool, foreground_is_game: impl FnOnce() -> bool) -> bool {
     app_active && foreground_is_game()
 }
@@ -82,15 +85,15 @@ pub fn tab_pressed(pressed: u16) -> bool {
     pressed & TAB_BIT != 0
 }
 
-/// 押した瞬間の集合に Ctrl+C（観戦コードのコピーの頼み）があるか。
+/// 押した瞬間の集合にCtrl+C（観戦コードのコピーの要求）があるかどうか。
 pub fn copy_pressed(pressed: u16) -> bool {
     pressed & C_BIT != 0
 }
 
-/// 押した瞬間の集合から、遅れの量の押下（`Connected::press_delay` に渡す値）を 1 つ選ぶ。0〜`bounds` の上限はその値、9 は `AUTO`。
-/// 同じ tick に複数押したら番号の大きい方が後勝ち。何も押していなければ `None`。
+/// 押した瞬間の集合から遅れの量の押下（`Connected::press_delay`に渡す値）を1つ選ぶ。0〜`bounds`の上限まではその値になり、9は`AUTO`になる。
+/// 同じtickに複数押したら番号の大きい方が後勝ち。何も押していなければ`None`。
 pub fn pick(pressed: u16) -> Option<u8> {
-    // 数字 d の値は d そのもの（0〜8）で、9 は `AUTO`（= 9）。`bounds` の上限と `AUTO` が隣り合わせであることを縛る。
+    // 数字dの値はdそのもの（0〜8）で、9は`AUTO`（= 9）。`bounds`の上限と`AUTO`が隣り合わせであることを縛る。
     debug_assert_eq!(bounds(Mode::Rollback).1 + 1, AUTO);
     (0..=AUTO).rev().find(|&d| pressed & (1 << d) != 0)
 }
@@ -215,7 +218,7 @@ mod tests {
         assert_eq!(e.feed(Some(C_BIT | C)), 0, "読めない間から押していた");
         assert_eq!(e.feed(Some(C)), 0);
         assert_eq!(e.feed(Some(C_BIT | C)), C_BIT, "離して押せば効く");
-        // 数字と一緒でも、遅れの量の選びは C に影響されず、C は遅れの量にも Tab にもならない。
+        // 数字と一緒でも遅れの量の選択はCに影響されない。Cは遅れの量にもTabにもならない。
         let mut e = DigitEdge::new();
         e.feed(Some(C));
         let p = e.feed(Some(C | C_BIT | K5));

@@ -1,7 +1,18 @@
 # th09.exe is 32-bit, so everything we build is 32-bit (a 64-bit DLL cannot be loaded into it).
 # Static CRT: the target machine does not need the VC runtime installed.
+# Hardening: CFG (/GUARD:CF), ASLR (/DYNAMICBASE), DEP (/NXCOMPAT) and SafeSEH. ASLR and DEP are the linker's
+# defaults and are written out so the intent is visible. /SAFESEH makes the link fail if any object has no safe
+# exception handler table. CFG is enforced only in a process whose exe has it, so it guards the loader;
+# inside th09.exe (built without CFG) the checks in the DLL do nothing.
 [build]
 target = "i686-pc-windows-msvc"
 
 [target.i686-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "control-flow-guard=checks",
+    "-C", "link-arg=/GUARD:CF",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/SAFESEH",
+]

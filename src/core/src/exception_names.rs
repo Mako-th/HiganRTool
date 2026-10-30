@@ -1,13 +1,14 @@
-//! 例外コードの名前の表。DLL の例外ハンドラ（落ちうるコードだけを記録する）とローダーの未処理例外のフィルターが、
-//! 同じコードを同じ名前でログに書く。値は Windows SDK の ntstatus.h / winnt.h の NTSTATUS。
+//! 例外コードの名前の表。
+//! DLLの例外ハンドラ（落ちうるコードだけを記録する）とローダーの未処理例外のフィルターが同じコードを同じ名前でログに書く。
+//! 値はWindows SDKのntstatus.h / winnt.hのNTSTATUS。
 
 pub const ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const IN_PAGE_ERROR: u32 = 0xC000_0006;
 pub const STACK_OVERFLOW: u32 = 0xC000_00FD;
-/// デバッガに渡す通知で、落ちる例外ではない。デバッガが無いまま未処理になった場合だけローダーのフィルターが書く。
+/// デバッガに渡す通知。落ちる例外ではない。デバッガが無いまま未処理になった場合だけローダーのフィルターが書く。
 pub const BREAKPOINT: u32 = 0x8000_0003;
 
-/// 記録する（プロセスが落ちうる）例外コードの名前。C++ の例外・デバッガへの通知・スレッドの名付けなどは None。
+/// 記録する（プロセスが落ちうる）例外コードの名前。C++ の例外・デバッガへの通知・スレッドの名付けなどはNone。
 pub fn fatal_name(code: u32) -> Option<&'static str> {
     Some(match code {
         ACCESS_VIOLATION => "アクセス違反",
@@ -26,7 +27,7 @@ pub fn fatal_name(code: u32) -> Option<&'static str> {
     })
 }
 
-/// `fatal_name` に、未処理で届きうるブレークポイントを足した表。
+/// `fatal_name`に未処理で届きうるブレークポイントを足した表。
 pub fn name(code: u32) -> Option<&'static str> {
     match code {
         BREAKPOINT => Some("ブレークポイント"),
@@ -52,7 +53,7 @@ mod tests {
             assert!(fatal_name(code).is_some(), "{code:08X}");
         }
         for code in [
-            0xE06D_7363, // C++ の例外（Rust のパニックも）
+            0xE06D_7363, // C++ の例外（Rustのパニックも）
             BREAKPOINT,
             0x4001_0006, // OutputDebugString
             0x406D_1388, // スレッドの名付け

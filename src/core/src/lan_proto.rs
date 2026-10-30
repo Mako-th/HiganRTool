@@ -1,19 +1,21 @@
-//! LAN 対戦の申し込みのやりとり（pure）。クライアントがホストのアドレスへ参加を申し込み、ホストが始める側の接続コードをそのまま返し、
-//! クライアントが返すコードを返す。観戦は申し込みに観戦の印を付け、ホストが観戦コードを返す。ルームサーバーが運ぶ接続コードの代わりに
-//! LAN の UDP が運ぶだけで、コードの中身も、そのあとの接続（HELLO・鍵の交換）も、インターネットの経路と同じ。
+//! LAN対戦の申し込みのやりとり（pure）。
+//! クライアントがホストのアドレスへ参加を申し込む。ホストは始める側の接続コードをそのまま返し、クライアントは返すコードを返す。
+//! 観戦は申し込みに観戦の印を付ける。ホストは観戦コードを返す。
+//! ルームサーバーが運ぶ接続コードの代わりにLANのUDPが運ぶだけ。コードの中身もそのあとの接続（HELLO・鍵の交換）もインターネットの経路と同じ。
 //!
-//! - 1 通 = マジック `HGLN`（4 B）・バージョン（1 B）・種類（1 B）・申し込みの番号（4 B。クライアントが引く乱数で、返事にコピーする）・種類ごとの本文。ゲームの受信ソケットとは別のソケットで受ける（ゲームの受信ループには入れない）ので、ゲームの通信の `HGRT` とは混ざらない。
-//! - 本文のコードは ASCII の表示できる文字だけ・`code::MAX_CODE_CHARS` まで。長さは 2 B で持ち、1 通の長さと合わなければ捨てる。
-//! - 守るのは LAN の中の取り違えと再送だけ（秘密は載せない。コードの中の秘密は LAN の中を平文で渡る）。ホストは先着 1 人（`Host`）。
+//! - 1通 = マジック`HGLN`（4 B）・バージョン（1 B）・種類（1 B）・申し込みの番号（4 B。クライアントが生成する乱数で、返事にコピーする）・種類ごとの本文。
+//! 対戦用受信ソケットとは別のソケットで受ける（ゲームの受信ループには入れない）。そのためゲームの通信の`HGRT`とは混ざらない。
+//! - 本文のコードはASCIIの表示できる文字だけ・`code::MAX_CODE_CHARS`まで。長さは2 Bで持つ。1通の長さと合わなければ捨てる。
+//! - 守るのはLANの中の取り違えと再送だけ（秘密は載せない。コードの中の秘密の乱数はLANの中を平文で渡る）。ホストは先着1人（`Host`）。
 //!
-//! 状態機械 `Host` / `Client` / `Watcher` は時刻を引数で受ける（ms）。送る・開く・待つ副作用は呼び手（dll の `lan_link`）の仕事で、ここは「何を返すか・次に何をさせるか」だけを決める。
+//! ステートマシン`Host` / `Client` / `Watcher`は時刻を引数で受ける（ms）。送る・開く・待つ副作用は呼び手（dllの`lan_link`）の仕事。ここは「何を返すか・次に何をさせるか」だけを決める。
 
-use core::net::SocketAddrV4;
+use core::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::code::MAX_CODE_CHARS;
 
 pub const MAGIC: [u8; 4] = *b"HGLN";
-/// 申し込みのやりとりのバージョン。通信の `PROTO_VER` とは別（このやりとりの形が変わるときだけ上げる）。
+/// 申し込みのやりとりのバージョン。通信の`PROTO_VER`とは別（このやりとりの形が変わるときだけ上げる）。
 pub const LAN_VER: u8 = 1;
 const HEADER_LEN: usize = 10;
 
@@ -33,23 +35,23 @@ pub const CLIENT_WAIT_OFFER_MS: u64 = 10_000;
 pub const CLIENT_WAIT_ACK_MS: u64 = 10_000;
 /// 観戦の申し込みの返事を待つ上限（ms）。
 pub const WATCH_WAIT_MS: u64 = 10_000;
-/// ホストが、参加を受けてから始める側のコードを用意するまでに待つ上限（ms。ネットワークを開く時間）。
+/// ホストが参加を受けてから始める側のコードを用意するまで待つ上限（ms。ネットワークを開く時間）。
 pub const HOST_WAIT_OFFER_MS: u64 = 15_000;
-/// ホストが、コードを返してから返すコードが届くまでに待つ上限（ms）。過ぎたら待機へ戻る（打ち間違えた 1 通で待機を終えない）。
+/// ホストがコードを返してから返すコードが届くまで待つ上限（ms）。過ぎたら待機へ戻る（打ち間違えた1通で待機を終えない）。
 pub const HOST_WAIT_REPLY_MS: u64 = 30_000;
 
 /// 断る理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
-    /// もう別の人が参加している（先着 1 人）。
+    /// もう別の人が参加している（先着1人）。
     Busy,
-    /// 観戦の申し込みだが、まだ対戦が始まっていない（観戦コードは対戦が接続してから出せる）。
+    /// 観戦の申し込みだがまだ対戦が始まっていない（観戦コードは対戦が接続してから出せる）。
     NotYet,
     /// 観戦を受けない設定（`[spectate] enable = 0`）か、観戦の用意ができていない。
     WatchOff,
-    /// バージョンが違う（`theirs` は断りを受ける側から見た相手＝断る側の通信のバージョン）。
+    /// バージョンが違う（`theirs`は断りを受ける側から見た相手＝断る側の通信のバージョン）。
     OtherVersion { theirs: u8 },
-    /// ビルドが違う（`theirs` は断る側のビルド番号）。
+    /// ビルドが違う（`theirs`は断る側のビルド番号）。
     OtherBuild { theirs: u32 },
 }
 
@@ -78,7 +80,7 @@ impl Why {
     }
 }
 
-/// 1 通。`code` は借りた文字（`decode` は元のバイト列を借りる）。
+/// 1通。`code`は借りた文字（`decode`は元のバイト列を借りる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
     Join { id: u32, proto: u8, build: u32 },
@@ -99,12 +101,12 @@ pub enum DecodeError {
     BadKind(u8),
     /// 本文の長さが種類と合わない。
     BadLength,
-    /// コードが ASCII の表示できる文字だけでない、または `MAX_CODE_CHARS` を越える。
+    /// コードがASCIIの表示できる文字だけでない、または`MAX_CODE_CHARS`を越える。
     BadText,
     BadReason,
 }
 
-/// 受けたバイト列がこのやりとりの 1 通らしいか（マジックだけ見る。ほかの通信を読み捨てるときの振り分け）。
+/// 受けたバイト列がこのやりとりの1通らしいかどうか（マジックだけ見る。ほかの通信を読み捨てるときの振り分け）。
 pub fn looks_like_lan(bytes: &[u8]) -> bool {
     bytes.starts_with(&MAGIC)
 }
@@ -116,7 +118,7 @@ fn header(out: &mut Vec<u8>, kind: u8, id: u32) {
     out.extend_from_slice(&id.to_le_bytes());
 }
 
-/// 1 通を作る。コードが長すぎる・ASCII の表示できる文字だけでないときは `None`（呼び手が送らない）。
+/// 1通を作る。コードが長すぎる・ASCIIの表示できる文字だけでないときは`None`（呼び手が送らない）。
 pub fn encode(msg: &Msg<'_>) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(HEADER_LEN + 2 + MAX_CODE_CHARS);
     let text = |out: &mut Vec<u8>, code: &str| -> Option<()> {
@@ -161,7 +163,7 @@ pub fn encode(msg: &Msg<'_>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 1 通を読む。長さは本文と過不足なく合っていなければ捨てる（余りのバイトも断る）。
+/// 1通を読む。長さは本文と過不足なく合っていなければ捨てる（余りのバイトも断る）。
 pub fn decode(bytes: &[u8]) -> Result<Msg<'_>, DecodeError> {
     if bytes.len() < HEADER_LEN {
         return Err(DecodeError::TooShort);
@@ -242,8 +244,9 @@ pub struct Ver {
 }
 
 impl Ver {
-    /// 相手（申し込んだ側）の値が違えば断る理由。通信のバージョンを先に見る。理由の `theirs` は断りを受ける側から見た相手、
-    /// つまり断る側（自分）の値（受けた側の画面が「相手のバージョンが違います（自分 N・相手 M）」と出せるように）。
+    /// 相手（申し込んだ側）の値が違えば断る理由。通信のバージョンを先に見る。
+    /// 理由の`theirs`は断りを受ける側から見た相手。つまり断る側（自分）の値。
+    /// 受けた側の画面が「相手のバージョンが違います（自分 N・相手 M）」と出せるようにするため。
     pub fn check(self, proto: u8, build: u32) -> Option<Why> {
         if proto != self.proto {
             Some(Why::OtherVersion { theirs: self.proto })
@@ -257,18 +260,30 @@ impl Ver {
 
 // ---- ホスト ----
 
-/// ホストの状態機械が呼び手にさせること。
+/// ホストのステートマシンが呼び手にさせること。
+/// `via`はその相手の申し込みを受けた呼び手の受付用受信ソケットの番号（`Host::on_datagram`に渡した値）。
+/// 返事はその受付用受信ソケットから出す。
+/// 相手に届く自分のアドレスは相手ごとに違いうる（有線と無線の両方があるPC）。
+/// また申し込む側のソケットは`connect`済みで、ほかのアドレスから来た返事を受け取らない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostAct {
-    /// `to` へ送る。
-    Send { to: SocketAddrV4, bytes: Vec<u8> },
-    /// 最初の参加者を受けた。呼び手は `src` へ届くアドレスでゲームのネットワークを開き、始める側のコードを作って `Host::offer_ready` へ渡す。
-    Accepted { src: SocketAddrV4 },
-    /// クライアントの返すコードが届いた（1 回だけ）。呼び手はこれを読んで接続を始める。
+    /// 受付用受信ソケット`via`から`to`へ送る。
+    Send {
+        to: SocketAddrV4,
+        via: usize,
+        bytes: Vec<u8>,
+    },
+    /// 最初の参加者を受けた。呼び手は受付用受信ソケット`via`のアドレスでゲームのネットワークを開く。そのあと始める側のコードを作って`Host::offer_ready`へ渡す。
+    Accepted { src: SocketAddrV4, via: usize },
+    /// クライアントの返すコードが届いた（1回だけ）。呼び手はこれを読んで接続を始める。
     DeliverReply { code: String },
-    /// 観戦コードを頼まれた（対戦が接続している間）。呼び手は観戦コードを用意して `Host::watch_code_ready` へ渡す。
-    WatchWanted { src: SocketAddrV4, id: u32 },
-    /// 返すコードが届かないまま上限が過ぎたので、待機へ戻った（次の参加者を受ける）。
+    /// 観戦コードを頼まれた（対戦が接続している間）。呼び手は観戦コードを用意して`Host::watch_code_ready`へ渡す。
+    WatchWanted {
+        src: SocketAddrV4,
+        id: u32,
+        via: usize,
+    },
+    /// 返すコードが届かないまま上限が過ぎたので待機へ戻った（次の参加者を受ける）。
     Rewait,
     /// 始める側のコードが用意できないまま上限が過ぎた（ネットワークを開けない）。
     TimedOut,
@@ -281,12 +296,14 @@ enum HostState {
     /// 参加者を受けた。始める側のコードを待っている。
     Opening {
         src: SocketAddrV4,
+        via: usize,
         id: u32,
         since: u64,
     },
     /// コードを返した。返すコードを待っている。
     Offered {
         src: SocketAddrV4,
+        via: usize,
         id: u32,
         code: String,
         since: u64,
@@ -299,19 +316,36 @@ enum HostState {
     Dead,
 }
 
-/// ホストの申し込みの受け口（先着 1 人）。
+/// 同じIPの観戦の申し込みに観戦コードを渡す最短の間隔（ms）。
+/// 観戦者は返事が来るまで`RETRY_MS`（500 ms）ごとに再送し、`WATCH_WAIT_MS`（10秒）で諦める。
+/// そのため返事が失われても待つ間に4回は渡せる。
+/// 間隔の中の申し込みには何も返さない。
+/// 送信元を偽った申し込みで別のPCへ観戦コードを送らせる量を抑えるため（観戦コードは申し込みより大きい）。
+pub const WATCH_PER_IP_MS: u64 = 2_000;
+/// ホスト全体で1秒あたりに観戦コードを渡す数の上限（LANの中の観戦者が同時に申し込む数ほど）。
+pub const WATCH_PER_SEC: u32 = 4;
+/// 観戦コードを渡したIPを覚える数（あふれたら最も古いものを忘れる）。
+const WATCH_SEEN_MAX: usize = 16;
+
+/// ホスト側で申し込みを受け付けるステートマシン（先着1人）。
 #[derive(Debug, Clone)]
 pub struct Host {
     me: Ver,
     state: HostState,
-    /// 観戦の申し込みを受ける設定か。
+    /// 観戦の申し込みを受ける設定かどうか。
     watch_ok: bool,
-    /// 返すコードを待つ上限（ms。既定 `HOST_WAIT_REPLY_MS`）。
+    /// 返すコードを待つ上限（ms。既定`HOST_WAIT_REPLY_MS`）。
     reply_wait: u64,
+    /// 観戦コードを渡したIPと時刻（`WATCH_PER_IP_MS`）。
+    watch_seen: [Option<(Ipv4Addr, u64)>; WATCH_SEEN_MAX],
+    /// 今の1秒の始まりとその間に観戦コードを渡した数（`WATCH_PER_SEC`）。
+    watch_window: (u64, u32),
+    /// 上限で観戦コードを渡さなかった申し込みの数。
+    watch_dropped: u32,
 }
 
-fn send(to: SocketAddrV4, msg: &Msg<'_>) -> Option<HostAct> {
-    encode(msg).map(|bytes| HostAct::Send { to, bytes })
+fn send(to: SocketAddrV4, via: usize, msg: &Msg<'_>) -> Option<HostAct> {
+    encode(msg).map(|bytes| HostAct::Send { to, via, bytes })
 }
 
 impl Host {
@@ -321,6 +355,9 @@ impl Host {
             state: HostState::Waiting,
             watch_ok,
             reply_wait: HOST_WAIT_REPLY_MS,
+            watch_seen: [None; WATCH_SEEN_MAX],
+            watch_window: (0, 0),
+            watch_dropped: 0,
         }
     }
 
@@ -330,13 +367,24 @@ impl Host {
         self
     }
 
-    /// 参加者を受けた後か（このあと来る別の参加の申し込みは断る）。
+    /// 参加者を受けた後かどうか（このあと来る別の参加の申し込みは断る）。
     pub fn is_taken(&self) -> bool {
         !matches!(self.state, HostState::Waiting)
     }
 
-    /// 受けたバイト列 1 通。壊れたもの・ほかの通信は何もしない。
-    pub fn on_datagram(&mut self, src: SocketAddrV4, bytes: &[u8], now: u64) -> Vec<HostAct> {
+    /// 上限（`WATCH_PER_IP_MS`・`WATCH_PER_SEC`）で観戦コードを渡さなかった申し込みの数。
+    pub fn watch_dropped(&self) -> u32 {
+        self.watch_dropped
+    }
+
+    /// 呼び手の受付用受信ソケット`via`で受けたバイト列1通。壊れたもの・ほかの通信は何もしない。
+    pub fn on_datagram(
+        &mut self,
+        src: SocketAddrV4,
+        via: usize,
+        bytes: &[u8],
+        now: u64,
+    ) -> Vec<HostAct> {
         let Ok(msg) = decode(bytes) else {
             return Vec::new();
         };
@@ -344,17 +392,18 @@ impl Host {
         match msg {
             Msg::Join { id, proto, build } => {
                 if let Some(why) = self.me.check(proto, build) {
-                    acts.extend(send(src, &Msg::Refuse { id, why }));
+                    acts.extend(send(src, via, &Msg::Refuse { id, why }));
                     return acts;
                 }
                 match &self.state {
                     HostState::Waiting => {
                         self.state = HostState::Opening {
                             src,
+                            via,
                             id,
                             since: now,
                         };
-                        acts.push(HostAct::Accepted { src });
+                        acts.push(HostAct::Accepted { src, via });
                     }
                     // 同じ参加者の再送: コードを用意できていれば返し直す（失われた返事の分）。用意中なら何もしない。
                     HostState::Opening { src: s, id: i, .. } if *s == src && *i == id => {}
@@ -364,27 +413,30 @@ impl Host {
                         code,
                         ..
                     } if *s == src && *i == id => {
-                        acts.extend(send(src, &Msg::Offer { id, code }));
+                        acts.extend(send(src, via, &Msg::Offer { id, code }));
                     }
-                    // 同じアドレスからの新しい番号: 取りやめてやり直した同じ PC（開き直したソケットはポートも替わる）。返すコードを受け取る前なら
-                    // 前の申し込みを捨てて置き換える。用意したコードはまだ誰にも読まれていないので、そのまま返す。
+                    // 同じアドレスからの新しい番号: 取りやめてやり直した同じPC（開き直したソケットはポートも替わる）。
+                    // 返すコードを受け取る前なら前の申し込みを捨てて置き換える。
+                    // 用意したコードはまだ誰にも読まれていないのでそのまま返す。
                     HostState::Opening { src: s, since, .. } if s.ip() == src.ip() => {
                         self.state = HostState::Opening {
                             src,
+                            via,
                             id,
                             since: *since,
                         };
                     }
                     HostState::Offered { src: s, code, .. } if s.ip() == src.ip() => {
-                        acts.extend(send(src, &Msg::Offer { id, code }));
+                        acts.extend(send(src, via, &Msg::Offer { id, code }));
                         self.state = HostState::Offered {
                             src,
+                            via,
                             id,
                             code: code.clone(),
                             since: now,
                         };
                     }
-                    _ => acts.extend(send(src, &Msg::Refuse { id, why: Why::Busy })),
+                    _ => acts.extend(send(src, via, &Msg::Refuse { id, why: Why::Busy })),
                 }
             }
             Msg::Reply { id, code } => match &self.state {
@@ -393,30 +445,36 @@ impl Host {
                     acts.push(HostAct::DeliverReply {
                         code: code.to_string(),
                     });
-                    acts.extend(send(src, &Msg::ReplyAck { id }));
+                    acts.extend(send(src, via, &Msg::ReplyAck { id }));
                 }
                 // 確認が失われてクライアントが送り直した: 確認だけ返し直す（コードは渡し直さない）。
                 HostState::Replied { src: s, id: i } if *s == src && *i == id => {
-                    acts.extend(send(src, &Msg::ReplyAck { id }));
+                    acts.extend(send(src, via, &Msg::ReplyAck { id }));
                 }
                 _ => {}
             },
             Msg::Watch { id, proto, build } => {
                 if let Some(why) = self.me.check(proto, build) {
-                    acts.extend(send(src, &Msg::Refuse { id, why }));
+                    acts.extend(send(src, via, &Msg::Refuse { id, why }));
                 } else if !self.watch_ok {
                     acts.extend(send(
                         src,
+                        via,
                         &Msg::Refuse {
                             id,
                             why: Why::WatchOff,
                         },
                     ));
                 } else if self.state == HostState::Linked {
-                    acts.push(HostAct::WatchWanted { src, id });
+                    if self.watch_allowed(*src.ip(), now) {
+                        acts.push(HostAct::WatchWanted { src, id, via });
+                    } else {
+                        self.watch_dropped = self.watch_dropped.saturating_add(1);
+                    }
                 } else {
                     acts.extend(send(
                         src,
+                        via,
                         &Msg::Refuse {
                             id,
                             why: Why::NotYet,
@@ -433,14 +491,54 @@ impl Host {
         acts
     }
 
+    /// `ip`へ観戦コードを今渡してよいかどうか。よければ渡したことを記録する。
+    fn watch_allowed(&mut self, ip: Ipv4Addr, now: u64) -> bool {
+        let recent = |t: u64| now.saturating_sub(t) < WATCH_PER_IP_MS;
+        if self
+            .watch_seen
+            .iter()
+            .flatten()
+            .any(|(i, t)| *i == ip && recent(*t))
+        {
+            return false;
+        }
+        if now.saturating_sub(self.watch_window.0) >= 1_000 {
+            self.watch_window = (now, 0);
+        }
+        if self.watch_window.1 >= WATCH_PER_SEC {
+            return false;
+        }
+        self.watch_window.1 = self.watch_window.1.saturating_add(1);
+        // 同じIPの枠、空きの枠、最も古い枠の順に使う。
+        let slot = self
+            .watch_seen
+            .iter()
+            .position(|e| e.is_some_and(|(i, _)| i == ip))
+            .or_else(|| self.watch_seen.iter().position(Option::is_none))
+            .or_else(|| {
+                self.watch_seen
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.map_or(0, |(_, t)| t))
+                    .map(|(n, _)| n)
+            });
+        if let Some(e) = slot.and_then(|n| self.watch_seen.get_mut(n)) {
+            *e = Some((ip, now));
+        }
+        true
+    }
+
     /// 始める側のコードを用意できた。参加者へ返す。
     pub fn offer_ready(&mut self, code: &str, now: u64) -> Vec<HostAct> {
-        let HostState::Opening { src, id, .. } = self.state else {
+        let HostState::Opening { src, via, id, .. } = self.state else {
             return Vec::new();
         };
-        let acts: Vec<HostAct> = send(src, &Msg::Offer { id, code }).into_iter().collect();
+        let acts: Vec<HostAct> = send(src, via, &Msg::Offer { id, code })
+            .into_iter()
+            .collect();
         self.state = HostState::Offered {
             src,
+            via,
             id,
             code: code.to_string(),
             since: now,
@@ -455,30 +553,38 @@ impl Host {
         }
     }
 
-    /// 観戦コードを用意できた（`WatchWanted` の答え）。
-    pub fn watch_code_ready(&self, src: SocketAddrV4, id: u32, code: &str) -> Vec<HostAct> {
-        send(src, &Msg::WatchCode { id, code })
+    /// 観戦コードを用意できた（`WatchWanted`の答え。`via`はその`WatchWanted`の値）。
+    pub fn watch_code_ready(
+        &self,
+        src: SocketAddrV4,
+        id: u32,
+        via: usize,
+        code: &str,
+    ) -> Vec<HostAct> {
+        send(src, via, &Msg::WatchCode { id, code })
             .into_iter()
             .collect()
     }
 
     /// 観戦コードを出せなかった（用意が無い・ホストの役でない、など）。
-    pub fn watch_refused(&self, src: SocketAddrV4, id: u32, why: Why) -> Vec<HostAct> {
-        send(src, &Msg::Refuse { id, why }).into_iter().collect()
-    }
-
-    /// 受けた参加者を断って待機へ戻す（呼び手がその相手を受けられないとき。例: ゲームのネットワークが別のアドレスで開いたまま）。
-    pub fn refuse_taken(&mut self) -> Vec<HostAct> {
-        let HostState::Opening { src, id, .. } = self.state else {
-            return Vec::new();
-        };
-        self.state = HostState::Waiting;
-        send(src, &Msg::Refuse { id, why: Why::Busy })
+    pub fn watch_refused(&self, src: SocketAddrV4, id: u32, via: usize, why: Why) -> Vec<HostAct> {
+        send(src, via, &Msg::Refuse { id, why })
             .into_iter()
             .collect()
     }
 
-    /// 時間が進んだ。待つ上限を過ぎたら一度だけ、コードの用意なら `TimedOut`（以後は何も受けない）、返すコードなら `Rewait`（待機へ戻る）。
+    /// 受けた参加者を断って待機へ戻す（呼び手がその相手を受けられないとき。例: ゲームのネットワークが別のアドレスで開いたまま）。
+    pub fn refuse_taken(&mut self) -> Vec<HostAct> {
+        let HostState::Opening { src, via, id, .. } = self.state else {
+            return Vec::new();
+        };
+        self.state = HostState::Waiting;
+        send(src, via, &Msg::Refuse { id, why: Why::Busy })
+            .into_iter()
+            .collect()
+    }
+
+    /// 時間が進んだ。待つ上限を過ぎたら一度だけ次を返す。コードを用意している間なら`TimedOut`（以後は何も受けない）。返すコードを待っている間なら`Rewait`（待機へ戻る）。
     pub fn tick(&mut self, now: u64) -> Vec<HostAct> {
         match &self.state {
             HostState::Opening { since, .. } if now.saturating_sub(*since) > HOST_WAIT_OFFER_MS => {
@@ -500,7 +606,7 @@ impl Host {
 pub enum ClientAct {
     /// ホストへ送る。
     Send(Vec<u8>),
-    /// ホストの始める側のコードが届いた（1 回だけ）。呼び手はこれを読んで返すコードを作り、`Client::reply_ready` へ渡す。
+    /// ホストの始める側のコードが届いた（1回だけ）。呼び手はこれを読んで返すコードを作り、`Client::reply_ready`へ渡す。
     DeliverOffer { code: String },
     /// 返すコードの受け取りを検証した。
     Done,
@@ -544,7 +650,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// `id` は申し込みの番号（呼び手が乱数で引く）。作った時刻から待ち始める。最初の 1 通は `start` で。
+    /// `id`は申し込みの番号（呼び手が乱数で生成する）。作った時刻から待ち始める。最初の1通は`start`で。
     pub fn new(me: Ver, id: u32, now: u64) -> Client {
         Client {
             me,
@@ -660,7 +766,7 @@ impl Client {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherAct {
     Send(Vec<u8>),
-    /// 観戦コードが届いた（1 回だけ）。
+    /// 観戦コードが届いた（1回だけ）。
     DeliverCode {
         code: String,
     },
@@ -814,7 +920,7 @@ mod tests {
             for cut in 0..b.len() {
                 assert!(decode(&b[..cut]).is_err(), "{m:?} を {cut} B で切った");
             }
-            // 0 は文字の検査でも落ちるので、表示できる文字（長さの検査だけが止める）でも足す。
+            // 0は文字の検査でも落ちる。そのため表示できる文字（長さの検査だけが止める）でも足す。
             for pad in [0u8, b'A'] {
                 let mut more = b.clone();
                 more.push(pad);
@@ -838,7 +944,7 @@ mod tests {
         .unwrap();
         refuse[HEADER_LEN] = 77;
         assert_eq!(decode(&refuse), Err(DecodeError::BadReason));
-        // 通信のバージョンが u8 に収まらない理由の値。
+        // 通信のバージョンがu8に収まらない理由の値。
         let mut refuse = encode(&Msg::Refuse {
             id: 1,
             why: Why::OtherVersion { theirs: 1 },
@@ -865,7 +971,7 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // 受ける側: 長さの欄と本文が合わない・上限を越える・表示できない文字。
+        // 受ける側: 長さのフィールドと本文が合わない・上限を越える・表示できない文字。
         let mut b = encode(&Msg::Offer { id: 1, code: "abc" }).unwrap();
         b[HEADER_LEN] = 4;
         assert_eq!(decode(&b), Err(DecodeError::BadLength));
@@ -898,7 +1004,7 @@ mod tests {
     fn sent(acts: &[HostAct]) -> Vec<(SocketAddrV4, Msg<'_>)> {
         acts.iter()
             .filter_map(|a| match a {
-                HostAct::Send { to, bytes } => Some((*to, decode(bytes).unwrap())),
+                HostAct::Send { to, bytes, .. } => Some((*to, decode(bytes).unwrap())),
                 _ => None,
             })
             .collect()
@@ -910,14 +1016,14 @@ mod tests {
         let (a, b) = (addr(10, 50000), addr(11, 50001));
         assert!(!h.is_taken());
         assert_eq!(
-            h.on_datagram(a, &join(100), 0),
-            vec![HostAct::Accepted { src: a }]
+            h.on_datagram(a, 0, &join(100), 0),
+            vec![HostAct::Accepted { src: a, via: 0 }]
         );
         assert!(h.is_taken());
         // 用意中の再送は何も返さない。
-        assert!(h.on_datagram(a, &join(100), 500).is_empty());
-        // 2 人目は断る。
-        let acts = h.on_datagram(b, &join(200), 600);
+        assert!(h.on_datagram(a, 0, &join(100), 500).is_empty());
+        // 2人目は断る。
+        let acts = h.on_datagram(b, 0, &join(200), 600);
         assert_eq!(
             sent(&acts),
             vec![(
@@ -941,7 +1047,7 @@ mod tests {
             )]
         );
         // 失われた返事の分、再送に同じコードを返す。
-        let acts = h.on_datagram(a, &join(100), 1300);
+        let acts = h.on_datagram(a, 0, &join(100), 1300);
         assert_eq!(
             sent(&acts),
             vec![(
@@ -958,7 +1064,7 @@ mod tests {
     fn a_reply_is_delivered_once_and_only_from_the_joiner() {
         let mut h = Host::new(ME, true);
         let (a, b) = (addr(10, 50000), addr(11, 50001));
-        h.on_datagram(a, &join(100), 0);
+        h.on_datagram(a, 0, &join(100), 0);
         h.offer_ready("OFFERCODE", 10);
         let reply = |id| {
             encode(&Msg::Reply {
@@ -968,9 +1074,9 @@ mod tests {
             .unwrap()
         };
         // 別のアドレス・別の番号の返すコードは読まない。
-        assert!(h.on_datagram(b, &reply(100), 20).is_empty());
-        assert!(h.on_datagram(a, &reply(999), 20).is_empty());
-        let acts = h.on_datagram(a, &reply(100), 30);
+        assert!(h.on_datagram(b, 0, &reply(100), 20).is_empty());
+        assert!(h.on_datagram(a, 0, &reply(999), 20).is_empty());
+        let acts = h.on_datagram(a, 0, &reply(100), 30);
         assert_eq!(
             acts.iter()
                 .filter(|a| matches!(a, HostAct::DeliverReply { .. }))
@@ -982,7 +1088,7 @@ mod tests {
         }));
         assert_eq!(sent(&acts), vec![(a, Msg::ReplyAck { id: 100 })]);
         // 確認が失われて送り直されても、渡し直さず確認だけ返す。
-        let acts = h.on_datagram(a, &reply(100), 530);
+        let acts = h.on_datagram(a, 0, &reply(100), 530);
         assert!(
             !acts
                 .iter()
@@ -1008,7 +1114,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            sent(&h.on_datagram(a, &old, 0)),
+            sent(&h.on_datagram(a, 0, &old, 0)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1024,7 +1130,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            sent(&h.on_datagram(a, &other, 0)),
+            sent(&h.on_datagram(a, 0, &other, 0)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1042,7 +1148,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            sent(&h.on_datagram(a, &w, 0))[0].1,
+            sent(&h.on_datagram(a, 0, &w, 0))[0].1,
             Msg::Refuse {
                 why: Why::OtherVersion { .. },
                 ..
@@ -1064,7 +1170,7 @@ mod tests {
         let mut h = Host::new(ME, true);
         // 対戦の接続前: まだ。
         assert_eq!(
-            sent(&h.on_datagram(a, &watch(1), 0)),
+            sent(&h.on_datagram(a, 0, &watch(1), 0)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1073,10 +1179,10 @@ mod tests {
                 }
             )]
         );
-        h.on_datagram(addr(10, 5), &join(7), 0);
+        h.on_datagram(addr(10, 5), 0, &join(7), 0);
         h.offer_ready("O", 1);
         assert_eq!(
-            sent(&h.on_datagram(a, &watch(2), 2)),
+            sent(&h.on_datagram(a, 0, &watch(2), 2)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1088,19 +1194,24 @@ mod tests {
         );
         h.linked();
         assert_eq!(
-            h.on_datagram(a, &watch(3), 3),
-            vec![HostAct::WatchWanted { src: a, id: 3 }]
+            h.on_datagram(a, 0, &watch(3), 3),
+            vec![HostAct::WatchWanted {
+                src: a,
+                id: 3,
+                via: 0
+            }]
         );
-        // 何人でも頼める（上限は観戦の側が見る）。
+        // 別のIPなら頼める（人数の上限は観戦の側が見る）。
         assert_eq!(
-            h.on_datagram(addr(21, 1), &watch(4), 4),
+            h.on_datagram(addr(21, 1), 0, &watch(4), 4),
             vec![HostAct::WatchWanted {
                 src: addr(21, 1),
-                id: 4
+                id: 4,
+                via: 0
             }]
         );
         assert_eq!(
-            sent(&h.watch_code_ready(a, 3, "WCODE")),
+            sent(&h.watch_code_ready(a, 3, 0, "WCODE")),
             vec![(
                 a,
                 Msg::WatchCode {
@@ -1110,7 +1221,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            sent(&h.watch_refused(a, 3, Why::WatchOff)),
+            sent(&h.watch_refused(a, 3, 0, Why::WatchOff)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1123,7 +1234,7 @@ mod tests {
         let mut off = Host::new(ME, false);
         off.linked();
         assert_eq!(
-            sent(&off.on_datagram(a, &watch(5), 0)),
+            sent(&off.on_datagram(a, 0, &watch(5), 0)),
             vec![(
                 a,
                 Msg::Refuse {
@@ -1134,7 +1245,7 @@ mod tests {
         );
         // 接続後の参加の申し込みは断る。
         assert!(matches!(
-            sent(&h.on_datagram(addr(30, 1), &join(77), 9))[0].1,
+            sent(&h.on_datagram(addr(30, 1), 0, &join(77), 9))[0].1,
             Msg::Refuse { why: Why::Busy, .. }
         ));
     }
@@ -1144,9 +1255,9 @@ mod tests {
         let mut h = Host::new(ME, true);
         let (old, again) = (addr(10, 50000), addr(10, 50007));
         let reply = |id| encode(&Msg::Reply { id, code: "R" }).unwrap();
-        h.on_datagram(old, &join(100), 0);
+        h.on_datagram(old, 0, &join(100), 0);
         // 用意中に置き換わる: 返事は無く、コードは新しい申し込みへ返る。
-        assert!(h.on_datagram(again, &join(200), 10).is_empty());
+        assert!(h.on_datagram(again, 0, &join(200), 10).is_empty());
         assert_eq!(
             sent(&h.offer_ready("OFFER", 20)),
             vec![(
@@ -1157,10 +1268,10 @@ mod tests {
                 }
             )]
         );
-        // コードを返した後も置き換わる: 同じコードを新しい申し込みへ返し、上限の時計も新しい申し込みから数える。
+        // コードを返した後も置き換わる: 同じコードを新しい申し込みへ返す。上限の時計も新しい申し込みから数える。
         let third = addr(10, 50011);
         assert_eq!(
-            sent(&h.on_datagram(third, &join(300), 20_000)),
+            sent(&h.on_datagram(third, 0, &join(300), 20_000)),
             vec![(
                 third,
                 Msg::Offer {
@@ -1171,21 +1282,21 @@ mod tests {
         );
         assert!(h.tick(20_000 + HOST_WAIT_REPLY_MS).is_empty());
         // 置き換えられた申し込みの返すコードは読まない。
-        assert!(h.on_datagram(again, &reply(200), 20_100).is_empty());
+        assert!(h.on_datagram(again, 0, &reply(200), 20_100).is_empty());
         // 別のアドレスは置き換えない。
         assert!(matches!(
-            sent(&h.on_datagram(addr(11, 50000), &join(400), 20_200))[0].1,
+            sent(&h.on_datagram(addr(11, 50000), 0, &join(400), 20_200))[0].1,
             Msg::Refuse { why: Why::Busy, .. }
         ));
-        // 返すコードを受け取った後は、同じアドレスでも断る。
+        // 返すコードを受け取った後は同じアドレスでも断る。
         assert!(
-            h.on_datagram(third, &reply(300), 20_300)
+            h.on_datagram(third, 0, &reply(300), 20_300)
                 .contains(&HostAct::DeliverReply {
                     code: "R".to_string()
                 })
         );
         assert!(matches!(
-            sent(&h.on_datagram(addr(10, 50013), &join(500), 20_400))[0].1,
+            sent(&h.on_datagram(addr(10, 50013), 0, &join(500), 20_400))[0].1,
             Msg::Refuse { why: Why::Busy, .. }
         ));
     }
@@ -1194,12 +1305,12 @@ mod tests {
     fn the_host_gives_up_when_the_code_or_the_reply_does_not_come() {
         let a = addr(10, 50000);
         let mut h = Host::new(ME, true);
-        h.on_datagram(a, &join(1), 0);
+        h.on_datagram(a, 0, &join(1), 0);
         assert!(h.tick(HOST_WAIT_OFFER_MS).is_empty());
         assert_eq!(h.tick(HOST_WAIT_OFFER_MS + 1), vec![HostAct::TimedOut]);
         assert!(h.tick(HOST_WAIT_OFFER_MS + 2).is_empty(), "2 回言わない");
         let mut h = Host::new(ME, true);
-        h.on_datagram(a, &join(1), 0);
+        h.on_datagram(a, 0, &join(1), 0);
         h.offer_ready("O", 100);
         assert!(h.tick(100 + HOST_WAIT_REPLY_MS).is_empty());
         assert_eq!(h.tick(100 + HOST_WAIT_REPLY_MS + 1), vec![HostAct::Rewait]);
@@ -1212,6 +1323,7 @@ mod tests {
         assert!(
             h.on_datagram(
                 a,
+                0,
                 &encode(&Msg::Reply { id: 1, code: "R" }).unwrap(),
                 40_000
             )
@@ -1219,8 +1331,8 @@ mod tests {
         );
         let b = addr(11, 50000);
         assert_eq!(
-            h.on_datagram(b, &join(2), 40_001),
-            vec![HostAct::Accepted { src: b }]
+            h.on_datagram(b, 0, &join(2), 40_001),
+            vec![HostAct::Accepted { src: b, via: 0 }]
         );
         // 受けた参加者を呼び手が受けられないとき: 断って待機へ戻す。
         assert_eq!(
@@ -1237,9 +1349,9 @@ mod tests {
         assert!(h.refuse_taken().is_empty(), "待機中は何も断らない");
         // 返すコードが届いた後は時間切れにならない。
         let mut h = Host::new(ME, true);
-        h.on_datagram(a, &join(1), 0);
+        h.on_datagram(a, 0, &join(1), 0);
         h.offer_ready("O", 0);
-        h.on_datagram(a, &encode(&Msg::Reply { id: 1, code: "R" }).unwrap(), 5);
+        h.on_datagram(a, 0, &encode(&Msg::Reply { id: 1, code: "R" }).unwrap(), 5);
         assert!(h.tick(10_000_000).is_empty());
     }
 
@@ -1253,7 +1365,7 @@ mod tests {
             b"HGLN",
             b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
         ] {
-            assert!(h.on_datagram(a, junk, 0).is_empty());
+            assert!(h.on_datagram(a, 0, junk, 0).is_empty());
         }
         assert!(!h.is_taken());
         // クライアント向けの種類をホストが受けても何もしない。
@@ -1267,7 +1379,7 @@ mod tests {
             },
         ] {
             assert!(
-                h.on_datagram(a, &encode(&m).unwrap(), 0).is_empty(),
+                h.on_datagram(a, 0, &encode(&m).unwrap(), 0).is_empty(),
                 "{m:?}"
             );
         }
@@ -1294,7 +1406,7 @@ mod tests {
                 code: "OFFER".to_string()
             }]
         );
-        // 返事の再送は 2 回渡さない。
+        // 返事の再送は2回渡さない。
         assert!(c.on_datagram(&offer).is_empty());
         // 申し込みはもう送り直さない。
         assert!(c.tick(5000).is_empty());
@@ -1386,5 +1498,185 @@ mod tests {
             w.on_datagram(&encode(&Msg::WatchCode { id: 8, code: "X" }).unwrap())
                 .is_empty()
         );
+    }
+
+    fn watch_msg(id: u32) -> Vec<u8> {
+        encode(&Msg::Watch {
+            id,
+            proto: ME.proto,
+            build: ME.build,
+        })
+        .unwrap()
+    }
+
+    fn linked_host() -> Host {
+        let mut h = Host::new(ME, true);
+        h.linked();
+        h
+    }
+
+    fn wanted(acts: &[HostAct]) -> usize {
+        acts.iter()
+            .filter(|a| matches!(a, HostAct::WatchWanted { .. }))
+            .count()
+    }
+
+    #[test]
+    fn the_same_ip_gets_a_watch_code_once_per_interval_and_the_rest_get_nothing() {
+        let mut h = linked_host();
+        let a = addr(20, 50100);
+        assert_eq!(wanted(&h.on_datagram(a, 0, &watch_msg(1), 0)), 1);
+        // 送り直し（`RETRY_MS`ごと）と、ポートと番号を替えた同じIP。どれにも何も返さない。
+        let same_ip = addr(20, 50999);
+        for (i, t) in [RETRY_MS, 2 * RETRY_MS, WATCH_PER_IP_MS - 1]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(h.on_datagram(a, 0, &watch_msg(1), t).is_empty(), "{t}");
+            assert!(
+                h.on_datagram(same_ip, 0, &watch_msg(50 + i as u32), t)
+                    .is_empty(),
+                "{t}"
+            );
+        }
+        assert_eq!(h.watch_dropped(), 6);
+        assert_eq!(
+            wanted(&h.on_datagram(a, 0, &watch_msg(1), WATCH_PER_IP_MS)),
+            1
+        );
+        // 別のIPは待たない。
+        assert_eq!(
+            wanted(&h.on_datagram(addr(21, 1), 0, &watch_msg(2), WATCH_PER_IP_MS)),
+            1
+        );
+    }
+
+    #[test]
+    fn watch_codes_across_all_ips_stop_at_the_per_second_cap() {
+        let mut h = linked_host();
+        let mut given = 0;
+        for i in 0..(2 * WATCH_PER_SEC) as u8 {
+            given += wanted(&h.on_datagram(addr(30 + i, 1), 0, &watch_msg(u32::from(i)), 5_000));
+        }
+        assert_eq!(given, WATCH_PER_SEC as usize);
+        assert_eq!(h.watch_dropped(), WATCH_PER_SEC);
+        // 次の1秒には断ったIPも受ける（IPごとの間隔は渡したIPだけに掛かる）。
+        let late = addr(30 + WATCH_PER_SEC as u8, 1);
+        assert_eq!(wanted(&h.on_datagram(late, 0, &watch_msg(99), 5_999)), 0);
+        assert_eq!(wanted(&h.on_datagram(late, 0, &watch_msg(99), 6_000)), 1);
+        // 覚える数（16）を越えるIPが来ても全体の上限は効いたまま。
+        let mut more = 0;
+        for i in 0..40u8 {
+            more +=
+                wanted(&h.on_datagram(addr(100 + i, 1), 0, &watch_msg(200), 6_000 + u64::from(i)));
+        }
+        assert_eq!(more, WATCH_PER_SEC as usize - 1);
+    }
+
+    #[test]
+    fn an_honest_watcher_whose_first_answer_was_lost_still_gets_the_code_in_time() {
+        let mut h = linked_host();
+        let a = addr(20, 50100);
+        let mut w = Watcher::new(ME, 7, 0);
+        let mut to_host: Vec<Vec<u8>> = w
+            .start()
+            .into_iter()
+            .filter_map(|x| match x {
+                WatcherAct::Send(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        let mut answers = 0;
+        let mut got = None;
+        for t in (0..=WATCH_WAIT_MS).step_by(50) {
+            for b in std::mem::take(&mut to_host) {
+                for act in h.on_datagram(a, 0, &b, t) {
+                    if let HostAct::WatchWanted { src, id, via } = act {
+                        answers += 1;
+                        // 最初の答えは失われた。
+                        if answers > 1 {
+                            for s in h.watch_code_ready(src, id, via, "WC") {
+                                if let HostAct::Send { bytes, .. } = s {
+                                    for wa in w.on_datagram(&bytes) {
+                                        if let WatcherAct::DeliverCode { code } = wa {
+                                            got = Some((t, code));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for wa in w.tick(t) {
+                match wa {
+                    WatcherAct::Send(b) => to_host.push(b),
+                    WatcherAct::TimedOut => panic!("観戦者が諦めた（{t} ms）"),
+                    _ => {}
+                }
+            }
+            if got.is_some() {
+                break;
+            }
+        }
+        let (t, code) = got.expect("観戦コードが届かない");
+        assert_eq!(code, "WC");
+        assert!(t <= WATCH_PER_IP_MS + RETRY_MS, "{t} ms");
+        assert_eq!(answers, 2);
+    }
+
+    #[test]
+    fn every_answer_leaves_from_the_listener_its_request_arrived_on() {
+        let mut h = Host::new(ME, true);
+        let (a, b) = (addr(10, 50000), addr(11, 50001));
+        assert_eq!(
+            h.on_datagram(a, 2, &join(100), 0),
+            vec![HostAct::Accepted { src: a, via: 2 }]
+        );
+        let via_of = |acts: &[HostAct]| -> Vec<(SocketAddrV4, usize)> {
+            acts.iter()
+                .filter_map(|x| match x {
+                    HostAct::Send { to, via, .. } => Some((*to, *via)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            via_of(&h.on_datagram(b, 1, &join(200), 1)),
+            [(b, 1)],
+            "断りは受けた受付用受信ソケットから"
+        );
+        // 別の受付用受信ソケットに多くの送信元が来ても参加者の受付用受信ソケットは変わらない。
+        for i in 0..70u16 {
+            let other = SocketAddrV4::new(
+                Ipv4Addr::new(10, 9, (i / 200) as u8, (i % 200) as u8 + 1),
+                40_000 + i,
+            );
+            h.on_datagram(other, 0, &join(1_000 + u32::from(i)), 1);
+        }
+        assert_eq!(
+            via_of(&h.offer_ready("O", 2)),
+            [(a, 2)],
+            "後から出すコードは参加者の受付用受信ソケットから"
+        );
+        assert_eq!(via_of(&h.on_datagram(a, 2, &join(100), 3)), [(a, 2)]);
+        let reply = encode(&Msg::Reply { id: 100, code: "R" }).unwrap();
+        assert_eq!(via_of(&h.on_datagram(a, 2, &reply, 4)), [(a, 2)]);
+        h.linked();
+        let c = addr(12, 50002);
+        let acts = h.on_datagram(c, 3, &watch_msg(5), 5);
+        assert_eq!(
+            acts,
+            vec![HostAct::WatchWanted {
+                src: c,
+                id: 5,
+                via: 3
+            }]
+        );
+        assert_eq!(via_of(&h.watch_code_ready(c, 5, 3, "W")), [(c, 3)]);
+        assert_eq!(via_of(&h.watch_refused(c, 5, 3, Why::WatchOff)), [(c, 3)]);
+        let mut r = Host::new(ME, true);
+        r.on_datagram(a, 4, &join(1), 0);
+        assert_eq!(via_of(&r.refuse_taken()), [(a, 4)]);
     }
 }

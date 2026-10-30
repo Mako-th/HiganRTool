@@ -1,11 +1,11 @@
 //! ランダム対戦の待ち列（`src/server/src/random_queue.ts`）のクライアントの純粋な部品。
 //!
-//! 待ち列に入ると、サーバーが来た順に 2 人ずつ組にし、組ごとに推測できない新しいルーム名を割り当てて 2 人へ返す。組になった後は
-//! 今のルームの手順（`room.rs`）へ、その名で入り直す。ここは待ち列の手順だけを持つ（ソケットも時計も持たない）。
-//! 順番は `queue`（待ち列に入った。期限つき）→ `paired`（割り当てたルーム名と、待ち列に先に入った側か）→ サーバーが 1000 で閉じる。
-//! 待つ間の ping / pong、期限の切れ方、閉じる番号と直前の error の文はルームと同じ（`room.rs`）。
-//! 割り当てられたルーム名は画面にもログにも出さない（人がそのルームへ割り込めないための秘密）。[`AssignedRoom`] の `Debug` は名を伏せる。
-//! 見張りのスレッドで回す。ゲームのスレッドでは呼ばない。
+//! 待ち列に入るとサーバーが来た順に2人ずつペアにする。ペアごとに推測できない新しいルーム名を割り当てて2人へ返答する。
+//! ペアになった後は今のルームの手順（`room.rs`）へその名で入り直す。ここは待ち列の手順だけを持つ（ソケットも時計も持たない）。
+//! 順番は`queue`（待ち列に入った。期限つき）→ `paired`（割り当てたルーム名と、待ち列に先に入った側かどうか）→ サーバーが1000で閉じる。
+//! 待つ間のping / pong、期限の切れ方、閉じる番号と直前のerrorの文はルームと同じ（`room.rs`）。
+//! 割り当てられたルーム名は画面にもログにも出さない（人がそのルームへ割り込めないための秘密）。[`AssignedRoom`]の`Debug`は名を伏せる。
+//! 監視の処理のスレッドで回す。ゲームのスレッドでは呼ばない。
 
 use crate::room::{CLIENT_ID_BYTES, CLIENT_ID_PARAM};
 use crate::room::{
@@ -14,23 +14,23 @@ use crate::room::{
     ROOM_TTL_MS, RoomName, Why, backstop, classify_http, hex_lower, parse_flat,
 };
 
-// ---------------- サーバーの決まり（見本 tests/fixtures/room/rules.json の random_*） ----------------
+// ---------------- サーバーの決まり（見本tests/fixtures/room/rules.jsonのrandom_*） ----------------
 
-/// 待ち列のパスの先頭。後ろにビルド番号（10 進）が付く（`rules.ts` の `RANDOM_PATH_PREFIX`）。
+/// 待ち列のパスの先頭。後ろにビルド番号（10進）が付く（`rules.ts`の`RANDOM_PATH_PREFIX`）。
 pub const RANDOM_PATH_PREFIX: &str = "/v0/random/";
-/// 待ち列の期限（`rules.ts` の `RANDOM_QUEUE_TTL_MS`。ルームの期限と同じ）。
+/// 待ち列の期限（`rules.ts`の`RANDOM_QUEUE_TTL_MS`。ルームの期限と同じ）。
 pub const RANDOM_QUEUE_TTL_MS: u64 = ROOM_TTL_MS;
-/// 割り当てられたルームの期限（`rules.ts` の `RANDOM_ROOM_TTL_MS`）。
+/// 割り当てられたルームの期限（`rules.ts`の`RANDOM_ROOM_TTL_MS`）。
 pub const RANDOM_ROOM_TTL_MS: u64 = 60 * 1000;
-/// 割り当てられるルーム名の先頭と、続く乱数の 16 進の文字数（`rules.ts` の `RANDOM_ROOM_PREFIX` / `RANDOM_ROOM_HEX_LEN`）。
-/// 利用者は `.` を打てない（[`RoomName::parse`]）ので、打ったルーム名とぶつからない。
+/// 割り当てられるルーム名の先頭と続く乱数の16進の文字数（`rules.ts`の`RANDOM_ROOM_PREFIX` / `RANDOM_ROOM_HEX_LEN`）。
+/// 利用者は`q.`で始まる名を打てない（[`RoomName::parse`]が断る）ので打ったルーム名とぶつからない。
 pub const RANDOM_ROOM_PREFIX: &str = "q.";
 pub const RANDOM_ROOM_HEX_LEN: usize = 30;
 
 const _: () = assert!(RANDOM_ROOM_PREFIX.len() + RANDOM_ROOM_HEX_LEN == ROOM_NAME_MAX);
 
-/// 待ち列へ接続するパス（`/v0/random/<ビルド番号>`、`id` があれば問い `?cid=…` を付ける。問いの書き方はルームのパスと同じ）。
-/// ビルド番号は 10 進で先頭に 0 を付けない（サーバーが 1 通りの書き方だけを受ける）。
+/// 待ち列へ接続するパス（`/v0/random/<ビルド番号>`。`id`があればクエリ`?cid=…`を付ける。クエリの書き方はルームのパスと同じ）。
+/// ビルド番号は10進で先頭に0を付けない（サーバーが1通りの書き方だけを受ける）。
 pub fn random_path(build: u32, id: Option<&[u8; CLIENT_ID_BYTES]>) -> String {
     let mut out = format!("{RANDOM_PATH_PREFIX}{build}");
     if let Some(id) = id {
@@ -45,7 +45,7 @@ pub fn random_path(build: u32, id: Option<&[u8; CLIENT_ID_BYTES]>) -> String {
     out
 }
 
-/// サーバーが待ち列で割り当てたルーム名。形は `q.` ＋ 小文字の 16 進 30 文字だけ（それ以外は受けない）。
+/// サーバーが待ち列で割り当てたルーム名。形は`q.` ＋ 小文字の16進30文字だけ（それ以外は受けない）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AssignedRoom(RoomName);
 
@@ -56,7 +56,7 @@ impl core::fmt::Debug for AssignedRoom {
 }
 
 impl AssignedRoom {
-    /// サーバーから届いた名を検証する。形が違えば `None`。
+    /// サーバーから届いた名を検証する。形が違えば`None`。
     pub fn parse(raw: &str) -> Option<AssignedRoom> {
         let hex = raw.strip_prefix(RANDOM_ROOM_PREFIX)?;
         let shape_ok = hex.len() == RANDOM_ROOM_HEX_LEN
@@ -79,17 +79,17 @@ impl AssignedRoom {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMsg {
-    /// 接続した直後に 1 回。`expires_at` は待ち列の期限（UNIX 秒）。
+    /// 接続した直後に1回。`expires_at`は待ち列の期限（UNIX秒）。
     Queue { expires_at: u64 },
-    /// 組になった。割り当てたルーム名と、待ち列に先に入った側か。
+    /// ペアになった。割り当てたルーム名と、待ち列に先に入った側かどうか。
     Paired { room: AssignedRoom, first: bool },
-    /// ping への自動応答。
+    /// pingへの自動応答。
     Pong,
-    /// 閉じる直前の 1 通。知らない名は `None`。
+    /// 閉じる直前の1通。知らない名は`None`。
     Error { code: Option<CloseCode> },
 }
 
-/// サーバーから届いた 1 通を読む。知らない `t`（`room` など、ルームの文を含む）は誤り。順番は見ない（[`QueueClient`] が見る）。
+/// サーバーから届いた1通を読む。知らない`t`（`room`などルームの文を含む）は誤り。順番は見ない（[`QueueClient`]が見る）。
 pub fn parse_queue_message(text: &str) -> Result<QueueMsg, MsgError> {
     if text.len() > MESSAGE_MAX_BYTES {
         return Err(MsgError::TooLarge { bytes: text.len() });
@@ -117,13 +117,13 @@ pub fn parse_queue_message(text: &str) -> Result<QueueMsg, MsgError> {
     }
 }
 
-// ---------------- クライアントの状態機械 ----------------
+// ---------------- クライアントのステートマシン ----------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueEvent {
-    /// 待ち列に入った。`expires_at` は待ち列の期限（UNIX 秒。表示の目安）。
+    /// 待ち列に入った。`expires_at`は待ち列の期限（UNIX秒。表示の目安）。
     Queued { expires_at: u64 },
-    /// 組になった（この直後に手順は終わる）。割り当てられたルームへ入り直す。`first` は待ち列に先に入った側。
+    /// ペアになった（この直後に手順は終わる）。割り当てられたルームへ入り直す。`first`は待ち列に先に入った側。
     Paired { room: AssignedRoom, first: bool },
     /// 手順が終わらなかった。
     Failed(Failure),
@@ -131,26 +131,29 @@ pub enum QueueEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueAction {
-    /// この文字をそのままテキストの文で送る（ping だけ）。
+    /// この文字をそのままテキストの文で送る（pingだけ）。
     Send(String),
     Notify(QueueEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueState {
-    /// 101 を待っている（運びは dll）。
+    /// 101を待っている（実際の通信はdllが行う）。
     Connecting,
-    /// 101 の後、`queue` を待っている。
+    /// 101の後、`queue`を待っている。
     AwaitQueue,
-    /// `queue` の後、組になる（`paired`）のを待っている。
+    /// `queue`の後、ペアになる（`paired`）のを待っている。
     AwaitPaired,
     Done,
     Failed(Failure),
 }
 
-/// 待ち列のクライアントの手順。I/O をせず、送る文と出来事の列を返す。使い方は [`crate::room::RoomClient`] と同じ
-/// （接続する前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、接続できなければ `on_transport_failed`。
-/// 以後、受けた文を `on_text`、閉じる番号を `on_close` へ。`next_wake` の時刻か、それより前に `poll` を呼ぶ）。
+/// 待ち列のクライアントの手順。I/Oをせず、送る文とイベントの列を返す。
+/// 使い方は[`crate::room::RoomClient`]と同じ。
+/// 接続する前に`new`を呼ぶ。
+/// 101なら`on_upgraded`、101でなければ`on_http_refused`、接続できなければ`on_transport_failed`を呼ぶ。
+/// 以後は受けた文を`on_text`、閉じる番号を`on_close`へ渡す。
+/// `next_wake`の時刻か、それより前に`poll`を呼ぶ。
 #[derive(Debug, Clone)]
 pub struct QueueClient {
     state: QueueState,
@@ -193,7 +196,7 @@ impl QueueClient {
             .map(|p| p.saturating_add(PONG_TIMEOUT_MS))
     }
 
-    /// 次に `poll` を呼ぶべき時刻（ms）。何も待っていなければ None。
+    /// 次に`poll`を呼ぶべき時刻（ms）。何も待っていなければNone。
     pub fn next_wake(&self) -> Option<u64> {
         [
             self.next_ping_ms,
@@ -217,7 +220,7 @@ impl QueueClient {
         vec![QueueAction::Notify(QueueEvent::Failed(f))]
     }
 
-    /// 101 を受けた。`queue` を待ち始め、ping の時計を回す。
+    /// 101を受けた。`queue`を待ち始め、pingの時計を回す。
     pub fn on_upgraded(&mut self, now: Now) -> Vec<QueueAction> {
         if self.state != QueueState::Connecting {
             return Vec::new();
@@ -244,7 +247,7 @@ impl QueueClient {
         }
     }
 
-    /// サーバーが閉じた。組になる前の 1000 は早すぎる終わり。
+    /// サーバーが閉じた。ペアになる前の1000は早すぎる終わり。
     pub fn on_close(&mut self, code: u16) -> Vec<QueueAction> {
         if self.is_finished() {
             return Vec::new();
@@ -260,7 +263,7 @@ impl QueueClient {
         if self.is_finished() {
             return Vec::new();
         }
-        // 文が届いた = サーバーまでの経路は生きている（pong に限らない）。
+        // 文が届いた = サーバーまでの経路は生きている（pongに限らない）。
         self.unanswered_ping_ms = None;
         let msg = match parse_queue_message(text) {
             Ok(m) => m,
@@ -288,14 +291,14 @@ impl QueueClient {
         }
     }
 
-    /// 順番違いの文（`queue` の前の `paired`・2 回目の `queue` など）。
+    /// 順番違いの文（`queue`の前の`paired`・2回目の`queue`など）。
     fn out_of_order(&mut self) -> Vec<QueueAction> {
         self.fail(Failure::Unresponsive(Why::BadMessage(MsgError::BadValue(
             "t",
         ))))
     }
 
-    /// 時計を進める。期限を過ぎていれば失敗、ping の時刻なら ping。
+    /// 時計を進める。期限を過ぎていれば失敗にし、pingの時刻ならpingを送る。
     pub fn poll(&mut self, now: Now) -> Vec<QueueAction> {
         if self.is_finished() || self.state == QueueState::Connecting {
             return Vec::new();
@@ -309,7 +312,7 @@ impl QueueClient {
             };
             return self.fail(f);
         }
-        // ping より先に見る（3 周目の後の 4 通目を送る前に切る）。
+        // pingより先に見る（3周目の後の4通目を送る前に切る）。
         if let Some(s) = self.silence_deadline_at()
             && now.ms >= s
         {
@@ -326,7 +329,7 @@ impl QueueClient {
     }
 }
 
-// 予備の期限の長さは、サーバーの期限の後ろに `DEADLINE_GRACE_MS` を足す（`backstop`）。ここで使う定数の取り込みを検査が検証する。
+// 予備の期限の長さは、サーバーの期限の後ろに`DEADLINE_GRACE_MS`を足す（`backstop`）。ここで使う定数を取り込めていることを検査が検証する。
 const _: () = assert!(DEADLINE_GRACE_MS > 0);
 
 #[cfg(test)]
@@ -355,7 +358,7 @@ mod tests {
         ))]
     }
 
-    /// 見本の `random_` で始まる鍵を全部読み、この部品の定数と突き合わせる（読まなかった鍵が残れば落ちる）。
+    /// 見本の`random_`で始まる鍵を全部読み、この部品の定数と突き合わせる（読まなかった鍵が残れば落ちる）。
     #[test]
     fn constants_match_the_random_keys_of_the_rules_fixture() {
         let list = parse_flat(RULES).expect("rules.json は平らな JSON");
@@ -392,7 +395,7 @@ mod tests {
             random_path(7, Some(&id)),
             format!("/v0/random/7?cid={}", "ab".repeat(CLIENT_ID_BYTES))
         );
-        // ルームのパスの問いと同じ書き方（サーバーの parseClientId が読む形）。
+        // ルームのパスの問いと同じ書き方（サーバーのparseClientIdが読む形）。
         let room = RoomName::parse("r").unwrap();
         assert_eq!(
             room.path_with_client(&id).split_once('?').map(|x| x.1),
@@ -422,13 +425,13 @@ mod tests {
         ] {
             assert_eq!(AssignedRoom::parse(bad), None, "{bad:?}");
         }
-        // 利用者が打てる名ではない（`.` が NotAscii）。サーバーの決まりは通る。
+        // 利用者が打てる名ではない（`q.`で始まる）。サーバーの決まりは通る。
         assert_eq!(
             RoomName::parse(ASSIGNED),
-            Err(RoomNameError::NotAscii { pos: 1 })
+            Err(RoomNameError::ReservedPrefix)
         );
         assert!(RoomName::parse_server_rules(ASSIGNED).is_ok());
-        assert!(!RoomName::accepts_char('.'));
+        assert!(RoomName::accepts_char('.'), "`.` 自体は使える");
         assert!(!ROOM_NAME_BAD_NAMES.contains(&ASSIGNED));
         // 打てる名どうしは割り当ての形にならない。
         for typed in [
@@ -440,7 +443,7 @@ mod tests {
         ] {
             assert_eq!(AssignedRoom::parse(typed), None, "{typed}");
         }
-        // 画面・ログに出さない名は Debug にも出ない。
+        // 画面・ログに出さない名はDebugにも出ない。
         assert!(!format!("{ok:?}").contains("0123456789"));
         let ev = QueueEvent::Paired {
             room: ok,
@@ -541,7 +544,7 @@ mod tests {
             })]
         );
         assert_eq!(c.state(), QueueState::AwaitPaired);
-        // 待つ間も ping を送り、pong を受ける。
+        // 待つ間もpingを送り、pongを受ける。
         assert_eq!(
             c.poll(t(PING_INTERVAL_MS + 1)),
             vec![QueueAction::Send(PING_TEXT.to_owned())]
@@ -561,7 +564,7 @@ mod tests {
         assert!(c.is_finished());
         assert_eq!(c.state(), QueueState::Done);
         assert_eq!(c.next_wake(), None, "終わったら時計を止める");
-        // サーバーの 1000 は終わった後なので何も起こさない。
+        // サーバーの1000は終わった後なので何も起こさない。
         assert_eq!(c.on_close(1000), vec![]);
         assert_eq!(c.state(), QueueState::Done);
         let mut c = QueueClient::new();
@@ -611,18 +614,18 @@ mod tests {
 
     #[test]
     fn the_client_fails_on_early_closes_expiry_and_silence() {
-        // 組になる前の 1000 は早すぎる終わり。
+        // ペアになる前の1000は早すぎる終わり。
         let mut c = QueueClient::new();
         joined(&mut c, 0);
         assert_eq!(c.on_close(1000), failed(Why::Closed(1000)));
-        // 待ち列の期限（サーバーの 4408）。
+        // 待ち列の期限（サーバーの4408）。
         let mut c = QueueClient::new();
         joined(&mut c, 0);
         assert_eq!(
             c.on_close(4408),
             vec![QueueAction::Notify(QueueEvent::Failed(Failure::Expired))]
         );
-        // サーバーが error を送ってから閉じる形。
+        // サーバーがerrorを送ってから閉じる形。
         let mut c = QueueClient::new();
         joined(&mut c, 0);
         assert_eq!(
@@ -653,11 +656,11 @@ mod tests {
             c.poll(t(deadline)),
             vec![QueueAction::Notify(QueueEvent::Failed(Failure::Expired))]
         );
-        // 101 の後に queue が来ない。
+        // 101の後にqueueが来ない。
         let mut c = QueueClient::new();
         c.on_upgraded(t(0));
         assert_eq!(c.poll(t(ROOM_GREETING_TIMEOUT_MS)), failed(Why::NoRoom));
-        // ping に pong が来ない。
+        // pingにpongが来ない。
         let mut c = QueueClient::new();
         joined(&mut c, 0);
         assert_eq!(c.poll(t(PING_INTERVAL_MS)).len(), 1);
@@ -680,7 +683,7 @@ mod tests {
         let mut c = QueueClient::new();
         joined(&mut c, 0);
         assert_eq!(c.on_transport_failed(), failed(Why::Lost));
-        // 終わった後に何が来ても、何も起こさない。
+        // 終わった後に何が来ても何も起こさない。
         assert_eq!(c.on_text(t(1), &paired_text(ASSIGNED, "first")), vec![]);
         assert_eq!(c.on_close(4408), vec![]);
         assert_eq!(c.poll(t(10_000_000)), vec![]);

@@ -1,5 +1,6 @@
-//! 観戦者へ断りを配る側（`spectate_refuse.rs`）の検査。ルーム名は合成の値だけ。接続する検査は loopback の偽サーバー（`net_room::fake`）と
-//! 本物の WinHTTP で実時間に回すので `#[ignore]`（全件の回が `--ignored` で走らせる）。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。
+//! 観戦者へ断りを送る配布側（`spectate_refuse.rs`）の検査。ルーム名は合成の値だけ。
+//! 接続する検査はloopbackの偽サーバー（`net_room::fake`）と本物のWinHTTPで実時間に回すので`#[ignore]`にしてある。全件の回が`--ignored`で走らせる。
+//! 外へは接続しない（`127.0.0.1`と`Proxy::Direct`）。
 use super::*;
 
 use std::sync::atomic::Ordering;
@@ -24,6 +25,11 @@ pub(crate) fn room_opts(base: &str) -> RoomOptions {
 
 const NAME: &str = "synth-refuse";
 
+/// サーバーに接続しない検査のチケット（形だけがサーバーと同じ合成の値）。
+fn synth_ticket() -> SeatTicket {
+    SeatTicket::parse("1790000000.1790086400.Rf2-_mRf2-_mRf2-_mRf2-_mRf2-_mRf2-_mRf2-_mM").unwrap()
+}
+
 #[test]
 fn the_counts_text_names_each_count_and_no_room() {
     let c = RefuseCounts {
@@ -31,12 +37,14 @@ fn the_counts_text_names_each_count_and_no_room() {
         refused: 2,
         wrong_role: 1,
         failed: 4,
+        evicted: 6,
+        bad_ticket: 7,
         connect_errors: 5,
         panicked: 0,
     };
     let t = c.text();
     assert!(
-        t.contains("入った 3（役が逆で閉じた 1）・拒否を送った 2・ルームの失敗 4・接続不能 5"),
+        t.contains("入った 3（役が逆で閉じた 1）・拒否を送った 2・ルームの失敗 4（入室許可の拒否 7）・後から成立した対戦に席を譲った 6・接続不能 5"),
         "{t}"
     );
     assert!(!t.contains("パニック"), "{t}");
@@ -49,10 +57,11 @@ fn dropping_the_refuser_stops_its_thread_even_when_the_server_is_unreachable() {
     let r = spawn(
         room_opts("ws://127.0.0.1:9"),
         &RoomName::parse(NAME).unwrap(),
+        synth_ticket(),
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    // 止まらないと join が返らないので、別のスレッドで手放して時間の上限で待つ。
+    // 止まらないとjoinが返らないので、別のスレッドで手放して時間の上限で待つ。
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         drop(r);
@@ -70,8 +79,9 @@ fn a_refuse_that_cannot_be_sent_ends_the_entry_and_the_caster_enters_again_later
     use higanr_core::spectate_room::CasterPhase;
     let srv = FakeServer::start();
     let shared = Arc::new(Shared::default());
-    let spec_room = RoomName::parse(NAME).unwrap().spectate_of();
-    let mut r = Runner::new(room_opts(&srv.base()), spec_room, Arc::clone(&shared));
+    let origin = RoomName::parse(NAME).unwrap();
+    let ticket = srv.mint_ticket(&origin.spectate_of());
+    let mut r = Runner::new(room_opts(&srv.base()), origin, ticket, Arc::clone(&shared));
     r.step(0);
     r.conn.as_mut().expect("入っていない").fail_sends_for_test();
     let t0 = Instant::now();
@@ -105,8 +115,10 @@ fn a_refusing_host_sends_refuse_and_enters_again_after_the_room_expires() {
     let srv = FakeServer::start();
     srv.knobs.room_ttl_ms.store(600, Ordering::Release);
     let shared = Arc::new(Shared::default());
-    let spec_room = RoomName::parse(NAME).unwrap().spectate_of();
-    let mut r = Runner::new(room_opts(&srv.base()), spec_room, Arc::clone(&shared));
+    let origin = RoomName::parse(NAME).unwrap();
+    let spec_room = origin.spectate_of();
+    let ticket = srv.mint_ticket(&spec_room);
+    let mut r = Runner::new(room_opts(&srv.base()), origin, ticket, Arc::clone(&shared));
     let t0 = Instant::now();
     while shared.counts().refused < 2 {
         assert!(
@@ -130,5 +142,57 @@ fn a_refusing_host_sends_refuse_and_enters_again_after_the_room_expires() {
     assert!(
         !paths.is_empty() && paths.iter().all(|p| p.starts_with(&want)),
         "観戦用のルームでないところへ入った: {paths:?}"
+    );
+    let queries = srv.seen.queries.lock().unwrap().clone();
+    assert!(
+        queries
+            .iter()
+            .all(|q| q.ends_with(&format!("ticket={}", ticket.as_str()))
+                && !q.to_ascii_lowercase().contains(NAME)),
+        "{queries:?}"
+    );
+}
+
+#[test]
+fn a_refuser_whose_ticket_is_refused_stops_and_one_that_loses_its_seat_waits_five_minutes() {
+    use higanr_core::spectate_room::{CASTER_EVICTED_MS, CasterPhase};
+    let joined = |r: &mut Runner, now: u64| {
+        assert_eq!(r.caster.poll(now), Some(CasterAction::Connect));
+        r.on_event(
+            Event::Joined {
+                role: higanr_core::room::Role::Offer,
+                expires_at: 0,
+            },
+            now,
+        );
+    };
+    let shared = Arc::new(Shared::default());
+    let mut r = Runner::new(
+        room_opts("ws://127.0.0.1:9"),
+        RoomName::parse(NAME).unwrap(),
+        synth_ticket(),
+        Arc::clone(&shared),
+    );
+    joined(&mut r, 0);
+    r.on_event(Event::Failed(Failure::BadTicket), 10);
+    assert_eq!(r.caster.status(10).phase, CasterPhase::GaveUp);
+    assert_eq!(r.caster.poll(3_600_000), None);
+    assert_eq!(shared.counts().bad_ticket, 1);
+    assert!(r.told);
+
+    let shared = Arc::new(Shared::default());
+    let mut r = Runner::new(
+        room_opts("ws://127.0.0.1:9"),
+        RoomName::parse(NAME).unwrap(),
+        synth_ticket(),
+        Arc::clone(&shared),
+    );
+    joined(&mut r, 0);
+    r.on_event(Event::Failed(Failure::PeerLeft), 10);
+    let c = shared.counts();
+    assert_eq!((c.evicted, c.failed), (1, 1), "{c:?}");
+    assert_eq!(
+        r.caster.status(10).next_entry_at,
+        Some(10 + CASTER_EVICTED_MS)
     );
 }

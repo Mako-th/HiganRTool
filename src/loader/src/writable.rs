@@ -1,8 +1,8 @@
-//! 起動の最初に、ツールのフォルダへ書き込めるかをチェックする（配るバージョンだけ）。
-//! Program Files のような管理者しか書けない場所では、更新もログの保存もできない。マニフェストの無い 32bit の exe は
-//! Windows が書き込みを `%LOCALAPPDATA%\VirtualStore` へ逃がし、作成は成功して見える（実測では、作ったファイルを開いた
-//! ハンドルのパスも VirtualStore を指し、存在の確認は逃がされた側を本来の場所の存在として答えた）。そこで、逃がし先に
-//! 同じファイルが現れたかで見分ける。書けなくても起動は止めない。
+//! 起動の最初にツールのフォルダへ書き込めるかをチェックする（配布バージョンだけ）。
+//! Program Filesのような管理者しか書き込めない場所では更新もログの保存もできない。
+//! マニフェストの無い32bitのexeでは、Windowsが書き込みを`%LOCALAPPDATA%\VirtualStore`へ逃がす。そのため作成は成功して見える。
+//! 実測では作ったファイルを開いたハンドルのパスもVirtualStoreを指した。存在の確認も逃がされた側を本来の場所の存在として答えた。
+//! そこで逃がし先に同じファイルが現れたかで見分ける。書き込めなくても起動は止めない。
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -18,13 +18,13 @@ pub const NOTICE_SECS: u64 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
     Writable,
-    /// 作れたが、本来のフォルダではなく VirtualStore に作られた。
+    /// 作れたが、本来のフォルダではなくVirtualStoreに作られた。
     Redirected,
-    /// 作れなかった（理由は OS の文）。
+    /// 作れなかった（理由はOSの文）。
     Denied(String),
 }
 
-/// 本物はファイルとコンソール、検査では偽物を差し込む。
+/// 本物はファイルとコンソール。検査では偽物を差し込む。
 pub trait Site {
     fn probe(&mut self, dir: &Path) -> Probe;
     fn say(&mut self, text: &str);
@@ -40,8 +40,8 @@ pub fn notice_text(lang: Lang) -> String {
     )
 }
 
-/// 書けなければ知らせて待つ。書けるかを返す。`dist` が偽なら何も試さない（開発用のビルドは作業ツリーの中から動かす）。
-/// `in_game_folder` なら、ゲームのフォルダへ一時ファイルでも作らないよう試さない。
+/// 書き込めなければ知らせて待つ。書き込めるかどうかを返す。`dist`が偽なら何も試さない（開発用のビルドは作業ツリーの中から動かす）。
+/// `in_game_folder`ならゲームのフォルダへ一時ファイルでも作らないよう試さない。
 pub fn check(
     dist: bool,
     in_game_folder: bool,
@@ -70,7 +70,7 @@ pub fn check(
     false
 }
 
-/// 逃がされたときに作られる場所: `%LOCALAPPDATA%\VirtualStore\` の下に、ドライブ名を除いた元のパスが続く。
+/// 逃がされたときに作られる場所: `%LOCALAPPDATA%\VirtualStore\`の下にドライブ名を除いた元のパスが続く。
 pub fn virtual_counterpart(file: &Path, local_app_data: &Path) -> PathBuf {
     let rest: PathBuf = file
         .components()
@@ -86,7 +86,7 @@ pub fn virtual_counterpart(file: &Path, local_app_data: &Path) -> PathBuf {
 
 /// 本物の試し。一時ファイルを作って消す。
 pub struct FsProbe {
-    /// `%LOCALAPPDATA%`（読めなければ逃がされたかは見分けられず、作れたら書けるとみなす）。
+    /// `%LOCALAPPDATA%`（読み取れなければ逃がされたかどうかは見分けられず、作れたら書き込めるとみなす）。
     pub local_app_data: Option<PathBuf>,
     pub exists: Box<dyn FnMut(&Path) -> bool>,
 }
@@ -122,7 +122,7 @@ impl FsProbe {
     }
 }
 
-/// 本番: 試しは `FsProbe`、知らせはコンソール、記録は段階ログ。
+/// 本番: 試しは`FsProbe`、知らせはコンソール、記録は段階ログ。
 pub struct RealSite(pub FsProbe);
 
 impl Site for RealSite {
@@ -299,7 +299,7 @@ mod tests {
             "一時ファイルが残った"
         );
         assert_eq!(std::fs::read_dir(&local).unwrap().count(), 0);
-        // %LOCALAPPDATA% が読めなくても、作れれば書けるとみなす。
+        // %LOCALAPPDATA%が読めなくても作れれば書き込めるとみなす。
         let mut p = FsProbe {
             local_app_data: None,
             exists: Box::new(|p| p.exists()),
@@ -357,7 +357,7 @@ mod tests {
         assert!(!asked[1].exists(), "逃がし先のファイルが残った");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 
-        // 逃がし先に元からあった同名のファイルは、逃がしの印にしない。
+        // 逃がし先に元からあった同名のファイルは逃がしの印にしない。
         let mut p = FsProbe {
             local_app_data: Some(local.clone()),
             exists: Box::new(|_| true),

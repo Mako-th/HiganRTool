@@ -1,12 +1,26 @@
-//! rollback の可否実験の判断（pure。unsafe 無し。Win32・ゲームのメモリ・入口のアセンブリは `rollback_win.rs`）。
+//! rollbackの可否実験の判断（pure。unsafe無し。Win32・ゲームのメモリ・入口のアセンブリは`rollback_win.rs`）。
 //!
-//! 問い: マッチの中のある tick T の始まりで状態をコピー、k tick 進めてからコピーを書き戻し、同じ入力で k tick 進め直すと、同じ状態に着くか。手順（1 回ぶん。どれも入力の地点 = tick の始まりで、ゲームのスレッドで）:
-//! 1. マッチに入って `start_seconds` 秒（その後は `gap_ticks`）経った tick T の始まり: 範囲の表（決まった塊・EffectSys の要素の配列・.data の範囲・DLL の領域と割り当て器の状態）を作り、コピー S を取る。台本はこの tick から普通に feed し、そのワード（1P・2P）を k 個記録する。
-//! 2. T + k の始まり: 期間の中で「書き戻すと壊れること」が起きていないかを見る。起きていれば書き戻さずに捨てる。起きていなければ今の状態を D1 としてコピー、S を書き戻し、記録した 1 個目のワードを feed する（台本は進めない）。続く k − 1 tick は記録したワードを順に feed する。
-//! 3. 次の始まり（D2）: D1 のコピーと今の状態を、範囲ごとにダイジェストで比べ、違った範囲だけバイトで比べる。
+//! 問い: マッチの中のあるtick Tの始まりで状態をコピーする。k tick進めてからコピーを書き戻し、同じ入力でk tick進め直すと、同じ状態に着くか。
+//! 手順（1回ぶん。どれもゲームのスレッドで、入力の地点 = tick の始まりに行う）:
+//! 1. マッチに入って`start_seconds`秒（その後は`gap_ticks`）経ったtick Tの始まり: 範囲の表（決まったブロック・EffectSysの要素の配列・.dataの範囲・DLLの領域とアロケータの状態）を作り、コピーSを取る。
+//!    台本はこのtickから普通にfeedし、そのワード（1P・2P）をk個記録する。
+//! 2. T + k の始まり: 期間の中で「書き戻すと壊れること」が起きていないかを見る。
+//!    起きていれば書き戻さずに捨てる。
+//!    起きていなければ今の状態をD1としてコピーし、Sを書き戻し、記録した1個目のワードをfeedする（台本は進めない）。
+//!    続くk − 1 tickは記録したワードを順にfeedする。
+//! 3. 次の始まり（D2）: D1のコピーと今の状態を範囲ごとにダイジェストで比べ、違った範囲だけバイトで比べる。
 //!
-//! 捨てる条件（書き戻した状態が「もう無い物」を指すか、状態の外と食い違う）: 期間の中でゲームのスレッドが DLL の領域の外の塊（CRT の塊）を解放した / 別のスレッドが DLL の領域の塊を解放しようとした・領域の塊の解放が壊れていた・領域が足りず CRT へ回した確保があった / 更新の列・描画の列の並びが変わった（ScreenEffect の登録と解除。列のリンクはレジストリにありコピーしていない）/ 決まった塊のポインタ・EffectSys の要素の数が変わった / マッチを出た / 台本が feed しなかった tick がある。
-//! 確保・ファイル・ロック待ち・パニックを持たない（`Probe` の中身は固定長）。
+//! 捨てる条件は次のどれか（書き戻した状態が「もう無いもの」を指すか、状態の外と食い違う場合）。
+//! - 期間の中でゲームのスレッドがDLLの領域の外のブロック（CRTのブロック）を解放した。
+//! - 別のスレッドがDLLの領域のブロックを解放しようとした。
+//! - 領域のブロックの解放が壊れていた。
+//! - 領域が足りずCRTへ回した確保があった。
+//! - 更新の列・描画の列の並びが変わった（ScreenEffectの登録と解除。列のリンクはレジストリにありコピーしていない）。
+//! - 決まったブロックのポインタ・EffectSysの要素の数が変わった。
+//! - マッチを出た。
+//! - 台本がfeedしなかったtickがある。
+//!
+//! 確保・ファイル・ロック待ち・パニックを持たない（`Probe`の中身は固定長）。
 #![forbid(unsafe_code)]
 
 use higanr_core::arena::{ArenaMem, ArenaState, STATE_WORDS};
@@ -17,9 +31,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::rollback_draw::{self, DrawDiag, SkipDraw};
 use crate::rollback_resim::{self, ResimMode, ResimRec};
 
-// ---- 表の型（値は `th09_addr`）----
+// ---- 表の型（値は`th09_addr`）----
 
-/// 決まった塊（ポインタが入っているアドレスと大きさ）。
+/// 決まったブロック（ポインタが入っているアドレスと大きさ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbBlock {
     pub name: &'static str,
@@ -28,7 +42,7 @@ pub struct RbBlock {
     pub source: &'static str,
 }
 
-/// EffectSys の要素の配列（EffectSys のポインタが入っているアドレスと、要素の数・足し分の想定）。
+/// EffectSysの要素の配列（EffectSysのポインタが入っているアドレスと要素の数・足し分の想定）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbEffect {
     pub name: &'static str,
@@ -38,9 +52,10 @@ pub struct RbEffect {
     pub source: &'static str,
 }
 
-/// 塊の中のポインタと本数で決まる VM の配列（陣の背景の `bgscroll`）。読み込みのスレッドが CRT から取るので塊のコピーに入らず、
-/// 本数は読み込みの後に決まる。コピーのバッファは `max` 本ぶんを取り、回ごとに `[[owner]+ptr_off]` から `[[owner]+count_off]` 本
-/// （i32）だけをコピーする。本数が 0 以下・`max` を越える・ポインタが 0 ならコピーしない（長さ 0）。
+/// ブロックの中のポインタと本数で決まるVMの配列（陣の背景の`bgscroll`）。
+/// 読み込みのスレッドがCRTから確保するので、ブロックのコピーには入らない。本数は読み込みの後に決まる。
+/// コピーのバッファは`max`本ぶんを確保し、回ごとに`[[owner]+ptr_off]`から`[[owner]+count_off]`本（i32）だけをコピーする。
+/// 本数が0以下・`max`を越える・ポインタが0ならコピーしない（長さ0）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbVmArray {
     pub name: &'static str,
@@ -53,12 +68,12 @@ pub struct RbVmArray {
     pub source: &'static str,
 }
 
-/// VM の配列の今の形（`vm_array_shape`）。`len` はコピーするバイト数（コピーしないときは 0）。
+/// VMの配列の今の形（`vm_array_shape`）。`len`はコピーするバイト数（コピーしないときは0）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmShape {
-    /// 塊の欄のポインタ（読めた値。コピーしないときも残す —— 測る入口が上限を越えた陣も読む）。
+    /// ブロックのフィールドのポインタ（読めた値。コピーしないときも残す —— 測る入口が上限を越えた陣も読む）。
     pub addr: u32,
-    /// 塊の欄の本数（読めた値。負もありうる）。
+    /// ブロックのフィールドの本数（読めた値。負もありうる）。
     pub count: i32,
     pub len: u32,
 }
@@ -77,9 +92,10 @@ impl VmShape {
     }
 }
 
-/// VM の配列 `v` の今のアドレス・本数・コピーする長さを読む。持ち主の塊のポインタが読めない・0 なら断る。配列のポインタ・本数が読めない・
-/// 0・上限を越えるときは長さ 0（コピーしない）を返す: 背景の VM は見た目だけ（乱数の変数を使う ANM は `etama.anm` だけで、
-/// `world*.anm` は 0 件）なので、コピーできない陣は直す前と同じ形に残し、巻き戻しは止めない。
+/// VMの配列`v`の今のアドレス・本数・コピーする長さを読む。
+/// 所有者のブロックのポインタが読めない・0なら断る。
+/// 配列のポインタ・本数が読めない・0・上限を越えるときは長さ0（コピーしない）を返す。
+/// 背景のVMは見た目だけ（乱数の変数を使うANMは`etama.anm`だけで`world*.anm`は0件）なので、コピーできない陣は直す前と同じ形に残し、巻き戻しは止めない。
 pub fn vm_array_shape(
     t: &Tables,
     v: &RbVmArray,
@@ -108,13 +124,13 @@ pub fn vm_array_shape(
     let len = if addr == 0 || count <= 0 || count as u32 > v.max {
         0
     } else {
-        // count ≤ max なので、バッファの大きさ（max × elem。`Layout::plan` が溢れを断った）を越えない。
+        // count ≤ maxなのでバッファの大きさ（max × elem。`Layout::plan`が溢れを断った）を越えない。
         count as u32 * v.elem
     };
     Ok(VmShape { addr, count, len })
 }
 
-/// コピーする .data の範囲 `[start, end)`。
+/// コピーする .dataの範囲`[start, end)`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbData {
     pub name: &'static str,
@@ -123,7 +139,7 @@ pub struct RbData {
     pub source: &'static str,
 }
 
-/// DLL の領域へ向けない呼び出し元の範囲 `[start, end)`。
+/// DLLの領域へ向けない呼び出し元の範囲`[start, end)`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbCallers {
     pub start: u32,
@@ -131,7 +147,7 @@ pub struct RbCallers {
     pub why: &'static str,
 }
 
-/// 比べない所の 1 行（コピーと書き戻しはする。D1 と D2 の比べからだけ外す）。見分け方は `kind`。
+/// 比べない所の1行（コピーと書き戻しはする。D1とD2の比べからだけ外す）。見分け方は`kind`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RbSkip {
     pub name: &'static str,
@@ -139,13 +155,14 @@ pub struct RbSkip {
     pub source: &'static str,
 }
 
-/// 比べない所の見分け方。どれも「外すのは fps の値が入る所だけ」の粒度で書く（範囲を丸ごと外すと本物のずれを隠す）。
+/// 比べない所の見分け方。どれも「外すのはfpsの値が入る所だけ」の粒度で書く（範囲を丸ごと外すと本物のずれを隠す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RbSkipKind {
-    /// ゲームのアドレスの範囲 `[start, end)`（中の語が全部その値の欄のとき）。
+    /// ゲームのアドレスの範囲`[start, end)`（中の語が全部その値の欄のとき）。
     Range { start: u32, end: u32 },
-    /// 文字の列 `list` の `count` 本（1 本 `stride` バイト）のうち、D1 と D2 の両方で `+pos_off` の 3 語が `pos` と同じ
-    /// 枠の、先頭から `text` バイト（文字の欄）。何番目の枠に入るかが回ごとに変わる文字を、位置の欄で見分ける。
+    /// 文字の列`list`の`count`本（1本`stride`バイト）のうち条件を満たす枠の先頭から`text`バイト（文字のフィールド）。
+    /// 条件は、D1とD2の両方で`+pos_off`の3ワードが`pos`と同じこと。
+    /// 何番目の枠に入るかが回ごとに変わる文字を、位置のフィールドで見分ける。
     TextAt {
         list: u32,
         stride: u32,
@@ -154,8 +171,8 @@ pub enum RbSkipKind {
         pos_off: u32,
         pos: [u32; 3],
     },
-    /// DLL の領域の中で、札（確保の呼び出し元）が `callers` のどれかの塊のうち、書き位置 `[[ptr_at] + cursor_off]` が
-    /// S の始まりから D1・D2 の始まりまでに進んだバイト（`cursor_span`）。書き位置は `Probe` が 3 つの始まりで読む（`Marks`）。
+    /// DLLの領域の中でタグ（確保の呼び出し元）が`callers`のどれかのブロックのうち、書き位置`[[ptr_at] + cursor_off]`がSの始まりからD1・D2の始まりまでに進んだバイト（`cursor_span`）。
+    /// 書き位置は`Probe`が3つの始まりで読む（`Marks`）。
     Cursor {
         callers: &'static [u32],
         ptr_at: u32,
@@ -163,17 +180,17 @@ pub enum RbSkipKind {
     },
 }
 
-/// コピーする範囲の表（本物は `Tables::th09()`、検査では小さな偽物）。
+/// コピーする範囲の表（本物は`Tables::th09()`・検査では小さな偽物）。
 #[derive(Debug, Clone, Copy)]
 pub struct Tables {
     pub blocks: &'static [RbBlock],
     pub effects: &'static [RbEffect],
-    /// 塊の中のポインタと本数で決まる VM の配列（製品の経路だけ。実験の経路は空にして、その入口の挙動を変えない）。
+    /// ブロックの中のポインタと本数で決まるVMの配列（製品の経路だけ。実験の経路は空にしてその入口の挙動を変えない）。
     pub vm_arrays: &'static [RbVmArray],
     pub data: &'static [RbData],
-    /// 比べない所（`MAX_SKIP_ROWS` 行まで）。
+    /// 比べない所（`MAX_SKIP_ROWS`行まで）。
     pub skips: &'static [RbSkip],
-    /// EffectSys の中の要素の配列のポインタ・数・足し分の位置と、要素の大きさ。
+    /// EffectSysの中の要素の配列のポインタ・数・足し分の位置と要素の大きさ。
     pub effect_ptr: u32,
     pub effect_count: u32,
     pub effect_extra: u32,
@@ -185,8 +202,10 @@ impl Tables {
         Self::th09_with(crate::th09_addr::ROLLBACK_DATA, &[])
     }
 
-    /// 製品の経路（`rollback_play`）の表。実験の表との違いは、.data に更新の列のつなぎ（レジストリの先頭の 2 つの節 0x40 B）を足し、
-    /// fps の計測の 6 語を外し（`th09_addr::ROLLBACK_PLAY_DATA`）、陣の背景の VM の配列（`th09_addr::ROLLBACK_VM_ARRAYS`）を足すこと。
+    /// 製品の経路（`rollback_play`）の表。実験の表との違いは次のとおり。
+    /// - .dataに更新の列のつなぎ（レジストリの先頭の2つのノード0x40 B）を足す。
+    /// - fpsの計測の6ワードを外す（`th09_addr::ROLLBACK_PLAY_DATA`）。
+    /// - 陣の背景のVMの配列（`th09_addr::ROLLBACK_VM_ARRAYS`）を足す。
     pub fn th09_play() -> Self {
         Self::th09_with(
             crate::th09_addr::ROLLBACK_PLAY_DATA,
@@ -219,7 +238,7 @@ impl Tables {
 
 // ---- ini ----
 
-/// 節の名前（`HiganRTool.ini`。`[alloc_count]` と同じファイル）。
+/// カテゴリの名前（`HiganRTool.ini`。`[alloc_count]`と同じファイル）。
 pub const SECTION: &str = "rollback_probe";
 const KEYS: [&str; 8] = [
     "enable",
@@ -231,11 +250,11 @@ const KEYS: [&str; 8] = [
     "resim",
     rollback_draw::INI_KEY,
 ];
-/// k の値の数の上限と、k の上限（記録する語の領域の大きさ。600 tick = 10 秒）。
+/// kの値の数の上限とkの上限（記録するワードの領域の大きさ。600 tick = 10秒）。
 pub const MAX_KS: usize = 8;
 pub const MAX_K: u32 = 600;
 pub const MAX_RECORDS: usize = 120;
-/// 1 秒の tick の数（マッチの中は 60 tick/秒。実測で 59〜61）。
+/// 1秒のtickの数（マッチの中は60 tick/秒。実測で59〜61）。
 pub const TICKS_PER_SECOND: u32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +265,7 @@ pub struct Settings {
     pub trials_per_k: u32,
     pub gap_ticks: u32,
     pub arena_bytes: u32,
-    /// 進め直しの形（既定は実時間の k フレーム。`frame` は 1 回の描画の中で走査を k 回 —— `rollback_resim.rs`）。
+    /// 進め直しの形（既定は実時間のkフレーム。`frame`は1回の描画の中で走査をk回 —— `rollback_resim.rs`）。
     pub resim: ResimMode,
 }
 
@@ -269,7 +288,7 @@ fn in_range(key: &str, v: u32, lo: u32, hi: u32) -> Result<u32, String> {
     }
 }
 
-/// ini の本文から読む。`[rollback_probe]` が無い・`enable = 0` なら `Ok(None)`。知らないキーは断る。
+/// iniの本文から読む。`[rollback_probe]`が無い・`enable = 0`なら`Ok(None)`。知らないキーは断る。
 pub fn settings_from_text(text: &str) -> Result<Option<Settings>, String> {
     let ini = ini::parse(text).map_err(|e| e.to_string())?;
     if !ini.has_section(SECTION) {
@@ -320,7 +339,7 @@ pub fn settings_from_text(text: &str) -> Result<Option<Settings>, String> {
         None => ResimMode::Realtime,
         Some(v) => ResimMode::parse(v)?,
     };
-    // 値の綴りの誤りはここで断る（本物の読み出しは `skip_draw_from_text`）。
+    // 値の綴りの誤りはここで断る（本物の読み出しは`skip_draw_from_text`）。
     skip_draw_from_ini(&ini)?;
     Ok(Some(Settings {
         start_ticks: start_seconds * TICKS_PER_SECOND,
@@ -340,17 +359,18 @@ fn skip_draw_from_ini(ini: &ini::Ini) -> Result<SkipDraw, String> {
     }
 }
 
-/// 描画用の欄の除外（`skip_draw_fields`。既定は `none` = 数えるだけで比べの結果は変えない）。`Settings` には入れず別に読む
-/// （検査が多く組み立てるので、除外は `Probe::set_skip_draw` で渡す）。綴りは `settings_from_text` が先に断っている。
+/// 描画用のフィールドの除外（`skip_draw_fields`。既定は `none` = カウントするだけで比較の結果は変えない）。
+/// `Settings`には含めず別に読む。検査が多く組み立てるので、除外は`Probe::set_skip_draw`で渡す。
+/// 綴りは`settings_from_text`が先に断っている。
 pub fn skip_draw_from_text(text: &str) -> Result<SkipDraw, String> {
     skip_draw_from_ini(&ini::parse(text).map_err(|e| e.to_string())?)
 }
 
 // ---- 範囲の表 ----
 
-/// 範囲の数の上限（本物は塊 20・要素の配列 3・.data 7・領域・割り当て器の状態 = 32。製品の経路は .data に更新の列のレジストリを
-/// 足して 33、陣の背景の VM の配列 2 本を足して 35 でちょうど埋まる）。越えると `Layout::plan` が断り、`arm` が「範囲の表を
-/// 作れない」と書いて入れない（黙って範囲を落とさない）。
+/// 範囲の数の上限（本物はブロック20・要素の配列3・.data 7・領域・アロケータの状態 = 32）。
+/// 製品の経路は .dataに更新の列のレジストリを足して33、陣の背景のVMの配列2本を足して35でちょうど埋まる。
+/// 越えると`Layout::plan`が断り、`arm`が「範囲の表を作れない」と書いて有効にしない（黙って範囲を落とさない）。
 pub const MAX_REGIONS: usize = 35;
 pub const STATE_BYTES: u32 = STATE_WORDS as u32 * 4;
 
@@ -358,14 +378,14 @@ pub const STATE_BYTES: u32 = STATE_WORDS as u32 * 4;
 pub enum RegionKind {
     Block(u8),
     Effect(u8),
-    /// 塊の中のポインタと本数で決まる VM の配列（`Tables::vm_arrays` の番号）。長さは回ごとに変わり、0 ならコピーしない。
+    /// ブロックの中のポインタと本数で決まるVMの配列（`Tables::vm_arrays`の番号）。長さは回ごとに変わる。0ならコピーしない。
     VmArray(u8),
     Data(u8),
     Arena,
     ArenaState,
 }
 
-/// 1 つの範囲。`buf_off` はコピーのバッファの中の位置（`cap` ずつ並ぶ。範囲の表の形で決まり、回ごとに変わらない）。
+/// 1つの範囲。`buf_off`はコピーのバッファの中の位置（`cap`ずつ並ぶ。範囲の表の形で決まり、回ごとに変わらない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     pub kind: RegionKind,
@@ -389,24 +409,24 @@ pub struct Layout {
     pub regions: [Region; MAX_REGIONS],
 }
 
-/// 範囲の表を作れなかった理由（`u8` は範囲の番号）。
+/// 範囲の表を作れなかった理由（`u8`は範囲の番号）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutError {
-    /// ポインタが 0。
+    /// ポインタが0。
     Null(u8),
-    /// ポインタ・EffectSys の欄が読めない。
+    /// ポインタ・EffectSysのフィールドが読めない。
     Unreadable(u8),
-    /// EffectSys の要素の数・足し分が想定と違う。
+    /// EffectSysの要素の数・足し分が想定と違う。
     EffectShape { region: u8, count: u32, extra: u32 },
-    /// 範囲がコミット済みで書ける頁でない。
+    /// 範囲がコミット済みで書き込み可能なページではない。
     NotWritable(u8),
 }
 
 impl Layout {
-    /// 範囲の表の形（バッファの中の位置と大きさ）を決める。.data の範囲はアドレスも決まる。塊と要素の配列のアドレスは
-    /// `fill` が回ごとに読む。
+    /// 範囲の表の形（バッファの中の位置と大きさ）を決める。.dataの範囲はアドレスも決まる。
+    /// ブロックと要素の配列のアドレスは`fill`が回ごとに読む。
     pub fn plan(t: &Tables, arena_base: u32, arena_bytes: u32) -> Result<Layout, String> {
-        // 書き位置の記録（`Marks`）は行の番号で引くので、領域を越える行があると黙って外し損ねる。先に断る。
+        // 書き位置の記録（`Marks`）は行の番号で参照するので領域を越える行があると黙って外し損ねる。先に断る。
         if t.skips.len() > MAX_SKIP_ROWS {
             return Err(format!(
                 "比較対象外の表が {} 行です（{MAX_SKIP_ROWS} 行まで）",
@@ -476,7 +496,7 @@ impl Layout {
         self.regions().iter().map(|r| r.cap).sum()
     }
 
-    /// 塊・要素の配列のアドレスと長さが同じか（領域の長さは比べない）。
+    /// ブロック・要素の配列のアドレスと長さが同じかどうか（領域の長さは比べない）。
     pub fn same_places(&self, o: &Layout) -> bool {
         self.n == o.n
             && self
@@ -487,12 +507,12 @@ impl Layout {
     }
 }
 
-/// 範囲の表を埋めるのに要るインターフェース（`fill_layout`）。実験は `ProbeIo` から（`fill`）、製品の経路は `rollback_play` の
-/// インターフェースから渡す（同じ手順を 2 つ書かないため）。
+/// 範囲の表を埋めるのに要るインターフェース（`fill_layout`）。
+/// 実験は`ProbeIo`から（`fill`）、製品の経路は`rollback_play`のインターフェースから渡す（同じ手順を2つ書かないため）。
 pub trait LayoutIo {
-    /// 落ちない読み方で 4 バイト。
+    /// 例外を出さない読み方で4バイト。
     fn read_u32(&mut self, addr: u32) -> Option<u32>;
-    /// `[addr, addr + len)` がコミット済みで書ける頁か。
+    /// `[addr, addr + len)`がコミット済みで書き込み可能なページかどうか。
     fn check_rw(&mut self, addr: u32, len: u32) -> bool;
 }
 
@@ -507,7 +527,7 @@ impl LayoutIo for ViaProbe<'_> {
     }
 }
 
-/// 回ごとに、塊・要素の配列のアドレスを読み、全部の範囲が書けるかを見る。領域の長さは `arena_top`。
+/// 回ごとにブロック・要素の配列のアドレスを読み、全部の範囲が書き込み可能かをチェックする。領域の長さは`arena_top`。
 pub fn fill(
     l: &mut Layout,
     t: &Tables,
@@ -567,7 +587,7 @@ pub fn fill_layout(
             }
             RegionKind::VmArray(v) => {
                 let s = vm_array_shape(t, &t.vm_arrays[v as usize], io, idx)?;
-                // コピーしない（長さ 0）ときはアドレスも 0 に（範囲の中の判定・記録の表に古い配列のアドレスを残さない）。
+                // コピーしない（長さ0）ときはアドレスも0に（範囲の中の判定・記録の表に古い配列のアドレスを残さない）。
                 r.addr = s.place().0;
                 r.len = s.len;
             }
@@ -584,17 +604,18 @@ pub fn fill_layout(
 
 // ---- 比べない所 ----
 //
-// 実機で食い違った所のうち、同期と関係ない表示・実時間の値（fps の計測・「60.00fps」の文字・記録係の fps のバイト）を、
-// コピーと書き戻しはそのままに、D1 と D2 の比べからだけ外す。外すのは表（`th09_addr::ROLLBACK_COMPARE_SKIPS`）に書いた所だけで、
-// その外は 1 バイトでも違えば食い違い。見分けに要る値が読めない・形が合わないときは外さない（比べる所が増えるだけ）。
+// 実機で食い違った所のうち同期と関係ない表示・実時間の値（fpsの計測・「60.00fps」の文字・記録係のfpsのバイト）を、D1とD2の比べからだけ外す。
+// コピーと書き戻しはそのまま行う。
+// 外すのは表（`th09_addr::ROLLBACK_COMPARE_SKIPS`）に書いた所だけ。その外は1バイトでも違えば食い違い。
+// 見分けに要る値が読めない・形が合わないときは外さない（比べる所が増えるだけ）。
 
-/// 1 つの範囲の中の比べない所の数の上限（本物は fps_timing 1・fps の文字の枠 1〜2・記録係の塊の書き位置 1〜4）。
+/// 1つの範囲の中の比べない所の数の上限（本物はfps_timing 1・fpsの文字の枠1〜2・記録係のブロックの書き位置1〜4）。
 /// 越えた分は外さずに比べる（`Skips::dropped`）。
 pub const MAX_SKIPS: usize = 32;
-/// 比べない所の表の行の上限（`Marks` の領域の大きさ）。越えると `Layout::plan` が断る。
+/// 比べない所の表の行の上限（`Marks`の領域の大きさ）。越えると`Layout::plan`が断る。
 pub const MAX_SKIP_ROWS: usize = 8;
 
-/// `Cursor` の行ごとの書き位置（`[0]` = S の始まり・`[1]` = D1 の始まり・`[2]` = D2 の始まり。読めなければ `None`）。添字は表の行の番号。
+/// `Cursor`の行ごとの書き位置（`[0]` = Sの始まり・`[1]` = D1の始まり・`[2]` = D2の始まり。読めなければ`None`）。添字は表の行の番号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Marks {
     pub at: [[Option<u32>; 3]; MAX_SKIP_ROWS],
@@ -605,7 +626,7 @@ impl Marks {
         at: [[None; 3]; MAX_SKIP_ROWS],
     };
 
-    /// `Cursor` の行の書き位置を今の値で読み、`[which]` へ入れる（ゲームのスレッド。読むだけ）。
+    /// `Cursor`の行の書き位置を今の値で読み、`[which]`へ書き込む（ゲームのスレッド。読むだけ）。
     fn read(&mut self, t: &Tables, io: &mut dyn ProbeIo, which: usize) {
         for (i, s) in t.skips.iter().enumerate().take(MAX_SKIP_ROWS) {
             if let RbSkipKind::Cursor {
@@ -622,13 +643,14 @@ impl Marks {
     }
 }
 
-/// 塊 `[p, p + n)` のうち、書き位置が `s` から `d` まで 1 バイトずつ進んで書いた所（領域の先頭からの座標）。書き位置が塊の中に
-/// あるとは `p ≤ c ≤ p + n`。期間の中の取り直しは 1 回までと見る（記録係は 3,598 tick に 1 回、k は `MAX_K` = 600 まで）。
-/// 2 回跨ぐと間の塊を外し損ねるが、それは食い違いが出る向きで、隠す向きではない。
-/// - `s` も `d` もこの塊: `[s, d)`（戻る向き `d < s` なら無し）。
-/// - `s` だけ: 期間の中で別の塊へ取り直した。`[s, p + n)`。
-/// - `d` だけ: 期間の中で取り直した先の塊。`[p, d)`。
-/// - どちらでもない: 無し（期間の中で書いていない塊）。
+/// ブロック`[p, p + n)`のうち、書き位置が`s`から`d`まで1バイトずつ進んで書いた所（領域の先頭からの座標）。
+/// 書き位置がブロックの中にあるとは`p ≤ c ≤ p + n`のこと。
+/// 期間の中の取り直しは1回までと見る（記録係は3,598 tickに1回・kは `MAX_K` = 600 まで）。
+/// 2回跨ぐと間のブロックを外し損ねる。それは食い違いが出る向きで、隠す向きではない。
+/// - `s`も`d`もこのブロック: `[s, d)`（戻る向き`d < s`なら無し）。
+/// - `s`だけ: 期間の中で別のブロックへ取り直した。`[s, p + n)`。
+/// - `d`だけ: 期間の中で取り直した先のブロック。`[p, d)`。
+/// - どちらでもない: 無し（期間の中で書いていないブロック）。
 pub fn cursor_span(p: u32, n: u32, s: u32, d: u32) -> Option<(u32, u32)> {
     let end = p.saturating_add(n);
     let has = |c: u32| p <= c && c <= end;
@@ -641,12 +663,12 @@ pub fn cursor_span(p: u32, n: u32, s: u32, d: u32) -> Option<(u32, u32)> {
     (a < b).then_some((a, b))
 }
 
-/// 1 つの範囲の中の比べない所（範囲の先頭からの `[start, end)`。始まりの順）。固定長（ゲームのスレッドで作る）。
+/// 1つの範囲の中の比べない所（範囲の先頭からの`[start, end)`。始まりの順）。固定長（ゲームのスレッドで作る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Skips {
     n: usize,
     r: [(u32, u32); MAX_SKIPS],
-    /// 領域が足りずに落とした数。落とした所は比べる（比べる所が増えるだけで、食い違いを隠す向きには働かない）。
+    /// 領域が足りずに落とした数。落とした所は比べる（比べる所が増えるだけで食い違いを隠す向きには働かない）。
     pub dropped: u32,
 }
 
@@ -665,7 +687,7 @@ impl Skips {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        // 始まりの順に差し込む（比べるときに先頭から 1 回なめるだけで済むように）。
+        // 始まりの順に差し込む（比べるときに先頭から1回たどるだけで済むように）。
         let mut i = self.n;
         while i > 0 && self.r[i - 1].0 > start {
             self.r[i] = self.r[i - 1];
@@ -680,11 +702,11 @@ impl Skips {
     }
 }
 
-/// 範囲 `r`（D1 のコピー `a1`・今 `a2`）の中の比べない所（範囲の先頭からの位置）。表の行ごとに:
-/// - `Range`: ゲームのアドレスの範囲のうち `r` に掛かる所（DLL の領域と割り当て器の状態には掛けない）。
-/// - `TextAt`: 列の枠のうち `r` に丸ごと入り、D1 と D2 の両方で位置の欄が `pos` の枠の文字の欄。
-/// - `Cursor`: `r` が DLL の領域のとき、今の割り当て器 `st`（D2）を歩いて札の合う塊ごとに `cursor_span`（S → D1 と
-///   S → D2 の両方）。級の余り・塊の先頭・札の違う塊は比べる。先頭が壊れていて歩けなければ、歩けた所まで。
+/// 範囲`r`（D1のコピー`a1`・今`a2`）の中の比べない所（範囲の先頭からの位置）。表の行ごとに:
+/// - `Range`: ゲームのアドレスの範囲のうち`r`に掛かる所（DLLの領域とアロケータの状態には掛けない）。
+/// - `TextAt`: 列の枠のうち`r`に丸ごと入るもので、D1とD2の両方で位置のフィールドが`pos`の枠の文字のフィールド。
+/// - `Cursor`: `r`がDLLの領域のとき、今のアロケータ`st`（D2）をたどってタグの合うブロックごとに`cursor_span`（S → D1とS → D2の両方）を取る。
+///   サイズクラスの余り・ブロックの先頭・タグの違うブロックは比べる。先頭が壊れていてたどれないときはたどれた所まで。
 ///
 /// 確保しない・パニックしない（ゲームのスレッドの比べの中で呼ぶ）。
 pub fn region_skips<M: ArenaMem>(
@@ -777,21 +799,21 @@ pub struct Compared {
     pub offs: [u32; DIFF_OFFS],
     pub n_offs: u8,
     pub skipped: u32,
-    /// 最初に違った位置（`diff.first`）から 4 バイトを、リトルエンディアンの u32 として読んだ値。D1 / D2 のどちらかで 4 バイトに
-    /// 届かなければ両方 `None`（診断用）。
+    /// 最初に違った位置（`diff.first`）から4バイトを、リトルエンディアンのu32として読んだ値。
+    /// D1 / D2のどちらかで4バイトに届かなければ両方`None`（診断用）。
     pub first4_d1: Option<u32>,
     pub first4_d2: Option<u32>,
 }
 
-/// 表の外から足す比べない所（比べる範囲の先頭からの `[start, end)` を、始まりの小さい順に `emit` へ渡す関数）。描画用の欄の
-/// 除外: 枠ごと・塊ごとに数が変わり `Skips` の固定長に収まらないので、歩きながら渡す。渡す順が乱れると、比べる区間を取りこぼす・
-/// 二重に数える。
+/// 表の外から足す比べない所（比べる範囲の先頭からの`[start, end)`を始まりの小さい順に`emit`へ渡す関数）。
+/// 描画用のフィールドの除外: 枠ごと・ブロックごとに数が変わり`Skips`の固定長に収まらないのでたどりながら渡す。
+/// 渡す順が乱れると比べる区間を取りこぼすか二重に数える。
 pub type ExtraSkips<'a> = &'a dyn Fn(&mut dyn FnMut(u32, u32));
 
 pub fn no_extra_skips(_emit: &mut dyn FnMut(u32, u32)) {}
 
-/// `[0, total)` から比べない所（`skips` と `extra`。どちらも始まりの順）を除いた区間を先頭から順に `f(始まり, 終わり)` で渡す。
-/// 最後の区間は空でも 1 回渡す（比べない所が無いとき、ダイジェストが `digest(a)` と同じ値になるように）。
+/// `[0, total)`から比べない所（`skips`と`extra`。どちらも始まりの順）を除いた区間を先頭から順に`f(始まり, 終わり)`で渡す。
+/// 最後の区間は空でも1回渡す（比べない所が無いときダイジェストが`digest(a)`と同じ値になるように）。
 fn for_segments(total: u32, skips: &Skips, extra: ExtraSkips, mut f: impl FnMut(u32, u32)) {
     let mut cur = 0u32;
     let mut si = 0usize;
@@ -803,7 +825,7 @@ fn for_segments(total: u32, skips: &Skips, extra: ExtraSkips, mut f: impl FnMut(
         }
         cur = cur.max(e);
     };
-    // 表の行（`skips`）と `extra` を、始まりの順に混ぜて渡す。
+    // 表の行（`skips`）と`extra`を始まりの順に混ぜて渡す。
     extra(&mut |s, e| {
         while si < st.len() && st[si].0 <= s {
             skip(st[si].0, st[si].1, &mut f);
@@ -823,16 +845,18 @@ fn part(a: &[u8], s: u32, e: u32) -> &[u8] {
     &a[(s as usize).min(n)..(e as usize).min(n)]
 }
 
-/// 表の行の比べない所だけで比べる（検査が、描画用の欄の除外を入れる前からの比べ方の基準に使う。本物は `compare_bytes_with`）。
+/// 表の行の比べない所だけで比べる（検査が描画用のフィールドの除外を追加する前からの比べ方の基準に使う。本物は`compare_bytes_with`）。
 #[cfg(test)]
 pub fn compare_bytes(a1: &[u8], a2: &[u8], skips: &Skips) -> Compared {
     compare_bytes_with(a1, a2, skips, &no_extra_skips)
 }
 
-/// D1 のコピー `a1` と今 `a2` を、比べない所（表の行 `skips` と表の外から足す `extra`）を除いて比べる。ダイジェストは比べる区間を
-/// 先頭から順に `digest_continue` で連ねた値。バイトの比べはダイジェストか長さが違ったときだけ（ゲームのスレッドで約 12 MB を
-/// 通すため）。`skipped` には `extra` の分も数える。違いの位置は範囲の先頭から。長さが違えば、長い方のはみ出した分も
-/// （比べない所の外なら）違うと数える。確保しない・パニックしない。
+/// D1のコピー`a1`と今`a2`を、比べない所（表の行`skips`と表の外から足す`extra`）を除いて比べる。
+/// ダイジェストは比べる区間を先頭から順に`digest_continue`で連ねた値。
+/// バイトの比べはダイジェストか長さが違ったときだけ行う（ゲームのスレッドで約12 MBを通すため）。
+/// `skipped`には`extra`の分も数える。違いの位置は範囲の先頭から。
+/// 長さが違えば長い方のはみ出した分も（比べない所の外なら）違うと数える。
+/// 確保しない・パニックしない。
 pub fn compare_bytes_with(a1: &[u8], a2: &[u8], skips: &Skips, extra: ExtraSkips) -> Compared {
     let total = a1.len().max(a2.len()) as u32;
     let (mut h1, mut h2) = (DIGEST_INIT, DIGEST_INIT);
@@ -868,8 +892,8 @@ pub fn compare_bytes_with(a1: &[u8], a2: &[u8], skips: &Skips, extra: ExtraSkips
         o.bytes = o.bytes.saturating_add(d.bytes);
         o.first = o.first.or(Some(f));
         o.last = Some(l);
-        // 区間どうしが同じ頁を分けるときは、その頁を 2 回数えない（区間の中の頁は先頭から順なので、重なりうるのは
-        // この区間の最初の頁と、前の区間の最後の頁だけ）。
+        // 区間どうしが同じページを分け合うときは、そのページを2回数えない。
+        // 区間の中のページは先頭から順なので、重なりうるのはこの区間の最初のページと前の区間の最後のページだけ。
         let shared = u32::from(last_page == Some(f / page));
         o.pages = o.pages.saturating_add(d.pages - shared);
         last_page = Some(l / page);
@@ -880,7 +904,7 @@ pub fn compare_bytes_with(a1: &[u8], a2: &[u8], skips: &Skips, extra: ExtraSkips
             }
         }
     });
-    // 診断用に、最初に違った位置から 4 バイトを両方読む（読めなければ両方 `None`）。
+    // 診断用に最初に違った位置から4バイトを両方読む（読めなければ両方`None`）。
     if let Some(o) = out.diff.first {
         let o = o as usize;
         let read4 = |a: &[u8]| {
@@ -901,27 +925,27 @@ pub enum Buf {
     D1,
 }
 
-/// 入口と割り当て器の数（どれも増えるだけ。期間の中の回数は差で取る）。
+/// 入口とアロケータのカウンタ（どれも増えるだけ。期間の中の回数は差で取る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counters {
-    /// ゲームのスレッドの確保で、DLL の領域へ向けなかったもの（呼び出し元が状態の外・領域が足りない）。見張りの間だけ。
+    /// ゲームのスレッドの確保のうちDLLの領域へ向けなかったもの（呼び出し元が状態の外・領域が足りない）。監視の間だけ。
     pub out_allocs: u32,
-    /// ゲームのスレッドが DLL の領域の外の塊（NULL でない）を解放した回数のうち、同じ期間の中で生まれた塊（`out_frees_born`）
-    /// でないもの（期間の前からある塊）。見張りの間だけ。
+    /// ゲームのスレッドがDLLの領域の外のブロック（NULLでない）を解放した回数のうち、同じ期間の中で生まれたブロック（`out_frees_born`）でないもの（期間の前からあるブロック）。
+    /// 監視の間だけ。
     pub out_frees: u32,
-    /// 領域の外の塊の解放のうち、同じ見張りの間に CRT へ回した確保で生まれた塊（アドレスを `BornSet` で引けた）。書き戻した状態は
-    /// この塊を指さない（コピーした時点に無かった）ので、期間を捨てない。
+    /// 領域の外のブロックの解放のうち、同じ監視の間にCRTへ回した確保で生まれたブロック（アドレスを`BornSet`で見つけられた）の解放。
+    /// 書き戻した状態はこのブロックを指さない（コピーした時点に無かった）ので期間を捨てない。
     pub out_frees_born: u32,
-    /// 見張りの間に CRT へ回した確保のうち、`BornSet` が満ちてアドレスを記録できなかったもの。その塊の解放を生まれ・前からの
-    /// どちらとも言えないので、1 回でもあれば期間を捨てる（`Skip::OutsideFree`）。
+    /// 監視の間にCRTへ回した確保のうち、`BornSet`が満杯でアドレスを記録できなかったもの。
+    /// そのブロックの解放は期間の中で生まれたものか前からあるものか区別できない。そのため1回でもあれば期間を捨てる（`Skip::OutsideFree`）。
     pub out_untracked: u32,
-    /// 別のスレッドが DLL の領域の塊を解放しようとした回数（解放せずに数えるだけ）。
+    /// 別のスレッドがDLLの領域のブロックを解放しようとした回数（解放せずに数えるだけ）。
     pub foreign_frees: u32,
-    /// DLL の領域の塊の解放を割り当て器が断った回数（二重・途中・壊れた先頭）。
+    /// DLLの領域のブロックの解放をアロケータが断った回数（二重・途中・壊れた先頭）。
     pub bad_frees: u32,
-    /// 領域が足りず CRT へ回した確保。
+    /// 領域が足りずCRTへ回した確保。
     pub arena_full: u32,
-    /// 割り当て器の確保・解放の回数（割り当て器の状態の欄。書き戻すと戻る）。
+    /// アロケータの確保・解放の回数（アロケータの状態のフィールド。書き戻すと戻る）。
     pub arena_allocs: u32,
     pub arena_frees: u32,
 }
@@ -942,11 +966,12 @@ impl Counters {
     }
 }
 
-/// `BornSet` の枠の数。外の確保があった期間は 1 期間 10 回（実測）なので、25 倍の余裕。
+/// `BornSet`の枠の数。外の確保があった期間は1期間10回（実測）なので25倍の余裕。
 pub const BORN_CAP: usize = 256;
 
-/// 見張りの間に CRT へ回した確保のアドレス（期間の中で生まれた、DLL の領域の外の塊）。見張りを立てるたびに空にする。入口
-/// （ゲームのスレッド）から呼ぶので、ヒープを使わず、パニックしない。`static` にするため中身は原子の語にする（`Relaxed`）。
+/// 監視の間にCRTへ回した確保のアドレス（期間の中で生まれたDLLの領域の外のブロック）。監視を始めるたびに空にする。
+/// 入口（ゲームのスレッド）から呼ぶので、ヒープを使わずパニックしない。
+/// `static`にするため、中身はアトミックなワードにする（`Relaxed`）。
 pub struct BornSet {
     v: [AtomicU32; BORN_CAP],
     len: AtomicU32,
@@ -964,9 +989,10 @@ impl BornSet {
         self.len.store(0, Ordering::Relaxed);
     }
 
-    /// アドレスを記録する。満ちていて記録できなければ false（NULL は記録せず true —— CRT が確保に失敗した塊は解放の入口が数えない）。
-    /// 同じアドレスが 2 回来たら 2 枠使う（operator new `0x47B24E` は malloc の入口 `0x47B151` を通らず同じ `0x47B125` を呼ぶので、
-    /// 1 回の確保で記録するのは 1 回。重複は CRT の free を通らない解放の後だけ）。
+    /// アドレスを記録する。満杯で記録できなければfalseを返す（NULLは記録せずtrueを返す。CRTが確保に失敗したブロックは解放の入口が数えない）。
+    /// 同じアドレスが2回来たら2枠使う。
+    /// operator new `0x47B24E`はmallocの入口`0x47B151`を通らず同じ`0x47B125`を呼ぶので、1回の確保で記録するのは1回。
+    /// 重複はCRTのfreeを通らない解放の後だけ。
     pub fn add(&self, p: u32) -> bool {
         if p == 0 {
             return true;
@@ -980,7 +1006,7 @@ impl BornSet {
         true
     }
 
-    /// アドレスが記録してあれば、同じアドレスの枠を全部取り除いて true（2 回記録したアドレスも 1 回の解放で消える）。無ければ false。
+    /// アドレスが記録してあれば同じアドレスの枠を全部取り除いてtrueを返す（2回記録したアドレスも1回の解放で消える）。無ければfalse。
     pub fn take(&self, p: u32) -> bool {
         let mut n = self.len.load(Ordering::Relaxed) as usize;
         let mut found = false;
@@ -1020,7 +1046,7 @@ pub const DIFF_OFFS: usize = 4;
 pub struct RegionResult {
     pub kind: RegionKind,
     pub addr: u32,
-    /// D1 と D2 の長さ（領域だけ違いうる）。
+    /// D1とD2の長さ（領域だけ違いうる）。
     pub len1: u32,
     pub len2: u32,
     pub d1: u64,
@@ -1030,7 +1056,7 @@ pub struct RegionResult {
     pub n_offs: u8,
     /// 比べなかったバイトの数（比べない所。ダイジェストもこの所を除いた値）。
     pub skipped: u32,
-    /// 最初に違った位置から 4 バイト（`Compared::first4_d1` / `first4_d2` と同じ。診断用）。
+    /// 最初に違った位置から4バイト（`Compared::first4_d1` / `first4_d2`と同じ。診断用）。
     pub first4_d1: Option<u32>,
     pub first4_d2: Option<u32>,
 }
@@ -1060,7 +1086,7 @@ impl RegionResult {
         Self::of_with(r, a1, a2, skips, &no_extra_skips)
     }
 
-    /// `of` に、表の外の比べない所 `extra`（描画用の欄）を足したもの。`skipped` に数える。
+    /// `of`に表の外の比べない所`extra`（描画用のフィールド）を足したもの。`skipped`に数える。
     pub fn of_with(
         r: &Region,
         a1: &[u8],
@@ -1090,28 +1116,28 @@ impl RegionResult {
     }
 }
 
-/// ゲームのスレッドが外から得るもの。本物は `rollback_win::RealProbeIo`（入力の地点の中）。
+/// ゲームのスレッドが外から得るもの。本物は`rollback_win::RealProbeIo`（入力の地点の中）。
 pub trait ProbeIo {
-    /// マッチの中か（場面 2・読み込み中でない・マッチの終わりのメニューでない・デモでない）。
+    /// マッチの中かどうか（場面2・読み込み中でない・マッチ終了時のメニューでない・デモでない）。
     fn in_match(&mut self) -> bool;
     fn read_u32(&mut self, addr: u32) -> Option<u32>;
     fn check_rw(&mut self, addr: u32, len: u32) -> bool;
-    /// 更新の列と描画の列の並び（節のアドレス・関数・this）のダイジェスト。
+    /// 更新の列と描画の列の並び（ノードのアドレス・関数・this）のダイジェスト。
     fn list_signature(&mut self) -> u64;
     fn arena_top(&mut self) -> u32;
-    /// ゲームのスレッドの確保を DLL の領域へ向けるか。
+    /// ゲームのスレッドの確保をDLLの領域へ向けるかどうか。
     fn set_redirect(&mut self, on: bool);
-    /// 領域の外の確保・解放を数えるか（期間中だけ）。
+    /// 領域の外の確保・解放を数えるかどうか（期間中だけ）。
     fn set_watch(&mut self, on: bool);
     fn counters(&mut self) -> Counters;
-    /// 範囲をバッファへコピーする（割り当て器の状態を含む）。
+    /// 範囲をバッファへコピーする（アロケータの状態を含む）。
     fn save(&mut self, l: &Layout, to: Buf);
-    /// S を書き戻す（領域は `[0, S の top)` を戻し、`[S の top, 今の top)` を 0 にし、割り当て器の状態を戻す）。
+    /// Sを書き戻す（領域は`[0, S の top)`を戻し、`[S の top, 今の top)`を0にし、アロケータの状態を戻す）。
     fn restore(&mut self, l: &Layout);
-    /// D1 のバッファと今の状態を範囲ごとに比べる（`out` は `l.n` 個）。比べない所は `region_skips(t, …, marks)`、
-    /// バイトの比べは `RegionResult::of`。
+    /// D1のバッファと今の状態を範囲ごとに比べる（`out`は`l.n`個）。
+    /// 比べない所は`region_skips(t, …, marks)`で決め、バイトの比べは`RegionResult::of`で行う。
     fn compare(&mut self, t: &Tables, l: &Layout, marks: &Marks, out: &mut [RegionResult]);
-    /// `compare` に、診断（違ったバイトの内訳 `diag`）と描画用の欄の除外 `skip` を足したもの。既定は `compare` のまま。
+    /// `compare`に診断（違ったバイトの内訳`diag`）と描画用のフィールドの除外`skip`を足したもの。既定は`compare`のまま。
     /// 本物（`rollback_win`）だけが上書きする。
     fn compare_draw(
         &mut self,
@@ -1124,16 +1150,16 @@ pub trait ProbeIo {
     ) {
         self.compare(t, l, marks, out);
     }
-    /// ローカル入力を 1 回読み、feed を 3 回（0 に p1・1 に p2・2 に p1|p2）呼ぶ（台本の経路と同じ順）。
+    /// ローカル入力を1回読み、feedを3回（0にp1・1にp2・2にp1|p2）呼ぶ（台本の経路と同じ順）。
     fn feed(&mut self, p1: u16, p2: u16);
     fn now_us(&mut self) -> u64;
     fn stop_requested(&mut self) -> bool;
     fn publish(&mut self, rec: &TrialRecord);
-    /// 次の場面の要求が今の場面と違うか（読めなければ true）。フレームの形の進め直しの前にだけ見る（場面の切替をまたがない）。
+    /// 次の場面の要求が今の場面と違うかどうか（読めなければtrue）。フレームの形の進め直しの前にだけ見る（場面の切替をまたがない）。
     fn scene_request_pending(&mut self) -> bool {
         false
     }
-    /// フレームの形の進め直しの前（S を書き戻す前）に、BGM の待ち行列と文字の数を取っておく（`rollback_resim::capture_outputs`）。
+    /// フレームの形の進め直しの前（Sを書き戻す前）にBGMの待ち行列と文字の数を取っておく（`rollback_resim::capture_outputs`）。
     /// 実時間の形では呼ばない。
     fn capture_outputs(&mut self) {}
 }
@@ -1143,20 +1169,20 @@ pub trait ProbeIo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
     Layout(LayoutError),
-    /// 期間の中に台本が feed しなかった tick があった（台本が終わった・止まった）。
+    /// 期間の中に台本がfeedしなかったtickがあった（台本が終わった・止まった）。
     ScriptGap,
     LeftMatch,
     OutsideFree,
-    /// 期間の中で生まれた領域の外の塊が、D1 でまだ生きている（外の確保の数 ≠ 期間の中で生まれた塊の解放の数）。
+    /// 期間の中で生まれた領域の外のブロックがD1でまだ生きている（外の確保の数 ≠ 期間の中で生まれたブロックの解放の数）。
     OutsideAlive,
     ForeignFree,
     BadFree,
     ArenaFull,
     ListChanged,
     LayoutChanged,
-    /// フレームの形の進め直しの前に、次の場面の要求が立っていた（進め直しが場面の切替をまたぐ）。
+    /// フレームの形の進め直しの前に次の場面の要求が立っていた（進め直しが場面の切替をまたぐ）。
     SceneRequest,
-    /// 終わりの合図を受けた（進め直しの途中なら、比べはしたが確保の向け先が変わっていたかもしれない）。
+    /// 終了の通知を受けた（進め直しの途中なら比べはしたが確保の向け先が変わっていたかもしれない）。
     Stopped,
 }
 
@@ -1171,10 +1197,10 @@ pub enum Outcome {
 pub struct TrialRecord {
     pub index: u32,
     pub k: u32,
-    /// マッチに入ってから何 tick 目の始まりでコピーしたか（DLL が数えたマッチの tick）。
+    /// マッチに入ってから何tick目の始まりでコピーしたか（DLLが数えたマッチのtick）。
     pub match_tick: u32,
     pub outcome: Outcome,
-    /// コピー S・D1 のコピー・書き戻し・比べにかかった時間（マイクロ秒）。
+    /// コピーS・D1のコピー・書き戻し・比べにかかった時間（マイクロ秒）。
     pub save_us: u32,
     pub d1_us: u32,
     pub restore_us: u32,
@@ -1187,11 +1213,11 @@ pub struct TrialRecord {
     pub top_d2: u32,
     pub n: u8,
     pub regions: [RegionResult; MAX_REGIONS],
-    /// 比べない所の書き位置（S・D1・D2 の始まりで読んだ値）。
+    /// 比べない所の書き位置（S・D1・D2の始まりで読んだ値）。
     pub marks: Marks,
-    /// フレームの形の進め直しの記録。実時間の形では全部 0 / なし。
+    /// フレームの形の進め直しの記録。実時間の形では全部0 / なし。
     pub resim: ResimRec,
-    /// 違ったバイトの内訳（比べの後に本物の実装 `compare_draw` が埋める。埋めなければ `valid = false`）。
+    /// 違ったバイトの内訳（比べの後に本物の実装`compare_draw`が埋める。埋めなければ`valid = false`）。
     pub draw: DrawDiag,
 }
 
@@ -1255,11 +1281,11 @@ impl TrialRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// マッチの tick を `need` 数えたら次の回を始める。
+    /// マッチのtickを`need`数えたら次の回を始める。
     Wait,
-    /// コピーした後、台本のワードを記録しながら進めている。
+    /// コピーした後に台本のワードを記録しながら進める段階。
     Forward,
-    /// 書き戻した後、記録した語の `j` 個目を feed する。
+    /// 書き戻した後に記録したワードの`j`個目をfeedする段階。
     Replay {
         j: u32,
     },
@@ -1273,7 +1299,7 @@ pub struct Probe {
     phase: Phase,
     need: u32,
     match_ticks: u32,
-    /// 次の回の番号（記録の数）と、k を選ぶ回し手。
+    /// 次の回の番号（記録の数）とkを順に選ぶカーソル。
     records: u32,
     cursor: u32,
     done_per_k: [u32; MAX_KS],
@@ -1286,7 +1312,7 @@ pub struct Probe {
     sig: u64,
     c0: Counters,
     rec: TrialRecord,
-    /// フレームの形で、今のフレームが書き戻しのフレーム（D1 の点から `take_owed` までの間）か。
+    /// フレームの形のとき、今のフレームが書き戻しのフレーム（D1の点から`take_owed`までの間）かどうか。
     resim_armed: bool,
     skip_draw: SkipDraw,
 }
@@ -1318,12 +1344,12 @@ impl Probe {
         })
     }
 
-    /// 描画用の欄の除外（`ARMED` を立てる前にだけ呼ぶ）。
+    /// 描画用のフィールドの除外（`ARMED`を立てる前にだけ呼ぶ）。
     pub fn set_skip_draw(&mut self, m: SkipDraw) {
         self.skip_draw = m;
     }
 
-    /// 進め直しの形（走査の call を書けなかった場合に realtime へ戻すために変える。`ARMED` を立てる前にだけ呼ぶ）。
+    /// 進め直しの形（走査のcallを書き込めなかった場合にrealtimeへ戻すために変える。`ARMED`を立てる前にだけ呼ぶ）。
     pub fn set_resim(&mut self, m: ResimMode) {
         self.s.resim = m;
     }
@@ -1336,8 +1362,8 @@ impl Probe {
         self.s.resim == ResimMode::Frame
     }
 
-    /// 走査の 1 回目の後に、このフレームであと何回走査を呼ぶか（書き戻しのフレームだけ `Some(k − 1)`、ほかは `None`）。
-    /// 1 回聞いたら空になる（打ち切りの後の残りは次のフレームから実時間で続く）。
+    /// 走査の1回目の後にこのフレームであと何回走査を呼ぶか（書き戻しのフレームだけ`Some(k − 1)`、ほかは`None`）。
+    /// 1回取得したら空になる（打ち切りの後の残りは次のフレームから実時間で続く）。
     pub fn take_owed(&mut self) -> Option<u32> {
         if !self.resim_armed {
             return None;
@@ -1349,7 +1375,7 @@ impl Probe {
         })
     }
 
-    /// 進め直しの 1 回の走査の後の記録（`index` 0 = 最初の回。時間はマイクロ秒）。
+    /// 進め直しの1回の走査の後の記録（`index` 0 = 最初の回。時間はマイクロ秒）。
     pub fn note_scan(&mut self, index: u32, us: u32, scene_req: bool) {
         let r = &mut self.rec.resim;
         if index == 0 {
@@ -1368,7 +1394,7 @@ impl Probe {
         self.rec.resim.abort = Some(why);
     }
 
-    /// 最後の回の前に SE・BGM・文字の数を戻せたか。
+    /// 最後の回の前にSE・BGM・文字の数を戻せたかどうか。
     pub fn note_outputs(&mut self, ok: bool) {
         self.rec.resim.outputs_restored = Some(ok);
     }
@@ -1385,7 +1411,7 @@ impl Probe {
         self.phase == Phase::Done
     }
 
-    /// まだ回が足りない k のうち、回し手の次のもの。無ければ `None`。
+    /// まだ回が足りないkのうち、カーソルが次に指すもの。無ければ`None`。
     fn next_k(&mut self) -> Option<u32> {
         let nk = self.s.nk as u32;
         for _ in 0..nk {
@@ -1405,8 +1431,8 @@ impl Probe {
             || self.records as usize >= MAX_RECORDS
     }
 
-    /// 入力の地点（tick の始まり）で呼ぶ。`Some(1)` なら記録した入力ワードを feed した（入口は poll_all も台本も呼ばずに戻る）。
-    /// `None` なら台本の経路へ（台本が feed したら `after_feed` を呼ぶ）。
+    /// 入力の地点（tickの始まり）で呼ぶ。`Some(1)`なら記録した入力ワードをfeedした（入口はpoll_allも台本も呼ばずに戻る）。
+    /// `None`なら台本の経路へ（台本がfeedしたら`after_feed`を呼ぶ）。
     pub fn on_tick(&mut self, io: &mut dyn ProbeIo) -> Option<u32> {
         let stop = io.stop_requested();
         let m = io.in_match();
@@ -1437,14 +1463,14 @@ impl Probe {
                 self.begin(io)
             }
             Phase::Forward => self.forward(io, m, stop),
-            // 進め直しの途中でマッチを出たら、記録した語をマッチの外（マッチの終わりのメニュー）へ入れずに捨てる（前向きの期間は `forward` が
-            // 同じ理由で捨てている）。
+            // 進め直しの途中でマッチを出たら記録したワードをマッチの外（マッチ終了時のメニュー）へfeedせずに捨てる。
+            // 前向きの期間も`forward`が同じ理由で捨てている。
             Phase::Replay { .. } if !m => self.skip(io, Skip::LeftMatch),
             Phase::Replay { j } => self.replay(io, j, stop),
         }
     }
 
-    /// 台本が feed した語（ゲームのスレッド。`on_tick` が `None` を返した tick だけ）。
+    /// 台本がfeedしたワード（ゲームのスレッド。`on_tick`が`None`を返したtickだけ）。
     pub fn after_feed(&mut self, p1: u16, p2: u16) {
         if self.phase != Phase::Forward {
             return;
@@ -1465,7 +1491,7 @@ impl Probe {
         self.rec = TrialRecord::EMPTY;
         self.rec.index = self.records;
         self.rec.k = k;
-        // フレームの形の回は、捨てた回も印を付ける（終わりの集計の母数を、書き戻しまで進んだ回だけにしないため）。
+        // フレームの形の回は捨てた回にもフラグを付ける（終わりの集計の母数を書き戻しまで進んだ回だけにしないため）。
         self.rec.resim.frame = self.resim_frame();
         self.rec.match_tick = self.match_ticks;
         self.k = k;
@@ -1507,11 +1533,12 @@ impl Probe {
         io.set_watch(false);
         self.rec.fwd = d;
         let why = if d.out_frees > 0 || d.out_untracked > 0 {
-            // 期間の中で生まれて同じ期間で解放された外の塊だけなら捨てない。
+            // 期間の中で生まれて同じ期間で解放された外のブロックだけなら捨てない。
             Some(Skip::OutsideFree)
         } else if d.out_allocs != d.out_frees_born {
-            // 期間の中で生まれて D1 でまだ生きている外の塊がある。書き戻しは安全だが、進め直した側（D2）は CRT から別のアドレスを受け取りうるので、
-            // 状態がそのポインタを持っていれば D1 と D2 が必ず違いうる。
+            // 期間の中で生まれてD1でまだ生きている外のブロックがある。
+            // 書き戻しは安全。ただし進め直した側（D2）はCRTから別のアドレスを受け取りうる。
+            // そのため状態がそのポインタを持っていればD1とD2が必ず違いうる。
             Some(Skip::OutsideAlive)
         } else if d.foreign_frees > 0 {
             Some(Skip::ForeignFree)
@@ -1522,7 +1549,7 @@ impl Probe {
         } else if io.list_signature() != self.sig {
             Some(Skip::ListChanged)
         } else if self.resim_frame() && io.scene_request_pending() {
-            // フレームの形は、進め直しの前に次の場面の要求が立っていれば進め直さない（場面の切替をまたがない）。
+            // フレームの形は進め直しの前に次の場面の要求が立っていれば進め直さない（場面の切替をまたがない）。
             Some(Skip::SceneRequest)
         } else {
             None
@@ -1542,7 +1569,7 @@ impl Probe {
         self.rec.top_d1 = top;
         self.d1 = l;
         if self.resim_frame() {
-            // 途中の回が積む SE・BGM・文字の数を最後の回の前に戻すため、S を書き戻す前の値を取っておく（k = 1 は途中の回が無いので要らない）。
+            // 途中の回が積むSE・BGM・文字の数を最後の回の前に戻すため、Sを書き戻す前の値を取っておく（k = 1 は途中の回が無いので要らない）。
             if self.k > 1 {
                 io.capture_outputs();
             }
@@ -1714,7 +1741,7 @@ fn counters_text(c: &Counters) -> String {
     )
 }
 
-/// 1 回ぶんの文（本ログと `_rollback.txt`）。1 行目が結果、違った範囲は 1 行ずつ。
+/// 1回ぶんの文（本ログと`_rollback.txt`）。1行目が結果、違った範囲は1行ずつ。
 pub fn trial_lines(t: &Tables, plan: &Layout, r: &TrialRecord) -> Vec<String> {
     let head = format!(
         "巻き戻し: 回 {}（k = {}、試合の {} tick 目で写した）: ",
@@ -1743,8 +1770,8 @@ pub fn trial_lines(t: &Tables, plan: &Layout, r: &TrialRecord) -> Vec<String> {
             format!("捨てた（{}。書き戻しと比べはした）", skip_text(t, plan, &s))
         }
     };
-    // 比べなかったバイト（表に書いた所だけ）。DLL の領域の分を分けて出すのは、記録係の fps のバイトを札と書き位置で見分けられたかを
-    // ログで検証するため。
+    // 比べなかったバイト（表に書いた所だけ）。
+    // DLLの領域の分を分けて出すのは、記録係のfpsのバイトをタグと書き位置で見分けられたかをログで検証するため。
     let skipped: u64 = r.regions().iter().map(|x| u64::from(x.skipped)).sum();
     let skipped_arena: u32 = r
         .regions()
@@ -1791,7 +1818,7 @@ pub fn trial_lines(t: &Tables, plan: &Layout, r: &TrialRecord) -> Vec<String> {
             x.d1,
             x.d2
         ));
-        // 診断用: 最初に違った位置から 4 バイトを f32 と u32 の 16 進で（両方読めたときだけ）。
+        // 診断用: 最初に違った位置から4バイトをf32とu32の16進で（両方読めたときだけ）。
         if let (Some(w1), Some(w2)) = (x.first4_d1, x.first4_d2) {
             v.push(format!(
                 "巻き戻し:   最初の4バイト {}（+0x{:X}）: D1 f32={} u32=0x{:08X} / D2 f32={} u32=0x{:08X}",
@@ -1807,7 +1834,7 @@ pub fn trial_lines(t: &Tables, plan: &Layout, r: &TrialRecord) -> Vec<String> {
     v
 }
 
-/// `Cursor` の行の書き位置（`名前 S 0x… → D1 0x… / D2 0x…`。読めなかった所は `-`）。`Cursor` の行が無ければ空。
+/// `Cursor`の行の書き位置（`名前 S 0x… → D1 0x… / D2 0x…`。読めなかった所は`-`）。`Cursor`の行が無ければ空。
 fn marks_text(t: &Tables, m: &Marks) -> String {
     let hex = |c: Option<u32>| c.map_or("-".to_string(), |c| format!("0x{c:08X}"));
     t.skips
@@ -2289,10 +2316,10 @@ mod tests {
         end: 0x140,
         source: "",
     }];
-    /// 記録係の塊の札（本物の `0x004203F2` と同じ値）と、書き位置の欄（blk_b の +0x1C = 0x31C）。
+    /// 記録係のブロックのタグ（本物の`0x004203F2`と同じ値）と書き位置のフィールド（blk_bの +0x1C = 0x31C）。
     const SKIP_TAG: u32 = 0x0042_03F2;
     const CURSOR_AT: u32 = 0x31C;
-    /// 偽の比べない所: globals の中の範囲（乱数 0x120〜0x124 と塊のポインタの欄 0x100〜0x10C の外）と、記録係の書き位置。
+    /// 偽の比べない所: globalsの中の範囲（乱数0x120〜0x124とブロックのポインタのフィールド0x100〜0x10Cの外）と記録係の書き位置。
     const T_SKIPS: &[RbSkip] = &[
         RbSkip {
             name: "noise",
@@ -2342,13 +2369,13 @@ mod tests {
         }
     }
 
-    /// 偽のゲーム: 0x0〜0x1000 の平らなメモリ（ポインタの欄・塊・要素の配列）と領域・割り当て器。1 tick の更新は語と乱数で塊を書き、
-    /// ときどき領域から確保・解放して、そのポインタを blk_a へ入れる（ポインタの値まで比べる）。
+    /// 偽のゲーム: 0x0〜0x1000の平らなメモリ（ポインタのフィールド・ブロック・要素の配列）と領域・アロケータ。
+    /// 1 tickの更新はワードと乱数でブロックを書き換える。ときどき領域から確保・解放して、そのポインタをblk_aへ書き込む（ポインタの値まで比べる）。
     struct Game {
         mem: Vec<u8>,
         arena: Vec<u8>,
         state: ArenaState,
-        /// 生きている領域の塊（偽物ではコピーと書き戻しで一緒に扱う）。
+        /// 生きている領域のブロック（偽物ではコピーと書き戻しで一緒に扱う）。
         live: Vec<u32>,
         live_at_snap: Vec<u32>,
         in_match: bool,
@@ -2357,20 +2384,20 @@ mod tests {
         c: Counters,
         snap: Vec<u8>,
         d1: Vec<u8>,
-        /// コピーしない所に持たせた、更新に効く値（true なら毎 tick 足す —— 巻き戻しても戻らない）。
+        /// コピーしない所に持たせた更新に効く値（trueなら毎tick足す —— 巻き戻しても戻らない）。
         hidden: u32,
         hidden_on: bool,
-        /// この tick に領域の外の解放を起こす。
+        /// このtickに領域の外の解放を起こす。
         outside_free_at: Option<u32>,
-        /// この tick に、期間の中で生まれた外の塊の確保と解放を起こす。
+        /// このtickに期間の中で生まれた外のブロックの確保と解放を起こす。
         born_free_at: Option<u32>,
-        /// この tick に、アドレスを記録できなかった外の確保を起こす。
+        /// このtickにアドレスを記録できなかった外の確保を起こす。
         untracked_at: Option<u32>,
-        /// この tick に、期間の中で生まれて解放されない外の確保を起こす。
+        /// このtickに期間の中で生まれて解放されない外の確保を起こす。
         alive_at: Option<u32>,
         list_change_at: Option<u32>,
         leave_at: Option<u32>,
-        /// 1 回でも書き戻した後で、この tick にマッチを出る（進め直しの間にマッチを出る形。前向きの期間では出ない）。
+        /// 1回でも書き戻した後のこのtickにマッチを出る（進め直しの間にマッチを出る形。前向きの期間では出ない）。
         leave_after_restore_at: Option<u32>,
         list_sig: u64,
         stop: bool,
@@ -2379,16 +2406,15 @@ mod tests {
         published: Vec<TrialRecord>,
         now: u64,
         restores: u32,
-        /// 同期と関係ない値の真似（fps の数字）: このアドレスへ毎 tick、通算の tick の下位 1 バイトを書く（巻き戻しても戻らないので D1 と D2 で必ず違う）。
+        /// 同期と関係ない値の真似（fpsの数字）: このアドレスへ毎tick通算のtickの下位1バイトを書く（巻き戻しても戻らないのでD1とD2で必ず違う）。
         noise_at: Option<u32>,
-        /// 記録係の真似 `(札, 塊の大きさ)`: 確保を向けている tick に、書き位置 `[CURSOR_AT]` が今の塊の外（塊の終わりを含む）なら、
-        /// 札つきで塊を領域から取って 0 で埋め（本物の `0x00420456`〜`0x00420460`）、書き位置を塊の先頭へ。そして書き位置へ通算の tick の
-        /// 下位 1 バイトを書いて 1 進める（本物は 30 tick に 1 回。偽物は毎 tick）。
+        /// 記録係の真似`(札, 塊の大きさ)`: 確保を向けているtickに書き位置`[CURSOR_AT]`が今のブロックの外（ブロックの終わりを含む）なら、タグつきでブロックを領域から確保して0で埋め（本物の`0x00420456`〜`0x00420460`）、書き位置をブロックの先頭へ移す。
+        /// そして書き位置へ通算のtickの下位1バイトを書いて1進める（本物は30 tickに1回。偽物は毎tick）。
         recorder: Option<(u32, u32)>,
-        /// 記録係の今の塊（領域のアドレス）。偽物では `live` と同じく、コピーした時点のバックアップへ書き戻しで戻す。
+        /// 記録係の今のブロック（領域のアドレス）。偽物では`live`と同じくコピーした時点のバックアップへ書き戻しで戻す。
         rec_chunk: Option<u32>,
         rec_chunk_at_snap: Option<u32>,
-        /// 外してはいけない所の真似: 毎 tick、今の塊の `+.0`（`Some(u32::MAX)` なら書き位置の 1 つ先）へも同じ値を書く（塊の中に収まるときだけ）。
+        /// 外してはいけない所の真似: 毎tick今のブロックの`+.0`（`Some(u32::MAX)`なら書き位置の1つ先）へも同じ値を書く（ブロックの中に収まるときだけ）。
         rec_stray: Option<u32>,
         scene_req: bool,
         /// インターフェースの呼ばれた順（フレームの形の順序の検査用）。
@@ -2435,7 +2461,7 @@ mod tests {
             };
             g.w32(0x100, 0x200); // blk_a
             g.w32(0x104, 0x300); // blk_b
-            g.w32(0x108, 0x400); // fx の EffectSys
+            g.w32(0x108, 0x400); // fxのEffectSys
             g.w32(0x400, 0x500); // 要素の配列
             g.w32(0x404, 2);
             g.w32(0x408, 1);
@@ -2694,7 +2720,7 @@ mod tests {
         }
     }
 
-    /// 台本の真似のワード（tick ごとに違う。進め直しで台本のワードを使うと、記録したワードと違って状態がずれる）。
+    /// 台本の真似のワード（tickごとに違う。進め直しで台本のワードを使うと記録したワードと違って状態がずれる）。
     fn script_word(t: u32) -> (u16, u16) {
         (
             ((t * 7) % 5) as u16 | 1,
@@ -2708,7 +2734,7 @@ mod tests {
                 continue;
             }
             if gap_at == Some(t) {
-                g.step(0, 0); // poll_all の入力（台本のワードではない）
+                g.step(0, 0); // poll_allの入力（台本のワードではない）
                 continue;
             }
             let (a, b) = script_word(t);
@@ -2781,7 +2807,7 @@ mod tests {
         assert!(sum.iter().any(|l| l.contains("globals 4")), "{sum:?}");
     }
 
-    /// `Game` を包み、`compare_draw` だけ上書きする偽（描画用の欄の診断のインターフェースの検査用。診断の中身は `rollback_draw` の検査で見る）。
+    /// `Game`を包み、`compare_draw`だけ上書きする偽（描画用のフィールドの診断のインターフェースの検査用。診断の中身は`rollback_draw`の検査で見る）。
     struct DrawGame {
         g: Game,
         seen: Vec<SkipDraw>,
@@ -3238,11 +3264,11 @@ mod tests {
         let mut a1 = vec![0u8; 0x10C];
         let mut a2 = vec![0u8; 0x10C];
         for a in [&mut a1, &mut a2] {
-            put(a, 3, POS); // 両方で fps の位置（外す）
+            put(a, 3, POS); // 両方でfpsの位置（外す）
             put(a, 7, POS); // はみ出す枠（外さない）
         }
-        put(&mut a1, 5, POS); // D1 だけ（外さない）
-        put(&mut a1, 6, POS); // z だけ違う（外さない）
+        put(&mut a1, 5, POS); // D1だけ（外さない）
+        put(&mut a1, 6, POS); // zだけ違う（外さない）
         put(&mut a2, 6, [POS[0], POS[1], 1]);
         assert_eq!(
             skips_of(&t, &r, &a1, &a2, &st, &mut arena, &m),
@@ -3471,7 +3497,7 @@ mod tests {
         assert!(crossed >= 2, "k = 4 の 2 回は取り直しを跨ぐ（{crossed}）");
     }
 
-    /// 本物の表で `fill` と `Probe` を回す偽のインターフェース（読むのはアドレスの表だけ。書き戻し・比べは呼ばれたら落ちる）。
+    /// 本物の表で`fill`と`Probe`を回す偽のインターフェース（読むのはアドレスの表だけ。書き戻し・比べは呼ばれたら落ちる）。
     struct MapIo {
         words: std::collections::HashMap<u32, u32>,
         not_rw: Option<u32>,
@@ -3604,15 +3630,17 @@ mod tests {
         }
     }
 
-    /// 偽のゲームで、do_frame の走査 1 回ぶん（= 入力の地点 1 回 + 台本の tick 1 回）を回す `ScanIo`。本物の `RealScan`
-    /// と同じ組み方: 1 回目の走査の中の入力の地点で `Probe` が D1 をコピーして書き戻し、走査の後に `take_owed` を聞き、
-    /// 残りの回は入力の地点が記録した語を feed する。
+    /// 偽のゲームでdo_frameの走査1回ぶん（= 入力の地点1回 + 台本のtick 1回）を回す`ScanIo`。
+    /// 本物の`RealScan`と同じ組み方をする。
+    /// - 1回目の走査の中の入力の地点で、`Probe`がD1をコピーして書き戻す。
+    /// - 走査の後に`take_owed`を取得する。
+    /// - 残りの回は、入力の地点が記録したワードをfeedする。
     struct GameScan<'a> {
         g: &'a mut Game,
         p: &'a mut Probe,
         script_t: u32,
         calls: u32,
-        /// この通算の回（0 始まり）に走査が 1 を返す（打ち切りの真似）。
+        /// この通算の回（0始まり）に走査が1を返す（打ち切りの真似）。
         abort_at: Option<u32>,
         events: Vec<&'static str>,
     }

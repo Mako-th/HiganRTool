@@ -1,6 +1,6 @@
-//! 本ログの名前と、本ログの中の「起動の区切り」の行。DLL が書き、ローダーが読む。
+//! 本ログの名前と本ログの中の「起動の区切り」の行。DLLが書き、ローダーが読む。
 //!
-//! 本ログは日ごとの 1 ファイル（`dll_YYYYMMDD.log`）に起動のたびに追記するので、1 つの実行の範囲は区切りの行で見分ける。
+//! 本ログは日ごとの1ファイル（`dll_YYYYMMDD.log`）に起動のたびに追記する。そのため1つの実行の範囲は区切りの行で見分ける。
 
 #![forbid(unsafe_code)]
 
@@ -13,13 +13,13 @@ pub const RUN_HEADER_PREFIX: &str = "==== 起動 pid ";
 const RUN_HEADER_SUFFIX: &str = " ====";
 const SEP: &str = " / ";
 
-/// 区切りの行: `==== 起動 pid <PID> / <時刻> / <回ごとの名前の元> ====`。回ごとの名前の元は、隣のファイル
-/// （`<元>_net_frames.csv.gz` など）の名前の先頭。
+/// 区切りの行: `==== 起動 pid <PID> / <時刻> / <回ごとの名前の元> ====`。
+/// 回ごとの名前の元は隣のファイル（`<元>_net_frames.csv.gz`など）の名前の先頭。
 pub fn run_header(pid: u32, time: &str, stem: &str) -> String {
     format!("{RUN_HEADER_PREFIX}{pid}{SEP}{time}{SEP}{stem}{RUN_HEADER_SUFFIX}")
 }
 
-/// 日ごとの本ログの名前（`dll_YYYYMMDD.log`）か。
+/// 日ごとの本ログの名前（`dll_YYYYMMDD.log`）かどうか。
 pub fn is_daily_log_name(name: &str) -> bool {
     let Some(rest) = name
         .strip_prefix(LOG_PREFIX)
@@ -30,7 +30,7 @@ pub fn is_daily_log_name(name: &str) -> bool {
     rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// 区切りの行から（PID, 回ごとの名前の元）。形が違えば None。
+/// 区切りの行から（PID, 回ごとの名前の元）。形が違えばNone。
 fn parse_header(line: &str) -> Option<(u32, &str)> {
     let body = line
         .strip_prefix(RUN_HEADER_PREFIX)?
@@ -42,12 +42,12 @@ fn parse_header(line: &str) -> Option<(u32, &str)> {
     Some((pid, stem))
 }
 
-/// 1 行（改行を除く）が区切りの行ならその PID。大きな本ログを行ごとに読む側が、全体を持たずに区切りを探すのに使う。
+/// 1行（改行を除く）が区切りの行ならそのPID。大きな本ログを行ごとに読む側が全体を持たずに区切りを探すのに使う。
 pub fn header_pid(line: &str) -> Option<u32> {
     parse_header(line).map(|(p, _)| p)
 }
 
-/// `pid` の実行の範囲: その PID の最後の区切りの行から、次の区切りの行（どの PID でも）の手前まで。
+/// `pid`の実行の範囲: そのPIDの最後の区切りの行から次の区切りの行（どのPIDでも）の手前まで。
 #[derive(Debug, PartialEq, Eq)]
 pub struct RunSection<'a> {
     pub stem: &'a str,
@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn only_a_whole_line_header_with_the_same_pid_counts() {
         let h = run_header(12, "t", "dll_x");
-        // PID の前方一致（12 と 123）・行の途中・CRLF・形の崩れ。
+        // PIDの前方一致（12と123）・行の途中・CRLF・形の崩れ。
         let text = format!(
             "{}\nx\n{}\r\ny\r\n前置き {h}\n==== 起動 pid 12 / t ====\n",
             run_header(123, "t", "dll_long"),

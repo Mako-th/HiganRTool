@@ -1,5 +1,5 @@
-//! 自作の `.res` を llvm-rc が同じ内容の `.rc` から作る `.res` とバイト単位で比べる。
-//! llvm-rc が無い環境（Windows の開発機など）では飛ばす。`REQUIRE_LLVM_RC=1` なら無いこと自体を失敗にする。
+//! 自作の`.res`をllvm-rcが同じ内容の`.rc`から作る`.res`とバイト単位で比べる。
+//! llvm-rcが無い環境（Windowsの開発機など）では飛ばす。`REQUIRE_LLVM_RC=1`なら無いこと自体を失敗にする。
 
 use higanr_build_res::{FileKind, VersionInfo, parse_version, version_res};
 use std::path::Path;
@@ -56,7 +56,7 @@ fn llvm_rc_res(dir: &Path, rc: &str) -> Option<Vec<u8>> {
     let rc_path = dir.join("v.rc");
     let res_path = dir.join("v.res");
     std::fs::write(&rc_path, rc).unwrap();
-    // windows.h の代わりに最小の定義を書く（llvm-rc は SDK が無くても動く）。
+    // windows.hの代わりに最小の定義を書く（llvm-rcはSDKが無くても動く）。
     std::fs::write(
         dir.join("windows.h"),
         "#define LANG_ENGLISH 0x09\n#define SUBLANG_ENGLISH_US 0x01\n\

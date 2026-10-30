@@ -1,12 +1,15 @@
-//! ネットワーク対戦の間も、自分の PC にだけゲーム自身のスクリーンショットを撮らせるキー（P・Home）の取り方（pure。unsafe 無し）。
+//! ネットワーク対戦の間も自分のPCにだけゲーム自身のスクリーンショットを撮らせるキー（P・Home）の取り方（pure。unsafe無し）。
 //!
-//! ツールが入力ワードを握っている tick の語は、自分の分も相手と同じマスクをかける（`MATCH_SEND_MASK` に P/Home の `0x0800` は無い。
-//! 相手の PC にスクリーンショットを書かせないため）ので、ゲーム自身の判定（Present のラッパの中で `[2]+0x06 & 0x0800` を見る）に届かない。
-//! そこで DLL が自分のキーボードの押した瞬間だけを覚え、Present のラッパを呼ぶ間だけ `0x0800` を立てて戻す（書き込みは `shot_key_win.rs`）。入力ワード・リプレイの語・CHECK・観戦には触れない。
+//! ツールが入力ワードを占有しているtickでは、自分の分のワードにも相手と同じマスクをかける。
+//! `MATCH_SEND_MASK`にP/Homeの`0x0800`は無い（相手のPCにスクリーンショットを書かせないため）。
+//! そのためゲーム自身の判定（Presentのラッパの中で`[2]+0x06 & 0x0800`を見る）に押下が届かない。
+//! そこでDLLが自分のキーボードの押した瞬間だけを覚え、Presentのラッパを呼ぶ間だけ`0x0800`を立てて戻す（書き込みは`shot_key_win.rs`）。
+//! 入力ワード・リプレイのワード・CHECK・観戦には触れない。
 //!
-//! - 押した瞬間は P と Home の「どちらか」で取る（ゲームは同じビットに割り当てているので、片方を押したまま他方を押しても 1 枚）。
-//! - 取るのはツールが握っている tick だけ。握っていない tick（`Action::Local`）はゲーム自身の poll が P を読むので、二重に撮らない。
-//! - 押下は次の Present のラッパまで持ち越す（フレームスキップで失われない。1 回の押下で 1 枚）。読めない tick（別のアプリが前面・文字の入力中）の後は、押されたままのキーを押下と取らない。
+//! - 押した瞬間はPとHomeの「どちらか」で取る（ゲームは同じビットに割り当てているので片方を押したまま他方を押しても1枚）。
+//! - 取るのはツールが入力を占有しているtickだけ。占有していないtick（`Action::Local`）はゲーム自身のpollがPを読むので二重に撮らない。
+//! - 押下は次のPresentのラッパまで持ち越す（フレームスキップで失われない。1回の押下で1枚）。
+//!   読めないtick（別のアプリが前面・文字の入力中）の後は押されたままのキーを押下と取らない。
 
 #![forbid(unsafe_code)]
 
@@ -17,9 +20,9 @@ const PENDING_BIT: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShotKeys {
-    /// 前の tick に P か Home が押されていた（読めなかった tick は押されていたことにする）。
+    /// 前のtickにPかHomeが押されていた（読めなかったtickは押されていたことにする）。
     prev: bool,
-    /// 取った押下がまだ Present のラッパに届いていない。
+    /// 取った押下がまだPresentのラッパに届いていない。
     pending: bool,
 }
 
@@ -38,7 +41,7 @@ impl ShotKeys {
         }
     }
 
-    /// 原子変数に預けるための 2 ビットの形。
+    /// アトミック変数に保存するための2ビットの形。
     pub const fn from_bits(b: u32) -> Self {
         ShotKeys {
             prev: b & PREV_BIT != 0,
@@ -54,8 +57,10 @@ impl ShotKeys {
         self.pending
     }
 
-    /// 1 tick に 1 回。`down` は P か Home が今押されているか（読んではいけない間は `None`）、`held` はこの tick でツールが入力を握っているか。
-    /// 握っていない tick は押下を作らず、持ち越しも捨てる（その tick からゲーム自身の poll が読むので、遅れて撮らない）。
+    /// 1 tickに1回呼ぶ。
+    /// `down`はPかHomeが今押されているか（読んではいけない間は`None`）。
+    /// `held`はこのtickでツールが入力を占有しているか。
+    /// 占有していないtickは押下を作らず、持ち越しも捨てる（そのtickからゲーム自身のpollが読むので遅れて撮らない）。
     pub fn tick(&mut self, down: Option<bool>, held: bool) {
         let edge = match down {
             Some(d) => {
@@ -75,18 +80,18 @@ impl ShotKeys {
         }
     }
 
-    /// Present のラッパを呼ぶ直前に 1 回。持ち越した押下があれば真を返して消す（1 回の押下で 1 枚）。
+    /// Presentのラッパを呼ぶ直前に1回。持ち越した押下があれば真を返して消す（1回の押下で1枚）。
     pub fn take(&mut self) -> bool {
         core::mem::take(&mut self.pending)
     }
 }
 
-/// ラッパを呼ぶ間だけ立てる語。すでに立っていれば `None`（ゲームはそのまま撮るので、触らず、戻すときも落とさない）。
+/// ラッパを呼ぶ間だけビットを立てるワード。すでに立っていれば`None`（ゲームはそのまま撮るので触らない。戻すときも落とさない）。
 pub fn raise(word: u16) -> Option<u16> {
     (word & SHOT_BIT == 0).then_some(word | SHOT_BIT)
 }
 
-/// ラッパから戻ったら、立てたビットだけを落とす。ほかのビットは今の値のまま（立てている間に書き換わったものを巻き戻さない）。
+/// ラッパから戻ったら立てたビットだけを落とす。ほかのビットは今の値のまま（立てている間に書き換わったものを巻き戻さない）。
 pub fn lower(word: u16) -> u16 {
     word & !SHOT_BIT
 }
@@ -95,7 +100,7 @@ pub fn lower(word: u16) -> u16 {
 mod tests {
     use super::*;
 
-    /// 読める tick（握っている）で押下の列を流し、各 tick の後に押下が持ち越されているかを返す。
+    /// 読めるtick（入力を占有している）で押下の列を渡して、各tickの後に押下が持ち越されているかを返す。
     fn run(seq: &[bool]) -> Vec<bool> {
         let mut s = ShotKeys::new();
         seq.iter()
@@ -108,7 +113,7 @@ mod tests {
 
     #[test]
     fn only_the_press_edge_counts_and_a_key_held_since_the_start_does_not() {
-        // 最初の読みで押されていたキーは押下でない。離して押し直した tick で 1 回。押し続けは新しい押下を作らない。
+        // 最初の読みで押されていたキーは押下でない。離して押し直したtickで1回。押し続けは新しい押下を作らない。
         assert_eq!(
             run(&[true, true, false, true, true]),
             [false, false, false, true, true],
@@ -142,7 +147,7 @@ mod tests {
 
     #[test]
     fn nothing_is_made_or_kept_on_a_tick_the_tool_does_not_hold() {
-        // 握っていない tick（ゲーム自身の poll が読む）の押下は作らない。握っていない間に押して、握る tick になっても押したままなら押下でない。
+        // 占有していないtick（ゲーム自身のpollが読む）の押下は作らない。占有していない間に押して占有するtickになっても押したままなら押下でない。
         let mut s = ShotKeys::new();
         s.tick(Some(false), false);
         s.tick(Some(true), false);
@@ -158,7 +163,7 @@ mod tests {
         s.tick(Some(false), true);
         s.tick(Some(true), true);
         assert!(s.pending());
-        // 持ち越した押下は、握っていない tick が来たら捨てる（遅れて 1 枚撮らない）。
+        // 持ち越した押下は占有していないtickが来たら捨てる（遅れて1枚撮らない）。
         s.tick(Some(true), false);
         assert!(!s.take(), "握っていない tick の後に持ち越しが残った");
     }
@@ -173,7 +178,7 @@ mod tests {
         s.tick(Some(false), true);
         s.tick(Some(true), true);
         assert!(s.pending(), "離して押せば取る");
-        // 読めない tick は持ち越しを消さない（前面を離れても、押した分の 1 枚は残る）。
+        // 読めないtickは持ち越しを消さない（前面を離れても押した分の1枚は残る）。
         s.tick(None, true);
         assert!(s.pending());
         assert!(s.take());

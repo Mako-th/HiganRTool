@@ -1,11 +1,13 @@
-//! 観戦のホストの検査（本物の UDP・受信スレッド・リングバッファ。観戦者は core の `Watcher` を別のスレッドで走らせる）。
+//! 観戦のホストの検査（本物のUDP・受信スレッド・リングバッファ。観戦者はcoreの`Watcher`を別のスレッドで走らせる）。
 use super::*;
 use crate::net_udp;
 use crate::netplay::Net;
 use crate::spectate_testkit::{Behavior, NOACK_WINDOW, Observer};
 use higanr_core::auth::AuthKey;
 use higanr_core::candidate::Candidates;
-use higanr_core::wire::{self, MAX_DATAGRAM, Message, Seat, Select, Step, StepKind};
+use higanr_core::wire::{
+    self, MAX_DATAGRAM, MAX_STREAM_RECORDS, Message, Seat, Select, Step, StepKind,
+};
 use std::time::{Duration, Instant};
 
 pub(super) const MATCH_SESSION: u32 = 0x5EED_0001;
@@ -45,7 +47,7 @@ fn sel(seed: u16) -> Select {
     }
 }
 
-/// ゲームのスレッドが書く記録の並び（seg 0 の選択 → マッチ → seg 1 のマッチ → 終わり）。`frames` は seg 0 のマッチの長さ。
+/// ゲームのスレッドが書く記録の並び（seg 0の選択 → マッチ → seg 1のマッチ → 終わり）。`frames`はseg 0のマッチの長さ。
 fn script(frames: u32) -> Vec<Record> {
     let mut v = vec![
         Record::Seg { seg: 0 },
@@ -81,7 +83,7 @@ fn script(frames: u32) -> Vec<Record> {
     v
 }
 
-/// 受信スレッドが観戦のホストを取るまで待つ（設定した直後に届いた JOIN は対戦のセッションへ回るので、黙る観戦者が入れなくなる）。
+/// 受信スレッドが観戦のホストを取得するまで待つ（設定した直後に届いたJOINは対戦のセッションへ回るので黙る観戦者が入れなくなる）。
 pub(super) fn wait_active(rx: &net_udp::RecvThread) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !rx.spectate_active() {
@@ -111,7 +113,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     d
 }
 
-/// 対戦の相手（この検査のソケット）が送る、対戦の session・鍵の PING。受信スレッドは session で経路を分けるだけで中を開かないので、封じる鍵は検査の値でよい。
+/// 対戦の相手（この検査のソケット）が送る対戦のsession・鍵のPING。受信スレッドはsessionで経路を分けるだけで中を開かない。そのため封じる鍵は検査の値でよい。
 pub(super) fn match_ping(seq: u32) -> Vec<u8> {
     let _ = AuthKey::derive(&MATCH_SECRET, MATCH_SESSION);
     let dir = higanr_core::seal::DirKeys::from_raw([0x4D; 32], [0x4D; 32]);
@@ -139,7 +141,7 @@ fn every_record_the_game_wrote_reaches_a_watcher_in_order_and_match_packets_stil
     let spectate_session = p.sender.session_id();
     assert!(rx.install_spectate(p.sender));
     wait_active(&rx);
-    // 受け待ちの上限を短くしない（1 ms にすると、対戦の相手のパケットが 20 走行に 1 走行ほど落ちた。`net_udp::RECV_POLL`）。
+    // 受け待ちの上限を短くしない（1 msにすると対戦の相手のパケットが20走行に1走行ほど落ちた。`net_udp::RECV_POLL`）。
     assert_eq!(
         net.recv_timeout(),
         Some(net_udp::RECV_POLL),
@@ -150,7 +152,7 @@ fn every_record_the_game_wrote_reaches_a_watcher_in_order_and_match_packets_stil
         "2 つ目を受け付けた"
     );
     let obs = Observer::spawn(&p.code_text, Behavior::Normal, 7);
-    // 観戦者が入ってから書く（遅れて入った観戦者は、いまの seg の始まりから流れる）。
+    // 観戦者が入ってから書く（遅れて入った観戦者はいまのsegの始まりから流れる）。
     wait_joined(&rx, 1);
     let want = script(500);
     for r in &want {
@@ -250,7 +252,7 @@ fn silent_noack_and_vanishing_watchers_do_not_stop_the_receive_thread() {
         Observer::spawn(&p.code_text, Behavior::Normal, 4),
     ];
     wait_joined(&rx, 4);
-    // ACK を返さない観戦者がウィンドウで止まるのが見えるよう、ウィンドウより多く積む。
+    // ACKを返さない観戦者が最初の1通で止まるのが見えるよう、ウィンドウより多く積む。
     let want = script(NOACK_WINDOW as u32 + 200);
     assert!(want.len() > NOACK_WINDOW + 200);
     for r in &want {
@@ -277,7 +279,7 @@ fn silent_noack_and_vanishing_watchers_do_not_stop_the_receive_thread() {
         rx.spectate_snapshot()
     );
     let mut normal = None;
-    // 普通の観戦者を先に待つ（全部が届くまで待つ間に、ACK を返さない観戦者へもウィンドウぶんが届き終える）。
+    // 普通の観戦者を先に待つ（全部が届くまで待つ間にACKを返さない観戦者へもウィンドウぶんが届き終える）。
     for o in observers.into_iter().rev() {
         match o.behavior {
             Behavior::Normal => {
@@ -286,10 +288,10 @@ fn silent_noack_and_vanishing_watchers_do_not_stop_the_receive_thread() {
             }
             Behavior::NoAck => {
                 let s = o.finish();
-                assert_eq!(
-                    s.recs.len(),
-                    NOACK_WINDOW,
-                    "ACK を返さない観戦者はウィンドウちょうどまで受け、越えない"
+                assert!(
+                    (1..=MAX_STREAM_RECORDS).contains(&s.recs.len()),
+                    "ACK を返さない観戦者は記録の最初の 1 通だけ受け、越えない: {}",
+                    s.recs.len()
                 );
             }
             Behavior::Silent => {
@@ -363,7 +365,7 @@ fn two_hosts_with_the_same_secret_and_session_get_different_keys() {
     assert_ne!(pa, [0u8; 32], "公開鍵が空");
 }
 
-/// 開発用の `[spectate] fake_uplink` は、ini の経路の観戦のホストの送り手（SpectateSender）に届く。
+/// 開発用の`[spectate] fake_uplink`はiniの経路の観戦のホストの送り手（SpectateSender）に届く。
 #[test]
 fn the_dev_fake_uplink_reaches_the_sender_of_the_ini_path() {
     let ini = |extra: &str| {
@@ -460,7 +462,7 @@ fn the_spectate_setup_failure_phrases_are_seen_as_problems_and_a_success_is_not(
     assert!(!note_has_problem(""));
 }
 
-/// `tick` を検査が直に呼ぶ（受信スレッドの周回を待たない）ので、リングバッファの溢れの形が決まる。
+/// `tick`を検査が直に呼ぶ（受信スレッドの周回を待たない）のでリングバッファの溢れの形が決まる。
 #[test]
 fn an_overflowed_ring_tells_the_host_the_stream_was_cut_before_the_new_seg() {
     let sock = UdpSocket::bind(lo(0)).unwrap();
@@ -533,7 +535,7 @@ fn a_panic_in_the_spectate_host_stops_only_the_spectating() {
     assert!(text.contains("パニックで観戦を止めた"), "{text}");
 }
 
-/// 数えを 3 通りに設定する（自分で抜けた 2・応答が無く外した 5・リングバッファの溢れ 7）→ 語と数が対になって出る。
+/// 集計の数を3通り設定する（自分で抜けた2・応答が無く外した5・リングバッファの溢れ7）。語と数がペアになって出る。
 #[test]
 fn the_snapshot_line_tells_leaving_by_bye_from_being_dropped_for_silence() {
     let mut s = Snapshot::default();
@@ -547,9 +549,25 @@ fn the_snapshot_line_tells_leaving_by_bye_from_being_dropped_for_silence() {
     );
 }
 
+#[test]
+fn the_snapshot_line_counts_acks_dropped_for_a_missing_cookie() {
+    let mut s = Snapshot::default();
+    s.host.acks = 9;
+    s.host.acks_clamped = 1;
+    s.host.sacks_clamped = 2;
+    s.host.cookie_refused = 4;
+    let text = s.text();
+    assert!(
+        text.contains(
+            "受けた ACK 9（積んだより先の嘘 1・受け取れた範囲の嘘 2・クッキーを返さず捨てた 4）"
+        ),
+        "{text}"
+    );
+}
+
 // ---------------- 穴あけ ----------------
 //
-// `SpectateSender::tick` / `on_datagram` を検査が直に呼ぶので、時刻 `now` を自分で決められる。宛先は本物の UDP（loopback）のソケット。
+// `SpectateSender::tick` / `on_datagram`を検査が直に呼ぶので時刻`now`を自分で決められる。宛先は本物のUDP（loopback）のソケット。
 
 use higanr_core::spectate::{
     PUNCH_INTERVAL_MS, PUNCH_PACKET, PUNCH_ROUNDS, Watcher, WatcherConfig,
@@ -581,7 +599,7 @@ fn punch_target() -> UdpSocket {
     s
 }
 
-/// ソケットに届いているものを、来なくなるまで数える。戻りは（穴あけの印 HGRp、それ以外）。
+/// ソケットに届いているものを来なくなるまで数える。戻りは（穴あけの印HGRp, それ以外）。
 fn drain_seen(s: &UdpSocket) -> (usize, usize) {
     let (mut punches, mut others) = (0, 0);
     let mut buf = [0u8; 2048];
@@ -606,7 +624,7 @@ fn cands_of(addrs: &[SocketAddr]) -> Candidates {
     Candidates::from_addrs(addrs).unwrap()
 }
 
-/// 観戦用のコード（`SPEC_SESSION`・`SPEC_SECRET`）で作った JOIN（`secret` を替えるとタグが合わない）。
+/// 観戦用のコード（`SPEC_SESSION`・`SPEC_SECRET`）で作ったJOIN（`secret`を替えるとタグが合わない）。
 fn join_bytes(secret: Secret, nonce: u64) -> Vec<u8> {
     struct Collect(Vec<Vec<u8>>);
     impl Outlet for Collect {
@@ -736,7 +754,7 @@ fn a_request_for_another_viewer_adds_a_plan_and_a_repeat_restarts_only_that_view
     }
     assert_eq!(punches_seen(&t1), 3, "1 人目の予定が後の頼みで消えた");
     assert_eq!(punches_seen(&t2), 5, "2 人目の予定は 5 回");
-    // 同じ観戦者の頼み直し（候補が重なる）は、その人の予定を作り直し、ほかの人の予定は動かさない。
+    // 同じ観戦者の頼み直し（候補が重なる）はその人の予定を作り直し、ほかの人の予定は動かさない。
     shared.request_punch(cands_of(&[a1]));
     for k in 0..9 {
         sender.tick(&sock, 3_000 + k * 200);
@@ -828,7 +846,7 @@ fn with_every_plan_busy_the_one_furthest_along_makes_room_and_finished_plans_are
     let (mut sender, sock, shared) = punch_sender(Scope::Loopback);
     let ts: Vec<UdpSocket> = (0..=PUNCH_PLANS).map(|_| quick_target()).collect();
     let req = |i: usize| shared.request_punch(cands_of(&[ts[i].local_addr().unwrap()]));
-    // 0 番だけ先に始め、3 回送ったところで残りの 9 人が加わる（枠が全部埋まる）。
+    // 0番だけ先に始め、3回送ったところで残りの9人が加わる（枠が全部埋まる）。
     req(0);
     for k in 0..3 {
         sender.tick(&sock, k * PUNCH_INTERVAL_MS);
@@ -838,7 +856,7 @@ fn with_every_plan_busy_the_one_furthest_along_makes_room_and_finished_plans_are
     }
     sender.tick(&sock, 3 * PUNCH_INTERVAL_MS);
     assert_eq!(sender.punch_counts.evicted, 0);
-    // 11 人目: 送り終えた予定が無いので、いちばん先まで送った 0 番の予定（4 回送った）を押し出す。
+    // 11人目: 送り終えた予定が無いのでいちばん先まで送った0番の予定（4回送った）を押し出す。
     req(PUNCH_PLANS);
     for k in 4..14 {
         sender.tick(&sock, k * PUNCH_INTERVAL_MS);
@@ -848,7 +866,7 @@ fn with_every_plan_busy_the_one_furthest_along_makes_room_and_finished_plans_are
     want[0] = 4;
     assert_eq!(seen, want, "押し出されたのは 0 番だけ");
     assert_eq!(sender.punch_counts.evicted, 1);
-    // 全部送り終えた後の頼みは、送り終えた枠を使い、押し出さない。
+    // 全部送り終えた後の頼みは送り終えた枠を使い、押し出さない。
     let late = quick_target();
     shared.request_punch(cands_of(&[late.local_addr().unwrap()]));
     for k in 20..30 {
@@ -879,7 +897,7 @@ fn a_joining_viewer_stops_only_its_own_plan_among_several() {
     assert_eq!(sender.punch_counts.stopped, 1);
 }
 
-/// 測りの組 PAIR（ホストとの鍵で封じた 1,200 B）。`peek_type` が見分ける形で、中身を開くのは番を持つ観戦者の鍵だけ。
+/// 測りのペアPAIR（ホストとの鍵で封じた1,200 B）。`peek_type`が見分ける形。中身を開くのは番を持つ観戦者の鍵だけ。
 fn pair_bytes() -> Vec<u8> {
     let dir = higanr_core::seal::DirKeys::from_raw([0x51; 32], [0x51; 32]);
     let mut b = [0u8; MAX_DATAGRAM];
@@ -958,7 +976,7 @@ fn the_snapshot_lines_add_the_tree_and_measure_rows_only_when_they_have_numbers(
     assert_eq!(rows.len(), 4, "{lines}");
     assert!(rows[1].starts_with("観戦者のツリー:") && rows[2].starts_with("上り回線速度の測定:"));
     assert!(rows[3].starts_with("観戦帯域の調整:"));
-    // 片方だけに数があれば、その行だけ。
+    // 片方だけに数があればその行だけ。
     let only_measure = Snapshot {
         host: HostCounts {
             measures: 1,
@@ -968,7 +986,7 @@ fn the_snapshot_lines_add_the_tree_and_measure_rows_only_when_they_have_numbers(
     };
     assert_eq!(only_measure.tree_text(), None);
     assert!(only_measure.measure_text().is_some());
-    // 数が 1 つだけでも行は出る。
+    // 数が1つだけでも行は出る。
     let one = |f: fn(&mut Snapshot)| {
         let mut s = Snapshot::default();
         f(&mut s);
@@ -1002,10 +1020,11 @@ fn the_tree_row_adds_the_swaps_only_when_there_are_some() {
     assert!(!s.text().contains("入れ替え"), "silenced の行に混ぜた");
 }
 
-// ---------------- IPv4 と IPv6 の両方の経路 ----------------
+// ---------------- IPv4とIPv6の両方の経路 ----------------
 //
-// 観戦者は観戦用のコードの IPv4・IPv6 の全候補へ JOIN を送り、最初に STREAM が返った経路に決める。ホストは IPv6 の受信スレッドでも観戦者の便を受け、
-// 返事は宛先の族のソケットから出す。IPv6 の loopback（`::1`）が使えない PC では、その旨を標準エラーに書いて検査を測らずに戻る。
+// 観戦者は観戦用のコードのIPv4・IPv6の全候補へJOINを送り、最初にSTREAMが返った経路に決める。
+// ホストはIPv6の受信スレッドでも観戦者のパケットを受け、返事は宛先のアドレスファミリのソケットから出す。
+// IPv6のloopback（`::1`）が使えないPCでは、その旨を標準エラーに書いて検査を測らずに戻る。
 
 fn v6lo(port: u16) -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port)
@@ -1023,7 +1042,7 @@ fn v6_available(what: &str) -> bool {
     }
 }
 
-/// どこも待っていない IPv4 の loopback のアドレス（届かない候補）。
+/// どこも待っていないIPv4のloopbackのアドレス（届かない候補）。
 fn dead_v4() -> SocketAddr {
     let s = UdpSocket::bind(lo(0)).unwrap();
     s.local_addr().unwrap()
@@ -1040,7 +1059,7 @@ struct DualHost {
     _peer: UdpSocket,
 }
 
-/// IPv4 と IPv6 の受信ソケットを持つホストを作り、観戦のホストを組み込む。
+/// IPv4とIPv6の受信ソケットを持つホストを作り、観戦のホストを組み込む。
 fn dual_host() -> DualHost {
     let peer = UdpSocket::bind(lo(0)).unwrap();
     let peer_addr = peer.local_addr().unwrap();
@@ -1062,7 +1081,7 @@ fn dual_host() -> DualHost {
     }
 }
 
-/// 観戦用のコードの候補だけを替えたコード（session・秘密・鍵は同じ）。
+/// 観戦用のコードの候補だけを替えたコード（session・秘密の乱数・鍵は同じ）。
 fn code_with(code_text: &str, cands: &[SocketAddr]) -> String {
     let c = code::read_spectate(code_text, net_udp::now_unix()).unwrap();
     code::write_spectate(
@@ -1088,7 +1107,7 @@ fn watcher_for(code_text: &str, nonce: u64) -> Watcher {
     })
 }
 
-/// 観戦者の側を `limit` まで回す（本物のソケット。`GameNet` が宛先の族でソケットを選ぶ）。`done` が真になったら true。
+/// 観戦者の側を`limit`まで回す（本物のソケット。`GameNet`が宛先のアドレスファミリでソケットを選ぶ）。`done`が真になったらtrue。
 fn drive(
     net: &mut net_udp::GameNet,
     w: &mut Watcher,
@@ -1111,7 +1130,7 @@ fn drive(
     false
 }
 
-/// 観戦者の側のソケット（IPv4 と、`v6` なら IPv6）。
+/// 観戦者の側のソケット（IPv4と、`v6`ならIPv6）。
 fn viewer_net(v6: bool) -> (net_udp::GameNet, net_udp::RecvThread) {
     let (net, rx) = net_udp::open(lo(0), &[lo(9)]).unwrap();
     if v6 {
@@ -1120,7 +1139,7 @@ fn viewer_net(v6: bool) -> (net_udp::GameNet, net_udp::RecvThread) {
     (net, rx)
 }
 
-/// ホストへ記録を書いて、観戦者がそれを全部受け取るまで回す。
+/// ホストへ記録を書いて観戦者がそれを全部受け取るまで回す。
 fn deliver_script(h: &DualHost, vnet: &mut net_udp::GameNet, w: &mut Watcher) {
     let want = script(60);
     for r in &want {
@@ -1195,7 +1214,7 @@ fn when_both_paths_answer_the_first_one_wins_and_the_other_is_dropped_and_left_a
         h.rx.spectate_snapshot()
     );
     let chosen_v6 = w.host_addr().unwrap().is_ipv6();
-    // 余った経路の枠が外れて 1 人になる（返事を待つ間は両方の枠が立っていてよい）。
+    // 余った経路の枠が外れて1人になる（返事を待つ間は両方の枠が立っていてよい）。
     let settled = drive(&mut vnet, &mut w, Duration::from_secs(5), |_| {
         h.rx.spectate_snapshot().is_some_and(|s| s.spectators == 1)
     });
@@ -1250,7 +1269,7 @@ fn a_host_with_an_ipv6_socket_still_serves_an_ipv4_only_watcher() {
     assert_eq!((snap.spectators, snap.spectators_v6), (1, 0), "{snap:?}");
     assert_eq!((snap.via.recv_v6, snap.send.sent_v6), (0, 0), "{snap:?}");
     assert_eq!(snap.send.errors, 0, "送りの誤り: {snap:?}");
-    // コードに IPv6 の候補が先頭にあっても、観戦者が IPv6 のソケットを持たなければ IPv4 で接続する。
+    // コードにIPv6の候補が先頭にあっても観戦者がIPv6のソケットを持たなければIPv4で接続する。
     let both = code_with(&h.code_text, &[h.v6, h.v4]);
     let mut w2 = watcher_for(&both, 0x64);
     let (mut vnet2, _vrx2) = viewer_net(false);
@@ -1303,7 +1322,7 @@ fn punches_leave_from_the_socket_of_the_destinations_family() {
     );
 }
 
-/// 隣の検査が、範囲の中の IPv6 には送れることを見る。
+/// 隣の検査が範囲の中のIPv6には送れることを見る。
 #[test]
 fn punches_to_an_ipv6_destination_outside_the_scope_are_refused_at_the_door() {
     let (mut sender, sock, shared) = punch_sender(Scope::Loopback);
@@ -1319,7 +1338,7 @@ fn punches_to_an_ipv6_destination_outside_the_scope_are_refused_at_the_door() {
     );
 }
 
-/// IPv4 の待ちの偶然の位相で通らないよう、20 回のうち 17 回以上が 15 ms 以内を要る。
+/// IPv4の待ちの位相が偶然合って通ることがないよう、20回のうち17回以上が15 ms以内に収まることを条件にする。
 #[test]
 #[ignore = "実時間の 15 ms を測る(他の検査と処理を取り合うと揺れる)ので単独の組で走らせる。全件の回で --ignored の直列の組に入る"]
 fn a_match_datagram_on_the_ipv6_socket_drains_the_spectate_ring_at_once() {
@@ -1332,7 +1351,7 @@ fn a_match_datagram_on_the_ipv6_socket_drains_the_spectate_ring_at_once() {
     assert!(h.ring.push(Record::Seg { seg: 0 }));
     let (mut quick, mut slowest) = (0, Duration::ZERO);
     for i in 0..20u32 {
-        // 前の記録が空になるのを待ってから 1 件積む（他の周回が先に空にした分は数えない）。
+        // 前の記録が空になるのを待ってから1件積む（他の周回が先に空にした分は数えない）。
         let settle = Instant::now();
         while u64::from(h.ring.counts().pushed) != pushed()
             && settle.elapsed() < Duration::from_secs(1)
@@ -1363,7 +1382,7 @@ fn a_match_datagram_on_the_ipv6_socket_drains_the_spectate_ring_at_once() {
     );
 }
 
-/// 観戦者の側の JOIN(`Watcher::poll` が出すもの)を、宛先つきで集める。
+/// 観戦者の側のJOIN(`Watcher::poll`が出すもの)を宛先つきで集める。
 fn join_packets(code_text: &str, nonce: u64) -> Vec<(SocketAddr, Vec<u8>)> {
     struct Collect(Vec<(SocketAddr, Vec<u8>)>);
     impl Outlet for Collect {
@@ -1387,7 +1406,7 @@ fn a_busy_spectate_host_never_holds_up_the_receive_threads_and_keeps_the_watcher
     let peer4 = UdpSocket::bind(lo(0)).unwrap();
     let peer6 = UdpSocket::bind(v6lo(0)).unwrap();
     let guard = h.rx.hold_spectate_sender();
-    // 観戦者の JOIN(IPv4・IPv6)と、対戦の PING を 5 通ずつ。
+    // 観戦者のJOIN(IPv4・IPv6)と、対戦のPINGを5通ずつ。
     for (to, bytes) in join_packets(&text, 0x71) {
         let sock: &UdpSocket = if to.is_ipv6() { &peer6 } else { &peer4 };
         sock.send_to(&bytes, to).unwrap();
@@ -1412,7 +1431,7 @@ fn a_busy_spectate_host_never_holds_up_the_receive_threads_and_keeps_the_watcher
         "錠を持たれている間に観戦のホストが動いた"
     );
     drop(guard);
-    // 離した後の周回で、積んであった JOIN を処理する(失われていない)。
+    // 離した後の周回で積んであったJOINを処理する(失われていない)。
     let t0 = Instant::now();
     while h.rx.spectate_snapshot().map_or(0, |s| s.host.joined) < 1 {
         assert!(
@@ -1476,8 +1495,8 @@ fn the_queue_behind_a_busy_lock_is_bounded_and_counts_what_it_drops() {
     drop(net);
 }
 
-/// ゲームのスレッドが書いた対戦の往復の要約（`Net::note_delay`）が、受信スレッドの観戦者への送信に届き、延びていれば送信を止める（遅れた観戦者へ記録を速く送る追いつきの送りが無いので半分にしない）。
-/// 延びていない要約と「標本なし」では下げない。
+/// ゲームのスレッドが書いた対戦の往復の要約（`Net::note_delay`）が受信スレッドの観戦者への送信に届く。
+/// 往復が延びていれば送信を止める（遅れた観戦者へ記録を速く送る追いつきの送信が無いので半分にしない）。延びていない要約と「サンプルなし」では下げない。
 #[test]
 fn the_delay_noted_on_the_game_thread_reaches_the_spectate_sender() {
     use higanr_core::rtt_probe::DelaySnapshot;
@@ -1500,10 +1519,11 @@ fn the_delay_noted_on_the_game_thread_reaches_the_spectate_sender() {
         net.note_delay(Some(DelaySnapshot {
             at,
             queue_ms: recent - 30,
+            fresh_ms: recent - 30,
             base_ms: 30,
         }));
     };
-    // 延びていない要約・標本なしを 0.3 秒渡し続けても下げない（受信スレッドは 50 ms ごとには回る）。
+    // 延びていない要約・サンプルなしを0.3秒渡し続けても下げない（受信スレッドは50 msごとには回る）。
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_millis(300) {
         note(&mut net, 35);
@@ -1515,13 +1535,42 @@ fn the_delay_noted_on_the_game_thread_reaches_the_spectate_sender() {
     let t0 = Instant::now();
     loop {
         note(&mut net, 80);
-        // 遅れた観戦者へ記録を速く送る追いつきの送りが無いので、半分にせず止める。
+        // 遅れた観戦者へ記録を速く送る追いつきの送信が無いので半分にせず止める。
         if level(&rx) == (FULL_PPM, true) {
             break;
         }
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "往復の延びが観戦の送りに届かない"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(net);
+}
+
+/// ゲームのスレッドが書いた自分の上り（`Net::note_host_uplink`）が受信スレッドの観戦者への送信に届く。
+#[test]
+fn the_own_uplink_noted_on_the_game_thread_reaches_the_spectate_sender() {
+    let peer = UdpSocket::bind(lo(0)).unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let (mut net, rx) = net_udp::open(lo(0), &[peer_addr]).unwrap();
+    let me = net.local_addr().unwrap();
+    let p = prepare(&settings(peer_addr, true), me).unwrap();
+    assert!(rx.install_spectate(p.sender));
+    wait_active(&rx);
+    let uplink = |rx: &net_udp::RecvThread| {
+        rx.hold_spectate_sender()
+            .as_ref()
+            .expect("観戦のホスト")
+            .host_uplink()
+    };
+    assert_eq!(uplink(&rx), 0, "渡す前から値がある");
+    net.note_host_uplink(123_456);
+    let t0 = Instant::now();
+    while uplink(&rx) != 123_456 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "自分の上りが観戦の送りに届かない"
         );
         std::thread::sleep(Duration::from_millis(5));
     }

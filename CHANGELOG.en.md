@@ -6,6 +6,66 @@ Different versions cannot connect to each other.
 Use the same version as your opponent.
 
 
+## v1.2.1
+
+### Added
+
+- At the end of a match, each player now chooses and decides on the menu.
+  The item each player is choosing is outlined in red for 1P and blue for 2P.
+  When the two chosen items differ, the lower one is used.
+  You can cancel your decision until both players have decided.
+  However, if either player decides on "Save replay and quit", the connection ends right away.
+- "1P" and "2P" in the name display during a match are now shown in red and blue.
+  This matches the outline colors of the end-of-match menu.
+- In Match Mode's "人間 対 人間", 1P and 2P can now each play on their own keyboard.
+  Each time you choose "人間 対 人間", 1P and 2P each press the keys shown on screen (Z, X, Shift, Up, Down, Left, Right) on their own keyboard to assign it.
+  After assigning, input from anything other than the assigned keyboards (including gamepads) is ignored until the match ends or you go back to a menu before "人間 対 人間".
+  Press a gamepad button or Esc while the prompt is shown to play without splitting that time.
+  Set `split_keyboards = 0` under `[input]` in `HiganRTool.ini` to skip the prompt and keep playing without splitting.
+- Added `status_side` (where the status and delay are shown during a match) to `[ui]` in `HiganRTool.ini`.
+  Choose from `1p` (bottom left, default) / `2p` (bottom right) / `self` (your side) / `opponent` (the opponent's side).
+- You can now set the file name of saved replays with `name` under `[replay]` in `HiganRTool.ini`.
+  You can use `{date}` (yyyymmdd), `{time}` (hhmm), `{1Pchara}`, `{2Pchara}` (character names), `{1Pname}`, `{2Pname}` (player names), `{wins}` (rounds won), `{rlifes}` (life at the end of each round) and more.
+  The default is `th9_ud{num}`, the same as before.
+- If a new version is released while you are playing, it is now shown on screen.
+  It appears below the menu that opens when you choose 妖怪 対 妖怪, and at the top left of the end-of-match menu while connected.
+  Set `update_check = 0` under `[loader]` in `HiganRTool.ini` to turn it off.
+
+### Changed
+
+- A room name now cannot be used by anyone else while its match is running.
+  Trying to enter a name in use shows "This room name is in use."
+  The name becomes available again when the connection to the room in use ends.
+- More symbols can now be used in player names and room names.
+  `` ` ``, `;` and `/` cannot be used.
+  Room names starting with `w.` or `q.` cannot be used either.
+- Only the two players who play in a room can now accept spectators and list the match in the spectator list.
+  This keeps people who are not playing from creating the spectating room first and making arriving spectators connect to their PC.
+- Reviewed the security of the network code and the room server with audit tools.
+  The results and what the design cannot protect are in "11. Security" of [TECHNICAL](./TECHNICAL.en.md).
+- Enabled Control Flow Guard (CFG) for `HiganRTool.exe`.
+  ASLR, DEP and SafeSEH were already enabled; they are now also stated explicitly in the build settings.
+- Logs are now sent to the developer as a zip of the `logs` folder.
+  The messages on screen and the Issue templates were updated to match.
+- Rewrote the comments in the source code to make them easier to understand.
+
+### Fixed
+
+- Fixed a bug where a malicious spectating host could make a spectator's PC take screenshots or create many empty folders.
+- Fixed a bug where a PC running HiganRTool could be made to send packets to an unrelated third party.
+  Added limits on link measurement, spectating requests and LAN spectate-code replies.
+- Fixed a bug where control characters in the opponent's name from a connection code were shown as is in the `HiganRTool.exe` window.
+- Fixed a bug where replays were not saved automatically when the game folder name contained Chinese or other non-Japanese characters.
+  When run as administrator, they were saved into a folder with a garbled name.
+  Please move replays saved in that folder manually.
+- Fixed a bug where jitter in the connection alone could make the host stop sending to spectators, freezing the spectated match.
+- Fixed a bug where letters and digits in the status and delay row during a match were cut off or spaced out on Windows without MS Gothic (such as English Windows).
+  Without MS Gothic, letters and digits are now shown in a monospaced font.
+  In addition, fonts that are standard on Wine and Proton on Linux and on Wine on Mac were added to the fonts used for Japanese text when MS Gothic is not available.
+- Fixed a bug where replays were not saved automatically after a folder was full up to `th9_ud9999`.
+  They are now saved in a folder with the same name plus `_2`.
+
+
 ## v1.2.0
 
 ### Added

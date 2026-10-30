@@ -1,31 +1,40 @@
-//! 接続後の生存（PING / PONG と、沈黙による切断）と、終わりの BYE。
+//! 接続後の生存（PING / PONGと沈黙による切断）と終わりのBYE。
 //!
-//! PING / PONG を 1 秒に 1 回送り合い、同じ session_id のものが 60 秒何も届かなければ切れたとして BYE(切断) を出す。ソケットも時計も持たない。dll と peer_sim は、接続したときに `Liveness::new(session_id, いまの ms)` を作り、以後に受けた全部のパケットを `on_packet` へ渡し、1〜4 ms ごとに `poll_send` を呼ぶ。
-//! - 終わりの BYE: 送り直しの決まりが無く、落ちると相手は 60 秒の沈黙を待つ。そこで自分から終える（`close`）ときは、直後に BYE を 1 通出し、その後も PING は続けて相手の PING には PONG の代わりに BYE を返す。受けた BYE には返さない（両者が閉じているとき、返しの返しが往復し続けるため）。
-//! - 相手のゲームスレッドが止まったとき: PONG は受信スレッドがその場で返すので、PONG だけは届き続けうる。そこで受信スレッドは、自分のゲームスレッドの心拍が `HEARTBEAT_LIMIT_MS` より古ければ PONG を返さない（`heartbeat_fresh`）。
-//!   PONG 以外の便はゲームスレッドしか送らないので、途絶えた長さ（`quiet_ms`）を「相手のゲームスレッドが黙った長さ」として読める。
+//! PING / PONGを1秒に1回送り合う。同じsession_idのパケットが60秒何も届かなければ切れたとしてBYE(切断)を出す。
+//! ソケットも時計も持たない。
+//! dllとpeer_simは接続時に`Liveness::new(session_id, いまの ms)`を作る。以後に受けた全部のパケットを`on_packet`へ渡し、1〜4 msごとに`poll_send`を呼ぶ。
+//! - 終わりのBYE: 再送の決まりが無く、BYEが失われると相手は60秒の沈黙を待つ。
+//!   そこで自分から終える（`close`）ときは直後にBYEを1通出す。その後もPINGは続け、相手のPINGにはPONGの代わりにBYEを返す。
+//!   受けたBYEには返さない（両者が閉じているときは返答の返答が往復し続けるため）。
+//! - 相手のゲームスレッドが止まったとき: PONGは受信スレッドがその場で返すのでPONGだけは届き続けうる。
+//!   そこで受信スレッドは自分のゲームスレッドの心拍が`HEARTBEAT_LIMIT_MS`より古ければPONGを返さない（`heartbeat_fresh`）。
+//!   PONG以外のパケットはゲームスレッドしか送らない。そのため途絶えた長さ（`quiet_ms`）を「相手のゲームスレッドが黙った長さ」として読める。
 //!
-//! 受信スレッドかゲームスレッドから呼ばれうるので、ヒープを使わず、パニックしうる添字と unwrap を置かない。時刻は u32 の ms で、差は `wrapping_sub` で取る（49 日で折り返しても差は正しい）。
+//! 受信スレッドかゲームスレッドから呼ばれうる。そのためヒープを使わず、パニックしうる添字とunwrapを置かない。
+//! 時刻はu32のms。差は`wrapping_sub`で取る（49日で折り返しても差は正しい）。
 
 use crate::wire::{ByeReason, Message, Packet};
 
 pub const PING_INTERVAL_MS: u32 = 1_000;
 
-/// 相手から何も届かなければ切れたと見るまでの時間（ms）。ちょうど 60000 ms で切れたとする。フルスクリーンのゲームを最小化して、プレイヤーが接続コードを
-/// 渡すので、通信が途切れても長めに待つ。接続前の時間切れは `handshake::TIMEOUT_MS` で、これとは別。
+/// 相手から何も届かなければ切れたと見るまでの時間（ms）。ちょうど60000 msで切れたとする。
+/// フルスクリーンのゲームを最小化してプレイヤーが接続コードを渡すので、通信が途切れても長めに待つ。
+/// 接続前の時間切れは`handshake::TIMEOUT_MS`で、これとは別。
 pub const SILENCE_LIMIT_MS: u32 = 60_000;
 
-/// ゲームスレッドの心拍がこれより古ければ、受信スレッドは PONG を返さない（ms）。ウィンドウのドラッグ・最小化・デバイスの喪失で
-/// ゲームスレッドが止まるのは正常なので、これより短くしない。自分のゲームスレッドが同じ長さ止まると、戻ったときに自分の側でも
-/// 切れる（`check_silence`）ので、同じ長さにそろえた。
+/// ゲームスレッドの心拍がこれより古ければ受信スレッドはPONGを返さない（ms）。
+/// ウィンドウのドラッグ・最小化・デバイスの喪失でゲームスレッドが止まるのは正常なので、これより短くしない。
+/// 自分のゲームスレッドが同じ長さ止まると、戻ったときに自分の側でも切れる（`check_silence`）。そのため同じ長さにそろえた。
 pub const HEARTBEAT_LIMIT_MS: u32 = SILENCE_LIMIT_MS;
 const _: () = assert!(
     HEARTBEAT_LIMIT_MS >= 60_000,
     "最小化してコードを渡す間より短い"
 );
 
-/// 心拍がまだ新しいか。`beat` はゲームスレッドが最後に書いた時刻（0 はまだ書いていない）、`now` は受信スレッドが `beat` を読んだ後に
-/// 同じ時計で取った時刻。`beat` が `now` より少し先なのは読みの順の差なので新しいとみなす。
+/// 心拍がまだ新しいかどうか。
+/// `beat`はゲームスレッドが最後に書いた時刻（0はまだ書いていない）。
+/// `now`は受信スレッドが`beat`を読んだ後に同じ時計で取った時刻。
+/// `beat`が`now`より少し先なのは読む順序の差なので新しいとみなす。
 pub fn heartbeat_fresh(beat: u32, now: u32) -> bool {
     beat != 0
         && (now.wrapping_sub(beat) < HEARTBEAT_LIMIT_MS
@@ -35,13 +44,13 @@ pub fn heartbeat_fresh(beat: u32, now: u32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Alive,
-    /// 自分から終えた（`close`）。相手の PING に BYE を返す。
+    /// 自分から終えた（`close`）。相手のPINGにBYEを返す。
     Closing(ByeReason),
-    /// 相手から 60 秒何も届かなかった。以後は何も送らない。
+    /// 相手から60秒何も届かなかった。以後は何も送らない。
     Dead,
 }
 
-/// `poll_send` が返す、いま送るもの。PING と BYE は同じ呼び出しで両方出ることがあるので欄を分けた。
+/// `poll_send`の戻り値。いま送るもの。PINGとBYEは同じ呼び出しで両方出ることがあるのでフィールドを分けた。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outbox {
     pub ping: Option<Message>,
@@ -51,21 +60,21 @@ pub struct Outbox {
 /// 数（ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counters {
-    /// session_id の違うもの。「届いた」に数えない。
+    /// session_idの違うもの。「届いた」に数えない。
     pub wrong_session: u32,
-    /// 送った覚えの無い send_time の PONG（最初の PING より前、または未来）。RTT に使わない。
+    /// 送った覚えの無いsend_timeのPONG（最初のPINGより前または未来）。RTTに使わない。
     pub bad_pong: u32,
     pub after_dead: u32,
     pub pings_sent: u32,
     pub pongs_received: u32,
 }
 
-/// 往復の中央値に使う直近の PONG の数（1 秒に 1 回なので約 8 秒ぶん）。
+/// 往復の中央値に使う直近のPONGの数（1秒に1回なので約8秒ぶん）。
 pub const RTT_WINDOW: usize = 8;
-/// 中央値を出すのに要る PONG の数。1〜2 個では外れ値を除けないので、それまでは出さない。
+/// 中央値を出すのに要るPONGの数。1〜2個では外れ値を除けないのでそれまでは出さない。
 pub const RTT_MEDIAN_MIN: usize = 3;
 
-/// 往復（ms）の中央値（偶数個なら真ん中の 2 つの平均を切り捨て）。`RTT_MEDIAN_MIN` 個に満たなければ None。
+/// 往復（ms）の中央値（偶数個なら真ん中の2つの平均を切り捨て）。`RTT_MEDIAN_MIN`個に満たなければNone。
 pub fn median_ms(samples: &[u32]) -> Option<u32> {
     if samples.len() < RTT_MEDIAN_MIN {
         return None;
@@ -80,7 +89,7 @@ pub fn median_ms(samples: &[u32]) -> Option<u32> {
     Some(((u64::from(lo) + u64::from(hi)) / 2) as u32)
 }
 
-/// 往復（ms）の最大。`RTT_MEDIAN_MIN` 個に満たなければ None（1〜2 個の「最大」は偶然の 1 回で、良い回線の印にならない）。
+/// 往復（ms）の最大。`RTT_MEDIAN_MIN`個に満たなければNone（1〜2個の「最大」は偶然の1回なので良い回線の目安にならない）。
 pub fn max_ms(samples: &[u32]) -> Option<u32> {
     if samples.len() < RTT_MEDIAN_MIN {
         return None;
@@ -93,23 +102,23 @@ pub fn max_ms(samples: &[u32]) -> Option<u32> {
 pub struct Liveness {
     session_id: u32,
     state: State,
-    /// 同じ session_id のものが最後に届いた時刻。
+    /// 同じsession_idのものが最後に届いた時刻。
     last_heard: u32,
-    /// 同じ session_id の PONG 以外のものが最後に届いた時刻（相手のゲームスレッドが最後に動いていた印）。
+    /// 同じsession_idのPONG以外のものが最後に届いた時刻（相手のゲームスレッドが最後に動いていた目安）。
     last_active: u32,
     ping_sent: Option<u32>,
-    /// 最初に PING を送った時刻（PONG の send_time がこれより前なら、送った覚えが無い）。
+    /// 最初にPINGを送った時刻（PONGのsend_timeがこれより前なら送った覚えが無い）。
     first_ping: Option<u32>,
     bye_due: Option<ByeReason>,
     rtt: Option<u32>,
-    /// 直近の PONG の往復（ms）のリングバッファと、今までに測った数。
+    /// 直近のPONGの往復（ms）のリングバッファと今までに測った数。
     rtt_hist: [u32; RTT_WINDOW],
     rtt_n: u32,
     peer_bye: Option<ByeReason>,
     counters: Counters,
 }
 
-/// 前に送った時刻から `PING_INTERVAL_MS` 経ったか。まだ 1 度も送っていなければすぐ送る。
+/// 前に送った時刻から`PING_INTERVAL_MS`経ったかどうか。まだ1度も送っていなければすぐ送る。
 fn due(last: Option<u32>, now: u32) -> bool {
     match last {
         None => true,
@@ -143,20 +152,21 @@ impl Liveness {
         self.rtt
     }
 
-    /// 今までに測った PONG の往復の数（`rtt_ms` が新しい標本になったかを見る）。
+    /// 今までに測ったPONGの往復の数（`rtt_ms`が新しいサンプルになったかを見る）。
     pub fn rtt_count(&self) -> u32 {
         self.rtt_n
     }
 
-    /// 直近の PONG の往復の中央値（µs）。格子を寄せる判定の入力で、最後の 1 回だと揺れるネットワークで判定が毎秒開閉するため。
-    /// 平均でなく中央値なのは、相手が読み込みで 1 度止まった外れ値で判定が 8 秒閉じるのを避けるため。
+    /// 直近のPONGの往復の中央値（µs）。格子を寄せる判定の入力に使う。
+    /// 最後の1回の値だと揺れるネットワークで判定が毎秒開閉するため、直近の中央値にしている。
+    /// 平均でなく中央値なのは相手が読み込みで1度止まった外れ値で判定が8秒閉じるのを避けるため。
     pub fn rtt_median_us(&self) -> Option<u32> {
         let n = (self.rtt_n as usize).min(RTT_WINDOW);
         let hist = self.rtt_hist.get(..n)?;
         median_ms(hist).map(|ms| ms.saturating_mul(1_000))
     }
 
-    /// 直近の PONG の往復の最大（ms）。推奨値が 0 を選ぶ条件（回線が安定しているか）を見るのに使う。
+    /// 直近のPONGの往復の最大（ms）。推奨値が0を選ぶ条件（回線が安定しているかどうか）を見るのに使う。
     pub fn rtt_max_ms(&self) -> Option<u32> {
         let n = (self.rtt_n as usize).min(RTT_WINDOW);
         max_ms(self.rtt_hist.get(..n)?)
@@ -174,13 +184,13 @@ impl Liveness {
         now.wrapping_sub(self.last_heard)
     }
 
-    /// PONG 以外が届いていない長さ（ms）。相手の受信スレッドが PONG を返し続けていても、相手のゲームスレッドが止まれば伸びる。
+    /// PONG以外が届いていない長さ（ms）。相手の受信スレッドがPONGを返し続けていても相手のゲームスレッドが止まれば伸びる。
     pub fn quiet_ms(&self, now: u32) -> u32 {
         now.wrapping_sub(self.last_active)
     }
 
-    /// 60 秒（ちょうどを含む）何も届かなければ切れたとする。`on_packet` と `poll_send` の両方の入口で見る。
-    /// 生きていたときだけ BYE(切断) を出す。
+    /// 60秒（ちょうどを含む）何も届かなければ切れたとする。`on_packet`と`poll_send`の両方の入口で見る。
+    /// 生きていたときだけBYE(切断)を出す。
     fn check_silence(&mut self, now: u32) {
         if self.state == State::Dead || self.silence_ms(now) < SILENCE_LIMIT_MS {
             return;
@@ -192,13 +202,14 @@ impl Liveness {
         self.state = State::Dead;
     }
 
-    /// 受けたパケット（種類を問わず全部）。返ったもの（PONG か BYE）は受けた相手へすぐ送る。受けた時刻は `now` とみなす。
+    /// 受けたパケット（種類を問わず全部）。戻り値（PONGかBYE）は受けた相手へすぐ送る。受けた時刻は`now`とみなす。
     pub fn on_packet(&mut self, pkt: &Packet, now: u32) -> Option<Message> {
         self.on_packet_at(pkt, now, now)
     }
 
-    /// `on_packet` と同じ。`rx` はこの 1 通を受信スレッドが受けた時刻（`now` 以前）で、PONG の往復だけをこれで測る。
-    /// `now` で測ると、受けてから渡すまで（最大 1 フレーム）が RTT に足される（実測）。
+    /// `on_packet`と同じ。
+    /// `rx`はこの1通を受信スレッドが受けた時刻（`now`以前）。PONGの往復だけをこれで測る。
+    /// `now`で測ると受けてから渡すまで（最大1フレーム）がRTTに足される（実測）。
     pub fn on_packet_at(&mut self, pkt: &Packet, now: u32, rx: u32) -> Option<Message> {
         self.check_silence(now);
         if self.state == State::Dead {
@@ -215,14 +226,14 @@ impl Liveness {
         }
         match pkt.msg {
             Message::Bye(r) => {
-                // 受けた BYE には返さない（返しの返しが往復し続けるため）。
+                // 受けたBYEには返さない（返答の返答が往復し続けるため）。
                 if self.peer_bye.is_none() {
                     self.peer_bye = Some(r);
                 }
                 None
             }
             Message::Ping { send_time } => match self.state {
-                // 閉じた後は PONG の代わりに BYE を返す（最初の BYE が落ちたときの届け直し）。
+                // 閉じた後はPONGの代わりにBYEを返す（最初のBYEが失われたときの届け直し）。
                 State::Closing(r) => Some(Message::Bye(r)),
                 _ => Some(Message::Pong { send_time }),
             },
@@ -235,7 +246,7 @@ impl Liveness {
     }
 
     fn on_pong(&mut self, send_time: u32, rx: u32) {
-        // 最初の PING から受けた時刻までの間に無い send_time は、送った覚えが無いので RTT に使わない。
+        // 最初のPINGから受けた時刻までの間に無いsend_timeは送った覚えが無いのでRTTに使わない。
         let valid = self
             .first_ping
             .is_some_and(|f| rx.wrapping_sub(send_time) <= rx.wrapping_sub(f));
@@ -252,7 +263,7 @@ impl Liveness {
         self.rtt_n = self.rtt_n.saturating_add(1);
     }
 
-    /// 自分から終える。次の `poll_send` で BYE を出す。生きているときだけ効く。
+    /// 自分から終える。次の`poll_send`でBYEを出す。生きているときだけ効く。
     pub fn close(&mut self, reason: ByeReason) {
         if self.state == State::Alive {
             self.state = State::Closing(reason);
@@ -260,7 +271,7 @@ impl Liveness {
         }
     }
 
-    /// いま送るもの。切れた後は、切れたときの BYE(切断) の 1 通だけ。
+    /// いま送るもの。切れた後は切れたときのBYE(切断)の1通だけ。
     pub fn poll_send(&mut self, now: u32) -> Outbox {
         self.check_silence(now);
         let mut out = Outbox {
@@ -343,7 +354,7 @@ mod tests {
             "偶数個は真ん中 2 つの平均"
         );
         assert_eq!(median_ms(&[24, 24, 300, 24, 24]), Some(24), "外れ値");
-        // 同じ 5 個の平均は 79 ms（外れ値で判定が閉じる値）。
+        // 同じ5個の平均は79 ms（外れ値で判定が閉じる値）。
         assert_eq!((24 * 4 + 300) / 5, 79);
         let mut l = Liveness::new(SID, 1_000);
         assert_eq!(l.rtt_median_us(), None);
@@ -422,12 +433,12 @@ mod tests {
             l.on_packet_at(&pkt(SID, Message::Pong { send_time: 2_000 }), now, rx);
             assert_eq!(l.rtt_ms(), Some(3), "渡した時刻 {now}");
         }
-        // 沈黙は渡した時刻から数える: 最後に渡したのが 2050（受けたのは 2003）なので、61999 ではまだ生きていて、62050 で切れる。
+        // 沈黙は渡した時刻から数える: 最後に渡したのが2050（受けたのは2003）なので61999ではまだ生きていて、62050で切れる。
         l.poll_send(61_999);
         assert_eq!(l.state(), State::Alive);
         l.poll_send(62_050);
         assert_eq!(l.state(), State::Dead);
-        // 送った覚えの無い PONG（受けた時刻より後に送ったことになる）は、渡した時刻が後でも RTT に使わない。
+        // 送った覚えの無いPONG（受けた時刻より後に送ったことになる）は渡した時刻が後でもRTTに使わない。
         let mut l = Liveness::new(SID, 1_000);
         assert!(l.poll_send(1_000).ping.is_some());
         l.on_packet_at(&pkt(SID, Message::Pong { send_time: 1_010 }), 1_020, 1_005);
@@ -440,7 +451,7 @@ mod tests {
         let mut l = Liveness::new(SID, 0);
         l.poll_send(0);
         l.on_packet(&ping(0), 500);
-        // 10 秒では切れない（最小化してコードを渡す間）。
+        // 10秒では切れない（最小化してコードを渡す間）。
         assert_eq!(l.poll_send(10_500).bye, None);
         assert_eq!(l.poll_send(60_499).bye, None, "59 秒 999 では切れない");
         assert_eq!(l.state(), State::Alive);
@@ -477,7 +488,7 @@ mod tests {
 
     #[test]
     fn packet_at_the_boundary_does_not_revive() {
-        // 60000 ms ちょうどに届いたものは、先に切れたと見る（handshake の時間切れと同じ順）。
+        // 60000 msちょうどに届いたものは先に切れたと見る（handshakeの時間切れと同じ順）。
         let mut l = Liveness::new(SID, 0);
         assert_eq!(l.on_packet(&ping(1), 60_000), None);
         assert_eq!(l.state(), State::Dead);
@@ -561,7 +572,7 @@ mod tests {
 
     #[test]
     fn when_pongs_stop_the_side_that_only_pings_dies_sixty_seconds_after_the_last_pong() {
-        // 相手はこちらの PING に PONG を返すだけ（相手のゲームスレッドは止まっていて PING も INPUT も来ない）。
+        // 相手はこちらのPINGにPONGを返すだけ（相手のゲームスレッドは止まっていてPINGもINPUTも来ない）。
         let mut l = Liveness::new(SID, 0);
         let mut last_pong = 0;
         for t in (0..=6_000).step_by(1_000) {
@@ -569,7 +580,7 @@ mod tests {
             l.on_packet(&pkt(SID, Message::Pong { send_time: t }), t + 20);
             last_pong = t + 20;
         }
-        // 相手の受信スレッドが心拍の古さで PONG をやめた後も、こちらは PING を送り続ける。
+        // 相手の受信スレッドが心拍の古さでPONGをやめた後もこちらはPINGを送り続ける。
         for t in (7_000..last_pong + SILENCE_LIMIT_MS).step_by(1_000) {
             assert!(l.poll_send(t).ping.is_some(), "{t}");
         }
@@ -594,7 +605,7 @@ mod tests {
         assert_eq!(l.state(), State::Alive, "PONG が届く間は切れない");
         assert_eq!(l.quiet_ms(30_010), 29_510, "PONG で静かな時間が戻った");
         assert_eq!(l.silence_ms(30_010), 0);
-        // PONG 以外は 1 通で戻る。別の session のものは数えない。
+        // PONG以外は1通で戻る。別のsessionのものは数えない。
         l.on_packet(&pkt(SID ^ 1, Message::Ping { send_time: 2 }), 30_100);
         assert_eq!(l.quiet_ms(30_100), 29_600);
         l.on_packet(&pkt(SID, Message::Bye(ByeReason::Finished)), 30_200);
@@ -609,7 +620,7 @@ mod tests {
         assert!(heartbeat_fresh(1_000, 1_000 + HEARTBEAT_LIMIT_MS - 1));
         assert!(!heartbeat_fresh(1_000, 1_000 + HEARTBEAT_LIMIT_MS));
         assert!(!heartbeat_fresh(1_000, 1_000 + 3_600_000));
-        // 書き手が読みより少し先（読みの順の差）。
+        // 書き込み側が読み取りより少し先（読む順序の差）。
         assert!(heartbeat_fresh(1_005, 1_000));
         // 時計の折り返しをまたいでも同じ。
         let b = u32::MAX - 100;

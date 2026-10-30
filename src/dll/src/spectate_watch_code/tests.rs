@@ -1,4 +1,4 @@
-//! 観戦者の接続コードの見張り（`code_side = spectate`）の検査。ファイルは一時フォルダだけ。接続コード・秘密・名前・アドレスは合成の値。
+//! 観戦者の接続コードを監視する処理（`code_side = spectate`）の検査。ファイルは一時フォルダだけを使う。接続コード・秘密の乱数・名前・アドレスは合成の値。
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ fn code_of(side: Side, secret: Option<Secret>, addrs: &[SocketAddr], expires: u6
     }
 }
 
-/// 配る側の公開鍵の標本（観戦者の設定にそのまま渡ることを見る）。
+/// 配信する側の公開鍵のサンプル（観戦者の設定にそのまま渡ることを検証する）。
 const HOST_PUBLIC: [u8; 32] = [0x41; 32];
 
 fn spectate_text(addrs: &[SocketAddr], expires: u64) -> String {
@@ -73,7 +73,8 @@ fn a_spectate_code_becomes_a_watcher_config_once() {
     };
     let c = cfg.0;
     assert_eq!((c.session_id, c.secret, c.nonce), (SESSION, SECRET, 0xFEED));
-    // 配る側の公開鍵はコードの値、観戦者の種は読むたびに OS の乱数（同じ中身を別の読み手が読んでも種は別）。
+    // 配信する側の公開鍵はコードの値。
+    // 観戦者の種は読むたびにOSの乱数になる（同じ中身を別の読み手が読んでも種は別）。
     assert_eq!(c.host_public, HOST_PUBLIC);
     let Step::Ready(again, _, _) =
         Reader::new(&settings("loopback"), 0xFEED).on_peer_file(Some(text.as_bytes()), NOW)
@@ -197,19 +198,19 @@ fn ipv6_host_candidates_follow_the_viewers_socket_and_the_scope() {
     let v4: SocketAddr = "203.0.113.5:47001".parse().unwrap();
     let v6: SocketAddr = "[2606:4700::10]:47001".parse().unwrap();
     let both = [v6, v4];
-    // IPv6 のソケットがある観戦者は、IPv4 も IPv6 も宛先にする。
+    // IPv6のソケットがある観戦者はIPv4もIPv6も宛先にする。
     let mut r = Reader::new(&settings("internet"), 1).with_v6(true);
     assert_eq!(hosts_of(&mut r, &both), vec![v4, v6]);
-    // 既定(`Reader::new`)は IPv6 のソケットが無い扱い: IPv4 が残るかぎり IPv6 は宛先にしない。
+    // 既定(`Reader::new`)はIPv6のソケットが無い扱い: IPv4が残るかぎりIPv6は宛先にしない。
     let mut r = Reader::new(&settings("internet"), 1);
     assert_eq!(hosts_of(&mut r, &both), vec![v4]);
     // 明示しても同じ。
     let mut r = Reader::new(&settings("internet"), 1).with_v6(false);
     assert_eq!(hosts_of(&mut r, &both), vec![v4]);
-    // IPv6 しか無いコードは、そのまま通す（ソケットが無い観戦者は時間切れで知る）。
+    // IPv6しか無いコードはそのまま通す（ソケットが無い観戦者は時間切れで知る）。
     let mut r = Reader::new(&settings("internet"), 1).with_v6(false);
     assert_eq!(hosts_of(&mut r, &[v6]), vec![v6]);
-    // 範囲の外の IPv6 は、IPv6 のソケットがあっても宛先にしない（対戦の候補と同じ範囲のガード）。
+    // 範囲の外のIPv6はIPv6のソケットがあっても宛先にしない（対戦の候補と同じ範囲のガード）。
     let mut r = Reader::new(&settings("loopback"), 1).with_v6(true);
     assert_eq!(hosts_of(&mut r, &[lo(47_001), v6]), vec![lo(47_001)]);
     let mut r = Reader::new(&settings("lan"), 1).with_v6(true);
@@ -283,7 +284,7 @@ fn the_watcher_thread_reads_peer_code_txt_and_never_writes_my_code() {
     assert!(w.facts().connected_at.is_some());
     assert!(!dir.join(MY_CODE_FILE).exists());
     assert!(!w.finished(), "接続した後の終わりを見ずに終わった");
-    // 溜めた記録の上限で終えたら、その理由を「状態」に出して終わる。
+    // 溜めた記録の上限で終えたらその理由を「状態」に出して終わる。
     slot.mark_buffer_full();
     slot.mark_done();
     wait_until("見張りが終わらない", || w.finished());
@@ -374,7 +375,7 @@ fn the_watch_code_refusals_follow_the_current_language() {
     ui_lang::set(Lang::Ja);
 }
 
-/// ファイルの誤りの文（日本語）は、どの言語でも本ログに残り、英語のウィンドウには出ない。
+/// ファイルの誤りの文（日本語）はどの言語でも本ログに残る。英語のウィンドウには出ない。
 #[test]
 fn a_file_error_stays_in_the_log_and_the_english_window_has_no_japanese() {
     use higanr_core::lang::{Lang, has_japanese};

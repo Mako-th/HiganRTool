@@ -1,10 +1,10 @@
-//! 観戦者の受け渡し（受信スレッド → ゲームのスレッド）: 組み立てが連続にした記録のリングと、接続の状態・集計の原子変数。
+//! 観戦者の受け渡し（受信スレッド → ゲームのスレッド）。組み立てが連続にした記録のリングと、接続の状態・集計のアトミック変数を持つ。
 //!
-//! - リングの書き手は観戦者の受け取り（`recv.rs`。2 本の受信スレッドのうちロックを取れた方）だけ、読み手はゲームのスレッドだけ。枠を `Relaxed` で
-//!   書いてから書いた数を `Release` で進め、読み手は書いた数を `Acquire` で読んでから枠を読む（`spectate_ring` と同じ）。
-//! - 1 枠 10 語: 記録 9 語（`spectate_ring::pack` の詰め方）と、使えるようになった時刻（µs の下位 32 bit。余裕の起点）。語 0 の bit 9 は
-//!   「流れが飛んだ（`reset`）後の最初の記録」。
-//! - 読み手の側は確保・ロック待ち・パニックしうる添字を持たない。確保は作るとき（観戦者のセッションを開くスレッド）の 1 回だけ。
+//! - リングの書き手は観戦者の受け取り（`recv.rs`。2本の受信スレッドのうちロックを取れた方）だけ。読み手はゲームのスレッドだけ。
+//! - 書き手は枠を`Relaxed`で書いてから、書いた数を`Release`で進める。読み手は書いた数を`Acquire`で読んでから枠を読む（`spectate_ring`と同じ）。
+//! - 1枠は10ワード。記録9ワード（`spectate_ring::pack`の詰め方）と、使えるようになった時刻（µsの下位32 bit。余裕の起点）。
+//!   ワード0のbit 9は「流れが飛んだ（`reset`）後の最初の記録」。
+//! - 読み手の側は確保・ロック待ち・パニックしうる添字を持たない。確保は作成時（観戦者のセッションを開くスレッド）の1回だけ。
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -17,31 +17,32 @@ use higanr_core::wire::{ByeReason, Record};
 use crate::net_ring::{ADDR_WORDS, decode_addr, encode_addr};
 use crate::spectate_ring::{WORDS as REC_WORDS, pack, unpack};
 
-/// 枠の数（約 1 時間）。記録は 1 秒に約 60（マッチの 1 フレームか選択の 1 tick に 1 つ）と、マッチの間の約 1 秒ごとの対戦の状態と照合で、
-/// 220,000 ÷ 62 ≈ 3,550 秒。1 枠 40 B で約 8.8 MB。
+/// 枠の数（約1時間）。
+/// 記録は1秒に約60（マッチの1フレームか選択の1 tickに1つ）。さらにマッチの間の約1秒ごとに対戦の状態と照合の記録が入る。
+/// 220,000 ÷ 62 ≈ 3,550秒。1枠40 Bで約8.8 MB。
 pub const FEED_LEN: usize = 220_000;
 const CELL_WORDS: usize = REC_WORDS + 1;
 const T_WORD: usize = REC_WORDS;
 const FLAG_JUMP: u32 = 1 << 9;
-/// 語 0 の bit 10: 時間を使わない記録（`Record::takes_time` が偽）。読み手が返すときに数える。
+/// ワード0のbit 10: 時間を使わない記録（`Record::takes_time`が偽）。読み手が返すときに数える。
 const FLAG_TIMELESS: u32 = 1 << 10;
 const WC_LEN: usize = 14;
 const AC_LEN: usize = 4;
 const TREE_LEN: usize = 12;
 const SIDE_LEN: usize = 12;
-/// 受信スレッドだけが数えるもの: 照合のずれで戻らなかった数・UPnP の結果・知らせの JOIN の送った数と送らなかった数。
+/// 受信スレッドだけが数えるもの: 照合のずれで戻らなかった数・UPnPの結果・知らせのJOINの送った数と送らなかった数。
 const OWN_LEN: usize = 4;
-/// 中継の数の語: 設定・作れなかった回数・epoch・親が元のホスト・直接だけ・断られた・配る側あり ＋ 木の数 ＋ 配る側の数 ＋ 受信スレッドの数。
+/// 中継の数のワード: 設定・作れなかった回数・epoch・親が元のホスト・直接だけ・断られた・配信側あり ＋ 木の数 ＋ 配信側の数 ＋ 受信スレッドの数。
 pub(crate) const RELAY_LEN: usize = 7 + TREE_LEN + SIDE_LEN + OWN_LEN;
-/// u64 の語に u32 の値を入れるときの「値あり」の印（下位 32 bit が値）。
+/// u64のワードにu32の値を書き込むときの「値あり」のフラグ（下位32 bitが値）。
 const SOME: u64 = 1 << 32;
-/// 照合のずれの要求の語（`WatchFeed::mismatch`）: `SOME` ＋ この印 ＋ 下位 32 bit の位置。
+/// 照合のずれの要求のワード（`WatchFeed::mismatch`）: `SOME` ＋ このフラグ ＋ 下位32 bitの位置。
 const MISMATCH_BROKEN: u64 = 1 << 33;
 
-/// 中継の配る側の数（`SpectateHost::counts` のうち中継に関わるもの）。
+/// 中継の配信側の数（`SpectateHost::counts`のうち中継に関わるもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RelaySideCounts {
-    /// いまの子の数（受け入れて JOIN を待っている子を含まない）。
+    /// いまの子の数（受け入れてJOINを待っている子を含まない）。
     pub children: u64,
     pub pushed: u64,
     pub relay_jumps: u64,
@@ -53,29 +54,29 @@ pub struct RelaySideCounts {
     pub records_sent: u64,
     pub resends: u64,
     pub rehomes_sent: u64,
-    /// 受け入れる子の候補へ送った穴あけの印。
+    /// 受け入れる子の候補へ送った穴あけ用パケットの数。
     pub punches_sent: u64,
 }
 
-/// 中継の配る側を持つ観戦者の UPnP の結果。
+/// 中継の配信側を持つ観戦者のUPnPの結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatchUpnp {
-    /// 頼んでいない（中継しない・ルームの経路でない・scope が internet でない・ini の upnp = off・家の中の IPv4 でない）。
+    /// 頼んでいない（中継しない・ルームの経路でない・scopeがinternetでない・iniの upnp = off・家の中のIPv4でない）。
     #[default]
     NotAsked,
-    /// 頼んで、結果を待っている。
+    /// 頼んで結果を待っている。
     Waiting,
-    /// 割り当てて、自分の候補に足した。
+    /// 割り当てて自分の候補に足した。
     Mapped,
-    /// ルーターの外側のアドレスが STUN で見えたアドレスと違う（二重 NAT の見込み）。割り当ては取り下げた。
+    /// ルーターの外側のアドレスがSTUNで見えたアドレスと違う（二重NATの見込み）。割り当ては取り下げた。
     Behind,
     /// 外側のアドレスを突き合わせられない。割り当ては取り下げた。
     Unchecked,
-    /// 割り当てたが、自分の候補の並びに足せない。割り当ては取り下げた。
+    /// 割り当てたが自分の候補の並びに足せない。割り当ては取り下げた。
     NoRoom,
     /// 割り当てられなかった（応じない・断られた・通信の誤り）。
     Failed,
-    /// 割り当てたが、接続した受け取りに中継の配る側が無い（作れなかった）。割り当ては取り下げた。
+    /// 割り当てたが接続した受け取りに中継の配信側が無い（作れなかった）。割り当ては取り下げた。
     NoRelay,
 }
 
@@ -123,9 +124,9 @@ impl WatchUpnp {
 /// 観戦者の中継の木の数（本ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RelayCounts {
-    /// 中継する設定（ini の `[spectate] relay = 1`）。
+    /// 中継する設定（iniの`[spectate] relay = 1`）。
     pub enabled: bool,
-    /// 中継する設定なのに、鍵の種を引けない・リングを確保できないので中継しなかった回数。
+    /// 中継する設定なのに鍵の種を生成できない・リングを確保できないので中継しなかった回数。
     pub failed: u64,
     pub epoch: u64,
     pub parent_is_home: bool,
@@ -133,12 +134,12 @@ pub struct RelayCounts {
     /// 一度接続した後に元のホストに断られた（満員）。
     pub refused: bool,
     pub tree: TreeCounts,
-    /// 子の観戦者へ記録を中継する側（持っていなければ None）。
+    /// 子の観戦者へ記録を中継する側（持っていなければNone）。
     pub side: Option<RelaySideCounts>,
-    /// 照合がずれたとき親が中継役だったが、直接の元のホストへ戻らなかった数（ずれた記録を前の親が運んだ・その seg でポーズが崩れた）。
+    /// 照合がずれたときに親が中継役だったのに、元のホストへ直接戻らなかった数（ずれた記録を前の親が運んだ・そのマッチでポーズが崩れた）。
     pub mismatch_stays: u64,
     pub upnp: WatchUpnp,
-    /// 接続した後に、候補・回線の型の変化を元のホストへ知らせた JOIN の数。
+    /// 接続した後に候補・ネットワーク種別のフラグの変化を元のホストへ知らせたJOINの数。
     pub announces_sent: u64,
     /// 知らせを送らなかった回数（中継役になった後・親が中継役・元のホストのアドレスが無い）。
     pub announces_skipped: u64,
@@ -212,7 +213,7 @@ pub(crate) fn relay_words(c: &RelayCounts) -> [u64; RELAY_LEN] {
     ]
 }
 
-/// `relay_words` の逆。
+/// `relay_words`の逆。
 pub(crate) fn relay_counts_of(w: [u64; RELAY_LEN]) -> RelayCounts {
     let [
         enabled,
@@ -293,11 +294,11 @@ pub(crate) fn relay_counts_of(w: [u64; RELAY_LEN]) -> RelayCounts {
     }
 }
 
-/// リングから読んだ 1 つ。
+/// リングから読んだ1つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     pub rec: Record,
-    /// 使えるようになった時刻（µs の下位 32 bit）。
+    /// 使えるようになった時刻（µsの下位32 bit）。
     pub t_us: u32,
     /// 流れが飛んだ後の最初の記録。
     pub jump: bool,
@@ -307,8 +308,8 @@ pub struct WatchFeed {
     cells: Box<[[AtomicU32; CELL_WORDS]]>,
     written: AtomicU32,
     read: AtomicU32,
-    /// `written` / `read` のうち、時間を使う記録の数（書き手・読み手がそれぞれ数える）。溜まりの数と 1 表示に届いた数はこれで数え、
-    /// 名前・対戦の状態・照合を入れない。
+    /// `written` / `read`のうち時間を使う記録の数（書き手と読み手がそれぞれ数える）。
+    /// 溜まりの数と1表示に届いた数はこれで数える。名前・対戦の状態・照合は含めない。
     timed_written: AtomicU32,
     timed_read: AtomicU32,
     /// 読み手が戻せなかった枠（起きないはず）。
@@ -317,10 +318,10 @@ pub struct WatchFeed {
     full: AtomicBool,
     broken: AtomicBool,
     has_watcher: AtomicBool,
-    /// ホストの最初の STREAM を受けた（`host` を書いた後に立てる）。
+    /// ホストの最初のSTREAMを受けた（`host`を書いた後に立てる）。
     joined: AtomicBool,
     host: [AtomicU32; ADDR_WORDS],
-    /// 時刻（ms）。上位 32 bit が 1 なら値あり。
+    /// 時刻（ms）。上位32 bitが1なら値あり。
     last_heard: AtomicU64,
     code_at: AtomicU64,
     joined_at: AtomicU64,
@@ -330,9 +331,9 @@ pub struct WatchFeed {
     /// 一度接続した後に元のホストに断られた（満員。ゲームのスレッドが溜めた記録を使い切ってから終える）。
     refused: AtomicBool,
     // ---- ゲームのスレッドが書く ----
-    /// 照合がずれた（受信スレッドが取る）: ずれた Check の記録の位置（読んだ数）と、その seg でポーズが崩れていたか。
+    /// 照合がずれた（受信スレッドが取る）: ずれたCheckの記録の位置（読んだ数）とそのマッチでポーズが崩れていたか。
     mismatch: AtomicU64,
-    /// 観戦を終えた（受信スレッドは BYE を出して以後は何もしない）。`bye` を書いた後に立てる。
+    /// 観戦を終えた（受信スレッドはBYEを出して以後は何もしない）。`bye`を書いた後に立てる。
     ended: AtomicBool,
     bye: AtomicU32,
 }
@@ -416,7 +417,7 @@ fn bye_code(r: Option<ByeReason>) -> u32 {
 }
 
 impl WatchFeed {
-    /// 枠の数を指定して作る（0 は 1 に上げる）。確保するのはここだけで、確保できなければ `None`。
+    /// 枠の数を指定して作る（0は1に上げる）。確保するのはここだけ。確保できなければ`None`。
     pub fn try_with_len(len: usize) -> Option<Self> {
         let n = len.max(1);
         let mut cells = Vec::new();
@@ -460,7 +461,7 @@ impl WatchFeed {
         (w.wrapping_sub(r) as usize) < self.cells.len()
     }
 
-    /// 1 つ書く。満杯なら書かずに false。
+    /// 1つ書く。満杯なら書かずにfalse。
     pub(super) fn push(&self, rec: &Record, jump: bool, t_us: u32) -> bool {
         if !self.has_room() {
             return false;
@@ -484,7 +485,7 @@ impl WatchFeed {
             t.store(t_us, Ordering::Relaxed);
         }
         if !timeless {
-            // 読み手はこの数だけを読む（`written` と組で読まない）ので、1 つ先に見えることはあっても減りはしない。
+            // 読み手はこの数だけを読む（`written`とペアでは読まない）ので1つ先に見えることはあっても減らない。
             let n = self.timed_written.load(Ordering::Relaxed);
             self.timed_written
                 .store(n.wrapping_add(1), Ordering::Release);
@@ -493,7 +494,7 @@ impl WatchFeed {
         true
     }
 
-    /// 検査だけ: 戻せない枠（種類の欄が 0）を 1 つ書く。
+    /// 検査だけ: 戻せない枠（種類のフィールドが0）を1つ書く。
     #[cfg(test)]
     pub(super) fn push_unreadable_for_test(&self) {
         assert!(self.push(&Record::Seg { seg: 0 }, false, 0));
@@ -554,7 +555,7 @@ impl WatchFeed {
         }
     }
 
-    /// 受信スレッドが周回ごとに、いまの状態をゲームのスレッドが読めるよう原子変数に書く（断りの後に入り直せたら下ろす）。
+    /// 受信スレッドが周回ごとに、断られた状態かどうかをゲームのスレッドが読めるようアトミック変数に書く（断られた後に入り直せたら下ろす）。
     pub(super) fn set_refused(&self, on: bool) {
         self.refused.store(on, Ordering::Release);
     }
@@ -570,7 +571,7 @@ impl WatchFeed {
         (v & SOME != 0).then_some((v as u32, v & MISMATCH_BROKEN != 0))
     }
 
-    /// ゲームのスレッドが観戦を終えたか、と、受信スレッドが親へ出してほしい BYE。
+    /// ゲームのスレッドが観戦を終えたかどうかと、受信スレッドが親へ出してほしいBYE。
     pub(super) fn end_request(&self) -> Option<Option<ByeReason>> {
         self.ended
             .load(Ordering::Acquire)
@@ -579,20 +580,20 @@ impl WatchFeed {
 
     // ---------------- 読み手（ゲームのスレッド） ----------------
 
-    /// 検査だけ: 書いてあって読んでいない数（時間を使わない記録も含む。溜まりは `timed_len`）。
+    /// 検査だけ: 書いてあって読んでいない数（時間を使わない記録も含む。溜まりは`timed_len`）。
     #[cfg(test)]
     pub fn len(&self) -> u32 {
         let r = self.read.load(Ordering::Relaxed);
         self.written.load(Ordering::Acquire).wrapping_sub(r)
     }
 
-    /// 検査だけ: これまでに書いた数（時間を使わない記録も含む。1 表示に届いた数は `timed_written`）。
+    /// 検査だけ: これまでに書いた数（時間を使わない記録も含む。1表示に届いた数は`timed_written`）。
     #[cfg(test)]
     pub fn written(&self) -> u32 {
         self.written.load(Ordering::Acquire)
     }
 
-    /// 次の 1 つを読む（進めない）。
+    /// 次の1つを読む（進めない）。
     pub fn peek(&self) -> Option<Entry> {
         loop {
             let r = self.read.load(Ordering::Relaxed);
@@ -621,19 +622,20 @@ impl WatchFeed {
         }
     }
 
-    /// 次に `peek` で読む記録の位置（読み手だけが呼ぶ。`written_pos` と同じ数え方）。
+    /// 次に`peek`で読む記録の位置（読み手だけが呼ぶ。`written_pos`と同じ数え方）。
     pub fn read_pos(&self) -> u32 {
         self.read.load(Ordering::Relaxed)
     }
 
-    /// 照合がずれた: `pos`（`read_pos` で取った Check の記録の位置）と、その seg でポーズが崩れていたか。受信スレッドが、親が中継役で、
-    /// 記録がいまの親から来たなら直接へ戻る。取られる前に次が来たら上書きする。
+    /// 照合がずれたことを渡す。`pos`（`read_pos`で取ったCheckの記録の位置）と、そのマッチでポーズが崩れていたかどうかを渡す。
+    /// 受信スレッドは、親が中継役で記録がいまの親から来たなら、直接の元のホストへ戻る。
+    /// 取られる前に次が来たら上書きする。
     pub fn request_mismatch(&self, pos: u32, broken: bool) {
         let v = SOME | if broken { MISMATCH_BROKEN } else { 0 } | u64::from(pos);
         self.mismatch.store(v, Ordering::Release);
     }
 
-    /// `peek` で読んだ 1 つを使い終えた（枠を返す）。
+    /// `peek`で読んだ1つを使い終えた（枠を返す）。
     pub fn advance(&self) {
         let r = self.read.load(Ordering::Relaxed);
         if self.written.load(Ordering::Acquire) != r {
@@ -649,7 +651,7 @@ impl WatchFeed {
         }
     }
 
-    /// これまでに書いた、時間を使う記録の数（1 表示の間に届いた数を差で取る）。
+    /// これまでに書いた時間を使う記録の数（1表示の間に届いた数を差で取る）。
     pub fn timed_written(&self) -> u32 {
         self.timed_written.load(Ordering::Acquire)
     }
@@ -685,13 +687,13 @@ impl WatchFeed {
         Some(decode_addr(&w))
     }
 
-    /// 最後に何かを聞いてからの ms（何も聞いていなければ `None`）。
+    /// 最後に何かを聞いてからのms（何も聞いていなければ`None`）。
     pub fn silent_ms(&self, now_ms: u32) -> Option<u32> {
-        // 受信スレッドの書いた時刻が、読んだ `now_ms` より少し後のこともある（`elapsed` は 0 にする）。
+        // 受信スレッドの書いた時刻が読んだ`now_ms`より少し後のこともある（`elapsed`は0にする）。
         opt_ms(self.last_heard.load(Ordering::Acquire)).map(|t| elapsed(now_ms, t))
     }
 
-    /// 受信スレッドが `Watcher` を受け取ってから、ホストの最初の STREAM を受けるまでの ms。
+    /// 受信スレッドが`Watcher`を受け取ってから、ホストの最初のSTREAMを受けるまでのms。
     pub fn join_wait_ms(&self) -> Option<u32> {
         let code = opt_ms(self.code_at.load(Ordering::Relaxed))?;
         let joined = self
@@ -744,7 +746,7 @@ impl WatchFeed {
         self.bad.load(Ordering::Relaxed)
     }
 
-    /// 観戦を終えた。`bye` があれば受信スレッドがホストへ 1 通出す。2 回目からは何もしない。
+    /// 観戦を終えた。`bye`があれば受信スレッドがホストへ1通出す。2回目からは何もしない。
     pub fn end(&self, bye: Option<ByeReason>) {
         if self.ended.load(Ordering::Relaxed) {
             return;
@@ -793,7 +795,7 @@ mod tests {
         assert_eq!(f.peek(), None);
         f.advance();
         assert_eq!(f.len(), 0, "空のときの advance で進んだ");
-        // 長い名前の枠に短い記録・短い名前を書いても、前の中身が混ざらない。
+        // 長い名前の枠に短い記録・短い名前を書いても前の中身が混ざらない。
         assert!(f.push(&frame(4), false, 1));
         assert_eq!(f.peek().map(|e| e.rec), Some(frame(4)));
         assert_eq!((f.written(), f.bad()), (5, 0));
@@ -839,7 +841,7 @@ mod tests {
 
     #[test]
     fn the_production_feed_holds_about_an_hour_in_under_9_mb() {
-        // 1 秒に 60 記録（マッチの語か選択の語）と、約 1 秒ごとの対戦の状態 1 記録・照合 1 記録。
+        // 1秒に60記録（マッチのワードか選択のワード）と約1秒ごとの対戦の状態1記録・照合1記録。
         let secs = FEED_LEN / 62;
         assert!((3_500..=3_700).contains(&secs), "{secs} 秒");
         let bytes = FEED_LEN * std::mem::size_of::<[AtomicU32; CELL_WORDS]>();

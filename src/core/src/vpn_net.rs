@@ -1,29 +1,30 @@
-//! VPN の仮想 LAN（Radmin VPN・Hamachi・ZeroTier）のネットワークの範囲（pure）。
+//! VPNの仮想LAN（Radmin VPN・Hamachi・ZeroTier）のネットワークの範囲（pure）。
 //!
-//! これらのアダプターは私設でないアドレス（Radmin は 26/8、Hamachi は 25/8、ZeroTier は選んだ範囲）を持つことがあるので、
-//! 範囲 lan（`guard`）には入らない。アダプターの名前でツールを見分け、そのアダプターのネットワーク 1 つだけを範囲 lan に足す。
-//! 名前で決め打ちにするのは、会社の VPN のようにインターネットから届くアドレスを持つ仮想のアダプターで待たないため。
+//! これらのアダプターは私設でないアドレス（Radminは26/8、Hamachiは25/8、ZeroTierは選んだ範囲）を持つことがある。
+//! そのため範囲lan（`guard`）には入らない。
+//! アダプターの名前でツールを見分け、そのアダプターのネットワーク1つだけを範囲lanに足す。
+//! 名前で決め打ちにするのは、会社のVPNのようにインターネットから届くアドレスを持つ仮想のアダプターで待ち受けないため。
 
 use std::net::Ipv4Addr;
 
-/// 使うネットワークの長さ（OnLinkPrefixLength）の下限と上限。これより広い（/8 未満）・狭い（/31 以上）ものは使わない。
+/// 使うネットワークの長さ（OnLinkPrefixLength）の下限と上限。これより広い（/8未満）・狭い（/31以上）ものは使わない。
 pub const PREFIX_MIN: u8 = 8;
 pub const PREFIX_MAX: u8 = 30;
 
-/// IPv4 のネットワーク（先頭のアドレスと長さ）。
+/// IPv4のネットワーク（先頭のアドレスと長さ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Net4 {
     base: u32,
     prefix: u8,
 }
 
-/// `prefix` の上位ビットが立ったマスク。`prefix` は `PREFIX_MIN..=PREFIX_MAX`（`Net4::new` が保つ）。
+/// `prefix`の上位ビットが立ったマスク。`prefix`は`PREFIX_MIN..=PREFIX_MAX`（`Net4::new`が保つ）。
 fn mask(prefix: u8) -> u32 {
     u32::MAX << (32 - u32::from(prefix))
 }
 
 impl Net4 {
-    /// `ip` が属するネットワーク。長さが `PREFIX_MIN..=PREFIX_MAX` の外なら `None`。
+    /// `ip`が属するネットワーク。長さが`PREFIX_MIN..=PREFIX_MAX`の外なら`None`。
     pub fn new(ip: Ipv4Addr, prefix: u8) -> Option<Net4> {
         if !(PREFIX_MIN..=PREFIX_MAX).contains(&prefix) {
             return None;
@@ -38,7 +39,7 @@ impl Net4 {
         self.prefix
     }
 
-    /// ネットワークの中の 1 台のアドレスか。ネットワークのアドレス（ホスト部が全部 0）とブロードキャスト（全部 1）は含めない。
+    /// ネットワークの中の1台のアドレスかどうか。ネットワークのアドレス（ホスト部が全部0）とブロードキャスト（全部1）は含めない。
     pub fn contains_host(self, ip: Ipv4Addr) -> bool {
         let v = u32::from(ip);
         let m = mask(self.prefix);
@@ -46,12 +47,12 @@ impl Net4 {
         v & m == self.base && host != 0 && host != !m
     }
 
-    /// 原子変数に載せる形（bit 40 = 有効・bit 32..40 = 長さ・下位 32 bit = 先頭のアドレス）。
+    /// アトミック変数に載せる形（bit 40 = 有効・bit 32..40 = 長さ・下位32 bit = 先頭のアドレス）。
     pub fn pack(self) -> u64 {
         1 << 40 | u64::from(self.prefix) << 32 | u64::from(self.base)
     }
 
-    /// `pack` の逆。有効の印が無い・長さが範囲の外なら `None`。
+    /// `pack`の逆。有効ビットが無い・長さが範囲の外なら`None`。
     pub fn unpack(w: u64) -> Option<Net4> {
         if w >> 40 & 1 == 0 {
             return None;
@@ -69,7 +70,7 @@ pub enum VpnTool {
 }
 
 impl VpnTool {
-    /// アダプターの説明か接続の名前（小文字にして）に `radmin`・`hamachi`・`zerotier` が入るもの。どちらも画面にもログにも出さない。
+    /// アダプターの説明か接続の名前（小文字にして）に`radmin`・`hamachi`・`zerotier`が入るもの。どちらも画面にもログにも出さない。
     pub fn of_names(description: &str, name: &str) -> Option<VpnTool> {
         let has = |w: &str| {
             description.to_ascii_lowercase().contains(w) || name.to_ascii_lowercase().contains(w)
@@ -94,7 +95,7 @@ impl VpnTool {
         }
     }
 
-    /// 札に詰める番号（0 は無し）。
+    /// 札に詰める番号（0は無し）。
     pub fn code(self) -> u8 {
         match self {
             VpnTool::Radmin => 1,
@@ -113,17 +114,17 @@ impl VpnTool {
     }
 }
 
-/// `VpnSet` に入れる数の上限（3 つのツールのうち ZeroTier は複数のネットワークを同時に持てる）。
+/// `VpnSet`に入れる数の上限（3つのツールのうちZeroTierは複数のネットワークを同時に持てる）。
 pub const VPN_SET_MAX: usize = 8;
 
-/// 自分の PC の VPN のネットワークの集まり（固定長。アドレスの入力の判定に使う）。
+/// 自分のPCのVPNのネットワークの集まり（固定長。アドレスの入力の判定に使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VpnSet([Option<Net4>; VPN_SET_MAX]);
 
 impl VpnSet {
     pub const NONE: VpnSet = VpnSet([None; VPN_SET_MAX]);
 
-    /// 重なりを除き、`VPN_SET_MAX` 個まで入れる。
+    /// 重なりを除き、`VPN_SET_MAX`個まで追加する。
     pub fn from_nets(nets: impl IntoIterator<Item = Net4>) -> VpnSet {
         let mut s = VpnSet::NONE;
         let mut n = 0;
@@ -136,7 +137,7 @@ impl VpnSet {
         s
     }
 
-    /// `ip` を含むネットワーク。
+    /// `ip`を含むネットワーク。
     pub fn find(&self, ip: Ipv4Addr) -> Option<Net4> {
         self.0
             .iter()

@@ -1,7 +1,7 @@
-//! ホストの決め方（`host_pick.rs`）を、2 つの `Link` を偽のネットワークで接続して見る。公開の API だけを使う。
+//! ホストの決め方（`host_pick.rs`）の検査。2つの`Link`を偽のネットワークで接続して見る。公開のAPIだけを使う。
 //!
-//! ネットワークは µs の模型: 送り手ごとの上りの太さで 1 通ずつ順に送り出し（前の便が出終わるまで次は出ない）、片道の遅れを足して届く。
-//! 台 A は role_nonce が大きい（取りまとめ役）、台 B は小さい。どちらがホストになるかを台の番号と揃えない筋（B がホスト）を必ず含める。
+//! ネットワークはµsの模型。送り手ごとの上りの太さで1通ずつ順に送り出す（前の便が出終わるまで次は出ない）。届くまでには片道の遅れを足す。
+//! 台Aはrole_nonceが大きい（取りまとめ役）。台Bは小さい。どちらがホストになるかが台の番号と揃わない筋（Bがホスト）を必ず含める。
 
 use std::net::SocketAddr;
 
@@ -39,7 +39,7 @@ fn sym() -> NatMark {
 
 const UNKNOWN: NatMark = NatMark::UNKNOWN;
 
-/// 便の種類（落とし方を決めるため。読めない便は `Other`）。
+/// 便の種類（落とし方を決めるため。読めない便は`Other`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Probe,
@@ -48,15 +48,15 @@ enum Kind {
     Other,
 }
 
-/// 台の設定。`up` は上りの太さ（B/s）。
+/// 台の設定。`up`は上りの太さ（B/s）。
 #[derive(Clone, Copy)]
 struct Side {
     up: u64,
     pick: Option<Setup>,
-    /// rollback を望むときの D（None なら delay 方式）。
+    /// rollbackを望むときのD（Noneならdelay方式）。
     rb: Option<u8>,
     latency: u8,
-    /// ホストになったときに座る席（先にいたかを名乗らない経路はホストの希望が通る）。
+    /// ホストになったときに座るサイド（先にいたかを名乗らない経路はホストの希望が通る）。
     seat: Seat,
 }
 
@@ -71,17 +71,17 @@ fn side(up: u64, nat: NatMark) -> Side {
 }
 
 struct Net {
-    /// (届く µs, 通し, 宛先の台, バイト列)。
+    /// (届くµs, 通し, 宛先の台, バイト列)。
     q: Vec<(u64, u64, usize, Vec<u8>)>,
     seq: u64,
-    /// 台ごとの上りが空く µs。
+    /// 台ごとの上りが空くµs。
     busy: [u64; 2],
     up: [u64; 2],
     one_way_us: u64,
-    /// 便を落とすか（送り手の台, 種類, その種類の何通目）。
+    /// 便を落とすかどうか（送り手の台, 種類, その種類の何通目）。
     drop: Box<dyn FnMut(usize, Kind, u32) -> bool>,
     nth: [[u32; 4]; 2],
-    /// 台ごとの、種類ごとの送った数。
+    /// 台ごとの種類ごとの送った数。
     sent: [[u32; 4]; 2],
 }
 
@@ -143,17 +143,17 @@ fn make_link(i: usize, s: Side, start: u32) -> Link {
 
 struct Run {
     est: [Established; 2],
-    /// 台ごとの接続した ms。
+    /// 台ごとの接続したms。
     at: [u32; 2],
     sent: [[u32; 4]; 2],
 }
 
-/// 1 ms ごとに: 届いた便を宛先の台へ渡す（受けた時刻は µs）→ 両台の `poll`。両台が接続したら止める。
+/// 1 msごとに: 届いた便を宛先の台へ渡す（受けた時刻はµs）→ 両台の`poll`。両台が接続したら止める。
 fn run(sides: [Side; 2], one_way_ms: u32, drop: Box<dyn FnMut(usize, Kind, u32) -> bool>) -> Run {
     run_from(sides, one_way_ms, drop, [0, 0])
 }
 
-/// `run` の、台ごとに始める ms を決められる形。始める前に届いた便は落ちる（ポートがまだ開いていない）。
+/// 台ごとに始めるmsを決められる形の`run`。始める前に届いた便は落ちる（ポートがまだ開いていない）。
 fn run_from(
     sides: [Side; 2],
     one_way_ms: u32,
@@ -233,7 +233,7 @@ fn keep_all() -> Box<dyn FnMut(usize, Kind, u32) -> bool> {
     Box::new(|_, _, _| false)
 }
 
-/// 両台の結果が食い違わないことと、ホストが `host`（台の番号）であることを見る。席・delay・D・決め手の材料も両台で同じ。
+/// 両台の結果が食い違わないことと、ホストが`host`（台の番号）であることを見る。サイド・delay・D・決め手の材料も両台で同じ。
 fn check(r: &Run, host: usize, tag: &str) {
     let [a, b] = r.est;
     assert_eq!(
@@ -269,7 +269,7 @@ const MBPS: u64 = 125_000;
 
 #[test]
 fn the_fatter_side_hosts_even_when_its_nonce_is_smaller() {
-    // B（nonce が小さい）が 20 倍太い。
+    // B（nonceが小さい）が20倍太い。
     let r = run(
         [side(MBPS, open()), side(20 * MBPS, open())],
         15,
@@ -278,11 +278,11 @@ fn the_fatter_side_hosts_even_when_its_nonce_is_smaller() {
     check(&r, 1, "B が太い");
     let b = r.est[1].pick;
     assert!(b.active && b.basis == Basis::Uplink, "{b:?}");
-    // 見積もりは送り出しの太さ（列の幅 ÷ 番号の差）。模型の到着は µs なので 1% の中に入る。
+    // 見積もりは送り出しの太さ（列の幅 ÷ 番号の差）。模型の到着はµsなので1%の中に入る。
     let near = |got: u32, want: u64| (got as u64).abs_diff(want) * 100 <= want;
     assert!(near(b.own_up, 20 * MBPS), "B の上りの見積もり {}", b.own_up);
     assert!(near(b.peer_up, MBPS), "A の上りの見積もり {}", b.peer_up);
-    // 80 Mbps の列（幅 1.08 ms）も測れる。到着を ms で丸めると 1 ms か 2 ms になり、1% に入らない。
+    // 80 Mbpsの列（幅1.08 ms）も測れる。到着をmsで丸めると1 msか2 msになるので1%に入らない。
     let r = run(
         [side(8 * MBPS, open()), side(80 * MBPS, open())],
         15,
@@ -290,7 +290,7 @@ fn the_fatter_side_hosts_even_when_its_nonce_is_smaller() {
     );
     check(&r, 1, "B が 80 Mbps");
     assert!(near(r.est[1].pick.own_up, 80 * MBPS), "{:?}", r.est[1].pick);
-    // 逆向き: A が太ければ A。
+    // 逆向き: Aが太ければA。
     let r = run(
         [side(20 * MBPS, open()), side(MBPS, open())],
         15,
@@ -300,7 +300,7 @@ fn the_fatter_side_hosts_even_when_its_nonce_is_smaller() {
     assert_eq!(r.est[0].pick.basis, Basis::Uplink);
 }
 
-/// 列が 1 ms 未満で届き切る太さ（約 86 Mbps より上）は上限の値: 太い同士は role_nonce、太いと細いは太い方。
+/// 列が1 ms未満で届き切る太さ（約86 Mbpsより上）は上限の値: 太い同士はrole_nonce、太いと細いは太い方。
 #[test]
 fn lines_above_the_cap_tie_with_each_other_and_beat_thin_ones() {
     let r = run(
@@ -341,7 +341,7 @@ fn a_small_difference_keeps_the_nonce() {
 
 #[test]
 fn every_lost_part_still_gives_one_answer() {
-    // (筋, 落とす便, B が太いので測れればホストは B だが、測れない筋は nonce の A)
+    // (筋, 落とす便, Bが太いので測れればホストはBだが、測れない筋はnonceのA)
     type Drop = fn(usize, Kind, u32) -> bool;
     let cases: [(&str, Drop, usize); 6] = [
         (
@@ -385,7 +385,7 @@ fn every_lost_part_still_gives_one_answer() {
 
 #[test]
 fn a_report_after_the_wait_falls_to_the_nonce() {
-    // 片道 300 ms: A が B の HELLO を受けてから、B の値が届くまで 2 片道 ＋ 列の幅 > 500 ms。
+    // 片道300 ms: AがBのHELLOを受けてからBの値が届くまで2片道 ＋ 列の幅 > 500 ms。
     let r = run(
         [side(MBPS, open()), side(20 * MBPS, open())],
         300,
@@ -395,7 +395,7 @@ fn a_report_after_the_wait_falls_to_the_nonce() {
     let a = r.est[0].pick;
     assert_eq!((a.own_up, a.basis), (0, Basis::Nonce), "{a:?}");
     assert!(a.peer_up > 0, "A は B の列を測れている");
-    // 同じ片道 100 ms なら間に合い、B がホスト。
+    // 同じ片道100 msなら間に合い、Bがホスト。
     let r = run(
         [side(MBPS, open()), side(20 * MBPS, open())],
         100,
@@ -406,14 +406,14 @@ fn a_report_after_the_wait_falls_to_the_nonce() {
 
 #[test]
 fn nat_kinds_come_before_the_uplink() {
-    // (A の型, B の型, A の太さ, B の太さ, ホスト, 決め手)
+    // (Aの型, Bの型, Aの太さ, Bの太さ, ホスト, 決め手)
     let cases = [
         (sym(), open(), 20 * MBPS, MBPS, 1, Basis::Nat),
         (open(), sym(), MBPS, 20 * MBPS, 0, Basis::Nat),
         (sym(), sym(), MBPS, 20 * MBPS, 1, Basis::Uplink),
         (UNKNOWN, sym(), MBPS, 20 * MBPS, 1, Basis::Uplink),
         (open(), UNKNOWN, 20 * MBPS, MBPS, 0, Basis::Uplink),
-        // シンメトリックでも UPnP で開けていれば届く型。
+        // シンメトリックでもUPnPで開けていれば届く型。
         (
             NatMark {
                 symmetry: Symmetry::Yes,
@@ -441,7 +441,7 @@ fn nat_kinds_come_before_the_uplink() {
 
 #[test]
 fn the_decided_host_brings_its_own_seat_and_rollback_d() {
-    // 両者が 1P を望み（名乗らない経路はホストの希望が通る）、rollback の D は A 2・B 5。
+    // 両者が1Pを望み（名乗らない経路はホストの希望が通る）、rollbackのDはA 2・B 5。
     let mut a = side(MBPS, open());
     let mut b = side(20 * MBPS, open());
     a.rb = Some(2);
@@ -450,13 +450,13 @@ fn the_decided_host_brings_its_own_seat_and_rollback_d() {
     check(&r, 1, "B がホスト");
     assert_eq!(r.est[1].seat, Seat::P1);
     assert_eq!((r.est[0].mode, r.est[0].delay), (Mode::Rollback, 5));
-    // A がホストなら A の値。
+    // AがホストならAの値。
     let (a2, b2) = (Side { up: 20 * MBPS, ..a }, Side { up: MBPS, ..b });
     let r = run([a2, b2], 15, keep_all());
     check(&r, 0, "A がホスト");
     assert_eq!(r.est[0].seat, Seat::P1);
     assert_eq!((r.est[1].mode, r.est[1].delay), (Mode::Rollback, 2));
-    // 希望が違う（A は 2P、B は 1P）: host_seat は決まったホストの希望。
+    // 希望が違う（Aは2P、Bは1P）: host_seatは決まったホストの希望。
     for (ua, ub, host, want) in [
         (MBPS, 20 * MBPS, 1, Seat::P1),
         (20 * MBPS, MBPS, 0, Seat::P2),
@@ -469,7 +469,7 @@ fn the_decided_host_brings_its_own_seat_and_rollback_d() {
         assert_eq!(r.est[1 - host].host_seat, want);
         assert_eq!((r.est[0].seat, r.est[1].seat), (Seat::P2, Seat::P1));
     }
-    // delay 方式は両者の希望の大きい方（ホストに依らない）。
+    // delay方式は両者の希望の大きい方（ホストに依らない）。
     let (mut a3, mut b3) = (side(MBPS, open()), side(20 * MBPS, open()));
     a3.latency = 6;
     b3.latency = 1;
@@ -528,12 +528,13 @@ fn random_losses_never_split_the_roles() {
         check(&r, host, &format!("回 {round}"));
         hosts[host] += 1;
     }
-    // 効く期間: 60 回のうち両方の台がホストになった回がある（台の番号で決まっていない）。
+    // 効く期間: 60回のうち両方の台がホストになった回がある（台の番号で決まっていない）。
     assert!(hosts[0] > 0 && hosts[1] > 0, "{hosts:?}");
 }
 
-/// 接続までの時間の増分（模型）。決め方を使わない組と比べ、近い相手（片道 15 ms）と遠い相手（片道 150 ms）で、同時に始める組と
-/// B が 1 片道遅れて始める組を出す。細い側は 1 Mbps か 0.4 Mbps、太い側は 8 Mbps。
+/// 接続までの時間の増分（模型）。決め方を使わない場合と比べる。
+/// 近い相手（片道15 ms）と遠い相手（片道150 ms）のそれぞれで、同時に始める場合とBが1片道遅れて始める場合を出す。
+/// 細い側は1 Mbpsか0.4 Mbps、太い側は8 Mbps。
 #[test]
 fn connect_time_increase_in_the_model() {
     const KBPS400: u64 = 50_000;
@@ -570,7 +571,7 @@ fn connect_time_increase_in_the_model() {
             on.at,
             off.at
         );
-        // 増える待ちは、取りまとめ役が値を待つ上限（500 ms）と AGREE の片道を越えない。
+        // 増える待ちは取りまとめ役が値を待つ上限（500 ms）とAGREEの片道を越えない。
         assert!(
             inc.iter().all(|&d| {
                 d >= 0 && d <= i64::from(host_pick::REPORT_WAIT_MS) + i64::from(one_way)

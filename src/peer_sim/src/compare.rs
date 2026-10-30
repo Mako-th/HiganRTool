@@ -1,20 +1,21 @@
-//! 突き合わせ（`peer_sim --compare`）: dll の `_net_frames.csv` と peer_sim の記録を読み、使ったフレームの列 (seg, frame, 1P, 2P) が同じかを
-//! 見て、dll の余裕と待ちの分布（p50 / p95 / p99 / max）と delay の変わり目を出す。
-//! 一致の決まり: dll の行は全部、peer_sim の同じ番目の行と (seg, frame, 1P, 2P) が同じ（`same_key`）。delay は条件に入れず、
-//! 違った行の数だけ別に出す（`Outcome::delay_only`。`compare2.rs` も同じ）。peer_sim は末尾に 1 行まで多くてよい（dll が最後の語を取ってから閉じた分）。
-//! どちらかが 0 行なら、比べられていないので食い違いとする（0 行を一致と言ってしまわないため。`--compare2` と同じ扱い）。
-//! 読むだけのツール（ファイルは `main.rs` が読む）。ここは文字列を受けて文字列を返す。
+//! 突き合わせ（`peer_sim --compare`）: dllの`_net_frames.csv`とpeer_simの記録を読む。
+//! 使ったフレームの列 (seg, frame, 1P, 2P)が同じかを見て、dllの余裕と待ちの分布（p50 / p95 / p99 / max）とdelayの変わり目を出す。
+//! 一致の決まり: dllの行は全部、peer_simの同じ番目の行と (seg, frame, 1P, 2P)が同じ（`same_key`）。
+//! delayは条件に入れず、違った行の数だけ別に出す（`Outcome::delay_only`。`compare2.rs`も同じ）。
+//! peer_simは末尾に1行まで多くてよい（dllが最後のワードを取ってから閉じた分）。
+//! どちらかが0行なら比べられていないので食い違いとする（0行を一致と言ってしまわないため。`--compare2`と同じ扱い）。
+//! 読むだけのツール（ファイルは`main.rs`が読む）。ここは文字列を受けて文字列を返す。
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-// dll の `_net_frames.csv` の見出し（新旧）は `higanr_core::replay_compare` の定数。古い 7 列のログも読み、そのときの `head_wait_us` は
-// 0 として扱う。
+// dllの`_net_frames.csv`のヘッダ（新旧）は`higanr_core::replay_compare`の定数。
+// 古い7列のログも読み、そのときの`head_wait_us`は0として扱う。
 use higanr_core::replay_compare::{NET_FRAMES_HEADER, NET_FRAMES_HEADER_V1};
 
 use crate::record::{ms3, percentile};
 
-/// dll の `_net_frames.csv` の見出しか（新旧どちらか）。`parse_dll_csv` を呼ぶかの見分けに使う。
+/// dllの`_net_frames.csv`のヘッダかどうか（新旧どちらか）。`parse_dll_csv`を呼ぶかの見分けに使う。
 pub fn is_dll_header(h: &str) -> bool {
     let h = h.trim();
     h == NET_FRAMES_HEADER || h == NET_FRAMES_HEADER_V1
@@ -34,7 +35,7 @@ pub struct DllRow {
     pub row: Row,
     pub margin_us: Option<u64>,
     pub wait_us: u64,
-    /// フレームの始まりで相手の入力ワードを待った時間（µs。7 列の古いログは 0）。
+    /// フレームの始まりで相手の入力ワードを待った時間（µs。7列の古いログは0）。
     pub head_wait_us: u64,
 }
 
@@ -49,8 +50,9 @@ fn hex16(s: &str, what: &str, line: usize) -> Result<u16, String> {
         .map_err(|_| format!("{line} 行目の {what} {s:?} が 16 進で読めない"))
 }
 
-/// dll の `_net_frames.csv` を読む。見出しが新旧どちらでもなければ断る（古い 4 列の CSV を黙って読み違えないように）。見出しが 7 列の
-/// 古い形なら行も 7 列で、`head_wait_us` は 0。新しい形（8 列）の行が 7 列、古い形の行が 8 列なら、見出しと行の食い違いとして断る。
+/// dllの`_net_frames.csv`を読む。ヘッダが新旧どちらでもなければ断る（古い4列のCSVを黙って読み違えないように）。
+/// ヘッダが7列の古い形なら行も7列で、`head_wait_us`は0。
+/// 新しい形（8列）で行が7列のとき、または古い形で行が8列のときは、ヘッダと行の食い違いとして断る。
 pub fn parse_dll_csv(text: &str) -> Result<Vec<DllRow>, String> {
     let mut lines = text.lines().enumerate();
     let cols = match lines.next() {
@@ -73,7 +75,7 @@ pub fn parse_dll_csv(text: &str) -> Result<Vec<DllRow>, String> {
         if f.len() != cols {
             return Err(format!("{n} 行目の列の数が {cols} でない: {l:?}"));
         }
-        // 列の数は上で見た（7 か 8）ので、先頭の 7 つの後ろは 0 個（古い形）か 1 個（フレームの始まりの待ち）。
+        // 列の数は上で見た（7か8）ので先頭の7つの後ろは0個（古い形）か1個（フレームの始まりの待ち）。
         let [seg, frame, p1, p2, delay, margin, wait, rest @ ..] = f.as_slice() else {
             return Err(format!("{n} 行目の列が足りない: {l:?}"));
         };
@@ -101,7 +103,7 @@ pub fn parse_dll_csv(text: &str) -> Result<Vec<DllRow>, String> {
     Ok(out)
 }
 
-/// peer_sim の記録を読む（`#` で始まらない空でない行が `seg frame 1P 2P delay`）。
+/// peer_simの記録を読む（`#`で始まらない空でない行が`seg frame 1P 2P delay`）。
 pub fn parse_peer_record(text: &str) -> Result<Vec<Row>, String> {
     let mut out = Vec::new();
     for (i, l) in text.lines().enumerate() {
@@ -130,15 +132,16 @@ pub struct Outcome {
     pub dll_rows: usize,
     pub peer_rows: usize,
     pub matched: usize,
-    /// 先頭から一致した行のうち、delay だけが違った行の数。一致の判定には入れない（出力の 1 行）。
+    /// 先頭から一致した行のうち、delayだけが違った行の数。一致の判定には入れない（出力の1行）。
     pub delay_only: usize,
-    /// 最初に食い違った番目と、そこの両者の行（片方が尽きていれば None）。
+    /// 最初に食い違った番目と、そこの両者の行（片方が尽きていればNone）。
     pub first_diff: Option<(usize, Option<Row>, Option<Row>)>,
     pub ok: bool,
 }
 
-/// 一致の決まりに入れる欄（seg・frame・1P・2P）が同じか。delay は入れない（使った後の delay は書き出す時点の今の D なので、マッチの途中で
-/// D を替えた後は語が同じでも違いうる）。`compare2` もこの関数を使う。
+/// 一致の決まりに入れるフィールド（seg・frame・1P・2P）が同じかどうか。
+/// delayは入れない。使った後のdelayは書き出す時点の今のDなので、マッチの途中でDを替えた後はワードが同じでも違いうる。
+/// `compare2`もこの関数を使う。
 pub(crate) fn same_key(x: &Row, y: &Row) -> bool {
     x.seg == y.seg && x.frame == y.frame && x.p1 == y.p1 && x.p2 == y.p2
 }
@@ -149,7 +152,7 @@ pub fn compare(dll: &[DllRow], peer: &[Row]) -> Outcome {
         .zip(peer)
         .take_while(|(d, p)| same_key(&d.row, p))
         .count();
-    // 先頭から一致した行（欄は同じ）の中で、delay だけが違う行の数。一致の後ろは数えない（そこは一致と言っていない行）。
+    // 先頭から一致した行（フィールドは同じ）の中でdelayだけが違う行の数。一致の後ろは数えない（そこは一致と言っていない行）。
     let delay_only = dll
         .iter()
         .zip(peer)
@@ -175,7 +178,7 @@ pub fn compare(dll: &[DllRow], peer: &[Row]) -> Outcome {
     }
 }
 
-/// p50 / p95 / p99 / max の文（µs の列から。空なら「-」）。`compare2` も使う。
+/// p50 / p95 / p99 / maxの文（µsの列から。空なら「-」）。`compare2`も使う。
 pub(crate) fn dist(v: &mut [u64]) -> String {
     v.sort_unstable();
     format!(
@@ -187,7 +190,7 @@ pub(crate) fn dist(v: &mut [u64]) -> String {
     )
 }
 
-/// 突き合わせの判定の語（`--compare` と `--compare2` で同じ言い方にする）。0 行の側があれば、食い違いの中でも「比べられていない」と分けて書く。
+/// 突き合わせの判定の語（`--compare`と`--compare2`で同じ言い方にする）。0行の側があれば食い違いの中でも「比べられていない」と分けて書く。
 pub(crate) fn verdict(ok: bool, rows_a: usize, rows_b: usize) -> &'static str {
     if ok {
         "一致"
@@ -243,7 +246,7 @@ pub fn report(dll: &[DllRow], peer: &[Row]) -> (String, bool) {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    // delay の変わり目（使った後の値が前の行と違う行）。
+    // delayの変わり目（使った後の値が前の行と違う行）。
     let mut changes = Vec::new();
     for w in dll.windows(2) {
         if let [a, b] = w
@@ -309,8 +312,7 @@ pub fn report(dll: &[DllRow], peer: &[Row]) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    //! 見出し・16 進の語・空の余裕・`#` の行の読み、一致の決まり（1 行の食い違い・dll の余り・peer_sim の余り 1 行と 2 行・delay だけの違い）、
-    //! delay の変わり目を見る。
+    //! ヘッダ・16進のワード・空の余裕・`#`の行の読み、一致の決まり（1行の食い違い・dllの余り・peer_simの余り1行と2行・delayだけの違い）、delayの変わり目を検査する。
     use super::*;
 
     const CSV: &str = "seg,frame,p1,p2,delay,margin_us,wait_us\n0,0,0000,0000,2,,0\n0,1,0000,0000,2,,5\n0,2,001A,0040,2,31000,0\n0,3,0010,0004,5,30000,2500\n1,0,0000,0000,5,,0\n";
@@ -441,7 +443,7 @@ mod tests {
                 "{what}: {text}"
             );
         }
-        // 対照: 1 行どうし・peer_sim の 1 行の余りは一致のまま（0 行のガードが全部を断っているのではない）。
+        // 対照: 1行どうし・peer_simの1行の余りは一致のまま（0行のガードが全部を断っているのではない）。
         assert!(compare(&d[..1], &p[..1]).ok);
         assert!(compare(&d[..1], &p[..2]).ok);
         let (text, ok) = report(&d, &p);
@@ -455,7 +457,7 @@ mod tests {
         assert!(parse_dll_csv("seg,frame,p1,p2\n0,0,0000,0000\n").is_err());
         assert!(parse_dll_csv("").is_err());
         assert!(parse_dll_csv(&format!("{NET_FRAMES_HEADER}\n0,0,0000,0000,2,\n")).is_err());
-        // 16 進でない語（列の数は合わせてある。列の数で落ちているのではないこと）。
+        // 16進でないワード（列の数は合わせてある。列の数で落ちているのではないこと）。
         assert!(parse_dll_csv(&format!("{NET_FRAMES_HEADER}\n0,0,00G0,0000,2,,0,0\n")).is_err());
         assert!(parse_dll_csv(&format!("{NET_FRAMES_HEADER_V1}\n0,0,00G0,0000,2,,0\n")).is_err());
         assert!(parse_peer_record("0 0 0000 0000\n").is_err());

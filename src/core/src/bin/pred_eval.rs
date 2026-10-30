@@ -1,11 +1,11 @@
-//! rollback の予測の当たり外れを、人の入力の記録で数えるツール（ゲームは動かさない。読むだけで、配る zip には入らない）。
+//! rollbackの予測の当たり外れを人の入力の記録で数えるツール（ゲームは動かさない。読むだけ。配布するzipには入らない）。
 //!
 //! 使い方: `pred_eval --out <新しいフォルダ> [--csv <_net_frames.csv か .csv.gz>]... [--rpy <リプレイ.rpy>]... [--r 8] [--focus-k 9] [--skip-check]`
-//! - 入力の列は 1 席 1 本。`--csv` は seg ごとの 1P・2P の列、`--rpy` は人の席の列だけ（`human_cpu == 0`。CPU の席は全部 0 なので捨てる）。語は `WORD_MASK` で切る。
-//! - 片道 k tick・遅れ D ごとの予測の幅は m = max(k − D, 0)、待ちの上限 R で打ち切る（`pred_eval::width_and_wait`）。採点は m ごとに 1 度だけ行う。
-//! - 学習する方法（P2・P3）は online（そのマッチの中だけ学ぶ）と warm（ほかのファイルの全列で先に学ぶ。leave-one-file-out）の両方を出す。
-//! - 先に `--csv` の列で P0 の w = 1・2・4・8 を、実回線のログで出してある数（`DOC_CHECK`）と照らす。0.05 ポイントを超えて違えば止まる（終了コード 3）。別のログなら `--skip-check`。
-//! - `--out` のフォルダは新しく作る（あれば断る）。中身は `by_m.csv` / `by_k_d.csv` / `per_stream.csv` / `streams.csv`。
+//! - 入力の列は1サイド1本。`--csv`はマッチごとの1P・2Pの列。`--rpy`は人のサイドの列だけ（`human_cpu == 0`。CPUのサイドは全部0なので捨てる）。ワードは`WORD_MASK`で切る。
+//! - 片道k tick・遅れDごとの予測の幅は m = max(k − D, 0)。待ちの上限Rで打ち切る（`pred_eval::width_and_wait`）。採点はmごとに1度だけ行う。
+//! - 学習する方法（P2・P3）はonline（そのマッチの中だけ学ぶ）とwarm（ほかのファイルの全列で先に学ぶ。leave-one-file-out）の両方を出す。
+//! - 先に`--csv`の列でP0の w = 1・2・4・8 を、実回線のログで出してある数（`DOC_CHECK`）と照らす。0.05ポイントを超えて違えば止まる（終了コード3）。別のログなら`--skip-check`。
+//! - `--out`のフォルダは新しく作る（あれば断る）。中身は`by_m.csv` / `by_k_d.csv` / `per_stream.csv` / `streams.csv`。
 //!
 //! リプレイは読むだけ。プレイヤー名・日付は出さない（列の名前は通し番号）。
 #![forbid(unsafe_code)]
@@ -23,16 +23,16 @@ use higanr_core::replay_decode as dec;
 
 const USAGE: &str = "使い方: pred_eval --out <新しいフォルダ> [--csv <_net_frames.csv>]... [--rpy <リプレイ.rpy>]... [--r 8] [--focus-k 9] [--skip-check]";
 const MAX_FILE: u64 = 64 << 20;
-/// 検算の相手: 先に実回線のログで出してある数。ほかの人との実回線のマッチ（20,302 tick・1 seg）の 1P / 2P で、w tick 前の語の繰り返しが外れる割合（%）。
+/// 検算の相手: 先に実回線のログで出してある数。ほかの人との実回線のマッチ（20,302 tick・1 seg）の1P / 2Pでw tick前のワードの繰り返しが外れる割合（%）。
 const DOC_CHECK: [(usize, f64, f64); 4] = [
     (1, 17.6, 12.9),
     (2, 31.6, 23.7),
     (4, 52.9, 40.7),
     (8, 66.7, 54.4),
 ];
-/// 既存の数は小数 1 桁なので、丸めの幅 0.05 以内なら一致とする。
+/// 既存の数は小数1桁なので、丸めの幅0.05以内なら一致とする。
 const CHECK_TOL: f64 = 0.05;
-/// 表に出す列の名前（`METHODS` の後ろに、どれかが当たれば当たりとした上限の目安を足す）。
+/// 表に出す列の名前。`METHODS`の後ろに、どれかの方法が当たれば当たりとした上限の目安を足す。
 const ORACLE: usize = METHODS.len();
 const COLS: usize = METHODS.len() + 1;
 /// 学習の仕方。
@@ -42,11 +42,11 @@ const D_MAX: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Group {
-    /// 実回線のマッチ（両席とも人）。
+    /// 実回線のマッチ（両サイドとも人）。
     Net,
-    /// リプレイの人の席（相手は CPU）。
+    /// リプレイの人のサイド（相手はCPU）。
     Cpu,
-    /// リプレイの人の席（相手も人）。
+    /// リプレイの人のサイド（相手も人）。
     Human,
 }
 
@@ -68,7 +68,7 @@ impl Group {
 struct Stream {
     label: String,
     group: Group,
-    /// 元のファイルの通し番号（warm の学習から同じファイルの列を除く）。
+    /// 元のファイルの通し番号（warmの学習から同じファイルの列を除く）。
     source: usize,
     words: Vec<u16>,
 }
@@ -142,7 +142,7 @@ fn load_csv(path: &str, source: usize, out: &mut Vec<Stream>) -> Result<(), Stri
     let rows = cmp::parse_net_frames(&t.text).map_err(|e| format!("{path} を読めない: {e:?}"))?;
     for seg in cmp::segs(&rows) {
         let seg_rows: Vec<_> = rows.iter().filter(|r| r.seg == seg).collect();
-        // frame が 0 から 1 ずつ進んでいなければ、語の並びが tick の並びと違う（欠け・重複）ので断る。
+        // frameが0から1ずつ進んでいなければワードの並びがtickの並びと違う（欠け・重複）ので断る。
         if let Some((i, r)) = seg_rows
             .iter()
             .enumerate()
@@ -196,7 +196,7 @@ fn load_rpy(path: &str, source: usize, out: &mut Vec<Stream>) -> Result<(), Stri
     Ok(())
 }
 
-/// 学習する方法を、ほかのファイルの全列で先に学ばせる（列の境目では履歴だけ捨てる）。
+/// 学習する方法をほかのファイルの全列で先に学ばせる（列の境目では履歴だけ捨てる）。
 fn trained(index: usize, streams: &[Stream], skip_source: usize) -> Method {
     let mut p = Method::new(index).unwrap_or_else(|| unreachable!("方法の添字は METHODS の範囲"));
     for s in streams.iter().filter(|s| s.source != skip_source) {
@@ -209,7 +209,7 @@ fn trained(index: usize, streams: &[Stream], skip_source: usize) -> Method {
     p
 }
 
-/// 採点の結果: [train][group][列][m] の集計と、[train][stream][列][m] の列ごとの集計。
+/// 採点の結果: [train][group][列][m]の集計と、[train][stream][列][m]の列ごとの集計。
 struct Results {
     pooled: Vec<Vec<Vec<Vec<Summary>>>>,
     per_stream: Vec<Vec<Vec<Vec<Summary>>>>,
@@ -220,11 +220,11 @@ fn score(streams: &[Stream]) -> Results {
     let mut pooled = vec![vec![vec![vec![Summary::default(); ms]; COLS]; GROUPS.len()]; 2];
     let mut per_stream = vec![vec![vec![vec![Summary::default(); ms]; COLS]; streams.len()]; 2];
     for (ti, _) in TRAINS.iter().enumerate() {
-        // 集めてから最後に summary() にする。
+        // 集めてから最後にsummary()にする。
         let mut pools: Vec<Vec<Vec<Pool>>> =
             vec![vec![vec![Pool::default(); ms]; COLS]; GROUPS.len()];
         for (si, s) in streams.iter().enumerate() {
-            // 表を使う方法は、この列のために 1 度だけ作って m ごとに複製する。
+            // 表を使う方法はこの列のために1度だけ作ってmごとに複製する。
             let bases: Vec<Method> = (0..METHODS.len())
                 .map(|i| {
                     if ti == 1 {
@@ -376,7 +376,7 @@ fn write_csvs(dir: &str, streams: &[Stream], res: &Results, r: usize) -> Result<
     write_new(dir, "streams.csv", &st)
 }
 
-/// 検算。`--csv` の列の席 1・2 ごとに、P0 の w = 1・2・4・8 を既存の数と照らす。
+/// 検算。`--csv`の列のサイド1・2ごとにP0の w = 1・2・4・8 を既存の数と照らす。
 fn check_against_doc(streams: &[Stream]) -> bool {
     let nets: Vec<&Stream> = streams.iter().filter(|s| s.group == Group::Net).collect();
     if nets.len() < 2 {
@@ -406,7 +406,7 @@ fn check_against_doc(streams: &[Stream]) -> bool {
             if hit { "" } else { "不一致" }
         );
     }
-    // eval_stream の P0 でも同じ数になること（採点の経路の検算）。
+    // eval_streamのP0でも同じ数になること（採点の経路の検算）。
     for (w, _, _) in DOC_CHECK {
         for s in nets.iter().take(2) {
             let mut p = Method::new(0).unwrap_or_else(|| unreachable!());
@@ -513,7 +513,7 @@ fn print_tables(streams: &[Stream], res: &Results, a: &Args) {
         }
     }
 
-    // k 固定で D を振った表（実際の遅れ設定の見え方）。
+    // k固定でDを振った表（実際の遅れ設定の見え方）。
     let k = a.focus_k;
     println!(
         "\n==== 片道 k = {k} tick（≒ {} ms）で遅れ D を振る（R = {}。online）====",

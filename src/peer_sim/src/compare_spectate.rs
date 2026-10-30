@@ -1,19 +1,21 @@
-//! 観戦者の列と対戦する2人の列の突き合わせ（`peer_sim --compare-spectate`）: 観戦者の CSV（`watch::frames_csv`。`seg,frame,p1,p2`）と、
-//! 対戦する2人の記録（dll の `_net_frames.csv` か peer_sim の記録）を読み、観戦者が受け取ったマッチの入力ワードが、使われた入力ワードと同じかを見る。
-//! 一致の決まり（全部を満たしたとき ok）:
-//! - 観戦者の行が 1 行以上ある（0 行は「比べられていない」で食い違い）。
-//! - 観戦者の最初の行の (seg, frame) が対戦する2人の列のどこかにあり、そこから観戦者の行が全部、同じ番目の行と同じ。遅れて入った観戦者は、いまの seg の始まりから流れるので、列の先頭からでなくてよいが、**その seg の最初の行**であること。
-//! - 観戦者の最後の行の後に残る行が 1 行まで（dll が最後の語を取ってから閉じた分。`compare` と同じ許し方）。多く残っているなら、観戦者が途中で受け取りをやめている。残りの行数は必ず出す。
+//! 観戦者の列と対戦する2人の列の突き合わせ（`peer_sim --compare-spectate`）。
+//! 観戦者のCSV（`watch::frames_csv`。`seg,frame,p1,p2`）と対戦する2人の記録（dllの`_net_frames.csv`かpeer_simの記録）を読む。
+//! 観戦者が受け取ったマッチの入力ワードが使われた入力ワードと同じかを見る。
+//! 一致の決まり（全部を満たしたときok）:
+//! - 観戦者の行が1行以上ある（0行は「比べられていない」で食い違い）。
+//! - 観戦者の最初の行の (seg, frame)が対戦する2人の列のどこかにある。そこから先の観戦者の行は全部、その列の同じ番目の行と同じ。
+//!   遅れて入った観戦者はいまのsegの始まりから受け取るので列の先頭からでなくてよい。ただし**そのsegの最初の行**であること。
+//! - 観戦者の最後の行の後に残る行が1行まで（dllが最後のワードを取ってから閉じた分。`compare`と同じ許し方）。多く残っているなら観戦者が途中で受け取りをやめている。残りの行数は必ず出す。
 //!
-//! 押下（`# 押下` の行が peer_sim の記録にあるとき）も、観戦者の記録の CSV があれば比べる: 観戦者の押下の並びが、対戦する2人の押下の並びの末尾と同じ（先頭から観戦したなら全部と同じ）。
-//! 読むだけのツール（ファイルは `main.rs` が読む）。ここは文字列を受けて文字列を返す。
+//! 押下（`# 押下`の行がpeer_simの記録にあるとき）も観戦者の記録のCSVがあれば比べる。観戦者の押下の並びが対戦する2人の押下の並びの末尾と同じ（先頭から観戦したなら全部と同じ）。
+//! 読むだけのツール（ファイルは`main.rs`が読む）。ここは文字列を受けて文字列を返す。
 
 use std::fmt::Write as _;
 
 use crate::compare::{is_dll_header, parse_dll_csv, parse_peer_record, verdict};
 use crate::watch::FRAMES_CSV_HEADER;
 
-/// 比べる 1 行（seg・frame・1P・2P。観戦者の列には delay が無いので、対戦する2人側の delay は比べない）。
+/// 比べる1行（seg・frame・1P・2P。観戦者の列にはdelayが無いので対戦する2人側のdelayは比べない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SRow {
     pub seg: u16,
@@ -71,7 +73,7 @@ pub fn parse_watch_frames(text: &str) -> Result<Vec<SRow>, String> {
     Ok(out)
 }
 
-/// 対戦する2人の記録を読む。先頭の行が dll の `_net_frames.csv` の見出しなら dll の CSV、そうでなければ peer_sim の記録。
+/// 対戦する2人の記録を読む。先頭の行がdllの`_net_frames.csv`のヘッダならdllのCSV。そうでなければpeer_simの記録。
 pub fn parse_player(text: &str) -> Result<Vec<SRow>, String> {
     let first = text.lines().find(|l| !l.trim().is_empty()).map(str::trim);
     let rows: Vec<(u16, u32, u16, u16)> = if first.is_some_and(is_dll_header) {
@@ -91,8 +93,8 @@ pub fn parse_player(text: &str) -> Result<Vec<SRow>, String> {
         .collect())
 }
 
-/// peer_sim の記録の `# 押下 step kind value screen` の行を、`watch::step_fields` と同じ文字の形にして取り出す。
-/// 見出しの行（`# 押下 step kind value screen（入った順）`）は数として読めないので読み飛ばす。
+/// peer_simの記録の`# 押下 step kind value screen`の行を`watch::step_fields`と同じ文字の形にして取り出す。
+/// ヘッダの行（`# 押下 step kind value screen（入った順）`）は数として読めないので読み飛ばす。
 pub fn presses_from_peer_log(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|l| {
@@ -114,15 +116,15 @@ pub fn presses_from_peer_log(text: &str) -> Vec<String> {
 pub struct Outcome {
     pub watch_rows: usize,
     pub player_rows: usize,
-    /// 観戦者の最初の行が、対戦する2人の列の何番目（0 から）にあたるか。無ければ None。
+    /// 観戦者の最初の行が対戦する2人の列の何番目（0から）にあたるか。無ければNone。
     pub offset: Option<usize>,
     /// 観戦者の先頭から続けて一致した行の数。
     pub matched: usize,
-    /// 最初に食い違った観戦者の行の番目（0 から）と、そこの両者の行。
+    /// 最初に食い違った観戦者の行の番目（0から）とそこの両者の行。
     pub first_diff: Option<(usize, Option<SRow>, Option<SRow>)>,
-    /// 観戦者の最初の行が、対戦する2人の列のその seg の最初の行にあたるか。
+    /// 観戦者の最初の行が対戦する2人の列のそのsegの最初の行にあたるか。
     pub starts_at_seg_head: bool,
-    /// 観戦者の最後の行の後に残った対戦する2人の行の数（offset が無ければ None）。
+    /// 観戦者の最後の行の後に残った対戦する2人の行の数（offsetが無ければNone）。
     pub tail_left: Option<usize>,
     pub ok: bool,
 }
@@ -171,7 +173,7 @@ pub fn compare(watch: &[SRow], player: &[SRow]) -> Outcome {
     }
 }
 
-/// 押下の並びの比べ。観戦者の並びが、対戦する2人の並びの末尾と同じ（先頭から観戦したなら全部と同じ）。戻り値は（一致したか, 文）。
+/// 押下の並びの比べ。観戦者の並びが対戦する2人の並びの末尾と同じ（先頭から観戦したなら全部と同じ）。戻り値は（一致したか, 文）。
 pub fn compare_steps(watch: &[String], player: &[String], from_start: bool) -> (bool, String) {
     let k = watch.len();
     let ok = if from_start {
@@ -193,10 +195,11 @@ pub fn compare_steps(watch: &[String], player: &[String], from_start: bool) -> (
     (ok, text)
 }
 
-/// 突き合わせの文と、一致したか。`steps` は（観戦者の押下, 対戦する2人の押下, 観戦者がリングバッファの先頭から受けたか）で、対戦する2人が peer_sim の
-/// 記録で、観戦者の記録の CSV もあるときだけ渡す。「リングバッファの先頭から」は、観戦者の記録の最初の番号が 0 のとき（マッチの入力ワードの先頭が
-/// 対戦する2人の列の先頭であることとは別: 押下・SELECT は `Seg(0)` の後ろ（マッチの入力ワードの前）に積まれるので、seg 0 のマッチの入力ワードの先頭から
-/// 入った観戦者でも、リングバッファの先頭から入っていれば押下・SELECT を受けている）。
+/// 突き合わせの文と一致したかを返す。
+/// `steps`は（観戦者の押下, 対戦する2人の押下, 観戦者がリングバッファの先頭から受けたか）。対戦する2人がpeer_simの記録で観戦者の記録のCSVもあるときだけ渡す。
+/// 「リングバッファの先頭から」は観戦者の記録の最初の番号が0のときを指す。マッチの入力ワードの先頭が対戦する2人の列の先頭であることとは別。
+/// 押下・SELECTは`Seg(0)`の後ろ（マッチの入力ワードの前）に積まれる。
+/// そのためseg 0のマッチの入力ワードの先頭から入った観戦者でも、リングバッファの先頭から入っていれば押下・SELECTを受けている。
 pub fn report(
     watch: &[SRow],
     player: &[SRow],
@@ -323,7 +326,7 @@ mod tests {
         assert!(parse_watch_frames("seg,frame,p1,p2\n0,0,ZZ,1\n").is_err());
         let dll = "seg,frame,p1,p2,delay,margin_us,wait_us\n0,0,00C4,BEEF,3,100,0\n";
         assert_eq!(parse_player(dll).unwrap(), vec![r(0, 0, 0xC4, 0xBEEF)]);
-        // 末尾へ `head_wait_us` を足した 8 列の CSV も dll の CSV として読む（見出しの比べが古い形だけだと、peer_sim の記録として読んで落ちる）。
+        // 末尾へ`head_wait_us`を足した8列のCSVもdllのCSVとして読む（ヘッダの比較が古い形だけだとpeer_simの記録として読んで失敗する）。
         let dll8 =
             "seg,frame,p1,p2,delay,margin_us,wait_us,head_wait_us\n0,0,00C4,BEEF,3,100,0,8000\n";
         assert_eq!(parse_player(dll8).unwrap(), vec![r(0, 0, 0xC4, 0xBEEF)]);

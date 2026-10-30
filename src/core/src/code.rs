@@ -1,12 +1,16 @@
-//! 接続コード。接続を始める側が作り、相手へコピペ（かルームサーバー）で渡す。相手も自分のコードを返す。
+//! 接続コード。接続を始める側が作って相手へコピペ（かルームサーバー）で渡す。相手も自分のコードを返す。
 //!
-//! 中身: proto_ver・build・種別・session_id・名前・有効期限（UNIX 秒）・候補の列。**始める側のコードだけが秘密 16 B を持つ**。
-//! 末尾は、始める側はコピーの間違いを見つける 4 B の検算（SHA-256 の先頭）、返す側は `HMAC-SHA256(K, 本文)` の先頭 16 B（K は秘密と session から導く鍵。第三者が返す側のコードを偽って候補を差し替えるのを防ぐ）。
-//! 文字は自前の base64url（RFC 4648 §5、`=` なし）。中身の大半が乱数の秘密とアドレスなので圧縮はしない。
+//! 中身: proto_ver・build・種別・session_id・名前・有効期限（UNIX秒）・候補の列。**始める側のコードだけが秘密の乱数16 Bを持つ**。
+//! 末尾は始める側と返す側で違う。
+//! 始める側はコピーの間違いを見つける4 Bの検算（SHA-256の先頭）。
+//! 返す側は`HMAC-SHA256(K, 本文)`の先頭16 B。Kは秘密の乱数とsessionから導く鍵。このタグで第三者が返す側のコードを偽って候補を差し替えるのを防ぐ。
+//! 文字は自前のbase64url（`=`なしのRFC 4648 §5）。中身の大半が秘密の乱数とアドレスなので圧縮はしない。
 //! 読む順: 文字 → 長さ → バージョン → 種別 →（返す側: session_id）→ 検算かタグ → **ビルド** → 中身 → 長さの過不足 → 有効期限。
-//! 検算かタグを先に見るのはコピーの間違いを「候補のアドレスが変」と取り違えないため、ビルドを検算の後に見るのは「相手のバージョンが違う」と取り違えないため、有効期限を最後に見るのは壊れたコードを「期限切れ」と言わないため。
+//! 検算かタグを先に見るのはコピーの間違いを「候補のアドレスが変」と取り違えないため。
+//! ビルドを検算の後に見るのは「相手のバージョンが違う」と取り違えないため。
+//! 有効期限を最後に見るのは壊れたコードを「期限切れ」と言わないため。
 //!
-//! コピペの読み書きでしか使わないので `String` / `Vec` を使う（ゲームスレッドでは呼ばない）。ネットや人から来た文字を読むので、パニックしうる添字は置かない。
+//! コピペの読み書きでしか使わないので`String` / `Vec`を使う（ゲームスレッドでは呼ばない）。ネットや人から来た文字を読むのでパニックしうる添字は置かない。
 
 use sha2::{Digest, Sha256};
 
@@ -23,25 +27,27 @@ use crate::wire::{NAME_MAX, PROTO_VER};
 pub const CHECK_LEN: usize = 4;
 /// 返す側のタグの長さ（B。パケットのタグと同じ）。
 pub const CODE_TAG_LEN: usize = auth::TAG_LEN;
-/// 名前より前の決まった欄の長さ（バージョン 1・build 4・種別 1・session 4・期限 8・name_len 1）。
+/// 名前より前の決まったフィールドの長さ（バージョン1・build 4・種別1・session 4・期限8・name_len 1）。
 const HEAD_LEN: usize = 19;
-/// 読む文字の上限（base64 で）。いちばん長いコード（観戦用・名前 32 B・IPv6 の候補 8 つ）は
-/// 19 + 32 + 16 + 32 + 1 + 1 + 20 × 8 + 4 = 265 B = 354 文字。これを越える文字は中を読まずに断る。
+/// 読む文字の上限（base64で）。
+/// いちばん長いコード（観戦用・名前32 B・IPv6の候補8つ）は 19 + 32 + 16 + 32 + 1 + 1 + 20 × 8 + 4 = 265 B = 354文字。
+/// これを越える文字は中を読まずに断る。
 pub const MAX_CODE_CHARS: usize = 512;
-/// 読める文字の下限（base64 で）。いちばん短いコード（返す側・名前 0 B・IPv4 の候補 1 つ）は
-/// 19 + 0 + 1 + 1 + 8 + 16 = 45 B = 60 文字。これより短い文字は、ウィンドウが接続コードとして置かずに断る
-/// （対戦の形を選ぶ文字 `0` `delay` や打ち間違いを `peer_code.txt` へ置かない）。
+/// コードとして読める文字数の下限（base64で）。
+/// いちばん短いコード（返す側・名前0 B・IPv4の候補1つ）は 19 + 0 + 1 + 1 + 8 + 16 = 45 B = 60文字。
+/// これより短い文字はウィンドウが接続コードとして書き込まずに断る。
+/// 対戦の形を選ぶ文字`0` `delay`や打ち間違いを`peer_code.txt`へ書き込まないため。
 pub const MIN_CODE_CHARS: usize = 60;
-/// 有効期限の既定の長さ（秒）。コピペで渡して読むまでに切れず、古いコードが何日も使えないように 30 分。
+/// 有効期限の既定の長さ（秒）。30分にする。コピペで渡して読むまでには切れず、古いコードが何日も使えることもない長さ。
 pub const DEFAULT_TTL_SECS: u64 = 30 * 60;
 
-/// 秒数を人が読む長さの文字にする（60 の倍数なら「30 分」、そうでなければ「45 秒」）。
-/// ウィンドウの文の数字を定数から作り、`DEFAULT_TTL_SECS` を変えても古いままにならないようにする。
+/// 秒数を人が読む長さの文字にする（60の倍数なら「30 分」/ そうでなければ「45 秒」）。
+/// ウィンドウの文の数字を定数から作る。`DEFAULT_TTL_SECS`を変えても古いままにならない。
 pub fn span_text(secs: u64) -> String {
     span_text_in(Lang::Ja, secs)
 }
 
-/// `span_text` の言語つきバージョン（英語は「30 min」「45 s」）。単位の文字は `net_menu` の表と同じ。
+/// `span_text`の言語つきバージョン（英語は「30 min」「45 s」）。単位の文字は`net_menu`の表と同じ。
 pub fn span_text_in(lang: Lang, secs: u64) -> String {
     if secs >= 60 && secs.is_multiple_of(60) {
         format!("{}{}", secs / 60, T_SPAN_MIN.get(lang))
@@ -56,12 +62,13 @@ pub enum Side {
     Initiator = 1,
     /// 返す側（秘密を持たない。末尾はタグ）。
     Responder = 2,
-    /// 観戦用。形は始める側と同じ（秘密を持ち末尾は検算）だが、種別の 1 B で分けて対戦の答えや対戦のコードの読みには使えない
-    /// （`WrongSide` / `Inconsistent`）。秘密と session は対戦のものと**別に**引く（同じだと観戦者が対戦の鍵を作れてしまう）。
+    /// 観戦用。形は始める側と同じ（秘密を持ち末尾は検算）。
+    /// 種別の1 Bで分けてある。対戦の答えや対戦のコードの読みには使えない（`WrongSide` / `Inconsistent`）。
+    /// 秘密の乱数とsessionは対戦のものとは**別に**生成する（同じだと観戦者が対戦の鍵を作れてしまう）。
     Spectate = 3,
-    /// 観戦者の返し。インターネット越しの観戦で、観戦者が観戦用のコードへの answer としてルームサーバーへ預ける。
-    /// 形は返す側と同じ（秘密なし、末尾は `HMAC-SHA256(K, 本文)` の先頭 16 B）で、K と session_id は観戦用のコードのもの。
-    /// 中身は観戦者の名前と候補。対戦の返しとは読み合えない（`WrongSide`）。
+    /// 観戦者の返答。インターネット越しの観戦で観戦者が観戦用のコードへのanswerとしてルームサーバーへ登録する。
+    /// 形は返す側と同じ（秘密を持たず末尾は`HMAC-SHA256(K, 本文)`の先頭16 B）。Kとsession_idは観戦用のコードのもの。
+    /// 中身は観戦者の名前と候補。対戦の返答とは読み合えない（`WrongSide`）。
     SpectateReply = 4,
 }
 
@@ -69,57 +76,57 @@ pub enum Side {
 pub struct Code {
     pub side: Side,
     pub session_id: u32,
-    /// 始める側だけ Some。
+    /// 始める側だけSome。
     pub secret: Option<Secret>,
     pub name: Name,
-    /// 書いた側の回線の型の印（相手が、接続できなかったときの文を選ぶのに読む）。
+    /// 書いた側のネットワーク種別のフラグ（相手が接続できなかったときの文を選ぶのに読む）。
     pub nat: NatMark,
     pub candidates: Candidates,
-    /// 有効期限（UNIX 秒。この秒までは使える）。
+    /// 有効期限（UNIX秒。この秒までは使える）。
     pub expires: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeError {
-    /// base64url にない文字（`pos` は 0 からの文字の位置。前後の空白は除いた後）。
+    /// base64urlにない文字（`pos`は0からの文字の位置。前後の空白は除いた後）。
     BadChar { pos: usize },
-    /// 文字の数が base64 として成り立たない（4 で割って 1 余る）か、`MAX_CODE_CHARS` を越える。
+    /// 文字の数がbase64として成り立たない（4で割って1余る）か`MAX_CODE_CHARS`を越える。
     BadLength,
-    /// 最後の文字の使わないビットが 0 でない（同じ中身に 2 通りの文字を許さない）。
+    /// 最後の文字の使わないビットが0でない（同じ中身に2通りの文字を許さない）。
     NonCanonical,
-    /// 決まった欄を読むのにバイトが足りない。
+    /// 決まったフィールドを読むのにバイトが足りない。
     TooShort,
     /// 候補まで読んだ後、末尾の検算かタグの前にバイトが余る・足りない。
     LengthMismatch { expected: usize, actual: usize },
-    /// バージョンが `wire::PROTO_VER` でない（中はコードのバージョン）。読む順はバージョンが検算より先。
+    /// バージョンが`wire::PROTO_VER`でない（中はコードのバージョン）。読む順はバージョンが検算より先。
     BadVersion(u8),
     /// ビルド番号が自分と違う（中はコードの値）。検算・タグの後に見るのでコピーの間違いではない。
     OtherBuild { theirs: u32 },
-    /// 種別が違う（始める側のコードを読むところに返す側のコード、など）か、知らない値。
+    /// 種別が違う（始める側のコードを読むところに返す側のコード、など）か知らない値。
     WrongSide(u8),
-    /// 返す側のコードの session_id が、自分の始めた接続のものと違う。
+    /// 返す側のコードのsession_idが自分の始めた接続のものと違う。
     WrongSession { got: u32, want: u32 },
     /// 始める側の検算が合わない（コピーの間違い）。
     BadCheck,
-    /// 返す側のタグが合わない（秘密を知らない人が作った・書き換えた）。
+    /// 返す側のタグが合わない（秘密の乱数を知らない人が作った・書き換えた）。
     BadTag,
-    /// 名前が 32 B を越える・UTF-8 でない。
+    /// 名前が32 Bを越える・UTF-8でない。
     BadName,
-    /// 回線の型の印が定義の外（中はそのバイト）。
+    /// ネットワーク種別のフラグが定義の外（中はそのバイト）。
     BadNat(u8),
-    /// 候補の数が 0（接続できない）。
+    /// 候補の数が0（接続できない）。
     NoCandidates,
-    /// 候補の数が `MAX_CANDIDATES` を越える。
+    /// 候補の数が`MAX_CANDIDATES`を越える。
     TooManyCandidates(u8),
-    /// 候補の中身がおかしい（知らない種別・family、種別とアドレスの食い違い、ポート 0、重なり）。
+    /// 候補の中身がおかしい（知らない種別・family、種別とアドレスの食い違い、ポート0、重なり）。
     BadCandidate { index: u8, err: Option<CandError> },
     /// 有効期限を過ぎた。
     Expired { expires: u64, now: u64 },
-    /// 書くとき: 種別と秘密の有無が合わない（始める側なのに秘密が無い、など）。
+    /// 書くとき: 種別と秘密の乱数の有無が合わない（始める側なのに秘密の乱数が無い、など）。
     Inconsistent,
 }
 
-// ---------------- base64url（RFC 4648 §5。`=` なし） ----------------
+// ---------------- base64url（RFC 4648 §5。`=`なし） ----------------
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -170,8 +177,8 @@ pub fn b64_decode(text: &str) -> Result<Vec<u8>, CodeError> {
             n |= u32::from(v) << (18 - 6 * i);
         }
         let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        let keep = chunk.len() - 1; // 2 文字 → 1 B、3 文字 → 2 B、4 文字 → 3 B
-        // 最後の組の使わないビット（2 文字なら下 4 bit、3 文字なら下 2 bit）は 0 でなければならない。
+        let keep = chunk.len() - 1; // 2文字 → 1 B、3文字 → 2 B、4文字 → 3 B
+        // 最後のグループの使わないビット（2文字なら下4 bit、3文字なら下2 bit）は0でなければならない。
         let unused = match chunk.len() {
             2 => n & 0xFFFF,
             3 => n & 0xFF,
@@ -187,8 +194,9 @@ pub fn b64_decode(text: &str) -> Result<Vec<u8>, CodeError> {
 
 // ---------------- バイト列 ----------------
 
-/// 末尾（検算かタグ）の前までを作る。`build` はふつう `BUILD_NUMBER`、`host_public` は観戦用だけ
-/// （他の種別は None。合わなければ `Inconsistent`）。
+/// 末尾（検算かタグ）の前までを作る。
+/// `build`はふつう`BUILD_NUMBER`。
+/// `host_public`は観戦用だけ（他の種別はNone）。合わなければ`Inconsistent`。
 fn body_bytes(
     c: &Code,
     build: u32,
@@ -246,13 +254,13 @@ fn tag_of(secret: &Secret, session_id: u32, body: &[u8]) -> [u8; CODE_TAG_LEN] {
     out
 }
 
-/// 始める側のコードを書く（`c.side` は `Initiator`、`c.secret` は Some）。
+/// 始める側のコードを書く（`c.side`は`Initiator`、`c.secret`はSome）。
 pub fn write_initiator(c: &Code) -> Result<String, CodeError> {
     want_side(c, Side::Initiator)?;
     write_with_build(c, BUILD_NUMBER, None, None)
 }
 
-/// 書く関数と `c.side` が違えば書かない（取り違えを書く側で止める）。
+/// 書く関数と`c.side`が違えば書かない（取り違えを書く側で止める）。
 fn want_side(c: &Code, want: Side) -> Result<(), CodeError> {
     if c.side == want {
         Ok(())
@@ -261,28 +269,30 @@ fn want_side(c: &Code, want: Side) -> Result<(), CodeError> {
     }
 }
 
-/// 観戦用のコードを書く（`c.side` は `Spectate`、`c.secret` は Some）。形は始める側と同じで、
-/// 種別とホストの公開鍵 `host_public` が違う。
+/// 観戦用のコードを書く（`c.side`は`Spectate`、`c.secret`はSome）。
+/// 形は始める側と同じ。違うのは種別とホストの公開鍵`host_public`。
 pub fn write_spectate(c: &Code, host_public: &[u8; PUBLIC_LEN]) -> Result<String, CodeError> {
     want_side(c, Side::Spectate)?;
     write_with_build(c, BUILD_NUMBER, None, Some(host_public))
 }
 
-/// 返す側のコードを書く（`c.side` は `Responder`、`c.secret` は None）。`secret` は始める側のコードの秘密。
+/// 返す側のコードを書く（`c.side`は`Responder`、`c.secret`はNone）。`secret`は始める側のコードの秘密の乱数。
 pub fn write_reply(c: &Code, secret: &Secret) -> Result<String, CodeError> {
     want_side(c, Side::Responder)?;
     write_with_build(c, BUILD_NUMBER, Some(secret), None)
 }
 
-/// 観戦者の返しを書く（`c.side` は `SpectateReply`、`c.secret` は None）。`secret` と `c.session_id` は
-/// 観戦用のコードのもの。普通は [`write_spectate_reply_to`] を使う。
+/// 観戦者の返答を書く（`c.side`は`SpectateReply`、`c.secret`はNone）。
+/// `secret`と`c.session_id`は観戦用のコードのもの。
+/// 普通は[`write_spectate_reply_to`]を使う。
 pub fn write_spectate_reply(c: &Code, secret: &Secret) -> Result<String, CodeError> {
     want_side(c, Side::SpectateReply)?;
     write_with_build(c, BUILD_NUMBER, Some(secret), None)
 }
 
-/// 任意の種別を `build` 指定で書く。`tag_secret` は返す側・観戦者の返しだけ、`host_public` は観戦用だけ。
-/// **`BUILD_NUMBER` 以外の `build` は検査が別ビルドのコードを作るためだけ**。種別と引数が合わなければ `Inconsistent`。
+/// 任意の種別を`build`指定で書く。
+/// `tag_secret`は返す側・観戦者の返答だけ。`host_public`は観戦用だけ。
+/// **`BUILD_NUMBER`以外の`build`は検査が別ビルドのコードを作るためだけ**。種別と引数が合わなければ`Inconsistent`。
 #[doc(hidden)]
 pub fn write_with_build(
     c: &Code,
@@ -296,7 +306,7 @@ pub fn write_with_build(
             let chk = check_of(&v);
             v.extend_from_slice(&chk);
         }
-        // 秘密を持たず、末尾がタグの形（種別 2・4）。
+        // 秘密の乱数を持たず末尾がタグの形（種別2・4）。
         (Side::Responder | Side::SpectateReply, Some(secret)) => {
             let tag = tag_of(secret, c.session_id, &v);
             v.extend_from_slice(&tag);
@@ -330,13 +340,13 @@ fn le_u32(s: &[u8]) -> u32 {
     u32::from_le_bytes(a)
 }
 
-/// 前後の空白と先頭の BOM を除いた文字。
+/// 前後の空白と先頭のBOMを除いた文字。
 fn bare(text: &str) -> &str {
     text.trim().trim_start_matches('\u{FEFF}').trim()
 }
 
-/// 文字 → バイト列。前後の空白（コピペで付きがち）と先頭の BOM（U+FEFF）を除く。
-/// BOM はメモ帳で保存したファイルの先頭に付き、`str::trim` は空白と見ない。
+/// 文字 → バイト列。前後の空白（コピペで付きがち）と先頭のBOM（U+FEFF）を除く。
+/// BOMはメモ帳で保存したファイルの先頭に付く。`str::trim`はBOMを空白と見ない。
 fn text_bytes(text: &str) -> Result<Vec<u8>, CodeError> {
     let t = bare(text);
     if t.len() > MAX_CODE_CHARS {
@@ -347,7 +357,7 @@ fn text_bytes(text: &str) -> Result<Vec<u8>, CodeError> {
 
 /// バージョンと種別まで（検算・タグの前に見る）。
 fn head(b: &[u8], want: Side) -> Result<(), CodeError> {
-    // 19 B が無ければどの欄も読めない。バージョンだけは 1 B あれば先に見る（バージョン違いの短いコードを「短い」でなく「バージョンが違う」と言うため）。
+    // 19 Bが無ければどのフィールドも読み取れない。バージョンだけは1 Bあれば先に見る（バージョン違いの短いコードを「短い」でなく「バージョンが違う」と言うため）。
     if let Some(&v) = b.first()
         && v != PROTO_VER
     {
@@ -370,7 +380,7 @@ fn same_build(body: &[u8]) -> Result<(), CodeError> {
     Ok(())
 }
 
-/// 末尾を外した本文の中身を読む。観戦用は、秘密の後ろのホストの公開鍵も返す。
+/// 末尾を外した本文の中身を読む。観戦用は秘密の乱数の後ろのホストの公開鍵も返す。
 fn parse_body(
     body: &[u8],
     side: Side,
@@ -407,7 +417,7 @@ fn parse_body(
     let nat_byte = r.u8()?;
     let nat = NatMark::from_byte(nat_byte).ok_or(CodeError::BadNat(nat_byte))?;
     let rest = r.b.get(r.at..).unwrap_or(&[]);
-    // 並びを読む関数は 0 個を通すので、0 個はここで断る。
+    // 並びを読む関数は0個を通すので0個はここで断る。
     if rest.first() == Some(&0) {
         return Err(CodeError::NoCandidates);
     }
@@ -447,12 +457,12 @@ pub struct SpectateCode {
     pub host_public: [u8; PUBLIC_LEN],
 }
 
-/// 始める側のコードを読む（`now` は今の UNIX 秒）。
+/// 始める側のコードを読む（`now`は今のUNIX秒）。
 pub fn read_initiator(text: &str, now: u64) -> Result<Code, CodeError> {
     read_checked(text, Side::Initiator, now).map(|(c, _)| c)
 }
 
-/// 観戦用のコードを読む（`now` は今の UNIX 秒）。対戦の始める側のコードは `WrongSide(1)` で断る。
+/// 観戦用のコードを読む（`now`は今のUNIX秒）。対戦の始める側のコードは`WrongSide(1)`で断る。
 pub fn read_spectate(text: &str, now: u64) -> Result<SpectateCode, CodeError> {
     let (code, host_public) = read_checked(text, Side::Spectate, now)?;
     let host_public = host_public.ok_or(CodeError::Inconsistent)?;
@@ -470,7 +480,7 @@ fn read_checked(
         return Err(CodeError::TooShort);
     };
     let (body, chk) = b.split_at(split);
-    // 検算はコピーの間違いを見つけるためのもので、秘密を守るものではない（秘密はコードの中にある）。
+    // 検算はコピーの間違いを見つけるためのもの。秘密を守るものではない（秘密の乱数はコードの中にある）。
     if check_of(body) != chk {
         return Err(CodeError::BadCheck);
     }
@@ -478,7 +488,7 @@ fn read_checked(
     parse_body(body, side, now)
 }
 
-/// 返す側のコードを読む。`secret` と `session_id` は自分が始めた接続のもの（自分の始める側のコードの中身）。
+/// 返す側のコードを読む。`secret`と`session_id`は自分が始めた接続のもの（自分の始める側のコードの中身）。
 pub fn read_reply(
     text: &str,
     secret: &Secret,
@@ -488,7 +498,7 @@ pub fn read_reply(
     read_tagged(text, secret, session_id, now, Side::Responder)
 }
 
-/// 観戦者の返しを読む。`secret` と `session_id` は配る側が出した観戦用のコードのもの。読む順は `read_reply` と同じ。
+/// 観戦者の返答を読む。`secret`と`session_id`は配信する側が出した観戦用のコードのもの。読む順は`read_reply`と同じ。
 pub fn read_spectate_reply(
     text: &str,
     secret: &Secret,
@@ -528,12 +538,13 @@ fn read_tagged(
 }
 
 fn code_tag_ok(key: &AuthKey, body: &[u8], tag: &[u8]) -> bool {
-    // K を鍵にした HMAC の先頭 16 B。パケットのタグ（`AuthKey::verify`）と同じ式なので、同じ K・本文なら同じ値になる。
+    // Kを鍵にしたHMACの先頭16 B。パケットのタグ（`AuthKey::verify`）と同じ式なので同じK・本文なら同じ値になる。
     key.verify(body, tag)
 }
 
 // ---------------- 相手のコードのファイル ----------------
-// dll は接続コードを DLL のフォルダの `code\` のファイルで受け渡し、人が相手のコードを `peer_code.txt` に貼る。ここは貼られた文字を読み、取り違え（自分のコードを貼った・2 人とも同じ側を選んだ）を文字の誤りと分けて返す。
+// dllは接続コードをDLLのフォルダの`code\`のファイルで受け渡す。人が相手のコードを`peer_code.txt`に貼る。
+// ここは貼られた文字を読む。取り違え（自分のコードを貼った・2人とも同じ側を選んだ）は文字の誤りと分けて返す。
 
 #[derive(Debug, Clone, Copy)]
 pub enum Mine<'a> {
@@ -545,24 +556,25 @@ pub enum Mine<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerError {
-    /// 空白と BOM しか無い（まだ貼っていない）。
+    /// 空白とBOMしか無い（まだ貼っていない）。
     Empty,
     /// 自分のコードをそのまま貼った（相手のコードでない）。
     OwnCode,
-    /// 2 人とも始める側（相手のファイルも始める側のコードで、検算まで合う）。片方が返す側に直す。
+    /// 2人とも始める側（相手のファイルも始める側のコードで検算まで合う）。片方が返す側に直す。
     BothOffer,
-    /// 2 人とも返す側（相手のファイルも返す側のコード）。片方が始める側に直す。
+    /// 2人とも返す側（相手のファイルも返す側のコード）。片方が始める側に直す。
     BothAnswer,
-    /// そのほか（文字・長さ・検算・タグ・session・期限など。`CodeError` の理由のまま）。
+    /// そのほか（文字・長さ・検算・タグ・session・期限など。`CodeError`の理由のまま）。
     Code(CodeError),
 }
 
-/// 相手のファイルの文字 `text` を、自分の側 `mine` から読む（`now` は今の UNIX 秒）。
+/// 相手のファイルの文字`text`を自分の側`mine`から読む（`now`は今のUNIX秒）。
 /// 始める側は返す側のコードを、返す側は始める側のコードを読む。
 ///
-/// 「両方が始める側」は、種別 1 が来て始める側のコードとして検算まで合うときだけ言う（期限切れも含める。
-/// 種別の取り違えの方が先に直すこと）。検算が合わない種別 1 はコピーの間違いと見て `Code(WrongSide(1))` のまま返す。
-/// 返す側のコードは秘密が無いと検証できないので、「両方が返す側」は種別 2 を見ただけで言う。
+/// 「両方が始める側」は種別1が来て始める側のコードとして検算まで合うときだけ言う。
+/// 期限切れも含める（種別の取り違えの方が先に直すこと）。
+/// 検算が合わない種別1はコピーの間違いと見て`Code(WrongSide(1))`のまま返す。
+/// 返す側のコードは秘密の乱数が無いと検証できないので「両方が返す側」は種別2を見ただけで言う。
 pub fn read_peer(text: &str, mine: Mine<'_>, now: u64) -> Result<Code, PeerError> {
     let t = bare(text);
     if t.is_empty() {
@@ -602,8 +614,8 @@ pub fn read_peer(text: &str, mine: Mine<'_>, now: u64) -> Result<Code, PeerError
     }
 }
 
-/// 始める側のコード `init` への返す側のコードを書く。session は `init` のもの、タグの鍵は `init` の秘密から。
-/// 有効期限は `now` から `DEFAULT_TTL_SECS`。
+/// 始める側のコード`init`への返す側のコードを書く。sessionは`init`のものを使う。タグの鍵は`init`の秘密の乱数から作る。
+/// 有効期限は`now`から`DEFAULT_TTL_SECS`。
 pub fn write_reply_to(
     init: &Code,
     name: Name,
@@ -628,9 +640,10 @@ pub fn write_reply_to(
     )
 }
 
-/// 観戦用のコード `spec` への、観戦者の返し（種別 4）を書く。session とタグの鍵は `spec` のもの。
-/// 有効期限は `spec` の期限をそのまま使う。配る側は返しの期限を自分の時計で比べるので、配る側の時計で付いた値にしておけば、
-/// 観戦者の PC の時計がずれていても期限切れで捨てられない。
+/// 観戦用のコード`spec`への観戦者の返答（種別4）を書く。sessionとタグの鍵は`spec`のもの。
+/// 有効期限は`spec`の期限をそのまま使う。
+/// 配信する側は返答の期限を自分の時計で比べる。
+/// 配信する側の時計で付いた値にしておけば観戦者のPCの時計がずれていても期限切れで捨てられない。
 pub fn write_spectate_reply_to(
     spec: &Code,
     name: Name,
@@ -655,7 +668,7 @@ pub fn write_spectate_reply_to(
 
 #[cfg(test)]
 mod tests {
-    //! 期待値は crate の外（Python 3 の `hashlib` / `hmac` / `base64`）で計算した。
+    //! 期待値はcrateの外（Python 3の`hashlib` / `hmac` / `base64`）で計算した。
     use super::*;
     use crate::candidate::{CandKind, Candidate, MAX_CANDIDATES};
     use crate::nat::Symmetry;
@@ -697,86 +710,90 @@ mod tests {
     const EXPIRES: u64 = 1_800_000_000;
     const SID: u32 = 0x1122_3344;
 
-    /// 始める側の golden の本文（67 B）。build は開発用の 0（`HIGANR_BUILD_NUMBER` を付けて検査を回すと、
-    /// golden の読みはビルド違いで落ちる）。
+    /// 始める側のgoldenの本文（67 B）。
+    /// buildは開発用の0。`HIGANR_BUILD_NUMBER`を付けて検査を回すとgoldenの読みはビルド違いで落ちる。
     #[rustfmt::skip]
     const INIT_BODY: [u8; 67] = [
-        0x09,                   // バージョン 9（`PROTO_VER`）
+        0x0A,                   // バージョン10（`PROTO_VER`）
         0x00, 0x00, 0x00, 0x00, // build 0（開発用）
         0x01,                   // 始める側
         0x44, 0x33, 0x22, 0x11, // session 0x11223344
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 期限 1800000000 = 0x6B49D200
         0x02, b'a', b'b',       // 名前 "ab"
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密
-        0x06,                   // 回線の型の印: シンメトリック（bit 1）・UPnP で割り当て済み（bit 2）
-        0x02,                   // 候補 2 つ
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密の乱数
+        0x06,                   // ネットワーク種別のフラグ: シンメトリック（bit 1）・UPnPで割り当て済み（bit 2）
+        0x02,                   // 候補2つ
         0x01, 0x04, 127, 0, 0, 1, 0x99, 0xB7, // loopback 127.0.0.1:47001
         0x04, 0x06, 0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58, 0x1B, // IPv6 [2001:db8::1]:7000
     ];
     /// 検算（Python: `hashlib.sha256(INIT_BODY).digest()[:4]`）。
-    const INIT_CHECK: [u8; 4] = [0x7E, 0xF0, 0xB0, 0x53];
+    const INIT_CHECK: [u8; 4] = [0xA5, 0xE3, 0xD6, 0x08];
     /// 文字（Python: `base64.urlsafe_b64encode(INIT_BODY + INIT_CHECK).rstrip(b"=")`）。
-    const INIT_TEXT: &str = "CQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG37wsFM";
-    /// バージョン 8 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
+    const INIT_TEXT: &str = "CgAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG6Xj1gg";
+    /// バージョン9の始める側のコードの文字（形はバージョン10と同じで、先頭の1 Bと検算だけが違う）。
+    const INIT_TEXT_V9: &str = "CQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG37wsFM";
+    /// バージョン8の始める側のコードの文字（形はバージョン10と同じで、先頭の1 Bと検算だけが違う）。
     const INIT_TEXT_V8: &str = "CAAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7L7D7s";
-    /// バージョン 7 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
+    /// バージョン7の始める側のコードの文字（形はバージョン10と同じで、先頭の1 Bと検算だけが違う）。
     const INIT_TEXT_V7: &str = "BwAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG6w7Or0";
-    /// バージョン 6 の始める側のコードの文字（形はバージョン 9 と同じで、先頭の 1 B と検算だけが違う）。
+    /// バージョン6の始める側のコードの文字（形はバージョン10と同じで、先頭の1 Bと検算だけが違う）。
     const INIT_TEXT_V6: &str = "BgAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG7UpLvs";
-    /// バージョン 5 の始める側のコードの文字（回線の型の印の 1 B が無い形）。
+    /// バージョン5の始める側のコードの文字（ネットワーク種別のフラグの1 Bが無い形）。
     const INIT_TEXT_V5: &str = "BQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgb7NLang";
-    /// バージョン 4 の始める側のコードの文字（build の 4 B が無い形）。
+    /// バージョン4の始める側のコードの文字（buildの4 Bが無い形）。
     const INIT_TEXT_V4: &str =
         "BAFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtTz18H";
-    /// ビルド 403920 の始める側のコードの文字（`INIT_BODY` の build だけを変えて検算を付け直した）。
-    const INIT_TEXT_B403920: &str = "CdApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYG32XwGY";
-    /// バージョン 3 の始める側のコードの文字。
+    /// ビルド403920の始める側のコードの文字（`INIT_BODY`のbuildだけを変えて検算を付け直した）。
+    const INIT_TEXT_B403920: &str = "CtApBgABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYCAQR_AAABmbcEBiABDbgAAAAAAAAAAAAAAAFYGzKwsTY";
+    /// バージョン3の始める側のコードの文字。
     const INIT_TEXT_V3: &str =
         "AwFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtQIsU3";
-    /// バージョン 2 の始める側のコードの文字。
+    /// バージョン2の始める側のコードの文字。
     const INIT_TEXT_V2: &str =
         "AgFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBv0WQDS";
-    /// バージョン 1 の始める側のコードの文字。
+    /// バージョン1の始める側のコードの文字。
     const INIT_TEXT_V1: &str =
         "AQFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBs_wJYi";
-    /// バージョン 0 の始める側のコードの文字。
+    /// バージョン0の始める側のコードの文字。
     const INIT_TEXT_V0: &str =
         "AAFEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBsEJ6ZI";
 
-    /// 返す側の golden の本文（31 B）。
+    /// 返す側のgoldenの本文（31 B）。
     #[rustfmt::skip]
     const REPLY_BODY: [u8; 31] = [
-        0x09, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン 9・build 0・返す側
+        0x0A, 0x00, 0x00, 0x00, 0x00, 0x02, // バージョン10・build 0・返す側
         0x44, 0x33, 0x22, 0x11,
         0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00,
         0x02, b'c', b'd',
-        0x01,                   // 回線の型の印: シンメトリックでない・UPnP なし
+        0x01,                   // ネットワーク種別のフラグ: シンメトリックでない・UPnPなし
         0x01,
         0x02, 0x04, 192, 168, 0, 2, 0x59, 0x1B, // host 192.168.0.2:7001
     ];
-    /// タグ（Python: `hmac.new(K, REPLY_BODY, sha256).digest()[:16]`。K は `auth.rs` の `K_GOLDEN`）。
+    /// タグ（Python: `hmac.new(K, REPLY_BODY, sha256).digest()[:16]`。Kは`auth.rs`の`K_GOLDEN`）。
     const REPLY_TAG: [u8; 16] = [
-        0xE2, 0x9F, 0x0D, 0x56, 0x93, 0x43, 0xBE, 0xCF, 0x7B, 0x7D, 0xDB, 0x87, 0xA3, 0xEE, 0x2A,
-        0xE1,
+        0x9A, 0x91, 0x13, 0xB9, 0xA2, 0x65, 0x2F, 0x38, 0x02, 0x08, 0x56, 0xEA, 0xA2, 0xFE, 0xE9,
+        0x8A,
     ];
-    const REPLY_TEXT: &str = "CQAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-KfDVaTQ77Pe33bh6PuKuE";
-    /// バージョン 8 の返す側のコードの文字。
+    const REPLY_TEXT: &str = "CgAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG5qRE7miZS84AghW6qL-6Yo";
+    /// バージョン9の返す側のコードの文字。
+    const REPLY_TEXT_V9: &str = "CQAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-KfDVaTQ77Pe33bh6PuKuE";
+    /// バージョン8の返す側のコードの文字。
     const REPLY_TEXT_V8: &str = "CAAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG-CbB6cuNI4993i8rZHhpiw";
-    /// バージョン 7 の返す側のコードの文字。
+    /// バージョン7の返す側のコードの文字。
     const REPLY_TEXT_V7: &str = "BwAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6ShM8nFqtf1BSjgkXrB2Y8";
-    /// バージョン 6 の返す側のコードの文字。
+    /// バージョン6の返す側のコードの文字。
     const REPLY_TEXT_V6: &str = "BgAAAAACRDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG6EIdoTV8ABRMEBjMpbG2KU";
-    /// バージョン 5 の返す側のコードの文字。
+    /// バージョン5の返す側のコードの文字。
     const REPLY_TEXT_V5: &str = "BQAAAAACRDMiEQDSSWsAAAAAAmNkAQIEwKgAAlkbNIuZlsf0uRw7CxUvTKwQuA";
-    /// バージョン 4 の返す側のコードの文字。
+    /// バージョン4の返す側のコードの文字。
     const REPLY_TEXT_V4: &str = "BAJEMyIRANJJawAAAAACY2QBAgTAqAACWRvhJKMiyeMasvTBDRmqSi4J";
-    /// バージョン 3 の返す側のコードの文字。
+    /// バージョン3の返す側のコードの文字。
     const REPLY_TEXT_V3: &str = "AwJEMyIRANJJawAAAAACY2QBAgTAqAACWRtancCpZeKsY2fXVx9TwLSe";
-    /// バージョン 2 の返す側のコードの文字。
+    /// バージョン2の返す側のコードの文字。
     const REPLY_TEXT_V2: &str = "AgJEMyIRANJJawAAAAACY2QBAgTAqAACWRuwURwTi--NFss_V-Skc_9p";
-    /// バージョン 1 の返す側のコードの文字。
+    /// バージョン1の返す側のコードの文字。
     const REPLY_TEXT_V1: &str = "AQJEMyIRANJJawAAAAACY2QBAgTAqAACWRv1ZZSmOZlbq3_AOVTJo3x7";
-    /// バージョン 0 の返す側のコードの文字。
+    /// バージョン0の返す側のコードの文字。
     const REPLY_TEXT_V0: &str = "AAJEMyIRANJJawAAAAACY2QBAgTAqAACWRsWcDWIpgqixSIkh5agOXfx";
 
     fn init_code() -> Code {
@@ -862,8 +879,8 @@ mod tests {
         assert_eq!(b64_decode("-/8"), Err(CodeError::BadChar { pos: 1 }));
         assert_eq!(b64_decode("Zm9 v"), Err(CodeError::BadLength));
         assert_eq!(b64_decode("Zm9vY"), Err(CodeError::BadLength));
-        assert_eq!(b64_decode("Zh"), Err(CodeError::NonCanonical)); // "Zg" と同じ 1 B
-        assert_eq!(b64_decode("Zm9"), Err(CodeError::NonCanonical)); // "Zm8" と同じ 2 B
+        assert_eq!(b64_decode("Zh"), Err(CodeError::NonCanonical)); // "Zg" と同じ1 B
+        assert_eq!(b64_decode("Zm9"), Err(CodeError::NonCanonical)); // "Zm8" と同じ2 B
     }
 
     #[test]
@@ -888,30 +905,30 @@ mod tests {
         );
     }
 
-    /// IPv6 を入れた自分の候補（世界に通じる IPv6 ＋ LAN ＋ 外側 IPv4）の始める側のコードの本文（75 B）。
+    /// IPv6を含む自分の候補（世界に通じるIPv6 ＋ LAN ＋ 外側IPv4）の始める側のコードの本文（75 B）。
     /// 候補の並びは優先の順（IPv6 → LAN → 外側）。
     #[rustfmt::skip]
     const DUAL_BODY: [u8; 75] = [
-        0x09, 0x00, 0x00, 0x00, 0x00, // バージョン 9・build 0
+        0x0A, 0x00, 0x00, 0x00, 0x00, // バージョン10・build 0
         0x01, 0x44, 0x33, 0x22, 0x11, 0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 始める側・session・期限
         0x02, 0x61, 0x62,                                                                   // 名前 "ab"
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密
-        0x06,                                                                               // 回線の型の印
-        0x03,                                                                               // 候補 3 つ
-        0x04, 0x06, 0x24, 0x00, 0xCB, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x99, 0xB7,   // 種別 4・family 6・[2400:cb00::7]:47001
-        0x02, 0x04, 0xC0, 0xA8, 0x00, 0x02, 0x99, 0xB7,                                     // 種別 2・192.168.0.2:47001
-        0x03, 0x04, 0xCB, 0x00, 0x71, 0x05, 0x99, 0xB7,                                     // 種別 3・203.0.113.5:47001
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // 秘密の乱数
+        0x06,                                                                               // ネットワーク種別のフラグ
+        0x03,                                                                               // 候補3つ
+        0x04, 0x06, 0x24, 0x00, 0xCB, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x99, 0xB7,   // 種別4・family 6・[2400:cb00::7]:47001
+        0x02, 0x04, 0xC0, 0xA8, 0x00, 0x02, 0x99, 0xB7,                                     // 種別2・192.168.0.2:47001
+        0x03, 0x04, 0xCB, 0x00, 0x71, 0x05, 0x99, 0xB7,                                     // 種別3・203.0.113.5:47001
     ];
     /// 検算（Python: `hashlib.sha256(DUAL_BODY).digest()[:4]`）。
-    const DUAL_CHECK: [u8; 4] = [0x62, 0x1F, 0x8A, 0x80];
+    const DUAL_CHECK: [u8; 4] = [0x12, 0x74, 0x56, 0xA9];
     /// 文字（Python: `base64.urlsafe_b64encode(DUAL_BODY + DUAL_CHECK).rstrip(b"=")`）。
-    const DUAL_TEXT: &str = "CQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3Yh-KgA";
+    const DUAL_TEXT: &str = "CgAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwYDBAYkAMsAAAAAAAAAAAAAAAAHmbcCBMCoAAKZtwMEywBxBZm3EnRWqQ";
 
     #[test]
     fn a_code_with_a_global_ipv6_candidate_keeps_the_version_2_shape_and_round_trips() {
         let own = |extra: &[&str]| {
             let mut c = Candidates::EMPTY;
-            // 並べる順をわざと優先の逆にする（`Candidates` が優先の順に直す）。
+            // 並べる順をわざと優先の逆にする（`Candidates`が優先の順に直す）。
             for a in extra {
                 c.push(Candidate::guess(sa(a)).unwrap()).unwrap();
             }
@@ -963,7 +980,7 @@ mod tests {
             read_reply(&format!("\u{FEFF}{REPLY_TEXT}"), &secret(), SID, EXPIRES),
             Ok(reply_code())
         );
-        // 途中の BOM（UTF-8 で 3 B）。文字の数が 4 で割って 1 余るので、長さのガードが文字のガードより先に落とす。
+        // 途中のBOM（UTF-8で3 B）。文字の数が4で割って1余るので長さのガードが文字のガードより先に落とす。
         assert!(matches!(
             read_initiator(
                 &format!("{}\u{FEFF}{}", &INIT_TEXT[..8], &INIT_TEXT[8..]),
@@ -971,12 +988,12 @@ mod tests {
             ),
             Err(CodeError::BadChar { pos: 8 } | CodeError::BadLength)
         ));
-        // 末尾の BOM もコピーの間違いの文字（先頭だけを許す）。
+        // 末尾のBOMもコピーの間違いの文字（先頭だけを許す）。
         assert!(matches!(
             read_initiator(&format!("{INIT_TEXT}\u{FEFF}"), 0),
             Err(CodeError::BadChar { .. } | CodeError::BadLength)
         ));
-        // 長さのガードに頼らない形（観戦用で文字の数が 4 の倍数のもの + BOM の 3 B）でも、末尾の BOM は文字のガードで落ちる。
+        // 長さのガードに頼らない形（観戦用で文字の数が4の倍数のもの + BOM の3 B）でも末尾のBOMは文字のガードで落ちる。
         let aligned = write_spectate(
             &Code {
                 name: Name::new("abcd"),
@@ -1006,7 +1023,7 @@ mod tests {
             format!("{}\n{}", &INIT_TEXT[..40], &INIT_TEXT[40..]),
             format!("{}\r\n{}", &INIT_TEXT[..40], &INIT_TEXT[40..]),
         ] {
-            // LF 1 文字なら `BadLength`、CRLF なら `BadChar`。
+            // LF 1文字なら`BadLength`、CRLFなら`BadChar`。
             assert!(
                 matches!(
                     read_initiator(&t, 0),
@@ -1017,7 +1034,7 @@ mod tests {
         }
     }
 
-    /// 本文と検算を連結して末尾の `n` B を落とした文字（文字の切り口が正準のまま、検算だけが合わなくなる）。
+    /// 本文と検算を連結して末尾の`n` Bを落とした文字（文字の切り口が正準のまま検算だけが合わなくなる）。
     fn without_last_bytes(body: &[u8], check: &[u8], n: usize) -> String {
         let mut v = body.to_vec();
         v.extend_from_slice(check);
@@ -1033,7 +1050,7 @@ mod tests {
         }
     }
 
-    /// golden と別の始める側のコード（別の秘密・session）。
+    /// goldenと別の始める側のコード（別の秘密・session）。
     fn other_init_text(expires: u64) -> String {
         let mut c = init_code();
         c.session_id = SID ^ 0xFF;
@@ -1084,7 +1101,7 @@ mod tests {
             read_peer(&other_init_text(EXPIRES - 1), mine_offer(), now),
             Err(PeerError::BothOffer)
         );
-        // 種別 1 だが検算が合わない（コピーの間違い）: 言い切らない。
+        // 種別1だが検算が合わない（コピーの間違い）: 言い切らない。
         let mut v = INIT_BODY.to_vec();
         v[24] ^= 0x04;
         v.extend_from_slice(&INIT_CHECK);
@@ -1158,36 +1175,38 @@ mod tests {
         );
     }
 
-    /// 観戦用のコードのホストの公開鍵の標本（40 41 … 5F。欄のずれ・逆順が文字で見えるように）。
+    /// 観戦用のコードのホストの公開鍵のサンプル（40 41 … 5F。フィールドのずれ・逆順が文字で見えるように）。
     const HOST_PUBLIC: [u8; 32] = [
         0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E,
         0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D,
         0x5E, 0x5F,
     ];
-    /// 観戦用のコードの文字（Python: INIT_BODY の種別の 1 B を 3 にし、秘密の後ろに `HOST_PUBLIC` の 32 B を挟んで
-    /// 検算を付け、`base64.urlsafe_b64encode(..).rstrip(b"=")`）。
-    const SPECTATE_TEXT: &str = "CQAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbOURr3g";
-    /// バージョン 8 の観戦用のコードの文字。
+    /// 観戦用のコードの文字。
+    /// Python: INIT_BODYの種別の1 Bを3にして秘密の乱数の後ろに`HOST_PUBLIC`の32 Bを挟み、検算を付けて`base64.urlsafe_b64encode(..).rstrip(b"=")`。
+    const SPECTATE_TEXT: &str = "CgAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbWmcUww";
+    /// バージョン9の観戦用のコードの文字。
+    const SPECTATE_TEXT_V9: &str = "CQAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbOURr3g";
+    /// バージョン8の観戦用のコードの文字。
     const SPECTATE_TEXT_V8: &str = "CAAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbbnxN_Q";
-    /// バージョン 7 の観戦用のコードの文字。
+    /// バージョン7の観戦用のコードの文字。
     const SPECTATE_TEXT_V7: &str = "BwAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbhcFBcQ";
-    /// バージョン 6 の観戦用のコードの文字。
+    /// バージョン6の観戦用のコードの文字。
     const SPECTATE_TEXT_V6: &str = "BgAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fBgIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgbKz_PJg";
-    /// バージョン 5 の観戦用のコードの文字。
+    /// バージョン5の観戦用のコードの文字。
     const SPECTATE_TEXT_V5: &str = "BQAAAAADRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0OD0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBsHA7Ws";
-    /// バージョン 4 の観戦用のコードの文字。
+    /// バージョン4の観戦用のコードの文字。
     const SPECTATE_TEXT_V4: &str =
         "BANEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtkj-kS";
-    /// バージョン 3 の観戦用のコードの文字。
+    /// バージョン3の観戦用のコードの文字。
     const SPECTATE_TEXT_V3: &str =
         "AwNEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtfJGw8";
-    /// バージョン 2 の観戦用のコードの文字。
+    /// バージョン2の観戦用のコードの文字。
     const SPECTATE_TEXT_V2: &str =
         "AgNEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBvvJejz";
-    /// バージョン 1 の観戦用のコードの文字。
+    /// バージョン1の観戦用のコードの文字。
     const SPECTATE_TEXT_V1: &str =
         "AQNEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBtHoq-G";
-    /// バージョン 0 の観戦用のコードの文字。
+    /// バージョン0の観戦用のコードの文字。
     const SPECTATE_TEXT_V0: &str =
         "AANEMyIRANJJawAAAAACYWIAAQIDBAUGBwgJCgsMDQ4PAgEEfwAAAZm3BAYgAQ24AAAAAAAAAAAAAAABWBu_oMCs";
 
@@ -1200,7 +1219,7 @@ mod tests {
 
     #[test]
     fn version_0_codes_are_refused_with_their_version() {
-        // 観戦用は中身にホストの公開鍵が付くので、比べるのは中身の `Code` だけ。
+        // 観戦用は中身にホストの公開鍵が付くので比べるのは中身の`Code`だけ。
         let read_spectate = |t: &str, now: u64| read_spectate(t, now).map(|s| s.code);
         let old = Err(CodeError::BadVersion(0));
         assert_eq!(read_initiator(INIT_TEXT_V0, EXPIRES), old);
@@ -1226,7 +1245,7 @@ mod tests {
         assert_eq!(read_initiator(INIT_TEXT_V3, EXPIRES), v3);
         assert_eq!(read_reply(REPLY_TEXT_V3, &secret(), SID, EXPIRES), v3);
         assert_eq!(read_spectate(SPECTATE_TEXT_V3, EXPIRES), v3);
-        // バージョンの 1 B は build の欄より前なので、バージョン 4 の短い形でも「短い」でなく「バージョンが違う」。
+        // バージョンの1 Bはbuildのフィールドより前なのでバージョン4の短い形でも「短い」でなく「バージョンが違う」。
         let v4 = Err(CodeError::BadVersion(4));
         assert_eq!(read_initiator(INIT_TEXT_V4, EXPIRES), v4);
         assert_eq!(read_reply(REPLY_TEXT_V4, &secret(), SID, EXPIRES), v4);
@@ -1235,7 +1254,7 @@ mod tests {
             read_peer(INIT_TEXT_V4, Mine::Answer { own_text: None }, EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(4)))
         );
-        // バージョン 5（回線の型の印が無い形）は、文字が合っていてもバージョンで断る（印の 1 B ぶん欄がずれるので、読み進めない）。
+        // バージョン5（ネットワーク種別のフラグが無い形）は文字が合っていてもバージョンで断る（フラグの1 Bぶんフィールドがずれるので読み進めない）。
         let v5 = Err(CodeError::BadVersion(5));
         assert_eq!(read_initiator(INIT_TEXT_V5, EXPIRES), v5);
         assert_eq!(read_reply(REPLY_TEXT_V5, &secret(), SID, EXPIRES), v5);
@@ -1244,7 +1263,7 @@ mod tests {
             read_peer(INIT_TEXT_V5, Mine::Answer { own_text: None }, EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(5)))
         );
-        // バージョン 6 は形が同じでも、HELLO の +3 の bit2 を読めない相手なのでバージョンで断る。
+        // バージョン6は形が同じでもHELLOの +3のbit2を読み取れない相手なのでバージョンで断る。
         let v6 = Err(CodeError::BadVersion(6));
         assert_eq!(read_initiator(INIT_TEXT_V6, EXPIRES), v6);
         assert_eq!(read_reply(REPLY_TEXT_V6, &secret(), SID, EXPIRES), v6);
@@ -1253,7 +1272,7 @@ mod tests {
             read_peer(REPLY_TEXT_V6, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(6)))
         );
-        // バージョン 7 も形は同じだが、MENU の末尾の 4 B を持たない相手なのでバージョンで断る。
+        // バージョン7も形は同じだがMENUの末尾の4 Bを持たない相手なのでバージョンで断る。
         let v7 = Err(CodeError::BadVersion(7));
         assert_eq!(read_initiator(INIT_TEXT_V7, EXPIRES), v7);
         assert_eq!(read_reply(REPLY_TEXT_V7, &secret(), SID, EXPIRES), v7);
@@ -1262,7 +1281,7 @@ mod tests {
             read_peer(REPLY_TEXT_V7, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(7)))
         );
-        // バージョン 8 も形は同じだが、観戦の ACK の形（受け取れた範囲の長さ）が違う相手なのでバージョンで断る。
+        // バージョン8も形は同じだが観戦のACKの形（受け取れた範囲の長さ）が違う相手なのでバージョンで断る。
         let v8 = Err(CodeError::BadVersion(8));
         assert_eq!(read_initiator(INIT_TEXT_V8, EXPIRES), v8);
         assert_eq!(read_reply(REPLY_TEXT_V8, &secret(), SID, EXPIRES), v8);
@@ -1270,6 +1289,15 @@ mod tests {
         assert_eq!(
             read_peer(REPLY_TEXT_V8, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::BadVersion(8)))
+        );
+        // バージョン9も形は同じだがHELLO_ACK・SPECTATE_STREAM・SPECTATE_ACKの形が違う相手なのでバージョンで断る。
+        let v9 = Err(CodeError::BadVersion(9));
+        assert_eq!(read_initiator(INIT_TEXT_V9, EXPIRES), v9);
+        assert_eq!(read_reply(REPLY_TEXT_V9, &secret(), SID, EXPIRES), v9);
+        assert_eq!(read_spectate(SPECTATE_TEXT_V9, EXPIRES), v9);
+        assert_eq!(
+            read_peer(REPLY_TEXT_V9, mine_offer(), EXPIRES),
+            Err(PeerError::Code(CodeError::BadVersion(9)))
         );
         assert_eq!(read_initiator(INIT_TEXT, EXPIRES), Ok(init_code()));
         assert_eq!(read_spectate(SPECTATE_TEXT, EXPIRES), Ok(spectate_code()));
@@ -1299,9 +1327,9 @@ mod tests {
             read_peer(&reply, mine_offer(), EXPIRES),
             Err(PeerError::Code(CodeError::OtherBuild { theirs: other }))
         );
-        // コピーの間違い（検算・タグが合わない）は、ビルドが違っても `BadCheck`・`BadTag`（ビルドは後で見る）。
+        // コピーの間違い（検算・タグが合わない）はビルドが違っても`BadCheck`・`BadTag`（ビルドは後で見る）。
         let mut b = INIT_BODY;
-        b[1] = 0x50; // build を 0x50 に（検算はバージョン 0 の build のまま）
+        b[1] = 0x50; // buildを0x50に（検算はバージョン0のbuildのまま）
         let mut v = b.to_vec();
         v.extend_from_slice(&INIT_CHECK);
         assert_eq!(
@@ -1368,9 +1396,9 @@ mod tests {
                 "{what}のコードのバージョンとパケットのバージョン"
             );
         }
-        // 書いた物のバージョンが今の数（9）である。数を上げるなら golden も一緒に直す。
-        assert_eq!(packet_ver, 9);
-        // ビルド番号も、コードと HELLO で同じ数（`BUILD_NUMBER`）。コードは offset 1、HELLO は本文の +46。
+        // 書いた物のバージョンが今の数（10）である。数を上げるならgoldenも一緒に直す。
+        assert_eq!(packet_ver, 10);
+        // ビルド番号もコードとHELLOで同じ数（`BUILD_NUMBER`）。コードはoffset 1、HELLOは本文の +46。
         for (what, b) in [
             ("始める側", &code),
             ("観戦用", &spectate),
@@ -1396,7 +1424,7 @@ mod tests {
                 host_public: HOST_PUBLIC
             })
         );
-        // 公開鍵は秘密の直後（本文の 37 B 目から 32 B）。
+        // 公開鍵は秘密の直後（本文の37 B目から32 B）。
         let b = b64_decode(SPECTATE_TEXT).unwrap();
         assert_eq!(&b[37..69], &HOST_PUBLIC[..]);
         assert_ne!(SPECTATE_TEXT, INIT_TEXT);
@@ -1471,38 +1499,38 @@ mod tests {
             write_with_build(&spectate_code(), 0, None, None),
             Err(CodeError::Inconsistent)
         );
-        // 種別の 1 B を 3 → 1 に書き換えても、検算が合わず始める側のコードとして読めない。
+        // 種別の1 Bを3 → 1に書き換えても検算が合わず始める側のコードとして読み取れない。
         let mut bytes = INIT_BODY.to_vec();
         bytes[5] = 3;
         let mut forged = bytes.clone();
         forged[5] = 1;
-        forged.extend_from_slice(&check_of(&bytes)); // 3 のときの検算のまま
+        forged.extend_from_slice(&check_of(&bytes)); // 3のときの検算のまま
         assert_eq!(
             read_initiator(&b64_encode(&forged), EXPIRES),
             Err(CodeError::BadCheck)
         );
     }
 
-    /// 観戦者の返し（種別 4）の golden の本文（`REPLY_BODY` の種別の 1 B だけを 4 にした 31 B）。
+    /// 観戦者の返答（種別4）のgoldenの本文（`REPLY_BODY`の種別の1 Bだけを4にした31 B）。
     #[rustfmt::skip]
     const SPECTATE_REPLY_BODY: [u8; 31] = [
-        0x09, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン 9・build 0・観戦者の返し
-        0x44, 0x33, 0x22, 0x11, // 観戦用のコードの session 0x11223344
-        0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 期限 1800000000
+        0x0A, 0x00, 0x00, 0x00, 0x00, 0x04, // バージョン10・build 0・観戦者の返答
+        0x44, 0x33, 0x22, 0x11, // 観戦用のコードのsession 0x11223344
+        0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00, // 期限1800000000
         0x02, b'c', b'd',       // 名前 "cd"
-        0x01,                   // 回線の型の印
-        0x01,                   // 候補 1 つ
+        0x01,                   // ネットワーク種別のフラグ
+        0x01,                   // 候補1つ
         0x02, 0x04, 192, 168, 0, 2, 0x59, 0x1B, // host 192.168.0.2:7001
     ];
-    /// タグ（Python: `hmac.new(K, SPECTATE_REPLY_BODY, sha256).digest()[:16]`。K は観戦用のコードの秘密と
-    /// session から導く。`auth.rs` の `K_GOLDEN`）。
+    /// タグ（Python: `hmac.new(K, SPECTATE_REPLY_BODY, sha256).digest()[:16]`）。
+    /// Kは観戦用のコードの秘密の乱数とsessionから導く（`auth.rs`の`K_GOLDEN`）。
     const SPECTATE_REPLY_TAG: [u8; 16] = [
-        0x67, 0x30, 0x20, 0x5A, 0x37, 0xA9, 0x84, 0x15, 0x3B, 0x25, 0xAE, 0x31, 0x41, 0xE9, 0x04,
-        0x2F,
+        0xF3, 0x58, 0xC4, 0xF6, 0x24, 0x7C, 0x27, 0x8D, 0x07, 0xAF, 0x58, 0x44, 0x4C, 0xAE, 0x29,
+        0x73,
     ];
     /// 文字（Python: `base64.urlsafe_b64encode(SPECTATE_REPLY_BODY + SPECTATE_REPLY_TAG).rstrip(b"=")`）。
     const SPECTATE_REPLY_TEXT: &str =
-        "CQAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG2cwIFo3qYQVOyWuMUHpBC8";
+        "CgAAAAAERDMiEQDSSWsAAAAAAmNkAQECBMCoAAJZG_NYxPYkfCeNB69YREyuKXM";
 
     fn spectate_reply_code() -> Code {
         Code {
@@ -1541,7 +1569,7 @@ mod tests {
             read_reply(t4, &secret(), SID, EXPIRES),
             Err(CodeError::WrongSide(4))
         );
-        // 秘密が違っても session が違っても、種別が先。
+        // 秘密の乱数が違ってもsessionが違っても種別が先。
         assert_eq!(
             read_reply(t4, &wrong_secret, SID ^ 1, EXPIRES),
             Err(CodeError::WrongSide(4))
@@ -1572,7 +1600,7 @@ mod tests {
             read_spectate_reply(SPECTATE_TEXT, &secret(), SID, EXPIRES),
             Err(CodeError::WrongSide(3))
         );
-        // 種別の 1 B を 4 → 2 に書き換えても、タグが種別を含むので返す側のコードとして偽れない。
+        // 種別の1 Bを4 → 2に書き換えてもタグが種別を含むので返す側のコードとして偽れない。
         let mut forged = SPECTATE_REPLY_BODY.to_vec();
         forged[5] = 2;
         forged.extend_from_slice(&SPECTATE_REPLY_TAG);
@@ -1637,7 +1665,7 @@ mod tests {
             read_spectate_reply(&b64_encode(&v), &secret(), SID, now),
             Err(CodeError::BadTag)
         );
-        // 期限: 1 秒過ぎで断り、ちょうどは読める。タグが悪いときはタグが先。
+        // 期限: 1秒過ぎると断る。ちょうどなら読み取れる。タグが悪いときはタグが先。
         assert_eq!(
             read_spectate_reply(t, &secret(), SID, EXPIRES + 1),
             Err(CodeError::Expired {
@@ -1650,7 +1678,7 @@ mod tests {
             read_spectate_reply(&b64_encode(&v), &secret(), SID, EXPIRES + 1),
             Err(CodeError::BadTag)
         );
-        // バージョン違い（タグも合わなくなるが、バージョンが先）。
+        // バージョン違い（タグも合わなくなるがバージョンが先）。
         for ver in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
             let mut v = SPECTATE_REPLY_BODY.to_vec();
             v[0] = ver;
@@ -1680,7 +1708,7 @@ mod tests {
             read_spectate_reply(&signed(&none), &secret(), SID, now),
             Err(CodeError::NoCandidates)
         );
-        // 付け直したタグが合っていれば読める（上の毒がタグでなく本文の理由で落ちている証拠）。
+        // 付け直したタグが合っていれば読み取れる（上の不正な入力がタグでなく本文の理由で落ちている証拠）。
         assert!(read_spectate_reply(&signed(&SPECTATE_REPLY_BODY), &secret(), SID, now).is_ok());
         let mut bad = t.to_string();
         bad.replace_range(10..11, "+");
@@ -1709,7 +1737,7 @@ mod tests {
             (Side::SpectateReply, SID, None, cands, EXPIRES)
         );
         assert_eq!(c.name, Name::new("ef"));
-        // 期限は配る側の時計で付いた値（配る側のコードの期限）なので、配る側の時計で比べて期限まで通り、過ぎたら捨てる。
+        // 期限は配信する側の時計で付いた値（配信する側のコードの期限）。そのため配信する側の時計で比べて期限までは通り、過ぎたら捨てる。
         assert!(read_spectate_reply(&t, &secret(), SID, EXPIRES).is_ok());
         assert_eq!(
             read_spectate_reply(&t, &secret(), SID, EXPIRES + 1),
@@ -1747,7 +1775,7 @@ mod tests {
         }
     }
 
-    /// 本文を少し変え、末尾を付け直して文字にする（毒が狙ったガードまで届くように）。
+    /// 本文を少し変えて末尾を付け直し、文字にする（不正な入力が狙ったガードまで届くように）。
     fn init_text_of(body: &[u8]) -> String {
         let mut v = body.to_vec();
         v.extend_from_slice(&check_of(body));
@@ -1760,9 +1788,9 @@ mod tests {
         let mut t = INIT_TEXT.to_string();
         t.replace_range(10..11, "+");
         assert_eq!(read_initiator(&t, now), Err(CodeError::BadChar { pos: 10 }));
-        // バージョンの 1 B だけ合う先頭（"CQAA"）は、バージョン違いでなく短い。
-        assert_eq!(read_initiator("CQAA", now), Err(CodeError::TooShort));
-        // バージョン 0 の先頭（"AAFE"）は、短くてもバージョン違いが先。
+        // バージョンの1 Bだけ合う先頭（"CgAA"）はバージョン違いでなく短い。
+        assert_eq!(read_initiator("CgAA", now), Err(CodeError::TooShort));
+        // バージョン0の先頭（"AAFE"）は短くてもバージョン違いが先。
         assert_eq!(read_initiator("AAFE", now), Err(CodeError::BadVersion(0)));
         assert_eq!(read_initiator("", now), Err(CodeError::TooShort));
         assert_eq!(
@@ -1782,7 +1810,7 @@ mod tests {
             read_initiator(&init_text_of(&INIT_BODY[..66]), now),
             Err(CodeError::TooShort)
         );
-        // バージョン違い（検算は付け直してあるので、バージョンのガードだけが落とす）。
+        // バージョン違い（検算は付け直してあるのでバージョンのガードだけが落とす）。
         for v in [0u8, 1, 2, 3, 4, 5, 6, 7, 8] {
             let mut b = INIT_BODY;
             b[0] = v;
@@ -1945,7 +1973,7 @@ mod tests {
         assert_eq!(read_initiator(&long, now), Err(CodeError::BadLength));
     }
 
-    /// 型の印の 1 B の位置（始める側は秘密の後ろ、返す側は名前の後ろ）。印は検算・タグの内側にあるので、書き換えるとコピーの間違いと見える。
+    /// ネットワーク種別のフラグの1 Bの位置（始める側は秘密の乱数の後ろ。返す側は名前の後ろ）。フラグは検算・タグの内側にあるので書き換えるとコピーの間違いに見える。
     #[test]
     fn the_nat_mark_round_trips_in_every_kind_of_code_and_undefined_bytes_are_refused() {
         let now = EXPIRES;
@@ -1978,7 +2006,7 @@ mod tests {
             let t = write_spectate(&spec, &HOST_PUBLIC).unwrap();
             assert_eq!(read_spectate(&t, now).map(|s| s.code), Ok(spec), "{nat:?}");
         }
-        // 印が違えば文字も違う（印がコードの本文に入っている）。
+        // フラグが違えば文字も違う（フラグがコードの本文に入っている）。
         let a = write_initiator(&init_code()).unwrap();
         let b = write_initiator(&Code {
             nat: NatMark::UNKNOWN,
@@ -1986,7 +2014,7 @@ mod tests {
         })
         .unwrap();
         assert_ne!(a, b);
-        // 定義の外の印は、検算・タグを付け直しても断る（型の値 3、定義の外の bit）。
+        // 定義の外のフラグは検算・タグを付け直しても断る（ネットワーク種別の値3と定義の外のbit）。
         for bad in [0x03u8, 0x07, 0x08, 0x10, 0x80, 0xFF] {
             let mut ib = INIT_BODY;
             ib[37] = bad;
@@ -2003,7 +2031,7 @@ mod tests {
                 "返す側 {bad:#x}"
             );
         }
-        // 位置の前提（始める側 37 B 目・返す側 21 B 目が印）。
+        // 位置の前提（始める側37 B目・返す側21 B目がフラグ）。
         assert_eq!(INIT_BODY[37], 0x06);
         assert_eq!(REPLY_BODY[21], 0x01);
     }
@@ -2140,7 +2168,7 @@ mod tests {
             let n = r.below(120) as usize;
             let mut b: Vec<u8> = (0..n).map(|_| r.next() as u8).collect();
             if i % 2 == 0 && n >= 6 {
-                // バージョン・ビルドと種別だけは通して、中身を読む所まで届かせる（検算も付け直す）。
+                // バージョン・ビルドと種別だけは通して中身を読む所まで届かせる（検算も付け直す）。
                 b[0] = PROTO_VER;
                 b[1..5].copy_from_slice(&BUILD_NUMBER.to_le_bytes());
                 b[5] = 1;

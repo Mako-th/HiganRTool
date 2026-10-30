@@ -1,5 +1,5 @@
-//! 不具合の報告先（公開用リポジトリの Issues）。画面の文に URL を書く側（ローダー・DLL）が、文に入れた URL とこの定数が
-//! 合っているかを検査する。
+//! 不具合の報告先（公開用リポジトリのIssues）。
+//! 画面の文にURLを書く側（ローダー・DLL）が文に含めたURLとこの定数が合っているかどうかを検査する。
 
 pub const ISSUES_URL: &str = "https://github.com/Mako-th/HiganRTool/issues";
 

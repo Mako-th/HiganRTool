@@ -1,16 +1,16 @@
-//! 署名の照合と detour の組み立て（pure）。
+//! 署名の照合とdetourの組み立て（pure）。
 //!
-//! フック地点は「アドレス・期待バイト列・命令の境目」を持ち、逆アセンブラを持たずに「長さの和が期待バイト列と同じ」
-//! 「5 バイト以上」「どの命令も相対の分岐・呼び出しでない」「禁止の範囲と重ならない」を検証する。
-//! 実物の地点の表はここに書かない（アドレスの定数は `src/dll/th09_addr.rs`）。ゲームのメモリへ書く処理は `src/dll/` の
-//! unsafe な層で、ここは書くべきバイト列を組み立てるだけ。
+//! フック地点は「アドレス・期待バイト列・命令の境目」を持つ。
+//! 逆アセンブラを持たずに次を検証する: 「長さの和が期待バイト列と同じ」「5バイト以上」「どの命令も相対の分岐・呼び出しでない」「禁止の範囲と重ならない」。
+//! 実物の地点の表はここに書かない（アドレスの定数は`src/dll/th09_addr.rs`）。
+//! ゲームのメモリへ書く処理は`src/dll/`のunsafeな層が行う。ここは書くべきバイト列を組み立てるだけ。
 
-/// 地点 1 つぶんの記述。`expected` の長さと `instr_lens` の和は一致しなければならない（`check_site` が検証する）。
+/// 地点1つぶんの記述。`expected`の長さと`instr_lens`の和は一致しなければならない（`check_site`が検証する）。
 pub struct Site {
     pub name: &'static str,
     pub addr: u32,
     pub expected: &'static [u8],
-    /// `expected` を先頭から命令ごとに割った長さの列（バイト単位）。
+    /// `expected`を先頭から命令ごとに割った長さの列（バイト単位）。
     pub instr_lens: &'static [u8],
 }
 
@@ -21,7 +21,7 @@ pub struct AddrRange {
 }
 
 impl AddrRange {
-    /// 1 バイトでも重なるか（半開区間なので隣接は重ならない）。
+    /// 1バイトでも重なるかどうか（半開区間なので隣接は重ならない）。
     pub fn overlaps(&self, other: &AddrRange) -> bool {
         self.start < other.end && other.start < self.end
     }
@@ -29,11 +29,11 @@ impl AddrRange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteError {
-    /// `instr_lens` の和が `expected` の長さと違う。
+    /// `instr_lens`の和が`expected`の長さと違う。
     LenSumMismatch { sum: usize, expected_len: usize },
-    /// `expected` が 5 バイト未満（`E9 rel32` が入らない）。
+    /// `expected`が5バイト未満（`E9 rel32`が入らない）。
     TooShort { len: usize },
-    /// `instr_index` 番目の命令が相対（call/jmp/jcc rel）。
+    /// `instr_index`番目の命令が相対（call/jmp/jcc rel）。
     RelativeInstruction { instr_index: usize, addr: u32 },
     /// 禁止の範囲と重なる。
     Forbidden { range: AddrRange },
@@ -58,12 +58,12 @@ pub enum VerifyError {
     },
 }
 
-/// x86 の legacy 接頭辞。命令の相対／非相対はオペコードで決まるので、判定の前に飛ばす。
+/// x86のlegacy接頭辞。命令の相対／非相対はオペコードで決まるので判定の前に飛ばす。
 const PREFIXES: [u8; 11] = [
     0x66, 0x67, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65, 0xF0,
 ];
 
-/// 相対分岐・相対 call か。対象: `E8` / `E9` / `EB` / `70..=7F`（jcc rel8）/ `E0..=E3`（loop・jcxz rel8）/ `0F 80..=8F`（jcc rel32）。
+/// 相対分岐・相対callかどうか。対象: `E8` / `E9` / `EB` / `70..=7F`（jcc rel8）/ `E0..=E3`（loop・jcxz rel8）/ `0F 80..=8F`（jcc rel32）。
 fn is_relative_instr(instr: &[u8]) -> bool {
     let mut i = 0usize;
     while i < instr.len() && PREFIXES.contains(&instr[i]) {
@@ -81,7 +81,7 @@ fn is_relative_instr(instr: &[u8]) -> bool {
     }
 }
 
-/// 地点 1 つの照合。`forbidden` は重なってはいけない範囲（vpatch のパッチ地点・他のフック地点など）。
+/// 地点1つの照合。`forbidden`は重なってはいけない範囲（vpatchのパッチ地点・他のフック地点など）。
 pub fn check_site(site: &Site, forbidden: &[AddrRange]) -> Result<(), SiteError> {
     let sum: usize = site.instr_lens.iter().map(|&l| l as usize).sum();
     if sum != site.expected.len() {
@@ -119,7 +119,7 @@ pub fn check_site(site: &Site, forbidden: &[AddrRange]) -> Result<(), SiteError>
     Ok(())
 }
 
-/// 地点どうしが重ならないか（`O(n^2)` だが地点は数十）。
+/// 地点どうしが重ならないかどうか（`O(n^2)`だが地点は数十）。
 pub fn check_disjoint(sites: &[&Site]) -> Result<(), DisjointError> {
     for i in 0..sites.len() {
         let a_range = AddrRange {
@@ -142,7 +142,7 @@ pub fn check_disjoint(sites: &[&Site]) -> Result<(), DisjointError> {
     Ok(())
 }
 
-/// 実測のバイト列と期待バイト列を比べる。長さ違いも `Err`。
+/// 実測のバイト列と期待バイト列を比べる。長さ違いも`Err`。
 pub fn verify(actual: &[u8], expected: &[u8]) -> Result<(), VerifyError> {
     if actual.len() != expected.len() {
         return Err(VerifyError::LengthMismatch {
@@ -162,7 +162,7 @@ pub fn verify(actual: &[u8], expected: &[u8]) -> Result<(), VerifyError> {
     Ok(())
 }
 
-/// `at` に書く `E9 rel32`（jmp）。rel32 は `to - (at + 5)`（wrapping）。
+/// `at`に書く`E9 rel32`（jmp）。rel32は`to - (at + 5)`（wrapping）。
 pub fn jmp_rel32(at: u32, to: u32) -> [u8; 5] {
     encode_rel32(0xE9, at, to)
 }
@@ -178,17 +178,17 @@ fn encode_rel32(opcode: u8, at: u32, to: u32) -> [u8; 5] {
     [opcode, b[0], b[1], b[2], b[3]]
 }
 
-/// `at` にある `E8 rel32` の飛び先。先頭が `E8` でなければ `None`。
+/// `at`にある`E8 rel32`の飛び先。先頭が`E8`でなければ`None`。
 pub fn call_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     if bytes[0] != 0xE8 {
         return None;
     }
     let rel = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-    // rel を u32 で wrapping 加算すれば、符号付きの加算と同じ結果になる。
+    // relをu32でwrapping加算すれば符号付きの加算と同じ結果になる。
     Some(at.wrapping_add(5).wrapping_add(rel as u32))
 }
 
-/// `at` にある `E9 rel32` の飛び先（`call_target` の JMP バージョン）。先頭が `E9` でなければ `None`。
+/// `at`にある`E9 rel32`の飛び先（`call_target`のJMPバージョン）。先頭が`E9`でなければ`None`。
 pub fn jmp_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     if bytes[0] != 0xE9 {
         return None;
@@ -197,9 +197,9 @@ pub fn jmp_target(at: u32, bytes: &[u8; 5]) -> Option<u32> {
     Some(at.wrapping_add(5).wrapping_add(rel as u32))
 }
 
-/// 5 バイト JMP を書くときの最大の書き込み長。
+/// 5バイトJMPを書くときの最大の書き込み長。
 pub const MAX_PATCH_LEN: usize = 16;
-/// トランポリン（盗んだバイト ＋ 戻りの JMP）の最大長。
+/// トランポリン（盗んだバイト ＋ 戻りのJMP）の最大長。
 pub const MAX_TRAMPOLINE_LEN: usize = 32;
 
 /// 固定長のバッファと有効長。ヒープを使わない。
@@ -215,7 +215,7 @@ pub struct TrampolineBuf {
     pub len: usize,
 }
 
-/// `site.addr` に書くバイト列: `E9 rel32`（`hook` へ）＋残りを `0x90` で埋める。長さが `5..=MAX_PATCH_LEN` でなければ `None`。
+/// `site.addr`に書くバイト列: `E9 rel32`（`hook`へ）＋残りを`0x90`で埋める。長さが`5..=MAX_PATCH_LEN`でなければ`None`。
 pub fn patch_bytes(site: &Site, hook: u32) -> Option<PatchBuf> {
     let total = site.expected.len();
     if !(5..=MAX_PATCH_LEN).contains(&total) {
@@ -227,8 +227,8 @@ pub fn patch_bytes(site: &Site, hook: u32) -> Option<PatchBuf> {
     Some(PatchBuf { bytes, len: total })
 }
 
-/// `tramp_at` に書くトランポリン: 盗んだバイト（`site.expected`）＋戻りの `E9 rel32`（`site.addr + 盗んだ長さ` へ）。
-/// 合計が `MAX_TRAMPOLINE_LEN` を超えるなら `None`。
+/// `tramp_at`に書くトランポリン: 盗んだバイト（`site.expected`）＋戻りの`E9 rel32`（`site.addr + 盗んだ長さ`へ）。
+/// 合計が`MAX_TRAMPOLINE_LEN`を超えるなら`None`。
 pub fn trampoline_bytes(site: &Site, tramp_at: u32) -> Option<TrampolineBuf> {
     let stolen_len = site.expected.len();
     let total = stolen_len + 5;
@@ -246,8 +246,8 @@ pub fn trampoline_bytes(site: &Site, tramp_at: u32) -> Option<TrampolineBuf> {
 
 #[cfg(test)]
 mod tests {
-    //! 期待値の rel32 は手で計算した値（`jmp_rel32` / `call_rel32` から作らない）。実物の `0x0043112D` の
-    //! `E8 8E D8 FF FF` → `0x0042E9C0` も使う。
+    //! 期待値のrel32は手で計算した値（`jmp_rel32` / `call_rel32`から作らない）。
+    //! 実物の`0x0043112D`の`E8 8E D8 FF FF` → `0x0042E9C0`も使う。
     use super::*;
 
     #[test]
@@ -320,13 +320,13 @@ mod tests {
             jmp_rel32(0x000FFFF0, 0x10000010),
             [0xE9, 0x1B, 0x00, 0xF0, 0x0F]
         );
-        // call_target は E8 用だが rel32 の復元は同じなので、先頭バイトだけ E8 に差し替えて使う。
+        // call_targetはE8用だがrel32の復元は同じなので先頭バイトだけE8に差し替えて使う。
         let mut b = jmp_rel32(0x000FFFF0, 0x10000010);
         b[0] = 0xE8;
         assert_eq!(call_target(0x000FFFF0, &b), Some(0x10000010));
     }
 
-    // 合成の非相対命令列（5 バイト）。
+    // 合成の非相対命令列（5バイト）。
     const BENIGN_5: &[u8] = &[0x55, 0x8B, 0xEC, 0x51, 0x90]; // push ebp; mov ebp,esp; push ecx; nop
     const BENIGN_5_LENS: &[u8] = &[1, 2, 1, 1];
 
@@ -376,7 +376,7 @@ mod tests {
         let site = Site {
             name: "synthetic.too_short",
             addr: 0x0060_1000,
-            expected: &[0x90, 0x90, 0x90, 0x90], // 4 バイト
+            expected: &[0x90, 0x90, 0x90, 0x90], // 4バイト
             instr_lens: &[1, 1, 1, 1],
         };
         assert_eq!(check_site(&site, &[]), Err(SiteError::TooShort { len: 4 }));
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn patch_bytes_writes_jmp_and_pads_with_nop() {
-        let site = benign_site(); // 5 バイト
+        let site = benign_site(); // 5バイト
         let buf = patch_bytes(&site, 0x0070_0000).expect("5 bytes is patchable");
         assert_eq!(buf.len, 5);
         let expected_jmp = jmp_rel32(0x0060_1000, 0x0070_0000);

@@ -1,9 +1,10 @@
 //! サスペンド起動の経路。失敗の後始末は下の「行」ごとに決まる。
-//! 行 1 DLL の確認 → 2 ゲームの同定 → 3 `CreateProcessW(CREATE_SUSPENDED)` → 4 `VirtualAllocEx` → 5 `WriteProcessMemory`（DLL の絶対パス、UTF-16）→
-//! 6 `CreateRemoteThread(LoadLibraryW)` → 7 終わりを待つ → 8 戻り値を見る → 9 領域を返して `ResumeThread`。
-//! 失敗したら、一度も走っていないゲームを `TerminateProcess` で消して「始めずに終える」（ツールの無いゲームが立ち上がると取り違えるため）。
-//! どの行でも、開いたハンドルは全部閉じる。unsafe は無い（Win32 は `Win32` トレイト越し）。
-//! 仕組みは thprac の `RunGame` / `LoadRemoteLibrary` と同じ（コードはコピーしていない）。違い: 失敗したらゲームを殺す、パスの終端の 0 を自分で書く、待ちに上限を付ける。
+//! 行1 DLLの確認 → 2ゲームの同定 → 3 `CreateProcessW(CREATE_SUSPENDED)` → 4 `VirtualAllocEx` → 5 `WriteProcessMemory`（DLLの絶対パス、UTF-16）→
+//! 6 `CreateRemoteThread(LoadLibraryW)` → 7終わりを待つ → 8戻り値を見る → 9領域を返して`ResumeThread`。
+//! 失敗したら一度も走っていないゲームを`TerminateProcess`で消して「始めずに終える」（ツールの無いゲームが立ち上がると取り違えるため）。
+//! どの行でも開いたハンドルは全部閉じる。unsafeは無い（Win32は`Win32`トレイト越し）。
+//! 仕組みはthpracの`RunGame` / `LoadRemoteLibrary`と同じ（コードはコピーしていない）。
+//! 違い: 失敗したらゲームを殺す・パスの終端の0を自分で書く・待ちに上限を付ける。
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
@@ -14,21 +15,21 @@ use higanr_core::pe::{self, Ident, IdentField, PeError};
 
 use crate::win::{ErrorCode, Handle, LaunchNote, ProcessInfo, Remote, Spawn, WaitResult, Win32};
 
-/// リモートスレッドを待つ上限（行 7）。DllMain は重い仕事をしない約束なので普段は数十ミリ秒。
+/// リモートスレッドを待つ上限（行7）。DllMainは重い仕事をしない約束なので普段は数十ミリ秒。
 /// ウイルス対策ソフトが初回の読み込みを止めている間（クラウド照会で長引くことがある。実測はしていない）も待てるよう長く取る。
 pub const REMOTE_THREAD_TIMEOUT_MS: u32 = 60_000;
 
-/// 最初の待ち。ここまでに終わらず、ゲームのプロセスが生きていれば画面に知らせて `REMOTE_THREAD_TIMEOUT_MS` まで延ばす。
+/// 最初の待ち。ここまでに終わらずゲームのプロセスが生きていれば画面に知らせて`REMOTE_THREAD_TIMEOUT_MS`まで延ばす。
 pub const REMOTE_THREAD_NOTICE_MS: u32 = 10_000;
 
-/// 消えたかを待つ上限。`TerminateProcess` は終わりを待たずに戻るため。
+/// 消えたかを待つ上限。`TerminateProcess`は終わりを待たずに戻るため。
 pub const TERMINATE_WAIT_MS: u32 = 5_000;
 
-/// 値に意味は無い（0 以外であればよい）。
+/// 値に意味は無い（0以外であればよい）。
 pub const ABORT_EXIT_CODE: u32 = 1;
 
-/// 起動の前（DLL を入れる前。主スレッドは止まったまま）に子のメモリへ書く 1 か所。
-/// 書く前に `expect` と照合し、書いた後に `new` かを読み直す。
+/// 起動の前（DLLを注入する前。主スレッドは止まったまま）に子のメモリへ書く1か所。
+/// 書く前に`expect`と照合する。書いた後に`new`になっているかを読み直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodePatch {
     pub at: usize,
@@ -36,22 +37,23 @@ pub struct CodePatch {
     pub new: &'static [u8],
 }
 
-/// 2 つ目の花映塚だけに当てる書き換え（`--second`）。
+/// 2つ目の花映塚だけに当てる書き換え（`--second`）。
 /// `0x0042D912 call [0x48E0AC]`（CreateMutexA、名前 "Touhou 08 App"）
 /// → `0x0042D91D call [0x48E08C]`（GetLastError）→
 /// `0x0042D923 cmp eax,0xB7`（ERROR_ALREADY_EXISTS）→ `0x0042D928 75 19 jne 0x42D943`。
-/// 1 つ目が居ると jne が通らず -1 を返して終わる。jne を jmp（`EB`）にすると 2 つ目も先へ進む。
-/// ミューテックスはゲームの中で待つ・放す所が無い（`0x4B30A8` の読み手は `0x0042DA73` の 1 か所）。
+/// 1つ目が居るとjneが通らず -1を返して終わる。jneをjmp（`EB`）にすると2つ目も先へ進む。
+/// ミューテックスはゲームの中で待つ・放す所が無い（`0x4B30A8`の読み手は`0x0042DA73`の1か所）。
 pub const SECOND_INSTANCE: CodePatch = CodePatch {
     at: 0x0042_D928,
     expect: &[0x75, 0x19],
     new: &[0xEB, 0x19],
 };
 
-/// 別に起動している花映塚と独立させる書き換え（開発用の起動だけ当てる。`single::is_isolated`）。名前つきの印を持つ花映塚が居る間に別の花映塚を起動すると、
-/// 後から起動した方が「二つは起動できません」で終わる際に th09.cfg を全部 0 で書き出すため（実測）。
-/// `0x0042D909 68 44 02 49 00 push $0x490244`（CreateMutexA の名前 "Touhou 08 App"）を `6A 00 90 90 90`（push 0 と NOP 3 つ）にすると名前なしの印になり、
-/// GetLastError が ERROR_ALREADY_EXISTS を返さないので `0x0042D928` の jne も通る（`SECOND_INSTANCE` は要らない）。
+/// 別に起動している花映塚と独立させる書き換え（開発用の起動だけ当てる。`single::is_isolated`）。
+/// 理由（実測）: 名前つきの印を持つ花映塚が居る間に別の花映塚を起動すると、後から起動した方が「二つは起動できません」で終わる。
+/// その際にth09.cfgを全部0で書き出す。
+/// `0x0042D909 68 44 02 49 00 push $0x490244`（CreateMutexAの名前 "Touhou 08 App"）を`6A 00 90 90 90`（push 0とNOP 3つ）にすると名前なしの印になる。
+/// そのためGetLastErrorがERROR_ALREADY_EXISTSを返さず、`0x0042D928`のjneも通る（`SECOND_INSTANCE`は要らない）。
 pub const ISOLATED_INSTANCE: CodePatch = CodePatch {
     at: 0x0042_D909,
     expect: &[0x68, 0x44, 0x02, 0x49, 0x00],
@@ -62,16 +64,16 @@ pub const ISOLATED_INSTANCE: CodePatch = CodePatch {
 #[derive(Debug, Clone)]
 pub struct LaunchRequest<'a> {
     pub game: PathBuf,
-    /// この絶対パスのまま `LoadLibraryW` に渡す（ゲームのフォルダへコピーしない）。
+    /// この絶対パスのまま`LoadLibraryW`に渡す（ゲームのフォルダへコピーしない）。
     pub dll: PathBuf,
     /// 花映塚には渡さない。自己検査の的にだけ使う。
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
-    /// 本番は `TH09_V150A`、自己検査はローダー自身の値。
+    /// 本番は`TH09_V150A`、自己検査はローダー自身の値。
     pub ident: Ident<'a>,
-    /// 成功したとき、プロセスのハンドルを閉じずに返すか（自己検査が的の終了コードを見るため。閉じるのは呼んだ側）。
+    /// 成功したときプロセスのハンドルを閉じずに返すかどうか（自己検査が的の終了コードを見るため。閉じるのは呼んだ側）。
     pub keep_process_handle: bool,
-    /// 起動の前に書く所。開発用の起動は `ISOLATED_INSTANCE`、`--second` なら `SECOND_INSTANCE` も。普段の起動は空。
+    /// 起動の前に書く所。開発用の起動は`ISOLATED_INSTANCE`、`--second`なら`SECOND_INSTANCE`も。普段の起動は空。
     pub patches: Vec<CodePatch>,
     pub no_activate: bool,
 }
@@ -109,8 +111,8 @@ pub enum LaunchError {
 }
 
 impl LaunchError {
-    /// 後始末の行番号。`LoadLibraryAddress` は行 3 と同じ扱い、`RemoteThreadWaitFailed` は行 7、`ExitCodeUnavailable` は行 8、
-    /// `ResumeFailed` は行 9 の後、`Patch*` は行 3 と 4 の間（後始末は行 4 と同じ）。
+    /// 後始末の行番号。`LoadLibraryAddress`は行3と同じ扱い、`RemoteThreadWaitFailed`は行7、`ExitCodeUnavailable`は行8、
+    /// `ResumeFailed`は行9の後、`Patch*`は行3と4の間（後始末は行4と同じ）。
     pub fn row(&self) -> u8 {
         match self {
             LaunchError::DllPathInvalid(_)
@@ -157,7 +159,7 @@ pub const DLL_PATH_HAS_NUL: Tx = Tx {
     en: "the path contains a NUL character",
 };
 
-/// UTF-16LE・終端の 0 つき。絶対パスに限るのは、相対だとゲームのフォルダの同名の別 DLL を読みうるため。
+/// UTF-16LE・終端の0つき。絶対パスに限るのは相対だとゲームのフォルダの同名の別DLLを読みうるため。
 pub fn dll_path_bytes(dll: &Path) -> Result<Vec<u8>, LaunchError> {
     if !dll.is_absolute() {
         return Err(LaunchError::DllPathInvalid(DLL_NOT_ABSOLUTE));
@@ -179,7 +181,7 @@ pub fn launch<W: Win32>(w: &mut W, req: &LaunchRequest<'_>) -> Result<Launched, 
         cleanup_issues: Vec::new(),
     };
 
-    // 行 1: 何も始める前に見る（後始末は無い）。
+    // 行1: 何も始める前に見る（後始末は無い）。
     let path_bytes = dll_path_bytes(&req.dll).map_err(fail)?;
     let dll_bytes = w
         .read_file(&req.dll)
@@ -198,7 +200,7 @@ pub fn launch<W: Win32>(w: &mut W, req: &LaunchRequest<'_>) -> Result<Launched, 
     pe::check_ident(&game_bytes, &req.ident)
         .map_err(|m| fail(LaunchError::GameIdentMismatch(m.fields)))?;
 
-    // 行 3 の前: アドレスを先に引いておく（プロセスを作ってから失敗すると、殺すものが 1 つ増える）。
+    // 行3の前: アドレスを先に取得しておく（プロセスを作ってから失敗すると殺すものが1つ増える）。
     let load_library_w = w
         .load_library_w_address()
         .map_err(|e| fail(LaunchError::LoadLibraryAddress(e)))?;
@@ -214,7 +216,7 @@ pub fn launch<W: Win32>(w: &mut W, req: &LaunchRequest<'_>) -> Result<Launched, 
         .create_process_suspended(&spawn)
         .map_err(|e| fail(LaunchError::CreateProcess(e)))?;
 
-    // 行 4〜9。ここから先はプロセスがあるので、どの行でもハンドルを閉じてから戻る。
+    // 行4〜9。ここから先はプロセスがあるのでどの行でもハンドルを閉じてから戻る。
     let mut issues = Vec::new();
     let result = apply_patches(w, &pi, &req.patches, &mut issues)
         .and_then(|()| inject_and_resume(w, &pi, &path_bytes, load_library_w, &mut issues));
@@ -245,7 +247,7 @@ pub fn launch<W: Win32>(w: &mut W, req: &LaunchRequest<'_>) -> Result<Launched, 
     }
 }
 
-/// 起動の前の書き換え（行 3 と 4 の間）。1 か所ずつ 読む → 照合 → 書く → 読み直す。合わなければ始めずに終える（後始末は行 4 と同じ）。
+/// 起動の前の書き換え（行3と4の間）。1か所ずつ 読む → 照合 → 書く → 読み直す。合わなければ始めずに終える（後始末は行4と同じ）。
 fn apply_patches<W: Win32>(
     w: &mut W,
     pi: &ProcessInfo,
@@ -289,7 +291,7 @@ fn apply_patch<W: Win32>(w: &mut W, pi: &ProcessInfo, p: &CodePatch) -> Result<(
     }
 }
 
-/// 行 4〜9。リモートスレッドのハンドルはここで閉じ、プロセスとスレッドは呼んだ側が閉じる。
+/// 行4〜9。リモートスレッドのハンドルはここで閉じ、プロセスとスレッドは呼んだ側が閉じる。
 fn inject_and_resume<W: Win32>(
     w: &mut W,
     pi: &ProcessInfo,
@@ -305,7 +307,7 @@ fn inject_and_resume<W: Win32>(
         }
     };
 
-    // 行 5: 領域を返してから殺す（殺した後のプロセスには VirtualFreeEx が効かず、失敗が混ざる）。
+    // 行5: 領域を返してから殺す（殺した後のプロセスにはVirtualFreeExが効かず、失敗が混ざる）。
     if let Err(e) = w.write_memory(pi.process, region, path_bytes) {
         free(w, pi, region, issues);
         abort_game(w, pi, issues);
@@ -321,7 +323,7 @@ fn inject_and_resume<W: Win32>(
         }
     };
 
-    // 行 7: 時間切れでは領域を返さない（スレッドがまだパスを読んでいるかもしれない）。プロセスごと消せば領域も返る。
+    // 行7: 時間切れでは領域を返さない（スレッドがまだパスを読んでいるかもしれない）。プロセスごと消せば領域も返る。
     let mut waited = w.wait(remote, REMOTE_THREAD_NOTICE_MS);
     if waited == WaitResult::TimedOut && w.wait(pi.process, 0) == WaitResult::TimedOut {
         w.note(LaunchNote::SlowLoad);
@@ -343,7 +345,7 @@ fn inject_and_resume<W: Win32>(
     close(w, remote, issues);
     free(w, pi, region, issues);
 
-    // 行 8: 0 は `LoadLibraryW` の失敗。32bit の相手なので終了コードに HMODULE がそのまま入る。
+    // 行8: 0は`LoadLibraryW`の失敗。32bitの相手なので終了コードにHMODULEがそのまま入る。
     let module = match exit {
         Ok(0) => {
             abort_game(w, pi, issues);
@@ -388,8 +390,8 @@ fn close<W: Win32>(w: &mut W, h: Handle, issues: &mut Vec<CleanupIssue>) {
 
 #[cfg(test)]
 mod tests {
-    //! 行 1〜9 を偽物の Win32（`Fake`。失敗地点だけを決める）で通す。呼び出しの順とハンドル・領域の帳簿は `ledger::Traced`。
-    //! ファイルは合成の PE。
+    //! 行1〜9を偽物のWin32（`Fake`。失敗地点だけを決める）で通す。呼び出しの順とハンドル・領域の帳簿は`ledger::Traced`。
+    //! ファイルは合成のPE。
     use super::*;
     use crate::ledger::{Call, Traced};
     use crate::staged::Logged;
@@ -421,11 +423,12 @@ mod tests {
         LoadLibraryZero,
         ExitCodeUnavailable,
         Resume,
-        /// 行 9 は成功のまま、領域を返すのだけ失敗する。
+        /// 行9は成功のまま領域を返すのだけ失敗する。
         FreeOnly,
         PatchWrite,
         PatchLies,
-        /// 最初の待ちは時間切れ、ゲームのプロセスは生きていて、延ばした待ちで終わる。
+        /// 最初の待ちは時間切れになる。
+        /// ゲームのプロセスは生きていて、延ばした待ちで終わる。
         SlowLoad,
         /// 最初の待ちも延ばした待ちも時間切れ（プロセスは生きている）。
         SlowLoadNeverEnds,
@@ -440,7 +443,7 @@ mod tests {
         mem: HashMap<usize, u8>,
         remote_waits: u32,
         notes: Vec<LaunchNote>,
-        /// ログの行を貯める場所（`staged::Logged` の検査用）。呼ばれた瞬間の最後の行を `at_call` に残す。
+        /// ログの行を貯める場所（`staged::Logged`の検査用）。呼ばれた瞬間の最後の行を`at_call`に残す。
         trail: Option<Rc<RefCell<Vec<String>>>>,
         at_call: Vec<(&'static str, String)>,
     }
@@ -453,7 +456,7 @@ mod tests {
             Self {
                 files,
                 fail,
-                // 値はわざと 4 の倍数の途中から（0 や 1 から始めると「閉じ忘れ」と「未使用」が紛れる）
+                // 値はわざと4の倍数の途中から（0や1から始めると「閉じ忘れ」と「未使用」が紛れる）
                 next_handle: 0x1C4,
                 process: None,
                 remote_thread: None,
@@ -568,7 +571,7 @@ mod tests {
                     _ => {}
                 }
             }
-            // 生きているかの問い合わせ（待ち 0）にだけ「生きている」と答える。
+            // 生きているかの問い合わせ（待ち0）にだけ「生きている」と答える。
             if Some(handle) == self.process
                 && ms == 0
                 && matches!(self.fail, FailAt::SlowLoad | FailAt::SlowLoadNeverEnds)
@@ -695,7 +698,7 @@ mod tests {
         assert_eq!(ISOLATED_INSTANCE.expect, &[0x68, 0x44, 0x02, 0x49, 0x00]);
         assert_eq!(ISOLATED_INSTANCE.new, &[0x6A, 0x00, 0x90, 0x90, 0x90]);
         assert_eq!(ISOLATED_INSTANCE.expect.len(), ISOLATED_INSTANCE.new.len());
-        // 書き換えの範囲が jne（SECOND_INSTANCE）と重ならない。
+        // 書き換えの範囲がjne（SECOND_INSTANCE）と重ならない。
         assert!(ISOLATED_INSTANCE.at + ISOLATED_INSTANCE.new.len() <= SECOND_INSTANCE.at);
         let fake = Fake::new(FailAt::None).with_mem(ISOLATED_INSTANCE.at, ISOLATED_INSTANCE.expect);
         let mut req = request(false);
@@ -812,7 +815,7 @@ mod tests {
     #[test]
     fn row1_dll_not_pe32_i386_starts_nothing() {
         let mut pe32plus = synth::pe32(1, 0x200, &[0xC3]);
-        pe32plus[0x58] = 0x0B; // optional header の magic を 0x20B（PE32+）へ
+        pe32plus[0x58] = 0x0B; // optional headerのmagicを0x20B（PE32+）へ
         pe32plus[0x59] = 0x02;
         for (bytes, want) in [
             (pe32plus, PeError::Pe32Plus),
@@ -846,7 +849,7 @@ mod tests {
     #[test]
     fn row2_ident_mismatch_starts_nothing() {
         let mut fake = Fake::new(FailAt::None);
-        // 時刻だけ違う exe（他の 2 欄は合う）でも止まること。
+        // 時刻だけ違うexe（他の2フィールドは合う）でも止まること。
         fake.files.insert(
             PathBuf::from(GAME),
             synth::pe32(STAMP + 1, TEXT_SIZE, &ENTRY),
@@ -1028,12 +1031,12 @@ mod tests {
     struct LoggedRun {
         result: Result<Launched, LaunchFailure>,
         lines: Vec<String>,
-        /// 各段が呼ばれた瞬間の、ログの最後の行。
+        /// 各ステップが呼ばれた瞬間のログの最後の行。
         at_call: Vec<(&'static str, String)>,
         shown: Vec<LaunchNote>,
     }
 
-    /// 段階ログの包みで `fake` を起動する。
+    /// 段階ログのラッパーで`fake`を起動する。
     fn run_logged(mut fake: Fake) -> LoggedRun {
         let trail = Rc::new(RefCell::new(Vec::<String>::new()));
         fake.trail = Some(Rc::clone(&trail));
@@ -1208,7 +1211,7 @@ mod tests {
         assert!(t.live_regions().is_empty());
         assert_all_closed(&t);
 
-        // UTF-16LE ＋ 終端の 0（LoadLibraryW は 0 終端の LPCWSTR を読む）
+        // UTF-16LE ＋ 終端の0（LoadLibraryWは0終端のLPCWSTRを読む）
         let want: Vec<u8> = DLL
             .encode_utf16()
             .chain([0])

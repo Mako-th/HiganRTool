@@ -1,9 +1,10 @@
-//! 対戦の後に接続が終わったときの戻り道（`NetUi::on_lost` → `tick` の先頭）の検査。偽のゲーム `RetGame` は、一時停止
-//! （`0x00434740`）・終わりのメニュー（`0x004355F0`）・MainMenu の画面 1・6・7・8・14・15・16 を、逆アセンブルの処理の順
-//! （入力の地点の feed → その tick のハンドラが押した瞬間を読む）で動かす。ゲームのメモリへは何も書かれないこと
-//! （`write_menu_u32` が呼ばれない）も見る。
+//! 対戦の後に接続が終わったときの戻り道（`NetUi::on_lost` → `tick`の先頭）の検査。
+//! 偽のゲーム`RetGame`は、一時停止（`0x00434740`）・終わりのメニュー（`0x004355F0`）・MainMenuの画面1・6・7・8・14・15・16を動かす。
+//! 動かす順序は逆アセンブルで見たゲームの処理順で、入力の地点のfeedの後にそのtickのハンドラが押した瞬間を読む。
+//! ゲームのメモリへは何も書かれないこと（`write_menu_u32`が呼ばれない）も見る。
 use std::cell::Cell;
 
+use higanr_core::end_pick::model::EndMenu;
 use higanr_core::lockstep::Role;
 use higanr_core::menu_model::DECIDE_BITS;
 use higanr_core::net_menu::{T_AGAIN, T_RETURN_LOST, T_RETURN_PEER_LEFT, T_RETURN_SELF_CUT};
@@ -52,9 +53,9 @@ struct RetGame {
     anim: u32,
     cursor: u32,
     decided: [u32; 2],
-    /// MainMenu の作り直しの後、画面 1 → 6 → 7 → 8 を押下なしで進む。
+    /// MainMenuの作り直しの後、画面1 → 6 → 7 → 8を押下なしで進む。
     auto_walk: bool,
-    /// この tick の人の語と、その tick に UI が feed した 3 本。
+    /// このtickの人の入力ワードと、そのtickにUIがfeedした3本。
     user: u16,
     cur_feed: [Option<u16>; 3],
     menu_words_reads: u32,
@@ -126,7 +127,7 @@ impl RetGame {
         self.anim = 0;
     }
 
-    /// 1 tick: UI に入力を握らせ、握った feed（握らなければゲーム自身が読む人の語）でゲームを 1 フレーム進める。
+    /// 1 tick進める。UIに入力を占有させ、そのfeedでゲームを1フレーム進める（占有しなければゲーム自身が読む人の入力ワードで進める）。
     fn step(&mut self, ui: &mut NetUi, f: &UiFacts, user: u16) -> UiOut {
         self.user = user;
         self.cur_feed = [None; 3];
@@ -273,45 +274,29 @@ impl RetGame {
     }
 
     fn end_menu_frame(&mut self, p: u16) {
-        use end_menu::*;
-        let m = &mut self.end;
-        let ready = m.frames >= 4;
-        match m.state {
-            INIT => {
-                m.state = REMATCH;
-                m.frames = 0;
+        let mut m = EndMenu {
+            shown: self.end_menu,
+            state: self.end.state,
+            frames: self.end.frames,
+        };
+        let closed = m.frame(p);
+        self.end_menu = m.shown;
+        self.end = MenuState {
+            state: m.state,
+            frames: m.frames,
+        };
+        match closed {
+            Some(0) => {
+                self.rematch += 1;
+                self.next = 10;
             }
-            REMATCH | CHARA | SAVE if ready => {
-                let orig = m.state;
-                if p & UP != 0 {
-                    m.state = [0, SAVE, REMATCH, CHARA][orig as usize];
-                }
-                if p & DOWN != 0 {
-                    m.state = [0, CHARA, SAVE, REMATCH][orig as usize];
-                }
-                if p & DECIDE_BITS != 0 {
-                    m.state = orig + 3;
-                    m.frames = 0;
-                }
+            Some(1) => {
+                self.next = SCENE_MENU;
+                self.auto_walk = true;
             }
-            4..=6 if m.frames >= 20 => {
-                match m.state {
-                    4 => {
-                        self.rematch += 1;
-                        self.next = 10;
-                    }
-                    5 => {
-                        self.next = SCENE_MENU;
-                        self.auto_walk = true;
-                    }
-                    _ => self.next = REQ_SAVE_AND_QUIT,
-                }
-                m.state = INIT;
-                self.end_menu = false;
-            }
-            _ => {}
+            Some(_) => self.next = REQ_SAVE_AND_QUIT,
+            None => {}
         }
-        self.end.frames += 1;
     }
 
     fn menu_frame(&mut self, p0: u16, p2: u16, edge2: u16) {
@@ -467,7 +452,7 @@ fn row(b: &Board, i: usize) -> String {
         .unwrap_or_default()
 }
 
-/// 人は `every` tick ごとに、そのときの画面に合う 1 つを押す（一時停止の「タイトルへ戻る」→ 確認の「はい」・終わりのメニューの決定）。
+/// 人は`every` tickごとにそのときの画面に合う1つを押す（一時停止の「タイトルへ戻る」→ 確認の「はい」・終わりのメニューの決定）。
 fn tapper(g: &RetGame, t: u32) -> u16 {
     if !t.is_multiple_of(8) || g.scene != SCENE_MATCH {
         return 0;
@@ -517,7 +502,7 @@ fn a_cut_in_the_match_freezes_then_locks_the_pause_and_lands_on_yokai() {
     );
     assert_eq!(row(b, ROW_TL1), T_AGAIN.ja);
     assert_ne!(b.show() & SHOW_TL0, 0);
-    // 押しっぱなしの Esc・Q・決定は、一時停止を開いた後も押下にならない。
+    // 押しっぱなしのEsc・Q・決定は一時停止を開いた後も押下にならない。
     for _ in 0..30 {
         g.step(&mut ui, &finished(), Z | ESC | Q);
     }
@@ -537,7 +522,7 @@ fn a_cut_in_the_match_freezes_then_locks_the_pause_and_lands_on_yokai() {
         (st.returns, st.return_arrived, st.return_gave_up),
         (1, 1, 0)
     );
-    // 着いた後はいつもの画面 6（決定で入口のメニューが開く）。理由の行は開くまで残る。
+    // 着いた後はいつもの画面6（決定で入口のメニューが開く）。理由の行は開くまで残る。
     g.step(&mut ui, &finished(), 0);
     assert_eq!(row(b, ROW_TL0), T_RETURN_LOST.ja);
     g.step(&mut ui, &finished(), Z);
@@ -579,7 +564,7 @@ fn a_cut_in_the_selection_cancels_back_to_screen_six() {
             if !ui.returning() {
                 break;
             }
-            // 人が取消と決定を押し続けても、戻り道の押し方は変わらない。
+            // 人が取消と決定を押し続けても戻り道の押し方は変わらない。
             g.step(&mut ui, &finished(), X | Z);
         }
         assert!(ui.returning(), "画面 {screen}: 決定を押したまま手を返した");
@@ -631,7 +616,7 @@ fn leaving_by_the_confirm_box_and_runs_without_the_flow_do_not_return() {
     ui.on_lost(Why::Lost);
     assert!(!ui.returning(), "確かめの枠で抜けたのに戻した");
     assert_eq!(chimes(), c0);
-    // 印は 1 回で消える。相手の BYE が先に来たときは戻す。
+    // 印は1回で消える。相手のBYEが先に来たときは戻す。
     ui.left_by_menu = true;
     ui.on_lost(Why::PeerLeft);
     assert!(ui.returning());
@@ -667,7 +652,8 @@ fn a_self_cut_does_not_chime_but_still_returns_with_its_own_line() {
 
 #[test]
 fn staying_at_the_title_after_ones_own_save_and_quit_touches_nothing() {
-    // 自分で「保存して終了」を選んだときは `NetPlay::take_lost` が理由を返さない（`netplay::tests`）ので、戻り道は始まらない。
+    // 自分で「保存して終了」を選んだときは`NetPlay::take_lost`が理由を返さない（`netplay::tests`）。
+    // そのため戻り道は始まらない。
     let (mut ui, _b) = returning_ui();
     let mut g = RetGame::on_screen(1, 0);
     for _ in 0..200 {
@@ -693,7 +679,8 @@ fn unreadable_match_menus_leave_the_game_to_its_own_input() {
     assert_eq!(ui.stats().return_gave_up, 1);
 }
 
-/// 組み上がり: 2 台の `NetPlay` を偽のネットワークで接続し、片方が閉じたら、もう片方の `net_input` が `take_lost` を受けて戻り始める。
+/// 組み上がり: 2台の`NetPlay`を偽のネットワークで接続する。
+/// 片方が閉じたらもう片方の`net_input`が`take_lost`を受けて戻り始める。
 #[test]
 fn net_input_starts_the_flow_when_the_peer_leaves_after_the_match_was_made() {
     use crate::netplay::fake::{FRAME_US, FakeNet};
@@ -724,7 +711,7 @@ fn net_input_starts_the_flow_when_the_peer_leaves_after_the_match_was_made() {
     let mut np_b = NetPlay::new(link(1, 1), cfg, &mut nb);
     let (mut ui_a, _) = returning_ui();
     let (mut ui_b, _) = returning_ui();
-    // どちらも Match の画面以外（画面 7）にいる。戻り道が無ければ入力に触らない画面。
+    // どちらもMatchの画面以外（画面7）にいる。戻り道が無ければ入力に触らない画面。
     let mut ga = RetGame::on_screen(7, 0);
     let mut gb = RetGame::on_screen(7, 0);
     let mut tick = |np_a: &mut NetPlay, np_b: &mut NetPlay, ui_a: &mut NetUi, ui_b: &mut NetUi| {
@@ -753,7 +740,7 @@ fn net_input_starts_the_flow_when_the_peer_leaves_after_the_match_was_made() {
     );
     assert!(ui_b.returning(), "相手が抜けたのに戻り始めない");
     assert_eq!(ui_b.lost, Some(Why::PeerLeft));
-    // 閉じた側は自分から閉じた BYE(取消)（確認の枠ではない）なので、接続が切れた扱いで戻る。
+    // 閉じた側は自分から閉じたBYE(取消)で、確認の枠ではない。そのため接続が切れた扱いで戻る。
     assert!(ui_a.returning());
     assert_eq!(chimes(), c0 + 2);
     assert_eq!(np_b.take_lost(), None, "2 回目も理由を返した");

@@ -1,53 +1,55 @@
-//! マッチの終わりのリプレイの自動保存の判断のうち、ゲームのアドレスに依らないもの（pure）。
-//! - いつ保存を呼ぶか（`SaveGate`。場面・メニューの印・読み込みの 3 つを dll が真偽にして渡す）
-//! - 印の結果（`result_of`。勝ち数から）と、保存関数に渡す名前（`clock_name`。8 バイトの `HH:MM:SS`）
-//! - exe のフォルダの形の検証（`exe_dir_of`）と、保存関数へ渡す CP932 のパス（`ansi_vault_path`）
-//! - `HiganRTool.ini` の `[replay]` の読み方（`settings_from_ini`）
+//! マッチの終わりのリプレイの自動保存の判断のうちゲームのアドレスに依らないもの（pure）。
+//! - いつ保存を呼ぶか（`SaveGate`。場面・メニューのフラグ・読み込みの3つをdllが真偽にして渡す）
+//! - 印の結果（`result_of`。勝ち数から）と保存関数に渡す名前（`clock_name`。8バイトの`HH:MM:SS`）
+//! - exeのフォルダの形の検証（`exe_dir_of`）と保存関数へ渡すANSIのパス（`ansi_vault_path`）
+//! - `HiganRTool.ini`の`[replay]`の読み方（`settings_from_ini`）
 //!
-//! ゲームのアドレス・場面の番号・フォルダの中身はここに無い（dll が読んで渡す）。
+//! ゲームのアドレス・場面の番号・フォルダの中身はここに無い（dllが読んで渡す）。
 #![forbid(unsafe_code)]
 
-use encoding_rs::SHIFT_JIS;
-
+use crate::ansi::Ansi;
 use crate::ini::Ini;
 use crate::replay::{MatchResult, Side, Timestamp};
-use crate::vault::{self, Split};
+use crate::replay_name::DEFAULT_TEMPLATE;
+use crate::vault::Split;
 
-/// 保管庫のフォルダの名前（exe のフォルダの直下）。
+/// 保管庫のフォルダの名前（exeのフォルダの直下）。
 pub const VAULT_DIR: &str = "Replay_HiganRTool";
 pub const SECTION: &str = "replay";
-/// 保存関数に渡す名前の文字数。ゲームは長さを見ない strcpy でヘッダの 9 バイトの欄へコピーするので、NUL を入れて収まる 8 文字まで
-/// （9 文字以上は隣の難易度の欄を壊す）。
+/// 保存関数に渡す名前の文字数。ゲームは長さを見ないstrcpyでヘッダの9バイトのフィールドへコピーする。
+/// NULを含めて収まる8文字までにする（9文字以上は隣の難易度のフィールドを壊す）。
 pub const NAME_LEN: usize = 8;
-/// 名前を入れるバッファの大きさ（8 文字 ＋ NUL ＋ 詰め物の 0。4 の倍数）。
+/// 名前を入れるバッファの大きさ（8文字 ＋ NUL ＋ パディングの0。4の倍数）。
 pub const NAME_BUF: usize = 12;
-/// 保存関数に渡すパスの長さの上限（NUL を除く B）。保存は `CreateFileA` を通るので `MAX_PATH`（260）から NUL の 1 を引く。
+/// 保存関数に渡すパスの長さの上限（NULを除くB）。保存は`CreateFileA`を通るので`MAX_PATH`（260）からNULの1を引く。
 pub const ANSI_PATH_MAX: usize = 259;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveKind {
-    /// マッチの終わりのメニューが出ている。
+    /// マッチ終了時のメニューが出ている。
     MenuShown,
-    /// 場面 2 を抜ける・入り直す tick（保険）。`menu_seen` が false ならマッチは途中で終わった（一時停止から「タイトルへ」など）
-    /// ので印の結果は abort。
+    /// 場面2を抜ける・入り直すtick（保険）。
+    /// `menu_seen`がfalseならマッチは途中で終わった（一時停止から「タイトルへ」など）。
+    /// そのため印の結果はabort。
     Leaving { menu_seen: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GateScene {
     pub in_match: bool,
-    /// 次の要求がマッチでない（場面 2 を抜ける・作り直す tick）。`in_match` のときだけ意味がある。
+    /// 次の要求がマッチでない（場面2を抜ける・作り直すtick）。`in_match`のときだけ意味がある。
     pub leaving: bool,
     pub menu: bool,
     /// 読み込み中（読み込みのスレッドがリプレイの物に触りうる間）。
     pub loading: bool,
 }
 
-/// いつ保存を呼ぶかを決める（ゲームのスレッドが tick ごとに `tick` を呼ぶ）。
+/// いつ保存を呼ぶかを決める（ゲームのスレッドがtickごとに`tick`を呼ぶ）。
 ///
-/// - seg（場面 2 に入ってから抜ける・作り直すまで）ごとに保存は 1 回だけ。メニューの印が `settle` tick 続いたら `MenuShown`（`finish` まで毎 tick 返す。パスの準備が間に合わなければ再試行できる）、
-///   場面 2 を抜ける・入り直す tick で未保存なら 1 回だけ `Leaving` を返す（描画だけのフレームで同じ tick が繰り返されても 2 回は返さない）。
-/// - 呼んだ（か呼ばないと決めた）ら `finish`。場面 2 のまま次の要求も 2 に戻ったら（「再戦」）、新しい seg として数え直す。
+/// - マッチ（場面2に入ってから抜ける・作り直すまで）ごとに保存は1回だけ。
+///   メニューのフラグが`settle` tick続いたら`MenuShown`を返す。`finish`まで毎tick返す（パスの準備が間に合わなければ再試行できる）。
+///   場面2を抜ける・入り直すtickで未保存なら1回だけ`Leaving`を返す（描画だけのフレームで同じtickが繰り返されても2回は返さない）。
+/// - 呼んだ（か呼ばないと決めた）ら`finish`。場面2のまま次の要求も2に戻ったら（「再戦」）新しいマッチとして数え直す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveGate {
     settle: u32,
@@ -55,16 +57,16 @@ pub struct SaveGate {
     menu_seen: bool,
     done: bool,
     leaving: bool,
-    /// この seg で保存関数を呼んだ（`mark_called`）。数え直しで落ちる。ネットワーク対戦の「リプレイを保存して終了」で
-    /// ゲームの保存の画面を飛ばしてよいかの材料（`save_skip`）。
+    /// このマッチで保存関数を呼んだ（`mark_called`）。数え直しで解除される。
+    /// ネットワーク対戦の「リプレイを保存して終了」でゲームの保存の画面を飛ばしてよいかの材料（`save_skip`）。
     called: bool,
-    /// seg の数（場面 2 に入る・再戦で作り直すたびに 1 増える。数え直しでは戻らない）。マッチごとの記録の区切りに使う。
+    /// マッチの数（場面2に入る・再戦で作り直すたびに1増える。数え直しでは戻らない）。マッチごとの記録の区切りに使う。
     epoch: u32,
     in_seg: bool,
 }
 
 impl SaveGate {
-    /// `settle` はメニューの印が何 tick 続いたら呼ぶか（dll は adonis rev5 と同じ 6）。
+    /// `settle`はメニューのフラグが何tick続いたら呼ぶか（dllはadonis rev5と同じ6）。
     pub const fn new(settle: u32) -> Self {
         SaveGate {
             settle,
@@ -91,7 +93,7 @@ impl SaveGate {
         }
     }
 
-    /// seg の番号。`tick` が新しい seg の最初の tick で 1 増やす。
+    /// マッチの番号。`tick`が新しいマッチの最初のtickで1増やす。
     pub fn epoch(&self) -> u32 {
         self.epoch
     }
@@ -113,7 +115,7 @@ impl SaveGate {
             });
         }
         if self.leaving {
-            // 抜ける tick の後に、場面 2 のまま次の要求も 2 に戻った（「再戦」）。
+            // 抜けるtickの後に場面2のまま次の要求も2に戻った（「再戦」）。
             self.fresh();
             self.enter_seg();
         }
@@ -138,15 +140,15 @@ impl SaveGate {
         self.called = true;
     }
 
-    /// 場面 2 を抜ける tick の後も、次の seg に数え直すまでは残る（抜ける tick の後半でネットワーク処理が「保存して終了」を見るため）。
+    /// 場面2を抜けるtickの後も次のマッチに数え直すまでは残る（抜けるtickの後半でネットワーク処理が「保存して終了」を見るため）。
     pub fn called(&self) -> bool {
         self.called
     }
 }
 
-/// 印の結果（自分から見た）。勝ち数は席ごと、`required` は勝ちに要る数（ゲームは勝ち数を 1 増やした後に `required` と
-/// 比べてラウンドの演出を決める）。メニューを見ずに抜けたマッチは abort。両席の勝ち数が required に届いた・両席とも届いていない
-/// （メニューが出ていれば起きないはず）は draw にする。
+/// 印の結果（自分から見た）。勝ち数はサイドごと。`required`は勝ちに要る数（ゲームは勝ち数を1増やした後に`required`と比べてラウンドの演出を決める）。
+/// メニューを見ずに抜けたマッチはabort。
+/// 両サイドの勝ち数がrequiredに届いた場合と両サイドとも届いていない場合（メニューが出ていれば起きないはず）はdrawにする。
 pub fn result_of(
     kind: SaveKind,
     me: Side,
@@ -170,7 +172,7 @@ pub fn result_of(
     }
 }
 
-/// 保存関数に渡す名前 `HH:MM:SS`（8 文字）の後ろに NUL と詰め物の 0。範囲外の値（時計の誤り）でも 2 桁ずつに切るので 8 文字を越えない。
+/// 保存関数に渡す名前`HH:MM:SS`（8文字）の後ろにNULとパディングの0。範囲外の値（時計の誤り）でも2桁ずつに切るので8文字を越えない。
 pub fn clock_name(t: &Timestamp) -> [u8; NAME_BUF] {
     let mut out = [0u8; NAME_BUF];
     for (i, v) in [t.hour, t.minute, t.second].into_iter().enumerate() {
@@ -184,20 +186,20 @@ pub fn clock_name(t: &Timestamp) -> [u8; NAME_BUF] {
     out
 }
 
-/// ゲームが持つ exe のフォルダ（`char[0x104]`）を読めなかった訳。
+/// ゲームが持つexeのフォルダ（`char[0x104]`）を読めなかった理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExeDirError {
     NoNul,
     Empty,
-    /// 最後が `/` でない（ゲームは最後の区切りを `/` にして直後で切る）。
+    /// 最後が`/`でない（ゲームは最後の区切りを`/`にして直後で切る）。
     NotSlash,
-    /// 絶対パスでない（`GetModuleFileNameA` が失敗したときの `"./"` など）。作業フォルダに依るので使わない。
+    /// 絶対パスでない（`GetModuleFileNameA`が失敗したときの`"./"`など）。作業フォルダに依るので使わない。
     Relative,
-    NotCp932,
+    NotAnsi,
 }
 
-/// バッファから exe のフォルダ（末尾の `/` を含む。NUL は含まない）を取り出す。
-pub fn exe_dir_of(buf: &[u8]) -> Result<&[u8], ExeDirError> {
+/// バッファからexeのフォルダ（末尾の`/`を含む。NULは含まない）を取り出す。`ansi`で読めない文字があれば断る。
+pub fn exe_dir_of<'a>(buf: &'a [u8], ansi: &dyn Ansi) -> Result<&'a [u8], ExeDirError> {
     let n = buf.iter().position(|&b| b == 0).ok_or(ExeDirError::NoNul)?;
     let dir = &buf[..n];
     if dir.is_empty() {
@@ -214,34 +216,29 @@ pub fn exe_dir_of(buf: &[u8]) -> Result<&[u8], ExeDirError> {
     if !(drive || unc) {
         return Err(ExeDirError::Relative);
     }
-    if decode_cp932(dir).is_none() {
-        return Err(ExeDirError::NotCp932);
+    if ansi.decode(dir).is_none() {
+        return Err(ExeDirError::NotAnsi);
     }
     Ok(dir)
 }
 
-/// CP932 のバイト列を読む（誤りがあれば `None`）。
-pub fn decode_cp932(b: &[u8]) -> Option<String> {
-    let (s, had_errors) = SHIFT_JIS.decode_without_bom_handling(b);
-    (!had_errors).then(|| s.into_owned())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
-    /// フォルダ名かファイル名が 1 つの部品でない（区切り・`.`・`..`・空）。
+    /// フォルダ名かファイル名がパスの1要素でない（区切り・`.`・`..`・空）。
     BadPart(String),
-    NotCp932,
+    NotAnsi,
     TooLong(usize),
 }
 
-/// フォルダ名・ファイル名が 1 つの部品か（空・`.`・`..`・区切り・NUL を含まない）。保管庫の外へ書かないためのガード。
+/// フォルダ名・ファイル名がパスの1要素かどうか（空・`.`・`..`・区切り・NULを含まない）。保管庫の外へ書かないためのガード。
 pub fn is_single_part(p: &str) -> bool {
     !p.is_empty() && p != "." && p != ".." && !p.contains(['\\', '/', '\0'])
 }
 
-/// `<exe のフォルダ>/Replay_HiganRTool\<folder>\<file>` の CP932 のバイト列（NUL は含まない）。`exe_dir` は
-/// `exe_dir_of` が返した形（末尾の `/` を含む）。ゲームの保存も exe のフォルダを前置した形で開く。
+/// `<exe のフォルダ>/Replay_HiganRTool\<folder>\<file>`のANSIのバイト列（NULは含まない）。
+/// `exe_dir`は`exe_dir_of`が返した形（末尾の`/`を含む。すでにANSI）。ゲームの保存もexeのフォルダを前置した形で開く。
 pub fn ansi_vault_path(
+    ansi: &dyn Ansi,
     exe_dir: &[u8],
     folder: Option<&str>,
     file: &str,
@@ -258,7 +255,7 @@ pub fn ansi_vault_path(
     }
     rel.push('\\');
     rel.push_str(file);
-    let tail = vault::to_cp932(&rel).ok_or(PathError::NotCp932)?;
+    let tail = ansi.encode(&rel).ok_or(PathError::NotAnsi)?;
     let mut out = Vec::with_capacity(exe_dir.len() + tail.len());
     out.extend_from_slice(exe_dir);
     out.extend_from_slice(&tail);
@@ -268,15 +265,17 @@ pub fn ansi_vault_path(
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaySettings {
     pub split: Split,
+    /// ファイル名のテンプレート（書かれたまま。解析と、不適切なときの代わりの名前は`replay_name`）。
+    pub name: String,
 }
 
-/// 読めるキー（綴りの誤りで既定の値のまま走らないよう、これ以外は断る）。
-const KEYS: [&str; 2] = ["enable", "layout"];
+/// 読み取るキー。これ以外は断る（綴りの誤りで既定の値のまま走らないように）。
+const KEYS: [&str; 3] = ["enable", "layout", "name"];
 
-/// `[replay]` を読む。節が無い・`enable` が無いか 0 なら `Ok(None)`（自動保存は動かない。既定）。
+/// `[replay]`を読む。節が無い・`enable`が無いか0なら`Ok(None)`（自動保存は動かない。既定）。
 pub fn settings_from_ini(ini: &Ini) -> Result<Option<ReplaySettings>, String> {
     if !ini.has_section(SECTION) {
         return Ok(None);
@@ -300,11 +299,16 @@ pub fn settings_from_ini(ini: &Ini) -> Result<Option<ReplaySettings>, String> {
             format!("layout の値 {v:?} は peer / date / flat / pack50 のどれかにしてください")
         })?,
     };
-    Ok(Some(ReplaySettings { split }))
+    let name = ini
+        .get(SECTION, "name")
+        .unwrap_or(DEFAULT_TEMPLATE)
+        .to_string();
+    Ok(Some(ReplaySettings { split, name }))
 }
 
-/// 保存の直前に、見出しのチャージ型をゲームの設定のコピー（生きた試合が使った値）に合わせた結果。見出しは読み込みスレッドがその PC の
-/// `th09.cfg` からコピーしたままなので、そのまま保存すると、相手と設定が違う試合を素の花映塚で再生したときにずれる。
+/// 保存の直前にヘッダのチャージ型をゲームの設定のコピー（生きた試合が使った値）に合わせた結果。
+/// ヘッダは読み込みスレッドがそのPCの`th09.cfg`からコピーしたまま。
+/// そのまま保存すると相手と設定が違う試合を素の花映塚で再生したときにずれる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChargeSync {
     /// 試みていない（保存の記録の初期値）。
@@ -314,18 +318,18 @@ pub enum ChargeSync {
         p1: u8,
         p2: u8,
     },
-    /// コピーのポインタが 0 か読めない（書かない）。
+    /// コピーのポインタが0か読み取れない（書かない）。
     NoCopy,
-    /// 見出しのポインタが 0 か読めない（書かない）。
+    /// ヘッダのポインタが0か読み取れない（書かない）。
     NoHeader,
-    /// コピーの中のチャージ型が読めない（書かない）。
+    /// コピーの中のチャージ型が読み取れない（書かない）。
     CopyUnreadable,
-    /// 見出しへ書けなかった。
+    /// ヘッダへ書き込めなかった。
     WriteFailed,
 }
 
 impl ChargeSync {
-    /// 保存の記録（原子変数の 1 語）へ。下位 8 ビットが種類、次の 8 ビットが 1P、その次の 8 ビットが 2P。
+    /// 保存の記録（アトミック変数の1ワード）へ。下位8ビットが種類。次の8ビットが1P。その次の8ビットが2P。
     pub fn to_word(self) -> u32 {
         match self {
             ChargeSync::NotTried => 0,
@@ -353,9 +357,9 @@ impl ChargeSync {
     }
 }
 
-/// 設定のコピーのチャージ型 2 バイト（`copy + copy_off`、1P・2P の順）を、見出しの同じ並びの 2 バイト（`header + header_off`）へコピーする。
-/// ポインタが 0 のとき・読めないときは 1 バイトも書かない。席は入れ替えない（1P は 1P へ、2P は 2P へ）。
-/// `read` / `write` は落ちない読み書き（読めない・書けないアドレスは `None` / false を返す）。
+/// 設定のコピーのチャージ型2バイト（`copy + copy_off`。1P・2Pの順）をヘッダの同じ並びの2バイト（`header + header_off`）へコピーする。
+/// ポインタが0のとき・読み取れないときは1バイトも書かない。サイドは入れ替えない（1Pは1Pへ・2Pは2Pへ）。
+/// `read` / `write`は例外を出さない読み書き（読み取れない・書き込めないアドレスは`None` / falseを返す）。
 pub fn sync_header_charge(
     copy: Option<u32>,
     header: Option<u32>,
@@ -392,6 +396,28 @@ pub fn sync_header_charge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ansi::EncodingAnsi;
+
+    fn sjis() -> EncodingAnsi {
+        EncodingAnsi::shift_jis()
+    }
+
+    fn gbk() -> EncodingAnsi {
+        EncodingAnsi::gbk()
+    }
+
+    // 既存の検査は日本語のWindows（CP932）の動き。
+    fn exe_dir_of(buf: &[u8]) -> Result<&[u8], ExeDirError> {
+        super::exe_dir_of(buf, &sjis())
+    }
+
+    fn ansi_vault_path(
+        exe_dir: &[u8],
+        folder: Option<&str>,
+        file: &str,
+    ) -> Result<Vec<u8>, PathError> {
+        super::ansi_vault_path(&sjis(), exe_dir, folder, file)
+    }
 
     fn scene(in_match: bool, leaving: bool, menu: bool) -> GateScene {
         GateScene {
@@ -431,7 +457,7 @@ mod tests {
         assert_eq!(g.tick(MENU), None);
         assert_eq!(g.tick(MENU), None);
         assert_eq!(g.tick(MENU), Some(SaveKind::MenuShown));
-        // finish の前は毎 tick 返す（パスの準備が間に合わなかった tick の再試行）。
+        // finishの前は毎tick返す（パスの準備が間に合わなかったtickの再試行）。
         assert_eq!(g.tick(MENU), Some(SaveKind::MenuShown));
         g.finish();
         for _ in 0..10 {
@@ -449,7 +475,7 @@ mod tests {
         assert_eq!(g.tick(LEAVE), Some(SaveKind::Leaving { menu_seen: false }));
         assert_eq!(g.tick(LEAVE), None, "同じ抜ける tick の繰り返し");
         assert_eq!(g.tick(LEAVE), None);
-        // メニューを 2 tick 見た（settle に届かない）後で抜けた seg は「見た」。
+        // メニューを2 tick見た（settleに届かない）後で抜けたマッチは「見た」。
         let mut g = SaveGate::new(6);
         assert_eq!(g.tick(MENU), None);
         assert_eq!(g.tick(MENU), None);
@@ -465,7 +491,7 @@ mod tests {
         assert_eq!(g.tick(MENU), Some(SaveKind::MenuShown));
         g.finish();
         assert_eq!(g.tick(LEAVE), None);
-        // 再戦: 場面 2 のまま、次の要求が 2 に戻った。読み込み中の印は数えない。
+        // 再戦: 場面2のまま次の要求が2に戻った。読み込み中のフラグは数えない。
         let loading_menu = GateScene {
             loading: true,
             ..MENU
@@ -487,12 +513,12 @@ mod tests {
     fn epoch_counts_each_seg_once_even_across_rematch_and_exit() {
         let mut g = SaveGate::new(2);
         assert_eq!(g.epoch(), 0);
-        // 場面 2 の外では増えない。
+        // 場面2の外では増えない。
         for _ in 0..5 {
             g.tick(scene(false, false, false));
         }
         assert_eq!(g.epoch(), 0);
-        // 入った tick に 1 増え、同じ seg の間は増えない（メニュー・finish・抜ける tick も）。
+        // 入ったtickに1増える。同じマッチの間は増えない（メニュー・finish・抜けるtickも）。
         g.tick(PLAY);
         assert_eq!(g.epoch(), 1);
         g.tick(PLAY);
@@ -503,7 +529,7 @@ mod tests {
         g.tick(LEAVE);
         g.tick(LEAVE);
         assert_eq!(g.epoch(), 1);
-        // 再戦: 抜けた後に場面 2 のまま戻った tick で 2。
+        // 再戦: 抜けた後に場面2のまま戻ったtickで2。
         g.tick(PLAY);
         assert_eq!(g.epoch(), 2);
         g.tick(PLAY);
@@ -513,7 +539,7 @@ mod tests {
         assert_eq!(g.epoch(), 2);
         g.tick(PLAY);
         assert_eq!(g.epoch(), 3);
-        // 入ってすぐ抜ける seg も 1 つに数える。
+        // 入ってすぐ抜けるマッチも1つに数える。
         g.tick(scene(false, false, false));
         g.tick(LEAVE);
         assert_eq!(g.epoch(), 4);
@@ -619,7 +645,7 @@ mod tests {
         assert_eq!(exe_dir_of(unc), Ok(&unc[..unc.len() - 1]));
         let jp = b"C:\\\x93\x8C/\0";
         assert_eq!(exe_dir_of(jp), Ok(&jp[..jp.len() - 1]));
-        assert_eq!(exe_dir_of(b"C:\\\x81/\0"), Err(ExeDirError::NotCp932));
+        assert_eq!(exe_dir_of(b"C:\\\x81/\0"), Err(ExeDirError::NotAnsi));
     }
 
     #[test]
@@ -652,9 +678,9 @@ mod tests {
         }
         assert_eq!(
             ansi_vault_path(exe, Some("😀"), "x.rpy"),
-            Err(PathError::NotCp932)
+            Err(PathError::NotAnsi)
         );
-        // 長さ: exe 5 ＋ "Replay_HiganRTool\" 18 ＋ ファイル名 n。
+        // 長さ: exe 5 ＋ "Replay_HiganRTool\" 18 ＋ ファイル名n。
         let fixed = exe.len() + VAULT_DIR.len() + 1;
         let fits = "f".repeat(ANSI_PATH_MAX - fixed);
         assert_eq!(
@@ -666,6 +692,77 @@ mod tests {
             ansi_vault_path(exe, None, &over),
             Err(PathError::TooLong(ANSI_PATH_MAX + 1))
         );
+    }
+
+    // 中国語のWindowsの「D:\东方\」（CP936で 东 = B6 AB、方 = B7 BD）。
+    const GBK_EXE: &[u8] = b"D:\\\xB6\xAB\xB7\xBD/";
+
+    #[test]
+    fn a_chinese_exe_dir_is_read_as_chinese_and_not_as_shift_jis() {
+        let mut b = [0u8; 0x104];
+        b[..GBK_EXE.len()].copy_from_slice(GBK_EXE);
+        assert_eq!(super::exe_dir_of(&b, &gbk()), Ok(GBK_EXE));
+        let dir = &GBK_EXE[..GBK_EXE.len() - 1];
+        assert_eq!(gbk().decode(dir).as_deref(), Some("D:\\东方"));
+        // 決め打ちのCP932で読むと化けた名前（半角カナ）になる。
+        let wrong = sjis().decode(dir).unwrap();
+        assert!(wrong.starts_with("D:\\ｶｫ"), "{wrong}");
+        // CP936にだけある文字（A9 96 = 〇）を含む名前はCP932では読めない。
+        let only_gbk = b"D:\\\xA9\x96/\0";
+        assert_eq!(
+            super::exe_dir_of(only_gbk, &gbk()),
+            Ok(&only_gbk[..only_gbk.len() - 1])
+        );
+        assert_eq!(
+            super::exe_dir_of(only_gbk, &sjis()),
+            Err(ExeDirError::NotAnsi)
+        );
+        // 読めない並びは断る。
+        assert_eq!(
+            super::exe_dir_of(b"C:\\\x81/\0", &gbk()),
+            Err(ExeDirError::NotAnsi)
+        );
+    }
+
+    #[test]
+    fn the_ansi_path_for_a_chinese_exe_dir_keeps_its_bytes() {
+        let g = gbk();
+        let got =
+            super::ansi_vault_path(&g, GBK_EXE, Some("东方 vs ab"), "th9_ud0001.rpy").unwrap();
+        let mut want = GBK_EXE.to_vec();
+        want.extend_from_slice(b"Replay_HiganRTool\\");
+        want.extend_from_slice(&[0xB6, 0xAB, 0xB7, 0xBD]);
+        want.extend_from_slice(b" vs ab\\th9_ud0001.rpy");
+        assert_eq!(got, want);
+        // 日本語のWindowsのCP932では同じ名前の「东」は表せないので保存しない。
+        assert_eq!(
+            super::ansi_vault_path(&sjis(), GBK_EXE, Some("东"), "x.rpy"),
+            Err(PathError::NotAnsi)
+        );
+        assert_eq!(
+            super::ansi_vault_path(&g, GBK_EXE, Some("ｱ"), "x.rpy"),
+            Err(PathError::NotAnsi)
+        );
+    }
+
+    #[test]
+    fn the_ansi_path_length_counts_gbk_bytes() {
+        let g = gbk();
+        let fixed = GBK_EXE.len() + VAULT_DIR.len() + 1;
+        let fits = "f".repeat(ANSI_PATH_MAX - fixed);
+        assert_eq!(
+            super::ansi_vault_path(&g, GBK_EXE, None, &fits)
+                .unwrap()
+                .len(),
+            ANSI_PATH_MAX
+        );
+        // 文字数では259以下でもGBKの2バイトの文字で超える。
+        let han = "东".repeat((ANSI_PATH_MAX - fixed) / 2 + 1);
+        assert!(han.chars().count() <= ANSI_PATH_MAX - fixed);
+        assert!(matches!(
+            super::ansi_vault_path(&g, GBK_EXE, None, &han),
+            Err(PathError::TooLong(_))
+        ));
     }
 
     fn ini(text: &str) -> Ini {
@@ -680,13 +777,25 @@ mod tests {
         assert_eq!(settings_from_ini(&ini("[replay]\nenable = 0\n")), Ok(None));
         assert_eq!(
             settings_from_ini(&ini("[replay]\nenable = 1\n")),
-            Ok(Some(ReplaySettings { split: Split::Peer }))
+            Ok(Some(ReplaySettings {
+                split: Split::Peer,
+                name: "th9_ud{num}".to_string()
+            }))
         );
         assert_eq!(
             settings_from_ini(&ini("[Replay]\nenable = 1\nlayout = PACK50\n")),
             Ok(Some(ReplaySettings {
-                split: Split::Pack50
+                split: Split::Pack50,
+                name: "th9_ud{num}".to_string()
             }))
+        );
+        // 名前の記法は読むだけで断らない（不適切ならdllが既定の名前で保存して知らせる）。
+        assert_eq!(
+            settings_from_ini(&ini("[replay]\nenable = 1\nname = a{foo}:b ; 注\n"))
+                .unwrap()
+                .unwrap()
+                .name,
+            "a{foo}:b"
         );
         assert!(settings_from_ini(&ini("[replay]\nenable = yes\n")).is_err());
         assert!(settings_from_ini(&ini("[replay]\nenable = 1\nlayuot = date\n")).is_err());
@@ -694,7 +803,7 @@ mod tests {
         assert!(settings_from_ini(&ini("[replay]\nenable = 0\nx = 1\n")).is_err());
     }
 
-    /// 偽のメモリ: 設定のコピー（0x1000 から）と見出し（0x2000 から）。書けない範囲は `ro` で指定する。
+    /// 偽のメモリ: 設定のコピー（0x1000から）とヘッダ（0x2000から）。書き込めない範囲は`ro`で指定する。
     struct Mem {
         bytes: std::collections::BTreeMap<u32, u8>,
         ro: Vec<u32>,
@@ -704,7 +813,7 @@ mod tests {
     impl Mem {
         fn new() -> Mem {
             let mut bytes = std::collections::BTreeMap::new();
-            // コピー側: +0xB4 = 1P、+0xB5 = 2P。見出しは cfg 由来の 0 / 0。
+            // コピー側: +0xB4 = 1P。+0xB5 = 2P。ヘッダはcfg由来の0 / 0。
             bytes.insert(0x1000 + 0xB4, 1);
             bytes.insert(0x1000 + 0xB5, 0);
             bytes.insert(0x2000 + 0x190, 0);
@@ -720,7 +829,7 @@ mod tests {
             let bytes = &mut self.bytes;
             let ro = &self.ro;
             let writes = &mut self.writes;
-            // 読みと書きが同じ偽のメモリを触るので、読みは呼ぶ前のコピーから引く。
+            // 読みと書きが同じ偽のメモリを触るので読みは呼ぶ前のコピーから取得する。
             let snapshot = bytes.clone();
             sync_header_charge(
                 copy,
@@ -749,7 +858,7 @@ mod tests {
         );
         assert_eq!(m.bytes[&(0x2000 + 0x190)], 1, "1P の欄は写しの 1P");
         assert_eq!(m.bytes[&(0x2000 + 0x191)], 0, "2P の欄は写しの 2P");
-        // 席を入れ替えて見る（2P だけチャージ型）。
+        // サイドを入れ替えて見る（2Pだけチャージ型）。
         let mut m = Mem::new();
         m.bytes.insert(0x1000 + 0xB4, 0);
         m.bytes.insert(0x1000 + 0xB5, 1);
@@ -761,7 +870,7 @@ mod tests {
             (m.bytes[&(0x2000 + 0x190)], m.bytes[&(0x2000 + 0x191)]),
             (0, 1)
         );
-        // 書くのは 2 バイトだけ。
+        // 書くのは2バイトだけ。
         assert_eq!(m.writes, vec![(0x2000 + 0x190, 0), (0x2000 + 0x191, 1)]);
     }
 
@@ -774,7 +883,7 @@ mod tests {
             (Some(0x1000), None, ChargeSync::NoHeader),
             (Some(0x1000), Some(0), ChargeSync::NoHeader),
             (Some(0x1000), Some(u32::MAX), ChargeSync::NoHeader),
-            // 指す先が読めない
+            // 指す先が読み取れない
             (Some(0x5000), Some(0x2000), ChargeSync::CopyUnreadable),
         ] {
             let mut m = Mem::new();
@@ -791,7 +900,7 @@ mod tests {
         let mut m = Mem::new();
         m.ro.push(0x2000 + 0x190);
         assert_eq!(m.sync(Some(0x1000), Some(0x2000)), ChargeSync::WriteFailed);
-        // 見出しの先が無い（書けない）。
+        // ヘッダの先が無い（書き込めない）。
         let mut m = Mem::new();
         assert_eq!(m.sync(Some(0x1000), Some(0x3000)), ChargeSync::WriteFailed);
     }

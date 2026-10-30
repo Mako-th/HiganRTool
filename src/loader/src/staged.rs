@@ -1,5 +1,5 @@
-//! 起動の各段（プロセスを作る・領域を確保する・書き込む・読み込みのスレッドを作る・LoadLibraryW の戻り・再開）を、
-//! 呼ぶ前に 1 行ログへ書いてから素通しで呼ぶ包み。呼んだ先で落ちても、どの段だったかが最後の行に残る。
+//! 起動の各ステップ（プロセスの作成・領域の確保・書き込み・読み込みスレッドの作成・LoadLibraryWの戻り・再開）を呼ぶ前に1行ログへ書いてからそのまま呼ぶラッパー。
+//! 呼んだ先で落ちても、どのステップだったかが最後の行に残る。
 //! 結果は呼んだ後に続けて書く。パスは書かない。
 
 use std::path::Path;
@@ -10,7 +10,7 @@ use crate::win::{ErrorCode, Handle, LaunchNote, ProcessInfo, Remote, Spawn, Wait
 pub struct Logged<'a, W: Win32> {
     pub inner: W,
     log: &'a dyn Fn(&str),
-    /// 画面に出す知らせ。ログへは包みが書く。
+    /// 画面に出す知らせ。ログへはラッパーが書く。
     announce: &'a dyn Fn(LaunchNote),
 }
 
@@ -101,7 +101,7 @@ impl<W: Win32> Win32 for Logged<'_, W> {
         r
     }
 
-    /// 待ち 0（生きているかの問い合わせ）は、ゲームが続く間に何度も呼ばれるのでログに書かない。
+    /// 待ち0（生きているかの問い合わせ）はゲームが続く間に何度も呼ばれるのでログに書かない。
     fn wait(&mut self, handle: Handle, timeout_ms: u32) -> WaitResult {
         if timeout_ms == 0 {
             return self.inner.wait(handle, timeout_ms);

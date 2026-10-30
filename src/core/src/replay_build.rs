@@ -1,13 +1,13 @@
-//! 検査用の書き込み側: 合成のリプレイ（`T9RP`）を組む。`replay_decode` の往復と `replay_inputs` の検査が使う。
-//! 書くのは配列 A / B / C（と D）とゲームが検査する見出しだけ。実在の値は入れない（名前は既定の `NO NAME`）。
-//! 読み側と同じ思い違いをしていると往復は通るので、読み側には仕様から手で組んだ標本の検査もある。
+//! 検査用の書き込み側: 合成のリプレイ（`T9RP`）を組む。`replay_decode`の往復と`replay_inputs`の検査が使う。
+//! 書くのは配列A / B / C（とD）とゲームが検査するヘッダだけ。実在の値は書き込まない（名前は既定の`NO NAME`）。
+//! 読み側と同じ思い違いをしていると往復は通るので読み側には仕様から手で組んだサンプルの検査もある。
 
 use crate::replay_decode::{
     BLOCKS_START, BODY_START, CHECKSUM_SEED, CHUNK_FRAMES, ENC_START, FPS_EVERY,
     LZSS_INITIAL_WRITE, SLOTS, STAGE_HEADER_LEN, encrypt_in_place, expected_fps_len,
 };
 
-/// 履歴のリングバッファ。`replay_decode` と同じ値だが、片方だけの直しに気づけるよう別に持つ。
+/// 履歴のリングバッファ。`replay_decode`と同じ値だが片方だけの修正に気づけるよう別に持つ。
 const WINDOW: usize = 8192;
 const WINDOW_MASK: usize = WINDOW - 1;
 const MAX_MATCH: usize = 18;
@@ -38,9 +38,9 @@ impl BitWriter {
     }
 }
 
-/// 展開の逆（ゲームの圧縮 `0x00434020` と同じ形式）。履歴は 8192 バイトのリングバッファで、書き込み位置は 1 から。
-/// 位置 0 は終わりの印なので一致には使わない。まだ書いていない位置も使わない: ゲームの展開は履歴を 0 で埋めておらず、
-/// ゲーム自身の圧縮もそこを指さない（指したリプレイはゲームの一覧で読めない枠になった）。
+/// 展開の逆（ゲームの圧縮`0x00434020`と同じ形式）。履歴は8192バイトのリングバッファ。書き込み位置は1から。
+/// 位置0は終わりの印なので一致には使わない。
+/// まだ書いていない位置も使わない。ゲームの展開は履歴を0で埋めておらず、ゲーム自身の圧縮もそこを指さない（指したリプレイはゲームの一覧で読めない枠になった）。
 pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter {
         out: Vec::new(),
@@ -61,7 +61,7 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
                 let mut len = 0usize;
                 while len < max {
                     let q = (pos + len) & WINDOW_MASK;
-                    // q が一致の中で既に書いた位置なら、その値はデータの側。
+                    // qが一致の中で既に書いた位置なら、その値はデータの側。
                     let back = (q + WINDOW - write) & WINDOW_MASK;
                     let src = if back < len {
                         data[i + back]
@@ -103,7 +103,7 @@ pub fn lzss_compress(data: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    // 終わりの印: フラグ 0 と 13 bit の 0。端数は書かない。
+    // 終わりの印: フラグ0と13 bitの0。端数は書かない。
     w.put(false);
     w.put_bits(0, 13);
     w.out
@@ -120,9 +120,9 @@ pub struct StageSpec {
     pub p2_cpu_level: u16,
     pub p1_inputs: Vec<u16>,
     pub p2_inputs: Vec<u16>,
-    /// `None` なら `A | B`（実データの姿）。
+    /// `None`なら`A | B`（実データの姿）。
     pub p3_inputs: Option<Vec<u16>>,
-    /// `None` ならフレーム数から決まる長さで全部 60。
+    /// `None`ならフレーム数から決まる長さで全部60。
     pub fps: Option<Vec<u8>>,
 }
 
@@ -148,17 +148,17 @@ impl StageSpec {
 pub struct BuildSpec {
     /// 暗号の鍵（`+0x15`）。
     pub key: u8,
-    /// `+0x14` の乱数のゴミ。
+    /// `+0x14`の乱数のゴミ。
     pub junk: u8,
     pub game_mode: u8,
     pub difficulty: u8,
     pub stages: Vec<StageSpec>,
-    /// USER チャンクの本文（Shift-JIS。末尾の NUL は足す）。
+    /// USERチャンクの本文（Shift-JIS。末尾のNULは足す）。
     pub user_text: Vec<u8>,
 }
 
 impl BuildSpec {
-    /// Match（枠 9 だけ。2 席とも人間）。
+    /// Match（枠9だけ。2サイドとも人間）。
     pub fn match_replay(key: u8, p1_inputs: Vec<u16>, p2_inputs: Vec<u16>) -> Self {
         BuildSpec {
             key,
@@ -175,7 +175,7 @@ fn put_u32(v: &mut [u8], off: usize, x: u32) {
     v[off..off + 4].copy_from_slice(&x.to_le_bytes());
 }
 
-/// A / B / C のブロック（先頭の 0x20 バイトの構造体 ＋ 1 フレーム u16）。
+/// A / B / Cのブロック（先頭の0x20バイトの構造体 ＋ 1フレームu16）。
 fn stage_block(spec: &StageSpec, side: u8, words: &[u16]) -> Vec<u8> {
     let mut b = vec![0u8; STAGE_HEADER_LEN];
     if side < 2 {
@@ -191,7 +191,7 @@ fn stage_block(spec: &StageSpec, side: u8, words: &[u16]) -> Vec<u8> {
             b[0x0A..0x0C].copy_from_slice(&spec.p2_cpu_level.to_le_bytes());
         }
     } else {
-        // C は `+0x04`（RNG）以外 0。
+        // Cは`+0x04`（RNG）以外0。
         b[0x04..0x06].copy_from_slice(&spec.rng_seed.to_le_bytes());
     }
     for w in words {
@@ -200,9 +200,9 @@ fn stage_block(spec: &StageSpec, side: u8, words: &[u16]) -> Vec<u8> {
     b
 }
 
-/// 合成のリプレイ（末尾に USER チャンク 1 つ）。`slot`（0〜9）が枠で重ならないのは呼ぶ側の責任。
+/// 合成のリプレイ（末尾にUSERチャンク1つ）。`slot`（0〜9）が枠で重ならないのは呼ぶ側の責任。
 pub fn build_replay(spec: &BuildSpec) -> Vec<u8> {
-    // 本体: `0xC0` 以降。見出し部（`0xC0`〜`0x1EC`）→ 配列 A、B、C、D の順に、使う枠だけ。
+    // 本体: `0xC0`以降。ヘッダ部（`0xC0`〜`0x1EC`）→ 配列A・B・C・Dの順に使う枠だけ。
     let mut body = vec![0u8; BLOCKS_START - BODY_START];
     body[0] = 0x77; // 0xC0: 乱数のゴミ
     body[1] = b'a'; // 0xC1: バージョンの枝番
@@ -214,7 +214,7 @@ pub fn build_replay(spec: &BuildSpec) -> Vec<u8> {
         .iter_mut()
         .enumerate()
     {
-        *x = (i % 251) as u8; // オプションの塊の代わり
+        *x = (i % 251) as u8; // オプションのブロックの代わり
     }
     body[0x1DC - BODY_START..0x1DC - BODY_START + 6].copy_from_slice(b"0150a\0");
     body[0x1E4 - BODY_START] = spec.game_mode;
@@ -279,7 +279,7 @@ pub fn build_replay(spec: &BuildSpec) -> Vec<u8> {
     let mut file = plain;
     encrypt_in_place(&mut file[ENC_START..comp_size], spec.key);
 
-    // USER チャンク（ゲームと同じ: 全長 = 本文 + 13 を偶数へ、`+0x08` は残り物）。
+    // USERチャンク（ゲームと同じ: 全長 = 本文 + 13 を偶数へ、`+0x08`は残り物）。
     let total = (spec.user_text.len() + 13 + 1) & !1;
     file.extend_from_slice(b"USER");
     file.extend_from_slice(&(total as u32).to_le_bytes());
@@ -290,7 +290,7 @@ pub fn build_replay(spec: &BuildSpec) -> Vec<u8> {
     file
 }
 
-/// 読み側の `CHUNK_FRAMES` / `FPS_EVERY` をコピーした定数。検査が食い違いを見る場所。
+/// 読み側の`CHUNK_FRAMES` / `FPS_EVERY`をコピーした定数。検査が食い違いを見る場所。
 pub fn chunk_constants() -> (usize, usize) {
     (CHUNK_FRAMES, FPS_EVERY)
 }
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(chunk_constants(), (3598, 30));
     }
 
-    /// 履歴を `fill` で埋めて展開する（ゲームの展開は履歴を 0 で埋めない）。終わりの印で止まる。
+    /// 履歴を`fill`で埋めて展開する（ゲームの展開は履歴を0で埋めない）。終わりの印で止まる。
     fn unlzss_with_fill(data: &[u8], fill: u8) -> Vec<u8> {
         let bit = |p: usize| (data[p / 8] >> (7 - p % 8)) & 1;
         let take = |p: &mut usize, n: usize| {
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn compress_never_reads_unwritten_history() {
-        // 先頭が 0 の並びだと、0 のまま書いていない履歴の位置に一致してしまう。
+        // 先頭が0の並びだと0のまま書いていない履歴の位置に一致してしまう。
         let mut data = vec![0x77u8, 0x61, 0x50, 0x01];
         data.extend(std::iter::repeat_n(0u8, 40));
         data.extend((0..3000u32).map(|i| (i % 13) as u8));
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn compress_ends_with_dropped_partial_byte() {
-        // 空は 14 bit で 1 バイト、リテラル 1 つは 9 + 14 = 23 bit で 2 バイト。
+        // 空は14 bitで1バイト、リテラル1つは 9 + 14 = 23 bitで2バイト。
         assert_eq!(lzss_compress(&[]), vec![0x00]);
         assert_eq!(lzss_compress(&[0xFF]), vec![0xFF, 0x80]);
     }

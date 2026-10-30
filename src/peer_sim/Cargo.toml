@@ -3,11 +3,15 @@ name = "peer_sim"
 description = "偽の対戦相手。花映塚を使わずプロトコルだけ話す。検査と、1 台での lockstep の確かめに使う"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
 # 本体は lib に置き、exe（main.rs）は引数を読んで lib を呼ぶだけにする。
 # `tests/` の組み上がりの検査が、同じ本体を 2 本のスレッドで直に呼べるように。
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 

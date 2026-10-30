@@ -1,7 +1,8 @@
-//! 画面の言語の決め方。ini の `[ui] lang`（`auto` / `ja` / `en`）→ `auto` なら OS の UI の言語（`higanr_core::lang::resolve`）。
+//! 画面の言語の決め方。iniの`[ui] lang`（`auto` / `ja` / `en`）→ `auto`ならOSのUIの言語（`higanr_core::lang::resolve`）。
 //!
-//! 読めない ini・誤った `[ui]` は `auto` として扱う（言語が決まらずに起動を止めない）。ini の場所は dll と同じ決め方
-//! （`code_relay::ini_location`）。メニューで選んだ値は dll が ini の `lang` の行へ書き戻す。
+//! 読めないini・誤った`[ui]`は`auto`として扱う（言語が決まらずに起動を止めない）。
+//! iniの場所はdllと同じ決め方（`code_relay::ini_location`）。
+//! メニューで選んだ値はdllがiniの`lang`の行へ書き戻す。
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -10,7 +11,7 @@ use higanr_core::lang::{self, Lang, LangSetting};
 
 use crate::code_relay;
 
-/// 2 つの書式のうち言語に合う方で `format!` する。語順が違う文は、片方を機械的にコピーせずそれぞれ書く。
+/// 2つの書式のうち言語に合う方で`format!`する。語順が違う文は片方を機械的にコピーせずそれぞれ書く。
 macro_rules! by_lang {
     ($lang:expr, ja: $ja:literal, en: $en:literal $(, $($arg:tt)*)?) => {
         match $lang {
@@ -21,7 +22,7 @@ macro_rules! by_lang {
 }
 pub(crate) use by_lang;
 
-/// 材料から言語を決める。ini が読めなかった・`[ui]` が誤っていたときは `Auto` 扱い。
+/// 材料から言語を決める。iniが読めなかった・`[ui]`が誤っていたときは`Auto`扱い。
 pub fn decide(ini_text: Option<&str>, os_langid: u16) -> Lang {
     let setting = ini_text
         .and_then(|t| higanr_core::ini::parse(t).ok())
@@ -30,7 +31,7 @@ pub fn decide(ini_text: Option<&str>, os_langid: u16) -> Lang {
     lang::resolve(setting, os_langid)
 }
 
-/// ini の場所と DLL のフォルダから、ini を読んで決める。`inherited` は親から継いだ ini の環境変数。
+/// iniの場所とDLLのフォルダからiniを読んで決める。`inherited`は親から継いだiniの環境変数。
 pub fn detect_with(
     ini_flag: Option<&Path>,
     inherited: Option<&OsStr>,
@@ -47,9 +48,17 @@ pub fn detect(ini_flag: Option<&Path>, dll_dir: &Path, os_langid: u16) -> Lang {
     detect_with(ini_flag, inherited.as_deref(), dll_dir, os_langid)
 }
 
-/// ゲームのメニューの項目の名前。英語の文でも訳さずに書くので、「英語に日本語が無い」検査は除いてから見る。
+/// ゲームのメニューの項目の名前。英語の文でも訳さずに書くので「英語に日本語が無い」検査は除いてから見る。
 #[cfg(test)]
-pub const GAME_ITEM_NAME: &str = "妖怪 対 妖怪";
+pub const GAME_ITEM_NAMES: [&str; 2] = ["妖怪 対 妖怪", "人間 対 人間"];
+
+/// `s`からゲームのメニューの項目の名前を除いた文。
+#[cfg(test)]
+pub fn without_game_items(s: &str) -> String {
+    GAME_ITEM_NAMES
+        .iter()
+        .fold(s.to_string(), |acc, name| acc.replace(name, ""))
+}
 
 #[cfg(test)]
 mod tests {
@@ -94,17 +103,17 @@ mod tests {
         let root = temp_dir("detect");
         let dll_dir = root.join("bin");
         std::fs::create_dir_all(&dll_dir).unwrap();
-        // ini が無い: OS の言語。
+        // iniが無い: OSの言語。
         assert_eq!(detect_with(None, None, &dll_dir, EN_OS), Lang::En);
         assert_eq!(detect_with(None, None, &dll_dir, JA_OS), Lang::Ja);
-        // DLL のフォルダの ini の固定が OS に勝つ。
+        // DLLのフォルダのiniの固定がOSに勝つ。
         std::fs::write(dll_dir.join("HiganRTool.ini"), "[ui]\nlang = en\n").unwrap();
         assert_eq!(detect_with(None, None, &dll_dir, JA_OS), Lang::En);
-        // --ini で別の ini を指すと、そちらの [ui] に従う。
+        // --iniで別のiniを指すと、そちらの[ui]に従う。
         let other = root.join("other.ini");
         std::fs::write(&other, "[ui]\nlang = ja\n").unwrap();
         assert_eq!(detect_with(Some(&other), None, &dll_dir, EN_OS), Lang::Ja);
-        // 継いだ環境変数の ini（絶対パス）はそれに従い、空なら ini は無し（dll もネットワークの準備をしない）。
+        // 継いだ環境変数のini（絶対パス）はそれに従い、空ならiniは無し（dllもネットワークの準備をしない）。
         assert_eq!(
             detect_with(None, Some(other.as_os_str()), &dll_dir, EN_OS),
             Lang::Ja
@@ -116,7 +125,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// 日英の組の一覧。ここに無い定数は検査から漏れるので、`Tx` の定数を足したらここにも足す。
+    /// 日英のペアの一覧。ここに無い定数は検査から漏れるので`Tx`の定数を足したらここにも足す。
     fn all_tx() -> Vec<(&'static str, Tx)> {
         vec![
             ("cli::USAGE", cli::USAGE),
@@ -148,7 +157,7 @@ mod tests {
             assert_ne!(t.ja, t.en, "{name} が日英で同じ");
             assert!(has_japanese(t.ja), "{name} の日本語に日本語の文字が無い");
             // ゲームの項目の名前は訳さないので数えない。英語の文に日本語の括弧は使わない。
-            let without_game_item = t.en.replace(GAME_ITEM_NAME, "");
+            let without_game_item = without_game_items(t.en);
             assert!(
                 !has_japanese(&without_game_item),
                 "{name} の英語に日本語の文字: {}",

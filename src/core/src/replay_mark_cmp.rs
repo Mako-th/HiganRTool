@@ -1,11 +1,12 @@
-//! 複数台のリプレイの印（`HGRT`）のラウンドの記録を並べて比べるツールの中身（pure。ツールは `src/bin/replay_mark_cmp.rs`）。
+//! 複数台のリプレイの印（`HGRT`）のラウンドの記録を並べて比べるツールの中身（pure。ツールは`src/bin/replay_mark_cmp.rs`）。
 //!
-//! 印のラウンドの記録（`rN`）は、保存した台がマッチの間に生きたゲームの状態から境目の tick で読んだ値で、リプレイを再生して出した値ではない
-//! （`replay_detail`）。rollback の 2 台（a・b）と、確定した入力の列だけで進む観戦者（c。素の花映塚と同じ道を通る）の印を並べると、
-//! rollback の生きた状態が素の花映塚と違うか（a = b ≠ c）が分かる。
+//! 印のラウンドの記録（`rN`）は、保存した台がマッチの間に生きたゲームの状態から境目のtickで読んだ値。
+//! リプレイを再生して出した値ではない（`replay_detail`）。
+//! rollbackの2台（a・b）と、確定した入力の列だけで進む観戦者（c。素の花映塚と同じ経路を通る）の印を並べる。
+//! するとrollbackの生きた状態が素の花映塚と違うか（a = b ≠ c）が分かる。
 //!
-//! 比べるのは、1P から見たマッチの結果・ラウンドの記録（長さ・勝者・ライフ・C2+C3・ボス・リバーサル・スコア）・記録できなかったラウンドの数。
-//! 名前・時刻・通信の要約は台ごとに違って当然なので比べない。`with_inputs` のときは、リプレイの入力の語も台どうしで比べる。
+//! 比べるのは1Pから見たマッチの結果・ラウンドの記録（長さ・勝者・ライフ・C2+C3・ボス・リバーサル・スコア）・記録できなかったラウンドの数。
+//! 名前・時刻・通信の要約は台ごとに違って当然なので比べない。`with_inputs`のときはリプレイの入力のワードも台どうしで比べる。
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
@@ -14,7 +15,7 @@ use crate::replay::{self, MarkRead, MarkRole, MatchResult, Side};
 use crate::replay_decode;
 use crate::replay_detail::{RoundRec, SyncKind, Winner};
 
-/// リプレイ 1 本の入力（枠ごと）。
+/// リプレイ1本の入力（枠ごと）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageWords {
     pub slot: u8,
@@ -22,21 +23,21 @@ pub struct StageWords {
     pub p2: Vec<u16>,
 }
 
-/// 1 台・1 マッチ分の、比べる材料。
+/// 1台・1マッチ分の、比べる材料。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// ファイル名だけ（フォルダ名には相手の名前が入るので持たない）。
     pub file: String,
     pub start_utc: Option<u64>,
     pub sync: Option<SyncKind>,
-    /// 1P から見た結果。印の `result` は保存した台から見た結果なので、2P の台は勝ち負けを入れ替える。
+    /// 1Pから見た結果。印の`result`は保存した台から見た結果なので2Pの台は勝ち負けを入れ替える。
     pub p1_result: MatchResult,
     pub rounds: Vec<RoundRec>,
     pub rounds_dropped: u32,
     pub stages: Option<Vec<StageWords>>,
 }
 
-/// 1 台ぶん（ラベルと、start の順に並べたマッチ）。
+/// 1台ぶん（ラベルとstartの順に並べたマッチ）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
     pub label: String,
@@ -60,8 +61,9 @@ fn result_text(r: MatchResult) -> &'static str {
     }
 }
 
-/// リプレイのバイト列から比べる材料を作る。印が無い・読めない・マッチの記録（`rN` などの欄）が無いときは理由を返す
-/// （ラウンドの記録が無い印を黙って「0 ラウンド」として一致させないため）。
+/// リプレイのバイト列から比べる材料を作る。
+/// 印が無い・読み取れない・マッチの記録（`rN`などのフィールド）が無いときは理由を返す。
+/// ラウンドの記録が無い印を黙って「0ラウンド」として一致させないため。
 pub fn entry_from_bytes(file: &str, bytes: &[u8], with_inputs: bool) -> Result<Entry, String> {
     let mark = match replay::read_mark(bytes)
         .map_err(|e| format!("{file}: リプレイとして読めない（{e:?}）"))?
@@ -114,7 +116,7 @@ pub fn entry_from_bytes(file: &str, bytes: &[u8], with_inputs: bool) -> Result<E
     })
 }
 
-/// start（無ければ後ろ）→ ファイル名の順に並べる。同じ台のマッチを時刻の順に k 番目どうしで対にするため。
+/// start（無ければ後ろ）→ ファイル名の順に並べる。同じ台のマッチを時刻の順にk番目どうしで対にするため。
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         (a.start_utc.is_none(), a.start_utc, &a.file).cmp(&(
@@ -212,15 +214,16 @@ pub fn mark_diffs(a: &Entry, b: &Entry) -> Vec<String> {
     out
 }
 
-/// 入力の比べ。`diffs` は共通の範囲で違った所（空なら一致）、`note` は長さなど違いに数えない事実。
+/// 入力の比較結果。`diffs`は共通の範囲で違った所（空なら一致）。`note`は長さなど違いに数えない事実。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InputCmp {
     pub diffs: Vec<String>,
     pub note: String,
 }
 
-/// 共通のフレームの範囲の語を比べる。長さの違いは数えず `note` に出す（記録の終わりが台ごとに数フレームずれうるため。
-/// 数えるかどうかの線はこちらで決めず、数を見せる）。
+/// 共通のフレームの範囲のワードを比べる。
+/// 長さの違いは数えず`note`に出す。記録の終わりは台ごとに数フレームずれうる。
+/// 数えるかどうかの基準はこちらで決めず数を見せる。
 pub fn input_cmp(a: &[StageWords], b: &[StageWords]) -> InputCmp {
     let mut c = InputCmp::default();
     if a.len() != b.len() {
@@ -253,17 +256,17 @@ pub fn input_cmp(a: &[StageWords], b: &[StageWords]) -> InputCmp {
     c
 }
 
-/// 対にした start がこれ以上離れていたら、別のマッチを並べた疑いとして書く（秒。同じ PC の台どうしなら数秒のはず）。
+/// 対にしたstartがこれ以上離れていたら別のマッチを並べた疑いとして書く（秒。同じPCの台どうしなら数秒のはず）。
 const START_FAR_SEC: u64 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub text: String,
-    /// 全部の台に同じ本数（1 以上）があり、全部のマッチが全部の台で一致し、ラウンドの記録が 0 件のマッチも無い。
+    /// 全部の台に同じ本数（1以上）があり、全部のマッチが全部の台で一致し、ラウンドの記録が0件のマッチも無い。
     pub all_equal: bool,
 }
 
-/// 1 組の台の集計。
+/// 1ペアの台の集計。
 #[derive(Default, Clone, Copy)]
 struct PairTally {
     compared: usize,
@@ -292,7 +295,7 @@ fn entry_line(label: &str, e: &Entry) -> String {
     )
 }
 
-/// 台が 2 つ以上のとき、同じ番目のマッチどうしを並べて比べる。
+/// 台が2つ以上のとき、同じ番目のマッチどうしを並べて比べる。
 pub fn report(devs: &[Device], with_inputs: bool) -> Report {
     let mut text = String::new();
     let counts: Vec<String> = devs
@@ -497,7 +500,7 @@ mod tests {
         let a = entry("a.rpy", 100, three(vec![]));
         assert_eq!(mark_diffs(&a, &a.clone()), Vec::<String>::new());
 
-        // 1 欄ずつ変える。欄ごとに別の文言で落ちる（どれかの比べが抜けても 1 つは素通りしない）。
+        // 1フィールドずつ変える。フィールドごとに別の文言で落ちる（どれかの比較が抜けても1つは素通りしない）。
         let mut cases: Vec<(Entry, &str)> = Vec::new();
         let mut b = a.clone();
         b.rounds[1].frames += 1;
@@ -614,7 +617,7 @@ mod tests {
         assert!(!r.all_equal);
         assert!(r.text.contains("片方にしか無い 1 本"), "{}", r.text);
         assert!(r.text.contains("このマッチのリプレイが無い"), "{}", r.text);
-        // 両方ともラウンドの記録が 0 件（空どうしが等しいだけ）。
+        // 両方ともラウンドの記録が0件（空どうしが等しいだけ）。
         let e = |f: &str| entry(f, 100, vec![]);
         let r = report(
             &[dev("a", vec![e("a1.rpy")]), dev("b", vec![e("b1.rpy")])],
@@ -675,7 +678,7 @@ mod tests {
         let c = input_cmp(&a, &same_longer);
         assert!(c.diffs.is_empty(), "{c:?}");
         assert!(c.note.contains("長さ 4 / 5"), "{c:?}");
-        // 2P の語が 1 フレームだけ違う。
+        // 2Pの語が1フレームだけ違う。
         let b = vec![stage(vec![1, 2, 3, 4], vec![0, 0, 9, 0])];
         let c = input_cmp(&a, &b);
         assert_eq!(c.diffs.len(), 1, "{c:?}");
@@ -724,7 +727,7 @@ mod tests {
     #[test]
     fn a_two_p_replay_is_read_from_the_first_players_side() {
         let rounds = vec![round(1, Winner::P1)];
-        // 2P の台の「win」は 1P から見れば lose。観戦者の印は元から 1P から見た結果。
+        // 2Pの台の「win」は1Pから見ればlose。観戦者の印は元から1Pから見た結果。
         let p2_win = replay_with(&mark(
             Side::P2,
             MatchResult::Win,
@@ -767,7 +770,7 @@ mod tests {
         let e = entry_from_bytes("y.rpy", &replay_with(&m), false).unwrap_err();
         assert!(e.contains("マッチの記録"), "{e}");
         assert!(entry_from_bytes("z.rpy", b"not a replay", false).is_err());
-        // メニューの保存の印は「ラウンドの記録が無い」と分かる文言で断り、0 ラウンドとして一致させない。
+        // メニューの保存の印は「ラウンドの記録が無い」と分かる文言で断り、0ラウンドとして一致させない。
         let mut menu = build_replay(&BuildSpec::match_replay(0x52, vec![1], vec![2]));
         let chunk = replay::chunk_to_append_menu(
             &menu,

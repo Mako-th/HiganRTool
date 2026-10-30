@@ -1,6 +1,8 @@
-//! rollback のモードのマッチの経路（`netplay/rollback.rs`）の検査（pure）。`NetPlay` を 2 つ、仮のネットワーク（片道の遅れ）と偽のゲーム
-//! （`netplay::fake::FakeGame` は場面と自分の語、`rollback_testkit::FakeGame` は世界の状態とコピー）で接続し、走査の包みのフックと Present の後のフックを交互に回す。
-//! 世界の状態は feed された語の並びだけで決まるので、両者の最後の状態が「確定した行」から手で組んだ参照と一致すれば、予測の入力ワードが確定に混ざっておらず進め直しが正しい。
+//! rollbackのモードのマッチの経路（`netplay/rollback.rs`）の検査（pure）。
+//! `NetPlay`を2つ、仮のネットワーク（片道の遅れ）と偽のゲーム（`netplay::fake::FakeGame`は場面と自分の語、`rollback_testkit::FakeGame`は世界の状態とコピー）で接続する。
+//! 走査の包みのフックとPresentの後のフックを交互に回す。
+//! 世界の状態はfeedされた語の並びだけで決まる。
+//! だから両者の最後の状態が「確定した行」から手で組んだ参照と一致すれば、予測の入力ワードが確定に混ざっておらず進め直しが正しい。
 #![forbid(unsafe_code)]
 
 use super::fake::{FRAME_US, FakeGame as ScriptGame, FakeNet, local_word};
@@ -35,7 +37,7 @@ struct Side {
     /// 場面の境目が確定したときに偽のゲームが立てる次の要求（既定 10 = 再戦。6 = リプレイを保存して終了）。
     boundary_req: u32,
     quits: Vec<usize>,
-    /// `Some` なら、毎フレームの走査の後に `hud_facts` を呼び（本物の呼び手 `script_win::ui_hud_tick` と同じ）、戻りを順に溜める。
+    /// `Some`なら毎フレームの走査の後に`hud_facts`を呼び（本物の呼び手`script_win::ui_hud_tick`と同じ）、戻り値を順に溜める。
     hud_log: Option<Vec<Option<crate::net_ui::HudFacts>>>,
 }
 
@@ -50,7 +52,7 @@ fn pair(
     pair_with_ring(wish_a, wish_b, check, ahead, one_way_frames, lat_plan, None)
 }
 
-/// `pair` に、ホスト（A）へ観戦のリングバッファを付ける関数（接続する前に設定する。リングバッファの最初の記録は接続した tick の `Seg { 0 }`）。
+/// `pair`にホスト（A）へ観戦のリングバッファを付ける関数（接続する前に設定する。リングバッファの最初の記録は接続したtickの`Seg { 0 }`）。
 fn pair_with_ring(
     wish_a: ModeWish,
     wish_b: ModeWish,
@@ -124,8 +126,8 @@ fn pair_with_ring(
     (a, b, clock)
 }
 
-/// 1 フレーム（走査の包みのフック → do_frame の鳴らしと描画 → Present の後のフック）。フックが走査を呼ばなかったら走査が普通に走る（`on_input`）。
-/// 場面の境目が確定していたら偽のゲームに次の要求（`boundary_req`）を立てる。`take_save_quit` は本物の呼び手と同じく入力の地点の後に取る。
+/// 1フレーム（走査の包みのフック → do_frameの鳴らしと描画 → Presentの後のフック）。フックが走査を呼ばなかったら走査が普通に走る（`on_input`）。
+/// 場面の境目が確定していたら偽のゲームに次の要求（`boundary_req`）を立てる。`take_save_quit`は本物の呼び手と同じく入力の地点の後に取る。
 fn frame(s: &mut Side) -> RbScan {
     let Side {
         np,
@@ -207,8 +209,8 @@ fn drain_ring(ring: &crate::spectate_ring::SpectateRing) -> Vec<higanr_core::wir
     v
 }
 
-/// 検査のツール: 記録の列を、ホストの `SpectateHost` → 観戦者の `Watcher` へメモリの上で順に渡して、観戦者が受けた記録の列を返す。
-/// 観戦者は先に入っておく（遅れて入ると今の seg の始まりから流れる）。時刻は 1 記録ごとに 1 ms 進める。
+/// 検査のツール: 記録の列をホストの`SpectateHost` → 観戦者の`Watcher`へメモリの上で順に渡し、観戦者が受けた記録の列を返す。
+/// 観戦者は先に入っておく（遅れて入ると今のマッチの始まりから流れる）。時刻は1記録ごとに1 ms進める。
 fn through_core(recs: &[higanr_core::wire::Record]) -> Vec<higanr_core::wire::Record> {
     use higanr_core::auth::Secret;
     use higanr_core::link::Outlet;
@@ -270,8 +272,9 @@ fn through_core(recs: &[higanr_core::wire::Record]) -> Vec<higanr_core::wire::Re
     got
 }
 
-/// rollback と観戦の組み合わせ: ホストがリングバッファへ積む列が対戦する側の確定した列と一致し（予測の入力ワードが混ざらない）、seg の境目の並び
-/// （`Frame(seg k の最後)` の後に `Seg(k + 1)`）が崩れず、観戦者の組み立てを通しても変わらない。片道 1・3・6 フレーム × 境目の frame 2 通りで再戦を 1 回跨ぐ。
+/// rollbackと観戦の組み合わせ。ホストがリングバッファへ積む列は対戦する側の確定した列と一致する（予測の入力ワードが混ざらない）。
+/// マッチの境目の並び（`Frame(seg k の最後)`の後に`Seg(k + 1)`）が崩れず、観戦者の組み立てを通しても変わらない。
+/// 片道1・3・6フレーム × 境目のframe 2通りで、再戦を1回跨ぐ。
 #[test]
 fn a_rollback_hosts_spectate_ring_holds_exactly_the_confirmed_rows_across_a_rematch() {
     use crate::spectate_testkit::fold;
@@ -412,7 +415,7 @@ fn save_and_quit_at_a_rollback_boundary_closes_both_and_asks_once() {
     assert_eq!(a.rows, b.rows);
 }
 
-/// 参照: seg 0 の frame f の (1P, 2P)。1P は B（席 P1）、2P は A（席 P2）の語。D = `d`。
+/// 参照: マッチ0のframe fの (1P, 2P)。1PはB（サイドP1）、2PはA（サイドP2）の語。D = `d`。
 fn ref_row(d: u32, f: u32) -> (u16, u16) {
     let w = |seed: u64| {
         if f < d {
@@ -491,7 +494,7 @@ fn two_rollback_sides_confirm_the_same_rows_and_reach_the_same_state() {
     assert_eq!(a.rows, b.rows, "両者の確定の列が違う");
 }
 
-/// rollback でも試合の語の Ctrl（`0x0100`）は両席・両側の確定の行に残り、Enter（`0x1000`）は落ちる。
+/// rollbackでも試合の語のCtrl（`0x0100`）は両サイド・両側の確定の行に残り、Enter（`0x1000`）は落ちる。
 #[test]
 fn ctrl_in_the_match_word_reaches_both_seats_in_the_confirmed_rows_of_both_sides() {
     let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, 3);
@@ -516,7 +519,7 @@ fn ctrl_in_the_match_word_reaches_both_seats_in_the_confirmed_rows_of_both_sides
     assert_eq!(a.rows, b.rows, "両者の確定の列が違う");
 }
 
-/// リプレイの印の通信の要約: rollback のモードの接続は、形式・何マッチ目・止まった数（入力の地点が待った数）・進め直しの数を渡す。
+/// リプレイの印の通信の要約: rollbackのモードの接続は形式・何マッチ目・止まった数（入力の地点が待った数）・進め直しの数を渡す。
 #[test]
 fn the_replay_mark_view_reports_the_rollback_state_and_totals() {
     let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, 3);
@@ -526,7 +529,7 @@ fn the_replay_mark_view_reports_the_rollback_state_and_totals() {
         let v = crate::replay_save::NetView::of(&s.np).expect("つながっていた接続");
         assert_eq!((v.rollback, v.rb_ready), (true, s.np.rollback_ready()));
         assert!(v.rb_ready, "試合の最中");
-        // この部品は開始のフックを通さず Lockstep にする（本物は `on_match_start` が数える）ので、数は入れ物の値のまま。
+        // この部品は開始のフックを通さずLockstepにする（本物は`on_match_start`が数える）ので数は入れ物の値のまま。
         assert_eq!(v.match_no, s.np.stats().segs_started);
         assert_eq!(
             v.totals.stalls,
@@ -601,8 +604,10 @@ fn the_game_check_reads_the_confirmed_state_at_the_head_of_the_tick() {
     }
 }
 
-/// rollback のホストが観戦の流れへ積む照合は、確定した値（対戦の CHECK と同じ値。予測で進めた状態の値ではない）。ゲームの値の作り方は
-/// 送った CHECK のうち約 1 秒ごとのもの、ダイジェストの作り方は確定した行の seg の frame 0 からのダイジェスト。片道 3 フレームで戻しが起きる形。
+/// rollbackのホストが観戦の流れへ積む照合は確定した値（対戦のCHECKと同じ値。予測で進めた状態の値ではない）。
+/// ゲームの値の作り方は、送ったCHECKのうち約1秒ごとのもの。
+/// ダイジェストの作り方は、確定した行のマッチのframe 0からのダイジェスト。
+/// 片道3フレームで巻き戻しが起きる形。
 #[test]
 fn a_rollback_hosts_watch_checks_are_the_confirmed_values() {
     use crate::spectate_testkit::fold;
@@ -659,7 +664,7 @@ fn a_rollback_hosts_watch_checks_are_the_confirmed_values() {
             rb.resims > 0,
             "{source:?}: 戻しが起きていない（予測の値と区別できない）"
         );
-        // 観戦者がこの流れを使うと、照合が全部合う（rollback のホストは確定の後に積むので、自分の値が先にできる順）。
+        // 観戦者がこの流れを使うと照合が全部合う（rollbackのホストは確定の後に積むので自分の値が先にできる順）。
         let s = watch_through(&recs);
         assert_eq!(s.played as usize, f.frames.len(), "{source:?}");
         assert_eq!(
@@ -671,8 +676,8 @@ fn a_rollback_hosts_watch_checks_are_the_confirmed_values() {
     }
 }
 
-/// 検査のツール: 記録の列を観戦者（`WatchPlay`）に試合の中から使わせ、集計を返す。観戦者のゲームの値は、検査の rollback のゲーム
-/// （`rollback_testkit`）と同じ作り（使った行の `chain`・frame 0 は種の値・抽選回数はフレームの数・ライフ 0）。
+/// 検査のツール: 記録の列を観戦者（`WatchPlay`）に試合の中から使わせ、集計を返す。
+/// 観戦者のゲームの値は検査のrollbackのゲーム（`rollback_testkit`）と同じ作り（使った行の`chain`・frame 0は種の値・抽選回数はフレームの数・ライフ0）。
 fn watch_through(recs: &[higanr_core::wire::Record]) -> crate::spectate_watch::WatchStats {
     use crate::spectate_watch::{WatchConfig, WatchPlay, WatchSlot};
     struct W {
@@ -750,7 +755,7 @@ fn latency_switches_are_refused_in_the_rollback_mode() {
     assert_eq!(a.rows, b.rows);
 }
 
-/// 遅れの量を両者が変える: Ctrl+数字を両者が押すと D がマッチの途中で替わり、両者の確定の列が一致する。押下があった証拠（両者の `digit_presses`）を隣に並べる。
+/// 遅れの量を両者が変える: Ctrl+数字を両者が押すとDがマッチの途中で替わり、両者の確定の列が一致する。押下があった証拠（両者の`digit_presses`）を隣に並べる。
 #[test]
 fn both_sides_pick_d_with_digit_keys_and_it_switches_in_the_same_match() {
     use higanr_core::delay_pick;
@@ -760,7 +765,7 @@ fn both_sides_pick_d_with_digit_keys_and_it_switches_in_the_same_match() {
         s.np.cfg.delay_pick = true;
         s.np.ensure_pick();
     }
-    // (押し始めの tick, 数字)。各 3 tick 押し続ける。
+    // (押し始めのtick, 数字)。各3 tick押し続ける。
     let host_plan = [(60u32, 4u8), (140, 2), (220, 5)];
     let guest_plan = [(100u32, 3u8), (180, 1)];
     let held = |plan: &[(u32, u8)], t: u32| {
@@ -887,9 +892,9 @@ fn the_input_count_phrase_names_every_reason() {
     );
 }
 
-/// マッチの途中の切替: ホストが Ctrl+数字を押しても、ゲストが押しても、D がそのマッチのうちに替わり、両台が同じフレームで替える。
-/// ウィンドウの側へ渡す穴埋めの D（`PlayState` の hint）は seg の始まりの D、確定した行に添える D は今の D、次の seg の始まりの D は前の seg の最後の値。
-/// ホストが 2 を押して 1 → 2、ゲストが 1 を押して 2 → 1。どちらも 4 tick 押し続け、ちょうど 1 回の押下。
+/// マッチの途中の切替: ホストがCtrl+数字を押しても、ゲストが押しても、Dがそのマッチのうちに替わり、両台が同じフレームで替える。
+/// ウィンドウの側へ渡す穴埋めのD（`PlayState`のhint）はマッチの始まりのD。確定した行に添えるDは今のD。次のマッチの始まりのDは前のマッチの最後の値。
+/// ホストが2を押して1 → 2、ゲストが1を押して2 → 1。どちらも4 tick押し続け、ちょうど1回の押下。
 #[test]
 fn a_host_press_and_a_guest_wish_switch_d_mid_match_on_both_sides() {
     let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, 3);
@@ -1248,7 +1253,7 @@ fn a_stalled_side_waits_for_words_within_the_budget_and_still_agrees() {
     for s in [&a, &b] {
         assert!(s.net.waits > 0, "止まっている間に待っていない");
         assert!(s.np.stats().stalls > 0, "{:?}", s.np.stats());
-        // 内訳は rollback の待ちの種類。和が stall の数と同じで、delay 方式の「相手の入力待ち」は 0。
+        // 内訳はrollbackの待ちの種類。和がstallの数と同じで、delay方式の「相手の入力待ち」は0。
         let st = s.np.stats();
         assert_eq!(st.stalls_split_sum(), st.stalls, "{st:?}");
         assert_eq!(st.stalls_peer, 0, "{st:?}");
@@ -1268,8 +1273,9 @@ fn a_stalled_side_waits_for_words_within_the_budget_and_still_agrees() {
     }
 }
 
-/// 再接続: 実行の間ずっと生きるコピーの担当（`PlayState`）とゲームのメモリを、終わった 1 本目の接続から新しい 2 本目へそのまま渡したとき、
-/// 1 本目の後に確保の向け先が閉じ、2 本目が frame 0 から確定して、コピーの担当の数えが 2 本目で 0 に戻らない。
+/// 再接続: 実行の間ずっと生きるコピーの担当（`PlayState`）とゲームのメモリを、終わった1本目の接続から新しい2本目へそのまま渡す。
+/// そのとき1本目の後に確保の向け先が閉じ、2本目がframe 0から確定する。
+/// コピーの担当のカウンタは、2本目でも0に戻らない。
 #[test]
 fn a_second_connection_reuses_the_play_state_left_by_the_first() {
     let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, 12, 3);
@@ -1290,7 +1296,7 @@ fn a_second_connection_reuses_the_play_state_left_by_the_first() {
         );
     }
     let resim1 = a.st.stats().resim_confirmed_ticks;
-    // 2 本目: ネットワークとセッションは新しく、コピーの担当とゲームのメモリは 1 本目のものを続けて使う（本物では静的）。
+    // 2本目: ネットワークとセッションは新しく、コピーの担当とゲームのメモリは1本目のものを続けて使う（本物では静的）。
     let (mut a2, mut b2, clock2) = rollback_pair(CheckSource::InputDigest, 12, 3);
     core::mem::swap(&mut a2.st, &mut a.st);
     core::mem::swap(&mut a2.mem, &mut a.mem);
@@ -1664,7 +1670,7 @@ fn the_guest_follows_the_hosts_auto_flag_in_a_rollback_match_without_flicker() {
     );
 }
 
-/// 往復がほぼ 0 の回線（片道 0 フレーム）で測れたウィンドウの最大が小さいとき auto は D 0 を選び、片道 3 フレームの回線では 1 を選ぶ（両者へ揃う）。
+/// 往復がほぼ0の回線（片道0フレーム）で測れたウィンドウの最大が小さいときautoはD 0を選び、片道3フレームの回線では1を選ぶ（両者へ揃う）。
 #[test]
 fn auto_picks_d_zero_only_on_a_fast_link() {
     use higanr_core::delay_pick::AUTO;
@@ -1757,4 +1763,185 @@ fn a_pair_that_connected_in_delay_runs_rollback_after_the_format_switch() {
         assert_eq!(s.np.stats().rb_aborts, 0);
     }
     assert_eq!(a.rows, b.rows, "両者の確定の列が違う");
+}
+
+// ---- マッチの終わりの選択（`higanr_core::end_pick`）----
+
+type FeedRow = (u32, u16, u16, u16);
+
+/// 予測なしの対照の結果。
+struct EndRef {
+    /// (frame, p1, p2, `[2]`)の列。
+    feeds: Vec<FeedRow>,
+    /// 閉じた (frame, 項目)・決まった (項目, frame)・音の数（カーソル・決定・とりやめの順）。
+    closed: Option<(u32, u8)>,
+    decided: Option<(u8, u32)>,
+    se: [u32; 3],
+    /// 確定のtickごとの表示（続けて同じものは1つにまとめる）。
+    shows: Vec<higanr_core::end_pick::Show>,
+}
+
+/// 予測なしの対照: 確定した行を1つずつステートマシンと終わりのメニューのモデルに通す。メニューはframe `open_at`の後に出る（偽のゲームと同じ）。
+fn end_pick_reference(rows: &[(u32, u16, u16)], open_at: u32) -> EndRef {
+    use higanr_core::end_pick::model::EndMenu;
+    use higanr_core::end_pick::{EndPick, View};
+    let (mut pick, mut menu, mut prev) = (EndPick::new(), EndMenu::default(), 0u16);
+    let mut r = EndRef {
+        feeds: Vec::new(),
+        closed: None,
+        decided: None,
+        se: [0; 3],
+        shows: Vec::new(),
+    };
+    for &(f, p1, p2) in rows {
+        let v = View {
+            shown: menu.shown,
+            paused: false,
+            state: menu.state,
+            frames: menu.frames,
+        };
+        let o = pick.step(v, p1, p2, true);
+        for x in o.sounds() {
+            r.se[x as usize] += 1;
+        }
+        if r.shows.last() != Some(&o.show) {
+            r.shows.push(o.show);
+        }
+        if let Some(item) = o.decided {
+            r.decided = Some((item, f));
+        }
+        r.feeds.push((f, p1, p2, o.word2));
+        let pressed = o.word2 & !prev;
+        prev = o.word2;
+        if let Some(item) = menu.frame(pressed) {
+            r.closed = Some((f, item));
+            return r;
+        }
+        if f == open_at {
+            menu = EndMenu::open(menu.frames);
+        }
+    }
+    r
+}
+
+/// rollbackのモードの2台で R = 1〜16・片道2 / 5フレームのどれでも、確定したtickにfeedした (frame, p1, p2, `[2]`)の列が予測なしの対照と一致し、2台で同じになる。
+/// 予測のtick（後で進め直した走査）はメニューのキーを差し込まない。
+/// 予測の走査が閉じたメニューも、確定と同じtick・同じ項目になる。
+#[test]
+fn the_end_menu_pick_feeds_the_same_words_as_a_run_without_prediction_for_every_ahead() {
+    use higanr_core::end_pick::Se;
+    use higanr_core::end_pick::{MENU_KEYS, Note};
+    const OPEN_AT: u32 = 30;
+    let mut cells = 0;
+    let mut items = [0u32; 3];
+    let mut resims = 0u64;
+    let mut sounds = [0u32; 3];
+    for ahead in 1..=16u8 {
+        for one_way in [2u64, 5] {
+            let ctx = format!("R {ahead}・片道 {one_way} フレーム");
+            let (mut a, mut b, clock) = rollback_pair(CheckSource::InputDigest, ahead, one_way);
+            for s in [&mut a, &mut b] {
+                s.mem.end_open_at = Some(OPEN_AT);
+                s.mem.se_noise = false;
+            }
+            run(&mut a, &mut b, &clock, OPEN_AT + 120);
+            settle(&mut a, &mut b, &clock, 60);
+            let mut closes = Vec::new();
+            for s in [&a, &b] {
+                assert_eq!(s.np.rb_aborts(), 0, "{ctx}: {:?}", s.np.rb_abort_first());
+                let rows: Vec<(u32, u16, u16)> = s
+                    .rows
+                    .iter()
+                    .filter(|r| r.seg == 0)
+                    .map(|r| (r.frame, r.p1, r.p2))
+                    .collect();
+                let EndRef {
+                    feeds: want,
+                    closed,
+                    decided,
+                    se,
+                    shows,
+                } = end_pick_reference(&rows, OPEN_AT);
+                let (close_f, item) =
+                    closed.unwrap_or_else(|| panic!("{ctx}: 対照でメニューが閉じない"));
+                assert_eq!(
+                    rows.last().map(|r| r.0),
+                    Some(close_f),
+                    "{ctx}: seg 0 が閉じた frame で終わらない"
+                );
+                let got: Vec<FeedRow> = s
+                    .mem
+                    .final_feeds()
+                    .into_iter()
+                    .filter(|r| r.0 <= close_f)
+                    .collect();
+                assert_eq!(got, want, "{ctx}: 確定した tick の feed が対照と違う");
+                assert!(
+                    want.iter().any(|r| r.3 & MENU_KEYS != 0 && r.0 > OPEN_AT),
+                    "{ctx}: 差し込みが起きていない（検査の前提）"
+                );
+                // 同じtickを後で走査し直したなら前の走査は予測のtick。メニューの間はメニューのキーを差し込まない。
+                for (i, &(t, _, _, w2)) in s.mem.feeds.iter().enumerate() {
+                    let later = s.mem.feeds[i + 1..].iter().any(|r| r.0 == t);
+                    if later && t > OPEN_AT && t <= close_f {
+                        assert_eq!(w2 & MENU_KEYS, 0, "{ctx}: 予測の tick {t} で差し込んだ");
+                    }
+                }
+                assert!(
+                    s.mem.end_closes.iter().all(|&c| c == (close_f, item)),
+                    "{ctx}: 予測の走査が別の tick・項目で閉じた {:?}",
+                    s.mem.end_closes
+                );
+                let (d_item, d_frame) = decided.unwrap();
+                assert_eq!(
+                    s.mem.end_notes,
+                    vec![(0, Note::Decided(d_item), d_frame)],
+                    "{ctx}: 本ログへの知らせ"
+                );
+                assert!(
+                    s.mem
+                        .end_shows
+                        .iter()
+                        .any(|sh| matches!(sh.paint, higanr_core::end_pick::Paint::Decided(_))),
+                    "{ctx}: 決定の後の点滅を出していない"
+                );
+                // 縁取りは自分のサイドの分も確定のtickの表示だけ（予測のtickの表示を出さない）。
+                let none = higanr_core::end_pick::Show::NONE;
+                let mut want_shows = shows.iter().filter(|sh| **sh != none);
+                for sh in s.mem.end_shows.iter().filter(|sh| **sh != none) {
+                    assert!(
+                        want_shows.any(|w| w == sh),
+                        "{ctx}: 確定の tick の表示の列に無い {sh:?}"
+                    );
+                }
+                // 音は確定のtickでだけ積む（進め直しの回の音は近い同じ音とまとめられうるので対照の数を越えないことだけ見る）。
+                for kind in [Se::Cursor, Se::Decide, Se::Cancel] {
+                    let id = crate::th09_addr::end_menu_se(kind).0;
+                    let want = se[kind as usize];
+                    let played: u32 = s.mem.se_log.iter().filter(|e| e.1 == id).map(|e| e.2).sum();
+                    assert!(
+                        played <= want && (want == 0 || played > 0),
+                        "{ctx}: {kind:?} の音 {played} / 対照 {want}"
+                    );
+                    sounds[kind as usize] += want;
+                }
+                closes.push((close_f, item));
+                resims += u64::from(s.st.stats().resim_confirmed_ticks);
+            }
+            assert_eq!(closes[0], closes[1], "{ctx}: 2 台で閉じ方が違う");
+            let seg0 = |s: &Side| -> Vec<FrameRec> {
+                s.rows.iter().filter(|r| r.seg == 0).copied().collect()
+            };
+            assert_eq!(seg0(&a), seg0(&b), "{ctx}: seg 0 の確定の行");
+            items[usize::from(closes[0].1)] += 1;
+            cells += 1;
+        }
+    }
+    assert_eq!(cells, 32);
+    assert!(resims > 1_000, "進め直しが少ない（検査の前提）: {resims}");
+    assert!(
+        sounds[Se::Decide as usize] > 0 && sounds[Se::Cancel as usize] > 0,
+        "対照で決定ととりやめの音が鳴らない（検査の前提）: {sounds:?}"
+    );
+    assert!(items.iter().filter(|&&n| n > 0).count() >= 1, "{items:?}");
 }

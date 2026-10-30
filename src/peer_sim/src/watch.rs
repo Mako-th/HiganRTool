@@ -1,8 +1,10 @@
 //! 観戦者の役（`peer_sim --watch`）。
-//! 観戦用の接続コード（または対戦のホストの観戦のポートのアドレス＋session・秘密）でホストへ SPECTATE_JOIN を送り、流れてくる記録を core の `Watcher` で並べ、マッチの語を CSV に書く。対戦する2人の `_net_frames.csv` と突き合わせる（`compare_spectate`）。プロトコルの決まりは `higanr_core::spectate` にあり、ここは呼ぶだけ。
-//! 終わり方: ホストの `Record::End` を受けたら `LINGER_MS` の間ホストの送り直しへ ACK を返し、BYE(終了) を 1 通出して終える。JOIN を断られた・流れが `silent_end_ms` 途切れた・`max_ms` に達したときも終える。
-//! CSV は 2 本（回ごとに別名）: マッチの語 `seg,frame,p1,p2` と、SELECT・押下・MENU の語・seg の始まり・終わりを記録の番号つきで並べた `index,type,fields`。
-//! 観戦者からホストへの送信（JOIN・ACK・BYE）に `FaultConfig` を掛けられる。`drop_after` は「接続した後に黙る観戦者」の検査用。
+//! 観戦用の接続コード（または対戦のホストの観戦のポートのアドレス＋session・秘密の乱数）でホストへSPECTATE_JOINを送る。
+//! 流れてくる記録をcoreの`Watcher`で並べ、マッチのワードをCSVに書く。対戦する2人の`_net_frames.csv`と突き合わせる（`compare_spectate`）。
+//! プロトコルの決まりは`higanr_core::spectate`にあり、ここは呼ぶだけ。
+//! 終わり方は次のとおり。ホストの`Record::End`を受けたら`LINGER_MS`の間ホストの再送へACKを返し、BYE(終了)を1通出して終える。JOINを断られた・流れが`silent_end_ms`途切れた・`max_ms`に達したときも終える。
+//! CSVは2本（実行ごとに別名）。マッチのワードの`seg,frame,p1,p2`と、SELECT・押下・MENUのワード・segの始まり・終わりを記録の番号つきで並べた`index,type,fields`。
+//! 観戦者からホストへの送信（JOIN・ACK・BYE）に`FaultConfig`を掛けられる。`drop_after`は「接続した後に黙る観戦者」の検査用。
 
 use std::fmt::Write as _;
 use std::io::ErrorKind;
@@ -19,10 +21,10 @@ use higanr_core::wire::{ByeReason, Record, Seat, Select, Step};
 use crate::fault::{FaultConfig, FaultCounts};
 use crate::sim::{At, SimError, Tx};
 
-/// 終わりの記録の後、ホストの送り直しへ ACK を返し続ける長さ（ms）。最後の ACK が落ちた場合に備える。
+/// 終わりの記録の後にホストの再送へACKを返し続ける長さ（ms）。最後のACKが失われた場合に備える。
 pub const LINGER_MS: u32 = 300;
 
-/// マッチの語の CSV の見出し（1P・2P は dll の `_net_frames.csv` と同じ 16 進 4 桁）。
+/// マッチのワードのCSVのヘッダ（1P・2Pはdllの`_net_frames.csv`と同じ16進4桁）。
 pub const FRAMES_CSV_HEADER: &str = "seg,frame,p1,p2";
 pub const EVENTS_CSV_HEADER: &str = "index,type,fields";
 
@@ -36,9 +38,9 @@ pub struct WatchConfig {
     pub name: String,
     pub nonce: u64,
     pub fault: FaultConfig,
-    /// 実行し始めてから最初の JOIN までの長さ（ms）。遅れて入る検査用。
+    /// 実行し始めてから最初のJOINまでの長さ（ms）。遅れて入る検査用。
     pub start_after_ms: u32,
-    /// 流れを聞いた後、これだけ何も聞かなければ「ホストが黙った」で終える（ms）。
+    /// 流れを聞いた後にこれだけ何も聞かなければ「ホストが黙った」で終える（ms）。
     pub silent_end_ms: u32,
     pub max_ms: u32,
 }
@@ -46,9 +48,9 @@ pub struct WatchConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchEnd {
     HostEnded(ByeReason),
-    /// 流れを聞いた後で、`silent_end_ms` の間何も聞かなかった。
+    /// 流れを聞いた後で`silent_end_ms`の間何も聞かなかった。
     HostSilent,
-    /// JOIN を断られた（観戦者が上限）。
+    /// JOINを断られた（観戦者が上限）。
     Refused(ByeReason),
     Deadline,
 }
@@ -73,7 +75,7 @@ pub enum WEvent {
         p1: u16,
         p2: u16,
     },
-    /// 席ごとの名前（ホストが各 seg の `Seg` の直後に積む。UTF-8）。
+    /// サイドごとの名前（ホストが各segの`Seg`の直後に積む。UTF-8）。
     Name {
         seat: Seat,
         name: Name,
@@ -84,15 +86,15 @@ pub enum WEvent {
 #[derive(Debug, Clone)]
 pub struct WatchReport {
     pub end: WatchEnd,
-    /// 最初の STREAM を受けたか（JOIN が通った）。
+    /// 最初のSTREAMを受けたかどうか（JOINが通った）。
     pub joined: bool,
     pub host_addr: Option<SocketAddr>,
     pub frames: Vec<WFrame>,
     pub events: Vec<(u32, WEvent)>,
-    /// 取り出した記録の数（`jumps` は `reset` で今の seg の始まりへ飛んだ回数）。
+    /// 取り出した記録の数（`jumps`は`reset`で今のsegの始まりへ飛んだ回数）。
     pub records: u32,
     pub jumps: u32,
-    /// 直前の `Seg` が無いまま届いた語の数（0 のはず。あれば seg 0 として記録し数える）。
+    /// 直前の`Seg`が無いまま届いたワードの数（0のはず。あればseg 0として記録し数える）。
     pub frames_without_seg: u32,
     pub counts: WatcherCounts,
     pub asm: AsmCounts,
@@ -112,7 +114,7 @@ fn host_candidates(cfg: &WatchConfig, scope: Scope) -> Result<Candidates, SimErr
     })
 }
 
-/// 観戦者を 1 回走らせる。`sock` はネットワークの範囲の中に bind した UDP ソケット。
+/// 観戦者を1回走らせる。`sock`はネットワークの範囲の中にbindしたUDPソケット。
 pub fn run(cfg: &WatchConfig, sock: UdpSocket, scope: Scope) -> Result<WatchReport, SimError> {
     let local = sock.local_addr()?;
     guard::check_bind(local, scope, "観戦者の受信ソケット").map_err(SimError::Refused)?;
@@ -212,7 +214,7 @@ pub fn run(cfg: &WatchConfig, sock: UdpSocket, scope: Scope) -> Result<WatchRepo
                         },
                     ));
                 }
-                // 対戦の状態は画面の行に出すだけの値、照合は観戦者のゲームと比べる値で、どちらも突き合わせ用の CSV には入れない（ホストが 1 秒ごとに積むため）。
+                // 対戦の状態は画面の行に出すだけの値で、照合は観戦者のゲームと比べる値。どちらも突き合わせ用のCSVには書き込まない（ホストが1秒ごとに積むため）。
                 Record::Stats { .. } | Record::Check { .. } => {}
                 Record::End(reason) => {
                     rep.events.push((idx, WEvent::End(reason)));
@@ -239,7 +241,7 @@ pub fn run(cfg: &WatchConfig, sock: UdpSocket, scope: Scope) -> Result<WatchRepo
         std::thread::sleep(Duration::from_millis(1));
     };
     let now = now_ms(t0);
-    // 抜けるときは BYE(終了) を 1 通。落ちればホストは黙った観戦者として外す。
+    // 抜けるときはBYE(終了)を1通。失われればホストは黙った観戦者として外す。
     if w.host_addr().is_some() {
         w.bye(ByeReason::Finished, &mut At { tx: &mut tx, now });
         tx.flush(now.wrapping_add(u32::MAX / 2));
@@ -277,7 +279,7 @@ fn event_type(e: &WEvent) -> &'static str {
     }
 }
 
-/// 押下 1 つの文字列の形（`record::log_text` の `# 押下` の行と同じ。突き合わせが文字で比べる）。
+/// 押下1つの文字列の形（`record::log_text`の`# 押下`の行と同じ。突き合わせが文字で比べる）。
 pub fn step_fields(st: &Step) -> String {
     format!(
         "step={} kind={:?} value={:#04X} screen={}",
@@ -321,7 +323,7 @@ fn event_fields(e: &WEvent) -> String {
     }
 }
 
-/// 記録の CSV（マッチの語は入れない。`frames_csv`）。
+/// 記録のCSV（マッチのワードは含めない。`frames_csv`）。
 pub fn events_csv(rep: &WatchReport) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{EVENTS_CSV_HEADER}");
@@ -371,11 +373,11 @@ pub fn summary(rep: &WatchReport) -> String {
     s
 }
 
-/// 記録の CSV から `--compare-spectate` が使う 2 つを取り出したもの。
+/// 記録のCSVから`--compare-spectate`が使う2つを取り出したもの。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventsCsv {
     pub steps: Vec<String>,
-    /// 最初の行の記録の番号。0 ならリングバッファの先頭から全部受けた。0 でなければ、いまの seg の始まり `Seg(k)` から受けた。行が無ければ None。
+    /// 最初の行の記録の番号。0ならリングバッファの先頭から全部受けた。0でなければいまのsegの始まり`Seg(k)`から受けた。行が無ければNone。
     pub first_index: Option<u32>,
 }
 

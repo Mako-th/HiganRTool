@@ -1,22 +1,25 @@
-//! 観戦の中継の木の模型: ホスト（`SpectateHost`）・中継役（`Watcher` ＋ 中継の配る側 `SpectateHost::relay`）・子（`Watcher`）を、
-//! 落とす・重ねる・順を入れ替えるネットワークで接続し、紹介・受け入れの依頼・付け替え・満杯の取り置きを見る。
-//! ネットワークは 1 ms ごとに進む固定 seed の模型。中継役は dll の受信スレッドと同じ順（受ける → 組み立てから積む → `tend_relay` →
-//! `poll`）で回す。紹介・依頼・断りのガードは、封じた便を直に組み立てて見る。上りの測り（MEASURE・PAIR）の模型
-//! （`Sim::measured`）は、観戦者の上りを絞り、測りの組の到着を µs でホストの `on_pair` へ渡す。
+//! 観戦の中継の木の模型。
+//! ホスト（`SpectateHost`）・中継役（`Watcher` ＋ 中継の配信側`SpectateHost::relay`）・子（`Watcher`）を、パケットを落とす・重ねる・順を入れ替えるネットワークで接続する。
+//! その上で、紹介・受け入れの依頼・付け替え・満杯時の取り置きを検査する。
+//! ネットワークは1 msごとに進む固定seedの模型。
+//! 中継役はdllの受信スレッドと同じ順（受ける → 組み立てから積む → `tend_relay` → `poll`）で回す。
+//! 紹介・依頼・断りのガードは、封じた便を直接組み立てて検査する。
+//! 上りの測定（MEASURE・PAIR）の模型（`Sim::measured`）は、観戦者の上りを絞って、測定のペアの到着時刻をµsでホストの`on_pair`へ渡す。
 
 use higanr_core::auth::{AuthKey, Secret};
 use higanr_core::bits512::Bits512;
-use higanr_core::candidate::Candidates;
+use higanr_core::candidate::{CandKind, Candidate, Candidates};
 use higanr_core::handshake::Name;
 use higanr_core::link::Outlet;
 use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::rtt_probe::DelaySnapshot;
 use higanr_core::seal::{DirKeys, Ephemeral, KeySeed, Sender, Seq, read_nonce_field};
 use higanr_core::spectate::{
-    ADMIT_TTL_MS, HEARTBEAT_MS, HostConfig, HostEvent, MAX_SPECTATORS, MEASURE_CLOSE_MS,
-    MEASURE_PAIRS, MEASURE_RESEND_MS, MEASURE_RETRY_MS, MEASURE_SENDS, PAIR_CAP, PAIR_GAP_MS,
-    PREPAID_MS, PUNCH_ROUNDS, REJOIN_MS, RELAY_CHILDREN, RELAY_HEARTBEAT_MS, RELAY_QUIET_MS,
-    RESERVE_MS, RelayKey, SILENT_MS, SpectateHost, Watcher, WatcherConfig, leave_tree, tend_relay,
+    ADMIT_TTL_MS, DropReason, HEARTBEAT_MS, HostConfig, HostEvent, INTRO_WINDOW_MS, JOIN_RESEND_MS,
+    MAX_INTROS, MAX_SPECTATORS, MEASURE_CLOSE_MS, MEASURE_PAIRS, MEASURE_RESEND_MS,
+    MEASURE_RETRY_MS, MEASURE_SENDS, PAIR_CAP, PAIR_GAP_MS, PREPAID_MS, PUNCH_ROUNDS, REJOIN_MS,
+    RELAY_CHILDREN, RELAY_HEARTBEAT_MS, RELAY_QUIET_MS, RESERVE_MS, RelayKey, SILENT_MS,
+    SpectateHost, Watcher, WatcherConfig, leave_tree, tend_relay,
 };
 use higanr_core::spectate_rate::RELAY_MIN_BPS;
 use higanr_core::wire::{
@@ -66,12 +69,12 @@ fn seed(n: u16, salt: u8) -> KeySeed {
     KeySeed(s)
 }
 
-/// 観戦者 `n` の使い捨ての鍵の種。
+/// 観戦者`n`の使い捨ての鍵の種。
 fn wseed(n: u16) -> KeySeed {
     seed(n, 0xA7)
 }
 
-/// 観戦者 `n` の中継用の鍵の種。
+/// 観戦者`n`の中継用の鍵の種。
 fn rseed(n: u16) -> KeySeed {
     seed(n, 0x5B)
 }
@@ -109,7 +112,7 @@ impl Rng {
 
 struct InFlight {
     at: u32,
-    /// 着く時刻（µs。上りを絞った送り元の便だけ ms より細かい。測りの組の差に使う）。
+    /// 着く時刻（µs。上りを絞った送り元の便だけmsより細かい値になる。測りのペアの差に使う）。
     at_us: u64,
     seq: u64,
     from: SocketAddr,
@@ -117,7 +120,7 @@ struct InFlight {
     bytes: Vec<u8>,
 }
 
-/// PAIR の通し番号から、落とすかを決める。
+/// PAIRの通し番号から落とすかどうかを決める。
 type PairDrop = fn(u32) -> bool;
 
 struct Net {
@@ -136,23 +139,25 @@ struct Net {
     drop_admits: u32,
     /// ホストの紹介を、この数だけ先頭から落とす。
     drop_intros: u32,
-    /// 上りを絞った送り元（送り元, B/s, 上りが空く µs）。この送り元の便は上りに 1 通ずつ並び、ばらつき無しで送った順に着く。
+    /// 上りを絞った送り元（送り元, B/s, 上りが空くµs）。
+    /// この送り元の便は上りに1通ずつ並ぶ。ばらつき無しで送った順に着く。
     paced: Vec<(SocketAddr, u32, u64)>,
-    /// この送り元の PAIR のうち、通し番号（0 から。送り直しの番も続けて数える）で真になるものを落とす。
+    /// この送り元のPAIRのうち、通し番号（0から。送り直された測定の順番のPAIRも続けて数える）で真になるものを落とす。
     pair_drop: Option<(SocketAddr, PairDrop)>,
     pairs_seen: u32,
     dropped: u64,
-    /// 「送った相手からだけ受ける」NAT の内側にいるアドレス。
+    /// 「送った相手からだけ受ける」NATの内側にいるアドレス。
     nat: Vec<SocketAddr>,
-    /// NAT の穴（持ち主, 相手, 持ち主が最後に相手へ送った時刻）。NAT の内側かに依らず、送るたびに記録する。
+    /// NATの穴（所有者, 相手, 所有者が最後に相手へ送った時刻）。
+    /// NATの内側かどうかによらず送るたびに記録する。
     holes: Vec<(SocketAddr, SocketAddr, u32)>,
-    /// 穴が最後の送りから開いている長さ（ms）。
+    /// 穴が最後の送信から開いている長さ（ms）。
     nat_ttl: u32,
     nat_dropped: u64,
 }
 
 impl Net {
-    /// `owner` の NAT が `peer` からの便を通すか。
+    /// `owner`のNATが`peer`からの便を通すかどうか。
     fn nat_passes(&self, now: u32, owner: SocketAddr, peer: SocketAddr) -> bool {
         !self.nat.contains(&owner)
             || self
@@ -255,12 +260,12 @@ struct Node {
     relay: Option<SpectateHost>,
     uplink: u32,
     start_at: u32,
-    /// 動いている（抜けた・落ちたら false）。
+    /// 動いている（抜けた・落ちたらfalse）。
     live: bool,
     /// 抜けた・落ちた時刻。
     gone_at: Option<u32>,
     got: Vec<(u32, Record)>,
-    /// 親を替えた時刻と、替えた後の親が元のホストか。
+    /// 親を替えた時刻と、替えた後の親が元のホストかどうか。
     moves: Vec<(u32, bool)>,
     epoch: u16,
 }
@@ -270,28 +275,30 @@ struct Sim {
     net: Net,
     host: SpectateHost,
     nodes: Vec<Node>,
-    /// `PERIOD` ごとにホストが積む記録（None はその回は何も積まない。選択の画面・読み込みの間）。
+    /// `PERIOD`ごとにホストが積む記録。Noneはそのタイミングでは何も積まない（選択画面・読み込み中）。
     script: Vec<Option<Record>>,
     next_script: usize,
     log: Vec<Record>,
     events: Vec<(u32, SocketAddr, HostEvent)>,
-    /// ホストの数える人数が、動き始めた観戦者（落ちてから `SILENT_MS` の内の人を含む）の数を越えた最初の時刻と（人数, 観戦者の数）。
+    /// ホストが数える人数が、動き始めた観戦者の数を越えた最初の時刻と（人数, 観戦者の数）。
+    /// 観戦者には、落ちてから`SILENT_MS`以内の人を含む。
     over: Option<(u32, usize, usize)>,
-    /// 接続している生きた観戦者が `MAX_SPECTATORS` を越えた最初の時刻と数。
+    /// 接続している生きた観戦者が`MAX_SPECTATORS`を越えた最初の時刻と数。
     cap: Option<(u32, usize)>,
-    /// ホストが埋まっていると見る席（人数 ＋ 取り置き）が、接続している生きた観戦者より少なかった最初の時刻と（席, 観戦者の数）。
+    /// ホストが埋まっていると見る枠の数（人数 ＋ 取り置き）が、接続している生きた観戦者より少なかった最初の時刻と（枠の数, 観戦者の数）。
     under: Option<(u32, usize, usize)>,
-    /// `under` で数えない観戦者（ホストが黙ったと見て外した間も生きている人）。
+    /// `under`で数えない観戦者（ホストが黙ったと見て外している間も生きている人）。
     excused: Vec<u16>,
-    /// 中継役の下の子の親が、元のホストの直接の観戦者でなかった（木が 3 段になった）最初の時刻と子。
+    /// 中継役の下の子の親が、元のホストの直接の観戦者でなかった最初の時刻と子。
+    /// 木が3階層になったことを表す。
     deep: Option<(u32, u16)>,
-    /// 上りを測りで決める（`note_uplink` を呼ばず、模型が観戦者の上りを絞って、PAIR をホストの `on_pair` へ渡す）。
+    /// 上りを測定で決める。`note_uplink`を呼ばず、模型が観戦者の上りを絞ってPAIRをホストの`on_pair`へ渡す。
     measured: bool,
-    /// ホストが測りの番を渡した時刻と相手。
+    /// ホストが測定の順番を渡した時刻と相手。
     turns: Vec<(u32, SocketAddr)>,
 }
 
-/// 台本: `Seg(0)`・名前 2 つ・マッチの語 `frames` 個・`End`。
+/// 台本: `Seg(0)`・名前2つ・マッチのワード`frames`個・`End`。
 fn script(rng: &mut Rng, frames: u32) -> Vec<Option<Record>> {
     let mut v = seg_head(0);
     push_frames(&mut v, rng, frames);
@@ -317,8 +324,7 @@ fn push_frames(v: &mut Vec<Option<Record>>, rng: &mut Rng, frames: u32) {
     }));
 }
 
-/// 2 マッチの台本: マッチ 0 の語 `frames0` 個・`Seg(1)` と名前・`idle_ms` の間は何も積まない（マッチの切れ目）・マッチ 1 の語
-/// `frames1` 個・`End`。
+/// 2マッチの台本: マッチ0のワード`frames0`個・`Seg(1)`と名前・`idle_ms`の間は何も積まない（マッチの切れ目）・マッチ1のワード`frames1`個・`End`。
 fn two_matches(seed: u64, frames0: u32, idle_ms: u32, frames1: u32) -> Vec<Option<Record>> {
     let mut rng = Rng(seed ^ 0x7EE);
     let mut v = seg_head(0);
@@ -330,7 +336,7 @@ fn two_matches(seed: u64, frames0: u32, idle_ms: u32, frames1: u32) -> Vec<Optio
     v
 }
 
-/// 台本 `v` の `Seg(1)` を積む時刻と、その後の何も積まない間が終わる時刻。
+/// 台本`v`の`Seg(1)`を積む時刻と、その後の何も積まない間が終わる時刻。
 fn idle_window(v: &[Option<Record>]) -> (u32, u32) {
     let seg = v
         .iter()
@@ -358,7 +364,8 @@ const LOSSY: Chaos = Chaos {
     dup_pct: 5,
 };
 
-/// 落とさない回線（BYE・REHOME は 1 通きりで、落ちたら子が `REJOIN_MS` の待ちに戻る。その速さを見る検査に使う）。
+/// 落とさない回線。
+/// BYE・REHOMEは1通きりで、落ちたら子が`REJOIN_MS`の待ちに戻る。その戻る速さを検査するのに使う。
 const CALM: Chaos = Chaos {
     base: 5,
     jitter: 25,
@@ -392,7 +399,7 @@ impl Sim {
                 nat_ttl: u32::MAX,
                 nat_dropped: 0,
             },
-            host: SpectateHost::with_capacity(host_cfg(), 16_384),
+            host: fat_host(16_384),
             nodes: Vec::new(),
             script: script(&mut rng, frames),
             next_script: 0,
@@ -408,7 +415,7 @@ impl Sim {
         }
     }
 
-    /// 台本 `script` の模型。
+    /// 台本`script`の模型。
     fn with_script(seed: u64, c: Chaos, script: Vec<Option<Record>>) -> Sim {
         Sim {
             script,
@@ -416,7 +423,7 @@ impl Sim {
         }
     }
 
-    /// 上りを測りで決める模型。`add` の `uplink` は、その観戦者の上りの太さ（絞る）になる。
+    /// 上りを測定で決める模型。`add`の`uplink`はその観戦者の上りの太さ。この値に上りを絞る。
     fn measured(seed: u64, c: Chaos, frames: u32) -> Sim {
         Sim {
             measured: true,
@@ -424,7 +431,7 @@ impl Sim {
         }
     }
 
-    /// 観戦者 `n` を `start_at` ms から動かす。`relay` なら中継でき、上り `uplink` を持つ。
+    /// 観戦者`n`を`start_at` msから動かす。`relay`なら中継でき、上り`uplink`を持つ。
     fn add(&mut self, n: u16, start_at: u32, relay: bool, uplink: u32) {
         let mut w = watcher(n);
         w.set_nat(REACHABLE);
@@ -451,7 +458,7 @@ impl Sim {
         });
     }
 
-    /// 中継できる太い観戦者 1〜`count` を、`gap` ms おきに動かす。
+    /// 中継できる太い観戦者1〜`count`を、`gap` msおきに動かす。
     fn add_tree(&mut self, count: u16, gap: u32) {
         for n in 1..=count {
             self.add(n, u32::from(n) * gap, true, THICK);
@@ -466,7 +473,7 @@ impl Sim {
         self.nodes.iter_mut().find(|x| x.n == n).expect("観戦者")
     }
 
-    /// 観戦者 `n` を落とす（強制終了。以後の通信は届かない）。
+    /// 観戦者`n`を落とす（強制終了。以後の通信は届かない）。
     fn crash(&mut self, n: u16) {
         let (a, now) = (addr(n), self.now);
         self.net.dead.push(a);
@@ -475,7 +482,7 @@ impl Sim {
         x.gone_at = Some(now);
     }
 
-    /// 観戦者 `n` が観戦を終える（ホストへ BYE・子へ REHOME。送った便は届く）。
+    /// 観戦者`n`が観戦を終える（ホストへBYE・子へREHOME。送った便は届く）。
     fn leave(&mut self, n: u16) {
         let now = self.now;
         let Sim { net, nodes, .. } = self;
@@ -526,7 +533,7 @@ impl Sim {
                 };
                 let ev = self.host.on_datagram(p.from, &p.bytes, now, &mut tx);
                 self.events.push((now, p.from, ev));
-                // 測りの模型でなければ、接続した直後に上りを渡す（木の検査を測りから切り離す）。
+                // 測定の模型でなければ接続した直後に上りを渡す（木の検査を測定から切り離す）。
                 if ev == HostEvent::Joined
                     && !self.measured
                     && let Some(n) = self.nodes.iter().find(|x| x.addr == p.from)
@@ -547,7 +554,7 @@ impl Sim {
                 from: node.addr,
                 now,
             };
-            // 受信の振り分け: JOIN・ACK は配る側、STREAM・INTRO・ADMIT・REHOME は観戦者の側、BYE は送り元で分ける。
+            // 受信の振り分け: JOIN・ACKは配信側、STREAM・INTRO・ADMIT・REHOMEは観戦者の側、BYEは送り元で分ける。
             let to_relay = node.relay.is_some()
                 && match wire::peek_type(&p.bytes) {
                     PeekedType::SpectateJoin | PeekedType::SpectateAck => true,
@@ -630,7 +637,7 @@ impl Sim {
         }
     }
 
-    /// 親が中継役で、その中継役の親も元のホストでない観戦者（3 段目）。
+    /// 親が中継役で、その中継役の親も元のホストでない観戦者（3階層目）。
     fn find_deep(&self) -> Option<u16> {
         self.nodes.iter().filter(|x| x.live).find_map(|x| {
             let parent = x.w.host_addr().filter(|_| !x.w.parent_is_home())?;
@@ -668,7 +675,7 @@ impl Sim {
         }
     }
 
-    /// 観戦者 `n` の列が、ホストの列の `from` から積んだ終わりまで、飛ばずに一致する。
+    /// 観戦者`n`の列が、ホストの列の`from`から積んだ終わりまで、飛ばずに一致する。
     fn assert_column(&self, n: u16, from: u32) {
         let x = self.node(n);
         let tail = self.host.tail() as usize;
@@ -687,7 +694,7 @@ impl Sim {
         assert_eq!(x.w.assembler_counts().jumps, 0, "観戦者 {n}: 飛んだ");
     }
 
-    /// 走った間ずっと、接続している観戦者が上限以下で、ホストが席をその数以上と見ていた。
+    /// 走った間ずっと、接続している観戦者が上限以下で、ホストが数えた枠がその人数以上だった。
     fn assert_counts(&self) {
         assert_eq!(self.cap, None, "接続している観戦者が上限を越えた");
         assert_eq!(
@@ -696,7 +703,7 @@ impl Sim {
         );
     }
 
-    /// 中継役 `n` の子（親が `n` の観戦者）。
+    /// 中継役`n`の子（親が`n`の観戦者）。
     fn children_of(&self, n: u16) -> Vec<u16> {
         let a = addr(n);
         self.nodes
@@ -716,8 +723,8 @@ impl Sim {
     }
 }
 
-/// 10 人の木（中継役 2 人・子 4 人ずつ）ができた模型（観戦者 `k` は `k × 200` ms に入る。落としで入る順が入れ替わるので、
-/// 中継役は形で見る）。
+/// 10人の木（中継役2人・子4人ずつ）ができた模型。観戦者`k`は`k × 200` msに入る。
+/// 落とすと入る順が入れ替わるので、中継役が誰かは木の形で検査する。
 fn ten_tree(seed: u64, c: Chaos, frames: u32) -> Sim {
     let mut sim = Sim::new(seed, c, frames);
     sim.add_tree(10, 200);
@@ -728,6 +735,15 @@ fn ten_tree(seed: u64, c: Chaos, frames: u32) -> Sim {
 }
 
 impl Sim {
+    /// 木の形が`want`になるまで100 msずつ進める。`from`までは先に進めてから木を見る。`limit`までに揃わなければ失敗にする。
+    fn run_until_relays(&mut self, want: &[(u16, Vec<u16>)], from: u32, limit: u32) {
+        self.run_to(from);
+        while self.relays() != want && self.now < limit {
+            self.run_to(self.now + 100);
+        }
+        assert_eq!(self.relays(), want, "{limit} ms までに木の形が揃わない");
+    }
+
     /// 子を持つ中継役（子の多い順）と、その子。
     fn relays(&self) -> Vec<(u16, Vec<u16>)> {
         let mut v: Vec<(u16, Vec<u16>)> = self
@@ -742,6 +758,13 @@ impl Sim {
     }
 }
 
+/// 観戦のホスト。上りが太いと測定済みの状態にする。追いつきの送信は全体の上限から始まる。
+fn fat_host(capacity: usize) -> SpectateHost {
+    let mut h = SpectateHost::with_capacity(host_cfg(), capacity);
+    h.note_host_uplink(u32::MAX);
+    h
+}
+
 #[test]
 fn ten_spectators_form_two_relays_with_four_children_each_and_get_the_hosts_column() {
     for seed in [0x51, 0x6262] {
@@ -752,14 +775,14 @@ fn ten_spectators_form_two_relays_with_four_children_each_and_get_the_hosts_colu
         }
         assert_eq!(sim.host.spectator_count(), MAX_SPECTATORS);
         assert_eq!(sim.host.pending_intros(), 0);
-        // ホストが直接送るのは中継役 2 人だけ。
+        // ホストが直接送るのは中継役2人だけ。
         let direct: Vec<SocketAddr> = sim.host.spectators().map(|s| s.0).collect();
         let mut want: Vec<SocketAddr> = relays.iter().map(|&r| addr(r)).collect();
         want.sort();
         let mut direct_sorted = direct.clone();
         direct_sorted.sort();
         assert_eq!(direct_sorted, want, "seed {seed:#x}");
-        // 11 人目は断られる。
+        // 11人目は断られる。
         sim.add(11, sim.now + 1, false, 0);
         sim.run_until_caught_up(60_000);
         sim.assert_counts();
@@ -795,7 +818,7 @@ fn the_nat_model_passes_only_a_peer_the_owner_sent_to_and_forgets_it_after_the_t
     assert_eq!(sim.net.nat_dropped, 2, "古い穴を通した");
 }
 
-/// 中継役が「送った相手からだけ受ける」NAT の内側にいると、子の JOIN は中継役が子の候補へ穴あけを送るまで捨てられる。
+/// 中継役が「送った相手からだけ受ける」NATの内側にいると、子のJOINは中継役が子の候補へ穴あけを送るまで捨てられる。
 #[test]
 fn behind_a_restricted_nat_the_relay_punches_to_its_children_so_the_tree_forms() {
     for seed in [0x51, 0x6262] {
@@ -824,7 +847,7 @@ fn behind_a_restricted_nat_the_relay_punches_to_its_children_so_the_tree_forms()
             .filter_map(|x| x.relay.as_ref())
             .map(|r| r.counts().punches_sent)
             .sum();
-        // 子の JOIN が通ったら止める（止めなければ 8 人 × `PUNCH_ROUNDS` 通）。
+        // 子のJOINが通ったら止める（止めなければ8人 × `PUNCH_ROUNDS`通）。
         assert!(
             (8..8 * u64::from(PUNCH_ROUNDS) / 2).contains(&sent),
             "seed {seed:#x}: 中継役が送った穴あけ {sent} 通"
@@ -832,8 +855,8 @@ fn behind_a_restricted_nat_the_relay_punches_to_its_children_so_the_tree_forms()
     }
 }
 
-/// 木ができた後にホストが NAT の内側になった形（子へはもう何も送っていない）で、中継役が子を残して消えたとき、戻る子の JOIN が
-/// 通る。穴は最後の送りから `HOLE_TTL` だけ開く。
+/// 木ができた後にホストがNATの内側になり、子へはもう何も送っていない状態で中継役が子を残して消えた。
+/// このとき戻る子のJOINは通る。穴は最後の送信から`HOLE_TTL`だけ開く。
 const HOLE_TTL: u32 = 2_000;
 
 fn seven_tree_behind_host_nat(seed: u64, frames: u32) -> (Sim, u16, Vec<u16>) {
@@ -845,7 +868,7 @@ fn seven_tree_behind_host_nat(seed: u64, frames: u32) -> (Sim, u16, Vec<u16>) {
     (sim, a, kids)
 }
 
-/// 子 `kids` の JOIN が `t` から `within` ms の内にホストへ届き（その後ほかの中継役へ回ってもよい）、`gone` の下には誰もいない。
+/// 子`kids`のJOINが`t`から`within` ms以内にホストへ届き（その後ほかの中継役へ回ってもよい）、`gone`の下には誰もいない。
 fn assert_kids_reach_the_host(sim: &Sim, kids: &[u16], t: u32, within: u32, gone: u16) {
     for &n in kids {
         let first = sim
@@ -875,7 +898,7 @@ fn a_leaving_relays_children_get_through_the_hosts_nat_because_the_host_punches_
     sim.leave(a);
     sim.run_to(t + REJOIN_MS);
     assert_kids_reach_the_host(&sim, &kids, t, 1_000, a);
-    // 子の JOIN が通ったら止める（止めなければ 4 人 × `PUNCH_ROUNDS` 通）。
+    // 子のJOINが通ったら止める（止めなければ4人 × `PUNCH_ROUNDS`通）。
     let sent = sim.host.counts().punches_sent;
     assert!(
         (kids.len() as u64..2 * kids.len() as u64 + 1).contains(&sent),
@@ -924,7 +947,7 @@ fn the_count_follows_joins_leaves_and_returns() {
     assert_eq!(sim.over, None);
 }
 
-/// 中継役 2 人（子 4 人と 1 人）の木ができた模型。返すのは（子 4 人の中継役, その子）。
+/// 中継役2人（子4人と1人）の木ができた模型。返すのは（子4人の中継役, その子）。
 fn seven_tree(seed: u64, c: Chaos, frames: u32) -> Sim {
     let mut sim = Sim::new(seed, c, frames);
     sim.add_tree(7, 200);
@@ -934,7 +957,7 @@ fn seven_tree(seed: u64, c: Chaos, frames: u32) -> Sim {
     sim
 }
 
-/// 子 `kids` が元のホストへ戻った時刻（`at` からの ms）。
+/// 子`kids`が元のホストへ戻った時刻（`at`からのms）。
 fn return_delays(sim: &Sim, kids: &[u16], at: u32) -> Vec<u32> {
     kids.iter()
         .map(|&n| {
@@ -1023,9 +1046,10 @@ fn cutting_only_host_to_relay_makes_the_relay_rehome_its_children() {
     assert_eq!(sim.deep, None);
 }
 
-/// 中継役の上りだけを切ると、中継役の流れが止まり、子には `RELAY_HEARTBEAT_MS` ごとの生きている合図しか届かない（続けて落ちると子は
-/// `REJOIN_MS` で戻る）。子が付いたままの形を見るので、落とさない回線で回す。ホストが外した間の中継役は生きているが、ホストは数えない（入り直しで
-/// 満杯なら断られる）。
+/// 中継役の上りだけを切ると中継役の流れが止まる。子には`RELAY_HEARTBEAT_MS`ごとの生存確認（ping）しか届かない。
+/// 続けて落ちると子は`REJOIN_MS`で戻る。
+/// 子が付いたままの状態を検査するので、落とさない回線で回す。
+/// ホストが外した間の中継役は生きているが、ホストは数えない（入り直しで満杯なら断られる）。
 #[test]
 fn a_relay_the_host_dropped_comes_back_directly_while_it_still_has_children() {
     let mut sim = seven_tree(0x61, CALM, 1_700);
@@ -1152,8 +1176,8 @@ fn newcomers_after_a_child_left_a_relay_that_still_holds_it_never_pass_ten() {
     }
 }
 
-/// 中継役の BYE が子の JOIN より後に着く順（REHOME を先に送り、BYE を 150 ms 遅らせる）でも、満杯の木で戻る子は断られず、元の中継役へは
-/// 回されない。新しい人は中継役の BYE で空いた 1 席に入る。
+/// 中継役のBYEが子のJOINより後に着く順（REHOMEを先に送り、BYEを150 ms遅らせる）でも、満杯の木で戻る子は断られない。
+/// 戻る子は元の中継役へは回されない。新しい人は中継役のBYEで空いた1枠に入る。
 #[test]
 fn when_full_children_whose_join_beats_the_relays_bye_still_get_back_in() {
     let mut sim = ten_tree(0xB1, CALM, 1_100);
@@ -1212,7 +1236,7 @@ fn a_reservation_expires_after_reserve_ms_and_lets_a_newcomer_in() {
     let mut sim = ten_tree(0xA1, CALM, 1_100);
     let (a, kids) = sim.relays()[0].clone();
     let t = sim.now;
-    // 中継役は抜け、その子は落ちる（誰も戻らない）。取り置きの 4 席で、新しい人は 1 人しか入れない。
+    // 中継役は抜け、その子は落ちる（誰も戻らない）。取り置きの4枠があるので新しい人は1人しか入れない。
     for &n in &kids {
         sim.crash(n);
     }
@@ -1239,10 +1263,10 @@ fn a_reservation_expires_after_reserve_ms_and_lets_a_newcomer_in() {
     sim.assert_counts();
 }
 
-// ============================ 入れ替え・照合のずれで戻る・中継の合図 ============================
+// ============================ 入れ替え・照合のずれで戻る・中継の生存確認（ping） ============================
 
 impl Sim {
-    /// 観戦者 `n` の照合がずれた（`Watcher::return_on_mismatch`）。
+    /// 観戦者`n`の照合がずれた（`Watcher::return_on_mismatch`）。
     fn mismatch(&mut self, n: u16) -> bool {
         let now = self.now;
         let Sim { net, nodes, .. } = self;
@@ -1255,7 +1279,7 @@ impl Sim {
         node.w.return_on_mismatch(now, &mut tx)
     }
 
-    /// 観戦者 `n` が木の欄の変化を元のホストへ知らせる（`Watcher::announce`）。
+    /// 観戦者`n`が木のフィールドの変化を元のホストへ知らせる（`Watcher::announce`）。
     fn announce(&mut self, n: u16) -> bool {
         let now = self.now;
         let Sim { net, nodes, .. } = self;
@@ -1280,7 +1304,7 @@ impl Sim {
     }
 }
 
-/// 中継しない葉 1〜3 が先に直接入り、中継できる 4 が後から来る（4 は誰の下にも回らない）。マッチ 0 の後に `idle_ms` の切れ目。
+/// 中継しない葉1〜3が先に直接入り、中継できる4が後から来る（4は誰の下にも回らない）。マッチ0の後に`idle_ms`の切れ目。
 fn leaves_then_relay(seed: u64, c: Chaos, idle_ms: u32) -> Sim {
     let mut sim = Sim::with_script(seed, c, two_matches(seed, 300, idle_ms, 300));
     for n in 1..=3 {
@@ -1296,14 +1320,17 @@ fn at_the_match_break_direct_leaves_move_under_the_relay_and_their_column_does_n
         let mut sim = leaves_then_relay(seed, LOSSY, 6_000);
         let (_, end) = idle_window(&sim.script);
         sim.run_to(end);
-        assert_eq!(sim.children_of(4), vec![1, 2], "seed {seed:#x}");
+        let kids = sim.children_of(4);
+        assert_eq!(kids.len(), 2, "seed {seed:#x}");
         let mut direct: Vec<SocketAddr> = sim.host.spectators().map(|s| s.0).collect();
         direct.sort();
-        assert_eq!(
-            direct,
-            vec![addr(3), addr(4)],
-            "seed {seed:#x}: 直接は 2 人"
-        );
+        let mut want: Vec<SocketAddr> = (1..=3)
+            .filter(|n| !kids.contains(n))
+            .map(addr)
+            .chain([addr(4)])
+            .collect();
+        want.sort();
+        assert_eq!(direct, want, "seed {seed:#x}: 直接は 2 人");
         let c = sim.host.counts();
         assert_eq!(
             (c.swaps, c.swap_freed, c.silenced),
@@ -1326,14 +1353,14 @@ fn during_a_match_no_leaf_is_moved() {
     let (seg_at, end) = idle_window(&sim.script);
     sim.run_to(seg_at - 1);
     assert!(matches!(sim.log.last(), Some(Record::Frame { .. })));
-    // 中継役に向く 4 はもう ACK を返していて、上りも分かっている。
+    // 中継役に向く4はもうACKを返していて、上りも分かっている。
     assert_eq!(sim.host.uplink_of(addr(4)), Some(THICK));
     assert!(sim.host.tree_of(addr(4)).is_some_and(|v| !v.relay.no_intro));
     assert_eq!(sim.host.counts().swaps, 0, "試合中に入れ替えた");
     for n in 1..=3 {
         assert_eq!(sim.node(n).w.tree_counts().intros_taken, 0, "葉 {n}");
     }
-    // 切れ目に入ると、ホストが葉を移す（この模型で入れ替えが起きる証拠）。
+    // 切れ目に入るとホストが葉を移す（この模型で入れ替えが起きる証拠）。
     sim.run_to(end);
     assert_eq!(sim.host.counts().swaps, 2);
 }
@@ -1346,14 +1373,18 @@ fn a_leaf_whose_intro_was_lost_joins_the_host_after_rejoin_ms_and_is_introduced_
     sim.net.drop_intros = 1;
     sim.run_to(end);
     assert_eq!(sim.net.drop_intros, 0, "紹介を落とせていない");
-    assert_eq!(sim.children_of(4), vec![1, 2]);
+    assert_eq!(sim.children_of(4).len(), 2);
     let c = sim.host.counts();
     assert!(c.intro_resends >= 1, "紹介を送り直していない");
     assert_eq!((c.swaps, c.swap_freed, c.silenced), (2, 2, 0));
-    let moved = sim.node(1).moves.first().map_or(u32::MAX, |m| m.0);
+    // 紹介を落とされた葉は後に移った方。
+    let moved = (1..=3)
+        .filter_map(|n| sim.node(n).moves.first().map(|m| m.0))
+        .max()
+        .unwrap_or(u32::MAX);
     assert!(
         (seg_at + REJOIN_MS..seg_at + REJOIN_MS + 2_000).contains(&moved),
-        "葉 1 が移った時刻 {moved}（切れ目 {seg_at}）"
+        "紹介を落とされた葉が移った時刻 {moved}（切れ目 {seg_at}）"
     );
     sim.run_until_caught_up(60_000);
     sim.assert_counts();
@@ -1363,7 +1394,7 @@ fn a_leaf_whose_intro_was_lost_joins_the_host_after_rejoin_ms_and_is_introduced_
     assert_eq!(sim.over, None);
 }
 
-/// 中継役が依頼を受け取らない間に、ホストの紹介を受けた葉 1 が中継役へ届かず「直接だけ」で戻る（元の枠はまだある）。
+/// 中継役が依頼を受け取らない間にホストの紹介を受けた葉1が、中継役へ届かず「直接だけ」で戻る（元の枠はまだある）。
 #[test]
 fn a_leaf_back_while_its_direct_slot_remains_is_counted_once_and_keeps_its_slot() {
     let mut sim = leaves_then_relay(0x8D, CALM, 12_000);
@@ -1371,13 +1402,18 @@ fn a_leaf_back_while_its_direct_slot_remains_is_counted_once_and_keeps_its_slot(
     sim.run_to(seg_at - 1);
     sim.net.drop_admits = u32::MAX;
     sim.run_to(seg_at + REJOIN_MS + 500);
-    let w = &sim.node(1).w;
-    assert!(w.parent_is_home() && w.direct_only(), "葉 1 が戻っていない");
-    assert_eq!(w.tree_counts().unreached, 1);
+    // 最初に紹介された葉（どれかはackの位相で決まる）。
+    let leaf = (1..=3u16)
+        .find(|&n| {
+            let w = &sim.node(n).w;
+            w.parent_is_home() && w.direct_only()
+        })
+        .expect("紹介された葉が戻っていない");
+    assert_eq!(sim.node(leaf).w.tree_counts().unreached, 1);
     sim.net.drop_admits = 0;
     sim.run_to(end);
     let after: Vec<HostEvent> = sim
-        .events_of(1)
+        .events_of(leaf)
         .into_iter()
         .filter(|e| e.0 >= seg_at)
         .map(|e| e.1)
@@ -1385,10 +1421,11 @@ fn a_leaf_back_while_its_direct_slot_remains_is_counted_once_and_keeps_its_slot(
         .collect();
     assert!(
         after.first() == Some(&HostEvent::Refreshed) && !after.contains(&HostEvent::Joined),
-        "葉 1 が元の枠のまま戻っていない: {after:?}"
+        "葉 {leaf} が元の枠のまま戻っていない: {after:?}"
     );
-    // 葉 1 は直接のまま、2・3 は中継役 4 の下へ。空けた枠は 2・3 の分だけ。
-    assert_eq!(sim.children_of(4), vec![2, 3]);
+    // 戻った葉は直接のまま。ほかの2人は中継役4の下へ移る。空けた枠は2人の分だけ。
+    let others: Vec<u16> = (1..=3).filter(|&n| n != leaf).collect();
+    assert_eq!(sim.children_of(4), others);
     let c = sim.host.counts();
     assert_eq!((c.swaps, c.swap_freed, c.silenced), (3, 2, 0));
     sim.run_until_caught_up(60_000);
@@ -1399,11 +1436,11 @@ fn a_leaf_back_while_its_direct_slot_remains_is_counted_once_and_keeps_its_slot(
     assert_eq!(sim.over, None, "人数が二重になった");
 }
 
-/// 中継役 1（子 2〜5）と中継役 6（子 7〜9）。1 が落ち、戻った子は 6 が満杯なので直接に残る。後から来た中継できる 10 の下へ、
-/// 次の切れ目で移る。
+/// 中継役1（子2〜5）と中継役6（子7〜9）。1が落ち、戻った子は6が満杯なので直接に残る。
+/// その子は後から来た中継できる10の下へ次の切れ目で移る。
 #[test]
 fn children_back_from_a_crashed_relay_move_under_another_relay_at_the_next_break() {
-    for seed in [0x9E, 0xAFAF] {
+    for seed in [0x9F, 0xAFAF] {
         let mut sim = Sim::with_script(seed, LOSSY, two_matches(seed, 1_200, 6_000, 200));
         sim.add(1, 100, true, THICK);
         for n in 2..=5 {
@@ -1413,21 +1450,17 @@ fn children_back_from_a_crashed_relay_move_under_another_relay_at_the_next_break
         for n in 7..=9 {
             sim.add(n, 1_500 + 200 * u32::from(n - 6), false, 0);
         }
-        sim.run_to(3_500);
-        assert_eq!(
-            sim.relays(),
-            vec![(1, vec![2, 3, 4, 5]), (6, vec![7, 8, 9])],
-            "seed {seed:#x}"
-        );
+        sim.run_until_relays(&[(1, vec![2, 3, 4, 5]), (6, vec![7, 8, 9])], 3_500, 5_500);
+        let crashed_at = sim.now;
         sim.crash(1);
-        sim.run_to(3_500 + REJOIN_MS + 1_500);
+        sim.run_to(crashed_at + REJOIN_MS + 1_500);
         let home: Vec<u16> = (2..=5)
             .filter(|&n| sim.node(n).w.parent_is_home())
             .collect();
         assert_eq!(home.len(), 3, "seed {seed:#x}: 6 の空き 1 つ以外は直接");
         sim.add(10, sim.now, true, THICK);
         let (seg_at, end) = idle_window(&sim.script);
-        assert!(seg_at > 3_500 + SILENT_MS, "1 を外す前に切れ目が来る");
+        assert!(seg_at > crashed_at + SILENT_MS, "1 を外す前に切れ目が来る");
         sim.run_to(end);
         let mut kids = sim.children_of(10);
         kids.sort_unstable();
@@ -1443,7 +1476,7 @@ fn children_back_from_a_crashed_relay_move_under_another_relay_at_the_next_break
     }
 }
 
-/// 中継役 1（子 2〜5）と、中継役 6（子 7）。子 2 の照合がずれる。
+/// 中継役1（子2〜5）と、中継役6（子7）。子2の照合がずれる。
 #[test]
 fn a_mismatch_under_a_relay_returns_direct_only_and_is_never_introduced_again() {
     let mut sim = Sim::with_script(0xB2, LOSSY, two_matches(0xB2, 400, 6_000, 200));
@@ -1453,8 +1486,7 @@ fn a_mismatch_under_a_relay_returns_direct_only_and_is_never_introduced_again() 
     }
     sim.add(6, 1_500, true, THICK);
     sim.add(7, 2_500, false, 0);
-    sim.run_to(3_500);
-    assert_eq!(sim.relays(), vec![(1, vec![2, 3, 4, 5]), (6, vec![7])]);
+    sim.run_until_relays(&[(1, vec![2, 3, 4, 5]), (6, vec![7])], 3_500, 5_500);
     let t = sim.now;
     // 親が元のホストなら何もしない。
     assert!(!sim.mismatch(6));
@@ -1486,11 +1518,11 @@ fn a_mismatch_under_a_relay_returns_direct_only_and_is_never_introduced_again() 
         sim.host.ack_of(addr(2)).is_some(),
         "ホストが直接受けていない"
     );
-    // 中継役 1 は BYE で子 2 を外した。
+    // 中継役1はBYEで子2を外した。
     assert_eq!(sim.children_of(1), vec![3, 4, 5]);
     let relay1 = sim.node(1).relay.as_ref().expect("配る側");
     assert!(relay1.counts().left >= 1, "中継役へ BYE が届いていない");
-    // 切れ目でも、直接の 3 人（1・6・2）のうち 2 は移さない。
+    // 切れ目でも直接の3人（1・6・2）のうち2は移さない。
     let (seg_at, end) = idle_window(&sim.script);
     assert!(seg_at > t + 1_000);
     sim.run_to(end);
@@ -1507,8 +1539,8 @@ fn a_mismatch_under_a_relay_returns_direct_only_and_is_never_introduced_again() 
     }
 }
 
-/// 接続した後に足した候補と回線の型を、ホストが知らせの JOIN で読み直す（流れは飛ばない）。元のホストから中継役の下へ移った子と、
-/// まだ接続していない観戦者は送らない。
+/// 接続した後に足した候補とネットワーク種別のフラグを、ホストが通知のJOINで読み直す（ストリームは飛ばない）。
+/// 元のホストから中継役の下へ移った子と、まだ接続していない観戦者は通知を送らない。
 #[test]
 fn an_announce_updates_what_the_host_knows_and_only_a_joined_direct_watcher_sends_it() {
     let mut sim = leaves_then_relay(0xA7, CALM, 6_000);
@@ -1540,7 +1572,7 @@ fn an_announce_updates_what_the_host_knows_and_only_a_joined_direct_watcher_send
         "元のホストから中継役の下へ移った子が送った"
     );
     assert!(!sim.announce(5), "接続していない観戦者が送った");
-    // CALM は落とさないので 1 通で届く。
+    // CALMは落とさないので1通で届く。
     sim.run_to(t + 200);
     let after = sim.host.tree_of(addr(leaf)).expect("ホストの枠").join;
     assert!(after.candidates.contains(extra), "候補を読み直していない");
@@ -1554,7 +1586,7 @@ fn an_announce_updates_what_the_host_knows_and_only_a_joined_direct_watcher_send
     }
 }
 
-/// 選択の画面（記録が積まれず合図だけが流れる間）が 60 秒続き、10% 落ちる回線で、子が親の沈黙と見て戻らない。
+/// 選択画面（記録が積まれず生存確認（ping）だけが流れる間）が60秒続き、10%落ちる回線でも、子が親の沈黙と見なして戻ることはない。
 #[test]
 fn on_a_lossy_line_children_do_not_return_while_only_heartbeats_flow() {
     let mut wrong = Vec::new();
@@ -1580,9 +1612,9 @@ fn on_a_lossy_line_children_do_not_return_while_only_heartbeats_flow() {
     assert_eq!(wrong, vec![0, 0], "合図だけの間に子が戻った");
 }
 
-// ============================ 便を直に組み立てる検査 ============================
+// ============================ 便を直接組み立てる検査 ============================
 
-/// 封じた便・HMAC の便の受け口（`(宛先, バイト列)` を溜める）。
+/// 封じた便・HMACの便を送る代わりに溜めるバッファ（`(宛先, バイト列)`を溜める）。
 #[derive(Default)]
 struct Sink(Vec<(SocketAddr, Vec<u8>)>);
 
@@ -1593,7 +1625,7 @@ impl Outlet for Sink {
 }
 
 impl Sink {
-    /// 宛先 `to` の便を `keys` で開いて取り出す（開けない便は飛ばす）。
+    /// 宛先`to`の便を`keys`で開いて取り出す（開けない便は飛ばす）。
     fn opened(&self, to: SocketAddr, keys: &DirKeys) -> Vec<Message> {
         self.0
             .iter()
@@ -1604,7 +1636,7 @@ impl Sink {
     }
 }
 
-/// 観戦者 `n` を演じる側: ホストとの鍵（観戦者が「後ろ」）で ACK を封じ、ホストの便を開く。
+/// 観戦者`n`を演じる側: ホストとの鍵（観戦者が「後ろ」）でACKを封じ、ホストの便を開く。
 struct Fake {
     n: u16,
     keys: DirKeys,
@@ -1660,18 +1692,31 @@ impl Fake {
         self.sealed(&Message::SpectatePair(SpectatePair { turn, pair, second }))
     }
 
-    fn ack(&self, next: u32, relay: RelayState, admit_ack: u16) -> Vec<u8> {
+    /// 送り元`addr(n)`から返すACK。正直な観戦者と同じく、`host`がこの枠へ送ったSTREAMのクッキーを返す。
+    fn ack(&self, host: &SpectateHost, next: u32, relay: RelayState, admit_ack: u16) -> Vec<u8> {
+        self.ack_from(host, addr(self.n), next, relay, admit_ack)
+    }
+
+    fn ack_from(
+        &self,
+        host: &SpectateHost,
+        from: SocketAddr,
+        next: u32,
+        relay: RelayState,
+        admit_ack: u16,
+    ) -> Vec<u8> {
         self.sealed(&Message::SpectateAck {
             nonce: nonce_of(self.n),
             next,
             relay,
             admit_ack,
+            cookie: host.cookie_of(from),
             sack: Bits512::EMPTY,
         })
     }
 }
 
-/// 中継できる観戦者の JOIN の木の欄。
+/// 中継できる観戦者のJOINの木のフィールド。
 fn relay_tree(n: u16) -> JoinTree {
     JoinTree {
         relay_public: Some(RelayKey::new(&rseed(n)).public()),
@@ -1685,14 +1730,25 @@ const ON: RelayState = RelayState {
     no_intro: false,
 };
 
-/// 記録 0〜100 を積んだホストに、中継役を演じる観戦者 1 が入り、番号 `ack` まで受け取った。
+/// 記録0〜100を積んだホストに、中継役を演じる観戦者1が入り、番号`ack`まで受け取った。
 fn host_with_relay(
     tree: JoinTree,
     uplink: u32,
     relay: RelayState,
     ack: u32,
 ) -> (SpectateHost, Fake) {
-    let mut host = SpectateHost::with_capacity(host_cfg(), 1_024);
+    host_with_relay_at(addr(1), tree, uplink, relay, ack)
+}
+
+/// `host_with_relay`で中継役の送信元を`at`にしたもの。
+fn host_with_relay_at(
+    at: SocketAddr,
+    tree: JoinTree,
+    uplink: u32,
+    relay: RelayState,
+    ack: u32,
+) -> (SpectateHost, Fake) {
+    let mut host = fat_host(1_024);
     host.push(Record::Seg { seg: 0 }).unwrap();
     for f in 0..100 {
         host.push(Record::Frame {
@@ -1705,12 +1761,12 @@ fn host_with_relay(
     let r = Fake::new(1);
     let mut sink = Sink::default();
     assert_eq!(
-        host.on_datagram(addr(1), &r.join(tree), 0, &mut sink),
+        host.on_datagram(at, &r.join(tree), 0, &mut sink),
         HostEvent::Joined
     );
-    host.note_uplink(addr(1), uplink);
+    host.note_uplink(at, uplink);
     host.poll(1, &mut sink);
-    host.on_datagram(addr(1), &r.ack(ack, relay, 0), 2, &mut sink);
+    host.on_datagram(at, &r.ack_from(&host, at, ack, relay, 0), 2, &mut sink);
     (host, r)
 }
 
@@ -1739,7 +1795,7 @@ fn a_child_ahead_of_the_relay_is_taken_directly() {
         );
         assert_eq!(ev, want, "子 {n}（続き {resume:?}）");
     }
-    // ホストが子 3 へ送った紹介は子 3 との鍵で開け、中継役の中継用の公開鍵と、子の JOIN の nonce・epoch が載っている。
+    // ホストが子3へ送った紹介は子3との鍵で開ける。中継役の中継用の公開鍵と子のJOINのnonce・epochが載っている。
     let c3 = Fake::new(3);
     let got = sink.opened(addr(3), &c3.keys);
     let want_public = RelayKey::new(&rseed(1)).public();
@@ -1773,6 +1829,105 @@ fn a_child_ahead_of_the_relay_is_taken_directly() {
         "子の送り元が候補に無い"
     );
     assert_eq!((admits[1].no, admits[1].start), (2, 0));
+}
+
+fn cand(kind: CandKind, a: &str) -> Candidate {
+    Candidate::new(kind, a.parse().unwrap()).unwrap()
+}
+
+fn cands(list: &[Candidate]) -> Candidates {
+    let mut c = Candidates::EMPTY;
+    for x in list {
+        c.push(*x).unwrap();
+    }
+    c
+}
+
+/// 候補のアドレス（並びは候補の優先の順なので、並べ替えて比べる）。
+fn addrs_of(c: &Candidates) -> Vec<SocketAddr> {
+    sorted(c.as_slice().iter().map(|x| x.addr).collect())
+}
+
+fn sorted(mut v: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    v.sort();
+    v
+}
+
+fn sa(a: &str) -> SocketAddr {
+    a.parse().unwrap()
+}
+
+/// 申告の種類を偽ったloopback・LANの候補（Externalの私設アドレス・Loopback）も公開アドレスの違う相手への紹介と依頼には載らない。
+/// 公開アドレスが同じ相手には今までどおり全部載る。
+#[test]
+fn the_host_passes_loopback_and_lan_candidates_only_between_the_same_public_address_whatever_their_kind()
+ {
+    let relay_at = sa("198.51.100.1:5001");
+    let mut tree = relay_tree(1);
+    tree.candidates = cands(&[
+        cand(CandKind::Loopback, "127.0.0.1:7"),
+        cand(CandKind::External, "192.168.0.9:7000"),
+        cand(CandKind::External, "198.51.100.50:7000"),
+    ]);
+    let child_cands = cands(&[
+        cand(CandKind::External, "192.168.1.1:1900"),
+        cand(CandKind::Loopback, "127.0.0.1:9"),
+        cand(CandKind::Host, "10.0.0.5:4000"),
+        cand(CandKind::External, "203.0.113.9:4000"),
+    ]);
+    for (child_at, want_admit, want_intro) in [
+        (
+            sa("203.0.113.2:5002"),
+            vec![sa("203.0.113.2:5002"), sa("203.0.113.9:4000")],
+            vec![relay_at, sa("198.51.100.50:7000")],
+        ),
+        (
+            sa("198.51.100.1:6000"),
+            vec![
+                sa("198.51.100.1:6000"),
+                sa("192.168.1.1:1900"),
+                sa("127.0.0.1:9"),
+                sa("10.0.0.5:4000"),
+                sa("203.0.113.9:4000"),
+            ],
+            vec![
+                relay_at,
+                sa("127.0.0.1:7"),
+                sa("192.168.0.9:7000"),
+                sa("198.51.100.50:7000"),
+            ],
+        ),
+    ] {
+        let (mut host, r) = host_with_relay_at(relay_at, tree, THICK, ON, 50);
+        let c = Fake::new(2);
+        let mut sink = Sink::default();
+        let join = c.join(JoinTree {
+            candidates: child_cands,
+            ..child_tree(None, 1)
+        });
+        assert_eq!(
+            host.on_datagram(child_at, &join, 3, &mut sink),
+            HostEvent::Introduced
+        );
+        let admit: Vec<_> = sink
+            .opened(relay_at, &r.keys)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::SpectateAdmit(a) => Some(addrs_of(&a.candidates)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(admit, vec![sorted(want_admit)], "子 {child_at} の依頼");
+        let intro: Vec<_> = sink
+            .opened(child_at, &c.keys)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::SpectateIntro(i) => Some(addrs_of(&i.relay)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(intro, vec![sorted(want_intro)], "子 {child_at} への紹介");
+    }
 }
 
 #[test]
@@ -1865,14 +2020,14 @@ fn a_descendant_count_over_four_is_counted_as_four_and_the_ack_still_moves() {
         descendants: 7,
         no_intro: false,
     };
-    let ev = host.on_datagram(addr(1), &r.ack(60, lie, 0), 5, &mut Sink::default());
+    let ev = host.on_datagram(addr(1), &r.ack(&host, 60, lie, 0), 5, &mut Sink::default());
     assert_eq!(ev, HostEvent::Acked { progress: true });
     assert_eq!(host.ack_of(addr(1)), Some(60));
     assert_eq!(host.spectator_count(), 1 + usize::from(RELAY_CHILDREN));
     assert_eq!(host.counts().descendants_clamped, 1);
 }
 
-/// 中継役 1 と、紹介した子 2 が 1 人いるホスト。
+/// 中継役1と、紹介した子2が1人いるホスト。
 fn host_with_intro() -> (SpectateHost, Fake, Fake) {
     let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
     let c = Fake::new(2);
@@ -1894,7 +2049,7 @@ fn a_pending_intro_moves_to_the_relays_descendants_when_its_number_comes_back() 
         descendants: 1,
         no_intro: false,
     };
-    host.on_datagram(addr(1), &r.ack(60, one, 1), 10, &mut Sink::default());
+    host.on_datagram(addr(1), &r.ack(&host, 60, one, 1), 10, &mut Sink::default());
     assert_eq!((host.pending_intros(), host.spectator_count()), (0, 2));
 }
 
@@ -1914,17 +2069,86 @@ fn a_join_resend_gets_the_intro_again_without_a_key_agreement() {
     );
 }
 
+/// 紹介した子のJOINを送り元を変えて送り直されても、ほかの送り元へは`JOIN_RESEND_MS`に1回しか紹介を返さない。
+/// 紹介した子の送り元へは`JOIN_RESEND_MS / 2`に1回返す。
+#[test]
+fn an_intro_is_resent_to_other_sources_at_most_once_per_join_resend_ms() {
+    let (mut host, _, c) = host_with_intro();
+    let before = host.counts().key_agreements;
+    let join = c.join(child_tree(None, 0));
+    let intros = |sink: &Sink, to: SocketAddr| {
+        sink.opened(to, &c.keys)
+            .iter()
+            .filter(|m| matches!(m, Message::SpectateIntro(_)))
+            .count()
+    };
+    let mut sink = Sink::default();
+    let mut answered = 0;
+    for n in 100..1_100u16 {
+        let ev = host.on_datagram(addr(n), &join, 20, &mut sink);
+        answered += intros(&sink, addr(n));
+        assert!(matches!(ev, HostEvent::Introduced | HostEvent::Throttled));
+    }
+    assert_eq!(answered, 1, "ほかの送り元へ返した紹介");
+    let ev = host.on_datagram(addr(1_100), &join, 20 + JOIN_RESEND_MS, &mut sink);
+    assert_eq!(ev, HostEvent::Introduced);
+    assert_eq!(intros(&sink, addr(1_100)), 1);
+    for (t, n) in [(21, 1), (22, 0), (23, 0)] {
+        let mut own = Sink::default();
+        host.on_datagram(addr(2), &join, t, &mut own);
+        assert_eq!(intros(&own, addr(2)), n, "紹介した子の送り元 t={t}");
+    }
+    assert_eq!(host.counts().key_agreements, before);
+    assert_eq!(host.counts().intro_resends, 3);
+}
+
+/// 紹介した子の送り元は最初のJOINの送り元で、まだ検証していない。そこから同じJOINを1,000回送り直されても紹介は1回だけ返す。
+#[test]
+fn a_join_replayed_from_the_child_address_gets_one_intro_per_half_join_resend_ms() {
+    let (mut host, _, c) = host_with_intro();
+    let join = c.join(child_tree(None, 0));
+    let mut sink = Sink::default();
+    for _ in 0..1_000 {
+        let ev = host.on_datagram(addr(2), &join, 20, &mut sink);
+        assert!(matches!(ev, HostEvent::Introduced | HostEvent::Throttled));
+    }
+    let intros = sink
+        .opened(addr(2), &c.keys)
+        .iter()
+        .filter(|m| matches!(m, Message::SpectateIntro(_)))
+        .count();
+    assert_eq!(intros, 1);
+    assert_eq!(host.counts().intro_resends, 1);
+    assert_eq!(host.counts().join_throttled, 999);
+}
+
+/// 正直な子が`JOIN_RESEND_MS`ごとに送り直すJOINには毎回紹介を返す（紹介が続けて落ちても入れる）。
+#[test]
+fn an_honest_child_resending_every_join_resend_ms_gets_the_intro_each_time() {
+    let (mut host, _, c) = host_with_intro();
+    let join = c.join(child_tree(None, 0));
+    for k in 1..=8u32 {
+        let t = 3 + k * JOIN_RESEND_MS;
+        assert_eq!(
+            host.on_datagram(addr(2), &join, t, &mut Sink::default()),
+            HostEvent::Introduced,
+            "t={t}"
+        );
+    }
+    assert_eq!(host.counts().intro_resends, 8);
+}
+
 #[test]
 fn an_unanswered_admit_is_resent_and_the_intro_stops_counting_after_admit_ttl_ms() {
     let (mut host, r, _) = host_with_intro();
     let mut sink = Sink::default();
     let mut t = 3;
-    // 中継役は流れには ACK を返し続けるが、依頼の番号は返さない。
+    // 中継役はストリームにはACKを返し続けるが依頼の番号は返さない。
     while t < 3 + ADMIT_TTL_MS + 2_000 {
         t += 50;
         host.poll(t, &mut sink);
         if t % 500 == 3 {
-            host.on_datagram(addr(1), &r.ack(60, ON, 0), t, &mut Sink::default());
+            host.on_datagram(addr(1), &r.ack(&host, 60, ON, 0), t, &mut Sink::default());
         }
         if t == 3 + ADMIT_TTL_MS - 50 {
             assert_eq!(host.pending_intros(), 1, "寿命の前に消えた");
@@ -1939,7 +2163,7 @@ fn an_unanswered_admit_is_resent_and_the_intro_stops_counting_after_admit_ttl_ms
             .count()
     };
     assert!(admits(&sink) >= 2, "依頼を送り直していない");
-    // 数えなくなった後も、番号を飛ばさないよう依頼は送り直す。
+    // 数えなくなった後も番号を飛ばさないよう依頼は送り直す。
     let mut later = Sink::default();
     host.poll(t + 2_000, &mut later);
     assert_eq!(admits(&later), 1);
@@ -1964,19 +2188,19 @@ fn a_child_back_after_its_relay_already_dropped_it_is_not_subtracted_again() {
         descendants: 1,
         no_intro: false,
     };
-    host.on_datagram(addr(1), &r.ack(60, one, 1), 10, &mut Sink::default());
-    // 中継役が子を外した ACK が、子の戻りより先に着き、子は前払いが切れた後に戻る。
-    host.on_datagram(addr(1), &r.ack(60, ON, 1), 20, &mut Sink::default());
+    host.on_datagram(addr(1), &r.ack(&host, 60, one, 1), 10, &mut Sink::default());
+    // 中継役が子を外したACKが子の戻りより先に着く。子は前払いが切れた後に戻る。
+    host.on_datagram(addr(1), &r.ack(&host, 60, ON, 1), 20, &mut Sink::default());
     let back = c.join(child_tree(Some(30), 2));
     assert_eq!(
         host.on_datagram(addr(2), &back, 30 + PREPAID_MS, &mut Sink::default()),
         HostEvent::Joined
     );
     assert_eq!(host.spectator_count(), 2);
-    // 中継役に次の子が入ると、子孫の数がそのまま人数に乗る。
+    // 中継役に次の子が入ると子孫の数がそのまま人数に乗る。
     host.on_datagram(
         addr(1),
-        &r.ack(60, one, 1),
+        &r.ack(&host, 60, one, 1),
         40 + PREPAID_MS,
         &mut Sink::default(),
     );
@@ -1998,10 +2222,10 @@ fn a_child_back_after_its_relay_reported_dropping_it_is_not_subtracted_twice() {
         let ev = host.on_datagram(addr(n), &Fake::new(n).join(child_tree(None, 0)), t, &mut s);
         assert_eq!(ev, HostEvent::Introduced);
     }
-    host.on_datagram(addr(1), &r.ack(60, relaying(2), 2), 10, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(2), 2), 10, &mut s);
     assert_eq!(host.spectator_count(), 3);
-    // 中継役が子 3 を外した ACK が、子 3 の戻りより先に着く（子 2 は中継役の下に残る）。
-    host.on_datagram(addr(1), &r.ack(60, relaying(1), 2), 20, &mut s);
+    // 中継役が子3を外したACKが子3の戻りより先に着く（子2は中継役の下に残る）。
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(1), 2), 20, &mut s);
     let back = Fake::new(3).join(child_tree(Some(30), 2));
     assert_eq!(
         host.on_datagram(addr(3), &back, 30, &mut s),
@@ -2014,11 +2238,11 @@ fn a_child_back_after_its_relay_reported_dropping_it_is_not_subtracted_twice() {
 fn a_reordered_relay_ack_leaves_no_prepaid_seat() {
     let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
     let mut s = Sink::default();
-    host.on_datagram(addr(1), &r.ack(60, relaying(2), 0), 10, &mut s);
-    // 順の入れ替わった古い ACK（子孫 1）の後に、新しい ACK（子孫 2）が着く。
-    host.on_datagram(addr(1), &r.ack(60, relaying(1), 0), 11, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(2), 0), 10, &mut s);
+    // 順が入れ替わった古いACK（子孫1）の後に新しいACK（子孫2）が着く。
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(1), 0), 11, &mut s);
     assert_eq!(host.reserved(11), 1);
-    host.on_datagram(addr(1), &r.ack(60, relaying(2), 0), 12, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(2), 0), 12, &mut s);
     assert_eq!(host.reserved(12), 0);
     assert_eq!(host.spectator_count(), 3);
 }
@@ -2027,16 +2251,16 @@ fn a_reordered_relay_ack_leaves_no_prepaid_seat() {
 fn a_leaving_relays_prepaid_seats_become_its_reservation() {
     let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
     let mut s = Sink::default();
-    host.on_datagram(addr(1), &r.ack(60, relaying(2), 0), 10, &mut s);
-    // 中継役が子 2 人を REHOME した ACK の後、中継役の BYE が子の JOIN より先に着く。
-    host.on_datagram(addr(1), &r.ack(60, ON, 0), 11, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(2), 0), 10, &mut s);
+    // 中継役が子2人をREHOMEしたACKの後に中継役のBYEが子のJOINより先に着く。
+    host.on_datagram(addr(1), &r.ack(&host, 60, ON, 0), 11, &mut s);
     let bye = r.sealed(&Message::Bye(ByeReason::Cancelled));
     assert_eq!(host.on_datagram(addr(1), &bye, 12, &mut s), HostEvent::Left);
     assert_eq!(host.reserved(13), 2);
     assert!(host.reserved(12 + PREPAID_MS + 1) == 2 && host.reserved(12 + RESERVE_MS) == 0);
 }
 
-/// 中継役（子 4 人）と直接の 4 人で 9 人。中継役の子 5 が戻っても中継役はまだ子 5 の枠を持っている。
+/// 中継役（子4人）と直接の4人で9人。中継役の子5が戻っても中継役はまだ子5の枠を持っている。
 fn host_with_a_relay_holding_a_returned_child() -> (SpectateHost, Fake, u32) {
     let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
     let mut s = Sink::default();
@@ -2046,7 +2270,7 @@ fn host_with_a_relay_holding_a_returned_child() -> (SpectateHost, Fake, u32) {
         assert_eq!(ev, HostEvent::Introduced, "子 {n}");
         t += 150;
     }
-    host.on_datagram(addr(1), &r.ack(60, relaying(4), 4), t, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(4), 4), t, &mut s);
     let direct = JoinTree {
         direct_only: true,
         ..JoinTree::NONE
@@ -2062,7 +2286,7 @@ fn host_with_a_relay_holding_a_returned_child() -> (SpectateHost, Fake, u32) {
         host.on_datagram(addr(5), &back, t, &mut s),
         HostEvent::Joined
     );
-    host.on_datagram(addr(1), &r.ack(60, relaying(4), 4), t + 1, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(4), 4), t + 1, &mut s);
     assert_eq!(host.spectator_count(), 9);
     (host, r, t + 2)
 }
@@ -2088,7 +2312,7 @@ fn a_relay_still_holding_a_returned_child_gets_no_new_child() {
     assert_eq!(host.spectator_count(), MAX_SPECTATORS);
 }
 
-/// 中継役が受け取れない依頼（子が 4 人いる）は、番号を受け取らない（ACK に載せない）。
+/// 中継役が受け取れない依頼（子が4人いる）は番号を受け取らない（ACKに載せない）。
 #[test]
 fn a_relay_does_not_ack_an_admit_its_distributor_has_no_room_for() {
     let mut w = watcher(1);
@@ -2100,6 +2324,7 @@ fn a_relay_does_not_ack_an_admit_its_distributor_has_no_room_for() {
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -2141,50 +2366,11 @@ fn a_relay_does_not_ack_an_admit_its_distributor_has_no_room_for() {
     assert_eq!(relay.relay_state().descendants, 4);
 }
 
-/// 紹介の表（16 枠）が、中継役から BYE で抜けた子の置き場所で埋まり、いちばん古い子の置き場所が空けられた。中継役が落ちて
-/// その子が戻ると、表に名前が無くても満杯で断られない。
+/// 紹介の表（16枠）が中継役からBYEで抜けた子の置き場所で埋まり、いちばん古い子の置き場所が空けられた。
+/// その後に中継役が落ちてその子が戻ると、表に名前が無くても満杯で断られない。
 #[test]
 fn a_child_evicted_from_the_placement_table_still_gets_back_in_when_full() {
-    let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
-    let mut s = Sink::default();
-    let mut t = 3;
-    let mut admitted: u16 = 0;
-    for n in 2..=5u16 {
-        host.on_datagram(
-            addr(1),
-            &r.ack(60, relaying(admitted as u8), admitted),
-            t,
-            &mut s,
-        );
-        let ev = host.on_datagram(addr(n), &Fake::new(n).join(child_tree(None, 0)), t, &mut s);
-        assert_eq!(ev, HostEvent::Introduced);
-        admitted += 1;
-        t += 150;
-    }
-    host.on_datagram(addr(1), &r.ack(60, relaying(4), admitted), t, &mut s);
-    for n in 20..33u16 {
-        t += 150;
-        host.on_datagram(addr(1), &r.ack(60, relaying(3), admitted), t, &mut s);
-        let ev = host.on_datagram(addr(n), &Fake::new(n).join(child_tree(None, 0)), t, &mut s);
-        assert_eq!(ev, HostEvent::Introduced, "入れ替わり {n}");
-        admitted += 1;
-        t += 20;
-        host.on_datagram(addr(1), &r.ack(60, relaying(4), admitted), t, &mut s);
-    }
-    // 抜けた子の前払いが切れてから、直接の 5 人で満杯にする。
-    t += PREPAID_MS;
-    let direct = JoinTree {
-        direct_only: true,
-        ..JoinTree::NONE
-    };
-    for n in 40..45u16 {
-        t += 150;
-        let ev = host.on_datagram(addr(n), &Fake::new(n).join(direct), t, &mut s);
-        assert_eq!(ev, HostEvent::Joined);
-    }
-    assert_eq!(host.spectator_count(), MAX_SPECTATORS);
-    // 中継役が落ち、子は `REJOIN_MS` の後に戻る。
-    t += REJOIN_MS;
+    let (mut host, mut s, t) = full_room_after_a_relay_with_an_evicted_child_went_quiet();
     for (n, at) in [(2, t), (32, t + 1)] {
         let back = Fake::new(n).join(child_tree(Some(30), 2));
         let ev = host.on_datagram(addr(n), &back, at, &mut s);
@@ -2199,6 +2385,75 @@ fn a_child_evicted_from_the_placement_table_still_gets_back_in_when_full() {
         &mut s,
     );
     assert_eq!(ev, HostEvent::Refused);
+}
+
+/// 戻りの枠は、ホストがその中継役へ回した子にだけ渡す。
+/// 戻ってきた子と同じ木のフィールド（続きの番号・epoch・子なし）を名乗っただけのJOINは、満杯なら断られる。
+/// 本物の子の枠は残る。
+#[test]
+fn a_join_that_only_claims_to_be_a_returning_child_gets_no_reserved_seat() {
+    let (mut host, mut s, t) = full_room_after_a_relay_with_an_evicted_child_went_quiet();
+    let mut at = t;
+    for n in 60..64u16 {
+        let claim = Fake::new(n).join(child_tree(Some(30), 2));
+        let ev = host.on_datagram(addr(n), &claim, at, &mut s);
+        assert_eq!(ev, HostEvent::Refused, "名乗っただけの {n}");
+        at += 1_100;
+    }
+    assert_eq!(host.counts().reserved_used, 0);
+    for (n, at) in [(2, at), (32, at + 1)] {
+        let back = Fake::new(n).join(child_tree(Some(30), 2));
+        let ev = host.on_datagram(addr(n), &back, at, &mut s);
+        assert_eq!(ev, HostEvent::Joined, "子 {n}");
+    }
+    assert_eq!(host.counts().reserved_used, 2);
+}
+
+/// 中継役1へ子2〜5と20〜32を回した（子2は紹介の表から空けられた）。
+/// 直接の5人で満杯にした後に中継役が黙って`REJOIN_MS`経った状態にする。
+/// 戻り値は（ホスト, 送信を溜めるバッファ, いまの時刻）。
+fn full_room_after_a_relay_with_an_evicted_child_went_quiet() -> (SpectateHost, Sink, u32) {
+    let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 50);
+    let mut s = Sink::default();
+    let mut t = 3;
+    let mut admitted: u16 = 0;
+    for n in 2..=5u16 {
+        host.on_datagram(
+            addr(1),
+            &r.ack(&host, 60, relaying(admitted as u8), admitted),
+            t,
+            &mut s,
+        );
+        let ev = host.on_datagram(addr(n), &Fake::new(n).join(child_tree(None, 0)), t, &mut s);
+        assert_eq!(ev, HostEvent::Introduced);
+        admitted += 1;
+        t += 150;
+    }
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(4), admitted), t, &mut s);
+    for n in 20..33u16 {
+        t += 150;
+        host.on_datagram(addr(1), &r.ack(&host, 60, relaying(3), admitted), t, &mut s);
+        let ev = host.on_datagram(addr(n), &Fake::new(n).join(child_tree(None, 0)), t, &mut s);
+        assert_eq!(ev, HostEvent::Introduced, "入れ替わり {n}");
+        admitted += 1;
+        t += 20;
+        host.on_datagram(addr(1), &r.ack(&host, 60, relaying(4), admitted), t, &mut s);
+    }
+    // 抜けた子の前払いが切れてから直接の5人で満杯にする。
+    t += PREPAID_MS;
+    let direct = JoinTree {
+        direct_only: true,
+        ..JoinTree::NONE
+    };
+    for n in 40..45u16 {
+        t += 150;
+        let ev = host.on_datagram(addr(n), &Fake::new(n).join(direct), t, &mut s);
+        assert_eq!(ev, HostEvent::Joined);
+    }
+    assert_eq!(host.spectator_count(), MAX_SPECTATORS);
+    // 中継役が落ち、子は`REJOIN_MS`の後に戻る。
+    t += REJOIN_MS;
+    (host, s, t)
 }
 
 #[test]
@@ -2226,16 +2481,16 @@ fn a_known_spectator_with_a_newer_epoch_is_served_again_from_its_resume_point() 
     );
     assert_eq!(host.ack_of(addr(1)), Some(30));
     assert_eq!(host.tree_of(addr(1)).map(|v| v.join.epoch), Some(2));
-    // 遅れて着いた古い epoch の JOIN は、欄を読み直さない。
+    // 遅れて着いた古いepochのJOINはフィールドを読み直さない。
     host.on_datagram(addr(1), &again(0), 7, &mut sink);
     assert_eq!(host.tree_of(addr(1)).map(|v| v.join.epoch), Some(2));
 }
 
-/// 中継役 1・2 と、直接の観戦者 3（中継に向く）がいるホスト。ホストが子 4 へ紹介を 1 回送り、中継役 1・2 に印を付けた。
+/// 中継役1・2と、直接の観戦者3（中継に向く）がいるホスト。ホストが子4へ紹介を1回送り、中継役1・2に印を付けた。
 fn host_with_two_relays_and_a_spare() -> (SpectateHost, Fake, Fake, u32) {
     let (mut host, r1) = host_with_relay(relay_tree(1), THICK, ON, 50);
     let mut s = Sink::default();
-    // 中継役 2 は「直接だけ」で入る（中継役 1 の下へ回さない）。
+    // 中継役2は「直接だけ」で入る（中継役1の下へ回さない）。
     let r2 = Fake::new(2);
     let direct2 = JoinTree {
         direct_only: true,
@@ -2247,7 +2502,7 @@ fn host_with_two_relays_and_a_spare() -> (SpectateHost, Fake, Fake, u32) {
     );
     host.note_uplink(addr(2), THICK);
     host.poll(4, &mut s);
-    host.on_datagram(addr(2), &r2.ack(50, ON, 0), 5, &mut s);
+    host.on_datagram(addr(2), &r2.ack(&host, 50, ON, 0), 5, &mut s);
     let spare = JoinTree {
         direct_only: true,
         ..relay_tree(3)
@@ -2259,7 +2514,7 @@ fn host_with_two_relays_and_a_spare() -> (SpectateHost, Fake, Fake, u32) {
     );
     host.note_uplink(addr(3), THICK);
     host.poll(7, &mut s);
-    host.on_datagram(addr(3), &r3.ack(50, ON, 0), 8, &mut s);
+    host.on_datagram(addr(3), &r3.ack(&host, 50, ON, 0), 8, &mut s);
     let ev = host.on_datagram(addr(4), &Fake::new(4).join(child_tree(None, 0)), 9, &mut s);
     assert_eq!(ev, HostEvent::Introduced);
     assert!(host.is_relay_of(addr(1)) && host.is_relay_of(addr(2)));
@@ -2271,7 +2526,12 @@ fn host_with_two_relays_and_a_spare() -> (SpectateHost, Fake, Fake, u32) {
 fn a_relay_that_briefly_says_no_intro_still_holds_one_of_the_two_relay_places() {
     let (mut host, r1, _, t) = host_with_two_relays_and_a_spare();
     let mut s = Sink::default();
-    host.on_datagram(addr(1), &r1.ack(50, RelayState::NO_INTRO, 0), t, &mut s);
+    host.on_datagram(
+        addr(1),
+        &r1.ack(&host, 50, RelayState::NO_INTRO, 0),
+        t,
+        &mut s,
+    );
     host.on_datagram(
         addr(5),
         &Fake::new(5).join(child_tree(None, 0)),
@@ -2286,7 +2546,7 @@ fn a_child_back_twice_frees_its_newest_place() {
     let (mut host, _, r2, t) = host_with_two_relays_and_a_spare();
     let mut s = Sink::default();
     let c = Fake::new(4);
-    // 子 4 は中継役 1 へ回った（同じ太さなら枠の番号の小さい方）。依頼を受け取る前に戻り、中継役 2 へ回る。
+    // 子4は中継役1へ回った（同じ太さなら枠の番号の小さい方）。その後、依頼を受け取る前に戻って中継役2へ回る。
     let ev = host.on_datagram(addr(4), &c.join(child_tree(None, 2)), t, &mut s);
     assert_eq!(ev, HostEvent::Introduced);
     let to_r2 = s
@@ -2294,9 +2554,9 @@ fn a_child_back_twice_frees_its_newest_place() {
         .into_iter()
         .any(|m| matches!(m, Message::SpectateAdmit(a) if a.nonce == nonce_of(4)));
     assert!(to_r2, "中継役 2 へ回っていない");
-    host.on_datagram(addr(2), &r2.ack(50, relaying(1), 1), t + 1, &mut s);
+    host.on_datagram(addr(2), &r2.ack(&host, 50, relaying(1), 1), t + 1, &mut s);
     let before = host.spectator_count();
-    // もう一度戻る（直接だけ）: 新しい置き場所の中継役の子孫から引く。
+    // もう一度「直接だけ」で戻る。新しい置き場所の中継役の子孫数から差し引く。
     let back = JoinTree {
         direct_only: true,
         ..child_tree(Some(30), 4)
@@ -2314,7 +2574,7 @@ fn a_child_back_twice_frees_its_newest_place() {
 
 #[test]
 fn a_fifth_removed_relays_reservation_is_added_not_dropped() {
-    let mut host = SpectateHost::with_capacity(host_cfg(), 1_024);
+    let mut host = fat_host(1_024);
     host.push(Record::Seg { seg: 0 }).unwrap();
     let mut s = Sink::default();
     let fakes: Vec<Fake> = (1..=5).map(Fake::new).collect();
@@ -2326,7 +2586,7 @@ fn a_fifth_removed_relays_reservation_is_added_not_dropped() {
             HostEvent::Joined
         );
         host.poll(t + 1, &mut s);
-        host.on_datagram(addr(n), &f.ack(1, relaying(1), 0), t + 2, &mut s);
+        host.on_datagram(addr(n), &f.ack(&host, 1, relaying(1), 0), t + 2, &mut s);
     }
     assert_eq!(host.spectator_count(), 10);
     for (k, f) in fakes.iter().enumerate() {
@@ -2337,10 +2597,11 @@ fn a_fifth_removed_relays_reservation_is_added_not_dropped() {
     assert_eq!(host.reserved(1_200), 5, "5 人目の取り置きが消えた");
 }
 
-/// 記録 0〜100 を積んだホストに、観戦者 `ns`（番号・JOIN の木の欄・上り・ACK の中継の状態）が直接入って全部を受け取り、1 回
-/// `poll` した後に `Seg(1)` を積んで（マッチの切れ目）全員がそれも受け取った。返すのは次の時刻。
+/// 記録0〜100を積んだホストに、観戦者`ns`（番号・JOINの木のフィールド・上り・ACKの中継の状態）が直接入って全部を受け取った。
+/// 1回`poll`した後に`Seg(1)`を積み（マッチの切れ目）、全員がそれも受け取った。
+/// 返すのは次の時刻。
 fn host_at_cut(ns: &[(u16, JoinTree, u32, RelayState)]) -> (SpectateHost, Vec<Fake>, Sink, u32) {
-    let mut host = SpectateHost::with_capacity(host_cfg(), 1_024);
+    let mut host = fat_host(1_024);
     host.push(Record::Seg { seg: 0 }).unwrap();
     for f in 0..100 {
         host.push(Record::Frame {
@@ -2361,17 +2622,17 @@ fn host_at_cut(ns: &[(u16, JoinTree, u32, RelayState)]) -> (SpectateHost, Vec<Fa
     }
     for (f, &(n, _, up, st)) in fakes.iter().zip(ns) {
         host.note_uplink(addr(n), up);
-        host.on_datagram(addr(n), &f.ack(host.tail(), st, 0), 1, &mut sink);
+        host.on_datagram(addr(n), &f.ack(&host, host.tail(), st, 0), 1, &mut sink);
     }
     host.poll(2, &mut sink);
     host.push(Record::Seg { seg: 1 }).unwrap();
     for (f, &(n, _, _, st)) in fakes.iter().zip(ns) {
-        host.on_datagram(addr(n), &f.ack(host.tail(), st, 0), 3, &mut sink);
+        host.on_datagram(addr(n), &f.ack(&host, host.tail(), st, 0), 3, &mut sink);
     }
     (host, fakes, sink, 4)
 }
 
-/// 宛先 `f` へ送った紹介の数。
+/// 宛先`f`へ送った紹介の数。
 fn intros_to(sink: &Sink, f: &Fake) -> usize {
     sink.opened(addr(f.n), &f.keys)
         .iter()
@@ -2379,7 +2640,7 @@ fn intros_to(sink: &Sink, f: &Fake) -> usize {
         .count()
 }
 
-/// 中継役 `r` へ送った受け入れの依頼の子の nonce（送り直しも並ぶ）。
+/// 中継役`r`へ送った受け入れの依頼の子のnonce（送り直しも並ぶ）。
 fn admits_to(sink: &Sink, r: &Fake) -> Vec<u64> {
     sink.opened(addr(r.n), &r.keys)
         .into_iter()
@@ -2404,9 +2665,9 @@ fn at_the_break_relays_spares_parents_and_direct_only_leaves_are_not_moved() {
     let (mut host, f, mut sink, mut t) = host_at_cut(&[
         (1, relay_tree(1), 2 * THICK, ON),
         (2, relay_tree(2), 2 * THICK, ON),
-        // 中継役に向く予備（中継役はもう 2 人）。
+        // 中継役に向く予備（中継役はもう2人）。
         (3, relay_tree(3), THICK, ON),
-        // JOIN の後に子ができた（ACK の子孫だけ）。
+        // JOINの後に子ができた（ACKの子孫だけ）。
         (4, JoinTree::NONE, 0, relaying(1)),
         (5, direct, 0, off),
         (7, kids, 0, off),
@@ -2417,10 +2678,10 @@ fn at_the_break_relays_spares_parents_and_direct_only_leaves_are_not_moved() {
     let counts = |s: &Sink| f.iter().map(|x| intros_to(s, x)).collect::<Vec<_>>();
     assert_eq!(counts(&sink), vec![0, 0, 0, 0, 0, 0, 1]);
     assert_eq!(admits_to(&sink, &f[0]), vec![nonce_of(6)]);
-    // 中継役 1 が受け取ると葉 6 の枠を空ける。残りの 6 人（直接の 2 人を越える）は動かさない。
+    // 中継役1が受け取ると葉6の枠を空ける。残りの6人（直接の2人を越える）は動かさない。
     host.on_datagram(
         addr(1),
-        &f[0].ack(host.tail(), relaying(1), 1),
+        &f[0].ack(&host, host.tail(), relaying(1), 1),
         t,
         &mut sink,
     );
@@ -2432,7 +2693,12 @@ fn at_the_break_relays_spares_parents_and_direct_only_leaves_are_not_moved() {
         if t % 250 == 0 {
             for (x, st) in f.iter().zip(states) {
                 let admit = if x.n == 1 { 1 } else { 0 };
-                host.on_datagram(addr(x.n), &x.ack(host.tail(), st, admit), t, &mut sink);
+                host.on_datagram(
+                    addr(x.n),
+                    &x.ack(&host, host.tail(), st, admit),
+                    t,
+                    &mut sink,
+                );
             }
         }
         host.poll(t, &mut sink);
@@ -2451,7 +2717,7 @@ fn at_the_break_a_leaf_measuring_its_uplink_is_not_moved() {
     let off = RelayState::NO_INTRO;
     let (mut host, f, mut sink, t) = host_at_cut(&[
         (1, relay_tree(1), THICK, ON),
-        // 上りの分からない、中継できる観戦者（測りの番を持つ）。
+        // 上りの分からない中継できる観戦者（測定の順番を持つ）。
         (2, relay_tree(2), 0, ON),
         (3, JoinTree::NONE, 0, off),
     ]);
@@ -2462,7 +2728,7 @@ fn at_the_break_a_leaf_measuring_its_uplink_is_not_moved() {
     assert!(host.is_relay_of(addr(1)));
 }
 
-/// ホストが葉 2 へ送った紹介は届かず、中継役 1 も依頼を受け取らない（葉 2 は元の枠に残る）。
+/// ホストが葉2へ送った紹介は届かず、中継役1も依頼を受け取らない（葉2は元の枠に残る）。
 #[test]
 fn a_leaf_whose_swap_intro_is_still_in_the_table_is_not_introduced_again() {
     let off = RelayState::NO_INTRO;
@@ -2477,7 +2743,7 @@ fn a_leaf_whose_swap_intro_is_still_in_the_table_is_not_introduced_again() {
         t += 1;
         if t % 250 == 0 {
             for (x, st) in f.iter().zip(states) {
-                host.on_datagram(addr(x.n), &x.ack(host.tail(), st, 0), t, &mut sink);
+                host.on_datagram(addr(x.n), &x.ack(&host, host.tail(), st, 0), t, &mut sink);
             }
         }
         host.poll(t, &mut sink);
@@ -2486,13 +2752,13 @@ fn a_leaf_whose_swap_intro_is_still_in_the_table_is_not_introduced_again() {
             seen.push(now);
         }
     }
-    // ホストが、中継役 1 の依頼の受け取りを `ADMIT_TTL_MS` 待ってから、次の葉 3 へ。
+    // ホストが中継役1の依頼の受け取りを`ADMIT_TTL_MS`待ってから、次の葉3へ移る。
     assert_eq!(seen, vec![(0, 0), (1, 0), (1, 1)]);
     assert_eq!(host.counts().swaps, 2);
     assert!(host.ack_of(addr(2)).is_some(), "葉 2 の枠を空けた");
 }
 
-/// 中継役 1（太い）・2 がいて、子 3 は中継役 1 の下から戻った。そのとき中継役 2 は「紹介しないで」だったので、子 3 は直接に残る。
+/// 中継役1（太い）・2がいて、子3は中継役1の下から戻った。そのとき中継役2は「紹介しないで」だったので、子3は直接に残る。
 #[test]
 fn at_the_break_a_child_back_from_a_relay_moves_under_another_relay() {
     let (mut host, r1) = host_with_relay(relay_tree(1), 2 * THICK, ON, 101);
@@ -2508,7 +2774,7 @@ fn at_the_break_a_child_back_from_a_relay_moves_under_another_relay() {
     );
     host.note_uplink(addr(2), THICK);
     host.poll(4, &mut s);
-    host.on_datagram(addr(2), &r2.ack(101, ON, 0), 5, &mut s);
+    host.on_datagram(addr(2), &r2.ack(&host, 101, ON, 0), 5, &mut s);
     let c = Fake::new(3);
     assert_eq!(
         host.on_datagram(addr(3), &c.join(child_tree(None, 0)), 6, &mut s),
@@ -2519,8 +2785,13 @@ fn at_the_break_a_child_back_from_a_relay_moves_under_another_relay() {
         vec![nonce_of(3)],
         "中継役 1 へ回っていない"
     );
-    host.on_datagram(addr(1), &r1.ack(101, relaying(1), 1), 7, &mut s);
-    host.on_datagram(addr(2), &r2.ack(101, RelayState::NO_INTRO, 0), 8, &mut s);
+    host.on_datagram(addr(1), &r1.ack(&host, 101, relaying(1), 1), 7, &mut s);
+    host.on_datagram(
+        addr(2),
+        &r2.ack(&host, 101, RelayState::NO_INTRO, 0),
+        8,
+        &mut s,
+    );
     assert_eq!(
         host.on_datagram(addr(3), &c.join(child_tree(Some(101), 2)), 9, &mut s),
         HostEvent::Joined,
@@ -2528,13 +2799,18 @@ fn at_the_break_a_child_back_from_a_relay_moves_under_another_relay() {
     );
     host.push(Record::Seg { seg: 1 }).unwrap();
     let tail = host.tail();
-    host.on_datagram(addr(1), &r1.ack(tail, ON, 1), 10, &mut s);
-    host.on_datagram(addr(2), &r2.ack(tail, ON, 0), 10, &mut s);
-    host.on_datagram(addr(3), &c.ack(tail, RelayState::NO_INTRO, 0), 10, &mut s);
+    host.on_datagram(addr(1), &r1.ack(&host, tail, ON, 1), 10, &mut s);
+    host.on_datagram(addr(2), &r2.ack(&host, tail, ON, 0), 10, &mut s);
+    host.on_datagram(
+        addr(3),
+        &c.ack(&host, tail, RelayState::NO_INTRO, 0),
+        10,
+        &mut s,
+    );
     let mut cut = Sink::default();
     host.poll(11, &mut cut);
     assert_eq!(intros_to(&cut, &c), 1, "切れ目で移していない");
-    // 太くて番号の小さい中継役 1 ではなく、元の中継役でない 2 へ。
+    // 太くて番号の小さい中継役1ではなく元の中継役でない2へ回る。
     assert_eq!(admits_to(&cut, &r1), Vec::<u64>::new());
     assert_eq!(admits_to(&cut, &r2), vec![nonce_of(3)]);
 }
@@ -2546,16 +2822,21 @@ fn dropping_a_relays_twin_slot_keeps_its_childrens_reservation() {
     let ev = host.on_datagram(addr(2), &Fake::new(2).join(child_tree(None, 0)), 3, &mut s);
     assert_eq!(ev, HostEvent::Introduced);
     assert!(host.is_relay_of(addr(1)));
-    host.on_datagram(addr(1), &r.ack(60, relaying(1), 1), 10, &mut s);
+    host.on_datagram(addr(1), &r.ack(&host, 60, relaying(1), 1), 10, &mut s);
     assert_eq!((host.spectator_count(), host.reserved(10)), (2, 0));
-    // 中継役 1 の NAT が付け替わり、黙った後に別の送り元から入り直して、そちらから ACK を返す。
+    // 中継役1のNATが付け替わり、黙った後に別の送り元から入り直して、そちらからACKを返す。
     let moved = addr(30);
     let later = 10 + REJOIN_MS + 100;
     assert_eq!(
         host.on_datagram(moved, &r.join(relay_tree(1)), later, &mut s),
         HostEvent::Joined
     );
-    host.on_datagram(moved, &r.ack(60, relaying(1), 1), later + 1, &mut s);
+    host.on_datagram(
+        moved,
+        &r.ack_from(&host, moved, 60, relaying(1), 1),
+        later + 1,
+        &mut s,
+    );
     assert_eq!(host.ack_of(addr(1)), None, "古い経路の枠が残った");
     assert_eq!(host.counts().twins_dropped, 1);
     assert_eq!(
@@ -2565,7 +2846,7 @@ fn dropping_a_relays_twin_slot_keeps_its_childrens_reservation() {
     );
 }
 
-/// ホストから中継役へは `RELAY_HEARTBEAT_MS`、中継役でない直接の葉へは `HEARTBEAT_MS` ごとに合図する。
+/// ホストは中継役へ`RELAY_HEARTBEAT_MS`ごと、中継役でない直接の葉へ`HEARTBEAT_MS`ごとに生存確認（ping）を送る。
 #[test]
 fn the_host_heartbeats_a_relay_every_500_ms_and_a_plain_leaf_every_1000_ms() {
     let (mut host, r) = host_with_relay(relay_tree(1), THICK, ON, 101);
@@ -2579,16 +2860,16 @@ fn the_host_heartbeats_a_relay_every_500_ms_and_a_plain_leaf_every_1000_ms() {
         host.on_datagram(addr(2), &leaf.join(direct), 3, &mut s),
         HostEvent::Joined
     );
-    // 3 人目の紹介で中継役 1 に印が付く。
+    // 3人目の紹介で中継役1に印が付く。
     let ev = host.on_datagram(addr(3), &Fake::new(3).join(child_tree(None, 0)), 4, &mut s);
     assert_eq!(ev, HostEvent::Introduced);
     let mut sink = Sink::default();
     for t in 5..=5_004 {
         if t % 100 == 0 {
-            host.on_datagram(addr(1), &r.ack(101, ON, 0), t, &mut Sink::default());
+            host.on_datagram(addr(1), &r.ack(&host, 101, ON, 0), t, &mut Sink::default());
             host.on_datagram(
                 addr(2),
-                &leaf.ack(101, RelayState::NO_INTRO, 0),
+                &leaf.ack(&host, 101, RelayState::NO_INTRO, 0),
                 t,
                 &mut Sink::default(),
             );
@@ -2614,7 +2895,7 @@ fn the_host_heartbeats_a_relay_every_500_ms_and_a_plain_leaf_every_1000_ms() {
     );
 }
 
-/// 中継役の配る側から子へも `RELAY_HEARTBEAT_MS` ごとに合図する。
+/// 中継役の配信側は子へも`RELAY_HEARTBEAT_MS`ごとに生存確認（ping）を送る。
 #[test]
 fn the_relay_heartbeats_its_children_every_500_ms() {
     let mut r = relay_side();
@@ -2631,6 +2912,7 @@ fn the_relay_heartbeats_its_children_every_500_ms() {
     );
     let keys = child_relay_keys(&c);
     let seq = Seq::new();
+    let cookie = r.cookie_of(addr(2));
     let ack = || {
         let mut buf = [0u8; MAX_DATAGRAM];
         let msg = Message::SpectateAck {
@@ -2638,6 +2920,7 @@ fn the_relay_heartbeats_its_children_every_500_ms() {
             next: 40,
             relay: RelayState::NO_INTRO,
             admit_ack: 0,
+            cookie,
             sack: Bits512::EMPTY,
         };
         let k = wire::seal(&keys.sealer(Sender::Spectator), &seq, SID, &msg, &mut buf).unwrap();
@@ -2664,7 +2947,7 @@ fn the_relay_heartbeats_its_children_every_500_ms() {
 
 // ---------------------------- 観戦者の側 ----------------------------
 
-/// 観戦者 `w` へ、元のホストの鍵で `msg` を封じる（`keys` を替えると偽の鍵）。
+/// 観戦者`w`へ、元のホストの鍵で`msg`を封じる（`keys`を替えると偽の鍵）。
 fn from_host(w: &Watcher, msg: &Message, keys: Option<DirKeys>, seq: &Seq) -> Vec<u8> {
     let keys = keys.unwrap_or_else(|| {
         Ephemeral::from_seed(&host_cfg().key_seed)
@@ -2721,7 +3004,7 @@ fn old_wrong_or_forged_intros_do_not_move_the_watcher() {
         &mut sink,
     );
     assert!(!w.parent_is_home() && w.epoch() == 1);
-    // 遅れて着いた同じ紹介・別の中継役の紹介（前の epoch）は親を替えない。
+    // 遅れて着いた同じ紹介・別の中継役の紹介（前のepoch）は親を替えない。
     for relay in [1, 6] {
         w.on_datagram(
             HOST,
@@ -2746,7 +3029,7 @@ fn an_intro_from_outside_the_host_candidates_is_taken() {
         &mut sink,
     );
     assert!(!w.parent_is_home() && w.epoch() == 1);
-    // 紹介された中継役へ、epoch 1 の JOIN を送る。
+    // 紹介された中継役へ、epoch 1のJOINを送る。
     w.poll(2, &mut sink);
     let joins: Vec<(SocketAddr, JoinTree)> = sink
         .0
@@ -2761,8 +3044,343 @@ fn an_intro_from_outside_the_host_candidates_is_taken() {
         (joins[0].0, joins[0].1.epoch, joins[0].1.resume_from),
         (addr(1), 1, None)
     );
-    // 親（中継役）のアドレスは、中継役から STREAM が来るまで決まらない。
+    // 親（中継役）のアドレスは中継役からSTREAMが来るまで決まらない。
     assert_eq!(w.host_addr(), None);
+}
+
+/// 元のホストの候補`host`の観戦者`n`。
+fn watcher_of(n: u16, host: &[SocketAddr]) -> Watcher {
+    Watcher::new(WatcherConfig {
+        host: Candidates::from_addrs(host).expect("候補"),
+        ..watcher_config(n)
+    })
+}
+
+fn watcher_config(n: u16) -> WatcherConfig {
+    WatcherConfig {
+        session_id: SID,
+        secret: secret(),
+        nonce: nonce_of(n),
+        name: Name::new(&format!("t{n}")),
+        host: Candidates::from_addrs(&[HOST]).expect("loopback"),
+        host_public: host_cfg().public(),
+        key_seed: wseed(n),
+    }
+}
+
+/// 観戦者`w`の今のepochへの、中継役1の紹介（候補は`relay`）。
+fn intro_to(w: &Watcher, relay: Candidates) -> Message {
+    Message::SpectateIntro(SpectateIntro {
+        nonce: nonce_of(2),
+        epoch: w.epoch(),
+        relay_public: RelayKey::new(&rseed(1)).public(),
+        relay,
+    })
+}
+
+/// 観戦者が送ったJOINのうち、宛先が`pick`に合うものの数。
+fn joins_to(sink: &Sink, pick: impl Fn(SocketAddr) -> bool) -> usize {
+    sink.0
+        .iter()
+        .filter(|(a, b)| {
+            pick(*a)
+                && matches!(
+                    wire::decode(&key(), None, b).map(|p| p.msg),
+                    Ok(Message::SpectateJoin(_))
+                )
+        })
+        .count()
+}
+
+/// 敵対的なホストが観戦者の戻るたびに宛先8つを選んで紹介を送り直しても、観戦者が宛先へJOINを送るのは最初の1回の紹介の分だけ。
+/// 「直接だけ」で戻った後の紹介は受けない。
+#[test]
+fn a_hostile_host_repeating_intros_gets_only_one_round_of_joins_to_its_targets() {
+    let mut w = watcher(2);
+    let seq = Seq::new();
+    let hk = Ephemeral::from_seed(&host_cfg().key_seed)
+        .dir_keys(&w.public_key(), true, SID, &key())
+        .unwrap();
+    let targets: Vec<SocketAddr> = (1..=8).map(|p| sa(&format!("127.0.0.1:{p}"))).collect();
+    let mut sink = Sink::default();
+    for t in 1..=30_000 {
+        if w.parent_is_home() {
+            let msg = intro_to(&w, Candidates::from_addrs(&targets).unwrap());
+            w.on_datagram(HOST, &from_host(&w, &msg, Some(hk), &seq), t, &mut sink);
+        }
+        w.poll(t, &mut sink);
+    }
+    let rounds = (REJOIN_MS / JOIN_RESEND_MS) as usize;
+    assert_eq!(joins_to(&sink, |a| targets.contains(&a)), rounds * 8);
+    assert!(w.direct_only() && w.parent_is_home());
+    assert_eq!(w.tree_counts().intros_taken, 1);
+}
+
+/// 中継役の鍵も持つ敵対的なホストが、紹介 → 宛先へJOINを2秒送らせる → REHOMEで戻す、を3分繰り返したとする。
+/// 戻っている間は500 msごとに紹介を送る。
+/// 観戦者が受ける紹介は`MAX_INTROS`回で、宛先へ向かうJOINは紹介1回の分の`MAX_INTROS`倍。
+#[test]
+fn a_hostile_host_that_rehomes_quickly_gets_at_most_max_intros_rounds_of_joins() {
+    let mut w = watcher(2);
+    let seq = Seq::new();
+    let relay_keys = relay_keys_of(&w);
+    let targets: Vec<SocketAddr> = (1..=8).map(|p| sa(&format!("127.0.0.1:{p}"))).collect();
+    let mut sink = Sink::default();
+    let mut since = 0;
+    for t in 1..=180_000 {
+        if w.parent_is_home() {
+            if t - since >= 500 {
+                let msg = intro_to(&w, Candidates::from_addrs(&targets).unwrap());
+                w.on_datagram(HOST, &from_host(&w, &msg, None, &seq), t, &mut sink);
+                since = t;
+            }
+        } else if t - since >= 2_000 {
+            let rehome = from_host(&w, &Message::SpectateRehome, Some(relay_keys), &seq);
+            w.on_datagram(targets[0], &rehome, t, &mut sink);
+        }
+        w.poll(t, &mut sink);
+    }
+    // 紹介からREHOMEまでの2秒に250 msごとに8つの宛先へJOINを送る。
+    let per_intro = (2_000 / JOIN_RESEND_MS) as usize * targets.len();
+    let joins = joins_to(&sink, |a| targets.contains(&a));
+    assert_eq!(joins, MAX_INTROS as usize * per_intro);
+    assert!(w.direct_only() && w.parent_is_home());
+    let c = w.tree_counts();
+    assert_eq!(c.intros_taken, MAX_INTROS);
+    assert!(c.intros_ignored > 100, "効く期間: 紹介を送り続けた {c:?}");
+}
+
+/// 中継役1の鍵（観戦者`w`との向きごとの鍵。中継役の側）。
+fn relay_keys_of(w: &Watcher) -> DirKeys {
+    Ephemeral::from_seed(&rseed(1))
+        .dir_keys(&w.public_key(), true, SID, &key())
+        .unwrap()
+}
+
+/// 時刻`t`に紹介を受け、中継役のREHOMEで印なしで元のホストへ戻る。
+fn intro_then_rehome(w: &mut Watcher, seq: &Seq, relay_keys: DirKeys, t: u32) {
+    let msg = intro_to(w, Candidates::from_addrs(&[addr(1)]).unwrap());
+    w.on_datagram(
+        HOST,
+        &from_host(w, &msg, None, seq),
+        t,
+        &mut Sink::default(),
+    );
+    assert!(!w.parent_is_home(), "{t} ms の紹介");
+    let rehome = from_host(w, &Message::SpectateRehome, Some(relay_keys), seq);
+    w.on_datagram(addr(1), &rehome, t + 1, &mut Sink::default());
+    assert!(w.parent_is_home() && !w.direct_only(), "{t} ms の紹介の後");
+}
+
+/// 紹介は`INTRO_WINDOW_MS`以内に`MAX_INTROS`回まで。越えた紹介は受けず、「直接だけ」にしてepochを進め、元のホストへすぐJOINする。
+#[test]
+fn intros_stop_at_max_intros_and_then_the_watcher_stays_direct_only() {
+    let mut w = watcher(2);
+    let seq = Seq::new();
+    let relay_keys = relay_keys_of(&w);
+    let mut t = 1;
+    for _ in 0..MAX_INTROS {
+        intro_then_rehome(&mut w, &seq, relay_keys, t);
+        t += 10;
+    }
+    let epoch = w.epoch();
+    let mut sink = Sink::default();
+    let msg = intro_to(&w, Candidates::from_addrs(&[addr(1)]).unwrap());
+    w.on_datagram(HOST, &from_host(&w, &msg, None, &seq), t, &mut sink);
+    assert!(w.parent_is_home() && w.direct_only());
+    assert_eq!(w.epoch(), epoch + 1);
+    w.poll(t, &mut sink);
+    let home: Vec<JoinTree> = sink
+        .0
+        .iter()
+        .filter_map(|(a, b)| match wire::decode(&key(), None, b).ok()?.msg {
+            Message::SpectateJoin(j) if *a == HOST => Some(j.tree),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(home.len(), 1);
+    assert!(home[0].direct_only && home[0].epoch == epoch + 1);
+    let c = w.tree_counts();
+    assert_eq!((c.intros_taken, c.intros_ignored), (MAX_INTROS, 1));
+}
+
+/// `MAX_INTROS`回の後の紹介は最も古い紹介から`INTRO_WINDOW_MS`経っていれば受け、1 ms足りなければ断る。
+#[test]
+fn the_intro_cap_counts_only_the_intros_inside_the_window() {
+    for (late, taken) in [(INTRO_WINDOW_MS - 1, false), (INTRO_WINDOW_MS, true)] {
+        let mut w = watcher(2);
+        let seq = Seq::new();
+        let relay_keys = relay_keys_of(&w);
+        let first = 1;
+        for k in 0..MAX_INTROS as u32 {
+            intro_then_rehome(&mut w, &seq, relay_keys, first + 10 * k);
+        }
+        let msg = intro_to(&w, Candidates::from_addrs(&[addr(1)]).unwrap());
+        w.on_datagram(
+            HOST,
+            &from_host(&w, &msg, None, &seq),
+            first + late,
+            &mut Sink::default(),
+        );
+        assert_eq!(!w.parent_is_home(), taken, "最初の紹介から {late} ms");
+        assert_eq!(w.direct_only(), !taken, "最初の紹介から {late} ms");
+    }
+}
+
+/// 長い観戦。マッチの切れ目ごとに中継役の下へ移り、中継役が抜けて元のホストへ戻る。これを`MAX_INTROS`の何倍も繰り返しても「直接だけ」に切り替わらない。
+/// マッチは短めに見て30秒。
+#[test]
+fn a_long_honest_watch_keeps_taking_intros_across_many_match_boundaries() {
+    let mut w = watcher(2);
+    let seq = Seq::new();
+    let relay_keys = relay_keys_of(&w);
+    let match_ms = 30_000;
+    let rounds = 4 * MAX_INTROS;
+    for k in 0..rounds as u32 {
+        intro_then_rehome(&mut w, &seq, relay_keys, 1 + k * match_ms);
+    }
+    assert!(!w.direct_only());
+    let c = w.tree_counts();
+    assert_eq!((c.intros_taken, c.intros_ignored), (rounds, 0));
+}
+
+/// インターネット越しのホストの紹介では中継役のloopback・LANの候補（申告の種類によらない）へJOINを送らない。
+/// 使える候補が無ければ紹介を受けず、「直接だけ」で元のホストに残る。
+/// LANのホストならLANの候補は使い、loopbackは使わない。
+#[test]
+fn a_watcher_drops_relay_candidates_narrower_than_its_host() {
+    let net_host = sa("198.51.100.10:7000");
+    let lan_host = sa("192.168.1.5:7000");
+    let mixed = cands(&[
+        cand(CandKind::Loopback, "127.0.0.1:9"),
+        cand(CandKind::External, "192.168.1.1:1900"),
+        cand(CandKind::Host, "10.0.0.7:4000"),
+        cand(CandKind::External, "203.0.113.30:5000"),
+    ]);
+    let local_only = cands(&[
+        cand(CandKind::Loopback, "127.0.0.1:9"),
+        cand(CandKind::External, "192.168.1.1:1900"),
+    ]);
+    for (host, list, want) in [
+        (net_host, mixed, Some(vec![sa("203.0.113.30:5000")])),
+        (net_host, local_only, None),
+        (lan_host, local_only, Some(vec![sa("192.168.1.1:1900")])),
+    ] {
+        let mut w = watcher_of(2, &[host]);
+        let seq = Seq::new();
+        let mut sink = Sink::default();
+        w.on_datagram(
+            host,
+            &from_host(&w, &intro_to(&w, list), None, &seq),
+            1,
+            &mut sink,
+        );
+        w.poll(2, &mut sink);
+        let to: Vec<SocketAddr> = sink
+            .0
+            .iter()
+            .filter(|(a, b)| {
+                *a != host
+                    && matches!(
+                        wire::decode(&key(), None, b).map(|p| p.msg),
+                        Ok(Message::SpectateJoin(_))
+                    )
+            })
+            .map(|(a, _)| *a)
+            .collect();
+        match want {
+            Some(v) => {
+                assert!(!w.parent_is_home(), "{host} の紹介を受けない");
+                assert_eq!(to, v, "{host}");
+            }
+            None => {
+                assert!(to.is_empty(), "{to:?}");
+                assert!(w.parent_is_home() && w.direct_only() && w.epoch() == 1);
+                assert_eq!(
+                    joins_to(&sink, |a| a == host),
+                    1,
+                    "元のホストへ JOIN しない"
+                );
+            }
+        }
+    }
+}
+
+/// 中継役へのJOINには中継役の区分より狭い自分の候補（インターネット越しの中継役へLANのアドレス）を載せない。元のホストへは今までどおり全部。
+#[test]
+fn a_child_tells_an_internet_relay_only_its_internet_candidates() {
+    let host = sa("198.51.100.10:7000");
+    let relay = sa("198.51.100.40:6000");
+    let mut w = watcher_of(2, &[host]);
+    w.set_candidates(cands(&[
+        cand(CandKind::Host, "192.168.1.20:47101"),
+        cand(CandKind::Loopback, "127.0.0.1:47101"),
+        cand(CandKind::External, "203.0.113.7:47101"),
+    ]));
+    let seq = Seq::new();
+    let mut sink = Sink::default();
+    let sent = |sink: &mut Sink, to: SocketAddr| -> Vec<Vec<SocketAddr>> {
+        std::mem::take(&mut sink.0)
+            .into_iter()
+            .filter_map(|(a, b)| match wire::decode(&key(), None, &b).ok()?.msg {
+                Message::SpectateJoin(j) if a == to => Some(addrs_of(&j.tree.candidates)),
+                _ => None,
+            })
+            .collect()
+    };
+    w.poll(0, &mut sink);
+    assert_eq!(
+        sent(&mut sink, host),
+        vec![sorted(vec![
+            sa("192.168.1.20:47101"),
+            sa("127.0.0.1:47101"),
+            sa("203.0.113.7:47101")
+        ])]
+    );
+    let msg = intro_to(&w, Candidates::from_addrs(&[relay]).unwrap());
+    w.on_datagram(host, &from_host(&w, &msg, None, &seq), 1, &mut sink);
+    w.poll(2, &mut sink);
+    assert_eq!(sent(&mut sink, relay), vec![vec![sa("203.0.113.7:47101")]]);
+}
+
+/// 中継役はインターネット越しのホストの依頼にある子のloopback・LANの候補へは穴あけを送らない（候補から外して控える）。
+#[test]
+fn a_relay_of_an_internet_host_drops_narrower_child_candidates_from_an_admit() {
+    for (host, want) in [
+        (sa("198.51.100.10:7000"), vec![sa("203.0.113.8:4000")]),
+        (
+            HOST,
+            vec![
+                sa("127.0.0.1:9"),
+                sa("192.168.1.1:1900"),
+                sa("203.0.113.8:4000"),
+            ],
+        ),
+    ] {
+        let mut w = watcher_of(1, &[host]);
+        w.set_relay_public(Some(RelayKey::new(&rseed(1)).public()));
+        w.set_relay_state(ON);
+        let msg = Message::SpectateAdmit(SpectateAdmit {
+            candidates: cands(&[
+                cand(CandKind::Loopback, "127.0.0.1:9"),
+                cand(CandKind::External, "192.168.1.1:1900"),
+                cand(CandKind::External, "203.0.113.8:4000"),
+            ]),
+            ..match admit(1) {
+                Message::SpectateAdmit(a) => a,
+                _ => unreachable!(),
+            }
+        });
+        let seq = Seq::new();
+        w.on_datagram(
+            host,
+            &from_host(&w, &msg, None, &seq),
+            1,
+            &mut Sink::default(),
+        );
+        let got = w.take_admit().expect("依頼を控えない");
+        assert_eq!(addrs_of(&got.candidates), sorted(want), "{host}");
+    }
 }
 
 fn admit(no: u16) -> Message {
@@ -2776,7 +3394,7 @@ fn admit(no: u16) -> Message {
     })
 }
 
-/// 番号 0 の依頼は封じる側（ホスト）が作れず（`debug_assert`）、開く側（観戦者）は decode で捨てる（`wire::tests::poison_spectate_tree_messages`）。
+/// 番号0の依頼は封じる側（ホスト）が作れず（`debug_assert`）、開く側（観戦者）はdecodeで捨てる（`wire::tests::poison_spectate_tree_messages`）。
 #[test]
 fn admits_are_taken_in_order_and_a_skipped_number_is_not() {
     let mut w = watcher(1);
@@ -2799,10 +3417,11 @@ fn admits_are_taken_in_order_and_a_skipped_number_is_not() {
         (c.admits_taken, c.admits_ignored, c.control_dropped),
         (2, 4, 0)
     );
-    // 観戦者の ACK に、受け入れの依頼の受け取りの番号が載る。
+    // 観戦者のACKに受け入れの依頼の受け取り番号が載る。
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -2825,6 +3444,7 @@ fn a_watcher_stays_joined_while_it_moves_to_a_relay() {
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -2835,7 +3455,7 @@ fn a_watcher_stays_joined_while_it_moves_to_a_relay() {
         &mut Sink::default(),
     );
     assert_eq!(w.host_addr(), Some(HOST));
-    // 元のホストの紹介は、JOIN の今の epoch のものだけを受ける。
+    // 元のホストの紹介はJOINの今のepochのものだけを受ける。
     w.on_datagram(
         HOST,
         &from_host(&w, &intro(2, 0, 1), None, &seq),
@@ -2849,7 +3469,7 @@ fn a_watcher_stays_joined_while_it_moves_to_a_relay() {
         None,
         "親（中継役）のアドレスはまだ決まらない"
     );
-    // 中継役から何も来なければ、元のホストへ「直接だけ」で戻る。続きの番号を載せて JOIN する。
+    // 中継役から何も来なければ元のホストへ「直接だけ」で戻る。続きの番号を載せてJOINする。
     let mut sink = Sink::default();
     w.poll(2 + REJOIN_MS, &mut sink);
     assert!(w.parent_is_home() && w.direct_only() && w.epoch() == 2);
@@ -2874,6 +3494,7 @@ fn a_cancel_bye_after_joining_marks_the_end_but_not_before() {
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -2912,6 +3533,7 @@ fn a_stream_after_a_refusal_lowers_the_refused_mark() {
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -2935,7 +3557,7 @@ fn a_stream_after_a_refusal_lowers_the_refused_mark() {
 
 // ---------------------------- 中継役の配る側 ----------------------------
 
-/// 中継役 1 の配る側（記録 0〜39 を積んだ）。
+/// 中継役1の配信側（記録0〜39を積んだ）。
 fn relay_side() -> SpectateHost {
     let mut r = SpectateHost::relay_with_capacity(SID, secret(), RelayKey::new(&rseed(1)), 256);
     for f in 0..40 {
@@ -2962,7 +3584,7 @@ fn admit_for(c: &Fake, no: u16, epoch: u16, start: u32) -> SpectateAdmit {
     }
 }
 
-/// 子 `c` と中継役 1 の間の鍵（子の側）。
+/// 子`c`と中継役1の間の鍵（子の側）。
 fn child_relay_keys(c: &Fake) -> DirKeys {
     Ephemeral::from_seed(&wseed(c.n))
         .dir_keys(&RelayKey::new(&rseed(1)).public(), false, SID, &key())
@@ -2993,6 +3615,193 @@ fn the_relay_takes_only_named_children() {
     assert_eq!(r.relay_state().descendants, 1);
 }
 
+/// 子`c`が中継役1（`relay`）へ返すACK（子と中継役の鍵で封じる。中継役のSTREAMのクッキーを返す）。
+fn relay_ack(relay: &SpectateHost, c: &Fake, next: u32) -> Vec<u8> {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let msg = Message::SpectateAck {
+        nonce: nonce_of(c.n),
+        next,
+        relay: RelayState::NO_INTRO,
+        admit_ack: 0,
+        cookie: relay.cookie_of(addr(c.n)),
+        sack: Bits512::EMPTY,
+    };
+    let k = wire::seal(
+        &child_relay_keys(c).sealer(Sender::Spectator),
+        &c.seq,
+        SID,
+        &msg,
+        &mut buf,
+    )
+    .expect("封じる");
+    buf[..k].to_vec()
+}
+
+const NOT_ADMITTED: HostEvent = HostEvent::Dropped(higanr_core::spectate::DropReason::NotAdmitted);
+
+/// 紹介された子（アドレス2）がJOINした中継役。`ack_at`にACKを返すなら返す。
+fn relay_with_child(ack_at: Option<u32>) -> (SpectateHost, Fake) {
+    let mut r = relay_side();
+    let c = Fake::new(2);
+    assert!(r.admit(admit_for(&c, 1, 1, 10), 1));
+    let mut sink = Sink::default();
+    assert_eq!(
+        r.on_datagram(addr(2), &c.join(child_tree(None, 1)), 2, &mut sink),
+        HostEvent::Joined
+    );
+    if let Some(t) = ack_at {
+        assert!(matches!(
+            r.on_datagram(addr(2), &relay_ack(&r, &c, 12), t, &mut sink),
+            HostEvent::Acked { .. }
+        ));
+    }
+    (r, c)
+}
+
+/// 中継役も、子の枠の最初のACKは中継役のSTREAMのクッキーを返したものだけを受ける。
+/// 紹介された子でも、送り元を偽った枠をACK済みにはできない。
+#[test]
+fn a_relay_takes_the_first_ack_of_a_child_only_with_its_cookie() {
+    let (mut r, c) = relay_with_child(None);
+    let mut sink = Sink::default();
+    r.poll(3, &mut sink);
+    let cookie = sink
+        .opened(addr(2), &child_relay_keys(&c))
+        .into_iter()
+        .find_map(|m| match m {
+            Message::SpectateStream(s) => s.cookie,
+            _ => None,
+        });
+    assert!(cookie.is_some() && cookie == r.cookie_of(addr(2)));
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let forged = Message::SpectateAck {
+        nonce: nonce_of(2),
+        next: u32::MAX,
+        relay: RelayState::NO_INTRO,
+        admit_ack: 0,
+        cookie: None,
+        sack: Bits512::EMPTY,
+    };
+    let k = wire::seal(
+        &child_relay_keys(&c).sealer(Sender::Spectator),
+        &c.seq,
+        SID,
+        &forged,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(
+        r.on_datagram(addr(2), &buf[..k], 4, &mut sink),
+        HostEvent::Dropped(DropReason::NoCookie)
+    );
+    assert!(r.cookie_of(addr(2)).is_some(), "ACK 済みになった");
+    assert!(matches!(
+        r.on_datagram(addr(2), &relay_ack(&r, &c, 12), 5, &mut sink),
+        HostEvent::Acked { .. }
+    ));
+    assert_eq!(r.cookie_of(addr(2)), None);
+}
+
+/// 元の枠がACKを返していて聞こえている間は、観戦者はそちらの経路を使っているので、別の送り元（偽の宛先を含む）の双子の枠は追加しない。
+#[test]
+fn a_relay_refuses_a_twin_while_the_first_slot_is_acking() {
+    let (mut r, c) = relay_with_child(Some(5));
+    let mut sink = Sink::default();
+    for n in 3..=22u16 {
+        let now = 6 + u32::from(n) * 100;
+        assert_eq!(
+            r.on_datagram(addr(n), &c.join(child_tree(None, 1)), now, &mut sink),
+            NOT_ADMITTED,
+            "送り元 {n}"
+        );
+        r.poll(now, &mut sink);
+    }
+    assert_eq!(r.slot_count(), 1, "枠が増えた");
+    assert!(
+        sink.0.iter().all(|(to, _)| *to == addr(2)),
+        "ほかの宛先へ送った"
+    );
+    assert_eq!(r.counts().twin_refused, 20);
+}
+
+/// 対照: 元の枠がACKを返していないなら（その経路が届いていない）双子の枠を追加して、元の枠の続きから送る。
+#[test]
+fn a_relay_takes_a_twin_while_the_first_slot_has_not_acked() {
+    let (mut r, c) = relay_with_child(None);
+    let mut sink = Sink::default();
+    assert_eq!(
+        r.on_datagram(addr(3), &c.join(child_tree(None, 1)), 6, &mut sink),
+        HostEvent::Joined
+    );
+    assert_eq!(r.slot_count(), 2);
+    assert_eq!(r.ack_of(addr(3)), r.ack_of(addr(2)));
+    assert_eq!(r.counts().twin_refused, 0);
+}
+
+/// 同じ子（nonce・公開鍵）の枠は2つまで。
+#[test]
+fn a_relay_keeps_at_most_two_slots_per_child() {
+    let (mut r, c) = relay_with_child(None);
+    let mut sink = Sink::default();
+    for (n, want) in [(3, HostEvent::Joined), (4, NOT_ADMITTED), (5, NOT_ADMITTED)] {
+        let now = 200 + u32::from(n) * 125;
+        assert_eq!(
+            r.on_datagram(addr(n), &c.join(child_tree(None, 1)), now, &mut sink),
+            want,
+            "送り元 {n}"
+        );
+    }
+    assert_eq!(r.slot_count(), 2);
+    assert_eq!(r.counts().twin_refused, 2);
+}
+
+/// 元の枠が聞こえているかどうかはACKで判断する。JOINの送り直しで元の枠を生かし続けてもACKが`REJOIN_MS`無ければ双子の枠を追加する。
+#[test]
+fn a_relay_judges_the_first_slot_by_its_acks_not_by_rejoins() {
+    let (mut r, c) = relay_with_child(Some(5));
+    let mut sink = Sink::default();
+    let late = 5 + REJOIN_MS;
+    assert_eq!(
+        r.on_datagram(addr(2), &c.join(child_tree(None, 1)), late - 50, &mut sink),
+        HostEvent::Refreshed,
+        "JOIN の送り直しは元の枠を延ばす"
+    );
+    assert_eq!(
+        r.on_datagram(addr(3), &c.join(child_tree(None, 1)), late - 1, &mut sink),
+        NOT_ADMITTED,
+        "ACK から REJOIN_MS の手前では断る"
+    );
+    assert_eq!(
+        r.on_datagram(addr(3), &c.join(child_tree(None, 1)), late, &mut sink),
+        HostEvent::Joined
+    );
+    assert_eq!(r.slot_count(), 2);
+}
+
+/// 中継役の枠もACKが届いている間は名指しされた別の子のJOIN（同じ送り元）で置き換わらない。黙って`REJOIN_MS`経てば入れ替わる。
+#[test]
+fn a_relay_slot_that_is_acking_is_not_replaced_by_another_childs_join() {
+    let (mut r, _c) = relay_with_child(Some(5));
+    let other = Fake::new(3);
+    let mut sink = Sink::default();
+    assert!(r.admit(admit_for(&other, 2, 1, 10), 6));
+    assert_eq!(
+        r.on_datagram(addr(2), &other.join(child_tree(None, 1)), 2_000, &mut sink),
+        HostEvent::Throttled
+    );
+    assert_eq!(r.counts().rekey_held, 1);
+    assert_eq!(r.slot_count(), 1);
+    assert_eq!(
+        r.on_datagram(
+            addr(2),
+            &other.join(child_tree(None, 1)),
+            5 + REJOIN_MS,
+            &mut sink
+        ),
+        HostEvent::Joined
+    );
+}
+
 #[test]
 fn the_relay_rehomes_a_child_whose_start_it_does_not_have() {
     let mut r = relay_side();
@@ -3015,7 +3824,7 @@ fn a_relay_that_skips_ahead_rehomes_children_it_can_no_longer_serve() {
     r.poll(3, &mut sink);
     let opened = |s: &Sink| s.opened(addr(2), &child_relay_keys(&c));
     assert!(!opened(&sink).contains(&Message::SpectateRehome));
-    // 続けて積める番号は、子を残す。
+    // 続けて積める番号なら子を残す。
     assert!(r.push_at(40, Record::FILLER));
     r.poll(4, &mut sink);
     assert_eq!(r.spectator_count(), 1);
@@ -3045,7 +3854,7 @@ fn the_same_child_admitted_twice_to_one_relay_never_reuses_a_nonce() {
             r.on_datagram(addr(2), &c.join(child_tree(None, epoch)), t0, &mut sink),
             HostEvent::Joined
         );
-        for t in t0..t0 + 200 {
+        for t in t0..t0 + 400 {
             r.poll(t, &mut sink);
         }
         let mine: Vec<&Vec<u8>> = sink
@@ -3064,7 +3873,7 @@ fn the_same_child_admitted_twice_to_one_relay_never_reuses_a_nonce() {
             f.copy_from_slice(&b[HEADER_LEN..HEADER_LEN + 8]);
             seen.push(read_nonce_field(&f));
         }
-        // 子が抜ける（BYE は子と中継役の鍵で封じる）。
+        // 子が抜ける（BYEは子と中継役の鍵で封じる）。
         let mut buf = [0u8; MAX_DATAGRAM];
         let bye = Message::Bye(ByeReason::Cancelled);
         let k = wire::seal(
@@ -3085,7 +3894,7 @@ fn the_same_child_admitted_twice_to_one_relay_never_reuses_a_nonce() {
     uniq.dedup();
     assert_eq!(uniq.len(), seen.len(), "同じ鍵で同じ nonce を 2 回使った");
     assert!(seen.iter().all(|s| s.0 == Sender::SpectateHost as u8));
-    // 対照: 同じ種で作り直した配る側は通し番号を 0 から取るので、重なる（この検査が重なりを見分けられる証拠）。
+    // 対照: 同じ種で作り直した配信側は通し番号を0から取るので重なる（この検査が重なりを見分けられる証拠）。
     let mut again = relay_side();
     assert!(again.admit(admit_for(&c, 1, 1, 0), 0));
     let mut sink = Sink::default();
@@ -3099,14 +3908,14 @@ fn the_same_child_admitted_twice_to_one_relay_never_reuses_a_nonce() {
 
 // ============================ 上りの測り（MEASURE・PAIR） ============================
 
-/// 1 組の太さ（B/s）: 1,200 B の 2 通が `delta_us` µs 離れて着いた。
+/// 1ペアの太さ（B/s）: 1,200 Bの2通が`delta_us` µs離れて着いた。
 fn pair_bps(delta_us: u64) -> u32 {
     (1_200 * 1_000_000 / delta_us) as u32
 }
 
-/// 記録 0〜100 を積んだホストに、観戦者 `ns`（JOIN の木の欄つき）が入り、全部を受け取った ACK を返した（`poll` はまだ）。
+/// 記録0〜100を積んだホストに、観戦者`ns`（JOINの木のフィールドつき）が入り、全部を受け取ったACKを返した（`poll`はまだ）。
 fn host_with_watchers(ns: &[(u16, JoinTree)]) -> (SpectateHost, Vec<Fake>) {
-    let mut host = SpectateHost::with_capacity(host_cfg(), 1_024);
+    let mut host = fat_host(1_024);
     host.push(Record::Seg { seg: 0 }).unwrap();
     for f in 0..100 {
         host.push(Record::Frame {
@@ -3126,7 +3935,7 @@ fn host_with_watchers(ns: &[(u16, JoinTree)]) -> (SpectateHost, Vec<Fake>) {
             "観戦者 {n}"
         );
         assert_eq!(
-            host.on_datagram(addr(n), &f.ack(host.tail(), ON, 0), 0, &mut sink),
+            host.on_datagram(addr(n), &f.ack(&host, host.tail(), ON, 0), 0, &mut sink),
             HostEvent::Acked { progress: true }
         );
         fakes.push(f);
@@ -3134,7 +3943,7 @@ fn host_with_watchers(ns: &[(u16, JoinTree)]) -> (SpectateHost, Vec<Fake>) {
     (host, fakes)
 }
 
-/// 宛先 `f` へ送った MEASURE の番号（送った順。送り直しも並ぶ）。
+/// 宛先`f`へ送ったMEASUREの番号（送った順。送り直しも並ぶ）。
 fn measures_to(sink: &Sink, f: &Fake) -> Vec<u16> {
     sink.opened(addr(f.n), &f.keys)
         .into_iter()
@@ -3145,20 +3954,20 @@ fn measures_to(sink: &Sink, f: &Fake) -> Vec<u16> {
         .collect()
 }
 
-/// ホストを `from`〜`to` ms まで 1 ms ごとに回す。観戦者 `fakes` は 500 ms ごとに ACK を返して黙らない。
+/// ホストを`from`〜`to` msまで1 msごとに回す。観戦者`fakes`は500 msごとにACKを返して黙らない。
 fn run_host(host: &mut SpectateHost, fakes: &[Fake], from: u32, to: u32, sink: &mut Sink) {
     for t in from..=to {
         if t.is_multiple_of(500) {
             for f in fakes {
                 let next = host.ack_of(addr(f.n)).unwrap_or(0);
-                host.on_datagram(addr(f.n), &f.ack(next, ON, 0), t, sink);
+                host.on_datagram(addr(f.n), &f.ack(host, next, ON, 0), t, sink);
             }
         }
         host.poll(t, sink);
     }
 }
 
-/// 組 `pair` の 2 通を、`at` µs と `at + delta` µs に着いたとして渡す。
+/// ペア`pair`の2通を`at` µsと`at + delta` µsに着いたとして渡す。
 fn feed_pair(host: &mut SpectateHost, f: &Fake, turn: u16, pair: u8, at: u64, delta: u64) {
     assert!(
         host.on_pair(addr(f.n), &f.pair(turn, pair, false), at),
@@ -3170,7 +3979,7 @@ fn feed_pair(host: &mut SpectateHost, f: &Fake, turn: u16, pair: u8, at: u64, de
     );
 }
 
-/// 組 `k` の 1 通目が着く µs（組どうしを 100 ms 離す）。
+/// ペア`k`の1通目が着くµs（ペアどうしを100 ms離す）。
 fn pair_at(k: u8) -> u64 {
     1_000_000 + u64::from(k) * 100_000
 }
@@ -3180,7 +3989,7 @@ fn the_turn_goes_to_one_spectator_at_a_time_with_measure_sent_three_times_at_mos
     let (mut host, f) =
         host_with_watchers(&[(1, relay_tree(1)), (2, relay_tree(2)), (3, relay_tree(3))]);
     let mut sink = Sink::default();
-    // ホストが番を観戦者 1 に t = 1 で渡す。送り直しは最初の PAIR が来るまで 300 ms ごと、3 回まで。
+    // ホストが測定の順番を観戦者1に t = 1 で渡す。送り直しは最初のPAIRが来るまで300 msごとに3回まで。
     let mut t = 1;
     for (to, want) in [
         (MEASURE_RESEND_MS, 1),
@@ -3200,7 +4009,7 @@ fn the_turn_goes_to_one_spectator_at_a_time_with_measure_sent_three_times_at_mos
         measures_to(&sink, &f[1]).is_empty() && measures_to(&sink, &f[2]).is_empty(),
         "番を持つ人がいる間に別の人へ番を渡した"
     );
-    // 2 秒で締め（PAIR が来ないので測れない）、次の poll でホストが番を次の 1 人へ渡す。
+    // 2秒で締める（PAIRが来ないので測れない）。次のpollでホストが順番を次の1人へ渡す。
     run_host(&mut host, &f, t, t, &mut sink);
     assert_eq!(host.measuring(), None);
     assert_eq!(host.counts().uplinks_unmeasured, 1);
@@ -3219,13 +4028,13 @@ fn the_estimate_is_the_lower_median_and_ten_complete_pairs_close_the_turn_early(
     let mut sink = Sink::default();
     host.poll(1, &mut sink);
     let turn = measures_to(&sink, &f[0])[0];
-    // Δ（ms）を組の番号の順と揃えずに並べる。
+    // Δ（ms）をペアの番号の順と揃えずに並べる。
     let deltas_ms = [60u64, 10, 90, 30, 100, 20, 80, 40, 70, 50];
     for (k, d) in deltas_ms.iter().enumerate() {
         feed_pair(&mut host, &f[0], turn, k as u8, pair_at(k as u8), d * 1_000);
     }
     host.poll(2, &mut sink);
-    // 10 組の太さを小さい順に並べた 5 番目（Δ 60 ms）。平均（約 35,000）・上の中央値（Δ 50 ms の 24,000）とは違う。
+    // 10ペアの太さを小さい順に並べた5番目（Δ 60 ms）。平均（約35,000）・上の中央値（Δ 50 msの24,000）とは違う。
     assert_eq!(host.uplink_of(addr(1)), Some(pair_bps(60_000)));
     assert_eq!(pair_bps(60_000), 20_000);
     assert_eq!(host.measuring(), None, "10 組そろったのに締めない");
@@ -3241,7 +4050,7 @@ fn fewer_than_three_usable_pairs_measure_nothing_and_the_turn_comes_back_after_r
     let first = measures_to(&sink, &f[0])[0];
     feed_pair(&mut host, &f[0], first, 0, pair_at(0), 10_000);
     feed_pair(&mut host, &f[0], first, 1, pair_at(1), 20_000);
-    // 片方だけの組 2 つと、2 通目が先に着いた組（同じ µs。順の逆の組は使わない）。
+    // 片方だけのペア2つと、2通目が先に着いたペア（同じµs。順が逆のペアは使わない）。
     assert!(host.on_pair(addr(1), &f[0].pair(first, 2, false), pair_at(2)));
     assert!(host.on_pair(addr(1), &f[0].pair(first, 3, true), pair_at(3)));
     assert!(host.on_pair(addr(1), &f[0].pair(first, 4, true), pair_at(4)));
@@ -3271,9 +4080,9 @@ fn fewer_than_three_usable_pairs_measure_nothing_and_the_turn_comes_back_after_r
     let again = measures_to(&sink, &f[0]);
     assert_eq!(again.len(), 1, "{MEASURE_RETRY_MS} ms の後に番を回さない");
     assert_ne!(again[0], first, "新しい番号でない");
-    // 前の番の組は数えない。
+    // 前の順番のペアは数えない。
     assert!(!host.on_pair(addr(1), &f[0].pair(first, 7, false), pair_at(7)));
-    // 2 回目: ちょうど 3 組で決まる（Δ 40・10・20 ms の真ん中 = 60,000 B/s）。
+    // 2回目: ちょうど3ペアで決まる（Δ 40・10・20 msの真ん中 = 60,000 B/s）。
     for (k, d) in [(5u8, 40_000u64), (0, 10_000), (9, 20_000)] {
         feed_pair(&mut host, &f[0], again[0], k, pair_at(k) + 50_000_000, d);
     }
@@ -3295,7 +4104,7 @@ fn a_spectator_gets_two_turns_at_most_until_it_joins_again() {
         (host.counts().measures, host.counts().uplinks_unmeasured),
         (2, 2)
     );
-    // 抜けて入り直すと枠が新しいので、数え直す。
+    // 抜けて入り直すと枠が新しくなるので数え直す。
     let bye = f[0].sealed(&Message::Bye(ByeReason::Cancelled));
     assert_eq!(
         host.on_datagram(addr(1), &bye, end + 1, &mut sink),
@@ -3307,7 +4116,7 @@ fn a_spectator_gets_two_turns_at_most_until_it_joins_again() {
         HostEvent::Joined
     );
     let next = host.tail();
-    host.on_datagram(addr(1), &f[0].ack(next, ON, 0), end + 3, &mut sink);
+    host.on_datagram(addr(1), &f[0].ack(&host, next, ON, 0), end + 3, &mut sink);
     host.poll(end + 4, &mut sink);
     assert_eq!(measures_to(&sink, &f[0]).len(), 1);
     assert_eq!(host.counts().measures, 3);
@@ -3327,14 +4136,14 @@ fn pairs_from_another_address_key_or_turn_are_not_counted() {
     };
     for k in 0..MEASURE_PAIRS {
         let at = pair_at(k);
-        // 別の鍵（偽の組）。
+        // 別の鍵（偽のペア）。
         assert!(!host.on_pair(addr(1), &forged.pair(turn, k, false), at));
         assert!(!host.on_pair(addr(1), &forged.pair(turn, k, true), at + 10_000));
-        // 番を持たない観戦者 2 の組。
+        // 測定の順番を持たない観戦者2のペア。
         assert!(!host.on_pair(addr(2), &f[1].pair(turn, k, false), at));
-        // 番を持つ観戦者の鍵でも、別の送り元から。
+        // 測定の順番を持つ観戦者の鍵でも別の送り元からなら数えない。
         assert!(!host.on_pair(addr(2), &f[0].pair(turn, k, true), at + 10_000));
-        // 違う番の番号。
+        // 違う順番の番号。
         assert!(!host.on_pair(addr(1), &f[0].pair(turn.wrapping_add(1), k, false), at));
     }
     let c = host.counts();
@@ -3342,13 +4151,13 @@ fn pairs_from_another_address_key_or_turn_are_not_counted() {
         (c.pairs, c.pairs_dropped),
         (0, 5 * u64::from(MEASURE_PAIRS))
     );
-    // 対照: 同じ番の本物の組は数える（1 組では決まらない）。
+    // 対照: 同じ順番の本物のペアは数える（1ペアでは決まらない）。
     feed_pair(&mut host, &f[0], turn, 3, pair_at(3), 30_000);
     assert_eq!(host.counts().pairs, 2);
     host.poll(1 + MEASURE_CLOSE_MS, &mut sink);
     assert_eq!(host.uplink_of(addr(1)), Some(0));
     assert_eq!(host.counts().uplinks_unmeasured, 1);
-    // PAIR は `on_datagram` では開かずに捨てる（知らない送り元の封じた便として鍵を探しにいかない）。
+    // PAIRは`on_datagram`では開かずに捨てる（知らない送り元の封じた便として鍵を探しにいかない）。
     let stranger = SocketAddr::from(([127, 0, 0, 1], 48_999));
     assert_eq!(
         host.on_datagram(stranger, &f[0].pair(turn, 0, false), 2_100, &mut sink),
@@ -3383,9 +4192,10 @@ fn no_turn_is_given_while_the_spectate_sending_is_cut_or_paused() {
     let late = DelaySnapshot {
         at: 0,
         queue_ms: 50,
+        fresh_ms: 50,
         base_ms: 20,
     };
-    // 追いついた観戦者だけ（追いつきの送りが無い）: 往復が延びたら、ホストが番と送りを止める。
+    // 追いついた観戦者だけ（追いつきの送信が無い）。往復が延びたらホストは測定の順番と送信を止める。
     for (label, delay, want) in [("止めた", Some(late), None), ("対照", None, Some(addr(1)))] {
         let (mut host, _f) = host_with_watchers(&[(1, relay_tree(1))]);
         host.note_delay(delay.map(|d| DelaySnapshot { at: 1, ..d }));
@@ -3393,9 +4203,9 @@ fn no_turn_is_given_while_the_spectate_sending_is_cut_or_paused() {
         assert_eq!(host.measuring(), want, "{label}");
         assert_eq!(host.throttle_state().1, delay.is_some(), "{label}");
     }
-    // 遅れた観戦者（追いつきの送りがある）: 往復が延びたら全体の上限を半分にする（止めない）。
+    // 遅れた観戦者（追いつきの送信がある）。往復が延びたら全体の上限を半分にする（止めない）。
     for (label, delay, want) in [("絞った", Some(late), None), ("対照", None, Some(addr(1)))] {
-        let mut host = SpectateHost::with_capacity(host_cfg(), 1_024);
+        let mut host = fat_host(1_024);
         host.push(Record::Seg { seg: 0 }).unwrap();
         for k in 0..100 {
             host.push(Record::Frame {
@@ -3408,10 +4218,10 @@ fn no_turn_is_given_while_the_spectate_sending_is_cut_or_paused() {
         let f = Fake::new(1);
         let mut sink = Sink::default();
         host.on_datagram(addr(1), &f.join(relay_tree(1)), 0, &mut sink);
-        // ACK の前は番を渡さない。追いつきの送りだけが出る。
+        // ACKの前は測定の順番を渡さない。追いつきの送信だけが出る。
         host.poll(1, &mut sink);
         assert_eq!(host.measuring(), None, "{label}: ACK の前に番を渡した");
-        host.on_datagram(addr(1), &f.ack(0, ON, 0), 2, &mut sink);
+        host.on_datagram(addr(1), &f.ack(&host, 0, ON, 0), 2, &mut sink);
         host.note_delay(delay.map(|d| DelaySnapshot { at: 2, ..d }));
         host.poll(2, &mut sink);
         assert_eq!(host.measuring(), want, "{label}");
@@ -3458,7 +4268,7 @@ fn only_a_relay_capable_reachable_acked_spectator_with_an_unknown_uplink_gets_a_
         host.poll(1, &mut Sink::default());
         assert_eq!(host.measuring(), want, "{label}");
     }
-    // ACK で「紹介しないで」と返している人には渡さない（組を送らない）。
+    // ACKで「紹介しないで」と返答している人には順番を渡さない（ペアを送らない）。
     let (mut host, f) = host_with_watchers(&[(1, relay_tree(1))]);
     let stop = RelayState {
         descendants: 0,
@@ -3466,13 +4276,13 @@ fn only_a_relay_capable_reachable_acked_spectator_with_an_unknown_uplink_gets_a_
     };
     host.on_datagram(
         addr(1),
-        &f[0].ack(host.tail(), stop, 0),
+        &f[0].ack(&host, host.tail(), stop, 0),
         1,
         &mut Sink::default(),
     );
     host.poll(2, &mut Sink::default());
     assert_eq!(host.measuring(), None, "紹介しないで");
-    // 上りが分かっている人には渡さない（細くても）。
+    // 上りが分かっている人には順番を渡さない（細くても）。
     let (mut host, _f) = host_with_watchers(&[(1, relay_tree(1))]);
     host.note_uplink(addr(1), RELAY_MIN_BPS - 1);
     host.poll(1, &mut Sink::default());
@@ -3501,7 +4311,7 @@ fn the_relay_side_gives_no_turn_to_its_children() {
         seq: Seq::new(),
     };
     assert_eq!(
-        r.on_datagram(addr(2), &to_relay.ack(40, ON, 0), 3, &mut sink),
+        r.on_datagram(addr(2), &to_relay.ack(&r, 40, ON, 0), 3, &mut sink),
         HostEvent::Acked { progress: true }
     );
     for t in 4..=3_000 {
@@ -3510,7 +4320,7 @@ fn the_relay_side_gives_no_turn_to_its_children() {
     assert_eq!(r.measuring(), None);
     assert_eq!(r.counts().measures, 0);
     assert!(measures_to(&sink, &to_relay).is_empty());
-    // 対照: 同じ木の欄の観戦者を、元のホストは測る。
+    // 対照: 同じ木のフィールドの観戦者を元のホストは測る。
     let (mut host, _f) = host_with_watchers(&[(2, tree)]);
     host.poll(1, &mut Sink::default());
     assert_eq!(host.measuring(), Some(addr(2)));
@@ -3535,13 +4345,14 @@ fn a_fake_uplink_replaces_the_estimate_once_two_pairs_are_usable() {
 
 // ---------------------------- 観戦者の測り ----------------------------
 
-/// 元のホストから STREAM を 1 通受けて接続した、中継できる観戦者 `n`。
+/// 元のホストからSTREAMを1通受けて接続した、中継できる観戦者`n`。
 fn joined_relay_watcher(n: u16, seq: &Seq) -> Watcher {
     let mut w = watcher(n);
     w.set_relay_public(Some(RelayKey::new(&rseed(n)).public()));
     let stream = Message::SpectateStream(SpectateStream {
         first: 0,
         reset: true,
+        cookie: None,
         count: 0,
         records: [Record::FILLER; wire::MAX_STREAM_RECORDS],
     });
@@ -3555,7 +4366,7 @@ fn joined_relay_watcher(n: u16, seq: &Seq) -> Watcher {
     w
 }
 
-/// 観戦者 `w` を `from`〜`to` ms まで回し、ホストへ送った PAIR を（送った時刻, 中身, 長さ）で返す（ホストの側の鍵で開く）。
+/// 観戦者`w`を`from`〜`to` msまで回し、ホストへ送ったPAIRを（送った時刻, 中身, 長さ）で返す（ホストの側の鍵で開く）。
 fn pairs_sent(w: &mut Watcher, from: u32, to: u32) -> Vec<(u32, SpectatePair, usize)> {
     let keys = Ephemeral::from_seed(&host_cfg().key_seed)
         .dir_keys(&w.public_key(), true, SID, &key())
@@ -3604,7 +4415,7 @@ fn a_watcher_sends_ten_pairs_of_full_datagrams_every_100_ms_and_restarts_on_a_ne
         assert_eq!(*t, 10 + u32::from(k) * PAIR_GAP_MS, "{i} 通目");
         assert_eq!(*len, 1_200, "{i} 通目");
     }
-    // 新しい番号を受けたら、前の番をやめて組 0 から始め直す。
+    // 新しい番号を受けたら前の順番をやめてペア0から始め直す。
     tell(&mut w, 6, 1_300);
     let six = pairs_sent(&mut w, 1_300, 1_450);
     tell(&mut w, 7, 1_450);
@@ -3667,7 +4478,7 @@ fn a_watcher_that_cannot_relay_follows_a_relay_or_has_children_sends_no_pairs() 
         let c = w.tree_counts();
         assert_eq!((c.measures_taken, c.measures_ignored), (0, 1), "{label}");
     }
-    // 対照と、番の途中で子ができたらそこでやめる。
+    // 対照と、順番の途中で子ができたらそこでやめる。
     let mut w = joined_relay_watcher(1, &seq);
     w.on_datagram(
         HOST,
@@ -3682,11 +4493,11 @@ fn a_watcher_that_cannot_relay_follows_a_relay_or_has_children_sends_no_pairs() 
 
 // ---------------------------- 上りを絞った模型 ----------------------------
 
-/// 細い観戦者（目安の 2/3）と太い観戦者 2 人。
+/// 細い観戦者（目安の2/3）と太い観戦者2人。
 const THIN: u32 = RELAY_MIN_BPS * 2 / 3;
 const THICKER: u32 = 4 * RELAY_MIN_BPS;
 
-/// 見積もりが本当の太さの ±2% に入る。
+/// 見積もりが本当の太さの ±2%に入る。
 fn assert_near(sim: &Sim, n: u16, bps: u32) {
     let got = sim.host.uplink_of(addr(n)).expect("観戦者");
     let err = got.abs_diff(bps);
@@ -3699,7 +4510,7 @@ fn measured_uplinks_put_a_thin_spectator_below_the_relay_line_and_thick_ones_abo
     sim.add(1, 100, true, THIN);
     sim.add(2, 300, true, THICK);
     sim.add(3, 500, true, THICKER);
-    // 2 人目と 3 人目で中継役に向く人が 2 人そろうので、4 人目は測らない。
+    // 2人目と3人目で中継役に向く人が2人そろうので、4人目は測らない。
     sim.add(4, 600, true, THICKER);
     sim.run_to(12_000);
     assert_near(&sim, 1, THIN);
@@ -3720,7 +4531,7 @@ fn measured_uplinks_put_a_thin_spectator_below_the_relay_line_and_thick_ones_abo
         (c.measures, c.uplinks_measured, c.uplinks_unmeasured),
         (3, 3, 0)
     );
-    // 番は前の番を締めてから渡す（1 人ずつ）。番 1 回は 2 秒以内に締まる。
+    // 順番は前の順番を締めてから渡す（1人ずつ）。順番1回は2秒以内に締まる。
     for w in sim.turns.windows(2) {
         assert!(w[1].0 - w[0].0 <= MEASURE_CLOSE_MS + 1, "{:?}", sim.turns);
     }
@@ -3755,14 +4566,14 @@ fn a_tree_forms_from_measured_uplinks() {
 
 #[test]
 fn lost_pairs_still_decide_with_three_and_otherwise_the_turn_comes_back_after_retry_ms() {
-    // 組 0〜6 の 1 通目を落とす: 残るのは組 7〜9 の 3 組。
+    // ペア0〜6の1通目を落とす。残るのはペア7〜9の3ペア。
     let mut sim = Sim::measured(0x3B, CALM, 600);
     sim.net.pair_drop = Some((addr(1), |k| k % 2 == 0 && k / 2 < 7));
     sim.add(1, 100, true, THICK);
     sim.run_to(6_000);
     assert_near(&sim, 1, THICK);
     assert_eq!(sim.turns.len(), 1);
-    // 1 回目は組 0・1 だけを残す（2 組では決まらない）。2 回目は全部届く。
+    // 1回目はペア0・1だけを残す（2ペアでは決まらない）。2回目は全部届く。
     let mut sim = Sim::measured(0x3C, CALM, 600);
     sim.net.pair_drop = Some((addr(1), |k| (4..20).contains(&k)));
     sim.add(1, 100, true, THICK);

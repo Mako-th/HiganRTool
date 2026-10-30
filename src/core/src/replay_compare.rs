@@ -1,26 +1,29 @@
-//! リプレイから取り出した入力列（`replay_decode`）を CSV に書き、dll の `_net_frames.csv`（ネットワークでの実行で使った
-//! フレームの列）と突き合わせる。文字列を受けて文字列と数を返すだけの純粋な処理（ファイルはツール `replay_inputs` が読み書きする）。
+//! リプレイから取り出した入力列（`replay_decode`）をCSVに書く。
+//! それをdllの`_net_frames.csv`（ネットワークでの実行で使ったフレームの列）と突き合わせる。
+//! 文字列を受けて文字列と数を返すだけの純粋な処理（ファイルはツール`replay_inputs`が読み書きする）。
 //!
-//! `_net_frames.csv` の見出しの原本はここの `NET_FRAMES_HEADER`。`src/peer_sim/src/compare.rs` の `parse_dll_csv` は
-//! 別のクレートで core から使えないので、先頭の 5 列だけここで読み直し、見出しは同じ定数で断る。
+//! `_net_frames.csv`のヘッダの原本はここの`NET_FRAMES_HEADER`。
+//! `src/peer_sim/src/compare.rs`の`parse_dll_csv`は別のクレートでcoreから使えない。
+//! そのため先頭の5列だけここで読み直し、ヘッダは同じ定数で断る。
 //!
-//! 合わせ方は `offset`（`replay_frame = csv_frame + offset`）。リプレイの記録はネットワークの frame 0 の 1 tick 前から始まるので、
-//! 実測した全マッチで offset 1 で全行一致した。`compare` は offset を引数で受けるだけで、既定はツール `replay_inputs` が持つ。
-//! 合わないときの手がかりに、近い offset の一致数を数える（`scan_offsets`）。
+//! 合わせ方は`offset`（`replay_frame = csv_frame + offset`）。
+//! リプレイの記録はネットワークのframe 0の1 tick前から始まるので、実測した全マッチでoffset 1で全行一致した。
+//! `compare`はoffsetを引数で受けるだけ。既定はツール`replay_inputs`が持つ。
+//! 合わないときの手がかりに、近いoffsetの一致数を数える（`scan_offsets`）。
 
 use std::fmt::Write as _;
 
 use crate::replay_decode::{ReplayInputs, StageInputs};
 
-/// dll の `_net_frames.csv` の見出し（dll の書き手 `net_watch::NET_FRAMES_HEADER` と `peer_sim::compare` はこれを参照する）。
-/// ここで使うのは先頭の 4 列だけ。
+/// dllの`_net_frames.csv`のヘッダ（dllの書き手`net_watch::NET_FRAMES_HEADER`と`peer_sim::compare`はこれを参照する）。
+/// ここで使うのは先頭の4列だけ。
 pub const NET_FRAMES_HEADER: &str = "seg,frame,p1,p2,delay,margin_us,wait_us,head_wait_us";
-/// `head_wait_us` を足す前の見出し（7 列。過去のログも読む）。
+/// `head_wait_us`を足す前のヘッダ（7列。過去のログも読む）。
 pub const NET_FRAMES_HEADER_V1: &str = "seg,frame,p1,p2,delay,margin_us,wait_us";
-/// このモジュールが書く CSV の見出し。先頭の 4 列は `_net_frames.csv` と同じ入力ワードの書き方（16 進 4 桁）。
+/// このモジュールが書くCSVのヘッダ。先頭の4列は`_net_frames.csv`と同じ入力ワードの書き方（16進4桁）。
 pub const INPUTS_HEADER: &str = "slot,frame,p1,p2,p3";
 
-/// `_net_frames.csv` の 1 行（比べに使う先頭の 4 列だけ）。
+/// `_net_frames.csv`の1行（比べに使う先頭の4列だけ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetRow {
     pub seg: u16,
@@ -33,14 +36,14 @@ pub struct NetRow {
 pub enum CsvError {
     Empty,
     BadHeader(String),
-    /// `line` 行目（1 始まり。見出しが 1 行目）。
+    /// `line`行目（1始まり。ヘッダが1行目）。
     BadRow {
         line: usize,
         what: &'static str,
     },
 }
 
-/// `_net_frames.csv` を読む。見出しが違えば断る（古い列の並びを黙って読み違えないように）。
+/// `_net_frames.csv`を読む。ヘッダが違えば断る（古い列の並びを黙って読み違えないように）。
 pub fn parse_net_frames(text: &str) -> Result<Vec<NetRow>, CsvError> {
     let mut lines = text.lines().enumerate();
     let cols = match lines.next() {
@@ -84,7 +87,7 @@ pub fn segs(rows: &[NetRow]) -> Vec<u16> {
     v
 }
 
-/// リプレイの全枠を CSV にする（見出し ＋ 枠ごとにフレーム順）。語は 16 進 4 桁。
+/// リプレイの全枠をCSVにする（ヘッダ ＋ 枠ごとにフレーム順）。ワードは16進4桁。
 pub fn inputs_csv(r: &ReplayInputs) -> String {
     let mut s = String::from(INPUTS_HEADER);
     s.push('\n');
@@ -104,10 +107,10 @@ pub fn inputs_csv(r: &ReplayInputs) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Diff {
-    /// csv の行の順（0 始まり）。
+    /// csvの行の順（0始まり）。
     pub row: usize,
     pub csv: NetRow,
-    /// リプレイ側の語（範囲の外なら `None`）。
+    /// リプレイ側のワード（範囲の外なら`None`）。
     pub replay: Option<(u16, u16)>,
 }
 
@@ -115,47 +118,49 @@ pub struct Diff {
 pub struct Comparison {
     pub csv_rows: usize,
     pub replay_frames: usize,
-    /// 1P・2P とも同じだった行（一時停止の押下と止まっていた行は含まない）。
+    /// 1P・2Pとも同じだった行（一時停止の押下と止まっていた行は含まない）。
     pub matched: usize,
-    /// 1P の語が違った行（範囲の外を除く）。
+    /// 1Pのワードが違った行（範囲の外を除く）。
     pub p1_diff: usize,
-    /// 2P の語が違った行（範囲の外を除く）。
+    /// 2Pのワードが違った行（範囲の外を除く）。
     pub p2_diff: usize,
-    /// リプレイのフレームの範囲の外に当たった行（offset が合っていないか、リプレイが短い）。
+    /// リプレイのフレームの範囲の外に当たった行（offsetが合っていないか、リプレイが短い）。
     pub out_of_range: usize,
-    /// 食い違った行の数（`p1_diff` と `p2_diff` は両方違う行を 2 回数えるので、行としてはこちら）。
+    /// 食い違った行の数（`p1_diff`と`p2_diff`は両方違う行を2回数えるので、行としてはこちら）。
     pub mismatched: usize,
-    /// 一時停止の押下の行: csv の語が、リプレイの語に 0x0008 のビットだけを足した形。食い違いに数えない。
+    /// 一時停止の押下の行: csvのワードがリプレイのワードに0x0008のビットだけを足した形。食い違いに数えない。
     /// 止まっていた間の行（`paused_rows`）に入った分は数えない。
     pub pause_press: usize,
     pub pauses: usize,
-    /// 止まっていた間の csv の行（リプレイに対応するフレームが無いので比べない）。
+    /// 止まっていた間のcsvの行（リプレイに対応するフレームが無いので比べない）。
     pub paused_rows: usize,
-    /// csv の終わりの、リプレイの終わりより後の行（比べない。食い違いに数えない）。
+    /// csvの終わりの、リプレイの終わりより後の行（比べない。食い違いに数えない）。
     pub after_end: usize,
     pub first_diff: Option<Diff>,
 }
 
 impl Comparison {
-    /// 全部一致（0 行は「比べられていない」ので一致と言わない）。
+    /// 全部一致かどうか（0行は「比べられていない」ので一致と言わない）。
     pub fn all_match(&self) -> bool {
         self.csv_rows > 0 && self.mismatched == 0
     }
 }
 
-/// 一時停止のキー（入力語の 0x0008。csv では 1P・2P のどちらの語にも出る）。押下の行は csv の語が 0x0008 だけで
-/// リプレイの語は 0（実測）。止まっている間のフレームがリプレイに入らないことの原本は一時停止の旗 `0x004A7ECC`。
+/// 一時停止のキー（入力ワードの0x0008。csvでは1P・2Pのどちらのワードにも出る）。
+/// 押下の行はcsvのワードが0x0008だけでリプレイのワードは0（実測）。
+/// 止まっている間のフレームがリプレイに入らないことの原本は一時停止のフラグ`0x004A7ECC`。
 const PAUSE_BIT: u16 = 0x0008;
-/// 止まっていた区間の後、リプレイと続けて合うことを検証する行数。短いと、0 が続く所で偽の一致を拾う。
+/// 止まっていた区間の後、リプレイと続けて合うことを検証する行数。短いと0が続く所で偽の一致を拾う。
 const RESUME_WINDOW: usize = 120;
-/// 再開のウィンドウの、先頭の `RESUME_MIN_WINDOW` 行より後で違ってよい行数（実物では 0 で足りた）。
+/// 再開のウィンドウで先頭の`RESUME_MIN_WINDOW`行より後に違ってよい行数（実物では0で足りた）。
 const RESUME_TOLERANCE: usize = 5;
 /// これより少ない行しか残っていなければ、再開を検証できないので一時停止とは見なさない。
 const RESUME_MIN_WINDOW: usize = 30;
-/// リプレイが終わった後の csv の行（食い違いに数えない）の上限。リプレイはマッチの終わりで切れるが、ネットワークの列はその後の
-/// 数秒の入力も持つ（実測 119〜176 行）。10 秒 = 600 行を超えるなら offset の誤りやリプレイの欠けを疑って食い違いに数える。
+/// リプレイが終わった後のcsvの行（食い違いに数えない）の上限。
+/// リプレイはマッチの終わりで切れるが、ネットワークの列はその後の数秒の入力も持つ（実測119〜176行）。
+/// 10秒 = 600行を超えるならoffsetの誤りやリプレイの欠けを疑って食い違いに数える。
 const MAX_TAIL_ROWS: usize = 600;
-/// 止まっていた区間の長さの上限（行）。実物は 849・1,017 行（約 14〜17 秒）。1 時間分で打ち切る。
+/// 止まっていた区間の長さの上限（行）。実物は849・1,017行（約14〜17秒）。1時間分で打ち切る。
 const MAX_PAUSE_ROWS: usize = 216_000;
 
 fn replay_word(st: &StageInputs, frame: u32, offset: i64) -> Option<(u16, u16)> {
@@ -169,7 +174,7 @@ enum RowClass {
     Match,
     PausePress,
     Paused,
-    /// csv の終わりの、リプレイの終わりより後の行（`MAX_TAIL_ROWS` まで）。
+    /// csvの終わりの、リプレイの終わりより後の行（`MAX_TAIL_ROWS`まで）。
     AfterEnd,
     OutOfRange,
     Diff {
@@ -187,7 +192,7 @@ fn classify(r: &NetRow, w: Option<(u16, u16)>, mask: u16) -> RowClass {
     if !p1_bad && !p2_bad {
         return RowClass::Match;
     }
-    // 押下: 違う側は「0x0008 だけが csv に多い」形に限る（他のビットも違えば、押下ではなく食い違い）。
+    // 押下: 違う側は「0x0008だけがcsvに多い」形に限る（他のビットも違えば、押下ではなく食い違い）。
     let is_press = |bad: bool, c: u16, rp: u16| {
         !bad || (((c ^ rp) & mask) == (PAUSE_BIT & mask) && (c & PAUSE_BIT & mask) != 0)
     };
@@ -198,10 +203,12 @@ fn classify(r: &NetRow, w: Option<(u16, u16)>, mask: u16) -> RowClass {
     }
 }
 
-/// 一時停止の後の再開を探す。押下の最初の行 `press_start` 以降の行 `p` で止まり、行 `a`（`> mismatch_row`）で再開した、
-/// とする。行 `p` に当たるリプレイの位置 `r` から `RESUME_WINDOW` 行が行 `a` から先の csv と合えば採る。
-/// 0 が続くと止まった行は決まらないので、`p`・`a` の小さい方から採る。`base` は「csv の frame → リプレイの位置」の差
-/// （offset ＋ これまでに止まった分）。返すのは `(p, a, 再開後の base)`。行は連続した frame という前提。
+/// 一時停止の後の再開を探す。
+/// 押下の最初の行`press_start`以降の行`p`で止まり、行`a`（`> mismatch_row`）で再開したと仮定する。
+/// 行`p`に当たるリプレイの位置`r`から`RESUME_WINDOW`行が行`a`から先のcsvと合えば採る。
+/// 0が続くと止まった行は決まらないので`p`・`a`の小さい方から採る。
+/// `base`は「csvのframe → リプレイの位置」の差（offset ＋ これまでに止まった分）。
+/// 返すのは`(p, a, 再開後の base)`。行は連続したframeという前提。
 fn find_resume(
     rows: &[NetRow],
     st: &StageInputs,
@@ -217,13 +224,13 @@ fn find_resume(
         let Ok(ru) = usize::try_from(r) else { continue };
         let a_hi = p.saturating_add(MAX_PAUSE_ROWS).min(n);
         for a in (mismatch_row + 1)..a_hi {
-            // ウィンドウは、csv の残りとリプレイの残りの短い方まで（再開の後にマッチが終わる所まで）。
+            // ウィンドウはcsvの残りとリプレイの残りの短い方まで（再開の後にマッチが終わる所まで）。
             let win = RESUME_WINDOW.min(n - a).min(rep_n.saturating_sub(ru));
             if win < RESUME_MIN_WINDOW {
                 break;
             }
-            // 再開の直後に 1 行でも本当の食い違いがあると、止まり全体が見つからず、その先が全部食い違いになるので、
-            // 先頭の `RESUME_MIN_WINDOW` 行は 1 行も違わず、残りは `RESUME_TOLERANCE` 行まで違ってよいとする。
+            // 再開の直後に1行でも本当の食い違いがあると止まり全体が見つからず、その先が全部食い違いになる。
+            // そのため先頭の`RESUME_MIN_WINDOW`行は1行も違わず、残りは`RESUME_TOLERANCE`行まで違ってよいとする。
             let bad = |q: usize| {
                 (st.p1_inputs[ru + q] & mask) != (rows[a + q].p1 & mask)
                     || (st.p2_inputs[ru + q] & mask) != (rows[a + q].p2 & mask)
@@ -285,7 +292,7 @@ fn tally(
     c
 }
 
-/// 本体。`pause_aware` が偽なら、一時停止を考えない（押下の行も食い違い。`scan_offsets` が使う）。
+/// 本体。`pause_aware`が偽なら一時停止を考えない（押下の行も食い違い。`scan_offsets`が使う）。
 fn compare_inner(
     rows: &[NetRow],
     st: &StageInputs,
@@ -295,10 +302,10 @@ fn compare_inner(
 ) -> Comparison {
     let mut class: Vec<RowClass> = Vec::with_capacity(rows.len());
     let mut pauses = 0usize;
-    // リプレイの位置 = csv の frame + base（止まっていた分だけ base が減る）。
+    // リプレイの位置 = csv の frame + base（止まっていた分だけbaseが減る）。
     let mut base = offset;
     let mut press_start: Option<usize> = None;
-    // 行ごとのリプレイの語（止まっていた行は None）。
+    // 行ごとのリプレイのワード（止まっていた行はNone）。
     let mut replays: Vec<Option<(u16, u16)>> = Vec::with_capacity(rows.len());
     let mut i = 0usize;
     while i < rows.len() {
@@ -349,14 +356,15 @@ fn compare_inner(
     c
 }
 
-/// `rows`（1 つの seg の行）を、リプレイの 1 つの枠と比べる。`mask` は両側に掛けてから比べる。一時停止
-/// （押下の後、リプレイのフレームが進まない区間）は飛ばし、止まっていた区間とその前の押下の行は食い違いに数えない。
+/// `rows`（1つのマッチの行）をリプレイの1つの枠と比べる。`mask`は両側に掛けてから比べる。
+/// 一時停止（押下の後にリプレイのフレームが進まない区間）は飛ばす。
+/// 止まっていた区間とその前の押下の行は食い違いに数えない。
 pub fn compare(rows: &[NetRow], st: &StageInputs, offset: i64, mask: u16) -> Comparison {
     compare_inner(rows, st, offset, mask, true)
 }
 
-/// `-range..=range` の offset ごとの一致数を、多い順（同数なら offset の絶対値が小さい順）に返す。
-/// 一時停止は考えない（601 通りで再開を探すと重いため）。
+/// `-range..=range`のoffsetごとの一致数を多い順（同数ならoffsetの絶対値が小さい順）に返す。
+/// 一時停止は考えない（601通りで再開を探すと重いため）。
 pub fn scan_offsets(rows: &[NetRow], st: &StageInputs, mask: u16, range: i64) -> Vec<(i64, usize)> {
     let mut v: Vec<(i64, usize)> = (-range..=range)
         .map(|o| (o, compare_inner(rows, st, o, mask, false).matched))
@@ -536,7 +544,8 @@ mod tests {
         );
     }
 
-    /// 合成のマッチの k 番目の、ゲームの入力語。0x0008 は含めない。周期を持たない式にして、ずらして合う偽の一致を作らない。
+    /// 合成のマッチのk番目のゲームの入力ワード。0x0008は含めない。
+    /// 周期を持たない式にして、ずらすと合う偽の一致を作らない。
     fn game(k: usize) -> (u16, u16) {
         let k = k as u32;
         let a = (k.wrapping_mul(2_654_435_761) >> 11) as u16 & 0x03F7;
@@ -547,14 +556,14 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Ev {
         Game(usize),
-        /// 一時停止のキーを n フレーム押す。ゲームは進むが csv の語に 0x0008 が付く（リプレイは押下を記録しない）。
-        /// `true` なら 1P。
+        /// 一時停止のキーをnフレーム押す。ゲームは進むがcsvのワードに0x0008が付く（リプレイは押下を記録しない）。
+        /// `true`なら1P。
         Press(usize, bool),
-        /// 止まっている間の n 行（csv だけに入る。途中に 0x0008 の行も混ぜる）。
+        /// 止まっている間のn行（csvだけに入る。途中に0x0008の行も混ぜる）。
         Pause(usize),
     }
 
-    /// `(csv の行, リプレイの入力列)`。リプレイの先頭に `lead` フレームの余分を付ける。
+    /// `(csv の行, リプレイの入力列)`。リプレイの先頭に`lead`フレームの余分を付ける。
     fn synth(plan: &[Ev], lead: usize) -> (Vec<NetRow>, Vec<(u16, u16)>) {
         let mut rows = Vec::new();
         let mut rep: Vec<(u16, u16)> = (0..lead).map(|_| (0, 0)).collect();

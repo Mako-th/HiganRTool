@@ -1,4 +1,4 @@
-//! 配る HiganRTool.dll にバージョン情報を付ける。
+//! 配布用のHiganRTool.dllにバージョン情報を付ける。
 
 use higanr_build_res::{Artifact, FileKind, VersionInfo, emit};
 
@@ -16,8 +16,8 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_os == "windows" && target_env == "msvc" {
-        // std の ProcessPrng（bcryptprimitives.dll）を最初の呼びまで遅らせる。古い Wine で読み込みの時点に落ちないため。
-        // 失敗のフックは higanr_prng_shim（win.rs の install_delay_load_hook!）。
+        // stdのProcessPrng（bcryptprimitives.dll）の読み込みを最初の呼び出しまで遅らせる。古いWineでも読み込み時に失敗しないため。
+        // 遅延読み込みに失敗したときのフックはhiganr_prng_shim（win.rsのinstall_delay_load_hook!）。
         println!(
             "cargo:rustc-link-arg-cdylib=/DELAYLOAD:{}",
             higanr_prng_shim::PRNG_DLL

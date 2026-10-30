@@ -1,9 +1,13 @@
 //! 観戦用の接続コードの候補のアドレスを書き換える（`peer_sim --rewrite-spectate-code`）。
-//! 本物の観戦者の dll（`code_side = spectate`）を、ホストの直の受信ソケットでなく `--shape` の中継越しに接続するためのツール。ホストの dll が書くコードの候補はホストの待ち受けアドレスそのもので、観戦者は候補へ直に JOIN するので、中継を通すには候補を中継のポートに書き換えたコードを観戦者へ渡すしかない。
-//! 読み書きは core の `code::read_spectate` / `code::write_spectate`。検算はコピー間違い用で署名ではない（秘密は本文の中）ので、書き換えて付け直せば観戦者から見て正しいコードになる。session・秘密・名前・期限・種別は元のまま。
-//! 候補は置き換える（足さない）。観戦者は候補の全部へ JOIN を送りどれかから STREAM が来れば固定するので、元の受信ソケットを残すと中継を通らない経路ができ、揺らぎが掛からない。
-//! 候補にするのは中継の「観戦者向けの口」: `--a <ホストの受信ソケット> --b <観戦者の受信ソケット> --via-a X --via-b Y` なら観戦者（B）の宛先は `Y`（`X` だと送り元違いとして捨てられる。`shape::route`）。
-//! 書き換え先は `guard::check_peer` を通ったものだけ。期限切れ・対戦用・壊れたコードは断る（期限は延ばさない）。
+//! 本物の観戦者のdll（`code_side = spectate`）を、ホストの直の受信ソケットでなく`--shape`の中継越しに接続するためのツール。
+//! ホストのdllが書くコードの候補はホストの待ち受けアドレスそのもの。観戦者は候補へ直にJOINするので、中継を通すには候補を中継のポートに書き換えたコードを観戦者へ渡すしかない。
+//! 読み書きはcoreの`code::read_spectate` / `code::write_spectate`。
+//! 検算はコピー間違い用で署名ではない（秘密の乱数は本文の中）。そのため書き換えて付け直せば観戦者から見て正しいコードになる。
+//! session・秘密の乱数・名前・期限・種別は元のまま。
+//! 候補は置き換える（足さない）。
+//! 観戦者は候補の全部へJOINを送りどれかからSTREAMが来れば固定する。元の受信ソケットを残すと中継を通らない経路ができて揺らぎが掛からない。
+//! 候補にするのは中継の観戦者向けのポート。`--a <ホストの受信ソケット> --b <観戦者の受信ソケット> --via-a X --via-b Y`なら観戦者（B）の宛先は`Y`（`X`だと送り元違いとして捨てられる。`shape::route`）。
+//! 書き換え先は`guard::check_peer`を通ったものだけ。期限切れ・対戦用・壊れたコードは断る（期限は延ばさない）。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -63,7 +67,7 @@ pub fn rewrite(
         candidates: Candidates::from_addrs(&[candidate]).map_err(cand_error)?,
         ..c
     };
-    // 書き手が種別を検証するので、対戦用に化けることは無い。
+    // 書き手が種別を検証するので対戦用に化けることは無い。
     debug_assert_eq!(new.side, Side::Spectate);
     // 公開鍵も読んだ値のまま。
     let out = code::write_spectate(&new, &s.host_public)
@@ -77,8 +81,8 @@ pub fn rewrite(
     })
 }
 
-/// ファイルから読んで書き換え、`output` へ書く。出力先がゲームのフォルダの中なら断る。既にあれば `overwrite` が無いと断る。
-/// 末尾は dll の `spectate_code.txt` と同じ CRLF。
+/// ファイルから読んで書き換え、`output`へ書く。出力先がゲームのフォルダの中なら断る。既にあれば`overwrite`が無いと断る。
+/// 末尾はdllの`spectate_code.txt`と同じCRLF。
 pub fn rewrite_files(
     input: &Path,
     output: &Path,
@@ -196,7 +200,7 @@ mod tests {
         );
     }
 
-    /// 検算を付け直さずに本文だけ替えた偽物（末尾 4 B を元のコードのものに戻した形）が `BadCheck` で断られる。
+    /// 検算を付け直さずに本文だけ替えた偽物（末尾4 Bを元のコードのものに戻した形）が`BadCheck`で断られる。
     #[test]
     fn the_check_bytes_depend_on_the_candidate() {
         let src = original(Side::Spectate, &["127.0.0.1:47001"], NOW + 500);
@@ -307,7 +311,7 @@ mod tests {
         let none = d.join("none.txt");
         assert!(rewrite_files(&none, &out3, to, Scope::Loopback, false, NOW).is_err());
         assert!(!out3.exists(), "断ったのに出力を作った");
-        // 合成の空の th09.exe でゲームのフォルダに見立てる。
+        // 合成の空のth09.exeでゲームのフォルダに見立てる。
         let g = d.join("game");
         std::fs::create_dir_all(&g).unwrap();
         std::fs::write(g.join("th09.exe"), b"").unwrap();

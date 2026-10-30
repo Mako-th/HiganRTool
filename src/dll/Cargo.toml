@@ -3,8 +3,12 @@ name = "higanrtool_dll"
 description = "th09.exe に注入される DLL。build.bat が build/bin/HiganRTool.dll へ写す"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "higanrtool"
@@ -18,6 +22,8 @@ dist = []
 
 [dependencies]
 higanr_core = { path = "../core" }
+# WinHTTP で GET を 1 本する（遊んでいる間の新バージョンの知らせの目録の取得。loader も同じものを使う。自作）。
+higanr_http_win = { path = "../http_win" }
 # std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり（古い Wine 向け。自作）。build.rs が /DELAYLOAD を渡す。
 higanr_prng_shim = { path = "../prng_shim" }
 # Win32 の宣言だけ（MIT OR Apache-2.0。dll と loader が使う）。
@@ -44,6 +50,8 @@ higanr_prng_shim = { path = "../prng_shim" }
 # Win32_Networking_WinHttp は WinHttpOpen ほかと WinHttpWebSocket*（部屋サーバーへの WebSocket。OS の TLS とプロキシの設定を
 # そのまま使い、クレートは足さない —— src/dll/src/room_win.rs）に要る。検査の偽サーバーの握手の
 # SHA-1 は、開けてある Win32_Security_Cryptography の BCryptHash。
+# Win32_UI_Input は RegisterRawInputDevices / GetRawInputData ほか（人間 対 人間でキーボード 2 台を 1P・2P に分けるため、どのキーボードが押したかを
+# WM_INPUT で読む。読むだけで、入力を注ぐ API は呼ばない —— src/dll/src/split_kb_win.rs）に要る。
 # Win32_UI_Input_Ime は ImmAssociateContext ほか（部屋名の入力の間だけ、ゲームの窓から IME を切り離して、打った字が変換の途中の
 # 字にならないようにする。ゲームの窓の手続きの差し替え自体は Win32_UI_WindowsAndMessaging の SetWindowLongPtrW /
 # CallWindowProcW。自分のプロセスの窓だけ —— src/dll/src/text_input_win.rs）に要る。
@@ -80,6 +88,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Input",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -96,3 +105,5 @@ higanr_prng_shim = { path = "../prng_shim" }
 png = "0.18.1"
 # 検査だけ: 組み上がりの検査（`src/netplay/loopback.rs`）で、偽の対戦相手を同じプロセスのスレッドで走らせる（自作）。
 peer_sim = { path = "../peer_sim" }
+# 検査だけ: 新バージョンの知らせの検査が、目録に検査用の鍵で署名する（配る dll には入らない）。
+higanr_core = { path = "../core", features = ["test_key"] }

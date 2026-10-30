@@ -1,11 +1,13 @@
-//! リプレイ（`.rpy`）1 本から、枠（Match は枠 9）ごと・フレームごとの 1P / 2P の入力ワードを CSV で出し、dll の `_net_frames.csv` と突き合わせるツール。
+//! リプレイ（`.rpy`）1本から枠（Matchは枠9）ごと・フレームごとの1P / 2Pの入力ワードをCSVで出し、dllの`_net_frames.csv`と突き合わせるツール。
 //!
 //! 使い方: `replay_inputs <リプレイ.rpy> [--out <入力.csv>]` / `replay_inputs <リプレイ.rpy> --compare <_net_frames.csv.gz か .csv> [--seg N] [--slot S] [--offset K] [--mask HEX]`
-//! - `--out` は CSV（`slot,frame,p1,p2,p3`。入力ワードは 16 進 4 桁）をファイルへ（既存の名前は断る）。`--compare` も `--out` も無ければ標準出力へ。
-//! - `--compare`: csv の seg の N 行のうち、リプレイの同じフレームと 1P・2P とも一致した行を数え、最初の不一致を出す。`--seg` は csv に seg が 2 つ以上あるとき、`--slot` は枠が 2 つ以上あるとき必須。
-//!   `--offset K`: リプレイのフレーム = csv の frame + K（既定 `DEFAULT_OFFSET`。合わなければ近い K の一致数を出す）。`--mask HEX`: 両側にこのマスクを掛けてから比べる（既定 FFFF）。
-//! - 一時停止の間のフレームはリプレイに入らず、押下（0x0008）もリプレイでは 0 になる。csv は止まっている間も 1 tick 1 行で進むので、止まった行と再開の行の間は「食い違いでない行」に数える。csv の終わりの、リプレイの終わりより後の行（600 行まで）も数えない。
-//! - 終了コード: 0 = 全行一致（0 行は比べられていないので一致にしない）、1 = 不一致、2 = 使い方・読めない。リプレイは読むだけ。プレイヤー名・日付は出さない。
+//! - `--out`はCSV（`slot,frame,p1,p2,p3`。入力ワードは16進4桁）をファイルへ（既存の名前は断る）。`--compare`も`--out`も無ければ標準出力へ。
+//! - `--compare`: csvのsegのN行のうちリプレイの同じフレームと1P・2Pとも一致した行を数え、最初の不一致を出す。`--seg`はcsvにsegが2つ以上あるとき必須。`--slot`は枠が2つ以上あるとき必須。
+//!   `--offset K`: リプレイのフレーム = csvのframe + K（既定`DEFAULT_OFFSET`。合わなければ近いKの一致数を出す）。`--mask HEX`: 両側にこのマスクを掛けてから比べる（既定FFFF）。
+//! - 一時停止の間のフレームはリプレイに入らない。押下（0x0008）もリプレイでは0になる。
+//! csvは止まっている間も1 tick 1行で進む。そのため止まった行と再開の行の間は「食い違いでない行」に数える。
+//! csvの終わりのうちリプレイの終わりより後の行（600行まで）も数えない。
+//! - 終了コード: 0 = 全行一致（0行は比べられていないので一致にしない）、1 = 不一致、2 = 使い方・読めない。リプレイは読むだけ。プレイヤー名・日付は出さない。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -19,9 +21,9 @@ const USAGE: &str = "使い方:\n  replay_inputs <リプレイ.rpy> [--out <入�
 
 /// これより大きいファイルは読まない（壊れた指定でメモリを食わない）。
 const MAX_FILE: u64 = 64 << 20;
-/// 合わなかったときに一致数を出す offset の幅。記録の開始が 16 tick より前でも見つかるよう、開始の数秒分（300 tick）まで探す。
+/// 合わなかったときに一致数を出すoffsetの幅。開始の数秒分（300 tick）まで探すので記録の開始が16 tickより前でも見つかる。
 const SCAN_RANGE: i64 = 300;
-/// リプレイの記録はネットワークの frame 0 の 1 tick 前から始まる（実測: 実機の複数マッチで offset 1 が全行一致、0 は大量に食い違い）。
+/// リプレイの記録はネットワークのframe 0の1 tick前から始まる（実測: 実機の複数マッチでoffset 1が全行一致、0は大量に食い違い）。
 const DEFAULT_OFFSET: i64 = 1;
 
 #[derive(Debug, Default)]
@@ -31,7 +33,7 @@ struct Args {
     compare: Option<String>,
     seg: Option<u16>,
     slot: Option<u8>,
-    /// 指定が無ければ `DEFAULT_OFFSET`。指定の有無は「--compare の無い --offset」を断るのに使う。
+    /// 指定が無ければ`DEFAULT_OFFSET`。指定の有無は「--compareの無い --offset」を断るのに使う。
     offset: Option<i64>,
     mask: u16,
 }
@@ -205,8 +207,8 @@ fn report(rows: &[NetRow], st: &StageInputs, a: &Args, seg: u16, out: &mut Strin
             top.join(" / ")
         ));
     }
-    // 全行一致のとき、残ったリプレイのフレームは csv が先に終わった分。リプレイはマッチの終わりで切れ、
-    // ネットワークの列はその後の数秒も続くのが普通なので、残りがあれば csv の方が切れている。
+    // 全行一致のとき残ったリプレイのフレームはcsvが先に終わった分。
+    // リプレイはマッチの終わりで切れ、ネットワークの列はその後の数秒も続くのが普通。そのため残りがあればcsvの方が切れている。
     if c.csv_rows > 0 && c.first_diff.is_none() {
         let mapped = (c.csv_rows - c.paused_rows - c.after_end) as i64;
         let left = c.replay_frames as i64 - (offset.max(0) + mapped);
@@ -245,7 +247,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     let Some(csv_path) = &a.compare else {
         return Ok(true);
     };
-    // 平文の CSV も `.csv.gz` も読む。強制終了で切れた gzip は読めた所まで。
+    // 平文のCSVも`.csv.gz`も読む。強制終了で切れたgzipは読めた所まで。
     let t = gzlog::text_from_bytes(read_limited(csv_path)?)
         .map_err(|_| format!("{csv_path} が UTF-8 でない"))?;
     if let Some(note) = t.cut_note(csv_path) {

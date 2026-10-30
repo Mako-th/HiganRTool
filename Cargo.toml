@@ -6,6 +6,7 @@
 #   src/peer_sim bin    -> build/bin/peer_sim.exe (fake opponent)
 #   src/manifest_sign bin -> target/.../manifest_sign.exe (distributor's tool: update manifest key / sign / verify. Not shipped)
 #   src/prng_shim lib   -> used by loader and dll: stand-in for std's ProcessPrng (bcryptprimitives.dll) when its delay load fails (old Wine)
+#   src/http_win lib    -> used by loader and dll: one WinHTTP GET (update manifest / files, new-version notice)
 #   src/replay_fix bin  -> target/dist/.../replay_fix.exe (shipped as HiganRTool_replay_fix.exe: window tool that fixes the charge types of old replays)
 #
 # The target triple and static CRT are set in .cargo/config.toml.
@@ -13,14 +14,20 @@
 
 [workspace]
 resolver = "3"
-members = ["src/core", "src/dll", "src/loader", "src/peer_sim", "src/manifest_sign", "src/replay_fix", "src/build_res", "src/prng_shim"]
+members = ["src/core", "src/dll", "src/loader", "src/peer_sim", "src/manifest_sign", "src/replay_fix", "src/build_res", "src/prng_shim", "src/http_win"]
 
 [workspace.package]
 # 配布のバージョン（zip の名前と、更新の目録の表示名に使う）
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
+# いまのツールチェーン（rustc 1.98.1）。これより古い cargo は建てずに断る
+rust-version = "1.98"
 license = "GPL-3.0-or-later"
 publish = false
+
+[workspace.lints.clippy]
+# unsafe には、なぜ安全かの // SAFETY: を付ける（ゲームのメモリ・Win32 の層）
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 debug = false

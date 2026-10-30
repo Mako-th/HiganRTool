@@ -1,8 +1,8 @@
 //! ツールの画面の言語（日本語・英語）。pure。
 //!
-//! 決まり方は、ini の `[ui] lang`（`auto` / `ja` / `en`）→ `auto` なら OS の UI の言語（`resolve`）。メニューで選んだ値は
-//! ini の `lang` の行へ書き戻す（`set_lang_in_ini_text`）。
-//! ini の読み書きと OS の言語の取得は dll とローダーの仕事で、ここは文字の解釈と選び方、書き換え後の文だけ。
+//! 決まり方はiniの`[ui] lang`（`auto` / `ja` / `en`）の値。`auto`ならOSのUIの言語になる（`resolve`）。
+//! メニューで選んだ値はiniの`lang`の行へ書き戻す（`set_lang_in_ini_text`）。
+//! iniの読み書きとOSの言語の取得はdllとローダーの仕事。ここは文字の解釈と選び方と書き換え後の文だけ。
 //! ログ（本ログ・CSV）は切り替えない。
 
 use crate::ini::Ini;
@@ -17,7 +17,7 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Lang; 2] = [Lang::Ja, Lang::En];
 
-    /// ini とファイルの語（`ja` / `en`）。
+    /// iniとファイルの語（`ja` / `en`）。
     pub const fn word(self) -> &'static str {
         match self {
             Lang::Ja => "ja",
@@ -36,7 +36,7 @@ impl Lang {
         }
     }
 
-    /// Windows の LANGID（`GetUserDefaultUILanguage` の値）から。主言語が日本語（`LANG_JAPANESE` = 0x11）なら日本語、ほかは英語。
+    /// WindowsのLANGID（`GetUserDefaultUILanguage`の値）から。主言語が日本語（`LANG_JAPANESE` = 0x11）なら日本語、ほかは英語。
     pub const fn from_langid(id: u16) -> Lang {
         if id & 0x3FF == 0x11 {
             Lang::Ja
@@ -62,19 +62,20 @@ impl Lang {
     }
 }
 
-/// ini の `[ui] lang` の値。
+/// iniの`[ui] lang`の値。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LangSetting {
-    /// OS の UI の言語に従う（既定）。
+    /// OSのUIの言語に従う（既定）。
     #[default]
     Auto,
     Fixed(Lang),
 }
 
 pub const SECTION: &str = "ui";
-const KEYS: [&str; 1] = ["lang"];
+/// `[ui]`の知っているキー。`status_side`の値は`status_side::from_ini`が見る。
+const KEYS: [&str; 2] = ["lang", crate::status_side::KEY];
 
-/// `[ui]` を読む。節か `lang` が無ければ `Auto`。知らないキー・`auto` / `ja` / `en` 以外の値は断る。
+/// `[ui]`の`lang`を読む。節か`lang`が無ければ`Auto`。知らないキー・`auto` / `ja` / `en`以外の値は断る。
 pub fn setting_in_ini(ini: &Ini) -> Result<LangSetting, String> {
     if !ini.has_section(SECTION) {
         return Ok(LangSetting::Auto);
@@ -96,7 +97,7 @@ pub fn setting_in_ini(ini: &Ini) -> Result<LangSetting, String> {
     }
 }
 
-/// 使う言語。ini が固定していればそれ、`Auto` なら OS の言語。
+/// 使う言語。iniが固定していればそれ、`Auto`ならOSの言語。
 pub fn resolve(ini: LangSetting, os_langid: u16) -> Lang {
     match ini {
         LangSetting::Fixed(l) => l,
@@ -104,10 +105,10 @@ pub fn resolve(ini: LangSetting, os_langid: u16) -> Lang {
     }
 }
 
-/// `[ui]` の `lang` の行の値だけを `lang` の語に替えた ini の文を返す。ほかの行・コメント・空行・行末・先頭の BOM は変えない。
-/// `[ui]` に `lang` が無ければその節の最後のキーの後ろに足し、`[ui]` が無ければ末尾に節ごと足す。足す行の行末は、
-/// 文の最初の行末（CRLF / LF）に合わせる（改行が無い文は CRLF）。`;` `#` で始まる行は節の見出しにも値の行にも数えない
-/// （`ini::parse` と同じ読み方）。
+/// `[ui]`の`lang`の行の値だけを`lang`の語に替えたiniの文を返す。ほかの行・コメント・空行・行末・先頭のBOMは変えない。
+/// `[ui]`に`lang`が無ければその節の最後のキーの後ろに足す。`[ui]`が無ければ末尾に節ごと足す。
+/// 足す行の行末は文の最初の行末（CRLF / LF）に合わせる（改行が無い文はCRLF）。
+/// `;` `#`で始まる行は節のヘッダにも値の行にも数えない（`ini::parse`と同じ読み方）。
 pub fn set_lang_in_ini_text(text: &str, lang: Lang) -> String {
     let nl = match text.find('\n') {
         Some(i) if text[..i].ends_with('\r') => "\r\n",
@@ -183,7 +184,7 @@ pub fn set_lang_in_ini_text(text: &str, lang: Lang) -> String {
     lines.concat()
 }
 
-/// 日本語の文字（かな・カナ・漢字・全角の記号と空白）か。英語の文に日本語が混ざっていないかを見る検査用。
+/// 日本語の文字（かな・カナ・漢字・全角の記号と空白）かどうか。英語の文に日本語が混ざっていないかを見る検査用。
 pub fn is_japanese_char(c: char) -> bool {
     matches!(c, '\u{3000}'..='\u{30FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{FF00}'..='\u{FFEF}')
 }
@@ -192,7 +193,7 @@ pub fn has_japanese(s: &str) -> bool {
     s.chars().any(is_japanese_char)
 }
 
-/// 2 つの言語の同じ文。
+/// 2つの言語の同じ文。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tx {
     pub ja: &'static str,
@@ -207,7 +208,7 @@ impl Tx {
         }
     }
 
-    /// 両方の言語の文字（文字の表に入れる文字を集めるとき）。
+    /// 両方の言語の文字（文字の表に追加する文字を集めるとき）。
     pub const fn both(self) -> [&'static str; 2] {
         [self.ja, self.en]
     }
@@ -263,7 +264,17 @@ mod tests {
         assert!(setting("[ui]\nlang = \n").is_err());
     }
 
-    /// 配る ini と同じ形（コメントの `; [loader]` と `; lang` の行、節の間の空行、[ui] が途中にある）の合成。
+    #[test]
+    fn the_status_side_key_is_known_and_does_not_change_the_language() {
+        assert_eq!(
+            setting("[ui]\nlang = en\nstatus_side = self\n"),
+            Ok(LangSetting::Fixed(Lang::En))
+        );
+        assert_eq!(setting("[ui]\nstatus_side = 2p\n"), Ok(LangSetting::Auto));
+        assert!(setting("[ui]\nstatus_sides = 2p\n").is_err());
+    }
+
+    /// 配布するiniと同じ形（コメントの`; [loader]`と`; lang`の行、節の間の空行、[ui]が途中にある）の合成。
     const DIST_LIKE: &str = "; 設定。; か # で始まる行は読まない。\n\n[netplay]\nenable = 1\n; lang = ja\nname = HiganRTool\n\n[pacing]\nmode = auto\n\n[ui]\n; 言語。auto / ja / en\nlang = auto\n\n; 更新の確認をやめるとき\n; [loader]\n; update_check = 0\n";
 
     fn crlf(s: &str) -> String {
@@ -287,7 +298,7 @@ mod tests {
                 );
             }
         }
-        // 値だけが変わる: 前後の空白・大文字小文字・行末の空白・コメントでない `[ui]` の見出しの書き方はそのまま。
+        // 値だけが変わる: 前後の空白・大文字小文字・行末の空白・コメントでない`[ui]`のヘッダの書き方はそのまま。
         let odd = "[UI]\n  LANG\t=   ja  \n";
         assert_eq!(
             set_lang_in_ini_text(odd, Lang::En),
@@ -323,7 +334,7 @@ mod tests {
             set_lang_in_ini_text(t, Lang::En),
             "[ui]\n; lang = ja\nother = 1\nlang = en\n\n[pad]\npov = 1\n"
         );
-        // 見出しだけの節・末尾に改行の無い節。
+        // ヘッダだけの節・末尾に改行の無い節。
         assert_eq!(
             set_lang_in_ini_text("[ui]\n", Lang::Ja),
             "[ui]\nlang = ja\n"
@@ -352,7 +363,7 @@ mod tests {
             "[netplay]\nenable = 1\n\n[ui]\nlang = en\n"
         );
         assert_eq!(set_lang_in_ini_text("", Lang::En), "[ui]\r\nlang = en\r\n");
-        // コメントの `; [ui]` は節ではない。
+        // コメントの`; [ui]`は節ではない。
         let c = "; [ui]\n; lang = ja\n[pad]\npov = 1\n";
         let out = set_lang_in_ini_text(c, Lang::En);
         assert!(

@@ -1,40 +1,41 @@
-//! 割り当て器（pure）。マッチの中のゲームのスレッドの確保を、DLL が予約した 1 つの領域から配る。
+//! アロケータ（pure）。マッチの中のゲームのスレッドの確保をDLLが予約した1つの領域から割り当てる。
 //!
-//! 自前にする理由: CRT のヒープのままだと、コピーを書き戻してもヒープの「どこが空いているか」は戻らず、書き戻した本体が解放済みの塊を指す。
-//! 確保をこの領域に集め、割り当て器の状態（`ArenaState`）と領域の中身をいっしょにコピーして書き戻せば、確保と解放も巻き戻る（giuroll の「確保を追跡して巻き戻す」考えを参考にした。コードはコピーしていない）。
+//! 自前にする理由: CRTのヒープのままだとコピーを書き戻してもヒープの「どこが空いているか」は戻らない。そのため書き戻した本体が解放済みのブロックを指してしまう。
+//! 確保をこの領域に集める。アロケータの状態（`ArenaState`）と領域の中身をいっしょにコピーして書き戻せば確保と解放も巻き戻る。
+//! giurollの「確保を追跡して巻き戻す」考えを参考にした。コードはコピーしていない。
 //!
-//! - 大きさの級（16 << c バイト。c = 0..CLASSES）ごとの空きの列と、上へ伸ばすだけの `top`。級の中の塊は使い回すだけで、同じ順の確保・解放には必ず同じ位置を返す。
-//! - 塊のヘッダ（16 バイト）は領域の中にある: 印・級・求められた大きさ・4 語目（確保した者の札か、空きの列の次）。札で、比べから外す所を持つ塊を見分ける。
-//! - 解放した塊は、ヘッダの後ろの中身を級の大きさ全部 0 で埋める。ゲームは解放した塊を読まない（推定）ので、前の持ち主の中身が残って「同じ状態なのに中身が違う」と見えるのを消せる。
-//! - 領域の中身には `ArenaMem` を通してだけ触る。失敗は `None` / `Err` で返しパニックしない（ゲームのスレッドの確保の中で呼ばれる）。確保できなければ呼び出し側は CRT へ素通しする。
+//! - サイズクラス（16 << cバイト。c = 0..CLASSES）ごとの空きの列と上へ伸ばすだけの`top`。サイズクラスの中のブロックは使い回すだけ。同じ順の確保・解放には必ず同じ位置を返す。
+//! - ブロックのヘッダ（16バイト）は領域の中にある: 印・サイズクラス・求められた大きさ・4ワード目（確保した者のタグか空きの列の次）。比べから外す所を持つブロックはタグで見分ける。
+//! - 解放したブロックはヘッダの後ろの中身をサイズクラスの大きさ全部0で埋める。ゲームは解放したブロックを読まない（推定）ので前の所有者の中身が残って「同じ状態なのに中身が違う」と見えるのを消せる。
+//! - 領域の中身には`ArenaMem`を通してだけ触る。失敗は`None` / `Err`で返す。パニックしない（ゲームのスレッドの確保の中で呼ばれる）。確保できなければ呼び出し側はCRTへ素通しする。
 
 pub const ALIGN: u32 = 16;
 pub const HEADER: u32 = 16;
-/// 級の数。級 c の中身は `16 << c` バイト（c = 27 で 2 GiB。領域がそれより小さければ `top` の検査で断る）。
+/// サイズクラスの数。サイズクラスcの中身は`16 << c`バイト（c = 27 で2 GiB。領域がそれより小さければ`top`の検査で断る）。
 pub const CLASSES: usize = 28;
 pub const NONE: u32 = u32::MAX;
 
-/// 使っている塊の印（ヘッダの 1 語目）。解放済み・壊れたヘッダと見分けるためだけの値。
+/// 使っているブロックの印（ヘッダの1ワード目）。解放済み・壊れたヘッダと見分けるためだけの値。
 const MAGIC_USED: u32 = 0x5242_5553;
 const MAGIC_FREE: u32 = 0x5242_4546;
 
-// ヘッダの語の位置（塊の先頭からのバイト）。
+// ヘッダのワードの位置（ブロックの先頭からのバイト）。
 const H_MAGIC: u32 = 0;
 const H_CLASS: u32 = 4;
 const H_SIZE: u32 = 8;
-/// 空きの列にある間は列の次、使っている間は札（`alloc_tagged` の `tag`）。同じ語を使うのは、ヘッダの大きさと中身の境界を変えないため。
+/// 空きの列にある間は列の次。使っている間はタグ（`alloc_tagged`の`tag`）。同じワードを使うのはヘッダの大きさと中身の境界を変えないため。
 const H_NEXT: u32 = 12;
 const H_TAG: u32 = H_NEXT;
 
-/// 領域の中身（4 バイトの語で読み書き）。`off` は領域の先頭からのバイトで、4 の倍数・`len` 未満だけを渡す。
+/// 領域の中身（4バイトのワードで読み書き）。`off`は領域の先頭からのバイトで4の倍数・`len`未満だけを渡す。
 // 領域は空にならない。
 #[allow(clippy::len_without_is_empty)]
 pub trait ArenaMem {
     fn len(&self) -> u32;
     fn read(&self, off: u32) -> u32;
     fn write(&mut self, off: u32, v: u32);
-    /// `[off, off + len)` を 0 で埋める（4 の倍数で領域に収まる所だけ）。既定は 1 語ずつの `write`。
-    /// 本物は塊で埋める（ゲームのスレッドで走るので、語ごとの呼び出しを重ねない）。
+    /// `[off, off + len)`を0で埋める（4の倍数で領域に収まる所だけ）。既定は1ワードずつの`write`。
+    /// 本物はまとめて埋める（ゲームのスレッドで走るのでワードごとの呼び出しを重ねない）。
     fn zero(&mut self, off: u32, len: u32) {
         for o in (off..off + len).step_by(4) {
             self.write(o, 0);
@@ -44,24 +45,24 @@ pub trait ArenaMem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockInfo {
-    /// ヘッダの位置。中身の位置は `at + HEADER`。
+    /// ヘッダの位置。中身の位置は`at + HEADER`。
     pub at: u32,
-    /// 中身の級のバイト数（`16 << c`）。
+    /// 中身のサイズクラスのバイト数（`16 << c`）。
     pub payload_bytes: u32,
     pub used: bool,
-    /// 確保のときに求められた大きさ（空きの塊でも残る）。
+    /// 確保時に求められた大きさ（空きのブロックでも残る）。
     pub size: u32,
-    /// 使っている塊の札（空きの塊では `None`）。
+    /// 使っているブロックのタグ（空きのブロックでは`None`）。
     pub tag: Option<u32>,
 }
 
-/// 割り当て器の状態（これと領域の `[0, top)` をコピーすれば、巻き戻せる）。
+/// アロケータの状態（これと領域の`[0, top)`をコピーすれば巻き戻せる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArenaState {
-    /// 次に上へ伸ばす位置。`[top, len)` は一度も配っていない（DLL は 0 のまま保つ）。
+    /// 次に上へ伸ばす位置。`[top, len)`は一度も割り当てていない（DLLは0のまま保つ）。
     pub top: u32,
     pub heads: [u32; CLASSES],
-    /// 使っている塊の数と、その求められた大きさの和。
+    /// 使っているブロックの数とその求められた大きさの和。
     pub live_blocks: u32,
     pub live_bytes: u32,
     /// これまでの確保・解放の回数（巻き戻すと戻る。期間の中の回数を差で取る）。
@@ -81,7 +82,7 @@ impl Default for ArenaState {
 pub enum FreeError {
     Misaligned,
     OutOfRange,
-    /// 二重の解放か、塊でない所。
+    /// 二重の解放かブロックでない所。
     NotInUse,
     BadHeader,
 }
@@ -108,12 +109,12 @@ impl ArenaState {
         }
     }
 
-    /// `size` バイトを配り、中身の位置を返す。領域が足りなければ何も書かず `None`。札は `NONE`。
+    /// `size`バイトを割り当てて中身の位置を返す。領域が足りなければ何も書かず`None`。タグは`NONE`。
     pub fn alloc<M: ArenaMem>(&mut self, mem: &mut M, size: u32) -> Option<u32> {
         self.alloc_tagged(mem, size, NONE)
     }
 
-    /// `alloc` と同じに配り、ヘッダに札 `tag` を入れる（`for_each_used` が返す）。
+    /// `alloc`と同じに割り当ててヘッダにタグ`tag`を書き込む（`for_each_used`が返す）。
     pub fn alloc_tagged<M: ArenaMem>(&mut self, mem: &mut M, size: u32, tag: u32) -> Option<u32> {
         let c = class_of(size)?;
         let block = HEADER.checked_add(class_bytes(c))?;
@@ -123,7 +124,7 @@ impl ArenaState {
             head
         } else {
             if head != NONE {
-                // 列の先頭のヘッダが壊れている（ゲームが塊の外へ書いた）。この列は捨て、上へ伸ばす。
+                // 列の先頭のヘッダが壊れている（ゲームがブロックの外へ書いた）。この列は捨てて上へ伸ばす。
                 self.heads[c] = NONE;
                 self.broken_lists = self.broken_lists.wrapping_add(1);
             }
@@ -145,7 +146,7 @@ impl ArenaState {
         Some(at + HEADER)
     }
 
-    /// 塊を空きの列へ戻し、中身を級の大きさ全部 0 で埋める。ヘッダが合わなければ何も書かずに断る。
+    /// ブロックを空きの列へ戻す。中身はサイズクラスの大きさ全部0で埋める。ヘッダが合わなければ何も書かずに断る。
     pub fn free<M: ArenaMem>(&mut self, mem: &mut M, payload: u32) -> Result<(), FreeError> {
         if !payload.is_multiple_of(ALIGN) || payload < HEADER {
             return Err(FreeError::Misaligned);
@@ -162,7 +163,7 @@ impl ArenaState {
             return Err(FreeError::BadHeader);
         }
         let size = mem.read(at + H_SIZE);
-        // 級の大きさ全部を埋める（求められた大きさの後ろの余りも、使い回されても書かれない）。ヘッダの語は下で書く。
+        // サイズクラスの大きさ全部を埋める（求められた大きさの後ろの余りも、使い回されても書かれない）。ヘッダのワードは下で書く。
         mem.zero(at + HEADER, class_bytes(c));
         mem.write(at + H_MAGIC, MAGIC_FREE);
         mem.write(at + H_NEXT, self.heads[c]);
@@ -173,7 +174,7 @@ impl ArenaState {
         Ok(())
     }
 
-    /// `at` に級 `c` の塊のヘッダがあり、印が `magic` で、塊が `top` の中に収まるか。
+    /// `at`にサイズクラス`c`のブロックのヘッダがあり、印が`magic`でブロックが`top`の中に収まるかどうか。
     fn is_block<M: ArenaMem>(&self, mem: &M, at: u32, c: usize, magic: u32) -> bool {
         if c >= CLASSES || !at.is_multiple_of(ALIGN) {
             return false;
@@ -187,8 +188,9 @@ impl ArenaState {
         end <= self.top && mem.read(at + H_MAGIC) == magic && mem.read(at + H_CLASS) as usize == c
     }
 
-    /// 使っている塊を先頭から順に `f(中身の位置, 求められた大きさ, 札)` で渡す。ヘッダが壊れた塊に当たったらそこで止めて
-    /// `false` を返す（その先は渡さない。比べから外す塊が減るだけで、食い違いを隠す向きには働かない）。
+    /// 使っているブロックを先頭から順に`f(中身の位置, 求められた大きさ, 札)`で渡す。
+    /// ヘッダが壊れたブロックに当たったらそこで止めて`false`を返す。
+    /// その先は渡さない（比べから外すブロックが減るだけで食い違いを隠す向きには働かない）。
     pub fn for_each_used<M: ArenaMem>(&self, mem: &M, mut f: impl FnMut(u32, u32, u32)) -> bool {
         let mut at = 0u32;
         while at < self.top {
@@ -205,8 +207,8 @@ impl ArenaState {
         true
     }
 
-    /// ヘッダの位置 `at` の塊 1 つの情報。`at` が `top` 以上かヘッダが壊れていれば `None`。次のヘッダは `at + HEADER + payload_bytes`。
-    /// 空きの塊では札が列の次と同じ語に置き換わるので `None`。
+    /// ヘッダの位置`at`のブロック1つの情報。`at`が`top`以上かヘッダが壊れていれば`None`。次のヘッダは`at + HEADER + payload_bytes`。
+    /// 空きのブロックではタグが列の次と同じワードに置き換わるので`None`。
     pub fn block_at<M: ArenaMem>(&self, mem: &M, at: u32) -> Option<BlockInfo> {
         if at >= self.top {
             return None;
@@ -300,7 +302,7 @@ mod tests {
         assert_eq!(s.block_at(&m, y.at + HEADER + y.payload_bytes), None);
         assert_eq!(s.block_at(&m, 4), None, "先頭でない位置");
         m.write(HEADER + x.payload_bytes + 4, 99);
-        assert_eq!(s.block_at(&m, y.at), None, "級が壊れた頭");
+        assert_eq!(s.block_at(&m, y.at), None, "サイズクラスが壊れた頭");
     }
 
     #[test]
@@ -308,7 +310,7 @@ mod tests {
         let mut m = VecMem::new(1 << 14);
         let mut s = ArenaState::new();
         let before = s.alloc_tagged(&mut m, 100, 0x11).unwrap();
-        let a = s.alloc_tagged(&mut m, 676, 0xAA).unwrap(); // 級 1024
+        let a = s.alloc_tagged(&mut m, 676, 0xAA).unwrap(); // サイズクラス1024
         let after = s.alloc_tagged(&mut m, 100, 0x22).unwrap();
         for (p, n) in [(before, 128u32), (a, 1024), (after, 128)] {
             for off in (p..p + n).step_by(4) {
@@ -325,7 +327,7 @@ mod tests {
         for off in (a..a + 1024).step_by(4) {
             assert_eq!(m.read(off), 0, "解放した中身の +{} が残っている", off - a);
         }
-        // ヘッダ: 印は空き、級と求められた大きさは残る、4 語目は列の次。
+        // ヘッダ: 印は空き・サイズクラスと求められた大きさは残る・4ワード目は列の次。
         assert_eq!(
             head(&m, a),
             vec![MAGIC_FREE, class_of(676).unwrap() as u32, 676, NONE]
@@ -343,12 +345,12 @@ mod tests {
     fn a_reused_block_shows_nothing_of_the_previous_owner() {
         let mut m = VecMem::new(1 << 14);
         let mut s = ArenaState::new();
-        let a = s.alloc(&mut m, 1000).unwrap(); // 級 1024
+        let a = s.alloc(&mut m, 1000).unwrap(); // サイズクラス1024
         for off in (a..a + 1024).step_by(4) {
             m.write(off, 0x1234_5678);
         }
         s.free(&mut m, a).unwrap();
-        // 同じ級で小さい大きさを求めると、同じ塊が使い回されて全部の語が 0。
+        // 同じサイズクラスで小さい大きさを求めると同じブロックが使い回されて全部のワードが0。
         let b = s.alloc(&mut m, 513).unwrap();
         assert_eq!(b, a, "前提: 同じ塊を使い回す");
         for off in (b..b + 1024).step_by(4) {
@@ -413,7 +415,7 @@ mod tests {
         assert_eq!(class_of(1), Some(0));
         assert_eq!(class_of(16), Some(0));
         assert_eq!(class_of(17), Some(1));
-        assert_eq!(class_of(676), Some(6)); // エフェクトの VM の配列 1 本（0x2A4）は 1024 の級
+        assert_eq!(class_of(676), Some(6)); // エフェクトのVMの配列1本（0x2A4）は1024のサイズクラス
         assert_eq!(class_bytes(6), 1024);
         assert_eq!(class_of(0x8000_0000), Some(27));
         assert_eq!(class_of(0x8000_0001), None);
@@ -457,7 +459,10 @@ mod tests {
         s.free(&mut m, a).unwrap();
         s.free(&mut m, b).unwrap();
         let c = s.alloc(&mut m, 8).unwrap();
-        assert!(c >= top, "小さい級が 1024 の級の列から取った");
+        assert!(
+            c >= top,
+            "小さいサイズクラスが 1024 のサイズクラスの列から取った"
+        );
         let top = s.top;
         assert_eq!(s.alloc(&mut m, 1000), Some(b));
         assert_eq!(s.alloc(&mut m, 513), Some(a));
@@ -499,7 +504,7 @@ mod tests {
         assert_eq!(s.alloc(&mut m, 100), None);
         assert_eq!(s, before);
         assert!(s.alloc(&mut m, 90).is_none());
-        assert!(s.alloc(&mut m, 64).is_some()); // 16 + 64 = 80 で、残り 112 に入る
+        assert!(s.alloc(&mut m, 64).is_some()); // 16 + 64 = 80 で残り112に入る
         assert!(s.top <= 256);
         assert_eq!(s.alloc(&mut m, u32::MAX), None);
     }

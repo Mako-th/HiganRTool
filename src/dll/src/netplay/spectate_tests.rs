@@ -1,6 +1,6 @@
-//! 観戦のリングバッファへの積みの組み上がりの検査（pure）: 選択の画面を持つ偽のゲーム 2 つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク
-//! （`FakeNet`）で接続し、ホスト（A）に観戦のリングバッファを付けて、リングバッファへ書かれた記録が、ゲームが使った語・入った押下・SELECT の結果と食い違わないかを
-//! 見る（`menu_tests::both_sides_walk_the_same_screens` と同じ実行）。
+//! 観戦のリングバッファへの積みの組み上がりの検査（pure）。
+//! 選択の画面を持つ偽のゲーム2つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク（`FakeNet`）で接続する。
+//! ホスト（A）に観戦のリングバッファを付けて、リングバッファへ書かれた記録がゲームが使った語・入った押下・SELECTの結果と食い違わないかを見る（`menu_tests::both_sides_walk_the_same_screens`と同じ実行）。
 use std::sync::Arc;
 
 use higanr_core::wire::{Record, Seat};
@@ -9,7 +9,7 @@ use super::menu_tests::{MenuGame, Run, plans, run_with_ring, run_with_rings, run
 use crate::spectate_ring::{Popped, SpectateRing};
 use crate::spectate_testkit::{expected_selects, fold};
 
-/// `both_sides_walk_the_same_screens` の組（A: ホスト 1P、B: ゲスト 2P。マップの解放が違う）。
+/// `both_sides_walk_the_same_screens`のペア（A: ホスト1P、B: ゲスト2P。マップの解放が違う）。
 fn games() -> (MenuGame, MenuGame) {
     let (pa, pb) = plans();
     let mut a = MenuGame::new(0, pa, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
@@ -18,7 +18,7 @@ fn games() -> (MenuGame, MenuGame) {
     b.chara_cursor = [5, 10];
     a.max_matches = 2;
     b.max_matches = 2;
-    // マッチの中の語を 0 にしない（1P と 2P の語が同じ 0 だと、席の入れ違いが見えない）。両者で違う種にする。
+    // マッチの中の語を0にしない（1Pと2Pの語が同じ0だとサイドの入れ違いが見えない）。両者で違う種にする。
     a.match_words = Some(0xA1);
     b.match_words = Some(0xB2);
     (a, b)
@@ -77,7 +77,7 @@ fn the_ring_holds_exactly_what_the_host_game_used() {
             }
         }
 
-        // SELECT: 止める地点ごとに 1P → 2P の 2 つ。直後が frame 0。共通の欄はホストの値、席ごとの欄は各席の値。
+        // SELECT: 止める地点ごとに1P → 2Pの2つ。直後がframe 0。共通のフィールドはホストの値、サイドごとのフィールドは各サイドの値。
         assert_eq!(f.selects.len(), 2 * r.a.agreed.len(), "{ctx}");
         for (i, rec) in recs.iter().enumerate() {
             if let Record::Select { seat, .. } = rec {
@@ -87,7 +87,7 @@ fn the_ring_holds_exactly_what_the_host_game_used() {
                         "{ctx}: 1P の次が 2P でない"
                     );
                 } else {
-                    // 直後は frame 0 の照合、その次が frame 0。
+                    // 直後はframe 0の照合、その次がframe 0。
                     assert!(
                         matches!(recs.get(i + 1), Some(Record::Check { check, .. }) if check.frame == 0),
                         "{ctx}: SELECT の後が frame 0 の照合でない: {:?}",
@@ -101,7 +101,7 @@ fn the_ring_holds_exactly_what_the_host_game_used() {
                 }
             }
         }
-        // 照合: delay 方式は、約 1 秒ごとのフレームの直前に 1 つ。値は seg の frame 0 からの入力のダイジェスト（検査の対戦はダイジェストの作り方）。
+        // 照合: delay方式は約1秒ごとのフレームの直前に1つ。値はマッチのframe 0からの入力のダイジェスト（検査の対戦ではダイジェストを使う作り方）。
         let mut seg_digest = higanr_core::check::INPUT_DIGEST_INIT;
         let mut want_checks = Vec::new();
         for &(_, frame, p1, p2) in &f.frames {
@@ -193,7 +193,7 @@ fn a_ring_that_overflows_changes_nothing_about_the_match() {
     let steps = |np: &super::NetPlay| np.step_log().iter().map(|s| s.step).collect::<Vec<_>>();
     assert_eq!(steps(&r.npa), steps(&base.npa));
     assert_eq!(r.a.on_input_allocs, 0);
-    // 溢れた後、リングバッファに残ったものは seg の始まりから始まる列だけ（溢れた後の最初の Seg には印が付く）。
+    // 溢れた後にリングバッファに残ったものはマッチの始まりから始まる列だけ（溢れた後の最初のSegにはフラグが付く）。
     let popped = drain(&tiny);
     let marked: Vec<_> = popped.iter().filter(|p| p.after_gap).collect();
     assert!(
@@ -368,7 +368,7 @@ fn the_host_pushes_stats_once_a_second_only_inside_a_match() {
             "{ctx}: ping が 1 度も測れていない（値の欄が空振り）"
         );
 
-        // マッチの外には積まない: 各 Stats は、その seg の SELECT（1P → 2P）の後ろ・次の Seg の前（マッチの語の並びの中）にだけある。
+        // マッチの外には積まない: 各StatsはそのマッチのSELECT（1P → 2P）の後ろ・次のSegの前（マッチの語の並びの中）にだけある。
         let mut selects_in_seg = 0;
         let mut in_stats = 0;
         for rec in &recs {

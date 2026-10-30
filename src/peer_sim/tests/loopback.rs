@@ -1,8 +1,12 @@
-//! 組み上がったものが動くかの検査: 同じプロセスに 2 つの peer_sim を 2 本のスレッドで loopback に立て、ロス無し・決め打ちのロス・固定 seed のロス（落とす・遅らせる・重ねる）で走らせる。部品の検査は `higanr_core` の中にある。
-//! 合格の不変量: 両者が全部の seg を終える（接続 → 選択 → lockstep → BYE(終了)）。両者の (seg, frame, 1P, 2P, delay) の列が一致し、ロス無しの走行の列とも一致する。
-//! 列の先頭（各 seg の最初の切替を使うまで）が、台本のワードから手で組み立てた参照と一致する（両者が同じ誤りをしても、ロスの有無で変わらない誤りでも落ちるように）。
-//! latency の切替の要求が全部受け入れられ、壊し方が本当に効いている（落とした・遅らせた・重ねた数が 0 でない）。
-//! 選択の台本（`menu_*`）: 両者に入った押下の列が台本から手で書いた列と一致し、揃った SELECT が模型の値で、マッチの列が一致する（乱れの下でも）。模型に合わない押下では BYE(取消) でやめる。
+//! 組み上がったものが動くかの検査。
+//! 同じプロセスに2つのpeer_simを2本のスレッドでloopbackに立て、ロス無し・決め打ちのロス・固定seedのロス（落とす・遅らせる・重ねる）で走らせる。
+//! 部品の検査は`higanr_core`の中にある。
+//! 合格の不変量は次のとおり。
+//! 両者が全部のsegを終える（接続 → 選択 → lockstep → BYE(終了)）。
+//! 両者の (seg, frame, 1P, 2P, delay)の列が一致し、ロス無しの走行の列とも一致する。
+//! 列の先頭（各segの最初の切替を使うまで）が、台本のワードから手で組み立てた参照と一致する。両者が同じ誤りをしても、ロスの有無で変わらない誤りでも落ちるようにするため。
+//! latencyの切替の要求が全部受け入れられ、壊し方が本当に効いている（落とした・遅らせた・重ねた数が0でない）。
+//! 選択の台本（`menu_*`）では次を見る。両者に入った押下の列が台本から手で書いた列と一致する。揃ったSELECTが模型の値になる。マッチの列が一致する（乱れの下でも）。模型に合わない押下ではBYE(取消)でやめる。
 
 use std::net::UdpSocket;
 use std::sync::OnceLock;
@@ -24,8 +28,8 @@ use peer_sim::menu_plan;
 use peer_sim::sim::{self, End, LatStep, Rec, Report, SimConfig, SimError};
 use peer_sim::stun_fake::StunFake;
 
-// 観戦の組み上がりの検査。`build.bat` が走らせる `--test loopback --ignored` に載せるため、このファイルの子モジュールにしてある
-// （`tests/` の直下に別のファイルを作ると、`build.bat` に足すまで回らない）。
+// 観戦の組み上がりの検査。`build.bat`が走らせる`--test loopback --ignored`に載せるため、このファイルの子モジュールにしてある。
+// `tests/`の直下に別のファイルを作ると、`build.bat`に足すまで回らない。
 #[path = "loopback/spectate.rs"]
 mod spectate;
 
@@ -34,8 +38,9 @@ const FRAMES: u32 = 150;
 const SEED_A: u64 = 0xA11CE;
 const SEED_B: u64 = 0xB0B;
 
-/// 台 A（nonce が大きいのでホスト。席は 2P —— 役割と席をわざと入れ違いにして、1P / 2P の並べ違いを見えるようにする）と
-/// 台 B（ゲスト、1P）の設定。希望 latency は 2 と 3 なので、始めの delay は 3。
+/// 台Aの設定。nonceが大きいのでホストで、サイドは2P。役割とサイドをわざと入れ違いにして、1P / 2Pの並べ違いが見えるようにする。
+/// 台Bの設定。ゲストで1P。
+/// 希望latencyは2と3なので、始めのdelayは3。
 fn configs(fa: FaultConfig, fb: FaultConfig) -> (SimConfig, SimConfig, UdpSocket, UdpSocket) {
     let sa = UdpSocket::bind("127.0.0.1:0").expect("loopback に bind できる");
     let sb = UdpSocket::bind("127.0.0.1:0").expect("loopback に bind できる");
@@ -56,9 +61,9 @@ fn configs(fa: FaultConfig, fb: FaultConfig) -> (SimConfig, SimConfig, UdpSocket
         poll_ms: 1,
         segs: SEGS,
         frames_per_seg: FRAMES,
-        // 読み込みの長さを両者で違えて、先に読み込みを終えた側の INPUT を相手が読み込み中に受ける形にする。
+        // 読み込みの長さを両者で違える。先に読み込みを終えた側のINPUTを相手が読み込み中に受ける形にする。
         load_ms: 30,
-        // seg 0 で 3 → 5（増やす）、seg 1 で 5 → 1（減らす）。seg をまたいで delay を引き継ぐ形も通る。
+        // seg 0で3 → 5（増やす）。seg 1で5 → 1（減らす）。segをまたいでdelayを引き継ぐ形も通る。
         lat_script: vec![
             LatStep {
                 seg: 0,
@@ -145,10 +150,10 @@ fn assert_pair_ok(ra: &Report, rb: &Report, tag: &str) {
     }
 }
 
-/// 台本のワードから手で組み立てた参照と、各 seg の最初の切替を使うフレームまでを比べる。比べた数を返す。
-/// 切替を使うまでは delay がその seg の始めの値 d のまま（使ったフレームの後の delay で見分ける）なので、フレーム f のワードは
-/// capture_frame f − d で取ったもの（f < d なら両者とも 0）。切替を使うフレームそのもの（delay が変わった行）も、
-/// 取ったのは古い d のときなので同じ式で比べられる。
+/// 台本のワードから手で組み立てた参照と、各segの最初の切替を使うフレームまでを比べる。比べた数を返す。
+/// 切替を使うまではdelayがそのsegの始めの値dのまま。使ったフレームの後のdelayで見分ける。
+/// そのためフレームfのワードは capture_frame f − d で取ったもの（f < d なら両者とも0）。
+/// 切替を使うフレームそのもの（delayが変わった行）も、取ったのは古いdのときなので同じ式で比べられる。
 fn check_reference(recs: &[Rec]) -> usize {
     let mut checked = 0;
     let mut start = 3u8;
@@ -186,12 +191,11 @@ fn lossless_pair_finishes_and_matches_reference() {
     let (ra, rb) = baseline();
     assert_pair_ok(ra, rb, "ロス無し");
     let n = check_reference(&ra.recs);
-    // seg 0 は切替を使う 43 フレーム目まで（40 + 3）、seg 1 は 65 フレーム目まで（60 + 5）。
+    // seg 0は切替を使う43フレーム目まで（40 + 3）。seg 1は65フレーム目まで（60 + 5）。
     assert_eq!(n, 44 + 66, "参照と比べた数");
     for (r, who) in [(ra, "A"), (rb, "B")] {
-        // CHECK はフレーム 0, 30, 60, 90, 120 の seg ごとに 5 回（2 seg で 10 回）。ロス無しなら全部比べる。読み込みの短い側が
-        // 次の seg の frame 0 の CHECK を、相手がまだ前の seg の最後の数フレームにいる間に送っても、相手は seg + 1 の値として
-        // 持っておく（`check.rs`）。
+        // CHECKはフレーム0, 30, 60, 90, 120のsegごとに5回（2 segで10回）。ロス無しなら全部比べる。
+        // 読み込みの短い側が次のsegのframe 0のCHECKを送ることがある。そのとき相手がまだ前のsegの最後の数フレームにいても、相手は seg + 1 の値として持っておく（`check.rs`）。
         assert_eq!(r.check_matches, 10, "{who}");
         assert_eq!(r.check_dropped, 0, "{who}");
         assert_eq!(r.end, End::Finished { peer_bye: true }, "{who}");
@@ -270,8 +274,8 @@ fn random_loss_seed_2_matches_lossless_run() {
     assert_eq!(ra.recs, baseline().0.recs, "ロス無しの走行と食い違う");
 }
 
-/// 付いていく側（`follow`）と、決めたフレーム数で seg を終える側（先に立つ側）を接続する。
-/// 先に立つ側は latency を切り替えない（付いていく形の条件。`sim.rs` のモジュール doc）。
+/// 付いていく側（`follow`）と、指定のフレーム数でsegを終える側（先に立つ側）を接続する。
+/// 先に立つ側はlatencyを切り替えない（付いていく形の条件。`sim.rs`のモジュールdoc）。
 fn run_follow(follower_is_host: bool, ff: FaultConfig, poll_ms: u32) -> (Report, Report) {
     let (mut lead, mut fol, sl, sf) = configs(FaultConfig::default(), ff);
     fol.poll_ms = poll_ms;
@@ -294,9 +298,10 @@ fn run_follow(follower_is_host: bool, ff: FaultConfig, poll_ms: u32) -> (Report,
     (rl, rf)
 }
 
-/// `follower_sends_drop` は付いていく側の送りを落とす実行。そのときは付いていく側の BYE(終了) が、最初の 1 通も先に立つ側の
-/// PING への返し（`LINGER_MS` の間の 2〜3 回）も全部落ちることがあり、先に立つ側は 60 秒の沈黙で `Finished { peer_bye: false }` に
-/// なる。付いていく側は相手の BYE を受けてから閉じるので、いつも `peer_bye: true`。
+/// `follower_sends_drop`は付いていく側の送信を落とす実行。
+/// そのときは付いていく側のBYE(終了)が、最初の1通も先に立つ側のPINGへの返答（`LINGER_MS`の間の2〜3回）も全部落ちることがある。
+/// 全部落ちると先に立つ側は60秒の沈黙で`Finished { peer_bye: false }`になる。
+/// 付いていく側は相手のBYEを受けてから閉じるので、いつも`peer_bye: true`。
 fn assert_follow_ok(rl: &Report, rf: &Report, tag: &str, follower_sends_drop: bool) {
     let sum = |r: &Report| peer_sim::record::summary(r);
     assert_eq!(
@@ -355,8 +360,9 @@ fn follower_ends_each_seg_where_the_leader_does() {
     assert!(rf.faults.dropped > 100, "{:?}", rf.faults);
 }
 
-/// 先に立つ側（自分の時計で進む。dll の役）と、付いていく側（`--follow`。実機の検証の peer_sim の役）を delay 2 で接続し、
-/// 付いていく側の送りを全部 `one_way_ms` だけ遅らせる。先に立つ側の stall は、付いていく側のワードが枠に間に合わなかった数。
+/// 先に立つ側（自分の時計で進む。dllの役）と、付いていく側（`--follow`。実機の検証のpeer_simの役）をdelay 2で接続する。
+/// 付いていく側の送信を全部`one_way_ms`だけ遅らせる。
+/// 先に立つ側のstallは、付いていく側のワードが枠に間に合わなかった数。
 fn run_lagging_follower(one_way_ms: u32) -> (Report, Report) {
     let (mut lead, mut fol, sl, sf) = configs(
         FaultConfig::default(),
@@ -384,7 +390,7 @@ fn run_lagging_follower(one_way_ms: u32) -> (Report, Report) {
 
 const LAG_FRAMES: u32 = 180;
 
-/// 一定の遅れの実行で、両者が終え、列が一致し、両者の RTT が片道の遅れ `n` ms を含むこと。
+/// 一定の遅れの実行で両者が終え、列が一致し、両者のRTTが片道の遅れ`n` msを含むこと。
 fn assert_lag_ok(rl: &Report, rf: &Report, n: u32) {
     let sum = |r: &Report| peer_sim::record::summary(r);
     for (r, who) in [(rl, "先"), (rf, "付")] {
@@ -395,9 +401,9 @@ fn assert_lag_ok(rl: &Report, rf: &Report, n: u32) {
             sum(r)
         );
         assert_eq!(r.delay_start, Some(2), "{n} ms {who}");
-        // RTT は片道の遅れ（付いていく側の送り）を 1 回だけ含む: 先に立つ側の PING への PONG、付いていく側の PING。上は 1 ms ごとの取り出しと
-        // 送り出しの間隔の分で、枠は広めの 60 ms（別の建て直しが走る負荷の下で 30 ms だと落ちた）。遅れが両向きに掛かる壊れ方（RTT が 2 倍）は
-        // 120 ms の実行で捕まえる（240 ms になり枠 120〜180 の外）。
+        // RTTは片道の遅れ（付いていく側の送信）を1回だけ含む。先に立つ側のPINGへのPONGと、付いていく側のPINGが該当する。
+        // 上限は1 msごとの取り出しと送り出しの間隔の分で、枠は広めの60 msにしてある（別のビルドが走る負荷の下では30 msだと落ちた）。
+        // 遅れが両向きに掛かる壊れ方（RTTが2倍）は120 msの実行で捕まえる（240 msになり枠120〜180の外）。
         let rtt = r.rtt_ms.expect("PONG が返った");
         assert!((n..=n + 60).contains(&rtt), "{n} ms {who}: RTT {rtt} ms");
     }
@@ -410,8 +416,9 @@ fn assert_lag_ok(rl: &Report, rf: &Report, n: u32) {
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn one_way_delay_beyond_the_delay_window_stalls_the_leader() {
-    // 下: 付いていく側のワードは枠に間に合う。stall は OS のスレッドの起床の遅れの分だけで、枠は 180 フレームのうち 30 まで。上の側（120 ms）は半分（90）以上を
-    // 求めるので両者は離れている。遅れが両向きに掛かる壊れ方は RTT の枠が捕まえる。
+    // 下: 付いていく側のワードは枠に間に合う。stallはOSのスレッドの起床の遅れの分だけ。枠は180フレームのうち30まで。
+    // 上の側（120 ms）は半分（90）以上を求める。そのため両者は離れている。
+    // 遅れが両向きに掛かる壊れ方はRTTの枠が捕まえる。
     let (rl, rf) = run_lagging_follower(20);
     assert_lag_ok(&rl, &rf, 20);
     assert!(
@@ -420,8 +427,8 @@ fn one_way_delay_beyond_the_delay_window_stalls_the_leader() {
         rl.stalls,
         peer_sim::record::summary(&rl)
     );
-    // 上: 4 フレーム（delay 2 ＋ 2）ごとに 120 ms 以上かかるので、枠の半分以上が stall する（実測で 180 フレームのうち 180）。
-    // 下限は余裕を見て 4 分の 1。
+    // 上: 4フレーム（delay 2 ＋ 2）ごとに120 ms以上かかるので枠の半分以上がstallする（実測で180フレームのうち180）。
+    // 下限は余裕を見て4分の1。
     let (rl, rf) = run_lagging_follower(120);
     assert_lag_ok(&rl, &rf, 120);
     assert!(
@@ -460,8 +467,8 @@ fn pair_at_240_fps_plays_on_the_faster_frame() {
         assert_eq!(r.end, End::Finished { peer_bye: true }, "{who}\n{s}");
         assert_eq!(r.fps, 240);
         assert!(s.contains("★検査用: ペース 240 fps"), "{s}");
-        // 経過 = 接続と選択（数十 ms）＋ マッチ ＋ 終わりの待ち（`LINGER_MS`）。マッチは 240 fps で 2 秒（stall で延びる）、
-        // 60 fps なら 8 秒。
+        // 経過 = 接続と選択（数十ms）＋ マッチ ＋ 終わりの待ち（`LINGER_MS`）。
+        // マッチは240 fpsで2秒（stallで延びる）。60 fpsなら8秒。
         let play_ms = r.elapsed_ms.saturating_sub(sim::LINGER_MS);
         assert!(
             (2_000..6_000).contains(&play_ms),
@@ -477,7 +484,7 @@ fn pair_at_240_fps_plays_on_the_faster_frame() {
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn run_refuses_non_loopback_peer_before_sending() {
     let (mut ca, _, sa, _sb) = configs(FaultConfig::default(), FaultConfig::default());
-    // 理由の文: 範囲の外は範囲の名前（`run` は既定の loopback）を、意味の無いアドレスは「どの範囲でも」を言う。
+    // 理由の文には、範囲の外なら範囲の名前（`run`は既定のloopback）を出し、意味の無いアドレスなら「どの範囲でも」と出す。
     for (p, why) in [
         ("192.0.2.1:9", "scope = loopback"),
         ("[::ffff:127.0.0.1]:9", "どのネットワークの範囲でも"),
@@ -490,8 +497,8 @@ fn run_refuses_non_loopback_peer_before_sending() {
             other => panic!("{p}: 断らなかった: {:?}", other.map(|r| r.end)),
         }
     }
-    // 対照: 同じ設定で宛先だけ loopback にすると断らない（ガードが全部を断っているのではない）。相手がいないので接続できないが、
-    // 打ち切りを短くして実行を始めることだけを見る。
+    // 対照: 同じ設定で宛先だけloopbackにすると断らない（ガードが全部を断っているのではない）。
+    // 相手がいないので接続できない。打ち切りを短くして実行を始めることだけを見る。
     ca.peer = "127.0.0.1:9".parse().unwrap();
     ca.max_ms = 50;
     let r = sim::run(&ca, sa).expect("loopback の宛先は断らない");
@@ -503,8 +510,8 @@ fn run_refuses_non_loopback_peer_before_sending() {
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_going_silent_after_connecting_ends_with_disconnect() {
-    // B の送りを 120 通目の後から全部落とす（接続してマッチに入った後。ロス無しの走行で B が送るのは全部で 350 通ほど、
-    // 接続と選択は数十通で済む）。
+    // Bの送信を120通目の後から全部落とす（接続してマッチに入った後）。
+    // ロス無しの走行でBが送るのは全部で350通ほどで、接続と選択は数十通で済む。
     let fb = FaultConfig {
         drop_after: 120,
         ..FaultConfig::default()
@@ -573,8 +580,8 @@ B（{} ms）: {sb}",
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn unanswered_peer_times_out_in_handshake() {
-    // B は A へ何も届けない（100% 落とす）。A は何も受けないので「1 通も届かない」、B は A の HELLO を受けて役割を決めるが、
-    // 返しが全部落ちるので「届いたが接続できない」。
+    // BはAへ何も届けない（100%落とす）。Aは何も受けないので「1通も届かない」になる。
+    // BはAのHELLOを受けて役割を決めるが、返答が全部落ちるので「届いたが接続できない」になる。
     let fb = FaultConfig {
         drop_pct: 100,
         ..FaultConfig::default()
@@ -659,8 +666,8 @@ fn deadline_sends_one_finished_bye_and_the_follower_closes() {
     cb.frames_per_seg = 5;
     cb.max_ms = 20_000;
     let stop = Arc::new(AtomicBool::new(false));
-    // バージョン 5: BYE は封じた便なので、中継（ネットワーク）からは理由が読めない。ヘッダの type（平文）で数えるだけにし、理由は B の終わり方
-    // （相手の BYE(終了) を受けて閉じた）で見る。
+    // バージョン5: BYEは封じたパケットなので、中継（ネットワーク）からは理由が読めない。
+    // ヘッダのtype（平文）で数えるだけにして、理由はBの終わり方（相手のBYE(終了)を受けて閉じた）で見る。
     let byes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let relay_thread = {
         let (stop, byes) = (stop.clone(), byes.clone());
@@ -711,10 +718,10 @@ fn deadline_sends_one_finished_bye_and_the_follower_closes() {
         "試合に入る前に打ち切った（検査の前提が崩れた）"
     );
     assert_eq!(byes.lock().unwrap().len(), 1, "A が出した BYE の数");
-    // B は相手の BYE(終了) を受けて閉じた（60 秒の沈黙で切れたのではない —— それなら `Dead` で 63 秒を越える）。
+    // Bは相手のBYE(終了)を受けて閉じた（60秒の沈黙で切れたのではない —— それなら`Dead`で63秒を越える）。
     assert_eq!(rb.end, End::Finished { peer_bye: true }, "{}", sum(&rb));
     assert!(rb.elapsed_ms < 9_000, "{}\n{}", rb.elapsed_ms, sum(&rb));
-    // 使ったフレームの列は、短い方の長さまで一致する（打ち切りの時点で相手のワードがどこまで届いていたかで長さが違う）。
+    // 使ったフレームの列は短い方の長さまで一致する（打ち切りの時点で相手のワードがどこまで届いていたかで長さが違う）。
     let n = ra.recs.len().min(rb.recs.len());
     assert!(n > 0);
     assert_eq!(ra.recs[..n], rb.recs[..n], "列が食い違う");
@@ -722,16 +729,17 @@ fn deadline_sends_one_finished_bye_and_the_follower_closes() {
 
 // ================= fault matrix =================
 
-/// 攻撃者の送る毒（1 組）。`key` は本物の鍵（「本物のパケットを途中で書き換えた」形を作るためだけに使う）。
-/// 返すのは (宛先, 攻撃者のポートから送るか（false は候補にないポートから）, バイト列, 種類)。
+/// 攻撃者が送る不正な入力（1グループ）。`key`は本物の鍵（「本物のパケットを途中で書き換えた」形を作るためだけに使う）。
+/// 返すのは (宛先, 攻撃者のポートから送るか（falseは候補にないポートから）, バイト列, 種類)。
 fn poison_set(
     key: &AuthKey,
     sid: u32,
     a: std::net::SocketAddr,
     b: std::net::SocketAddr,
 ) -> Vec<(std::net::SocketAddr, bool, Vec<u8>)> {
-    // バージョン 5: 攻撃者は接続コードの秘密を知っていても、使い捨ての鍵（向きごとの鍵）は知らない。HMAC の便（HELLO）は本物を作れるので、
-    // それを途中で書き換えた形を毒にし、封じる便（PING）は当て推量の鍵で封じる。
+    // バージョン5: 攻撃者は接続コードの秘密の乱数を知っていても、使い捨ての鍵（向きごとの鍵）は知らない。
+    // HMACつきのパケット（HELLO）は本物を作れるので、それを途中で書き換えた形を不正な入力にする。
+    // 封じるパケット（PING）は当て推量の鍵で封じる。
     let mut buf = [0u8; MAX_DATAGRAM];
     let hello = Message::Hello(wire::Hello {
         proto_ver: wire::PROTO_VER,
@@ -853,8 +861,8 @@ fn fault_matrix_over_loopback_drops_poisons_and_matches_lossless_run() {
         "fault matrix: 毒 {rounds} 組 / 攻撃者のアドレスに届いた HELLO {} / A {a:?} / B {b:?}",
         hellos_at_atk.load(Ordering::Relaxed)
     );
-    // 走行が終わった後に届いた毒は数えられないので、下限で見る（送った組の数の半分以上 —— 走行の長さの大半）。種類ごとに、
-    // 数えた先が取り違えられていないこと（例: 改ざんを decode_errors に数えていない）も見る。
+    // 走行が終わった後に届いた不正な入力は数えられないので、下限で見る（送ったグループの数の半分以上 —— 走行の長さの大半）。
+    // 種類ごとに、数えた先が取り違えられていないこと（例: 改ざんをdecode_errorsに数えていない）も見る。
     assert!(
         a.bad_tag >= 3 * rounds / 2,
         "A の bad_tag {a:?}（{rounds} 組）"
@@ -929,8 +937,8 @@ fn a_peer_behind_a_moved_port_connects_by_learning_the_source() {
 
 // ================= 選択の台本（`--menu`） =================
 //
-// 台 A はホスト 1P、台 B はゲスト 2P（dll がホスト 1P、peer_sim がゲスト 2P の実機の形）。両者とも選択の台本で押し、
-// 7 → 6（選択の外）→ 7 → 8 → 16 を通ってから、決めたフレーム数のマッチ（lockstep）に入る。
+// 台Aはホスト1P、台Bはゲスト2P（dllがホスト1P、peer_simがゲスト2Pの実機の形）。
+// 両者とも選択の台本で押す。7 → 6（選択の外）→ 7 → 8 → 16を通ってから、指定のフレーム数のマッチ（lockstep）に入る。
 
 const MENU_HOST: &str = "\
 screen=7 press=cancel                    # step 0: 難易度の画面の取消で選択の外へ（両者とも）
@@ -948,10 +956,11 @@ screen=8 word=0x44 hold=5                # LEFT+SHIFT
 screen=8 wait=180 press=decide cursor=9  # step 5: 2P が決める（ホストの step 4 より十分後）
 ";
 
-/// 両者に入るはずの押下の列 (step, kind, value, screen)。value はプロトコルの行の形から手で書いた（キャラ: bit0 = 席、bit1 = Shift、
-/// bit2〜5 = カーソル。合わせ: 難易度 = カーソル、マップ = 一覧の値。ホストの peer_sim が出す値は `menu_plan::SIM_ALIGN_*`）。
-/// 難易度とマップの画面に入るたび（選択の外から入り直した 7 も、16 へ移った後も）、その画面の最初の押下より先にホストの合わせが
-/// 1 つ入る。キャラ選択（8）は合わせない。
+/// 両者に入るはずの押下の列 (step, kind, value, screen)。
+/// valueはプロトコルの行の形から手で書いた。キャラは bit0 = サイド、bit1 = Shift、bit2〜5 = カーソル。
+/// 合わせは、難易度がカーソル、マップが一覧の値。ホストのpeer_simが出す値は`menu_plan::SIM_ALIGN_*`。
+/// 難易度とマップの画面に入るたびに、その画面の最初の押下より先にホストの合わせが1つ入る。選択の外から入り直した7も、16へ移った後も同じ。
+/// キャラ選択（8）は合わせない。
 fn menu_expected_presses() -> Vec<(u16, StepKind, u8, u8)> {
     use StepKind::{Align as A, Cancel as C, Decide as D};
     vec![
@@ -959,10 +968,10 @@ fn menu_expected_presses() -> Vec<(u16, StepKind, u8, u8)> {
         (1, C, 0, 7),
         (2, A, 2, 7),
         (3, D, 3, 7),
-        (4, D, 0x08, 8), // 1P・カーソル 2
-        (5, C, 0x00, 8), // 1P の取消（カーソル 0）
-        (6, D, 0x1E, 8), // 1P・Shift・カーソル 7
-        (7, D, 0x25, 8), // 2P・カーソル 9
+        (4, D, 0x08, 8), // 1P・カーソル2
+        (5, C, 0x00, 8), // 1Pのキャンセル（カーソル0）
+        (6, D, 0x1E, 8), // 1P・Shift・カーソル7
+        (7, D, 0x25, 8), // 2P・カーソル9
         (8, A, 14, 16),
         (9, D, 15, 16),
     ]
@@ -981,7 +990,7 @@ fn run_menu_pair(fa: FaultConfig, fb: FaultConfig) -> (Report, Report) {
         c.load_ms = 0;
         c.max_ms = 40_000;
     }
-    // 初期ライフを違えて、相手の SELECT が自分の席の値として届いたかを見分ける。
+    // 初期ライフを違えて相手のSELECTが自分のサイドの値として届いたかを見分ける。
     cb.life = 3;
     let pa = menu_plan::parse(MENU_HOST).expect("ホストの台本が読める");
     let pb = menu_plan::parse(MENU_GUEST).expect("ゲストの台本が読める");
@@ -1016,7 +1025,7 @@ fn assert_menu_ok(ra: &Report, rb: &Report, tag: &str) {
     assert_eq!(got, menu_expected_presses(), "{tag}");
     assert_eq!(ra.presses, rb.presses, "{tag}: 両者の押下の列が違う");
 
-    // 揃った SELECT。キャラはカーソル → キャラの表から手で引いた値: カーソル 7 → 0x0E、カーソル 9 → 0x07。違うキャラなので色は Shift のまま。
+    // 揃ったSELECT。キャラはカーソル → キャラの表から手で調べた値: カーソル7 → 0x0E、カーソル9 → 0x07。違うキャラなので色はShiftのまま。
     let aa = ra.agreed.expect("A の SELECT が揃った");
     let ab = rb.agreed.expect("B の SELECT が揃った");
     for ag in [&aa, &ab] {
@@ -1046,9 +1055,9 @@ fn assert_menu_ok(ra: &Report, rb: &Report, tag: &str) {
     assert_eq!((mb.done, mb.items), (4, 4), "{tag}");
     assert_eq!((ma.left_to_mode, mb.left_to_mode), (1, 1), "{tag}");
     assert_eq!((ma.selections, mb.selections), (2, 2), "{tag}");
-    // ゲストは、画面の合わせが届いてから要求するので、ホストがまだ来ていない間の要求が捨てられて押し直す形は起きない。押し直しの数は
-    // 見ない: 機械が混んでフレームが遅れると、ホストの押下が同じ step を先に取ってゲストの要求が捨てられる（ホストを採る決まり）
-    // ことがあり、数は実行ごとに変わる。押し直しの働きは `menu_plan` の単体検査が見る。
+    // ゲストは画面の合わせが届いてから要求する。そのためホストがまだ来ていない間の要求が捨てられて押し直す形は起きない。
+    // 押し直しの数は見ない。マシンの負荷が高くてフレームが遅れると、ホストの押下が同じstepを先に取ってゲストの要求が捨てられることがある（ホストを採る決まり）。そのため数は実行ごとに変わる。
+    // 押し直しの働きは`menu_plan`の単体検査が見る。
     assert_eq!(ma.retries, 0, "{tag}: ホストは押し直しを数えない");
     for m in [ma, mb] {
         let md = m.model.expect("模型");
@@ -1068,8 +1077,8 @@ fn assert_menu_ok(ra: &Report, rb: &Report, tag: &str) {
             "{tag}"
         );
     }
-    // MENU のワード: キャラの画面は合わせないので、ゲストのワード（B）もホストのワード（A）も、1P の決定（step 4）の前の step 4 の間に
-    // 相手へ届く。画面を移るビットは落ちている。
+    // MENUのワード: キャラの画面は合わせないので、ゲストのワード（B）もホストのワード（A）も、1Pの決定（step 4）の前のstep 4の間に相手へ届く。
+    // 画面を移るビットは落ちている。
     assert!(
         ma.remote_words.contains(&(4, 0x44)),
         "{tag}: {:?}",
@@ -1263,8 +1272,9 @@ fn jittered_one_way_delay_keeps_both_sequences_equal() {
 
 // ================= 遅延とロスを揺らす中継（`--shape`） =================
 //
-// 本物の花映塚 2 台（dll 同士）の間に挟む中継を、peer_sim 2 本の間に挟んで見る。両者は乱れなしで、中継だけが向きごとに別の乱数で
-// 落とす・遅らせる・重ねる・一定の遅れを掛ける。両者は相手を中継のポート（`via_a` / `via_b`）として見る。
+// 本物の花映塚2台（dll同士）の間に挟む中継を、peer_sim 2本の間に挟んで試す。
+// 両者には乱れを掛けない。中継だけが向きごとに別の乱数で落とす・遅らせる・重ねる・一定の遅れを掛ける。
+// 両者は相手を中継のポート（`via_a` / `via_b`）として見る。
 
 fn relay_faults(seed: u64) -> FaultConfig {
     FaultConfig {
@@ -1296,7 +1306,7 @@ fn run_pair_via_relay(
         b2a,
         max_sec: 120,
     };
-    // A の相手は中継の A 向けのポート、B の相手は B 向けのポート（dll の ini の peer と同じ向き）。
+    // Aの相手は中継のA向けのポート、Bの相手はB向けのポート（dllのiniのpeerと同じ向き）。
     ca.peer = args.via_a;
     cb.peer = args.via_b;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1342,15 +1352,15 @@ fn relay_with_lag_and_loss_keeps_lockstep_and_checks_equal() {
             "{dir}: 乱れが効いていない {c:?}"
         );
         assert_eq!((c.foreign, c.send_errors), (0, 0), "{dir}: {c:?}");
-        // 出したコピーは「受けた − 落とした + 重ねた」を越えない（落とした通を出していれば越える）。下は、止めた時点で遅れの途中だったコピー
-        // （最後の数十 ms の送り）の分だけ少ない。
+        // 出したコピーは「受けた − 落とした + 重ねた」を越えない（落とした通を出していれば越える）。
+        // 下側は、止めた時点で遅れの途中だったコピー（最後の数十msの送信）の分だけ少ない。
         let expect = c.received - c.dropped + c.dupped;
         assert!(
             c.emitted <= expect && expect - c.emitted <= 15,
             "{dir}: 出した数が合わない（期待 {expect}）{c:?}"
         );
     }
-    // 中継が受けた通数は、両者が送った通数とほぼ同じ（終わりの数 ms に相手の最後の送りを読み切らずに止まる分だけ少ない）。
+    // 中継が受けた通数は両者が送った通数とほぼ同じ（終わりの数msに相手の最後の送信を読み切らずに止まる分だけ少ない）。
     for (got, sent, who) in [
         (rr.a2b.received, ra.counts.sends, "A"),
         (rr.b2a.received, rb.counts.sends, "B"),
@@ -1393,8 +1403,9 @@ fn relay_dropping_only_b_to_a_leaves_a_deaf_and_b_unanswered() {
 
 // ================= rollback のモード（`--mode rollback`） =================
 //
-// 取り決めで rollback に決まった 2 本を、揺らぐ遅れとロスの中継（`--shape`）越しに接続する。latency の切替の台本は持たない
-// （rollback のモードでは切替を出さない）。確定した列は、同じ語の delay 方式（delay = D）の列と同じはず。
+// 取り決めでrollbackに決まった2本を、揺らぐ遅れとロスの中継（`--shape`）越しに接続する。
+// latencyの切替の台本は持たない（rollbackのモードでは切替を出さない）。
+// 確定した列は、同じワードのdelay方式（delay = D）の列と同じはず。
 
 fn run_mode_pair_via_relay(
     a2b: FaultConfig,
@@ -1452,8 +1463,8 @@ fn run_mode_pair_via_relay_sync(
     (ra, rb, rr)
 }
 
-/// delay が seg を通して `d` のままの実行の参照（台本のワードから手で組み立てる。切替が無いので全部の行を見る）。
-/// ホスト（A）は 2P、ゲスト（B）は 1P。フレーム f のワードは capture_frame f − d で取ったもの（f < d なら 0）。
+/// delayがマッチの間ずっと`d`のままの実行の参照（台本のワードから手で組み立てる。切替が無いので全部の行を見る）。
+/// ホスト（A）は2P、ゲスト（B）は1P。フレームfのワードは capture_frame f − d で取ったもの（f < d なら0）。
 fn assert_fixed_delay_reference(recs: &[Rec], d: u8, tag: &str) {
     let d32 = u32::from(d);
     let mut n = 0;
@@ -1486,8 +1497,8 @@ fn assert_fixed_delay_reference(recs: &[Rec], d: u8, tag: &str) {
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn rollback_pair_over_a_jittering_relay_confirms_the_same_rows() {
-    // 向きごとに片道 20 ms ＋ コピー 1 通ごとに 0〜30 ms の揺らぎ ＋ 2 % のロス（`relay_faults`）。D = 1（17 ms）より長い片道なので、
-    // 相手のワードはたいてい間に合わず予測で進む。
+    // 向きごとに片道20 ms ＋ コピー1通ごとに0〜30 msの揺らぎ ＋ 2 %のロス（`relay_faults`）。
+    // D = 1（17 ms）より長い片道なので相手のワードはたいてい間に合わず予測で進む。
     let (ra, rb, rr) = run_mode_pair_via_relay(
         relay_faults(21),
         relay_faults(22),
@@ -1516,9 +1527,9 @@ fn rollback_pair_over_a_jittering_relay_confirms_the_same_rows() {
             SEGS * FRAMES
         );
     }
-    // 予測と進め直しは、少なくとも片方で本当に起きた（揺らぎを掛けないと 0 のまま通る）。両方ではない: 読み込みの短い A
-    // （`configs` の load_ms 30 と 250）が先に seg に入り、R まで先へ進んだまま止まり止まり走るので、B には A のワードがいつも先に届く。
-    // 時刻合わせで揃うが、片道 20 ms は D = 1（17 ms）より長いので、揃った後も予測は残る。
+    // 予測と進め直しは、少なくとも片方で本当に起きた（揺らぎを掛けないと0のまま通る）。
+    // 両方ではない。読み込みの短いA（`configs`のload_ms 30と250）が先にsegに入り、Rまで先へ進んだまま停止と再開を繰り返しながら走る。そのためBにはAのワードがいつも先に届く。
+    // 時刻合わせで揃うが片道20 msは D = 1（17 ms）より長いので、揃った後も予測は残る。
     let (sa, sb) = (ra.rollback.unwrap(), rb.rollback.unwrap());
     assert!(
         sa.live_predicted + sb.live_predicted > 0
@@ -1614,17 +1625,16 @@ fn rollback_wish_against_a_delay_peer_plays_delay() {
     assert_fixed_delay_reference(&ra.recs, 3, "delay に落ちた");
 }
 
-// ================= 付いていく形の rollback のモード（`--follow --mode rollback`） =================
+// ================= 付いていく形のrollbackのモード（`--follow --mode rollback`） =================
 //
-// seg の長さを決める側（`--frames`。dll の役）と、付いていく側（`--follow`。実機の検証の peer_sim の役）を、両者が rollback を望んで
-// 接続する。壊すのは付いていく側の送りだけ（決める側から付いていく側への向きは dll → peer_sim の向きで、delay 方式の付いていく形の
-// 検査もそうしている）。
+// segの長さを決める側（`--frames`。dllの役）と、付いていく側（`--follow`。実機の検証のpeer_simの役）が、両者ともrollbackを望んで接続する。
+// 壊すのは付いていく側の送信だけ。決める側から付いていく側への向きはdll → peer_simの向きで、delay方式の付いていく形の検査もそうしている。
 
 struct RbFollow {
-    /// 付いていく側をホストにするか（役と席の入れ違い）。
+    /// 付いていく側をホストにするかどうか（役とサイドの入れ違い）。
     follower_is_host: bool,
     lead_frames: u32,
-    /// 決める側の読み込みの長さ（次の seg の INPUT が最後のワードより後に届く間隔）。
+    /// 決める側の読み込みの長さ（次のsegのINPUTが最後のワードより後に届く間隔）。
     lead_load_ms: u32,
     ff: FaultConfig,
 }
@@ -1645,8 +1655,8 @@ fn run_rollback_follow(o: &RbFollow) -> (Report, Report) {
     if o.follower_is_host {
         std::mem::swap(&mut lead.role_nonce, &mut fol.role_nonce);
     }
-    // 決める側は時刻合わせを切る: 先へ進めて（R まで）予測させ、seg の最後のフレームの更新が予測になる形を作る（そうでない実行では、
-    // 決める側が seg の最後を待つ間に次のフレームを取る不具合を通り抜ける）。
+    // 決める側は時刻合わせを切る。先へ進めて（Rまで）予測させ、segの最後のフレームの更新が予測になる形を作る。
+    // そうでない実行では、決める側がsegの最後を待つ間に次のフレームを取る不具合を見逃す。
     let lead_opts = sim::RunOpts {
         mode: ModeWish::rollback(1),
         time_sync: false,
@@ -1663,8 +1673,9 @@ fn run_rollback_follow(o: &RbFollow) -> (Report, Report) {
     (rl, rf)
 }
 
-/// 両者が終え、確定の列が一致し、台本のワードから手で組んだ参照（D = 1。決める側 = A = 2P・SEED_A、付いていく側 = 1P・SEED_B）と一致し、付いていく側が次の seg の INPUT で 2 回 seg を進めたこと。
-/// `lead_holds` は、決める側が「最後のフレームの更新を予測で進めて待ち、確定して seg を出た」数（`Stats::holds_ended`）の下限。この形の判定は、決める側のスレッドが約 13 ms 遅れると最後のフレームの待ちが出ない実行があるので、ここでは行わず `run_rb_follow_until_shape` が実行し直しで行う（表明は緩めない）。
+/// 両者が終えること。確定の列が一致すること。確定の列が台本のワードから手で組んだ参照（D = 1。決める側 = A = 2P・SEED_A、付いていく側 = 1P・SEED_B）と一致すること。付いていく側が次のsegのINPUTで2回segを進めたこと。
+/// `lead_holds`は、決める側が「最後のフレームの更新を予測で進めて待ち、確定してsegを出た」数（`Stats::holds_ended`）の下限。
+/// この形の判定はここでは行わない。決める側のスレッドが約13 ms遅れると最後のフレームの待ちが出ない実行があるので、`run_rb_follow_until_shape`が実行し直しで行う（表明は緩めない）。
 fn assert_rb_follow_ok(
     rl: &Report,
     rf: &Report,
@@ -1729,8 +1740,8 @@ fn assert_rb_follow_ok(
         "{tag}"
     );
     assert_eq!(rl.follow, None);
-    // CHECK は seg ごとに 30 フレームおき（0, 30, …）。付いていく側の CHECK も確定の列から作るので全部合う。数えるのは付いていく側だけ:
-    // 決める側は、遅れて届く付いていく側の最後の CHECK を待たずに終えることがある。
+    // CHECKはsegごとに30フレームおき（0, 30, …）。付いていく側のCHECKも確定の列から作るので全部合う。
+    // 数えるのは付いていく側だけ。決める側は、遅れて届く付いていく側の最後のCHECKを待たずに終えることがある。
     assert_eq!(
         rf.check_matches,
         RB_FOLLOW_SEGS * frames.div_ceil(30),
@@ -1751,9 +1762,9 @@ fn assert_rb_follow_ok(
 
 const RB_FOLLOW_ATTEMPTS: u32 = 3;
 
-/// `run_rollback_follow` を、決める側が全部の seg の最後のフレームを予測で更新して待つ形（`holds_ended >= RB_FOLLOW_SEGS`）が出るまで
-/// 最大 `RB_FOLLOW_ATTEMPTS` 回走らせる。毎回の実行で `assert_rb_follow_ok` と `extra`（行の一致以外の表明）を全部チェックする。
-/// 3 回とも足りなければ 3 回分の holds_* を出して落とす。
+/// `run_rollback_follow`を最大`RB_FOLLOW_ATTEMPTS`回走らせる。決める側が全部のsegの最後のフレームを予測で更新して待つ形（`holds_ended >= RB_FOLLOW_SEGS`）が出るまで繰り返す。
+/// 毎回の実行で`assert_rb_follow_ok`と`extra`（行の一致以外の表明）を全部チェックする。
+/// 3回とも足りなければ3回分のholds_* を出して落とす。
 fn run_rb_follow_until_shape(o: &RbFollow, tag: &str, extra: impl Fn(&Report, &Report)) {
     let mut seen: Vec<String> = Vec::new();
     for attempt in 1..=RB_FOLLOW_ATTEMPTS {
@@ -1778,7 +1789,7 @@ fn run_rb_follow_until_shape(o: &RbFollow, tag: &str, extra: impl Fn(&Report, &R
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn rollback_follower_ends_each_seg_where_the_leader_does() {
-    // 片道 40 ms の遅れ（付いていく側の送りだけ）で、決める側は相手のワードを待たずに先へ進み、seg の最後を予測で更新する。
+    // 片道40 msの遅れ（付いていく側の送信だけ）で決める側は相手のワードを待たずに先へ進み、segの最後を予測で更新する。
     let slow = FaultConfig {
         one_way_ms: 40,
         ..FaultConfig::default()

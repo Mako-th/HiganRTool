@@ -1,4 +1,4 @@
-//! 画面の状態。Win32 にもファイルにも触らない（ウィンドウは `win`、ファイルは `work` と `scan`）。
+//! 画面の状態。Win32にもファイルにも触らない（ウィンドウは`win`、ファイルは`work`と`scan`）。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use higanr_core::replay::Side;
 use higanr_core::replay_rewrite::{FixPlan, PlanError};
 
-/// チャージ型。見出しの 1 バイト（0 = slow / 1 = charge。`th09.cfg` と同じ）。
+/// チャージ型。ヘッダの1バイト（0 = slow / 1 = charge。`th09.cfg`と同じ）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Slow,
@@ -44,7 +44,7 @@ impl Kind {
     }
 }
 
-/// (1P, 2P) の型。
+/// (1P, 2P)の型。
 pub type Pair = (Kind, Kind);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,18 +53,18 @@ pub enum Player {
     P2,
 }
 
-/// 出力先のフォルダ名。`<1P の型>-<2P の型>`（例 `slow-charge` は 1P = slow・2P = charge）。
+/// 出力先のフォルダ名。`<1P の型>-<2P の型>`（例`slow-charge`は 1P = slow・2P = charge）。
 pub fn pair_dir_name(pair: Pair) -> String {
     format!("{}-{}", pair.0.name(), pair.1.name())
 }
 
-/// `slow-charge` の形を読む（`pair_dir_name` の逆）。
+/// `slow-charge`の形を読む（`pair_dir_name`の逆）。
 pub fn parse_pair(s: &str) -> Option<Pair> {
     let (a, b) = s.split_once('-')?;
     Some((Kind::from_name(a)?, Kind::from_name(b)?))
 }
 
-/// 出力先のフォルダ名（4 通り）と同じ名前か。たどるときに読まない（作ったコピーをもう一度直すと戻ってしまう）。
+/// 出力先のフォルダ名（4通り）と同じ名前かどうか。たどるときに読まない（作ったコピーをもう一度直すと戻ってしまう）。
 pub fn is_pair_dir(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|s| parse_pair(&s.to_ascii_lowercase()).is_some())
@@ -73,15 +73,15 @@ pub fn is_pair_dir(name: &OsStr) -> bool {
 /// 直したコピーをまとめるフォルダの名前。
 pub const FIX_DIR: &str = "fix_replay";
 
-/// `fix_replay`（大文字小文字は区別しない）か。たどるときに読まない。
+/// `fix_replay`（大文字小文字は区別しない）かどうか。たどるときに読まない。
 pub fn is_fix_dir(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|s| s.eq_ignore_ascii_case(FIX_DIR))
 }
 
 /// 直したコピーの出力先: `<元のフォルダの1つ上>\fix_replay\<元のフォルダ名>\<1P の型>-<2P の型>\<同じ名前>`。
-/// 1つ上が無いとき（ドライブの直下など）は `<元のフォルダ>\fix_replay\<型>-<型>\<名前>`。
-/// 元が `fix_replay` の下にあるときは `fix_replay\fix_replay` を作らず、元のフォルダの中に型のフォルダを作る。
+/// 1つ上が無いとき（ドライブの直下など）は`<元のフォルダ>\fix_replay\<型>-<型>\<名前>`。
+/// 元が`fix_replay`の下にあるときは`fix_replay\fix_replay`を作らない。元のフォルダの中に型のフォルダを作る。
 /// どの場合も元のファイルとは別の場所になる。
 pub fn output_path(src: &Path, pair: Pair) -> Option<PathBuf> {
     let name = src.file_name()?;
@@ -97,31 +97,31 @@ pub fn output_path(src: &Path, pair: Pair) -> Option<PathBuf> {
     Some(root.join(pair_dir_name(pair)).join(name))
 }
 
-/// 1 本のリプレイを調べた結果。
+/// 1本のリプレイを調べた結果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Analysis {
     Fixable(Fixable),
-    /// 印に `charge` がある（新しいバージョンで保存した／直し済み）。
+    /// 印に`charge`がある（新しいバージョンで保存した／直し済み）。
     Recorded,
-    /// HiganRTool が保存したリプレイではない（印が無い・読めない）。
+    /// HiganRToolが保存したリプレイではない（印が無い・読めない）。
     NoMark,
-    /// ゲームのメニューから保存したリプレイ（HiganRTool の印はあるが、直す対象ではない）。
+    /// ゲームのメニューから保存したリプレイ（HiganRToolの印はあるが、直す対象ではない）。
     MenuMark,
-    /// 見出しの値が 0 / 1 のどちらでもない。
+    /// ヘッダの値が0 / 1のどちらでもない。
     OddValue(u8, u8),
     Unreadable(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fixable {
-    /// 保存した人の側。観戦者のリプレイは `None`。
+    /// 保存した人の側。観戦者のリプレイは`None`。
     pub side: Option<Side>,
-    /// (1P, 2P) の名前（表示用に整えたもの）。
+    /// (1P, 2P)の名前（表示用に整えたもの）。
     pub names: (String, String),
     pub current: Pair,
 }
 
-/// 名前は印から来る任意の文字列なので、制御文字を空白に替えてウィンドウに出せる形にする。
+/// 名前は印から来る任意の文字列なので制御文字を空白に替えてウィンドウに出せる形にする。
 fn clean_name(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -177,7 +177,7 @@ pub struct Entry {
     pick: Option<Pair>,
 }
 
-/// 読み込んだリプレイの並びと、いま見ている 1 本。調べるのは見るときだけ（フォルダに数千本あっても開くのが遅くならない）。
+/// 読み込んだリプレイの並びと、いま見ている1本。調べるのは見るときだけ（フォルダに数千本あっても開くのが遅くならない）。
 #[derive(Debug)]
 pub struct Session {
     entries: Vec<Entry>,
@@ -185,7 +185,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// 空なら `None`。
+    /// 空なら`None`。
     pub fn new(paths: Vec<PathBuf>) -> Option<Session> {
         if paths.is_empty() {
             return None;
@@ -211,7 +211,7 @@ impl Session {
         self.entries.is_empty()
     }
 
-    /// 0 始まり。
+    /// 0始まり。
     pub fn index(&self) -> usize {
         self.index
     }
@@ -240,7 +240,7 @@ impl Session {
         }
     }
 
-    /// いまの 1 本をまだ調べていなければ `analyze` で調べる。最初の直す値は、リプレイに入っている値。
+    /// いまの1本をまだ調べていなければ`analyze`で調べる。最初の直す値は、リプレイに入っている値。
     pub fn ensure_analyzed(&mut self, analyze: impl FnOnce(&Path) -> Analysis) {
         let e = &mut self.entries[self.index];
         if e.analysis.is_none() {
@@ -263,7 +263,7 @@ impl Session {
         }
     }
 
-    /// いまの 1 本の「直した後の設定」。直せないリプレイでは `None`。
+    /// いまの1本の「直した後の設定」。直せないリプレイでは`None`。
     pub fn pick(&self) -> Option<Pair> {
         self.entries[self.index].pick
     }
@@ -330,7 +330,7 @@ mod tests {
                 "th9_ud0008.rpy"
             ])
         );
-        // 1P と 2P を入れ替えると別のフォルダになる。
+        // 1Pと2Pを入れ替えると別のフォルダになる。
         assert_ne!(dst, output_path(&src, (Kind::Slow, Kind::Charge)).unwrap());
         assert_ne!(dst, src);
         assert_eq!(output_path(Path::new(""), (Kind::Slow, Kind::Slow)), None);
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn output_without_a_parent_folder_uses_fix_replay_inside_the_folder() {
         let pair = (Kind::Slow, Kind::Charge);
-        // 元のフォルダに 1 つ上が無い（相対パスでファイル名だけ）。
+        // 元のフォルダに1つ上が無い（相対パスでファイル名だけ）。
         assert_eq!(
             output_path(Path::new("a.rpy"), pair),
             Some(p(&["fix_replay", "slow-charge", "a.rpy"]))
@@ -349,7 +349,7 @@ mod tests {
             output_path(Path::new("C:\\a.rpy"), pair),
             Some(p(&["C:\\", "fix_replay", "slow-charge", "a.rpy"]))
         );
-        // 1 つ上が「空の親」でも、元のフォルダ名は残す。
+        // 1つ上が「空の親」でも、元のフォルダ名は残す。
         assert_eq!(
             output_path(&p(&["Alice", "a.rpy"]), pair),
             Some(p(&["fix_replay", "Alice", "slow-charge", "a.rpy"]))

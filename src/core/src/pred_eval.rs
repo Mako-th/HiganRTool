@@ -1,22 +1,27 @@
-//! rollback の「相手の入力ワードの予測」を、ゲームを動かさずに人の入力の記録で採点する部品（ツール `pred_eval` が使う）。
+//! rollbackの「相手の入力ワードの予測」をゲームを動かさずに人の入力の記録で採点する部品（ツール`pred_eval`が使う）。
 //!
-//! 採点のしかた（`rollback.rs` の `predicted_word` との対応）:
-//! - 片道 k tick・入力の遅れ D のとき、相手のフレーム f の入力ワードは tick f − D に取られて tick f − D + k に届く。フレーム f を進める tick f に確定しているのは f − m まで（m = max(k − D, 0)）なので、`predicted_word` の予測は幅 m の「m フレーム前の語の繰り返し」と同じ。
-//! - 見える状態は、確定した最新の語（c = t − m）の後の m フレームを予測の語で進めたもの。tick ごとにウィンドウ（c+1..=t）の予測をその tick の確定の最新から引き直す（`post_present` の進め直しと同じ）。
-//! - 外れ: tick t で使った予測（ウィンドウの最後の語）が本物の語と違う。見た目のずれ: ウィンドウの予測の語と本物の語で位置を積分した差。
+//! 採点のしかた（`rollback.rs`の`predicted_word`との対応）:
+//! - 片道k tick・入力の遅れDのとき相手のフレームfの入力ワードはtick f − D に取られてtick f − D + k に届く。
+//!   フレームfを進めるtick fに確定しているのは f − m まで（m = max(k − D, 0)）。
+//!   そのため`predicted_word`の予測は幅mの「mフレーム前のワードの繰り返し」と同じ。
+//! - 見える状態は確定した最新のワード（c = t − m）の後のmフレームを予測のワードで進めたもの。
+//!   tickごとにウィンドウ（c+1..=t）の予測をそのtickの確定済みの最新から生成し直す（`post_present`の進め直しと同じ）。
+//! - 外れ: tick tで使った予測（ウィンドウの最後のワード）が本物のワードと違う。
+//! - 見た目のずれ: ウィンドウの予測のワードと本物のワードで位置を積分した差。
 //!
-//! 予測の方法 `Predictor` はゲームスレッドで動かせる形（確保なし・固定の大きさの配列と整数だけ。`tests/alloc_check.rs` で検証する）。
-//! 採点側の `eval_stream` / `Pool` はツールの側で、ヒープと浮動小数を使う。語は `WORD_MASK`（送る語。`input_model::SEND_MASK`）を掛けて渡す。
+//! 予測の方法`Predictor`はゲームスレッドで動かせる形（確保なし・固定の大きさの配列と整数だけ。`tests/alloc_check.rs`で検証する）。
+//! 採点側の`eval_stream` / `Pool`はツール側でヒープと浮動小数を使う。
+//! ワードには`WORD_MASK`（送るワード。`input_model::SEND_MASK`）を掛けて渡す。
 
 use crate::input_model::SEND_MASK;
 use crate::pad_dirs::{DIR_DOWN, DIR_LEFT, DIR_MASK, DIR_RIGHT, DIR_UP};
 
-/// 採点する語のマスク。ネットワークで送る語と同じ。
+/// 採点するワードのマスク。ネットワークで送るワードと同じ。
 pub const WORD_MASK: u16 = SEND_MASK;
-/// 予測の幅の上限（rollback の `MAX_AHEAD`）。
+/// 予測の幅の上限（rollbackの`MAX_AHEAD`）。
 pub const MAX_M: usize = 16;
 
-/// 低速のビット（`0x0004`。入力語のビット）。
+/// 低速のビット（`0x0004`。入力ワードのビット）。
 const BIT_SLOW: u16 = 0x0004;
 const UP: u16 = DIR_UP as u16;
 const DOWN: u16 = DIR_DOWN as u16;
@@ -24,15 +29,15 @@ const LEFT: u16 = DIR_LEFT as u16;
 const RIGHT: u16 = DIR_RIGHT as u16;
 const DIRS: u16 = DIR_MASK as u16;
 
-/// 位置を積分するときの 1 フレームあたりの移動量（px）。16 キャラの高速 3.0〜5.5・低速 1.8〜3.5 の中ほどの代表値
-/// （霊夢・咲夜は高速 4.0、霊夢・メルランは低速 2.0）。出典はゲームの `plNN.sht` の実バイト。
+/// 位置を積分するときの1フレームあたりの移動量（px）。16キャラの高速3.0〜5.5・低速1.8〜3.5の中ほどの代表値
+/// （霊夢・咲夜は高速4.0、霊夢・メルランは低速2.0）。出典はゲームの`plNN.sht`の実バイト。
 pub const SPEED_FAST: f64 = 4.0;
 pub const SPEED_SLOW: f64 = 2.0;
-/// 斜めは 1 軸ぶんが 縦横 × sin(π/4)（合成の移動量が縦横と同じ。`0x0041BBF7`〜 が読み込み直後に上書きする）。
+/// 斜めは1軸ぶんが 縦横 × sin(π/4)（合成の移動量が縦横と同じ。`0x0041BBF7`〜 が読み込み直後に上書きする）。
 /// 画面の端での止まりは考えない（ずれが大きめに出る）。
 const DIAGONAL: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
-/// 語 1 つで 1 フレームに動く量 (dx, dy)。左右・上下の同時押しは打ち消す。
+/// ワード1つで1フレームに動く量 (dx, dy)。左右・上下の同時押しは打ち消す。
 pub fn velocity(w: u16) -> (f64, f64) {
     let dx = i32::from(w & RIGHT != 0) - i32::from(w & LEFT != 0);
     let dy = i32::from(w & DOWN != 0) - i32::from(w & UP != 0);
@@ -45,16 +50,17 @@ pub fn velocity(w: u16) -> (f64, f64) {
     (f64::from(dx) * speed * k, f64::from(dy) * speed * k)
 }
 
-/// 予測の方法。確定した語を 1 つずつ `observe` で受け、直近の確定の後 m フレーム先までの語を `predict` で出す。
+/// 予測の方法。確定したワードを1つずつ`observe`で受け取る。
+/// 直近の確定の後mフレーム先までのワードを`predict`で出す。
 pub trait Predictor {
-    /// 履歴（直近の語）だけ捨てる。学習した表は残す（別のマッチへ移るとき）。
+    /// 履歴（直近のワード）だけ捨てる。学習した表は残す（別のマッチへ移るとき）。
     fn reset_stream(&mut self);
     fn observe(&mut self, w: u16);
-    /// `out[i]` = 直近の確定の i+1 フレーム先の語。`out[..m]` だけ書く（m は `MAX_M` まで）。
+    /// `out[i]` = 直近の確定のi+1フレーム先のワード。`out[..m]`だけ書く（mは`MAX_M`まで）。
     fn predict(&self, m: usize, out: &mut [u16; MAX_M]);
 }
 
-/// P0: 直前の確定の語の繰り返し（いまの `predicted_word`）。何も無ければ 0。
+/// P0: 直前の確定のワードの繰り返し（いまの`predicted_word`）。何も無ければ0。
 #[derive(Clone, Default)]
 pub struct Repeat {
     last: u16,
@@ -72,7 +78,8 @@ impl Predictor for Repeat {
     }
 }
 
-/// P1: ビットごとに直近 3 語の多数決（1 フレームだけの揺れを無視する）。2 語しか無いときは同数なら直前の語に従う。
+/// P1: ビットごとに直近3ワードの多数決（1フレームだけの揺れを無視する）。
+/// 2ワードしか無いときは同数なら直前のワードに従う。
 #[derive(Clone, Default)]
 pub struct Majority3 {
     hist: [u16; 3],
@@ -105,7 +112,7 @@ impl Predictor for Majority3 {
     }
 }
 
-/// P4: 直前の語の繰り返し。ただし `keep` フレームより先の予測では方向のビットを離す（押し続けは長く続かないという賭け）。
+/// P4: 直前のワードの繰り返し。ただし`keep`フレームより先の予測では方向のビットを離す（押し続けは長く続かないという想定）。
 #[derive(Clone)]
 pub struct FarRelease {
     last: u16,
@@ -136,15 +143,17 @@ impl Predictor for FarRelease {
     }
 }
 
-/// `RunHazard` の連続の長さの上限（これ以上は同じ扱い）。
+/// `RunHazard`の連続の長さの上限（これ以上は同じ扱い）。
 const RUN_CAP: usize = 31;
-/// 表の 1 マスの数がこれを超えたら両方を半分にする（古い癖を忘れる）。
+/// 表の1マスの数がこれを超えたら両方を半分にする（古い癖を忘れる）。
 const COUNT_LIMIT: u16 = 8192;
 /// この回数に満たない状態では「変わらない」と見る（学習の前は繰り返しと同じ）。
 const MIN_OBS: u32 = 2;
 
-/// P2: 押した長さの癖。語の下位 8 ビットを別々に見て、「値 v のまま r フレーム続いたあと、次も続くか変わるか」の度数を学び、
-/// 予測は「続く確率が 5 割を切る所で変わる」とした道筋を引く。表は 8 ビット × 値 2 × 長さ 32 × 2 数 × u16 = 2 KB。
+/// P2: 押した長さの癖。ワードの下位8ビットを別々に見る。
+/// 「値vのままrフレーム続いたあと次も続くか変わるか」の度数を学ぶ。
+/// 予測は「続く確率が5割を切る所で変わる」と仮定した道筋を生成する。
+/// 表は8ビット × 値2 × 長さ32 × 2数 × u16 = 2 KB。
 #[derive(Clone)]
 pub struct RunHazard {
     cur: [u8; 8],
@@ -237,7 +246,7 @@ impl Predictor for RunHazard {
     }
 }
 
-/// P5: P2 の道筋に、P4 と同じ「`keep` フレームより先は方向を離す」を重ねる。
+/// P5: P2の道筋にP4と同じ「`keep`フレームより先は方向を離す」を重ねる。
 #[derive(Clone, Default)]
 pub struct HazardRelease {
     inner: RunHazard,
@@ -268,7 +277,7 @@ impl Predictor for HazardRelease {
     }
 }
 
-/// 表の 1 マス: 文脈の検証用（ハッシュの別の部分）・いちばん多い次の語の候補・その勢い（多数派の候補を 1 つだけ持つ数え方）。
+/// 表の1マス: 文脈の検証用（ハッシュの別の部分）・いちばん多い次のワードの候補・その勢い（多数派の候補を1つだけ持つ数え方）。
 #[derive(Clone, Copy, Default)]
 struct Slot {
     check: u16,
@@ -311,8 +320,10 @@ fn hash(ctx: u32) -> (usize, u16) {
     (idx, check)
 }
 
-/// P3: 直前の数語を文脈にした度数表。1 語前・2 語前まで・3 語前までの 3 つの表（1 語前は直に引き、あとの 2 つは 4096 マスのハッシュ）を持ち、
-/// 勢いのある長い文脈の候補を採る。どれにも無ければ直前の語の繰り返し。先の語は、予測した語を文脈へ足して引き続ける。
+/// P3: 直前の数ワードを文脈にした度数表。
+/// 1ワード前・2ワード前まで・3ワード前までの3つの表を持つ（1ワード前は直接引き、あとの2つは4096マスのハッシュ）。
+/// 勢いのある長い文脈の候補を採る。どれにも無ければ直前のワードの繰り返し。
+/// 先のワードは予測したワードを文脈へ足して表を引き続ける。
 /// 表の大きさは固定（`Slot` 4 B × (256 + 4096 × 2) ≒ 33 KB）。
 #[derive(Clone)]
 pub struct Context {
@@ -403,7 +414,7 @@ impl Predictor for Context {
     }
 }
 
-/// ツールの側で方法を並べて扱うための入れ物（表の大きいものは `Box`。ゲームスレッドの側は上の構造体を直に使う）。
+/// ツール側で方法を並べて扱うためのコンテナ（表の大きいものは`Box`。ゲームスレッド側は上の構造体を直接使う）。
 #[derive(Clone)]
 pub enum Method {
     Repeat(Repeat),
@@ -414,15 +425,15 @@ pub enum Method {
     HazardRelease(Box<HazardRelease>),
 }
 
-/// 採点する方法の並び。名前は出力の列の見出し。
+/// 採点する方法の並び。名前は出力の列のヘッダ。
 pub const METHODS: [&str; 7] = ["P0", "P1", "P2", "P3", "P4a", "P4b", "P5"];
-/// P4a / P4b が方向を残す先の長さ（フレーム）。
+/// P4a / P4bが方向を残す先の長さ（フレーム）。
 pub const FAR_KEEP: [usize; 2] = [3, 6];
-/// P5 が方向を残す先の長さ（フレーム）。結果を見る前に決めた値（P4a と P4b の間）。
+/// P5が方向を残す先の長さ（フレーム）。結果を見る前に決めた値（P4aとP4bの間）。
 pub const P5_KEEP: usize = 4;
 
 impl Method {
-    /// `METHODS` の添字から作る。
+    /// `METHODS`の添字から作る。
     pub fn new(index: usize) -> Option<Self> {
         Some(match index {
             0 => Method::Repeat(Repeat::default()),
@@ -470,18 +481,18 @@ impl Predictor for Method {
     }
 }
 
-/// 1 本の列を幅 m で採点した結果。tick t = m..n の分（m = 0 は予測が無いので全 tick で外れ 0・ずれ 0）。
+/// 1本の列を幅mで採点した結果。tick t = m..n の分（m = 0 は予測が無いので全tickで外れ0・ずれ0）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FrameEval {
     /// 使った予測の語が本物と違う。
     pub miss: Vec<bool>,
     /// ウィンドウの予測と本物で積分した位置の差の大きさ（px）。
     pub err: Vec<f32>,
-    /// 前の tick からのずれの変化の大きさ（px。見た目と本物の動きの食い違い）。先頭の tick は 0。
+    /// 前のtickからのずれの変化の大きさ（px。見た目と本物の動きの食い違い）。先頭のtickは0。
     pub snap: Vec<f32>,
 }
 
-/// `words`（語のマスク済みの列）を `p` で採点する。`p` は `reset_stream` 済みで、学習済みの表があってもよい。
+/// `words`（ワードのマスク済みの列）を`p`で採点する。`p`は`reset_stream`済みで学習済みの表があってもよい。
 pub fn eval_stream<P: Predictor>(p: &mut P, words: &[u16], m: usize) -> FrameEval {
     let n = words.len();
     let m = m.min(MAX_M);
@@ -516,7 +527,7 @@ pub fn eval_stream<P: Predictor>(p: &mut P, words: &[u16], m: usize) -> FrameEva
     ev
 }
 
-/// どれかの方法が当たれば当たり・ずれは方法のうち最小、とした上限の目安（その場で最良を選べる神様の値）。
+/// どれかの方法が当たれば当たりとし、ずれは方法のうちの最小を採る。上限の目安になる（その場で最良を選べる神様の値）。
 pub fn oracle(evals: &[&FrameEval]) -> FrameEval {
     let n = evals.iter().map(|e| e.miss.len()).min().unwrap_or(0);
     let mut o = FrameEval::default();
@@ -534,10 +545,10 @@ pub fn oracle(evals: &[&FrameEval]) -> FrameEval {
     o
 }
 
-/// ずれの大きさがこれ以上の tick の割合も数える（px。花映塚の自機の当たり判定の半径 2.0〜2.3 の約 4 倍）。
+/// ずれの大きさがこれ以上のtickの割合も数える（px。花映塚の自機の当たり判定の半径2.0〜2.3の約4倍）。
 pub const BIG_ERR: f32 = 8.0;
 
-/// 複数の列を合わせた集計の入れ物。外れの続く長さは列の境目をまたがない。
+/// 複数の列を合わせた集計を入れるコンテナ。外れの続く長さは列の境目をまたがない。
 #[derive(Debug, Clone, Default)]
 pub struct Pool {
     pub streams: usize,
@@ -629,7 +640,7 @@ fn mean(v: &[f32]) -> f64 {
     }
 }
 
-/// 昇順の列の q 分位（最近接順位）。空は既定値。
+/// 昇順の列のq分位（最近接順位）。空は既定値。
 fn nearest<T: Copy + Default>(sorted: &[T], q: f64) -> T {
     if sorted.is_empty() {
         return T::default();
@@ -638,10 +649,11 @@ fn nearest<T: Copy + Default>(sorted: &[T], q: f64) -> T {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-/// 予測の幅 m（相手の入力を待つ上限 R で打ち切った後）と、R を超えて待つ tick の割合（%）。
+/// 予測の幅m（相手の入力を待つ上限Rで打ち切った後）とRを超えて待つtickの割合（%）。
 ///
-/// 片道 k tick・遅れ D の対称な 2 台で、tick ごとの先頭 N が `N ≤ F + R` に縛られるとき、F は相手の取得（N_peer + D）に k tick 遅れて追うので、
-/// 長く見た進み方は `(D + R) / k` tick あたり 1（k > D + R のとき）。待つ割合 = `1 − (D + R) / k`（揺れの無い一定の片道での定常の見積もり）。
+/// 片道k tick・遅れDの対称な2台で、tickごとの先頭Nが`N ≤ F + R`に縛られるとき、Fは相手の取得（N_peer + D）にk tick遅れて追う。
+/// そのため長く見た進み方は`(D + R) / k` tickあたり1（k > D + R のとき）。
+/// 待つ割合 = `1 − (D + R) / k`（揺れの無い一定の片道での定常の見積もり）。
 pub fn width_and_wait(k: usize, d: usize, r: usize) -> (usize, f64) {
     let m = k.saturating_sub(d);
     let m_eff = m.min(r);
@@ -653,7 +665,7 @@ pub fn width_and_wait(k: usize, d: usize, r: usize) -> (usize, f64) {
     (m_eff, wait)
 }
 
-/// 外れた tick の割合（%）を、「w フレーム前の語の繰り返し」で直に数える（採点の検算用。`eval_stream` の P0 と一致するはず）。
+/// 外れたtickの割合（%）を「wフレーム前のワードの繰り返し」で直接数える（採点の検算用。`eval_stream`のP0と一致するはず）。
 pub fn repeat_miss_count(words: &[u16], w: usize) -> (u64, u64) {
     let mut miss = 0;
     let mut n = 0;
@@ -706,7 +718,7 @@ mod tests {
                 assert_eq!(miss_count(&e), 0, "{name} m={m}");
                 assert!(e.err.iter().all(|x| *x == 0.0), "{name} m={m}");
             }
-            // 方向を離す P4 は、押し続けの列では keep より先の分だけ必ず外れ、ずれは先の分 × 4 px になる。
+            // 方向を離すP4は、押し続けの列ではkeepより先の分だけ必ず外れ、ずれは先の分 × 4 pxになる。
             for (i, keep) in FAR_KEEP.iter().enumerate() {
                 let e = run(Method::new(4 + i).unwrap(), &words, m);
                 let (want_miss, want_err) = if m > *keep && m > 0 {
@@ -717,7 +729,7 @@ mod tests {
                 assert_eq!(miss_count(&e), want_miss, "P4 keep={keep} m={m}");
                 assert!(e.err.iter().all(|x| *x == want_err), "P4 keep={keep} m={m}");
             }
-            // P5 も同じ（押し続けの列では P2 の道筋は続くので、離すのは keep より先だけ）。
+            // P5も同じ（押し続けの列ではP2の道筋は続くので、離すのはkeepより先だけ）。
             let e = run(Method::new(6).unwrap(), &words, m);
             let (want_miss, want_err) = if m > P5_KEEP {
                 (200 - m, 4.0 * (m - P5_KEEP) as f32)
@@ -729,7 +741,7 @@ mod tests {
         }
     }
 
-    /// 交互に A・B と変わる列: 幅 m の繰り返しは m が奇数なら毎 tick 外れ、偶数なら一度も外れない。
+    /// 交互にA・Bと変わる列: 幅mの繰り返しはmが奇数なら毎tick外れる。偶数なら一度も外れない。
     #[test]
     fn alternating_stream_p0_follows_the_formula() {
         let words: Vec<u16> = (0..100)
@@ -745,7 +757,7 @@ mod tests {
         }
     }
 
-    /// 前半 R、後半 L の列。m = 3 の繰り返しは、変わった tick の 10・11・12 で外れ、ずれは 8・16・24 px。
+    /// 前半R・後半Lの列。m = 3 の繰り返しは変わったtickの10・11・12で外れる。ずれは8・16・24 px。
     #[test]
     fn step_stream_gives_exact_miss_and_error() {
         let words: Vec<u16> = (0..20).map(|i| if i < 10 { RIGHT } else { LEFT }).collect();
@@ -785,7 +797,7 @@ mod tests {
         );
     }
 
-    /// 7 フレーム押して 3 フレーム離す周期: 幅 1 の繰り返しは周期ごとに 2 回外れる。押した長さを学ぶ P2 は慣れた後は外れない。
+    /// 7フレーム押して3フレーム離す周期: 幅1の繰り返しは周期ごとに2回外れる。押した長さを学ぶP2は慣れた後は外れない。
     #[test]
     fn run_hazard_learns_a_fixed_press_length() {
         let words: Vec<u16> = (0..1000)
@@ -807,7 +819,7 @@ mod tests {
         );
     }
 
-    /// 3 語の周期（A B C）: 直前だけでは当たらず、文脈の表は慣れた後は外れない。
+    /// 3ワードの周期（A B C）: 直前だけでは当たらない。文脈の表は慣れた後は外れない。
     #[test]
     fn context_learns_a_cycle() {
         let cyc = [LEFT, RIGHT | 0x0001, UP];
@@ -829,14 +841,14 @@ mod tests {
         assert!(miss_count(&e) <= 3, "{}", miss_count(&e));
     }
 
-    /// 直前 1 語では決まらない列を、2 語・3 語の文脈が決める（長い文脈の表を引かなければ落ちる）。
+    /// 直前1ワードでは決まらない列を2ワード・3ワードの文脈が決める（長い文脈の表を引かなければ落ちる）。
     #[test]
     fn context_longer_orders_resolve_what_shorter_cannot() {
         let (a, b, c) = (LEFT, RIGHT, UP);
-        // A B A C: A の後は B と C が交互。
+        // A B A C: Aの後はBとCが交互。
         let w2: Vec<u16> = (0..800).map(|i| [a, b, a, c][i % 4]).collect();
         assert!(miss_count(&run(Context::default(), &w2, 1)) <= 12);
-        // A A B A A C: (A,A) の後が B と C に分かれ、3 語前まで見ないと決まらない。
+        // A A B A A C: (A,A)の後がBとCに分かれる。3ワード前まで見ないと決まらない。
         let w3: Vec<u16> = (0..1200).map(|i| [a, a, b, a, a, c][i % 6]).collect();
         let p3 = miss_count(&run(Context::default(), &w3, 1));
         assert!(p3 <= 15, "{p3}");

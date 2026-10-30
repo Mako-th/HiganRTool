@@ -32,6 +32,7 @@ It also has rollback netcode, which earlier tools for this game did not have, so
 - **Almost no port forwarding**: The server is used only for matchmaking. Match traffic goes directly between the two players' PCs (UDP). You need an open port only when your opponent is behind a symmetric NAT (→ "When you cannot connect"), and if your router supports UPnP the tool opens it automatically.
 - **Encrypted traffic**: Match and spectator traffic is encrypted with a one-time key made for each connection.
 - **Automatic updates**: Checks for a new version every time it starts and updates if there is one. After an update it shows what changed. Settings you changed are kept.
+- **Two keyboards in 人間 対 人間**: In Match Mode's "人間 対 人間", 1P and 2P can each play on their own keyboard (→ "Two keyboards" under "How it works").
 
 
 ## Requirements
@@ -111,7 +112,7 @@ Random matches appear in the Random match list under Watch, and anyone can watch
 
 Two players who enter the same room name play each other.
 
-1. Agree on a room name with your opponent. Use letters, digits, `-`, `_` and `@`, up to 32 characters. Choose a name others are unlikely to use.
+1. Agree on a room name with your opponent. Use letters, digits and symbols (except `` ` ``, `;` and `/`), up to 32 characters. Spaces at the start and end are removed. Names starting with `w.` or `q.` cannot be used. Choose a name others are unlikely to use.
 2. Both players enter it in "Room name" in the menu, then choose "Room match" under Play.
 3. When your opponent arrives, a sound plays and you are connected automatically (→ "After connecting").
 
@@ -170,7 +171,7 @@ Windows may treat the VPN network as public. Then also allow "Public networks" i
 - When both players choose 妖怪 対 妖怪 in Match Mode, the game goes to difficulty select and the match starts. If you were playing another mode, stop at a good point and choose 妖怪 対 妖怪.
 - 1P / 2P follow the "Side" setting in "Settings".
 - To disconnect, press Cancel on the Match Mode or difficulty screen and choose "Yes".
-- When you choose "Save replay and quit" at the end of a match, the connection ends (the replay is already saved automatically).
+- At the end of a match, each player chooses from the menu (→ "End-of-match menu").
 - When the connection closes after a match, you return to 妖怪 対 妖怪 on the title screen. To connect again, choose it there.
 - If the opponent does not respond for 60 seconds, the tool closes the connection (your game does not stay frozen either).
 - When the opponent stops responding for about 2 seconds, "Waiting for the opponent" appears at the top left. Hold Esc for 3 seconds while it is shown to disconnect yourself.
@@ -181,6 +182,21 @@ Windows may treat the VPN network as public. Then also allow "Public networks" i
 - **Change the netcode**: Ctrl+Tab on the character select screen. Either player can press it to change the netcode for both players.
 - **Copy the watch code**: Ctrl+C. The host presses it once the two players have connected. Whether it was copied is shown at the top left for a few seconds.
 - **Random character / map, skip dialogue**: Ctrl, or the skip button on a gamepad (as in the game). Ctrl+number and Ctrl+Tab also count as pressing Ctrl. If either player presses Ctrl, the dialogue is skipped for both.
+
+### End-of-match menu
+
+At the end of a match, each player chooses from the menu.
+The item each player is choosing is outlined in red for 1P and blue for 2P.
+
+<!-- zip:skip -->
+<img src="images/end_menu.png" width="400" alt="The end-of-match menu"> <img src="images/end_menu_zoom.png" width="400" alt="Close-up of the menu with 1P on Rematch and 2P on Change character">
+<!-- /zip:skip -->
+
+- When both have decided on different items, the lower item wins ("Save replay and quit" > "Change character" > "Rematch").
+- If either player decides on "Save replay and quit", the connection ends at that moment without waiting for the opponent.
+  If the replay of the match was saved automatically, the game's replay save screen does not appear.
+- Until both have decided, you can cancel your decision with Up or Down.
+- If a new version is released while you are playing, it appears at the top left of the menu.
 
 ### Spectating
 
@@ -300,6 +316,7 @@ A line with an unknown key or an unreadable value is ignored on its own, and the
 The ignored lines are shown below the netplay menu (the full list is written to the log).
 You can put a comment after a value, after a space and a `;`.
 A `HiganRTool.ini` saved in Shift_JIS instead of UTF-8 is also read.
+If you write characters other than Japanese (such as Chinese), save it in UTF-8.
 
 All settings are listed in the table below.
 
@@ -323,6 +340,7 @@ All settings are listed in the table below.
 | | vsync | Vsync. `off` (default) / `on` / `game` (the custom.exe setting as is). Only fullscreen changes |
 | [replay] | enable | Automatic replay saving. `1` (save each match) / `0` (do not save). The save location is under "How it works", "Replays" |
 | | layout | How the save folder is split. `peer` (`<1P> vs <2P>` folders) / `date` (by date) / `flat` (not split) / `pack50` (50 per folder, with names you can copy straight into the game's `replay` folder) |
+| | name | File name of saved replays. Default `th9_ud{num}`. You can use `{num}` (4-digit number) / `{date}` (yyyymmdd, `20261028`) / `{time}` (hhmm, `2313`) / `{1Pchara}` / `{2Pchara}` (characters) / `{1Pname}` / `{2Pname}` (names; characters that cannot be used become `-`) / `{round}` (number of rounds) / `{wins}` (rounds won, `2vs1`) / `{winner}` (`1P` or `2P`; `none` when undecided) / `{length}` (length of the match, `3m42s`) / `{rlengths}` (length of each round, `1m05s-1m22s`) / `{rlifes}` (life at the end of each round, `10vs0-0vs3`) / `{sync}` (`rollback` or `delay`) / `{delay}` (`2F`) / `{ping}` (`33ms`) / `{side}` (your side) / `{result}` (`win`, `lose` or `draw`); other characters are used as written. Allowed characters are ASCII letters, digits, `- _ . ( ) [ ] +` and spaces. Example: `th9_ud{date}-{time}_{1Pchara}VS{2Pchara}_{round}R_{winner}win`. |
 | [spectate] | enable | Accept spectators. `1` (accept; default) / `0` (refuse). If either player has `0`, no match can be watched |
 | | relay | Relaying while watching. `1` (relay to other spectators; default) / `0` (do not relay). Used only when watching random matches and room matches |
 | | ff_max | Fast-forward speed when you join mid-match. `1`–`16` (times; default `8`) |
@@ -331,10 +349,12 @@ All settings are listed in the table below.
 | | titlebar | Frame and title bar. `1` (show) / `0` (hide) |
 | | alwaysontop | Always on top. `1` (in front of other windows) / `0` (no) |
 | [pad] | pov | Whether to read the gamepad's D-pad as directions. `1` (read; default) / `0` (do not read) / `always` (for diagnosis). For gamepads the game does not read |
+| [input] | split_keyboards | Split two keyboards between 1P and 2P in "人間 対 人間". `1` (split; default) / `0` (do not split) |
 | [ui] | lang | Language of the tool's screens. `auto` (Windows display language) / `ja` / `en` |
+| | status_side | Position of the connection status and delay row during a match. `1p` (bottom left; default) / `2p` (bottom right) / `self` (bottom left if you are 1P, bottom right if 2P) / `opponent` (bottom right if you are 1P, bottom left if 2P). Spectators always see it at the bottom left |
 | [log] | detail | Amount of logging. `0` (brief; default) / `1` (detailed; use it when a problem occurs) |
 | [loader] | game | The location of the game's `th09.exe` (if empty, a window to choose the folder opens) |
-| | update_check | Update check before starting. `1` (check; default) / `0` (do not check) |
+| | update_check | Update check before starting, and the new-version notice while playing. `1` (check; default) / `0` (do not check) |
 
 If `[window]` is not written, the window stays as before. No effect in fullscreen.
 
@@ -360,8 +380,12 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
 - The server is used only to find your opponent in a room and to ask for your outside address (STUN).
 
 **Replays**
-- One replay is saved automatically after every match, to `Replay_HiganRTool\<1P> vs <2P>\` in the game folder (if the game is in Program Files, Windows saves it to the same place in VirtualStore).
+- One replay is saved automatically after every match, to `Replay_HiganRTool\<1P> vs <2P>\` in the game folder.
+- If the game is in a folder that needs administrator rights to write to, such as Program Files, Windows saves the replays to the folder of the same name under `%LOCALAPPDATA%\VirtualStore\` instead (the game's own `replay` folder works the same way).
+  Type `%LOCALAPPDATA%\VirtualStore` into the Explorer address bar to open it.
+  When you start the tool as administrator, it saves directly into the game folder.
 - Nothing is written to the game's `replay` folder. To watch one, copy it into the `replay` folder.
+- When a folder is full up to `th9_ud9999`, saving goes on in a folder with the same name plus `_2`, `_3`, and so on.
 - The game has a bug that crashes when saving the replay of a long match. This tool makes the game estimate the needed size correctly before saving, so it does not crash.
 
 **Replay Repair Tool (HiganRTool_replay_fix.exe)**
@@ -393,6 +417,15 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
 - It never changes files in the game folder (exe, settings, save data, replays). It writes only inside `Replay_HiganRTool`.
   During online play, you can still take a screenshot with P / Home (the game itself saves it to its usual `snapshot` folder). Pressing them does not take one on the opponent's PC.
 
+**Two keyboards**
+- If keys have been pressed on two or more keyboards since the game started, a prompt appears at the top left each time you choose "人間 対 人間" in Match Mode.
+- Following the prompt, 1P and 2P each press Z, X, Shift, Up, Down, Left and Right in order on their own keyboard. The keyboard you press becomes yours.
+  If you use two devices, such as a keyboard and a separate numpad, press on each of them and both are yours.
+- While the keyboards are split, input from anything other than the assigned keyboards (including gamepads) is ignored.
+- The assignment stays when you return from the pause menu during a match, and when you change characters or rematch after a match.
+  Normal input comes back when you return to the title or the Match Mode screen, or move on to the replay save screen.
+- Press a gamepad button or Esc while the prompt is shown to play without splitting that time.
+
 
 ## Safety
 
@@ -414,7 +447,7 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
   Contacts: GitHub Issues, Twitter (reply directly to @Sinus_lunicus_), or Discord (message makocchan. directly).
 - **Cannot connect**: Look up the number on the last line of the warning at the top left in "When you cannot connect" below.
 - **"HiganRTool version differs from the opponent"**: Both players should use the same zip.
-- **"Desync detected. This match was stopped."**: Press Esc to go back to the menu. Both players, please attach the logs from the `logs` folder and tell the developer.
+- **"Desync detected. This match was stopped."**: Press Esc to go back to the menu. Both players, please attach the `logs` folder as a zip and tell the developer.
 - **A firewall prompt about `th09.exe`**: Check "Private networks" and click "Allow access".
 
 
@@ -426,7 +459,7 @@ A **symmetric NAT** is a router that uses a different outside port for each dest
 With this type of router you cannot open a port explicitly from your side, so you cannot connect unless the other side's port is open.
 If both players have IPv6, you can connect regardless of the NAT type (`ipv6` in `[netplay]` is `on` by default).
 
-1. **UDP packets from the opponent do not arrive, for an unknown reason**: Record detailed logs by following the steps under "Logs" below, try again, then both players attach the logs and tell the developer. You also see this when the network blocks UDP (some universities, etc.).
+1. **UDP packets from the opponent do not arrive, for an unknown reason**: Record detailed logs by following the steps under "Logs" below, try again, then both players attach the `logs` folder as a zip and tell the developer. You also see this when the network blocks UDP (some universities, etc.).
 2. **Your opponent is behind a symmetric NAT and your UPnP is not available**: Open your port. Do one of these:
    - (a) Turn on UPnP in the router settings (this also lets other apps in your home open ports).
    - (b) Forward a UDP port on the router and set `bind` in `HiganRTool.ini` to that number. Example: for `bind = auto:17723`, forward UDP 17723 to this PC. You may close it after playing.
@@ -439,22 +472,22 @@ If both players have IPv6, you can connect regardless of the NAT type (`ipv6` in
 ## Logs
 
 - Logs are kept in the `logs` folder, one file per day (`dll_YYYYMMDD.log`). Starting several times on the same day adds to the same file, with a "==== 起動 ..." line at each start. Files older than 3 days are deleted automatically.
-- Send only that day's `dll_YYYYMMDD.log` to the developer (normally the brief log, just this one file).
-- If the game crashes at start-up or the window closes immediately, also attach `loader_YYYYMMDD.log` (a record of the start-up steps) from the `logs` folder.
+- To send logs to the developer, zip the `logs` folder and send the zip.
 - Only when asked for a detailed record, change `detail = 0` under `[log]` in `HiganRTool.ini` to `detail = 1` (in an old `HiganRTool.ini` without `[log]`, add the two lines `[log]` and `detail = 1`), and play again.
-  Also send the file ending in `_net_frames.csv.gz` (`_watch_frames.csv.gz` when watching) to the developer. This file gets a separate name for each start. Send the .gz as it is, without opening it.
+  Then zip the `logs` folder and send it in the same way.
 - Logs do not contain names, Windows user names or raw IP addresses (only the kind of IP, such as "outside" or "home", and port numbers). Even so, please send them only as part of a bug report (contacts are in "Troubleshooting"), and avoid posting them as-is where anyone can see them.
 
 
 ## Limitations
 
+- When the file name made with `name` under `[replay]` in `HiganRTool.ini` is longer than 100 characters, or has characters that cannot be used, the replay is saved with the usual `th9_udXXXX.rpy` name.
 - Only ver.1.50a is supported.
 - Two players who are both behind symmetric NATs, or a connection that blocks UDP, cannot connect. This needs a relay server, and there is no plan for it yet.
 - From mainland China, the room server (Random Match, Room Match and the spectate list) may be unreachable without a VPN. Connection codes, LAN play and watch codes do not use the server and still work.
   You can also play a distant opponent with LAN play if you both join a Radmin VPN, Hamachi or ZeroTier virtual LAN (→ "LAN").
 - Under Linux (Wine), the launcher may time out while waiting for the DLL to load. Run `wineserver -k` and start it again.
 - It cannot be used together with other tools for this game (other netplay tools, practice tools), because they patch the same places and conflict.
-- Up to 9999 replays are saved in one folder. After that, replays are not saved, so move or delete old ones.
+- When assigning two keyboards, keys entered by remote tools such as Parsec or by an on-screen keyboard are all treated as one keyboard.
 - Replays saved automatically by v1.0.0 desync when played back in the game if the two players used different charge settings (slow / charge).
   The netcode (rollback / delay) does not matter.
   The match itself was played with the correct settings; only the replay playback desyncs.
@@ -514,7 +547,7 @@ Rename them to `HiganRTool.exe` and `HiganRTool.dll` and put them in the same fo
 ## License
 
 <!-- zip:skip -->
-[GPL-3.0](./LICENSE) (version 3 or later).
+[GPL-3.0](./LICENSE).
 <!-- /zip:skip -->
 <!-- zip:only
 GPL-3.0 (with an exception for Team Shanghai Alice; see `LICENSE.txt`).

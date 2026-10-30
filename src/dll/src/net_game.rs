@@ -1,13 +1,15 @@
-//! 入力の地点の判断（`netplay.rs`）が見るゲームのウィンドウの本物（pure。unsafe 無し）: 場面・自分の入力ワード・feed・自分の SELECT・揃った値の書き込み・チャージ型・CHECK の値を、
-//! ゲームのメモリと関数（`NetIo` の向こう。本物は `script_win::RealTickIo`、検査では偽物）で行う。ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を使わない。
+//! 入力の地点の判断（`netplay.rs`）が見るゲームのウィンドウの本物（pure。unsafe無し）。
+//! 場面・自分の入力ワード・feed・自分のSELECT・揃った値の書き込み・チャージ型・CHECKの値を、ゲームのメモリと関数（`NetIo`の向こう。本物は`script_win::RealTickIo`、検査では偽物）で扱う。
+//! ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap`を使わない。
 //!
-//! - **自分の入力ワード**: 台本があれば、lockstep のフレームごとに台本を 1 tick 進め、自分の席の入力ワードを使う（相手の席の入力ワードは捨てる）。台本が終わっていれば（か無ければ）ローカル入力（素の poll `0x0042B850` の席 0。照合が合わなかった実行は `0x0042BE40`）。
-//!   台本の無い実行（人の入力）は、選択の画面でもマッチでもこの経路（`script` が `None`）で、人の押下は選択の画面では `NetPlay::menu_tick` が押した瞬間から STEP_REQ / STEP にする（台本の押下と同じ経路）。
-//! - **選択の画面**: MainMenu の欄（画面・substate・移る途中・カーソル・キャラのカーソルと席の旗）は落ちない読み方で、人対人の印 `0x4A7EA4` とマップの一覧 `0x4AC8C4` は直に読む（`net_select::MenuView`）。押下を入れる tick にカーソルを MainMenu へ落ちない書き方で書く。
-//! - **書く**のは相手の席のキャラ・色・初期ライフ、合意したマップ・難易度、シード（`set_state`）と、開始のフックの中のコピーのチャージ型、選択の画面のカーソルだけ。書く前に範囲を見て（`check_agreed`）、1 つでも外れていれば 1 つも書かない。
-//!   CPU レベルは書かない（読み込みスレッドが難易度から書き直す）。オプションブロック `0x004B3488` には書かない（終了時に th09.cfg へ書き出される）。
+//! - **自分の入力ワード**: 台本があればlockstepのフレームごとに台本を1 tick進めて自分のサイドの入力ワードを使う（相手のサイドの入力ワードは捨てる）。台本が終わっていれば（か無ければ）ローカル入力（素のpoll `0x0042B850`のサイド0。照合が合わなかった実行は`0x0042BE40`）。
+//!   台本の無い実行（人の入力）は、選択の画面でもマッチでもこの経路（`script`が`None`）を通る。人の押下は選択の画面では`NetPlay::menu_tick`が押した瞬間からSTEP_REQ / STEPにする（台本の押下と同じ経路）。
+//! - **選択の画面**: MainMenuのフィールド（画面・substate・移る途中・カーソル・キャラのカーソルとサイドの旗）は例外を出さない読み方で読む。人間 対 人間のフラグ`0x4A7EA4`とマップの一覧`0x4AC8C4`は直に読む（`net_select::MenuView`）。押下を反映するtickには、カーソルをMainMenuへ例外を出さない書き方で書く。
+//! - **書く**のは相手のサイドのキャラ・色・初期ライフ、合意したマップ・難易度、シード（`set_state`）、開始のフックの中のコピーのチャージ型、選択の画面のカーソルだけ。書く前に範囲を見る（`check_agreed`）。1つでも外れていれば1つも書かない。
+//!   CPUレベルは書かない（読み込みスレッドが難易度から書き直す）。オプションブロック`0x004B3488`には書かない（終了時にth09.cfgへ書き出される）。
 #![forbid(unsafe_code)]
 
+use higanr_core::end_pick;
 use higanr_core::input_model::{InputState, MATCH_SEND_MASK, keys};
 use higanr_core::lockstep::Role;
 use higanr_core::return_flow::{MenuState, PlayView};
@@ -23,53 +25,63 @@ use crate::netplay::{Action, BadValue, Game, watched_agreed};
 use crate::scripted::{self, GameAddrs, Stepped, TickIo, read_obs};
 use crate::th09_addr::{
     APP_ACTIVE, CHARA_MAX, CHARA_UNLOCK, CHARGE_MAX, COLOR_MAX, DIFFICULTY, DIFFICULTY_MAX,
-    END_MENU, INPUT_MANAGERS, LIFE_MAX, LIFE_MIN, LOADING, MAIN_MENU_PTR, MAP, MAP_LIST,
-    MAP_LIST_LEN, MAP_MAX, MAP_RANDOM_ANY, MAP_RANDOM_OF_TWO, MATCH_END_MENU, MENU_CHARA_CURSOR,
-    MENU_CHARA_DECIDED, MENU_CURSOR, MENU_OBJ_FRAMES, MENU_OBJ_STATE, MENU_PARTS_PTR,
-    MENU_SCREEN_ID, MENU_SUBSTATE, MENU_TRANSITIONING, OPT_CHARGE, OPTION_DIGEST_RANGES,
-    OPTIONS_BLOCK, OPTIONS_COPY_PTR, P1_CHAR, P1_COLOR, P1_LIFE_INIT, P1_PLAYER_PTR, P2_CHAR,
-    P2_COLOR, P2_LIFE_INIT, P2_PLAYER_PTR, PAUSE, PAUSE_MENU, PLAYER_LIFE, RNG_ADDR, RNG_COUNT,
-    SE_ID_MENU_CURSOR, SE_PAN_MENU_CURSOR, SELECT_KIND, SUP_SCENE_CUR, SUP_SCENE_REQ, SUPERVISOR,
+    END_MENU, GLOBAL_STATE, GLOBAL_STATE_REPLAY, INPUT_MANAGERS, LIFE_MAX, LIFE_MIN, LOADING,
+    MAIN_MENU_PTR, MAP, MAP_LIST, MAP_LIST_LEN, MAP_MAX, MAP_RANDOM_ANY, MAP_RANDOM_OF_TWO,
+    MATCH_END_MENU, MENU_CHARA_CURSOR, MENU_CHARA_DECIDED, MENU_CURSOR, MENU_OBJ_FRAMES,
+    MENU_OBJ_STATE, MENU_PARTS_PTR, MENU_SCREEN_ID, MENU_SUBSTATE, MENU_TRANSITIONING, OPT_CHARGE,
+    OPTION_DIGEST_RANGES, OPTIONS_BLOCK, OPTIONS_COPY_PTR, P1_CHAR, P1_COLOR, P1_LIFE_INIT,
+    P1_PLAYER_PTR, P2_CHAR, P2_COLOR, P2_LIFE_INIT, P2_PLAYER_PTR, PAUSE, PAUSE_MENU, PLAYER_LIFE,
+    RNG_ADDR, RNG_COUNT, SE_ID_MENU_CURSOR, SE_PAN_MENU_CURSOR, SELECT_KIND, SUP_SCENE_CUR,
+    SUP_SCENE_REQ, SUPERVISOR,
 };
 
-/// ゲームのスレッドが外から得るもの（台本の `TickIo` に書き込みとシードを足したもの）。本物は
-/// `script_win::RealTickIo`。どれも確保しない・パニックしない。
+/// ゲームのスレッドが外から得るもの（台本の`TickIo`に書き込みとシードを足したもの）。
+/// 本物は`script_win::RealTickIo`。どれも確保しない・パニックしない。
 pub trait NetIo: TickIo {
-    /// 素の poll（`0x0042B850`）を席 0・1・2 の順に 1 回ずつ呼んだ入力ワード（`poll_all` と同じ読み。InputManager は汚さない —— 書き戻す）。
-    /// 席 2 の入力ワードはキーボード全配置 ＋ 両方のパッドで、画面 6（Match）が読む `[2]` の入力ワードそのもの。poll の入口の照合が合わなかった実行・
-    /// 検査の偽物は `None`（呼び手は `local_input` の 1 入力ワードへ戻る）。
+    /// 素のpoll（`0x0042B850`）をサイド0・1・2の順に1回ずつ呼んだ入力ワード（`poll_all`と同じ読み。InputManagerは汚さない —— 書き戻す）。
+    /// サイド2の入力ワードはキーボード全配置 ＋ 両方のパッドで、画面6（Match）が読む`[2]`の入力ワードそのもの。
+    /// pollの入口の照合が合わなかった実行と検査の偽物は`None`（呼び出し側は`local_input`の1入力ワードへ戻る）。
     fn poll_words(&mut self) -> Option<[u32; 3]> {
         None
     }
-    /// ルーム名の入力欄（ウィンドウから打たれた文字を貯める）を開け閉めする。本物は `text_input_win::set_gate`。開けられなければ false。
+    /// ルーム名の入力フィールド（ウィンドウから打たれた文字を貯める）を開け閉めする。本物は`text_input_win::set_gate`。開けられなければfalse。
     /// 偽物は何もしない。
     fn text_gate(&mut self, _open: bool) -> bool {
         true
     }
-    /// 貯まった文字を古い順に `out` の長さまで取る。本物は `text_input_win::drain`。偽物は 0。
+    /// 貯まった文字を古い順に`out`の長さまで取る。本物は`text_input_win::drain`。偽物は0。
     fn typed_units(&mut self, _out: &mut [u16]) -> usize {
         0
     }
-    /// ゲームの .data の 4 バイトを直に書く（設置の前に読めると検証した `direct_ranges` のアドレスだけ）。
+    /// ゲームの .dataの4バイトを直に書く（設置の前に読み取り可能と検証した`direct_ranges`のアドレスだけ）。
     fn write_data_u32(&mut self, addr: u32, v: u32);
-    /// 落ちない書き方（自分のプロセスへの `WriteProcessMemory`）で 1 バイト。書けなければ false。
+    /// 例外を出さない書き方（自分のプロセスへの`WriteProcessMemory`）で1バイト書く。書き込めなければfalse。
     fn safe_write_u8(&mut self, addr: u32, v: u8) -> bool;
-    /// 落ちない書き方で 4 バイト（リトルエンディアン）。書けなければ false。
+    /// 例外を出さない書き方で4バイト（リトルエンディアン）書く。書き込めなければfalse。
     fn safe_write_u32(&mut self, addr: u32, v: u32) -> bool;
-    /// `set_state 0x00420160`（thiscall、ecx = `RNG_ADDR`、引数 u16）を 1 回呼ぶ。
+    /// `set_state 0x00420160`（thiscall、ecx = `RNG_ADDR`、引数u16）を1回呼ぶ。
     fn set_rng_state(&mut self, seed: u16);
-    /// .data の `out.len()` バイトを直に読む（`direct_ranges` の中だけ）。
+    /// .dataの`out.len()`バイトを直に読む（`direct_ranges`の中だけ）。
     fn read_data(&mut self, addr: u32, out: &mut [u8]);
-    /// 立ち絵の 3 本の関数（`net_portrait`）を呼べるか。起動のときに 3 本の入口のバイト列を全部照合して合ったときだけ
-    /// true（合わなければ立ち絵の追随だけを入れない。選択そのものは動く）。
+    /// 立ち絵の3本の関数（`net_portrait`）を呼べるかどうか。
+    /// 起動時に3本の入口のバイト列を全部照合して合ったときだけtrue。
+    /// 合わなければ立ち絵の追随だけを有効にしない。選択そのものは動く。
     fn portrait_armed(&mut self) -> bool {
         false
     }
-    /// 立ち絵の関数を 1 回呼ぶ（thiscall、ecx = MainMenu `m`、引数 4 つ、`ret 0x10`）。`portrait_armed` が false なら
-    /// 何もしない。
+    /// 立ち絵の関数を1回呼ぶ（thiscall・ecx = MainMenu `m`・引数4つ・`ret 0x10`）。
+    /// `portrait_armed`がfalseなら何もしない。
     fn call_portrait(&mut self, _m: u32, _call: PortraitCall) {}
-    /// SE を 1 つ積む（`0x43E2F0`。呼ぶ前に関数の頭のバイト列を照合する）。積めなければ false。偽物は積まない。
+    /// SEを1つ積む（`0x43E2F0`。呼ぶ前に関数の頭のバイト列を照合する）。積めなければfalse。偽物は積まない。
     fn push_se(&mut self, _id: u32, _pan: i32) -> bool {
+        false
+    }
+    /// マッチの終わりの選択の縁取りと色の指示を画面へ（本物は`end_outline_win::show`）。偽物は何もしない。
+    fn end_show(&mut self, _show: &end_pick::Show) {}
+    /// マッチの終わりの選択のイベントを本ログへ（本物は`end_outline_win::note`。確保しない）。
+    fn end_note(&mut self, _seg: u16, _note: end_pick::Note, _frame: u32) {}
+    /// `[debug] end_pick = shadow`かどうか（本物は`end_outline_win::shadow`）。
+    fn end_shadow(&mut self) -> bool {
         false
     }
 }
@@ -80,7 +92,7 @@ struct PortraitGate<'a> {
 
 impl PortraitEnv for PortraitGate<'_> {
     fn unlocked(&mut self, chara: u8) -> bool {
-        // 4 バイト読みの下位 1 バイトが解放の印（印は 16 バイトの表 `CHARA_UNLOCK`。表の後ろも同じ .data で読める）。
+        // 4バイト読みの下位1バイトが解放のフラグ（フラグは16バイトの表`CHARA_UNLOCK`。表の後ろも同じ .dataで読み取り可能）。
         CHARA_UNLOCK
             .checked_add(u32::from(chara))
             .and_then(|a| self.io.safe_u32(a))
@@ -92,7 +104,7 @@ impl PortraitEnv for PortraitGate<'_> {
             return None;
         }
         let m = self.io.safe_u32(MAIN_MENU_PTR).filter(|&p| p != 0)?;
-        // 部品の配列が 0 なら ANM が読まれていない（立ち絵の関数は何もしないが、呼ぶ意味も無い）。
+        // 部品の配列が0ならANMが読まれていない（立ち絵の関数は何もしない。呼ぶ意味も無い）。
         m.checked_add(MENU_PARTS_PTR)
             .and_then(|a| self.io.safe_u32(a))
             .filter(|&p| p != 0)?;
@@ -100,9 +112,15 @@ impl PortraitEnv for PortraitGate<'_> {
     }
 }
 
-/// 設置の前に「直に読める・書ける」と検証する .data の範囲（アドレス, 長さ）。花映塚ではどれも th09.exe の .data。
-pub fn direct_ranges() -> [(u32, u32); 19] {
+/// 設置の前に「直に読み取り可能・書き込み可能」と検証する .dataの範囲（アドレス, 長さ）。花映塚ではどれもth09.exeの .data。
+/// 一時停止のバイトのワードはマッチ終了時のメニューのフラグ（`PAUSE + 2`）を含み、試合の毎tickに1回読む（`read_end_view`）。
+pub fn direct_ranges() -> [(u32, u32); 21] {
     [
+        (PAUSE, 4),
+        (
+            END_MENU + MENU_OBJ_STATE,
+            MENU_OBJ_FRAMES + 4 - MENU_OBJ_STATE,
+        ),
         (SUPERVISOR + SUP_SCENE_CUR, 4),
         (SUPERVISOR + SUP_SCENE_REQ, 4),
         (P1_CHAR, 4),
@@ -126,6 +144,39 @@ pub fn direct_ranges() -> [(u32, u32); 19] {
         (SELECT_KIND, 4),
         (MAP_LIST, MAP_LIST_LEN),
     ]
+}
+
+// 一時停止のバイトの4バイト読みにマッチ終了時のメニューのフラグのバイトが入る（`read_end_view`の前提）。
+const _: () = assert!(MATCH_END_MENU == PAUSE + 2);
+
+/// マッチの終わりの選択が読む終わりのメニュー。ワード`PAUSE`の下位1バイトが一時停止で、3バイト目が`MATCH_END_MENU`（どちらも`movb`の1バイトのフィールド）。
+/// メニューの状態とカウントは出ているときだけ読む（出ていないメニューのフィールドは前の値のまま）。
+/// 読み取れなければ「出ていない」とする（`[2]`は2人のワードのORのまま）。
+/// delay方式・観戦者（`NetGame::end_view`）・rollbackのモード（`rollback_play::GameWindow::tick`）が同じ関数を使う。
+pub fn read_end_view(read: &mut dyn FnMut(u32) -> Option<u32>) -> end_pick::View {
+    let Some(w) = read(PAUSE) else {
+        return end_pick::View::default();
+    };
+    let shown = (w >> ((MATCH_END_MENU - PAUSE) * 8)) & 0xFF != 0;
+    let paused = w & 0xFF != 0;
+    if !shown {
+        return end_pick::View {
+            paused,
+            ..end_pick::View::default()
+        };
+    }
+    match (
+        read(END_MENU + MENU_OBJ_STATE),
+        read(END_MENU + MENU_OBJ_FRAMES),
+    ) {
+        (Some(state), Some(frames)) => end_pick::View {
+            shown,
+            paused,
+            state,
+            frames,
+        },
+        _ => end_pick::View::default(),
+    }
 }
 
 fn seat_addrs(seat: Seat) -> (u32, u32, u32) {
@@ -160,7 +211,7 @@ pub fn check_agreed(a: &Agreed) -> Result<(), BadValue> {
     Ok(())
 }
 
-/// 意味の分からない欄のダイジェスト（FNV-1a 32 bit。違えばログに残すだけ）。
+/// 意味の分からないフィールドのダイジェスト（FNV-1a 32 bit。違えばログに残すだけ）。
 pub fn option_digest(block_part: &[u8], base: u32) -> u32 {
     let mut h: u32 = 0x811C_9DC5;
     for (s, e) in OPTION_DIGEST_RANGES {
@@ -173,8 +224,9 @@ pub fn option_digest(block_part: &[u8], base: u32) -> u32 {
     h
 }
 
-/// 入力の地点の判断を、入口のアセンブリへの戻り値にする（`stub.rs` の決まり: 0 = poll_all、1 = poll_all を呼ばずに
-/// 戻る、2 = 描画だけのフレーム）。`None` は「lockstep の外」で、台本の経路（台本が終わっていれば 0）へ回す。
+/// 入力の地点の判断を入口のアセンブリへの戻り値にする。
+/// `stub.rs`の決まりは 0 = poll_all・1 = poll_all を呼ばずに戻る・2 = 描画だけのフレーム。
+/// `None`は「lockstepの外」を表し、台本の経路（台本が終わっていれば0）へ回す。
 pub fn entry_return(a: Action) -> Option<u32> {
     match a {
         Action::Local => None,
@@ -183,9 +235,10 @@ pub fn entry_return(a: Action) -> Option<u32> {
     }
 }
 
-/// 台本が終わったらネットワークを閉じるときの BYE の理由。走っている間は `None`。最後の段階まで押した = 終了、途中で止まった
-/// （条件を待ちきれなかった）= 中止。ini の `after_script = keep` なら最後の段階まで押しても閉じない（人の入力で続く）。
-/// 途中で止まったときは keep でも閉じる。
+/// 台本が終わったらネットワークを閉じるときのBYEの理由。走っている間は`None`。
+/// 最後の段階まで押した場合は終了。途中で止まった（条件を待ちきれなかった）場合は中止。
+/// iniの`after_script = keep`なら最後の段階まで押しても閉じない（人の入力で続く）。
+/// 途中で止まったときはkeepでも閉じる。
 pub fn script_end_bye(s: Status, after: AfterScript) -> Option<ByeReason> {
     match (s, after) {
         (Status::Running { .. }, _) | (Status::Done, AfterScript::Keep) => None,
@@ -199,7 +252,7 @@ pub struct ScriptStep {
     pub shot: u8,
     pub step: u16,
     pub status: Status,
-    /// この tick で台本が終わった・止まった（以後はローカル入力）。
+    /// このtickで台本が終わった・止まった（以後はローカル入力）。
     pub ended: bool,
 }
 
@@ -208,17 +261,17 @@ pub struct NetGame<'a> {
     pub script: Option<&'a mut Engine>,
     pub script_addrs: GameAddrs,
     pub script_step: Option<ScriptStep>,
-    /// 観戦者の Esc の読み（`peek_local_input`）が台本を進めた結果。台本の入力ワードは feed していない。`Action::Local` を返した tick は
-    /// これを `scripted::commit` に渡して feed する（`script_win::watch_tick`。台本を二重に進めない）。
+    /// 観戦者のEscの読み（`peek_local_input`）が台本を進めた結果。台本の入力ワードはfeedしていない。
+    /// `Action::Local`を返したtickはこれを`scripted::commit`に渡してfeedする（`script_win::watch_tick`。台本を二重に進めない）。
     pub peeked: Option<Stepped>,
-    /// ゲーム内のメニューが読んだ入力ワードの預かり（`Game::stash_local`）。次の `local_input` が返す。
+    /// ゲーム内のメニューが読んで保存しておいた入力ワード（`Game::stash_local`）。次の`local_input`が返す。
     pub stashed: Option<u16>,
-    /// この tick に `digit_keys` が読んだ結果（`NetGame` は tick ごとに作る）。Ctrl+数字の読み（`NetPlay::digit_tick`）と Ctrl+C の読み
-    /// （`NetUi::copy_tick`）が同じ tick に呼んでも、キーの問い合わせは 1 tick に 1 回で済ませる。
+    /// このtickに`digit_keys`が読んだ結果（`NetGame`はtickごとに作る）。
+    /// Ctrl+数字の読み（`NetPlay::digit_tick`）とCtrl+Cの読み（`NetUi::copy_tick`）が同じtickに呼んでもキーの問い合わせは1 tickに1回で済ませる。
     keys: Option<Option<u16>>,
-    /// この tick に台本から取り出した押下（数字・Tab・Ctrl+C）。`digit_script` と `copy_script` が同じ tick に別々に呼ばれるので、台本からは 1 回だけ取る。
+    /// このtickに台本から取り出した押下（数字・Tab・Ctrl+C）。`digit_script`と`copy_script`が同じtickに別々に呼ばれるので、台本からは1回だけ取る。
     script_keys: Option<Option<higanr_core::script::KeyPress>>,
-    /// `script_keys` の数字・Tab / Ctrl+C を、もう渡した。
+    /// `script_keys`の数字・Tab / Ctrl+Cをもう渡した。
     digits_given: bool,
     copy_given: bool,
 }
@@ -258,8 +311,9 @@ impl<'a> NetGame<'a> {
         crate::digit_keys_win::held()
     }
 
-    /// 台本が動いていれば 1 tick 進めて、結果を `script_step` に残す（`peek_local_input` 用。1 つの期間で 1 回だけ進め、2 回目からは
-    /// 前の結果を返す）。台本が無い・終わった・止まった後は `None`。
+    /// 台本が動いていれば1 tick進めて結果を`script_step`に残す（`peek_local_input`用）。
+    /// 1つの期間で進めるのは1回だけで、2回目からは前の結果を返す。
+    /// 台本が無い・終わった・止まった後は`None`。
     fn step_script_once(&mut self) -> Option<Stepped> {
         if self.peeked.is_some() {
             return self.peeked;
@@ -318,12 +372,12 @@ impl Game for NetGame<'_> {
         self.io.typed_units(out)
     }
 
-    /// 数字キーの読み（遅れの量を替える。`digit_keys`）: ゲームのウィンドウが前面のときだけ読む。前面の旗 `[0x004B30B8]` はゲーム自身が
-    /// キーボードを読むかを決める旗と同じ（0 ならゲームも読まない）。旗の意味は未照合なので、旗に加えて Windows の前面のウィンドウも
-    /// このゲームのものであることを要る（`digit_keys_win::foreground_is_game`）。どちらかが満たされない・旗が読めないときは
-    /// `None`。文字の入力中かどうかは `digit_keys_win::held` が見る。
+    /// 数字キーの読み（遅れの量を替える。`digit_keys`）: ゲームのウィンドウが前面のときだけ読む。
+    /// 前面のフラグ`[0x004B30B8]`はゲーム自身がキーボードを読むかを決めるフラグと同じ（0ならゲームも読まない）。
+    /// フラグの意味は未照合なので、フラグに加えてWindowsの前面のウィンドウもこのゲームのものであることを条件にする（`digit_keys_win::foreground_is_game`）。
+    /// どちらかが満たされない・フラグが読めないときは`None`。文字の入力中かどうかは`digit_keys_win::held`が見る。
     ///
-    /// 遅延の増分: 旗が立っている tick に前面のウィンドウの問い合わせ 3 回。同じ `NetGame` の 2 回目からは前の結果を返す。
+    /// 遅延の増分: フラグが立っているtickに前面のウィンドウの問い合わせ3回。同じ`NetGame`の2回目からは前の結果を返す。
     fn digit_keys(&mut self) -> Option<u16> {
         if let Some(k) = self.keys {
             return k;
@@ -333,8 +387,8 @@ impl Game for NetGame<'_> {
         k
     }
 
-    /// 台本の段階（`digit=x` / `tab=1`）が効き始めたとき、その次の tick に 1 回だけ、押した瞬間の集合（`digit_keys` の bit の並び）を
-    /// 返す。OS には何も注がない。台本が動いていない・段階が無い・`copy=1` だけの段階のときは `None`。
+    /// 台本の段階（`digit=x` / `tab=1`）が効き始めた次のtickに1回だけ押した瞬間の集合（`digit_keys`のbitの並び）を返す。
+    /// OSには何も送らない。台本が動いていない・段階が無い・`copy=1`だけの段階のときは`None`。
     fn digit_script(&mut self) -> Option<u16> {
         if self.digits_given {
             return None;
@@ -347,7 +401,7 @@ impl Game for NetGame<'_> {
         Some(k.digit.map_or(0, |d| 1u16 << d) | if k.tab { crate::digit_keys::TAB_BIT } else { 0 })
     }
 
-    /// 台本の段階（`copy=1`）が効き始めたとき、その次の tick に 1 回だけ `true`（Ctrl+C を押したことにする）。
+    /// 台本の段階（`copy=1`）が効き始めた次のtickに1回だけ`true`（Ctrl+Cを押したことにする）。
     fn copy_script(&mut self) -> bool {
         if self.copy_given {
             return false;
@@ -356,19 +410,33 @@ impl Game for NetGame<'_> {
         self.copy_given
     }
 
-    /// 台本の入れ物（`script`）があれば台本の付いている実行。入れ物は `script_win` が武装している間ずっと残る（終わっても外さない）ので、
-    /// 台本が終わった後の tick も `true`。`digit_tick` はこの実行で本物のキーを読まない。
+    /// 台本のコンテナ（`script`）があれば台本の付いている実行。
+    /// コンテナは`script_win`が武装している間ずっと残る（終わっても外さない）ので、台本が終わった後のtickも`true`。
+    /// `digit_tick`はこの実行で本物のキーを読まない。
     fn scripted_run(&self) -> bool {
         self.script.is_some()
     }
 
+    /// 台本の実行は偽の押下だけを使うので常に開ける。それ以外は数字キーと同じ門（ゲームの前面のフラグとOSの前面のウィンドウ）。
+    fn keys_gate(&mut self) -> bool {
+        if self.script.is_some() {
+            return true;
+        }
+        let active = self.io.safe_u32(APP_ACTIVE).is_some_and(|v| v != 0);
+        crate::digit_keys::may_read(active, crate::digit_keys_win::foreground_is_game)
+    }
+
+    fn replaying(&mut self) -> bool {
+        self.io.data_u32(GLOBAL_STATE) & GLOBAL_STATE_REPLAY != 0
+    }
+
     fn local_input(&mut self, seat: Seat) -> u16 {
-        // ゲーム内のメニューが同じ tick に読んだ入力ワード（台本・デバイスをもう読まない）。1 回だけ返す。
+        // ゲーム内のメニューが同じtickに読んだ入力ワード（台本・デバイスをもう読まない）。1回だけ返す。
         if let Some(w) = self.stashed.take() {
             return w;
         }
         if let Some(s) = self.peeked {
-            // 同じ tick に Esc の読み（`peek_local_input`）が台本をもう進めた。二重に進めず、その結果の入力ワードを使う。
+            // 同じtickにEscの読み（`peek_local_input`）が台本をもう進めた。二重に進めない。その結果の入力ワードを使う。
             if let Some((p1, p2)) = s.out.feed {
                 let w = match seat {
                     Seat::P1 => p1,
@@ -401,8 +469,8 @@ impl Game for NetGame<'_> {
     }
 
     fn menu_words(&mut self, seat: Seat) -> [u16; 3] {
-        // 台本が動いている・同じ tick にもう読んだ（預かり・Esc の読み）ときは、台本の入力ワード（`local_input`）をそのまま 1P の席へ。
-        // 台本の入力ワードを poll の入力ワードに差し替えると、台本の検査（`scripts/runs/m1c3_*.run`）が人の機器に左右される。
+        // 台本が動いている・同じtickにもう読んだ（保存済み・Escの読み）ときは台本の入力ワード（`local_input`）をそのまま1Pのサイドへ渡す。
+        // 台本の入力ワードをpollの入力ワードに差し替えると台本の検査（`scripts/runs/m1c3_*.run`）が人の機器に左右される。
         let scripted = self.stashed.is_some()
             || self.peeked.is_some()
             || self
@@ -417,10 +485,10 @@ impl Game for NetGame<'_> {
     }
 
     fn peek_local_input(&mut self) -> u16 {
-        // 台本が動いていれば、ここで 1 tick 進める（この期間で 1 回だけ。結果は `peeked` に残り、`Local` を返した tick の feed が使う）。
-        // 返すのは、本物のデバイスの入力ワードに、台本の入力ワードの ESC ビットだけを足したもの: 観戦中の tick は台本の入力ワードをゲームへ入れない
-        // （記録の列だけを入れる）ので、台本の Esc 以外のビットは読みに要らない。台本の Esc を読みに入れるのは、
-        // 実機で台本から観戦者の Esc の経路を検証できるようにするため。
+        // 台本が動いていればここで1 tick進める（この期間で1回だけ）。結果は`peeked`に残り`Local`を返したtickのfeedが使う。
+        // 返すのは本物のデバイスの入力ワードに台本の入力ワードのESCビットだけを足したもの。
+        // 観戦中のtickは台本の入力ワードをゲームへ渡さず記録の列だけを渡すので、台本のEsc以外のビットは読みに要らない。
+        // 台本のEscを読みに加えるのは、実機で台本から観戦者のEscの経路を検証できるようにするため。
         let device = self.io.local_input() as u16;
         let script = self.step_script_once().and_then(|s| s.word()).unwrap_or(0);
         device | (script & keys::ESC)
@@ -451,10 +519,10 @@ impl Game for NetGame<'_> {
             color: self.byte(co),
             life: self.byte(li),
             charge: self.byte(OPTIONS_BLOCK + OPT_CHARGE),
-            // −1 / −2 は下位 1 バイト（0xFF / 0xFE）で送り、書くときに i8 として戻す。
+            // −1 / −2は下位1バイト（0xFF / 0xFE）で送り、書くときにi8として戻す。
             map: self.byte(MAP),
             difficulty: self.byte(DIFFICULTY),
-            // CPU レベルは読み込みスレッドが難易度から書き直すので送らない。背景は読み込みスレッドが書く。
+            // CPUレベルは読み込みスレッドが難易度から書き直すので送らない。背景は読み込みスレッドが書く。
             cpu_1p: 0,
             cpu_2p: 0,
             background: 0,
@@ -475,8 +543,8 @@ impl Game for NetGame<'_> {
     }
 
     fn apply_watched(&mut self, p1: &Select, p2: &Select) -> Result<(), BadValue> {
-        // 先に 2 席とも範囲を見る（1 つでも外れていれば 1 つも書かない）。共通の欄（マップ・難易度・シード）は両席で同じ
-        // （対戦のホストの値を両方に入れて積まれる）ので、1 席目の値を 1 回だけ書く。
+        // 先に2サイドとも範囲を見る（1つでも外れていれば1つも書かない）。
+        // 共通のフィールド（マップ・難易度・シード）は両サイドで同じ（対戦のホストの値が両方に入って積まれる）ので1つ目のサイドの値を1回だけ書く。
         let (a1, a2) = (watched_agreed(p1), watched_agreed(p2));
         check_agreed(&a1)?;
         check_agreed(&a2)?;
@@ -567,9 +635,9 @@ impl Game for NetGame<'_> {
     }
 
     fn play_view(&mut self) -> Option<PlayView> {
-        // 読むのは戻り道の間と、観戦者の Esc の tick・ゲームのポーズの間だけ（ふだんの試合の tick には呼ばれない）なので、どれも落ちない読み方でよい。
+        // 読むのは戻り道の間と観戦者のEscのtick・ゲームのポーズの間だけ（ふだんの試合のtickには呼ばれない）なので、どれも例外を出さない読み方でよい。
         let loading = self.io.safe_u32(LOADING)? != 0;
-        // どちらも 1 バイトの欄（`movb`）。隣の 3 バイトは見ない。
+        // どちらも1バイトのフィールド（`movb`）。隣の3バイトは見ない。
         let paused = self.io.safe_u32(PAUSE)? & 0xFF != 0;
         let end_menu = self.io.safe_u32(MATCH_END_MENU)? & 0xFF != 0;
         let mut menu = |base: u32| {
@@ -589,10 +657,32 @@ impl Game for NetGame<'_> {
             end,
         })
     }
+
+    fn end_view(&mut self) -> end_pick::View {
+        // 試合の毎tickに読むので設置の前に読み取り可能と検証したフィールド（`direct_ranges`）を直に読む。
+        read_end_view(&mut |a| Some(self.io.data_u32(a)))
+    }
+
+    fn end_se(&mut self, se: end_pick::Se) -> bool {
+        let (id, pan) = crate::th09_addr::end_menu_se(se);
+        self.io.push_se(id, pan)
+    }
+
+    fn end_show(&mut self, show: &end_pick::Show) {
+        self.io.end_show(show);
+    }
+
+    fn end_note(&mut self, seg: u16, note: end_pick::Note, frame: u32) {
+        self.io.end_note(seg, note, frame);
+    }
+
+    fn end_shadow(&mut self) -> bool {
+        self.io.end_shadow()
+    }
 }
 
-/// CHECK の値を読む手段（`read_check_values` が使う）。`data` は th09.exe の .data を直に読む（落ちない）、`safe` はヒープ（Player）を
-/// 落ちない読み方で読む。
+/// CHECKの値を読む手段（`read_check_values`が使う）。
+/// `data`はth09.exeの .dataを直に読む（例外を出さない）。`safe`はヒープ（Player）を例外を出さない読み方で読む。
 pub trait CheckRead {
     fn data(&mut self, addr: u32) -> u32;
     fn safe(&mut self, addr: u32) -> Option<u32>;
@@ -609,9 +699,9 @@ impl CheckRead for IoRead<'_> {
     }
 }
 
-/// CHECK に載せるゲームの値（乱数の状態の下 16 bit・抽選回数・1P のライフ・2P のライフ）の読み方。delay 方式
-/// （`NetGame::check_values`）と rollback のモード（`rollback_play::GameWindow::check_values`）が同じ関数を使う。
-/// どれも描画だけの欄に当たらない。ライフは Player へのポインタが 0 なら 0、読めなければ 0。
+/// CHECKに載せるゲームの値（乱数の状態の下16 bit・抽選回数・1Pのライフ・2Pのライフ）の読み方。
+/// delay方式（`NetGame::check_values`）とrollbackのモード（`rollback_play::GameWindow::check_values`）が同じ関数を使う。
+/// どれも描画だけのフィールドには当たらない。ライフはPlayerへのポインタが0なら0。読み取れなければ0。
 pub fn read_check_values(r: &mut dyn CheckRead) -> (u16, u32, u8, u8) {
     let rng = r.data(RNG_ADDR) as u16;
     let count = r.data(RNG_COUNT);
@@ -635,7 +725,7 @@ mod tests {
     use higanr_core::selection::Mismatch;
     use std::collections::HashMap;
 
-    /// 偽のゲーム: .data の語（4 バイトずつ、アドレスで引く）・落ちない読み書きの先・InputManager は持たない。
+    /// 偽のゲームは .dataのワード（4バイトずつ。アドレスをキーにする）と例外を出さない読み書きの先を持つ。InputManagerは持たない。
     /// 呼ばれた書き込みとシードを順に残す。
     #[derive(Default)]
     struct Fake {
@@ -650,10 +740,10 @@ mod tests {
         feeds: Vec<(u32, u32)>,
         writes: Vec<(u32, u32)>,
         seeds: Vec<u16>,
-        /// 立ち絵の 3 本の関数が照合済みか（`NetIo::portrait_armed`）と、呼ばれた（ecx, 呼び出し）の列。
+        /// 立ち絵の3本の関数が照合済みかどうか（`NetIo::portrait_armed`）と、呼ばれた（ecx, 呼び出し）の列。
         portrait_armed: bool,
         portrait_calls: Vec<(u32, PortraitCall)>,
-        /// 積んだ SE（id, パン）。
+        /// 積んだSE（id, パン）。
         se: Vec<(u32, i32)>,
     }
 
@@ -735,9 +825,9 @@ mod tests {
         f.data.insert(P2_LIFE_INIT, 10);
         f.data.insert(MAP, 0xFFFF_FFFE); // −2
         f.data.insert(DIFFICULTY, 2);
-        f.data.insert(RNG_ADDR, 0x0005_BEEF); // 上の 2 バイトは抽選回数の隣の欄ではない（状態は u16）
+        f.data.insert(RNG_ADDR, 0x0005_BEEF); // 上の2バイトは抽選回数の隣のフィールドではない（状態はu16）
         f.data.insert(RNG_COUNT, 1234);
-        f.data.insert(OPTIONS_BLOCK + OPT_CHARGE, 0x0000_0100); // +0xB4 = 0（1P の枠）、+0xB5 = 1
+        f.data.insert(OPTIONS_BLOCK + OPT_CHARGE, 0x0000_0100); // +0xB4 = 0（1Pの枠）、+0xB5 = 1
         f
     }
 
@@ -790,7 +880,7 @@ mod tests {
             let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
             assert_eq!(g.digit_keys(), Some(K5), "前面なのに読まない");
         }
-        // 旗は立っているが、前面のウィンドウがほかのアプリ: 読まない。戻すと読む（隣の肯定）。
+        // フラグは立っているが前面のウィンドウがほかのアプリ: 読まない。戻すと読む（隣の肯定）。
         crate::digit_keys_win::test_set_foreground(false);
         {
             let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
@@ -817,7 +907,7 @@ mod tests {
             assert_eq!(g.digit_keys(), None);
         }
         crate::digit_keys_win::test_set_foreground(true);
-        // 同じ tick の 2 回目の呼び出し（Ctrl+数字の読みと Ctrl+C の読み）は問い合わせ直さない。次の tick（新しい `NetGame`）は読み直す。
+        // 同じtickの2回目の呼び出し（Ctrl+数字の読みとCtrl+Cの読み）は問い合わせ直さない。次のtick（新しい`NetGame`）は読み直す。
         use crate::digit_keys::{C_BIT, CTRL_BIT};
         f.safe.insert(APP_ACTIVE, 1);
         crate::digit_keys_win::test_set_held(Some(C_BIT | CTRL_BIT));
@@ -883,7 +973,7 @@ mod tests {
         assert_eq!(g.digit_script(), None);
     }
 
-    /// `copy=1` の段で数字・Tab の押下が出ない、`digit=` の段で Ctrl+C が出ないことも見る。
+    /// `copy=1`の段階で数字・Tabの押下が出ないこと、`digit=`の段階でCtrl+Cが出ないことも見る。
     #[test]
     fn a_script_step_with_copy_gives_it_once_and_the_call_order_does_not_matter() {
         use higanr_core::script::{Engine, Obs, parse};
@@ -963,7 +1053,7 @@ mod tests {
             let g = NetGame::new(&mut f, Some(&mut e), GameAddrs::th09());
             assert!(g.scripted_run(), "台本の入れ物があるのに台本の実行と見ない");
         }
-        // 台本を最後まで進めても入れ物は残る（終わった後も本物のキーを読まない）。
+        // 台本を最後まで進めてもコンテナは残る（終わった後も本物のキーを読まない）。
         for _ in 0..10 {
             if !matches!(e.status(), Status::Running { .. }) {
                 break;
@@ -1103,7 +1193,7 @@ mod tests {
             ]
         );
         assert_eq!(f.seeds, vec![0x2468], "シードは 1 回だけ");
-        // 2 席目だけ範囲の外: 1 つも書かない（1 席目も書かない）。
+        // 2つ目のサイドだけ範囲の外: 1つも書かない（1つ目のサイドも書かない）。
         let mut bad = p2;
         bad.chara = 16;
         let mut f = fake();
@@ -1223,7 +1313,7 @@ mod tests {
         f.safe.insert(CHARA_UNLOCK + 0x0E, 0x0100);
         assert_eq!(follow(&mut f, 0, 7), Followed::Refused);
         assert!(f.portrait_calls.is_empty());
-        // 相手の席の位置の経路は、未解放でも呼ぶ（ほかの門は同じ）。
+        // 相手のサイドの位置の経路は未解放でも呼ぶ（ほかの門は同じ）。
         let mut f = open();
         f.safe.insert(CHARA_UNLOCK + 6, 0);
         let got = NetGame::new(&mut f, None, GameAddrs::th09()).follow_portrait(
@@ -1245,7 +1335,7 @@ mod tests {
         assert_eq!(got, Followed::Refused, "署名が合わなければ呼ばない");
     }
 
-    /// ゲームのカーソルの移動 `0x0042474A`（`push $0x0`・`push $0xc`）と同じ id・パン。
+    /// ゲームのカーソルの移動`0x0042474A`（`push $0x0`・`push $0xc`）と同じid・パン。
     #[test]
     fn the_cursor_sound_is_the_games_cursor_move_sound() {
         let mut f = fake();
@@ -1442,12 +1532,12 @@ mod tests {
 
     #[test]
     fn peek_local_input_adds_only_the_scripts_esc_and_steps_the_script_once_per_window() {
-        const DEVICE: u16 = 0x0040; // LEFT だけ（X・Z・ESC を含まない）
+        const DEVICE: u16 = 0x0040; // LEFTだけ（X・Z・ESCを含まない）
         let mut f = fake();
         f.local = u32::from(DEVICE);
         f.data.insert(SUPERVISOR + SUP_SCENE_CUR, 2);
         let mut e = Engine::new(parse("scene=2 wait=1 p1=Z p2=X+ESC hold=2\n").unwrap());
-        // tick ごとの（最初の読み, 期間の終わりに台本が終わっていたか（None = 進めなかった）, local_input の 1P, 2P）
+        // tickごとの（最初の読み, 期間の終わりに台本が終わっていたか（None = 進めなかった）, local_inputの1P, 2P）
         let mut got = Vec::new();
         for tick in 1..=5 {
             let mut g = NetGame::new(&mut f, Some(&mut e), GameAddrs::th09());
@@ -1467,7 +1557,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (DEVICE, Some(false), 0, 0), // 条件を満たした tick（押す前の wait）
+                (DEVICE, Some(false), 0, 0), // 条件を満たしたtick（押す前のwait）
                 (
                     DEVICE | keys::ESC,
                     Some(false),
@@ -1480,12 +1570,12 @@ mod tests {
                     keys::Z,
                     keys::X | keys::ESC
                 ),
-                (DEVICE, Some(true), DEVICE, DEVICE), // 台本が終わった tick は、ローカル入力に戻る
+                (DEVICE, Some(true), DEVICE, DEVICE), // 台本が終わったtickはローカル入力に戻る
                 (DEVICE, None, DEVICE, DEVICE),       // 終わった後は進めない
             ],
             "tick ごとの（最初の読み, 台本が終わったか, local_input の 1P, 2P）"
         );
-        // デバイスの読み: peek は期間ごとに 3 回（15）＋ `local_input` が台本の入力ワードを使わない期間（tick 4・5）の 2 回ずつ（4）。
+        // デバイスの読み: peekは期間ごとに3回（15）＋ `local_input`が台本の入力ワードを使わない期間（tick 4・5）の2回ずつ（4）。
         assert_eq!(f.local_calls, 3 * 5 + 2 * 2, "デバイスの読みの数");
     }
 
@@ -1500,7 +1590,7 @@ mod tests {
         let mut e = Engine::new(parse("scene=9 limit=1 p1=Z\n").unwrap());
         {
             let mut g = NetGame::new(&mut f, Some(&mut e), GameAddrs::th09());
-            let _ = g.peek_local_input(); // 条件が成り立たず、limit=1 で止まる
+            let _ = g.peek_local_input(); // 条件が成り立たず、limit=1で止まる
             assert!(matches!(
                 g.peeked.map(|s| s.status),
                 Some(Status::Aborted { .. })
@@ -1528,7 +1618,7 @@ mod tests {
     #[test]
     fn play_view_reads_the_one_byte_flags_and_only_the_menus_that_are_shown() {
         let mut f = fake();
-        // 隣の 3 バイトが立っていても 1 バイトの欄だけを見る（一時停止の `0x4A7ECC` と `0x4A7ECE` は同じ 4 バイトに並ぶ）。
+        // 隣の3バイトが立っていても1バイトのフィールドだけを見る（一時停止の`0x4A7ECC`と`0x4A7ECE`は同じ4バイトに並ぶ）。
         f.safe.insert(LOADING, 0);
         f.safe.insert(PAUSE, 0x0001_0000);
         f.safe.insert(MATCH_END_MENU, 0x0000_0100);
@@ -1562,12 +1652,58 @@ mod tests {
                 frames: 40
             })
         );
-        // 一時停止のメニューの状態が読めなければ、試合の場面ごと読めない扱いにせず、その欄だけ None。
+        // 一時停止のメニューの状態が読み取れなければ試合の場面ごと読み取れない扱いにせず、そのフィールドだけNone。
         f.safe.remove(&(PAUSE_MENU + MENU_OBJ_FRAMES));
         let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
         assert_eq!(g.play_view().unwrap().pause, None);
         f.safe.remove(&PAUSE);
         let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
         assert_eq!(g.play_view(), None);
+    }
+
+    #[test]
+    fn the_end_view_reads_the_flag_byte_of_the_pause_word_and_the_menu_only_when_shown() {
+        let mut f = fake();
+        // 一時停止のワードの3バイト目だけがフラグ。2バイト目（Story / Extraのフラグ`0x4A7ECD`）は見ない。
+        f.data.insert(PAUSE, 0x0000_0100);
+        f.data.insert(END_MENU + MENU_OBJ_STATE, 2);
+        f.data.insert(END_MENU + MENU_OBJ_FRAMES, 7);
+        {
+            let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+            assert_eq!(g.end_view(), end_pick::View::default());
+        }
+        f.data.insert(PAUSE, 0x0001_0001);
+        let mut g = NetGame::new(&mut f, None, GameAddrs::th09());
+        assert_eq!(
+            g.end_view(),
+            end_pick::View {
+                shown: true,
+                paused: true,
+                state: 2,
+                frames: 7,
+            }
+        );
+        // 出ていなければメニューのフィールドは読まない。読み取れなければ「出ていない」。
+        let mut reads = Vec::new();
+        let v = read_end_view(&mut |a| {
+            reads.push(a);
+            Some(0x0000_0001)
+        });
+        assert_eq!((v.shown, v.paused, reads), (false, true, vec![PAUSE]));
+        assert_eq!(read_end_view(&mut |_| None), end_pick::View::default());
+        let v = read_end_view(&mut |a| (a == PAUSE).then_some(0x0001_0000));
+        assert_eq!(
+            v,
+            end_pick::View::default(),
+            "メニューの欄が読めないのに出ていると返した"
+        );
+        // 試合の毎tickに直に読むフィールドは設置の前に読み取り可能と検証する範囲に入っている。
+        let ranges = direct_ranges();
+        for a in [PAUSE, END_MENU + MENU_OBJ_STATE, END_MENU + MENU_OBJ_FRAMES] {
+            assert!(
+                ranges.iter().any(|&(s, n)| s <= a && a + 4 <= s + n),
+                "{a:#X} が直に読む範囲の外"
+            );
+        }
     }
 }

@@ -1,19 +1,21 @@
 //! 遅れの量を選ぶ形の純粋な部分: 推奨値の式・初めの値・数字キーの押下の記録。両者が数字キーで変える（ゲストの押下はホストへの要求）。
 //!
-//! - 推奨値（`recommend`）: 片道 ≈ RTT / 2 を 1 フレームで割った数が元。範囲は `RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。delay 方式は片道を切り上げ、rollback は片道の半分を D で吸って残りを予測で埋める。
-//!   0 を推すのは、直近の往復のウィンドウの最大がしきい値以下のときだけ（`recommend_with_max`）。RTT が測れていなければ推奨は出さない（`None`）。
-//! - 両者が選ぶ（`DelayPick`）: 押した瞬間ごとに 1 つ値を作って `Connected::press_delay` へ渡す。値を持ち続けて毎フレーム比べると、両者が変えたとき古い値を要求し続けて上書きし合う。
-//! - 初めの値: delay 方式は推奨値（`begin_match` でホストが 1 回だけ作る）、rollback は AGREE の D。ゲストは推奨値を出さない（2 つの値が競う）。範囲は `bounds`（0〜8）。
-//! - 数字キーと auto: Ctrl+数字の 0〜8 はその値、9 は `AUTO`（接続ごとの旗でホストが持つ。0〜8 で降りる、後勝ち）。立っている間、ホストは 9 を押した瞬間・ゲストが auto を要求したとき・seg の最初の取得のときだけ D を `recommend` にする。
-//!   seg の始まりの見直しを変わりにくくする規則は `AutoHold` に 1 つ。
-//! - メニューの「ディレイ」の並びは auto, 0F, 1F, …, 8F（端で止まり折り返さない。`DelayChoice::step`）。遅延の増分: 0（値は既存の INPUT の lat の欄で運ぶ）。
+//! - 推奨値（`recommend`）: 片道 ≈ RTT / 2を1フレームで割った数が元。範囲は`RECOMMEND_MIN`（1）〜`mode_pick::MAX_PICK_DELAY`（8）。
+//!   delay方式は片道を切り上げる。rollbackは片道の半分をDで吸って残りを予測で埋める。
+//!   0を推すのは直近の往復のウィンドウの最大がしきい値以下のときだけ（`recommend_with_max`）。RTTが測れていなければ推奨は出さない（`None`）。
+//! - 両者が選ぶ（`DelayPick`）: 押した瞬間ごとに1つ値を作って`Connected::press_delay`へ渡す。値を持ち続けて毎フレーム比べると両者が変えたとき古い値を要求し続けて上書きし合う。
+//! - 初めの値: delay方式は推奨値（`begin_match`でホストが1回だけ作る）。rollbackはAGREEのD。ゲストは推奨値を出さない（2つの値が競う）。範囲は`bounds`（0〜8）。
+//! - 数字キーとauto: Ctrl+数字の0〜8はその値。9は`AUTO`（ホストが接続ごとに持つフラグ。0〜8を押すと解除される。後勝ち）。
+//!   AUTOが有効な間はホストが次のときだけDを`recommend`にする: 9を押した瞬間・ゲストがautoを要求したとき・マッチの最初の取得のとき。
+//!   マッチの始まりの見直しを変わりにくくする規則は`AutoHold`に1つ。
+//! - メニューの「ディレイ」の並びはauto, 0F, 1F, …, 8F（端で止まって折り返さない。`DelayChoice::step`）。遅延の増分: 0（値は既存のINPUTのlatのフィールドで運ぶ）。
 #![forbid(unsafe_code)]
 
 use crate::frame::MAX_DELAY;
 use crate::mode_pick::MAX_PICK_DELAY;
 use crate::wire::Mode;
 
-/// RTT（ms）からフレーム数への換算: 片道 RTT / 2 を 1 フレーム 1000 / 60 ms で割る = RTT × 3 / 100。丸めを浮動小数に任せず整数で持つ。
+/// RTT（ms）からフレーム数への換算: 片道RTT / 2を1フレーム1000 / 60 msで割る = RTT × 3 / 100。丸めを浮動小数に任せず整数で持つ。
 const PER_RTT_NUM: u64 = 3;
 const PER_RTT_DEN: u64 = 100;
 const _: () = assert!(
@@ -21,19 +23,19 @@ const _: () = assert!(
     "片道 = RTT / 2、1 フレーム = 1000 / 60 ms"
 );
 
-/// 選べる値の下限（← → と数字キーの 0〜8。両形式とも）。delay 方式の 0 は毎フレーム 1 往復を待つので止まりやすいが、`Lockstep` は受ける。
+/// 選べる値の下限（← → と数字キーの0〜8。両形式とも）。delay方式の0は毎フレーム1往復を待つので止まりやすいが`Lockstep`は受ける。
 /// 推奨値の下限は別（`RECOMMEND_MIN`）。
 pub const DELAY_MIN: u8 = 0;
 
-/// 往復から引く推奨値の下限。0 を推すのは往復のウィンドウの最大が下のしきい値以下のときだけ（`recommend_with_max`）。
+/// 往復から求める推奨値の下限。0を推すのは往復のウィンドウの最大が下のしきい値以下のときだけ（`recommend_with_max`）。
 pub const RECOMMEND_MIN: u8 = 1;
 
-/// 往復のウィンドウの最大がこれ以下なら推奨値を 0 にする（ms）。delay 方式の 0 は毎フレーム相手の語を待つので rollback の半分にした。
-/// どちらも実測の裏付けは無く、決め直してよい値。
+/// 往復のウィンドウの最大がこれ以下なら推奨値を0にする（ms）。delay方式の0は毎フレーム相手のワードを待つのでrollbackの半分にした。
+/// どちらも実測の裏付けが無く決め直してよい値。
 pub const ZERO_MAX_ROLLBACK_MS: u32 = 16;
 pub const ZERO_MAX_DELAY_MS: u32 = 8;
 
-/// 方式ごとの、推奨値 0 を許す往復の最大（ms）。
+/// 方式ごとの、推奨値0を許す往復の最大（ms）。
 pub fn zero_max_ms(mode: Mode) -> u32 {
     match mode {
         Mode::Delay => ZERO_MAX_DELAY_MS,
@@ -41,12 +43,14 @@ pub fn zero_max_ms(mode: Mode) -> u32 {
     }
 }
 
-/// 要求（ゲストの INPUT の lat の delay の欄）と押下で「auto」を表す値（数字キーの 9）。選べる範囲の外で、wire が通す上限
-/// `frame::MAX_DELAY`（9）と同じなので、本文の形も検査も変えずに運べる。ホストが送る予定・切替がこの値になることは無い。
+/// 要求（ゲストのINPUTのlatのdelayのフィールド）と押下で「auto」を表す値（数字キーの9）。
+/// 選べる範囲の外で、wireが通す上限`frame::MAX_DELAY`（9）と同じ。
+/// そのため本文の形も検査も変えずに運べる。
+/// ホストが送る予定・切替がこの値になることは無い。
 pub const AUTO: u8 = MAX_DELAY;
 const _: () = assert!(MAX_PICK_DELAY < AUTO, "auto の値は選べる範囲の外");
 
-/// 遅延の選び 1 つ（メニューの値と接続の始まりの値）。`raw` が押下の値（`Connected::press_delay` へ渡す形。auto は `AUTO`）。
+/// 遅延の選び1つ（メニューの値と接続の始まりの値）。`raw`が押下の値（`Connected::press_delay`へ渡す形。autoは`AUTO`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelayChoice {
     Auto,
@@ -54,7 +58,7 @@ pub enum DelayChoice {
 }
 
 impl DelayChoice {
-    /// 押下の値から。範囲の外（`AUTO` 以外の 10 以上）は `None`。
+    /// 押下の値から。範囲の外（`AUTO`以外の10以上）は`None`。
     pub fn from_raw(x: u8) -> Option<DelayChoice> {
         if x == AUTO {
             Some(DelayChoice::Auto)
@@ -77,7 +81,7 @@ impl DelayChoice {
         }
     }
 
-    /// 並びの中で `by`（-1 が ←、+1 が →）だけ動かした値。両端で止まる。範囲の外の `Fixed` は上限へ寄せてから動かす。
+    /// 並びの中で`by`（-1が ←、+1が →）だけ動かした値。両端で止まる。範囲の外の`Fixed`は上限へ寄せてから動かす。
     pub fn step(self, by: i8) -> DelayChoice {
         let last = usize::from(MAX_PICK_DELAY) + 1;
         let i = self.index().min(last);
@@ -93,8 +97,8 @@ impl DelayChoice {
     }
 }
 
-/// 往復の最大が無い呼び手向けの推奨値（delay 方式なら遅れ、rollback なら D）。RTT が測れていなければ `None`。
-/// 下限は `RECOMMEND_MIN`（0 は推さない）、上限は `bounds`。
+/// 往復の最大が無い呼び出し側向けの推奨値（delay方式なら遅れ・rollbackならD）。RTTが測れていなければ`None`。
+/// 下限は`RECOMMEND_MIN`（0は推さない）。上限は`bounds`。
 pub fn recommend(mode: Mode, rtt_ms: Option<u32>) -> Option<u8> {
     let scaled = u64::from(rtt_ms?) * PER_RTT_NUM;
     let frames = match mode {
@@ -105,8 +109,8 @@ pub fn recommend(mode: Mode, rtt_ms: Option<u32>) -> Option<u8> {
     Some(frames.clamp(u64::from(RECOMMEND_MIN), u64::from(bounds(mode).1)) as u8)
 }
 
-/// 推奨値。往復のウィンドウの最大 `max_ms` がしきい値（`zero_max_ms`）以下なら 0、そうでなければ `recommend`（中央値 `rtt_ms` で引く）。
-/// `max_ms` が `None` なら 0 を推さない。
+/// 推奨値。往復のウィンドウの最大`max_ms`がしきい値（`zero_max_ms`）以下なら0。そうでなければ`recommend`（中央値`rtt_ms`で求める）。
+/// `max_ms`が`None`なら0を推さない。
 pub fn recommend_with_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<u8> {
     let r = recommend(mode, rtt_ms)?;
     Some(if max_ms.is_some_and(|m| m <= zero_max_ms(mode)) {
@@ -116,7 +120,7 @@ pub fn recommend_with_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) 
     })
 }
 
-/// 選べる範囲 (下限, 上限)。ホストがゲストの要求を詰めるのにも使う。`mode` は、方式で範囲を分けたくなったとき呼び手を直さずに済むよう残す。
+/// 選べる範囲 (下限, 上限)。ホストがゲストの要求を範囲に収めるのにも使う。`mode`は方式で範囲を分けたくなったとき呼び出し側を直さずに済むよう残す。
 pub fn bounds(_mode: Mode) -> (u8, u8) {
     (DELAY_MIN, MAX_PICK_DELAY)
 }
@@ -126,18 +130,19 @@ pub fn clamp(mode: Mode, x: u8) -> u8 {
     x.clamp(lo, hi)
 }
 
-// ---- auto の「マッチごとに見直す ＋ 変わりにくくする」----
+// ---- autoの「マッチごとに見直す ＋ 変わりにくくする」----
 //
-// 往復が推奨値の境目（delay 方式の 1 と 2 は 33 ms で 1、34 ms で 2。rollback の 1 と 2 は 100 ms で 1、101 ms で 2）に乗ると、seg の始まりごとに
-// 素の推奨値へ合わせては往復が数 ms 揺れるだけでマッチごとに D が替わるので、seg の始まりの見直しだけ「上げにくく・下げにくく」する。
+// 往復が推奨値の境目に乗ると、マッチの始まりごとに素の推奨値へ合わせては往復が数ms揺れるだけでマッチごとにDが替わってしまう。
+// 境目はdelay方式の1と2が33 msで1、34 msで2。rollbackの1と2が100 msで1、101 msで2。
+// そのためマッチの始まりの見直しだけ「上げにくく・下げにくく」する。
 
-/// 上げるときに往復から差し引く余裕（ms）。delay 方式で今 1 なら往復 39 ms 以上で 2（34〜38 ms は 1 のまま）。5 ms は往復の揺れ幅の見込みで、実測の裏付けは無い。
+/// 上げるときに往復から差し引く余裕（ms）。delay方式で今1なら往復39 ms以上で2（34〜38 msは1のまま）。5 msは往復の揺れ幅の見込みで実測の裏付けは無い。
 pub const UP_MARGIN_MS: u32 = 5;
 
-/// 下げるのに要る、続けて「今の D より低い」と出た seg の始まりの数（間に「下げない」seg の始まりが挟まれば数え直し）。
+/// 下げるのに必要な「今のDより低い」と続けて出たマッチの始まりの数（間に「下げない」マッチの始まりが挟まれば数え直し）。
 pub const DOWN_RUN: u8 = 2;
 
-/// 往復から引いた推奨値の組。`raw` は素、`up` は「往復 − `UP_MARGIN_MS`」で引いた上げる判断用の値（`raw` 以下）。
+/// 往復から求めた推奨値のペア。`raw`は素の値。`up`は「往復 − `UP_MARGIN_MS`」から求めた上げる判断用の値（`raw`以下）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recommend {
     pub raw: u8,
@@ -145,12 +150,12 @@ pub struct Recommend {
 }
 
 impl Recommend {
-    /// 往復（ms）から。測れていなければ `None`。最大を持たないので 0 は推さない。
+    /// 往復（ms）から。測れていなければ`None`。最大を持たないので0は推さない。
     pub fn from_rtt(mode: Mode, rtt_ms: Option<u32>) -> Option<Recommend> {
         Recommend::from_rtt_max(mode, rtt_ms, None)
     }
 
-    /// 往復の中央値とウィンドウの最大（ms）から。測れていなければ `None`。`up` は両方から余裕を引く。引く値は 0 で止める。
+    /// 往復の中央値とウィンドウの最大（ms）から。測れていなければ`None`。`up`は両方から余裕を引く。引く値は0で止める。
     pub fn from_rtt_max(mode: Mode, rtt_ms: Option<u32>, max_ms: Option<u32>) -> Option<Recommend> {
         let raw = recommend_with_max(mode, rtt_ms, max_ms)?;
         let up = recommend_with_max(
@@ -161,33 +166,35 @@ impl Recommend {
         Some(Recommend { raw, up })
     }
 
-    /// 余裕の無い組（`raw` = `up` = `r`）。往復を持たない検査と peer_sim 用。
+    /// 余裕の無いペア（`raw` = `up` = `r`）。往復を持たない検査とpeer_sim用。
     pub fn flat(r: u8) -> Recommend {
         Recommend { raw: r, up: r }
     }
 }
 
-/// `AutoHold::pick_head` の答え: 使う D と、変わりにくくして据え置いたか。
+/// `AutoHold::pick_head`の答え: 使うDと変わりにくくして据え置いたかどうか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadPick {
     pub d: u8,
     pub held: bool,
 }
 
-/// ホストが持つ auto の旗と、seg の始まりの見直しの規則。最初の適用・押した瞬間・ゲストの要求は素の推奨値をすぐ使い（`pick_now`）、
-/// seg の始まりは余裕つきで見直す（`pick_head`）。数字（0〜8）で旗を降ろすと数えも捨てる（`lower`）。確保しない。
+/// ホストが持つautoのフラグと、マッチの始まりの見直しの規則。
+/// 最初の適用・押した瞬間・ゲストの要求は素の推奨値をすぐ使う（`pick_now`）。
+/// マッチの始まりは余裕つきで見直す（`pick_head`）。
+/// 数字（0〜8）でフラグを降ろすと数えも捨てる（`lower`）。確保しない。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AutoHold {
     on: bool,
-    /// 旗が立ってから、まだ一度も推奨値を使っていない。測れる前に立てた旗の最初の適用も素の推奨値をすぐ使うため。
+    /// フラグが立ってから、まだ一度も推奨値を使っていない。測れる前に立てたフラグの最初の適用も素の推奨値をすぐ使うため。
     fresh: bool,
-    /// 続けて「今の D より低い」と出た seg の始まりの数と、そのうちの大きい推奨値（下げる先）。
+    /// 続けて「今のDより低い」と出たマッチの始まりの数とそのうちの大きい推奨値（下げる先）。
     low_run: u8,
     low_max: u8,
 }
 
 impl AutoHold {
-    /// 旗を立てる（もう立っていても立て直す: 次の適用は素の推奨値をすぐ使う）。
+    /// フラグを立てる（もう立っていても立て直す: 次の適用は素の推奨値をすぐ使う）。
     pub fn raise(&mut self) {
         *self = AutoHold {
             on: true,
@@ -204,7 +211,7 @@ impl AutoHold {
         self.on
     }
 
-    /// 押した瞬間・ゲストの要求・旗が立ってから最初の適用: 素の推奨値をすぐ使う。下げの数えは 0 に戻す。旗が降りている・測れていないときは `None`。
+    /// 押した瞬間・ゲストの要求・フラグが立ってから最初の適用: 素の推奨値をすぐ使う。下げの数えは0に戻す。フラグが降りている・測れていないときは`None`。
     pub fn pick_now(&mut self, rec: Option<Recommend>) -> Option<u8> {
         if !self.on {
             return None;
@@ -216,8 +223,10 @@ impl AutoHold {
         Some(rec.raw)
     }
 
-    /// seg の始まりの見直し。`d` は今の D。最初の適用なら `pick_now` と同じ。それ以外は、`up` が `d` より大きければ上げ、素の推奨値が `d` より
-    /// 小さい seg の始まりが `DOWN_RUN` 回続いたときだけ下げる（先はその間の大きい方）。旗が降りている・測れていないときは `None`。
+    /// マッチの始まりの見直し。`d`は今のD。最初の適用なら`pick_now`と同じ。
+    /// それ以外は`up`が`d`より大きければ上げる。
+    /// 素の推奨値が`d`より小さいマッチの始まりが`DOWN_RUN`回続いたときだけ下げる（先はその間の大きい方）。
+    /// フラグが降りている・測れていないときは`None`。
     pub fn pick_head(&mut self, d: u8, rec: Option<Recommend>) -> Option<HeadPick> {
         if !self.on {
             return None;
@@ -248,7 +257,7 @@ impl AutoHold {
         }
         self.low_run = 0;
         self.low_max = 0;
-        // 素の推奨値が `d` 以上で上げる条件に届かなかった。素なら上がる値を据え置いたときだけ「変わりにくくした」と数える。
+        // 素の推奨値が`d`以上で上げる条件に届かなかった。素なら上がる値を据え置いたときだけ「変わりにくくした」と数える。
         Some(HeadPick {
             d,
             held: rec.raw > d,
@@ -256,20 +265,20 @@ impl AutoHold {
     }
 }
 
-/// 1 本の接続の、遅れの量の選び（ゲームのスレッドが持つ。確保しない）。
+/// 1本の接続の遅れの量の選び（ゲームのスレッドが持つ。確保しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelayPick {
     host: bool,
     mode: Mode,
-    /// 押した（か推奨値で作った）がまだネットワーク側へ渡していない値（`take` で取る）。
+    /// 押した（か推奨値で作った）がまだネットワーク側へ渡していない値（`take`で取る）。
     pending: Option<u8>,
     /// 最後に作った値（ログ用）。
     last: Option<u8>,
     /// 数字キーの押下の回数。
     digits: u32,
-    /// delay 方式の推奨値を出したか、それより先に数字キーで値を作ったか。
+    /// delay方式の推奨値を出したか、それより先に数字キーで値を作ったかどうか。
     first_done: bool,
-    /// 接続前にメニュー（か ini の auto）で決めた遅延（ホストだけが使う）。
+    /// 接続前にメニュー（かiniのauto）で決めた遅延（ホストだけが使う）。
     start: Option<DelayChoice>,
 }
 
@@ -286,12 +295,12 @@ impl DelayPick {
         }
     }
 
-    /// 接続前に決めた遅延を設定する（ホストの `begin_match` が使う。ゲストは使わない。両者が決めると 2 つの値が競う）。
+    /// 接続前に決めた遅延を設定する（ホストの`begin_match`が使う。ゲストは使わない。両者が決めると2つの値が競う）。
     pub fn set_start(&mut self, c: Option<DelayChoice>) {
         self.start = c;
     }
 
-    /// 形式の切替で作り直す: 形式を替え、渡す前の値と接続前の遅延は捨てる（切替の STEP の D が新しい形式の初めの値になる）。
+    /// 形式の切替で作り直す: 形式を替え、渡す前の値と接続前の遅延は捨てる（切替のSTEPのDが新しい形式の初めの値になる）。
     /// 押下の回数はそのまま。
     pub fn switch_mode(&mut self, mode: Mode) {
         self.mode = mode;
@@ -325,8 +334,10 @@ impl DelayPick {
         self.digits
     }
 
-    /// マッチの始まり: ホストで、まだ値を作っていなければ 1 回だけ初めの値を作る。接続前に決めた遅延（`set_start`）があればそれ、
-    /// 無ければ delay 方式だけ今の推奨値（測れていなければ作らず、次のマッチの始まりで見る）。rollback の初めの値は AGREE の D のまま。
+    /// マッチの始まり: ホストでまだ値を作っていなければ1回だけ初めの値を作る。
+    /// 接続前に決めた遅延（`set_start`）があればそれを使う。
+    /// 無ければdelay方式だけ今の推奨値を使う（測れていなければ作らず次のマッチの始まりで見る）。
+    /// rollbackの初めの値はAGREEのDのまま。
     /// ゲストは何もしない。
     pub fn begin_match(&mut self, rtt_ms: Option<u32>) {
         if !self.host || self.first_done {
@@ -348,8 +359,8 @@ impl DelayPick {
         }
     }
 
-    /// 数字キーの押下を呼び手が直に `Connected::press_delay` へ渡した後に知らせる: 渡す前の値（マッチの始まりの初めの値）は捨てる（数字が後勝ち）。
-    /// ログ用の `chosen` は押した値。
+    /// 数字キーの押下を呼び出し側が直に`Connected::press_delay`へ渡した後に知らせる: 渡す前の値（マッチの始まりの初めの値）は捨てる（数字が後勝ち）。
+    /// ログ用の`chosen`は押した値。
     pub fn note_digit(&mut self, x: u8) {
         self.digits = self.digits.saturating_add(1);
         self.pending = None;
@@ -369,7 +380,7 @@ mod tests {
     #[test]
     fn the_delay_recommendation_rounds_the_one_way_frames_up() {
         let r = |ms| recommend(Mode::Delay, Some(ms));
-        // 0〜33 ms は 1（推奨の下限）、34 ms で 2。
+        // 0〜33 msは1（推奨の下限）。34 msで2。
         assert_eq!(r(0), Some(1), "推奨の下限 1（0 は人が選ぶ値）");
         assert_eq!(r(1), Some(1));
         assert_eq!(r(33), Some(1), "0.99 フレーム");
@@ -415,7 +426,7 @@ mod tests {
         }
     }
 
-    /// 境目は手で数えた値（rollback は最大 16 ms で 0・17 ms で 1、delay 方式は 8 ms で 0・9 ms で 1。中央値は小さくてよい）。
+    /// 境目は手で数えた値（rollbackは最大16 msで0・17 msで1、delay方式は8 msで0・9 msで1。中央値は小さくてよい）。
     #[test]
     fn zero_is_recommended_only_when_the_window_max_is_within_the_mode_threshold() {
         assert_eq!((ZERO_MAX_ROLLBACK_MS, ZERO_MAX_DELAY_MS), (16, 8));
@@ -435,7 +446,7 @@ mod tests {
         assert_eq!(dl(2, 9), Some(1));
         assert_eq!(dl(2, 16), Some(1), "rollback のしきい値では 0 にしない");
         assert_eq!(dl(70, 70), Some(3));
-        // 最大が無い（ウィンドウが 3 個に満たない・往復を持たない呼び手）なら 0 を推さない。
+        // 最大が無い（ウィンドウが3個に満たない・往復を持たない呼び出し側）なら0を推さない。
         for mode in [Mode::Delay, Mode::Rollback] {
             assert_eq!(recommend_with_max(mode, Some(0), None), Some(1), "{mode:?}");
             assert_eq!(recommend_with_max(mode, None, Some(0)), None, "{mode:?}");
@@ -448,7 +459,7 @@ mod tests {
         }
     }
 
-    /// `up` は中央値と最大の両方から 5 ms を引く: 0 から上がるのは最大がしきい値 + 5 ms を越えたとき（rollback は 22 ms、delay 方式は 14 ms）。
+    /// `up`は中央値と最大の両方から5 msを引く: 0から上がるのは最大がしきい値 + 5 msを越えたとき（rollbackは22 ms、delay方式は14 ms）。
     #[test]
     fn the_pair_with_a_max_keeps_zero_until_the_max_clears_threshold_plus_margin() {
         let p = |mode, med, max| Recommend::from_rtt_max(mode, Some(med), Some(max));
@@ -596,12 +607,12 @@ mod tests {
         );
     }
 
-    /// `AutoHold` は方式によらず推奨値の組だけを見る。境目は delay 方式の式で手で数える。
+    /// `AutoHold`は方式によらず推奨値のペアだけを見る。境目はdelay方式の式で手で数える。
     fn rec(rtt: u32) -> Option<Recommend> {
         Recommend::from_rtt(Mode::Delay, Some(rtt))
     }
 
-    /// 旗を立てて最初の適用を済ませた AutoHold（以降の seg の始まりは余裕つきの規則で動く）。
+    /// フラグを立てて最初の適用を済ませたAutoHold（以降のマッチの始まりは余裕つきの規則で動く）。
     fn used(first_rtt: u32) -> AutoHold {
         let mut a = AutoHold::default();
         a.raise();
@@ -609,8 +620,8 @@ mod tests {
         a
     }
 
-    /// 境目は手で数えた値（delay 方式は RTT × 3 / 100 の切り上げ: 33 ms で 1、34 ms で 2。「−5 ms」の側は 38 ms で 1、39 ms で 2。
-    /// rollback は 100 ms で 1、101 ms で 2。「−5 ms」の側は 105 ms で 1、106 ms で 2）。
+    /// 境目は手で数えた値（delay方式は RTT × 3 / 100 の切り上げ: 33 msで1、34 msで2。「−5 ms」の側は38 msで1、39 msで2。
+    /// rollbackは100 msで1、101 msで2。「−5 ms」の側は105 msで1、106 msで2）。
     #[test]
     fn the_recommend_pair_takes_the_margin_off_only_the_up_side() {
         assert_eq!(UP_MARGIN_MS, 5);
@@ -657,7 +668,7 @@ mod tests {
         assert_eq!(Recommend::flat(3), Recommend { raw: 3, up: 3 });
     }
 
-    /// 境目（今 1 で往復 34〜38 ms は据え置き・39 ms 以上で 2）は手で書いた値。
+    /// 境目（今1で往復34〜38 msは据え置き・39 ms以上で2）は手で書いた値。
     #[test]
     fn the_up_move_needs_the_margin() {
         for ms in 34..=38u32 {
@@ -668,7 +679,7 @@ mod tests {
         let mut a = used(33);
         let p = a.pick_head(1, rec(39)).unwrap();
         assert_eq!(p, HeadPick { d: 2, held: false }, "往復 39 ms で上がる");
-        // 上げる先は「−5 ms」の側の値（71 ms: 素は 3、−5 ms の側は 2）。
+        // 上げる先は「−5 ms」の側の値（71 ms: 素は3、−5 msの側は2）。
         let mut b = used(33);
         assert_eq!(b.pick_head(1, rec(71)).unwrap().d, 2);
         let mut c = used(33);
@@ -678,7 +689,7 @@ mod tests {
         );
     }
 
-    /// 手で書いた並び（今 3 → 低い 2 回で 2 / 今 5 の素 2 → 素 3 は大きい方の 3）。
+    /// 手で書いた並び（今3 → 低い2回で2 / 今5の素2 → 素3は大きい方の3）。
     #[test]
     fn the_down_move_needs_two_low_heads_in_a_row_and_restarts_when_one_is_between() {
         assert_eq!(DOWN_RUN, 2);
@@ -730,7 +741,7 @@ mod tests {
 
     #[test]
     fn the_press_and_the_first_use_take_the_raw_value_at_once() {
-        // 9 を押した瞬間: 往復 34 ms は素 2（余裕つきなら今 1 のまま）。
+        // 9を押した瞬間: 往復34 msは素2（余裕つきなら今1のまま）。
         let mut a = AutoHold::default();
         a.raise();
         assert_eq!(a.pick_now(rec(34)), Some(2));
@@ -763,7 +774,7 @@ mod tests {
         assert_eq!(off.pick_head(1, rec(34)), None);
     }
 
-    /// 0 の出入り（rollback。中央値 2 ms）: 0 から上がるのは最大 22 ms から、0 へ下がるのは素が 0 の seg の始まりが 2 回続いたとき。
+    /// 0の出入り（rollback。中央値2 ms）: 0から上がるのは最大22 msから。0へ下がるのは素が0のマッチの始まりが2回続いたとき。
     #[test]
     fn auto_holds_zero_until_the_max_clears_the_margin_and_drops_to_zero_after_two_heads() {
         let r = |max| Recommend::from_rtt_max(Mode::Rollback, Some(2), Some(max));
@@ -806,7 +817,7 @@ mod tests {
             "間に 0 でない回が挟まれば数え直し"
         );
         assert_eq!(b.pick_head(1, r(10)).unwrap().d, 1);
-        // 押した瞬間・最初の適用は素の 0 をすぐ使う。
+        // 押した瞬間・最初の適用は素の0をすぐ使う。
         let mut c = AutoHold::default();
         c.raise();
         assert_eq!(
@@ -826,7 +837,7 @@ mod tests {
         assert!(!a.is_on());
         assert_eq!(a.pick_head(3, rec(40)), None);
         a.raise();
-        // 立て直しの最初の適用は素の推奨値（今 3、素 2）。
+        // 立て直しの最初の適用は素の推奨値（今3、素2）。
         assert_eq!(a.pick_now(rec(40)), Some(2));
         assert_eq!(
             a.pick_head(3, rec(40)).unwrap(),

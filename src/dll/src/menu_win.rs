@@ -1,10 +1,10 @@
-//! メニューとライフの約 1 ms ごとの読み取りのスレッド（Win32 の層。unsafe はここにもある。1 つずつ `// SAFETY:`）。
+//! メニューとライフの約1 msごとの読み取りのスレッド（Win32の層。unsafeはここにもある。1つずつ`// SAFETY:`）。
 //!
-//! - 読み方は自分のプロセスへの `ReadProcessMemory`（`OwnProcess`）。MainMenu は解放された後もポインタが残るので、解放された所を読んでも落ちない読み方でたどる
-//!   （ページが無ければ失敗が返るだけ。値は当てにしない）。
-//! - 間隔は高分解能の待機タイマー（Windows 10 1803 から）で 1 ms。作れなければ `Sleep(1)`（既定では約 15.6 ms まで延びる。実際の間隔は集計に出る）。
-//! - 変わったときだけ `_menu.csv` に 1 行（判定と行は `menu.rs`）。1 秒ごとに `_menu.csv` を flush し、集計を共有の `Shared.stats` へコピーする。
-//! - スレッドの入口はパニックを外へ出さない。ゲームのスレッドには触らない（読むのは `stub::SEQ` の原子変数だけ）。ゲームのメモリは読むだけ。
+//! - 読み方は自分のプロセスへの`ReadProcessMemory`（`OwnProcess`）。
+//!   MainMenuは解放された後もポインタが残るので、解放された所を読んでも例外を出さない読み方でたどる（ページが無ければ失敗が返るだけ。値は当てにしない）。
+//! - 間隔は高分解能の待機タイマー（Windows 10 1803から）で1 ms。作れなければ`Sleep(1)`（既定では約15.6 msまで延びる。実際の間隔は集計に出る）。
+//! - 変わったときだけ`_menu.csv`に1行（判定と行は`menu.rs`）。1秒ごとに`_menu.csv`をflushし、集計を共有の`Shared.stats`へコピーする。
+//! - スレッドの入口はパニックを外へ出さない。ゲームのスレッドには触らない（読むのは`stub::SEQ`のアトミック変数だけ）。ゲームのメモリは読むだけ。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -29,9 +29,9 @@ use windows_sys::Win32::System::Threading::{
 use crate::menu::{MENU_CSV_HEADER, MemRead, MenuWatch, TickStats, TimerMode, read_sample};
 use crate::stub;
 
-/// 待機タイマーの 1 回の待ち（100 ns 単位。負は「今から」の相対）。1 ms。
+/// 待機タイマーの1回の待ち（100 ns単位。負は「今から」の相対）。1 ms。
 const WAIT_1MS_100NS: i64 = -10_000;
-/// タイマーが鳴らないときの歯止め（ms）。止まらずに `stop` を見に戻る。
+/// タイマーが鳴らないときの歯止め（ms）。止まらずに`stop`を見に戻る。
 const WAIT_GUARD_MS: u32 = 100;
 
 pub struct OwnProcess;
@@ -40,8 +40,8 @@ impl MemRead for OwnProcess {
     fn u32_at(&mut self, addr: u32) -> Option<u32> {
         let mut v: u32 = 0;
         let mut n: usize = 0;
-        // SAFETY: 自分のプロセスの擬似ハンドルと、読むアドレス・書く先（スタックの `v` の 4 バイト）・長さ・読めたバイト数の書く先を渡す
-        // だけ。読めなければ OS が失敗を返す。
+        // SAFETY: 自分のプロセスの擬似ハンドルと読むアドレス・書き込み先（スタックの`v`の4バイト）・長さ・読めたバイト数の書き込み先を渡すだけ。
+        // 読めなければOSが失敗を返す。
         let ok = unsafe {
             ReadProcessMemory(
                 GetCurrentProcess(),
@@ -57,7 +57,7 @@ impl MemRead for OwnProcess {
 
 fn qpc() -> i64 {
     let mut q: i64 = 0;
-    // SAFETY: `q` は書ける i64（LARGE_INTEGER と同じ大きさ）。XP 以降は失敗しない。
+    // SAFETY: `q`は書き込み可能なi64（LARGE_INTEGERと同じ大きさ）。XP以降は失敗しない。
     unsafe { QueryPerformanceCounter(&mut q) };
     q
 }
@@ -69,12 +69,12 @@ fn qpc_frequency() -> i64 {
     f
 }
 
-/// 高分解能の待機タイマー（作れなければ `None`）。スレッドの中で作り、そのスレッドで閉じる。
+/// 高分解能の待機タイマー（作れなければ`None`）。スレッドの中で作り、そのスレッドで閉じる。
 struct Timer(HANDLE);
 
 impl Timer {
     fn new() -> Option<Timer> {
-        // SAFETY: 属性 NULL・名前 NULL（名前なし）・旗と権利を渡すだけ。古い Windows で旗が分からなければ NULL が返る。
+        // SAFETY: 属性NULL・名前NULL（名前なし）・旗と権利を渡すだけ。古いWindowsで旗が分からなければNULLが返る。
         let h = unsafe {
             CreateWaitableTimerExW(
                 core::ptr::null(),
@@ -88,7 +88,7 @@ impl Timer {
 
     fn wait_1ms(&self) {
         let due = WAIT_1MS_100NS;
-        // SAFETY: `self.0` はいま作ってまだ閉じていないタイマー。`due` はこの呼び出しの間生きている。周期 0（1 回だけ）、完了ルーチンなし、電源の復帰なし。
+        // SAFETY: `self.0`はいま作ってまだ閉じていないタイマー。`due`はこの呼び出しの間生きている。周期0（1回だけ）・完了ルーチンなし・電源の復帰なし。
         let ok = unsafe { SetWaitableTimer(self.0, &due, 0, None, core::ptr::null(), 0) };
         if ok == 0 {
             sleep_1ms();
@@ -104,7 +104,7 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        // SAFETY: `new` で作ったハンドルを 1 回だけ閉じる。
+        // SAFETY: `new`で作ったハンドルを1回だけ閉じる。
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -182,7 +182,7 @@ fn run_loop(shared: &Shared, file: &mut dyn Write) {
     let to_us = |d: i64| (d.max(0) as u128 * 1_000_000 / qpf as u128) as u64;
     write(file, format!("{MENU_CSV_HEADER}\n").as_bytes(), &mut local);
     let mut mem = OwnProcess;
-    // メニューのフレームごとの行は開発用のビルドだけ（配るバージョンは状態が変わった行だけ）。
+    // メニューのフレームごとの行は開発用のビルドだけ（配布バージョンは状態が変わった行だけ）。
     let mut watch = MenuWatch::new(!cfg!(feature = "dist"));
     let t0 = qpc();
     let mut last = t0;
@@ -230,7 +230,7 @@ fn publish(shared: &Shared, file: &mut dyn Write, local: &mut TickStats, watch: 
 
 #[cfg(test)]
 mod tests {
-    //! 本物の Win32 を、検査のプロセス自身に当てる（花映塚は使わない）。MainMenu などの値は意味の無いものになる（落ちないことを見る）。
+    //! 本物のWin32を検査のプロセス自身に当てる（花映塚は使わない）。MainMenuなどの値は意味の無いものになる（例外を出さないことを見る）。
     use super::*;
 
     static SAMPLE: u32 = 0x1234_5678;

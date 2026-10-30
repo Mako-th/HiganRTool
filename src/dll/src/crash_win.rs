@@ -1,11 +1,11 @@
-//! 致命的な例外を本ログへ残す（ベクタ化した例外ハンドラ）。th09.exe はトップレベルのフィルタを自分で差し替えうるので、VEH で見る。
-//! 1 次例外を見るので、ゲームや OS が自分で受けて続ける例外も行になる（行の文は「見た」で、落ちたとは限らない）。
-//! 同じ（コード, 場所）の例外は最初の 1 回だけ行にし、繰り返しは数えるだけ。別の組は 32 件まで行にする。
-//! ハンドラはヒープを確保せず、ロックを取らず、いつも `EXCEPTION_CONTINUE_SEARCH` を返す（例外の処理を変えない）。
-//! 致命的でないコードは比べるだけで戻るので、普段の経路には何も足さない。
+//! 致命的な例外を本ログへ残す（ベクタ化した例外ハンドラ）。th09.exeはトップレベルのフィルタを自分で差し替えうる。そのためVEHで見る。
+//! 1次例外を見る。そのためゲームやOSが自分で受けて続ける例外も行になる（行の文は「見た」とだけ書く。落ちたとは限らない）。
+//! 同じ（コード, 場所）の例外は最初の1回だけ行にし、繰り返しは数えるだけ。別の（コード, 場所）は32件まで行にする。
+//! ハンドラはヒープを確保せずロックも取らない。いつも`EXCEPTION_CONTINUE_SEARCH`を返す（例外の処理を変えない）。
+//! 致命的でないコードは比べるだけで戻るので普段の経路には何も足さない。
 //!
-//! ハンドラは外さない。入れる前に DLL を固定（PIN）するので、プロセスの終わり（DLL_PROCESS_DETACH の後も）までハンドラのコードは
-//! 写像されたままで、使うのは原子変数と、複製してどこでも閉じないログのハンドルだけ。
+//! ハンドラは外さない。登録する前にDLLを固定（PIN）するのでプロセスの終わり（DLL_PROCESS_DETACHの後も）までハンドラのコードは写像されたままになる。
+//! 使うのはアトミック変数と、複製してどこでも閉じないログのハンドルだけ。
 
 mod line;
 
@@ -32,26 +32,27 @@ use line::{
     fatal_name, file_name_utf8, format_seen,
 };
 
-/// ハンドラが書くログのハンドル（本ログの複製）。NULL の間は書かない。
+/// ハンドラが書くログのハンドル（本ログの複製）。NULLの間は書かない。
 static LOG: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 /// 致命的なコードの例外を見た回数（繰り返しも含む）。
 static SEEN: AtomicU32 = AtomicU32::new(0);
-/// 行にした（コード, 場所）の組。
+/// 行にした（コード, 場所）のペア。
 static KINDS: Kinds = Kinds::new();
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// 本ログ `log` の複製へ書くハンドラを入れる（プロセスで 1 回）。ゲームのスレッドでは呼ばない。
+/// 本ログ`log`の複製へ書くハンドラを登録する（プロセスで1回）。ゲームのスレッドでは呼ばない。
 pub fn install(log: &File) -> Result<(), String> {
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Err("既に登録済み".to_string());
     }
-    // 本ログの書き手は自分のスレッドが終わると閉じるので、ハンドラには閉じない複製を持たせる（同じファイルオブジェクトなので、
-    // 書く位置は通常の書き手と共有され、上書きし合わない）。
+    // 本ログの書き手は自分のスレッドが終わると閉じる。
+    // そのためハンドラには閉じない複製を持たせる。
+    // 同じファイルオブジェクトなので書く位置は通常の書き手と共有され、上書きし合わない。
     let dup = log
         .try_clone()
         .map_err(|e| format!("ログのハンドルが複製不可: {e}"))?;
     let mut pinned: HMODULE = core::ptr::null_mut();
-    // SAFETY: 旗は「アドレスから引く」＋「固定する」。第 2 引数はこの DLL の中の関数のアドレスを指す疑似ポインタで、中身は読まれない。
+    // SAFETY: フラグは「アドレスから取得する」＋「固定する」。第2引数はこのDLLの中の関数のアドレスを指す疑似ポインタ。中身は読まれない。
     let ok = unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -63,7 +64,7 @@ pub fn install(log: &File) -> Result<(), String> {
         return Err("DLL 固定不能（外さないハンドラを登録できません）".to_string());
     }
     LOG.store(dup.into_raw_handle(), Ordering::Release);
-    // SAFETY: 渡す関数は PVECTORED_EXCEPTION_HANDLER の形で、上で固定した DLL の中にあり、プロセスの終わりまで呼べる。
+    // SAFETY: 渡す関数はPVECTORED_EXCEPTION_HANDLERの形。上で固定したDLLの中にあり、プロセスの終わりまで呼べる。
     let handle = unsafe { AddVectoredExceptionHandler(0, Some(on_exception)) };
     if handle.is_null() {
         return Err("AddVectoredExceptionHandler が失敗しました".to_string());
@@ -76,7 +77,7 @@ pub fn seen_count() -> u32 {
     SEEN.load(Ordering::Relaxed)
 }
 
-/// 終了時に本ログへ足す 1 行。致命的なコードの例外を 1 回も見ていなければ None。
+/// 終了時に本ログへ足す1行。致命的なコードの例外を1回も見ていなければNone。
 pub fn summary_line() -> Option<String> {
     let seen = seen_count();
     if seen == 0 {
@@ -96,7 +97,7 @@ pub fn summary_line() -> Option<String> {
 }
 
 unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: OS が渡す EXCEPTION_POINTERS と、その指す EXCEPTION_RECORD はハンドラの間有効。NULL なら見ない。
+    // SAFETY: OSが渡すEXCEPTION_POINTERSとその指すEXCEPTION_RECORDはハンドラの間有効。NULLなら見ない。
     let rec = unsafe { info.as_ref().and_then(|p| p.ExceptionRecord.as_ref()) };
     if let Some(rec) = rec {
         let n = rec.NumberParameters as usize;
@@ -110,7 +111,7 @@ unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// 数えて、初めての（コード, 場所）なら 1 行書く。大きなバッファは下の関数の中に確保し、ここのフレームは小さく保つ。
+/// 数える。初めての（コード, 場所）なら1行書く。大きなバッファは下の関数の中に確保し、ここのフレームは小さく保つ。
 fn observe(code: u32, addr: u32, params: &[usize]) {
     if fatal_name(code).is_none() {
         return;
@@ -130,7 +131,7 @@ fn observe(code: u32, addr: u32, params: &[usize]) {
     }
 }
 
-/// スタックオーバーフロー用。残りのスタックが少ないので、小さなバッファだけで、モジュールも時刻も引かない。
+/// スタックオーバーフロー用。残りのスタックが少ないので小さなバッファだけを使い、モジュールも時刻も取得しない。
 #[inline(never)]
 fn write_small(log: *mut c_void, nth: u32, code: u32, addr: u32) {
     let mut buf = [0u8; 192];
@@ -173,7 +174,7 @@ fn write_full(log: *mut c_void, nth: u32, code: u32, addr: u32, params: &[usize]
     write_raw(log, buf.get(..n).unwrap_or(&[]));
 }
 
-/// `NtQueryVirtualMemory` の `MemoryMappedFilenameInformation` の出力。先頭が UNICODE_STRING で、文字列はその直後に続く。
+/// `NtQueryVirtualMemory`の`MemoryMappedFilenameInformation`の出力。先頭がUNICODE_STRING。文字列はその直後に続く。
 #[repr(C)]
 struct SectionName {
     length: u16,
@@ -182,16 +183,16 @@ struct SectionName {
     path: [u16; 300],
 }
 
-/// `MEMORY_INFORMATION_CLASS::MemoryMappedFilenameInformation`（winternl.h / ntifs.h の列挙の 3 番目）。
+/// `MEMORY_INFORMATION_CLASS::MemoryMappedFilenameInformation`（winternl.h / ntifs.hの列挙の3番目）。
 const MEMORY_MAPPED_FILENAME_INFORMATION: i32 = 2;
 
-/// `addr` を含むモジュールのファイル名と RVA。ヒープもローダーロックも使わない（呼び出し側のバッファに書く）。
-/// 先頭は `VirtualQuery` の `AllocationBase`（イメージの写像の先頭）、名前は `NtQueryVirtualMemory` が返す写像のパスの最後の部分。
-/// `GetModuleFileNameW` はローダーロックを取りうるので使わない（ほかのスレッドがロックを持ったまま、このスレッドを待っていると止まる）。
-/// 名前が引けなければ `?`。イメージの外なら引けなかった扱い。
+/// `addr`を含むモジュールのファイル名とRVA。ヒープもローダーロックも使わない（呼び出し側のバッファに書く）。
+/// 先頭は`VirtualQuery`の`AllocationBase`（イメージの写像の先頭）。名前は`NtQueryVirtualMemory`が返す写像のパスの最後の部分。
+/// `GetModuleFileNameW`はローダーロックを取りうるので使わない（ほかのスレッドがロックを持ったままこのスレッドを待っていると止まる）。
+/// 名前が取得できなければ`?`。イメージの外なら取得できなかった扱い。
 fn module_at<'a>(addr: u32, name: &'a mut [u8; 96]) -> Place<'a> {
     let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: アドレスの領域を調べるだけ（`addr` を読み書きしない）。`info` は書ける MEMORY_BASIC_INFORMATION で、その大きさを渡す。
+    // SAFETY: アドレスの領域を調べるだけ（`addr`を読み書きしない）。`info`は書き込み可能なMEMORY_BASIC_INFORMATION。その大きさを渡す。
     let got = unsafe {
         VirtualQuery(
             addr as usize as *const c_void,
@@ -209,7 +210,7 @@ fn module_at<'a>(addr: u32, name: &'a mut [u8; 96]) -> Place<'a> {
         buffer: core::ptr::null_mut(),
         path: [0; 300],
     };
-    // SAFETY: 自分のプロセス（疑似ハンドル）の `addr` の写像のパスを `section` に書かせるだけ。渡す大きさは `section` の大きさそのもの。
+    // SAFETY: 自分のプロセス（疑似ハンドル）の`addr`の写像のパスを`section`に書かせるだけ。渡す大きさは`section`の大きさそのもの。
     let status = unsafe {
         NtQueryVirtualMemory(
             GetCurrentProcess(),
@@ -244,15 +245,15 @@ fn current_thread_id() -> u32 {
 }
 
 fn write_raw(log: *mut c_void, bytes: &[u8]) {
-    // SAFETY: `log` は `install` で複製し、どこでも閉じないハンドル。`ManuallyDrop` なので、ここでも閉じない。
-    // 書き込みは 1 回の WriteFile 相当で、ヒープもロックも使わない。
+    // SAFETY: `log`は`install`で複製した、どこでも閉じないハンドル。`ManuallyDrop`なのでここでも閉じない。
+    // 書き込みは1回のWriteFile相当。ヒープもロックも使わない。
     let mut f = ManuallyDrop::new(unsafe { File::from_raw_handle(log) });
     let _ = f.write(bytes);
 }
 
 #[cfg(test)]
 mod tests {
-    //! 本物の VEH を、検査のプロセス自身に入れる。致命的なコードは `RaiseException` で投げ、検査の後ろのハンドラが続行させる。
+    //! 本物のVEHを検査のプロセス自身に登録する。致命的なコードは`RaiseException`で投げる。検査の後ろのハンドラが続行させる。
     use super::*;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         RaiseException, RemoveVectoredExceptionHandler,
@@ -263,7 +264,7 @@ mod tests {
     const NOT_FATAL: u32 = 0xE048_4701;
 
     unsafe extern "system" fn continue_ours(info: *mut EXCEPTION_POINTERS) -> i32 {
-        // SAFETY: OS が渡す、ハンドラの間有効な構造体。
+        // SAFETY: OSが渡す、ハンドラの間有効な構造体。
         let Some(rec) = (unsafe { info.as_ref().and_then(|p| p.ExceptionRecord.as_ref()) }) else {
             return EXCEPTION_CONTINUE_SEARCH;
         };
@@ -276,7 +277,7 @@ mod tests {
     }
 
     fn raise(code: u32, args: &[usize]) {
-        // SAFETY: 引数は呼び出しの間生きている配列。印つきの例外は `continue_ours` が続行させるので、ここへ戻る。
+        // SAFETY: 引数は呼び出しの間生きている配列。印つきの例外は`continue_ours`が続行させるのでここへ戻る。
         unsafe { RaiseException(code, 0, args.len() as u32, args.as_ptr()) };
     }
 
@@ -297,7 +298,7 @@ mod tests {
         let file = File::create(&path).unwrap();
         install(&file).unwrap();
         assert!(install(&file).is_err(), "2 回目は入れない");
-        // SAFETY: 渡す関数は PVECTORED_EXCEPTION_HANDLER の形で、検査のバイナリの中にある。後ろへ足すので、上のハンドラが先に見る。
+        // SAFETY: 渡す関数はPVECTORED_EXCEPTION_HANDLERの形で検査のバイナリの中にある。後ろへ足すので上のハンドラが先に見る。
         let cont = unsafe { AddVectoredExceptionHandler(0, Some(continue_ours)) };
         assert!(!cont.is_null());
 
@@ -306,7 +307,7 @@ mod tests {
         assert!(lines(&path).is_empty());
         assert_eq!(summary_line(), None);
 
-        // 同じ場所から 3 回投げても行は 1 本で、残りは繰り返しとして数える。
+        // 同じ場所から3回投げても行は1本で、残りは繰り返しとして数える。
         let site = |i: usize| raise(ACCESS_VIOLATION, &[1, 0x10 + i, MAGIC]);
         for i in 0..3 {
             site(i);
@@ -323,9 +324,9 @@ mod tests {
             l.contains("0xC0000005 アクセス違反（0x00000010 の書き込み）"),
             "{l}"
         );
-        // RaiseException の場所は KernelBase.dll（古い Windows では kernel32.dll）の中。
+        // RaiseExceptionの場所はKernelBase.dll（古いWindowsではkernel32.dll）の中。
         assert!(l.to_ascii_lowercase().contains(".dll+0x"), "{l}");
-        // 場所のアドレスから RVA を引いた値はモジュールの先頭（64 KB 境界）。
+        // 場所のアドレスからRVAを引いた値はモジュールの先頭（64 KB境界）。
         let hex = |s: &str| u32::from_str_radix(&s[2..10], 16).unwrap();
         let at = l.find("場所 0x").unwrap() + "場所 ".len();
         let addr = hex(&l[at..]);
@@ -336,7 +337,7 @@ mod tests {
             "{l}"
         );
 
-        // スタックオーバーフローの経路は、本物を発生させずに直に通す。
+        // スタックオーバーフローの経路は本物を発生させずに直に通す。
         observe(STACK_OVERFLOW, 0x0040_1000, &[]);
         let l = &lines(&path)[1];
         assert!(
@@ -347,7 +348,7 @@ mod tests {
             "{l}"
         );
 
-        // 別のコードは別の組（場所は同じ RaiseException の中）。同じコードの繰り返しは行にならない。
+        // 別のコードは別のペア（場所は同じRaiseExceptionの中）。同じコードの繰り返しは行にならない。
         for _ in 0..8 {
             raise(0xC000_001D, &[MAGIC]);
         }
@@ -356,7 +357,7 @@ mod tests {
         assert_eq!(got.len(), 3, "{got:?}");
         assert!(got[2].contains("不正な命令"), "{}", got[2]);
 
-        // 場所が違えば別の組。32 件目で打ち止めになり、以降の別の組は数えるだけ。
+        // 場所が違えば別のペア。32件目で打ち止めになり、以降の別のペアは数えるだけ。
         for i in 0..40u32 {
             observe(0xC000_0094, 0x0050_0000 + i, &[]);
         }
@@ -367,7 +368,7 @@ mod tests {
             "{}",
             got[31]
         );
-        // 上限の後でも、行にした組の繰り返しは数える。
+        // 上限の後でも行にしたペアの繰り返しは数える。
         site(9);
         assert_eq!(seen_count(), 3 + 1 + 8 + 40 + 1);
         assert_eq!(lines(&path).len(), MAX_LINES as usize);
@@ -379,7 +380,7 @@ mod tests {
             "{sum}"
         );
 
-        // SAFETY: 上で入れた、検査のハンドラのハンドル。
+        // SAFETY: 上で登録した検査のハンドラのハンドル。
         unsafe { RemoveVectoredExceptionHandler(cont) };
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);
@@ -395,7 +396,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let want = exe.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(String::from_utf8_lossy(n), want);
-        // SAFETY: 引数 NULL は自分の実行ファイルの読み込み先頭を返すだけ。
+        // SAFETY: 引数NULLは自分の実行ファイルの読み込み先頭を返すだけ。
         let base = unsafe {
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(core::ptr::null())
         } as usize as u32;

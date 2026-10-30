@@ -1,8 +1,8 @@
-//! peer_sim.exe —— 偽の相手。引数を読み（`cli`）、ネットワークの範囲（`--scope`。既定 loopback）の中の受信ソケットを開き、`sim::run` を回し、記録を書く（`record`）。使い方は `src/peer_sim/README.md`。
-//! パニックしない作り: 失敗は全部 Result で受け、文と終了コードで返す。終了コード: 0 = 全部の seg を終えた（`--follow` では相手の BYE(終了) を受けて終えた）/ 1 = 走ったが終えられなかった / 2 = 引数・ソケット・記録の失敗。
-//! `--compare` / `--compare2` / `--compare-spectate` は 0 = 一致 / 1 = 食い違い（どちらかが 0 行で比べられていないときも）/ 2 = 読めない。
-//! `--watch` は 0 = ホストが BYE(終了) の記録を流すところまで受けた / 1 = それ以外の終わり（ホストが黙った・断られた・打ち切り・別の理由の BYE）/ 2 = 引数・ソケット・記録の失敗。
-//! `--stun-probe` は走らせずに 2 か所の STUN へ聞いて終わる: 0 = 2 か所とも答えた / 2 = 答えが無い・引数の誤り。
+//! peer_sim.exe —— 偽の相手。引数を読み（`cli`）、ネットワークの範囲（`--scope`。既定loopback）の中の受信ソケットを開き、`sim::run`を回し、記録を書く（`record`）。使い方は`src/peer_sim/README.md`。
+//! パニックしない作り: 失敗は全部Resultで受けて文と終了コードで返す。終了コード: 0 = 全部のマッチを終えた（`--follow`では相手のBYE(終了)を受けて終えた）/ 1 = 走ったが終えられなかった / 2 = 引数・ソケット・記録の失敗。
+//! `--compare` / `--compare2` / `--compare-spectate`は 0 = 一致 / 1 = 食い違い（どちらかが0行で比べられていないときも）/ 2 = 読めない。
+//! `--watch`は 0 = ホストがBYE(終了)の記録を流すところまで受けた / 1 = それ以外の終わり（ホストが黙った・断られた・打ち切り・別の理由のBYE）/ 2 = 引数・ソケット・記録の失敗。
+//! `--stun-probe`は走らせずに2か所のSTUNへ聞いて終わる: 0 = 2か所とも答えた / 2 = 答えが無い・引数の誤り。
 
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -25,8 +25,8 @@ use peer_sim::stun_fake::{self, StunFake};
 use peer_sim::stun_probe;
 use peer_sim::watch::{self, WatchEnd};
 
-/// 引数で渡さなかったときの role_nonce（接続ごとに 1 回引く乱数の代わり。暗号には使わない）。同じ PC で 2 つを同時に起動しても重ならないよう、
-/// 時刻（ns）とプロセス番号を混ぜる。
+/// 引数で渡さなかったときのrole_nonce（接続ごとに1回生成する乱数の代わり。暗号には使わない）。
+/// 同じPCで2つを同時に起動しても重ならないよう時刻（ns）とプロセス番号を混ぜる。
 fn default_nonce() -> u64 {
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,8 +44,9 @@ fn default_log_dir() -> Result<PathBuf, String> {
     Ok(dir.join("logs"))
 }
 
-/// `--stun-fake`: 偽の STUN を立て、`max_sec` 秒か落とされるまで待つ。答えが増えたときに問い合わせた相手の送り元を 1 行出す
-/// （LAN の回で「LAN のアドレスから来た」ことの証拠）。何も記録のファイルには書かない。
+/// `--stun-fake`: 偽のSTUNを立てて`max_sec`秒か落とされるまで待つ。
+/// 答えが増えたときに問い合わせた相手の送信元を1行出す（LANの検証で「LANのアドレスから来た」ことの証拠）。
+/// 何も記録のファイルには書かない。
 fn serve_stun_fake(a: &stun_fake::Args) -> Result<(), String> {
     let f = StunFake::spawn_in(a.bind, a.scope, 0)?;
     println!(
@@ -70,8 +71,8 @@ fn serve_stun_fake(a: &stun_fake::Args) -> Result<(), String> {
     Ok(())
 }
 
-/// `--shape`: 遅延とロスを揺らす中継を `max_sec` 秒（か落とされるまで）走らせ、10 秒ごとと終わりに向きごとの数を 1 行出す。
-/// 何も記録のファイルには書かない（数は標準出力の行だけ。回の記録に残したいときは呼び出し側が出力をコピーする）。
+/// `--shape`: 遅延とロスを揺らす中継を`max_sec`秒（か落とされるまで）走らせ、10秒ごとと終わりに向きごとの数を1行出す。
+/// 何も記録のファイルには書かない（数は標準出力の行だけ。実行の記録に残したいときは呼び出し側が出力をコピーする）。
 fn serve_shape(a: &shape::Args) -> Result<(), String> {
     println!(
         "peer_sim: 中継 A {} ⇄ [{} 中継 {}] ⇄ B {}（{} 秒か落とされるまで）",
@@ -97,8 +98,8 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `--watch`: 観戦者を走らせ、要約を出し、マッチの入力ワードの CSV と記録の CSV を回ごとに別名で書く。
-/// 戻り値は「ホストが BYE(終了) を流すところまで受けたか」。
+/// `--watch`: 観戦者を走らせ、要約を出し、マッチの入力ワードのCSVと記録のCSVを実行ごとに別名で書く。
+/// 戻り値は「ホストがBYE(終了)を流すところまで受けたか」。
 fn watch_main(w: &cli::WatchCli) -> Result<bool, String> {
     let log_dir = match &w.log_dir {
         Some(d) => d.clone(),
@@ -142,7 +143,7 @@ fn compare_spectate_main(
     let ptext = read(player)?;
     let p =
         compare_spectate::parse_player(&ptext).map_err(|e| format!("{}: {e}", player.display()))?;
-    // 押下は、観戦者の記録の CSV があり、対戦する2人の側が peer_sim の記録（`# 押下` の行を持つ）のときだけ比べる。
+    // 押下は観戦者の記録のCSVがあり、対戦する2人の側がpeer_simの記録（`# 押下`の行を持つ）のときだけ比べる。
     let steps = match events {
         Some(e) => {
             let ws =
@@ -213,7 +214,7 @@ fn real_main() -> Result<bool, String> {
             return Ok(ok);
         }
         Ok(Parsed::StunProbe(a)) => {
-            // 走らせずに 2 か所の STUN へ聞いて終わる（`stun_probe`）。答えが無ければ Err（終了コード 2）。
+            // 走らせずに2か所のSTUNへ聞いて終わる（`stun_probe`）。答えが無ければErr（終了コード2）。
             let sock =
                 UdpSocket::bind(a.bind).map_err(|e| format!("{} で待てない: {e}", a.bind))?;
             let r = stun_probe::run(&a, &sock, |h, p| {
@@ -236,9 +237,9 @@ fn real_main() -> Result<bool, String> {
         Some(d) => d.clone(),
         None => default_log_dir()?,
     };
-    // 走らせる前に出力先のフォルダをチェックする（実行し終えてから書けないと分かるのを避ける）。
+    // 走らせる前に出力先のフォルダをチェックする（実行し終えてから書き込めないと分かるのを避ける）。
     record::refuse_game_folder(&log_dir)?;
-    // 選択の台本は接続する前に読む（誤りがあれば 1 通も送らずに断る）。
+    // 選択の台本は接続する前に読む（誤りがあれば1通も送らずに断る）。
     let menu = match &c.menu {
         Some(p) => Some(menu_plan::load(p)?),
         None => None,
@@ -258,7 +259,7 @@ fn real_main() -> Result<bool, String> {
     if let Some(m) = &menu {
         println!("peer_sim: 選択の台本 {} 項目", m.items.len());
     }
-    // rollback を望む実行だけ 1 行出す（既定の delay 方式の実行の出力は変えない）。
+    // rollbackを望む実行だけ1行出す（既定のdelay方式の実行の出力は変えない）。
     if c.mode.mode == higanr_core::wire::Mode::Rollback {
         println!(
             "peer_sim: rollback を望む（D {}・R {}・時刻合わせ {}。相手も望めば rollback、でなければ delay 方式）",
@@ -280,11 +281,11 @@ fn real_main() -> Result<bool, String> {
             c.sim.max_ms / 1_000
         );
     }
-    // 範囲を広げた実行だけ 1 行出す（既定の loopback の実行の出力は変えない）。
+    // 範囲を広げた実行だけ1行出す（既定のloopbackの実行の出力は変えない）。
     if c.scope != higanr_core::guard::Scope::Loopback {
         println!("peer_sim: ネットワークの範囲 {}", c.scope.name());
     }
-    // 観戦のポート（`--spectate-host`）。観戦用の接続コードを 1 行出す（観戦者の `--watch --code` へ渡す）。
+    // 観戦のポート（`--spectate-host`）。観戦用の接続コードを1行出す（観戦者の`--watch --code`へ渡す）。
     let spectate = match &c.spectate {
         Some(s) => {
             let sp_sock = UdpSocket::bind(s.bind)
@@ -316,7 +317,7 @@ fn real_main() -> Result<bool, String> {
             mode: c.mode,
             ahead: c.ahead,
             time_sync: c.time_sync,
-            // 偽の相手はホストの決め方を名乗らない（相手が使っても役は role_nonce のまま。検査は `run_opts` で直に設定する）。
+            // 偽の相手はホストの決め方を名乗らない（相手が使っても役はrole_nonceのまま。検査は`run_opts`で直に設定する）。
             host_pick: None,
         },
     )

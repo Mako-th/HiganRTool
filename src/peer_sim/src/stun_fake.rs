@@ -1,7 +1,8 @@
-//! 偽の STUN の応答役（検査のツール）。本物の STUN サーバーへの問い合わせは外へ出る通信なので、検査は loopback に立てたこれで、dll と peer_sim の「STUN の Binding を送って受ける口」を見る。
-//! 受けた Binding Request に、送り元のアドレスを XOR-MAPPED-ADDRESS に載せた Success Response を返す（本物と同じ答え方。loopback なので答えは 127.0.0.1:ポート）。組み立ては `higanr_core::stun::encode_binding_success`。既定は受信ソケットも相手も loopback だけ。
-//! ネットワークの範囲を広げる形（`spawn_in`）: 問い合わせの送り元のガードを `guard::allows(scope, 送り元)` にする。受信ソケットは `127.0.0.1` のままにできる —— `bind = auto` の dll は LAN のアドレスから送るので送り元は LAN のアドレスになるが、宛先は同じ PC の 127.0.0.1 なので、Windows のファイアウォールの確認のダイアログは出ない。
-//! 受信ソケット自体も範囲のガード（`guard::check_bind`）を通せば LAN のアドレスに開ける（範囲を広げた引数のときだけ）。
+//! 偽のSTUNの応答役（検査のツール）。本物のSTUNサーバーへの問い合わせは外へ出る通信なので、検査はloopbackに立てたこれでdllとpeer_simの「STUNのBindingを送って受ける処理」を見る。
+//! 受けたBinding Requestに送り元のアドレスをXOR-MAPPED-ADDRESSに載せたSuccess Responseを返す（本物と同じ答え方。loopbackなので答えは127.0.0.1:ポート）。組み立ては`higanr_core::stun::encode_binding_success`。既定は受信ソケットも相手もloopbackだけ。
+//! ネットワークの範囲を広げる形（`spawn_in`）では、問い合わせの送り元のガードを`guard::allows(scope, 送り元)`にする。
+//! 受信ソケットは`127.0.0.1`のままにできる。`bind = auto`のdllはLANのアドレスから送るので送り元はLANのアドレスになるが、宛先は同じPCの127.0.0.1なのでWindowsのファイアウォールの確認ダイアログは出ない。
+//! 受信ソケット自体も範囲のガード（`guard::check_bind`）を通せばLANのアドレスに開ける（範囲を広げた引数のときだけ）。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -13,16 +14,16 @@ use std::time::Duration;
 use higanr_core::guard::{self, Scope};
 use higanr_core::stun::{self, MAX_SUCCESS_LEN};
 
-/// 単体で起動する形（`peer_sim --stun-fake ADDR`。LAN の回で手で起動して落とす）の引数。
+/// 単体で起動する形（`peer_sim --stun-fake ADDR`。LANの検証で手で起動して止める）の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub bind: SocketAddr,
     pub scope: Scope,
-    /// 自分で終わる秒数（落とし忘れて受信ソケットが残らないための上限）。
+    /// 自分で終わる秒数（止め忘れて受信ソケットが残らないための上限）。
     pub max_sec: u32,
 }
 
-/// `Args::max_sec` の既定（30 分。実機の検証の `limit_min` は最長 60 分で、STUN は接続の始めに 1 回聞かれるだけなので足りる）。
+/// `Args::max_sec`の既定（30分。実機の検証の`limit_min`は最長60分でSTUNは接続の始めに1回聞かれるだけなので足りる）。
 pub const DEFAULT_MAX_SEC: u32 = 1_800;
 
 pub const MAX_MAX_SEC: u32 = 7_200;
@@ -30,7 +31,7 @@ pub const MAX_MAX_SEC: u32 = 7_200;
 /// 走っている間に検査が回せるつまみ（聞き直しの検査が「答えのポートを途中で変える」「答えを止める」のに使う）。
 struct Dials {
     shift: AtomicU16,
-    /// true の間は、問い合わせを数えるだけで答えない（答えの返らない STUN）。
+    /// trueの間は、問い合わせを数えるだけで答えない（答えの返らないSTUN）。
     silent: AtomicBool,
     received: AtomicU32,
 }
@@ -45,13 +46,13 @@ pub struct StunFake {
 }
 
 impl StunFake {
-    /// `127.0.0.1` の空いたポートに立てる。見えたアドレスは送り元のまま（宛先に依らない割り当てのルーターの形）。
+    /// `127.0.0.1`の空いたポートに立てる。見えたアドレスは送り元のまま（宛先に依らない割り当てのルーターの形）。
     pub fn spawn() -> Result<StunFake, String> {
         Self::spawn_shifted(0)
     }
 
-    /// `spawn` と同じで、答えに載せるポートを送り元のポート + `shift`（65535 を越えたら回り、0 になれば 1）にする。宛先に依って外側のポートが
-    /// 変わるルーター（RFC 4787 の endpoint-dependent mapping）を模す検査用（`--stun-probe` の「ポートが違う」の形）。
+    /// `spawn`と同じで、答えに載せるポートを送り元のポート + `shift` にする（65535を越えたら回り、0になれば1）。
+    /// 宛先に依って外側のポートが変わるルーター（RFC 4787のendpoint-dependent mapping）を模す検査用（`--stun-probe`の「ポートが違う」の形）。
     pub fn spawn_shifted(shift: u16) -> Result<StunFake, String> {
         Self::spawn_in(
             SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -60,8 +61,8 @@ impl StunFake {
         )
     }
 
-    /// `bind` に立て、`scope` の範囲の相手だけに答える（`spawn` は `127.0.0.1:0` と `Scope::Loopback`）。
-    /// 受信ソケットは開く前に範囲のガード（`guard::check_bind`。0.0.0.0 など未指定アドレスも断る）を通す。
+    /// `bind`に立て、`scope`の範囲の相手だけに答える（`spawn`は`127.0.0.1:0`と`Scope::Loopback`）。
+    /// 受信ソケットは開く前に範囲のガード（`guard::check_bind`。0.0.0.0など未指定アドレスも断る）を通す。
     pub fn spawn_in(bind: SocketAddr, scope: Scope, shift: u16) -> Result<StunFake, String> {
         guard::check_bind(bind, scope, "受信ソケット")?;
         let sock = UdpSocket::bind(bind).map_err(|e| format!("{bind} で待てない: {e}"))?;
@@ -115,12 +116,12 @@ impl StunFake {
         self.dials.shift.store(shift, Ordering::Relaxed);
     }
 
-    /// true の間は答えない（問い合わせは `received` に数える。検査用）。
+    /// trueの間は答えない（問い合わせは`received`に数える。検査用）。
     pub fn set_silent(&self, silent: bool) {
         self.dials.silent.store(silent, Ordering::Relaxed);
     }
 
-    /// 受けた Binding Request の数（答えなかったものを含む）。`answered` は答えた数。
+    /// 受けたBinding Requestの数（答えなかったものを含む）。`answered`は答えた数。
     pub fn received(&self) -> u32 {
         self.dials.received.load(Ordering::Relaxed)
     }
@@ -148,8 +149,8 @@ fn serve(
         if dials.silent.load(Ordering::Relaxed) {
             continue;
         }
-        // 送る前に数える（送った後に数えると、クライアントが答えを受けて `answered()` を見る方が先になり「答えを受けたのに 0」と読める）。
-        // 送りに失敗したら数えと送り元を戻す。
+        // 送る前に数える。送った後に数えると、クライアントが答えを受けて`answered()`を見る方が先になり「答えを受けたのに0」と読める。
+        // 送信に失敗したらカウントと送り元を元に戻す。
         let prev = last_from.lock().ok().and_then(|g| *g);
         if let Ok(mut g) = last_from.lock() {
             *g = Some(from);
@@ -164,8 +165,8 @@ fn serve(
     }
 }
 
-/// 受けた 1 通への答え（`out` に書いた長さ）。範囲の外の送り元と、Binding Request でないものには答えない（None）。送り元のアドレスを持たない
-/// 検査でもガードを見られるよう、socket から切り離してある。
+/// 受けた1通への答え（`out`に書いた長さ）。範囲の外の送り元とBinding Requestでないものには答えない（None）。
+/// 送り元のアドレスを持たない検査でもガードを見られるよう、socketから切り離してある。
 fn reply_for(
     scope: Scope,
     from: SocketAddr,
@@ -181,7 +182,7 @@ fn reply_for(
     Some(stun::encode_binding_success(txn, seen, out))
 }
 
-/// 答えに載せるポート（0 はアドレスとして使えないので 1 に）。検査が「見えるはずのアドレス」を作るのに使う。
+/// 答えに載せるポート（0はアドレスとして使えないので1に）。検査が「見えるはずのアドレス」を作るのに使う。
 pub fn shifted_port(port: u16, shift: u16) -> u16 {
     match port.wrapping_add(shift) {
         0 => 1,
@@ -216,7 +217,7 @@ mod tests {
         let (n, from) = c.recv_from(&mut buf).unwrap();
         assert_eq!(from, f.addr());
         assert_eq!(stun::decode_binding_response(&buf[..n], &txn), Ok(me));
-        // 応答役は送ってから数を足すので、受けた直後はまだ 0 のことがある。少し待って見る。
+        // 応答役は送ってから数を足すので受けた直後はまだ0のことがある。少し待って見る。
         let t0 = std::time::Instant::now();
         while f.answered() == 0 && t0.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(1));

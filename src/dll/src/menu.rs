@@ -1,11 +1,17 @@
-//! メニューとライフの約 1 ms ごとの読み取りの、判定と行と間隔の集計（pure。unsafe 無し）。
+//! メニューとライフを約1 msごとに読み取る処理の判定・行・間隔の集計（pure。unsafe無し）。
 //!
-//! MainMenu `[0x4AC8C0]` は解放された後も 0 に戻らないので、入口ではたどらない。別のスレッドが約 1 ms ごとに、落ちない読み方（自分のプロセスへの `ReadProcessMemory`。本物は `menu_win.rs`）で読み、
-//! 変わったときだけ、読む前と読んだ後の番号（`stub::SEQ`）を添えて `_menu.csv` に 1 行書く。`anim` は毎フレーム変わるので値だけ残す。ReplayManager のカウンタ（値だけ）・Live / Replay・Gui の会話の状態と、その 2 つのポインタも読む。
-//! `seq_before` は読む直前に入口が取った番号の数（= 次に取られる番号）、`seq_after` は読んだ直後のそれ。2 つが同じなら読んでいる間に入口は通っていない。違えばその間に入口が通ったので、フレームの判定が ±1 になる。
-//! 一時停止（`PAUSE` のバイトと `PAUSE_MENU` の状態・フレームの数え）と終わりのメニュー（`MATCH_END_MENU` のバイトと `END_MENU`）も読む。
-//! 戻り道（`higanr_core::return_flow`）が読むアドレスを、戻り道を動かさない実機の検証で検証する材料（照らす側は `higanr_core::return_obs`）。
-//! フレームの数えは毎フレーム変わるので、開発用のビルドだけが変化の判定に入れる（`MenuWatch::new(true)`）。
+//! MainMenu `[0x4AC8C0]`は解放された後も0に戻らないので入口ではたどらない。
+//! 別のスレッドが約1 msごとに、例外を出さない読み方（自分のプロセスへの`ReadProcessMemory`。本物は`menu_win.rs`）で読む。
+//! 変わったときだけ、読む前と読んだ後の番号（`stub::SEQ`）を添えて`_menu.csv`に1行書く。
+//! `anim`は毎フレーム変わるので値だけ残す。
+//! ReplayManagerのカウンタ（値だけ）・Live / Replay・Guiの会話の状態とその2つのポインタも読む。
+//! `seq_before`は読む直前に入口が取った番号の数（= 次に取られる番号）。
+//! `seq_after`は読んだ直後のそれ。
+//! 2つが同じなら読んでいる間に入口は通っていない。
+//! 違えばその間に入口が通ったので、フレームの判定が ±1になる。
+//! 一時停止（`PAUSE`のバイトと`PAUSE_MENU`の状態・フレームの数え）と終わりのメニュー（`MATCH_END_MENU`のバイトと`END_MENU`）も読む。
+//! 戻り道（`higanr_core::return_flow`）が読むアドレスを、戻り道を動かさない実機の検証でチェックする材料（突き合わせる側は`higanr_core::return_obs`）。
+//! フレームの数えは毎フレーム変わるので開発用のビルドだけが変化の判定に含める（`MenuWatch::new(true)`）。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -39,11 +45,11 @@ pub struct MenuSample {
     pub replay_mode: Option<u32>,
     pub gui_ptr: Option<u32>,
     pub gui_talk: Option<u32>,
-    /// 一時停止のバイト（下位 1 バイト）と、一時停止のメニューの状態・フレームの数え。メニューが出ていない間の状態・数えは前の値のまま。
+    /// 一時停止のバイト（下位1バイト）と一時停止のメニューの状態・フレームの数え。メニューが出ていない間の状態・数えは前の値のまま。
     pub pause_flag: Option<u32>,
     pub pause_state: Option<u32>,
     pub pause_frames: Option<u32>,
-    /// マッチの終わりのメニューの印（下位 1 バイト）と、そのメニューの状態・フレームの数え。
+    /// マッチ終了時のメニューの印（下位1バイト）とそのメニューの状態・フレームの数え。
     pub end_flag: Option<u32>,
     pub end_state: Option<u32>,
     pub end_frames: Option<u32>,
@@ -54,7 +60,7 @@ fn deref(m: &mut dyn MemRead, ptr: Option<u32>, off: u32) -> Option<u32> {
     m.u32_at(p.checked_add(off)?)
 }
 
-/// 1 回の読み（ポインタは 1 回ずつ読み、その値から欄をたどる）。
+/// 1回の読み（ポインタは1回ずつ読み、その値から欄をたどる）。
 pub fn read_sample(m: &mut dyn MemRead) -> MenuSample {
     let menu_ptr = m.u32_at(MAIN_MENU_PTR);
     let p1_ptr = m.u32_at(P1_PLAYER_PTR);
@@ -78,7 +84,7 @@ pub fn read_sample(m: &mut dyn MemRead) -> MenuSample {
         replay_mode: deref(m, replay_ptr, REPLAY_MODE),
         gui_ptr,
         gui_talk: deref(m, gui_ptr, GUI_TALK),
-        // 旗は隣の欄を巻き込まないよう 1 バイトだけ使う。メニューの状態・数えは固定のアドレスで、ポインタをたどらない。
+        // フラグは隣のフィールドを巻き込まないよう1バイトだけ使う。メニューの状態・数えは固定のアドレスから読みポインタをたどらない。
         pause_flag: m.u32_at(PAUSE).map(|v| v & 0xFF),
         pause_state: m.u32_at(PAUSE_MENU + MENU_OBJ_STATE),
         pause_frames: m.u32_at(PAUSE_MENU + MENU_OBJ_FRAMES),
@@ -89,9 +95,9 @@ pub fn read_sample(m: &mut dyn MemRead) -> MenuSample {
 }
 
 impl MenuSample {
-    /// 変化の判定に使う欄（5 欄とライフ 2 つ、Live / Replay と会話の状態、一時停止と終わりのメニューの旗と状態）。ポインタ・`anim`・
-    /// ReplayManager のカウンタは入れない（ポインタが 0 になればその先の欄が「読めない」に変わるので行は出る）。メニューのフレームの数えは
-    /// 毎フレーム変わるので、`per_frame` のときだけ入れる（メニューが開いている間は 1 フレームに 1 行になる）。
+    /// 変化の判定に使うフィールド（5フィールドとライフ2つ・Live / Replayと会話の状態・一時停止と終わりのメニューのフラグと状態）。
+    /// ポインタ・`anim`・ReplayManagerのカウンタは含めない（ポインタが0になればその先のフィールドが「読めない」に変わるので行は出る）。
+    /// メニューのフレームの数えは毎フレーム変わるので`per_frame`のときだけ含める（メニューが開いている間は1フレームに1行になる）。
     fn key(&self, per_frame: bool) -> [Option<u32>; KEY_LEN] {
         let frames = |v: Option<u32>| if per_frame { v } else { None };
         [
@@ -114,10 +120,10 @@ impl MenuSample {
     }
 }
 
-/// 変化の判定に使う欄の数（`MenuSample::key`）。
+/// 変化の判定に使うフィールドの数（`MenuSample::key`）。
 const KEY_LEN: usize = 15;
 
-/// `_menu.csv` の見出し。照らす側（`return_obs::parse_menu_csv`）と同じ 1 つを使う。
+/// `_menu.csv`のヘッダ。突き合わせる側（`return_obs::parse_menu_csv`）と同じ1つを使う。
 pub use higanr_core::return_obs::MENU_CSV_HEADER;
 
 fn dec(v: Option<u32>) -> String {
@@ -137,7 +143,7 @@ pub struct MenuWatch {
 }
 
 impl MenuWatch {
-    /// `per_frame` が真なら、メニューのフレームの数えが変わるたびに行を出す（開発用のビルドだけ。配るバージョンは状態の変化だけ）。
+    /// `per_frame`が真ならメニューのフレームの数えが変わるたびに行を出す（開発用のビルドだけ。配布バージョンは状態の変化だけ）。
     pub fn new(per_frame: bool) -> MenuWatch {
         MenuWatch {
             per_frame,
@@ -193,10 +199,10 @@ pub enum TimerMode {
     Sleep1,
 }
 
-/// 間隔（前の読みから今の読みまで）の区分の境目（ミリ秒）。1 ms と `Sleep(1)` の既定の間隔（約 15.6 ms）の前後を細かく分ける。
+/// 間隔（前の読みから今の読みまで）の区分の境目（ミリ秒）。1 msと`Sleep(1)`の既定の間隔（約15.6 ms）の前後を細かく分ける。
 pub const TICK_EDGES_MS: [f64; 10] = [0.5, 0.9, 1.1, 1.5, 2.0, 3.0, 5.0, 10.0, 15.0, 17.0];
 
-/// 間隔の集計（ツールの精度）。区分ごとの数と最小・最大・和だけ持つ（15 分で約 90 万回）。
+/// 間隔の集計（ツールの精度）。区分ごとの数と最小・最大・和だけ持つ（15分で約90万回）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TickStats {
     pub mode: TimerMode,
@@ -320,7 +326,7 @@ mod tests {
             (REPLAY + REPLAY_MODE, 1),
             (GUI_PTR, GUI),
             (GUI + GUI_TALK, u32::MAX - 1), // −2（会話中）
-            // 旗は下位 1 バイトだけ使う（上位の欄は無視される）。
+            // 旗は下位1バイトだけ使う（上位の欄は無視される）。
             (PAUSE, 0x7F00_0001),
             (PAUSE_MENU + MENU_OBJ_STATE, 2),
             (PAUSE_MENU + MENU_OBJ_FRAMES, 9),

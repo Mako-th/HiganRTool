@@ -1,12 +1,11 @@
-//! rollback の状態機械（`src/core/src/rollback.rs`）の検査。
-//! - **偽のゲーム**（`FakeGame`）: 入力の履歴で決まる状態、コピー 1 枠と書き戻し、ライフ 0 で更新の列が変わる場面の境目、一時停止（走査は進まないが入力は読む tick）、
-//!   状態の外の欄（つなぎ・場面の要求。書き戻しで戻す）、戻せない副作用、進め直しの間の出力（SE の数）。
-//! - **偽のネットワーク**（`run`）: 1 ms 刻みの時計、片道の遅れ、決め打ちの列と固定 seed の乱れ（落とす・遅らせる・重ねる）。送るものは wire の encode → decode を通す。
-//!   両端は rollback の状態機械 ＋ 偽のゲーム（片端を delay 方式にした形も）。
-//! - **参照**（`reference`）: 同じ入力を本物の `Lockstep`（delay 方式）で回した実行。合格は、rollback の両端が流した確定の (seg, frame, p1, p2) の列と、
-//!   30 フレームごとの確定の始まりの状態（CHECK の値）が参照と一致すること。
+//! rollbackのステートマシン（`src/core/src/rollback.rs`）の検査。
+//! - **偽のゲーム**（`FakeGame`）: 入力の履歴で決まる状態、コピー1枠と書き戻し、ライフ0で更新の列が変わる場面の境目、一時停止（走査は進まないが入力は読むtick）、状態の外のフィールド（つなぎ・場面の要求。書き戻しで戻す）、戻せない副作用、進め直しの間の出力（SEの数）。
+//! - **偽のネットワーク**（`run`）: 1 ms刻みの時計、片道の遅れ、決め打ちの列と固定seedの乱れ（落とす・遅らせる・重ねる）。送るものはwireのencode → decodeを通す。
+//!   両端はrollbackのステートマシン ＋ 偽のゲーム（片端をdelay方式にした形も）。
+//! - **参照**（`reference`）: 同じ入力を本物の`Lockstep`（delay方式）で回した実行。
+//!   合格は、rollbackの両端が出力した確定の (seg, frame, p1, p2)の列と、30フレームごとの確定の始まりの状態（CHECKの値）が、参照と一致すること。
 //!
-//! 期待値は参照の実行から取る（rollback の式から作らない）。式の検査（⑤）は、ゲームの側が数えた更新・コピー・書き戻しの回数と、状態機械の `stats()`、参照の seg の長さを突き合わせる。
+//! 期待値は参照の実行から取る（rollbackの式から作らない）。式の検査（⑤）はゲームの側が数えた更新・コピー・書き戻しの回数と、ステートマシンの`stats()`、参照のsegの長さを突き合わせる。
 
 use higanr_core::auth::{AuthKey, Secret};
 use higanr_core::check::is_check_frame;
@@ -23,7 +22,7 @@ use higanr_core::wire::{self, Check, Input, LatChange, MAX_DATAGRAM, Message, Se
 // ---------------------------------------------------------------- 偽のゲーム
 
 const LIFE: u8 = 6;
-/// 一時停止の押下（どちらの語のこのビットでも。押した瞬間に切り替わる）。
+/// 一時停止の押下（どちらのワードのこのビットでも。押した瞬間に切り替わる）。
 const PAUSE_BIT: u16 = 0x4000;
 
 fn mix(h: u64, x: u64) -> u64 {
@@ -43,7 +42,7 @@ struct World {
     paused_ticks: u32,
 }
 
-/// コピーの範囲の外の欄（実物のつなぎ `0x4ACFC8`〜と Supervisor の `+0x58C` / `+0x590` に当たる）。
+/// コピーの範囲の外のフィールド（実物のつなぎ`0x4ACFC8`〜とSupervisorの`+0x58C` / `+0x590`に当たる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Outside {
     /// 更新の列の種類（要求が立つと変わる）。
@@ -61,7 +60,7 @@ enum Sabotage {
 }
 
 struct FakeGame {
-    /// 場面の始まりのライフ（既定は `LIFE`）。
+    /// 場面の始まりのライフ（既定は`LIFE`）。
     life: u8,
     world: World,
     outside: Outside,
@@ -179,7 +178,7 @@ impl Window for FakeGame {
             self.outside.req = false;
             self.world.chain = mix(self.world.chain, 0xDEAD);
         }
-        // 一時停止: 押した瞬間に切り替わる。止まっている間は世界を進めない（走査が 1 を返す）が、入力は読む。
+        // 一時停止: 押した瞬間に切り替わる。止まっている間は世界を進めない（走査が1を返す）が、入力は読む。
         let held = (t.p1 | t.p2) & PAUSE_BIT != 0;
         if held && !self.world.pause_held {
             self.world.paused = !self.world.paused;
@@ -239,7 +238,7 @@ impl Window for FakeGame {
     }
 }
 
-/// 台 `node` が seg `seg` の capture_frame `c` に取る語（台本）。5 フレームほど同じ語が続く（人の入力に近い形）。
+/// 台`node`がseg `seg`のcapture_frame `c`に取るワード（台本）。5フレームほど同じワードが続く（人の入力に近い形）。
 fn word(node: usize, seg: u16, c: u32) -> u16 {
     let block = u64::from(c + 2 * node as u32) / 5;
     let z = mix(mix(node as u64 + 1, u64::from(seg)), block);
@@ -250,11 +249,11 @@ fn word(node: usize, seg: u16, c: u32) -> u16 {
     w
 }
 
-/// 台 0 = 席 2P、台 1 = 席 1P（席と台の番号をわざと入れ違いにする）。
+/// 台 0 = サイド2P、台 1 = サイド1P（サイドと台の番号をわざと入れ違いにする）。
 const SEATS: [Seat; 2] = [Seat::P2, Seat::P1];
 const ROLES: [Role; 2] = [Role::Host, Role::Guest];
 
-// ---------------------------------------------------------------- 参照（delay 方式）
+// ---------------------------------------------------------------- 参照（delay方式）
 
 struct RefRun {
     confirmed: Vec<(u16, u32, u16, u16)>,
@@ -263,7 +262,7 @@ struct RefRun {
     paused_ticks: u32,
 }
 
-/// 本物の `Lockstep` を 2 台、ネットワークなし（即時に届く）で回す。同じ入力・同じ偽のゲーム。D は全部の seg で `delay`。
+/// 本物の`Lockstep`を2台ネットワークなし（即時に届く）で回す。同じ入力・同じ偽のゲーム。Dは全部のsegで`delay`。
 fn reference(delay: u8, segs: u32) -> RefRun {
     reference_seq(&vec![delay; segs as usize])
 }
@@ -272,7 +271,7 @@ fn reference_life(delay: u8, segs: u32, life: u8) -> RefRun {
     reference_seq_life(&vec![delay; segs as usize], life)
 }
 
-/// seg ごとの D（`delays[k]` が seg k の D）で回す参照。D は seg の始まりで決まり途中では変わらないので、seg ごとに `Lockstep` を作り直す。
+/// segごとのD（`delays[k]`がseg kのD）で回す参照。Dはsegの始まりで決まり途中では変わらない。そのためsegごとに`Lockstep`を作り直す。
 fn reference_seq(delays: &[u8]) -> RefRun {
     reference_seq_life(delays, LIFE)
 }
@@ -359,7 +358,7 @@ fn net_key() -> AuthKey {
     AuthKey::derive(&Secret([0x7E; 16]), 0x5EED)
 }
 
-/// 偽のネットワークの向きの鍵（封じた形だけを通す。偽のネットワークは両方向に同じ 1 本を使う）。
+/// 偽のネットワークの向きの鍵（封じた形だけを通す。偽のネットワークは両方向に同じ1本を使う）。
 fn net_dir() -> higanr_core::seal::DirKeys {
     higanr_core::seal::DirKeys::from_raw([0x7F; 32], [0x7F; 32])
 }
@@ -379,16 +378,16 @@ struct SendInfo {
     from: usize,
     #[allow(dead_code)] // 乱れの決め方に使いたいとき用（いまは使う検査が無い）
     kind: Kind,
-    /// その送り手がその seg の INPUT を送った通し番号（0 から。前の seg の INPUT への返信（バックアップ）は数えない）。乱れの決め方に使う。
+    /// その送信元がそのsegのINPUTを送った通し番号（0から。前のsegのINPUTへの返信（バックアップ）は数えない）。乱れの決め方に使う。
     nth: u32,
-    /// 送る INPUT の seg（前の seg のバックアップの返信ではその前の seg）。
+    /// 送るINPUTのseg（前のsegのバックアップの返信ではその前のseg）。
     seg: u16,
-    /// 載せた lat（ホストの D の予定・ゲストの要求）。
+    /// 載せたlat（ホストのDの予定・ゲストの要求）。
     lat: Option<LatChange>,
 }
 
-/// マッチの途中の Ctrl＋数字の押下（台 `node` が、seg `seg` の取得のフレーム `frame` の取得の前に `press_delay(x)` する）。
-/// ホスト（台 0）なら予定、ゲスト（台 1）なら要求。
+/// マッチの途中のCtrl＋数字の押下（台`node`がseg `seg`の取得のフレーム`frame`の取得の前に`press_delay(x)`する）。
+/// ホスト（台0）なら予定、ゲスト（台1）なら要求。
 #[derive(Debug, Clone, Copy)]
 struct PressAt {
     node: usize,
@@ -403,52 +402,53 @@ enum Fate {
     Drop,
     /// 片道の遅れに足す（後に送ったものに追い越される）。
     Delay(u64),
-    /// 1 通はふつうに、もう 1 通を足した遅れで。
+    /// 1通はふつうに、もう1通を足した遅れで。
     Dup(u64),
 }
 
 struct Scenario {
     cfg: [Config; 2],
     segs: u32,
-    /// seg ごとの D（`delays[k]` が seg k の D）。rollback ではホスト = 台 0 がマッチの終わりに `press_delay` で押す。
-    /// seg 0 は `cfg` の D（AGREE の値）と同じにしておく。
+    /// segごとのD（`delays[k]`がseg kのD）。rollbackではホスト = 台0がマッチの終わりに`press_delay`で押す。
+    /// seg 0は`cfg`のD（AGREEの値）と同じにしておく。
     delays: Vec<u8>,
     one_way_ms: u64,
     start_ms: [u64; 2],
     load_ms: [u64; 2],
     sabotage: Sabotage,
-    /// 台ごとの 1 フレームの長さ（µs）。既定は両方 `FRAME_MS`。違えると速い側が少しずつ先へずれる（時刻合わせの検査用）。
-    /// 1 ms 刻みの時計の上では、枠の始まりを µs で数え、その µs を越えた最初の ms に走らせる。
+    /// 台ごとの1フレームの長さ（µs）。既定は両方`FRAME_MS`。違えると速い側が少しずつ先へずれる（時刻合わせの検査用）。
+    /// 1 ms刻みの時計の上では枠の始まりをµsで数え、そのµsを越えた最初のmsに走らせる。
     period_us: [u64; 2],
     life: u8,
     max_ms: u64,
-    /// 台ごとに、格子を寄せられるか（b-spin のウィンドウ = true、ゲーム自身の時計のフルスクリーン = false）。寄せられる台は、枠の始まりで
-    /// `Rollback::glide_ppm_with(&glide_params)` が返した量だけ次の枠までの長さを変える。
+    /// 台ごとに格子を寄せられるかどうか（b-spinのウィンドウ = true、ゲーム自身の時計のフルスクリーン = false）。
+    /// 寄せられる台は枠の始まりで`Rollback::glide_ppm_with(&glide_params)`が返した量だけ次の枠までの長さを変える。
     glide: [bool; 2],
     glide_params: GlideParams,
-    /// 寄せる判定に渡す往復（µs）。`None` は片道の 2 倍。
+    /// 寄せる判定に渡す往復（µs）。`None`は片道の2倍。
     glide_rtt_us: Option<u32>,
-    /// `Some(j)` なら寄せる判定の往復を本物と同じ作りにする: 1 秒に 1 回の PONG（往復 = 片道の 2 倍 + 両向きの揺れ 0〜j ms）の
-    /// 直近 8 個の中央値（`liveness::median_ms`。3 個に満たない間は渡さない）。
+    /// `Some(j)`なら寄せる判定の往復を本物と同じ作りにする。
+    /// 往復は1秒に1回のPONG（往復 = 片道の2倍 + 両向きの揺れ0〜j ms）の直近8個の中央値（`liveness::median_ms`。3個に満たない間は渡さない）。
     pong_jitter_ms: Option<u64>,
-    /// `Some(off)` なら台 0 を「ゲーム自身の時計」にする: 時計が `off` µs から数え始め、周期が時計の大きさで 59.987〜60.015 fps に
-    /// 変わり、429.5 秒で 0 に戻って直後の枠が 7.46 ms で来る（`game_period_us`）。`period_us[0]` は使わない。
+    /// `Some(off)`なら台0を「ゲーム自身の時計」にする。
+    /// 時計は`off` µsから数え始める。周期は時計の大きさで59.987〜60.015 fpsに変わる。
+    /// 429.5秒で0に戻る。その直後の枠は7.46 msで来る（`game_period_us`）。`period_us[0]`は使わない。
     game_clock_offset_us: Option<u64>,
-    /// マッチの途中の Ctrl＋数字の押下。空でなければ、`delays` は seg 0 の D だけを使い、seg の始まりの D は前の seg の最後の予定の値になる
-    /// （`judge` もそれで見る）。
+    /// マッチの途中のCtrl＋数字の押下。
+    /// 空でなければ`delays`はseg 0のDだけを使い、segの始まりのDは前のsegの最後の予定の値になる（`judge`もそれで見る）。
     presses: Vec<PressAt>,
-    /// seg ごとの推奨値の組（`Rollback::set_recommend`。`flat_recs` / `rtt_recs` で作る）。
-    /// seg `k` に入った直後・押下より前に両台へ渡す。空なら渡さない。
+    /// segごとの推奨値のペア（`Rollback::set_recommend`。`flat_recs` / `rtt_recs`で作る）。
+    /// seg `k`に入った直後・押下より前に両台へ渡す。空なら渡さない。
     rec_seq: Vec<Recommend>,
-    /// マッチの途中で替える実行の、seg ごとの始まりの D の手書きの期待値。`None` なら前の seg の最後の予定の値。
-    /// 読み込みの間の押下や auto が始まりの D を直に替える実行では手で書く。
+    /// マッチの途中で替える実行のsegごとの始まりのDの手書きの期待値。`None`なら前のsegの最後の予定の値。
+    /// 読み込みの間の押下やautoが始まりのDを直に替える実行では手で書く。
     expect_heads: Option<Vec<u8>>,
 }
 
-/// `PressAt::frame` がこの値なら、その seg の読み込みに入った直後（`begin_seg` の後・最初の取得の前）に押す。
+/// `PressAt::frame`がこの値ならそのsegの読み込みに入った直後（`begin_seg`の後・最初の取得の前）に押す。
 const LOAD_PRESS: u32 = u32::MAX;
 
-/// rollback のモードの台 `i` の設定（台 0 = ホスト・席 2P、台 1 = ゲスト・席 1P）。
+/// rollbackのモードの台`i`の設定（台 0 = ホスト・サイド2P、台 1 = ゲスト・サイド1P）。
 fn rb_cfg(i: usize, delay: u8, ahead: u8) -> Config {
     Config::rollback(SEATS[i], delay, ahead).with_role(ROLES[i])
 }
@@ -505,45 +505,44 @@ struct Node {
     sync_skip: bool,
     /// 時刻合わせの待ちを返された数と、最後の待ちから走らせた更新の数。
     sync_steps: u32,
-    /// そのうち、seg の始まりの 300 フレームを過ぎてからの数。
+    /// そのうち、segの始まりの300フレームを過ぎてからの数。
     sync_steps_steady: u32,
     since_sync: u32,
-    /// 台ごとの時刻合わせの待ちの最悪: 直近 `RECENT_UPDATES` 更新の中の時刻合わせの待ちの数の、seg をまたいだ最大。数を出すだけで合否は付けない。
+    /// 台ごとの時刻合わせの待ちの最悪: 直近`RECENT_UPDATES`更新の中の時刻合わせの待ちの数の最大（segをまたいで取る）。数を出すだけで合否は付けない。
     updates_run: u32,
     recent_waits: Vec<u32>,
     worst_recent_waits: u32,
-    /// 格子を寄せた枠の数・1 フレームの長さの変化の最大（ppm の絶対値）・寄せた量の絶対値の合計 / 正味の合計（µs）。
+    /// 格子を寄せた枠の数・1フレームの長さの変化の最大（ppmの絶対値）・寄せた量の絶対値の合計 / 正味の合計（µs）。
     glide_frames: u32,
     glide_max_ppm: i32,
-    /// そのうち seg の始まりの 300 フレームを過ぎてからの最大・前の枠との差の最大・前の枠の値。
+    /// そのうちsegの始まりの300フレームを過ぎてからの最大・前の枠との差の最大・前の枠の値。
     glide_max_ppm_steady: i32,
     glide_max_step_ppm: i32,
     glide_max_step_ppm_steady: i32,
     glide_prev_ppm: i32,
     glide_abs_us: u64,
     glide_net_us: i64,
-    /// 寄せる判定の往復の作り: 直近の PONG の往復（ms）・次の PONG の時刻（ms）・揺れの乱数。
+    /// 寄せる判定の往復の作り: 直近のPONGの往復（ms）・次のPONGの時刻（ms）・揺れの乱数。
     rtt_hist: Vec<u32>,
     next_pong_ms: u64,
     pong_rng: Rng,
     /// 寄せる判定を呼んだ数と、そのとき「寄せてよい」だった数。
     glide_calls: u32,
     gate_open: u32,
-    /// ゲーム自身の時計の台: 前の枠の時計（折り返しの周期の中の µs）・折り返した時刻（sim の µs）。
+    /// ゲーム自身の時計の台: 前の枠の時計（折り返しの周期の中のµs）・折り返した時刻（simのµs）。
     game_prev_m: u64,
     wrap_times_us: Vec<u64>,
     wait_times_us: Vec<u64>,
-    /// 前の枠の始まりの `sync_steps`（待ちの直後の枠かを見る）と、寄せ幅が 1 枠に 5,000 ppm を越えて変わった数・そのうち前の枠で待ちが
-    /// あった数。
+    /// 前の枠の始まりの`sync_steps`（待ちの直後の枠かを見る）と、寄せ幅が1枠に5,000 ppmを越えて変わった数・そのうち前の枠で待ちがあった数。
     steps_at_prev_slot: u32,
     big_steps: u32,
     big_steps_after_wait: u32,
     big_steps_other: u32,
     last_send: u64,
     stalls: u32,
-    /// ゲストが D 未定で取得を断られた回（`CaptureError::NoDelay`）。ホストでは 0 のはず。
+    /// ゲストがD未定で取得を断られた回（`CaptureError::NoDelay`）。ホストでは0のはず。
     no_delay: u32,
-    /// 更新を走らせた枠ごとの (seg の番号, 更新したフレーム, 更新後の N − F)。時刻合わせの効きを見る。
+    /// 更新を走らせた枠ごとの (segの番号, 更新したフレーム, 更新後の N − F)。時刻合わせの効きを見る。
     ahead_log: Vec<(u32, u32, u32)>,
     prev_front: u32,
     resim_reports: u32,
@@ -555,7 +554,7 @@ struct Outcome {
     nodes: Vec<Node>,
     sent: u32,
     dropped: u32,
-    /// ネットワークへ出た INPUT の lat が取り決めと違った例。
+    /// ネットワークへ出たINPUTのlatが取り決めと違った例。
     wire: Vec<String>,
     prev_replies: u32,
     other_seg: [u32; 2],
@@ -570,10 +569,11 @@ struct Net<'f> {
     seq: higanr_core::seal::Seq,
     sent: u32,
     dropped: u32,
-    /// rollback の両端の実行なら true。ネットワークへ出る INPUT の lat を取り決めと比べる（ホストは全部の INPUT に載せ、frame 0 の値は
-    /// seg ごとに 1 つ、同じ F には同じ値。ゲストは載せないか要求 {seq ≥ 1, x}）。
+    /// rollbackの両端の実行ならtrue。
+    /// ネットワークへ出るINPUTのlatを取り決めと比べる。
+    /// ホストは全部のINPUTに載せ、frame 0の値はsegごとに1つで同じFには同じ値。ゲストは載せないか要求 {seq ≥ 1, x}。
     check_lat: bool,
-    /// マッチの途中の押下の無い実行なら seg ごとの D（frame 0 の値をこれと比べる）。
+    /// マッチの途中の押下の無い実行ならsegごとのD（frame 0の値をこれと比べる）。
     delays: Option<&'f [u8]>,
     seen_sched: std::collections::HashMap<(u16, u32), u8>,
     wire: Vec<String>,
@@ -673,13 +673,13 @@ fn monitor(n: &mut Node, what: &str) {
 
 const MAX_MS: u64 = 120_000;
 
-/// ゲーム自身の時計が 0 に戻る周期（µs）= 2^32 カウント ÷ 10 MHz（実測で 429.506 秒）。
+/// ゲーム自身の時計が0に戻る周期（µs）= 2^32カウント ÷ 10 MHz（実測で429.506秒）。
 const GAME_CLOCK_WRAP_US: u64 = 429_496_730;
-/// 折り返した直後の枠が来るまでの長さ（µs。実測 7.46 ms。ふつうの 16.67 ms より 9.2 ms 短い）。
+/// 折り返した直後の枠が来るまでの長さ（µs。実測7.46 ms。ふつうの16.67 msより9.2 ms短い）。
 const GAME_WRAP_SLOT_US: u64 = 7_460;
 
-/// ゲーム自身の時計が `m` µs（折り返しの周期の中）のときの 1 周期（µs）。実測の表: 32 秒まで 60.000 fps（表に無いのでウィンドウと同じとする）、
-/// 32〜64 秒 0.0166664、64〜128 秒 0.0166702、128 秒から折り返しまで 0.0166626。
+/// ゲーム自身の時計が`m` µs（折り返しの周期の中）のときの1周期（µs）。
+/// 実測の表: 32秒まで60.000 fps（表に無いのでウィンドウと同じとする）、32〜64秒0.0166664、64〜128秒0.0166702、128秒から折り返しまで0.0166626。
 fn game_period_us(m: u64) -> u64 {
     match m / 1_000_000 {
         0..=31 => 16_667,
@@ -689,11 +689,11 @@ fn game_period_us(m: u64) -> u64 {
     }
 }
 
-/// 台ごとの時刻合わせの待ちの数の最大を数える期間（更新の数。60 更新 = 約 1 秒）。
+/// 台ごとの時刻合わせの待ちの数の最大を数える期間（更新の数。60更新 = 約1秒）。
 const RECENT_UPDATES: u32 = 60;
 
 fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
-    // rollback のモードは台 0 がホスト・台 1 がゲスト（取り違えると、ホストの lat をゲストが載せるなどで INPUT が全部捨てられる）。
+    // rollbackのモードは台0がホスト・台1がゲスト（取り違えるとホストのlatをゲストが載せるなどでINPUTが全部捨てられる）。
     for (i, c) in sc.cfg.iter().enumerate() {
         if c.mode() == Mode::Rollback {
             assert_eq!(c.role(), ROLES[i], "台 {i} の役");
@@ -795,7 +795,7 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
             {
                 net.send(t, to, &p, Kind::PrevReply);
             }
-            // 正しい相手の INPUT は、lat の取り決めで捨てられない（捨てられたら模型の送り手が取り決めを破っている）。
+            // 正しい相手のINPUTはlatの取り決めで捨てられない（捨てられたら模型の送信元が取り決めを破っている）。
             if matches!(outcome, RecvOutcome::GuestLat | RecvOutcome::BadLat) {
                 nodes[to]
                     .violations
@@ -804,7 +804,7 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
         }
 
         #[allow(clippy::needless_range_loop)]
-        // nodes[i] を借りたまま net へ送るので、添字のまま書く。
+        // nodes[i]を借りたままnetへ送るので添字のまま書く。
         for i in 0..2 {
             let n = &mut nodes[i];
             let mut new_slot = false;
@@ -845,7 +845,7 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
                         let waited_before = n.sync_steps != n.steps_at_prev_slot;
                         n.steps_at_prev_slot = n.sync_steps;
                         if sc.glide[i] {
-                            // 枠の始まりで 1 回: 本物の dll も、始まりに 1 回だけ要求を読んで格子を動かす。
+                            // 枠の始まりで1回: 本物のdllも始まりに1回だけ要求を読んで格子を動かす。
                             let rtt_us = match sc.pong_jitter_ms {
                                 Some(j) => {
                                     if t >= n.next_pong_ms {
@@ -904,8 +904,9 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
                 n.ran = false;
                 n.sync_skip = false;
             }
-            // 取得は枠の始まりに 1 回。ゲストは seg の D を知るまで断られるので、知るまでは毎 ms 試す（本物の dll は D 未定の間、入力を
-            // 読まずに待つ）。D 未定の間も相手へ 4 ms ごとに語 0 個の INPUT を送り直す。
+            // 取得は枠の始まりに1回。
+            // ゲストはsegのDを知るまで断られる。そのため知るまでは毎ms試す（本物のdllはD未定の間は入力を読まずに待つ）。
+            // D未定の間も相手へ4 msごとにワード0個のINPUTを送り直す。
             if matches!(n.phase, Phase::Play)
                 && !n.rb.captured()
                 && (new_slot || !n.rb.delay_known())
@@ -991,12 +992,12 @@ fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
                     && sc.presses.is_empty()
                     && let Some(&d) = sc.delays.get(n.seg_idx as usize)
                 {
-                    // ホストはマッチの終わり（`begin_seg` の前）に D を押す。今の seg の残りでは届かない予定になり、次の seg の始まりの D になる。
+                    // ホストはマッチの終わり（`begin_seg`の前）にDを押す。今のsegの残りでは届かない予定になり、次のsegの始まりのDになる。
                     n.rb.press_delay(d);
                 }
                 n.rb.begin_seg(next);
                 if n.seg_idx < sc.segs {
-                    // 選択の間（読み込みの間）: 推奨値が替わり、人が押す（`LOAD_PRESS`）。ホストの押下は次の seg の始まりの D になる。
+                    // 選択の間（読み込みの間）: 推奨値が替わり、人が押す（`LOAD_PRESS`）。ホストの押下は次のsegの始まりのDになる。
                     if let Some(&r) = sc.rec_seq.get(n.seg_idx as usize) {
                         n.rb.set_recommend(Some(r));
                     }
@@ -1045,7 +1046,7 @@ fn check_after(n: &mut Node, before: (u32, u32), after: After) {
         let (f1, n1) = (n.rb.front(), n.rb.frame());
         let mut bad = from != f0 || f1 < f0;
         if !n.rb.scene_ended() {
-            // 通常の進め直し: 確定の分だけ F が進み、残りの N − F が予測の回数。N が戻ることもある（境目）。
+            // 通常の進め直し: 確定の分だけFが進み、残りの N − F が予測の回数。Nが戻ることもある（境目）。
             bad |= confirmed != f1 - f0 || predicted != n1 - f1;
         }
         bad |= n1 > n0;
@@ -1088,7 +1089,7 @@ fn jitter(seed: u64, max: u64) -> impl FnMut(&SendInfo) -> Fate {
     move |_| Fate::Delay(r.below(max + 1))
 }
 
-/// ロス 20%・入れ替え 10%・重複 5%・小さな揺らぎ（`lockstep.rs` の模型と同じ割合）。
+/// ロス20%・入れ替え10%・重複5%・小さな揺らぎ（`lockstep.rs`の模型と同じ割合）。
 fn lossy(seed: u64) -> impl FnMut(&SendInfo) -> Fate {
     let mut r = Rng::new(seed);
     move |_| {
@@ -1105,7 +1106,7 @@ fn lossy(seed: u64) -> impl FnMut(&SendInfo) -> Fate {
     }
 }
 
-/// 決め打ち: 60 通に 1 回、続けて 12 通を落とす（バースト）。台 0 → 台 1 の向きだけ 2 通おきに 15 ms 遅らせる。
+/// 決め打ち: 60通に1回、続けて12通を落とす（バースト）。台0 → 台1の向きだけ2通おきに15 ms遅らせる。
 fn burst_loss() -> impl FnMut(&SendInfo) -> Fate {
     let mut count = 0u32;
     move |info| {
@@ -1160,7 +1161,7 @@ impl Totals {
     }
 }
 
-/// 出口の ①〜⑤。落ちたら `Err` に理由を返す（否定の検査が「落ちること」を検証するため、assert にしない）。
+/// 出口の ①〜⑤。落ちたら`Err`に理由を返す（否定の検査が「落ちること」を検証するためassertにしない）。
 fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), String> {
     let e = |m: String| Err(format!("[{label}] {m}"));
     if !out.finished {
@@ -1225,14 +1226,14 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
             ));
         }
         let l: u32 = rf.seg_len.iter().sum();
-        // (F1) 全フレームは確定として 1 回ずつ（入力の地点か進め直しの中で）。
+        // (F1) 全フレームは確定として1回ずつ（入力の地点か進め直しの中で）。
         if s.live_confirmed + s.resim_confirmed_ticks != l {
             return e(format!(
                 "台 {i}: ⑤ 確定の更新 {} + {} != 参照の確定フレーム数 {l}",
                 s.live_confirmed, s.resim_confirmed_ticks
             ));
         }
-        // (F2) ゲームの側が数えた更新の数と、状態機械の数え。
+        // (F2) ゲームの側が数えた更新の数と、ステートマシンが数えた更新の数を比べる。
         let live = s.live_confirmed + s.live_unconfirmed_real + s.live_predicted;
         if n.game.tick_counts != [live, s.resim_confirmed_ticks, s.resim_predicted_ticks] {
             return e(format!(
@@ -1241,7 +1242,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
                 [live, s.resim_confirmed_ticks, s.resim_predicted_ticks]
             ));
         }
-        // (F3) 確定していない状態の上の更新は、進め直しで確定するか、境目より先で捨てたかのどちらか。
+        // (F3) 確定していない状態の上の更新は進め直しで確定するか、境目より先で捨てたかのどちらか。
         let unconf = s.live_unconfirmed_real + s.live_predicted;
         if unconf != s.resim_confirmed_ticks + s.discarded_ticks {
             return e(format!(
@@ -1249,7 +1250,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
                 s.resim_confirmed_ticks, s.discarded_ticks
             ));
         }
-        // (F3b) 予測の tick が立てた待ちは、必ず 3 つのどれかで解ける。
+        // (F3b)予測のtickが立てた待ちは必ず3つのどれかで解ける。
         if s.holds_set != s.holds_ended + s.holds_released + s.holds_rearmed {
             return e(format!(
                 "台 {i}: ⑤ 待ちの数 {} != 場面の終わり {} + 消えた {} + 立て直し {}",
@@ -1273,7 +1274,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
                 n.game.saves, s.saves, s.live_confirmed, s.resims
             ));
         }
-        // (F5) 時刻合わせの待ち: 状態機械の数と、呼び手が `Wait::Sync` を受けた数が同じ。使わない設定では 0。
+        // (F5) 時刻合わせの待ち: ステートマシンの数と呼び出し側が`Wait::Sync`を受けた数が同じ。使わない設定では0。
         if s.waits_sync != n.sync_steps {
             return e(format!(
                 "台 {i}: ⑤ 時刻合わせの待ち {} != 呼び手が受けた数 {}",
@@ -1292,7 +1293,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
                 s.scenes_ended, sc.segs
             ));
         }
-        // (F6) seg ごとの D: 両者とも seg k の D が `delays[k]` に決まった。D 未定で待つのはゲストだけ（ホストは自分で決める）。
+        // (F6) segごとのD: 両者ともseg kのDが`delays[k]`になる。D未定で待つのはゲストだけ（ホストは自分で決める）。
         if sc.cfg[i].mode() == Mode::Rollback {
             assert!(
                 (sc.segs as usize) < SEG_D_LOG,
@@ -1310,7 +1311,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
                     .map(|k| (k as u16, sc.delays[k]))
                     .collect()
             } else {
-                // マッチの途中で替えた実行: seg の始まりの D は、ホストの前の seg の最後の予定の値（無ければ前の seg の始まりの D）。
+                // マッチの途中で替えた実行: segの始まりのDはホストの前のsegの最後の予定の値（無ければ前のsegの始まりのD）。
                 match &sc.expect_heads {
                     Some(v) => {
                         assert_eq!(v.len(), sc.segs as usize, "手書きの始まりの D の数");
@@ -1345,7 +1346,7 @@ fn judge(label: &str, sc: &Scenario, out: &Outcome, rf: &RefRun) -> Result<(), S
     Ok(())
 }
 
-/// マッチの途中で D を替えた実行の、seg ごとの始まりの D（seg k + 1 の始まりは、ホストの記録した seg k の最後の予定の値）。
+/// マッチの途中でDを替えた実行のsegごとの始まりのD（seg k + 1 の始まりはホストの記録したseg kの最後の予定の値）。
 fn expected_seg_starts(host: &Stats, d0: u8, segs: u32) -> Vec<(u16, u8)> {
     assert!(
         (host.d_switches as usize) <= D_SWITCH_LOG,
@@ -1389,10 +1390,11 @@ fn schedules_of(s: &Stats, segs: u32) -> Vec<SegSched> {
         .collect()
 }
 
-/// 予定から、台 `node` の seg `seg` の apply_frame `a` の語を直に組む（状態機械の取得の作りとは別の式）: a が seg の始まりの D より
-/// 小さければ穴埋めの 0。そうでなければ、apply_frame（c + D(c)）が初めて a 以上になる取得のフレーム c を探し、ちょうど a なら
-/// その取得の語、越えていれば（D を上げた境目の隙間）1 つ手前の apply_frame の語。D を下げた後の取得は、その apply_frame が
-/// もっと前の取得で先に届いているので選ばれない。
+/// 予定から台`node`のseg `seg`のapply_frame `a`のワードを直接組む（ステートマシンの取得の作りとは別の式）。
+/// aがsegの始まりのDより小さければ穴埋めの0。
+/// そうでなければapply_frame（c + D(c)）が初めてa以上になる取得のフレームcを探す。
+/// ちょうどaならその取得のワード。越えていれば（Dを上げた境目の隙間）1つ手前のapply_frameのワード。
+/// Dを下げた後の取得は、そのapply_frameがもっと前の取得で先に届いているので選ばれない。
 fn word_at(node: usize, seg: u16, a: u32, sched: &SegSched) -> u16 {
     let (d0, sw) = sched;
     let d_of = |c: u32| {
@@ -1416,8 +1418,8 @@ fn word_at(node: usize, seg: u16, a: u32, sched: &SegSched) -> u16 {
     }
 }
 
-/// マッチの途中で D を替えた実行の参照: 両台の記録した予定から各台の語の列を `word_at` で組み、偽のゲームをネットワークなしで回す。
-/// 期待値の式は状態機械の取得の作りと別に書いた。
+/// マッチの途中でDを替えた実行の参照: 両台の記録した予定から各台のワードの列を`word_at`で組み、偽のゲームをネットワークなしで回す。
+/// 期待値の式はステートマシンの取得の作りと別に書いた。
 fn reference_from_schedules(scheds: &[Vec<SegSched>; 2], segs: u32, life: u8) -> RefRun {
     let mut g = [
         FakeGame::with_life(Sabotage::None, life),
@@ -1583,7 +1585,7 @@ fn jitter_loss_reorder_match_delay_reference() {
         "待ちの種類が足りない: {tot:?}"
     );
     assert!(s.live_predicted > 0 && s.live_confirmed > 0, "{tot:?}");
-    // 読み込みの長さの違う実行が含まれるので、時刻合わせの待ちも通っている。
+    // 読み込みの長さの違う実行が含まれるので時刻合わせの待ちも通っている。
     assert!(s.waits_sync > 0, "時刻合わせの待ちが 1 度も無い: {tot:?}");
     assert!(tot.paused_ticks > 0, "{tot:?}");
     assert!(
@@ -1628,11 +1630,11 @@ fn rollback_and_delay_mode_peers_refuse_each_others_inputs() {
             rbs.config().role() == Role::Host,
             "swap={swap}: rollback のホストだけが lat を載せる"
         );
-        // delay 方式の端が受けると、lat 付き（ホストの rollback）は BadLat。lat 無し（ゲストの rollback）は普通に受かる（その向きは下で押さえる）。
+        // delay方式の端が受けたときの結果: lat付き（ホストのrollback）はBadLat。lat無し（ゲストのrollback）は普通に受理される（その向きは下で検査する）。
         if from_rb.lat.is_some() {
             assert_eq!(dl.on_input(&from_rb), RecvOutcome::BadLat, "swap={swap}");
         }
-        // rollback の端: delay 方式の INPUT は lat が無い。ゲストなら BadLat、ホストなら普通に受かる。
+        // rollbackの端: delay方式のINPUTはlatが無い。ゲストならBadLat、ホストなら普通に受理される。
         let got = rbs.on_input(&from_dl);
         if rbs.config().role() == Role::Guest {
             assert_eq!(got, RecvOutcome::BadLat, "swap={swap}");
@@ -1669,9 +1671,9 @@ fn delay_mode_machine_equals_lockstep() {
     assert_eq!(tot.stats.live_predicted, 0);
 }
 
-// ---------------------------------------------------------------- seg ごとの D
+// ---------------------------------------------------------------- segごとのD
 
-/// ホストの seg の最初の `k` 通（前の seg のバックアップの返信は数えない）を落とす。ほかは普通に届く。
+/// ホストのsegの最初の`k`通（前のsegのバックアップの返信は数えない）を落とす。ほかは普通に届く。
 fn drop_first_host_inputs(k: u32) -> impl FnMut(&SendInfo) -> Fate {
     move |i| {
         if i.from == 0 && i.nth < k && !matches!(i.kind, Kind::PrevReply) {
@@ -1682,7 +1684,7 @@ fn drop_first_host_inputs(k: u32) -> impl FnMut(&SendInfo) -> Fate {
     }
 }
 
-/// ホストの seg の最初の 1 通だけを、`delay` ms 遅らせる（後の INPUT に追い越される）か、`dup` ms 後にもう 1 通足す。
+/// ホストのsegの最初の1通だけを`delay` ms遅らせる（後のINPUTに追い越される）か、`dup` ms後にもう1通足す。
 fn disturb_first_host_input(delay: Option<u64>, dup: Option<u64>) -> impl FnMut(&SendInfo) -> Fate {
     move |i| {
         if i.from == 0 && i.nth == 0 && !matches!(i.kind, Kind::PrevReply) {
@@ -1742,7 +1744,7 @@ fn d_changes_between_matches_and_both_sides_match_the_reference() {
         }
     }
     eprintln!("seg ごとの D: {tot:?} 前の seg のバックアップの返信 {prev_replies}");
-    // 網羅: ゲストが D 未定で待った・予測と進め直しが起きた・前の seg のバックアップの返信に lat が載った。
+    // 網羅: ゲストがD未定で待った・予測と進め直しが起きた・前のsegのバックアップの返信にlatが載った。
     assert!(tot.no_delay > 0, "ゲストが D を待った例が無い: {tot:?}");
     assert!(tot.stats.resims > 0, "{tot:?}");
     assert!(
@@ -1783,7 +1785,7 @@ fn the_guest_waits_for_the_hosts_d_and_the_gates_drop_what_breaks_the_agreement(
         Some(LatChange { frame: 0, delay: 1 }),
         "seg 0 の INPUT にも lat"
     );
-    // ホストは D を 2 に押す。ゲストの語をまだ受けていない（ガードが閉じている）ので予定は出さず、次の seg の始まりの D として持つ。
+    // ホストはDを2に押す。ゲストのワードをまだ受けていない（ガードが閉じている）ので予定は出さず、次のsegの始まりのDとして持つ。
     assert_eq!(host.press_delay(200), DelayPress::Refused);
     assert_eq!(host.press_delay(wire_max_delay() + 1), DelayPress::Refused);
     assert_eq!(host.press_delay(2), DelayPress::Held);
@@ -1826,7 +1828,7 @@ fn the_guest_waits_for_the_hosts_d_and_the_gates_drop_what_breaks_the_agreement(
         "最初の語は apply_frame D"
     );
     assert_eq!(h.lat, Some(LatChange { frame: 0, delay: 2 }));
-    // 取り決めを破る INPUT は、ゲストが D を知らないままでも捨てて、D を採らない。
+    // 取り決めを破るINPUTはゲストがDを知らないままでも捨ててDを採らない。
     let with_lat = |lat: Option<LatChange>| Input { lat, ..h };
     for (what, inp, want) in [
         ("lat なし", with_lat(None), RecvOutcome::BadLat),
@@ -1877,8 +1879,10 @@ fn the_guest_waits_for_the_hosts_d_and_the_gates_drop_what_breaks_the_agreement(
     );
     assert!(matches!(guest.on_input(&h), RecvOutcome::Accepted { .. }));
     assert_eq!(guest.seg_delay(), 2);
-    // D を知った後の seg の途中の予定: 知っている予定より大きい F は置き換え、同じ F で違う値は捨て、
-    // 小さい F は古い便なので lat だけ無視して受ける。
+    // Dを知った後のsegの途中の予定の扱い:
+    // 知っている予定より大きいFは置き換える。
+    // 同じFで違う値は捨てる。
+    // 小さいFは古い便なのでlatだけ無視して受ける。
     assert!(matches!(
         guest.on_input(&with_lat(Some(LatChange {
             frame: 50,
@@ -1915,12 +1919,12 @@ fn a_new_seg_input_arriving_before_the_guests_begin_seg_is_dropped_then_adopted(
     let delays = [1u8, 2, 0];
     let rf = reference_seq(&delays);
     let mut tot = Totals::default();
-    // 裏: 乱れ無しなら、ゲストの OtherSeg は起きない。
+    // 裏: 乱れ無しなら、ゲストのOtherSegは起きない。
     let sc = Scenario::rollback_seq(&delays, 8);
     let out = run(&sc, &mut clean);
     assert_eq!(out.other_seg, [0, 0], "乱れ無しで OtherSeg が起きている");
     expect_ok("clean", &sc, &out, &rf, &mut tot);
-    // 本番: ホストの seg 0 の INPUT を遅らせ、ホストは読み込みを待たずに seg 1 へ入る。
+    // 本番: ホストのseg 0のINPUTを遅らせ、ホストは読み込みを待たずにseg 1へ入る。
     for ahead in [8u8, 2] {
         let mut sc = Scenario::rollback_seq(&delays, ahead);
         sc.load_ms = [0, 300];
@@ -1949,7 +1953,7 @@ fn a_guest_leaving_a_seg_with_d_unknown_keeps_an_empty_prev_and_adopts_the_next_
     host.begin_seg(1);
     guest.begin_seg(1);
     assert!(!guest.delay_known());
-    // seg 1 の最初の取得の前（選択の間と同じ）の押下は、その seg の始まりの D をこの場で替える。
+    // seg 1の最初の取得の前（選択の間と同じ）の押下はそのsegの始まりのDをこの場で替える。
     assert_eq!(host.press_delay(0), DelayPress::Scheduled { frame: 0 });
     assert_eq!(host.seg_delay(), 0);
     host.begin_seg(2);
@@ -1987,7 +1991,7 @@ fn wire_max_delay() -> u8 {
     higanr_core::frame::MAX_DELAY
 }
 
-/// ホストの語 `0x40 + f`（取得のフレーム f）。
+/// ホストのワード`0x40 + f`（取得のフレームf）。
 fn hw(f: u32) -> u16 {
     0x4000 | f as u16
 }
@@ -2023,7 +2027,7 @@ fn the_host_press_switches_lead_frames_ahead_and_fills_or_drops_its_own_words() 
     for f in 4..=f1 + 2 {
         step(&mut host, f);
     }
-    // apply_frame の表（手で数えた）: f < F1 は f + 1、F1 は F1 + 3。その間の F1 + 1・F1 + 2 は直前の入力ワードで埋める。
+    // apply_frameの表（手で数えた）: f < F1 は f + 1、F1は F1 + 3。その間の F1 + 1・F1 + 2 は直前の入力ワードで埋める。
     let inp = host.build_input();
     let at = |a: u32| inp.words[(a - inp.base) as usize];
     assert_eq!(inp.base, f1 + 2 - 10, "ack は 10 フレーム遅れ");
@@ -2036,8 +2040,8 @@ fn the_host_press_switches_lead_frames_ahead_and_fills_or_drops_its_own_words() 
     assert_eq!(at(f1 + 5), hw(f1 + 2));
     assert_eq!(host.stats().d_filled, 2);
     assert_eq!(host.cur_delay(), 3);
-    // フレーム F1 + 3 の取得の前に ← ← で 1 へ（2 回目の押下は 1 回目の予定が届く前。届いていない予定は効かずに消え、
-    // F2 + 1 まで今の D 3 のまま）。
+    // フレーム F1 + 3 の取得の前に ← ← で1へ。
+    // 2回目の押下は1回目の予定が届く前に来る。届いていない予定は効かずに消える。F2 + 1 までは今のD 3のまま。
     let next = f1 + 3;
     let f2 = next + SWITCH_LEAD;
     assert_eq!(host.press_delay(2), DelayPress::Scheduled { frame: f2 });
@@ -2058,7 +2062,7 @@ fn the_host_press_switches_lead_frames_ahead_and_fills_or_drops_its_own_words() 
     );
     let inp = host.build_input();
     let at = |a: u32| inp.words[(a - inp.base) as usize];
-    // 取得 F2 − 1・F2 は D 3。F2 + 1・F2 + 2 は捨てる。
+    // 取得 F2 − 1・F2はD 3。F2 + 1・F2 + 2 は捨てる。
     assert_eq!(at(f2 + 2), hw(f2 - 1), "F2 の手前で D が動いた");
     assert_eq!(
         at(f2 + 3),
@@ -2079,12 +2083,12 @@ fn the_host_press_switches_lead_frames_ahead_and_fills_or_drops_its_own_words() 
     assert_eq!(host.seg_delay(), 1);
     host.begin_seg(2);
     assert_eq!(host.seg_delay(), 1, "押さなければ前の seg の D のまま");
-    // seg 2 の最初の取得の前の押下は、その seg の始まりの D をこの場で替える。
+    // seg 2の最初の取得の前の押下はそのsegの始まりのDをこの場で替える。
     assert_eq!(host.press_delay(0), DelayPress::Scheduled { frame: 0 });
     assert_eq!(host.seg_delay(), 0);
     host.begin_seg(3);
     assert_eq!(host.seg_delay(), 0);
-    // ゲストの押下は要求で、ゲスト自身の D は替わらない（D はホストの予定で決まる）。
+    // ゲストの押下は要求で、ゲスト自身のDは替わらない（Dはホストの予定で決まる）。
     let mut guest = Rollback::new(rb_cfg(1, 1, 8));
     assert_eq!(guest.press_delay(2), DelayPress::Asked { seq: 1 });
     assert_eq!(
@@ -2102,9 +2106,9 @@ fn the_host_press_switches_lead_frames_ahead_and_fills_or_drops_its_own_words() 
     assert_eq!(guest.cur_delay(), 1);
 }
 
-// ---------------------------------------------------------------- マッチの途中の D
+// ---------------------------------------------------------------- マッチの途中のD
 
-/// マッチの途中の押下: seg 0 で 1 → 2（ホスト）→ 0（ゲストの要求）→ 2（ホスト）、seg 1 で → 1（ゲスト）→ 0（ホスト）。
+/// マッチの途中の押下: seg 0で1 → 2（ホスト）→ 0（ゲストの要求）→ 2（ホスト）、seg 1で → 1（ゲスト）→ 0（ホスト）。
 fn mid_match_presses() -> Vec<PressAt> {
     let p = |node, seg, frame, x| PressAt {
         node,
@@ -2121,7 +2125,7 @@ fn mid_match_presses() -> Vec<PressAt> {
     ]
 }
 
-/// マッチの途中で替える実行（場面の始まりのライフを上げて、seg を 400 フレーム前後にする）。
+/// マッチの途中で替える実行（場面の始まりのライフを上げてsegを400フレーム前後にする）。
 fn mid_match_scenario(ahead: u8, presses: Vec<PressAt>) -> Scenario {
     let mut sc = Scenario::rollback(1, ahead, 3);
     sc.life = 30;
@@ -2146,7 +2150,7 @@ fn run_mid(
     out
 }
 
-/// 予定の便（ホストの lat が F > 0）だけを、最初の `k` 通落とす。
+/// 予定の便（ホストのlatが F > 0）だけを最初の`k`通落とす。
 fn drop_first_schedules(k: u32) -> impl FnMut(&SendInfo) -> Fate {
     let mut n = 0;
     move |i| {
@@ -2160,7 +2164,7 @@ fn drop_first_schedules(k: u32) -> impl FnMut(&SendInfo) -> Fate {
     }
 }
 
-/// 予定の便を 1 通おきに `ms` 遅らせる（後の便に追い越され、古い F の便が後から着く）か、全部重ねる。
+/// 予定の便を1通おきに`ms`遅らせる（後の便に追い越され、古いFの便が後から着く）か、全部重ねる。
 fn disturb_schedules(delay_ms: Option<u64>, dup_ms: Option<u64>) -> impl FnMut(&SendInfo) -> Fate {
     let mut n = 0u32;
     move |i| {
@@ -2179,7 +2183,7 @@ fn disturb_schedules(delay_ms: Option<u64>, dup_ms: Option<u64>) -> impl FnMut(&
     }
 }
 
-/// ゲストの要求の便（ゲストの lat）だけを、最初の `k` 通落とす（`u32::MAX` なら全部）。
+/// ゲストの要求の便（ゲストのlat）だけを最初の`k`通落とす（`u32::MAX`なら全部）。
 fn drop_first_wishes(k: u32) -> impl FnMut(&SendInfo) -> Fate {
     let mut n = 0;
     move |i| {
@@ -2247,8 +2251,8 @@ fn d_changes_mid_match_by_both_sides_match_the_schedule_reference() {
             dups += h.wish_dup;
         }
     }
-    // ゲストが R いっぱい先にいるネットワーク（時刻合わせを切り、ゲストが 400 ms 先に始める。R 16・片道 50 ms）: 予定が届くときゲストは
-    // F を過ぎて取っているので、受けた後のゲストの取得から替える。
+    // ゲストがRいっぱい先にいるネットワーク（時刻合わせを切り、ゲストが400 ms先に始める。R 16・片道50 ms）の場合。
+    // 予定が届くときゲストはFを過ぎて取っているので、受けた後のゲストの取得から替える。
     for seed in [None, Some(3u64)] {
         let mut sc = mid_match_scenario(16, mid_match_presses());
         sc.cfg = [
@@ -2340,7 +2344,7 @@ fn a_guest_wish_is_clamped_by_the_host_and_expires_without_its_value() {
         out.nodes[0].rb.auto_on(),
         "ゲストの auto でホストの旗が立たない"
     );
-    // 要求を 1 回取った分 + 旗が立った後の seg の始まり（seg 1・2）の最初の取得ごと（推奨値が無いので何も出さない）。
+    // 要求を1回取った分 + 旗が立った後のsegの始まり（seg 1・2）の最初の取得ごと（推奨値が無いので何も出さない）。
     assert_eq!(h.d_auto, 1 + (sc.segs - 1), "{h:?}");
     assert_eq!(
         h.d_switches,
@@ -2353,7 +2357,7 @@ fn a_guest_wish_is_clamped_by_the_host_and_expires_without_its_value() {
         out.nodes[0].rb.cur_delay(),
         "D が食い違う"
     );
-    // 取得 1 回に 1 通以上送るので、ゲストが要求を諦めるまでに WISH_FRAMES − 1 通以上。諦めた後は、ゲストが lat を載せない（数が上限の数倍で止まる）。
+    // 取得1回に1通以上送るのでゲストが要求を諦めるまでに WISH_FRAMES − 1通以上。諦めた後はゲストがlatを載せない（数が上限の数倍で止まる）。
     let lim = u32::from(higanr_core::lockstep::WISH_FRAMES);
     assert!(with_lat >= lim - 1 && with_lat < 4 * lim, "{with_lat}");
 }
@@ -2430,7 +2434,7 @@ fn a_guest_auto_wish_is_not_a_value_and_a_huge_net_schedule_does_not_overflow() 
         }),
         "auto の要求は lat の delay の欄に AUTO"
     );
-    // ネットワークから来る F が上限の手前: 足し算であふれず、予定は受け入れる。
+    // ネットワークから来るFが上限の手前: 足し算であふれず、予定は受け入れる。
     let mut host = Rollback::new(rb_cfg(0, 1, 8));
     host.capture(0x21).unwrap();
     let mut inp = host.build_input();
@@ -2530,15 +2534,16 @@ fn flat_recs(v: &[u8]) -> Vec<Recommend> {
     v.iter().map(|&r| Recommend::flat(r)).collect()
 }
 
-/// seg ごとの往復（ms）から rollback の推奨値の組を作る（本物の `link::Connected::recommend_pair_now` と同じ式）。
+/// segごとの往復（ms）からrollbackの推奨値のペアを作る（本物の`link::Connected::recommend_pair_now`と同じ式）。
 fn rtt_recs(v: &[u32]) -> Vec<Recommend> {
     v.iter()
         .map(|&ms| Recommend::from_rtt(Mode::Rollback, Some(ms)).expect("往復は測れている"))
         .collect()
 }
 
-/// ホスト 1 台だけで seg の始まりを順に通し、各 seg の始まりの D を返す。`presses` は `(seg, x)`: その seg の読み込みの間に押す
-/// （seg 0 は最初の取得の前）。ネットワークは要らない。
+/// ホスト1台だけでsegの始まりを順に通し、各segの始まりのDを返す。
+/// `presses`は`(seg, x)`で、そのsegの読み込みの間に押す（seg 0は最初の取得の前）。
+/// ネットワークは要らない。
 fn host_heads(d0: u8, recs: &[Recommend], presses: &[(usize, u8)]) -> (Vec<u8>, Rollback) {
     let mut host = Rollback::new(rb_cfg(0, d0, 8));
     let mut heads = Vec::new();
@@ -2558,7 +2563,7 @@ fn host_heads(d0: u8, recs: &[Recommend], presses: &[(usize, u8)]) -> (Vec<u8>, 
 
 #[test]
 fn the_auto_head_d_does_not_flicker_when_the_rtt_wanders_around_a_boundary() {
-    // rollback の推奨値の 1 と 2 の境目（100 ms で 1・101 ms で 2。「−5 ms」の側は 105 ms で 1・106 ms で 2）の上で揺れる往復。
+    // rollbackの推奨値の1と2の境目（100 msで1・101 msで2。「−5 ms」の側は105 msで1・106 msで2）の上で揺れる往復。
     let rtts = [100u32, 101, 105, 106, 100, 101, 100, 95];
     let mut sc = Scenario::rollback(1, 8, rtts.len() as u32);
     sc.life = 30;
@@ -2587,7 +2592,7 @@ fn the_auto_head_d_does_not_flicker_when_the_rtt_wanders_around_a_boundary() {
         assert_eq!(g.d_auto_held, 0, "[{name}] ゲストは見直さない");
         assert!(out.nodes[0].rb.auto_on(), "[{name}] 旗は立ったまま");
     }
-    // 対照（規則なし）: 同じ往復を素の推奨値だけで引くと、境目の往復で D がマッチごとに揺れる。
+    // 対照（規則なし）: 同じ往復から素の推奨値だけでDを決めると境目の往復でDがマッチごとに揺れる。
     let raw_heads: Vec<u8> = rtt_recs(&rtts).iter().map(|r| r.raw).collect();
     let flips = raw_heads.windows(2).filter(|w| w[0] != w[1]).count();
     let held_flips = heads.windows(2).filter(|w| w[0] != w[1]).count();
@@ -2599,7 +2604,7 @@ fn the_auto_head_d_does_not_flicker_when_the_rtt_wanders_around_a_boundary() {
 
 #[test]
 fn the_host_head_uses_the_press_at_once_then_holds_and_a_number_lowers_the_flag() {
-    // 往復 101 ms: 素 2・「−5 ms」の側 1。今 1 から 9 で 2（すぐ）、次の始まりは 100 ms（素 1）が 1 回目なので 2 のまま、2 回目で 1。
+    // 往復101 ms: 素2・「−5 ms」の側1。今1から9で2（すぐ）、次の始まりは100 ms（素1）が1回目なので2のまま、2回目で1。
     let rtt = [101u32, 100, 100, 101, 100, 100];
     let (heads, host) = host_heads(1, &rtt_recs(&rtt), &[(0, higanr_core::delay_pick::AUTO)]);
     assert_eq!(
@@ -2612,8 +2617,9 @@ fn the_host_head_uses_the_press_at_once_then_holds_and_a_number_lowers_the_flag(
         s.d_auto_held, 2,
         "据え置いたのは seg 1（素 1 が低い 1 回目）と seg 3（素 2 を上げの余裕で）: {s:?}"
     );
-    // 数字で旗が降りる: D 3 から 9（往復 167 ms: 素 3）、seg 1 の始まりは 100 ms の低い 1 回目で 3 のまま。seg 2 の読み込みの間にホストが 3 を押して
-    // 旗を降ろすと、その後は 100 ms が何回続いても 3 のまま。seg 4 の読み込みの間の 9 は素の推奨値（100 ms で 1）をすぐ使う。
+    // 数字で旗が降りる: D 3から9（往復167 ms: 素3）、seg 1の始まりは100 msの低い1回目で3のまま。
+    // seg 2の読み込みの間にホストが3を押して旗を降ろすと、その後は100 msが何回続いても3のまま。
+    // seg 4の読み込みの間の9は素の推奨値（100 msで1）をすぐ使う。
     let rtt = [167u32, 100, 100, 100, 100];
     let (heads, host) = host_heads(
         3,
@@ -2660,7 +2666,7 @@ fn prefill_and_prediction_read_the_seg_head_d_after_a_mid_seg_switch() {
     feed(&mut host, 5, 1, &words);
     host.post_present(&mut g);
     assert_eq!(host.front(), 21);
-    // 確定の行（席 1P: p1 = 自分）: frame 0 は穴埋め、1〜12 は取得 f − 1 の入力ワード（D 1）、13〜19 は埋めた入力ワード（取得 11）、20 は取得 12（D 8 の最初の入力ワード）、p2 は相手の入力ワード。
+    // 確定の行（サイド1P: p1 = 自分）: frame 0は穴埋め、1〜12は取得 f − 1 の入力ワード（D 1）、13〜19は埋めた入力ワード（取得11）、20は取得12（D 8の最初の入力ワード）、p2は相手の入力ワード。
     let want: Vec<(u32, u16, u16)> = (0..=20u32)
         .map(|f| match f {
             0 => (0, 0, 0),
@@ -2737,7 +2743,7 @@ fn judge_catches_a_single_wrong_word() {
 
 // ---------------------------------------------------------------- 台本で決めた小さな実行（状態機械の単体）
 
-/// 入力ワードで境目を決めるウィンドウ。`gate(frame, p2)` が真のとき要求が立つ。更新の種類と (frame, p1, p2) を記録する。
+/// 入力ワードで境目を決めるウィンドウ。`gate(frame, p2)`が真のとき要求が立つ。更新の種類と (frame, p1, p2)を記録する。
 struct Script<G: Fn(u32, u16) -> bool> {
     gate: G,
     log: Vec<(TickKind, u32, u16, u16)>,
@@ -2961,15 +2967,15 @@ fn outputs_during_resim_are_rolled_back() {
         assert_eq!(rb.front(), rb.frame());
     }
     assert_eq!((g.depth, g.max_depth), (0, 1));
-    // 入力の地点で鳴った SE だけが残る（進め直しの中の 15 回は全部捨てられる）。
+    // 入力の地点で鳴ったSEだけが残る（進め直しの中の15回は全部捨てられる）。
     assert_eq!(g.se, 12);
     assert_eq!(rb.stats().resims, 5);
 }
 
 // ---------------------------------------------------------------- 時刻合わせ
 
-/// 更新を走らせた枠のうち、seg の始めの `warm` フレームと終わりの `tail` フレームを除いた N − F の (中央値, 最大値, 枠の数)。
-/// 始めを除くのは、揃うまでの間を「揃った後」に混ぜないため。
+/// 更新を走らせた枠のうちsegの始めの`warm`フレームと終わりの`tail`フレームを除いた N − F の (中央値, 最大値, 枠の数)。
+/// 始めを除くのは揃うまでの間を「揃った後」に混ぜないため。
 fn ahead_stats(n: &Node, rf: &RefRun, warm: u32, tail: u32) -> (u32, u32, usize) {
     let mut v: Vec<u32> = n
         .ahead_log
@@ -2985,8 +2991,8 @@ fn ahead_stats(n: &Node, rf: &RefRun, warm: u32, tail: u32) -> (u32, u32, usize)
     )
 }
 
-/// 読み込みの長さの違う 2 台（台 0 が 30 ms・台 1 が 250 ms）で `segs` 個の seg を回す。台 0 が先に seg に入る。
-/// ネットワークは綺麗で片道は `ow` ms。`sync` は両端の時刻合わせ。
+/// 読み込みの長さの違う2台（台0が30 ms・台1が250 ms）で`segs`個のsegを回す。台0が先にsegに入る。
+/// ネットワークは綺麗で片道は`ow` ms。`sync`は両端の時刻合わせ。
 fn uneven_load_run(sync: bool, d: u8, r: u8, ow: u64, segs: u32) -> (Scenario, Outcome, RefRun) {
     let rf = reference(d, segs);
     let cfg = |i| rb_cfg(i, d, r).with_time_sync(sync);
@@ -2998,7 +3004,7 @@ fn uneven_load_run(sync: bool, d: u8, r: u8, ow: u64, segs: u32) -> (Scenario, O
     (sc, out, rf)
 }
 
-/// `uneven_load_run` の、両端が格子を寄せられるバージョン（b-spin 同士。往復の判定は片道の 2 倍）。
+/// `uneven_load_run`の、両端が格子を寄せられるバージョン（b-spin同士。往復の判定は片道の2倍）。
 fn uneven_load_run_glide(d: u8, r: u8, ow: u64, segs: u32) -> (Scenario, Outcome, RefRun) {
     let rf = reference(d, segs);
     let mut sc = Scenario::new([rb_cfg(0, d, r), rb_cfg(1, d, r)], segs);
@@ -3010,8 +3016,8 @@ fn uneven_load_run_glide(d: u8, r: u8, ow: u64, segs: u32) -> (Scenario, Outcome
     (sc, out, rf)
 }
 
-/// 揃った後（seg の始まりの 50 フレームを除く）の先の側の N − F の中央値の上限: 片道ぶんのフレーム数 + 時刻合わせの
-/// 閾値の残り（L < 1.5 フレーム）+ 端数の 1。
+/// 揃った後（segの始まりの50フレームを除く）の先の側の N − F の中央値の上限。
+/// 片道ぶんのフレーム数 + 時刻合わせの閾値の残り（L < 1.5フレーム）+ 端数の1。
 fn shrunk_bound(ow: u64) -> u32 {
     ow.div_ceil(FRAME_MS) as u32 + 2
 }
@@ -3046,8 +3052,8 @@ fn time_sync_shrinks_the_lead_of_the_early_starter() {
                 s1.waits_sync,
                 s0.waits_sync
             );
-            // 後ろの側は先の側より 1 を超えて先へ進まない（片道が 1 フレームより長ければ揃っていても両者が予測し、
-            // 先の側が 0 まで縮み後ろの側が 1 残ることがある）。
+            // 後ろの側は先の側より1を超えて先へ進まない。
+            // 片道が1フレームより長ければ揃っていても両者が予測し、先の側が0まで縮み後ろの側が1残ることがある。
             assert!(
                 back.0 <= lead.0 + 1,
                 "後ろの側 {back:?} が先の側 {lead:?} より先"
@@ -3172,8 +3178,8 @@ fn time_sync_waits_one_frame_at_a_time_with_spacing() {
     let s = out.nodes[0].rb.stats();
     let back = out.nodes[1].rb.stats().waits_sync;
     assert!(s.waits_sync >= 8, "大きい差なのに待ちが少ない {s:?}");
-    // 片道が 1 フレームを大きく越えるネットワーク（RTT 40 ms）では、揃った後に後ろの側が 1 回待つことがある。
-    // 先の側の待ちの 1 割に満たなければ符号の取り違えではない。
+    // 片道が1フレームを大きく越えるネットワーク（RTT 40 ms）では揃った後に後ろの側が1回待つことがある。
+    // 先の側の待ちの1割に満たなければ符号の取り違えではない。
     assert!(
         back * 10 < s.waits_sync,
         "後ろの側の待ち {back} が先の側 {} に近い",
@@ -3191,7 +3197,7 @@ fn time_sync_is_off_in_delay_mode() {
             .with_time_sync(false)
             .time_sync()
     );
-    // 両端が delay 方式（読み込みの長さが違っても待たない）。
+    // 両端がdelay方式（読み込みの長さが違っても待たない）。
     let rf = reference(2, 3);
     let mut sc = Scenario::new([c, Config::delay_mode(SEATS[1], 2).with_time_sync(true)], 3);
     sc.start_ms = [30, 250];
@@ -3204,10 +3210,10 @@ fn time_sync_is_off_in_delay_mode() {
 
 // ---------------------------------------------------------------- 時刻合わせ: 時計のずれ（片方の周期が速い）
 
-/// 長い seg 用のライフ（seg が数千フレーム続く）。
+/// 長いseg用のライフ（segが数千フレーム続く）。
 const DRIFT_LIFE: u8 = 200;
 
-/// 台 0 の周期が台 1 より短い（台 0 が先へずれる）実行。`start_ms[1]` が台 0 から見た最初のずれ（台 0 が先）。
+/// 台0の周期が台1より短い（台0が先へずれる）実行。`start_ms[1]`が台0から見た最初のずれ（台0が先）。
 fn drift_run(
     sync: bool,
     d: u8,
@@ -3237,8 +3243,10 @@ fn predicted_share(n: &Node) -> (u32, u32) {
     )
 }
 
-/// 周期（µs）の組: 台 0 が速い。`fast` は 1 分で約 98 ms ずれる誇張、`real` は花映塚のフルスクリーン（ゲーム自身の時計 60.0146 fps）と
-/// ウィンドウ（60.000 fps）の差（実測、1 分に約 14.6 ms）に近い 4 µs の差、`same` は同じ速さ。
+/// 周期（µs）のペア: 台0が速い。
+/// `fast`は1分で約98 msずれる誇張。
+/// `real`は花映塚のフルスクリーン（ゲーム自身の時計60.0146 fps）とウィンドウ（60.000 fps）の差（実測で1分に約14.6 ms）に近い4 µsの差。
+/// `same`は同じ速さ。
 const PERIODS: [(&str, [u64; 2]); 3] = [
     ("fast", [16_640, 16_667]),
     ("real", [16_663, 16_667]),
@@ -3369,9 +3377,9 @@ fn sweep_jitter_for_d(d: u8) {
 struct GlideAgg {
     runs: u32,
     pred: [(u32, u32); 2],
-    /// 台ごとの時刻合わせの待ち（`Wait::Sync`）の数と、60 更新の中の最大。
+    /// 台ごとの時刻合わせの待ち（`Wait::Sync`）の数と、60更新の中の最大。
     waits: [u32; 2],
-    /// そのうち seg の始まりの 300 フレームを過ぎてからの待ち。
+    /// そのうちsegの始まりの300フレームを過ぎてからの待ち。
     waits_steady: [u32; 2],
     worst: [u32; 2],
     resims: [u32; 2],
@@ -3383,12 +3391,12 @@ struct GlideAgg {
     glide_max_step_ppm_steady: [i32; 2],
     glide_abs_us: [u64; 2],
     glide_net_us: [i64; 2],
-    /// 台ごとの見積もり（`Stats::sync_lead_*`）の標本の数と合計（平均が 2L の偏りを見るため）。
+    /// 台ごとの見積もり（`Stats::sync_lead_*`）のサンプルの数と合計（平均が2Lの偏りを見るため）。
     lead_n: [u64; 2],
     lead_sum: [i64; 2],
     updates: u32,
     unfinished: u32,
-    /// 寄せる判定を呼んだ数・「寄せてよい」だった数・寄せ幅が 1 枠に 5,000 ppm を越えて変わった数・そのうち前の枠で待ちがあった数。
+    /// 寄せる判定を呼んだ数・「寄せてよい」だった数・寄せ幅が1枠に5,000 ppmを越えて変わった数・そのうち前の枠で待ちがあった数。
     glide_calls: [u32; 2],
     gate_open: [u32; 2],
     big_steps: [u32; 2],
@@ -3406,7 +3414,7 @@ impl GlideAgg {
         f64::from(self.waits[0] + self.waits[1]) / node_min.max(1e-9)
     }
 
-    /// 見積もりの平均（平均 = 「先にいるフレーム数の 2 倍」の値。標本ごとの平均の平均）。
+    /// 見積もりの平均（平均 = 「先にいるフレーム数の2倍」の値。サンプルごとの平均の平均）。
     fn mean_avg(&self, i: usize) -> f64 {
         2.0 * self.lead_sum[i] as f64 / self.lead_n[i].max(1) as f64 / f64::from(SYNC_UNIT)
     }
@@ -3448,7 +3456,7 @@ impl GlideAgg {
     }
 }
 
-/// D・片道・時計・揺れ・寄せられる台の組で、最初の位相 5 つ × seed（揺れが 0 なら 1 つ）の実行を `segs` seg ずつ回して集計する。
+/// D・片道・時計・揺れ・寄せられる台の組み合わせで最初の位相5つ × seed（揺れが0なら1つ）の実行を`segs` segずつ回して集計する。
 fn glide_sweep(
     d: u8,
     ow: u64,
@@ -3512,7 +3520,7 @@ fn glide_sweep(
     agg
 }
 
-/// 格子を寄せる形の表。環境変数 `GLIDE_SEGS`（既定 4）・`GLIDE_ONLY`（`d1` のように D を絞る）で変えられる。
+/// 格子を寄せる形の表。環境変数`GLIDE_SEGS`（既定4）・`GLIDE_ONLY`（`d1`のようにDを絞る）で変えられる。
 /// `cargo test --release -p higanr_core --test rollback_sim glide_table -- --ignored --nocapture`
 #[test]
 #[ignore = "格子を寄せる形の表。値は assert しない"]
@@ -3521,7 +3529,7 @@ fn glide_table() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    // 定数を掃くための上書き（1/256 単位は SYNC_UNIT = 256 のまま）。
+    // 定数を掃くための上書き（1/256単位は SYNC_UNIT = 256 のまま）。
     let env_i32 = |k: &str, d: i32| -> i32 {
         std::env::var(k)
             .ok()
@@ -3579,9 +3587,9 @@ fn glide_table() {
     }
 }
 
-/// 台 0 をゲーム自身の時計（429.5 秒の折り返し・時計の大きさで変わる周期）、台 1 を b-spin（60.000 fps）にした実行。
-/// 折り返しが実行の 120 秒目に来るよう時計を `GAME_CLOCK_WRAP_US − 120 秒` から数え始め、`segs` 個の seg（各 98 秒前後）を回す。
-/// `glide` は寄せられる台（台 0 はゲーム自身の時計なので `[false, false]` か `[false, true]`）。
+/// 台0をゲーム自身の時計（429.5秒の折り返し・時計の大きさで変わる周期）、台1をb-spin（60.000 fps）にした実行。
+/// 折り返しが実行の120秒目に来るよう時計を`GAME_CLOCK_WRAP_US − 120 秒`から数え始め、`segs`個のseg（各98秒前後）を回す。
+/// `glide`は寄せられる台（台0はゲーム自身の時計なので`[false, false]`か`[false, true]`）。
 fn game_clock_run(
     d: u8,
     ow: u64,
@@ -3662,7 +3670,7 @@ fn glide_follows_the_game_clock_across_period_reversals_and_the_wrap() {
         late(&base, 1)
     );
     assert_eq!(late(&on, 1), 0, "寄せられる側が止まった");
-    // ゲーム自身の側の待ちは全部、折り返しの 30 秒以内（seg の始まりを除く）。
+    // ゲーム自身の側の待ちは全部、折り返しの30秒以内（segの始まりを除く）。
     let near: Vec<u32> = wraps
         .iter()
         .map(|&t0| {
@@ -3697,7 +3705,7 @@ fn glide_replaces_the_drift_stops_without_more_prediction() {
     for ow in [3u64, 7] {
         for jmax in [0u64, 4] {
             if (ow, jmax) == (3, 4) {
-                continue; // 実行時間（debug の検査）のため、片道 3 ms は揺れなしだけ
+                continue; // 実行時間（debugの検査）のため片道3 msは揺れなしだけ
             }
             let base = glide_sweep(1, ow, PERIODS[1].1, jmax, [false, false], &p, 1);
             assert!(
@@ -3718,7 +3726,7 @@ fn glide_replaces_the_drift_stops_without_more_prediction() {
                     a.pct(0),
                     a.pct(1)
                 );
-                #[allow(clippy::needless_range_loop)] // 台の添字で 2 つの集計と g を引く
+                #[allow(clippy::needless_range_loop)] // 台の添字で2つの集計とgを取得する
                 for i in 0..2 {
                     assert!(
                         a.glide_max_step_ppm[i] <= p.slew_ppm,
@@ -3750,7 +3758,7 @@ fn glide_replaces_the_drift_stops_without_more_prediction() {
 fn glide_stays_off_on_a_long_link_and_at_d0_and_works_just_inside_the_gate() {
     let p = GlideParams::DEFAULT;
     let per = PERIODS[1].1;
-    // 往復 36 ms（片道 18 ms・揺れなし）: 寄せられる台でも寄せず、寄せない形と全く同じ数。
+    // 往復36 ms（片道18 ms・揺れなし）: 寄せられる台でも寄せず、寄せない形と全く同じ数。
     let off = glide_sweep(1, 18, per, 0, [false, false], &p, 1);
     let on = glide_sweep(1, 18, per, 0, [true, true], &p, 1);
     assert_eq!(on.glide_frames, [0, 0], "{}", on.text());
@@ -3759,7 +3767,7 @@ fn glide_stays_off_on_a_long_link_and_at_d0_and_works_just_inside_the_gate() {
         (off.pred, off.waits, off.resims),
         "往復が長いネットワークで数が変わった"
     );
-    // 往復 32 ms（片道 16 ms）: 寄せて、先の側の予測が大きく減る。
+    // 往復32 ms（片道16 ms）: 寄せて、先の側の予測が大きく減る。
     let off = glide_sweep(1, 16, per, 0, [false, false], &p, 1);
     let on = glide_sweep(1, 16, per, 0, [true, true], &p, 1);
     assert!(
@@ -3781,7 +3789,7 @@ fn glide_stays_off_on_a_long_link_and_at_d0_and_works_just_inside_the_gate() {
     assert_eq!((on.pred, on.waits), (off.pred, off.waits));
 }
 
-/// 台 0 が `start` ms 先に始まる（最初の位相差）4 通りの実行の、各台の (予測した更新, 生きた更新, 待ち) の合計。
+/// 台0が`start` ms先に始まる（最初の位相差）4通りの実行の各台の (予測した更新, 生きた更新, 待ち)の合計。
 fn drift_totals(
     sync: bool,
     d: u8,

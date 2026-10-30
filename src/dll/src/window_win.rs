@@ -1,11 +1,16 @@
-//! ウィンドウモードのウィンドウを作る呼び出し（`CreateWindowExA`。`0x42D5C2`）の差し替え。ini の `[window]` でウィンドウの大きさ・位置・タイトルバー・最前面を決める。
-//! 作り方は「ウィンドウだけ大きくする」: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。アドレスと期待バイト列は `th09_addr.rs` の「ウィンドウを作る呼び出し」の節、読みと計算は `higanr_core::window_size`（pure）。
+//! ウィンドウモードのウィンドウを作る呼び出し（`CreateWindowExA`。`0x42D5C2`）の差し替え。iniの`[window]`でウィンドウの大きさ・位置・タイトルバー・最前面を決める。
+//! 作り方は「ウィンドウだけ大きくする」。D3D8の裏の画面は640×480のままで、Presentの引き伸ばしに任せる。
+//! アドレスと期待バイト列は`th09_addr.rs`の「ウィンドウを作る呼び出し」の節にある。
+//! 読み取りと計算は`higanr_core::window_size`（pure）が行う。
 //!
-//! **時期**: 差し替えは DllMain の中（`win::on_process_attach`）で書く。ローダーは `CREATE_SUSPENDED` で作ったゲームに `LoadLibraryW` を呼ばせてから `ResumeThread` するので、ゲームのメインスレッドはウィンドウを作る地点まで走っていない（読み取りのスレッドが書く他のフックはウィンドウに間に合う保証が無いので、ここだけ別にした）。
-//! DllMain はローダーロックの下なので **ini はここで読まない**: 差し替えた関数が最初に呼ばれたとき（ウィンドウを作る前の 1 回）に読む。マッチ中に走るコードは無い。
+//! **時期**: 差し替えはDllMainの中（`win::on_process_attach`）で書く。
+//! ローダーは`CREATE_SUSPENDED`で作ったゲームに`LoadLibraryW`を呼ばせてから`ResumeThread`する。そのためゲームのメインスレッドはウィンドウを作る地点まで走っていない。
+//! 読み取りのスレッドが書く他のフックは、ウィンドウに間に合う保証が無い。そのためここだけ別にした。
+//! DllMainはローダーロックの下なので **iniはここで読まない**。差し替えた関数が最初に呼ばれたとき（ウィンドウを作る前の1回）に読む。マッチ中に走るコードは無い。
 //!
-//! 書く前に、地点の前後 49 バイトを実バイトで照合し、1 バイトでも違えば何も書かない。ini が無い・`[window]` が無い・読めない値のときは、差し替えた関数は元の `CreateWindowExA` へ引数をそのまま渡すだけ。
-//! ログの行は `main_log::push` で頼む（ファイルを開かない・書かないので、DllMain の中でもゲームのメインスレッドでも待たない）。行は設置 1・設定 1・ウィンドウを作った結果 1。
+//! 書く前に地点の前後49バイトを実バイトで照合する。1バイトでも違えば何も書かない。
+//! iniが無い・`[window]`が無い・読めない値のときは、差し替えた関数は元の`CreateWindowExA`へ引数をそのまま渡すだけ。
+//! ログの行は`main_log::push`で書き込みを依頼する（ファイルを開かず書かないので、DllMainの中でもゲームのメインスレッドでも待たない）。行は設置1・設定1・ウィンドウを作った結果1。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -52,10 +57,10 @@ type CreateWindowFn = unsafe extern "system" fn(
     *const c_void,
 ) -> *mut c_void;
 
-/// 自分の DLL のハンドル（DllMain が保存する。ini の場所 = DLL のフォルダを引くため）。
+/// 自分のDLLのハンドル（DllMainが保存する。iniの場所 = DLL のフォルダを取得するため）。
 static MODULE: AtomicUsize = AtomicUsize::new(0);
 
-/// ini から読んだ設定（初めて呼ばれたときに 1 回だけ読む）。`None` は「ウィンドウは今のまま」。
+/// iniから読んだ設定（初めて呼ばれたときに1回だけ読む）。`None`は「ウィンドウは今のまま」。
 static CONFIG: OnceLock<Option<WindowConfig>> = OnceLock::new();
 
 #[cfg(test)]
@@ -64,13 +69,13 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static TEST_ORIG: std::cell::Cell<Option<CreateWindowFn>> = const { std::cell::Cell::new(None) };
     static TEST_SKIP_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// 検査だけ: この検査のスレッドが頼んだ行（本ログの待ち行列は全検査で 1 つなので、行の中身はこちらで見る）。
+    /// 検査だけ: この検査のスレッドが依頼した行（本ログのキューは全検査で1つなので、行の中身はこちらで検証する）。
     static TEST_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// 検査だけ: 本物の待ち行列にも頼むか（行の数に上限があるので、本物へ届くことを検証する 1 本だけが立てる）。
+    /// 検査だけ: 本物のキューにも依頼するかどうか（行の数に上限があるので本物へ届くことを検証する1本だけが立てる）。
     static TEST_TO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// 本ログへ 1 行頼む（先頭に `ウィンドウ: ` を付ける）。失敗と異常の行。
+/// 本ログへ1行書き込みを依頼する（先頭に`ウィンドウ: `を付ける）。失敗と異常の行に使う。
 fn log(line: impl Into<String>) {
     emit(line.into(), false);
 }
@@ -96,7 +101,7 @@ fn emit(line: String, detail_only: bool) {
     }
 }
 
-/// ウィンドウを作る呼び出しを自前の関数へ向ける。**DllMain から呼ぶ**（ローダーロックの下で、ミューテックスを取った後）。
+/// ウィンドウを作る呼び出しを自前の関数へ向ける。**DllMainから呼ぶ**（ローダーロックの下でミューテックスを取った後）。
 /// 失敗してもロードは止めない（ウィンドウが今のままなだけ）。
 pub fn install(module: HMODULE) {
     MODULE.store(module as usize, Ordering::Relaxed);
@@ -118,7 +123,7 @@ pub fn install(module: HMODULE) {
     }
 }
 
-/// 設置の結果の 1 行（本ログに出る）。
+/// 設置の結果の1行（本ログに出る）。
 fn install_line(r: std::thread::Result<Result<String, String>>) -> String {
     let summary = match r {
         Ok(Ok(s)) => s,
@@ -134,8 +139,9 @@ fn entry_address() -> u32 {
     create_window_entry as *const () as usize as u32
 }
 
-/// `site` の範囲を読んで期待バイト列と照合し、全部合ったときだけ、`site.addr + call_off` の 6 バイト（`FF 15 abs32`）を
-/// `E8 rel32 90`（`target` への call）に替える。書いた後に読み直して検証する。書かなかったときは理由を `Err` で返す。
+/// `site`の範囲を読んで期待バイト列と照合する。
+/// 全部合ったときだけ`site.addr + call_off`の6バイト（`FF 15 abs32`）を`E8 rel32 90`（`target`へのcall）に差し替える。
+/// 書いた後に読み直して検証する。書かなかったときは理由を`Err`で返す。
 fn install_at(
     env: &mut dyn HookEnv,
     site: &SiteDef,
@@ -173,9 +179,9 @@ fn install_at(
     ))
 }
 
-/// `GetSystemMetrics` で、ゲームが外寸を作る式（`0x42D584` / `0x42D59E`）と同じ 3 つを引く。
+/// `GetSystemMetrics`でゲームが外寸を計算する式（`0x42D584` / `0x42D59E`）と同じ3つの値を取得する。
 fn frame_metrics() -> FrameMetrics {
-    // SAFETY: 引数は定数の索引で、ポインタを渡さない。
+    // SAFETY: 引数は定数の索引。ポインタは渡さない。
     unsafe {
         FrameMetrics {
             fixed_frame_x: GetSystemMetrics(SM_CXFIXEDFRAME),
@@ -185,7 +191,7 @@ fn frame_metrics() -> FrameMetrics {
     }
 }
 
-/// ini の `[window]`。初めて呼ばれたときに 1 回だけ読む（ウィンドウを作る前のゲームのメインスレッド。マッチ中は呼ばれない）。
+/// iniの`[window]`。初めて呼ばれたときに1回だけ読む（ウィンドウを作る前のゲームのメインスレッド。マッチ中は呼ばれない）。
 fn config() -> Option<WindowConfig> {
     if let Some(c) = test_config() {
         return c;
@@ -193,7 +199,7 @@ fn config() -> Option<WindowConfig> {
     *CONFIG.get_or_init(load_config)
 }
 
-/// 検査だけが指定する設定（製品のビルドでは常に `None` で、呼びは消える）。
+/// 検査だけが指定する設定（製品のビルドでは常に`None`で、呼びは消える）。
 #[cfg(test)]
 fn test_config() -> Option<Option<WindowConfig>> {
     TEST_CONFIG.with(|c| c.get())
@@ -259,11 +265,11 @@ fn load_config() -> Option<WindowConfig> {
     }
 }
 
-/// 元の `CreateWindowExA`: 呼ぶ時点のゲームの IAT の値（他のツールが IAT を替えていてもそちらを通す）。読めない・どの
-/// モジュールにも入っていない値なら、この DLL が import した `CreateWindowExA`。
+/// 元の`CreateWindowExA`: 呼ぶ時点のゲームのIATの値（他のツールがIATを書き換えていてもそちらを通す）。
+/// IATの値が読み取れないかどのモジュールにも含まれない値なら、このDLLがimportした`CreateWindowExA`を使う。
 #[cfg(test)]
 fn original() -> CreateWindowFn {
-    // 検査のプロセスの `0x48E1FC` は th09.exe の IAT ではない（読めても別の値）ので、読まずに、検査が指定した関数か import を使う。
+    // 検査のプロセスの`0x48E1FC`はth09.exeのIATではない（読めても別の値）。そのため読まずに検査が指定した関数かimportを使う。
     TEST_ORIG.with(|c| c.get()).unwrap_or(CreateWindowExA)
 }
 
@@ -273,7 +279,7 @@ fn original() -> CreateWindowFn {
     if read_own_into(WINDOW_CREATE_IAT, &mut b) {
         let v = u32::from_le_bytes(b);
         if v != 0 && module_of_addr(v).is_some() {
-            // SAFETY: IAT の欄には、ローダーが user32 の `CreateWindowExA`（stdcall、12 引数）のアドレスを書いている。値はいずれかのモジュールの中のアドレスと検証した。ゲーム自身が同じ欄を同じ型で呼んでいる。
+            // SAFETY: IATのエントリには、ローダーがuser32の`CreateWindowExA`（stdcall・12引数）のアドレスを書いている。値はいずれかのモジュールの中のアドレスと検証した。ゲーム自身が同じエントリを同じ型で呼んでいる。
             return unsafe { core::mem::transmute::<usize, CreateWindowFn>(v as usize) };
         }
     }
@@ -297,7 +303,7 @@ fn decide(orig_style: u32) -> Option<Decision> {
     })
 }
 
-/// 決めた引数の一文。ウィンドウを作る前にはログへ書かず、作った結果（`after_create`）と同じ 1 行にまとめる（行を増やさない）。
+/// 決定済みの引数を表す文字列。ウィンドウを作る前にはログへ書かない。作った結果（`after_create`）と同じ1行にまとめる（行を増やさない）。
 fn plan_text(d: &Decision) -> String {
     format!(
         "ゲームの style {:#010X} → {:#010X}、外寸 {}×{}、位置 {}",
@@ -313,9 +319,9 @@ fn plan_text(d: &Decision) -> String {
     )
 }
 
-/// 差し替え先。ゲームの `0x42D5C2` の `call *0x48e1fc` の代わりに呼ばれる（stdcall、12 引数、`ret 0x30`）。
-/// 設定が無ければ引数をそのまま元へ渡す。パニックは受けて、そのときも元の引数で元を呼ぶ。
-// 引数の数は Win32 の `CreateWindowExA` が 12 と決めている。
+/// 差し替え先。ゲームの`0x42D5C2`の`call *0x48e1fc`の代わりに呼ばれる（stdcall・12引数・`ret 0x30`）。
+/// 設定が無ければ引数をそのまま元へ渡す。パニックは受けて元の引数で元を呼ぶ。
+// 引数の数はWin32の`CreateWindowExA`が12と決めている。
 #[allow(clippy::too_many_arguments)]
 extern "system" fn create_window_entry(
     ex_style: u32,
@@ -343,7 +349,7 @@ extern "system" fn create_window_entry(
         ),
         None => (style, x, y, width, height),
     };
-    // SAFETY: `orig` は `CreateWindowExA` と同じ型の関数。引数はゲームが積んだ 12 個のうち、決めた 5 つ（style・位置・大きさ）だけ替える。文字列の 2 つはゲームの `.rdata` のアドレスのまま。
+    // SAFETY: `orig`は`CreateWindowExA`と同じ型の関数。引数はゲームが積んだ12個のうち5つ（style・位置・大きさ）だけ差し替える。文字列の2つはゲームの`.rdata`のアドレスのまま。
     let hwnd = unsafe {
         orig(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -363,8 +369,8 @@ extern "system" fn create_window_entry(
     hwnd
 }
 
-/// 作った後の測定と直しをするか。製品では常に true。検査の偽のハンドル（`0x1234` など）は別の本物のウィンドウのハンドルと
-/// 偶然同じ値になりうるので、その検査だけ止める。
+/// 作った後の測定と修正をするかどうか。製品では常にtrue。
+/// 検査の偽のハンドル（`0x1234`など）は別の本物のウィンドウのハンドルと偶然同じ値になりうる。そのためその検査だけ止める。
 #[cfg(test)]
 fn after_create_enabled() -> bool {
     !TEST_SKIP_AFTER.with(|c| c.get())
@@ -374,10 +380,10 @@ fn after_create_enabled() -> bool {
     true
 }
 
-/// 設定が無いとき（引数をそのまま渡したウィンドウ）の、作った後の style・外寸・client。ウィンドウを変えない実行でも client の画素数を
-/// ログに残す（`[window]` の値を決める手がかり）。
+/// 設定が無いとき（引数をそのまま渡したウィンドウ）の、作った後のstyle・外寸・clientをログに残す。
+/// ウィンドウを変えない実行でもclientのピクセル数をログに残す（`[window]`の値を決める手がかり）。
 fn log_unchanged(hwnd: HWND) {
-    // SAFETY: ウィンドウのハンドルと定数の索引だけを渡す。無効なら 0 が返る。
+    // SAFETY: ウィンドウのハンドルと定数の索引だけを渡す。無効なら0が返る。
     let style = unsafe { GetWindowLongA(hwnd, GWL_STYLE) } as u32;
     log_detail(format!(
         "ウィンドウを作成しました（設定なし。引数はそのまま）: style {style:#010X}、外 {:?}、client {:?}",
@@ -392,7 +398,7 @@ fn rect_size(r: &RECT) -> (i32, i32) {
 
 fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
     let mut r = RECT::default();
-    // SAFETY: `r` は書ける RECT。`hwnd` は作ったばかりのウィンドウ（無効なら FALSE が返るだけ）。
+    // SAFETY: `r`は書き込み可能なRECT。`hwnd`は作ったばかりのウィンドウ（無効ならFALSEが返るだけ）。
     (unsafe { GetClientRect(hwnd, &mut r) } != 0).then(|| rect_size(&r))
 }
 
@@ -402,14 +408,14 @@ fn window_rect(hwnd: HWND) -> Option<RECT> {
     (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then_some(r)
 }
 
-/// ウィンドウを作った後: client を測ってログに残し、指定と違えば外寸を直す。最前面なら最前面にする（前面は奪わない）。
+/// ウィンドウを作った後の処理。clientを測ってログに残し、指定と違えば外寸を修正する。最前面の指定なら最前面にする（前面は奪わない）。
 fn after_create(hwnd: HWND, d: &Decision) {
     let want = (d.cfg.client_w, d.cfg.client_h);
-    // SAFETY: ウィンドウのハンドルと定数の索引だけを渡す。無効なら 0 が返る。
+    // SAFETY: ウィンドウのハンドルと定数の索引だけを渡す。無効なら0が返る。
     let style = unsafe { GetWindowLongA(hwnd, GWL_STYLE) } as u32;
     let client = client_size(hwnd);
     let outer = window_rect(hwnd);
-    // 1 回のウィンドウで 1 行にする。外寸の直し（指定の client に合わせる）・最前面が失敗したら簡潔なログにも残す。
+    // 1回のウィンドウで1行にする。外寸の修正（指定のclientに合わせる）か最前面の設定が失敗したら簡潔なログにも残す。
     let mut failed = false;
     let mut text = format!(
         "ウィンドウを作りました: {}。結果 style {style:#010X}、外 {:?}、client {:?}（指定 {}×{}）",
@@ -422,7 +428,7 @@ fn after_create(hwnd: HWND, d: &Decision) {
     if let (Some(client), Some(outer)) = (client, outer.as_ref())
         && let Some((w, h)) = window_size::corrected_outer(want, client, rect_size(outer))
     {
-        // SAFETY: ウィンドウのハンドルと、大きさだけを変える旗（位置・重なり順・前面は変えない）。
+        // SAFETY: ウィンドウのハンドルと、大きさだけを変えるフラグ（位置・重なり順・前面は変えない）。
         let ok = unsafe {
             SetWindowPos(
                 hwnd,
@@ -441,7 +447,7 @@ fn after_create(hwnd: HWND, d: &Decision) {
         ));
     }
     if d.cfg.always_on_top {
-        // SAFETY: ウィンドウのハンドルと、位置・大きさ・前面の取り合いのどれも変えない旗（`SWP_NOACTIVATE`）。最前面にするだけ。
+        // SAFETY: ウィンドウのハンドルと、位置・大きさを変えず前面も奪わないフラグ（`SWP_NOACTIVATE`）。最前面にするだけ。
         let ok = unsafe {
             SetWindowPos(
                 hwnd,
@@ -456,7 +462,7 @@ fn after_create(hwnd: HWND, d: &Decision) {
         failed |= !ok;
         text.push_str(&format!("。最前面にしました（成功: {ok}）"));
     }
-    // 直しや最前面が失敗したときだけ簡潔にも残す。
+    // 修正や最前面の設定が失敗したときだけ簡潔なログにも残す。
     if failed {
         log(text);
     } else {
@@ -466,8 +472,9 @@ fn after_create(hwnd: HWND, d: &Decision) {
 
 #[cfg(test)]
 mod tests {
-    //! 組み上がりの検査（花映塚は使わない）。差し替えの書き込みは検査のプロセスが確保した頁の上のコピーに行い、書き換えた機械語を
-    //! 実際に呼んで、stdcall の 12 引数・戻り値・レジスタの保存・後始末が元の `call *mem` と同じに続くかまで見る。
+    //! 組み上がりの検査（花映塚は使わない）。
+    //! 差し替えの書き込みは、検査のプロセスが確保したページ上のコピーに行う。
+    //! 書き換えた機械語を実際に呼んで、stdcallの12引数・戻り値・レジスタの保存・後始末が元の`call *mem`と同じに続くかまで検証する。
     use super::*;
     use std::sync::Mutex as StdMutex;
     use windows_sys::Win32::Foundation::TRUE;
@@ -481,7 +488,7 @@ mod tests {
     struct Page(*mut u8);
     impl Page {
         fn new() -> Page {
-            // SAFETY: 新しい 1 頁を確保するだけ（アドレスは OS が選ぶ）。
+            // SAFETY: 新しい1ページを確保するだけ（アドレスはOSが選ぶ）。
             let p = unsafe {
                 VirtualAlloc(
                     core::ptr::null(),
@@ -497,7 +504,7 @@ mod tests {
             self.0 as usize as u32
         }
         fn put(&self, at: usize, b: &[u8]) {
-            // SAFETY: 確保した 4096 バイトの頁の中（呼び出し元が at + len <= 4096 を守る）。
+            // SAFETY: 確保した4096バイトのページの中（呼び出し元が at + len <= 4096 を守る）。
             unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), self.0.add(at), b.len()) };
         }
         fn get(&self, at: usize, len: usize) -> Vec<u8> {
@@ -507,7 +514,7 @@ mod tests {
     }
     impl Drop for Page {
         fn drop(&mut self) {
-            // SAFETY: `new` で確保した頁を、確保した側が解放する。
+            // SAFETY: `new`で確保したページを確保した側が解放する。
             unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
         }
     }
@@ -567,12 +574,12 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// 元の `CreateWindowExA` の代わりに呼ぶ記録係が受けた引数。
+    /// 元の`CreateWindowExA`の代わりに呼ぶ記録係が受けた引数。
     static SEEN: StdMutex<Vec<[usize; 12]>> = StdMutex::new(Vec::new());
-    /// SEEN と TEST_* を使う検査を 1 本ずつにする（`SEEN` は全体で 1 つ）。
+    /// SEENとTEST_* を使う検査を1本ずつにする（`SEEN`は全体で1つ）。
     static ONE_AT_A_TIME: StdMutex<()> = StdMutex::new(());
 
-    #[allow(clippy::too_many_arguments)] // Win32 の引数の数が 12 と決まっている
+    #[allow(clippy::too_many_arguments)] // Win32の引数の数が12と決まっている
     unsafe extern "system" fn recorder(
         a0: u32,
         a1: *const u8,
@@ -604,8 +611,9 @@ mod tests {
         0x1234usize as *mut c_void
     }
 
-    /// 書き換えた機械語を呼べる形に組む。ゲームの `0x42D597` 以降と同じ並び（引数の積み込みと call）を、ebx = hInstance・
-    /// edi = 幅・eax = 高さ・ecx の元の値を入れてから実行し、戻ったあとで esi / ebx / edi が呼ぶ前と同じかを `flag` に残す。
+    /// 書き換えた機械語を呼べる形に組む。
+    /// ゲームの`0x42D597`以降と同じ並び（引数の積み込みとcall）を、ebx = hInstance・edi = 幅・eax = 高さ・ecxの元の値を設定してから実行する。
+    /// 戻ったあとでesi / ebx / ediが呼ぶ前と同じかどうかを`flag`に残す。
     fn build_harness(page: &Page, flag_addr: u32) -> usize {
         const EBX: u32 = 0xB1B1_B1B1;
         const ESI: u32 = 0xE5E5_E5E5;
@@ -618,9 +626,9 @@ mod tests {
         code.push(0xBF);
         code.extend_from_slice(&EDI.to_le_bytes()); // mov edi, 幅
         code.push(0xB8);
-        code.extend_from_slice(&23u32.to_le_bytes()); // mov eax, SM_CYCAPTION の答え
+        code.extend_from_slice(&23u32.to_le_bytes()); // mov eax, SM_CYCAPTIONの答え
         code.push(0xB9);
-        code.extend_from_slice(&3u32.to_le_bytes()); // mov ecx, SM_CYFIXEDFRAME の答え
+        code.extend_from_slice(&3u32.to_le_bytes()); // mov ecx, SM_CYFIXEDFRAMEの答え
         let ctx_at = code.len();
         code.extend_from_slice(site_ctx());
         code.extend_from_slice(&[0x89, 0xC1]); // mov ecx, eax
@@ -641,8 +649,8 @@ mod tests {
     }
 
     fn run_harness(page: &Page) -> usize {
-        // SAFETY: `build_harness` が書いた機械語（cdecl の引数なし関数と同じ形で、戻り値は eax）を、確保した実行できる頁の
-        // 先頭から呼ぶ。ebx / esi / edi は入口で保存して出口で戻す。
+        // SAFETY: `build_harness`が書いた機械語（cdeclの引数なし関数と同じ形で戻り値はeax）を、確保した実行可能なページの先頭から呼ぶ。
+        // ebx / esi / ediは入口で保存して出口で戻す。
         let f: extern "C" fn() -> usize = unsafe { core::mem::transmute(page.0) };
         f()
     }
@@ -745,7 +753,7 @@ mod tests {
         TEST_SKIP_AFTER.with(|c| c.set(false));
     }
 
-    /// 本物の `CreateWindowExA`（組み込みの `STATIC` ウィンドウ。見えない）で、差し替えの関数が指定どおりの client / 位置 / 最前面のウィンドウを作るか。
+    /// 本物の`CreateWindowExA`（組み込みの`STATIC`ウィンドウ。見えない）で、差し替えの関数が指定どおりのclient / 位置 / 最前面のウィンドウを作るかどうか。
     fn create_real(cfg: WindowConfig, game_style: u32) -> (HWND, RECT, (i32, i32), i32) {
         create_real_ex(cfg, game_style, 0)
     }
@@ -810,13 +818,13 @@ mod tests {
     }
 
     fn destroy(hwnd: HWND) {
-        // SAFETY: この検査が作って、このスレッドで持っているウィンドウ。
+        // SAFETY: この検査が作ってこのスレッドで持っているウィンドウ。
         assert_eq!(unsafe { DestroyWindow(hwnd) }, TRUE);
     }
 
     #[test]
     fn real_windows_get_the_requested_client_size() {
-        // ゲームの style `0x100A0000` と同じ形（見えないウィンドウにするため WS_VISIBLE だけ外す）。Windows は WS_POPUP / WS_CHILD の
+        // ゲームのstyle `0x100A0000`と同じ形（見えないウィンドウにするためWS_VISIBLEだけ外す）。WindowsはWS_POPUP / WS_CHILDの
         let game_like = 0x000A_0000;
         let want = WindowConfig {
             client_w: 1001,
@@ -829,7 +837,7 @@ mod tests {
         let (h, outer, client, _) = create_real(want, game_like);
         assert_eq!(client, (1001, 563));
         assert_eq!((outer.left, outer.top), (30, 40));
-        // 最前面の要求を出して OS が成功を返したことはログに残る。旗は見えないウィンドウでは当てにならない（全件の回で立たない回があった）
+        // 最前面の要求を出してOSが成功を返したことはログに残る。フラグは見えないウィンドウでは当てにならない（全件の検査を実行したときに立たないことがあった）
         assert!(
             logged()
                 .iter()
@@ -871,7 +879,7 @@ mod tests {
         let (h, _, client, _) = create_real(WindowConfig::DEFAULT, game_like);
         assert_eq!(client, (640, 480));
         destroy(h);
-        // 外寸の式（枠の分を足す）が必ず外れる style: WS_POPUP は枠が無いので、足した分だけ client が大きく出る → 直しが効く。
+        // 外寸の式（枠の分を足す）が必ず外れるstyle: WS_POPUPは枠が無いので足した分だけclientが大きく出る → 修正が効く。
         TEST_LINES.with(|l| l.borrow_mut().clear());
         let (h, outer, client, _) = create_real(
             WindowConfig {

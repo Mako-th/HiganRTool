@@ -1,7 +1,9 @@
-//! 観戦者が IPv4 と IPv6 の両方の候補へ JOIN を送ったときの、ホストと観戦者の振る舞い。
+//! 観戦者がIPv4とIPv6の両方の候補へJOINを送ったときのホストと観戦者の振る舞い。
 //!
-//! ホストは送り元ごとに別の枠を作る（同じ観戦者が 2 枠になる）。観戦者が選んだ経路（最初の STREAM が届いた送り元）から ACK が来たら、
-//! もう片方の枠は外す。観戦者の側は最初の STREAM の送り元に決め、以後そこだけへ送る。ネットワークは持たず、`Outlet` の記録を手で渡す。
+//! ホストは送り元ごとに別の枠を作る（同じ観戦者が2枠になる）。
+//! 観戦者が選んだ経路（最初のSTREAMが届いた送り元）からACKが来たらもう片方の枠は外す。
+//! 観戦者の側は最初のSTREAMの送り元を経路に決め、以後そこだけへ送る。
+//! ネットワークは持たず`Outlet`の記録を手で渡す。
 //! アドレスは文書用の範囲（RFC 5737 / RFC 3849）。
 
 use higanr_core::auth::{AuthKey, Secret};
@@ -103,7 +105,7 @@ fn host_with_records() -> SpectateHost {
     host
 }
 
-/// 同じ観戦者（nonce が同じ）の JOIN を、IPv4 と IPv6 の送り元から入れる。
+/// 同じ観戦者（nonceが同じ）のJOINをIPv4とIPv6の送り元からホストへ渡す。
 fn join_both(host: &mut SpectateHost, nonce: u64, now: u32) {
     let mut sink = Sink::default();
     for from in [VIEW4, VIEW6] {
@@ -114,11 +116,11 @@ fn join_both(host: &mut SpectateHost, nonce: u64, now: u32) {
     }
 }
 
-/// 観戦者の ACK（`Watcher` が STREAM を受けて返すもの）を、その送り元の枠へ渡す。ホストの STREAM は `streams` から `to` 宛のものを使う。
+/// 観戦者のACK（`Watcher`がSTREAMを受けて返すもの）をその送り元の枠へ渡す。ホストのSTREAMは`streams`から`to`宛のものを使う。
 fn ack_from(host: &mut SpectateHost, streams: &Sink, to: &str, now: u32) -> HostEvent {
     let mut w = Watcher::new(watcher_cfg(&[sa(HOST4), sa(HOST6)], 0xB0B0));
     let mut acks = Sink::default();
-    // 観戦者は ACK を返す側（STREAM を受けた送り元 = `to` の枠に向けたホストの便）。
+    // 観戦者はACKを返す側（STREAMを受けた送り元 = `to` の枠に向けたホストの便）。
     let stream = streams
         .to(sa(to))
         .into_iter()
@@ -132,7 +134,7 @@ fn ack_from(host: &mut SpectateHost, streams: &Sink, to: &str, now: u32) -> Host
     host.on_datagram(sa(to), &ack, now, &mut Sink::default())
 }
 
-/// 両方の経路から入った同じ観戦者は、ACK を返した経路だけが残る。
+/// 両方の経路から入った同じ観戦者はACKを返した経路だけが残る。
 #[test]
 fn the_path_that_acks_stays_and_the_silent_twin_is_dropped() {
     let mut host = host_with_records();
@@ -165,7 +167,7 @@ fn the_path_that_acks_stays_and_the_silent_twin_is_dropped() {
     assert_eq!(left, vec![sa(VIEW4)]);
 }
 
-/// 別の観戦者（nonce も公開鍵も違う）の枠は、同じ族でも別の族でも外さない。
+/// 別の観戦者（nonceも公開鍵も違う）の枠は同じ族でも別の族でも外さない。
 #[test]
 fn another_watcher_on_the_other_family_is_not_a_twin() {
     let mut host = host_with_records();
@@ -180,7 +182,7 @@ fn another_watcher_on_the_other_family_is_not_a_twin() {
     assert_eq!(host.counts().twins_dropped, 0);
 }
 
-/// 経路が決まった後に、もう片方の経路の JOIN が遅れて届いても枠を作らない。観戦者の NAT が付け替わって黙った後の入り直しは、ホストが受ける。
+/// 経路の決定後にもう片方の経路のJOINが遅れて届いても枠を作らない。観戦者のNATが付け替わって黙った後の入り直しはホストが受ける。
 #[test]
 fn a_late_join_on_the_other_path_is_ignored_but_a_rebind_after_silence_is_taken() {
     let mut host = host_with_records();
@@ -195,7 +197,7 @@ fn a_late_join_on_the_other_path_is_ignored_but_a_rebind_after_silence_is_taken(
     );
     assert_eq!(host.spectator_count(), 1, "遅れた JOIN が枠を作った");
     assert_eq!(host.counts().twins_dropped, 1);
-    // 古い経路が最後に聞こえた 20 ms から `REJOIN_MS` に満たないうちはまだ生きている。ちょうど `REJOIN_MS` で、新しい送り元は入れる。
+    // 古い経路が最後に聞こえた20 msから`REJOIN_MS`に満たないうちはまだ生きている。ちょうど`REJOIN_MS`になると新しい送り元は入れる。
     assert_eq!(
         host.on_datagram(
             sa(VIEW6),
@@ -221,7 +223,7 @@ fn a_late_join_on_the_other_path_is_ignored_but_a_rebind_after_silence_is_taken(
     );
 }
 
-/// 人数の上限は別人の数で止め、同じ観戦者の 2 つ目の経路の枠は上限いっぱいでも入れる。別人の 11 人目は断る。
+/// 人数の上限は別人の数で数える。同じ観戦者の2つ目の経路の枠は上限いっぱいでも入れる。別人の11人目は断る。
 #[test]
 fn the_limit_counts_people_and_a_second_path_takes_a_spare_slot() {
     let mut host = host_with_records();
@@ -234,7 +236,7 @@ fn the_limit_counts_people_and_a_second_path_takes_a_spare_slot() {
         );
     }
     assert_eq!(host.spectator_count(), MAX_SPECTATORS);
-    // 10 人目(nonce 0x10A)が IPv6 からも JOIN する: 枠は 11、人数は 10 のまま。
+    // 10人目(nonce 0x10A)がIPv6からもJOINする: 枠は11、人数は10のまま。
     assert_eq!(
         host.on_datagram(
             sa(VIEW6),
@@ -248,7 +250,7 @@ fn the_limit_counts_people_and_a_second_path_takes_a_spare_slot() {
     assert_eq!(host.slot_count(), MAX_SPECTATORS + 1);
     assert_eq!(host.spectator_count(), MAX_SPECTATORS);
     assert_eq!(host.counts().joined, MAX_SPECTATORS as u64);
-    // 別人の 11 人目は断る。
+    // 別人の11人目は断る。
     assert_eq!(
         host.on_datagram(
             sa("198.51.100.99:40000"),
@@ -262,7 +264,7 @@ fn the_limit_counts_people_and_a_second_path_takes_a_spare_slot() {
     assert_eq!(host.spectator_count(), MAX_SPECTATORS);
 }
 
-/// 観戦者は最初に STREAM が届いた経路に決め、以後の ACK・JOIN の送り直しはそこだけへ出す。
+/// 観戦者は最初にSTREAMが届いた経路だけを使う。以後のACK・JOINの送り直しもそこだけへ出す。
 #[test]
 fn the_watcher_sticks_to_the_first_family_that_answers() {
     let mut host = host_with_records();
@@ -279,7 +281,7 @@ fn the_watcher_sticks_to_the_first_family_that_answers() {
     let mut out = Sink::default();
     w.on_datagram(sa(HOST6), streams.to(sa(VIEW6))[0], 10, &mut out);
     assert_eq!(w.host_addr(), Some(sa(HOST6)));
-    // もう片方の族から遅れて届いた STREAM は別の送り元として捨て、ACK も返さない。
+    // もう片方の族から遅れて届いたSTREAMは別の送り元として捨て、ACKも返さない。
     let acks_before = out.0.len();
     w.on_datagram(sa(HOST4), streams.to(sa(VIEW4))[0], 11, &mut out);
     assert_eq!(out.0.len(), acks_before, "選ばなかった経路へ ACK を返した");
@@ -293,7 +295,7 @@ fn the_watcher_sticks_to_the_first_family_that_answers() {
     );
 }
 
-/// ホストの穴あけの印（HGRT でない便）を受けた数を、IPv6 の分だけ別に数える。
+/// ホストの穴あけの印（HGRTでない便）を受けた数をIPv6の分だけ別に数える。
 #[test]
 fn punch_packets_are_counted_per_family() {
     let mut w = Watcher::new(watcher_cfg(&[sa(HOST4), sa(HOST6)], 0xB0B0));

@@ -1,5 +1,6 @@
-//! 配る側（`spectate_offer.rs`）の検査。部品は毎回の回、観戦用のルームとの往復（loopback の偽サーバーと本物のスレッド。実時間で数秒）は
-//! `#[ignore]`（全件の回 `build.bat` が `--ignored` で走らせる）。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。ルーム名・アドレス・コードは合成の値だけ。
+//! 配布側（`spectate_offer.rs`）の検査。
+//! 部品の検査は毎回の回に含める。観戦用のルームとの往復（loopbackの偽サーバーと本物のスレッド。実時間で数秒）は`#[ignore]`にして、全件の回（`build.bat`）が`--ignored`で走らせる。
+//! 外へは接続しない（`127.0.0.1`と`Proxy::Direct`）。ルーム名・アドレス・コードは合成の値だけ。
 use super::*;
 
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ fn lo(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// ゲーム内のメニューの経路の設定（`code_side = game`、`[spectate] enable = 1`）。`extra` は `[netplay]` に足す行。
+/// ゲーム内のメニューの経路の設定（`code_side = game`・`[spectate] enable = 1`）。`extra`は`[netplay]`に足す行。
 fn settings(extra: &str) -> NetSettings {
     crate::net_config::from_text(&format!(
         "[netplay]\nenable = 1\nbind = 127.0.0.1:0\ncode_side = game\nclipboard = file\nname = host\n{extra}[spectate]\nenable = 1\n"
@@ -38,6 +39,11 @@ fn room_opts(base: &str) -> RoomOptions {
 const SESSION: u32 = 0x5EED_0B01;
 const SECRET: Secret = Secret([0x21; 16]);
 
+/// サーバーに接続しない検査のチケット（形だけがサーバーと同じ合成の値）。
+fn synth_ticket() -> SeatTicket {
+    SeatTicket::parse("1790000000.1790086400.Of5-_kOf5-_kOf5-_kOf5-_kOf5-_kOf5-_kOf5-_kc").unwrap()
+}
+
 fn armed(s: &NetSettings, mapped: Option<SocketAddr>) -> Armed {
     armed_v6(s, mapped, None)
 }
@@ -56,7 +62,7 @@ fn armed_v6(s: &NetSettings, mapped: Option<SocketAddr>, v6: Option<SocketAddr>)
     .unwrap()
 }
 
-/// 期限 `expires` の観戦用のコードへの返し（返しの期限はコードの期限）。
+/// 期限`expires`の観戦用のコードへの返答（返答の期限はコードの期限）。
 fn reply_text(session: u32, secret: Secret, cands: &[SocketAddr], expires: u64) -> String {
     let spec = Code {
         side: code::Side::Spectate,
@@ -78,8 +84,8 @@ fn reply_text(session: u32, secret: Secret, cands: &[SocketAddr], expires: u64) 
 fn runner(s: &NetSettings) -> (Runner, Arc<Shared>) {
     let a = armed(s, None);
     let shared = Arc::clone(a.kit.shared());
-    let room = RoomName::parse("synth-room").unwrap().spectate_of();
-    (Runner::new(a.kit, room, None), shared)
+    let room = RoomName::parse("synth-room").unwrap();
+    (Runner::new(a.kit, room, synth_ticket(), None), shared)
 }
 
 const V4_ONLY: Families = Families {
@@ -143,16 +149,16 @@ fn the_offer_and_watch_codes_carry_an_ipv6_candidate_only_when_a_v6_socket_exist
         "観戦コードに IPv6 が無い"
     );
     assert_eq!(a.kit.families, BOTH);
-    // 読み戻した観戦用のコードにも載っている（コードの形式が観戦でも IPv6 を運べる）。
+    // 読み戻した観戦用のコードにも載っている（コードの形式が観戦でもIPv6を運べる）。
     let text = a.oneway.write(5_000_000).unwrap();
     let read = code::read_spectate(&text, 5_000_000).unwrap();
     assert!(addrs(&read.code.candidates).contains(&v6));
-    // IPv6 のソケットが無ければ載せない。
+    // IPv6のソケットが無ければ載せない。
     let a = armed_v6(&on, None, None);
     assert!(addrs(&a.kit.candidates).iter().all(SocketAddr::is_ipv4));
     assert!(addrs(&a.oneway.candidates).iter().all(SocketAddr::is_ipv4));
     assert_eq!(a.kit.families, V4_ONLY);
-    // 世界に通じない IPv6（文書用・リンクローカル）は、ソケットがあっても載せない（対戦のコードと同じ判定）。
+    // インターネットに通じないIPv6（文書用・リンクローカル）はソケットがあっても載せない（対戦のコードと同じ判定）。
     for bad in ["[2001:db8::1]:47001", "[fe80::1]:47001"] {
         let a = armed_v6(&on, None, Some(bad.parse().unwrap()));
         assert!(
@@ -179,7 +185,7 @@ fn arming_follows_the_link_so_a_host_both_allow_keeps_the_mapping() {
     assert!(!offer.keeps_mapping(), "片方が禁止したホスト");
 }
 
-/// 候補が空になる設定（STUN の答えが無い `candidates = mapped`）で用意に失敗したとき、句が簡潔にも出る形になる。
+/// 候補が空になる設定（STUNの答えが無い`candidates = mapped`）で用意に失敗したとき、失敗の句が問題と判定される形になる（簡潔なログにも出る）。
 #[test]
 fn an_arm_failure_note_is_seen_as_a_problem() {
     let s = settings("scope = internet\ncandidates = mapped\nstun = stun.example.invalid:3478\n");
@@ -211,12 +217,12 @@ fn arming_needs_the_spectate_section_and_draws_fresh_values() {
     );
     assert!(a.is_none() && note.is_empty(), "{note}");
     let on = settings("");
-    // ルームサーバーが無くても用意する（観戦コードの経路だけ）。配る側のスレッドは作れない。
+    // ルームサーバーが無くても用意する（観戦コードの経路だけ）。配布側のスレッドは作れない。
     let (a, note) = arm(&on, lo(47_001), None, None, None, None, &link);
     let a = a.expect(&note);
     assert!(note.contains("観戦用のルームへは入りません"), "{note}");
     let room = RoomName::parse("synth-room").unwrap();
-    let err = spawn(a.kit, &room, None).unwrap_err();
+    let err = spawn(a.kit, &room, synth_ticket(), None).unwrap_err();
     assert!(err.contains("room_server"), "{err}");
     let (a, note) = arm(
         &on,
@@ -326,7 +332,7 @@ fn only_a_reply_with_the_right_tag_session_and_expiry_asks_for_a_punch() {
     );
 }
 
-/// 観戦者の PC の時計がずれていても、すぐ出した返しはホストの時計で通る（返しの期限はホストのコードの期限）。
+/// 観戦者のPCの時計がずれていてもすぐ出した返答はホストの時計で通る（返答の期限はホストのコードの期限）。
 #[test]
 fn a_reply_from_a_viewer_with_a_skewed_clock_still_asks_for_a_punch() {
     let host_now = 5_000_000u64;
@@ -335,12 +341,13 @@ fn a_reply_from_a_viewer_with_a_skewed_clock_still_asks_for_a_punch() {
     let host_code = a.oneway.write(host_now).unwrap();
     let mut r = Runner::new(
         a.kit,
-        RoomName::parse("synth-room").unwrap().spectate_of(),
+        RoomName::parse("synth-room").unwrap(),
+        synth_ticket(),
         None,
     );
     for skew in [-600i64, 0, 600] {
         let viewer_now = host_now.checked_add_signed(skew).unwrap();
-        // 観戦者の側の手順（`spectate_join` と同じ: 自分の時計でコードを読み、返しを書く）。
+        // 観戦者の側の手順（`spectate_join`と同じ: 自分の時計でコードを読み、返答を書く）。
         let spec = code::read_spectate(&host_code, viewer_now).unwrap();
         let reply = code::write_spectate_reply_to(
             &spec.code,
@@ -356,7 +363,7 @@ fn a_reply_from_a_viewer_with_a_skewed_clock_still_asks_for_a_punch() {
             "時計が {skew} 秒ずれた観戦者の返しで穴あけを頼まない: {:?}",
             shared.get().offer
         );
-        // ホストのコードの期限が本当に過ぎた後の返しは捨てる。
+        // ホストのコードの期限が本当に過ぎた後の返答は捨てる。
         let expired = shared.get().offer.expired;
         r.punch(&reply, host_now + code::DEFAULT_TTL_SECS + 1);
         assert_eq!(shared.punch_generation(), before + 1, "期限切れで頼んだ");
@@ -364,7 +371,7 @@ fn a_reply_from_a_viewer_with_a_skewed_clock_still_asks_for_a_punch() {
     }
 }
 
-/// `follow_mapping` を直に回す（ルームへは接続しない）。
+/// `follow_mapping`を直接呼ぶ（ルームへは接続しない）。
 fn remap_runner(mapped: SocketAddr, upnp: Option<u16>) -> (Runner, OnewayCode, Arc<Shared>) {
     let a = arm_with(
         &settings(""),
@@ -378,8 +385,12 @@ fn remap_runner(mapped: SocketAddr, upnp: Option<u16>) -> (Runner, OnewayCode, A
     )
     .unwrap();
     let shared = Arc::clone(a.kit.shared());
-    let room = RoomName::parse("synth-room").unwrap().spectate_of();
-    (Runner::new(a.kit, room, None), a.oneway, shared)
+    let room = RoomName::parse("synth-room").unwrap();
+    (
+        Runner::new(a.kit, room, synth_ticket(), None),
+        a.oneway,
+        shared,
+    )
 }
 
 fn addrs_of(c: &Candidates) -> Vec<SocketAddr> {
@@ -407,7 +418,7 @@ fn a_moved_mapping_rebuilds_both_codes_and_the_same_mapping_does_not() {
     r.follow_mapping(0);
     assert_eq!(shared.get().offer.remapped, 0);
     assert_eq!(addrs_of(&r.kit.candidates), before);
-    // ポートが動いた: 預ける候補と観戦コードの候補が新しいポートになる。
+    // ポートが動いた: 登録する候補と観戦コードの候補が新しいポートになる。
     shared.offer.note_mapped(moved);
     r.follow_mapping(10);
     let now = addrs_of(&r.kit.candidates);
@@ -425,7 +436,7 @@ fn a_moved_mapping_rebuilds_both_codes_and_the_same_mapping_does_not() {
         r.follow_mapping(t);
     }
     assert_eq!(shared.get().offer.remapped, 1);
-    // アドレスが変わると UPnP の候補もそのアドレスへ付く。
+    // アドレスが変わるとUPnPの候補もそのアドレスへ付く。
     shared.offer.note_mapped(other_ip);
     r.follow_mapping(50);
     assert_eq!(shared.get().offer.remapped, 2);
@@ -443,7 +454,7 @@ fn a_moved_mapping_rebuilds_both_codes_and_the_same_mapping_does_not() {
     r.follow_mapping(60);
     assert_eq!(shared.get().offer.remapped, 3);
     assert_eq!(addrs_of(&r.kit.candidates), before);
-    // IPv6 の答えは受けない（NAT の付け替えは IPv4 の話）。
+    // IPv6の答えは受けない（NATの付け替えはIPv4の話）。
     shared
         .offer
         .note_mapped("[2606:4700::1]:4000".parse().unwrap());
@@ -460,15 +471,22 @@ fn the_snapshot_line_shows_the_offer_part_only_when_armed_and_never_an_address_o
     r.stats().bump(Stat::FailRate);
     r.stats().bump(Stat::Remapped);
     r.stats().bump(Stat::Remapped);
+    r.stats().bump(Stat::FailBadTicket);
+    for _ in 0..3 {
+        r.stats().bump(Stat::Evicted);
+    }
     let text = shared.get().text();
     assert!(
         text.contains("配信側")
             && text.contains("入った 1")
             && text.contains("預けた 1")
             && text.contains("外側のアドレスの変化で作り直し 2")
-            && text.contains("混雑 1"),
+            && text.contains("混雑 1")
+            && text.contains("入室許可の拒否 1")
+            && text.contains("後から成立した対戦に席を譲った 3"),
         "{text}"
     );
+    assert!(!text.contains("Of5-"), "札が行に出た: {text}");
     assert!(text.contains("未作成"), "{text}");
     for secret_like in ["127.0.0.1", "synth-room", "w."] {
         assert!(
@@ -497,7 +515,7 @@ fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
     }
 }
 
-/// 観戦者の役（ルームの guest）で入り、配る側の観戦用のコードを受けて、`make` で作った返しを answer する。サーバーが 1000 で閉じるまで回す。
+/// 観戦者の役（ルームのguest）で入って配布側の観戦用のコードを受け取り、`make`で作った返答をanswerする。サーバーが1000で閉じるまで回す。
 fn viewer_answers(base: &str, room: &RoomName, make: impl FnOnce(&Code) -> String) -> Code {
     let mut c = RoomConn::start(&room_opts(base), room).unwrap();
     let t0 = Instant::now();
@@ -519,6 +537,7 @@ fn viewer_answers(base: &str, room: &RoomName, make: impl FnOnce(&Code) -> Strin
                 }
                 Event::Done => done = true,
                 Event::Failed(f) => panic!("観戦者のルームの手順が失敗した: {f:?}"),
+                Event::Held => panic!("観戦用のルームで接続を保った"),
                 Event::Matched { .. } => {}
             }
         }
@@ -535,7 +554,8 @@ fn viewer_answers(base: &str, room: &RoomName, make: impl FnOnce(&Code) -> Strin
     spec.expect("観戦用のコードを受けた")
 }
 
-/// 配る側のスレッドの組み上がり（本物のスレッド ＋ 偽のルームサーバー ＋ 本物の WinHTTP）。観戦用のルーム（元のルーム名のハッシュ）だけへ入り、サーバーの 1000 の後に入り直し、止めたら終わる。
+/// 配布側のスレッドの結合テスト（本物のスレッド ＋ 偽のルームサーバー ＋ 本物のWinHTTP）。
+/// 観戦用のルーム（元のルーム名のハッシュ）だけへ入り、サーバーの1000の後に入り直し、止めたら終わる。
 #[test]
 #[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（入り直しの 2 秒を 2 回含む。十数秒）。全件の回（build.bat）で --ignored で走る"]
 fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
@@ -556,7 +576,7 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
     let shared = Arc::clone(a.kit.shared());
     let match_room = RoomName::parse("synth-spec-room").unwrap();
     let spec_room = match_room.spectate_of();
-    spawn(a.kit, &match_room, None).unwrap();
+    spawn(a.kit, &match_room, srv.mint_ticket(&spec_room), None).unwrap();
     assert!(shared.get().offer.running);
     wait_until(
         "観戦用のコードの預け",
@@ -669,7 +689,7 @@ fn the_offer_thread_serves_one_viewer_per_entry_and_rejoins_after_each() {
     );
 }
 
-/// 預けたコードを誰も受け取っていない間に外側のポートが動いたら、入り直して新しいポートのコードを預ける。同じアドレスなら入り直さない。
+/// 登録したコードを誰も受け取っていない間に外側のポートが動いたら入り直して、新しいポートのコードを登録する。同じアドレスなら入り直さない。
 #[test]
 #[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
 fn a_moved_mapping_enters_again_and_the_viewer_gets_the_new_port() {
@@ -690,8 +710,9 @@ fn a_moved_mapping_enters_again_and_the_viewer_gets_the_new_port() {
     )
     .unwrap();
     let shared = Arc::clone(a.kit.shared());
-    let spec_room = RoomName::parse("synth-remap-room").unwrap().spectate_of();
-    let mut r = Runner::new(a.kit, spec_room, None);
+    let match_room = RoomName::parse("synth-remap-room").unwrap();
+    let spec_room = match_room.spectate_of();
+    let mut r = Runner::new(a.kit, match_room, srv.mint_ticket(&spec_room), None);
     let t0 = Instant::now();
     let run_until = |r: &mut Runner, what: &str, limit: Duration, cond: &dyn Fn() -> bool| {
         let t1 = Instant::now();
@@ -743,7 +764,8 @@ fn a_moved_mapping_enters_again_and_the_viewer_gets_the_new_port() {
     r.close();
 }
 
-/// 観戦者がコードを受け取った（`matched` が届いている）同じ見回りで外側のポートが動いても、閉じずにその手順を終えさせ、次の入室で新しいポートのコードを預ける。
+/// 観戦者がコードを受け取った（`matched`が届いている）のと同じポーリングで外側のポートが動いても、閉じずにその手順を終えさせる。
+/// 次の入室で新しいポートのコードを登録する。
 #[test]
 #[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（入り直しの 2 秒を含む。数秒）。全件の回（build.bat）で --ignored で走る"]
 fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
@@ -764,10 +786,9 @@ fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
     )
     .unwrap();
     let shared = Arc::clone(a.kit.shared());
-    let spec_room = RoomName::parse("synth-remap-matched")
-        .unwrap()
-        .spectate_of();
-    let mut r = Runner::new(a.kit, spec_room, None);
+    let match_room = RoomName::parse("synth-remap-matched").unwrap();
+    let spec_room = match_room.spectate_of();
+    let mut r = Runner::new(a.kit, match_room, srv.mint_ticket(&spec_room), None);
     let t0 = Instant::now();
     let ms = || u64::try_from(t0.elapsed().as_millis()).unwrap();
     while shared.get().offer.offered < 1 {
@@ -775,7 +796,7 @@ fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
         r.step(ms(), crate::net_udp::now_unix());
         std::thread::sleep(Duration::from_millis(20));
     }
-    // 観戦者が入ってコードを受け取る。配る側は回さないので、`matched` は配る側の接続に届いたまま読まれていない。
+    // 観戦者が入ってコードを受け取る。配布側はポーリングしないので、`matched`は配布側の接続に届いたまま読まれていない。
     let mut v = RoomConn::start(&room_opts(&base), &spec_room).unwrap();
     let mut spec = None;
     let t1 = Instant::now();
@@ -829,7 +850,7 @@ fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    // 配る側も同じ接続で返しを受け、穴あけを頼んで手順を終える。
+    // 配布側も同じ接続で返答を受け取り、穴あけを頼んで手順を終える。
     while shared.get().offer.done < 1 {
         assert!(
             t1.elapsed() < Duration::from_secs(10),
@@ -863,7 +884,11 @@ fn a_moved_mapping_lets_a_viewer_who_got_the_code_finish() {
 const LIST_BUILD: u32 = 7;
 const Q_NAME: &str = "q.0123456789abcdef0123456789abcd";
 
-fn listing_info(cap: u8) -> ListingInfo {
+fn q_ticket(srv: &FakeServer) -> SeatTicket {
+    srv.mint_ticket(&RoomName::parse_server_rules(Q_NAME).unwrap().spectate_of())
+}
+
+fn listing_info(cap: u8, ticket: SeatTicket) -> ListingInfo {
     ListingInfo {
         build: LIST_BUILD,
         posting: Posting {
@@ -873,11 +898,12 @@ fn listing_info(cap: u8) -> ListingInfo {
             mode: higanr_core::wire::Mode::Rollback,
             delay: 1,
             cap,
+            ticket,
         },
     }
 }
 
-/// 一覧に載せる配る側（観戦用のルームの名は割り当ての名から導く）。
+/// 一覧に載せる配布側（観戦用のルームの名は割り当ての名から導く）。
 fn listing_runner(srv: &FakeServer, listing: Option<ListingInfo>) -> (Runner, Arc<Shared>) {
     let base = srv.base();
     let s = settings(&format!("room_server = {base}\n"));
@@ -894,10 +920,10 @@ fn listing_runner(srv: &FakeServer, listing: Option<ListingInfo>) -> (Runner, Ar
     .unwrap();
     let shared = Arc::clone(a.kit.shared());
     let q = RoomName::parse_server_rules(Q_NAME).unwrap();
-    (Runner::new(a.kit, q.spectate_of(), listing), shared)
+    (Runner::new(a.kit, q, q_ticket(srv), listing), shared)
 }
 
-/// 見回りを実時間で 20 ms ごとに回して、条件が整うまで待つ。
+/// ポーリングを実時間で20 msごとに回して条件が整うまで待つ。
 fn step_until(r: &mut Runner, what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
     let t0 = Instant::now();
     while !cond() {
@@ -914,7 +940,7 @@ fn step_until(r: &mut Runner, what: &str, limit: Duration, mut cond: impl FnMut(
 #[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
 fn a_random_host_lists_the_match_follows_the_spectator_count_and_leaves_when_stopped() {
     let srv = FakeServer::start();
-    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10)));
+    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10, q_ticket(&srv))));
     let want = RoomName::parse_server_rules(Q_NAME).unwrap().spectate_of();
     step_until(&mut r, "一覧に載る", Duration::from_secs(5), || {
         !srv.watch_items(LIST_BUILD).is_empty()
@@ -952,7 +978,7 @@ fn a_random_host_lists_the_match_follows_the_spectator_count_and_leaves_when_sto
         Duration::from_secs(5),
         || shared.get().offer.listed == 1,
     );
-    // 観戦者の数に付いていく（上限を越える数は上限に収める）。
+    // 観戦者の数に追従する（上限を超える数は上限に収める）。
     for (n, want) in [(3u32, 3i64), (0, 0), (99, 10), (1, 1)] {
         shared.set_spectators(n);
         step_until(
@@ -979,7 +1005,7 @@ fn a_random_host_lists_the_match_follows_the_spectator_count_and_leaves_when_sto
 fn a_host_without_listing_info_never_touches_the_list() {
     let srv = FakeServer::start();
     let (mut r, shared) = listing_runner(&srv, None);
-    // 観戦用のルームへは入る（配る側は動く）。一覧のエンドポイントには触らない。
+    // 観戦用のルームへは入る（配布側は動く）。一覧のエンドポイントには触らない。
     step_until(
         &mut r,
         "観戦用のルームへ入る",
@@ -1001,9 +1027,9 @@ fn a_host_without_listing_info_never_touches_the_list() {
 #[ignore = "偽サーバー・本物のスレッドと WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
 fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up() {
     let srv = FakeServer::start();
-    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10)));
+    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10, q_ticket(&srv))));
     let posts = || srv.seen.watch_post_upgrades.load(Ordering::Acquire);
-    // 件数の上限（list_full）で断られたら、入り直さない。
+    // 件数の上限（list_full）で断られたら入り直さない。
     srv.knobs.list_full.store(true, Ordering::Release);
     let t0 = Instant::now();
     r.step(0, 0);
@@ -1021,14 +1047,14 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
     assert!(srv.watch_items(LIST_BUILD).is_empty());
     r.close();
 
-    // それ以外の失敗（bad_message）は、間隔を空けて入り直す（30 秒・60 秒・…）。時計は見回りに渡す値で進める。
+    // それ以外の失敗（bad_message）は間隔を空けて入り直す（30秒・60秒・…）。時計はポーリングに渡す値で進める。
     let srv = FakeServer::start();
-    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10)));
+    let (mut r, shared) = listing_runner(&srv, Some(listing_info(10, q_ticket(&srv))));
     let posts = || srv.seen.watch_post_upgrades.load(Ordering::Acquire);
     srv.knobs.list_bad.store(true, Ordering::Release);
     let mut now = 0u64;
     r.step(now, 0);
-    // 失敗の出来事は次の見回りで届く。
+    // 失敗のイベントは次のポーリングで届く。
     let t0 = Instant::now();
     while shared.get().offer.list_failed < 1 {
         assert!(t0.elapsed() < Duration::from_secs(5), "断られたと数えない");
@@ -1045,7 +1071,7 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
     now = failed_at + RELIST_FIRST_MS;
     r.step(now, 0);
     wait_until("2 回目の post", Duration::from_secs(5), || posts() == 2);
-    // 2 回目の失敗の後は間隔が倍になる。
+    // 2回目の失敗の後は間隔が倍になる。
     let t0 = Instant::now();
     while shared.get().offer.list_failed < 2 {
         assert!(
@@ -1064,7 +1090,7 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
         2,
         "2 回目の失敗の後に 30 秒で入り直した（60 秒に倍になるはず）"
     );
-    // 偽サーバーの一覧の断りを止めると、次の入り直しで載る。
+    // 偽サーバーの一覧の断りを止めると次の入り直しで載る。
     srv.knobs.list_bad.store(false, Ordering::Release);
     now = failed2_at + 2 * RELIST_FIRST_MS;
     r.step(now, 0);
@@ -1078,7 +1104,7 @@ fn a_refused_listing_retries_after_a_growing_delay_and_a_full_list_is_given_up()
         r.step(now, 0);
         std::thread::sleep(Duration::from_millis(10));
     }
-    // 載った知らせは次の見回りで届く。
+    // 載った通知は次のポーリングで届く。
     while shared.get().offer.listed < 1 {
         assert!(t0.elapsed() < Duration::from_secs(5), "載ったと数えない");
         now += 10;
@@ -1134,7 +1160,7 @@ fn an_offer_that_cannot_be_sent_ends_the_entry_and_the_caster_enters_again_later
     r.close();
 }
 
-/// 開発用の `[spectate] fake_uplink` は、ゲーム内のメニューの経路の観戦のホストにも届く（書かなければ無し）。
+/// 開発用の`[spectate] fake_uplink`はゲーム内のメニューの経路の観戦のホストにも届く（書かなければ無し）。
 #[test]
 fn the_dev_fake_uplink_reaches_the_sender_of_the_in_game_path() {
     let with = crate::net_config::from_text(
@@ -1144,4 +1170,241 @@ fn the_dev_fake_uplink_reaches_the_sender_of_the_in_game_path() {
     .unwrap();
     assert_eq!(armed(&with, None).parts.sender.fake_uplink(), Some(77_000));
     assert_eq!(armed(&settings(""), None).parts.sender.fake_uplink(), None);
+}
+
+// ---------------- 席のチケット ----------------
+
+/// 配布側を役hostの席に着かせる（サーバーに接続しない。`make_offer`は接続が無ければ何も送らない）。
+fn seat(r: &mut Runner, now: u64) {
+    assert_eq!(r.caster.poll(now), Some(CasterAction::Connect));
+    r.on_event(
+        Event::Joined {
+            role: Role::Offer,
+            expires_at: 0,
+        },
+        now,
+        5_000_000,
+    );
+    assert_eq!(
+        r.caster.status(now).phase,
+        higanr_core::spectate_room::CasterPhase::Casting
+    );
+}
+
+#[test]
+fn a_caster_that_loses_its_seat_counts_it_once_and_waits_five_minutes_as_a_guest() {
+    use higanr_core::spectate_room::{CASTER_EVICTED_MS, CASTER_WRONG_ROLE_MS, WaitReason};
+    let (mut r, shared) = runner(&settings(""));
+    seat(&mut r, 0);
+    r.on_event(Event::Failed(Failure::PeerLeft), 100, 5_000_000);
+    let c = shared.get().offer;
+    assert_eq!((c.evicted, c.fail_peer_left), (1, 1), "{c:?}");
+    assert!(r.told_evicted);
+    let s = r.caster.status(100);
+    assert_eq!(s.last_wait, Some(WaitReason::Evicted));
+    assert_eq!(s.next_entry_at, Some(100 + CASTER_EVICTED_MS));
+    assert_eq!(r.caster.poll(100 + CASTER_WRONG_ROLE_MS), None);
+    // 入り直しても新しいチケットの配布側がいる（役guest）場合: 5秒でなく5分ごと。席を譲った数は増やさない。
+    let t = 100 + CASTER_EVICTED_MS;
+    assert_eq!(r.caster.poll(t), Some(CasterAction::Connect));
+    r.on_event(
+        Event::Joined {
+            role: Role::Answer,
+            expires_at: 0,
+        },
+        t,
+        5_000_000,
+    );
+    let s = r.caster.status(t);
+    assert_eq!(s.next_entry_at, Some(t + CASTER_EVICTED_MS), "{s:?}");
+    assert_eq!(shared.get().offer.evicted, 1);
+    assert!(
+        crate::main_log::peek()
+            .iter()
+            .filter(|l| l.as_str() == EVICTED_LINE)
+            .count()
+            <= 1,
+        "本ログに 2 回出た"
+    );
+}
+
+#[test]
+fn a_caster_whose_ticket_is_refused_stops_entering_and_listing() {
+    let srv_less = settings("");
+    let a = armed(&srv_less, None);
+    let shared = Arc::clone(a.kit.shared());
+    let mut r = Runner::new(
+        a.kit,
+        RoomName::parse_server_rules(Q_NAME).unwrap(),
+        synth_ticket(),
+        Some(listing_info(10, synth_ticket())),
+    );
+    seat(&mut r, 0);
+    r.on_event(Event::Failed(Failure::BadTicket), 10, 5_000_000);
+    let c = shared.get().offer;
+    assert_eq!((c.fail_bad_ticket, c.fail_unresponsive), (1, 0), "{c:?}");
+    assert!(r.told_bad_ticket);
+    assert_eq!(
+        r.caster.status(10).phase,
+        higanr_core::spectate_room::CasterPhase::GaveUp
+    );
+    assert!(
+        r.listing
+            .as_ref()
+            .is_some_and(|l| l.gave_up && l.conn.is_none())
+    );
+    for t in [10, 60_000, 3_600_000] {
+        assert_eq!(r.caster.poll(t), None, "{t}");
+    }
+}
+
+/// 対戦をせずにチケットだけで入る観戦者の真似ができないこと（別のルームのチケット・チケットなし）と、より新しいチケットの配布側が席を取った後の配布側。
+#[test]
+#[ignore = "偽サーバー・本物の WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn a_caster_with_another_rooms_ticket_gives_up_and_an_evicted_one_does_not_rejoin_every_five_seconds()
+ {
+    use higanr_core::spectate_room::{CASTER_EVICTED_MS, CasterPhase};
+    // 別のルームのチケット: 400 bad_ticketで止まり、入り直さない。
+    let srv = FakeServer::start();
+    let base = srv.base();
+    let mk = |port: u16| {
+        arm_with(
+            &settings(&format!("room_server = {base}\n")),
+            lo(port),
+            None,
+            None,
+            None,
+            Some(room_opts(&base)),
+            || Ok(SESSION),
+            || Ok(SECRET),
+        )
+        .unwrap()
+    };
+    let a = mk(47_006);
+    let shared = Arc::clone(a.kit.shared());
+    let room = RoomName::parse("synth-seat-room").unwrap();
+    let wrong = srv.mint_ticket(&RoomName::parse("synth-other-room").unwrap().spectate_of());
+    let mut r = Runner::new(a.kit, room, wrong, None);
+    let t0 = Instant::now();
+    let ms = || u64::try_from(t0.elapsed().as_millis()).unwrap();
+    while shared.get().offer.fail_bad_ticket == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            shared.get().offer
+        );
+        r.step(ms(), crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(r.caster.status(ms()).phase, CasterPhase::GaveUp);
+    let ups = srv.seen.upgrades.load(Ordering::Acquire);
+    let paths = srv.seen.paths.lock().unwrap().len();
+    for t in [ms(), ms() + 60_000, ms() + 3_600_000] {
+        r.step(t, crate::net_udp::now_unix());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(srv.seen.upgrades.load(Ordering::Acquire), ups);
+    assert_eq!(srv.seen.paths.lock().unwrap().len(), paths, "入り直した");
+    r.close();
+
+    // 正しいチケットで席に着いた後に、同じルーム名で後から成立した対戦のチケット（より新しい発行）に席を取られる。
+    let spec_room = room.spectate_of();
+    let a = mk(47_007);
+    let shared = Arc::clone(a.kit.shared());
+    let issued = crate::net_udp::now_unix();
+    let mut r = Runner::new(a.kit, room, srv.mint_ticket_at(&spec_room, issued), None);
+    let t0 = Instant::now();
+    let mut now = 0u64;
+    while shared.get().offer.offered == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            shared.get().offer
+        );
+        now += 10;
+        r.step(now, crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut newer = RoomConn::start_as_host(
+        &room_opts(&base),
+        &spec_room,
+        &srv.mint_ticket_at(&spec_room, issued + 5),
+    )
+    .unwrap();
+    let t1 = Instant::now();
+    while shared.get().offer.evicted == 0 {
+        assert!(
+            t1.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            shared.get().offer
+        );
+        let _ = newer.poll();
+        now += 10;
+        r.step(now, crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(r.told_evicted);
+    // 5秒・1分経っても入り直さない。5分後に入ると役guestになり、また5分待つ。
+    let ups = srv.seen.upgrades.load(Ordering::Acquire);
+    for dt in [5_000, 6_000, 60_000] {
+        r.step(now + dt, crate::net_udp::now_unix());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        srv.seen.upgrades.load(Ordering::Acquire),
+        ups,
+        "5 分より前に入り直した"
+    );
+    now += CASTER_EVICTED_MS;
+    let t2 = Instant::now();
+    while shared.get().offer.wrong_role == 0 {
+        assert!(
+            t2.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            shared.get().offer
+        );
+        let _ = newer.poll();
+        now += 10;
+        r.step(now, crate::net_udp::now_unix());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let s = r.caster.status(now);
+    assert!(
+        s.next_entry_at
+            .is_some_and(|t| t >= now + CASTER_EVICTED_MS - 1_000),
+        "{s:?}"
+    );
+    assert_eq!(shared.get().offer.evicted, 1);
+    assert!(!newer.is_finished(), "新しい札の配る側の席を壊した");
+    r.close();
+}
+
+#[test]
+#[ignore = "偽サーバー・本物の WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn the_post_carries_the_ticket_and_a_server_without_a_seat_key_does_not_list() {
+    let srv = FakeServer::start();
+    let t = q_ticket(&srv);
+    let (mut r, _shared) = listing_runner(&srv, Some(listing_info(10, t)));
+    step_until(&mut r, "一覧に載る", Duration::from_secs(5), || {
+        !srv.watch_items(LIST_BUILD).is_empty()
+    });
+    let posts = srv.seen.posts.lock().unwrap().clone();
+    assert!(
+        posts.len() == 1 && posts[0].ends_with(&format!(r#","ticket":"{}"}}"#, t.as_str())),
+        "{posts:?}"
+    );
+    r.close();
+    // 別のルームのチケット・鍵の無いサーバーでは載らない。
+    for keyed in [true, false] {
+        let srv = FakeServer::start();
+        srv.knobs.no_seat_key.store(!keyed, Ordering::Release);
+        let wrong = srv.mint_ticket(&RoomName::parse("synth-other").unwrap().spectate_of());
+        let ticket = if keyed { wrong } else { q_ticket(&srv) };
+        let (mut r, shared) = listing_runner(&srv, Some(listing_info(10, ticket)));
+        step_until(&mut r, "断られる", Duration::from_secs(5), || {
+            shared.get().offer.list_failed >= 1
+        });
+        assert!(srv.watch_items(LIST_BUILD).is_empty(), "{keyed}");
+        r.close();
+    }
 }

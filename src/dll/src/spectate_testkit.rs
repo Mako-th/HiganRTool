@@ -1,5 +1,6 @@
-//! 観戦のホストの検査ツール（検査のときだけ）: 観戦者を別のスレッドで走らせる（core の `Watcher` を直接回す）ことと、観戦者が
-//! 受けた記録の列をマッチの語・押下・SELECT に畳むこと。`spectate_host.rs` の検査、`netplay/loopback.rs`、`netplay/spectate_tests.rs` が使う。
+//! 観戦のホストの検査ツール（検査時だけ使う）。観戦者を別のスレッドで走らせる（coreの`Watcher`を直接回す）。
+//! 観戦者が受けた記録の列をマッチのワード・押下・SELECTに畳む。
+//! `spectate_host.rs`の検査と`netplay/loopback.rs`・`netplay/spectate_tests.rs`が使う。
 #![forbid(unsafe_code)]
 
 use std::net::{SocketAddr, UdpSocket};
@@ -18,17 +19,17 @@ use higanr_core::wire::{ByeReason, Record, Seat, Select, Step};
 use crate::net_udp::RecvThread;
 use crate::netplay::NetPlay;
 
-/// ホストの送信ウィンドウ（`core::spectate::SEND_WINDOW`）。ACK を返さない観戦者が受けられる記録の数の上限。
+/// ホストの送信ウィンドウ（`core::spectate::SEND_WINDOW`）。ACKを返さない観戦者が受けられる記録の数の上限。
 pub const NOACK_WINDOW: usize = higanr_core::spectate::SEND_WINDOW as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Behavior {
     Normal,
-    /// JOIN は送るが、届いた STREAM に ACK を返さない（ウィンドウの 512 記録で止まる）。
+    /// JOINは送るが、届いたSTREAMにACKを返さない（ウィンドウの512記録で止まる）。
     NoAck,
-    /// JOIN を 1 回送った後は何も聞かず何も送らない（ソケットは開いたまま）。
+    /// JOINを1回送った後は何も聞かず何も送らない（ソケットは開いたまま）。
     Silent,
-    /// 記録を `n` 個受けたところで消える（ソケットを閉じる。以後ホストが送ると ICMP の port unreachable が返る）。
+    /// 記録を`n`個受けたところで消える（ソケットを閉じる。以後ホストが送るとICMPのport unreachableが返る）。
     Vanish(usize),
 }
 
@@ -38,9 +39,9 @@ pub struct Seen {
     pub counts: WatcherCounts,
     pub joined: bool,
     pub datagrams: u32,
-    /// 受けたデータグラムの長さの合計（ホストが送った量。loopback は落とさない）。
+    /// 受けたデータグラムの長さの合計（ホストが送った量。loopbackは落とさない）。
     pub bytes: u64,
-    /// `recs` の各記録を取り出した時刻（`recs` と同じ並び。ホストが積んでから観戦者が使えるまでの遅れを測る）。
+    /// `recs`の各記録を取り出した時刻（`recs`と同じ並び。ホストが積んでから観戦者が使えるまでの遅れを測る）。
     pub popped: Vec<Instant>,
 }
 
@@ -66,7 +67,7 @@ pub struct Observer {
 }
 
 impl Observer {
-    /// `code_text` は `spectate_code.txt` の中身（`Prepared::code_text`）。`nonce` は観戦者ごとに変える。
+    /// `code_text`は`spectate_code.txt`の中身（`Prepared::code_text`）。`nonce`は観戦者ごとに変える。
     pub fn spawn(code_text: &str, behavior: Behavior, nonce: u64) -> Observer {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -134,7 +135,7 @@ fn observe(
         nonce,
         name: Name::new("watcher"),
         host: c.code.candidates,
-        // ホストの公開鍵は観戦用のコードから、観戦者の種は観戦者ごとに OS の乱数で（本物の観戦者と同じ）。
+        // ホストの公開鍵は観戦用のコードから取る。観戦者の種は観戦者ごとにOSの乱数で作る（本物の観戦者と同じ）。
         host_public: c.host_public,
         key_seed: crate::net_udp::draw_key_seed().expect("OS の乱数が引ける"),
     });
@@ -192,9 +193,10 @@ fn observe(
     seen
 }
 
-/// 本物の経路（`spectate_host::arm` と `commit` と同じ部品）で観戦のホストを用意し、リングバッファをゲームのセッション `np` に付け、観戦のホストの送り手を受信スレッド `rx` に渡し、
-/// `behaviors` の観戦者を作って全員が入る（ホストが JOIN を受ける）まで待つ。`local` はゲームの受信ソケット、`session` は対戦の session
-/// （観戦用の session はそれと別に引かれる）。
+/// 本物の経路（`spectate_host::arm`と`commit`と同じ部品）で観戦のホストを用意する。
+/// リングバッファをゲームのセッション`np`に付け、観戦のホストの送信側を受信スレッド`rx`に渡す。
+/// `behaviors`の観戦者を作り、全員が入る（ホストがJOINを受ける）まで待つ。
+/// `local`は対戦用受信ソケット、`session`は対戦のsession。観戦用のsessionは別に生成する。
 pub fn attach(
     np: &mut NetPlay,
     rx: &RecvThread,
@@ -205,7 +207,7 @@ pub fn attach(
     attach_with_code(np, rx, local, session, behaviors).0
 }
 
-/// `attach` に、観戦用のコードの文字（`spectate_code.txt` の中身）も返す関数（dll の観戦者を別に作る検査が使う）。
+/// `attach`に加えて観戦用のコードの文字（`spectate_code.txt`の中身）も返す関数。dllの観戦者を別に作る検査が使う。
 pub fn attach_with_code(
     np: &mut NetPlay,
     rx: &RecvThread,
@@ -244,7 +246,7 @@ pub fn attach_with_code(
     (observers, p.code_text)
 }
 
-/// 揃った値から、席ごとの SELECT の記録の期待。`netplay.rs` の `spec_selects` とは別に書いた（同じ間違いを 2 か所でコピーしないため）。
+/// 揃った値からサイドごとのSELECTの記録の期待を作る。`netplay.rs`の`spec_selects`とは別に書いた（同じ間違いを2か所にコピーしないため）。
 pub fn expected_selects(own_seat: Seat, own: Select, a: &Agreed) -> [Record; 2] {
     let common = |s: Select| Select {
         map: a.map,
@@ -269,7 +271,7 @@ pub fn expected_selects(own_seat: Seat, own: Select, a: &Agreed) -> [Record; 2] 
     ]
 }
 
-/// 記録の列を、マッチの語・押下・SELECT に畳んだもの（比べる側が使う）。
+/// 記録の列をマッチのワード・押下・SELECTに畳んだもの（比べる側が使う）。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Folded {
     pub frames: Vec<(u16, u32, u16, u16)>,
@@ -283,7 +285,7 @@ pub struct Folded {
     pub checks: Vec<(higanr_core::wire::CheckKind, higanr_core::wire::WatchCheck)>,
 }
 
-/// 畳む。最初の記録が `Seg` でなければ panic（流れは seg の始まりから始まる）。
+/// 畳む。最初の記録が`Seg`でなければpanic（流れはマッチの始まりから始まる）。
 pub fn fold(recs: &[Record]) -> Folded {
     let mut f = Folded::default();
     let mut seg: Option<u16> = None;

@@ -1,10 +1,10 @@
-//! 画面の言語（日本語・英語）の今の値と、メニューで選んだ値を ini へ書き戻す処理（unsafe 無し）。
+//! 画面の言語（日本語・英語）の今の値の保持と、メニューで選んだ値をiniへ書き戻す処理（unsafe無し）。
 //!
-//! - 今の値は 1 か所の原子変数。ゲームのスレッドが書き（メニューで替えたとき）、見張り・ウィンドウの文を書くスレッドも読む。
-//!   決め方は起動のとき（`session::load_net`）に 1 回: ini の `[ui] lang` → `auto` なら OS の UI の言語（`higanr_core::lang::resolve`）。
-//! - メニューで替えたら、起動のときに読んだのと同じ ini の `lang` の行を別のスレッド（`script_win::save_ui_lang`）が書き換える。
-//!   ゲームのスレッドはファイルに触らない。一時ファイルへ書いてから置き換える。ini 以外のファイルは書かない。
-//! - 本ログ・CSV は言語を切り替えない（日本語のまま）。
+//! - 今の値は1か所のアトミック変数。ゲームのスレッドが書き（メニューで替えたとき）、監視の処理・ウィンドウの文を書くスレッドも読む。
+//!   決め方は起動時（`session::load_net`）に1回: iniの`[ui] lang` → `auto`ならOSのUIの言語（`higanr_core::lang::resolve`）。
+//! - メニューで替えたら起動時に読んだのと同じiniの`lang`の行を別のスレッド（`script_win::save_ui_lang`）が書き換える。
+//!   ゲームのスレッドはファイルに触らない。一時ファイルへ書いてから置き換える。ini以外のファイルは書かない。
+//! - 本ログ・CSVは言語を切り替えない（日本語のまま）。
 //! - 検査では今の値をスレッドごとに持つ（並列の検査が互いの言語を書き換えない）。
 
 #![forbid(unsafe_code)]
@@ -41,7 +41,7 @@ thread_local! {
     static CURRENT: LangCell = const { LangCell::new() };
 }
 
-/// 今の言語。起動のあいだは日本語（`set` が呼ばれるまで）。確保しない。
+/// 今の言語。起動中は日本語（`set`が呼ばれるまで）。確保しない。
 pub fn current() -> Lang {
     #[cfg(not(test))]
     {
@@ -53,7 +53,7 @@ pub fn current() -> Lang {
     }
 }
 
-/// 今の言語を設定する（起動のときの読み取りのスレッドと、メニューで替えたゲームのスレッド）。確保しない。
+/// 今の言語を設定する（起動時の読み取りのスレッドとメニューで替えたゲームのスレッド）。確保しない。
 pub fn set(l: Lang) {
     #[cfg(not(test))]
     CURRENT.set(l);
@@ -61,8 +61,8 @@ pub fn set(l: Lang) {
     CURRENT.with(|c| c.set(l));
 }
 
-/// ini の `[ui] lang` を `lang` に書き換える。ほかの設定の書き戻しと同じ鍵の中で書く（`ini_store`）。
-/// 中身が変わらなければ書かない。`path` が無い（ini なしで走っている）なら書かずに誤りを返す。
+/// iniの`[ui] lang`を`lang`に書き換える。ほかの設定の書き戻しと同じロックの中で書く（`ini_store`）。
+/// 中身が変わらなければ書かない。`path`が無い（iniなしで走っている）なら書かずにエラーを返す。
 pub fn save_to_ini(path: Option<&Path>, lang: Lang) -> Result<(), String> {
     let path = path.ok_or("ini の場所が不明（ini なしの実行）なので言語を書きません")?;
     ini_store::update(
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_current_language_is_one_value_shared_by_threads() {
-        // 検査では thread_local だが、変数そのものは別のスレッドから読める（本番は静的な 1 つ）。
+        // 検査ではthread_localだが変数そのものは別のスレッドから読める（本番は静的な1つ）。
         let cell = std::sync::Arc::new(LangCell::new());
         assert_eq!(cell.get(), Lang::Ja, "起動のあいだは日本語");
         let c2 = std::sync::Arc::clone(&cell);

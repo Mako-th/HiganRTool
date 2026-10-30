@@ -1,25 +1,28 @@
-//! フレームのペース（取り込みの形 B「フレームの始まりで待つだけ」）の期限の計算と、1 フレームの記録の行・集計（pure）。
-//! Win32 に触らない: 時刻は QueryPerformanceCounter の値（整数のカウント）として受け取り、待つかどうか・どこまで待つかを返すだけ。待つのは `src/dll/src/pacing_win.rs`。
-//! - 期限の式: 基点 `base`（最初にフレームの始まりへ来た時刻）から `G_j = base + floor(j × QPF ÷ fps)`（fps は既定 60）。64 ビット（掛け算は 128 ビット）の整数で毎回ここから作り、
-//!   前の期限に 1 周期を足して作らない。足して作ると、QPF が 60 で割り切れない PC（例 3,579,545 Hz）で毎フレーム切り捨てた端数が積もってずれる。
-//!   花映塚自身は QPC の下位 32 ビットを単精度で割った時計に 1/60 を足すので、周期が 0.0166626 秒などに丸められ、429.5 秒ごとに折り返す。
-//! - 遅れたとき: ゲーム自身と同じく「取り戻さない」。遅れて始めたフレームの次の期限は、始めた時刻より後の最初の格子点（`first_after`）。格子（位相）はそのままで、
-//!   過ぎた格子点は飛ばす（数を返す）。花映塚の `0x0042DC74`〜`0x0042DC8B` も「期限 < 今 の間 1/60 ずつ足す」ので同じ形。vpatch の `AllowShortDelay=0`（基点を今に取り直す）とは違う。
-//! - ペース（fps）: vpatch の `GameFPS` と同じく ini（`[pacing] fps`）で変えられる（仕組みだけ参考）。検査の回を速く回すため。ゲームの 1 フレームの中身はペースに依らない見込み:
-//!   ゲーム自身の時計 `0x0042CC90` を呼ぶのは do_frame の始まり `0x0042DC44` と尻 `0x0042DD65` の 2 か所だけで、B は始まりを置き換える。既定の 60 なら製品の遅延の増分は 0。
+//! フレームのペース（取り込みの形B「フレームの始まりで待つだけ」）の期限の計算と、1フレームの記録の行・集計（pure）。
+//! Win32に触らない: 時刻はQueryPerformanceCounterの値（整数のカウント）として受け取る。待つかどうか・どこまで待つかを返すだけ。待つのは`src/dll/src/pacing_win.rs`。
+//! - 期限の式: 基点`base`（最初にフレームの始まりへ来た時刻）から`G_j = base + floor(j × QPF ÷ fps)`（fpsは既定60）。
+//!   64ビット（掛け算は128ビット）の整数で毎回ここから作る。前の期限に1周期を足して作らない。
+//!   足して作るとQPFが60で割り切れないPC（例3,579,545 Hz）で毎フレーム切り捨てた端数が積もってずれる。
+//!   花映塚自身はQPCの下位32ビットを単精度で割った時計に1/60を足す。そのため周期が0.0166626秒などに丸められ、429.5秒ごとに折り返す。
+//! - 遅れたとき: ゲーム自身と同じく「取り戻さない」。遅れて始めたフレームの次の期限は始めた時刻より後の最初の格子点（`first_after`）。
+//!   格子（位相）はそのままで過ぎた格子点は飛ばす（数を返す）。
+//!   花映塚の`0x0042DC74`〜`0x0042DC8B`も「期限 < 今 の間1/60ずつ足す」ので同じ形。vpatchの`AllowShortDelay=0`（基点を今に取り直す）とは違う。
+//! - ペース（fps）: vpatchの`GameFPS`と同じくini（`[pacing] fps`）で変えられる（仕組みだけ参考）。検査を速く回すため。
+//!   ゲームの1フレームの中身はペースに依らない見込み。ゲーム自身の時計`0x0042CC90`を呼ぶのはdo_frameの始まり`0x0042DC44`と終わり`0x0042DD65`の2か所だけで、Bは始まりを置き換える。
+//!   既定の60なら製品の遅延の増分は0。
 #![forbid(unsafe_code)]
 
 use crate::ini::Ini;
 use crate::pacing_hybrid::{HYBRID_KEYS, HybridParams};
 
-/// 1 秒あたりのフレーム数の既定（花映塚の `[0x490278]` = 1/60）。ini に `fps` が無ければこれ。
+/// 1秒あたりのフレーム数の既定（花映塚の `[0x490278]` = 1/60）。iniに`fps`が無ければこれ。
 pub const DEFAULT_FPS: u64 = 60;
 pub const MIN_FPS: u64 = 1;
-/// ini の `fps` の上限。検査の用途（240 前後）に足りる値。B の始まりは残りが 1 ms（dll の `pacing::SPIN_US`）以下なら寝ずに QPC を読み続けるので、1000 では 1 フレームずっと回し読みになる。
-/// QPF より大きい値は `Grid::new` / `Pace::new` が断る。
+/// iniの`fps`の上限。検査の用途（240前後）に足りる値。Bの始まりは残りが1 ms（dllの`pacing::SPIN_US`）以下なら寝ずにQPCを読み続ける。そのため1000では1フレームずっと回し読みになる。
+/// QPFより大きい値は`Grid::new` / `Pace::new`が断る。
 pub const MAX_FPS: u64 = 1_000;
 
-/// `qpf` と `fps` で格子が刻めるか（fps が 0 でなく、1 周期が 1 カウント以上。満たないと格子点が重なる）。
+/// `qpf`と`fps`で格子が刻めるか（fpsが0でなく、1周期が1カウント以上。満たないと格子点が重なる）。
 pub fn can_tick(qpf: u64, fps: u64) -> bool {
     fps >= MIN_FPS && qpf >= fps
 }
@@ -57,7 +60,7 @@ impl Grid {
         if t < self.base {
             return 0;
         }
-        // j0 = floor((t - base) × fps ÷ qpf) は at(j0) <= t を満たす。at(j0 + 1) は切り捨てで t ちょうどに落ちることがあるので、越えるまで進める（qpf >= fps なので進むのは多くても 2 回）。
+        // j0 = floor((t - base) × fps ÷ qpf) は at(j0) <= t を満たす。at(j0 + 1)は切り捨てでtちょうどに落ちることがあるので、越えるまで進める（qpf >= fps なので進むのは多くても2回）。
         let j0 = ((t - self.base) as u128 * self.fps as u128 / self.qpf as u128) as u64;
         let mut j = j0.saturating_add(1);
         while self.at(j) <= t && j < u64::MAX {
@@ -80,7 +83,7 @@ pub struct Pace {
     fps: u64,
     grid: Option<Grid>,
     next: u64,
-    /// 期限が今より 2 周期より先にあったので基点を取り直した回数（QPC が戻ったときの守り）。
+    /// 期限が今より2周期より先にあったので基点を取り直した回数（QPCが戻ったときの守り）。
     rebased: u64,
     nudge_rem: i32,
 }
@@ -113,8 +116,8 @@ impl Pace {
         self.rebased
     }
 
-    /// 次のフレームから、1 周期の長さを `ppm`（100 万分率。正 = 伸ばす = 遅くなる）だけ変える: 基点を `周期 × ppm / 10^6` カウントだけ動かす（以後の期限が全部その分ずれる）。
-    /// 割り切れない端数は次の呼び出しへ持ち越す（QPF が小さい環境で、小さい ppm が 0 カウントに丸められ続けないため）。動かしたカウント（符号つき）を返す。格子がまだ無ければ 0。
+    /// 次のフレームから1周期の長さを`ppm`（100万分率。正 = 伸ばす = 遅くなる）だけ変える: 基点を`周期 × ppm / 10^6`カウントだけ動かす（以後の期限が全部その分ずれる）。
+    /// 割り切れない端数は次の呼び出しへ持ち越す（QPFが小さい環境で、小さいppmが0カウントに丸められ続けないため）。動かしたカウント（符号つき）を返す。格子がまだ無ければ0。
     pub fn nudge(&mut self, ppm: i32) -> i64 {
         let Some(g) = self.grid else {
             return 0;
@@ -130,7 +133,7 @@ impl Pace {
         self.qpf.div_ceil(self.fps)
     }
 
-    /// いま待っているフレームの期限。最初の呼び出しで基点を `now` にする。期限が `now` より 2 周期より先なら（QPC は戻らないので作りの誤りか時計の異常）、基点を `now` に取り直す（待ち続けて止まらないための守り）。
+    /// いま待っているフレームの期限。最初の呼び出しで基点を`now`にする。期限が`now`より2周期より先なら（QPCは戻らないので実装の誤りか時計の異常）基点を`now`に取り直す（待ち続けて止まらないための守り）。
     pub fn deadline(&mut self, now: u64) -> u64 {
         let grid = match self.grid {
             Some(g) => g,
@@ -159,7 +162,7 @@ impl Pace {
         d
     }
 
-    /// フレームの始まりで呼ぶ。`spin` は最後に QPC を読み続ける幅（カウント）、`chunk_us` は 1 回に寝る長さの上限（µs）。寝る長さは「残り − spin」を µs に切り捨て、`chunk_us` で抑え、1 µs 以上にする。
+    /// フレームの始まりで呼ぶ。`spin`は最後にQPCを読み続ける幅（カウント）。`chunk_us`は1回に寝る長さの上限（µs）。寝る長さは「残り − spin」をµsに切り捨て、`chunk_us`で抑え、1 µs以上にする。
     pub fn decide(&mut self, now: u64, spin: u64, chunk_us: u32) -> Head {
         let deadline = self.deadline(now);
         if now >= deadline {
@@ -178,7 +181,7 @@ impl Pace {
         Head::Sleep { deadline, us }
     }
 
-    /// フレームを `start` に始めた。次の期限を「`start` より後の最初の格子点」にする（取り戻さない）。飛ばした格子点の数を返す。
+    /// フレームを`start`に始めた。次の期限を「`start`より後の最初の格子点」にする（取り戻さない）。飛ばした格子点の数を返す。
     pub fn started(&mut self, start: u64) -> u64 {
         let Some(grid) = self.grid else {
             return 0;
@@ -204,35 +207,38 @@ pub fn us_to_ticks_ceil(us: u64, qpf: u64) -> u64 {
 }
 
 pub const SECTION: &str = "pacing";
-/// 節の中で読むキー（これと `pacing_hybrid::HYBRID_KEYS` の `hybrid_*` 以外は断る。綴りの誤りで既定のまま走らないように）。
+/// カテゴリの中で読むキー（これと`pacing_hybrid::HYBRID_KEYS`の`hybrid_*`以外は断る。綴りの誤りで既定のまま走らないように）。
 const KEYS: [&str; 6] = ["mode", "fps", "cycle_secs", "cycle_phases", "wait", "vsync"];
 
-/// `mode = cycle` の 1 区間の長さ（秒）の既定。6 分のマッチなら 1 方式あたり 4 区間になる。
+/// `mode = cycle`の1区間の長さ（秒）の既定。6分のマッチなら1方式あたり4区間になる。
 pub const DEFAULT_CYCLE_SECS: u64 = 30;
-/// `cycle_secs` の下限・上限。下限 1 秒（1 区間が数十フレームより短いと、入れ替えの直後のフレームばかりになる）。上限は dll の計測の上限（`observe::SCRIPT_MAX_SECONDS` = 1200 秒）の 3 倍。
+/// `cycle_secs`の下限・上限。下限1秒（1区間が数十フレームより短いと入れ替えの直後のフレームばかりになる）。上限はdllの計測の上限（`observe::SCRIPT_MAX_SECONDS` = 1200秒）の3倍。
 pub const MIN_CYCLE_SECS: u64 = 1;
 pub const MAX_CYCLE_SECS: u64 = 3_600;
 
-/// `[pacing]` の節が無いとき（ini が無いときも）・`mode` を書かないときの形。ウィンドウと垂直同期を取らないフルスクリーンは `wait` の方式、垂直同期を取るフルスクリーンは game の `Mode::Auto`。
-/// 切り分けの実測（同じ実行で 30 秒ごとに入れ替え。各方式 9,000〜10,800 フレーム）で、入力 → Present の前の p99 は b だけが約 +500 µs 悪く、b-spin は game と同じだった。
-/// b の遅れの原因は寝ることで、b-spin は論理コア 1 つを回し続ける（素の花映塚と同じ）。
-/// 垂直同期を取るフルスクリーンの素の花映塚は Present が垂直同期を待つので、60.000 fps の格子を刻むと走査線と干渉する見込みがあり、game に任せる。
+/// `[pacing]`のカテゴリが無いとき（iniが無いときも）や`mode`を書かないときの形（`Mode::Auto`）。
+/// ウィンドウと垂直同期を取らないフルスクリーンでは`wait`の方式を使い、垂直同期を取るフルスクリーンではgameの方式を使う。
+/// 切り分けの実測（同じ実行で30秒ごとに入れ替え。各方式9,000〜10,800フレーム）では、入力 → Presentの前のp99はbだけが約 +500 µs悪かった。b-spinはgameと同じだった。
+/// bの遅れの原因は寝ること。b-spinは論理コア1つを回し続ける（素の花映塚と同じ）。
+/// 垂直同期を取るフルスクリーンの素の花映塚はPresentが垂直同期を待つ。60.000 fpsの格子を刻むと走査線と干渉する見込みがあるのでgameに任せる。
 pub const DEFAULT_MODE: Mode = Mode::Auto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Game,
     B,
-    /// B と同じ格子だが、期限の前に寝ずに `Sleep(0)` で回る（ゲーム自身の待ち方 `0x0042DD7B` と同じ形）。
+    /// Bと同じ格子だが、期限の前に寝ずに`Sleep(0)`で回る（ゲーム自身の待ち方`0x0042DD7B`と同じ形）。
     BSpin,
-    /// game → b → b-spin を `cycle_secs` ごとに入れ替える（切り分け用）。並びは `cycle_phases` で変えられる。
+    /// game → b → b-spinを`cycle_secs`ごとに入れ替える（切り分け用）。並びは`cycle_phases`で変えられる。
     Cycle,
-    /// B と同じ格子で、期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後は b-spin と同じに `Sleep(0)` で回る（処理の重さを下げるため。`crate::pacing_hybrid`）。auto の既定の待ち方。
+    /// Bと同じ格子で期限の「回し読みの幅 + 余裕」前までは高分解能の待機タイマーで寝て、その後はb-spinと同じに`Sleep(0)`で回る（処理の重さを下げるため。`crate::pacing_hybrid`）。autoの既定の待ち方。
     BHybrid,
-    /// vpatch の通常のペースの形の再現（`crate::pacing_vpatch`）。遅延の表の「vpatch 相当」を測るための測定専用で、既定でも `wait` / `cycle_phases` の候補でもない。
+    /// vpatchの通常のペースの形の再現（`crate::pacing_vpatch`）。遅延の表の「vpatch 相当」を測るための測定専用で、既定でも`wait` / `cycle_phases`の候補でもない。
     Vpatch,
-    /// フレームごとに画面の形（`Screen`）を読み、ウィンドウと垂直同期を取らないフルスクリーンなら `wait` の方式、垂直同期を取るフルスクリーン・読めないなら game の経路（始まりの入口がゲーム自身の時計へ任せる）。既定（`DEFAULT_MODE`）。
-    /// DLL の設置（`install`）の時でなくフレームごとに読むのは、設置が花映塚の設定の読み込み（WinMain の `0x0042E4D0`）より前に走りうり、読んだ値が起動前の 0 = フルスクリーンに見えるため。
+    /// 既定（`DEFAULT_MODE`）。フレームごとに画面の形（`Screen`）を読み、ウィンドウと垂直同期を取らないフルスクリーンなら`wait`の方式を使う。
+    /// 垂直同期を取るフルスクリーンと読めないときはgameの経路を使う（始まりの入口がゲーム自身の時計へ任せる）。
+    /// DLLの設置（`install`）のときでなくフレームごとに読むのは、設置が花映塚の設定の読み込み（WinMainの`0x0042E4D0`）より前に走りうるため。
+    /// そのときに読むと値は起動前の 0 = フルスクリーンに見える。
     Auto,
 }
 
@@ -263,7 +269,7 @@ impl Mode {
         .find(|m| m.name().eq_ignore_ascii_case(s))
     }
 
-    /// DLL がゲームの `0x0042DC44` に始まりの call を書くか。game だけが書かない（auto はフルスクリーンのフレームでも書いたまま、始まりの入口がゲーム自身の経路へ任せる）。
+    /// DLLがゲームの`0x0042DC44`に始まりのcallを書くかどうか。gameだけが書かない（autoはフルスクリーンのフレームでも書いたまま、始まりの入口がゲーム自身の経路へ任せる）。
     pub fn uses_head(self) -> bool {
         self != Mode::Game
     }
@@ -284,7 +290,7 @@ impl Mode {
 pub enum Screen {
     Windowed,
     Fullscreen,
-    /// フルスクリーンで、デバイスの PresentationInterval が IMMEDIATE（垂直同期を取らない）。
+    /// フルスクリーンで、デバイスのPresentationIntervalがIMMEDIATE（垂直同期を取らない）。
     FullscreenImmediate,
     Unknown,
 }
@@ -292,9 +298,10 @@ pub enum Screen {
 /// D3DPRESENT_INTERVAL_IMMEDIATE。
 pub const PRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 
-/// フルスクリーンのときの形を、デバイスの present parameters のコピー（`0x004B3450`。CreateDevice の後に `0x0042E089` の `rep movsl` で 13 語をコピーし、
-/// Reset もこれを渡す）の PresentationInterval（`+0x30`）で分ける。デバイスを作る関数は、フルスクリーンで `[0x4B30CC]` か `[0x4B36AC]` が立てば
-/// IMMEDIATE（`0x0042DE4A`）、立たなければ 1（`0x0042DE74`）を設定し、IMMEDIATE で作れなければ 1 に替えて作り直す（`0x0042DFE4`）。
+/// フルスクリーンのときの形を、デバイスのpresent parametersのコピー（`0x004B3450`）のPresentationInterval（`+0x30`）で分ける。
+/// コピーはCreateDeviceの後に`0x0042E089`の`rep movsl`で13ワードを書く。Resetもこのコピーを渡す。
+/// デバイスを作る関数はフルスクリーンで`[0x4B30CC]`か`[0x4B36AC]`が立てばIMMEDIATE（`0x0042DE4A`）を設定する。
+/// 立たなければ1（`0x0042DE74`）を設定する。IMMEDIATEで作れなければ1に替えて作り直す（`0x0042DFE4`）。
 pub fn fullscreen_screen(interval: u32) -> Screen {
     if interval == PRESENT_INTERVAL_IMMEDIATE {
         Screen::FullscreenImmediate
@@ -303,13 +310,13 @@ pub fn fullscreen_screen(interval: u32) -> Screen {
     }
 }
 
-/// 設定のブロック `0x004B3488` の `+0xB1`（= `0x004B3539`）の 1 バイトを読み分ける（原本の逆アセンブルで確認）:
-/// - デバイスを作る関数 `0x0042DD90` の `0x0042DDC2` `cmp %bl,0x4b3539`（bl = 0）→ 0 でなければ `0x0042DE94` へ飛び、`0x0042DEA1` で Windowed = 1・SwapEffect 3（COPY）。
-///   0 ならフルスクリーンの経路（Windowed は `rep stos` の 0 のまま。`[0x4B30CC]` / `[0x4B36AC]` が立たなければリフレッシュ 60・PresentationInterval 1）。
-/// - 既定値は 0（`0x0041A8EE` `mov %al,0xb1(%edx)`、al = 0）= フルスクリーン。読み込みの照合 `0x0042F84B` が 2 以上を断る。
-/// - オプションの画面は 0 と 1 を行き来する（`0x00427A0D`〜`0x00427A1F` / `0x00427C5D`〜`0x00427C6E`）。
+/// 設定のブロック`0x004B3488`の`+0xB1`（= `0x004B3539`）の1バイトを読み分ける（原本の逆アセンブルで確認）:
+/// - デバイスを作る関数`0x0042DD90`の`0x0042DDC2` `cmp %bl,0x4b3539`（bl = 0）→ 0でなければ`0x0042DE94`へ飛び、`0x0042DEA1`で Windowed = 1・SwapEffect 3（COPY）。
+///   0ならフルスクリーンの経路（Windowedは`rep stos`の0のまま。`[0x4B30CC]` / `[0x4B36AC]`が立たなければリフレッシュ60・PresentationInterval 1）。
+/// - 既定値は0（`0x0041A8EE` `mov %al,0xb1(%edx)`、al = 0）= フルスクリーン。読み込みの照合`0x0042F84B`が2以上を断る。
+/// - オプションの画面は0と1を行き来する（`0x00427A0D`〜`0x00427A1F` / `0x00427C5D`〜`0x00427C6E`）。
 ///
-/// 2 以上は花映塚の作りでは起きない値なので、ゲームの `jne`（0 以外はウィンドウ）に合わせず「読めない」として扱う（フルスクリーンと同じ game の経路に倒す）。
+/// 2以上は花映塚の作りでは起きない値なのでゲームの`jne`（0以外はウィンドウ）に合わせず「読めない」として扱う（フルスクリーンと同じgameの経路に倒す）。
 pub fn screen_from_flag(b: u8) -> Screen {
     match b {
         0 => Screen::Fullscreen,
@@ -318,7 +325,7 @@ pub fn screen_from_flag(b: u8) -> Screen {
     }
 }
 
-/// `mode = auto` のフレームの方式。ウィンドウと垂直同期を取らないフルスクリーンは既定の `wait` の方式、垂直同期を取るフルスクリーンと読めないときは game（ゲーム自身の待ちと垂直同期のまま）。
+/// `mode = auto`のフレームの方式。ウィンドウと垂直同期を取らないフルスクリーンは既定の`wait`の方式、垂直同期を取るフルスクリーンと読めないときはgame（ゲーム自身の待ちと垂直同期のまま）。
 pub fn auto_phase(s: Screen) -> Phase {
     auto_phase_with(s, DEFAULT_WAIT)
 }
@@ -330,9 +337,9 @@ pub fn auto_phase_with(s: Screen, wait: Phase) -> Phase {
     }
 }
 
-/// `mode = auto` で格子を刻むときの待ち方の既定（ini の `wait` を書かないとき）。b-hybrid は b-spin より処理が軽く、入力 → Present の前の p50 が少し長い。
+/// `mode = auto`で格子を刻むときの待ち方の既定（iniの`wait`を書かないとき）。b-hybridはb-spinより処理が軽く、入力 → Presentの前のp50が少し長い。
 pub const DEFAULT_WAIT: Phase = Phase::BHybrid;
-/// `wait` に書ける値と方式（格子を刻む方式のうち、寝ずに回る区間を持つ 2 つ。b は寝ることで遅れた方式なので入れない）。
+/// `wait`に指定できる値と方式（格子を刻む方式のうち寝ずに回る区間を持つ2つ。bは寝ることで遅れた方式なので含めない）。
 pub const WAIT_CHOICES: [(&str, Phase); 2] =
     [("passive", Phase::BHybrid), ("active", Phase::BSpin)];
 
@@ -343,12 +350,13 @@ pub fn wait_name(p: Phase) -> &'static str {
         .map_or(p.name(), |(n, _)| n)
 }
 
-/// `[pacing] vsync`: ゲームが custom.exe の「垂直同期を取らない」（Supervisor `+0x450` = `[0x4B3550]` の bit `0x20`。`0x0042ED50`）を
-/// 読む 2 か所 —— 起動の設定の読み込み `0x0042FB4D`（立っていれば `[0x4B36AC] = 1` で計測を飛ばし、フルスクリーンを IMMEDIATE で作る）と、
-/// 計測の終わりの判定 `0x0042F2AD`（立っていれば計測の結果を見ない）—— の答えを替える。保存されている値（`th09.cfg`）は替えない。
+/// `[pacing] vsync`: ゲームがcustom.exeの「垂直同期を取らない」（Supervisor `+0x450` = `[0x4B3550]` のbit `0x20`。`0x0042ED50`）を読む2か所の答えを替える。
+/// 一方は起動の設定の読み込み`0x0042FB4D`（立っていれば`[0x4B36AC] = 1`で計測を飛ばし、フルスクリーンをIMMEDIATEで作る）。
+/// もう一方は計測の終わりの判定`0x0042F2AD`（立っていれば計測の結果を見ない）。
+/// 保存されている値（`th09.cfg`）は替えない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vsync {
-    /// custom.exe の設定のまま。
+    /// custom.exeの設定のまま。
     Game,
     /// 垂直同期を取る（答えは「取らなくない」）。計測とその結果の判定はゲーム自身のまま。
     On,
@@ -373,7 +381,7 @@ impl Vsync {
         Vsync::ALL.into_iter().find(|f| f.name() == s)
     }
 
-    /// ゲームが聞く「垂直同期を取らないか」の答え。`saved` は custom.exe の保存値（bit `0x20` が立っているか）。
+    /// ゲームが聞く「垂直同期を取らないか」の答え。`saved`はcustom.exeの保存値（bit `0x20`が立っているか）。
     pub fn vsync_off(self, saved: bool) -> bool {
         match self {
             Vsync::Game => saved,
@@ -383,12 +391,22 @@ impl Vsync {
     }
 }
 
-/// ゲーム自身の時計の経路（フルスクリーン・cycle の game の区間）で、始まりのこの 1 回がフレームを始める見込みか。始まりの中の待ち（delay 方式の「相手の語を始まりで待つ」）を、始める 1 回の直前でだけ呼ぶために使う。整数だけで比べる（ゲームのスレッドの始まりから呼ぶので x87 に触らない）。
+/// ゲーム自身の時計の経路（フルスクリーン・cycleのgameの区間）で、始まりのこの1回がフレームを始める見込みかどうか。
+/// 始まりの中の待ち（delay方式の「相手のワードを始まりで待つ」）を、始める1回の直前でだけ呼ぶために使う。
+/// 整数だけで比べる（ゲームのスレッドの始まりから呼ぶのでx87に触らない）。
 ///
-/// ゲームの判断（原本の逆アセンブルで確認）: 時計 `0x0042CC90` は QPC の下位 32 ビット `qpc_low` を `[0x4B30C4]`（`divisor`。QPF の下位 32 ビット）で割り、制御語 `0x007F`（単精度）の下で丸める。do_frame の `0x0042DC59` `fcoml 0x3c(%esi)` → `0x0042DC64` `jne 0x42dd77` で、今が期限 `+0x3C`（double。`deadline_bits` はそのビット列）以下なら `Sleep(0)` して戻り、越えていれば始める。今が前の今 `+0x34` より小さい（時計の折り返し）ときは `0x0042DC56` で期限を今に書き換えるので始めない。
+/// ゲームの判断（原本の逆アセンブルで確認）: 時計`0x0042CC90`はQPCの下位32ビット`qpc_low`を`[0x4B30C4]`（`divisor`。QPFの下位32ビット）で割り、制御ワード`0x007F`（単精度）の下で丸める。
+/// do_frameの`0x0042DC59` `fcoml 0x3c(%esi)` → `0x0042DC64` `jne 0x42dd77`で、今が期限`+0x3C`（double。`deadline_bits`はそのビット列）以下なら`Sleep(0)`して戻る。越えていれば始める。
+/// 今が前の今`+0x34`より小さい（時計の折り返し）ときは`0x0042DC56`で期限を今に書き換えるので始めない。
 ///
-/// ここでは丸めの前の値 `qpc_low / divisor` が「期限 − `early_ticks`」を越えたら真にする。`early_ticks` を単精度の丸め（256〜512 秒で半カウント約 15 µs）とこちらが QPC を読んでからゲームが読むまでの間より大きく取れば、「ゲームが始める 1 回」は必ず真に入る（真が早すぎる側にだけ外れる。早すぎた 1 回で待っても同じ tick で 2 度は待たない —— `NetPlay::head_wait`）。折り返しの直後は偽になり、ゲームが期限を書き換えた次の回で真になる。`divisor` が 0（timeGetTime の経路）・期限が負・数でない（NaN・無限）なら偽（待たない）。
-/// `GAME_DUE_EARLY_US` は早めの幅（µs）で、丸め（最大で半カウント約 15 µs ＋ 2^31 を越えた QPC の丸め約 13 µs）と QPC の読みからゲームの読みまでの間を足しても余る。早めた分は「始まりで待ち始めるのが期限の最大この幅だけ前」になるだけで、入力の読みはゲームの期限より前にならない。
+/// ここでは丸めの前の値`qpc_low / divisor`が「期限 − `early_ticks`」を越えたら真にする。
+/// `early_ticks`は単精度の丸め（256〜512秒で半カウント約15 µs）と、こちらがQPCを読んでからゲームが読むまでの間より大きく取る。
+/// そうすれば「ゲームが始める1回」は必ず真に入る（真が早すぎる側にだけ外れる。早すぎた1回で待っても同じtickで2度は待たない —— `NetPlay::head_wait`）。
+/// 折り返しの直後は偽になり、ゲームが期限を書き換えた次の回で真になる。
+/// `divisor`が0（timeGetTimeの経路）・期限が負・数でない（NaN・無限）なら偽（待たない）。
+///
+/// `GAME_DUE_EARLY_US`は早めの幅（µs）。丸め（最大で半カウント約15 µs ＋ 2^31を越えたQPCの丸め約13 µs）とQPCの読みからゲームの読みまでの間を足しても余る。
+/// 早めた分は「始まりで待ち始めるのが期限の最大この幅だけ前」になるだけ。入力の読みはゲームの期限より前にならない。
 pub const GAME_DUE_EARLY_US: u32 = 200;
 
 pub fn game_due_early_ticks(divisor: u32) -> u32 {
@@ -430,7 +448,7 @@ pub enum Phase {
     B,
     BSpin,
     BHybrid,
-    /// `Mode::Vpatch` のフレーム（`cycle_phases` には書けない）。
+    /// `Mode::Vpatch`のフレーム（`cycle_phases`には書けない）。
     Vpatch,
 }
 
@@ -515,12 +533,12 @@ impl CyclePhases {
     }
 }
 
-/// `cycle_phases` の値を読む（`game, b, b-spin` のように、方式の名前をカンマで区切る。大文字・小文字は区別する。CSV の札と同じ文字）。
+/// `cycle_phases`の値を読む（`game, b, b-spin`のように方式の名前をカンマで区切る。大文字・小文字は区別する。CSVのラベルと同じ文字）。
 pub fn parse_cycle_phases(v: &str) -> Result<CyclePhases, String> {
     let names: Vec<&str> = v.split(',').map(str::trim).collect();
     let mut phases = Vec::with_capacity(names.len());
     for n in &names {
-        // vpatch は測定専用の mode = vpatch だけで走らせる（区間の入れ替えに載せると、Present の待ちの状態が区間をまたぐ）。
+        // vpatchは測定専用の mode = vpatch だけで走らせる（区間の入れ替えに載せるとPresentの待ちの状態が区間をまたぐ）。
         let p = Phase::from_name(n).filter(|p| *p != Phase::Vpatch);
         phases.push(p.ok_or(format!(
             "cycle_phases の {n:?} は game / b / b-spin / b-hybrid のどれでもありません"
@@ -531,7 +549,7 @@ pub fn parse_cycle_phases(v: &str) -> Result<CyclePhases, String> {
     ))
 }
 
-/// `mode = cycle` の区間の時計（ゲームのスレッドの始まりだけが触る。確保しない）。区間を決めるのはフレームの始まりだけなので、1 フレームの途中で方式が変わることはない。
+/// `mode = cycle`の区間の時計（ゲームのスレッドの始まりだけが触る。確保しない）。区間を決めるのはフレームの始まりだけなので1フレームの途中で方式が変わることはない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cycle {
     len: u64,
@@ -565,7 +583,7 @@ impl Cycle {
         self.switches
     }
 
-    /// フレームの最初の始まりで呼ぶ。いまの区間が `len` カウント以上続いていれば次の方式へ進め、区間の始まりを `now` にする（遅れても区間を取り戻さない）。返すのは（このフレームの方式、入れ替えたか）。
+    /// フレームの最初の始まりで呼ぶ。いまの区間が`len`カウント以上続いていれば次の方式へ進め、区間の始まりを`now`にする（遅れても区間を取り戻さない）。返すのは（このフレームの方式、入れ替えたか）。
     pub fn at_frame(&mut self, now: u64) -> (Phase, bool) {
         let Some(since) = self.since else {
             self.since = Some(now);
@@ -584,18 +602,18 @@ impl Cycle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacingIni {
     pub mode: Mode,
-    /// ペース（`fps`。書かなければ `DEFAULT_FPS`）。game と cycle では必ず `DEFAULT_FPS`（`mode_from_ini` が断る）。
+    /// ペース（`fps`。書かなければ`DEFAULT_FPS`）。gameとcycleでは必ず`DEFAULT_FPS`（`mode_from_ini`が断る）。
     pub fps: u64,
     pub cycle_secs: u64,
     pub cycle_phases: CyclePhases,
-    /// `mode = auto` で格子を刻むフレームの方式（`wait`。b-hybrid か b-spin）。ほかの mode では使わない。
+    /// `mode = auto`で格子を刻むフレームの方式（`wait`。b-hybridかb-spin）。ほかのmodeでは使わない。
     pub wait: Phase,
     pub vsync: Vsync,
     pub hybrid: HybridParams,
 }
 
 impl PacingIni {
-    /// 節が無い（ini が無い）ときの形。`mode_from_ini` と dll の「ini が無い」の経路が同じ値を使う。
+    /// カテゴリが無い（iniが無い）ときの形。`mode_from_ini`とdllの「iniが無い」の経路が同じ値を使う。
     pub const DEFAULT: PacingIni = PacingIni {
         mode: DEFAULT_MODE,
         fps: DEFAULT_FPS,
@@ -616,10 +634,10 @@ impl PacingIni {
     }
 }
 
-/// `fps` の値を読む（ini と `pacing_sum --fps` が同じ読み方をする）。10 進の整数で `MIN_FPS`〜`MAX_FPS`。
+/// `fps`の値を読む（iniと`pacing_sum --fps`が同じ読み方をする）。10進の整数で`MIN_FPS`〜`MAX_FPS`。
 pub fn parse_fps(v: &str) -> Result<u64, String> {
     let t = v.trim();
-    // `u64::from_str` は先頭の `+` を通すので、数字だけかを先に見る。
+    // `u64::from_str`は先頭の`+`を通すので数字だけかを先に見る。
     let n = (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
         .then(|| t.parse::<u64>().ok())
         .flatten();
@@ -644,11 +662,11 @@ pub fn parse_cycle_secs(v: &str) -> Result<u64, String> {
     }
 }
 
-/// `[pacing]` の節を読む（形とペース）。節が無ければ `PacingIni::DEFAULT`（auto・60 fps）、`mode` を書かなければ `DEFAULT_MODE`。
-/// `fps` は b・b-spin・b-hybrid・vpatch でだけ効く。game・cycle・auto（`mode` を書かないときも）で 60 以外を書いたら誤りとして断る
-/// （ゲーム自身のペースはこのツールが変えないので、書いたのに効かない実行・区間ごとに速さの違う実行を作らない）。
-/// `cycle_secs` と `cycle_phases` は cycle でだけ、`hybrid_*` は b-hybrid のフレームがありうる形（`PacingIni::uses_hybrid`）でだけ書ける。
-/// `wait` と `vsync` はどの mode でも書ける（配る ini に行として書くので、`mode` を手で替えても断らない）。`wait` が効くのは auto だけ。
+/// `[pacing]`のカテゴリを読む（形とペース）。カテゴリが無ければ`PacingIni::DEFAULT`（auto・60 fps）。`mode`を書かなければ`DEFAULT_MODE`。
+/// `fps`はb・b-spin・b-hybrid・vpatchでだけ効く。game・cycle・auto（`mode`を書かないときも）で60以外を書いたら誤りとして断る。
+/// ゲーム自身のペースはこのツールが変えないので、書いたのに効かない実行や区間ごとに速さの違う実行を作らないために断る。
+/// `cycle_secs`と`cycle_phases`はcycleでだけ書ける。`hybrid_*`はb-hybridのフレームがありうる形（`PacingIni::uses_hybrid`）でだけ書ける。
+/// `wait`と`vsync`はどのmodeでも書ける（配布するiniに行として書くので`mode`を手で替えても断らない）。`wait`が効くのはautoだけ。
 pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     if !ini.has_section(SECTION) {
         return Ok(PacingIni::DEFAULT);
@@ -744,13 +762,13 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     Ok(cfg)
 }
 
-/// 論理 CPU の平らな番号（`group × 64 + 群の中の番号`）。GetCurrentProcessorNumberEx の PROCESSOR_NUMBER と GetSystemCpuSetInformation の `Group` / `LogicalProcessorIndex` を同じ式で平らにして突き合わせる
-/// （1 群は最大 64 個。Windows のプロセッサ群の決まり）。
+/// 論理CPUの平らな番号（`group × 64 + 群の中の番号`）。GetCurrentProcessorNumberExのPROCESSOR_NUMBERとGetSystemCpuSetInformationの`Group` / `LogicalProcessorIndex`を同じ式で平らにして突き合わせる。
+/// 1群は最大64個（Windowsのプロセッサ群の決まり）。
 pub fn flat_cpu(group: u16, number: u8) -> u32 {
     group as u32 * 64 + number as u32
 }
 
-/// 論理 CPU ごとの効率クラス（`SYSTEM_CPU_SET_INFORMATION.EfficiencyClass`）の表。値が大きいほど速く、電力の効率は悪い。性能コアと省電力コアの混成（例 i5-12600K）なら 2 種類、そうでなければ 1 種類になる見込み。
+/// 論理CPUごとの効率クラス（`SYSTEM_CPU_SET_INFORMATION.EfficiencyClass`）の表。値が大きいほど速く、電力の効率は悪い。性能コアと省電力コアの混成（例i5-12600K）なら2種類、そうでなければ1種類になる見込み。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CpuClasses {
     cpus: Vec<(u32, u8)>,
@@ -798,7 +816,7 @@ impl CpuClasses {
     }
 }
 
-/// `SYSTEM_CPU_SET_INFORMATION` の中の位置（winnt.h の並び。dll の `pacing_win` の検査が windows-sys の `offset_of!` と突き合わせる）。1 件の大きさは先頭の `Size` に書いてあり、それで次の件へ進む。
+/// `SYSTEM_CPU_SET_INFORMATION`の中の位置（winnt.hの並び。dllの`pacing_win`の検査がwindows-sysの`offset_of!`と突き合わせる）。1件の大きさは先頭の`Size`に書いてあり、それで次の件へ進む。
 pub const CPU_SET_OFF_SIZE: usize = 0;
 pub const CPU_SET_OFF_TYPE: usize = 4;
 pub const CPU_SET_OFF_GROUP: usize = 12;
@@ -806,7 +824,7 @@ pub const CPU_SET_OFF_LOGICAL_INDEX: usize = 14;
 pub const CPU_SET_OFF_EFFICIENCY: usize = 18;
 pub const CPU_SET_TYPE_CPU_SET: u32 = 0;
 
-/// GetSystemCpuSetInformation が埋めたバイト列を読む（Win32 は呼ばない）。大きさが 8 未満・残りをはみ出す件があれば誤り。
+/// GetSystemCpuSetInformationが埋めたバイト列を読む（Win32は呼ばない）。大きさが8未満・残りをはみ出す件があれば誤り。
 pub fn parse_cpu_sets(bytes: &[u8]) -> Result<CpuClasses, String> {
     let u32_at = |o: usize| -> u32 {
         u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
@@ -918,37 +936,39 @@ pub struct FrameRow {
     pub head_eff: Option<u8>,
     pub input_eff: Option<u8>,
     pub present_eff: Option<u8>,
-    /// 最初に入力の地点を通ったとき・Present の前の QueryThreadCycleTime（ゲームのスレッドが CPU で走った周期の累計。0 は「無い」）。入力では QPC の後、Present の前では QPC の前に取るので、周期の期間は QPC の期間の内側に入る。
+    /// 最初に入力の地点を通ったときとPresentの前のQueryThreadCycleTime（ゲームのスレッドがCPUで走った周期の累計。0は「無い」）。入力ではQPCの後で取り、Presentの前ではQPCの前に取る。そのため周期の期間はQPCの期間の内側に入る。
     pub input_cycles: u64,
     pub present_cycles: u64,
-    /// この枠の始まりが読んだ格子の寄せの要求（ppm。正 = 伸ばす。要求が無かった・0 なら 0）。ゲーム自身の区間で捨てた要求も値は残す（捨てたことは `glide_moved` が 0 であることで分かる）。
+    /// この枠の始まりが読んだ格子の寄せの要求（ppm。正 = 伸ばす。要求が無かった・0なら0）。ゲーム自身の区間で捨てた要求も値は残す（捨てたことは`glide_moved`が0であることで分かる）。
     pub glide_req_ppm: i32,
-    /// 実際に格子の基点を動かした量（QPC のカウント。符号つき。動かさなかった・格子が無かった・ゲーム自身の区間は 0）。CSV では µs（小数 1 桁）で書く。
+    /// 実際に格子の基点を動かした量（QPCのカウント。符号つき。動かさなかった・格子が無かった・ゲーム自身の区間は0）。CSVではµs（小数1桁）で書く。
     pub glide_moved: i64,
-    /// この枠で b-hybrid の始まりが「寝るか譲るか」を決めたときの余裕の最大（µs。`pacing_hybrid::Doze::margin_us`）。判断が無かった枠は 0。
+    /// この枠でb-hybridの始まりが「寝るか譲るか」を決めたときの余裕の最大（µs。`pacing_hybrid::Doze::margin_us`）。判断が無かった枠は0。
     pub hybrid_margin_us: u32,
-    /// この枠で b-hybrid の始まりが待機タイマーで寝た眠りの寝過ごしの最大（µs。実際に寝た長さ − 頼んだ長さ。早く起きたら 0）。寝なかった枠・測っていない古い CSV は `None`（CSV では空）。
+    /// この枠でb-hybridの始まりが待機タイマーで寝たときの寝過ごしの最大（µs。実際に寝た長さ − 頼んだ長さ。早く起きたら0）。寝なかった枠・測っていない古いCSVは`None`（CSVでは空）。
     pub oversleep_us: Option<u32>,
 }
 
-/// CSV の先頭の行。前の 15 列が記録そのもので、次の 4 列は QPF から出した µs（読み戻すときは使わない）。その後ろの 9 列（`phase`〜`present_cycles`）が足した記録、次の 2 列がそこから出した値。
-/// 最後の 2 列（`glide_req_ppm` `glide_moved_us`）が格子の寄せの記録（µs の方は `glide_moved` から出す）、その後ろの 3 列（`hybrid_margin_us` `oversleep_us` `frame_cycles`）が b-hybrid の記録
-/// （`frame_cycles` は 1 つ前の行の `present_cycles` との差から出す。読み戻すときは使わない）。前の 19 列の並びと意味は変えていない（足す前の CSV も `parse_csv` が読む）。
+/// CSVの先頭の行。前の15列が記録そのもの。次の4列はQPFから出したµs（読み戻すときは使わない）。
+/// その後ろの9列（`phase`〜`present_cycles`）が足した記録。次の2列がそこから出した値。
+/// 最後の2列（`glide_req_ppm` `glide_moved_us`）が格子の寄せの記録（µsの方は`glide_moved`から出す）。
+/// その後ろの3列（`hybrid_margin_us` `oversleep_us` `frame_cycles`）がb-hybridの記録（`frame_cycles`は1つ前の行の`present_cycles`との差から出す。読み戻すときは使わない）。
+/// 前の19列の並びと意味は変えていない（足す前のCSVも`parse_csv`が読む）。
 pub const CSV_HEADER: &str = "frame,paced,deadline_qpc,first_head_qpc,head_calls,sleeps,start_qpc,late,rebased,skipped,inputs,sup_frame,input_qpc,present_begin_qpc,present_end_qpc,wake_late_us,input_to_present_us,present_us,period_us,phase,head_cpu,head_eff,input_cpu,input_eff,present_cpu,present_eff,input_cycles,present_cycles,input_to_present_cycles,cycles_per_us,glide_req_ppm,glide_moved_us,hybrid_margin_us,oversleep_us,frame_cycles";
 const CSV_RAW_COLUMNS: usize = 15;
-/// 足す前の CSV の列の数（記録 15 ＋ µs 4）。
+/// 足す前のCSVの列の数（記録15 ＋ µs 4）。
 const CSV_OLD_COLUMNS: usize = 19;
 const CSV_NEW_RAW_COLUMNS: usize = 9;
 const CSV_NEW_COLUMNS: usize = CSV_OLD_COLUMNS + CSV_NEW_RAW_COLUMNS;
 const CSV_NEW_DERIVED_COLUMNS: usize = 2;
-/// 格子の寄せの 2 列が始まる位置（0 始まり）と、それを含めた列の数。古い CSV（28 / 30 列）には無い。
+/// 格子の寄せの2列が始まる位置（0始まり）と、それを含めた列の数。古いCSV（28 / 30列）には無い。
 const CSV_GLIDE_AT: usize = CSV_NEW_COLUMNS + CSV_NEW_DERIVED_COLUMNS;
 const CSV_GLIDE_COLUMNS: usize = CSV_GLIDE_AT + 2;
-/// b-hybrid の 3 列（記録 2 ＋ 出した値 1）が始まる位置と、それを含めた列の数。古い CSV（32 列まで）には無い。
+/// b-hybridの3列（記録2 ＋ 出した値1）が始まる位置と、それを含めた列の数。古いCSV（32列まで）には無い。
 const CSV_HYBRID_AT: usize = CSV_GLIDE_COLUMNS;
 const CSV_HYBRID_COLUMNS: usize = CSV_HYBRID_AT + 3;
 
-/// 寄せた枠として数える最小の寄せ幅（ppm。0.1% = 60 fps で約 17 µs）。それより小さい寄せは毎フレーム出るので、数に入れると枠の数がほぼ全部になって意味が無い。本ログの寄せの行（dll）と `pacing_sum` が同じ値で数える。
+/// 寄せた枠として数える最小の寄せ幅（ppm。0.1% = 60 fpsで約17 µs）。それより小さい寄せは毎フレーム出るので数に入れると枠の数がほぼ全部になって意味が無い。本ログの寄せの行（dll）と`pacing_sum`が同じ値で数える。
 pub const GLIDE_COUNT_PPM: u32 = 1_000;
 
 pub fn us_text(ticks: i64, qpf: u64) -> String {
@@ -961,7 +981,7 @@ pub fn us_text(ticks: i64, qpf: u64) -> String {
     format!("{sign}{}.{}", a / 10, a % 10)
 }
 
-/// `us_text` の逆（符号つき・小数 1 桁の µs の文字を、最も近いカウントへ。絶対値で丸め、ちょうど 0.5 カウントは大きい側）。`qpf` が 0・文字が読めなければ `None`。
+/// `us_text`の逆（符号つき・小数1桁のµsの文字を最も近いカウントへ。絶対値で丸め、ちょうど0.5カウントは大きい側）。`qpf`が0・文字が読めなければ`None`。
 fn us_text_to_ticks(text: &str, qpf: u64) -> Option<i64> {
     if qpf == 0 {
         return None;
@@ -1014,7 +1034,9 @@ impl FrameRow {
             .then(|| diff(self.present_cycles, self.input_cycles))
     }
 
-    /// 入力 → Present の前の「周期 ÷ µs」（整数に切り捨て）。QueryThreadCycleTime はスレッドが CPU に載っている間だけ数えるので、その間ずっと走っていれば周期を数える速さ（TSC の MHz のはず。推定）に近く、寝ていた・追い出されていた時間があればその割合だけ小さくなる。コアの周波数が下がっても、TSC で数えているなら値は下がらない（推定）。
+    /// 入力 → Presentの前の「周期 ÷ µs」（整数に切り捨て）。QueryThreadCycleTimeはスレッドがCPUに載っている間だけ数える。
+    /// そのためその間ずっと走っていれば周期を数える速さ（TSCのMHzのはず。推定）に近い。寝ていた・追い出されていた時間があればその割合だけ小さくなる。
+    /// コアの周波数が下がっても、TSCで数えているなら値は下がらない（推定）。
     pub fn cycles_per_us(&self, qpf: u64) -> Option<i64> {
         let c = self.input_to_present_cycles()?;
         let t = self.input_to_present()?;
@@ -1072,7 +1094,8 @@ impl FrameRow {
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
         ];
-        // 要求が無い・動かさなかった枠も 0 / 0.0 と書く（空にすると足す前の CSV と見分けが付かない）。b-hybrid の余裕は判断の無かった枠も 0 と書き、寝過ごしは寝なかった枠を空にする（0 は「寝て、寝過ごさなかった」）。
+        // 要求が無い・動かさなかった枠も0 / 0.0と書く（空にすると足す前のCSVと見分けが付かない）。
+        // b-hybridの余裕は判断の無かった枠も0と書く。寝過ごしは寝なかった枠を空にする（0は「寝て、寝過ごさなかった」）。
         format!(
             "{old},{},{},{},{},{},{}",
             new.join(","),
@@ -1086,21 +1109,22 @@ impl FrameRow {
         )
     }
 
-    /// 1 フレームにゲームのスレッドが CPU で走った周期（この行と 1 つ前の行の、Present の前の QueryThreadCycleTime の差）。番号が続いていて、どちらにも周期があるときだけ。
-    /// 寝ていた時間は数えないので、b-spin（回り続ける）と b-hybrid（寝る）で比べれば処理に使った量の違いが出る。
+    /// 1フレームにゲームのスレッドがCPUで走った周期（この行と1つ前の行のPresentの前のQueryThreadCycleTimeの差）。番号が続いていて、どちらにも周期があるときだけ。
+    /// 寝ていた時間は数えない。そのためb-spin（回り続ける）とb-hybrid（寝る）で比べれば処理に使った量の違いが出る。
     pub fn frame_cycles(&self, prev: Option<&FrameRow>) -> Option<i64> {
         let p = prev.filter(|p| p.frame.wrapping_add(1) == self.frame)?;
         (p.present_cycles != 0 && self.present_cycles != 0)
             .then(|| diff(self.present_cycles, p.present_cycles))
     }
 
-    /// CSV の 1 行を読む（先頭の行・`#` の行・空の行は `None`）。µs の列と、足した列の後ろ 2 列（出した値）は読まない（`glide_moved` は 0 のまま。µs からカウントへ戻すには QPF が要るので `parse_csv_at`）。
-    /// 足す前の CSV（19 列まで）も読む（足した欄は「無い」）。20〜27 列は途中で切れた行として断る。
+    /// CSVの1行を読む（先頭の行・`#`の行・空の行は`None`）。µsの列と足した列の後ろ2列（出した値）は読まない。
+    /// `glide_moved`は0のまま。µsからカウントへ戻すにはQPFが要るので`parse_csv_at`を使う。
+    /// 足す前のCSV（19列まで）も読む（足したフィールドは「無い」）。20〜27列は途中で切れた行として断る。
     pub fn parse_csv(line: &str) -> Result<Option<FrameRow>, String> {
         Self::parse_csv_at(line, 0)
     }
 
-    /// `parse_csv` に加えて、`glide_moved_us`（µs・小数 1 桁）を `qpf` でカウントへ戻して `glide_moved` に入れる。最も近いカウントへ丸めるので、QPF が 10 MHz を越えて 1 カウントが 0.1 µs より短いときは元のカウントと 1 つ違いうる。`qpf` が 0 なら戻さない。
+    /// `parse_csv`に加えて、`glide_moved_us`（µs・小数1桁）を`qpf`でカウントへ戻して`glide_moved`に書き込む。最も近いカウントへ丸めるのでQPFが10 MHzを越えて1カウントが0.1 µsより短いときは元のカウントと1つ違いうる。`qpf`が0なら戻さない。
     pub fn parse_csv_at(line: &str, qpf: u64) -> Result<Option<FrameRow>, String> {
         let t = line.trim();
         if t.is_empty() || t.starts_with("frame,") || t.starts_with('#') {
@@ -1283,8 +1307,8 @@ pub fn parse_preamble(line: &str) -> Option<Preamble> {
     })
 }
 
-/// `_pacing.csv` の本文を集計する（あとから集計するツール `pacing_sum` が使う）。最初の `#` の行が無い・読めない行があれば誤り（行の番号つき）。`fps` はその回のペース（CSV には書かない）。
-/// `frames` を渡せば、その番号の範囲（両端を含む）の行だけを集計する（マッチの中だけを見るとき）。
+/// `_pacing.csv`の本文を集計する（あとから集計するツール`pacing_sum`が使う）。最初の`#`の行が無い・読めない行があれば誤り（行の番号つき）。`fps`はその回のペース（CSVには書かない）。
+/// `frames`を渡せば、その番号の範囲（両端を含む）の行だけを集計する（マッチの中だけを見るとき）。
 pub fn summarize_csv(
     text: &str,
     fps: u64,
@@ -1366,15 +1390,16 @@ impl Dist {
     }
 }
 
-/// 1 つの列の標本の上限（件）。2 の冪にするのは `Vec` の伸び方（倍々）で容量が上限ちょうどに収まり、倍の容量を確保しないため。
-/// 60 fps の 1260 秒（`observe::SCRIPT_MAX_SECONDS` = 75,600 フレーム）の 1.7 倍で、60 fps なら約 36 分まで間引かない（間引かない間は従来の `Dist::of` と同じ答え）。
-/// 1 列 8 B × 131,072 = 1 MiB、列は 9 本なので 1 つの集計で最大 9 MiB（集計は全体 ＋ 方式ごと ＋（方式、コア）ごと）。上限の無かった頃は 12 時間（約 2.6 M フレーム）で 1 つの集計に約 190 MB（推定）。
-/// 32bit のゲームのプロセスに常駐する量を半分にするため、1 << 18 でなく 1 << 17 を採った。
+/// 1つの列のサンプルの上限（件）。2の冪にするのは`Vec`の伸び方（倍々）で容量が上限ちょうどに収まり、倍の容量を確保しないため。
+/// 60 fpsの1260秒（`observe::SCRIPT_MAX_SECONDS` = 75,600フレーム）の1.7倍。60 fpsなら約36分まで間引かない（間引かない間は従来の`Dist::of`と同じ答え）。
+/// 1列8 B × 131,072 = 1 MiBで列は9本なので1つの集計で最大9 MiB（集計は全体 ＋ 方式ごと ＋（方式、コア）ごと）。
+/// 上限の無かった頃は12時間（約2.6 Mフレーム）で1つの集計に約190 MB（推定）。
+/// 32bitのゲームのプロセスに常駐する量を半分にするため、1 << 18 でなく 1 << 17 を採った。
 pub const SERIES_CAP: usize = 1 << 17;
 
 /// 分位数を出すための値の並び。件数・最小・最大・合計は全件を数えて正確に持ち、並びだけを上限（`SERIES_CAP`）の中に収める。
-/// 収め方は決まった間引き（乱数なし）: 上限に着いたら 1 つおきに捨てて半分にし、以後は 2 倍の間隔で残す。残るのは「番号が間隔の倍数のもの」だけなので、実行の全体にわたって等間隔の標本になり、同じ入力なら同じ答え。
-/// 上限に着くまでは全件が残り、`dist` は従来（全件を並べ替える `Dist::of`）と同じ値を返す。
+/// 収め方は決まった間引き（乱数なし）: 上限に着いたら1つおきに捨てて半分にし、以後は2倍の間隔で残す。残るのは「番号が間隔の倍数のもの」だけ。そのため実行の全体にわたって等間隔のサンプルになり、同じ入力なら同じ答え。
+/// 上限に着くまでは全件が残り、`dist`は従来（全件を並べ替える`Dist::of`）と同じ値を返す。
 #[derive(Debug, Clone)]
 struct Series {
     samples: Vec<i64>,
@@ -1415,7 +1440,8 @@ impl Series {
         self.sum += i128::from(v);
         if self.n.is_multiple_of(self.stride) {
             if self.samples.len() >= self.cap {
-                // 全件を残していた間（標本が cap 件）は n = cap × stride で、cap が偶数なので n は 2 × stride の倍数。半分にした後もこの値は新しい間隔の倍数に当たる。
+                // 全件を残していた間（サンプルがcap件）は n = cap × stride。capが偶数なのでnは 2 × stride の倍数。
+                // 半分にした後もこの値は新しい間隔の倍数に当たる。
                 let mut i = 0usize;
                 self.samples.retain(|_| {
                     i += 1;
@@ -1526,7 +1552,7 @@ pub struct HybridTally {
     pub oversleep: Option<Dist>,
     pub late_after_sleep: usize,
     pub frame_cycles: Option<Dist>,
-    /// スレッドの使用率の見込み（論理コア 1 つを 1.0）。周期の和 ÷（その行の周期の時間 × 入力 → Present の前の「周期 ÷ µs」の中央値）。入力 → Present の前はスレッドがほぼ CPU に載り続けている区間なので、その「周期 ÷ µs」を数える速さとみなす。
+    /// スレッドの使用率の見込み（論理コア1つを1.0）。周期の和 ÷（その行の周期の時間 × 入力 → Presentの前の「周期 ÷ µs」の中央値）。入力 → Presentの前はスレッドがほぼCPUに載り続けている区間なのでその「周期 ÷ µs」を数える速さとみなす。
     pub busy: Option<f64>,
 }
 
@@ -1555,10 +1581,10 @@ pub struct Summary {
     pub cpu_moved: usize,
     pub no_input: usize,
     pub fps: Option<f64>,
-    /// 格子の寄せの要求と動かした量（足す前の CSV・寄せの無い実行は全部 0）。`lines` は要求が 1 件も無ければ書かない。
+    /// 格子の寄せの要求と動かした量（足す前のCSV・寄せの無い実行は全部0）。`lines`は要求が1件も無ければ書かない。
     pub glide: GlideTally,
     pub hybrid: HybridTally,
-    /// 間引いた列（見出し、残した間隔、標本の件数、全件の数）。間引いた列の p50 / p95 / p99 は近似で、空なら全部正確（`Series`）。
+    /// 間引いた列（ヘッダ、残した間隔、サンプルの件数、全件の数）。間引いた列のp50 / p95 / p99は近似で、空なら全部正確（`Series`）。
     pub thinned: Vec<(&'static str, u64, usize, u64)>,
 }
 
@@ -1829,7 +1855,7 @@ impl Summary {
                 None => "n = 0（測れていない）".to_string(),
             }
         ));
-        // 古い CSV・寝ない実行では出さない（0 件と書かない）。
+        // 古いCSV・寝ない実行では出さない（0件と書かない）。
         let h = &self.hybrid;
         if let Some(d) = &h.frame_cycles {
             v.push(format!(
@@ -1912,7 +1938,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// 本ログと `pacing_sum` に書く行。方式の集計は 2 つ以上の方式が出たときだけ、コアの種類の集計はどれか 1 件でも種類が分かったときだけ。
+    /// 本ログと`pacing_sum`に書く行。方式の集計は2つ以上の方式が出たときだけ、コアの種類の集計はどれか1件でも種類が分かったときだけ。
     pub fn lines(&self) -> Vec<String> {
         let mut v = self.all.lines();
         if self.by_phase.len() > 1 {
@@ -1940,7 +1966,7 @@ impl Report {
     }
 }
 
-/// 行を受けて、全体・方式ごと・（方式、コアの種類）ごとに集計する（書き出しのスレッドと `pacing_sum`）。分けた集計の周期は「その行と 1 つ前の行（方式を問わない）」の差で、区間の境目をまたいで数十秒の周期を作らない。
+/// 行を受けて全体・方式ごと・（方式、コアの種類）ごとに集計する（書き出しのスレッドと`pacing_sum`）。分けた集計の周期は「その行と1つ前の行（方式を問わない）」の差。区間の境目をまたいで数十秒の周期を作らない。
 #[derive(Debug, Clone)]
 pub struct Splitter {
     qpf: u64,
@@ -2039,7 +2065,7 @@ mod tests {
 
     const FPSES: [u64; 4] = [MIN_FPS, DEFAULT_FPS, 240, MAX_FPS];
 
-    /// 花映塚の時計と期限の比べを、単精度の丸めごと真似る。QPC の下位 32 ビットは `fildl` で符号つきに読み、負なら 2^32 を足す（ここで単精度に丸まる）。割り算も単精度に丸まる。
+    /// 花映塚の時計と期限の比べを、単精度の丸めごと真似る。QPCの下位32ビットは`fildl`で符号つきに読み、負なら2^32を足す（ここで単精度に丸まる）。割り算も単精度に丸まる。
     fn game_runs(qpc_low: u32, divisor: u32, deadline: f64) -> bool {
         let l = if qpc_low >= 1 << 31 {
             f64::from(qpc_low as f32)
@@ -2299,11 +2325,11 @@ mod tests {
 
     #[test]
     fn decide_sleeps_in_chunks_then_spins_then_runs() {
-        let qpf = 10_000_000; // 1 µs = 10 カウント
+        let qpf = 10_000_000; // 1 µs = 10カウント
         let mut p = Pace::new(qpf, DEFAULT_FPS).unwrap();
         p.decide(0, 0, 1_000);
         p.started(0);
-        let d = p.deadline(1); // 166,666 カウント
+        let d = p.deadline(1); // 166,666カウント
         assert_eq!(d, 166_666);
         let spin = 10_000; // 1 ms
         assert_eq!(
@@ -2630,7 +2656,7 @@ mod tests {
         }
         rows[3].inputs = 0; // 入力なし
         rows[5].paced = false; // ゲーム自身のペース
-        rows[8].present_begin += p; // 1 フレーム分遅れた Present（長い周期 1 件）
+        rows[8].present_begin += p; // 1フレーム分遅れたPresent（長い周期1件）
         rows[8].present_end = rows[8].present_begin + 500;
         rows[8].input = rows[8].present_begin - 30_000;
         rows.remove(6); // 番号の飛び（5 → 7）
@@ -2672,8 +2698,8 @@ mod tests {
     fn summary_long_periods_follow_the_fps() {
         let qpf = 10_000_000;
         let fps = 240;
-        let p = qpf / fps; // 41,666 カウント
-        let limit = qpf * 3 / (2 * fps); // 62,500 カウント
+        let p = qpf / fps; // 41,666カウント
+        let limit = qpf * 3 / (2 * fps); // 62,500カウント
         let mut s = Summarizer::new(qpf, fps);
         let mut t = 1_000_000u64;
         for (f, step) in [0, p, p, p, 2 * p, limit, limit + 1, p]
@@ -3386,7 +3412,7 @@ mod tests {
         ] {
             err(&format!("[pacing]\nwait = {v}\n"), "wait の値");
         }
-        // wait と vsync は、どの mode でも書ける（auto 以外では wait は効かない）。
+        // waitとvsyncは、どのmodeでも書ける（auto以外ではwaitは効かない）。
         for mode in ["game", "b", "b-spin", "b-hybrid", "vpatch", "cycle", "auto"] {
             let c = ok(&format!(
                 "[pacing]\nmode = {mode}\nwait = active\nvsync = off\n"
@@ -3632,7 +3658,7 @@ mod tests {
             "{text}"
         );
     }
-    /// 検査用の並び: 0..n の並べ替え（k = 1,000,003 は素数で、n が k の倍数でなければ i ↦ i·k mod n が全単射）を、負の値も混ぜるため n/2 だけずらしたもの。
+    /// 検査用の並び: 0..nの並べ替え（k = 1,000,003は素数で、nがkの倍数でなければi ↦ i·k mod nが全単射）を負の値も混ぜるためn/2だけずらしたもの。
     fn shuffled(n: u64) -> Vec<i64> {
         (0..n)
             .map(|i| (i * 1_000_003 % n) as i64 - (n / 2) as i64)
@@ -3710,7 +3736,7 @@ mod tests {
     #[test]
     fn summarizer_thinning_keeps_counts_and_long_periods_exact_and_says_so() {
         let qpf = 10_000_000;
-        let (p, long) = (166_667u64, 300_000u64); // 1.5 周期 = 250,000 カウントより長いのは 300,000 の方
+        let (p, long) = (166_667u64, 300_000u64); // 1.5周期 = 250,000カウントより長いのは300,000の方
         let run = |rows: u32| {
             let mut s = Summarizer::new(qpf, DEFAULT_FPS).with_series_cap(256);
             let mut t = 2_000_000u64;

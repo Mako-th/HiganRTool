@@ -1,10 +1,11 @@
-//! インターネット越しの観戦の穴あけ: 配る側（`SpectateHost`）が観戦者の候補へ `PunchPlan` で穴あけのパケットを送り、観戦者
-//! （`Watcher`）の JOIN が NAT を通って流れが始まるところまでを、偽の NAT（宛先のアドレスで絞る型）を両側に付けて組み上げて見る。
-//! あわせて `PunchPlan` の予定（200 ms おき・5 回・JOIN が来たら止める）と、観戦者の「候補に無い送り元の STREAM」の受け入れ
-//! （`learned_host`）を直に見る。
+//! インターネット越しの観戦の穴あけの検査。
+//! 配信側（`SpectateHost`）が観戦者の候補へ`PunchPlan`で穴あけのパケットを送る。
+//! 観戦者（`Watcher`）のJOINがNATを通って流れが始まるところまでを、偽のNAT（宛先のアドレスで絞る型）を両側に付けて組み上げて検査する。
+//! あわせて`PunchPlan`の予定（200 msおき・5回・JOINが来たら止める）を直接検査する。
+//! 観戦者が「候補に無い送り元のSTREAM」を受け入れること（`learned_host`）も直接検査する。
 //!
-//! ネットワークは 1 ms ごとに進む固定の模型（実際の UDP・時計は使わない）。片道 20 ms、落とさない（落ちるのは NAT のゲートだけ）。
-//! アドレスは文書用の範囲（RFC 5737 の 203.0.113.0/24・198.51.100.0/24、RFC 1918 の LAN）。
+//! ネットワークは1 msごとに進む固定の模型（実際のUDP・時計は使わない）。片道20 ms、落とさない（落ちるのはNATのゲートだけ）。
+//! アドレスは文書用の範囲（RFC 5737の203.0.113.0/24・198.51.100.0/24、RFC 1918のLAN）。
 
 use higanr_core::auth::{AuthKey, Secret};
 use higanr_core::candidate::Candidates;
@@ -40,7 +41,7 @@ fn host_cfg() -> HostConfig {
     }
 }
 
-/// 観戦者の使い捨ての鍵の種（模型では nonce から決める）。
+/// 観戦者の使い捨ての鍵の種（模型ではnonceから決める）。
 fn wseed(nonce: u64) -> KeySeed {
     KeySeed([(nonce as u8) ^ 0x3C; 32])
 }
@@ -159,7 +160,7 @@ fn a_late_poll_sends_one_round_and_the_clock_may_wrap() {
     let mut plan = PunchPlan::new(&cands(&addrs), 0);
     let mut sink = Sink::default();
     assert_eq!(plan.poll(0, &mut sink), 3);
-    // 5 秒呼ばれなかった: 1 周だけ。次はそこから 200 ms 後。
+    // 5秒呼ばれなかった: 1周だけ。次はそこから200 ms後。
     assert_eq!(plan.poll(5_000, &mut sink), 3);
     assert_eq!(plan.poll(5_001, &mut sink), 0);
     assert_eq!(plan.poll(5_199, &mut sink), 0);
@@ -184,7 +185,7 @@ fn a_join_from_a_candidate_stops_only_that_candidates_punches() {
     let mut plan = PunchPlan::new(&cands(&addrs), 0);
     let mut sink = Sink::default();
     assert_eq!(plan.poll(0, &mut sink), 3);
-    // 予定にないアドレス（同じ IP の別ポート・別 IP の同じポート）は止めない。
+    // 予定にないアドレス（同じIPの別ポート・別IPの同じポート）は止めない。
     assert!(!plan.stop_for(sa([198, 51, 100, 7], 40_001)));
     assert!(!plan.stop_for(sa([198, 51, 100, 8], 40_000)));
     assert_eq!(plan.active(), 3);
@@ -229,7 +230,7 @@ fn an_empty_plan_sends_nothing_and_eight_candidates_are_all_served() {
     assert_eq!(sink.0.len(), 8);
 }
 
-/// ホストを作り、`viewer` からの JOIN を受けさせ、`start` の記録を積んで、観戦者へ出る STREAM のバイト列を返す。
+/// ホストを作り、`viewer`からのJOINを受けさせ、`start`の記録を積んで、観戦者へ出るSTREAMのバイト列を返す。
 fn host_stream_to(viewer: SocketAddr, nonce: u64) -> (SpectateHost, Vec<Vec<u8>>) {
     let mut host = SpectateHost::with_capacity(host_cfg(), 64);
     host.push(Record::Seg { seg: 0 }).unwrap();
@@ -269,7 +270,7 @@ fn a_valid_stream_from_outside_the_candidates_is_accepted_and_fixes_the_host() {
     assert_eq!(out.0.len(), 1, "ACK を出した");
     assert_eq!(out.0[0].0, actual, "ACK は採ったアドレスへ");
     assert_eq!(w.pop(), Some(Record::Seg { seg: 0 }));
-    // 以後はそのアドレスだけ。元の候補のアドレスからの通は別の送り元（`foreign`）。
+    // 以後はそのアドレスだけ。元の候補のアドレスからのパケットは別の送り元（`foreign`）になる。
     w.on_datagram(cand, &streams[0], 20, &mut out);
     assert_eq!(w.counts().foreign, 1);
     assert_eq!(w.counts().streams, 1);
@@ -329,7 +330,7 @@ fn everything_else_from_outside_the_candidates_is_dropped_as_foreign() {
     let last = bad_tag.len() - 1;
     bad_tag[last] ^= 1;
     w.on_datagram(stranger, &bad_tag, 3, &mut out);
-    // タグの合う BYE（観戦者の鍵の、ホストの送る向きで封じる）。ホストのアドレスにしない・host_bye を立てない。
+    // タグの合うBYE（観戦者の鍵を、ホストの送る向きにして封じる）。送り元をホストのアドレスにせず、host_byeも立てない。
     let to_w = w.dir_keys().expect("鍵がある").swapped();
     let n = wire::seal(
         &to_w.sealer(Sender::SpectateHost),
@@ -362,13 +363,15 @@ fn everything_else_from_outside_the_candidates_is_dropped_as_foreign() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Inbound {
     Open,
-    /// 内から送った相手の（IP・ポート）からだけ通す（宛先のアドレスで絞る型）。
+    /// 内側から送った相手の（IP・ポート）からのパケットだけ通す（宛先のアドレスで絞る型）。
     AddrPort,
     AddrOnly,
 }
 
-/// 内側の 1 台の前に付ける NAT。外側のアドレスは `ext_ip`、外から受けるポートは `ext_port`（外へ出すとき使うポート `out_port` が違えば、
-/// 外へ出すときだけ外側のポートが変わる型）。外から来た通は、宛先のポートが `ext_port` か `out_port` で、`inbound` の絞りを通ったものだけが内側へ入る。
+/// 内側の1台の前に付けるNAT。
+/// 外側のアドレスは`ext_ip`。外から受けるポートは`ext_port`。
+/// 外へ出すとき使うポート`out_port`が違えば、外へ出すときだけ外側のポートが変わる型。
+/// 外から来たパケットは、宛先のポートが`ext_port`か`out_port`で、`inbound`の絞りを通ったものだけが内側へ入る。
 struct Nat {
     ext_ip: IpAddr,
     ext_port: u16,
@@ -457,7 +460,7 @@ struct World {
     host: SpectateHost,
     watcher: Watcher,
     plan: Option<PunchPlan>,
-    /// JOIN を受けた送り元へ穴あけを止める（本番の使い方）か。
+    /// JOINを受けた送り元への穴あけを止めるかどうか（本番の使い方）。
     stop_on_join: bool,
     punch_at: u32,
     wire: Vec<Packet>,
@@ -595,7 +598,7 @@ fn strict_pair() -> (Nat, Nat) {
 fn punching_opens_the_hosts_nat_and_the_viewers_join_starts_the_stream() {
     let (a, b) = strict_pair();
     let mut w = World::new(a, b, Some(1_600));
-    // 穴あけの前（JOIN は 250 ms ごとに 7 回送っている）: ホストの NAT は 1 通も通さない。
+    // 穴あけの前（JOINは250 msごとに7回送っている）: ホストのNATは1通も通さない。
     w.run_to(1_599);
     assert_eq!(w.nat_a.passed, 0, "穴あけの前に JOIN が通った");
     assert!(
@@ -607,7 +610,7 @@ fn punching_opens_the_hosts_nat_and_the_viewers_join_starts_the_stream() {
     assert!(!w.watcher.is_joined());
     assert!(w.watcher.counts().joins_sent >= 6);
     assert_eq!(w.punches, 0);
-    // 穴あけの後: 次の JOIN（1750）が通り、流れが始まる。
+    // 穴あけの後: 次のJOIN（1750）が通り、流れが始まる。
     w.run_to(3_000);
     assert_eq!(w.host.spectator_count(), 1);
     assert!(w.watcher.is_joined());
@@ -655,7 +658,7 @@ fn the_stream_starts_even_when_the_punches_come_before_the_viewer_joins() {
     let mut w = World::new(a, b, Some(1));
     w.viewer_start = 1_000;
     w.run_to(999);
-    // 穴あけ 5 通（1・201・401・601・801 ms）は、観戦者の NAT が何も送っていない相手からなので全部落ちた。
+    // 穴あけ5通（1・201・401・601・801 ms）は、観戦者のNATが何も送っていない相手からなので全部落ちた。
     assert_eq!(w.punches, 5);
     assert_eq!((w.nat_b.passed, w.nat_b.dropped), (0, 5));
     assert_eq!(w.watcher.counts().not_hgrt, 0);
@@ -680,6 +683,6 @@ fn a_host_whose_replies_leave_from_another_port_still_streams() {
     assert_eq!(w.host.spectator_count(), 1);
     assert!(w.got.len() > 100, "{}", w.got.len());
     assert_eq!(&w.log[..w.got.len()], &w.got[..]);
-    // ホストは ACK を受けて流れが進んでいる（観戦者の ack がホストの積んだ所に近い）。
+    // ホストはACKを受けて流れが進んでいる（観戦者のackがホストの積んだ所に近い）。
     assert!(w.host.tail() - w.watcher.ack() < 5);
 }

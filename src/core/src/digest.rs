@@ -1,15 +1,18 @@
-//! 状態のダイジェストと、2 つのコピーの違いの数え（pure）。巻き戻しの実験で、進めた後の状態と、
-//! 書き戻して進め直した後の状態を範囲ごとに比べる。違った範囲だけバイトで比べる。
+//! 状態のダイジェストと2つのコピーの違いの数え（pure）。
+//! 巻き戻しの実験で進めた後の状態と書き戻して進め直した後の状態を範囲ごとに比べる。
+//! 違った範囲だけバイトで比べる。
 //!
-//! FNV-1a（64 ビット。`check.rs` の入力のダイジェストと同じ定数）を 8 バイトの語ごとに回し、最後に長さを混ぜる。
-//! 1 バイトずつより 8 倍速い（1 回の実験で約 12 MB を 2 回通し、ゲームのスレッドで走る）ので値は違う。
+//! FNV-1a（64ビット。`check.rs`の入力のダイジェストと同じ定数）を8バイトのワードごとに回す。
+//! 最後に長さを混ぜる。
+//! 1バイトずつより8倍速い（1回の実験で約12 MBを2回通し、ゲームのスレッドで走る）。
+//! そのため値はバイトごとに回した場合とは違う。
 //! 確保しない・パニックしない。
 
-/// 初期値（FNV-1a 64 ビットの offset basis。`check::INPUT_DIGEST_INIT` と同じ値）。
+/// 初期値（FNV-1a 64ビットのoffset basis。`check::INPUT_DIGEST_INIT`と同じ値）。
 pub const DIGEST_INIT: u64 = 0xCBF2_9CE4_8422_2325;
 const PRIME: u64 = 0x0000_0100_0000_01B3;
 
-/// 頁の大きさ（Windows と同じ 4 KiB）。
+/// ページの大きさ（Windowsと同じ4 KiB）。
 pub const PAGE: usize = 4096;
 
 pub fn digest(bytes: &[u8]) -> u64 {
@@ -27,14 +30,14 @@ pub fn digest_continue(h: u64, bytes: &[u8]) -> u64 {
         h ^= u64::from(b);
         h = h.wrapping_mul(PRIME);
     }
-    // 長さを混ぜる（0 を足しただけの範囲と、短い範囲を取り違えないため）。
+    // 長さを混ぜる（0を足しただけの範囲と短い範囲を取り違えないため）。
     h ^= bytes.len() as u64;
     h.wrapping_mul(PRIME)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Diff {
-    /// 違うバイトの数（長さが違えば、長い方のはみ出した分も違うと数える）。
+    /// 違うバイトの数（長さが違えば長い方のはみ出した分も違うと数える）。
     pub bytes: u32,
     /// 最初と最後の違うバイトの位置。
     pub first: Option<u32>,
@@ -42,7 +45,8 @@ pub struct Diff {
     pub pages: u32,
 }
 
-/// `a` と `b` をバイトで比べる。8 バイトずつ見て同じ語は飛ばす。違う位置を `offsets` の長さまで書き、書いた数を返す。
+/// `a`と`b`をバイトで比べる。8バイトずつ見て同じワードは飛ばす。
+/// 違う位置を`offsets`の長さまで書く。書いた数を返す。
 pub fn diff(a: &[u8], b: &[u8], offsets: &mut [u32]) -> (Diff, usize) {
     let n = a.len().min(b.len());
     let mut d = Diff::default();

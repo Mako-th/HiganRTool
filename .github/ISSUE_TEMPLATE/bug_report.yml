@@ -1,0 +1,107 @@
+name: 不具合の報告 / Bug report
+description: 動かない・表示がおかしいなどの報告 / Something does not work or looks wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        送る前に、READMEの「困ったとき」「接続できないとき」「現在の制約」を見てください。
+        状況が分からないと原因を調べられないので、分かる範囲ですべての欄を埋めてください。
+        日本語・英語・中国語のどれで書いてもかまいません。
+
+        Before sending, please read "Troubleshooting", "When you cannot connect" and "Limitations" in the README.
+        We cannot look into a report without knowing the situation, so please fill in every field you can.
+        You may write in Japanese, English or Chinese.
+  - type: input
+    id: version
+    attributes:
+      label: HiganRToolのバージョン / HiganRTool version
+      description: |
+        `logs`フォルダの`loader_YYYYMMDD.log`の「HiganRTool.exe 1.2.1」のような行で分かります。
+        Shown in a line such as "HiganRTool.exe 1.2.1" in `loader_YYYYMMDD.log` in the `logs` folder.
+      placeholder: "1.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 起きた場面 / Where it happened
+      multiple: true
+      options:
+        - ランダムマッチ / Random match
+        - ルームマッチ / Room match
+        - 接続コード / Connection code
+        - LAN
+        - 観戦 / Spectating
+        - ネット対戦以外（ひとりで遊ぶ・リプレイなど） / Outside netplay (single player, replays, etc.)
+        - 起動・更新 / Starting or updating
+        - その他 / Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 何が起きたか / What happened
+      description: |
+        画面に出た文があれば、そのまま書いてください。
+        If a message appeared, please copy it as is.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 起きるまでの手順 / Steps to reproduce
+      description: |
+        毎回起きるか、ときどき起きるかも書いてください。
+        Please also say whether it happens every time or only sometimes.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 本来どうなるはずか / What you expected
+    validations:
+      required: false
+  - type: textarea
+    id: tools
+    attributes:
+      label: 一緒に使っているツール・パッチ / Other tools and patches
+      description: |
+        言語パッチ（thcrapなど。使っているパッチの名前も）・vpatch・thprac・録画や配信のソフトなど。無ければ「なし」と書いてください。
+        Language patches (e.g. thcrap, with the names of the patches), vpatch, thprac, recording or streaming software, etc. Write "none" if there are none.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: OSとバージョン / OS and version
+      description: |
+        Windows以外は対応しない可能性があります。
+        Systems other than Windows may not be supported.
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: スクリーンショット / Screenshot
+      description: |
+        表示がおかしいときは必ず添えてください。画像はここにドラッグ＆ドロップできます。
+        Required if something looks wrong. You can drag and drop images here.
+    validations:
+      required: false
+  - type: textarea
+    id: log
+    attributes:
+      label: ログ / Log
+      description: |
+        `logs`フォルダをzipにして、ここにドラッグ＆ドロップしてください。
+        Issuesは誰でも見られます。ログを公開したくないときは、ここに「DiscordかTwitterで送れます」と書いてください。
+        Please zip the `logs` folder and drag and drop it here.
+        Issues are public. If you do not want to post the log, write "I can send it on Discord or Twitter" here.
+    validations:
+      required: true

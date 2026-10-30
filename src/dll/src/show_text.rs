@@ -1,13 +1,13 @@
-//! ローダーのウィンドウ（`status.txt` の「状態」の行）に出す文の日本語・英語（pure）。
+//! ローダーのウィンドウ（`status.txt`の「状態」の行）に出す文の日本語・英語（pure）。
 //!
-//! 接続コードを受け取った人が読む文で、内部の語を使わず、次にすることを 1 つ添える。言語は呼び手が `ui_lang::current()` で渡す。
-//! 本ログの文はここに無い（日本語のまま）。数や名前を挟む文は関数にして、語順を言語ごとに組む。
+//! 接続コードを受け取った人が読む文。内部の語を使わず次にすることを1つ添える。言語は呼び手が`ui_lang::current()`で渡す。
+//! 本ログの文はここに無い（日本語のまま）。数や名前を挟む文は関数にして語順を言語ごとに組む。
 #![forbid(unsafe_code)]
 
 use higanr_core::code::span_text_in;
 use higanr_core::lang::{Lang, Tx};
 
-/// 準備の中の誤り（こちらの作りの誤りで、人の手では直らない）。詳しくは本ログ。
+/// 準備の中の誤り（こちらの作りの誤りで人の手では直らない）。詳しくは本ログ。
 pub const INTERNAL: Tx = Tx {
     ja: "接続の準備に失敗しました（詳細はログを確認してください）。ゲームを閉じて起動し直してください。",
     en: "Failed to prepare the connection (details in the log). Close the game and start it again.",
@@ -19,10 +19,10 @@ pub const BROKEN: Tx = Tx {
     en: "The opponent's code is incomplete or wrong. Copy the whole code again and paste it into this window.",
 };
 
-/// ネットワークを開けなかった（見張りを作る前に断った・見張りが止められた）ときの文。
+/// ネットワークを開けなかった（監視の処理を作る前に断った・監視の処理が止められた）ときの文。
 pub const NOT_STARTED: Tx = Tx {
-    ja: "通信を始められませんでした（理由はログにあります）。logsフォルダのファイルを添えて、開発者に伝えてください。",
-    en: "Could not start networking (the reason is in the log). Please report this on GitHub Issues with the files in the logs folder.",
+    ja: "通信を始められませんでした（理由はログにあります）。zipにしたlogsフォルダを添えて、開発者に伝えてください。",
+    en: "Could not start networking (the reason is in the log). Please report this on GitHub Issues with the logs folder as a zip.",
 };
 
 pub const PEER_UNREADABLE: Tx = Tx {
@@ -105,19 +105,19 @@ pub const WATCH_ENDED_UNCONNECTED: Tx = Tx {
     en: "Ended without connecting to the host. To try again, close the game and start it again.",
 };
 
-/// ウィンドウで選んだ rollback を採れなかったときに「状態」の行へ足す文（`NetSettings` の ini が delay 方式）。
+/// ウィンドウで選んだrollbackを採れなかったときに「状態」の行へ足す文（`NetSettings`のiniがdelay方式）。
 pub const ROLLBACK_INI_DELAY: Tx = Tx {
     ja: "ウィンドウで選んだrollbackは使えません（HiganRTool.iniがdelay方式になっているため）。delay方式で接続します。",
     en: "The rollback you chose in the window cannot be used (the setting file says delay mode). Connecting in delay mode.",
 };
 
-/// 同じく、この起動で rollback の準備ができなかったとき。
+/// 同じくこの起動でrollbackの準備ができなかったとき。
 pub const ROLLBACK_NOT_READY: Tx = Tx {
     ja: "ウィンドウで選んだrollbackは使えません（この起動ではrollbackの準備ができなかったため。理由はログにあります）。delay方式で接続します。",
     en: "The rollback you chose in the window cannot be used (rollback was not ready in this start; the reason is in the log). Connecting in delay mode.",
 };
 
-/// 相手のコードの期限切れ。長さは `ttl_secs` から作る（数字を文に直書きすると、期限を変えたときにウィンドウの文だけ古いままになる）。
+/// 相手のコードの期限切れ。長さは`ttl_secs`から作る（数字を文に直書きすると期限を変えたときにウィンドウの文だけ古いままになる）。
 pub fn expired(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
@@ -141,7 +141,7 @@ pub fn watch_expired(lang: Lang, ttl_secs: u64) -> String {
     }
 }
 
-/// 始める側が、返す側から届く返しのコードを待つ間。
+/// 始める側が返す側から届く返答のコードを待つ間。
 pub fn offer_waiting(lang: Lang, ttl_secs: u64) -> String {
     let span = span_text_in(lang, ttl_secs);
     match lang {
@@ -167,7 +167,7 @@ pub fn gave_up(lang: Lang, secs: u64) -> String {
     }
 }
 
-/// 始める側が返しのコードを読んだ。
+/// 始める側が返答のコードを読んだ。
 pub fn reply_read(lang: Lang, who: &str) -> String {
     match lang {
         Lang::Ja => format!("相手「{who}」の返答コードを読みました。接続しています。"),
@@ -195,7 +195,7 @@ pub fn watch_read(lang: Lang, who: &str) -> String {
     }
 }
 
-/// 今の設定では相手へ接続しに行けない（ネットワークの範囲 `scope` の外）。アドレスはウィンドウに出さない。
+/// 今の設定では相手へ接続しに行けない（ネットワークの範囲`scope`の外）。アドレスはウィンドウに出さない。
 pub fn no_route(lang: Lang, scope: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -207,7 +207,7 @@ pub fn no_route(lang: Lang, scope: &str) -> String {
     }
 }
 
-/// 接続した。自分の席（1P か 2P か）は画面から読めない値なので出す。形は接続したセッションの AGREE で決まった形（モードと遅れ）。
+/// 接続した。自分のサイド（1Pか2Pか）は画面から読み取れない値なので出す。形は接続したセッションのAGREEで決まった形（モードと遅れ）。
 pub fn connected(
     lang: Lang,
     seat: Option<higanr_core::wire::Seat>,
@@ -233,8 +233,8 @@ pub fn connected(
     }
 }
 
-/// 相手のコードを受け取るファイルを読めなかった。`what` は本ログと同じ日本語の文（パスと OS の誤り）で、
-/// 英語のウィンドウには出さない（日本語が混ざるため。詳細は本ログで読める）。
+/// 相手のコードを受け取るファイルを読めなかった。`what`は本ログと同じ日本語の文（パスとOSの誤り）。
+/// 日本語が混ざるため英語のウィンドウには出さない（詳細は本ログで読める）。
 pub fn peer_file_unreadable(lang: Lang, what: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -244,7 +244,7 @@ pub fn peer_file_unreadable(lang: Lang, what: &str) -> String {
     }
 }
 
-/// `what` の扱いは `peer_file_unreadable` と同じ。
+/// `what`の扱いは`peer_file_unreadable`と同じ。
 pub fn watch_file_unreadable(lang: Lang, what: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -254,7 +254,7 @@ pub fn watch_file_unreadable(lang: Lang, what: &str) -> String {
     }
 }
 
-/// 相手へ返すコードをファイルに書けなかった。`what` の扱いは `peer_file_unreadable` と同じ。
+/// 相手へ返すコードをファイルに書けなかった。`what`の扱いは`peer_file_unreadable`と同じ。
 pub fn reply_not_written(lang: Lang, what: &str) -> String {
     match lang {
         Lang::Ja => format!(
@@ -264,7 +264,7 @@ pub fn reply_not_written(lang: Lang, what: &str) -> String {
     }
 }
 
-/// 終わりの文に足す、自分の接続コードのファイルを消せなかった知らせ。`what` の扱いは `peer_file_unreadable` と同じ。
+/// 自分の接続コードのファイルを消せなかった知らせ。終わりの文に足す。`what`の扱いは`peer_file_unreadable`と同じ。
 pub fn my_code_not_deleted(lang: Lang, shown: &str, what: &str) -> String {
     match lang {
         Lang::Ja => format!("{shown}（自分の接続コードのファイルを消せませんでした: {what}）"),
@@ -274,7 +274,7 @@ pub fn my_code_not_deleted(lang: Lang, shown: &str, what: &str) -> String {
     }
 }
 
-/// `status.txt` の見出しの行。ローダーは最後の行だけを「状態」に出す。
+/// `status.txt`のヘッダの行。ローダーは最後の行だけを「状態」に出す。
 pub fn status_header(lang: Lang, side: Side, secs: f32) -> String {
     match lang {
         Lang::Ja => {
@@ -298,7 +298,7 @@ pub fn status_header(lang: Lang, side: Side, secs: f32) -> String {
     }
 }
 
-/// `status_header` の側（`net_config::CodeSide` を、この module が持たなくてよいようにコピーしたもの）。
+/// `status_header`の側（`net_config::CodeSide`をこのmoduleが持たなくてよいようにコピーしたもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Offer,
@@ -312,7 +312,7 @@ mod tests {
     use super::*;
     use higanr_core::lang::has_japanese;
 
-    /// 呼び元（`net_code` / `spectate_watch_code`）が渡す `what` の実物の形: パスと OS の誤りの文（日本語）。
+    /// 呼び元（`net_code` / `spectate_watch_code`）が渡す`what`の実物の形: パスとOSの誤りの文（日本語）。
     const WHAT: &str = "peer_code.txt を開けない: アクセスが拒否されました。 (os error 5)";
 
     const ALL: [Tx; 21] = [

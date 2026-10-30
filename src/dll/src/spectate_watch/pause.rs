@@ -1,11 +1,13 @@
-//! 観戦者のマッチの中の一時停止（pure）。Esc で手元のゲームのポーズ（`0x00434740`、this = `0x004D66F8`）を開き、ポーズのメニューを
-//! 観戦者の手元の入力で動かす。開けない間（ホストのポーズの再現中・マッチの終わりのメニュー・前の語に Esc が入っている・この seg で崩れた）は、
-//! 記録を止めた描画だけのフレーム（重ね描きの一時停止）にする。
+//! 観戦者のマッチの中の一時停止（pure）。
+//! Escで手元のゲームのポーズ（`0x00434740`、this = `0x004D66F8`）を開き、ポーズのメニューを観戦者の手元の入力で動かす。
+//! 開けない間は、記録を止めた描画だけのフレーム（重ね描きの一時停止）にする。
+//! 開けないのは次のとき: ホストのポーズの再現中・マッチ終了時のメニュー・前のワードにEscが入っている・このマッチで崩れた。
 //!
-//! ポーズの間は試合のノードが走らない（GameManager が `0x0041AC1E` で走査を止める）ので記録を使わない。ポーズのメニューが読むのは `[2]+0x06`
-//! だけなので `[2]` だけを feed し、`[0]`・`[1]` には触らない（入力の地点が poll を呼ばずに戻るので、どの InputManager もゲームは書かない。
-//! 毎 tick 入れるとキーごとのリピートの数えがホストより進む）。再開の後に閉じる tick（状態 3 で数えが `CLOSE_FRAMES` 以上）に次の `Frame` を
-//! 使う。その tick の GameManager は `[2]+0x06 & 8` を見るので、状態 3 の間の `[2]` は最後の `Frame` の `p1|p2` にする。
+//! ポーズの間は試合のノードが走らない（GameManagerが`0x0041AC1E`で走査を止める）ので記録を使わない。
+//! ポーズのメニューが読むのは`[2]+0x06`だけ。そのため`[2]`だけをfeedし、`[0]`・`[1]`には触らない。
+//! 入力の地点がpollを呼ばずに戻るので、どのInputManagerもゲームは書かない。毎tick feedするとキーごとのリピートの数えがホストより進む。
+//! 再開の後に閉じるtick（状態3で数えが`CLOSE_FRAMES`以上）に次の`Frame`を使う。
+//! そのtickのGameManagerは`[2]+0x06 & 8`を見る。そのため状態3の間の`[2]`は最後の`Frame`の`p1|p2`にする。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::MATCH_SEND_MASK;
@@ -17,12 +19,13 @@ use super::WatchPlay;
 use crate::netplay::peer_wait::ESC_HOLD_MS;
 use crate::netplay::{Action, Game};
 
-/// マッチの外の長押しの案内を、Esc を離してから残す長さ（ms。押す長さと同じ）。
+/// マッチの外の長押しの案内をEscを離してから残す長さ（ms。押す長さと同じ）。
 pub const ESC_HINT_KEEP_MS: u32 = ESC_HOLD_MS;
 
-/// ゲームのポーズの間に手元の入力から `[2]` へ入れるビット。手元の入力（`Game::local_input`）は、台本の語なら `MATCH_SEND_MASK` を
-/// 当てた語、デバイスの語は poll の生の語で、Q（`pause::KEY_TO_TITLE`。どの状態からでも「タイトルへ戻る」へ行く `0x004347AD`）・
-/// P/Home（`0x0800`。ゲーム自身のスクリーンショット `0x0042DBAA`）・Enter などを含みうる。ネットワークで送る語と同じマスクで切ってこれらを落とす。
+/// ゲームのポーズの間に手元の入力から`[2]`へ書き込むビット。
+/// 手元の入力（`Game::local_input`）は、台本のワードなら`MATCH_SEND_MASK`を当てたワード。デバイスのワードならpollの生のワードになる。
+/// 手元の入力はQ（`pause::KEY_TO_TITLE`。どの状態からでも「タイトルへ戻る」へ行く`0x004347AD`）・P/Home（`0x0800`。ゲーム自身のスクリーンショット`0x0042DBAA`）・Enterなどを含みうる。
+/// ネットワークで送るワードと同じマスクで切り、これらを落とす。
 pub(super) const PAUSE_KEYS: u16 = MATCH_SEND_MASK;
 const _: () = assert!(
     PAUSE_KEYS & pause::KEY_TO_TITLE == 0 && PAUSE_KEYS & 0x0800 == 0 && PAUSE_KEYS & ESC != 0
@@ -31,16 +34,17 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalPause {
     Off,
-    /// Esc を入れた tick の次（ポーズが開いたかを見る）。
+    /// Escを書き込んだtickの次（ポーズが開いたかを見る）。
     Opening,
     /// ゲームのポーズが開いている。
     Open,
-    /// 閉じる tick に次の `Frame` を使いに行った（記録が無ければ描画だけのフレームで、次の tick もここ）。`prev2` はその前の `[2]`。
+    /// 閉じるtickに次の`Frame`を使いに行った（記録が無ければ描画だけのフレームで次のtickもここ）。`prev2`はその前の`[2]`。
     Closing {
         prev2: u16,
     },
-    /// 閉じる tick に `Frame` を使った。次の tick に閉じたかを見る。`reopen` はその `Frame` の `[2]` に Esc の押した瞬間があった
-    /// （ホストがそのフレームでポーズを開いた。閉じた直後に開き直すのが正しい）。
+    /// 閉じるtickに`Frame`を使った。次のtickに閉じたかを見る。
+    /// `reopen`はその`Frame`の`[2]`にEscの押した瞬間があったかどうか。
+    /// ホストがそのフレームでポーズを開いたので、閉じた直後に開き直すのが正しい。
     Closed {
         reopen: bool,
     },
@@ -51,43 +55,43 @@ pub(super) enum LocalPause {
 /// 一時停止の数（本ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PauseStats {
-    /// ゲームのポーズを開いた回数と、開いている間の tick（Esc の tick を除く）。
+    /// ゲームのポーズを開いた回数と開いている間のtick（Escのtickを除く）。
     pub opened: u32,
     pub ticks: u64,
-    /// 閉じる tick に次の `Frame` を使った回数。
+    /// 閉じるtickに次の`Frame`を使った回数。
     pub resumed: u32,
     /// 閉じた直後にホストのポーズが開き直した回数（正しい動き）。
     pub reopened: u32,
-    /// 崩れ: Esc の tick にポーズが開かなかった（試合が最後の語で 1 フレーム進んだ）。
+    /// 崩れ: Escのtickにポーズが開かなかった（試合が最後のワードで1フレーム進んだ）。
     pub open_slips: u32,
-    /// 崩れ: 閉じる tick に閉じなかった・その前に閉じた・開き直しの食い違い。
+    /// 崩れ: 閉じるtickに閉じなかった・その前に閉じた・開き直しの食い違い。
     pub close_slips: u32,
-    /// ポーズの状態を読めず、描画だけのフレームにした tick。
+    /// ポーズの状態を読めず描画だけのフレームにしたtick。
     pub unreadable: u32,
-    /// 崩れた seg で、ゲームのポーズの代わりに重ね描きの一時停止にした回数。
+    /// 崩れたマッチでゲームのポーズの代わりに重ね描きの一時停止にした回数。
     pub fallbacks: u32,
-    /// ポーズの「タイトルへ戻る」で観戦を終えた回数（0 か 1）。
+    /// ポーズの「タイトルへ戻る」で観戦を終えた回数（0か1）。
     pub quits: u32,
-    /// 重ね描きの一時停止の回数と、その tick。
+    /// 重ね描きの一時停止の回数とそのtick。
     pub overlays: u32,
     pub overlay_ticks: u64,
-    /// マッチの外の Esc の押下（押した瞬間）の数。
+    /// マッチの外のEscの押下（押した瞬間）の数。
     pub esc_outside: u32,
 }
 
-/// 左上の 1 行に出す観戦者の知らせ。
+/// 左上の1行に出す観戦者の知らせ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchNotice {
     /// 次のキャラ選択から映る（`WatchPlay::awaiting_select`）。
     NextSelect,
     /// 重ね描きの一時停止。
     Paused,
-    /// マッチの外で Esc を押している（3 秒の長押しで観戦をやめる）。
+    /// マッチの外でEscを押している（3秒の長押しで観戦をやめる）。
     EscHold,
 }
 
 impl WatchPlay {
-    /// マッチの中の tick の一時停止の判断。`Some` はこの tick の答え（記録を使わない）、`None` は記録の経路（`match_frame`）へ進む。
+    /// マッチの中のtickの一時停止の判断。`Some`はこのtickの答え（記録を使わない）。`None`は記録の経路（`match_frame`）へ進む。
     pub(super) fn pause_tick<G: Game>(&mut self, game: &mut G, esc: bool) -> Option<Action> {
         if let LocalPause::Closed { reopen } = self.pause {
             self.check_closed(game, reopen);
@@ -110,7 +114,7 @@ impl WatchPlay {
         }
     }
 
-    /// 記録の経路の後: 閉じる tick に `Frame` を使えたら、次の tick に閉じたかを見る。
+    /// 記録の経路の後: 閉じるtickに`Frame`を使えたら次のtickに閉じたかを見る。
     pub(super) fn after_close(&mut self, a: Action) {
         if let (LocalPause::Closing { prev2 }, Action::Played(r)) = (self.pause, a) {
             self.pause = LocalPause::Closed {
@@ -120,12 +124,12 @@ impl WatchPlay {
         }
     }
 
-    /// Esc の tick。ゲームのポーズを開けるなら `[2]` に最後の語と Esc の押した瞬間を入れる（記録は使わない）。開けないなら重ね描きの一時停止。
+    /// Escのtick。ゲームのポーズを開けるなら`[2]`に最後のワードとEscの押した瞬間を書き込む（記録は使わない）。開けないなら重ね描きの一時停止。
     fn open_pause<G: Game>(&mut self, game: &mut G) -> Action {
         self.mark_used();
         let (p1, p2) = self.last_words;
-        // GameManager が開くのは、ポーズ・終わりのメニュー・読み込みのどれでもなく `[2]+0x06 & 8` のとき（`0x0041AB4E`〜`0x0041AB7B`）。
-        // 前の語に Esc が入っていると押した瞬間を作れない。
+        // GameManagerが開くのは、ポーズ・終わりのメニュー・読み込みのどれでもなく`[2]+0x06 & 8`のとき（`0x0041AB4E`〜`0x0041AB7B`）。
+        // 前のワードにEscが入っていると押した瞬間を作れない。
         let can = game
             .play_view()
             .is_some_and(|v| !v.loading && !v.paused && !v.end_menu)
@@ -146,7 +150,7 @@ impl WatchPlay {
         Action::Zero
     }
 
-    /// ゲームのポーズが開いている間の 1 tick（入力の地点で読んだ状態と数えは、前の tick の終わりの値）。
+    /// ゲームのポーズが開いている間の1 tick（入力の地点で読んだ状態と数えは前のtickの終わりの値）。
     fn game_pause<G: Game>(&mut self, game: &mut G) -> Option<Action> {
         self.mark_used();
         let view = game.play_view();
@@ -168,7 +172,7 @@ impl WatchPlay {
                 ..
             }) => m,
             Some(PlayView { paused: false, .. }) => {
-                // 閉じる tick を待たずに閉じた（試合が最後の語で進んだ）。
+                // 閉じるtickを待たずに閉じた（試合が最後の語で進んだ）。
                 self.stats.pause.close_slips = self.stats.pause.close_slips.saturating_add(1);
                 self.slip(LocalPause::Off);
                 return None;
@@ -179,7 +183,7 @@ impl WatchPlay {
         let (p1, p2) = self.last_words;
         let w2 = match menu.state {
             pause::LEAVING => {
-                // 「タイトルへ戻る」→「はい」。観戦を終え、以後この状態を Esc で再開へ戻させない（`finish` が `leaving` を立てる）。
+                // 「タイトルへ戻る」→「はい」。観戦を終え、以後この状態をEscで再開へ戻させない（`finish`が`leaving`を立てる）。
                 self.stats.pause.quits = self.stats.pause.quits.saturating_add(1);
                 self.quit_by_esc();
                 self.pause = LocalPause::Off;
@@ -196,7 +200,7 @@ impl WatchPlay {
         Some(Action::Zero)
     }
 
-    /// 閉じる tick の次: 閉じたか（`reopen` なら開き直したか）を見る。
+    /// 閉じるtickの次: 閉じたか（`reopen`なら開き直したか）を見る。
     fn check_closed<G: Game>(&mut self, game: &mut G, reopen: bool) {
         self.pause = LocalPause::Off;
         let ok = match game.play_view() {
@@ -212,7 +216,7 @@ impl WatchPlay {
                 reopen
             }
             Some(_) => {
-                // 閉じなかった。閉じる tick に使った `Frame` は試合に入っていない（取り戻さない）。このポーズの扱いは続ける。
+                // 閉じなかった。閉じるtickに使った`Frame`は試合に入っていない（取り戻さない）。このポーズの扱いは続ける。
                 self.pause = LocalPause::Open;
                 false
             }
@@ -227,7 +231,7 @@ impl WatchPlay {
         }
     }
 
-    /// 崩れた: この seg の残りはゲームのポーズを開かない（`begin_seg` で戻す）。
+    /// 崩れた: このマッチの残りはゲームのポーズを開かない（`begin_seg`で戻す）。
     fn slip(&mut self, next: LocalPause) {
         self.pause_broken = true;
         self.pause = next;
@@ -238,10 +242,11 @@ impl WatchPlay {
         Action::RenderOnly
     }
 
-    /// マッチの中で観戦を終えた後、場面がマッチを出るまでの tick（`leaving`）。`[2]` だけをこちらが作り、本物のキーボードで試合を進めない:
-    /// ポーズが開いていれば Q の押した瞬間で「タイトルへ戻る」（状態 8。20 tick 後に次の要求 1）へ送り、状態 8 の間は何も押さない（Esc は
-    /// 状態 8 を再開へ戻す `0x0043474B`）。開いていなければ Esc の押した瞬間で開く。終わりのメニュー・読めないときは、手元の入力から Esc と Q を
-    /// 落として入れる（メニューは観戦者が選ぶ）。押した瞬間は 1 tick おきに作る。
+    /// マッチの中で観戦を終えた後に、場面がマッチを出るまでのtick（`leaving`）。`[2]`だけをこちらが作り、本物のキーボードで試合を進めない。
+    /// ポーズが開いていればQの押した瞬間で「タイトルへ戻る」（状態8。20 tick後に次の要求1）へ送る。状態8の間は何も押さない（Escは状態8を再開へ戻す`0x0043474B`）。
+    /// ポーズが開いていなければEscの押した瞬間で開く。
+    /// 終わりのメニューが出ているときと状態を読めないときは、手元の入力からEscとQを落とした入力を書き込む（メニューは観戦者が選ぶ）。
+    /// 押した瞬間は1 tickおきに作る。
     pub(super) fn leaving_tick<G: Game>(&mut self, game: &mut G) -> Action {
         let w2 = match game.play_view() {
             Some(PlayView {

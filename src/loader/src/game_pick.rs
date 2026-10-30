@@ -1,7 +1,7 @@
-//! 花映塚の th09.exe の場所を、初回だけ人に選ばせて覚える（`--game` をリンク先に足させる方式は不慣れな人には難しいため）。
+//! 花映塚のth09.exeの場所を初回だけ人に選ばせて覚える（`--game`をリンク先に足させる方式は不慣れな人には難しいため）。
 //!
-//! 判断だけをここに書き、ウィンドウ・ファイル・画面は `Host` の向こうへ出す。覚える場所は ini の `[loader] game`（th09.exe のフルパス）。
-//! 以前のバージョンの `game_path.txt` は起動のとき ini へ移して消す。`--game` を付けた起動は読み書きしない。
+//! 判断だけをここに書き、ウィンドウ・ファイル・画面は`Host`の向こうへ出す。覚える場所はiniの`[loader] game`（th09.exeのフルパス）。
+//! 以前のバージョンの`game_path.txt`は起動時にiniへ移して消す。`--game`を付けた起動は読み書きしない。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,9 @@ use higanr_core::pe::{self, Ident, IdentField, TH09_V150A};
 
 use crate::ui_lang::by_lang;
 
-/// 以前のバージョンが th09.exe の場所を覚えていたファイル（HiganRTool.exe と同じフォルダ）。今は読まず、起動のとき ini へ移して消す。
+/// 以前のバージョンがth09.exeの場所を覚えていたファイル（HiganRTool.exeと同じフォルダ）。今は読まない。起動時にiniへ移して消す。
 pub const LEGACY_FILE: &str = "game_path.txt";
-/// 覚える場所の ini のカテゴリとキー。
+/// 覚える場所のiniのカテゴリとキー。
 pub const INI_SECTION: &str = "loader";
 pub const INI_KEY: &str = "game";
 
@@ -50,14 +50,14 @@ impl PickError {
             .to_string(),
             PickError::DialogFailed(why) => by_lang!(
                 lang,
-                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文と、logsフォルダのファイルを添えて、開発者に伝えてください（https://github.com/Mako-th/HiganRTool/issues）。",
-                en: "Could not open the folder picker ({why}). Nothing was started. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with this message and the files in the logs folder."
+                ja: "フォルダを選ぶウィンドウを開けませんでした（{why}）。何も起動していません。この文と、zipにしたlogsフォルダを添えて、開発者に伝えてください（https://github.com/Mako-th/HiganRTool/issues）。",
+                en: "Could not open the folder picker ({why}). Nothing was started. Please report this on GitHub Issues (https://github.com/Mako-th/HiganRTool/issues) with this message and the logs folder as a zip."
             ),
         }
     }
 }
 
-/// ウィンドウ・ファイル・画面の外。本物は `main.rs` の `RealPickHost`、検査は偽物。
+/// ウィンドウ・ファイル・画面の外。本物は`main.rs`の`RealPickHost`。検査では偽物を使う。
 pub trait Host {
     fn lang(&self) -> Lang;
     fn read_saved(&mut self) -> Option<String>;
@@ -90,7 +90,7 @@ fn check_exe<H: Host>(h: &mut H, exe: &Path) -> Check {
     }
 }
 
-/// 最初の行を trim する（BOM も外す）。空・相対パスは None（相対は起動した場所で指す先が変わる）。
+/// 最初の行をtrimする（BOMも外す）。空・相対パスはNone（相対は起動した場所で指す先が変わる）。
 pub fn parse_saved(text: &str) -> Option<PathBuf> {
     let line = text.trim_start_matches('\u{feff}').lines().next()?.trim();
     if line.is_empty() {
@@ -100,12 +100,12 @@ pub fn parse_saved(text: &str) -> Option<PathBuf> {
     p.is_absolute().then_some(p)
 }
 
-/// ini の `game` に書く値（UTF-8 にできないパスは書けないので `None`）。
+/// iniの`game`に書く値（UTF-8にできないパスは書けないので`None`）。
 pub fn saved_text(exe: &Path) -> Option<String> {
     exe.to_str().map(str::to_string)
 }
 
-/// 以前のバージョンのファイル（`LEGACY_FILE`）の中身を、ini に書く値にする（引き継ぎ用）。
+/// 以前のバージョンのファイル（`LEGACY_FILE`）の中身を、iniに書く値にする（引き継ぎ用）。
 pub fn parse_legacy(text: &str) -> Option<String> {
     parse_saved(text).and_then(|p| saved_text(&p))
 }
@@ -127,7 +127,7 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// 実際に読んだファイルと値・期待の値を 3 行で説明する（そのまま送れる形）。
+/// 実際に読んだファイルと値・期待の値を3行で説明する（そのまま送れる形）。
 pub fn ident_details(path: &Path, bytes: &[u8], lang: Lang) -> Vec<String> {
     ident_details_against(path, bytes, &TH09_V150A, lang)
 }
@@ -187,7 +187,7 @@ fn ident_details_against(path: &Path, bytes: &[u8], want: &Ident<'_>, lang: Lang
     lines
 }
 
-/// ドライブ名の後に `\` や `/` が無い形（`D:原作\th09.exe`）か。起動した場所で指す先が変わる。
+/// ドライブ名の後に`\`や`/`が無い形（`D:原作\th09.exe`）かどうか。起動した場所で指す先が変わる。
 pub fn is_drive_relative(p: &Path) -> bool {
     let s = p.to_string_lossy();
     let b = s.as_bytes();
@@ -204,13 +204,13 @@ pub fn drive_relative_message(orig: &Path, lang: Lang) -> String {
     )
 }
 
-/// 覚えた場所がそのまま使える（`resolve` がウィンドウを出さずに返す）ときの exe。ウィンドウを出す前に、ゲームのフォルダを先に知るために使う。
+/// 覚えた場所がそのまま使える（`resolve`がウィンドウを出さずに返す）ときのexe。ウィンドウを出す前にゲームのフォルダを先に知るために使う。
 pub fn remembered_exe<H: Host>(h: &mut H) -> Option<PathBuf> {
     let exe = h.read_saved().as_deref().and_then(parse_saved)?;
     matches!(check_exe(h, &exe), Check::Ok).then_some(exe)
 }
 
-/// `force_dialog` は `--choose-game`（覚えた場所が使えてもウィンドウを出す）。
+/// `force_dialog`は`--choose-game`（覚えた場所が使えてもウィンドウを出す）。
 pub fn resolve<H: Host>(h: &mut H, force_dialog: bool) -> Result<PathBuf, PickError> {
     let lang = h.lang();
     let saved = h.read_saved().as_deref().and_then(parse_saved);
@@ -280,7 +280,7 @@ pub fn resolve<H: Host>(h: &mut H, force_dialog: bool) -> Result<PathBuf, PickEr
                 details.join("\n")
             )),
         }
-        // 選び直しは、いま選んだフォルダから始める。
+        // 選び直しはいま選んだフォルダから始める。
         initial = Some(dir);
     }
 }
@@ -317,7 +317,7 @@ mod tests {
     use higanr_core::lang::has_japanese;
     use std::collections::{HashMap, VecDeque};
 
-    /// 偽のウィンドウ。答えは台本（`answers`）、尽きたら取り消し。
+    /// 偽のウィンドウ。答えは台本（`answers`）。尽きたらキャンセルとして扱う。
     #[derive(Default)]
     struct Fake {
         lang: Lang,
@@ -407,7 +407,7 @@ mod tests {
         b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual_address
         b[sec + 16..sec + 20].copy_from_slice(&text_raw.to_le_bytes());
         b[sec + 20..sec + 24].copy_from_slice(&(raw_off as u32).to_le_bytes());
-        // 節の実体がファイルの範囲に収まらない大きさでも、入口の位置の読み出しは範囲内。
+        // 節の実体がファイルの範囲に収まらない大きさでも入口の位置の読み出しは範囲内。
         b[raw_off..raw_off + entry.len()].copy_from_slice(entry);
         b
     }
@@ -477,7 +477,7 @@ mod tests {
         );
     }
 
-    /// 事前に決めたゲームのフォルダと、実際に選ばれるフォルダが食い違うと、ログの場所の判断が狂う。
+    /// 事前に決定したゲームのフォルダと実際に選ばれるフォルダが食い違うとログの場所の判断が狂う。
     #[test]
     fn a_remembered_exe_is_known_up_front_only_when_resolve_would_use_it_as_is() {
         let (mut f, exe) = with_exe("X:\\game", good_exe());
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn english_run_says_every_pick_message_in_english() {
-        // 覚えた場所が消えている → 選び直し → フォルダに th09.exe が無い → 1.50a でない → 覚えられない、を英語で通す。
+        // 覚えた場所が消えている → 選び直し → フォルダにth09.exeが無い → 1.50aでない → 覚えられない、を英語で通す。
         let mut f = Fake {
             lang: Lang::En,
             saved: Some("X:\\gone\\th09.exe".into()),
@@ -719,7 +719,7 @@ mod tests {
             m.contains("Add a \\ after the drive name") && !has_japanese(&m),
             "{m}"
         );
-        // 英語と日本語で、値（アドレス・長さ）の欄は同じ数だけ出る。
+        // 英語と日本語で値（アドレス・長さ）のフィールドは同じ数だけ出る。
         let ja = ident_details(Path::new("X:\\a\\th09.exe"), &good_exe(), Lang::Ja);
         let en = ident_details(Path::new("X:\\a\\th09.exe"), &good_exe(), Lang::En);
         assert_eq!(ja.len(), en.len());

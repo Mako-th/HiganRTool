@@ -1,11 +1,11 @@
-//! ログに書く前の行から、個人を特定できる文字を伏せる。
+//! ログに書く前の行から個人を特定できる文字を伏せる。
 //!
-//! - ユーザーのフォルダ（ドライブ直下の `Users`）の下の名前
-//! - ゲームと DLL のフォルダ（`Scrub::dir`）
-//! - IP アドレス（種類 + ポートにする。ポートは NAT の状態を読むために残す）
-//! - 接続コードの形の長い文字の並び（base64url。`LONG_TOKEN_MIN` 文字以上）
+//! - ユーザーのフォルダ（ドライブ直下の`Users`）の下の名前
+//! - ゲームとDLLのフォルダ（`Scrub::dir`）
+//! - IPアドレス（種類 + ポートにする。ポートはNATの状態を読むために残す）
+//! - 接続コードの形の長い文字の並び（base64url。`LONG_TOKEN_MIN`文字以上）
 //!
-//! 書き込み側で個別に気を付けても、OS のエラーの文などに混ざる分は防げないので、ログを書く出口の最後でまとめて通す。
+//! 書き込み側で個別に気を付けてもOSのエラーの文などに混ざる分は防げない。そのためログを書く出口の最後でまとめて通す。
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +26,7 @@ pub fn ip_kind(ip: IpAddr) -> &'static str {
 
 pub const USER_LABEL: &str = "<user>";
 
-/// 語の文字。ASCII だけ（日本語の文は語の切れ目なしにアドレスやパスへ続くので、かな・漢字の直後でもアドレスとして読む）。
+/// 語の文字。ASCIIだけ（日本語の文は語の切れ目なしにアドレスやパスへ続くので、かな・漢字の直後でもアドレスとして読む）。
 fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -35,14 +35,14 @@ fn is_sep(c: char) -> bool {
     c == '\\' || c == '/'
 }
 
-/// `Users\<名前>` の名前を伏せる。名前は区切り（`\` か `/`）までで、区切りが無いときは最初の空白まで。
+/// `Users\<名前>`の名前を伏せる。名前は区切り（`\`か`/`）まで。区切りが無いときは最初の空白まで。
 pub fn hide_user(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let key: Vec<char> = "users".chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
-        // ドライブ直下の `Users` に限る（別の語の途中の `users\` を伏せない）。
+        // ドライブ直下の`Users`に限る（別の語の途中の`users\`を伏せない）。
         let at_key = i >= 3
             && is_sep(chars[i - 1])
             && chars[i - 2] == ':'
@@ -71,7 +71,7 @@ pub fn hide_user(s: &str) -> String {
         while end < chars.len() && !stop(chars[end]) {
             end += 1;
         }
-        // 区切りが続かない（文の途中で終わる）ときは、名前に空白を含めず最初の空白まで。
+        // 区切りが続かない（文の途中で終わる）ときは名前に空白を含めず最初の空白まで。
         if !(end < chars.len() && is_sep(chars[end])) {
             end = name_start;
             while end < chars.len() && !stop(chars[end]) && !chars[end].is_whitespace() {
@@ -87,11 +87,11 @@ pub fn hide_user(s: &str) -> String {
     out
 }
 
-/// 伏せ始める長さ。接続コードの最短（`code::MIN_CODE_CHARS` = 返す側 60 文字）より少し短い 3 文字下から。
+/// 伏せ始める長さ。接続コードの最短（`code::MIN_CODE_CHARS` = 返す側60文字）より少し短い3文字下から。
 pub const LONG_TOKEN_MIN: usize = crate::code::MIN_CODE_CHARS - 3;
 pub const LONG_TOKEN_LABEL: &str = "<長い文字の並び>";
 
-/// base64url の文字（英数字・`-`・`_`）が `LONG_TOKEN_MIN` 文字以上続く並びを伏せる（接続コードを誤って書いたときの備え）。
+/// base64urlの文字（英数字・`-`・`_`）が`LONG_TOKEN_MIN`文字以上続く並びを伏せる（接続コードを誤って書いたときの備え）。
 pub fn hide_long_tokens(s: &str) -> String {
     let is_b64 = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     let mut out = String::with_capacity(s.len());
@@ -137,7 +137,7 @@ fn parse_v4(run: &[char]) -> Option<(usize, std::net::Ipv4Addr)> {
     Some((text.chars().count(), ip))
 }
 
-/// 直後の `:ポート`（1〜5 桁）の長さ（`:` を含む）。
+/// 直後の`:ポート`（1〜5桁）の長さ（`:`を含む）。
 fn port_len(rest: &[char]) -> usize {
     if rest.first() != Some(&':') {
         return 0;
@@ -150,14 +150,14 @@ fn port_len(rest: &[char]) -> usize {
     }
 }
 
-/// IP アドレス（v4・v6）を「種類 + ポート」に替える。
+/// IPアドレス（v4・v6）を「種類 + ポート」に替える。
 pub fn hide_addrs(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        // 語の途中・`1.2.3.4.5` のような長い数の途中からはアドレスと読まない。
+        // 語の途中・`1.2.3.4.5`のような長い数の途中からはアドレスと読まない。
         let prev_word = i > 0
             && (is_word(chars[i - 1])
                 || (chars[i - 1] == '.' && i >= 2 && chars[i - 2].is_ascii_digit()));
@@ -217,7 +217,7 @@ pub fn hide_addrs(s: &str) -> String {
     out
 }
 
-/// フォルダの接頭を置き換える表。大文字・小文字は ASCII だけ区別しない。
+/// フォルダの接頭を置き換える表。大文字・小文字はASCIIだけ区別しない。
 #[derive(Debug, Clone, Default)]
 pub struct Scrub {
     dirs: Vec<(Vec<char>, String)>,
@@ -228,7 +228,7 @@ impl Scrub {
         Self::default()
     }
 
-    /// `path` で始まる文字を `label` に替える（`\` と `/` の両方の綴りで）。空のパスは足さない。
+    /// `path`で始まる文字を`label`に替える（`\`と`/`の両方の綴りで）。空のパスは足さない。
     pub fn dir(mut self, path: &str, label: &str) -> Self {
         let p = path.trim_end_matches(['\\', '/']);
         if p.is_empty() {
@@ -240,7 +240,7 @@ impl Scrub {
                 self.dirs.push((key, label.to_string()));
             }
         }
-        // 長い方を先に当てる（ゲームのフォルダが DLL のフォルダの親のとき、子が先に当たるように）。
+        // 長い方を先に当てる（ゲームのフォルダがDLLのフォルダの親のとき、子が先に当たるように）。
         self.dirs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
         self
     }
@@ -280,7 +280,7 @@ impl Scrub {
     }
 }
 
-/// 1 行ずつ `Scrub` を通して `inner` へ書く。改行が来るまで溜める（`writeln!` が 1 行を何度かに分けて書くため）。
+/// 1行ずつ`Scrub`を通して`inner`へ書く。改行が来るまで溜める（`writeln!`が1行を何度かに分けて書くため）。
 pub struct ScrubWrite<W: Write> {
     inner: W,
     scrub: Scrub,
@@ -307,7 +307,7 @@ impl<W: Write> ScrubWrite<W> {
             }
             let mut text = self.scrub.line(&String::from_utf8_lossy(&line));
             text.push_str(if cr { "\r\n" } else { "\n" });
-            // 1 行を 1 回の書き込みにする（書き込み中のファイルをローダーが読んでも、行の途中で切れにくい）。
+            // 1行を1回の書き込みにする（書き込み中のファイルをローダーが読んでも行の途中で切れにくい）。
             self.inner.write_all(text.as_bytes())?;
         }
         Ok(())
@@ -329,7 +329,7 @@ impl<W: Write> Write for ScrubWrite<W> {
 impl<W: Write> Drop for ScrubWrite<W> {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
-            // 次の起動の区切りの行が、この行の続きにならないよう改行で終える。
+            // 次の起動の区切りの行がこの行の続きにならないよう改行で終える。
             let mut text = self.scrub.line(&String::from_utf8_lossy(&self.pending));
             text.push('\n');
             let _ = self.inner.write_all(text.as_bytes());
@@ -341,7 +341,7 @@ impl<W: Write> Drop for ScrubWrite<W> {
 mod tests {
     use super::*;
 
-    /// 見本のパスは組み立てる（公開用の走査がユーザーのフォルダの形を拾う）。`~` を `Users` に、`~l` を `users` にする。
+    /// 見本のパスは組み立てる（公開用の走査がユーザーのフォルダの形を拾う）。`~`を`Users`にする。`~l`を`users`にする。
     fn u(s: &str) -> String {
         s.replace("~l", "users").replace('~', "Users")
     }
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_connection_code_shaped_run_is_hidden_and_ordinary_text_is_not() {
-        // 候補 2 つ・名前 "ab" の始める側のコード（golden）。
+        // 候補2つ・名前 "ab" の始める側のコード（golden）。
         let code = "BQAAAAABRDMiEQDSSWsAAAAAAmFiAAECAwQFBgcICQoLDA0ODwIBBH8AAAGZtwQGIAENuAAAAAAAAAAAAAAAAVgb7NLang";
         assert_eq!(
             hide_long_tokens(&format!("コード {code} を書いた")),

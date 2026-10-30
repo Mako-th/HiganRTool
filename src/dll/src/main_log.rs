@@ -1,27 +1,28 @@
 //! 本ログへ行を頼む入口（pure）。
 //!
-//! ウィンドウの差し替え（`window_win.rs`）とパッドの十字キー（`pad_extra_win.rs`）は本ログの書き手（`win.rs` の読み取りのスレッド）ではなく、`DllMain` の下でも走る。
-//! `logs\` の中を増やさないよう別ファイルは作らず、行をここへ頼み、本ログの書き手が書く。頼む側はメモリに積むだけ（ファイルを開かない・書かない・待たない）。
-//! 書き手は `Draining` で本ログを包み、書き込みが行の先頭から始まるたびに積んだ行を先に書く（`writeln!` は文字列を何度かに分けて書くので「直前が改行か」で行の先頭を見分ける）。
-//! 包みの下の `ScrubWrite` が 1 行を 1 回の書き込みにまとめる（ローダーが読んでも行の途中で切れにくいように）。各行の先頭には出どころ（`ウィンドウ:`・`pad:`）を付ける。
-//! 最後の 1 回は書き手が終わるときに `Draining::drain_now` で流す。ゲームのプロセスが先に終わると、その間に積んだ行は残らない。
+//! ウィンドウの差し替え（`window_win.rs`）とパッドの十字キー（`pad_extra_win.rs`）は本ログの書き手（`win.rs`の読み取りのスレッド）ではない。
+//! これらは`DllMain`の下でも走る。
+//! `logs\`の中を増やさないよう別ファイルは作らない。行をここへ頼み本ログの書き手が書く。頼む側はメモリに積むだけ（ファイルを開かない・書かない・待たない）。
+//! 書き手は`Draining`で本ログを包む。書き込みが行の先頭から始まるたびに積んだ行を先に書く（`writeln!`は文字列を何度かに分けて書くので「直前が改行か」で行の先頭を見分ける）。
+//! 包みの下の`ScrubWrite`が1行を1回の書き込みにまとめる（ローダーが読んでも行の途中で切れにくいように）。各行の先頭には出どころ（`ウィンドウ:`・`pad:`）を付ける。
+//! 最後の1回は書き手が終わるときに`Draining::drain_now`で書き出す。ゲームのプロセスが先に終わるとその間に積んだ行は残らない。
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
 use std::sync::Mutex;
 
-/// 積んでおける行の数。書き手が先に終わった後も頼む側は走り続けるので上限を設ける。溢れたら捨てて数える（次の書き出しの 1 行に出る）。
+/// 積んでおける行の数。書き手が先に終わった後も頼む側は走り続けるので上限を設ける。溢れたら捨てて数える（次の書き出しの1行に出る）。
 pub const MAX_QUEUED_LINES: usize = 64;
 
 struct Inner {
     /// （詳細だけの行か, 行）。
     lines: Vec<(bool, String)>,
-    /// 上限で捨てた行の数（書き出すと 0 に戻す）。
+    /// 上限で捨てた行の数（書き出すと0に戻す）。
     dropped: usize,
 }
 
-/// 頼まれた行の待ち行列。製品は `QUEUE` を 1 つだけ使う（検査は自前のものを作る）。
+/// 頼まれた行の待ち行列。製品は`QUEUE`を1つだけ使う（検査は自前のものを作る）。
 pub struct LineQueue {
     inner: Mutex<Inner>,
 }
@@ -40,12 +41,12 @@ impl LineQueue {
         self.push_as(false, line.into());
     }
 
-    /// 詳細のときだけ書く行。簡潔か詳細かは書くときの `log_mode::detail()` で選ぶ（頼む側は DllMain の中で、まだ ini を読んでいない）。
+    /// 詳細のときだけ書く行。簡潔か詳細かは書くときの`log_mode::detail()`で選ぶ（頼む側はDllMainの中でまだiniを読んでいない）。
     pub fn push_detail(&self, line: impl Into<String>) {
         self.push_as(true, line.into());
     }
 
-    /// `problem` なら簡潔にも書く行、そうでなければ詳細だけの行。
+    /// `problem`なら簡潔にも書く行、そうでなければ詳細だけの行。
     pub fn push_when(&self, problem: bool, line: impl Into<String>) {
         self.push_as(!problem, line.into());
     }
@@ -59,7 +60,7 @@ impl LineQueue {
         }
     }
 
-    /// 積んである行を足した順に `out` へ書く。書けなかった行は戻さない。ロックは取り出す間だけ持つ（頼む側を待たせない）。
+    /// 積んである行を足した順に`out`へ書く。書けなかった行は戻さない。ロックは取り出す間だけ持つ（頼む側を待たせない）。
     pub fn drain_into(&self, out: &mut dyn Write) {
         let (lines, dropped) = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -112,7 +113,7 @@ impl Default for LineQueue {
 
 static QUEUE: LineQueue = LineQueue::new();
 
-/// 本ログへ 1 行頼む（どのスレッドからでも。`DllMain` の中からでもよい）。
+/// 本ログへ1行頼む（どのスレッドからでも。`DllMain`の中からでもよい）。
 pub fn push(line: impl Into<String>) {
     QUEUE.push(line);
 }
@@ -144,7 +145,7 @@ pub fn peek_brief() -> Vec<String> {
 pub struct Draining<'a, W: Write> {
     inner: W,
     queue: &'a LineQueue,
-    /// 直前に書いたバイトが改行（か、まだ何も書いていない）= いま行の先頭。
+    /// 直前に書いたバイトが改行なら（またはまだ何も書いていなければ）いま行の先頭。
     at_line_start: bool,
 }
 
@@ -157,7 +158,7 @@ impl<'a, W: Write> Draining<'a, W> {
         }
     }
 
-    /// いま行の先頭なら、積んである行を書く（書き手が終わるときの最後の 1 回）。行の途中なら何もしない。
+    /// いま行の先頭なら積んである行を書く（書き手が終わるときの最後の1回）。行の途中なら何もしない。
     pub fn drain_now(&mut self) {
         if self.at_line_start {
             self.queue.drain_into(&mut self.inner);
@@ -180,7 +181,7 @@ impl<W: Write> Write for Draining<'_, W> {
         Ok(n)
     }
 
-    /// 行の先頭なら、積んである行も先に書く（簡潔なログは 1 秒ごとの行が無いので、頼まれた行が次の書き込みまで残らないように）。
+    /// 行の先頭なら積んである行も先に書く（簡潔なログは1秒ごとの行が無いので頼まれた行が次の書き込みまで残らないように）。
     fn flush(&mut self) -> io::Result<()> {
         self.drain_now();
         self.inner.flush()

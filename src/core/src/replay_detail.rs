@@ -1,13 +1,14 @@
-//! 印（`replay.rs`）に足す、マッチの情報の型と書式。ラウンドごとの記録、同期方式、ビルド番号、開始時刻、通信の要約、接続の中の何マッチ目か。
+//! 印（`replay.rs`）に足すマッチの情報の型と書式。ラウンドごとの記録、同期方式、ビルド番号、開始時刻、通信の要約、接続の中の何マッチ目か。
 //!
-//! 印のバージョンは 1 のまま、`Mark` の後ろに任意のキーを足す（読み手は知らないキーを読み飛ばす）。入れるのは `ALLOWED_KEYS` のキーだけで、
-//! 値は数字・`-`・`.` と決まった語なので `%XX` の逃がしを通しても変わらない。//! IP・ポート・接続コード・ルーム名・接続 ID の欄は持たない。
-//! ゲームのスレッドの外（保管庫のスレッドと検査）で使うので、ヒープを使い、どんなバイト列でもパニックしない。
+//! 印のバージョンは1のまま`Mark`の後ろに任意のキーを足す（読み手は知らないキーを読み飛ばす）。
+//! 足すのは`ALLOWED_KEYS`のキーだけ。値は数字・`-`・`.`と決まった語なので`%XX`のエスケープを通しても変わらない。
+//! IP・ポート・接続コード・ルーム名・接続IDのフィールドは持たない。
+//! ゲームのスレッドの外（保管庫のスレッドと検査）で使うのでヒープを使い、どんなバイト列でもパニックしない。
 #![forbid(unsafe_code)]
 
 use crate::replay::MarkError;
 
-/// `rN` のキーの上限。ゲームは Match の勝ちに要る数を 2 に決める（`0x0041AFBA`）ので 3 ラウンドが最大で、上限は余裕。
+/// `rN`のキーの上限。ゲームはMatchの勝ちに要る数を2に決める（`0x0041AFBA`）ので3ラウンドが最大。上限は余裕を持たせた値。
 pub const MAX_ROUND_KEYS: usize = 16;
 
 const ROUND_KEY_NAMES: [&str; MAX_ROUND_KEYS] = [
@@ -25,7 +26,7 @@ const KEY_CHARGE: usize = 6;
 const KEY_ROUNDS: usize = 7;
 const KEY_COUNT: usize = KEY_ROUNDS + MAX_ROUND_KEYS;
 
-/// このモジュールが書く・読むキー（並びは `values` の添字と同じ）。
+/// このモジュールが書く・読むキー（並びは`values`の添字と同じ）。
 pub const ALLOWED_KEYS: [&str; KEY_COUNT] = {
     let mut k = [""; KEY_COUNT];
     k[KEY_SYNC] = "sync";
@@ -58,7 +59,7 @@ impl SyncKind {
     }
 }
 
-/// ラウンドの勝者（席の番号。1P / 2P）。勝ち数の増えた席が 1 つに決まらなければ `Unknown`。
+/// ラウンドの勝者（サイドの番号。1P / 2P）。勝ち数の増えたサイドが1つに決まらなければ`Unknown`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Winner {
     P1,
@@ -66,15 +67,15 @@ pub enum Winner {
     Unknown,
 }
 
-/// 1 ラウンドの記録。`[0]` が 1P、`[1]` が 2P。`None` は読めなかった値。
-/// カウンタ（`c23`・`boss`・`rev`）はそのラウンドの分（境目どうしの差）。ライフとスコアは境目の tick の値そのまま。
+/// 1ラウンドの記録。`[0]`が1P、`[1]`が2P。`None`は読めなかった値。
+/// カウンタ（`c23`・`boss`・`rev`）はそのラウンドの分（境目どうしの差）。ライフとスコアは境目のtickの値そのまま。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundRec {
     /// ラウンドの時間（`round_frames`）。
     pub frames: u32,
     pub winner: Winner,
     pub life: [Option<u32>; 2],
-    /// C2 と C3 の数（Player の `spell_attacks`）。
+    /// C2とC3の数（Playerの`spell_attacks`）。
     pub c23: [Option<u32>; 2],
     /// ボスアタックの数（`boss_attacks`）。
     pub boss: [Option<u32>; 2],
@@ -89,14 +90,14 @@ pub struct RoundRec {
 pub struct CommSummary {
     pub ping_median_ms: Option<u32>,
     pub ping_max_ms: Option<u32>,
-    /// 相手の語を待って止まった回数（delay 方式は描画だけにしたフレーム、rollback は入力の地点が待った回数）。
+    /// 相手のワードを待って止まった回数（delay方式は描画だけにしたフレーム、rollbackは入力の地点が待った回数）。
     pub stalls: u32,
-    /// 進め直し（書き戻し）の回数と、そのために余分に進めた tick の数。
+    /// 進め直し（書き戻し）の回数とそのために余分に進めたtickの数。
     pub rewinds: u32,
     pub resim_ticks: u32,
 }
 
-/// 印に足す、マッチの情報。全部任意（足りないものは書かない）。
+/// 印に足すマッチの情報。全部任意（足りないものは書かない）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatchDetail {
     pub sync: Option<SyncKind>,
@@ -107,7 +108,7 @@ pub struct MatchDetail {
     pub rounds: Vec<RoundRec>,
     /// 記録の上限を越えて捨てたラウンドの数。
     pub rounds_dropped: u32,
-    /// 生きた試合で使った 1P / 2P のチャージ型（見出しへ書いたのと同じ値）。書けなかった・読めなかったときは `None`。
+    /// 生きた試合で使った1P / 2Pのチャージ型（ヘッダへ書いたのと同じ値）。書き込めなかった・読み取れなかったときは`None`。
     pub charge: Option<[u8; 2]>,
 }
 
@@ -143,7 +144,7 @@ impl RoundRec {
         )
     }
 
-    /// `to_value` の逆。欄の数が 12 でない・数字でない・範囲を越える値は `None`。
+    /// `to_value`の逆。フィールドの数が12でない・数字でない・範囲を越える値は`None`。
     pub fn parse(v: &[u8]) -> Option<RoundRec> {
         let f: Vec<&[u8]> = v.split(|&b| b == b'.').collect();
         if f.len() != 12 {
@@ -194,7 +195,7 @@ impl CommSummary {
     }
 }
 
-/// 数字だけ（`+`・空白・空は不可）の 10 進を読む。
+/// 数字だけ（`+`・空白・空は不可）の10進を読む。
 fn digits_u64(b: &[u8]) -> Option<u64> {
     if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
         return None;
@@ -206,7 +207,7 @@ fn digits_u32(b: &[u8]) -> Option<u32> {
     digits_u64(b).and_then(|v| u32::try_from(v).ok())
 }
 
-/// `-` は「読めなかった」（外側の `Some(None)`）。数字でも `-` でもなければ外側が `None`。
+/// `-`は「読めなかった」（外側の`Some(None)`）。数字でも`-`でもなければ外側が`None`。
 fn dash_u32(b: &[u8]) -> Option<Option<u32>> {
     if b == b"-" {
         Some(None)
@@ -223,7 +224,7 @@ fn dash_u64(b: &[u8]) -> Option<Option<u64>> {
     }
 }
 
-/// `charge` の値 `<1P>.<2P>`（それぞれ 0〜255 の 10 進）を読む。
+/// `charge`の値`<1P>.<2P>`（それぞれ0〜255の10進）を読む。
 fn parse_charge(v: &[u8]) -> Option<[u8; 2]> {
     let mut it = v.split(|&b| b == b'.');
     let p1 = u8::try_from(digits_u32(it.next()?)?).ok()?;
@@ -232,7 +233,7 @@ fn parse_charge(v: &[u8]) -> Option<[u8; 2]> {
 }
 
 impl MatchDetail {
-    /// 書くキーと値（`ALLOWED_KEYS` の並び）。値は逃がす前。
+    /// 書くキーと値（`ALLOWED_KEYS`の並び）。値はエスケープする前。
     pub fn fields(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         if let Some(s) = self.sync {
@@ -264,7 +265,7 @@ impl MatchDetail {
         out
     }
 
-    /// 書けない値（`rN` のキーが足りない）なら、読むときに壊れていることになるので書く前に断る。
+    /// 書き込めない値（`rN`のキーが足りない）なら読むときに壊れていることになるので書く前に断る。
     pub fn check(&self) -> Result<(), MarkError> {
         if self.rounds.len() > MAX_ROUND_KEYS {
             return Err(MarkError::BadValue("rounds"));
@@ -273,7 +274,7 @@ impl MatchDetail {
     }
 }
 
-/// 読むときに、印の本文から集めたキーの値（逃がしを戻した後）。`MatchDetail` に組み立てる。
+/// 読むときに印の本文から集めたキーの値（エスケープを戻した後）。`MatchDetail`に組み立てる。
 pub struct DetailFields {
     values: [Option<Vec<u8>>; KEY_COUNT],
 }
@@ -286,7 +287,7 @@ impl Default for DetailFields {
     }
 }
 
-/// `key` がこのモジュールのキーなら、その番号（`ALLOWED_KEYS` の添字）。
+/// `key`がこのモジュールのキーなら、その番号（`ALLOWED_KEYS`の添字）。
 pub fn key_index(key: &[u8]) -> Option<usize> {
     ALLOWED_KEYS.iter().position(|k| k.as_bytes() == key)
 }
@@ -296,7 +297,7 @@ pub fn key_name(idx: usize) -> &'static str {
 }
 
 impl DetailFields {
-    /// 同じキーが 2 回来たら `DuplicateKey`。
+    /// 同じキーが2回来たら`DuplicateKey`。
     pub fn put(&mut self, idx: usize, value: Vec<u8>) -> Result<(), MarkError> {
         let name = key_name(idx);
         match self.values.get_mut(idx) {
@@ -309,7 +310,7 @@ impl DetailFields {
         }
     }
 
-    /// 何も無ければ `Ok(None)`（足す前の印）。値が読めなければその key の `BadValue`。`rN` は `r1` から途切れず並ぶこと。
+    /// 何も無ければ`Ok(None)`（足す前の印）。値が読み取れなければそのkeyの`BadValue`。`rN`は`r1`から途切れず並ぶこと。
     pub fn finish(self) -> Result<Option<MatchDetail>, MarkError> {
         if self.values.iter().all(Option::is_none) {
             return Ok(None);
@@ -463,7 +464,7 @@ mod tests {
         for k in &keys {
             assert!(ALLOWED_KEYS.contains(k), "{k}");
         }
-        // 接続 ID・ルーム名・接続コード・IP・ポートの欄は無い。
+        // 接続ID・ルーム名・接続コード・IP・ポートのフィールドは無い。
         for k in ALLOWED_KEYS {
             for forbidden in ["room", "conn", "code", "ip", "addr", "port", "host", "sid"] {
                 assert_ne!(k, forbidden);
@@ -519,7 +520,7 @@ mod tests {
             );
         }
         assert_eq!(err(&[("r1", "1.2")]), MarkError::BadValue("r1"));
-        // r1 が無いのに r2 がある（途切れている）。
+        // r1が無いのにr2がある（途切れている）。
         assert_eq!(err(&[("r2", &r2)]), MarkError::BadValue("r2"));
         assert_eq!(err(&[("r1", &r1), ("r3", &r2)]), MarkError::BadValue("r3"));
     }
@@ -538,7 +539,7 @@ mod tests {
                 .unwrap();
             assert_eq!(back, d);
         }
-        // 席は 1P . 2P の順。
+        // サイドは1P . 2Pの順。
         let d = feed(&[("charge", "1.0")]).finish().unwrap().unwrap();
         assert_eq!(d.charge, Some([1, 0]));
         // 無いときは出さない。

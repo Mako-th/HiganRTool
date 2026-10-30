@@ -1,8 +1,8 @@
-//! 受信のリング: 受信スレッド（書き手 1 本）が受けた生のデータグラムを書き、ゲームスレッド（読み手 1 本）が tick の始まりと相手を待つ間に取り出す。
+//! 受信のリング: 受信スレッド（書き手1本）が受けた生のデータグラムを書き、ゲームスレッド（読み手1本）がtickの始まりと相手を待つ間に取り出す。
 //!
-//! - 中身の解析はしない（生のバイト列と送り元のアドレスだけ）。例外は PING だけで、受信スレッドがその場で PONG を返し（`net_udp` の `answer_ping`）、返したことを枠の印（`push_marked` / `pop_marked`）でセッションへ知らせる。
-//! - 書き手だけが「書いた数」、読み手だけが「読んだ数」を `Release` で進め、相手側は `Acquire` で読んでから枠を読み書きする。枠は原子変数の配列（4 バイトずつ `Relaxed`）なので unsafe が要らない。
-//! - 満杯なら新しい方を捨てて数える。`MAX_DATAGRAM` を超えたものも捨てて数える。
+//! - 中身の解析はしない（生のバイト列と送り元のアドレスだけ）。例外はPINGだけ。受信スレッドがその場でPONGを返し（`net_udp`の`answer_ping`）、返したことを枠のフラグ（`push_marked` / `pop_marked`）でセッションへ知らせる。
+//! - 書き手だけが「書いた数」を、読み手だけが「読んだ数」を`Release`で進める。相手側は`Acquire`で読んでから枠を読み書きする。枠はアトミック変数の配列（4バイトずつ`Relaxed`）なのでunsafeが要らない。
+//! - 満杯なら新しい方を捨てて数える。`MAX_DATAGRAM`を超えたものも捨てて数える。
 //!
 //! 読み手の側（`pop`）はゲームスレッドで走るので、確保・ロック待ち・パニックしうる添字を使わない。
 #![forbid(unsafe_code)]
@@ -12,19 +12,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use higanr_core::wire::MAX_DATAGRAM;
 
-/// 枠の数。ゲームスレッドは 1 フレームに少なくとも 1 回は空にし、相手が送るのは 4 ms ごとの送り直しと PING などなので、
-/// 1 フレームに届くのは多くて十数通の見込み。64 あれば溢れない。
+/// 枠の数。ゲームスレッドは1フレームに少なくとも1回は空にする。
+/// 相手が送るのは4 msごとの再送とPINGなどなので、1フレームに届くのは多くて十数通の見込み。64あれば溢れない。
 pub const RING_SLOTS: usize = 64;
 const WORDS: usize = MAX_DATAGRAM.div_ceil(4);
-/// 送り元のアドレスを詰める語の数（種類・ポート・アドレス 4 語・flowinfo・scope_id）。
+/// 送り元のアドレスを詰めるワードの数（種類・ポート・アドレス4ワード・flowinfo・scope_id）。
 pub(crate) const ADDR_WORDS: usize = 8;
 
 struct Slot {
     len: AtomicU32,
-    /// 受けた時刻（µs。下位・上位の 32 bit。書き手が `recv_from` から戻った直後に読んだ時計）。
+    /// 受けた時刻（µs。下位・上位の32 bit。書き手が`recv_from`から戻った直後に読んだ時計）。
     t_lo: AtomicU32,
     t_hi: AtomicU32,
-    /// 受信スレッドがこの 1 通（PING）にその場で PONG を返したか（0 / 1。`higanr_core::pong`）。
+    /// 受信スレッドがこの1通（PING）にその場でPONGを返したかどうか（0 / 1。`higanr_core::pong`）。
     pong_sent: AtomicU32,
     addr: [AtomicU32; ADDR_WORDS],
     data: [AtomicU32; WORDS],
@@ -110,13 +110,13 @@ impl RecvRing {
         }
     }
 
-    /// 書き手（受信スレッド）: 1 通を、受けた時刻 `t_us` と一緒に書く。捨てたら false。印なし（リングの検査が使う短い形）。
+    /// 書き手（受信スレッド）: 1通をその受信時刻`t_us`と一緒に書く。捨てたらfalse。フラグなし（リングの検査が使う短い形）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn push(&self, from: SocketAddr, bytes: &[u8], t_us: u64) -> bool {
         self.push_marked(from, bytes, t_us, false)
     }
 
-    /// `push` と同じ。`pong_sent` は、受信スレッドがこの 1 通にその場で PONG を返したか（読み手のセッションが PONG を重ねないための印）。
+    /// `push`と同じ。`pong_sent`は受信スレッドがこの1通にその場でPONGを返したかどうか（読み手のセッションがPONGを重ねないためのフラグ）。
     pub fn push_marked(&self, from: SocketAddr, bytes: &[u8], t_us: u64, pong_sent: bool) -> bool {
         if bytes.len() > MAX_DATAGRAM {
             self.dropped_big.fetch_add(1, Ordering::Relaxed);
@@ -150,12 +150,12 @@ impl RecvRing {
         true
     }
 
-    /// 読み手（ゲームスレッド）: 1 通を `buf` へコピーして取り出す（送り元・長さ・受けた時刻）。無ければ None。確保しない。
+    /// 読み手（ゲームスレッド）: 1通を`buf`へコピーして取り出す（送り元・長さ・受けた時刻）。無ければNone。確保しない。
     pub fn pop(&self, buf: &mut [u8; MAX_DATAGRAM]) -> Option<(SocketAddr, usize, u64)> {
         self.pop_marked(buf).map(|(a, n, t, _)| (a, n, t))
     }
 
-    /// `pop` と同じ。4 つ目は書き手が添えた「PONG を返した」の印（`push_marked`）。確保しない。
+    /// `pop`と同じ。4つ目は書き手が添えた「PONGを返した」フラグ（`push_marked`）。確保しない。
     pub fn pop_marked(
         &self,
         buf: &mut [u8; MAX_DATAGRAM],
@@ -196,7 +196,7 @@ impl RecvRing {
 
 #[cfg(test)]
 mod tests {
-    //! 2 本のスレッドの間で書き終える前の枠を読まないこと（`Release` / `Acquire` の抜け）と、取り出しで確保しないことも見る。
+    //! 2本のスレッドの間で書き終える前の枠を読まないこと（`Release` / `Acquire`の抜け）と、取り出しで確保しないことも見る。
     use super::*;
     use std::sync::Arc;
 
@@ -278,11 +278,11 @@ mod tests {
     fn two_threads_see_every_datagram_whole_and_in_order() {
         // 書き手は通し番号を全部のバイトに書く。読み手は、どの枠も全部のバイトが同じ番号で、番号が
         const N: u32 = 20_000;
-        // 時刻は上位と下位の 32 bit がどちらも番号で変わる値（片方だけコピーすると食い違う）。
+        // 時刻は上位と下位の32 bitがどちらも番号で変わる値（片方だけコピーすると食い違う）。
         fn stamp(n: u32) -> u64 {
             (u64::from(n) << 32) | u64::from(n.wrapping_mul(0x9E37_79B9))
         }
-        // 時間切れ（どちらのループも 30 秒で落とす。止まった検査が全体を止めない）。読み手が落ちたら
+        // 時間切れ（どちらのループも30秒で落とす。止まった検査が全体を止めない）。読み手が落ちたら
         const LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
         struct Abort(Arc<std::sync::atomic::AtomicBool>);
         impl Drop for Abort {

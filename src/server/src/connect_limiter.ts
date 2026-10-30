@@ -1,10 +1,11 @@
-// 接続の回数を数える Durable Object。鍵（IPv4 または IPv6 の /64。rules.ts の connectLimitKey）ごとに 1 つ（idFromName）。
-// 入口（index.ts）がルームの Durable Object へ渡す前に hit() を 1 回呼ぶ。数え方と理由は rules.ts の slideConnectWindow。
+// 接続の回数を数えるDurable Object。鍵（IPv4またはIPv6の /64。rules.tsのconnectLimitKey）ごとに1つ（idFromName）。
+// 入口（index.ts）がルームのDurable Objectへ渡す前にhit()を1回呼ぶ。数え方と理由はrules.tsのslideConnectWindow。
 //
-// 許した時刻（最大 CONNECT_LIMIT_PER_MINUTE 個）をストレージに 1 つの値として持つ。メモリだけにしないのは、使われていない
-// Durable Object は数秒で退去してメモリの数えが消え、「上限回接続して、退去を待って次の上限回」で 60 秒に上限の 2 倍通せてしまうため。
-// 書くのは許した回だけ（叩かれても書き込みが増えない）。古い IP の行は、最後の許した回の 60 秒後のアラームで全部消す。
-// ログには何も書かない（鍵は IP なので）。
+// 許した時刻（最大CONNECT_LIMIT_PER_MINUTE個）をストレージに1つの値として持つ。
+// メモリだけにしないのは、使われていないDurable Objectが数秒で退去してメモリ上の回数が消えるため。
+// そうなると「上限回接続して退去を待ち、また上限回接続する」ことで、60秒に上限の2倍を通せてしまう。
+// 書くのは許した回だけ（叩かれても書き込みが増えない）。古いIPの行は最後の許した回の60秒後のアラームで全部消す。
+// ログには何も書かない（鍵はIPなので）。
 
 import { DurableObject } from "cloudflare:workers";
 import { CONNECT_WINDOW_MS, slideConnectWindow } from "./rules";
@@ -16,21 +17,21 @@ export class ConnectLimiter extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    // 起動したときに前の数えを読み直す（読み終わるまで他の要求を入れない）。
+    // 起動時に前の回数を読み直す（読み終わるまで他の要求を受け付けない）。
     void ctx.blockConcurrencyWhile(async () => {
       this.stamps = (await ctx.storage.get<number[]>(KEY)) ?? [];
     });
   }
 
-  /** この鍵の接続を 1 回数える。許すなら true、期間の中で上限に達していたら false。 */
+  /** この鍵の接続を1回数える。許すならtrue、期間の中で上限に達していたらfalse。 */
   async hit(): Promise<boolean> {
     const now = Date.now();
     const r = slideConnectWindow(this.stamps, now);
     this.stamps = r.stamps;
     if (!r.allowed) return false;
     await this.ctx.storage.put(KEY, r.stamps);
-    // アラームの有無は記憶から直に見る。「行が空 = アラーム無し」と推測すると、put の成功後に setAlarm が投げた回の次から、
-    // 行があるのにアラームが無くなり、行が永久に残る。
+    // アラームの有無はストレージから直接調べる。
+    // 「行が空 = アラーム無し」と推測すると、putが成功した後にsetAlarmが例外を投げたとき、次回から行があるのにアラームが無い状態になり、行が永久に残る。
     if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(now + CONNECT_WINDOW_MS);
     return true;
   }

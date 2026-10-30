@@ -1,10 +1,10 @@
-//! メニューで決めた設定（プレイヤー名・ルーム名・同期方式・ディレイ・サイド）を `HiganRTool.ini` の該当の 1 行へ書き戻す（unsafe 無し）。
+//! メニューで決めた設定（プレイヤー名・ルーム名・同期方式・ディレイ・サイド）を`HiganRTool.ini`の該当の1行へ書き戻す（unsafe無し）。
 //!
-//! - 設定の原本は ini 1 つ。決まった時点で書くので、ini とメニューはいつも同じ値になり、「どちらが優先」の規則は無い。
-//! - 書くのは決めた tick で作った別のスレッド。ゲームのスレッドはスレッドを 1 本作るだけで、確保・ファイルの I/O を足さない。
-//! - 続けて決めたとき、古い頼みが新しい値を上書きしないよう、頼みごとに番号を振り、書く直前（ini のロックの中）で最新かをチェックする。
-//! - 行の書き換えは `higanr_core::ini_edit`、ファイルの出し入れは `ini_store`。サイドの「おまかせ」は `host_seat` の行を消す（読み手は行が無ければおまかせ）。
-//! - 以前のバージョンが別ファイルに覚えていた名前・ルーム名は、起動のとき `migrate_legacy` が ini へ移して消す。
+//! - 設定の原本はini 1つ。決まった時点で書くのでiniとメニューはいつも同じ値になる。「どちらが優先」の規則は無い。
+//! - 書くのは決めたtickで作った別のスレッド。ゲームのスレッドはスレッドを1本作るだけ。確保・ファイルのI/Oは足さない。
+//! - 続けて決めたときに古い頼みが新しい値を上書きしないよう、頼みごとに番号を振って書く直前（iniのロックの中）で最新かどうかをチェックする。
+//! - 行の書き換えは`higanr_core::ini_edit`。ファイルの出し入れは`ini_store`。サイドの「おまかせ」は`host_seat`の行を消す（読み手は行が無ければおまかせ）。
+//! - 以前のバージョンが別ファイルに覚えていた名前・ルーム名は、起動時に`migrate_legacy`がiniへ移して消す。
 
 #![forbid(unsafe_code)]
 
@@ -23,14 +23,14 @@ use higanr_core::wire::SeatWish;
 
 use crate::net_config::{DEFAULT_NAME, SECTION};
 
-/// 起動のときに読んだ ini のパス（メニューを組み込むとき 1 回だけ設定する）。無ければ（ini なしの実行）書かずに本ログへ出す。
+/// 起動時に読んだiniのパス（メニューを組み込むときに1回だけ設定する）。無ければ（iniなしの実行）書かずに本ログへ出す。
 static TARGET: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn set_target(path: Option<PathBuf>) {
     let _ = TARGET.set(path);
 }
 
-/// 頼みの番号。取るのはゲームのスレッド、見るのは書くスレッドの ini のロックの中。
+/// 頼みの番号。取るのはゲームのスレッド。見るのは書くスレッドのiniのロックの中。
 struct Seq(AtomicU32);
 
 impl Seq {
@@ -60,7 +60,7 @@ fn report(what: &str, r: Result<bool, String>) {
     }
 }
 
-/// 頼みに番号を振り、別のスレッドで書く。`target` が無ければ書かずに本ログへ出す。
+/// 頼みに番号を振って別のスレッドで書く。`target`が無ければ書かずに本ログへ出す。
 fn ask(
     what: &'static str,
     target: Option<PathBuf>,
@@ -112,7 +112,7 @@ fn room_job(t: Option<PathBuf>, n: RoomBuf) -> Option<std::thread::JoinHandle<()
     })
 }
 
-/// 同期方式かディレイを替えた（ゲームのスレッド）。どちらを替えても 2 行とも書く。
+/// 同期方式かディレイを替えた（ゲームのスレッド）。どちらを替えても2行とも書く。
 pub fn save_shape(pick: Pick, delay: DelayChoice) {
     shape_job(target(), pick, delay);
 }
@@ -141,7 +141,7 @@ fn seat_job(t: Option<PathBuf>, wish: SeatWish) -> Option<std::thread::JoinHandl
     })
 }
 
-/// LAN のホストのアドレスを決めた（ゲームのスレッド）。
+/// LANのホストのアドレスを決めた（ゲームのスレッド）。
 pub fn save_lan_host(a: LanAddr) {
     lan_host_job(target(), a);
 }
@@ -155,7 +155,7 @@ fn lan_host_job(t: Option<PathBuf>, a: LanAddr) -> Option<std::thread::JoinHandl
     )
 }
 
-/// 以下の `write_*` は、`is_latest` が真のときだけ書く（偽なら `Ok(false)`）。
+/// 以下の`write_*`は`is_latest`が真のときだけ書く（偽なら`Ok(false)`）。
 pub fn write_name(
     path: &Path,
     n: &NameBuf,
@@ -172,7 +172,7 @@ pub fn write_name(
     )
 }
 
-/// `lan_host` の行（ポートが既定なら省いた形）。
+/// `lan_host`の行（ポートが既定なら省いた形）。
 pub fn write_lan_host(
     path: &Path,
     a: LanAddr,
@@ -205,7 +205,7 @@ pub fn write_room(
     )
 }
 
-/// ルームへ入った名を `room` に書く（見張りのスレッドから。その場で書く）。これより前に頼んだ書き込みは捨てる。
+/// ルームへ入った名を`room`に書く（監視のスレッドから。その場で書く）。これより前に頼んだ書き込みは捨てる。
 pub fn remember_room(path: &Path, n: &RoomBuf) -> Result<bool, String> {
     ROOM_SEQ.next();
     write_room(path, n, || true)
@@ -275,7 +275,7 @@ fn legacy_room(text: &str) -> Option<String> {
     room_input::parse_last(text).map(|r| r.as_str().to_string())
 }
 
-/// 配る ini の `name` のまま（利用者がまだ決めていない）なら、名前のファイルの値を移す。
+/// 配布用のiniの`name`のまま（利用者がまだ決めていない）なら名前のファイルの値を移す。
 fn name_is_default(v: &str) -> bool {
     v == DEFAULT_NAME
 }
@@ -284,7 +284,7 @@ fn room_is_default(_v: &str) -> bool {
     false
 }
 
-/// 以前のバージョンが保存先（`code_dir`）に覚えていた名前とルーム名を ini へ移す（起動のとき 1 回、ini を読む前に）。
+/// 以前のバージョンが保存先（`code_dir`）に覚えていた名前とルーム名をiniへ移す（起動時にiniを読む前に1回）。
 /// 返すのは本ログ用の文。
 pub fn migrate_legacy(ini_path: &Path, code_dir: &Path) -> Vec<String> {
     ini_store::migrate(
@@ -449,7 +449,7 @@ mod tests {
             assert_eq!(start_auto, auto);
         }
         let text = std::fs::read_to_string(&p).unwrap();
-        // [pacing] の mode には触らない。
+        // [pacing]のmodeには触らない。
         assert!(text.contains("[pacing]\r\nmode = auto\r\n"), "{text}");
         assert_eq!(text.matches("mode = ").count(), 2, "{text}");
     }
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(s.lan_host, Some(a));
         assert_eq!(s.mode, Mode::Delay);
         assert!(s.ini_notes.is_empty());
-        // 「おまかせ」は host_seat の行を足して消す。元の行数に戻る。
+        // 「おまかせ」はhost_seatの行を足して消す。元の行数に戻る。
         write_seat(&p, SeatWish::P2, || true).unwrap();
         assert_eq!(lines(&p), n + 1);
         write_seat(&p, SeatWish::Any, || true).unwrap();
@@ -628,7 +628,7 @@ mod tests {
         let logs = migrate_legacy(&t.0.join("none.ini"), &code);
         assert_eq!(logs.len(), 1);
         assert!(code.join("player_name.txt").exists());
-        std::fs::write(code.join("room_last.txt"), "has space\n").unwrap();
+        std::fs::write(code.join("room_last.txt"), "has/slash\n").unwrap();
         let p = t.ini(INI);
         migrate_legacy(&p, &code);
         assert!(

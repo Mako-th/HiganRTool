@@ -20,8 +20,9 @@ This document was written by AI (see "[About the use of AI](./README.en.md#about
 8. [Replays](#8-replays)
 9. [Automatic updates](#9-automatic-updates)
 10. [Logs and personal data](#10-logs-and-personal-data)
-11. [Building and testing](#11-building-and-testing)
-12. [Prior work](#12-prior-work)
+11. [Security](#11-security)
+12. [Building and testing](#12-building-and-testing)
+13. [Prior work](#13-prior-work)
 
 
 ## 1. Overview
@@ -32,7 +33,7 @@ The game is 32-bit, so every Rust part is built for `i686-pc-windows-msvc` (stat
 - **Loader** (`src/loader`, `HiganRTool.exe`): Starts the game suspended, makes it load the DLL, and then lets it run. Before that, it checks for updates.
 - **DLL** (`src/dll`, `HiganRTool.dll`): The main part, running inside the game process. It handles hooks, reading and writing game memory, drawing, sending and receiving UDP, and talking to the room server.
 - **Core** (`src/core`): Protocol encoding and decoding, the connection state machine, the lockstep and rollback state machines, connection codes, replay parsing, and so on. It does not depend on Win32, and `#![forbid(unsafe_code)]` forbids `unsafe`. Every byte that arrives from the network is parsed here.
-- **Room server** (`src/server`): A small server on Cloudflare Workers and Durable Objects. It only relays connection codes, runs the random-match queue and the spectator list, and redirects update downloads.
+- **Room server** (`src/server`): A small server on Cloudflare Workers and Durable Objects. It only relays connection codes, runs the random-match queue and the spectator list, issues seat tickets for spectating rooms, and redirects update downloads.
 - **Fake opponent** (`src/peer_sim`, `peer_sim.exe`): A test opponent that speaks the protocol without the game. It is not shipped.
 - **Manifest signing tool** (`src/manifest_sign`): Used by the distributor to sign the update manifest. It is not shipped.
 - **Replay Repair Tool** (`HiganRTool_replay_fix.exe`): Fixes the header of replays saved by v1.0.0 when the two players used different charge settings. It never changes the original files.
@@ -59,7 +60,7 @@ flowchart LR
 ```
 
 Match traffic goes directly between the two players' PCs over UDP.
-The room server is used only until the players find each other; match traffic never passes through it.
+The room server is used only until the players find each other; match traffic never passes through it (during the match, only a connection that keeps the room name in use stays open).
 
 
 ## 2. Hooking into the game
@@ -151,7 +152,8 @@ HiganRTool uses the same building blocks as the game's own built-in netplay.
    For this, the input the game itself reads for both players combined is added.
    So if a different gamepad is selected as the 2P input device and it is connected, that gamepad's input is mixed in as well.
    Until the match is set, input is read the game's own way.
-2. Only the bits for Z, X, Shift, Esc, Ctrl and the directions are sent (Ctrl is used for skipping dialogue and random character / map select). The opponent's bits also take effect on your side, so keys such as the screenshot key are not sent.
+2. Only the bits for Z, X, Shift, Esc, Ctrl and the directions are sent (`MATCH_SEND_MASK` = `0x01FF`; `src/core/src/input_model.rs`. Ctrl is used for skipping dialogue and random character / map select). The opponent's bits also take effect on your side, so keys such as the screenshot key are not sent.
+   The values received from the opponent are also masked the same way before they are given to the game. Even if an opponent using a modified tool sets other bits, they do not trigger screenshots or the like on your PC.
 3. It orders the two values by seat and lets the game's own input-building function produce all three parts. The previous value, press and release edges, and key repeat are produced by the game itself, so the rules are exactly those of the unmodified game.
 
 The local input is read at the same point as in the unmodified game (the start of the input update), so reading input adds no delay.
@@ -289,7 +291,7 @@ Every packet starts with a 12-byte header:
 | Offset | Size | Content |
 |---:|---:|---|
 | 0 | 4 | magic `"HGRT"` |
-| 4 | 1 | Protocol version (currently 9) |
+| 4 | 1 | Protocol version (currently 10) |
 | 5 | 1 | Type |
 | 6 | 2 | Reserved (0) |
 | 8 | 4 | session_id (random number chosen by the side that starts the connection) |
@@ -302,7 +304,7 @@ Each type has a fixed body length, and packets of the wrong length are dropped.
 | Value | Name | Direction | Content |
 |---:|---|---|---|
 | 1 | HELLO | Both | Starts the connection. Name, preferred netcode, random number that decides the coordinator, seat preference, whether spectators are accepted, whether the host-selection method is used, build number, ephemeral public key, NAT type, D for rollback |
-| 2 | HELLO_ACK | Both | Reply to HELLO, including the public key |
+| 2 | HELLO_ACK | Both | Reply to HELLO, including the sender's public key and the public key of the HELLO it answers |
 | 10 | AGREE | Coordinator → peer (the peer echoes the same content back) | Fixed 14 bytes. The host's seat, netcode, delay (or D), which side is the host, and the upstream bandwidth and NAT type of both sides used to decide |
 | 3 | INPUT | Both | seg, ack (the next apply_frame needed from the peer), first apply_frame, inputs (up to 32), delay change schedule, timestamps for measuring the round trip (own send time, plus the send time of the last INPUT received from the peer and how long it was held) |
 | 4 | CHECK | Both | Sync check (3-6) |
@@ -316,8 +318,8 @@ Each type has a fixed body length, and packets of the wrong length are dropped.
 | 23 | PROBE_RESULT | Non-coordinator → coordinator (before the connection only) | The upstream bandwidth of the coordinator, estimated from the PROBE train (B/s; 0 means it could not be measured) |
 | 15 | BYE | Both | End (finished, disconnected, desync, cancelled) |
 | 13 | SPECTATE_JOIN | Spectator → host or relay | Request to spectate. Name, fast-forward speed (`ff_max`), build number, public key, relay fields (public key for relaying, NAT type, number of parent changes (epoch), record number to resume from, candidate addresses) |
-| 14 | SPECTATE_STREAM | Host or relay → spectator | Spectator records (up to 16) |
-| 19 | SPECTATE_ACK | Spectator → host or relay | What was received (end of the contiguous range, plus a bitmap of up to 511 records after it), relay status (number of descendants, and "do not introduce"), number of the last admission request received |
+| 14 | SPECTATE_STREAM | Host or relay → spectator | Spectator records (up to 16). To a spectator that has not acknowledged yet, also a cookie (8 bytes) |
+| 19 | SPECTATE_ACK | Spectator → host or relay | What was received (end of the contiguous range, plus a bitmap of up to 511 records after it), relay status (number of descendants, and "do not introduce"), number of the last admission request received, and the cookie (echoed unchanged if the last STREAM received carried one) |
 | 24 | SPECTATE_INTRO | Host → spectator | Introduction of a relay. The spectator's nonce and epoch, the relay's public key for relaying, the relay's candidate addresses |
 | 25 | SPECTATE_ADMIT | Host → relay | Request to admit a child. Request number, number of the record where the child starts, the child's nonce, epoch, public key and candidate addresses |
 | 26 | SPECTATE_REHOME | Relay → child | No body. A signal from the relay telling its children that it will not forward records to them any more, so they should go back to the original host |
@@ -330,6 +332,9 @@ When both sides announce in HELLO that they use the host-selection method, the h
 
 1. **NAT type**: If only one side is unreachable from its peer (symmetric NAT without UPnP), the other side is the host. If either side's type is unknown, this step does not decide.
 2. **Upstream bandwidth**: After receiving the peer's HELLO, each side sends 10 PROBE packets back to back to the source of that HELLO. The receiver estimates the peer's upstream bandwidth as (difference between the largest and smallest sequence numbers received) × 1200 bytes ÷ (difference between the arrival times of those two packets). If one side is at least 1.25 times the other, the higher one is the host.
+   At most 4 PROBE trains (`host_pick::MAX_PROBE_TRAINS`) are sent per connection (including restarts of the procedure); beyond that, the host is decided without comparing bandwidth.
+   To a HELLO from a source that is not among the connection code's candidates, at most 1 train is sent per connection (it does not count toward the trains sent to the real peer).
+   A PROBE is 1200 bytes, so this limits how much someone who captured a HELLO and spoofs its source can make the tool send PROBEs to another PC.
 3. **role_nonce**: Otherwise the side with the larger role_nonce (the coordinator) is the host.
 
 The non-coordinator returns its estimate in PROBE_RESULT.
@@ -368,6 +373,9 @@ nonce    = 4 zero bytes || sender id (1 byte) || sequence number (7 bytes)
 - **Ephemeral keys**: A new X25519 private key is generated from the OS random number generator for each connection, and the public keys are exchanged in HELLO / HELLO_ACK. "First" is the side with the larger HELLO random number for a match, and the side that forwards (the host, or a relay) for spectating.
 - **No nonce reuse**: The sender id is fixed per sending thread, and each sender's sequence number counts up from 0 and is never reset, so the same nonce is never used twice with the same key.
 - **Weak public keys**: If a public key would make the shared value zero, no keys are derived.
+- **Replies to old HELLOs**: The ephemeral key is drawn again whenever the connection handshake is restarted.
+  HELLO_ACK carries the public key of the HELLO it answers, so the receiver compares it with its current public key and recognizes replies to HELLOs from before the restart (including ones that were captured and replayed).
+  Such replies do not select a path, and their source address is not added to the candidates.
 
 Because the keys are ephemeral, recorded traffic cannot be decrypted even if the secret or the connection code leaks later (forward secrecy).
 Spectating uses the same scheme, with separate keys for each spectator.
@@ -382,7 +390,7 @@ The key between a relay and its child is derived with the same formula from a th
 
 ### 4-4. Version and build number
 
-- **Protocol version** (currently 9; `wire::PROTO_VER`): Carried in the header, in HELLO and at the start of the connection code. A peer with a different version is refused before connecting, as "the peer's version is different", after its tag has been verified. There is no backward compatibility.
+- **Protocol version** (currently 10; `wire::PROTO_VER`): Carried in the header, in HELLO and at the start of the connection code. A peer with a different version is refused before connecting, as "the peer's version is different", after its tag has been verified. There is no backward compatibility.
 - **Build number** (`update::BUILD_NUMBER`): An increasing number assigned to each released zip. It is carried in connection codes, HELLO and SPECTATE_JOIN, and a mismatch is refused before a single packet is encrypted. Synchronization depends on both players running the same code, so different builds never connect. Your own builds (number 0) connect only with other number-0 builds.
 
 
@@ -434,6 +442,15 @@ Both players send HELLO to every candidate of the other every 20 ms.
 A NAT lets in replies from addresses it has sent to, so when both sides send at the same time, a path opens.
 The first path that gets a reply is used; if nothing connects within 10 seconds, the procedure is restarted and keeps going.
 
+- **Sources that are not candidates**: When a HELLO with a valid tag arrives from an address that is not a candidate, the tool does not start sending HELLO to that address every 20 ms.
+  It answers each such packet with a single HELLO, and does not send HELLO_ACK.
+  When a HELLO_ACK of the current session (4-3) comes back from that address, the address is added to the learned candidates (up to 4; `candidate::MAX_LEARNED`).
+  With a peer whose router rewrites the port, this single answer is enough to connect in the same number of round trips as before.
+- **Candidates come first**: When the peer's HELLO arrives from a candidate in the connection code, a reply (HELLO_ACK, AGREE) from a learned source does not choose the path.
+  If the path was chosen at a learned source and a reply then arrives from a candidate, the path is switched to the candidate before the connection is made (`Paths::heard_back`, `Paths::prefer_code`; `src/core/src/candidate.rs`).
+  After the connection is made, the path does not change.
+  This is so that, when the peer is at a candidate, someone who replays a captured reply from another address cannot point the match path at that address (for the cases this does not cover, see 11-3).
+
 ### 5-5. Pairs that cannot connect
 
 - Both players are behind symmetric NATs, and neither can open a port (no UPnP).
@@ -441,6 +458,30 @@ The first path that gets a reply is used; if nothing connects within 10 seconds,
 
 There is no relay server (such as TURN).
 A relay would add latency and make a server carry match traffic.
+
+### 5-6. LAN
+
+In a LAN match, the connection code is passed over UDP on the LAN instead of through the room server (`src/core/src/lan_proto.rs`, `src/dll/src/lan_link.rs`).
+The requests are packets of a separate format starting with `HGLN`, on a socket separate from the game traffic (`HGRT`).
+The content of the code and the connection that follows (4, 5-4) are the same.
+
+- **Listening sockets**: The host opens a listening socket for each of its LAN addresses (the default port is 17723; `lan_addr::DEFAULT_PORT`).
+  It reads only requests whose source is in the LAN range (private and link-local addresses; on a socket for a VPN virtual LAN, that VPN's network).
+  It is not narrowed to the host's own subnet, so a peer on another subnet connected through a router is accepted too.
+  The opponent is the first one to arrive.
+- **Replies**: A reply to a request (connection code, watch code, refusal) is sent from the socket that received the request.
+- **How much is read**: At most 256 packets (`RECV_PER_POLL`) are read from one socket per pass, and the stop signal is checked between sockets.
+  This keeps a pass from never ending when a flood of requests arrives.
+- **Watch code**: While a match is set, the host answers spectators' requests with the watch code.
+  It answers the same IP at most once per 2 seconds (`lan_proto::WATCH_PER_IP_MS`) and at most 4 times per second for the whole host (`WATCH_PER_SEC`), and remembers up to 16 IPs.
+  Requests beyond that get no answer.
+  A watch code is larger than the request, so this limits how much someone who spoofs the source of a request can make the host send watch codes to another PC.
+  A spectator resends its request every 500 ms and gives up after 10 seconds, so a single lost answer is still in time.
+- **What this does not protect against**: The secret in the connection code crosses the LAN in plaintext.
+  Someone on the same LAN who only reads packets cannot read the match (it is encrypted with the ephemeral keys of 4-3).
+  Someone who can send packets can use a captured secret to cut in to the host before the real opponent.
+  The LAN request itself has no authentication.
+  The design trusts the LAN of the venue.
 
 
 ## 6. Room server
@@ -472,11 +513,11 @@ sequenceDiagram
   A->>S: Enter the room over WebSocket
   A->>S: offer (starting side's connection code)
   B->>S: Enter the room over WebSocket
-  S->>B: peer (A's code)
+  S->>B: peer (A's code, seat ticket)
+  S->>A: matched (seat ticket)
   B->>S: answer (replying side's connection code)
   S->>A: peer (B's code)
-  S-->>A: close
-  S-->>B: close
+  Note over A,B: Both keep their room connections open during the match (the room name stays in use)
   A->>B: HELLO over UDP (hole punching)
   B->>A: HELLO over UDP (hole punching)
   Note over A,B: From here on, direct UDP (encrypted)
@@ -484,16 +525,27 @@ sequenceDiagram
 
 The room's host / guest (the side that makes the code / the side that replies) is not the same thing as the match's host / guest (decided by the host-selection method in 4-2).
 
-- **Room names**: 1 to 32 characters. The client accepts only ASCII letters and digits and `-` `_` `@`. The server applies NFKC, trims surrounding whitespace and lowercases the name before looking up the room, so names that differ only in case are the same room.
-- **Timeouts**: 10 minutes from when the first person enters. Once the guest has arrived, the answer must come within 1 minute. When a room expires, the client enters again automatically.
+- **Room names**: 1 to 32 characters. The client accepts only the printable ASCII characters (0x20 to 0x7E) except `` ` ``, `;` and `/`, and removes surrounding spaces. It refuses names starting with `w.` or `q.` (used for spectator rooms and random match assignments). The server applies NFKC, trims surrounding whitespace and lowercases the name before looking up the room, so names that differ only in case are the same room.
+- **Timeouts**: 10 minutes from when the first person enters. Once the guest has arrived, the answer must come within 1 minute. When a room expires, the client enters again automatically. After the match is made, the room no longer times out.
 - **Keepalive**: The client sends a ping every 30 seconds. The server answers it automatically without waking the Durable Object.
+  After the match is made, the server treats the time of that automatic answer as a sign of life.
+  An alarm every 5 minutes closes any connection whose last sign is older than 90 seconds, closes the other connection too, and frees the room.
+- **Room name in use**: After the host has received the guest's code and the match is made, both players keep their WebSocket to the room open for the whole match and send only pings.
+  They close it when they return to the title screen, stop netplay, or their connection to the opponent ends.
+  While two people are in a room (before or after the match is made), a third person entering the same room name is refused with 409 `room_in_use` (the screen shows "This room name is in use.").
+  If either player leaves after the match is made, the server closes the other one too and frees the room.
+  If the server closes the connection after the match is made, the client does nothing to the match and does not enter the room again (the room name then becomes free; see 11-3).
+  A spectating room (7) closes both connections once the spectator has sent its reply, and refuses a third person with 409 `room_full`.
+- **Seat ticket**: When the two players first meet, the server gives a seat ticket for the spectating room to the room's host in `matched` and to the room's guest in `peer` ("Seat in the spectating room" in 7).
+  A server without its secret key (`SEAT_KEY`), or with one shorter than 32 characters (`SEAT_KEY_MIN_CHARS`), gives no ticket.
+  The match is made with or without a ticket; without one, only spectating is unavailable ("Seat in the spectating room" in 7).
 
 ### 6-3. Random match
 
 - There is one queue per build number, so players on different builds are never paired.
 - Players are paired two at a time in order of arrival. Each pair gets a new room name (`q.` + 120 random bits as 30 hex digits), sent to both, and the queue connection is closed.
 - The two players then enter that room as in 6-2, and from there it works like a room match. An assigned room expires after 1 minute.
-- The client cannot type `.`, so assigned room names never collide with names typed by people, and they cannot be guessed.
+- The client refuses names starting with `w.` or `q.`, so assigned room names never collide with names typed by people, and they cannot be guessed.
 - A player can stay in the queue for 10 minutes; after that, the client re-enters automatically.
 
 ### 6-4. Spectator list
@@ -501,11 +553,18 @@ The room's host / guest (the side that makes the code / the side that replies) i
 This is the list of random matches in progress.
 
 - The list is posted by the match host of a random match, and only when both players have `[spectate] enable = 1`. The guest's setting reaches the host as one bit in the first packet of the connection (HELLO).
-- The host sends the assigned room name, both names, the netcode, the delay, and the number and limit of spectators to the server.
+- The host sends the assigned room name, both names, the netcode, the delay, the number and limit of spectators, and the seat ticket (6-2) to the server.
 - The server checks the format of the assigned room name and derives the spectating room name itself (`w.` + the first 8 bytes of the SHA-256 of the assigned room name, in hex). The server does not keep the assigned room name and never lists it. Arbitrary spectating room names cannot be posted, so spectating rooms for room matches never appear in the list.
+- The post is refused unless the ticket is valid and unexpired for that spectating room name. Someone without a ticket cannot post.
+  A ticket only shows that two connections met in a room with that name, so a ticket made with one's own two connections can be posted as well (11-3).
 - When the posting side's connection closes, the entry is removed.
 - The list holds up to 100 entries in total and up to 2 per IP address (per /64 for IPv6).
 - The server sends the whole list to viewers when they open it, and sends the whole list again whenever it changes (at most once per second).
+- Viewing connections are limited to 500 in total (`WATCH_VIEW_MAX_TOTAL`) and 3 per IP address (per /64 for IPv6; `WATCH_VIEW_MAX_PER_KEY`) (`src/server/src/rules.ts`, `src/server/src/watch_list.ts`).
+  When a 4th one arrives from the same IP, the oldest connection of that IP is closed.
+  A new connection beyond 500 in total is refused with 409.
+- The server closes a viewing connection with 4408 10 minutes after it was made (`WATCH_VIEW_TTL_MS`).
+  The client enters again without changing the screen.
 
 ### 6-5. What the server does not record
 
@@ -513,6 +572,7 @@ This is the list of random matches in progress.
 - The Worker code writes nothing to the logs (no room names, connection codes or IP addresses). The only exception is one fixed line when the connection counter itself fails.
 - The connection counter keys on the IPv4 address or the IPv6 /64 and keeps only the times of connections in the last 60 seconds. It is deleted 60 seconds after the last connection.
 - List entries (names and so on) are kept only while the posting side stays connected.
+- Seat tickets are neither stored nor logged. The host's connection to a spectating room keeps only the issue time of the ticket that took the seat.
 
 Match traffic does not go through the server and is encrypted, so the server cannot read the match (see also "What this does not protect against" in 4-3).
 
@@ -532,7 +592,43 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
   To reduce the host's upload as spectators increase, spectators can relay to each other (see "Relay tree" below).
 - **Limit**: 10 spectators. Descendants of a relay and spectators that have been introduced and are awaiting a reply are counted too.
 - **How to join**: For a room match, the host keeps re-entering a spectating room (`w.` + the first 8 bytes of the SHA-256 of the room name, in hex) as the host, leaving a spectating code there. A spectator enters the same room as the guest, receives the spectating code, and sends the host a reply carrying its own candidate addresses through the room. The host sends short packets to the spectator's candidates to open a path, then accepts the spectator's SPECTATE_JOIN. For a random match, the spectator enters the same spectating room from the list in 6-4.
+- **Seat in the spectating room**: Only a connection that puts a seat ticket, valid and unexpired for that spectating room name, in the URL query (`ticket=`) can take the host's seat of a spectating room (`src/server/src/ticket.ts`).
+  - A ticket is a string of the form `<issue UNIX seconds>.<expiry UNIX seconds>.<MAC>`, where the MAC is HMAC-SHA256 with the server's secret key (the Worker secret `SEAT_KEY`).
+    The signed text is a fixed purpose string, the spectating room name, the issue time and the expiry.
+    The client carries it without reading it.
+  - A ticket expires 24 hours after it is issued, and the same ticket is reused for the whole match (the host re-enters for each spectator).
+  - The client never sends the original room name to the server. The spectating room name is derived from the room name each player typed, and the ticket is made for that name.
+  - A connection without a ticket, or with an expired one, that reaches an empty spectating room is refused with 409 (spectators keep re-entering every 12 seconds to wait).
+    A ticket whose format or signature is wrong (including a ticket for another room) is refused with 400 `bad_ticket`. Re-entering would not change that, so the host stops entering.
+  - When a host arrives with a ticket issued later than that of the seated host, the server closes the previous host and its spectators, and gives the seat to the new host.
+    A match made later under the same room name wins, so nobody can take the seat in advance with an older ticket.
+    A match room stays in use during the match (6-2), so another match can be made under the same room name only after the first two players have left the room, or after their connection to the room has dropped during the match (11-3).
+    A host that has lost its seat re-enters every 5 minutes to check whether the seat is free.
+  - A spectator has 10 seconds from receiving the spectating code to send its reply.
+    A spectator that leaves without replying, or runs out of time, does not close the host's connection; the server hands the same code to the next spectator.
+  - If the server has no secret key, or is an older server that gives no tickets, the host neither enters the spectating room nor posts to the list. The match goes on.
+  - **What this does not protect**: Someone who knows the room name and uses a modified client to make their own match in the same room after the real match gets a newer ticket and can take the seat.
+    The match partner also holds a ticket, so the partner taking the seat cannot be prevented either (the same as for a random match).
 - **Stream**: The host puts everything that has been decided (selection screen input, selection results, match input, names, match status, verification, the end) into "records" with a single sequence number, and sends them. The spectator reports what it has received in an ACK to the host (or, if it is a child of a relay, to that relay), and the host resends only the missing records (the resend interval is based on the RTT).
+  The host makes an unguessable 8-byte value (a cookie) for each spectator and includes it in STREAMs to a spectator that has not acknowledged yet.
+  The cookie is the first 8 bytes of an HMAC-SHA256 with a key derived from the host's key seed, so even someone holding the spectating code cannot make it.
+  The spectator echoes the cookie it received in its next ACK.
+  Until an ACK with the matching cookie arrives, the host sends that spectator only the first packet and a keepalive every 100 ms, and drops it after 3 seconds (`UNACKED_MS`) without one.
+  An ACK with a wrong cookie is dropped.
+  A relay does the same toward its children.
+  Someone who spoofs the source of a JOIN never receives the STREAM, so they cannot make the first ACK.
+  This limits how much spectator records can be sent to a third party by spoofing the source of a JOIN.
+- **Whether a slot is alive**: The host and relays judge whether a spectator's slot is alive by the time the last sealed ACK arrived (`src/core/src/spectate.rs`).
+  A plaintext JOIN can be resent by anyone who captured it, so it is not used for this.
+  A spectator from whom no sealed ACK arrives for 10 seconds (`SILENT_MS`) is dropped.
+  A slot that has received an ACK within 3 seconds (`REJOIN_MS`) is not replaced by another spectator (a JOIN with a different nonce or public key).
+  The same spectator (nonce and public key) can have at most 2 slots, for its IPv4 and IPv6 paths.
+- **Input a spectator gives to the game**: A spectator applies the same mask as a match (`MATCH_SEND_MASK`; 2-4) to the input in the records (match, selection screens, screen changes) before giving it to the game (`src/dll/src/spectate_watch.rs`).
+  Even if the host sets bits such as the screenshot key (P/Home) in the records, they have no effect on the spectator's PC.
+  The input digest used for verification (see "Verification" below) is also computed from the masked input.
+- **Spectating connection deadline**: A spectator that came through a room gives up, as unable to connect, if no STREAM arrives from the host within 30 seconds (`LINK_TIMEOUT_MS`; `src/dll/src/spectate_join.rs`) after sending its reply.
+  The 30 seconds count from the first reply and are not extended when the spectating code is received again.
+  Through a watch code, the deadline is 10 seconds (`CODE_LINK_TIMEOUT_MS`) from when the spectator starts sending JOIN.
   The host may send a spectator records only up to 512 records (the send window, `SEND_WINDOW`) past the end of what that spectator has received contiguously.
   This is enough to carry the maximum fast-forward speed (about 1,000 records per second) without a gap, even on a line with a 300 ms round trip. The width of the received-range bitmap (sack) is matched to it at 511 records (4-2).
 - **Relay tree**: In random matches and room matches (spectating through the spectating room), spectators relay records to each other (`src/core/src/spectate/tree.rs`).
@@ -554,6 +650,18 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
   The relay accepts only the child named in the request (a JOIN whose nonce, epoch and public key match). The relay sends hole-punching packets to the child's candidates.
   The relay puts the records received from the host into its own ring buffer with their numbers unchanged, and forwards them to its children. The key with a child is derived from a throwaway key generated by the relay, with the same formula as in 4-3. The relay decrypts the records it receives and re-encrypts them with each child's key.
   A relay has no round trip of a match, so it is not throttled by round-trip growth (only the per-spectator limit applies).
+  - **Resending introductions**: When the same JOIN arrives again from the address of an introduced child, the host resends the introduction.
+    It resends at most once per 125 ms (`CHILD_RESEND_GAP_MS`; `src/core/src/spectate/tree.rs`).
+    An honest child resends its JOIN every 250 ms (`JOIN_RESEND_MS`), so every one of them is answered.
+    To a JOIN from a source that is not an introduced child, it answers at most once per 250 ms.
+    The child's address is the source of its first JOIN and may not be genuine, so this limits how much resent JOINs can make the host send introductions to a third party.
+  - **Number of introductions**: A spectator accepts at most 8 introductions (`MAX_INTROS`) in the last 60 seconds (`INTRO_WINDOW_MS`).
+    It does not accept introductions beyond that, or after it has the "direct only" mark, and keeps receiving directly from the original host.
+    A spectator sends JOINs to the relay's candidates on each introduction, so this keeps a hostile host from repeating introductions to make the spectator's PC send JOINs to a third party.
+  - **Filtering candidates**: The candidates in introductions and admission requests are filtered by the class of the address (loopback, LAN, internet; `guard::reach`), not by the declared candidate kind.
+    The host includes loopback and LAN addresses only when the two parties being introduced (the relay and the child) have the same public IP as seen by the host.
+    Spectators and relays do not use candidates of a narrower class than the original host (loopback and LAN candidates, when the host is across the internet).
+    So a relay and its child behind the same NAT go back to direct spectating after 3 seconds if the router does not support hairpin NAT.
 - **Returning from the tree**: A child that hears no records from its relay for 3 seconds (`REJOIN_MS`), or receives REHOME from it, advances its epoch by 1 and sends JOIN to the original host again, with the number of the record to resume from (`resume_from`).
   The host either introduces another relay or accepts the spectator directly. If it still has the records to resume from in its ring buffer, it streams from there.
   A child that gets no records from the relay within 3 seconds of the introduction goes back with a "direct only" mark and is not introduced again.
@@ -565,16 +673,18 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
   A spectator that has not connected yet keeps resending JOIN while waiting, and shows that the match is full when the wait times out. A spectator that was connected and could not be put back because the host was full stops spectating and shows on its own screen that the match is full.
   When a relay drops, the host holds seats so that its children can return to the original host. For 5 seconds after the relay is removed (`REJOIN_MS` + 2 seconds), as many seats as that relay had descendants are kept empty, and they count in the fullness check for new spectators.
   A returning spectator (identified by nonce and public key) can take a held seat even when the host is full. This puts returning spectators ahead of new ones.
+  Only children that the host sent to that relay can take a held seat (the host remembers up to 32). A spectator that only claims in its JOIN to be returning does not get a seat.
 - **Re-querying STUN**: While spectators are being served, the tool sends a Binding Request again every 15 seconds from the receiving socket to the same STUN server, even after the match connection is made (only when the destination is IPv4; `src/dll/src/net_udp.rs`).
   "While spectators are being served" means while the host is waiting for spectators in the spectating room, and while it is hosting a match in which both players allow spectating.
   When the match is connected over IPv6, the host's IPv4 port mapping can lapse and the port in the watch code can become stale. This was added on that assumption (the cause is an estimate).
-  When the external address or port changes, the watch code is rebuilt. If nobody has received the code that was posted, the host re-enters the spectating room and posts the new code.
+  When the external address or port changes, the watch code is rebuilt. If nobody has received the code that was posted, the host re-enters the spectating room and posts the new code. If a spectator has received it, the host stays in the seat until that spectator's reply window (10 seconds) plus 5 seconds has passed, and re-enters if it is still seated after that.
 - **Prioritizing the match**: So that spectator traffic does not congest the match, the spectator stream has a limit that is lowered when the round trip of the match grows (`src/core/src/spectate_rate.rs`).
   - **Limit**: Catch-up traffic per spectator is at most that spectator's fast-forward speed (`ff_max`) × the normal record rate × 1.25 (6,970 B/s when `ff_max` is 8). The normal record rate is one second of records sent packed 16 records per packet, as during catch-up (697 B/s). It is smaller than the one-packet-per-frame traffic to a caught-up spectator (about 3 KB/s) because the per-packet header and authentication tag are spread over 16 records. The total is at most the sum of the two largest limits. Normal traffic to spectators that have caught up is not counted against this limit.
   - **Measuring the round trip**: The round trip of the match is measured with every INPUT. INPUT carries its own send time and the send time of the last INPUT received from the peer together with how long it was held; subtracting the time the peer held it gives one sample.
-  - **Growth**: The growth is the difference between the minimum of the last 4 samples and the minimum over the last 10 seconds. Spectator traffic only goes through the host's upstream, so the growth in the peer-to-self direction is subtracted, leaving the time spent waiting in the host's own upstream.
-  - **Lowering**: When the growth exceeds 20 ms, the total limit is halved, down to 1/8. The interval between successive cuts is twice the usual round trip (100 to 1000 ms). If it keeps growing after the limit is fully lowered, traffic to spectators that have caught up is stopped as well (only keep-alive signals remain). If there has been no catch-up traffic in the last second, it is stopped at once instead of halved.
-  - **Restoring**: Once the growth is back to 10 ms or less, stopped traffic is restored after 1.5 seconds. The lowered limit is raised by 1/8 per second (back to full from the floor in 7 seconds). While the samples are older than 1.5 seconds (menus, pause), it neither lowers nor restores.
+  - **Growth**: The growth is the difference between the minimum over the last 2 seconds and the minimum over the last 10 seconds. Per-packet jitter (Wi-Fi and the like) disappears in the 2-second minimum while a queue in the upstream pushes up every sample, so jitter is not mistaken for congestion. The same difference is also taken over the minimum of the last 4 samples (about 67 ms) to catch a queue as it starts to form. Spectator traffic only goes through the host's upstream, so the growth in the peer-to-self direction is subtracted, leaving the time spent waiting in the host's own upstream.
+  - **Starting limit**: Each time catch-up traffic starts, the total limit is first lowered to 1/4 of the host's upstream and then raised from there. The host's upstream is the value the peer measured when connecting (the PROBE train used to choose the host). If it could not be measured (LAN and the like), it starts from the floor of 1/8. Without round-trip samples of a match (a relaying spectator sending to its children), it is not lowered, since it could not be raised again.
+  - **Lowering**: When the growth (2 seconds) exceeds 20 ms, or the growth over the last 4 samples exceeds 60 ms, the total limit is halved, down to 1/8. The interval between successive cuts is twice the usual round trip (100 to 1000 ms). If it keeps growing after the limit is fully lowered, traffic to spectators that have caught up is stopped as well (only keep-alive signals remain). If there has been no catch-up traffic in the last second, it is stopped at once instead of halved.
+  - **Restoring**: Once the growth is back to 10 ms or less, stopped traffic is restored after 1.5 seconds. The lowered limit is raised by 1/8 per second, only while the growth over the last 4 samples is also 10 ms or less (back to full from the floor in 7 seconds). While the samples are older than 1.5 seconds (menus, pause), it neither lowers nor restores.
 - **Margin**: A spectator starts playing once 3 frames of records have built up (so it is shown about 50 ms behind the host). This delay applies only to spectators, never to the two players.
   Records keep being received even while the game is stopped (for example, while the window is being dragged). Up to about one hour of records is held; when that fills up, the watch ends.
 - **Catching up**: A spectator who joins mid-match receives everything from the start of the current seg. On the spectator's side, time spent on the selection screens is skipped, and while more than 6 frames of match input are queued, the game update is run several times per drawn frame to fast-forward. Normal speed resumes at 3 frames or fewer.
@@ -588,7 +698,7 @@ A message is limited to 2048 bytes and a connection code to 1024 characters; any
   If its parent is a relay, the mismatched record came from that relay, and the local pause has not gone out of step, the spectator sends BYE to that relay and goes back to the original host with the "direct only" mark. This is so that a relay that rewrites records can be noticed.
   Name, match status and verification records do not advance match time, so they are excluded from the buffered-record count, fast-forward and pacing.
 - **Refusing**: If either player has `[spectate] enable = 0`, no match can be watched.
-  In a random match, the match is not posted to the list. In a room match, the host enters the spectating room and sends a refusal to the spectator. The room server then closes the spectator's connection with code 4403, so the spectator learns of the refusal right away. With connection codes, no watch code is made. With LAN, the host sends a refusal to the spectator (reason `WatchOff`).
+  In a random match, the match is not posted to the list. In a room match, the host enters the spectating room and sends a refusal to the spectator (taking the seat with the ticket, as in "Seat in the spectating room" above). The room server then closes the spectator's connection with code 4403, so the spectator learns of the refusal right away. With connection codes, no watch code is made. With LAN, the host sends a refusal to the spectator (reason `WatchOff`).
 
 Matches connected with connection codes cannot be spectated through a room, because there is no room name to derive a spectating room from.
 Instead, the host copies a watch code with Ctrl+C, and the spectator pastes it with "Paste watch code". The spectator then connects directly to the host without going through the room server.
@@ -606,6 +716,9 @@ The replay format, checksum and compression are produced by the game itself, so 
 - **File name**: `th9_udXXXX.rpy`, up to 9999 per folder.
 - Before player names are used as folder names, `\ / : * ? " < > |`, control characters and characters missing from Shift-JIS are replaced, and reserved names (`CON`, `NUL` and so on) are avoided.
 - Spectators also save the matches they watched to the end.
+  The 1P and 2P names a spectator uses for saving are fixed per seg, as the first pair in which both names are present.
+  A folder made while preparing a save and then not used is deleted if it is empty (`src/dll/src/replay_save.rs`).
+  This keeps empty folders from piling up on the spectator's PC even if the host keeps changing the name records.
 
 ### 8-2. The `HGRT` mark
 
@@ -668,6 +781,10 @@ In released builds, the loader checks for a new version before starting the game
 - File names that can be replaced follow fixed rules (only ASCII letters, digits and `.` `_` `-`; up to 64 characters; no `..`; not a user file such as `HiganRTool.ini`, not the logs, not `th09.exe`, not a Windows reserved name). A name outside these rules is not used even if a signed manifest lists it.
 - `.old` files are deleted on the next start after the new version has successfully started the game.
 - The check is skipped for your own builds (build number 0), for an exe placed inside the game folder, with `[loader] update_check = 0`, and in a few other cases.
+- While you play, the DLL fetches the same hash list, verifies its signature and shows on screen if a newer version exists.
+  It fetches when the 妖怪 対 妖怪 menu opens and when a connection is made (if 10 minutes or more have passed since the last fetch), and on the end-of-match menu while connected (at most once every 30 minutes).
+  The request runs on its own thread and the game thread never waits for it. It only shows the notice; files are replaced at the next start.
+  It does not fetch for your own builds (build number 0) or with `update_check = 0`. It still shows the notice where the update before starting is not available, such as an exe inside the game folder.
 - The private key is not in this repository.
 
 
@@ -690,7 +807,7 @@ Being careful at each call site cannot catch things mixed into OS error messages
 - IP addresses → the kind of address (same PC, home network, outside) and the port
 - Long strings shaped like connection codes → hidden
 
-Player names and room names are never written to the logs in the first place.
+Player names, room names and seat tickets are never written to the logs in the first place.
 
 ### 10-3. What others can see
 
@@ -700,7 +817,107 @@ Player names and room names are never written to the logs in the first place.
 - **Room server**: Room names, connection codes (including the name, candidate addresses and the secret) and the connecting IP address. The server does not store them (6-5).
 
 
-## 11. Building and testing
+## 11. Security
+
+This section sums up what HiganRTool protects, how it protects it, what it cannot protect, and how it is checked for vulnerabilities.
+The details of each mechanism are in the other sections, which are referred to here.
+
+### 11-1. What is protected
+
+- **The PCs of the opponent and spectators**: Packets, connection codes and names that arrive from the opponent, spectators or a spectating host must not be able to run code on your PC or make it write files.
+- **The match**: Third parties other than the opponent must not be able to read or modify the match input.
+- **Connection secrets**: The secret in the connection code, and the content of match and spectator traffic.
+- **Automatic updates**: Update files not signed by the developer, or versions older than the current one, must not be installed.
+
+### 11-2. How it is protected
+
+- **Encryption and authentication**: The tool does not implement its own cryptography; it uses crates.
+  Key-exchange packets carry an HMAC tag made with a key derived from the secret, and every other packet is protected with ephemeral X25519 keys and ChaCha20-Poly1305 (4-3).
+  The receiver verifies the tag or the encryption before reading the content, and drops packets that do not verify.
+  There is no path that falls back to an unencrypted form.
+  Reply codes are protected with a tag too (5-1).
+- **Parsing bytes**: Every byte that arrives from the network is parsed in `src/core`, where `unsafe` is forbidden (1).
+  Each type has a fixed length, and packets that do not match are dropped (4-1).
+- **Input given to the game**: The opponent's input and the input in spectator records are masked before they are given to the game (2-4, and "Input a spectator gives to the game" in 7).
+- **Where files are written**: Only fixed places in the game folder are written (2-5).
+  A spectator's automatic save is written to a folder whose name has been sanitized, and folders that were not used are removed (8-1).
+  When a status line containing the opponent's name is written to the file passed between the DLL and the loader (`status.txt`), and when the loader shows it in its window, control characters (Unicode category Cc), line separators (U+2028, U+2029) and characters that change text direction (U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069) are replaced with `?` (`code_files::plain_line`; `src/core/src/code_files.rs`).
+  This keeps the opponent's name from adding lines or injecting console control sequences.
+- **Automatic updates**: The Ed25519 signature on the manifest is verified before it is read, and the file names that can be replaced are restricted by rules (9).
+- **Room server**: The host seat of a spectating room and posts to the spectator list are allowed only for connections holding a ticket carrying an HMAC under a key only the server holds (`SEAT_KEY`) ("Seat in the spectating room" in 7, and 6-4).
+  A room name in use cannot be used by anyone else (6-2).
+- **Limits**: The amount reflected to third parties, and the processing load on the receiver, are limited.
+  - Before connecting: PROBE trains (4-2), answers to sources that are not candidates (5-4), LAN watch codes and how much is read per pass (5-6).
+  - Spectating: the number of spectators ("Limit" in 7), traffic to slots without an ACK ("Stream" in 7), the number of slots and their replacement ("Whether a slot is alive" in 7), resending and the number of introductions ("Introduction and admission" in 7), full-house refusals ("Full house and returning spectators" in 7), and the amount of spectator traffic ("Prioritizing the match" in 7).
+  - Room server: connection counts (6-6), the number and lifetime of viewing connections (6-4), and the wait for replies in spectating rooms ("Seat in the spectating room" in 7).
+
+### 11-3. What cannot be protected
+
+The following cannot be protected by design, or were accepted without adding mechanisms to protect them.
+The tool is used in a small community, so preventing anything that reaches the PCs of the opponent and spectators or the match comes before stacking up mechanisms against harassment.
+
+- **IP addresses**: Players connect directly, so your opponent and spectators learn your IP address ("What this does not protect against" in 4-3, and 10-3).
+- **People who have seen a connection code**: "What this does not protect against" in 4-3.
+- **LAN**: "What this does not protect against" in 5-6.
+- **Whoever used a room name first**: A room name in use belongs to whoever used it first.
+  This includes someone who used a modified tool to make a match under the same name before the real two players.
+  The real two players are refused with "This room name is in use.", so please use another name.
+- **The seat in a spectating room**: "What this does not protect" under "Seat in the spectating room" in 7 (someone who makes a match under the same room name later, and the match partner also holding a ticket).
+  In addition, if the connection to the server's room drops during a match, the room name becomes free (6-2).
+  Someone who knows the room name can then make their own match under that name, get a newer ticket, and take the seat in the spectating room.
+  Spectators who come after that receive that person's spectating code, so they receive fake match records from that person, and that person learns their IP addresses.
+  The effect on the spectators' PCs stays within the protections on the spectator's side (7), such as the input mask.
+- **The spectator seat in a spectating room**: A spectating room (`w.`) has one seat for a spectator waiting for the spectating code.
+  If the same person keeps taking that seat again every 10 seconds, it becomes hard for new spectators to get in.
+  People already spectating are not affected.
+- **Seats in character select**: The opponent can forge the seat written in the character-select decide and cancel packets (STEP_REQ, STEP).
+  So an opponent using a modified tool can decide or cancel your character.
+  The effect stays within visible choices that can be made again, and does not reach the PC's memory or files.
+- **Spectator list slots**: Someone can fill spectator list slots with tickets obtained by making matches with their own two connections (6-4).
+  The limit of 2 entries per IP address (per /64 for IPv6) still applies.
+- **The server's free tier**: Rooms in use and spectator list posts have no maximum lifetime as long as keepalives keep coming.
+  Someone can keep their own matches going, keep the server's alarms running, and use up the server's free tier.
+  Judging from the usage so far, this is unlikely to reach the limit.
+- **The match path**: Someone who can eavesdrop on the traffic can, when the following conditions line up, point the match path at another address and stop the match (cases outside "Candidates come first" in 5-4).
+  - With a peer none of whose packets arrive from a code candidate (a peer whose router rewrites the port), when a captured and replayed reply arrives first.
+  - Even with a peer at a candidate, when none of the peer's HELLO, HELLO_ACK and AGREE arrive from a candidate before the connection is made, and the connection is made with a replayed packet.
+  - When someone who can spoof source addresses replays a reply with a forged code-candidate address and makes the tool switch to an unusable candidate of a peer whose router rewrites the port (an estimate).
+
+  In every case only the match or the connection stops, and the content of the match stays protected by encryption.
+  Preventing these would need a way to move the path after the connection is made, which the tool does not have.
+
+### 11-4. Vulnerability checks
+
+The source of v1.2.1 was checked with audit tools in which AI agents read the source.
+
+- **Cloudflare's `security-audit`** (MIT; https://github.com/cloudflare/security-audit-skill ): run 3 times.
+  The first run covered automatic updates, the P2P traffic of matches and spectating, the use of cryptography, and the room server.
+  The second and third runs covered the code changed since the previous run, and the source after the previous run's needs-validation findings were fixed.
+- **Trail of Bits' `rust-review`** (CC-BY-SA-4.0; https://github.com/trailofbits/skills ): run once.
+  It covered `src/core` and `src/dll`, looking at `unsafe`, FFI, concurrency and panics.
+
+The results were as follows.
+
+- **Confirmed** (findings verified by running the code): 0.
+- **Needs validation** (findings built up by reading the source): 28 in total over the 3 runs of `security-audit` (6 in the first, 14 in the second, 8 in the third).
+  The main fixes were for things that reach a PC (a spectating host making a spectator's PC write screenshots or empty folders) and for amplified reflection to third parties (PROBE trains, spectator JOINs, LAN watch codes).
+  How seats and slots are taken, reuse of HELLO, limits and other points were fixed as well.
+  Of the harassment and free-tier kinds, those that remain were accepted as items that cannot be protected in 11-3.
+- **`rust-review`**: 2 findings, both missing settings (no `rust-version` in the workspace, and no lint that mechanically stops `unsafe` without `// SAFETY:`).
+  Both were fixed, and the missing `// SAFETY:` comments were filled in.
+  There were 0 findings about the code itself.
+
+The limits of these checks are as follows.
+
+- Neither tool ran the target code.
+  Where there were no findings, it means "nothing was found", not that the absence of holes was verified.
+- The third run stopped after a single hunting pass.
+- The tools themselves are not included in this repository or in the released files.
+
+Known vulnerabilities in dependencies are checked with Dependabot (12).
+
+
+## 12. Building and testing
 
 ```
 rustup target add i686-pc-windows-msvc
@@ -723,7 +940,7 @@ The target and the static CRT are set in `.cargo/config.toml`.
 - Real-time tests (`#[ignore]`) can be run locally with `cargo test --workspace -- --ignored`.
 
 
-## 12. Prior work
+## 13. Prior work
 
 All code was written from scratch.
 The following were used only as references for how things work (no code was copied):

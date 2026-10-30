@@ -1,9 +1,11 @@
-//! Windows 標準の「ファイルを開く」（`.rpy`・複数選択）と「フォルダーの選択」（`IFileOpenDialog`）。
+//! Windows標準の「ファイルを開く」（`.rpy`・複数選択）と「フォルダーの選択」（`IFileOpenDialog`）。
 //!
-//! `windows-sys` は COM のインターフェースの呼び出しの型を持たないので、使う vtable を自分で宣言する（ローダーの
-//! フォルダ選びと同じ作り）。並びは Windows SDK 10.0.26100.0 の `shobjidl_core.h`。0 始まりで IUnknown が 0〜2、
-//! `IModalWindow::Show` が 3、`IFileDialog` は 4〜26、`IFileOpenDialog::GetResults` が 27。間の使わない行は `usize` で埋める。
-//! x86 の COM は stdcall。
+//! `windows-sys`はCOMのインターフェースを呼び出すための型を持たない。
+//! そのため使うvtableは自分で宣言する（ローダーのフォルダ選びと同じ作り）。
+//! メソッドの並びはWindows SDK 10.0.26100.0の`shobjidl_core.h`のとおり。
+//! 0始まりでIUnknownが0〜2、`IModalWindow::Show`が3、`IFileDialog`は4〜26、`IFileOpenDialog::GetResults`が27。
+//! 間の使わないスロットは`usize`で埋める。
+//! x86のCOMはstdcall。
 
 use core::ffi::c_void;
 use std::ffi::OsString;
@@ -30,7 +32,7 @@ const IID_IFILE_OPEN_DIALOG: GUID = GUID::from_u128(0xD57C7288_D4AD_4768_BE02_9D
 
 /// 取り消しはこの値（`HRESULT_FROM_WIN32(ERROR_CANCELLED)`）で返る。
 const HRESULT_CANCELLED: Hresult = 0x8007_04C7_u32 as i32;
-/// このスレッドの COM が別の方式で初期化済み（そのまま使える）。
+/// このスレッドのCOMが別の方式で初期化済み（そのまま使える）。
 const RPC_E_CHANGED_MODE: Hresult = 0x8001_0106_u32 as i32;
 
 /// `COMDLG_FILTERSPEC`（`shtypes.h`）。
@@ -104,7 +106,7 @@ struct Com<V: HasRelease> {
 
 impl<V: HasRelease> Com<V> {
     /// # Safety
-    /// `raw` は `V` の並びの vtable を持つ、参照を 1 つ渡された COM オブジェクトであること。
+    /// `raw`は`V`の並びのvtableを持つ、参照を1つ渡されたCOMオブジェクトであること。
     unsafe fn from_raw(raw: *mut c_void) -> Self {
         Com {
             raw,
@@ -113,7 +115,7 @@ impl<V: HasRelease> Com<V> {
     }
 
     fn vtbl(&self) -> &V {
-        // SAFETY: `from_raw` の約束で、先頭の 1 語が vtable へのポインタ。`self` が持つ間 vtable も生きている。
+        // SAFETY: `from_raw`の約束で先頭の1ワードがvtableへのポインタ。`self`が持つ間はvtableも生きている。
         unsafe { &**(self.raw as *const *const V) }
     }
 }
@@ -121,7 +123,7 @@ impl<V: HasRelease> Com<V> {
 impl<V: HasRelease> Drop for Com<V> {
     fn drop(&mut self) {
         let release = self.vtbl().release_fn();
-        // SAFETY: `self.raw` はまだ生きていて（Drop は 1 回だけ）、受け取った参照を 1 つ返す。
+        // SAFETY: `self.raw`はまだ生きている（Dropは1回だけ）。受け取った参照を1つ返す。
         unsafe { release(self.raw) };
     }
 }
@@ -152,7 +154,7 @@ impl ComScope {
 impl Drop for ComScope {
     fn drop(&mut self) {
         if self.uninit {
-            // SAFETY: `enter` で成功した CoInitializeEx と対（同じスレッドで 1 回）。
+            // SAFETY: `enter`で成功したCoInitializeExと対（同じスレッドで1回）。
             unsafe { CoUninitialize() };
         }
     }
@@ -166,14 +168,14 @@ fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 出さずに用意するところまで（検査がウィンドウを出さずに vtable の並びをチェックするため）。
+/// 出さずに用意するところまで（検査がウィンドウを出さずにvtableの並びをチェックするため）。
 fn make_dialog(
     title: &str,
     extra_options: u32,
     filter: Option<(&str, &str)>,
 ) -> Result<Com<DialogVtbl>, String> {
     let mut raw: *mut c_void = ptr::null_mut();
-    // SAFETY: CLSID と IID は定数、`raw` は書ける 1 語。成功すれば参照を 1 つ得る。
+    // SAFETY: CLSIDとIIDは定数。`raw`は書き込み可能な1ワード。成功すれば参照を1つ得る。
     let hr = unsafe {
         CoCreateInstance(
             &CLSID_FILE_OPEN_DIALOG,
@@ -186,11 +188,11 @@ fn make_dialog(
     if hr < 0 || raw.is_null() {
         return Err(hr_text("CoCreateInstance(FileOpenDialog)", hr));
     }
-    // SAFETY: IFileOpenDialog は IFileDialog の vtable を前方に含む（`shobjidl_core.h`）。参照は上で 1 つ得た。
+    // SAFETY: IFileOpenDialogはIFileDialogのvtableを前方に含む（`shobjidl_core.h`）。参照は上で1つ得た。
     let dlg: Com<DialogVtbl> = unsafe { Com::from_raw(raw) };
 
     let mut opts: u32 = 0;
-    // SAFETY: `dlg` は生きている。`opts` は書ける u32。
+    // SAFETY: `dlg`は生きている。`opts`は書き込み可能なu32。
     let hr = unsafe { (dlg.vtbl().get_options)(dlg.raw, &mut opts) };
     if hr < 0 {
         return Err(hr_text("GetOptions", hr));
@@ -202,7 +204,7 @@ fn make_dialog(
         return Err(hr_text("SetOptions", hr));
     }
     let title_w = wide_nul(title);
-    // SAFETY: `title_w` は終端 0 つきで、呼びの間生きている。
+    // SAFETY: `title_w`は終端0つきで呼びの間生きている。
     let hr = unsafe { (dlg.vtbl().set_title)(dlg.raw, title_w.as_ptr()) };
     if hr < 0 {
         return Err(hr_text("SetTitle", hr));
@@ -213,7 +215,7 @@ fn make_dialog(
             name: name_w.as_ptr(),
             spec: spec_w.as_ptr(),
         }];
-        // SAFETY: `specs` は 1 件で、2 つの文字列とも終端 0 つき。SetFileTypes は呼びの中で内容を複製する。
+        // SAFETY: `specs`は1件。2つの文字列とも終端0つき。SetFileTypesは呼びの中で内容を複製する。
         let hr = unsafe { (dlg.vtbl().set_file_types)(dlg.raw, 1, specs.as_ptr()) };
         if hr < 0 {
             return Err(hr_text("SetFileTypes", hr));
@@ -222,15 +224,15 @@ fn make_dialog(
     Ok(dlg)
 }
 
-/// 項目 1 つのファイルシステム上のパス。
+/// 項目1つのファイルシステム上のパス。
 fn item_path(item: &Com<ItemVtbl>) -> Result<PathBuf, String> {
     let mut name: *mut u16 = ptr::null_mut();
-    // SAFETY: `item` は生きている。`name` は書ける 1 語で、CoTaskMemFree で返す文字列を指す。
+    // SAFETY: `item`は生きている。`name`は書き込み可能な1ワード。CoTaskMemFreeで解放する文字列を指す。
     let hr = unsafe { (item.vtbl().get_display_name)(item.raw, SIGDN_FILESYSPATH, &mut name) };
     if hr < 0 || name.is_null() {
         return Err(hr_text("GetDisplayName", hr));
     }
-    // SAFETY: `name` は終端 0 の UTF-16 を指す。長さを数えてコピーしてから返す。
+    // SAFETY: `name`は終端0のUTF-16を指す。長さを数えてコピーしてから返す。
     let path = unsafe {
         let mut len = 0usize;
         while *name.add(len) != 0 {
@@ -243,9 +245,9 @@ fn item_path(item: &Com<ItemVtbl>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// 出して、閉じるまで待つ。取り消しは `Ok(false)`。
+/// 出して閉じるまで待つ。取り消しは`Ok(false)`。
 fn show(dlg: &Com<DialogVtbl>, owner: *mut c_void) -> Result<bool, String> {
-    // SAFETY: `dlg` は生きている。`owner` は呼び出し側のウィンドウ（null でもよい）。Show は人が閉じるまで戻らない。
+    // SAFETY: `dlg`は生きている。`owner`は呼び出し側のウィンドウ（nullでもよい）。Showは人が閉じるまで戻らない。
     let hr = unsafe { (dlg.vtbl().show)(dlg.raw, owner) };
     if hr == HRESULT_CANCELLED {
         return Ok(false);
@@ -256,7 +258,7 @@ fn show(dlg: &Com<DialogVtbl>, owner: *mut c_void) -> Result<bool, String> {
     Ok(true)
 }
 
-/// 「フォルダーの選択」。取り消しは `Ok(None)`。
+/// 「フォルダーの選択」。取り消しは`Ok(None)`。
 pub fn choose_folder(owner: *mut c_void, title: &str) -> Result<Option<PathBuf>, String> {
     let _scope = ComScope::enter()?;
     let dlg = make_dialog(title, FOS_PICKFOLDERS, None)?;
@@ -264,12 +266,12 @@ pub fn choose_folder(owner: *mut c_void, title: &str) -> Result<Option<PathBuf>,
         return Ok(None);
     }
     let mut item_raw: *mut c_void = ptr::null_mut();
-    // SAFETY: `dlg` は生きている。`item_raw` は書ける 1 語。
+    // SAFETY: `dlg`は生きている。`item_raw`は書き込み可能な1ワード。
     let hr = unsafe { (dlg.vtbl().get_result)(dlg.raw, &mut item_raw) };
     if hr < 0 || item_raw.is_null() {
         return Err(hr_text("GetResult", hr));
     }
-    // SAFETY: 上で得た IShellItem の参照 1 つ。
+    // SAFETY: 上で得たIShellItemの参照1つ。
     let item: Com<ItemVtbl> = unsafe { Com::from_raw(item_raw) };
     item_path(&item).map(Some)
 }
@@ -290,15 +292,15 @@ pub fn choose_replays(
         return Ok(Vec::new());
     }
     let mut arr_raw: *mut c_void = ptr::null_mut();
-    // SAFETY: `dlg` は生きている。`arr_raw` は書ける 1 語。
+    // SAFETY: `dlg`は生きている。`arr_raw`は書き込み可能な1ワード。
     let hr = unsafe { (dlg.vtbl().get_results)(dlg.raw, &mut arr_raw) };
     if hr < 0 || arr_raw.is_null() {
         return Err(hr_text("GetResults", hr));
     }
-    // SAFETY: 上で得た IShellItemArray の参照 1 つ。
+    // SAFETY: 上で得たIShellItemArrayの参照1つ。
     let arr: Com<ItemArrayVtbl> = unsafe { Com::from_raw(arr_raw) };
     let mut count = 0u32;
-    // SAFETY: `arr` は生きている。`count` は書ける u32。
+    // SAFETY: `arr`は生きている。`count`は書き込み可能なu32。
     let hr = unsafe { (arr.vtbl().get_count)(arr.raw, &mut count) };
     if hr < 0 {
         return Err(hr_text("GetCount", hr));
@@ -306,12 +308,12 @@ pub fn choose_replays(
     let mut out = Vec::new();
     for i in 0..count {
         let mut item_raw: *mut c_void = ptr::null_mut();
-        // SAFETY: `arr` は生きている。`i` は `count` の範囲内。`item_raw` は書ける 1 語。
+        // SAFETY: `arr`は生きている。`i`は`count`の範囲内。`item_raw`は書き込み可能な1ワード。
         let hr = unsafe { (arr.vtbl().get_item_at)(arr.raw, i, &mut item_raw) };
         if hr < 0 || item_raw.is_null() {
             return Err(hr_text("GetItemAt", hr));
         }
-        // SAFETY: 上で得た IShellItem の参照 1 つ。
+        // SAFETY: 上で得たIShellItemの参照1つ。
         let item: Com<ItemVtbl> = unsafe { Com::from_raw(item_raw) };
         out.push(item_path(&item)?);
     }
@@ -335,7 +337,7 @@ mod tests {
         let _scope = ComScope::enter().expect("COM が初期化できない");
         let opts_of = |d: &Com<DialogVtbl>| {
             let mut o = 0u32;
-            // SAFETY: `d` は生きている。`o` は書ける u32。
+            // SAFETY: `d`は生きている。`o`は書き込み可能なu32。
             let hr = unsafe { (d.vtbl().get_options)(d.raw, &mut o) };
             assert!(hr >= 0);
             o

@@ -1,28 +1,40 @@
-//! マッチの前の選択（難易度・キャラ・マップの画面）の状態機械。MENU・STEP_REQ・STEP・SELECT。
-//! バイト列の形は `wire.rs`。ここは「いつ何を入れ、何を送るか」だけを持つ。
-//! 画面を移る押下はゲームの中で戻せない。順番を決めるのは step ごとにホスト 1 人にして、コピーが遅れて届いても step の食い違いで捨てられるようにした（両者が対称に要求と了承をやり取りする形では、断られた要求のコピーが遅れて了承され、両者が同じ step に別の押下を入れた。
-//! `old_symmetric_protocol_diverges_on_note_scenario` が再現する）。
-//! dll は 1 フレームに、届いた MENU / STEP_REQ / STEP / SELECT を `on_*` へ渡し、`local_frame` を呼んで返った `remote` と `apply` をゲームへ入れ、`build_menu()` と `poll_send(いまの ms)` が返すものを送る。選択を出る押下は `build_menu` より先に `leave()`（出た後に送った MENU が遅れて次の選択に届くと、相手が来ていないのに「来た」になり、ホストの押下が相手の居ない画面へ入るため）。
-//! 押下の持ち越し（`ready_ok`）・合わせ（`StepKind::Align`）・相手の席の位置（`take_peer_cursor`）・相手の入力ワードの再生（`fresh` / `next_remote`）を扱う。
-//! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を使わない。入力ワードの列は 32 ワードの固定のリングバッファで、添字はいつも `% 32`。数の足し算は飽和させる。
+//! マッチの前の選択（難易度・キャラ・マップの画面）のステートマシン。MENU・STEP_REQ・STEP・SELECT。
+//! バイト列の形は`wire.rs`。ここは「いつ何をゲームへ書き込み、何を送るか」だけを持つ。
+//! 画面を移る押下はゲームの中で戻せない。
+//! そのため順番を決めるのはstepごとにホスト1人にした。
+//! これでコピーが遅れて届いてもstepの食い違いで捨てられる。
+//! 両者が対称に要求と了承をやり取りする形では断られた要求のコピーが遅れて了承され、両者が同じstepに別の押下を書き込んだ。
+//! これは`old_symmetric_protocol_diverges_on_note_scenario`が再現する。
+//! dllは1フレームごとに、届いたMENU / STEP_REQ / STEP / SELECTを`on_*`へ渡す。
+//! 次に`local_frame`を呼び、返った`remote`と`apply`をゲームへ書き込む。
+//! 最後に`build_menu()`と`poll_send(いまの ms)`が返すものを送る。
+//! 選択を出る押下は`build_menu`より先に`leave()`を呼ぶ。
+//! 出た後に送ったMENUが遅れて次の選択に届くと、相手が来ていないのに「来た」になる。
+//! そうなるとホストの押下が相手の居ない画面へ入る。
+//! 押下の持ち越し（`ready_ok`）・合わせ（`StepKind::Align`）・相手のサイドの位置（`take_peer_cursor`）・相手の入力ワードの再生（`fresh` / `next_remote`）を扱う。
+//! ゲームスレッドで呼ぶのでヒープを使わず、パニックしうる添字を使わない。
+//! 入力ワードの列は32ワードの固定のリングバッファで、添字はいつも`% 32`。
+//! 数の足し算は飽和させる。
 
 use crate::menu_model::{KEY_CTRL, Model, Outcome, uses_align};
 use crate::wire::{CURSOR_NONE, MAX_WORDS, Menu, Message, Select, Step, StepKind};
 
-/// STEP・STEP_REQ・SELECT を送り直す間隔（ms）。INPUT の待ち中の再送と同じ値に揃えてあるが、由来が別なので別の名前で持つ。
+/// STEP・STEP_REQ・SELECTを送り直す間隔（ms）。INPUTの待ち中の再送と同じ値に揃えてある。
+/// 由来が別なので別の名前で持つ。
 pub const RESEND_MS: u32 = 4;
 
-/// MENU の入力ワードのリングの長さ。送り手は未 ack の新しい方から 32 ワードまで送り、受け手もそれ以上は溜めない（入力ワードはカーソルの表示にだけ効く）。
+/// MENUの入力ワードのリングの長さ。送信側は未ackの新しい方から32ワードまで送る。
+/// 受信側もそれ以上は溜めない（入力ワードはカーソルの表示にだけ効く）。
 const RING: u32 = MAX_WORDS as u32;
 
-/// 役割（接続の手順で決まる）。lockstep と同じ型。
+/// 役割（接続の手順で決まる）。lockstepと同じ型。
 pub use crate::lockstep::Role;
 
-/// 画面を移る押下。step はこの状態機械が付ける。
+/// 画面を移る押下。stepはこのステートマシンが付ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Press {
     pub kind: StepKind,
-    /// 難易度・マップの画面ではカーソルの値、キャラ選択では押した席と Shift。ここでは意味を見ない。
+    /// 難易度・マップの画面ではカーソルの値。キャラ選択では押したサイドとShift。ここでは意味を見ない。
     pub value: u8,
     pub screen: u8,
 }
@@ -40,35 +52,35 @@ impl Press {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameOut {
-    /// 相手の入力ワード（届いた順に 1 フレーム 1 ワード。無ければ直前の入力ワード。画面が移る step の直後は 0）。
+    /// 相手の入力ワード（届いた順に1フレーム1ワード。無ければ直前の入力ワード。画面が移るstepの直後は0）。
     pub remote: u16,
-    /// このフレームで入れる画面を移る押下。`value` へカーソルを合わせてから入れる。
-    /// `step` はこの押下の通し番号（ログ用。ゲームへは入れない）。
+    /// このフレームでゲームへ書き込む画面を移る押下。`value`へカーソルを合わせてから書き込む。
+    /// `step`はこの押下の通し番号（ログ用。ゲームへは書き込まない）。
     pub apply: Option<Step>,
 }
 
-/// `poll_send` が返す、いま送るもの。送り直しの対象は同時に 2 つまであり得る（ホストの最後の STEP と SELECT）。
+/// `poll_send`が返す、いま送るもの。送り直しの対象は同時に2つまであり得る（ホストの最後のSTEPとSELECT）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outbox {
     pub step: Option<Message>,
     pub select: Option<Message>,
 }
 
-/// SELECT の値の食い違い（違えばログに残し、ホストの値を採る）。
+/// SELECTの値の食い違い（違えばログに残し、ホストの値を採る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Mismatch {
     pub map: bool,
     pub difficulty: bool,
-    /// オプションの意味の分からない欄のダイジェスト（違えばログだけ）。
+    /// オプションの意味の分からないフィールドのダイジェスト（違えばログだけ）。
     pub option_digest: bool,
 }
 
-/// 両者の SELECT が揃ったときの値。
+/// 両者のSELECTが揃ったときの値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Agreed {
-    /// 相手の SELECT そのまま（相手の席のキャラ・色・初期ライフ・チャージ型はここから書く）。
+    /// 相手のSELECTそのまま（相手のサイドのキャラ・色・初期ライフ・チャージ型はここから書く）。
     pub peer: Select,
-    /// マップ・難易度はホストの値（食い違いは `mismatch`）。
+    /// マップ・難易度はホストの値（食い違いは`mismatch`）。
     pub map: u8,
     pub difficulty: u8,
     /// ホストだけが意味を持つ値。
@@ -79,112 +91,117 @@ pub struct Agreed {
     pub mismatch: Mismatch,
 }
 
-/// 相手の席のキャラのカーソル（相手の MENU の末尾）。
+/// 相手のサイドのキャラのカーソル（相手のMENUの末尾）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerCursor {
-    /// 相手の画面（MENU の送り手）。
+    /// 相手の画面（MENUの送信側）。
     pub screen: u8,
     /// 0〜15。
     pub cursor: u8,
-    /// 前に受けた位置（同じ画面）から動いていて、その間の相手の入力ワードに「ランダム」（Ctrl）が無かった。`take_peer_cursor` で消える。
+    /// 前に受けた位置（同じ画面）から動き、その間の相手の入力ワードに「ランダム」（Ctrl）が無かった。
+    /// `take_peer_cursor`で消える。
     pub moved: bool,
 }
 
 /// 捨てたものの数（ログ用）。増え続けるなら相手か経路がおかしい。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counters {
-    /// 自分の画面を移る押下を入れなかった（相手が来ていない / 前の STEP が届いていない / 要求を持っている / 選択の外）。
+    /// 自分の画面を移る押下を書き込まなかった（相手が来ていない / 前のSTEPが届いていない / 要求を持っている / 選択の外）。
     pub press_dropped: u32,
-    /// ホストが捨てた STEP_REQ（違う step / 選択の外 / 同じフレームのホストの押下に負けた / 相手が来ていない）。
+    /// ホストが捨てたSTEP_REQ（違うstep / 選択の外 / 同じフレームのホストの押下に負けた / 相手が来ていない）。
     pub req_dropped: u32,
-    /// ゲストが捨てた STEP（古い = 重複 / 選択の外）。
+    /// ゲストが捨てたSTEP（古い = 重複 / 選択の外）。
     pub step_dropped: u32,
-    /// 自分と違う step の MENU、選択の外で届いた MENU。
+    /// 自分と違うstepのMENU、選択の外で届いたMENU。
     pub menu_dropped: u32,
-    /// match_no の違う SELECT、2 通目以降の SELECT。
+    /// match_noの違うSELECT、2通目以降のSELECT。
     pub select_dropped: u32,
-    /// 手順の上では来ないもの（ゲストの step がホストより先、新しすぎる STEP、役割の逆向きのメッセージ）。
+    /// 手順の上では来ないもの（ゲストのstepがホストより先、新しすぎるSTEP、役割の逆向きのメッセージ）。
     pub impossible: u32,
 }
 
-/// 選択の状態機械。接続ごとに 1 つ作り、選択に入るたびに `enter()`、出るたびに `leave()`。step と語の番号は接続の間持ち越す。
+/// 選択のステートマシン。接続ごとに1つ作る。
+/// 選択に入るたびに`enter()`を呼び、出るたびに`leave()`を呼ぶ。
+/// stepとワードの番号は接続の間持ち越す。
 #[derive(Debug, Clone)]
 pub struct Selection {
     role: Role,
     active: bool,
-    /// 「相手が来た」: この選択に入ってから、自分と同じ step の相手の MENU が届いた。
+    /// 「相手が来た」: この選択に入ってから自分と同じstepの相手のMENUが届いた。
     present: bool,
-    /// 次に決まる押下の通し番号 = 入れ終えた押下の数。
+    /// 次に決まる押下の通し番号 = 書き込み終えた押下の数。
     step: u16,
-    /// 最後に入れた合わせの画面（この選択に入ってからの分。`enter` で消す）。今の画面と同じなら、その画面の合わせは済み。
+    /// 最後に書き込んだ合わせの画面（この選択に入ってからの分。`enter`で消す）。
+    /// 今の画面と同じならその画面の合わせは済み。
     aligned: Option<u8>,
-    /// 選択に入ってから、まだ相手の MENU（同じ step）を 1 通も受けていない（最初の MENU は古い入力ワードを再生しない）。
+    /// 選択に入ってからまだ相手のMENU（同じstep）を1通も受けていない（最初のMENUは古い入力ワードを再生しない）。
     fresh: bool,
 
     // ---- ホストだけが使う ----
-    /// ゲストが入れ終えたと分かっている step（ゲストの MENU・STEP_REQ の step の最大。SELECT でも進む）。
-    /// `guest_step >= step` が「前の STEP がゲストに届いた」。
+    /// ゲストが書き込み終えたと分かっているstep（ゲストのMENU・STEP_REQのstepの最大。SELECTでも進む）。
+    /// `guest_step >= step`が「前のSTEPがゲストに届いた」。
     guest_step: u16,
-    /// 受け入れ待ちの STEP_REQ（自分と同じ step のものだけ。次の `local_frame` で入れるか捨てる）。
+    /// 受け入れ待ちのSTEP_REQ（自分と同じstepのものだけ。次の`local_frame`で書き込むか捨てる）。
     held_req: Option<Press>,
-    /// 最後に決めた STEP（`guest_step` がこれを越えるまで送り直す）。
+    /// 最後に決めたSTEP（`guest_step`がこれを越えるまで送り直す）。
     last_step: Option<Step>,
     last_step_sent: Option<u32>,
 
     // ---- ゲストだけが使う ----
-    /// 自分の要求（1 つだけ。step はいつも `self.step`。step が進んだら捨てる）。
+    /// 自分の要求（1つだけ。stepはいつも`self.step`。stepが進んだら捨てる）。
     pending: Option<Press>,
     pending_sent: Option<u32>,
-    /// 届いた、次に入れる STEP（`step == self.step` のものだけ）。
+    /// 届いているSTEPのうち次に書き込むもの（`step == self.step`のものだけ）。
     ready: Option<Step>,
 
-    // ---- MENU の入力ワード（番号は step ごとに 0 から） ----
+    // ---- MENUの入力ワード（番号はstepごとに0から） ----
     tx_ring: [u16; MAX_WORDS],
     tx_next: u32,
-    /// 相手の ack（相手が次に要る自分の入力ワードの番号）。
+    /// 相手のack（相手が次に要る自分の入力ワードの番号）。
     tx_acked: u32,
-    /// 今の step の相手の入力ワード（`rx.end` が自分の送る ack）。
+    /// 今のstepの相手の入力ワード（`rx.end`が自分の送るack）。
     rx: RxWords,
-    /// 1 つ前の step の相手の入力ワードの残り（同じ画面に残る step の後だけ。モジュール doc の「同じ画面に残る step を
-    /// またぐ相手の入力ワード」）。`prev_step` が Some の間だけ受け、`rx` より先に渡す。
+    /// 1つ前のstepの相手の入力ワードの残り（同じ画面に残るstepの後だけ）。
+    /// 詳細はモジュールdocの「同じ画面に残るstepをまたぐ相手の入力ワード」。
+    /// `prev_step`がSomeの間だけ受け`rx`より先に渡す。
     prev_rx: RxWords,
-    /// `prev_rx` の step。新しい step の入力ワードを渡し始めたら・画面が移る step を入れたら・選択に入り直したら None。
+    /// `prev_rx`のstep。次のどれかでNoneになる: 新しいstepの入力ワードを渡し始めた・画面が移るstepを書き込んだ・選択に入り直した。
     prev_step: Option<u16>,
     /// 直前にゲームへ渡した相手の入力ワード（次の入力ワードが無いフレームに続ける）。
     rx_last: u16,
-    /// この選択に入ってから入れた STEP で追う画面（同じ画面に残る step かを決める）。
+    /// この選択に入ってから書き込んだSTEPで追う画面（同じ画面に残るstepかを判定する）。
     screens: Screens,
 
-    // ---- 席の位置（MENU の末尾） ----
-    /// 送る自分の画面と自分の席のキャラのカーソル（0〜15 か `CURSOR_NONE`）。
+    // ---- サイドの位置（MENUの末尾） ----
+    /// 送る自分の画面と自分のサイドのキャラのカーソル（0〜15か`CURSOR_NONE`）。
     own_screen: u8,
     own_cursor: u8,
     peer_cursor: Option<PeerCursor>,
-    /// `peer_cursor` を運んだ MENU の入力ワードの終わりの番号（今の step。これより古い MENU の位置は使わない）。
+    /// `peer_cursor`を運んだMENUの入力ワードの終わりの番号（今のstep。これより古いMENUの位置は使わない）。
     peer_cursor_end: u32,
-    /// 今の step で受けた相手の入力ワードのうち、Ctrl が立っていたいちばん大きい番号。
+    /// 今のstepで受けた相手の入力ワードのうち、Ctrlが立っていたいちばん大きい番号。
     peer_ctrl_at: Option<u32>,
 
     // ---- SELECT ----
-    /// その接続で何戦目か（0 から。SELECT を決めた選択の次の `enter` で 1 進む）。
+    /// その接続で何戦目か（0から。SELECTを決めた選択の次の`enter`で1進む）。
     match_no: u16,
     own_select: Option<Select>,
-    /// 自分の SELECT を決めたときの step（ホスト: ゲストの SELECT が届いたら、ゲストはここまで入れ終えている）。
+    /// 自分のSELECTを決めたときのstep（ホスト: ゲストのSELECTが届いたらゲストはここまで書き込み終えている）。
     own_select_step: u16,
     peer_select: Option<Select>,
-    /// 相手の最初の INPUT が届いた（SELECT の送り直しをやめる）。
+    /// 相手の最初のINPUTが届いた（SELECTの送り直しをやめる）。
     peer_input_seen: bool,
     select_sent: Option<u32>,
 
     counters: Counters,
 }
 
-/// 相手の入力ワードの受け取りの列（1 つの step の分。番号は step ごとに 0 から）。32 ワードの固定のリングで持つ。
+/// 相手の入力ワードの受け取りの列（1つのstepの分。番号はstepごとに0から）。32ワードの固定のリングで持つ。
 #[derive(Debug, Clone, Copy)]
 struct RxWords {
     ring: [u16; MAX_WORDS],
     play: u32,
-    /// 受け取った入力ワードの番号の終わり。`play..end` は全部リングにある（いつも `play <= end`）。
+    /// 受け取った入力ワードの番号の終わり。`play..end`は全部リングにある（いつも`play <= end`）。
     end: u32,
 }
 
@@ -209,9 +226,9 @@ impl RxWords {
         Some(w)
     }
 
-    /// MENU の入力ワード（番号 `base` から）を番号の順に足す。番号が u32 を越える MENU は手順の外なので何もせず false。
+    /// MENUの入力ワード（番号`base`から）を番号の順に足す。番号がu32を越えるMENUは手順の外なので何もせずfalse。
     fn receive(&mut self, base: u32, words: &[u16]) -> bool {
-        // 下の `base + i` が桁あふれしないことの検証も兼ねる。
+        // 下の`base + i`が桁あふれしないことの検証も兼ねる。
         let fits = u32::try_from(words.len())
             .ok()
             .and_then(|n| base.checked_add(n))
@@ -220,7 +237,7 @@ impl RxWords {
             return false;
         }
         if base > self.end {
-            // 番号が飛んだ = 送り手が 32 ワードを越えて落とした。飛んだ先から続ける。
+            // 番号が飛んだ = 送信側が32ワードを越えて落とした。飛んだ先から続ける。
             self.play = base;
             self.end = base;
         }
@@ -232,24 +249,24 @@ impl RxWords {
             }
         }
         if self.len() > RING {
-            // 32 ワードより溜まった（片道の遅れが揺れて一度に届いた）。古い方を落とす。
+            // 32ワードより溜まった（片道の遅れが揺れて一度に届いた）。古い方を落とす。
             self.play = self.end - RING;
         }
         true
     }
 }
 
-/// この選択に入ってから入れた STEP で追う画面（`menu_model::Model`）。両者が同じ順に入れた STEP の列から同じ模型を進める。
+/// この選択に入ってから書き込んだSTEPで追う画面（`menu_model::Model`）。両者が同じ順に書き込んだSTEPの列から同じモデルを進める。
 #[derive(Debug, Clone, Copy)]
 enum Screens {
-    /// まだ STEP を入れていない（入った画面は席の旗が 0 —— `Model::new`）。
+    /// まだSTEPを書き込んでいない（入った画面はサイドのフラグが0 —— `Model::new`）。
     Unseen,
     Known(Model),
-    /// 入れた STEP が模型と食い違った。この選択の間は、どの step も画面が移るものとして扱う。
+    /// 書き込んだSTEPがモデルと食い違った。この選択の間はどのstepも画面が移るものとして扱う。
     Lost,
 }
 
-/// 前に送った時刻から `RESEND_MS` 経ったか。まだ送っていなければすぐ送る（遅延を足さないため）。
+/// 前に送った時刻から`RESEND_MS`経ったかどうか。まだ送っていなければすぐ送る（遅延を足さないため）。
 fn due(last: Option<u32>, now: u32) -> bool {
     match last {
         None => true,
@@ -316,7 +333,7 @@ impl Selection {
         self.active
     }
 
-    /// ゲストの持っている要求。ホストはいつも None。
+    /// ゲストの持っている要求。ホストはいつもNone。
     pub fn pending_press(&self) -> Option<Press> {
         self.pending
     }
@@ -329,11 +346,11 @@ impl Selection {
         self.counters
     }
 
-    /// 選択に入る（Match の難易度画面、2 戦目以降はキャラ選択）。「相手が来た」を戻し、相手の入力ワードの溜まりは捨て、直前の入力ワードは 0 に戻す。
-    /// ワードの番号は戻さない（相手は番号を続けて送るので、戻すと相手の入力ワードを古いと見て捨て続ける）。ホストの最後の STEP の送り直しは止めない。
+    /// 選択に入る（Matchの難易度画面。2戦目以降はキャラ選択）。「相手が来た」を戻す。相手の入力ワードの溜まりは捨てる。直前の入力ワードは0に戻す。
+    /// ワードの番号は戻さない（相手は番号を続けて送るので戻すと相手の入力ワードを古いと見て捨て続ける）。ホストの最後のSTEPの送り直しは止めない。
     pub fn enter(&mut self) {
         if self.own_select.is_some() {
-            // 前の選択で SELECT を決めた = 1 戦を始めた。両者の match_no は同じ所で進む。
+            // 前の選択でSELECTを決めた = 1戦を始めた。両者のmatch_noは同じ所で進む。
             self.match_no = self.match_no.wrapping_add(1);
             self.own_select = None;
             self.peer_select = None;
@@ -355,13 +372,14 @@ impl Selection {
         self.forget_peer_cursor();
     }
 
-    /// 今の画面 `screen` の合わせを入れ終えたか。ゲストはこれが偽の間、動かない。合わせを使わない画面（キャラ選択）はいつも真。
+    /// 今の画面`screen`の合わせを書き込み終えたかどうか。ゲストはこれが偽の間動かない。合わせを使わない画面（キャラ選択）はいつも真。
     pub fn is_aligned(&self, screen: u8) -> bool {
         !uses_align(screen) || self.aligned == Some(screen)
     }
 
-    /// ホスト: 今の画面 `screen` の合わせをいま押下として渡してよいか（相手が来ていて、前の STEP が届いていて、この画面の合わせがまだ）。
-    /// ゲームが読む状態か・自分の入力ワードに方向が立っていないかは dll が見る。ゲストと、合わせを使わない画面ではいつも false。
+    /// ホスト: 今の画面`screen`の合わせをいま押下として渡してよいかどうか（次が全部揃っているとき: 相手が来ている・前のSTEPが届いている・この画面の合わせがまだ）。
+    /// ゲームが読む状態かどうかと自分の入力ワードに方向が立っていないかどうかはdllが見る。
+    /// ゲストと合わせを使わない画面ではいつもfalse。
     pub fn align_due(&self, screen: u8) -> bool {
         self.role == Role::Host
             && uses_align(screen)
@@ -372,11 +390,11 @@ impl Selection {
             && self.aligned != Some(screen)
     }
 
-    /// 選択を出る。自分の押下・ゲストの要求・STEP の受け入れをやめる。
+    /// 選択を出る。自分の押下・ゲストの要求・STEPの受け入れをやめる。
     ///
-    /// ホストの最後の STEP と SELECT の送り直しは止めない。選択を出る押下（難易度の画面の取消）の STEP が落ちたまま送り直しをやめると、
-    /// ゲストだけが選択の画面に残って戻れない（`exit_step_lost_after_host_left_still_reaches_guest`）。
-    /// STEP はゲストの step がそれを越えたら、SELECT は相手の最初の INPUT で止まる。
+    /// ホストの最後のSTEPとSELECTの送り直しは止めない。
+    /// 選択を出る押下（難易度の画面でキャンセルを押すこと）のSTEPが落ちたまま送り直しをやめると、ゲストだけが選択の画面に残って戻れない（`exit_step_lost_after_host_left_still_reaches_guest`）。
+    /// STEPはゲストのstepがそれを越えたら止まり、SELECTは相手の最初のINPUTで止まる。
     pub fn leave(&mut self) {
         self.active = false;
         self.present = false;
@@ -387,19 +405,19 @@ impl Selection {
         self.forget_peer_cursor();
     }
 
-    /// 次に送る MENU に載せる、自分の画面と自分の席のキャラのカーソル（キャラ選択の外は `CURSOR_NONE`）。0〜15 の外は
-    /// `CURSOR_NONE` にする（相手の decode は範囲の外の MENU を丸ごと捨てる）。
+    /// 次に送るMENUに載せる自分の画面と自分のサイドのキャラのカーソルを設定する（キャラ選択の外は`CURSOR_NONE`）。
+    /// 0〜15の外は`CURSOR_NONE`にする（相手のdecodeは範囲の外のMENUを丸ごと捨てる）。
     pub fn set_own_cursor(&mut self, screen: u8, cursor: u8) {
         self.own_screen = screen;
         self.own_cursor = if cursor <= 15 { cursor } else { CURSOR_NONE };
     }
 
-    /// 相手の席の最新の位置（見るだけ。`moved` は消さない）。
+    /// 相手のサイドの最新の位置（見るだけ。`moved`は消さない）。
     pub fn peer_cursor(&self) -> Option<PeerCursor> {
         self.peer_cursor
     }
 
-    /// 相手の席の最新の位置（同じ step の MENU から）。返した後、`moved` を消す（位置は持ったまま）。
+    /// 相手のサイドの最新の位置（同じstepのMENUから）。返した後`moved`を消す（位置は持ったまま）。
     pub fn take_peer_cursor(&mut self) -> Option<PeerCursor> {
         let pc = self.peer_cursor?;
         if let Some(p) = self.peer_cursor.as_mut() {
@@ -414,7 +432,7 @@ impl Selection {
         self.peer_ctrl_at = None;
     }
 
-    /// 今の step の相手の MENU から、相手の席の位置を取る。`end` はその MENU の入力ワードの終わりの番号。
+    /// 今のstepの相手のMENUから相手のサイドの位置を取る。`end`はそのMENUの入力ワードの終わりの番号。
     fn note_peer_cursor(&mut self, m: &Menu, words: &[u16], end: u32) {
         for (i, &w) in words.iter().enumerate() {
             if w & KEY_CTRL != 0 {
@@ -423,11 +441,11 @@ impl Selection {
             }
         }
         if end < self.peer_cursor_end {
-            // 入れ替わって遅れて届いた古い MENU。
+            // 入れ替わって遅れて届いた古いMENU。
             return;
         }
-        // 前の位置を運んだ MENU のいちばん新しい語（番号 `peer_cursor_end − 1`）から、この MENU のいちばん新しい語までに Ctrl が
-        // あれば、その間の動きは「ランダム」と見る（位置は語の 1 つ前までの結果なので、前の MENU の最後の語から数える）。
+        // 前の位置を運んだMENUのいちばん新しいワード（番号`peer_cursor_end − 1`）から、このMENUのいちばん新しいワードまでにCtrlがあればその間の動きは「ランダム」と見る。
+        // 位置はワードの1つ前までの結果なので、前のMENUの最後のワードから数える。
         let random = self
             .peer_ctrl_at
             .is_some_and(|n| n.saturating_add(1) >= self.peer_cursor_end);
@@ -446,9 +464,11 @@ impl Selection {
         });
     }
 
-    /// 1 フレームぶん。`local` は画面を移るビットを落とした自分の入力ワード、`press` は画面を移る押下（ゲームがこのフレームに押下を読む
-    /// 状態のときだけ渡す）。`ready_ok` は持っている押下をこのフレームにゲームへ入れられるか（false なら持ち越す）。
-    /// このフレームの語は押下で画面が移る前の画面で使われるので、押下を入れる前の step に数える。
+    /// 1フレームぶん。
+    /// `local`は画面を移るビットを落とした自分の入力ワード。
+    /// `press`は画面を移る押下（ゲームがこのフレームに押下を読む状態のときだけ渡す）。
+    /// `ready_ok`は持っている押下をこのフレームにゲームへ書き込めるかどうか（falseなら持ち越す）。
+    /// このフレームのワードは押下で画面が移る前の画面で使われる。そのため押下を書き込む前のstepに数える。
     pub fn local_frame(&mut self, local: u16, press: Option<Press>, ready_ok: bool) -> FrameOut {
         let remote = self.next_remote();
         self.tx_ring[slot(self.tx_next)] = local;
@@ -462,8 +482,8 @@ impl Selection {
             let stays = self.stays_on_screen(&st);
             self.advance_step(stays);
             if stays {
-                // 押下を入れたフレームの自分の入力ワードは同じ画面でカーソルを動かしている。前の step の MENU はもう作らないので、
-                // 新しい step の 0 番に積み直す。
+                // 押下を書き込んだフレームの自分の入力ワードは同じ画面でカーソルを動かしている。
+                // 前のstepのMENUはもう作らないので新しいstepの0番に積み直す。
                 self.tx_ring[slot(0)] = local;
                 self.tx_next = 1;
             }
@@ -474,8 +494,8 @@ impl Selection {
         FrameOut { remote, apply }
     }
 
-    /// 入れた押下 `st` の後も同じ画面に残るか（相手の入力ワードを step をまたいで続けるか）を決め、画面の模型を進める。
-    /// 合わせは false（合わせの値がそれより前の語を全部含むので、続けると二重に動く）。
+    /// 書き込んだ押下`st`の後も同じ画面に残るか（相手の入力ワードをstepをまたいで続けるか）を判定し、画面のモデルを進める。
+    /// 合わせはfalse（合わせの値がそれより前のワードを全部含むので続けると二重に動く）。
     fn stays_on_screen(&mut self, st: &Step) -> bool {
         let mut model = match self.screens {
             Screens::Lost => return false,
@@ -489,15 +509,15 @@ impl Selection {
                 outcome == Outcome::Stay && st.kind != StepKind::Align && model.screen() == before
             }
             Err(_) => {
-                // 模型と食い違った。古い画面の語を新しい画面へ入れるより、捨てる側に倒す。
+                // モデルと食い違った。古い画面のワードを新しい画面へ渡すより捨てる側に倒す。
                 self.screens = Screens::Lost;
                 false
             }
         }
     }
 
-    /// 次の `local_frame` が `ready_ok = true` なら入れる、持っている押下（ホスト: 受けたゲストの要求 / ゲスト: 届いた STEP）。
-    /// dll はこれを見て、ゲームがその押下を読む状態かを決める。
+    /// 持っている押下（ホスト: 受けたゲストの要求 / ゲスト: 届いたSTEP）。次の`local_frame`が`ready_ok = true`なら書き込む。
+    /// dllはこれを見て、ゲームがその押下を読む状態かどうかを判定する。
     pub fn next_apply(&self) -> Option<Step> {
         match self.role {
             Role::Host => {
@@ -514,11 +534,11 @@ impl Selection {
     /// ホスト: このフレームで決める押下。自分の押下を先に見る（同じフレームにゲストの要求があってもホストを採る）。
     fn host_decide(&mut self, press: Option<Press>, ready_ok: bool) -> Option<Step> {
         let req = self.held_req.take();
-        // 前の STEP がゲストに届いたか = ゲストの MENU か STEP_REQ の step がそれを越えた。
+        // 前のSTEPがゲストに届いたかどうか = ゲストのMENUかSTEP_REQのstepがそれを越えた。
         let delivered = self.guest_step >= self.step;
         let open = self.active && self.present && delivered && self.step < u16::MAX;
         if !open {
-            // 1 往復より短い間に画面を 2 回移る押下は人の手では出ないので捨てる。覚えておくと、ホストの画面が遅れて勝手に移る。
+            // 1往復より短い間に画面を2回移る押下は人の手では出ないので捨てる。持ち越すとホストの画面が遅れて勝手に移る。
             if press.is_some() {
                 self.counters.press_dropped = self.counters.press_dropped.saturating_add(1);
             }
@@ -529,14 +549,14 @@ impl Selection {
         }
         let p = match (press, req) {
             (Some(p), Some(_)) => {
-                // ゲストの要求は step の食い違いで捨てられる。
+                // ゲストの要求はstepの食い違いで捨てられる。
                 self.counters.req_dropped = self.counters.req_dropped.saturating_add(1);
                 p
             }
             (Some(p), None) => p,
             (None, Some(r)) if ready_ok => r,
             (None, Some(r)) => {
-                // ゲームがまだ読まない（入る演出の間など）。同じ step のまま持ち越す。
+                // ゲームがまだ読まない（入る演出の間など）。同じstepのまま持ち越す。
                 self.held_req = Some(r);
                 return None;
             }
@@ -548,7 +568,7 @@ impl Selection {
         Some(st)
     }
 
-    /// ゲスト: 自分の押下は入れずに要求にし、届いた STEP を step の順に入れる。
+    /// ゲスト: 自分の押下はゲームへ書き込まず要求にして、届いたSTEPをstepの順に書き込む。
     fn guest_take(&mut self, press: Option<Press>, ready_ok: bool) -> Option<Step> {
         if let Some(p) = press {
             // 相手が来ていなければ要求しない（どちらも画面を移れない）。要求を持っている間の押下は捨てる。
@@ -560,12 +580,12 @@ impl Selection {
             }
         }
         if !ready_ok {
-            // 届いた STEP は、ゲームが読む状態になるまで持ち越す。
+            // 届いたSTEPはゲームが読む状態になるまで持ち越す。
             return None;
         }
         let st = self.ready.take()?;
         if st.step != self.step {
-            // on_step で step を見てから保持するので来ない。
+            // on_stepでstepを見てから保持するので来ない。
             self.counters.impossible = self.counters.impossible.saturating_add(1);
             return None;
         }
@@ -575,18 +595,19 @@ impl Selection {
         Some(st)
     }
 
-    /// step を 1 進め、ワードの番号を 0 から数え直す。`stays`（同じ画面に残る step）なら相手の入力ワードの残りを前の step の分として持ち、
-    /// 直前の入力ワードも続ける。画面が移る step なら残りを捨てて直前の入力ワードを 0 に戻す。
+    /// stepを1進めワードの番号を0から数え直す。
+    /// `stays`（同じ画面に残るstep）なら相手の入力ワードの残りを前のstepの分として持ち、直前の入力ワードも続ける。
+    /// 画面が移るstepなら残りを捨てて直前の入力ワードを0に戻す。
     fn advance_step(&mut self, stays: bool) {
         if stays {
-            // 前の step の残りをまだ持っていたら（新しい step の入力ワードを 1 つも渡さないうちにもう 1 つ来た）捨てる。
+            // 前のstepの残りをまだ持っていたら（新しいstepの入力ワードを1つも渡さないうちにもう1つ来た）捨てる。
             self.prev_rx = self.rx;
             self.prev_step = Some(self.step);
         } else {
             self.prev_step = None;
             self.rx_last = 0;
         }
-        // 位置は同じ画面に残る step なら持ち越す（相手はその画面で動き続けている）。語の番号は step ごとに 0 から。
+        // 位置は同じ画面に残るstepなら持ち越す（相手はその画面で動き続けている）。ワードの番号はstepごとに0から。
         let kept = if stays { self.peer_cursor } else { None };
         self.forget_peer_cursor();
         self.peer_cursor = kept;
@@ -597,11 +618,12 @@ impl Selection {
         self.rx = RxWords::EMPTY;
     }
 
-    /// 相手の入力ワードを 1 つ。次の入力ワードがまだ無ければ直前の入力ワードを続ける（0 にすると押し続けた方向が一瞬離れ、カーソルが余分に動く）。
-    /// 前の step の残りがあれば先に渡す。
+    /// 相手の入力ワードを1つ。次の入力ワードがまだ無ければ直前の入力ワードを続ける（0にすると押し続けた方向が一瞬離れてカーソルが余分に動く）。
+    /// 前のstepの残りがあれば先に渡す。
     fn next_remote(&mut self) -> u16 {
-        // 語が溜まっているとき、「何も押していない」語が続く分は飛ばして追いつく（押した瞬間も押している長さも変わらない）。
-        // 溜まりの原因の 1 つは、ゲストが合わせを入れる前の入る演出（8〜9 tick）の間にホストが送り続けた語。押している語は飛ばさない。
+        // ワードが溜まっているときは「何も押していない」ワードが続く分を飛ばして追いつく（押した瞬間も押している長さも変わらない）。
+        // 溜まりの原因の1つは、ゲストが合わせを書き込む前の入る演出（8〜9 tick）の間にホストが送り続けたワード。
+        // 押しているワードは飛ばさない。
         while self.queued() > 1 && self.rx_last == 0 && self.front() == Some(0) {
             self.pop();
         }
@@ -611,7 +633,7 @@ impl Selection {
         self.rx_last
     }
 
-    /// 溜まっていてまだ渡していない相手の入力ワードの数（前の step の残りと今の step の分）。
+    /// 溜まっていてまだ渡していない相手の入力ワードの数（前のstepの残りと今のstepの分）。
     fn queued(&self) -> u32 {
         let prev = if self.prev_step.is_some() {
             self.prev_rx.len()
@@ -635,12 +657,12 @@ impl Selection {
             return Some(w);
         }
         let w = self.rx.pop()?;
-        // 新しい step の入力ワードを渡し始めた。この後に前の step の入力ワードが遅れて届いても、渡すと順が入れ替わるので受けない。
+        // 新しいstepの入力ワードを渡し始めた。この後に前のstepの入力ワードが遅れて届いても渡すと順が入れ替わるので受けない。
         self.prev_step = None;
         Some(w)
     }
 
-    /// 毎フレーム送る MENU。未 ack の新しい方から 32 ワードまで。選択の外では返さない。
+    /// 毎フレーム送るMENU。未ackの新しい方から32ワードまで。選択の外では返さない。
     pub fn build_menu(&self) -> Option<Menu> {
         if !self.active {
             return None;
@@ -664,7 +686,7 @@ impl Selection {
         })
     }
 
-    /// ホスト: ゲストが step `s` にいると分かった。自分の step より大きい値は手順の外として数えない。
+    /// ホスト: ゲストがstep `s`にいると分かった。自分のstepより大きい値は手順の外として数えない。
     fn note_guest_step(&mut self, s: u16) {
         if s > self.step {
             self.counters.impossible = self.counters.impossible.saturating_add(1);
@@ -673,15 +695,15 @@ impl Selection {
         }
     }
 
-    /// 相手の MENU。自分と違う step のものは捨てる（ホストは ack として step だけ見る）。ただし同じ画面に残る step の後は、
-    /// 1 つ前の step の MENU の入力ワードも残りとして受ける。
+    /// 相手のMENU。自分と違うstepのものは捨てる（ホストはackとしてstepだけ見る）。
+    /// ただし同じ画面に残るstepの後は1つ前のstepのMENUの入力ワードも残りとして受ける。
     pub fn on_menu(&mut self, m: &Menu) {
         if self.role == Role::Host {
             self.note_guest_step(m.step);
         }
         let count = (m.count as usize).min(MAX_WORDS);
         if self.active && self.prev_step == Some(m.step) {
-            // 前の step の残り。ack は前の step の自分の入力ワードの番号なので見ない。「相手が来た」はもう立っている。
+            // 前のstepの残り。ackは前のstepの自分の入力ワードの番号なので見ない。「相手が来た」はもう立っている。
             if !self.prev_rx.receive(m.base, &m.words[..count]) {
                 self.counters.impossible = self.counters.impossible.saturating_add(1);
             }
@@ -693,7 +715,7 @@ impl Selection {
         }
         self.present = true;
         let first = std::mem::take(&mut self.fresh);
-        // 送っていない番号まで ack されることは無いが、来ても送った所で止める。
+        // 送っていない番号までackされることは無いが、来ても送った所で止める。
         let ack = m.ack.min(self.tx_next);
         if ack > self.tx_acked {
             self.tx_acked = ack;
@@ -702,22 +724,22 @@ impl Selection {
             self.counters.impossible = self.counters.impossible.saturating_add(1);
             return;
         }
-        // `receive` が true なら `base + count` は桁あふれしない。
+        // `receive`がtrueなら`base + count`は桁あふれしない。
         self.note_peer_cursor(m, &m.words[..count], m.base.saturating_add(count as u32));
         if first && self.rx.len() > 1 {
-            // 選択に入って最初の MENU: 相手が入る前から溜めていた古い入力ワードは再生しない（再生すると以後の入力ワードもその分遅れる）。
+            // 選択に入って最初のMENU: 相手が入る前から溜めていた古い入力ワードは再生しない（再生すると以後の入力ワードもその分遅れる）。
             self.rx.play = self.rx.end - 1;
         }
     }
 
-    /// ゲストの STEP_REQ（ホストだけが意味を持つ）。自分と同じ step の要求だけを、次の `local_frame` まで持つ。
+    /// ゲストのSTEP_REQ（ホストだけが意味を持つ）。自分と同じstepの要求だけを次の`local_frame`まで持つ。
     pub fn on_step_req(&mut self, r: &Step) {
         if self.role != Role::Host {
             self.counters.impossible = self.counters.impossible.saturating_add(1);
             return;
         }
         if r.kind == StepKind::Align {
-            // 合わせを出すのはホストだけ（wire の decode も捨てる。ここは状態機械を直に呼ぶ経路の守り）。
+            // 合わせを出すのはホストだけ（wireのdecodeも捨てる。ここはステートマシンを直に呼ぶ経路の守り）。
             self.counters.impossible = self.counters.impossible.saturating_add(1);
             return;
         }
@@ -735,8 +757,8 @@ impl Selection {
         }
     }
 
-    /// ホストの STEP（ゲストだけが意味を持つ）。自分の step と同じものだけを次の `local_frame` で入れる。
-    /// 古いものは重複なので捨てる。新しすぎるものは来ない（ホストは前の STEP が届くまで次を決めない）。
+    /// ホストのSTEP（ゲストだけが意味を持つ）。自分のstepと同じものだけを次の`local_frame`で書き込む。
+    /// 古いものは重複なので捨てる。新しすぎるものは来ない（ホストは前のSTEPが届くまで次を決めない）。
     pub fn on_step(&mut self, s: &Step) {
         if self.role != Role::Guest || s.step > self.step {
             self.counters.impossible = self.counters.impossible.saturating_add(1);
@@ -751,7 +773,7 @@ impl Selection {
         }
     }
 
-    /// 自分の SELECT を決める（マップの決定を入れたフレームに呼ぶ）。ゲストはホストだけが意味を持つ欄を 0 にする。2 度目以降は無視する。
+    /// 自分のSELECTを決める（マップの決定を書き込んだフレームに呼ぶ）。ゲストはホストだけが意味を持つフィールドを0にする。2度目以降は無視する。
     pub fn set_local_select(&mut self, sel: &Select) {
         if self.own_select.is_some() {
             return;
@@ -770,7 +792,7 @@ impl Selection {
         self.select_acks_final_step();
     }
 
-    /// 相手の SELECT。match_no の合うものの最初の 1 通だけ受ける。
+    /// 相手のSELECT。match_noの合うものの最初の1通だけ受ける。
     pub fn on_select(&mut self, s: &Select) {
         if s.match_no != self.match_no || self.peer_select.is_some() {
             self.counters.select_dropped = self.counters.select_dropped.saturating_add(1);
@@ -780,8 +802,8 @@ impl Selection {
         self.select_acks_final_step();
     }
 
-    /// ホスト: ゲストはマップの決定を入れてから SELECT を送るので、ゲストの SELECT は最後の STEP の ack を兼ねる。
-    /// ゲストの MENU は選択を出た後は来ないので、これが無いと送り直しが止まらない。
+    /// ホスト: ゲストはマップの決定を書き込んでからSELECTを送るので、ゲストのSELECTは最後のSTEPのackを兼ねる。
+    /// ゲストのMENUは選択を出た後は来ないので、これが無いと送り直しが止まらない。
     fn select_acks_final_step(&mut self) {
         if self.role == Role::Host && self.own_select.is_some() && self.peer_select.is_some() {
             let s = self.own_select_step.min(self.step);
@@ -791,8 +813,9 @@ impl Selection {
         }
     }
 
-    /// 相手の最初の INPUT が届いた。自分の SELECT の送り直しをやめる。dll は、これから始まるマッチの seg の INPUT が届いたときだけ呼ぶこと
-    /// （前のマッチの INPUT を数えると、相手に SELECT が届かないまま送り直しが止まる）。自分の SELECT を決める前の呼び出しは数えない。
+    /// 相手の最初のINPUTが届いた。自分のSELECTの送り直しをやめる。
+    /// dllはこれから始まるマッチのINPUTが届いたときだけ呼ぶこと（前のマッチのINPUTを数えると、相手にSELECTが届かないまま送り直しが止まる）。
+    /// 自分のSELECTを決める前の呼び出しは数えない。
     pub fn on_peer_input(&mut self) {
         if self.own_select.is_some() {
             self.peer_input_seen = true;
@@ -803,7 +826,7 @@ impl Selection {
         self.own_select.is_some() && self.peer_select.is_some()
     }
 
-    /// 揃った値。マップ・難易度・ホストだけの値はホストの SELECT から採り、食い違いに印を立てる。
+    /// 揃った値。マップ・難易度・ホストだけの値はホストのSELECTから採り、食い違いのフラグを立てる。
     pub fn agreed(&self) -> Option<Agreed> {
         let own = self.own_select?;
         let peer = self.peer_select?;
@@ -827,7 +850,7 @@ impl Selection {
         })
     }
 
-    /// いま送るもの（新しいものはすぐ、送り直しは `RESEND_MS` ごと）。
+    /// いま送るもの（新しいものはすぐ、送り直しは`RESEND_MS`ごと）。
     pub fn poll_send(&mut self, now: u32) -> Outbox {
         let mut out = Outbox::default();
         match self.role {
@@ -863,8 +886,8 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
-    //! 部品ごとの検査と、2 台の模型（1 ms 刻みの時計・方向ごとの送達の列・約 16 ms ごとのフレーム・4 ms ごとの送り直し）の検査。
-    //! 2 台の模型の合格の不変量は `check_logs`。
+    //! 部品ごとの検査と2台のモデル（1 ms刻みの時計・方向ごとの送達の列・約16 msごとのフレーム・4 msごとの送り直し）の検査。
+    //! 2台のモデルの合格の不変量は`check_logs`。
 
     use super::*;
     use std::collections::HashMap;
@@ -915,7 +938,7 @@ mod tests {
         }
     }
 
-    // ================= 2 台の模型 =================
+    // ================= 2台のモデル =================
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Dir {
@@ -923,7 +946,7 @@ mod tests {
         G2H,
     }
 
-    /// 送達の筋書きが見る種類。旧バージョンの模型では要求が Req、了承 / 断りが Step。
+    /// 送達の筋書きが見る種類。旧バージョンのモデルでは要求がReq、了承 / 断りがStep。
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Kind {
         Menu,
@@ -933,7 +956,7 @@ mod tests {
         Other,
     }
 
-    /// 送達の筋書きに渡すもの。`nth` は（向き・種類・step）ごとの何通目か（0 から）。
+    /// 送達の筋書きに渡すもの。`nth`は（向き・種類・step）ごとの何通目か（0から）。
     #[derive(Clone, Copy, Debug)]
     struct Ctx {
         now: u32,
@@ -943,7 +966,7 @@ mod tests {
         nth: u32,
     }
 
-    /// 片方の機械。新しい手順（`NewNode`）と旧バージョンのコピー（`OldNode`）を同じ模型で回すための形。
+    /// 片方のノード。新しい手順（`NewNode`）と旧バージョンのコピー（`OldNode`）を同じモデルで回すためのトレイト。
     trait Node {
         type Msg: Clone;
         fn frame(&mut self, now: u32, press: Pr, out: &mut Vec<Self::Msg>);
@@ -961,7 +984,7 @@ mod tests {
         guest_period: u32,
     }
 
-    /// 決め打ちの筋の既定: ホストのフレームは 0, 16, 32, …、ゲストは 8, 24, 40, …。片道 10 ms。
+    /// 決め打ちの筋の既定: ホストのフレームは0, 16, 32, …、ゲストは8, 24, 40, …。片道10 ms。
     const CFG: Cfg = Cfg {
         end: 1000,
         host_phase: 0,
@@ -970,8 +993,7 @@ mod tests {
         guest_period: 16,
     };
 
-    /// 方向ごとの送達の列。筋書きが返す遅れの列の数だけ届く（空 = 落とす、2 つ = 重ねる、
-    /// 遅れの違い = 入れ替える）。
+    /// 方向ごとの送達の列。筋書きが返す遅れの列の数だけ届く（空 = 落とす・2つ = 重ねる・遅れの違い = 入れ替える）。
     struct Net<M> {
         q: Vec<(u32, u64, Dir, M)>,
         seq: u64,
@@ -1020,7 +1042,7 @@ mod tests {
         }
     }
 
-    /// 1 ms ずつ: 届いたものを渡す → フレームの来た側が 1 フレーム進む → 両者が送り直しを見る。
+    /// 1 msずつ: 届いたものを渡す → フレームの来た側が1フレーム進む → 両者が送り直しを見る。
     fn run<N: Node>(
         h: &mut N,
         g: &mut N,
@@ -1068,8 +1090,8 @@ mod tests {
         vec![10]
     }
 
-    /// 合格の不変量。step が 0 から抜けも重なりも無く並び、ゲストの列はホストの列の先頭と一致する。
-    /// `final_eq` なら全部一致する。
+    /// 合格の不変量。stepが0から抜けも重なりも無く並び、ゲストの列はホストの列の先頭と一致する。
+    /// `final_eq`なら全部一致する。
     fn check_logs(h: &[Entry], g: &[Entry], final_eq: bool) -> Result<(), String> {
         for (who, log) in [("host", h), ("guest", g)] {
             for (i, e) in log.iter().enumerate() {
@@ -1089,12 +1111,12 @@ mod tests {
         Ok(())
     }
 
-    /// 検査の筋で「選択を出る押下」とみなすもの（取消で value の下 2 ビットが 3）。
+    /// 検査のシナリオで「選択を出る押下」とみなすもの（キャンセルでvalueの下2ビットが3）。
     fn is_exit(st: &Step) -> bool {
         st.kind == StepKind::Cancel && st.value % 4 == 3
     }
 
-    /// 新しい手順の 1 台。dll の呼ぶ順（モジュール doc）で呼ぶ。
+    /// 新しい手順の1台。dllの呼ぶ順（モジュールdoc）で呼ぶ。
     struct NewNode {
         sel: Selection,
         log: Vec<Entry>,
@@ -1109,12 +1131,12 @@ mod tests {
         steps_sent: Vec<(u32, Entry)>,
         applied_at: Vec<u32>,
         exits_done: u32,
-        /// 押下を入れた後の「入る演出」の長さの上限（フレーム。0 なら演出なし）。演出の間はゲームが押下を読まない模型。
+        /// 押下を書き込んだ後の「入る演出」の長さの上限（フレーム。0なら演出なし）。演出の間はゲームが押下を読まないモデル。
         busy_max: u32,
         busy_left: u32,
-        /// 演出の間に、持っている押下を持ち越したフレームの数。
+        /// 演出の間に持っている押下を持ち越したフレームの数。
         held_frames: u32,
-        /// 演出の間に押下が入ってしまった数（0 でなければ誤り）。
+        /// 演出の間に押下が書き込まれてしまった数（0でなければ誤り）。
         applied_while_busy: u32,
     }
 
@@ -1155,12 +1177,12 @@ mod tests {
                 }
             }
             self.frame_no += 1;
-            // 語は送り手ごとに一意で 0 にならない（受け手が並びと重複を検証できるように）。
+            // ワードは送信側ごとに一意で0にならない（受信側が並びと重複を検証できるように）。
             let word = 0x8000 | (self.frame_no & 0x7FFF) as u16;
             let s = self.sel.step();
             let busy = self.busy_left > 0;
             self.busy_left = self.busy_left.saturating_sub(1);
-            // 演出の間は、ゲームが押下を読まないので、自分の押下も押下にしない。
+            // 演出の間はゲームが押下を読まないので自分の押下も押下にしない。
             let press = if busy { None } else { press };
             if busy && self.sel.next_apply().is_some() {
                 self.held_frames += 1;
@@ -1178,7 +1200,7 @@ mod tests {
                 self.log.push((st.step, st.kind, st.value));
                 self.applied_at.push(now);
                 if self.exits && is_exit(&st) {
-                    // 選択を出る押下を入れたフレームは、MENU を作る前に leave。
+                    // 選択を出る押下を書き込んだフレームはMENUを作る前にleaveを呼ぶ。
                     self.sel.leave();
                     self.exits_done += 1;
                     self.reenter_at = Some(now + 30 + self.rng.below(300));
@@ -1229,8 +1251,8 @@ mod tests {
         }
     }
 
-    /// 受け手がゲームへ渡した相手の入力ワード（直前の入力ワードの繰り返しと 0 を除く）が、step ごとに、
-    /// 送り手の積んだ入力ワードの部分列になっている（順が入れ替わらない・作られない）。検証した入力ワードの数を返す。
+    /// 受信側がゲームへ渡した相手の入力ワード（直前の入力ワードの繰り返しと0を除く）が、stepごとに送信側の積んだ入力ワードの部分列になっているかを検証する（順が入れ替わらない・作られない）。
+    /// 検証した入力ワードの数を返す。
     fn words_ok(sent: &[(u16, u16)], got: &[(u16, u16)]) -> Result<usize, String> {
         let mut by_step: HashMap<u16, Vec<u16>> = HashMap::new();
         for &(s, w) in sent {
@@ -1262,8 +1284,10 @@ mod tests {
 
     // ================= 旧バージョンのコピー（対称の了承制） =================
 
-    /// 旧バージョンの手順を再現した模型: 要求した側は了承を受けて入れる。受けた側は了承を返して入れる。了承待ちの間に同じ step の
-    /// 要求を受けたら、ホストは断り、ゲストは取り下げて了承する。違う step は断る。書いていない所は旧バージョンに有利に読んだ。
+    /// 旧バージョンの手順を再現したモデル。
+    /// 要求した側は了承を受けて書き込む。受けた側は了承を返して書き込む。
+    /// 了承待ちの間に同じstepの要求を受けたら、ホストは断り、ゲストは取り下げて了承する。
+    /// 違うstepは断る。書いていない所は旧バージョンに有利に読んだ。
     #[derive(Clone, Debug)]
     enum OldMsg {
         Req(u16, StepKind, u8),
@@ -1357,7 +1381,7 @@ mod tests {
 
     #[test]
     fn old_symmetric_protocol_diverges_on_note_scenario() {
-        // ホストの P のコピーの 1 通だけが遅れ、step の追いついたゲストが Q を了承待ちで持つ時刻に届く。
+        // ホストのPのコピーの1通だけが遅れ、stepの追いついたゲストがQを了承待ちで持つ時刻に届く。
         let mut h = OldNode::new(true);
         let mut g = OldNode::new(false);
         let cfg = Cfg {
@@ -1423,7 +1447,7 @@ mod tests {
 
     #[test]
     fn new_protocol_agrees_on_note_scenario_stale_request_copy() {
-        // Q のコピーの 1 通だけが遅れ、ゲストが step 1 で R を要求してホストが R を持っている時刻に届く。
+        // Qのコピーの1通だけが遅れ、ゲストがstep 1でRを要求してホストがRを持っている時刻に届く。
         let mut h = NewNode::new(Role::Host, 0, false, 1);
         let mut g = NewNode::new(Role::Guest, 0, false, 2);
         let mut faults = |c: Ctx| match (c.dir, c.kind, c.step, c.nth) {
@@ -1673,7 +1697,7 @@ mod tests {
         assert_eq!(g.exits_done, 1);
     }
 
-    // ================= 固定 seed の乱数 =================
+    // ================= 固定seedの乱数 =================
 
     fn random_cfg(rng: &mut Rng, end: u32) -> Cfg {
         Cfg {
@@ -1685,11 +1709,11 @@ mod tests {
         }
     }
 
-    /// 乱れる時間（ms）。これより後は落とさず 5〜14 ms で届け、送り直しが片付くのを見る。
+    /// 乱れる時間（ms）。これより後は落とさず5〜14 msで届けて送り直しが終わるのを見る。
     const CHAOS_UNTIL: u32 = 2500;
     const RANDOM_END: u32 = 4000;
 
-    /// 20% 落とす・残りの 10% を重ねる・遅れは 3〜62 ms（入れ替わる）。
+    /// 20%落とす・残りの10%を重ねる・遅れは3〜62 ms（入れ替わる）。
     fn chaos_faults(seed: u64) -> impl FnMut(Ctx) -> Vec<u32> {
         let mut r = Rng(seed ^ 0xA5A5_A5A5);
         move |c: Ctx| {
@@ -1706,8 +1730,8 @@ mod tests {
         }
     }
 
-    /// 両者がでたらめに押す（フレームごとに 10%）。ホストの value は 0〜3、ゲストは 4〜7
-    /// （入った押下が誰のものか分かるように）。
+    /// 両者がでたらめに押す（フレームごとに10%）。
+    /// ホストのvalueは0〜3でゲストは4〜7にする（書き込んだ押下が誰のものか分かるように）。
     fn chaos_presses(seed: u64) -> impl FnMut(Role, u32, u16) -> Pr {
         let mut r = Rng(seed ^ 0x5A5A_5A5A);
         move |role: Role, now: u32, _: u16| {
@@ -1784,7 +1808,7 @@ mod tests {
             }
         }
         eprintln!("selection random (1000 seed): {tally:?}");
-        // 効く期間が本当に踏まれていること（0 なら何も測れていない）。
+        // 効く期間が本当に踏まれていること（0なら何も測れていない）。
         assert!(tally.entries > 1000, "{tally:?}");
         assert!(tally.by_guest > 100, "{tally:?}");
         assert!(tally.exits > 100, "{tally:?}");
@@ -1858,7 +1882,7 @@ mod tests {
         }
     }
 
-    /// 相手の席の位置つきの MENU（画面 8）。
+    /// 相手のサイドの位置つきのMENU（画面8）。
     fn menu_at(step: u16, base: u32, ws: &[u16], cursor: u8) -> Menu {
         Menu {
             screen: SCREEN_CHARA,
@@ -1912,7 +1936,7 @@ mod tests {
         assert_eq!(h.local_frame(0, None, false).apply, None);
         assert_eq!(h.next_apply(), Some(req), "持ち越した");
         assert_eq!(h.local_frame(0, None, true).apply, Some(req));
-        // 前の STEP がゲストに届く前は、自分の step の要求があっても next_apply に出ない。
+        // 前のSTEPがゲストに届く前は自分のstepの要求があってもnext_applyに出ない。
         let mut h2 = present(Role::Host);
         h2.on_step_req(&req);
         assert!(h2.local_frame(0, None, true).apply.is_some());
@@ -1922,7 +1946,7 @@ mod tests {
             screen: 16,
         });
         assert_eq!(h2.next_apply(), None, "前の STEP が届く前");
-        // 相手の要求を持ち越している間に自分の押下が来たら、自分の押下を採る。
+        // 相手の要求を持ち越している間に自分の押下が来たら自分の押下を採る。
         h.on_step_req(&Step { step: 1, ..req });
         assert_eq!(h.next_apply(), Some(Step { step: 1, ..req }));
         assert_eq!(h.local_frame(0, None, false).apply, None);
@@ -2052,7 +2076,7 @@ mod tests {
         assert_eq!(h.poll_send(40).step, None);
     }
 
-    // ================= 部品: MENU の入力ワード =================
+    // ================= 部品: MENUの入力ワード =================
 
     #[test]
     fn menu_words_in_order_one_per_frame_then_hold_last() {
@@ -2171,7 +2195,7 @@ mod tests {
         assert!(st.is_some(), "選択を出る取消を入れた");
         h.leave();
         assert!(h.build_menu().is_none(), "出た後");
-        // ゲストが出た後に作った MENU が、次の選択に入ったホストに遅れて届くと「来た」になる。だから作らない。
+        // ゲストが出た後に作ったMENUが次の選択に入ったホストに遅れて届くと「来た」になる。だから作らない。
         let mut tail = Selection::new(Role::Guest);
         tail.enter();
         tail.on_menu(&menu(0, 0, 0, &[]));
@@ -2360,7 +2384,8 @@ mod tests {
     // ================= 合わせ =================
 
     const AL: StepKind = StepKind::Align;
-    /// 合わせを使う画面（マップ）。下の 2 台の模型の「2 つのカーソル」は合わせの値の詰め方を検証するための抽象で、画面の意味は持たない。
+    /// 合わせを使う画面（マップ）。下の2台のモデルの「2つのカーソル」は合わせの値の詰め方を検証するための抽象。
+    /// 画面の意味は持たない。
     const SCR: u8 = 16;
 
     fn align_press(value: u8, screen: u8) -> Option<Press> {
@@ -2478,7 +2503,7 @@ mod tests {
         assert_eq!(g.build_menu().map(|m| m.ack), Some(1));
     }
 
-    // ================= 相手の席の位置（キャラ選択） =================
+    // ================= 相手のサイドの位置（キャラ選択） =================
 
     fn peer(s: &mut Selection) -> Option<(u8, u8, bool)> {
         s.take_peer_cursor().map(|p| (p.screen, p.cursor, p.moved))
@@ -2530,7 +2555,7 @@ mod tests {
         }
     }
 
-    /// ランダム（Ctrl）を離した直後の 1 回と、ランダムの後の本当の移動も見る。
+    /// ランダム（Ctrl）を離した直後の1回とランダムの後の本当の移動も見る。
     #[test]
     fn moves_during_the_random_are_not_moves() {
         let mut g = present(Role::Guest);
@@ -2548,7 +2573,7 @@ mod tests {
         g.on_menu(&menu_at(0, 4, &[0], 7));
         g.on_menu(&menu_at(0, 5, &[0, 0], 8));
         assert_eq!(peer(&mut g), Some((8, 8, true)), "ランダムの後の移動");
-        // 1 通に何語も載る（ack が遅れる）ときも、前の位置の後の語だけを見る。
+        // 1通に何ワードも載る（ackが遅れる）ときも前の位置の後のワードだけを見る。
         g.on_menu(&menu_at(0, 7, &[KEY_CTRL, 0, 0], 9));
         assert_eq!(peer(&mut g), Some((8, 9, false)), "前の位置の後の語に Ctrl");
         g.on_menu(&menu_at(0, 10, &[0, 0, 0], 10));
@@ -2618,7 +2643,7 @@ mod tests {
         );
     }
 
-    /// 範囲の外の位置は `CURSOR_NONE` にして送る（相手の decode が MENU ごと捨てるため）。
+    /// 範囲の外の位置は`CURSOR_NONE`にして送る（相手のdecodeがMENUごと捨てるため）。
     #[test]
     fn build_menu_carries_the_own_cursor() {
         let mut h = present(Role::Host);
@@ -2637,12 +2662,12 @@ mod tests {
         assert_eq!((m.screen, m.cursor), (SCREEN_MAP, CURSOR_NONE));
     }
 
-    // ---- 合わせの 2 台の模型（カーソルを持つ） ----
+    // ---- 合わせの2台のモデル（カーソルを持つ） ----
 
     use crate::input_model::keys;
     use crate::menu_model::APPLY_CLEAR_BITS;
 
-    /// 模型の 2 つのカーソル（0〜15）を合わせの value の 1 バイトに詰める・戻す。
+    /// モデルの2つのカーソル（0〜15）を合わせのvalueの1バイトに詰める・戻す。
     fn pack2(c: [u8; 2]) -> u8 {
         (c[0] & 0x0F) | (c[1] << 4)
     }
@@ -2651,8 +2676,9 @@ mod tests {
         [v & 0x0F, v >> 4]
     }
 
-    /// 合わせの検査の 1 台。画面 `SCR` で 2 つのカーソル（0〜15）を持ち、dll の `menu_tick` と同じ順に `Selection` を呼ぶ。
-    /// ゲームは語の押した瞬間（右 = +1、左 = −1）で席ごとのカーソルを動かす。合わせを受けたゲストは、書いてからその tick は動かさない。
+    /// 合わせの検査の1台。画面`SCR`で2つのカーソル（0〜15）を持ち、dllの`menu_tick`と同じ順に`Selection`を呼ぶ。
+    /// ゲームはワードの押した瞬間（右 = +1・左 = −1）でサイドごとのカーソルを動かす。
+    /// 合わせを受けたゲストは、カーソルを書き込んだtickには動かさない。
     struct CursorNode {
         sel: Selection,
         role: Role,
@@ -2664,7 +2690,7 @@ mod tests {
         frame_no: u32,
         changes: Vec<(u32, [u8; 2])>,
         aligned_at: Option<u32>,
-        /// 合わせが届く前に、ゲームへ入れた入力ワードの方向・Ctrl・Shift の数（ゲストは 0 であること）。
+        /// 合わせが届く前にゲームへ書き込んだ入力ワードの方向・Ctrl・Shiftの数（ゲストは0であること）。
         pre_align_dirs: u32,
     }
 
@@ -2835,7 +2861,7 @@ mod tests {
     #[test]
     fn a_late_guest_sees_the_hosts_move_within_a_few_frames() {
         for delay in [1u32, 16, 40] {
-            // ホストは右・左を 30 回ずつ（溜まる語を 32 より多くする）。
+            // ホストは右・左を30回ずつ（溜まるワードを32より多くする）。
             let mut host_moves: Vec<(u32, u16)> = (0..60)
                 .map(|i| (3 + 3 * i, if i % 2 == 0 { keys::RIGHT } else { keys::LEFT }))
                 .collect();
@@ -2859,7 +2885,7 @@ mod tests {
 
     #[test]
     fn random_runs_end_with_equal_cursors() {
-        // 効く期間が本当に踏まれたか（0 なら何も測れていない）。
+        // 効く期間が本当に踏まれたか（0なら何も測れていない）。
         let (mut host_before, mut guest_after, mut host_after) = (0u32, 0u32, 0u32);
         for seed in 0..300u64 {
             let mut rng = Rng(seed ^ 0xC0FFEE);
@@ -2910,12 +2936,13 @@ mod tests {
         assert!(host_before > 30 && guest_after > 100 && host_after > 100);
     }
 
-    // ================= 同じ画面に残る step をまたぐ相手の入力ワード =================
+    // ================= 同じ画面に残るstepをまたぐ相手の入力ワード =================
 
     use crate::menu_model::{SCREEN_CHARA, SCREEN_DIFFICULTY, SCREEN_MAP, chara_value};
 
-    /// ゲストに STEP の列 `steps`（kind, value, screen）を入れる。各 STEP の前にその step の相手の入力ワード 0x10 を 1 つ届け、最後の STEP の後に
-    /// 前の step の入力ワード 0x11 を遅れて届ける。返すのは、最後の STEP の後の 2 フレームの相手の入力ワードと、遅れた入力ワードで `menu_dropped` が増えたか。
+    /// ゲストにSTEPの列`steps`（kind, value, screen）を渡す。
+    /// 各STEPの前にそのstepの相手の入力ワード0x10を1つ届け、最後のSTEPの後に前のstepの入力ワード0x11を遅れて届ける。
+    /// 返すのは、最後のSTEPの後の2フレームの相手の入力ワードと、遅れた入力ワードで`menu_dropped`が増えたかどうか。
     fn after_last_step(steps: &[(StepKind, u8, u8)]) -> ([u16; 2], bool) {
         let mut g = present(Role::Guest);
         let mut last = 0u16;
@@ -2990,16 +3017,16 @@ mod tests {
         let fo = g.local_frame(0, None, true);
         assert_eq!((fo.remote, fo.apply.is_some()), (a, true));
         let mut got = Vec::new();
-        g.on_menu(&menu(0, 0, 0, &[a, b, c])); // 重複と新しい語
+        g.on_menu(&menu(0, 0, 0, &[a, b, c])); // 重複と新しいワード
         g.on_menu(&menu(0, 0, 2, &[c])); // 重複だけ
         got.push(g.local_frame(0, None, true).remote);
         got.push(g.local_frame(0, None, true).remote);
         g.on_menu(&menu(0, 0, 1, &[b, c, d])); // 重なり
-        g.on_menu(&menu(1, 0, 0, &[e, f])); // 新しい step
+        g.on_menu(&menu(1, 0, 0, &[e, f])); // 新しいstep
         got.push(g.local_frame(0, None, true).remote);
         got.push(g.local_frame(0, None, true).remote);
         let dropped = g.counters().menu_dropped;
-        g.on_menu(&menu(0, 0, 0, &[a, b, c, d, x])); // 新しい語を渡し始めた後の前の step の語
+        g.on_menu(&menu(0, 0, 0, &[a, b, c, d, x])); // 新しいワードを渡し始めた後の前のstepのワード
         assert_eq!(g.counters().menu_dropped, dropped + 1);
         got.push(g.local_frame(0, None, true).remote);
         got.push(g.local_frame(0, None, true).remote);
@@ -3009,8 +3036,9 @@ mod tests {
 
     type WordRec = (u32, u16, u32, u16);
 
-    /// 同じ画面に残る step の検査の 1 台。キャラ選択（画面 8）に入り、毎フレーム台本の語を積み、押下は自分の画面の模型から作る。
-    /// 期待は、受け手が渡す相手の入力ワードが、送り手が自分のゲームへ入れた入力ワードの列と同じ並びで、画面の区切りをまたがないこと。
+    /// 同じ画面に残るstepの検査の1台。
+    /// キャラ選択（画面8）に入り、毎フレーム台本のワードを積み、押下は自分の画面のモデルから作る。
+    /// 期待は、受信側が渡す相手の入力ワードの並びが送信側が自分のゲームへ書き込んだ入力ワードの列と同じで、画面の区切りをまたがないこと。
     struct ScreenNode {
         sel: Selection,
         seat: usize,
@@ -3019,9 +3047,9 @@ mod tests {
         frame_no: u32,
         word: Box<dyn Fn(u32) -> u16>,
         auto: bool,
-        /// 自分の入力ワード。step は相手がその入力ワードを受け取る step（同じ画面に残る押下を入れたフレームの入力ワードは次の step）。
+        /// 自分の入力ワード。stepは相手がその入力ワードを受け取るstep（同じ画面に残る押下を書き込んだフレームの入力ワードは次のstep）。
         sent: Vec<WordRec>,
-        /// 相手の入力ワード。step はゲームへ渡したフレームの（押下を入れる前の）step。
+        /// 相手の入力ワード。stepはゲームへ渡したフレームの（押下を入れる前の）step。
         got: Vec<WordRec>,
         log: Vec<Entry>,
         applied_at: Vec<u32>,
@@ -3048,8 +3076,8 @@ mod tests {
             }
         }
 
-        /// でたらめの実行の押下: キャラ選択では自分の席を決める / 決めていれば取り消す、マップでは取消。
-        /// 選択を出る押下と、決めていない席の取消（難易度へ戻る）は出さない。
+        /// でたらめな実行の押下。キャラ選択では自分のサイドが未決定なら決定し、決定済みなら取り消す。マップではキャンセルを押す。
+        /// 選択を出る押下と、未決定のサイドでのキャンセル（難易度へ戻る）は出さない。
         fn auto_kind(&self) -> Option<StepKind> {
             match self.model.screen() {
                 SCREEN_CHARA if self.model.decided(self.seat).is_some() => Some(C),
@@ -3151,7 +3179,7 @@ mod tests {
         n
     }
 
-    /// 相手の入力ワードで `bit` が立った最初と最後の間に、`bit` の立っていないフレームがあるか。
+    /// 相手の入力ワードで`bit`が立った最初と最後の間に、`bit`の立っていないフレームがあるかどうか。
     fn has_gap(recs: &[WordRec], bit: u16) -> bool {
         let on: Vec<bool> = recs.iter().map(|r| r.3 & bit != 0).collect();
         match (on.iter().position(|&x| x), on.iter().rposition(|&x| x)) {
@@ -3288,8 +3316,8 @@ mod tests {
         assert!(words > 50_000 && carried > 5_000 && stays > 1_000 && moves > 1_000);
     }
 
-    /// 受け手が渡した相手の入力ワード（0 と直前の入力ワードの繰り返しを除く）が、送り手の積んだ入力ワードの並びの部分列で、渡したときの画面の区切りが
-    /// 積んだときと同じ。（検証した入力ワードの数, 前の step の入力ワードを次の step で渡した数）を返す。
+    /// 受信側が渡した相手の入力ワード（0と直前の入力ワードの繰り返しを除く）が、送信側の積んだ入力ワードの並びの部分列で、渡したときの画面の区切りが積んだときと同じかを検証する。
+    /// （検証した入力ワードの数, 前のstepの入力ワードを次のstepで渡した数）を返す。
     fn stream_ok(sent: &[WordRec], got: &[WordRec]) -> Result<(usize, usize), String> {
         let at: HashMap<u16, (usize, u16, u32)> = sent
             .iter()

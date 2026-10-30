@@ -1,11 +1,13 @@
-//! 観戦者の接続コードの見張り（ini の `code_side = spectate`）。
+//! 観戦者の接続コードを監視する処理（iniの`code_side = spectate`）。
 //!
-//! コードのフォルダの `peer_code.txt` を `POLL`（250 ms）ごとに見て、中身が前に見たものと違えば観戦用のコード（ホストが `spectate_code.txt` に
-//! 書いたもの。種別 3）として読み、読めたら `WatchSlot` に観戦者の設定（session・秘密・ホストの候補）を書く。返しのコードは書かない
-//! （観戦者はホストへ JOIN を送るだけ）。`status.txt` にウィンドウの文を書く（ローダーのウィンドウが「状態」に出す）。
-//! - 対戦用のコード（種別 1・2）は種別で断って `status.txt` に言う（`CodeError::WrongSide`）。ホストの候補はネットワークのガード（`guard::check_peer`。ini の `scope`）を通ったものだけを `WatchSlot` へ渡す。
-//! - ゲームのスレッドはファイルに触らない（`WatchSlot` の原子変数と待たない錠だけ）。接続した・観戦が終わったら見張りも終わる。
-//!   期間（`HANDSHAKE_RETRY_MS` = 30 分）の間に観戦者が使えるコードを貼らなければ、見張りは諦める。
+//! コードのフォルダの`peer_code.txt`を`POLL`（250 ms）ごとに見る。
+//! 中身が前に見たものと違えば、観戦用のコード（ホストが`spectate_code.txt`に書いたもの。種別3）として読む。
+//! 読めたら`WatchSlot`に観戦者の設定（session・秘密の乱数・ホストの候補）を書く。
+//! 返答のコードは書かない（観戦者はホストへJOINを送るだけ）。
+//! `status.txt`にウィンドウの文を書く（ローダーのウィンドウが「状態」に出す）。
+//! - 対戦用のコード（種別1・2）は種別で断り、`status.txt`に理由を書く（`CodeError::WrongSide`）。ホストの候補はネットワークのガード（`guard::check_peer`。iniの`scope`）を通ったものだけを`WatchSlot`へ渡す。
+//! - ゲームのスレッドはファイルに触らない（`WatchSlot`のアトミック変数と待たないロックだけ）。接続した・観戦が終わったら監視も終わる。
+//!   期間（`HANDSHAKE_RETRY_MS` = 30分）の間に観戦者が使えるコードを貼らなければ、監視は諦める。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -32,13 +34,13 @@ use crate::ui_lang;
 
 const NOTES_MAX: usize = 64;
 
-/// 見張りの文。`log` は本ログへ（詳しいまま）、`show` は `status.txt` へ。
+/// 監視の処理が出す文。`log`は本ログへ詳しいまま書き、`show`は`status.txt`へ書く。
 struct Line {
     log: String,
     show: String,
 }
 
-/// 観戦用のコードのファイルを読めなかった。`e`（日本語の誤りの文）は本ログに必ず残し、ウィンドウには言語に合う文だけを出す。
+/// 観戦用のコードのファイルを読めなかった。`e`（日本語の誤りの文）は本ログに必ず残す。ウィンドウには言語に合う文だけを出す。
 fn file_error_line(lang: higanr_core::lang::Lang, e: &str) -> Line {
     Line {
         log: e.to_string(),
@@ -63,7 +65,7 @@ impl Shared {
     }
 }
 
-/// 見張りの持ち手。落とすと見張りを止め、そのスレッドが終わるのを待つ。
+/// 監視の処理のハンドル。破棄すると監視を止め、そのスレッドが終わるのを待つ。
 pub struct WatchCode {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
@@ -105,7 +107,7 @@ impl Drop for WatchCode {
     }
 }
 
-/// 見張りの 1 回の結果（ファイルの読み書きを含まない判断）。
+/// 監視の1回の結果（ファイルの読み書きを含まない判断）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     Same,
@@ -113,7 +115,7 @@ pub enum Step {
     Ready(Box<WatcherConfigEq>, String, String),
 }
 
-/// `WatcherConfig` は `PartialEq` でないので、検査が比べられる形で包む（session・nonce・ホストのアドレスの並び）。
+/// `WatcherConfig`は`PartialEq`でないので検査が比べられる形で包む（session・nonce・ホストのアドレスの並び）。
 #[derive(Debug, Clone)]
 pub struct WatcherConfigEq(pub WatcherConfig);
 
@@ -129,13 +131,14 @@ impl PartialEq for WatcherConfigEq {
 
 impl Eq for WatcherConfigEq {}
 
-/// 受け渡しの状態（pure。ファイルの読み書きは見張りのスレッド）。
+/// 受け渡しの状態（pure。ファイルの読み書きは監視のスレッドが行う）。
 #[derive(Debug, Clone)]
 pub struct Reader {
     scope: higanr_core::guard::Scope,
     name: Name,
     nonce: u64,
-    /// IPv6 のソケットを開いているか(既定は開いていない。開く `script_win::open_watch_net` だけが `with_v6` で立てる)。開いていなければ、IPv4 の候補が残るかぎり IPv6 の候補へは JOIN を送らない（送っても誤りになるだけ）。
+    /// IPv6のソケットを開いているかどうか(既定は開いていない。開く`script_win::open_watch_net`だけが`with_v6`で立てる)。
+    /// 開いていなければIPv4の候補が残るかぎりIPv6の候補へはJOINを送らない（送っても誤りになるだけ）。
     v6: bool,
     seen: Option<Vec<u8>>,
 }
@@ -156,7 +159,7 @@ impl Reader {
         self
     }
 
-    /// ホストの候補から、自分が送れない族を除く。除くと空になるなら、そのまま（届かないことを時間切れで知る）。
+    /// ホストの候補から自分が送れないアドレスファミリを除く。除くと空になるならそのままにする（届かないことを時間切れで知る）。
     fn sendable(&self, cands: &Candidates) -> Candidates {
         if self.v6 {
             return *cands;
@@ -206,14 +209,14 @@ impl Reader {
             Err(say) => return Step::Refused(say.log, say.show, Some(Refusal::NoRoute)),
         };
         let Some(secret) = c.secret else {
-            // 観戦用のコードは必ず秘密を持つ（`code::read_spectate` が検証する）。来たら作りの誤り。
+            // 観戦用のコードは必ず秘密の乱数を持つ（`code::read_spectate`が検証する）。持たないコードが来たら実装の誤り。
             return Step::Refused(
                 "観戦用のコードに秘密が無い".to_string(),
                 st::INTERNAL.get(ui_lang::current()).to_string(),
                 Some(Refusal::Internal),
             );
         };
-        // 観戦者の使い捨ての鍵: JOIN ごとに OS の乱数で引く。引けなければ接続しない。
+        // 観戦者の使い捨ての鍵: JOINごとにOSの乱数で生成する。生成できなければ接続しない。
         let key_seed = match crate::net_udp::draw_key_seed() {
             Ok(k) => k,
             Err(e) => {
@@ -261,7 +264,7 @@ fn refusal(e: CodeError) -> (String, String, Option<Refusal>) {
             st::WATCH_BROKEN.get(lang).to_string(),
             Some(Refusal::Broken),
         ),
-        // ホストの HiganRTool のバージョンが違う。本ログは日本語、ウィンドウは今の言語。
+        // ホストのHiganRToolのバージョンが違う。本ログの文は日本語。ウィンドウの文は今の言語。
         CodeError::BadVersion(theirs) => {
             let log =
                 higanr_core::net_menu::other_version_text(higanr_core::wire::PROTO_VER, theirs);
@@ -272,7 +275,7 @@ fn refusal(e: CodeError) -> (String, String, Option<Refusal>) {
             );
             (log, show, Some(Refusal::OtherVersion { theirs }))
         }
-        // ホストのビルドが違う。本ログは日本語、ウィンドウは今の言語。
+        // ホストのビルドが違う。本ログの文は日本語。ウィンドウの文は今の言語。
         CodeError::OtherBuild { theirs } => {
             let log =
                 higanr_core::net_menu::other_build_text(higanr_core::update::BUILD_NUMBER, theirs);
@@ -296,7 +299,7 @@ fn refusal(e: CodeError) -> (String, String, Option<Refusal>) {
     }
 }
 
-/// 開く（`script_win::open_net` から。ネットワークを動かす前）: コードのフォルダを作り、見張りのスレッドを作る。戻りの文は本ログの「ネットワーク: 開いた」の行に足す。
+/// 開く（`script_win::open_net`から。ネットワークを動かす前）: コードのフォルダを作り、監視のスレッドを作る。戻り値の文は本ログの「ネットワーク: 開いた」の行に足す。
 pub fn start(
     s: &NetSettings,
     dir: PathBuf,
@@ -334,7 +337,7 @@ pub fn start(
     let join = std::thread::Builder::new()
         .name("higanr-watch-code".into())
         .spawn(move || {
-            // パニックは受けて外へ出さない（スレッドの入口）。受けたら見張りをやめる。
+            // パニックは受けて外へ出さない（スレッドの入口）。受けたら監視をやめる。
             let _ = catch_unwind(AssertUnwindSafe(|| w.run()));
         })
         .map_err(|e| format!("観戦用のコードの見張りのスレッドの作成不能: {e}"))?;
@@ -403,7 +406,7 @@ impl Runner {
         let mut connected = false;
         loop {
             if connected {
-                // 接続した後は終わりだけを見る。溜めた記録の上限で終えたときだけ、理由を「状態」に出す。
+                // 接続した後は終わりだけを見る。溜めた記録の上限で終えたときだけ理由を「状態」に出す。
                 if self.shared.stop.load(Ordering::Relaxed) {
                     return;
                 }

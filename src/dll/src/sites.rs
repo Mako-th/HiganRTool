@@ -1,29 +1,30 @@
-//! 地点の表の型と、表そのものの検査・実物のバイト列の判定（pure。unsafe 無し）。
+//! 地点の表の型と表そのものの検査・実物のバイト列の判定（pure。unsafe無し）。
 //!
-//! 実物の値（アドレス・期待バイト列）は `th09_addr.rs` にだけ書く。照合の芯は `higanr_core::patch`（`check_site` / `check_disjoint` / `verify`）。
-//! `check_site` は相対の分岐を含む地点を断るので、地点を使い方で 3 つに分け、当てるのは inline detour で書く地点だけにする。
-//! 他は「call 先の差し替え」の規則（`E8` と元の飛び先）と、禁止の範囲・地点どうしの重なりで検証する。
+//! 実物の値（アドレス・期待バイト列）は`th09_addr.rs`にだけ書く。照合の芯は`higanr_core::patch`（`check_site` / `check_disjoint` / `verify`）。
+//! `check_site`は相対の分岐を含む地点を断る。そのため地点を使い方で3つに分け、当てるのはinline detourで書く地点だけにする。
+//! 他は「call先の差し替え」の規則（`E8`と元の飛び先）と禁止の範囲・地点どうしの重なりで検証する。
 #![forbid(unsafe_code)]
 
 use higanr_core::patch::{self, AddrRange, DisjointError, Site, SiteError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Use {
-    /// inline detour（5 バイト JMP ＋ トランポリン）で書く予定の地点。`check_site`
-    /// （命令の境目の和・5 バイト以上・相対の分岐なし・禁止の範囲）を通す。
+    /// inline detour（5バイトJMP ＋ トランポリン）で書く予定の地点。
+    /// `check_site`（命令の境目の和・5バイト以上・相対の分岐なし・禁止の範囲）を通す。
     Detour { instr_lens: &'static [u8] },
-    /// call 先の差し替え。`addr` は **オペコード `E8` の位置**で、期待バイト列は `E8 rel32` の 5 バイト。書き換えるのは
-    /// rel32（`addr + 1` から 4 バイト）だけ。`original_target` は rel32 から計算した元の飛び先がこれと一致することを検証する値。
+    /// call先の差し替え。`addr`は **オペコード`E8`の位置**。期待バイト列は`E8 rel32`の5バイト。
+    /// 書き換えるのはrel32（`addr + 1`から4バイト）だけ。
+    /// `original_target`はrel32から計算した元の飛び先がこれと一致することを検証する値。
     CallRel32 { original_target: u32 },
-    /// 書かない。照合だけ（観測・戻りアドレス・呼ぶ前の関数の入口）。`instr_lens` は期待バイト列の末尾が命令の境目で終わるときだけ
-    /// 持つ（関数の入口の先頭 8 バイトは命令の途中で切れるので `None`）。
+    /// 書かない。照合だけ（観測・戻りアドレス・呼ぶ前の関数の入口）。
+    /// `instr_lens`は期待バイト列の末尾が命令の境目で終わるときだけ持つ（関数の入口の先頭8バイトは命令の途中で切れるので`None`）。
     VerifyOnly { instr_lens: Option<&'static [u8]> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SiteDef {
     pub name: &'static str,
-    /// image base `0x400000` を前提にした VA。
+    /// image base `0x400000`を前提にしたVA。
     pub addr: u32,
     pub expected: &'static [u8],
     pub kind: Use,
@@ -39,8 +40,8 @@ impl SiteDef {
         }
     }
 
-    /// `check_disjoint` に渡す core の `Site`。アドレスと長さしか見ないので、境目を持たない行は空の列にしておく
-    /// （`check_site` には渡さない）。
+    /// `check_disjoint`に渡すcoreの`Site`。
+    /// アドレスと長さしか見ないので境目を持たない行は空の列にしておく（`check_site`には渡さない）。
     fn as_core_site(&self) -> Site {
         let instr_lens: &'static [u8] = match self.kind {
             Use::Detour { instr_lens } => instr_lens,
@@ -66,32 +67,32 @@ impl SiteDef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableError {
-    /// inline detour の行が `check_site` に落ちた（境目の和・短すぎ・相対の分岐・禁止の範囲）。
+    /// inline detourの行が`check_site`に落ちた（境目の和・短すぎ・相対の分岐・禁止の範囲）。
     Detour { name: &'static str, err: SiteError },
-    /// 照合だけの行で、命令の境目の和が期待バイト列の長さと食い違う。
+    /// 照合だけの行で命令の境目の和が期待バイト列の長さと食い違う。
     LenSumMismatch {
         name: &'static str,
         sum: usize,
         expected_len: usize,
     },
-    /// call 先の差し替えの行が `E8 rel32` の 5 バイトの形をしていない。
+    /// call先の差し替えの行が`E8 rel32`の5バイトの形をしていない。
     CallShape { name: &'static str },
-    /// rel32 から計算した飛び先が、表に書いた元の飛び先と食い違う。
+    /// rel32から計算した飛び先が表に書いた元の飛び先と食い違う。
     CallTarget {
         name: &'static str,
         computed: u32,
         original_target: u32,
     },
-    /// inline detour 以外の行が禁止の範囲と重なった（inline detour の行は `Detour` の中で返る）。
+    /// inline detour以外の行が禁止の範囲と重なった（inline detourの行は`Detour`の中で返る）。
     Forbidden {
         name: &'static str,
         range: AddrRange,
     },
-    /// 2 つの行が重なった。
+    /// 2つの行が重なった。
     Overlap(DisjointError),
 }
 
-/// 表そのものの検査。1 つ目に見つかった誤りで止める。
+/// 表そのものの検査。1つ目に見つかった誤りで止める。
 pub fn check_table(sites: &[SiteDef], forbidden: &[AddrRange]) -> Result<(), TableError> {
     for def in sites {
         match def.kind {
@@ -138,7 +139,7 @@ pub fn check_table(sites: &[SiteDef], forbidden: &[AddrRange]) -> Result<(), Tab
             }
         }
     }
-    // 照合だけの行も重なりの検査に入れる: 書く地点と重なっていたら、書いた後の照合が必ず落ちる。
+    // 照合だけの行も重なりの検査の対象に含める。書く地点と重なっていたら書いた後の照合が必ず落ちる。
     let core_sites: Vec<Site> = sites.iter().map(SiteDef::as_core_site).collect();
     let refs: Vec<&Site> = core_sites.iter().collect();
     patch::check_disjoint(&refs).map_err(TableError::Overlap)
@@ -158,11 +159,11 @@ fn check_forbidden(def: &SiteDef, forbidden: &[AddrRange]) -> Result<(), TableEr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SiteOutcome {
     Match,
-    /// 実際に読めたバイト列（期待バイト列と同じ長さ）。
+    /// 実際に読み取れたバイト列（期待バイト列と同じ長さ）。
     Mismatch {
         actual: Vec<u8>,
     },
-    /// その範囲がコミット済みで読める頁ではなかった。
+    /// その範囲がコミット済みで読み取り可能なページではなかった。
     Unreadable,
 }
 
@@ -178,7 +179,7 @@ pub fn judge(def: &SiteDef, actual: Option<&[u8]>) -> SiteOutcome {
     }
 }
 
-/// `A1 08 31 4B 00` の形（ログと検査で使う）。
+/// `A1 08 31 4B 00`の形（ログと検査で使う）。
 pub fn hex_bytes(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 3);
     for (i, b) in bytes.iter().enumerate() {
@@ -192,7 +193,7 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! 表の型の検査（合成の値）。実物の表の検査は `th09_addr.rs` の側にある。
+    //! 表の型の検査（合成の値）。実物の表の検査は`th09_addr.rs`の側にある。
     use super::*;
 
     #[test]

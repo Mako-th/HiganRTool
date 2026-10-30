@@ -12,11 +12,11 @@
 
 - **起動と注入**: `launch.rs`（サスペンドで起動 → DLLのパスを書き込む → `LoadLibraryW`のスレッド → 再開の手順と、失敗したときの後始末）・`staged.rs`・`real.rs`（本物のWin32）・`win.rs`（Win32の呼び出しをまとめたトレイト。検査では偽物に差し替えます）・`ledger.rs`（開いたハンドルと確保した領域を数え、閉じ忘れを検査で見つけます）・`env_block.rs`・`imports.rs`（DLLが使う関数がこのWindowsにあるかを先に確かめます）・`selftest.rs`（`--selftest`）・`synth.rs`（検査用の合成のPE）。
 - **花映塚の場所**: `game_pick.rs`（初回だけ、th09.exeのあるフォルダを選んでもらって覚えます）・`folder_dialog.rs`（Windows標準のフォルダ選択）。
-- **自動アップデート**（配布するビルドだけ。機能`dist`）: `update.rs`（流れ・置き換え・失敗したときの戻し・ダウンロードの進み具合）・`http_win.rs`（WinHTTPのGET）・`post_update.rs`（更新して起動し直した初回だけ、`HiganRTool.ini`を配る形に合わせて設定の値を引き継ぎ、`release_notes/`の変更点を出してEnterを待ちます）。目録の読みと署名の確かめは`higanr_core::update`です。
+- **自動アップデート**（配布するビルドだけ。機能`dist`）: `update.rs`（流れ・置き換え・失敗したときの戻し・ダウンロードの進み具合）・`src/http_win`（クレート`higanr_http_win`。WinHTTPのGET。DLLも使います）・`post_update.rs`（更新して起動し直した初回だけ、`HiganRTool.ini`を配る形に合わせて設定の値を引き継ぎ、`release_notes/`の変更点を出してEnterを待ちます）。目録の読みと署名の確かめは`higanr_core::update`です。
 - **接続コード**: `code_relay.rs`（ゲームの外で接続コードを受け渡すときのウィンドウ）。
 - **起動の前の確かめとログ**: `writable.rs`（ツールのフォルダに書き込めるか）・`freshness.rs`（開発用のビルドで、古い成果物での起動を断る）・`crash_log.rs`（ローダーのログと、落ちたときの記録）・`hold.rs`（断って終わるときに、ウィンドウをEnterまで残すか）・`ui_lang.rs`・`cli.rs`。
 
-`unsafe`を書いてよいのは`real.rs`・`folder_dialog.rs`・`http_win.rs`だけで、ほかのモジュールは`#[forbid(unsafe_code)]`です。
+`unsafe`を書いてよいのは`real.rs`・`folder_dialog.rs`だけで、ほかのモジュールは`#[forbid(unsafe_code)]`です。
 
 ## 自動アップデート
 

@@ -1,11 +1,11 @@
-//! パッドの十字キー（POV ハット）を方向のビットに足す判断と設置の手順（pure。unsafe 無し）。
+//! パッドの十字キー（POVハット）を方向のビットに足す判断と設置の手順（pure。unsafe無し）。
 //!
-//! 花映塚はパッド 1 台を読む関数 `0x0042B410` で lX・lY（winmm は X・Y）しか読まず、十字キーが POV で報告されるパッドでは方向が立たない。
-//! そこで、その関数への 4 つの呼び出しの rel32 を自前の入口（`pad_extra_win::pad_entry`）へ向け、入口は元の関数を同じ引数で呼んだ後で、`finish` が POV から作った方向を戻り値に OR する。
-//! ここは「戻り値にどう足すか」（`finish`）と「6 行を照合して 4 つの rel32 を書く」（`install`。書く手順は `hook::install_call_hook_at`）。ゲームのメモリ・Win32・COM の呼び出しは `pad_extra_win.rs`。
+//! 花映塚はパッド1台を読む関数`0x0042B410`でlX・lY（winmmはX・Y）しか読まない。十字キーがPOVで報告されるパッドでは方向が立たない。
+//! そこでその関数への4つの呼び出しのrel32を自前の入口（`pad_extra_win::pad_entry`）へ向ける。入口は元の関数を同じ引数で呼ぶ。その後`finish`がPOVから作った方向を戻り値にORする。
+//! ここは「戻り値にどう足すか」（`finish`）と「6行を照合して4つのrel32を書く」（`install`。書く手順は`hook::install_call_hook_at`）。ゲームのメモリ・Win32・COMの呼び出しは`pad_extra_win.rs`。
 //!
-//! 遅延: 読む時点は元の関数が返った直後なので、入力は遅れない。足すのは入口 1 回あたり原子変数の読み書きが数回と、winmm の経路なら `joyGetPosEx` 1 回（DirectInput の経路なら `GetDeviceState` 1 回）。
-//! デバイスごとに 1 tick 1 回へはまとめない: 呼び出しごとに今の状態を読めば止まった値を返す恐れが無く、まとめるには tick を見分ける印が要る（候補の `SUP_FRAME` は、描画だけのフレームでは on_tick の途中から直に戻るので進まない）。
+//! 遅延: 読む時点は元の関数が返った直後なので入力は遅れない。足すのは入口1回あたりアトミック変数の読み書きが数回と、winmmの経路なら`joyGetPosEx` 1回（DirectInputの経路なら`GetDeviceState` 1回）。
+//! デバイスごとに1 tick 1回へはまとめない: 呼び出しごとに今の状態を読めば止まった値を返す恐れが無い。まとめるにはtickを見分ける目印が要る（候補の`SUP_FRAME`は描画だけのフレームではon_tickの途中から直に戻るので進まない）。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -18,21 +18,20 @@ use higanr_core::patch;
 use crate::hook::{self, HookEnv};
 use crate::sites::{SiteDef, SiteOutcome, Use, hex_bytes, judge};
 
-/// デバイスの読み（本物は `pad_extra_win::RealPadIo`、検査では偽物）。
+/// デバイスの読み（本物は`pad_extra_win::RealPadIo`、検査では偽物）。
 pub trait PadIo {
-    /// `[0x004B3114]` と `[0x004B3118]`（IDirectInputDevice8 へのポインタ。0 = 無い）。
+    /// `[0x004B3114]`と`[0x004B3118]`（IDirectInputDevice8へのポインタ。0 = 無い）。
     fn slots(&self) -> [u32; 2];
-    /// DirectInput のデバイス `device`（`slots` の値）の `DIJOYSTATE2` の `rgdwPOV[0]`。取れなければ `None`。
+    /// DirectInputのデバイス`device`（`slots`の値）の`DIJOYSTATE2`の`rgdwPOV[0]`。取れなければ`None`。
     fn dinput_pov0(&self, device: u32) -> Option<u32>;
-    /// winmm の `joyGetPosEx(joy_id)` の `dwPOV`。取れなければ `None`。
+    /// winmmの`joyGetPosEx(joy_id)`の`dwPOV`。取れなければ`None`。
     fn winmm_pov(&self, joy_id: u32) -> Option<u32>;
 }
 
-/// ゲームのスレッドが足す数えと、別のスレッドが立てる旗。全部原子変数（ロックも確保も無い）。
+/// ゲームのスレッドが足す数えと、別のスレッドが立てるフラグ。全部アトミック変数（ロックも確保も無い）。
 pub struct PadState {
     enabled: AtomicU32,
-    /// winmm の経路で `dwPOV` を読んでよいデバイス（添字 = デバイス番号）。ハットの有無を引き直すスレッドが書く
-    /// （`higanr_core::pad_dirs::winmm_may_read`）。
+    /// winmmの経路で`dwPOV`を読んでよいデバイス（添字 = デバイス番号）。ハットの有無を取得し直すスレッドが書く（`higanr_core::pad_dirs::winmm_may_read`）。
     winmm_gate: [AtomicU32; 2],
     di: AtomicU32,
     mm: AtomicU32,
@@ -54,7 +53,7 @@ impl PadState {
         }
     }
 
-    /// 入口が POV を足し始める（rel32 を書く前に呼ぶ）。
+    /// 入口がPOVを足し始める（rel32を書く前に呼ぶ）。
     pub fn enable(&self) {
         self.enabled.store(1, Ordering::Release);
     }
@@ -85,7 +84,7 @@ impl PadState {
         }
     }
 
-    /// ハットが無い（旗が閉じている）ので `joyGetPosEx` を呼ばなかった回数。
+    /// ハットが無い（旗が閉じている）ので`joyGetPosEx`を呼ばなかった回数。
     pub fn skipped(&self) -> u32 {
         self.skipped.load(Ordering::Relaxed)
     }
@@ -97,8 +96,8 @@ impl Default for PadState {
     }
 }
 
-/// 元の関数の戻り値 `ret` に、デバイス `dev` の十字キーの方向を足して返す（ゲームのスレッド。確保しない・待たない）。
-/// 足せないとき（切ってある・デバイス番号が範囲外・ハットの旗が閉じている・読めない）は `ret` のまま。
+/// 元の関数の戻り値`ret`に、デバイス`dev`の十字キーの方向を足して返す（ゲームのスレッド。確保しない・待たない）。
+/// 足せないとき（切ってある・デバイス番号が範囲外・ハットのフラグが閉じている・読めない）は`ret`のまま。
 pub fn finish(state: &PadState, io: &dyn PadIo, ret: u32, dev: u32) -> u32 {
     if state.enabled.load(Ordering::Acquire) == 0 {
         return ret;
@@ -142,7 +141,7 @@ pub struct InstallReport {
     pub verified: usize,
     pub rows: usize,
     pub written: usize,
-    /// 書く呼び出しの数（表の `CallRel32` の行）。
+    /// 書く呼び出しの数（表の`CallRel32`の行）。
     pub call_rows: usize,
     pub lines: Vec<String>,
 }
@@ -153,10 +152,11 @@ impl InstallReport {
     }
 }
 
-/// 表の全行を照合し、**全部一致したときだけ**、`CallRel32` の行の rel32 を `entry` へ向ける。1 行でも合わない・読めないときは
-/// 1 バイトも書かない。書く手順（全スレッドを止めて EIP を見て、止めたまま読み直して書く）は `hook::install_call_hook_at`。
+/// 表の全行を照合し、**全部一致したときだけ** `CallRel32` の行のrel32を`entry`へ向ける。
+/// 1行でも合わない・読めないときは1バイトも書かない。
+/// 書く手順（全スレッドを止めてEIPを見て、止めたまま読み直して書く）は`hook::install_call_hook_at`。
 /// 書く途中で失敗したときは書けた分だけ残る（呼び出しはどれも単独で正しい。書けなかった呼び出しは元の関数を呼ぶだけ）。
-/// `label` は本ログの各行の頭に付ける出どころ。
+/// `label`は本ログの各行の頭に付ける出どころ。
 pub fn install_as(
     env: &mut dyn HookEnv,
     rows: &[SiteDef],
@@ -176,7 +176,7 @@ pub fn install_as(
     };
     let mut refused = false;
     for d in rows {
-        // 表の行はどれも `MAX_PATCH_LEN`（16）以下。ヒープを使わない固定長で読む。
+        // 表の行はどれも`MAX_PATCH_LEN`（16）以下。ヒープを使わない固定長で読む。
         let mut buf = [0u8; patch::MAX_PATCH_LEN];
         let n = d.expected.len();
         let actual = if n <= buf.len() && env.read_code(d.addr, &mut buf[..n]) {
@@ -212,7 +212,7 @@ pub fn install_as(
         ));
         return r;
     }
-    // 全部書けて、読み返した飛び先が全部入口と一致したときは 1 行にまとめる。1 つでも欠けたら、どの呼び出しがどうだったかを全部残す。
+    // 全部書けて読み返した飛び先が全部入口と一致したときは1行にまとめる。1つでも欠けたらどの呼び出しがどうだったかを全部残す。
     let mut detail = vec![format!(
         "{label}: 照合 {}/{} 行が一致（呼び出し {} 行と呼び先 0x{:08X} を検証する行）。呼び出しの rel32 を入口 0x{entry:08X} へ向けます。",
         r.verified,
@@ -274,13 +274,13 @@ pub fn install_as(
     r
 }
 
-/// パッドの 4 つの呼び出しの設置（`install_as` の接頭辞が `pad`）。
+/// パッドの4つの呼び出しの設置（`install_as`の接頭辞が`pad`）。
 pub fn install(env: &mut dyn HookEnv, rows: &[SiteDef], entry: u32) -> InstallReport {
     install_as(env, rows, entry, "pad")
 }
 
-/// `DllMain` で本ログへ頼む設置の行。全部書けたときは設定の行と設置の 1 行を 1 行にまとめ、書けなかったときは
-/// 設定の行の後に理由の行を続ける。
+/// `DllMain`で本ログへ頼む設置の行。全部書けたときは設定の行と設置の1行を1行にまとめる。
+/// 書けなかったときは設定の行の後に理由の行を続ける。
 pub fn attach_lines(settings: &str, report: &InstallReport) -> Vec<String> {
     match report.lines.as_slice() {
         [one] if report.complete() => {
@@ -294,7 +294,7 @@ pub fn attach_lines(settings: &str, report: &InstallReport) -> Vec<String> {
     }
 }
 
-/// 本ログの 1 行: 数えのコピー。`when` は「初めて」「終わり」。
+/// 本ログの1行: 数えのコピー。`when`は「初めて」「終わり」。
 pub fn counts_line(when: &str, c: &Counts, skipped: u32, gate: [bool; 2]) -> String {
     format!(
         "pad: 数え（{when}）: 処理フローは DirectInput {} 回 / winmm {} 回（winmm でハットが無いので読まなかった {} 回。ハットあり: 0 番 {} / 1 番 {}）、十字キーで方向を足した回数 {}、読めなかった回数 {}",
@@ -308,12 +308,13 @@ pub fn counts_line(when: &str, c: &Counts, skipped: u32, gate: [bool; 2]) -> Str
     )
 }
 
-/// ハットの有無の行を本ログに頼む回数の上限（初めて + 変化 3 回まで）。パッドの抜き差しで本ログが増え続けないように。
+/// ハットの有無の行を本ログに頼む回数の上限（初めて + 変化3回まで）。パッドの抜き差しで本ログが増え続けないように。
 pub const MAX_CAPS_LINES: u32 = 4;
 
-/// 別スレッドが 1 秒ごとに見たものから、本ログへ頼む行を決める: ハットの有無は変わったときだけ（高々 `MAX_CAPS_LINES` 回）、
-/// 数えは「経路が初めて使われた・初めて方向を足した・初めて読めなかった」の最初の 1 回ずつ（`pad_dirs::should_log` を
-/// 経過時間 0 で使う）。マッチ中に毎回は頼まない。
+/// 別スレッドが1秒ごとに見たものから、本ログへ頼む行を決める。
+/// ハットの有無は変わったときだけ頼む（高々`MAX_CAPS_LINES`回）。
+/// 数えは「経路が初めて使われた・初めて方向を足した・初めて読めなかった」の最初の1回ずつ頼む（`pad_dirs::should_log`を経過時間0で使う）。
+/// マッチ中に毎回は頼まない。
 #[derive(Debug, Default)]
 pub struct LogPlan {
     last_caps: Option<[Option<u32>; 2]>,
@@ -345,8 +346,8 @@ impl LogPlan {
     }
 }
 
-/// winmm の `joyGetDevCaps` の結果の行（添字 = デバイス番号。`None` = 接続されていない）。ハット（POV）の有無は、
-/// 効かなかったときにまず見る事実。2 台分を 1 行にして本ログの行を増やさない。
+/// winmmの`joyGetDevCaps`の結果の行（添字 = デバイス番号。`None` = 接続されていない）。
+/// ハット（POV）の有無は効かなかったときにまず見る事実。2台分を1行にして本ログの行を増やさない。
 pub fn caps_line(caps: [Option<u32>; 2]) -> String {
     let one = |dev: usize, c: Option<u32>| match c {
         None => format!("{dev} 番 接続していない（joyGetDevCaps が失敗）"),
@@ -391,7 +392,7 @@ mod tests {
     use crate::ticks::CopyRow;
     use higanr_core::pad_dirs::{DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_UP};
 
-    /// 偽のデバイス。呼ばれた回数を数え、`panic_on` が立っていればパニックする。
+    /// 偽のデバイス。呼ばれた回数を数え、`panic_on`が立っていればパニックする。
     struct FakeIo {
         slots: [u32; 2],
         di: Option<u32>,
@@ -443,7 +444,7 @@ mod tests {
         s
     }
 
-    const BUTTONS: u32 = 0x0000_130F; // Z・X・Shift・Esc（0x0F）と Enter（0x1000）、0x100（Ctrl）
+    const BUTTONS: u32 = 0x0000_130F; // Z・X・Shift・Esc（0x0F）とEnter（0x1000）、0x100（Ctrl）
     const TWO: [u32; 2] = [0x1000, 0x2000];
     const ONE: [u32; 2] = [0x1000, 0];
 
@@ -804,7 +805,7 @@ mod tests {
     #[test]
     fn install_reports_a_failed_write_and_still_tries_the_rest() {
         let mut env = FakeCode::exe_like();
-        // 書けないアドレスは rel32 の位置（オペコードの次）。
+        // 書き込めないアドレスはrel32の位置（オペコードの次）。
         env.write_fail_at = Some(PAD_SITES[1].addr + 1);
         let r = install(&mut env, PAD_SITES, ENTRY);
         assert!(!r.complete());

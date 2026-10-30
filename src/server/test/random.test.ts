@@ -1,5 +1,5 @@
-// ランダム対戦の検査: 入口（index.ts の /v0/random/<ビルド番号>）→ 待ち列（random_queue.ts）→ 割り当てたルーム（room.ts）を、
-// ローカルの workerd の上で本物の WebSocket で叩く。
+// ランダム対戦の検査。入口（index.tsの /v0/random/<ビルド番号>）→ 待ち列（random_queue.ts）→ 割り当てたルーム（room.ts）を順に通す。
+// ローカルのworkerdの上で本物のWebSocketを使って叩く。
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -27,8 +27,10 @@ import {
   freshBuild,
   freshCid,
   freshIp,
+  peerWithTicket,
   rawConnect,
   sleep,
+  stubFor,
 } from "./helpers";
 
 const ROOM_RE = /^q\.[0-9a-f]{30}$/;
@@ -61,7 +63,7 @@ describe("2 人を組にする", () => {
     const a = await connectRandom(build);
     const qa = await a.next();
     expect(qa.t).toBe("queue");
-    // 期限は UNIX 秒。いまから 10 分先の前後。
+    // 期限はUNIX秒。いまから10分先の前後。
     const nowSecs = Math.floor(Date.now() / 1000);
     expect(qa.expires_at).toBeGreaterThanOrEqual(nowSecs + RANDOM_QUEUE_TTL_MS / 1000 - 10);
     expect(qa.expires_at).toBeLessThanOrEqual(nowSecs + RANDOM_QUEUE_TTL_MS / 1000 + 10);
@@ -81,7 +83,7 @@ describe("2 人を組にする", () => {
     expect((await b.closed).code).toBe(Close.Done);
   });
 
-  it("組になった 2 人は返されたルーム名で今のルームに入り、コードを渡し合える（先に入った方が host）", async () => {
+  it("組になった 2 人は返されたルーム名で今のルームに入り、コードを渡し合える（先に入った方が host）。成立の後は 2 人が残り、割り当てのルームの期限でも閉じない", async () => {
     const build = freshBuild();
     const { c: a } = await join(build);
     const { c: b } = await join(build);
@@ -91,19 +93,33 @@ describe("2 人を組にする", () => {
     const ha = await connect(room);
     const ra = await ha.next();
     expect(ra).toMatchObject({ t: "room", role: "host" });
-    // 割り当てたルームの期限は短い（片方が来なくても 10 分待たせない）。
+    // 割り当てたルームの期限は短い（片方が来なくても10分待たせない）。
     const nowSecs = Math.floor(Date.now() / 1000);
     expect(ra.expires_at).toBeLessThanOrEqual(nowSecs + RANDOM_ROOM_TTL_MS / 1000 + 5);
     expect(ra.expires_at).toBeGreaterThanOrEqual(nowSecs + RANDOM_ROOM_TTL_MS / 1000 - 5);
     ha.sendJson({ t: "offer", code: fakeCode("rh") });
     const hb = await connect(room);
     expect(await hb.next()).toMatchObject({ t: "room", role: "guest" });
-    expect(await hb.next()).toEqual({ t: "peer", code: fakeCode("rh") });
+    expect(await hb.next()).toEqual(peerWithTicket(fakeCode("rh")));
     expect((await ha.next()).t).toBe("matched");
     hb.sendJson({ t: "answer", code: fakeCode("rg") });
     expect(await ha.next()).toEqual({ t: "peer", code: fakeCode("rg") });
-    expect((await ha.closed).code).toBe(Close.Done);
-    expect((await hb.closed).code).toBe(Close.Done);
+    await sleep(50);
+    await runInDurableObject(stubFor(room), (_inst, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { deadline: number };
+        att.deadline = Date.now() - 1;
+        ws.serializeAttachment(att);
+      }
+    });
+    expect(await runDurableObjectAlarm(stubFor(room))).toBe(true);
+    expect(await ha.silentFor(100)).toBeNull();
+    expect(ha.isClosed || hb.isClosed).toBe(false);
+    const third = await rawConnect(`/v0/rooms/${room}`);
+    expect(third.status).toBe(409);
+    expect(await third.json()).toEqual({ error: "room_in_use" });
+    ha.close();
+    expect((await hb.closed).code).toBe(Close.PeerLeft);
   });
 
   it("先に入った人が first（3 組続けて、入った順のまま）", async () => {
@@ -145,7 +161,7 @@ describe("3 人以上・同時", () => {
     }
     const paired = logs.filter((m) => m.length === 2 && m[1].t === "paired");
     const waiting = logs.filter((m) => m.length === 1);
-    // 組になった人には、組の知らせが 1 通だけ（もう一度組にされない）で、閉じられている。
+    // ペアになった人にはペアの知らせが1通だけ届く（もう一度ペアにされない）。接続は閉じられている。
     for (let i = 0; i < clients.length; i++) {
       if (logs[i].length === 2) {
         expect((await clients[i].closed).code).toBe(Close.Done);
@@ -154,7 +170,7 @@ describe("3 人以上・同時", () => {
     }
     expect(paired.length).toBe(4);
     expect(waiting.length).toBe(1);
-    // 組ごとに 2 人が同じルーム名で、先後が 1 人ずつ。
+    // ペアごとに2人が同じルーム名で先後が1人ずつ。
     const byRoom = new Map<string, string[]>();
     for (const m of paired) {
       const list = byRoom.get(m[1].room) ?? [];
@@ -184,7 +200,7 @@ describe("3 人以上・同時", () => {
     const pb = await b.next();
     expect(pa.t).toBe("paired");
     expect(pb.room).toBe(pa.room);
-    // 組になった 2 人は閉じられ、3 人目の入室でもう一度組にされない。
+    // ペアになった2人の接続は閉じられる。3人目が入室してももう一度ペアにされない。
     expect((await a.closed).code).toBe(Close.Done);
     expect((await b.closed).code).toBe(Close.Done);
     expect(await a.silentFor(100)).toBeNull();
@@ -249,7 +265,7 @@ describe("組にした直後に片方が消えた", () => {
     const { c: b } = await join(build);
     const { room } = await a.next();
     await b.next();
-    // b は消える（ルームに入らない）。a だけがルームへ入る。
+    // bは消える（ルームに入らない）。aだけがルームへ入る。
     const h = await connect(room);
     const r = await h.next();
     expect(r).toMatchObject({ t: "room", role: "host" });
@@ -471,7 +487,7 @@ describe("割り当てるルーム名", () => {
       expect(await g.next(), guess).toMatchObject({ t: "room", role: "host" });
       g.close();
     }
-    // 組のルームは 2 人目が来るまで何も起きない。
+    // ペアのルームは2人目が来るまで何も起きない。
     expect(await host.silentFor(100)).toBeNull();
     host.close();
   });

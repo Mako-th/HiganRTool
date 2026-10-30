@@ -1,5 +1,4 @@
-// 進行中のランダム対戦の一覧の検査: 入口（index.ts の /v0/watch/<ビルド番号>/post と view）→ 一覧（watch_list.ts）を、
-// ローカルの workerd の上で本物の WebSocket で叩く。
+// 進行中のランダム対戦の一覧の検査: 入口（index.tsの /v0/watch/<ビルド番号>/postとview）→ 一覧（watch_list.ts）をローカルのworkerdの上で本物のWebSocketで叩く。
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
@@ -13,6 +12,10 @@ import {
   WATCH_MAX_PER_IP,
   WATCH_MAX_TOTAL,
   WATCH_STALE_MS,
+  WATCH_VIEW_MAX_PER_KEY,
+  WATCH_VIEW_MAX_TOTAL,
+  WATCH_VIEW_SWEEP_MS,
+  WATCH_VIEW_TTL_MS,
   newRandomRoomName,
   spectateRoomName,
 } from "../src/rules";
@@ -28,6 +31,7 @@ import {
   sameSlash64,
   sleep,
   stubFor,
+  ticketFor,
 } from "./helpers";
 
 const W_RE = /^w\.[0-9a-f]{16}$/;
@@ -36,30 +40,34 @@ function listStub(build: number): DurableObjectStub {
   return env.WATCH_LIST.get(env.WATCH_LIST.idFromName(`b${build}`));
 }
 
-function post(over: Record<string, unknown> = {}): Record<string, unknown> {
+async function post(over: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  // チケットはその名で揃った対戦のhostが受けるものと同じ（検査のSEAT_KEYで作る）。名が文字列でない誤りの検査には形だけの文字を指定する。
+  const room = "room" in over ? over.room : newRandomRoomName();
+  const ticket = typeof room === "string" ? await ticketFor(await spectateRoomName(room)) : "0.0.x";
   return {
     t: "post",
-    room: newRandomRoomName(),
+    room,
     p1: "Alice",
     p2: "Bob",
     mode: "rollback",
     delay: 1,
     watchers: 0,
     cap: WATCH_CAP_MAX,
+    ticket,
     ...over,
   };
 }
 
-/** 載せる口に接続して post を送り、`listed` を受けるところまで。 */
+/** 一覧に載せるエンドポイントに接続してpostを送り、`listed`を受けるところまで。 */
 async function listed(build: number, over: Record<string, unknown> = {}, ip?: string): Promise<{ c: Client; room: string }> {
   const c = await connectWatch(build, "post", ip);
-  const m = post(over);
+  const m = await post(over);
   c.sendJson(m);
   expect(await c.next(), JSON.stringify(over)).toEqual({ t: "listed" });
   return { c, room: m.room as string };
 }
 
-/** 見る口に接続し、最初の `list` を返す。 */
+/** 一覧を見るエンドポイントに接続して最初の`list`を返す。 */
 async function view(build: number, ip?: string): Promise<{ v: Client; items: any[] }> {
   const v = await connectWatch(build, "view", ip);
   const m = await v.next();
@@ -67,7 +75,7 @@ async function view(build: number, ip?: string): Promise<{ v: Client; items: any
   return { v, items: m.items };
 }
 
-/** 載せる口へ送った文が断られる（error ＋ 閉じる番号）こと。 */
+/** 一覧に載せるエンドポイントへ送ったメッセージが断られる（error ＋ 閉じるコード）こと。 */
 async function refused(build: number, msg: unknown, code: number, name: string, ip?: string): Promise<void> {
   const c = await connectWatch(build, "post", ip);
   c.sendJson(msg);
@@ -121,7 +129,7 @@ describe("載せる", () => {
   it("2 回目の post・載る前の count・載せる口が view の文を送る・上限を越えた cap・知らない t は 4400", async () => {
     const build = freshBuild();
     const { c } = await listed(build);
-    c.sendJson(post());
+    c.sendJson(await post());
     expect(await c.next()).toEqual({ t: "error", code: "bad_message" });
     expect((await c.closed).code).toBe(Close.BadMessage);
     await refused(build, { t: "count", watchers: 1 }, Close.BadMessage, "bad_message");
@@ -135,7 +143,7 @@ describe("載せる", () => {
     a.send(new Uint8Array([1, 2, 3]).buffer);
     expect((await a.closed).code).toBe(Close.BadMessage);
     const b = await connectWatch(build, "post");
-    b.send(JSON.stringify(post({ pad: "x".repeat(MESSAGE_MAX_BYTES) })));
+    b.send(JSON.stringify(await post({ pad: "x".repeat(MESSAGE_MAX_BYTES) })));
     expect(await b.next()).toEqual({ t: "error", code: "too_large" });
     expect((await b.closed).code).toBe(Close.TooLarge);
     const c = await connectWatch(build, "post");
@@ -166,7 +174,7 @@ describe("割り当ての名でないものは載せない", () => {
       42,
       ["q." + hex],
     ];
-    for (const room of bad) await refused(build, post({ room }), Close.BadMessage, "bad_message");
+    for (const room of bad) await refused(build, await post({ room }), Close.BadMessage, "bad_message");
     const { items } = await view(build);
     expect(items, "断った名が一覧に載った").toEqual([]);
     // 対照: 形が合えば載る（断るガードが全部を断っているだけではない）。
@@ -174,16 +182,27 @@ describe("割り当ての名でないものは載せない", () => {
     expect((await view(build)).items).toHaveLength(1);
   });
 
-  it("名前（p1・p2）の文字: 英数字・- _ @ ・置き換えの ? は通り、空・33 字・空白・日本語・記号・文字列でないものは 4400", async () => {
+  it("名前（p1・p2）の文字: 0x20〜0x7E のうち / ; ` 以外（間の空白・. \" \\ を含む）は通り、空・33 字・前後の空白・/ ; ` ・日本語・制御文字・文字列でないものは 4400", async () => {
     const build = freshBuild();
-    for (const ok of ["a", "Alice-1_@", "?", "?abc?", "A".repeat(32)]) {
+    for (const ok of ["a", "Alice-1_@", "?", "?abc?", "A".repeat(32), "a b", "a.b", "<b>", 'a"b\\c', "~ !:<_a", "A l.i@ce"]) {
       const { c } = await listed(build, { p1: ok, p2: ok }, freshIp());
       c.close();
     }
-    for (const name of ["", "A".repeat(33), "a b", " a", "アリス", "a/b", "a.b", "<b>", "a\n", "a\u0000", 1, null]) {
-      await refused(build, post({ p1: name }), Close.BadMessage, "bad_message");
-      await refused(build, post({ p2: name }), Close.BadMessage, "bad_message");
+    for (const name of ["", "A".repeat(33), " ", " a", "a ", "アリス", "a/b", "a;b", "a`b", "a\n", "a\u0000", "a\u007f", 1, null]) {
+      await refused(build, await post({ p1: name }), Close.BadMessage, "bad_message");
+      await refused(build, await post({ p2: name }), Close.BadMessage, "bad_message");
     }
+  });
+
+  it("名前の \" と \\ は一覧にそのまま載り、見る側の JSON で元の文字に戻る", async () => {
+    const build = freshBuild();
+    const name = 'a"b\\c d.e';
+    const { c } = await listed(build, { p1: name, p2: name }, freshIp());
+    const { v, items } = await view(build);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ p1: name, p2: name });
+    v.close();
+    c.close();
   });
 
   it("方式・遅延・観戦者の数と上限: 範囲の外・整数でない・文字列は 4400", async () => {
@@ -204,7 +223,7 @@ describe("割り当ての名でないものは載せない", () => {
       { watchers: 3, cap: 2 },
       { watchers: "0" },
     ]) {
-      await refused(build, post(over), Close.BadMessage, "bad_message");
+      await refused(build, await post(over), Close.BadMessage, "bad_message");
     }
     // 端の値は通る。
     const a = await listed(build, { delay: 0, cap: 1, watchers: 1, mode: "delay" }, freshIp());
@@ -215,6 +234,65 @@ describe("割り当ての名でないものは載せない", () => {
   });
 });
 
+describe("席の札（本物の対戦なしに載せない）", () => {
+  it("否定: 札が無い・文字列でない・別の割り当ての名の札・観戦用の名でなく割り当ての名に作った札・期限切れ・形の悪い札は 4400 で、一覧に載らない", async () => {
+    const build = freshBuild();
+    const room = newRandomRoomName();
+    const w = await spectateRoomName(room);
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const valid = await ticketFor(w);
+    for (const ticket of [
+      undefined,
+      null,
+      42,
+      await ticketFor(await spectateRoomName(newRandomRoomName())),
+      await ticketFor(room),
+      await ticketFor(w, nowSecs - 100, nowSecs - 1),
+      valid.slice(0, -1),
+      `${valid}x`,
+      "",
+    ]) {
+      const m = await post({ room });
+      if (ticket === undefined) delete m.ticket;
+      else m.ticket = ticket;
+      await refused(build, m, Close.BadMessage, "bad_message");
+    }
+    expect((await view(build)).items, "断った札で一覧に載った").toEqual([]);
+    // 対照: 同じ名の正しいチケットなら載る。
+    await listed(build, { room, ticket: valid });
+    expect((await view(build)).items).toHaveLength(1);
+  });
+
+  it("ランダム対戦で揃った host が matched で受けた札で載せられる（札は導いた観戦用の名に効く）", async () => {
+    const qb = freshBuild();
+    const a = await connectRandom(qb);
+    await a.next();
+    const b = await connectRandom(qb);
+    await b.next();
+    const { room } = await a.next();
+    await b.next();
+    const ha = await connect(room);
+    await ha.next();
+    ha.sendJson({ t: "offer", code: "AAAAhost" });
+    const hb = await connect(room);
+    await hb.next();
+    const peer = await hb.next();
+    const matched = await ha.next();
+    expect(matched.t).toBe("matched");
+    const build = freshBuild();
+    // host（matchedのチケット）とguest（peerのチケット）のどちらが載せても通る（観戦を配信するのはどちらのPCにもなりうる）。
+    const one = await listed(build, { room, ticket: matched.ticket });
+    one.c.close();
+    await one.c.closed;
+    await sleep(50);
+    const two = await listed(build, { room, ticket: peer.ticket });
+    expect((await view(build)).items.map((x) => x.room)).toEqual([await spectateRoomName(room)]);
+    two.c.close();
+    ha.close();
+    hb.close();
+  });
+});
+
 describe("数の上限", () => {
   it("1 IP から載せられるのは 2 件まで: 3 件目は list_full（4429）で断り、一覧にも載らない", async () => {
     const build = freshBuild();
@@ -222,11 +300,11 @@ describe("数の上限", () => {
     await listed(build, {}, ip);
     await listed(build, {}, ip);
     const third = await connectWatch(build, "post", ip);
-    third.sendJson(post());
+    third.sendJson(await post());
     expect(await third.next()).toEqual({ t: "error", code: "list_full" });
     expect((await third.closed).code).toBe(Close.ListFull);
     expect((await view(build)).items).toHaveLength(WATCH_MAX_PER_IP);
-    // 別の IP からは載る。
+    // 別のIPからは載る。
     await listed(build, {}, freshIp());
     expect((await view(build)).items).toHaveLength(WATCH_MAX_PER_IP + 1);
   });
@@ -236,7 +314,7 @@ describe("数の上限", () => {
     const ip = freshIp();
     await listed(build, {}, ip);
     await listed(build, {}, sameSlash64(ip, 2));
-    await refused(build, post(), Close.ListFull, "list_full", sameSlash64(ip, 3));
+    await refused(build, await post(), Close.ListFull, "list_full", sameSlash64(ip, 3));
   });
 
   it("載せていた 1 件が切れれば、同じ IP からまた載せられる", async () => {
@@ -254,7 +332,7 @@ describe("数の上限", () => {
     const build = freshBuild();
     const open: Client[] = [];
     for (let i = 0; i < WATCH_MAX_TOTAL; i++) open.push((await listed(build, {}, freshIp())).c);
-    await refused(build, post(), Close.ListFull, "list_full", freshIp());
+    await refused(build, await post(), Close.ListFull, "list_full", freshIp());
     const { items } = await view(build);
     expect(items).toHaveLength(WATCH_MAX_TOTAL);
     await listed(freshBuild(), {}, freshIp());
@@ -275,7 +353,7 @@ describe("数の上限", () => {
     const room = newRandomRoomName();
     const ip = freshIp();
     const first = await listed(build, { room, p1: "Old" }, ip);
-    await refused(build, post({ room, p1: "Other" }), Close.BadMessage, "bad_message", freshIp());
+    await refused(build, await post({ room, p1: "Other" }), Close.BadMessage, "bad_message", freshIp());
     expect((await view(build)).items.map((x) => x.p1)).toEqual(["Old"]);
     const again = await listed(build, { room, p1: "New" }, ip);
     expect((await first.c.closed).code).toBe(Close.Done);
@@ -295,7 +373,7 @@ describe("見る口", () => {
     expect(afterPost.t).toBe("list");
     expect(afterPost.items).toHaveLength(1);
     expect(afterPost.items[0].watchers).toBe(0);
-    // 数の変化: 前の送りから 1 秒以内なので、まとめて遅れて届く（待たずにアラームを回す）。
+    // 数の変化: 前の送信から1秒以内なのでまとめて遅れて届く（待たずにアラームを回す）。
     host.c.sendJson({ t: "count", watchers: 4 });
     await sleep(100);
     expect(await v.silentFor(0), "1 秒以内の変化がすぐ届いた").toBeNull();
@@ -340,7 +418,7 @@ describe("見る口", () => {
     const vy = await view(y);
     expect(vx.items.map((i) => i.p1)).toEqual(["OnX"]);
     expect(vy.items.map((i) => i.p1)).toEqual(["OnY"]);
-    // x の変化は y の観戦者へ届かない。
+    // xの変化はyの観戦者へ届かない。
     a.c.close();
     expect(await vx.v.next()).toEqual({ t: "list", items: [] });
     expect(await vy.v.silentFor(150)).toBeNull();
@@ -570,6 +648,155 @@ describe("setAlarm が失敗しても入室・載せる操作は通る", () => {
     expect(await a.next()).toMatchObject({ t: "queue" });
     await connectRandom(build);
     expect(await a.next()).toMatchObject({ t: "paired", order: "first" });
+  });
+});
+
+describe("見る口の接続の数と寿命", () => {
+  /** 一覧を見る接続の作成時刻だけを過去へずらす（寿命の検査用。一覧に載せる接続は動かさない）。 */
+  async function ageViews(build: number, ms: number): Promise<void> {
+    await runInDurableObject(listStub(build), (_inst, state) => {
+      for (const ws of state.getWebSockets()) {
+        const a = ws.deserializeAttachment() as { kind: string; created: number };
+        if (a.kind === "view") {
+          a.created = Date.now() - ms;
+          ws.serializeAttachment(a);
+        }
+      }
+    });
+  }
+
+  it("決まりの値: 全体 500 本・同じ鍵 3 本・寿命 10 分", () => {
+    expect([WATCH_VIEW_MAX_TOTAL, WATCH_VIEW_MAX_PER_KEY, WATCH_VIEW_TTL_MS]).toEqual([500, 3, 600_000]);
+  });
+
+  it("同じ鍵（IPv6 は /64）の 4 本目は、その鍵の一番古い接続を 1000 で閉じて入る。ほかの鍵の接続は閉じない", async () => {
+    const build = freshBuild();
+    const ip = freshIp();
+    const other = await connectWatch(build, "view", freshIp());
+    await other.next();
+    const mine: Client[] = [];
+    for (let i = 0; i < WATCH_VIEW_MAX_PER_KEY; i++) {
+      mine.push(await connectWatch(build, "view", sameSlash64(ip, i + 1)));
+      await mine[i].next();
+      await sleep(5);
+    }
+    for (const c of mine) expect(c.isClosed).toBe(false);
+    const fourth = await connectWatch(build, "view", sameSlash64(ip, 9));
+    expect((await fourth.next()).t).toBe("list");
+    expect((await mine[0].closed).code).toBe(Close.Done);
+    await sleep(50);
+    expect(mine[1].isClosed).toBe(false);
+    expect(mine[2].isClosed).toBe(false);
+    expect(other.isClosed).toBe(false);
+    expect(fourth.isClosed).toBe(false);
+    // 5本目は2番目に古い接続を閉じる（順に入れ替わる）。
+    const fifth = await connectWatch(build, "view", ip);
+    await fifth.next();
+    expect((await mine[1].closed).code).toBe(Close.Done);
+    await sleep(50);
+    expect(mine[2].isClosed).toBe(false);
+    for (const c of [other, mine[2], fourth, fifth]) c.close();
+  });
+
+  it("全体は 500 本まで: 501 本目は 409 room_full で WebSocket を張らずに断る。同じ鍵が自分の古い接続を閉じて入るのは 500 本でも通る。空きができれば入れる", async () => {
+    const build = freshBuild();
+    const shared = freshIp();
+    const mine: Client[] = [];
+    for (let i = 0; i < WATCH_VIEW_MAX_PER_KEY; i++) {
+      mine.push(await connectWatch(build, "view", sameSlash64(shared, i + 1)));
+      await sleep(5);
+    }
+    const spare = await connectWatch(build, "view", freshIp());
+    // 残りはDurable Objectの中で直に作る（500本を入口から開くと遅い）。
+    const fake = WATCH_VIEW_MAX_TOTAL - WATCH_VIEW_MAX_PER_KEY - 1;
+    await runInDurableObject(listStub(build), (_inst, state) => {
+      for (let i = 0; i < fake; i++) {
+        const server = new WebSocketPair()[1];
+        state.acceptWebSocket(server);
+        server.serializeAttachment({ kind: "view", done: false, key: `fake:${i}`, created: Date.now() });
+      }
+    });
+    const over = await rawConnect(`/v0/watch/${build}/view`, { ip: freshIp() });
+    expect(over.status).toBe(409);
+    expect(await over.json()).toEqual({ error: "room_full" });
+    expect(over.webSocket).toBeNull();
+    // 一覧に載せる接続は一覧を見る接続の本数に数えない。
+    const poster = await connectWatch(build, "post", freshIp());
+    poster.close();
+    // 同じ鍵の4本目: 自分の一番古い接続が閉じるので全体は増えない。
+    const fourth = await connectWatch(build, "view", shared);
+    expect((await fourth.next()).t).toBe("list");
+    expect((await mine[0].closed).code).toBe(Close.Done);
+    expect(spare.isClosed).toBe(false);
+    // 空きができれば別の鍵も接続できる。
+    spare.close();
+    await spare.closed;
+    await sleep(50);
+    const again = await connectWatch(build, "view", freshIp());
+    expect((await again.next()).t).toBe("list");
+    for (const c of [...mine, fourth, again]) c.close();
+  });
+
+  it("作ってから WATCH_VIEW_TTL_MS で、アラームが expired（4408）で閉じる。期限の前のアラームは閉じない。閉じた後は入り直せる", async () => {
+    const build = freshBuild();
+    const ip = freshIp();
+    const v = await connectWatch(build, "view", ip);
+    await v.next();
+    // 期限の前（寿命の手前）のアラームでは閉じない。
+    await ageViews(build, WATCH_VIEW_TTL_MS - 60_000);
+    await runDurableObjectAlarm(listStub(build));
+    await sleep(100);
+    expect(v.isClosed).toBe(false);
+    // 寿命を過ぎたら閉じる。アラームは寿命と関係なく一覧の全体を1通送ることがあるのでerrorまで読み飛ばす。
+    await ageViews(build, WATCH_VIEW_TTL_MS + WATCH_VIEW_SWEEP_MS);
+    expect(await runDurableObjectAlarm(listStub(build))).toBe(true);
+    let m = await v.next();
+    while (m.t === "list") m = await v.next();
+    expect(m).toEqual({ t: "error", code: "expired" });
+    expect((await v.closed).code).toBe(Close.Expired);
+    const again = await connectWatch(build, "view", ip);
+    expect((await again.next()).t).toBe("list");
+    again.close();
+  });
+
+  it("見る口を作ると寿命の時刻にアラームが掛かる（載せる口が無くても自然に閉じる）: 作った時刻から TTL 以上 TTL＋刻み以内", async () => {
+    const build = freshBuild();
+    const before = Date.now();
+    const v = await connectWatch(build, "view");
+    await v.next();
+    const at = await runInDurableObject(listStub(build), (_inst, state) => state.storage.getAlarm());
+    expect(at).not.toBeNull();
+    expect(at as number).toBeGreaterThanOrEqual(before + WATCH_VIEW_TTL_MS);
+    expect(at as number).toBeLessThanOrEqual(Date.now() + WATCH_VIEW_TTL_MS + WATCH_VIEW_SWEEP_MS);
+    v.close();
+  });
+
+  it("寿命が来た見る口だけが閉じ、載せる口と寿命の来ていない見る口は残る", async () => {
+    const build = freshBuild();
+    const host = await listed(build);
+    const old = await connectWatch(build, "view");
+    await old.next();
+    await ageViews(build, WATCH_VIEW_TTL_MS + WATCH_VIEW_SWEEP_MS);
+    const young = await connectWatch(build, "view");
+    await young.next();
+    await runDurableObjectAlarm(listStub(build));
+    expect((await old.closed).code).toBe(Close.Expired);
+    await sleep(50);
+    expect(young.isClosed).toBe(false);
+    expect(host.c.isClosed).toBe(false);
+    host.c.close();
+    young.close();
+  });
+
+  it("時刻の無い古い attachment の見る口も、次のアラームで閉じる（期限なしで残らない）", async () => {
+    const build = freshBuild();
+    const v = await connectWatch(build, "view");
+    await v.next();
+    await runInDurableObject(listStub(build), (_inst, state) => {
+      for (const ws of state.getWebSockets()) ws.serializeAttachment({ kind: "view", done: false });
+    });
+    expect(await runDurableObjectAlarm(listStub(build))).toBe(true);
+    expect((await v.closed).code).toBe(Close.Expired);
   });
 });
 

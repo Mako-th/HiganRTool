@@ -1,10 +1,21 @@
-//! プロトコルのシリアライズ（encode / decode）。ヘッダは 12 B、本文の配置は `Message` と各本文の型の doc。
+//! プロトコルのシリアライズ（encode / decode）。ヘッダは12 B。本文の配置は`Message`と各本文の型のdoc。
 //!
-//! ここは encode / decode だけを持つ。ack・ウィンドウ・再送・latency の切替の意味は状態機械の仕事で、`Message` はただの値。受信専用スレッドとゲームスレッドの両方から呼ぶので、ヒープを使わない（語の列は `[u16; MAX_WORDS]` ＋ 個数、name は `[u8; NAME_MAX]` ＋ 長さ）。
-//! 検査の方針: HELLO 本文の `proto_ver` は `PROTO_VER` 以外を捨てる。ヘッダのバージョン（offset 4）が違うものは `BadVersion(相手のバージョン)` で捨て、タグを比べた**後**に見るので、`BadVersion` は秘密を知る相手が別のバージョンで送ったものと言える（接続のセッション `link.rs` はそれを見て、接続する前に「相手のバージョンが違う」で手順をやめる）。INPUT / MENU の入力ワード（`0x0100` も送るので u16 の全域を許す）と SELECT のゲームの値、STEP / STEP_REQ の `value` と `screen` は検査しない（受け手が自分の画面と比べる）。
-//! 認証: 鍵を交換する便（HELLO・HELLO_ACK・SPECTATE_JOIN）と PROBE（[`is_signed_type`] が決める 1 か所）は、末尾に 16 B の HMAC のタグ（`auth.rs`）を付ける。ほかの全部は使い捨ての鍵から引いた向きごとの鍵で封じる（`seal`。ChaCha20-Poly1305。`seal.rs`）: ヘッダ 12 B ‖ nonce の欄 8 B ‖ 暗号化した本文 ‖ タグ 16 B。ヘッダは暗号化せず追加の認証データにする。1 データグラムの上限 `MAX_DATAGRAM`（1200 B）はタグ込み。
-//! `decode` の順: 長さ → magic → ヘッダのバージョンが違えば type に依らず HMAC のタグで検証して `BadVersion`（合わなければ `BadTag`）→ type が HMAC の 4 つならタグ、ほかは `Opener` で開く（`Opener` が無ければ `NotKeyed`、開かなければ `BadTag`）→ ヘッダの flags・予約・type → 本文。ヘッダの session_id もタグの中なので、別の接続の遅れたパケットは鍵が違って落ちる。
-//! 受信ソケットには STUN の応答も来る。どちらかは `classify` が先頭で分ける（HGRT は magic、STUN は offset 4 の magic cookie）。
+//! ここはencode / decodeだけを持つ。
+//! ack・ウィンドウ・再送・latencyの切替の意味はステートマシンの仕事。`Message`はただの値。
+//! 受信専用スレッドとゲームスレッドの両方から呼ぶのでヒープを使わない（ワードの列は`[u16; MAX_WORDS]` ＋ 個数。nameは`[u8; NAME_MAX]` ＋ 長さ）。
+//! 検査の方針: HELLO本文の`proto_ver`は`PROTO_VER`以外を捨てる。
+//! ヘッダのバージョン（offset 4）が違うものは`BadVersion(相手のバージョン)`で捨てる。
+//! ヘッダのバージョンはタグを比べた**後**に見る。そのため`BadVersion`は秘密を知る相手が別のバージョンで送ったものと言える。
+//! 接続のセッション`link.rs`はそれを見て接続する前に「相手のバージョンが違う」で手順をやめる。
+//! INPUT / MENUの入力ワード（`0x0100`も送るのでu16の全域を許す）とSELECTのゲームの値は検査しない。
+//! STEP / STEP_REQの`value`と`screen`も検査しない（受け手が自分の画面と比べる）。
+//! 認証: 鍵を交換する便（HELLO・HELLO_ACK・SPECTATE_JOIN）とPROBE（[`is_signed_type`]が決める1か所）は末尾に16 BのHMACのタグ（`auth.rs`）を付ける。
+//! ほかの全部は使い捨ての鍵から生成した向きごとの鍵で封じる（`seal`。ChaCha20-Poly1305。`seal.rs`）: ヘッダ12 B ‖ nonceのフィールド8 B ‖ 暗号化した本文 ‖ タグ16 B。
+//! ヘッダは暗号化せず追加の認証データにする。
+//! 1データグラムの上限`MAX_DATAGRAM`（1200 B）はタグ込み。
+//! `decode`の順: 長さ → magic → ヘッダのバージョンが違えばtypeに依らずHMACのタグで検証して`BadVersion`（合わなければ`BadTag`）→ typeがHMACの4つならタグ、ほかは`Opener`で開く（`Opener`が無ければ`NotKeyed`、開かなければ`BadTag`）→ ヘッダのflags・予約・type → 本文。
+//! ヘッダのsession_idもタグの中なので別の接続の遅れたパケットは鍵が違って落ちる。
+//! 受信ソケットにはSTUNの応答も来る。どちらかは`classify`が先頭で分ける（HGRTはmagic、STUNはoffset 4のmagic cookie）。
 
 use crate::auth::AuthKey;
 pub use crate::auth::TAG_LEN;
@@ -17,35 +28,35 @@ use crate::seal::{NONCE_FIELD_LEN, Opener, PUBLIC_LEN, SEAL_OVERHEAD, SEAL_TAG_L
 use crate::spectate::{MEASURE_PAIRS, PAIR_LEN};
 use crate::spectate_pace::{FF_UPDATES_MAX, FF_UPDATES_MIN};
 
-/// パケットの先頭 4B。
+/// パケットの先頭4B。
 pub const MAGIC: [u8; 4] = *b"HGRT";
-/// プロトコルのバージョン（ヘッダ offset 4 と HELLO 本文の offset 0。接続コードの offset 0 も同じ数）。違うバージョンの相手とは接続する前に断る。
-pub const PROTO_VER: u8 = 9;
+/// プロトコルのバージョン（ヘッダoffset 4とHELLO本文のoffset 0。接続コードのoffset 0も同じ数）。違うバージョンの相手とは接続する前に断る。
+pub const PROTO_VER: u8 = 10;
 
-/// HELLO の本文の長さ（B）。
+/// HELLOの本文の長さ（B）。
 pub const HELLO_LEN: usize = 84;
-/// HELLO_ACK の本文の長さ（B。16 B ＋ 公開鍵）。
-pub const HELLO_ACK_LEN: usize = 16 + PUBLIC_LEN;
-/// HELLO の +3 の bit1（rollback ができる。bit0 が望むモード）。
+/// HELLO_ACKの本文の長さ（B。16 B ＋ 公開鍵 ＋ 答えたHELLOの公開鍵）。
+pub const HELLO_ACK_LEN: usize = 16 + 2 * PUBLIC_LEN;
+/// HELLOの +3のbit1（rollbackができる。bit0が望むモード）。
 const HELLO_CAN_ROLLBACK_BIT: u8 = 2;
-/// HELLO の +3 の bit2（観戦を許可する。`[spectate] enable = 1`）。
+/// HELLOの +3のbit2（観戦を許可する。`[spectate] enable = 1`）。
 const HELLO_LISTABLE_BIT: u8 = 4;
-/// HELLO の +3 の bit3（PROBE を交わしてホストを決める。`host_pick.rs`）。
+/// HELLOの +3のbit3（PROBEを交わしてホストを決める。`host_pick.rs`）。
 const HELLO_PICK_BIT: u8 = 8;
-/// AGREE の本文の長さ（B）。
+/// AGREEの本文の長さ（B）。
 const AGREE_LEN: usize = 14;
-/// PROBE の本文の長さ（B。全体で `PROBE_LEN`）。
+/// PROBEの本文の長さ（B。全体で`PROBE_LEN`）。
 const PROBE_BODY_LEN: usize = PROBE_LEN - HEADER_LEN - TAG_LEN;
 pub const HEADER_LEN: usize = 12;
-/// INPUT / MENU の入力ワードの最大個数。
+/// INPUT / MENUの入力ワードの最大個数。
 pub const MAX_WORDS: usize = 32;
-/// 1 データグラムの上限（経路 MTU を割らない）。
+/// 1データグラムの上限（経路MTUを割らない）。
 pub const MAX_DATAGRAM: usize = 1200;
-/// HELLO の name の最大バイト数。
+/// HELLOのnameの最大バイト数。
 pub const NAME_MAX: usize = 32;
 
-// type（ヘッダ offset 5）の値。0・5〜7・12・29 以上は欠番・未実装で、知らない type として捨てる。
-// 公開 API は `Message` の variant で表すので、ここは非公開。
+// type（ヘッダoffset 5）の値。0・5〜7・12・29以上は欠番・未実装。知らないtypeとして捨てる。
+// 公開APIは`Message`のvariantで表すので、ここは非公開。
 const TYPE_HELLO: u8 = 1;
 const TYPE_HELLO_ACK: u8 = 2;
 const TYPE_INPUT: u8 = 3;
@@ -65,7 +76,7 @@ const TYPE_SPECTATE_ACK: u8 = 19;
 const TYPE_READY: u8 = 20;
 /// ホストの表示用の状態（ホスト → ゲストだけ）。
 const TYPE_HOST_STATE: u8 = 21;
-/// 上りの太さを測る列の 1 通（接続の手順の中。両方向）。
+/// 上りの太さを測る列の1通（接続の手順の中。両方向）。
 const TYPE_PROBE: u8 = 22;
 /// ゲストが測った取りまとめ役の上り（ゲスト → 取りまとめ役）。
 const TYPE_PROBE_RESULT: u8 = 23;
@@ -77,14 +88,14 @@ const TYPE_SPECTATE_ADMIT: u8 = 25;
 const TYPE_SPECTATE_REHOME: u8 = 26;
 /// 上りの太さを測る番（ホスト → 観戦者）。
 const TYPE_SPECTATE_MEASURE: u8 = 27;
-/// 測りの組の 1 通（観戦者 → ホスト）。
+/// 測定のペアの1通（観戦者 → ホスト）。
 const TYPE_SPECTATE_PAIR: u8 = 28;
-/// SPECTATE_MEASURE の本文の長さ（番の番号 u16）。
+/// SPECTATE_MEASUREの本文の長さ（番の番号u16）。
 const MEASURE_LEN: usize = 2;
-/// SPECTATE_PAIR の本文の長さ（封じた全体で `PAIR_LEN`）。
+/// SPECTATE_PAIRの本文の長さ（封じた全体で`PAIR_LEN`）。
 const PAIR_BODY_LEN: usize = PAIR_LEN - HEADER_LEN - SEAL_OVERHEAD;
 
-/// AGREE の host_seat。0/1 以外は捨てる値なので、型で範囲を保証する。
+/// AGREEのhost_seat。0/1以外は捨てる値なので型で範囲を保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seat {
     P1 = 0,
@@ -105,7 +116,8 @@ impl Seat {
     }
 }
 
-/// 遅延の方式（HELLO の +3「望むモード」と AGREE の +2「決まったモード」）。0 / 1 以外は捨てる値なので、型で範囲を保証する。
+/// 遅延の方式（HELLOの +3「望むモード」とAGREEの +2「決まったモード」）。
+/// 0 / 1以外は捨てる値なので型で範囲を保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// 今の方式。相手の入力ワードが揃うまで待つ。
@@ -128,7 +140,7 @@ impl Mode {
     }
 }
 
-/// 席の希望（HELLO の +44）。0〜2 以外は捨てる値なので、型で範囲を保証する。
+/// サイドの希望（HELLOの +44）。0〜2以外は捨てる値なので型で範囲を保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeatWish {
     /// おまかせ（相手の希望に合わせる。両方おまかせなら乱数）。
@@ -152,10 +164,10 @@ impl SeatWish {
     }
 }
 
-/// ルームに先にいたかの名乗り（HELLO の +45）。0〜2 以外は捨てる値。
+/// ルームに先にいたかの名乗り（HELLOの +45）。0〜2以外は捨てる値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arrival {
-    /// 名乗らない（ini の `peer`・ローダーのウィンドウ・peer_sim。ホストを先と見る）。
+    /// 名乗らない（iniの`peer`・ローダーのウィンドウ・peer_sim。ホストを先と見る）。
     Unknown = 0,
     /// 先にいた（始める側。ルームに先に入った・「接続コードを作る」を選んだ）。
     First = 1,
@@ -178,7 +190,7 @@ impl Arrival {
     }
 }
 
-/// BYE の reason。1〜4 以外は捨てる値。
+/// BYEのreason。1〜4以外は捨てる値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByeReason {
     Finished = 1,
@@ -202,28 +214,31 @@ impl ByeReason {
         self as u8
     }
 
-    /// `self as u32` の逆（dll が原子変数・リングの語に詰めた値から戻す）。1〜4 以外は `None`。
+    /// `self as u32`の逆（dllがアトミック変数・リングのワードに詰めた値から戻す）。1〜4以外は`None`。
     pub fn from_u32(v: u32) -> Option<Self> {
         u8::try_from(v).ok().and_then(Self::from_u8)
     }
 }
 
-/// STEP_REQ / STEP の kind。0 と 5 以上は捨てる値。
+/// STEP_REQ / STEPのkind。0と5以上は捨てる値。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     Decide = 1,
     Cancel = 2,
-    /// 合わせ（ホストだけが STEP に載せる。STEP_REQ に載っていたら decode が捨てる）。選択の画面へ入ったとき、
-    /// ゲストのカーソルをホストの値へ寄せる。画面は移らないが、STEP なので step は 1 進む。
+    /// 合わせ（ホストだけがSTEPに載せる。STEP_REQに載っていたらdecodeが捨てる）。
+    /// 選択の画面へ入ったときにゲストのカーソルをホストの値へ寄せる。
+    /// 画面は移らない。STEPなのでstepは1進む。
     Align = 3,
-    /// 対戦の形式の切替（キャラセレクト（画面 8）の間の Tab）。STEP の value は [`FormatValue`]、STEP_REQ の value は
-    /// 要求（形式だけ。D と旗はホストが決める）。画面は移らず、ゲームへは何も入れないが、STEP なので step は 1 進み、
-    /// 両者が同じ tick にネットワークの側の形式を替える。**観戦の流れには載せない**（`decode` は観戦の記録の中の Format を捨てる）。
+    /// 対戦の形式の切替（キャラセレクト（画面8）の間のTab）。
+    /// STEPのvalueは[`FormatValue`]。STEP_REQのvalueは要求（形式だけ。Dと旗はホストが決める）。
+    /// 画面は移らず、ゲームへは何も入力しない。STEPなのでstepは1進む。
+    /// 両者が同じtickにネットワークの側の形式を替える。
+    /// **観戦の流れには載せない**（`decode`は観戦の記録の中のFormatを捨てる）。
     Format = 4,
 }
 
 impl StepKind {
-    /// ワイヤの 1 B から。STEP の種類の表はここ 1 か所。
+    /// ワイヤの1 Bから。STEPの種類の表はここ1か所。
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(StepKind::Decide),
@@ -239,15 +254,15 @@ impl StepKind {
     }
 }
 
-/// `StepKind::Format` の value（1 B）: bit0 = 形式（1 = rollback・0 = delay 方式）、bit1 = auto の旗、bit2〜5 = 新しい D
-/// （0〜`mode_pick::MAX_PICK_DELAY`）、bit6〜7 = 0。ホストが STEP に載せる完全な形（`pack`）と、ゲストの STEP_REQ に載る
-/// 要求（形式だけ。`request`）がある。ゲストの要求に D と旗が無いのは、それらの正がホストだけにあるため。
+/// `StepKind::Format`のvalue（1 B）: bit0 = 形式（1 = rollback・0 = delay方式）、bit1 = auto の旗、bit2〜5 = 新しいD（0〜`mode_pick::MAX_PICK_DELAY`）、bit6〜7 = 0。
+/// ホストがSTEPに載せる完全な形（`pack`）と、ゲストのSTEP_REQに載る要求（形式だけ。`request`）がある。
+/// ゲストの要求にDと旗が無いのはそれらの正がホストだけにあるため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatValue {
     pub mode: Mode,
-    /// 新しい D（delay 方式の遅れも同じ欄。範囲は両形式とも `delay_pick::bounds`）。
+    /// 新しいD（delay方式の遅れも同じフィールド。範囲は両形式とも`delay_pick::bounds`）。
     pub delay: u8,
-    /// 切替の後も auto の旗を立てておくか（ホストの旗。ゲストは使わない）。
+    /// 切替の後もautoの旗を立てておくか（ホストの旗。ゲストは使わない）。
     pub auto: bool,
 }
 
@@ -257,13 +272,13 @@ impl FormatValue {
     const DELAY_SHIFT: u8 = 2;
     const DELAY_MASK: u8 = 0x0F;
 
-    /// 1 B に詰める。D は範囲の上限に詰める（呼び手の取り違えでワイヤの検査に落ちる値を作らない）。
+    /// 1 Bに詰める。Dは範囲の上限に詰める（呼び手の取り違えでワイヤの検査に落ちる値を作らない）。
     pub fn pack(self) -> u8 {
         let d = self.delay.min(crate::mode_pick::MAX_PICK_DELAY);
         self.mode.to_u8() | (u8::from(self.auto) * Self::AUTO_BIT) | (d << Self::DELAY_SHIFT)
     }
 
-    /// 1 B から。予約のビット（6〜7）が立っている・D が範囲の外は `None`（`decode` が STEP ごと捨てる）。
+    /// 1 Bから。予約のビット（6〜7）が立っている・Dが範囲の外は`None`（`decode`がSTEPごと捨てる）。
     pub fn unpack(v: u8) -> Option<Self> {
         if v & 0xC0 != 0 {
             return None;
@@ -279,7 +294,7 @@ impl FormatValue {
         })
     }
 
-    /// ゲストの要求の value（形式だけ。D = 0・旗なし）。
+    /// ゲストの要求のvalue（形式だけ。D = 0・旗なし）。
     pub fn request(mode: Mode) -> u8 {
         mode.to_u8()
     }
@@ -293,87 +308,89 @@ impl FormatValue {
     }
 }
 
-/// INPUT に載る latency の切替。`None` はワイヤ上 `lat_frame = 0xFFFFFFFF` ・ `lat_delay = 0`（「切替なし」の詰め方）。
+/// INPUTに載るlatencyの切替。`None`はワイヤ上`lat_frame = 0xFFFFFFFF`・`lat_delay = 0`（「切替なし」の詰め方）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatChange {
-    /// 切替を結び付けた apply_frame。
+    /// 切替を結び付けたapply_frame。
     pub frame: u32,
     pub delay: u8,
 }
 
-/// HOST_STATE の本文（type 21。ホスト → ゲスト。5 B）。ゲストの画面の (A)（auto の旗）と、INPUT が流れない間（キャラセレクト
-/// など）にホストが押した D を出すための表示用の値で、同期の芯には入らない。旗を持つのはホストだけなので、ゲストに知らせる
-/// 経路はこれだけ。
+/// HOST_STATEの本文（type 21。ホスト → ゲスト。5 B）。
+/// ゲストの画面の (A)（autoの旗）とINPUTが流れない間（キャラセレクトなど）にホストが押したDを出すための表示用の値。
+/// 同期の芯には入らない。
+/// 旗を持つのはホストだけなのでゲストに知らせる経路はこれだけ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostState {
-    /// 便の番号（古い便を捨てる。ホストが値を送るたびに 1 進む。u16 を回る。受け手は差の符号つきで比べる）。
+    /// 便の番号（古い便を捨てる。ホストが値を送るたびに1進む。u16を回る。受け手は差の符号つきで比べる）。
     pub seq: u16,
     /// ホストの今の対戦の形式。
     pub mode: Mode,
-    /// 画面に出す目標の D（ホストの `shown_delay`）。0〜`delay_pick::bounds` の上限。
+    /// 画面に出す目標のD（ホストの`shown_delay`）。0〜`delay_pick::bounds`の上限。
     pub delay: u8,
     pub auto: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hello {
-    /// 本文中の proto_ver（ヘッダの欄とは別）。
+    /// 本文中のproto_ver（ヘッダのフィールドとは別）。
     pub proto_ver: u8,
     pub latency: u8,
-    /// name の有効バイト数（0〜32）。
+    /// nameの有効バイト数（0〜32）。
     pub name_len: u8,
-    /// 望むモード（+3 の bit0）。
+    /// 望むモード（+3のbit0）。
     pub mode: Mode,
-    /// rollback が**できる**か（+3 の bit1）。望み（`mode`）とは別: 望まなくてもできれば、キャラセレクトの Tab で両者が
-    /// rollback へ替えられる（両者ができるときだけ）。この印を立てない相手は false。
+    /// rollbackが**できる**かどうか（+3のbit1）。望み（`mode`）とは別。
+    /// 望まなくてもできればキャラセレクトのTabで両者がrollbackへ替えられる（両者ができるときだけ）。
+    /// この印を立てない相手はfalse。
     pub can_rollback: bool,
-    /// 観戦を許可するか（+3 の bit2。`[spectate] enable = 1`）。両者が立てたときだけホストが観戦の受付を作る
-    /// （`watch_list::may_list`）。
+    /// 観戦を許可するかどうか（+3のbit2。`[spectate] enable = 1`）。
+    /// 両者が立てたときだけホストが観戦の受付を作る（`watch_list::may_list`）。
     pub listable: bool,
     /// 役割決めの乱数。
     pub role_nonce: u64,
-    /// UTF-8。`name_len` より後ろは全部 0（詰め物）。
+    /// UTF-8。`name_len`より後ろは全部0（詰め物）。
     pub name: [u8; NAME_MAX],
-    /// 席の希望（+44）。
+    /// サイドの希望（+44）。
     pub seat_wish: SeatWish,
     /// ルームに先にいたかの名乗り（+45）。
     pub arrival: Arrival,
-    /// ビルド番号（+46。`update::BUILD_NUMBER`）。違えば接続する前に断る（0 と 0 は同じ）。
+    /// ビルド番号（+46。`update::BUILD_NUMBER`）。違えば接続する前に断る（0と0は同じ）。
     pub build: u32,
     /// 使い捨ての鍵の公開鍵（+50。`seal.rs`）。
     pub public: [u8; PUBLIC_LEN],
-    /// PROBE を交わしてホストを決める（+3 の bit3。両者が立てたときだけ決める —— `host_pick.rs`）。
+    /// PROBEを交わしてホストを決める（+3のbit3。両者が立てたときだけ決める —— `host_pick.rs`）。
     pub host_pick: bool,
-    /// 回線の型の印（+82。`NatMark::to_byte`）。
+    /// ネットワーク種別のフラグ（+82。`NatMark::to_byte`）。
     pub nat: NatMark,
-    /// rollback に決まったときの D（+83。0〜9）。この人がホストに決まったら AGREE の delay の欄になる。
+    /// rollbackに決まったときのD（+83。0〜9）。この人がホストに決まったらAGREEのdelayのフィールドになる。
     pub rollback_delay: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Input {
     pub seg: u16,
-    /// 相手から次に要る apply_frame。
+    /// 相手から次に要るapply_frame。
     pub ack: u32,
-    /// 入力ワードの列の最初の apply_frame。
+    /// 入力ワードの列の最初のapply_frame。
     pub base: u32,
-    /// latency の切替（ホストだけが載せる）。
+    /// latencyの切替（ホストだけが載せる）。
     pub lat: Option<LatChange>,
-    /// 時刻の返し（受けた相手の時刻を相手へ返す。送るときにセッションが入れる。`rtt_probe::EchoClock`）。
+    /// 時刻の返答（受けた相手の時刻を相手へ返す。送るときにセッションが設定する。`rtt_probe::EchoClock`）。
     pub stamp: Stamp,
     /// 入力ワードの個数（0〜32）。
     pub count: u8,
-    /// 入力語（花映塚の 16 bit）。有効なのは `[..count]` だけ（`count` を超える分は decode では 0 で埋める）。
+    /// 入力ワード（花映塚の16 bit）。有効なのは`[..count]`だけ（`count`を超える分はdecodeでは0で埋める）。
     pub words: [u16; MAX_WORDS],
 }
 
-/// INPUT の時刻の欄（本文 +16 の 5 B: sent u16・echo u16・held u8）。対戦の往復を INPUT ごとに測る。
+/// INPUTの時刻のフィールド（本文 +16の5 B: sent u16・echo u16・held u8）。対戦の往復をINPUTごとに測る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stamp {
-    /// 送り手の時計（ms の下位 16 ビット）。
+    /// 送信元の時計（msの下位16ビット）。
     pub sent: u16,
-    /// 送り手が最後に受けた相手の INPUT の `sent` と、受けてからこの INPUT を送るまでの ms（`STAMP_HELD_MAX` まで）。まだ受けていない・
-    /// それより長く持ったなら None（本文は echo 0・held 0xFF）。
+    /// 送信元が最後に受けた相手のINPUTの`sent`と、受けてからこのINPUTを送るまでのms（`STAMP_HELD_MAX`まで）。
+    /// まだ受けていない・それより長く持ったならNone（本文はecho 0・held 0xFF）。
     pub echo: Option<(u16, u8)>,
 }
 
@@ -384,10 +401,10 @@ impl Stamp {
     };
 }
 
-/// `Stamp::echo` の持った ms の上限（255 は「返しなし」の印）。
+/// `Stamp::echo`の持ったmsの上限（255は「返答なし」の印）。
 pub const STAMP_HELD_MAX: u8 = 254;
 const STAMP_NO_ECHO: u8 = 0xFF;
-/// INPUT の本文の、入力ワードの前の部分の長さ（B）。
+/// INPUTの本文の、入力ワードの前の部分の長さ（B）。
 const INPUT_HEAD_LEN: usize = 21;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,7 +417,7 @@ pub struct Check {
     pub life_2p: u8,
 }
 
-/// SELECT の本文。ゲームの値（キャラ・色など）の範囲はここでは見ない（書く前に dll が見る）。
+/// SELECTの本文。ゲームの値（キャラ・色など）の範囲はここでは見ない（書く前にdllが見る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Select {
     pub match_no: u16,
@@ -422,85 +439,92 @@ pub struct Menu {
     pub step: u16,
     /// 相手から次に要る語の番号。
     pub ack: u32,
-    /// 最初の入力ワードの番号（step ごとに 0 から）。
+    /// 最初の入力ワードの番号（stepごとに0から）。
     pub base: u32,
     pub count: u8,
-    /// `count` を超える分は decode では 0 で埋める。
+    /// `count`を超える分はdecodeでは0で埋める。
     pub words: [u16; MAX_WORDS],
-    /// 送り手の画面（`[[0x4AC8C0]+0x1B228]`。読めなければ 0）。受け手は自分の画面と比べる。
+    /// 送信元の画面（`[[0x4AC8C0]+0x1B228]`。読めなければ0）。受け手は自分の画面と比べる。
     pub screen: u8,
-    /// 送り手の席のキャラのカーソル（0〜15）。キャラ選択の画面の外なら `CURSOR_NONE`。
+    /// 送信元のサイドのキャラのカーソル（0〜15）。キャラ選択の画面の外なら`CURSOR_NONE`。
     pub cursor: u8,
-    /// 難易度・マップの画面の共有カーソル用。今は `[CURSOR_NONE, 0]` を送り、受け手は読まない。
+    /// 難易度・マップの画面の共有カーソル用。今は`[CURSOR_NONE, 0]`を送り、受け手は読まない。
     pub shared: [u8; 2],
 }
 
-/// MENU の `cursor`（と `shared[0]`）の「位置なし」。
+/// MENUの`cursor`（と`shared[0]`）の「位置なし」。
 pub const CURSOR_NONE: u8 = 0xFF;
 
-/// STEP_REQ / STEP 共通の本文。
+/// STEP_REQ / STEP共通の本文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
     pub step: u16,
     pub kind: StepKind,
     pub value: u8,
-    /// 押した画面の ID（花映塚の `[[0x4AC8C0]+0x1B228]`）。受け手は自分の画面がこれになってから入れる。
-    /// 0 は「画面を持たない」（peer_sim の選択）。
+    /// 押した画面のID（花映塚の`[[0x4AC8C0]+0x1B228]`）。受け手は自分の画面がこれになってから反映する。
+    /// 0は「画面を持たない」（peer_simの選択）。
     pub screen: u8,
 }
 
-/// SPECTATE_STREAM 1 通に載せる記録の最大個数。いちばん長い記録（名前の 35 B）が 16 個で 12 + 6 + 560 + 16 = 594 B
-/// （1200 B の枠に収まる）。`Message` は `Copy` で値渡しされるので、増やすと全メッセージの大きさが膨らむ。
+/// SPECTATE_STREAM 1通に載せる記録の最大個数。
+/// いちばん長い記録（名前の35 B）が16個で 12 + 6 + 560 + 24 = 602 B（クッキーが載れば610 B。1200 Bの枠に収まる）。
+/// `Message`は`Copy`で値渡しされるので増やすと全メッセージの大きさが膨らむ。
 pub const MAX_STREAM_RECORDS: usize = 16;
 
-/// 観戦の流れの 1 記録。記録は種類つきで 1 本の通し番号（`spectate.rs`）に並ぶ。
+/// 観戦の流れの1記録。記録は種類つきで1本の通し番号（`spectate.rs`）に並ぶ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
-    /// 「この後の記録は seg k のもの」の宣言（観戦者はマッチの状態を捨てて新しい seg に入る）。接続したとき（seg 0）と
-    /// 前の seg を出るとき（次の seg）に積まれ、その seg の選択の押下・SELECT はこの記録の後ろに来る。遅れて JOIN した
-    /// 観戦者は、いまの seg のこの記録から流れる。
+    /// 「この後の記録はマッチkのもの」の宣言（観戦者はそれまでのマッチの状態を捨てて新しいマッチに入る）。
+    /// 接続したとき（マッチ0）と前のマッチを出るとき（次のマッチ）に積まれる。
+    /// そのマッチの選択の押下・SELECTはこの記録の後ろに来る。
+    /// 遅れてJOINした観戦者はいまのマッチのこの記録から流れる。
     Seg { seg: u16 },
-    /// ① 止める地点の SELECT の結果。席ごとに 1 つ（P1 → P2 の順に 2 つ続ける）。マップ・難易度・CPU レベル・
-    /// シードなど両席で共通の欄は、ホストの値を両方に入れる。
+    /// ① 止める地点のSELECTの結果。サイドごとに1つ（P1 → P2の順に2つ続ける）。
+    /// マップ・難易度・CPUレベル・シードなど両サイドで共通のフィールドはホストの値を両方に書き込む。
     Select { seat: Seat, sel: Select },
-    /// ② 選択の画面で決まった押下（ホストの STEP と同じ値）。
+    /// ② 選択の画面で決まった押下（ホストのSTEPと同じ値）。
     Step(Step),
-    /// ② 選択の画面の 1 フレームぶんの MENU の入力ワード（両席。画面を移るビットを落とした後の入力ワード）。
+    /// ② 選択の画面の1フレームぶんのMENUの入力ワード（両サイド。画面を移るビットを落とした後の入力ワード）。
     Menu { p1: u16, p2: u16 },
-    /// ③ マッチの 1 フレームの語（1P・2P）。seg は直前の `Seg` の記録。
+    /// ③ マッチの1フレームの入力ワード（1P・2P）。所属するマッチは直前の`Seg`の記録が示す。
     Frame { frame: u32, p1: u16, p2: u16 },
-    /// ④ 終わり（BYE の reason）。
+    /// ④ 終わり（BYEのreason）。
     End(ByeReason),
-    /// ⑤ 席ごとの名前（UTF-8。HELLO の name と同じガード —— 32 B まで・`len` より後ろは 0）。ホストが各 seg の `Seg` の直後に
-    /// 1P → 2P の順に 2 つ積む。`Record::name` で作る。
+    /// ⑤ サイドごとの名前（UTF-8。HELLOのnameと同じガード —— 32 Bまで・`len`より後ろは0）。
+    /// ホストが各マッチの`Seg`の直後に1P → 2Pの順に2つ積む。
+    /// `Record::name`で作る。
     Name {
         seat: Seat,
         len: u8,
         bytes: [u8; NAME_MAX],
     },
-    /// ⑥ 対戦の状態（観戦者の左下の行の前半）。ホストがマッチの最中に約 1 秒（60 フレーム）に 1 回、対戦する 2 人の左下の行と同じ値を
-    /// 積む。時間を使わない記録（観戦者は最新の値だけを持つ）。値が無いときは `STATS_PING_UNKNOWN` / `STATS_ROLLBACK_NONE`。
-    /// `Record::stats` で作る。
+    /// ⑥ 対戦の状態（観戦者の左下の行の前半）。
+    /// ホストがマッチの最中に約1秒（60フレーム）に1回、対戦する2人の左下の行と同じ値を積む。
+    /// 時間を使わない記録（観戦者は最新の値だけを持つ）。
+    /// 値が無いときは`STATS_PING_UNKNOWN` / `STATS_ROLLBACK_NONE`。
+    /// `Record::stats`で作る。
     Stats {
-        /// 対戦する 2 人の間の往復（ms。ホストが測った値）。測れていなければ `STATS_PING_UNKNOWN`。
+        /// 対戦する2人の間の往復（ms。ホストが測った値）。測れていなければ`STATS_PING_UNKNOWN`。
         ping_ms: u16,
-        /// 今のマッチの入力の遅れ（rollback なら D、delay 方式なら今の遅れ）。
+        /// 今のマッチの入力の遅れ（rollbackならD、delay方式なら今の遅れ）。
         latency: u8,
-        /// rollback の「戻し」（直近 60 フレームで 1 フレームに進め直した更新の数の最大）。delay 方式なら `STATS_ROLLBACK_NONE`。
+        /// rollbackの「戻し」（直近60フレームで1フレームに進め直した更新の数の最大）。delay方式なら`STATS_ROLLBACK_NONE`。
         rollback: u8,
     },
-    /// ⑦ 照合（ホストが確定した状態の値。観戦者は同じ frame の自分の値と比べる）。対戦の CHECK の seg を除いた欄と、値の作り方。
-    /// ホストがマッチの最中に約 1 秒ごと（`check::is_watch_check_frame`）に積む。時間を使わない記録。`Record::check` で作る。
+    /// ⑦ 照合（ホストが確定した状態の値。観戦者は同じframeの自分の値と比べる）。
+    /// フィールドは対戦のCHECKからsegを除いたもの。値の作り方も対戦のCHECKと同じ。
+    /// ホストがマッチの最中に約1秒ごと（`check::is_watch_check_frame`）に積む。
+    /// 時間を使わない記録。`Record::check`で作る。
     Check { kind: CheckKind, check: WatchCheck },
 }
 
-/// `Record::Check` の値の作り方（対戦の CHECK の 2 通りと同じ）。
+/// `Record::Check`の値の作り方（対戦のCHECKの2通りと同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckKind {
-    /// ゲームの値（乱数の状態の下 16 bit・抽選回数・両者のライフ）。
+    /// ゲームの値（乱数の状態の下16 bit・抽選回数・両者のライフ）。
     Game = 0,
-    /// その seg の frame 0 からの入力の列のダイジェスト（`check::check_from_input_digest` の詰め方）。途中から入った観戦者も作れるよう、
-    /// 対戦の CHECK（接続からの通し）と違って seg ごとに作り直す。
+    /// そのマッチのframe 0からの入力の列のダイジェスト（`check::check_from_input_digest`の詰め方）。
+    /// 途中から入った観戦者も作れるように、対戦のCHECK（接続からの通し）と違ってマッチごとに作り直す。
     InputDigest = 1,
 }
 
@@ -514,7 +538,7 @@ impl CheckKind {
     }
 }
 
-/// `Record::Check` の値（`Check` の seg を除いたもの）。
+/// `Record::Check`の値（`Check`のsegを除いたもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchCheck {
     pub frame: u32,
@@ -536,12 +560,12 @@ impl From<&Check> for WatchCheck {
     }
 }
 
-/// `Record::Stats` の ping が測れていない印（`u16::MAX`。測れた値は 65,534 ms で頭打ち）。
+/// `Record::Stats`のpingが測れていない印（`u16::MAX`。測れた値は65,534 msで頭打ち）。
 pub const STATS_PING_UNKNOWN: u16 = u16::MAX;
-/// `Record::Stats` の rollback が無い（delay 方式のマッチ）印（`u8::MAX`。ある値は 254 で頭打ち）。
+/// `Record::Stats`のrollbackが無い（delay方式のマッチ）印（`u8::MAX`。ある値は254で頭打ち）。
 pub const STATS_ROLLBACK_NONE: u8 = u8::MAX;
 
-// 記録の種類の 1 B。
+// 記録の種類の1 B。
 const REC_SEG: u8 = 1;
 const REC_SELECT: u8 = 2;
 const REC_STEP: u8 = 3;
@@ -552,55 +576,61 @@ const REC_NAME: u8 = 7;
 const REC_STATS: u8 = 8;
 const REC_CHECK: u8 = 9;
 
-/// SELECT の本文の長さ（B）。
+/// SELECTの本文の長さ（B）。
 const SELECT_LEN: usize = 18;
-/// STEP_REQ / STEP の本文の長さ（B）。
+/// STEP_REQ / STEPの本文の長さ（B）。
 const STEP_LEN: usize = 5;
-/// 記録 `Name` の本文の長さ（B。seat u8 / len u8 / name 32 B）。
+/// 記録`Name`の本文の長さ（B。seat u8 / len u8 / name 32 B）。
 const NAME_REC_LEN: usize = 2 + NAME_MAX;
-/// 記録 `Stats` の本文の長さ（B。ping_ms u16 / latency u8 / rollback u8）。
+/// 記録`Stats`の本文の長さ（B。ping_ms u16 / latency u8 / rollback u8）。
 const STATS_REC_LEN: usize = 4;
-/// 記録 `Check` の本文の長さ（B。frame u32 / rng_state u16 / rng_count u32 / life_1p u8 / life_2p u8 / kind u8）。
+/// 記録`Check`の本文の長さ（B。frame u32 / rng_state u16 / rng_count u32 / life_1p u8 / life_2p u8 / kind u8）。
 const CHECK_REC_LEN: usize = 13;
-/// SPECTATE_STREAM の本文の、記録の前の部分（first u32・flags u8・count u8）。
+/// SPECTATE_STREAMの本文の、記録の前の部分（first u32・flags u8・count u8）。
 const STREAM_HEAD_LEN: usize = 6;
-/// SPECTATE_STREAM の flags の bit0（`SpectateStream::reset`）。ほかのビットは 0 でなければ捨てる。
+/// SPECTATE_STREAMのflagsのbit0（`SpectateStream::reset`）。ほかのビットは0でなければ捨てる。
 const STREAM_FLAG_RESET: u8 = 1;
-/// SPECTATE_JOIN の名前の欄の終わり（バージョン 4 までの本文の長さ）。
+/// SPECTATE_STREAMのflagsのbit1: 頭の後ろ（+6）にクッキーu64が載る（`SpectateStream::cookie`）。
+const STREAM_FLAG_COOKIE: u8 = 2;
+/// クッキーの長さ（B。STREAMとACKで同じ）。
+const COOKIE_LEN: usize = 8;
+/// SPECTATE_JOINの名前の欄の終わり（バージョン4までの本文の長さ）。
 const JOIN_NAME_END: usize = 10 + NAME_MAX;
-/// SPECTATE_JOIN の公開鍵の欄の終わり（中継の木の欄の始まり）。
+/// SPECTATE_JOINの公開鍵の欄の終わり（中継の木の欄の始まり）。
 const JOIN_PUBLIC_END: usize = JOIN_NAME_END + 4 + PUBLIC_LEN;
-/// SPECTATE_JOIN の本文の、候補の並びの前までの長さ（B）。
+/// SPECTATE_JOINの本文の、候補の並びの前までの長さ（B）。
 const JOIN_FIXED_LEN: usize = JOIN_PUBLIC_END + 8 + PUBLIC_LEN;
-/// JOIN の印（+78）の bit0: 中継できる（中継用の公開鍵が載る）。
+/// JOINの印（+78）のbit0: 中継できる（中継用の公開鍵が載る）。
 const JOIN_RELAY_BIT: u8 = 1;
-/// JOIN の印の bit1: 紹介された中継役に接続できず、ホストへ直接戻った。
+/// JOINの印のbit1: 紹介された中継役に接続できず、ホストへ直接戻った。
 const JOIN_DIRECT_ONLY_BIT: u8 = 2;
-/// JOIN の印の bit2: `resume_from` が載る。
+/// JOINの印のbit2: `resume_from`が載る。
 const JOIN_RESUME_BIT: u8 = 4;
-/// JOIN の印の bit3: いま中継役として子を持っている。
+/// JOINの印のbit3: いま中継役として子を持っている。
 const JOIN_CHILDREN_BIT: u8 = 8;
 const JOIN_FLAGS_MASK: u8 =
     JOIN_RELAY_BIT | JOIN_DIRECT_ONLY_BIT | JOIN_RESUME_BIT | JOIN_CHILDREN_BIT;
-/// SPECTATE_ACK の本文の、`sack` の前の部分（nonce u64・next u32・中継の状態 u8・受け入れの依頼の受け取り u16）の長さ（B）。
-/// 後ろに `sack` のバイト列が 0〜`bits512::BYTES` 個続く。
-const ACK_HEAD_LEN: usize = 15;
-/// ACK の中継の状態の下位 3 bit（子孫の数）。
+/// SPECTATE_ACKの本文の、クッキーと`sack`の前の部分の長さ（B）。内訳はnonce u64・next u32・中継の状態u8・受け入れの依頼の受け取りu16・flags u8。
+/// flagsのbit0が立っていればクッキーu64が続き、その後ろに`sack`のバイト列が0〜`bits512::BYTES`個続く。
+const ACK_HEAD_LEN: usize = 16;
+/// ACKのflagsのbit0（`SpectateAck`の`cookie`）。ほかのビットは0でなければ捨てる。
+const ACK_FLAG_COOKIE: u8 = 1;
+/// ACKの中継の状態の下位3 bit（子孫の数）。
 const RELAY_DESCENDANTS_MASK: u8 = 0x07;
-/// ACK の中継の状態の bit7（紹介しないで）。
+/// ACKの中継の状態のbit7（紹介しないで）。
 const RELAY_NO_INTRO_BIT: u8 = 0x80;
-/// SPECTATE_INTRO の本文の、候補の並びの前までの長さ（nonce u64・epoch u16・中継用の公開鍵）。
+/// SPECTATE_INTROの本文の、候補の並びの前までの長さ（nonce u64・epoch u16・中継用の公開鍵）。
 const INTRO_FIXED_LEN: usize = 10 + PUBLIC_LEN;
-/// SPECTATE_ADMIT の本文の、候補の並びの前までの長さ（番号 u16・始める番号 u32・子の nonce u64・子の epoch u16・子の公開鍵）。
+/// SPECTATE_ADMITの本文の、候補の並びの前までの長さ（番号u16・始める番号u32・子のnonce u64・子のepoch u16・子の公開鍵）。
 const ADMIT_FIXED_LEN: usize = 16 + PUBLIC_LEN;
-/// SPECTATE_ACK の `sack`（受け取れた範囲）が指せる記録の数。ビット i（下位が 0）が番号 `next + 1 + i` の記録を表す。
-/// 最上位の 1 ビットは予約（0 でなければ捨てる）。ホストのウィンドウ `spectate::SEND_WINDOW`（512）は ack の番号そのものを含むので、
-/// `next` より先に受け取っていてよいのは 511 個まで。
+/// SPECTATE_ACKの`sack`（受け取れた範囲）が指せる記録の数。ビットi（下位が0）が番号`next + 1 + i`の記録を表す。
+/// 最上位の1ビットは予約（0でなければ捨てる）。
+/// ホストのウィンドウ`spectate::SEND_WINDOW`（512）はackの番号そのものを含むので`next`より先に受け取っていてよいのは511個まで。
 pub const SACK_BITS: u32 = 511;
-/// `sack` で使ってよいビット（下位 `SACK_BITS` ビット）。
+/// `sack`で使ってよいビット（下位`SACK_BITS`ビット）。
 pub const SACK_MASK: Bits512 = Bits512::low(SACK_BITS);
 
-/// `Frame` の記録 `n` 個を載せた、封じた SPECTATE_STREAM の長さ（B。IP・UDP のヘッダは含まない）。
+/// `Frame`の記録`n`個を載せた、封じたSPECTATE_STREAMの長さ（B。IP・UDPのヘッダは含まない）。
 pub const fn sealed_frame_stream_len(n: usize) -> usize {
     let frame = Record::Frame {
         frame: 0,
@@ -611,10 +641,10 @@ pub const fn sealed_frame_stream_len(n: usize) -> usize {
 }
 
 impl Record {
-    /// `decode` が、`count` を超える枠を埋める値（意味は無い）。
+    /// `decode`が`count`を超える枠を埋める値（意味は無い）。
     pub const FILLER: Record = Record::Seg { seg: 0 };
 
-    /// 記録 1 つのワイヤ上の長さ（種類の 1 B を含む）。
+    /// 記録1つのワイヤ上の長さ（種類の1 Bを含む）。
     pub const fn wire_len(&self) -> usize {
         1 + match self {
             Record::Seg { .. } => 2,
@@ -629,7 +659,7 @@ impl Record {
         }
     }
 
-    /// 観戦者が 1 tick を使う記録か。名前・対戦の状態・照合は時間を使わない（観戦者は値を持つだけで、溜まりや早送りの数に入れない）。
+    /// 観戦者が1 tickを使う記録かどうか。名前・対戦の状態・照合は時間を使わない（観戦者は値を持つだけ。溜まりや早送りの数には入れない）。
     pub const fn takes_time(&self) -> bool {
         !matches!(
             self,
@@ -637,7 +667,7 @@ impl Record {
         )
     }
 
-    /// 照合の記録を作る（対戦の `Check` から seg を除く）。
+    /// 照合の記録を作る（対戦の`Check`からsegを除く）。
     pub fn check(kind: CheckKind, c: &Check) -> Record {
         Record::Check {
             kind,
@@ -645,7 +675,7 @@ impl Record {
         }
     }
 
-    /// 名前の記録を作る。`name` の 32 B を超える分は切る。
+    /// 名前の記録を作る。`name`の32 Bを超える分は切る。
     pub fn name(seat: Seat, name: &[u8]) -> Record {
         let len = name.len().min(NAME_MAX);
         let mut bytes = [0u8; NAME_MAX];
@@ -659,8 +689,8 @@ impl Record {
         }
     }
 
-    /// 対戦の状態の記録を作る。`ping_ms` / `rollback` が `None`（測れていない・delay 方式）なら印の値、あれば頭打ちして
-    /// （印と同じ値にならないよう `STATS_*` の 1 つ手前まで）入れる。
+    /// 対戦の状態の記録を作る。`ping_ms` / `rollback`が`None`（測れていない・delay方式）なら印の値を書き込む。
+    /// 値があれば頭打ちして書き込む（印と同じ値にならないよう`STATS_*`の1つ手前まで）。
     pub fn stats(ping_ms: Option<u32>, latency: u8, rollback: Option<u32>) -> Record {
         Record::Stats {
             ping_ms: ping_ms.map_or(STATS_PING_UNKNOWN, |p| {
@@ -687,7 +717,7 @@ impl Record {
         }
     }
 
-    /// `out`（`wire_len()` B 以上）へ詰める。戻り値は書いた長さ。
+    /// `out`（`wire_len()` B以上）へ詰める。戻り値は書いた長さ。
     fn write(&self, out: &mut [u8]) -> usize {
         out[0] = self.kind_byte();
         let body = &mut out[1..];
@@ -698,7 +728,7 @@ impl Record {
                 put_select(&mut body[1..], sel);
             }
             Record::Step(s) => {
-                // 形式の切替は観戦の流れに載せない（受ける側の `decode` も捨てる）。
+                // 形式の切替は観戦の流れに載せない（受ける側の`decode`も捨てる）。
                 debug_assert!(
                     s.kind != StepKind::Format,
                     "形式の切替は観戦の流れに積まない"
@@ -742,8 +772,8 @@ impl Record {
         self.wire_len()
     }
 
-    /// `buf` の先頭から記録を 1 つ読む。戻り値は（記録, 読んだ長さ）。足りない・種類が外・値が範囲の外は誤り
-    /// （パニックしない）。
+    /// `buf`の先頭から記録を1つ読む。戻り値は（記録, 読んだ長さ）。
+    /// 足りない・種類が外・値が範囲の外は誤りを返す（パニックしない）。
     fn read(buf: &[u8]) -> Result<(Record, usize), DecodeError> {
         const T: u8 = TYPE_SPECTATE_STREAM;
         let Some(&kind) = buf.first() else {
@@ -813,7 +843,7 @@ impl Record {
                 }
                 let mut bytes = [0u8; NAME_MAX];
                 bytes.copy_from_slice(&p[2..2 + NAME_MAX]);
-                // HELLO・JOIN と同じガード（後ろが 0・UTF-8）。観戦者がこの名前を保管庫のフォルダ名にするので、読める文字だけを通す。
+                // HELLO・JOINと同じガード（後ろが0・UTF-8）。観戦者がこの名前を保管庫のフォルダ名にするので読める文字だけを通す。
                 if bytes[len as usize..].iter().any(|&b| b != 0) {
                     return Err(DecodeError::FieldOutOfRange {
                         msg_type: T,
@@ -855,46 +885,46 @@ impl Record {
     }
 }
 
-/// SPECTATE_JOIN の本文（観戦者 → ホスト・中継役）。配置: name_len u8・ff_max u8・nonce u64・name 32 B・build u32（+42）・
-/// 公開鍵 32 B（+46）・印 u8（+78）・回線の型 u8（+79）・epoch u16（+80）・resume_from u32（+82）・中継用の公開鍵 32 B（+86）・
-/// 候補の並び（+118。`candidate::write_list`）。印・+79〜は [`JoinTree`]。
+/// SPECTATE_JOINの本文（観戦者 → ホスト・中継役）。
+/// 配置: name_len u8・ff_max u8・nonce u64・name 32 B・build u32（+42）・公開鍵32 B（+46）・印u8（+78）・ネットワーク種別のフラグu8（+79）・epoch u16（+80）・resume_from u32（+82）・中継用の公開鍵32 B（+86）・候補の並び（+118。`candidate::write_list`）。
+/// 印・+79〜は[`JoinTree`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpectateJoin {
-    /// name の有効バイト数（0〜32）。
+    /// nameの有効バイト数（0〜32）。
     pub name_len: u8,
-    /// 観戦者の早送りの速さ（+1。1 表示あたりの更新の数 `spectate_pace::FF_UPDATES_MIN`〜`FF_UPDATES_MAX`。範囲の外の JOIN は捨てる）。
-    /// ホストはこれで、その観戦者への追いつきの送りの上限を決める（`spectate_rate::watcher_cap_bps`）。
+    /// 観戦者の早送りの速さ（+1。1表示あたりの更新の数`spectate_pace::FF_UPDATES_MIN`〜`FF_UPDATES_MAX`。範囲の外のJOINは捨てる）。
+    /// ホストはこれでその観戦者への追いつきの送信の上限を決める（`spectate_rate::watcher_cap_bps`）。
     pub ff_max: u8,
-    /// 観戦者が起動ごとに引く乱数。同じ送り元から違う値の JOIN が来たら、観戦者が起動し直したと見る。
+    /// 観戦者が起動ごとに生成する乱数。同じ送信元から違う値のJOINが来たら観戦者が起動し直したと見る。
     pub nonce: u64,
-    /// UTF-8。`name_len` より後ろは全部 0。
+    /// UTF-8。`name_len`より後ろは全部0。
     pub name: [u8; NAME_MAX],
-    /// ビルド番号（+42）。違えばホストは JOIN を捨てて数える（`spectate::DropReason::OtherBuild`）。
+    /// ビルド番号（+42）。違えばホストはJOINを捨てて数える（`spectate::DropReason::OtherBuild`）。
     pub build: u32,
     /// 観戦者の使い捨ての鍵の公開鍵（+46）。ホストはこれと観戦用の秘密鍵から観戦者ごとの鍵を作る。
     pub public: [u8; PUBLIC_LEN],
-    /// 中継の木の欄（+78〜）。
+    /// 中継の木のフィールド（+78〜）。
     pub tree: JoinTree,
 }
 
-/// JOIN の中継の木の欄。印（+78）の bit0 = `relay_public` あり・bit1 = `direct_only`・bit2 = `resume_from` あり・
-/// bit3 = `has_children`。ほかの bit が立った JOIN、bit0 が無いのに中継用の公開鍵が 0 でない JOIN、bit2 が無いのに
-/// `resume_from` が 0 でない JOIN は捨てる（同じ値に 2 通りのバイト列を作らない）。
+/// JOINの中継の木のフィールド。印（+78）の bit0 = `relay_public`あり・bit1 = `direct_only`・bit2 = `resume_from`あり・bit3 = `has_children`。
+/// 次のJOINは捨てる。ほかのbitが立ったもの・bit0が無いのに中継用の公開鍵が0でないもの・bit2が無いのに`resume_from`が0でないもの。
+/// 同じ値に2通りのバイト列を作らないため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinTree {
-    /// 中継できるなら、中継用の公開鍵（子との鍵を作る）。None なら欄は 0。
+    /// 中継できるなら中継用の公開鍵（子との鍵を作る）。Noneならフィールドは0。
     pub relay_public: Option<[u8; PUBLIC_LEN]>,
     /// 紹介された中継役に接続できず、ホストへ直接戻った（ホストは紹介せず直接受ける）。
     pub direct_only: bool,
     /// いま中継役として子を持っている（ホストは紹介に回さず直接受ける）。
     pub has_children: bool,
-    /// 続きから受けたいときの番号（連続で受け取れた終わり）。ホストはリングにあればそこから流す。None なら欄は 0。
+    /// 続きから受けたいときの番号（連続で受け取れた終わり）。ホストはリングにあればそこから送信する。Noneならフィールドは0。
     pub resume_from: Option<u32>,
-    /// 回線の型（+79。`NatMark::to_byte`）。
+    /// ネットワーク種別のフラグ（+79。`NatMark::to_byte`）。
     pub nat: NatMark,
-    /// 親を替えた回数（+80。0 から）。古い紹介を見分ける。
+    /// 親を替えた回数（+80。0から）。古い紹介を見分ける。
     pub epoch: u16,
-    /// 自分の候補（0〜`MAX_CANDIDATES` 個）。
+    /// 自分の候補（0〜`MAX_CANDIDATES`個）。
     pub candidates: Candidates,
 }
 
@@ -911,17 +941,17 @@ impl JoinTree {
     };
 }
 
-/// ACK の中継の状態（1 B）: 下位 3 bit = 子孫の数・bit7 = 紹介しないで。ほかの bit が立った ACK は捨てる。
+/// ACKの中継の状態（1 B）: 下位3 bit = 子孫の数・bit7 = 紹介しないで。ほかのbitが立ったACKは捨てる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayState {
-    /// 子孫の数（0〜7。受け入れて JOIN を待っている子も数える）。
+    /// 子孫の数（0〜7。受け入れてJOINを待っている子も数える）。
     pub descendants: u8,
     /// 紹介しないで（中継できない・中継をやめた）。
     pub no_intro: bool,
 }
 
 impl RelayState {
-    /// 載せられる子孫の数の上限（下位 3 bit）。
+    /// 載せられる子孫の数の上限（下位3 bit）。
     pub const MAX_DESCENDANTS: u8 = RELAY_DESCENDANTS_MASK;
 
     /// 中継しない観戦者の値。
@@ -950,11 +980,11 @@ impl RelayState {
     }
 }
 
-/// SPECTATE_INTRO の本文（ホスト → 観戦者。その観戦者との鍵で封じる）。配置: nonce u64・epoch u16（+8）・
-/// 中継用の公開鍵 32 B（+10）・候補の並び（+42）。
+/// SPECTATE_INTROの本文（ホスト → 観戦者。その観戦者との鍵で封じる）。
+/// 配置: nonce u64・epoch u16（+8）・中継用の公開鍵32 B（+10）・候補の並び（+42）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpectateIntro {
-    /// 観戦者の JOIN の nonce と `epoch`（両方が観戦者の今の値と合う紹介だけを受ける）。
+    /// 観戦者のJOINのnonceと`epoch`（両方が観戦者の今の値と合う紹介だけを受ける）。
     pub nonce: u64,
     pub epoch: u16,
     /// 中継役の中継用の公開鍵。
@@ -963,11 +993,12 @@ pub struct SpectateIntro {
     pub relay: Candidates,
 }
 
-/// SPECTATE_ADMIT の本文（ホスト → 中継役。中継役との鍵で封じる）。配置: 番号 u16・始める番号 u32（+2）・子の nonce u64（+6）・
-/// 子の epoch u16（+14）・子の公開鍵 32 B（+16）・子の候補の並び（+48）。番号 0 は捨てる。
+/// SPECTATE_ADMITの本文（ホスト → 中継役。中継役との鍵で封じる）。
+/// 配置: 番号u16・始める番号u32（+2）・子のnonce u64（+6）・子のepoch u16（+14）・子の公開鍵32 B（+16）・子の候補の並び（+48）。
+/// 番号0は捨てる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpectateAdmit {
-    /// 依頼の番号（1 から）。
+    /// 依頼の番号（1から）。
     pub no: u16,
     /// 子が流れ始める記録の番号。
     pub start: u32,
@@ -978,44 +1009,52 @@ pub struct SpectateAdmit {
     pub candidates: Candidates,
 }
 
-/// SPECTATE_PAIR の本文（観戦者 → ホスト。ホストとの鍵で封じる）。配置: 番の番号 u16・組の番号 u8（+2。0〜`MEASURE_PAIRS` − 1）・
-/// 組の中の順 u8（+3。0 か 1）・+4 から 0 の詰め物。封じた全体がちょうど `PAIR_LEN`（組の 2 通の到着の差を太さに比べて大きくする）。
+/// SPECTATE_PAIRの本文（観戦者 → ホスト。ホストとの鍵で封じる）。
+/// 配置: 番の番号u16・ペアの番号u8（+2。0〜`MEASURE_PAIRS` − 1）・ペアの中の順u8（+3。0か1）・+4から0の詰め物。
+/// 封じた全体がちょうど`PAIR_LEN`になる（ペアの2通の到着の差を太さに比べて大きくするため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpectatePair {
-    /// MEASURE の番の番号（1 から）。
+    /// MEASUREの番の番号（1から）。
     pub turn: u16,
     pub pair: u8,
-    /// 組の 2 通目。
+    /// ペアの2通目。
     pub second: bool,
 }
 
-/// SPECTATE_STREAM の本文（ホスト → 観戦者）。
+/// SPECTATE_STREAMの本文（ホスト → 観戦者）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpectateStream {
     /// 最初の記録の通し番号。
     pub first: u32,
-    /// 「ここから始めてよい」の印。受け手が持つ連続の終わりより `first` が先でも、そこへ飛ぶ（遅れて入った・
-    /// 古い記録がリングバッファから落ちた観戦者へ、いまの seg の始まりから流すとき）。付けないときは飛ばない（順の入れ替わりで
-    /// 先の番号が先に着いただけかもしれないので）。
+    /// 「ここから始めてよい」の印。受け手が持つ連続の終わりより`first`が先でもそこへ飛ぶ。
+    /// 遅れて入った観戦者や古い記録がリングバッファから落ちた観戦者へ、いまのマッチの始まりから送信するときに付ける。
+    /// 付けないときは飛ばない（順の入れ替わりで先の番号が先に着いただけかもしれないので）。
     pub reset: bool,
-    /// 記録の個数（0〜`MAX_STREAM_RECORDS`）。0 は「生きている」の合図（受け手は ack を返す）。
+    /// 配信する側が枠ごとに生成した値。ACKを1回も受けていない枠へのSTREAMにだけ載る。
+    /// 受け手は次のACKでそのまま返す（JOINの送信元を偽った人はSTREAMを受け取れないので最初のACKを作れない）。
+    pub cookie: Option<u64>,
+    /// 記録の個数（0〜`MAX_STREAM_RECORDS`）。0は生存確認（ping）。受け手はackを返す。
     pub count: u8,
-    /// 有効なのは `[..count]` だけ（超える分は decode では `Record::FILLER`）。
+    /// 有効なのは`[..count]`だけ（超える分はdecodeでは`Record::FILLER`）。
     pub records: [Record; MAX_STREAM_RECORDS],
 }
 
-/// メッセージ（本文だけ。ヘッダの session_id は `Packet` 側）。
-// SpectateStream が最も大きく（16 記録）、候補の並びを持つ JOIN・INTRO・ADMIT が次ぐ（i686 で 584 B と 336〜424 B。ほかは
-// 90 B 以下）。Box にすると確保が要り、受信・ゲームのスレッドで確保しない規則に反する。
+/// メッセージ（本文だけ。ヘッダのsession_idは`Packet`側）。
+// SpectateStreamが最も大きく（16記録）、候補の並びを持つJOIN・INTRO・ADMITが次ぐ（i686で584 Bと336〜424 B。ほかは90 B以下）。
+// Boxにすると確保が要るので受信・ゲームのスレッドで確保しない規則に反する。
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message {
     Hello(Hello),
-    /// HELLO への返し（HELLO と同じく HMAC のタグの便）。
+    /// HELLOへの返答（HELLOと同じくHMACのタグの便）。本文はecho_nonce u64・role_nonce u64・public（+16）・echo_public（+48）。
     HelloAck {
         echo_nonce: u64,
         role_nonce: u64,
         public: [u8; PUBLIC_LEN],
+        /// 答えたHELLOの公開鍵。使い捨ての鍵は接続のセッションごとに生成する。
+        /// 受け手は自分の今の公開鍵と比べて前のセッションへの返答を見分ける。
+        /// role_nonceはメニューを開いている間は変わらないので`echo_nonce`だけでは見分けられない。
+        echo_public: [u8; PUBLIC_LEN],
     },
     Input(Input),
     Check(Check),
@@ -1025,14 +1064,14 @@ pub enum Message {
     Pong {
         send_time: u32,
     },
-    /// 取りまとめ役（role_nonce の大きい方）が決めた値（本文 14 B）: host_seat u8・delay u8・mode u8・ホスト u8（0 = 送り手、1 = 受け手）・
-    /// 送り手の上り u32・受け手の上り u32・送り手の回線の型 u8・受け手の回線の型 u8。席・delay は決まったホストの側の値。
+    /// 取りまとめ役（role_nonceの大きい方）が決めた値（本文14 B）: host_seat u8・delay u8・mode u8・ホストu8（0 = 送信元、1 = 受け手）・送信元の上りu32・受け手の上りu32・送信元のネットワーク種別のフラグu8・受け手のネットワーク種別のフラグu8。
+    /// サイド・delayは決まったホストの側の値。
     Agree {
         host_seat: Seat,
-        /// delay 方式ではマッチを始める delay、rollback のモードでは D（`apply_frame = capture_frame + D`）。0〜9。
+        /// delay方式ではマッチを始めるdelay、rollbackのモードではD（`apply_frame = capture_frame + D`）。0〜9。
         delay: u8,
         mode: Mode,
-        /// どちらがホストかと、決めるのに使った値（`host_pick::Pick`）。
+        /// どちらがホストかと決めるのに使った値（`host_pick::Pick`）。
         pick: Pick,
     },
     Select(Select),
@@ -1040,46 +1079,50 @@ pub enum Message {
     Menu(Menu),
     StepReq(Step),
     Step(Step),
-    /// 観戦者 → ホスト。観戦用の接続コードの session・鍵のパケット。
+    /// 観戦者 → ホスト。観戦用の接続コードのsession・鍵のパケット。
     SpectateJoin(SpectateJoin),
     /// ホスト → 観戦者。
     SpectateStream(SpectateStream),
-    /// 観戦者 → ホスト。`nonce` は自分の JOIN の値（起動し直す前の遅れた ACK を見分ける）、`next` は次に要る記録の番号
-    /// （それより前は連続で受け取った）、`sack` は `next` の**後ろ**で受け取れた記録（ビット i = 番号 `next + 1 + i`。
-    /// `next` 自身は受け取れていない）。ホストは、届いていない記録だけを送り直す。
-    /// 本文は nonce 8 B・next 4 B・中継の状態 1 B（+12）・`admit_ack` u16（+13）の後に `sack` のバイト列（バイト j = ビット 8j〜8j+7）。
-    /// 後ろの 0 のバイトは載せない（最後のバイトが 0 の本文は捨てる。同じ値に 2 通りのバイト列を作らない）。
+    /// 観戦者 → ホスト。
+    /// `nonce`は自分のJOINの値（起動し直す前の遅れたACKを見分ける）。
+    /// `next`は次に要る記録の番号（それより前は連続で受け取った）。
+    /// `sack`は`next`の**後ろ**で受け取れた記録（ビット i = 番号`next + 1 + i`。`next`自身は受け取れていない）。
+    /// ホストは届いていない記録だけを送り直す。
+    /// 本文はnonce 8 B・next 4 B・中継の状態1 B（+12）・`admit_ack` u16（+13）・flags u8（+15）・クッキーu64（+16。flagsのbit0のときだけ）の後に`sack`のバイト列（バイト j = ビット8j〜8j+7）。
+    /// 後ろの0のバイトは載せない（最後のバイトが0の本文は捨てる。同じ値に2通りのバイト列を作らない）。
     SpectateAck {
         nonce: u64,
         next: u32,
         relay: RelayState,
-        /// 最後に受けた受け入れの依頼（ADMIT）の番号（累積。0 は「まだ無い」）。
+        /// 最後に受けた受け入れの依頼（ADMIT）の番号（累積。0は「まだ無い」）。
         admit_ack: u16,
+        /// 最後に受けたSTREAMのクッキー（[`SpectateStream::cookie`]。載っていなければNone）。
+        cookie: Option<u64>,
         sack: Bits512,
     },
     /// ホスト → 観戦者。中継役の紹介。
     SpectateIntro(SpectateIntro),
     /// ホスト → 中継役。子の受け入れの依頼。
     SpectateAdmit(SpectateAdmit),
-    /// 中継役 → 子（本文 0 B）。この親はもう配らないので、元のホストへ戻れ。
+    /// 中継役 → 子（本文0 B）。この親はもう配信しないので元のホストへ戻れ。
     SpectateRehome,
-    /// ホスト → 観戦者（本文 2 B）。上りの太さを測る番を渡す。`turn` は番の番号（1 から。0 は捨てる）。
+    /// ホスト → 観戦者（本文2 B）。上りの太さを測る番を渡す。`turn`は番の番号（1から。0は捨てる）。
     SpectateMeasure {
         turn: u16,
     },
-    /// 観戦者 → ホスト。測りの組の 1 通。
+    /// 観戦者 → ホスト。測定のペアの1通。
     SpectatePair(SpectatePair),
-    /// 「自分は対戦を始めてよい（『妖怪 対 妖怪』を選んだ）」（両方向。本文 0 B）。`code_side = game` の実行だけが送る
-    /// （`match_gate.rs`）。
+    /// 「自分は対戦を始めてよい（『妖怪 対 妖怪』を選んだ）」（両方向。本文0 B）。
+    /// `code_side = game`の実行だけが送る（`match_gate.rs`）。
     Ready,
-    /// ホスト → ゲスト（本文 5 B）。ack は要らない（最新の値だけ持つ。値が変わった tick と約 1 秒ごとに送り直す）。
+    /// ホスト → ゲスト（本文5 B）。ackは要らない（最新の値だけ持つ。値が変わったtickと約1秒ごとに送り直す）。
     /// ホストでない側が受けたら捨てる（`UnknownType`）。
     HostState(HostState),
-    /// 上りの太さを測る列の 1 通（HMAC のタグの便。全体で `host_pick::PROBE_LEN`）。本文は通し番号 u8（0〜`PROBE_COUNT` − 1）の後を 0 で埋める。
+    /// 上りの太さを測る列の1通（HMACのタグの便。全体で`host_pick::PROBE_LEN`）。本文は通し番号u8（0〜`PROBE_COUNT` − 1）の後を0で埋める。
     Probe {
         seq: u8,
     },
-    /// ゲストが測った取りまとめ役の上り（B/s。0 = 測れない。本文 4 B）。AGREE が届くまで送り直す。
+    /// ゲストが測った取りまとめ役の上り（B/s。0 = 測れない。本文4 B）。AGREEが届くまで送り直す。
     ProbeResult {
         up: u32,
     },
@@ -1091,33 +1134,33 @@ pub struct Packet {
     pub msg: Message,
 }
 
-/// decode が捨てた理由。
+/// decodeが捨てた理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// ヘッダ 12 B とタグ 16 B（計 28 B）に満たない。
+    /// ヘッダ12 Bとタグ16 B（計28 B）に満たない。
     TooShort { got: usize },
-    /// magic が `"HGRT"` でない。
+    /// magicが`"HGRT"`でない。
     BadMagic,
-    /// 認証タグが合わない（改ざん・別の鍵・別の session_id・切り詰め）。本文は読んでいない。封じた便が開かない（別の向き・
-    /// 別の接続の鍵・nonce の欄やヘッダの改ざん）ときも同じ。
+    /// 認証タグが合わない（改ざん・別の鍵・別のsession_id・切り詰め）。本文は読んでいない。
+    /// 封じた便が開かない（別の向き・別の接続の鍵・nonceのフィールドやヘッダの改ざん）ときも同じ。
     BadTag,
-    /// 封じた便だが、`Opener` が無い（鍵の交換がまだ —— 相手の HELLO より先に届いた）。中は読んでいない。
+    /// 封じた便だが`Opener`が無い（鍵の交換がまだ —— 相手のHELLOより先に届いた）。中は読んでいない。
     NotKeyed,
-    /// ヘッダの proto_ver が `PROTO_VER` でない（中は相手のバージョン）。タグを比べた後に見る。
+    /// ヘッダのproto_verが`PROTO_VER`でない（中は相手のバージョン）。タグを比べた後に見る。
     BadVersion(u8),
-    /// ヘッダの flags または予約バイト（offset 6・7）が 0 でない。
+    /// ヘッダのflagsまたは予約バイト（offset 6・7）が0でない。
     HeaderReserved,
-    /// 知らない type（0・5〜7・12・29 以上）。
+    /// 知らないtype（0・5〜7・12・29以上）。
     UnknownType(u8),
-    /// 本文の長さが type ごとの固定長（可変部は count から決まる期待値）と違う。
+    /// 本文の長さがtypeごとの固定長（可変部はcountから決まる期待値）と違う。
     LengthMismatch {
         msg_type: u8,
         expected: usize,
         actual: usize,
     },
-    /// 値が範囲の外、または予約欄が 0 でない。
+    /// 値が範囲の外または予約フィールドが0でない。
     FieldOutOfRange { msg_type: u8, field: &'static str },
-    /// HELLO の name が UTF-8 として読めない。
+    /// HELLOのnameがUTF-8として読めない。
     InvalidUtf8,
 }
 
@@ -1176,7 +1219,7 @@ fn message_type_id(msg: &Message) -> u8 {
     }
 }
 
-/// SELECT の本文（18 B）を `out` へ詰める。SELECT 本体と、観戦の記録が同じ配置を使う。
+/// SELECTの本文（18 B）を`out`へ詰める。SELECT本体と観戦の記録が同じ配置を使う。
 fn put_select(out: &mut [u8], s: &Select) {
     put_u16(out, 0, s.match_no);
     out[2] = s.chara;
@@ -1193,7 +1236,7 @@ fn put_select(out: &mut [u8], s: &Select) {
     put_u32(out, 14, s.option_digest);
 }
 
-/// STEP_REQ / STEP の本文（5 B）を `out` へ詰める。観戦の記録も同じ配置。
+/// STEP_REQ / STEPの本文（5 B）を`out`へ詰める。観戦の記録も同じ配置。
 fn put_step(out: &mut [u8], s: &Step) {
     put_u16(out, 0, s.step);
     out[2] = s.kind.to_u8();
@@ -1201,7 +1244,7 @@ fn put_step(out: &mut [u8], s: &Step) {
     out[4] = s.screen;
 }
 
-/// 候補の並び（接続コードと同じ形。`candidate::write_list`）を `out` の先頭へ詰め、書いたバイト数を返す。
+/// 候補の並び（接続コードと同じ形。`candidate::write_list`）を`out`の先頭へ詰め、書いたバイト数を返す。
 fn put_list(c: &Candidates, out: &mut [u8]) -> usize {
     let mut tmp = [0u8; LIST_WIRE_MAX];
     let n = candidate::write_list(c, &mut tmp);
@@ -1209,7 +1252,7 @@ fn put_list(c: &Candidates, out: &mut [u8]) -> usize {
     n
 }
 
-/// 本文 `body` の `at` から候補の並びを読む。並びが本文の終わりまでちょうどでなければ捨てる。
+/// 本文`body`の`at`から候補の並びを読む。並びが本文の終わりまでちょうどでなければ捨てる。
 fn get_list(msg_type: u8, body: &[u8], at: usize) -> Result<Candidates, DecodeError> {
     let rest = body.get(at..).unwrap_or(&[]);
     let (list, used) = candidate::read_list(rest).map_err(|e| match e {
@@ -1237,7 +1280,7 @@ fn get_list(msg_type: u8, body: &[u8], at: usize) -> Result<Candidates, DecodeEr
     Ok(list)
 }
 
-/// 本文が、候補の並びの前まで（`fixed` B）と並びの個数の 1 B に足りなければ捨てる。
+/// 本文が候補の並びの前まで（`fixed` B）と並びの個数の1 Bに足りなければ捨てる。
 fn need_fixed(msg_type: u8, body: &[u8], fixed: usize) -> Result<(), DecodeError> {
     if body.len() <= fixed {
         return Err(DecodeError::LengthMismatch {
@@ -1249,10 +1292,10 @@ fn need_fixed(msg_type: u8, body: &[u8], fixed: usize) -> Result<(), DecodeError
     Ok(())
 }
 
-/// 本文を `out`（ヘッダの後ろ）へ詰め、書いたバイト数を返す。
+/// 本文を`out`（ヘッダの後ろ）へ詰め、書いたバイト数を返す。
 ///
-/// `count` や `latency` などが範囲の外の値は呼び出し側のバグなので `debug_assert!` で早期に落とす（release では素通り。
-/// ネットワークから来た値はここを通らない）。
+/// `count`や`latency`などが範囲の外の値は呼び出し側のバグなので`debug_assert!`で早期に落とす。
+/// releaseでは素通りする。ネットワークから来た値はここを通らない。
 fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
     match msg {
         Message::Hello(h) => {
@@ -1272,7 +1315,7 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             put_u32(out, 46, h.build);
             out[50..50 + PUBLIC_LEN].copy_from_slice(&h.public);
             out[82] = h.nat.to_byte();
-            // 範囲の外は受け手が HELLO ごと捨てるので、範囲に収めて書く。
+            // 範囲の外は受け手がHELLOごと捨てるので範囲に収めて書く。
             out[83] = h.rollback_delay.min(MAX_DELAY);
             HELLO_LEN
         }
@@ -1280,10 +1323,12 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             echo_nonce,
             role_nonce,
             public,
+            echo_public,
         } => {
             put_u64(out, 0, *echo_nonce);
             put_u64(out, 8, *role_nonce);
-            out[16..HELLO_ACK_LEN].copy_from_slice(public);
+            out[16..16 + PUBLIC_LEN].copy_from_slice(public);
+            out[16 + PUBLIC_LEN..HELLO_ACK_LEN].copy_from_slice(echo_public);
             HELLO_ACK_LEN
         }
         Message::Input(i) => {
@@ -1302,12 +1347,13 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
                     out[14] = 0;
                 }
             }
-            // count が 32 を超えていても配列の外を読まない。debug_assert は release で消えるので、個数を詰めてその個数を書く
-            // （受け手は正しく読める）。
+            // countが32を超えていても配列の外を読まない。
+            // debug_assertはreleaseで消えるので個数を詰めてその個数を書く。
+            // そうすれば受け手は正しく読める。
             let n = (i.count as usize).min(MAX_WORDS);
             out[15] = n as u8;
             put_u16(out, 16, i.stamp.sent);
-            // 持った ms が上限を越えた返しは載せない（受け手の往復の標本にならない）。
+            // 保持したmsが上限を越えた返答は載せない（受け手の往復のサンプルにならない）。
             match i.stamp.echo {
                 Some((echo, held)) if held <= STAMP_HELD_MAX => {
                     put_u16(out, 18, echo);
@@ -1365,7 +1411,7 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             put_u16(out, 0, m.step);
             put_u32(out, 2, m.ack);
             put_u32(out, 6, m.base);
-            // INPUT と同じ理由で、個数は 32 で詰めてその個数を書く。
+            // INPUTと同じ理由で個数は32で詰めてその個数を書く。
             let n = (m.count as usize).min(MAX_WORDS);
             out[10] = n as u8;
             for k in 0..n {
@@ -1384,7 +1430,7 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
         Message::SpectateJoin(j) => {
             debug_assert!((j.name_len as usize) <= NAME_MAX, "name_len は 0..=32");
             out[0] = j.name_len;
-            // 範囲の外は受け手が捨てるので、範囲に収めて書く。
+            // 範囲の外は受け手が捨てるので範囲に収めて書く。
             out[1] = j.ff_max.clamp(FF_UPDATES_MIN as u8, FF_UPDATES_MAX as u8);
             put_u64(out, 2, j.nonce);
             out[10..JOIN_NAME_END].copy_from_slice(&j.name);
@@ -1404,11 +1450,15 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
         }
         Message::SpectateStream(s) => {
             put_u32(out, 0, s.first);
-            out[4] = u8::from(s.reset);
-            // INPUT と同じ理由で、個数は上限で詰めてその個数を書く（配列の外を読まない）。
+            out[4] = u8::from(s.reset) | (u8::from(s.cookie.is_some()) * STREAM_FLAG_COOKIE);
+            // INPUTと同じ理由で個数は上限で詰めてその個数を書く（配列の外を読まない）。
             let n = (s.count as usize).min(MAX_STREAM_RECORDS);
             out[5] = n as u8;
             let mut at = STREAM_HEAD_LEN;
+            if let Some(c) = s.cookie {
+                put_u64(out, at, c);
+                at += COOKIE_LEN;
+            }
             for rec in s.records.iter().take(n) {
                 at += rec.write(&mut out[at..]);
             }
@@ -1419,6 +1469,7 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             next,
             relay,
             admit_ack,
+            cookie,
             sack,
         } => {
             debug_assert!(
@@ -1429,10 +1480,16 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
             put_u32(out, 8, *next);
             out[12] = relay.to_byte();
             put_u16(out, 13, *admit_ack);
+            out[15] = u8::from(cookie.is_some()) * ACK_FLAG_COOKIE;
+            let mut at = ACK_HEAD_LEN;
+            if let Some(c) = cookie {
+                put_u64(out, at, *c);
+                at += COOKIE_LEN;
+            }
             let mut raw = [0u8; bits512::BYTES];
             let n = sack.to_wire(&mut raw);
-            out[ACK_HEAD_LEN..ACK_HEAD_LEN + n].copy_from_slice(&raw[..n]);
-            ACK_HEAD_LEN + n
+            out[at..at + n].copy_from_slice(&raw[..n]);
+            at + n
         }
         Message::SpectateIntro(i) => {
             put_u64(out, 0, i.nonce);
@@ -1489,8 +1546,9 @@ fn encode_body(msg: &Message, out: &mut [u8]) -> usize {
     }
 }
 
-/// type が HMAC のタグの便（鍵を交換する便: HELLO・HELLO_ACK・SPECTATE_JOIN と PROBE）か。決まりはここ 1 か所
-/// （`encode` / `seal` と `decode` が同じ関数を見る）。PROBE は中身が通し番号だけで、封じる通し番号を 10 個使う理由が無いので封じない。
+/// typeがHMACのタグの便（鍵を交換する便: HELLO・HELLO_ACK・SPECTATE_JOINとPROBE）かどうか。
+/// 決まりはここ1か所（`encode` / `seal`と`decode`が同じ関数を見る）。
+/// PROBEは中身が通し番号だけ。封じる通し番号を10個使う理由が無いので封じない。
 pub fn is_signed_type(type_id: u8) -> bool {
     matches!(
         type_id,
@@ -1498,7 +1556,7 @@ pub fn is_signed_type(type_id: u8) -> bool {
     )
 }
 
-/// `msg` が HMAC のタグの便か（[`is_signed_type`] の `Message` を受ける形）。
+/// `msg`がHMACのタグの便かどうか（[`is_signed_type`]の`Message`を受ける形）。
 pub fn is_signed(msg: &Message) -> bool {
     is_signed_type(message_type_id(msg))
 }
@@ -1512,11 +1570,14 @@ fn put_header(out: &mut [u8; MAX_DATAGRAM], session_id: u32, type_id: u8) {
     out[8..12].copy_from_slice(&session_id.to_le_bytes());
 }
 
-/// 鍵を交換する便（[`is_signed_type`]）を組み立て、末尾に `key` のタグを付ける。`out` は `MAX_DATAGRAM` B の固定バッファ
-/// （呼び出し側がスタックに持つ）。戻り値はタグ込みの長さ（`out[..戻り値]` を送る）。
+/// 鍵を交換する便（[`is_signed_type`]）を組み立てて末尾に`key`のタグを付ける。
+/// `out`は`MAX_DATAGRAM` Bの固定バッファ（呼び出し側がスタックに持つ）。
+/// 戻り値はタグ込みの長さ（`out[..戻り値]`を送る）。
 ///
-/// 封じる便（AGREE・INPUT・PING など）は `seal` で作る。ここへ渡したら何も作らず 0 を返す（相手は HMAC のタグの INPUT を
-/// 開けずに捨てるので、間違えて送ると黙って届かない。0 B なら呼び手の検査がすぐ落ちる）。
+/// 封じる便（AGREE・INPUT・PINGなど）は`seal`で作る。
+/// ここへ渡したら何も作らず0を返す。
+/// 相手はHMACのタグのINPUTを開けずに捨てる。そのため間違えて送ると黙って届かない。
+/// 0 Bなら呼び手の検査がすぐ落ちる。
 pub fn encode(
     key: &AuthKey,
     session_id: u32,
@@ -1531,18 +1592,20 @@ pub fn encode(
     put_header(out, session_id, type_id);
     let body_len = encode_body(msg, &mut out[HEADER_LEN..]);
     let n = HEADER_LEN + body_len;
-    // 最長の HMAC の便（PROBE）がちょうど 1200 B の枠。
+    // 最長のHMACの便（PROBE）がちょうど1200 Bの枠。
     let tag = key.tag(&out[..n]);
     out[n..n + TAG_LEN].copy_from_slice(&tag);
     n + TAG_LEN
 }
 
-/// 封じる便（[`is_signed_type`] でないもの）を組み立てて封じる: ヘッダ 12 B ‖ nonce の欄 8 B ‖ 暗号化した本文 ‖ タグ 16 B。
-/// ヘッダが追加の認証データ。通し番号は `seq` から 1 つ取る（送り手ごとに 1 つの `Seq`）。戻り値は全体の長さ。
-/// HMAC の便を渡した・通し番号を使い切ったら None（何も送らない）。確保しない。
+/// 封じる便（[`is_signed_type`]でないもの）を組み立てて封じる: ヘッダ12 B ‖ nonceのフィールド8 B ‖ 暗号化した本文 ‖ タグ16 B。
+/// ヘッダが追加の認証データ。通し番号は`seq`から1つ取る（送り手ごとに1つの`Seq`）。戻り値は全体の長さ。
+/// HMACの便を渡した・通し番号を使い切ったらNone（何も送らない）。確保しない。
 ///
-/// 最長は測りの組の PAIR（1200 B ちょうど）、次が観戦の STREAM（16 記録 × 名前の記録 35 B ＝ 560 B ＋ 6 B）で 602 B、対戦は
-/// INPUT の 121 B。どれも 1200 B の枠に収まる（`seal_fits_the_datagram_for_the_longest_bodies` が見る）。
+/// 最長は測りのPAIR（1200 Bちょうど）。
+/// 次が観戦のSTREAM（16記録 × 名前の記録35 B ＝ 560 B ＋ 6 B）で602 B。
+/// 対戦はINPUTの121 B。
+/// どれも1200 Bの枠に収まる（`seal_fits_the_datagram_for_the_longest_bodies`が検証する）。
 pub fn seal(
     sealer: &Sealer,
     seq: &Seq,
@@ -1567,11 +1630,11 @@ pub fn seal(
     Some(end + SEAL_TAG_LEN)
 }
 
-/// 受信ソケットに来た 1 データグラムの種類（受信ソケットで magic と STUN の cookie を見て分ける）。
+/// 受信ソケットに来た1データグラムの種類（受信ソケットでmagicとSTUNのcookieを見て分ける）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Datagram {
     Hgrt,
-    /// STUN（20 B 以上、先頭 2 bit が 0、offset 4 の 4 B が magic cookie `0x2112A442`（BE）。RFC 5389 §6）。
+    /// STUN（20 B以上・先頭2 bitが0・offset 4の4 Bがmagic cookie `0x2112A442`（BE）。RFC 5389 §6）。
     Stun,
     Other,
 }
@@ -1591,8 +1654,8 @@ pub fn classify(bytes: &[u8]) -> Datagram {
     }
 }
 
-/// タグを比べる前に、ヘッダの session_id だけを覗く（別の接続の遅れたパケットを「別のセッション」として数え分けるため）。
-/// 長さか magic が合わなければ None。
+/// タグを比べる前にヘッダのsession_idだけを覗く（別の接続の遅れたパケットを「別のセッション」として数え分けるため）。
+/// 長さかmagicが合わなければNone。
 pub fn peek_session(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < HEADER_LEN + TAG_LEN || !bytes.starts_with(&MAGIC) {
         return None;
@@ -1600,8 +1663,9 @@ pub fn peek_session(bytes: &[u8]) -> Option<u32> {
     Some(get_u32(bytes, 8))
 }
 
-/// タグを比べる前に、ヘッダの type を覗く（下の `peek_*` の元）。長さか magic が合わなければ None。本物かどうかはタグを比べるまで
-/// 分からない（`decode` の仕事）。
+/// タグを比べる前にヘッダのtypeを覗く（下の`peek_*`の元）。
+/// 長さかmagicが合わなければNone。
+/// 本物かどうかはタグを比べるまで分からない（`decode`の仕事）。
 fn peek_type_id(bytes: &[u8]) -> Option<u8> {
     if bytes.len() < HEADER_LEN + TAG_LEN || !bytes.starts_with(&MAGIC) {
         return None;
@@ -1609,19 +1673,20 @@ fn peek_type_id(bytes: &[u8]) -> Option<u8> {
     bytes.get(5).copied()
 }
 
-/// タグを比べる前に、ヘッダの type が PING かだけを覗く（受信スレッドの PONG の応答役 `pong.rs` の最初のガード）。PING でない 1 通に
-/// タグの計算を足さないため。
+/// タグを比べる前にヘッダのtypeがPINGかどうかだけを覗く（受信スレッドのPONGの応答役`pong.rs`の最初のガード）。
+/// PINGでない1通にタグの計算を足さないため。
 pub fn peek_is_ping(bytes: &[u8]) -> bool {
     peek_type_id(bytes) == Some(TYPE_PING)
 }
 
-/// タグを比べる前に、ヘッダの type が PROBE かだけを覗く（接続した後の PROBE に 1,200 B の HMAC を計算しないため。`Link::on_datagram_rx_us`）。
+/// タグを比べる前にヘッダのtypeがPROBEかどうかだけを覗く（接続した後のPROBEに1,200 BのHMACを計算しないため。`Link::on_datagram_rx_us`）。
 pub fn peek_is_probe(bytes: &[u8]) -> bool {
     peek_type_id(bytes) == Some(TYPE_PROBE)
 }
 
-/// タグを比べる前に、ヘッダの type が接続の手順の 3 つ（HELLO・HELLO_ACK・AGREE）のどれかだけを覗く。候補に無い送り元から
-/// 来た 1 通を「学ぶ候補」にしてよいかの最初のガード（`Link::on_datagram_at`）。手順の外の型はタグの計算まで進めない。
+/// タグを比べる前にヘッダのtypeが接続の手順の3つ（HELLO・HELLO_ACK・AGREE）のどれかだけを覗く。
+/// 候補に無い送信元から来た1通を「学ぶ候補」にしてよいかどうかの最初のガード（`Link::on_datagram_at`）。
+/// 手順の外の型はタグの計算まで進めない。
 pub fn peek_is_handshake(bytes: &[u8]) -> bool {
     matches!(
         peek_type_id(bytes),
@@ -1629,25 +1694,27 @@ pub fn peek_is_handshake(bytes: &[u8]) -> bool {
     )
 }
 
-/// [`peek_type`] が返す種類: 観戦の 9 種と、それ以外。
+/// [`peek_type`]が返す種類: 観戦の9種とそれ以外。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeekedType {
     SpectateJoin,
     SpectateStream,
     SpectateAck,
-    /// BYE（対戦と観戦で同じ type。どちらのものかは送り元で分ける）。
+    /// BYE（対戦と観戦で同じtype。どちらのものかは送信元で分ける）。
     Bye,
     SpectateIntro,
     SpectateAdmit,
     SpectateRehome,
     SpectateMeasure,
     SpectatePair,
-    /// 観戦の外の type・知らない type・短い・magic が違う。
+    /// 観戦の外のtype・知らないtype・短い・magicが違う。
     Other,
 }
 
-/// タグを比べる前に、ヘッダの type が観戦のどの便かを覗く（受信の振り分け。JOIN・ACK は配る側、STREAM・INTRO・ADMIT・
-/// REHOME・MEASURE は観戦者の側、BYE は送り元で分ける。PAIR は元のホストが µs の時刻で `SpectateHost::on_pair` へ）。
+/// タグを比べる前にヘッダのtypeが観戦のどの便かを覗く（受信の振り分け）。
+/// JOIN・ACKは配信する側、STREAM・INTRO・ADMIT・REHOME・MEASUREは観戦者の側へ渡す。
+/// BYEは送信元で分ける。
+/// PAIRは元のホストがµsの時刻で`SpectateHost::on_pair`へ渡す。
 pub fn peek_type(bytes: &[u8]) -> PeekedType {
     match peek_type_id(bytes) {
         Some(TYPE_SPECTATE_JOIN) => PeekedType::SpectateJoin,
@@ -1673,7 +1740,8 @@ fn decode_hello(body: &[u8]) -> Result<Message, DecodeError> {
         });
     }
     let proto_ver = body[0];
-    // `PROTO_VER` 以外を捨てる。ヘッダのバージョンはもう合っているので、ここで落ちるのはヘッダと本文で違うバージョンを名乗る壊れた相手だけ。
+    // `PROTO_VER`以外を捨てる。
+    // ヘッダのバージョンはもう合っているので、ここで落ちるのはヘッダと本文で違うバージョンを名乗る壊れた相手だけ。
     if proto_ver != PROTO_VER {
         return Err(DecodeError::FieldOutOfRange {
             msg_type: TYPE_HELLO,
@@ -1694,7 +1762,7 @@ fn decode_hello(body: &[u8]) -> Result<Message, DecodeError> {
             field: "name_len",
         });
     }
-    // +3: bit0 = 望むモード（0 = delay 方式）、bit1 = rollback ができる、bit2 = 観戦を許可する、bit3 = ホストを決める。ほかのビットは捨てる値。
+    // +3: bit0 = 望むモード（0 = delay方式）、bit1 = rollbackができる、bit2 = 観戦を許可する、bit3 = ホストを決める。ほかのビットが立っていたら捨てる。
     if body[3] & !(1 | HELLO_CAN_ROLLBACK_BIT | HELLO_LISTABLE_BIT | HELLO_PICK_BIT) != 0 {
         return Err(DecodeError::FieldOutOfRange {
             msg_type: TYPE_HELLO,
@@ -1728,7 +1796,7 @@ fn decode_hello(body: &[u8]) -> Result<Message, DecodeError> {
         msg_type: TYPE_HELLO,
         field: "arrival",
     })?;
-    // +46・+50: ビルド番号と公開鍵。どちらも値の範囲を見ない（ビルドの比べと公開鍵の弱い点は手順と `seal.rs` の仕事）。
+    // +46・+50: ビルド番号と公開鍵。どちらも値の範囲を見ない（ビルドの比較と公開鍵の弱い点は手順と`seal.rs`の仕事）。
     let build = get_u32(body, 46);
     let mut public = [0u8; PUBLIC_LEN];
     public.copy_from_slice(&body[50..50 + PUBLIC_LEN]);
@@ -1772,11 +1840,14 @@ fn decode_hello_ack(body: &[u8]) -> Result<Message, DecodeError> {
         });
     }
     let mut public = [0u8; PUBLIC_LEN];
-    public.copy_from_slice(&body[16..LEN]);
+    public.copy_from_slice(&body[16..16 + PUBLIC_LEN]);
+    let mut echo_public = [0u8; PUBLIC_LEN];
+    echo_public.copy_from_slice(&body[16 + PUBLIC_LEN..LEN]);
     Ok(Message::HelloAck {
         echo_nonce: get_u64(body, 0),
         role_nonce: get_u64(body, 8),
         public,
+        echo_public,
     })
 }
 
@@ -1831,7 +1902,7 @@ fn decode_input(body: &[u8]) -> Result<Message, DecodeError> {
     };
     let echo = get_u16(body, 18);
     let held = body[20];
-    // 返しなしは echo 0 だけ（同じ値に 2 通りのバイト列を作らない）。
+    // 返答なしはecho 0だけ（同じ値に2通りのバイト列を作らない）。
     let echo = if held == STAMP_NO_ECHO {
         if echo != 0 {
             return Err(DecodeError::FieldOutOfRange {
@@ -1960,7 +2031,7 @@ fn decode_probe(body: &[u8]) -> Result<Message, DecodeError> {
             field: "seq",
         });
     }
-    // 詰め物は 0 だけ（同じ値に 2 通りのバイト列を作らない）。
+    // 詰め物は0だけ（同じ値に2通りのバイト列を作らない）。
     if body[1..].iter().any(|&b| b != 0) {
         return Err(DecodeError::FieldOutOfRange {
             msg_type: T,
@@ -1984,8 +2055,8 @@ fn decode_probe_result(body: &[u8]) -> Result<Message, DecodeError> {
     })
 }
 
-/// SELECT の本文（18 B ちょうど）を読む。SELECT 本体（`msg_type` = 11）と観戦の記録が同じ配置・同じガードを使う。
-/// 誤りの `msg_type` は呼び手の type。
+/// SELECTの本文（18 Bちょうど）を読む。SELECT本体（`msg_type` = 11）と観戦の記録が同じ配置・同じガードを使う。
+/// エラーの`msg_type`は呼び手のtype。
 fn parse_select(msg_type: u8, body: &[u8]) -> Result<Select, DecodeError> {
     if body.len() != SELECT_LEN {
         return Err(DecodeError::LengthMismatch {
@@ -2185,7 +2256,7 @@ fn decode_spectate_pair(body: &[u8]) -> Result<Message, DecodeError> {
         1 => true,
         _ => return Err(bad("order")),
     };
-    // 詰め物は 0 だけ（同じ値に 2 通りのバイト列を作らない）。
+    // 詰め物は0だけ（同じ値に2通りのバイト列を作らない）。
     if body[4..].iter().any(|&b| b != 0) {
         return Err(bad("padding"));
     }
@@ -2204,7 +2275,7 @@ fn decode_spectate_stream(body: &[u8]) -> Result<Message, DecodeError> {
     let first = get_u32(body, 0);
     let flags = body[4];
     let count = body[5];
-    if flags & !STREAM_FLAG_RESET != 0 {
+    if flags & !(STREAM_FLAG_RESET | STREAM_FLAG_COOKIE) != 0 {
         return Err(DecodeError::FieldOutOfRange {
             msg_type: T,
             field: "flags",
@@ -2216,8 +2287,21 @@ fn decode_spectate_stream(body: &[u8]) -> Result<Message, DecodeError> {
             field: "count",
         });
     }
-    let mut records = [Record::FILLER; MAX_STREAM_RECORDS];
     let mut at = STREAM_HEAD_LEN;
+    let cookie = if flags & STREAM_FLAG_COOKIE != 0 {
+        if body.len() < STREAM_HEAD_LEN + COOKIE_LEN {
+            return Err(DecodeError::LengthMismatch {
+                msg_type: T,
+                expected: STREAM_HEAD_LEN + COOKIE_LEN,
+                actual: body.len(),
+            });
+        }
+        at += COOKIE_LEN;
+        Some(get_u64(body, STREAM_HEAD_LEN))
+    } else {
+        None
+    };
+    let mut records = [Record::FILLER; MAX_STREAM_RECORDS];
     for slot in records.iter_mut().take(count as usize) {
         let (rec, n) = Record::read(body.get(at..).unwrap_or(&[]))?;
         *slot = rec;
@@ -2233,35 +2317,41 @@ fn decode_spectate_stream(body: &[u8]) -> Result<Message, DecodeError> {
     Ok(Message::SpectateStream(SpectateStream {
         first,
         reset: flags & STREAM_FLAG_RESET != 0,
+        cookie,
         count,
         records,
     }))
 }
 
 fn decode_spectate_ack(body: &[u8]) -> Result<Message, DecodeError> {
-    const MAX_LEN: usize = ACK_HEAD_LEN + bits512::BYTES;
-    if !(ACK_HEAD_LEN..=MAX_LEN).contains(&body.len()) {
+    let has_cookie = body.get(15).is_some_and(|f| f & ACK_FLAG_COOKIE != 0);
+    let head = ACK_HEAD_LEN + if has_cookie { COOKIE_LEN } else { 0 };
+    let max_len = head + bits512::BYTES;
+    if !(head..=max_len).contains(&body.len()) {
         return Err(DecodeError::LengthMismatch {
             msg_type: TYPE_SPECTATE_ACK,
-            expected: if body.len() < ACK_HEAD_LEN {
-                ACK_HEAD_LEN
-            } else {
-                MAX_LEN
-            },
+            expected: if body.len() < head { head } else { max_len },
             actual: body.len(),
         });
     }
-    let raw = body.get(ACK_HEAD_LEN..).unwrap_or(&[]);
+    if body[15] & !ACK_FLAG_COOKIE != 0 {
+        return Err(DecodeError::FieldOutOfRange {
+            msg_type: TYPE_SPECTATE_ACK,
+            field: "flags",
+        });
+    }
+    let cookie = has_cookie.then(|| get_u64(body, ACK_HEAD_LEN));
+    let raw = body.get(head..).unwrap_or(&[]);
     let bad = DecodeError::FieldOutOfRange {
         msg_type: TYPE_SPECTATE_ACK,
         field: "sack",
     };
-    // 後ろの 0 のバイトは載せない（載っていたら正規の形でない）。
+    // 後ろの0のバイトは載せない（載っていたら正規の形でない）。
     if raw.last() == Some(&0) {
         return Err(bad);
     }
     let sack = Bits512::from_wire(raw).ok_or(bad)?;
-    // 最上位のビットは予約（番号 `next + 512` は、ウィンドウ（`next` を含めて 512）の外）。
+    // 最上位のビットは予約（番号`next + 512`はウィンドウ（`next`を含めて512）の外）。
     if !sack.andn(&SACK_MASK).is_empty() {
         return Err(bad);
     }
@@ -2274,11 +2364,12 @@ fn decode_spectate_ack(body: &[u8]) -> Result<Message, DecodeError> {
         next: get_u32(body, 8),
         relay,
         admit_ack: get_u16(body, 13),
+        cookie,
         sack,
     })
 }
 
-/// HOST_STATE の本文の長さ（seq 2 + mode 1 + delay 1 + auto 1）。
+/// HOST_STATEの本文の長さ（seq 2 + mode 1 + delay 1 + auto 1）。
 const HOST_STATE_LEN: usize = 5;
 
 fn decode_host_state(body: &[u8]) -> Result<Message, DecodeError> {
@@ -2293,7 +2384,7 @@ fn decode_host_state(body: &[u8]) -> Result<Message, DecodeError> {
         msg_type: TYPE_HOST_STATE,
         field: "mode",
     })?;
-    // 上限は選べる範囲（`delay_pick::bounds`）。auto の値 9 はここに載らない（auto は別の欄）。
+    // 上限は選べる範囲（`delay_pick::bounds`）。autoの値9はここに載らない（autoは別のフィールド）。
     let delay = body[3];
     if delay > crate::delay_pick::bounds(mode).1 {
         return Err(DecodeError::FieldOutOfRange {
@@ -2347,7 +2438,7 @@ fn decode_bye(body: &[u8]) -> Result<Message, DecodeError> {
     Ok(Message::Bye(reason))
 }
 
-/// MENU の本文の末尾の固定の欄（画面・カーソル・共有カーソル 2 B）の長さ。
+/// MENUの本文の末尾の固定のフィールド（画面・カーソル・共有カーソル2 B）の長さ。
 const MENU_TAIL_LEN: usize = 4;
 
 fn decode_menu(body: &[u8]) -> Result<Message, DecodeError> {
@@ -2415,7 +2506,7 @@ fn decode_step_body(msg_type: u8, body: &[u8]) -> Result<Step, DecodeError> {
         msg_type,
         field: "kind",
     })?;
-    // 合わせを出すのはホストだけ（ゲストの STEP_REQ に載っていたら手順の外）。
+    // 合わせを出すのはホストだけ（ゲストのSTEP_REQに載っていたら手順の外）。
     if msg_type == TYPE_STEP_REQ && kind == StepKind::Align {
         return Err(DecodeError::FieldOutOfRange {
             msg_type,
@@ -2425,8 +2516,8 @@ fn decode_step_body(msg_type: u8, body: &[u8]) -> Result<Step, DecodeError> {
     let value = body[3];
     let screen = body[4];
     if kind == StepKind::Format {
-        // 形式の切替: STEP は完全な形（`FormatValue::unpack`）、STEP_REQ は要求（形式だけ）。観戦の流れには載らない。
-        // value の中身が範囲の外なら STEP ごと捨てる。
+        // 形式の切替: STEPは完全な形（`FormatValue::unpack`）、STEP_REQは要求（形式だけ）。観戦の流れには載らない。
+        // valueの中身が範囲の外ならSTEPごと捨てる。
         let ok = match msg_type {
             TYPE_STEP => FormatValue::unpack(value).is_some(),
             TYPE_STEP_REQ => FormatValue::is_request(value),
@@ -2451,11 +2542,13 @@ fn decode_step_body(msg_type: u8, body: &[u8]) -> Result<Step, DecodeError> {
     })
 }
 
-/// パケットを解く。`bytes` は受信した UDP データグラムそのもの（ヘッダ・タグ込み）。`open` は相手から自分への向きの `Opener`
-/// （鍵の交換の後。まだなら None）。
+/// パケットを解く。
+/// `bytes`は受信したUDPデータグラムそのもの（ヘッダ・タグ込み）。
+/// `open`は相手から自分への向きの`Opener`（鍵の交換の後。まだならNone）。
 ///
-/// 長さと magic を見た後、本文を読む前に認証する（順はモジュール doc）。捨てる理由は `DecodeError` に分けて返す
-/// （ログに残すのは呼び出し側の仕事）。確保しない。
+/// 長さとmagicを見た後、本文を読む前に認証する（順はモジュールdoc）。
+/// 捨てる理由は`DecodeError`に分けて返す（ログに残すのは呼び出し側の仕事）。
+/// 確保しない。
 pub fn decode(key: &AuthKey, open: Option<&Opener>, bytes: &[u8]) -> Result<Packet, DecodeError> {
     if bytes.len() < HEADER_LEN + TAG_LEN {
         return Err(DecodeError::TooShort { got: bytes.len() });
@@ -2465,8 +2558,9 @@ pub fn decode(key: &AuthKey, open: Option<&Opener>, bytes: &[u8]) -> Result<Pack
     }
     let ver = bytes[4];
     let type_id = bytes[5];
-    // バージョンの違う相手は封じる鍵を持たない。type に依らず HMAC のタグで検証し、合えばバージョンで断る。合わない（秘密を知らない
-    // 第三者がバージョンを変えた）ものは `BadTag` で、手順を止めさせない。
+    // バージョンの違う相手は封じる鍵を持たない。
+    // typeに依らずHMACのタグで検証して合えばバージョンで断る。
+    // 合わないもの（秘密の乱数を知らない第三者がバージョンを変えた）は`BadTag`にして手順を止めさせない。
     if ver != PROTO_VER || is_signed_type(type_id) {
         let (signed, tag) = bytes.split_at(bytes.len() - TAG_LEN);
         if !key.verify(signed, tag) {
@@ -2490,7 +2584,7 @@ pub fn decode(key: &AuthKey, open: Option<&Opener>, bytes: &[u8]) -> Result<Pack
         <&[u8; SEAL_TAG_LEN]>::try_from(tag),
         plain.get_mut(HEADER_LEN..HEADER_LEN + body_len),
     ) else {
-        // 1200 B を越える便と、形の合わないもの。
+        // 1200 Bを越える便と形の合わないもの。
         return Err(DecodeError::TooShort { got: bytes.len() });
     };
     work.copy_from_slice(cipher);
@@ -2501,7 +2595,7 @@ pub fn decode(key: &AuthKey, open: Option<&Opener>, bytes: &[u8]) -> Result<Pack
     decode_signed(&plain[..HEADER_LEN + body_len])
 }
 
-/// タグを外した後（ヘッダ ‖ 本文）を解く。長さ（12 B 以上）と magic は `decode` が見ている。
+/// タグを外した後（ヘッダ ‖ 本文）を解く。長さ（12 B以上）とmagicは`decode`が見ている。
 fn decode_signed(bytes: &[u8]) -> Result<Packet, DecodeError> {
     if bytes.len() < HEADER_LEN {
         return Err(DecodeError::TooShort { got: bytes.len() });
@@ -2553,15 +2647,16 @@ fn decode_signed(bytes: &[u8]) -> Result<Packet, DecodeError> {
 
 #[cfg(test)]
 mod tests {
-    //! golden packet（手で書いたバイト列との一致）→ 毒標本（1 か所だけ壊して、そのガードだけが落とすことを示す）→
-    //! 往復とでたらめの大量件数。封じる便の golden は平文の形（ヘッダ ‖ 本文）で書く: `encode_to_vec` は封じた便を開いて
-    //! 平文に戻し、`dec` は封じ直してから `decode` へ渡す。毒標本は壊した後に認証を付け直して渡す（そうしないと、どの毒も
-    //! 認証のガードで落ち、後ろのガードが素通りでも気づけない）。
+    //! golden packet（手で書いたバイト列との一致）→ 不正入力サンプル（1か所だけ壊してそのガードだけが落とすことを示す）→ 往復とでたらめの大量件数。
+    //! 封じる便のgoldenは平文の形（ヘッダ ‖ 本文）で書く。
+    //! `encode_to_vec`は封じた便を開いて平文に戻し、`dec`は封じ直してから`decode`へ渡す。
+    //! 不正入力サンプルは壊した後に認証を付け直して渡す。
+    //! そうしないとどのサンプルも認証のガードで落ち、後ろのガードが素通りでも気づけない。
     use super::*;
     use crate::auth::AuthKey;
     use crate::seal::{DirKeys, Opener, Sealer, Sender, Seq};
 
-    const SID: u32 = 0x1122_3344; // 全 golden 共通の session_id（LE: 44 33 22 11）
+    const SID: u32 = 0x1122_3344; // 全golden共通のsession_id（LE: 44 33 22 11）
 
     fn key() -> AuthKey {
         AuthKey::derive(&crate::auth::tests::golden_secret(), SID)
@@ -2647,7 +2742,7 @@ mod tests {
         }
     }
 
-    /// 認証を付け直してから解く（毒標本が、狙ったガードまで届くように）。
+    /// 認証を付け直してから解く（不正入力サンプルが狙ったガードまで届くように）。
     fn dec(bytes: &[u8]) -> Result<Packet, DecodeError> {
         decode(&key(), Some(&opener()), &wrapped(bytes))
     }
@@ -2660,33 +2755,33 @@ mod tests {
 
     #[rustfmt::skip]
     const HELLO_GOLDEN: [u8; HEADER_LEN + HELLO_LEN] = [
-        // ヘッダ 12B
+        // ヘッダ12B
         0x48, 0x47, 0x52, 0x54, // magic "HGRT"
-        0x09,                   // proto_ver = 9（`PROTO_VER`）
+        0x0A,                   // proto_ver = 10（`PROTO_VER`）
         0x01,                   // type = 1 (HELLO)
         0x00,                   // flags（予約。0）
         0x00,                   // 予約
         0x44, 0x33, 0x22, 0x11, // session_id = 0x11223344
-        // 本文 84B
-        0x09,                   // 本文の proto_ver（ヘッダと同じ 9 だけ通る）
+        // 本文84B
+        0x0A,                   // 本文のproto_ver（ヘッダと同じ10だけ通る）
         0x03,                   // latency（希望。3）
-        0x09,                   // name_len = 9（「テスト」の UTF-8 バイト数）
-        0x00,                   // mode = 0（delay 方式。以前は予約で、古いバージョンの HELLO もこの形）
+        0x09,                   // name_len = 9（「テスト」のUTF-8バイト数）
+        0x00,                   // mode = 0（delay方式。以前は予約で古いバージョンのHELLOもこの形）
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // role_nonce = 0x0102030405060708
-        0xE3, 0x83, 0x86, 0xE3, 0x82, 0xB9, 0xE3, 0x83, 0x88, // name: "テスト" の UTF-8（9B）
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // name 残り 23B は 0（1/2）
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                   // name 残り 23B は 0（2/2）
-        0x02,                   // seat_wish = 2（2P）。+44（バージョン 4）
-        0x01,                   // arrival = 1（先）。+45（バージョン 4）
-        0xD0, 0x29, 0x06, 0x00, // build = 403920（0x000629D0。2026-10-08 12:00 UTC の分の数）。+46（バージョン 5）
-        // 公開鍵 32 B（+50。バージョン 5）: A0 A1 … BF
+        0xE3, 0x83, 0x86, 0xE3, 0x82, 0xB9, 0xE3, 0x83, 0x88, // name: "テスト" のUTF-8（9B）
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // name残り23Bは0（1/2）
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,                   // name残り23Bは0（2/2）
+        0x02,                   // seat_wish = 2（2P）。+44（バージョン4）
+        0x01,                   // arrival = 1（先）。+45（バージョン4）
+        0xD0, 0x29, 0x06, 0x00, // build = 403920（0x000629D0。2026-10-08 12:00 UTCの分の数）。+46（バージョン5）
+        // 公開鍵32 B（+50。バージョン5）: A0 A1 … BF
         0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
         0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,
-        0x05,                   // nat = 0b101（シンメトリックでない・UPnP で割り当て）。+82
+        0x05,                   // nat = 0b101（シンメトリックでない・UPnPで割り当て）。+82
         0x04,                   // rollback_delay = 4。+83
     ];
 
-    /// 公開鍵の標本（A0 A1 … BF。順に並べて、欄のずれ・逆順が値で見えるように）。
+    /// 公開鍵のサンプル（A0 A1 … BF。順に並べてフィールドのずれ・逆順が値で見えるように）。
     fn public_sample(first: u8) -> [u8; PUBLIC_LEN] {
         let mut p = [0u8; PUBLIC_LEN];
         for (i, b) in p.iter_mut().enumerate() {
@@ -2697,7 +2792,7 @@ mod tests {
 
     fn hello_golden_msg() -> Message {
         Message::Hello(Hello {
-            proto_ver: 9,
+            proto_ver: 10,
             latency: 3,
             name_len: 9,
             mode: Mode::Delay,
@@ -2778,7 +2873,7 @@ mod tests {
                 "+{at} = {v:#x}"
             );
         }
-        // bit4 は定義の外。
+        // bit4は定義の外。
         let mut b = HELLO_GOLDEN;
         b[HEADER_LEN + 3] = 0x10;
         assert!(matches!(
@@ -2790,14 +2885,17 @@ mod tests {
     #[rustfmt::skip]
     const HELLO_ACK_GOLDEN: [u8; HEADER_LEN + HELLO_ACK_LEN] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x02, 0x00, 0x00,
+        0x0A, 0x02, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // echo_nonce = 0x1122334455667788
         0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, // role_nonce = 0x99AABBCCDDEEFF00
-        // 公開鍵 32 B（+16。バージョン 5）: 10 11 … 2F
+        // 公開鍵32 B（+16。バージョン5）: 10 11 … 2F
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
         0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
+        // 答えたHELLOの公開鍵32 B（+48。バージョン10）: 60 61 … 7F
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
+        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F,
     ];
 
     fn hello_ack_golden_msg() -> Message {
@@ -2805,6 +2903,7 @@ mod tests {
             echo_nonce: 0x1122_3344_5566_7788,
             role_nonce: 0x99AA_BBCC_DDEE_FF00,
             public: public_sample(0x10),
+            echo_public: public_sample(0x60),
         }
     }
 
@@ -2818,12 +2917,25 @@ mod tests {
         assert_eq!(p.msg, hello_ack_golden_msg());
     }
 
+    #[test]
+    fn a_hello_ack_without_the_echoed_public_key_is_refused() {
+        let short = &HELLO_ACK_GOLDEN[..HEADER_LEN + 16 + PUBLIC_LEN];
+        assert_eq!(
+            dec(short),
+            Err(DecodeError::LengthMismatch {
+                msg_type: TYPE_HELLO_ACK,
+                expected: HELLO_ACK_LEN,
+                actual: 16 + PUBLIC_LEN,
+            })
+        );
+    }
+
     #[rustfmt::skip]
     const INPUT_COUNT0_GOLDEN: [u8; HEADER_LEN + 21] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x03, 0x00, 0x00,
+        0x0A, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
-        // 本文（count = 0。語なし）
+        // 本文（count = 0。ワードなし）
         0x01, 0x00,             // seg = 1
         0x10, 0x00, 0x00, 0x00, // ack = 16
         0x05, 0x00, 0x00, 0x00, // base = 5
@@ -2831,8 +2943,8 @@ mod tests {
         0x00,                   // lat_delay = 0（切替なし）
         0x00,                   // count = 0
         0x34, 0x12,             // stamp.sent = 0x1234
-        0x00, 0x00,             // stamp.echo = 0（返しなし）
-        0xFF,                   // stamp.held = 0xFF（返しなし）
+        0x00, 0x00,             // stamp.echo = 0（返答なし）
+        0xFF,                   // stamp.held = 0xFF（返答なし）
     ];
 
     fn input_count0_golden_msg() -> Message {
@@ -2863,9 +2975,9 @@ mod tests {
     #[rustfmt::skip]
     const INPUT_COUNT3_GOLDEN: [u8; HEADER_LEN + 27] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x03, 0x00, 0x00,
+        0x0A, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
-        // 本文（count = 3。lat なし）
+        // 本文（count = 3。latなし）
         0x02, 0x00,             // seg = 2
         0x20, 0x00, 0x00, 0x00, // ack = 32
         0x06, 0x00, 0x00, 0x00, // base = 6
@@ -2875,7 +2987,7 @@ mod tests {
         0xEF, 0xBE,             // stamp.sent = 0xBEEF
         0x02, 0x01,             // stamp.echo = 0x0102
         0x07,                   // stamp.held = 7 ms
-        0x01, 0x00, 0x02, 0x00, 0x04, 0x00, // 入力語 × 3
+        0x01, 0x00, 0x02, 0x00, 0x04, 0x00, // 入力ワード × 3
     ];
 
     fn input_count3_golden_msg() -> Message {
@@ -2910,9 +3022,9 @@ mod tests {
     #[rustfmt::skip]
     const INPUT_COUNT2_LAT_GOLDEN: [u8; HEADER_LEN + 25] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x03, 0x00, 0x00,
+        0x0A, 0x03, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
-        // 本文（count = 2。lat あり）
+        // 本文（count = 2。latあり）
         0x03, 0x00,             // seg = 3
         0x30, 0x00, 0x00, 0x00, // ack = 48
         0x07, 0x00, 0x00, 0x00, // base = 7
@@ -2922,7 +3034,7 @@ mod tests {
         0xFE, 0xFF,             // stamp.sent = 0xFFFE
         0xF0, 0xFF,             // stamp.echo = 0xFFF0
         0xFE,                   // stamp.held = 254 ms（上限）
-        0x08, 0x00, 0x10, 0x00, // 入力語 × 2
+        0x08, 0x00, 0x10, 0x00, // 入力ワード × 2
     ];
 
     fn input_count2_lat_golden_msg() -> Message {
@@ -2959,7 +3071,7 @@ mod tests {
     #[rustfmt::skip]
     const CHECK_GOLDEN: [u8; HEADER_LEN + 14] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x04, 0x00, 0x00,
+        0x0A, 0x04, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x04, 0x00,             // seg = 4
         0x64, 0x00, 0x00, 0x00, // frame = 100
@@ -2990,7 +3102,7 @@ mod tests {
     #[rustfmt::skip]
     const PING_GOLDEN: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x08, 0x00, 0x00,
+        0x0A, 0x08, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x60, 0xEA, 0x00, 0x00, // send_time = 60000
     ];
@@ -3006,7 +3118,7 @@ mod tests {
     #[rustfmt::skip]
     const PONG_GOLDEN: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x09, 0x00, 0x00,
+        0x0A, 0x09, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x61, 0xEA, 0x00, 0x00, // send_time = 60001
     ];
@@ -3022,16 +3134,16 @@ mod tests {
     #[rustfmt::skip]
     const AGREE_GOLDEN: [u8; HEADER_LEN + 14] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x0A, 0x00, 0x00,
+        0x0A, 0x0A, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x01, // host_seat = 1 (P2)
         0x04, // delay = 4
-        0x00, // mode = 0（delay 方式）
+        0x00, // mode = 0（delay方式）
         0x01, // ホスト = 1（受け手）
         0x45, 0x23, 0x01, 0x00, // 送り手の上り = 0x00012345（74,565 B/s）
         0xCD, 0xAB, 0x89, 0x00, // 受け手の上り = 0x0089ABCD（9,022,413 B/s）
-        0x02, // 送り手の回線の型 = 0b010（シンメトリック）
-        0x01, // 受け手の回線の型 = 0b001（シンメトリックでない）
+        0x02, // 送り手のネットワーク種別 = 0b010（シンメトリック）
+        0x01, // 受け手のネットワーク種別 = 0b001（シンメトリックでない）
     ];
 
     fn agree_golden_msg() -> Message {
@@ -3067,7 +3179,7 @@ mod tests {
     #[rustfmt::skip]
     const AGREE_ROLLBACK_GOLDEN: [u8; HEADER_LEN + 14] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x0A, 0x00, 0x00,
+        0x0A, 0x0A, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x00, // host_seat = 0 (P1)
         0x02, // delay = D = 2
@@ -3075,7 +3187,7 @@ mod tests {
         0x00, // ホスト = 0（送り手）
         0x00, 0x00, 0x00, 0x00, // 送り手の上り = 0（測れない）
         0x00, 0x00, 0x00, 0x00, // 受け手の上り = 0
-        0x00, 0x00, // 回線の型 = 不明・不明（`Pick::NONE`）
+        0x00, 0x00, // ネットワーク種別 = 不明・不明（`Pick::NONE`）
     ];
 
     #[test]
@@ -3093,10 +3205,10 @@ mod tests {
     #[rustfmt::skip]
     const PROBE_HEAD: [u8; HEADER_LEN + 2] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x16, 0x00, 0x00, // type = 22（PROBE）
+        0x0A, 0x16, 0x00, 0x00, // type = 22（PROBE）
         0x44, 0x33, 0x22, 0x11,
         0x07, // 通し番号 = 7
-        0x00, // 詰め物（ここから 1,171 B は全部 0）
+        0x00, // 詰め物（ここから1,171 Bは全部0）
     ];
 
     #[test]
@@ -3150,7 +3262,7 @@ mod tests {
     #[rustfmt::skip]
     const PROBE_RESULT_GOLDEN: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x17, 0x00, 0x00, // type = 23（PROBE_RESULT）
+        0x0A, 0x17, 0x00, 0x00, // type = 23（PROBE_RESULT）
         0x44, 0x33, 0x22, 0x11,
         0x40, 0x0D, 0x03, 0x00, // up = 0x00030D40（200,000 B/s）
     ];
@@ -3176,7 +3288,7 @@ mod tests {
     #[rustfmt::skip]
     const SELECT_GOLDEN: [u8; HEADER_LEN + 18] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x0B, 0x00, 0x00,
+        0x0A, 0x0B, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x02, 0x00, // match_no = 2
         0x03,       // chara
@@ -3220,7 +3332,7 @@ mod tests {
     #[rustfmt::skip]
     const BYE_GOLDEN: [u8; HEADER_LEN + 1] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x0F, 0x00, 0x00,
+        0x0A, 0x0F, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x03, // reason = 3（ズレ検出）
     ];
@@ -3233,11 +3345,11 @@ mod tests {
         assert_eq!(p.msg, msg);
     }
 
-    /// READY（type 20。本文 0 B）。
+    /// READY（type 20。本文0 B）。
     #[rustfmt::skip]
     const READY_GOLDEN: [u8; HEADER_LEN] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x14, 0x00, 0x00,
+        0x0A, 0x14, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
     ];
 
@@ -3261,11 +3373,11 @@ mod tests {
         );
     }
 
-    /// HOST_STATE（type 21。本文 5 B）。seq = 0x0102・mode = rollback（1）・delay = 8・auto = 1。
+    /// HOST_STATE（type 21。本文5 B）。seq = 0x0102・mode = rollback（1）・delay = 8・auto = 1。
     #[rustfmt::skip]
     const HOST_STATE_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x15, 0x00, 0x00, // type = 21
+        0x0A, 0x15, 0x00, 0x00, // type = 21
         0x44, 0x33, 0x22, 0x11,
         0x02, 0x01,             // seq = 0x0102（LE）
         0x01,                   // mode = 1（rollback）
@@ -3292,7 +3404,7 @@ mod tests {
             dec(&HOST_STATE_GOLDEN).unwrap().msg,
             host_state_golden_msg()
         );
-        // auto = 0・delay = 0 の側（0 を「無い」と読む取り違えを縛る）。
+        // auto = 0・delay = 0 の側（0を「無い」と読む取り違えを縛る）。
         let mut zero = HOST_STATE_GOLDEN;
         zero[HEADER_LEN + 3] = 0;
         zero[HEADER_LEN + 4] = 0;
@@ -3348,18 +3460,18 @@ mod tests {
     #[rustfmt::skip]
     const MENU_GOLDEN: [u8; HEADER_LEN + 19] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x10, 0x00, 0x00,
+        0x0A, 0x10, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         // 本文（count = 2）
         0x05, 0x00,             // step = 5
         0x09, 0x00, 0x00, 0x00, // ack = 9
         0x02, 0x00, 0x00, 0x00, // base = 2
         0x02,                   // count = 2
-        0x00, 0x01,             // 語 0 = 0x0100（決定キーの印。そのまま送る）
-        0x02, 0x00,             // 語 1 = 0x0002
+        0x00, 0x01,             // ワード 0 = 0x0100（決定キーの印。そのまま送る）
+        0x02, 0x00,             // ワード 1 = 0x0002
         0x08,                   // screen = 8（キャラ選択）
         0x0C,                   // cursor = 12
-        0xFF, 0x00,             // shared（今は 0xFF, 0）
+        0xFF, 0x00,             // shared（今は0xFF, 0）
     ];
 
     fn menu_golden_msg() -> Message {
@@ -3388,7 +3500,7 @@ mod tests {
     #[rustfmt::skip]
     const MENU_COUNT0_GOLDEN: [u8; HEADER_LEN + 15] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x10, 0x00, 0x00,
+        0x0A, 0x10, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x01, 0x00,             // step = 1
         0x00, 0x00, 0x00, 0x00, // ack = 0
@@ -3415,7 +3527,8 @@ mod tests {
         assert_eq!(dec(&MENU_COUNT0_GOLDEN).unwrap().msg, m);
     }
 
-    /// 末尾の 4 B が語の個数に合わせてずれる（語の前や固定の位置に書くと落ちる）。欄ごとに違う値にして、入れ違いも落とす。
+    /// 末尾の4 Bがワードの個数に合わせてずれる（ワードの前や固定の位置に書くと落ちる）。
+    /// フィールドごとに違う値にして入れ違いも落とす。
     #[test]
     fn menu_tail_follows_the_words_for_every_count() {
         for n in 0..=MAX_WORDS {
@@ -3444,7 +3557,7 @@ mod tests {
     #[rustfmt::skip]
     const STEP_REQ_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x11, 0x00, 0x00,
+        0x0A, 0x11, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x06, 0x00, // step = 6
         0x01,       // kind = 1（決定）
@@ -3468,10 +3581,10 @@ mod tests {
     #[rustfmt::skip]
     const STEP_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x12, 0x00, 0x00,
+        0x0A, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x07, 0x00, // step = 7
-        0x02,       // kind = 2（取消）
+        0x02,       // kind = 2（キャンセル）
         0x00,       // value = 0
         0x07,       // screen = 7（難易度）
     ];
@@ -3489,8 +3602,8 @@ mod tests {
         assert_eq!(p.msg, msg);
     }
 
-    // ---------- 毒標本（golden を 1 か所だけ壊す）----------
-    // 期待する DecodeError の種類まで assert_eq! で見る（Err というだけでは違うガードが先に落としても気づけない）。
+    // ---------- 不正入力サンプル（goldenを1か所だけ壊す）----------
+    // 期待するDecodeErrorの種類までassert_eq! で見る（Errというだけでは違うガードが先に落としても気づけない）。
 
     #[test]
     fn poison_too_short_for_header() {
@@ -3535,13 +3648,15 @@ mod tests {
             .collect()
     }
 
-    /// 封じた PING と PONG の golden（Python 3 の `cryptography` で crate の外で計算した値。鍵は `seal.rs` の `OKM_GOLDEN`:
-    /// PING は Alice → Bob（前 32 B）・送り手 0・通し番号 0・send_time 60000、PONG は Bob → Alice（後ろ 32 B）・送り手 1・
-    /// 通し番号 0x0102030405・send_time 7）。式は `ChaCha20Poly1305(key).encrypt(0 の 4 B ‖ 送り手 ‖ 番号 7 B LE, 本文, ヘッダ)`。
+    /// 封じたPINGとPONGのgolden（Python 3の`cryptography`でcrateの外で計算した値）。
+    /// 鍵は`seal.rs`の`OKM_GOLDEN`。
+    /// PINGはAlice → Bob（前32 B）・送り手0・通し番号0・send_time 60000。
+    /// PONGはBob → Alice（後ろ32 B）・送り手1・通し番号0x0102030405・send_time 7。
+    /// 式は`ChaCha20Poly1305(key).encrypt(0 の 4 B ‖ 送り手 ‖ 番号 7 B LE, 本文, ヘッダ)`。
     const PING_SEALED: &str =
-        "4847525409080000443322110000000000000000eab779302266f6542572092bb0e21e65c9a93db1";
+        "484752540a080000443322110000000000000000eab779303a8c994a9544f3175dc22b4578eb591c";
     const PONG_SEALED: &str =
-        "4847525409090000443322110105040302010000873647e2e578e6923846e83e893e50a74f194919";
+        "484752540a090000443322110105040302010000873647e2920d4f1504304b1a25f7fceba861dff4";
 
     #[test]
     fn golden_sealed_ping_and_pong() {
@@ -3699,6 +3814,7 @@ mod tests {
             let mut st = SpectateStream {
                 first: 7,
                 reset: false,
+                cookie: None,
                 count: n as u8,
                 records: [Record::FILLER; MAX_STREAM_RECORDS],
             };
@@ -3749,6 +3865,7 @@ mod tests {
         let mut st = SpectateStream {
             first: 0,
             reset: false,
+            cookie: None,
             count: MAX_STREAM_RECORDS as u8,
             records: [Record::FILLER; MAX_STREAM_RECORDS],
         };
@@ -3760,7 +3877,7 @@ mod tests {
         assert!(n <= MAX_DATAGRAM, "{n} B");
         assert_eq!(n, 12 + 8 + 6 + 16 * 35 + 16);
         assert_eq!(dec_raw(&buf[..n]).unwrap().msg, m);
-        // 測りの組は枠いっぱい。
+        // 測りのペアは枠いっぱい。
         let n = seal(&sealer(), &Seq::new(), SID, &pair_msg(), &mut buf).unwrap();
         assert_eq!(n, MAX_DATAGRAM);
         assert_eq!(dec_raw(&buf[..n]).unwrap().msg, pair_msg());
@@ -3815,6 +3932,7 @@ mod tests {
                 echo_nonce: 1,
                 role_nonce: 2,
                 public: public_sample(4),
+                echo_public: public_sample(0x44),
             },
             Message::Agree {
                 host_seat: Seat::P1,
@@ -3828,7 +3946,7 @@ mod tests {
             Message::Pong { send_time: 1 },
             Message::Bye(ByeReason::Finished),
             Message::Ready,
-            // 候補の外から来た PROBE・PROBE_RESULT からは学ばない。
+            // 候補の外から来たPROBE・PROBE_RESULTからは学ばない。
             Message::Probe { seq: 0 },
             Message::ProbeResult { up: 1 },
         ];
@@ -3885,7 +4003,7 @@ mod tests {
     #[test]
     fn poison_input_count_mismatches_word_list() {
         let mut bytes = INPUT_COUNT3_GOLDEN.to_vec();
-        bytes.truncate(bytes.len() - 2); // 語 1 個分（2B）を削る
+        bytes.truncate(bytes.len() - 2); // ワード1個分（2B）を削る
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::LengthMismatch {
@@ -3918,11 +4036,11 @@ mod tests {
         assert!(dec(&HELLO_GOLDEN).is_ok());
     }
 
-    /// バージョン 0 の HELLO（バージョンを上げる前の golden）。
+    /// バージョン0のHELLO（バージョンを上げる前のgolden）。
     #[rustfmt::skip]
     const HELLO_V0_GOLDEN: [u8; HEADER_LEN + 44] = [
         0x48, 0x47, 0x52, 0x54, // magic "HGRT"
-        0x00,                   // proto_ver = 0（バージョン 0）
+        0x00,                   // proto_ver = 0（バージョン0）
         0x01,                   // type = 1 (HELLO)
         0x00, 0x00,
         0x44, 0x33, 0x22, 0x11, // session_id = 0x11223344
@@ -3934,12 +4052,12 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    /// バージョン 3 の HELLO（本文 44 B。今の `HELLO_GOLDEN` からバージョンの 2 B と末尾の席の希望・名乗りを除いた列）。バージョン違いの断りが
-    /// 長さの検査より先に効くことを見るために残す。
+    /// バージョン3のHELLO（本文44 B。今の`HELLO_GOLDEN`からバージョンの2 Bと末尾のサイドの希望・名乗りを除いた列）。
+    /// バージョン違いの断りが長さの検査より先に効くことを検証するために残す。
     #[rustfmt::skip]
     const HELLO_V3_GOLDEN: [u8; HEADER_LEN + 44] = [
         0x48, 0x47, 0x52, 0x54, // magic "HGRT"
-        0x03,                   // proto_ver = 3（バージョン 3）
+        0x03,                   // proto_ver = 3（バージョン3）
         0x01,                   // type = 1 (HELLO)
         0x00, 0x00,
         0x44, 0x33, 0x22, 0x11, // session_id = 0x11223344
@@ -4065,7 +4183,7 @@ mod tests {
 
     #[test]
     fn poison_unknown_type_each_gap() {
-        // 0・5〜7・12・29 以上は欠番・未実装（13・14・19・24〜28 は観戦に使う。20 は READY、21 は HOST_STATE、22・23 は PROBE と PROBE_RESULT）。
+        // 0・5〜7・12・29以上は欠番・未実装（13・14・19・24〜28は観戦に使う。20はREADY、21はHOST_STATE、22・23はPROBEとPROBE_RESULT）。
         for &t in &[0u8, 5, 6, 7, 12, 29, 255] {
             let mut bytes = HELLO_GOLDEN.to_vec();
             bytes[5] = t;
@@ -4184,8 +4302,8 @@ mod tests {
     #[test]
     fn poison_hello_name_tail_nonzero() {
         let mut bytes = HELLO_GOLDEN;
-        let last = HEADER_LEN + 43; // 本文 +43 = name の最後（バージョン 4 で末尾に +44・+45 が付いたので len - 1 ではない）
-        bytes[last] = 0x7A; // name 領域の最後の 1B（name_len より後ろ）
+        let last = HEADER_LEN + 43; // 本文 +43 = name の最後（バージョン4で末尾に +44・+45が付いたのでlen - 1ではない）
+        bytes[last] = 0x7A; // name領域の最後の1B（name_lenより後ろ）
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::FieldOutOfRange {
@@ -4198,8 +4316,8 @@ mod tests {
     #[test]
     fn poison_hello_name_invalid_utf8() {
         let mut bytes = HELLO_GOLDEN;
-        bytes[12 + 12] = 0xFF; // name[0] を不正な先頭バイトに
-        bytes[12 + 13] = 0xFF; // 後続も continuation byte にならない値に
+        bytes[12 + 12] = 0xFF; // name[0]を不正な先頭バイトに
+        bytes[12 + 13] = 0xFF; // 後続もcontinuation byteにならない値に
         assert_eq!(dec(&bytes), Err(DecodeError::InvalidUtf8));
     }
 
@@ -4219,7 +4337,7 @@ mod tests {
     #[test]
     fn poison_input_lat_delay_over_max_with_change() {
         let mut bytes = INPUT_COUNT2_LAT_GOLDEN;
-        bytes[12 + 14] = 10; // lat_delay = 10 (> 9)。lat_frame は切替ありのまま
+        bytes[12 + 14] = 10; // lat_delay = 10 (> 9)。lat_frameは切替ありのまま
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::FieldOutOfRange {
@@ -4231,7 +4349,7 @@ mod tests {
 
     #[test]
     fn poison_input_body_of_the_old_length_without_the_stamp() {
-        // 時刻の欄の無い前の形（16 B）と、欄の途中で切れた長さは捨てる。
+        // 時刻のフィールドの無い前の形（16 B）とフィールドの途中で切れた長さは捨てる。
         for len in 16..INPUT_HEAD_LEN {
             let bytes = &INPUT_COUNT0_GOLDEN[..HEADER_LEN + len];
             assert_eq!(
@@ -4262,7 +4380,7 @@ mod tests {
     #[test]
     fn poison_input_echo_without_a_held_time() {
         let mut bytes = INPUT_COUNT0_GOLDEN;
-        bytes[12 + 18] = 1; // held は 0xFF（返しなし）のまま echo だけ 0 でない
+        bytes[12 + 18] = 1; // heldは0xFF（返しなし）のままechoだけ0でない
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::FieldOutOfRange {
@@ -4303,7 +4421,7 @@ mod tests {
     #[test]
     fn poison_agree_host_seat_out_of_range() {
         let mut bytes = AGREE_GOLDEN;
-        bytes[12] = 2; // host_seat = 2 (0/1 のみ)
+        bytes[12] = 2; // host_seat = 2 (0/1のみ)
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::FieldOutOfRange {
@@ -4452,7 +4570,7 @@ mod tests {
             bytes[at] = v;
             assert!(dec(&bytes).is_ok(), "cursor = {v}");
         }
-        // 末尾の 4 B が無い（前のバージョンの形）・1 B 足りない・1 B 多い。
+        // 末尾の4 Bが無い（前のバージョンの形）・1 B足りない・1 B多い。
         for cut in [4usize, 1] {
             assert_eq!(
                 dec(&MENU_GOLDEN[..MENU_GOLDEN.len() - cut]),
@@ -4488,7 +4606,7 @@ mod tests {
     #[test]
     fn poison_step_req_kind_out_of_range() {
         let mut bytes = STEP_REQ_GOLDEN;
-        bytes[12 + 2] = 3; // kind = 3（STEP_REQ は 1/2 のみ。3 は STEP の合わせ）
+        bytes[12 + 2] = 3; // kind = 3（STEP_REQは1/2のみ。3はSTEPの合わせ）
         assert_eq!(
             dec(&bytes),
             Err(DecodeError::FieldOutOfRange {
@@ -4501,11 +4619,11 @@ mod tests {
     #[rustfmt::skip]
     const STEP_ALIGN_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x12, 0x00, 0x00,
+        0x0A, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x08, 0x00, // step = 8
         0x03,       // kind = 3（合わせ）
-        0x64,       // value = 0x64（キャラ選択の 1P のカーソル 4・2P のカーソル 6）
+        0x64,       // value = 0x64（キャラ選択の1Pのカーソル4・2Pのカーソル6）
         0x08,       // screen = 8（キャラ）
     ];
 
@@ -4565,7 +4683,7 @@ mod tests {
     #[rustfmt::skip]
     const STEP_FORMAT_GOLDEN: [u8; HEADER_LEN + 5] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x12, 0x00, 0x00,
+        0x0A, 0x12, 0x00, 0x00,
         0x44, 0x33, 0x22, 0x11,
         0x09, 0x00, // step = 9
         0x04,       // kind = 4（形式の切替）
@@ -4666,6 +4784,7 @@ mod tests {
         let stream = Message::SpectateStream(SpectateStream {
             first: 0,
             reset: false,
+            cookie: None,
             count: 1,
             records,
         });
@@ -4708,7 +4827,8 @@ mod tests {
         }
     }
 
-    /// 観戦の許可の印は +3 の bit2 だけに出て、望むモード（bit0）・rollback ができる（bit1）とどの組でも混ざらない。
+    /// 観戦の許可のフラグは +3のbit2だけに出る。
+    /// 望むモード（bit0）・rollbackができる（bit1）とどの組み合わせでも混ざらない。
     #[test]
     fn golden_hello_listable_is_bit2_and_independent_of_the_other_bits() {
         let Message::Hello(base) = hello_golden_msg() else {
@@ -4734,7 +4854,7 @@ mod tests {
             assert_eq!(got, h, "{byte:#04x}");
             assert_eq!(got.listable, byte >= 4, "{byte:#04x}");
         }
-        // 立てたときに変わるのは +3 の 1 バイトだけ。
+        // 立てたときに変わるのは +3の1バイトだけ。
         let on = encode_to_vec(
             SID,
             &Message::Hello(Hello {
@@ -4782,7 +4902,8 @@ mod tests {
             self.next_u64() & 1 == 1
         }
 
-        /// `0..=max` の一様分布ではないが、検査用の値の作成には十分。
+        /// `0..=max`の一様分布ではない。
+        /// 検査用の値の作成には十分。
         fn next_range_u8(&mut self, max_inclusive: u8) -> u8 {
             (self.next_u64() % (max_inclusive as u64 + 1)) as u8
         }
@@ -4838,7 +4959,7 @@ mod tests {
                 p2: rng.next_u16(),
             },
             5 => {
-                // 0x20..=0x7E の表示できる ASCII だけ（1 バイト = 常に妥当な UTF-8）。
+                // 0x20..=0x7Eの表示できるASCIIだけ（1バイト = 常に妥当なUTF-8）。
                 let len = usize::from(rng.next_range_u8(NAME_MAX as u8));
                 let name: Vec<u8> = (0..len).map(|_| 0x20 + rng.next_range_u8(0x5E)).collect();
                 Record::name(if rng.next_bool() { Seat::P1 } else { Seat::P2 }, &name)
@@ -4880,12 +5001,12 @@ mod tests {
     }
 
     fn random_nat(rng: &mut SplitMix64) -> NatMark {
-        // 読める 6 通り（型 0〜2 × UPnP）。
+        // 定義の中の6通り（型0〜2 × UPnP）。
         NatMark::from_byte(rng.next_range_u8(2) | (u8::from(rng.next_bool()) << 2))
             .expect("定義の中のバイト")
     }
 
-    /// 0〜8 個の候補（種別と family を混ぜる。ポートを変えて重ならない）。
+    /// 0〜8個の候補（種別とfamilyを混ぜる。ポートを変えて重ならない）。
     fn random_cands(rng: &mut SplitMix64) -> Candidates {
         use crate::candidate::{CandKind, Candidate};
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -4931,7 +5052,7 @@ mod tests {
                 let name_len = rng.next_range_u8(NAME_MAX as u8);
                 let mut name = [0u8; NAME_MAX];
                 for b in name.iter_mut().take(name_len as usize) {
-                    // 0x20..=0x7E の表示できる ASCII だけ使う（1 バイト = 常に妥当な UTF-8）。
+                    // 0x20..=0x7Eの表示できるASCIIだけ使う（1バイト = 常に妥当なUTF-8）。
                     *b = 0x20 + rng.next_range_u8(0x7E - 0x20);
                 }
                 Message::Hello(Hello {
@@ -4968,6 +5089,7 @@ mod tests {
                 echo_nonce: rng.next_u64(),
                 role_nonce: rng.next_u64(),
                 public: random_public(rng),
+                echo_public: random_public(rng),
             },
             2 => {
                 let count = rng.next_range_u8(MAX_WORDS as u8);
@@ -4978,8 +5100,8 @@ mod tests {
                 let lat = if rng.next_bool() {
                     let mut frame = rng.next_u32();
                     if frame == u32::MAX {
-                        // 0xFFFFFFFF は「切替なし」の印なので、Some の中身には使わない
-                        // （使うと decode が None に読み替え、往復が一致しなくなる）。
+                        // 0xFFFFFFFFは「切替なし」の印なのでSomeの中身には使わない。
+                        // 使うとdecodeがNoneに読み替えて往復が一致しなくなる。
                         frame = 0;
                     }
                     Some(LatChange {
@@ -5104,6 +5226,7 @@ mod tests {
                 Message::SpectateStream(SpectateStream {
                     first: rng.next_u32(),
                     reset: rng.next_bool(),
+                    cookie: None,
                     count,
                     records,
                 })
@@ -5116,8 +5239,9 @@ mod tests {
                     no_intro: rng.next_bool(),
                 },
                 admit_ack: rng.next_u16(),
+                cookie: None,
                 sack: {
-                    // 上の語を落として、短いバイト列（後ろの 0 を載せない形）も作る。
+                    // 上のワードを落として短いバイト列（後ろの0を載せない形）も作る。
                     let words = rng.next_range_u8(bits512::WORDS as u8) as usize;
                     let mut w = [0u64; bits512::WORDS];
                     for x in w.iter_mut().take(words) {
@@ -5182,52 +5306,52 @@ mod tests {
         }
     }
 
-    // ---------- 観戦の 3 メッセージ（13 JOIN・14 STREAM・19 ACK）----------
+    // ---------- 観戦の3メッセージ（13 JOIN・14 STREAM・19 ACK）----------
 
     fn spectate_pkt(msg_type: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![
-            b'H', b'G', b'R', b'T', 9, msg_type, 0, 0, 0x44, 0x33, 0x22,
-            0x11, // バージョン 9
+            b'H', b'G', b'R', b'T', 10, msg_type, 0, 0, 0x44, 0x33, 0x22,
+            0x11, // バージョン10
         ];
         v.extend_from_slice(body);
         v
     }
 
-    /// JOIN の本文の、中継の木の欄の前（78 B）。
+    /// JOINの本文のうち中継の木のフィールドより前の部分（78 B）。
     #[rustfmt::skip]
     const SPECTATE_JOIN_HEAD: [u8; JOIN_PUBLIC_END] = [
         0x02,                   // name_len = 2
         0x0B,                   // ff_max = 11
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nonce = 0x1122334455667788
-        b'a', b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // name 32 B（"ab" ＋ 0 が 30）
+        b'a', b'b', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // name 32 B（"ab" ＋ 0が30）
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0x04, 0x03, 0x02, 0x01, // build = 0x01020304（+42）
-        // 公開鍵 32 B（+46）: 60 61 … 7F
+        // 公開鍵32 B（+46）: 60 61 … 7F
         0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
         0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F,
     ];
 
-    /// 中継の木の欄が全部 0（印 0・回線の型 0・epoch 0・resume_from 0・中継用の公開鍵 0・候補 0 個）。
+    /// 中継の木のフィールドが全部0（フラグ0・ネットワーク種別0・epoch 0・resume_from 0・中継用の公開鍵0・候補0個）。
     const JOIN_TREE_NONE: [u8; JOIN_FIXED_LEN - JOIN_PUBLIC_END + 1] =
         [0; JOIN_FIXED_LEN - JOIN_PUBLIC_END + 1];
 
-    /// 印を全部立て、IPv6 と外側 IPv4 の候補を載せた中継の木の欄（+78〜）。
+    /// フラグを全部立ててIPv6と外側IPv4の候補を載せた中継の木のフィールド（+78〜）。
     #[rustfmt::skip]
     const JOIN_TREE_FULL: [u8; 40 + 29] = [
-        0x0F,                   // 印: bit0 中継できる・bit1 直接だけ・bit2 resume_from あり・bit3 子がいる
-        0x05,                   // 回線の型: 宛先で変わらない（1）・UPnP（bit2）
+        0x0F,                   // フラグ: bit0中継できる・bit1直接だけ・bit2 resume_fromあり・bit3子がいる
+        0x05,                   // ネットワーク種別: 宛先で変わらない（1）・UPnP（bit2）
         0x34, 0x12,             // epoch = 0x1234
         0x78, 0x56, 0x34, 0x12, // resume_from = 0x12345678
-        // 中継用の公開鍵 32 B（+86）: 90 91 … AF
+        // 中継用の公開鍵32 B（+86）: 90 91 … AF
         0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
         0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
-        0x02,                   // 候補 2 個（接続コードと同じ形。優先の順）
-        0x04, 0x06,             // 種別 4（IPv6）・family 6
+        0x02,                   // 候補2個（接続コードと同じ形。優先の順）
+        0x04, 0x06,             // 種別4（IPv6）・family 6
         0x24, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // 2400::1
-        0x58, 0x1B,             // ポート 7000
-        0x03, 0x04,             // 種別 3（外側 IPv4）・family 4
+        0x58, 0x1B,             // ポート7000
+        0x03, 0x04,             // 種別3（外側IPv4）・family 4
         0x08, 0x08, 0x04, 0x04, // 8.8.4.4
-        0x39, 0x30,             // ポート 12345
+        0x39, 0x30,             // ポート12345
     ];
 
     fn join_body(tree: &[u8]) -> Vec<u8> {
@@ -5291,7 +5415,7 @@ mod tests {
         assert_eq!(dec(&want).unwrap().msg, spectate_join_full_msg());
     }
 
-    /// 中継できる・続きありの印で、鍵や番号が 0 のもの（0 でも印があれば値として読む）。
+    /// 中継できる・続きありのフラグで鍵や番号が0のもの（0でもフラグがあれば値として読む）。
     #[test]
     fn a_join_with_the_relay_and_resume_bits_reads_zero_values_as_values() {
         let mut tree = JOIN_TREE_NONE;
@@ -5306,14 +5430,54 @@ mod tests {
         assert_eq!(j.tree.resume_from, Some(0));
     }
 
-    /// ACK の本文の、`sack` の前の部分。
+    /// ACKの本文の、`sack`の前の部分（クッキーなし）。
     #[rustfmt::skip]
     const SPECTATE_ACK_HEAD: [u8; ACK_HEAD_LEN] = [
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // nonce = 0x0102030405060708
         0x00, 0x01, 0x00, 0x00,                         // next = 256
-        0x83,                                           // 中継の状態: 子孫 3・bit7 紹介しないで
+        0x83,                                           // 中継の状態: 子孫3・bit7紹介しないで
         0x02, 0x01,                                     // 受け入れの依頼の受け取り = 0x0102
+        0x00,                                           // flags: クッキーなし
     ];
+
+    #[test]
+    fn golden_spectate_ack_with_a_cookie_puts_it_before_the_sack() {
+        let mut s = Bits512::EMPTY;
+        s.set(0);
+        let mut m = ack_msg(s);
+        if let Message::SpectateAck { cookie, .. } = &mut m {
+            *cookie = Some(0x1122_3344_5566_7788);
+        }
+        let mut body = SPECTATE_ACK_HEAD.to_vec();
+        body[15] = 0x01;
+        body.extend_from_slice(&[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x01]);
+        let want = spectate_pkt(TYPE_SPECTATE_ACK, &body);
+        assert_eq!(encode_to_vec(SID, &m), want);
+        assert_eq!(dec(&want).unwrap().msg, m);
+    }
+
+    #[test]
+    fn an_ack_with_unknown_flag_bits_or_a_cut_cookie_is_refused() {
+        for flags in [0x02u8, 0x80] {
+            let mut body = SPECTATE_ACK_HEAD.to_vec();
+            body[15] = flags;
+            assert!(
+                matches!(
+                    dec(&spectate_pkt(TYPE_SPECTATE_ACK, &body)),
+                    Err(DecodeError::FieldOutOfRange { field: "flags", .. })
+                ),
+                "flags {flags:#x}"
+            );
+        }
+        // クッキーのフラグがあるのに8 Bに足りない。
+        let mut body = SPECTATE_ACK_HEAD.to_vec();
+        body[15] = 0x01;
+        body.extend_from_slice(&[1, 2, 3]);
+        assert!(matches!(
+            dec(&spectate_pkt(TYPE_SPECTATE_ACK, &body)),
+            Err(DecodeError::LengthMismatch { .. })
+        ));
+    }
 
     fn ack_msg(sack: Bits512) -> Message {
         Message::SpectateAck {
@@ -5324,6 +5488,7 @@ mod tests {
                 no_intro: true,
             },
             admit_ack: 0x0102,
+            cookie: None,
             sack,
         }
     }
@@ -5345,7 +5510,7 @@ mod tests {
 
     #[test]
     fn golden_spectate_ack_with_a_one_byte_sack() {
-        // ビット 0 = 番号 257、ビット 3 = 番号 260。
+        // ビット 0 = 番号257、ビット 3 = 番号260。
         let mut s = Bits512::EMPTY;
         s.set(0);
         s.set(3);
@@ -5362,7 +5527,7 @@ mod tests {
     #[test]
     fn golden_spectate_ack_with_the_largest_511_bit_sack() {
         let mut bytes = [0xFFu8; 64];
-        bytes[63] = 0x7F; // ビット 511 は予約
+        bytes[63] = 0x7F; // ビット511は予約
         assert_ack_golden(SACK_MASK, &bytes);
         assert_eq!(
             encode_to_vec(SID, &ack_msg(SACK_MASK)).len(),
@@ -5377,26 +5542,27 @@ mod tests {
             next: 256,
             relay: RelayState::NO_INTRO,
             admit_ack: 0,
+            cookie: None,
             sack: Bits512::EMPTY,
         };
         let mut body = SPECTATE_ACK_HEAD;
-        body[12..].copy_from_slice(&[0x80, 0, 0]);
+        body[12..].copy_from_slice(&[0x80, 0, 0, 0]);
         let want = spectate_pkt(TYPE_SPECTATE_ACK, &body);
         assert_eq!(encode_to_vec(SID, &m), want);
         assert_eq!(dec(&want).unwrap().msg, m);
     }
 
-    /// INTRO の本文（候補 2 個）。
+    /// INTROの本文（候補2個）。
     #[rustfmt::skip]
     const SPECTATE_INTRO_BODY: [u8; INTRO_FIXED_LEN + 29] = [
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // nonce = 0x1122334455667788
         0x02, 0x00,             // epoch = 2
-        // 中継用の公開鍵 32 B（+10）: 40 41 … 5F
+        // 中継用の公開鍵32 B（+10）: 40 41 … 5F
         0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
         0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
-        0x02,                   // 候補 2 個（+42）
-        0x04, 0x06, 0x24, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58, 0x1B, // IPv6 2400::1 ポート 7000
-        0x03, 0x04, 0x08, 0x08, 0x04, 0x04, 0x39, 0x30, // 外側 IPv4 8.8.4.4 ポート 12345
+        0x02,                   // 候補2個（+42）
+        0x04, 0x06, 0x24, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58, 0x1B, // IPv6 2400::1ポート7000
+        0x03, 0x04, 0x08, 0x08, 0x04, 0x04, 0x39, 0x30, // 外側IPv4 8.8.4.4ポート12345
     ];
 
     fn intro_msg() -> Message {
@@ -5415,18 +5581,18 @@ mod tests {
         assert_eq!(dec(&want).unwrap().msg, intro_msg());
     }
 
-    /// ADMIT の本文（候補 1 個）。
+    /// ADMITの本文（候補1個）。
     #[rustfmt::skip]
     const SPECTATE_ADMIT_BODY: [u8; ADMIT_FIXED_LEN + 9] = [
         0x03, 0x01,             // 番号 = 0x0103
         0x10, 0x27, 0x00, 0x00, // 始める番号 = 10000（+2）
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // 子の nonce = 0x0102030405060708（+6）
         0x05, 0x00,             // 子の epoch = 5（+14）
-        // 子の公開鍵 32 B（+16）: C0 C1 … DF
+        // 子の公開鍵32 B（+16）: C0 C1 … DF
         0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
         0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF,
-        0x01,                   // 候補 1 個（+48）
-        0x02, 0x04, 0xC0, 0xA8, 0x01, 0x07, 0xD2, 0x04, // LAN 192.168.1.7 ポート 1234
+        0x01,                   // 候補1個（+48）
+        0x02, 0x04, 0xC0, 0xA8, 0x01, 0x07, 0xD2, 0x04, // LAN 192.168.1.7ポート1234
     ];
 
     fn admit_msg() -> Message {
@@ -5470,7 +5636,7 @@ mod tests {
                 "{m:?}"
             );
         }
-        // HMAC のタグの便は、この 4 つの type だけ。
+        // HMACのタグの便はこの4つのtypeだけ。
         let signed: Vec<u8> = (0..=u8::MAX).filter(|&t| is_signed_type(t)).collect();
         assert_eq!(signed, [1, 2, 13, 22]);
     }
@@ -5490,7 +5656,7 @@ mod tests {
                 actual,
             })
         };
-        // INTRO: 候補の並びの前で切れた・候補 9 個・候補の途中で切れた・後ろに余り。
+        // INTRO: 候補の並びの前で切れた・候補9個・候補の途中で切れた・後ろに余り。
         let t = TYPE_SPECTATE_INTRO;
         assert!(dec(&spectate_pkt(t, &SPECTATE_INTRO_BODY)).is_ok());
         for cut in [0, INTRO_FIXED_LEN] {
@@ -5512,7 +5678,7 @@ mod tests {
         b = SPECTATE_INTRO_BODY;
         b[INTRO_FIXED_LEN + 1] = 5; // 知らない種別
         assert_eq!(dec(&spectate_pkt(t, &b)), field(t, "candidates"));
-        // ADMIT: 番号 0 は捨てる（1 は通る）。
+        // ADMIT: 番号0は捨てる（1は通る）。
         let t = TYPE_SPECTATE_ADMIT;
         let mut b = SPECTATE_ADMIT_BODY;
         b[0] = 0;
@@ -5527,7 +5693,7 @@ mod tests {
             dec(&spectate_pkt(t, &SPECTATE_ADMIT_BODY[..ADMIT_FIXED_LEN])),
             len(t, ADMIT_FIXED_LEN + 1, ADMIT_FIXED_LEN)
         );
-        // REHOME: 本文は 0 B だけ。
+        // REHOME: 本文は0 Bだけ。
         let t = TYPE_SPECTATE_REHOME;
         assert_eq!(dec(&spectate_pkt(t, &[0])), len(t, 0, 1));
     }
@@ -5537,7 +5703,7 @@ mod tests {
     #[rustfmt::skip]
     const SPECTATE_MEASURE_GOLDEN: [u8; HEADER_LEN + 2] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x1B, 0x00, 0x00, // type = 27（SPECTATE_MEASURE）
+        0x0A, 0x1B, 0x00, 0x00, // type = 27（SPECTATE_MEASURE）
         0x44, 0x33, 0x22, 0x11,
         0x05, 0x01,             // 番の番号 = 0x0105
     ];
@@ -5549,16 +5715,16 @@ mod tests {
         assert_eq!(dec(&SPECTATE_MEASURE_GOLDEN).unwrap().msg, m);
     }
 
-    /// PAIR の先頭（ヘッダと、詰め物の前の 4 B）。
+    /// PAIRの先頭（ヘッダと詰め物の前の4 B）。
     #[rustfmt::skip]
     const SPECTATE_PAIR_HEAD: [u8; HEADER_LEN + 4] = [
         0x48, 0x47, 0x52, 0x54,
-        0x09, 0x1C, 0x00, 0x00, // type = 28（SPECTATE_PAIR）
+        0x0A, 0x1C, 0x00, 0x00, // type = 28（SPECTATE_PAIR）
         0x44, 0x33, 0x22, 0x11,
         0x03, 0x02,             // 番の番号 = 0x0203
-        0x07,                   // 組の番号 = 7（+2）
-        0x01,                   // 組の中の順 = 1（2 通目。+3）
-        // +4 から 1,160 B は全部 0
+        0x07,                   // ペアの番号 = 7（+2）
+        0x01,                   // ペアの中の順 = 1（2通目。+3）
+        // +4から1,160 Bは全部0
     ];
 
     fn pair_msg() -> Message {
@@ -5580,7 +5746,7 @@ mod tests {
         assert_eq!(&plain[..SPECTATE_PAIR_HEAD.len()], SPECTATE_PAIR_HEAD);
         assert!(plain[SPECTATE_PAIR_HEAD.len()..].iter().all(|&b| b == 0));
         assert_eq!(dec(&plain).unwrap().msg, pair_msg());
-        // 1 通目（順 0）も読める。
+        // 1通目（順0）も読める。
         let mut first = plain.clone();
         first[HEADER_LEN + 3] = 0;
         assert!(matches!(
@@ -5604,7 +5770,7 @@ mod tests {
                 actual,
             })
         };
-        // MEASURE: 番号 0 は捨てる（1 は通る）・2 B でないものは捨てる。
+        // MEASURE: 番号0は捨てる（1は通る）・2 Bでないものは捨てる。
         let t = TYPE_SPECTATE_MEASURE;
         assert_eq!(dec(&spectate_pkt(t, &[0, 0])), field(t, "turn"));
         assert_eq!(
@@ -5613,7 +5779,7 @@ mod tests {
         );
         assert_eq!(dec(&spectate_pkt(t, &[1])), len(t, 2, 1));
         assert_eq!(dec(&spectate_pkt(t, &[1, 0, 0])), len(t, 2, 3));
-        // PAIR: 番号 0・組の番号 10・順 2・詰め物が 0 でない・長さ違いは捨てる。組の番号 9・順 0 は通る。
+        // PAIR: 番号0・ペアの番号10・順2・詰め物が0でない・長さ違いは捨てる。ペアの番号9・順0は通る。
         let t = TYPE_SPECTATE_PAIR;
         let plain = encode_to_vec(SID, &pair_msg());
         let at = HEADER_LEN;
@@ -5661,18 +5827,18 @@ mod tests {
             b[5] = t;
             assert_eq!(peek_type(&b), want(t), "type {t}");
             named += usize::from(want(t) != PeekedType::Other);
-            // 同じ覗きの元を使う 3 つも、type の表どおり。
+            // 同じ覗きの元を使う3つもtypeの表どおり。
             assert_eq!(peek_is_ping(&b), t == 8, "type {t}");
             assert_eq!(peek_is_probe(&b), t == 22, "type {t}");
             assert_eq!(peek_is_handshake(&b), matches!(t, 1 | 2 | 10), "type {t}");
-            // 短い・magic が違うものは覗かない。
+            // 短い・magicが違うものは覗かない。
             assert_eq!(peek_type(&b[..HEADER_LEN + TAG_LEN - 1]), PeekedType::Other);
             b[0] = b'X';
             assert_eq!(peek_type(&b), PeekedType::Other);
             assert!(!peek_is_ping(&b) && !peek_is_probe(&b) && !peek_is_handshake(&b));
         }
         assert_eq!(named, 9);
-        // 作った便でも同じ（封じた便・HMAC の便の両方）。
+        // 作った便でも同じ（封じた便・HMACの便の両方）。
         let mut buf = [0u8; MAX_DATAGRAM];
         for (m, w) in [
             (spectate_join_full_msg(), PeekedType::SpectateJoin),
@@ -5693,7 +5859,7 @@ mod tests {
         }
     }
 
-    /// 6 種類の記録を 1 つずつ並べた STREAM（本文 51 B）。
+    /// 6種類の記録を1つずつ並べたSTREAM（本文51 B）。
     #[rustfmt::skip]
     const SPECTATE_STREAM_BODY: [u8; 51] = [
         0x05, 0x01, 0x00, 0x00, // first = 261
@@ -5748,6 +5914,7 @@ mod tests {
         Message::SpectateStream(SpectateStream {
             first: 261,
             reset: true,
+            cookie: None,
             count: 6,
             records,
         })
@@ -5761,6 +5928,7 @@ mod tests {
         let empty = Message::SpectateStream(SpectateStream {
             first: 7,
             reset: false,
+            cookie: None,
             count: 0,
             records: [Record::FILLER; MAX_STREAM_RECORDS],
         });
@@ -5768,6 +5936,36 @@ mod tests {
             encode_to_vec(SID, &empty),
             spectate_pkt(TYPE_SPECTATE_STREAM, &[7, 0, 0, 0, 0, 0])
         );
+    }
+
+    #[test]
+    fn golden_spectate_stream_with_a_cookie_puts_it_before_the_records() {
+        let mut m = spectate_stream_msg();
+        if let Message::SpectateStream(s) = &mut m {
+            s.cookie = Some(0x0102_0304_0506_0708);
+        }
+        let mut body = SPECTATE_STREAM_BODY[..6].to_vec();
+        body[4] = 0x03; // reset ＋ クッキー
+        body.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        body.extend_from_slice(&SPECTATE_STREAM_BODY[6..]);
+        let want = spectate_pkt(TYPE_SPECTATE_STREAM, &body);
+        assert_eq!(encode_to_vec(SID, &m), want);
+        assert_eq!(dec(&want).unwrap().msg, m);
+        // フラグがあるのにクッキーの8 Bが無い本文と知らないflagsのbitは捨てる。
+        let mut cut = SPECTATE_STREAM_BODY[..6].to_vec();
+        cut[4] = 0x02;
+        cut[5] = 0;
+        cut.extend_from_slice(&[1, 2, 3]);
+        assert!(matches!(
+            dec(&spectate_pkt(TYPE_SPECTATE_STREAM, &cut)),
+            Err(DecodeError::LengthMismatch { .. })
+        ));
+        let mut odd = SPECTATE_STREAM_BODY.to_vec();
+        odd[4] = 0x05;
+        assert!(matches!(
+            dec(&spectate_pkt(TYPE_SPECTATE_STREAM, &odd)),
+            Err(DecodeError::FieldOutOfRange { field: "flags", .. })
+        ));
     }
 
     #[test]
@@ -5793,6 +5991,7 @@ mod tests {
         let msg = Message::SpectateStream(SpectateStream {
             first: 0,
             reset: false,
+            cookie: None,
             count: MAX_STREAM_RECORDS as u8,
             records,
         });
@@ -5803,20 +6002,20 @@ mod tests {
         assert_eq!(dec_raw(&buf[..n]).unwrap().msg, msg);
     }
 
-    /// 名前の記録 2 つ（「テスト」と ASCII）を並べた STREAM の本文（6 + 2 × 35 = 76 B）。
+    /// 名前の記録2つ（「テスト」とASCII）を並べたSTREAMの本文（6 + 2 × 35 = 76 B）。
     #[rustfmt::skip]
     const SPECTATE_STREAM_NAMES_BODY: [u8; 76] = [
         0x0A, 0x00, 0x00, 0x00, // first = 10
         0x00,                   // flags
         0x02,                   // count = 2
         0x07, 0x00, 0x09,       // Name { seat: P1（0）, len 9,
-        0xE3, 0x83, 0x86, 0xE3, 0x82, 0xB9, 0xE3, 0x83, 0x88, // 「テスト」の UTF-8
+        0xE3, 0x83, 0x86, 0xE3, 0x82, 0xB9, 0xE3, 0x83, 0x88, // 「テスト」のUTF-8
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 32 B になるまでの 0 }
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 32 Bになるまでの0 }
         0x07, 0x01, 0x03,       // Name { seat: P2（1）, len 3,
         b'a', b'b', b'c',
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 32 B になるまでの 0 }
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 32 Bになるまでの0 }
     ];
 
     fn spectate_names_msg() -> Message {
@@ -5826,6 +6025,7 @@ mod tests {
         Message::SpectateStream(SpectateStream {
             first: 10,
             reset: false,
+            cookie: None,
             count: 2,
             records,
         })
@@ -5842,7 +6042,7 @@ mod tests {
         assert_eq!((len, bytes), (32, [b'x'; 32]));
     }
 
-    /// 対戦の状態の記録 2 つ（ping 14 ms・Latency 1・Rollback 2 と、測れていない印の値）を並べた STREAM の本文（6 + 2 × 5 = 16 B）。
+    /// 対戦の状態の記録2つ（ping 14 ms・Latency 1・Rollback 2と測れていない印の値）を並べたSTREAMの本文（6 + 2 × 5 = 16 B）。
     #[rustfmt::skip]
     const SPECTATE_STREAM_STATS_BODY: [u8; 16] = [
         0x0A, 0x00, 0x00, 0x00, // first = 10
@@ -5859,6 +6059,7 @@ mod tests {
         Message::SpectateStream(SpectateStream {
             first: 10,
             reset: false,
+            cookie: None,
             count: 2,
             records,
         })
@@ -5943,6 +6144,7 @@ mod tests {
         Message::SpectateStream(SpectateStream {
             first: 60,
             reset: false,
+            cookie: None,
             count: 2,
             records,
         })
@@ -5953,7 +6155,7 @@ mod tests {
         let want = spectate_pkt(TYPE_SPECTATE_STREAM, &SPECTATE_STREAM_CHECK_BODY);
         assert_eq!(encode_to_vec(SID, &spectate_check_msg()), want);
         assert_eq!(dec(&want).unwrap().msg, spectate_check_msg());
-        // seg は載らない（観戦者は直前の `Seg` の記録で知っている）。
+        // segは載らない（観戦者は直前の`Seg`の記録で知っている）。
         let Message::SpectateStream(s) = spectate_check_msg() else {
             unreachable!()
         };
@@ -5977,7 +6179,7 @@ mod tests {
         let t = TYPE_SPECTATE_STREAM;
         let good = SPECTATE_STREAM_CHECK_BODY;
         assert!(dec(&spectate_pkt(t, &good)).is_ok());
-        // 作り方の欄が 0・1 の外。
+        // 作り方のフィールドが0・1の外。
         let mut bad_kind = good;
         bad_kind[19] = 2;
         assert_eq!(
@@ -5987,7 +6189,7 @@ mod tests {
                 field: "check_kind",
             })
         );
-        // 最後の記録が 1 B 足りない。
+        // 最後の記録が1 B足りない。
         assert_eq!(
             dec(&spectate_pkt(t, &good[..33])),
             Err(DecodeError::LengthMismatch {
@@ -6018,7 +6220,7 @@ mod tests {
 
     #[test]
     fn a_record_stays_within_36_bytes() {
-        // 記録に大きい欄を足して 36 B を越えると、観戦のホストのリングバッファ（`spectate::RING_CAP` 個）の確保と `Message` の大きさが見積もりより太る。
+        // 記録に大きいフィールドを足して36 Bを越えると観戦のホストのリングバッファ（`spectate::RING_CAP`個）の確保と`Message`の大きさが見積もりより大きくなる。
         assert_eq!(core::mem::size_of::<Record>(), 36);
     }
 
@@ -6027,11 +6229,12 @@ mod tests {
         let msg = Message::SpectateStream(SpectateStream {
             first: 0,
             reset: false,
+            cookie: None,
             count: MAX_STREAM_RECORDS as u8,
             records: [Record::name(Seat::P2, "あ".as_bytes()); MAX_STREAM_RECORDS],
         });
         let mut buf = [0u8; MAX_DATAGRAM];
-        // バージョン 5 で nonce の欄の 8 B が増えた（12 + 8 + 6 + 16×35 + 16 = 602 B）。
+        // バージョン5でnonceのフィールドの8 Bが増えた（12 + 8 + 6 + 16×35 + 16 = 602 B）。
         let n = enc(SID, &msg, &mut buf);
         assert_eq!(n, 12 + 6 + 16 * 35 + crate::seal::SEAL_OVERHEAD);
         assert!(n <= MAX_DATAGRAM);
@@ -6076,6 +6279,7 @@ mod tests {
         let msg = Message::SpectateStream(SpectateStream {
             first: 1,
             reset: false,
+            cookie: None,
             count: 40,
             records: [Record::Menu { p1: 1, p2: 2 }; MAX_STREAM_RECORDS],
         });
@@ -6094,7 +6298,7 @@ mod tests {
         let none = join_body(&JOIN_TREE_NONE);
         let min = none.len();
         assert!(dec(&spectate_pkt(t, &none)).is_ok());
-        // 候補の個数の 1 B より前で切れたもの（中継の木の欄の無い古い形の 78 B も）。
+        // 候補の個数の1 Bより前で切れたもの（中継の木のフィールドの無い古い形の78 Bも）。
         for cut in [min - 1, JOIN_PUBLIC_END, JOIN_NAME_END] {
             assert_eq!(
                 dec(&spectate_pkt(t, &none[..cut])),
@@ -6124,7 +6328,7 @@ mod tests {
         let mut b = none.clone();
         b[0] = 33;
         assert_eq!(dec(&spectate_pkt(t, &b)), field("name_len"));
-        // 早送りの速さは 1〜16 だけ（範囲の両端は通る）。
+        // 早送りの速さは1〜16だけ（範囲の両端は通る）。
         for (ff, ok) in [
             (0, false),
             (1, true),
@@ -6145,10 +6349,10 @@ mod tests {
             }
         }
         b = none.clone();
-        b[10 + 5] = b'x'; // name_len = 2 の後ろに 0 でない文字
+        b[10 + 5] = b'x'; // name_len = 2 の後ろに0でない文字
         assert_eq!(dec(&spectate_pkt(t, &b)), field("name_tail"));
         b = none.clone();
-        b[10] = 0xFF; // UTF-8 でない
+        b[10] = 0xFF; // UTF-8でない
         assert_eq!(dec(&spectate_pkt(t, &b)), Err(DecodeError::InvalidUtf8));
     }
 
@@ -6165,19 +6369,19 @@ mod tests {
         let full = join_body(&JOIN_TREE_FULL);
         assert!(dec(&spectate_pkt(t, &full)).is_ok());
         let none = join_body(&JOIN_TREE_NONE);
-        // 予約の bit（bit4〜7）。
+        // 予約のbit（bit4〜7）。
         for flag in [0x10u8, 0x80, 0xF0] {
             let mut b = full.clone();
             b[at] |= flag;
             assert_eq!(dec(&spectate_pkt(t, &b)), field("tree_flags"), "{flag:#x}");
         }
-        // 回線の型の定義の外。
+        // ネットワーク種別の定義の外。
         for nat in [0x03u8, 0x08, 0xFF] {
             let mut b = full.clone();
             b[at + 1] = nat;
             assert_eq!(dec(&spectate_pkt(t, &b)), field("nat"), "{nat:#x}");
         }
-        // bit0 が無いのに中継用の公開鍵が 0 でない（鍵の最初と最後の 1 B）。
+        // bit0が無いのに中継用の公開鍵が0でない（鍵の最初と最後の1 B）。
         for k in [at + 8, JOIN_FIXED_LEN - 1] {
             let mut b = none.clone();
             b[k] = 1;
@@ -6185,7 +6389,7 @@ mod tests {
             b[at] = JOIN_RELAY_BIT;
             assert!(dec(&spectate_pkt(t, &b)).is_ok(), "+{k} bit0 あり");
         }
-        // bit2 が無いのに resume_from が 0 でない（最下位と最上位の 1 B）。
+        // bit2が無いのにresume_fromが0でない（最下位と最上位の1 B）。
         for k in [at + 4, at + 7] {
             let mut b = none.clone();
             b[k] = 1;
@@ -6193,11 +6397,11 @@ mod tests {
             b[at] = JOIN_RESUME_BIT;
             assert!(dec(&spectate_pkt(t, &b)).is_ok(), "+{k} bit2 あり");
         }
-        // 候補 9 個（上限 8 を越える）。
+        // 候補9個（上限8を越える）。
         let mut b = full.clone();
         b[JOIN_FIXED_LEN] = 9;
         assert_eq!(dec(&spectate_pkt(t, &b)), field("candidate_count"));
-        // 候補の中身: 知らない family・同じ候補の重なり。
+        // 候補の中身: 知らないfamily・同じ候補の重なり。
         let mut b = full.clone();
         b[JOIN_FIXED_LEN + 2] = 5;
         assert_eq!(dec(&spectate_pkt(t, &b)), field("candidates"));
@@ -6229,7 +6433,7 @@ mod tests {
                 actual: n + 1
             })
         );
-        // 8 個ちょうどは通る。
+        // 8個ちょうどは通る。
         let mut eight = Candidates::EMPTY;
         for i in 0..8u16 {
             eight
@@ -6260,7 +6464,7 @@ mod tests {
         });
         let ack_len = |len: usize, expected: usize| {
             assert_eq!(
-                dec(&spectate_pkt(t, &vec![1u8; len])),
+                dec(&spectate_pkt(t, &vec![0u8; len])),
                 Err(DecodeError::LengthMismatch {
                     msg_type: t,
                     expected,
@@ -6269,15 +6473,32 @@ mod tests {
                 "len={len}"
             );
         };
-        // 中継の木の欄の無い古い形（12 B）も短い。
+        // 中継の木のフィールドの無い古い形（12 B）も短い。
         for len in [0usize, 12, ACK_HEAD_LEN - 1] {
             ack_len(len, ACK_HEAD_LEN);
         }
-        // 最大（12 + 64）を 1 B でも越えたら捨てる。
+        // 最大（頭 ＋ 64）を1 Bでも越えたら捨てる。クッキーのフラグがあれば頭の後ろの8 Bも数える。
         for len in [ACK_HEAD_LEN + 65, ACK_HEAD_LEN + 200] {
             ack_len(len, ACK_HEAD_LEN + 64);
         }
-        // 後ろの 0 のバイト（正規の形は載せない）。途中の 0 は通る。
+        for (len, expected) in [
+            (ACK_HEAD_LEN, ACK_HEAD_LEN + 8),
+            (ACK_HEAD_LEN + 7, ACK_HEAD_LEN + 8),
+            (ACK_HEAD_LEN + 8 + 65, ACK_HEAD_LEN + 8 + 64),
+        ] {
+            let mut body = vec![0u8; len];
+            body[15] = 0x01;
+            assert_eq!(
+                dec(&spectate_pkt(t, &body)),
+                Err(DecodeError::LengthMismatch {
+                    msg_type: t,
+                    expected,
+                    actual: len
+                }),
+                "クッキーつき len={len}"
+            );
+        }
+        // 後ろの0のバイト（正規の形は載せない）。途中の0は通る。
         for tail in [&[0x00u8][..], &[0x01, 0x00], &[0x80, 0x00, 0x00]] {
             assert_eq!(dec(&spectate_pkt(t, &ack_body(tail))), bad_sack, "{tail:?}");
         }
@@ -6285,7 +6506,7 @@ mod tests {
         full[63] = 0x00;
         assert_eq!(dec(&spectate_pkt(t, &ack_body(&full))), bad_sack);
         assert!(dec(&spectate_pkt(t, &ack_body(&[0x00, 0x01]))).is_ok());
-        // 予約のビット（最後のバイトの最上位 = ビット 511）。
+        // 予約のビット（最後のバイトの最上位 = ビット511）。
         let mut b = [0u8; 64];
         for reserved in [0x80u8, 0xFF, 0x81] {
             b[63] = reserved;
@@ -6375,7 +6596,7 @@ mod tests {
         b[5] = 17;
         assert_eq!(dec(&spectate_pkt(t, &b)), field("count"));
         b = good;
-        b[4] = 0x03;
+        b[4] = 0x05;
         assert_eq!(dec(&spectate_pkt(t, &b)), field("flags"));
         for k in [0u8, 10, 255] {
             b = good;
@@ -6408,7 +6629,7 @@ mod tests {
 
     #[test]
     fn spectate_stream_bodies_never_panic_on_garbage() {
-        // 母数: 記録の解きまで届いたもの（Ok か記録のガードで落ちた）が 1 万件を越えることを見る。
+        // 母数: 記録を解く処理まで届いたもの（Okか記録のガードで落ちた）が1万件を越えることを検証する。
         let mut rng = SplitMix64::new(0x0BAD_5EED_0000_0014);
         let mut reached = 0u32;
         for _ in 0..100_000u32 {
@@ -6451,8 +6672,8 @@ mod tests {
 
     #[test]
     fn decode_never_panics_on_100k_garbage_inputs() {
-        // 半分は先頭を「HGRT・今のバージョン・予約 0」にして認証を付け直す（でたらめのままだと、ほぼ全部が認証のガードか magic のガードで落ち、
-        // 本文の解き方を通らない）。
+        // 半分は先頭を「HGRT・今のバージョン・予約0」にして認証を付け直す。
+        // でたらめのままだとほぼ全部が認証のガードかmagicのガードで落ちて本文を解く処理を通らない。
         let mut rng = SplitMix64::new(0x5EED_F00D_1234_5678);
         let mut reached_body = 0u32;
         for i in 0..100_000u32 {
@@ -6468,7 +6689,7 @@ mod tests {
                 bytes[6] = 0;
                 bytes[7] = 0;
             }
-            // パニックしなければ良い。Err/Ok どちらでもよい（`Opener` ありと、鍵の交換の前の両方）。
+            // パニックしなければ良い。Err/Okどちらでもよい（`Opener`ありと鍵の交換の前の両方）。
             let _ = dec_raw(&bytes);
             let _ = decode(&key(), None, &bytes);
             let r = dec(&bytes);
@@ -6484,7 +6705,7 @@ mod tests {
                 reached_body += 1;
             }
         }
-        // 母数を言う: 本文の解き方まで届いたもの（通った・本文のガードで落ちた）が 1 万件を越える。
+        // 母数: 本文を解く処理まで届いたもの（通った・本文のガードで落ちた）が1万件を越えることを検証する。
         assert!(
             reached_body > 10_000,
             "本文まで届いたのが {reached_body} 件"

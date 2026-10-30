@@ -1,0 +1,36 @@
+name: 機能の要望 / Feature request
+description: 新しい機能や変更の提案 / Suggest a new feature or a change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        送る前に、READMEの「現在の制約」と、ほかのIssuesに同じ要望が無いかを見てください。
+        日本語・英語・中国語のどれで書いてもかまいません。
+
+        Before sending, please check "Limitations" in the README and whether the same request is already in Issues.
+        You may write in Japanese, English or Chinese.
+  - type: textarea
+    id: want
+    attributes:
+      label: ほしい機能 / What you would like
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: 困っていること・使う場面 / Why you need it
+      description: |
+        今どう困っているか、どんな場面で使うかを書いてください。
+        Describe the problem you have now, or when you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: 例・参考 / Example
+      description: |
+        設定の書き方の例や、ほかのツールの似た機能など。
+        For example, how a setting could be written, or a similar feature in another tool.
+    validations:
+      required: false

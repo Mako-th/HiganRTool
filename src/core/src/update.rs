@@ -1,28 +1,34 @@
 //! 起動前の更新の確認のうち、ネットから来るバイト列を読む部分（pure）。
 //!
-//! 配るバージョンの `HiganRTool.exe` は、花映塚を起動する前に「更新の目録」を 1 つ取り、署名を検証し、今より新しいバージョンならウィンドウで尋ねる（流れは `src/loader/src/update.rs`）。ここは目録の形・署名・バージョンの比べ・置き換えてよいファイル名・URL・設定の読みだけを持つ。
+//! 配布するバージョンの`HiganRTool.exe`は花映塚を起動する前に「更新の目録」を1つ取り、署名を検証し、今より新しいバージョンならウィンドウで尋ねる（流れは`src/loader/src/update.rs`）。
+//! ここは目録の形・署名・バージョンの比べ・置き換えてよいファイル名・URL・設定の読みだけを持つ。
 //! ファイルを書く・通信する層は持たない（検査を本物の通信なしに回すため）。
-//! 目録は UTF-8・LF・1 つの空白区切りの行（`HiganRTool-manifest 1` / `version` / `display` / `file <名前> <大きさ> <SHA-256>` / `signature <Ed25519 の署名>`）。
-//! 署名は最後の `signature` の行を除いた本文の前に [`SIGN_CONTEXT`] を付けたものに付け、署名を検証してから本文を読む。
-//! `version` と [`BUILD_NUMBER`] は同じ数（単調に増える u32）。配るバージョンのビルドのときだけ `tools/make_dist.py` が環境変数 `HIGANR_BUILD_NUMBER` で渡す: **2026-01-01 00:00 UTC からの経過分**。開発用のビルドは 0 で、0 のときローダーはチェックに行かない。
-//! 公開鍵は [`UPDATE_PUBLIC_KEY_HEX`]、目録の URL は [`UPDATE_SERVER`] ＋ [`MANIFEST_PATH`]。検査用の鍵（[`TEST_PUBLIC_KEY_HEX`]）は秘密の種が公開なので、これを載せた exe には誰でも更新を署名できる。`tools/make_dist.py` は検査用の鍵に戻っていると止まる。
+//! 目録はUTF-8・LF・1つの空白区切りの行（`HiganRTool-manifest 1` / `version` / `display` / `file <名前> <大きさ> <SHA-256>` / `signature <Ed25519 の署名>`）。
+//! 署名は最後の`signature`の行を除いた本文の前に[`SIGN_CONTEXT`]を付けたものに対して付ける。
+//! 読むときは署名を検証してから本文を読む。
+//! `version`と[`BUILD_NUMBER`]は同じ数（単調に増えるu32）。
+//! 配布するバージョンのビルド時だけ`tools/make_dist.py`が環境変数`HIGANR_BUILD_NUMBER`で渡す: **2026-01-01 00:00 UTCからの経過分**。
+//! 開発用のビルドは0。0のときローダーはチェックに行かない。
+//! 公開鍵は[`UPDATE_PUBLIC_KEY_HEX`]、目録のURLは[`UPDATE_SERVER`] ＋ [`MANIFEST_PATH`]。
+//! 検査用の鍵（[`TEST_PUBLIC_KEY_HEX`]）は秘密の種が公開なので、これを載せたexeには誰でも更新を署名できる。
+//! `tools/make_dist.py`は検査用の鍵に戻っていると止まる。
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 // ---- 差し替える定数 ----
 
-/// 更新の URL を持つサーバー（ルームサーバーと同じ宿）。配った exe はこの宿へ問い合わせるので、変えるなら配り直しになる。
+/// 更新のURLを持つサーバー（ルームサーバーと同じホスト）。配布したexeはこのホストへ問い合わせるので、変えるなら再配布になる。
 pub const UPDATE_SERVER: &str = "https://higanr-rooms.higan-re-room.workers.dev";
-/// 目録の URL（サーバーが配り場所の最新の目録へ 302 で回す）。
+/// 目録のURL（サーバーが配布場所の最新の目録へ302でリダイレクトする）。
 pub const MANIFEST_PATH: &str = "/update/manifest";
-/// ファイルの URL の先頭（この後ろに名前を付ける。サーバーが配り場所の同名のファイルへ 302 で回す）。
+/// ファイルのURLの先頭（この後ろに名前を付ける。サーバーが配布場所の同名のファイルへ302でリダイレクトする）。
 pub const FILES_PATH: &str = "/update/files/";
 
-/// 配るバージョンが信じる公開鍵（Ed25519、32 バイトの小文字の 16 進）。秘密の鍵はリポジトリの外。
+/// 配布するバージョンが信頼する公開鍵（Ed25519の32バイトの小文字の16進）。秘密の鍵はリポジトリの外。
 pub const UPDATE_PUBLIC_KEY_HEX: &str =
     "5e817e7227e26e6514b4a3a1e0e9d8ff85af5a357a617083a015fee4609623b2";
-/// 検査用の鍵の公開鍵（秘密の種は `test_key::SEED`）。`UPDATE_PUBLIC_KEY_HEX` がこれと同じなら、まだ本物の鍵に替えていない。
+/// 検査用の鍵の公開鍵（秘密の種は`test_key::SEED`）。`UPDATE_PUBLIC_KEY_HEX`がこれと同じならまだ本物の鍵に替えていない。
 pub const TEST_PUBLIC_KEY_HEX: &str =
     "02937f57dd46ff2563d4ecedad0546da0ec561ad38c3d316ab016de447d74fb4";
 
@@ -32,20 +38,21 @@ pub const MANIFEST_MAGIC: &str = "HiganRTool-manifest 1";
 
 /// 目録の大きさの上限（バイト）。ネットから来る長さなので上を決める。
 pub const MAX_MANIFEST_BYTES: usize = 8 * 1024;
-/// 1 ファイルの大きさの上限（バイト）。目録の `size` はこれ以下だけ受ける（署名つきでも）。
+/// 1ファイルの大きさの上限（バイト）。目録の`size`はこれ以下だけ受ける（署名つきでも）。
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// ローダーが目録の取得で待つ上限（ミリ秒。名前の解決から本文の受信まで）。ネットに出られないときも、花映塚の起動をこれ以上遅らせない。
+/// ローダーが目録の取得で待つ上限（ミリ秒。名前の解決から本文の受信まで）。ネットに出られないときも花映塚の起動をこれ以上遅らせない。
 pub const CHECK_DEADLINE_MS: u64 = 2000;
 
-/// 更新の直後に、ローダーが起動し直した新しい exe へ渡す環境変数の名前。あればチェックに行かない（更新が終わらずに起動し直しが続く事故を
-/// 止める歯止め）。
+/// 更新の直後にローダーが起動し直した新しいexeへ渡す環境変数の名前。
+/// あればチェックに行かない（更新が終わらずに起動し直しが続く事故を止める歯止め）。
 pub const JUST_UPDATED_ENV: &str = "HIGANRTOOL_JUST_UPDATED";
 
 // ---- 置き換えてよいファイル ----
 
-/// このバージョンが配るファイル名（配る zip の中身のうち、利用者の設定でないもの）。更新の片づけ（`.old` / `.new`）はこの名前だけを
-/// 見る。置き換えてよい名前は [`is_allowed_name`] の規則で決まり、この表には縛られない（目録は署名で守られている）。
+/// このバージョンが配布するファイル名（配布するzipの中身のうち利用者の設定でないもの）。
+/// 更新の後始末（`.old` / `.new`）はこの名前だけを見る。
+/// 置き換えてよい名前は[`is_allowed_name`]の規則で決まり、この表には縛られない（目録は署名で守られている）。
 pub const SHIPPED_FILES: [&str; 7] = [
     "HiganRTool.exe",
     "HiganRTool.dll",
@@ -55,15 +62,15 @@ pub const SHIPPED_FILES: [&str; 7] = [
     "LICENSE.txt",
     "THIRD_PARTY_LICENSES.txt",
 ];
-/// 目録に必ず載るファイル（exe だけ・dll だけの更新で、組み合わせの違う 2 つが並ぶのを断る）。
+/// 目録に必ず載るファイル（exeだけ・dllだけの更新で組み合わせの違う2つが並ぶのを断る）。
 pub const REQUIRED_FILES: [&str; 2] = ["HiganRTool.exe", "HiganRTool.dll"];
 /// 動いている自分自身（最後に置き換える）。
 pub const SELF_EXE: &str = "HiganRTool.exe";
 
-/// 名前の長さの上限（文字）。サーバーの `isUpdatableFileName`（`src/server/src/update.ts`）と同じ規則。
+/// 名前の長さの上限（文字）。サーバーの`isUpdatableFileName`（`src/server/src/update.ts`）と同じ規則。
 pub const MAX_NAME_LEN: usize = 64;
-/// 更新が置き換えない名前（利用者のもの・ツールが自分で作るもの・ゲームの exe）。大文字小文字を区別せずに比べる。
-/// 目録の名前 2 つは配り場所の側の名前（`tools/make_dist.py` の `MANIFEST_ASSET` / `UNSIGNED_MANIFEST`）。
+/// 更新が置き換えない名前（利用者のもの・ツールが自分で作るもの・ゲームのexe）。大文字小文字を区別せずに比べる。
+/// 目録の名前2つは配布場所の側の名前（`tools/make_dist.py`の`MANIFEST_ASSET` / `UNSIGNED_MANIFEST`）。
 const RESERVED_NAMES: [&str; 8] = [
     "HiganRTool.ini",
     "game_path.txt",
@@ -77,9 +84,11 @@ const RESERVED_NAMES: [&str; 8] = [
 /// 置き換えの途中でツールが作る名前の語尾。
 const TEMP_SUFFIXES: [&str; 2] = [".old", ".new"];
 
-/// 更新が置き換えてよいファイル名か。普通のファイル名（ASCII の英数字と `.` `_` `-` だけ・1〜[`MAX_NAME_LEN`] 文字）で、
-/// `.` で始まらず・終わらず・`..` を含まず、`.old` / `.new` で終わらず、利用者のもの（[`RESERVED_NAMES`]）でなく、
-/// Windows の機器の名前（`CON`・`NUL`・`COM1` など。拡張子が付いても機器）でないこと。
+/// 更新が置き換えてよいファイル名かどうか。次が全部揃ったときだけ真。
+/// - 普通のファイル名（ASCIIの英数字と`.` `_` `-`だけ・1〜[`MAX_NAME_LEN`]文字）。
+/// - `.`で始まらず終わらず`..`を含まず`.old` / `.new`で終わらない。
+/// - 利用者のもの（[`RESERVED_NAMES`]）でない。
+/// - Windowsのデバイス名（`CON`・`NUL`・`COM1`など。拡張子が付いてもデバイス）でない。
 pub fn is_allowed_name(name: &str) -> bool {
     let plain = (1..=MAX_NAME_LEN).contains(&name.len())
         && name
@@ -99,7 +108,7 @@ fn ends_with_ignore_case(name: &str, suffix: &str) -> bool {
         && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
-/// `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9`（最初の `.` より前。Windows は拡張子が付いても機器として開く）。
+/// `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9`（最初の`.`より前。Windowsは拡張子が付いてもデバイスとして開く）。
 fn is_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name);
     let up = stem.to_ascii_uppercase();
@@ -114,17 +123,17 @@ pub fn old_name(name: &str) -> String {
     format!("{name}.old")
 }
 
-/// 落とした物を置き換えの前に書いておく先（`HiganRTool.exe` → `HiganRTool.exe.new`）。
+/// ダウンロードしたファイルを置き換えの前に書いておく先（`HiganRTool.exe` → `HiganRTool.exe.new`）。
 pub fn new_name(name: &str) -> String {
     format!("{name}.new")
 }
 
 // ---- ビルド番号 ----
 
-/// このビルド番号。配るバージョンのビルドのときだけ環境変数 `HIGANR_BUILD_NUMBER` から入る。無い・読めない値は 0。
+/// このビルド番号。配布するバージョンのビルド時だけ環境変数`HIGANR_BUILD_NUMBER`から入る。無い・読めない値は0。
 pub const BUILD_NUMBER: u32 = parse_build_number(option_env!("HIGANR_BUILD_NUMBER"));
 
-/// 10 進の数字だけの文字列を u32 にする（空・数字以外・u32 を越える値は 0）。const で `BUILD_NUMBER` を作るための関数。
+/// 10進の数字だけの文字列をu32にする（空・数字以外・u32を越える値は0）。constで`BUILD_NUMBER`を作るための関数。
 pub const fn parse_build_number(s: Option<&str>) -> u32 {
     let Some(s) = s else { return 0 };
     let mut rest = s.as_bytes();
@@ -145,13 +154,14 @@ pub const fn parse_build_number(s: Option<&str>) -> u32 {
     n as u32
 }
 
-/// ビルド番号の起点（2026-01-01 00:00 UTC）の、1970-01-01 からの日数。
+/// ビルド番号の起点（2026-01-01 00:00 UTC）の、1970-01-01からの日数。
 const BUILD_EPOCH_DAYS: i64 = 20_454;
-/// ビルド番号を画面に出すときの時差（分）。配る zip の名と更新のウィンドウのバージョンの名は日本の時刻なので UTC+9。
+/// ビルド番号を画面に出すときの時差（分）。配布するzipの名と更新のウィンドウのバージョンの名は日本の時刻なのでUTC+9。
 const BUILD_SHOWN_OFFSET_MIN: i64 = 9 * 60;
 
-/// ビルド番号を、日本の時刻の（年, 月, 日, 時, 分）にする。0（開発用のビルド）は None。更新のウィンドウが見せるバージョンの名と同じ日付で
-/// 書くため。確保しない。
+/// ビルド番号を日本の時刻の（年, 月, 日, 時, 分）にする。0（開発用のビルド）はNone。
+/// 日本の時刻にするのは、更新のウィンドウが見せるバージョンの名と同じ日付で書くため。
+/// 確保しない。
 pub fn build_stamp(n: u32) -> Option<(u32, u32, u32, u32, u32)> {
     if n == 0 {
         return None;
@@ -159,7 +169,7 @@ pub fn build_stamp(n: u32) -> Option<(u32, u32, u32, u32, u32)> {
     let minutes = i64::from(n) + BUILD_SHOWN_OFFSET_MIN;
     let days = BUILD_EPOCH_DAYS + minutes.div_euclid(24 * 60);
     let in_day = minutes.rem_euclid(24 * 60);
-    // 1970-01-01 からの日数 → 年月日（グレゴリオ暦。civil_from_days の式）。
+    // 1970-01-01からの日数 → 年月日（グレゴリオ暦。civil_from_daysの式）。
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -178,22 +188,23 @@ pub fn build_stamp(n: u32) -> Option<(u32, u32, u32, u32, u32)> {
     ))
 }
 
-/// 目録のバージョンが、いまのバージョンより新しいか。**同じ・古いは使わない**（古いバージョンへ戻す攻撃と、同じバージョンの再配布を断る）。
+/// 目録のバージョンがいまのバージョンより新しいかどうか。**同じ・古いは使わない**（古いバージョンへ戻す攻撃と、同じバージョンの再配布を断る）。
 pub fn is_newer(current: u32, offered: u32) -> bool {
     offered > current
 }
 
 // ---- 起動できた印 ----
 
-/// 新しいバージョンが花映塚を起動できたときに書く印の名前（ローダーの exe のフォルダ）。中身はビルド番号（10 進 1 行）。一つ前のバージョンの
-/// `.old` は、この印が今のバージョンと同じになった次の起動で消す。起動する前に消すと、起動できなかった新しいバージョンから元のバージョンへ戻せなくなる。
+/// 新しいバージョンが花映塚を起動できたときに書く印の名前（ローダーのexeのフォルダ）。中身はビルド番号（10進1行）。
+/// 一つ前のバージョンの`.old`はこの印が今のバージョンと同じになった次の起動で消す。
+/// 起動する前に消すと、起動できなかった新しいバージョンから元のバージョンへ戻せなくなる。
 pub const LAUNCHED_MARK: &str = "update_launched.txt";
 
 pub fn launched_mark_text(build: u32) -> String {
     format!("{build}\n")
 }
 
-/// 印の中身が今のビルド番号と同じか。読めない中身・ビルド番号 0（開発のビルド）・別のバージョンの印は false（`.old` を消さない側へ倒す）。
+/// 印の中身が今のビルド番号と同じかどうか。読めない中身・ビルド番号0（開発のビルド）・別のバージョンの印はfalse（`.old`を消さない側へ倒す）。
 pub fn launched_mark_matches(text: Option<&str>, build: u32) -> bool {
     build != 0 && text.and_then(|t| t.trim().parse::<u32>().ok()) == Some(build)
 }
@@ -210,7 +221,7 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub version: u32,
-    /// ウィンドウに出すバージョンの名（`[0-9A-Za-z._-]` の 1〜32 文字）。
+    /// ウィンドウに出すバージョンの名（`[0-9A-Za-z._-]`の1〜32文字）。
     pub display: String,
     pub files: Vec<FileEntry>,
 }
@@ -218,14 +229,14 @@ pub struct Manifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
     TooLarge,
-    /// 最後の行が `signature <128 文字の 16 進>` の形でない（署名が無い・欠けた）。
+    /// 最後の行が`signature <128 文字の 16 進>`の形でない（署名が無い・欠けた）。
     NoSignature,
     /// 公開鍵が使えない（定数の誤り）。
     BadPublicKey,
     /// 署名が合わない（書き換えられた・別の鍵）。
     SignatureMismatch,
     NotUtf8,
-    /// 本文の形が違う。`line` は 1 から、`why` は直し方が分かる短い文。
+    /// 本文の形が違う。`line`は1から、`why`は直し方が分かる短い文。
     BadBody {
         line: usize,
         why: String,
@@ -261,7 +272,7 @@ pub fn signing_message(body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// 本文（LF で終わる）に署名の行を足した、配る目録の全体。署名ツールが使う。
+/// 本文（LFで終わる）に署名の行を足した配布する目録の全体。署名ツールが使う。
 pub fn compose_signed(body: &str, signature: &[u8; 64]) -> Result<String, ManifestError> {
     if !body.ends_with('\n') {
         return Err(bad(1, "本文が LF で終わっていない"));
@@ -269,7 +280,7 @@ pub fn compose_signed(body: &str, signature: &[u8; 64]) -> Result<String, Manife
     Ok(format!("{body}signature {}\n", to_hex(signature)))
 }
 
-/// 目録の全体を（本文, 署名）に分ける。署名の行が最後の 1 行で、その前までが本文。
+/// 目録の全体を（本文, 署名）に分ける。署名の行が最後の1行で、その前までが本文。
 fn split_signed(bytes: &[u8]) -> Result<(&[u8], [u8; 64]), ManifestError> {
     let without_last_lf = bytes
         .strip_suffix(b"\n")
@@ -289,7 +300,7 @@ fn split_signed(bytes: &[u8]) -> Result<(&[u8], [u8; 64]), ManifestError> {
     Ok((body, sig))
 }
 
-/// 署名を検証してから本文を読む。`public_key` は 32 バイトの Ed25519 の公開鍵。検証に通らなければ本文は読まない。
+/// 署名を検証してから本文を読む。`public_key`は32バイトのEd25519の公開鍵。検証に通らなければ本文は読まない。
 pub fn verify_and_parse(bytes: &[u8], public_key: &[u8; 32]) -> Result<Manifest, ManifestError> {
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(ManifestError::TooLarge);
@@ -309,7 +320,7 @@ pub fn parse_body(text: &str) -> Result<Manifest, ManifestError> {
         return Err(bad(1, "本文が LF で終わっていない"));
     }
     let mut lines = text.split('\n');
-    // 末尾の LF のあとの空要素は、ここで捨てる（それ以外の空行は下で断る）。
+    // 末尾のLFのあとの空要素は、ここで捨てる（それ以外の空行は下で断る）。
     let mut all: Vec<&str> = lines.by_ref().collect();
     all.pop();
     let mut it = all.into_iter().enumerate().map(|(i, l)| (i + 1, l));
@@ -347,7 +358,7 @@ pub fn parse_body(text: &str) -> Result<Manifest, ManifestError> {
         if !is_allowed_name(name) {
             return Err(bad(n, "置き換えてよいファイル名でない"));
         }
-        // Windows は大文字小文字を区別しないので、綴りの違うだけの名前も同じファイルとして 2 回と数える。
+        // Windowsは大文字小文字を区別しないので綴りの違うだけの名前も同じファイルとして2回と数える。
         if files.iter().any(|f| f.name.eq_ignore_ascii_case(name)) {
             return Err(bad(n, "同じファイルが 2 回ある"));
         }
@@ -381,7 +392,7 @@ fn is_display_text(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// 先頭が 0 でない 10 進の数字だけ（`+`・空白・先頭の 0 を断る。0 も断る）。
+/// 先頭が0でない10進の数字だけ（`+`・空白・先頭の0を断る。0も断る）。
 fn parse_decimal_u32(s: &str) -> Option<u32> {
     parse_decimal_u64(s).and_then(|v| u32::try_from(v).ok())
 }
@@ -394,9 +405,9 @@ fn parse_decimal_u64(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-// ---- ハッシュと 16 進 ----
+// ---- ハッシュと16進 ----
 
-/// SHA-256（パッケージ `sha2`）。ローダーはこれで落としたファイルを目録と照らす。
+/// SHA-256（パッケージ`sha2`）。ローダーはこれでダウンロードしたファイルを目録と照らす。
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
@@ -411,7 +422,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// 小文字の 16 進を `out` の長さちょうどに読む（長さ違い・大文字・16 進でない文字は None）。
+/// 小文字の16進を`out`の長さちょうどに読む（長さ違い・大文字・16進でない文字はNone）。
 pub fn from_hex_exact(s: &str, out: &mut [u8]) -> Option<()> {
     let b = s.as_bytes();
     if b.len() != out.len() * 2 {
@@ -422,7 +433,7 @@ pub fn from_hex_exact(s: &str, out: &mut [u8]) -> Option<()> {
         b'a'..=b'f' => Some(c - b'a' + 10),
         _ => None,
     };
-    // 長さは上で偶数と検証してある（端数 `_` は空）。
+    // 長さは上で偶数と検証してある（端数`_`は空）。
     let (pairs, _) = b.as_chunks::<2>();
     for (o, [hi, lo]) in out.iter_mut().zip(pairs) {
         *o = (val(*hi)? << 4) | val(*lo)?;
@@ -430,7 +441,7 @@ pub fn from_hex_exact(s: &str, out: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-/// 配るバージョンが信じる公開鍵（32 バイト）。定数が 16 進として読めなければ None（検査が落とす）。
+/// 配布するバージョンが信頼する公開鍵（32バイト）。定数が16進として読めなければNone（検査が落とす）。
 pub fn update_public_key() -> Option<[u8; 32]> {
     let mut k = [0u8; 32];
     from_hex_exact(UPDATE_PUBLIC_KEY_HEX, &mut k)?;
@@ -451,8 +462,8 @@ pub struct Endpoint {
     pub path: String,
 }
 
-/// `http://宿[:ポート]/道` か `https://…` を分ける。宿は ASCII の文字・数字・`.`・`-` だけ（括弧つきの IPv6 は使わない）。
-/// 製品の URL は定数、検査の URL は loopback なので、ネットから来る文字列には使わない。
+/// `http://宿[:ポート]/道`か`https://…`を分ける。ホストはASCIIの文字・数字・`.`・`-`だけ（括弧つきのIPv6は使わない）。
+/// 製品のURLは定数で検査のURLはloopbackなので、ネットから来る文字列には使わない。
 pub fn parse_url(url: &str) -> Option<Endpoint> {
     let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
@@ -479,20 +490,21 @@ pub fn parse_url(url: &str) -> Option<Endpoint> {
     })
 }
 
-/// 目録の URL。`server` は `UPDATE_SERVER` の形（末尾の `/` は付けても付けなくてもよい）。
+/// 目録のURL。`server`は`UPDATE_SERVER`の形（末尾の`/`は付けても付けなくてもよい）。
 pub fn manifest_url(server: &str) -> String {
     format!("{}{MANIFEST_PATH}", server.trim_end_matches('/'))
 }
 
-/// ファイルの URL。置き換えてよい名前以外は None（呼ぶ側が名前の検査を忘れても、URL の段階で止める）。
+/// ファイルのURL。置き換えてよい名前以外はNone（呼ぶ側が名前の検査を忘れてもURLの段階で止める）。
 pub fn file_url(server: &str, name: &str) -> Option<String> {
     is_allowed_name(name).then(|| format!("{}{FILES_PATH}{name}", server.trim_end_matches('/')))
 }
 
-// ---- 設定（HiganRTool.ini の [loader] update_check）----
+// ---- 設定（HiganRTool.iniの[loader] update_check）----
 
-/// ini の `[loader]` の `update_check`。`0` でチェックしない、`1` か無記入でチェックする。それ以外の値・読めない ini は `Err` で、
-/// 呼ぶ側はチェックする側に倒す（書き損じで更新が黙って止まらないように）。ini が無ければチェックする。
+/// iniの`[loader]`の`update_check`。`0`でチェックしない。`1`か無記入でチェックする。
+/// それ以外の値・読めないiniは`Err`になる。呼ぶ側はチェックする側に倒す（書き損じで更新が黙って止まらないように）。
+/// iniが無ければチェックする。
 pub fn update_check_enabled(ini_text: Option<&str>) -> Result<bool, String> {
     let Some(text) = ini_text else {
         return Ok(true);
@@ -507,7 +519,7 @@ pub fn update_check_enabled(ini_text: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// 検査用の鍵（公開の種）。署名を作る側の部品で、cargo の機能 `test_key` を開けた検査と core 自身の検査でだけ入る。
+/// 検査用の鍵（公開の種）。署名を作る側の部品。cargoの機能`test_key`を有効にした検査とcore自身の検査でだけ含まれる。
 #[cfg(any(test, feature = "test_key"))]
 pub mod test_key {
     use super::*;
@@ -529,7 +541,7 @@ pub mod test_key {
         sign_with(&SEED, body)
     }
 
-    /// 合成の本文（バージョン `version`、exe と dll と README.txt）。ファイルの中身は `file_bytes` で作る。
+    /// 合成の本文（バージョン`version`、exeとdllとREADME.txt）。ファイルの中身は`file_bytes`で作る。
     pub fn sample_body(version: u32) -> String {
         let mut s = format!("{MANIFEST_MAGIC}\nversion {version}\ndisplay 20261008-abcdef0\n");
         for name in ["HiganRTool.exe", "HiganRTool.dll", "README.txt"] {
@@ -732,7 +744,7 @@ mod tests {
                 verify_and_parse(signed.as_bytes(), &key())
             );
         }
-        // 比べ用: 上の head ＋ exe ＋ dll は通る（誤りの印が別の所から来ていない）。
+        // 比べ用: 上のhead ＋ exe ＋ dllは通る（誤りの印が別の所から来ていない）。
         assert!(verify_and_parse(sign(&format!("{head}{exe}{dll}")).as_bytes(), &key()).is_ok());
     }
 
@@ -749,7 +761,7 @@ mod tests {
         };
         for ok in NAME_RULE_ACCEPT {
             assert!(is_allowed_name(ok), "{ok:?}");
-            // 配る表に無い名前（NOTICE.txt など）も、署名つきの目録なら受ける。
+            // 配布する表に無い名前（NOTICE.txtなど）も署名つきの目録なら受ける。
             let m = manifest_with(ok);
             if ok == "HiganRTool.exe" || ok == "HiganRTool.dll" {
                 assert!(m.is_err(), "{ok}: 同じ名前が 2 回あるのに通した");
@@ -774,7 +786,7 @@ mod tests {
         );
     }
 
-    /// サーバー（`src/server/test/update.test.ts` の `ACCEPT` / `REJECT`）と同じ表。`tools/make_dist.py` が 2 つの一致を見る。
+    /// サーバー（`src/server/test/update.test.ts`の`ACCEPT` / `REJECT`）と同じ表。`tools/make_dist.py`が2つの一致を見る。
     const NAME_RULE_ACCEPT: [&str; 18] = [
         "HiganRTool.exe",
         "HiganRTool.dll",

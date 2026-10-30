@@ -1,12 +1,18 @@
-//! 台本のマッチの状態の操作（無敵・ライフ・ゲージ）を、入力の地点（`script_win::tick_inner` の終わり。Player の更新 —— 優先度 15・16 —— より前）でゲームのメモリへ書く判断（pure。unsafe 無し）。「いつ効くか」は `higanr_core::script::Engine`（`inv` / `take_pending`）が決める。
+//! 台本のマッチの状態の操作（無敵・ライフ・ゲージ）をゲームのメモリへ書く判断（pure。unsafe無し）。
+//! 書く地点は入力の地点（`script_win::tick_inner`の終わり。Playerの更新 —— 優先度15・16 —— より前）。
+//! 「いつ効くか」は`higanr_core::script::Engine`（`inv` / `take_pending`）が決める。
 //!
-//! - 無敵の側の Player に `+0x1B78 = 2.0f` と `+0x1B7C = 2` の両方を書く（int だけでは毎 tick float から作り直される）。1 回だけの値（ライフ・ゲージ）は、書ける側だけ書いて取り出す。書けない側は `Engine` が次の tick へ持ち越す。
-//! - 書けるのは、Player へのポインタが 0 でなく読み込み中でない tick だけ（読み込みのスレッドが Player を作り直している間に書かない）。書く前に Player の署名（ライフ `+0xA8` が 0〜`LIFE_MAX`、ゲージ `+0x30388` が 0〜`GAUGE_MAX` の有限の float）を見て、合わなければ何も書かず記録する（解放された Player や、読み違えたアドレスを書き換えないため）。
-//! - 台本が終わった・止まったら書かない（無敵は値が 2 なので次の tick の減算で自然に切れる）。ネットワーク（lockstep）の実行と、巻き戻しの実験の実行では書かずに断る（`Refuse`）。一度断ったら、その実行の間は断り続ける（ネットワークが途中で止まっても書き始めない）。
+//! - 無敵の側のPlayerに`+0x1B78 = 2.0f`と`+0x1B7C = 2`の両方を書く（intだけでは毎tick floatから作り直される）。
+//!   1回だけの値（ライフ・ゲージ）は書き込み可能な側にだけ書いて取り出す。書き込めない側は`Engine`が次のtickへ持ち越す。
+//! - 書くのはPlayerへのポインタが0でなく、読み込み中でもないtickだけ（読み込みのスレッドがPlayerを作り直している間は書かない）。
+//!   書く前にPlayerの署名（ライフ`+0xA8`が0〜`LIFE_MAX`・ゲージ`+0x30388`が0〜`GAUGE_MAX`の有限のfloat）を見る。合わなければ何も書かずに記録する（解放されたPlayerや読み違えたアドレスを書き換えないため）。
+//! - 台本が終わった・止まったら書かない（無敵は値が2なので次のtickの減算で自然に切れる）。ネットワーク（lockstep）の実行と巻き戻しの実験の実行では書かずに断る（`Refuse`）。一度断ったらその実行の間は断り続ける（ネットワークが途中で止まっても書き始めない）。
 //!
-//! ゲームのメモリは `StateMem` の向こうへ分ける（本物は `script_win::RealTickIo`。Player はヒープなので、自分のプロセスへの `ReadProcessMemory` / `WriteProcessMemory` で落ちない読み書きをする）。ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を使わない。記録は決まった大きさの原子変数の表（`StateLog`）に書き、読み取りのスレッドが文にする（`StateLog::text`）。
-//! 遅延の増分: 台本が状態の操作を使わない tick は `Engine` の値を 2 つ見るだけ。使う tick は `ReadProcessMemory` 最大 6 回（側ごとにポインタ・ライフ・ゲージ）・`WriteProcessMemory` 最大 8 回（数 µs〜十数 µs の見込み。測っていない）。検査のツールなので、製品の実行（台本なし）は 0。
-//! 仕組みは thprac の花映塚対応の無敵（被弾処理の呼び出しを飛ばす書き換え）を参考に、値の書き込みに変えた（コードはコピーしていない）。
+//! ゲームのメモリは`StateMem`を通して読み書きする（本物は`script_win::RealTickIo`）。Playerはヒープなので、自分のプロセスへの`ReadProcessMemory` / `WriteProcessMemory`を使い、例外を出さずに読み書きする。
+//! ゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap`を使わない。
+//! 記録は決まった大きさのアトミック変数の表（`StateLog`）に書き、読み取りのスレッドが文にする（`StateLog::text`）。
+//! 遅延の増分: 台本が状態の操作を使わないtickは`Engine`の値を2つ見るだけ。使うtickは`ReadProcessMemory`最大6回（側ごとにポインタ・ライフ・ゲージ）・`WriteProcessMemory`最大8回（数µs〜十数µsの見込み。測っていない）。検査のツールなので製品の実行（台本なし）は0。
+//! 仕組みはthpracの花映塚対応の無敵（被弾処理の呼び出しを飛ばす書き換え）を参考に値の書き込みに変えた（コードはコピーしていない）。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -18,7 +24,7 @@ use crate::th09_addr::{
     PLAYER_INV_TIMER_F, PLAYER_INV_TIMER_I, PLAYER_LIFE,
 };
 
-// 台本が受け付ける範囲（core）と、ゲームの範囲（th09_addr）が食い違えば建たない（core は花映塚のアドレスを知らないので同じ数を持つ）。
+// 台本が受け付ける範囲（core）とゲームの範囲（th09_addr）が食い違えばビルドが通らない（coreは花映塚のアドレスを知らないので同じ数を持つ）。
 const _: () = assert!(
     LIFE_SET_MIN == LIFE_MIN as u32
         && LIFE_SET_MAX == LIFE_MAX as u32
@@ -27,22 +33,23 @@ const _: () = assert!(
 
 pub const PLAYER_SLOTS: [u32; 2] = [P1_PLAYER_PTR, P2_PLAYER_PTR];
 
-/// ゲームのメモリの読み書き（本物は `script_win::RealTickIo`、検査では偽物）。どれも確保しない・パニックしない。
+/// ゲームのメモリの読み書き（本物は`script_win::RealTickIo`。検査では偽物）。どれも確保しない・パニックしない。
 pub trait StateMem {
-    /// 読み込み中か（`[0x4A7EB4]` が 0 でない）。
+    /// 読み込み中かどうか（`[0x4A7EB4]`が0でない）。
     fn loading(&mut self) -> bool;
-    /// 落ちない読み方で 4 バイト。読めなければ `None`。
+    /// 例外を出さない読み方で4バイト読む。読めなければ`None`。
     fn read_u32(&mut self, addr: u32) -> Option<u32>;
-    /// 落ちない書き方で 4 バイト（リトルエンディアン）。書けなければ false。
+    /// 例外を出さない書き方で4バイト書く（リトルエンディアン）。書けなければfalse。
     fn write_u32(&mut self, addr: u32, v: u32) -> bool;
 }
 
-/// 書かずに断る実行（`apply` の `refuse`。値は記録の語にそのまま入れる）。
+/// 書かずに断る実行（`apply`の`refuse`。値は記録のワードにそのまま書き込む）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refuse {
-    /// ネットワーク（lockstep）が動いている（書くのは自分のゲームのメモリだけなので、本物 2 台では片方だけの状態が変わり、次の CHECK で列がずれる。peer_sim が相手のネットワークの実行も断る）。
+    /// ネットワーク（lockstep）が動いている。書くのは自分のゲームのメモリだけなので、本物2台では片方だけの状態が変わって次のCHECKで列がずれる。
+    /// peer_simが相手のネットワークの実行も断る。
     Net = 1,
-    /// 巻き戻しの実験が入っている（期間の中で書いた 1 回だけの値は、進め直し（台本を進めない）で書き直されず、偽の食い違いになる）。
+    /// 巻き戻しの実験が有効（期間の中で書いた1回だけの値は、進め直し（台本を進めない）で書き直されず偽の食い違いになる）。
     Rollback = 2,
 }
 
@@ -61,44 +68,45 @@ impl Refuse {
 /// 記録の件数の上限（それより先は数えるだけ）。
 pub const LOG_EVENTS: usize = 64;
 
-// 記録の種類（`StateLog` の語 1 の下位 8 ビット）。
+// 記録の種類（`StateLog`のワード1の下位8ビット）。
 const EV_INV: u32 = 1;
 const EV_INV_WRITTEN: u32 = 2;
 const EV_LIFE: u32 = 3;
 const EV_GAUGE: u32 = 4;
 const EV_DROP_LIFE: u32 = 5;
 const EV_DROP_GAUGE: u32 = 6;
-/// 断った（値は `Refuse` の番号）。その実行で 1 回だけ記録する。
+/// 断った（値は`Refuse`の番号）。その実行で1回だけ記録する。
 const EV_REFUSED: u32 = 7;
-/// 断ったので捨てた 1 回だけの値。
+/// 断ったので捨てた1回だけの値。
 const EV_REFUSED_LIFE: u32 = 8;
 const EV_REFUSED_GAUGE: u32 = 9;
-/// 署名が合わなかった（側ごとに最初の 1 回だけ記録する）。値はライフの語か、ゲージの float のビット、読めなかったアドレス。
+/// 署名が合わなかった（側ごとに最初の1回だけ記録する）。値はライフのワード・ゲージのfloatのビット・読めなかったアドレスのどれか。
 const EV_SIG_LIFE: u32 = 10;
 const EV_SIG_GAUGE: u32 = 11;
 const EV_SIG_READ: u32 = 12;
 
-/// 書いた記録（ゲームのスレッドだけが書き、読み取りのスレッドが `text` で読む）。1 件は 3 語（tick の番号・種類 |
-/// 側 << 8 | 書けた << 16・値）。書き手は件数を Release で進め、読み手は Acquire で読んでから中身を読む。
+/// 書いた記録（ゲームのスレッドだけが書き、読み取りのスレッドが`text`で読む）。
+/// 1件は3ワード（tickの番号・種類 | 側 << 8 | 書けた << 16・値）。
+/// 書き手は件数をReleaseで進める。読み手はAcquireで読んでから中身を読む。
 pub struct StateLog {
     events: [[AtomicU32; 3]; LOG_EVENTS],
     n: AtomicU32,
     last_inv: AtomicU32,
-    /// 無敵が入ってから、まだ 1 回も書けていない側のビット（最初に書けた tick を記録する）。
+    /// 無敵が有効になってからまだ1回も書けていない側のビット（最初に書けたtickを記録する）。
     inv_first: AtomicU32,
-    /// 側ごと: 無敵を書いた tick / Player が無い・読み込み中で書かなかった tick / 書き込みに失敗した tick /
-    /// 1 回だけの値を持ち越した tick。
+    /// 側ごと: 無敵を書いたtick / Playerが無い・読み込み中で書かなかったtick / 書き込みに失敗したtick /
+    /// 1回だけの値を持ち越したtick。
     inv_written: [AtomicU32; 2],
     inv_skipped: [AtomicU32; 2],
     inv_failed: [AtomicU32; 2],
     carried: [AtomicU32; 2],
     sig_bad: [AtomicU32; 2],
-    /// 署名が合わなかったことを記録した側のビット（側ごとに最初の 1 回だけ記録する）。
+    /// 署名が合わなかったことを記録した側のビット（側ごとに最初の1回だけ記録する）。
     sig_logged: AtomicU32,
-    /// 断った理由（`Refuse` の番号。0 = 断っていない）。一度立てたら `reset` まで戻さない。
+    /// 断った理由（`Refuse`の番号。0 = 断っていない）。一度立てたら`reset`まで戻さない。
     refused: AtomicU32,
     refused_logged: AtomicU32,
-    /// 状態の操作を使う段階が来たのに、断って書かなかった tick。
+    /// 状態の操作を使う段階が来たのに断って書かなかったtick。
     refused_ticks: AtomicU32,
 }
 
@@ -176,7 +184,7 @@ impl StateLog {
         self.n.load(Ordering::Acquire)
     }
 
-    /// 記録 `i` 件目（tick, 種類, 側, 書けた, 値）。検査と `text` が使う。
+    /// 記録`i`件目（tick, 種類, 側, 書けた, 値）。検査と`text`が使う。
     fn event(&self, i: usize) -> Option<(u32, u32, usize, bool, u32)> {
         let e = self.events.get(i)?;
         let w1 = e[1].load(Ordering::Relaxed);
@@ -189,7 +197,7 @@ impl StateLog {
         ))
     }
 
-    /// ログの文（読み取りのスレッド）。何も起きていなければ 1 行。
+    /// ログの文（読み取りのスレッド）。何も起きていなければ1行。
     pub fn text(&self) -> String {
         let n = self.count();
         let side = |s: usize| if s == 0 { "1P" } else { "2P" };
@@ -325,8 +333,8 @@ fn drop_pending(engine: &mut Engine, log: &StateLog, k: u32, life_kind: u32, gau
     }
 }
 
-/// Player `p` の署名（ライフ・ゲージがゲームの取りうる範囲の中か）。合わなければ、側ごとに最初の 1 回だけ記録して false。
-/// ゲージの範囲 0〜400 の根拠: 溜める関数の頭打ち 400.0 と、ゲームが書く定数 0 / 100.0（`0x0041CABF` `0x0041E522` `0x0041EF72`）/ 1.0（減らす関数 `0x0041F310` の下限 `0x0041F32B`）。外れても「書かない」側に倒れるだけ。
+/// Player `p`の署名（ライフ・ゲージがゲームの取りうる範囲の中かどうか）。合わなければ側ごとに最初の1回だけ記録してfalse。
+/// ゲージの範囲0〜400の根拠: 溜める関数の頭打ち400.0と、ゲームが書く定数0 / 100.0（`0x0041CABF` `0x0041E522` `0x0041EF72`）/ 1.0（減らす関数`0x0041F310`の下限`0x0041F32B`）。外れても「書かない」側に倒れるだけ。
 fn player_signature_ok(
     mem: &mut dyn StateMem,
     p: u32,
@@ -339,9 +347,9 @@ fn player_signature_ok(
     let bad = match (mem.read_u32(life_at), mem.read_u32(gauge_at)) {
         (None, _) => Some((EV_SIG_READ, life_at)),
         (_, None) => Some((EV_SIG_READ, gauge_at)),
-        // ライフは 0〜10（0 は負けた後。書く値の範囲 `LIFE_MIN`〜 とは別に、読む側は 0 を許す）。
+        // ライフは0〜10（0は負けた後）。書く値の範囲`LIFE_MIN`〜 とは別に、読む側は0を許す。
         (Some(life), _) if life > u32::from(LIFE_MAX) => Some((EV_SIG_LIFE, life)),
-        // ゲージは有限の 0〜400（NaN は範囲の比べで外れる）。
+        // ゲージは有限の0〜400（NaNは範囲の比較で外れる）。
         (_, Some(g)) if !(0.0..=GAUGE_MAX as f32).contains(&f32::from_bits(g)) => {
             Some((EV_SIG_GAUGE, g))
         }
@@ -360,8 +368,10 @@ fn player_signature_ok(
     false
 }
 
-/// 1 tick ぶん（入力の地点で、台本を進めた後に毎 tick 呼ぶ）。`slots` は Player へのポインタの欄（1P, 2P）、
-/// `k` は入口の tick の番号（記録に残す）、`refuse` はこの tick に断る理由（ネットワーク・巻き戻しの実験が動いていれば `Some`）。
+/// 1 tickぶん（入力の地点で台本を進めた後に毎tick呼ぶ）。
+/// `slots`はPlayerへのポインタのフィールド（1P, 2P）。
+/// `k`は入口のtickの番号（記録に残す）。
+/// `refuse`はこのtickに断る理由（ネットワーク・巻き戻しの実験が動いていれば`Some`）。
 pub fn apply(
     engine: &mut Engine,
     mem: &mut dyn StateMem,
@@ -370,7 +380,7 @@ pub fn apply(
     log: &StateLog,
     refuse: Option<Refuse>,
 ) {
-    // 断る理由は、状態の操作を使う段階が来る前でも覚える（ネットワークが途中で止まっても、その実行では書き始めない）。
+    // 断る理由は状態の操作を使う段階が来る前でも覚えておく（ネットワークが途中で止まってもその実行では書き始めない）。
     if let Some(r) = refuse {
         let _ = log
             .refused
@@ -397,7 +407,7 @@ pub fn apply(
     }
     let refused = log.refused.load(Ordering::Relaxed);
     if refused != 0 {
-        // 断る実行: ゲームのメモリは読みも書きもしない。1 回だけの値は、この実行では書けないので捨てる。
+        // 断る実行: ゲームのメモリは読みも書きもしない。1回だけの値はこの実行では書けないので捨てる。
         if log.refused_logged.swap(1, Ordering::Relaxed) == 0 {
             log.push(k, EV_REFUSED, 0, false, refused);
         }
@@ -405,7 +415,7 @@ pub fn apply(
         drop_pending(engine, log, k, EV_REFUSED_LIFE, EV_REFUSED_GAUGE);
         return;
     }
-    // 書ける側の Player（読み込み中なら、どちらも書かない。要らない側は読まない）。署名が合わない側も書かない。
+    // 書き込み可能な側のPlayer（読み込み中ならどちらも書かない。要らない側は読まない）。署名が合わない側も書かない。
     let loading = mem.loading();
     let mut players = [None; 2];
     let mut sig_bad = [false; 2];
@@ -434,7 +444,7 @@ pub fn apply(
             }
             continue;
         };
-        // float と int の両方（int だけでは毎 tick の減算 `0x0042F490` が float から作り直す）。
+        // floatとintの両方（intだけでは毎tickの減算`0x0042F490`がfloatから作り直す）。
         let f = mem.write_u32(
             p.wrapping_add(PLAYER_INV_TIMER_F),
             (INV_TIMER_VALUE as f32).to_bits(),
@@ -464,12 +474,12 @@ pub fn apply(
             continue;
         };
         if let Some(v) = s.life[side] {
-            // ライフは 4 バイトの int。
+            // ライフは4バイトのint。
             let ok = mem.write_u32(p.wrapping_add(PLAYER_LIFE), u32::from(v));
             log.push(k, EV_LIFE, side, ok, u32::from(v));
         }
         if let Some(v) = s.gauge[side] {
-            // ゲージは 4 バイトの float。
+            // ゲージは4バイトのfloat。
             let ok = mem.write_u32(p.wrapping_add(PLAYER_GAUGE), f32::from(v).to_bits());
             log.push(k, EV_GAUGE, side, ok, u32::from(v));
         }
@@ -486,7 +496,7 @@ pub(crate) mod tests {
     const P1: u32 = 0x0200_0000;
     const P2: u32 = 0x0300_0000;
 
-    /// 偽のゲームのメモリ: 読めるアドレスの値と、書いた順（アドレス, 値）。`fail_writes` なら書き込みを失敗させる。
+    /// 偽のゲームのメモリ: 読み取り可能なアドレスの値と書いた順（アドレス, 値）。`fail_writes`なら書き込みを失敗させる。
     #[derive(Default)]
     struct FakeMem {
         loading: bool,
@@ -497,8 +507,8 @@ pub(crate) mod tests {
     }
 
     impl FakeMem {
-        /// ポインタの欄に `p1` / `p2` を入れ、偽の Player `P1` / `P2` の署名の欄には範囲の中の値（席ごとに違う値。
-        /// 境目の 0 と 400.0 も入れる）を入れる。
+        /// ポインタのフィールドに`p1` / `p2`を書き込む。
+        /// 偽のPlayer `P1` / `P2`の署名のフィールドには範囲の中の値を書き込む（サイドごとに違う値。境目の0と400.0も書き込む）。
         fn with_players(p1: u32, p2: u32) -> Self {
             let mut m = FakeMem::default();
             m.mem.insert(SLOTS[0], p1);

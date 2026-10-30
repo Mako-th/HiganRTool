@@ -14,6 +14,7 @@ import {
   parseClientId,
   parseClientMessage,
   roomNameFromPath,
+  spectateRoomName,
 } from "../src/rules";
 
 describe("cid（起動ごとの乱数）", () => {
@@ -45,7 +46,7 @@ describe("部屋名", () => {
     expect(normalizeRoomName(four)).toBe(four);
     expect(normalizeRoomName(`${four}a`)).toBeNull();
     expect(normalizeRoomName(` ${"y".repeat(ROOM_NAME_MAX)} `)).toBe("y".repeat(ROOM_NAME_MAX));
-    // 揃える前の 128 B は、揃えると縮む名にも当てる（「ｶﾞ」22 個 = 132 B → 揃えると 22 文字）。
+    // 揃える前の128 Bは揃えると縮む名にも当てる（「ｶﾞ」22個 = 132 B → 揃えると22文字）。
     expect(normalizeRoomName("ｶﾞ".repeat(21))).toBe("ガ".repeat(21)); // 126 B
     expect(normalizeRoomName("ｶﾞ".repeat(22))).toBeNull(); // 132 B
     expect(normalizeRoomName("㍿".repeat(8))).toBe("株式会社".repeat(8));
@@ -57,7 +58,7 @@ describe("部屋名", () => {
     for (const bad of ["", " ", "　", "﻿", "a\u0000b", "a\u007Fb", "a\u0085b", "a/b", ".", "..", "a\uD800b"]) {
       expect(normalizeRoomName(bad), JSON.stringify(bad)).toBeNull();
     }
-    // 隣: 同じ文字でも名の一部なら通る（`.` `..` は名そのものだけを断る。`／` は揃えると `/` になるがパスを割らないので通す）。
+    // 隣: 同じ文字でも名の一部なら通る（`.` `..`は名そのものだけを断る。`／`は揃えると`/`になるがパスを割らないので通す）。
     for (const good of ["...", ".a", "a.", "a..b", "Ａ／Ｂ"]) {
       expect(normalizeRoomName(good), JSON.stringify(good)).not.toBeNull();
     }
@@ -68,7 +69,7 @@ describe("部屋名", () => {
     expect(decodeRoomName("%e8%8a%b1")).toBe("花");
     expect(decodeRoomName("a+b")).toBe("a+b");
     expect(decodeRoomName("a%20b")).toBe("a b");
-    expect(decodeRoomName("a%2Fb")).toBe("a/b"); // 戻した後の normalizeRoomName が断る
+    expect(decodeRoomName("a%2Fb")).toBe("a/b"); // 戻した後のnormalizeRoomNameが断る
     for (const bad of ["%", "%4", "%ZZ", "a%2", "%E8%8A", "%ED%A0%80", "%C0%AF", "%FF", "%80"]) {
       expect(decodeRoomName(bad), bad).toBeNull();
     }
@@ -140,7 +141,7 @@ describe("文の形", () => {
       '"offer"',
       JSON.stringify({ code }),
       JSON.stringify({ t: "join", code }),
-      JSON.stringify({ t: "ping" }), // ping は自動応答の完全一致だけ。Room へ届いたら誤り
+      JSON.stringify({ t: "ping" }), // pingは自動応答の完全一致だけ。Roomへ届いたら誤り
       JSON.stringify({ t: "offer" }),
       JSON.stringify({ t: "offer", code: 123 }),
       JSON.stringify({ t: "offer", code: null }),
@@ -170,5 +171,37 @@ describe("観戦の断り（refuse）の決まり", () => {
     for (const p of [`/v0/rooms/q.${hex}`, "/v0/rooms/room", "/v0/rooms/w", "/v0/rooms/xw.abc", `/v0/rooms/a/w.${hex}`, "/v0/rooms/%ZZw.abc", "/v0/rooms/%2Fw.abc"]) {
       expect(isWatchRoomPath(p), p).toBe(false);
     }
+  });
+});
+
+/**
+ * 元のルーム名 → 観戦用のルーム名。クライアントの`RoomName::spectate_of`（前後の空白を除き、ASCIIの大文字だけ小文字にしたバイトの
+  * SHA-256の先頭8 B）と同じ値。Pythonのhashlibで同じ手順を書いて作った（クライアントの検査にも同じペアを入れる）。
+ */
+const SPECTATE_VECTORS: readonly (readonly [string, string])[] = [
+  ["room-1", "w.2cb5ddf410150fdf"],
+  ["Room-1", "w.2cb5ddf410150fdf"],
+  [" ROOM-1 ", "w.2cb5ddf410150fdf"],
+  ["　room-1　", "w.2cb5ddf410150fdf"],
+  ["a", "w.ca978112ca1bbdca"],
+  ["x".repeat(32), "w.c62e4615bd39e222"],
+  ["Room_1@x", "w.6bc0e6b40c1d8ded"],
+  ["部屋", "w.02c744ed8d58cb9b"],
+  ["ＡＢＣ", "w.7410406bec06a980"],
+  ["ÀBC", "w.92f7b3d5b44982b8"],
+  ["àbc", "w.4953a7a5767a8ba3"],
+  ["あいう Abc", "w.a1161492e1eb850f"],
+];
+
+describe("観戦用の名の導き方（クライアントの spectate_of とバイト単位で同じ）", () => {
+  it("テストベクトルと全部一致する（大文字・前後の空白・日本語・全角を含む）", async () => {
+    for (const [origin, want] of SPECTATE_VECTORS) {
+      expect(await spectateRoomName(origin), JSON.stringify(origin)).toBe(want);
+    }
+  });
+
+  it("ASCII の大文字だけを小文字にする: 全角は NFKC しない・À は Unicode の小文字化をしない（À と à は別の名）", async () => {
+    expect(await spectateRoomName("ÀBC")).not.toBe(await spectateRoomName("àbc"));
+    expect(await spectateRoomName("ＡＢＣ")).not.toBe(await spectateRoomName("abc"));
   });
 });

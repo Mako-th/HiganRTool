@@ -1,17 +1,17 @@
-//! 接続した知らせの音を、その場で合成して WAV のバイト列にする。
+//! 接続した知らせの音をその場で合成してWAVのバイト列にする。
 //!
-//! 基音と倍音の正弦波を足し、高い倍音ほど早く減衰させた鐘の音を、2 音（ミ → シ）少しずらして重ねる。
+//! 基音と倍音の正弦波を足し、高い倍音ほど早く減衰させた鐘の音を2音（ミ → シ）少しずらして重ねる。
 //! 確保するのでゲームのスレッドでは呼ばない。
 
 use std::f64::consts::TAU;
 
-/// 標本化の周波数（Hz）。5 kHz より上は使わないので 22,050 で足りる。
+/// サンプリング周波数（Hz）。5 kHzより上は使わないので22,050で足りる。
 pub const RATE: u32 = 22_050;
 pub const SECONDS: f64 = 0.9;
-/// いちばん大きい標本（16 ビットの満量のうち約 −6 dBFS）。
+/// いちばん大きいサンプル（16ビットの満量のうち約 −6 dBFS）。
 pub const PEAK: i16 = 16_000;
 
-/// 1 音: 始まる時刻（秒）と基音（Hz）。
+/// 1音: 始まる時刻（秒）と基音（Hz）。
 const NOTES: [(f64, f64); 2] = [
     (0.0, 659.255),  // ミ（E5）
     (0.14, 987.767), // シ（B5）
@@ -68,12 +68,12 @@ pub fn wav(rate: u32, samples: &[i16]) -> Vec<u8> {
     b.extend_from_slice(&(36 + data_len).to_le_bytes());
     b.extend_from_slice(b"WAVE");
     b.extend_from_slice(b"fmt ");
-    b.extend_from_slice(&16u32.to_le_bytes()); // fmt の塊の長さ
+    b.extend_from_slice(&16u32.to_le_bytes()); // fmtのチャンクの長さ
     b.extend_from_slice(&1u16.to_le_bytes()); // PCM
     b.extend_from_slice(&1u16.to_le_bytes()); // チャンネル数
     b.extend_from_slice(&rate.to_le_bytes());
-    b.extend_from_slice(&(rate * 2).to_le_bytes()); // 1 秒のバイト数
-    b.extend_from_slice(&2u16.to_le_bytes()); // 1 標本のバイト数
+    b.extend_from_slice(&(rate * 2).to_le_bytes()); // 1秒のバイト数
+    b.extend_from_slice(&2u16.to_le_bytes()); // 1サンプルのバイト数
     b.extend_from_slice(&16u16.to_le_bytes()); // ビット数
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data_len.to_le_bytes());
@@ -98,7 +98,7 @@ mod tests {
         u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
     }
 
-    /// `f` Hz の成分の強さ（Goertzel）。
+    /// `f` Hzの成分の強さ（Goertzel）。
     fn power_at(s: &[i16], from: usize, to: usize, f: f64) -> f64 {
         let w = TAU * f / f64::from(RATE);
         let c = 2.0 * w.cos();

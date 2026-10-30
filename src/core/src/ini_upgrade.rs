@@ -1,11 +1,12 @@
-//! 配る ini の雛形を土台に、今の ini の値を移して新しい形の ini を作る（pure。ファイルは触らない）。更新で増えたキーや説明を、利用者が変えた値を残したまま古い ini に入れるためのもの。
+//! 配布用のiniの雛形を土台に今のiniの値を移して新しい形のiniを作る（pure。ファイルは触らない）。
+//! 更新で増えたキーや説明を、利用者が変えた値を残したまま古いiniに追加するためのもの。
 //!
-//! - 今の ini で行として書かれているキー（節とキーは `ini` と同じ扱い。大文字・小文字を区別しない）は、雛形の同じキーの行に今の値で入れる。雛形で注になっている行（`; key = v`）は、注を外してから入れる。
-//! - 雛形に無いキーは、その節の最後のキーの行の後ろへ残す（節も無ければ末尾に節ごと）。値は消さない。雛形の `; [window]` のように見出しごと注の節は、今の ini にその節のキーがあれば見出しの注を外す。
-//! - 注は雛形のものになる（今の ini にあった注は残らない）。改行は雛形に合わせる。値の中身は見ない。
-//! - 値が、知っている古い配る ini（`OLD_TEMPLATES`）の同じ節・キーの値と同じなら、利用者が変えていない既定値とみなして移さず新しい雛形の値にする（新しいバージョンで既定値を変えても、既存の利用者が古い既定値のままにならないように）。
-//!   比べるのは `ini` の読み手が返す形（前後の空白と行末の注を除く。大文字・小文字は区別する）で、古い雛形で注だった行は比べない。
-//! - 読めない行（`ini::parse_lenient` が捨てる行）があるときと、作った結果を読み直して値が合わないキーがあるときは、`Upgraded::is_safe` を偽にする。
+//! - 今のiniで行として書かれているキー（節とキーは`ini`と同じ扱い。大文字・小文字を区別しない）は、雛形の同じキーの行に今の値で書き込む。雛形で注になっている行（`; key = v`）は注を外してから書き込む。
+//! - 雛形に無いキーはその節の最後のキーの行の後ろへ残す（節も無ければ末尾に節ごと）。値は消さない。雛形の`; [window]`のようにヘッダごと注の節は、今のiniにその節のキーがあればヘッダの注を外す。
+//! - 注は雛形のものになる（今のiniにあった注は残らない）。改行は雛形に合わせる。値の中身は見ない。
+//! - 値が既知の古い配布用のini（`OLD_TEMPLATES`）の同じ節・キーの値と同じなら利用者が変えていない既定値とみなす。その値は移さず新しい雛形の値にする（新しいバージョンで既定値を変えても既存の利用者が古い既定値のままにならないように）。
+//!   比べるのは`ini`の読み手が返す形（前後の空白と行末の注を除く。大文字・小文字は区別する）。古い雛形で注だった行は比べない。
+//! - 読めない行（`ini::parse_lenient`が捨てる行）があるときと、作った結果を読み直して値が合わないキーがあるときは`Upgraded::is_safe`を偽にする。
 
 #![forbid(unsafe_code)]
 
@@ -13,17 +14,19 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::ini::{self, Ini, strip_comment};
 
-/// これまでに配ったバージョンの配る ini（値の比べ先）。配る zip を作るときに、そのバージョンの `scripts/dist/HiganRTool.ini` を
-/// `ini_templates/` へ足して、ここへ 1 行足す（足し忘れは `every_old_template_file_is_listed` が落とす）。
-pub const OLD_TEMPLATES: [&str; 4] = [
+/// これまでに配布したバージョンの配布用ini（値の比べ先）。
+/// 配布用のzipを作るときにそのバージョンの`scripts/dist/HiganRTool.ini`を`ini_templates/`へ足す。
+/// さらにここへ1行足す（足し忘れは`every_old_template_file_is_listed`が落とす）。
+pub const OLD_TEMPLATES: [&str; 5] = [
     include_str!("ini_templates/v1.0.0.ini"),
     include_str!("ini_templates/v1.1.0.ini"),
     include_str!("ini_templates/v1.1.1.ini"),
     include_str!("ini_templates/v1.2.0.ini"),
+    include_str!("ini_templates/v1.2.1.ini"),
 ];
 
-/// 名前を替えたキー: (節, 古いキー, 新しいキー, 値の読み替え)。表に無い値はそのまま移す（読めない値なら dll がその行を使わない）。
-/// 今の ini に新しいキーもあれば、新しいキーの値を使い、古いキーは移さない。
+/// 名前を替えたキー: (節, 古いキー, 新しいキー, 値の読み替え)。表に無い値はそのまま移す（読めない値ならdllがその行を使わない）。
+/// 今のiniに新しいキーもあれば新しいキーの値を使い、古いキーは移さない。
 pub type Renamed = (
     &'static str,
     &'static str,
@@ -38,7 +41,7 @@ pub const RENAMED: [Renamed; 1] = [(
     &[("b-hybrid", "passive"), ("b-spin", "active")],
 )];
 
-/// `entry` の古いキーを新しいキーと値に読み替える。名前を替えたキーでなければそのまま。
+/// `entry`の古いキーを新しいキーと値に読み替える。名前を替えたキーでなければそのまま。
 fn renamed(entry: (String, String, String)) -> (String, String, String) {
     let (section, key, value) = entry;
     match RENAMED
@@ -64,7 +67,7 @@ pub struct KeyRef {
 }
 
 impl KeyRef {
-    /// `[section] key`（名前の無い節は `key` だけ）。
+    /// `[section] key`（名前の無い節は`key`だけ）。
     pub fn shown(&self) -> String {
         if self.section.is_empty() {
             self.key.clone()
@@ -76,31 +79,31 @@ impl KeyRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upgraded {
-    /// 新しい ini の全文（BOM なし）。
+    /// 新しいiniの全文（BOMなし）。
     pub text: String,
-    /// 雛形のキーの行に値を移したもの（今の ini に書かれていた順）。
+    /// 雛形のキーの行に値を移したもの（今のiniに書かれていた順）。
     pub kept: Vec<KeyRef>,
     /// 雛形に無く、節の末尾などへ残したもの。
     pub carried: Vec<KeyRef>,
-    /// 値が古い配る ini の既定値のままだったので、移さず新しい雛形の値にしたもの。
+    /// 値が古い配布用iniの既定値のままだったので移さず新しい雛形の値にしたもの。
     pub defaulted: Vec<KeyRef>,
-    /// 今の ini の読めない行の番号（1 から）。
+    /// 今のiniの読めない行の番号（1から）。
     pub unreadable: Vec<usize>,
     /// 作った結果を読み直すと値が合わないキー。
     pub lost: Vec<KeyRef>,
 }
 
 impl Upgraded {
-    /// 今の ini を `text` に置き換えてよいか。
+    /// 今のiniを`text`に置き換えてよいかどうか。
     pub fn is_safe(&self) -> bool {
         self.unreadable.is_empty() && self.lost.is_empty()
     }
 }
 
 enum Kind {
-    /// 読める見出し。
+    /// 読めるヘッダ。
     Header,
-    /// 注になっている見出し（`; [window]`）。雛形に同じ名前の見出しが無いものだけ。
+    /// 注になっているヘッダ（`; [window]`）。雛形に同じ名前のヘッダが無いものだけ。
     CommentedHeader,
     Key(String),
     /// 注になっているキーの行（`; key = v`）。
@@ -111,7 +114,7 @@ enum Kind {
 struct Line {
     text: String,
     kind: Kind,
-    /// この行が属する節（見出しの行はその節）。注の見出しの下は、その名前の節に数える。
+    /// この行が属する節（ヘッダの行はその節）。注のヘッダの下はその名前の節に数える。
     section: String,
 }
 
@@ -171,7 +174,7 @@ fn classify(template: &str) -> Vec<Line> {
     out
 }
 
-/// `key = 値 ; 注` の値を `value` にする。キーの書き方と後ろの注は残す。
+/// `key = 値 ; 注`の値を`value`にする。キーの書き方と後ろの注は残す。
 fn with_value(line: &str, value: &str) -> String {
     let Some(eq) = line.find('=') else {
         return line.to_string();
@@ -215,7 +218,7 @@ fn find_line(lines: &[Line], section: &str, key: &str, commented: bool) -> Optio
     })
 }
 
-/// 節の最後のキーの行（なければ見出しの行）。名前の無い節は、最初の見出しより前の最後の空でない行。
+/// 節の最後のキーの行（なければヘッダの行）。名前の無い節は最初のヘッダより前の最後の空でない行。
 fn anchor(lines: &[Line], section: &str) -> Option<usize> {
     lines.iter().rposition(|l| {
         l.section == section
@@ -227,7 +230,7 @@ fn anchor(lines: &[Line], section: &str) -> Option<usize> {
     })
 }
 
-/// (節, キー, 値) を書かれた順に。名前の無い節が先頭。
+/// (節, キー, 値)を書かれた順に。名前の無い節が先頭。
 fn entries_of(ini: &Ini) -> Vec<(String, String, String)> {
     let mut entries = Vec::new();
     for section in std::iter::once("").chain(ini.sections().iter().map(String::as_str)) {
@@ -239,24 +242,24 @@ fn entries_of(ini: &Ini) -> Vec<(String, String, String)> {
     entries
 }
 
-/// 雛形の行 `key = 値 ; 注` の値（`ini` の読み手と同じ形）。
+/// 雛形の行`key = 値 ; 注`の値（`ini`の読み手と同じ形）。
 fn line_value(line: &str) -> &str {
     line.split_once('=')
         .map_or("", |(_, rest)| strip_comment(rest.trim()))
 }
 
-/// `template` の形に `user`（今の ini の全文）の値を移す。古い雛形との比べはしない。
+/// `template`の形に`user`（今のiniの全文）の値を移す。古い雛形との比べはしない。
 pub fn upgrade(template: &str, user: &str) -> Upgraded {
     upgrade_over(template, user, &[])
 }
 
-/// `upgrade` に、これまでに配ったバージョンの配る ini（`OLD_TEMPLATES`）との比べを足したもの。更新の本番はこちら。
+/// `upgrade`にこれまでに配布したバージョンの配布用ini（`OLD_TEMPLATES`）との比べを足したもの。更新の本番はこちら。
 pub fn upgrade_known(template: &str, user: &str) -> Upgraded {
     upgrade_over(template, user, &OLD_TEMPLATES)
 }
 
-/// `old_templates` のどれかの同じ節・キーの値と同じ値は、利用者が変えていない既定値として移さない。
-/// ただし新しい雛形の行の値も同じなら、移しても同じなので普通に移す（`kept`）。
+/// `old_templates`のどれかの同じ節・キーの値と同じ値は利用者が変えていない既定値として移さない。
+/// ただし新しい雛形の行の値も同じなら移しても同じなので普通に移す（`kept`）。
 pub fn upgrade_over(template: &str, user: &str, old_templates: &[&str]) -> Upgraded {
     let lenient = ini::parse_lenient(user);
     let old_defaults: HashSet<(String, String, String)> = old_templates
@@ -286,7 +289,7 @@ pub fn upgrade_over(template: &str, user: &str, old_templates: &[&str]) -> Upgra
         entries.push(entry);
     }
 
-    // 注の見出しの節に今の ini のキーがあれば、見出しの注を外す。
+    // 注のヘッダの節に今のiniのキーがあればヘッダの注を外す。
     for line in &mut lines {
         if matches!(line.kind, Kind::CommentedHeader) && entries.iter().any(|e| e.0 == line.section)
         {
@@ -423,7 +426,7 @@ lang = auto
         assert_eq!(got.get("netplay", "enable"), Some("0"));
         assert_eq!(got.get("netplay", "delay"), Some("4"));
         assert_eq!(got.get("ui", "lang"), Some("en"));
-        // 触っていないキーは雛形のまま、順序も説明も雛形のまま。
+        // 触っていないキーは雛形のまま。順序も説明も雛形のまま。
         assert_eq!(got.get("netplay", "upnp"), Some("on"));
         assert_eq!(got.get("pacing", "mode"), Some("auto"));
         assert_eq!(
@@ -453,7 +456,7 @@ lang = auto
         assert!(r.text.contains("\nmode = delay\n"), "{}", r.text);
         assert!(!r.text.contains("; room ="), "{}", r.text);
         assert!(!r.text.contains("; mode = rollback"), "{}", r.text);
-        // [pacing] の mode とは別。
+        // [pacing]のmodeとは別。
         assert!(r.text.contains("[pacing]\nmode = auto\n"), "{}", r.text);
         assert_eq!(r.kept, vec![who("netplay", "room"), who("netplay", "mode")]);
     }
@@ -511,7 +514,7 @@ lang = auto
         assert!(r.text.contains("\n; [window]\n"), "{}", r.text);
         assert!(!ini::parse(&r.text).unwrap().has_section("window"));
 
-        // 雛形に無いキーだけでも節を開き、その節の最後の行の後ろへ足す。
+        // 雛形に無いキーだけでも節を開く。その節の最後の行の後ろへ足す。
         let r = upgrade(T, "[window]\nfoo = 1\n");
         assert!(r.is_safe(), "{r:?}");
         assert!(
@@ -521,7 +524,7 @@ lang = auto
             r.text
         );
         assert_eq!(r.carried, vec![who("window", "foo")]);
-        // ほかの節のキーが、注の節の下へ入らない。
+        // ほかの節のキーが注の節の下へ入らない。
         let r = upgrade(T, "[window]\nwidth = 1\n[ui]\nextra = 2\n");
         let got = ini::parse(&r.text).unwrap();
         assert_eq!(got.get("ui", "extra"), Some("2"));
@@ -547,7 +550,7 @@ lang = auto
         }
     }
 
-    // 改行が雛形とそろわないと、古いメモ帳で 1 行に潰れる。
+    // 改行が雛形とそろわないと古いメモ帳で1行に潰れる。
     #[test]
     fn line_endings_follow_the_template() {
         let crlf = T.replace('\n', "\r\n");
@@ -558,7 +561,7 @@ lang = auto
             assert_eq!(r.text.matches(eol).count(), bare_lf, "{eol:?}");
             assert!(r.text.ends_with(eol));
         }
-        // 利用者の ini が CRLF でも LF でも、結果は雛形の改行。
+        // 利用者のiniがCRLFでもLFでも結果は雛形の改行。
         let r = upgrade(T, "[netplay]\r\nenable = 0\r\n");
         assert!(!r.text.contains('\r'), "{:?}", r.text);
     }
@@ -607,13 +610,13 @@ lang = auto
         let r = upgrade(T, "[netplay\nenable = 0\n[ui]\nlang = ja\n");
         assert_eq!(r.unreadable, vec![1, 2], "読めない見出しと、その下の行");
         assert!(!r.is_safe());
-        // 値は読めた分だけ移っている（呼ぶ側が書くかを決める）。
+        // 値は読めた分だけ移っている（書くかどうかは呼ぶ側が決める）。
         assert_eq!(ini::parse(&r.text).unwrap().get("ui", "lang"), Some("ja"));
     }
 
     #[test]
     fn a_result_that_does_not_read_back_is_not_safe() {
-        // 雛形の読めない見出しの下にキーがあると、書いても読まれない。
+        // 雛形の読めないヘッダの下にキーがあると書いても読まれない。
         let broken = "[a]\n[b\nk = 1\n";
         let r = upgrade(broken, "[a]\nk = 7\n");
         assert_eq!(r.lost, vec![who("a", "k")], "{r:?}");
@@ -635,7 +638,7 @@ lang = auto
             r.text,
             "[a]\nk = 9\nj = 2\n; m = y\nc = 6\nq = 7\n[b]\nz = 6\n; [w]\n; width = 2\n"
         );
-        // k と z は新しい値。m は新しい雛形で注なので注のまま。j は新旧とも 2 なので普通に移した扱い。
+        // kとzは新しい値。mは新しい雛形で注なので注のまま。jは新旧とも2なので普通に移した扱い。
         assert_eq!(
             r.defaulted,
             vec![who("a", "k"), who("a", "m"), who("b", "z")]
@@ -654,7 +657,7 @@ lang = auto
         assert_eq!(got.get("b", "z"), Some("50"));
         assert_eq!(got.get("a", "new"), Some("1"));
         assert!(r.defaulted.is_empty(), "{r:?}");
-        // 古い雛形に無い c は、新しい雛形の値 6 と違えば利用者の値。
+        // 古い雛形に無いcは新しい雛形の値6と違えば利用者の値。
         let r = over("[a]\nc = 5\n");
         assert_eq!(ini::parse(&r.text).unwrap().get("a", "c"), Some("5"));
         assert!(r.defaulted.is_empty(), "{r:?}");
@@ -711,13 +714,13 @@ lang = auto
             assert!(r.carried.is_empty(), "{r:?}");
             assert!(!r.kept.is_empty(), "{r:?}");
         }
-        // 新しいバージョンが既定値を変えたとして、v1.0.0 のままの値が新しい値になる。
+        // 新しいバージョンが既定値を変えたとする。v1.0.0のままの値は新しい値になる。
         let changed = dist.replace("\r\nupnp = on\r\n", "\r\nupnp = off\r\n");
         assert_ne!(changed, dist);
         let r = upgrade_known(&changed, v100);
         assert_eq!(r.text, changed);
         assert_eq!(r.defaulted, vec![who("netplay", "upnp")], "{r:?}");
-        // 利用者が変えた値は v1.0.0 から引き継いでも残る。
+        // 利用者が変えた値はv1.0.0から引き継いでも残る。
         let r = upgrade_known(&changed, &v100.replace("\nupnp = on\n", "\nupnp = yes\n"));
         assert_eq!(
             ini::parse(&r.text).unwrap().get("netplay", "upnp"),
@@ -726,7 +729,7 @@ lang = auto
         assert!(r.defaulted.is_empty(), "{r:?}");
     }
 
-    // 新しいキーも書いてあるときは、古いキーの値で上書きしない。読み替えた行は雛形の `wait` の行に入る。
+    // 新しいキーも書いてあるときは古いキーの値で上書きしない。読み替えた行は雛形の`wait`の行に入る。
     #[test]
     fn auto_window_is_carried_over_as_wait() {
         let dist = crate::ini_store::dist_ini_text();
@@ -790,7 +793,7 @@ lang = auto
             r.text
         );
         assert_eq!(r.carried, vec![who("", "top")]);
-        // 雛形の最初が見出しなら、見出しの前に入れて空行を挟む。
+        // 雛形の最初がヘッダならヘッダの前に追加して空行を挟む。
         let r = upgrade("[a]\nk = 1\n", "top = 1\n");
         assert_eq!(r.text, "top = 1\n\n[a]\nk = 1\n");
         assert!(r.is_safe());
@@ -811,10 +814,10 @@ lang = auto
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("HiganRTool.ini");
-        // ini が無ければ作らない。
+        // iniが無ければ作らない。
         assert!(ini_store::rewrite(&p, |_| Some("x".into())).is_err());
         assert!(!p.exists());
-        // Shift_JIS の ini は、値を読んで UTF-8 で書く。
+        // Shift_JISのiniは値を読んでUTF-8で書く。
         let sjis = encoding_rs::SHIFT_JIS
             .encode("[netplay]\nname = 花映塚\nenable = 0\n")
             .0
@@ -854,7 +857,7 @@ lang = auto
         assert!(!same.kept.is_empty());
         let empty = upgrade(&shipped, "");
         assert_eq!(empty.text, shipped);
-        // 利用者が全部の値を変えた ini を、配る ini の形に移しても全部残る。
+        // 利用者が全部の値を変えたiniを配布用iniの形に移しても全部残る。
         let mine = ini::parse_lenient(&shipped).ini;
         let mut user = String::new();
         for s in std::iter::once("").chain(mine.sections().iter().map(String::as_str)) {

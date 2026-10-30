@@ -1,8 +1,14 @@
-//! 起動直後のリフレッシュレートの計測（`0x42F1A0`）の BeginScene の呼びの差し替え。計測は Present が失敗すると Reset の戻り値を見ずに次の BeginScene へ進むので、フルスクリーンでデバイスが失われると system の d3d8.dll の中で NULL を読んで落ちる。
-//! 差し替えた入口は TestCooperativeLevel が D3D_OK でないとき BeginScene を呼ばずに計測の終わりの判定（`0x42F2A8`）へ抜け、サンプル不足の扱いはゲーム自身に任せる。アドレスと期待バイト列は `th09_addr.rs` の「起動の計測の守り」の節。
+//! 起動直後のリフレッシュレートの計測（`0x42F1A0`）がBeginSceneを呼ぶ箇所の差し替え。
+//! 計測はPresentが失敗するとResetの戻り値を見ずに次のBeginSceneへ進む。そのためフルスクリーンでデバイスが失われるとsystemのd3d8.dllの中でNULLを読んで落ちる。
+//! 差し替えた入口はTestCooperativeLevelがD3D_OKでないときBeginSceneを呼ばずに計測の終わりの判定（`0x42F2A8`）へ抜ける。
+//! サンプル不足の扱いはゲーム自身に任せる。
+//! アドレスと期待バイト列は`th09_addr.rs`の「起動の計測の守り」の節。
 //!
-//! **時期**: 書くのは DllMain の中（`win::on_process_attach`）。ローダーは `CREATE_SUSPENDED` で作ったゲームに `LoadLibraryW` を呼ばせてから主スレッドを走らせるので、計測まで誰もこの 14 バイトを実行していない。ini は読まない（ローダーロック）。
-//! 書く前に 14 バイトを実バイトで照合し、1 バイトでも違えば何も書かない。デバイスが正常なときの入口の仕事は vtable 2 回の読みと TestCooperativeLevel の 1 回だけで、計測の間（起動の約 1 秒）にしか走らない。
+//! **時期**: 書くのはDllMainの中（`win::on_process_attach`）。
+//! ローダーは`CREATE_SUSPENDED`で作ったゲームに`LoadLibraryW`を呼ばせてから主スレッドを走らせる。そのため計測まで誰もこの14バイトを実行していない。
+//! iniは読まない（ローダーロック）。
+//! 書く前に14バイトを実バイトで照合し、1バイトでも違えば何も書かない。
+//! デバイスが正常なときの入口の仕事はvtable 2回の読みとTestCooperativeLevelの1回だけ。計測の間（起動の約1秒）にしか走らない。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -22,18 +28,18 @@ use crate::th09_addr::{
     D3D8_TESTCOOP_SLOT,
 };
 
-/// デバイス（IDirect3DDevice8）の COM メソッドは stdcall で、引数は this だけ（TestCooperativeLevel / BeginScene）。
+/// デバイス（IDirect3DDevice8）のCOMメソッド（TestCooperativeLevel / BeginScene）はstdcallで引数はthisだけ。
 type DeviceFn = unsafe extern "system" fn(u32) -> i32;
 
-/// 打ち切りの行を出したか。打ち切りは計測の終わりなので何度も起きないが、行は 1 回だけにする。
+/// 打ち切りの行を出したかどうか。打ち切りは計測の終わりなので何度も起きないが、行は1回だけにする。
 static LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
-    /// 検査だけ: この検査のスレッドが頼んだ行（本ログの待ち行列は全検査で 1 つなので、行の中身はこちらで見る）。
+    /// 検査だけ: この検査のスレッドが頼んだ行（本ログの待ち行列は全検査で1つなので、行の中身はこちらで見る）。
     static TEST_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-/// 検査だけ: `[0x4B3108]` の代わりの置き場のアドレス。
+/// 検査だけ: `[0x4B3108]`の代わりの置き場のアドレス。
 #[cfg(test)]
 static TEST_CELL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -53,7 +59,7 @@ fn log_detail(line: String) {
     crate::main_log::push_detail(line);
 }
 
-/// デバイスへのポインタの置き場のアドレス（製品では `[0x4B3108]`）。
+/// デバイスへのポインタの置き場のアドレス（製品では`[0x4B3108]`）。
 fn device_cell() -> u32 {
     #[cfg(test)]
     {
@@ -65,12 +71,12 @@ fn device_cell() -> u32 {
     }
 }
 
-/// 計測の BeginScene の呼びを自前の入口へ向ける。**DllMain から呼ぶ**（ローダーロックの下）。
+/// 計測のBeginSceneの呼びを自前の入口へ向ける。**DllMainから呼ぶ**（ローダーロックの下）。
 /// 失敗してもロードは止めない（計測が今のままなだけ）。
 pub fn install() {
     let site = CALIB_GUARD_SITES[0];
     let r = catch_unwind(AssertUnwindSafe(|| {
-        // 他のスレッドを止めずに書くので、主スレッドが計測へ入る前（デバイスがまだ無い）でなければ書かない（動いているゲームへの注入）。
+        // 他のスレッドを止めずに書く。そのため主スレッドが計測へ入る前（デバイスがまだ無い）でなければ書かない（動いているゲームへの注入）。
         let mut cell = [0u8; 4];
         let mut env = RealHook::new();
         if !env.read_code(device_cell(), &mut cell) {
@@ -95,7 +101,7 @@ fn entry_address() -> u32 {
     calib_guard_entry as *const () as usize as u32
 }
 
-/// 書く 14 バイト: `call entry` / `test eax,eax` / `jnz abort` / `nop`。`call` の rel32 は `at + 5` から、`jnz` の rel32 は `at + 13` からの相対。
+/// 書く14バイト: `call entry` / `test eax,eax` / `jnz abort` / `nop`。`call`のrel32は`at + 5`から、`jnz`のrel32は`at + 13`からの相対。
 fn guard_patch_to(at: u32, entry: u32, abort: u32) -> [u8; CALIB_GUARD_LEN] {
     let c = patch::call_rel32(at, entry);
     let rel = abort.wrapping_sub(at.wrapping_add(13)).to_le_bytes();
@@ -104,8 +110,8 @@ fn guard_patch_to(at: u32, entry: u32, abort: u32) -> [u8; CALIB_GUARD_LEN] {
     ]
 }
 
-/// `site` の 14 バイトを読んで期待バイト列と照合し、全部合ったときだけ書く。書いた後に読み直して検証する。
-/// 書かなかったときは理由を `Err` で返す。
+/// `site`の14バイトを読んで期待バイト列と照合し、全部合ったときだけ書く。書いた後に読み直して検証する。
+/// 書かなかったときは理由を`Err`で返す。
 fn install_at(env: &mut dyn HookEnv, site: &SiteDef, entry: u32) -> Result<String, String> {
     let mut seen = [0u8; CALIB_GUARD_LEN];
     if site.expected.len() != CALIB_GUARD_LEN || !env.read_code(site.addr, &mut seen) {
@@ -143,12 +149,13 @@ fn install_at(env: &mut dyn HookEnv, site: &SiteDef, entry: u32) -> Result<Strin
 /// 計測を打ち切る理由。
 enum Lost {
     NoDevice,
-    /// TestCooperativeLevel が D3D_OK 以外を返した（`0x88760868` DEVICELOST・`0x88760869` DEVICENOTRESET など）。
+    /// TestCooperativeLevelがD3D_OK以外を返した（`0x88760868` DEVICELOST・`0x88760869` DEVICENOTRESETなど）。
     Hr(i32),
 }
 
-/// 打ち切りの行を 1 回だけ頼む。ゲームの主スレッドから呼ばれるが、計測の終わりの 1 回で、ヒープの確保とキューのロックは
-/// 他のフック（ウィンドウの作成の失敗の行）と同じ。パニックはここで受け、入口の戻り値を変えない。
+/// 打ち切りの行を1回だけ頼む。
+/// ゲームの主スレッドから呼ばれるが計測の終わりの1回だけ。ヒープの確保とキューのロックは他のフック（ウィンドウの作成の失敗の行）と同じ。
+/// パニックはここで受け、入口の戻り値を変えない。
 fn note_lost(why: &Lost) {
     if LOGGED.swap(true, Ordering::Relaxed) {
         return;
@@ -167,29 +174,31 @@ fn note_lost(why: &Lost) {
 }
 
 /// # Safety
-/// `addr` は読める 4 バイト（呼び出し元が、デバイスのポインタの置き場・生きたデバイスとその vtable の中だけを渡す）。
+/// `addr`は読み取り可能な4バイト（呼び出し元はデバイスのポインタの置き場・生きたデバイスとそのvtableの中だけを渡す）。
 unsafe fn read_u32(addr: u32) -> u32 {
-    // SAFETY: 呼び出し元の約束（読める 4 バイト）。
+    // SAFETY: 呼び出し元の約束（読み取り可能な4バイト）。
     unsafe { core::ptr::read_volatile(addr as usize as *const u32) }
 }
 
-/// 差し替えた呼びの入口（cdecl、引数なし）。0 を返したときは BeginScene を呼んだ後で、ゲームはそのまま EndScene へ進む。
-/// 1 を返したときは呼ばなかった。ebx・esi・edi・ebp は cdecl の約束で保たれ、抜け先の esi（サンプルの数）が変わらない。
-/// 判断の部分（ポインタの読みと vtable 越しの 2 回の呼び）にパニックしうる処理は無く、パニックしうるのはログだけ（`note_lost` が受ける）。
+/// 差し替えた呼びの入口（cdeclで引数なし）。
+/// 0を返したときはBeginSceneを呼んだ後で、ゲームはそのままEndSceneへ進む。
+/// 1を返したときは呼んでいない。
+/// ebx・esi・edi・ebpはcdeclの約束で保たれるので、抜け先のesi（サンプルの数）が変わらない。
+/// 判断の部分（ポインタの読みとvtable越しの2回の呼び）にパニックしうる処理は無い。パニックしうるのはログだけ（`note_lost`が受ける）。
 extern "C" fn calib_guard_entry() -> u32 {
-    // SAFETY: 置き場は `[0x4B3108]`（.data。読める）。値はゲームがデバイスを作った後はデバイスのアドレスで、作る前と失敗の後は 0。
+    // SAFETY: 置き場は`[0x4B3108]`（.data。読み取り可能）。値はゲームがデバイスを作った後はデバイスのアドレス。作る前と失敗の後は0。
     let dev = unsafe { read_u32(device_cell()) };
     if dev == 0 {
         note_lost(&Lost::NoDevice);
         return 1;
     }
-    // SAFETY: 0 でない値はゲーム自身が BeginScene の呼びに使うデバイス。COM オブジェクトの先頭 4 バイトは vtable のアドレス。
+    // SAFETY: 0でない値はゲーム自身がBeginSceneの呼びに使うデバイス。COMオブジェクトの先頭4バイトはvtableのアドレス。
     let vtbl = unsafe { read_u32(dev) };
     if vtbl == 0 {
         note_lost(&Lost::NoDevice);
         return 1;
     }
-    // SAFETY: 生きたデバイスの vtable の中のスロット（TestCooperativeLevel `0x0C`・BeginScene `0x88`）。
+    // SAFETY: 生きたデバイスのvtableの中のスロット（TestCooperativeLevel `0x0C`・BeginScene `0x88`）。
     let (tcl, begin) = unsafe {
         (
             read_u32(vtbl.wrapping_add(D3D8_TESTCOOP_SLOT)),
@@ -200,22 +209,22 @@ extern "C" fn calib_guard_entry() -> u32 {
         note_lost(&Lost::NoDevice);
         return 1;
     }
-    // SAFETY: `tcl` は 0 でない TestCooperativeLevel（ゲームのメインループ `0x0042E69A` が同じ呼びをする）。stdcall・引数は this だけ。
+    // SAFETY: `tcl`は0でないTestCooperativeLevel（ゲームのメインループ`0x0042E69A`が同じ呼びをする）。stdcall・引数はthisだけ。
     let hr = unsafe { core::mem::transmute::<usize, DeviceFn>(tcl as usize)(dev) };
-    // 成功の正の値では打ち切らない（計測の Present の判定 `0x42F21F jge` と同じ向き）。
+    // 成功の正の値では打ち切らない（計測のPresentの判定`0x42F21F jge`と同じ向き）。
     if hr < 0 {
         note_lost(&Lost::Hr(hr));
         return 1;
     }
-    // SAFETY: `begin` は 0 でない BeginScene（元の呼び `0x0042F1E1` と同じ）。戻り値はゲームも読まない。
+    // SAFETY: `begin`は0でないBeginScene（元の呼び`0x0042F1E1`と同じ）。戻り値はゲームも読まない。
     unsafe { core::mem::transmute::<usize, DeviceFn>(begin as usize)(dev) };
     0
 }
 
 #[cfg(test)]
 mod tests {
-    //! 組み上がりの検査（花映塚は使わない）。偽の COM（vtable を持つ静的な偽のデバイス）に入口を向け、書き換えた機械語を実際に呼んで、
-    //! 抜け先・esi・スタックまで見る。
+    //! 組み上がりの検査（花映塚は使わない）。
+    //! 偽のCOM（vtableを持つ静的な偽のデバイス）に入口を向け、書き換えた機械語を実際に呼んで抜け先・esi・スタックまで見る。
     use super::*;
     use crate::hook::tests::FakeHook;
     use crate::stub::testkit::{
@@ -234,7 +243,7 @@ mod tests {
     struct Obj(AtomicU32);
     static FAKE_DEVICE: Obj = Obj(AtomicU32::new(0));
     static DEV_VTBL: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
-    /// `[0x4B3108]` の代わり（中身は偽のデバイスのアドレスか 0）。
+    /// `[0x4B3108]`の代わり（中身は偽のデバイスのアドレスか0）。
     static FAKE_DEVICE_PTR: AtomicU32 = AtomicU32::new(0);
     static TCL_HR: AtomicU32 = AtomicU32::new(0);
     static N_TCL: AtomicU32 = AtomicU32::new(0);
@@ -260,7 +269,7 @@ mod tests {
         0
     }
 
-    /// 偽のデバイスを用意する（呼び出しの数・直前の行・一度だけの旗も戻す）。
+    /// 偽のデバイスを用意する（呼び出しの数・直前の行・一度だけのフラグも戻す）。
     fn setup(hr: i32, device: bool) {
         for w in DEV_VTBL.iter() {
             w.store(0, Ordering::SeqCst);
@@ -298,12 +307,12 @@ mod tests {
         assert_eq!(a[7], PRE_ESP.load(Ordering::SeqCst), "{label}: esp");
     }
 
-    /// ebx / esi / edi / ebp / esp が変わらないことも見る。
+    /// ebx / esi / edi / ebp / espが変わらないことも見る。
     #[test]
     fn entry_calls_begin_scene_only_when_the_device_is_ok() {
         let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entry_address();
-        // (名前, TestCooperativeLevel の戻り, デバイスはあるか, 戻り値, TCL の回数, BeginScene の回数)
+        // (名前, TestCooperativeLevelの戻り, デバイスはあるか, 戻り値, TCLの回数, BeginSceneの回数)
         let cases = [
             ("正常", 0, true, 0u32, 1u32, 1u32),
             ("成功の正の値", 1, true, 0, 1, 1),
@@ -407,7 +416,7 @@ mod tests {
     struct Page(*mut u8);
     impl Page {
         fn new() -> Page {
-            // SAFETY: 新しいページを 1 つ確保するだけ（アドレスは OS が選ぶ）。
+            // SAFETY: 新しいページを1つ確保するだけ（アドレスはOSが選ぶ）。
             let p = unsafe {
                 VirtualAlloc(
                     core::ptr::null(),
@@ -423,18 +432,18 @@ mod tests {
             self.0 as usize as u32
         }
         fn put(&self, at: usize, b: &[u8]) {
-            // SAFETY: 確保した 4096 バイトのページの中（呼び出し元が at + len <= 4096 を守る）。
+            // SAFETY: 確保した4096バイトのページの中（呼び出し元が at + len <= 4096 を守る）。
             unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), self.0.add(at), b.len()) };
         }
     }
     impl Drop for Page {
         fn drop(&mut self) {
-            // SAFETY: `new` で確保したページを、確保した側が解放する。
+            // SAFETY: `new`で確保したページを、確保した側が解放する。
             unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
         }
     }
 
-    /// ゲームの `0x42F1D9` の前後の形（esi = サンプルの数）を真似る。
+    /// ゲームの`0x42F1D9`の前後の形（esi = サンプルの数）を真似る。
     #[test]
     fn patched_code_falls_through_or_jumps_and_keeps_esi() {
         const ESI: u32 = 0xE5E5_E5E5;
@@ -454,16 +463,16 @@ mod tests {
         ));
         code.push(0xB8); // mov eax, FALL
         code.extend_from_slice(&FALL.to_le_bytes());
-        code.extend_from_slice(&[0xEB, 0x05]); // jmp done（抜け先の mov eax を飛ばす）
+        code.extend_from_slice(&[0xEB, 0x05]); // jmp done（抜け先のmov eaxを飛ばす）
         assert_eq!(code.len(), abort_off);
         code.push(0xB8); // abort: mov eax, ABORT
         code.extend_from_slice(&ABORT.to_le_bytes());
-        code.extend_from_slice(&[0x81, 0xF6]); // done: xor esi, ESI（壊れていなければ 0）
+        code.extend_from_slice(&[0x81, 0xF6]); // done: xor esi, ESI（壊れていなければ0）
         code.extend_from_slice(&ESI.to_le_bytes());
         code.extend_from_slice(&[0x09, 0xF0, 0x5E, 0xC3]); // or eax, esi / pop esi / ret
         page.put(0, &code);
         let run = || {
-            // SAFETY: 上で書いた機械語（cdecl の引数なし関数と同じ形で、戻り値は eax）。esi は入口で保存して出口で戻す。
+            // SAFETY: 上で書いた機械語（cdeclの引数なし関数と同じ形で、戻り値はeax）。esiは入口で保存して出口で戻す。
             let f: extern "C" fn() -> u32 = unsafe { core::mem::transmute(page.0) };
             f()
         };

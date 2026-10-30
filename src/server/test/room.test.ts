@@ -1,8 +1,16 @@
-// 組み上がりの検査: 入口（index.ts）→ ルーム（room.ts）を、ローカルの workerd の上で本物の WebSocket で叩く。
+// 組み上がりの検査: 入口（index.ts）→ ルーム（room.ts）をローカルのworkerdの上で本物のWebSocketで叩く。
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { CODE_MAX_CHARS, Close, CONNECT_LIMIT_PER_MINUTE, PING_TEXT, RETRY_AFTER_SECS } from "../src/rules";
-import { Client, connect, fakeCode, freshCid, freshIp, freshRoom, rawConnect, sleep, stubFor } from "./helpers";
+import {
+  CODE_MAX_CHARS,
+  Close,
+  CONNECT_LIMIT_PER_MINUTE,
+  HELD_STALE_MS,
+  HELD_SWEEP_MS,
+  PING_TEXT,
+  RETRY_AFTER_SECS,
+} from "../src/rules";
+import { Client, connect, fakeCode, freshCid, freshIp, freshRoom, peerWithTicket, rawConnect, sleep, stubFor } from "./helpers";
 
 async function openHost(room: string, code = fakeCode("host")): Promise<Client> {
   const a = await connect(room);
@@ -10,6 +18,40 @@ async function openHost(room: string, code = fakeCode("host")): Promise<Client> 
   expect(r).toMatchObject({ t: "room", role: "host" });
   a.sendJson({ t: "offer", code });
   return a;
+}
+
+/** 対戦を成立させる（hostが登録し、guestがコードを受けてanswerを返し、hostが受ける）。2人は部屋に残ったまま返す。 */
+async function heldPair(room: string, hostCid?: string, guestCid?: string): Promise<{ a: Client; b: Client }> {
+  const a = await connect(room, undefined, hostCid);
+  expect(await a.next()).toMatchObject({ t: "room", role: "host" });
+  a.sendJson({ t: "offer", code: fakeCode("h") });
+  const b = await connect(room, undefined, guestCid);
+  expect(await b.next()).toMatchObject({ t: "room", role: "guest" });
+  expect(await b.next()).toEqual(peerWithTicket(fakeCode("h")));
+  expect((await a.next()).t).toBe("matched");
+  b.sendJson({ t: "answer", code: fakeCode("g") });
+  expect(await a.next()).toEqual({ t: "peer", code: fakeCode("g") });
+  await sleep(50);
+  return { a, b };
+}
+
+/** 成立の時刻を`ago` ms前へずらす（自動応答の時刻には触らない）。 */
+async function ageHeld(room: string, ago: number): Promise<void> {
+  await runInDurableObject(stubFor(room), (_inst, state) => {
+    for (const ws of state.getWebSockets()) {
+      const a = ws.deserializeAttachment() as { held?: number };
+      if (a.held === undefined) continue;
+      a.held = Date.now() - ago;
+      ws.serializeAttachment(a);
+    }
+  });
+}
+
+async function expectInUse(room: string, cid?: string): Promise<void> {
+  const res = await rawConnect(`/v0/rooms/${room}${cid === undefined ? "" : `?cid=${cid}`}`);
+  expect(res.status).toBe(409);
+  expect(res.webSocket).toBeNull();
+  expect(await res.json()).toEqual({ error: "room_in_use" });
 }
 
 async function forceDeadlinePast(room: string): Promise<void> {
@@ -23,7 +65,7 @@ async function forceDeadlinePast(room: string): Promise<void> {
 }
 
 describe("揃う", () => {
-  it("host が預け、guest が入ると、互いのコードが渡り、両者が 1000 で閉じる", async () => {
+  it("host が預け、guest が入ると、互いのコードが渡り、2 人は部屋に残る。どちらかが抜けるともう 1 人も閉じて部屋が空く", async () => {
     const room = freshRoom();
     const hostCode = fakeCode("hostcode");
     const guestCode = fakeCode("guestcode");
@@ -32,7 +74,7 @@ describe("揃う", () => {
     const ra = await a.next();
     expect(ra.t).toBe("room");
     expect(ra.role).toBe("host");
-    // 期限は UNIX 秒。いまから 10 分先の前後（時計のずれを見て広めに）。
+    // 期限はUNIX秒。いまから10分先の前後（時計のずれを見て広めに）。
     const nowSecs = Math.floor(Date.now() / 1000);
     expect(ra.expires_at).toBeGreaterThanOrEqual(nowSecs + 590);
     expect(ra.expires_at).toBeLessThanOrEqual(nowSecs + 610);
@@ -41,17 +83,22 @@ describe("揃う", () => {
 
     const b = await connect(room);
     expect(await b.next()).toMatchObject({ t: "room", role: "guest", expires_at: ra.expires_at });
-    expect(await b.next()).toEqual({ t: "peer", code: hostCode });
+    expect(await b.next()).toEqual(peerWithTicket(hostCode));
     const matched = await a.next();
     expect(matched.t).toBe("matched");
-    // 揃ってからは answer の期限（1 分）で縛る。
+    // 揃ってからはanswerの期限（1分）で縛る。
     expect(matched.expires_at).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 61);
 
     b.sendJson({ t: "answer", code: guestCode });
     expect(await a.next()).toEqual({ t: "peer", code: guestCode });
-    expect((await a.closed).code).toBe(Close.Done);
-    expect((await b.closed).code).toBe(Close.Done);
+    expect(await a.silentFor(100)).toBeNull();
+    expect(await b.silentFor(0)).toBeNull();
+    expect(a.isClosed || b.isClosed).toBe(false);
+    await expectInUse(room);
 
+    a.close();
+    expect(await b.next()).toEqual({ t: "error", code: "peer_left" });
+    expect((await b.closed).code).toBe(Close.PeerLeft);
     const c = await connect(room);
     expect(await c.next()).toMatchObject({ t: "room", role: "host" });
     c.close();
@@ -67,12 +114,15 @@ describe("揃う", () => {
     expect(await a.silentFor(0)).toBeNull();
 
     a.sendJson({ t: "offer", code: fakeCode("late") });
-    expect(await b.next()).toEqual({ t: "peer", code: fakeCode("late") });
+    expect(await b.next()).toEqual(peerWithTicket(fakeCode("late")));
     expect((await a.next()).t).toBe("matched");
     b.sendJson({ t: "answer", code: fakeCode("ans") });
     expect(await a.next()).toEqual({ t: "peer", code: fakeCode("ans") });
-    expect((await a.closed).code).toBe(Close.Done);
-    expect((await b.closed).code).toBe(Close.Done);
+    expect(await b.silentFor(100)).toBeNull();
+    expect(a.isClosed || b.isClosed).toBe(false);
+    b.close();
+    expect(await a.next()).toEqual({ t: "error", code: "peer_left" });
+    expect((await a.closed).code).toBe(Close.PeerLeft);
   });
 
   it("部屋名の大文字と小文字は同じ部屋", async () => {
@@ -99,7 +149,7 @@ describe("揃う", () => {
 });
 
 describe("3 人目", () => {
-  it("否定: 3 人目は 409 room_full で、WebSocket を張らない。先の 2 人は続けられる", async () => {
+  it("否定: 3 人目は 409 room_in_use で、WebSocket を張らない。先の 2 人は続けられる", async () => {
     const room = freshRoom();
     const a = await openHost(room);
     const b = await connect(room);
@@ -107,14 +157,13 @@ describe("3 人目", () => {
     await b.next(); // peer
     await a.next(); // matched
 
-    const res = await rawConnect(`/v0/rooms/${room}`);
-    expect(res.status).toBe(409);
-    expect(res.webSocket).toBeNull();
-    expect(await res.json()).toEqual({ error: "room_full" });
+    await expectInUse(room);
 
     b.sendJson({ t: "answer", code: fakeCode("g") });
     expect(await a.next()).toEqual({ t: "peer", code: fakeCode("g") });
-    expect((await a.closed).code).toBe(Close.Done);
+    expect(a.isClosed || b.isClosed).toBe(false);
+    a.close();
+    b.close();
   });
 
   it("否定: guest がまだ host のコードを受けていなくても、3 人目は断る", async () => {
@@ -123,41 +172,144 @@ describe("3 人目", () => {
     await a.next();
     const b = await connect(room);
     await b.next();
-    const res = await rawConnect(`/v0/rooms/${room}`);
-    expect(res.status).toBe(409);
+    await expectInUse(room);
     a.close();
     b.close();
   });
 });
 
+describe("成立の後（ルーム名を使用中にする）", () => {
+  it("否定: 成立の後の 3 人目は、cid の有無にかかわらず 409 room_in_use で、WebSocket を張らない", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room, freshCid(), freshCid());
+    await expectInUse(room);
+    await expectInUse(room, freshCid());
+    expect(a.isClosed || b.isClosed).toBe(false);
+    a.close();
+    b.close();
+  });
+
+  it("ルームの期限が過ぎても、成立の後の 2 人はアラームで閉じない（期限の前の部屋と分ける）", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    await forceDeadlinePast(room);
+    expect(await runDurableObjectAlarm(stubFor(room))).toBe(true);
+    expect(await a.silentFor(100)).toBeNull();
+    expect(await b.silentFor(0)).toBeNull();
+    expect(a.isClosed || b.isClosed).toBe(false);
+    await expectInUse(room);
+    a.close();
+    b.close();
+  });
+
+  it("成立の後のアラームは HELD_SWEEP_MS 先に掛かる", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    const at = await runInDurableObject(stubFor(room), (_i, s) => s.storage.getAlarm());
+    expect(at).not.toBeNull();
+    expect(at!).toBeGreaterThan(Date.now() + HELD_SWEEP_MS - 10_000);
+    expect(at!).toBeLessThanOrEqual(Date.now() + HELD_SWEEP_MS);
+    a.close();
+    b.close();
+  });
+
+  it("生存の合図が古い接続はアラームで expired で閉じ、合図のある相手も peer_left で閉じて部屋が空く", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    await ageHeld(room, HELD_STALE_MS + 1000);
+    // aだけがpingを送る（自動応答の時刻が新しくなる）。bは送らない。
+    a.send(PING_TEXT);
+    expect(await a.next()).toEqual({ t: "pong" });
+    expect(await runDurableObjectAlarm(stubFor(room))).toBe(true);
+    expect(await b.next()).toEqual({ t: "error", code: "expired" });
+    expect((await b.closed).code).toBe(Close.Expired);
+    expect(await a.next()).toEqual({ t: "error", code: "peer_left" });
+    expect((await a.closed).code).toBe(Close.PeerLeft);
+    const c = await connect(room);
+    expect(await c.next()).toMatchObject({ t: "room", role: "host" });
+    c.close();
+  });
+
+  it("否定: 成立の時刻が古くても、2 人とも合図を送っていればアラームで閉じない（自動応答の時刻を読んでいる対照）", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    await ageHeld(room, HELD_STALE_MS + 1000);
+    for (const c of [a, b]) {
+      c.send(PING_TEXT);
+      expect(await c.next()).toEqual({ t: "pong" });
+    }
+    expect(await runDurableObjectAlarm(stubFor(room))).toBe(true);
+    expect(await a.silentFor(100)).toBeNull();
+    expect(await b.silentFor(0)).toBeNull();
+    expect(a.isClosed || b.isClosed).toBe(false);
+    await expectInUse(room);
+    a.close();
+    b.close();
+  });
+
+  it("アラームが遅れていても、合図の途絶えた部屋には次の人が host として入れる（入口でも合図を見る）", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    await ageHeld(room, HELD_STALE_MS + 1000);
+    const c = await connect(room);
+    expect(await c.next()).toMatchObject({ t: "room", role: "host" });
+    expect((await a.closed).code).toBe(Close.Expired);
+    expect((await b.closed).code).toBe(Close.Expired);
+    c.close();
+  });
+
+  it("否定: 成立の後に ping 以外の文を送った接続は bad_message で閉じ、相手も peer_left で閉じる", async () => {
+    const room = freshRoom();
+    const { a, b } = await heldPair(room);
+    b.sendJson({ t: "answer", code: fakeCode("again") });
+    expect(await b.next()).toEqual({ t: "error", code: "bad_message" });
+    expect((await b.closed).code).toBe(Close.BadMessage);
+    expect(await a.next()).toEqual({ t: "error", code: "peer_left" });
+    expect((await a.closed).code).toBe(Close.PeerLeft);
+  });
+
+  it("成立の後に同じ cid で入り直すと、古い接続は 1000、相手は peer_left で閉じ、入り直した人が新しい部屋の host になる", async () => {
+    const room = freshRoom();
+    const cid = freshCid();
+    const { a, b } = await heldPair(room, undefined, cid);
+    const again = await connect(room, undefined, cid);
+    expect(await again.next()).toMatchObject({ t: "room", role: "host" });
+    expect((await b.closed).code).toBe(Close.Done);
+    expect(await a.next()).toEqual({ t: "error", code: "peer_left" });
+    expect((await a.closed).code).toBe(Close.PeerLeft);
+    again.close();
+  });
+});
+
 describe("入り直し（同じ cid）", () => {
-  /** guest が host のコードを受けた状態（host は matched を受け取り済み）まで進める。guest は閉じずに残す（届かなかった入室のコピー）。 */
+  /** guestがhostのコードを受けた状態（hostはmatchedを受け取り済み）まで進める。guestは閉じずに残す（届かなかった入室のコピー）。 */
   async function matchedWithGhost(room: string, cid: string) {
     const a = await openHost(room, fakeCode("h"));
     const ghost = await connect(room, undefined, cid);
     expect(await ghost.next()).toMatchObject({ t: "room", role: "guest" });
-    expect(await ghost.next()).toEqual({ t: "peer", code: fakeCode("h") });
+    expect(await ghost.next()).toEqual(peerWithTicket(fakeCode("h")));
     expect((await a.next()).t).toBe("matched");
     return { a, ghost };
   }
 
-  it("届かなかった guest が残っていても、同じ cid の入り直しは room_full にならず、host と揃う", async () => {
+  it("届かなかった guest が残っていても、同じ cid の入り直しは room_in_use にならず、host と揃う", async () => {
     const room = freshRoom();
     const cid = freshCid();
     const { a, ghost } = await matchedWithGhost(room, cid);
 
     const b = await connect(room, undefined, cid);
     expect(await b.next()).toMatchObject({ t: "room", role: "guest" });
-    expect(await b.next()).toEqual({ t: "peer", code: fakeCode("h") });
-    // 古い接続は 1000 で閉じられ、host は閉じられない・2 度目の matched も受けない。
+    expect(await b.next()).toEqual(peerWithTicket(fakeCode("h")));
+    // 古い接続は1000で閉じられる。hostは閉じられず2度目のmatchedも受けない。
     expect((await ghost.closed).code).toBe(Close.Done);
     expect(await a.silentFor(100)).toBeNull();
     expect(a.isClosed).toBe(false);
 
     b.sendJson({ t: "answer", code: fakeCode("g") });
     expect(await a.next()).toEqual({ t: "peer", code: fakeCode("g") });
-    expect((await a.closed).code).toBe(Close.Done);
-    expect((await b.closed).code).toBe(Close.Done);
+    expect(a.isClosed || b.isClosed).toBe(false);
+    a.close();
+    b.close();
   });
 
   it("入れ替えた guest の期限は host の answer の期限のまま（host は知らされないので延ばさない）", async () => {
@@ -166,7 +318,7 @@ describe("入り直し（同じ cid）", () => {
     const { a, ghost } = await matchedWithGhost(room, cid);
     await forceDeadlinePast(room);
     const b = await connect(room, undefined, cid);
-    // 期限切れのルームは片付いて、入り直した人は新しいルームの host になる（期限が過ぎた入れ替え元に引きずられない）。
+    // 期限切れのルームは取り除かれる。入り直した人は新しいルームのhostになる（期限が過ぎた入れ替え元に引きずられない）。
     expect(await b.next()).toMatchObject({ t: "room", role: "host" });
     expect((await a.closed).code).toBe(Close.Expired);
     expect((await ghost.closed).code).toBe(Close.Expired);
@@ -181,14 +333,14 @@ describe("入り直し（同じ cid）", () => {
     await ghost.next();
     await ghost.next();
     const matched = await a.next();
-    await sleep(1100); // 秒の粒度を越えて、延びていれば値が変わるようにする
+    await sleep(1100); // 秒の粒度を越えるまで待つ（延びていれば値が変わる）
     const b = await connect(room, undefined, cid);
     expect(await b.next()).toMatchObject({ role: "guest", expires_at: matched.expires_at });
     a.close();
     b.close();
   });
 
-  it("否定: cid が違う 3 人目・cid を付けない古いクライアントの入り直しは、今までどおり 409 room_full", async () => {
+  it("否定: cid が違う 3 人目・cid を付けない古いクライアントの入り直しは、今までどおり 409（room_in_use）", async () => {
     const room = freshRoom();
     const cid = freshCid();
     const { a, ghost } = await matchedWithGhost(room, cid);
@@ -202,9 +354,9 @@ describe("入り直し（同じ cid）", () => {
     ]) {
       const res = await rawConnect(path);
       expect(res.status, path).toBe(409);
-      expect(await res.json(), path).toEqual({ error: "room_full" });
+      expect(await res.json(), path).toEqual({ error: "room_in_use" });
     }
-    // 断られても、揃っている 2 人は続けられる。
+    // 断られても揃っている2人は続けられる。
     expect(ghost.isClosed).toBe(false);
     ghost.sendJson({ t: "answer", code: fakeCode("g") });
     expect(await a.next()).toEqual({ t: "peer", code: fakeCode("g") });
@@ -219,7 +371,7 @@ describe("入り直し（同じ cid）", () => {
     expect(await guest.next()).toMatchObject({ role: "guest" });
 
     const again = await connect(room, undefined, cid);
-    // 自分の残りの guest にならず、host になる。
+    // 自分の残りのguestにならず、hostになる。
     expect(await again.next()).toMatchObject({ t: "room", role: "host" });
     expect((await old.closed).code).toBe(Close.Done);
     expect(await guest.next()).toEqual({ t: "error", code: "peer_left" });
@@ -255,7 +407,7 @@ describe("入り直し（同じ cid）", () => {
     });
     const b = await connect(room, undefined, freshCid());
     expect(await b.next()).toMatchObject({ role: "guest" });
-    expect(await b.next()).toEqual({ t: "peer", code: fakeCode("old") });
+    expect(await b.next()).toEqual(peerWithTicket(fakeCode("old")));
     expect((await a.next()).t).toBe("matched");
     a.close();
     b.close();
@@ -296,7 +448,7 @@ describe("期限", () => {
     const a = await openHost(room);
     await forceDeadlinePast(room);
     const b = await connect(room);
-    // 古い host は期限切れで閉じ、入ってきた人は新しいルームの host になる（古い host のコードは渡らない）。
+    // 古いhostは期限切れで閉じる。入ってきた人は新しいルームのhostになる（古いhostのコードは渡らない）。
     expect(await b.next()).toMatchObject({ t: "room", role: "host" });
     expect(await a.next()).toEqual({ t: "error", code: "expired" });
     expect((await a.closed).code).toBe(Close.Expired);
@@ -312,7 +464,7 @@ describe("大きすぎる・形の悪い文", () => {
     const a = await openHost(room, big);
     const b = await connect(room);
     await b.next();
-    expect(await b.next()).toEqual({ t: "peer", code: big });
+    expect(await b.next()).toEqual(peerWithTicket(big));
     a.close();
     b.close();
   });
@@ -423,7 +575,7 @@ describe("大きすぎる・形の悪い文", () => {
     a.sendJson({ t: "offer", code: fakeCode("h") });
     const c = await connect(room);
     expect(await c.next()).toMatchObject({ role: "guest" });
-    expect(await c.next()).toEqual({ t: "peer", code: fakeCode("h") });
+    expect(await c.next()).toEqual(peerWithTicket(fakeCode("h")));
     a.close();
     c.close();
   });
@@ -478,7 +630,7 @@ describe("入口で断るもの", () => {
     const ip = freshIp();
     const opened: Client[] = [];
     for (let i = 0; i < CONNECT_LIMIT_PER_MINUTE; i++) {
-      // ルームを分けて、409 ではなく回数のガードだけを見る。
+      // ルームを分けて409ではなく回数のガードだけを見る。
       opened.push(await connect(freshRoom("rl"), ip));
     }
     const res = await rawConnect(`/v0/rooms/${freshRoom("rl")}`, { ip });
@@ -539,7 +691,7 @@ describe("片方が途中で切れる", () => {
     a.sendJson({ t: "offer", code: fakeCode("stay") });
     const c = await connect(room);
     expect(await c.next()).toMatchObject({ role: "guest" });
-    expect(await c.next()).toEqual({ t: "peer", code: fakeCode("stay") });
+    expect(await c.next()).toEqual(peerWithTicket(fakeCode("stay")));
     a.close();
     c.close();
   });
@@ -550,13 +702,13 @@ describe("Hibernation", () => {
     const room = freshRoom();
     const stub = stubFor(room);
     const a = await openHost(room, fakeCode("sleepy"));
-    await sleep(50); // offer を Durable Object が受け終えるのを待つ
+    await sleep(50); // offerをDurable Objectが受け終えるのを待つ
 
-    // 眠らせる前のインスタンスに印を付け、眠った後に印が消えている（本当に作り直された）ことを見る。
+    // 眠らせる前のインスタンスに印を付ける。眠った後に印が消えている（本当に作り直された）ことを見る。
     await runInDurableObject(stub, (inst) => {
       (inst as unknown as Record<string, unknown>).__mark = 1;
     });
-    await evictDurableObject(stub); // 既定は WebSocket を閉じずに眠らせる
+    await evictDurableObject(stub); // 既定はWebSocketを閉じずに眠らせる
     const marked = await runInDurableObject(stub, (inst, state) => ({
       mark: (inst as unknown as Record<string, unknown>).__mark,
       sockets: state.getWebSockets().length,
@@ -569,14 +721,21 @@ describe("Hibernation", () => {
 
     const b = await connect(room);
     expect(await b.next()).toMatchObject({ role: "guest" });
-    expect(await b.next()).toEqual({ t: "peer", code: fakeCode("sleepy") });
+    expect(await b.next()).toEqual(peerWithTicket(fakeCode("sleepy")));
     expect((await a.next()).t).toBe("matched");
 
     await evictDurableObject(stub);
     b.sendJson({ t: "answer", code: fakeCode("woke") });
     expect(await a.next()).toEqual({ t: "peer", code: fakeCode("woke") });
-    expect((await a.closed).code).toBe(Close.Done);
-    expect((await b.closed).code).toBe(Close.Done);
+    // 成立の後に眠っても2人は残る。pingには起動せずに答え、3人目は断る。
+    await sleep(50);
+    await evictDurableObject(stub);
+    b.send(PING_TEXT);
+    expect(await b.next()).toEqual({ t: "pong" });
+    await expectInUse(room);
+    expect(a.isClosed || b.isClosed).toBe(false);
+    a.close();
+    expect((await b.closed).code).toBe(Close.PeerLeft);
   });
 
   it("否定: 眠らせるときに WebSocket を閉じる設定では、host は残らない（検査の道具が本当に眠らせている対照）", async () => {

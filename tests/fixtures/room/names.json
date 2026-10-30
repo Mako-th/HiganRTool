@@ -1,5 +1,5 @@
 {
-  "about": "部屋名の見本の名の列（平らな JSON。文字列だけ）。サーバーの決まりの実装は src/server/src/rules.ts、数は rules.json。鍵の頭で期待を決める: ok_ = サーバーも core のサーバーの決まり（RoomName::parse_server_rules）も通す（dll の RoomName::parse は、さらに ASCII の英数字と - _ @ だけを通すので、日本語・全角・空白・記号の名は NotAscii で断る。サーバーは通したまま） / bad_ = 両方が断る（サーバーは 400。bad_empty と bad_dot_ は道の区切りが空か、URL の読み方で消えるので 404）/ server_bad_ = parse_server_rules は通しサーバーが 400（NFKC で揃えるまで分からない長さ。dll は NFKC を持たない）/ same_<名>_a と _b = 両方通り、サーバーで同じ部屋 / diff_<名>_a と _b = 両方通り、別の部屋。部屋の揃え方は NFKC → 前後の空白を除く → 小文字。読むのは src/server/test/fixture.test.ts（揃えた文字と部屋の行き先）と src/core/src/room.rs の検査（dll が通すか断るか・道の符号化を戻すと元の文字）。実在のプレイヤー名・部屋名は書かない（合成の文字だけ）。same と diff の名は、揃えた文字が互いに重ならないように選ぶ（検査が同じ部屋を使い回さないように。fixture.test.ts が重なりを見る）。",
+  "about": "部屋名の見本の名の列（平らな JSON。文字列だけ）。サーバーの決まりの実装は src/server/src/rules.ts、数は rules.json。鍵の頭で期待を決める: ok_ = サーバーも core のサーバーの決まり（RoomName::parse_server_rules）も通す（dll の RoomName::parse は、さらに 0x20〜0x7E のうち ` ; / 以外の文字だけを通し、前後の空白を除いた名を返すので、日本語・全角・` や ; の入る名は NotAscii で断る。前後の空白を除いて小文字にした名が w. か q. で始まるものも断る（ReservedPrefix。この見本には置かず room.rs の検査が持つ）。サーバーは通したまま） / bad_ = 両方が断る（サーバーは 400。bad_empty と bad_dot_ は道の区切りが空か、URL の読み方で消えるので 404）/ server_bad_ = parse_server_rules は通しサーバーが 400（NFKC で揃えるまで分からない長さ。dll は NFKC を持たない）/ same_<名>_a と _b = 両方通り、サーバーで同じ部屋 / diff_<名>_a と _b = 両方通り、別の部屋。部屋の揃え方は NFKC → 前後の空白を除く → 小文字。読むのは src/server/test/fixture.test.ts（揃えた文字と部屋の行き先）と src/core/src/room.rs の検査（dll が通すか断るか・道の符号化を戻すと元の文字）。実在のプレイヤー名・部屋名は書かない（合成の文字だけ）。same と diff の名は、揃えた文字が互いに重ならないように選ぶ（検査が同じ部屋を使い回さないように。fixture.test.ts が重なりを見る）。",
   "same_fullwidth_alnum_a": "ＡＢＣ１２３",
   "same_fullwidth_alnum_b": "abc123",
   "same_case_a": "Room-1_X",
@@ -29,6 +29,9 @@
   "ok_padded_ascii": " yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ",
   "ok_shrinks_by_nfkc": "ｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞｶﾞ",
   "ok_symbols": "a+.%?#&=~\\ '()*!,;:@[]{}|^`\"z",
+  "ok_dll_symbols": "a+.%?#&=~\\ '()*!,:@[]{}|^\"<>$z",
+  "ok_semicolon": "a;b",
+  "ok_backtick": "a`b",
   "ok_dots_inside": "...",
   "ok_dot_head": ".a",
   "ok_emoji": "🌸花映塚🌸",

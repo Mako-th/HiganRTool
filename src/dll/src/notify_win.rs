@@ -1,8 +1,8 @@
-//! 接続したときの知らせ（音とタスクバー点滅。前面は奪わない）の Win32 の層。
+//! 接続したときの知らせ（音とタスクバー点滅。前面は奪わない）のWin32の層。
 //!
-//! 接続コードの見張りのスレッド（`net_code` の `higanr-code`）が、接続を見た 1 回だけ `connected` を呼ぶ（ゲームのスレッドでは呼ばない）。
-//! ゲームのウィンドウが前面に無ければ `FlashWindowEx` で点滅させ、`higanr_core::chime` の合成音を `PlaySoundW` で鳴らす（約 0.9 秒、鳴り終わるまで待つ）。
-//! 試合の後に接続が切れた知らせ（`lost`）は音だけ（`chime_lost`、約 0.3 秒）で、ゲームのスレッドが作った短いスレッドが鳴らす。他のプロセスのウィンドウには触らない。
+//! 接続コードの監視スレッド（`net_code`の`higanr-code`）が接続を見た1回だけ`connected`を呼ぶ（ゲームのスレッドでは呼ばない）。
+//! ゲームのウィンドウが前面に無ければ`FlashWindowEx`で点滅させる。`higanr_core::chime`の合成音は`PlaySoundW`で鳴らす（約0.9秒。鳴り終わるまで待つ）。
+//! 試合の後に接続が切れた知らせ（`lost`）は音だけ（`chime_lost`。約0.3秒）。ゲームのスレッドが作った短いスレッドが鳴らす。他のプロセスのウィンドウには触らない。
 
 use core::ffi::c_void;
 
@@ -21,15 +21,15 @@ struct Search {
 }
 
 unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: `lparam` は `game_window` が渡した `&mut Search` で、`EnumWindows` の中で同期に呼ばれる間は生きている。
+    // SAFETY: `lparam`は`game_window`が渡した`&mut Search`で、`EnumWindows`の中で同期に呼ばれる間は生きている。
     let s = unsafe { &mut *(lparam as *mut Search) };
     let mut pid = 0u32;
-    // SAFETY: `hwnd` は `EnumWindows` が渡したウィンドウ。`pid` は書ける u32。ウィンドウが消えていても 0 が返るだけ。
+    // SAFETY: `hwnd`は`EnumWindows`が渡したウィンドウ。`pid`は書き込み可能なu32。ウィンドウが消えていても0が返るだけ。
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     if pid != s.pid {
         return 1;
     }
-    // SAFETY: 読むだけの問い合わせ。ウィンドウが消えていれば 0 / NULL が返るだけ。
+    // SAFETY: 読むだけの問い合わせ。ウィンドウが消えていれば0 / NULLが返るだけ。
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
     // SAFETY: 同上。
     let owned = !unsafe { GetWindow(hwnd, GW_OWNER) }.is_null();
@@ -40,23 +40,23 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
     1
 }
 
-/// 自分のプロセスの、見えていて持ち主の無い一番上のウィンドウ（花映塚ではゲームのウィンドウ）。無ければ None。`text_input_win` も同じウィンドウを探す。
+/// 自分のプロセスの見えていて所有者の無い一番上のウィンドウ（花映塚ではゲームのウィンドウ）。無ければNone。`text_input_win`も同じウィンドウを探す。
 pub(crate) fn game_window() -> Option<HWND> {
     let mut s = Search {
         // SAFETY: 引数の無い問い合わせ。
         pid: unsafe { GetCurrentProcessId() },
         found: core::ptr::null_mut(),
     };
-    // SAFETY: `visit` は署名どおりの呼び戻しで、`s` はこの呼び出しの間だけ生きている。途中で止めても戻り値は見ない（`found` で決める）。
+    // SAFETY: `visit`は署名どおりのコールバックで、`s`はこの呼び出しの間だけ生きている。途中で止めても戻り値は見ない（`found`で決める）。
     unsafe { EnumWindows(Some(visit), &mut s as *mut Search as LPARAM) };
     (!s.found.is_null()).then_some(s.found)
 }
 
 /// タスクバーのボタンだけを前面に来るまで点滅させる。タイトルバーと枠（`FLASHW_CAPTION`）は点滅させない。
-/// 枠の点滅はアクティブの行き来に見え、パッドで遊ぶと前面に来ないまま点滅し続ける。
+/// 枠の点滅はアクティブの行き来に見える。パッドで遊ぶと前面に来ないまま点滅し続ける。
 const FLASH_FLAGS: u32 = FLASHW_TRAY | FLASHW_TIMERNOFG;
 
-/// タスクバーを点滅させる（前面に来るまで）。前面にあれば点滅しない。本ログへの 1 句を返す。
+/// タスクバーを点滅させる（前面に来るまで）。前面にあれば点滅しない。本ログへの1句を返す。
 fn flash() -> &'static str {
     let Some(hwnd) = game_window() else {
         return "ゲームのウィンドウが見つからないので点滅しなかった";
@@ -72,7 +72,7 @@ fn flash() -> &'static str {
         uCount: 0,
         dwTimeout: 0,
     };
-    // SAFETY: `info` は大きさを入れた FLASHWINFO。戻り値は「前に点滅していたか」で失敗の印ではない。前面は変えない。
+    // SAFETY: `info`は大きさを設定したFLASHWINFO。戻り値は「前に点滅していたか」で失敗を示す値ではない。前面は変えない。
     unsafe { FlashWindowEx(&info) };
     "ゲームのウィンドウを点滅させた（前面に来たら止まる）"
 }
@@ -85,10 +85,10 @@ fn chime() -> &'static str {
     }
 }
 
-/// 合成した WAV を鳴り終わるまで鳴らす（呼んだスレッドが待つ）。鳴らせなければ false。
+/// 合成したWAVを鳴り終わるまで鳴らす（呼んだスレッドが待つ）。鳴らせなければfalse。
 fn play(wav: &[u8]) -> bool {
-    // SAFETY: `SND_MEMORY` なので 1 つ目の引数は WAV の先頭（`SND_SYNC` で戻るのは鳴り終わった後なので `wav` は生きている）。
-    // `SND_NODEFAULT` なので読めなくても既定の音は鳴らさない。
+    // SAFETY: `SND_MEMORY`なので1つ目の引数はWAVの先頭（`SND_SYNC`で戻るのは鳴り終わった後なので`wav`は生きている）。
+    // `SND_NODEFAULT`なので読めなくても既定の音は鳴らさない。
     let r = unsafe {
         PlaySoundW(
             wav.as_ptr().cast::<u16>(),
@@ -99,14 +99,14 @@ fn play(wav: &[u8]) -> bool {
     r != 0
 }
 
-/// 接続が切れた知らせの音。鳴り終わるまで待つので、ゲームのスレッドでは呼ばない。鳴らせなければ false。
-// 検査のビルドでは呼び手（`script_win::play_lost_chime`）が音を鳴らさずに数えるだけなので、呼ばれない。
+/// 接続が切れた知らせの音。鳴り終わるまで待つのでゲームのスレッドでは呼ばない。鳴らせなければfalse。
+// 検査のビルドでは呼び出し元（`script_win::play_lost_chime`）が音を鳴らさずに数えるだけなので呼ばれない。
 #[cfg_attr(test, allow(dead_code))]
 pub fn lost() -> bool {
     play(&higanr_core::chime_lost::lost_wav())
 }
 
-/// 接続した知らせ（点滅 → 音）。本ログの「ネットワークの外」の行へ足す文を返す。見張りのスレッドから 1 回だけ呼ぶ。
+/// 接続した知らせ（点滅 → 音）。本ログの「ネットワークの外」の行へ足す文を返す。監視スレッドから1回だけ呼ぶ。
 pub fn connected() -> String {
     let f = flash();
     let c = chime();

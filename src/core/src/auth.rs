@@ -1,12 +1,12 @@
-//! 認証タグ（HMAC-SHA256 の先頭 16 バイト。暗号化はしない）。
+//! 認証タグ（HMAC-SHA256の先頭16バイト。暗号化はしない）。
 //!
-//! - 秘密: 接続を始める側が引く 16 バイトの乱数（dll が OS の乱数を引いて渡す）。
-//! - 鍵: `K = HMAC-SHA256(key = 秘密, msg = "HGRT v0 auth" ‖ session_id（LE 4 B）)`。接続ごとに 1 回（`AuthKey::derive`）。
-//! - タグ: `HMAC-SHA256(K, ヘッダ ‖ 本文)` の先頭 16 バイト。比べは crate の定数時間の検証（`Mac::verify_truncated_left`）。
+//! - 秘密の乱数: 接続を始める側が生成する16バイト（dllがOSの乱数を取得して渡す）。
+//! - 鍵: `K = HMAC-SHA256(key = 秘密, msg = "HGRT v0 auth" ‖ session_id（LE 4 B）)`。接続ごとに1回（`AuthKey::derive`）。
+//! - タグ: `HMAC-SHA256(K, ヘッダ ‖ 本文)`の先頭16バイト。比較はcrateの定数時間の検証（`Mac::verify_truncated_left`）で行う。
 //!
-//! 暗号は自作しない: RustCrypto の `hmac` 0.13 と `sha2` 0.11（どちらも MIT OR Apache-2.0）を呼ぶ形をここにまとめる。
-//! ヒープを使わない: タグはゲームスレッドで 1 通ごとに作る・比べる。鍵を入れ終えた HMAC の状態（数百バイト）を `AuthKey` に持ち、1 通ごとにスタックの上でコピーしてから本文を足す（鍵から作り直すと圧縮が 2 回余計にかかる）。
-//! 鍵は 16 B と 32 B だけ（HMAC は 64 B 未満の鍵を 0 で足す。RFC 2104）なので、64 B の配列にして `KeyInit::new` に渡す（失敗の枝も unwrap も要らない）。
+//! 暗号は自作しない: RustCryptoの`hmac` 0.13と`sha2` 0.11（どちらもMIT OR Apache-2.0）を呼ぶ形をここにまとめる。
+//! ヒープを使わない: タグはゲームスレッドで1通ごとに作る・比較する。鍵を設定し終えたHMACの状態（数百バイト）を`AuthKey`に持つ。1通ごとにスタックの上でコピーしてから本文を足す（鍵から作り直すと圧縮が2回余計にかかる）。
+//! 鍵は16 Bと32 Bだけ（HMACは64 B未満の鍵を0で足す。RFC 2104）なので64 Bの配列にして`KeyInit::new`に渡す（失敗の分岐もunwrapも要らない）。
 
 use hmac::digest::Key;
 use hmac::{Hmac, KeyInit, Mac};
@@ -14,13 +14,13 @@ use sha2::Sha256;
 
 pub const SECRET_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
-/// 鍵を作るときに秘密の後ろに付ける文字。プロトコルのバージョン（`wire::PROTO_VER`）を上げても変えない。
-/// 文字をバージョンごとに変えると、違うバージョンの相手のパケットはタグ違いで落ち、「コードの取り違え」と「相手のバージョンが違う」を見分けられない。
-/// 保てば、タグの合ったパケットのヘッダのバージョンを読んで接続前に「相手のバージョンが違う」と言える（`wire::decode` の `BadVersion`）。
-/// 文字の中の "v0" は鍵の作り方のバージョンで、プロトコルのバージョンではない。
+/// 鍵を作るときに秘密の乱数の後ろに付ける文字。プロトコルのバージョン（`wire::PROTO_VER`）を上げても変えない。
+/// 文字をバージョンごとに変えると違うバージョンの相手のパケットはタグ違いで落ちる。すると「コードの取り違え」と「相手のバージョンが違う」を見分けられない。
+/// 変えなければタグの合ったパケットのヘッダのバージョンを読んで接続前に「相手のバージョンが違う」と言える（`wire::decode`の`BadVersion`）。
+/// 文字の中の "v0" は鍵の作り方のバージョン。プロトコルのバージョンではない。
 pub const KEY_LABEL: &[u8] = b"HGRT v0 auth";
 
-/// SHA-256 のブロック長（B）。この長さ以下の鍵は後ろに 0 を足して使う。
+/// SHA-256のブロック長（B）。この長さ以下の鍵は後ろに0を足して使う。
 const BLOCK_LEN: usize = 64;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -35,7 +35,7 @@ impl std::fmt::Debug for Secret {
 }
 
 impl Secret {
-    /// 16 進 32 桁（大文字・小文字どちらも。`0x` は付けない）から読む。
+    /// 16進32桁（大文字・小文字どちらも。`0x`は付けない）から読む。
     pub fn from_hex(s: &str) -> Result<Secret, String> {
         let b = s.as_bytes();
         if b.len() != SECRET_LEN * 2 {
@@ -80,8 +80,7 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// 64 B 以下の鍵を 0 で 64 B にし、鍵を入れ終えた HMAC を作る。64 B を越える鍵は渡さない
-/// （越えた分は切り捨てるので RFC 2104 と違う値になる。`hmac_matches_rfc4231_samples` が 64 B 以下だけを見るのはそのため）。
+/// 64 B以下の鍵を0で64 Bにし、その鍵を設定し終えたHMACを作る。64 Bを越える鍵は渡さない（越えた分は切り捨てるのでRFC 2104と違う値になる。`hmac_matches_rfc4231_samples`が64 B以下だけを見るのはそのため）。
 fn keyed(key: &[u8]) -> HmacSha256 {
     let mut k = [0u8; BLOCK_LEN];
     for (d, s) in k.iter_mut().zip(key.iter()) {
@@ -90,7 +89,7 @@ fn keyed(key: &[u8]) -> HmacSha256 {
     HmacSha256::new(&Key::<HmacSha256>::from(k))
 }
 
-/// 1 回の HMAC-SHA256（32 B）。接続コードの返す側のタグ（`code.rs`）と検査が使う。
+/// 1回のHMAC-SHA256（32 B）。接続コードの返答側のタグ（`code.rs`）と検査が使う。
 pub(crate) fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut m = keyed(key);
     for p in parts {
@@ -104,7 +103,7 @@ pub(crate) fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 #[derive(Clone)]
 pub struct AuthKey {
     mac: HmacSha256,
-    /// K そのもの（接続コードの返す側のタグにも使う）。
+    /// Kそのもの（接続コードの返答側のタグにも使う）。
     k: [u8; 32],
 }
 
@@ -135,7 +134,7 @@ impl AuthKey {
         out
     }
 
-    /// `tag` が `data` のタグか。長さが `TAG_LEN` でなければ偽。
+    /// `tag`が`data`のタグかどうか。長さが`TAG_LEN`でなければ偽。
     pub fn verify(&self, data: &[u8], tag: &[u8]) -> bool {
         if tag.len() != TAG_LEN {
             return false;
@@ -148,7 +147,7 @@ impl AuthKey {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! 期待値はこの crate の外で作った: RFC 4231 §4 の標本と、Python 3 の標準の `hmac` / `hashlib` で計算した値。
+    //! 期待値はこのcrateの外で作った: RFC 4231 §4のサンプルとPython 3の標準の`hmac` / `hashlib`で計算した値。
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
@@ -158,7 +157,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// RFC 4231 §4.2〜§4.6（Test Case 1〜5。鍵 4〜25 B）。Test Case 6・7 は鍵が 131 B で `keyed` の前提の外なので入れない。
+    /// RFC 4231 §4.2〜§4.6（Test Case 1〜5。鍵4〜25 B）。Test Case 6・7は鍵が131 Bで`keyed`の前提の外なので含めない。
     #[test]
     fn hmac_matches_rfc4231_samples() {
         let cases: [(Vec<u8>, &[u8], &str); 5] = [
@@ -199,15 +198,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// 秘密 00 01 … 0f、session_id 0x11223344 を、Python の `hmac` で `b"HGRT v0 auth" + session_id(LE 4 B)` に掛けた値。
+    /// 秘密の乱数00 01 … 0fとsession_id 0x11223344をPythonの`hmac`で`b"HGRT v0 auth" + session_id(LE 4 B)`に掛けた値。
     const K_GOLDEN: &str = "45c520b62dbb40eebccfe58eb7f51993126eba6c3a93388569ce8549bb720acf";
 
-    /// `wire.rs` の PING の golden の 16 B。
+    /// `wire.rs`のPINGのgoldenの16 B。
     #[rustfmt::skip]
     pub(crate) const PING_SIGNED: [u8; 16] = [
         0x48, 0x47, 0x52, 0x54, 0x04, 0x08, 0x00, 0x00, 0x44, 0x33, 0x22, 0x11, 0x60, 0xEA, 0x00, 0x00,
     ];
-    /// 上の 16 B のタグ（Python の `hmac.new(K, PING_SIGNED, hashlib.sha256).digest()[:16]`）。
+    /// 上の16 Bのタグ（Pythonの`hmac.new(K, PING_SIGNED, hashlib.sha256).digest()[:16]`）。
     pub(crate) const PING_TAG: &str = "000c227eb9310fbde04aba055ddd2b0a";
 
     pub(crate) fn golden_secret() -> Secret {
@@ -258,8 +257,8 @@ pub(crate) mod tests {
         assert!(!AuthKey::derive(&s2, 0x1122_3344).verify(&PING_SIGNED, &tag));
     }
 
-    /// 1 通あたりのタグの所要を測るツールなので `#[ignore]`。走らせ方: `cargo test -p higanr_core --release --lib -- --ignored --nocapture measure_tag`。
-    /// 落ちるのは 1 通が 1 ms を越えたとき（建て方の取り違え）だけ。
+    /// 1通あたりのタグの所要時間を測るツールなので`#[ignore]`。走らせ方: `cargo test -p higanr_core --release --lib -- --ignored --nocapture measure_tag`。
+    /// 失敗するのは1通が1 msを越えたとき（ビルド設定の取り違え）だけ。
     #[test]
     #[ignore = "所要を測るだけ。手で --release --ignored --nocapture で走らせる"]
     fn measure_tag_cost_per_datagram() {

@@ -1,13 +1,14 @@
-//! 2 台の模型（`lockstep` の検査の中だけで使う）。
+//! 2台の模型（`lockstep`の検査の中だけで使う）。
 //!
-//! - 1 ms 単位の時計。フレームは 16 ms ごとの枠で、2 台の枠の始まりはずらしてある。
-//! - 枠の始まりに、そのフレームを未取得なら `capture` → INPUT を送る。枠の中は 1 ms ごとに `advance` を試し、揃わない間は
-//!   4 ms ごとに `build_input()` を送り直す。枠の終わりまで揃わなければ stall として数え、次の枠で同じフレームをやり直す。
-//! - 送ったものは必ず encode → decode を通す。方向ごとに `fate` が落とす・遅らせる（入れ替え）・重ねるを決める。
-//! - seg の最後のフレームを使ったら `begin_seg` して読み込みに入る。最後の seg を終えた台も `begin_seg` して、前の seg の
-//!   バックアップの返信だけを続ける。
+//! - 1 ms単位の時計。フレームは16 msごとの枠。2台の枠の始まりはずらしてある。
+//! - 枠の始まりにそのフレームを未取得なら`capture` → INPUTを送る。
+//!   枠の中は1 msごとに`advance`を試し、揃わない間は4 msごとに`build_input()`を送り直す。
+//!   枠の終わりまで揃わなければstallとして数え、次の枠で同じフレームをやり直す。
+//! - 送ったものは必ずencode → decodeを通す。方向ごとに`fate`が落とす・遅らせる（入れ替え）・重ねるを決める。
+//! - マッチの最後のフレームを使ったら`begin_seg`して読み込みに入る。
+//!   最後のマッチを終えた台も`begin_seg`して、前のマッチのバックアップの返信だけを続ける。
 //!
-//! 台 0 = ホスト（席 2P）、台 1 = ゲスト（席 1P）。席と台の番号をわざと入れ違いにしてある（揃えると by_seat の入れ違いが見えない）。
+//! 台 0 = ホスト（サイド2P）、台 1 = ゲスト（サイド1P）。サイドと台の番号をわざと入れ違いにしてある（揃えるとby_seatの入れ違いが見えない）。
 
 use super::*;
 use crate::wire::{self, MAX_DATAGRAM, Message};
@@ -17,7 +18,7 @@ fn net_key() -> &'static crate::auth::AuthKey {
     K.get_or_init(|| crate::auth::AuthKey::derive(&crate::auth::Secret([0x7E; 16]), 0x5EED))
 }
 
-/// 模型の向きの鍵（封じた形だけを通す）。鍵の交換は接続のセッションの仕事なので、両方向に同じ 1 本を使う。
+/// 模型の向きの鍵（封じた形だけを通す）。鍵の交換は接続のセッションの仕事なので両方向に同じ1本を使う。
 fn net_dir() -> crate::seal::DirKeys {
     crate::seal::DirKeys::from_raw([0x7F; 32], [0x7F; 32])
 }
@@ -73,11 +74,11 @@ pub struct Scenario {
     pub one_way_ms: u64,
     pub start_ms: [u64; 2],
     pub load_ms: [u64; 2],
-    /// ホストが (seg の番号, frame, 値) の取得の前に `request_delay` する。
+    /// ホストが (マッチの番号, frame, 値)の取得の前に`request_delay`する。
     pub requests: Vec<(u32, u32, u8)>,
     pub retry_busy: bool,
     pub reply_prev: bool,
-    /// Ctrl＋数字の押下: (台, seg の番号, frame, 値)。その台がその取得の前に `press_delay` する（ホストは次の取得で切替、ゲストは要求）。
+    /// Ctrl＋数字の押下: (台, マッチの番号, frame, 値)。その台がその取得の前に`press_delay`する（ホストは次の取得で切替、ゲストは要求）。
     pub presses: Vec<(usize, u32, u32, u8)>,
 }
 
@@ -129,7 +130,7 @@ pub struct Outcome {
     pub stalls: [u32; 2],
     pub stats: [Stats; 2],
     pub counts: Counts,
-    /// ホストの `request_delay` の結果: (seg の番号, frame, 新しい delay, 結果)。
+    /// ホストの`request_delay`の結果: (マッチの番号, frame, 新しいdelay, 結果)。
     pub requests: Vec<(u32, u32, u8, Result<(), LatError>)>,
 }
 
@@ -196,7 +197,7 @@ impl Net<'_> {
     }
 }
 
-/// 模型を走らせる。全部の seg を両台が終えるか、時間切れ（`finished = false`）まで。
+/// 模型を走らせる。全部のマッチを両台が終えるか時間切れ（`finished = false`）まで。
 pub fn run(sc: &Scenario, fate: &mut dyn FnMut(&SendInfo) -> Fate) -> Outcome {
     let mut nodes: Vec<Node> = (0..2)
         .map(|i| Node {
@@ -368,7 +369,7 @@ pub struct Rng(u64);
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        // `seed | 1` だと 2 と 3 が同じ列になるので、一度かき混ぜる。
+        // `seed | 1`だと2と3が同じ列になるので一度かき混ぜる。
         let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z ^= z >> 31;
@@ -389,7 +390,7 @@ impl Rng {
     }
 }
 
-/// ロス 20%・入れ替え（遅らせる）10%・重複 5%・小さな揺らぎ。
+/// ロス20%・入れ替え（遅らせる）10%・重複5%・小さな揺らぎ。
 pub fn random_fate(seed: u64) -> impl FnMut(&SendInfo) -> Fate {
     let mut rng = Rng::new(seed);
     move |_info| {

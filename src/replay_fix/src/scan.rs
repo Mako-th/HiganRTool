@@ -1,10 +1,10 @@
-//! 選ばれたファイルとフォルダから、直す対象のリプレイ（`.rpy`）の一覧を作る。
+//! 選ばれたファイルとフォルダから直す対象のリプレイ（`.rpy`）の一覧を作る。
 
 use std::path::{Path, PathBuf};
 
 use crate::model::{is_fix_dir, is_pair_dir};
 
-/// フォルダの中を下へたどる深さ（選んだフォルダが 0）。
+/// フォルダの中を下へたどる深さ（選んだフォルダが0）。
 pub const MAX_DEPTH: usize = 4;
 /// 集めるリプレイの上限（指定の間違いで大きなフォルダを全部たどらないため）。
 pub const MAX_FILES: usize = 20_000;
@@ -21,8 +21,9 @@ fn is_replay(p: &Path) -> bool {
     p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rpy"))
 }
 
-/// 選ばれたもの（ファイルかフォルダ）から集める。フォルダは中を下へたどるが、出力先の名前（`fix_replay`・`slow-charge` など）のフォルダの中は
-/// 読まない。ファイルは `.rpy` だけ。無いパス・読めないフォルダは黙って飛ばす。
+/// 選ばれたもの（ファイルかフォルダ）から集める。
+/// フォルダは中を下へたどる。ただし出力先の名前（`fix_replay`・`slow-charge`など）のフォルダの中は読まない。
+/// ファイルは`.rpy`だけ。無いパス・読み取れないフォルダは黙って飛ばす。
 pub fn collect(inputs: &[PathBuf]) -> Found {
     let mut found = Found::default();
     for input in inputs {
@@ -108,7 +109,7 @@ mod tests {
         }
         // 名前が似ているだけのフォルダは読む。
         touch(&d.join("fix_replays").join("kept.rpy"));
-        // 深さ 4（選んだフォルダが 0）の中までは読み、5 つ下は読まない。
+        // 深さ4（選んだフォルダが0）の中までは読み、5つ下は読まない。
         touch(&d.join("1").join("2").join("3").join("4").join("limit.rpy"));
         touch(
             &d.join("1")

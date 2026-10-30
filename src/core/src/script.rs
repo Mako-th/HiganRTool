@@ -1,19 +1,19 @@
-//! 台本（text）の読み取りと、1 tick ずつ進める状態機械。
+//! 台本（text）の読み取りと1 tickずつ進めるステートマシン。
 //!
-//! DLL のゲームのスレッドから毎 tick 呼ばれる（`Engine::step`）ので、確保もパニックもしない（添字は `get`、足し算は
-//! `saturating_*`）。`parse` は台本の読み込み時にしか呼ばれないのでヒープを使ってよい。
-//! 段階の `inv=` / `life1=` / `life2=` / `gauge1=` / `gauge2=` は「いつ効くか」だけをここで決め、ゲームのメモリへ書くのは DLL。
-//! `inv` は後の段階で変えるまで続く値、ライフとゲージは 1 回だけの値で、書けない tick の間は `Engine` が持ち越す（`take_pending`）。
+//! DLLのゲームのスレッドから毎tick呼ばれる（`Engine::step`）ので確保もパニックもしない（添字は`get`、足し算は`saturating_*`）。
+//! `parse`は台本の読み込み時にしか呼ばれないのでヒープを使ってよい。
+//! 段階の`inv=` / `life1=` / `life2=` / `gauge1=` / `gauge2=`は「いつ効くか」だけをここで決める。ゲームのメモリへ書くのはDLL。
+//! `inv`は後の段階で変えるまで続く値。ライフとゲージは1回だけの値で、書き込めないtickの間は`Engine`が持ち越す（`take_pending`）。
 
 use crate::input_model::{MATCH_SEND_MASK, keys};
 use std::collections::HashMap;
 use std::fmt;
 
-/// 台本の置き場をローダー（`--script`）からゲームの中の DLL へ渡す環境変数の名前。
-/// こちらで渡した台本は、DLL が読んだ後に `logs\` へ移さない（2 つのゲームがそれぞれのコピーを持てるように）。
+/// 台本の置き場をローダー（`--script`）からゲームの中のDLLへ渡す環境変数の名前。
+/// こちらで渡した台本はDLLが読んだ後に`logs\`へ移さない（2つのゲームがそれぞれのコピーを持てるように）。
 pub const PATH_ENV: &str = "HIGANRTOOL_SCRIPT";
 
-/// 台本 1 本ぶん。`settle` は画面が移ってから 2 枚目を撮るまでの tick（既定 30。0 なら撮らない）。
+/// 台本1本ぶん。`settle`は画面が移ってから2枚目を撮るまでのtick（既定30。0なら撮らない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script {
     pub steps: Vec<Step>,
@@ -22,50 +22,85 @@ pub struct Script {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
-    /// 台本ファイルの行番号（1 始まり）。
+    /// 台本ファイルの行番号（1始まり）。
     pub line: u32,
     pub cond: Cond,
-    /// 条件を初めて満たしてから押すまでの tick（1 以上。既定 10）。
+    /// 条件を初めて満たしてから押すまでのtick（1以上。既定10）。
     pub wait: u32,
-    /// 押す tick 数（`p1`/`p2` がある段階だけ。1 以上。既定 1）。
+    /// 押すtick数（`p1`/`p2`がある段階だけ。1以上。既定1）。
     pub hold: u32,
     pub p1: u16,
     pub p2: u16,
-    /// 条件を待つ上限の tick（既定 1200 = 20 秒）。
+    /// 条件を待つ上限のtick（既定 1200 = 20秒）。
     pub limit: u32,
     pub shot_pre: bool,
     pub shot_post: bool,
-    /// ログに出す短い名札（空白の無い 1〜64 バイト）。
+    /// ログに出す短いタグ（空白の無い1〜64バイト）。
     pub note: String,
-    /// `optional=1`: 条件が `limit` tick の間満たされなくても中止せず、押さずに次の段階へ進む。押す段階は押し始める tick にもう一度
-    /// 条件を見て、崩れていれば飛ばす（会話を送る Z が、会話の終わった後のメニューの別の項目を決めないため）。
+    /// `optional=1`: 条件が`limit` tickの間満たされなくても中止せず、押さずに次の段階へ進む。
+    /// 押す段階は押し始めるtickにもう一度条件を見て、崩れていれば飛ばす。
+    /// 会話を送るZが、会話の終わった後のメニューの別の項目を決定してしまわないため。
     pub optional: bool,
-    /// `inv=`（無敵にする側のビット `INV_P1` / `INV_P2`。`Some(0)` は切る）。無ければ前の値のまま。
+    /// `inv=`（無敵にする側のビット`INV_P1` / `INV_P2`。`Some(0)`は切る）。無ければ前の値のまま。
     pub inv: Option<u8>,
     pub set: SetOnce,
-    /// `type=` / `bs=` / `enter=`（ルーム名の入力欄へ入れる文字。段階が効き始めたとき 1 回だけ）。
+    /// `type=` / `bs=` / `enter=`（ルーム名の入力欄へ入力する文字。段階が効き始めたとき1回だけ）。
     pub typed: Option<Typed>,
-    /// `digit=` / `tab=` / `copy=`（数字キー・Tab・Ctrl+C をその tick に押したことにする。段階が効き始めたとき 1 回だけ）。
+    /// `digit=` / `tab=` / `copy=`（数字キー・Tab・Ctrl+Cをそのtickに押したことにする。段階が効き始めたとき1回だけ）。
     pub keys: Option<KeyPress>,
+    /// `kbd=`（偽のRaw Inputのイベント。台ごとの押下の表を差し替える。段階が効き始めたとき1回だけ）。
+    pub raw: Option<RawKeys>,
 }
 
-/// 台本が「押した」ことにする数字キー・Tab・Ctrl+C。OS には何も注がず、dll の `NetPlay::digit_tick` と `NetUi::copy_tick` が読む「押した瞬間」の
-/// 集合をその 1 tick だけ差し替える。ビットの並び（数字 d = bit d、Tab = bit10、C = bit13）は dll の `digit_keys` が持つ。
+/// `kbd=`の1台ぶん: 台の番号と押しているVK（空 = 全部離す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawKeyboard {
+    pub dev: u8,
+    vks: [u8; RAW_KEYS_MAX],
+    len: u8,
+}
+
+impl RawKeyboard {
+    pub fn vks(&self) -> &[u8] {
+        self.vks.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+}
+
+/// 台本が入れる偽のRaw Inputのイベント（`kbd=0:Z,1:LEFT+X`）。OSへは何も送らずdllの台ごとの押下の表（`split_kb::DeviceTable`）を差し替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawKeys {
+    boards: [RawKeyboard; RAW_BOARDS_MAX],
+    len: u8,
+}
+
+impl RawKeys {
+    pub fn boards(&self) -> &[RawKeyboard] {
+        self.boards.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+}
+
+/// 1つの`kbd=`に指定できる台の数と1台に指定できるキーの数。
+pub const RAW_BOARDS_MAX: usize = 4;
+pub const RAW_KEYS_MAX: usize = 6;
+
+/// 台本が「押した」ことにする数字キー・Tab・Ctrl+C。
+/// OSへは何も送らず、dllの`NetPlay::digit_tick`と`NetUi::copy_tick`が読む「押した瞬間」の集合をその1 tickだけ差し替える。
+/// ビットの並び（数字 d = bit d、Tab = bit10、C = bit13）はdllの`digit_keys`が持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeyPress {
-    /// 押した数字（0〜9。0〜8 が遅れの値、9 が auto）。
+    /// 押した数字（0〜9。0〜8が遅れの値で9がauto）。
     pub digit: Option<u8>,
     /// Tab（対戦の形式の切替）。
     pub tab: bool,
-    /// Ctrl+C（観戦コードのコピー）。台本の実行は本物のキーを読まないので、人のクリップボードを使わずに `clipboard = file` の置き場へ書かせる。
+    /// Ctrl+C（観戦コードのコピー）。台本の実行は本物のキーを読まないので人のクリップボードを使わずに`clipboard = file`の置き場へ書かせる。
     pub copy: bool,
 }
 
-/// `type=` の文字の長さの上限（ルーム名の上限 `room::ROOM_NAME_MAX` と同じ）。
+/// `type=`の文字の長さの上限（ルーム名の上限`room::ROOM_NAME_MAX`と同じ）。
 pub const TYPED_TEXT_MAX: usize = crate::room::ROOM_NAME_MAX;
 
-/// 台本がルーム名の入力欄へ入れる文字（OS の入力は注がない）。Backspace を `bs` 回 → `type` の文字 → `enter` なら Enter の順。
-/// 文字は `room::RoomName::accepts_char` を通るものだけ。
+/// 台本がルーム名の入力欄へ入力する文字（OSへは入力を送らない）。Backspaceを`bs`回 → `type`の文字 → `enter`ならEnterの順。
+/// 文字は`room::RoomName::accepts_char`を通るものだけ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Typed {
     pub backspaces: u8,
@@ -76,12 +111,12 @@ pub struct Typed {
 
 impl Typed {
     pub fn text(&self) -> &str {
-        // 作るのは `parse_typed` だけで、ASCII の文字しか入らない。
+        // 作るのは`parse_typed`だけ。ASCIIの文字しか入らない。
         core::str::from_utf8(self.text.get(..usize::from(self.text_len)).unwrap_or(&[]))
             .unwrap_or("")
     }
 
-    /// 入れる文字（UTF-16 の単位。`WM_CHAR` の `wParam` と同じ形）の数。
+    /// 入力する文字（UTF-16の単位。`WM_CHAR`の`wParam`と同じ形）の数。
     pub fn unit_count(&self) -> usize {
         usize::from(self.backspaces) + usize::from(self.text_len) + usize::from(self.enter)
     }
@@ -101,18 +136,18 @@ impl Typed {
     }
 }
 
-/// 無敵にする側のビット。bit0 = 1P、bit1 = 2P（DLL の Player のアドレスの並びと同じ）。
+/// 無敵にする側のビット。bit0 = 1P、bit1 = 2P（DLLのPlayerのアドレスの並びと同じ）。
 pub const INV_P1: u8 = 1;
 pub const INV_P2: u8 = 2;
 
-/// `life1=` / `life2=` の範囲。ゲームが初期ライフに選べる 1〜10（DLL の `th09_addr::LIFE_MIN` / `LIFE_MAX`）。
-/// 0 は断る: ゲームがライフを 0 にするのは負けの処理（`0x0041E5CE`）の中だけで、通さずに 0 にするとラウンドの終わりが呼ばれない恐れがある。
+/// `life1=` / `life2=`の範囲。ゲームが初期ライフに選べる1〜10（DLLの`th09_addr::LIFE_MIN` / `LIFE_MAX`）。
+/// 0は断る: ゲームがライフを0にするのは負けの処理（`0x0041E5CE`）の中だけ。その処理を通さずに0にするとラウンドの終わりが呼ばれない恐れがある。
 pub const LIFE_SET_MIN: u32 = 1;
 pub const LIFE_SET_MAX: u32 = 10;
-/// `gauge1=` / `gauge2=` の上限。ゲーム自身が溜めるときの頭打ち 400.0（`0x0041BCF6 movl $0x43c80000`。DLL の `th09_addr::GAUGE_MAX`）。
+/// `gauge1=` / `gauge2=`の上限。ゲーム自身が溜めるときの頭打ち400.0（`0x0041BCF6 movl $0x43c80000`。DLLの`th09_addr::GAUGE_MAX`）。
 pub const GAUGE_SET_MAX: u32 = 400;
 
-/// 1 回だけ書く値（添字 0 = 1P、1 = 2P）。
+/// 1回だけ書く値（添字 0 = 1P、1 = 2P）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SetOnce {
     pub life: [Option<u8>; 2],
@@ -124,7 +159,7 @@ impl SetOnce {
         self.life.iter().all(Option::is_none) && self.gauge.iter().all(Option::is_none)
     }
 
-    /// 後から来た値で上書きする（書いていない欄は残す）。
+    /// 後から来た値で上書きする（書いていないフィールドは残す）。
     fn merge(&mut self, newer: SetOnce) {
         for side in 0..2 {
             if let Some(v) = newer.life[side] {
@@ -147,16 +182,17 @@ pub struct Cond {
     pub pause: Option<bool>,
     pub loading: Option<bool>,
     pub demo: Option<bool>,
-    /// マッチの終わりのメニューが押せる（`endmenu=1`）/ 押せない（`endmenu=0`）。
+    /// マッチ終了時のメニューが押せる（`endmenu=1`）/ 押せない（`endmenu=0`）。
     pub end_menu: Option<bool>,
-    /// マッチの終わりのメニューの印 `[0x4A7ECE]` が立っている（`menuflag=1`。会話が出ていても真）。
+    /// マッチ終了時のメニューの印`[0x4A7ECE]`が立っている（`menuflag=1`。会話が出ていても真）。
     pub menu_flag: Option<bool>,
-    /// 会話が表示中（`talk=1`）/ 走っていない（`talk=0`）。読めない間はどちらを書いても満たさない（台本が止まって理由が出る方が、
-    /// 読めないまま押して会話とメニューを取り違えるより安全）。
+    /// 会話が表示中（`talk=1`）/ 走っていない（`talk=0`）。
+    /// 読めない間はどちらを書いても条件を満たさない。
+    /// 台本が止まって理由が出る方が、読めないまま押して会話とメニューを取り違えるより安全だから。
     pub talk: Option<bool>,
 }
 
-/// DLL がその tick で読めた画面の状態。`screen`/`cursor`/`sub`/`trans` は、場面が 1 で読めたときだけ `Some`。
+/// DLLがそのtickで読めた画面の状態。`screen`/`cursor`/`sub`/`trans`は場面が1で読めたときだけ`Some`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Obs {
     pub scene: u32,
@@ -167,17 +203,18 @@ pub struct Obs {
     pub pause: bool,
     pub loading: bool,
     pub demo: bool,
-    /// マッチの終わりのメニューが出ていて、会話が走っていない（= Z・下がメニューへ届く）。`[0x4A7ECE] != 0` かつ
-    /// `[[0x4A7E38]+0xE94C]` が会話中でない、で作る。場面 2 の中でしか 1 にならない。
+    /// マッチ終了時のメニューが出ていて会話が走っていない（= Z・下がメニューへ届く）。
+    /// `[0x4A7ECE] != 0`かつ`[[0x4A7E38]+0xE94C]`が会話中でないときに真にする。
+    /// 場面2の中でしか1にならない。
     pub end_menu: bool,
-    /// マッチの終わりのメニューの印 `[0x4A7ECE]` の下位 1 バイトが 0 でない（会話は問わない）。
+    /// マッチ終了時のメニューの印`[0x4A7ECE]`の下位1バイトが0でない（会話は問わない）。
     pub menu_flag: bool,
-    /// Gui の会話が走っているか（ゲーム自身の `0x00404980` と同じ判定）。場面 2 のときだけ読み、Gui が無い・読めない・
-    /// 場面 2 でないときは `None`（`talk=` の条件は `None` に対し 0 でも 1 でも満たさない）。
+    /// Guiの会話が走っているかどうか（ゲーム自身の`0x00404980`と同じ判定）。
+    /// 場面2のときだけ読む。Guiが無い・読めない・場面2でないときは`None`（`talk=`の条件は`None`に対し0でも1でも満たさない）。
     pub talk: Option<bool>,
 }
 
-/// 台本が読めなかった理由。行番号は 1 始まりで、台本全体に関わる理由（段階が 1 つも無い）は 0。
+/// 台本が読めなかった理由。行番号は1始まり。台本全体に関わる理由（段階が1つも無い）の行番号は0。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub line: u32,
@@ -282,7 +319,7 @@ fn get_u32_ranged(
     Ok(v)
 }
 
-/// キー名 1 つを `MATCH_SEND_MASK` の中のビットへ。peer_sim の選択の台本も使う。
+/// キー名1つを`MATCH_SEND_MASK`の中のビットへ。peer_simの選択の台本も使う。
 pub fn key_by_name(name: &str) -> Option<u16> {
     match name {
         "Z" => Some(keys::Z),
@@ -298,7 +335,7 @@ pub fn key_by_name(name: &str) -> Option<u16> {
     }
 }
 
-/// `p1=`/`p2=`: `0x` の 16 進、またはキー名を `+` で連結したもの。`MATCH_SEND_MASK` の外のビットが立てば誤り。
+/// `p1=`/`p2=`: `0x`の16進、またはキー名を`+`で連結したもの。`MATCH_SEND_MASK`の外のビットが立てば誤り。
 fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
     let Some(v) = fields.get(name) else {
         return Ok(0);
@@ -324,13 +361,91 @@ fn get_keys(fields: &Fields, line: u32, name: &str) -> Result<u16, ParseError> {
     Ok(value)
 }
 
+/// `kbd=`のキー名 → VK。`0x41`の形の16進も使える。
+fn raw_vk_by_name(name: &str) -> Option<u8> {
+    use crate::split_kb::vk;
+    match name {
+        "Z" => Some(vk::Z),
+        "X" => Some(vk::X),
+        "SHIFT" => Some(vk::SHIFT),
+        "ESC" => Some(vk::ESCAPE),
+        "CTRL" => Some(vk::CONTROL),
+        "UP" => Some(vk::UP),
+        "DOWN" => Some(vk::DOWN),
+        "LEFT" => Some(vk::LEFT),
+        "RIGHT" => Some(vk::RIGHT),
+        "Q" => Some(vk::Q),
+        "S" => Some(vk::S),
+        "D" => Some(vk::D),
+        "R" => Some(vk::R),
+        "ENTER" => Some(vk::RETURN),
+        "NUM8" => Some(vk::NUMPAD8),
+        "NUM2" => Some(vk::NUMPAD2),
+        "NUM4" => Some(vk::NUMPAD4),
+        "NUM6" => Some(vk::NUMPAD6),
+        hex => hex
+            .strip_prefix("0x")
+            .and_then(|h| u8::from_str_radix(h, 16).ok()),
+    }
+}
+
+/// `kbd=`: `台の番号:キー+キー`を`,`で並べる（台は0〜7、最大`RAW_BOARDS_MAX`台、同じ台は1回、1台のキーは最大`RAW_KEYS_MAX`）。
+/// その台の押下を書いたキーだけにする（`none`は全部離す）。不明なキー名は断る。綴りの誤りで黙って何も起きないことを防ぐため。
+fn get_raw_keys(fields: &Fields, line: u32) -> Result<Option<RawKeys>, ParseError> {
+    let Some(v) = fields.get("kbd") else {
+        return Ok(None);
+    };
+    let mut raw = RawKeys::default();
+    for item in v.split(',') {
+        let (dev, keys) = item
+            .split_once(':')
+            .ok_or_else(|| err(line, format!("kbd は 台の番号:キー の形です: {item}")))?;
+        let last = crate::split_kb::DEVICES - 1;
+        let dev = dev
+            .parse::<u8>()
+            .ok()
+            .filter(|&d| usize::from(d) <= last)
+            .ok_or_else(|| err(line, format!("kbd の台の番号は 0〜{last} です: {dev}")))?;
+        let mut board = RawKeyboard {
+            dev,
+            ..RawKeyboard::default()
+        };
+        if keys != "none" {
+            for name in keys.split('+') {
+                let vk = raw_vk_by_name(name)
+                    .ok_or_else(|| err(line, format!("kbd に不明なキー名があります: {name}")))?;
+                let at = usize::from(board.len);
+                let slot = board.vks.get_mut(at).ok_or_else(|| {
+                    err(
+                        line,
+                        format!("kbd の 1 台のキーは {RAW_KEYS_MAX} つまでです"),
+                    )
+                })?;
+                *slot = vk;
+                board.len += 1;
+            }
+        }
+        if raw.boards().iter().any(|b| b.dev == dev) {
+            return Err(err(line, format!("kbd の台 {dev} が重複しています")));
+        }
+        let at = usize::from(raw.len);
+        let slot = raw
+            .boards
+            .get_mut(at)
+            .ok_or_else(|| err(line, format!("kbd の台は {RAW_BOARDS_MAX} つまでです")))?;
+        *slot = board;
+        raw.len += 1;
+    }
+    Ok(Some(raw))
+}
+
 const KNOWN_STEP_FIELDS: &[&str] = &[
     "scene", "screen", "cursor", "sub", "trans", "pause", "loading", "demo", "endmenu", "menuflag",
     "talk", "optional", "p1", "p2", "hold", "wait", "limit", "shot", "note", "inv", "life1",
-    "life2", "gauge1", "gauge2", "type", "bs", "enter", "digit", "tab", "copy",
+    "life2", "gauge1", "gauge2", "type", "bs", "enter", "digit", "tab", "copy", "kbd",
 ];
 
-/// `digit=` / `tab=` / `copy=`。`digit` は 0〜9 の 1 桁（2 桁以上・符号・空は断る）、`tab` と `copy` は 1 だけ。
+/// `digit=` / `tab=` / `copy=`。`digit`は0〜9の1桁（2桁以上・符号・空は断る）。`tab`と`copy`は1だけ。
 fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseError> {
     if !(fields.contains("digit") || fields.contains("tab") || fields.contains("copy")) {
         return Ok(None);
@@ -361,8 +476,8 @@ fn get_keys_press(fields: &Fields, line: u32) -> Result<Option<KeyPress>, ParseE
     Ok(Some(k))
 }
 
-/// `type=` / `bs=` / `enter=`。`type` は `room::RoomName::accepts_char` を通る 1〜`TYPED_TEXT_MAX` 文字（綴りの誤りで
-/// 黙って捨てられないよう、使えない文字は断る）。`bs` は 1〜`TYPED_TEXT_MAX`。`enter` は 1 だけ。
+/// `type=` / `bs=` / `enter=`。`type`は`room::RoomName::accepts_char`を通る1〜`TYPED_TEXT_MAX`文字（使えない文字は断る。綴りの誤りで黙って捨てられないため）。
+/// `bs`は1〜`TYPED_TEXT_MAX`。`enter`は1だけ。
 fn get_typed(fields: &Fields, line: u32) -> Result<Option<Typed>, ParseError> {
     if !(fields.contains("type") || fields.contains("bs") || fields.contains("enter")) {
         return Ok(None);
@@ -379,7 +494,9 @@ fn get_typed(fields: &Fields, line: u32) -> Result<Option<Typed>, ParseError> {
         if let Some(bad) = v.chars().find(|&c| !crate::room::RoomName::accepts_char(c)) {
             return Err(err(
                 line,
-                format!("type に入力できない文字があります（英数字と - _ だけ）: {bad:?}"),
+                format!(
+                    "type に入力できない文字があります（半角の英数字と記号だけ。` ; / は不可）: {bad:?}"
+                ),
             ));
         }
         for (d, s) in t.text.iter_mut().zip(v.bytes()) {
@@ -398,7 +515,7 @@ fn get_typed(fields: &Fields, line: u32) -> Result<Option<Typed>, ParseError> {
     Ok(Some(t))
 }
 
-/// `inv=`: `p1` / `p2` / `p1+p2` / `0` の 4 つだけ。綴りの誤りで黙って無敵にならない・切れないよう、書き方を 1 つに絞る。
+/// `inv=`: `p1` / `p2` / `p1+p2` / `0`の4つだけ。綴りの誤りで黙って無敵にならない・切れないよう、書き方を1つに絞る。
 fn get_inv(fields: &Fields, line: u32) -> Result<Option<u8>, ParseError> {
     match fields.get("inv") {
         None => Ok(None),
@@ -432,7 +549,7 @@ fn get_set_once(fields: &Fields, line: u32) -> Result<SetOnce, ParseError> {
         .into_iter()
         .enumerate()
     {
-        // 範囲は u8 / u16 に収まる。
+        // 範囲はu8 / u16に収まる。
         s.life[side] =
             get_opt_u32_ranged(fields, line, life, LIFE_SET_MIN, LIFE_SET_MAX)?.map(|v| v as u8);
         s.gauge[side] =
@@ -513,6 +630,7 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
     let set = get_set_once(&fields, line)?;
     let typed = get_typed(&fields, line)?;
     let keys = get_keys_press(&fields, line)?;
+    let raw = get_raw_keys(&fields, line)?;
 
     Ok(Step {
         line,
@@ -530,6 +648,7 @@ fn parse_step_line(line: u32, tokens: &[&str]) -> Result<Step, ParseError> {
         set,
         typed,
         keys,
+        raw,
     })
 }
 
@@ -584,9 +703,9 @@ pub fn parse(text: &str) -> Result<Script, ParseError> {
     })
 }
 
-// ---- 状態機械（Engine） ----
+// ---- ステートマシン（Engine） ----
 
-/// 撮影の理由のビット。1 つの tick に複数立ちうる（`Out::shot` は OR で合成する）。
+/// 撮影の理由のビット。1つのtickに複数立ちうる（`Out::shot`はORで合成する）。
 pub const START: u8 = 1;
 pub const PRE: u8 = 2;
 pub const POST: u8 = 4;
@@ -596,15 +715,15 @@ pub const ABORT: u8 = 32;
 pub const END: u8 = 64;
 pub const WAIT: u8 = 128;
 
-/// 1 tick ぶんの出力。`feed` が `None` のときは「台本は何もしないので元の poll_all へ戻せ」の合図。
+/// 1 tickぶんの出力。`feed`が`None`のときは「台本は何もしないので元のpoll_allへ戻せ」という指示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Out {
     pub feed: Option<(u16, u16)>,
     pub shot: u8,
     pub step: u16,
-    /// この tick の無敵の側。台本が終わった・止まった tick からは 0。
+    /// このtickの無敵の側。台本が終わった・止まったtickからは0。
     pub inv: u8,
-    /// この tick に効き始めた 1 回だけの値（書くのは `Engine::take_pending` の側）。
+    /// このtickに効き始めた1回だけの値（書くのは`Engine::take_pending`の側）。
     pub set: SetOnce,
 }
 
@@ -615,8 +734,8 @@ pub enum Status {
     Aborted { step: u16, line: u32 },
 }
 
-/// 段階の中の細かい位置。t0（条件を初めて満たした tick）からの相対位置を「残り tick 数」で持つ（桁あふれの心配が無い）。
-/// `fails` は条件を満たさなかった tick の数。`remaining` は「この tick を含め、あと何 tick がその区間か」（0 にはならない）。
+/// 段階の中の細かい位置。t0（条件を初めて満たしたtick）からの相対位置を「残りtick数」で持つ（桁あふれの心配が無い）。
+/// `fails`は条件を満たさなかったtickの数。`remaining`は「このtickを含めあと何tickがその区間か」（0にはならない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     WaitCond { fails: u32 },
@@ -629,25 +748,27 @@ enum Terminal {
     Aborted { step: u16, line: u32 },
 }
 
-/// 台本を 1 tick ずつ進める状態機械。
+/// 台本を1 tickずつ進めるステートマシン。
 pub struct Engine {
     script: Script,
     index: usize,
     phase: Phase,
     first_tick: bool,
-    /// 前 tick の (scene, screen, pause)。
+    /// 前tickの (scene, screen, pause)。
     prev_key: (u32, Option<u32>, bool),
-    /// SETTLE が予約されている残り tick 数（1 なら次に処理する tick で発火）。
+    /// SETTLEが予約されている残りtick数（1なら次に処理するtickで発火）。
     settle_pending: Option<u32>,
     terminal: Option<Terminal>,
     inv: u8,
-    /// 効き始めたが DLL がまだ書いていない 1 回だけの値。
+    /// 効き始めたがDLLがまだ書いていない1回だけの値。
     pending: SetOnce,
     fired: SetOnce,
-    /// 効き始めたが DLL がまだ入力欄へ入れていない文字。
+    /// 効き始めたがDLLがまだ入力欄へ入力していない文字。
     typed: Option<Typed>,
-    /// 効き始めたが DLL がまだ読んでいない数字キー・Tab の押下。
+    /// 効き始めたがDLLがまだ読んでいない数字キー・Tabの押下。
     keys: Option<KeyPress>,
+    /// 効き始めたがDLLがまだ台の表へ反映していない偽のRaw Inputのイベント。
+    raw: Option<RawKeys>,
 }
 
 impl Engine {
@@ -664,11 +785,12 @@ impl Engine {
             fired: SetOnce::default(),
             typed: None,
             keys: None,
+            raw: None,
             script,
         }
     }
 
-    /// 効き始めた数字キー・Tab の押下を 1 回だけ取り出す。次の段階が効き始める前に取られなかった押下は、後の段階のもので置き換わる。
+    /// 効き始めた数字キー・Tabの押下を1回だけ取り出す。次の段階が効き始める前に取られなかった押下は後の段階のもので置き換わる。
     pub fn take_keys(&mut self) -> Option<KeyPress> {
         if self.terminal.is_some() {
             return None;
@@ -676,7 +798,15 @@ impl Engine {
         self.keys.take()
     }
 
-    /// 効き始めた文字を 1 回だけ取り出す。次の段階が効き始める前に取られなかった文字は、後の段階のもので置き換わる。
+    /// 効き始めた偽のRaw Inputのイベントを1回だけ取り出す。
+    pub fn take_raw(&mut self) -> Option<RawKeys> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        self.raw.take()
+    }
+
+    /// 効き始めた文字を1回だけ取り出す。次の段階が効き始める前に取られなかった文字は後の段階のもので置き換わる。
     pub fn take_typed(&mut self) -> Option<Typed> {
         if self.terminal.is_some() {
             return None;
@@ -684,7 +814,7 @@ impl Engine {
         self.typed.take()
     }
 
-    /// 今の無敵の側。台本が終わった・止まったら 0。
+    /// 今の無敵の側。台本が終わった・止まったら0。
     pub fn inv(&self) -> u8 {
         if self.terminal.is_some() { 0 } else { self.inv }
     }
@@ -693,7 +823,7 @@ impl Engine {
         self.pending
     }
 
-    /// 書ける側（`writable[0]` = 1P、`[1]` = 2P）の 1 回だけの値を取り出す。書けない側の値は次の tick へ持ち越す。
+    /// 書き込み可能な側（`writable[0]` = 1P、`[1]` = 2P）の1回だけの値を取り出す。書き込み不可の側の値は次のtickへ持ち越す。
     pub fn take_pending(&mut self, writable: [bool; 2]) -> SetOnce {
         let mut out = SetOnce::default();
         if self.terminal.is_some() {
@@ -708,12 +838,12 @@ impl Engine {
         out
     }
 
-    /// 持ち越している値を全部捨てて返す（台本が終わった・止まったのに書けていなかった分。ログに残すため）。
+    /// 持ち越している値を全部捨てて返す（台本が終わった・止まったのに書き込めていなかった分。ログに残すため）。
     pub fn discard_pending(&mut self) -> SetOnce {
         core::mem::take(&mut self.pending)
     }
 
-    /// 段階 `self.index` の状態の操作を効かせる（その段階がキーを押し始める tick か、キーの無い段階の wait の終わりの tick）。
+    /// 段階`self.index`の状態の操作を効かせる（その段階がキーを押し始めるtickか、キーの無い段階のwaitの終わりのtick）。
     fn activate(&mut self) {
         let Some(st) = self.script.steps.get(self.index) else {
             return;
@@ -724,6 +854,7 @@ impl Engine {
         let set = st.set;
         let typed = st.typed;
         let keys = st.keys;
+        let raw = st.raw;
         self.pending.merge(set);
         self.fired.merge(set);
         if typed.is_some() {
@@ -731,6 +862,9 @@ impl Engine {
         }
         if keys.is_some() {
             self.keys = keys;
+        }
+        if raw.is_some() {
+            self.raw = raw;
         }
     }
 
@@ -747,8 +881,9 @@ impl Engine {
         }
     }
 
-    /// 画面の組の遷移から TRANSITION / SETTLE / START のビットを作る。既存の予約を先に消化してから、この tick の遷移で
-    /// 新しい予約を作る（「新しい移りで置き換える」を、同じ tick 内で古い予約の消化と取り違えないため）。
+    /// 画面の組み合わせの遷移からTRANSITION / SETTLE / STARTのビットを作る。
+    /// 既存の予約を先に消化してから、このtickの遷移で新しい予約を作る。
+    /// 「新しい遷移で置き換える」ことを、同じtick内で古い予約の消化と取り違えないため。
     fn screen_bits(&mut self, obs: &Obs) -> u8 {
         let mut shot = 0u8;
         let cur_key = (obs.scene, obs.screen, obs.pause);
@@ -792,7 +927,7 @@ impl Engine {
         let mut shot = self.screen_bits(obs);
 
         if self.index >= self.script.steps.len() {
-            // 最後の段階が終わった次の tick で Done になり、feed: None・shot |= END。
+            // 最後の段階が終わった次のtickでDoneになる（feed: None・shot |= END）。
             shot |= END;
             self.terminal = Some(Terminal::Done);
             return Out {
@@ -832,7 +967,7 @@ impl Engine {
                 } else {
                     let fails = fails.saturating_add(1);
                     if fails >= limit && optional {
-                        // 出なかった段階は飛ばす（会話が出ないマッチでも台本が止まらない）。この tick は何も押さない。
+                        // 出なかった段階は飛ばす（会話が出ないマッチでも台本が止まらない）。このtickは何も押さない。
                         self.advance_step();
                     } else if fails >= limit {
                         shot |= ABORT;
@@ -897,7 +1032,7 @@ impl Engine {
         }
     }
 
-    /// Wait 区間の最後の tick に来た処理。キーがある段階は PRE を立てて Hold 区間へ、無い段階は WAIT を立てて次の段階へ。
+    /// Wait区間の最後のtickに来た処理。キーがある段階はPREを立ててHold区間へ、無い段階はWAITを立てて次の段階へ。
     fn finish_wait(&mut self, has_keys: bool, hold: u32, shot_pre: bool, shot_post: bool) -> u8 {
         let mut shot = 0u8;
         if has_keys {
@@ -909,7 +1044,7 @@ impl Engine {
             if shot_post {
                 shot |= WAIT;
             }
-            // キーの無い段階は wait の終わりの tick から状態の操作が効く（段階を進める前に。`activate` は今の段階を見る）。
+            // キーの無い段階はwaitの終わりのtickから状態の操作が効く（段階を進める前に。`activate`は今の段階を見る）。
             self.activate();
             self.advance_step();
         }
@@ -981,7 +1116,7 @@ fn matches_cond(cond: &Cond, obs: &Obs) -> bool {
     {
         return false;
     }
-    // 読めない（`None`）ときは 0 でも 1 でも満たさない。
+    // 読めない（`None`）ときは0でも1でも満たさない。
     if let Some(b) = cond.talk
         && obs.talk != Some(b)
     {
@@ -1155,9 +1290,9 @@ mod tests {
         assert_eq!(out2.feed, Some((0, 0)));
         assert_eq!(out2.shot, 0);
 
-        let out3 = eng.step(&obs_scene(2)); // 満たす（t0）。wait=3 なので Wait 区間へ
+        let out3 = eng.step(&obs_scene(2)); // 満たす（t0）。wait=3なのでWait区間へ
         assert_eq!(out3.feed, Some((0, 0)));
-        assert_eq!(out3.shot, TRANSITION); // scene が 1→2 で変わった
+        assert_eq!(out3.shot, TRANSITION); // sceneが1→2で変わった
     }
 
     #[test]
@@ -1201,7 +1336,7 @@ mod tests {
         assert_eq!(out1.feed, Some((0, 0)));
         let out2 = eng.step(&obs_scene(1));
         assert_eq!(out2.feed, Some((0, 0)));
-        let out3 = eng.step(&obs_scene(1)); // 3 回目の不一致で limit に達する
+        let out3 = eng.step(&obs_scene(1)); // 3回目の不一致でlimitに達する
         assert_eq!(out3.feed, None);
         assert_eq!(out3.shot, ABORT);
         assert_eq!(out3.step, 0);
@@ -1220,12 +1355,12 @@ mod tests {
 
         let out1 = eng.step(&o); // t0 (段階0)
         assert_eq!(out1.feed, Some((0, 0)));
-        let out2 = eng.step(&o); // t0+wait-1 (段階0)。WAIT が立ち、段階1へ。
+        let out2 = eng.step(&o); // t0+wait-1 (段階0)。WAITが立ち、段階1へ。
         assert_eq!(out2.feed, Some((0, 0)));
         assert_eq!(out2.shot, WAIT);
         assert_eq!(out2.step, 0);
 
-        let out3 = eng.step(&o); // 段階1: wait=1 なのでこの tick がそのまま最後。
+        let out3 = eng.step(&o); // 段階1: wait=1なのでこのtickがそのまま最後。
         assert_eq!(out3.feed, Some((0, 0)));
         assert_eq!(out3.shot, WAIT);
         assert_eq!(out3.step, 1);
@@ -1237,12 +1372,12 @@ mod tests {
         let mut eng = Engine::new(script);
 
         eng.step(&obs_scene(1)); // tick1: START（t0）
-        let a = eng.step(&obs_scene(2)); // tick2: scene 1→2 で TRANSITION。settle_pending=3
+        let a = eng.step(&obs_scene(2)); // tick2: scene 1→2でTRANSITION。settle_pending=3
         assert_eq!(a.shot, TRANSITION);
         let b = eng.step(&obs_scene(2)); // tick3: 変化なし。settle_pending=2
         assert_eq!(b.shot, 0);
-        // tick4 で本来 SETTLE が立つはずが、ここで新しい遷移が来て置き換わる。
-        let c = eng.step(&obs_scene(3)); // tick4: scene 2→3 で TRANSITION。旧予約は消える。
+        // 本来はtick4でSETTLEが立つ。ここで新しい遷移が来て置き換わる。
+        let c = eng.step(&obs_scene(3)); // tick4: scene 2→3でTRANSITION。旧予約は消える。
         assert_eq!(c.shot, TRANSITION);
         assert_eq!(
             c.shot & SETTLE,
@@ -1264,13 +1399,13 @@ mod tests {
         let mut eng = Engine::new(script);
         let o = obs_scene(1);
 
-        eng.step(&o); // 段階0完了（wait=1 なのでこの tick で完了、キー無しなので即次へ）
-        let end_out = eng.step(&o); // Done への tick
+        eng.step(&o); // 段階0完了（wait=1なのでこのtickで完了、キー無しなので即次へ）
+        let end_out = eng.step(&o); // Doneへのtick
         assert_eq!(end_out.shot, END);
         assert_eq!(end_out.feed, None);
         assert_eq!(end_out.step, 1);
 
-        let after = eng.step(&o); // Done の後
+        let after = eng.step(&o); // Doneの後
         assert_eq!(after.shot, 0);
         assert_eq!(after.feed, None);
         assert_eq!(after.step, 1);
@@ -1318,7 +1453,7 @@ mod tests {
         assert_eq!(o.feed, Some((keys::DOWN, 0)));
         let o = eng.step(&with(true));
         assert_eq!((o.feed, o.step), (Some((0, 0)), 1));
-        let o = eng.step(&with(false)); // wait=1: 条件を満たした tick が PRE、次が Z
+        let o = eng.step(&with(false)); // wait=1: 条件を満たしたtickがPRE、次がZ
         assert_eq!(o.feed, Some((0, 0)));
         assert_eq!(eng.step(&with(false)).feed, Some((keys::Z, 0)));
     }
@@ -1406,7 +1541,7 @@ mod tests {
             assert_eq!(o.shot & ABORT, 0, "k={k}: 中止した");
         }
         assert_eq!(eng.status(), Status::Running { step: 1 });
-        eng.step(&talk(false)); // 段階 1 の wait=1（PRE）
+        eng.step(&talk(false)); // 段階1のwait=1（PRE）
         assert_eq!(eng.step(&talk(false)).feed, Some((keys::Z, 0)));
         let script = parse("scene=2 talk=1 optional=1 wait=2 p1=Z\nscene=2 wait=1\n").unwrap();
         let mut eng = Engine::new(script);
@@ -1416,8 +1551,8 @@ mod tests {
         let mut eng =
             Engine::new(parse("scene=2 talk=1 optional=1 wait=2 p1=Z\nscene=2 wait=1\n").unwrap());
         eng.step(&talk(true)); // t0
-        eng.step(&talk(true)); // wait の最後
-        let o = eng.step(&talk(false)); // 押し始める tick に条件が崩れている
+        eng.step(&talk(true)); // waitの最後
+        let o = eng.step(&talk(false)); // 押し始めるtickに条件が崩れている
         assert_eq!(o.feed, Some((0, 0)), "崩れたのに押した");
         assert_eq!(eng.status(), Status::Running { step: 1 });
         let mut eng = Engine::new(parse("scene=2 talk=1 limit=2 p1=Z\n").unwrap());
@@ -1477,7 +1612,7 @@ mod tests {
         let mut eng = Engine::new(script);
         let o = obs_scene(1);
         let invs: Vec<u8> = (0..8).map(|_| eng.step(&o).inv).collect();
-        // tick 0〜1: 段階0 の wait。tick 2〜3: 押す。tick 4〜5: 段階1 の wait。tick 6: 段階2 は wait=1 なのでその tick に inv=0 が効く。tick 7: Done。
+        // tick 0〜1: 段階0のwait。tick 2〜3: 押す。tick 4〜5: 段階1のwait。tick 6: 段階2はwait=1なのでそのtickにinv=0が効く。tick 7: Done。
         assert_eq!(invs, vec![0, 0, 3, 3, 3, 3, 0, 0]);
         assert_eq!(eng.status(), Status::Done);
         assert_eq!(eng.inv(), 0);
@@ -1491,9 +1626,9 @@ mod tests {
         let b = eng.step(&obs_scene(1)).inv;
         let c = eng.step(&obs_scene(1)).inv; // t0 + wait − 1
         assert_eq!((a, b, c), (0, 0, INV_P2));
-        assert_eq!(eng.step(&obs_scene(1)).inv, INV_P2); // 段階1 の条件待ち（1 回目の不一致）
+        assert_eq!(eng.step(&obs_scene(1)).inv, INV_P2); // 段階1の条件待ち（1回目の不一致）
         assert_eq!(eng.inv(), INV_P2);
-        let stop = eng.step(&obs_scene(1)); // 2 回目の不一致で止まる
+        let stop = eng.step(&obs_scene(1)); // 2回目の不一致で止まる
         assert_eq!((stop.shot & ABORT, stop.inv), (ABORT, 0));
         assert_eq!(eng.inv(), 0);
     }
@@ -1506,7 +1641,7 @@ mod tests {
         .unwrap();
         let mut eng = Engine::new(script);
         let o = obs_scene(1);
-        let out = eng.step(&o); // 段階0 の wait=1 の tick に効く
+        let out = eng.step(&o); // 段階0のwait=1のtickに効く
         assert_eq!(out.set.life, [Some(1), None]);
         assert_eq!(out.set.gauge, [None, Some(300)]);
         let t = eng.take_pending([true, false]);
@@ -1565,7 +1700,9 @@ mod tests {
         let long = "a".repeat(TYPED_TEXT_MAX + 1);
         for bad in [
             "type=",
-            "type=a.b",
+            "type=a;b",
+            "type=a/b",
+            "type=a`b",
             "type=a_b_c d",
             "type=部屋",
             "type=ＡＢ",
@@ -1579,6 +1716,10 @@ mod tests {
             assert!(parse(&format!("scene=1 {bad}\n")).is_err(), "{bad}");
         }
         assert!(parse(&format!("scene=1 type={}\n", "a".repeat(TYPED_TEXT_MAX))).is_ok());
+        let dotted = parse("scene=1 type=a.b@\"c\\\n").unwrap().steps[0]
+            .typed
+            .unwrap();
+        assert_eq!(dotted.text(), "a.b@\"c\\", "`.` `@` `\"` `\\` は打てる");
         let mut eng = Engine::new(s);
         let o = obs_scene(1);
         eng.step(&o);
@@ -1702,6 +1843,46 @@ mod tests {
         assert_eq!(eng.take_keys(), None, "2 回取り出せた");
     }
 
-    // `Engine::step` が確保しないことの検査は `src/core/tests/alloc_check.rs` にある。割り当てを数えるには `unsafe impl GlobalAlloc`
-    // が要るが、このクレートは `forbid(unsafe_code)` で、integration test は別クレートなので書ける。
+    #[test]
+    fn kbd_field_parses_per_device_key_sets_and_is_taken_once_when_the_step_takes_effect() {
+        use crate::split_kb::vk;
+        let s = parse(
+            "scene=1 wait=2 kbd=0:Z,1:LEFT+X\nscene=1 wait=1 kbd=1:none\nscene=1 wait=1 kbd=2:0x41\nscene=1 wait=1\n",
+        )
+        .unwrap();
+        let r = s.steps[0].raw.unwrap();
+        assert_eq!(r.boards().len(), 2);
+        assert_eq!((r.boards()[0].dev, r.boards()[0].vks()), (0, &[vk::Z][..]));
+        assert_eq!(
+            (r.boards()[1].dev, r.boards()[1].vks()),
+            (1, &[vk::LEFT, vk::X][..])
+        );
+        assert_eq!(s.steps[1].raw.unwrap().boards()[0].vks(), &[] as &[u8]);
+        assert_eq!(s.steps[2].raw.unwrap().boards()[0].vks(), &[0x41]);
+        assert_eq!(s.steps[3].raw, None);
+        for bad in [
+            "kbd=",
+            "kbd=0",
+            "kbd=8:Z",
+            "kbd=x:Z",
+            "kbd=0:Q2",
+            "kbd=0:Z,0:X",
+            "kbd=0:Z+X+Q+S+D+R+UP",
+            "kbd=0:Z,1:Z,2:Z,3:Z,4:Z",
+            "kbd=0:0x100",
+        ] {
+            assert!(parse(&format!("scene=1 {bad}\n")).is_err(), "{bad}");
+        }
+        let mut eng = Engine::new(s);
+        let o = obs_scene(1);
+        eng.step(&o);
+        assert_eq!(eng.take_raw(), None, "効き始める前に出た");
+        eng.step(&o);
+        assert_eq!(eng.take_raw(), Some(r));
+        assert_eq!(eng.take_raw(), None, "2 回取り出せた");
+    }
+
+    // `Engine::step`が確保しないことの検査は`src/core/tests/alloc_check.rs`にある。
+    // 割り当てを数えるには`unsafe impl GlobalAlloc`が要る。
+    // このクレートは`forbid(unsafe_code)`だが、integration testは別クレートなので書ける。
 }

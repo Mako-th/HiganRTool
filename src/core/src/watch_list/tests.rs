@@ -14,6 +14,9 @@ fn t(ms: u64) -> Now {
     }
 }
 
+/// 合成のサイドのチケット（形だけがサーバーと同じ）。
+const TICKET: &str = "1790000000.1790086400.Zq3-_xZq3-_xZq3-_xZq3-_xZq3-_xZq3-_xZq3-_x0";
+
 fn posting(cap: u8) -> Posting {
     Posting {
         room: AssignedRoom::parse(ASSIGNED).unwrap(),
@@ -22,6 +25,7 @@ fn posting(cap: u8) -> Posting {
         mode: Mode::Rollback,
         delay: 1,
         cap,
+        ticket: crate::room::SeatTicket::parse(TICKET).unwrap(),
     }
 }
 
@@ -47,7 +51,7 @@ fn good_row() -> String {
     row_json("w.0123456789abcdef", "Alice", "Bob", "rollback", 1, 3, 10)
 }
 
-/// ホストと相手の `[spectate] enable` の 4 通りのうち、載せるのは両者が 1 のときだけ。
+/// ホストと相手の`[spectate] enable`の4通りのうち載せるのは両者が1のときだけ。
 #[test]
 fn listing_needs_both_players_to_allow_it() {
     for (own, peer, want) in [
@@ -104,10 +108,13 @@ fn constants_match_the_watch_keys_of_the_rules_fixture() {
                 "サーバーの切れた扱いは、こちらが pong を待つ上限より後"
             ),
             ("watch_list_max_bytes", V::Int(n)) => assert_eq!(*n as usize, WATCH_LIST_MAX_BYTES),
+            ("watch_answer_ttl_ms", V::Int(n)) => {
+                assert_eq!(*n as u64, crate::room::WATCH_ANSWER_TTL_MS)
+            }
             other => panic!("見本の鍵を知らない、または型が違う: {other:?}"),
         }
     }
-    assert_eq!(seen, 13, "見本の watch_ の鍵の数");
+    assert_eq!(seen, 14, "見本の watch_ の鍵の数");
     // 新しい閉じる番号も見本にあり、部品の番号・名と合う。
     let key = list.iter().find(|(k, _)| k == "close_list_full");
     assert_eq!(
@@ -175,13 +182,13 @@ fn the_post_text_is_exact_and_clamps_what_the_server_would_refuse() {
     assert_eq!(
         write_post(&p, 3),
         format!(
-            r#"{{"t":"post","room":"{ASSIGNED}","p1":"Alice","p2":"Bob","mode":"rollback","delay":1,"watchers":3,"cap":10}}"#
+            r#"{{"t":"post","room":"{ASSIGNED}","p1":"Alice","p2":"Bob","mode":"rollback","delay":1,"watchers":3,"cap":10,"ticket":"{TICKET}"}}"#
         )
     );
     let mut d = posting(10);
     d.mode = Mode::Delay;
     d.delay = 200;
-    // 観戦者の数は上限まで・遅延は最大まで・上限は 1〜WATCH_CAP_MAX に収める。
+    // 観戦者の数は上限まで・遅延は最大まで・上限は1〜WATCH_CAP_MAXに収める。
     let text = write_post(&d, 99);
     assert!(
         text.contains(r#""mode":"delay","delay":15,"watchers":10,"cap":10"#),
@@ -193,10 +200,37 @@ fn the_post_text_is_exact_and_clamps_what_the_server_would_refuse() {
     assert_eq!(write_count(7), r#"{"t":"count","watchers":7}"#);
 }
 
+/// `"`と`\`を含む名前でも送る文はJSONとして解釈でき、元の名前に戻る。
+#[test]
+fn quotes_and_backslashes_in_names_are_escaped_in_the_post_text() {
+    let mut p = posting(10);
+    p.p1 = WatchName::lossy(r#"a"b\c"#);
+    p.p2 = WatchName::lossy(r#"\"x"#);
+    assert_eq!(p.p1.as_str(), r#"a"b\c"#);
+    let text = write_post(&p, 0);
+    assert!(
+        text.contains(r#""p1":"a\"b\\c","p2":"\\\"x","mode""#),
+        "{text}"
+    );
+    let fields = parse_flat(&text).expect("JSON として読める");
+    let get = |k: &str| {
+        fields.iter().find_map(|(key, v)| match v {
+            V::Str(s) if key.as_ref() == k => Some(s.to_string()),
+            _ => None,
+        })
+    };
+    assert_eq!(get("p1").as_deref(), Some(r#"a"b\c"#));
+    assert_eq!(get("p2").as_deref(), Some(r#"\"x"#));
+    // 名前をそのまま通常の文字で書くものはエスケープしない。
+    assert_eq!(json_escaped("a b.c@"), "a b.c@");
+    assert_eq!(json_escaped("\u{1}"), "\\u0001");
+}
+
 #[test]
 fn a_posting_never_shows_the_assigned_room_in_debug() {
     let p = posting(10);
     assert!(!format!("{p:?}").contains("0123"));
+    assert!(!format!("{p:?}").contains("Zq3"), "Debug に札が出た");
     let c = HostClient::new(p, 0);
     assert!(!format!("{c:?}").contains("0123456789abcdef"), "{c:?}");
 }
@@ -205,18 +239,29 @@ fn a_posting_never_shows_the_assigned_room_in_debug() {
 
 #[test]
 fn watch_names_accept_only_the_server_characters() {
-    for ok in ["a", "Alice-1_@", "?", "?abc?", &"A".repeat(32)] {
+    for ok in [
+        "a",
+        "Alice-1_@",
+        "?",
+        "?abc?",
+        &"A".repeat(32),
+        "a b",
+        "a.b",
+        "<b>",
+        "a\"b\\c",
+    ] {
         assert_eq!(WatchName::parse(ok).unwrap().as_str(), ok);
     }
     for bad in [
         "",
         &"A".repeat(33),
-        "a b",
         " a",
+        "a ",
+        " ",
         "アリス",
         "a/b",
-        "a.b",
-        "<b>",
+        "a;b",
+        "a`b",
         "a\n",
         "a\u{0}",
     ] {
@@ -229,12 +274,25 @@ fn lossy_names_replace_what_the_server_would_refuse() {
     assert_eq!(WatchName::lossy("Alice").as_str(), "Alice");
     assert_eq!(WatchName::lossy("  Bob  ").as_str(), "Bob");
     assert_eq!(WatchName::lossy("アリス").as_str(), "???");
-    assert_eq!(WatchName::lossy("a b.c").as_str(), "a?b?c");
+    assert_eq!(WatchName::lossy("a b.c").as_str(), "a b.c");
+    assert_eq!(WatchName::lossy("a;b`c/d").as_str(), "a?b?c?d");
     assert_eq!(WatchName::lossy("").as_str(), "?");
     assert_eq!(WatchName::lossy("   ").as_str(), "?");
     assert_eq!(WatchName::lossy(&"x".repeat(40)).len(), WATCH_NAME_MAX);
+    // 32文字で切った端が空白なら落とす。
+    let cut = format!("{} y", "x".repeat(31));
+    assert_eq!(WatchName::lossy(&cut).as_str(), "x".repeat(31));
     // 作ったものはサーバーの決まり（parse）を必ず通る。
-    for s in ["", "あ", "a b", "A".repeat(40).as_str(), "Alice", "🙂x"] {
+    for s in [
+        "",
+        "あ",
+        "a b",
+        "A".repeat(40).as_str(),
+        "Alice",
+        "🙂x",
+        cut.as_str(),
+        "a;b",
+    ] {
         let n = WatchName::lossy(s);
         assert_eq!(WatchName::parse(n.as_str()), Some(n), "{s:?}");
     }
@@ -315,7 +373,7 @@ fn a_full_row_is_full_only_at_the_cap() {
 #[test]
 fn rows_outside_the_rules_are_skipped_and_counted_and_the_good_ones_stay() {
     let bad = [
-        // 観戦用でない名（q.… を載せない約束の鏡。サーバーが出したら捨てる）。
+        // 観戦用でない名（q.… を一覧に載せないというサーバーの決まりに対応する。サーバーが出したら捨てる）。
         row_json("q.0123456789abcdef0123456789abcd", "A", "B", "rollback", 1, 0, 10),
         row_json("w.0123456789abcde", "A", "B", "rollback", 1, 0, 10),
         row_json("w.0123456789abcdeff", "A", "B", "rollback", 1, 0, 10),
@@ -323,7 +381,8 @@ fn rows_outside_the_rules_are_skipped_and_counted_and_the_good_ones_stay() {
         row_json("w.0123456789abcdeg", "A", "B", "rollback", 1, 0, 10),
         row_json("x.0123456789abcdef", "A", "B", "rollback", 1, 0, 10),
         row_json("w.0123456789abcdef", "", "B", "rollback", 1, 0, 10),
-        row_json("w.0123456789abcdef", "A", "a b", "rollback", 1, 0, 10),
+        row_json("w.0123456789abcdef", "A", "a;b", "rollback", 1, 0, 10),
+        row_json("w.0123456789abcdef", " A", "B", "rollback", 1, 0, 10),
         row_json("w.0123456789abcdef", "A", "B", "auto", 1, 0, 10),
         row_json("w.0123456789abcdef", "A", "B", "rollback", 16, 0, 10),
         row_json("w.0123456789abcdef", "A", "B", "rollback", -1, 0, 10),
@@ -358,7 +417,7 @@ fn rows_outside_the_rules_are_skipped_and_counted_and_the_good_ones_stay() {
 
 #[test]
 fn a_list_message_that_is_not_a_list_is_an_error() {
-    // items が無い・配列でない・配列の中が物でない・件数が多すぎる・同じ鍵が 2 回。
+    // itemsが無い・配列でない・配列の中が物でない・件数が多すぎる・同じ鍵が2回。
     assert_eq!(
         parse_view_message(r#"{"t":"list"}"#),
         Err(MsgError::Missing("items"))
@@ -470,7 +529,7 @@ fn host_messages() {
     }
 }
 
-// ---------------- ゲームのスレッドへ渡す語 ----------------
+// ---------------- ゲームのスレッドへ渡すワード ----------------
 
 #[test]
 fn a_row_survives_the_words_and_garbage_words_are_refused() {
@@ -483,7 +542,7 @@ fn a_row_survives_the_words_and_garbage_words_are_refused() {
     long.delay = WATCH_DELAY_MAX;
     long.watchers = 10;
     assert_eq!(WatchRow::from_words(&long.to_words()), Some(long));
-    // 語が壊れている: 名前の長さ・文字・遅延・上限・観戦者の数。
+    // ワードが壊れている: 名前の長さ・文字・遅延・上限・観戦者の数。
     let base = r.to_words();
     let mut w = base;
     w[18] = (w[18] & !0xFF) | 33;
@@ -556,7 +615,7 @@ fn the_host_posts_when_upgraded_and_is_listed_on_the_answer() {
     assert_eq!(sends(&a).len(), 1);
     assert!(sends(&a)[0].contains(r#""watchers":2"#));
     assert_eq!(c.state(), HostState::AwaitListed);
-    // 2 回目の 101 は何も起こさない。
+    // 2回目の101は何も起こさない。
     assert!(c.on_upgraded(t(1)).is_empty());
     let a = c.on_text(t(50), r#"{"t":"listed"}"#);
     assert_eq!(a, vec![HostAction::Notify(HostEvent::Listed)]);
@@ -710,7 +769,7 @@ fn the_host_gives_up_when_listed_never_comes_but_never_after() {
         c.poll(t(ROOM_GREETING_TIMEOUT_MS)),
         failed(Failure::Unresponsive(Why::NoRoom))
     );
-    // 載った後は、時間がいくら経っても自分からは切れない（pong が来る限り）。
+    // 載った後は時間がいくら経っても自分からは切れない（pongが来る限り）。
     let mut c = upgraded_host(0);
     c.on_text(t(1), r#"{"t":"listed"}"#);
     let mut now = 1;
@@ -727,7 +786,7 @@ fn the_host_gives_up_when_listed_never_comes_but_never_after() {
 fn the_host_is_cut_when_pongs_stop() {
     let mut c = upgraded_host(0);
     c.on_text(t(1), r#"{"t":"listed"}"#);
-    // 30 秒ごとに ping、最初の ping から PONG_TIMEOUT_MS で切る（途中で他の文が来なければ）。
+    // 30秒ごとにpingを送る。最初のpingからPONG_TIMEOUT_MSで切る（途中で他の文が来なければ）。
     let first = PING_INTERVAL_MS;
     assert_eq!(
         c.poll(t(first)),
@@ -746,7 +805,7 @@ fn the_host_is_cut_when_pongs_stop() {
         c.poll(t(first + PONG_TIMEOUT_MS)),
         failed(Failure::Unresponsive(Why::NoPong))
     );
-    // 否定: pong が 1 通でも届けば数え直す。
+    // 否定: pongが1通でも届けば数え直す。
     let mut c = upgraded_host(0);
     c.on_text(t(1), r#"{"t":"listed"}"#);
     c.poll(t(first));
@@ -785,7 +844,7 @@ fn the_viewer_gets_every_list_in_full_and_stays_open() {
         })]
     );
     assert!(!c.is_finished());
-    // 一覧が届いた後は期限が無い（ping だけ）。
+    // 一覧が届いた後は期限が無い（pingだけ）。
     assert_eq!(c.next_wake(), Some(PING_INTERVAL_MS));
 }
 
@@ -820,7 +879,7 @@ fn the_viewer_fails_without_a_first_list_and_on_the_servers_close() {
             }
         ))]
     );
-    // 101 の前に届いた一覧・載せる口の文・壊れた文は誤り。
+    // 101の前に届いた一覧・載せる口の文・壊れた文は誤り。
     let mut c = ViewClient::new();
     assert!(matches!(
         c.on_text(t(0), &list_json(&[])).as_slice(),

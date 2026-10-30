@@ -1,9 +1,12 @@
-//! 検査だけの偽物: 本物の花映塚の代わりに `rollback_play::PlayMem` を実装する偽のゲーム（`FakeGame`）。
-//! 語のアドレス → 値の表で、コピーは範囲の中の語だけをコピーする。`rollback_play` と `netplay/rollback.rs` の検査が使う。
+//! 検査だけの偽物: 本物の花映塚の代わりに`rollback_play::PlayMem`を実装する偽のゲーム（`FakeGame`）。
+//! 偽のゲームの状態はワードのアドレス → 値の表で持つ。
+//! コピーは範囲の中のワードだけをコピーする。`rollback_play`と`netplay/rollback.rs`の検査が使う。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
+use higanr_core::end_pick::model::EndMenu;
+use higanr_core::end_pick::{Note, Show};
 use higanr_core::render_reset::{self, Field as ResetField, Refused};
 
 use crate::rollback_play::{Order, OutCounts, PlayMem, PlayState, SUP_FIELDS, ScanRun};
@@ -16,12 +19,18 @@ use crate::th09_addr::{
     STAGE_TINT_MODE, SUPERVISOR, UPDATE_REGISTRY, UPDATE_REGISTRY_BYTES, VM_BYTES, VM_CLOCK,
     VM_CUR_INSTR,
 };
+use crate::th09_addr::{
+    END_MENU, INPUT_MANAGERS, MATCH_END_MENU, MENU_OBJ_FRAMES, MENU_OBJ_STATE, PAUSE,
+};
 
-/// 偽の DLL の領域（アドレスは検査の中だけの値。偽のゲームは領域の中身を語の表で持つ）。
+/// 終わりのメニューが閉じるときに書く次の要求（再戦`0x00435A24`の10・キャラを変更`0x00435A08`の1・リプレイを保存して終了`0x00435A40`の6）。
+pub(crate) const END_MENU_REQS: [u32; 3] = [10, 1, 6];
+
+/// 偽のDLLの領域（アドレスは検査の中だけの値。偽のゲームは領域の中身をワードの表で持つ）。
 pub(crate) const ARENA_BASE: u32 = 0x2000_0000;
 pub(crate) const ARENA_BYTES: u32 = 1 << 20;
 pub(crate) const STATE: u32 = 0x004A_8000;
-/// 列の並びに入るがコピーの範囲の外にある語（Supervisor の中。コピーの外の節のリンクの代わり）。
+/// 列の並びに入るがコピーの範囲の外にあるワード（Supervisorの中。コピーの外の節のリンクの代わり）。
 pub(crate) const LIST_OUTSIDE: u32 = SUPERVISOR + 0x10;
 
 pub(crate) struct FakeGame {
@@ -42,61 +51,73 @@ pub(crate) struct FakeGame {
     pub(crate) now: u64,
     pub(crate) ret: i32,
     pub(crate) consume: bool,
-    /// p2 がこの値の tick で次の場面の要求を立てる・列の並びを変える・外の塊を取る。
+    /// p2がこの値のtickで次の場面の要求を立てる・列の並びを変える・外のブロックを取る。
     pub(crate) scene_on_p2: Option<u16>,
-    /// 数えた tick（`RNG_COUNT`。進め直しで戻る）がこの数の倍数になる tick で次の場面の要求を立てる（対戦の両側で同じ tick になる）。
+    /// 数えたtick（`RNG_COUNT`。進め直しで戻る）がこの数の倍数になるtickで次の場面の要求を立てる（対戦の両側で同じtickになる）。
     pub(crate) scene_every_ticks: Option<u32>,
     pub(crate) list_on_p2: Option<u16>,
     pub(crate) alloc_on_p2: Option<u16>,
     pub(crate) se_in_resim: u32,
     /// 列の並びを本物と同じ形（レジストリから次をたどる）で読む。偽なら簡単な形。
     pub(crate) real_lists: bool,
-    /// 解放を CRT へ渡さなかった塊・旗・節を書き戻した数・節の書き戻しを断るか。
+    /// 解放をCRTへ渡さなかったブロック・旗・節を書き戻した数・節の書き戻しを断るかどうか。
     pub(crate) held: Vec<u32>,
     pub(crate) hold_frees: bool,
     pub(crate) node_writes: u32,
     pub(crate) refuse_node_writes: bool,
     pub(crate) hold_in_scans: Vec<bool>,
     pub(crate) pending_sets: u32,
-    /// コピーのときにバックアップした ScreenEffect の本体のアドレス・見張りの外で CRT へ解放が渡った本体・本体を書き戻した数・
-    /// 本体の書き戻しを断るか。
+    /// コピーのときにバックアップしたScreenEffectの本体のアドレス・監視していないときにCRTへ解放が渡った本体・本体を書き戻した数・本体の書き戻しを断るかどうか。
     pub(crate) stray_bodies: Vec<u32>,
     pub(crate) freed_bodies: Vec<u32>,
     pub(crate) body_writes: u32,
     pub(crate) refuse_body_writes: bool,
     pub(crate) body_reads: u32,
-    /// Stage の色の模様の真似（`th09_addr::STAGE_TINT` の注の本物の形）: p2 がこの値の tick でスペルカードの始まりの形
-    /// （1P の Stage に模様 1・2P に模様 2、残り `TINT_TICKS`）を立てる。更新（feed の走査）は模様が 0 でない Stage の色を書き、
-    /// 残りが尽きたら模様を 0 にする。描画は色を描画の後の値に戻す。`None` なら Stage の欄に触らない。
+    /// Stageの色のパターンの真似（`th09_addr::STAGE_TINT`の注の本物の形）。
+    /// p2がこの値のtickでスペルカードの始まりの形（1PのStageにパターン1・2Pにパターン2、残り`TINT_TICKS`）を立てる。
+    /// 更新（feedの走査）はパターンが0でないStageの色を書く。
+    /// 残りが尽きたらパターンを0にする。
+    /// 描画は色を描画の後の値に戻す。`None`ならStageのフィールドに触らない。
     pub(crate) tint_on_p2: Option<u16>,
     pub(crate) reset_calls: u32,
-    /// fps の計測 `0x4316B0` の真似: 描画のたびに描画の回数を 1 足し、基準の時刻から 500 ms 以上なら fps を計算し直して
-    /// 丸めた値を `FPS_SHOWN` に書く。時刻は描画の回数 × 50 / 3 ms（60 fps）。偽なら fps の欄に触らない。
+    /// fpsの計測`0x4316B0`の真似。
+    /// 描画のたびに描画の回数を1足し、基準の時刻から500 ms以上ならfpsを計算し直して丸めた値を`FPS_SHOWN`に書く。
+    /// 時刻は描画の回数 × 50 / 3 ms（60 fps）。偽ならfpsのフィールドに触らない。
     pub(crate) fps_model: bool,
     pub(crate) draws: u32,
-    /// 毎 tick に `s & 0x3F` の id の SE を積む雑音（既定 true）。SE の検査は false にして、決まった出来事だけを積む。
+    /// 毎tickに`s & 0x3F`のidのSEを積む雑音（既定true）。SEの検査はfalseにして決まったイベントだけを積む。
     pub(crate) se_noise: bool,
-    /// 相手の入力ワード（p2）が前の tick から変わった tick で `id + (p2 & 0xF)` の SE を積む（状態は `STATE + 8` に持つので書き戻しで戻る）・
-    /// 自分の入力ワード（p1）が変わった tick で同じく（`STATE + 4`）。予測は相手の直前の入力ワードの繰り返しなので、相手の変わり目の出来事は
-    /// 予測では起きず、進め直しの確定の回で初めて起きる。
+    /// 相手の入力ワード（p2）が前のtickから変わったtickに`id + (p2 & 0xF)`のSEを積む（状態は`STATE + 8`に持つので書き戻しで戻る）。
+    /// 自分の入力ワード（p1）が変わったtickにも同じように積む（`STATE + 4`）。
+    /// 予測は相手の直前の入力ワードの繰り返しなので、相手の変わり目のイベントは予測では起きず、進め直しの確定の回で初めて起きる。
     pub(crate) se_p2_change: Option<u32>,
     pub(crate) se_p1_change: Option<u32>,
-    /// p2 がこの値の tick で SE を積む（状態を持たない）。
+    /// p2がこの値のtickでSEを積む（状態を持たない）。
     pub(crate) se_p2_eq: Option<(u16, u32)>,
-    /// `push_se`（遅れて積み直し）で積んだ (id, パン) の列。`se_refuse` が真なら先頭のバイト列が合わない本物と同じに断る。
+    /// `push_se`（遅れて積み直し）で積んだ (id, パン)の列。`se_refuse`が真なら先頭のバイト列が合わない本物と同じに断る。
     pub(crate) se_pushed: Vec<(u32, i32)>,
     pub(crate) se_refuse: bool,
-    /// 鳴らした（`play_and_draw` が待ち行列を空にした）SE の記録: (何回目の do_frame か, id, 回数)。
+    /// 鳴らした（`play_and_draw`が待ち行列を空にした）SEの記録: (何回目のdo_frameか, id, 回数)。
     pub(crate) se_log: Vec<(u32, u32, u32)>,
     pub(crate) se_draws: u32,
-    /// 読めないアドレス（`read_u32` が `None` を返す。出力のバックアップを取れなかった進め直しの形）。
+    /// 読めないアドレス（`read_u32`が`None`を返す。出力のバックアップを取れなかった進め直しの形）。
     pub(crate) deny_read: Option<u32>,
+    /// マッチ終了時のメニューの模型（`higanr_core::end_pick::model`）。数えたtickがこの値のtickの後にメニューを出す。
+    /// 状態と数え・印・`[2]`の前のワードは本物と同じアドレスのワードに持つ（コピーの範囲の中なので書き戻しで戻る）。
+    /// 閉じたら決定済みの項目の次の要求を立てる。`None`なら触らない。
+    pub(crate) end_open_at: Option<u32>,
+    /// feedの走査ごとの (数えたtick, p1, p2, `[2]`のワード)。後の走査が同じtickを上書きするので最後に残った行が確定の行。
+    pub(crate) feeds: Vec<(u32, u16, u16, u16)>,
+    /// メニューが閉じた走査の (数えたtick, 決定済みの項目)（予測の走査を含む）・本ログへの通知・画面へ渡したもの。
+    pub(crate) end_closes: Vec<(u32, u8)>,
+    pub(crate) end_notes: Vec<(u16, Note, u32)>,
+    pub(crate) end_shows: Vec<Show>,
 }
 
-/// 偽のゲームの陣の背景の VM の配列のアドレス（陣ごと。検査の中だけの値）。
+/// 偽のゲームの陣の背景のVMの配列のアドレス（陣ごと。検査の中だけの値）。
 pub(crate) const BG_ARRAY: [u32; 2] = [0x0E00_0000, 0x0E10_0000];
 
-/// 偽のゲームのスペルカードの模様の長さ（本物 `0x404161 mov $0x1e`）。
+/// 偽のゲームのスペルカードのパターンの長さ（本物`0x404161 mov $0x1e`）。
 pub(crate) const TINT_TICKS: u32 = 0x1E;
 
 impl FakeGame {
@@ -173,11 +194,51 @@ impl FakeGame {
             se_log: Vec::new(),
             se_draws: 0,
             deny_read: None,
+            end_open_at: None,
+            feeds: Vec::new(),
+            end_closes: Vec::new(),
+            end_notes: Vec::new(),
+            end_shows: Vec::new(),
         }
     }
 
-    /// SE を 1 つ積む（本物の `0x43E2F0` の形: 同じ id の枠があれば回数を増やしてパンを足し、無ければ最初の空き枠へ id・パン・回数 1。
-    /// 回数が 0x80 以上なら足さない。12 枠が埋まっていれば捨てる）。
+    /// 終わりのメニューの模型の1フレーム（feedの走査の中。`tick`はこの走査の前の数えたtick）。
+    fn end_menu_tick(&mut self, tick: u32, w2: u16) {
+        let im2 = INPUT_MANAGERS[2];
+        let pressed = w2 & !(self.get(im2) as u16);
+        self.mem.insert(im2, u32::from(w2));
+        let mut m = EndMenu {
+            shown: (self.get(PAUSE) >> ((MATCH_END_MENU - PAUSE) * 8)) & 0xFF != 0,
+            state: self.get(END_MENU + MENU_OBJ_STATE),
+            frames: self.get(END_MENU + MENU_OBJ_FRAMES),
+        };
+        if let Some(item) = m.frame(pressed) {
+            self.end_closes.push((tick, item));
+            self.mem
+                .insert(SUP_FIELDS[1], END_MENU_REQS[usize::from(item)]);
+        }
+        if self.end_open_at == Some(tick) {
+            m = EndMenu::open(m.frames);
+        }
+        let flag = u32::from(m.shown) << ((MATCH_END_MENU - PAUSE) * 8);
+        self.mem.insert(PAUSE, flag);
+        self.mem.insert(END_MENU + MENU_OBJ_STATE, m.state);
+        self.mem.insert(END_MENU + MENU_OBJ_FRAMES, m.frames);
+    }
+
+    /// 数えたtickごとの最後のfeed（確定した行）。
+    pub(crate) fn final_feeds(&self) -> Vec<(u32, u16, u16, u16)> {
+        let mut last: BTreeMap<u32, (u16, u16, u16)> = BTreeMap::new();
+        for &(t, p1, p2, w2) in &self.feeds {
+            last.insert(t, (p1, p2, w2));
+        }
+        last.into_iter()
+            .map(|(t, (p1, p2, w2))| (t, p1, p2, w2))
+            .collect()
+    }
+
+    /// SEを1つ積む（本物の`0x43E2F0`の形: 同じidの枠があれば回数を増やしてパンを足し、無ければ最初の空き枠へid・パン・回数1。
+    /// 回数が0x80以上なら足さない。12枠が埋まっていれば捨てる）。
     pub(crate) fn se_queue_push(&mut self, id: u32, pan: i32) {
         for slot in 0..SND_SE_SLOTS {
             let id_at = SOUND_MANAGER + SND_SE_IDS + slot * 4;
@@ -244,7 +305,7 @@ impl FakeGame {
         self.se_log.iter().map(|&(_, id, _)| id).collect()
     }
 
-    /// 両陣の Stage に陣の背景の VM の配列（`n` 本。どれも動いている —— 今の命令が 0 でない）を用意する（本物は読み込みが用意する）。
+    /// 両陣のStageに陣の背景のVMの配列（`n`本。どれも動いている —— 今の命令が0でない）を用意する（本物は読み込みが用意する）。
     pub(crate) fn set_bg(&mut self, n: u32) {
         for (side, &arr) in BG_ARRAY.iter().enumerate() {
             let s = self.stage(side);
@@ -262,8 +323,9 @@ impl FakeGame {
         self.get(BG_ARRAY[side] + i * VM_BYTES + VM_CLOCK)
     }
 
-    /// 更新 `Stage::on_tick 0x402350` → `0x4011D0` の真似（feed の走査の中）: 用意した VM の時計を 1 進める（run_vm の末尾
-    /// `0x4393A1`）。本数は Stage の欄から読む（コピーの書き戻しで戻った値で回る）。
+    /// 更新`Stage::on_tick 0x402350` → `0x4011D0`の真似（feedの走査の中）。
+    /// 用意したVMの時計を1進める（run_vmの末尾`0x4393A1`）。
+    /// 本数はStageのフィールドから読む（コピーの書き戻しで戻った値で回る）。
     fn bg_tick(&mut self) {
         for side in 0..2 {
             let s = self.stage(side);
@@ -280,7 +342,7 @@ impl FakeGame {
         }
     }
 
-    /// fps の計測 `0x4316B0` の真似（描画の中）。
+    /// fpsの計測`0x4316B0`の真似（描画の中）。
     fn fps_draw(&mut self) {
         self.draws += 1;
         let now = self.draws * 50 / 3;
@@ -288,7 +350,7 @@ impl FakeGame {
         self.mem.insert(FPS_DRAWS, count);
         let base = self.get(FPS_BASE_MS);
         if now.wrapping_sub(base) >= 500 {
-            // `0x43171D cmp $0x1f4` → 回数 ÷ 経った秒、+0.5 を切り捨て（`0x4318B8` / `0x4318BE`）。
+            // `0x43171D cmp $0x1f4` → 回数 ÷ 経った秒を出し、0.5を足して切り捨てる（`0x4318B8` / `0x4318BE`）。
             let fps = (count * 1000 + (now - base) / 2) / (now - base);
             self.mem.insert(FPS_BASE_MS, now);
             self.mem.insert(FPS_DRAWS, 0);
@@ -309,8 +371,8 @@ impl FakeGame {
         self.get(ptr_at)
     }
 
-    /// do_frame が走査の後に SE と BGM を鳴らして空にし、描画で文字の数を 0 にする形。Stage の色の真似が入っていれば、
-    /// 描画 `0x403680` と同じく色を描画の後の値に戻す。
+    /// do_frameが走査の後にSEとBGMを鳴らして空にし、描画で文字の数を0にする形。
+    /// Stageの色の真似が有効なら、描画`0x403680`と同じく色を描画の後の値に戻す。
     pub(crate) fn play_and_draw(&mut self) {
         self.se_draws += 1;
         let n = self.se_draws;
@@ -335,8 +397,9 @@ impl FakeGame {
         }
     }
 
-    /// 更新 `Stage::on_tick 0x402350` の色の部分の真似。`p2` が `tint_on_p2` なら模様を立てる（スペルカードの始まり
-    /// `0x403E50` の真似。更新の中で立つので、その tick の Stage の更新より前に立てる。本物の順は読んでいない）。
+    /// 更新`Stage::on_tick 0x402350`の色の部分の真似。
+    /// `p2`が`tint_on_p2`ならパターンを立てる（スペルカードの始まり`0x403E50`の真似）。
+    /// 本物では更新の中で立つのでそのtickのStageの更新より前に立てる。本物の順は読んでいない。
     fn tint_tick(&mut self, p2: u16) {
         let Some(trigger) = self.tint_on_p2 else {
             return;
@@ -422,8 +485,8 @@ impl PlayMem for FakeGame {
         self.mem.extend(s);
         self.arena_top = top;
     }
-    /// コピー（語の表）の範囲 `r` の中を塊のバイト列に組み直して本物と同じ `render_reset::apply` を掛け、欄に掛かる語だけを
-    /// コピーへ戻す（偽のゲームの語は 4 の倍数のアドレスに割り当てる）。
+    /// コピー（ワードの表）の範囲`r`の中をブロックのバイト列に組み直し、本物と同じ`render_reset::apply`を掛ける。
+    /// フィールドに掛かるワードだけをコピーへ戻す（偽のゲームのワードは4の倍数のアドレスに割り当てる）。
     fn reset_in_snap(&mut self, r: &Region, fields: &[ResetField<'_>]) -> Result<u32, Refused> {
         self.reset_calls += 1;
         let len = r.len.min(r.cap);
@@ -469,7 +532,12 @@ impl PlayMem for FakeGame {
     fn run_scan(&mut self, order: Order, resim: bool) -> ScanRun {
         self.scans.push((order, resim));
         self.hold_in_scans.push(self.hold_frees);
-        if let Order::Feed { p1, p2 } = order {
+        if let Order::Feed { p1, p2, w2 } = order {
+            if self.end_open_at.is_some() {
+                let tick = self.get(RNG_COUNT);
+                self.feeds.push((tick, p1, p2, w2));
+                self.end_menu_tick(tick, w2);
+            }
             let s = self
                 .get(STATE)
                 .wrapping_mul(31)
@@ -477,7 +545,7 @@ impl PlayMem for FakeGame {
             self.mem.insert(STATE, s);
             self.mem.insert(RNG_ADDR, s & 0xFFFF);
             self.mem.insert(RNG_COUNT, self.get(RNG_COUNT) + 1);
-            // SE・BGM・文字の数を積む（本物は走査の中の SE の積み `0x43E2F0`・BGM の `0x43EE40`・文字の `0x4342A0`）。
+            // SE・BGM・文字の数を積む（本物は走査の中のSEの積み`0x43E2F0`・BGMの`0x43EE40`・文字の`0x4342A0`）。
             if self.se_noise {
                 self.se_queue_push(s & 0x3F, 0);
             }
@@ -597,7 +665,13 @@ impl PlayMem for FakeGame {
     fn body_freed(&mut self, addr: u32) -> bool {
         !self.stray_bodies.contains(&addr) || self.freed_bodies.contains(&addr)
     }
-    /// 本物と同じ向き: 先頭のバイト列が合わなければ（`se_refuse`）積まずに false。積めば待ち行列へ本物の形で積む。
+    /// 本物と同じ向き: 先頭のバイト列が合わなければ（`se_refuse`）積まずにfalse。積めば待ち行列へ本物の形で積む。
+    fn end_show(&mut self, show: &Show) {
+        self.end_shows.push(*show);
+    }
+    fn end_note(&mut self, seg: u16, note: Note, frame: u32) {
+        self.end_notes.push((seg, note, frame));
+    }
     fn push_se(&mut self, id: u32, pan: i32) -> bool {
         if self.se_refuse {
             return false;

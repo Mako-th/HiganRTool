@@ -1,8 +1,8 @@
-//! 起動しようとしている th09.exe と同じパスの th09.exe がもう動いているか、を決める純粋な部分。
-//! プロセスの一覧と名前つきミューテックスは Win32 の層（ローダーの `single`）が受け持つ。
+//! 起動しようとしているth09.exeと同じパスのth09.exeがもう動いているかどうかを判定する純粋な部分。
+//! プロセスの一覧と名前つきミューテックスはWin32の層（ローダーの`single`）が受け持つ。
 //!
-//! パスは大文字・小文字を区別せず、区切り・`.` / `..`・`\\?\` の接頭辞をそろえて比べる（NTFS は大文字・小文字を区別しない）。
-//! 8.3 の短い名前までは解かない。呼ぶ側が `canonicalize` した絶対パスを渡す。
+//! パスは大文字・小文字を区別せず、区切り・`.` / `..`・`\\?\`の接頭辞をそろえて比べる（NTFSは大文字・小文字を区別しない）。
+//! 8.3の短い名前までは解かない。呼ぶ側が`canonicalize`した絶対パスを渡す。
 
 /// 比べるためのパスの形。`\\?\C:\a` → `c:\a`、`\\?\UNC\s\x` → `\\s\x`。
 pub fn normalize_path(path: &str) -> String {
@@ -38,13 +38,13 @@ pub fn same_path(a: &str, b: &str) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 
-/// パスの最後の要素（ファイル名）。区切りは `\` と `/`。
+/// パスの最後の要素（ファイル名）。区切りは`\`と`/`。
 pub fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// プロセスの一覧（pid と実行ファイル名）から、`target` と同じ名前のものの pid を返す。自分は除く。
-/// 名前で絞るのは、全プロセスのフルパスを引く（権限のないものもある）のを避けるため。
+/// プロセスの一覧（pidと実行ファイル名）から`target`と同じ名前のもののpidを返す。自分は除く。
+/// 名前で絞るのは全プロセスのフルパスを取得する（権限のないものもある）のを避けるため。
 pub fn same_name_pids(procs: &[(u32, String)], target: &str, own_pid: u32) -> Vec<u32> {
     let want = file_name(target).to_lowercase();
     procs
@@ -54,13 +54,13 @@ pub fn same_name_pids(procs: &[(u32, String)], target: &str, own_pid: u32) -> Ve
         .collect()
 }
 
-/// 花映塚が起動すると作る二重起動の印（`0x0042D909 push $0x490244` の CreateMutexA の名前。永夜抄と同じ名前）。
-/// これがあれば、花映塚（か永夜抄）が動いている。thprac もこの名前で動いているゲームを見つける。
+/// 花映塚が起動すると作る二重起動の印（`0x0042D909 push $0x490244`のCreateMutexAの名前。永夜抄と同じ名前）。
+/// これがあれば花映塚（か永夜抄）が動いている。thpracもこの名前で動いているゲームを見つける。
 pub const GAME_MUTEX: &str = "Touhou 08 App";
 
-/// ローダー同士が「確認から起動まで」を 1 つにするための名前つきミューテックスの名前。
-/// 同じゲームの実行ファイルなら同じ名前、別のフォルダなら別の名前になる（検査用のコピーは並べて動かせる）。
-/// `Local\` はセッションごと。名前に `\` は使えないので、パスは FNV-1a の 64 ビットにする。
+/// ローダー同士が「確認から起動まで」を1つずつ順に行うための名前つきミューテックスの名前。
+/// 同じゲームの実行ファイルなら同じ名前になり、別のフォルダなら別の名前になる（検査用のコピーは並べて動かせる）。
+/// `Local\`はセッションごと。名前に`\`は使えないのでパスはFNV-1aの64ビットにする。
 pub fn lock_name(target: &str) -> String {
     let mut h: u64 = 0xCBF2_9CE4_8422_2325;
     for b in normalize_path(target).bytes() {
@@ -94,7 +94,7 @@ mod tests {
         assert!(!same_path(A, r"C:\Games\Touhou_b\th09.exe"));
         assert!(!same_path(A, r"C:\Games\Touhou\th09b.exe"));
         assert!(!same_path(A, r"D:\Games\Touhou\th09.exe"));
-        // 先頭の区切りの数が違うだけの UNC とドライブは別物。
+        // 先頭の区切りの数が違うだけのUNCとドライブは別物。
         assert!(!same_path(r"\\srv\th09.exe", r"srv\th09.exe"));
     }
 
@@ -112,7 +112,7 @@ mod tests {
             (13, "explorer.exe".to_string()),
         ];
         assert_eq!(same_name_pids(&procs, A, 99), vec![10, 11]);
-        // 自分の pid は除く。
+        // 自分のpidは除く。
         assert_eq!(same_name_pids(&procs, A, 10), vec![11]);
         assert!(same_name_pids(&[], A, 1).is_empty());
         assert_eq!(file_name(A), "th09.exe");
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(n, lock_name(r"\\?\c:\GAMES\touhou\TH09.exe"));
         assert_ne!(n, lock_name(r"C:\Games\Touhou_b\th09.exe"));
         assert!(n.starts_with("Local\\HiganRTool_Launch_"));
-        // 名前に区切りの `\` は 1 つだけ（`Local\` の後ろ）。
+        // 名前に区切りの`\`は1つだけ（`Local\`の後ろ）。
         assert_eq!(n.matches('\\').count(), 1, "{n}");
     }
 }

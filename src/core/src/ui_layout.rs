@@ -1,12 +1,13 @@
-//! ゲーム内 UI の頂点の配置（pure。D3D8 は触らない）。
+//! ゲーム内UIの頂点の配置（pure。D3D8は触らない）。
 //!
-//! 右下に 1 行を配置する `overlay::layout_line` では、画面の中央のメニュー・左上の行・上の枠の左の行は配置できない。
-//! ここは「左上の座標（画素）を渡して配置する」下の層（四角形と 1 行の文字）と、中央の枠の大きさの決め方を持つ。
-//! 文字の幅・フォールバック（表に無い文字は `?`）・ゲームの文字の配置は `overlay::resolve` を使う（`layout_line` と同じ幅になる）。
+//! 右下に1行を配置する`overlay::layout_line`では画面の中央のメニュー・左上の行・上の枠の左の行は配置できない。
+//! ここは「左上の座標（画素）を渡して配置する」下の層（四角形と1行の文字）と、中央の枠の大きさの決め方を持つ。
+//! 文字の幅・フォールバック（表に無い文字は`?`）・ゲームの文字の配置は`overlay::resolve`を使う（`layout_line`と同じ幅になる）。
 //!
-//! ゲームのスレッドで毎フレーム呼ぶので、確保もパニックもしない（出力は呼び手の配列。添字は範囲を検証してから使う）。
-//! メニューは行ごとに `DrawPrimitiveUP` を呼ぶ（1 行は最大 `MAX_TEXT` 文字 = `MAX_VERTS` 頂点で、スタックの配列が小さく済む。
-//! 状態の保存と戻しは 1 回にまとめる。`overlay_win::draw_with_saved_state`）。
+//! ゲームのスレッドで毎フレーム呼ぶので確保もパニックもしない（出力は呼び手の配列。添字は範囲を検証してから使う）。
+//! メニューは行ごとに`DrawPrimitiveUP`を呼ぶ。
+//! 1行は最大`MAX_TEXT`文字 = `MAX_VERTS`頂点なのでスタックの配列が小さく済む。
+//! 状態の保存と復元は1回にまとめる（`overlay_win::draw_with_saved_state`）。
 #![forbid(unsafe_code)]
 
 use crate::overlay::{
@@ -14,10 +15,10 @@ use crate::overlay::{
     rect_uv, resolve, resolve_plain, resolve_small, slot_uv,
 };
 
-/// 文字の幅と絵の決め方（`overlay::resolve` か、ゲームの文字を使わない `overlay::resolve_plain`）。
+/// 文字の幅と絵の決め方（`overlay::resolve`か、ゲームの文字を使わない`overlay::resolve_plain`）。
 type Resolver = fn(&AtlasSpec, char, Option<u32>) -> (u32, Face);
 
-/// 行の下地の余白（画素。`overlay::STYLE_DEFAULT.pad` と同じ）。
+/// 行の下地の余白（画素。`overlay::STYLE_DEFAULT.pad`と同じ）。
 pub const PAD: u32 = 2;
 /// 中央の枠の内側の余白（画素）。
 pub const BOX_MARGIN: u32 = 10;
@@ -31,61 +32,93 @@ pub const COLOR_DIM: u32 = 0xA000_0000;
 /// 枠の下地・枠線。
 pub const COLOR_BOX: u32 = 0xF010_1830;
 pub const COLOR_BORDER: u32 = 0xFFB0_C0E0;
-/// 文字の色: ふつう / 選んでいる項目 / 見出し / 補足（キーの行） / 断り・失敗。
+/// 文字の色: ふつう / 選択中の項目 / 見出し / 補足（キーの行） / 断り・失敗。
 pub const COLOR_TEXT: u32 = 0xFFFF_FFFF;
 pub const COLOR_SELECTED: u32 = 0xFFFF_E060;
 pub const COLOR_TITLE: u32 = 0xFF90_D0FF;
 pub const COLOR_HINT: u32 = 0xFFA0_A8B8;
 pub const COLOR_WARN: u32 = 0xFFFF_A070;
+/// 新しいバージョンの知らせの色（薄い赤）。
+pub const COLOR_NOTICE: u32 = 0xFFFF_9090;
 /// 左上・上の枠の左の行の下地（半透明の黒）。
 pub const COLOR_LINE_BACK: u32 = 0x9000_0000;
 
-/// マッチ中の行（`net_menu::hud_line`）の置き場（画素）: 上の枠（高さ `HUD_BAND_H`）の左。文字の枠の左上が (`HUD_X`, `HUD_Y`)、
-/// 下地は文字の左右に `PAD` ずつ広げて y = 0 から `HUD_BAND_H` の高さ。
+/// マッチ中の行（`net_menu::hud_line`）の置き場（画素）: 上の枠（高さ`HUD_BAND_H`）の左。
+/// 文字の枠の左上が (`HUD_X`, `HUD_Y`)。
+/// 下地は文字の左右に`PAD`ずつ広げて y = 0 から`HUD_BAND_H`の高さ。
 pub const HUD_X: u32 = 6;
 pub const HUD_Y: u32 = 1;
 pub const HUD_BAND_H: u32 = 15;
-/// ゲームの真ん中のタイマー（「00:03」）の文字の左の縁（画素の x）。実機の撮影 3 枚で測った（ゲームの定義からは引いていない）。
+/// ゲームの真ん中のタイマー（「00:03」）の文字の左の縁（画素のx）。実機の撮影3枚で測った（ゲームの定義からは取得していない）。
 pub const TIMER_LEFT: u32 = 299;
-/// マッチ中の行の下地の右端（この x は含まない）の上限。文字の終わり（`HUD_X + HUD_TEXT_MAX_W` = 288）からタイマーの縁まで
-/// 11 画素（英数字 1 文字の送り `overlay::GAME_ADVANCE` = 9 より広い）あけ、「推奨 1」の 1 がタイマーに続いて読めないようにする。
+/// マッチ中の行の下地の右端（このxは含まない）の上限。
+/// 文字の終わり（`HUD_X + HUD_TEXT_MAX_W` = 288）からタイマーの縁まで11画素あける（英数字1文字の送り `overlay::GAME_ADVANCE` = 9 より広い）。
+/// これで「推奨 1」の1がタイマーの数字に続けて読まれないようにする。
 pub const HUD_RIGHT: u32 = 290;
 const _: () = assert!(
     HUD_RIGHT - PAD + crate::overlay::GAME_ADVANCE < TIMER_LEFT,
     "行の文字の終わりとタイマーの間に、英数字 1 文字ぶんより広い隙間を置く"
 );
-/// マッチ中の行の文字を配置できる幅（画素）。下地の右端 `HUD_X + 幅 + PAD` が `HUD_RIGHT` を越えない幅。越える文字は描く側
-/// （`push_text_plain` の `max_w`）が落とす。この行は GDI の文字（半角 7 画素）で描く（`text_width_plain`）。
+/// マッチ中の行の文字を配置できる幅（画素）。下地の右端`HUD_X + 幅 + PAD`が`HUD_RIGHT`を越えない幅。
+/// 越える文字は描く側（`push_text_plain`の`max_w`）が落とす。
+/// この行はGDIの文字（半角7画素）で描く（`text_width_plain`）。
 pub const HUD_TEXT_MAX_W: u32 = HUD_RIGHT - HUD_X - PAD;
 
-/// マッチ中の帯の文字（GDI の文字）の枠の幅（画素）。`overlay_win` が文字の高さ 14 から `cell_w = 高さ / 2 切り上げ` = 7 で作る。
+/// マッチ中の帯の文字（GDIの文字）の枠の幅（画素）。`overlay_win`が文字の高さ14から `cell_w = 高さ / 2 切り上げ` = 7 で作る。
 pub const HUD_CELL_W: u32 = 7;
 
-/// 試合中の名前の帯と下の通信の状態の行の文字の左端（画素の x）。帯は画面の端に接し、文字は端から `PAD` ずつ内側。
-/// 下地は文字の左右に `PAD` ずつ広げる（左の帯は x = 0 から、右の帯は画面の右端まで）。
+/// 試合中の名前の帯と下の通信の状態の行の文字の左端（画素のx）。
+/// 帯は画面の端に接する。文字は端から`PAD`ずつ内側。
+/// 下地は文字の左右に`PAD`ずつ広げる（左の帯は x = 0 から、右の帯は画面の右端まで）。
 pub const HUD_EDGE_X: u32 = PAD;
 
-/// 試合中の名前の帯: 上の枠の左に「1P 名前」、右に「名前 2P」（右寄せ）。幅の上限は左右とも、
-/// 中央のタイマーに届かない `HUD_RIGHT` までの幅。
+/// 試合中の名前の帯: 上の枠の左に「1P 名前」、右に「名前 2P」（右寄せ）。
+/// 幅の上限は左右とも中央のタイマーに届かない`HUD_RIGHT`までの幅。
 pub const HUD_NAME_MAX_W: u32 = HUD_RIGHT - HUD_EDGE_X - PAD;
-/// 名前の帯の文字の枠の数の上限（半角 1 枠。全角は 2 枠）。ラベル「1P 」「 2P」の 3 枠を引いた残り。
-/// 名前は HELLO で 32 バイトまでなので、ふつうは切れない。
+/// 名前の帯の文字の枠の数の上限（半角1枠。全角は2枠）。ラベル「1P 」「 2P」の3枠を引いた残り。
+/// 名前はHELLOで32バイトまでなのでふつうは切れない。
 pub const HUD_NAME_CELLS: u32 = HUD_NAME_MAX_W / HUD_CELL_W - 3;
 const _: () = assert!(HUD_NAME_CELLS >= 32, "半角 32 文字の名前は切らずに収まる");
 
-/// 通信の状態の行を下の枠の左へ配置する。帯は y = `screen_h - HUD_BAND_H` から、文字の枠の上端はその `HUD_Y` 下。
+/// 通信の状態の行を下の枠の左へ配置する。帯は y = `screen_h - HUD_BAND_H` から。文字の枠の上端はその`HUD_Y`下。
 pub fn hud_bottom_y(screen_h: u32) -> u32 {
     screen_h.saturating_sub(HUD_BAND_H)
 }
-/// 下の枠の中央のゲームの fps 表示（「60.00fps」）の文字の左の縁（画素の x）。実機の撮影 1 枚から測った。
+/// 下の枠の中央のゲームのfps表示（「60.00fps」）の文字の左の縁（画素のx）。実機の撮影1枚から測った。
 pub const FPS_LEFT: u32 = 284;
-/// 通信の状態の行の下地の右端（この x は含まない）の上限。fps の文字の縁まで半角 1 文字ぶんあける。
-/// 実際に出るいちばん広い形（39 文字 = 273 画素）がちょうど収まる。
+/// 通信の状態の行の下地の右端（このxは含まない）の上限。fpsの文字の縁まで半角1文字ぶんあける。
+/// 実際に出るいちばん広い形（39文字 = 273画素）がちょうど収まる。
 pub const HUD_BOTTOM_RIGHT: u32 = FPS_LEFT - HUD_CELL_W;
-/// 通信の状態の行の文字を配置できる幅（画素）。越える文字は描く側（`push_text_plain` の `max_w`）が落とす。
+/// 通信の状態の行の文字を配置できる幅（画素）。越える文字は描く側（`push_text_plain`の`max_w`）が落とす。
 pub const HUD_BOTTOM_TEXT_MAX_W: u32 = HUD_BOTTOM_RIGHT - HUD_EDGE_X - PAD;
 
-/// 右寄せの帯の文字の左端（画素の x）。画面の右端から `HUD_EDGE_X` あけ、文字の幅 `w` ぶん左へ。
+/// 下の枠の中央のゲームのfps表示の文字の右の縁（画素のx）。`FPS_LEFT`と同じ撮影1枚から測った。
+pub const FPS_RIGHT: u32 = 352;
+/// 右下に置く通信の状態の行の下地の左端の下限。fpsの文字の縁まで半角1文字ぶんあける（`HUD_BOTTOM_RIGHT`の左右反転）。
+pub const HUD_BOTTOM_LEFT_MIN: u32 = FPS_RIGHT + HUD_CELL_W;
+
+/// 通信の状態の行の文字を配置できる幅（画素）。
+/// 左下は`HUD_BOTTOM_TEXT_MAX_W`。
+/// 右下は右寄せなので画面の幅から下地の左端が`HUD_BOTTOM_LEFT_MIN`に収まる幅を引き、`HUD_BOTTOM_TEXT_MAX_W`を上限にする。
+pub const fn hud_bottom_cap(screen_w: u32, right: bool) -> u32 {
+    if !right {
+        return HUD_BOTTOM_TEXT_MAX_W;
+    }
+    let room = screen_w.saturating_sub(HUD_EDGE_X + PAD + HUD_BOTTOM_LEFT_MIN);
+    if room < HUD_BOTTOM_TEXT_MAX_W {
+        room
+    } else {
+        HUD_BOTTOM_TEXT_MAX_W
+    }
+}
+/// ゲームの画面の幅（画素）。下の枠のfpsの位置はこの幅での測定値。
+pub const GAME_SCREEN_W: u32 = 640;
+const _: () = assert!(
+    hud_bottom_cap(GAME_SCREEN_W, true) == HUD_BOTTOM_TEXT_MAX_W,
+    "右下でも左下と同じ最長の行が収まる"
+);
+
+/// 右寄せの帯の文字の左端（画素のx）。画面の右端から`HUD_EDGE_X`あけ、文字の幅`w`ぶん左へ。
 pub fn hud_right_text_x(screen_w: u32, w: u32) -> u32 {
     screen_w.saturating_sub(HUD_EDGE_X.saturating_add(w))
 }
@@ -98,9 +131,11 @@ pub enum RowStyle {
     Title,
     Hint,
     Warn,
-    /// ふつうの色で、小さい文字（`overlay::SMALL_CELL_H`）で描く行。観戦者の左下の通信の状態の行だけ。
+    /// 新しいバージョンの知らせ（`COLOR_NOTICE`）。
+    Notice,
+    /// ふつうの色で小さい文字（`overlay::SMALL_CELL_H`）で描く行。観戦者の左下の通信の状態の行だけ。
     Small,
-    /// 文字の無い隙間の行。高さは行の 1/3・1/2・1 行分（`RowStyle::height`）。
+    /// 文字の無い隙間の行。高さは行の1/3・1/2・1行分（`RowStyle::height`）。
     GapSmall,
     GapMedium,
     GapLarge,
@@ -118,6 +153,7 @@ impl RowStyle {
             RowStyle::GapSmall => 6,
             RowStyle::GapMedium => 7,
             RowStyle::GapLarge => 8,
+            RowStyle::Notice => 9,
         }
     }
 
@@ -131,6 +167,7 @@ impl RowStyle {
             6 => RowStyle::GapSmall,
             7 => RowStyle::GapMedium,
             8 => RowStyle::GapLarge,
+            9 => RowStyle::Notice,
             _ => RowStyle::Normal,
         }
     }
@@ -146,10 +183,11 @@ impl RowStyle {
             RowStyle::Title => COLOR_TITLE,
             RowStyle::Hint => COLOR_HINT,
             RowStyle::Warn => COLOR_WARN,
+            RowStyle::Notice => COLOR_NOTICE,
         }
     }
 
-    /// 行の高さ（画素）。`row_h` は文字の行の高さ（`row_height`）。
+    /// 行の高さ（画素）。`row_h`は文字の行の高さ（`row_height`）。
     pub fn height(self, row_h: u32) -> u32 {
         match self {
             RowStyle::GapSmall => row_h / 3,
@@ -169,23 +207,23 @@ pub fn rows_height(spec: &AtlasSpec, styles: &[RowStyle]) -> u32 {
     styles.iter().map(|s| s.height(row_h)).sum()
 }
 
-/// 1 行 `text` の幅（画素）。表に無い文字は `?` の幅（描く文字と同じ幅）。`MAX_TEXT` 文字で切る（`push_text` と同じ）。
+/// 1行`text`の幅（画素）。表に無い文字は`?`の幅（描く文字と同じ幅）。`MAX_TEXT`文字で切る（`push_text`と同じ）。
 pub fn text_width(spec: &AtlasSpec, text: &str) -> u32 {
     width_by(spec, text, resolve)
 }
 
-/// `text_width_plain` の、小さい文字のバージョン（`overlay::resolve_small`。観戦者の左下の行）。
+/// `text_width_plain`の小さい文字のバージョン（`overlay::resolve_small`。観戦者の左下の行）。
 pub fn text_width_small(spec: &AtlasSpec, text: &str) -> u32 {
     width_by(spec, text, resolve_small)
 }
 
-/// 帯（上端 `band_y`・高さ `HUD_BAND_H`）の真ん中に小さい文字を配置するときの、文字の枠の上端の y（`push_text_small` に渡す）。
-/// 小さい文字の絵は枠の下端に揃う（`Face::Game`）ので、枠の上端は「絵の下端 − 枠の高さ」。
+/// 帯（上端`band_y`・高さ`HUD_BAND_H`）の真ん中に小さい文字を配置するときの文字の枠の上端のy（`push_text_small`に渡す）。
+/// 小さい文字の絵は枠の下端に揃う（`Face::Game`）ので枠の上端は「絵の下端 − 枠の高さ」。
 pub fn small_text_y(spec: &AtlasSpec, band_y: u32) -> u32 {
     (band_y + HUD_BAND_H.div_ceil(2) + SMALL_CELL_H.div_ceil(2)).saturating_sub(spec.cell_h)
 }
 
-/// `text_width` の、ゲームの文字を使わないバージョン（`push_text_plain` と同じ幅。英数字も GDI の枠の幅）。
+/// `text_width`のゲームの文字を使わないバージョン（`push_text_plain`と同じ幅。英数字もGDIの枠の幅）。
 pub fn text_width_plain(spec: &AtlasSpec, text: &str) -> u32 {
     width_by(spec, text, resolve_plain)
 }
@@ -198,7 +236,7 @@ fn width_by(spec: &AtlasSpec, text: &str, by: Resolver) -> u32 {
         .fold(0u32, u32::saturating_add)
 }
 
-/// 四角形 1 つ（塗りの枠を貼る）を `out[at..]` へ書く。左上 `(x, y)`・幅 `w`・高さ `h`（画素）。書けたら次の位置、入らなければ `at`。
+/// 四角形1つ（塗りの枠を貼る）を`out[at..]`へ書く。左上`(x, y)`・幅`w`・高さ`h`（画素）。書けたら次の位置、入らなければ`at`。
 pub fn push_rect(
     out: &mut [Vertex],
     at: usize,
@@ -222,8 +260,9 @@ pub fn push_rect(
     }
 }
 
-/// 1 行 `text` の文字を、左上 `(x, y)`（文字の枠の左上）から `out[at..]` へ書く。幅が `max_w` を越える文字・`MAX_TEXT` 文字を越える文字・
-/// `out` に入らない文字は落とす。戻りは（次の位置, 描いた幅）。下地は含まない（呼び手が `push_rect` で）。
+/// 1行`text`の文字を左上`(x, y)`（文字の枠の左上）から`out[at..]`へ書く。
+/// 幅が`max_w`を越える文字・`MAX_TEXT`文字を越える文字・`out`に入らない文字は落とす。
+/// 戻りは（次の位置, 描いた幅）。下地は含まない（呼び手が`push_rect`で）。
 pub fn push_text(
     out: &mut [Vertex],
     at: usize,
@@ -236,8 +275,9 @@ pub fn push_text(
     push_by(out, at, spec, pos, text, color, max_w, resolve)
 }
 
-/// `push_text` の、ゲームの文字を使わないバージョン: 英数字も GDI の文字の枠（高さ `cell_h`・半角 `cell_w`）で描き、空白も枠の幅で進む
-/// （`overlay::resolve_plain`）。拡大縮小はしない（点の標本化なので縮めると崩れる）。
+/// `push_text`のゲームの文字を使わないバージョン。
+/// 英数字もGDIの文字の枠（高さ`cell_h`・半角`cell_w`）で描き、空白も枠の幅で進む（`overlay::resolve_plain`）。
+/// 拡大縮小はしない（点のサンプリングなので縮めると崩れる）。
 pub fn push_text_plain(
     out: &mut [Vertex],
     at: usize,
@@ -250,7 +290,7 @@ pub fn push_text_plain(
     push_by(out, at, spec, pos, text, color, max_w, resolve_plain)
 }
 
-/// `push_text_plain` の、小さい文字のバージョン（観戦者の左下の行。文字の枠の上端は `small_text_y`）。
+/// `push_text_plain`の小さい文字のバージョン（観戦者の左下の行。文字の枠の上端は`small_text_y`）。
 pub fn push_text_small(
     out: &mut [Vertex],
     at: usize,
@@ -263,7 +303,7 @@ pub fn push_text_small(
     push_by(out, at, spec, pos, text, color, max_w, resolve_small)
 }
 
-// 引数が 8 つになるのは `push_text` の 7 つに文字の決め方を足したため。
+// 引数が8つになるのは`push_text`の7つに文字の決め方を足したため。
 #[allow(clippy::too_many_arguments)]
 fn push_by(
     out: &mut [Vertex],
@@ -292,7 +332,7 @@ fn push_by(
                 slot_uv(spec, slot),
             )),
             Face::Game(g) => {
-                // `overlay::layout_line` と同じ: 文字の絵の下端を枠の下端に揃える。
+                // `overlay::layout_line`と同じ: 文字の絵の下端を枠の下端に揃える。
                 let bottom = (y + spec.cell_h) as f32 + GAME_BASELINE_SHIFT as f32;
                 let left = game_glyph_left(spec, gx, &g);
                 Some((
@@ -318,15 +358,15 @@ pub struct MenuBox {
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// 文字を配置する左端と、1 行目の文字の枠の上端。行 `i` の文字の枠の上端は `text_y + i * row_h`（`row_h` = `row_height`）。
+    /// 文字を配置する左端と、1行目の文字の枠の上端。行`i`の文字の枠の上端は`text_y + i * row_h`（`row_h` = `row_height`）。
     pub text_x: u32,
     pub text_y: u32,
-    /// 文字を配置できる幅（これを越える文字は `push_text` が落とす）。
+    /// 文字を配置できる幅（これを越える文字は`push_text`が落とす）。
     pub text_w: u32,
 }
 
-/// 高さ `rows_h` 画素（`rows_height`）の行・いちばん広い行の幅 `max_text_w` の枠を、画面（`screen_w` × `screen_h`）の中央に配置する。画面に入りきらなければ
-/// 画面の余白（`SCREEN_MARGIN`）まで縮める（文字は `text_w` で切れる）。
+/// 高さ`rows_h`画素（`rows_height`）の行・いちばん広い行の幅`max_text_w`の枠を画面（`screen_w` × `screen_h`）の中央に配置する。
+/// 画面に入りきらなければ画面の余白（`SCREEN_MARGIN`）まで縮める（文字は`text_w`で切れる）。
 pub fn menu_box(screen_w: u32, screen_h: u32, rows_h: u32, max_text_w: u32) -> MenuBox {
     let want_w = max_text_w.saturating_add(2 * (BOX_MARGIN + BORDER));
     let want_h = rows_h.saturating_add(2 * (BOX_MARGIN + BORDER));
@@ -345,7 +385,7 @@ pub fn menu_box(screen_w: u32, screen_h: u32, rows_h: u32, max_text_w: u32) -> M
     }
 }
 
-/// 画面を暗くする四角と、枠の枠線・下地を `out[0..]` へ書く（18 頂点。`MENU_BACK_VERTS`）。戻りは書いた頂点の数。
+/// 画面を暗くする四角と、枠の枠線・下地を`out[0..]`へ書く（18頂点。`MENU_BACK_VERTS`）。戻りは書いた頂点の数。
 pub fn push_menu_back(
     out: &mut [Vertex],
     spec: &AtlasSpec,
@@ -369,7 +409,7 @@ pub fn push_menu_back(
     )
 }
 
-/// `push_menu_back` が書く頂点の数（四角 3 つ）。
+/// `push_menu_back`が書く頂点の数（四角3つ）。
 pub const MENU_BACK_VERTS: usize = 18;
 
 #[cfg(test)]
@@ -429,7 +469,7 @@ mod tests {
         assert_eq!(text_width(&s, "ab"), 14, "半角 2 文字 = 7 × 2");
         assert_eq!(text_width(&s, "接続"), 28, "全角 2 文字 = 14 × 2");
         assert_eq!(text_width(&s, "接続 ab"), 28 + 7 + 14);
-        // 表に無い文字（`鬱`）は `?`（半角 1 枠）で数える。描く文字と同じ。
+        // 表に無い文字（`鬱`）は`?`（半角1枠）で数える。描く文字と同じ。
         assert!(s.slot_of('鬱').is_none() && s.slot_of('?').is_some());
         assert_eq!(text_width(&s, "鬱"), 7, "描く文字（`?`）の 1 枠で進む");
         let long: String = "a".repeat(MAX_TEXT + 50);
@@ -441,7 +481,7 @@ mod tests {
         let s = spec();
         let mut out = [Vertex::default(); 12];
         assert_eq!(push_rect(&mut out, 0, &s, (10, 20, 30, 40), 0xFF11_2233), 6);
-        // 画素の端の座標（0.5 引く）。
+        // 画素の端の座標（0.5引く）。
         assert_eq!((out[0].x, out[0].y), (9.5, 19.5));
         assert_eq!((out[5].x, out[5].y), (39.5, 59.5));
         assert_eq!(out[0].color, 0xFF11_2233);
@@ -515,6 +555,23 @@ mod tests {
     }
 
     #[test]
+    fn the_right_bottom_row_keeps_clear_of_the_fps_text() {
+        assert_eq!(hud_bottom_cap(640, false), HUD_BOTTOM_TEXT_MAX_W);
+        assert_eq!(hud_bottom_cap(640, true), HUD_BOTTOM_TEXT_MAX_W);
+        assert_eq!(hud_bottom_cap(1280, true), HUD_BOTTOM_TEXT_MAX_W);
+        // 狭い画面では右寄せの下地の左端がfpsに届かない幅まで縮める。
+        for sw in [300u32, 400, 500, 600, 640] {
+            let w = hud_bottom_cap(sw, true);
+            let left = hud_right_text_x(sw, w).saturating_sub(PAD);
+            assert!(left >= HUD_BOTTOM_LEFT_MIN || w == 0, "{sw}: {left}");
+        }
+        assert_eq!(hud_bottom_cap(10, true), 0, "入らない画面では 0");
+        // 右下の行の下地は画面の右端に接する（名前の帯の右と同じ寄せ方）。
+        let w = 100;
+        assert_eq!(hud_right_text_x(640, w) + w + HUD_EDGE_X, 640);
+    }
+
+    #[test]
     fn gaps_are_a_third_a_half_and_a_whole_row_and_add_up() {
         let s = spec();
         let row_h = row_height(&s);
@@ -542,6 +599,7 @@ mod tests {
             RowStyle::Title,
             RowStyle::Hint,
             RowStyle::Warn,
+            RowStyle::Notice,
         ];
         for st in all {
             assert_eq!(RowStyle::from_code(st.code()), st);

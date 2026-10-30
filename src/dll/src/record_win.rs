@@ -1,9 +1,10 @@
-//! tick ごとの記録を読む Win32 の層（unsafe はここにもある。1 つずつ `// SAFETY:`）。
+//! tickごとの記録を読むWin32の層（unsafeはここにもある。1つずつ`// SAFETY:`）。
 //!
-//! `observe::RecordEnv` の本物: リングバッファの読み取り、TSC（`rdtsc`）と QueryPerformanceCounter の対、QueryPerformanceFrequency、CPUID の
-//! invariant TSC、ゲームの時計の分母 `[0x4B30C4]` の読み取り（`win::read_own_memory`。読むだけ）、入口のコピーの表の読み返し、
-//! 本ログの隣のファイル（`_ticks.csv` / `_changes.csv` / `_snap.bin` / `_menu.csv`）、メニューとライフのスレッド（`menu_win`）。
-//! 読む順・判定・ログの文は `observe.rs` などにだけ書く。このコードは読み取りのスレッドで走る（ゲームのスレッドではない）。
+//! `observe::RecordEnv`の本物。次を持つ。
+//! リングバッファの読み取り。TSC（`rdtsc`）とQueryPerformanceCounterのペア。QueryPerformanceFrequency。CPUIDのinvariant TSC。
+//! ゲームの時計の分母`[0x4B30C4]`の読み取り（`win::read_own_memory`。読むだけ）。入口のコピーの表の読み返し。
+//! 本ログの隣のファイル（`_ticks.csv` / `_changes.csv` / `_snap.bin` / `_menu.csv`）。メニューとライフのスレッド（`menu_win`）。
+//! 読む順・判定・ログの文は`observe.rs`などにだけ書く。このコードは読み取りのスレッドで走る（ゲームのスレッドではない）。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -33,16 +34,16 @@ use crate::trial_summary::HostFacts;
 use crate::win::read_own_memory;
 use crate::{script_win, shot_win};
 
-/// CPUID の拡張の葉の最大を返す葉と、invariant TSC の葉（`0x80000007` の EDX bit 8 が「TSC が電力の状態によらず一定の速さで
-/// 進む」）。
+/// CPUIDの拡張の葉の最大を返す葉とinvariant TSCの葉。
+/// `0x80000007`のEDX bit 8が「TSCが電力の状態によらず一定の速さで進む」を表す。
 const CPUID_EXT_MAX: u32 = 0x8000_0000;
 const CPUID_POWER_MGMT: u32 = 0x8000_0007;
 const INVARIANT_TSC_BIT: u32 = 1 << 8;
 
 pub struct RealRecord {
-    /// 回ごとの名前のパス（隣のファイルの名前の元。日ごとの本ログでは実在しない。`None` なら隣のファイルは開かない）。
+    /// 実行ごとの名前のパス（隣のファイルの名前の元。日ごとの本ログでは実在しない。`None`なら隣のファイルは開かない）。
     run_path: Option<PathBuf>,
-    /// ゲームのフォルダ（exe のフォルダ）。ここと同じかその下には書かない（本ログと同じ守り）。
+    /// ゲームのフォルダ（exeのフォルダ）。ここと同じかその下には書かない（本ログと同じ守り）。
     exe_dir: Option<PathBuf>,
     menu: Option<MenuThread>,
 }
@@ -56,8 +57,8 @@ impl RealRecord {
         }
     }
 
-    /// 本ログの隣に、本ログの名前の先頭 ＋ `suffix` のファイルを `create_new` で開く（既存を上書きしない）。
-    /// 出力先が exe のフォルダと同じかその下なら断る。
+    /// 本ログの隣に本ログの名前の先頭 ＋ `suffix`のファイルを`create_new`で開く（既存を上書きしない）。
+    /// 出力先がexeのフォルダと同じかその下なら断る。
     fn open_raw(&self, suffix: &str) -> Result<(String, File), String> {
         let log = self.run_path.as_ref().ok_or("本ログの場所が未決定")?;
         let dir = log.parent().ok_or("本ログのフォルダが不明")?;
@@ -93,7 +94,7 @@ impl RealRecord {
 }
 
 fn rdtsc() -> u64 {
-    // SAFETY: `rdtsc` は読むだけの命令で、ユーザーモードで許されている。引数も副作用も無い。
+    // SAFETY: `rdtsc`は読むだけの命令。ユーザーモードで許されている。引数も副作用も無い。
     unsafe { core::arch::x86::_rdtsc() }
 }
 
@@ -109,7 +110,7 @@ impl RecordEnv for RealRecord {
     fn tsc_qpc(&mut self) -> (u64, i64) {
         let a = rdtsc();
         let mut q: i64 = 0;
-        // SAFETY: `q` は書ける i64（LARGE_INTEGER と同じ大きさ）。XP 以降は失敗しない。
+        // SAFETY: `q`は書き込み可能なi64（LARGE_INTEGERと同じ大きさ）。XP以降は失敗しない。
         unsafe { QueryPerformanceCounter(&mut q) };
         let b = rdtsc();
         (a.wrapping_add(b.wrapping_sub(a) / 2), q)
@@ -123,7 +124,7 @@ impl RecordEnv for RealRecord {
     }
 
     fn invariant_tsc(&self) -> Option<bool> {
-        // 葉 0x80000007 は、拡張の葉の最大がそこまであるときだけ問う（無い葉を問うと別の葉の値が返る CPU がある）。
+        // 葉0x80000007は拡張の葉の最大がそこまであるときだけ問う（無い葉を問うと別の葉の値が返るCPUがある）。
         let max = core::arch::x86::__cpuid(CPUID_EXT_MAX).eax;
         if max < CPUID_POWER_MGMT {
             return None;
@@ -142,9 +143,11 @@ impl RecordEnv for RealRecord {
     }
 
     fn open_output(&mut self, suffix: &str) -> Result<(String, Box<dyn Write>), String> {
-        // `.gz` で終わる名前（大きい CSV）は gzip で書く。圧縮は書き込み先を持つスレッドで行い、ゲームのスレッドには乗らない。
-        // `BufWriter` は挟まない（圧縮器が自分で塊にして書く）。ゲームを閉じるとこのスレッドごと消えて `Drop` が走らないので、
-        // ファイルは sync flush のたびに終わりの印の仮を書く形（`new_seekable`）で開く。
+        // `.gz`で終わる名前（大きいCSV）はgzipで書く。
+        // 圧縮は書き込み先を持つスレッドで行う。ゲームのスレッドには乗らない。
+        // `BufWriter`は挟まない（圧縮器が自分でブロックにして書く）。
+        // ゲームを閉じるとこのスレッドごと消えて`Drop`が走らない。
+        // そのためファイルはsync flushのたびに終端マーカーの仮を書く形（`new_seekable`）で開く。
         if gzlog::is_gz_name(suffix) {
             let (name, f) = self.open_raw(suffix)?;
             return Ok((name, Box::new(GzLogWriter::new_seekable(f))));
@@ -223,7 +226,7 @@ impl RecordEnv for RealRecord {
     }
 
     fn net_status(&self) -> Option<(NetSnapshot, String)> {
-        // ゲーム内のメニューの実行は、ネットワークを開く前でも本ログの「ネットワークの外」の行を出す。
+        // ゲーム内のメニューの実行はネットワークを開く前でも本ログの「ネットワークの外」の行を出す。
         (script_win::net_armed() || script_win::net_pending()).then(script_win::net_status)
     }
 
@@ -246,7 +249,7 @@ impl RecordEnv for RealRecord {
 
 #[cfg(test)]
 mod tests {
-    //! 本物の Win32 を検査のプロセス自身に当てる（花映塚は使わない）。ファイルは一時フォルダだけ。
+    //! 本物のWin32を検査のプロセス自身に当てる（花映塚は使わない）。ファイルは一時フォルダだけ。
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -340,7 +343,7 @@ mod tests {
         let rows = "seg,frame\n0,0\n0,1\n";
         w.write_all(rows.as_bytes()).unwrap();
         w.flush().unwrap();
-        // 閉じずに（`Drop` を走らせずに）読む = ゲームを閉じた後のファイル。
+        // 閉じずに（`Drop`を走らせずに）読む = ゲームを閉じた後のファイル。
         let live = gzlog::read_log_text(&d.join(&name)).unwrap();
         assert_eq!((live.text.as_str(), live.cut), (rows, false));
         drop(w);

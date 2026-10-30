@@ -1,13 +1,14 @@
-//! ウィンドウモードの起動時のウィンドウの大きさ・位置・タイトルバー・最前面（ini の `[window]`）を決める（unsafe 無し）。
+//! ウィンドウモードの起動時のウィンドウの大きさ・位置・タイトルバー・最前面（iniの`[window]`）を決める（unsafe無し）。
 //!
-//! 「ウィンドウだけ大きくする」作り: D3D8 の裏の画面は 640×480 のまま、Present の引き伸ばしに任せる。ここは ini の読みと `CreateWindowExA` に渡す値の計算だけで、Win32 は呼ばない（呼ぶ側は `src/dll/src/window_win.rs`）。
-//! キーの名前は adonis rev4 / rev5 と vpatch の `[Window]` に合わせ、大文字・小文字は区別しない:
-//! - `[window]` が無ければ何もしない（`from_ini` が `None`）。今のゲームのウィンドウのまま。
-//! - `width` / `height`: client 領域（枠を除いた中身）の画素数。既定 640 / 480。整数倍でなくてよい。
-//! - `x` / `y`: ウィンドウの左上（枠を含む外側の位置）。両方書いたときだけ使う。書かなければ `CW_USEDEFAULT`。
+//! 「ウィンドウだけ大きくする」作り: D3D8の裏の画面は640×480のままPresentの引き伸ばしに任せる。
+//! ここはiniの読みと`CreateWindowExA`に渡す値の計算だけを行う。Win32は呼ばない（呼ぶ側は`src/dll/src/window_win.rs`）。
+//! キーの名前はadonis rev4 / rev5とvpatchの`[Window]`に合わせ、大文字・小文字は区別しない:
+//! - `[window]`が無ければ何もしない（`from_ini`が`None`）。今のゲームのウィンドウのまま。
+//! - `width` / `height`: client領域（枠を除いた中身）の画素数。既定640 / 480。整数倍でなくてよい。
+//! - `x` / `y`: ウィンドウの左上（枠を含む外側の位置）。両方書いたときだけ使う。書かなければ`CW_USEDEFAULT`。
 //! - `titlebar`: 1（既定）= 今の枠のまま、0 = 枠なし。`alwaysontop`: 1 = 最前面、0（既定）= 通常。
 //!
-//! 知らないキー・読めない値・範囲外の値があれば、そのカテゴリを丸ごと使わない（`Err`。`[netplay]` / `[pacing]` と同じ）。
+//! 知らないキー・読み取れない値・範囲外の値があればそのカテゴリを丸ごと使わない（`Err`。`[netplay]` / `[pacing]`と同じ）。
 #![forbid(unsafe_code)]
 
 use crate::ini::Ini;
@@ -16,21 +17,21 @@ use crate::patch;
 pub const SECTION: &str = "window";
 pub const KEYS: [&str; 6] = ["width", "height", "x", "y", "titlebar", "alwaysontop"];
 
-/// 既定の client の大きさ。ゲームのウィンドウの大きさ（`0x42D584` の `lea 0x280(...)` と `0x42D59E` の `lea 0x1e0(...)`）と同じ。
+/// 既定のclientの大きさ。ゲームのウィンドウの大きさ（`0x42D584`の`lea 0x280(...)`と`0x42D59E`の`lea 0x1e0(...)`）と同じ。
 pub const DEFAULT_WIDTH: i32 = 640;
 pub const DEFAULT_HEIGHT: i32 = 480;
-/// width / height の範囲（本実装の決め）: 下は既定の 4 分の 1（これより小さいと枠の最小幅に負ける）、上は 8K。
+/// width / heightの範囲（本実装での決定）: 下は既定の4分の1（これより小さいと枠の最小幅に負ける）。上は8K。
 pub const MIN_WIDTH: i32 = 160;
 pub const MIN_HEIGHT: i32 = 120;
 pub const MAX_WIDTH: i32 = 7680;
 pub const MAX_HEIGHT: i32 = 4320;
-/// x / y の範囲。複数のモニターで左や上へ出す負の値を通す。
+/// x / yの範囲。複数のモニターで左や上へ出す負の値を通す。
 pub const MIN_POS: i32 = -32768;
 pub const MAX_POS: i32 = 32767;
 
-/// `CreateWindowExA` の x / y に渡すと「システムが決める」になる値（`0x80000000`）。ゲームも `0x42D5A7` / `0x42D5AC` で渡す。
+/// `CreateWindowExA`のx / yに渡すと「システムが決める」になる値（`0x80000000`）。ゲームも`0x42D5A7` / `0x42D5AC`で渡す。
 pub const CW_USEDEFAULT: i32 = i32::MIN;
-/// ウィンドウスタイルの `WS_POPUP`（枠も title も無い）と `WS_VISIBLE`。
+/// ウィンドウスタイルの`WS_POPUP`（枠もtitleも無い）と`WS_VISIBLE`。
 pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 
@@ -38,14 +39,14 @@ pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub struct WindowConfig {
     pub client_w: i32,
     pub client_h: i32,
-    /// ウィンドウの左上。`None` なら `CW_USEDEFAULT`。
+    /// ウィンドウの左上。`None`なら`CW_USEDEFAULT`。
     pub pos: Option<(i32, i32)>,
     pub title_bar: bool,
     pub always_on_top: bool,
 }
 
 impl WindowConfig {
-    /// `[window]` の節だけがあって何も書かなかったときの形（今のゲームの 640×480 の client・枠あり・位置は今のまま）。
+    /// `[window]`のカテゴリだけがあって何も書かなかったときの形（今のゲームの640×480のclient・枠あり・位置は今のまま）。
     pub const DEFAULT: WindowConfig = WindowConfig {
         client_w: DEFAULT_WIDTH,
         client_h: DEFAULT_HEIGHT,
@@ -73,7 +74,7 @@ impl WindowConfig {
     }
 }
 
-/// 整数（`-` は先頭に 1 つだけ。`+` や小数点や単位は断る）を読み、`[min, max]` を検証する。
+/// 整数（`-`は先頭に1つだけ。`+`や小数点や単位は断る）を読み、`[min, max]`を検証する。
 fn parse_int(key: &str, v: &str, min: i32, max: i32) -> Result<i32, String> {
     let t = v.trim();
     let digits = t.strip_prefix('-').unwrap_or(t);
@@ -98,7 +99,7 @@ fn parse_flag(key: &str, v: &str) -> Result<bool, String> {
     }
 }
 
-/// ini の `[window]` を読む。節が無ければ `Ok(None)`（今のウィンドウのまま）。
+/// iniの`[window]`を読む。カテゴリが無ければ`Ok(None)`（今のウィンドウのまま）。
 pub fn from_ini(ini: &Ini) -> Result<Option<WindowConfig>, String> {
     if !ini.has_section(SECTION) {
         return Ok(None);
@@ -126,7 +127,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<WindowConfig>, String> {
             parse_int("x", x, MIN_POS, MAX_POS)?,
             parse_int("y", y, MIN_POS, MAX_POS)?,
         )),
-        // 片方だけでは、書かなかった側を「今のまま」にできない（x が既定値だと y は無視される）。
+        // 片方だけでは書かなかった側を「今のまま」にできない（xが既定値だとyは無視される）。
         _ => {
             return Err(format!(
                 "[{SECTION}] の x と y は両方書いたときだけ使います（片方だけでは位置を決めません）"
@@ -160,8 +161,7 @@ pub struct FrameMetrics {
     pub caption_y: i32,
 }
 
-/// ゲームがウィンドウの外寸を作る式（`0x42D584`: `0x280 + 2 × GetSystemMetrics(7)`、`0x42D59E`:
-/// `0x1E0 + GetSystemMetrics(4) + 2 × GetSystemMetrics(8)`）に client の大きさを入れたもの。
+/// ゲームがウィンドウの外寸を作る式（`0x42D584`: `0x280 + 2 × GetSystemMetrics(7)`、`0x42D59E`: `0x1E0 + GetSystemMetrics(4) + 2 × GetSystemMetrics(8)`）にclientの大きさを代入したもの。
 pub fn game_outer_size(client_w: i32, client_h: i32, m: &FrameMetrics) -> (i32, i32) {
     (
         client_w.saturating_add(m.fixed_frame_x.saturating_mul(2)),
@@ -171,7 +171,7 @@ pub fn game_outer_size(client_w: i32, client_h: i32, m: &FrameMetrics) -> (i32, 
     )
 }
 
-/// `CreateWindowExA` の引数のうち、こちらが替える 5 つ。
+/// `CreateWindowExA`の引数のうちこちらが替える5つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateArgs {
     pub style: u32,
@@ -181,8 +181,9 @@ pub struct CreateArgs {
     pub height: i32,
 }
 
-/// `orig_style` はゲームが渡した style（ウィンドウモードでは `0x100A0000`）。タイトルバーありはその style のままにして外寸だけ
-/// client から作り直し、なしは `WS_POPUP` にして外寸 = client。`WS_VISIBLE` はゲームの style のものを引き継ぐ。
+/// `orig_style`はゲームが渡したstyle（ウィンドウモードでは`0x100A0000`）。
+/// タイトルバーありはそのstyleのままにして外寸だけclientから作り直す。なしは`WS_POPUP`にして外寸 = client。
+/// `WS_VISIBLE`はゲームのstyleのものを引き継ぐ。
 pub fn plan(cfg: &WindowConfig, orig_style: u32, m: &FrameMetrics) -> CreateArgs {
     let (x, y) = cfg.pos.unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
     if cfg.title_bar {
@@ -205,9 +206,10 @@ pub fn plan(cfg: &WindowConfig, orig_style: u32, m: &FrameMetrics) -> CreateArgs
     }
 }
 
-/// 作ったウィンドウの client が指定と違ったときの、直した外寸。`game_outer_size` の枠の分が OS の実際の枠と食い違うため要る
-/// （検査用のウィンドウで、式は +6 × +29、実際は +16 × +39（実測: Windows 11 の 1 台））。作った後の測定から直して client を守る。
-/// `outer` は作ったウィンドウの外寸、`client` は測った client。合っていれば `None`。
+/// 作ったウィンドウのclientが指定と違ったときの、直した外寸。
+/// `game_outer_size`の枠の分がOSの実際の枠と食い違うため要る（検査用のウィンドウで式は +6 × +29、実際は +16 × +39（実測: Windows 11の1台））。
+/// 作った後の測定から直してclientを守る。
+/// `outer`は作ったウィンドウの外寸。`client`は測ったclient。合っていれば`None`。
 pub fn corrected_outer(
     want: (i32, i32),
     client: (i32, i32),
@@ -221,8 +223,8 @@ pub fn corrected_outer(
     })
 }
 
-/// `CreateWindowExA` を呼ぶ `FF 15 abs32`（6 バイト）の置き換え: `E8 rel32` ＋ `90`。元の命令が 6 バイトで、
-/// `call` の戻りアドレスが 5 バイト目の次になるので nop を通って続く。
+/// `CreateWindowExA`を呼ぶ`FF 15 abs32`（6バイト）の置き換え: `E8 rel32` ＋ `90`。
+/// 元の命令が6バイトで`call`の戻りアドレスが5バイト目の次になるので、nopを通って続く。
 pub fn call_patch(site: u32, target: u32) -> [u8; 6] {
     let c = patch::call_rel32(site, target);
     [c[0], c[1], c[2], c[3], c[4], 0x90]
@@ -237,7 +239,7 @@ mod tests {
         from_ini(&ini::parse(text).expect("ini が読める"))
     }
 
-    /// 今のゲームのウィンドウの枠（96 dpi の標準）。
+    /// 今のゲームのウィンドウの枠（96 dpiの標準）。
     const M: FrameMetrics = FrameMetrics {
         fixed_frame_x: 3,
         fixed_frame_y: 3,
@@ -362,19 +364,19 @@ mod tests {
         assert_eq!(pon.style, GAME_STYLE);
         assert_eq!(poff.style, WS_POPUP | WS_VISIBLE);
         assert_eq!((pon.x, pon.y, poff.x, poff.y), (100, 50, 100, 50));
-        // 見えないウィンドウ（検査）なら、枠なしも見えないまま。
+        // 見えないウィンドウ（検査）なら枠なしも見えないまま。
         assert_eq!(plan(&off, GAME_STYLE & !WS_VISIBLE, &M).style, WS_POPUP);
     }
 
     #[test]
     fn correction_moves_the_outer_size_by_the_client_error() {
         assert_eq!(corrected_outer((640, 480), (640, 480), (646, 509)), None);
-        // 枠が無いウィンドウに枠の分を足して作った（client 646×509）→ 640×480 に縮める。
+        // 枠が無いウィンドウに枠の分を足して作った（client 646×509）→ 640×480に縮める。
         assert_eq!(
             corrected_outer((640, 480), (646, 509), (646, 509)),
             Some((640, 480))
         );
-        // 枠の分を足し足りなかった（client が小さい）→ 広げる。
+        // 枠の分を足し足りなかった（clientが小さい）→ 広げる。
         assert_eq!(
             corrected_outer((1280, 960), (1274, 937), (1280, 960)),
             Some((1286, 983))
@@ -403,7 +405,7 @@ mod tests {
     fn the_dist_ini_example_is_readable_and_off_by_default() {
         let dist = include_str!("../../../scripts/dist/HiganRTool.ini").replace("\r\n", "\n");
         assert_eq!(read(&dist), Ok(None), "配る ini のままでは [window] が無効");
-        // `;[window]` から次の節（または末尾）までの、先頭が `; ` の行を外す。
+        // `;[window]`から次のカテゴリ（または末尾）までにある、先頭が`; `の行を外す。
         let start = dist
             .find("\n; [window]\n")
             .expect("配る ini に注の [window] が無い")

@@ -1,17 +1,16 @@
-//! STUN の Binding だけ（RFC 5389 / RFC 8489）: Binding Request の組み立てと Binding Success Response の解析。
-//! 候補アドレスの選び方・STUN サーバー・ソケット・乱数は net の層の仕事（`link.rs` と同じ「セッションは持たない」流儀）。
-//! - 属性は付けない（MESSAGE-INTEGRITY / FINGERPRINT も送らない）。transaction id は呼び手が渡す（core は乱数を持たない）。
-//! - 解析は XOR-MAPPED-ADDRESS（0x0020）を優先し、無ければ MAPPED-ADDRESS（0x0001）。知らない属性は 4 バイト境界の
-//!   パディングごと読み飛ばす。MESSAGE-INTEGRITY / FINGERPRINT は検証しない。
-//! - 問い合わせの送り直しと答え合わせ（`Query`）、検査の偽の応答役が使う応答の組み立て（`encode_binding_success`）、
-//!   2 か所の STUN の答えの比べ（`compare_mappings`・`Mapping`・`SecondProbe`）も持つ。
-//!   受信ソケットで HGRT と STUN を分けるのは `wire::classify`。
+//! STUNのBindingだけ（RFC 5389 / RFC 8489）: Binding Requestの組み立てとBinding Success Responseの解析。
+//! 候補アドレスの選び方・STUNサーバー・ソケット・乱数はnetの層の仕事（`link.rs`と同じ「セッションは持たない」流儀）。
+//! - 属性は付けない（MESSAGE-INTEGRITY / FINGERPRINTも送らない）。transaction idは呼び手が渡す（coreは乱数を持たない）。
+//! - 解析はXOR-MAPPED-ADDRESS（0x0020）を優先する。無ければMAPPED-ADDRESS（0x0001）。
+//!   知らない属性は4バイト境界のパディングごと読み飛ばす。MESSAGE-INTEGRITY / FINGERPRINTは検証しない。
+//! - 次も持つ: 問い合わせの再送と答え合わせ（`Query`）・検査の偽の応答役が使う応答の組み立て（`encode_binding_success`）・2か所のSTUNの答えの比較（`compare_mappings`・`Mapping`・`SecondProbe`）。
+//!   受信ソケットでHGRTとSTUNを分けるのは`wire::classify`。
 //!
-//! 接続の手順でだけ呼ぶ想定だが、unsafe 禁止・パニックしうる添字と unwrap は使わない。
+//! 接続の手順でだけ呼ぶ想定だが、unsafe禁止・パニックしうる添字とunwrapは使わない。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// transaction id の長さ（96 bit。RFC 5389 §6）。
+/// transaction idの長さ（96 bit。RFC 5389 §6）。
 pub const TRANSACTION_ID_LEN: usize = 12;
 pub type TransactionId = [u8; TRANSACTION_ID_LEN];
 
@@ -24,15 +23,15 @@ const TYPE_BINDING_REQUEST: u16 = 0x0001;
 const TYPE_BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
 const TYPE_BINDING_ERROR_RESPONSE: u16 = 0x0111;
 
-// 属性の type（RFC 5389 §15.1・§15.2）。
+// 属性のtype（RFC 5389 §15.1・§15.2）。
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
-// アドレスの family（RFC 5389 §15.1）。
+// アドレスのfamily（RFC 5389 §15.1）。
 const FAMILY_IPV4: u8 = 0x01;
 const FAMILY_IPV6: u8 = 0x02;
 
-/// Binding Request（属性なし。20 B ちょうど）を作る。
+/// Binding Request（属性なし。20 Bちょうど）を作る。
 pub fn encode_binding_request(txn: TransactionId) -> [u8; HEADER_LEN] {
     let mut buf = [0u8; HEADER_LEN];
     buf[0..2].copy_from_slice(&TYPE_BINDING_REQUEST.to_be_bytes());
@@ -42,18 +41,18 @@ pub fn encode_binding_request(txn: TransactionId) -> [u8; HEADER_LEN] {
     buf
 }
 
-/// `decode_binding_response` が返すエラー。パニックの代わりに区別できる形で返す。
+/// `decode_binding_response`が返すエラー。パニックの代わりに区別できる形で返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StunError {
     Truncated,
-    /// message type の先頭 2 bit が 0 でない（STUN 以外との識別。RFC 5389 §6）。
+    /// message typeの先頭2 bitが0でない（STUN以外との識別。RFC 5389 §6）。
     BadLeadingBits,
     BadCookie,
     LengthNotMultipleOf4,
     LengthMismatch,
     AttrOverrun,
     UnknownFamily,
-    /// アドレス属性の value の長さが、family（IPv4 なら 8 B、IPv6 なら 20 B）に合わない。
+    /// アドレス属性のvalueの長さが、family（IPv4なら8 B、IPv6なら20 B）に合わない。
     MalformedAddress,
     /// Binding Error Response（`0x0111`）だった。
     ErrorResponse,
@@ -69,14 +68,14 @@ struct Header {
     txn: TransactionId,
 }
 
-/// ヘッダ（20 B）だけを読み、構造的な検査（先頭 2 bit・cookie・4 の倍数・本体の長さ）を通す。type の意味と
-/// transaction id の一致は呼び手が見る。
+/// ヘッダ（20 B）だけを読み、構造的な検査（先頭2 bit・cookie・4の倍数・本体の長さ）を通す。
+/// typeの意味とtransaction idの一致は呼び手が見る。
 fn decode_header(bytes: &[u8]) -> Result<Header, StunError> {
     if bytes.len() < HEADER_LEN {
         return Err(StunError::Truncated);
     }
     let msg_type = u16::from_be_bytes([bytes[0], bytes[1]]);
-    // message-type は 14 bit の意味しか持たず、先頭 2 bit は常に 0（STUN の目印）。
+    // message-typeは14 bitの意味しか持たず、先頭2 bitは常に0（STUNの目印）。
     if msg_type & 0xC000 != 0 {
         return Err(StunError::BadLeadingBits);
     }
@@ -88,7 +87,7 @@ fn decode_header(bytes: &[u8]) -> Result<Header, StunError> {
     if !msg_len.is_multiple_of(4) {
         return Err(StunError::LengthNotMultipleOf4);
     }
-    // 本体の長さは、渡されたバイト列のうちヘッダの後ろの分とちょうど合っていなければならない（余りが付いた別のプロトコルや途中で切れたものを弾く）。
+    // 本体の長さは渡されたバイト列のうちヘッダの後ろの分とちょうど合っていなければならない（余りが付いた別のプロトコルや途中で切れたものを弾く）。
     if bytes.len() != HEADER_LEN + msg_len {
         return Err(StunError::LengthMismatch);
     }
@@ -102,9 +101,10 @@ fn decode_header(bytes: &[u8]) -> Result<Header, StunError> {
     })
 }
 
-/// MAPPED-ADDRESS / XOR-MAPPED-ADDRESS の value のうち、family（1 B）より後ろだけを渡す。`xor_key` が `Some` なら
-/// XOR-MAPPED-ADDRESS として解く（port は magic cookie の上位 16 bit、IPv6 の address は cookie ＋ transaction id と
-/// XOR する。RFC 5389 §15.2）。`None` なら MAPPED-ADDRESS としてそのまま読む（§15.1）。
+/// MAPPED-ADDRESS / XOR-MAPPED-ADDRESSのvalueのうちfamily（1 B）より後ろだけを渡す。
+/// `xor_key`が`Some`ならXOR-MAPPED-ADDRESSとして解く。
+/// portはmagic cookieの上位16 bitとXORし、IPv6のaddressはcookie ＋ transaction idとXORする（RFC 5389 §15.2）。
+/// `None`ならMAPPED-ADDRESSとしてそのまま読む（§15.1）。
 fn decode_addr_body(
     family: u8,
     rest: &[u8],
@@ -158,7 +158,7 @@ fn decode_mapped_address(value: &[u8]) -> Result<SocketAddr, StunError> {
     decode_addr_body(family, &value[2..], None)
 }
 
-/// XOR-MAPPED-ADDRESS の属性 value を解く（`cookie` と `txn` はヘッダの値）。
+/// XOR-MAPPED-ADDRESSの属性valueを解く（`cookie`と`txn`はヘッダの値）。
 fn decode_xor_mapped_address(
     value: &[u8],
     cookie: u32,
@@ -174,7 +174,7 @@ fn decode_xor_mapped_address(
     decode_addr_body(family, &value[2..], Some(&key))
 }
 
-/// Binding Success Response を解析し、STUN サーバーから見えた自分のアドレスを返す。`expected_txn` は要求に使った値。
+/// Binding Success Responseを解析し、STUNサーバーから見えた自分のアドレスを返す。`expected_txn`は要求に使った値。
 pub fn decode_binding_response(
     bytes: &[u8],
     expected_txn: &TransactionId,
@@ -190,8 +190,9 @@ pub fn decode_binding_response(
     }
     let body = &bytes[HEADER_LEN..HEADER_LEN + hdr.msg_len];
 
-    // 属性を歩く。知らない属性は読み飛ばす。最初の XOR-MAPPED-ADDRESS / MAPPED-ADDRESS の value だけ取っておき、読み終えてから
-    // XOR を優先して解く。未知の属性の中身を読まずに次へ跳べるよう、枠（type・length・パディング）はどの属性も同じ検査をする。
+    // 属性を順にたどる。知らない属性は読み飛ばす。
+    // 最初のXOR-MAPPED-ADDRESS / MAPPED-ADDRESSのvalueだけ取っておき、読み終えてからXORを優先して解く。
+    // 未知の属性の中身を読まずに次へ跳べるよう枠（type・length・パディング）はどの属性も同じ検査をする。
     let mut xor_val: Option<&[u8]> = None;
     let mut mapped_val: Option<&[u8]> = None;
     let mut i = 0usize;
@@ -212,9 +213,9 @@ pub fn decode_binding_response(
             ATTR_MAPPED_ADDRESS if mapped_val.is_none() => mapped_val = Some(val),
             _ => {}
         }
-        // 次の属性は 4 バイト境界から（パディングは length に数えない）。
+        // 次の属性は4バイト境界から（パディングはlengthに数えない）。
         let padded = alen.div_ceil(4) * 4;
-        // 加算が跳ねてもループの入口の `i + 4 <= body.len()` が守る。
+        // 加算が上限で止まってもループの入口の`i + 4 <= body.len()`が守る。
         i = start.saturating_add(padded);
     }
 
@@ -229,16 +230,16 @@ pub fn decode_binding_response(
 
 // ---------------- 偽の応答役と問い合わせ ----------------
 
-/// `encode_binding_success` が書く最長（IPv6 の XOR-MAPPED-ADDRESS 1 つ）。
+/// `encode_binding_success`が書く最長（IPv6のXOR-MAPPED-ADDRESS 1つ）。
 pub const MAX_SUCCESS_LEN: usize = HEADER_LEN + 4 + 20;
 
-/// Binding Request なら transaction id を返す（検査の偽の応答役が使う。属性は見ない）。
+/// Binding Requestならtransaction idを返す（検査の偽の応答役が使う。属性は見ない）。
 pub fn binding_request_txn(bytes: &[u8]) -> Option<TransactionId> {
     let hdr = decode_header(bytes).ok()?;
     (hdr.msg_type == TYPE_BINDING_REQUEST).then_some(hdr.txn)
 }
 
-/// Binding Success Response（XOR-MAPPED-ADDRESS 1 つだけ。RFC 5389 §15.2）を作る。検査の偽の応答役が使う。戻り値は書いた長さ。
+/// Binding Success Response（XOR-MAPPED-ADDRESS 1つだけ。RFC 5389 §15.2）を作る。検査の偽の応答役が使う。戻り値は書いた長さ。
 pub fn encode_binding_success(
     txn: TransactionId,
     mapped: SocketAddr,
@@ -277,8 +278,9 @@ pub fn encode_binding_success(
     HEADER_LEN + 4 + value_len
 }
 
-/// 問い合わせの送り直しの間隔（ms）。RFC 5389 §7.2.1 の既定（RTO 500 ms から倍々で 7 回。計 39.5 秒）は接続の手順の
-/// 時間切れ（10 秒。`handshake::TIMEOUT_MS`）より長いので、250 ms ごとに 8 回（2 秒）で打ち切る。
+/// 問い合わせの再送の間隔（ms）。
+/// RFC 5389 §7.2.1の既定はRTO 500 msから倍々で7回（計39.5秒）。
+/// これは接続の手順の時間切れ（10秒。`handshake::TIMEOUT_MS`）より長い。そのため250 msごとに8回（2秒）で打ち切る。
 pub const QUERY_INTERVAL_MS: u32 = 250;
 pub const QUERY_TRIES: u32 = 8;
 
@@ -289,15 +291,15 @@ pub enum QueryState {
     TimedOut,
 }
 
-/// 1 つの STUN サーバーへの Binding の問い合わせ（ソケットも時計も乱数も持たない）。呼び手は `poll_send` が返したものを
-/// 送り、受けた STUN を `on_datagram` へ渡す。
+/// 1つのSTUNサーバーへのBindingの問い合わせ（ソケットも時計も乱数も持たない）。
+/// 呼び手は`poll_send`が返したものを送り、受けたSTUNを`on_datagram`へ渡す。
 #[derive(Debug, Clone, Copy)]
 pub struct Query {
     txn: TransactionId,
     sent: u32,
     last: Option<u32>,
     state: QueryState,
-    /// 違う transaction id・壊れた応答（数えて捨てる）。
+    /// 違うtransaction id・壊れた応答（数えて捨てる）。
     pub ignored: u32,
 }
 
@@ -316,8 +318,8 @@ impl Query {
         self.state
     }
 
-    /// 送るものがあれば返す（最初はすぐ、以後 `QUERY_INTERVAL_MS` ごと）。`QUERY_TRIES` 回送った後、もう 1 間隔待っても
-    /// 答えが無ければ `TimedOut`。
+    /// 送るものがあれば返す（最初はすぐ。以後は`QUERY_INTERVAL_MS`ごと）。
+    /// `QUERY_TRIES`回送った後にもう1間隔待っても答えが無ければ`TimedOut`。
     pub fn poll_send(&mut self, now: u32) -> Option<[u8; HEADER_LEN]> {
         if self.state != QueryState::Waiting {
             return None;
@@ -336,7 +338,7 @@ impl Query {
         Some(encode_binding_request(self.txn))
     }
 
-    /// 受けた 1 データグラム（STUN と分けたもの）。答えなら `Done` にして true。
+    /// 受けた1データグラム（STUNと分けたもの）。答えなら`Done`にしてtrue。
     pub fn on_datagram(&mut self, bytes: &[u8]) -> bool {
         if self.state != QueryState::Waiting {
             return false;
@@ -354,9 +356,10 @@ impl Query {
     }
 }
 
-/// 待っている間の聞き直しの間隔（ms）。家庭用ルーターの UDP の対応づけの寿命は機種で違い、短いものは 30 秒前後と言われる
-/// （RFC 4787 §4.3 は 2 分以上を求めるが守らない機種がある）ので、その半分にした（ルーターごとの実際の寿命は測っていない）。
-/// 接続したら止める（観戦を配っている間だけは続ける）。同じ STUN サーバーへ 20 B が 15 秒に 1 回。
+/// 待っている間の聞き直しの間隔（ms）。
+/// 家庭用ルーターのUDPの対応づけの寿命は機種で違い、短いものは30秒前後と言われる（RFC 4787 §4.3は2分以上を求めるが守らない機種がある）。
+/// そのため短い寿命の半分にした（ルーターごとの実際の寿命は測っていない）。
+/// 接続したら止める（観戦を配信している間だけは続ける）。同じSTUNサーバーへ20 Bが15秒に1回。
 pub const KEEP_INTERVAL_MS: u32 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,7 +367,7 @@ pub enum Remap {
     Same,
     /// アドレスは同じでポートだけ変わった（ルーターが対応づけを忘れて付け直した形）。
     PortOnly,
-    /// アドレスが変わった（ポートも変わったかは問わない。回線の付け替え・CGNAT の別の出口など）。
+    /// アドレスが変わった（ポートも変わったかは問わない。回線の付け替え・CGNATの別の出口など）。
     Address,
 }
 
@@ -383,23 +386,24 @@ pub fn remap(before: SocketAddr, after: SocketAddr) -> Remap {
 pub struct KeepCounts {
     pub sent: u32,
     pub answered: u32,
-    /// 答えにならなかった STUN（違う transaction id・壊れたもの・答えの二重）。
+    /// 答えにならなかったSTUN（違うtransaction id・壊れたもの・答えの二重）。
     pub ignored: u32,
-    /// 前に見えていた外側のアドレスから変わった回数（ポートだけ / アドレスも）。一度変わってそのままなら 1 回。
+    /// 前に見えていた外側のアドレスから変わった回数（ポートだけ / アドレスも）。一度変わってそのままなら1回。
     pub changed_port: u32,
     pub changed_addr: u32,
-    /// 直近の答えが、自分のコードに載せたアドレスと違うか（まだ答えが無ければ false）。
+    /// 直近の答えが自分のコードに載せたアドレスと違うかどうか（まだ答えが無ければfalse）。
     pub differs_from_code: bool,
 }
 
-/// 待っている間、同じ STUN サーバーへ一定の間隔で Binding を聞き直す状態機械（`Query` と同じ流儀）。目的はルーターの
-/// 対応づけを忘れさせないことと、外側のアドレスが変わったかを測ること。呼び手は `due` が true のとき `send` の戻りを送り、
-/// 受けた STUN を `on_datagram` へ渡す。最初の問い合わせは作った時刻から 1 間隔後。問い合わせは 1 つだけ覚える
-/// （次を送ると前の答えは捨てる）。
+/// 待っている間、同じSTUNサーバーへ一定の間隔でBindingを聞き直すステートマシン（`Query`と同じ流儀）。
+/// 目的はルーターの対応づけを忘れさせないことと、外側のアドレスが変わったかを測ること。
+/// 呼び手は`due`がtrueのとき`send`の戻りを送り、受けたSTUNを`on_datagram`へ渡す。
+/// 最初の問い合わせは作った時刻から1間隔後。
+/// 問い合わせは1つだけ覚える（次を送ると前の答えは捨てる）。
 #[derive(Debug, Clone, Copy)]
 pub struct Keep {
     interval_ms: u32,
-    /// 自分のコードに載せた外側のアドレス（最初の `Query` の答え）。
+    /// 自分のコードに載せた外側のアドレス（最初の`Query`の答え）。
     code: SocketAddr,
     /// 直近に見えた外側のアドレス（前の答えと比べて変わったかを数える）。
     seen: SocketAddr,
@@ -424,7 +428,7 @@ impl Keep {
         now.wrapping_sub(self.last_send) >= self.interval_ms
     }
 
-    /// 問い合わせを 1 通作る（`due` が true のときに呼ぶ）。
+    /// 問い合わせを1通作る（`due`がtrueのときに呼ぶ）。
     pub fn send(&mut self, now: u32, txn: TransactionId) -> [u8; HEADER_LEN] {
         self.txn = Some(txn);
         self.last_send = now;
@@ -432,7 +436,7 @@ impl Keep {
         encode_binding_request(txn)
     }
 
-    /// 受けた STUN。答えとして使えたら、前の答えからの変わり方を返す。
+    /// 受けたSTUN。答えとして使えたら、前の答えからの変わり方を返す。
     pub fn on_datagram(&mut self, bytes: &[u8]) -> Option<Remap> {
         let answer = self
             .txn
@@ -441,7 +445,7 @@ impl Keep {
             self.counts.ignored = self.counts.ignored.saturating_add(1);
             return None;
         };
-        // 答えは 1 回だけ使う。
+        // 答えは1回だけ使う。
         self.txn = None;
         self.counts.answered = self.counts.answered.saturating_add(1);
         let r = remap(self.seen, a);
@@ -463,17 +467,18 @@ impl Keep {
         self.counts
     }
 
-    /// 直近の答えの外側のアドレス（まだ答えが無ければ作ったときの `mapped`）。
+    /// 直近の答えの外側のアドレス（まだ答えが無ければ作ったときの`mapped`）。
     pub fn seen(&self) -> SocketAddr {
         self.seen
     }
 }
 
-// ---------------- 2 か所の STUN の答えの比べ ----------------
+// ---------------- 2か所のSTUNの答えの比較 ----------------
 
-/// 同じ待ち受けソケットから 2 か所の STUN へ聞いて、見えた外側のアドレスを比べた結果。ルーターが「宛先ごとに外側のポートを変える型」
-/// （RFC 4787 の endpoint-dependent mapping。俗に対称型）かを見分ける。違えば、STUN で見えたアドレスは STUN サーバー向けの穴で、
-/// 相手には使えない。`peer_sim` の `--stun-probe` も同じ比べを使う。
+/// 同じ待ち受けソケットから2か所のSTUNへ聞いて見えた外側のアドレスを比べた結果。
+/// ルーターが「宛先ごとに外側のポートを変える型」（RFC 4787のendpoint-dependent mapping。俗に対称型）かどうかを見分ける。
+/// 違えばSTUNで見えたアドレスはSTUNサーバー向けの穴で、相手には使えない。
+/// `peer_sim`の`--stun-probe`も同じ比較を使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mapping {
     Same,
@@ -485,7 +490,7 @@ pub enum Mapping {
 }
 
 impl Mapping {
-    /// 宛先によって見えるアドレスが変わるか（STUN で見えたアドレスを相手に使えない見込みか）。
+    /// 宛先によって見えるアドレスが変わるかどうか（STUNで見えたアドレスを相手に使えない見込みか）。
     pub fn depends_on_destination(self) -> bool {
         self != Mapping::Same
     }
@@ -495,7 +500,7 @@ impl Mapping {
     }
 }
 
-/// 2 つの「見えたアドレス」を比べる。族（IPv4 / IPv6）が違えば None。引数の順に依らない。
+/// 2つの「見えたアドレス」を比べる。アドレスファミリ（IPv4 / IPv6）が違えばNone。引数の順に依らない。
 pub fn compare_mappings(a: SocketAddr, b: SocketAddr) -> Option<Mapping> {
     if a.is_ipv4() != b.is_ipv4() {
         return None;
@@ -511,14 +516,15 @@ pub fn compare_mappings(a: SocketAddr, b: SocketAddr) -> Option<Mapping> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondOutcome {
     Compared(Mapping),
-    /// 答えは来たが、族が 1 か所目と違い比べられなかった。
+    /// 答えは来たが、アドレスファミリが1か所目と違い比べられなかった。
     Incomparable,
     NoAnswer,
 }
 
-/// 2 か所目の STUN への問い合わせ 1 回分（`Query` ＋ 1 か所目の答えとの比べ）。呼び手は `poll_send` が返したものを 2 か所目の
-/// サーバーへ送り、そのサーバーから来た STUN を `on_datagram` へ渡し、`outcome` が Some になったら止める。
-/// 偽の答え・壊れた答えは `Query` が捨てて数える。送り元の確認は呼び手の仕事。
+/// 2か所目のSTUNへの問い合わせ1回分（`Query` ＋ 1か所目の答えとの比較）。
+/// 呼び手は`poll_send`が返したものを2か所目のサーバーへ送り、そのサーバーから来たSTUNを`on_datagram`へ渡す。
+/// `outcome`がSomeになったら止める。
+/// 偽の答え・壊れた答えは`Query`が捨てて数える。送信元の確認は呼び手の仕事。
 #[derive(Debug, Clone, Copy)]
 pub struct SecondProbe {
     query: Query,
@@ -535,7 +541,7 @@ impl SecondProbe {
         }
     }
 
-    /// 送るものがあれば返す（間隔と回数は `Query` と同じ）。
+    /// 送るものがあれば返す（間隔と回数は`Query`と同じ）。
     pub fn poll_send(&mut self, now: u32) -> Option<[u8; HEADER_LEN]> {
         if self.done.is_some() {
             return None;
@@ -571,12 +577,12 @@ impl SecondProbe {
 
 #[cfg(test)]
 mod tests {
-    //! 期待値は自分で組み立てた golden（手計算した XOR の鍵で答え合わせ）と RFC 5769 §2.2・§2.3 の標本。
-    //! 実装の往復だけで正しさを主張しない。毒標本（1 か所だけ壊す）→ 往復とでたらめの大量件数。
+    //! 期待値は自分で組み立てたgolden（手計算したXORの鍵で答え合わせ）とRFC 5769 §2.2・§2.3のサンプル。
+    //! 実装の往復だけで正しさを主張しない。不正な入力のサンプル（1か所だけ壊す）→ 往復とでたらめの大量件数。
     use super::*;
 
-    // ---------- golden 1: IPv4（自分で組み立てた。RFC 5769 の値ではない） ----------
-    // アドレス 203.0.113.5:4242 を XOR-MAPPED-ADDRESS で載せる。
+    // ---------- golden 1: IPv4（自分で組み立てた。RFC 5769の値ではない） ----------
+    // アドレス203.0.113.5:4242をXOR-MAPPED-ADDRESSで載せる。
     // X-Port  = 0x1092 (=4242) ^ 0x2112 (cookie の上位16 bit) = 0x3180
     // X-Addr  = 0xCB007105 (=203.0.113.5) ^ 0x2112A442 = 0xEA12D547
 
@@ -588,7 +594,7 @@ mod tests {
     const IPV4_XOR_RESPONSE: [u8; 32] = [
         // ヘッダ（20 B）
         0x01, 0x01, // type = Binding Success Response
-        0x00, 0x0C, // length = 12（属性 1 つ、value 8B + 属性ヘッダ 4B）
+        0x00, 0x0C, // length = 12（属性1つ、value 8B + 属性ヘッダ4B）
         0x21, 0x12, 0xA4, 0x42, // magic cookie
         0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // transaction id
         // XOR-MAPPED-ADDRESS
@@ -605,9 +611,9 @@ mod tests {
         assert_eq!(addr, SocketAddr::from(([203, 0, 113, 5], 4242)));
     }
 
-    // ---------- golden 2: IPv6（自分で組み立てた。RFC 5769 の値ではない） ----------
-    // アドレス [2001:db8:85a3::8a2e:370:7334]:5000 を XOR-MAPPED-ADDRESS で載せる。
-    // 鍵は cookie（4B）+ transaction id（12B）の 16B。X-Port と X-Address は本文中の doc の通り
+    // ---------- golden 2: IPv6（自分で組み立てた。RFC 5769の値ではない） ----------
+    // アドレス[2001:db8:85a3::8a2e:370:7334]:5000をXOR-MAPPED-ADDRESSで載せる。
+    // 鍵はcookie（4B）+ transaction id（12B）の16B。X-PortとX-Addressは本文中のdocの通り
 
     const TXN2: TransactionId = [
         0x9F, 0x8E, 0x7D, 0x6C, 0x5B, 0x4A, 0x39, 0x28, 0x17, 0x06, 0xF5, 0xE4,
@@ -636,7 +642,7 @@ mod tests {
         assert_eq!(addr, SocketAddr::new(IpAddr::V6(want_ip), 5000));
     }
 
-    // ---------- golden 4・5: RFC 5769 §2.2・§2.3 の標本（本文の 16 進のダンプから転記した） ----------
+    // ---------- golden 4・5: RFC 5769 §2.2・§2.3のサンプル（本文の16進のダンプから転記した） ----------
 
     const RFC5769_TXN: TransactionId = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
@@ -692,18 +698,18 @@ mod tests {
         assert_eq!(addr, SocketAddr::new(IpAddr::V6(want_ip), 32853));
     }
 
-    /// XOR-MAPPED-ADDRESS が無いときの MAPPED-ADDRESS へのフォールバック（IPv4 golden の後ろに MAPPED-ADDRESS だけを付ける）。
+    /// XOR-MAPPED-ADDRESSが無いときのMAPPED-ADDRESSへのフォールバック（IPv4 goldenの後ろにMAPPED-ADDRESSだけを付ける）。
     #[rustfmt::skip]
     const IPV4_MAPPED_ONLY_RESPONSE: [u8; 32] = [
         0x01, 0x01,
         0x00, 0x0C,
         0x21, 0x12, 0xA4, 0x42,
         0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-        // MAPPED-ADDRESS（XOR しない生の値）
+        // MAPPED-ADDRESS（XORしない生の値）
         0x00, 0x01, // type
         0x00, 0x08, // length = 8
         0x00, 0x01, // reserved, family = IPv4
-        0x10, 0x92, // port = 4242（生の値。XOR しない）
+        0x10, 0x92, // port = 4242（生の値。XORしない）
         0xCB, 0x00, 0x71, 0x05, // address = 203.0.113.5
     ];
 
@@ -714,20 +720,20 @@ mod tests {
         assert_eq!(addr, SocketAddr::from(([203, 0, 113, 5], 4242)));
     }
 
-    /// 両方の属性がある応答では XOR-MAPPED-ADDRESS を優先する（MAPPED-ADDRESS はわざと違うアドレス）。
+    /// 両方の属性がある応答ではXOR-MAPPED-ADDRESSを優先する（MAPPED-ADDRESSはわざと違うアドレス）。
     #[rustfmt::skip]
     const BOTH_ATTRS_RESPONSE: [u8; 44] = [
         0x01, 0x01,
         0x00, 0x18, // length = 24（MAPPED 12B + XOR 12B）
         0x21, 0x12, 0xA4, 0x42,
         0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
-        // MAPPED-ADDRESS（10.0.0.9:1。わざと XOR-MAPPED-ADDRESS と違う値）
+        // MAPPED-ADDRESS（10.0.0.9:1。わざとXOR-MAPPED-ADDRESSと違う値）
         0x00, 0x01,
         0x00, 0x08,
         0x00, 0x01,
         0x00, 0x01, // port = 1
         0x0A, 0x00, 0x00, 0x09, // address = 10.0.0.9
-        // XOR-MAPPED-ADDRESS（golden 1 と同じ 203.0.113.5:4242）
+        // XOR-MAPPED-ADDRESS（golden 1と同じ203.0.113.5:4242）
         0x00, 0x20,
         0x00, 0x08,
         0x00, 0x01,
@@ -791,7 +797,7 @@ mod tests {
     #[test]
     fn poison_length_not_multiple_of_4() {
         let mut bytes = IPV4_XOR_RESPONSE.to_vec();
-        // length を 12 → 13 にし、本体を 1 バイト増やして「本体と合わない」の方を先に踏まないようにする。
+        // lengthを12 → 13にし、本体を1バイト増やして「本体と合わない」の方を先に踏まないようにする。
         bytes[3] = 13;
         bytes.push(0);
         assert_eq!(
@@ -803,7 +809,7 @@ mod tests {
     #[test]
     fn poison_length_mismatch_with_actual_body() {
         let mut bytes = IPV4_XOR_RESPONSE.to_vec();
-        bytes.push(0); // 本体の後ろに 1 バイト余らせる。length は 12 のまま。
+        bytes.push(0); // 本体の後ろに1バイト余らせる。lengthは12のまま。
         assert_eq!(
             decode_binding_response(&bytes, &TXN1),
             Err(StunError::LengthMismatch)
@@ -824,7 +830,7 @@ mod tests {
     #[test]
     fn poison_unknown_address_family() {
         let mut bytes = IPV4_XOR_RESPONSE;
-        bytes[25] = 0x03; // family（0x01/0x02 のどちらでもない）
+        bytes[25] = 0x03; // family（0x01/0x02のどちらでもない）
         assert_eq!(
             decode_binding_response(&bytes, &TXN1),
             Err(StunError::UnknownFamily)
@@ -872,10 +878,10 @@ mod tests {
 
     #[test]
     fn poison_malformed_address_value_length() {
-        // XOR-MAPPED-ADDRESS の value を短くする（length 8 → 4。address 抜き）。
+        // XOR-MAPPED-ADDRESSのvalueを短くする（length 8 → 4。address抜き）。
         let mut bytes = IPV4_XOR_RESPONSE[..28].to_vec();
-        bytes[3] = 8; // header の length はそのまま（属性ヘッダ 4B + value 4B = 8B）
-        bytes[23] = 4; // 属性の length を 4 に
+        bytes[3] = 8; // headerのlengthはそのまま（属性ヘッダ 4B + value 4B = 8B）
+        bytes[23] = 4; // 属性のlengthを4に
         assert_eq!(
             decode_binding_response(&bytes, &TXN1),
             Err(StunError::MalformedAddress)
@@ -884,10 +890,10 @@ mod tests {
 
     #[test]
     fn unknown_attribute_before_the_address_is_skipped() {
-        // 数えない）。パディングを跳ばさずに次を読むと、後ろの XOR-MAPPED-ADDRESS の type が
+        // 数えない）。パディングを跳ばさずに次を読むと、後ろのXOR-MAPPED-ADDRESSのtypeが
         let mut bytes = Vec::with_capacity(IPV4_XOR_RESPONSE.len() + 8);
         bytes.extend_from_slice(&IPV4_XOR_RESPONSE[..HEADER_LEN]);
-        bytes[2..4].copy_from_slice(&20u16.to_be_bytes()); // 8B（知らない属性。ヘッダ4B+value3B+パディング1B）+ 12B（元の length）
+        bytes[2..4].copy_from_slice(&20u16.to_be_bytes()); // 8B（知らない属性。ヘッダ4B+value3B+パディング1B）+ 12B（元のlength）
         bytes.extend_from_slice(&[0x99, 0x99, 0x00, 0x03, 0xDE, 0xAD, 0xBE, 0x00]);
         bytes.extend_from_slice(&IPV4_XOR_RESPONSE[HEADER_LEN..]);
         let addr = decode_binding_response(&bytes, &TXN1).expect("知らない属性で止まった");
@@ -930,10 +936,10 @@ mod tests {
 
     #[test]
     fn decode_never_panics_on_garbage_that_looks_like_a_valid_header() {
-        // 上の完全ランダムだと、cookie が一致する確率が 2^32 分の 1 でほぼ通らず、属性の
+        // 上の完全ランダムだと、cookieが一致する確率が2^32分の1でほぼ通らず、属性の
         let mut rng = SplitMix64::new(0x1234_5678_9ABC_DEF0);
         for _ in 0..50_000u32 {
-            let body_len = ((rng.next_u64() % 51) as usize) * 4; // 0, 4, .., 200（4 の倍数）
+            let body_len = ((rng.next_u64() % 51) as usize) * 4; // 0, 4, .., 200（4の倍数）
             let mut bytes = vec![0u8; HEADER_LEN + body_len];
             bytes[0..2].copy_from_slice(&TYPE_BINDING_SUCCESS_RESPONSE.to_be_bytes());
             bytes[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());

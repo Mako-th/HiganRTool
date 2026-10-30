@@ -1,7 +1,8 @@
-//! 512 ビットの固定長ビット集合（観戦者へ送るホストの送信ウィンドウ `spectate::SEND_WINDOW` と、ACK の受け取れた範囲 `sack` の表）。
-//! `Copy` で確保せず、添字は `get` で範囲を見る（ゲームスレッドから呼ぶ部品がパニックしない）。ビット i は語 `i / 64` の下位から `i % 64` 番目。
+//! 512ビットの固定長ビット集合（観戦者へ送るホストの送信ウィンドウ`spectate::SEND_WINDOW`とACKの受け取れた範囲`sack`の表）。
+//! `Copy`で確保せず、添字は`get`で範囲を見る（ゲームスレッドから呼ぶ部品がパニックしない）。
+//! ビットiはワード`i / 64`の下位から`i % 64`番目。
 
-/// 語の数。
+/// ワードの数。
 pub const WORDS: usize = 8;
 /// ビットの数。
 pub const BITS: u32 = 512;
@@ -14,7 +15,7 @@ pub struct Bits512(pub [u64; WORDS]);
 impl Bits512 {
     pub const EMPTY: Bits512 = Bits512([0; WORDS]);
 
-    /// 下位 `n` ビットが立った集合（`n` が 512 以上なら全部）。
+    /// 下位`n`ビットが立った集合（`n`が512以上なら全部）。
     pub const fn low(n: u32) -> Bits512 {
         let mut w = [0u64; WORDS];
         let mut i = 0;
@@ -45,7 +46,7 @@ impl Bits512 {
         }
     }
 
-    /// `first` から `n` ビットを立てる。
+    /// `first`から`n`ビットを立てる。
     pub fn set_range(&mut self, first: u32, n: u32) {
         for i in first..first.saturating_add(n).min(BITS) {
             self.set(i);
@@ -70,7 +71,7 @@ impl Bits512 {
             .map(|(i, w)| i as u32 * 64 + 63 - w.leading_zeros())
     }
 
-    /// `from` 以降で最初に立っているビットの番号。
+    /// `from`以降で最初に立っているビットの番号。
     pub fn next_set(&self, from: u32) -> Option<u32> {
         let start = (from / 64) as usize;
         for (i, &w) in self.0.iter().enumerate().skip(start) {
@@ -86,7 +87,7 @@ impl Bits512 {
         None
     }
 
-    /// `from` から続けて立っているビットの数（`max` まで）。
+    /// `from`から続けて立っているビットの数（`max`まで）。
     pub fn run_len(&self, from: u32, max: u32) -> u32 {
         let mut n = 0;
         while n < max && self.get(from.saturating_add(n)) {
@@ -95,7 +96,7 @@ impl Bits512 {
         n
     }
 
-    /// 右へ `n` ビット詰める（番号が `n` 小さくなる。512 以上なら空）。
+    /// 右へ`n`ビット詰める（番号が`n`小さくなる。512以上なら空）。
     pub fn shr(&mut self, n: u32) {
         let (ws, bs) = ((n / 64) as usize, n % 64);
         let src = self.0;
@@ -110,7 +111,7 @@ impl Bits512 {
         }
     }
 
-    /// 左へ `n` ビット送る（番号が `n` 大きくなる。512 を越えた分は捨てる）。
+    /// 左へ`n`ビット送る（番号が`n`大きくなる。512を越えた分は捨てる）。
     pub fn shl(&mut self, n: u32) {
         let (ws, bs) = ((n / 64) as usize, n % 64);
         let src = self.0;
@@ -141,7 +142,7 @@ impl Bits512 {
         self.zip(o, |a, b| a | b)
     }
 
-    /// `self` のうち `o` に無いもの。
+    /// `self`のうち`o`に無いもの。
     pub fn andn(&self, o: &Bits512) -> Bits512 {
         self.zip(o, |a, b| a & !b)
     }
@@ -154,7 +155,7 @@ impl Bits512 {
         r
     }
 
-    /// ワイヤの形: バイト j がビット 8j〜8j+7（下位から）。後ろの 0 のバイトは載せない。`out` に書いて載せた長さを返す。
+    /// ワイヤの形: バイトjがビット8j〜8j+7（下位から）。後ろの0のバイトは載せない。`out`に書いて載せた長さを返す。
     pub fn to_wire(&self, out: &mut [u8; BYTES]) -> usize {
         for (w, dst) in self.0.iter().zip(out.as_chunks_mut::<8>().0.iter_mut()) {
             *dst = w.to_le_bytes();
@@ -162,7 +163,7 @@ impl Bits512 {
         out.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)
     }
 
-    /// `to_wire` の逆。`BYTES` を越える長さは None。後ろの 0 のバイトを許すかは呼び手が決める。
+    /// `to_wire`の逆。`BYTES`を越える長さはNone。後ろの0のバイトを許すかどうかは呼び出し側が決める。
     pub fn from_wire(bytes: &[u8]) -> Option<Bits512> {
         if bytes.len() > BYTES {
             return None;

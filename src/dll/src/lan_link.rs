@@ -1,12 +1,17 @@
-//! LAN 対戦の申し込みの運び手（std のソケットだけ。unsafe 無し）。
-//! 接続コードの受け渡しをクリップボードやルームサーバーでなく LAN の UDP でやる（判断と手順は core の `lan_proto`）。ここはソケットを開き、状態機械に受けたバイト列を渡し、出てきた「送る」「開く」「読ませる」を行うだけ。
-//! コードの中身も接続の手順も、インターネットの経路と同じ（ホストが `Swapper::offer` で作ったコードをクライアントへ返し、クライアントが返すコードを返す）。
-//! - **別のスレッド・別のソケット**: 申し込みの受け口はゲームの受信ソケット（`net_udp` の受信ループ）とは別で、ゲームのスレッドには何も足さない。ホストの受け口は、LAN の自分のアドレスごとに 1 つずつ（`bind(アドレス:ポート)`）。
-//!   全部のアドレスで受ける未指定アドレスの待ち受けにしないのは、WAN 側のアドレスで待たず、どのアドレスに申し込みが届いたか（＝その相手に届く自分のアドレス）をそのまま分かるようにするため。
-//! - **ゲームのネットワークは参加を受けてから開く**: ホストは申し込みが届いたアドレスで、クライアントは申し込み先へ届く自分のアドレスでゲームのネットワークを開き（`LanEnv::open_net`。`scope = lan`（VPN のアドレスでは、そのネットワークを足した範囲）・STUN・UPnP・IPv6 なし）、
-//!   見張り（`net_code_game::GameWatcher`）が `LanBridge` を通してコードを受け渡す。見張りは「作る」「貼る」と同じ手順を踏むが、コードの運び先がクリップボードでなく `LanBridge`。
-//! - **見張りとの受け渡し**: 運び手と見張りの間は `LanBridge`（ロックで守った小さな入れ物）。見張りは指示のリングバッファの読み手のまま（運び手は、ネットワークを開く前の取りやめの指示だけを自分で読み、開く頼みを出したら読まない）。
-//!   申し込みの文脈（ホスト・クライアント・観戦の 3 つ）ごとに 1 本のスレッドで、終われば（取りやめ・失敗・成立して務めを終えた）スレッドも終わる。
+//! LAN対戦の申し込みの運び手（stdのソケットだけ。unsafe無し）。
+//! 接続コードの受け渡しをクリップボードやルームサーバーでなくLANのUDPでやる（判断と手順はcoreの`lan_proto`）。
+//! ここはソケットを開いてステートマシンに受けたバイト列を渡し、出てきた「送る」「開く」「読ませる」を行うだけ。
+//! コードの中身も接続の手順もインターネットの経路と同じ（ホストが`Swapper::offer`で作ったコードをクライアントへ返し、クライアントが返すコードをホストへ返す）。
+//! - **別のスレッド・別のソケット**: 申し込みの受付用受信ソケットは対戦用受信ソケット（`net_udp`の受信ループ）とは別。ゲームのスレッドには何も足さない。
+//!   ホストの受付用受信ソケットはLANの自分のアドレスごとに1つずつ（`bind(アドレス:ポート)`）。
+//!   未指定アドレスで全部のアドレスを受ける待ち受けにはしない。理由はWAN側のアドレスで待たないことと、どのアドレスに申し込みが届いたか（＝その相手に届く自分のアドレス）をそのまま分かるようにすること。
+//! - **ゲームのネットワークは参加を受けてから開く**: ホストは申し込みが届いたアドレスで開く。クライアントは申し込み先へ届く自分のアドレスで開く。
+//!   開くときは`scope = lan`（VPNのアドレスではそのネットワークを足した範囲）・STUN・UPnP・IPv6なし（`LanEnv::open_net`）。
+//!   監視の処理（`net_code_game::GameWatcher`）が`LanBridge`を通してコードを受け渡す。
+//!   監視の処理は「作る」「貼る」と同じ手順を踏むが、コードの運び先がクリップボードでなく`LanBridge`。
+//! - **監視の処理との受け渡し**: 運び手と監視の処理の間は`LanBridge`（ロックで守った小さなバッファ）。
+//!   指示のリングバッファの読み手は監視の処理のまま。運び手はネットワークを開く前の取りやめの指示だけを自分で読み、開く頼みを出したら読まない。
+//!   スレッドは申し込みの文脈（ホスト・クライアント・観戦の3つ）ごとに1本。取りやめ・失敗・成立して務めを終えたときにスレッドも終わる。
 
 #![forbid(unsafe_code)]
 
@@ -29,30 +34,37 @@ use higanr_core::wire::MAX_DATAGRAM;
 use crate::clipboard::Clipboard;
 use crate::net_ui::{Order, UiLink};
 
-/// ホストの受け口を回す間隔。申し込みは人が待つ程度の頻度なので、短くしない（待つだけで処理の重さは無い）。
+/// ホストの受付用受信ソケットをポーリングする間隔。申し込みは人が待つ程度の頻度なので短くしない（待つだけで処理の重さは無い）。
 const POLL: Duration = Duration::from_millis(20);
-/// 申し込みを受けてからゲームのネットワークを開き、見張りが動き出すまで待つ上限。
+/// 申し込みを受けてからゲームのネットワークを開き、監視の処理が動き出すまで待つ上限。
 const ATTACH_WAIT: Duration = Duration::from_secs(20);
-/// 前のネットワークの片づけが済んで、新しいネットワークを開ける（ポートが空く）のを待つ上限。
+/// 前のネットワークの後始末が済んで新しいネットワークを開ける（ポートが空く）のを待つ上限。
 const NET_FREE_WAIT: Duration = Duration::from_secs(8);
 
-/// ゲームのネットワークを開くときの役。ホストは役割の乱数を大きくして、いつも試合のホスト（観戦コードを出す側）になる。
+/// ゲームのネットワークを開くときの役。ホストは役割の乱数を大きくしていつも試合のホスト（観戦コードを出す側）になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanRole {
     Host,
     Client,
 }
 
-/// 運び手が見張りにさせたいこと。
+/// 運び手が監視の処理にさせたいこと。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeCmd {
-    /// 始める側のコードを作って `LanBridge` へ書く。
+    /// 始める側のコードを作って`LanBridge`へ書く。
     Create,
-    /// `LanBridge` にあるコードを読む（ホストは返すコード、クライアントは始める側のコード）。
+    /// `LanBridge`にあるコードを読む（ホストは返すコードを読み、クライアントは始める側のコードを読む）。
     Paste,
-    /// 観戦コードを作って答える（`LanBridge::post_watch_answer`）。
-    WatchCode { src: SocketAddrV4, id: u32 },
+    /// 観戦コードを作って答える（`LanBridge::post_watch_answer`。`via`は申し込みを受けた受付用受信ソケットの番号。答えにそのまま付けて返す）。
+    WatchCode {
+        src: SocketAddrV4,
+        id: u32,
+        via: usize,
+    },
 }
+
+/// 観戦の申し込みへの答え（送信元・番号・受けた受付用受信ソケットの番号・観戦コードか断る理由）。
+type WatchAnswer = (SocketAddrV4, u32, usize, Result<String, Why>);
 
 #[derive(Default)]
 struct Inner {
@@ -60,16 +72,16 @@ struct Inner {
     closed: bool,
     connected: bool,
     aborted: bool,
-    /// 見張りが書いたコード（運び手が取って相手へ送る）。
+    /// 監視の処理が書いたコード（運び手が取って相手へ送る）。
     outgoing: Option<String>,
-    /// 運び手が書いたコード（見張りが `read` で読む。読んでも消さない）。
+    /// 運び手が書いたコード（監視の処理が`read`で読む。読んでも消さない）。
     incoming: Option<String>,
     cmds: VecDeque<BridgeCmd>,
-    watch_answers: VecDeque<(SocketAddrV4, u32, Result<String, Why>)>,
+    watch_answers: VecDeque<WatchAnswer>,
     failure: Option<Event>,
 }
 
-/// 運び手と見張りの受け渡し。
+/// 運び手と監視の処理の受け渡し。
 #[derive(Default)]
 pub struct LanBridge {
     inner: Mutex<Inner>,
@@ -88,14 +100,14 @@ impl LanBridge {
         r
     }
 
-    // ---- 見張りの側 ----
+    // ---- 監視の処理の側 ----
 
-    /// 見張りが動き出した。
+    /// 監視の処理が動き出した。
     pub fn attach(&self) {
         self.with(|i| i.attached = true);
     }
 
-    /// 見張りが終わった（以後、運び手は務めを終える）。
+    /// 監視の処理が終わった（以後は運び手が務めを終える）。
     pub fn close(&self) {
         self.with(|i| i.closed = true);
     }
@@ -105,7 +117,7 @@ impl LanBridge {
         self.with(|i| i.connected = true);
     }
 
-    /// 見張りが待ちをやめた（メニューの取りやめ・失敗）。運び手は務めを終える。
+    /// 監視の処理が待ちをやめた（メニューの取りやめ・失敗）。運び手は務めを終える。
     pub fn abort(&self) {
         self.with(|i| i.aborted = true);
     }
@@ -126,8 +138,14 @@ impl LanBridge {
         self.with(|i| i.incoming.clone())
     }
 
-    pub fn post_watch_answer(&self, src: SocketAddrV4, id: u32, answer: Result<String, Why>) {
-        self.with(|i| i.watch_answers.push_back((src, id, answer)));
+    pub fn post_watch_answer(
+        &self,
+        src: SocketAddrV4,
+        id: u32,
+        via: usize,
+        answer: Result<String, Why>,
+    ) {
+        self.with(|i| i.watch_answers.push_back((src, id, via, answer)));
     }
 
     // ---- 運び手の側 ----
@@ -156,16 +174,16 @@ impl LanBridge {
         self.with(|i| i.outgoing.take())
     }
 
-    pub fn take_watch_answer(&self) -> Option<(SocketAddrV4, u32, Result<String, Why>)> {
+    pub fn take_watch_answer(&self) -> Option<WatchAnswer> {
         self.with(|i| i.watch_answers.pop_front())
     }
 
-    /// 見張りに、画面へ出して待ちをやめさせる（時間切れなど）。
+    /// 監視の処理に、イベントを画面へ出させて待ちをやめさせる（時間切れなど）。
     pub fn fail(&self, ev: Event) {
         self.with(|i| i.failure = Some(ev));
     }
 
-    /// 見張りが動き出すのを待つ。動き出したら true。
+    /// 監視の処理が動き出すのを待つ。動き出したらtrue。
     pub fn wait_attached(&self, limit: Duration) -> bool {
         let end = Instant::now() + limit;
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -188,7 +206,7 @@ impl LanBridge {
     }
 }
 
-/// 見張りがコードを受け渡す「クリップボード」（`LanBridge` へ書く・から読む）。
+/// 監視の処理がコードを受け渡す「クリップボード」（`LanBridge`への書き込みと読み取り）。
 pub struct LanClip(pub Arc<LanBridge>);
 
 impl Clipboard for LanClip {
@@ -202,37 +220,37 @@ impl Clipboard for LanClip {
     }
 }
 
-/// ゲームのネットワークを開く頼み（`LanEnv::open_net`）。引数は自分のアドレス・開く範囲（`Scope::lan_via`）・役・見張りとの受け渡し。
+/// ゲームのネットワークを開く頼み（`LanEnv::open_net`）。引数は自分のアドレス・開く範囲（`Scope::lan_via`）・役・監視の処理との受け渡し。
 type OpenNet =
     Box<dyn Fn(Ipv4Addr, Scope, LanRole, Arc<LanBridge>) -> Result<(), String> + Send + Sync>;
 
-/// 運び手の材料。製品は `script_win` が、検査は偽物を渡す。
+/// 運び手の材料。製品は`script_win`が、検査は偽物を渡す。
 pub struct LanEnv {
     pub link: Arc<UiLink>,
     pub ver: Ver,
-    /// 観戦の申し込みを受ける設定か（`[spectate] enable = 1`）。
+    /// 観戦の申し込みを受ける設定かどうか（`[spectate] enable = 1`）。
     pub watch_ok: bool,
-    /// ホストの受け口のポート。
+    /// ホストの受付用受信ソケットのポート。
     pub port: u16,
-    /// ホストが返すコードを待つ上限（ms。製品は `lan_proto::HOST_WAIT_REPLY_MS`）。過ぎたら待機へ戻る。
+    /// ホストが返すコードを待つ上限（ms。製品は`lan_proto::HOST_WAIT_REPLY_MS`）。過ぎたら待機へ戻る。
     pub reply_wait_ms: u64,
-    /// ホストの自分の LAN のアドレス（本物の LAN → VPN → ほかの仮想の順）。
+    /// ホストの自分のLANのアドレス（本物のLAN → VPN → ほかの仮想の順）。
     pub addresses: Box<dyn Fn() -> Result<Vec<HostAddr>, String> + Send + Sync>,
-    /// クライアント・観戦の自分の PC の VPN のアドレス（利用者が打ったアドレスが LAN の外のとき、この中のネットワークなら受ける）。
+    /// クライアント・観戦の自分のPCのVPNのアドレス（利用者が打ったアドレスがLANの外のとき、この中のネットワークなら受ける）。
     pub vpn_links: Box<dyn Fn() -> Vec<VpnLink> + Send + Sync>,
-    /// 前のネットワークの片づけが済んで、ホストの受け口のポートが空いたか。
+    /// 前のネットワークの後始末が済んでホストの受付用受信ソケットのポートが空いたかどうか。
     pub net_free: Box<dyn Fn() -> bool + Send + Sync>,
-    /// ゲームのネットワークを `ip` で開く頼み（開くスレッドを作って返る。見張りは動き出したら `LanBridge::attach` を呼ぶ）。
+    /// ゲームのネットワークを`ip`で開く頼み（開くスレッドを作って返る。監視の処理は動き出したら`LanBridge::attach`を呼ぶ）。
     pub open_net: OpenNet,
-    /// 観戦コードを受けた。観戦者のネットワークを `ip`・範囲 `scope` で開く頼みを出す（観戦者のセッションを作るのはゲームのスレッド）。
+    /// 観戦コードを受けた。観戦者のネットワークを`ip`・範囲`scope`で開く頼みを出す（観戦者のセッションを作るのはゲームのスレッド）。
     pub start_watch: Box<dyn Fn(String, Ipv4Addr, Scope) -> Result<(), String> + Send + Sync>,
-    /// 本ログへ 1 行頼む（製品は `script_win` が本ログと「ネットワーク」の詳細へ書く。検査は記録する）。
+    /// 本ログへ1行頼む（製品は`script_win`が本ログと「ネットワーク」の詳細へ書く。検査は記録する）。
     pub note: Box<dyn Fn(String) + Send + Sync>,
-    /// 申し込みの番号（クライアント・観戦が引く乱数）。
+    /// 申し込みの番号（クライアント・観戦が生成する乱数）。
     pub id: u32,
-    /// 今の UNIX 秒（待機時間の起点）。
+    /// 今のUNIX秒（待機時間の起点）。
     pub unix: fn() -> u64,
-    /// 外から止める（プロセスの終わり、など）。
+    /// 外から止める（プロセスの終了時など）。
     pub stop: Arc<AtomicBool>,
 }
 
@@ -242,8 +260,8 @@ impl LanEnv {
     }
 }
 
-/// ゲームのネットワークを VPN の範囲で開く頼みの前に、本ログへ 1 行書く（範囲 lan の接続では何も書かない）。
-/// ツールの名前は `vpn_links` の `ip` で引く（引けなければ名前を省く）。アドレスは書かない。
+/// ゲームのネットワークをVPNの範囲で開く頼みの前に本ログへ1行書く（範囲lanの接続では何も書かない）。
+/// ツールの名前は`vpn_links`の`ip`で取得する（取得できなければ名前を省く）。アドレスは書かない。
 fn note_vpn_open(env: &LanEnv, ip: Ipv4Addr, scope: Scope) {
     if let Scope::LanVpn(net) = scope {
         let tool = (env.vpn_links)()
@@ -254,7 +272,7 @@ fn note_vpn_open(env: &LanEnv, ip: Ipv4Addr, scope: Scope) {
     }
 }
 
-/// 本ログの VPN の行（ツールの名前とネットマスクの長さだけ）。
+/// 本ログのVPNの行（ツールの名前とネットマスクの長さだけ）。
 fn vpn_open_line(tool: Option<VpnTool>, prefix: u8) -> String {
     match tool {
         Some(t) => format!(
@@ -265,7 +283,7 @@ fn vpn_open_line(tool: Option<VpnTool>, prefix: u8) -> String {
     }
 }
 
-/// 状態の札の書き手（運び手が見張りに引き継ぐ前だけ使う）。
+/// 状態のタグの書き手（運び手が監視の処理に引き継ぐ前だけ使う）。
 struct Say<'a> {
     link: &'a UiLink,
     note: Note,
@@ -285,13 +303,13 @@ impl<'a> Say<'a> {
     fn put(&mut self, state: CodeState, event: Event) {
         self.note.state = state;
         self.note.event = event;
-        // ホストは見張りが動いた後も札を書く（待機へ戻ったとき）ので、見張りが書いた数の続きから数える（同じ数だとメニューが変化を見落とす）。
+        // ホストは監視の処理が動いた後もタグを書く（待機へ戻ったとき）。そのため監視の処理が書いた数の続きから数える（同じ数だとメニューが変化を見落とす）。
         let last = self.link.note().map_or(self.note.seq, |n| n.seq);
         self.note.seq = last.wrapping_add(1);
         self.link.publish(&self.note);
     }
 
-    /// 待ちを終える（元のメニューへ戻し、理由を残す）。
+    /// 待ちを終える（元のメニューへ戻して理由を残す）。
     fn end(&mut self, event: Event) {
         self.put(CodeState::Idle, event);
     }
@@ -304,9 +322,9 @@ pub enum End {
     Cancelled,
     /// 外から止められた。
     Stopped,
-    /// 失敗して、理由を画面へ出した。
+    /// 失敗して理由を画面へ出した。
     Failed(Event),
-    /// 務めを終えた（コードの受け渡しが済んだ・見張りが終わった）。
+    /// 務めを終えた（コードの受け渡しが済んだ・監視の処理が終わった）。
     Done,
 }
 
@@ -317,7 +335,7 @@ fn v4(a: SocketAddr) -> Option<SocketAddrV4> {
     }
 }
 
-/// 取りやめの指示が来ているか（ネットワークを開く前だけ指示のリングバッファを読む。ほかの指示は読み捨てる）。
+/// 取りやめの指示が来ているかどうか（ネットワークを開く前だけ指示のリングバッファを読む。ほかの指示は読み捨てる）。
 fn cancel_asked(link: &UiLink) -> bool {
     let mut cancel = false;
     while let Some(o) = link.take_order() {
@@ -358,41 +376,23 @@ fn wait_for(limit: Duration, mut ok: impl FnMut() -> bool, stop: &AtomicBool) ->
 
 // ---- ホスト ----
 
-/// 覚えておく送り元の数の上限（古いものから忘れる。LAN の中の申し込みの相手なので、数は人の数ほど）。
-const ROUTES_MAX: usize = 64;
+/// 1回の巡回で1つの受付用受信ソケットから読む数の上限。
+/// 読み取りより速く送られ続けても巡回を終え、外からの停止・取りやめ・コードの受け渡しを待たせない（読み残しは次の巡回で読む）。
+/// 正直な申し込みは500 msごとに1通なので届くことはない。
+const RECV_PER_POLL: usize = 256;
 
-/// 送り元ごとの、申し込みを受けた受け口の番号。返事はその受け口から返す: 相手に届く自分のアドレスは相手ごとに違いうる（有線と無線の両方がある PC）し、
-/// 申し込む側のソケットは `connect` 済みで、ほかのアドレスから来た返事を受け取らない。
-#[derive(Default)]
-struct Routes(VecDeque<(SocketAddrV4, usize)>);
-
-impl Routes {
-    fn note(&mut self, src: SocketAddrV4, at: usize) {
-        self.0.retain(|(s, _)| *s != src);
-        self.0.push_back((src, at));
-        if self.0.len() > ROUTES_MAX {
-            self.0.pop_front();
-        }
-    }
-
-    fn get(&self, src: SocketAddrV4) -> Option<usize> {
-        self.0.iter().find(|(s, _)| *s == src).map(|(_, at)| *at)
-    }
-}
-
-/// 開いた受け口 1 つ。
+/// 開いた受付用受信ソケット1つ。
 struct Listener {
     ip: Ipv4Addr,
     sock: UdpSocket,
-    /// 私設でない VPN のアドレスの受け口なら、そのネットワーク。同じネットワークから来た申し込みだけを読み、ゲームのネットワークはこれを足した範囲で開く。
+    /// 私設でないVPNのアドレスの受付用受信ソケットなら、そのネットワーク。同じネットワークから来た申し込みだけを読み、ゲームのネットワークはこれを足した範囲で開く。
     net: Option<Net4>,
 }
 
-/// 受け口 `at` で受けた 1 通を状態機械へ渡す。送り元が受け口の読んでよい範囲の外なら相手にしない（WAN から届いたものを読まない）。ポート 0 も断る。
-/// `vpn` が `Some` の受け口（私設でない VPN のアドレス）は同じネットワークの送り元だけ、`None` の受け口は範囲 lan の送り元だけ。
+/// 受付用受信ソケット`at`（読む範囲は`vpn`。`Listener::net`）で受けた1通をステートマシンへ渡す。
+/// 送信元が受付用受信ソケットの読んでよい範囲（`source_ok`）の外なら相手にしない（WANから届いたものを読まない）。
 fn host_receive(
     host: &mut Host,
-    routes: &mut Routes,
     (at, vpn): (usize, Option<Net4>),
     from: SocketAddr,
     bytes: &[u8],
@@ -401,12 +401,34 @@ fn host_receive(
     let Some(src) = v4(from).filter(|s| source_ok(*s, vpn)) else {
         return Vec::new();
     };
-    routes.note(src, at);
-    host.on_datagram(src, bytes, now)
+    host.on_datagram(src, at, bytes, now)
 }
 
-/// ホストの務め。自分の LAN のアドレスの受け口を開いて参加者を待ち、先着 1 人を受けたらゲームのネットワークを開いてその人とコードを受け渡し、
-/// 対戦が成立した後は観戦の申し込みに観戦コードを答える。参加者が返すコードを返さないまま上限が過ぎたら、開いたネットワークのまま待機へ戻る。
+/// 受付用受信ソケット`at`からいま届いている分を`cap`通（製品は`RECV_PER_POLL`）まで読んでステートマシンへ渡し、返す内容を`acts`に追加する。読んだ数を返す。
+fn read_listener(
+    host: &mut Host,
+    (at, l): (usize, &Listener),
+    buf: &mut [u8],
+    (now, cap): (u64, usize),
+    acts: &mut Vec<HostAct>,
+) -> usize {
+    let mut n_read = 0;
+    while n_read < cap {
+        let Ok((n, from)) = l.sock.recv_from(buf) else {
+            break;
+        };
+        n_read += 1;
+        if let Some(b) = buf.get(..n) {
+            acts.extend(host_receive(host, (at, l.net), from, b, now));
+        }
+    }
+    n_read
+}
+
+/// ホストの務め。自分のLANのアドレスの受付用受信ソケットを開いて参加者を待つ。
+/// 先着1人を受けたらゲームのネットワークを開き、その人とコードを受け渡す。
+/// 対戦が成立した後は観戦の申し込みに観戦コードを答える。
+/// 参加者が返すコードを返さないまま上限が過ぎたら開いたネットワークのまま待機へ戻る。
 pub fn run_host(env: &LanEnv) -> End {
     let mut say = Say::new(&env.link);
     if !wait_for(NET_FREE_WAIT, || (env.net_free)(), &env.stop) {
@@ -422,7 +444,7 @@ pub fn run_host(env: &LanEnv) -> End {
     };
     let mut socks: Vec<Listener> = Vec::new();
     let mut tools = [None; LAN_IPS_MAX];
-    // 画面に出せる数（`LAN_IPS_MAX`）までしか受け口を開かない: 画面に無いアドレスで待っても、相手はそのアドレスを知らない。
+    // 画面に出せる数（`LAN_IPS_MAX`）までしか受付用受信ソケットを開かない。画面に無いアドレスで待っても相手はそのアドレスを知らない。
     for h in ips {
         if socks.len() >= LAN_IPS_MAX {
             break;
@@ -445,7 +467,7 @@ pub fn run_host(env: &LanEnv) -> End {
         say.end(Event::LanPortBusy);
         return End::Failed(Event::LanPortBusy);
     }
-    // 画面に出すのは受け口を開けたアドレスの全部（VPN のツールのアドレスには、ツールの名前を添える）。
+    // 画面に出すのは受付用受信ソケットを開けたアドレスの全部（VPNのツールのアドレスにはツールの名前を添える）。
     say.note.lan_port = env.port;
     say.note.lan_tools = tools;
     for (i, l) in socks.iter().take(LAN_IPS_MAX).enumerate() {
@@ -459,8 +481,7 @@ pub fn run_host(env: &LanEnv) -> End {
     let now = || t0.elapsed().as_millis() as u64;
     let mut host = Host::new(env.ver, env.watch_ok).with_reply_wait(env.reply_wait_ms);
     let mut bridge: Option<Arc<LanBridge>> = None;
-    let mut routes = Routes::default();
-    // ゲームのネットワークを開いたアドレス。待機へ戻った後の参加者は、このアドレスに届いた人だけ受けられる（ネットワークは開き直さない）。
+    // ゲームのネットワークを開いたアドレス。待機へ戻った後の参加者はこのアドレスに届いた人だけ受けられる（ネットワークは開き直さない）。
     let mut net_ip: Option<Ipv4Addr> = None;
     let mut buf = [0u8; MAX_DATAGRAM + 64];
     loop {
@@ -468,7 +489,7 @@ pub fn run_host(env: &LanEnv) -> End {
             say.end(Event::LanCancelled);
             return End::Stopped;
         }
-        // ネットワークを開く前だけ、取りやめの指示を自分で読む。開いた後は見張りが読み、取りやめは `LanBridge::abort` で届く。
+        // 取りやめの指示を自分で読むのはネットワークを開く前だけ。開いた後は監視の処理が読み、取りやめは`LanBridge::abort`で届く。
         if bridge.is_none() && cancel_asked(&env.link) {
             say.end(Event::LanCancelled);
             return End::Cancelled;
@@ -483,42 +504,46 @@ pub fn run_host(env: &LanEnv) -> End {
             if let Some(code) = b.take_outgoing() {
                 let acts = host.offer_ready(&code, now());
                 for a in acts {
-                    send_host_act(&socks, &routes, a);
+                    send_host_act(&socks, a);
                 }
             }
-            while let Some((src, id, answer)) = b.take_watch_answer() {
+            while let Some((src, id, via, answer)) = b.take_watch_answer() {
                 let acts = match answer {
-                    Ok(code) => host.watch_code_ready(src, id, &code),
-                    Err(why) => host.watch_refused(src, id, why),
+                    Ok(code) => host.watch_code_ready(src, id, via, &code),
+                    Err(why) => host.watch_refused(src, id, via, why),
                 };
                 for a in acts {
-                    send_host_act(&socks, &routes, a);
+                    send_host_act(&socks, a);
                 }
             }
         }
         let mut acts = Vec::new();
         for (i, l) in socks.iter().enumerate() {
-            while let Ok((n, from)) = l.sock.recv_from(&mut buf) {
-                acts.extend(host_receive(
-                    &mut host,
-                    &mut routes,
-                    (i, l.net),
-                    from,
-                    &buf[..n],
-                    now(),
-                ));
+            if env.stopped() {
+                say.end(Event::LanCancelled);
+                return End::Stopped;
             }
+            read_listener(
+                &mut host,
+                (i, l),
+                &mut buf,
+                (now(), RECV_PER_POLL),
+                &mut acts,
+            );
         }
         acts.extend(host.tick(now()));
         for a in acts {
             match a {
-                HostAct::Send { .. } => send_host_act(&socks, &routes, a),
-                HostAct::Accepted { src } => {
-                    let on = routes.get(src).and_then(|at| socks.get(at));
-                    let ip = on.map_or(Ipv4Addr::LOCALHOST, |l| l.ip);
-                    let scope = Scope::lan_via(ip, on.and_then(|l| l.net));
+                HostAct::Send { .. } => send_host_act(&socks, a),
+                HostAct::Accepted { via, .. } => {
+                    // 番号はステートマシンが申し込みを受けたときに覚えた受付用受信ソケットの番号。受付用受信ソケットは開いた後に減らないのでいつも見つかる。
+                    let Some(on) = socks.get(via) else {
+                        continue;
+                    };
+                    let ip = on.ip;
+                    let scope = Scope::lan_via(ip, on.net);
                     match (&bridge, net_ip) {
-                        // 待機へ戻った後: 開いたままのネットワークで、見張りに新しいコードを作らせる（前のコードは前の参加者に渡した）。
+                        // 待機へ戻った後は開いたままのネットワークで監視の処理に新しいコードを作らせる（前のコードは前の参加者に渡した）。
                         (Some(b), Some(on)) if on == ip => {
                             say.note.name = [0; NAME_UNITS];
                             say.put(CodeState::LanLinking, Event::LanPeer);
@@ -527,7 +552,7 @@ pub fn run_host(env: &LanEnv) -> End {
                         // ネットワークは別のアドレスで開いている。その相手に届くとは限らないので断る。
                         (Some(_), _) => {
                             for a in host.refuse_taken() {
-                                send_host_act(&socks, &routes, a);
+                                send_host_act(&socks, a);
                             }
                         }
                         (None, _) => {
@@ -555,12 +580,12 @@ pub fn run_host(env: &LanEnv) -> End {
                         b.post_cmd(BridgeCmd::Paste);
                     }
                 }
-                HostAct::WatchWanted { src, id } => {
+                HostAct::WatchWanted { src, id, via } => {
                     if let Some(b) = &bridge {
-                        b.post_cmd(BridgeCmd::WatchCode { src, id });
+                        b.post_cmd(BridgeCmd::WatchCode { src, id, via });
                     }
                 }
-                // 参加者が返すコードを返さなかった（取りやめた・打ち間違えた）。ネットワークは開いたまま、待機の画面へ戻す。
+                // 参加者が返すコードを返さなかった（取りやめた・打ち間違えた）。ネットワークは開いたまま待機の画面へ戻す。
                 HostAct::Rewait => {
                     say.note.name = [0; NAME_UNITS];
                     say.put(CodeState::LanWaiting, Event::None);
@@ -577,8 +602,10 @@ pub fn run_host(env: &LanEnv) -> End {
     }
 }
 
-/// 受け口が読んでよい送り元か。VPN のネットワークの受け口はそのネットワークの中の 1 台だけ、そうでない受け口は範囲 lan。
-/// どちらも、WAN から届いたもの・ポート 0・どの範囲でも使えないアドレス（マルチキャストなど）は読まない。
+/// 受付用受信ソケットが読んでよい送信元かどうか。
+/// VPNのネットワークの受付用受信ソケット（`vpn`）はそのネットワークの中の1台だけを読む。
+/// そうでない受付用受信ソケットは範囲lanの送信元なら誰でも読む（同じLANの誰でも先着1人。ルーターでつないだ別のサブネットの私設のアドレスも受ける）。
+/// どちらもWANから届いたもの・ポート0・どの範囲でも使えないアドレス（マルチキャストなど）は読まない。
 fn source_ok(src: SocketAddrV4, vpn: Option<Net4>) -> bool {
     let addr = SocketAddr::V4(src);
     match vpn {
@@ -589,21 +616,19 @@ fn source_ok(src: SocketAddrV4, vpn: Option<Net4>) -> bool {
     }
 }
 
-fn send_host_act(socks: &[Listener], routes: &Routes, a: HostAct) {
-    if let HostAct::Send { to, bytes } = a {
-        // 宛先の申し込みを受けた受け口から返す（その相手に届く自分のアドレスから出す）。返事はどれも受けた 1 通への答えなので、覚えていない
-        // 宛先は、上限を越えて忘れたときだけ。そのときは先頭の受け口から出す。
-        let at = routes.get(to).unwrap_or(0);
-        if let Some(l) = socks.get(at) {
-            let _ = l.sock.send_to(&bytes, to);
-        }
+/// 送る。使う受付用受信ソケットは宛先の申し込みを受けた受付用受信ソケット（ステートマシンが受けたときに覚えた番号）。その相手に届く自分のアドレスから出す。
+fn send_host_act(socks: &[Listener], a: HostAct) {
+    if let HostAct::Send { to, via, bytes } = a
+        && let Some(l) = socks.get(via)
+    {
+        let _ = l.sock.send_to(&bytes, to);
     }
 }
 
 // ---- 申し込む側の下ごしらえ ----
 
-/// 利用者が打ったアドレスに申し込んでよいか。範囲 lan の中ならよい（`Ok(None)`）。外なら、自分の PC の VPN のネットワークの中の 1 台のときだけよい
-/// （`Ok(Some(その VPN のアドレス))`）。それ以外は断る。
+/// 利用者が打ったアドレスに申し込んでよいかどうか。範囲lanの中ならよい（`Ok(None)`）。
+/// 外なら自分のPCのVPNのネットワークの中の1台のときだけよい（`Ok(Some(その VPN のアドレス))`）。それ以外は断る。
 fn admit_host(addr: LanAddr, links: &[VpnLink]) -> Result<Option<VpnLink>, String> {
     if guard::allows(Scope::Lan, SocketAddr::V4(addr.socket())) {
         return Ok(None);
@@ -615,8 +640,9 @@ fn admit_host(addr: LanAddr, links: &[VpnLink]) -> Result<Option<VpnLink>, Strin
         .ok_or_else(|| "LAN の外のアドレス".to_string())
 }
 
-/// 申し込むソケットが選んだ自分のアドレス `local` から、その接続でゲームのネットワークを開く範囲を決める。VPN のアドレスへの申し込み（`link`）は、
-/// `local` がその VPN のアダプターのアドレスのときだけ通す。そうでなければ、経路が VPN を通らず、世界のアドレスとして外へ出てしまう。
+/// 申し込むソケットが選んだ自分のアドレス`local`から、その接続でゲームのネットワークを開く範囲を決める。
+/// VPNのアドレスへの申し込み（`link`）は`local`がそのVPNのアダプターのアドレスのときだけ通す。
+/// そうでなければ経路がVPNを通らず、世界のアドレスとして外へ出てしまう。
 fn scope_via(link: Option<VpnLink>, local: Ipv4Addr) -> Result<Scope, String> {
     match link {
         Some(l) if l.ip != local => Err("VPN を経由しない経路".to_string()),
@@ -624,7 +650,7 @@ fn scope_via(link: Option<VpnLink>, local: Ipv4Addr) -> Result<Scope, String> {
     }
 }
 
-/// ホストのアドレス宛ての UDP ソケットと、そのホストに届く自分のアドレス（OS の経路で決まる）と、その接続でゲームのネットワークを開く範囲。
+/// ホストのアドレス宛てのUDPソケット・そのホストに届く自分のアドレス（OSの経路で決まる）・その接続でゲームのネットワークを開く範囲。
 fn dial(addr: LanAddr, links: &[VpnLink]) -> Result<(UdpSocket, Ipv4Addr, Scope), String> {
     let to = SocketAddr::V4(addr.socket());
     let link = admit_host(addr, links)?;
@@ -644,8 +670,9 @@ fn dial(addr: LanAddr, links: &[VpnLink]) -> Result<(UdpSocket, Ipv4Addr, Scope)
 
 // ---- クライアント ----
 
-/// クライアントの務め。ホストのアドレスへ参加を申し込み、始める側のコードを受けたらゲームのネットワークを開いて見張りに読ませ、
-/// 見張りが作った返すコードをホストへ返して、受け取りの確認を待つ。
+/// クライアントの務め。ホストのアドレスへ参加を申し込む。
+/// 始める側のコードを受けたらゲームのネットワークを開いて監視の処理に読ませる。
+/// 監視の処理が作った返すコードをホストへ返し、受け取りの確認を待つ。
 pub fn run_client(env: &LanEnv, addr: LanAddr) -> End {
     let mut say = Say::new(&env.link);
     let (sock, local, scope) = match dial(addr, &(env.vpn_links)()) {
@@ -657,8 +684,8 @@ pub fn run_client(env: &LanEnv, addr: LanAddr) -> End {
     };
     say.note.name = [0; NAME_UNITS];
     say.put(CodeState::LanLinking, Event::LanPeer);
-    // 前のネットワークの片づけ（待っているだけのセッションを `request_lan` が手放した）が済むまで申し込まない。済む前に始める側のコードが
-    // 届くと、ゲームのネットワークを開けない。
+    // 前のネットワークの後始末（待っているだけのセッションを`request_lan`が手放した）が済むまで申し込まない。
+    // 済む前に始める側のコードが届くとゲームのネットワークを開けない。
     if !wait_for(NET_FREE_WAIT, || (env.net_free)(), &env.stop) {
         if env.stopped() {
             say.end(Event::LanCancelled);
@@ -736,8 +763,8 @@ pub fn run_client(env: &LanEnv, addr: LanAddr) -> End {
 
 // ---- 観戦 ----
 
-/// 観戦の務め。ホストのアドレスへ観戦コードを頼み、受けたら観戦者のネットワークを開く頼みを出す。前のネットワークの片づけは待たない
-/// （観戦者のネットワークを開く頼みは、片づけの途中なら片づけ終えてから開く）。
+/// 観戦の務め。ホストのアドレスへ観戦コードを頼み、受けたら観戦者のネットワークを開く頼みを出す。
+/// 前のネットワークの後始末は待たない（観戦者のネットワークを開く頼みは後始末の途中なら終えてから開く）。
 pub fn run_watch(env: &LanEnv, addr: LanAddr) -> End {
     let mut say = Say::new(&env.link);
     let (sock, local, scope) = match dial(addr, &(env.vpn_links)()) {
@@ -797,10 +824,10 @@ pub fn run_watch(env: &LanEnv, addr: LanAddr) -> End {
     }
 }
 
-/// 同時に動かす運び手は 1 本まで（動いている間に次の頼みが来たら断る）。
+/// 同時に動かす運び手は1本まで（動いている間に次の頼みが来たら断る）。
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// 運び手のスレッドを作る。動いている運び手があれば作らず `false`（呼び手は読み捨てる）。終わりに `done` を呼ぶ。
+/// 運び手のスレッドを作る。動いている運び手があれば作らず`false`（呼び出し元は読み捨てる）。終了時に`done`を呼ぶ。
 pub fn spawn(
     name: &str,
     env: LanEnv,
@@ -849,7 +876,7 @@ mod tests {
         s.local_addr().unwrap().port()
     }
 
-    /// 偽の見張り: 実物の見張りが `LanBridge` に対してすること（動き出して、指示を取って、コードを書く・読む）だけを真似る。
+    /// 偽の監視の処理。実物の監視の処理が`LanBridge`に対してすること（動き出す・指示を取る・コードを書く・読む）だけを真似る。
     fn fake_watcher(bridge: Arc<LanBridge>, role: LanRole, log: Arc<Mutex<Vec<String>>>) {
         thread::spawn(move || {
             bridge.attach();
@@ -858,7 +885,7 @@ mod tests {
             let mut made = 0;
             while t.elapsed() < Duration::from_secs(10) && !bridge.is_aborted() {
                 match bridge.take_cmd() {
-                    // 2 回目からは別のコード（作り直したことが分かるように）。
+                    // 2回目からは別のコード（作り直したことが分かるように）。
                     Some(BridgeCmd::Create) => {
                         made += 1;
                         log.lock().unwrap().push("create".into());
@@ -879,9 +906,9 @@ mod tests {
                             }
                         }
                     }
-                    Some(BridgeCmd::WatchCode { src, id }) => {
+                    Some(BridgeCmd::WatchCode { src, id, via }) => {
                         log.lock().unwrap().push("watchcode".into());
-                        bridge.post_watch_answer(src, id, Ok("WATCH-CODE".into()));
+                        bridge.post_watch_answer(src, id, via, Ok("WATCH-CODE".into()));
                     }
                     None => {}
                 }
@@ -891,7 +918,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             if role == LanRole::Client {
-                // クライアントの見張りはコードの受け渡しの後も居る。運び手が先に終わるのを待ってから閉じる。
+                // クライアントの監視の処理はコードの受け渡しの後も残る。運び手が先に終わるのを待ってから閉じる。
                 thread::sleep(Duration::from_millis(300));
                 bridge.close();
             }
@@ -901,15 +928,15 @@ mod tests {
     struct Rig {
         env: LanEnv,
         opened: Arc<Mutex<Vec<(Ipv4Addr, LanRole)>>>,
-        /// `open_net`・`start_watch` が受けた範囲（呼ばれた順）。
+        /// `open_net`・`start_watch`が受けた範囲（呼ばれた順）。
         scopes: Arc<Mutex<Vec<Scope>>>,
         watch: Arc<Mutex<Vec<(String, Ipv4Addr)>>>,
         log: Arc<Mutex<Vec<String>>>,
-        /// `note` が受けた本ログの行（呼ばれた順）。
+        /// `note`が受けた本ログの行（呼ばれた順）。
         notes: Arc<Mutex<Vec<String>>>,
     }
 
-    /// VPN でない受け口のアドレス。
+    /// VPNでない受付用受信ソケットのアドレス。
     fn plain(ip: Ipv4Addr) -> HostAddr {
         HostAddr {
             ip,
@@ -998,7 +1025,7 @@ mod tests {
     }
 
     impl<T> Bg<T> {
-        /// `limit` のうちに戻らなければ、止めを立てて落ちる。
+        /// `limit`のうちに戻らなければ停止フラグを立ててパニックする。
         fn wait(self, limit: Duration) -> T {
             match self.rx.recv_timeout(limit) {
                 Ok(v) => v,
@@ -1016,7 +1043,7 @@ mod tests {
         }
     }
 
-    /// 運び手が終わるのを待つ上限（申し込みの待ちの上限 10 秒より長く）。
+    /// 運び手が終わるのを待つ上限（申し込みの待ちの上限10秒より長く）。
     const DONE: Duration = Duration::from_secs(15);
 
     fn host_bg(host: Rig) -> Bg<End> {
@@ -1044,7 +1071,7 @@ mod tests {
         let host_opened = Arc::clone(&host.opened);
         let host_log = Arc::clone(&host.log);
         let h = host_bg(host);
-        // 待機の札: LAN の待機・自分のアドレスとポート。
+        // 待機のタグはLANの待機・自分のアドレスとポート。
         assert!(waiting(&host_link));
         let n = last_note(&host_link);
         assert_eq!(
@@ -1072,7 +1099,7 @@ mod tests {
             *c_opened.lock().unwrap(),
             vec![(Ipv4Addr::LOCALHOST, LanRole::Client)]
         );
-        // クライアントの見張りは始める側のコードを読み、ホストの見張りは返すコードを読む。
+        // クライアントの監視の処理は始める側のコードを読む。ホストの監視の処理は返すコードを読む。
         assert_eq!(
             *c_log.lock().unwrap(),
             vec!["paste:OFFER-CODE-FROM-HOST".to_string()]
@@ -1082,10 +1109,10 @@ mod tests {
             .unwrap()
             .contains(&"paste:REPLY-CODE-FROM-CLIENT".to_string())));
         assert_eq!(host_log.lock().unwrap()[0], "create");
-        // 接続の途中の札（クライアントの画面）。見張りが引き継ぐ前の最後の札。
+        // 接続の途中のタグ（クライアントの画面）。監視の処理が引き継ぐ前の最後のタグ。
         let cn = last_note(&cl_link);
         assert_eq!((cn.state, cn.event), (CodeState::LanLinking, Ev::LanPeer));
-        // 観戦: 成立の後なら観戦コードが返り、観戦者のネットワークを開く頼みが出る。
+        // 観戦: 成立の後なら観戦コードが返り観戦者のネットワークを開く頼みが出る。
         let w = rig(0, 77, true);
         let w_watch = Arc::clone(&w.watch);
         let end = {
@@ -1093,7 +1120,7 @@ mod tests {
                 ip: Ipv4Addr::LOCALHOST,
                 port,
             };
-            // 成立の印が運び手に届くのを待つ（偽の見張りが set_connected した後、運び手が見回る）。
+            // 成立の通知が運び手に届くのを待つ（偽の監視の処理がset_connectedした後に運び手がポーリングする）。
             thread::sleep(Duration::from_millis(300));
             run_watch(&w.env, wa)
         };
@@ -1102,7 +1129,7 @@ mod tests {
             *w_watch.lock().unwrap(),
             vec![("WATCH-CODE".to_string(), Ipv4Addr::LOCALHOST)]
         );
-        // ホストの務めを外から止める（偽の見張りは閉じないので）。
+        // ホストの務めを外から止める（偽の監視の処理は閉じないので）。
         assert_eq!(h.stop(), End::Stopped);
     }
 
@@ -1124,14 +1151,12 @@ mod tests {
             "[fe80::1]:5000",
         ] {
             let mut host = Host::new(VER, true);
-            let mut routes = Routes::default();
             let from: SocketAddr = a.parse().unwrap();
             assert!(
-                host_receive(&mut host, &mut routes, (1, None), from, &join, 0).is_empty(),
+                host_receive(&mut host, (1, None), from, &join, 0).is_empty(),
                 "{a}"
             );
             assert!(!host.is_taken(), "{a} で先着が埋まった");
-            assert!(routes.0.is_empty(), "{a}");
         }
         for a in [
             "192.168.0.5:5000",
@@ -1141,25 +1166,110 @@ mod tests {
             "127.0.0.1:9",
         ] {
             let mut host = Host::new(VER, true);
-            let mut routes = Routes::default();
             let src: SocketAddrV4 = a.parse().unwrap();
             assert_eq!(
-                host_receive(
-                    &mut host,
-                    &mut routes,
-                    (1, None),
-                    SocketAddr::V4(src),
-                    &join,
-                    0
-                ),
-                vec![HostAct::Accepted { src }],
+                host_receive(&mut host, (1, None), SocketAddr::V4(src), &join, 0),
+                vec![HostAct::Accepted { src, via: 1 }],
                 "{a}"
             );
-            assert_eq!(routes.get(src), Some(1), "{a}");
         }
     }
 
-    /// 127.0.0.2 は 127.0.0.1 と別のアドレス（有線と無線の両方がある PC の見立て）。
+    /// 普通の受付用受信ソケットはルーターでつないだ別のサブネットの私設の送信元からの申し込みも受ける（同じLANの誰でも先着1人）。
+    /// 申し込みを受けた受付用受信ソケットの番号を覚える（返事はその受付用受信ソケットから出す）。WANの送信元は読まない。
+    #[test]
+    fn a_plain_listener_takes_private_senders_on_other_subnets_and_answers_from_the_listener_that_read_them()
+     {
+        let join = join_msg(1);
+        // 受付用受信ソケットのアドレスが192.168.0.xでも送信元のサブネットでは断らない。
+        for a in [
+            "192.168.0.5:5000",
+            "192.168.1.5:5000",
+            "192.168.88.200:65535",
+            "10.1.2.3:5000",
+            "172.16.9.9:5000",
+            "169.254.200.9:5000",
+        ] {
+            let mut host = Host::new(VER, true);
+            let src: SocketAddrV4 = a.parse().unwrap();
+            assert_eq!(
+                host_receive(&mut host, (3, None), SocketAddr::V4(src), &join, 0),
+                vec![HostAct::Accepted { src, via: 3 }],
+                "{a}"
+            );
+            assert!(host.is_taken(), "{a}");
+        }
+        for a in ["8.8.8.8:5000", "203.0.113.9:5000", "192.168.1.5:0"] {
+            let mut host = Host::new(VER, true);
+            let from: SocketAddr = a.parse().unwrap();
+            assert!(
+                host_receive(&mut host, (3, None), from, &join, 0).is_empty(),
+                "{a}"
+            );
+            assert!(!host.is_taken(), "{a}");
+        }
+    }
+
+    /// 1回の巡回で1つの受付用受信ソケットから読む数は上限で止まる。読み残しは次の巡回で読む。
+    #[test]
+    fn one_round_reads_at_most_the_cap_from_a_listener() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let to = sock.local_addr().unwrap();
+        let l = Listener {
+            ip: Ipv4Addr::LOCALHOST,
+            sock,
+            net: None,
+        };
+        // 上限は小さな数で見る（OSの受信のバッファの大きさに左右されない数）。
+        let (cap, extra) = (5usize, 3usize);
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for i in 0..cap + extra {
+            sender.send_to(&join_msg(i as u32), to).unwrap();
+        }
+        let mut host = Host::new(VER, true);
+        let mut buf = [0u8; MAX_DATAGRAM + 64];
+        let mut acts = Vec::new();
+        let mut first = 0;
+        // 送った分が受付用受信ソケットに入るのを待つ。
+        for _ in 0..100 {
+            first += read_listener(
+                &mut host,
+                (0, &l),
+                &mut buf,
+                (0, cap.saturating_sub(first)),
+                &mut acts,
+            );
+            if first == cap {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(first, cap);
+        assert_eq!(
+            acts,
+            vec![HostAct::Accepted {
+                src: v4(sender.local_addr().unwrap()).unwrap(),
+                via: 0
+            }]
+        );
+        let mut rest = 0;
+        for _ in 0..100 {
+            rest += read_listener(&mut host, (0, &l), &mut buf, (1, cap), &mut acts);
+            if rest >= extra {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(rest, extra, "読み残しを次の巡回で読まない");
+        assert_eq!(
+            read_listener(&mut host, (0, &l), &mut buf, (2, 0), &mut acts),
+            0,
+            "上限 0 で読んだ"
+        );
+    }
+
+    /// 127.0.0.2は127.0.0.1と別のアドレス（有線と無線の両方があるPCの見立て）。
     #[test]
     fn the_network_opens_on_the_address_the_request_arrived_at() {
         let port = port_free();
@@ -1176,7 +1286,7 @@ mod tests {
             (2, [127, 0, 0, 1], [127, 0, 0, 2]),
             "有線と無線の両方のアドレスを出す"
         );
-        // 2 つ目のアドレスへ申し込む。返事がそのアドレスから出なければ、接続したソケットは受け取らず「返事がない」で終わる。
+        // 2つ目のアドレスへ申し込む。返事がそのアドレスから出なければ接続したソケットは受け取らず、「返事がない」で終わる。
         let c = rig(0, 31, true);
         let end = client_bg(c, LanAddr { ip: second, port }).wait(DONE);
         assert_eq!(end, End::Done);
@@ -1230,14 +1340,14 @@ mod tests {
         let link = Arc::clone(&host.env.link);
         let h = host_bg(host);
         assert!(waiting(&link));
-        // 先着は 127.0.0.1 へ。
+        // 先着は127.0.0.1へ。
         let first = LanAddr {
             ip: Ipv4Addr::LOCALHOST,
             port,
         };
         assert_eq!(client_bg(rig(0, 41, true), first).wait(DONE), End::Done);
         let at_second = LanAddr { ip: second, port };
-        // 観戦は 127.0.0.2 へ（成立の印が運び手に届くまでの短い間は「まだ」と断られる）。
+        // 観戦は127.0.0.2へ（成立の通知が運び手に届くまでの短い間は「まだ」と断られる）。
         let w = rig(0, 42, true);
         let w_watch = Arc::clone(&w.watch);
         let until = Instant::now() + Duration::from_secs(3);
@@ -1250,7 +1360,7 @@ mod tests {
         };
         assert_eq!(end, End::Done, "観戦コードが届かない");
         assert_eq!(w_watch.lock().unwrap().len(), 1);
-        // 別のビルドの参加の申し込みも 127.0.0.2 へ。断りの理由が届く。
+        // 別のビルドの参加の申し込みも127.0.0.2へ。断りの理由が届く。
         let mut other = rig(0, 43, true);
         other.env.ver = Ver {
             proto: VER.proto,
@@ -1275,7 +1385,7 @@ mod tests {
         let opened = Arc::clone(&host.opened);
         let h = host_bg(host);
         assert!(waiting(&link));
-        // 黙る参加者: JOIN を 1 通送り、始める側のコードを受けたら何も返さない。
+        // 黙る参加者。JOINを1通送り、始める側のコードを受けたら何も返さない。
         let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
         silent
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1309,7 +1419,7 @@ mod tests {
             "待機へ戻らない: {:?}",
             link.note()
         );
-        // ネットワークと別のアドレス（127.0.0.2）に届いた参加者は断る（返事は 127.0.0.2 から出る）。
+        // ネットワークと別のアドレス（127.0.0.2）に届いた参加者は断る（返事は127.0.0.2から出る）。
         let other = UdpSocket::bind("127.0.0.1:0").unwrap();
         other
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1324,7 +1434,7 @@ mod tests {
             })
         );
         assert_eq!(from.ip(), second);
-        // 次の参加者は 127.0.0.1 へ: 開いたままのネットワークで、作り直したコードを受け取って接続する。
+        // 次の参加者は127.0.0.1へ申し込む。開いたままのネットワークで作り直したコードを受け取って接続する。
         let c = rig(0, 3, true);
         let c_log = Arc::clone(&c.log);
         let addr = LanAddr {
@@ -1363,7 +1473,7 @@ mod tests {
                 ip: Ipv4Addr::LOCALHOST,
                 port,
             };
-            // 返すコードは来ないので、クライアントの側は待ち続ける。ホストの運び手だけを見る。
+            // 返すコードは来ないのでクライアントの側は待ち続ける。ホストの運び手だけを見る。
             let cl = client_bg(rig(0, 5, true), addr);
             assert!(wait_until(Duration::from_secs(5), || keep
                 .lock()
@@ -1463,10 +1573,10 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// `dial` のガードを外すと最初のチェックで落ち、何も送らない（UDP の `connect` はパケットを出さない）。
+    /// `dial`のガードを外すと最初のチェックで落ちる。何も送らない（UDPの`connect`はパケットを出さない）。
     #[test]
     fn an_outside_address_no_address_and_a_busy_port_end_with_their_own_events() {
-        // 文書用のアドレス（TEST-NET-3）。LAN の外。
+        // 文書用のアドレス（TEST-NET-3）。LANの外。
         let outside = LanAddr {
             ip: Ipv4Addr::new(203, 0, 113, 5),
             port: 17723,
@@ -1483,7 +1593,7 @@ mod tests {
             End::Failed(Ev::LanNoHost)
         );
         assert_eq!(last_note(&link).event, Ev::LanNoHost);
-        // 自分の LAN のアドレスが無い。
+        // 自分のLANのアドレスが無い。
         let mut h = rig(port_free(), 0, true);
         h.env.addresses = Box::new(|| Ok(Vec::new()));
         assert_eq!(run_host(&h.env), End::Failed(Ev::LanNoAddress));
@@ -1512,7 +1622,7 @@ mod tests {
             },
         );
         let mut buf = [0u8; MAX_DATAGRAM];
-        // 申し込みの送り直しの間隔（500 ms）より長く待っても、何も届かない。
+        // 申し込みの送り直しの間隔（500 ms）より長く待っても何も届かない。
         fake_host
             .set_read_timeout(Some(Duration::from_millis(700)))
             .unwrap();
@@ -1542,7 +1652,7 @@ mod tests {
         assert_eq!(h.wait(Duration::from_secs(5)), End::Cancelled);
         let n = last_note(&link);
         assert_eq!((n.state, n.event), (CodeState::Idle, Ev::LanCancelled));
-        // ポートは閉じて、もう一度待てる。
+        // ポートは閉じているのでもう一度待てる。
         assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
     }
 
@@ -1563,7 +1673,7 @@ mod tests {
     fn a_vpn_listener_reads_only_its_own_network_and_a_plain_one_never_reads_a_vpn_source() {
         let radmin = Some(net("26.0.0.1", 8));
         let join = join_msg(1);
-        // (送り元, VPN の受け口(26/8)が読む, 普通の受け口が読む)
+        // (送信元, VPNの受付用受信ソケット(26/8)が読むか, 普通の受付用受信ソケットが読むか)
         for (a, vpn_ok, plain_ok) in [
             ("26.5.6.7:5000", true, false),
             ("26.0.0.1:1", true, false),
@@ -1585,18 +1695,15 @@ mod tests {
             let from: SocketAddr = a.parse().unwrap();
             for (vpn, want) in [(radmin, vpn_ok), (None, plain_ok)] {
                 let mut host = Host::new(VER, true);
-                let mut routes = Routes::default();
-                let acts = host_receive(&mut host, &mut routes, (2, vpn), from, &join, 0);
-                assert_eq!(!acts.is_empty(), want, "{a} / 受け口 {vpn:?}");
-                assert_eq!(host.is_taken(), want, "{a} / 受け口 {vpn:?}");
-                assert_eq!(
-                    routes.get(match from {
-                        SocketAddr::V4(v) => v,
-                        SocketAddr::V6(_) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-                    }),
-                    want.then_some(2),
-                    "{a} / 受け口 {vpn:?}"
-                );
+                let acts = host_receive(&mut host, (2, vpn), from, &join, 0);
+                assert_eq!(!acts.is_empty(), want, "{a} / 受付用受信ソケット {vpn:?}");
+                assert_eq!(host.is_taken(), want, "{a} / 受付用受信ソケット {vpn:?}");
+                if want {
+                    assert!(
+                        matches!(acts[..], [HostAct::Accepted { via: 2, .. }]),
+                        "{a} / 受付用受信ソケット {vpn:?}: {acts:?}"
+                    );
+                }
             }
         }
     }
@@ -1607,19 +1714,11 @@ mod tests {
         let join = join_msg(2);
         let odd = Some(net("240.0.0.1", 8));
         let mut host = Host::new(VER, true);
-        let mut routes = Routes::default();
         let from: SocketAddr = "240.0.0.5:5000".parse().unwrap();
-        assert!(host_receive(&mut host, &mut routes, (0, odd), from, &join, 0).is_empty());
+        assert!(host_receive(&mut host, (0, odd), from, &join, 0).is_empty());
         assert!(!host.is_taken());
         let ok: SocketAddr = "26.0.0.5:5000".parse().unwrap();
-        let acts = host_receive(
-            &mut host,
-            &mut routes,
-            (0, Some(net("26.0.0.1", 8))),
-            ok,
-            &join,
-            0,
-        );
+        let acts = host_receive(&mut host, (0, Some(net("26.0.0.1", 8))), ok, &join, 0);
         assert!(!acts.is_empty(), "同じ表で、使える送り元は読む");
     }
 
@@ -1660,13 +1759,13 @@ mod tests {
                 "{out}"
             );
         }
-        // VPN のネットワークが無ければ、今までどおり LAN の外。
+        // VPNのネットワークが無ければ今までどおりLANの外。
         assert!(admit_host(at("26.200.0.1"), &[]).is_err());
-        // 広いネットワーク（172/8 など）が私設のアドレスを含んでいても、私設の宛先は VPN の扱いにしない（LAN のアダプターを通るので、VPN の経路のチェックで断らない）。
+        // 広いネットワーク（172/8など）が私設のアドレスを含んでいても私設の宛先はVPNの扱いにしない（LANのアダプターを通るのでVPNの経路のチェックで断らない）。
         let wide = link("172.99.1.1", 8);
         assert_eq!(admit_host(at("172.16.0.5"), &[wide]), Ok(None));
         assert_eq!(admit_host(at("172.200.0.5"), &[wide]), Ok(Some(wide)));
-        // LAN の中は、VPN の指定があっても VPN の扱いにしない。
+        // LANの中はVPNの指定があってもVPNの扱いにしない。
         for lan in [
             "192.168.0.2",
             "10.0.0.5",
@@ -1677,7 +1776,7 @@ mod tests {
             assert_eq!(admit_host(at(lan), &all), Ok(None), "{lan}");
             assert_eq!(admit_host(at(lan), &[]), Ok(None), "{lan}");
         }
-        // 経路: 申し込むソケットの自分のアドレスが VPN のアダプターのアドレスのときだけ通り、その VPN のネットワークを足した範囲になる。
+        // 経路のチェックを通るのは申し込むソケットの自分のアドレスがVPNのアダプターのアドレスのときだけ。そのときはそのVPNのネットワークを足した範囲になる。
         assert_eq!(
             scope_via(Some(radmin), radmin.ip),
             Ok(Scope::LanVpn(radmin.net))
@@ -1691,7 +1790,7 @@ mod tests {
         );
     }
 
-    /// 待機の札のツールの名前が別のアドレスに付かないことも見る。
+    /// 待機のタグのツールの名前が別のアドレスに付かないことも見る。
     #[test]
     fn a_vpn_listener_answers_inside_its_network_only_and_opens_the_game_network_in_the_widened_scope()
      {
@@ -1740,13 +1839,13 @@ mod tests {
             let mut buf = [0u8; MAX_DATAGRAM];
             s.recv_from(&mut buf).map(|(n, _)| buf[..n].to_vec())
         };
-        // 127.0.0.1 は 127.0.0.4/30 の外: 何も返らず、ネットワークも開かない。
+        // 127.0.0.1は127.0.0.4/30の外なので何も返らずネットワークも開かない。
         assert!(
             ask("127.0.0.1", 700).is_err(),
             "ネットワークの外の申し込みに答えた"
         );
         assert!(opened.lock().unwrap().is_empty());
-        // 127.0.0.6 は中: 始める側のコードが返り、VPN のネットワークを足した範囲で開く。
+        // 127.0.0.6は中なので始める側のコードが返り、VPNのネットワークを足した範囲で開く。
         let reply = ask("127.0.0.6", 5000).expect("ネットワークの中の申し込みに答えない");
         assert!(matches!(decode(&reply), Ok(Msg::Offer { id: 9, .. })));
         assert_eq!(*opened.lock().unwrap(), vec![(listener, LanRole::Host)]);
@@ -1759,7 +1858,7 @@ mod tests {
         assert_eq!(h.stop(), End::Stopped);
     }
 
-    /// ツールが引けない時は名前だけを省く。
+    /// ツールが取得できないときは名前だけを省く。
     #[test]
     fn the_vpn_line_names_the_tool_and_the_prefix_only() {
         assert_eq!(
@@ -1874,7 +1973,7 @@ mod tests {
             .load(Ordering::SeqCst)
             == 1));
         assert!(wait_until(Duration::from_secs(5), || !is_active()));
-        // パニックは受けて、次を作れる。
+        // パニックを受けた後も次を作れる。
         let r3 = spawn(
             "t3",
             rig(0, 0, true).env,

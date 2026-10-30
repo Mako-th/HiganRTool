@@ -1,8 +1,11 @@
 //! 観戦のホストの側のポート（`--spectate-host`）。
-//! peer_sim が対戦のホストのとき、core の `SpectateHost`（記録のリングバッファ・観戦者ごとの送りウィンドウ）を持ち、使うと決まった記録（SELECT・選択の押下・MENU の入力ワード・マッチの入力ワード・終わり）を積んで観戦者へ流す。dll 無しに「peer_sim 対 peer_sim ＋ 観戦者」を loopback で回すためのツール。
-//! 別の受信ソケットを持つ。観戦用のコードの session・秘密は対戦のものと別に引く（同じ値だと観戦者が対戦の鍵を作れてしまう —— `higanr_core::spectate` の `HostConfig`）。
-//! 1 本のスレッドで回す（対戦の 1 ms の周回の中で、受信・観戦者への送信・積みを 1 回ずつ）。観戦者が遅れても黙っても対戦する2人は待たない（検査 `silent_spectator_*`）。
-//! 観戦者への送り（STREAM・BYE）には `FaultConfig` を掛けられる（CLI の手段は無く、中継 `--shape` を挟めばよい）。ホストの役のときだけ流す。ゲストになった走行では何も積まず、生きている合図（空の STREAM）だけが出る（報告の `active` が false）。
+//! peer_simが対戦のホストのときcoreの`SpectateHost`（記録のリングバッファ・観戦者ごとの送信ウィンドウ）を持つ。
+//! 確定した記録（SELECT・選択の押下・MENUの入力ワード・マッチの入力ワード・終わり）を積んで観戦者へ送る。
+//! dll無しに「peer_sim対peer_sim ＋ 観戦者」をloopbackで回すためのツール。
+//! 別の受信ソケットを持つ。観戦用のコードのsession・秘密の乱数は対戦のものと別に生成する（同じ値だと観戦者が対戦の鍵を作れてしまう —— `higanr_core::spectate`の`HostConfig`）。
+//! 1本のスレッドで回す（対戦の1 msの周回の中で受信・観戦者への送信・記録の積みを1回ずつ）。観戦者が遅れても黙っても対戦する2人は待たない（検査`silent_spectator_*`）。
+//! 観戦者への送信（STREAM・BYE）には`FaultConfig`を掛けられる（CLIの手段は無いので中継`--shape`を挟めばよい）。
+//! 記録を流すのはホストの役のときだけ。ゲストになった走行では何も積まず、生存確認（空のSTREAM）だけが出る（報告の`active`がfalse）。
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
@@ -17,32 +20,32 @@ use higanr_core::wire::{ByeReason, Record};
 use crate::fault::{FaultConfig, FaultCounts};
 use crate::sim::{At, SimError, Tx};
 
-/// 終わりの記録の後、観戦者が受け取り終えるのを待つ長さ（ms）。黙った観戦者に走行の終わりを引き延ばされないための上限。
+/// 終わりの記録の後に観戦者が受け取り終えるのを待つ長さ（ms）。黙った観戦者に走行の終わりを引き延ばされないための上限。
 pub const DRAIN_MS: u32 = 1_000;
 
 #[derive(Debug)]
 pub struct SpectateHostOpts {
-    /// 観戦者を受けるソケット（ネットワークの範囲の中のアドレスに bind したもの。`run_opts` が複製して使う）。
+    /// 観戦者を受けるソケット（ネットワークの範囲の中のアドレスにbindしたもの。`run_opts`が複製して使う）。
     pub sock: UdpSocket,
-    /// 観戦用のコードの session と秘密（対戦のものと別の値）。
+    /// 観戦用のコードのsessionと秘密（対戦のものと別の値）。
     pub session_id: u32,
     pub secret: Secret,
-    /// 配る側の使い捨ての鍵の種。通常は走るたびに新しい種（`keys::fresh_seed`）。固定の種（`keys::spectate_host_seed`）は
-    /// 同じ秘密・session で起動し直すと同じ鍵で通し番号が 0 から数え直しになるので、観戦者が式で公開鍵を作る検査の 1 回きりの実行だけに使う。
+    /// 配信する側の使い捨ての鍵の種。通常は走るたびに新しい種（`keys::fresh_seed`）を使う。
+    /// 固定の種（`keys::spectate_host_seed`）は同じ秘密の乱数・sessionで起動し直すと同じ鍵で通し番号が0から数え直しになる。そのため観戦者が式で公開鍵を作る検査の1回きりの実行だけに使う。
     pub key_seed: KeySeed,
     pub fault: FaultConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpectateHostReport {
-    /// ホストの役で、記録を積んだか（false = ゲストになったか、接続しなかった）。
+    /// ホストの役で記録を積んだかどうか（false = ゲストになったか接続しなかった）。
     pub active: bool,
     pub counts: HostCounts,
     pub faults: FaultCounts,
     pub tail: u32,
-    /// 終わりに残っていた観戦者の（送り元, 次に要る番号）。`tail` に届いていれば全部受け取り終えている。
+    /// 終わりに残っていた観戦者の（送り元, 次に要る番号）。`tail`に届いていれば全部受け取り終えている。
     pub spectators: Vec<(SocketAddr, u32)>,
-    /// 受け取り終えるのを待った長さ（ms。`DRAIN_MS` が上限）。
+    /// 受け取り終えるのを待った長さ（ms。`DRAIN_MS`が上限）。
     pub drain_ms: u32,
     pub sends: u64,
     pub send_errors: u64,
@@ -57,7 +60,7 @@ pub(crate) struct SpectateSide {
     drain_ms: u32,
 }
 
-/// 走行の終わり方に対応する BYE の理由（観戦の `Record::End`）。接続する前の失敗は記録が無いので None。
+/// 走行の終わり方に対応するBYEの理由（観戦の`Record::End`）。接続する前の失敗は記録が無いのでNone。
 pub(crate) fn end_reason(end: &crate::sim::End) -> Option<ByeReason> {
     use crate::sim::End;
     match end {
@@ -81,7 +84,7 @@ impl SpectateSide {
             host: SpectateHost::new(HostConfig {
                 session_id: o.session_id,
                 secret: o.secret,
-                // 配る側の種は呼び手が決める。
+                // 配信する側の種は呼び手が決める。
                 key_seed: o.key_seed,
             }),
             tx: Tx::new(sock, o.fault, scope),
@@ -123,7 +126,7 @@ impl SpectateSide {
                     );
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                // 観戦者が先に閉じたポートへの送りの後の受信が WSAECONNRESET になる（対戦のポートと同じ）。読み飛ばす。
+                // 観戦者が先に閉じたポートへの送信の後の受信がWSAECONNRESETになる（対戦のポートと同じ）。読み飛ばす。
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => continue,
                 Err(e) => return Err(SimError::Io(e)),
             }
@@ -144,7 +147,7 @@ impl SpectateSide {
         self.host.spectators().all(|(_, _, ack)| ack >= tail)
     }
 
-    /// 走行の終わりに、いる観戦者が受け取り終える（終わりの記録まで）のを `DRAIN_MS` まで待つ。
+    /// 走行の終わりに、いる観戦者が受け取り終える（終わりの記録まで）のを`DRAIN_MS`まで待つ。
     pub(crate) fn drain(&mut self, t0: Instant) -> Result<(), SimError> {
         let start = Instant::now();
         while !self.all_caught_up() && start.elapsed().as_millis() < u128::from(DRAIN_MS) {
@@ -173,7 +176,7 @@ impl SpectateSide {
 
 #[cfg(test)]
 mod tests {
-    //! 実時間は 0.3 秒ほど（loopback の実 UDP）。
+    //! 実時間は0.3秒ほど（loopbackの実UDP）。
     use super::*;
     use higanr_core::auth::AuthKey;
     use higanr_core::wire::{self, MAX_DATAGRAM, Message, NAME_MAX, SpectateJoin};
@@ -233,7 +236,7 @@ mod tests {
             side.push(Record::Seg { seg: k });
         }
         let spy = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // 秘密が違う（タグ違い）・session が違う（ヘッダの session が観戦用のものでない）。
+        // 秘密の乱数が違う（タグ違い）・sessionが違う（ヘッダのsessionが観戦用のものでない）。
         spy.send_to(
             &join_bytes(&Secret(*b"another-secret-1"), SESSION, 7),
             host_addr,
@@ -246,7 +249,7 @@ mod tests {
         assert_eq!(got, 0, "観戦者でない者へ流した");
         assert_eq!((r.counts.bad_tag, r.counts.wrong_session), (1, 1), "{r:?}");
         assert_eq!(r.counts.joined, 0);
-        // 対照: 正しい JOIN には流し始める（上の 0 が「口が壊れていた」ではないこと）。
+        // 対照: 正しいJOINには送り始める（上の0が「ポートが壊れていた」ではないこと）。
         spy.send_to(&join_bytes(&SECRET, SESSION, 7), host_addr)
             .unwrap();
         let got = pump_and_count(&mut side, &spy, 150);

@@ -1,5 +1,5 @@
-//! ツール `pacing_sum` を本物のプロセスで走らせる検査（合成の `_pacing.csv` だけ）。平文でも `.csv.gz` でも読む・
-//! 切れた gzip は読めた所まで使って知らせる、の配線を見る。
+//! ツール`pacing_sum`を本物のプロセスで走らせる検査（合成の`_pacing.csv`だけ）。
+//! 平文でも`.csv.gz`でも読むこと、切れたgzipは読めた所まで使って知らせることの配線を見る。
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ impl Drop for Tmp {
     }
 }
 
-/// 合成の `_pacing.csv`（60 fps の b。入力 → Present の前は行ごとに違う値）。
+/// 合成の`_pacing.csv`（60 fpsのb。入力 → Presentの前は行ごとに違う値）。
 fn pacing_csv(rows: u32) -> String {
     let qpf = 10_000_000;
     let mut s = format!(
@@ -56,7 +56,7 @@ fn pacing_csv(rows: u32) -> String {
     s
 }
 
-/// `finish` が false なら終わりの印の 8 B を落とす（強制終了で切れた形）。
+/// `finish`がfalseなら終わりの印の8 Bを落とす（強制終了で切れた形）。
 fn gz_bytes(csv: &str, finish: bool) -> Vec<u8> {
     let mut w = GzLogWriter::with_sync_interval(Vec::new(), std::time::Duration::ZERO);
     w.write_all(csv.as_bytes()).unwrap();

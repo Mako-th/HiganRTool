@@ -1,4 +1,4 @@
-//! 引数の読み方と、ウィンドウを出さない `--batch`（検査と手順の自動化用）。
+//! 引数の読み方と、ウィンドウを出さない`--batch`（検査と手順の自動化用）。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ pub const EXIT_OK: i32 = 0;
 /// 作れなかったリプレイがある（同じ名前が既にある・印が無い・読めない など）。
 pub const EXIT_PROBLEM: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-/// 対象のリプレイが 1 本も見つからなかった。
+/// 対象のリプレイが1本も見つからなかった。
 pub const EXIT_NOTHING: i32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
     }
 }
 
-/// `--batch`: ウィンドウを出さずに、見つけたリプレイ全部へ同じ値で作る。(終了コード, 結果の文)。
+/// `--batch`: ウィンドウを出さずに見つけたリプレイ全部へ同じ値で作る。(終了コード, 結果の文)。
 pub fn run_batch(pair: Pair, inputs: &[PathBuf], lang: Lang) -> (i32, String) {
     let text = Text(lang);
     let found = collect(inputs);
@@ -151,7 +151,7 @@ mod tests {
         );
     }
 
-    /// `root\Alice vs Bob\th9_ud0001〜0004.rpy`。1・3 本目は直せて、2・4 本目は直し済み。
+    /// `root\Alice vs Bob\th9_ud0001〜0004.rpy`。1・3本目は直せる。2・4本目は直し済み。
     fn write_samples(root: &Path) {
         use crate::work::tests::replay;
         use higanr_core::replay::Side;
@@ -188,7 +188,7 @@ mod tests {
             )
         );
         assert!(out.join("th9_ud0001.rpy").is_file() && out.join("th9_ud0003.rpy").is_file());
-        // 出力先の中は読まないので、もう一度でも対象は元の 4 本のまま。
+        // 出力先の中は読まない。そのためもう一度走らせても対象は元の4本のまま。
         let (code, text) = run_batch(pair, std::slice::from_ref(&root), Lang::En);
         assert_eq!(code, EXIT_PROBLEM, "{text}");
         assert!(text.starts_with("Processed 0 of 4 replays.\n"), "{text}");

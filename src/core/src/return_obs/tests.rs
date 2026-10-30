@@ -1,12 +1,12 @@
 use super::*;
 use crate::input_model::keys::{DOWN, ESC, UP, Z};
 
-/// DLL の `menu::MENU_CSV_HEADER` は、これを再公開している（DLL 側の検査が、DLL の行をこの読み手で読めることを見る）。
+/// DLLの`menu::MENU_CSV_HEADER`はこれを再公開している（DLL側の検査がDLLの行をこの読み手で読めることを検証する）。
 const HEADER: &str = MENU_CSV_HEADER;
 
 const Q: u16 = 0x0200;
 
-/// 見出しと同じ 25 欄の行。使わない欄は空（DLL の行も、読めなかった欄は空）。
+/// ヘッダと同じ25フィールドの行。使わないフィールドは空（DLLの行も読めなかったフィールドは空）。
 fn csv_line(seq: u32, screen: i32, cursor: i32, k: [u32; 6]) -> String {
     let mut f = vec![String::new(); 25];
     f[0] = seq.to_string();
@@ -22,8 +22,10 @@ fn csv_line(seq: u32, screen: i32, cursor: i32, k: [u32; 6]) -> String {
     f.join(",")
 }
 
-/// ゲームの模型。一時停止（`0x00434740`）と終わりのメニュー（`0x004355F0`）を逆アセンブルの順で 1 呼びずつ進める。
-/// 入力は押した瞬間（`[2]+0x06`）。数えは呼びの終わりに 1 足す（`0x00434B44`）。
+/// ゲームの模型。
+/// 一時停止（`0x00434740`）と終わりのメニュー（`0x004355F0`）を逆アセンブルの順に呼び出し1回ずつ進める。
+/// 入力は押した瞬間（`[2]+0x06`）。
+/// 数えは呼び出しの終わりに1足す（`0x00434B44`）。
 #[derive(Clone)]
 struct Sim {
     seq: u32,
@@ -33,11 +35,11 @@ struct Sim {
     end: (u32, u32),
     screen: i32,
     cursor: i32,
-    /// 入力を読み始める数え（実物は `MENU_READ_FRAMES`）。変異用に変えられる。
+    /// 入力を読み始める数え（実物は`MENU_READ_FRAMES`）。変異用に変えられる。
     read_frames: u32,
-    /// 決定で数えをリセットするか（実物は する）。
+    /// 決定で数えをリセットするかどうか（実物は する）。
     reset_on_decide: bool,
-    /// 閉じるまでの数え（実物は `CLOSE_FRAMES`）。
+    /// 閉じるまでの数え（実物は`CLOSE_FRAMES`）。
     close_frames: u32,
     lines: Vec<String>,
     last_key: Option<[u32; 6]>,
@@ -177,7 +179,7 @@ impl Sim {
         }
     }
 
-    /// Esc の tick: GameManager（優先度 2）が旗を立てる。メニューの関数（優先度 1）はこの tick では走らない。
+    /// Escのtick: GameManager（優先度2）が旗を立てる。メニューの関数（優先度1）はこのtickでは走らない。
     fn open_pause(&mut self) {
         self.seq += 1;
         self.pause_flag = 1;
@@ -201,7 +203,9 @@ impl Sim {
     }
 }
 
-/// 台本どおりの一時停止 2 回（開いた直後の下は効かず、再開と「タイトルへ戻る」の往復で再開 / 確認の枠を一周して「いいえ」の決定 → 再開）。
+/// 台本どおりの一時停止2回。
+/// 前半は開いた直後の下が効かず、再開と「タイトルへ戻る」を往復して再開する。
+/// 後半は確認の枠を一周して「いいえ」を決定し、再開する。
 fn pause_plan(s: &mut Sim) {
     s.idle(40);
     s.open_pause();
@@ -222,7 +226,7 @@ fn pause_plan(s: &mut Sim) {
     s.press(Z, 30);
 }
 
-/// 台本どおりの終わりのメニュー: 下を一周・上を一周して、再戦を決める。
+/// 台本どおりの終わりのメニュー: 下を一周・上を一周して再戦を決める。
 fn end_plan(s: &mut Sim) {
     s.idle(20);
     s.open_end();
@@ -305,7 +309,7 @@ fn a_move_outside_the_table_fails() {
 #[test]
 fn a_state_out_of_range_fails() {
     let mut t = full_trace().text();
-    // 最初の「状態 2」の行を 12 に書き換える。
+    // 最初の「状態 2」の行を12に書き換える。
     let line = t
         .lines()
         .find(|l| l.split(',').nth(20) == Some("2"))
@@ -323,7 +327,7 @@ fn a_state_out_of_range_fails() {
     );
 }
 
-/// 実物が 4 でなく 2 から読む模型で再現する。
+/// 実物が4でなく2から読む模型で再現する。
 #[test]
 fn an_input_taken_before_the_read_frames_fails_the_gate() {
     let mut s = Sim::new();
@@ -335,7 +339,7 @@ fn an_input_taken_before_the_read_frames_fails_the_gate() {
     s.press(ESC, 30);
     let r = judge_text(&s.text(), &Expect::default());
     assert_eq!(status(&r, "pause.gate"), Status::Fail, "{}", r.render());
-    // 同じ入力でも、実物の模型は数えが足りない間は受けない（状態が動かない）ので、ゲートは通る。
+    // 同じ入力でも実物の模型は数えが足りない間は受けない（状態が動かない）のでゲートは通る。
     let mut ok = Sim::new();
     ok.idle(5);
     ok.open_pause();
@@ -372,7 +376,7 @@ fn a_decide_that_does_not_reset_the_frames_fails() {
     );
 }
 
-/// ±1 tick は許す。
+/// ±1 tickは許す。
 #[test]
 fn the_close_delay_must_be_twenty_ticks() {
     for (frames, ok) in [(20, true), (19, true), (21, true), (30, false), (10, false)] {
@@ -414,7 +418,8 @@ fn an_unclosed_pause_is_not_measured_for_the_close_only_when_the_pause_was_asked
     );
 }
 
-/// 結果は出すが数えず、同じ記録を一時停止を求めて読めば落ちる。
+/// 求めていない区間の失敗は結果に出すが合否には数えない。
+/// 同じ記録を一時停止を求めて読めば落ちる。
 #[test]
 fn a_failure_in_a_section_nobody_asked_for_is_shown_but_does_not_decide() {
     let mut s = Sim::new();
@@ -436,7 +441,7 @@ fn a_failure_in_a_section_nobody_asked_for_is_shown_but_does_not_decide() {
         ..only_screen
     };
     assert!(judge_text(&s.text(), &asked).failed());
-    // 求めたものが落ちるときは、求めていない区間が合格でも落ちる。
+    // 求めたものが落ちるときは求めていない区間が合格でも落ちる。
     let wrong = Expect {
         final_screen: Some((7, 0)),
         ..Expect::default()
@@ -445,7 +450,8 @@ fn a_failure_in_a_section_nobody_asked_for_is_shown_but_does_not_decide() {
     assert!(r.failed(), "{}", r.render());
 }
 
-/// 効いたバージョンは 1→2 の後に 2→1・1→2・2→3 と続いて列が変わる。効かなかったバージョンは、下を押さない記録と同じ列になる。
+/// 効いたバージョンは1→2の後に2→1・1→2・2→3と続いて列が変わる。
+/// 効かなかったバージョンは下を押さない記録と同じ列になる。
 #[test]
 fn an_early_input_that_took_effect_changes_the_first_pause_moves() {
     let first = Expect {
@@ -484,7 +490,8 @@ fn an_early_input_that_took_effect_changes_the_first_pause_moves() {
     assert_eq!(f.status, Status::Fail, "{}", took.render());
     assert!(f.detail.contains("2→3"), "{}", f.detail);
     assert!(took.not_all_passed());
-    // 読み始めを過ぎてから当たった「開いた直後の下」: 入力で動いた移りの前の数えは足りている（gate は通る）が、台本の想定（読み始め前に当たる）とは違うので列が変わる。
+    // 読み始めを過ぎてから当たった「開いた直後の下」: 入力で動いた移りの前の数えは足りている（gateは通る）。
+    // ただし台本の想定（読み始め前に当たる）とは違うので列が変わる。
     let late = run(MENU_READ_FRAMES, true, 6);
     assert_eq!(
         status(&late, "pause.first_moves"),
@@ -570,7 +577,7 @@ fn a_closing_race_row_of_the_end_menu_is_not_a_failure() {
 /// 確認の枠で「はい」へ行かない記録で再現する。
 #[test]
 fn a_missing_required_move_fails_the_coverage_and_names_it() {
-    // 2 回目の一時停止の「はい」の往復を省いた記録。
+    // 2回目の一時停止の「はい」の往復を省いた記録。
     let mut s = Sim::new();
     s.idle(40);
     s.open_pause();
@@ -641,7 +648,7 @@ fn frames_faster_than_ticks_fail() {
     s.idle(5);
     s.open_pause();
     s.idle(5);
-    // 1 tick の間に数えが 10 進んだ行を足す。
+    // 1 tickの間に数えが10進んだ行を足す。
     let last = s.lines.last().unwrap().clone();
     let mut f: Vec<String> = last.split(',').map(str::to_string).collect();
     f[1] = (s.seq + 1).to_string();
@@ -708,13 +715,13 @@ fn leaving_by_the_confirm_box_closes_after_twenty_ticks_too() {
 fn a_race_row_while_closing_and_a_stale_first_row_are_not_failures() {
     let mut s = Sim::new();
     s.idle(3);
-    // 旗が立った最初の行は前の区間の値が残る（状態 4・数え 21）。メニューの関数が走ると状態 0 から始まる。
+    // 旗が立った最初の行は前の区間の値が残る（状態4・数え21）。メニューの関数が走ると状態0から始まる。
     s.pause = (4, 21);
     s.open_pause();
     s.pause = (0, 0);
     s.idle(30);
     s.press(ESC, 19);
-    // 閉じる呼びの途中: 状態は 0 にしたが旗はまだ 1。
+    // 閉じる呼び出しの途中: 状態は0にしたが旗はまだ1。
     let saved = s.pause;
     s.pause = (0, saved.1);
     s.last_key = None;
@@ -748,7 +755,7 @@ fn unreadable_rows_fail() {
     assert_eq!(status(&r, "pause.readable"), Status::Fail, "{}", r.render());
 }
 
-/// 見出しの欄の数とこの検査の模型の行の欄の数（25）がずれても落ちる。
+/// ヘッダのフィールドの数とこの検査の模型の行のフィールドの数（25）がずれても落ちる。
 #[test]
 fn the_header_names_every_column_the_reader_needs() {
     let names: Vec<&str> = MENU_CSV_HEADER.split(',').collect();
@@ -797,11 +804,11 @@ fn the_reader_refuses_old_or_broken_files() {
         "{:?}",
         parse_menu_csv(&text_in_number).err()
     );
-    // 見出しの前に別の行があっても、見出しの列の並びで読む。
+    // ヘッダの前に別の行があってもヘッダの列の並びで読む。
     let swapped = HEADER.replace("pause_flag,pause_state", "pause_state,pause_flag");
     let row = csv_line(1, 6, 4, [2, 1, 3, 0, 0, 0]);
     let rows = parse_menu_csv(&format!("; 注\n{swapped}\n{row}\n")).unwrap();
-    // 見出しで 19 番目が pause_state、20 番目が pause_flag になったので、値は入れ替わって読まれる。
+    // ヘッダで19番目がpause_state、20番目がpause_flagになったので値は入れ替わって読まれる。
     assert_eq!(rows[0].pause.state, Some(2));
     assert_eq!(rows[0].pause.flag, Some(1));
 }

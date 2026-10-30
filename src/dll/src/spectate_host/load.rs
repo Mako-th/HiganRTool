@@ -1,5 +1,5 @@
-//! 観戦者の数と受信スレッドの負荷の実測（実時間。`#[ignore]`）。観戦者を 0・4・10 人にして、同じ受信スレッドへ対戦の相手の便
-//! （100 Hz）が届く遅れ、受信スレッドが観戦に使った時間、ホストが観戦者へ送る量、観戦者の遅れを比べる。
+//! 観戦者の数と受信スレッドの負荷の実測（実時間。`#[ignore]`）。観戦者を0・4・10人にして次を比べる。
+//! 同じ受信スレッドへ対戦の相手のパケット（100 Hz）が届く遅れ・受信スレッドが観戦に使った時間・ホストが観戦者へ送る量・観戦者の遅れ。
 use super::*;
 use crate::net_udp;
 use crate::netplay::Net;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::tests::{MATCH_SESSION, match_ping};
 const FRAME: Duration = Duration::from_nanos(16_666_667);
-/// 受信スレッドが観戦に使う 1 周の p99 の上限（µs）。対戦の相手の便の間隔（`PEER_GAP` 10 ms）の 1 割。
+/// 受信スレッドが観戦に使う1周のp99の上限（µs）。対戦の相手のパケットの間隔（`PEER_GAP` 10 ms）の1割。
 const ROUND_P99_LIMIT_US: f64 = 1_000.0;
 const PEER_GAP: Duration = Duration::from_millis(10);
 
@@ -37,7 +37,7 @@ fn pct(v: &mut [u64], p: f64) -> u64 {
     v.get(i).copied().unwrap_or(0)
 }
 
-/// µs の列の「n / 平均 / p50 / p95 / p99 / 最大」。
+/// µsの列の「n / 平均 / p50 / p95 / p99 / 最大」。
 fn summary(v: &[u64]) -> String {
     let mut s = v.to_vec();
     let mean = s.iter().sum::<u64>() as f64 / s.len().max(1) as f64;
@@ -53,31 +53,31 @@ fn summary(v: &[u64]) -> String {
 }
 
 struct Report {
-    /// 相手の便が、受信スレッドの `recv_from` を抜けてリングバッファの印を付けられるまでの遅れ（µs。送ってから）。
+    /// 相手のパケットが受信スレッドの`recv_from`を抜けてリングバッファの印を付けられるまでの遅れ（µs。送ってから）。
     stamp_us: Vec<u64>,
-    /// 相手の便を、ゲームのスレッドがリングバッファから取り出すまでの遅れ（µs。送ってから）。
+    /// 相手のパケットをゲームのスレッドがリングバッファから取り出すまでの遅れ（µs。送ってから）。
     game_us: Vec<u64>,
-    /// 観戦の仕事の 1 周の長さ（µs）と、そのうち観戦者の便の処理の分（µs）。
+    /// 観戦の仕事の1周の長さ（µs）とそのうち観戦者のパケットの処理の分（µs）。
     round_us: Vec<u64>,
     dgram_us: Vec<u64>,
-    /// 全観戦者が受けた量の合計（バイト）と、その秒（観戦者が終わりまで受けた時まで）。
+    /// 全観戦者が受けた量の合計（バイト）とその秒数（観戦者が終わりまで受けた時点まで）。
     bytes: u64,
     secs: f64,
-    /// 観戦者が記録を使えるまでの遅れ（µs。ホストのリングバッファへ積んでから。Frame の記録だけ）。
+    /// 観戦者が記録を使えるまでの遅れ（µs。ホストのリングバッファへ積んでから。Frameの記録だけ）。
     watch_us: Vec<u64>,
     /// 受信スレッドの観戦の仕事の割合（観戦の周の合計 ÷ 実時間）。
     duty: f64,
-    /// ゲームのスレッドがリングバッファへ 1 記録書く所要（ns）。
+    /// ゲームのスレッドがリングバッファへ1記録書くのにかかる時間（ns）。
     push_ns: Vec<u64>,
-    /// 一様に着く便が観戦の仕事に当たって待つ時間の期待値（µs）= Σ(周の長さ²) ÷ 2 ÷ 実時間。
+    /// 一様に着くパケットが観戦の仕事に当たって待つ時間の期待値（µs）= Σ(周の長さ²) ÷ 2 ÷ 実時間。
     expected_wait_us: f64,
     sent: usize,
     received: usize,
     snap: Snapshot,
 }
 
-/// `late` が 0 でなければ、観戦者が入る前に試合の頭からの記録を `late` 個積んでおく（遅れて入った観戦者が、全員そろって追いつきを
-/// 始める形）。
+/// `late`が0でなければ観戦者が入る前に試合の頭からの記録を`late`個積んでおく。
+/// 遅れて入った観戦者が全員そろって追いつきを始める形。
 fn run(n: usize, secs: u64, late: u32) -> Report {
     let peer = UdpSocket::bind(lo()).unwrap();
     let peer_addr = peer.local_addr().unwrap();
@@ -103,8 +103,8 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     };
     assert!(ring.push(Record::Seg { seg: 0 }));
     if late > 0 {
-        // ゲームのリングバッファ（4,096。溢れると次の `Seg` まで受けない）を溢れさせないよう、2,000 ずつ積んで、受信スレッドが
-        // ホストへ移し終えるのを待つ。
+        // ゲームのリングバッファ（4,096。溢れると次の`Seg`まで受けない）を溢れさせないよう2,000ずつ積む。
+        // 積んだ後は受信スレッドがホストへ移し終えるのを待つ。
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut k = 0;
         while k < late {
@@ -140,7 +140,7 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
 
     let total_sends = (secs * 1000 / PEER_GAP.as_millis() as u64) as usize;
     let packets: Vec<Vec<u8>> = (0..total_sends as u32).map(match_ping).collect();
-    // 時刻の対応: 受信スレッドの印（`now_us`）と、この検査の `Instant`。
+    // 時刻の対応: 受信スレッドの印（`now_us`）とこの検査の`Instant`。
     let base = Instant::now();
     let base_us = net.now_us();
     let start = base + Duration::from_millis(50);
@@ -162,7 +162,7 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut next_frame = start;
     let t_end = start + Duration::from_secs(secs) + Duration::from_millis(500);
-    // 遅れて入る観戦者は、測りの 1 秒目に全員そろって入る（対戦の相手の便が届いている間に、追いつきの送りが重なる）。
+    // 遅れて入る観戦者は測りの1秒目に全員そろって入る（対戦の相手のパケットが届いている間に追いつきの送信が重なる）。
     let join_at = start + Duration::from_secs(1);
     let mut k = 0u32;
     while Instant::now() < t_end {
@@ -188,8 +188,8 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     let sent = sender.join().unwrap();
     assert!(ring.push(Record::End(ByeReason::Finished)));
     let elapsed = base.elapsed();
-    // 終わりまで受けるのを待つ長さ: 全員の記録を全体の上限（観戦者は既定の早送り）で送り切る見込みの 1.5 倍 ＋ 10 秒（見込みは測りの間に
-    // 送った分も含む多めの値）。
+    // 終わりまで受けるのを待つ長さ: 全員の記録を全体の上限（観戦者は既定の早送り）で送り切る見込みの1.5倍 ＋ 10秒。
+    // 見込みは測りの間に送った分も含む多めの値。
     let records = 3 + u64::from(late) + u64::from(frames);
     let cap = higanr_core::spectate_rate::total_cap_bps(std::iter::repeat_n(
         higanr_core::spectate_pace::FF_UPDATES_DEFAULT as u8,
@@ -203,7 +203,7 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     for o in &observers {
         assert!(o.wait_end(wait), "観戦者が {wait:?} で終わりまで受けない");
     }
-    // 送った量の秒は、観戦者が終わりまで受けた時まで（遅れて入った観戦者は、測りの終わりの後も追いつきを受けている）。
+    // 送った量の秒数は観戦者が終わりまで受けた時点まで（遅れて入った観戦者は測りの終わりの後も追いつきを受けている）。
     let xfer = base.elapsed();
     let seen: Vec<_> = observers.into_iter().map(Observer::finish).collect();
     let snap = rx.spectate_snapshot().expect("集計");
@@ -217,7 +217,7 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
         .map(|i| game_at[i].duration_since(sent[i]).as_micros() as u64)
         .collect();
 
-    // 観戦者が受けた列が全員同じで、書いた列と一致する（同期）。
+    // 観戦者が受けた列が全員同じで書いた列と一致する（同期）。
     let want_len = 2 + late as usize + frames as usize;
     let mut watch_us = Vec::new();
     for sn in &seen {
@@ -253,7 +253,7 @@ fn run(n: usize, secs: u64, late: u32) -> Report {
     let round_us = log(&shared.busy.round);
     let dgram_us = log(&shared.busy.dgram);
     if n > 0 {
-        // 観戦者の便のうち重いのは JOIN（鍵の計算）。入った人数ぶんの上位がそれ。
+        // 観戦者のパケットのうち重いのはJOIN（鍵の計算）。入った人数ぶんの上位がそれ。
         let mut top = dgram_us.clone();
         top.sort_unstable_by(|a, b| b.cmp(a));
         top.truncate(n);
@@ -305,7 +305,7 @@ fn show(n: usize, round: usize, r: &Report) {
     );
 }
 
-/// 1 回の実行の要約: 平均・p50・p95・p99・最大（µs）。
+/// 1回の実行の要約: 平均・p50・p95・p99・最大（µs）。
 fn five(v: &[u64]) -> [u64; 5] {
     let mut s = v.to_vec();
     let mean = s.iter().sum::<u64>() / s.len().max(1) as u64;
@@ -330,10 +330,10 @@ fn env(k: &str, d: u64) -> u64 {
         .unwrap_or(d)
 }
 
-/// 条件（観戦者の数, 先に積む記録の数）を交互に `passes` 回ずつ回し、実行ごとの要約の中央値を標準エラーに出す。戻りは条件ごとの
-/// （相手の便が受信スレッドの印を受けるまでの遅れの平均の中央値, 観戦の 1 周の最大の中央値, 観戦の 1 周の p99 の中央値）（µs）。
+/// 条件（観戦者の数, 先に積む記録の数）を交互に`passes`回ずつ回す。実行ごとの要約の中央値を標準エラーに出す。
+/// 戻りは条件ごとの（相手のパケットが受信スレッドの印を受けるまでの遅れの平均の中央値, 観戦の1周の最大の中央値, 観戦の1周のp99の中央値）（µs）。
 fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64, f64)> {
-    // 条件ごとの実行の要約: 印までの遅れ・ゲームが取るまでの遅れ・観戦の 1 周・観戦者が使えるまでの遅れ・リングバッファへ書く所要。
+    // 条件ごとの実行の要約: 印までの遅れ・ゲームが取るまでの遅れ・観戦の1周・観戦者が使えるまでの遅れ・リングバッファへ書く所要。
     let mut runs: Vec<Vec<[[u64; 5]; 5]>> = vec![vec![]; cases.len()];
     let mut duty: Vec<Vec<f64>> = vec![vec![]; cases.len()];
     let mut expect: Vec<Vec<f64>> = vec![vec![]; cases.len()];
@@ -399,11 +399,10 @@ fn compare(cases: &[(usize, u32)], secs: u64, passes: u64) -> Vec<(f64, f64, f64
     out
 }
 
-/// 観戦者の数が 0・4・10 のとき、同じ受信スレッドで対戦の相手の便が届く遅れがどう変わるかを実測する。値は標準エラーに出す
-/// （条件を交互に何回も回し、実行ごとの要約の中央値で比べる。この PC は他の仕事で揺れるので、標本を合わせず実行ごとに見る）。
-/// 観戦者の ACK は STREAM ごとに返る（core の `Watcher`）ので、受信スレッドの 1 周は ACK 1 通ごと。
-/// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う・観戦者 10 人で相手の便の遅れ（受信スレッドの印まで）の平均の
-/// 中央値が 0 人より 0.5 ms を越えて増える・観戦の 1 周の p99 の中央値が `ROUND_P99_LIMIT_US` を越える。
+/// 観戦者の数が0・4・10のとき同じ受信スレッドで対戦の相手のパケットが届く遅れがどう変わるかを実測する。値は標準エラーに出す。
+/// 条件を交互に何回も回し、実行ごとの要約の中央値で比べる（このPCは他の仕事で揺れるのでサンプルを合わせず実行ごとに見る）。
+/// 観戦者のACKはSTREAMごとに返る（coreの`Watcher`）ので、受信スレッドの1周はACK 1通ごと。
+/// 落ちる条件: 相手のパケットが欠ける・観戦者の列が書いた列と違う・観戦者10人で相手のパケットの遅れ（受信スレッドの印まで）の平均の中央値が0人より0.5 msを越えて増える・観戦の1周のp99の中央値が`ROUND_P99_LIMIT_US`を越える。
 #[test]
 #[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 9 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
 fn measure_receive_thread_load_with_0_4_and_10_spectators() {
@@ -420,10 +419,9 @@ fn measure_receive_thread_load_with_0_4_and_10_spectators() {
     );
 }
 
-/// 試合の頭から 135 秒ぶん（8,100 記録）遅れて入った観戦者 10 人が、測りの 1 秒目にそろって追いつきを始めるとき、同じ受信スレッドで
-/// 対戦の相手の便が届く遅れと、観戦の 1 周の最悪を、観戦者 0 人と比べる。値は標準エラーに出す。観戦者の ACK は STREAM ごと。
-/// 落ちる条件: 相手の便が欠ける・観戦者の列が書いた列と違う（全員が先に積んだ記録から最後まで受ける）・観戦の 1 周の p99 の
-/// 中央値が `ROUND_P99_LIMIT_US` を越える。
+/// 試合の頭から135秒ぶん（8,100記録）遅れて入った観戦者10人が測りの1秒目にそろって追いつきを始める場合を測る。
+/// 同じ受信スレッドで対戦の相手のパケットが届く遅れと観戦の1周の最悪を観戦者0人の場合と比べる。値は標準エラーに出す。観戦者のACKはSTREAMごと。
+/// 落ちる条件: 相手のパケットが欠ける・観戦者の列が書いた列と違う（全員が先に積んだ記録から最後まで受ける）・観戦の1周のp99の中央値が`ROUND_P99_LIMIT_US`を越える。
 #[test]
 #[ignore = "手で走らせる測り（既定は 1 回 10 秒 × 6 回）。値を標準エラーに出す。HIGANR_LOAD_SECS / HIGANR_LOAD_PASSES で変える"]
 fn measure_receive_thread_load_with_ten_late_spectators() {

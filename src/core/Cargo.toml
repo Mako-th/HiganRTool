@@ -3,8 +3,12 @@ name = "higanr_core"
 description = "HiganRTool の中核（プロトコル・lockstep のフレームの式・リプレイの解析）。Win32 に依存しない"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/lib.rs"

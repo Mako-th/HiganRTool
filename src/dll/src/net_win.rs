@@ -1,8 +1,13 @@
-//! 受信のイベントと、ゲームスレッドが相手を待つ待ち（Win32 の層。unsafe はここにもある。1 つずつ `// SAFETY:`）。
+//! 受信のイベントと、ゲームスレッドが相手を待つ待ち（Win32の層。unsafeはここにもある。1つずつ`// SAFETY:`）。
 //!
-//! 受信スレッドは 1 通書くたびにイベント（自動リセット）を立てる。ゲームスレッドは、イベントと高分解能の待機タイマー（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`。Windows 10 1803 から）を `WaitForMultipleObjects` で待つ。
-//! 届けばすぐ起き、届かなければタイマーの時刻に起きる。`WaitForSingleObject` の待ち時間だけで待つと OS の時計の分解能（既定 15.6 ms）に丸められ、4 ms の送り直しと 1 フレームの予算が崩れる。タイマーが作れなければ、イベントだけを ms で待つ（`high_resolution()` が false。ログに出す）。
-//! ここは待ち方だけを持つ。何を待つか・いつまで待つかは `netplay.rs`。OS の乱数（`os_random`）もここにある: 接続の秘密と STUN の transaction id に使う。暗号は自作しないので、Windows の `BCryptGenRandom`（`BCRYPT_USE_SYSTEM_PREFERRED_RNG` なのでアルゴリズムのハンドルは要らない）を呼ぶだけ。
+//! 受信スレッドは1通書くたびにイベント（自動リセット）を立てる。ゲームスレッドはイベントと高分解能の待機タイマー（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`。Windows 10 1803から）を`WaitForMultipleObjects`で待つ。
+//! 届けばすぐ起き、届かなければタイマーの時刻に起きる。
+//! `WaitForSingleObject`の待ち時間だけで待つとOSの時計の分解能（既定15.6 ms）に丸められる。
+//! そのため4 msの再送と1フレームの予算が崩れる。
+//! タイマーが作れなければイベントだけをmsで待つ（`high_resolution()`がfalse。ログに出す）。
+//! ここは待ち方だけを持つ。何を待つか・いつまで待つかは`netplay.rs`。
+//! OSの乱数（`os_random`）もここにある。接続の秘密の乱数とSTUNのtransaction idに使う。
+//! 暗号は自作しないのでWindowsの`BCryptGenRandom`（`BCRYPT_USE_SYSTEM_PREFERRED_RNG`なのでアルゴリズムのハンドルは要らない）を呼ぶだけ。
 
 use std::sync::Arc;
 
@@ -21,28 +26,28 @@ const WAIT_GUARD_MS: u32 = 50;
 /// 受信のイベント（自動リセット）。受信スレッドが立て、ゲームスレッドが待つ。
 pub struct Event(HANDLE);
 
-// SAFETY: 中身はカーネルのイベントのハンドルで、どのスレッドから `SetEvent` / 待ちをしてもよい
-// （Win32 の決まり）。閉じるのは `Drop` の 1 回だけ。
+// SAFETY: 中身はカーネルのイベントのハンドル。どのスレッドから`SetEvent` / 待ちをしてもよい（Win32の決まり）。
+// 閉じるのは`Drop`の1回だけ。
 unsafe impl Send for Event {}
-// SAFETY: 同上（`&Event` から呼ぶのは `SetEvent` と待ちだけで、どちらもスレッドをまたいでよい）。
+// SAFETY: 同上（`&Event`から呼ぶのは`SetEvent`と待ちだけでどちらもスレッドをまたいでよい）。
 unsafe impl Sync for Event {}
 
 impl Event {
     pub fn new() -> Option<Event> {
-        // SAFETY: 属性 NULL・自動リセット（manual = 0）・最初は立っていない・名前 NULL を渡すだけ。
+        // SAFETY: 属性NULL・自動リセット（manual = 0）・最初は立っていない・名前NULLを渡すだけ。
         let h = unsafe { CreateEventW(core::ptr::null(), 0, 0, core::ptr::null()) };
         (!h.is_null()).then_some(Event(h))
     }
 
     pub fn set(&self) {
-        // SAFETY: `self.0` は `new` で作ってまだ閉じていないイベント。
+        // SAFETY: `self.0`は`new`で作ってまだ閉じていないイベント。
         unsafe { SetEvent(self.0) };
     }
 }
 
 impl Drop for Event {
     fn drop(&mut self) {
-        // SAFETY: `new` で作ったハンドルを 1 回だけ閉じる。
+        // SAFETY: `new`で作ったハンドルを1回だけ閉じる。
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -50,12 +55,12 @@ impl Drop for Event {
 struct Timer(HANDLE);
 
 // SAFETY: カーネルのタイマーのハンドル。作ったスレッドと別のスレッド（ゲームスレッド）で使ってよい。
-// `Waiter` ごと 1 本のスレッドへ移して使い、同時に 2 本からは使わない（`Waiter` は `Sync` でない）。
+// `Waiter`ごと1本のスレッドへ移して使い、同時に2本からは使わない（`Waiter`は`Sync`でない）。
 unsafe impl Send for Timer {}
 
 impl Timer {
     fn new() -> Option<Timer> {
-        // SAFETY: 属性 NULL・名前 NULL（名前なし）・旗と権利を渡すだけ。古い Windows で旗が分からなければ NULL。
+        // SAFETY: 属性NULL・名前NULL（名前なし）・フラグと権利を渡すだけ。古いWindowsでフラグが分からなければNULL。
         let h = unsafe {
             CreateWaitableTimerExW(
                 core::ptr::null(),
@@ -70,7 +75,7 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        // SAFETY: `new` で作ったハンドルを 1 回だけ閉じる。
+        // SAFETY: `new`で作ったハンドルを1回だけ閉じる。
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -79,11 +84,11 @@ impl Drop for Timer {
 pub enum Woke {
     /// イベントが立った（何か届いた）。
     Signaled,
-    /// 時刻が来た（か、歯止めで戻った）。
+    /// 時刻が来た（か歯止めで戻った）。
     TimedOut,
 }
 
-/// ゲームスレッドの待ち。1 本のスレッドだけが使う。
+/// ゲームスレッドの待ち。1本のスレッドだけが使う。
 pub struct Waiter {
     event: Arc<Event>,
     timer: Option<Timer>,
@@ -101,21 +106,21 @@ impl Waiter {
         self.timer.is_some()
     }
 
-    /// 最大 `us` µs 待つ。イベントが立てば早く戻る。確保しない。
+    /// 最大`us` µs待つ。イベントが立てば早く戻る。確保しない。
     pub fn wait(&self, us: u32) -> Woke {
         if us == 0 {
             return Woke::TimedOut;
         }
         let guard_ms = us / 1000 + WAIT_GUARD_MS;
         if let Some(t) = &self.timer {
-            // 100 ns 単位。負は「今から」の相対。
+            // 100 ns単位。負は「今から」の相対。
             let due: i64 = -(i64::from(us) * 10);
-            // SAFETY: `t.0` は作ってまだ閉じていないタイマー。`due` はこの呼び出しの間生きている。周期 0（1 回だけ）、
-            // 完了ルーチンなし、電源の復帰なし。前の待ちで残っていた時刻は、ここで設定し直される。
+            // SAFETY: `t.0`は作ってまだ閉じていないタイマー。`due`はこの呼び出しの間生きている。
+            // 周期0（1回だけ）・完了ルーチンなし・電源の復帰なし。前の待ちで残っていた時刻はここで設定し直される。
             let ok = unsafe { SetWaitableTimer(t.0, &due, 0, None, core::ptr::null(), 0) };
             if ok != 0 {
                 let hs = [self.event.0, t.0];
-                // SAFETY: `hs` はこの呼び出しの間生きている 2 つの開いたハンドルの配列。どれか 1 つで戻る（all = 0）。
+                // SAFETY: `hs`はこの呼び出しの間生きている2つの開いたハンドルの配列。どれか1つで戻る（all = 0）。
                 let r = unsafe { WaitForMultipleObjects(2, hs.as_ptr(), 0, guard_ms) };
                 return if r == WAIT_OBJECT_0 {
                     Woke::Signaled
@@ -125,7 +130,7 @@ impl Waiter {
             }
         }
         let ms = us.div_ceil(1000);
-        // SAFETY: 開いたイベントを ms で待つだけ（`INFINITE` にはしない）。
+        // SAFETY: 開いたイベントをmsで待つだけ（`INFINITE`にはしない）。
         let r = unsafe { WaitForSingleObject(self.event.0, ms.min(INFINITE - 1)) };
         if r == WAIT_OBJECT_0 {
             Woke::Signaled
@@ -135,14 +140,14 @@ impl Waiter {
     }
 }
 
-/// `buf` を OS の乱数で埋める（`BCryptGenRandom`）。失敗したら false（`buf` の中身は使わない）。
+/// `buf`をOSの乱数で埋める（`BCryptGenRandom`）。失敗したらfalse（`buf`の中身は使わない）。
 /// 接続を開くとき（読み取りのスレッド）にだけ呼ぶ。ゲームスレッドでは呼ばない。
 pub fn os_random(buf: &mut [u8]) -> bool {
     let Ok(len) = u32::try_from(buf.len()) else {
         return false;
     };
-    // SAFETY: `buf` はこの呼び出しの間生きている、長さ `len` の書ける領域。`BCRYPT_USE_SYSTEM_PREFERRED_RNG` の
-    // ときアルゴリズムのハンドルは null でよい（Win32 の決まり）。戻り値の NTSTATUS は 0 以上が成功。
+    // SAFETY: `buf`はこの呼び出しの間生きている、長さ`len`の書き込み可能な領域。
+    // `BCRYPT_USE_SYSTEM_PREFERRED_RNG`のときアルゴリズムのハンドルはnullでよい（Win32の決まり）。戻り値のNTSTATUSは0以上が成功。
     let st = unsafe {
         BCryptGenRandom(
             core::ptr::null_mut(),
@@ -154,18 +159,19 @@ pub fn os_random(buf: &mut [u8]) -> bool {
     st >= 0
 }
 
-/// マルチキャストを出すインターフェースを `ip` の持ち主のネットワークインターフェースに決める（`IP_MULTICAST_IF`）。std にこの設定が無い。
-/// この PC のようにネットワークインターフェースが複数あると、指定しない送り出しは既定の経路のインターフェースから出てルーターへ届かず、SSDP の返事が来ない。
-/// UPnP の問い合わせ（`upnp.rs`）だけが呼ぶ。
+/// マルチキャストを出すインターフェースを`ip`を持つネットワークインターフェースに指定する（`IP_MULTICAST_IF`）。stdにこの設定が無い。
+/// このPCのようにネットワークインターフェースが複数ある場合に指定しないと、送り出しが既定の経路のインターフェースから出る。
+/// そのためルーターへ届かずSSDPの返事が来ない。
+/// UPnPの問い合わせ（`upnp.rs`）だけが呼ぶ。
 pub fn set_multicast_if(sock: &std::net::UdpSocket, ip: std::net::Ipv4Addr) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         IP_MULTICAST_IF, IPPROTO_IP, SOCKET, SOCKET_ERROR, setsockopt,
     };
-    // in_addr はネットワークの順の 4 バイト（`octets` の並びと同じ）。
+    // in_addrはネットワークバイトオーダーの4バイト（`octets`の並びと同じ）。
     let addr = ip.octets();
-    // SAFETY: `sock` はこの呼び出しの間生きている UDP ソケットで、`as_raw_socket` はその有効なハンドル。`addr` は
-    // 長さ 4 の読める領域で、`optlen` に同じ 4 を渡す。
+    // SAFETY: `sock`はこの呼び出しの間生きているUDPソケットで、`as_raw_socket`はその有効なハンドル。
+    // `addr`は長さ4の読み取り可能な領域で、`optlen`に同じ4を渡す。
     let r = unsafe {
         setsockopt(
             sock.as_raw_socket() as SOCKET,
@@ -224,7 +230,7 @@ mod tests {
             w.high_resolution(),
             "高分解能の待機タイマーの作成不能（Windows 10 1803 より前の可能性）"
         );
-        // 4 ms を 20 回待ち、中央の値が 4〜8 ms に収まること（丸められれば 15.6 ms 前後）。
+        // 4 msを20回待ち、中央の値が4〜8 msに収まること（丸められれば15.6 ms前後）。
         let mut took: Vec<Duration> = (0..20)
             .map(|_| {
                 let t0 = Instant::now();

@@ -1,9 +1,16 @@
-//! ネットの選択の組み上がりの検査（pure）: 選択の画面を持つ偽のゲーム 2 つを、本物の入力の地点の判断（`NetPlay`）と仮のネットワーク（`FakeNet`）で接続し、両者が同じ画面を同じ順に通って、同じ値でマッチに入るかを見る。
+//! ネットの選択の組み上がりの検査（pure）。
+//! 選択の画面を持つ偽のゲーム2つを本物の入力の地点の判断（`NetPlay`）と仮のネットワーク（`FakeNet`）で接続する。
+//! 両者が同じ画面を同じ順に通り、同じ値でマッチに入るかを見る。
 //!
-//! 偽のゲーム `MenuGame` は、ゲームの決まり（選択の 3 画面の表）を `netplay.rs` / `net_select.rs` / `menu_model.rs` とは別に転記したもの: feed された 3 本の押した瞬間を読み、substate 0 の間（入る演出）は押下を読まず、難易度 7・キャラ 8・マップ 16 の画面を移る。読まれなかった画面を移る押下は数える（押下を入れる tick を dll が誤ると、ここが 0 でなくなる）。
+//! 偽のゲーム`MenuGame`は、ゲームの決まり（選択の3画面の表）を`netplay.rs` / `net_select.rs` / `menu_model.rs`とは別に転記したもの。
+//! feedされた3本の押した瞬間を読み、難易度7・キャラ8・マップ16の画面を移る。
+//! substate 0の間（入る演出）は押下を読まない。
+//! 読まれなかった画面を移る押下は数える（押下を差し込むtickをdllが誤ると、ここが0でなくなる）。
 //!
-//! 台本の無いネットワーク実行: `MenuGame` の台本（`Act` の列）は dll の台本ではなく人の手の語の列の真似で、`Game::local_input`（本物ではローカル入力。素の poll `0x0042B850` の席 0、照合が合わなければ `0x0042BE40`）から入る。
-//! 押し続け（`hold` > 1）は画面が移っても押したまま、マッチの中の語は `match_words`、再戦は `rematches`、CHECK のゲームの値は `load_draws`（frame 0 の抽選回数だけが両者で違う形）で作る。
+//! 台本の無いネットワーク実行: `MenuGame`の台本（`Act`の列）はdllの台本ではない。
+//! 人が押す語の列の真似で、`Game::local_input`（本物ではローカル入力。素のpoll `0x0042B850`のサイド0。照合が合わなければ`0x0042BE40`）から入る。
+//! 押し続け（`hold` > 1）は画面が移っても押したままにする。
+//! マッチの中の語は`match_words`、再戦は`rematches`、CHECKのゲームの値は`load_draws`（frame 0の抽選回数だけが両者で違う形）で作る。
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
@@ -24,16 +31,16 @@ use crate::th09_addr::{MENU_CHARA_CURSOR, MENU_CURSOR};
 
 const DECIDE: u16 = 0x1001;
 const CANCEL: u16 = 0x000A;
-/// キャラのカーソル → キャラ（表 `0x4A1E2C`）。
+/// キャラのカーソル → キャラ（表`0x4A1E2C`）。
 pub(super) const CHARA_TABLE: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 14, 15, 7, 8, 10, 11, 9, 12, 13];
 
-/// 入力の地点の判断を偽のゲームから同じ入口で呼ぶ（対戦の `NetPlay` と、観戦者の `spectate_watch::WatchPlay`）。
+/// 入力の地点の判断を偽のゲームから同じ入口で呼ぶ（対戦の`NetPlay`と観戦者の`spectate_watch::WatchPlay`）。
 pub(crate) trait Driver {
     fn on_input<G: Game, N: Net>(&mut self, game: &mut G, net: &mut N) -> Action;
     fn on_match_start<G: Game>(&mut self, game: &mut G);
     fn phase(&self) -> Phase;
     fn last_timing(&self) -> super::FrameTiming;
-    /// 本物の呼び手（`script_win::ui_hud_tick`）が入力の地点の後に毎 tick 呼ぶ `NetPlay::hud_facts`。観戦者のセッションには無いので `None`。
+    /// 本物の呼び手（`script_win::ui_hud_tick`）が入力の地点の後に毎tick呼ぶ`NetPlay::hud_facts`。観戦者のセッションには無いので`None`。
     fn hud_probe(&mut self) -> Option<crate::net_ui::HudFacts> {
         None
     }
@@ -57,7 +64,7 @@ impl Driver for NetPlay {
     }
 }
 
-/// 台本の 1 項目: `round` マッチを終えた後で、画面が `screen` になってから `wait` tick 待ち、`word` を `hold` tick 押す。
+/// 台本の1項目。`round`マッチを終えた後で画面が`screen`になってから`wait` tick待ち、`word`を`hold` tick押す。
 #[derive(Debug, Clone, Copy)]
 pub struct Act {
     pub round: u32,
@@ -77,8 +84,8 @@ pub(super) const fn act(round: u32, screen: u32, wait: u32, word: u16, hold: u32
     }
 }
 
-/// 台本とは別に、人が押す語（Esc など。観戦者の検査用）。`when` が初めて真になった tick から `ticks` tick のあいだ `word` を押す
-/// （その tick の自分の語に OR する）。
+/// 台本とは別に人が押す語（Escなど。観戦者の検査用）。
+/// `when`が初めて真になったtickから`ticks` tickのあいだ`word`を押す（そのtickの自分の語にORする）。
 pub struct Press {
     pub when: Box<dyn Fn(&MenuGame) -> bool>,
     pub word: u16,
@@ -106,7 +113,7 @@ pub struct MenuGame {
     pub screen: u32,
     pub sub: u32,
     anim: u32,
-    /// 入る演出の長さ（花映塚は 8）。検査が片方だけ長くして、相手の押下が演出の間に届く形を作る。
+    /// 入る演出の長さ（花映塚は8）。検査が片方だけ長くして相手の押下が演出の間に届く形を作る。
     pub anim_len: u32,
     pub cursor: u32,
     pub chara_cursor: [u32; 2],
@@ -136,126 +143,126 @@ pub struct MenuGame {
     pub matches: u32,
     pub max_matches: u32,
     pub played: Vec<(u16, u32, u16, u16)>,
-    /// マッチのフレームを使った tick に feed された 3 本（`played` と同じ並び。合成の語の入れ違いを見る）。
+    /// マッチのフレームを使ったtickにfeedされた3本（`played`と同じ並び。合成の語の入れ違いを見る）。
     pub fed_played: Vec<[u16; 3]>,
-    /// 選択の画面で feed された 3 本（`Action::Menu` の tick。席の入れ違いを見る）。
+    /// 選択の画面でfeedされた3本（`Action::Menu`のtick。サイドの入れ違いを見る）。
     pub fed_menu: Vec<[u16; 3]>,
-    /// `fed_menu` の各 tick の画面（入力の地点で見えていた画面）。
+    /// `fed_menu`の各tickの画面（入力の地点で見えていた画面）。
     pub fed_menu_screen: Vec<u32>,
-    /// マッチから戻った: 次のメニューの tick で押下なしに 7 → 8。
+    /// マッチから戻った: 次のメニューのtickで押下なしに7 → 8。
     pub pending_auto8: bool,
-    /// ゲームが決めた値（止める地点で SELECT が書き直す前）: 両席が揃ったときの両席のキャラ、決めたマップ。
+    /// ゲームが決定した値（止める地点でSELECTが書き直す前）。両サイドが揃ったときの両サイドのキャラと、決定したマップ。
     pub decided_chars: Vec<[u8; 2]>,
     pub decided_maps: Vec<i32>,
-    /// `on_input` の中の割り当て・解放の回数（ゲームのスレッドの規則: 0 であること）。
+    /// `on_input`の中の割り当て・解放の回数（ゲームのスレッドの規則: 0であること）。
     pub on_input_allocs: u64,
-    /// `Some` なら、毎 tick 入力の地点の後に `hud_facts` を呼び、その戻りを順に溜める。
+    /// `Some`なら毎tick入力の地点の後に`hud_facts`を呼び、その戻り値を順に溜める。
     pub hud_log: Option<Vec<Option<crate::net_ui::HudFacts>>>,
-    /// この tick は dll がネットの選択で feed した。
+    /// このtickはdllがネットの選択でfeedした。
     menu_fed: bool,
     // ---- 人の手の真似 ----
-    /// 押し続けている語と、残りの tick（画面が移っても押したまま）。
+    /// 押し続けている語と残りのtick（画面が移っても押したまま）。
     hold_word: u16,
     hold_left: u32,
-    /// マッチの中の語の種（`Some` なら `local_word(種, n)`。None ならマッチの中は 0）。
+    /// マッチの中の語の種（`Some`なら`local_word(種, n)`。Noneならマッチの中は0）。
     pub match_words: Option<u64>,
     match_word_n: u64,
-    /// 1 回の選択の後に続ける再戦の数（マッチの最後のフレームの更新が次の要求 10 を書く）。
+    /// 1回の選択の後に続ける再戦の数（マッチの最後のフレームの更新が次の要求10を書く）。
     pub rematches: u32,
     rematch_left: u32,
-    /// マッチの「乱数」（使った語で進む。マッチの始めに同じ値へ戻す）と、frame 0 の抽選回数（読み込みの引き。両者で違ってよい値）。
+    /// マッチの「乱数」（使った語で進む。マッチの始めに同じ値へ戻す）とframe 0の抽選回数（読み込みで乱数を生成した回数。両者で違ってよい値）。
     rng: u64,
     pub load_draws: u32,
     // ---- タイトルのデモ ----
-    /// 画面 6 で押さずに読む状態の tick がこの数に達したら、選択を通らずに次の要求 2（デモ）を書く（1 回だけ）。花映塚は放っておくと約 27 秒でデモに入る。
+    /// 画面6で押さずに読む状態のtickがこの数に達したら、選択を通らずに次の要求2（デモ）を書く（1回だけ）。花映塚は放っておくと約27秒でデモに入る。
     pub demo_after: Option<u32>,
     demo_idle: u32,
     demo_req: bool,
-    /// デモの中なら、残りのフレーム（読み込みの後に数える）。
+    /// デモの中なら残りのフレーム（読み込みの後に数える）。
     demo_left: Option<u32>,
     demo_load: u32,
     /// デモの長さ（読み込みの後の更新の数）。
     pub demo_len: u32,
-    /// デモの更新が走った数（描画だけのフレームなら走らない）と、終えたデモの数。
+    /// デモの更新が走った数（描画だけのフレームなら走らない）と終えたデモの数。
     pub demo_frames: u32,
     pub demos: u32,
-    /// デモの要求からデモの終わりまでで、判断が `Local` 以外を返した tick（ネットワークが触った）。
+    /// デモの要求からデモの終わりまでに判断が`Local`以外を返したtick（ネットワークが触った）。
     pub demo_not_local: u32,
-    /// デモの要求を書いた tick のネットワークの段階（`Selecting` なら接続した後にデモが来た —— 直す前に止まった期間）。
+    /// デモの要求を書いたtickのネットワークの段階（`Selecting`なら接続した後にデモが来た —— 直す前に止まった期間）。
     pub demo_req_phase: Option<super::Phase>,
     // ---- 接続する前の決定 ----
-    /// `Some((画面, 語, 周期))`: その画面にいる間、台本とは別に `周期` tick ごとに語を押す（人が決定を叩き続ける形。押した
-    /// 画面が移れば止まり、台本の続きが動く）。
+    /// `Some((画面, 語, 周期))`: その画面にいる間は台本とは別に`周期` tickごとに語を押す（人が決定を叩き続ける形）。
+    /// 押した画面が移れば止まり、台本の続きが動く。
     pub spam: Option<(u32, u16, u32)>,
     spam_t: u32,
     // ---- 立ち絵の追随 ----
-    /// dll がキャラのカーソルを違う値へ書いた回（席, 前, 後）と、そのとき立ち絵の 3 本を呼ばせた回。ゲームの移動の経路は
-    /// 「カーソルが動く → 立ち絵と席の目印」なので、両方の列は同じでなければならない。
+    /// dllがキャラのカーソルを違う値へ書いた回（サイド, 前, 後）と、そのとき立ち絵の3本を呼ばせた回。
+    /// ゲームの移動の経路は「カーソルが動く → 立ち絵とサイドの目印」なので両方の列は同じでなければならない。
     pub cursor_jumps: Vec<(usize, u32, u32)>,
     pub portraits: Vec<(usize, u32, u32)>,
     // ---- キャラ選択の解放・ランダム・初期ライフ・音 ----
-    /// 手元で解放済みのキャラ（キャラの番号で引く。`[0x4A81CC + キャラ]`）。移動とランダムは未解放のキャラを飛ばす（`0x0042304D`）。
+    /// 手元で解放済みのキャラ（キャラの番号で参照する。`[0x4A81CC + キャラ]`）。移動とランダムは未解放のキャラを飛ばす（`0x0042304D`）。
     pub chara_unlocked: [bool; 16],
-    /// ランダム（Ctrl）の乱数（ゲームの乱数 `0x42AE50` の代わり）。台ごとに違えると、ランダムの行き先が両者で違う。
+    /// ランダム（Ctrl）の乱数（ゲームの乱数`0x42AE50`の代わり）。台ごとに違えるとランダムの行き先が両者で違う。
     pub menu_rng: u32,
     /// 初期ライフ（Shift＋左右。1〜10）。
     pub life: [u32; 2],
-    /// ゲームの移動の道が鳴らしたカーソルの音（`0x0042474A`。席ごと）。
+    /// ゲームの移動の経路が鳴らしたカーソルの音（`0x0042474A`。サイドごと）。
     pub move_se: [u32; 2],
-    /// dll が積んだカーソルの音（`Game::cursor_se`）の tick。
+    /// dllが積んだカーソルの音（`Game::cursor_se`）のtick。
     pub dll_cursor_se: Vec<u32>,
-    /// 自分の席のカーソルが取った値（最初の値と、変わるたび）。
+    /// 自分のサイドのカーソルが取った値（最初の値と変わるたび）。
     pub own_cursor_values: Vec<u32>,
     // ---- 合わせの観測 ----
-    /// 何 tick 目か（`tick` の呼び出しの数）と、今の画面に入ってからの tick。
+    /// 何tick目か（`tick`の呼び出しの数）と今の画面に入ってからのtick。
     pub tick_no: u32,
     screen_age: u32,
-    /// 画面に入ってから `SNAP_AGE` tick 目の (画面, 難易度・マップの値, キャラのカーソル)。決定より前の静かな間に取る
-    /// ので、決定の tick のカーソル合わせでは作れない（合わせの検査用）。
+    /// 画面に入ってから`SNAP_AGE` tick目の (画面, 難易度・マップの値, キャラのカーソル)。
+    /// 決定より前の静かな間に取るので、決定のtickのカーソル合わせでは作れない（合わせの検査用）。
     pub snaps: Vec<(u32, u32, [u32; 2])>,
     /// 同じ画面の中でカーソルが変わった (tick, 画面, 難易度・マップの値, キャラのカーソル)。
     pub changes: Vec<(u32, u32, u32, [u32; 2])>,
     last_view: (u32, u32, [u32; 2]),
     // ---- 観戦者の観測 ----
-    /// `Game::local_input` が呼ばれた回数（観戦者は接続した後に読まない —— 自分の入力が届かない証拠）。
+    /// `Game::local_input`が呼ばれた回数（観戦者は接続した後に読まない —— 自分の入力が届かない証拠）。
     pub local_input_calls: u32,
-    /// `Game::peek_local_input`（観戦者の Esc の読み）が呼ばれた回数。
+    /// `Game::peek_local_input`（観戦者のEscの読み）が呼ばれた回数。
     pub peek_calls: u32,
     /// 人が押す語（`Press`）。
     pub presses: Vec<Press>,
-    /// dll の台本の語（`Press` の形で書く。空なら台本は無い）。台本は接続している間も 1 tick に 1 回進む（`peek_local_input` が進める）。
-    /// 読みに足されるのは台本の語の ESC だけで、`Action::Local` を返した tick の feed は台本の語を全部入れる。
+    /// dllの台本の語（`Press`の形で書く。空なら台本は無い）。台本は接続している間も1 tickに1回進む（`peek_local_input`が進める）。
+    /// 読みに足されるのは台本の語のESCだけ。`Action::Local`を返したtickのfeedには台本の語が全部入る。
     pub script_presses: Vec<Press>,
-    /// 台本を進めた回数（`peek_local_input` は呼ぶたびに進める。`local_input` と `Local` の feed は、その tick にもう進めていれば進めない）。
+    /// 台本を進めた回数（`peek_local_input`は呼ぶたびに進める。`local_input`と`Local`のfeedは、そのtickにもう進めていれば進めない）。
     pub script_steps: u32,
     script_word: Option<u16>,
-    /// 台本の語が 0 でなかった tick の数と、そのうち `Action::Local` でなかった tick の数（後者の tick でも台本の語は feed されない）。
+    /// 台本の語が0でなかったtickの数と、そのうち`Action::Local`でなかったtickの数（後者のtickでも台本の語はfeedされない）。
     pub script_nonzero_ticks: u32,
     pub script_nonzero_non_local: u32,
-    /// この tick の自分の語（台本と `presses`）。同じ tick に何度読んでも同じ値を返す（本物のデバイスは 1 tick の間同じ状態）。
+    /// このtickの自分の語（台本と`presses`）。同じtickに何度読んでも同じ値を返す（本物のデバイスは1 tickの間同じ状態）。
     tick_word: Option<u16>,
-    /// `Action::Local` の feed に Esc が含まれていた tick の番号（`tick_no`。自分の Esc がゲームへ届いた証拠）。
+    /// `Action::Local`のfeedにEscが含まれていたtickの番号（`tick_no`。自分のEscがゲームへ届いた証拠）。
     pub esc_local: Vec<u32>,
-    /// `Game::apply_watched` で書かれた両席の SELECT の組（止める地点ごと）。`on_input` の中から push するので先に広げておく。
+    /// `Game::apply_watched`で書かれた両サイドのSELECTのペア（止める地点ごと）。`on_input`の中からpushするので先に広げておく。
     pub watched: Vec<[Select; 2]>,
-    /// `Game::write_charge` に渡された（1P, 2P）。
+    /// `Game::write_charge`に渡された（1P, 2P）。
     pub charges: Vec<(u8, u8)>,
-    /// 台本の段階（`digit=x` / `tab=1`）の代わり: 次の tick の `Game::digit_script` が 1 回だけ返す「押した瞬間」の集合。
+    /// 台本の段階（`digit=x` / `tab=1`）の代わり: 次のtickの`Game::digit_script`が1回だけ返す「押した瞬間」の集合。
     pub digit_script: Option<u16>,
-    /// 検査の Tab の予定（画面, その画面に入ってからの tick）。`Game::digit_script` がその tick に 1 回だけ Tab を返す（返したら予定から外す）。
+    /// 検査のTabの予定（画面, その画面に入ってからのtick）。`Game::digit_script`がそのtickに1回だけTabを返す（返したら予定から外す）。
     pub tab_at: Vec<(u32, u32)>,
-    /// 本物のキーの読み（`Game::digit_keys`）の代わり: 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`digit_keys` の bit の並び）。`None` は読んではいけない間。
+    /// 本物のキーの読み（`Game::digit_keys`）の代わり: 数字キー0〜9・Tab・Ctrl・Alt/Winの今の押下の集合（`digit_keys`のbitの並び）。`None`は読んではいけない間。
     pub digit_held: Option<u16>,
     /// 台本の付いている実行（`Game::scripted_run`）。
     pub scripted: bool,
 }
 
-/// 合わせの検査で、画面に入ってから何 tick 目にカーソルを控えるか（入る演出 9 tick と、片道 40 ms の合わせ + 押し直しより後）。
+/// 合わせの検査で画面に入ってから何tick目にカーソルを控えるか（入る演出9 tickと片道40 msの合わせ + 押し直しより後）。
 const SNAP_AGE: u32 = 120;
 
 impl MenuGame {
     pub fn new(seat: usize, plan: Vec<Act>, unlocked_maps: &[u8]) -> Self {
-        // 一覧: 表 `0x4A1D9C` の並びのうち、解放済み（と 14・15）だけを前から詰める。
+        // 一覧: 表`0x4A1D9C`の並びのうち解放済み（と14・15）だけを前から詰める。
         let order = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 9, 12, 13, 14, 15];
         let mut map_list = [0xFFu8; 16];
         let mut n = 0;
@@ -289,7 +296,7 @@ impl MenuGame {
             plan_t: 0,
             screens: Vec::new(),
             ignored_presses: 0,
-            // `on_input` の中（止める地点の `apply_agreed`）から push するので、先に広げておく。
+            // `on_input`の中（止める地点の`apply_agreed`）からpushするので先に広げておく。
             agreed: Vec::with_capacity(16),
             load_left: 0,
             load_ticks: 4,
@@ -358,13 +365,14 @@ impl MenuGame {
             digit_held: None,
             scripted: false,
         };
-        // 画面 6（人対人を選ぶ画面）から始める。台本が 6 で決めて 7 へ入る（接続した後に選択の画面へ入る形）。
+        // 画面6（人間 対 人間を選ぶ画面）から始める。台本が6で決定して7へ入る（接続した後に選択の画面へ入る形）。
         g.set_screen(6, true);
         g
     }
 
-    /// 合わせの検査が見る値: 難易度（7）はカーソル、マップ（16）はカーソルが指す一覧の値（添字は解放状況で両者ごとに違う）、
-    /// キャラ（8）は 0。
+    /// 合わせの検査が見る値。難易度（7）はカーソル。
+    /// マップ（16）はカーソルが指す一覧の値（添字は解放状況で両者ごとに違う）。
+    /// キャラ（8）は0。
     fn cursor_item(&self) -> u32 {
         match self.screen {
             7 => self.cursor,
@@ -382,7 +390,7 @@ impl MenuGame {
         if self.own_cursor_values.last() != Some(&own) {
             self.own_cursor_values.push(own);
         }
-        // キャラのカーソルはキャラ選択（8）の間だけ見る（ほかの画面では、まだ合わせ前の最初のカーソルのままでよい）。
+        // キャラのカーソルはキャラ選択（8）の間だけ見る（ほかの画面ではまだ合わせ前の最初のカーソルのままでよい）。
         let chara = if self.screen == 8 {
             self.chara_cursor
         } else {
@@ -403,7 +411,7 @@ impl MenuGame {
         }
     }
 
-    /// `0x0042304D`: カーソルのキャラが手元で未解放なら、`delta` の向きに解放済みのキャラまで進める。
+    /// `0x0042304D`: カーソルのキャラが手元で未解放なら`delta`の向きに解放済みのキャラまで進める。
     fn skip_locked(&self, cur: u32, delta: i32) -> u32 {
         let mut c = cur;
         for _ in 0..16 {
@@ -474,7 +482,7 @@ impl MenuGame {
         if self.plan_t <= a.wait {
             return 0;
         }
-        // 押し始めの tick で次の項目へ（押下で画面が移ると、次の tick はもう違う画面）。残りは押し続ける。
+        // 押し始めのtickで次の項目へ（押下で画面が移ると次のtickはもう違う画面）。残りは押し続ける。
         self.plan_i += 1;
         self.plan_t = 0;
         self.hold_word = a.word;
@@ -482,7 +490,7 @@ impl MenuGame {
         a.word
     }
 
-    /// この tick の自分の語（台本の語に `presses` を OR したもの）。1 tick に 1 回だけ台本を進める。
+    /// このtickの自分の語（台本の語に`presses`をORしたもの）。1 tickに1回だけ台本を進める。
     fn word_once(&mut self) -> u16 {
         if let Some(w) = self.tick_word {
             return w;
@@ -569,7 +577,7 @@ impl MenuGame {
             Action::Local => {
                 let mut w = self.word_once();
                 if self.script_on() {
-                    // 台本の語（読みで進めていればその結果。進めていなければここで 1 回進める）は全部入る。
+                    // 台本の語（読みで進めていればその結果。進めていなければここで1回進める）は全部入る。
                     w |= self.script_word_once();
                 }
                 let w = w & 0x00FF;
@@ -601,7 +609,7 @@ impl MenuGame {
     }
 
     fn update<P: Driver>(&mut self, np: &mut P, pressed: [u16; 3], held: [u16; 3], played: bool) {
-        // タイトルのデモ: 選択を通らずに場面 2 へ（リプレイの再生のマッチ）。デモの更新はネットワークの判断が `Local` の tick にだけ走る。
+        // タイトルのデモ: 選択を通らずに場面2へ（リプレイの再生のマッチ）。デモの更新はネットワークの判断が`Local`のtickにだけ走る。
         if self.demo_req && self.cur == 1 && self.next == 2 {
             self.demo_req = false;
             self.cur = 2;
@@ -701,7 +709,7 @@ impl MenuGame {
         }
     }
 
-    /// 読まれなかった画面を移る押下を数える（dll がネットの選択で feed した tick だけ。いつもの入力の押下は数えない）。
+    /// 読まれなかった画面を移る押下を数える（dllがネットの選択でfeedしたtickだけ。いつもの入力の押下は数えない）。
     fn ignore(&mut self) {
         if self.menu_fed {
             self.ignored_presses += 1;
@@ -758,8 +766,10 @@ impl MenuGame {
                 }
             }
             8 => {
-                // 席ごとに: Shift を押していれば左右で初期ライフ（`0x00428AE5`〜）、でなければ `0x0042474A` の移動（左 → 右 → 上 → 下の順に
-                // 1 つだけ。音を鳴らす）と未解放の飛ばし（`0x0042304D`）。続けて Ctrl を押していればランダム（`0x00428B48`〜。音なし）。
+                // サイドごとに次の処理をする。
+                // Shiftを押していれば左右で初期ライフを変える（`0x00428AE5`〜）。
+                // Shiftを押していなければ`0x0042474A`の移動（左 → 右 → 上 → 下の順に1つだけ。音を鳴らす）と未解放の飛ばし（`0x0042304D`）。
+                // 続けてCtrlを押していればランダム（`0x00428B48`〜。音なし）。
                 for s in 0..2 {
                     if self.decided[s] != 0 {
                         continue;
@@ -852,7 +862,7 @@ impl MenuGame {
                     self.decided_maps.push(self.map);
                     self.difficulty = self.saved_diff;
                     self.next = 2;
-                    // MainMenu のノードの登録が外れる（画面は 16 のまま、以後は走らない）。
+                    // MainMenuのノードの登録が外れる（画面は16のまま。以後は走らない）。
                     self.sub = 99;
                 } else if p2 & CANCEL != 0 {
                     self.set_screen(8, true);
@@ -899,8 +909,8 @@ impl Game for MenuGame {
         self.digit_script.take()
     }
     fn peek_local_input(&mut self) -> u16 {
-        // 本物の `NetGame` と同じ約束: デバイスの語に、台本の語の ESC だけを足す。台本はここで 1 回進める（呼ぶたびに数える）。
-        // `local_input_calls` は増やさない。
+        // 本物の`NetGame`と同じ約束: デバイスの語に台本の語のESCだけを足す。台本はここで1回進める（呼ぶたびに数える）。
+        // `local_input_calls`は増やさない。
         self.peek_calls += 1;
         let device = self.word_once();
         if self.script_on() {
@@ -955,7 +965,7 @@ impl Game for MenuGame {
         true
     }
     fn check_values(&mut self) -> (u16, u32, u8, u8) {
-        // frame 0（まだ 1 フレームも使っていない）の抽選回数は読み込みの引き（両者で違ってよい）、以後は同じ値。
+        // frame 0（まだ1フレームも使っていない）の抽選回数は読み込みで乱数を生成した回数（両者で違ってよい）。以後は同じ値。
         let count = if self.frames == 0 { self.load_draws } else { 5 };
         (self.rng as u16, count, 10, 10)
     }
@@ -997,7 +1007,7 @@ impl Game for MenuGame {
         cursor: u32,
         locked: Locked,
     ) -> Followed {
-        /// 署名・MainMenu・部品の門を開けた偽物（それらは本物のウィンドウの検査 `net_game.rs` が見る）。解放はこの台の表。
+        /// 署名・MainMenu・部品の門を開けた偽物（それらは本物のウィンドウの検査`net_game.rs`が見る）。解放はこの台の表。
         struct Open([bool; 16]);
         impl PortraitEnv for Open {
             fn unlocked(&mut self, chara: u8) -> bool {
@@ -1034,7 +1044,7 @@ pub(super) fn link_cfg(peer: u16, nonce: u64) -> link::Config {
     link_cfg_named(peer, nonce, "m")
 }
 
-/// `link_cfg` に名前を指定する形（観戦の名前の検査は、2 人の名前が違わないと席の取り違えに気づけない）。
+/// `link_cfg`に名前を指定する形（観戦の名前の検査は2人の名前が違わないとサイドの取り違えに気づけない）。
 pub(super) fn link_cfg_named(peer: u16, nonce: u64, name: &str) -> link::Config {
     link::Config {
         handshake: handshake::Config {
@@ -1050,8 +1060,8 @@ pub(super) fn link_cfg_named(peer: u16, nonce: u64, name: &str) -> link::Config 
     }
 }
 
-/// 1 回走らせる。A はホスト 1P、B はゲスト 2P。どちらも `max_matches` マッチを終えてメニューへ戻り、台本を使い切るか、
-/// `ticks` を越えたら止める。
+/// 1回走らせる。Aはホスト1P、Bはゲスト2P。
+/// どちらも`max_matches`マッチを終えてメニューへ戻り、台本を使い切るか`ticks`を越えたら止める。
 pub(super) struct Run {
     pub(super) a: MenuGame,
     pub(super) b: MenuGame,
@@ -1063,7 +1073,7 @@ fn run(a: MenuGame, b: MenuGame, delay_us: u64, drop_a: u32, drop_b: u32, ticks:
     run_with_ring(a, b, delay_us, drop_a, drop_b, ticks, None)
 }
 
-/// `run` に、ホスト（A）へ観戦のリングバッファを付ける入口（`spectate_tests.rs`）。リングバッファを読むのは呼び手（走らせた後）。
+/// `run`にホスト（A）へ観戦のリングバッファを付ける入口（`spectate_tests.rs`）。リングバッファを読むのは呼び手（走らせた後）。
 pub(super) fn run_with_ring(
     a: MenuGame,
     b: MenuGame,
@@ -1076,7 +1086,7 @@ pub(super) fn run_with_ring(
     run_with_rings(a, b, delay_us, drop_a, drop_b, ticks, (ring, None), false)
 }
 
-/// `run_with_ring` の、両者にリングバッファを付けられる形。`host_only` が真なら、ゲーム内のメニューの経路と同じ `NetPlay::set_spectate_for_host` で設定する。
+/// `run_with_ring`の、両者にリングバッファを付けられる形。`host_only`が真ならゲーム内のメニューの経路と同じ`NetPlay::set_spectate_for_host`で設定する。
 // 検査のツール。引数を束ねる型を足しても読み手は増えない。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_with_rings(
@@ -1097,7 +1107,7 @@ pub(super) fn run_with_rings(
     )
 }
 
-/// `run_with_rings` の、両者が HELLO で名乗る観戦の許可を `listable` にする形（`host_only` のときだけ名乗る）。
+/// `run_with_rings`の、両者がHELLOで名乗る観戦の許可を`listable`にする形（`host_only`のときだけ名乗る）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_with_rings_as(
     mut a: MenuGame,
@@ -1133,7 +1143,7 @@ pub(super) fn run_with_rings_as(
     }
     let mut npb = NetPlay::new(link_cfg(1, 1), cfg, &mut nb);
     if host_only {
-        // ゲーム内のメニューの経路と同じく、HELLO で観戦の許可を名乗る。
+        // ゲーム内のメニューの経路と同じくHELLOで観戦の許可を名乗る。
         npa.link.set_listable(listable);
         npb.link.set_listable(listable);
     }
@@ -1169,9 +1179,10 @@ pub(super) fn run_with_rings_as(
 
 pub(super) fn plans() -> (Vec<Act>, Vec<Act>) {
     use keys::{DOWN, LEFT, RIGHT, SHIFT, UP, X, Z};
-    // 両者とも画面 6 で 30 tick 待って 7 へ入る。入る演出は 9 tick なので、wait 8 は「読む状態になった最初の tick に押す」
-    // （ゲストでは、ホストの押下の STEP が演出の明ける前に届き、持ち越す形になる）。両者の最初のカーソルは違えてあるので、
-    // 押下を入れる tick にカーソルを合わせなければ、ゲームが決める値が両者で分かれる。
+    // 両者とも画面6で30 tick待って7へ入る。
+    // 入る演出は9 tickなので、wait 8は「読む状態になった最初のtickに押す」。
+    // ゲストではホストの押下のSTEPが演出の明ける前に届き、持ち越す形になる。
+    // 両者の最初のカーソルは違えてある。押下を差し込むtickにカーソルを合わせなければ、ゲームが決める値が両者で分かれる。
     let a = vec![
         act(0, 6, 30, Z, 1),
         act(0, 7, 8, X, 1),
@@ -1184,7 +1195,7 @@ pub(super) fn plans() -> (Vec<Act>, Vec<Act>) {
         act(0, 8, 6, Z, 1),
         act(0, 16, 8, X, 1),
         act(0, 8, 30, Z, 1),
-        // マッチから戻ったキャラ選択は直に呼ばれない経路なので、読む状態になるのは入ってから 10 tick 目（wait 9）。
+        // マッチから戻ったキャラ選択は直に呼ばれない経路なので、読む状態になるのは入ってから10 tick目（wait 9）。
         act(1, 8, 9, Z, 1),
         act(1, 16, 12, DOWN, 1),
         act(1, 16, 3, Z, 1),
@@ -1217,7 +1228,7 @@ fn both_sides_walk_the_same_screens() {
         (8, 0, 3, 8),
         (12, 5, 7, 8),
         (25, 7, 5, 8),
-        // B の入る演出を長くする（A の押下が B の演出の間に届き、B が持ち越す形を必ず作る）。
+        // Bの入る演出を長くする（Aの押下がBの演出の間に届き、Bが持ち越す形を必ず作る）。
         (1, 0, 0, 14),
         (16, 0, 0, 14),
         (12, 5, 7, 14),
@@ -1270,7 +1281,7 @@ fn both_sides_walk_the_same_screens() {
             (r.b.chara, r.b.color, r.b.difficulty, r.b.map),
             "{ctx}: 試合に入った値"
         );
-        // ゲームが決めた値そのもの（SELECT で書き直す前）も両者で同じ（押下の tick にカーソルを合わせた）。
+        // ゲームが決定した値そのもの（SELECTで書き直す前）も両者で同じ（押下のtickにカーソルを合わせた）。
         assert_eq!(
             r.a.decided_chars, r.b.decided_chars,
             "{ctx}: ゲームが決めたキャラ"
@@ -1283,8 +1294,8 @@ fn both_sides_walk_the_same_screens() {
             r.a.saved_diff, r.b.saved_diff,
             "{ctx}: 難易度のカーソルの控え"
         );
-        // 1 マッチ目: 難易度・マップは合わせの後の値（両者の最初のカーソルが違っても、入ったときに B が A の値へ寄る）。キャラは各自の
-        // 席のカーソルのまま（B の 2P は B の最初の 10 から左へ 1 つ。キャラ選択は合わせない）。
+        // 1マッチ目。難易度・マップは合わせの後の値（両者の最初のカーソルが違っても入ったときにBがAの値へ寄る）。
+        // キャラは各自のサイドのカーソルのまま（Bの2PはBの最初の10から左へ1つ。キャラ選択は合わせない）。
         let first = r.a.agreed[0];
         assert_eq!(first.difficulty, 2, "{ctx}: 難易度");
         assert_eq!(first.map, 9, "{ctx}: マップ");
@@ -1335,12 +1346,12 @@ fn both_sides_walk_the_same_screens() {
             total_applied += np.stats().menu_applied;
         }
     }
-    // 持ち越しが本当に起きた（0 なら入る演出の期間を踏めていない）。
+    // 持ち越しが本当に起きた（0なら入る演出の期間を踏めていない）。
     eprintln!(
         "ネットの選択の組み上がり（11 走行 × 2 台）: 入れた押下 {total_applied}、持ち越したフレーム {total_held}"
     );
     assert!(total_held > 10, "持ち越し {total_held}");
-    // カーソルを違う値へ書いた回が本当にあった（0 なら立ち絵の検査は空振り）。
+    // カーソルを違う値へ書いた回が本当にあった（0なら立ち絵の検査は空振り）。
     assert!(total_jumps > 10, "カーソルを書いた回 {total_jumps}");
     assert!(total_applied > 100, "{total_applied}");
 }
@@ -1445,7 +1456,7 @@ fn a_human_walks_selection_match_rematch_and_bye() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(steps(&npa), steps(&npb), "{ctx}: 入った押下の列");
-        // 決定・取消（合わせを除く）の数。合わせは難易度・マップの画面ごとに 1 回ずつ（3 回。キャラ選択は合わせない）。
+        // 決定・取消（合わせを除く）の数。合わせは難易度・マップの画面ごとに1回ずつ（3回。キャラ選択は合わせない）。
         let real = |np: &NetPlay| {
             np.step_log()
                 .iter()
@@ -1494,7 +1505,7 @@ fn a_human_walks_selection_match_rematch_and_bye() {
                 .all(|r| r.2 != 0 && r.3 != 0),
             "{ctx}: 試合の中の人の語が入っていない"
         );
-        // CHECK: frame 0 と 30・60 を 4 マッチ。ロスの実行は落ちた分だけ減る（送り直さない）。
+        // CHECK: frame 0と30・60を4マッチ。ロスの実行は落ちた分だけ減る（再送しない）。
         for (who, np) in [("A", &npa), ("B", &npb)] {
             let c = np.connected().expect("繋がった");
             let m = c.counts().check_matches;
@@ -1575,7 +1586,7 @@ fn simultaneous_chara_decides_are_not_lost() {
                 want[sb] = CHARA_TABLE[b.chara_cursor[sb] as usize];
                 assert_eq!(a.decided_chars.first(), Some(&want), "{ctx}");
                 assert_eq!(a.played, b.played, "{ctx}");
-                // 押し直した実行を役ごとに数える。どちらかが 0 なら、その期間を踏めていない。
+                // 押し直した実行を役ごとに数える。どちらかが0ならその期間を踏めていない。
                 guest_retried += u32::from(npb.stats().menu_retries > 0);
                 host_retried += u32::from(npa.stats().menu_retries > 0);
             }
@@ -1596,8 +1607,9 @@ fn a_title_demo_is_left_alone_and_the_net_match_still_works() {
     use keys::{LEFT, RIGHT, SHIFT, UP, Z};
     const DEMO_LEN: u32 = 30;
     const MATCH_FRAMES: u32 = 40;
-    // 画面 6 の最初の押下までの tick。デモに入った側は戻ってから数え直す。入らない側は相手のデモの分を足し、両者がほぼ同じ頃に
-    // 選択の画面へ入るようにする（先に入ったホストの押下は相手が来るまで入らず、この台本は 1 回しか押さない）。
+    // 画面6の最初の押下までのtick。デモに入った側は戻ってから数え直す。
+    // 入らない側は相手のデモの分を足し、両者がほぼ同じ頃に選択の画面へ入るようにする。
+    // 先に入ったホストの押下は相手が来るまで入らない。この台本は1回しか押さない。
     const W: u32 = 40;
     const W_WAIT_PEER_DEMO: u32 = W + 57;
     let mut runs = 0u32;
@@ -1992,7 +2004,7 @@ fn a_host_that_mashes_decide_before_the_link_does_not_run_ahead() {
         let mut npa = NetPlay::new(link_cfg(2, 0xF000), cfg, &mut na);
         let mut npb = NetPlay::new(link_cfg(1, 1), cfg, &mut nb);
         let ctx = format!("片道 {delay_ms} ms");
-        // B が動き出す tick（それまで A は接続できない。A は tick 31 で 7 へ入る）。
+        // Bが動き出すtick（それまでAは接続できない。Aはtick 31で7へ入る）。
         const B_STARTS: u32 = 120;
         let mut slot = clock.get();
         let mut done = false;
@@ -2057,10 +2069,10 @@ fn a_host_that_mashes_decide_before_the_link_does_not_run_ahead() {
 }
 
 // ---- 合わせ ----
-// 2 台の偽のゲームの最初のカーソルは違える。「決定の前の静かな間」に取ったカーソル（`MenuGame::snaps`）を比べるので、
-// 決定の tick のカーソル合わせ（`apply_plan`）では作れない値になる。
+// 2台の偽のゲームの最初のカーソルは違える。
+// 「決定の前の静かな間」に取ったカーソル（`MenuGame::snaps`）を比べるので、決定のtickのカーソル合わせ（`apply_plan`）では作れない値になる。
 
-/// 2 台を同じ時計で 1 tick ずつ進める（A、その半フレーム後に B）。
+/// 2台を同じ時計で1 tickずつ進める（A、その半フレーム後にB）。
 struct Duo {
     a: MenuGame,
     b: MenuGame,
@@ -2144,7 +2156,7 @@ impl Duo {
     }
 }
 
-/// 最初のカーソルを違えた 2 台（A: 難易度 1・キャラ [3, 8]・一覧は全部、B: 難易度 3・キャラ [5, 10]・一覧は 4 つだけ）。
+/// 最初のカーソルを違えた2台（A: 難易度1・キャラ[3, 8]・一覧は全部、B: 難易度3・キャラ[5, 10]・一覧は4つだけ）。
 fn differing_games(pa: Vec<Act>, pb: Vec<Act>) -> (MenuGame, MenuGame) {
     let a = MenuGame::new(0, pa, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     let mut b = MenuGame::new(1, pb, &[0, 2, 5, 9]);
@@ -2328,13 +2340,13 @@ fn a_guest_decide_before_the_alignment_waits_and_takes_the_aligned_value() {
     }
 }
 
-// ---- キャラ選択の相手の席の位置 ----
+// ---- キャラ選択の相手のサイドの位置 ----
 
-/// B（2P）の手元で解放済みのキャラのカーソル（キャラ 0〜5・8 = カーソル 0〜5・10）。A（1P）は全部解放済み。A のカーソルが
-/// 6〜9・11〜15 に来ると、B の手元では未解放のキャラの上に居る。
+/// B（2P）の手元で解放済みのキャラのカーソル（キャラ0〜5・8 = カーソル0〜5・10）。A（1P）は全部解放済み。
+/// Aのカーソルが6〜9・11〜15に来ると、Bの手元では未解放のキャラの上に居る。
 const B_UNLOCKED_CURSORS: [u32; 7] = [0, 1, 2, 3, 4, 5, 10];
 
-/// 解放の集合を違えた 2 台。A は右・右・下・ランダム 25 tick・左・上の後に決め、B は左・左・ランダム 20 tick・右の後に決める。
+/// 解放の集合を違えた2台。Aは右・右・下・ランダム25 tick・左・上の後に決定し、Bは左・左・ランダム20 tick・右の後に決定する。
 fn unlock_duo(delay_ms: u64, drop_a: u32, drop_b: u32) -> Duo {
     use keys::{DOWN, LEFT, RIGHT, UP, Z};
     let pa = vec![
@@ -2428,7 +2440,7 @@ fn the_peer_seat_follows_the_peers_own_cursor_with_different_unlocks_and_the_ran
                 "{ctx}: {who} にキャラ選択の合わせが入った"
             );
         }
-        // 相手の席に書いた値は、相手が自分の席で取った値だけ（取ったことの無い位置を見せない）。
+        // 相手のサイドに書いた値は相手が自分のサイドで取った値だけ（取ったことの無い位置を見せない）。
         for (who, g, peer, other) in [("A", &d.a, &d.b, 1usize), ("B", &d.b, &d.a, 0usize)] {
             for &(seat, _, to) in &g.cursor_jumps {
                 if seat == other {
@@ -2441,7 +2453,7 @@ fn the_peer_seat_follows_the_peers_own_cursor_with_different_unlocks_and_the_ran
             }
             assert_eq!(g.portraits, g.cursor_jumps, "{ctx}: {who} の立ち絵");
         }
-        // 音: 相手のゲームの移動の道が鳴らした数だけ鳴らす（ランダムでは鳴らさない）。数は dll の数とも合う。
+        // 音: 相手のゲームの移動の経路が鳴らした数だけ鳴らす（ランダムでは鳴らさない）。数はdllの数とも合う。
         for (who, g, np, peer, other) in [
             ("A", &d.a, &d.npa, &d.b, 1usize),
             ("B", &d.b, &d.npb, &d.a, 0usize),
@@ -2477,13 +2489,13 @@ fn the_peer_seat_follows_the_peers_own_cursor_with_different_unlocks_and_the_ran
             (0, 0),
             "{ctx}: on_input が確保した"
         );
-        // 決めたキャラは両者で同じ（相手の席は STEP の値で決まる）。
+        // 決定したキャラは両者で同じ（相手のサイドはSTEPの値で決まる）。
         assert_eq!(d.a.decided_chars, d.b.decided_chars, "{ctx}");
     }
     eprintln!(
         "相手の席の位置（4 走行）: 見た tick {checked_total}、B が未解放のキャラの上の A の位置を見せた tick {on_locked_total}、ランダムなどで音なしに書いた {random_writes}"
     );
-    // 効く期間を踏んだ（0 なら未解放の飛ばしもランダムも試せていない）。
+    // 効く期間を踏んだ（0なら未解放の飛ばしもランダムも試せていない）。
     assert!(on_locked_total > 20, "{on_locked_total}");
     assert!(random_writes > 20, "{random_writes}");
 }
@@ -2502,7 +2514,7 @@ fn the_select_row_shows_from_the_chara_screen_on_and_the_guest_follows_the_host_
     let pb = vec![act(0, 6, 30, Z, 1), act(0, 8, 560, Z, 1)];
     let (a, b) = differing_games(pa, pb);
     let mut d = Duo::new(a, b, 5, 0, 0);
-    // 画面ごとの「出た・出なかった」の数（空振りでないこと）と、画面が同じまま続いた tick の数。
+    // 画面ごとの「出た・出なかった」の数（空振りでないこと）と、画面が同じまま続いたtickの数。
     let (mut on_select, mut on16, mut off_other, mut in_match, mut stable) =
         (0u32, 0u32, 0u32, 0u32, [0u32; 2]);
     let mut last_screen = [0u32; 2];
@@ -2532,7 +2544,7 @@ fn the_select_row_shows_from_the_chara_screen_on_and_the_guest_follows_the_host_
                     on_select += 1;
                     on16 += u32::from(g.screen == 16);
                 }
-                // 画面 6・7 は、場面に入ったばかりの tick（マッチから戻った tick。`stable` が溜まらない）も出さない（前の選択の番号が残っていれば出る）。
+                // 画面6・7は場面に入ったばかりのtick（マッチから戻ったtick。`stable`が溜まらない）も出さない（前の選択の番号が残っていれば出る）。
                 Phase::Selecting if g.cur == 1 && matches!(g.screen, 6 | 7) => {
                     assert!(
                         hud[i].is_none(),
@@ -2678,7 +2690,7 @@ fn a_start_choice_on_the_slot_becomes_the_hosts_auto_flag_in_the_first_match() {
     );
 }
 
-// ---- 対戦の形式の切替（キャラセレクトの Tab）----
+// ---- 対戦の形式の切替（キャラセレクトのTab）----
 
 fn press_tab(g: &mut MenuGame) {
     g.digit_script = Some(crate::digit_keys::TAB_BIT);
@@ -2977,7 +2989,7 @@ fn only_ctrl_tab_flips_the_format_and_alt_or_win_stops_it() {
     assert_eq!(d.npa.stats().tab_presses, 1);
 }
 
-/// キャラセレクトに落ち着いた 2 台。`scripted` は A の実行が台本の付いたものか、`pick` は A が Ctrl+数字を読む実行か。
+/// キャラセレクトに落ち着いた2台。`scripted`はAの実行が台本の付いたものかどうか。`pick`はAがCtrl+数字を読む実行かどうか。
 fn chara_select_duo(scripted: bool, pick: bool) -> Duo {
     use keys::Z;
     let pa = vec![
@@ -3002,8 +3014,8 @@ fn chara_select_duo(scripted: bool, pick: bool) -> Duo {
     d
 }
 
-/// A が `ticks` tick のあいだ語の Ctrl（`0x0100`）を押し、その間に自分のゲームへ入った語・相手へ届いた語に `0x0100` が残ったか。
-/// 相手へ届いた語は B の数（`menu_peer_random`）で見る（キャラ選択の B は相手の語の Ctrl を相手の席へ入れずに落とすので、B の feed には出ない）。
+/// Aが`ticks` tickのあいだ語のCtrl（`0x0100`）を押し、その間に自分のゲームへ入った語・相手へ届いた語に`0x0100`が残ったかどうか。
+/// 相手へ届いた語はBの数（`menu_peer_random`）で見る。キャラ選択のBは相手の語のCtrlを相手のサイドへ書き込まずに落とすので、Bのfeedには出ない。
 fn skip_bit_leaks(d: &mut Duo, ticks: u32) -> (bool, bool) {
     const SKIP: u16 = 0x0100;
     let (na, nb) = (d.a.fed_menu.len(), d.b.fed_menu.len());
@@ -3021,8 +3033,8 @@ fn skip_bit_leaks(d: &mut Duo, ticks: u32) -> (bool, bool) {
     )
 }
 
-/// キャラセレクトでは語の Ctrl（`0x0100`。ゲームの「ランダム」）を落とさない: キーボードの Ctrl でもパッドのスキップでも、
-/// 自分のゲームへ入れる語にも相手へ送る語にも残る。
+/// キャラセレクトでは語のCtrl（`0x0100`。ゲームの「ランダム」）を落とさない。
+/// キーボードのCtrlでもパッドのスキップでも、自分のゲームへ渡す語にも相手へ送る語にも残る。
 #[test]
 fn the_ctrl_bit_reaches_both_the_own_game_and_the_peer_on_the_chara_select() {
     let mut d = chara_select_duo(false, true);
@@ -3034,7 +3046,7 @@ fn the_ctrl_bit_reaches_both_the_own_game_and_the_peer_on_the_chara_select() {
     );
 }
 
-/// R（`0x4000`）はキャラセレクトでも「ランダム」の Ctrl にならず、自分のゲームにも相手にも Ctrl が立たない。
+/// R（`0x4000`）はキャラセレクトでも「ランダム」のCtrlにならず、自分のゲームにも相手にもCtrlが立たない。
 #[test]
 fn r_on_the_chara_select_does_not_become_the_random_key() {
     let mut d = chara_select_duo(false, true);
@@ -3051,7 +3063,7 @@ fn r_on_the_chara_select_does_not_become_the_random_key() {
     );
 }
 
-/// Ctrl+C（観戦コードのコピー）の Ctrl も語に残る。C は遅れの量にも同期方式の切替にもならない。
+/// Ctrl+C（観戦コードのコピー）のCtrlも語に残る。Cは遅れの量にも同期方式の切替にもならない。
 #[test]
 fn ctrl_c_on_the_chara_select_keeps_the_ctrl_bit_and_does_not_change_the_delay() {
     use crate::digit_keys::{C_BIT, CTRL_BIT};
@@ -3087,7 +3099,7 @@ fn script_digits_work_in_a_run_with_a_lat_plan_but_real_keys_are_not_read() {
         check: CheckSource::InputDigest,
         wait_budget_us: WAIT_BUDGET_US,
         require_net_selection: true,
-        // `delay_pick` を真にしても、`lat_plan` が空でないと `pick` は作られない（`ensure_pick`）。
+        // `delay_pick`を真にしても`lat_plan`が空でないと`pick`は作られない（`ensure_pick`）。
         delay_pick: true,
         lat_plan: LatPlan::new(&[(1_000_000, 3)]).unwrap(),
         ..Config::default()
@@ -3185,7 +3197,7 @@ fn a_format_step_does_not_swallow_the_guests_pending_decide_retry() {
     }
 }
 
-/// キャラセレクトで相手のゲームスレッドが黙ると（ここでは B を丸ごと止める）、沈黙の 60 秒より前に「相手の応答を待っています」が出る。
+/// キャラセレクトで相手のゲームスレッドが黙ると（ここではBを丸ごと止める）、沈黙の60秒より前に「相手の応答を待っています」が出る。
 #[test]
 fn a_quiet_peer_on_the_chara_screen_brings_the_notice_before_the_silence_limit() {
     let mut d = chara_select_duo(false, false);
@@ -3205,7 +3217,7 @@ fn a_quiet_peer_on_the_chara_screen_brings_the_notice_before_the_silence_limit()
         }
     }
     let shown = shown_ms.expect("相手が黙っても知らせが出ない");
-    // B は選択の間 MENU を毎フレーム送るので、黙った始まりは止めた時刻。そこから QUIET_MS で待ちに入り、NOTICE_TICKS で出る。
+    // Bは選択の間MENUを毎フレーム送るので黙った始まりは止めた時刻。そこからQUIET_MSで待ちに入り、NOTICE_TICKSで出る。
     let at = u64::from(super::peer_wait::QUIET_MS)
         + u64::from(super::peer_wait::NOTICE_TICKS) * FRAME_US / 1_000;
     assert!(
@@ -3223,7 +3235,7 @@ fn a_quiet_peer_on_the_chara_screen_brings_the_notice_before_the_silence_limit()
     assert!(!d.npa.peer_wait_shown());
 }
 
-/// 接続した行の材料の `watch_off` は、自分が観戦を許可し相手が許可していないときだけ立つ。`may_list` は両者で同じ値になる。
+/// 接続した行の材料の`watch_off`は自分が観戦を許可し相手が許可していないときだけ立つ。`may_list`は両者で同じ値になる。
 #[test]
 fn only_a_player_whose_opponent_refuses_watching_gets_watch_off() {
     use std::sync::Arc;
@@ -3241,7 +3253,7 @@ fn only_a_player_whose_opponent_refuses_watching_gets_watch_off() {
         sb.set_list_wish(wish_b);
         sa.offer(link_cfg(2, 0xF000));
         sb.offer(link_cfg(1, 1));
-        // 接続した行を最初に出す tick から正しい値か（1 tick でも今までの案内を出さない）。
+        // 接続した行を最初に出すtickから正しい値かどうか（1 tickでも今までの案内を出さない）。
         let off = |np: &NetPlay| match np.ui_conn(0).0 {
             higanr_core::net_menu::Conn::Connected { watch_off, .. } => Some(watch_off),
             _ => None,

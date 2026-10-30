@@ -1,11 +1,23 @@
-//! ペース B（先頭で待つだけ）と「入力 → Present」の時刻のフック（pure。unsafe 無し）。順番と判定と記録のリングバッファだけを持ち、Win32（QPC・待機タイマー・入口のアセンブリ・書き出しのスレッド）は `PacingHost` と `PaceClock` の向こう（本物は `pacing_win.rs`）に分ける。
+//! ペースB（先頭で待つだけ）と「入力 → Present」の時刻のフック（pure。unsafe無し）。
+//! 持つのは順番と判定と記録のリングバッファだけ。Win32（QPC・待機タイマー・入口のアセンブリ・書き出しのスレッド）は`PacingHost`と`PaceClock`の向こう（本物は`pacing_win.rs`）に分ける。
 //!
-//! - 既定の形: ini が無い・`[pacing]` が無い・`mode` を書かないときは auto（60 fps）。フレームの最初の先頭のフックで画面の形（`th09_addr::OPTION_WINDOWED`。フルスクリーンならデバイスの PresentationInterval も）を読んで、ウィンドウと垂直同期を取らないフルスクリーンなら `wait` の方式（既定 b-hybrid）、垂直同期を取るフルスクリーン・読めないならゲーム自身の時計の経路へ任せる。先頭を書かずゲーム自身の待ちのままにするのは `mode = game` と書いたときだけ。
-//! - 設置（`install`。読み取りのスレッド）: 使う行（game なら `present_call`、b なら `PACING_SITES` の 6 行）を全部読んで照合し、1 行でも違えば何も書かない（vpatch が先頭を書き換えていればここで断る）。書き出しを作ってから Present の call の rel32 を書き、入力の入口の時刻を開け、b なら先頭の call の rel32 を書く。どの call も、入口が読む静的変数（元の飛び先・着地）を書く前に設定する（`hook::install_call_hook_at` の `prepare`）。
-//! - 先頭（`Pacer::head`。ゲームのスレッド）: 期限までの残りが 1 ms より多ければ最大 1 ms 寝て「まだ」を返し（do_frame が 0 を返し、ゲームのメッセージループへ戻る）、1 ms 以下なら期限まで QPC を読み続けて「始める」を返す。遅れていればすぐ「始める」。
-//! - 記録のリングバッファ（`PACE_RING`）: 1 フレーム（Present 1 回）1 枠。書くのはゲームのスレッドだけで、読むのは書き出しのスレッド（100 ms ごと）。終わり（`finish`）で書き出しを止め、集計を本ログへ書く。
-//! - 切り分けの形: `mode = b-spin`（B の格子のまま、期限の前は寝ずに `Sleep(0)` でメッセージループへ戻す。auto のウィンドウのときの方式）、`mode = cycle`（game → b → b-spin を `cycle_secs` ごとに入れ替える）、`mode = vpatch`（測定専用。`higanr_core::pacing_vpatch`。先頭で「期限 − 準備時間」まで普通の待機タイマーで寝てから始め、Present の直前で期限まで待つ。既定の経路は変えない）。
-//! - b-hybrid（`higanr_core::pacing_hybrid`）: B の格子のまま、残りが「回し読み 1 ms + 余裕」より多い間は待機タイマーで寝て、余裕の間は `Sleep(0)` で譲り、最後の 1 ms は回し読み。処理の重さを下げるための形で、auto の既定の待ち方。寝る長さと余裕の決め方は core にだけ書く。
+//! - 既定の形: iniが無い・`[pacing]`が無い・`mode`を書かないときはauto（60 fps）。
+//!   フレームの最初の先頭のフックで画面の形（`th09_addr::OPTION_WINDOWED`。フルスクリーンならデバイスのPresentationIntervalも）を読む。
+//!   ウィンドウと垂直同期を取らないフルスクリーンなら`wait`の方式（既定b-hybrid）にする。垂直同期を取るフルスクリーンのときと画面の形を読めないときは、ゲーム自身の時計の経路へ任せる。
+//!   先頭を書かずゲーム自身の待ちのままにするのは`mode = game`と書いたときだけ。
+//! - 設置（`install`。読み取りのスレッド）: 使う行（gameなら`present_call`、bなら`PACING_SITES`の6行）を全部読んで照合する。1行でも違えば何も書かない（vpatchが先頭を書き換えていればここで断る）。
+//!   書き出しを作ってからPresentのcallのrel32を書き、入力の入口の時刻の記録を有効にし、bなら先頭のcallのrel32を書く。
+//!   どのcallも、入口が読む静的変数（元の飛び先・着地）を、そのcallを書く前に設定する（`hook::install_call_hook_at`の`prepare`）。
+//! - 先頭（`Pacer::head`。ゲームのスレッド）: 期限までの残りが1 msより多ければ最大1 ms寝て「まだ」を返す（do_frameが0を返し、ゲームのメッセージループへ戻る）。
+//!   1 ms以下なら期限までQPCを読み続けて「始める」を返す。遅れていればすぐ「始める」を返す。
+//! - 記録のリングバッファ（`PACE_RING`）: 1フレーム（Present 1回）につき1枠。書くのはゲームのスレッドだけ。読むのは書き出しのスレッド（100 msごと）。
+//!   終わり（`finish`）で書き出しを止め、集計を本ログへ書く。
+//! - 切り分けの形:
+//!   `mode = b-spin`はBの格子のまま期限の前は寝ずに`Sleep(0)`でメッセージループへ戻す。autoのウィンドウのときの方式。
+//!   `mode = cycle`はgame → b → b-spinを`cycle_secs`ごとに入れ替える。
+//!   `mode = vpatch`は測定専用（`higanr_core::pacing_vpatch`）。先頭で「期限 − 準備時間」まで普通の待機タイマーで寝てから始め、Presentの直前で期限まで待つ。既定の経路は変えない。
+//! - b-hybrid（`higanr_core::pacing_hybrid`）: Bの格子のまま、残りが「回し読み1 ms + 余裕」より多い間は待機タイマーで寝る。余裕の間は`Sleep(0)`で譲り、最後の1 msはQPCを読み続ける。
+//!   処理の重さを下げるための形で、autoの既定の待ち方。寝る長さと余裕の決め方はcoreにだけ書く。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
@@ -27,31 +39,31 @@ use crate::th09_addr::{
 };
 use crate::trial_summary::PaceEnd;
 
-/// 最後に QPC を読み続ける幅（µs）。vpatch の SleepType≠0 と同じ 1 ms。高分解能の待機タイマーの起床の遅れがこれを越えるとフレームが遅れて始まる（`_pacing.csv` の `wake_late_us`）。
+/// 最後にQPCを読み続ける幅（µs）。vpatchのSleepType≠0と同じ1 ms。高分解能の待機タイマーの起床の遅れがこれを越えるとフレームが遅れて始まる（`_pacing.csv`の`wake_late_us`）。
 pub const SPIN_US: u64 = 1_000;
-/// 1 回に寝る長さの上限（µs）。寝たら「まだ」でメッセージループへ戻す（寝続けるとメッセージを汲まない）。
+/// 1回に寝る長さの上限（µs）。寝たら「まだ」でメッセージループへ戻す（寝続けるとメッセージを汲まない）。
 pub const CHUNK_US: u32 = 1_000;
-/// 本ログの隣の CSV の名前の末尾。`.gz` で終わる名前は gzip で書く（`higanr_core::gzlog` が読む）。
+/// 本ログの隣のCSVの名前の末尾。`.gz`で終わる名前はgzipで書く（`higanr_core::gzlog`が読む）。
 pub const CSV_SUFFIX: &str = "_pacing.csv.gz";
 pub const WRITER_POLL_MS: u64 = 100;
-/// 書き出しのスレッドを止める上限（秒。開発用と配るバージョンの両方）= 12 時間。`finish` が呼ばれなかった実行でもスレッドが止まる保険で、ここで止まると集計も止まる。
-/// 台本の実行（20 分）より長いのは、人が遊ぶネットワークの実行に上限が無いため。長くしても集計のメモリは伸びない（列の標本は `higanr_core::pacing::SERIES_CAP` で頭打ち）。
+/// 書き出しのスレッドを止める上限（秒。開発用と配布バージョンの両方）= 12時間。`finish`が呼ばれなかった実行でもスレッドが止まる保険。ここで止まると集計も止まる。
+/// 台本の実行（20分）より長いのは、人が遊ぶネットワークの実行に上限が無いため。長くしても集計のメモリは伸びない（列のサンプルは`higanr_core::pacing::SERIES_CAP`で頭打ち）。
 pub const WRITER_THREAD_MAX_SECONDS: u64 = 12 * 60 * 60;
-/// 開発用で CSV に行を書く上限（秒）。台本の実行（`observe::SCRIPT_MAX_SECONDS`）に 60 秒足した値。
+/// 開発用でCSVに行を書く上限（秒）。台本の実行（`observe::SCRIPT_MAX_SECONDS`）に60秒足した値。
 pub const WRITER_CSV_MAX_SECONDS_DEV: u64 = crate::observe::SCRIPT_MAX_SECONDS as u64 + 60;
-/// 配るバージョンで本ログの隣の CSV に行を書く上限（秒）。起動から 10 分（600 + 60 秒）。1 起動の `_pacing.csv` が 12〜15 MB になり大きすぎたため。
-/// この上限を越えてもリングバッファは読み続けて集計に入れる（書かなかった行は `WriterTally::csv_capped`）。
+/// 配布バージョンで本ログの隣のCSVに行を書く上限（秒）。起動から10分（600 + 60秒）。1起動の`_pacing.csv`が12〜15 MBになり大きすぎたため。
+/// この上限を越えてもリングバッファは読み続けて集計に入れる（書かなかった行は`WriterTally::csv_capped`）。
 pub const WRITER_CSV_MAX_SECONDS_DIST: u64 = 600 + 60;
 
-/// 書き出しの上限（秒）。`csv_seconds` は CSV に行を書く上限、`thread_seconds` はスレッドを止める上限（集計もここで止まる）。
-/// 分けるのは、配るバージョンでファイルを軽くしつつ、起動から 11 分より後のマッチの分布を本ログに残すため。
+/// 書き出しの上限（秒）。`csv_seconds`はCSVに行を書く上限、`thread_seconds`はスレッドを止める上限（集計もここで止まる）。
+/// 分けるのは、配布バージョンでファイルを軽くしつつ起動から11分より後のマッチの分布を本ログに残すため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterLimits {
     pub csv_seconds: u64,
     pub thread_seconds: u64,
 }
 
-/// このバージョンの書き出しの上限。`dist` を引数で受けるのは、配るバージョンの値を開発用のビルドの検査でも見るため。
+/// このバージョンの書き出しの上限。`dist`を引数で受けるのは配布バージョンの値を開発用のビルドの検査でも見るため。
 pub const fn writer_limits(dist: bool) -> WriterLimits {
     WriterLimits {
         csv_seconds: if dist {
@@ -63,20 +75,20 @@ pub const fn writer_limits(dist: bool) -> WriterLimits {
     }
 }
 
-/// 先頭の入口への答え（`pacing_win::pacing_head_entry` が分かれる値）。0 = ゲーム自身の経路（元の飛び先の時計へ）。
+/// 先頭の入口への答え（`pacing_win::pacing_head_entry`が分岐する値）。0 = ゲーム自身の経路（元の飛び先の時計へ）。
 pub const HEAD_FALLBACK: u32 = 0;
 pub const HEAD_RUN: u32 = 1;
 pub const HEAD_NOT_YET: u32 = 2;
 
-/// 入力の入口（`stub::input_wait_entry`）が時刻を打つか。0 の間、入口のこの経路の命令は `cmp` と `je` の 2 つだけ。1 にするのは `install` が Present の call を書いた後だけ。
+/// 入力の入口（`stub::input_wait_entry`）が時刻を記録するかどうか。0の間、入口のこの経路の命令は`cmp`と`je`の2つだけ。1にするのは`install`がPresentのcallを書いた後だけ。
 pub static INPUT_STAMP_ON: AtomicU32 = AtomicU32::new(0);
 
 // ---- 格子の寄せ ----
-/// 寄せた枠として数える最小の寄せ幅（ppm）。`pacing_sum` も同じ値で数える。
+/// 寄せた枠として数える最小の寄せ幅（ppm）。`pacing_sum`も同じ値で数える。
 pub const GLIDE_COUNT_PPM: u32 = pace::GLIDE_COUNT_PPM;
 const GLIDE_DEFAULT_FRAME_US: u32 = 1_000_000 / pace::DEFAULT_FPS as u32;
 
-/// rollback の時刻合わせが決めた「次の枠の長さの変化」を、先頭（ペース B の格子）へ渡す変数と、寄せの数え。書くのも読むのもゲームのスレッドだけなので順序は `Relaxed` で足りる。確保しない・待たない。
+/// rollbackの時刻合わせが決めた「次の枠の長さの変化」を、先頭（ペースBの格子）へ渡す変数と、寄せの数え。書くのも読むのもゲームのスレッドだけなので順序は`Relaxed`で足りる。確保しない・待たない。
 pub struct GlideCell {
     req: AtomicI32,
     frame_us: AtomicU32,
@@ -191,12 +203,12 @@ impl GlideCell {
     }
 }
 
-/// 格子を寄せる要求を持つ変数（ひとつだけ。ゲームの 1 つのマッチの経路が使う）。じかに使わず `glide()` を通す。
+/// 格子を寄せる要求を持つ変数（ひとつだけ。ゲームの1つのマッチの経路が使う）。じかに使わず`glide()`を通す。
 #[cfg(not(test))]
 static GLIDE: GlideCell = GlideCell::new();
 
-/// 格子を寄せる要求を持つ型。製品では 1 つの静的変数（書き手 `rollback_scan` と読み手 `Pacer::head` は同じゲームのスレッド）。
-/// 検査ではスレッドごとの変数にする: cargo test は検査を並列のスレッドで走らせ、rollback の検査が書いた要求を別の検査の先頭が読んで期限を動かしうるため。
+/// 格子を寄せる要求を持つ型。製品では1つの静的変数（書き手`rollback_scan`と読み手`Pacer::head`は同じゲームのスレッド）。
+/// 検査ではスレッドごとの変数にする: cargo testは検査を並列のスレッドで走らせ、rollbackの検査が書いた要求を別の検査の先頭が読んで期限を動かしうるため。
 #[cfg(not(test))]
 pub fn glide() -> &'static GlideCell {
     &GLIDE
@@ -210,14 +222,14 @@ pub fn glide() -> &'static GlideCell {
     T_GLIDE.with(|g| *g)
 }
 
-/// リングバッファの件数（60 fps で約 68 秒ぶん。書き出しは 100 ms ごとに読むので、周回で失うのは書き出しが 1 分止まったときだけ）。
+/// リングバッファの件数（60 fpsで約68秒ぶん。書き出しは100 msごとに読むので周回で失うのは書き出しが1分止まったときだけ）。
 pub const PACE_RING_LEN: u32 = 4_096;
 const PACE_RING_MASK: u32 = PACE_RING_LEN - 1;
 const _: () = assert!(PACE_RING_LEN.is_power_of_two());
-/// 1 枠の語の数（128 バイト。32 語を全部使う）。
+/// 1枠のワードの数（128バイト。32ワードを全部使う）。
 const SLOT_WORDS: usize = 32;
 
-// 枠の中の語の位置。64 ビットの時刻は下位・上位の 2 語。
+// 枠の中のワードの位置。64ビットの時刻は下位・上位の2ワード。
 const W_TICKET: usize = 0;
 const W_FRAME: usize = 1;
 const W_FLAGS: usize = 2;
@@ -232,17 +244,17 @@ const W_START: usize = 12;
 const W_INPUT: usize = 14;
 const W_PRESENT_BEGIN: usize = 16;
 const W_PRESENT_END: usize = 18;
-// 以下、CPU の番号は「平らな番号 + 1」（0 は「無い」）。
+// 以下、CPUの番号は「平らな番号 + 1」（0は「無い」）。
 const W_PHASE: usize = 20;
 const W_HEAD_CPU: usize = 21;
 const W_INPUT_CPU: usize = 22;
 const W_PRESENT_CPU: usize = 23;
 const W_INPUT_CYCLES: usize = 24;
 const W_PRESENT_CYCLES: usize = 26;
-// 格子の寄せの語。どちらも符号つき 32 ビット（要求は ppm、動かした量は QPC のカウント）。
+// 格子の寄せのワード。どちらも符号つき32ビット（要求はppm。動かした量はQPCのカウント）。
 const W_GLIDE_REQ: usize = 28;
 const W_GLIDE_MOVED: usize = 29;
-// b-hybrid の語。余裕は µs（0 は判断が無い）、寝過ごしは「µs + 1」（0 は寝ていない）。どちらも枠の中の最大。
+// b-hybridのワード。余裕はµs（0は判断が無い）。寝過ごしは「µs + 1」（0は寝ていない）。どちらも枠の中の最大。
 const W_HYBRID_MARGIN: usize = 30;
 const W_OVERSLEEP: usize = 31;
 const W_USED: usize = 32;
@@ -257,7 +269,7 @@ pub struct PaceSlot {
     w: [AtomicU32; SLOT_WORDS],
 }
 
-/// 記録のリングバッファ。書くのはゲームのスレッドだけ（入力の入口・先頭・Present の入口はどれもゲームのスレッドで走る）。
+/// 記録のリングバッファ。書くのはゲームのスレッドだけ（入力の入口・先頭・Presentの入口はどれもゲームのスレッドで走る）。
 pub struct PaceRing {
     slots: [PaceSlot; PACE_RING_LEN as usize],
     cur: AtomicU32,
@@ -276,7 +288,7 @@ pub static PACE_RING: PaceRing = PaceRing {
 pub enum PaceRead {
     Row(FrameRow),
     NotYet,
-    /// 周回で上書きされた（か、上書きの途中）。
+    /// 周回で上書きされた、または上書きの途中。
     Lapped,
 }
 
@@ -311,7 +323,8 @@ impl PaceRing {
         self.cur_slot().w[W_PHASE].store(phase.code(), Ordering::Relaxed);
     }
 
-    /// 先頭が読んだ格子の寄せの要求（ppm）と、実際に動かしたカウント。要求が 0 でないときだけ呼ぶ（ゲーム自身の区間は寝て戻る先頭ごとに読むので、0 で上書きして前に読んだ要求を消さない）。
+    /// 先頭が読んだ格子の寄せの要求（ppm）と、実際に動かしたカウント。要求が0でないときだけ呼ぶ。
+    /// ゲーム自身の区間では寝て戻る先頭のたびに読むので、0で上書きして前に読んだ要求を消さないようにする。
     pub fn on_glide(&self, req_ppm: i32, moved_ticks: i64) {
         let s = self.cur_slot();
         s.w[W_GLIDE_REQ].store(req_ppm as u32, Ordering::Relaxed);
@@ -346,7 +359,7 @@ impl PaceRing {
         Self::bump(self.cur_slot(), W_SLEEPS);
     }
 
-    /// b-hybrid の先頭が寝るか譲るかを決めたときの余裕（µs）。枠の中の最大を残す。
+    /// b-hybridの先頭が寝るか譲るかを決めたときの余裕（µs）。枠の中の最大を残す。
     pub fn on_hybrid_margin(&self, us: u32) {
         let w = &self.cur_slot().w[W_HYBRID_MARGIN];
         if us > w.load(Ordering::Relaxed) {
@@ -394,7 +407,7 @@ impl PaceRing {
         Self::put64(s, W_PRESENT_CYCLES, cycles);
     }
 
-    /// Present から戻った。札を立て（それまでの書きより後に見える）、番号を進め、次の枠を空にする（札を 0 にしてから中身を消す）。
+    /// Presentから戻った。チケットを立て（それまでの書き込みより後に見える）、番号を進め、次の枠を空にする（チケットを0にしてから中身を消す）。
     pub fn on_present_end(&self, now: u64) {
         let n = self.cur.load(Ordering::Relaxed);
         let s = self.slot(n);
@@ -476,11 +489,11 @@ impl PaceRing {
 pub trait PaceClock {
     fn now(&mut self) -> u64;
     fn sleep_us(&mut self, us: u32);
-    /// 普通の（高分解能でない）待機タイマーで最大 `us` µs 寝る。`mode = vpatch` だけが使う。
+    /// 普通の（高分解能でない）待機タイマーで最大`us` µs寝る。`mode = vpatch`だけが使う。
     fn sleep_plain_us(&mut self, us: u32);
     fn yield_now(&mut self);
     fn cpu(&mut self) -> u32;
-    /// 花映塚の画面の形（`mode = auto` がフレームの最初の先頭のフックで 1 回だけ読む）。本物は `OPTION_WINDOWED` の 1 バイトを読むだけ。設置で読めると検証できなかったときは読まずに `Screen::Unknown`。
+    /// 花映塚の画面の形（`mode = auto`がフレームの最初の先頭のフックで1回だけ読む）。本物は`OPTION_WINDOWED`の1バイトを読むだけ。設置で読めると検証できなかったときは読まずに`Screen::Unknown`。
     fn screen(&mut self) -> Screen;
 }
 
@@ -495,11 +508,11 @@ pub struct Pacer {
     wait: Phase,
     phase: Phase,
     frame: Option<u32>,
-    /// b-hybrid の余裕の見積もりと b-spin へ戻す応答（寝る長さを決める。数値は ini の `hybrid_*`）。
+    /// b-hybridの余裕の見積もりとb-spinへ戻す応答（寝る長さを決める。数値はiniの`hybrid_*`）。
     doze: Doze,
-    /// この枠で b-hybrid の先頭が 1 回以上寝たか（遅れて始めた枠が「寝た後の遅れ」かを決める）。
+    /// この枠でb-hybridの先頭が1回以上寝たかどうか（遅れて始めた枠が「寝た後の遅れ」かを決める）。
     slept: bool,
-    /// `mode = vpatch` の期限と準備時間（他の方式では None）。
+    /// `mode = vpatch`の期限と準備時間（他の方式ではNone）。
     vp: Option<Vpatch>,
 }
 
@@ -544,8 +557,10 @@ impl Pacer {
         &self.pace
     }
 
-    /// フレームの最初の先頭のフックで方式を決め、枠に札を書く。cycle・auto で game から b / b-spin へ移るときは格子を設定し直す（game の区間の間に B の格子点は何百も過ぎているので、
-    /// 設定し直さないと最初のフレームが「遅れて始めた」になり飛ばした格子点を数え続ける）。b → b-spin は同じ格子のまま。auto の画面の形もここ（フレームに 1 回）でだけ読み、1 フレームの途中で方式を変えない。
+    /// フレームの最初の先頭のフックで方式を決め、枠にタグを書く。
+    /// cycle・autoでgameからb / b-spinへ移るときは格子を設定し直す。
+    /// gameの区間の間にBの格子点は何百も過ぎているので、設定し直さないと最初のフレームが「遅れて始めた」になり飛ばした格子点を数え続ける。
+    /// b → b-spinは同じ格子のまま。autoの画面の形もここ（フレームに1回）でだけ読み、1フレームの途中で方式を変えない。
     fn phase_for_frame(&mut self, now: u64, clock: &mut dyn PaceClock, ring: &PaceRing) -> bool {
         let n = ring.completed();
         if self.frame == Some(n) {
@@ -558,7 +573,7 @@ impl Pacer {
         } else if self.auto {
             self.phase = pace::auto_phase_with(clock.screen(), self.wait);
         }
-        // b-hybrid で寝た後に期限を越える枠が続いて b-spin へ戻した後は、b-hybrid の枠を b-spin として走らせ、札も b-spin にする。
+        // b-hybridで寝た後に期限を越える枠が続いてb-spinへ戻した後は、b-hybridの枠をb-spinとして走らせてタグもb-spinにする。
         if self.phase == Phase::BHybrid && self.doze.fell_back() {
             self.phase = Phase::BSpin;
         }
@@ -571,15 +586,15 @@ impl Pacer {
         true
     }
 
-    /// 先頭へ来たときの判断。`HEAD_RUN`・`HEAD_NOT_YET`（寝た・譲った後）・`HEAD_FALLBACK`（cycle の game の区間・auto のフルスクリーンのフレーム）を返し、枠に書く。
+    /// 先頭へ来たときの判断。`HEAD_RUN`・`HEAD_NOT_YET`（寝た・譲った後）・`HEAD_FALLBACK`（cycleのgameの区間・autoのフルスクリーンのフレーム）を返し、枠に書く。
     pub fn head(&mut self, clock: &mut dyn PaceClock, ring: &PaceRing) -> u32 {
         let now = clock.now();
         let first = self.phase_for_frame(now, clock, ring);
         if self.phase == Phase::Game {
-            // ゲーム自身の経路は期限の前なら `Sleep(0)` の後に do_frame から 0 を返してまた先頭へ来る。どの 1 回がフレームを始めるかは分からないので、論理 CPU は来るたびに取り直す。
+            // ゲーム自身の経路は期限の前なら`Sleep(0)`の後にdo_frameから0を返してまた先頭へ来る。どの1回がフレームを始めるかは分からないので論理CPUは来るたびに取り直す。
             ring.on_head_pass(now);
             ring.on_head_cpu(clock.cpu());
-            // 格子を持たない区間（フルスクリーン）は寄せられないので、溜めずに捨てる。
+            // 格子を持たない区間（フルスクリーン）は寄せられないので溜めずに捨てる。
             let dropped = glide().take();
             if dropped != 0 {
                 ring.on_glide(dropped, 0);
@@ -589,11 +604,12 @@ impl Pacer {
         if self.phase == Phase::Vpatch {
             return self.head_vpatch(now, clock, ring);
         }
-        // 格子を寄せる（rollback の時刻合わせ）: これから始める枠の期限を、前の枠の入力の地点が決めた分だけ前後させる。期限を決める（`decide`）より前、枠の最初の先頭のフックに 1 回だけ
-        // （寝て戻る先頭で動かすと同じ枠の期限が先頭の数だけずれる）。変わるのは期限だけで、入力を読む順は変わらない。
+        // 格子を寄せる（rollbackの時刻合わせ）: これから始める枠の期限を、前の枠の入力の地点が決めた分だけ前後させる。
+        // 動かすのは期限を決める（`decide`）より前で、枠の最初の先頭のフックに1回だけ（寝て戻る先頭で動かすと同じ枠の期限が先頭の数だけずれる）。
+        // 変わるのは期限だけ。入力を読む順は変わらない。
         if first {
             let ppm = glide().take();
-            // 格子がまだ無い枠（フルスクリーンからウィンドウモードへ移った最初の枠など）は動かせないので、寄せた枠に数えない。
+            // 格子がまだ無い枠（フルスクリーンからウィンドウモードへ移った最初の枠など）は動かせないので寄せた枠に数えない。
             let mut moved = 0;
             if ppm != 0 && self.pace.grid().is_some() {
                 moved = self.pace.nudge(ppm);
@@ -604,7 +620,7 @@ impl Pacer {
             }
         }
         let rebased0 = self.pace.rebased();
-        // 最後の回し読みの幅: b-hybrid の枠は ini の `hybrid_spin_us`、b / b-spin は `SPIN_US`。
+        // 最後にQPCを読み続ける幅: b-hybridの枠はiniの`hybrid_spin_us`。b / b-spinは`SPIN_US`。
         let spin = if self.phase == Phase::BHybrid {
             self.doze.spin()
         } else {
@@ -618,7 +634,7 @@ impl Pacer {
                 match self.phase {
                     Phase::BSpin => clock.yield_now(),
                     Phase::BHybrid => {
-                        // 寝るか譲るかと寝る長さは core（`Doze::choose`）。`Head::Sleep` は残りが回し読みの幅より大きいときだけ来る。
+                        // 寝るか譲るかと寝る長さはcore（`Doze::choose`）が決める。`Head::Sleep`は残りがQPCを読み続ける幅より大きいときだけ来る。
                         ring.on_hybrid_margin(self.doze.margin_us());
                         let rest = deadline.saturating_sub(now).saturating_sub(spin);
                         match self.doze.choose(rest) {
@@ -632,7 +648,7 @@ impl Pacer {
                             Wait::Yield => clock.yield_now(),
                         }
                     }
-                    // b（と、ここへは来ない game と vpatch）。寝過ごしは測らない（測るための QPC の読みを足さない）。
+                    // b、およびここへは来ないgameとvpatch。寝過ごしは測らない（測るためのQPCの読みを足さない）。
                     Phase::B | Phase::Game | Phase::Vpatch => {
                         ring.on_sleep();
                         clock.sleep_us(us);
@@ -653,7 +669,7 @@ impl Pacer {
             }
             Head::Run { deadline, late } => {
                 ring.on_head(now, deadline);
-                // 寝た後に期限を越えた枠を数える（数が ini の `hybrid_fallback_*` に達したら、次の枠から b-spin へ戻す）。
+                // 寝た後に期限を越えた枠を数える（数がiniの`hybrid_fallback_*`に達したら次の枠からb-spinへ戻す）。
                 if late && self.slept && self.phase == Phase::BHybrid {
                     self.doze.late_after_sleep();
                 }
@@ -662,8 +678,9 @@ impl Pacer {
         }
     }
 
-    /// vpatch 相当の先頭。起きる時刻（期限 − 準備時間）まで、普通の待機タイマーで目標の `SPIN_US` 手前まで寝て、残りは QPC を読み続け、1 回で「始める」を返す
-    /// （メッセージループへは戻さない。vpatch も先頭のフックの中で待つ）。期限を過ぎていれば待たずに始める（基点の設定し直しは `Vpatch::begin`）。格子の寄せは受けない。
+    /// vpatch相当の先頭。起きる時刻（期限 − 準備時間）の`SPIN_US`手前まで普通の待機タイマーで寝て、残りはQPCを読み続ける。
+    /// その後1回で「始める」を返す（メッセージループへは戻さない。vpatchも先頭のフックの中で待つ）。
+    /// 期限を過ぎていれば待たずに始める（基点の設定し直しは`Vpatch::begin`）。格子の寄せは受けない。
     fn head_vpatch(&mut self, now: u64, clock: &mut dyn PaceClock, ring: &PaceRing) -> u32 {
         let dropped = glide().take();
         if dropped != 0 {
@@ -695,7 +712,7 @@ impl Pacer {
         HEAD_RUN
     }
 
-    /// Present の直前（`mode = vpatch` だけ）。標本を足し、期限までの待ちを同じ手順で行う。他の方式では何もしない。
+    /// Presentの直前（`mode = vpatch`だけ）。サンプルを足し、同じ手順で期限まで待つ。他の方式では何もしない。
     pub fn before_present(&mut self, clock: &mut dyn PaceClock) {
         let (spin, qpf) = (self.spin, self.pace.qpf());
         let Some(vp) = self.vp.as_mut() else {
@@ -731,7 +748,7 @@ impl Pacer {
     }
 }
 
-/// `target` まで待つ（vpatch 相当）。`target − spin` までは普通の待機タイマーで寝て、その後 `target` まで QPC を読み続ける。寝たかを返す。
+/// `target`まで待つ（vpatch相当）。`target − spin`までは普通の待機タイマーで寝て、その後`target`までQPCを読み続ける。寝たかどうかを返す。
 fn vp_wait(clock: &mut dyn PaceClock, now: u64, target: u64, spin: u64, qpf: u64) -> bool {
     let slept = vpatch::sleep_ticks(now, target, spin);
     if let Some(r) = slept {
@@ -758,9 +775,11 @@ pub struct WriterTally {
     pub report: Report,
 }
 
-/// リングバッファを `stop()` が true になるまで（か `limits.thread_seconds` まで）`WRITER_POLL_MS` ごとに読み、全部の行を集計に入れる。1 フレーム 1 行は `out` に書くが、`limits.csv_seconds` を越えた後は書かず `csv_capped` に数える。
-/// 止めた後にもう 1 回読み切ってから返す。`fps` は集計のペース。論理 CPU の効率クラスは `classes`（設置の時に 1 回読んだ表）から、このスレッドで引く。
-#[allow(clippy::too_many_arguments)] // 書き出しのスレッドの入口 1 か所から呼ぶだけで、束ねる型を作るほどの口ではない
+/// リングバッファを`stop()`がtrueになるまで（か`limits.thread_seconds`まで）`WRITER_POLL_MS`ごとに読み、全部の行を集計に入れる。
+/// 1フレーム1行は`out`に書く。`limits.csv_seconds`を越えた後は書かず`csv_capped`に数える。
+/// 止めた後にもう1回読み切ってから返す。`fps`は集計のペース。
+/// 論理CPUの効率クラスは`classes`（設置の時に1回読んだ表）から、このスレッドで取得する。
+#[allow(clippy::too_many_arguments)] // 書き出しのスレッドの入口1か所から呼ぶだけで、束ねる型を作るほどの口ではない
 pub fn writer_loop(
     ring: &PaceRing,
     pre: &Preamble,
@@ -775,16 +794,16 @@ pub fn writer_loop(
     let csv_polls = limits.csv_seconds * 1_000 / WRITER_POLL_MS;
     let max_polls = limits.thread_seconds * 1_000 / WRITER_POLL_MS;
     let mut sum = Splitter::new(qpf, fps, &pre.eff_classes, pre.mode.fixed_phase());
-    // 最初の行は `# qpf=… mode=… eff_classes=… cycle_secs=…`（あとから集計する `pacing_sum` が読む）、次が列の名前。
+    // 最初の行は`# qpf=… mode=… eff_classes=… cycle_secs=…`（あとから集計する`pacing_sum`が読む）。次の行が列の名前。
     let mut ok = writeln!(out, "{}", pace::csv_preamble(pre))
         .and_then(|_| writeln!(out, "{}", pace::CSV_HEADER))
         .is_ok();
     let (mut rows, mut lost, mut csv_capped) = (0u64, 0u64, 0u64);
     let mut next = 0u32;
     let mut prev: Option<FrameRow> = None;
-    // game の実行は先頭を書かないので札が付かない。行に `game` を入れる。
+    // gameの実行は先頭を書かないのでタグが付かない。行には`game`を書く。
     let fill_phase = (pre.mode == Mode::Game).then_some(Phase::Game);
-    // `write_csv` が false（CSV の上限の後）なら行は書かず集計にだけ入れる。リングバッファは止めるまで読み続ける。
+    // `write_csv`がfalse（CSVの上限の後）なら行は書かず集計にだけ入れる。リングバッファは止めるまで読み続ける。
     let mut drain = |ok: &mut bool, sum: &mut Splitter, write_csv: bool| {
         let upto = ring.completed();
         while next != upto {
@@ -846,9 +865,9 @@ pub trait PacingHost {
     fn qpf(&self) -> u64;
     fn head_entry(&self) -> u32;
     fn present_entry(&self) -> u32;
-    /// B の待ち（高分解能の待機タイマー）と先頭のフック（形・ペース・cycle の秒は `cfg`）を用意する。作れなければ Err（先頭は書かない）。`screen_flag` は auto の先頭が読む画面の形のアドレス
-    /// （設置で読めると検証したときだけ `OPTION_WINDOWED`。それ以外は 0 で、先頭は読まずに `Screen::Unknown`）。`window` はゲーム自身の時計の経路で「この先頭の 1 回がフレームを始めるか」を見るウィンドウの構造体のアドレス
-    /// （読めると検証したときだけ `WINDOW_ADDR`。それ以外は 0 で、その経路では先頭のフックの中の待ちを呼ばない）。
+    /// Bの待ち（高分解能の待機タイマー）と先頭のフック（形・ペース・cycleの秒は`cfg`）を用意する。作れなければErr（先頭は書かない）。
+    /// `screen_flag`はautoの先頭が読む画面の形のアドレス。設置で読めると検証したときだけ`OPTION_WINDOWED`で、それ以外は0（先頭は読まずに`Screen::Unknown`）。
+    /// `window`はゲーム自身の時計の経路で「この先頭の1回がフレームを始めるか」を見るウィンドウの構造体のアドレス。読めると検証したときだけ`WINDOW_ADDR`で、それ以外は0（その経路では先頭のフックの中の待ちを呼ばない）。
     fn arm_pacer(
         &mut self,
         qpf: u64,
@@ -857,7 +876,7 @@ pub trait PacingHost {
         window: u32,
     ) -> Result<String, String>;
     fn cpu_classes(&mut self) -> Result<CpuClasses, String>;
-    /// 記録のリングバッファを空にし、書き出しのスレッドを作る（CSV を開く）。開いたファイルの名前。`fps` は集計のペース。
+    /// 記録のリングバッファを空にし、書き出しのスレッドを作る（CSVを開く）。戻り値は開いたファイルの名前。`fps`は集計のペース。
     fn start_writer(
         &mut self,
         pre: Preamble,
@@ -902,8 +921,8 @@ fn verify_row(env: &mut dyn HookEnv, d: &SiteDef) -> Result<(), String> {
     Ok(())
 }
 
-/// auto の先頭が読む画面の形のアドレスを、設置の時に 1 バイト読めるかでチェックする（読めなければ 0 を返し、先頭は読まない）。ここで読んだ値は本ログに残すだけで形は決めない:
-/// 設置は花映塚の設定の読み込みより前に走りうるので、この時点の 0 は「フルスクリーン」とは限らない。
+/// autoの先頭が読む画面の形のアドレスを、設置の時に1バイト読めるかどうかでチェックする（読めなければ0を返し、先頭は読まない）。
+/// ここで読んだ値は本ログに残すだけで形は決めない。設置は花映塚の設定の読み込みより前に走りうるので、この時点の0は「フルスクリーン」とは限らない。
 fn checked_screen_flag(env: &mut dyn HookEnv, out: &mut dyn Write) -> u32 {
     let mut b = [0u8; 1];
     if !env.read_code(OPTION_WINDOWED, &mut b) {
@@ -921,8 +940,8 @@ fn checked_screen_flag(env: &mut dyn HookEnv, out: &mut dyn Write) -> u32 {
     OPTION_WINDOWED
 }
 
-/// ゲーム自身の時計の経路（auto のフルスクリーン・cycle の game の区間）で先頭が読むウィンドウの構造体（時計の分母 `+0x14`・期限 `+0x3C`）を、設置の時に読めるかでチェックする
-/// （読めなければ 0 を返し、その経路では先頭のフックの中の待ちを呼ばない）。中の値は設置の時には決まっていないことがあるので、読めるかだけを見る。
+/// ゲーム自身の時計の経路（autoのフルスクリーン・cycleのgameの区間）で先頭が読むウィンドウの構造体（時計の分母`+0x14`・期限`+0x3C`）を、設置の時に読めるかどうかでチェックする。
+/// 読めなければ0を返し、その経路では先頭のフックの中の待ちを呼ばない。中の値は設置の時には決まっていないことがあるので読めるかどうかだけを見る。
 fn checked_window(env: &mut dyn HookEnv, out: &mut dyn Write) -> u32 {
     let mut b = [0u8; WINDOW_SPAN as usize];
     if !env.read_code(WINDOW_ADDR, &mut b) {
@@ -935,8 +954,8 @@ fn checked_window(env: &mut dyn HookEnv, out: &mut dyn Write) -> u32 {
     WINDOW_ADDR
 }
 
-/// ini から形を決める。`Ok((形, 既定になった理由))`、`Err` は本ログへ書く理由（何も触らない）。ini が無い・節が無い・`mode` を書かないときは既定の auto（`pace::DEFAULT_MODE`）。
-/// 読めない ini・節の中の誤りは触らない（誤った設定のまま黙って既定を走らせない）。`mode = auto` と明示したときは既定の行を出さない。
+/// iniから形を決める。`Ok((形, 既定になった理由))`、`Err`は本ログへ書く理由（何も触らない）。iniが無い・節が無い・`mode`を書かないときは既定のauto（`pace::DEFAULT_MODE`）。
+/// 読めないini・節の中の誤りは触らない（誤った設定のまま黙って既定を走らせない）。`mode = auto`と明示したときは既定の行を出さない。
 fn cfg_from_ini(
     read: Result<Option<String>, String>,
 ) -> Result<(PacingIni, Option<String>), String> {
@@ -990,7 +1009,7 @@ pub fn install(
     }
 }
 
-/// `install` の中身。`modes` には、形が決まったときに 求められた形 と 先頭を用意できた後の形 を入れる。
+/// `install`の中身。`modes`には、形が決まったときに「求められた形」と「先頭を用意できた後の形」を書き込む。
 fn install_modes(
     env: &mut dyn HookEnv,
     host: &mut dyn PacingHost,
@@ -1000,7 +1019,7 @@ fn install_modes(
     let cfg = match cfg_from_ini(host.read_ini()) {
         Ok((c, None)) => c,
         Ok((c, Some(why))) => {
-            // 既定で入ったことを本ログで見分けられるよう、どの経路で既定になったかを 1 行書く。
+            // 既定になったことを本ログで見分けられるよう、どの経路で既定になったかを1行書く。
             let _ = writeln!(
                 detail_out(out),
                 "ペース: {why}ので既定の mode = {}（{} fps）で設置します。ゲーム自身の待ちのままにするなら [{}] に mode = game と書いてください",
@@ -1133,7 +1152,7 @@ fn install_modes(
     }
     let used_mode = if paced { mode } else { Mode::Game };
     modes.1 = Some(used_mode);
-    // 先頭に入れなかったらゲーム自身のペース（60）で集計する。ini の fps は b / b-spin にしか効かない。
+    // 先頭のフックを設置できなかったらゲーム自身のペース（60）で集計する。iniのfpsはb / b-spinにしか効かない。
     let used_fps = if paced { fps } else { pace::DEFAULT_FPS };
     let pre = Preamble {
         qpf,
@@ -1200,7 +1219,7 @@ fn install_modes(
         );
         return Installed::Stamps;
     }
-    // vpatch の先頭のフックは寝てもメッセージループへ戻らない（先頭のフックの中で待つ）ので、B の文を当てない。
+    // vpatchの先頭のフックは寝てもメッセージループへ戻らない（先頭のフックの中で待つ）ので、本ログにB用の文を書かない。
     if mode == Mode::Vpatch {
         let _ = writeln!(
             detail_out(out),
@@ -1267,7 +1286,7 @@ fn install_modes(
         Mode::B | Mode::Game => {}
     }
     if fps != pace::DEFAULT_FPS {
-        // 製品の実行で誤って使ったときに本ログで見分けられるよう、既定と違えば必ず 1 行足す。
+        // 製品の実行で誤って使ったときに本ログで見分けられるよう既定と違えば必ず1行足す。
         let _ = writeln!(
             out,
             "ペース: ★検査用: fps = {fps}（ゲームが {fps}/{} 倍で進む。普段の対戦では使わない）。",
@@ -1299,7 +1318,7 @@ fn hybrid_text(p: &HybridParams) -> String {
     )
 }
 
-/// 書き出しを止め、集計を本ログへ書く（`session::run` が計測の後に呼ぶ）。戻りは試験のまとめの材料（書き出しを作っていない・終わりを受け取れなければ None）。
+/// 書き出しを止め、集計を本ログへ書く（`session::run`が計測の後に呼ぶ）。戻り値は試験のまとめの材料（書き出しを作っていない・終わりを受け取れなければNone）。
 pub fn finish(host: &mut dyn PacingHost, out: &mut dyn Write) -> Option<PaceEnd> {
     let end = host.stop_writer()?;
     let c = host.counters();
@@ -1329,7 +1348,7 @@ pub fn finish(host: &mut dyn PacingHost, out: &mut dyn Write) -> Option<PaceEnd>
                 c.fallbacks,
                 c.panics
             );
-            // CSV の上限を越えた行は書かず、集計にだけ入れた。
+            // CSVの上限を越えた行は書かず、集計にだけ入れた。
             if e.tally.csv_capped > 0 {
                 let _ = writeln!(
                     out,
@@ -1376,7 +1395,7 @@ pub(crate) mod tests {
     }
 
     impl FakeCode {
-        /// 表の全行の期待バイト列と、画面の形の 1 バイト（1 = ウィンドウ）と、ウィンドウの構造体の範囲（0）を設定した偽物。
+        /// 表の全行の期待バイト列と、画面の形の1バイト（1 = ウィンドウ）と、ウィンドウの構造体の範囲（0）を設定した偽物。
         pub(crate) fn original() -> FakeCode {
             let mut mem = BTreeMap::new();
             for d in PACING_SITES {
@@ -1785,7 +1804,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// vpatch（FpuPatch の 5 バイト・Vsync≥0 の 8 バイト）や rev5 #20 が先頭を書き換えた実行で、b が何も書かず書き出しも作らない。標本は実際に出る形から取る。どの形でも game なら Present のフックだけは付く。
+    /// vpatch（FpuPatchの5バイト・Vsync≥0の8バイト）やrev5 #20が先頭を書き換えた実行で、bが何も書かず書き出しも作らない。サンプルは実際に出る形から取る。どの形でもgameならPresentのフックだけは付く。
     #[test]
     fn vpatch_forms_at_the_head_write_nothing() {
         let h = site(PACING_HEAD_SITE).addr;
@@ -1793,7 +1812,7 @@ pub(crate) mod tests {
         rev5.extend_from_slice(&[0xEB, 0x42, 0x90]);
         let mut vsync = patch::call_rel32(h, 0x6000_40B0).to_vec();
         vsync.extend_from_slice(&[0xEB, 0x42, 0x90]);
-        // FpuPatch の飛び先は読んでいない（vpatch の DLL の中のどこか）ので合成のアドレス。形（E8 rel32 の 5 バイト）だけ実物。
+        // FpuPatchの飛び先は読んでいない（vpatchのDLLの中のどこか）ので合成のアドレス。形（E8 rel32の5バイト）だけ実物。
         let fpu = patch::call_rel32(h, 0x6000_3F00).to_vec();
         let mut n = 0;
         for (label, bytes) in [
@@ -2434,7 +2453,7 @@ pub(crate) mod tests {
         ring.reset();
     }
 
-    /// 偽の時計: `now` を返すたびに `step` 進み、寝ると寝た µs ぶん進む（10 MHz で 1 µs = 10 カウント）。譲ると 5 µs 進む。
+    /// 偽の時計: `now`を返すたびに`step`進み、寝ると寝たµsぶん進む（10 MHzで1 µs = 10カウント）。譲ると5 µs進む。
     struct FakeClock {
         now: u64,
         step: u64,
@@ -2472,7 +2491,7 @@ pub(crate) mod tests {
         }
         fn sleep_us(&mut self, us: u32) {
             self.slept.push(us);
-            self.now += us as u64 * 10 + self.overshoot; // 起床の遅れ（既定 70 µs）
+            self.now += us as u64 * 10 + self.overshoot; // 起床の遅れ（既定70 µs）
         }
         fn sleep_plain_us(&mut self, us: u32) {
             self.plain.push(us);
@@ -2558,7 +2577,7 @@ pub(crate) mod tests {
         ring.reset();
     }
 
-    /// 1 フレーム進める: 先頭 → 作業 `work` カウント → Present の直前（待ちがあれば待つ）→ Present の前後の印。先頭の答えと、Present の直前のフックを呼ぶ前の時刻を返す。
+    /// 1フレーム進める: 先頭 → 作業`work`カウント → Presentの直前（待ちがあれば待つ）→ Presentの前後の時刻の記録。先頭の答えと、Presentの直前のフックを呼ぶ前の時刻を返す。
     fn vpatch_frame(p: &mut Pacer, c: &mut FakeClock, ring: &PaceRing, work: u64) -> (u32, u64) {
         let code = p.head(c, ring);
         c.now += work;
@@ -2602,7 +2621,7 @@ pub(crate) mod tests {
         let spin = pace::us_to_ticks_ceil(SPIN_US, qpf);
         assert_eq!(c.plain, vec![((wake - spin - entry) / 10) as u32]);
         assert!(c.slept.is_empty(), "高分解能の寝かたを使った");
-        // 作業 1 ms の後、Present の直前で期限まで待つ（目標の 1 ms 手前まで普通のタイマーで寝る）。
+        // 作業1 msの後Presentの直前で期限まで待つ（目標の1 ms手前まで普通のタイマーで寝る）。
         c.now += 10_000;
         let before = c.now;
         p.before_present(&mut c);
@@ -2639,7 +2658,7 @@ pub(crate) mod tests {
         let mut c = FakeClock::at(1_000_000, 3);
         let (_, base) = vpatch_frame(&mut p, &mut c, ring, 0);
         c.now += 10_000;
-        // 作業 8 ms（起きてから 8 ms 後に Present の直前。期限は起きた 3 ms 後なので過ぎている）。
+        // 作業8 ms（起きてから8 ms後にPresentの直前。期限は起きた3 ms後なので過ぎている）。
         let (code, at) = vpatch_frame(&mut p, &mut c, ring, 80_000);
         assert_eq!(code, HEAD_RUN);
         assert!(at > base + period, "作業が期限を越えた");
@@ -2656,7 +2675,7 @@ pub(crate) mod tests {
         let PaceRead::Row(r) = ring.read(2) else {
             panic!()
         };
-        // 標本 = 起きた時刻（偽の時計は読むたびに 3 カウント進む）から Present の直前のフックまで = 作業 80,000 + 3。
+        // サンプル = 起きた時刻（偽の時計は読むたびに3カウント進む）からPresentの直前のフックまで = 作業80,000 + 3。
         assert_eq!(
             r.deadline,
             base + 2 * qpf / 60 - 80_003,
@@ -2665,7 +2684,7 @@ pub(crate) mod tests {
         ring.reset();
     }
 
-    // 位相を保つ B と同じ「元の格子の次の点」に合わせない。
+    // 位相を保つBと同じ「元の格子の次の点」に合わせない。
     #[test]
     fn vpatch_late_head_runs_at_once_and_moves_the_base() {
         let _g = lock();
@@ -2676,7 +2695,7 @@ pub(crate) mod tests {
         let mut p = Pacer::new(qpf, &cfg(Mode::Vpatch)).unwrap();
         let mut c = FakeClock::at(1_000_000, 3);
         let (_, base) = vpatch_frame(&mut p, &mut c, ring, 0);
-        // 次の期限（base + period）を 5 ms 過ぎて先頭へ来る。
+        // 次の期限（base + period）を5 ms過ぎて先頭へ来る。
         c.now = base + period + 50_000;
         let plain = c.plain.len();
         let (code, at) = vpatch_frame(&mut p, &mut c, ring, 1_000);
@@ -2687,7 +2706,7 @@ pub(crate) mod tests {
         };
         assert!(r.late && r.rebased, "{r:?}");
         assert!(r.sleeps == 0 && r.head_calls == 1);
-        // 次のフレームの期限は、設定し直した Present の時刻から 1 周期。元の格子（base + 2 × period）ではない。
+        // 次のフレームの期限は設定し直したPresentの時刻から1周期。元の格子（base + 2 × period）ではない。
         c.now += 10_000;
         p.head(&mut c, ring);
         c.now += 1_000;
@@ -2853,7 +2872,7 @@ pub(crate) mod tests {
         ring.reset();
     }
 
-    /// 偽の時計で 1 フレームを回す。game の区間（先頭が `HEAD_FALLBACK`）はゲーム自身の経路が 1/60 秒ごとに進めることにして検査の関数が時計を進め、b / b-spin の区間は先頭が待つ。どのフレームも作業 2 ms の後に入力と Present。
+    /// 偽の時計で1フレームを回す。gameの区間（先頭が`HEAD_FALLBACK`）はゲーム自身の経路が1/60秒ごとに進めることにして検査の関数が時計を進める。b / b-spinの区間は先頭が待つ。どのフレームも作業2 msの後に入力とPresent。
     fn run_one(p: &mut Pacer, c: &mut FakeClock, ring: &PaceRing, n: u32) {
         let mut calls = 0;
         let code = loop {
@@ -3131,7 +3150,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// b-hybrid の先頭（偽の時計。寝過ごしは既定の 70 µs）。
+    /// b-hybridの先頭（偽の時計。寝過ごしは既定の70 µs）。
     #[test]
     fn b_hybrid_head_sleeps_then_yields_then_spins() {
         let _g = lock();
@@ -3275,7 +3294,7 @@ pub(crate) mod tests {
         };
         let mut p = Pacer::new(10_000_000, &auto).unwrap();
         let mut c = FakeClock::at(1_000_000_000, 3);
-        // ウィンドウ 20 → 垂直同期を取るフルスクリーン 10 → 取らないフルスクリーン 20 フレーム。
+        // ウィンドウ20 → 垂直同期を取るフルスクリーン10 → 取らないフルスクリーン20フレーム。
         let screen_at = |n: u32| match n {
             0..20 => Screen::Windowed,
             20..30 => Screen::Fullscreen,

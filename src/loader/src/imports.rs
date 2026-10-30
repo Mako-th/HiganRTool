@@ -1,8 +1,8 @@
-//! 注入する DLL の import 表を読み、この Windows に無い DLL・関数を見つける。
-//! Windows が DLL を読むとき、import が 1 つでも解決できないと読み込みごと失敗する（原因は `LoadLibraryW` の 0 としか分からない）。
-//! 注入の前に自分のプロセスで同じ引き当てを試しておけば、何が無いかを名指しして、ゲームを起動する前に止められる。
+//! 注入するDLLのimport表を読み、このWindowsに無いDLL・関数を見つける。
+//! WindowsがDLLを読むときimportが1つでも解決できないと読み込みごと失敗する（原因は`LoadLibraryW`の0としか分からない）。
+//! 注入の前に自分のプロセスで同じ引き当てを試しておけば何が無いかを名指しして、ゲームを起動する前に止められる。
 //!
-//! 読むのは通常の import 表だけ（遅延 import は読まない）。表の読み取りは `pe::parse` の節の表を使う。
+//! 読むのは通常のimport表だけ（遅延importは読まない）。表の読み取りは`pe::parse`の節の表を使う。
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -35,7 +35,7 @@ pub struct Import {
 }
 
 const E_LFANEW_AT: usize = 0x3C;
-/// optional header の先頭から: NumberOfRvaAndSizes、データディレクトリの 1 番目（import 表）。
+/// optional headerの先頭から: NumberOfRvaAndSizes、データディレクトリの1番目（import表）。
 const NUMBER_OF_RVA_AND_SIZES: usize = 92;
 const IMPORT_DIRECTORY: usize = 104;
 const DESCRIPTOR_SIZE: usize = 20;
@@ -55,7 +55,7 @@ fn c_string(b: &[u8], off: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&tail[..len]).into_owned())
 }
 
-/// import 表の全部。import 表が無い DLL は空。表が読めない（壊れている）ときは理由。
+/// import表の全部。import表が無いDLLは空。表が読めない（壊れている）ときは理由。
 pub fn read_imports(bytes: &[u8]) -> Result<Vec<Import>, &'static str> {
     let info = pe::parse(bytes).map_err(|_| "PE の見出しが読めない")?;
     let e_lfanew = u32_at(bytes, E_LFANEW_AT).ok_or("PE の見出しが読めない")? as usize;
@@ -94,7 +94,7 @@ pub fn read_imports(bytes: &[u8]) -> Result<Vec<Import>, &'static str> {
             let name = if entry & 0x8000_0000 != 0 {
                 ImportName::Ordinal((entry & 0xFFFF) as u16)
             } else {
-                // IMAGE_IMPORT_BY_NAME: 2 バイトのヒントの後に名前。
+                // IMAGE_IMPORT_BY_NAME: 2バイトのヒントの後に名前。
                 ImportName::Name(c_string(bytes, at(entry)? + 2).ok_or("関数の名前が読めない")?)
             };
             out.push(Import {
@@ -106,15 +106,15 @@ pub fn read_imports(bytes: &[u8]) -> Result<Vec<Import>, &'static str> {
     Err("DLL の数が多すぎる")
 }
 
-/// 1 つの import が、この Windows で引けるか。
+/// 1つのimportがこのWindowsで引き当てられるかどうか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     Found,
-    /// DLL が無い（`ERROR_MOD_NOT_FOUND`）。
+    /// DLLが無い（`ERROR_MOD_NOT_FOUND`）。
     NoDll,
-    /// DLL はあるが、その関数が無い。
+    /// DLLはあるが、その関数が無い。
     NoFunction,
-    /// DLL を読めなかったが、無いとは言えない（権限・初期化の失敗など）。止める理由にはしない。
+    /// DLLを読めなかったが、無いとは言えない（権限・初期化の失敗など）。止める理由にはしない。
     LoadFailed(ErrorCode),
 }
 
@@ -125,7 +125,7 @@ pub trait ImportProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Missing {
     pub dll: String,
-    /// None なら DLL ごと無い。
+    /// NoneならDLLごと無い。
     pub function: Option<String>,
 }
 
@@ -133,18 +133,18 @@ pub struct Missing {
 pub struct Report {
     pub checked: usize,
     pub missing: Vec<Missing>,
-    /// チェックできなかった DLL と OS のエラー。
+    /// チェックできなかったDLLとOSのエラー。
     pub unchecked: Vec<(String, ErrorCode)>,
 }
 
-/// 全部の import を引く。DLL が無いものはその DLL を 1 回だけ数える。
+/// 全部のimportを引き当てる。DLLが無いものはそのDLLを1回だけ数える。
 pub fn check(bytes: &[u8], probe: &mut dyn ImportProbe) -> Result<Report, &'static str> {
     let imports = read_imports(bytes)?;
     let mut report = Report {
         checked: imports.len(),
         ..Report::default()
     };
-    // DLL ごとの結論（無い・チェックできない）。同じ DLL の残りの関数は引かない。
+    // DLLごとの結論（無い・チェックできない）。同じDLLの残りの関数は引き当てない。
     let mut settled: BTreeSet<String> = BTreeSet::new();
     for imp in &imports {
         let key = imp.dll.to_ascii_lowercase();
@@ -173,7 +173,7 @@ pub fn check(bytes: &[u8], probe: &mut dyn ImportProbe) -> Result<Report, &'stat
     Ok(report)
 }
 
-/// 画面に出す文の 1 件ぶん。
+/// 画面に出す文の1件ぶん。
 fn missing_line(m: &Missing, os: &str, lang: Lang) -> String {
     match &m.function {
         Some(f) => {
@@ -195,7 +195,7 @@ fn missing_line(m: &Missing, os: &str, lang: Lang) -> String {
     }
 }
 
-/// 画面に出す文。欠けているものが無ければ None。
+/// 画面に出す文。欠けているものが無ければNone。
 pub fn describe(report: &Report, os: &str, lang: Lang) -> Option<String> {
     if report.missing.is_empty() {
         return None;
@@ -218,9 +218,9 @@ pub enum Verdict {
     Clear,
     /// 起動を止める。画面に出す文。
     Stop(String),
-    /// Wine / Proton の上なので止めずに続ける。欠けていた件数（ログに残す）。
-    /// Wine の loader は無い関数を代わりの実装で埋めて読み込みを成功させる（推定。実機の Wine では検証していない）ため、
-    /// 欠けて見えても動くことがある。
+    /// Wine / Protonの上なので止めずに続ける。欠けていた件数（ログに残す）。
+    /// Wineのloaderは無い関数を代わりの実装で埋めて読み込みを成功させる（推定。実機のWineでは検証していない）。
+    /// そのため欠けて見えても動くことがある。
     Tolerated { missing: usize },
 }
 
@@ -243,7 +243,7 @@ mod tests {
     const TEXT_FILE_OFFSET: usize = 0x200;
     const TEXT_RVA: u32 = 0x1000;
 
-    /// 合成の PE に import 表を書く。`libs` は（DLL 名, 関数）。関数は名前か序数。
+    /// 合成のPEにimport表を書く。`libs`は（DLL名, 関数）。関数は名前か序数。
     fn pe_with_imports(libs: &[(&str, &[ImportName])]) -> Vec<u8> {
         let mut b = synth::pe32(1, 0x1000, &[0xC3]);
         b.resize(TEXT_FILE_OFFSET + 0x1000, 0);
@@ -254,7 +254,7 @@ mod tests {
         let strings_at = 0x400usize;
         let mut cursor = strings_at;
         let mut thunks_at = 0x200usize;
-        // 記述子は 0x100 から。
+        // 記述子は0x100から。
         for (i, (dll, names)) in libs.iter().enumerate() {
             let d = 0x100 + i * DESCRIPTOR_SIZE;
             let dll_at = cursor;
@@ -269,7 +269,7 @@ mod tests {
                     ImportName::Ordinal(o) => 0x8000_0000 | u32::from(*o),
                     ImportName::Name(s) => {
                         let at = cursor;
-                        // 2 バイトのヒントを空けて名前。
+                        // 2バイトのヒントを空けて名前。
                         b[TEXT_FILE_OFFSET + at + 2..TEXT_FILE_OFFSET + at + 2 + s.len()]
                             .copy_from_slice(s.as_bytes());
                         cursor += 2 + s.len() + 1;
@@ -279,9 +279,9 @@ mod tests {
                 put(&mut b, thunks_at, entry);
                 thunks_at += 4;
             }
-            thunks_at += 4; // 終わりの 0
+            thunks_at += 4; // 終わりの0
         }
-        // optional header: NumberOfRvaAndSizes と import 表のディレクトリ。
+        // optional header: NumberOfRvaAndSizesとimport表のディレクトリ。
         let opt = 0x40 + 24;
         b[opt + NUMBER_OF_RVA_AND_SIZES..opt + NUMBER_OF_RVA_AND_SIZES + 4]
             .copy_from_slice(&16u32.to_le_bytes());
@@ -294,7 +294,7 @@ mod tests {
         ImportName::Name(s.to_string())
     }
 
-    /// 持っている (DLL, 関数) の表から答える偽物。DLL の名前は大文字小文字を区別しない。
+    /// 持っている (DLL, 関数)の表から答える偽物。DLLの名前は大文字小文字を区別しない。
     struct Table {
         have: HashMap<String, Vec<String>>,
         failing: Vec<(String, ErrorCode)>,
@@ -378,14 +378,14 @@ mod tests {
     #[test]
     fn a_broken_table_is_reported_not_guessed() {
         let mut b = sample();
-        // import 表をどの節にも入らない場所へ向ける。
+        // import表をどの節にも入らない場所へ向ける。
         let opt = 0x40 + 24;
         b[opt + IMPORT_DIRECTORY..opt + IMPORT_DIRECTORY + 4]
             .copy_from_slice(&0x0090_0000u32.to_le_bytes());
         assert_eq!(read_imports(&b), Err("import 表がファイルの外を指している"));
         assert!(read_imports(&b[..0x30]).is_err());
         assert!(read_imports(b"not a pe").is_err());
-        // 記述子の列が終わらないまま切れても、止まって失敗を返す。
+        // 記述子の列が終わらないまま切れても止まって失敗を返す。
         let mut cut = sample();
         cut.truncate(TEXT_FILE_OFFSET + 0x108);
         assert!(read_imports(&cut).is_err());

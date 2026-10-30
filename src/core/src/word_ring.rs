@@ -1,16 +1,19 @@
-//! マッチのワードの置き場（apply_frame を印にした固定長のリング）と、INPUT の受理のウィンドウ。`lockstep.rs` と `rollback.rs` が使う。
+//! マッチのワードの置き場（apply_frameをタグにした固定長のリング）とINPUTの受理のウィンドウ。
+//! `lockstep.rs`と`rollback.rs`が使う。
 //!
-//! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を使わない。印が合わない枠は「無い」と読むので、
-//! 古いワードが残っていても取り違えない。
+//! ゲームスレッドで呼ぶのでヒープを使わない。パニックしうる添字も使わない。
+//! タグが合わない枠は「無い」と読む。
+//! そのため古いワードが残っていても取り違えない。
 
-/// ワードのリングの枠の数。未確認のワードは delay 方式で ≤ 30 ワード・rollback で D＋R（≤ 9＋16）程度なので、
-/// 128 あれば溢れない（受理のウィンドウ ±64 ＋ 32 ワードより広い）。
+/// ワードのリングの枠の数。
+/// 未確認のワードはdelay方式で ≤ 30ワード・rollbackでD＋R（≤ 9＋16）程度なので、128あれば溢れない。
+/// この枠の数は受理のウィンドウ ±64 ＋ 32ワードより広い。
 pub(crate) const RING: usize = 128;
 
 /// 受理のウィンドウの半幅（`e − 64 ≤ base ≤ e + 64`）。
 pub(crate) const WINDOW: u32 = 64;
 
-/// リングの空き枠の印。apply_frame は u32 で折り返しを考えないので、この値には届かない。
+/// リングの空き枠の印。apply_frameはu32で折り返しを考えないので、この値には届かない。
 const EMPTY: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +31,7 @@ impl Ring {
     }
 
     fn slot(x: u32) -> usize {
-        // RING は定数なので、添字は必ず 0..RING に収まる（パニックしない）。
+        // RINGは定数なので、添字は必ず0..RINGに収まる（パニックしない）。
         (x as usize) % RING
     }
 
@@ -55,7 +58,7 @@ impl Ring {
     }
 }
 
-/// `base` が受理のウィンドウ（次に要る apply_frame `e` の ±`WINDOW`）の中か。
+/// `base`が受理のウィンドウ（次に要るapply_frame `e`の ±`WINDOW`）の中かどうか。
 pub(crate) fn in_window(base: u32, e: u32) -> bool {
     base >= e.saturating_sub(WINDOW) && base <= e.saturating_add(WINDOW)
 }

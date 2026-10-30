@@ -1,8 +1,9 @@
-//! 花映塚が動いている間は、もう 1 つ起動しない。
-//! 起動の前に、花映塚の二重起動の印（`GAME_MUTEX`。素の起動・vpatch・普段の HiganRTool の起動が作る）があれば断る。
-//! 台本などの開発用の起動は印を名前なしにする（`launch::ISOLATED_INSTANCE`）ので、プロセスの一覧から同じパスの th09.exe も探す。別のフォルダのコピーは、印が無ければ断らない。
-//! 2 つのローダーがほぼ同時に走ると互いの th09.exe がまだ一覧に無い瞬間があるので、確認から起動の終わりまでを、ゲームのパスから決めた名前のミューテックスで 1 つずつにする（取れなかったときも断る）。
-//! 一覧もミューテックスも取れなければ、断らずに起動する（起動できなくなるより多重起動の方がまし）。unsafe は無い（Win32 は `Host` トレイト越し）。
+//! 花映塚が動いている間はもう1つ起動しない。
+//! 起動の前に花映塚の二重起動の印（`GAME_MUTEX`。素の起動・vpatch・普段のHiganRToolの起動が作る）があれば断る。
+//! 台本などの開発用の起動は印を名前なしにする（`launch::ISOLATED_INSTANCE`）のでプロセスの一覧から同じパスのth09.exeも探す。別のフォルダのコピーは印が無ければ断らない。
+//! 2つのローダーがほぼ同時に走ると互いのth09.exeがまだ一覧に無い瞬間がある。
+//! そのため確認から起動の終わりまでを、ゲームのパスから決まる名前のミューテックスで1つずつにする（取れなかったときも断る）。
+//! 一覧もミューテックスも取れなければ断らずに起動する（起動できなくなるより多重起動の方がまし）。unsafeは無い（Win32は`Host`トレイト越し）。
 
 use std::path::Path;
 
@@ -21,28 +22,28 @@ pub enum Lock {
 }
 
 pub trait Host {
-    /// 待たずに取る。前の持ち主が持ったまま終わっていた場合も取れたこととする。
+    /// 待たずに取る。前の所有者が持ったまま終わっていた場合も取れたこととする。
     fn lock(&mut self, name: &str) -> Lock;
     fn unlock(&mut self, token: usize);
     /// 全プロセスの (pid, 実行ファイル名)。
     fn processes(&mut self) -> Result<Vec<(u32, String)>, ErrorCode>;
-    /// 権限などで開けなければ None。
+    /// 権限などで開けなければNone。
     fn image_path(&mut self, pid: u32) -> Option<String>;
-    /// 名前つきのミューテックスが今あるか（開くだけで、作らない）。
+    /// 名前つきのミューテックスが今あるかどうか（開くだけで作らない）。
     fn mutex_exists(&mut self, name: &str) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// 同じパスの th09.exe が動いている。
+    /// 同じパスのth09.exeが動いている。
     Running(u32),
-    /// 別のローダーが同じパスの th09.exe を起動している途中。
+    /// 別のローダーが同じパスのth09.exeを起動している途中。
     Starting,
     /// 花映塚（か永夜抄）の二重起動の印がある。
     Marker,
 }
 
-/// 取っているミューテックス（取れなかったときは None）。`leave` で放す。
+/// 取っているミューテックス（取れなかったときはNone）。`leave`で放す。
 #[derive(Debug, PartialEq, Eq)]
 pub struct Held(Option<usize>);
 
@@ -51,19 +52,20 @@ pub const ALREADY_RUNNING: Tx = Tx {
     en: "Touhou 9 is already running.",
 };
 
-/// 確認する起動か。`--second` と台本の起動（`--script`）は開発用で、同じ花映塚を続けて起動するので確認しない。
+/// 確認する起動かどうか。`--second`と台本の起動（`--script`）は開発用で、同じ花映塚を続けて起動するので確認しない。
 pub fn is_checked(second: bool, script: Option<&Path>) -> bool {
     !second && script.is_none()
 }
 
-/// 起動する花映塚の二重起動の印を名前なしにする（使っている人の花映塚と独立させる）起動か。開発用の起動（`--second`・
-/// `--script`・`--background`）だけ。普段の起動は印の名前を残す（thprac がこの名前で花映塚を見つけ、素の花映塚の二重起動も止まる）。
+/// 起動する花映塚の二重起動の印を名前なしにする（使っている人の花映塚と独立させる）起動かどうか。
+/// 開発用の起動（`--second`・`--script`・`--background`）だけがそうなる。
+/// 普段の起動は印の名前を残す（thpracがこの名前で花映塚を見つけ、素の花映塚の二重起動も止まる）。
 pub fn is_isolated(second: bool, script: Option<&Path>, background: bool) -> bool {
     !is_checked(second, script) || background
 }
 
-/// `game` は絶対パス。`log` は段階ログへ書く関数。
-/// `check_marker` は花映塚の二重起動の印を見るか（印を名前なしにする開発用の起動は、使っている人の花映塚の印で断らないよう見ない）。
+/// `game`は絶対パス。`log`は段階ログへ書く関数。
+/// `check_marker`は花映塚の二重起動の印を見るかどうか（印を名前なしにする開発用の起動は使っている人の花映塚の印で断らないよう見ない）。
 pub fn enter<H: Host>(
     h: &mut H,
     game: &Path,
@@ -126,7 +128,7 @@ pub fn enter<H: Host>(
     Ok(Held(held))
 }
 
-/// 起動が終わったら（成功も失敗も）呼ぶ。起動した th09.exe はもう一覧に載っているので、次のローダーには見える。
+/// 起動が終わったら（成功も失敗も）呼ぶ。起動したth09.exeはもう一覧に載っているので、次のローダーには見える。
 pub fn leave<H: Host>(h: &mut H, held: Held) {
     if let Some(t) = held.0 {
         h.unlock(t);

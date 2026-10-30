@@ -13,8 +13,8 @@ rem
 rem Steps: cargo build --release, cargo test, peer_sim's and the DLL's --ignored
 rem real-time tests, copy + rename the outputs to build\bin, then check with objdump
 rem that the DLL and the EXE are pei-i386 (th09.exe is 32-bit; a 64-bit DLL
-rem cannot be loaded into it).
-rem The target triple and static CRT come from .cargo\config.toml.
+rem cannot be loaded into it) and carry DYNAMIC_BASE, NX_COMPAT and GUARD_CF.
+rem The target triple, static CRT and hardening flags come from .cargo\config.toml.
 rem rustc finds the MSVC linker (VS Build Tools) by itself; no vcvars32 needed.
 rem
 rem Usage:  cmd /c build.bat [/skip-unit] [/skip-realtime]
@@ -101,7 +101,7 @@ call :copyout "%RELDIR%\higanrtool.dll" "%OUT%\HiganRTool.dll" || exit /b 1
 call :copyout "%RELDIR%\higanrtool_loader.exe" "%OUT%\HiganRTool.exe" || exit /b 1
 call :copyout "%RELDIR%\peer_sim.exe" "%OUT%\peer_sim.exe" || exit /b 1
 
-echo === 4/4 verify: pei-i386 ===
+echo === 4/4 verify: pei-i386 and hardening flags ===
 if not exist "%OBJDUMP%" (
     echo [build.bat] objdump.exe not found: "%OBJDUMP%"
     exit /b 1
@@ -134,5 +134,16 @@ if errorlevel 1 (
     exit /b 1
 )
 findstr /c:"file format" "%TEMP%\higanrtool_objdump_check.txt"
+del "%TEMP%\higanrtool_objdump_check.txt" >nul 2>nul
+"%OBJDUMP%" -p "%~1" > "%TEMP%\higanrtool_objdump_check.txt"
+for %%F in (DYNAMIC_BASE NX_COMPAT GUARD_CF) do (
+    findstr /c:"%%F" "%TEMP%\higanrtool_objdump_check.txt" >nul
+    if errorlevel 1 (
+        echo [build.bat] missing %%F: "%~1"
+        del "%TEMP%\higanrtool_objdump_check.txt" >nul 2>nul
+        exit /b 1
+    )
+)
+echo     DYNAMIC_BASE NX_COMPAT GUARD_CF: "%~1"
 del "%TEMP%\higanrtool_objdump_check.txt" >nul 2>nul
 exit /b 0

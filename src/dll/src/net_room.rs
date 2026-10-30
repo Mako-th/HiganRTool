@@ -1,12 +1,20 @@
-//! ルームサーバーのクライアントの運び: 受信だけの専用スレッド `higanr-room` と、見張りのスレッドから呼ぶ入口（ルームの [`RoomConn`]・ランダム対戦の待ち列の [`QueueConn`]。どちらも [`Conn`] で、回す手順の機械だけが違う）。
+//! ルームサーバーのクライアントの通信部分。受信だけの専用スレッド`higanr-room`と、監視のスレッドから呼ぶ入口を持つ。
+//! 入口はルーム用の[`RoomConn`]とランダム対戦の待ち列用の[`QueueConn`]。どちらも[`Conn`]で、動かすステートマシンだけが違う。
 //!
-//! - **受信スレッド**（`higanr-room`）: 接続 → Upgrade → 受信を繰り返し、届いたものを channel で積むだけ。止まってよいのはこのスレッドだけ（名前の解決・TCP・TLS・HTTP の往復・届くまでの受信）。
-//! - **見張りのスレッド**（呼び手。`net_code_game` の `GameWatcher`）: [`RoomConn::poll`] で channel を取り出し、core の `room::RoomClient` を回し、送る文（offer / answer / 30 秒ごとの ping）を送り、出来事を返す。止まらない（送りは小さな文を、サーバーへの TCP の送信側へ渡すだけ。閉じる途中なら送らずに戻る）。
-//! - **閉じるスレッド**（`higanr-room-close`。終わりのときに 1 本だけ、短く）: `WinHttpWebSocketClose` を呼ぶ。止まっている受信はそれでその場で戻る（12017）。`close` 自身は相手が閉じ返さなければ閉じる待ち（[`CLOSE_WAIT_MS`]）まで止まるので見張りから外した。
+//! - **受信スレッド**（`higanr-room`）: 接続・Upgrade・受信を繰り返し、届いたものをchannelに積むだけ。ブロックしてよいのはこのスレッドだけ（名前解決・TCP・TLS・HTTPの往復・受信待ち）。
+//! - **監視のスレッド**（呼び出し側。`net_code_game`の`GameWatcher`）: [`RoomConn::poll`]でchannelから取り出し、coreの`room::RoomClient`を動かす。
+//!   送る文（offer / answer / 30秒ごとのping）を送り、イベントを返す。
+//!   ブロックしない（送信は小さな文をサーバーへのTCPの送信側へ渡すだけ。閉じる途中なら送らずに戻る）。
+//! - **閉じるスレッド**（`higanr-room-close`。終了時に1本だけ短く動く）: `WinHttpWebSocketClose`を呼ぶ。
+//!   ブロック中の受信はそれでその場で戻る（12017）。
+//!   `close`自身は相手が閉じ返さないと待ち時間（[`CLOSE_WAIT_MS`]）までブロックするので監視のスレッドから外した。
 //!   別のスレッドからハンドルを閉じて受信を解く形は採らない（`room_win.rs`）。
-//! - ゲームのスレッドからは何も呼ばない（確保・ブロッキング I/O がある）。遅延の増分はマッチの中で 0（P2P の接続前に WebSocket はサーバー側が閉じている）。
-//! - 手順の判断（何をいつ送るか・届いた文の意味・期限・ping・pong が来ないこと）は全部 core の `room.rs`（待ち列は `room_queue.rs`）。ここは「届いたものを順に渡す」「返ってきた送る文を送る」「終わったら閉じる」だけを持つ。
-//!   core の `room::Role` は [`code_side`] で `net_config::CodeSide` へコピーする（host / guest の語は使わない）。
+//! - ゲームのスレッドからは何も呼ばない（メモリ確保とブロッキングI/Oがある）。
+//!   マッチ中の遅延の増分は0。対戦のルームの接続は成立後も試合の間保つが、監視のスレッドが30秒ごとにpingを送るだけで、対戦のパケットとは別の接続。
+//! - 手順の判断は全部coreの`room.rs`（待ち列は`room_queue.rs`）にある。
+//!   判断とは何をいつ送るか・届いた文の意味・期限・ping・pongが来ないこと。
+//!   ここが持つのは「届いたものを順に渡す」「返ってきた送る文を送る」「終わったら閉じる」だけ。
+//!   coreの`room::Role`は[`code_side`]で`net_config::CodeSide`へコピーする（host / guestの語は使わない）。
 #![forbid(unsafe_code)]
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -17,8 +25,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use higanr_core::room::{
-    Action, CLIENT_ID_BYTES, Event, MESSAGE_MAX_BYTES, Now, Role, RoomClient, RoomName, State,
-    SubmitError,
+    Action, CLIENT_ID_BYTES, Event, MESSAGE_MAX_BYTES, Now, Role, RoomClient, RoomName, SeatTicket,
+    State, SubmitError,
 };
 use higanr_core::room_queue::{QueueAction, QueueClient, QueueEvent, random_path};
 use higanr_core::watch_list::{
@@ -30,19 +38,20 @@ use crate::net_config::CodeSide;
 use crate::net_win::os_random;
 use crate::room_win::{Endpoint, OpenError, Proxy, Received, Step, Timeouts, WebSocket};
 
-/// Upgrade までの各段階（名前の解決・TCP の接続・送り・101 の先頭）の待ちの上限。core の `ROOM_GREETING_TIMEOUT_MS` と同じ
-/// 10 秒（人がメニューの前で待てる長さ）。
+/// Upgradeまでの各段階（名前解決・TCPの接続・送信・101の先頭）の待ち時間の上限。
+/// coreの`ROOM_GREETING_TIMEOUT_MS`と同じ10秒（人がメニューの前で待てる長さ）。
 pub const OPEN_TIMEOUT_MS: u32 = 10_000;
 
-// Upgrade の後の受信には上限を設けない（設けられない）: `WINHTTP_OPTION_RECEIVE_TIMEOUT` は WebSocket の受信に効かない
-// （loopback で測った。検査 `winhttp_facts_receive_timeout_*`）。生きているかは core の ping / pong（`room::PONG_TIMEOUT_MS`）が見て、
-// 終わりは閉じるスレッドの `close` が受信を解く。
+// Upgradeの後の受信には上限を設けない（設けられない）。
+// `WINHTTP_OPTION_RECEIVE_TIMEOUT`はWebSocketの受信に効かない（loopbackで測った。検査`winhttp_facts_receive_timeout_*`）。
+// 生きているかどうかはcoreのping / pong（`room::PONG_TIMEOUT_MS`）が見る。
+// 終了時は閉じるスレッドの`close`が受信を解く。
 
-/// 閉じるとき、相手の閉じ返しを待つ上限（`WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`。単位は ms と測った）。
-/// 閉じるスレッドだけがこの間止まる。閉じ返しはサーバーの中の往復だけなので 2 秒で足りる。
+/// 閉じるとき、相手の閉じ返しを待つ上限（`WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT`。単位はmsと測った）。
+/// 閉じるスレッドだけがこの間ブロックする。閉じ返しはサーバー内の往復だけなので2秒で足りる。
 pub const CLOSE_WAIT_MS: u32 = 2_000;
 
-/// こちらから閉じるときの番号（RFC 6455 の 1000 = 正常に終えた。取りやめ・失敗でも同じ）。
+/// こちらから閉じるときの番号（RFC 6455の 1000 = 正常に終えた。取りやめ・失敗でも同じ）。
 const CLOSE_NORMAL: u16 = 1000;
 
 pub fn product_timeouts() -> Timeouts {
@@ -55,8 +64,9 @@ pub fn product_timeouts() -> Timeouts {
     }
 }
 
-/// この起動の乱数（入室の要求の問い `cid`）。起動ごとに 1 回だけ引く: 入り直しが同じ値を送ることで、サーバーが前の入室
-/// （こちらには届かなかったもの）を 3 人目扱いにせず置き換える。引けなければ付けない（サーバーは古いクライアントと同じに扱う）。
+/// この起動の乱数（入室の要求のクエリ`cid`）。起動ごとに1回だけ生成する。
+/// 入り直しが同じ値を送ることで、サーバーは前の入室（こちらには届かなかったもの）を3人目扱いにせず置き換える。
+/// 生成できなければ付けない（サーバーは古いクライアントと同じに扱う）。
 fn client_id() -> Option<[u8; CLIENT_ID_BYTES]> {
     static ID: OnceLock<Option<[u8; CLIENT_ID_BYTES]>> = OnceLock::new();
     *ID.get_or_init(|| {
@@ -72,7 +82,7 @@ pub fn code_side(role: Role) -> CodeSide {
     }
 }
 
-// ---------------- サーバーの宿（設定の値） ----------------
+// ---------------- サーバーのホスト名（設定の値） ----------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
@@ -83,18 +93,18 @@ pub struct Base {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseError {
-    /// `ws://` か `wss://` で始まらない。
+    /// `ws://`か`wss://`で始まらない。
     Scheme,
-    /// 宿の名が空・使えない文字（英数字・`-`・`.` の外。IPv6 の `[...]` も読まない）。
+    /// ホスト名が空または使えない文字を含む（英数字・`-`・`.`以外。IPv6の`[...]`も読まない）。
     Host,
-    /// 番号が数でない・0・65535 を越える。
+    /// ポート番号が数でない・0・65535を越える。
     Port,
-    /// パス・問い・断片が付いている（パスはルーム名から作る）。末尾の `/` だけは許す。
+    /// パス・クエリ・フラグメントが付いている（パスはルーム名から作る）。末尾の`/`だけは許す。
     Path,
 }
 
 impl Base {
-    /// `ws://宿[:番号][/]` か `wss://宿[:番号][/]`。番号が無ければ 80 / 443。スキームの大文字小文字は問わない。
+    /// `ws://宿[:番号][/]`か`wss://宿[:番号][/]`。番号が無ければ80 / 443。スキームの大文字小文字は問わない。
     pub fn parse(s: &str) -> Result<Base, BaseError> {
         let lower = s.get(..6).map(str::to_ascii_lowercase);
         let (secure, rest) = if lower.as_deref() == Some("wss://") {
@@ -145,18 +155,18 @@ impl Base {
     }
 }
 
-// ---------------- 受信スレッドと見張りの受け渡し ----------------
+// ---------------- 受信スレッドと監視のスレッドの受け渡し ----------------
 
 #[derive(Debug)]
 enum Incoming {
-    /// 101 を受けた（WebSocket は `Shared::ws` に格納した）。
+    /// 101を受けた（WebSocketは`Shared::ws`に格納した）。
     Upgraded,
-    /// 101 でない応答。
+    /// 101でない応答。
     Refused {
         status: u16,
         body: String,
     },
-    /// 接続できなかった（WinHTTP の段階と番号）。
+    /// 接続できなかった（WinHTTPの段階と番号）。
     OpenFailed {
         step: Step,
         code: u32,
@@ -164,25 +174,26 @@ enum Incoming {
     Text(String),
     /// バイナリの文（サーバーは送らない）。
     Binary,
-    /// 相手の close（番号。無ければ 1005）。
+    /// 相手のclose（番号。無ければ1005）。
     Closed(u16),
-    /// 受信の誤り（WinHTTP の番号）。
+    /// 受信の誤り（WinHTTPの番号）。
     RecvError(u32),
 }
 
 struct Shared {
     ws: Mutex<Option<Arc<WebSocket>>>,
-    /// 送りの向き（`send_text` / `close`）を 1 本に絞るロック。WinHTTP の WebSocket は送り 1 本と受け 1 本までなので、見張りの送りと
-    /// 閉じるスレッド・受信スレッドの `close` を重ねない。見張りは `try_lock` で取り、取れなければ（閉じる途中）送らない。
+    /// 送信側の呼び出し（`send_text` / `close`）を1本に絞るロック。
+    /// WinHTTPのWebSocketは送信1本と受信1本までなので、監視のスレッドの送信と閉じるスレッド・受信スレッドの`close`を重ねない。
+    /// 監視のスレッドは`try_lock`で取り、取れなければ（閉じる途中なら）送らない。
     send_lock: Mutex<()>,
-    /// `close` を 1 回だけ呼ぶための印（受信スレッドが相手の close に答えるのと、閉じるスレッドが閉じるのとが重なるため）。
+    /// `close`を1回だけ呼ぶためのフラグ。受信スレッドが相手のcloseに答える処理と閉じるスレッドが閉じる処理とが重なるため。
     closing: AtomicBool,
-    /// 見張りが終えた（取りやめ・手順の終わり）。Upgrade の前なら、受信スレッドは接続した直後に自分で閉じる。
+    /// 監視のスレッドが終えた（取りやめ・手順の終わり）。Upgradeの前なら受信スレッドは接続した直後に自分で閉じる。
     ended: AtomicBool,
 }
 
 impl Shared {
-    /// `close` を 1 回だけ呼ぶ。待ちうる（[`CLOSE_WAIT_MS`]）ので受信スレッドか閉じるスレッドからだけ呼ぶ。
+    /// `close`を1回だけ呼ぶ。[`CLOSE_WAIT_MS`]までブロックすることがあるので受信スレッドか閉じるスレッドからだけ呼ぶ。
     fn close_once(&self, ws: &WebSocket) {
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
@@ -192,7 +203,7 @@ impl Shared {
     }
 }
 
-/// close の待ちの上限を設定できなかったこと（Wine など）を、接続ごとでなく起動ごとに 1 回だけ本ログへ出す。
+/// closeの待ち時間の上限を設定できなかったこと（Wineなど）を接続ごとでなく起動ごとに1回だけ本ログへ出す。
 fn log_close_timeout_once(code: u32) {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::AcqRel) {
@@ -210,7 +221,7 @@ fn recv_main(
     tx: Sender<Incoming>,
     max: usize,
 ) {
-    // 101 でない本文は 1 通の上限 + 1 バイトまで読む（越えたことを core が「サーバーの JSON でない」と読めるように）。
+    // 101でない本文は1通の上限 + 1バイトまで読む（越えたことをcoreが「サーバーのJSONでない」と読めるように）。
     let ws = match WebSocket::open(&ep, proxy, t, MESSAGE_MAX_BYTES + 1) {
         Ok(ws) => Arc::new(ws),
         Err(OpenError::Refused { status, body }) => {
@@ -226,7 +237,7 @@ fn recv_main(
         log_close_timeout_once(code);
     }
     *shared.ws.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&ws));
-    // 見張りが先に終えていた（接続する途中の取りやめ）か、もう見張りがいない: 閉じて終わる。
+    // 監視のスレッドが先に終えていた（接続の途中で取りやめた）か、もう監視のスレッドがいない場合は閉じて終わる。
     if shared.ended.load(Ordering::Acquire) || tx.send(Incoming::Upgraded).is_err() {
         shared.close_once(&ws);
         return;
@@ -244,7 +255,7 @@ fn recv_main(
             }
             Ok(Received::Close) => {
                 let _ = tx.send(Incoming::Closed(ws.close_status()));
-                // 相手の close に閉じ返す（こちらが先に閉じていれば何もしない）。
+                // 相手のcloseに閉じ返す（こちらが先に閉じていれば何もしない）。
                 shared.close_once(&ws);
                 return;
             }
@@ -256,7 +267,7 @@ fn recv_main(
     }
 }
 
-// ---------------- 見張りの入口 ----------------
+// ---------------- 監視のスレッドの入口 ----------------
 
 #[derive(Debug, Clone)]
 pub struct RoomOptions {
@@ -277,9 +288,9 @@ impl RoomOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitRefused {
-    /// core が断った（番でない・文字が悪い）。状態は変わらない。
+    /// coreが断った（いまはコードを受け付けられない状態・文字が悪い）。状態は変わらない。
     Core(SubmitError),
-    /// 送れなかった（接続が切れた・閉じる途中）。失敗の出来事は次の `poll` で返る。
+    /// 送れなかった（接続が切れた・閉じる途中）。失敗のイベントは次の`poll`で返る。
     NotSent,
 }
 
@@ -291,7 +302,7 @@ pub enum TransportNote {
     Binary,
 }
 
-/// 運びが手順の機械（core の `RoomClient`・`QueueClient`）を回すための入口。機械が返す送る文と出来事を [`Act`] に揃える。
+/// 通信部分が手順のステートマシン（coreの`RoomClient`・`QueueClient`）を動かすための入口。ステートマシンが返す送る文とイベントを[`Act`]に揃える。
 pub trait Machine {
     type Event;
     fn on_upgraded(&mut self, now: Now) -> Vec<Act<Self::Event>>;
@@ -302,13 +313,13 @@ pub trait Machine {
     fn poll(&mut self, now: Now) -> Vec<Act<Self::Event>>;
     fn is_finished(&self) -> bool;
     fn next_wake(&self) -> Option<u64>;
-    /// 受けられる 1 通の大きさの上限（バイト）。一覧の全体の文は、ルームの文より大きい。
+    /// 受けられる1通の大きさの上限（バイト）。一覧の全体の文はルームの文より大きい。
     fn message_max(&self) -> usize {
         MESSAGE_MAX_BYTES
     }
 }
 
-/// 機械が返す 1 つの仕事: 文を送る・出来事を上（呼び手の見張り）へ渡す。
+/// ステートマシンが返す1つの仕事。文を送る、またはイベントを上（呼び出し側の監視のスレッド）へ渡す。
 pub enum Act<E> {
     Send(String),
     Notify(E),
@@ -465,9 +476,10 @@ impl Machine for ViewClient {
     }
 }
 
-/// ルームサーバーとの 1 回の手順（接続する → ルームに入る → コードを渡し合う → 閉じる）。見張りのスレッドが持ち、
-/// [`Conn::poll`] を [`Conn::next_poll_in`] より短い間隔で呼ぶ。手放す（`Drop`）と閉じ始める（待たない）。
-/// 手順の機械 `M` がルーム（[`RoomConn`]）とランダム対戦の待ち列（[`QueueConn`]）で違うだけで、運びは同じ。
+/// ルームサーバーとの1回の手順（接続する → ルームに入る → コードを渡し合う → 閉じる）。
+/// 監視のスレッドが持ち、[`Conn::poll`]を[`Conn::next_poll_in`]より短い間隔で呼ぶ。
+/// 手放す（`Drop`）と閉じ始める（待たない）。
+/// 手順のステートマシン`M`がルーム（[`RoomConn`]）とランダム対戦の待ち列（[`QueueConn`]）で違うだけで、通信部分は同じ。
 pub struct Conn<M: Machine> {
     client: M,
     rx: Receiver<Incoming>,
@@ -478,9 +490,9 @@ pub struct Conn<M: Machine> {
     t0: Instant,
     cancelled: bool,
     notes: Vec<TransportNote>,
-    /// `submit_code` の中で起きた出来事（送れなかった失敗）。次の `poll` の始まりで返す。
+    /// `submit_code`の中で起きたイベント（送れなかった失敗）。次の`poll`の始まりで返す。
     pending: Vec<M::Event>,
-    /// 検査だけ: 以後の送りを WinHTTP の送りの失敗と同じに扱う。
+    /// 検査だけ: 以後の送信をWinHTTPの送信の失敗と同じに扱う。
     #[cfg(test)]
     fail_sends: bool,
 }
@@ -495,17 +507,38 @@ pub type HostListConn = Conn<HostClient>;
 pub type ViewListConn = Conn<ViewClient>;
 
 impl Conn<RoomClient> {
-    /// 受信スレッドを作って接続し始める（待たない）。スレッドを作れなければ誤りの文。
+    /// 受信スレッドを作って接続し始める（待たない）。スレッドを作れなければエラーの文を返す。
+    /// 対戦のルームは成立後も接続を保つ（[`State::Holding`]。手放すまでサーバーがルーム名を使用中にする）。
     pub fn start(opts: &RoomOptions, room: &RoomName) -> Result<RoomConn, String> {
         let path = match client_id() {
             Some(id) => room.path_with_client(&id),
             None => room.path(),
         };
-        Conn::start_at(opts, path, RoomClient::new())
+        Conn::start_at(opts, path, RoomClient::for_room(room))
     }
 
-    /// 自分のコードを渡す（始める側は `Joined` の後、返す側は `PeerCode` の後）。`Ok` は「文を WebSocket へ渡し終えた」。
-    /// 返す側はこの `Ok` の時点で P2P を始めてよい（サーバーの 1000 を待たない）。
+    /// 観戦用のルーム`room`のhostの席を取りに入る（配信する側・観戦の断り）。
+    /// サーバーは`room`について正しく期限内のチケットを持つ接続にだけhostの席を渡す（チケットは対戦の成立で受けたもの。元のルーム名は送らない）。
+    pub fn start_as_host(
+        opts: &RoomOptions,
+        room: &RoomName,
+        ticket: &SeatTicket,
+    ) -> Result<RoomConn, String> {
+        let id = client_id();
+        Conn::start_at(
+            opts,
+            room.path_with_ticket(id.as_ref(), ticket),
+            RoomClient::new(),
+        )
+    }
+
+    /// この入室で受け取った席のチケット（対戦のルームで成立したとき）。古いサーバーや鍵の無いサーバーでは無い。
+    pub fn ticket(&self) -> Option<SeatTicket> {
+        self.client.ticket()
+    }
+
+    /// 自分のコードを渡す（始める側は`Joined`の後。返す側は`PeerCode`の後）。`Ok`は「文をWebSocketへ渡し終えた」こと。
+    /// 返す側はこの`Ok`の時点でP2Pを始めてよい（サーバーの1000を待たない）。
     pub fn submit_code(&mut self, code: &str) -> Result<(), SubmitRefused> {
         if self.cancelled {
             return Err(SubmitRefused::NotSent);
@@ -514,7 +547,7 @@ impl Conn<RoomClient> {
         self.send_acts(acts)
     }
 
-    /// 観戦を断る（観戦用のルームの始める側が `Joined` の後、`offer` の代わりに）。以後ルームの期限まで残る。
+    /// 観戦を断る（観戦用のルームの始める側が`Joined`の後に`offer`の代わりに送る）。以後ルームの期限まで残る。
     pub fn refuse(&mut self) -> Result<(), SubmitRefused> {
         if self.cancelled {
             return Err(SubmitRefused::NotSent);
@@ -527,8 +560,8 @@ impl Conn<RoomClient> {
         let acts = acts_of_room(acts);
         let mut out = Vec::new();
         let sent = self.run(acts, &mut out);
-        // 送れなかったときに `run` が積んだ失敗の出来事は、core が終わった後の `poll` からは出てこないので、持っておいて
-        // 次の `poll` の始まりで返す（閉じる途中なら、番号の方が次の `poll` で失敗を返す）。
+        // 送れなかったときに`run`が積んだ失敗のイベントは、coreが終わった後の`poll`からは出てこない。
+        // そのため保持しておき、次の`poll`の始まりで返す（閉じる途中なら、閉じた番号の方が次の`poll`で失敗を返す）。
         self.pending.extend(out);
         if self.client.is_finished() {
             self.begin_close();
@@ -546,8 +579,8 @@ impl Conn<RoomClient> {
 }
 
 impl Conn<QueueClient> {
-    /// ランダム対戦の待ち列へ接続し始める（待たない）。`build` は `update::BUILD_NUMBER`（同じビルドの人どうしだけが組になる）。
-    /// 組になると [`QueueEvent::Paired`] で割り当てのルーム名が届き、手順はそこで終わる（ルームへは [`RoomConn::start`] で入り直す）。
+    /// ランダム対戦の待ち列へ接続し始める（待たない）。`build`は`update::BUILD_NUMBER`（同じビルドの人どうしだけがペアになる）。
+    /// ペアになると[`QueueEvent::Paired`]で割り当てられたルーム名が届き、手順はそこで終わる。ルームへは[`RoomConn::start`]で入り直す。
     pub fn start_queue(opts: &RoomOptions, build: u32) -> Result<QueueConn, String> {
         let id = client_id();
         let path = random_path(build, id.as_ref());
@@ -556,7 +589,7 @@ impl Conn<QueueClient> {
 }
 
 impl Conn<HostClient> {
-    /// 一覧の載せるエンドポイントへ接続し始める（待たない）。接続したら `posting` を送り、`HostEvent::Listed` で載ったと分かる。
+    /// 一覧へ掲載するエンドポイントへ接続し始める（待たない）。接続したら`posting`を送る。一覧に載ったことは`HostEvent::Listed`で分かる。
     pub fn start_post(
         opts: &RoomOptions,
         build: u32,
@@ -570,7 +603,7 @@ impl Conn<HostClient> {
         )
     }
 
-    /// 観戦者の数が変わった。載っていれば `count` を送る（載る前なら、載った直後に送る）。送れなかった失敗は次の `poll` で返る。
+    /// 観戦者の数が変わった。一覧に載っていれば`count`を送る（載る前なら載った直後に送る）。送れなかった失敗は次の`poll`で返る。
     pub fn set_watchers(&mut self, n: u8) {
         if self.cancelled {
             return;
@@ -583,7 +616,7 @@ impl Conn<HostClient> {
 }
 
 impl Conn<ViewClient> {
-    /// 一覧の見るエンドポイントへ接続し始める（待たない）。一覧は `ViewEvent::List` で全体が届く。
+    /// 一覧を閲覧するエンドポイントへ接続し始める（待たない）。一覧の全体は`ViewEvent::List`で届く。
     pub fn start_view(opts: &RoomOptions, build: u32) -> Result<ViewListConn, String> {
         Conn::start_at(opts, watch_view_path(build), ViewClient::new())
     }
@@ -605,7 +638,7 @@ impl<M: Machine> Conn<M> {
         let recv = std::thread::Builder::new()
             .name("higanr-room".into())
             .spawn(move || {
-                // パニックは受けて外へ出さない。受けたら channel が切れ、見張りは「切れた」と読む。
+                // パニックはここで受けて外へ出さない。受けるとchannelが切れ、監視のスレッドは「切れた」と読む。
                 let _ = catch_unwind(AssertUnwindSafe(|| recv_main(ep, proxy, t, sh, tx, max)));
             })
             .map_err(|e| format!("ルームの受信スレッドの作成不能: {e}"))?;
@@ -625,7 +658,7 @@ impl<M: Machine> Conn<M> {
         })
     }
 
-    /// 検査だけ: 以後の送りを失敗させる（upgrade の後に WinHTTP の送りが誤りを返した形）。
+    /// 検査だけ: 以後の送信を失敗させる（upgradeの後にWinHTTPの送信がエラーを返した状態）。
     #[cfg(test)]
     pub fn fail_sends_for_test(&mut self) {
         self.fail_sends = true;
@@ -640,7 +673,7 @@ impl<M: Machine> Conn<M> {
         }
     }
 
-    /// 届いたものを渡し、時計を進め、送る文を送る。起きた出来事を順に返す。止まらない。
+    /// 届いたものを渡して時計を進め、送る文を送る。起きたイベントを順に返す。ブロックしない。
     pub fn poll(&mut self) -> Vec<M::Event> {
         let now = self.now();
         self.poll_at(now)
@@ -656,8 +689,8 @@ impl<M: Machine> Conn<M> {
                 Ok(m) => m,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // 受信スレッドが終わった（閉じる番号・受信の誤りはもう渡した）か、パニックで落ちた。手順の途中なら
-                    // 「切れた」。
+                    // 受信スレッドが終わった（閉じる番号・受信のエラーは渡し済み）か、パニックで終了した。
+                    // 手順の途中なら「切れた」として扱う。
                     let acts = self.client.on_transport_failed();
                     self.run(acts, &mut out);
                     break;
@@ -680,11 +713,11 @@ impl<M: Machine> Conn<M> {
                 }
                 Incoming::Text(text) => self.client.on_text(now, &text),
                 Incoming::Binary => {
-                    // サーバーはバイナリを送らない。来たら途中か相手が壊れているので、切れたと同じ扱い。
+                    // サーバーはバイナリを送らない。来たら途中か相手が壊れているので切れたと同じ扱いにする。
                     self.notes.push(TransportNote::Binary);
                     self.client.on_transport_failed()
                 }
-                // 番号が無ければ 1005 のまま渡す（core は知らない番号として「応答しません」に）。
+                // 番号が無ければ1005のまま渡す（coreは知らない番号として「応答しません」に）。
                 Incoming::Closed(code) => self.client.on_close(code),
                 Incoming::RecvError(code) => {
                     self.notes.push(TransportNote::RecvError(code));
@@ -701,7 +734,7 @@ impl<M: Machine> Conn<M> {
         out
     }
 
-    /// 取りやめる（メニューから・ルーム名を変える）。この後 `poll` は何も返さない。閉じ始めて戻る（待たない）。
+    /// 取りやめる（メニューから操作したときやルーム名を変えたとき）。この後`poll`は何も返さない。閉じ始めて戻る（待たない）。
     pub fn cancel(&mut self) {
         self.cancelled = true;
         self.begin_close();
@@ -711,8 +744,8 @@ impl<M: Machine> Conn<M> {
         self.cancelled || self.client.is_finished()
     }
 
-    /// 次に `poll` を呼ぶべきまでの長さ（ping と期限。届いた文は時刻に関わらずすぐ渡したいので、見張りはこれより
-    /// 短い間隔でも呼んでよい）。
+    /// 次に`poll`を呼ぶべきときまでの長さ（pingと期限）。
+    /// 届いた文は時刻に関わらずすぐ渡したいので、監視のスレッドはこれより短い間隔で呼んでもよい。
     pub fn next_poll_in(&self) -> Option<Duration> {
         let now = self.now().ms;
         self.client
@@ -724,8 +757,8 @@ impl<M: Machine> Conn<M> {
         std::mem::take(&mut self.notes)
     }
 
-    /// 受信スレッド（と閉じるスレッド）が終わるのを `limit` まで待つ。終わったら true。見張りのスレッドでは呼ばない
-    /// （検査と、DLL を閉じるときの片付け用）。
+    /// 受信スレッド（と閉じるスレッド）が終わるのを`limit`まで待つ。終わったらtrue。
+    /// 監視のスレッドでは呼ばない（検査と、DLLを閉じるときの後始末用）。
     pub fn join_within(&mut self, limit: Duration) -> bool {
         let until = Instant::now() + limit;
         for slot in [&mut self.recv, &mut self.closer] {
@@ -750,8 +783,8 @@ impl<M: Machine> Conn<M> {
                 Act::Notify(e) => out.push(e),
                 Act::Send(text) => match self.send(&text) {
                     Sent::Yes => {}
-                    // 相手が先に閉じた。閉じる番号は受信スレッドが channel へ先に積んである（`recv_main` は積んでから閉じ返す）
-                    // ので、ここで「切れた」にせず、次の `poll` で番号の方（期限・相手が抜けた など）で終える。
+                    // 相手が先に閉じた。閉じる番号は受信スレッドが先にchannelへ積んである（`recv_main`は積んでから閉じ返す）。
+                    // そのためここでは「切れた」にせず、次の`poll`で番号の方（期限・相手が抜けた など）で終える。
                     Sent::Closing => all_sent = false,
                     Sent::Failed => {
                         all_sent = false;
@@ -776,7 +809,7 @@ impl<M: Machine> Conn<M> {
         let Some(ws) = self.ws.as_ref() else {
             return Sent::Failed;
         };
-        // 閉じる途中（受信スレッドが相手の close に閉じ返している）なら送らない。待たない。
+        // 閉じる途中（受信スレッドが相手のcloseに閉じ返している）なら送らない。待たない。
         let _g = match self.shared.send_lock.try_lock() {
             Ok(g) => g,
             Err(TryLockError::Poisoned(p)) => p.into_inner(),
@@ -794,7 +827,9 @@ impl<M: Machine> Conn<M> {
         }
     }
 
-    /// 閉じ始める（1 回だけ）。Upgrade の前なら受信スレッドが接続した直後に閉じる。後なら閉じるスレッドを 1 本作る。
+    /// 閉じ始める（1回だけ）。
+    /// Upgradeの前なら受信スレッドが接続した直後に閉じる。
+    /// 後なら閉じるスレッドを1本作る。
     fn begin_close(&mut self) {
         if self.shared.ended.swap(true, Ordering::AcqRel) {
             return;
@@ -825,7 +860,7 @@ impl<M: Machine> Conn<M> {
             && let Ok(_g) = self.shared.send_lock.try_lock()
             && !self.shared.closing.swap(true, Ordering::AcqRel)
         {
-            // スレッドを作れない: 待たない `shutdown` だけ送る（サーバーが閉じ返せば受信スレッドはそれで終わる）。
+            // スレッドを作れない場合は待たない`shutdown`だけ送る（サーバーが閉じ返せば受信スレッドはそれで終わる）。
             let _ = ws.shutdown(CLOSE_NORMAL);
         }
     }
@@ -833,9 +868,9 @@ impl<M: Machine> Conn<M> {
 
 enum Sent {
     Yes,
-    /// 閉じる途中で送らなかった（相手の close の番号が channel にある）。
+    /// 閉じる途中で送らなかった（相手のcloseの番号がchannelにある）。
     Closing,
-    /// 送れなかった（接続していない・WinHTTP の誤り）。
+    /// 送れなかった（接続していない・WinHTTPの誤り）。
     Failed,
 }
 
@@ -847,15 +882,20 @@ impl<M: Machine> Drop for Conn<M> {
 
 #[cfg(test)]
 pub(crate) mod fake {
-    //! loopback の偽のルームサーバー。`src/server/src/index.ts`（入口の断り）と `room.ts`（2 人の役割・offer / peer / matched /
-    //! answer・観戦の断り refuse と 4403・閉じる番号と直前の error の文・期限・片方が抜けたとき）の振る舞いのコピー。値は全部 `tests/fixtures/room/rules.json`
-    //! から読み、自前の定数を持たない。`127.0.0.1:0` で受け、外へは接続しない。
-    //! コピーしていないもの: 同じ cid の入り直しの置き換え（検査の一部は 1 つのプロセスから 2 人分を接続する。問いは受けて `seen` に残すだけ）・
-    //! Hibernation・Durable Object の記憶・IP ごとの数え（1 本にまとめ、通す数は検査が `limit` で設定する）。
-    //! クライアントの文は JSON.parse でなく、こちらのクライアントが送る 4 つの形（offer・answer・refuse・ping の 12 文字）の文字の一致で
-    //! 読む（ほかは room.ts と同じく 4400）。WebSocket の握手の SHA-1 は OS の BCrypt（`room_win::sha1`）。枠組みとマスク解きは
-    //! RFC 6455 §5 を読んで手で書いた。
-    //! 役割の名は room.ts の文字（`"host"` / `"guest"`）を文にだけ書き、Rust の名前は `Side::Offer` / `Side::Answer`。
+    //! loopbackの偽のルームサーバー。`src/server/src/index.ts`（入口での断り）と`room.ts`の振る舞いのコピー。
+    //! コピー範囲は次の通り。2人の役割・offer / peer / matched / answer・観戦の断りrefuseと4403・閉じる番号と直前のerrorの文・期限・片方が抜けたとき・席のチケット・成立後に2人を残して3人目をroom_in_useで断ること・生存確認（ping）が古くなった接続を閉じること。
+    //! 値は全部`tests/fixtures/room/rules.json`から読み、自前の定数を持たない。`127.0.0.1:0`で受け、外へは接続しない。
+    //! 席のチケット（`ticket.ts`）は、形と期限と「チケットの名のw.でしか席が取れない」ことをコピーする。
+    //! 形の桁・文字数と用途の識別子はcoreの`room`の定数で、coreの検査がrules.jsonと突き合わせる。
+    //! MACは本物のHMAC-SHA256でなく、偽サーバーの中だけの鍵とSHA-1 2本で作る（本物のチケットとは互換でない）。
+    //! コピーしていないもの: 同じcidの入り直しの置き換え・Hibernation・Durable Objectの記憶・IPごとの数え・成立後のアラームの間隔。
+    //! - 同じcidの入り直しの置き換え: 検査の一部は1つのプロセスから2人分を接続する。クエリは受けて`seen`に残すだけ。
+    //! - IPごとの数え: 1本にまとめ、通す数は検査が`limit`で設定する。
+    //! - 成立後のアラームの間隔: 生存確認（ping）の古さはポーリングの5 msごとに見る。
+    //! クライアントの文はJSON.parseでなく、こちらのクライアントが送る4つの形（offer・answer・refuse・pingの12文字）との文字列の一致で読む。
+    //! ほかはroom.tsと同じく4400にする。
+    //! WebSocketの握手のSHA-1はOSのBCrypt（`room_win::sha1`）。フレームの組み立てとマスク解きはRFC 6455 §5を読んで手で書いた。
+    //! 役割の名はroom.tsの文字（`"host"` / `"guest"`）を文にだけ書く。Rustの名前は`Side::Offer` / `Side::Answer`。
 
     use std::collections::HashMap;
     use std::io::{self, Read, Write};
@@ -867,7 +907,7 @@ pub(crate) mod fake {
 
     const RULES_JSON: &str = include_str!("../../../tests/fixtures/room/rules.json");
 
-    /// WebSocket の握手の決まった文字（RFC 6455 §1.3）。
+    /// WebSocketの握手の決まった文字（RFC 6455 §1.3）。
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -888,6 +928,9 @@ pub(crate) mod fake {
         pub message_max_bytes: usize,
         pub room_ttl_ms: u64,
         pub answer_ttl_ms: u64,
+        pub held_stale_ms: u64,
+        pub http_room_in_use: String,
+        pub http_room_full: String,
         pub ping_text: String,
         pub pong_text: String,
         pub retry_after_secs: u64,
@@ -905,6 +948,9 @@ pub(crate) mod fake {
         pub watch_delay_max: i64,
         pub watch_modes: Vec<String>,
         pub watch_room_prefix: String,
+        pub watch_answer_ttl_ms: u64,
+        pub ticket_param: String,
+        pub ticket_ttl_secs: u64,
     }
 
     enum Val {
@@ -947,8 +993,8 @@ pub(crate) mod fake {
         String::from_utf8(v).expect("見本は UTF-8")
     }
 
-    /// `%XX` を戻す（`decodeURIComponent` のコピー）。`%` の後が 16 進 2 桁でない・戻したものが UTF-8 でない（代理・長すぎる
-    /// 符号を含む）なら None。
+    /// `%XX`をデコードする（`decodeURIComponent`のコピー）。
+    /// `%`の後が16進2桁でない場合と、デコードした結果がUTF-8でない場合（サロゲート・オーバーロング符号を含む）はNone。
     fn percent_decode(s: &str) -> Option<String> {
         let b = s.as_bytes();
         let mut out = Vec::with_capacity(b.len());
@@ -970,7 +1016,7 @@ pub(crate) mod fake {
         String::from_utf8(out).ok()
     }
 
-    /// 平らな JSON（文字列と整数だけ）の小さな読み手。見本の形だけを読む（入れ子・小数・真偽が来たら落ちる）。
+    /// 平らなJSON（文字列と整数だけ）の小さなパーサー。見本の形だけを読む（入れ子・小数・真偽が来たらパニックする）。
     fn read_flat(s: &str) -> Vec<(String, Val)> {
         let b = s.as_bytes();
         let mut i = 0;
@@ -1023,8 +1069,8 @@ pub(crate) mod fake {
                     _ => None,
                 })
                 .collect();
-            // 揃え方: コピーは NFKC を持たない（クレートを足さない）ので、前後の空白と小文字だけをコピーする。検査の名は NFKC で
-            // 変わらない文字で選ぶ。見本の手順が変わったら、コピーも直すよう落とす。
+            // 正規化の方法: コピーはNFKCを持たない（クレートを足さない）ので、前後の空白と小文字化だけをコピーする。
+            // 検査の名はNFKCで変わらない文字で選ぶ。見本の手順が変わったら、コピーも直すよう検査を失敗させる。
             assert_eq!(
                 s("room_name_fold"),
                 "nfkc,trim,lower",
@@ -1058,6 +1104,9 @@ pub(crate) mod fake {
                 message_max_bytes: n("message_max_bytes") as usize,
                 room_ttl_ms: n("room_ttl_ms") as u64,
                 answer_ttl_ms: n("answer_ttl_ms") as u64,
+                held_stale_ms: n("held_stale_ms") as u64,
+                http_room_in_use: s("http_room_in_use"),
+                http_room_full: s("http_room_full"),
                 ping_text: s("ping_text"),
                 pong_text: s("pong_text"),
                 retry_after_secs: n("retry_after_secs") as u64,
@@ -1075,10 +1124,13 @@ pub(crate) mod fake {
                 watch_delay_max: n("watch_delay_max"),
                 watch_modes: s("watch_modes").split(',').map(str::to_owned).collect(),
                 watch_room_prefix: s("watch_room_prefix"),
+                watch_answer_ttl_ms: n("watch_answer_ttl_ms") as u64,
+                ticket_param: s("ticket_param"),
+                ticket_ttl_secs: n("ticket_ttl_secs") as u64,
             }
         }
 
-        /// rules.ts の `parseBuildSegment`: 先頭に 0 を付けない 10 進で u32 の範囲。
+        /// rules.tsの`parseBuildSegment`: 先頭に0を付けない10進でu32の範囲。
         fn build_from_segment(seg: &str) -> Option<u32> {
             let canonical = seg == "0"
                 || (!seg.starts_with('0')
@@ -1088,7 +1140,7 @@ pub(crate) mod fake {
             canonical.then(|| seg.parse().ok()).flatten()
         }
 
-        /// 揃えた後の名が、ランダム対戦の割り当てた形（先頭 ＋ 小文字の 16 進）か。
+        /// 正規化した後の名が、ランダム対戦に割り当てられる形（先頭 ＋ 小文字の16進）かどうか。
         fn is_random_room(&self, name: &str) -> bool {
             name.strip_prefix(self.random_room_prefix.as_str())
                 .is_some_and(|hex| {
@@ -1107,16 +1159,16 @@ pub(crate) mod fake {
                 .unwrap_or_else(|| panic!("見本に close_{name} が無い"))
         }
 
-        /// rules.ts の `roomNameFromPath`: パスの先頭の後ろが空でなく `/` を含まない。
+        /// rules.tsの`roomNameFromPath`: パスの先頭の後ろが空でなく`/`を含まない。
         fn room_from_path<'a>(&self, path: &'a str) -> Option<&'a str> {
             let rest = path.strip_prefix(self.path_prefix.as_str())?;
             (!rest.is_empty() && !rest.contains('/')).then_some(rest)
         }
 
-        /// rules.ts の `decodeRoomName` と `normalizeRoomName`（パスの区切りを受け、符号化を戻して検証し、揃えた文字を返す）。
-        /// 揃え方は NFKC を除いたコピー（[`Rules::load`] の注釈）。
+        /// rules.tsの`decodeRoomName`と`normalizeRoomName`。パスの区切りを受け取り、デコードして検証し、正規化した文字列を返す。
+        /// 正規化はNFKCを除いたコピー（[`Rules::load`]の注釈）。
         fn normalize(&self, segment: &str) -> Option<String> {
-            // 区切りの前置きのガード（1 B は 3 文字まで）と、戻せない符号（`%` の後が 16 進 2 桁でない・UTF-8 として壊れている）。
+            // 先に長さのガード（1 Bは3文字まで）をかけ、デコードできないエンコード（`%`の後が16進2桁でない・UTF-8として壊れている）も断る。
             if segment.len() > self.room_name_max_bytes * 3 {
                 return None;
             }
@@ -1141,7 +1193,17 @@ pub(crate) mod fake {
             (n >= self.room_name_min && n <= self.room_name_max).then_some(key)
         }
 
-        /// rules.ts の `checkCode`（長さ → 文字の順）。良ければ None、悪ければ閉じる名。
+        /// クエリの`ticket`（`URLSearchParams`と同じく`+`は空白、`%XX`はデコードする）。無ければNone。
+        fn ticket_of_query(&self, query: &str) -> Option<String> {
+            let raw = query.split('&').find_map(|kv| {
+                kv.strip_prefix(self.ticket_param.as_str())?
+                    .strip_prefix('=')
+            })?;
+            // デコードできないエンコードは、形の合わないチケットとして断る（サーバーはURLのパースで捨てるが、本番のクライアントは出さない）。
+            Some(percent_decode(&raw.replace('+', " ")).unwrap_or_else(|| "%".into()))
+        }
+
+        /// rules.tsの`checkCode`（長さ → 文字の順）。良ければNone。悪ければ閉じる名を返す。
         fn check_code(&self, code: &str) -> Option<&'static str> {
             let n: usize = code.chars().map(char::len_utf16).sum();
             if n > self.code_max_chars {
@@ -1152,33 +1214,135 @@ pub(crate) mod fake {
         }
     }
 
+    // ---- 席のチケット（ticket.tsのコピー。MACだけ偽物）----
+
+    use higanr_core::room::{TICKET_MAC_CHARS, TICKET_NUM_MAX_DIGITS, TICKET_PURPOSE};
+
+    /// 偽サーバーのチケットのMACの鍵（本物のSEAT_KEYの代わり）。
+    const FAKE_SEAT_KEY: &[u8] = b"higanr-fake-seat-key-loopback-only";
+
+    fn base64url(data: &[u8]) -> String {
+        base64(data)
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    }
+
+    /// チケットのMACの文字列（32 Bをbase64urlにした`TICKET_MAC_CHARS`文字）。署名する文は本物と同じ並び（用途の識別子・w. の名・発行・期限）。
+    fn ticket_mac(watch: &str, issued: u64, expires: u64) -> String {
+        let text = format!("{TICKET_PURPOSE}\n{watch}\n{issued}\n{expires}");
+        let mut mac = Vec::new();
+        for tag in *b"AB" {
+            let mut m = vec![tag];
+            m.extend_from_slice(FAKE_SEAT_KEY);
+            m.extend_from_slice(text.as_bytes());
+            mac.extend(crate::room_win::sha1(&m).expect("SHA-1"));
+        }
+        mac.truncate(32);
+        base64url(&mac)
+    }
+
+    fn mint(watch: &str, issued: u64, ttl: u64) -> String {
+        let expires = issued + ttl;
+        format!("{issued}.{expires}.{}", ticket_mac(watch, issued, expires))
+    }
+
+    /// ticket.tsの`TicketVerdict`。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TicketVerdict {
+        None,
+        Bad,
+        Expired,
+        Valid(u64),
+    }
+
+    /// ticket.tsの`TICKET_RE`の数のフィールド。`0`か、先頭が0でない`TICKET_NUM_MAX_DIGITS`桁までの10進。
+    fn ticket_number(s: &str) -> Option<u64> {
+        let ok = s == "0"
+            || (!s.is_empty()
+                && s.len() <= TICKET_NUM_MAX_DIGITS
+                && !s.starts_with('0')
+                && s.bytes().all(|b| b.is_ascii_digit()));
+        ok.then(|| s.parse().ok()).flatten()
+    }
+
+    /// ticket.tsの`judgeTicket`。`keyed`が偽ならSEAT_KEYの無いサーバー（形の合わないものだけBad、ほかはNone）。
+    fn judge_ticket(
+        ticket: Option<&str>,
+        watch: &str,
+        now_secs: u64,
+        keyed: bool,
+    ) -> TicketVerdict {
+        let Some(t) = ticket else {
+            return TicketVerdict::None;
+        };
+        let parts: Vec<&str> = t.split('.').collect();
+        let shaped = parts.len() == 3
+            && parts[2].len() == TICKET_MAC_CHARS
+            && parts[2]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        let (Some(issued), Some(expires), true) = (
+            parts.first().and_then(|s| ticket_number(s)),
+            parts.get(1).and_then(|s| ticket_number(s)),
+            shaped,
+        ) else {
+            return TicketVerdict::Bad;
+        };
+        if !keyed {
+            return TicketVerdict::None;
+        }
+        // 1通りの書き方のMACだけが一致する（最後の文字の使わないビットを変えたものもBad）。
+        if parts[2] != ticket_mac(watch, issued, expires) {
+            return TicketVerdict::Bad;
+        }
+        if now_secs >= expires {
+            return TicketVerdict::Expired;
+        }
+        TicketVerdict::Valid(issued)
+    }
+
+    /// 打った名からroom.tsと同じ方法で導いた観戦用の名（dllの`spectate_of`）。パスの区切りを受け取る。
+    fn watch_name_of_segment(segment: &str) -> Option<String> {
+        let raw = percent_decode(segment)?;
+        higanr_core::room::RoomName::parse_server_rules(&raw)
+            .ok()
+            .map(|r| r.spectate_of().as_str().to_owned())
+    }
+
     #[derive(Default)]
     pub struct Knobs {
-        /// ping に pong を返さない（自動応答を止める。片側だけ切れた TCP のコピー）。
+        /// pingにpongを返さない（自動応答を止める。片側だけ切れたTCPのコピー）。
         pub no_pong: AtomicBool,
-        /// 何を受けても読まない・答えない（close にも閉じ返さない。止まったサーバーのコピー）。
+        /// 何を受けても読まない・答えない（closeにも閉じ返さない。止まったサーバーのコピー）。
         pub deaf: AtomicBool,
-        /// 101 の後に room を送らない。
+        /// 101の後にroomを送らない。
         pub no_room: AtomicBool,
-        /// room の後に、番号の無い close を送る（WinHTTP がそれを 1005 と返すかを見る）。
+        /// roomの後に番号の無いcloseを送る（WinHTTPがそれを1005と返すかを見る）。
         pub close_without_status: AtomicBool,
-        /// 閉じる前の error の文を送らない（閉じる番号だけで正しく読めるかを見る）。
+        /// 閉じる前のerrorの文を送らない（閉じる番号だけで正しく読めるかを見る）。
         pub no_error_text: AtomicBool,
-        /// 0 なら見本の値（rules.json）。期限の検査が短く差し替える。
+        /// 0なら見本の値（rules.json）。期限の検査が短く差し替える。
         pub room_ttl_ms: AtomicU64,
         pub answer_ttl_ms: AtomicU64,
-        /// 0 なら見本の値。ランダム対戦の待ち列の期限と、割り当てたルームの期限。
+        /// 0なら見本の値。ランダム対戦の待ち列の期限と割り当てたルームの期限。
         pub random_queue_ttl_ms: AtomicU64,
         pub random_room_ttl_ms: AtomicU64,
-        /// 待ち列で組にしない（待ち列の「待つ」を続けさせる）。
+        /// 待ち列でペアにしない（待ち列の「待つ」を続けさせる）。
         pub no_pairing: AtomicBool,
-        /// 一覧の載せるエンドポイントが、post を list_full で断る（件数の上限のコピー）。
+        /// 一覧へ掲載するエンドポイントがpostをlist_fullで断る（件数の上限のコピー）。
         pub list_full: AtomicBool,
-        /// 一覧の載せるエンドポイントが、post を bad_message で断る（入り直しの検査用）。
+        /// 一覧へ掲載するエンドポイントがpostをbad_messageで断る（入り直しの検査用）。
         pub list_bad: AtomicBool,
-        /// 回数の歯止めまでに通す要求の数（0 なら数えない）。
+        /// 回数制限までに通す要求の数（0なら数えない）。
         pub limit: AtomicUsize,
-        /// 入口で必ずこの応答を返す（状態の番号・本文）。Cloudflare 自身の誤りのページなどのコピー。
+        /// SEAT_KEYの無いサーバーの動き。チケットを載せず、観戦用のルームのhostの席と一覧への投稿を断る。
+        pub no_seat_key: AtomicBool,
+        /// 0なら見本の値。観戦用のルームの観戦者のanswerの期限。
+        pub watch_answer_ttl_ms: AtomicU64,
+        /// 0なら見本の値。成立後の接続の生存確認（ping）の古さの上限。
+        pub held_stale_ms: AtomicU64,
+        /// 入口で必ずこの応答を返す（ステータスコード・本文）。Cloudflare自身のエラーページなどのコピー。
         pub forced: Mutex<Option<(u16, String)>>,
     }
 
@@ -1186,19 +1350,19 @@ pub(crate) mod fake {
     pub struct Seen {
         pub texts: Mutex<Vec<String>>,
         pub client_closes: Mutex<Vec<Option<u16>>>,
-        /// 届いた要求のパス（WinHTTP がルーム名の符号化を変えずに渡すかを見るため。届いた文字のまま。問いは含めない）。
+        /// 届いた要求のパス。WinHTTPがルーム名のエンコードを変えずに渡すかを検証するためのもので、届いた文字のまま持つ（クエリは含めない）。
         pub paths: Mutex<Vec<String>>,
-        /// 届いた要求の問い（`?` の後ろ。無ければ空）。`paths` と同じ順。
+        /// 届いた要求のクエリ（`?`の後ろ。無ければ空）。`paths`と同じ順。
         pub queries: Mutex<Vec<String>>,
         pub upgrades: AtomicUsize,
-        /// ランダム対戦の待ち列に入った数（Upgrade した数）。
+        /// ランダム対戦の待ち列に入った数（Upgradeした数）。
         pub queue_upgrades: AtomicUsize,
-        /// 待ち列が割り当てたルーム名（検査が「ログや画面に出ていない」を検証する元）。
+        /// 待ち列が割り当てたルーム名（検査が「ログや画面に出ていない」ことを検証するときの元データ）。
         pub assigned: Mutex<Vec<String>>,
-        /// 一覧の載せるエンドポイント・見るエンドポイントに入った数（Upgrade した数）。
+        /// 一覧へ掲載するエンドポイントと閲覧するエンドポイントに入った数（Upgradeした数）。
         pub watch_post_upgrades: AtomicUsize,
         pub watch_view_upgrades: AtomicUsize,
-        /// 一覧の載せるエンドポイントへ届いた post の文（検査が 1P・2P の名前・方式を検証する）。
+        /// 一覧へ掲載するエンドポイントへ届いたpostの文（検査が1P・2Pの名前・方式を検証する）。
         pub posts: Mutex<Vec<String>>,
     }
 
@@ -1225,12 +1389,26 @@ pub(crate) mod fake {
         code: Option<String>,
         got_peer: bool,
         done: bool,
-        /// host だけ: 観戦を断った（room.ts の `refused`）。
+        /// hostだけ: 観戦を断った（room.tsの`refused`）。
         refused: bool,
+        /// 観戦用のルームかどうか。
+        watch: bool,
+        /// hostだけ: matchedを送った（guestが入れ替わっても2度は送らない）。
+        matched: bool,
+        /// 対戦のルームだけ: この接続が打った名から導いた観戦用の名（チケットに署名する名）。鍵が無ければNone。
+        wname: Option<String>,
+        /// 対戦のルームのhostだけ: 最初に揃ったときのチケットの発行時刻（UNIX秒）。
+        issued: Option<u64>,
+        /// 観戦用のルームのhostだけ: 席を取ったチケットの発行時刻（UNIX秒）。
+        seat: Option<u64>,
+        /// 対戦のルームだけ: 成立した時刻（room.tsの`held`）。以後は期限で閉じず、生存確認（ping）で見る。
+        held: Option<Instant>,
+        /// 最後にpingを受けた時刻（room.tsの自動応答の時刻）。
+        last_ping: Option<Instant>,
         w: Arc<Mutex<TcpStream>>,
     }
 
-    /// ランダム対戦の待ち列の 1 人（random_queue.ts の `QueueAtt`）。
+    /// ランダム対戦の待ち列の1人（random_queue.tsの`QueueAtt`）。
     struct QMember {
         id: usize,
         deadline: Instant,
@@ -1238,7 +1416,7 @@ pub(crate) mod fake {
         w: Arc<Mutex<TcpStream>>,
     }
 
-    /// 一覧に載った 1 件（watch_list.ts の `WatchItem`）。
+    /// 一覧に載った1件（watch_list.tsの`WatchItem`）。
     #[derive(Clone)]
     struct WItem {
         room: String,
@@ -1274,7 +1452,7 @@ pub(crate) mod fake {
         rooms: Mutex<HashMap<String, Vec<Member>>>,
         /// ビルド番号ごとの待ち列（入った順）。
         queues: Mutex<HashMap<u32, Vec<QMember>>>,
-        /// ビルド番号ごとの一覧（載せた順）と、見ている人。
+        /// ビルド番号ごとの一覧（載せた順）とそれを見ている人。
         watch: Mutex<HashMap<u32, WatchBook>>,
         next_id: AtomicUsize,
         passed: AtomicUsize,
@@ -1339,6 +1517,7 @@ pub(crate) mod fake {
                         let mut rooms = lock(&inner.rooms);
                         for room in rooms.values_mut() {
                             expire_if_due(&inner, room, now);
+                            close_stale_held(&inner, room, now);
                         }
                         drop(rooms);
                         let mut queues = lock(&inner.queues);
@@ -1365,11 +1544,29 @@ pub(crate) mod fake {
             &self.inner.rules
         }
 
+        /// 観戦用のルーム`watch`について、いま発行したチケット（検査が対戦を成立させずに配信する側を動かすため）。
+        pub fn mint_ticket(
+            &self,
+            watch: &higanr_core::room::RoomName,
+        ) -> higanr_core::room::SeatTicket {
+            self.mint_ticket_at(watch, unix_ms() / 1000)
+        }
+
+        /// 発行時刻（UNIX秒）を指定したチケット（より新しいチケットが席を取る検査のため）。
+        pub fn mint_ticket_at(
+            &self,
+            watch: &higanr_core::room::RoomName,
+            issued: u64,
+        ) -> higanr_core::room::SeatTicket {
+            let t = mint(watch.as_str(), issued, self.inner.rules.ticket_ttl_secs);
+            higanr_core::room::SeatTicket::parse(&t).expect("偽サーバーの札が札の形でない")
+        }
+
         pub fn texts_matching(&self, pred: impl Fn(&str) -> bool) -> usize {
             lock(&self.seen.texts).iter().filter(|t| pred(t)).count()
         }
 
-        /// 一覧（ビルド番号ごと）に載っている件を載せた順に。観戦用のルーム名は割り当ての名から導いた `w.…`。
+        /// 一覧（ビルド番号ごと）に載っている件を載せた順に返す。観戦用のルーム名は割り当てられた名から導いた`w.…`。
         pub fn watch_items(&self, build: u32) -> Vec<ListedItem> {
             lock(&self.inner.watch)
                 .get(&build)
@@ -1397,9 +1594,28 @@ pub(crate) mod fake {
                 .get(&build)
                 .map_or(0, |b| b.views.len())
         }
+
+        /// 一覧を見ている接続を今すぐ全部4408 expiredで閉じる。サーバーは作ってから10分で閉じる。待たずに検査が起こすための関数。
+        pub fn expire_views(&self, build: u32) {
+            let name = "expired";
+            let mut watch = lock(&self.inner.watch);
+            let Some(book) = watch.get_mut(&build) else {
+                return;
+            };
+            for v in book.views.drain(..) {
+                write_frame(
+                    &v.w,
+                    0x1,
+                    format!(r#"{{"t":"error","code":"{name}"}}"#).as_bytes(),
+                );
+                let mut p = self.inner.rules.close(name).to_be_bytes().to_vec();
+                p.extend_from_slice(name.as_bytes());
+                write_frame(&v.w, 0x8, &p);
+            }
+        }
     }
 
-    /// 偽サーバーの一覧に載っている 1 件。
+    /// 偽サーバーの一覧に載っている1件。
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ListedItem {
         pub room: String,
@@ -1431,7 +1647,7 @@ pub(crate) mod fake {
         }
     }
 
-    // ---- 枠（RFC 6455 §5.2）----
+    // ---- フレーム（RFC 6455 §5.2）----
 
     fn write_frame(w: &Mutex<TcpStream>, op: u8, payload: &[u8]) {
         let mut f = vec![0x80 | op];
@@ -1453,8 +1669,8 @@ pub(crate) mod fake {
         write_frame(&m.w, 0x1, text.as_bytes());
     }
 
-    /// room.ts の `closeWith`: 印を付け、withError なら error の文を 1 通送ってから閉じる（1000 では送らない）。
-    /// つまみ `no_error_text` は error の文を省く。
+    /// room.tsの`closeWith`。終了済みにし、withErrorならerrorの文を1通送ってから閉じる（1000では送らない）。
+    /// つまみ`no_error_text`を立てるとerrorの文を省く。
     fn close_with(inner: &Inner, m: &mut Member, name: &str, with_error: bool) {
         m.done = true;
         if with_error && name != "done" && !inner.knobs.no_error_text.load(Ordering::Acquire) {
@@ -1529,7 +1745,7 @@ pub(crate) mod fake {
         out
     }
 
-    // ---- HTTP の入口（index.ts）----
+    // ---- HTTPの入口（index.ts）----
 
     struct Head {
         method: String,
@@ -1581,7 +1797,7 @@ pub(crate) mod fake {
         let _ = s.write_all(r.as_bytes());
         let _ = s.flush();
         let _ = s.shutdown(Shutdown::Write);
-        // 相手が読み終えて閉じるまで待つ（先に閉じると RST で本文が落ちることがある）。
+        // 相手が読み終えて閉じるまで待つ（先に閉じるとRSTで本文が失われることがある）。
         let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
         let mut sink = [0u8; 256];
         while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
@@ -1592,7 +1808,7 @@ pub(crate) mod fake {
             return;
         };
         let rules = &inner.rules;
-        // 問いは index.ts が見る `url.pathname` に入らない。ここでもパスから外す。
+        // クエリはindex.tsが見る`url.pathname`に入らない。ここでもパスから外す。
         let (path, query) = head.path.split_once('?').unwrap_or((&head.path, ""));
         lock(&inner.seen.paths).push(path.to_owned());
         lock(&inner.seen.queries).push(query.to_owned());
@@ -1612,7 +1828,7 @@ pub(crate) mod fake {
         if head.method != "GET" {
             return respond(&mut s, 405, "", r#"{"error":"method_not_allowed"}"#);
         }
-        // ルーム名は符号化されたまま来る。戻せない符号も文字の決まりの外と同じ 400。
+        // ルーム名はエンコードされたまま来る。デコードできないエンコードも文字の決まりの外と同じ400にする。
         let Some(name) = rules.normalize(raw) else {
             return respond(&mut s, 400, "", r#"{"error":"bad_room_name"}"#);
         };
@@ -1631,25 +1847,72 @@ pub(crate) mod fake {
         let accept =
             base64(&crate::room_win::sha1(format!("{key}{WS_GUID}").as_bytes()).expect("SHA-1"));
 
+        // 観戦用のルームのhostの席は、そのルームの名について正しく期限内のチケットを持つ接続だけが取れる（room.ts）。
+        let is_watch = name.starts_with(rules.watch_room_prefix.as_str());
+        let keyed = !inner.knobs.no_seat_key.load(Ordering::Acquire);
+        let fresh = if is_watch {
+            let t = rules.ticket_of_query(query);
+            match judge_ticket(t.as_deref(), &name, unix_ms() / 1000, keyed) {
+                TicketVerdict::Bad => return respond(&mut s, 400, "", r#"{"error":"bad_ticket"}"#),
+                TicketVerdict::Valid(issued) => Some(issued),
+                TicketVerdict::None | TicketVerdict::Expired => None,
+            }
+        } else {
+            None
+        };
+        let wname = (!is_watch && keyed)
+            .then(|| watch_name_of_segment(raw))
+            .flatten();
         let id = inner.next_id.fetch_add(1, Ordering::AcqRel);
         {
             let mut rooms = lock(&inner.rooms);
             let now = Instant::now();
             let room = rooms.entry(name.clone()).or_default();
             expire_if_due(inner, room, now);
-            let live: Vec<&Member> = room.iter().filter(|m| !m.done).collect();
-            let (side, deadline, deadline_unix_ms) = if live.is_empty() {
+            close_stale_held(inner, room, now);
+            let live: Vec<usize> = (0..room.len()).filter(|&i| !room[i].done).collect();
+            let seated = live.iter().copied().find(|&i| room[i].side == Side::Offer);
+            let new_room = || {
                 let t = if rules.is_random_room(&name) {
                     ttl(&inner.knobs.random_room_ttl_ms, rules.random_room_ttl_ms)
                 } else {
                     ttl(&inner.knobs.room_ttl_ms, rules.room_ttl_ms)
                 };
                 (Side::Offer, now + Duration::from_millis(t), unix_ms() + t)
-            } else if live.len() == 1 && live[0].side == Side::Offer {
-                (Side::Answer, live[0].deadline, live[0].deadline_unix_ms)
+            };
+            let (side, deadline, deadline_unix_ms) = if let (true, Some(h), Some(f)) =
+                (is_watch, seated, fresh)
+                && room[h].seat.is_none_or(|s| f > s)
+            {
+                // より新しい対戦のチケットの場合は前のhost（とそのコードを受けた観戦者）を閉じて席を渡す。
+                for &i in &live {
+                    close_with(inner, &mut room[i], "peer_left", true);
+                }
+                new_room()
+            } else if live.is_empty() {
+                if is_watch && fresh.is_none() {
+                    drop(rooms);
+                    let body = format!(r#"{{"error":"{}"}}"#, rules.http_room_full);
+                    return respond(&mut s, 409, "", &body);
+                }
+                new_room()
+            } else if live.len() == 1
+                && room[live[0]].side == Side::Offer
+                && room[live[0]].held.is_none()
+            {
+                (
+                    Side::Answer,
+                    room[live[0]].deadline,
+                    room[live[0]].deadline_unix_ms,
+                )
             } else {
                 drop(rooms);
-                return respond(&mut s, 409, "", r#"{"error":"room_full"}"#);
+                let error = if is_watch {
+                    &rules.http_room_full
+                } else {
+                    &rules.http_room_in_use
+                };
+                return respond(&mut s, 409, "", &format!(r#"{{"error":"{error}"}}"#));
             };
             let hs = format!(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -1667,6 +1930,13 @@ pub(crate) mod fake {
                 got_peer: false,
                 done: false,
                 refused: false,
+                watch: is_watch,
+                matched: false,
+                wname,
+                issued: None,
+                seat: fresh.filter(|_| is_watch && side == Side::Offer),
+                held: None,
+                last_ping: None,
                 w: Arc::new(Mutex::new(w)),
             };
             inner.seen.upgrades.fetch_add(1, Ordering::AcqRel);
@@ -1684,7 +1954,7 @@ pub(crate) mod fake {
                 m.done = true;
                 write_frame(&m.w, 0x8, &[]);
             }
-            // 観戦を断っている host のルームへ入った guest は、コードを渡さずに断りの印で閉じる（host は残す）。
+            // 観戦を断っているhostのルームへ入ったguestは、コードを渡さず断りの印で閉じる（hostは残す）。
             let host_refused = room
                 .iter()
                 .any(|h| !h.done && h.side == Side::Offer && h.refused);
@@ -1700,7 +1970,8 @@ pub(crate) mod fake {
         let _ = s.shutdown(Shutdown::Both);
     }
 
-    /// index.ts の `overLimit`: 通す数（`knobs.limit`）を越えていれば 429 を返して true。ルームと待ち列で 1 本の数え。
+    /// index.tsの`overLimit`。通す数（`knobs.limit`）を越えていれば429を返してtrueを返す。
+    /// 数えるカウンタはルームと待ち列で共通の1本。
     fn refuse_if_over_limit(inner: &Inner, s: &mut TcpStream) -> bool {
         let limit = inner.knobs.limit.load(Ordering::Acquire);
         if limit > 0 && inner.passed.fetch_add(1, Ordering::AcqRel) >= limit {
@@ -1716,11 +1987,11 @@ pub(crate) mod fake {
         false
     }
 
-    // ---- ランダム対戦の待ち列（random_queue.ts のコピー）----
+    // ---- ランダム対戦の待ち列（random_queue.tsのコピー）----
     //
-    // コピーしていないもの: 同じ cid の入り直しの置き換え（ルームのコピーと同じ理由。検査は 1 つのプロセスから 2 人分を接続するので cid が同じ）。
+    // コピーしていないもの: 同じcidの入り直しの置き換え（ルームのコピーと同じ理由。検査は1つのプロセスから2人分を接続するのでcidが同じ）。
 
-    /// index.ts の待ち列のエンドポイントと `RandomQueue.fetch`: ビルド番号ごとの待ち列に入れ、2 人そろえば割り当てたルーム名を返して閉じる。
+    /// index.tsの待ち列のエンドポイントと`RandomQueue.fetch`。ビルド番号ごとの待ち列に入れ、2人そろえば割り当てたルーム名を返して閉じる。
     fn serve_queue(inner: &Inner, mut s: TcpStream, head: &Head, path: &str) {
         let rules = &inner.rules;
         if head.method != "GET" {
@@ -1799,7 +2070,7 @@ pub(crate) mod fake {
         write_frame(&m.w, 0x8, &p);
     }
 
-    /// `RandomQueue.tryPair`: 入った順に先の 2 人から組にする。割り当てた名は `seen.assigned` にも残す（検査用）。
+    /// `RandomQueue.tryPair`。入った順に先の2人からペアにする。割り当てた名は`seen.assigned`にも残す（検査用）。
     fn try_pair_queue(inner: &Inner, q: &mut [QMember]) {
         if inner.knobs.no_pairing.load(Ordering::Acquire) {
             return;
@@ -1885,19 +2156,27 @@ pub(crate) mod fake {
         }
     }
 
-    // ---- 進行中のランダム対戦の一覧（watch_list.ts のコピー）----
+    // ---- 進行中のランダム対戦の一覧（watch_list.tsのコピー）----
     //
-    // コピーしていないもの: 1 IP あたり 2 件の上限・載せた人が生きているかの期限・見るエンドポイントへの変化のまとめ送り（変わるたびにすぐ全体を送る）・
-    // 同じルームの載せ直しの置き換え。クライアントの文は JSON.parse でなく `read_flat` で読む。
+    // コピーしていないもの: 1 IPあたり2件の上限・掲載した人が生きているかの期限・閲覧するエンドポイントへの変化のまとめ送信・同じルームの掲載し直しの置き換え。
+    // まとめ送信の代わりに、変わるたびにすぐ全体を送る。
+    // クライアントの文はJSON.parseでなく`read_flat`で読む。
 
     fn is_name(s: &str) -> bool {
         (1..=32).contains(&s.chars().count())
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'@' | b'?'))
+            && s.chars().all(higanr_core::room::RoomName::accepts_char)
+            && !s.starts_with(' ')
+            && !s.ends_with(' ')
     }
 
-    /// `parsePost` のコピー: 割り当ての名の形・名前の文字・方式・数の範囲。通れば一覧に載せる 1 件（観戦用のルーム名は割り当ての名から導く）。
-    fn parse_post(rules: &Rules, text: &str) -> Option<WItem> {
+    /// `JSON.stringify`が文字列に書き込む形（名前は0x20〜0x7Eだけなので`"`と`\`だけエスケープする）。
+    fn json_str(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    /// `parsePost`のコピー。割り当てられた名の形・名前の文字・方式・数の範囲を検証する。
+    /// 通れば一覧に載せる1件を返す（観戦用のルーム名は割り当てられた名から導く）。
+    fn parse_post(rules: &Rules, text: &str, keyed: bool) -> Option<WItem> {
         let list = std::panic::catch_unwind(|| read_flat(text)).ok()?;
         let st = |k: &str| match list.iter().find(|(n, _)| n == k) {
             Some((_, Val::S(v))) => Some(v.clone()),
@@ -1914,6 +2193,7 @@ pub(crate) mod fake {
         if !rules.is_random_room(&q) {
             return None;
         }
+        let ticket = st("ticket")?;
         let (p1, p2, mode) = (st("p1")?, st("p2")?, st("mode")?);
         let (delay, watchers, cap) = (num("delay")?, num("watchers")?, num("cap")?);
         let ok = is_name(&p1)
@@ -1930,6 +2210,13 @@ pub(crate) mod fake {
             .spectate_of()
             .as_str()
             .to_owned();
+        // その割り当ての名で本当に対戦が成立した証拠（席のチケット）が無ければ載せない。鍵が無ければ全部断る。
+        if !matches!(
+            judge_ticket(Some(&ticket), &room, unix_ms() / 1000, keyed),
+            TicketVerdict::Valid(_)
+        ) {
+            return None;
+        }
         Some(WItem {
             room,
             p1,
@@ -1941,7 +2228,7 @@ pub(crate) mod fake {
         })
     }
 
-    /// `WatchList.listMessage` のコピー: 載せた順の全体（鍵の順は JSON.stringify の出力と同じ）。
+    /// `WatchList.listMessage`のコピー。載せた順の全体を返す（キーの順はJSON.stringifyの出力と同じ）。
     fn watch_list_text(book: &WatchBook) -> String {
         let items: Vec<String> = book
             .posts
@@ -1950,7 +2237,13 @@ pub(crate) mod fake {
             .map(|i| {
                 format!(
                     r#"{{"room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},"watchers":{},"cap":{}}}"#,
-                    i.room, i.p1, i.p2, i.mode, i.delay, i.watchers, i.cap
+                    i.room,
+                    json_str(&i.p1),
+                    json_str(&i.p2),
+                    i.mode,
+                    i.delay,
+                    i.watchers,
+                    i.cap
                 )
             })
             .collect();
@@ -2028,7 +2321,8 @@ pub(crate) mod fake {
         let _ = s.shutdown(Shutdown::Both);
     }
 
-    /// 載せるエンドポイント・見るエンドポイントの接続を 1 本読む。切れたら一覧から外し、載っていたなら見る人へ全体を送り直す。
+    /// 掲載するエンドポイントと閲覧するエンドポイントの接続を1本読む。
+    /// 切れたら一覧から外し、載っていたなら閲覧している人へ全体を送り直す。
     fn watch_loop(inner: &Inner, build: u32, id: usize, is_post: bool, s: &mut TcpStream) {
         let leave = |inner: &Inner| {
             let mut watch = lock(&inner.watch);
@@ -2124,7 +2418,10 @@ pub(crate) mod fake {
         }
     }
 
-    /// 載せるエンドポイントの 1 通: 最初の post なら一覧へ載せ、載せてきた接続へ listed を送る。count なら載せた項目の観戦者数を替える。断るなら error の名を返す（呼び手が載せてきた接続へ送る）。
+    /// 掲載するエンドポイントに届いた1通の処理。
+    /// 最初のpostなら一覧へ載せ、掲載してきた接続へlistedを送る。
+    /// countなら掲載した項目の観戦者数を替える。
+    /// 断るならerrorの名を返す（呼び出し側が掲載してきた接続へ送る）。
     fn on_post_text(
         inner: &Inner,
         book: &mut WatchBook,
@@ -2152,7 +2449,8 @@ pub(crate) mod fake {
             return Some("bad_message");
         }
         lock(&inner.seen.posts).push(text.to_owned());
-        let Some(item) = parse_post(rules, text) else {
+        let keyed = !inner.knobs.no_seat_key.load(Ordering::Acquire);
+        let Some(item) = parse_post(rules, text, keyed) else {
             return Some("bad_message");
         };
         if inner.knobs.list_bad.load(Ordering::Acquire) {
@@ -2227,9 +2525,10 @@ pub(crate) mod fake {
             return;
         };
         let Some(i) = idx(room, id) else { return };
-        // `setWebSocketAutoResponse`: 文字の完全一致だけ。Durable Object を起動しない（done でも返す）。
+        // `setWebSocketAutoResponse`: 文字の完全一致だけ。Durable Objectを起動しない（doneでも返す）。
         if text == rules.ping_text {
             if !inner.knobs.no_pong.load(Ordering::Acquire) {
+                room[i].last_ping = Some(Instant::now());
                 send_text(&room[i], &rules.pong_text);
             }
             return;
@@ -2237,10 +2536,15 @@ pub(crate) mod fake {
         if room[i].done {
             return;
         }
+        // 成立の後はpingだけを送る約束（room.ts）。ほかの文は誤りとして閉じ、相手も閉じる。
+        if room[i].held.is_some() {
+            return fail(inner, room, id, "bad_message");
+        }
         if text.len() > rules.message_max_bytes {
             return fail(inner, room, id, "too_large");
         }
-        // room.ts の refuse: 観戦用のルームの host が offer の前に 1 回だけ。待っている guest は断りの印で閉じ、host は残す。
+        // room.tsのrefuse。観戦用のルームのhostがofferの前に1回だけ送る。
+        // 待っているguestは断りの印で閉じ、hostは残す。
         if text == higanr_core::room::REFUSE_TEXT {
             let ok = room[i].side == Side::Offer
                 && room[i].code.is_none()
@@ -2289,13 +2593,19 @@ pub(crate) mod fake {
                     return fail(inner, room, id, "peer_left");
                 };
                 send_text(&room[h], &format!(r#"{{"t":"peer","code":"{code}"}}"#));
-                close_with(inner, &mut room[h], "done", false);
-                close_with(inner, &mut room[i], "done", false);
+                if room[i].watch {
+                    close_with(inner, &mut room[h], "done", false);
+                    close_with(inner, &mut room[i], "done", false);
+                } else {
+                    // 対戦のルーム: 2人を残してルーム名を使用中にする。
+                    room[h].held = Some(now);
+                    room[i].held = Some(now);
+                }
             }
         }
     }
 
-    /// room.ts の `tryMatch`。
+    /// room.tsの`tryMatch`。対戦のルームの最初の成立で、hostへはmatched、guestへはpeerにチケットを載せる（鍵があるときだけ）。
     fn try_match(inner: &Inner, room: &mut [Member], now: Instant) {
         let h = room.iter().position(|m| !m.done && m.side == Side::Offer);
         let g = room.iter().position(|m| !m.done && m.side == Side::Answer);
@@ -2306,47 +2616,124 @@ pub(crate) mod fake {
         if room[g].got_peer {
             return;
         }
-        let a = ttl(&inner.knobs.answer_ttl_ms, inner.rules.answer_ttl_ms);
-        let by_answer = now + Duration::from_millis(a);
-        let (deadline, unix) = if by_answer < room[h].deadline {
-            (by_answer, unix_ms() + a)
+        let first = !room[h].matched;
+        if first {
+            let a = ttl(&inner.knobs.answer_ttl_ms, inner.rules.answer_ttl_ms);
+            let by_answer = now + Duration::from_millis(a);
+            if by_answer < room[h].deadline {
+                room[h].deadline = by_answer;
+                room[h].deadline_unix_ms = unix_ms() + a;
+            }
+            room[h].matched = true;
+            if !room[h].watch {
+                room[h].issued = Some(unix_ms() / 1000);
+            }
+        }
+        // 観戦用のルームは観戦者ごとに短い期限で縛る（過ぎた観戦者だけを閉じ、hostは次の観戦者を待つ）。
+        let (deadline, unix) = if room[h].watch {
+            let w = ttl(
+                &inner.knobs.watch_answer_ttl_ms,
+                inner.rules.watch_answer_ttl_ms,
+            );
+            let by = now + Duration::from_millis(w);
+            if by < room[h].deadline {
+                (by, unix_ms() + w)
+            } else {
+                (room[h].deadline, room[h].deadline_unix_ms)
+            }
         } else {
             (room[h].deadline, room[h].deadline_unix_ms)
         };
-        for k in [h, g] {
-            room[k].deadline = deadline;
-            room[k].deadline_unix_ms = unix;
-        }
+        room[g].deadline = deadline;
+        room[g].deadline_unix_ms = unix;
         room[g].got_peer = true;
-        send_text(&room[g], &format!(r#"{{"t":"peer","code":"{code}"}}"#));
-        send_text(
-            &room[h],
-            &format!(r#"{{"t":"matched","expires_at":{}}}"#, unix / 1000),
-        );
+        let ttl_secs = inner.rules.ticket_ttl_secs;
+        let ticket_of = |m: &Member| -> String {
+            match (&m.wname, room[h].issued) {
+                (Some(w), Some(i)) => format!(r#","ticket":"{}""#, mint(w, i, ttl_secs)),
+                _ => String::new(),
+            }
+        };
+        let (gt, ht) = (ticket_of(&room[g]), ticket_of(&room[h]));
+        send_text(&room[g], &format!(r#"{{"t":"peer","code":"{code}"{gt}}}"#));
+        if first {
+            send_text(
+                &room[h],
+                &format!(
+                    r#"{{"t":"matched","expires_at":{}{ht}}}"#,
+                    room[h].deadline_unix_ms / 1000
+                ),
+            );
+        }
     }
 
-    /// room.ts の `expireIfDue`。
+    /// room.tsの`closeStaleHeld`。成立後の接続のうち、最後のping（無ければ成立の時刻）が古いものをexpiredで閉じる。
+    /// 成立後のもう1人はpeer_leftで閉じる。
+    fn close_stale_held(inner: &Inner, room: &mut [Member], now: Instant) {
+        let limit =
+            Duration::from_millis(ttl(&inner.knobs.held_stale_ms, inner.rules.held_stale_ms));
+        let stale = |m: &Member| {
+            m.held.is_some_and(|h| {
+                let last = m.last_ping.map_or(h, |p| p.max(h));
+                now.saturating_duration_since(last) > limit
+            })
+        };
+        let marks: Vec<bool> = room.iter().map(|m| !m.done && stale(m)).collect();
+        if !marks.contains(&true) {
+            return;
+        }
+        for (m, was_stale) in room.iter_mut().zip(marks) {
+            if m.done || m.held.is_none() {
+                continue;
+            }
+            close_with(
+                inner,
+                m,
+                if was_stale { "expired" } else { "peer_left" },
+                true,
+            );
+        }
+    }
+
+    /// room.tsの`expireIfDue`。成立の後の接続は期限で閉じない。
     fn expire_if_due(inner: &Inner, room: &mut [Member], now: Instant) -> bool {
-        let Some(d) = room.iter().filter(|m| !m.done).map(|m| m.deadline).min() else {
+        // 観戦用のルーム: answerの期限を過ぎた観戦者だけを閉じ、hostは残す。
+        if let Some(h) = room
+            .iter()
+            .position(|m| !m.done && m.side == Side::Offer && m.watch)
+            && now < room[h].deadline
+        {
+            let mut any = false;
+            for m in room
+                .iter_mut()
+                .filter(|m| !m.done && m.side == Side::Answer && now >= m.deadline)
+            {
+                close_with(inner, m, "expired", true);
+                any = true;
+            }
+            return any;
+        }
+        let waiting = |m: &Member| !m.done && m.held.is_none();
+        let Some(d) = room.iter().filter(|m| waiting(m)).map(|m| m.deadline).min() else {
             return false;
         };
         if now < d {
             return false;
         }
-        for m in room.iter_mut().filter(|m| !m.done) {
+        for m in room.iter_mut().filter(|m| waiting(m)) {
             close_with(inner, m, "expired", true);
         }
         true
     }
 
-    /// room.ts の `fail`。
+    /// room.tsの`fail`。
     fn fail(inner: &Inner, room: &mut [Member], id: usize, name: &str) {
         let Some(i) = idx(room, id) else { return };
         close_with(inner, &mut room[i], name, true);
         after_leave(inner, room, i);
     }
 
-    /// room.ts の `gone`。
+    /// room.tsの`gone`。
     fn gone(inner: &Inner, name: &str, id: usize) {
         let mut rooms = lock(&inner.rooms);
         let Some(room) = rooms.get_mut(name) else {
@@ -2360,14 +2747,20 @@ pub(crate) mod fake {
         after_leave(inner, room, i);
     }
 
-    /// room.ts の `afterLeave`。
+    /// room.tsの`afterLeave`。観戦用のルームではguestが抜けてもhostを閉じない（次の観戦者へ同じコードを渡す）。
+    /// 成立の後にどちらかが抜けたら、もう1人も閉じる。
     fn after_leave(inner: &Inner, room: &mut [Member], i: usize) {
-        let (side, got_peer) = (room[i].side, room[i].got_peer);
+        let (side, got_peer, watch, held) = (
+            room[i].side,
+            room[i].got_peer,
+            room[i].watch,
+            room[i].held.is_some(),
+        );
         for (j, other) in room.iter_mut().enumerate() {
             if j == i || other.done {
                 continue;
             }
-            if side == Side::Offer || got_peer {
+            if side == Side::Offer || (got_peer && !watch) || held {
                 close_with(inner, other, "peer_left", true);
             }
         }
@@ -2428,6 +2821,11 @@ pub(crate) mod fake {
             assert_eq!(r.closes.len(), 8);
             assert_eq!(r.room_ttl_ms, 600_000);
             assert_eq!(r.answer_ttl_ms, 60_000);
+            assert_eq!(r.held_stale_ms, 90_000);
+            assert_eq!(
+                (r.http_room_in_use.as_str(), r.http_room_full.as_str()),
+                ("room_in_use", "room_full")
+            );
             assert_eq!(r.ping_text, r#"{"t":"ping"}"#);
             assert_eq!(r.normalize("Room-1_X").as_deref(), Some("room-1_x"));
             assert_eq!(r.normalize(&"a".repeat(33)), None);
@@ -2474,8 +2872,9 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    //! 部品の検査（毎回の回）は `Base` と役割のコピーだけ。組み上がりの検査（loopback の偽サーバー `fake` と、本物の WinHTTP・
-    //! 本物のスレッド）は実時間で走るので `#[ignore]` で、全件の回が `--ignored` で走らせる。外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。
+    //! 部品の検査（毎回の検査で走る）は`Base`と役割のコピーだけ。
+    //! 組み上がりの検査（loopbackの偽サーバー`fake`と本物のWinHTTP・本物のスレッドを使う）は実時間で走るので`#[ignore]`を付け、全件の検査で`--ignored`を付けて走らせる。
+    //! 外へは接続しない（`127.0.0.1`と`Proxy::Direct`）。
     use super::fake::FakeServer;
     use super::*;
     use higanr_core::room::{
@@ -2575,8 +2974,9 @@ mod tests {
         }
     }
 
-    /// 検査のルーム名はサーバーの決まり（`parse_server_rules`）で検証する。dll の本番（`parse`）は ASCII の英数字と `-` `_` だけだが、
-    /// サーバーは日本語も受け付けたままなので、その受け入れ（符号化・400）はこの入口で見る。
+    /// 検査のルーム名はサーバーの決まり（`parse_server_rules`）で検証する。
+    /// dllの本番（`parse`）が通すのはASCIIの英数字と`-` `_`だけ。
+    /// サーバーは日本語も受け付けたままなので、その受け入れ（エンコード・400）はこの入口で検証する。
     fn start(f: &FakeServer, room: &str) -> RoomConn {
         RoomConn::start(
             &opts_for(&f.base()),
@@ -2585,8 +2985,8 @@ mod tests {
         .unwrap()
     }
 
-    /// `poll` を回して出来事を集める（時計は `offset_ms` だけ進めて渡す）。`stop` が真になったら返す。`limit` を過ぎたら
-    /// 集めた出来事を出して落ちる。
+    /// `poll`を繰り返し呼んでイベントを集める（時計は`offset_ms`だけ進めて渡す）。`stop`が真になったら返す。
+    /// `limit`を過ぎたら集めたイベントを出力して検査を失敗させる。
     fn pump(
         c: &mut RoomConn,
         offset_ms: u64,
@@ -2660,14 +3060,14 @@ mod tests {
         t0.elapsed()
     }
 
-    // 始める側・返す側のコード（base64url の文字。実在のものではない合成の文字）。
+    // 始める側・返す側のコード（base64urlの文字。実在のものではない合成の文字）。
     const OFFER_CODE: &str = "HRo1-OfferSide_Code";
     const ANSWER_CODE: &str = "HRa1-AnswerSide_Code";
 
     // ---- 組み上がり: 手順が通る ----
 
-    /// 2 人がコードを渡し合って両方 Done になるまで。`offer_first` は「始める側が offer を出してから返す側が来る」か
-    /// 「返す側が先に来て待つ」か。
+    /// 2人がコードを渡し合って両方が成立後の保持状態（Held）になり、片方が手放すともう片方も失敗にせず終わるまでを検証する。
+    /// `offer_first`は始める側がofferを出してから返す側が来るか、返す側が先に来て待つかの切り替え。
     fn trade(offer_first: bool) {
         let f = FakeServer::start();
         let mut a = start(&f, "Trade-Room");
@@ -2698,7 +3098,7 @@ mod tests {
             "返す側の Ok = answer を渡し終えた（§5-2 の (2) で P2P を始める時点）"
         );
         let evs_a = pump(&mut a, 0, Duration::from_secs(5), |e| {
-            e.contains(&Event::Done)
+            e.contains(&Event::Held)
         });
         assert_eq!(peer_code(&evs_a).as_deref(), Some(ANSWER_CODE));
         assert!(
@@ -2706,12 +3106,32 @@ mod tests {
             "始める側は matched を受ける: {evs_a:?}"
         );
         let evs_b = pump(&mut b, 0, Duration::from_secs(5), |e| {
-            e.contains(&Event::Done)
+            e.contains(&Event::Held)
         });
         assert!(!has_failed(&evs_a) && !has_failed(&evs_b));
+        // 成立の後も2人は残り、同じ名の3人目は使用中で断られる。
+        std::thread::sleep(Duration::from_millis(50));
+        let evs: Vec<Event> = [a.poll(), b.poll()].concat();
+        assert!(evs.is_empty(), "{evs:?}");
+        assert_eq!((a.state(), b.state()), (State::Holding, State::Holding));
+        let mut third = start(&f, "TRADE-ROOM");
+        assert_eq!(wait_failure(&mut third), Failure::RoomInUse);
+        // 始める側が手放すとサーバーが返す側も閉じ、返す側は失敗にせず終える。
+        a.cancel();
+        let evs_b = pump(&mut b, 0, Duration::from_secs(5), |e| {
+            e.contains(&Event::Done)
+        });
+        assert!(!has_failed(&evs_b), "{evs_b:?}");
         assert!(a.is_finished() && b.is_finished());
         assert_joins(&mut a, Duration::from_secs(3));
         assert_joins(&mut b, Duration::from_secs(3));
+        assert_joins(&mut third, Duration::from_secs(3));
+        // 部屋は空いたので次の人は始める側になる。
+        let mut next = start(&f, "trade-room");
+        let evs = wait_state(&mut next, State::NeedOwnCode);
+        assert!(joined_as(&evs, Role::Offer), "{evs:?}");
+        next.cancel();
+        assert_joins(&mut next, Duration::from_secs(3));
         let offer = format!(r#"{{"t":"offer","code":"{OFFER_CODE}"}}"#);
         let answer = format!(r#"{{"t":"answer","code":"{ANSWER_CODE}"}}"#);
         assert_eq!(f.texts_matching(|t| t == offer), 1);
@@ -2742,7 +3162,7 @@ mod tests {
             joined_as(&evs, Role::Answer),
             "大小だけ違う日本語の名は同じルーム"
         );
-        // 届いたパスは、こちらが作ったパスと 1 文字も違わない。
+        // 届いたパスは、こちらが作ったパスと1文字も違わない。
         let want: Vec<String> = [name_a, name_b]
             .iter()
             .map(|n| RoomName::parse_server_rules(n).unwrap().path())
@@ -2757,7 +3177,7 @@ mod tests {
         assert_joins(&mut a, Duration::from_secs(3));
         assert_joins(&mut b, Duration::from_secs(3));
 
-        // こちらは通し（ASCII でないので長さを数えない）、サーバーが 400 で断る名。
+        // こちらは通すが（ASCIIでないので長さを数えない）サーバーが400で断る名。
         let long = "部".repeat(33);
         assert!(RoomName::parse_server_rules(&long).is_ok());
         let mut c = start(&f, &long);
@@ -2776,7 +3196,7 @@ mod tests {
     #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
     fn every_join_carries_the_same_client_id() {
         let f = FakeServer::start();
-        // ルームを替えても、入り直し（同じルームへ 2 度目）でも同じ値。
+        // ルームを替えても入り直し（同じルームへ2度目）でも同じ値。
         let mut a = start(&f, "cid-a");
         wait_state(&mut a, State::NeedOwnCode);
         a.cancel();
@@ -2849,6 +3269,9 @@ mod tests {
                 r#"{"error":"bad_room_name"}"#.into(),
                 Failure::BadRoomName,
             ),
+            (400, r#"{"error":"bad_ticket"}"#.into(), Failure::BadTicket),
+            (409, r#"{"error":"room_full"}"#.into(), Failure::RoomFull),
+            (409, r#"{"error":"room_in_use"}"#.into(), Failure::RoomInUse),
             (
                 429,
                 r#"{"error":"rate_limited","retry_after":7}"#.into(),
@@ -2871,10 +3294,14 @@ mod tests {
         let mut b = start(&f, "full");
         wait_state(&mut b, State::AwaitPeerCode);
         let mut c = start(&f, "full");
-        assert_eq!(wait_failure(&mut c), Failure::RoomFull);
+        assert_eq!(
+            wait_failure(&mut c),
+            Failure::RoomInUse,
+            "成立の前でも、対戦のルームの 3 人目は使用中"
+        );
         assert!(!a.is_finished() && !b.is_finished());
 
-        // 回数の歯止め: 1 回だけ通し、次は 429 と、クライアントが待つ秒の見本（index.ts と同じ本文と Retry-After ヘッダー）。
+        // 回数制限の検査。1回だけ通し、次は429と、クライアントが待つ秒数の見本（index.tsと同じ本文とRetry-Afterヘッダー）を返す。
         let f2 = FakeServer::start();
         f2.knobs.limit.store(1, Ordering::Release);
         let mut d = start(&f2, "limited");
@@ -2887,7 +3314,7 @@ mod tests {
             }
         );
 
-        // 誰も受けていない番号: 接続できない（WinHTTP の誤り）→ 応答しません。
+        // 誰も受けていないポートへ接続できない（WinHTTPの誤り）→ 応答しません。
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -2904,6 +3331,190 @@ mod tests {
                 .any(|n| matches!(n, TransportNote::OpenFailed { .. })),
             "繋がらなかった段階と番号を記録に残す"
         );
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_watch_room_hands_its_host_seat_only_to_a_connection_with_a_ticket_for_that_room() {
+        let f = FakeServer::start();
+        let opts = opts_for(&f.base());
+        let origin = RoomName::parse("Seat-Room").unwrap();
+        let w = origin.spectate_of();
+
+        // 空の観戦用のルームへチケットなし（観戦者の入り方）→ 409。
+        let mut c = RoomConn::start(&opts, &w).unwrap();
+        assert_eq!(wait_failure(&mut c), Failure::RoomFull);
+        // 別のルームの名のチケット → 400 bad_ticket。
+        let other = f.mint_ticket(&RoomName::parse("Seat-Room2").unwrap().spectate_of());
+        let mut c = RoomConn::start_as_host(&opts, &w, &other).unwrap();
+        assert_eq!(wait_failure(&mut c), Failure::BadTicket);
+        // 期限の切れたチケット → 409（観戦者と同じ断り）。
+        let ttl = f.rules().ticket_ttl_secs;
+        let old = f.mint_ticket_at(&w, unix_now() - ttl - 5);
+        let mut c = RoomConn::start_as_host(&opts, &w, &old).unwrap();
+        assert_eq!(wait_failure(&mut c), Failure::RoomFull);
+        // そのルームのチケット → host。クエリにはチケットだけが載り、元のルーム名は載らない。
+        let ticket = f.mint_ticket(&w);
+        let mut host = RoomConn::start_as_host(&opts, &w, &ticket).unwrap();
+        pump(&mut host, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Offer)
+        });
+        let queries = f.seen.queries.lock().unwrap().clone();
+        let last = queries.last().unwrap();
+        assert!(
+            last.ends_with(&format!("ticket={}", ticket.as_str())),
+            "{queries:?}"
+        );
+        assert!(
+            queries
+                .iter()
+                .all(|q| !q.to_ascii_lowercase().contains("seat-room") && !q.contains("origin")),
+            "{queries:?}"
+        );
+        // hostがいればチケットなしの観戦者はguestで入れる。3人目は409。
+        let mut guest = RoomConn::start(&opts, &w).unwrap();
+        pump(&mut guest, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Answer)
+        });
+        let mut third = RoomConn::start(&opts, &w).unwrap();
+        assert_eq!(wait_failure(&mut third), Failure::RoomFull);
+        // チケットは観戦用でないルームでは見ない（別の名のチケットでも普通に入る）。
+        let mut plain =
+            RoomConn::start_as_host(&opts, &RoomName::parse("plain").unwrap(), &other).unwrap();
+        pump(&mut plain, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Offer)
+        });
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_newer_ticket_takes_the_seat_and_an_equal_one_joins_as_a_guest() {
+        let f = FakeServer::start();
+        let opts = opts_for(&f.base());
+        let w = RoomName::parse("Evict-Room").unwrap().spectate_of();
+        let t = unix_now();
+        let mut a = RoomConn::start_as_host(&opts, &w, &f.mint_ticket_at(&w, t)).unwrap();
+        pump(&mut a, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Offer)
+        });
+        // 同じ発行のチケット（成立した相手のチケット）は席を取らない。
+        let mut same = RoomConn::start_as_host(&opts, &w, &f.mint_ticket_at(&w, t)).unwrap();
+        pump(&mut same, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Answer)
+        });
+        same.cancel();
+        assert_joins(&mut same, Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(100));
+        // より新しいチケットは前のhostを4410で閉じて席を取る。
+        let mut b = RoomConn::start_as_host(&opts, &w, &f.mint_ticket_at(&w, t + 5)).unwrap();
+        pump(&mut b, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Offer)
+        });
+        assert_eq!(wait_failure(&mut a), Failure::PeerLeft);
+        // 古いチケットで入り直すとguest。
+        let mut a2 = RoomConn::start_as_host(&opts, &w, &f.mint_ticket_at(&w, t)).unwrap();
+        pump(&mut a2, 0, Duration::from_secs(5), |e| {
+            joined_as(e, Role::Answer)
+        });
+        assert!(!b.is_finished());
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_room_match_hands_both_sides_a_ticket_that_takes_the_seat_of_the_watch_room_they_derive() {
+        for keyed in [true, false] {
+            let f = FakeServer::start();
+            f.knobs.no_seat_key.store(!keyed, Ordering::Release);
+            let mut a = start(&f, "Ticket-Room");
+            wait_state(&mut a, State::NeedOwnCode);
+            a.submit_code(OFFER_CODE).unwrap();
+            let mut b = start(&f, "ticket-room");
+            wait_state(&mut b, State::NeedOwnCode);
+            b.submit_code(ANSWER_CODE).unwrap();
+            pump(&mut a, 0, Duration::from_secs(5), |e| {
+                e.contains(&Event::Held)
+            });
+            pump(&mut b, 0, Duration::from_secs(5), |e| {
+                e.contains(&Event::Held)
+            });
+            if !keyed {
+                assert_eq!((a.ticket(), b.ticket()), (None, None), "鍵の無いサーバー");
+                // 鍵の無いサーバーは偽サーバーが作ったチケットでも席を渡さない。
+                let w = RoomName::parse("Ticket-Room").unwrap().spectate_of();
+                let mut c =
+                    RoomConn::start_as_host(&opts_for(&f.base()), &w, &f.mint_ticket(&w)).unwrap();
+                assert_eq!(wait_failure(&mut c), Failure::RoomFull);
+                continue;
+            }
+            let (ta, tb) = (
+                a.ticket().expect("始める側の札"),
+                b.ticket().expect("返す側の札"),
+            );
+            // 大文字小文字だけが違う名は同じ観戦用のルーム。どちらのチケットでも席が取れる。
+            let w = RoomName::parse("Ticket-Room").unwrap().spectate_of();
+            for t in [ta, tb] {
+                let mut h = RoomConn::start_as_host(&opts_for(&f.base()), &w, &t).unwrap();
+                pump(&mut h, 0, Duration::from_secs(5), |e| {
+                    joined_as(e, Role::Offer)
+                });
+                h.cancel();
+                assert_joins(&mut h, Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // そのチケットは別のルームの観戦用のルームでは使えない。
+            let elsewhere = RoomName::parse("Other-Room").unwrap().spectate_of();
+            let mut c = RoomConn::start_as_host(&opts_for(&f.base()), &elsewhere, &ta).unwrap();
+            assert_eq!(wait_failure(&mut c), Failure::BadTicket);
+            // クライアントはチケットを文では送らない（クエリに付けるだけ）。
+            assert_eq!(f.texts_matching(|t| t.contains("ticket")), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_watch_host_outlives_viewers_that_leave_or_time_out_without_answering() {
+        let f = FakeServer::start();
+        f.knobs.watch_answer_ttl_ms.store(400, Ordering::Release);
+        let opts = opts_for(&f.base());
+        let w = RoomName::parse("Outlive-Room").unwrap().spectate_of();
+        let mut host = RoomConn::start_as_host(&opts, &w, &f.mint_ticket(&w)).unwrap();
+        wait_state(&mut host, State::NeedOwnCode);
+        host.submit_code(OFFER_CODE).unwrap();
+        // 1人目はコードを受けて答えずに抜ける。
+        let mut v1 = RoomConn::start(&opts, &w).unwrap();
+        let evs = pump(&mut v1, 0, Duration::from_secs(5), |e| {
+            peer_code(e).is_some()
+        });
+        assert_eq!(peer_code(&evs).as_deref(), Some(OFFER_CODE));
+        v1.cancel();
+        let evs = pump(&mut host, 0, Duration::from_secs(5), |e| {
+            e.iter().any(|x| matches!(x, Event::Matched { .. }))
+        });
+        assert!(!has_failed(&evs), "{evs:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        // 2人目は同じコードを受け、答えの期限で閉じられる。hostにはmatchedがもう来ない。
+        let mut v2 = RoomConn::start(&opts, &w).unwrap();
+        let evs = pump(&mut v2, 0, Duration::from_secs(5), |e| {
+            peer_code(e).is_some()
+        });
+        assert_eq!(peer_code(&evs).as_deref(), Some(OFFER_CODE));
+        assert_eq!(wait_failure(&mut v2), Failure::Expired);
+        let evs = run_for(&mut host, 0, Duration::from_millis(300));
+        assert!(evs.is_empty(), "host に届いた: {evs:?}");
+        // 3人目が答えればhostはその返答を受けて終わる。
+        let mut v3 = RoomConn::start(&opts, &w).unwrap();
+        wait_state(&mut v3, State::NeedOwnCode);
+        v3.submit_code(ANSWER_CODE).unwrap();
+        let evs = pump(&mut host, 0, Duration::from_secs(5), |e| {
+            e.contains(&Event::Done)
+        });
+        assert_eq!(peer_code(&evs).as_deref(), Some(ANSWER_CODE));
     }
 
     // ---- 組み上がり: 手順の途中の失敗 ----
@@ -2934,7 +3545,8 @@ mod tests {
     #[test]
     #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
     fn a_leaving_peer_is_told() {
-        // サーバーは閉じる前に error の文を送る。文を省いて閉じる番号だけでも同じ結果になること（番号の受け渡しを文が隠さないこと）を両方で見る。
+        // サーバーは閉じる前にerrorの文を送る。
+        // 文を省いて閉じる番号だけでも同じ結果になること（番号の受け渡しを文が隠さないこと）を両方の場合で検証する。
         for no_error_text in [false, true] {
             let f = FakeServer::start();
             f.knobs
@@ -2958,6 +3570,79 @@ mod tests {
             drop(a);
             assert_eq!(wait_failure(&mut b), Failure::PeerLeft, "{no_error_text}");
         }
+    }
+
+    /// 対戦のルームで成立させ、2人とも保持状態にする。
+    fn held_pair(f: &FakeServer, room: &str) -> (RoomConn, RoomConn) {
+        let mut a = start(f, room);
+        wait_state(&mut a, State::NeedOwnCode);
+        a.submit_code(OFFER_CODE).unwrap();
+        let mut b = start(f, room);
+        wait_state(&mut b, State::NeedOwnCode);
+        b.submit_code(ANSWER_CODE).unwrap();
+        wait_state(&mut a, State::Holding);
+        wait_state(&mut b, State::Holding);
+        (a, b)
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_held_room_whose_sign_goes_stale_is_emptied_without_failing_either_side() {
+        let f = FakeServer::start();
+        f.knobs.held_stale_ms.store(400, Ordering::Release);
+        let (mut a, mut b) = held_pair(&f, "stale-room");
+        // aだけがpingを送り続ける（時計を30秒ずつ進めて渡す）。bは送らない。
+        let t0 = Instant::now();
+        let (mut evs_a, mut evs_b) = (Vec::new(), Vec::new());
+        let mut k = 0;
+        while !(a.is_finished() && b.is_finished()) {
+            k += 1;
+            let mut now = a.now();
+            now.ms += k * PING_INTERVAL_MS;
+            evs_a.extend(a.poll_at(now));
+            evs_b.extend(b.poll());
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "閉じない: {evs_a:?} {evs_b:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !has_failed(&evs_a) && !has_failed(&evs_b),
+            "{evs_a:?} {evs_b:?}"
+        );
+        assert!(evs_a.contains(&Event::Done) && evs_b.contains(&Event::Done));
+        let pings = f.texts_matching(|t| t == higanr_core::room::PING_TEXT);
+        assert!(pings >= 2, "a が ping を送っていない（{pings} 通）");
+        // 部屋は空いた。
+        let mut next = start(&f, "stale-room");
+        let evs = wait_state(&mut next, State::NeedOwnCode);
+        assert!(joined_as(&evs, Role::Offer), "{evs:?}");
+        for c in [&mut a, &mut b, &mut next] {
+            c.cancel();
+            assert_joins(c, Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
+    fn a_held_room_outlives_the_room_and_answer_deadlines() {
+        let f = FakeServer::start();
+        f.knobs.room_ttl_ms.store(300, Ordering::Release);
+        f.knobs.answer_ttl_ms.store(200, Ordering::Release);
+        let (mut a, mut b) = held_pair(&f, "long-room");
+        std::thread::sleep(Duration::from_millis(600));
+        let evs: Vec<Event> = [a.poll(), b.poll()].concat();
+        assert!(evs.is_empty(), "{evs:?}");
+        assert_eq!((a.state(), b.state()), (State::Holding, State::Holding));
+        // 返す側が手放しても始める側は失敗にせず終える。
+        b.cancel();
+        let evs = pump(&mut a, 0, Duration::from_secs(5), |e| {
+            e.contains(&Event::Done)
+        });
+        assert!(!has_failed(&evs), "{evs:?}");
+        assert_joins(&mut a, Duration::from_secs(3));
+        assert_joins(&mut b, Duration::from_secs(3));
     }
 
     #[test]
@@ -2985,8 +3670,8 @@ mod tests {
         assert_eq!(wait_failure(&mut b), Failure::Expired);
         assert_eq!(wait_failure(&mut a), Failure::Expired);
 
-        // サーバーが閉じた直後（見張りがまだ読んでいない間）にコードを出す: 送らずに NotSent を返し、失敗は「切れた」でなく
-        // 期限（届いていた番号の方）で返す。
+        // サーバーが閉じた直後（監視のスレッドがまだ読んでいない間）にコードを出す。
+        // 送らずにNotSentを返し、失敗は「切れた」でなく期限（届いていた番号の方）で返す。
         let f = FakeServer::start();
         f.knobs.room_ttl_ms.store(300, Ordering::Release);
         let mut a = start(&f, "expire-race");
@@ -3080,7 +3765,7 @@ mod tests {
             vec![Some(CLOSE_NORMAL)]
         );
 
-        // 何も答えないサーバー: 受信はその場で解け、閉じるスレッドは閉じる待ち（検査は 500 ms）で終わる。
+        // 何も答えないサーバーの場合。受信はその場で解け、閉じるスレッドは閉じる待ち時間（検査では500 ms）で終わる。
         let f = FakeServer::start();
         let mut c = start(&f, "cancel-2");
         wait_state(&mut c, State::NeedOwnCode);
@@ -3097,8 +3782,8 @@ mod tests {
             "閉じる待ちの分は止まる: {took:?}"
         );
 
-        // 接続する途中（TCP は受けるが HTTP に答えない）: 応答の先頭の待ちの上限で終わる（取りやめでは解けない。見張りは待たない）。
-        // 上限は 300 ms に設定し、WinHTTP の見回りの間隔（約 4 秒）の分を見込む。相手が切る 9 秒より前。
+        // 接続の途中（TCPは受けるがHTTPに答えない）の場合。応答の先頭の待ち時間の上限で終わる（取りやめでは解けない。監視のスレッドは待たない）。
+        // 上限は300 msに設定し、WinHTTPの定期処理の間隔（約4秒）の分を見込む。相手が切る9秒より前になる。
         let (port, hold) = raw_server(None, Duration::from_secs(9));
         let t0 = Instant::now();
         let mut o = opts_for(&format!("ws://127.0.0.1:{port}"));
@@ -3116,7 +3801,7 @@ mod tests {
         hold.join().unwrap();
     }
 
-    /// 1 本だけ受ける生の TCP の相手。要求の先頭を読み、`reply` があれば書き、`hold` の間持ってから切る。
+    /// 1本だけ受ける生のTCPの相手。要求の先頭を読み`reply`があれば書き、`hold`の間保持してから切る。
     fn raw_server(reply: Option<&'static [u8]>, hold: Duration) -> (u16, JoinHandle<()>) {
         use std::io::{Read, Write};
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3137,7 +3822,7 @@ mod tests {
         (port, h)
     }
 
-    // ---- WinHTTP の振る舞い ----
+    // ---- WinHTTPの振る舞い ----
 
     fn ep(f: &FakeServer, room: &str) -> Endpoint {
         Base::parse(&f.base())
@@ -3171,8 +3856,9 @@ mod tests {
     #[test]
     #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
     fn winhttp_facts_receive_timeout_does_not_bound_ws_receive() {
-        // WinHTTP の時間切れは粗い間隔（約 4 秒）で見回るので、300 ms を設定しても切れるのは最大 4 秒余り後。相手が切る（8 秒）より前に切れたこと・
-        // WebSocket の受信がその間隔を越えても戻らないことを見る。3 つは同時に走らせる（待ちを重ねない）。
+        // WinHTTPのタイムアウトは粗い間隔（約4秒）の定期処理で調べるので、300 msを設定しても切れるのは最大4秒余り後になる。
+        // 検証するのは、相手が切る（8秒）より前に切れたことと、WebSocketの受信がその間隔を越えても戻らないこと。
+        // 3つは同時に走らせる（待ちを重ねない）。
         let t = Timeouts {
             response_ms: 300,
             ..test_timeouts()
@@ -3195,7 +3881,7 @@ mod tests {
             let r = WebSocket::open(&raw_endpoint(port2), Proxy::Direct, t, 4096);
             (r.err(), t0.elapsed())
         });
-        // 効かない側: 同じ設定で Upgrade した WebSocket の受信は、文が来なければ間隔を越えても戻らない。
+        // 効かない側の検証。同じ設定でUpgradeしたWebSocketの受信は文が来なければ間隔を越えても戻らない。
         let f = FakeServer::start();
         let ws = open_ws(&f, "rt", t);
         assert_eq!(ws.try_set_receive_timeout(300), Err(12018));
@@ -3305,7 +3991,7 @@ mod tests {
         }
     }
 
-    /// Wine の winhttp は WebSocket のハンドルの close の待ちの設定を 12009 で断る。それでも開けて、送受信も閉じる処理もできる。
+    /// WineのwinhttpはWebSocketのハンドルのcloseの待ち時間の設定を12009で断る。それでも開けて送受信も閉じる処理もできる。
     #[test]
     #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
     fn open_survives_a_refused_close_timeout() {
@@ -3328,7 +4014,7 @@ mod tests {
         );
         assert_eq!(ws.close(CLOSE_NORMAL), Ok(()));
 
-        // 通常の経路は設定できて、印が付かない。
+        // 通常の経路は設定できる。印は付かない。
         let ws = open_ws(&f, "normal", test_timeouts());
         assert_eq!(ws.close_timeout_error(), None);
     }
@@ -3417,11 +4103,11 @@ mod tests {
         assert_eq!(*f.seen.assigned.lock().unwrap(), vec![room_a.clone()]);
         let paths = f.seen.paths.lock().unwrap().clone();
         assert_eq!(paths, vec!["/v0/random/403920"; 2]);
-        // 終わった後に閉じる番号が来ても出来事は増えない。
+        // 終わった後に閉じる番号が来てもイベントは増えない。
         assert!(a.poll().is_empty() && b.poll().is_empty());
         assert_joins(&mut a, Duration::from_secs(3));
         assert_joins(&mut b, Duration::from_secs(3));
-        // 割り当てられたルームには、今のルームの手順で入って先に着いた方が始める側になる。
+        // 割り当てられたルームには今のルームの手順で入り、先に着いた方が始める側になる。
         let name = RoomName::parse_server_rules(&room_a).unwrap();
         let mut ra = RoomConn::start(&opts_for(&f.base()), &name).unwrap();
         let evs = wait_state(&mut ra, State::NeedOwnCode);
@@ -3443,7 +4129,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(250));
         assert!(a.poll().is_empty() && b.poll().is_empty());
         assert!(f.seen.assigned.lock().unwrap().is_empty());
-        // 同じ番号の人が来れば、その人と組になる。
+        // 同じ番号の人が来ればその人とペアになる。
         let mut c = start_queue(&f, 8);
         pump_queue(&mut c, 0, Duration::from_secs(5), |e| paired(e).is_some());
         pump_queue(&mut b, 0, Duration::from_secs(5), |e| paired(e).is_some());
@@ -3461,7 +4147,7 @@ mod tests {
         });
         assert_eq!(queue_failure(&evs), Some(Failure::Expired));
         assert_joins(&mut a, Duration::from_secs(3));
-        // 取りやめた人は待ち列に残らない: 次に来た人は組にならない。
+        // 取りやめた人は待ち列に残らない。次に来た人はペアにならない。
         f.knobs.random_queue_ttl_ms.store(0, Ordering::Release);
         let mut b = start_queue(&f, 2);
         pump_queue(&mut b, 0, Duration::from_secs(5), queued);
@@ -3505,7 +4191,7 @@ mod tests {
             }),
             "ルームと同じ 1 本の数え"
         );
-        // ルームへの接続も同じ数えに入る（待ち列の 1 回で上限）。
+        // ルームへの接続も同じカウントに入る（待ち列の1回で上限）。
         let mut r = start(&f, "limit-shared");
         assert_eq!(
             wait_failure(&mut r),
@@ -3513,11 +4199,11 @@ mod tests {
                 retry_after_secs: f.rules().retry_after_secs as u32
             }
         );
-        // queue が来ない・pong が来ない。
+        // queueが来ない・pongが来ない。
         let f = FakeServer::start();
         f.knobs.no_room.store(true, Ordering::Release);
         let mut c = start_queue(&f, 1);
-        // 101 を受けてから時計を進める（受ける前に進めると、期限が進めた時計から数え始まる）。
+        // 101を受けてから時計を進める（受ける前に進めると期限が進めた時計から数え始まる）。
         let t0 = Instant::now();
         while f.seen.queue_upgrades.load(Ordering::Acquire) == 0
             || t0.elapsed() < Duration::from_millis(300)

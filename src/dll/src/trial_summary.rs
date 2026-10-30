@@ -1,8 +1,13 @@
-//! 試験のまとめ（pure。unsafe 無し）: 試験のあと本ログだけを読んで「どこが上手くいき、どこが上手くいかなかったか」が分かるよう、項目ごとに 〇（うまくいった）/ ×（うまくいかなかった）/ －（試していない・まだ分からない）と、次にすることが分かる短い理由を 1 行ずつ出す。
+//! 試験のまとめ（pure。unsafe無し）。
+//! 試験のあと本ログだけを読んで「どこが上手くいき、どこが上手くいかなかったか」が分かるようにする。
+//! 項目ごとに 〇（うまくいった）/ ×（うまくいかなかった）/ －（試していない・まだ分からない）の印と、次にすることが分かる短い理由を1行ずつ出す。
 //!
-//! 集めた値 `Facts`（読み取りのスレッドが作る。ゲームのスレッドには何も足さない）から、判断 `judge` が 14 項目の `Item` を作り、`render` が本ログの節にする。見つけた値だけを使い、値が無ければ －（0 件・100% を「うまくいった」と読まない）。
-//! 書き出す時期は `observe::run_len`（1 秒ごとに印の並びが変わったときと 60 秒ごとの「途中経過」）と `session::run` の最後（節の名前は「==== 試験のまとめ ====」）。ゲームを閉じて終えるとプロセスごと消えて終わりの節が書かれないことがあるので、途中経過も残す。
-//! 配るバージョン（feature `dist`）でも出る。文言は配るバージョンの走査の語（`tools/make_dist.py` の `INTERNAL_WORDS`）を使わない。
+//! 集めた値`Facts`（読み取りのスレッドが作る。ゲームのスレッドには何も足さない）から判断`judge`が14項目の`Item`を作り、`render`が本ログの節にする。
+//! 見つけた値だけを使う。値が無ければ －（0件・100%を「うまくいった」と読まない）。
+//!
+//! 書き出す時期は`observe::run_len`（1秒ごとに印の並びが変わったときと60秒ごとの「途中経過」）と`session::run`の最後（節の名前は「==== 試験のまとめ ====」）。
+//! ゲームを閉じて終えるとプロセスごと消えて終わりの節が書かれないことがあるので途中経過も残す。
+//! 配布バージョン（feature `dist`）でも出る。文言は配布バージョンの走査の語（`tools/make_dist.py`の`INTERNAL_WORDS`）を使わない。
 #![forbid(unsafe_code)]
 
 use std::net::{IpAddr, SocketAddr};
@@ -67,7 +72,7 @@ pub enum PaceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pacing {
     pub kind: PaceKind,
-    /// ini（か既定）が求めた形と、実際に使う形（始まりを用意できなければ game になる）。
+    /// ini（か既定）が求めた形と実際に使う形（始まりを用意できなければgameになる）。
     pub requested: Option<&'static str>,
     pub used: Option<&'static str>,
 }
@@ -134,11 +139,11 @@ pub enum Refusal {
     WrongKind,
     NoRoute,
     Internal,
-    /// 相手のコードのバージョンが違う（`theirs` はコードのバージョン、自分のバージョンは `PROTO_VER`）。
+    /// 相手のコードのバージョンが違う（`theirs`はコードのバージョン。自分のバージョンは`PROTO_VER`）。
     OtherVersion {
         theirs: u8,
     },
-    /// 相手のコードのビルド番号が違う（`theirs` はコードの値、自分は `update::BUILD_NUMBER`）。
+    /// 相手のコードのビルド番号が違う（`theirs`はコードの値。自分は`update::BUILD_NUMBER`）。
     OtherBuild {
         theirs: u32,
     },
@@ -178,14 +183,14 @@ impl Refusal {
     }
 }
 
-/// ゲーム内のメニューで、相手を探すために選んだ項目（名前の原本は `net_menu`。本ログの文字は `link_log::route_name`）。
+/// ゲーム内のメニューで相手を探すために選んだ項目（名前の原本は`net_menu`。本ログの文字は`link_log::route_name`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Random,
     Room,
     /// 「対戦コード作成」（始める側）。
     Create,
-    /// 「対戦コード入力」（返す側）。
+    /// 「対戦コード入力」（返答する側）。
     Paste,
     Lan,
 }
@@ -200,13 +205,13 @@ pub struct CodeFacts {
     pub connected_at: Option<f32>,
     pub ended_unconnected: bool,
     pub gave_up: bool,
-    /// ゲーム内のメニューの実行で、選んだ項目と、選んだ時刻（`peer_read_at` と同じ、見張りを作ってからの秒）。何も選ばなかった実行（観戦だけの起動を含む）は None。
+    /// ゲーム内のメニューの実行で選んだ項目と選んだ時刻（`peer_read_at`と同じ。監視の処理を作ってからの秒）。何も選ばなかった実行（観戦だけの起動を含む）はNone。
     pub route: Option<Route>,
     pub chosen_at: Option<f32>,
-    /// ランダムマッチで待ち列から組になった時刻と、自分が待ち列に先に入ったか。
+    /// ランダムマッチで待ち列からペアになった時刻と、自分が待ち列に先に入ったかどうか。
     pub paired_at: Option<f32>,
     pub queue_first: Option<bool>,
-    /// 相手のコードを読んでセッションの設定を組み込んだときの自分の側（始める側 / 返す側）と、接続したときの対戦のホストか。
+    /// 相手のコードを読んでセッションの設定を組み込んだときの自分の側（始める側 / 返答する側）と、接続したときの対戦のホストかどうか。
     pub placed_side: Option<CodeSide>,
     pub host: Option<bool>,
 }
@@ -236,7 +241,7 @@ impl CodeFacts {
 pub struct ReplayFacts {
     pub attempts: u32,
     pub saved: u32,
-    /// 保存関数を呼ばなかった（書き込みが足りない見込み）・呼んだがファイルが 0 バイト・印を足せなかった・保存先の準備ができなかった。
+    /// 保存関数を呼ばなかった（書き込みが足りない見込み）・呼んだがファイルが0バイト・印を足せなかった・保存先の準備ができなかった。
     pub not_called: u32,
     pub empty_file: u32,
     pub mark_failed: u32,
@@ -245,7 +250,7 @@ pub struct ReplayFacts {
 }
 
 impl ReplayFacts {
-    /// うまくいかなかった回数。保存先の準備の失敗は、あとで 1 本でも保存できていれば持ち直したので数えない（2 秒ごとに試し直すので続く間は増え続ける）。
+    /// うまくいかなかった回数。保存先の準備の失敗はあとで1本でも保存できていれば持ち直したので数えない（2秒ごとに試し直すので続く間は増え続ける）。
     fn failures(&self) -> u32 {
         let prep = if self.saved == 0 { self.prep_failed } else { 0 };
         self.not_called + self.empty_file + self.mark_failed + prep
@@ -270,18 +275,18 @@ impl ReplayFacts {
     }
 }
 
-/// 読み取りのスレッドが、ゲームの中の静的な値から引く値（ネットワークを開いたときのこと・接続コードの状態・パニック・自動保存）。
+/// 読み取りのスレッドがゲームの中の静的な値から取得する値（ネットワークを開いたときのこと・接続コードの状態・パニック・自動保存）。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HostFacts {
     pub open: Option<OpenInfo>,
     pub code: Option<CodeFacts>,
     pub net_panicked: bool,
     pub replay: ReplayFacts,
-    /// ゲーム内のメニューの実行（`code_side = game`）で、ネットワークを開く頼みが来たか（メニューが無い実行は `NotMenu`）。
+    /// ゲーム内のメニューの実行（`code_side = game`）でネットワークを開く要求が来たかどうか（メニューが無い実行は`NotMenu`）。
     pub menu: MenuNet,
 }
 
-/// ゲーム内のメニューの実行の、ネットワークの開き方の段階。メニューは最初の「作る」「貼る」までネットワークを開かないので、その前に終わった回は「ネットワークを使う設定だが、まだ開いていない」。
+/// ゲーム内のメニューで実行したときのネットワークの開き方の段階。メニューは最初の「作る」「貼る」までネットワークを開かないので、その前に終わった実行は「ネットワークを使う設定だが、まだ開いていない」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MenuNet {
     #[default]
@@ -309,7 +314,7 @@ fn menu_unopened(f: &Facts) -> bool {
     f.host.menu == MenuNet::NotAsked && f.host.open.is_none()
 }
 
-/// ネットワークを開く頼み（`UiOut::open_net`）を出す項目。名前の原本は `net_menu`。LAN と観戦はこの頼みを出さない。
+/// ネットワークを開く要求（`UiOut::open_net`）を出す項目。名前の原本は`net_menu`。LANと観戦はこの要求を出さない。
 fn menu_not_opened() -> String {
     use higanr_core::net_menu::{T_CREATE, T_PASTE, T_RANDOM, T_ROOM};
     format!(
@@ -318,7 +323,7 @@ fn menu_not_opened() -> String {
     )
 }
 
-/// ネットワークの数の項目の先頭のチェック: ネットワークを使わない実行・メニューでネットワークを開かなかった実行は、理由つきの － を返す。
+/// ネットワークの数の項目の先頭のチェック: ネットワークを使わない実行・メニューでネットワークを開かなかった実行は理由つきの － を返す。
 fn net_or_skip(f: &Facts, name: &'static str) -> Result<NetSnapshot, Item> {
     if menu_unopened(f) {
         return Err(skip(name, menu_not_opened()));
@@ -332,7 +337,7 @@ fn addr_kind(a: SocketAddr) -> &'static str {
     higanr_core::log_scrub::ip_kind(a.ip())
 }
 
-/// 受信ソケットのアドレスの呼び名。VPN の範囲のネットワークの中のアドレスは、インターネットのアドレスと見分けて「VPN」と書く。
+/// 受信ソケットのアドレスの呼び名。VPNの範囲のネットワークの中のアドレスはインターネットのアドレスと見分けて「VPN」と書く。
 fn local_kind(local: SocketAddr, scope: Scope) -> &'static str {
     match (scope, local.ip()) {
         (Scope::LanVpn(net), IpAddr::V4(ip)) if net.contains_host(ip) => "VPN",
@@ -340,7 +345,7 @@ fn local_kind(local: SocketAddr, scope: Scope) -> &'static str {
     }
 }
 
-/// 経路の呼び名。`vpn` は VPN の範囲で開いた実行（その範囲の外側のアドレスは VPN のネットワークの中の 1 台だけ）。
+/// 経路の呼び名。`vpn`はVPNの範囲で開いた実行（その範囲の外側のアドレスはVPNのネットワークの中の1台だけ）。
 fn path_kind(k: u32, vpn: bool) -> &'static str {
     match k {
         1 => "同じ PC の中",
@@ -356,7 +361,7 @@ fn secs(ms: u32) -> String {
     format!("{:.1}", f64::from(ms) / 1000.0)
 }
 
-/// ズレの行の末尾の案内。詳細なログには使ったフレームの CSV があるので見比べる。簡潔なログには無いので、詳細で再現するよう案内する。
+/// ズレの行の末尾の案内。詳細なログには使ったフレームのCSVがあるので見比べる。簡潔なログには無いので詳細で再現するよう案内する。
 pub fn compare_frames_hint() -> &'static str {
     if crate::log_mode::detail() {
         "_net_frames.csv.gz の同じ seg・frame の前後を、両者のファイルで見比べる"
@@ -389,7 +394,7 @@ pub fn check_diff(a: &Check, b: &Check) -> Vec<&'static str> {
     v
 }
 
-/// ズレの時点の両者の CHECK を 1 つの文に（本ログの「ネットワーク:」の行と、まとめの「同期」の行が使う）。
+/// ズレの時点の両者のCHECKを1つの文に（本ログの「ネットワーク:」の行とまとめの「同期」の行が使う）。
 pub fn desync_text(local: &Check, remote: &Check) -> String {
     let diff = check_diff(local, remote);
     format!(
@@ -406,7 +411,7 @@ pub fn desync_text(local: &Check, remote: &Check) -> String {
 
 const FRAME_US: u64 = 16_667;
 
-/// 片道（RTT の半分）が delay フレーム分の時間を超えるか。超えると、相手の入力ワードが使う時刻までに届かず、自分のゲームが毎フレーム待つはず。
+/// 片道（RTTの半分）がdelayフレーム分の時間を超えるかどうか。超えると相手の入力ワードが使う時刻までに届かず、自分のゲームが毎フレーム待つはず。
 pub fn rtt_exceeds_delay(rtt_ms: u32, delay: u32) -> bool {
     delay > 0 && u64::from(rtt_ms) * 1_000 / 2 > u64::from(delay) * FRAME_US
 }
@@ -622,7 +627,7 @@ fn stun(f: &Facts) -> Item {
             N_STUN,
             "使っていない（ini に stun の指定が無い。同じ家の中の相手だけなら要らない）",
         ),
-        // 外側のポートが受信ソケットと同じか・待つ間の聞き直しの数（アドレス・ポートの値は書かない）。診断が無い実行は 1 句のまま。
+        // 外側のポートが受信ソケットと同じか・待つ間の聞き直しの数（アドレス・ポートの値は書かない）。診断が無い実行は1句のまま。
         Some(Stun::Seen) => {
             let tail = f
                 .net
@@ -657,7 +662,7 @@ fn code(f: &Facts) -> Item {
     let Some(c) = &f.host.code else {
         return skip(N_CODE, "接続コードを使わない設定");
     };
-    // ゲーム内のメニューの実行で相手を探す項目を選んでいない（観戦だけの起動など）。コードを使っていないので、貼られない・終わったとは言わない。
+    // ゲーム内のメニューの実行で相手を探す項目が未選択（観戦だけの起動など）。コードを使っていないので貼られない・終わったとは言わない。
     if c.side == CodeSide::Game && c.route.is_none() {
         return skip(
             N_CODE,
@@ -675,7 +680,7 @@ fn code(f: &Facts) -> Item {
         }
         .to_string()
     });
-    // ランダムマッチとルームマッチは、人がコードを見ない（サーバーを通して自動で受け渡す）ので「貼る・読む」と言わない。
+    // ランダムマッチとルームマッチは人がコードを見ない（サーバーを通して自動で受け渡す）ので「貼る・読む」と言わない。
     let by_server = matches!(c.route, Some(Route::Random | Route::Room));
     if let Some(t) = c.peer_read_at {
         let again = match (c.refused, c.last_refusal) {
@@ -715,7 +720,7 @@ fn code(f: &Facts) -> Item {
             format!("{side}。{what}（{} 回）: {}", c.refused, r.text()),
         );
     }
-    // 次にすること: ゲーム内のメニューは起動し直さずにメニューから接続し直せる。ローダーのウィンドウの形は起動し直す。
+    // 次にすること: ゲーム内のメニューは起動し直さずにメニューから接続し直せる。ローダーのウィンドウから起動した場合は起動し直す。
     let again = match c.route {
         Some(r) if c.side == CodeSide::Game => format!(
             "「妖怪 対 妖怪」からメニューを開き、「{}」を選び直す",
@@ -789,8 +794,9 @@ fn link(f: &Facts) -> Item {
         Ok(s) => s,
         Err(item) => return item,
     };
-    // 接続できなかった理由を読むための診断（送った HELLO の数・候補の数・コードの外側のアドレスの古さ・聞き直し）。セッションを作った後だけ付ける
-    // （作る前は数が全部 0 で、0 件と測っていないが見分けられない）。
+    // 接続できなかった理由を読むための診断（送ったHELLOの数・候補の数・コードの外側のアドレスの古さ・聞き直し）。
+    // セッションを作った後だけ付ける。
+    // 作る前は数が全部0になり、0件だったのか測っていないのか見分けられないため。
     let diag = if s.has_link_box() {
         format!("。{}", s.diag_text())
     } else {
@@ -837,8 +843,9 @@ fn link(f: &Facts) -> Item {
     skip(N_LINK, format!("まだ接続していない{diag}"))
 }
 
-/// 選択が揃ったときの、ホストの値との食い違いの数。マップ・難易度は食い違えばホストの値を採って続く（`selection::Agreed`）。オプションのダイジェストは記録だけ。
-/// 揃った回数が数えられていない（最後の 1 回の印だけある）ときは、その 1 回の印から言う。
+/// 選択が揃ったときのホストの値との食い違いの数。
+/// マップ・難易度は食い違えばホストの値を採って続く（`selection::Agreed`）。オプションのダイジェストは記録だけ。
+/// 揃った回数が数えられていない（最後の1回の印だけある）ときはその1回の印から言う。
 fn select_diff_text(s: &NetSnapshot) -> String {
     let last = s.agreed_mismatch.unwrap_or(0);
     let bit = |b: u8| u32::from(last & b != 0);
@@ -895,7 +902,7 @@ fn select(f: &Facts) -> Item {
         }
         _ => {}
     }
-    // 食い違いは × にしない。マップ・難易度はホストの値を採って続く作りで（`selection::Agreed`）、ここで返すと後ろの判定が隠れる。
+    // 食い違いは × にしない。マップ・難易度はホストの値を採って続く作り（`selection::Agreed`）なのでここで返すと後ろの判定が隠れる。
     if s.menu_align_miss > 0 || s.menu_lost > 0 {
         return bad(
             N_SELECT,
@@ -905,7 +912,7 @@ fn select(f: &Facts) -> Item {
             ),
         );
     }
-    // 押下が入ったか、SELECT が両者で揃った（揃った値がある）なら選択は通っている（選択の画面を持たない偽のゲームは押下が 0 のまま SELECT だけが揃う）。
+    // 押下が入った・SELECTが両者で揃った（揃った値がある）のどちらかなら選択は通っている（選択の画面を持たない偽のゲームは押下が0のままSELECTだけが揃う）。
     if s.menu_applied > 0 || s.agreed_mismatch.is_some() {
         return ok(
             N_SELECT,
@@ -1017,7 +1024,7 @@ fn rtt(f: &Facts) -> Item {
         Err(item) => return item,
     };
     match s.rtt_ms {
-        // rollback は待たずに予測する。RTT の大きさだけでは × にせず、片道が D を超えるときは理由を添えて － にする。
+        // rollbackは待たずに予測する。RTTの大きさだけでは × にせず、片道がDを超えるときは理由を添えて － にする。
         Some(ms) if s.rollback && rtt_exceeds_delay(ms, s.delay) => skip(
             N_RTT,
             format!(
@@ -1056,7 +1063,7 @@ fn ending(f: &Facts) -> Item {
     end_item(N_END, s.end, s.end_detail)
 }
 
-/// 終わりの種類（`NetSnapshot::end`）とその中身 `d` の印と文。試合の終わりの行（`match_events`）が同じ文を使う。
+/// 終わりの種類（`NetSnapshot::end`）とその中身`d`の印と文。試合の終わりの行（`match_events`）が同じ文を使う。
 pub fn end_item(name: &'static str, end: u32, d: u32) -> Item {
     match end {
         0 => skip(name, "ネットワークはまだ終わっていない"),
@@ -1102,7 +1109,7 @@ pub fn end_item(name: &'static str, end: u32, d: u32) -> Item {
             name,
             "接続したが、対戦が成立しないまま時間切れで閉じた（どちらかが「妖怪 対 妖怪」を選ばなかった）",
         ),
-        // 8 と同じくツールの不具合ではない（相手の使い方・バージョンの違い）。
+        // 8と同じくツールの不具合ではない（相手の使い方・バージョンの違い）。
         9 => skip(
             name,
             "接続したが、相手の HiganRTool が古いか、相手がゲーム内のメニューから接続していないので閉じた（相手の READY が来ないまま選択の通信が来た）",
@@ -1111,7 +1118,7 @@ pub fn end_item(name: &'static str, end: u32, d: u32) -> Item {
             name,
             "接続したが、対戦が成立しないまま相手が閉じた（相手の時間切れか、相手が抜けた。相手のログを見る）",
         ),
-        // 相手の HiganRTool のバージョンが違う（`net_watch::END_OTHER_VERSION`）。ツールの使い方で直る（同じ zip を使う）が、マッチはできなかった。
+        // 相手のHiganRToolのバージョンが違う（`net_watch::END_OTHER_VERSION`）。ツールの使い方で直る（同じzipを使う）がマッチはできなかった。
         11 => bad(
             name,
             other_version_text(PROTO_VER, u8::try_from(d).unwrap_or(u8::MAX)),
@@ -1210,8 +1217,9 @@ pub fn marks(items: &[Item]) -> Vec<Mark> {
     items.iter().map(|i| i.mark).collect()
 }
 
-/// RTT 以外の印の並び（変わったときだけ途中経過を書くための比べ用）。rollback の RTT は片道が D の時間をまたいで 〇 ⇄ － と揺れて変わりの大半を占めるため、比べから外す。
-/// 外す項目は名（`N_RTT`）で決める。
+/// RTT以外の印の並び（変わったときだけ途中経過を書くための比較用）。
+/// rollbackのRTTは片道がDの時間をまたぐたびに 〇 ⇄ － と揺れる。変化の大半を占めるので比較から外す。
+/// 外す項目は名前（`N_RTT`）で決める。
 pub fn marks_without_rtt(items: &[Item]) -> Vec<Mark> {
     items
         .iter()
@@ -1220,8 +1228,8 @@ pub fn marks_without_rtt(items: &[Item]) -> Vec<Mark> {
         .collect()
 }
 
-/// 簡潔なログの途中経過: 前に書いた項目から印が変わった項目だけ。`prev` が無い（最初の）ときは 〇 と × の項目（－ は書かない）。
-/// RTT は 〇 と － の間を行き来するので見ない（`marks_without_rtt` と同じ）。
+/// 簡潔なログの途中経過: 前に書いた項目から印が変わった項目だけ。`prev`が無い（最初の）ときは 〇 と × の項目（－ は書かない）。
+/// RTTは 〇 と － の間を行き来するので見ない（`marks_without_rtt`と同じ）。
 pub fn render_changes(k: u32, items: &[Item], prev: Option<&[Item]>) -> String {
     let mut out = format!("==== 状態の変化（{k} 秒の時点） ====\n");
     for (i, it) in items.iter().enumerate() {
@@ -1251,7 +1259,7 @@ pub fn render(f: &Facts) -> String {
     out
 }
 
-/// 検査用: 設置が全部うまくいき、ネットワークと自動保存を入れた実行の、設置までの材料。
+/// 検査用: 設置が全部うまくいき、ネットワークと自動保存を有効にした実行の設置までの材料。
 #[cfg(test)]
 pub(crate) fn installed_game_facts() -> GameFacts {
     GameFacts {
@@ -1736,7 +1744,7 @@ mod tests {
             t.contains("コードは使っていない") && !t.contains("貼られ"),
             "{t}"
         );
-        // 同じ状態でも、項目を選んでいれば今までどおり ×。
+        // 同じ状態でも項目を選択していれば今までどおり ×。
         f.host.code.as_mut().unwrap().route = Some(Route::Create);
         assert_eq!(mark_of(&f, N_CODE), Mark::Bad);
     }
@@ -1830,7 +1838,7 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("やり直す"), "{t}");
-        // 食い違いがあっても、後ろの判定（カーソル・押下）は隠れない。
+        // 食い違いがあっても後ろの判定（カーソル・押下）は隠れない。
         net_mut(&mut f).menu_align_miss = 1;
         assert_eq!(mark_of(&f, N_SELECT), Mark::Bad);
         assert!(text_of(&f, N_SELECT).contains("カーソルを合わせられなかった 1 回"));
@@ -2212,7 +2220,9 @@ mod tests {
         assert_eq!(mark_of(&f, N_CODE), Mark::Ok);
     }
 
-    /// 「接続できなかった」回（家の中の相手・STUN は答えた・相手のコードは読めたが、相手から 10 秒 1 通も届かず 3 回作り直して終わった）の節の全文を見本として固定する（文言を変えたらここも直す）。
+    /// 「接続できなかった」実行の節の全文を見本として固定する。
+    /// 実行の内容: 家の中の相手・STUNは答えた・相手のコードは読めた。ただし相手から10秒1通も届かず3回作り直して終わった。
+    /// 文言を変えたらここも直す。
     #[test]
     fn a_link_that_never_came_up_reads_top_to_bottom() {
         let mut f = good();

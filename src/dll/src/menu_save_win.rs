@@ -1,8 +1,10 @@
-//! ゲームのメニューから保存するリプレイの入口と、印を足すスレッドの Win32 の層（unsafe はここに閉じ込める。1 つずつ `// SAFETY:`）。
+//! ゲームのメニューから保存するリプレイの入口と印を足すスレッドのWin32の層（unsafeはここに閉じ込める。1つずつ`// SAFETY:`）。
 //!
-//! 保存関数 `0x00420C60` を呼ぶゲームの 2 か所（保存の画面 `0x004297F1`・内蔵のネット対戦の自動保存 `0x00429BF6`）の rel32 を、`DllMain` の中（ゲームの主スレッドがまだ走っていない）で自前の入口 `menu_save_entry` へ向ける。
-//! 入口は (1) 見積もりのループが読む場所へ本当の印を書く踏み台 `replay_save_win::save_call` 経由で保存関数を呼び（長い試合で確保を越えて書く不具合の避け方）、(2) 戻った後にパス・始めの時刻・game_mode を `SaveSignal` に書く。
-//! ファイルを触るのは別のスレッドで、判断は `menu_save.rs`。ゲームのスレッドの入口は確保・ファイル I/O・ログの書き出し・待ちをしない。
+//! 保存関数`0x00420C60`を呼ぶゲームの2か所（保存の画面`0x004297F1`・内蔵のネット対戦の自動保存`0x00429BF6`）のrel32を`DllMain`の中（ゲームの主スレッドがまだ走っていない）で自前の入口`menu_save_entry`へ向ける。
+//! 入口は次をする。
+//! (1) 見積もりのループが読む場所へ本当の印を書くトランポリン`replay_save_win::save_call`経由で保存関数を呼ぶ（長い試合で確保を越えて書く不具合の避け方）。
+//! (2) 戻った後にパス・始めの時刻・game_modeを`SaveSignal`に書く。
+//! ファイルを触るのは別のスレッド。判断は`menu_save.rs`にある。ゲームのスレッドの入口は確保・ファイルI/O・ログの書き出し・待ちをしない。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -35,22 +37,22 @@ use crate::th09_addr::{
 };
 use crate::win::{debug_out, read_own_into, read_own_memory};
 
-/// 印に書く HiganRTool のバージョン名（ワークスペースの `version`）。
+/// 印に書くHiganRToolのバージョン名（ワークスペースの`version`）。
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// ゲームのスレッドが書き、印を足すスレッドが拾う合図。
+/// ゲームのスレッドが書き、印を足すスレッドが拾う通知。
 static SIGNAL: SaveSignal = SaveSignal::new();
 
-/// 保存関数の型。MSVC の `__fastcall`（ecx = this、edx = パス、スタックに名前の 1 語、呼ばれた側が `ret 4`）は Rust の `extern "fastcall"` と同じ約束。
+/// 保存関数の型。MSVCの`__fastcall`（ecx = this、edx = パス、スタックに名前の1ワード、呼ばれた側が`ret 4`）はRustの`extern "fastcall"`と同じ約束。
 type SaveFn = unsafe extern "fastcall" fn(u32, u32, u32) -> u32;
 
-/// ゲームから呼ばれる入口。2 か所の呼び出しの rel32 がここへ向く。引数は元の保存関数と同じ。
+/// ゲームから呼ばれる入口。2か所の呼び出しのrel32がここへ向く。引数は元の保存関数と同じ。
 pub extern "fastcall" fn menu_save_entry(this: u32, path: u32, name: u32) -> u32 {
     entry_with(&SIGNAL, REPLAY_SAVE_FN, GAME_MODE, this, path, name)
 }
 
-/// 入口の本体。`save_fn` は保存関数、`mode_addr` は `game_mode` の語（検査では自前の変数）。ゲームのスレッドで走る。
-/// 読めない・パニックしたときも、ゲームの保存は必ず呼ぶ（保存が起きないことは避ける）。
+/// 入口の本体。`save_fn`は保存関数、`mode_addr`は`game_mode`のワード（検査では自前の変数）。ゲームのスレッドで走る。
+/// 読めない・パニックしたときもゲームの保存は必ず呼ぶ（保存が起きないことは避ける）。
 pub(crate) fn entry_with(
     signal: &SaveSignal,
     save_fn: u32,
@@ -62,14 +64,14 @@ pub(crate) fn entry_with(
     let started = now_ms();
     let flags = catch_unwind(|| read_flags(this)).unwrap_or(None);
     let Some(flags) = flags else {
-        // SAFETY: `save_fn` は `on_attach` の照合を通した保存関数（検査では偽物）。引数はゲームから受けた値をそのまま渡す。
+        // SAFETY: `save_fn`は`on_attach`の照合を通した保存関数（検査では偽物）。引数はゲームから受けた値をそのまま渡す。
         return unsafe { call_plain(save_fn, this, path, name) };
     };
-    // 再生の側（`+0x114` が 0 でない）は記録した保存ではないので、見積もりの直しだけして印の合図は立てない。
+    // 再生の側（`+0x114`が0でない）は記録した保存ではないので見積もりの直しだけして印を足す通知は立てない。
     let recording =
         catch_unwind(|| read_u32(this.wrapping_add(REPLAY_MODE)) == Some(0)).unwrap_or(false);
-    // SAFETY: `save_fn` は照合を通した保存関数。`this` は 0 でなく、見出しのポインタ `[this+8]` が 0 でなく `flags` を読めた ReplayManager。
-    // `path`・`name` はゲームから受けた引数。
+    // SAFETY: `save_fn`は照合を通した保存関数。`this`は0でなく、ヘッダのポインタ`[this+8]`が0でなく`flags`を読めたReplayManager。
+    // `path`・`name`はゲームから受けた引数。
     let (ret, diag) = unsafe { call_with_flags(save_fn, this, path, name, &flags) };
     if recording {
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -90,7 +92,7 @@ fn read_u32(addr: u32) -> Option<u32> {
     read_own_into(addr, &mut b).then_some(u32::from_le_bytes(b))
 }
 
-/// 見出し（`[this+8]`）の `+0x20` の 10 語（面ごとの印）。ヒープを使わない。
+/// ヘッダ（`[this+8]`）の`+0x20`の10ワード（面ごとの印）。ヒープを使わない。
 fn read_flags(this: u32) -> Option<[u32; STAGES]> {
     if this == 0 {
         return None;
@@ -110,7 +112,7 @@ fn read_flags(this: u32) -> Option<[u32; STAGES]> {
     Some(out)
 }
 
-/// NUL までのパスを 1 バイトずつ読む（ページの端で止まっても落ちない）。NUL が見つからないまま `buf` が埋まれば `buf.len()`。読めなければ `None`。
+/// NULまでのパスを1バイトずつ読む（ページの端で止まっても例外を出さない）。NULが見つからないまま`buf`が埋まれば`buf.len()`。読めなければ`None`。
 fn read_cstr(addr: u32, buf: &mut [u8; PATH_MAX + 1]) -> Option<usize> {
     for (i, slot) in buf.iter_mut().enumerate() {
         let mut b = [0u8; 1];
@@ -133,26 +135,26 @@ fn note_saved(signal: &SaveSignal, path: u32, started: u64, mode_addr: u32, diag
     signal.record(&buf[..n], started, mode, diag);
 }
 
-/// 0 でない語の数。
+/// 0でないワードの数。
 fn nonzero(words: &[u32; STAGES]) -> u32 {
     words.iter().filter(|&&w| w != 0).count() as u32
 }
 
 /// # Safety
-/// `save_fn` は ReplayManager::save（`SaveFn` の約束）のアドレス。引数は保存関数が受ける値。
+/// `save_fn`はReplayManager::save（`SaveFn`の約束）のアドレス。引数は保存関数が受ける値。
 unsafe fn call_plain(save_fn: u32, this: u32, path: u32, name: u32) -> u32 {
-    // SAFETY: 呼び手の約束どおり、`save_fn` は `SaveFn` の約束の関数。
+    // SAFETY: 呼び手の約束どおり、`save_fn`は`SaveFn`の約束の関数。
     let f = unsafe { core::mem::transmute::<usize, SaveFn>(save_fn as usize) };
     // SAFETY: 引数は呼び手から受けた値をそのまま渡す。
     unsafe { f(this, path, name) }
 }
 
-/// 本当の印 `flags` を見積もりのループが読む場所に書いてから保存関数を呼ぶ（`save_call`。`need` は 0 で、呼ばない守りは使わない）。
-/// 見積もりには面ごとの塊の数（`count_chunks`）を渡す。
-/// 戻り値は元の保存関数と同じく 0 と、踏み台が返した書く前・読み戻し・見積もりから作る `SaveDiag`（本ログ用。確保しない）。
+/// 本当の印`flags`を見積もりのループが読む場所に書いてから保存関数を呼ぶ（`save_call`。`need`は0なので呼ばない守りは使わない）。
+/// 見積もりには面ごとのチャンクの数（`count_chunks`）を渡す。
+/// 戻り値は元の保存関数と同じ0と、トランポリンが返した書く前・読み戻し・見積もりから作る`SaveDiag`のペア（本ログ用。確保しない）。
 ///
 /// # Safety
-/// `save_fn` は ReplayManager::save のアドレスで、先頭が `th09_addr::REPLAY_SAVE_SIG` と一致するもの。`this`・`path`・`name` は保存関数が受ける値。
+/// `save_fn`はReplayManager::saveのアドレスで、先頭が`th09_addr::REPLAY_SAVE_SIG`と一致するもの。`this`・`path`・`name`は保存関数が受ける値。
 unsafe fn call_with_flags(
     save_fn: u32,
     this: u32,
@@ -162,12 +164,12 @@ unsafe fn call_with_flags(
 ) -> (u32, SaveDiag) {
     let mut before = [0u32; STAGES];
     let mut after = [0u32; STAGES];
-    // 読めない・長すぎる連鎖は塊 0 として見積もる（ゲームの保存は必ず呼ぶ）。本ログには「読めなかった」と出す。
+    // 読めない・長すぎる連鎖はチャンク0として見積もる（ゲームの保存は必ず呼ぶ）。本ログには「読めなかった」と出す。
     let counted = count_chunks(&mut OwnProcess, this);
     let chunks = counted.unwrap_or([0; STAGES]);
     let mut est = 0u32;
-    // SAFETY（`save_call` の約束）: `save_fn` は呼び手の約束。`before`・`after`・`est` はこのスタックの書ける領域、`flags`・`chunks` は読める 10 語。
-    // `need` が 0 なので見積もりで断らず、必ず保存関数を呼ぶ。踏み台が書くのは自分のスタックの esp より下の 40 バイトだけ。ゲームのスレッドから呼ぶ。
+    // SAFETY: `save_call`の約束を満たす。`save_fn`は呼び手の約束。`before`・`after`・`est`はこのスタックの書き込み可能な領域、`flags`・`chunks`は読み取り可能な10ワード。
+    // `need`が0なので見積もりで断らず必ず保存関数を呼ぶ。トランポリンが書くのは自分のスタックのespより下の40バイトだけ。ゲームのスレッドから呼ぶ。
     unsafe {
         save_call(
             save_fn,
@@ -202,8 +204,8 @@ unsafe fn call_with_flags(
 
 // ---- 印を足すスレッドのファイル ----
 
-/// 足すファイルを開く本物。`exe_dir` / `base` は検査が差し替える（本物は `None` で、ゲームの exe のフォルダを `0x4ACD08` から読み、
-/// 相対パスは作業フォルダ基準のまま開く —— ゲームの保存と同じ道）。
+/// 足すファイルを開く本物。`exe_dir` / `base`は検査が差し替える。
+/// 本物は`None`で、ゲームのexeのフォルダを`0x4ACD08`から読み、相対パスは作業フォルダ基準のまま開く（ゲームの保存と同じ開き方）。
 pub struct RealMarkIo {
     exe_dir: Option<Vec<u8>>,
     base: Option<PathBuf>,
@@ -218,7 +220,7 @@ impl RealMarkIo {
     }
 }
 
-/// ゲームが持つ exe のフォルダ（CP932 のバイト列。最後は `/`）。
+/// ゲームが持つexeのフォルダ（ANSIのバイト列。最後は`/`）。
 fn game_exe_dir() -> Option<Vec<u8>> {
     let raw = read_own_memory(EXE_DIR, EXE_DIR_LEN as usize)?;
     let n = raw.iter().position(|&b| b == 0)?;
@@ -282,16 +284,17 @@ impl MarkFile for RealMarkFile {
         Ok(v)
     }
     fn append(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // 追記の権利だけで開いてあるので、書く位置は常に末尾。
+        // 追記の権利だけで開いてあるので書く位置は常に末尾。
         self.file.write_all(bytes).map_err(|e| e.to_string())?;
         self.file.flush().map_err(|e| e.to_string())
     }
 }
 
-// ---- DllMain からの設置 ----
+// ---- DllMainからの設置 ----
 
-/// `DllMain`（`DLL_PROCESS_ATTACH`）から呼ぶ。4 行を照合して 2 つの呼び出しを入口へ向け、印を足すスレッドを作る。照合が 1 行でも合わなければ
-/// 1 バイトも書かず、今までどおりゲームの保存になる。パニックは受けて、書いた分だけを残す。
+/// `DllMain`（`DLL_PROCESS_ATTACH`）から呼ぶ。4行を照合して2つの呼び出しを入口へ向け、印を足すスレッドを作る。
+/// 照合が1行でも合わなければ1バイトも書かず、今までどおりゲームの保存になる。
+/// パニックは受けて、書いた分だけを残す。
 pub fn on_attach(module: HMODULE) {
     let r = catch_unwind(AssertUnwindSafe(|| attach_inner(module)));
     if r.is_err() {
@@ -314,14 +317,14 @@ fn attach_inner(module: HMODULE) {
     for l in &report.lines {
         main_log::push_when(!report.complete(), l.clone());
     }
-    // 1 つも書けなければ入口は呼ばれないので、印を足すスレッドは要らない。
+    // 1つも書けなければ入口は呼ばれないので、印を足すスレッドは要らない。
     if report.written > 0 {
         start_thread(module);
     }
 }
 
 fn start_thread(module: HMODULE) {
-    // SAFETY: `mark_thread` は LPTHREAD_START_ROUTINE の形。引数は自分の DLL のハンドルで、この DLL は自分を解放しない。
+    // SAFETY: `mark_thread`はLPTHREAD_START_ROUTINEの形。引数は自分のDLLのハンドルで、このDLLは自分を解放しない。
     // スレッドの属性は既定。ローダーロックが外れてから走る。
     let h = unsafe {
         CreateThread(
@@ -369,8 +372,9 @@ fn run_thread() {
 
 #[cfg(test)]
 mod tests {
-    //! 偽の保存関数（先頭の 12 バイトを花映塚と同じにした素のアセンブリ）と、機械語の呼び出し元を使い、入口が本物の `call` の約束
-    //! （fastcall・`ret 4`・スタックの高さ）と踏み台の書く 10 語で働くかを見る。花映塚は使わない。
+    //! 偽の保存関数（先頭の12バイトを花映塚と同じにした素のアセンブリ）と機械語の呼び出し元を使う。
+    //! 入口が本物の`call`の約束（fastcall・`ret 4`・スタックの高さ）とトランポリンの書く10ワードで働くかを見る。
+    //! 花映塚は使わない。
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
@@ -383,7 +387,7 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
     };
 
-    /// 偽の保存関数と静的変数は 1 組しか無いので、1 本ずつ走らせる。
+    /// 偽の保存関数と静的変数は1セットしか無いので1本ずつ走らせる。
     static SERIAL: Mutex<()> = Mutex::new(());
 
     static HITS: AtomicU32 = AtomicU32::new(0);
@@ -395,9 +399,10 @@ mod tests {
     static T_MODE: AtomicU32 = AtomicU32::new(0);
     static T_LAST: AtomicU32 = AtomicU32::new(0);
 
-    // SAFETY（`#[unsafe(naked)]`）: 花映塚の保存関数の真似。先頭の 12 バイトは署名と同じ（`.byte` で書くのは、アセンブラが `mov ebp,esp` を別の符号に
-    // しうるため）。呼ばれた回数・this（edi）・パス（edx）・名前（`[ebp+8]`）・見積もりのループが読む 10 語（`[ebp - 0x1F8 + 4i]`）を静的変数へ
-    // コピーして `ret 4` で戻る（名前を片付ける）。ebx・esi には触らない。書くのは検査の静的変数と自分の枠だけ。
+    // SAFETY（`#[unsafe(naked)]`）: 花映塚の保存関数の真似。
+    // 先頭の12バイトは署名と同じ（`.byte`で書くのはアセンブラが`mov ebp,esp`を別の符号にしうるため）。
+    // 呼ばれた回数・this（edi）・パス（edx）・名前（`[ebp+8]`）・見積もりのループが読む10ワード（`[ebp - 0x1F8 + 4i]`）を静的変数へコピーして`ret 4`で戻る（名前の引数を取り除く）。
+    // ebx・esiには触らない。書くのは検査の静的変数と自分の枠だけ。
     #[unsafe(naked)]
     extern "C" fn fake_save() {
         core::arch::naked_asm!(
@@ -433,7 +438,7 @@ mod tests {
         f as usize as u32
     }
 
-    /// 検査の入口（`menu_save_entry` と同じ形。保存関数は偽物、game_mode は自前の変数）。
+    /// 検査の入口（`menu_save_entry`と同じ形。保存関数は偽物、game_modeは自前の変数）。
     extern "fastcall" fn test_entry(this: u32, path: u32, name: u32) -> u32 {
         entry_with(
             &T_SIGNAL,
@@ -452,9 +457,11 @@ mod tests {
 
     const PATTERN: u32 = 0x5151_5151;
 
-    /// ゲームと同じ形の呼び出し元: 呼ぶ前に、保存関数のループが読む場所（`E − 0x200` からの 10 語）へ模様を書き（呼び手のスタックの残り）、
-    /// ecx = this・edx = パス・`push` 名前で `call`。呼んだ後でスタックの高さが元か検証し、ずれていれば eax に印を入れて戻す。
-    /// 戻り値は eax（高さが合えば 0）。`call` の `E8` の位置を返す。
+    /// ゲームと同じ形の呼び出し元。
+    /// 呼ぶ前に保存関数のループが読む場所（`E − 0x200`からの10ワード）へパターンを書く（呼び手のスタックの残り）。
+    /// その後 ecx = this・edx = パス・`push`名前で`call`する。
+    /// 呼んだ後でスタックの高さが元かどうかを検証し、ずれていればeaxに印を入れて戻す。
+    /// 戻り値はeax（高さが合えば0）。`call`の`E8`の位置を返す。
     fn caller(this: u32, path: u32, name: u32, target: u32, at: u32) -> (Vec<u8>, u32) {
         let mut c: Vec<u8> = vec![
             0x53, // push ebx
@@ -489,7 +496,7 @@ mod tests {
         (c, call_at)
     }
 
-    /// 呼び出し元を実行できるメモリに書く。`f` は実行して戻り値（eax）を返す関数と、メモリの先頭・`E8` の位置を受ける。
+    /// 呼び出し元を実行できるメモリに書く。`f`は、実行して戻り値（eax）を返す関数・メモリの先頭・`E8`の位置を受ける。
     fn with_code<R>(
         this: u32,
         path: u32,
@@ -497,7 +504,7 @@ mod tests {
         target: u32,
         f: impl FnOnce(&dyn Fn() -> u32, u32, u32) -> R,
     ) -> R {
-        // SAFETY: 読み書き実行できる 0x1000 バイトを確保する（解放は最後）。
+        // SAFETY: 読み書き実行できる0x1000バイトを確保する（解放は最後）。
         let mem = unsafe {
             VirtualAlloc(
                 core::ptr::null(),
@@ -509,15 +516,15 @@ mod tests {
         assert_ne!(mem, 0);
         let (code, call_at) = caller(this, path, name, target, mem as u32);
         assert!(code.len() < 0x100);
-        // SAFETY: 確保した 0x1000 バイトの先頭へ、それより短い機械語を書く。
+        // SAFETY: 確保した0x1000バイトの先頭へ、それより短い機械語を書く。
         unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), mem as *mut u8, code.len()) };
         let run = || -> u32 {
-            // SAFETY: 先頭は上で書いた呼び出し元（cdecl で呼べる: ebx・edi を保ち、eax に戻す）。
+            // SAFETY: 先頭は上で書いた呼び出し元（cdeclで呼べる: ebx・ediを保ち、eaxに戻す）。
             let g = unsafe { core::mem::transmute::<usize, extern "C" fn() -> u32>(mem) };
             g()
         };
         let r = f(&run, mem as u32, call_at);
-        // SAFETY: 上で確保した領域を 1 回だけ解放する。
+        // SAFETY: 上で確保した領域を1回だけ解放する。
         unsafe { VirtualFree(mem as *mut c_void, 0, MEM_RELEASE) };
         r
     }
@@ -526,7 +533,7 @@ mod tests {
         core::array::from_fn(|i| SEEN_FLAGS[i].load(Ordering::SeqCst))
     }
 
-    /// 語ごとに違う値で、0 の面を混ぜる（0 の面を取り違えると値が合わない）。
+    /// ワードごとに違う値にし、0の面も混ぜる（0の面を取り違えると値が合わない）。
     fn real_flags() -> [u32; STAGES] {
         let mut r: [u32; STAGES] = core::array::from_fn(|i| 0x0BB4_7000 + i as u32 * 0x44);
         r[1] = 0;
@@ -534,11 +541,11 @@ mod tests {
         r
     }
 
-    /// ReplayManager の見本: `+8` が見出しへのポインタ、`+0x114` が再生の側か。見出しの `+0x20` に印。
+    /// ReplayManagerの見本: `+8`がヘッダへのポインタ。`+0x114`が再生の側かどうか。ヘッダの`+0x20`に印。
     struct World {
         manager: Box<[u32; 0x48]>,
         _header: Box<[u32; 0x7B]>,
-        /// 面ごとの塊の連鎖に足した塊（`+0x14` が次）。Vec が伸びてもアドレスが動かないように Box に入れる。
+        /// 面ごとのチャンクの連鎖に足したチャンク（`+0x14`が次）。Vecが伸びてもアドレスが動かないようにBoxに入れる。
         #[allow(clippy::vec_box)]
         nodes: Vec<Box<[u32; 6]>>,
     }
@@ -561,7 +568,7 @@ mod tests {
             self.manager.as_ptr() as usize as u32
         }
 
-        /// 面 `stage` の塊の連鎖に、先頭の塊の後ろへ `extra` 個連結する。
+        /// 面`stage`のチャンクの連鎖に先頭のチャンクの後ろへ`extra`個連結する。
         fn chain(&mut self, stage: usize, extra: usize) {
             let next_at = |stage: usize| {
                 (REPLAY_STAGE_NODES as usize
@@ -587,7 +594,7 @@ mod tests {
     const PATH: &[u8] = b"replay/th9_05.rpy\0";
     const NAME: [u8; 12] = *b"12:34:56\0\0\0\0";
 
-    /// 検査の合図を、前に拾った番号を覚えたまま拾う（拾い済みのものは `None`）。
+    /// 前に拾った番号を覚えたまま検査の通知を拾う（拾い済みのものは`None`）。
     fn drain_signal() -> Option<crate::menu_save::Taken> {
         let mut last = T_LAST.load(Ordering::SeqCst);
         let t = T_SIGNAL.take(&mut last);
@@ -595,7 +602,7 @@ mod tests {
         t
     }
 
-    /// 検査ごとに、拾い済みでない合図を読み捨てて、偽の保存関数の記録を空にする。
+    /// 検査ごとに拾い済みでない通知を読み捨て、偽の保存関数の記録を空にする。
     fn reset() {
         let _ = drain_signal();
         HITS.store(0, Ordering::SeqCst);
@@ -604,7 +611,7 @@ mod tests {
         }
     }
 
-    /// 呼び出し元から入口へ（rel32 は最初から入口）。
+    /// 呼び出し元から入口へ（rel32は最初から入口）。
     fn call_through_entry(this: u32, path: u32) -> u32 {
         with_code(
             this,
@@ -621,7 +628,7 @@ mod tests {
         reset();
         T_MODE.store(2, Ordering::SeqCst);
         let mut w = world(real_flags(), 0);
-        // 印のある面 2 に塊を 2 つ足す。印の無い面 1 の塊は見積もりに入らない。
+        // 印のある面2にチャンクを2つ足す。印の無い面1のチャンクは見積もりに入らない。
         w.chain(2, 2);
         w.chain(1, 1);
         let before = now_ms();
@@ -650,8 +657,8 @@ mod tests {
         assert_eq!(t.path, b"replay/th9_05.rpy");
         assert_eq!(t.game_mode, 2);
         assert!(!t.too_long);
-        // 本当の印は 8 面（r[1]・r[4] が 0）。塊は印のある面の先頭 8 個 + 足した 2 個。書く前の 10 語は踏み台の足元に残っていた値で、
-        // 入口の枠の深さで変わるので数は決めない。
+        // 本当の印は8面（r[1]・r[4]が0）。チャンクは印のある面の先頭8個 + 足した2個。
+        // 書く前の10ワードはトランポリンの足元に残っていた値で、入口の枠の深さで変わるので数は決めない。
         let real_n = real_flags().iter().filter(|&&f| f != 0).count() as u32;
         assert_eq!(real_n, 8);
         let per_stage = crate::th09_addr::SAVE_EST_PER_STAGE;
@@ -686,7 +693,7 @@ mod tests {
         T_MODE.store(2, Ordering::SeqCst);
         let mut w = world(real_flags(), 0);
         w.chain(2, 1);
-        // 面 3 の先頭の塊の次が読めない所を指す。
+        // 面3の先頭のチャンクの次が読み取れない場所を指す。
         let at = (REPLAY_STAGE_NODES + REPLAY_STAGE_STRIDE * 3 + REPLAY_NODE_NEXT) as usize / 4;
         w.manager[at] = 0x0000_1000;
         let ret = call_through_entry(w.this(), PATH.as_ptr() as usize as u32);
@@ -705,7 +712,7 @@ mod tests {
 
     #[test]
     fn without_the_entry_the_game_loop_reads_the_callers_leftover() {
-        // 前提の確認（変異が効く土台）: 入口を通さないと、ループが読むのは呼び手のスタックの残り（ここでは模様）。
+        // 前提のチェック（変異が効く土台）: 入口を通さないとループが読むのは呼び手のスタックの残り（ここではパターン）。
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let w = world(real_flags(), 0);
@@ -736,7 +743,7 @@ mod tests {
                 "書き換える前は元の保存関数"
             );
             assert!(drain_signal().is_none());
-            // 本物の `install_as` の書き方で、呼び出しの rel32 だけを入口へ向ける。
+            // 本物の`install_as`の書き方で呼び出しのrel32だけを入口へ向ける。
             let want: &'static [u8] = Box::leak(
                 {
                     let mut v = vec![0xE8];
@@ -784,7 +791,7 @@ mod tests {
     #[test]
     fn an_unreadable_manager_or_header_calls_the_original_untouched() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        // this = 0、見出しのポインタが 0、見出しが読めない（確保されていないアドレス）のどれでも、保存関数は呼ばれ、何も書かず、合図も無い。
+        // 次のどれでも、保存関数は呼ばれ、何も書かず、通知も無い: this = 0・ヘッダのポインタが0・ヘッダが読み取れない（確保されていないアドレス）。
         let mut zero_header = world(real_flags(), 0);
         zero_header.manager[REPLAY_HEADER_PTR as usize / 4] = 0;
         let mut bad_header = world(real_flags(), 0);
@@ -811,11 +818,11 @@ mod tests {
     fn an_unreadable_or_overlong_path_is_signalled_as_such() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let w = world(real_flags(), 0);
-        // 読めないパス（確保されていないアドレス）。
+        // 読み取れないパス（確保されていないアドレス）。
         reset();
         call_through_entry(w.this(), 0x0000_2000);
         assert_eq!(drain_signal().expect("合図").path, b"");
-        // NUL が `PATH_MAX` 以内に無いパス。
+        // NULが`PATH_MAX`以内に無いパス。
         let long = vec![b'a'; PATH_MAX + 10];
         let mut long_z = long.clone();
         long_z.push(0);
@@ -823,7 +830,7 @@ mod tests {
         call_through_entry(w.this(), long_z.as_ptr() as usize as u32);
         let t = drain_signal().expect("合図");
         assert!(t.too_long, "{t:?}");
-        // ちょうど `PATH_MAX` バイトは通る。
+        // ちょうど`PATH_MAX`バイトは通る。
         let mut max = vec![b'a'; PATH_MAX];
         max.push(0);
         reset();
@@ -961,7 +968,7 @@ mod tests {
         let marked = std::fs::read(&file).unwrap();
         assert_eq!(&marked[..orig.len()], &orig[..]);
         assert!(marked.len() > orig.len());
-        // 2 回目は既に印があるので足さない。
+        // 2回目は既に印があるので足さない。
         let o = handle(
             &taken(b"replay/th9_05.rpy", now_ms()),
             9,
@@ -974,7 +981,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&file).unwrap(), marked);
 
-        // 作業フォルダ（cwd）が exe のフォルダでない: 同じ相対パスのファイルが別の場所にあっても足さない。
+        // 作業フォルダ（cwd）がexeのフォルダでない: 同じ相対パスのファイルが別の場所にあっても足さない。
         let other = temp_dir("b");
         let theirs = other.join("replay/th9_06.rpy");
         std::fs::write(&theirs, &orig).unwrap();
@@ -989,7 +996,7 @@ mod tests {
         assert_eq!(std::fs::read(&theirs).unwrap(), orig);
         assert_eq!(std::fs::read(d.join("replay/th9_06.rpy")).unwrap(), orig);
 
-        // exe のフォルダ側に対応するファイルが無い: 検証できないので足さない。
+        // exeのフォルダ側に対応するファイルが無い: 検証できないので足さない。
         std::fs::write(other.join("replay/th9_07.rpy"), &orig).unwrap();
         let o = handle(
             &taken(b"replay/th9_07.rpy", now_ms()),
@@ -1016,7 +1023,7 @@ mod tests {
             "足す側がファイルを作った"
         );
 
-        // 保存に失敗して古いファイルが残っている（更新時刻が 1 時間前）。
+        // 保存に失敗して古いファイルが残っている（更新時刻が1時間前）。
         let old = d.join("replay/th9_09.rpy");
         std::fs::write(&old, &orig).unwrap();
         let f = OpenOptions::new().write(true).open(&old).unwrap();

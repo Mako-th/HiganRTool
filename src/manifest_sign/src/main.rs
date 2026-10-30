@@ -1,9 +1,10 @@
-//! `manifest_sign` —— 配る側のツール。更新の目録の署名の鍵を作り、目録に署名し、検証する。配る exe・dll には入らない。
-//! 使い方: `keygen --key <秘密の鍵のファイル>`（新しい鍵を作り、公開鍵（16 進）を出す）/ `pubkey --key <秘密の鍵のファイル>` /
+//! `manifest_sign` —— 配布側のツール。更新の目録の署名の鍵を作り、目録に署名し、検証する。配布するexe・dllには入らない。
+//! 使い方: `keygen --key <秘密の鍵のファイル>`（新しい鍵を作り、公開鍵（16進）を出す）/ `pubkey --key <秘密の鍵のファイル>` /
 //! `sign --key <秘密の鍵のファイル> --in <署名なしの目録> --out <署名つきの目録>` / `verify --pub <公開鍵の 16 進> --in <署名つきの目録>`。
-//! 鍵のファイルは git に追跡されない場所に保存する（作業ツリーの中で `.gitignore` に外されていない場所と `dist` の下は読み書きとも断る）。
-//! 中身は種 32 バイトの小文字の 16 進。無くすと配った exe へ更新を届けられないのでバックアップを取る。`keygen` は既存のファイルを上書きしない。
-//! 署名の前に本文の形を検証し、署名の後に公開鍵で検証し直してから書く。公開鍵は `src/core/src/update.rs` の `UPDATE_PUBLIC_KEY_HEX` に貼る。
+//! 鍵のファイルはgitに追跡されない場所に保存する。
+//! 作業ツリーの中で`.gitignore`に無視されていない場所と`dist`の下は、読み書きとも断る。
+//! 中身は種32バイトの小文字の16進。無くすと配布したexeへ更新を届けられないのでバックアップを取る。`keygen`は既存のファイルを上書きしない。
+//! 署名の前に本文の形を検証し、署名の後に公開鍵で検証し直してから書く。公開鍵は`src/core/src/update.rs`の`UPDATE_PUBLIC_KEY_HEX`に貼る。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -87,7 +88,7 @@ impl Opts {
     }
 }
 
-/// `dist` の下か、リポジトリの中で git に無視されていない場所ならその理由。
+/// `dist`の下か、リポジトリの中でgitに無視されていない場所ならその理由。
 fn forbidden_key_place(path: &Path) -> Option<String> {
     let abs = std::path::absolute(path).ok()?;
     let mut here: Option<&Path> = abs.parent();
@@ -116,7 +117,7 @@ fn forbidden_key_place(path: &Path) -> Option<String> {
     None
 }
 
-/// git が `path` を無視するか。git を呼べなければ無視しないとみなす（断る側に倒す）。
+/// gitが`path`を無視するかどうか。gitを呼べなければ無視しないとみなす（断る側に倒す）。
 fn git_ignores(repo: &Path, path: &Path) -> bool {
     std::process::Command::new("git")
         .arg("-C")
@@ -142,7 +143,7 @@ fn keygen(path: &str, out: &mut dyn Write) -> Result<(), String> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| format!("OS の乱数を引けません（{e}）"))?;
     let text = format!("{}\n", update::to_hex(&seed));
-    // create_new: 既にある鍵を上書きしない（無くすと配った exe へ更新を届けられなくなる）。
+    // create_new: 既にある鍵を上書きしない（無くすと配布したexeへ更新を届けられなくなる）。
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -184,7 +185,7 @@ fn sign(key: &str, input: &str, output: &str, out: &mut dyn Write) -> Result<(),
     let m = update::parse_body(&body).map_err(|e| format!("{input} の形が使えません: {e}"))?;
     let sig = key.sign(&update::signing_message(body.as_bytes()));
     let signed = update::compose_signed(&body, &sig.to_bytes()).map_err(|e| e.to_string())?;
-    // 書く前に、公開鍵で検証し直す（署名の取り違え・書式の食い違いをここで止める）。
+    // 書く前に公開鍵で検証し直す（署名の取り違え・書式の食い違いをここで止める）。
     let public = key.verifying_key().to_bytes();
     let back = update::verify_and_parse(signed.as_bytes(), &public)
         .map_err(|e| format!("署名したものを確かめ直せませんでした: {e}"))?;
@@ -344,7 +345,7 @@ mod tests {
         let tracked = forbidden_key_place(&repo.join("k.txt"));
         assert!(tracked.is_some_and(|w| w.contains(".gitignore")));
         assert!(forbidden_key_place(&repo.join("src").join("k.txt")).is_some());
-        // 無視されていても dist の下は断る。
+        // 無視されていてもdistの下は断る。
         let dist = forbidden_key_place(&repo.join("dist").join("k.txt"));
         assert!(dist.is_some_and(|w| w.contains("dist")));
         std::fs::remove_dir_all(&repo).unwrap();

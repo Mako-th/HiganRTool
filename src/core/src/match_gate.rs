@@ -1,28 +1,29 @@
-//! 対戦の成立（READY。type 20）の状態機械（pure。確保しない）。
+//! 対戦の成立（READY。type 20）のステートマシン（pure。確保しない）。
 //!
-//! 成立は「両者が『妖怪 対 妖怪』を選んだ」とき。成立の前は lockstep・選択の同期（MENU / STEP_REQ / STEP / SELECT）・CHECK に入らない（待っている間に別のモードで遊べる）。接続してから `MATCH_WAIT_MS` の間に成立しなければ閉じる。
-//! `code_side = game` の実行だけが使う（`link::Link::set_match_gate`）。それ以外は接続したときに成立したことになり、READY を 1 通も送らない。
+//! 成立は「両者が『妖怪 対 妖怪』を選んだ」とき。成立の前はlockstep・選択の同期（MENU / STEP_REQ / STEP / SELECT）・CHECKに入らない（待っている間に別のモードで遊べる）。接続してから`MATCH_WAIT_MS`の間に成立しなければ閉じる。
+//! `code_side = game`の実行だけが使う（`link::Link::set_match_gate`）。それ以外は接続時に成立したことになり、READYを1通も送らない。
 //! - 単調: 自分の「選んだ」も相手の「選んだ」も一度立ったら戻らない。取り消したいときは「抜ける」（BYE）だけ。
-//! - 送り直し: 自分が選んでいる間、`READY_RESEND_MS` ごとに READY を送る。成立した後も、相手から成立後の通信を 1 通受けるまでは送り続ける（相手が自分の READY を落としたとき、相手だけが成立しないまま残らないため）。
-//! - 時間切れ: 接続した時刻から `MATCH_WAIT_MS` 経っても成立していなければ一度だけ「切れた」と言う（呼び手が BYE(取消) で閉じる）。成立した後は切れない。
-//! - ゲートの無い相手: 相手から成立後の通信を受けたのに相手の READY を 1 通も受けていない状態が `NO_GATE_MS` 続いたら、一度だけ「相手にゲートが無い」と言う（閉じ方は時間切れと同じ。待ち続けると相手だけが難易度の画面で止まるため）。
+//! - 再送: 自分が選んでいる間`READY_RESEND_MS`ごとにREADYを送る。成立した後も相手から成立後の通信を1通受けるまでは送り続ける（相手が自分のREADYを落としたとき相手だけが成立しないまま残らないため）。
+//! - 時間切れ: 接続した時刻から`MATCH_WAIT_MS`経っても成立していなければ一度だけ「切れた」と言う（呼び手がBYE(取消)で閉じる）。成立した後は切れない。
+//! - ゲートの無い相手: 相手から成立後の通信を受けたのに相手のREADYを1通も受けていない状態が`NO_GATE_MS`続いたら一度だけ「相手にゲートが無い」と言う（閉じ方は時間切れと同じ。待ち続けると相手だけが難易度の画面で止まるため）。
 //!
-//! 時刻は u32 の ms で、差は `wrapping_sub` で取る（`liveness.rs` と同じ）。
+//! 時刻はu32のmsで、差は`wrapping_sub`で取る（`liveness.rs`と同じ）。
 
 use crate::liveness::PING_INTERVAL_MS;
 
-/// 接続してから成立を待つ長さ（ms）。10 分。画面の文（`net_menu`）もここから作る。
+/// 接続してから成立を待つ長さ（ms）。10分。画面の文（`net_menu`）もここから作る。
 pub const MATCH_WAIT_MS: u32 = 10 * 60 * 1000;
 
-/// READY を送り直す間隔（ms）。生存の PING と同じ間隔（`liveness::PING_INTERVAL_MS`）。
+/// READYを再送する間隔（ms）。生存のPINGと同じ間隔（`liveness::PING_INTERVAL_MS`）。
 pub const READY_RESEND_MS: u32 = PING_INTERVAL_MS;
 
-/// 相手から成立後の通信が届いてから、相手の READY を待つ長さ（ms）。過ぎても READY が 1 通も届かなければ、相手にゲートが無いと見て閉じる。
-/// 送り直しの間隔の 3 倍: ゲートのある相手なら、1 通目とその後の 2 回の送り直しが続けて落ちない限り届く。
+/// 相手から成立後の通信が届いてから相手のREADYを待つ長さ（ms）。過ぎてもREADYが1通も届かなければ相手にゲートが無いと見て閉じる。
+/// 再送の間隔の3倍。ゲートのある相手なら1通目とその後の2回の再送が続けて失われない限り届く。
 pub const NO_GATE_MS: u32 = 3 * READY_RESEND_MS;
 
-/// 成立しないまま閉じた理由。`Gate::check_close` が返すのは `TimedOut` と `PeerHasNoGate` だけ。`PeerLeft` は呼び手（dll）が
-/// 成立の前に相手の BYE(取消) を受けたときに使う（同じ画面の行と終わりの種類に載せるため、ここに定義する）。
+/// 成立しないまま閉じた理由。`Gate::check_close`が返すのは`TimedOut`と`PeerHasNoGate`だけ。
+/// `PeerLeft`は呼び手（dll）が成立の前に相手のBYE(取消)を受けたときに使う。
+/// 同じ画面の行と終わりの種類に載せるため、ここに定義する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoMatch {
     TimedOut,
@@ -65,7 +66,7 @@ impl Gate {
         }
     }
 
-    /// 自分が選んだ。初めてなら true（呼び手はすぐ `poll_send` を呼んで 1 通目を出す）。閉じた後は立てない。
+    /// 自分が選んだ。初めてならtrue（呼び手はすぐ`poll_send`を呼んで1通目を出す）。閉じた後は立てない。
     pub fn set_local(&mut self) -> bool {
         if self.local || self.closed.is_some() {
             return false;
@@ -82,8 +83,9 @@ impl Gate {
         self.peer = true;
     }
 
-    /// 相手から成立後の通信が時刻 `now` に届いた。相手はもう成立しているので送り直しをやめる。相手の「選んだ」は READY でだけ立てる
-    /// （この印で立てるとゲートの無い相手と成立してしまう）。最初の 1 通の時刻を、ゲートの無い相手を見分ける起点に覚える。
+    /// 相手から成立後の通信が時刻`now`に届いた。相手はもう成立しているので再送をやめる。
+    /// 相手の「選んだ」はREADYでだけ立てる（成立後の通信で立てるとゲートの無い相手と成立してしまう）。
+    /// 最初の1通の時刻をゲートの無い相手を見分ける起点として覚える。
     pub fn on_post(&mut self, now: u32) {
         self.peer_post = true;
         if self.post_since.is_none() {
@@ -111,8 +113,9 @@ impl Gate {
         self.closed
     }
 
-    /// 今 READY を送るか（送るなら送ったことにして true）。自分が選んでいて、相手の成立後の通信をまだ受けておらず、前に送ってから
-    /// `READY_RESEND_MS` 経った（1 度も送っていなければすぐ）とき。閉じた後は送らない。
+    /// 今READYを送るかどうか（送るなら送ったことにしてtrue）。
+    /// 送るのは次が全部揃ったとき: 自分が選んでいる・相手の成立後の通信をまだ受けていない・前に送ってから`READY_RESEND_MS`経った（1度も送っていなければすぐ）。
+    /// 閉じた後は送らない。
     pub fn poll_send(&mut self, now: u32) -> bool {
         if !self.local || self.peer_post || self.closed.is_some() {
             return false;
@@ -127,8 +130,8 @@ impl Gate {
         due
     }
 
-    /// 閉じるかを見る。相手にゲートが無いと分かった（相手の成立後の通信から `NO_GATE_MS` の間 READY が来ない）か `MATCH_WAIT_MS` 経った、
-    /// 最初の 1 回だけ理由を返す。両方が同じ時刻に当たったら、具体的なゲートの無い方を採る。
+    /// 閉じるかどうかを見る。相手にゲートが無いと分かった（相手の成立後の通信から`NO_GATE_MS`の間READYが来ない）か`MATCH_WAIT_MS`経ったときに、最初の1回だけ理由を返す。
+    /// 両方が同じ時刻に当たったら具体的なゲートの無い方を採る。
     pub fn check_close(&mut self, now: u32) -> Option<NoMatch> {
         if self.closed.is_some() || self.matched() {
             return None;
@@ -306,7 +309,7 @@ mod tests {
         assert!(g.matched());
         assert_eq!(g.check_close(10_000 + 10 * NO_GATE_MS), None);
         assert_eq!(g.closed(), None);
-        // READY を 1 通でも受けていれば、成立後の通信が来てもゲートの無い相手とは見ない。
+        // READYを1通でも受けていれば成立後の通信が来てもゲートの無い相手とは見ない。
         let mut g = Gate::new(0);
         g.on_ready();
         g.on_post(1_000);

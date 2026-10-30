@@ -1,12 +1,14 @@
-//! 大きい CSV（`_net_frames.csv`・`_pacing.csv`・`_watch_frames.csv`）を gzip で書く・読む（unsafe 無し）。配布バージョンのログが大きすぎた（1 起動で `_net_frames.csv` 5〜12 MB・`_pacing.csv` 7〜15 MB）ので、CSV だけ gzip にする。
-//! 圧縮は読み取りのスレッド（`_net_frames.csv`）と書き出しのスレッド（`_pacing.csv`）で走り、ゲームのスレッドはリングバッファへ書くだけ。
+//! 大きいCSV（`_net_frames.csv`・`_pacing.csv`・`_watch_frames.csv`）をgzipで書く・読む（unsafe無し）。
+//! 配布バージョンのログが大きすぎた（1起動で`_net_frames.csv` 5〜12 MB・`_pacing.csv` 7〜15 MB）。そのためCSVだけgzipにする。
+//! 圧縮は読み取りのスレッド（`_net_frames.csv`）と書き出しのスレッド（`_pacing.csv`）で走る。ゲームのスレッドはリングバッファへ書くだけ。
 //!
-//! ゲームを閉じるとプロセスごと消える（ライターの `Drop` は走らない）ので、閉じる経路に頼らず次の 3 つで備える。
-//! - 書く側: `flush` のうち `SYNC_INTERVAL` ごとの 1 回だけを deflate の sync flush（空の stored ブロックで境を byte に揃える。辞書は捨てない）にする。毎回入れると圧縮率が落ちる。
-//! - 書く側（`Seek` できる書き先）: sync flush のたびに終わりの印の仮（最終ブロック 2 B ＋ CRC32 と長さの 8 B）を書いて位置を戻す。次の書き込みが仮の上に重なるので、ファイルはいつ止まっても最後の sync flush までを持つ完全な gzip になる。
-//! - 読む側: `decode_lenient` は終わりの印が無くても最後の sync flush までの中身を返す（`LogText::cut` が立つ）。
+//! ゲームを閉じるとプロセスごと消える（ライターの`Drop`は走らない）。そのため閉じる経路に頼らず次の3つで備える。
+//! - 書く側: `flush`のうち`SYNC_INTERVAL`ごとの1回だけをdeflateのsync flush（空のstoredブロックで境をbyteに揃える。辞書は捨てない）にする。毎回sync flushすると圧縮率が落ちる。
+//! - 書く側（`Seek`できる書き先）: sync flushのたびに終わりの印の仮（最終ブロック2 B ＋ CRC32と長さの8 B）を書いて位置を戻す。次の書き込みが仮の上に重なる。そのためファイルはいつ止まっても最後のsync flushまでを持つ完全なgzipになる。
+//! - 読む側: `decode_lenient`は終わりの印が無くても最後のsync flushまでの中身を返す（`LogText::cut`が立つ）。
 //!
-//! 失う行は最後の sync flush より後の約 1 秒分（60 fps で約 60 行）。2 秒にすると圧縮後の大きさは約 2% 増に収まる（1 秒は約 5% 増。`sync_flush_costs_little`）が、失う行が倍になるので 1 秒にした。
+//! 失う行は最後のsync flushより後の約1秒分（60 fpsで約60行）。
+//! 2秒にすると圧縮後の大きさは約2%増に収まる（1秒は約5%増。`sync_flush_costs_little`）。ただし失う行が倍になるので1秒にした。
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -16,37 +18,38 @@ use flate2::read::GzDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Crc};
 
-/// 書き出しの圧縮の強さ。gzip -6 と同じ（実測で `_net_frames.csv` は元の 23%、`_pacing.csv` は 33%）。
+/// 書き出しの圧縮の強さ。gzip -6と同じ（実測で`_net_frames.csv`は元の23%・`_pacing.csv`は33%）。
 const LEVEL: u32 = 6;
 
-/// sync flush の間隔。1 秒の呼び手に必ず当たるよう 1 秒より少し短くする（ちょうど 1 秒だと、呼びが 1 ms 早く来た回を
-/// 飛ばして最大 2 秒を失う）。
+/// sync flushの間隔。1秒ごとの呼び出しに必ず当たるよう1秒より少し短くする。
+/// ちょうど1秒だと呼び出しが1 ms早く来た回を飛ばして最大2秒を失う。
 pub const SYNC_INTERVAL: Duration = Duration::from_millis(900);
 
-/// gzip のヘッダー（RFC 1952。mtime 0・XFL 0・OS 不明）。
+/// gzipのヘッダー（RFC 1952。mtime 0・XFL 0・OS不明）。
 const HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
-/// 空の最終ブロック（固定ハフマンの終端だけ）。直前が sync flush で byte の境に揃っていれば、これで deflate が閉じる。
+/// 空の最終ブロック（固定ハフマンの終端だけ）。直前がsync flushでbyteの境に揃っていればこれでdeflateが閉じる。
 const FINAL_BLOCK: [u8; 2] = [0x03, 0x00];
-/// 終わりの印の仮の長さ（最終ブロック ＋ CRC32 ＋ 元の長さ）。`finish` が書く最小の終わり（最終ブロック ＋ 8 B）と同じ長さなので、
-/// 本物は必ず仮を覆う。
+/// 終わりの印の仮の長さ（最終ブロック ＋ CRC32 ＋ 元の長さ）。
+/// `finish`が書く最小の終わり（最終ブロック ＋ 8 B）と同じ長さ。
+/// そのため本物は必ず仮を覆う。
 const TAIL_LEN: usize = 10;
 
-/// 書き先の位置を `n` byte 戻す（`Seek` できる書き先だけが持つ）。
+/// 書き先の位置を`n` byte戻す（`Seek`できる書き先だけが持つ）。
 type Rewind<W> = fn(&mut W, usize) -> io::Result<()>;
 
 fn rewind_seek<W: Seek>(w: &mut W, n: usize) -> io::Result<()> {
     w.seek(SeekFrom::Current(-(n as i64))).map(|_| ())
 }
 
-/// gzip で書くライター。捨てると（`Drop`）終わりの印を書く。
+/// gzipで書くライター。捨てると（`Drop`）終わりの印を書く。
 pub struct GzLogWriter<W: Write> {
-    /// 閉じた後は `None`。
+    /// 閉じた後は`None`。
     enc: Option<DeflateEncoder<W>>,
     crc: Crc,
     header_done: bool,
-    /// sync flush の後に書き込みがあったか。無ければ `flush` は何も書かない（待ちの間にファイルを伸ばさない）。
+    /// sync flushの後に書き込みがあったかどうか。無ければ`flush`は何も書かない（待ちの間にファイルを伸ばさない）。
     dirty: bool,
-    /// 最後に sync flush した時刻。`None` は一度もしていない（最初の `flush` は間隔を待たずに入れ、開いた直後の短い実行も読めるようにする）。
+    /// 最後にsync flushした時刻。`None`は一度もしていない（最初の`flush`は間隔を待たずにsync flushする。開いた直後の短い実行も読めるようにするため）。
     last_sync: Option<Instant>,
     sync_interval: Duration,
     rewind: Option<Rewind<W>>,
@@ -57,7 +60,7 @@ impl<W: Write> GzLogWriter<W> {
         Self::with_sync_interval(inner, SYNC_INTERVAL)
     }
 
-    /// 検査用に間隔を替えられる（`Duration::ZERO` なら `flush` のたびに sync flush）。
+    /// 検査用に間隔を替えられる（`Duration::ZERO`なら`flush`のたびにsync flush）。
     pub fn with_sync_interval(inner: W, sync_interval: Duration) -> Self {
         GzLogWriter {
             enc: Some(DeflateEncoder::new(inner, Compression::new(LEVEL))),
@@ -125,7 +128,7 @@ impl<W: Write> GzLogWriter<W> {
 }
 
 impl<W: Write + Seek> GzLogWriter<W> {
-    /// `Seek` できる書き先（ファイル）用。`flush` の sync flush のたびに終わりの印の仮を書き、書き先の位置を戻す。
+    /// `Seek`できる書き先（ファイル）用。`flush`のsync flushのたびに終わりの印の仮を書いて書き先の位置を戻す。
     pub fn new_seekable(inner: W) -> Self {
         Self::seekable_with_sync_interval(inner, SYNC_INTERVAL)
     }
@@ -167,20 +170,20 @@ impl<W: Write> Drop for GzLogWriter<W> {
     }
 }
 
-/// gzip で書くファイルの名前の尻。ライターを開く側（dll の `open_output`）がこれで見分ける。
+/// gzipで書くファイルの名前の末尾。ライターを開く側（dllの`open_output`）がこれで見分ける。
 pub const GZ_EXT: &str = ".gz";
 
 pub fn is_gz_name(name: &str) -> bool {
     name.ends_with(GZ_EXT)
 }
 
-/// gzip の先頭の 2 B（RFC 1952）。1 B（`0x1f`）だけで切れたものも gzip として扱う（`0x1f` は CSV の先頭にならない）。
+/// gzipの先頭の2 B（RFC 1952）。1 B（`0x1f`）だけで切れたものもgzipとして扱う（`0x1f`はCSVの先頭にならない）。
 pub fn is_gzip(bytes: &[u8]) -> bool {
     bytes.first() == Some(&0x1f) && bytes.get(1).is_none_or(|&b| b == 0x8b)
 }
 
-/// 終わりの印が無くても読めるところまで伸ばす。戻りの `bool` は印まで届かなかったか。壊れている場合も、強制終了の
-/// 切れ方と区別せず `(それまでの分, true)` を返す。
+/// 終わりの印が無くても読めるところまで展開する。戻りの`bool`は印まで届かなかったかどうか。
+/// 壊れている場合も強制終了の切れ方と区別せず`(それまでの分, true)`を返す。
 pub fn decode_lenient(bytes: &[u8]) -> (Vec<u8>, bool) {
     let mut dec = GzDecoder::new(bytes);
     let mut out = Vec::new();
@@ -191,7 +194,7 @@ pub fn decode_lenient(bytes: &[u8]) -> (Vec<u8>, bool) {
             Ok(n) => out.extend_from_slice(&buf[..n]),
             Err(_) => return (out, true),
         }
-        // 小さな入力が巨大に伸びる gzip でメモリを食わない（実物の CSV は展開後 22 MB ほど）。
+        // 小さな入力が巨大に伸びるgzipでメモリを食わない（実物のCSVは展開後22 MBほど）。
         if out.len() > MAX_DECODED {
             return (out, true);
         }
@@ -203,7 +206,7 @@ const MAX_DECODED: usize = 1 << 30;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogText {
     pub text: String,
-    /// gzip が終わりの印まで届かず、最後の行の手前で切った。
+    /// gzipが終わりの印まで届かなかったので最後の行の手前で切った。
     pub cut: bool,
 }
 
@@ -217,7 +220,7 @@ impl LogText {
     }
 }
 
-/// 先頭の 2 B で見分ける（拡張子は見ない）。切れた gzip は最後の `\n` までで切る。UTF-8 でなければ `InvalidData`。
+/// 先頭の2 Bで見分ける（拡張子は見ない）。切れたgzipは最後の`\n`までで切る。UTF-8でなければ`InvalidData`。
 pub fn text_from_bytes(bytes: Vec<u8>) -> io::Result<LogText> {
     let (raw, cut) = if is_gzip(&bytes) {
         decode_lenient(&bytes)
@@ -302,9 +305,9 @@ mod tests {
         let first = net_rows(300);
         w.write_all(first.as_bytes()).unwrap();
         w.flush().unwrap();
-        // flush の時点の byte 列 = 強制終了で残るファイル。
+        // flushの時点のbyte列 = 強制終了で残るファイル。
         let killed = sink.borrow().clone();
-        // flush の後にまだ書く（killed には入らない）。
+        // flushの後にまだ書く（killedには入らない）。
         w.write_all(b"0,9999,0000,0000,3,,0\n").unwrap();
         drop(w);
         let ended = sink.borrow().clone();
@@ -318,7 +321,7 @@ mod tests {
         assert!(done.text.ends_with("0,9999,0000,0000,3,,0\n"));
     }
 
-    /// 終わりの印まで厳密に読む（CRC・長さも照合）。戻りは (本文, 印の後に余ったバイト数)。足りなければ Err。
+    /// 終わりの印まで厳密に読む（CRC・長さも照合）。戻りは (本文, 印の後に余ったバイト数)。足りなければErr。
     fn strict(bytes: &[u8]) -> io::Result<(String, usize)> {
         let mut rest = bytes;
         let mut text = String::new();
@@ -373,7 +376,7 @@ mod tests {
         let a = net_rows(300);
         w.write_all(a.as_bytes()).unwrap();
         w.flush().unwrap();
-        // sync の後の書き込みは flush されない（強制終了で失う分）。
+        // syncの後の書き込みはflushされない（強制終了で失う分）。
         w.write_all(net_rows(2_000).as_bytes()).unwrap();
         let killed = w.enc.as_ref().unwrap().get_ref().get_ref().clone();
         let back = text_from_bytes(killed).unwrap();
@@ -446,7 +449,7 @@ mod tests {
     fn cut_in_the_middle_of_a_row_drops_only_that_row() {
         let text = net_rows(2_000);
         let gz = gz_all(&text, Duration::ZERO);
-        // 終わりの印 8 B を落とした上で、さらに 30 B 削る（deflate の途中で切れる）。
+        // 終わりの印8 Bを落とした上でさらに30 B削る（deflateの途中で切れる）。
         let cut = gz[..gz.len() - 8 - 30].to_vec();
         let back = text_from_bytes(cut).unwrap();
         assert!(back.cut);

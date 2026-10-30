@@ -1,10 +1,12 @@
-//! 観戦者の側（`spectate_watch.rs`）の組み上がりの検査（pure。仮の時計と仮のネットワーク）: 選択の画面を持つ偽のゲーム 2 つ（A = ホスト 1P、
-//! B = ゲスト 2P。`menu_tests::MenuGame`）を本物の入力の地点の判断（`NetPlay`）で動かし、ホスト A の観戦のリングバッファ（`SpectateRing`）から記録を core の
-//! `SpectateHost` に積み、仮のネットワークで観戦者（`WatchPlay` ＋ 3 つ目の `MenuGame` W）へ流す。W の偽のゲームは、タイトルから 7 の画面へ入る
-//! ところだけ自分の台本で進み、あとは記録の列だけで動く。
+//! 観戦者の側（`spectate_watch.rs`）の組み上がりの検査（pure。仮の時計と仮のネットワーク）。
+//! 選択の画面を持つ偽のゲーム2つ（A = ホスト1P、B = ゲスト2P。`menu_tests::MenuGame`）を、本物の入力の地点の判断（`NetPlay`）で動かす。
+//! ホストAの観戦のリングバッファ（`SpectateRing`）から記録を取り出し、coreの`SpectateHost`に積む。
+//! それを仮のネットワークで観戦者（`WatchPlay` ＋ 3つ目の`MenuGame` W）へ送る。
+//! Wの偽のゲームは、タイトルから7の画面へ入るところだけ自分の台本で進み、あとは記録の列だけで動く。
 //!
-//! 合格は「W が使った試合の語・入った押下・書いた SELECT が、A と B のゲームが使った・決めた値と一致する」こと。期待は W の作りと別の所から取る:
-//! マッチの語は A・B のゲームが使った列（`MenuGame::played`）、押下は A の `step_log`、ゲームが決めた値は A・B のゲーム自身の状態。
+//! 合格は「Wが使った試合のワード・入った押下・書いたSELECTが、AとBのゲームが使った値・決定した値と一致する」こと。
+//! 期待はWの作りと別の所から取る。
+//! マッチのワードはA・Bのゲームが使った列（`MenuGame::played`）。押下はAの`step_log`。ゲームが決定した値はA・Bのゲーム自身の状態。
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -43,35 +45,35 @@ impl Driver for WatchPlay {
     }
 }
 
-/// 検査の対戦する側の名前（合成。A はホスト・1P、B はゲスト・2P）。
+/// 検査の対戦する側の名前（合成。Aはホスト・1P、Bはゲスト・2P）。
 const NAME_A: &str = "host-a";
 const NAME_B: &str = "guest-b";
 
 thread_local! {
-    /// 真の間に作った `Rig` は、ホストのリングバッファから取り出した `Name` の記録を観戦の流れへ積まない（名前を受けていない観戦者の形を作る）。検査のスレッドごと。
+    /// 真の間に作った`Rig`は、ホストのリングバッファから取り出した`Name`の記録を観戦の流れへ積まない（名前を受けていない観戦者の形を作る）。検査のスレッドごと。
     static DROP_NAMES: Cell<bool> = const { Cell::new(false) };
-    /// `Some` の間に作った `Rig` のホストは、遅れた JOIN の遡りの上限をこの値にする（0 = 選択の seg まで遡れない形）。
+    /// `Some`の間に作った`Rig`のホストは、遅れたJOINの遡りの上限をこの値にする（0 = 選択のsegまで遡れない形）。
     static HOST_REWIND: Cell<Option<u32>> = const { Cell::new(None) };
-    /// `Some((n, k))` の間に作った `Rig` は、観戦者がマッチのフレームを n 使ったところで、観戦者のゲームのスレッドを k フレーム止める
-    /// （受信スレッドの代わりは回り続ける。ウィンドウのドラッグなどの形）。
+    /// `Some((n, k))`の間に作った`Rig`は、観戦者がマッチのフレームをn使ったところで、観戦者のゲームのスレッドをkフレーム止める。
+    /// 受信スレッドの代わりは回り続ける（ウィンドウのドラッグなどの形）。
     static WATCHER_FREEZE: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
-    /// `Some` の間に作った対戦する 2 人の CHECK（と観戦の照合）の作り方。`None` は入力のダイジェスト。
+    /// `Some`の間に作った対戦する2人のCHECK（と観戦の照合）の作り方。`None`は入力のダイジェスト。
     static HOST_CHECK: Cell<Option<CheckSource>> = const { Cell::new(None) };
 }
 
-/// 観戦用のコードの session と秘密（対戦の session 9・`DEFAULT_SECRET` とは別の値）。
+/// 観戦用のコードのsessionと秘密（対戦のsession 9・`DEFAULT_SECRET`とは別の値）。
 pub(super) const SPEC_SESSION: u32 = 0x5EC7_0033;
 pub(super) const SPEC_SECRET: Secret = Secret(*b"watch-tests-0001");
-/// 観戦のホストの使い捨ての鍵の種と、観戦者の種（検査の決め事の固定値。本物は dll が OS の乱数で引く）。
+/// 観戦のホストの使い捨ての鍵のシードと観戦者のシード（検査では固定値にする。本物はdllがOSの乱数で生成する）。
 const SPEC_HOST_SEED: higanr_core::seal::KeySeed = higanr_core::seal::KeySeed([0x48; 32]);
 const SPEC_WATCHER_SEED: higanr_core::seal::KeySeed = higanr_core::seal::KeySeed([0x57; 32]);
 
-/// 観戦のホストの公開鍵（`SPEC_HOST_SEED` の公開鍵。観戦者の設定に入れる —— 本物は観戦用のコードから）。
+/// 観戦のホストの公開鍵（`SPEC_HOST_SEED`の公開鍵）。観戦者の設定に書き込む。本物は観戦用のコードから得る。
 fn spec_host_public() -> [u8; 32] {
     higanr_core::seal::Ephemeral::from_seed(&SPEC_HOST_SEED).public()
 }
 
-/// 観戦者（`SPEC_WATCHER_SEED`）が送った便を開く関数（観戦者の送る向き）。検査が観戦者の ACK・BYE を外から読むため。
+/// 観戦者（`SPEC_WATCHER_SEED`）が送ったパケットを開く関数（観戦者の送る向き）。検査が観戦者のACK・BYEを外から読むため。
 fn watcher_sent_opener() -> higanr_core::seal::Opener {
     higanr_core::seal::Ephemeral::from_seed(&SPEC_WATCHER_SEED)
         .dir_keys(
@@ -85,7 +87,8 @@ fn watcher_sent_opener() -> higanr_core::seal::Opener {
         .opener()
 }
 
-/// 観戦者の偽のゲームの台本: 6 で待って 7 へ入る。ホストの最初の押下が難易度の取消なので 6 へ戻る —— もう一度 7 へ入る。
+/// 観戦者の偽のゲームの台本。6で待って7へ入る。
+/// ホストの最初の押下は難易度のキャンセルなので6へ戻り、もう一度7へ入る。
 /// 以後の画面（8・16）へは記録の押下で進む。
 fn watcher_plan() -> Vec<Act> {
     vec![act(0, 6, 30, Z, 1), act(0, 6, 15, Z, 1)]
@@ -107,7 +110,7 @@ fn spec_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
     (addr(10), addr(11))
 }
 
-/// 観戦の用意: ホスト（`SpectateHost`）・観戦者との仮のネットワーク・観戦者。`hook` を 1 フレームに 1 回呼ぶ。
+/// 観戦の用意: ホスト（`SpectateHost`）・観戦者との仮のネットワーク・観戦者。`hook`を1フレームに1回呼ぶ。
 struct Rig {
     host: SpectateHost,
     hnet: FakeNet,
@@ -117,50 +120,50 @@ struct Rig {
     key: AuthKey,
     recs: Vec<Record>,
     sent: Vec<Message>,
-    /// `sent`（観戦者が送った各通）を観戦のホスト（`SpectateHost`）が受けた時点の `wticks`（観戦者の tick の数。BYE が観戦者の何 tick 目に出たかを見る）。
+    /// `sent`（観戦者が送った各パケット）を観戦のホスト（`SpectateHost`）が受けた時点の`wticks`（観戦者のtickの数。BYEが観戦者の何tick目に出たかを見る）。
     sent_at: Vec<u32>,
-    /// 観戦者が終えた後の tick の数と、そのうち `Action::Local` でなかった数（終えた後は自分の入力だけ）。
+    /// 観戦者が終えた後のtickの数と、そのうち`Action::Local`でなかった数（終えた後は自分の入力だけ）。
     post_end_ticks: u32,
     post_end_not_local: u32,
     wp: WatchPlay,
     wg: MenuGame,
     started: bool,
     wticks: u32,
-    /// 動かし始めた時点の観戦者の `local_input` の回数（接続した後は増えない —— 自分の入力を読まない証拠）。
+    /// 動かし始めた時点の観戦者の`local_input`の回数（接続した後は増えないことが、自分の入力を読まない証拠になる）。
     local_at_join: Option<u32>,
-    /// 観戦者の tick ごとの「ネットワークが `Local` を返したとき、ゲームが選択の画面か試合の中だった」回数（自分の入力が届く経路）。
+    /// 観戦者のtickごとの「ネットワークが`Local`を返したとき、ゲームが選択の画面か試合の中だった」回数（自分の入力が届く経路）。
     leaks: u32,
-    /// 観戦者の `on_input` の確保の回数（接続した後の tick）。
+    /// 観戦者の`on_input`の確保の回数（接続した後のtick）。
     allocs_joined: u64,
     paused: bool,
-    /// 終わりの記録（`End`）を観戦の経路へ積むのをこの tick の数だけ遅らせる（`Seg` は先に積む）。0 なら遅らせない。
+    /// 終わりの記録（`End`）を観戦の経路へ積むのをこのtickの数だけ遅らせる（`Seg`は先に積む）。0なら遅らせない。
     end_delay_ticks: u32,
-    /// 遅らせている `End` と、残りの tick。
+    /// 遅らせている`End`と、残りのtick。
     late_end: Option<(Record, u32)>,
     drop_names: bool,
-    /// 最後の seg を出た後の `Menu`・`Step` を積まない（peer_sim のホストのように、出た直後に閉じる並び）。
+    /// 最後のsegを出た後の`Menu`・`Step`を積まない（peer_simのホストのように、出た直後に閉じる並び）。
     bare_tail: bool,
     left_last_seg: bool,
-    /// 観戦者を本物の走査の包みと同じ呼ばれ方（早送りつき）で回す。既定は false（今までの検査は 1 表示 = 1 更新のまま）。
+    /// 観戦者を本物の走査のラッパーと同じ呼ばれ方（早送りつき）で回す。既定はfalse（今までの検査は1表示 = 1更新のまま）。
     ff_on: bool,
-    /// 観戦者を動かした表示（`hook` の呼び）の数と、最初に接続した表示・最初に追いつき終えた表示の番号。
+    /// 観戦者を動かした表示（`hook`の呼び出し）の数と、最初に接続した表示・最初に追いつき終えた表示の番号。
     displays: u32,
     joined_display: Option<u32>,
     caught_up_display: Option<u32>,
-    /// 走査 1 回ごとの印（false = 表示の最初の走査、true = 余分な走査）と、余分な走査の前に SE・文字の数を整えた回数。
+    /// 走査1回ごとのフラグ（false = 表示の最初の走査、true = 余分な走査）と、余分な走査の前にSE・文字の数を整えた回数。
     ff_scans: Vec<bool>,
     ff_drops: u32,
-    /// 偽のゲームの走査 1 回の所要（µs）。表示の中の時計（`ff_skew`）に走査のたびに足す（時間の上限の検査）。
+    /// 偽のゲームの走査1回の所要時間（µs）。表示の中の時計（`ff_skew`）に走査のたびに足す（時間の上限の検査）。
     scan_cost_us: u64,
     ff_skew: u64,
-    /// 余分な走査のうち、マッチのフレームを使わなかったもの（0 のはず）。
+    /// 余分な走査のうちマッチのフレームを使わなかったもの（0のはず）。
     extra_not_played: u32,
     /// 最初に追いつき終えた後に使ったマッチのフレームの余裕（記録が届いてから使うまで。µs）。
     after_margins: Vec<u32>,
     hud: Vec<Option<WatchHudFacts>>,
-    /// tick ごとの（`awaiting_select`、それまでに使ったマッチのフレームの数）。
+    /// tickごとの（`awaiting_select`、それまでに使ったマッチのフレームの数）。
     awaiting: Vec<(bool, u64)>,
-    /// 接続した後の早送りの問い（`ff_begin`・`ff_more`・`ff_end`）の確保の回数。
+    /// 接続した後の早送りの呼び出し（`ff_begin`・`ff_more`・`ff_end`）の確保の回数。
     display_allocs: u64,
     /// 観戦者のゲームのスレッドを止める予定（`WATCHER_FREEZE`）・残りのフレーム・止めた時と動き出した時のホストの数。
     freeze_at: Option<(u64, u32)>,
@@ -244,7 +247,7 @@ impl Rig {
         }
     }
 
-    /// 1 フレームに 1 回: ホストのリングバッファを空にして観戦者へ送り、観戦者の受けを host に渡し、観戦者を 1 tick 動かす（`start` が真になってから）。
+    /// 1フレームに1回呼ぶ。ホストのリングバッファを空にして観戦者へ送り、観戦者から届いたパケットをhostに渡し、観戦者を1 tick動かす（`start`が真になってから）。
     fn hook(&mut self, now_us: u64, start: bool) {
         if self.sclock.get() < now_us {
             self.sclock.set(now_us);
@@ -264,7 +267,7 @@ impl Rig {
                     let _ = self.host.push(Record::End(ByeReason::Cancelled));
                 }
                 if self.bare_tail {
-                    // 最後の seg を出た後の選択の画面の記録は積まない（`Seg(次)` の直後が `End` の並び）。
+                    // 最後のsegを出た後の選択の画面の記録は積まない（`Seg(次)`の直後が`End`の並び）。
                     if matches!(p.rec, Record::Seg { seg } if seg > 0) {
                         self.left_last_seg = true;
                     } else if self.left_last_seg
@@ -278,7 +281,7 @@ impl Rig {
                 }
                 self.recs.push(p.rec);
                 if self.end_delay_ticks > 0 && matches!(p.rec, Record::End(_)) {
-                    // `Seg` は先に積んだ。`End` は遅れて積む（記録の並びは変えない。届く時刻だけ遅らせる）。
+                    // `Seg`は先に積んだ。`End`は遅れて積む（記録の並びは変えない。届く時刻だけ遅らせる）。
                     self.late_end = Some((p.rec, self.end_delay_ticks));
                 } else {
                     let _ = self.host.push(p.rec);
@@ -295,11 +298,11 @@ impl Rig {
             }
             self.host.poll(now_ms, &mut self.hnet);
         }
-        // 観戦者の受信スレッドの代わり（ゲームのスレッドの tick と別に、フレームごとに回る）。
+        // 観戦者の受信スレッドの代わり（ゲームのスレッドのtickと別に、フレームごとに回る）。
         self.wnet.run_watch();
         if start && !self.started {
             self.started = true;
-            // 受け取りを受信スレッド（の代わり）へ渡す 1 tick（接続する前）。タイトルの偽のゲームで空回りさせる。
+            // 受け取りを受信スレッド（の代わり）へ渡す1 tick（接続する前）。タイトルの偽のゲームで空回りさせる。
             let mut scratch = MenuGame::new(0, Vec::new(), &[0]);
             let _ = self.wp.on_input(&mut scratch, &mut self.wnet);
         }
@@ -356,8 +359,8 @@ impl Rig {
             if self.local_at_join.is_none() {
                 self.local_at_join = Some(calls_before);
             }
-            // 自分の入力が届く経路は `Action::Local`（いつもの poll_all）だけ。選択の画面とマッチの中では返さない。
-            // 終わりを受けた tick（その tick から自分の入力へ戻る）は数えない。
+            // 自分の入力が届く経路は`Action::Local`（いつものpoll_all）だけ。選択の画面とマッチの中では返さない。
+            // 終わりを受けたtick（そのtickから自分の入力へ戻る）は数えない。
             if a == Action::Local
                 && !ended_before
                 && self.wp.end().is_none()
@@ -379,8 +382,9 @@ impl Rig {
     }
 }
 
-/// 観戦者の偽のゲームを、本物の走査の包みと同じ呼ばれ方（`spectate_watch::run_display`）で回すための関数。走査 1 回 = 偽のゲームの更新 1 回
-/// （`tick_once`）。SE・文字の数を整える関数は呼ばれた回数だけ数える（偽のゲームは SE を鳴らさない）。
+/// 観戦者の偽のゲームを、本物の走査のラッパーと同じ呼ばれ方（`spectate_watch::run_display`）で回すための関数。
+/// 走査1回 = 偽のゲームの更新1回（`tick_once`）。
+/// SE・文字の数を整える関数は呼ばれた回数だけ数える（偽のゲームはSEを鳴らさない）。
 impl FfHost for Rig {
     fn scan(&mut self, extra: bool) -> i32 {
         self.ff_scans.push(extra);
@@ -395,7 +399,7 @@ impl FfHost for Rig {
         if matches!(a, Action::Played(_)) && self.caught_up_display.is_some() {
             self.after_margins.extend(self.wp.last_timing().margin_us);
         }
-        // 本物の走査は、描画だけのフレーム（入力の地点の出口）で 1 を返し、普通の更新ではノード数（2 以上）を返す。
+        // 本物の走査は、描画だけのフレーム（入力の地点の出口）では1を返す。普通の更新ではノード数（2以上）を返す。
         match a {
             Action::RenderOnly => 1,
             _ => 2,
@@ -420,7 +424,7 @@ impl FfHost for Rig {
     }
 
     fn boundary(&mut self) -> bool {
-        // 偽のゲームは、マッチの中は場面 2・次の要求 0。
+        // 偽のゲームは、マッチの中は場面2・次の要求0。
         self.wg.cur != 2 || self.wg.next != 0
     }
 }
@@ -433,8 +437,9 @@ struct Out {
     rig: Rig,
 }
 
-/// A・B を回し、W を付ける。`start_when` が真になった tick（A を見て）に W を開始する。A と B が全部のマッチを終えてメニューへ戻ったら
-/// A が BYE(終了) で閉じ、W が終わる（か 6000 tick）まで回す。`with_watcher` が偽なら W は開始せず、リングバッファも付けない。
+/// A・Bを回し、Wを付ける。`start_when`が真になったtick（Aを見て）にWを開始する。
+/// AとBが全部のマッチを終えてメニューへ戻ったら、AがBYE(終了)で閉じる。Wが終わる（か6000 tick）まで回す。
+/// `with_watcher`が偽ならWは開始せず、リングバッファも付けない。
 fn run_rig(
     a: MenuGame,
     b: MenuGame,
@@ -456,8 +461,9 @@ fn run_rig(
     )
 }
 
-/// `run_rig` に、ホストの観戦者への送信を止める tick（`pause_when` が A を見て真の間。ホストの受信スレッドが止まった・ネットワークが詰まった形。
-/// A と B の対戦は止まらない）を足したもの。
+/// `run_rig`に、ホストの観戦者への送信を止めるtickを足したもの。
+/// 止めるのは`pause_when`がAを見て真の間で、ホストの受信スレッドが止まった形・ネットワークが詰まった形にあたる。
+/// AとBの対戦は止まらない。
 #[allow(clippy::too_many_arguments)] // 検査のツール。引数は全部別の意味
 fn run_rig_with(
     a: MenuGame,
@@ -482,8 +488,9 @@ fn run_rig_with(
     )
 }
 
-/// `run_rig_with` に、最後の seg を出た後の選択の記録を積まない選択（`bare_tail`）と、終わりの記録だけを `end_delay_ticks` tick 遅らせて
-/// 観戦の経路へ積む選択を足したもの。
+/// `run_rig_with`に次のオプションを足したもの。
+/// - 最後のsegを出た後の選択の記録を積まない（`bare_tail`）。
+/// - 終わりの記録だけを`end_delay_ticks` tick遅らせて観戦の経路へ積む。
 #[allow(clippy::too_many_arguments)] // 検査のツール。引数は全部別の意味
 fn run_rig_full(
     a: MenuGame,
@@ -509,7 +516,7 @@ fn run_rig_full(
     )
 }
 
-/// `run_rig_full` に、観戦者を本物の走査の包みと同じ呼ばれ方（早送りつき。`Rig::ff_on`）で回す選択を足したもの。
+/// `run_rig_full`に、観戦者を本物の走査のラッパーと同じ呼ばれ方（早送りつき。`Rig::ff_on`）で回すオプションを足したもの。
 #[allow(clippy::too_many_arguments)] // 検査のツール。引数は全部別の意味
 fn run_rig_inner(
     mut a: MenuGame,
@@ -531,7 +538,7 @@ fn run_rig_inner(
         require_net_selection: true,
         ..Config::default()
     };
-    // 2 人の名前は別々にする（観戦の `Name` の記録が席を取り違えても気づけるように）。
+    // 2人の名前は別々にする（観戦の`Name`の記録がサイドを取り違えても気づけるように）。
     let mut npa = NetPlay::new(link_cfg_named(2, 0xF000, NAME_A), cfg, &mut na);
     let mut rig = Rig::new(w, spec_delay_us);
     rig.drop_names = DROP_NAMES.with(Cell::get);
@@ -610,8 +617,8 @@ fn from_start(_: &MenuGame) -> bool {
     true
 }
 
-/// 観戦者が使ったマッチの語・入った押下・書いた SELECT が、A と B のゲームが使った・決めた値と一致するか。初めから観戦している
-/// 観戦者は、選択の画面の語を 1 つも捨てない（`menu_skipped` が 0。捨てるのは遅れて入って追いつくときだけ）。
+/// 観戦者が使ったマッチのワード・入った押下・書いたSELECTが、AとBのゲームが使った値・決定した値と一致するかどうか。
+/// 初めから観戦している観戦者は、選択の画面のワードを1つも捨てない（`menu_skipped`が0。捨てるのは遅れて入って追いつくときだけ）。
 fn assert_follows(o: &Out, tag: &str) {
     assert_eq!(
         o.rig.wp.stats().menu_skipped,
@@ -621,8 +628,10 @@ fn assert_follows(o: &Out, tag: &str) {
     assert_follows_with(o, tag, false);
 }
 
-/// `assert_follows` の、遅れて入った観戦者の形: 選択の画面の語は追いつくために捨てた分だけホストより少なく（0 でない語の列が
-/// ホストの列の部分列）、押下・マッチの語・決めた値は全行一致のまま。捨てていること（追いつきの経路を通ったこと）も検証する。
+/// `assert_follows`の、遅れて入った観戦者の形。
+/// 選択の画面のワードは、追いつくために捨てた分だけホストより少ない（0でないワードの列がホストの列の部分列）。
+/// 押下・マッチのワード・決定した値は全行一致のまま。
+/// 捨てていること（追いつきの経路を通ったこと）も検証する。
 fn assert_follows_late(o: &Out, tag: &str) {
     assert!(
         o.rig.wp.stats().menu_skipped > 0,
@@ -638,7 +647,7 @@ fn assert_follows_with(o: &Out, tag: &str, late: bool) {
     assert_eq!(w.played, o.a.played, "{tag}: W の列と A の列");
     assert_eq!(w.played, o.b.played, "{tag}: W の列と B の列");
     assert_eq!(f.frames, o.a.played, "{tag}: ホストの記録の列と A の列");
-    // 照合: ホストが積んだ記録を全部、観戦者の値と比べて合っている（ホストのダイジェストと W の列が同じなら合う）。
+    // 照合: ホストが積んだ記録を全部、観戦者の値と比べて合っている（ホストのダイジェストとWの列が同じなら合う）。
     let s = o.rig.wp.stats();
     assert!(!f.checks.is_empty(), "{tag}: ホストが照合を積んでいない");
     assert_eq!(
@@ -647,16 +656,18 @@ fn assert_follows_with(o: &Out, tag: &str, late: bool) {
         "{tag}: 照合（一致, ずれ）: {:?}",
         s.first_mismatch
     );
-    // 選択の画面で feed した 3 本（1P・2P・合成）のうち 0 でないものの列は、ホスト A が feed した列と全部同じ（席の入れ違い・押下を語に載せ忘れる
-    // とここで分かる）。0 の tick は待ちの長さが観戦者と A で違うので除く。
+    // 選択の画面でfeedした3本（1P・2P・合成）のうち0でないものの列は、ホストAがfeedした列と全部同じになる。
+    // サイドの入れ違いや、押下をワードに載せ忘れたことがここで分かる。
+    // 0のtickは待ちの長さが観戦者とAで違うので除く。
     let nonzero = |v: &[[u16; 3]]| {
         v.iter()
             .copied()
             .filter(|f| *f != [0; 3])
             .collect::<Vec<_>>()
     };
-    // キャラ選択では、A は相手（B・2P）の語の方向と「ランダム」を落として入れ、カーソルは位置で書く。観戦者は両席を語のまま入れるので、
-    // 観戦者の列の画面 8 の 2P の語に同じ落とし方を当ててから比べる。
+    // キャラ選択では、Aは相手（B・2P）のワードの方向と「ランダム」を取り除いてfeedし、カーソルは位置で書く。
+    // 観戦者は両サイドをワードのままfeedする。
+    // そのため観戦者の列の画面8の2Pのワードに同じ取り除き方を当ててから比べる。
     let as_host: Vec<[u16; 3]> = w
         .fed_menu
         .iter()
@@ -744,7 +755,7 @@ fn assert_follows_with(o: &Out, tag: &str, late: bool) {
         w.watched.last().copied(),
         "{tag}: 最後に書いた SELECT"
     );
-    // 自分（観戦者）の入力が届かない: 接続した後はローカルの入力を 1 回も読まず、選択の画面とマッチの中で `Local` を返さない。
+    // 自分（観戦者）の入力が届かない: 接続した後はローカルの入力を1回も読まず、選択の画面とマッチの中で`Local`を返さない。
     assert_eq!(
         Some(w.local_input_calls),
         o.rig.local_at_join,
@@ -791,7 +802,7 @@ fn a_watcher_walks_the_hosts_selection_and_plays_the_hosts_matches() {
         assert_eq!(s.jumps, 0, "{tag}");
         assert_eq!(s.matches_started, 2, "{tag}");
         assert!(s.menu_applied >= 8, "{tag}: {s:?}");
-        // 余裕: 1 マッチの始まりで記録が溜まるのを待ち（`WATCH_MARGIN_FRAMES`）、使ったフレームは全部、届いてから 33 ms 以上の余裕を持って使った。
+        // 余裕: 1マッチの始まりで記録が溜まるのを待つ（`WATCH_MARGIN_FRAMES`）。使ったフレームは全部、届いてから33 ms以上の余裕を持って使った。
         assert!(
             (1..=60).contains(&s.start_hold_ticks),
             "{tag}: 余裕待ち {}",
@@ -872,6 +883,63 @@ fn words_before_the_screens_align_are_muted_and_after_it_they_move_the_cursor() 
     assert_eq!(rig.wg.cursor, 3, "合わせの値 2 から下へ 1 つ");
     assert_eq!(rig.wp.stats().menu_applied, 1);
     assert_eq!(rig.wp.stats().menu_align_miss, 0);
+}
+
+#[test]
+fn selection_words_with_the_screenshot_bit_never_reach_the_game() {
+    use higanr_core::input_model::MATCH_SEND_MASK;
+    use higanr_core::input_model::keys::{DOWN, LEFT, RIGHT};
+    use higanr_core::wire::{Step, StepKind};
+    const SHOT: u16 = 0x0800;
+    let w = MenuGame::new(0, vec![act(0, 6, 12, Z, 1)], &[0, 1, 2, 3]);
+    let mut rig = Rig::new(w, 1_000);
+    let menu = |p1, p2| Record::Menu {
+        p1: p1 | SHOT,
+        p2: p2 | SHOT,
+    };
+    for r in [
+        Record::Seg { seg: 0 },
+        menu(RIGHT, LEFT | SHIFT | Z),
+        menu(RIGHT, LEFT | SHIFT | Z),
+        Record::Step(Step {
+            step: 0,
+            kind: StepKind::Align,
+            value: 2,
+            screen: 7,
+        }),
+        menu(0, 0),
+        menu(DOWN, 0),
+        menu(0, 0),
+    ] {
+        rig.host.push(r).unwrap();
+    }
+    let mut now = 1_000_000u64;
+    for _ in 0..200 {
+        rig.hook(now, true);
+        now += FRAME_US;
+    }
+    assert!(
+        rig.wg
+            .fed_menu
+            .iter()
+            .flatten()
+            .all(|w| w & !MATCH_SEND_MASK == 0),
+        "選択の feed に MATCH_SEND_MASK の外のビットが混ざった: {:?}",
+        rig.wg.fed_menu
+    );
+    let nonzero: Vec<[u16; 3]> = rig
+        .wg
+        .fed_menu
+        .iter()
+        .copied()
+        .filter(|f| *f != [0; 3])
+        .collect();
+    assert_eq!(
+        nonzero,
+        vec![[DOWN, 0, DOWN]],
+        "正直な語と同じ再生にならない"
+    );
+    assert_eq!(rig.wg.cursor, 3);
 }
 
 #[test]
@@ -1158,8 +1226,8 @@ fn a_late_joiner_replays_the_current_seg_from_its_head_and_follows_the_next() {
     let o = run_rig(a, b, w, true, &late, 5_000, 30_000);
     assert!(o.rig.started);
     assert_follows_late(&o, "遅れた JOIN（1 試合目の途中）");
-    // 選択を始まりから辿り直した（A（対戦のホスト）が入れた tick の数 = W（観戦者）が記録から入れた tick の数 + 観戦者が追いつくために捨てた `Menu`）。1 マッチ目のマッチの語は
-    // 同じ速さで追う（早送りは別の経路）ので、追いつく間に溜まったマッチのフレームが 1 秒を越える。
+    // 選択を始まりから辿り直した（A（対戦のホスト）がfeedしたtickの数 = W（観戦者）が記録からfeedしたtickの数 + 観戦者が追いつくために捨てた`Menu`）。
+    // 1マッチ目のマッチのワードは同じ速さで追う（早送りは別の経路）。そのため追いつく間に溜まったマッチのフレームが1秒を越える。
     let s = o.rig.wp.stats();
     assert_eq!(
         s.menu_frames + s.menu_skipped,
@@ -1171,7 +1239,7 @@ fn a_late_joiner_replays_the_current_seg_from_its_head_and_follows_the_next() {
     assert_eq!(s.jumps, 0);
 }
 
-/// 長いマッチ（A・B・W とも 900 フレームのマッチを 2 回）。遅れて入った観戦者に溜まりができる長さ。
+/// 長いマッチ（A・B・Wとも900フレームのマッチを2回）。遅れて入った観戦者にフレームが溜まる長さ。
 fn long_games() -> (MenuGame, MenuGame, MenuGame) {
     let (mut a, mut b) = games();
     a.match_frames = 900;
@@ -1180,8 +1248,9 @@ fn long_games() -> (MenuGame, MenuGame, MenuGame) {
     (a, b, w)
 }
 
-/// 早送りの数が、走査の呼ばれ方と合っているか（余分に回した数 = 余分な走査 = SE・文字の数を整えた数。1 表示の余分は上限以内。余分な
-/// 走査はどれもマッチのフレームを使った）。
+/// 早送りの数が、走査の呼ばれ方と合っているかどうか。
+/// 余分に回した数 = 余分な走査 = SE・文字の数を整えた数。
+/// 1表示の余分は上限以内。余分な走査はどれもマッチのフレームを使った。
 fn assert_ff_accounting(o: &Out, tag: &str) {
     let ff = o.rig.wp.stats().ff;
     let extras = o.rig.ff_scans.iter().filter(|e| **e).count() as u64;
@@ -1609,8 +1678,8 @@ fn the_screen_eight_walk_does_not_fire_when_the_game_is_where_the_record_starts(
     }
 }
 
-/// 1 回選んで 2 回再戦する 3 試合（各 50 フレーム）。観戦者は 2 試合目（再戦の seg 1）の途中で入る。`bare_tail` は `run_rig_full` と同じ
-/// （最後の seg を出た後の選択の記録を積まず、`End` が `Seg` の直後に来る）。
+/// 1回選んで2回再戦する3試合（各50フレーム）。観戦者は2試合目（再戦のseg 1）の途中で入る。
+/// `bare_tail`の意味は`run_rig_full`と同じ（最後のsegを出た後の選択の記録を積まず、`End`が`Seg`の直後に来る）。
 fn rematch_run(bare_tail: bool) -> Out {
     let (pa, pb) = plans();
     let round0 = |p: Vec<Act>| p.into_iter().filter(|a| a.round == 0).collect::<Vec<_>>();
@@ -1673,7 +1742,7 @@ fn a_late_joiner_in_a_rematch_seg_replays_the_rematches_from_the_last_selection(
 #[test]
 fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
     HOST_REWIND.with(|c| c.set(Some(0)));
-    // ホストは最後の試合の後の選択を積まない: 印が立ったまま `End` を受ける形（終われば下りる）。
+    // ホストは最後の試合の後の選択を積まない: 印が立ったまま`End`を受ける形（終われば下りる）。
     let o = rematch_run(true);
     HOST_REWIND.with(|c| c.set(None));
     assert!(o.rig.started);
@@ -1687,7 +1756,7 @@ fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
     assert_eq!(wg.screen, 7, "選択の画面のまま（自分の入力は届かない）");
     assert_eq!(o.rig.leaks, 0);
     assert_eq!(wg.ignored_presses, 0);
-    // 最初の試合の語を捨てた tick から観戦が終わるまで「次のキャラ選択から映ります」の印が続き、終われば下りる。
+    // 最初の試合の語を捨てたtickから観戦が終わるまで「次のキャラ選択から映ります」の印が続き、終われば下りる。
     let marks: Vec<bool> = o.rig.awaiting.iter().map(|x| x.0).collect();
     let first = marks.iter().position(|a| *a).expect("印が立っていない");
     let last = marks.iter().rposition(|a| *a).unwrap_or(first);
@@ -1783,7 +1852,7 @@ fn the_wait_mark_goes_down_with_the_first_selection_record_used_menu_or_step() {
         assert!(rig.wp.awaiting_select(), "{with_step}: 印が立っていない");
         rig.host.push(Record::Seg { seg: 1 }).unwrap();
         if with_step {
-            // 押下とその tick の `Menu` は Step の側で一緒に使う（`Menu` の枝を通らない）。
+            // 押下とそのtickの`Menu`はStepの側で一緒に使う（`Menu`の枝を通らない）。
             rig.host
                 .push(Record::Step(Step {
                     step: 0,
@@ -1863,8 +1932,9 @@ fn the_players_are_the_same_with_and_without_a_watcher() {
     assert_eq!(with.a.screens, without.a.screens);
 }
 
-/// 製品の既定の作り方（ゲームの値）の CHECK でも、ホストが積んだ照合を観戦者が全部自分のゲームの値と比べて合う（`assert_follows`）。
-/// frame 0 の抽選回数は読み込みの引きで両者が違う（偽のゲームの `load_draws`）ので、比べない欄が効いていることも見る。
+/// 製品の既定の作り方（ゲームの値）のCHECKでも、ホストが積んだ照合を観戦者が全部自分のゲームの値と比べて合う（`assert_follows`）。
+/// frame 0の抽選回数は両者で違う（読み込み中の乱数の生成回数が違う。偽のゲームの`load_draws`）。
+/// そのため比べないフィールドが効いていることも見る。
 #[test]
 fn the_watch_checks_match_with_the_game_values_too() {
     HOST_CHECK.with(|c| c.set(Some(CheckSource::Game)));
@@ -1893,7 +1963,7 @@ fn the_watch_checks_match_with_the_game_values_too() {
 fn the_watchers_own_keys_never_reach_the_game_except_esc_which_leaves() {
     let (a, b) = games();
     let mut w = watcher_game(a.match_frames, 2, 0);
-    // 選択の画面とマッチの中では、X・Z・Shift を 3 tick ごとに叩く人の手（画面 6 の外の全部の画面で）。Esc は含めない。
+    // 選択の画面とマッチの中では、X・Z・Shiftを3 tickごとに叩く人の手（画面6の外の全部の画面で）。Escは含めない。
     w.spam = Some((7, X | Z | SHIFT, 3));
     let o = run_rig(a, b, w, true, &from_start, 5_000, 20_000);
     assert_follows(&o, "観戦者の手がうるさい");
@@ -1941,7 +2011,7 @@ fn before_joining_decides_are_dropped() {
     assert_eq!(wp.phase(), Phase::Unconnected);
     assert_eq!(g.screen, 7, "繋がる前に決定が通った（8 へ進んだ）");
     assert!(wp.stats().pre_join_decides >= 1);
-    // 対照: 決定を落とさない設定（選択の画面を持たないゲームのウィンドウ）なら、同じ台本で 8 へ進む。決定の押下が本当に 7 で押されていることのチェック。
+    // 対照: 決定を捨てない設定（選択の画面を持たないゲームのウィンドウ）なら、同じ台本で8へ進む。決定の押下が本当に7で押されていることのチェック。
     let slot2 = Arc::new(WatchSlot::new());
     let mut wp2 = WatchPlay::new(
         slot2,
@@ -1986,7 +2056,7 @@ fn a_silent_host_hands_the_input_back_after_the_silent_time() {
     }
     assert_eq!(rig.wp.end(), Some(WatchEnd::HostSilent));
     assert_eq!(rig.wp.phase(), Phase::Ended);
-    // ホストが黙ったので BYE は送らない。再 JOIN は送り続けた（ホストが戻れば入り直せる）。
+    // ホストが黙ったのでBYEは送らない。再JOINは送り続けた（ホストが戻れば入り直せる）。
     let mut buf = [0u8; MAX_DATAGRAM];
     let (mut joins, mut byes) = (0, 0);
     while let Some((_, n, _)) = rig.hnet.recv(&mut buf) {
@@ -2001,7 +2071,7 @@ fn a_silent_host_hands_the_input_back_after_the_silent_time() {
     assert!(joins >= 3, "再 JOIN {joins}");
 }
 
-/// 1 マッチだけ通す A・B（選択は 1 回。マッチが終わるとホストは `Seg(次)` を積み、閉じると `End` が続く）と、マッチが終わらない W。
+/// 1マッチだけ通すA・B（選択は1回。マッチが終わるとホストは`Seg(次)`を積み、閉じると`End`が続く）と、マッチが終わらないW。
 fn single_match_games() -> (MenuGame, MenuGame, MenuGame) {
     let (pa, pb) = plans();
     let round0 = |p: Vec<Act>| p.into_iter().filter(|a| a.round == 0).collect::<Vec<_>>();
@@ -2096,9 +2166,9 @@ fn a_seg_followed_by_more_records_still_ends_lost() {
     assert_eq!(o.rig.wp.end(), Some(WatchEnd::Lost));
 }
 
-// ---------------------------------------------------------------- 観戦者の Esc（観戦をやめる）
+// ---------------------------------------------------------------- 観戦者のEsc（観戦をやめる）
 
-/// Esc の検査の対戦する側（`games()` のマッチを 80 フレームに伸ばしたもの。マッチの 20 フレーム目がマッチの途中になる）。
+/// Escの検査の対戦する側（`games()`のマッチを80フレームに伸ばしたもの。マッチの20フレーム目がマッチの途中になる）。
 const ESC_MATCH_FRAMES: u32 = 80;
 
 fn esc_games() -> (MenuGame, MenuGame) {
@@ -2108,12 +2178,12 @@ fn esc_games() -> (MenuGame, MenuGame) {
     (a, b)
 }
 
-/// Esc の検査の観戦者（マッチの長さは `esc_games()` と同じ）。
+/// Escの検査の観戦者（マッチの長さは`esc_games()`と同じ）。
 fn esc_watcher() -> MenuGame {
     watcher_game(ESC_MATCH_FRAMES, 2, 0)
 }
 
-/// 2 回の短い Esc: `when` が真になった tick と、その `gap` tick 後に 1 tick ずつ押す（マッチの中の一時停止と、その解き方）。
+/// 2回の短いEsc。`when`が真になったtickと、その`gap` tick後に1 tickずつ押す（マッチの中の一時停止と、その解除）。
 fn esc_taps(when: impl Fn(&MenuGame) -> bool + 'static, gap: u32) -> [Press; 2] {
     let at = Rc::new(Cell::new(None::<u32>));
     let first = Rc::clone(&at);
@@ -2137,21 +2207,21 @@ fn esc_taps(when: impl Fn(&MenuGame) -> bool + 'static, gap: u32) -> [Press; 2] 
     ]
 }
 
-/// 長押しの検査で押し続ける tick（3 秒 ＝ 180 tick に 10 tick の余り）。
+/// 長押しの検査で押し続けるtick（3秒 ＝ 180 tickに10 tickの余り）。
 const ESC_HOLD_TICKS: u32 = 190;
 
-/// 観戦をやめる Esc の長押し: `when` が真になった tick から `ESC_HOLD_TICKS` tick 押し続ける。
+/// 観戦をやめるEscの長押し: `when`が真になったtickから`ESC_HOLD_TICKS` tick押し続ける。
 fn esc_hold(when: impl Fn(&MenuGame) -> bool + 'static) -> Press {
     Press::new(when, ESC, ESC_HOLD_TICKS)
 }
 
-/// Esc の検査の実行: 観戦の片道 1 ms（BYE がホストへ次の tick の始まりまでに届く）。
+/// Escの検査の実行: 観戦の片道1 ms（BYEがホストへ次のtickの始まりまでに届く）。
 fn esc_run(w: MenuGame) -> Out {
     let (a, b) = esc_games();
     run_rig(a, b, w, true, &from_start, 1_000, 20_000)
 }
 
-/// 観戦者が出した BYE（ホストが受けたもの）の（理由, 観戦者の何 tick 目の後に受けたか）。
+/// 観戦者が出したBYE（ホストが受けたもの）の（理由, 観戦者の何tick目の後に受けたか）。
 fn byes_of(o: &Out) -> Vec<(ByeReason, u32)> {
     o.rig
         .sent
@@ -2164,8 +2234,13 @@ fn byes_of(o: &Out) -> Vec<(ByeReason, u32)> {
         .collect()
 }
 
-/// Esc で抜けた実行に共通のチェック: 終わりは `Quit`・段階は `Ended`・BYE は 1 通（理由は取消）で抜けた Esc の次のフレーム（受信スレッドの次の周回）に出ている・
-/// その tick の Esc はゲームへ届いている・以後の tick は全部 `Local`・ホストは観戦者を「自分で抜けた」で外している・観戦者の `on_input` は接続した後に確保していない。抜けた Esc の tick の番号を返す。
+/// Escで抜けた実行に共通のチェック。抜けたEscのtickの番号を返す。
+/// - 終わりは`Quit`、段階は`Ended`。
+/// - BYEは1通（理由は取消）で、抜けたEscの次のフレーム（受信スレッドの次の周回）に出ている。
+/// - そのtickのEscはゲームへ届いている。
+/// - 以後のtickは全部`Local`。
+/// - ホストは観戦者を「自分で抜けた」で外している。
+/// - 観戦者の`on_input`は接続した後に確保していない。
 fn assert_left_by_esc(o: &Out, tag: &str) -> u32 {
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     assert_eq!(wp.end(), Some(WatchEnd::Quit), "{tag}: {:?}", wp.stats());
@@ -2201,7 +2276,7 @@ fn assert_left_by_esc(o: &Out, tag: &str) -> u32 {
 fn holding_esc_in_a_selection_screen_leaves_with_one_bye_and_short_escs_do_not() {
     let (a, _) = esc_games();
     let mut w = esc_watcher();
-    // 短い Esc 2 回では終えない（前の作りの「3 秒以内の 2 回」も終えない）。
+    // 短いEsc 2回では終えない（前の作りの「3秒以内の2回」も終えない）。
     let tapped = Rc::new(Cell::new(None::<u32>));
     let first = Rc::clone(&tapped);
     w.presses.extend(esc_taps(
@@ -2228,7 +2303,7 @@ fn holding_esc_in_a_selection_screen_leaves_with_one_bye_and_short_escs_do_not()
         ESC,
         1,
     ));
-    // ホスト A がキャラ選択（画面 8）で 5 秒待つ形（長押しの 3 秒の間に試合へ入らない）。
+    // ホストAがキャラ選択（画面8）で5秒待つ形（長押しの3秒の間に試合へ入らない）。
     let (mut pa, _) = plans();
     pa.insert(4, act(0, 8, 300, 0, 1));
     let mut slow = MenuGame::new(0, pa, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
@@ -2267,8 +2342,9 @@ fn holding_esc_in_a_selection_screen_leaves_with_one_bye_and_short_escs_do_not()
     );
 }
 
-/// ポーズの状態を読めない偽のゲーム（`MenuGame` は `play_view` が無い）では、マッチの中の Esc はゲームのポーズを開かず、重ね描きの
-/// 一時停止（描画だけのフレーム）にする。もう 1 回の Esc で戻り、止めた間の記録を使って最後まで A と同じ列になる。観戦は終えない。
+/// ポーズの状態を読み取れない偽のゲーム（`MenuGame`は`play_view`が無い）では、マッチの中のEscはゲームのポーズを開かない。
+/// 代わりに重ね描きの一時停止（描画だけのフレーム）にする。
+/// もう1回のEscで戻り、止めた間の記録を使って最後までAと同じ列になる。観戦は終えない。
 #[test]
 fn esc_in_a_match_without_a_readable_pause_holds_by_the_overlay_and_a_second_esc_resumes() {
     let mut w = esc_watcher();
@@ -2399,10 +2475,10 @@ fn a_watcher_leaving_changes_nothing_for_the_players() {
     assert!(!without.a.played.is_empty(), "対戦者が試合をしていない");
 }
 
-// ---------------------------------------------------------------- 台本から押した観戦者の Esc（実機で台本から検証する経路）
+// ---------------------------------------------------------------- 台本から押した観戦者のEsc（実機で台本から検証する経路）
 
-/// 台本の語の検査に共通のチェック: 台本は毎 tick ちょうど 1 回進んだ（接続する前・接続している間・抜けた後のどの tick でも。
-/// 進めた回数が tick の数と同じ）。読みが 2 回進めていれば多く、進めない tick があれば少なくなる。
+/// 台本のワードの検査に共通のチェック: 台本は毎tickちょうど1回進んだ（接続する前・接続している間・抜けた後のどのtickでも）。
+/// つまり進めた回数がtickの数と同じ。読みが2回進めていれば多くなり、進めないtickがあれば少なくなる。
 fn assert_script_stepped_once_per_tick(o: &Out, tag: &str) {
     let wg = &o.rig.wg;
     assert!(wg.tick_no > 100, "{tag}: 実行が短い {}", wg.tick_no);
@@ -2530,7 +2606,7 @@ fn a_watcher_leaving_by_a_scripts_esc_changes_nothing_for_the_players() {
     assert_eq!(with.a.screens, without.a.screens);
 }
 
-// 長く続く選択の画面に遅れて入った観戦者・2 回目の選択（別のキャラ）を追う観戦者。
+// 長く続く選択の画面に遅れて入った観戦者・2回目の選択（別のキャラ）を追う観戦者。
 mod select_join;
 
 #[test]
@@ -2635,8 +2711,8 @@ fn a_new_seg_forgets_the_previous_matchs_peer_stats() {
 fn a_format_switch_is_not_in_the_stream_and_the_watcher_does_not_stall() {
     use higanr_core::wire::StepKind;
     let (mut a, mut b) = games();
-    // 画面 8 に入ってから 30 tick 目に A、50 tick 目に B が Tab を押す（B の決定は 75 tick 目。要求を持っている間の押下は捨てる規則に
-    // 決定が当たると、台本の 1 回きりの決定が消えてマッチに入らない）。
+    // 画面8に入ってから30 tick目にA、50 tick目にBがTabを押す（Bの決定は75 tick目）。
+    // 要求を持っている間の押下は捨てる規則に決定が当たると、台本の1回きりの決定が消えてマッチに入らない。
     a.tab_at = vec![(8, 30)];
     b.tab_at = vec![(8, 50)];
     let w = watcher_game(a.match_frames, 2, 0);
@@ -2661,7 +2737,7 @@ fn a_format_switch_is_not_in_the_stream_and_the_watcher_does_not_stall() {
             .all(|r| !matches!(r, Record::Step(s) if s.kind == StepKind::Format)),
         "観戦の流れに形式の STEP が積まれた"
     );
-    // リングバッファの読み手（受信スレッド）が「読めない記録」として捨てたものも無い（ホストが形式の STEP を積んでも読み手の守りが隠すので、リングバッファの異常の数で見る）。
+    // リングバッファの読み手（受信スレッド）が「読み取れない記録」として捨てたものも無い（ホストが形式のSTEPを積んでも読み手の守りが隠すので、リングバッファの異常の数で見る）。
     assert_eq!(
         o.rig.ring.counts().bad,
         0,
@@ -2803,7 +2879,7 @@ fn a_watcher_whose_game_thread_stops_for_30_seconds_keeps_receiving_and_follows_
         "溜まっていない（止まっていない）: {:?}",
         o.rig.wp.stats()
     );
-    // 動き出した後は 30 秒遅れのまま見るので、次の選択の画面では遅れて入った観戦者と同じく選択の語を捨てて詰める。
+    // 動き出した後は30秒遅れのまま見るので、次の選択の画面では遅れて入った観戦者と同じく選択のワードを捨てて詰める。
     assert_follows_late(&o, "30 秒止まった観戦者");
     assert_eq!(o.rig.host.counts().resends, 0);
 }

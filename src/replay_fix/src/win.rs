@@ -1,4 +1,4 @@
-//! Windows 専用の部分: 起動の入口・ウィンドウ・標準のダイアログ。
+//! Windows専用の部分: 起動の入口・ウィンドウ・標準のダイアログ。
 
 mod dialogs;
 mod ui;
@@ -20,7 +20,7 @@ fn os_lang() -> Lang {
 fn message_box(text: &str, caption: &str) {
     let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let c: Vec<u16> = caption.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: 2 つの文字列とも終端 0 つきで呼びの間生きている。親のウィンドウは無し（null）。
+    // SAFETY: 2つの文字列とも終端0つきで呼びの間生きている。親のウィンドウは無し（null）。
     unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
@@ -32,7 +32,7 @@ fn message_box(text: &str, caption: &str) {
 }
 
 fn write_log(path: &Path, text: &str) {
-    // ウィンドウを出さない実行なので、書けなくても終了コードだけは正しく返す。
+    // ウィンドウを出さない実行なので書き込めなくても終了コードだけは正しく返す。
     let _ = std::fs::write(path, text);
 }
 

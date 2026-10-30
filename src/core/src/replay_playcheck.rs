@@ -1,11 +1,12 @@
-//! 素の花映塚でリプレイを再生したとき、生きた試合どおりに再生できたかを、印（`HGRT`）の `rN` と再生中に読んだ同じ tick の値で突き合わせる
-//! （pure。ツールは `src/bin/replay_playcheck.rs`、再生中の値を積む側は dll の `replay_watch`）。
+//! 素の花映塚でリプレイを再生したとき生きた試合どおりに再生できたかどうかを突き合わせる。
+//! 印（`HGRT`）の`rN`と再生中に読んだ同じtickの値を比べる（pure。ツールは`src/bin/replay_playcheck.rs`。再生中の値を積む側はdllの`replay_watch`）。
 //!
-//! 再生の側は、各ラウンドの決着の tick（`completed_rounds` が増えた tick）の値を生きた試合と同じ読み方（`MatchLog`）で積み、再生を出たときに
-//! ログへ 1 行を書く（`format_line`）。書式は印の `rN` の値と同じ 12 欄（`replay_detail::RoundRec`）で、
-//! `再生の照合: 最後まで再生 end=complete date=26/10/14 name=12:34:56 rounds=2 r1=<12 欄> r2=<12 欄>` の形。
-//! 行ごとにまとまっているので、別のスレッドの行が間に入っても読める。`date` / `name` は再生した見出し（`+0xC4` / `+0xCE`）の文字で、読めなかった
-//! ときは書かない。
+//! 再生の側は各ラウンドの決着のtick（`completed_rounds`が増えたtick）の値を生きた試合と同じ読み方（`MatchLog`）で積む。
+//! 再生を出たときにログへ1行を書く（`format_line`）。
+//! 書式は印の`rN`の値と同じ12フィールド（`replay_detail::RoundRec`）を並べた次の形。
+//! `再生の照合: 最後まで再生 end=complete date=26/10/14 name=12:34:56 rounds=2 r1=<12 欄> r2=<12 欄>`
+//! 行ごとにまとまっているので別のスレッドの行が間に入っても読める。
+//! `date` / `name`は再生したヘッダ（`+0xC4` / `+0xCE`）の文字。読み取れなかったときは書かない。
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
@@ -14,16 +15,17 @@ use crate::replay_decode;
 use crate::replay_detail::{MAX_ROUND_KEYS, RoundRec, Winner};
 use crate::replay_mark_cmp;
 
-/// 再生の行の目印。ログの行の先頭に別の文字（時刻など）が付いても、この語から後ろを読む。
+/// 再生の行の目印。ログの行の先頭に別の文字（時刻など）が付いてもこの語から後ろを読む。
 pub const PLAY_MARK: &str = "再生の照合:";
-/// 展開した本体（`replay_decode::decode_image`）の中の、見出しの日付（`yy/mm/dd` + NUL の 9 バイト）と名前（9 バイト）の位置。
+/// 展開した本体（`replay_decode::decode_image`）の中のヘッダの日付（`yy/mm/dd` + NUL の9バイト）と名前（9バイト）の位置。
 /// 形式は保存関数（th09.exe）が書くもの。
 pub const HEADER_DATE_OFFSET: usize = 0xC4;
 pub const HEADER_NAME_OFFSET: usize = 0xCE;
 pub const HEADER_FIELD_LEN: usize = 9;
 
-/// 見出しの 9 バイトの欄を行に書ける文字にする。NUL で終わる 1〜8 文字の ASCII の見える文字（空白は `_`）だけを受け、
-/// NUL が無い・空・見えない文字や ASCII 以外（Shift-JIS の名前）を含むものは `None`。
+/// ヘッダの9バイトのフィールドを行に書き込める文字にする。
+/// NULで終わる1〜8文字のASCIIの見える文字（空白は`_`）だけを受け付ける。
+/// NULが無い・空・見えない文字やASCII以外（Shift-JISの名前）を含むものは`None`。
 pub fn header_field(raw: &[u8]) -> Option<String> {
     let end = raw.iter().position(|&b| b == 0)?;
     if end == 0 || end >= HEADER_FIELD_LEN {
@@ -40,7 +42,7 @@ pub fn header_field(raw: &[u8]) -> Option<String> {
     Some(out)
 }
 
-/// どのリプレイかを見分ける見出しの文字。両方そろったときだけ見分けに使う。
+/// どのリプレイかを見分けるヘッダの文字。両方そろったときだけ見分けに使う。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ident {
     pub date: Option<String>,
@@ -60,19 +62,19 @@ impl Ident {
     }
 }
 
-/// ログの 1 行（1 回の再生）。
+/// ログの1行（1回の再生）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayBlock {
-    /// 何行目か（1 から）。
+    /// 何行目か（1から）。
     pub line: usize,
     pub ident: Ident,
-    /// 勝ちに要る数に届くまで再生した（false は途中で抜けた）。
+    /// 勝ちに要る数に届くまで再生した（falseは途中で抜けた）。
     pub complete: bool,
     pub rounds: Vec<RoundRec>,
     pub rounds_dropped: u32,
 }
 
-/// 再生を出たときに書く 1 行。
+/// 再生を出たときに書く1行。
 pub fn format_line(
     complete: bool,
     ident: &Ident,
@@ -109,7 +111,7 @@ pub fn format_line(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParsedLog {
     pub blocks: Vec<PlayBlock>,
-    /// 目印はあるが読めなかった行（行番号, 理由）。
+    /// 目印はあるが読み取れなかった行（行番号, 理由）。
     pub bad: Vec<(usize, String)>,
 }
 
@@ -181,7 +183,7 @@ pub fn parse_log(text: &str) -> ParsedLog {
     out
 }
 
-/// 比べる側のリプレイ（印の `rN` と見出しの文字）。
+/// 比べる側のリプレイ（印の`rN`とヘッダの文字）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefReplay {
     /// ファイル名だけ（フォルダ名には相手の名前が入る）。
@@ -191,8 +193,8 @@ pub struct RefReplay {
     pub rounds_dropped: u32,
 }
 
-/// リプレイのバイト列から比べる材料を作る。印が無い・読めない・ラウンドの記録が 0 件のときは理由を返す（0 件どうしを黙って一致にしない）。
-/// 見出しが復号できないときは見出しの文字だけ無しにする（印があれば比べられる）。
+/// リプレイのバイト列から比べる材料を作る。印が無い・読み取れない・ラウンドの記録が0件のときは理由を返す（0件どうしを黙って一致にしない）。
+/// ヘッダが復号できないときはヘッダの文字だけ無しにする（印があれば比べられる）。
 pub fn ref_from_bytes(file: &str, bytes: &[u8]) -> Result<RefReplay, String> {
     let e = replay_mark_cmp::entry_from_bytes(file, bytes, false)?;
     if e.rounds.is_empty() {
@@ -216,12 +218,12 @@ pub fn ref_from_bytes(file: &str, bytes: &[u8]) -> Result<RefReplay, String> {
     })
 }
 
-/// 複数のブロックから比べる 1 つを選んだ根拠。
+/// 複数のブロックから比べる1つを選んだ根拠。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickBy {
-    /// 見出しの日付と名前が両方そろって合うもの。
+    /// ヘッダの日付と名前が両方そろって合うもの。
     Header,
-    /// 見出しでは見分けられず、ラウンドの数と各ラウンドの長さが合うもの。
+    /// ヘッダでは見分けられず、ラウンドの数と各ラウンドの長さが合うもの。
     RoundLengths,
     /// どれも合わず、最後のブロック。
     LastBlock,
@@ -239,7 +241,7 @@ impl PickBy {
     }
 }
 
-/// 比べるブロックを選ぶ。各段で複数あれば最後（一番新しい再生）。ブロックが無ければ `None`。
+/// 比べるブロックを選ぶ。各段階で複数あれば最後（一番新しい再生）。ブロックが無ければ`None`。
 pub fn pick(r: &RefReplay, blocks: &[PlayBlock]) -> Option<(usize, PickBy)> {
     if r.ident.is_known()
         && let Some(i) = blocks.iter().rposition(|b| b.ident == r.ident)
@@ -259,17 +261,17 @@ pub fn pick(r: &RefReplay, blocks: &[PlayBlock]) -> Option<(usize, PickBy)> {
     blocks.len().checked_sub(1).map(|i| (i, PickBy::LastBlock))
 }
 
-/// 1 項目の違い。`expected` は印、`actual` は再生。
+/// 1項目の違い。`expected`は印、`actual`は再生。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diff {
-    /// 何ラウンド目か（1 から）。0 はマッチ全体の項目。
+    /// 何ラウンド目か（1から）。0はマッチ全体の項目。
     pub round: usize,
     pub item: String,
     pub expected: String,
     pub actual: String,
 }
 
-/// 1 ラウンドで比べる項目の数（長さ・勝者・ライフ・C2+C3・ボス・リバーサル・スコアの 1P / 2P）。
+/// 1ラウンドで比べる項目の数（長さ・勝者・ライフ・C2+C3・ボス・リバーサル・スコアの1P / 2P）。
 pub const ITEMS_PER_ROUND: usize = 12;
 
 fn opt32(v: Option<u32>) -> String {
@@ -329,7 +331,7 @@ fn round_diffs(n: usize, x: &RoundRec, y: &RoundRec, out: &mut Vec<Diff>) {
     }
 }
 
-/// 比べた結果。`items` は比べた項目の数（共通のラウンド × `ITEMS_PER_ROUND`）。
+/// 比べた結果。`items`は比べた項目の数（共通のラウンド × `ITEMS_PER_ROUND`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comparison {
     pub items: usize,
@@ -342,7 +344,7 @@ impl Comparison {
     }
 }
 
-/// 印と再生のブロックを項目ごとに比べる。ラウンド数が違えば共通のラウンドだけ項目を比べ、数の違いも 1 項目として足す。
+/// 印と再生のブロックを項目ごとに比べる。ラウンド数が違えば共通のラウンドだけ項目を比べ、数の違いも1項目として足す。
 pub fn compare(r: &RefReplay, b: &PlayBlock) -> Comparison {
     let mut diffs = Vec::new();
     if r.rounds.len() != b.rounds.len() {
@@ -378,7 +380,7 @@ pub struct Report {
     pub equal: bool,
 }
 
-/// ツールの本体: ログの全文とリプレイから、選んで・比べて・文にする。再生の行が 1 つも読めなければ `Err`（測れていない）。
+/// ツールの本体: ログの全文とリプレイから選んで・比べて・文にする。再生の行が1つも読み取れなければ`Err`（測れていない）。
 pub fn run(r: &RefReplay, log: &str) -> Result<Report, String> {
     let parsed = parse_log(log);
     let mut text = String::new();
@@ -484,7 +486,7 @@ mod tests {
         }
     }
 
-    /// 合成のリプレイ（見出しの日付は `26/01/01`、名前は `NO NAME`）に、`rounds` の印を付けたもの。
+    /// 合成のリプレイ（ヘッダの日付は`26/01/01`、名前は`NO NAME`）に`rounds`の印を付けたもの。
     fn replay_bytes(rounds: Vec<RoundRec>) -> Vec<u8> {
         let mut f = build_replay(&BuildSpec::match_replay(0x52, vec![1, 2], vec![3, 4]));
         let mark = Mark {
@@ -605,7 +607,7 @@ mod tests {
             1,
             "違うのはその 1 項目だけ"
         );
-        // 項目ごと: 長さ・勝者・各カウンタの 1P / 2P・不明の値も別の項目として出る。
+        // 項目ごと: 長さ・勝者・各カウンタの1P / 2P・不明の値も別の項目として出る。
         let mut p = two_rounds();
         p[0].frames += 1;
         p[0].winner = Winner::P2;
@@ -680,7 +682,7 @@ mod tests {
         let rep = run(&r, &log).unwrap();
         assert!(rep.equal, "{}", rep.text);
         assert!(rep.text.contains("3 件のうち 1 件目"), "{}", rep.text);
-        // 同じ見出しが 2 回あれば最後（一番新しい再生）。
+        // 同じ見出しが2回あれば最後（一番新しい再生）。
         let log = [
             block(&ident("26/01/01", "NO_NAME"), true, &other),
             block(&ident("26/01/01", "NO_NAME"), true, &two_rounds()),
@@ -706,7 +708,7 @@ mod tests {
         )
         .blocks;
         assert_eq!(pick(&r, &blocks), Some((0, PickBy::RoundLengths)));
-        // 見出しが合わない（別の日）ブロックしか無くても、長さが合えば長さで選ぶ。
+        // ヘッダが合わない（別の日）ブロックしか無くても長さが合えば長さで選ぶ。
         let blocks = parse_log(&block(&ident("25/01/01", "00:00:00"), true, &two_rounds())).blocks;
         assert_eq!(pick(&r, &blocks), Some((0, PickBy::RoundLengths)));
         // どれも合わなければ最後。選び方の文に「疑い」が出る。
@@ -727,7 +729,7 @@ mod tests {
         assert!(e.contains("再生の行"), "{e}");
         let e = run(&r, &format!("{PLAY_MARK} end=complete rounds=1")).unwrap_err();
         assert!(e.contains("どれも読めない"), "{e}");
-        // 印のラウンドが 0 件のリプレイは材料にしない。
+        // 印のラウンドが0件のリプレイは材料にしない。
         let e = ref_from_bytes("z.rpy", &replay_bytes(Vec::new())).unwrap_err();
         assert!(e.contains("0 件"), "{e}");
         // 印の無いリプレイ。

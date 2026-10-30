@@ -1,7 +1,7 @@
-//! 本物の Win32（`windows-sys`）。ローダーの unsafe は `folder_dialog.rs`・`http_win.rs` とここにだけある。
-//! 判断はしない（手順は `launch.rs`。ここに書くと偽物の検査が本物の経路を見なくなる）。
+//! 本物のWin32（`windows-sys`）。ローダーのunsafeは`folder_dialog.rs`とここにだけある。
+//! 判断はしない（手順は`launch.rs`。ここに書くと偽物の検査が本物の経路を見なくなる）。
 
-// std の ProcessPrng の遅延読み込みが失敗したときのフック（build.rs の /DELAYLOAD と対）。
+// stdのProcessPrngの遅延読み込みが失敗したときのフック（build.rsの /DELAYLOADと対）。
 higanr_prng_shim::install_delay_load_hook!();
 
 use core::ffi::c_void;
@@ -66,7 +66,7 @@ fn h(handle: Handle) -> HANDLE {
     handle.0 as HANDLE
 }
 
-/// 終端 0 つきの UTF-16。途中に 0 があれば None。
+/// 終端0つきのUTF-16。途中に0があればNone。
 fn wide_nul(s: &OsStr) -> Option<Vec<u16>> {
     let mut v: Vec<u16> = s.encode_wide().collect();
     if v.contains(&0) {
@@ -76,7 +76,7 @@ fn wide_nul(s: &OsStr) -> Option<Vec<u16>> {
     Some(v)
 }
 
-/// 引数を C ランタイムが読み戻せる形に包む（両端を `"` で囲み、閉じの `"` 直前の `\` を倍にする）。`"` を含む引数は断る。
+/// 引数をCランタイムが読み戻せる形に包む（両端を`"`で囲み、閉じの`"`直前の`\`を倍にする）。`"`を含む引数は断る。
 fn push_quoted(out: &mut Vec<u16>, arg: &OsStr) -> Option<()> {
     let w: Vec<u16> = arg.encode_wide().collect();
     if w.contains(&0) || w.contains(&(b'"' as u16)) {
@@ -90,9 +90,10 @@ fn push_quoted(out: &mut Vec<u16>, arg: &OsStr) -> Option<()> {
     Some(())
 }
 
-/// 子に渡すコマンドライン。引数が無ければ None（`lpCommandLine` を NULL にし、Windows が実行ファイルのパスを引用符なしで
-/// そのまま使う）。vpatch と同じ形で、Discord は花映塚をコマンドラインの文字列で見分けるため、vpatch で登録した Discord の
-/// 項目がそのまま当たる。花映塚はコマンドラインの中身を使わない（vpatch の起動で遊べている）。
+/// 子に渡すコマンドライン。
+/// 引数が無ければNone（`lpCommandLine`をNULLにするとWindowsが実行ファイルのパスを引用符なしでそのまま使う）。
+/// vpatchと同じ形にする。Discordは花映塚をコマンドラインの文字列で見分ける。そのためvpatchで登録したDiscordの項目がそのまま当たる。
+/// 花映塚はコマンドラインの中身を使わない（vpatchの起動で遊べている）。
 pub fn command_line_or_null(spawn: &Spawn) -> Result<Option<Vec<u16>>, ()> {
     if spawn.args.is_empty() {
         return Ok(None);
@@ -111,9 +112,9 @@ pub fn command_line(spawn: &Spawn) -> Option<Vec<u16>> {
     Some(out)
 }
 
-/// `no_activate` なら、子の最初の `ShowWindow` の `nCmdShow` を `SW_SHOWNOACTIVATE` にする。
-/// 前面のアプリの子孫として起動したプロセスの最初のウィンドウには Windows が前面を渡し、起動した花映塚が約 1.4 秒後に
-/// 前面を取ってキー入力を奪った（実測）ため。
+/// `no_activate`なら子の最初の`ShowWindow`の`nCmdShow`を`SW_SHOWNOACTIVATE`にする。
+/// 前面のアプリの子孫として起動したプロセスの最初のウィンドウにはWindowsが前面を渡す。
+/// そのため起動した花映塚が約1.4秒後に前面を取ってキー入力を奪った（実測）。
 pub fn startup_info(no_activate: bool) -> STARTUPINFOW {
     let mut si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
@@ -135,12 +136,12 @@ impl Win32 for RealWin32 {
 
     fn load_library_w_address(&mut self) -> Result<usize, ErrorCode> {
         let name = wide_nul(OsStr::new("kernel32.dll")).ok_or(ERROR_INVALID_PARAMETER)?;
-        // SAFETY: `name` は終端 0 つきで生きている。kernel32.dll は常に載っているので参照を増やさない GetModuleHandleW で足りる。
+        // SAFETY: `name`は終端0つきで生きている。kernel32.dllは常に載っているので参照を増やさないGetModuleHandleWで足りる。
         let module = unsafe { GetModuleHandleW(name.as_ptr()) };
         if module.is_null() {
             return Err(last_error());
         }
-        // SAFETY: `module` は有効な HMODULE、名前は終端 0 つきの ASCII。
+        // SAFETY: `module`は有効なHMODULE、名前は終端0つきのASCII。
         let proc = unsafe { GetProcAddress(module, c"LoadLibraryW".as_ptr().cast()) };
         match proc {
             Some(f) => Ok(f as usize),
@@ -173,8 +174,8 @@ impl Win32 for RealWin32 {
         let si = startup_info(spawn.no_activate);
         let mut pi = PROCESS_INFORMATION::default();
         let cmd_ptr = cmd.as_mut().map_or(ptr::null_mut(), |c| c.as_mut_ptr());
-        // SAFETY: 文字列は終端 0 つきで生きている。lpCommandLine は書き換えられうるので自分の `Vec` か NULL を渡す。
-        // ハンドルは継承させない。環境は null か、生きている `env_block`（CREATE_UNICODE_ENVIRONMENT を立てた）。
+        // SAFETY: 文字列は終端0つきで生きている。lpCommandLineは書き換えられうるので自分の`Vec`かNULLを渡す。
+        // ハンドルは継承させない。環境はnullか、生きている`env_block`（CREATE_UNICODE_ENVIRONMENTを立てた）。
         let ok = unsafe {
             CreateProcessW(
                 app.as_ptr(),
@@ -200,7 +201,7 @@ impl Win32 for RealWin32 {
     }
 
     fn virtual_alloc(&mut self, process: Handle, size: usize) -> Result<Remote, ErrorCode> {
-        // SAFETY: 相手のプロセスに領域を作るだけ。`process` は閉じていない全権のハンドル。
+        // SAFETY: 相手のプロセスに領域を作るだけ。`process`は閉じていない全権のハンドル。
         let p = unsafe {
             VirtualAllocEx(
                 h(process),
@@ -218,7 +219,7 @@ impl Win32 for RealWin32 {
 
     fn write_memory(&mut self, process: Handle, at: Remote, data: &[u8]) -> Result<(), ErrorCode> {
         let mut written = 0usize;
-        // SAFETY: 読むのは `data`、書くのは相手の `at`（`data.len()` 以上を確保した領域）。
+        // SAFETY: 読むのは`data`、書くのは相手の`at`（`data.len()`以上を確保した領域）。
         let ok = unsafe {
             WriteProcessMemory(
                 h(process),
@@ -232,7 +233,7 @@ impl Win32 for RealWin32 {
             return Err(last_error());
         }
         if written != data.len() {
-            // 一部しか書けなかった。途中で切れたパスの DLL を読ませないよう失敗にする。
+            // 一部しか書き込めなかった。途中で切れたパスのDLLを読ませないよう失敗にする。
             return Err(ERROR_INVALID_PARAMETER);
         }
         Ok(())
@@ -246,7 +247,7 @@ impl Win32 for RealWin32 {
     ) -> Result<Vec<u8>, ErrorCode> {
         let mut buf = vec![0u8; len];
         let mut read = 0usize;
-        // SAFETY: 書くのは `buf`（`len` バイト）、読むのは相手の `at`（読めなければ失敗を返すだけ）。
+        // SAFETY: 書くのは`buf`（`len`バイト）、読むのは相手の`at`（読み取れなければ失敗を返すだけ）。
         let ok = unsafe {
             ReadProcessMemory(
                 h(process),
@@ -267,7 +268,7 @@ impl Win32 for RealWin32 {
 
     fn patch_code(&mut self, process: Handle, at: usize, data: &[u8]) -> Result<(), ErrorCode> {
         let mut old: PAGE_PROTECTION_FLAGS = 0;
-        // SAFETY: 相手の `at` から `data.len()` バイトの保護を変えるだけ。
+        // SAFETY: 相手の`at`から`data.len()`バイトの保護を変えるだけ。
         let ok = unsafe {
             VirtualProtectEx(
                 h(process),
@@ -281,7 +282,7 @@ impl Win32 for RealWin32 {
             return Err(last_error());
         }
         let mut written = 0usize;
-        // SAFETY: 読むのは `data`、書くのは相手の `at`（上で書けるようにした）。
+        // SAFETY: 読むのは`data`、書くのは相手の`at`（上で書き込み可能にした）。
         let wrote = unsafe {
             WriteProcessMemory(
                 h(process),
@@ -309,7 +310,7 @@ impl Win32 for RealWin32 {
         if restored == 0 {
             return Err(last_error());
         }
-        // SAFETY: 相手のプロセスの命令キャッシュを流すだけ（書いた範囲）。
+        // SAFETY: 相手のプロセスの命令キャッシュをフラッシュするだけ（書いた範囲）。
         let flushed = unsafe { FlushInstructionCache(h(process), at as *const c_void, data.len()) };
         if flushed == 0 {
             return Err(last_error());
@@ -326,11 +327,11 @@ impl Win32 for RealWin32 {
         if start == 0 {
             return Err(ERROR_INVALID_PARAMETER);
         }
-        // SAFETY: `start` は 0 でないアドレス（kernel32 の LoadLibraryW）で、呼ぶのは相手のプロセスの中だけ。
-        // 32bit では usize と関数ポインタは同じ大きさ。
+        // SAFETY: `start`は0でないアドレス（kernel32のLoadLibraryW）で、呼ぶのは相手のプロセスの中だけ。
+        // 32bitではusizeと関数ポインタは同じ大きさ。
         let routine: unsafe extern "system" fn(*mut c_void) -> u32 =
             unsafe { core::mem::transmute::<usize, _>(start) };
-        // SAFETY: `process` は閉じていない全権のハンドル。引数は相手の中のアドレスで、こちらでは参照しない。
+        // SAFETY: `process`は閉じていない全権のハンドル。引数は相手の中のアドレスで、こちらでは参照しない。
         let t = unsafe {
             CreateRemoteThread(
                 h(process),
@@ -349,20 +350,20 @@ impl Win32 for RealWin32 {
     }
 
     fn wait(&mut self, handle: Handle, timeout_ms: u32) -> WaitResult {
-        // SAFETY: `handle` は閉じていないハンドル（スレッドかプロセス）。待つだけで何も書かない。
+        // SAFETY: `handle`は閉じていないハンドル（スレッドかプロセス）。待つだけで何も書かない。
         let r = unsafe { WaitForSingleObject(h(handle), timeout_ms) };
         match r {
             WAIT_OBJECT_0 => WaitResult::Signaled,
             WAIT_TIMEOUT => WaitResult::TimedOut,
             WAIT_FAILED => WaitResult::Failed(last_error()),
-            // WAIT_ABANDONED はミューテックスにしか返らない。
+            // WAIT_ABANDONEDはミューテックスにしか返らない。
             other => WaitResult::Failed(other),
         }
     }
 
     fn thread_exit_code(&mut self, thread: Handle) -> Result<u32, ErrorCode> {
         let mut code = 0u32;
-        // SAFETY: `thread` は閉じていないスレッドのハンドル。`code` は呼び出しの間生きている。
+        // SAFETY: `thread`は閉じていないスレッドのハンドル。`code`は呼び出しの間生きている。
         let ok = unsafe { GetExitCodeThread(h(thread), &mut code) };
         if ok == 0 {
             return Err(last_error());
@@ -371,7 +372,7 @@ impl Win32 for RealWin32 {
     }
 
     fn virtual_free(&mut self, process: Handle, at: Remote) -> Result<(), ErrorCode> {
-        // SAFETY: `at` は virtual_alloc が返した領域の先頭（MEM_RELEASE では大きさに 0）。相手のメモリだけに触る。
+        // SAFETY: `at`はvirtual_allocが返した領域の先頭（MEM_RELEASEでは大きさに0）。相手のメモリだけに触る。
         let ok = unsafe { VirtualFreeEx(h(process), at.0 as *mut c_void, 0, MEM_RELEASE) };
         if ok == 0 {
             return Err(last_error());
@@ -380,7 +381,7 @@ impl Win32 for RealWin32 {
     }
 
     fn resume_thread(&mut self, thread: Handle) -> Result<u32, ErrorCode> {
-        // SAFETY: `thread` は CreateProcessW が返した主スレッドのハンドル（閉じていない）。
+        // SAFETY: `thread`はCreateProcessWが返した主スレッドのハンドル（閉じていない）。
         let r = unsafe { ResumeThread(h(thread)) };
         if r == u32::MAX {
             return Err(last_error());
@@ -389,7 +390,7 @@ impl Win32 for RealWin32 {
     }
 
     fn terminate_process(&mut self, process: Handle, exit_code: u32) -> Result<(), ErrorCode> {
-        // SAFETY: `process` はこのローダーが作ったプロセスのハンドル（他人のプロセスは殺さない）。
+        // SAFETY: `process`はこのローダーが作ったプロセスのハンドル（他人のプロセスは殺さない）。
         let ok = unsafe { TerminateProcess(h(process), exit_code) };
         if ok == 0 {
             return Err(last_error());
@@ -398,7 +399,7 @@ impl Win32 for RealWin32 {
     }
 
     fn close_handle(&mut self, handle: Handle) -> Result<(), ErrorCode> {
-        // SAFETY: `handle` はこのローダーが開いたハンドルで、閉じるのはこの 1 回だけ。
+        // SAFETY: `handle`はこのローダーが開いたハンドルで、閉じるのはこの1回だけ。
         let ok = unsafe { CloseHandle(h(handle)) };
         if ok == 0 {
             return Err(last_error());
@@ -409,10 +410,10 @@ impl Win32 for RealWin32 {
 
 #[cfg(not(feature = "dist"))]
 impl RealWin32 {
-    /// 自己検査が的の終了コードを読むためだけに使う（`Win32` トレイトには入れない）。
+    /// 自己検査がターゲットの終了コードを読むためだけに使う（`Win32`トレイトには追加しない）。
     pub fn process_exit_code(&mut self, process: Handle) -> Result<u32, ErrorCode> {
         let mut code = 0u32;
-        // SAFETY: `process` は閉じていないプロセスのハンドル。`code` は呼び出しの間生きている。
+        // SAFETY: `process`は閉じていないプロセスのハンドル。`code`は呼び出しの間生きている。
         let ok = unsafe { GetExitCodeProcess(h(process), &mut code) };
         if ok == 0 {
             return Err(last_error());
@@ -421,20 +422,20 @@ impl RealWin32 {
     }
 }
 
-/// 自己検査だけ: 読めない DLL を読ませたとき OS のエラーのウィンドウで止まらないようにする。子プロセスにも引き継がれる。本番では呼ばない。
+/// 自己検査だけ: 読み込めないDLLを読ませたときOSのエラーのウィンドウで止まらないようにする。子プロセスにも引き継がれる。本番では呼ばない。
 #[cfg(not(feature = "dist"))]
 pub fn quiet_error_mode() {
-    // SAFETY: 自分のプロセスの設定を 1 つ変えるだけ。戻り値（前の設定）は使わない。
+    // SAFETY: 自分のプロセスの設定を1つ変えるだけ。戻り値（前の設定）は使わない。
     unsafe {
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     }
 }
 
-/// 黒いウィンドウに付いているプロセスの数。ショートカット起動なら 1、コマンドプロンプトや検査のツールからなら 2 以上。取れなければ None。
+/// コンソールウィンドウに付いているプロセスの数。ショートカット起動なら1、コマンドプロンプトや検査のツールからなら2以上。取れなければNone。
 pub fn console_process_count() -> Option<u32> {
     use windows_sys::Win32::System::Console::GetConsoleProcessList;
     let mut ids = [0u32; 4];
-    // SAFETY: `ids` は長さ 4 の書ける配列で、その長さを渡す（戻り値は配列より多くても数は正しい）。
+    // SAFETY: `ids`は長さ4の書き込み可能な配列で、その長さを渡す（戻り値は配列より多くても数は正しい）。
     let n = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
     (n != 0).then_some(n)
 }
@@ -450,12 +451,12 @@ impl crate::single::Host for RealSingle {
         let Some(wide) = wide_nul(OsStr::new(name)) else {
             return Lock::Failed(ERROR_INVALID_PARAMETER);
         };
-        // SAFETY: `wide` は終端 0 つきで生きている。属性は既定（NULL）、最初は誰も持たない。
+        // SAFETY: `wide`は終端0つきで生きている。属性は既定（NULL）、最初は誰も持たない。
         let m = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
         if m.is_null() {
             return Lock::Failed(last_error());
         }
-        // SAFETY: `m` は上で作った有効なミューテックスのハンドル。待たずに取るだけ。
+        // SAFETY: `m`は上で作った有効なミューテックスのハンドル。待たずに取るだけ。
         match unsafe { WaitForSingleObject(m, 0) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Lock::Held(m as usize),
             other => {
@@ -464,7 +465,7 @@ impl crate::single::Host for RealSingle {
                 } else {
                     0
                 };
-                // SAFETY: 取れなかったので `m` は閉じて捨てる（1 回だけ）。
+                // SAFETY: 取れなかったので`m`は閉じて捨てる（1回だけ）。
                 unsafe { CloseHandle(m) };
                 if other == WAIT_TIMEOUT {
                     Lock::Busy
@@ -478,7 +479,7 @@ impl crate::single::Host for RealSingle {
     fn unlock(&mut self, token: usize) {
         use windows_sys::Win32::System::Threading::ReleaseMutex;
         let m = token as HANDLE;
-        // SAFETY: `token` は `lock` が返した、同じスレッドで取ったミューテックス。放して閉じるのは 1 回だけ。
+        // SAFETY: `token`は`lock`が返した、同じスレッドで取ったミューテックス。放して閉じるのは1回だけ。
         unsafe {
             ReleaseMutex(m);
             CloseHandle(m);
@@ -491,16 +492,16 @@ impl crate::single::Host for RealSingle {
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
         };
-        // SAFETY: 引数は定数だけ。失敗は INVALID_HANDLE_VALUE。
+        // SAFETY: 引数は定数だけ。失敗はINVALID_HANDLE_VALUE。
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap == INVALID_HANDLE_VALUE {
             return Err(last_error());
         }
-        // SAFETY: 0 で埋めた構造体で足りる（dwSize は下で設定する）。
+        // SAFETY: 0で埋めた構造体で足りる（dwSizeは下で設定する）。
         let mut entry: PROCESSENTRY32W = unsafe { core::mem::zeroed() };
         entry.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut out = Vec::new();
-        // SAFETY: `snap` は有効なスナップショット、`entry` は dwSize を設定した書ける構造体。
+        // SAFETY: `snap`は有効なスナップショット、`entry`はdwSizeを設定した書き込み可能な構造体。
         let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
         while more {
             let len = entry
@@ -515,7 +516,7 @@ impl crate::single::Host for RealSingle {
             // SAFETY: 同上。
             more = unsafe { Process32NextW(snap, &mut entry) } != 0;
         }
-        // SAFETY: 上で作った `snap` を閉じる（1 回だけ）。
+        // SAFETY: 上で作った`snap`を閉じる（1回だけ）。
         unsafe { CloseHandle(snap) };
         Ok(out)
     }
@@ -524,40 +525,40 @@ impl crate::single::Host for RealSingle {
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         };
-        // SAFETY: 制限つきの情報だけを求めて開く。開けなければ NULL。
+        // SAFETY: 制限つきの情報だけを求めて開く。開けなければNULL。
         let p = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if p.is_null() {
             return None;
         }
-        // パスの長さの上限（32767 文字）に終端の 0 を足した分。
+        // パスの長さの上限（32767文字）に終端の0を足した分。
         let mut buf = vec![0u16; 32_768];
         let mut len = buf.len() as u32;
-        // SAFETY: `p` は有効なプロセスのハンドル。`buf` は `len` 文字を書ける。0 は Win32 形式のパス。
+        // SAFETY: `p`は有効なプロセスのハンドル。`buf`は`len`文字を書き込める。0はWin32形式のパス。
         let ok = unsafe { QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len) };
-        // SAFETY: 上で開いた `p` を閉じる（1 回だけ）。
+        // SAFETY: 上で開いた`p`を閉じる（1回だけ）。
         unsafe { CloseHandle(p) };
         (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
 
     fn mutex_exists(&mut self, name: &str) -> bool {
         use windows_sys::Win32::System::Threading::OpenMutexW;
-        // 標準のアクセス権の SYNCHRONIZE（待てるだけ）。
+        // 標準のアクセス権のSYNCHRONIZE（待てるだけ）。
         const SYNCHRONIZE: u32 = 0x0010_0000;
         let Some(wide) = wide_nul(OsStr::new(name)) else {
             return false;
         };
-        // SAFETY: `wide` は終端 0 つきで生きている。開くだけで、作らない・取らない。
+        // SAFETY: `wide`は終端0つきで生きている。開くだけで、作らない・取らない。
         let m = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
         if m.is_null() {
             return false;
         }
-        // SAFETY: 上で開いた `m` を閉じる（1 回だけ）。
+        // SAFETY: 上で開いた`m`を閉じる（1回だけ）。
         unsafe { CloseHandle(m) };
         true
     }
 }
 
-/// OS の UI の言語（`GetUserDefaultUILanguage`。LANGID）。画面の言語の既定に使う。
+/// OSのUIの言語（`GetUserDefaultUILanguage`。LANGID）。画面の言語の既定に使う。
 pub fn user_ui_langid() -> u16 {
     // SAFETY: 引数の無い読み取りだけの関数で、どのスレッドから呼んでもよい。
     unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() }
@@ -567,13 +568,13 @@ fn api_error(name: &str, code: ErrorCode, lang: Lang) -> String {
     by_lang!(lang, ja: "{name}、GetLastError {code}", en: "{name}, GetLastError {code}")
 }
 
-/// `OpenClipboard` を試す回数。他のアプリが一瞬開いていると断られるため。
+/// `OpenClipboard`を試す回数。他のアプリが一瞬開いていると断られるため。
 const CLIPBOARD_TRIES: u32 = 5;
 const CLIPBOARD_GAP_MS: u64 = 20;
 
-/// `text` をクリップボードへコピーする。検査からは呼ばない（使っている人のクリップボードを書き換えるため。`code_relay::Host` の偽物で差し替える）。
+/// `text`をクリップボードへコピーする。検査からは呼ばない（使っている人のクリップボードを書き換えるため。`code_relay::Host`の偽物で差し替える）。
 ///
-/// 開き手のウィンドウは NULL。文書は「EmptyClipboard すると持ち主が NULL になり SetClipboardData が失敗する」と書くが、実物では検証していない。
+/// クリップボードを開くウィンドウはNULL。文書は「EmptyClipboardすると持ち主がNULLになりSetClipboardDataが失敗する」と書くが実物では検証していない。
 /// 失敗したら理由を返す。
 pub fn set_clipboard_text(text: &str, lang: Lang) -> Result<(), String> {
     use windows_sys::Win32::Foundation::GlobalFree;
@@ -597,7 +598,7 @@ pub fn set_clipboard_text(text: &str, lang: Lang) -> Result<(), String> {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_GAP_MS));
         }
-        // SAFETY: NULL のウィンドウ（呼び出しスレッドが開き手になる）。何も読み書きしない。
+        // SAFETY: NULLのウィンドウ（呼び出しスレッドがクリップボードを開く側になる）。何も読み書きしない。
         if unsafe { OpenClipboard(ptr::null_mut()) } != 0 {
             opened = true;
             break;
@@ -612,34 +613,34 @@ pub fn set_clipboard_text(text: &str, lang: Lang) -> Result<(), String> {
             return Err(api_error("EmptyClipboard", last_error(), lang));
         }
         let bytes = wide.len() * std::mem::size_of::<u16>();
-        // SAFETY: 動かせるグローバルメモリを `bytes` だけ確保する。失敗なら NULL が返り、下で見る。
+        // SAFETY: 動かせるグローバルメモリを`bytes`だけ確保する。失敗ならNULLが返るので下でチェックする。
         let mem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
         if mem.is_null() {
             return Err(api_error("GlobalAlloc", last_error(), lang));
         }
-        // SAFETY: `mem` は上で確保した閉じていないハンドル。錠を掛けてアドレスを得る。
+        // SAFETY: `mem`は上で確保した閉じていないハンドル。ロックを掛けてアドレスを得る。
         let p = unsafe { GlobalLock(mem) }.cast::<u16>();
         if p.is_null() {
             let e = last_error();
-            // SAFETY: `mem` はまだクリップボードに渡していないので、こちらが返す。
+            // SAFETY: `mem`はまだクリップボードに渡していないのでこちらが返す。
             unsafe { GlobalFree(mem) };
             return Err(api_error("GlobalLock", e, lang));
         }
-        // SAFETY: `p` は `wide.len()` 個の u16 を確保した領域の先頭で、`wide` と重ならない。書き終えたら錠を外す。
+        // SAFETY: `p`は`wide.len()`個のu16を確保した領域の先頭で、`wide`と重ならない。書き終えたらロックを解除する。
         unsafe {
             ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
             GlobalUnlock(mem);
         }
-        // SAFETY: 空にしたクリップボードへ、錠を外したメモリを渡す。成功すれば持ち主はシステムに移る。
+        // SAFETY: 空にしたクリップボードへロックを解除したメモリを渡す。成功すれば所有者はシステムに移る。
         if unsafe { SetClipboardData(CF_UNICODETEXT, mem) }.is_null() {
             let e = last_error();
-            // SAFETY: 渡せなかったので持ち主はこちらのまま。返す。
+            // SAFETY: 渡せなかったので所有者はこちらのまま。返す。
             unsafe { GlobalFree(mem) };
             return Err(api_error("SetClipboardData", e, lang));
         }
         Ok(())
     })();
-    // SAFETY: 上で開いたクリップボードを閉じる（成功でも失敗でも 1 回だけ）。
+    // SAFETY: 上で開いたクリップボードを閉じる（成功でも失敗でも1回だけ）。
     unsafe { CloseClipboard() };
     result
 }
@@ -649,7 +650,7 @@ pub fn module_loaded(path: &Path) -> bool {
     let Some(name) = wide_nul(path.as_os_str()) else {
         return false;
     };
-    // SAFETY: `name` は終端 0 つきで生きている。参照を増やさずに引くだけ。
+    // SAFETY: `name`は終端0つきで生きている。参照を増やさずに取得するだけ。
     let m = unsafe { GetModuleHandleW(name.as_ptr()) };
     !m.is_null()
 }
@@ -657,7 +658,7 @@ pub fn module_loaded(path: &Path) -> bool {
 /// ローカルの時刻（段階ログの行頭とファイル名）。
 pub fn local_stamp() -> LocalStamp {
     let mut st = SYSTEMTIME::default();
-    // SAFETY: `st` は GetLocalTime が書く SYSTEMTIME そのもの。
+    // SAFETY: `st`はGetLocalTimeが書くSYSTEMTIMEそのもの。
     unsafe { GetLocalTime(&mut st) };
     LocalStamp {
         year: st.wYear,
@@ -670,7 +671,7 @@ pub fn local_stamp() -> LocalStamp {
     }
 }
 
-/// `RtlGetVersion` の OSVERSIONINFOW。`GetVersionExW` はマニフェストが無いと 6.2 以降を偽るので使わない。
+/// `RtlGetVersion`のOSVERSIONINFOW。`GetVersionExW`はマニフェストが無いと6.2以降を偽るので使わない。
 #[repr(C)]
 struct OsVersionInfo {
     size: u32,
@@ -681,22 +682,22 @@ struct OsVersionInfo {
     csd: [u16; 128],
 }
 
-/// `10.0.19045` の形の Windows のバージョン。ntdll の `RtlGetVersion` が引けなければ `不明`。
+/// `10.0.19045`の形のWindowsのバージョン。ntdllの`RtlGetVersion`が取得できなければ`不明`。
 pub fn os_version() -> String {
     let Some(name) = wide_nul(OsStr::new("ntdll.dll")) else {
         return "不明".to_string();
     };
-    // SAFETY: `name` は終端 0 つきで生きている。ntdll.dll は全プロセスに載っているので参照を増やさない関数で足りる。
+    // SAFETY: `name`は終端0つきで生きている。ntdll.dllは全プロセスに載っているので参照を増やさない関数で足りる。
     let ntdll = unsafe { GetModuleHandleW(name.as_ptr()) };
     if ntdll.is_null() {
         return "不明".to_string();
     }
-    // SAFETY: `ntdll` は有効な HMODULE、名前は終端 0 つきの ASCII。
+    // SAFETY: `ntdll`は有効なHMODULE、名前は終端0つきのASCII。
     let Some(f) = (unsafe { GetProcAddress(ntdll, c"RtlGetVersion".as_ptr().cast()) }) else {
         return "不明".to_string();
     };
     type RtlGetVersion = unsafe extern "system" fn(*mut OsVersionInfo) -> i32;
-    // SAFETY: RtlGetVersion は OSVERSIONINFOW を 1 つ受ける関数で、32bit では関数のアドレスと同じ大きさの型に直せる。
+    // SAFETY: RtlGetVersionはOSVERSIONINFOWを1つ受ける関数で、32bitでは関数のアドレスと同じ大きさの型に直せる。
     let f: RtlGetVersion = unsafe { core::mem::transmute(f) };
     let mut info = OsVersionInfo {
         size: size_of::<OsVersionInfo>() as u32,
@@ -706,7 +707,7 @@ pub fn os_version() -> String {
         platform: 0,
         csd: [0; 128],
     };
-    // SAFETY: `info` は `size` を正しく書いた OSVERSIONINFOW と同じ並びで、呼び出しの間生きている。
+    // SAFETY: `info`は`size`を正しく書いたOSVERSIONINFOWと同じ並びで、呼び出しの間生きている。
     let status = unsafe { f(&mut info) };
     if status != 0 {
         return "不明".to_string();
@@ -714,23 +715,23 @@ pub fn os_version() -> String {
     format!("{}.{}.{}", info.major, info.minor, info.build)
 }
 
-/// Wine / Proton の上か（DLL の `win::wine_version` と同じ判定: `ntdll` が `wine_get_version` を出している）。名前を引くだけで呼ばない。
+/// Wine / Protonの上かどうか（DLLの`win::wine_version`と同じ判定: `ntdll`が`wine_get_version`を出している）。名前を取得するだけで呼ばない。
 pub fn is_wine() -> bool {
     let Some(name) = wide_nul(OsStr::new("ntdll.dll")) else {
         return false;
     };
-    // SAFETY: `name` は終端 0 つきで生きている。ntdll.dll は全プロセスに載っているので参照を増やさない関数で足りる。
+    // SAFETY: `name`は終端0つきで生きている。ntdll.dllは全プロセスに載っているので参照を増やさない関数で足りる。
     let ntdll = unsafe { GetModuleHandleW(name.as_ptr()) };
     if ntdll.is_null() {
         return false;
     }
-    // SAFETY: `ntdll` は有効な HMODULE、名前は終端 0 つきの ASCII。無ければ None が返るだけ。
+    // SAFETY: `ntdll`は有効なHMODULE、名前は終端0つきのASCII。無ければNoneが返るだけ。
     unsafe { GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()) }.is_some()
 }
 
 const ERROR_MOD_NOT_FOUND: ErrorCode = 126;
 
-/// import の引き当てを、このプロセスに実際に DLL を読んでチェックする本物。読んだ DLL は覚えておき、最後に手放す。
+/// このプロセスに実際にDLLを読んでimportの引き当てをチェックする本物。読んだDLLは覚えておき、最後に手放す。
 #[derive(Default)]
 pub struct RealProbe {
     loaded: HashMap<String, Result<usize, ErrorCode>>,
@@ -739,7 +740,7 @@ pub struct RealProbe {
 impl RealProbe {
     fn load(dll: &str) -> Result<usize, ErrorCode> {
         let name = wide_nul(OsStr::new(dll)).ok_or(ERROR_INVALID_PARAMETER)?;
-        // SAFETY: `name` は終端 0 つきで生きている。探す場所を System32 だけにして、同じ名前の別の DLL を拾わない。
+        // SAFETY: `name`は終端0つきで生きている。探す場所をSystem32だけにして同じ名前の別のDLLを拾わない。
         let m =
             unsafe { LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if m.is_null() {
@@ -765,10 +766,10 @@ impl ImportProbe for RealProbe {
                 let Ok(c) = CString::new(n.as_bytes()) else {
                     return Presence::NoFunction;
                 };
-                // SAFETY: `module` は `load` が返した読み込み済みの DLL、`c` は終端 0 つきで生きている。
+                // SAFETY: `module`は`load`が返した読み込み済みのDLL、`c`は終端0つきで生きている。
                 unsafe { GetProcAddress(module, c.as_ptr().cast()) }
             }
-            // SAFETY: 序数での引き当て（下位 16 ビットだけを持つ値をポインタの形で渡す決まり）。
+            // SAFETY: 序数での引き当て（下位16ビットだけを持つ値をポインタの形で渡す決まり）。
             ImportName::Ordinal(o) => unsafe {
                 GetProcAddress(module, usize::from(*o) as *const u8)
             },
@@ -784,7 +785,7 @@ impl ImportProbe for RealProbe {
 impl Drop for RealProbe {
     fn drop(&mut self) {
         for m in self.loaded.values().filter_map(|r| r.as_ref().ok()) {
-            // SAFETY: `load` が 1 回だけ読んだ DLL を、DLL ごとに 1 回だけ手放す。
+            // SAFETY: `load`が1回だけ読んだDLLを、DLLごとに1回だけ手放す。
             unsafe { FreeLibrary(*m as HMODULE) };
         }
     }
@@ -792,32 +793,33 @@ impl Drop for RealProbe {
 
 // ---- 未処理の例外 ----
 
-/// 書いた後は OS の普通の異常終了の扱い（報告のウィンドウ・イベントログ）に任せる。
+/// 書いた後はOSの普通の異常終了の扱い（報告のウィンドウ・イベントログ）に任せる。
 pub const EXCEPTION_PASS_ON: i32 = EXCEPTION_CONTINUE_SEARCH;
 
 static EXCEPTION_FILE: OnceLock<File> = OnceLock::new();
 static EXCEPTION_VERDICT: AtomicI32 = AtomicI32::new(EXCEPTION_CONTINUE_SEARCH);
 static FILTER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// 未処理の例外（アクセス違反など）の場所を 1 行書くフィルターを登録する。書いた後は `verdict` を返す
-/// （本番は `EXCEPTION_CONTINUE_SEARCH`: 普通の異常終了の扱いを変えない）。書き先は `attach_exception_file` で渡されるまで標準エラー
-/// （ログのファイルを、ゲームのフォルダの外と判定する前に作らないため）。登録は最初の 1 回だけ。
+/// 未処理の例外（アクセス違反など）の場所を1行書くフィルターを登録する。
+/// 書いた後は`verdict`を返す（本番は`EXCEPTION_CONTINUE_SEARCH`: 普通の異常終了の扱いを変えない）。
+/// 書き先は`attach_exception_file`で渡されるまで標準エラー（ログのファイルをゲームのフォルダの外と判定する前に作らないため）。
+/// 登録は最初の1回だけ。
 pub fn install_exception_filter(verdict: i32) {
     EXCEPTION_VERDICT.store(verdict, Ordering::Relaxed);
     if FILTER_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
-    // SAFETY: `exception_filter` は `LPTOP_LEVEL_EXCEPTION_FILTER` の形で、プロセスが終わるまで有効な関数。戻り値（前のフィルター）は使わない。
+    // SAFETY: `exception_filter`は`LPTOP_LEVEL_EXCEPTION_FILTER`の形で、プロセスが終わるまで有効な関数。戻り値（前のフィルター）は使わない。
     unsafe { SetUnhandledExceptionFilter(Some(exception_filter)) };
 }
 
-/// 以降の未処理の例外の行を `file` へ書く。最初に渡した 1 つだけが有効。
+/// 以降の未処理の例外の行を`file`へ書く。最初に渡した1つだけが有効。
 pub fn attach_exception_file(file: File) {
     let _ = EXCEPTION_FILE.set(file);
 }
 
 unsafe extern "system" fn exception_filter(info: *const EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: OS が渡す例外の情報で、この呼び出しの間は有効。
+    // SAFETY: OSが渡す例外の情報で、この呼び出しの間は有効。
     unsafe {
         match EXCEPTION_FILE.get() {
             Some(file) => write_exception(file, info),
@@ -827,13 +829,13 @@ unsafe extern "system" fn exception_filter(info: *const EXCEPTION_POINTERS) -> i
     EXCEPTION_VERDICT.load(Ordering::Relaxed)
 }
 
-/// 例外のコード・アドレス・モジュール+RVA を 1 行書く。壊れたプロセスの中で走るので、確保せず、スタックの固定長の
-/// 領域だけを使う。
+/// 例外のコード・アドレス・モジュール+RVAを1行書く。
+/// 壊れたプロセスの中で走るので確保せずスタックの固定長の領域だけを使う。
 ///
 /// # Safety
-/// `info` は null か、`ExceptionRecord` が null か有効な `EXCEPTION_RECORD` を指す `EXCEPTION_POINTERS`。
+/// `info`はnullか、`ExceptionRecord`がnullか有効な`EXCEPTION_RECORD`を指す`EXCEPTION_POINTERS`。
 unsafe fn write_exception(mut file: impl std::io::Write, info: *const EXCEPTION_POINTERS) {
-    // SAFETY: 呼び出し側の約束（null か有効）。
+    // SAFETY: 呼び出し側の約束（nullか有効）。
     let Some(info) = (unsafe { info.as_ref() }) else {
         return;
     };
@@ -863,7 +865,7 @@ unsafe fn write_exception(mut file: impl std::io::Write, info: *const EXCEPTION_
 
 const MODULE_NAME_MAX: usize = 260;
 
-/// `NtQueryVirtualMemory` の `MemoryMappedFilenameInformation` の出力。先頭が UNICODE_STRING で、文字列はその直後に続く。
+/// `NtQueryVirtualMemory`の`MemoryMappedFilenameInformation`の出力。先頭がUNICODE_STRINGで、文字列はその直後に続く。
 #[repr(C)]
 struct SectionName {
     length: u16,
@@ -872,15 +874,16 @@ struct SectionName {
     path: [u16; MODULE_NAME_MAX + 40],
 }
 
-/// `MEMORY_INFORMATION_CLASS::MemoryMappedFilenameInformation`（winternl.h / ntifs.h の列挙の 3 番目）。
+/// `MEMORY_INFORMATION_CLASS::MemoryMappedFilenameInformation`（winternl.h / ntifs.hの列挙の3番目）。
 const MEMORY_MAPPED_FILENAME_INFORMATION: i32 = 2;
 
-/// `addr` を含むイメージのファイル名（フォルダを除く。ASCII 以外は `?`）を `name` に入れて（長さ, アドレスの RVA）を返す。
-/// イメージの外なら（0, 0）。名前だけ引けなければ `?` 1 文字。確保せず、`GetModuleFileNameW`（ローダーロックを取りうる）も使わない。
-/// 先頭は `VirtualQuery` の `AllocationBase`、名前は `NtQueryVirtualMemory` が返す写像のパス（DLL の `crash_win` と同じ引き方）。
+/// `addr`を含むイメージのファイル名（フォルダを除く。ASCII以外は`?`）を`name`に書き込み、（長さ, アドレスのRVA）を返す。
+/// イメージの外なら（0, 0）。名前だけ取得できなければ`?` 1文字。
+/// 確保せず、`GetModuleFileNameW`（ローダーロックを取りうる）も使わない。
+/// 先頭は`VirtualQuery`の`AllocationBase`。名前は`NtQueryVirtualMemory`が返すマッピングのパス（DLLの`crash_win`と同じ取得方法）。
 fn module_of(addr: usize, name: &mut [u8; MODULE_NAME_MAX]) -> (usize, u32) {
     let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: アドレスの領域を調べるだけ（`addr` を読み書きしない）。`info` は書ける MEMORY_BASIC_INFORMATION で、その大きさを渡す。
+    // SAFETY: アドレスの領域を調べるだけ（`addr`を読み書きしない）。`info`は書き込み可能なMEMORY_BASIC_INFORMATIONで、その大きさを渡す。
     let got = unsafe {
         VirtualQuery(
             addr as *const c_void,
@@ -898,7 +901,7 @@ fn module_of(addr: usize, name: &mut [u8; MODULE_NAME_MAX]) -> (usize, u32) {
         buffer: ptr::null_mut(),
         path: [0; MODULE_NAME_MAX + 40],
     };
-    // SAFETY: 自分のプロセス（疑似ハンドル）の `addr` の写像のパスを `section` に書かせるだけ。渡す大きさは `section` の大きさそのもの。
+    // SAFETY: 自分のプロセス（疑似ハンドル）の`addr`のマッピングのパスを`section`に書かせるだけ。渡す大きさは`section`の大きさそのもの。
     let status = unsafe {
         NtQueryVirtualMemory(
             GetCurrentProcess(),
@@ -918,7 +921,7 @@ fn module_of(addr: usize, name: &mut [u8; MODULE_NAME_MAX]) -> (usize, u32) {
     (unknown_if_empty(len, name), rva)
 }
 
-/// 名前が引けなかった（長さ 0）ときは `?` 1 文字にする。モジュールの場所は分かっているので RVA は残す。
+/// 名前が取得できなかった（長さ0）ときは`?` 1文字にする。モジュールの場所は分かっているのでRVAは残す。
 fn unknown_if_empty(len: usize, name: &mut [u8]) -> usize {
     if len > 0 {
         return len;
@@ -927,7 +930,7 @@ fn unknown_if_empty(len: usize, name: &mut [u8]) -> usize {
     1
 }
 
-/// パスの最後の部分を `out` に入れた長さ（ASCII 以外は `?`。入りきらない分は切る）。
+/// パスの最後の部分を`out`に書き込んだ長さ（ASCII以外は`?`。入りきらない分は切る）。
 fn ascii_file_name(wide: &[u16], out: &mut [u8]) -> usize {
     let start = wide
         .iter()
@@ -1057,8 +1060,9 @@ mod tests {
         assert!(report.unchecked.is_empty(), "{:?}", report.unchecked);
     }
 
-    // 組み上がった DLL の import が、この機械で全部引けること。DLL の場所は環境変数 HIGANR_IMPORT_CHECK_DLL
-    // （無ければ build\bin の HiganRTool.dll）。build.bat の後に `--ignored` で走らせる。
+    // ビルドしたDLLのimportがこのマシンで全部解決できること。
+    // DLLの場所は環境変数HIGANR_IMPORT_CHECK_DLL（無ければbuild\binのHiganRTool.dll）。
+    // build.batの後に`--ignored`で走らせる。
     #[test]
     #[ignore = "組み上がった DLL を読むので、build.bat の後に --ignored で走らせる"]
     fn every_import_of_the_built_dll_is_found_here() {
@@ -1079,7 +1083,7 @@ mod tests {
         assert!(report.unchecked.is_empty(), "{:?}", report.unchecked);
     }
 
-    // イメージの外（スタック・小さい値）を引けたことにすると落ちる。
+    // イメージの外（スタック・小さい値）を取得できたことにすると落ちる。
     #[test]
     fn module_of_names_the_exe_and_the_offset_inside_it() {
         let mut name = [0u8; MODULE_NAME_MAX];
@@ -1088,7 +1092,7 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         let want = me.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(String::from_utf8_lossy(&name[..len]), want);
-        // SAFETY: 引数 NULL は自分の exe の読み込み先頭を返すだけ。
+        // SAFETY: 引数NULLは自分のexeの読み込み先頭を返すだけ。
         let base = unsafe { GetModuleHandleW(ptr::null()) } as usize;
         assert_eq!(rva as usize, at - base);
 
@@ -1150,10 +1154,10 @@ mod tests {
             ExceptionRecord: &mut rec,
             ContextRecord: ptr::null_mut(),
         };
-        // SAFETY: `info` は有効な EXCEPTION_RECORD を指す。
+        // SAFETY: `info`は有効なEXCEPTION_RECORDを指す。
         unsafe { write_exception(&file, &info) };
-        // null の情報は何も書かず落ちない。
-        // SAFETY: null は許される入力。
+        // nullの情報は何も書かず例外を出さない。
+        // SAFETY: nullは許される入力。
         unsafe { write_exception(&file, ptr::null()) };
         let text = std::fs::read_to_string(&path).unwrap();
         let me = std::env::current_exe().unwrap();
@@ -1183,7 +1187,7 @@ mod tests {
         // SAFETY: 自分のプロセスのエラー表示の設定を変えるだけ（検査が落ちたときの報告のウィンドウを出さない）。
         unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS) };
         install_exception_filter(EXCEPTION_EXECUTE_HANDLER);
-        // "-" はファイルを渡さない回（標準エラーに書かれるはず）。
+        // "-" はファイルを渡さない場合（標準エラーに書かれるはず）。
         if path != "-" {
             let file = std::fs::OpenOptions::new()
                 .append(true)
@@ -1192,7 +1196,7 @@ mod tests {
                 .unwrap();
             attach_exception_file(file);
         }
-        // SAFETY: わざと、先頭の 64 KB の中（必ず未割り当て）へ書いて未処理のアクセス違反を起こす。
+        // SAFETY: わざと先頭の64 KBの中（必ず未割り当て）へ書いて未処理のアクセス違反を起こす。
         unsafe { (0x10 as *mut u32).write_volatile(1) };
     }
 

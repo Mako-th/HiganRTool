@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 困ったとき（README）
+    url: https://github.com/Mako-th/HiganRTool#困ったとき
+    about: よくある表示と、その対処です。
+  - name: Troubleshooting (README)
+    url: https://github.com/Mako-th/HiganRTool/blob/main/README.en.md#troubleshooting
+    about: Common messages and what to do.

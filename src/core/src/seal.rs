@@ -1,8 +1,15 @@
-//! バージョン 5 の使い捨ての鍵と、便の暗号化（AEAD）。暗号は自作しない: `x25519-dalek`（BSD-3-Clause）・`chacha20poly1305`・`hkdf`（RustCrypto。MIT OR Apache-2.0）を呼ぶ形を 1 か所にまとめる。
+//! バージョン5の使い捨ての鍵と便の暗号化（AEAD）。暗号は自作しない: `x25519-dalek`（BSD-3-Clause）・`chacha20poly1305`・`hkdf`（RustCrypto。MIT OR Apache-2.0）を呼ぶ形を1か所にまとめる。
 //!
-//! - **鍵**: 使い捨ての X25519 の鍵から、向きごとの鍵を `HKDF-SHA256` で引く。弱い点（共有の値が 0 になる）を送ってきた相手には鍵を作らない。
-//! - **nonce を二度使わない**: 同じ鍵で同じ nonce を 2 回使うと ChaCha20-Poly1305 は平文の XOR と認証の鍵が漏れる（RFC 8439 §4）。**送り手の印**（[`Sender`]）を送るスレッドごとに固定し、**通し番号**（[`Seq`]）は送り手ごとに 0 から 1 ずつ増やし、鍵と同じかそれより長い寿命の物に持たせて 0 に戻さない。`Seq` は `Clone` が無く、同じ印で複数のスレッドが送るとき（PONG の応答役）は参照で共有する。2^56（[`SEQ_LIMIT`]）に着いたら送らない。
-//! - **確保しない**: 封じる・開くはゲームのスレッドと受信スレッドで 1 通ごとに呼ぶ。`chacha20poly1305` はその場で暗号化するインターフェース（`AeadInOut`）だけを使い、既定の機能（alloc）は切ってある。`Seq` も原子変数をそのまま持つだけ（`Arc` で共有すると、セッションの作り直しのたびにゲームのスレッドで確保と解放が出る）。`tests/alloc_check.rs` が見る。
+//! - **鍵**: 使い捨てのX25519の鍵から向きごとの鍵を`HKDF-SHA256`で生成する。弱い点（共有の値が0になる）を送ってきた相手には鍵を作らない。
+//! - **nonceを二度使わない**: 同じ鍵で同じnonceを2回使うとChaCha20-Poly1305は平文のXORと認証の鍵が漏れる（RFC 8439 §4）。
+//!   **送信元の印**（[`Sender`]）は送るスレッドごとに固定する。
+//!   **通し番号**（[`Seq`]）は送信元ごとに0から1ずつ増やす。鍵と同じかそれより長い寿命のものに持たせ、0に戻さない。
+//!   `Seq`は`Clone`が無い。同じ印で複数のスレッドが送るとき（PONGの応答役）は参照で共有する。
+//!   2^56（[`SEQ_LIMIT`]）に着いたら送らない。
+//! - **確保しない**: 封じる・開くはゲームのスレッドと受信スレッドで1通ごとに呼ぶ。
+//!   `chacha20poly1305`はその場で暗号化するインターフェース（`AeadInOut`）だけを使い、既定の機能（alloc）は切ってある。
+//!   `Seq`もアトミック変数をそのまま持つだけ（`Arc`で共有するとセッションの作り直しのたびにゲームのスレッドで確保と解放が出る）。
+//!   `tests/alloc_check.rs`が見る。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,17 +22,17 @@ use crate::auth::AuthKey;
 
 pub const SEED_LEN: usize = 32;
 pub const PUBLIC_LEN: usize = 32;
-/// nonce の欄の長さ（B。送り手の印 1 ‖ 通し番号 7）。
+/// nonceのフィールドの長さ（B。送信元の印1 ‖ 通し番号7）。
 pub const NONCE_FIELD_LEN: usize = 8;
 pub const SEAL_TAG_LEN: usize = 16;
-/// 封じた便が本文の外に足す長さ（nonce の欄 ＋ タグ）。HMAC のタグ（16 B）より 8 B 長い。
+/// 封じた便が本文の外に足す長さ（nonceのフィールド ＋ タグ）。HMACのタグ（16 B）より8 B長い。
 pub const SEAL_OVERHEAD: usize = NONCE_FIELD_LEN + SEAL_TAG_LEN;
-/// 通し番号の上限（7 B に収まる数の個数）。
+/// 通し番号の上限（7 Bに収まる数の個数）。
 pub const SEQ_LIMIT: u64 = 1 << 56;
-/// HKDF の info の先頭。鍵の作り方のバージョンなので、プロトコルのバージョンを上げても変えない。
+/// HKDFのinfoの先頭。鍵の作り方のバージョンなのでプロトコルのバージョンを上げても変えない。
 pub const KEYS_LABEL: &[u8] = b"HGRT v5 keys";
 
-/// 使い捨ての鍵の種（呼び手が OS の乱数で引いた 32 B）。`Debug` では中身を出さない。
+/// 使い捨ての鍵の種（呼び手がOSの乱数で生成した32 B）。`Debug`では中身を出さない。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeySeed(pub [u8; SEED_LEN]);
 
@@ -35,15 +42,15 @@ impl std::fmt::Debug for KeySeed {
     }
 }
 
-/// 送り手の印（送るスレッドごとに固定）。同じ鍵で送る送り手どうしが違う印を持てば、通し番号が同じでも nonce は重ならない。
+/// 送信元の印（送るスレッドごとに固定）。同じ鍵で送る送信元どうしが違う印を持てば通し番号が同じでもnonceは重ならない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Sender {
-    /// ゲームのスレッドの対戦の接続のセッション（`link::Link` と `link::Connected`。同じ通し番号を共有する）。
+    /// ゲームのスレッドの対戦の接続のセッション（`link::Link`と`link::Connected`。同じ通し番号を共有する）。
     Link = 0,
-    /// 受信スレッドの PONG の応答役（IPv4・IPv6 の受信スレッドが同じ通し番号を共有する）。
+    /// 受信スレッドのPONGの応答役（IPv4・IPv6の受信スレッドが同じ通し番号を共有する）。
     Pong = 1,
-    /// 観戦の配る側（観戦者の全員へ同じ通し番号で送る）。
+    /// 観戦の配信側（観戦者の全員へ同じ通し番号で送る）。
     SpectateHost = 2,
     /// 観戦者（`spectate::Watcher`）。
     Spectator = 3,
@@ -61,7 +68,7 @@ impl Sender {
     }
 }
 
-/// 使い捨ての鍵（秘密鍵と公開鍵）。`Debug` では中身を出さない。捨てると秘密鍵はメモリから消える（`zeroize`）。
+/// 使い捨ての鍵（秘密鍵と公開鍵）。`Debug`では中身を出さない。捨てると秘密鍵はメモリから消える（`zeroize`）。
 #[derive(Clone)]
 pub struct Ephemeral {
     secret: StaticSecret,
@@ -75,21 +82,23 @@ impl std::fmt::Debug for Ephemeral {
 }
 
 impl Ephemeral {
-    /// 種から作る（X25519 の秘密鍵は種そのもの。クランプは crate が計算のときにする）。公開鍵の計算は接続ごとに 1 回
-    /// （所要は `measure_seal_cost` で測る）。
+    /// 種から作る（X25519の秘密鍵は種そのもの。クランプはcrateが計算時にする）。
+    /// 公開鍵の計算は接続ごとに1回（所要は`measure_seal_cost`で測る）。
     pub fn from_seed(seed: &KeySeed) -> Ephemeral {
         let secret = StaticSecret::from(seed.0);
         let public = PublicKey::from(&secret).to_bytes();
         Ephemeral { secret, public }
     }
 
-    /// 公開鍵（HELLO / HELLO_ACK・観戦用のコード・JOIN に載せる）。
+    /// 公開鍵（HELLO / HELLO_ACK・観戦用のコード・JOINに載せる）。
     pub fn public(&self) -> [u8; PUBLIC_LEN] {
         self.public
     }
 
-    /// 相手の公開鍵 `peer` との向きごとの鍵。`i_am_first` は自分が「前」か。`k` は接続コードの秘密と session から作る K
-    /// （HKDF の salt）。相手の公開鍵が弱い点（共有の値が 0）なら None（来るのは壊れた相手だけ。その相手とは暗号の便を交わさない）。
+    /// 相手の公開鍵`peer`との向きごとの鍵。
+    /// `i_am_first`は自分が「前」かどうか。
+    /// `k`は接続コードの秘密の乱数とsessionから作るK（HKDFのsalt）。
+    /// 相手の公開鍵が弱い点（共有の値が0）ならNone（来るのは壊れた相手だけ。その相手とは暗号の便を交わさない）。
     pub fn dir_keys(
         &self,
         peer: &[u8; PUBLIC_LEN],
@@ -118,7 +127,7 @@ impl Ephemeral {
     }
 }
 
-/// HKDF-SHA256 で 64 B を引く。検査が crate の外で計算した値と比べられるよう、式だけを切り出した。
+/// HKDF-SHA256で64 Bを生成する。式だけを切り出したのは、検査がcrateの外で計算した値と比べられるようにするため。
 fn expand_keys(
     shared: &[u8; 32],
     salt: &[u8; 32],
@@ -128,7 +137,7 @@ fn expand_keys(
 ) -> [u8; 64] {
     let hk = Hkdf::<Sha256>::new(Some(salt), shared);
     let mut okm = [0u8; 64];
-    // 64 B は HKDF の上限（255 × 32 B）より短いので誤りは返らない。返っても全部 0 のままにして相手と食い違わせる。
+    // 64 BはHKDFの上限（255 × 32 B）より短いので誤りは返らない。返っても全部0のままにして相手と食い違わせる。
     let _ = hk.expand_multi_info(
         &[KEYS_LABEL, &session_id.to_le_bytes(), first, second],
         &mut okm,
@@ -136,7 +145,7 @@ fn expand_keys(
     okm
 }
 
-/// 向きごとの鍵 2 本（送る向き `tx`・受ける向き `rx`）。`Debug` では中身を出さない。
+/// 向きごとの鍵2本（送る向き`tx`・受ける向き`rx`）。`Debug`では中身を出さない。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DirKeys {
     tx: [u8; 32],
@@ -150,7 +159,7 @@ impl std::fmt::Debug for DirKeys {
 }
 
 impl DirKeys {
-    /// 鍵の交換を通さず向きの鍵だけを決めて使う検査のため（2 台の模型 `testnet.rs`）。
+    /// 鍵の交換を通さず向きの鍵だけを決めて使う検査のため（2台の模型`testnet.rs`）。
     pub fn from_raw(tx: [u8; 32], rx: [u8; 32]) -> DirKeys {
         DirKeys { tx, rx }
     }
@@ -176,7 +185,7 @@ impl DirKeys {
     }
 }
 
-/// 通し番号（送り手ごと）。`Clone` が無く、共有は参照で。
+/// 通し番号（送信元ごと）。`Clone`が無いので共有は参照で行う。
 #[derive(Default)]
 pub struct Seq(AtomicU64);
 
@@ -187,7 +196,7 @@ impl std::fmt::Debug for Seq {
 }
 
 impl Seq {
-    /// 0 から数える新しい通し番号（確保しない。`static` にも持てる）。
+    /// 0から数える新しい通し番号（確保しない。`static`にも持てる）。
     pub const fn new() -> Seq {
         Seq(AtomicU64::new(0))
     }
@@ -203,14 +212,14 @@ impl Seq {
         self.0.load(Ordering::Relaxed)
     }
 
-    /// 番号を 1 つ取る。[`SEQ_LIMIT`] に着いていたら None。番号が重ならないことだけが要るので Relaxed。
+    /// 番号を1つ取る。[`SEQ_LIMIT`]に着いていたらNone。番号が重ならないことだけが要るのでRelaxed。
     fn take(&self) -> Option<u64> {
         let v = self.0.fetch_add(1, Ordering::Relaxed);
         (v < SEQ_LIMIT).then_some(v)
     }
 }
 
-/// 送る向きの封じる側（鍵 ＋ 送り手の印）。通し番号は持たない。`Debug` では鍵を出さない。
+/// 送る向きの封じる側（鍵 ＋ 送信元の印）。通し番号は持たない。`Debug`では鍵を出さない。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Sealer {
     key: [u8; 32],
@@ -228,7 +237,7 @@ impl Sealer {
         self.sender
     }
 
-    /// `body` をその場で暗号化し、（nonce の欄, タグ）を返す。`aad` はヘッダ 12 B。番号を使い切っていたら None（`body` は変えない）。
+    /// `body`をその場で暗号化して（nonceのフィールド, タグ）を返す。`aad`はヘッダ12 B。番号を使い切っていたらNone（`body`は変えない）。
     pub(crate) fn seal(
         &self,
         seq: &Seq,
@@ -254,7 +263,7 @@ impl std::fmt::Debug for Opener {
 }
 
 impl Opener {
-    /// `body`（暗号文）をその場で開く。タグが合わなければ false（`body` の中身は使わない）。
+    /// `body`（暗号文）をその場で開く。タグが合わなければfalse（`body`の中身は使わない）。
     pub(crate) fn open(
         &self,
         aad: &[u8],
@@ -266,7 +275,7 @@ impl Opener {
     }
 }
 
-/// nonce の欄（送り手の印 ‖ 通し番号の下位 7 B。LE）。
+/// nonceのフィールド（送信元の印 ‖ 通し番号の下位7 B。LE）。
 pub(crate) fn nonce_field(sender: u8, seq: u64) -> [u8; NONCE_FIELD_LEN] {
     let s = seq.to_le_bytes();
     [sender, s[0], s[1], s[2], s[3], s[4], s[5], s[6]]
@@ -280,7 +289,7 @@ pub fn read_nonce_field(field: &[u8; NONCE_FIELD_LEN]) -> (u8, u64) {
     (field[0], u64::from_le_bytes(s))
 }
 
-/// AEAD の nonce（12 B）= 0 の 4 B ‖ nonce の欄。
+/// AEADの nonce（12 B）= 0 の4 B ‖ nonce のフィールド。
 fn nonce_of(field: &[u8; NONCE_FIELD_LEN]) -> [u8; 12] {
     let mut n = [0u8; 12];
     for (d, s) in n.iter_mut().skip(4).zip(field.iter()) {
@@ -289,7 +298,7 @@ fn nonce_of(field: &[u8; NONCE_FIELD_LEN]) -> [u8; 12] {
     n
 }
 
-/// ChaCha20-Poly1305 でその場で封じる（RFC 8439 の標本と比べるため、nonce の作り方と分けた）。
+/// ChaCha20-Poly1305でその場で封じる（RFC 8439のサンプルと比べるためnonceの作り方と分けた）。
 fn aead_seal(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -322,8 +331,9 @@ fn aead_open(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! 期待値は crate の外で作った: RFC 7748 §6.1・RFC 5869 の Test Case 1・RFC 8439 §2.8.2 の標本と、
-    //! Python 3 の `cryptography` と標準の `hmac` で計算した HGRT の鍵。
+    //! 期待値はcrateの外で作った。
+    //! - RFC 7748 §6.1・RFC 5869のTest Case 1・RFC 8439 §2.8.2のサンプル
+    //! - Python 3の`cryptography`と標準の`hmac`で計算したHGRTの鍵
     use super::*;
     use crate::auth::Secret;
 
@@ -341,7 +351,7 @@ pub(crate) mod tests {
         a
     }
 
-    /// RFC 7748 §6.1 の Alice と Bob の秘密鍵。
+    /// RFC 7748 §6.1のAliceとBobの秘密鍵。
     pub(crate) const ALICE: &str =
         "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
     pub(crate) const BOB: &str = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb";
@@ -399,8 +409,8 @@ pub(crate) mod tests {
         assert!(!aead_open(&key, &nonce, &aad2, &mut back, &tag));
     }
 
-    /// HGRT の鍵の golden（Python 3 の `cryptography` と標準の `hmac` で計算）:
-    /// 秘密は 00 01 … 0f、session 0x11223344（K は `auth.rs` の `K_GOLDEN`）、Alice が「前」。
+    /// HGRTの鍵のgolden（Python 3の`cryptography`と標準の`hmac`で計算）:
+    /// 秘密の乱数は00 01 … 0f、session 0x11223344（Kは`auth.rs`の`K_GOLDEN`）、Aliceが「前」。
     pub(crate) const OKM_GOLDEN: &str = "a214f2218b0ed79e233e9d33ea6313cc0f1b9331319bab495e637b4bf968edb2\
         9f0d189db2c6386bb21403da6623ae2bd5ffc41a30ba575e4134243152c0ee9b";
 

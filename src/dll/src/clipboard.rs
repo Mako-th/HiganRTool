@@ -1,7 +1,8 @@
-//! 接続コードの受け渡しの入口（ゲームの中のメニュー `code_side = game`）: クリップボードの型と、開発用のファイル実装・検査用の偽物（pure。unsafe 無し）。
+//! 接続コードの受け渡しの入口（ゲームの中のメニュー`code_side = game`）: クリップボードの型と、開発用のファイル実装・検査用の偽物（pure。unsafe無し）。
 //!
-//! 見張りのスレッド（`net_code`）がメニューの指示で呼ぶ（ゲームのスレッドは触らない）。本物は `clipboard_win::SystemClipboard`（unsafe はそこ）、
-//! 開発用は `FileClipboard`（ini の `clipboard = file`。`clip_out.txt` / `clip_in.txt`）、検査は `FakeClipboard`。
+//! 監視のスレッド（`net_code`）がメニューの指示で呼ぶ（ゲームのスレッドは触らない）。
+//! 本物は`clipboard_win::SystemClipboard`（unsafeはそこ）。
+//! 開発用は`FileClipboard`（iniの`clipboard = file`。`clip_out.txt` / `clip_in.txt`）。検査は`FakeClipboard`。
 //! 検査と実機の検証は利用者のクリップボードを書き換えてはいけないので、本物を呼ぶ検査は書かない。
 #![forbid(unsafe_code)]
 
@@ -10,13 +11,13 @@ use std::path::PathBuf;
 
 use higanr_core::code_files::{CLIP_IN_FILE, CLIP_OUT_FILE, MAX_FILE_BYTES};
 
-/// 読む文字の上限（UTF-16 の単位の数 = 文字数）。これより後ろは読まず、読んだ分だけで `code` が「長すぎる」と断る。
+/// 読む文字の上限（UTF-16の単位の数 = 文字数）。これより後ろは読まない。読んだ分だけで`code`が「長すぎる」と断る。
 /// 大きなクリップボードを丸ごとコピーしないため。
 pub const MAX_READ_CHARS: usize = MAX_FILE_BYTES as usize;
 
-/// クリップボード（に見えるインターフェース）。見張りのスレッドから 1 回ずつ呼ぶ。
+/// クリップボード（に見えるインターフェース）。監視のスレッドから1回ずつ呼ぶ。
 pub trait Clipboard: Send {
-    /// 文字を読む。文字が無い・空なら `Ok(None)`（クリップボードが空、か文字以外の中身）。`MAX_READ_CHARS` 文字まで。
+    /// 文字を読む。文字が無い・空なら`Ok(None)`（クリップボードが空か文字以外の中身）。`MAX_READ_CHARS`文字まで。
     fn read(&mut self) -> Result<Option<String>, String>;
     fn write(&mut self, text: &str) -> Result<(), String>;
 }
@@ -57,7 +58,7 @@ impl Clipboard for FileClipboard {
     }
 }
 
-/// 検査用の偽のクリップボード（中身は共有の入れ物。呼ばれた書き込みを記録する）。
+/// 検査用の偽のクリップボード（中身は共有のコンテナ。呼ばれた書き込みを記録する）。
 #[cfg(test)]
 pub mod fake {
     use super::Clipboard;
@@ -67,10 +68,10 @@ pub mod fake {
     pub struct Inner {
         pub text: Option<String>,
         pub writes: Vec<String>,
-        /// 真なら `read` / `write` が失敗する。
+        /// 真なら`read` / `write`が失敗する。
         pub fail_read: bool,
         pub fail_write: bool,
-        /// 呼ばれた `read` の数（クリップボードを読まないはずの経路が読んでいないかを見る）。
+        /// 呼ばれた`read`の数（クリップボードを読まないはずの経路が読んでいないかを見る）。
         pub reads: u32,
     }
 

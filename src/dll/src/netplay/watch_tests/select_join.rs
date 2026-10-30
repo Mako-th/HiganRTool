@@ -1,18 +1,21 @@
-//! 長く続く選択の画面に遅れて入った観戦者（実回線の試験で「キャラ選択の最中にルームに入ると、対戦に進まない」）と、初めから観戦している観戦者が「キャラ変更」で別のキャラを選ぶ 2 回目の選択を追う検査。
-//! `watch_tests.rs` の `Rig`（ホスト・仮のネットワーク・観戦者）と偽のゲームをそのまま使う。
+//! 長く続く選択の画面に遅れて入った観戦者を追う検査（実回線の試験で「キャラ選択の最中にルームに入ると、対戦に進まない」となった）。
+//! 初めから観戦している観戦者が「キャラ変更」で別のキャラを選ぶ2回目の選択も追う。
+//! `watch_tests.rs`の`Rig`（ホスト・仮のネットワーク・観戦者）と偽のゲームをそのまま使う。
 //!
-//! 原因: 選択の画面でホストが積む `Menu`（その tick の両席の語）は 1 tick に 1 つ。遅れて入った観戦者は seg の始まりから 1 tick に 1 つずつ使うので、ホストが選択の画面に居た時間がそのまま観戦者の遅れになり、その間はマッチに進まない。
+//! 原因: 選択の画面でホストが積む`Menu`（そのtickの両サイドのワード）は1 tickに1つ。
+//! 遅れて入った観戦者はsegの始まりから1 tickに1つずつ使う。
+//! そのためホストが選択の画面に居た時間がそのまま観戦者の遅れになり、その間はマッチに進まない。
 //!
-//! 比べるもの: マッチの最初のフレームを使った tick（ホストと観戦者）の差、マッチの語・押下の列・決めたキャラ・マップ（観戦者の列がホストと全行一致するか）。
+//! 比べるもの: マッチの最初のフレームを使ったtickの差（ホストと観戦者）。マッチのワード・押下の列・決定済みのキャラ・マップ（観戦者の列がホストと全行一致するか）。
 use std::cell::Cell;
 
 use higanr_core::input_model::keys::{LEFT, RIGHT};
 
 use super::*;
 
-/// 画面に長くとどまる tick の数（60 Hz で 25 秒）。観戦者はその半ばで入る。
+/// 画面に長くとどまるtickの数（60 Hzで25秒）。観戦者はその半ばで入る。
 const IDLE: u32 = 1_500;
-/// 観戦者が入ってから、ホストのマッチの最初のフレームより何 tick 遅れてよいか（接続・押下の再生・余裕待ちの分。2.5 秒）。
+/// 観戦者が入ってから、ホストのマッチの最初のフレームより何tick遅れてよいか（接続・押下の再生・余裕待ちの分。2.5秒）。
 const LAG_OK_TICKS: u32 = 150;
 const MATCH_FRAMES: u32 = 60;
 
@@ -34,9 +37,9 @@ impl Idle {
     }
 }
 
-/// 台本。1 回目の選択は `idle0` の画面で `IDLE` tick 止まる（None は止まらない）。2 回目の選択（1 マッチ終えてキャラ選択から）は、
-/// 両者とも 1 回目と違うキャラを選ぶ（`idle1` が真ならキャラ選択で `IDLE` tick 止まる）。A（ホスト 1P）がカーソルを動かして決め、
-/// B（ゲスト 2P）は A の後に決める。
+/// 台本。1回目の選択は`idle0`の画面で`IDLE` tick止まる（Noneは止まらない）。
+/// 2回目の選択（1マッチ終えてキャラ選択から）は、両者とも1回目と違うキャラを選ぶ（`idle1`が真ならキャラ選択で`IDLE` tick止まる）。
+/// A（ホスト1P）がカーソルを動かして決定し、B（ゲスト2P）はAの後に決定する。
 fn plans_with(idle0: Option<Idle>, idle1: bool) -> (Vec<Act>, Vec<Act>) {
     let wait = |here: Idle, base: u32| if idle0 == Some(here) { IDLE } else { base };
     let mut a = vec![
@@ -111,11 +114,11 @@ struct Probe {
     a_first: Vec<u32>,
     w_first: Vec<u32>,
     joined_at: Option<u32>,
-    /// 観戦者が追いつくために `Menu` を捨てた最後の tick（止まった = ホストの積んだ分を受け終えて追いついた）。
+    /// 観戦者が追いつくために`Menu`を捨てた最後のtick（止まった = ホストの積んだ分を受け終えて追いついた）。
     last_skip_at: Option<u32>,
 }
 
-/// `run_rig` と同じ組み立て（A と B を回し、W（観戦者）を付ける）で、マッチの最初のフレームを使った tick を記録する。
+/// `run_rig`と同じ組み立て（AとBを回し、W（観戦者）を付ける）で、マッチの最初のフレームを使ったtickを記録する。
 fn run_probe(
     a: MenuGame,
     b: MenuGame,
@@ -210,7 +213,7 @@ fn run_probe_with(
     }
 }
 
-/// `screen` の画面に入ってから `after` tick 経ったら入る（ホスト A を見る）。画面に入った tick は最初に見たときに控える。
+/// `screen`の画面に入ってから`after` tick経ったら入る（ホストAを見る）。画面に入ったtickは最初に見たときに記録する。
 fn join_in_screen(screen: u32, matches: u32, after: u32) -> impl Fn(&MenuGame) -> bool {
     let seen = Cell::new(0u32);
     move |a: &MenuGame| {
@@ -221,8 +224,9 @@ fn join_in_screen(screen: u32, matches: u32, after: u32) -> impl Fn(&MenuGame) -
     }
 }
 
-/// 観戦者が見たマッチ（ホストの `skip` マッチ目から）の語・押下・キャラ・マップがホストと全行一致し、マッチの最初のフレームを
-/// ホストから `LAG_OK_TICKS` tick 以内に使い、ホストの終わりで終え、自分の入力が届かず、読まれない押下も無いこと。
+/// 観戦者が見たマッチ（ホストの`skip`マッチ目から）のワード・押下・キャラ・マップがホストと全行一致すること。
+/// マッチの最初のフレームをホストから`LAG_OK_TICKS` tick以内に使うこと。
+/// ホストの終わりで終えること。自分の入力が届かず、読まれない押下も無いこと。
 fn assert_caught_up(p: &Probe, skip: usize, tag: &str) {
     let (wp, wg) = (&p.rig.wp, &p.rig.wg);
     let s = wp.stats();
@@ -308,7 +312,7 @@ fn a_watcher_joining_in_the_middle_of_a_long_selection_screen_reaches_the_match_
         let p = run_probe(a, b, w, &when, 12_000);
         assert!(p.joined_at.is_some(), "{idle:?}: 観戦者を起こせていない");
         assert_caught_up(&p, 0, &format!("{idle:?} の半ばで入る"));
-        // 追いつきの経路を通った（`Menu` の大半を捨てた）。通っていなければ上の遅れの検査は別の理由で通っている。
+        // 追いつきの経路を通った（`Menu`の大半を捨てた）。通っていなければ上の遅れの検査は別の理由で通っている。
         let skipped = p.rig.wp.stats().menu_skipped;
         assert!(skipped >= 400, "{idle:?}: 捨てた Menu {skipped}");
     }
@@ -347,8 +351,9 @@ fn a_watcher_catches_up_over_a_slow_line_before_the_host_decides() {
     let p = run_probe_with(a, b, w, &when, 12_000, 100_000);
     assert!(p.joined_at.is_some(), "観戦者を起こせていない");
     assert_caught_up(&p, 0, "片道 100 ms");
-    // 入ってから、ホストが seg の始まりから積んだ 780 ほどの `Menu` を観戦者が受け終える（最後に捨てる）まで: ウィンドウ 512 記録を 1 往復（片道 100 ms ＋
-    // 観戦者の 17 ms の周回）ずつ受けるので 2 往復ほど（測りは 41 tick）。上限は 3 倍の余裕で 120 tick（約 2 秒）。
+    // 入ってから、ホストがsegの始まりから積んだ780ほどの`Menu`を観戦者が受け終える（最後に捨てる）まで。
+    // ウィンドウ512記録を1往復（片道100 ms ＋観戦者の17 msの周回）ずつ受けるので2往復ほどになる（測りは41 tick）。
+    // 上限は3倍の余裕で120 tick（約2秒）。
     let (j, c) = (p.joined_at.unwrap_or(0), p.last_skip_at);
     eprintln!(
         "片道 100 ms: 入ってから最後の Menu を捨てるまで {:?} tick",

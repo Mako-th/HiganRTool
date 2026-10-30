@@ -1,9 +1,10 @@
-//! 文字の描画の DLL の側のうち、unsafe の要らない部分（pure）: 表示する文の二重のバッファ、1 フレームの上乗せの記録、文の更新スレッドの計算、
-//! 設置の順（`session::run` から呼ぶ）と本ログへの集計。D3D8 と GDI を呼ぶ層は `overlay_win.rs`、頂点と文字の表の計算は `higanr_core::overlay`。
+//! 文字の描画のDLL側のうちunsafeの要らない部分（pure）。
+//! 表示する文のダブルバッファ・1フレームの上乗せの記録・文の更新スレッドの計算・設置の順（`session::run`から呼ぶ）・本ログへの集計を持つ。
+//! D3D8とGDIを呼ぶ層は`overlay_win.rs`。頂点と文字の表の計算は`higanr_core::overlay`。
 //!
-//! - 文: 読み取りの側の更新スレッド（1 本）が `TEXT.publish` で書き、ゲームのスレッド（描画の入口）が `TEXT.read` で読む。
-//!   読み手は確保もロック待ちもしない（書きかけなら読み直すか、そのフレームは描かない）。文字の単位は UTF-16（`TEXT_UNITS` = `MAX_TEXT` = 128 単位）。
-//! - 上乗せの時間: ゲームのスレッドが `TIMINGS.record` で書き、読み取りのスレッドが終わりに `snapshot` で読む。
+//! - 文: 読み取り側の更新スレッド（1本）が`TEXT.publish`で書き、ゲームのスレッド（描画の入口）が`TEXT.read`で読む。
+//!   読み手は確保もロック待ちもしない（書きかけなら読み直すか、そのフレームは描かない）。文字の単位はUTF-16（`TEXT_UNITS` = `MAX_TEXT` = 128単位）。
+//! - 上乗せの時間: ゲームのスレッドが`TIMINGS.record`で書き、読み取りのスレッドが終わりに`snapshot`で読む。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -20,24 +21,25 @@ use crate::th09_addr::{
     SPRITE_W, SPRITE_X0, SPRITE_X1, SPRITE_Y0, SPRITE_Y1,
 };
 
-// ---- 文の二重のバッファ ----
+// ---- 文のダブルバッファ ----
 
-/// バッファ 1 つに入る UTF-16 の単位の数（= `MAX_TEXT`）。日本語（基本面）は 1 文字 1 単位なので 128 文字まで入る。長さ `len` は別の語に持つので、
-/// 単位を丸ごと使い切れる。読み手は語を全部コピーした後に札を読み直し、違えば読んだ中身を捨てる（`read_with`）。
+/// バッファ1つに入るUTF-16の単位の数（= `MAX_TEXT`）。日本語（基本面）は1文字1単位なので128文字まで入る。
+/// 長さ`len`は別のワードに持つので単位を丸ごと使い切れる。
+/// 読み手はワードを全部コピーした後にタグを読み直し、違えば読んだ中身を捨てる（`read_with`）。
 pub const TEXT_UNITS: usize = MAX_TEXT;
 const BOX_WORDS: usize = TEXT_UNITS / 2;
 const _: () = assert!(TEXT_UNITS.is_multiple_of(2) && BOX_WORDS * 2 == TEXT_UNITS);
 
 struct TextSlot {
-    /// 札（奇数 = 書いている途中）。seqlock の書き方（tick のリングバッファと同じ考え方）。
+    /// タグ（奇数 = 書き込み中）。seqlockの書き方（tickのリングバッファと同じ考え方）。
     seq: AtomicU32,
     len: AtomicU32,
-    /// 単位を 2 つずつ（下位 16 ビットが先の単位）。
+    /// 単位を2つずつ（下位16ビットが先の単位）。
     words: [AtomicU32; BOX_WORDS],
 }
 
-/// 表示する 1 行の二重のバッファ。書き手は 1 人（更新スレッド）で、最後に書いたバッファの番号を `generation` で知らせる。書き手は「知らせていない方」のバッファに
-/// 書くので、読み手が読んでいるバッファとはふつう重ならない。重なったときは札で分かる。
+/// 表示する1行のダブルバッファ。書き手は1人（更新スレッド）。最後に書いたバッファの番号を`generation`で知らせる。
+/// 書き手は「知らせていない方」のバッファに書くので、読み手が読んでいるバッファとはふつう重ならない。重なったときはタグで分かる。
 pub struct TextBox {
     generation: AtomicU32,
     slots: [TextSlot; 2],
@@ -57,7 +59,7 @@ impl TextBox {
         }
     }
 
-    /// 書く（書き手は 1 人だけ）。`MAX_TEXT` 単位を越える分は文字の境で落とす（基本面の外の文字を 2 単位の途中で切らない）。
+    /// 書く（書き手は1人だけ）。`MAX_TEXT`単位を越える分は文字の境で落とす（基本面の外の文字を2単位の途中で切らない）。
     pub fn publish(&self, text: &str) {
         let mut units = [0u16; TEXT_UNITS];
         let len = ov::encode_utf16_capped(text, &mut units);
@@ -77,13 +79,13 @@ impl TextBox {
         self.generation.store(g, Ordering::Release);
     }
 
-    /// 最後に知らされたバッファを読み、`buf` にコピーして単位の数を返す。書きかけ・壊れた長さなら `None`。確保しない。
+    /// 最後に知らされたバッファを読み、`buf`にコピーして単位の数を返す。書きかけ・壊れた長さなら`None`。確保しない。
     pub fn read(&self, buf: &mut [u16; TEXT_UNITS]) -> Option<usize> {
         self.read_with(buf, || {}, || {})
     }
 
-    /// `read` の中身。`mid` は語の前半をコピーした後・後半をコピーする前に、`between` は全部をコピーした後・札を読み直す前に呼ぶ（検査が「読んでいる間に
-    /// 書かれた」を作るため）。本物は何もしない閉包。
+    /// `read`の中身。`mid`はワードの前半をコピーした後・後半をコピーする前に呼ぶ。`between`は全部をコピーした後・タグを読み直す前に呼ぶ（検査が「読んでいる間に書かれた」を作るため）。
+    /// 本物は何もしないクロージャ。
     fn read_with(
         &self,
         buf: &mut [u16; TEXT_UNITS],
@@ -117,7 +119,7 @@ impl TextBox {
         Some(len)
     }
 
-    /// 検査用: いま読まれる方のバッファを「書いている途中」にする／戻す（描画の側の検査が、書きかけの文を描かないことを見るため）。
+    /// 検査用: いま読まれる方のバッファを「書いている途中」にする／戻す（描画の側の検査が書きかけの文を描かないことを見るため）。
     #[cfg(test)]
     pub(crate) fn mark_writing(&self, writing: bool) {
         let g = self.generation.load(Ordering::SeqCst);
@@ -135,19 +137,19 @@ impl Default for TextBox {
     }
 }
 
-/// 表示する文（描画の入口が読む。`\n` 区切りで最大 `MAX_LINES` 行）。
+/// 表示する文（描画の入口が読む。`\n`区切りで最大`MAX_LINES`行）。
 pub static TEXT: TextBox = TextBox::new();
 
-/// 接続で決まった Latency（`NO_LATENCY` なら出さない）。ネットワークのスレッドが書き、更新スレッドが 250 ms ごとに読んで文にする。
+/// 接続で決まったLatency（`NO_LATENCY`なら出さない）。ネットワークのスレッドが書き、更新スレッドが250 msごとに読んで文にする。
 pub static LATENCY: AtomicU32 = AtomicU32::new(NO_LATENCY);
 pub const NO_LATENCY: u32 = u32::MAX;
 
-// ---- 1 フレームの上乗せ ----
+// ---- 1フレームの上乗せ ----
 
-/// 上乗せの記録の件数（60 fps で約 68 秒ぶん）。百分位はこの最後の件数から、最大は全件から出す。
+/// 上乗せの記録の件数（60 fpsで約68秒ぶん）。百分位はこの最後の件数から出し、最大は全件から出す。
 pub const TIMING_LEN: usize = 4096;
 
-/// 描画の入口で文字を描くのにかかった時間（QPC のカウント）。書き手はゲームのスレッドだけ。
+/// 描画の入口で文字を描くのにかかった時間（QPCのカウント）。書き手はゲームのスレッドだけ。
 pub struct Timings {
     n: AtomicU32,
     max: AtomicU32,
@@ -158,7 +160,7 @@ pub struct Timings {
 pub struct TimingSnapshot {
     pub total: u32,
     pub max: u32,
-    /// 最後の `min(total, TIMING_LEN)` 件（順は問わない）。
+    /// 最後の`min(total, TIMING_LEN)`件（順は問わない）。
     pub recent: Vec<i64>,
 }
 
@@ -180,7 +182,7 @@ impl Timings {
         self.n.store(i.wrapping_add(1), Ordering::Release);
     }
 
-    /// コピーする（読み取りのスレッド）。ゲームのスレッドが書いている最中でも、1 件ずつは書き終えた値か前の周の値。
+    /// コピーする（読み取りのスレッド）。ゲームのスレッドが書いている最中でも1件ずつは書き終えた値か前の周の値。
     pub fn snapshot(&self) -> TimingSnapshot {
         let total = self.n.load(Ordering::Acquire);
         let k = (total as usize).min(TIMING_LEN);
@@ -209,21 +211,21 @@ impl Default for Timings {
 
 pub static TIMINGS: Timings = Timings::new();
 
-// ---- 描けなかった理由と数え ----
+// ---- 描けなかった理由と回数 ----
 
-/// 描くのを止めた理由（最初の 1 つだけ残す。`overlay_win::FAIL`）。
+/// 描くのを止めた理由（最初の1つだけ残す。`overlay_win::FAIL`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fail {
     None = 0,
     /// 文字の表が用意されていない（設置の順の誤り）。
     NoAtlas = 1,
-    /// CreateTexture が失敗した。
+    /// CreateTextureが失敗した。
     CreateTexture = 2,
-    /// テクスチャの LockRect が失敗した・画素の領域が返らなかった。
+    /// テクスチャのLockRectが失敗した・画素の領域が返らなかった。
     LockTexture = 3,
-    /// 状態を読む Get* が失敗した（戻せないので描かない）。
+    /// 状態を読むGet* が失敗した（戻せないので描かない）。
     GetState = 4,
-    /// デバイスのアドレスが、テクスチャを作ったときと違う（作り直された。古いテクスチャは使えない）。
+    /// デバイスのアドレスがテクスチャを作ったときと違う（作り直された。古いテクスチャは使えない）。
     DeviceChanged = 5,
     /// ゲームのスレッドでパニックを受けた。
     Panic = 6,
@@ -256,13 +258,13 @@ impl Fail {
     }
 }
 
-/// `Fail::GetState` で失敗した Get* の呼び出し（`stop` に渡す詳細の上位 16 ビット）。下位 16 ビットは引数。
+/// `Fail::GetState`で失敗したGet* の呼び出し（`stop`に渡す詳細の上位16ビット）。下位16ビットは引数。
 pub const GET_RENDER_STATE: u32 = 1;
 pub const GET_TEXTURE_STAGE_STATE: u32 = 2;
 pub const GET_VERTEX_SHADER: u32 = 3;
 pub const GET_VIEWPORT: u32 = 4;
 
-/// 止めた詳細の値: 呼び出しの番号と引数（`GET_TEXTURE_STAGE_STATE` は 段 << 8 | 種類）。
+/// 止めた詳細の値: 呼び出しの番号と引数（`GET_TEXTURE_STAGE_STATE`は ステージ << 8 | 種類）。
 pub fn stop_detail(call: u32, arg: u32) -> u32 {
     call << 16 | (arg & 0xFFFF)
 }
@@ -280,8 +282,8 @@ fn stop_detail_text(detail: u32) -> Option<String> {
     })
 }
 
-/// 描画を止めたときの本ログの 1 行（読み取りのスレッドが 1 回だけ書く）。`fail` は `Fail` の番号、`hr` は失敗した呼び出しの HRESULT
-/// （0 は呼び出しの失敗ではない理由）、`detail` は `stop_detail`（0 は無し）。
+/// 描画を止めたときの本ログの1行（読み取りのスレッドが1回だけ書く）。`fail`は`Fail`の番号。
+/// `hr`は失敗した呼び出しのHRESULT（0は呼び出しの失敗ではない理由）。`detail`は`stop_detail`（0は無し）。
 pub fn stop_line(fail: u32, hr: u32, detail: u32) -> String {
     let why = Fail::from_code(fail).map_or_else(
         || format!("知らない理由の番号 {fail}"),
@@ -300,67 +302,69 @@ pub fn stop_line(fail: u32, hr: u32, detail: u32) -> String {
 pub struct OverlayCounters {
     /// 描いたフレーム。
     pub drawn: u32,
-    /// `TestCooperativeLevel` が D3D_OK でなく描かなかったフレーム（デバイスが失われている間）。
+    /// `TestCooperativeLevel`がD3D_OKでなく描かなかったフレーム（デバイスが失われている間）。
     pub lost: u32,
-    /// デバイスのアドレスが 0 で描かなかったフレーム。
+    /// デバイスのアドレスが0で描かなかったフレーム。
     pub no_device: u32,
     /// 文が書きかけで読めず描かなかったフレーム。
     pub torn: u32,
-    /// `DrawPrimitiveUP` が失敗したフレーム。
+    /// `DrawPrimitiveUP`が失敗したフレーム。
     pub draw_failed: u32,
-    /// 自分の状態を設定する・戻す `Set*` のどれかが失敗した回数。
+    /// 自分の状態を設定する・戻す`Set*`のどれかが失敗した回数。
     pub set_failed: u32,
     pub panics: u32,
-    /// 止めた理由（`Fail` の番号）と、そのときの HRESULT。
+    /// 止めた理由（`Fail`の番号）とそのときのHRESULT。
     pub fail: u32,
     pub fail_hr: u32,
-    /// 最初の 1 回（テクスチャを作ってコピーする）にかかった QPC のカウント。
+    /// 最初の1回（テクスチャを作ってコピーする）にかかったQPCのカウント。
     pub setup_ticks: u32,
 }
 
 // ---- ゲームの文字（ascii.anm）を読み取る前のチェック ----
 
-/// ゲームの文字をコピーできていない理由（最後の 1 つを `overlay_win` が覚え、本ログが書く）。`Wait` の組は「まだ読み込み前かもしれない」ので
-/// 次の試しで直る。`Refuse` の組は直らないので試さない。
+/// ゲームの文字をコピーできていない理由（最後の1つを`overlay_win`が覚え、本ログが書く）。
+/// `Wait`グループは「まだ読み込み前かもしれない」ので次の試しで直る。`Refuse`グループは直らないので試さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameFontWhy {
     None = 0,
     // ---- 試し直す ----
-    /// AsciiManager の読み込み口のポインタが 0 か読めない（ゲームの初期化の前）。
+    /// AsciiManagerの読み込み口のポインタが0か読めない（ゲームの初期化の前）。
     NoLoadedPtr = 1,
-    /// AnmManager のポインタが 0 か読めない。
+    /// AnmManagerのポインタが0か読めない。
     NoAnmManager = 2,
-    /// 読み込み口が `[AnmManager] + 0x144` と違う（別の物を掴んでいる）。
+    /// 読み込み口が`[AnmManager] + 0x144`と違う（別のものを指している）。
     PtrMismatch = 3,
-    /// ファイルの中身が無い・読み込みの進みが 0 でない（読み込み中）。
+    /// ファイルの中身が無い・読み込みの進みが0でない（読み込み中）。
     NotLoaded = 4,
-    /// 読み込み口の名前が `ascii.anm` でない。
+    /// 読み込み口の名前が`ascii.anm`でない。
     NameMismatch = 5,
-    /// スプライトの配列のポインタが 0 か、スプライトが読めない。
+    /// スプライトの配列のポインタが0か、スプライトが読めない。
     SpriteUnreadable = 6,
-    /// スプライトの欄が変（テクスチャのポインタが 0・矩形が空か画素の整数でない・テクスチャの大きさと合わない）。
+    /// スプライトのフィールドが不正（テクスチャのポインタが0・矩形が空か画素の整数でない・テクスチャの大きさと合わない）。
     SpriteBad = 7,
     /// 文字によってテクスチャのポインタや大きさが違う。
     TextureDiffers = 8,
-    /// 自分のテクスチャがまだ無い（最初の 1 回の後にだけ試す）。
+    /// 自分のテクスチャがまだ無い（最初の1回の後にだけ試す）。
     NoOwnTexture = 9,
-    /// ゲームのテクスチャの vtable が自分のテクスチャと違う（IDirect3DTexture8 でなさそう）。
+    /// ゲームのテクスチャのvtableが自分のテクスチャと違う（IDirect3DTexture8でなさそう）。
     VtableMismatch = 10,
     // ---- 試さない ----
-    /// GetLevelDesc が失敗した。
+    /// GetLevelDescが失敗した。
     LevelDescFailed = 20,
     /// コピーできない画素の形式。
     FormatUnsupported = 21,
-    /// GetLevelDesc の大きさがスプライトの欄の大きさと違う。
+    /// GetLevelDescの大きさがスプライトのフィールドの大きさと違う。
     DimsMismatch = 22,
     /// 文字の絵が予約した枠（16×16）より大きい。
     GlyphTooBig = 23,
-    /// LockRect が失敗した（何度か試した後）。
+    /// LockRectが失敗した（何度か試した後）。
     LockFailed = 24,
     /// 画素の切り出しが断られた（呼ぶ前のチェックをすり抜けた —— あり得ない）。
     ExtractFailed = 25,
-    /// 試しの回数が上限（`GF_MAX_ATTEMPTS`）を越えた。待つ理由（読み込み前）が直らないまま長く続いたので、もう試さない。
+    /// 試しの回数が上限（`GF_MAX_ATTEMPTS`）を越えた。待つ理由（読み込み前）が直らないまま長く続いたのでもう試さない。
     GaveUp = 26,
+    /// コピーした文字の絵の指紋が元の花映塚の値の表（`KNOWN_GAME_FONT_HASHES`）にない（英語パッチなどで差し替わっている）。
+    Differs = 27,
     // ---- 更新スレッド ----
     /// 更新スレッドがコピーした後の文字の表を作れなかった。
     ApplyFailed = 30,
@@ -388,6 +392,7 @@ impl GameFontWhy {
             LockFailed,
             ExtractFailed,
             GaveUp,
+            Differs,
             ApplyFailed,
         ]
         .into_iter()
@@ -420,24 +425,26 @@ impl GameFontWhy {
             GameFontWhy::LockFailed => "LockRect が失敗した",
             GameFontWhy::ExtractFailed => "画素の切り出しが断られた",
             GameFontWhy::GaveUp => "試す回数の上限を越えたので、もう試さない",
+            GameFontWhy::Differs => "元の花映塚と異なるため不使用（パッチの可能性）",
             GameFontWhy::ApplyFailed => "更新スレッドがコピーした後の文字の表を作れなかった",
         }
     }
 }
 
-// ---- ゲームの文字をコピーする試しと、文字の表の差し替えの試し直しの決まり（pure。`overlay_win` が使う）----
+// ---- ゲームの文字をコピーする試しと、文字の表の差し替えの試し直しの決まり（pure。`overlay_win`が使う）----
 
-/// ゲームの文字を試す間隔（描画の入口を通った回数）。60 fps で約 0.5 秒。試しは safe な読み（VirtualQuery）が数回だが、
-/// 読み込み前の長い間、毎フレーム払う理由が無い。
+/// ゲームの文字を試す間隔（描画の入口を通った回数）。60 fpsで約0.5秒。
+/// 試しはsafeな読み（VirtualQuery）が数回で済む。ただし読み込み前の長い間に毎フレーム試す理由は無い。
 pub const GF_EVERY: u32 = 30;
-/// 試しの回数の上限。越えたら以降は試さず、GDI の文字のまま描く。600 回 × 30 フレーム = 5 分。ゲームは ascii.anm を起動時に読み込む形
-/// （`0x004344ED`〜`0x00434503` の AsciiManager の初期化）なので、読み込みは描画が始まってから長くかからないはず。
-/// 5 分は余裕を見た値（読み込みにかかる時間そのものは測っていない）。5 分を越えても読み込み前なら、ゲームの作りが想定と違う（別のバージョンなど）。
+/// 試しの回数の上限。越えたら以降は試さずGDIの文字のまま描く。600回 × 30フレーム = 5分。
+/// ゲームはascii.anmを起動時に読み込む作り（`0x004344ED`〜`0x00434503`のAsciiManagerの初期化）なので、読み込みは描画が始まってから長くかからないはず。
+/// 5分は余裕を見た値（読み込みにかかる時間そのものは測っていない）。
+/// 5分を越えても読み込み前なら、ゲームの作りが想定と違う（別のバージョンなど）。
 pub const GF_MAX_ATTEMPTS: u32 = 600;
-/// LockRect の失敗を待つ回数（この回数目の失敗であきらめる）。
+/// LockRectの失敗を待つ回数（この回数目の失敗であきらめる）。
 pub const GF_LOCK_FAIL_LIMIT: u32 = 5;
 
-/// 描画の入口を通った通し番号 `frame`（0 から）と、それまでの試しの回数 `attempts` から、今回することを決める。
+/// 描画の入口を通った通し番号`frame`（0から）とそれまでの試しの回数`attempts`から今回することを決める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GfGate {
     /// 試す間隔でない（何もしない）。
@@ -462,28 +469,28 @@ pub fn gf_lock_gives_up(fails: u32) -> bool {
     fails >= GF_LOCK_FAIL_LIMIT
 }
 
-/// 文字の表の差し替えでテクスチャを作り直すのに失敗したとき、差し替え前のテクスチャで描き続けながら試し直す回数の上限
-/// （最初の 1 回を含めて `SWAP_MAX_TRIES` 回試して、だめならあきらめる）。
+/// 文字の表の差し替えでテクスチャを作り直すのに失敗したときは差し替え前のテクスチャで描き続けながら試し直す。
+/// その回数の上限（最初の1回を含めて`SWAP_MAX_TRIES`回試して、だめならあきらめる）。
 pub const SWAP_MAX_TRIES: u32 = 3;
-/// 失敗の後、次の試しまで待つ描画の入口の回数（60 fps で約 1 秒。失敗した直後の毎フレームに CreateTexture を呼ばない）。
+/// 失敗の後に次の試しまで待つ描画の入口の回数（60 fpsで約1秒。失敗した直後の毎フレームにCreateTextureを呼ばない）。
 pub const SWAP_RETRY_EVERY: u32 = 60;
 
-/// 差し替えのテクスチャを作りに行くか。`tries` はここまでに試した回数（0 = まだ 1 回も試していない）、`frames_since` は
-/// 最後の失敗からの描画の入口の回数。最初の 1 回はすぐ、失敗の後は `SWAP_RETRY_EVERY` 回待って、`SWAP_MAX_TRIES` 回まで。
+/// 差し替えのテクスチャを作りに行くかどうか。`tries`はここまでに試した回数（0 = まだ1回も試していない）。
+/// `frames_since`は最後の失敗からの描画の入口の回数。最初の1回はすぐ試し、失敗の後は`SWAP_RETRY_EVERY`回待って`SWAP_MAX_TRIES`回まで試す。
 pub fn swap_should_try(tries: u32, frames_since: u32) -> bool {
     tries == 0 || (tries < SWAP_MAX_TRIES && frames_since >= SWAP_RETRY_EVERY)
 }
 
-/// 読むアドレス（本物は `th09_addr` の定数。検査は偽のメモリのアドレス）。
+/// 読むアドレス（本物は`th09_addr`の定数。検査は偽のメモリのアドレス）。
 #[derive(Debug, Clone, Copy)]
 pub struct GameAddrs {
-    /// AsciiManager の読み込み口のポインタが入っているアドレス（`ASCII_ANM_LOADED_PTR`）。
+    /// AsciiManagerの読み込み口のポインタが入っているアドレス（`ASCII_ANM_LOADED_PTR`）。
     pub loaded_ptr: u32,
-    /// AnmManager のポインタが入っているアドレス（`ANM_MANAGER_PTR`）。
+    /// AnmManagerのポインタが入っているアドレス（`ANM_MANAGER_PTR`）。
     pub anm_manager_ptr: u32,
 }
 
-/// スプライト 1 つの矩形と、画面に描く大きさ（`+0x34` × `+0x30` を四捨五入。読めなければ 0）。
+/// スプライト1つの矩形と画面に描く大きさ（`+0x34` × `+0x30` を四捨五入。読めなければ0）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpriteInfo {
     pub rect: Rect,
@@ -491,7 +498,7 @@ pub struct SpriteInfo {
     pub quad_h: u32,
 }
 
-/// チェックが通った結果: 文字の絵の載っているテクスチャ（1 つ）とその大きさ、文字ごとのスプライト
+/// チェックが通った結果: 文字の絵の載っているテクスチャ（1つ）とその大きさ、文字ごとのスプライト
 /// （枠の番号 = `game_index`。`` ` `` の枠は `None`）。
 #[derive(Debug, Clone, Copy)]
 pub struct Probed {
@@ -501,7 +508,7 @@ pub struct Probed {
     pub sprites: [Option<SpriteInfo>; GAME_GLYPHS],
 }
 
-/// 読む関数: `addr` から `buf.len()` バイトを読む。読めなければ false（ゲームのメモリを読むだけ。ヒープを使わない）。
+/// 読む関数: `addr`から`buf.len()`バイトを読む。読めなければfalse（ゲームのメモリを読むだけ。ヒープを使わない）。
 pub type ReadMem<'a> = &'a mut dyn FnMut(u32, &mut [u8]) -> bool;
 
 fn rd32(read: ReadMem, addr: u32) -> Option<u32> {
@@ -524,11 +531,11 @@ fn pixel_of(f: f32) -> Option<u32> {
         .then(|| f.round() as u32)
 }
 
-/// ゲームが ascii.anm を読み終えているかを検証し、英数字のスプライトを読む（読むだけ。確保しない）。検証する順と根拠:
-/// 1. `[loaded_ptr]` = L（0 でない）。2. `[anm_manager_ptr]` = M（0 でない）で、`L == M + 0x120 × 1 + 0x24`（`0x0043C640`〜`0x0043C682` が
-///    返す読み込み口の式）。3. `[L+4]`（ファイルの中身）が 0 でなく、`[L+0x18]`（読み込みの進み）が 0（`0x0043C7D0`〜 が 0 になるまで待つ）。
-/// 4. `L+0x20` が `"ascii.anm\0"`。5. `[L+0x0C]`（スプライトの配列）が 0 でなく、文字 `0x21`〜`0x7E`（`` ` `` を除く）の 0x44 バイトが
-///    読めて、`+4` のテクスチャが 0 でなく全部同じ、矩形（`+8`〜`+0x14`）が整数の画素で空でなくテクスチャの大きさ（`+0x1C` 幅・`+0x18` 高さ）の中に収まる。
+/// ゲームがascii.anmを読み終えているかを検証し、英数字のスプライトを読む（読むだけ。確保しない）。検証する順と根拠:
+/// 1. `[loaded_ptr]` = L（0でない）。2. `[anm_manager_ptr]` = M（0でない）で、`L == M + 0x120 × 1 + 0x24`（`0x0043C640`〜`0x0043C682`が
+///    返す読み込み口の式）。3. `[L+4]`（ファイルの中身）が0でなく、`[L+0x18]`（読み込みの進み）が0（`0x0043C7D0`〜 が0になるまで待つ）。
+/// 4. `L+0x20`が`"ascii.anm\0"`。5. `[L+0x0C]`（スプライトの配列）が0でなく、文字`0x21`〜`0x7E`（`` ` `` を除く）の0x44バイトが
+///    読めて、`+4`のテクスチャが0でなく全部同じ、矩形（`+8`〜`+0x14`）が整数の画素で空でなくテクスチャの大きさ（`+0x1C`幅・`+0x18`高さ）の中に収まる。
 pub fn probe_game_font(read: ReadMem, a: GameAddrs) -> Result<Probed, GameFontWhy> {
     let l = rd32(read, a.loaded_ptr)
         .filter(|&v| v != 0)
@@ -600,7 +607,7 @@ pub fn probe_game_font(read: ReadMem, a: GameAddrs) -> Result<Probed, GameFontWh
         } else if (out.texture, out.tex_w, out.tex_h) != (tex, tw, th) {
             return Err(GameFontWhy::TextureDiffers);
         }
-        // 画面に描く大きさは、読めなければ 0（`apply_game_font` は 0 なら絵の大きさで描く）。
+        // 画面に描く大きさは読めなければ0（`apply_game_font`は0なら絵の大きさで描く）。
         let q = |off: u32| {
             f32_at(&b, off)
                 .filter(|f| f.is_finite() && (0.0..=65536.0).contains(f))
@@ -620,13 +627,13 @@ pub fn probe_game_font(read: ReadMem, a: GameAddrs) -> Result<Probed, GameFontWh
     Ok(out)
 }
 
-/// 描いた後に頂点の流れ 0 へ戻す頂点バッファ（読むだけ）。DrawPrimitiveUP は流れ 0 を NULL にするが、ゲームは頂点の形の覚え
-/// `[AnmManager+0x12886]` が 2 なら SetStreamSource を飛ばして DrawPrimitive（`0x0043B4BB`）へ進むので、そのときだけゲームの頂点バッファ
-/// `[AnmManager+0x12890]` を返す。2 でなければゲームが描く前に自分で戻すので `None`。AnmManager がまだ無い・読めない・バッファが 0 のときも `None`。
-/// GetStreamSource を使わない理由は `overlay_win` の頭の注。
+/// 描いた後に頂点のストリーム0へ戻す頂点バッファ（読むだけ）。
+/// DrawPrimitiveUPはストリーム0をNULLにする。ゲームは頂点形式のキャッシュ`[AnmManager+0x12886]`が2ならSetStreamSourceを飛ばしてDrawPrimitive（`0x0043B4BB`）へ進む。
+/// そのときだけゲームの頂点バッファ`[AnmManager+0x12890]`を返す。2でなければゲームが描く前に自分で戻すので`None`。AnmManagerがまだ無い・読めない・バッファが0のときも`None`。
+/// GetStreamSourceを使わない理由は`overlay_win`の頭の注。
 pub fn stream0_to_restore(read: ReadMem, anm_manager_ptr: u32) -> Option<u32> {
     let m = rd32(read, anm_manager_ptr).filter(|&m| m != 0)?;
-    // 覚え（1 バイト）から頂点バッファ（4 バイト）までを 1 回で読む。
+    // キャッシュ（1バイト）から頂点バッファ（4バイト）までを1回で読む。
     let mut b = [0u8; (ANM_QUAD_VB + 4 - ANM_VTX_FORMAT) as usize];
     if !read(m.checked_add(ANM_VTX_FORMAT)?, &mut b) || b[0] != ANM_VTX_FORMAT_QUAD_VB {
         return None;
@@ -640,18 +647,18 @@ fn ov_range() -> core::ops::RangeInclusive<u32> {
 
 // ---- 文の更新スレッド ----
 
-/// 何回ぶんの見本で fps を出すか（250 ms ごとに 1 つ → 約 1 秒）。
+/// 何回ぶんのサンプルでfpsを出すか（250 msごとに1つ → 約1秒）。
 const FPS_SPAN: usize = 5;
 
-/// 更新スレッドの計算（読み取りの側で 250 ms ごと）: 描画の入口を通った回数と QPC の組を覚えておき、約 1 秒前との差から
-/// fps を出して文を作る。
+/// 更新スレッドの計算（読み取り側で250 msごと）。描画の入口を通った回数とQPCのペアを覚えておく。
+/// 約1秒前との差からfpsを出して文を作る。
 #[derive(Debug, Clone, Default)]
 pub struct Updater {
     samples: std::collections::VecDeque<(u64, u32)>,
 }
 
 impl Updater {
-    /// `now` は QPC、`draws` は描画の入口を通った回数（`draw::draw_calls`）、`qpf` は QPC の周波数。
+    /// `now`はQPC、`draws`は描画の入口を通った回数（`draw::draw_calls`）、`qpf`はQPCの周波数。
     pub fn step(&mut self, now: u64, draws: u32, qpf: u64, latency: u32) -> String {
         self.samples.push_back((now, draws));
         while self.samples.len() > FPS_SPAN {
@@ -670,34 +677,38 @@ impl Updater {
     }
 }
 
-// ---- 設置と集計（`session::run` から）----
+// ---- 設置と集計（`session::run`から）----
 
-/// 文字の描画を受け持つもの。本物は `overlay_win::RealOverlayHost`。
+/// 文字の描画を受け持つもの。本物は`overlay_win::RealOverlayHost`。
 pub trait OverlayHost {
-    /// DLL のフォルダの `HiganRTool.ini` を読む（移さない）。無ければ `Ok(None)`。
+    /// DLLのフォルダの`HiganRTool.ini`を読む（移動しない）。無ければ`Ok(None)`。
     fn read_ini(&mut self) -> Result<Option<String>, String>;
-    /// GDI で文字の表を描き、ゲームのスレッドが読むバッファへ書く（1 回だけ）。文字の枠の大きさなどの文を返す。
+    /// GDIで文字の表を描き、ゲームのスレッドが読むバッファへ書く（1回だけ）。文字の枠の大きさなどの文を返す。
     fn build_atlas(&mut self) -> Result<String, String>;
-    /// デバイスと present parameters のアドレスを検証して保存し、文の更新スレッドを作る（描画の入口はまだ描かない）。
+    /// デバイスとpresent parametersのアドレスを検証して保存し、文の更新スレッドを作る（描画の入口はまだ描かない）。
     fn arm(&mut self) -> Result<(), String>;
     /// 描画の入口の分岐を開く（`OVERLAY_ON` = 1）。
     fn on(&mut self);
-    /// ini の `[overlay] preview = 1`（旗が立っているときだけ、`build_atlas` の前に呼ぶ）。
+    /// iniの`[overlay] preview = 1`（フラグが立っているときだけ`build_atlas`の前に呼ぶ）。
     fn set_preview(&mut self, _on: bool) {}
-    /// 右下の fps の行を出さない（ゲーム内のメニューのためだけに文字の描画を開いたとき。`[overlay] enable = 1` が無い）。`arm` の前に呼ぶ。
+    /// 右下のfpsの行を出さない（ゲーム内のメニューのためだけに文字の描画を開いたとき。`[overlay] enable = 1`が無い）。`arm`の前に呼ぶ。
     fn set_quiet(&mut self, _on: bool) {}
-    /// ゲームの文字（ascii.anm の絵）の状態の説明（本ログ用。ゲームの文字を使わない実装は空）。
+    /// ゲームの文字（ascii.anmの絵）の状態の説明（本ログ用。ゲームの文字を使わない実装は空）。
     fn game_font_report(&self) -> String {
+        String::new()
+    }
+    /// ゲームの文字について詳細でなくても本ログに残す行（絵の指紋・パッチによる不使用）。行ごとに改行で区切る。無ければ空。
+    fn game_font_notes(&self) -> String {
         String::new()
     }
     fn counters(&self) -> OverlayCounters;
     fn timings(&self) -> TimingSnapshot;
-    /// QPC の周波数。
+    /// QPCの周波数。
     fn qpf(&self) -> u64;
 }
 
-/// 文字の描画を入れる（`session::run` が描画の detour の後に 1 回呼ぶ）。ini の `[overlay]` に `enable = 1` が
-/// あり、描画の detour が書け、文字の表とアドレスが用意できたときだけ開いて true を返す。ログは「文字の描画: 」で始まる行。
+/// 文字の描画を有効にする（`session::run`が描画のdetourの後に1回呼ぶ）。
+/// iniの`[overlay]`に`enable = 1`があり、描画のdetourを書き込み済みで、文字の表とアドレスが用意できたときだけ開いてtrueを返す。ログは「文字の描画: 」で始まる行。
 pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Write) -> bool {
     let text = match host.read_ini() {
         Ok(Some(t)) => t,
@@ -723,7 +734,7 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
             ))
         }) {
         Ok((true, p, _)) => (p, false),
-        // ゲーム内のメニュー（`code_side = game`）は、文字が出ないと使えないので `[overlay] enable` が無くても開く。右下の行は出さない。
+        // ゲーム内のメニュー（`code_side = game`）は文字が出ないと使えないので`[overlay] enable`が無くても開く。右下の行は出さない。
         Ok((false, p, true)) => (p, true),
         Ok((false, _, false)) => {
             let _ = writeln!(
@@ -789,6 +800,14 @@ pub fn install(host: &mut dyn OverlayHost, draw_written: bool, out: &mut dyn Wri
 }
 
 pub fn finish(host: &mut dyn OverlayHost, out: &mut dyn Write) {
+    finish_stats(host, out);
+    // 指紋とパッチによる不使用は詳細でなくても本ログに残す（利用者の報告から原因を追えるように）。
+    for line in host.game_font_notes().lines() {
+        let _ = writeln!(out, "文字の描画: {line}");
+    }
+}
+
+fn finish_stats(host: &mut dyn OverlayHost, out: &mut dyn Write) {
     let c = host.counters();
     let qpf = host.qpf().max(1);
     let us = |t: u32| t as f64 * 1_000_000.0 / qpf as f64;
@@ -879,7 +898,7 @@ pub(crate) mod tests {
         b.publish(&ja);
         assert_eq!(b.read(&mut buf), Some(MAX_TEXT));
         assert_eq!(read_string(&b).as_deref(), Some(ja.as_str()));
-        // 上限を越える分は落とす。最後が基本面の外の文字（2 単位）にまたがるときは、その文字ごと落とす。
+        // 上限を越える分は落とす。最後が基本面の外の文字（2単位）にまたがるときはその文字ごと落とす。
         b.publish(&format!("{ja}あ"));
         assert_eq!(b.read(&mut buf), Some(MAX_TEXT));
         let tail = format!("{}😀", "x".repeat(MAX_TEXT - 1));
@@ -957,7 +976,7 @@ pub(crate) mod tests {
         assert_eq!(gf_gate(60, GF_MAX_ATTEMPTS - 1), GfGate::Try, "最後の 1 回");
         assert_eq!(gf_gate(90, GF_MAX_ATTEMPTS), GfGate::GiveUp);
         assert_eq!(gf_gate(90, GF_MAX_ATTEMPTS + 7), GfGate::GiveUp);
-        // 間隔でないフレームは、上限を越えていても何もしない。
+        // 間隔でないフレームは上限を越えていても何もしない。
         assert_eq!(gf_gate(91, GF_MAX_ATTEMPTS), GfGate::Skip);
         assert!(!gf_lock_gives_up(GF_LOCK_FAIL_LIMIT - 1));
         assert!(gf_lock_gives_up(GF_LOCK_FAIL_LIMIT));
@@ -1023,6 +1042,7 @@ pub(crate) mod tests {
         pub counters: OverlayCounters,
         pub recent: Vec<i64>,
         pub report: String,
+        pub notes: String,
     }
 
     impl OverlayHost for FakeOverlay {
@@ -1040,6 +1060,9 @@ pub(crate) mod tests {
         }
         fn game_font_report(&self) -> String {
             self.report.clone()
+        }
+        fn game_font_notes(&self) -> String {
+            self.notes.clone()
         }
         fn build_atlas(&mut self) -> Result<String, String> {
             self.events.push("atlas");
@@ -1179,7 +1202,29 @@ pub(crate) mod tests {
         f.report.clear();
         let mut out = Vec::new();
         finish(&mut f, &mut out);
-        assert!(!String::from_utf8(out).unwrap().contains("ゲームの字"));
+        assert!(!String::from_utf8(out).unwrap().contains("ゲームの文字:"));
+    }
+
+    #[test]
+    fn finish_writes_the_game_font_notes_even_in_brief_mode() {
+        let mut f = FakeOverlay {
+            notes: "ゲームの文字の指紋: 0x1（テスト）\nゲームの文字: 不使用".to_string(),
+            ..Default::default()
+        };
+        for detail in [false, true] {
+            let mut out = Vec::new();
+            crate::log_mode::with_detail(detail, || finish(&mut f, &mut out));
+            let log = String::from_utf8(out).unwrap();
+            assert!(
+                log.contains("文字の描画: ゲームの文字の指紋: 0x1（テスト）\n")
+                    && log.contains("文字の描画: ゲームの文字: 不使用\n"),
+                "詳細 {detail}: {log}"
+            );
+        }
+        f.notes.clear();
+        let mut out = Vec::new();
+        crate::log_mode::with_detail(false, || finish(&mut f, &mut out));
+        assert!(!String::from_utf8(out).unwrap().contains("ゲームの文字"));
     }
 
     // ---- ゲームの文字を読む前のチェック（偽のメモリ）----
@@ -1248,7 +1293,7 @@ pub(crate) mod tests {
         m.put(sprite_at(c), &b);
     }
 
-    /// 読み込み済みの ascii.anm の偽のメモリ。文字 c の絵は 7 × 9（`(k % 16) × 8`, `(k / 16) × 10`）、テクスチャは 128 × 128。
+    /// 読み込み済みのascii.anmの偽のメモリ。文字cの絵は 7 × 9（`(k % 16) × 8`, `(k / 16) × 10`）、テクスチャは 128 × 128。
     fn loaded_world() -> Mem {
         let mut m = Mem {
             regions: vec![
@@ -1470,6 +1515,8 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(GameFontWhy::from_code(0), Some(GameFontWhy::None));
+        assert_eq!(GameFontWhy::from_code(27), Some(GameFontWhy::Differs));
+        assert!(GameFontWhy::Differs as u32 >= GameFontWhy::LevelDescFailed as u32);
         assert_eq!(GameFontWhy::from_code(30), Some(GameFontWhy::ApplyFailed));
         assert_eq!(GameFontWhy::from_code(11), None);
         assert!(
@@ -1577,7 +1624,7 @@ pub(crate) mod tests {
 
     type Events = std::rc::Rc<core::cell::RefCell<Vec<&'static str>>>;
 
-    /// 呼ばれた順だけを外に残す偽の実装（`session::run` が中身を持つので、中を後から覗けない）。
+    /// 呼ばれた順だけを外に残す偽の実装（`session::run`が中身を持つので中を後から覗けない）。
     struct SpyOverlay(Events);
 
     impl OverlayHost for SpyOverlay {
@@ -1792,8 +1839,8 @@ pub(crate) mod tests {
     const ANM: u32 = 0x0010_0000;
     const VB: u32 = 0xBBBB_0000;
 
-    /// AnmManager のポインタを入れる欄と、覚え・頂点バッファの区画だけを持つ偽のメモリ。アドレス 0 からの区画も持つ（ポインタが 0 のときに
-    /// 0 + 0x12886 を読みに行くと、覚え 2・バッファありが返る）。
+    /// AnmManagerのポインタを入れるフィールドと、キャッシュ・頂点バッファの区画だけを持つ偽のメモリ。
+    /// アドレス0からの区画も持つ。ポインタが0のときに 0 + 0x12886 を読みに行くと、キャッシュ2・バッファありが返る。
     fn anm_world(mgr: u32, flag: u8, vb: u32) -> Mem {
         let mut m = Mem {
             regions: vec![(P_ANM, vec![0; 4])],

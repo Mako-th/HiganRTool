@@ -1,8 +1,8 @@
-//! 台本を 1 tick 進める判断（pure）: 画面の組（`Obs`）を読み、`Engine::step` を呼び、feed する tick では InputManager 3 本の
-//! 前後をコピーして feed を 3 回呼ぶ。
+//! 台本を1 tick進める判断（pure）。画面の状態（`Obs`）を読み、`Engine::step`を呼ぶ。
+//! feedするtickではInputManager 3本の前後をコピーしてfeedを3回呼ぶ。
 //!
-//! ゲームのメモリの読み・ゲームの関数の呼び出しは `TickIo` の向こうへ分ける（本物は `script_win::RealTickIo`、検査では偽物）。
-//! ここはゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap` を使わない（`FeedRecord` はスタックに作る）。
+//! ゲームのメモリの読み・ゲームの関数の呼び出しは`TickIo`の向こうへ分ける（本物は`script_win::RealTickIo`、検査では偽物）。
+//! ここはゲームのスレッドで走るので、確保・ファイル・ロック待ち・`unwrap`を使わない（`FeedRecord`はスタックに作る）。
 #![forbid(unsafe_code)]
 
 use higanr_core::input_model::MATCH_SEND_MASK;
@@ -16,22 +16,22 @@ use crate::th09_addr::{
     SUP_SCENE_CUR, SUPERVISOR,
 };
 
-/// MainMenu の欄を使う場面（場面 1 = タイトルとメニュー）。
+/// MainMenuのフィールドを使う場面（場面 1 = タイトルとメニュー）。
 pub const SCENE_MENU: u32 = 1;
 
-/// ゲームのスレッドが読むアドレス（花映塚では `th09_addr` の値。検査では検査の静的変数のアドレス）。
+/// ゲームのスレッドが読むアドレス（花映塚では`th09_addr`の値。検査では検査の静的変数のアドレス）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GameAddrs {
     pub supervisor: u32,
     pub pause: u32,
     pub loading: u32,
     pub global_state: u32,
-    /// MainMenu へのポインタが入っているアドレス（落ちない読み方でだけたどる）。
+    /// MainMenuへのポインタが入っているアドレス（例外を出さない読み方でだけたどる）。
     pub main_menu_ptr: u32,
     pub input_managers: [u32; 3],
-    /// マッチの終わりのメニューの印（1 バイトの欄。4 バイトで読んで下位 1 バイトだけ見る）。
+    /// マッチ終了時のメニューのフラグ（1バイトのフィールド。4バイトで読んで下位1バイトだけ見る）。
     pub match_end_menu: u32,
-    /// Gui へのポインタが入っているアドレス（会話の状態を落ちない読み方でたどる）。
+    /// Guiへのポインタが入っているアドレス（会話の状態を例外を出さない読み方でたどる）。
     pub gui_ptr: u32,
 }
 
@@ -66,15 +66,16 @@ impl GameAddrs {
     }
 }
 
-/// Gui の会話の状態の値が「会話が走っている」か。ゲーム自身の判定 `0x00404980` と同じ: 0 以上と −2 が会話中、−1 が会話なし。
-/// 実測で見えた値は −1（会話なし）と 0・200・201（会話中）だけで、−2 の意味は未確認だが、ゲームの定義に合わせて「会話中」に数える。
+/// Guiの会話の状態の値が「会話が走っている」かどうか。ゲーム自身の判定`0x00404980`と同じで、0以上と −2が会話中、−1が会話なし。
+/// 実測で見えた値は −1（会話なし）と0・200・201（会話中）だけ。−2の意味は未確認だが、ゲームの定義に合わせて「会話中」に数える。
 pub fn talk_state_running(v: u32) -> bool {
     let s = v as i32;
     s >= 0 || s == -2
 }
 
-/// Gui の会話が走っているか（`talk=` 条件の値）。Gui のポインタが 0・読めない、会話の欄が読めないときは `None`（読めないまま
-/// 押すより、台本が止まって理由が出る方が安全）。場面 2 でないときも `None`（場面 1 で古い Gui を読んで真にしないため）。
+/// Guiの会話が走っているかどうか（`talk=`条件の値）。
+/// Guiのポインタが0か読み取れないとき、会話のフィールドが読み取れないときは`None`（読めないまま押すより台本が止まって理由が出る方が安全）。
+/// 場面2でないときも`None`（場面1で古いGuiを読んで真にしないため）。
 fn read_talk(io: &mut dyn TickIo, a: &GameAddrs, scene: u32) -> Option<bool> {
     if scene != SCENE_MATCH {
         return None;
@@ -86,37 +87,39 @@ fn read_talk(io: &mut dyn TickIo, a: &GameAddrs, scene: u32) -> Option<bool> {
         .map(talk_state_running)
 }
 
-/// マッチの終わりのメニューが押せるか。印 `[0x4A7ECE]`（1 バイト）が 0 でなく、しかも会話が走っていない。会話が読めないときは
-/// 押せない側に倒す（読めない間に押して会話を送らないため）。
+/// マッチ終了時のメニューが押せるかどうか。フラグ`[0x4A7ECE]`（1バイト）が0でなく、しかも会話が走っていない。
+/// 会話が読めないときは押せない側に倒す（読めない間に押して会話を送らないため）。
 ///
-/// 印を 1 にするのは `0x4170A8` と `0x4178BE` の 2 か所だけ。後者は直前の `0x417854`（`mov 0xe94c(%esi),%eax; test; jge 0x417bf1`）で、
-/// 会話が走っている（0 以上）間は通らない。前者の経路（`0x41705B`〜`0x4170A8`）には会話の確認を読み取れなかった（見つからなかっただけで、無いとは検証していない）。
-/// 印は決定の 20 フレーム後に `0x435A4A` / `0x43560C` が 0 に戻す。会話の状態を重ねて見るのは、順序を逆アセンブルだけに頼らないため（会話のウィンドウは会話が終わった後も描かれたままかもしれない。推定）。
-/// メニューは出てから 4 フレーム入力を見ないので、真になってから 10 tick 以上待って押すこと。
+/// フラグを1にするのは`0x4170A8`と`0x4178BE`の2か所だけ。
+/// 後者は直前の`0x417854`（`mov 0xe94c(%esi),%eax; test; jge 0x417bf1`）により、会話が走っている（0以上）間は通らない。
+/// 前者の経路（`0x41705B`〜`0x4170A8`）には会話の確認を読み取れなかった（見つからなかっただけで、無いとは検証していない）。
+/// フラグは決定の20フレーム後に`0x435A4A` / `0x43560C`が0に戻す。
+/// 会話の状態を重ねて見るのは、順序を逆アセンブルだけに頼らないため（会話のウィンドウは会話が終わった後も描かれたままかもしれない。推定）。
+/// メニューは出てから4フレーム入力を見ないので、真になってから10 tick以上待って押すこと。
 fn end_menu_pressable(menu_flag: bool, talk: Option<bool>) -> bool {
     menu_flag && talk == Some(false)
 }
 
-/// ゲームのスレッドが外から得るもの。本物は `script_win::RealTickIo`。どれも確保しない・パニックしない。
+/// ゲームのスレッドが外から得るもの。本物は`script_win::RealTickIo`。どれも確保しない・パニックしない。
 pub trait TickIo {
-    /// ゲームの .data の 4 バイトを直に読む（設置の前に読めると検証したアドレスだけ）。
+    /// ゲームの .dataの4バイトを直に読む（設置の前に読み取り可能と検証したアドレスだけ）。
     fn data_u32(&mut self, addr: u32) -> u32;
-    /// 落ちない読み方（自分のプロセスへの `ReadProcessMemory`）で 4 バイト。読めなければ `None`。
+    /// 例外を出さない読み方（自分のプロセスへの`ReadProcessMemory`）で4バイト読む。読めなければ`None`。
     fn safe_u32(&mut self, addr: u32) -> Option<u32>;
     fn read_im(&mut self, addr: u32, out: &mut [u8; IM_BYTES]);
-    /// ローカル入力を 1 回読む（戻り値の下位 16 ビットが語）。台本だけの実行（ネットワークなし）は `0x0042BE40`（InputManager に書かない）。
-    /// ネットワークのセッションを組み込めた実行で poll の入口の照合が合っていれば、素の poll `0x0042B850` を席 0 で呼ぶ（InputManager[0] は呼ぶ前後で
-    /// コピーして戻す）。
+    /// ローカル入力を1回読む（戻り値の下位16ビットがワード）。
+    /// 台本だけの実行（ネットワークなし）は`0x0042BE40`を使う（InputManagerに書かない）。
+    /// ネットワークのセッションを組み込めた実行でpollの入口の照合が合っていれば、素のpoll `0x0042B850`をサイド0で呼ぶ（InputManager[0]は呼ぶ前後でコピーして戻す）。
     fn local_input(&mut self) -> u32;
-    /// feed `0x0042ACE0`（ecx = 番号、edx = 語）を 1 回呼ぶ。
+    /// feed `0x0042ACE0`（ecx = 番号、edx = ワード）を1回呼ぶ。
     fn feed(&mut self, index: u32, word: u32);
 }
 
-/// 今の画面の組を読む。MainMenu の欄は落ちない読み方で読み、今の場面が 1 のときだけ使う。MainMenu のポインタが 0・読めない欄は
-/// `None`。
+/// 今の画面の状態を読む。MainMenuのフィールドは例外を出さない読み方で読み、今の場面が1のときだけ使う。
+/// MainMenuのポインタが0のときと読めないフィールドは`None`。
 pub fn read_obs(io: &mut dyn TickIo, a: &GameAddrs) -> Obs {
     let scene = io.data_u32(a.supervisor.wrapping_add(SUP_SCENE_CUR));
-    // 一時停止は 1 バイトの欄（`movb` で 1 → 2 に書かれる）。4 バイトで読んだ隣の 3 バイトは見ない。
+    // 一時停止は1バイトのフィールド（`movb`で1 → 2に書かれる）。4バイトで読んだ隣の3バイトは見ない。
     let pause = io.data_u32(a.pause) & 0xFF != 0;
     let loading = io.data_u32(a.loading) != 0;
     let demo = io.data_u32(a.global_state) & GLOBAL_STATE_DEMO != 0;
@@ -155,19 +158,19 @@ pub fn read_obs(io: &mut dyn TickIo, a: &GameAddrs) -> Obs {
 pub struct TickOut {
     /// 入口へ返す値: 0 = 元の飛び先（poll_all）へ、1 = poll_all を呼ばずに戻る。
     pub ret: u32,
-    /// 撮影の理由のビット（`higanr_core::script` の `START`〜`WAIT`。0 なら撮らない）と段階。
+    /// 撮影の理由のビット（`higanr_core::script`の`START`〜`WAIT`。0なら撮らない）と段階。
     pub shot: u8,
     pub step: u16,
-    /// 台本が終わった / 止まった（以後この tick から元の poll_all へ戻す。`Out::feed` が `None`）。
+    /// 台本が終わった / 止まった（以後このtickから元のpoll_allへ戻す。`Out::feed`が`None`）。
     pub stop: bool,
-    /// feed した tick の記録（feed しなかった tick は `None`）。
+    /// feedしたtickの記録（feedしなかったtickは`None`）。
     pub record: Option<FeedRecord>,
     pub status: Status,
 }
 
-/// 台本を 1 tick 進める。順: 前の 3 本をコピーする → ローカル入力 → feed 3 回（`0` に p1・`1` に p2・`2` に p1|p2）→ 後の 3 本をコピーする。
-/// 元の poll_all は呼ばずに戻る。
-#[cfg(test)] // 本物の経路は `script_win::script_tick` が `advance` と `commit` に割って呼ぶ（検査が「割っても 1 つの `tick` と同じ」を見る）
+/// 台本を1 tick進める。順: 前の3本をコピーする → ローカル入力 → feed 3回（`0`にp1・`1`にp2・`2`にp1|p2）→ 後の3本をコピーする。
+/// 元のpoll_allは呼ばずに戻る。
+#[cfg(test)] // 本物の経路は`script_win::script_tick`が`advance`と`commit`に割って呼ぶ（検査が「割っても1つの`tick`と同じ」を見る）
 pub fn tick(engine: &mut Engine, io: &mut dyn TickIo, a: &GameAddrs, k: u32) -> TickOut {
     let stepped = advance(engine, io, a);
     commit(io, a, k, &stepped)
@@ -185,9 +188,10 @@ impl Stepped {
     }
 }
 
-/// 台本を 1 tick 進めるだけ（画面を読んで `Engine::step`。feed はしない）。観戦者の経路が、接続している間の台本の Esc を読むために
-/// 使う: 観戦中の tick は台本の語をゲームへ入れないが、台本は 1 tick に 1 回ずつ進めたい。`Local` を返す tick は、同じ結果を
-/// `commit` に渡して feed する（二重に進めない）。
+/// 台本を1 tick進めるだけ（画面を読んで`Engine::step`。feedはしない）。
+/// 観戦者の経路が、接続している間の台本のEscを読むために使う。
+/// 観戦中のtickは台本のワードをゲームへ渡さないが、台本は1 tickに1回ずつ進めたい。
+/// `Local`を返すtickは同じ結果を`commit`に渡してfeedする（二重に進めない）。
 pub fn advance(engine: &mut Engine, io: &mut dyn TickIo, a: &GameAddrs) -> Stepped {
     let obs = read_obs(io, a);
     let out = engine.step(&obs);
@@ -197,7 +201,7 @@ pub fn advance(engine: &mut Engine, io: &mut dyn TickIo, a: &GameAddrs) -> Stepp
     }
 }
 
-/// `advance` の結果を feed する（`tick` の後半。台本を進めない）。feed しない結果（終わった・止まった）は元の飛び先へ戻す。
+/// `advance`の結果をfeedする（`tick`の後半。台本を進めない）。feedしない結果（終わった・止まった）は元の飛び先へ戻す。
 pub fn commit(io: &mut dyn TickIo, a: &GameAddrs, k: u32, stepped: &Stepped) -> TickOut {
     let (out, status) = (stepped.out, stepped.status);
     let Some((p1, p2)) = out.feed else {
@@ -210,7 +214,7 @@ pub fn commit(io: &mut dyn TickIo, a: &GameAddrs, k: u32, stepped: &Stepped) -> 
             status,
         };
     };
-    // 語は念のためここでも `MATCH_SEND_MASK` の中へ（台本の読み込みで断ってあるが、feed する直前の守り）。
+    // ワードは念のためここでも`MATCH_SEND_MASK`の中へ（台本の読み込みで断ってあるが、feedする直前の守り）。
     let (p1, p2) = (p1 & MATCH_SEND_MASK, p2 & MATCH_SEND_MASK);
     let mut rec = FeedRecord {
         k,
@@ -241,7 +245,7 @@ pub fn commit(io: &mut dyn TickIo, a: &GameAddrs, k: u32, stepped: &Stepped) -> 
     }
 }
 
-/// 進み具合の状態（ゲームのスレッドが原子変数へ出し、読み取りのスレッドが読む）。
+/// 進み具合の状態（ゲームのスレッドがアトミック変数へ出し、読み取りのスレッドが読む）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunState {
     #[default]
@@ -285,14 +289,14 @@ impl RunState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Progress {
     pub state: RunState,
-    /// 今の段階（0 始まり）。止まったときは止まった段階。
+    /// 今の段階（0始まり）。止まったときは止まった段階。
     pub step: u32,
-    /// 止まった段階の行の番号（止まっていなければ 0）。
+    /// 止まった段階の行の番号（止まっていなければ0）。
     pub line: u32,
-    /// 台本の入口を通った tick の数と、そのうち feed した tick の数。
+    /// 台本の入口を通ったtickの数と、そのうちfeedしたtickの数。
     pub ticks: u32,
     pub fed: u32,
-    /// 入口の分かれ道（`SCRIPT_ON`）がいま開いているか。
+    /// 入口の分岐（`SCRIPT_ON`）がいま開いているかどうか。
     pub on: bool,
 }
 
@@ -350,7 +354,7 @@ pub(crate) mod tests {
     const MENU: u32 = 0x0400_0000;
     const GUI: u32 = 0x0500_0000;
 
-    /// 偽のゲーム: .data の値・落ちない読み（無いアドレスは読めない）・InputManager 3 本（feed は模型で動く）と、呼ばれた順の記録。
+    /// 偽のゲーム。.dataの値・例外を出さない読み（無いアドレスは読めない）・InputManager 3本（feedは模型で動く）と、呼ばれた順の記録を持つ。
     pub(crate) struct FakeIo {
         pub data: HashMap<u32, u32>,
         pub safe: HashMap<u32, u32>,
@@ -415,7 +419,7 @@ pub(crate) mod tests {
         io.safe.insert(MENU + MENU_SUBSTATE, 1);
         io.data.insert(ADDRS.pause, 7);
         io.data.insert(ADDRS.loading, 0x100);
-        io.data.insert(ADDRS.global_state, 0x0C); // bit1 は 0（bit2・bit3）
+        io.data.insert(ADDRS.global_state, 0x0C); // bit1は0（bit2・bit3）
         let o = read_obs(&mut io, &ADDRS);
         assert_eq!(
             (o.scene, o.screen, o.cursor, o.sub, o.trans),
@@ -533,7 +537,8 @@ pub(crate) mod tests {
         }
         pressed.retain(|&p| p != 0);
         assert_eq!(pressed, [keys::Z]);
-        // 会話が終わる。次の Z の段階は押し始める tick の再確認で崩れているので押さない。その次の Z の段階は出ない会話を `limit` で飛ばす。
+        // 会話が終わる。次のZの段階は押し始めるtickの再確認で崩れているので押さない。
+        // その次のZの段階は出ない会話を`limit`で飛ばす。
         // 会話が終わって初めて（`endmenu=1`）下を押す。
         io.safe.insert(GUI + GUI_TALK, u32::MAX);
         for k in 9..18 {
@@ -560,7 +565,7 @@ pub(crate) mod tests {
             assert_eq!((o.record.unwrap().p1, o.stop), (0, false), "会話の間 k={k}");
         }
         io.safe.insert(GUI + GUI_TALK, u32::MAX); // 会話が終わった
-        let o = tick(&mut e, &mut io, &ADDRS, 5); // wait=1: 満たした tick が PRE
+        let o = tick(&mut e, &mut io, &ADDRS, 5); // wait=1: 満たしたtickがPRE
         assert_eq!(o.record.unwrap().p1, 0);
         let o = tick(&mut e, &mut io, &ADDRS, 6);
         assert_eq!(o.record.unwrap().p1, keys::DOWN);

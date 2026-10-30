@@ -1,9 +1,9 @@
-//! 更新して起動し直した初回だけの仕事。ini を配る ini の形に合わせ、変更点を出して Enter を待つ。
+//! 更新して起動し直した初回だけの仕事。iniを配布iniの形に合わせ、変更点を出してEnterを待つ。
 //!
-//! - 呼ぶのは配るバージョンの、人が起動した初回（`update::start_with`）だけ。台本・開発用の引数の起動、ツールがゲームのフォルダの中の
-//!   起動では呼ばない。
-//! - ini の値は引き継ぐ（`higanr_core::ini_upgrade`）。読めない行があるなど安全に合わせられないときは、ini に触らない。
-//! - Enter を待つのは、標準入力も出力もコンソールのときだけ（`Host::interactive`）。パイプや検査のツールからの起動では待たない。
+//! - 呼ぶのは配布バージョンで人が起動した初回（`update::start_with`）だけ。
+//!   台本・開発用の引数の起動と、ツールがゲームのフォルダの中にあるときの起動では呼ばない。
+//! - iniの値は引き継ぐ（`higanr_core::ini_upgrade`）。読めない行があるなど安全に合わせられないときはiniに触らない。
+//! - Enterを待つのは標準入力も出力もコンソールのときだけ（`Host::interactive`）。パイプや検査のツールからの起動では待たない。
 
 use std::path::Path;
 
@@ -15,7 +15,7 @@ use crate::code_relay::INI_FILE;
 use crate::ui_lang::by_lang;
 use crate::update::Host;
 
-/// 変更点の文。exe に埋める。
+/// 変更点の文。exeに埋める。
 pub const NOTES: Tx = Tx {
     ja: include_str!("../release_notes/ja.txt"),
     en: include_str!("../release_notes/en.txt"),
@@ -30,9 +30,9 @@ pub const ENTER_TEXT: Tx = Tx {
 const LIST_MAX: usize = 8;
 
 pub struct Plan<'a> {
-    /// ini と exe があるフォルダ。
+    /// iniとexeがあるフォルダ。
     pub dir: &'a Path,
-    /// 土台にする、配る ini の全文。
+    /// 土台にする配布iniの全文。
     pub ini_template: &'a str,
     pub notes: &'a str,
     pub lang: Lang,
@@ -43,7 +43,7 @@ pub fn run(host: &mut dyn Host, p: &Plan<'_>) {
     show_notes(host, p.notes, p.lang);
 }
 
-/// `dir` の ini を `template` の形に合わせる。ini が無ければ何もしない（無いときの書き出しは DLL の仕事）。
+/// `dir`のiniを`template`の形に合わせる。iniが無ければ何もしない（無いときの書き出しはDLLの仕事）。
 pub fn upgrade_ini(host: &mut dyn Host, dir: &Path, template: &str, lang: Lang) {
     let path = dir.join(INI_FILE);
     if !path.is_file() {
@@ -58,7 +58,7 @@ pub fn upgrade_ini(host: &mut dyn Host, dir: &Path, template: &str, lang: Lang) 
     });
     match (wrote, report) {
         (Err(why), _) => {
-            // 理由の文は日本語のログ用なので、英語の画面には出さない（ログには残す）。
+            // 理由の文は日本語のログ用なので英語の画面には出さない（ログには残す）。
             crate::crash_log::stage(&format!("ini を新しい形に合わせられなかった: {why}"));
             host.say(&match lang {
                 Lang::Ja => format!(
@@ -143,7 +143,7 @@ fn names(keys: &[ini_upgrade::KeyRef]) -> String {
     list
 }
 
-/// 変更点を出す。コンソールが人のときだけ Enter を待つ。文が空なら何も出さず待たない。
+/// 変更点を出す。コンソールが人のときだけEnterを待つ。文が空なら何も出さず待たない。
 pub fn show_notes(host: &mut dyn Host, notes: &str, lang: Lang) {
     let notes = notes.trim();
     if notes.is_empty() {
@@ -387,13 +387,13 @@ mod tests {
             };
             show_notes(&mut host, NOTES.get(lang), lang);
             let all = host.shown.join("\n");
-            let all = all.replace(crate::ui_lang::GAME_ITEM_NAME, "");
+            let all = crate::ui_lang::without_game_items(&all);
             assert_eq!(has_japanese(&all), lang == Lang::Ja, "{lang:?}: {all}");
             assert_eq!(host.waits, 1);
         }
         assert!(!NOTES.ja.trim().is_empty() && !NOTES.en.trim().is_empty());
         // ゲームのメニューの名前は訳さない。それ以外の日本語が混ざれば落ちる。
-        let en = NOTES.en.replace(crate::ui_lang::GAME_ITEM_NAME, "");
+        let en = crate::ui_lang::without_game_items(NOTES.en);
         assert!(!has_japanese(&en), "英語の変更点に日本語がある");
     }
 }

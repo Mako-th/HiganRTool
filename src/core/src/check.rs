@@ -1,25 +1,25 @@
 //! CHECK（ズレの検出）の突き合わせ。
 //!
-//! frame 0 と以後 30 フレームごとに自分の値（乱数・抽選回数・両者のライフ）を直近 16 回分（480 フレーム）持ち、
-//! 相手の値と両方揃ったら比べる（送り直さない）。相手が先に進んでいることがあるので相手の値も 16 回分持つ。
-//! 1 つ先の seg の相手の値も持ち、その seg に入ったら比べる（読み込みの短い側が先に frame 0 の CHECK を送るため）。
-//! それ以外の seg のものは捨てる。ゲームスレッドで呼ぶので固定長の表（16 枠）だけを使う。
+//! frame 0と以後30フレームごとに自分の値（乱数・抽選回数・両者のライフ）を直近16回分（480フレーム）持つ。
+//! 相手の値と両方揃ったら比べる（送り直さない）。相手が先に進んでいることがあるので相手の値も16回分持つ。
+//! 1つ先のマッチの相手の値も持ち、そのマッチに入ったら比べる（読み込みの短い側が先にframe 0のCHECKを送るため）。
+//! それ以外のマッチのものは捨てる。ゲームスレッドで呼ぶので固定長の表（16枠）だけを使う。
 
 use crate::wire::{Check, CheckKind, WatchCheck};
 
-/// CHECK を送る間隔（フレーム）。
+/// CHECKを送る間隔（フレーム）。
 pub const CHECK_INTERVAL: u32 = 30;
-/// 持っておく回数（480 フレーム分）。
+/// 持っておく回数（480フレーム分）。
 pub const CHECK_KEEP: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CheckRule {
-    /// 4 つの欄を全部比べる（ダイジェストも抽選回数の欄に詰めるので frame 0 でも外さない）。
+    /// 4つのフィールドを全部比べる（ダイジェストも抽選回数のフィールドに詰めるのでframe 0でも外さない）。
     #[default]
     All,
-    /// frame 0 だけ抽選回数を比べない（ゲームの値を入れるときの形）。抽選回数 `0x004ACE10` は優先度 7 の
-    /// on_tick `0x00420190` が毎 tick 0 に戻すが、読み込みの間は走らず溜まる。frame 0 の値は読み込みの前後の場面の引きを含みうる
-    /// （未確認）。frame 30 からは比べる。
+    /// frame 0だけ抽選回数を比べない（ゲームの値を書き込むときの形）。
+    /// 抽選回数`0x004ACE10`は優先度7のon_tick `0x00420190`が毎tick 0に戻す。ただし読み込みの間はon_tickが走らないので溜まる。
+    /// frame 0の値は読み込みの前後の場面での抽選を含みうる（未確認）。frame 30からは比べる。
     SkipCountAtFrame0,
 }
 
@@ -28,27 +28,27 @@ pub enum CheckResult {
     Match {
         frame: u32,
     },
-    /// 合わなかった。両者の値をログへ（BYE(ズレ検出) を出す）。
+    /// 合わなかった。両者の値をログへ書く。BYE(ズレ検出)を出す。
     Mismatch {
         local: Check,
         remote: Check,
     },
 }
 
-/// 1 枠。`done` は比べ終えた印（重複して届いた CHECK で 2 回報告しない）。
+/// 1枠。`done`は比べ終えたかどうかのフラグ（重複して届いたCHECKで2回報告しない）。
 #[derive(Debug, Clone, Copy)]
 struct Slot {
     check: Check,
     done: bool,
 }
 
-/// 両者の CHECK の記録。seg ごとに `begin_seg` で空にする。
+/// 両者のCHECKの記録。マッチごとに`begin_seg`で空にする。
 #[derive(Debug, Clone)]
 pub struct CheckLog {
     seg: u16,
     local: [Option<Slot>; CHECK_KEEP],
     remote: [Option<Check>; CHECK_KEEP],
-    /// 次の seg（seg + 1）の相手の値。その seg に入ったら `remote` へ移す。
+    /// 次のマッチ（seg + 1）の相手の値。そのマッチに入ったら`remote`へ移す。
     next: [Option<Check>; CHECK_KEEP],
     latest_local: Option<u32>,
     dropped: u32,
@@ -59,7 +59,7 @@ pub fn is_check_frame(frame: u32) -> bool {
     frame.is_multiple_of(CHECK_INTERVAL)
 }
 
-/// 観戦者へ送る流れに、ホストの照合の記録（`wire::Record::Check`）を積む間隔（フレーム。約 1 秒）。対戦の CHECK の 2 回に 1 回で、値は CHECK と同じ作り方。
+/// 観戦者へ送る流れにホストの照合の記録（`wire::Record::Check`）を積む間隔（フレーム。約1秒）。対戦のCHECKの2回に1回。値はCHECKと同じ作り方。
 pub const WATCH_CHECK_INTERVAL: u32 = 2 * CHECK_INTERVAL;
 
 pub fn is_watch_check_frame(frame: u32) -> bool {
@@ -67,13 +67,12 @@ pub fn is_watch_check_frame(frame: u32) -> bool {
 }
 
 // ---- 入力の列のダイジェスト（検査用）----
-// ゲームの乱数とライフを持たない相手（peer_sim）とは、CHECK の rng の欄にそれまでに使った (1P, 2P) の列の
-// ダイジェストを入れて比べる。
+// ゲームの乱数とライフを持たない相手（peer_sim）とは、CHECKのrngのフィールドにそれまでに使った (1P, 2P)の列のダイジェストを入れて比べる。
 
-/// ダイジェストの初期値（FNV-1a 64 bit）。seg をまたいで続ける。
+/// ダイジェストの初期値（FNV-1a 64 bit）。マッチをまたいで続ける。
 pub const INPUT_DIGEST_INIT: u64 = 0xCBF2_9CE4_8422_2325;
 
-/// ダイジェストに 1 フレーム（1P, 2P の順）を足す。
+/// ダイジェストに1フレーム（1P, 2Pの順）を足す。
 pub fn input_digest_push(h: u64, p1: u16, p2: u16) -> u64 {
     let mut h = h;
     for b in p1.to_le_bytes().into_iter().chain(p2.to_le_bytes()) {
@@ -83,7 +82,7 @@ pub fn input_digest_push(h: u64, p1: u16, p2: u16) -> u64 {
     h
 }
 
-/// ダイジェストを CHECK の欄に詰める（下 16 bit を rng_state、次の 32 bit を rng_count、ライフは 0）。
+/// ダイジェストをCHECKのフィールドに詰める（下16 bitをrng_state、次の32 bitをrng_count、ライフは0）。
 pub fn check_from_input_digest(seg: u16, frame: u32, digest: u64) -> Check {
     Check {
         seg,
@@ -96,7 +95,7 @@ pub fn check_from_input_digest(seg: u16, frame: u32, digest: u64) -> Check {
 }
 
 fn slot_of(frame: u32) -> usize {
-    // 添字は常に 0..CHECK_KEEP（パニックしない）。
+    // 添字は常に0..CHECK_KEEP（パニックしない）。
     ((frame / CHECK_INTERVAL) as usize) % CHECK_KEEP
 }
 
@@ -129,8 +128,8 @@ impl CheckLog {
         self.rule
     }
 
-    /// 新しい seg に入る。前の seg の値は比べない。1 つ先なら届いていた相手の値を引き継ぎ、
-    /// 飛ばしたなら捨てた数に足す。
+    /// 新しいマッチに入る。前のマッチの値は比べない。
+    /// 1つ先なら届いていた相手の値を引き継ぐ。飛ばしたなら捨てた数に足す。
     pub fn begin_seg(&mut self, seg: u16) {
         let early = self.next;
         let carried = seg == self.seg.wrapping_add(1);
@@ -151,7 +150,7 @@ impl CheckLog {
         self.seg
     }
 
-    /// 比べずに捨てた相手の CHECK の数。
+    /// 比べずに捨てた相手のCHECKの数。
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
@@ -179,7 +178,7 @@ impl CheckLog {
             return None;
         }
         if r.seg == self.seg.wrapping_add(1) {
-            // 相手が先に次の seg に入った。自分が入るまで持っておく（重複は上書き）。
+            // 相手が先に次のマッチに入った。自分が入るまで持っておく（重複は上書き）。
             self.next[slot_of(r.frame)] = Some(*r);
             return None;
         }
@@ -187,7 +186,7 @@ impl CheckLog {
             self.dropped += 1;
             return None;
         }
-        // 16 回分より古いものは比べない（枠は新しい値で上書き済み）。
+        // 16回分より古いものは比べない（枠は新しい値で上書き済み）。
         if let Some(l) = self.latest_local
             && r.frame + CHECK_INTERVAL * CHECK_KEEP as u32 <= l
         {
@@ -219,7 +218,7 @@ impl CheckLog {
     }
 }
 
-/// 観戦者が自分のゲームで作った照合の値（同じ frame の 2 通り。ホストの記録がどちらの作り方かは記録が持つ）。
+/// 観戦者が自分のゲームで作った照合の値（同じframeの2通り。ホストの記録がどちらの作り方かは記録が持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnCheck {
     pub game: WatchCheck,
@@ -239,9 +238,10 @@ pub enum WatchVerdict {
     },
 }
 
-/// 観戦者の照合: ホストの `Record::Check` と同じ frame の自分の値を、どちらが先に来ても組にして比べる。delay 方式のホストは
-/// その frame の `Frame` の前に、rollback のホストは確定した後（`Frame` の後）に積むので、両方の順を持つ。1 秒に 1 回なので枠は 1 つずつ。
-/// seg の始まりで `clear` する（frame の番号は seg ごとに 0 から）。
+/// 観戦者の照合: ホストの`Record::Check`と同じframeの自分の値をどちらが先に来てもペアにして比べる。
+/// delay方式のホストはそのframeの`Frame`の前に積む。rollbackのホストは確定した後（`Frame`の後）に積む。そのため両方の順を持つ。
+/// 1秒に1回なので枠は1つずつ。
+/// マッチの始まりで`clear`する（frameの番号はマッチごとに0から）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WatchChecks {
     host: Option<(CheckKind, WatchCheck)>,
@@ -406,7 +406,7 @@ mod tests {
             log.on_remote(&chk(0, 30, 1)),
             Some(CheckResult::Match { frame: 30 })
         );
-        // 16 回前（0）は枠が 480 に上書き済みなので捨てる。
+        // 16回前（0）は枠が480に上書き済みなので捨てる。
         assert_eq!(log.on_remote(&chk(0, 0, 0)), None);
         assert_eq!(log.dropped(), 1);
         assert_eq!(
@@ -582,14 +582,14 @@ mod tests {
 
     #[test]
     fn a_watch_check_pairs_in_either_order_and_judges_by_the_hosts_kind() {
-        // ホストが先（delay 方式）。
+        // ホストが先（delay方式）。
         let mut w = WatchChecks::default();
         assert_eq!(w.on_host(CheckKind::Game, wc(60, 1, 2)), None);
         assert_eq!(
             w.on_own(own(60, 1, 2)),
             Some(WatchVerdict::Match { frame: 60 })
         );
-        // 自分が先（rollback の確定の後に積まれる）。
+        // 自分が先（rollbackの確定の後に積まれる）。
         assert_eq!(w.on_own(own(120, 3, 4)), None);
         assert_eq!(
             w.on_host(CheckKind::Game, wc(120, 3, 5)),
@@ -628,7 +628,7 @@ mod tests {
             w.on_own(own(120, 1, 2)),
             Some(WatchVerdict::Match { frame: 120 })
         );
-        // frame 0 の抽選回数は読み込みの引きで両者が違ってよい（対戦の CHECK と同じ）。ダイジェストは全部比べる。
+        // frame 0の抽選回数は読み込み中の抽選で両者が違ってよい（対戦のCHECKと同じ）。ダイジェストは全部比べる。
         assert_eq!(w.on_host(CheckKind::Game, wc(0, 5, 999)), None);
         assert_eq!(
             w.on_own(own(0, 5, 1)),
@@ -639,7 +639,7 @@ mod tests {
             w.on_own(own(0, 5, 1)),
             Some(WatchVerdict::Mismatch { .. })
         ));
-        // seg の始まりで捨てる。
+        // マッチの始まりで捨てる。
         assert_eq!(w.on_host(CheckKind::Game, wc(60, 1, 2)), None);
         w.clear();
         assert_eq!(w.on_own(own(60, 1, 2)), None, "前の seg の記録と比べた");

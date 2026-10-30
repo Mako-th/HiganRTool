@@ -1,4 +1,4 @@
-//! マッチの中の lockstep の状態機械。ソケットも時計も持たない。dll（と peer_sim）が 1 フレームに次の順で呼ぶ:
+//! マッチの中のlockstepのステートマシン。ソケットも時計も持たない。dll（とpeer_sim）が1フレームに次の順で呼ぶ:
 //! ```text
 //! 読み込みに入るとき / 試合の場面を出るとき: ls.begin_seg(次の seg)
 //! if !ls.captured() { ls.capture(local)?; send(ls.build_input()) }   // 取得は 1 フレームに 1 回
@@ -6,17 +6,17 @@
 //! if let Some(a) = ls.advance() { feed(by_seat(my_seat, a.local, a.remote)) } else { 描画だけのフレーム（次の do_frame で同じフレームをやり直す。capture はし直さない）}
 //! いつでも: on_input が PrevSeg { reply: true } なら send(ls.build_prev_input())
 //! ```
-//! ゲームスレッドで呼ぶので、ヒープを使わず、パニックしうる添字を置かない。入力ワードは固定長のリング（`word_ring`）に保持し、印が合わない枠は「無い」と読む。
+//! ゲームスレッドで呼ぶのでヒープを使わずパニックしうる添字を置かない。入力ワードは固定長のリング（`word_ring`）に保持する。印が合わない枠は「無い」と読む。
 
 use crate::delay_pick::{AUTO, AutoHold, Recommend};
 use crate::frame::{MAX_DELAY, apply_frame, is_prefill};
 use crate::wire::{Input, LatChange, MAX_WORDS, Seat};
 use crate::word_ring::{RING, Ring, in_window};
 
-/// 相手の入力を待つ間に `build_input()` を送り直す間隔（ms）。この状態機械は時計を持たないので、呼び手（dll と peer_sim）が数える。
+/// 相手の入力を待つ間に`build_input()`を再送する間隔（ms）。このステートマシンは時計を持たないので呼び出し側（dllとpeer_sim）が数える。
 pub const RESEND_MS: u32 = 4;
 
-/// ホストかゲストか（接続の手順で決まる。`handshake.rs`）。latency の切替を出せるのはホストだけ（ゲストは `press_delay` で要求する）。
+/// ホストかゲストか（接続の手順で決まる。`handshake.rs`）。latencyの切替を出せるのはホストだけ（ゲストは`press_delay`で要求する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Host,
@@ -25,52 +25,53 @@ pub enum Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatError {
-    /// ゲストは切替を出せない（ゲストは `press_delay` で要求する。frame 0 の lat はホストが INPUT ごと捨てる）。
+    /// ゲストは切替を出せない（ゲストは`press_delay`で要求する。frame 0のlatはホストがINPUTごと捨てる）。
     NotHost,
-    /// 0〜9 の外（`frame::MAX_DELAY`）。
+    /// 0〜9の外（`frame::MAX_DELAY`）。
     OutOfRange,
-    /// いまの delay と同じ（待っている切替があれば取り下げる）。
+    /// いまのdelayと同じ（待っている切替があれば取り下げる）。
     Unchanged,
-    /// 前の切替を両者が使い終えていない。INPUT に載る切替はいつも 1 つ。条件は `request_delay` の説明。
+    /// 前の切替を両者が使い終えていない。INPUTに載る切替はいつも1つ。条件は`request_delay`の説明。
     Busy,
-    /// 取り決めで rollback のモードに決まった接続（切替は「a のワードが届かなければ a に進めない」に頼るが、予測は a を越えるので出さない）。
+    /// 取り決めでrollbackのモードに決まった接続。
+    /// 切替は「aのワードが届かなければaに進めない」ことに頼る。しかし予測はaを越えるので出さない。
     RollbackMode,
 }
 
 /// 遅れの量の押下（`press_delay`）がどう扱われたか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelayPress {
-    /// ホスト（rollback）: 予定を出した。取得のフレーム `frame` から新しい D。
+    /// ホスト（rollback）: 予定を出した。取得のフレーム`frame`から新しいD。
     Scheduled { frame: u32 },
-    /// ホスト（rollback）: ゲストがこの seg の D を知ったと分かるまで持っておく（ゲート）。
+    /// ホスト（rollback）: ゲストがこのsegのDを知ったと分かるまで持っておく（ゲート）。
     Held,
-    /// ホスト（delay 方式）: 次の取得で切替に結び付ける。前の切替を両者が使い終えていなければ、使い終えた後の取得で。
+    /// ホスト（delay方式）: 次の取得で切替に結び付ける。前の切替を両者が使い終えていなければ使い終えた後の取得で。
     Queued,
-    /// ゲスト: ホストへ要求した（INPUT の lat に `seq` で載せる）。
+    /// ゲスト: ホストへ要求した（INPUTのlatに`seq`で載せる）。
     Asked { seq: u32 },
-    /// 今の値（決まっている値か、要求している値）と同じ。何もしない。
+    /// 今の値（決定済みの値か要求中の値）と同じ。何もしない。
     Unchanged,
-    /// 0〜9 の外。または、この状態機械では変えない（rollback の状態機械の delay 方式）。
+    /// 0〜9の外。またはこのステートマシンでは変えない（rollbackのステートマシンのdelay方式）。
     Refused,
 }
 
-/// ゲストの要求を INPUT に載せ続ける上限（取得の数。60 fps で 2 秒）。押した値が通らなかったとき（同じ瞬間にホストが別の値を押して
-/// 後勝ち等）に諦める。
+/// ゲストの要求をINPUTに載せ続ける上限（取得の数。60 fpsで2秒）。
+/// 押した値が通らなかったとき（同じ瞬間にホストが別の値を押して後勝ちになった場合など）に諦める。
 pub const WISH_FRAMES: u8 = 120;
 
-/// ゲストの要求（`press_delay`）。INPUT の lat に {frame: seq, delay: x} として載せる（seq は 1 から。0 と `u32::MAX` は使わない）。
+/// ゲストの要求（`press_delay`）。INPUTのlatに {frame: seq, delay: x} として載せる（seqは1から。0と`u32::MAX`は使わない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wish {
     pub(crate) seq: u32,
     pub(crate) x: u8,
-    /// 押した時点の「予定・切替を受けた回数」。これより後に受けた予定・切替で値が `x` なら、通ったと見てやめる。
+    /// 押した時点の「予定・切替を受けた回数」。これより後に受けた予定・切替で値が`x`なら通ったと見てやめる。
     pub(crate) mark: u32,
-    /// 残りの取得の数（`WISH_FRAMES` から減らす）。
+    /// 残りの取得の数（`WISH_FRAMES`から減らす）。
     pub(crate) left: u8,
 }
 
 impl Wish {
-    /// 次の seq（1 から。`u32::MAX` に届いたら 1 へ戻さず止める）。
+    /// 次のseq（1から。`u32::MAX`に届いたら1へ戻さず止める）。
     pub(crate) fn next_seq(last: u32) -> u32 {
         last.saturating_add(1).clamp(1, u32::MAX - 1)
     }
@@ -84,22 +85,22 @@ pub enum CaptureError {
     NoDelay,
 }
 
-/// `on_input` の結果。`Accepted` 以外は、中身を 1 つも使わずに捨てた。
+/// `on_input`の結果。`Accepted`以外は中身を1つも使わずに捨てた。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvOutcome {
-    /// 受け入れた。`new_words` は新しく入ったワードの数、`conflicts` はもう持っている apply_frame に違うワードが来た数（最初のワードを守る）。
+    /// 受け入れた。`new_words`は新しく入ったワードの数。`conflicts`はもう持っているapply_frameに違うワードが来た数（最初のワードを守る）。
     Accepted { new_words: u8, conflicts: u8 },
-    /// 自分より 1 つ前の seg の INPUT。`reply` なら相手はまだ前の seg のワードを待っているので `build_prev_input()` を送り返す。
+    /// 自分より1つ前のsegのINPUT。`reply`なら相手はまだ前のsegのワードを待っているので`build_prev_input()`を送り返す。
     PrevSeg { reply: bool },
-    /// 自分と違う seg。
+    /// 自分と違うseg。
     OtherSeg,
-    /// ホストが受けた、frame 0 の lat を載せた INPUT（丸ごと捨てる。ゲストの lat は要求で frame ≥ 1 なので、frame 0 は取り決めの違反）。
+    /// ホストが受けたframe 0のlatを載せたINPUT（丸ごと捨てる。ゲストのlatは要求でframe ≥ 1なのでframe 0は取り決めの違反）。
     GuestLat,
-    /// base が受理期間の外。
+    /// baseが受理期間の外。
     OutOfWindow,
-    /// ack が、自分がまだ送っていない apply_frame を指す（正しい相手なら起きない）。
+    /// ackが自分のまだ送っていないapply_frameを指す（正しい相手なら起きない）。
     AckAhead,
-    /// 切替の delay が 0〜9 の外。rollback のゲストでは、lat が無い・frame が 0 でない・D と違う値も。
+    /// 切替のdelayが0〜9の外。rollbackのゲストではlatが無い・frameが0でない・Dと違う値も。
     BadLat,
 }
 
@@ -108,83 +109,91 @@ pub struct Applied {
     pub frame: u32,
     pub local: u16,
     pub remote: u16,
-    /// このフレームで latency の切替を使ったら、その新しい delay（capture_frame frame+1 から効く）。
+    /// このフレームでlatencyの切替を使ったらその新しいdelay（capture_frame frame+1から効く）。
     pub switched_to: Option<u8>,
 }
 
-/// 目に見えない食い違いの数（ログに出す）。どれも正しい相手なら 0。
+/// 目に見えない食い違いの数（ログに出す）。どれも正しい相手なら0。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stats {
     pub conflicts: u32,
-    /// 使い終えたフレームを指す、使ったものと違う切替が届いた数（両者が食い違う兆し）。
+    /// 使い終えたフレームを指す切替のうち使ったものと違うものが届いた数（両者が食い違う兆し）。
     pub lat_late: u32,
-    /// 使う前の切替を持っている間に、別の切替が届いた数（最初の方を守った）。
+    /// 使う前の切替を持っている間に別の切替が届いた数（最初の方を守った）。
     pub lat_conflicts: u32,
-    /// delay を減らしたときに捨てた自分の取得の数（k 回。食い違いではない）。
+    /// delayを減らしたときに捨てた自分の取得の数（k回。食い違いではない）。
     pub discarded_captures: u32,
-    /// ゲスト: Ctrl＋数字で要求した数（`DelayPress::Asked`）/ 届いた印を見ずに `WISH_FRAMES` で諦めた数。
+    /// ゲスト: Ctrl＋数字で要求した数（`DelayPress::Asked`）/ 通った切替を受けずに`WISH_FRAMES`で諦めた数。
     pub wish_sent: u32,
     pub wish_expired: u32,
-    /// ホスト: ゲストの要求を取った数 / 前に受けた seq 以下なので lat だけ無視した数（ゲストが同じ要求を重ねて送ってきた分）。
+    /// ホスト: ゲストの要求を取った数 / 前に受けたseq以下なのでlatだけ無視した数（ゲストが同じ要求を重ねて送ってきた分）。
     pub wish_taken: u32,
     pub wish_dup: u32,
     /// ホスト: 押下・要求の値を切替に結び付けた数 / 前の切替を使い終えていないので次の取得へ回した数（`Busy`）。
     pub want_bound: u32,
     pub want_busy: u32,
-    /// ホスト: seg の始まりの見直しで、素の推奨値なら遅れが替わるのに、変わりにくくして据え置いた数。
+    /// ホスト: segの始まりの見直しで素の推奨値なら遅れが替わるところを、変わりにくくして据え置いた数。
     pub auto_held: u32,
 }
 
-/// マッチの中の lockstep（1 接続に 1 つ）。
+/// マッチの中のlockstep（1接続に1つ）。
 ///
-/// - 自分の列は apply_frame `seg_start_delay` から `local_next` の手前まで途切れずに並ぶ（取得のたびに 1 ワード。latency の切替の境目では k ワード埋める / 取得を捨てる）。相手の列は `remote_next`（= 送る ack）の手前まで全部届いている。
-///   先のワードが先に届いたらリングに保持しておき、穴が埋まったら ack を進める。相手の ack（`peer_ack`）より前の自分のワードは送らない。送る INPUT は `peer_ack` から最大 32 ワード。
-/// - latency の切替: ホストの `request_delay(new)` は次に列へ入る自分の取得（apply_frame a）に結び付き、`LatChange { frame: a, delay: new }` として相手の ack が a を越えるまで毎回の INPUT に載る。両者ともフレーム a を使うとき（`advance`）に delay を替え、capture_frame a+1 から新しい delay で取る。
-/// - 両者が変える: `press_delay(x)` で、ホストは値を `want` に設定し（後勝ち）、次の `capture` の先頭で `request_delay` へ渡す。ゲストは要求（`Wish`）を毎回の INPUT の lat に載せ、ホストは seq が前より大きければ 1 回だけ取り、範囲（`delay_pick::bounds`）に詰めて `want` に設定する。
-///   frame 0 のゲストの lat は取り決めの違反として INPUT ごと捨てる（`GuestLat`）。遅延の増分: マッチ中の入力は 0。
-/// - seg の境目: `begin_seg` は、その時点で送るはずだった INPUT（前の seg の未確認のワード。32 ワードまで）を 1 つだけ取っておく。先に抜けた側がこれを返さないと、前の seg の最後のワードを待つ相手が止まったままになるので、`on_input` が `PrevSeg { reply: true }` を返したら送り返す（マッチの場面を出るときも `begin_seg` して返し続ける）。
+/// - 自分の列はapply_frame `seg_start_delay`から`local_next`の手前まで途切れずに並ぶ（取得のたびに1ワード。latencyの切替の境目ではkワード埋める / 取得を捨てる）。
+///   相手の列は`remote_next`（= 送るack）の手前まで全部届いている。
+///   先のワードが先に届いたらリングに保持しておき、穴が埋まったらackを進める。
+///   相手のack（`peer_ack`）より前の自分のワードは送らない。送るINPUTは`peer_ack`から最大32ワード。
+/// - latencyの切替: ホストの`request_delay(new)`は次に列へ入る自分の取得（apply_frame a）に結び付く。
+///   結び付いた切替は`LatChange { frame: a, delay: new }`として、相手のackがaを越えるまで毎回のINPUTに載る。
+///   両者ともフレームaを使うとき（`advance`）にdelayを替え、capture_frame a+1から新しいdelayで取る。
+/// - 両者が変える: `press_delay(x)`でホストは値を`want`に設定し（後勝ち）、次の`capture`の先頭で`request_delay`へ渡す。
+///   ゲストは要求（`Wish`）を毎回のINPUTのlatに載せる。
+///   ホストはseqが前より大きければ1回だけ取り、範囲（`delay_pick::bounds`）に詰めて`want`に設定する。
+///   frame 0のゲストのlatは取り決めの違反としてINPUTごと捨てる（`GuestLat`）。遅延の増分: マッチ中の入力は0。
+/// - segの境目: `begin_seg`はその時点で送るはずだったINPUT（前のsegの未確認のワード。32ワードまで）を1つだけ取っておく。
+///   先に抜けた側がこれを返さないと、前のsegの最後のワードを待つ相手が止まったままになる。
+///   そのため`on_input`が`PrevSeg { reply: true }`を返したら送り返す（マッチの場面を出るときも`begin_seg`して返し続ける）。
 #[derive(Debug, Clone)]
 pub struct Lockstep {
     role: Role,
     seg: u16,
-    /// いま有効な delay（0〜9）。seg をまたいで引き継ぐ。
+    /// いま有効なdelay（0〜9）。segをまたいで引き継ぐ。
     delay: u8,
-    /// この seg に入ったときの delay。apply_frame がこれより小さいフレームは両者とも 0。
+    /// このsegに入ったときのdelay。apply_frameがこれより小さいフレームは両者とも0。
     seg_start_delay: u8,
     frame: u32,
     captured: bool,
     local: Ring,
     local_next: u32,
     remote: Ring,
-    /// 相手から次に要る apply_frame（送る ack）。
+    /// 相手から次に要るapply_frame（送るack）。
     remote_next: u32,
-    /// 相手から届いた ack のうち最大のもの（それより前の自分のワードは相手が持っている）。
+    /// 相手から届いたackのうち最大のもの（それより前の自分のワードは相手が持っている）。
     peer_ack: u32,
-    /// ホスト: まだ取得に結び付いていない切替の要求（新しい delay）。
+    /// ホスト: まだ取得に結び付いていない切替の要求（新しいdelay）。
     request: Option<u8>,
-    /// 両者がフレーム a で使う切替（ホスト: 結び付けたもの / ゲスト: 受け取ったもの）。
+    /// 両者がフレームaで使う切替（ホスト: 結び付けたもの / ゲスト: 受け取ったもの）。
     pending: Option<LatChange>,
-    /// ホスト: INPUT に載せ続ける切替（相手の ack が a を越えるまで）。
+    /// ホスト: INPUTに載せ続ける切替（相手のackがaを越えるまで）。
     carry: Option<LatChange>,
-    /// ホスト: 最後に結び付けた切替と、そのときの旧 delay（Busy の判定用）。
+    /// ホスト: 最後に結び付けた切替とそのときの旧delay（Busyの判定用）。
     last_bound: Option<(LatChange, u8)>,
     /// 最後に使った切替（重複して届いた同じ切替を見分ける）。
     last_applied: Option<LatChange>,
-    /// 前の seg のバックアップ（`begin_seg` の時点の `build_input()`）。
+    /// 前のsegのバックアップ（`begin_seg`の時点の`build_input()`）。
     prev: Option<Input>,
-    /// 前の seg で自分が使ったフレームの数。相手が要るのは apply_frame < prev_end だけ。
+    /// 前のsegで自分が使ったフレームの数。相手が要るのは apply_frame < prev_end だけ。
     prev_end: u32,
     stats: Stats,
-    /// ホスト: 次の取得で `request_delay` に渡す値（自分の押下とゲストの要求。後勝ち）。seg をまたいで持つ。
+    /// ホスト: 次の取得で`request_delay`に渡す値（自分の押下とゲストの要求。後勝ち）。segをまたいで持つ。
     want: Option<u8>,
-    /// ホスト: 最後に取ったゲストの要求の seq（接続の間。seg で戻さない）。
+    /// ホスト: 最後に取ったゲストの要求のseq（接続の間。segで戻さない）。
     last_wish_seq: u32,
-    /// ゲスト: 載せている要求と、最後に使った seq。
+    /// ゲスト: 載せている要求と最後に使ったseq。
     wish: Option<Wish>,
     wish_seq: u32,
-    /// ゲスト: 受けた切替の数（要求が通ったかを見る印）。
+    /// ゲスト: 受けた切替の数。要求が通ったかどうかの判定に使う。
     switch_gen: u32,
-    /// ホスト: auto の旗と seg の始まりの見直しの規則（`delay_pick::AutoHold`。接続ごとに 1 つ）と、呼び手が最後に渡した推奨値。
+    /// ホスト: autoの旗とsegの始まりの見直しの規則（`delay_pick::AutoHold`。接続ごとに1つ）と呼び出し側が最後に渡した推奨値。
     auto: AutoHold,
     rec: Option<Recommend>,
 }
@@ -243,8 +252,9 @@ impl Lockstep {
         self.last_applied = None;
     }
 
-    /// 形式の切替で、この機械がマッチを動かす側に替わるとき（最初の取得の前）。遅れを新しい値 `d` にして seg の始まりを作り直す（`begin_seg` と
-    /// 同じ形。バックアップ `prev` は触らない）。押下・要求は切替の前の値なので捨てる。
+    /// 形式の切替でこのステートマシンがマッチを動かす側に替わるとき（最初の取得の前）の処理。
+    /// 遅れを新しい値`d`にしてsegの始まりを作り直す（`begin_seg`と同じ形。バックアップ`prev`は触らない）。
+    /// 押下・要求は切替の前の値なので捨てる。
     pub fn restart_head(&mut self, d: u8, auto: bool) {
         let d = d.min(MAX_DELAY);
         self.delay = d;
@@ -285,7 +295,7 @@ impl Lockstep {
         self.frame
     }
 
-    /// 相手から次に要る apply_frame（送る ack）。peer_sim の「付いていく」形が、相手がどのフレームまで取ったかを見るのに使う。
+    /// 相手から次に要るapply_frame（送るack）。peer_simの「付いていく」形が、相手がどのフレームまで取ったかを見るのに使う。
     pub fn remote_next(&self) -> u32 {
         self.remote_next
     }
@@ -302,19 +312,19 @@ impl Lockstep {
     pub fn shown_delay(&self) -> u8 {
         let mine = match self.role {
             Role::Host => self.want.or(self.request),
-            // auto の要求は値ではない（9 を画面に出さない）。
+            // autoの要求は値ではない（9を画面に出さない）。
             Role::Guest => self.wish.map(|w| w.x).filter(|&x| x != AUTO),
         };
         mine.or(self.pending.map(|sw| sw.delay))
             .unwrap_or(self.delay)
     }
 
-    /// 遅れの量の押下（両者。上の「両者が変える」）。ホストは次の取得で切替に結び付け、ゲストはホストへ要求する。
+    /// 遅れの量の押下（両者。上の「両者が変える」）。ホストは次の取得で切替に結び付ける。ゲストはホストへ要求する。
     pub fn press_delay(&mut self, x: u8) -> DelayPress {
         self.press_delay_forced(x, false)
     }
 
-    /// `press_delay` の、同じ値でも要求するバージョン（ゲストだけが見る `force`）。
+    /// 同じ値でも要求するバージョンの`press_delay`（ゲストだけが見る`force`）。
     pub fn press_delay_forced(&mut self, x: u8, force: bool) -> DelayPress {
         if x > MAX_DELAY {
             return DelayPress::Refused;
@@ -355,7 +365,7 @@ impl Lockstep {
         }
     }
 
-    /// ホスト: 押した瞬間・ゲストの auto の要求で、素の推奨値を `want` に設定する。推奨値が無ければ何もしない（旗は立ったまま）。
+    /// ホスト: 押した瞬間・ゲストのautoの要求で素の推奨値を`want`に設定する。推奨値が無ければ何もしない（旗は立ったまま）。
     fn auto_now(&mut self) -> DelayPress {
         match self.auto.pick_now(self.rec) {
             Some(x) => self.want_auto(x),
@@ -363,8 +373,8 @@ impl Lockstep {
         }
     }
 
-    /// ホスト: seg の始まりの最初の取得で、旗が立っていれば遅れを見直して `want` に設定する（今の目標は上げにくく・下げにくく）。マッチの途中では
-    /// 呼ばない。
+    /// ホスト: segの始まりの最初の取得で旗が立っていれば遅れを見直して`want`に設定する（今の目標は上げにくく・下げにくく）。
+    /// マッチの途中では呼ばない。
     fn auto_head(&mut self) {
         if let Some(p) = self.auto.pick_head(self.shown_delay(), self.rec) {
             if p.held {
@@ -374,7 +384,7 @@ impl Lockstep {
         }
     }
 
-    /// auto が決めた値 `x` を `want` に設定する。今の目標と同じ値なら何も出さない。
+    /// autoが決めた値`x`を`want`に設定する。今の目標と同じ値なら何も出さない。
     fn want_auto(&mut self, x: u8) -> DelayPress {
         if self.shown_delay() == x {
             return DelayPress::Unchanged;
@@ -387,7 +397,7 @@ impl Lockstep {
         self.wish.map(|w| w.x)
     }
 
-    /// ホスト: auto の旗が立っているか。ゲストは常に false（ゲストの画面に出す旗は `HOST_STATE` で知る）。
+    /// ホスト: autoの旗が立っているかどうか。ゲストは常にfalse（ゲストの画面に出す旗は`HOST_STATE`で知る）。
     pub fn auto_on(&self) -> bool {
         self.auto.is_on()
     }
@@ -401,7 +411,7 @@ impl Lockstep {
         self.rec
     }
 
-    /// ホスト: 持っている値（押下・要求）を切替に結び付ける（`capture` の先頭）。`Busy` なら持ったまま、ほかは捨てる。
+    /// ホスト: 持っている値（押下・要求）を切替に結び付ける（`capture`の先頭）。`Busy`なら持ったまま。ほかは捨てる。
     fn bind_want(&mut self) {
         let Some(w) = self.want else {
             return;
@@ -416,7 +426,7 @@ impl Lockstep {
         }
     }
 
-    /// ゲスト: 新しい切替を受けた・取得を 1 つ進めた後に、要求をやめるかを見る（押した後の切替で値が同じ / 回数の上限）。
+    /// ゲスト: 新しい切替を受けた・取得を1つ進めた後に要求をやめるかどうかを見る（押した後の切替で値が同じ / 回数の上限）。
     fn settle_wish(&mut self, captured: bool) {
         let Some(mut w) = self.wish else {
             return;
@@ -446,9 +456,11 @@ impl Lockstep {
         self.captured
     }
 
-    /// latency の切替を要求する（ホストだけ）。次に列へ入る自分の取得に結び付く。まだ結び付いていない要求があれば置き換える。
-    /// 前の切替（フレーム a、旧 delay o）の間は `Busy`: 自分がまだ a を使っていない / 相手の ack が a を越えていない（INPUT に載る切替はいつも 1 つ）/
-    /// 相手のワード a+o+1 がまだ届いていない（このワードは相手が capture_frame a+1 以降に作るので、届いていれば相手も a を使い終えている。これが無いと、ゲストは使う前の切替を 2 つ持ちうる）。
+    /// latencyの切替を要求する（ホストだけ）。次に列へ入る自分の取得に結び付く。まだ結び付いていない要求があれば置き換える。
+    /// 前の切替（フレームa・旧delay o）の間は`Busy`を返す。次のどれかのとき:
+    /// 自分がまだaを使っていない / 相手のackがaを越えていない（INPUTに載る切替はいつも1つ）/ 相手のワードa+o+1がまだ届いていない。
+    /// 最後の条件のワードは相手がcapture_frame a+1以降に作るので、届いていれば相手もaを使い終えている。
+    /// この条件が無いとゲストは使う前の切替を2つ持ちうる。
     pub fn request_delay(&mut self, new: u8) -> Result<(), LatError> {
         if self.role != Role::Host {
             return Err(LatError::NotHost);
@@ -473,15 +485,17 @@ impl Lockstep {
         Ok(())
     }
 
-    /// フレーム `frame()` の自分の入力を取る（1 フレームに 1 回）。切替の境目では、apply_frame が自分の列の次より先（delay が k 増えた）なら、隙間の k 個を直前のワードで埋めてから入れる（0 で埋めると押し続けている
-    /// 射撃が k フレーム離れたことになる）。自分の列の次より手前（delay が k 減った）なら、この取得を捨てる。
-    /// 捨てた取得に切替の要求は結び付けない（相手がもう持っているワードに切替を後から載せても、相手はそれを見ずに a を越えうる）。
+    /// フレーム`frame()`の自分の入力を取る（1フレームに1回）。
+    /// 切替の境目でapply_frameが自分の列の次より先（delayがk増えた）のときは、隙間のk個を直前のワードで埋めてから列に追加する。
+    /// 0で埋めると押し続けている射撃がkフレーム離れたことになる。
+    /// 自分の列の次より手前（delayがk減った）のときは、この取得を捨てる。
+    /// 捨てた取得に切替の要求は結び付けない（相手がもう持っているワードに切替を後から載せても相手はそれを見ずにaを越えうる）。
     pub fn capture(&mut self, local: u16) -> Result<(), CaptureError> {
         if self.captured {
             return Err(CaptureError::AlreadyCaptured);
         }
         if self.role == Role::Host {
-            // auto の旗が立っていれば、seg の最初の取得でその時点の推奨値で見直す（マッチの途中では追わない）。
+            // autoの旗が立っていればsegの最初の取得でその時点の推奨値で見直す（マッチの途中では追わない）。
             if self.auto.is_on() && self.frame == 0 {
                 self.auto_head();
             }
@@ -494,7 +508,7 @@ impl Lockstep {
             self.settle_wish(true);
             return Ok(());
         }
-        // 相手がまだ持っていない自分のワードと、まだ使っていない自分のワードを上書きしない。
+        // 相手がまだ持っていない自分のワードとまだ使っていない自分のワードを上書きしない。
         let oldest_needed = self.frame.min(self.peer_ack);
         if apply - oldest_needed >= RING as u32 {
             return Err(CaptureError::Full);
@@ -535,7 +549,7 @@ impl Lockstep {
             seg: self.seg,
             ack: self.remote_next,
             base,
-            // ホスト: 相手の ack が a を越えるまで載せる。ゲスト: 要求を、やめるまで毎回載せる。
+            // ホスト: 相手のackがaを越えるまで載せる。ゲスト: 要求をやめるまで毎回載せる。
             lat: match self.role {
                 Role::Host => self.carry.filter(|sw| sw.frame >= self.peer_ack),
                 Role::Guest => self.wish.map(|w| LatChange {
@@ -549,7 +563,7 @@ impl Lockstep {
         }
     }
 
-    /// 前の seg のバックアップ（`on_input` が `PrevSeg { reply: true }` を返したときに送る）。
+    /// 前のsegのバックアップ（`on_input`が`PrevSeg { reply: true }`を返したときに送る）。
     pub fn build_prev_input(&self) -> Option<Input> {
         self.prev
     }
@@ -557,15 +571,15 @@ impl Lockstep {
     pub fn on_input(&mut self, inp: &Input) -> RecvOutcome {
         if inp.seg != self.seg {
             if self.prev.is_some_and(|p| p.seg == inp.seg) {
-                // 相手の ack が自分が使い終えたフレームに届いていなければ、相手はまだ前の seg の自分のワードを待っている。バックアップの終わりで
-                // 比べると、使われない先のワードを互いに待ち合い、バックアップどうしが返信し合って止まらない。
+                // 相手のackが自分の使い終えたフレームに届いていなければ、相手はまだ前のsegの自分のワードを待っている。
+                // バックアップの終わりで比べると使われない先のワードを互いに待ち合い、バックアップどうしが返信し合って止まらない。
                 return RecvOutcome::PrevSeg {
                     reply: inp.ack < self.prev_end,
                 };
             }
             return RecvOutcome::OtherSeg;
         }
-        // ゲストの lat は要求（frame = seq ≥ 1）。frame 0 は取り決めの違反として丸ごと捨てる。
+        // ゲストのlatは要求（frame = seq ≥ 1）。frame 0は取り決めの違反として丸ごと捨てる。
         if self.role == Role::Host && inp.lat.is_some_and(|l| l.frame == 0) {
             return RecvOutcome::GuestLat;
         }
@@ -591,7 +605,7 @@ impl Lockstep {
         }
 
         let n = (inp.count as usize).min(MAX_WORDS);
-        // 先のワードを置けるのは、まだ使っていないワードの枠を上書きしない範囲だけ（frame + RING の手前）。
+        // 先のワードを置けるのはまだ使っていないワードの枠を上書きしない範囲だけ（frame + RING の手前）。
         let limit = self.frame.saturating_add(RING as u32);
         let mut new_words = 0u8;
         let mut conflicts = 0u8;
@@ -664,7 +678,7 @@ impl Lockstep {
         self.last_wish_seq = l.frame;
         self.stats.wish_taken = self.stats.wish_taken.saturating_add(1);
         if l.delay == AUTO {
-            // ゲストの auto: 旗を立てて、素の推奨値をすぐ使う（変わりにくくするのは seg の始まりの見直しだけ）。
+            // ゲストのauto: 旗を立てて素の推奨値をすぐ使う（変わりにくくするのはsegの始まりの見直しだけ）。
             self.auto.raise();
             self.auto_now();
         } else {
@@ -689,7 +703,7 @@ impl Lockstep {
         }
     }
 
-    /// `frame()` で要る相手のワードが、もう届いているか。delay 方式の dll が、フレームの始まりで相手のワードを待つかを決めるのに使う。
+    /// `frame()`で要る相手のワードがもう届いているかどうか。delay方式のdllがフレームの始まりで相手のワードを待つかどうかを決めるのに使う。
     pub fn remote_ready(&self) -> bool {
         self.remote_word(self.frame).is_some()
     }
@@ -734,23 +748,24 @@ pub fn by_seat(my_seat: Seat, local: u16, remote: u16) -> (u16, u16) {
     }
 }
 
-// 2 台の模型（検査の中だけで使う）。
+// 2台の模型（検査の中だけで使う）。
 #[cfg(test)]
 #[path = "testnet.rs"]
 mod testnet;
 
 #[cfg(test)]
 mod tests {
-    //! golden trace は手で書いた表と同期で回した 2 台の出力を比べる。2 台の模型（`testnet.rs`）は決め打ちのロス列と固定 seed の乱数列で、
+    //! golden traceでは2台を同期で回した出力を手で書いた表と比べる。
+    //! 2台の模型（`testnet.rs`）は決め打ちのロス列と固定seedの乱数列で動かす。
     //! 両台の記録・ロスの無い走行・台本から組んだ参照の列が一致することを見る。
     use super::testnet::{self, Fate, Kind, Outcome, Rec, Scenario, SendInfo};
     use super::*;
 
     type FateBox = Box<dyn FnMut(&SendInfo) -> Fate>;
-    /// 切替の表の 1 行: (ホストの local, ゲストの local, switched_to, ホストの INPUT に lat があったか)。
+    /// 切替の表の1行: (ホストのlocal, ゲストのlocal, switched_to, ホストのINPUTにlatがあったか)。
     type SwitchRow = (u16, u16, Option<u8>, bool);
 
-    // ---------- 同期の 2 台（表の検査用） ----------
+    // ---------- 同期の2台（表の検査用） ----------
 
     struct SyncFrame {
         ia: Input,
@@ -780,8 +795,8 @@ mod tests {
         }
     }
 
-    // ---------- golden trace（latency 0 と 3） ----------
-    // 台 A = ホスト・席 2P、台 B = ゲスト・席 1P。表の列: フレーム / 送った INPUT / 受信 / 適用（A の local, remote）/ リプレイ（1P, 2P）。
+    // ---------- golden trace（latency 0と3） ----------
+    // 台A = ホスト・サイド2P、台B = ゲスト・サイド1P。表の列: フレーム / 送ったINPUT / 受信 / 適用（Aのlocal, remote）/ リプレイ（1P, 2P）。
     const A_SCRIPT: [u16; 10] = [
         0x0001, 0x0003, 0x0002, 0x0010, 0x0011, 0x0040, 0x0041, 0x0080, 0x0081, 0x0004,
     ];
@@ -818,7 +833,7 @@ mod tests {
         Row { frame: 9, base: 8, count: 2, a_words: [0x0081, 0x0004], b_words: [0x0280, 0x0300], ack: 9, recv_new: 1, a_local: 0x0004, a_remote: 0x0300, p1: 0x0300, p2: 0x0004 },
     ];
 
-    // latency 3: apply_frame 0〜2 は両者 0（送らない。ack は 3 から）。capture_frame f のワードはフレーム f+3 で使う。
+    // latency 3: apply_frame 0〜2は両者0（送らない。ackは3から）。capture_frame fのワードはフレームf+3で使う。
     #[rustfmt::skip]
     const GOLDEN_L3: [Row; 10] = [
         Row { frame: 0, base: 3, count: 1, a_words: [0x0001, 0], b_words: [0x0200, 0], ack: 3, recv_new: 1, a_local: 0, a_remote: 0, p1: 0, p2: 0 },
@@ -907,7 +922,7 @@ mod tests {
         b.advance().unwrap();
         assert_eq!(a.frame(), 1);
         assert!(a.remote_ready(), "B の frame 0 のワードは届いている");
-        // A だけが frame 1 を取って先へ進む。frame 2 で要るワードは B が frame 1 で取るワード（apply 2）で、B が取る前は届いていない。
+        // Aだけがframe 1を取って先へ進む。frame 2で要るワードはBがframe 1で取るワード（apply 2）。これはBが取る前は届いていない。
         a.capture(0x33).unwrap();
         a.advance().unwrap();
         assert_eq!(a.frame(), 2);
@@ -939,7 +954,7 @@ mod tests {
         assert_eq!((got.local, got.remote), (1, 9), "最初の取得が残る");
     }
 
-    // ---------- latency の切替の境目（手で書いた表） ----------
+    // ---------- latencyの切替の境目（手で書いた表） ----------
 
     fn h(c: u32) -> u16 {
         0x1000 + c as u16
@@ -948,7 +963,7 @@ mod tests {
         0x2000 + c as u16
     }
 
-    /// 同期で回し、ホストが `req_at` の取得の前に `request_delay(new)` する。各フレームの `SwitchRow` を返す。
+    /// 同期で回す。ホストが`req_at`の取得の前に`request_delay(new)`する。各フレームの`SwitchRow`を返す。
     fn sync_switch_run(
         delay: u8,
         frames: u32,
@@ -976,8 +991,9 @@ mod tests {
 
     #[test]
     fn switch_table_2_to_4() {
-        // delay 2、フレーム 5 の取得に切替（a = 5+2 = 7、新 delay 4）。captures 0〜7 は旧 2 で
-        // apply 2〜9、capture 8 は新 4 で apply 12。隙間の 10・11 は apply 9 のワード（capture 7）で埋まる。
+        // delay 2、フレーム5の取得に切替（a = 5+2 = 7、新delay 4）。
+        // captures 0〜7は旧2でapply 2〜9、capture 8は新4でapply 12。
+        // 隙間の10・11はapply 9のワード（capture 7）で埋まる。
         let (rows, _, _) = sync_switch_run(2, 16, 5, 4);
         #[rustfmt::skip]
         let want: [SwitchRow; 16] = [
@@ -991,9 +1007,9 @@ mod tests {
             (0x1005, 0x2005, Some(4), false), // f7  = a。ここで切り替える
             (0x1006, 0x2006, None,    false), // f8
             (0x1007, 0x2007, None,    false), // f9  = capture 7（旧 delay の最後）
-            (0x1007, 0x2007, None,    false), // f10 埋め（直前のワード）
-            (0x1007, 0x2007, None,    false), // f11 埋め（直前のワード）
-            (0x1008, 0x2008, None,    false), // f12 = capture 8（新 delay 4）
+            (0x1007, 0x2007, None,    false), // f10埋め（直前のワード）
+            (0x1007, 0x2007, None,    false), // f11埋め（直前のワード）
+            (0x1008, 0x2008, None,    false), // f12 = capture 8（新delay 4）
             (0x1009, 0x2009, None,    false), // f13
             (0x100A, 0x200A, None,    false), // f14
             (0x100B, 0x200B, None,    false), // f15
@@ -1003,24 +1019,25 @@ mod tests {
 
     #[test]
     fn switch_table_4_to_1() {
-        // delay 4、フレーム 3 の取得に切替（a = 7、新 delay 1）。captures 0〜7 は apply 4〜11、
-        // capture 8・9・10 は apply 9・10・11 で送り済みと重なるので捨てる（k = 3）。capture 11 → 12。
+        // delay 4、フレーム3の取得に切替（a = 7、新delay 1）。
+        // captures 0〜7はapply 4〜11。
+        // capture 8・9・10はapply 9・10・11で送り済みと重なるので捨てる（k = 3）。capture 11 → 12。
         let (rows, a, b) = sync_switch_run(4, 16, 3, 1);
         #[rustfmt::skip]
         let want: [SwitchRow; 16] = [
-            (0,      0,      None,    false), // f0 穴埋め
+            (0,      0,      None,    false), // f0穴埋め
             (0,      0,      None,    false), // f1
             (0,      0,      None,    false), // f2
-            (0,      0,      None,    true),  // f3 この取得（capture 3, apply 7）に切替が載る
-            (0x1000, 0x2000, None,    true),  // f4 = capture 0。ゲストの ack が 7 を越えるまで載せる
-            (0x1001, 0x2001, None,    false), // f5（ゲストの ack はフレーム 4 の交換で 8）
+            (0,      0,      None,    true),  // f3この取得（capture 3, apply 7）に切替が載る
+            (0x1000, 0x2000, None,    true),  // f4 = capture 0。ゲストのackが7を越えるまで載せる
+            (0x1001, 0x2001, None,    false), // f5（ゲストのackはフレーム4の交換で8）
             (0x1002, 0x2002, None,    false), // f6
             (0x1003, 0x2003, Some(1), false), // f7 = a
             (0x1004, 0x2004, None,    false), // f8
             (0x1005, 0x2005, None,    false), // f9
             (0x1006, 0x2006, None,    false), // f10
-            (0x1007, 0x2007, None,    false), // f11 = capture 7（旧 delay の最後）
-            (0x100B, 0x200B, None,    false), // f12 = capture 11（8・9・10 は捨てた）
+            (0x1007, 0x2007, None,    false), // f11 = capture 7（旧delayの最後）
+            (0x100B, 0x200B, None,    false), // f12 = capture 11（8・9・10は捨てた）
             (0x100C, 0x200C, None,    false), // f13
             (0x100D, 0x200D, None,    false), // f14
             (0x100E, 0x200E, None,    false), // f15
@@ -1086,7 +1103,7 @@ mod tests {
         }
         assert_eq!((a.delay(), b.delay()), (6, 6));
 
-        // 捨てる取得の最中に要求が通る場合（ゲストが先に進んでいて、Busy が先に解ける）: 次の捨てられない取得まで待つ。
+        // 捨てる取得の最中に要求が通る場合（ゲストが先に進んでいてBusyが先に解ける）: 次の捨てられない取得まで待つ。
         let mut a = Lockstep::new(Role::Host, 4);
         let mut b = Lockstep::new(Role::Guest, 4);
         for f in 0..10u32 {
@@ -1095,7 +1112,7 @@ mod tests {
             }
             sync_frame(&mut a, &mut b, h(f), g(f));
         }
-        b.capture(g(10)).unwrap(); // apply 11 は送り済み ⇒ 捨てる
+        b.capture(g(10)).unwrap(); // apply 11は送り済み ⇒ 捨てる
         assert!(b.advance().is_some());
         b.capture(g(11)).unwrap(); // apply 12
         assert!(matches!(
@@ -1106,7 +1123,7 @@ mod tests {
         a.capture(h(10)).unwrap(); // apply 11 ⇒ 捨てる。要求は結び付かない
         assert_eq!(a.pending_switch(), None);
         b.on_input(&a.build_input());
-        assert!(a.advance().is_some()); // フレーム 10
+        assert!(a.advance().is_some()); // フレーム10
         a.capture(h(11)).unwrap(); // apply 12 ⇒ ここに結び付く
         assert_eq!(
             a.pending_switch(),
@@ -1117,7 +1134,7 @@ mod tests {
         );
         b.on_input(&a.build_input());
         a.on_input(&b.build_input());
-        let (x, y) = (a.advance().unwrap(), b.advance().unwrap()); // フレーム 11
+        let (x, y) = (a.advance().unwrap(), b.advance().unwrap()); // フレーム11
         assert_eq!((x.local, x.remote), (y.remote, y.local));
         assert_eq!(
             b.pending_switch(),
@@ -1175,9 +1192,9 @@ mod tests {
         }
     }
 
-    // ---------- 参照の列（送り手の規則を素朴に書いたもの） ----------
+    // ---------- 参照の列（送信側の規則を素朴に書いたもの） ----------
 
-    /// 台 `node` の seg `seg` の apply_frame 0..len のワード。`switches` は (使ったフレーム a, 新 delay)。
+    /// 台`node`のseg `seg`のapply_frame 0..lenのワード。`switches`は (使ったフレームa, 新delay)。
     fn reference_list(
         node: usize,
         seg: u16,
@@ -1189,7 +1206,7 @@ mod tests {
         let mut d = u32::from(start_delay);
         let mut c = 0u32;
         while (list.len() as u32) < len {
-            // capture_frame c の delay: a < c の切替は使い終えている（a+1 から新しい delay）。
+            // capture_frame cのdelay: a < c の切替は使い終えている（a+1 から新しいdelay）。
             for &(a, nd) in switches {
                 if a + 1 == c {
                     d = u32::from(nd);
@@ -1209,7 +1226,7 @@ mod tests {
         list
     }
 
-    /// 模型の結果を検証する: 走り切った / 両台の記録が同じ / 参照の列と同じ / 食い違いの数が 0。
+    /// 模型の結果を検証する: 走り切った / 両台の記録が同じ / 参照の列と同じ / 食い違いの数が0。
     fn assert_run(sc: &Scenario, out: &Outcome, label: &str) {
         assert!(
             out.finished,
@@ -1270,9 +1287,9 @@ mod tests {
         testnet::run(sc, &mut |_| Fate::Deliver)
     }
 
-    // ---------- 2 台の模型: 決め打ちのロス列 ----------
+    // ---------- 2台の模型: 決め打ちのロス列 ----------
 
-    /// 決め打ちのロス列（名前・何発いじるはずか・fate）。F = フレーム 20 の取得の直後に、各台が相手へ送る INPUT。
+    /// 決め打ちのロス列（名前・何発いじるはずか・fate）。F = フレーム20の取得の直後に各台が相手へ送るINPUT。
     fn scripted_fates() -> Vec<(&'static str, u32, FateBox)> {
         const F: u32 = 20;
         let first_at = |i: &SendInfo, from: usize, f: u32| {
@@ -1368,7 +1385,7 @@ mod tests {
         }
     }
 
-    // ---------- 2 台の模型: 固定 seed の乱数列 ----------
+    // ---------- 2台の模型: 固定seedの乱数列 ----------
 
     #[test]
     fn model_random_losses_3000_frames() {
@@ -1417,7 +1434,7 @@ mod tests {
             (0, 500, 9),
             (0, 700, 0),
             (1, 50, 4),
-            (1, 997, 8), // a = 997 + 4 = 1001。seg 1 は 999 まで ⇒ 使われない
+            (1, 997, 8), // a = 997 + 4 = 1001。seg 1は999まで ⇒ 使われない
             (2, 10, 2),
             (2, 400, 6),
         ];
@@ -1466,7 +1483,7 @@ mod tests {
         }
     }
 
-    // ---------- 2 台の模型: latency の切替 ----------
+    // ---------- 2台の模型: latencyの切替 ----------
 
     #[test]
     fn model_switches_with_lat_packet_loss_dup_reorder() {
@@ -1544,8 +1561,8 @@ mod tests {
         }
         a.request_delay(5).unwrap(); // capture 10 ⇒ a1 = 13
         sync_frame(&mut a, &mut b, h(10), g(10));
-        a.on_input(&b.build_input()); // ゲストの ack 14（a1 を越えた）がホストに届く
-        // ゲストは 11 を取ったところで遅れる。ホストだけ 11〜13 を使い、13 で切り替える。
+        a.on_input(&b.build_input()); // ゲストのack 14（a1を越えた）がホストに届く
+        // ゲストは11を取ったところで遅れる。ホストだけ11〜13を使い、13で切り替える。
         b.capture(g(11)).unwrap();
         for f in 11..14 {
             a.capture(h(f)).unwrap();
@@ -1562,8 +1579,8 @@ mod tests {
         );
         let second = a.request_delay(2);
         a.capture(h(14)).unwrap();
-        b.on_input(&a.build_input()); // ゲストが a1 を使う前に届く
-        a.on_input(&b.build_input()); // ゲストの ack が進み、ホストは切替を載せるのをやめる
+        b.on_input(&a.build_input()); // ゲストがa1を使う前に届く
+        a.on_input(&b.build_input()); // ゲストのackが進み、ホストは切替を載せるのをやめる
         let mut ra = Vec::new();
         let mut rb = Vec::new();
         for _ in 0..200 {
@@ -1602,7 +1619,7 @@ mod tests {
 
     #[test]
     fn model_back_to_back_switch_requests() {
-        // ホストが先に進んでいる（ロスと遅れで delay フレームまで先行しうる）ときに起きるので、同期の検査では出ない。
+        // ホストが先に進んでいる（ロスと遅れでdelayフレームまで先行しうる）ときに起きるので同期の検査では出ない。
         let pairs = [
             (7u8, 0u8),
             (9, 2),
@@ -1643,7 +1660,7 @@ mod tests {
     #[test]
     fn seg_switch_not_used_before_seg_change_is_dropped_by_both() {
         let mut sc = Scenario::new(3, 2, 60);
-        sc.requests = vec![(0, 58, 7)]; // a = 61。seg 0 は 59 まで
+        sc.requests = vec![(0, 58, 7)]; // a = 61。seg 0は59まで
         for (name, delay_lat) in [("ふつう", 0u64), ("lat が seg の後に届く", 400)] {
             let mut fate = move |i: &SendInfo| {
                 if i.has_lat && delay_lat > 0 {
@@ -1667,13 +1684,13 @@ mod tests {
 
     #[test]
     fn seg_boundary_needs_prev_reply() {
-        // バックアップを返さないバージョン（「違う seg は捨てる」だけ）では止まることを隣で見る。
+        // バックアップを返さないバージョン（「違うsegは捨てる」だけ）では止まることを隣で見る。
         for delay in [0u8, 2] {
             let per = 60u32;
             let mut sc = Scenario::new(delay, 2, per);
-            // ホストは読み込みをすぐ終えて新しい seg の INPUT を先に送る（ゲストはまだ前の seg）。
+            // ホストは読み込みをすぐ終えて新しいsegのINPUTを先に送る（ゲストはまだ前のseg）。
             sc.load_ms = [1, 300];
-            // ホストの seg 0 の最後のワードを全部落とす。バックアップの返信は 30 ms 遅らせ、その間に新しい seg の INPUT がゲストに着くようにする。
+            // ホストのseg 0の最後のワードを全部落とす。バックアップの返信は30 ms遅らせ、その間に新しいsegのINPUTがゲストに着くようにする。
             let cut = per - 1 - u32::from(delay);
             let mk = move || {
                 move |i: &SendInfo| {
@@ -1741,7 +1758,7 @@ mod tests {
         );
     }
 
-    // ---------- 毒標本 ----------
+    // ---------- 不正な入力のサンプル ----------
 
     fn warmed() -> (Lockstep, Lockstep) {
         let mut a = Lockstep::new(Role::Host, 0);
@@ -1771,7 +1788,7 @@ mod tests {
         let (mut a, _) = warmed();
         let e = a.build_input().ack;
         assert_eq!(e, 70);
-        let ack = a.build_input().base; // 相手の ack として正しい値
+        let ack = a.build_input().base; // 相手のackとして正しい値
         assert_eq!(
             a.on_input(&inp(0, ack, e + 65, &[1])),
             RecvOutcome::OutOfWindow
@@ -1781,7 +1798,7 @@ mod tests {
             RecvOutcome::OutOfWindow
         );
         assert_eq!(a.build_input().ack, e);
-        // 期間のちょうど端は受ける（効く期間）。e−64 は昔のワードのコピー（同じワードなら食い違いでない）。
+        // 期間のちょうど端は受ける（効く期間）。e−64は昔のワードのコピー（同じワードなら食い違いでない）。
         assert!(matches!(
             a.on_input(&inp(0, ack, e + 64, &[1])),
             RecvOutcome::Accepted { new_words: 1, .. }
@@ -1915,7 +1932,7 @@ mod tests {
         a.capture(h(71)).unwrap();
         assert_eq!(a.pending_switch(), None, "切替は使った後");
         assert_eq!(a.shown_delay(), 3, "試合の途中の推奨値の変化を追った");
-        // ゲストの画面の目標に 9 は出ない。要求は INPUT の lat の delay の欄に AUTO で載る。
+        // ゲストの画面の目標に9は出ない。要求はINPUTのlatのdelayのフィールドにAUTOで載る。
         assert_eq!(b.press_delay(AUTO), DelayPress::Asked { seq: 1 });
         assert_eq!(
             b.shown_delay(),
@@ -1966,8 +1983,9 @@ mod tests {
         assert_eq!(a4.shown_delay(), 0, "旗が降りているのに推奨値へ動いた");
     }
 
-    /// ホスト a・ゲスト b を順に回して（seg ごとに 40 フレーム）、各 seg の最後の遅れとホストの統計を返す。`recs` は seg ごとの推奨値、
-    /// `*_presses` は `(seg, x)`（その seg の最初の取得の前）。
+    /// ホストa・ゲストbを順に回して（segごとに40フレーム）各segの最後の遅れとホストの統計を返す。
+    /// `recs`はsegごとの推奨値。
+    /// `*_presses`は`(seg, x)`（そのsegの最初の取得の前）。
     fn auto_run(
         d0: u8,
         recs: &[crate::delay_pick::Recommend],
@@ -2016,18 +2034,19 @@ mod tests {
 
     #[test]
     fn the_delay_press_is_at_once_the_head_holds_and_a_number_lowers_the_flag() {
-        // 往復 34 ms（素 2・−5 ms の側 1）で今 1: ホストの 9 で 2（すぐ）。次の seg の始まりは 33 ms（素 1）の 1 回目なので 2 のまま、2 回目で 1、34 ms は上げない。
+        // 往復34 ms（素の推奨値2・−5 msの側1）で今1のとき: ホストが9を押すとすぐ2になる。
+        // 次のsegの始まりは33 ms（素の推奨値1）の1回目なので2のまま。2回目で1になる。34 msは上げない。
         let (ds, st) = auto_run(1, &rtt_recs(&[34, 33, 33, 34, 33, 33]), &[(0, AUTO)], &[]);
         assert_eq!(ds, vec![2, 2, 1, 1, 1, 1]);
         assert_eq!(
             st.auto_held, 2,
             "seg 1（素 1 の低い 1 回目）と seg 3（素 2 を上げの余裕で）: {st:?}"
         );
-        // ゲストの 9（要求）もすぐ素の推奨値: seg 1 で往復 34 ms・今 1 → 2。
+        // ゲストの9（要求）もすぐ素の推奨値: seg 1で往復34 ms・今1 → 2。
         let (ds, _) = auto_run(1, &rtt_recs(&[34, 34]), &[], &[(1, AUTO)]);
         assert_eq!(ds, vec![1, 2], "ゲストの要求が余裕つきで 1 のまま");
-        // 数字で旗が降りる: D 3 の 9（70 ms で素 3）、seg 2 の初めにホストが 3 を押すと旗が降り、33 ms が続いても 3。
-        // seg 4 の初めの 9 は素の推奨値（33 ms で 1）をすぐ使う。
+        // 数字で旗が降りる: D 3の9（70 msで素3）、seg 2の初めにホストが3を押すと旗が降り、33 msが続いても3。
+        // seg 4の初めの9は素の推奨値（33 msで1）をすぐ使う。
         let (ds, _) = auto_run(
             3,
             &rtt_recs(&[70, 33, 33, 33, 33]),
@@ -2035,13 +2054,13 @@ mod tests {
             &[],
         );
         assert_eq!(ds, vec![3, 3, 3, 3, 1]);
-        // ゲストの数字（要求）でもホストの旗が降りる: seg 1 でゲストが 2 を要求する。旗が降りていれば seg 2 以降は 33 ms が続いても 2、
-        // 降りていなければ seg 2 の始まりで 1 に下がる。
+        // ゲストの数字（要求）でもホストの旗が降りる: seg 1でゲストが2を要求する。
+        // 旗が降りていればseg 2以降は33 msが続いても2のまま。降りていなければseg 2の始まりで1に下がる。
         let (ds, _) = auto_run(3, &rtt_recs(&[70, 33, 33, 33]), &[(0, AUTO)], &[(1, 2)]);
         assert_eq!(ds, vec![3, 2, 2, 2]);
     }
 
-    // ---------- 2 台の模型: ゲストの要求 ----------
+    // ---------- 2台の模型: ゲストの要求 ----------
 
     #[test]
     fn model_guest_wishes_switch_both_sides_with_loss_dup_reorder() {

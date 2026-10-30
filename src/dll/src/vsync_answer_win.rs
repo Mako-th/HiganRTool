@@ -1,9 +1,11 @@
-//! `[pacing] vsync`: ゲームが custom.exe の「垂直同期を取らない」を読む 2 か所（`call 0x42ed50`。起動の設定の読み込み `0x42FB4D`・
-//! 起動の計測の終わりの判定 `0x42F2AD`）を自前の入口へ向け、答えを ini の値で替える（`higanr_core::pacing::Vsync::vsync_off`）。
-//! 保存されている値 `[0x4B3550]` には書かないので、`th09.cfg` の書き出しは custom.exe の値のまま。アドレスと期待バイト列は `th09_addr.rs` の「フルスクリーンの垂直同期」の節。
+//! `[pacing] vsync`: ゲームがcustom.exeの「垂直同期を取らない」を読む2か所を自前の入口へ向け、答えをiniの値で差し替える（`higanr_core::pacing::Vsync::vsync_off`）。
+//! 対象の呼び出しは`call 0x42ed50`で、起動の設定の読み込み`0x42FB4D`と起動時の計測の終わりの判定`0x42F2AD`にある。
+//! 保存されている値`[0x4B3550]`には書かない。そのため`th09.cfg`の書き出しはcustom.exeの値のまま。
+//! アドレスと期待バイト列は`th09_addr.rs`の「フルスクリーンの垂直同期」の節。
 //!
-//! 書くのは DllMain の中（`win::on_process_attach`。主スレッドは設定の読み込みまで走っていない）。ローダーロックの下なので ini はここで読まず、
-//! 入口が最初に呼ばれたとき（`0x42FB4D`。起動の途中の主スレッド）に 1 回だけ読む。2 行のどちらかが合わなければ 1 バイトも書かない。
+//! 書き込みはDllMainの中で行う（`win::on_process_attach`。主スレッドは設定の読み込みまで走っていない）。
+//! ローダーロックの下なのでiniはここで読まない。入口が最初に呼ばれたとき（`0x42FB4D`。起動の途中の主スレッド）に1回だけ読む。
+//! 2行のどちらかが合わなければ1バイトも書かない。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -30,7 +32,7 @@ use crate::th09_addr::{
 use crate::win::module_path;
 
 static MODULE: AtomicUsize = AtomicUsize::new(0);
-/// ini の `[pacing] vsync`（初めて呼ばれたときに 1 回だけ読む）。
+/// iniの`[pacing] vsync`（初めて呼ばれたときに1回だけ読む）。
 static SETTING: OnceLock<Vsync> = OnceLock::new();
 
 #[cfg(test)]
@@ -56,12 +58,12 @@ fn emit(line: String, detail_only: bool) {
     }
 }
 
-/// 2 か所の `call 0x42ed50` を自前の入口へ向ける。**DllMain から呼ぶ**。失敗してもロードは止めない（custom.exe の設定のまま）。
+/// 2か所の`call 0x42ed50`を自前の入口へ向ける。**DllMainから呼ぶ**。失敗してもロードは止めない（custom.exeの設定のまま）。
 pub fn install(module: HMODULE) {
     MODULE.store(module as usize, Ordering::Relaxed);
     let r = catch_unwind(AssertUnwindSafe(|| {
-        // 他のスレッドを止めずに書くので、主スレッドが起動の設定の読み込みへ来る前（デバイスがまだ無い）でなければ書かない。
-        // 計測の終わりの判定 `0x42F2AD` は、プロセスの中でデバイスを作り直すたびにまた走る。
+        // 他のスレッドを止めずに書く。そのため主スレッドが起動の設定の読み込みへ来る前（デバイスがまだ無い間）でなければ書かない。
+        // 計測の終わりの判定`0x42F2AD`はプロセスの中でデバイスを作り直すたびにまた走る。
         let mut env = RealHook::new();
         let mut cell = [0u8; 4];
         if !env.read_code(D3D8_DEVICE_PTR, &mut cell) {
@@ -89,7 +91,7 @@ fn entry_address() -> u32 {
     vsync_answer_entry as *const () as usize as u32
 }
 
-/// 照合と書き込みに使うコードの読み書き（本物は `RealHook`。検査は 2 行が収まる大きさの偽物）。
+/// 照合と書き込みに使うコードの読み書き（本物は`RealHook`。検査は2行が収まる大きさの偽物）。
 trait CodeMem {
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> bool;
     fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<WriteDone, u32>;
@@ -104,7 +106,7 @@ impl<T: HookEnv> CodeMem for T {
     }
 }
 
-/// 全部の行を読んで照合し、全部合ったときだけ各行の `call` の 5 バイトを書く。書いた後に読み直して検証する。
+/// 全部の行を読んで照合し、全部合ったときだけ各行の`call`の5バイトを書く。書いた後に読み直して検証する。
 fn install_at(env: &mut dyn CodeMem, sites: &[SiteDef], entry: u32) -> Result<String, String> {
     for s in sites {
         let mut seen = vec![0u8; s.expected.len()];
@@ -137,7 +139,7 @@ fn install_at(env: &mut dyn CodeMem, sites: &[SiteDef], entry: u32) -> Result<St
             }
         };
         if let Some(why) = failed {
-            // 前の行に書いた call を元のバイト列へ戻す（片方だけ替わった形を残さない）。
+            // 前の行に書いたcallを元のバイト列へ戻す（片方だけ替わった形を残さない）。
             let mut undone = true;
             for (p, &pat) in sites[..i].iter().zip(&VSYNC_ANSWER_CALL_AT) {
                 let off = (pat - p.addr) as usize;
@@ -183,7 +185,7 @@ fn load_setting() -> Vsync {
             return pace::DEFAULT_VSYNC;
         }
     };
-    // `read_net_ini` は読めない行を捨てた本文を返す（捨てた行の注はペースの側が本ログに出す）。
+    // `read_net_ini`は読めない行を捨てた本文を返す（捨てた行の注はペースの側が本ログに出す）。
     match higanr_core::ini::parse(&text).map_err(|e| e.to_string()) {
         Ok(ini) => match pace::mode_from_ini(&ini) {
             Ok(c) => c.vsync,
@@ -213,7 +215,7 @@ fn saved_word_addr() -> u32 {
     }
 }
 
-/// 答えの行（1 起動に 1 回。保存値と違う答えのときは簡潔にも出す）。
+/// 答えの行（1起動に1回。保存値と違う答えのときは簡潔にも出す）。
 static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn note_answer(f: Vsync, saved: bool, answer: bool) {
@@ -232,11 +234,11 @@ fn note_answer(f: Vsync, saved: bool, answer: bool) {
     );
 }
 
-/// 差し替えた呼びの入口（cdecl、引数なし。元の `0x42ED50` は ecx = Supervisor の this で、どちらの地点でも `0x4B3100`）。
-/// 0 か 1 を返す。ebx・esi・edi・ebp は cdecl の約束で保たれ、ecx・edx は呼んだ後に読まれない。FPU には触らない。
-/// ini の読みとログは最初の 1 回だけで、パニックは受けて保存値のままの答えを返す。
+/// 差し替えた呼び出しの入口（cdecl・引数なし）。元の`0x42ED50`はecxにSupervisorのthisを受け取る。その値はどちらの地点でも`0x4B3100`。
+/// 0か1を返す。ebx・esi・edi・ebpはcdeclの約束で保たれる。ecx・edxは呼んだ後に読まれない。FPUには触らない。
+/// iniの読み込みとログは最初の1回だけ。パニックは受けて保存値のままの答えを返す。
 extern "C" fn vsync_answer_entry() -> u32 {
-    // SAFETY: `[0x4B3550]` は Supervisor の中の 4 バイト（.data。読める）。元の関数も同じ語を読む。
+    // SAFETY: `[0x4B3550]`はSupervisorの中の4バイト（.data。読み取り可能）。元の関数も同じワードを読む。
     let word = unsafe { core::ptr::read_volatile(saved_word_addr() as usize as *const u32) };
     let saved = word & VSYNC_OFF_BIT != 0;
     let r = catch_unwind(AssertUnwindSafe(|| {
@@ -260,7 +262,7 @@ mod tests {
         TEST_LINES.with(|l| l.borrow().clone())
     }
 
-    /// 答えの表は game=保存値・on=0・off=1。bit 0x20 以外を見ない。ebx / esi / edi / ebp / esp を変えない。
+    /// 答えの表はgame=保存値・on=0・off=1。bit 0x20以外を見ない。ebx / esi / edi / ebp / espを変えない。
     #[test]
     fn entry_answers_by_the_setting_and_never_writes_the_saved_word() {
         let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -398,7 +400,7 @@ mod tests {
                 .any(|c| (*c + 1..*c + 5).contains(a))),
             "call の rel32 の外を書いた: {changed:X?}"
         );
-        // 2 か所目の書き込みが失敗したら、1 か所目も元のバイト列に戻っている（片方だけ替わった形を残さない）。
+        // 2か所目の書き込みが失敗したら1か所目も元のバイト列に戻っている（片方だけ替わった形を残さない）。
         let mut f = fresh();
         f.fail_at = Some(VSYNC_ANSWER_CALL_AT[1]);
         let before = f.mem.clone();

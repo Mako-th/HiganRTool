@@ -1,28 +1,37 @@
-//! 戻り道（`return_flow`）が読むアドレスを、戻り道を動かさない実機の検証の `_menu.csv` で照らす（pure）。
+//! 戻り道（`return_flow`）が読むアドレスを`_menu.csv`で照らす（pure）。
+//! 照らす相手は戻り道を動かさない実機の検証の記録。
 //!
 //! 読むのは一時停止のメニュー（`0x4D66F8`）と終わりのメニュー（`0x4D8C00`）の状態・フレームの数え、一時停止の旗、終わりのメニューの印。
-//! DLL の読み取りのスレッドが約 1 ms ごとに読み、変わったときだけ（開発用のビルドはフレームの数えが変わるたびに）`_menu.csv` に 1 行書く（`higanrtool_dll::menu`）。行の `seq_after` は、読んだ直後までに入力の地点が通った数（= ゲームの tick の通し番号）。
-//! 照らすことは `Finding::check` の名前（前半が一時停止 `pause` / 終わりのメニュー `end`）のとおり: 状態の範囲（`state_range`）・移り方が逆アセンブルで読んだ表（`PAUSE_MOVES` / `END_MOVES`）の中か（`transitions`）・入力のゲートと数えのリセット（`gate` / `frames_reset`）・閉じるまでの `CLOSE_FRAMES` tick（`pause.close_delay`）・数えが tick より速く進まないこと（`frames_vs_ticks`）・求めた移りが全部見えたか（`coverage`）・1 回目の一時停止の移りの列（`pause.first_moves`）。
-//! 母数 0 は「測れていない」: 求めたのに区間が 1 つも無いときは `Status::NotMeasured` で、合格に数えない。
-//! 合否（`Report::not_all_passed`）を決めるのは、求めた区間・求めた検査の結果だけ。求めていない区間の結果は照らして出すが数えない。
+//! DLLの読み取りのスレッドが約1 msごとに読む。
+//! 変わったときだけ（開発用のビルドはフレームの数えが変わるたびに）`_menu.csv`に1行書く（`higanrtool_dll::menu`）。
+//! 行の`seq_after`は読んだ直後までに入力の地点が通った数（= ゲームのtickの通し番号）。
+//! 照らす項目は`Finding::check`の名前のとおり（前半が一時停止`pause` / 終わりのメニュー`end`）。
+//! - 状態の範囲（`state_range`）。
+//! - 移り方が逆アセンブルで読んだ表（`PAUSE_MOVES` / `END_MOVES`）の中かどうか（`transitions`）。
+//! - 入力のゲートと数えのリセット（`gate` / `frames_reset`）。
+//! - 閉じるまでの`CLOSE_FRAMES` tick（`pause.close_delay`）。
+//! - 数えがtickより速く進まないこと（`frames_vs_ticks`）。
+//! - 求めた移りが全部見えたかどうか（`coverage`）。
+//! - 1回目の一時停止の移りの列（`pause.first_moves`）。
+//! 母数0は「測れていない」: 求めたのに区間が1つも無いときは`Status::NotMeasured`で合格に数えない。
+//! 合否（`Report::not_all_passed`）を決めるのは求めた区間・求めた検査の結果だけ。求めていない区間の結果は照らして出すが数えない。
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
 
 use crate::return_flow::{MENU_READ_FRAMES, end_menu, pause};
 
-/// `_menu.csv` の見出し。`t_us` は読み取りのスレッドが始まってからの µs（QueryPerformanceCounter）。
-/// 末尾の 6 欄が一時停止と終わりのメニュー（`parse_menu_csv` が列の名前で引く）。書き手は `higanrtool_dll::menu`。
+/// `_menu.csv`のヘッダ。`t_us`は読み取りのスレッドが始まってからのµs（QueryPerformanceCounter）。
+/// 末尾の6フィールドが一時停止と終わりのメニュー（`parse_menu_csv`が列の名前で取得する）。書き手は`higanrtool_dll::menu`。
 pub const MENU_CSV_HEADER: &str = "seq_before,seq_after,t_us,menu_ptr,screen_id,substate,cursor,prev_screen,transitioning,anim,p1_ptr,p1_life,p2_ptr,p2_life,replay_ptr,replay_counter,replay_mode,gui_ptr,gui_talk,pause_flag,pause_state,pause_frames,end_flag,end_state,end_frames";
 
 pub use crate::return_flow::CLOSE_FRAMES;
-/// tick の数えの許容（読むのは 1 ms ごとで、1 tick の途中で読みうる）。
+/// tickの数えの許容（読むのは1 msごとで1 tickの途中で読みうる）。
 const TICK_SLACK: u32 = 1;
 
-/// 一時停止の状態の移り（`0x00434740`）。(から, へ, 数えをリセットするか)。
-/// 出どころ: 0→1 `0x00434878`・1→2 `0x00434911` / `0x00434936`・1→3 `0x0043497F`・2→1 `0x00434A20` / `0x00434A4F`・
-/// 2→5 `0x00434ABD`・5→4 / 4→5 `0x00434BF2` / `0x00434CF6`・5→2 `0x00434D62`・4→8 `0x00434C4E`。
-/// 3→0 / 8→0 は閉じる呼びの途中（状態を 0 にしてから旗を下ろす 2 命令の間 `0x00434AD2`〜`0x00434AD8`）で読んだときの行。
+/// 一時停止の状態の移り（`0x00434740`）。(移り元, 移り先, 数えをリセットするかどうか)。
+/// 出どころ: 0→1 `0x00434878`・1→2 `0x00434911` / `0x00434936`・1→3 `0x0043497F`・2→1 `0x00434A20` / `0x00434A4F`・2→5 `0x00434ABD`・5→4 / 4→5 `0x00434BF2` / `0x00434CF6`・5→2 `0x00434D62`・4→8 `0x00434C4E`。
+/// 3→0 / 8→0は閉じる呼び出しの途中（状態を0にしてから旗を下ろす2命令の間`0x00434AD2`〜`0x00434AD8`）で読んだときの行。
 const PAUSE_MOVES: [(u32, u32, bool); 11] = [
     (pause::INIT, pause::RESUME, true),
     (pause::RESUME, pause::TITLE, false),
@@ -37,14 +46,15 @@ const PAUSE_MOVES: [(u32, u32, bool); 11] = [
     (pause::LEAVING, pause::INIT, false),
 ];
 
-/// Esc（`0x0043474B push $0x8`）と Q（`0x004347AD push $0x200`）は、どの状態からでも 3 / 8 へ数えをリセットして、入力のゲートなしで移る。
+/// Esc（`0x0043474B push $0x8`）とQ（`0x004347AD push $0x200`）はどの状態からでも3 / 8へ数えをリセットして入力のゲートなしで移る。
 fn pause_shortcut(to: u32) -> bool {
     to == pause::RESUMING || to == pause::LEAVING
 }
 
-/// 終わりのメニューの状態の移り（`0x004355F0`）。上下は循環。出どころ: 1→3 `0x00435715`・1→2 `0x0043573A`・1→4 `0x0043577F`・
-/// 2→1 `0x0043585E`・2→3 `0x00435883`・3→2 `0x0043597D`・3→1 `0x004359A2`。2→5 / 3→6 は決定（`0x00435A00` 前後）。
-/// 4→0 / 5→0 / 6→0 は閉じる呼びの途中（状態を 0 にしてから旗を下ろす 2 命令の間 `0x00435A1E` / `0x00435A3A` → `0x00435A4A`）で読んだときの行。
+/// 終わりのメニューの状態の移り（`0x004355F0`）。上下は循環。
+/// 出どころ: 1→3 `0x00435715`・1→2 `0x0043573A`・1→4 `0x0043577F`・2→1 `0x0043585E`・2→3 `0x00435883`・3→2 `0x0043597D`・3→1 `0x004359A2`。
+/// 2→5 / 3→6は決定（`0x00435A00`前後）。
+/// 4→0 / 5→0 / 6→0は閉じる呼び出しの途中（状態を0にしてから旗を下ろす2命令の間`0x00435A1E` / `0x00435A3A` → `0x00435A4A`）で読んだときの行。
 const END_MOVES: [(u32, u32, bool); 13] = [
     (end_menu::INIT, end_menu::REMATCH, true),
     (end_menu::REMATCH, end_menu::SAVE, false),
@@ -61,7 +71,7 @@ const END_MOVES: [(u32, u32, bool); 13] = [
     (6, end_menu::INIT, false),
 ];
 
-/// 台本が通すと求める移り（`Expect`）。一時停止: 再開と「タイトルへ戻る」の往復・確認の枠の「いいえ」「はい」の往復と「いいえ」の決定・再開の確定。
+/// 台本の操作で起きることを求める移り（`Expect`）。一時停止: 再開と「タイトルへ戻る」の往復・確認の枠の「いいえ」「はい」の往復と「いいえ」の決定・再開の確定。
 pub const PAUSE_REQUIRED: [(u32, u32); 8] = [
     (pause::INIT, pause::RESUME),
     (pause::RESUME, pause::TITLE),
@@ -84,8 +94,9 @@ pub const END_REQUIRED: [(u32, u32); 8] = [
     (end_menu::REMATCH, 4),
 ];
 
-/// 台本の 1 回目の一時停止（開いた直後の下 → 下 → 上 → Esc）で、旗が立っている間に起きる状態の移りの列。開いた直後の下は数えが
-/// `MENU_READ_FRAMES` に届く前なので効かず、効けば 1→2 の後に 2→1・1→2・2→3 と続いて列が変わる。
+/// 台本の1回目の一時停止（開いた直後の下 → 下 → 上 → Esc）で旗が立っている間に起きる状態の移りの列。
+/// 開いた直後の下は数えが`MENU_READ_FRAMES`に届く前なので効かない。
+/// 効けば1→2の後に2→1・1→2・2→3と続いて列が変わる。
 pub const PAUSE_FIRST_MOVES: [(u32, u32); 4] = [
     (pause::INIT, pause::RESUME),
     (pause::RESUME, pause::TITLE),
@@ -100,7 +111,7 @@ struct Menu {
     frames: Option<u32>,
 }
 
-/// `_menu.csv` の 1 行（照らすのに要る欄だけ）。
+/// `_menu.csv`の1行（照らすのに要るフィールドだけ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
     pub seq_before: u32,
@@ -114,13 +125,13 @@ pub struct Row {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    /// 見出しの行が無い。
+    /// ヘッダの行が無い。
     NoHeader,
-    /// 要る列が見出しに無い（古いバージョンの `_menu.csv`）。
+    /// 要る列がヘッダに無い（古いバージョンの`_menu.csv`）。
     MissingColumn(&'static str),
-    /// 行 `line`（1 から）の列 `column` が数として読めない。
+    /// 行`line`（1から）の列`column`が数として読めない。
     BadNumber { line: usize, column: &'static str },
-    /// 行 `line` の欄の数が見出しと違う。
+    /// 行`line`のフィールドの数がヘッダと違う。
     Width { line: usize },
 }
 
@@ -154,7 +165,7 @@ const COLUMNS: [&str; 11] = [
     "end_frames",
 ];
 
-/// `_menu.csv` を読む。見出しの行は列の名前で引く（列の並びに依らない）。空の欄は「読めなかった」で `None`。
+/// `_menu.csv`を読む。列はヘッダの名前で取得する（列の並びに依らない）。空のフィールドは「読めなかった」で`None`。
 pub fn parse_menu_csv(text: &str) -> Result<Vec<Row>, ParseError> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut lines = text.lines().enumerate();
@@ -193,7 +204,7 @@ pub fn parse_menu_csv(text: &str) -> Result<Vec<Row>, ParseError> {
         let seq = |k: usize| -> Result<u32, ParseError> {
             num(k)?.and_then(|v| u32::try_from(v).ok()).ok_or(bad(k))
         };
-        // 状態・数えは `(x as i32)` で書かれる。想定の外の値も落とさず `u32` に直して持つ（範囲の検査が見る）。
+        // 状態・数えは`(x as i32)`で書かれる。想定の外の値も捨てずに`u32`に直して持つ（範囲の検査が見る）。
         let un = |k: usize| num(k).map(|o| o.map(|v| v as u32));
         let sn = |k: usize| num(k).map(|o| o.map(|v| v as i32));
         rows.push(Row {
@@ -221,7 +232,7 @@ pub fn parse_menu_csv(text: &str) -> Result<Vec<Row>, ParseError> {
 pub enum Status {
     Pass,
     Fail,
-    /// 測れていない（母数 0・列が空）。合格に数えない。
+    /// 測れていない（母数0・列が空）。合格に数えない。
     NotMeasured,
     /// 合否にしない記録。
     Info,
@@ -232,20 +243,20 @@ pub struct Finding {
     pub check: String,
     pub status: Status,
     pub detail: String,
-    /// 合否に数えるか。求めていない区間の結果は照らして出すが数えない。
+    /// 合否に数えるかどうか。求めていない区間の結果は照らして出すが数えない。
     pub counts: bool,
 }
 
-/// 何を求めるか。`false` の区間は、あれば照らして結果を出すが、合否には数えない。
+/// 何を求めるか。`false`の区間はあれば照らして結果を出すが合否には数えない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Expect {
-    /// 一時停止の `PAUSE_REQUIRED` の移りが全部見えること。
+    /// 一時停止の`PAUSE_REQUIRED`の移りが全部見えること。
     pub pause: bool,
-    /// 終わりのメニューの `END_REQUIRED` の移りが全部見えること。
+    /// 終わりのメニューの`END_REQUIRED`の移りが全部見えること。
     pub end: bool,
-    /// 1 回目の一時停止の移りの列が `PAUSE_FIRST_MOVES` と一致すること（`pause` を求めなくても、これだけ求められる）。
+    /// 1回目の一時停止の移りの列が`PAUSE_FIRST_MOVES`と一致すること（`pause`を求めなくてもこれだけ求められる）。
     pub pause_first: bool,
-    /// 最後の行の画面とカーソル（戻り道の到着: 画面 6・カーソル 4）。
+    /// 最後の行の画面とカーソル（戻り道の到着: 画面6・カーソル4）。
     pub final_screen: Option<(u32, i32)>,
 }
 
@@ -263,7 +274,7 @@ impl Report {
             .any(|f| f.counts && f.status == Status::Fail)
     }
 
-    /// 求めたものが落ちた、か測れていない。合格に数えない。求めていない区間の結果は数えない。
+    /// 求めたものが落ちたとき、または測れていないとき真。測れていないものは合格に数えない。求めていない区間の結果は数えない。
     pub fn not_all_passed(&self) -> bool {
         self.findings
             .iter()
@@ -336,13 +347,13 @@ impl Kind {
         }
     }
 
-    /// 近道（どの状態からでも、数えをリセットして、入力のゲートなしで移る）か。
+    /// 近道（どの状態からでも数えをリセットして入力のゲートなしで移る）かどうか。
     fn shortcut(self, to: u32) -> bool {
         self == Kind::Pause && pause_shortcut(to)
     }
 }
 
-/// 旗が立っている行の連なり `rows[first..=last]`。`close` は旗が下りた最初の行。
+/// 旗が立っている行の連なり`rows[first..=last]`。`close`は旗が下りた最初の行。
 #[derive(Debug, Clone, Copy)]
 struct Episode {
     first: usize,
@@ -391,8 +402,9 @@ struct Move {
     new_frames: u32,
 }
 
-/// 区間の状態の移り。旗が立った直後の最初の行は前の値が残っていることがある（メニューの関数が 1 回も走っていない）ので、
-/// 状態が `INIT` のときだけ起点にし、そうでなければ 2 行目から数える。読めない行は飛ばす。
+/// 区間の状態の移り。
+/// 旗が立った直後の最初の行は前の値が残っていることがある（メニューの関数が1回も走っていない）。
+/// そのため状態が`INIT`のときだけ起点にし、そうでなければ2行目から数える。読めない行は飛ばす。
 fn moves_of(rows: &[Row], ep: &Episode, kind: Kind) -> Vec<Move> {
     let mut out = Vec::new();
     let mut prev: Option<(u32, u32)> = None;
@@ -420,7 +432,7 @@ fn moves_of(rows: &[Row], ep: &Episode, kind: Kind) -> Vec<Move> {
     out
 }
 
-/// 結果 1 件。落ちた詳細が無ければ `pass_text`、あれば詳細を並べて `Fail`。
+/// 結果1件。落ちた詳細が無ければ`pass_text`、あれば詳細を並べて`Fail`。
 fn verdict(out: &mut Vec<Finding>, kind: Kind, suffix: &str, bad: &[String], pass_text: String) {
     let (status, detail) = if bad.is_empty() {
         (Status::Pass, pass_text)
@@ -510,7 +522,7 @@ fn check_moves(
                 continue;
             }
         };
-        // 入力で動く移り（0→1 は自動）は、前の状態のフレームの数えが読み始めの数え以上。近道は数えを問わない。
+        // 入力で動く移り（0→1は自動）は前の状態のフレームの数えが読み始めの数え以上。近道は数えを問わない。
         if m.from != 0 && m.prev_frames < MENU_READ_FRAMES {
             if shortcut {
                 shortcut_early += 1;
@@ -521,7 +533,8 @@ fn check_moves(
                 ));
             }
         }
-        // リセットする移りは新しい状態の最初の行の数えが 0 か 1（0 にして、同じ呼びの終わりで 1 足す）、しない移りは数えが続く。
+        // リセットする移りは新しい状態の最初の行の数えが0か1になる（0にして同じ呼び出しの終わりで1足す）。
+        // リセットしない移りは数えが続く。
         let ok = if reset {
             m.new_frames <= 1 + TICK_SLACK
         } else {
@@ -568,7 +581,7 @@ fn check_moves(
     seen
 }
 
-/// 数えは tick より速く進まない（1 tick に 1 回の更新）。
+/// 数えはtickより速く進まない（1 tickに1回の更新）。
 fn check_ticks(rows: &[Row], eps: &[Episode], kind: Kind, out: &mut Vec<Finding>) {
     let mut too_fast = Vec::new();
     for ep in eps {
@@ -602,7 +615,7 @@ fn check_ticks(rows: &[Row], eps: &[Episode], kind: Kind, out: &mut Vec<Finding>
     );
 }
 
-/// 再開の確定（3）かタイトルへ（8）に入ってから旗が下りるまで `CLOSE_FRAMES` tick。下りた行の状態は 0。
+/// 再開の確定（3）かタイトルへ（8）に入ってから旗が下りるまで`CLOSE_FRAMES` tick。下りた行の状態は0。
 fn check_close(rows: &[Row], eps: &[Episode], out: &mut Vec<Finding>) {
     let (mut bad, mut seen) = (Vec::new(), 0usize);
     for ep in eps {
@@ -657,7 +670,7 @@ fn check_close(rows: &[Row], eps: &[Episode], out: &mut Vec<Finding>) {
     }
 }
 
-/// 区間ごとの照らし。求めていない区間（`want` が偽）の結果は出すが、合否に数えない。
+/// 区間ごとに照らす。求めていない区間（`want`が偽）の結果は出すが合否に数えない。
 fn judge_kind(rows: &[Row], kind: Kind, want: bool, out: &mut Vec<Finding>) -> usize {
     let from = out.len();
     let n = judge_episodes(rows, kind, want, out);
@@ -724,7 +737,7 @@ fn judge_episodes(rows: &[Row], kind: Kind, want: bool, out: &mut Vec<Finding>) 
     eps.len()
 }
 
-/// 1 回目の一時停止の区間の移りの列が `PAUSE_FIRST_MOVES` と一致するか。閉じる呼びの途中で読んだ 3→0 の行は列の終わりから外す。
+/// 1回目の一時停止の区間の移りの列が`PAUSE_FIRST_MOVES`と一致するかどうか。閉じる呼び出しの途中で読んだ3→0の行は列の終わりから外す。
 fn check_first_moves(rows: &[Row], out: &mut Vec<Finding>) {
     let show = |v: &[(u32, u32)]| {
         v.iter()
@@ -771,7 +784,7 @@ fn check_first_moves(rows: &[Row], out: &mut Vec<Finding>) {
     note(out, Kind::Pause, "first_moves", status, detail);
 }
 
-/// `_menu.csv` の行を照らす。`want` で求めたものだけが合否に効く。
+/// `_menu.csv`の行を照らす。`want`で求めたものだけが合否に効く。
 pub fn judge(rows: &[Row], want: &Expect) -> Report {
     let mut findings = Vec::new();
     let p = judge_kind(rows, Kind::Pause, want.pause, &mut findings);

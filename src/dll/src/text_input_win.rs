@@ -1,12 +1,18 @@
-//! ルーム名の入力がウィンドウから文字を受ける仕組み（Win32 の層。判断は core の `room_input` と `net_menu`）。
+//! ルーム名の入力がウィンドウから文字を受ける仕組み（Win32の層。判断はcoreの`room_input`と`net_menu`）。
 //!
-//! ゲームのウィンドウの手続きを、文字（`WM_CHAR`）だけを横取りする手続きに差し替える（サブクラス化。自分のプロセスのウィンドウだけ）:
-//! - 入力の受信ソケット（`TextRing`）が閉じている間は何も貯めず、全部のメッセージを元の手続きへ素通しする。
-//! - 開いている間は `WM_CHAR` を貯め（ゲームへは渡さない）、入力の地点が 1 tick に 1 回 `drain` で取る。ウィンドウから IME も切り離す（開いたままだと、打った文字が変換の途中の文字になって `WM_CHAR` に来ない）。
+//! ゲームのウィンドウの手続きを別の手続きに差し替える（サブクラス化。自分のプロセスのウィンドウだけ）。
+//! 差し替えた手続きは文字（`WM_CHAR`）を横取りし、`WM_INPUT`と前面の喪失を`split_kb_win`へ知らせる。
+//! - 文字の受付（`TextRing`）が閉じている間は何も貯めず、全部のメッセージを元の手続きへ素通しする。
+//! - 開いている間は`WM_CHAR`を貯める（ゲームへは渡さない）。入力の地点が1 tickに1回`drain`で取る。ウィンドウからIMEも切り離す（開いたままだと打った文字が変換途中の文字になり`WM_CHAR`に来ない）。
 //!
-//! ウィンドウの手続きも入力の地点もゲームのスレッドで走るので、リングバッファの書き手も読み手も同じスレッド。それでも `head` / `tail` は Release / Acquire で進める。確保しない・待たない・パニックしない（ウィンドウの手続きは `catch_unwind` で包む）。
-//! 花映塚のメインループは `PeekMessageA`（`0x0042E672`）で取ったメッセージを必ず `TranslateMessage`（`0x0042E680`）→ `DispatchMessageA`（`0x0042E68A`）へ流すので `WM_CHAR` は作られ、打った文字は同じ frame の入力の地点より前に届く。
-//! ウィンドウの手続き `0x0042D3D0` は `WM_CLOSE`・`WM_ACTIVATEAPP`・`WM_ERASEBKGND`・`WM_SETCURSOR`・`0x3C9` を扱い、ほかは `DefWindowProcA` へ流す（`WM_CHAR` は何もされない）。ウィンドウは ANSI のウィンドウなので、`SetWindowLongPtrW` で Unicode の手続きに替えると `WM_CHAR` は UTF-16 の 1 単位で来る（元の手続きへは `CallWindowProcW` が ANSI に直して渡す）。
+//! ウィンドウの手続きも入力の地点もゲームのスレッドで走る。そのためリングバッファの書き手も読み手も同じスレッド。
+//! それでも`head` / `tail`はRelease / Acquireで進める。
+//! メモリ確保・待機・パニックはしない（ウィンドウの手続きは`catch_unwind`で包む）。
+//! 花映塚のメインループは`PeekMessageA`（`0x0042E672`）で取ったメッセージを必ず`TranslateMessage`（`0x0042E680`）→ `DispatchMessageA`（`0x0042E68A`）へ渡す。
+//! そのため`WM_CHAR`は作られ、打った文字は同じframeの入力の地点より前に届く。
+//! ウィンドウの手続き`0x0042D3D0`は`WM_CLOSE`・`WM_ACTIVATEAPP`・`WM_ERASEBKGND`・`WM_SETCURSOR`・`0x3C9`を扱う。ほかは`DefWindowProcA`へ渡す（`WM_CHAR`は何もされない）。
+//! ウィンドウはANSIのウィンドウなので`SetWindowLongPtrW`でUnicodeの手続きに替えると`WM_CHAR`はUTF-16の1単位で来る。
+//! 元の手続きへは`CallWindowProcW`がANSIに直して渡す。
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::panic::catch_unwind;
@@ -17,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, GWLP_WNDPROC, SetWindowLongPtrW, WM_CHAR, WNDPROC,
 };
 
-/// リングバッファの長さ（2 の冪）。台本が一度に入れる最大（Backspace 32 ＋ 文字 32 ＋ Enter = 65 単位）と人が打つ文字を足しても余る。溢れたら新しい文字を捨てる。
+/// リングバッファの長さ（2のべき乗）。台本が一度に書き込む最大（Backspace 32 ＋ 文字32 ＋ Enter = 65単位）と人が打つ文字を足してもまだ余裕がある。溢れたら新しい文字を捨てる。
 const RING_LEN: usize = 128;
 const _: () = assert!(RING_LEN.is_power_of_two());
 
@@ -38,7 +44,7 @@ impl TextRing {
         }
     }
 
-    /// 受信ソケットを開ける・閉じる。**どちらも貯まっている文字を捨てる**（次の入力へ持ち越さない）。読み手（ゲームのスレッド）から呼ぶ。
+    /// 受付を開ける・閉じる。**どちらも貯まっている文字を捨てる**（次の入力へ持ち越さない）。読み手（ゲームのスレッド）から呼ぶ。
     pub fn set_open(&self, on: bool) {
         self.tail
             .store(self.head.load(Ordering::Acquire), Ordering::Release);
@@ -49,7 +55,7 @@ impl TextRing {
         self.open.load(Ordering::Acquire)
     }
 
-    /// 文字を 1 つ貯める（書き手）。受信ソケットが閉じている・満杯なら貯めずに false。
+    /// 文字を1つ貯める（書き手）。受付が閉じている・満杯なら貯めずにfalse。
     pub fn push(&self, unit: u16) -> bool {
         if !self.is_open() {
             return false;
@@ -94,43 +100,47 @@ impl Default for TextRing {
 
 static RING: TextRing = TextRing::new();
 
-/// メッセージ 1 つが、受信ソケットの開いている入力の文字として横取りされるか。横取りしたら文字を貯める（`true` = 元の手続きへ渡さない）。
+/// メッセージ1つが入力の文字として横取りされるかどうか（横取りするのは受付が開いている間だけ）。横取りしたら文字を貯める（`true` = 元の手続きへ渡さない）。
 fn consume(ring: &TextRing, msg: u32, wparam: usize) -> bool {
     if msg != WM_CHAR || !ring.is_open() {
         return false;
     }
-    // 貯められなかった（満杯）文字も、入力の間はゲームへ渡さない。
+    // 貯められなかった（満杯）文字も入力の間はゲームへ渡さない。
     ring.push(wparam as u16);
     true
 }
 
 // ---- ウィンドウの手続きの差し替え ----
 
-/// 差し替える前のウィンドウの手続き（`SetWindowLongPtrW` が返したもの。0 = 差し替えていない）。
+/// 差し替える前のウィンドウの手続き（`SetWindowLongPtrW`が返したもの。0 = 差し替えていない）。
 static PREV_PROC: AtomicUsize = AtomicUsize::new(0);
 static HOOKED: AtomicUsize = AtomicUsize::new(0);
-/// 差し替えの結果: 0 = まだ試していない（ウィンドウが見つからなかったときも 0。次に開くときに探し直す）、1 = 差し替えた、
-/// 2 = 差し替えられなかった（ウィンドウは見つかったが断られた。同じウィンドウへ何度やっても同じなので二度は試さない）。
+/// 差し替えの結果。
+/// 0 = 未試行（ウィンドウが見つからなかったときも0。次に開くときに探し直す）。
+/// 1 = 差し替え済み。
+/// 2 = 差し替え失敗（ウィンドウは見つかったが断られた。同じウィンドウへ何度やっても同じなので二度は試さない）。
 static INSTALL: AtomicU32 = AtomicU32::new(INSTALL_NOT_TRIED);
-/// 直近の探索でゲームのウィンドウが見つからなかった（`install_text` が本ログの 1 行に書き分ける）。
+/// 直近の探索でゲームのウィンドウが見つからなかったかどうか（`install_text`が本ログの1行に書き分ける）。
 static NO_WINDOW: AtomicBool = AtomicBool::new(false);
 const INSTALL_NOT_TRIED: u32 = 0;
 const INSTALL_OK: u32 = 1;
 const INSTALL_FAILED: u32 = 2;
 static IME_OFF: AtomicBool = AtomicBool::new(false);
-/// 切り離す前の IME の文脈（`HIMC` の値。0 = 元から無かった）。
+/// 切り離す前のIMEの文脈（`HIMC`の値。0 = 元から無かった）。
 static SAVED_IMC: AtomicUsize = AtomicUsize::new(0);
 
 /// 差し替えたウィンドウの手続き。文字を横取りする以外は全部元の手続きへ渡す。
 ///
 /// # Safety
-/// Windows がウィンドウの手続きとして呼ぶ（引数は Windows が渡した値）。
+/// Windowsがウィンドウの手続きとして呼ぶ（引数はWindowsが渡した値）。
 unsafe extern "system" fn subclass_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // キーボードごとの押下の表（`split_kb_win`）へWM_INPUTと前面の喪失を知らせる。ゲーム自身の処理は止めない。
+    let _ = catch_unwind(|| crate::split_kb_win::on_message(msg, wparam, lparam));
     // パニックはウィンドウの手続きの外へ出さない。起きたら横取りしなかったことにして元へ渡す。
     let taken = catch_unwind(|| consume(&RING, msg, wparam)).unwrap_or(false);
     if taken {
@@ -138,11 +148,11 @@ unsafe extern "system" fn subclass_proc(
     }
     let prev = PREV_PROC.load(Ordering::Acquire);
     if prev == 0 {
-        // 差し替えの記録が無いのに呼ばれた（来ない見込み）。ウィンドウの既定の扱いへ。
-        // SAFETY: 引数は Windows が渡した、この手続きの引数そのもの。
+        // 差し替えの記録が無いのに呼ばれた（来ない見込み）。ウィンドウの既定の処理に任せる。
+        // SAFETY: 引数はWindowsが渡した、この手続きの引数そのもの。
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    // SAFETY: `prev` は `install_on` が保存した元のウィンドウの手続き（0 でない）。`CallWindowProcW` は ANSI の元の手続きへ必要な変換をして渡す。
+    // SAFETY: `prev`は`install_on`が保存した元のウィンドウの手続き（0でない）。`CallWindowProcW`はANSIの元の手続きへ必要な変換をして渡す。
     unsafe {
         CallWindowProcW(
             core::mem::transmute::<usize, WNDPROC>(prev),
@@ -156,7 +166,7 @@ unsafe extern "system" fn subclass_proc(
 
 fn install_on(hwnd: HWND) -> bool {
     let me = subclass_proc as *const () as usize;
-    // SAFETY: `hwnd` は自分のプロセスのウィンドウ、`me` は上の署名どおりの手続きで、この DLL が生きている間（注入された DLL は外れない）有効。戻り値は元の手続き（失敗は 0）。ウィンドウの手続きの差し替えは、ウィンドウを作ったスレッドに依らず同じプロセスの中なら通る。
+    // SAFETY: `hwnd`は自分のプロセスのウィンドウ。`me`は上の署名どおりの手続きで、このDLLが生きている間（注入されたDLLは外れない）有効。戻り値は元の手続き（失敗は0）。ウィンドウの手続きの差し替えは、ウィンドウを作ったスレッドに依らず同じプロセスの中なら通る。
     let prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, me as _) } as usize;
     if prev == 0 {
         INSTALL.store(INSTALL_FAILED, Ordering::Release);
@@ -168,8 +178,9 @@ fn install_on(hwnd: HWND) -> bool {
     true
 }
 
-/// 差し替えを済ませる（初めて受信ソケットを開けるときに 1 回）。差し替えられたら true。ウィンドウが見つからないときは何も覚えず（起動の直後など、次に探し直す）、
-/// 見つかったのに断られたときだけ覚えて二度は試さない。`find` はウィンドウの探し方。
+/// 差し替えを済ませる（初めて受付を開けるときに1回）。差し替えられたらtrue。
+/// ウィンドウが見つからないときは何も記録しない（起動直後など。次に探し直す）。
+/// 見つかったのに断られたときだけ記録して二度は試さない。`find`はウィンドウの探し方。
 fn ensure_installed_with(find: impl FnOnce() -> Option<HWND>) -> bool {
     match INSTALL.load(Ordering::Acquire) {
         INSTALL_OK => true,
@@ -191,16 +202,21 @@ fn ensure_installed() -> bool {
     ensure_installed_with(crate::notify_win::game_window)
 }
 
+/// 手続きを差し替えたゲームのウィンドウ（まだなら差し替えてから）。ゲームのスレッドから呼ぶ。
+pub(crate) fn hooked_window() -> Option<HWND> {
+    ensure_installed().then(|| HOOKED.load(Ordering::Acquire) as HWND)
+}
+
 pub fn install_text() -> &'static str {
     match INSTALL.load(Ordering::Acquire) {
-        INSTALL_OK => "ウィンドウの文字の受信ソケット: 置いた",
+        INSTALL_OK => "ウィンドウの文字の受付: 置いた",
         INSTALL_FAILED => {
-            "ウィンドウの文字の受信ソケット: 置けなかった（ゲームのウィンドウの手続きの差し替えを断られた）"
+            "ウィンドウの文字の受付: 置けなかった（ゲームのウィンドウの手続きの差し替えを断られた）"
         }
         _ if NO_WINDOW.load(Ordering::Acquire) => {
-            "ウィンドウの文字の受信ソケット: ゲームのウィンドウが見つからなかった（次にルーム名の入力を開くときに探し直す）"
+            "ウィンドウの文字の受付: ゲームのウィンドウが見つからなかった（次にルーム名の入力を開くときに探し直す）"
         }
-        _ => "ウィンドウの文字の受信ソケット: まだ置いていない（ルーム名の入力を開くまで置かない）",
+        _ => "ウィンドウの文字の受付: まだ置いていない（ルーム名の入力を開くまで置かない）",
     }
 }
 
@@ -211,7 +227,7 @@ fn ime_off() {
     if hwnd.is_null() || IME_OFF.swap(true, Ordering::AcqRel) {
         return;
     }
-    // SAFETY: `hwnd` は差し替えた自分のウィンドウ。ウィンドウを作ったスレッド（ゲームのスレッド）から呼ぶ（別のスレッドからは断られるだけで、戻り値が空になる）。第 2 引数の空は IME の文脈を切り離す約束。
+    // SAFETY: `hwnd`は差し替えた自分のウィンドウ。ウィンドウを作ったスレッド（ゲームのスレッド）から呼ぶ（別のスレッドからは断られるだけで戻り値が空になる）。第2引数の空はIMEの文脈を切り離す約束。
     let prev = unsafe { ImmAssociateContext(hwnd, core::ptr::null_mut()) };
     SAVED_IMC.store(prev as usize, Ordering::Release);
 }
@@ -225,14 +241,15 @@ fn ime_restore() {
     if hwnd.is_null() || saved == 0 {
         return;
     }
-    // SAFETY: `hwnd` は差し替えた自分のウィンドウで、`saved` は切り離したときに返った元の文脈。同じスレッドで戻す。
+    // SAFETY: `hwnd`は差し替えた自分のウィンドウで、`saved`は切り離したときに返った元の文脈。同じスレッドで戻す。
     unsafe { ImmAssociateContext(hwnd, saved as _) };
 }
 
 // ---- ゲームのスレッドから使う関数 ----
 
-/// 入力の受信ソケットを開ける・閉じる（ルーム名の入力に入った・出た tick に 1 回）。開けるときウィンドウの手続きをまだ差し替えていなければ差し替える
-/// （人の操作で 1 回だけの重い所）。差し替えられなければ受信ソケットは開けず false。
+/// 文字の受付を開ける・閉じる（ルーム名の入力に入った・出たtickに1回）。
+/// 開けるときウィンドウの手続きをまだ差し替えていなければ差し替える（人の操作で1回だけの重い処理）。
+/// 差し替えられなければ受付は開けずfalse。
 pub fn set_gate(open: bool) -> bool {
     if open {
         if !ensure_installed() {
@@ -247,8 +264,8 @@ pub fn set_gate(open: bool) -> bool {
     true
 }
 
-/// 文字の入力の受信ソケットが開いているか。数字キーで遅れの量を替える読みが、打った数字を文字として取っている間は読まないために見る。
-#[cfg_attr(test, allow(dead_code))] // 検査では `digit_keys_win::held` が偽の読みを返し、この関数は呼ばない
+/// 文字の受付が開いているかどうか。数字キーで遅れの量を変える処理は、打った数字を文字として取っている間は読まない。そのために開いているかどうかを見る。
+#[cfg_attr(test, allow(dead_code))] // 検査では`digit_keys_win::held`が偽の読みを返し、この関数は呼ばない
 pub fn gate_open() -> bool {
     RING.is_open()
 }
@@ -257,16 +274,17 @@ pub fn drain(out: &mut [u16]) -> usize {
     RING.drain(out)
 }
 
-/// 台本の文字を受信ソケットへ入れる（受信ソケットが閉じていれば入らない。本物のキーボードと同じ決まり）。入った数を返す。
+/// 台本の文字をリングバッファへ追加する（受付が閉じていれば追加されない。本物のキーボードと同じ決まり）。追加できた数を返す。
 pub fn push_script(units: impl Iterator<Item = u16>) -> usize {
     units.filter(|&u| RING.push(u)).count()
 }
 
-/// 検査用: 本物の静的な状態を使う検査は、このモジュールのものも `script_win` のものも 1 本ずつ走らせる。
+/// 検査用: 本物の静的な状態を使う検査は、このモジュールのものも`script_win`のものも1本ずつ走らせる。
 #[cfg(test)]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 検査用: ウィンドウの手続きを差し替えずに、本物のリングバッファの受信ソケットだけを開け閉めする（`script_win` の検査が、台本の文字がリングバッファへ入ることを見る）。
+/// 検査用: ウィンドウの手続きを差し替えずに本物のリングバッファの受付だけを開け閉めする。
+/// `script_win`の検査が、台本の文字がリングバッファへ入ることを検証するために使う。
 #[cfg(test)]
 pub(crate) fn test_set_ring_open(on: bool) {
     RING.set_open(on);
@@ -313,7 +331,7 @@ mod tests {
         assert_eq!(r.drain(&mut out), 0, "閉じても文字が残った");
         r.set_open(true);
         assert_eq!(r.drain(&mut out), 0);
-        // tail を 2^32 の手前に設定して 1 周させても、番号の桁あふれで壊れない。
+        // tailを2^32の手前に設定して1周させても番号の桁あふれで壊れない。
         r.head.store(u32::MAX - 3, Ordering::Release);
         r.tail.store(u32::MAX - 3, Ordering::Release);
         for u in 1..=10u16 {
@@ -344,7 +362,7 @@ mod tests {
     fn make_window() -> HWND {
         let class = wide("STATIC");
         let title = wide("");
-        // SAFETY: 引数は 0 終わりの UTF-16 と空の値。STATIC は OS の組み込みのクラスで、ウィンドウは検査のスレッドの持ち物。
+        // SAFETY: 引数は0終わりのUTF-16と空の値。STATICはOSの組み込みのクラスで、ウィンドウは検査のスレッドが所有する。
         unsafe {
             CreateWindowExW(
                 0,
@@ -366,7 +384,7 @@ mod tests {
     fn restore_window(hwnd: HWND) {
         let prev = PREV_PROC.swap(0, Ordering::AcqRel);
         if prev != 0 {
-            // SAFETY: `prev` は `install_on` が受け取った元の手続き。同じウィンドウへ戻す。
+            // SAFETY: `prev`は`install_on`が受け取った元の手続き。同じウィンドウへ戻す。
             unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev as _) };
         }
         HOOKED.store(0, Ordering::Release);
@@ -386,7 +404,7 @@ mod tests {
     }
 
     fn deliver(hwnd: HWND, msg: u32, wparam: usize) -> LRESULT {
-        // SAFETY: `GetWindowLongPtrW` が返すのはウィンドウの今の手続きで、`CallWindowProcW` はそれを呼ぶ。
+        // SAFETY: `GetWindowLongPtrW`が返すのはウィンドウの今の手続きで、`CallWindowProcW`はそれを呼ぶ。
         unsafe {
             let cur = GetWindowLongPtrW(hwnd, GWLP_WNDPROC) as usize;
             CallWindowProcW(
@@ -403,10 +421,10 @@ mod tests {
     fn a_real_window_is_subclassed_and_only_chars_are_taken_while_the_gate_is_open() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let hwnd = make_window();
-        // SAFETY: 直前の API の最後の誤りの番号（失敗したときだけ使う）。
         assert!(
             !hwnd.is_null(),
             "検査のウィンドウを作れない（{}）",
+            // SAFETY: 直前のAPIが設定した最後のエラーコード（失敗したときだけ使う）。
             unsafe { GetLastError() }
         );
         let _guard = WindowGuard(hwnd);
@@ -417,18 +435,18 @@ mod tests {
         deliver(hwnd, WM_CHAR, 0x61);
         assert_eq!(drain(&mut out), 0, "閉じているのに取り込んだ");
         let text = wide("room-title");
-        // SAFETY: 検査のウィンドウと 0 終わりの UTF-16。
+        // SAFETY: 検査のウィンドウと0終わりのUTF-16。
         unsafe { SetWindowTextW(hwnd, text.as_ptr()) };
         let mut got = [0u16; 32];
-        // SAFETY: 検査のウィンドウと書ける 32 単位の配列。
+        // SAFETY: 検査のウィンドウと書き込み可能な32単位の配列。
         let n = unsafe { GetWindowTextW(hwnd, got.as_mut_ptr(), got.len() as i32) } as usize;
         assert_eq!(
             String::from_utf16_lossy(&got[..n]),
             "room-title",
             "WM_CHAR 以外が元の手続きへ届かない"
         );
-        // 開ける: IME を切り離し、文字を取り込む（戻りは 0）。
-        // SAFETY: 検査のウィンドウから今の IME の文脈を読むだけ（取ったら返す）。
+        // 開ける: IMEを切り離して文字を取り込む（戻りは0）。
+        // SAFETY: 検査のウィンドウから今のIMEの文脈を読むだけ（取ったら返す）。
         let before = unsafe { ImmGetContext(hwnd) };
         if !before.is_null() {
             // SAFETY: 取った文脈を返す。
@@ -437,10 +455,7 @@ mod tests {
         assert!(set_gate(true));
         // SAFETY: 同上。
         let during = unsafe { ImmGetContext(hwnd) };
-        assert!(
-            during.is_null(),
-            "受信ソケットを開けても IME が切り離されない"
-        );
+        assert!(during.is_null(), "受付を開けても IME が切り離されない");
         assert_eq!(deliver(hwnd, WM_CHAR, 0x41), 0);
         assert_eq!(deliver(hwnd, WM_CHAR, 0x0D), 0);
         assert_eq!(drain(&mut out), 2);
@@ -453,7 +468,7 @@ mod tests {
         assert_eq!(
             after.is_null(),
             before.is_null(),
-            "受信ソケットを閉じても IME が戻らない"
+            "受付を閉じても IME が戻らない"
         );
         if !after.is_null() {
             // SAFETY: 取った文脈を返す。
@@ -469,10 +484,53 @@ mod tests {
     }
 
     #[test]
+    fn a_real_window_takes_the_raw_input_registration_and_tells_the_key_table_when_deactivated() {
+        use higanr_core::split_kb::vk;
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_ACTIVATEAPP;
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hwnd = make_window();
+        assert!(!hwnd.is_null());
+        let _guard = WindowGuard(hwnd);
+        crate::split_kb_win::TABLE.reset();
+        assert!(install_on(hwnd));
+        assert!(
+            crate::split_kb_win::register_on(hwnd),
+            "キーボードの Raw Input の登録を断られた"
+        );
+        // 登録の一覧に自分のウィンドウ宛てのキーボードが載る。
+        let mut list = [crate::split_kb_win::RegEntry {
+            page: 0,
+            usage: 0,
+            flags: 0,
+            target: 0,
+        }; crate::split_kb_win::LIST_MAX];
+        let n = crate::split_kb_win::registered(&mut list).expect("登録の一覧を読めない");
+        assert!(
+            list[..n]
+                .iter()
+                .any(|e| (e.page, e.usage, e.target) == (1, 6, hwnd as usize)),
+            "{:?}",
+            &list[..n]
+        );
+        crate::split_kb_win::TABLE.set_key(0, vk::Z, true);
+        deliver(hwnd, WM_ACTIVATEAPP, 1);
+        assert_eq!(crate::split_kb_win::TABLE.snap(true).words[0], 1);
+        deliver(hwnd, WM_ACTIVATEAPP, 0);
+        assert_eq!(
+            crate::split_kb_win::TABLE.snap(true).words[0],
+            0,
+            "前面を失ったのに押下が残った"
+        );
+        crate::split_kb_win::test_unregister();
+        crate::split_kb_win::test_set_registered(false);
+        crate::split_kb_win::TABLE.reset();
+    }
+
+    #[test]
     fn without_a_game_window_the_gate_stays_shut_and_the_search_is_repeated_next_time() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(INSTALL.load(Ordering::Acquire), INSTALL_NOT_TRIED);
-        assert!(!set_gate(true), "ウィンドウが無いのに受信ソケットを開けた");
+        assert!(!set_gate(true), "ウィンドウが無いのに受付を開けた");
         assert!(!RING.is_open());
         assert!(
             !IME_OFF.load(Ordering::Acquire),

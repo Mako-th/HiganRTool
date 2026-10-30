@@ -1,6 +1,6 @@
-//! 中継の木の観戦者の側の配線（`recv.rs` の振り分け・中継の配る側・`leave_tree`、`WatchSlot` の中継の設定、断りの読み手）の検査。
-//! 仮のネットワークの模型は、受け取り（`WatchRecv`）を中継役と子にし、core の `SpectateHost` をホストにする（落とさない・片道 2 ms）。
-//! 本物の通信層（loopback）の回は終わりに。
+//! 中継の木の観戦者の側の配線の検査。対象は`recv.rs`の振り分け・中継の配布する側・`leave_tree`・`WatchSlot`の中継の設定・断りの読み手。
+//! 仮のネットワークの模型は受け取り（`WatchRecv`）を中継役と子にする。ホストはcoreの`SpectateHost`を使う（便は失われない・片道2 ms）。
+//! 本物の通信層（loopback）の検査はファイルの終わりにある。
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -50,7 +50,7 @@ const REACHABLE: NatMark = NatMark {
 /// 中継役に向く上りの太さ。
 const THICK: u32 = 2 * RELAY_MIN_BPS;
 const ONE_WAY_US: u64 = 2_000;
-/// 仮のネットワークに置いておける便の数（送りで確保しないよう前もって取る）。
+/// 仮のネットワークに置いておける便の数（送信時に確保しないよう前もって確保しておく）。
 const QUEUE_CAP: usize = 4_096;
 /// 子が動き始める時刻（ms。中継役がホストに接続した後）。
 const CHILD_START_MS: u64 = 400;
@@ -96,12 +96,12 @@ fn frame(n: u32) -> Record {
     }
 }
 
-/// ホストが観戦者 `public` へ封じた 1 通（BYE の断りなど、ホストの決まりを通さずに作る）。
+/// ホストが観戦者`public`へ封じた1通（BYEの断りなどホストの決まりを通さずに作る）。
 fn from_host(public: &[u8; 32], msg: &Message) -> Vec<u8> {
     sealed_by(&HOST_SEED, public, &Seq::new(), msg)
 }
 
-/// 鍵の種 `seed` の送り手（元のホストか中継役）が観戦者 `public` へ封じた 1 通。
+/// 鍵の種`seed`の送り手（元のホストか中継役）が観戦者`public`へ封じた1通。
 fn sealed_by(seed: &KeySeed, public: &[u8; 32], seq: &Seq, msg: &Message) -> Vec<u8> {
     let keys = Ephemeral::from_seed(seed)
         .dir_keys(public, true, SESSION, &AuthKey::derive(&SECRET, SESSION))
@@ -145,14 +145,14 @@ struct Pkt {
     bytes: [u8; MAX_DATAGRAM],
 }
 
-/// 仮のネットワーク。置き場は前もって取ってあり、送りで確保しない。
+/// 仮のネットワーク。置き場は前もって確保してある。送信時には確保しない。
 struct Wire {
     q: Vec<Pkt>,
-    /// 中継役が出した BYE と REHOME（宛先と種類）の順。
+    /// 中継役が出したBYEとREHOME（宛先と種類）の順。
     order: Vec<(SocketAddr, PeekedType)>,
-    /// 送り元ごとの最初の JOIN。
+    /// 送り元ごとの最初のJOIN。
     joins: Vec<(SocketAddr, usize, [u8; MAX_DATAGRAM])>,
-    /// ホストへ送った JOIN（送り元, 送った時刻 µs）。
+    /// ホストへ送ったJOIN（送り元, 送った時刻µs）。
     join_log: Vec<(SocketAddr, u64)>,
     dropped: u64,
 }
@@ -234,7 +234,7 @@ fn node(addr: SocketAddr, relay: bool, nonce: u64, seed: u8, start_us: u64) -> N
     }
 }
 
-/// ホスト・中継役（`nodes[0]`）・子（`nodes[1]`）の模型。1 歩 1 ms。
+/// ホスト・中継役（`nodes[0]`）・子（`nodes[1]`）の模型。1歩1 ms。
 struct Model {
     now_us: u64,
     host: SpectateHost,
@@ -252,7 +252,7 @@ struct Model {
 }
 
 impl Model {
-    /// `relay`: 中継役の候補（`nodes[0]`）が中継する設定か。子（`nodes[1]`）は中継しない設定。
+    /// `relay`: 中継役の候補（`nodes[0]`）が中継する設定かどうか。子（`nodes[1]`）は中継しない設定。
     fn new(relay: bool) -> Model {
         let mut host = SpectateHost::with_capacity(host_cfg(), 1 << 14);
         host.push(Record::Seg { seg: 0 }).unwrap();
@@ -298,7 +298,7 @@ impl Model {
             host.push(f).unwrap();
             log.push(f);
         }
-        // 中継役の上りの見積もり（測りは core の検査が見る）。
+        // 中継役の上りの見積もり（測定はcoreの検査が見る）。
         if uplink_known {
             host.note_uplink(RELAY, THICK);
         }
@@ -366,7 +366,7 @@ impl Model {
         self.run_until(self.now_us / 1_000 + ms);
     }
 
-    /// 送り元 `from` の最初の JOIN の木の欄。
+    /// 送り元`from`の最初のJOINの木のフィールド。
     fn first_join(&self, from: SocketAddr) -> JoinTree {
         let (_, len, bytes) = self
             .wire
@@ -381,7 +381,7 @@ impl Model {
         self.nodes[i].recv.watcher_for_test().expect("観戦者")
     }
 
-    /// 中継役 `nodes[0]` の受け取りを、パニックの後・受信スレッドの止まりと同じに手放させる。
+    /// 中継役`nodes[0]`の受け取りをパニックの後や受信スレッドの停止のときと同じように手放させる。
     fn abandon_relay(&mut self) {
         let mut tx = Tx {
             w: &mut self.wire,
@@ -391,7 +391,7 @@ impl Model {
         self.nodes[0].recv.abandon(&mut tx);
     }
 
-    /// ホストから `to` へ 1 通届ける（次の歩で着く）。
+    /// ホストから`to`へ1通届ける（次の歩で着く）。
     fn inject_from_host(&mut self, to: SocketAddr, bytes: &[u8]) {
         let mut buf = [0u8; MAX_DATAGRAM];
         buf[..bytes.len()].copy_from_slice(bytes);
@@ -404,19 +404,19 @@ impl Model {
         });
     }
 
-    /// 中継役の数を、本ログの行を作る `WatchStatus` に通した文。
+    /// 中継役の数を本ログの行を作る`WatchStatus`に通した文字列。
     fn relay_line(&self) -> String {
         self.line_of(0)
     }
 
-    /// 観戦者 `nodes[i]` の中継の数を、本ログの行を作る `WatchStatus` に通した文。
+    /// 観戦者`nodes[i]`の中継の数を本ログの行を作る`WatchStatus`に通した文字列。
     fn line_of(&self, i: usize) -> String {
         let rc = self.nodes[i].feed.relay_counts().expect("中継の数");
         relay_text(&self.nodes[i].slot, &rc)
     }
 }
 
-/// 中継の数 `rc` を、本ログの行を作る `WatchStatus` に通した文。
+/// 中継の数`rc`を本ログの行を作る`WatchStatus`に通した文字列。
 fn relay_text(slot: &Arc<WatchSlot>, rc: &RelayCounts) -> String {
     let wp = WatchPlay::with_feed_len(Arc::clone(slot), watch_cfg(), 8);
     wp.feed().set_code_at(0);
@@ -506,14 +506,14 @@ fn with_relay_off_the_watcher_is_never_a_relay_and_sends_the_same_join_as_before
     );
 }
 
-/// ゲームのスレッドが観戦を終えた理由ごとの BYE（`WatchFeed::end`）と、受け取りを手放したとき。
+/// ゲームのスレッドが観戦を終えた理由ごとのBYE（`WatchFeed::end`）と、受け取りを手放したとき。
 #[derive(Debug, Clone, Copy)]
 enum Ending {
     /// 自分で抜けた・続けられない（BYE(取消)）。
     Cancelled,
     /// ホストの終わりの記録（BYE(終わり)）。
     Finished,
-    /// ホストが黙った・接続コードの見張りが諦めた・受信スレッドの処理が止まった（BYE を頼まない）。
+    /// ホストが黙った・接続コードの監視の処理が諦めた・受信スレッドの処理が止まった（BYEを頼まない）。
     NoBye,
     /// 受信スレッドの観戦者の処理がパニックした・受信スレッドが止まる。
     Abandoned,
@@ -558,7 +558,7 @@ fn every_way_the_relay_stops_says_bye_to_the_host_first_and_sends_its_child_home
             [(HOST, PeekedType::Bye), (CHILD, PeekedType::SpectateRehome)],
             "{e:?}: BYE が先・REHOME が後でない"
         );
-        // 子は元のホストから続きを受ける。中継役はもう配らない。
+        // 子は元のホストから続きを受ける。中継役はもう配布しない。
         let had = m.nodes[1].got.len();
         m.run_for(500);
         assert_eq!(m.watcher(1).host_addr(), Some(HOST), "{e:?}");
@@ -651,7 +651,7 @@ fn a_cancel_bye_after_joining_marks_the_feed_refused_and_before_joining_marks_th
     );
     assert!(!m.nodes[0].slot.full_before_join());
     assert!(m.nodes[0].feed.relay_counts().unwrap().refused);
-    // 接続する前にホストの満員の断りが来たら、満員の待ち（観戦は続け、時間切れのときに満員と数える）。
+    // 接続する前にホストから満員の断りが来たら満員の待ちになる。観戦は続け、時間切れのときに満員と数える。
     let mut n = node(CHILD, false, 0xA3, 0x23, 0);
     let mut sink = Sink::default();
     n.recv.service(1_000, &mut sink);
@@ -702,7 +702,7 @@ fn a_new_offer_drops_the_full_before_join_mark_of_the_one_it_replaces() {
     slot.mark_full_before_join();
     slot.offer(watcher_cfg(HOST, 1, 0x31));
     assert!(!slot.full_before_join(), "offer が印を下ろさない");
-    // 受信スレッドが古い受け取りのまま印を立てた後に新しい受け取りへ替えても、印は残らない。
+    // 受信スレッドが古い受け取りのままフラグを立てた後に新しい受け取りへ替えても、フラグは残らない。
     let mut n = node(CHILD, false, 0xA3, 0x23, 0);
     let mut sink = Sink::default();
     n.recv.service(1_000, &mut sink);
@@ -760,7 +760,7 @@ fn the_slot_makes_a_relay_side_only_when_relay_is_enabled_and_a_key_seed_was_dra
     let mut o = slot.take_newer(&mut 0).unwrap();
     assert!(o.relay.is_none() && !slot.relay_enabled());
     assert_eq!(join_of(&mut o).relay_public, None);
-    // 中継する設定で、OS の乱数で種を引く。
+    // 中継する設定のときOSの乱数で種を生成する。
     let slot = WatchSlot::new();
     slot.enable_relay(Candidates::from_addrs(&[RELAY]).unwrap());
     slot.offer(cfg);
@@ -770,7 +770,7 @@ fn the_slot_makes_a_relay_side_only_when_relay_is_enabled_and_a_key_seed_was_dra
     assert!(t.relay_public.is_some());
     assert_eq!(t.candidates.as_slice()[0].addr, RELAY);
     assert_eq!(slot.relay_failed(), 0);
-    // 種を引けなければ中継しない（観戦は続ける）。
+    // 種を生成できなければ中継しない（観戦は続ける）。
     slot.offer_with(cfg, Some(Err("乱数を引けない".to_string())));
     let mut o = slot.take_newer(&mut 1).unwrap();
     assert!(o.relay.is_none());
@@ -778,10 +778,10 @@ fn the_slot_makes_a_relay_side_only_when_relay_is_enabled_and_a_key_seed_was_dra
     assert_eq!(slot.relay_failed(), 1);
 }
 
-// ---------------- 照合のずれで戻る・UPnP の知らせ ----------------
+// ---------------- 照合のずれで戻る・UPnPの知らせ ----------------
 
-/// 中継役の上りが分かる前に、子（`nodes[1]`）と葉（`nodes[2]`）が直接に入り、マッチの切れ目で子だけが中継役の下へ移った模型。
-/// 戻り値の 2 つ目は、移った時点の子の ack（前の親から連続で受けた数）。
+/// 中継役の上りが分かる前に子（`nodes[1]`）と葉（`nodes[2]`）が直接に入り、マッチの切れ目で子だけが中継役の下へ移った模型。
+/// 戻り値の2つ目は移った時点の子のack（前の親から連続で受けた数）。
 fn with_child_swapped() -> (Model, u32) {
     let mut m = Model::new(true);
     m.uplink_from_ms = 1_500;
@@ -837,7 +837,7 @@ fn a_mismatch_returns_home_only_for_a_record_from_the_current_relay_and_an_unbro
     };
     // 前の親（元のホスト）が運んだ記録のずれ。
     ask(&mut m, from - 1, false);
-    // その seg でポーズが崩れていた。
+    // そのマッチでポーズが崩れていた。
     ask(&mut m, from, true);
     assert!(!m.watcher(1).parent_is_home(), "戻らないはずのずれで戻った");
     let rc = m.nodes[1].feed.relay_counts().unwrap();
@@ -879,13 +879,15 @@ fn stream_msg(first: u32, n: u32) -> Message {
     Message::SpectateStream(SpectateStream {
         first,
         reset: first == 0,
+        cookie: None,
         count: n as u8,
         records,
     })
 }
 
-/// ホストが中継役を紹介した時点で組み立てが ack より先に持っていた飛び飛びの記録は、後でいまの親が抜けを埋めて連続になっても前の親の分に数える
-/// （その間の抜けも）。いまの親がその先に運んだ記録のずれでだけ戻る。
+/// ホストが中継役を紹介した時点で組み立てがackより先に持っていた飛び飛びの記録は、前の親の分に数える。
+/// 後でいまの親が抜けを埋めて連続になっても同じ（その間の抜けも前の親の分）。
+/// 戻るのはいまの親がその先に運んだ記録にずれがあったときだけ。
 #[test]
 fn records_held_beyond_the_ack_at_the_intro_count_as_the_previous_parents() {
     let slot = Arc::new(WatchSlot::new());
@@ -910,7 +912,7 @@ fn records_held_beyond_the_ack_at_the_intro_count_as_the_previous_parents() {
     };
     deliver(&mut recv, HOST, &stream_msg(0, 16), &mut sink);
     deliver(&mut recv, HOST, &stream_msg(16, 4), &mut sink);
-    // 20〜23 が抜けて、24〜29 が先に着いた。
+    // 20〜23が抜けて、24〜29が先に着いた。
     deliver(&mut recv, HOST, &stream_msg(24, 6), &mut sink);
     let w = recv.watcher_for_test().unwrap();
     assert_eq!((w.ack(), w.stored_end(), feed.written_pos()), (20, 30, 20));
@@ -969,7 +971,7 @@ fn the_mismatch_line_is_left_out_while_there_is_no_mismatch() {
     assert!(!text.contains("UPnP"), "{text}");
 }
 
-/// 中継役（`nodes[0]`）に足した UPnP の候補。
+/// 中継役（`nodes[0]`）に足したUPnPの候補。
 fn upnp_extra() -> SocketAddr {
     SocketAddr::from(([198, 51, 100, 7], 47_301))
 }
@@ -987,7 +989,7 @@ fn relay_alone() -> Model {
     m
 }
 
-/// `mark` の後に中継役がホストへ送った JOIN の時刻（µs）。
+/// `mark`の後に中継役がホストへ送ったJOINの時刻（µs）。
 fn joins_after(m: &Model, mark: usize) -> Vec<u64> {
     m.wire.join_log[mark..]
         .iter()
@@ -1064,7 +1066,7 @@ fn a_relay_with_a_child_or_one_that_had_children_does_not_announce() {
     assert!(joins_after(&m, mark).is_empty(), "子がいるのに知らせた");
     let rc = m.nodes[0].feed.relay_counts().unwrap();
     assert_eq!((rc.announces_sent, rc.announces_skipped), (0, 1));
-    // 子が抜けた後も、中継役になった後なので知らせない。
+    // 中継役になった後は子が抜けても知らせない。
     m.nodes[1].feed.end(Some(ByeReason::Cancelled));
     m.run_for(100);
     assert_eq!(
@@ -1089,7 +1091,7 @@ fn a_relay_with_a_child_or_one_that_had_children_does_not_announce() {
     assert_eq!(m.nodes[0].feed.relay_counts().unwrap().announces_skipped, 2);
 }
 
-/// 受け取りの最初の JOIN が割り当てを載せる（受信スレッドが取る前に割り当てが出た・接続する前に受け取りを替えた）なら知らせない。
+/// 受け取りの最初のJOINが割り当てを載せる（受信スレッドが取る前に割り当てが出た・接続する前に受け取りを替えた）なら知らせない。
 #[test]
 fn a_upnp_mapping_that_a_watchers_first_join_carries_is_not_announced() {
     // 受け取りを受信スレッドが取る前。
@@ -1102,7 +1104,7 @@ fn a_upnp_mapping_that_a_watchers_first_join_carries_is_not_announced() {
     let rc = m.nodes[0].feed.relay_counts().unwrap();
     assert_eq!((rc.announces_sent, rc.announces_skipped), (0, 0));
     assert_eq!(rc.upnp, WatchUpnp::Mapped);
-    // 最初の受け取りの JOIN の後、接続する前に受け取りを替えた。
+    // 最初の受け取りのJOINの後、接続する前に受け取りを替えた。
     let mut m = Model::new(true);
     m.nodes[1].start_us = u64::MAX;
     m.host_from_ms = 300;
@@ -1128,8 +1130,9 @@ fn a_upnp_mapping_that_a_watchers_first_join_carries_is_not_announced() {
     );
 }
 
-/// 最初の JOIN の後に割り当てが出たら、接続した後に知らせる。接続する前の送り直しの JOIN が載せていても（その JOIN が落ちて、
-/// ホストが前の JOIN で受け入れていることがある）。
+/// 最初のJOINの後に割り当てが出たら接続した後に知らせる。
+/// 接続する前に再送したJOINが割り当てを載せていても同じ。
+/// そのJOINが失われてホストが前のJOINで受け入れていることがあるため。
 #[test]
 fn a_upnp_mapping_after_the_first_join_is_announced_after_joining_even_if_a_resent_join_carried_it()
 {
@@ -1140,7 +1143,7 @@ fn a_upnp_mapping_after_the_first_join_is_announced_after_joining_even_if_a_rese
         m.run_until(1);
         assert!(!m.watcher(0).is_joined());
         m.nodes[0].recv.note_upnp(UpnpNews::Mapped(upnp_own()));
-        // 接続した歩より前に送った JOIN の数（接続した歩では送り直さない）。
+        // 接続した歩より前に送ったJOINの数（接続した歩では送り直さない）。
         let mut before = 0;
         while !m.watcher(0).is_joined() {
             assert!(m.now_us < 2_000_000, "接続しない");
@@ -1169,7 +1172,7 @@ fn a_upnp_mapping_after_the_first_join_is_announced_after_joining_even_if_a_rese
     }
 }
 
-/// 中継する設定で配る側を作れなかった受け取り: 接続するまでは割り当てを使うか決めず、接続したら通信層へ割り当ての取り下げを 1 回だけ頼む。
+/// 中継する設定で配布する側を作れなかった受け取り: 接続するまでは割り当てを使うかどうか決めない。接続したら通信層へ割り当ての取り下げを1回だけ頼む。
 #[test]
 fn a_watcher_whose_relay_side_failed_asks_once_to_withdraw_the_mapping_after_joining() {
     let mut m = Model::new(true);
@@ -1224,7 +1227,7 @@ fn an_unused_upnp_result_or_a_watcher_without_relay_changes_nothing_but_the_log(
         m.relay_line()
             .contains(" / UPnP: 外側のアドレスが STUN と不一致（取り下げ） / ホストへ知らせの JOIN 送った 0・送らなかった 0")
     );
-    // 中継しない観戦者は、割り当てが来ても候補を載せず知らせない。
+    // 中継しない観戦者は割り当てが来ても候補を載せず知らせない。
     let mut m = Model::new(false);
     m.nodes[1].start_us = u64::MAX;
     m.run_until(500);
@@ -1255,7 +1258,7 @@ fn bind_lo() -> UdpSocket {
     s
 }
 
-/// 本物の受信スレッドの中継役（`GameNet` ＋ `WatchPlay`）と、検査のスレッドで回すホスト（core の `SpectateHost`）と子（core の `Watcher`）。
+/// 本物の受信スレッドの中継役（`GameNet` ＋ `WatchPlay`）と、検査のスレッドで回すホスト（coreの`SpectateHost`）と子（coreの`Watcher`）。
 struct Rig {
     hsock: UdpSocket,
     csock: UdpSocket,
@@ -1274,14 +1277,14 @@ impl Rig {
         Self::new_with(true)
     }
 
-    /// `relay_side`: 中継の配る側を作れるか（false は鍵の種を引けなかった形）。
+    /// `relay_side`: 中継の配布する側を作れるかどうか（falseは鍵の種を生成できなかった状態）。
     fn new_with(relay_side: bool) -> (Rig, RecvThread) {
         let hsock = bind_lo();
         let csock = bind_lo();
         let haddr = hsock.local_addr().unwrap();
         let (net, rx) =
             net_udp::open_for_code(SocketAddr::from(([127, 0, 0, 1], 0))).expect("通信層を開ける");
-        // loopback では 2 か所目の STUN を聞かないので、届く側の回線の型を置く。
+        // loopbackでは2か所目のSTUNを聞かないので届く側のネットワーク種別を設定する。
         net.set_second_stun_for_test(SecondStun::Compared(higanr_core::stun::Mapping::Same));
         let raddr = net.local_addr().unwrap();
         let slot = Arc::new(WatchSlot::new());
@@ -1312,7 +1315,7 @@ impl Rig {
         (rig, rx)
     }
 
-    /// 1 周: ゲームのスレッドの手入れ・ホストが受けて送る・（`with_child` なら）子が受けて送る。
+    /// 1周: ゲームのスレッドの手入れ・ホストが受けて送る・（`with_child`なら）子が受けて送る。
     fn round(&mut self, with_child: bool) {
         let now = self.t0.elapsed().as_millis() as u32;
         self.wp.tend(&mut self.net);
@@ -1339,7 +1342,7 @@ impl Rig {
         }
     }
 
-    /// 中継役が接続し、子が中継役から 20 記録受けるまで回す。
+    /// 中継役が接続して子が中継役から20記録受けるまで回す。
     fn attach_child(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.wp.is_joined() {
@@ -1358,7 +1361,7 @@ impl Rig {
         assert!(self.host.is_relay_of(self.raddr));
     }
 
-    /// 中継役が BYE を送り、子が REHOME を受けて元のホストへ戻るまで回す。
+    /// 中継役がBYEを送り、子がREHOMEを受けて元のホストへ戻るまで回す。
     fn wait_child_home(&mut self, left: u64, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !(self.host.counts().left > left && self.child.tree_counts().rehomes == 1) {
@@ -1402,8 +1405,10 @@ fn stopping_the_receive_thread_sends_the_relays_child_home() {
     r.wait_child_home(left, "受信スレッドの止まり");
 }
 
-/// 本物の受信スレッドの中継役が、開くときに頼んだ UPnP の結果を接続した後に覗き、STUN と突き合わせる。`outer` はルーターが答える
-/// 外側のアドレス。`relay_side` は `Rig::new_with` と同じ。戻り値は（Rig, 受信スレッド, 偽のルーターの数）。
+/// 本物の受信スレッドの中継役が開くときに頼んだUPnPの結果を接続した後に読み取り、STUNと突き合わせる。
+/// `outer`はルーターが答える外側のアドレス。
+/// `relay_side`は`Rig::new_with`と同じ。
+/// 戻り値は（Rig, 受信スレッド, 偽のルーターの数）。
 fn rig_with_upnp(
     outer: std::net::Ipv4Addr,
     relay_side: bool,

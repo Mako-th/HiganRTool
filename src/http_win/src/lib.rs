@@ -1,8 +1,8 @@
-//! WinHTTP で GET を 1 本する（更新の目録とファイルを取る）。判断は `update.rs`。ローダーの unsafe は `real.rs`・`folder_dialog.rs` とここにだけある。
-//! dll がルームサーバーで使うのと同じ API（OS の TLS・プロキシ設定をそのまま使う）。
-//! 302 は WinHTTP が辿る（https から http への転送は断る）。本文は `max` バイトまで（ネットから来る長さを信じない）。
-//! `Content-Length` と受けた長さが違えば `Truncated`（WinHTTP は閉じられた接続を「読み終わり」と返すことがある）。
-//! 待ちの上限は `Timeouts` の 4 つ（操作ごと）。全体の上限は呼ぶ側が決める。
+//! WinHTTPでGETを1回行う（更新のマニフェストとファイルを取得する）。ローダー（起動前の更新）とDLL（遊んでいる間の新バージョンの通知）が使う。
+//! 判断は呼び出し側が行う（`higanr_core::update`とローダーの`update.rs`・DLLの`update_check.rs`）。OSのTLS・プロキシ設定をそのまま使う。
+//! 302はWinHTTPがリダイレクトを追う（httpsからhttpへの転送は断る）。本文は`max`バイトまで（ネットから来る長さを信じない）。
+//! `Content-Length`と受けた長さが違えば`Truncated`（WinHTTPは閉じられた接続を「読み終わり」と返すことがある）。
+//! 待ち時間の上限は`Timeouts`の4つ（操作ごと）。全体の上限は呼び出し側が決める。
 
 use core::ffi::c_void;
 
@@ -16,15 +16,22 @@ use windows_sys::Win32::Networking::WinHttp::{
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
 };
 
-use crate::ui_lang::by_lang;
+/// 2つの書式のうち言語に合う方で`format!`する。
+macro_rules! by_lang {
+    ($lang:expr, ja: $ja:literal, en: $en:literal $(, $($arg:tt)*)?) => {
+        match $lang {
+            Lang::Ja => format!($ja $(, $($arg)*)?),
+            Lang::En => format!($en $(, $($arg)*)?),
+        }
+    };
+}
 
 const USER_AGENT: &str = "HiganRTool-updater";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proxy {
     Automatic,
-    /// 検査（loopback）用。自動の探索で外へ出ないように。
-    #[allow(dead_code)] // 検査だけが作る（製品は常に OS の設定に従う）
+    /// 検査（loopback）用。自動の探索で外へ出ないように（製品は常にOSの設定に従う）。
     Direct,
 }
 
@@ -87,13 +94,13 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: `self.0` は WinHTTP が返した null でないハンドルで、ここで 1 回だけ閉じる（`Handle` はコピーできない）。
+        // SAFETY: `self.0`はWinHTTPが返したnullでないハンドル。ここで1回だけ閉じる（`Handle`はコピーできない）。
         unsafe { WinHttpCloseHandle(self.0) };
     }
 }
 
 fn last_error() -> u32 {
-    // SAFETY: 引数の無い呼び出し。直前の Win32 の呼び出しと同じスレッドで読む。
+    // SAFETY: 引数の無い呼び出し。直前のWin32の呼び出しと同じスレッドで読む。
     unsafe { GetLastError() }
 }
 
@@ -101,11 +108,11 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
-/// ヘッダが無い・読めなければ None。
+/// ヘッダが無いか読み取れなければNone。
 fn query_number(request: &Handle, which: u32) -> Option<u32> {
     let mut value: u32 = 0;
     let mut len: u32 = core::mem::size_of::<u32>() as u32;
-    // SAFETY: 応答を受けた要求のハンドル。書き先は 4 バイトの `value`（長さ `len`）。
+    // SAFETY: 応答を受けた要求のハンドル。書き先は4バイトの`value`（長さ`len`）。
     let ok = unsafe {
         WinHttpQueryHeaders(
             request.0,
@@ -119,7 +126,7 @@ fn query_number(request: &Handle, which: u32) -> Option<u32> {
     (ok != 0).then_some(value)
 }
 
-/// `progress` には、本文を読み進めるたびにそこまでに受け取ったバイト数を渡す（呼ぶのはこのスレッド）。
+/// `progress`には本文を読み進めるたびにそこまでに受け取ったバイト数を渡す（呼ぶのはこのスレッド）。
 pub fn get(
     ep: &Endpoint,
     proxy: Proxy,
@@ -132,7 +139,7 @@ pub fn get(
         Proxy::Automatic => WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         Proxy::Direct => WINHTTP_ACCESS_TYPE_NO_PROXY,
     };
-    // SAFETY: `agent` は終端 0 の UTF-16 で生きている。プロキシの名と除外は null。
+    // SAFETY: `agent`は終端0のUTF-16で生きている。プロキシの名と除外はnull。
     let session = Handle::new(
         unsafe {
             WinHttpOpen(
@@ -146,7 +153,7 @@ pub fn get(
         "WinHttpOpen",
     )?;
     let ms = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
-    // SAFETY: 開いたセッションのハンドルに 4 つの ms を設定するだけ。
+    // SAFETY: 開いたセッションのハンドルに4つのmsを設定するだけ。
     let ok = unsafe {
         WinHttpSetTimeouts(
             session.0,
@@ -163,7 +170,7 @@ pub fn get(
         });
     }
     let host = wide(&ep.host);
-    // SAFETY: 開いたセッション・終端 0 の宿の名・番号。
+    // SAFETY: 開いたセッション・終端0のホスト名・ポート番号。
     let connect = Handle::new(
         unsafe { WinHttpConnect(session.0, host.as_ptr(), ep.port, 0) },
         "WinHttpConnect",
@@ -171,7 +178,7 @@ pub fn get(
     let verb = wide("GET");
     let path = wide(&ep.path);
     let flags = if ep.secure { WINHTTP_FLAG_SECURE } else { 0 };
-    // SAFETY: 開いた接続・終端 0 の動詞とパス。バージョン・参照元・受ける型は null。
+    // SAFETY: 開いた接続・終端0のHTTPメソッドとパス。バージョン・参照元・受ける型はnull。
     let request = Handle::new(
         unsafe {
             WinHttpOpenRequest(
@@ -186,7 +193,7 @@ pub fn get(
         },
         "WinHttpOpenRequest",
     )?;
-    // SAFETY: 足すヘッダーも本文も無い要求を送る（null・長さ 0）。
+    // SAFETY: 追加するヘッダーも本文も無い要求を送る（null・長さ0）。
     let ok =
         unsafe { WinHttpSendRequest(request.0, core::ptr::null(), 0, core::ptr::null(), 0, 0, 0) };
     if ok == 0 {
@@ -195,7 +202,7 @@ pub fn get(
             code: last_error(),
         });
     }
-    // SAFETY: 送った要求の応答を待つ。予約の引数は null。
+    // SAFETY: 送った要求の応答を待つ。予約の引数はnull。
     let ok = unsafe { WinHttpReceiveResponse(request.0, core::ptr::null_mut()) };
     if ok == 0 {
         return Err(HttpError::Transport {
@@ -219,7 +226,7 @@ pub fn get(
     let mut buf = [0u8; 16 * 1024];
     loop {
         let mut read: u32 = 0;
-        // SAFETY: `buf` は `buf.len()` バイト書ける領域、`read` は書ける u32。
+        // SAFETY: `buf`は`buf.len()`バイト書き込み可能な領域。`read`は書き込み可能なu32。
         let ok = unsafe {
             WinHttpReadData(
                 request.0,
@@ -229,7 +236,7 @@ pub fn get(
             )
         };
         if ok == 0 {
-            // 途中で切られた接続は、ここで失敗として返ることがある（読み終わりと区別して「切れた」と言う）。
+            // 途中で切られた接続はここで失敗として返ることがある（読み終わりと区別して「切れた」として扱う）。
             return match declared {
                 Some(want) => Err(HttpError::Truncated {
                     got: body.len(),

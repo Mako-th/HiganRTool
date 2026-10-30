@@ -1,5 +1,5 @@
-// 共通の見本（tests/fixtures/room/）と rules.ts の突き合わせ。Rust の側も同じ見本を include_str! で読むので、
-// rules.ts と Rust のコピーのずれを縛る。
+// 共通の見本（tests/fixtures/room/）とrules.tsの突き合わせ。
+// Rustの側も同じ見本をinclude_str! で読むのでrules.tsとRustのコピーのずれを防げる。
 import { describe, expect, it } from "vitest";
 import namesJson from "../../../tests/fixtures/room/names.json";
 import rulesJson from "../../../tests/fixtures/room/rules.json";
@@ -10,6 +10,8 @@ import {
   CLOSE_NAME,
   CODE_MAX_CHARS,
   Close,
+  HELD_STALE_MS,
+  HELD_SWEEP_MS,
   MESSAGE_MAX_BYTES,
   PING_TEXT,
   PONG_TEXT,
@@ -27,6 +29,13 @@ import {
   ROOM_NAME_MAX_BYTES,
   ROOM_NAME_MIN,
   ROOM_TTL_MS,
+  RoomRefusal,
+  TICKET_MAC_CHARS,
+  TICKET_NUM_MAX_DIGITS,
+  TICKET_PARAM,
+  TICKET_PURPOSE,
+  TICKET_TTL_SECS,
+  WATCH_ANSWER_TTL_MS,
   WATCH_CAP_MAX,
   WATCH_DELAY_MAX,
   WATCH_HASH_BYTES,
@@ -46,12 +55,13 @@ import {
   spectateRoomName,
 } from "../src/rules";
 import spectateNamesJson from "../../../tests/fixtures/room/spectate_names.json";
+import { judgeTicket } from "../src/ticket";
 import { connect, rawConnect } from "./helpers";
 
 const rules = rulesJson as Record<string, string | number>;
 const names = namesJson as Record<string, string>;
 
-/** 見本の鍵を読む（無い・型が違うなら落ちる）。最後に読まなかった鍵が無いことを見る。 */
+/** 見本の鍵を読む（無い・型が違うなら失敗する）。最後に読まなかった鍵が無いことを見る。 */
 const used = new Set<string>(["about", "about_lines"]);
 function num(k: string): number {
   used.add(k);
@@ -74,7 +84,7 @@ function parseRanges(s: string): [number, number][] {
   });
 }
 
-/** 見本の room_name_fold の順に揃える（rules.ts の実装とは別に組み立てる）。 */
+/** 見本のroom_name_foldの順に揃える（rules.tsの実装とは別に組み立てる）。 */
 function foldByFixture(raw: string): string {
   let s = raw;
   for (const step of (rules.room_name_fold as string).split(",")) {
@@ -111,7 +121,7 @@ function classify() {
   return { ok, bad, serverBad, pairs: [...pairs].map(([n, p]) => ({ n, kind: p.kind, a: p.a!, b: p.b! })) };
 }
 
-/** パスに載せたときに 404 になる名（パスの読み方で区切りが消える）。ほかの bad_ は 400。 */
+/** パスに載せたときに404になる名（パスの読み方で区切りが消える）。ほかのbad_ は400。 */
 function expected404(key: string): boolean {
   return key === "bad_empty" || key.startsWith("bad_dot_");
 }
@@ -127,7 +137,7 @@ describe("rules.json と rules.ts", () => {
     expect(text("room_name_bad_names").split(",")).toEqual([...ROOM_NAME_BAD_NAMES]);
     expect(text("room_name_fold").split(",")).toEqual([...ROOM_NAME_FOLD]);
 
-    // 全コードポイント（代理を除く）で、`a<文字>b` を断るかが見本の範囲と `/` の和に一致すること。
+    // 全コードポイント（サロゲートを除く）で`a<文字>b`を断るかどうかが見本の範囲と`/`の和に一致すること。
     const ranges = parseRanges(text("room_name_controls"));
     const bad = new Set(ROOM_NAME_BAD_CHARS);
     let rejected = 0;
@@ -154,6 +164,13 @@ describe("rules.json と rules.ts", () => {
     expect(num("message_max_bytes")).toBe(MESSAGE_MAX_BYTES);
     expect(num("room_ttl_ms")).toBe(ROOM_TTL_MS);
     expect(num("answer_ttl_ms")).toBe(ANSWER_TTL_MS);
+    expect(num("held_stale_ms")).toBe(HELD_STALE_MS);
+    expect(num("held_sweep_ms")).toBe(HELD_SWEEP_MS);
+    // 生存確認の古さの上限は定期処理の間隔より短い（定期処理のたびに途絶えた接続を必ず閉じられる）。
+    expect(HELD_STALE_MS).toBeLessThan(HELD_SWEEP_MS);
+    const httpKeys = Object.keys(rules).filter((k) => k.startsWith("http_"));
+    for (const k of httpKeys) expect(text(k), k).toBe(k.slice("http_".length));
+    expect(httpKeys.map((k) => rules[k]).sort()).toEqual(Object.values(RoomRefusal).sort());
     expect(text("ping_text")).toBe(PING_TEXT);
     expect(text("pong_text")).toBe(PONG_TEXT);
     expect(num("retry_after_secs")).toBe(RETRY_AFTER_SECS);
@@ -179,6 +196,12 @@ describe("rules.json と rules.ts", () => {
     expect(text("watch_modes").split(",")).toEqual([...WATCH_MODES]);
     expect(num("watch_stale_ms")).toBe(WATCH_STALE_MS);
     expect(num("watch_list_max_bytes")).toBe(WATCH_LIST_MAX_BYTES);
+    expect(num("watch_answer_ttl_ms")).toBe(WATCH_ANSWER_TTL_MS);
+    expect(text("ticket_param")).toBe(TICKET_PARAM);
+    expect(num("ticket_ttl_secs")).toBe(TICKET_TTL_SECS);
+    expect(text("ticket_purpose")).toBe(TICKET_PURPOSE);
+    expect(num("ticket_num_max_digits")).toBe(TICKET_NUM_MAX_DIGITS);
+    expect(num("ticket_mac_chars")).toBe(TICKET_MAC_CHARS);
 
     const closeKeys = Object.keys(rules).filter((k) => k.startsWith("close_"));
     for (const k of closeKeys) {
@@ -190,6 +213,21 @@ describe("rules.json と rules.ts", () => {
 
     const unread = Object.keys(rules).filter((k) => !used.has(k));
     expect(unread, "比べていない鍵").toEqual([]);
+  });
+});
+
+describe("rules.json と札の形（ticket.ts の TICKET_RE）", () => {
+  it("発行と期限は ticket_num_max_digits 桁まで、MAC は ticket_mac_chars 文字ちょうどだけを札の形として通す（鍵なしで形だけを見る）", async () => {
+    const digits = rules.ticket_num_max_digits as number;
+    const mac = "A".repeat(rules.ticket_mac_chars as number);
+    const n = "9".repeat(digits);
+    const shape = async (t: string) => (await judgeTicket(null, "w.x", t, 0)).kind;
+    expect(await shape(`${n}.${n}.${mac}`)).toBe("none");
+    expect(await shape(`0.0.${mac}`)).toBe("none");
+    expect(await shape(`${n}9.1.${mac}`)).toBe("bad");
+    expect(await shape(`1.${n}9.${mac}`)).toBe("bad");
+    expect(await shape(`1.1.${mac}A`)).toBe("bad");
+    expect(await shape(`1.1.${mac.slice(1)}`)).toBe("bad");
   });
 });
 
@@ -210,7 +248,7 @@ describe("names.json と normalizeRoomName", () => {
     const { ok, bad, serverBad, pairs } = classify();
     const same = pairs.filter((p) => p.kind === "same");
     const diff = pairs.filter((p) => p.kind === "diff");
-    // 母数（どの頭も 0 件で素通りにならないように。件数そのものは固定しない）。
+    // 母数（どの頭も0件で素通りにならないように。件数そのものは固定しない）。
     for (const [what, n] of [["ok", ok.length], ["bad", bad.length], ["server_bad", serverBad.length], ["same", same.length], ["diff", diff.length]] as const) {
       expect(n, what).toBeGreaterThan(0);
     }
@@ -233,7 +271,7 @@ describe("names.json と normalizeRoomName", () => {
       }
     }
     expect(keys.size).toBe(same.length + diff.length * 2);
-    // 効く場合が見本にあること: 揃える前は 33 文字以上でも揃えると 32 文字以下になる名、逆に揃えると 33 文字以上になる名、32 文字以下で 128 B だけを越える名。
+    // 効く場合が見本にあること: 揃える前は33文字以上でも揃えると32文字以下になる名、逆に揃えると33文字以上になる名、32文字以下で128 Bだけを越える名。
     const chars = (s: string) => [...s].length;
     const bytes = (s: string) => new TextEncoder().encode(s).byteLength;
     expect(ok.some(([, v]) => chars(v) > ROOM_NAME_MAX), "揃えると縮む・空白を除く ok").toBe(true);

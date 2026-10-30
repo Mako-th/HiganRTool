@@ -1,12 +1,14 @@
 //! 検査だけの偽物: ゲームのウィンドウの模型（`FakeGame`）と、仮の時計で動くネットワーク（`FakeNet`）。
 //!
-//! `FakeGame` が持つゲームの動き:
-//! - 入力の地点の後、同じ tick の優先度 0 の後半で場面の切替が走る（今 1・次 2 → 場面 2 と読み込み、今 2・次 10 → 場面 2 を作り直して読み込み、今 2・次 1 → メニュー）。**描画だけのフレームでは、切替も更新も走らない。**
-//! - 読み込みは `load_*` tick。読み込みを終えた後の最初の更新の中で開始のフック（`on_match_start`）が実行、次の tick が frame 0。
-//! - マッチの中の更新は feed された 3 本から「乱数」を進める（CHECK をゲームから読むときの値）。seg の決めたフレーム数（`seg_frames`）を使うと、最後のフレームの更新が次の要求を書く（再戦 10、最後なら 1）。
-//! - メニューでは、接続して選択に入ってから `menu_before_decide` tick で「マップの決定」（次の要求 2）を書く。
+//! `FakeGame`が持つゲームの動き:
+//! - 入力の地点の後に、同じtickの優先度0の後半で場面の切替が走る（今1・次2 → 場面2と読み込み、今2・次10 → 場面2を作り直して読み込み、今2・次1 → メニュー）。**描画だけのフレームでは切替も更新も走らない。**
+//! - 読み込みは`load_*` tick。読み込みを終えた後の最初の更新の中で開始のフック（`on_match_start`）が実行される。次のtickがframe 0。
+//! - マッチの中の更新はfeedされた3本から「乱数」を進める（CHECKをゲームから読むときの値）。segに設定されたフレーム数（`seg_frames`）を使うと最後のフレームの更新が次の要求を書く（再戦10、最後なら1）。
+//! - メニューでは接続して選択に入ってから`menu_before_decide` tickで「マップの決定」（次の要求2）を書く。
+//! - `end_menu`を立てるとsegのフレーム数を使った後に次の要求を書かず、マッチ終了時のメニュー（`higanr_core::end_pick::model`）を出す。
+//!   メニューはfeedされた`[2]`の押した瞬間で動き、閉じたフレームに決定済みの項目の次の要求（再戦10・キャラを変更1・リプレイを保存して終了6）を書く。
 //!
-//! 偽物の中で起きた食い違い（feed した 3 本が返しと合わない、など）は、その場で落とす。
+//! 偽物の中で起きた食い違い（feedした3本が戻り値と合わないなど）はその場で落とす。
 #![forbid(unsafe_code)]
 
 use std::cell::{Cell, RefCell};
@@ -14,6 +16,9 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
+use higanr_core::end_pick::model::EndMenu;
+use higanr_core::end_pick::{self, MENU_KEYS};
+use higanr_core::input_model::InputState;
 use higanr_core::link::Outlet;
 use higanr_core::lockstep::Role;
 use higanr_core::selection::Agreed;
@@ -37,7 +42,7 @@ fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// `seed` の偽のゲームが n 回目（1 から）に読むローカル入力。`SEND_MASK`（0x00FF）の中で 0 を避ける。
+/// `seed`の偽のゲームがn回目（1から）に読むローカル入力。`SEND_MASK`（0x00FF）の中で0を避ける。
 pub fn local_word(seed: u64, n: u64) -> u16 {
     (mix(seed ^ (n << 20)) % 255) as u16 + 1
 }
@@ -52,14 +57,14 @@ pub struct FakeGame {
     loading_left: u32,
     in_match: bool,
     pub frames_per_seg: u32,
-    /// 空でなければ、n 番目（0 から）のマッチのフレーム数（マッチごとに長さが違う形。尽きたら `frames_per_seg`）。
+    /// 空でなければn番目（0から）のマッチのフレーム数（マッチごとに長さが違う形。尽きたら`frames_per_seg`）。
     pub seg_frames: Vec<u32>,
     segs_done: usize,
-    /// 1 回の選択で続けるマッチの数（2 つ目からは再戦）。
+    /// 1回の選択で続けるマッチの数（2つ目からは再戦）。
     pub segs_per_session: u32,
-    /// 選択からマッチまで（と、再戦の続き）を何回するか。回の間はマッチを出てメニューへ戻る。
+    /// 選択からマッチまで（と再戦の続き）を何回するか。回と回の間はマッチを出てメニューへ戻る。
     pub sessions: u32,
-    /// 回の終わりにマッチを出る次の要求（既定 1 = キャラを変更。6 = リプレイを保存して終了）。
+    /// 各回の終わりにマッチを出る次の要求（既定 1 = キャラを変更。6 = リプレイを保存して終了）。
     pub leave_req: u32,
     frames_in_seg: u32,
     segs_in_session: u32,
@@ -75,30 +80,44 @@ pub struct FakeGame {
     pub zero: u64,
     pub local: u64,
     pub rng: u64,
-    /// マッチのフレームを使った数がこれになったら、乱数を 1 ビット壊す（ズレの検査）。
+    /// マッチのフレームを使った数がこれになったら乱数を1ビット壊す（ズレの検査）。
     pub corrupt_at: Option<u64>,
     pub select_chara: u8,
-    /// 自分の SELECT に載せるマップ（両者で違えばホストの値を採る）。
+    /// 自分のSELECTに載せるマップ（両者で違えばホストの値を採る）。
     pub select_map: u8,
     pub agreed: Vec<(Seat, Agreed)>,
     pub charges: Vec<(u8, u8)>,
     pub match_starts: u32,
-    /// `Some` なら `apply_agreed` がこの値で断る（範囲の外の SELECT の検査）。
+    /// `Some`なら`apply_agreed`がこの値で断る（範囲の外のSELECTの検査）。
     pub reject_agreed: Option<BadValue>,
-    /// `local_input` に渡された席（bit 0 = 1P、bit 1 = 2P）。
+    /// `local_input`に渡されたサイド（bit 0 = 1P、bit 1 = 2P）。
     pub seats_seen: u8,
-    /// 人が Esc を押している（`peek_local_input` が `ESC` を返す）。同期ズレで止めたマッチの Esc の検査用。
+    /// 人がEscを押している（`peek_local_input`が`ESC`を返す）。同期ズレで止めたマッチのEscの検査用。
     pub esc_down: bool,
-    /// `local_input` の語に足すビット（既定 0）。マスクの内外のビットを人が押した形の検査用。
+    /// `local_input`のワードに足すビット（既定0）。マスクの内外のビットを人が押した形の検査用。
     pub local_or: u16,
-    /// 数字キー 0〜9・Tab・Ctrl・Alt/Win の今の押下の集合（`Game::digit_keys`。bit の並びは `digit_keys`）。`None` は読んではいけない間。検査が tick の合間に設定する。
+    /// 数字キー0〜9・Tab・Ctrl・Alt/Winの今の押下の集合（`Game::digit_keys`。bitの並びは`digit_keys`）。`None`は読んではいけない間。検査がtickの合間に設定する。
     pub digit_held: Option<u16>,
-    /// `digit_keys` を呼ばれた回数（1 tick に 1 回、読んでよい phase だけ —— マッチの外は `dispatch`、マッチの間は取得で）。
+    /// `digit_keys`を呼ばれた回数（1 tickに1回。読んでよいphaseだけ —— マッチの外は`dispatch`、マッチの間は取得で）。
     pub digit_reads: u64,
-    /// 台本の付いている実行（`Game::scripted_run`）の印。検査が立てる（既定は false = 台本の無い実行）。
+    /// 台本の付いている実行（`Game::scripted_run`）かどうかのフラグ。検査が立てる（既定は false = 台本の無い実行）。
     pub scripted: bool,
-    /// 台本の段階の押下（`Game::digit_script`）。検査が設定し、取り出したら空になる（1 回だけ）。既定は `None`。
+    /// 台本の段階の押下（`Game::digit_script`）。検査が設定し、取り出したら空になる（1回だけ）。既定は`None`。
     pub script_press: Option<u16>,
+    /// マッチ終了時のメニューを出すかどうか（既定 false = 今までのsegの終わり）。`end_menus`回閉じたら`done`。
+    pub end_menu: bool,
+    pub end_menus: u32,
+    menu: EndMenu,
+    im2: InputState,
+    /// 閉じたメニューの (seg, 最後に使ったframe, 次の要求)・画面へ渡したもの・積んだカーソルの音・本ログへの知らせ。
+    pub end_reqs: Vec<(u16, u32, u32)>,
+    pub end_shows: Vec<end_pick::Show>,
+    pub end_se: u32,
+    /// 積んだ終わりのメニューの音（種類の順）。
+    pub end_sounds: Vec<end_pick::Se>,
+    pub end_notes: Vec<(u16, end_pick::Note, u32)>,
+    /// `Game::end_shadow`の答え。
+    pub end_shadow: bool,
 }
 
 impl FakeGame {
@@ -135,7 +154,7 @@ impl FakeGame {
             corrupt_at: None,
             select_chara: (seed % 16) as u8,
             select_map: 1,
-            // 割り当ての検査で、`on_input` の中から呼ばれる push が伸びないように先に広げておく。
+            // 割り当ての検査で`on_input`の中から呼ばれるpushが伸びないように先に広げておく。
             agreed: Vec::with_capacity(64),
             charges: Vec::with_capacity(64),
             match_starts: 0,
@@ -147,6 +166,16 @@ impl FakeGame {
             digit_reads: 0,
             scripted: false,
             script_press: None,
+            end_menu: false,
+            end_menus: 0,
+            menu: EndMenu::default(),
+            im2: InputState::new(),
+            end_reqs: Vec::new(),
+            end_shows: Vec::with_capacity(256),
+            end_se: 0,
+            end_sounds: Vec::with_capacity(64),
+            end_notes: Vec::with_capacity(64),
+            end_shadow: false,
         }
     }
 
@@ -163,6 +192,9 @@ impl FakeGame {
 
     pub fn after<P: Driver>(&mut self, a: Action, np: &mut P) {
         let mut played = false;
+        if let Some(w) = self.fed[2] {
+            self.im2.feed(w);
+        }
         match a {
             Action::RenderOnly => {
                 if np.phase() == Phase::Lockstep {
@@ -181,9 +213,15 @@ impl FakeGame {
             }
             Action::Menu => panic!("選択の画面を持たない偽のゲームでネットの選択が動いた"),
             Action::Played(r) => {
+                // メニューの外は`[2]`が2人のワードのOR。メニューの間はメニューのキーだけが変わりうる。
+                let keep = if self.menu.shown {
+                    !MENU_KEYS
+                } else {
+                    u16::MAX
+                };
                 assert_eq!(
-                    self.fed,
-                    [Some(r.p1), Some(r.p2), Some(r.p1 | r.p2)],
+                    [self.fed[0], self.fed[1], self.fed[2].map(|w| w & keep)],
+                    [Some(r.p1), Some(r.p2), Some((r.p1 | r.p2) & keep)],
                     "feed した 3 本が返しと違う"
                 );
                 assert!(self.in_match, "開始の前に試合のフレームを使った");
@@ -247,6 +285,10 @@ impl FakeGame {
                 .get(self.segs_done)
                 .copied()
                 .unwrap_or(self.frames_per_seg);
+            if self.end_menu {
+                self.end_menu_frame(len);
+                return;
+            }
             if self.frames_in_seg >= len {
                 self.segs_done += 1;
                 self.segs_in_session += 1;
@@ -265,9 +307,58 @@ impl FakeGame {
     }
 }
 
+impl FakeGame {
+    /// マッチ終了時のメニューの1フレーム（AsciiManagerの更新。使ったフレームの後）。所定のフレーム数を使ったらメニューを出す。
+    fn end_menu_frame(&mut self, len: u32) {
+        if let Some(item) = self.menu.frame(self.im2.pressed) {
+            let req = [10, 1, 6][usize::from(item)];
+            let last = self.recs.last().map_or((0, 0), |r| (r.seg, r.frame));
+            self.end_reqs.push((last.0, last.1, req));
+            self.segs_done += 1;
+            if self.end_reqs.len() as u32 >= self.end_menus {
+                self.done = true;
+            }
+            self.next = req;
+            return;
+        }
+        if !self.menu.shown && self.frames_in_seg == len {
+            self.menu = EndMenu::open(self.menu.frames);
+        }
+    }
+}
+
 impl Game for FakeGame {
     fn scenes(&mut self) -> (u32, u32) {
         (self.cur, self.next)
+    }
+
+    fn end_view(&mut self) -> end_pick::View {
+        end_pick::View {
+            shown: self.menu.shown,
+            paused: false,
+            state: self.menu.state,
+            frames: self.menu.frames,
+        }
+    }
+
+    fn end_se(&mut self, se: end_pick::Se) -> bool {
+        if se == end_pick::Se::Cursor {
+            self.end_se += 1;
+        }
+        self.end_sounds.push(se);
+        true
+    }
+
+    fn end_show(&mut self, show: &end_pick::Show) {
+        self.end_shows.push(*show);
+    }
+
+    fn end_note(&mut self, seg: u16, note: end_pick::Note, frame: u32) {
+        self.end_notes.push((seg, note, frame));
+    }
+
+    fn end_shadow(&mut self) -> bool {
+        self.end_shadow
     }
 
     fn local_input(&mut self, seat: Seat) -> u16 {
@@ -290,8 +381,8 @@ impl Game for FakeGame {
         self.scripted
     }
 
-    /// 観戦者の Esc の読み。この偽物の `local_input` は Esc を含む疑似乱数の語を返すので、そのまま読むと観戦者が勝手に抜ける。
-    /// 人は既定では何も押していない（0。`esc_down` を立てた検査だけ Esc）。`word_n` も進めない。
+    /// 観戦者のEscの読み。この偽物の`local_input`はEscを含む疑似乱数のワードを返すのでそのまま読むと観戦者が勝手に抜ける。
+    /// 人は既定では何も押していない（0。`esc_down`を立てた検査だけEsc）。`word_n`も進めない。
     fn peek_local_input(&mut self) -> u16 {
         if self.esc_down {
             higanr_core::input_model::keys::ESC
@@ -352,34 +443,36 @@ struct Packet {
 
 type Inbox = Rc<RefCell<VecDeque<Packet>>>;
 
-/// 仮の時計で動くネットワーク。2 つを `pair` で作り、互いの受信キューへ送る。送りに確保しない（受信キューは先に広げておく）。
+/// 仮の時計で動くネットワーク。2つを`pair`で作り、互いの受信キューへ送る。送信で確保しない（受信キューは先に広げておく）。
 pub struct FakeNet {
     me: SocketAddr,
-    /// 相手のアドレス（これ以外の宛先へ送ったものは届かない。`misdirected` に数える）。
+    /// 相手のアドレス（これ以外の宛先へ送ったものは届かない。`misdirected`に数える）。
     peer: SocketAddr,
-    /// 相手以外の宛先へ送った数（候補が 1 つの検査では 0 のはず）。
+    /// 相手以外の宛先へ送った数（候補が1つの検査では0のはず）。
     pub misdirected: u32,
     clock: Rc<Cell<u64>>,
     inbox: Inbox,
     peer_inbox: Inbox,
     pub delay_us: u64,
-    /// 送った n 通目（1 から）がこの倍数なら落とす（0 なら落とさない）。
+    /// 送ったn通目（1から）がこの倍数なら落とす（0なら落とさない）。
     pub drop_every: u32,
     pub sent: u32,
     pub dropped: u32,
     pub waits: u32,
-    /// 送った HGRT の 1 通を、ヘッダの type（offset 5）ごとに数えた数。対戦の成立の前に MENU・INPUT・CHECK などを送っていないことを見る。
+    /// 送ったHGRTの1通をヘッダのtype（offset 5）ごとに数えた数。対戦の成立の前にMENU・INPUT・CHECKなどを送っていないことを見る。
     pub types: [u32; 32],
-    /// `link_up`（接続の手順が成り立った知らせ）を受けた回数。本物は STUN の聞き直しをこれで止める。
+    /// `link_up`（接続の手順が成り立った知らせ）を受けた回数。本物はSTUNの聞き直しをこれで止める。
     pub link_ups: u32,
-    /// `own_port_varies` が返す値（2 か所目の STUN の比べの偽。既定は比べられていない `None`）。
+    /// `own_port_varies`が返す値（2か所目のSTUNとの比較の偽の結果。既定は比較していない`None`）。
     pub varies: Option<bool>,
-    /// `own_nat` が返す UPnP の割り当ての有無（偽。既定は割り当てなし）。
+    /// `own_nat`が返すUPnPの割り当ての有無（偽。既定は割り当てなし）。
     pub upnp: bool,
-    /// `note_delay` で受けた往復の要約のうち、最後の「標本あり」と、その回数。
+    /// `note_delay`で受けた往復の要約のうち最後の「サンプルあり」とその回数。
     pub delay_last: Option<higanr_core::rtt_probe::DelaySnapshot>,
+    /// 最後に渡された自分の上り（B/s）。
+    pub host_uplink_last: u32,
     pub delay_notes: u32,
-    /// 観戦者の受け取り（`watch_install`）。設定されたら、届いた便は全部これが受ける（本物の受信スレッドの代わりに `run_watch` が回す）。
+    /// 観戦者の受け取り（`watch_install`）。設定されたら届いたパケットは全部これが受ける（本物の受信スレッドの代わりに`run_watch`が回す）。
     watch: Option<WatchRecv>,
 }
 
@@ -407,6 +500,7 @@ impl FakeNet {
             varies: None,
             upnp: false,
             delay_last: None,
+            host_uplink_last: 0,
             delay_notes: 0,
             watch: None,
         };
@@ -415,7 +509,7 @@ impl FakeNet {
         (na, nb, clock)
     }
 
-    /// 相手でない送り元 `from` から 1 通届いた形にする（今の時刻に着く。「候補に無い送り元」の検査用）。
+    /// 相手でない送り元`from`から1通届いた形にする（今の時刻に着く。「候補に無い送り元」の検査用）。
     pub fn inject_from(&self, from: SocketAddr, bytes: &[u8]) {
         let mut p = Packet {
             due: self.clock.get(),
@@ -433,8 +527,9 @@ impl FakeNet {
         self.inbox.borrow().front().map(|p| p.due)
     }
 
-    /// 受信スレッドの代わりの 1 周: 届いている便を観戦者の受け取りへ渡し、周回の仕事をする。ゲームのスレッドが時計を読む・待つたびに回るので、
-    /// 本物の受信スレッドと同じく、ゲームのスレッドの tick の間にも受ける。ゲームのスレッドが止まっている形は、検査がこれを直に呼ぶ。
+    /// 受信スレッドの代わりの1周: 届いているパケットを観戦者の受け取りへ渡し、周回の処理をする。
+    /// ゲームのスレッドが時計を読む・待つたびに回るので、本物の受信スレッドと同じくゲームのスレッドのtickの間にも受ける。
+    /// ゲームのスレッドが止まっている形では、検査がこれを直接呼ぶ。
     pub fn run_watch(&mut self) {
         let Some(mut r) = self.watch.take() else {
             return;
@@ -531,6 +626,10 @@ impl Net for FakeNet {
             self.delay_last = snap;
             self.delay_notes += 1;
         }
+    }
+
+    fn note_host_uplink(&mut self, bps: u32) {
+        self.host_uplink_last = bps;
     }
 
     fn own_port_varies(&mut self) -> Option<bool> {

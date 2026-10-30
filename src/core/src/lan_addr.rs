@@ -1,8 +1,9 @@
-//! LAN のホストのアドレス（`IPv4:ポート`）の入力と読み方（pure。確保しない）。
+//! LANのホストのアドレス（`IPv4:ポート`）の入力と読み方（pure。確保しない）。
 //!
-//! メニューの「クライアント」「観戦」で、対戦のホストが画面に出したアドレスをキーボードで打つ。文字の受け方はルーム名・プレイヤー名の入力と同じ
-//! （`room_input::classify_by`。全角の数字・記号は半角に直して受ける）で、受ける文字だけが違う（数字・`.`・`:`）。決めたアドレスは ini の
-//! `[netplay] lan_host` に書き戻し、次に打つときの初めの値にする（書き戻すのは dll の仕事）。
+//! メニューの「クライアント」「観戦」で対戦のホストが画面に出したアドレスをキーボードで打つ。
+//! 文字の受け方はルーム名・プレイヤー名の入力と同じ（`room_input::classify_by`。全角の数字・記号は半角に直して受ける）。
+//! 違うのは受ける文字だけ（数字・`.`・`:`）。
+//! 決定したアドレスはiniの`[netplay] lan_host`に書き戻し、次に打つときの初めの値にする（書き戻すのはdllの仕事）。
 
 use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -10,10 +11,10 @@ use crate::guard::{self, Scope};
 use crate::room_input::{Edit, TextKey, classify_by};
 use crate::vpn_net::VpnSet;
 
-/// ポートを省いたときのポート。ホストが待つポートの既定でもある（ゲームの受信ソケットの既定 `bind = auto:17723` と同じ数）。
+/// ポートを省いたときのポート。ホストが待つポートの既定でもある（対戦用受信ソケットの既定`bind = auto:17723`と同じ数）。
 pub const DEFAULT_PORT: u16 = 17723;
 
-/// 入力できる長さ。`255.255.255.255:65535` の 21 文字。
+/// 入力できる長さ。`255.255.255.255:65535`の21文字。
 pub const ADDR_MAX: usize = 21;
 
 /// 打てる文字（数字・`.`・`:`）。
@@ -21,7 +22,7 @@ pub fn accepts_char(c: char) -> bool {
     c.is_ascii_digit() || c == '.' || c == ':'
 }
 
-/// LAN のホストの待ち受けの場所。
+/// LANのホストの待ち受けの場所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanAddr {
     pub ip: Ipv4Addr,
@@ -33,7 +34,7 @@ impl LanAddr {
         SocketAddrV4::new(self.ip, self.port)
     }
 
-    /// `ADDR_MAX` 文字までの入力の形（初めの値にするとき）。ポートが既定なら省く。
+    /// `ADDR_MAX`文字までの入力の形（初めの値にするとき）。ポートが既定なら省く。
     pub fn to_buf(self) -> AddrBuf {
         let mut b = AddrBuf::new();
         let mut tmp = [0u8; ADDR_MAX];
@@ -45,7 +46,7 @@ impl LanAddr {
     }
 }
 
-/// `addr` を `tmp` に書いた文字列（`192.168.0.2` か `192.168.0.2:19000`。ポートが既定なら省く）。確保しない。
+/// `addr`を`tmp`に書いた文字列（`192.168.0.2`か`192.168.0.2:19000`。ポートが既定なら省く）。確保しない。
 fn write_addr(tmp: &mut [u8; ADDR_MAX], a: LanAddr) -> &str {
     let mut n = 0;
     let mut put = |b: u8| {
@@ -115,7 +116,7 @@ impl AddrBuf {
         core::str::from_utf8(self.buf.get(..self.len).unwrap_or(&[])).unwrap_or("")
     }
 
-    /// 受けない文字か上限なら足さずに false。
+    /// 受けない文字か上限なら足さずにfalse。
     pub fn push(&mut self, c: char) -> bool {
         if !accepts_char(c) {
             return false;
@@ -141,7 +142,7 @@ impl AddrBuf {
         true
     }
 
-    /// ini の値から（読めなければ空）。決まりの外のアドレスは捨てて空にする。
+    /// iniの値から（読めなければ空）。決まりの外のアドレスは捨てて空にする。
     pub fn from_ini(s: Option<&str>) -> AddrBuf {
         match s.map(str::trim).and_then(|t| parse(t).ok()) {
             Some(a) => a.to_buf(),
@@ -162,20 +163,20 @@ impl AddrBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrWhy {
     Empty,
-    /// `192.168.0.2` か `192.168.0.2:17723` の形でない。
+    /// `192.168.0.2`か`192.168.0.2:17723`の形でない。
     Form,
-    /// ポートが 1〜65535 でない。
+    /// ポートが1〜65535でない。
     Port,
-    /// LAN のアドレス（私設・リンクローカル・自分の PC の VPN のネットワークの中。試験用に loopback も）でない。
+    /// LANのアドレス（私設・リンクローカル・自分のPCのVPNのネットワークの中。試験用にloopbackも）でない。
     NotLan,
 }
 
-/// 打ったアドレスを読む。`IPv4` か `IPv4:ポート`（前後の空白は除く）。ポートを省けば `DEFAULT_PORT`。LAN の範囲の外は `NotLan`。
+/// 打ったアドレスを読む。`IPv4`か`IPv4:ポート`（前後の空白は除く）。ポートを省けば`DEFAULT_PORT`。LANの範囲の外は`NotLan`。
 pub fn parse(s: &str) -> Result<LanAddr, AddrWhy> {
     parse_with(s, &VpnSet::NONE)
 }
 
-/// `parse` に、自分の PC の VPN のネットワーク `vpn` の中のアドレスも通すもの。
+/// `parse`に自分のPCのVPNのネットワーク`vpn`の中のアドレスも通すもの。
 pub fn parse_with(s: &str, vpn: &VpnSet) -> Result<LanAddr, AddrWhy> {
     let a = parse_form(s)?;
     let in_lan = guard::reach(core::net::IpAddr::V4(a.ip)).is_some_and(|r| r <= Scope::Lan);
@@ -186,8 +187,8 @@ pub fn parse_with(s: &str, vpn: &VpnSet) -> Result<LanAddr, AddrWhy> {
     }
 }
 
-/// 形とポートだけを検証し、範囲は見ない（どの範囲でも使えないアドレス = 未指定・マルチキャスト・ブロードキャスト・0.x は `NotLan`）。
-/// ini の `lan_host` は VPN の範囲のアドレスも書かれるが、VPN が接続しているかは起動のときに分からないので、これで読む。
+/// 形とポートだけを検証し、範囲は見ない（どの範囲でも使えないアドレス = 未指定・マルチキャスト・ブロードキャスト・0.xは`NotLan`）。
+/// iniの`lan_host`にはVPNの範囲のアドレスも書かれる。VPNが接続しているかどうかは起動時に分からないのでこれで読む。
 pub fn parse_form(s: &str) -> Result<LanAddr, AddrWhy> {
     let t = s.trim();
     if t.is_empty() {
@@ -319,7 +320,7 @@ mod tests {
         ] {
             assert_eq!(parse(text), Err(why), "{text:?}");
         }
-        // 試験のための loopback は通す。
+        // 試験のためのloopbackは通す。
         assert!(parse("127.0.0.1:47001").is_ok());
     }
 
@@ -357,18 +358,18 @@ mod tests {
             if !ok {
                 assert_eq!(got, Err(AddrWhy::NotLan), "{text}");
             }
-            // VPN のネットワークが無ければ、今までどおり私設と loopback だけ。
+            // VPNのネットワークが無ければ今までどおり私設とloopbackだけ。
             assert_eq!(
                 parse(text).is_ok(),
                 text.starts_with("192.168.") || text.starts_with("10.") || text.starts_with("127."),
                 "{text}"
             );
         }
-        // 形とポートの断りは、範囲より先。
+        // 形とポートの断りは範囲より先。
         assert_eq!(parse_with("26.1.2.3:0", &set), Err(AddrWhy::Port));
         assert_eq!(parse_with("26.1.2", &set), Err(AddrWhy::Form));
         assert_eq!(parse_with("", &set), Err(AddrWhy::Empty));
-        // 入力の欄から（`AddrBuf::parse_with`）。
+        // 入力のフィールドから（`AddrBuf::parse_with`）。
         let i = typed("26.1.2.3");
         assert_eq!(i.text().parse(), Err(AddrWhy::NotLan));
         assert_eq!(i.text().parse_with(&set).map(|a| a.port), Ok(DEFAULT_PORT));
@@ -445,7 +446,7 @@ mod tests {
             port: DEFAULT_PORT,
         };
         assert_eq!(a.to_buf().as_str(), "192.168.1.20");
-        // ini の値が決まりの外なら空から始める。
+        // iniの値が決まりの外なら空から始める。
         for bad in [
             None,
             Some(""),

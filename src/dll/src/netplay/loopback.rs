@@ -1,11 +1,10 @@
-//! 組み上がりの検査: 偽のゲームを回すスレッドと peer_sim（`sim::run`）のスレッドを同じプロセスで loopback に接続する。dll の側は
-//! 本物の通信層（`net_udp`: ソケット・受信スレッド・リング・受信のイベントと高分解能の待機タイマー）と `NetPlay`。
-//! 本物の UDP の上で、接続 → 止める地点 → SELECT → lockstep（再戦で seg を進める）→ BYE を通し、dll と peer_sim の
-//! (seg, frame, 1P, 2P) の列と CHECK（入力の列のダイジェスト）が一致すること、ローカル入力を描画だけのフレームの後に読み直さないこと、
-//! ゲームスレッドの `on_input` が確保しないことを見る。付いていく形の 2 本（`peer_sim_follows_*`）は、マッチごとに長さの違う偽のゲーム
-//! （peer_sim は長さを知らない）で、再戦とメニューへ戻っての次の選択を通す。`peer_sim_menu_plan_walks_*` は選択の画面を持つ偽のゲーム
-//! （`menu_tests::MenuGame`）と選択の台本で動く peer_sim で、ネットの選択を 2 回通す。
-//! 実時間で走る（1 本 10 秒ほど）ので `#[ignore]`。全件の回（`build.bat`）が `--ignored` で走らせる。
+//! 組み上がりの検査: 偽のゲームを回すスレッドとpeer_sim（`sim::run`）のスレッドを同じプロセスでloopbackに接続する。
+//! dllの側は本物の通信層（`net_udp`: ソケット・受信スレッド・リング・受信のイベントと高分解能の待機タイマー）と`NetPlay`を使う。
+//! 本物のUDPの上で接続 → 止める地点 → SELECT → lockstep（再戦でsegを進める）→ BYEを通す。
+//! 次を見る: dllとpeer_simの (seg, frame, 1P, 2P)の列とCHECK（入力の列のダイジェスト）が一致すること・ローカル入力を描画だけのフレームの後に読み直さないこと・ゲームスレッドの`on_input`が確保しないこと。
+//! 付いていく形の2本（`peer_sim_follows_*`）は、マッチごとに長さの違う偽のゲーム（peer_simは長さを知らない）で再戦とメニューへ戻っての次の選択を通す。
+//! `peer_sim_menu_plan_walks_*`は選択の画面を持つ偽のゲーム（`menu_tests::MenuGame`）と選択の台本で動くpeer_simで、ネットの選択を2回通す。
+//! 実時間で走る（1本10秒ほど）ので`#[ignore]`。全件の実行（`build.bat`）が`--ignored`で走らせる。
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,7 +23,7 @@ use crate::spectate_testkit::{Behavior, Seen, attach, expected_selects, fold};
 const SID: u32 = 0x5EED_3001;
 const SEGS: u32 = 3;
 const FRAMES: u32 = 120;
-/// 付いていく形のマッチの長さ（1 回目の選択で 2 マッチ、メニューへ戻って 2 回目の選択で 2 マッチ）。
+/// 付いていく形のマッチの長さ（1回目の選択で2マッチ、メニューへ戻って2回目の選択で2マッチ）。
 const FOLLOW_LENGTHS: [u32; 4] = [150, 45, 200, 90];
 
 struct Case {
@@ -33,24 +32,24 @@ struct Case {
     lengths: Vec<u32>,
     segs_per_session: u32,
     sessions: u32,
-    /// dll の latency の切替の予定（ホストのとき）。
+    /// dllのlatencyの切替の予定（ホストのとき）。
     dll_lat_plan: Vec<(u64, u8)>,
-    /// peer_sim の切替の台本（ホストのとき）と、peer_sim が送るパケットの壊し方。
+    /// peer_simの切替の台本（ホストのとき）とpeer_simが送るパケットの壊し方。
     sim_lat: Vec<LatStep>,
     sim_fault: FaultConfig,
-    /// dll は ini に秘密を書かずに開き（`net_udp::prepare_link` が OS の乱数で引き、偽の STUN に問い合わせ、自分の接続コードを作る）、
-    /// peer_sim はそのコードから session・秘密・候補を取る（peer_sim の `--code` と同じ読み方）。
+    /// dllはiniに秘密の乱数を書かずに開く（`net_udp::prepare_link`がOSの乱数で生成し、偽のSTUNに問い合わせ、自分の接続コードを作る）。
+    /// peer_simはそのコードからsession・秘密の乱数・候補を取る（peer_simの`--code`と同じ読み方）。
     via_code: bool,
-    /// dll の受信ソケットに接続する観戦者（空なら観戦のホストを設定しない）。
+    /// dllの受信ソケットに接続する観戦者（空なら観戦のホストを設定しない）。
     spectators: Vec<Behavior>,
-    /// 遅れの量の選び: 空でなければ dll の `Config::delay_pick` を立て、dll の使ったフレームの数がこの範囲の間だけ、
-    /// Ctrl+その数字を押し続ける（範囲の始まりで 1 回の押下）。
+    /// 遅れの量の選択: 空でなければdllの`Config::delay_pick`を立てる。
+    /// dllの使ったフレームの数がこの範囲の間だけCtrl+その数字を押し続ける（範囲の始まりで1回の押下）。
     pick_windows: Vec<(usize, usize, u8)>,
-    /// ホストの決め方: 両者が使い、`dll_is_host` の側を検査用の値で太く見せる。role_nonce は逆にする（nonce のままならもう片方がホスト）。
+    /// ホストの決め方: 両者が使う。`dll_is_host`の側を検査用の値で太く見せる。role_nonceは逆にする（nonceのままならもう片方がホスト）。
     host_pick: bool,
 }
 
-/// ホストの決め方の検査で、太く見せる側と細く見せる側の見積もり（B/s）。差は 100 倍。
+/// ホストの決め方の検査で太く見せる側と細く見せる側の見積もり（B/s）。差は100倍。
 const FAT_UP: u32 = 10_000_000;
 const THIN_UP: u32 = 100_000;
 
@@ -58,7 +57,7 @@ fn lo() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-/// dll がホストなら peer_sim の nonce を小さく。席はホストが 2P（役割と席を入れ違いにする）。
+/// dllがホストならpeer_simのnonceを小さく。サイドはホストが2P（役割とサイドを入れ違いにする）。
 fn run(case: Case) -> Outcome {
     let dll_is_host = case.dll_is_host;
     let total: u32 = case.lengths.iter().sum();
@@ -76,7 +75,7 @@ fn run(case: Case) -> Outcome {
     } else {
         (0x0001, 0xF000)
     };
-    // 各台の見積もりは相手の上り: ホストに決まるべき側を、相手から見て太く見せる。
+    // 各台の見積もりは相手の上り: ホストに決まるべき側を相手から見て太く見せる。
     let pick = |peer_is_host: bool| {
         case.host_pick.then_some(higanr_core::host_pick::Setup {
             nat: higanr_core::nat::NatMark::UNKNOWN,
@@ -326,7 +325,7 @@ fn run(case: Case) -> Outcome {
         if r0 != 3 {
             assert_eq!(seen.get(1), Some(&r0), "{role}: 推奨値へ移らない {seen:?}");
         }
-        // 推奨値が 5 のときは 5 の押下で値が動かず、見分けられない（押下の数は上の `digits` が見る）。
+        // 推奨値が5のときは5の押下で値が動かず見分けられない（押下の数は上の`digits`が見る）。
         if r0 != 5 {
             assert!(
                 seen.contains(&5),
@@ -437,9 +436,9 @@ fn run(case: Case) -> Outcome {
 }
 
 struct Outcome {
-    /// 一致した CHECK の数（dll の側）。
+    /// 一致したCHECKの数（dllの側）。
     checks: u32,
-    /// dll がセッションを作ってから接続するまで（ms）。
+    /// dllがセッションを作ってから接続するまで（ms）。
     connect_ms: u32,
     dll_stalls: u64,
     dll_max_stall_run: u32,
@@ -449,7 +448,7 @@ struct Outcome {
     snapshot: Option<crate::spectate_host::Snapshot>,
 }
 
-/// 普通の観戦者が受けた記録の列を、dll と peer_sim の使った列と全行比べる（再戦をまたぐ seg を含む）。
+/// 普通の観戦者が受けた記録の列をdllとpeer_simの使った列と全行比べる（再戦をまたぐsegを含む）。
 fn assert_normal_observer(
     role: &str,
     seen: &Seen,
@@ -522,8 +521,8 @@ fn dll_as_guest_plays_against_peer_sim() {
     run(fixed_case(false));
 }
 
-/// 組み上がり: ini に秘密が無いとき、dll が OS の乱数で秘密を引き、自分の接続コードに秘密・session・受信ソケット（STUN で見えたアドレス）を載せ、
-/// peer_sim がそのコードから dll に接続できる。マッチの列は `dll_as_host_plays_against_peer_sim` と同じ形で見る。
+/// 組み上がり: iniに秘密の乱数が無いときdllがOSの乱数で秘密の乱数を生成し、自分の接続コードに秘密の乱数・session・受信ソケット（STUNで見えたアドレス）を載せる。
+/// peer_simがそのコードからdllに接続できること。マッチの列は`dll_as_host_plays_against_peer_sim`と同じ形で見る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn dll_initiates_with_an_os_secret_and_peer_sim_joins_by_its_code() {
@@ -533,9 +532,9 @@ fn dll_initiates_with_an_os_secret_and_peer_sim_joins_by_its_code() {
     });
 }
 
-/// 相手が後から起きても接続する: dll の接続の手順が 10 秒の時間切れでやめたまま作り直さない、作り直しを数えない、相手のポートがまだ開いていない
-/// 間の送信（ICMP の port unreachable が `WSAECONNRESET` で返る）で受信スレッドが止まる、を見る。peer_sim のポートは起きるまで閉じておく
-/// （番号だけ先に取って離し、15 秒後に同じ番号で開き直す）。実時間で約 20 秒。逆向き（peer_sim が先に起きて dll が遅れる）は peer_sim の側に作り直しの入口が要る。
+/// 相手が後から起動しても接続する。次のどれも起きないことを見る: dllの接続の手順が10秒の時間切れでやめたまま作り直さない・作り直しを数えない・相手のポートがまだ開いていない間の送信で受信スレッドが止まる（ICMPのport unreachableが`WSAECONNRESET`で返る）。
+/// peer_simのポートは起動するまで閉じておく（番号だけ先に取って離し、15秒後に同じ番号で開き直す）。実時間で約20秒。
+/// 逆向き（peer_simが先に起動してdllが遅れる）はpeer_simの側に作り直しの入口が要る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_waking_15_seconds_late_still_connects() {
@@ -698,8 +697,9 @@ fn follow_case(dll_is_host: bool) -> Case {
     }
 }
 
-/// ホストの決め方: role_nonce では peer_sim がホストになる組で、dll を検査用の値で太く見せると dll がホストになり、マッチの列が一致する
-/// （席・delay も dll の側の値。`run` が見る）。peer_sim も同じ値で決める（決め方の材料が入れ違いで同じ —— `run` の `pick`）。
+/// ホストの決め方: role_nonceではpeer_simがホストになる組み合わせで、dllを検査用の値で太く見せるとdllがホストになり、マッチの列が一致する。
+/// サイド・delayもdllの側の値（`run`が見る）。
+/// peer_simも同じ値で決める（決め方の材料が入れ違いで同じ —— `run`の`pick`）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn the_side_shown_fatter_hosts_against_peer_sim() {
@@ -709,7 +709,7 @@ fn the_side_shown_fatter_hosts_against_peer_sim() {
     });
 }
 
-/// 逆の向き: role_nonce では dll がホストになる組で、peer_sim を太く見せると peer_sim がホストになり、マッチの列が一致する。
+/// 逆の向き: role_nonceではdllがホストになる組み合わせで、peer_simを太く見せるとpeer_simがホストになり、マッチの列が一致する。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_shown_fatter_hosts_against_the_dll() {
@@ -719,8 +719,8 @@ fn peer_sim_shown_fatter_hosts_against_the_dll() {
     });
 }
 
-/// 近い相手（loopback）で、接続までの時間がホストの決め方でどれだけ増えるか（本ログ用の実測。合否は増分が待つ上限を越えないことだけ）。
-/// 短いマッチ 1 つを、決め方を使う組と使わない組で 3 回ずつ（1 回約 4.5 秒）。
+/// 近い相手（loopback）で接続までの時間がホストの決め方でどれだけ増えるか（本ログ用の実測。合否は増分が待つ上限を越えないことだけ）。
+/// 短いマッチ1つを、決め方を使う設定と使わない設定で3回ずつ走らせる（1回約4.5秒）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn host_pick_connect_time_on_loopback() {
@@ -751,8 +751,9 @@ fn host_pick_connect_time_on_loopback() {
     );
 }
 
-/// 遅れの量をホストが決める: dll がホストで、Ctrl+数字で delay 方式の遅れを変えたとき、peer_sim（ゲスト。付いていく形・
-/// 送りを固定 seed で乱す）と使った後の delay の列・マッチの列が一致する。期間 1 は seg 0 の 60〜71（5）、期間 2 は seg 2 の 25〜32（2）（マッチの長さ 150・45・200・90）。
+/// 遅れの量をホストが決める: dllがホストでCtrl+数字によりdelay方式の遅れを変えたとき、使った後のdelayの列・マッチの列がpeer_simと一致する。
+/// peer_simはゲストで、付いていく形。送信は固定seedで乱す。
+/// 期間1はseg 0の60〜71（5）、期間2はseg 2の25〜32（2）（マッチの長さ150・45・200・90）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_follows_the_dll_host_digit_keys() {
@@ -770,8 +771,8 @@ fn peer_sim_follows_the_dll_host_digit_keys() {
     });
 }
 
-/// dll がホストで予定どおりに latency を切り替えたとき（増やす・減らす・次の seg で増やす）、peer_sim（付いていく形）と使った後の delay の列・
-/// マッチの列が一致する。固定 seed の乱れの下でも止まらない。切替はマッチの終わりから離して設定する。
+/// dllがホストで予定どおりにlatencyを切り替えたとき（増やす・減らす・次のsegで増やす）、使った後のdelayの列・マッチの列がpeer_sim（付いていく形）と一致する。
+/// 固定seedの乱れの下でも止まらない。切替はマッチの終わりから離して設定する。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_follows_dll_host_latency_switches_under_seeded_losses() {
@@ -789,7 +790,7 @@ fn peer_sim_follows_dll_host_latency_switches_under_seeded_losses() {
     });
 }
 
-/// dll がゲストで、peer_sim（ホスト。付いていく形）が台本どおりに切り替えたとき、両者の delay の列・マッチの列が一致する。決め打ちのロス（13 通ごとに 3 通続けて落とす）の下でも止まらない。
+/// dllがゲストでpeer_sim（ホスト。付いていく形）が台本どおりに切り替えたとき、両者のdelayの列・マッチの列が一致する。決め打ちのロス（13通ごとに3通続けて落とす）の下でも止まらない。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn dll_guest_follows_peer_sim_host_latency_switches_under_fixed_losses() {
@@ -832,8 +833,8 @@ fn peer_sim_follows_dll_as_guest_through_rematch_and_menu() {
     run(follow_case(false));
 }
 
-/// 観戦者: dll がホスト（席は 2P）で、普通の観戦者が受けた列が、dll と peer_sim の使ったマッチの語（再戦と、メニューへ戻って次の選択に入る seg をまたぐ 5 つの seg）と
-/// 全行一致する。seg の始まり・SELECT・終わりが欠けたり順が違ったりせず、観戦者が 2 人でも流れ、観戦のパケットが対戦のセッションへ回らない。
+/// 観戦者: dllがホスト（サイドは2P）で、普通の観戦者が受けた列がdllとpeer_simの使ったマッチのワード（再戦と、メニューへ戻って次の選択に入るsegをまたぐ5つのseg）と全行一致する。
+/// segの始まり・SELECT・終わりが欠けたり順が違ったりしない。観戦者が2人でも流れ、観戦のパケットが対戦のセッションへ回らない。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn spectators_of_the_dll_host_see_the_same_match_as_the_dll_and_peer_sim() {
@@ -847,7 +848,7 @@ fn spectators_of_the_dll_host_see_the_same_match_as_the_dll_and_peer_sim() {
     assert_eq!((snap.ring.gaps, snap.ring.dropped_full), (0, 0), "{snap:?}");
 }
 
-/// 観戦が dll の役割に依らない（ゲストの席・ゲストの STEP の経路でも積む。席の取り違えが無い）。dll がゲスト 1P・peer_sim がホスト。
+/// 観戦がdllの役割に依らない（ゲストのサイド・ゲストのSTEPの経路でも積む。サイドの取り違えが無い）。dllがゲスト1P・peer_simがホスト。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn spectators_of_the_dll_guest_see_the_same_match_as_the_dll_and_peer_sim() {
@@ -857,10 +858,11 @@ fn spectators_of_the_dll_guest_see_the_same_match_as_the_dll_and_peer_sim() {
     });
 }
 
-/// 対戦する側への遅延の増分 0: 観戦者が黙る・ACK を返さない・途中で消えるとき、dll の使った列・delay の列が観戦者なしの実行と変わらず、
-/// stall が観戦者なしより増えない（ゲームのスレッドが観戦者を待たない・受信スレッドが詰まらない）。普通の観戦者は巻き込まれず、
-/// dll からの、黙った観戦者への送り直しはある。観戦者なしの実行と観戦者 4 人（普通・ACK なし・黙る・40 記録で消える）の実行を続けて走らせて比べる。
-/// stall は実時間の値（peer_sim の読み込み 300 ms を待つ分が大半）なので、増えた分が読み込みの揺らぎより大きいかで見る。
+/// 対戦する側への遅延の増分0: 観戦者が黙る・ACKを返さない・途中で消えるとき、dllの使った列・delayの列が観戦者なしの実行と変わらない。
+/// stallも観戦者なしより増えない（ゲームのスレッドが観戦者を待たない・受信スレッドが詰まらない）。
+/// 普通の観戦者は巻き込まれない。dllからの黙った観戦者への再送はある。
+/// 観戦者なしの実行と観戦者4人（普通・ACKなし・黙る・40記録で消える）の実行を続けて走らせて比べる。
+/// stallは実時間の値（peer_simの読み込み300 msを待つ分が大半）なので、増えた分が読み込みの揺らぎより大きいかで見る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn silent_slow_and_vanishing_spectators_do_not_change_the_dll_or_its_stalls() {
@@ -892,8 +894,8 @@ fn silent_slow_and_vanishing_spectators_do_not_change_the_dll_or_its_stalls() {
     for (b, seen) in &spec.spectated {
         match b {
             Behavior::Normal => {}
-            // ウィンドウちょうどで止まることは `spectate_host::tests` が見る。ここはマッチがウィンドウより短く、長くしても記録は
-            // 実時間で積まれるので、ウィンドウぶん積まれる前に黙った観戦者として外れる（`SILENT_MS`）。
+            // ウィンドウちょうどで止まることは`spectate_host::tests`が見る。
+            // ここはマッチがウィンドウより短い。長くしても記録は実時間で積まれるので、ウィンドウぶん積まれる前に黙った観戦者として外れる（`SILENT_MS`）。
             Behavior::NoAck => assert!(!seen.recs.is_empty(), "ACK を返さない観戦者が何も受けない"),
             Behavior::Silent => assert_eq!(seen.datagrams, 0),
             Behavior::Vanish(n) => assert!(seen.recs.len() >= *n),
@@ -904,12 +906,12 @@ fn silent_slow_and_vanishing_spectators_do_not_change_the_dll_or_its_stalls() {
     assert_eq!(snap.host.joined, 4, "{snap:?}");
 }
 
-/// 観戦者の上限（`MAX_SPECTATORS`）。上限を下げると、この人数が入れずに検査が落ちる。
+/// 観戦者の上限（`MAX_SPECTATORS`）。上限を下げるとこの人数が入れずに検査が落ちる。
 const FULL_HOUSE: usize = 10;
 
-/// 観戦者が上限の 10 人全員普通に観戦しても、対戦が観戦者なしの実行と変わらない: dll の使った列・delay の列が同じで、
-/// CHECK が一致し続け（ずれれば BYE で終わる）、stall が増えない。全員がマッチの語・SELECT・
-/// 再戦をまたぐ seg を対戦する側と全行一致で受ける（`run` の中の `assert_normal_observer`）。
+/// 観戦者が上限の10人全員普通に観戦しても、対戦が観戦者なしの実行と変わらない。
+/// dllの使った列・delayの列が同じで、CHECKが一致し続け（ずれればBYEで終わる）、stallが増えない。
+/// 全員がマッチのワード・SELECT・再戦をまたぐsegを対戦する側と全行一致で受ける（`run`の中の`assert_normal_observer`）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn a_full_house_of_spectators_does_not_change_the_dll_or_its_stalls() {
@@ -947,21 +949,22 @@ fn a_full_house_of_spectators_does_not_change_the_dll_or_its_stalls() {
     assert_eq!(full.spectated.len(), FULL_HOUSE);
 }
 
-/// stall の回数の揺らぎとして許す幅。同じ PC で観戦者なしを 7 回走らせて stall は 24〜35 回（最長の連続はどれも 15）、観戦者 4 人ありを 6 回走らせて
-/// 24〜32 回（最長 14〜15）だった（実測）。観戦者をゲームのスレッドが待てば 1 フレームごとに stall が出て数百回増えるので、揺らぎの最大の差（11）を越える 12 を許す。
+/// stallの回数の揺らぎとして許す幅。
+/// 同じPCで観戦者なしを7回走らせてstallは24〜35回（最長の連続はどれも15）。観戦者4人ありを6回走らせて24〜32回（最長14〜15）だった（実測）。
+/// 観戦者をゲームのスレッドが待てば1フレームごとにstallが出て数百回増える。そのため揺らぎの最大の差（11）を越える12を許す。
 const STALL_JITTER: u64 = 12;
 
-/// 選択の画面を持つ偽のゲーム（`menu_tests::MenuGame`。dll がホスト 1P）と、選択の台本で動く peer_sim（`--follow --menu`。ゲスト 2P）で、
-/// 画面を移る押下の列・ゲストの要求（キャラの決定・マップ −2）・止める地点での −2 の置き換え・マッチから戻った 2 回目の選択（キャラ選択から）・
-/// 同じキャラの色の決まりが両者で一致し、マッチの列が揃い、`on_input` が確保しない。
+/// 選択の画面を持つ偽のゲーム（`menu_tests::MenuGame`。dllがホスト1P）と、選択の台本で動くpeer_sim（`--follow --menu`。ゲスト2P）で次を見る。
+/// 画面を移る押下の列・ゲストの要求（キャラの決定・マップ −2）・止める地点での −2の置き換え・マッチから戻った2回目の選択（キャラ選択から）・同じキャラの色の決まりが両者で一致する。
+/// マッチの列が揃う。`on_input`が確保しない。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn peer_sim_menu_plan_walks_the_selection_with_the_dll() {
     menu_plan_walk(false);
 }
 
-/// 上の実行の間、観戦者が受けた列が、dll の入った押下（12 個。合わせを含む）・マッチの語（180 行）・選択の tick の数（Menu の記録）・
-/// SELECT（止める地点ごとに 1P → 2P。2P は peer_sim が決めたキャラ・色）と全部一致する。観戦の経路は押下の値を変えない。
+/// 上の実行の間に観戦者が受けた列が、dllの入った押下（12個。合わせを含む）・マッチのワード（180行）・選択のtickの数（Menuの記録）・SELECT（止める地点ごとに1P → 2P。2Pはpeer_simが決めたキャラ・色）と全部一致する。
+/// 観戦の経路は押下の値を変えない。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn a_spectator_sees_the_selection_presses_and_match_of_the_menu_plan_walk() {
@@ -1098,7 +1101,7 @@ fn menu_plan_walk(spectate: bool) {
     };
     let d = StepKind::Decide;
     let al = StepKind::Align;
-    // キャラ選択（8）は合わせない（相手の席は MENU の位置で書く）。
+    // キャラ選択（8）は合わせない（相手のサイドはMENUの位置で書く）。
     let expected = vec![
         st(0, al, 1, 7),
         st(1, d, 1, 7),
@@ -1218,8 +1221,9 @@ fn menu_plan_walk(spectate: bool) {
     );
 }
 
-/// dll がゲスト 1P・peer_sim がホスト 2P（`--follow --menu`）のネットの選択で、dll の押下（難易度・キャラ・マップ）が要求としてホストに入り、
-/// 入った押下の列・揃った値・マッチの列が両者で一致する。マップは具体の値だけ（ゲストの −2 は peer_sim のホストが置き換えない）。
+/// dllがゲスト1P・peer_simがホスト2P（`--follow --menu`）のネットの選択で、dllの押下（難易度・キャラ・マップ）が要求としてホストに入ることを見る。
+/// 入った押下の列・揃った値・マッチの列が両者で一致する。
+/// マップは具体の値だけ（ゲストの −2はpeer_simのホストが置き換えない）。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn the_dll_as_guest_walks_the_selection_with_a_host_peer_sim() {
@@ -1336,7 +1340,7 @@ fn the_dll_as_guest_walks_the_selection_with_a_host_peer_sim() {
         .iter()
         .filter(|s| s.kind != StepKind::Align)
         .count();
-    // 合わせは難易度・マップの画面に入るたび（3 回）。キャラ選択は合わせない。
+    // 合わせは難易度・マップの画面に入るたび（3回）。キャラ選択は合わせない。
     assert_eq!((real, dll_steps.len() - real), (7, 3), "{dll_steps:?}");
     assert_eq!(
         np.step_log().iter().filter(|r| r.own).count(),
@@ -1373,8 +1377,8 @@ struct HeadRun {
     stats: Stats,
 }
 
-/// dll が相手の入力を待つ予算と始まりの待ちの上限。本物の値（1 フレーム）だと、負荷で 1 回遅れただけで止まりが起き、その側のフレームが格子から 1 つずれて
-/// 待ちの起きない形に移る。
+/// dllが相手の入力を待つ予算と始まりの待ちの上限。本物の値（1フレーム）だと負荷で1回遅れただけで止まりが起きる。
+/// すると、その側のフレームが格子から1つずれて待ちの起きない形に移る。
 const HEAD_RUN_BUDGET_US: u32 = 200_000;
 
 fn two_dll_run(head_wait: bool, phase_us: u64, frames: u32) -> [HeadRun; 2] {
@@ -1458,9 +1462,10 @@ fn two_dll_run(head_wait: bool, phase_us: u64, frames: u32) -> [HeadRun; 2] {
     ]
 }
 
-/// 始まりの待ち（別スレッドの 2 本の dll・本物の UDP・実時間）: 始まりの待ちの有無で確定した入力の列が変わらず両者で一致し、先に進む側
-/// （B の格子が A より `F + 8 ms` 遅れ、遅れ 1 なので片方が毎フレーム 8 ms 前後待つ形）の待ちが始まりへ移り、待たなくてよい側は始まりで待たない。
-/// 待つ側が A か B かは選択の同期が決めるので、切った実行で待った側を見て決める。待ちの起きる形で走っている証拠を先に見る。
+/// 始まりの待ち（別スレッドの2本のdll・本物のUDP・実時間）: 始まりの待ちの有無で確定した入力の列が変わらず両者で一致する。
+/// 先に進む側の待ちが始まりへ移り、待たなくてよい側は始まりで待たない（Bの格子がAより`F + 8 ms`遅れ、遅れ1なので片方が毎フレーム8 ms前後待つ形）。
+/// 待つ側がAかBかは選択の同期が決めるので、待ちを切った実行で待った側を見て決める。
+/// 待ちの起きる形で走っている証拠を先に見る。
 #[test]
 #[ignore = "loopback の実時間の検査。全件の回（build.bat）で --ignored で走る"]
 fn head_wait_moves_the_leading_dlls_wait_before_its_input_over_real_udp() {

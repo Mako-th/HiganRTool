@@ -1,12 +1,13 @@
-//! `_pacing.csv.gz`（DLL が `build\bin\logs\` に書く。平文の `_pacing.csv` も読む）をあとから集計するツール。読むだけで、どのファイルにも書かない。
-//! gzip が強制終了で切れていたら、読めた所までを使って標準エラーに知らせる。
+//! `_pacing.csv.gz`（DLLが`build\bin\logs\`に書く。平文の`_pacing.csv`も読む）をあとから集計するツール。読むだけ。どのファイルにも書かない。
+//! gzipが強制終了で切れていたら読み取れた所までを使って標準エラーに知らせる。
 //!
 //! 使い方: `cargo run --release -p higanr_core --bin pacing_sum -- [--fps N] [--frames A-B] <_pacing.csv.gz> [...]`
-//! ファイルごとに、形（game / b / b-spin / b-hybrid / vpatch / cycle / auto）と、周期・起床の遅れ・入力 → Present の前 / 後・
-//! Present の長さの p50 / p95 / p99 / max と母数を出す（集計の式は DLL と同じ `higanr_core::pacing::Splitter`）。方式や効率クラスが複数あれば、その別にも出す。
-//! 列 `glide_req_ppm` `glide_moved_us` に 0 でない要求があれば「格子の寄せ」の行を、b-hybrid の列があれば使用率の見込みと寝過ごしの行も出す。
-//! `--fps` は長い周期の閾値に使うペース（既定 60。CSV には書かれていないので、本ログの「ペース:」の N を渡す）。
-//! `--frames A-B` は Present の番号（CSV の `frame`）の範囲（両端を含む）の行だけを集計する。場面の境目は人が決めて渡す。
+//! ファイルごとに形（game / b / b-spin / b-hybrid / vpatch / cycle / auto）を出す。
+//! 周期・起床の遅れ・入力 → Presentの前 / 後・Presentの長さのp50 / p95 / p99 / maxと母数も出す（集計の式はDLLと同じ`higanr_core::pacing::Splitter`）。
+//! 方式や効率クラスが複数あればその別にも出す。
+//! 列`glide_req_ppm` `glide_moved_us`に0でない要求があれば「格子の寄せ」の行を出す。b-hybridの列があれば使用率の見込みと寝過ごしの行も出す。
+//! `--fps`は長い周期の閾値に使うペース（既定60。CSVには書かれていないので本ログの「ペース:」のNを渡す）。
+//! `--frames A-B`はPresentの番号（CSVの`frame`）の範囲（両端を含む）の行だけを集計する。場面の境目は人が決めて渡す。
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
@@ -20,12 +21,12 @@ const USAGE: &str =
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     fps: u64,
-    /// Present の番号の範囲（両端を含む）。
+    /// Presentの番号の範囲（両端を含む）。
     frames: Option<(u32, u32)>,
     paths: Vec<String>,
 }
 
-/// `A-B`（10 進、A ≤ B）。
+/// `A-B`（10進・A ≤ B）。
 fn parse_frames(v: &str) -> Result<(u32, u32), String> {
     let bad = || format!("--frames の値 {v:?} は A-B（10 進の整数、A ≤ B）");
     let (a, b) = v.split_once('-').ok_or_else(bad)?;
@@ -42,7 +43,7 @@ fn parse_frames(v: &str) -> Result<(u32, u32), String> {
     Ok((a, b))
 }
 
-/// `--fps N` と `--frames A-B` はどこに書いてもよく、どちらも 1 回だけ。
+/// `--fps N`と`--frames A-B`はどこに書いてもよい。どちらも1回だけ。
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut fps = None;
     let mut frames = None;

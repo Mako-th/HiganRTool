@@ -1,11 +1,14 @@
-// 進行中のランダム対戦の一覧 = Durable Object（ビルド番号ごとに 1 つ。idFromName("b<番号>")）。口は 2 つ。
+// 進行中のランダム対戦の一覧 = Durable Object（ビルド番号ごとに1つ。idFromName("b<番号>")）。エンドポイントは2つ。
 //
-// - post（載せる口）: 対戦のホストが持ち続ける。最初の 1 通 `post` で、割り当てのルーム名 q.…・1P・2P の名前・同期方式・観戦者の数と上限を
-//   送る。サーバーは q.… の形をチェックし、観戦用のルーム名 w.… を自分で導く（任意の w.… を載せられない。ルーム対戦の観戦用のルームを
-//   一覧へ漏らさない）。q.… は持たず、一覧にも出さない。切れたら一覧から消す。1 IP（IPv6 は /64）から 2 件まで・全体で 100 件まで。
-// - view（見る口）: 観戦者が一覧を開いている間だけ持つ。開いたときに一覧の全体、変わるたびに全体を送る（変化は 1 秒に 1 回にまとめる）。
+// - post（載せるエンドポイント）: 対戦のホストが接続を持ち続ける。最初の1通`post`で次を送る。
+//   割り当てのルーム名q.…・1P・2Pの名前・同期方式・観戦者の数と上限・そのルームで受けた席のチケット。
+//   サーバーはq.… の形をチェックし、観戦用のルーム名w.… を自分で導く。任意のw.… は載せられず、ルーム対戦の観戦用のルームを一覧に載せない。
+//   チケットがそのw.… について正しく期限内でなければ断る（対戦なしの投稿で枠を埋めさせない）。
+//   q.… は保持せず一覧にも出さない。切れたら一覧から消す。1 IP（IPv6は /64）から2件まで・全体で100件まで。
+// - view（見るエンドポイント）: 観戦者が一覧を開いている間だけ接続を持つ。開いたときと変わるたびに一覧の全体を送る（変化は1秒に1回にまとめる）。
+//   全体で500本・同じ鍵から3本まで（4本目は同じ鍵の一番古いものを閉じる）・作ってから10分でexpiredで閉じる（クライアントは入り直す）。
 //
-// 状態は WebSocket の attachment にだけ保存する（Hibernation から復帰しても一覧を作り直せる）。ログ（console）には何も書かない。
+// 状態はWebSocketのattachmentにだけ保存する（Hibernationから復帰しても一覧を作り直せる）。ログ（console）には何も書かない。
 
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -22,16 +25,21 @@ import {
   WATCH_MAX_TOTAL,
   WATCH_STALE_MS,
   WATCH_UNPOSTED_MS,
+  WATCH_VIEW_MAX_PER_KEY,
+  WATCH_VIEW_MAX_TOTAL,
+  WATCH_VIEW_SWEEP_MS,
+  WATCH_VIEW_TTL_MS,
   type WatchItem,
   connectLimitKey,
   parsePost,
   parseWatchPath,
   spectateRoomName,
 } from "./rules";
+import { judgeTicket, seatKey } from "./ticket";
 
 interface PostAtt {
   kind: "post";
-  /** 回数の数えと同じ鍵（IPv4 / IPv6 の /64）。1 IP あたりの件数に使う。 */
+  /** 回数を数える鍵と同じ鍵（IPv4 / IPv6の /64）。1 IPあたりの件数に使う。 */
   key: string;
   created: number;
   /** 最後に文が届いた時刻。 */
@@ -40,7 +48,7 @@ interface PostAtt {
   seq: number;
   item: WatchItem | null;
   done: boolean;
-  /** count を数える期間の始まりと、その期間に受けた数。 */
+  /** countを数える期間の始まりとその期間に受けた数。 */
   cw?: number;
   cn?: number;
 }
@@ -48,6 +56,9 @@ interface PostAtt {
 interface ViewAtt {
   kind: "view";
   done: boolean;
+  /** 同じ鍵（IPv4 / IPv6の /64）の本数を数えるのと期限（createdから）の判定に使う。古いattachmentでは未定義。 */
+  key?: string;
+  created?: number;
 }
 
 type Att = PostAtt | ViewAtt;
@@ -55,14 +66,14 @@ type Att = PostAtt | ViewAtt;
 const OPEN = 1;
 
 export class WatchList extends DurableObject<Env> {
-  /** 最後に観戦者へ全体を送った時刻（復帰し直したら 0 から。すぐ送る側に倒れる）。 */
+  /** 最後に観戦者へ全体を送った時刻（復帰し直したら0から。すぐ送る側に倒れる）。 */
   private lastSent = 0;
   /**
-   * まとめて送る変化が残っている印。ストレージには書かない（書き込みの枠を荒らしに使わせない）。追い出されて失っても、
-   * 復帰し直した最初のアラームで必ず全体を送る（alarm）ので、観戦者の表示が古いままになることはない。
+   * まとめて送る変化が残っているかどうかのフラグ。ストレージには書かない（書き込みの枠を荒らしに使わせない）。
+   * 追い出されて失っても復帰し直した最初のアラームで必ず全体を送る（alarm）ので、観戦者の表示が古いままになることはない。
    */
   private flushPending = false;
-  /** 掛けてあるアラームの時刻。undefined は未確認（復帰し直した直後）、null は無い。 */
+  /** 掛けてあるアラームの時刻。undefinedは未確認（復帰し直した直後）。nullは無い。 */
   private alarmAt: number | null | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -74,19 +85,31 @@ export class WatchList extends DurableObject<Env> {
     const now = Date.now();
     const { kind } = parseWatchPath(new URL(req.url).pathname);
     if (kind === null) return Response.json({ error: "not_found" }, { status: 404 });
+    const key = connectLimitKey(req.headers.get("CF-Connecting-IP"));
+    if (kind === "view") {
+      const views = this.liveViews();
+      const mine = views.filter((w) => (att(w) as ViewAtt).key === key);
+      if (mine.length >= WATCH_VIEW_MAX_PER_KEY) {
+        // 同じ鍵の一番古い接続を閉じて受け入れる（他の鍵の接続は閉じない。閉じた分で全体は増えない）。
+        const oldest = mine.reduce((o, w) => ((att(w) as ViewAtt).created ?? 0) < ((att(o) as ViewAtt).created ?? 0) ? w : o);
+        closeWith(oldest, Close.Done, false);
+      } else if (views.length >= WATCH_VIEW_MAX_TOTAL) {
+        return Response.json({ error: "room_full" }, { status: 409 });
+      }
+    }
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
     if (kind === "post") {
-      const key = connectLimitKey(req.headers.get("CF-Connecting-IP"));
       const a: PostAtt = { kind: "post", key, created: now, at: now, seq: 0, item: null, done: false };
       server.serializeAttachment(a);
       await this.scheduleAlarm();
     } else {
-      const a: ViewAtt = { kind: "view", done: false };
+      const a: ViewAtt = { kind: "view", done: false, key, created: now };
       server.serializeAttachment(a);
       send(server, this.listMessage());
+      await this.scheduleAlarm();
     }
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -95,7 +118,7 @@ export class WatchList extends DurableObject<Env> {
     const a = att(ws);
     if (a.done) return;
     if (a.kind === "view") {
-      // 見る口は ping（自動応答）以外を送らない。
+      // viewエンドポイントはping（自動応答）以外を送らない。
       closeWith(ws, Close.BadMessage, true);
       return;
     }
@@ -112,11 +135,17 @@ export class WatchList extends DurableObject<Env> {
         closeWith(ws, Close.BadMessage, true);
         return;
       }
-      // await は 1 回だけ。数えてから書くまでの間に別の文を入れない。
+      // awaitは数える前に済ませる。数えてから書くまでの間に別の文が割り込まないようにする。
       const room = await spectateRoomName(p.room);
+      // その割り当ての名で本当に対戦が成立した証拠（席のチケット）が無ければ載せない。SEAT_KEYが無いときは全部断る。
+      const ticket = await judgeTicket(await seatKey(this.env.SEAT_KEY), room, p.ticket, Math.floor(now / 1000));
+      if (ticket.kind !== "valid") {
+        closeWith(ws, Close.BadMessage, true);
+        return;
+      }
       const live = this.livePosts().filter((w) => w !== ws);
       const same = live.find((w) => (att(w) as PostAtt).item?.room === room);
-      // 同じ IP からの載せ直し（前の接続が切れたのをまだ知らない）は置き換える。別の IP の同じ部屋は断る。
+      // 同じIPからの載せ直し（前の接続が切れたのをまだ知らない）は置き換える。別のIPの同じ部屋は断る。
       if (same !== undefined && (att(same) as PostAtt).key !== a.key) {
         closeWith(ws, Close.BadMessage, true);
         return;
@@ -183,7 +212,10 @@ export class WatchList extends DurableObject<Env> {
         changed ||= a.item !== null;
       }
     }
-    // lastSent が 0 なら復帰し直した後で、残っていたかもしれない印を失っている。念のため全体を送る。
+    for (const w of this.liveViews()) {
+      if (now >= viewDeadline(att(w) as ViewAtt)) closeWith(w, Close.Expired, true);
+    }
+    // lastSentが0なら復帰し直した後なので、残っていたかもしれないフラグを失っている。念のため全体を送る。
     const flush = this.flushPending || this.lastSent === 0;
     this.flushPending = false;
     this.alarmAt = null;
@@ -216,12 +248,12 @@ export class WatchList extends DurableObject<Env> {
     try {
       ws.serializeAttachment(a);
     } catch {
-      // 閉じた WebSocket には書けないことがある。livePosts の readyState でも落ちる。
+      // 閉じたWebSocketには書き込めないことがある。livePostsのreadyStateで除いても例外が出る。
     }
     try {
       ws.close(1000, "bye");
     } catch {
-      // 閉じた後の二重の close。
+      // 閉じた後の二重のclose。
     }
     await this.changedIfListed(a);
   }
@@ -231,7 +263,7 @@ export class WatchList extends DurableObject<Env> {
     else await this.scheduleAlarm();
   }
 
-  /** 一覧が変わった。前の送りから最短の間隔が空いていればすぐ、空いていなければアラームでまとめて送る。 */
+  /** 一覧が変わった。前の送信から最短の間隔が空いていればすぐ送る。空いていなければアラームでまとめて送る。 */
   private async changed(now: number): Promise<void> {
     if (now - this.lastSent >= WATCH_BROADCAST_MIN_MS) {
       this.broadcast(now);
@@ -254,18 +286,19 @@ export class WatchList extends DurableObject<Env> {
       const auto = this.ctx.getWebSocketAutoResponseTimestamp(ws);
       if (auto !== null) last = Math.max(last, auto.getTime());
     } catch {
-      // 取れなければ最後の文の時刻だけで数える。
+      // 取得できなければ最後の文の時刻だけで数える。
     }
     return last + WATCH_STALE_MS;
   }
 
   /**
-   * アラームは今の予定より早めるときだけ掛ける（setAlarm は書き込みに数えられる）。予定が早すぎても、鳴ったときに
-   * alarm が掛け直す。書けなくても入室・載せる操作は失敗にしない（期限の掃除は次の操作かアラームで遅れて済む）。
+   * アラームは今の予定より早めるときだけ掛ける（setAlarmは書き込みに数えられる）。
+   * 予定が早すぎても鳴ったときにalarmが掛け直す。書き込めなくても入室・載せる操作は失敗にしない（期限の掃除は次の操作かアラームで遅れて済む）。
    */
   private async scheduleAlarm(): Promise<void> {
     try {
       const times: number[] = this.livePosts().map((w) => this.deadline(w, att(w) as PostAtt));
+      for (const w of this.liveViews()) times.push(viewDeadline(att(w) as ViewAtt));
       if (this.flushPending) times.push(this.lastSent + WATCH_BROADCAST_MIN_MS);
       if (this.alarmAt === undefined) this.alarmAt = await this.ctx.storage.getAlarm();
       if (times.length === 0) {
@@ -286,11 +319,16 @@ export class WatchList extends DurableObject<Env> {
   }
 }
 
+/** 作ってからWATCH_VIEW_TTL_MS後を掃除の間隔に切り上げた時刻。createdが無い古いattachmentは次のアラームで閉じる。 */
+function viewDeadline(a: ViewAtt): number {
+  return Math.ceil(((a.created ?? 0) + WATCH_VIEW_TTL_MS) / WATCH_VIEW_SWEEP_MS) * WATCH_VIEW_SWEEP_MS;
+}
+
 function att(ws: WebSocket): Att {
   return ws.deserializeAttachment() as Att;
 }
 
-/** 届いた 1 通を JSON の物に読む。大きさを最初に見る（大きなものを JSON として解かない）。 */
+/** 届いた1通をJSONとして読む。大きさを最初に見る（大きなものをJSONとして解かない）。 */
 function parseObject(data: string | ArrayBuffer): Record<string, unknown> | typeof Close.TooLarge | typeof Close.BadMessage {
   if (typeof data !== "string") return Close.BadMessage;
   if (new TextEncoder().encode(data).byteLength > MESSAGE_MAX_BYTES) return Close.TooLarge;
@@ -318,13 +356,13 @@ function closeWith(ws: WebSocket, code: number, withError: boolean): void {
   try {
     ws.serializeAttachment(a);
   } catch {
-    // 閉じた WebSocket には書けないことがある。
+    // 閉じたWebSocketには書き込めないことがある。
   }
   const name = CLOSE_NAME[code] ?? "bad_message";
   if (withError && name !== "done") send(ws, { t: "error", code: name });
   try {
     ws.close(code, name);
   } catch {
-    // 二重の close。
+    // 二重のclose。
   }
 }

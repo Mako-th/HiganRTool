@@ -1,10 +1,10 @@
-// ランダム対戦の待ち列 = Durable Object（ビルド番号ごとに 1 つ。idFromName("b<番号>")）。
+// ランダム対戦の待ち列 = Durable Object（ビルド番号ごとに1つ。idFromName("b<番号>")）。
 //
-// 来た順に 2 人ずつ組にし、組ごとに推測できない新しいルーム名（rules.ts の newRandomRoomName）を 2 人へ返して閉じる。
-// 2 人目が来た時点で組にするので、待っている人は同じビルドにつき高々 1 人。組になった 2 人は、返されたルーム名で
-// 今までのルーム（room.ts。/v0/rooms/<名>）へ入り直し、そこで接続コードを渡し合う。
+// 来た順に2人ずつペアにする。ペアごとに推測できない新しいルーム名（rules.tsのnewRandomRoomName）を2人へ返して閉じる。
+// 2人目が来た時点でペアにするので、待っている人は同じビルドにつき高々1人。
+// ペアになった2人は返されたルーム名で今までのルーム（room.ts。/v0/rooms/<名>）へ入り直し、そこで接続コードを渡し合う。
 //
-// 状態は room.ts と同じく WebSocket の attachment にだけ保存する。ログ（console）には何も書かない（ルーム名・IP・cid を出さない）。
+// 状態はroom.tsと同じくWebSocketのattachmentにだけ保存する。ログ（console）には何も書かない（ルーム名・IP・cidを出さない）。
 
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -20,7 +20,7 @@ import {
 } from "./rules";
 
 interface QueueAtt {
-  /** 並び（待ち列に入った順。生きている接続の最大 + 1）。先に入った人が first。 */
+  /** 並び（待ち列に入った順。生きている接続の最大 + 1）。先に入った人がfirst。 */
   seq: number;
   deadline: number;
   cid: string | null;
@@ -39,7 +39,7 @@ export class RandomQueue extends DurableObject<Env> {
     const now = Date.now();
     this.expireIfDue(now);
 
-    // 同じ利用者の入り直し: 届かなかった前の入室が残っていても、自分自身と組にしない。
+    // 同じ利用者の入り直し: 届かなかった前の入室が残っていても自分自身とペアにしない。
     const cid = parseClientId(new URL(req.url).searchParams.get(CLIENT_ID_PARAM));
     if (cid !== null) {
       for (const w of this.live()) {
@@ -62,7 +62,7 @@ export class RandomQueue extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** 待ち列の人は ping 以外を送らない。 */
+  /** 待ち列の人はping以外を送らない。 */
   async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
     if (att(ws).done) return;
     closeWith(ws, Close.BadMessage, true);
@@ -86,7 +86,7 @@ export class RandomQueue extends DurableObject<Env> {
     return this.ctx.getWebSockets().filter((w) => w.readyState === OPEN && !att(w).done);
   }
 
-  /** 先に入った 2 人から順に組にする。 */
+  /** 先に入った2人から順にペアにする。 */
   private tryPair(): void {
     const waiting = this.live().sort((x, y) => att(x).seq - att(y).seq);
     while (waiting.length >= 2) {
@@ -106,7 +106,7 @@ export class RandomQueue extends DurableObject<Env> {
     }
   }
 
-  /** 書けなくても入室は失敗にしない（無料枠の使い切りなど）。期限は次の入室の expireIfDue か、掛け直されたアラームで片づく。 */
+  /** 書き込めなくても入室は失敗にしない（無料枠の使い切りなど）。期限は次の入室のexpireIfDueか掛け直されたアラームで後始末される。 */
   private async scheduleAlarm(): Promise<void> {
     try {
       const live = this.live();
@@ -116,7 +116,7 @@ export class RandomQueue extends DurableObject<Env> {
       }
       await this.ctx.storage.setAlarm(Math.min(...live.map((w) => att(w).deadline)));
     } catch {
-      // 受け付けたソケットを占有者のまま 500 で捨てるより、期限が遅れる方を取る。
+      // 受け付けたソケットを占有者のまま500で捨てるより、期限が遅れる方を取る。
     }
   }
 
@@ -128,7 +128,7 @@ export class RandomQueue extends DurableObject<Env> {
     try {
       ws.close(1000, "bye");
     } catch {
-      // 閉じた後の二重の close。
+      // 閉じた後の二重のclose。
     }
     await this.scheduleAlarm();
   }
@@ -142,7 +142,7 @@ function trySerialize(ws: WebSocket, a: QueueAtt): void {
   try {
     ws.serializeAttachment(a);
   } catch {
-    // 閉じた WebSocket には書けないことがある。done は live() の readyState でも落ちる。
+    // 閉じたWebSocketには書き込めないことがある。doneはlive()のreadyStateでも落ちる。
   }
 }
 
@@ -163,6 +163,6 @@ function closeWith(ws: WebSocket, code: number, withError: boolean): void {
   try {
     ws.close(code, name);
   } catch {
-    // 二重の close。
+    // 二重のclose。
   }
 }

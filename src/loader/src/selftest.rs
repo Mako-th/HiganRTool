@@ -1,9 +1,10 @@
-//! `HiganRTool.exe --selftest` —— 本物の Win32 の経路で、後始末の行 1・2・8・9 を通す。
+//! `HiganRTool.exe --selftest` —— 本物のWin32の経路で後始末の行1・2・8・9を通す。
 //!
-//! **花映塚は起動しない。** 的はこのローダー自身（`--selftest-target`）。偽物の検査（`launch.rs`）は手順を見、ここは
-//! 「OS が本当にそう振る舞うか」（CREATE_SUSPENDED の子にリモートスレッドで LoadLibraryW が効く・読めない DLL で 0 が返る・
-//! 再開した子の中に DLL が居る）を見る。行 9 は環境変数が子に届くことと、鮮度のガード（`freshness.rs`）の判定も見る。
-//! 一時フォルダに読めない DLL を作るだけで、起動した的はどの結果でも必ず終わらせる。ゲームのフォルダには何も書かない。
+//! **花映塚は起動しない。** ターゲットはこのローダー自身（`--selftest-target`）。
+//! 偽物の検査（`launch.rs`）は手順を見る。ここでは「OSが本当にそう振る舞うか」を見る。
+//! 見るのは次の内容: CREATE_SUSPENDEDの子にリモートスレッドでLoadLibraryWが効く・読み込めないDLLで0が返る・再開した子の中にDLLが居る。
+//! 行9は環境変数が子に届くことと、鮮度のガード（`freshness.rs`）の判定も見る。
+//! 一時フォルダに読み込めないDLLを作るだけ。起動したターゲットはどの結果でも必ず終わらせる。ゲームのフォルダには何も書かない。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,22 +17,22 @@ use crate::real::{self, RealWin32};
 use crate::synth;
 use crate::win::{WaitResult, Win32};
 
-/// 再開した的が自分で終わるのを待つ上限（普段は 1 秒もかからない）。
+/// 再開したターゲットが自分で終わるのを待つ上限（普段は1秒もかからない）。
 const TARGET_EXIT_WAIT_MS: u32 = 10_000;
 
-/// 的が「DLL が自分の中に居た」ときの終了コード。
+/// ターゲットが「DLLが自分の中に居た」ときの終了コード。
 pub const TARGET_OK: i32 = 0;
 pub const TARGET_MISSING: i32 = 3;
-/// DLL は居たが、渡した環境の変数が届いていない・値が違う。
+/// DLLは居たが、渡した環境の変数が届いていない・値が違う。
 pub const TARGET_ENV_MISSING: i32 = 4;
 /// 親の環境（`SystemRoot`）が継がれていない（ブロックが親の環境を捨てた）。
 pub const TARGET_PARENT_ENV_LOST: i32 = 5;
 
-/// 行 9 で的の環境に追加する変数（`--ini` / `--script` と同じ `env_block` の経路）。
+/// 行9でターゲットの環境に追加する変数（`--ini` / `--script`と同じ`env_block`の経路）。
 const SELFTEST_ENV: &str = "HIGANRTOOL_SELFTEST_ENV";
 const SELFTEST_ENV_VALUE: &str = "row9 ツール";
 
-/// 花映塚の同定（`TH09_V150A`）と同じ 20 バイト。
+/// 花映塚の同定（`TH09_V150A`）と同じ20バイト。
 const ENTRY_LEN: usize = 20;
 
 struct TempDir(PathBuf);
@@ -47,12 +48,12 @@ impl TempDir {
             std::process::id(),
             nanos
         ));
-        // 前の回のフォルダを使い回さないよう、既にあれば失敗させる。
+        // 前回のフォルダを使い回さないよう既にあれば失敗させる。
         std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Self(dir))
     }
 
-    /// 読めない DLL を読ませた直後は、ウイルス対策などが掴んでいることがあるので少し待って試し直す。
+    /// 読み込めないDLLを読ませた直後はウイルス対策などがファイルを開いていることがあるので少し待って試し直す。
     fn remove(&self) -> Result<(), String> {
         let mut last = String::new();
         for _ in 0..10 {
@@ -162,7 +163,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
     let tmp = TempDir::create()?;
     let missing_dll = tmp.0.join("missing.dll");
     let bad_dll = tmp.0.join("not_loadable.dll");
-    // core の読み取りは通る（行 1 で弾かれない）が、Windows のローダーは読めない合成の PE。
+    // coreの読み取りは通る（行1で弾かれない）が、Windowsのローダーが読み込めない合成のPE。
     std::fs::write(&bad_dll, synth::pe32(0, 0x200, &[0xC3]))
         .map_err(|e| format!("{}: {e}", bad_dll.display()))?;
 
@@ -171,7 +172,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
     println!("  DLL（行 9）: {}", good_dll.display());
     println!("  一時フォルダ: {}", tmp.0.display());
 
-    // 行 9（`keep`）だけ的の環境に変数を追加する（行 1・2・8 は親の環境を継ぐ経路。両方を通す）。
+    // 行9（`keep`）だけターゲットの環境に変数を追加する（行1・2・8は親の環境を継ぐ経路。両方を通す）。
     fn make_req<'a>(me: &Path, dll: &Path, ident: Ident<'a>, keep: bool) -> LaunchRequest<'a> {
         LaunchRequest {
             game: me.to_path_buf(),
@@ -185,11 +186,11 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
             ident,
             keep_process_handle: keep,
             patches: Vec::new(),
-            // 行 9 だけ前面にしない起動の仕方（STARTF_USESHOWWINDOW つきの STARTUPINFOW を受け付けることを通す）。
+            // 行9だけ前面にしない起動の仕方（STARTF_USESHOWWINDOWつきのSTARTUPINFOWを受け付けることを通す）。
             no_activate: keep,
         }
     }
-    // 親の環境に同じ名前が既にあると、行 9 の「届いた」が継いだだけで通ってしまう。先に断る。
+    // 親の環境に同じ名前が既にあると行9の「届いた」が継いだだけで通ってしまう。先に断る。
     if std::env::var_os(SELFTEST_ENV).is_some() {
         return Err(format!(
             "この自己検査の環境に {SELFTEST_ENV} が既にある（行 9 の環境の確かめができない）"
@@ -201,7 +202,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         total: 0,
     };
 
-    // 鮮度のガードを実機の起動と同じ入力で回す。断る判定は NG（`--game` の起動も断られるため）。
+    // 鮮度のガードを実機の起動と同じ入力で回す。断る判定はNG（`--game`の起動も断られるため）。
     report.check(
         "鮮度のガード（build.bat の後の build\\bin は断らない）",
         match crate::freshness::check(&me, &good_dll) {
@@ -220,7 +221,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         },
     );
 
-    // 的の判定の否定側: DLL を読み込んでいないこのプロセスで、終了コード 0 が恒真でないことをチェックする。
+    // ターゲットの判定の否定側: DLLを読み込んでいないこのプロセスで終了コード0が恒真でないことをチェックする。
     report.check(
         "ターゲットの判定（否定側）",
         match target(&good_dll) {
@@ -231,7 +232,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         },
     );
 
-    // 行 1: DLL が無い → 何も起動しない。
+    // 行1: DLLが無い → 何も起動しない。
     {
         let mut t = Traced::new(RealWin32);
         let r = launch::launch(&mut t, &req(&missing_dll, ident, false));
@@ -251,7 +252,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         );
     }
 
-    // 行 2（追加）: 花映塚の同定の値で自分を見る → 合わないので何も起動しない。
+    // 行2（追加）: 花映塚の同定の値で自分を見る → 合わないので何も起動しない。
     {
         let mut t = Traced::new(RealWin32);
         let r = launch::launch(&mut t, &req(&good_dll, pe::TH09_V150A, false));
@@ -271,7 +272,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         );
     }
 
-    // 行 8: 読めない DLL → LoadLibraryW が 0 → 的を殺す。
+    // 行8: 読み込めないDLL → LoadLibraryWが0 → ターゲットを終了させる。
     {
         let mut t = Traced::new(RealWin32);
         let r = launch::launch(&mut t, &req(&bad_dll, ident, false));
@@ -296,7 +297,7 @@ fn run_inner(dll: Option<PathBuf>) -> Result<i32, String> {
         );
     }
 
-    // 行 9: 本物の DLL → 注入して再開。的は自分の中に DLL が居ることをチェックして 0 で終わる。
+    // 行9: 本物のDLL → 注入して再開。ターゲットは自分の中にDLLが居ることをチェックして0で終わる。
     {
         let mut t = Traced::new(RealWin32);
         let r = launch::launch(&mut t, &req(&good_dll, ident, true));
@@ -363,7 +364,7 @@ pub fn target(dll: &Path) -> i32 {
     )
 }
 
-/// 的の判定（pure）。DLL が居ない → `TARGET_MISSING`、渡した変数が無い・違う → `TARGET_ENV_MISSING`、
+/// ターゲットの判定（pure）。DLLが居ない → `TARGET_MISSING`、渡した変数が無い・違う → `TARGET_ENV_MISSING`、
 /// 親の環境が無い → `TARGET_PARENT_ENV_LOST`。
 fn target_verdict(loaded: bool, env: Option<&std::ffi::OsStr>, system_root: bool) -> i32 {
     if !loaded {

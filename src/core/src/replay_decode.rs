@@ -1,12 +1,15 @@
-//! リプレイ（`.rpy`）の暗号化・圧縮の部分を復号・展開し、マッチ（ステージの枠）ごと・フレームごとの
-//! 1P / 2P（と 3 本目）の入力語を取り出す。
+//! リプレイ（`.rpy`）の暗号化・圧縮の部分を復号・展開する。
+//! マッチ（ステージの枠）ごと・フレームごとの1P / 2P（と3本目）の入力ワードを取り出す。
 //!
-//! `replay.rs` は平文の部分（`T9RP`・`comp_size`・USER チャンク）だけを読む。こちらは `+0x18` から `comp_size` の手前を読む。
-//! 形の根拠はゲーム本体の読み込み・圧縮の逆アセンブル（コードはコピーしていない）: 復号は `0x0042060B`〜`0x00420631`、チェックサムは
-//! `0x0042063B`〜`0x0042064E`、展開は `0x00420694`〜`0x004206A8`、圧縮（展開の逆）は `0x00434020`。圧縮の終わりは、フラグ 0 と 13 bit の 0 を書き、
-//! 8 bit にそろわなかった端数のビットは書かずに捨てる（`0x0043421B`〜`0x00434248`）ので、展開側は終わりの印の位置の 13 bit が足りなくても 0 として読む。
-//! 3 本目の配列 C は `InputManager[2] + 0x2C`（1P と 2P を合わせた語）で、実データでは `A | B` と一致する。読み出して `p3` として持つだけで、一致を強制しない。
-//! どんなバイト列を渡されてもパニックしない（添字は `get`、足し算は `checked_*`、出力の大きさに上限）。ヒープを使う（ゲームスレッドの外で呼ぶ）。
+//! `replay.rs`は平文の部分（`T9RP`・`comp_size`・USERチャンク）だけを読む。こちらは`+0x18`から`comp_size`の手前を読む。
+//! 形の根拠はゲーム本体の読み込み・圧縮の逆アセンブル（コードはコピーしていない）。
+//! 復号は`0x0042060B`〜`0x00420631`、チェックサムは`0x0042063B`〜`0x0042064E`、展開は`0x00420694`〜`0x004206A8`、圧縮（展開の逆）は`0x00434020`。
+//! 圧縮の終わりはフラグ0と13 bitの0を書く。
+//! 8 bitにそろわなかった端数のビットは書かずに捨てる（`0x0043421B`〜`0x00434248`）。
+//! そのため展開側は終わりの印の位置の13 bitが足りなくても0として読む。
+//! 3本目の配列Cは`InputManager[2] + 0x2C`（1Pと2Pを合わせたワード）で、実データでは`A | B`と一致する。
+//! 読み出して`p3`として持つだけ。一致は強制しない。
+//! どんなバイト列を渡されてもパニックしない（添字は`get`・足し算は`checked_*`・出力の大きさに上限）。ヒープを使う（ゲームスレッドの外で呼ぶ）。
 
 use crate::replay::{MAGIC, MIN_COMP_SIZE};
 
@@ -20,51 +23,52 @@ pub const KEY_STEP: u8 = 7;
 pub const CHECKSUM_OFFSET: usize = 0x10;
 /// チェックサムの初期値（`0x0042063B mov $0x3f000318,%edi`）。
 pub const CHECKSUM_SEED: u32 = 0x3F00_0318;
-/// LZSS の入力の始まりで、展開後の本体（`image` の `0xC0` 以降）の始まり（`0x0042069B lea 0xc0(%ebx)`）。
+/// LZSSの入力の始まりで、展開後の本体（`image`の`0xC0`以降）の始まり（`0x0042069B lea 0xc0(%ebx)`）。
 pub const BODY_START: usize = 0xC0;
 /// `comp_size`（`+0x0C`）の位置。
 const COMP_SIZE_OFFSET: usize = 0x0C;
-/// LZSS の入力の長さの位置（`+0x18`。`0x00420697 mov 0x18(%edi),%edx`）。
+/// LZSSの入力の長さの位置（`+0x18`。`0x00420697 mov 0x18(%edi),%edx`）。
 const LZSS_LEN_OFFSET: usize = 0x18;
 /// 展開後の長さの位置（`+0x1C`。`0x00420694 mov 0x1c(%edi),%eax`）。
 const DECOMP_SIZE_OFFSET: usize = 0x1C;
 /// バージョン（`+0x04`。`0x004205FD cmpw $0x2,0x4(%esi)`）。
 const VERSION_OFFSET: usize = 0x04;
-/// `+0x06` は 0 でなければならない（`0x00420604`〜`0x00420609`）。
+/// `+0x06`は0でなければならない（`0x00420604`〜`0x00420609`）。
 const RESERVED_OFFSET: usize = 0x06;
 
-/// 展開後の長さの上限。実物は 1 本で高々数百 KB（1,455 本の平均で約 170 KB）なので、桁違いに大きいヘッダの値は
-/// 壊れているとして展開しない（確保の爆発を避ける安全側の値）。
+/// 展開後の長さの上限。
+/// 実物は1本で高々数百KB（1,455本の平均で約170 KB）なので桁違いに大きいヘッダの値は壊れているとして展開しない。
+/// 確保の爆発を避ける安全側の値。
 pub const MAX_DECOMP_SIZE: u32 = 64 << 20;
 
-/// 配列 A・B・C・D のポインタ表の位置（各 10 本の u32）。
+/// 配列A・B・C・Dのポインタ表の位置（各10本のu32）。
 const ARRAY_TABLE: [usize; 4] = [0x20, 0x48, 0x70, 0x98];
 /// ポインタの本数（枠の数）。
 pub const SLOTS: usize = 10;
-/// 配列の名前（`ARRAY_TABLE` と同じ順。A = 1P、B = 2P、C = `InputManager[2]`、D = FPS 表）。
+/// 配列の名前（`ARRAY_TABLE`と同じ順。A = 1P、B = 2P、C = `InputManager[2]`、D = FPS表）。
 const ARRAY_NAMES: [char; 4] = ['A', 'B', 'C', 'D'];
-/// 最初のブロックが始まる位置（実物の 1,455 本すべてでここ）。
+/// 最初のブロックが始まる位置（実物の1,455本すべてでここ）。
 pub const BLOCKS_START: usize = 0x1EC;
-/// A / B / C のブロックの先頭の構造体の長さ。その後ろに 1 フレームにつき u16。
+/// A / B / Cのブロックの先頭の構造体の長さ。その後ろに1フレームにつきu16。
 pub const STAGE_HEADER_LEN: usize = 0x20;
-/// 1 つの塊のフレーム数（`cmpl $0xe0e,0x10(%ecx)` = 3598）。D は 30 フレームに 1 バイトで、塊ごとに切り捨てる。
+/// 1つのチャンクのフレーム数（`cmpl $0xe0e,0x10(%ecx)` = 3598）。Dは30フレームに1バイト。チャンクごとに切り捨てる。
 pub const CHUNK_FRAMES: usize = 3598;
-/// D（FPS 表）は何フレームに 1 バイトか（`0x0042033A mov $0x1e,%ecx`）。
+/// D（FPS表）は何フレームに1バイトか（`0x0042033A mov $0x1e,%ecx`）。
 pub const FPS_EVERY: usize = 30;
 
-/// ヘッダ `+0x0D7`: 難易度。
+/// ヘッダ`+0x0D7`: 難易度。
 const DIFFICULTY_OFFSET: usize = 0xD7;
-/// ヘッダ `+0x1E4`: game_mode（0 = Story、1 = Extra、2 = Match）。
+/// ヘッダ`+0x1E4`: game_mode（0 = Story、1 = Extra、2 = Match）。
 const GAME_MODE_OFFSET: usize = 0x1E4;
 
 /// 展開（LZSS）で読めなかった理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LzssError {
-    /// フラグ・リテラル・長さ・（0 でない）位置の途中でデータが尽きた。
+    /// フラグ・リテラル・長さ・（0でない）位置の途中でデータが尽きた。
     Truncated,
-    /// 終わりの印（フラグ 0 と位置 0）が無いまま尽きた。
+    /// 終わりの印（フラグ0と位置0）が無いまま尽きた。
     MissingTerminator,
-    /// 終わりの印の後に、読まれないビットが残っている（ゲームの書き方は端数を捨てるので、残らない）。
+    /// 終わりの印の後に読まれないビットが残っている（ゲームの書き方は端数を捨てるので残らない）。
     TrailingBits { bits: usize },
     /// 出力が上限（ヘッダの展開後の長さ）を超える。
     Overflow { limit: usize },
@@ -73,76 +77,76 @@ pub enum LzssError {
 /// 復号・展開・配列の読み出しができなかった理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// 長さが `0x18` 未満（見出しすら無い）。
+    /// 長さが`0x18`未満（ヘッダすら無い）。
     TooShort { len: usize },
-    /// 先頭 4 バイトが `T9RP` でない。
+    /// 先頭4バイトが`T9RP`でない。
     BadMagic,
-    /// `+0x04` が 2 でない（ゲームの読み込みが断る形）。
+    /// `+0x04`が2でない（ゲームの読み込みが断る形）。
     BadVersion { version: u16 },
-    /// `+0x06` が 0 でない（同上）。
+    /// `+0x06`が0でない（同上）。
     BadReserved { value: u8 },
-    /// `comp_size` が `0xC0` 未満か、ファイルの長さを超える。
+    /// `comp_size`が`0xC0`未満か、ファイルの長さを超える。
     CompSizeOutOfRange { comp_size: u32, len: usize },
     /// チェックサムが合わない（鍵・復号の範囲・壊れた保存のどれか）。
     ChecksumMismatch { stored: u32, computed: u32 },
-    /// `+0x18`（LZSS の長さ）が `comp_size - 0xC0` と違う（書き手は同じ値から両方を作る）。
+    /// `+0x18`（LZSSの長さ）が`comp_size - 0xC0`と違う（書き手は同じ値から両方を作る）。
     LzssLenField { field: u32, expected: u32 },
-    /// `+0x1C`（展開後の長さ）が上限 `MAX_DECOMP_SIZE` を超える。
+    /// `+0x1C`（展開後の長さ）が上限`MAX_DECOMP_SIZE`を超える。
     DecompSizeTooLarge { size: u32 },
     /// 展開できなかった。
     Lzss(LzssError),
-    /// 展開した長さが `+0x1C` と違う。
+    /// 展開した長さが`+0x1C`と違う。
     DecompSizeMismatch { field: u32, actual: usize },
-    /// 展開後の本体が `0x1EC`（最初のブロックの位置）より短い。
+    /// 展開後の本体が`0x1EC`（最初のブロックの位置）より短い。
     ImageTooShort { len: usize },
-    /// ポインタが `0x1EC` 未満か、本体の長さを超える。
+    /// ポインタが`0x1EC`未満か、本体の長さを超える。
     BadPointer {
         array: char,
         slot: u8,
         ptr: u32,
         len: usize,
     },
-    /// 2 つのポインタが同じ位置を指す（ブロックの境目が決まらない）。
+    /// 2つのポインタが同じ位置を指す（ブロックの境目が決まらない）。
     SharedPointer { ptr: u32 },
-    /// A・B・C のどれかだけが 0 の枠（3 本そろって書かれるはず）。
+    /// A・B・Cのどれかだけが0の枠（3本そろって書かれるはず）。
     MissingArray { slot: u8 },
-    /// A / B / C のブロックの長さが `0x20 + 2n` の形でない。
+    /// A / B / Cのブロックの長さが`0x20 + 2n`の形でない。
     BadBlockLen { array: char, slot: u8, len: usize },
-    /// 同じ枠の A・B・C のフレーム数が違う。
+    /// 同じ枠のA・B・Cのフレーム数が違う。
     FrameCountMismatch { slot: u8 },
 }
 
-/// 席（1P / 2P）の面ごとの情報（ブロックの先頭の構造体）。
+/// サイド（1P / 2P）の面ごとの情報（ブロックの先頭の構造体）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SideInfo {
     /// `+0x00`（u32。開始時の累計。内部値）。
     pub score: u32,
-    /// `+0x06`（キャラ ID）。
+    /// `+0x06`（キャラID）。
     pub character: u8,
-    /// `+0x07`（0 = 人間、1 = CPU。CPU の側は入力列が全部 0）。
+    /// `+0x07`（0 = 人間、1 = CPU。CPUの側は入力列が全部0）。
     pub human_cpu: u8,
-    /// `+0x0A`（u16。CPU レベル）。
+    /// `+0x0A`（u16。CPUレベル）。
     pub cpu_level: u16,
 }
 
-/// 1 つの枠（ステージ）の入力。Match は枠 9 だけを使う（実測 1,358 本）。ラウンドの区切りはファイルに無いので区切らない。
+/// 1つの枠（ステージ）の入力。Matchは枠9だけを使う（実測1,358本）。ラウンドの区切りはファイルに無いので区切らない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageInputs {
     /// 枠の番号（0〜9）。
     pub slot: u8,
-    /// 開始時の乱数の状態（A の `+0x04`。ゲームが書き戻すのは A のもの）。
+    /// 開始時の乱数の状態（Aの`+0x04`。ゲームが書き戻すのはAのもの）。
     pub rng_seed: u16,
     pub p1: SideInfo,
     pub p2: SideInfo,
-    /// A: 1P の語（`InputManager[0] + 0x2C`）。1 フレームに 1 つ。
+    /// A: 1Pのワード（`InputManager[0] + 0x2C`）。1フレームに1つ。
     pub p1_inputs: Vec<u16>,
-    /// B: 2P の語（`InputManager[1] + 0x2C`）。CPU の席は全部 0。
+    /// B: 2Pのワード（`InputManager[1] + 0x2C`）。CPUのサイドは全部0。
     pub p2_inputs: Vec<u16>,
-    /// C: `InputManager[2] + 0x2C`（実データでは `A | B`）。
+    /// C: `InputManager[2] + 0x2C`（実データでは`A | B`）。
     pub p3_inputs: Vec<u16>,
-    /// D: FPS の記録（30 フレームに 1 バイト）。無ければ空。
+    /// D: FPSの記録（30フレームに1バイト）。無ければ空。
     pub fps: Vec<u8>,
-    /// D の長さが、フレーム数から決まる長さ（`expected_fps_len`）と同じか。
+    /// Dの長さがフレーム数から決まる長さ（`expected_fps_len`）と同じかどうか。
     pub fps_len_ok: bool,
 }
 
@@ -151,7 +155,7 @@ impl StageInputs {
         self.p1_inputs.len()
     }
 
-    /// `C != (A | B)` のフレームの数（実データでは 0。0 でなくても読み出しは通す）。
+    /// `C != (A | B)`のフレームの数（実データでは0。0でなくても読み出しは通す）。
     pub fn p3_not_or_count(&self) -> usize {
         self.p1_inputs
             .iter()
@@ -166,7 +170,7 @@ impl StageInputs {
 pub struct ReplayInputs {
     pub difficulty: u8,
     pub game_mode: u8,
-    /// 使われている枠（A・B・C がそろっているもの）を番号順に。
+    /// 使われている枠（A・B・Cがそろっているもの）を番号順に。
     pub stages: Vec<StageInputs>,
 }
 
@@ -180,7 +184,8 @@ fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// 復号（その場で）。鍵は 1 バイトごとに `KEY_STEP` を足し、鍵もバイトも u8 で回る（`0x00420620`〜`0x00420625`）。
+/// 復号（その場で）。鍵は1バイトごとに`KEY_STEP`を足す。
+/// 鍵もバイトもu8で回る（`0x00420620`〜`0x00420625`）。
 pub fn decrypt_in_place(buf: &mut [u8], key: u8) {
     let mut k = key;
     for b in buf.iter_mut() {
@@ -189,7 +194,7 @@ pub fn decrypt_in_place(buf: &mut [u8], key: u8) {
     }
 }
 
-/// 暗号化（`decrypt_in_place` の逆）。
+/// 暗号化（`decrypt_in_place`の逆）。
 pub fn encrypt_in_place(buf: &mut [u8], key: u8) {
     let mut k = key;
     for b in buf.iter_mut() {
@@ -198,8 +203,8 @@ pub fn encrypt_in_place(buf: &mut [u8], key: u8) {
     }
 }
 
-/// チェックサム: `CHECKSUM_SEED` に、復号した後の `[0x15, comp_size)` のバイトを u32 で足す（あふれは回る）。
-/// `decrypted` は先頭から `comp_size` バイト以上あること（足りなければ `None`）。
+/// チェックサム: 復号した後の`[0x15, comp_size)`のバイトをu32で`CHECKSUM_SEED`に足す（あふれは回る）。
+/// `decrypted`は先頭から`comp_size`バイト以上あること（足りなければ`None`）。
 pub fn checksum(decrypted: &[u8], comp_size: usize) -> Option<u32> {
     let span = decrypted.get(KEY_OFFSET..comp_size)?;
     Some(
@@ -208,12 +213,12 @@ pub fn checksum(decrypted: &[u8], comp_size: usize) -> Option<u32> {
     )
 }
 
-/// LZSS の履歴の大きさ（`1 << 13`。`0x004341B6 and $0x1fff`）。
+/// LZSSの履歴の大きさ（`1 << 13`。`0x004341B6 and $0x1fff`）。
 const HISTORY_SIZE: usize = 1 << 13;
 const HISTORY_MASK: usize = HISTORY_SIZE - 1;
-/// 書き込み位置の初期値（`0x0043406D movl $0x1,-0x14(%ebp)`。位置 0 は終わりの印に使うので空ける）。
+/// 書き込み位置の初期値（`0x0043406D movl $0x1,-0x14(%ebp)`。位置0は終わりの印に使うので空ける）。
 pub const LZSS_INITIAL_WRITE: usize = 1;
-/// 一致の長さのビット幅と下駄（4 bit ＋ 3。長さは 3〜18）。
+/// 一致の長さのビット幅と足す値（4 bit ＋ 3。長さは3〜18）。
 const LEN_BITS: u32 = 4;
 const LEN_MIN: usize = 3;
 const INDEX_BITS: u32 = 13;
@@ -228,7 +233,7 @@ impl Bits<'_> {
         self.data.len() * 8 - self.pos
     }
 
-    /// `n`（≤ 16）ビットを読む。足りなければ `None`（位置は動かさない）。
+    /// `n`（≤ 16）ビットを読む。足りなければ`None`（位置は動かさない）。
     fn take(&mut self, n: u32) -> Option<u32> {
         if (n as usize) > self.remaining() {
             return None;
@@ -244,8 +249,9 @@ impl Bits<'_> {
     }
 }
 
-/// LZSS を展開する。出力が `limit` バイトを超えたら断る。終わりの印の 13 bit は（ゲームの書き方が端数を捨てるので）
-/// 足りなくてもよい。印が無い・印の後にビットが残っていれば断る。
+/// LZSSを展開する。出力が`limit`バイトを超えたら断る。
+/// ゲームの書き方は端数を捨てるので終わりの印の13 bitは足りなくてもよい。
+/// 印が無い、または印の後にビットが残っていれば断る。
 pub fn unlzss(data: &[u8], limit: usize) -> Result<Vec<u8>, LzssError> {
     let mut bits = Bits { data, pos: 0 };
     let mut history = vec![0u8; HISTORY_SIZE];
@@ -266,7 +272,7 @@ pub fn unlzss(data: &[u8], limit: usize) -> Result<Vec<u8>, LzssError> {
             }
             write = (write + 1) & HISTORY_MASK;
         } else {
-            // 位置の 13 bit。足りない分は 0（左詰め）で読む。0 になれば終わりの印。
+            // 位置の13 bit。足りない分は0（左詰め）で読む。0になれば終わりの印。
             let avail = bits.remaining().min(INDEX_BITS as usize) as u32;
             let head = bits.take(avail).ok_or(LzssError::Truncated)?;
             let index = (head << (INDEX_BITS - avail)) as usize;
@@ -298,8 +304,9 @@ pub fn unlzss(data: &[u8], limit: usize) -> Result<Vec<u8>, LzssError> {
     }
 }
 
-/// 復号・展開した本体（`image`）。`image[..0x18]` は生の見出し、`image[0x18..0xC0]` は復号した見出し、
-/// `image[0xC0..]` は展開した本体。USER チャンクは含まない。
+/// 復号・展開した本体（`image`）。
+/// `image[..0x18]`は生のヘッダ。`image[0x18..0xC0]`は復号したヘッダ。`image[0xC0..]`は展開した本体。
+/// USERチャンクは含まない。
 pub fn decode_image(file: &[u8]) -> Result<Vec<u8>, DecodeError> {
     let len = file.len();
     if len < ENC_START {
@@ -366,7 +373,7 @@ pub fn decode_image(file: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(image)
 }
 
-/// 30 フレームに 1 バイトの D の長さ（塊ごとに切り捨て）。
+/// 30フレームに1バイトのDの長さ（チャンクごとに切り捨て）。
 pub fn expected_fps_len(frames: usize) -> usize {
     (frames / CHUNK_FRAMES) * (CHUNK_FRAMES / FPS_EVERY) + (frames % CHUNK_FRAMES) / FPS_EVERY
 }
@@ -391,13 +398,14 @@ fn words(block: &[u8]) -> Option<Vec<u16>> {
     )
 }
 
-/// 展開した本体から、枠ごとの入力を読む。ブロックは隙間なく並ぶので、各ブロックの終わりは「次に大きいポインタ」（最後は本体の終わり）。
+/// 展開した本体から枠ごとの入力を読む。ブロックは隙間なく並ぶ。そのため各ブロックの終わりは「次に大きいポインタ」（最後は本体の終わり）。
 pub fn read_inputs(image: &[u8]) -> Result<ReplayInputs, DecodeError> {
     if image.len() < BLOCKS_START {
         return Err(DecodeError::ImageTooShort { len: image.len() });
     }
-    // ポインタを全部集める。A・B・C のブロックは必ず 0x20 バイト以上あるので本体の中を指す。D は 30 フレーム
-    // 未満だと空になりうるので本体の終わりを指してもよく、空の D どうしは同じ位置を指しうる。
+    // ポインタを全部集める。
+    // A・B・Cのブロックは必ず0x20バイト以上あるので本体の中を指す。
+    // Dは30フレーム未満だと空になりうる。そのため本体の終わりを指してもよく、空のDどうしは同じ位置を指しうる。
     let mut ptrs = [[0u32; SLOTS]; 4];
     let mut starts: Vec<(u32, usize)> = Vec::new();
     for (ai, base) in ARRAY_TABLE.iter().enumerate() {
@@ -435,7 +443,7 @@ pub fn read_inputs(image: &[u8]) -> Result<ReplayInputs, DecodeError> {
         if p == 0 {
             return None;
         }
-        // 同じ位置を指す D が後ろの枠にあれば、この D は空（ファイルの中の並びは枠の順）。
+        // 同じ位置を指すDが後ろの枠にあればこのDは空（ファイルの中の並びは枠の順）。
         if ai == 3 && ((slot + 1)..SLOTS).any(|s2| ptrs[3][s2] == p) {
             return image.get(p as usize..p as usize);
         }
@@ -526,7 +534,7 @@ mod tests {
         }
     }
 
-    /// 「0」と「1」の文字列から MSB 先頭のバイト列を作る（端数は捨てる —— ゲームの書き方）。書き込み側とは共有しない。
+    /// 「0」と「1」の文字列からMSB先頭のバイト列を作る（端数は捨てる —— ゲームの書き方）。書き込み側とは共有しない。
     fn bytes_from_bits(s: &str) -> Vec<u8> {
         let bits: Vec<u8> = s
             .chars()
@@ -542,11 +550,11 @@ mod tests {
 
     #[test]
     fn decrypt_matches_hand_computed_vectors() {
-        // 鍵 0x40: 平文 10 20 30 のとき、暗号は 10+40=50、20+47=67、30+4E=7E。
+        // 鍵0x40: 平文10 20 30のとき暗号は10+40=50、20+47=67、30+4E=7E。
         let mut b = [0x50u8, 0x67, 0x7E];
         decrypt_in_place(&mut b, 0x40);
         assert_eq!(b, [0x10, 0x20, 0x30]);
-        // 鍵が u8 で回る: 鍵 0xFC は 0xFC → 0x03（0xFC+7=0x103）→ 0x0A。平文 00 00 00 の暗号は FC 03 0A。
+        // 鍵がu8で回る: 鍵0xFCは0xFC → 0x03（0xFC+7=0x103）→ 0x0A。平文00 00 00の暗号はFC 03 0A。
         let mut w = [0xFCu8, 0x03, 0x0A];
         decrypt_in_place(&mut w, 0xFC);
         assert_eq!(w, [0, 0, 0]);
@@ -564,18 +572,18 @@ mod tests {
     #[test]
     fn checksum_matches_hand_computed_vector() {
         let mut d = vec![0u8; 0x20];
-        d[0x14] = 0xEE; // 範囲の外（0x15 の手前）
+        d[0x14] = 0xEE; // 範囲の外（0x15の手前）
         d[0x15] = 0x03;
         d[0x16] = 0x00;
         d[0x17] = 0x00;
         d[0x18] = 0x10;
-        d[0x1F] = 0x20; // comp_size = 0x20 なら範囲の外（0x20 の手前まで）
+        d[0x1F] = 0x20; // comp_size = 0x20 なら範囲の外（0x20の手前まで）
         d[0x10] = 0xFF; // 範囲の外（チェックサム自身）
         assert_eq!(checksum(&d, 0x1F), Some(0x3F00_0318 + 0x03 + 0x10));
         assert_eq!(checksum(&d, 0x20), Some(0x3F00_0318 + 0x03 + 0x10 + 0x20));
         assert_eq!(checksum(&d, 0x21), None);
         assert_eq!(checksum(&d, 0x14), None);
-        // u32 で回る: 0xFF を 1,700 万個（総和 4.3e9 は u32 に収まらない）。期待値は u64 で計算して 2^32 で割った余り。
+        // u32で回る: 0xFFを1,700万個（総和4.3e9はu32に収まらない）。期待値はu64で計算して2^32で割った余り。
         let big = vec![0xFFu8; 0x15 + 17_000_000];
         let want = (u64::from(CHECKSUM_SEED) + 255 * 17_000_000) % (1u64 << 32);
         assert_eq!(checksum(&big, big.len()), Some(want as u32));
@@ -584,8 +592,8 @@ mod tests {
     #[test]
     fn unlzss_hand_written_stream() {
         // 'A' → 1 01000001 / 'B' → 1 01000010（履歴の位置 1 = 'A'、2 = 'B'）
-        // 一致: 0 ＋ 位置 1（0000000000001）＋ 長さ 7 − 3 = 4（0100）→ 位置 1 から 7 バイト = A B A B A B A（重なる一致）
-        // 終わり: 0 ＋ 13 bit の 0。計 50 bit → 6 バイト（48 bit）で、最後の 2 bit は捨てる。
+        // 一致: 0 ＋ 位置1（0000000000001）＋ 長さ7 − 3 = 4（0100）→ 位置1から7バイト = A B A B A B A（重なる一致）
+        // 終わり: 0 ＋ 13 bitの0。計50 bit → 6バイト（48 bit）で最後の2 bitは捨てる。
         let s = "101000001 101000010 0 0000000000001 0100 0 0000000000000";
         let data = bytes_from_bits(s);
         assert_eq!(data.len(), 6);
@@ -596,9 +604,9 @@ mod tests {
 
     #[test]
     fn unlzss_terminator_forms() {
-        // 「空」: 印だけ（14 bit → 8 bit にそろう分は 1 バイト）。
+        // 「空」: 印だけ。14 bitのうち8 bitにそろう分の1バイトだけを書く。
         assert_eq!(unlzss(&[0x00], 10).unwrap(), Vec::<u8>::new());
-        // 印（フラグ 1 bit ＋ 位置 13 bit）の後に 2 bit 余る（16 bit のうち 14 bit が印）→ 断る。
+        // 印（フラグ1 bit ＋ 位置13 bit）の後に2 bit余る（16 bitのうち14 bitが印）→ 断る。
         assert_eq!(
             unlzss(&[0x00, 0x00], 10),
             Err(LzssError::TrailingBits { bits: 2 })
@@ -612,7 +620,7 @@ mod tests {
             unlzss(&bytes_from_bits("1 0100 0001 1 0101"), 10),
             Err(LzssError::Truncated)
         );
-        // 位置が途中で切れていて 0 でない: フラグ 0 の後の 7 bit が 0000001。
+        // 位置が途中で切れていて0でない: フラグ0の後の7 bitが0000001。
         assert_eq!(unlzss(&[0b0000_0001], 10), Err(LzssError::Truncated));
     }
 
@@ -685,7 +693,7 @@ mod tests {
             assert_eq!(st.fps.len(), expected_fps_len(frames));
             assert!(st.fps_len_ok);
         }
-        // 1 と 2 の取り違えを見つけるため、席ごとの情報も別の値で往復する。
+        // 1と2の取り違えを見つけるためサイドごとの情報も別の値で往復する。
         let spec = sample_spec(50);
         let got = decode_inputs(&build_replay(&spec)).unwrap();
         let (s, g) = (&spec.stages[0], &got.stages[0]);
@@ -698,7 +706,7 @@ mod tests {
 
     #[test]
     fn expected_fps_len_matches_hand_values() {
-        // 3598 / 30 = 119 余り 28、7196 は塊 2 つ、3599 は塊 1 つ ＋ 1 フレーム。
+        // 3598 / 30 = 119余り28、7196はチャンク2つ、3599はチャンク1つ ＋ 1フレーム。
         assert_eq!(expected_fps_len(0), 0);
         assert_eq!(expected_fps_len(29), 0);
         assert_eq!(expected_fps_len(30), 1);
@@ -711,7 +719,7 @@ mod tests {
 
     #[test]
     fn hand_assembled_file_decodes() {
-        // 本体（`0xC0` 以降）: 0x1EC − 0xC0 = 0x12C バイトの見出し部 ＋ A・B・C 各 0x20 + 6 ＋ D は無し。
+        // 本体（`0xC0`以降）: 0x1EC − 0xC0 = 0x12Cバイトのヘッダ部 ＋ A・B・C各 0x20 + 6 ＋ D は無し。
         let a_ptr = 0x1ECu32;
         let blk = 0x20 + 6;
         let mut body = vec![0u8; 0x12C];
@@ -735,7 +743,7 @@ mod tests {
         body.extend_from_slice(&a);
         body.extend_from_slice(&b);
         body.extend_from_slice(&c);
-        // LZSS: 全部リテラル（1 + 8 bit）＋ 終わり（0 + 13 bit の 0）。端数は捨てる。
+        // LZSS: 全部リテラル（1 + 8 bit）＋ 終わり（0 + 13 bitの0）。端数は捨てる。
         let mut bit_string = String::new();
         for byte in &body {
             bit_string.push('1');
@@ -753,7 +761,7 @@ mod tests {
         plain[0x15] = 0x55; // 鍵
         plain[0x18..0x1C].copy_from_slice(&(lzss.len() as u32).to_le_bytes());
         plain[0x1C..0x20].copy_from_slice(&(body.len() as u32).to_le_bytes());
-        // 配列 A の枠 9、B の枠 9、C の枠 9（`0x20 + 4 * 9`、`0x48 + 4 * 9`、`0x70 + 4 * 9`）。
+        // 配列Aの枠9、Bの枠9、Cの枠9（`0x20 + 4 * 9`、`0x48 + 4 * 9`、`0x70 + 4 * 9`）。
         plain[0x20 + 36..0x20 + 40].copy_from_slice(&a_ptr.to_le_bytes());
         plain[0x48 + 36..0x48 + 40].copy_from_slice(&(a_ptr + blk as u32).to_le_bytes());
         plain[0x70 + 36..0x70 + 40].copy_from_slice(&(a_ptr + 2 * blk as u32).to_le_bytes());
@@ -762,7 +770,7 @@ mod tests {
             .iter()
             .fold(0x3F00_0318u32, |s, &x| s + u32::from(x));
         plain[0x10..0x14].copy_from_slice(&sum.to_le_bytes());
-        // 暗号化: [0x18, comp_size) の i 番目に 鍵 + 7 * i を足す（手で書く）。
+        // 暗号化: [0x18, comp_size)のi番目に 鍵 + 7 * i を足す（手で書く）。
         let mut file = plain.clone();
         for (i, x) in file[0x18..comp_size].iter_mut().enumerate() {
             *x = x.wrapping_add(0x55u8.wrapping_add((7 * i) as u8));
@@ -840,7 +848,7 @@ mod tests {
             decode_inputs(&f),
             Err(DecodeError::ChecksumMismatch { .. })
         ));
-        // USER チャンクを壊してもこの入口は通る（範囲の外）。
+        // USERチャンクを壊してもこの入口は通る（範囲の外）。
         let mut f = good.clone();
         let n = f.len();
         f[n - 3] ^= 0xFF;
@@ -850,7 +858,7 @@ mod tests {
             Err(DecodeError::CompSizeOutOfRange { .. })
         ));
 
-        // 中身を壊して、チェックサムを合わせ直す（暗号化 → 復号の内側を狙う毒）。
+        // 中身を壊してチェックサムを合わせ直す（暗号化 → 復号の内側を狙う不正な入力）。
         let repack = |edit: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
             let mut plain = good[..comp].to_vec();
             let key = plain[0x15];
@@ -943,7 +951,7 @@ mod tests {
         let mut im = image.clone();
         im[ptr_c9..ptr_c9 + 4].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(read_inputs(&im), Err(DecodeError::MissingArray { slot: 9 }));
-        // D を丸ごと落とす: D の表はまだ残っているが、指す先が本体の終わりなので空の D として読める。
+        // Dを丸ごと落とす: Dの表はまだ残っている。指す先が本体の終わりなので空のDとして読める。
         let d9 = u32::from_le_bytes(image[0x98 + 36..0x98 + 40].try_into().unwrap()) as usize;
         let mut im = image.clone();
         im.truncate(d9);
@@ -969,7 +977,7 @@ mod tests {
 
     #[test]
     fn random_bytes_never_panic() {
-        // 半分は正しい形の合成リプレイを何バイトか壊したもので、奥まで届いた本数が 0 でないことも見る（全部が入口で断られると測れていない）。
+        // 半分は正しい形の合成リプレイを何バイトか壊したもの。奥まで届いた本数が0でないことも見る（全部が入口で断られると測れていない）。
         let mut rng = XorShift(0x9E37_79B9);
         let (mut ok, mut reached_lzss, mut reached_arrays) = (0u32, 0u32, 0u32);
         let base = build_replay(&sample_spec(200));

@@ -1,19 +1,20 @@
-//! ゲームのメニューが保存関数へ渡すパスの形と、印を足してよいファイルかの判断（pure）。
+//! ゲームのメニューが保存関数へ渡すパスの形と、印を足してよいファイルかどうかの判断（pure）。
 //!
-//! 保存関数 `0x00420C60` を呼ぶのは 2 か所で、パスは exe のフォルダを作業フォルダにして開かれる相対パス:
-//! - 保存の画面（`0x004297F1`）: `sprintf("replay/th9_%.2d.rpy", 枠 + 1)`（書式は `0x0048FA84`）。枠は 25 個。
-//! - 内蔵のネット対戦の自動保存（`0x00429BF6`）: `sprintf("./replay/th9_udn%.3d.rpy", n)`（書式は `0x0048FA68`）。
-//!   n は 1 から、空いている最初の番号（`0x00429B8D`〜`0x00429BC0`）。1000 個とも埋まっていると 1000。
+//! 保存関数`0x00420C60`を呼ぶのは2か所。パスはexeのフォルダを作業フォルダにして開かれる相対パス:
+//! - 保存の画面（`0x004297F1`）: `sprintf("replay/th9_%.2d.rpy", 枠 + 1)`（書式は`0x0048FA84`）。枠は25個。
+//! - 内蔵のネット対戦の自動保存（`0x00429BF6`）: `sprintf("./replay/th9_udn%.3d.rpy", n)`（書式は`0x0048FA68`）。
+//!   nは1から数えて空いている最初の番号（`0x00429B8D`〜`0x00429BC0`）。1000個とも埋まっていると1000。
 //!
-//! 印を足すファイルは、この 2 つの形のパスだけに限る（`..`・絶対パス・別のフォルダは断る）。
+//! 印を足すファイルはこの2つの形のパスだけに限る（`..`・絶対パス・別のフォルダは断る）。
 #![forbid(unsafe_code)]
 
-/// 保存の画面の枠の数（一覧の 25 枠。`0x00426DAB` の `cmp $0x19`）。保管庫の `pack50` の半分（`vault::PACK50_HALF`）も同じ枠の数。
+/// 保存の画面の枠の数（一覧の25枠。`0x00426DAB`の`cmp $0x19`）。保管庫の`pack50`の半分（`vault::PACK50_HALF`）も同じ枠の数。
 pub const SLOTS: u8 = 25;
 /// 内蔵のネット対戦の自動保存の番号の上限（`0x00429BBA cmp $0x3e8,%edi`）。
 pub const UDN_MAX: u16 = 1000;
-/// ファイルの更新時刻が保存の始まりの時刻よりこれだけ前でも新しいと見なす。FAT の更新時刻は 2 秒刻み（切り捨て）なので、
-/// 同じ 2 秒では足りず、粗い時計の分を足して 3 秒にした。
+/// ファイルの更新時刻が保存の始まりの時刻よりこれだけ前でも新しいと見なす。
+/// FATの更新時刻は2秒刻み（切り捨て）なので同じ2秒では足りない。
+/// 粗い時計の分を足して3秒にした。
 pub const MTIME_SLACK_MS: u64 = 3000;
 
 /// 保存関数に渡されたパスの種類。
@@ -25,13 +26,13 @@ pub enum MenuSavePath {
     Udn(u16),
 }
 
-/// 保存の画面の枠 `n`（1〜25）のファイル名（書式 `th9_%.2d.rpy`、`0x0048FA84` の `replay/` の後ろ）。
+/// 保存の画面の枠`n`（1〜25）のファイル名（書式`th9_%.2d.rpy`、`0x0048FA84`の`replay/`の後ろ）。
 pub fn slot_file_name(n: u16) -> String {
     format!("th9_{n:02}.rpy")
 }
 
 impl MenuSavePath {
-    /// exe のフォルダからの相対パス（`/` 区切り。先頭の `./` は付けない）。
+    /// exeのフォルダからの相対パス（`/`区切り。先頭の`./`は付けない）。
     pub fn relative(&self) -> String {
         match self {
             MenuSavePath::Slot(n) => format!("replay/{}", slot_file_name(u16::from(*n))),
@@ -40,7 +41,7 @@ impl MenuSavePath {
     }
 }
 
-/// 数字だけの欄（`min_width` 桁以上 4 桁まで）を数にする。`+`・空白・数字以外が混ざれば `None`。桁数の厳密な形は呼び手が見る。
+/// 数字だけのフィールド（`min_width`桁以上4桁まで）を数にする。`+`・空白・数字以外が混ざれば`None`。桁数の厳密な形は呼び手が見る。
 fn digits(s: &str, min_width: usize) -> Option<u16> {
     if s.len() < min_width || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -48,8 +49,9 @@ fn digits(s: &str, min_width: usize) -> Option<u16> {
     s.parse().ok()
 }
 
-/// 保存関数に渡されたパス（NUL を含まない CP932 のバイト列）を、2 つの形のどちらかとして読む。形が違えば `None`。
-/// 読めたものは `relative()` が元のパスと同じ文字になる（先頭の `./` を除いて）ので、`..` や別のフォルダは通らない。
+/// 保存関数に渡されたパス（NULを含まないANSIのバイト列。2つの形はASCIIだけなのでコードページに依らない）を2つの形のどちらかとして読む。
+/// 形が違えば`None`。
+/// 読み取れたものは`relative()`が元のパスと同じ文字になる（先頭の`./`を除いて）。そのため`..`や別のフォルダは通らない。
 pub fn parse_save_path(path: &[u8]) -> Option<MenuSavePath> {
     let s = core::str::from_utf8(path).ok()?;
     if let Some(num) = s
@@ -57,7 +59,7 @@ pub fn parse_save_path(path: &[u8]) -> Option<MenuSavePath> {
         .and_then(|r| r.strip_suffix(".rpy"))
     {
         let n = digits(num, 3)?;
-        // `%.3d` は 3 桁未満を 0 で埋める。余分な 0（0001）は作らない。
+        // `%.3d`は3桁未満を0で埋める。余分な0（0001）は作らない。
         return ((1..=UDN_MAX).contains(&n) && (n >= 1000 || num.len() == 3))
             .then_some(MenuSavePath::Udn(n));
     }
@@ -68,8 +70,8 @@ pub fn parse_save_path(path: &[u8]) -> Option<MenuSavePath> {
     (num.len() == 2 && (1..=u16::from(SLOTS)).contains(&n)).then_some(MenuSavePath::Slot(n as u8))
 }
 
-/// ファイルの更新時刻（UNIX 時刻のミリ秒）が、今回の保存の始まり以降か。失敗して前の保存の古いファイルが残っているときに、
-/// そのファイルへ印を足さないための判断。
+/// ファイルの更新時刻（UNIX時刻のミリ秒）が今回の保存の始まり以降かどうか。
+/// 失敗して前の保存の古いファイルが残っているときにそのファイルへ印を足さないための判断。
 pub fn written_since(mtime_ms: u64, started_ms: u64) -> bool {
     mtime_ms.saturating_add(MTIME_SLACK_MS) >= started_ms
 }
@@ -104,7 +106,7 @@ mod tests {
 
     #[test]
     fn the_games_own_format_strings_make_paths_that_are_read() {
-        // 書式 `replay/th9_%.2d.rpy` / `./replay/th9_udn%.3d.rpy` をこちらで展開して、読み手と食い違わないか。
+        // 書式`replay/th9_%.2d.rpy` / `./replay/th9_udn%.3d.rpy`をこちらで展開して読み手と食い違わないかを見る。
         for n in 1..=SLOTS {
             let p = format!("replay/th9_{n:02}.rpy");
             let r = parse_save_path(p.as_bytes()).unwrap();
@@ -148,6 +150,8 @@ mod tests {
             b"other/th9_01.rpy",
             b"replay/th9_01.rpyx",
             b"\x83\x8a/th9_01.rpy",
+            b"\xB6\xAB/replay/th9_01.rpy",
+            b"replay/\xB6\xAB/th9_01.rpy",
         ] {
             assert_eq!(
                 parse_save_path(bad),
@@ -163,7 +167,7 @@ mod tests {
         let start = 1_000_000_000_000u64;
         assert!(written_since(start, start));
         assert!(written_since(start + 5_000, start));
-        // FAT の 2 秒刻みで切り捨てた時刻（最大 2 秒前）に、粗い時計の分が加わっても通る。
+        // FATの2秒刻みで切り捨てた時刻（最大2秒前）に粗い時計の分が加わっても通る。
         assert!(written_since(start - 2_000, start));
         assert!(written_since(start - 2_999, start));
         assert!(written_since(start - MTIME_SLACK_MS, start));

@@ -1,9 +1,11 @@
-// 検査のツール: ルームへ WebSocket で接続する関数と、届いた文を順に待つ入れ物。送り元の IP は文書用のアドレスだけを使う。
+// 検査のツール: ルームへWebSocketで接続する関数と届いた文を順に待つバッファ。送り元のIPは文書用のアドレスだけを使う。
 import { env, exports } from "cloudflare:workers";
-import { normalizeRoomName } from "../src/rules";
+import { expect } from "vitest";
+import { TICKET_MAC_CHARS, normalizeRoomName } from "../src/rules";
+import { mintTicket, seatKey } from "../src/ticket";
 
-// 送り元は文書用の IPv6（RFC 3849 の 2001:db8::/32）。ファイルごとに乱数の区切りを変え、回数の制限が持ち越されないようにする
-// （/64 で数えるので 3・4 グループ目を変える）。
+// 送り元は文書用のIPv6（RFC 3849の2001:db8::/32）。
+// ファイルごとに乱数の区切りを変えて回数の制限が持ち越されないようにする（/64で数えるので3・4グループ目を変える）。
 const fileTag = Math.floor(Math.random() * 0xffff).toString(16);
 let ipSeq = 0;
 /** 検査ごとに別の送り元（別の /64）にする。 */
@@ -71,7 +73,7 @@ export class Client {
     return this.closedFlag;
   }
 
-  /** 次の 1 通。ms 待っても来なければ落ちる。 */
+  /** 次の1通。ms待っても来なければ失敗する。 */
   next(ms = 2000): Promise<any> {
     const m = this.queue.shift();
     if (m !== undefined) return Promise.resolve(m);
@@ -102,10 +104,17 @@ export class Client {
   }
 }
 
-/** ルーム名（打った文字のまま）で接続する。dll と同じく UTF-8 をパーセント符号化してパスに載せる。 */
-export async function connect(room: string, ip?: string, cid?: string): Promise<Client> {
-  const query = cid === undefined ? "" : `?cid=${cid}`;
-  const res = await rawConnect(`/v0/rooms/${encodeURIComponent(room)}${query}`, { ip });
+/** ルームのパス。ticketは観戦用のルームのhostが出す席のチケット（符号化して載せる）。 */
+export function roomPath(room: string, cid?: string, ticket?: string): string {
+  const q: string[] = [];
+  if (cid !== undefined) q.push(`cid=${cid}`);
+  if (ticket !== undefined) q.push(`ticket=${encodeURIComponent(ticket)}`);
+  return `/v0/rooms/${encodeURIComponent(room)}${q.length === 0 ? "" : `?${q.join("&")}`}`;
+}
+
+/** ルーム名（打った文字のまま）で接続する。dllと同じくUTF-8をパーセント符号化してパスに載せる。 */
+export async function connect(room: string, ip?: string, cid?: string, ticket?: string): Promise<Client> {
+  const res = await rawConnect(roomPath(room, cid, ticket), { ip });
   if (res.status !== 101 || res.webSocket === null) {
     throw new Error(`expected 101, got ${res.status}: ${await res.text()}`);
   }
@@ -113,13 +122,13 @@ export async function connect(room: string, ip?: string, cid?: string): Promise<
 }
 
 let buildSeq = 0;
-/** 検査ごとに別のビルド番号（別の待ち列）。ほかの検査の待ち人と組にならないように。 */
+/** 検査ごとに別のビルド番号（別の待ち列）。ほかの検査の待ち人とペアにならないように。 */
 export function freshBuild(): number {
   buildSeq += 1;
   return 1_000_000 + parseInt(fileTag, 16) * 1000 + buildSeq;
 }
 
-/** ランダム対戦の待ち列へ接続する（パス `/v0/random/<ビルド番号>`）。 */
+/** ランダム対戦の待ち列へ接続する（パス`/v0/random/<ビルド番号>`）。 */
 export async function connectRandom(build: number, ip?: string, cid?: string): Promise<Client> {
   const query = cid === undefined ? "" : `?cid=${cid}`;
   const res = await rawConnect(`/v0/random/${build}${query}`, { ip });
@@ -129,7 +138,7 @@ export async function connectRandom(build: number, ip?: string, cid?: string): P
   return new Client(res.webSocket);
 }
 
-/** 進行中のランダム対戦の一覧へ接続する（post = 載せる口・view = 見る口。パス `/v0/watch/<ビルド番号>/<post|view>`）。 */
+/** 進行中のランダム対戦の一覧へ接続する（post = 載せる口・view = 見る口。パス`/v0/watch/<ビルド番号>/<post|view>`）。 */
 export async function connectWatch(build: number, kind: "post" | "view", ip?: string): Promise<Client> {
   const res = await rawConnect(`/v0/watch/${build}/${kind}`, { ip });
   if (res.status !== 101 || res.webSocket === null) {
@@ -139,7 +148,7 @@ export async function connectWatch(build: number, kind: "post" | "view", ip?: st
 }
 
 let cidSeq = 0;
-/** 起動ごとの乱数の見本（16 進 32 文字）。検査ごとに別の値。 */
+/** 起動ごとの乱数の見本（16進32文字）。検査ごとに別の値。 */
 export function freshCid(): string {
   cidSeq += 1;
   return `${fileTag.padStart(4, "0")}${cidSeq.toString(16).padStart(4, "0")}`.padEnd(32, "c");
@@ -149,7 +158,22 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** 合成の接続コード（base64url の文字だけ）。 */
+/** チケットの形（発行.期限.MAC）。 */
+export const TICKET_RE = new RegExp(`^\\d+\\.\\d+\\.[A-Za-z0-9_-]{${TICKET_MAC_CHARS}}$`);
+
+/** guestが受けるpeer（対戦のルームではチケットが載る）。 */
+export function peerWithTicket(code: string): unknown {
+  return { t: "peer", code, ticket: expect.stringMatching(TICKET_RE) };
+}
+
+/** 検査のSEAT_KEYで観戦用のルーム名wについてチケットを作る（既定はいま発行の24時間）。 */
+export async function ticketFor(w: string, issued = Math.floor(Date.now() / 1000), expires?: number): Promise<string> {
+  const key = await seatKey(env.SEAT_KEY);
+  if (key === null) throw new Error("検査の SEAT_KEY が無い");
+  return mintTicket(key, w, issued, expires);
+}
+
+/** 合成の接続コード（base64urlの文字だけ）。 */
 export function fakeCode(tag: string, len = 80): string {
   const base = `AAE${tag}`.replace(/[^A-Za-z0-9_-]/g, "x");
   return (base + "Q".repeat(len)).slice(0, len);

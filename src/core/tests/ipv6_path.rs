@@ -1,9 +1,12 @@
-//! IPv6 の経路の組み上がりの検査。公開の入口（`Link`）だけを使う。
+//! IPv6の経路の組み上がりの検査。公開の入口（`Link`）だけを使う。
 //!
-//! 2 つの `Link` を偽のネットワーク（1 ms ごとに進む固定の模型）で接続する。各 `Link` は IPv4 のソケットと IPv6 のソケットを 1 つずつ持ち、宛先の族と
-//! 同じ族のソケットから出て、相手の同じ族のソケットへ着く。族ごとに「生きている / 全部捨てる」を切り替えられる。IPv6 の送り元は
-//! OS が返す形をまねて flowinfo と scope_id を付けて渡す（`SocketAddr` の `==` はそれらも比べるので、アドレスとポートだけで
-//! 比べるガードが崩れると接続できない）。アドレスは文書用の範囲（203.0.113.0/24）と、2400:cb00:: の架空の IPv6。
+//! 2つの`Link`を偽のネットワーク（1 msごとに進む固定の模型）で接続する。
+//! 各`Link`はIPv4のソケットとIPv6のソケットを1つずつ持つ。
+//! 宛先のアドレスファミリと同じファミリのソケットから出て、相手の同じファミリのソケットへ着く。
+//! ファミリごとに「生きている / 全部捨てる」を切り替えられる。
+//! IPv6の送り元はOSが返す形をまねてflowinfoとscope_idを付けて渡す。
+//! `SocketAddr`の`==`はそれらも比べるので、アドレスとポートだけで比べるガードが崩れると接続できない。
+//! アドレスは文書用の範囲（203.0.113.0/24）と2400:cb00:: の架空のIPv6。
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
@@ -33,7 +36,7 @@ fn b_v6() -> SocketAddr {
     sa("[2400:cb00::b]:42002")
 }
 
-/// OS が返す形をまねた IPv6 の送り元（flowinfo・scope_id が 0 でない）。
+/// OSが返す形をまねたIPv6の送り元（flowinfo・scope_idが0でない）。
 fn os_v6(a: SocketAddr) -> SocketAddr {
     match a {
         SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0x0A_BCDE, 11)),
@@ -98,6 +101,20 @@ fn hello(nonce: u64) -> Message {
     })
 }
 
+fn public_of(nonce: u64) -> [u8; higanr_core::seal::PUBLIC_LEN] {
+    higanr_core::seal::Ephemeral::from_seed(&higanr_core::seal::KeySeed([nonce as u8; 32])).public()
+}
+
+/// `role`の相手がnonce `echo`のHELLOへ返す今のセッションのHELLO_ACK。
+fn ack(echo: u64, role: u64) -> Message {
+    Message::HelloAck {
+        echo_nonce: echo,
+        role_nonce: role,
+        public: public_of(role),
+        echo_public: public_of(echo),
+    }
+}
+
 #[derive(Default)]
 struct Q(Vec<(SocketAddr, Vec<u8>)>);
 
@@ -113,7 +130,7 @@ fn fam(a: SocketAddr) -> usize {
     usize::from(a.is_ipv6())
 }
 
-/// 2 つの `Link` と偽のネットワーク。A の相手の候補は `[B の IPv4, B の IPv6]`、B は逆。
+/// 2つの`Link`と偽のネットワーク。Aの相手の候補は`[B の IPv4, B の IPv6]`、Bは逆。
 struct Net {
     a: Link,
     b: Link,
@@ -314,7 +331,7 @@ fn with_both_families_alive_the_link_connects_and_prefers_ipv6() {
 }
 
 #[test]
-fn an_unlisted_ipv6_source_with_a_good_tag_is_learned_and_a_mapped_one_is_not() {
+fn an_unlisted_ipv6_source_is_learned_from_a_current_ack_and_a_mapped_one_is_never_answered() {
     let moved = sa("[2400:cb00::b]:42099");
     let mut a = link(&[b_v6()], 1);
     let mut q = Q::default();
@@ -336,48 +353,53 @@ fn an_unlisted_ipv6_source_with_a_good_tag_is_learned_and_a_mapped_one_is_not() 
         7005,
     );
     a.on_datagram(mapped, &enc(&hello(2)), 3, &mut q);
+    a.on_datagram(mapped, &enc(&ack(1, 2)), 3, &mut q);
     let c = a.recv_counts();
-    assert_eq!((c.learned, c.foreign), (0, 1), "{c:?}");
-    assert!(q.0.is_empty(), "学ばなかった送り元へ返した");
+    assert_eq!((c.learned, c.foreign), (0, 2), "{c:?}");
+    assert!(q.0.is_empty(), "学べない送り元へ返した");
 
+    let sent_to = |q: &Q, pred: fn(&Message) -> bool| -> Vec<SocketAddr> {
+        q.0.iter()
+            .filter(|(_, b)| wire::decode(&key(), None, b).is_ok_and(|p| pred(&p.msg)))
+            .map(|(to, _)| *to)
+            .collect()
+    };
     a.on_datagram(os_v6(moved), &enc(&hello(2)), 4, &mut q);
     let c = a.recv_counts();
-    assert_eq!((c.learned, c.foreign), (1, 1), "{c:?}");
-    let replies: Vec<SocketAddr> =
-        q.0.iter()
-            .filter(|(_, b)| {
-                matches!(
-                    wire::decode(&key(), None, b).map(|p| p.msg),
-                    Ok(Message::HelloAck { .. })
-                )
-            })
-            .map(|(to, _)| *to)
-            .collect();
-    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!((c.learned, c.foreign), (0, 2), "HELLO で学んだ: {c:?}");
+    let hellos = sent_to(&q, |m| matches!(m, Message::Hello(_)));
     assert!(
-        replies.iter().all(|r| same_endpoint(*r, moved)),
-        "{replies:?}"
+        hellos.iter().filter(|d| same_endpoint(**d, moved)).count() == 1,
+        "学んでいない送り元へ HELLO を 1 回だけ返していない: {hellos:?}"
     );
-    a.on_datagram(os_v6(moved), &enc(&hello(2)), 5, &mut q);
-    assert_eq!(a.recv_counts().learned, 1);
     q.0.clear();
-    for t in 6..=60 {
-        a.poll(t, &mut q);
-    }
-    let to: Vec<SocketAddr> =
-        q.0.iter()
-            .filter(|(_, b)| {
-                matches!(
-                    wire::decode(&key(), None, b).map(|p| p.msg),
-                    Ok(Message::Hello(_))
-                )
-            })
-            .map(|(to, _)| *to)
-            .collect();
-    assert!(to.iter().any(|d| same_endpoint(*d, b_v6())), "{to:?}");
+
+    // BのHELLOはコードの候補から届いているので学んだ送り元の返答では経路を決めず、候補の返答で決める。
+    a.on_datagram(os_v6(moved), &enc(&ack(1, 2)), 5, &mut q);
+    assert_eq!(a.recv_counts().learned, 1);
+    assert_eq!(a.path(), None);
+    a.on_datagram(os_v6(b_v6()), &enc(&ack(1, 2)), 5, &mut q);
     assert!(
-        to.iter().any(|d| same_endpoint(*d, moved)),
-        "学んだ IPv6 のアドレスへ送らない: {to:?}"
+        a.path().is_some_and(|p| same_endpoint(p, b_v6())),
+        "{:?}",
+        a.path()
     );
-    assert!(a.hello_sent_learned() > 0);
+
+    // 相手の便がコードの候補から1通も届いていなければ学んだ送り元の返答で経路を決める。
+    let mut a = link(&[b_v6()], 1);
+    a.poll(1, &mut q);
+    q.0.clear();
+    a.on_datagram(os_v6(moved), &enc(&ack(1, 2)), 5, &mut q);
+    assert_eq!(a.recv_counts().learned, 1);
+    assert!(
+        a.path().is_some_and(|p| same_endpoint(p, moved)),
+        "{:?}",
+        a.path()
+    );
+    a.on_datagram(os_v6(moved), &enc(&hello(2)), 6, &mut q);
+    let acks = sent_to(&q, |m| matches!(m, Message::HelloAck { .. }));
+    assert!(
+        acks.len() == 1 && same_endpoint(acks[0], moved),
+        "学んだ送り元の HELLO に返していない: {acks:?}"
+    );
 }

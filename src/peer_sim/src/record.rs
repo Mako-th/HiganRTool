@@ -1,8 +1,8 @@
-//! 記録: フレームごとの (seg, frame, 1P, 2P) の列と、終わりの要約（総フレーム数、stall の総数と最大連続、「到着 → 適用」の
-//! p50 / p95 / p99 / max、捨てたものの数）。
+//! 記録: フレームごとの (seg, frame, 1P, 2P)の列と終わりの要約。
+//! 要約は総フレーム数・stallの総数と最大連続・「到着 → 適用」のp50 / p95 / p99 / max・捨てたものの数。
 //!
-//! 回ごとに別名のファイルを `create_new` で作り、既存のファイルを上書きしない。出力先のフォルダの中か上に `th09.exe` があれば（ゲームの
-//! フォルダ）書かずに断る。
+//! 実行ごとに別名のファイルを`create_new`で作り、既存のファイルを上書きしない。
+//! 出力先のフォルダの中か上に`th09.exe`があれば（ゲームのフォルダ）書かずに断る。
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
@@ -14,16 +14,16 @@ use higanr_core::handshake::FailReason;
 
 use crate::sim::{End, Report};
 
-/// 同じ秒に同じ名前で何度作ってよいか（`_2`〜の尻を付けて探す回数）。
+/// 同じ秒に同じ名前で何度作ってよいか（`_2`〜の末尾を付けて探す回数）。
 const NAME_ATTEMPTS: u32 = 100;
 
-/// 最近順位法の百分位（`permille` は千分率。950 = p95）。並べた列で。空なら None。
+/// 最近順位法の百分位（`permille`は千分率。950 = p95）。並べた列で。空ならNone。
 pub fn percentile(sorted: &[u64], permille: u64) -> Option<u64> {
     if sorted.is_empty() {
         return None;
     }
     let n = sorted.len() as u64;
-    // 順位 = ceil(n × p)。1 から数えるので、添字はその 1 つ前。
+    // 順位 = ceil(n × p)。1から数えるので添字はその1つ前。
     let rank = (n * permille).div_ceil(1_000).max(1);
     sorted.get((rank - 1) as usize).copied()
 }
@@ -44,12 +44,12 @@ pub fn summary(rep: &Report) -> String {
         End::Finished { peer_bye: false } => {
             "全部の seg を終えた（相手の BYE は届かず、相手が 60 秒黙った）".to_string()
         }
-        // 相手の HiganRTool のバージョンが違う: dll と同じ文字（自分は名乗ったバージョン）。
+        // 相手のHiganRToolのバージョンが違う: dllと同じ文字（自分は名乗ったバージョン）。
         End::HandshakeFailed(FailReason::OtherVersion { theirs }) => format!(
             "接続できなかった: {}",
             higanr_core::net_menu::other_version_text(rep.proto_ver, theirs)
         ),
-        // 相手のビルドが違う（バージョン 5）: dll と同じ文字（自分は `update::BUILD_NUMBER`）。
+        // 相手のビルドが違う（バージョン5）: dllと同じ文字（自分は`update::BUILD_NUMBER`）。
         End::HandshakeFailed(FailReason::OtherBuild { theirs }) => format!(
             "接続できなかった: {}",
             higanr_core::net_menu::other_build_text(higanr_core::update::BUILD_NUMBER, theirs)
@@ -65,7 +65,7 @@ pub fn summary(rep: &Report) -> String {
         End::MenuDiverged { step, mismatch } => format!(
             "入った押下が選択の模型に合わなかった（BYE(取消) を出した）: {step:?} / {mismatch:?}"
         ),
-        // 打ち切りで終えた回を、相手の側（dll の記録の「相手が終えた」）と突き合わせられるよう、BYE を出したかを添える。
+        // 打ち切りで終えた実行を相手の側（dllの記録の「相手が終えた」）と突き合わせられるようBYEを出したかを添える。
         End::Deadline if rep.deadline_bye => format!(
             "打ち切りの時刻（{} ms）を過ぎた（--max-sec。相手へ BYE(終了) を 1 通出して終えた）",
             rep.max_ms
@@ -114,7 +114,7 @@ pub fn summary(rep: &Report) -> String {
     }
     let frames = rep.recs.len();
     match rep.follow {
-        // 付いていく形は相手のワードを待って使うのが常なので、stall は数えない（`sim.rs` のモジュール doc）。
+        // 付いていく形は相手のワードを待って使うのが常なのでstallは数えない（`sim.rs`のモジュールdoc）。
         Some(f) => {
             let _ = writeln!(
                 s,
@@ -219,8 +219,8 @@ pub fn log_text(rep: &Report, args_line: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# peer_sim の記録");
     let _ = writeln!(s, "# 引数: {args_line}");
-    // 入った押下は `#` の行に書く（`#` でない行は (seg frame 1P 2P delay) の列だけにして、dll の
-    // `_net_frames.csv` や相手の記録と行ごとに突き合わせられる形を保つ）。
+    // 入った押下は`#`の行に書く。
+    // `#`でない行は (seg frame 1P 2P delay)の列だけにしてdllの`_net_frames.csv`や相手の記録と行ごとに突き合わせられる形を保つ。
     let _ = writeln!(s, "# 押下 step kind value screen（入った順）");
     for st in &rep.presses {
         let _ = writeln!(
@@ -288,7 +288,7 @@ fn safe(s: &str) -> String {
     if t.is_empty() { "_".to_string() } else { t }
 }
 
-/// UTC の `YYYYMMDD_HHMMSSZ`（std だけで作る。地方時は std では取れない）。
+/// UTCの`YYYYMMDD_HHMMSSZ`（stdだけで作る。地方時はstdでは取れない）。
 pub fn utc_stamp(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)
@@ -296,7 +296,7 @@ pub fn utc_stamp(t: SystemTime) -> String {
         .unwrap_or(0);
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
-    // 1970-01-01 からの日数を年月日へ（civil_from_days の考え方）。
+    // 1970-01-01からの日数を年月日へ（civil_from_daysの考え方）。
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -318,7 +318,7 @@ pub fn write_log(dir: &Path, name: &str, text: &str) -> Result<PathBuf, String> 
     write_named(dir, name, ".log", text)
 }
 
-/// `write_log` の、末尾（`suffix`。`.log`・`_watch_frames.csv` など）を選べる形。観戦者の CSV（`watch`）が使う。
+/// 末尾（`suffix`。`.log`・`_watch_frames.csv`など）を選べる`write_log`。観戦者のCSV（`watch`）が使う。
 pub fn write_named(dir: &Path, name: &str, suffix: &str, text: &str) -> Result<PathBuf, String> {
     refuse_game_folder(dir)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{} を作れない: {e}", dir.display()))?;

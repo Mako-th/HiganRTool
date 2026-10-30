@@ -1,7 +1,7 @@
-//! 照合の手順（pure）。自分の exe の同定と、地点の表の各地点の期待バイト列の照合（読むだけ）をしてログに書く。
-//! 最初のフックからは、ここの集計が全部通ったときだけ `session::run` が 1 地点を書く。
-//! Win32 の呼び出しは `Env` の向こうへ分け、ここは順番とログの文だけを持つ。同定が合わなければ 1 バイトも読まない。
-//! 注入したスレッド（ゲームスレッドではない）で走るので、ファイルの I/O とヒープの確保は構わない。
+//! 照合の手順（pure）。自分のexeの同定と地点の表の各地点の期待バイト列の照合（読むだけ）をしてログに書く。
+//! 最初のフック以降はここの集計が全部通ったときだけ`session::run`が1地点を書き込む。
+//! Win32の呼び出しは`Env`の向こうへ分ける。ここは順番とログの文だけを持つ。同定が合わなければ1バイトも読まない。
+//! 注入したスレッド（ゲームスレッドではない）で走るのでファイルのI/Oとヒープの確保は構わない。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -17,11 +17,11 @@ use crate::trial_summary::IdentState;
 pub enum IdentOutcome {
     Match,
     Mismatch(IdentMismatch),
-    /// exe のパスが取れない・ファイルが読めない（理由の文）。
+    /// exeのパスが取得できない・ファイルが読み取れない（理由の文）。
     Unreadable(String),
 }
 
-/// exe のファイルを読んだ結果を同定する（照合は `higanr_core::pe::check_ident`）。
+/// exeのファイルを読んだ結果を同定する（照合は`higanr_core::pe::check_ident`）。
 pub fn ident_of_file(read: std::io::Result<Vec<u8>>, ident: &Ident<'_>) -> IdentOutcome {
     match read {
         Err(e) => IdentOutcome::Unreadable(e.to_string()),
@@ -32,31 +32,31 @@ pub fn ident_of_file(read: std::io::Result<Vec<u8>>, ident: &Ident<'_>) -> Ident
     }
 }
 
-/// 照合が外から得るもの。本物は `win::RealEnv`。
+/// 照合が外から得るもの。本物は`win::RealEnv`。
 pub trait Env {
     fn exe_path(&self) -> Option<String>;
     fn ident(&self) -> IdentOutcome;
-    /// 自分の exe が読み込まれた位置（`GetModuleHandleW(NULL)`）。
+    /// 自分のexeが読み込まれた位置（`GetModuleHandleW(NULL)`）。
     fn image_base(&self) -> usize;
-    /// 自分のプロセスのメモリ `[addr, addr + len)` を読む（読むだけ）。コミット済みで読める頁でなければ `None`。
+    /// 自分のプロセスのメモリ`[addr, addr + len)`を読む（読むだけ）。コミット済みで読み取り可能なページでなければ`None`。
     fn read(&mut self, addr: u32, len: usize) -> Option<Vec<u8>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Summary {
-    /// 地点の照合まで進んだか（同定・image base・表の検査のどれかで止まれば false）。
+    /// 地点の照合まで進んだか（同定・image base・表の検査のどれかで止まればfalse）。
     pub checked_sites: bool,
     pub total: usize,
     pub matched: usize,
     pub mismatched: usize,
     pub unreadable: usize,
-    /// 同定の結果（image base が違う・表の検査が落ちたときは `Match` のまま止まる）。
+    /// 同定の結果（image baseが違う・表の検査が落ちたときは`Match`のまま止まる）。
     pub ident: IdentState,
-    /// 一致しなかった地点（不一致と読めなかったもの）の名前（試験のまとめの「フックの設置」の行）。
+    /// 一致しなかった地点（不一致と読み取れなかったもの）の名前（試験のまとめの「フックの設置」の行）。
     pub bad_sites: Vec<&'static str>,
 }
 
-/// 起動の最初の 1 行（簡潔にも残す）。ビルド番号は配るバージョンのビルドだけ入る（開発用は 0）。
+/// 起動の最初の1行（簡潔にも残す）。ビルド番号が入るのは配布するバージョンのビルドだけ（開発用は0）。
 pub fn build_line() -> String {
     format!(
         "HiganRTool: ビルド {} / プロトコル {} / {}",
@@ -70,7 +70,7 @@ pub fn build_line() -> String {
     )
 }
 
-/// OS のバージョン（`RtlGetVersion`。互換モードの影響を受けない値）。
+/// OSのバージョン（`RtlGetVersion`。互換モードの影響を受けない値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OsVersion {
     pub major: u32,
@@ -78,7 +78,7 @@ pub struct OsVersion {
     pub build: u32,
 }
 
-/// 起動の見出しの環境の 1 行（簡潔にも残す）。起動のときだけ落ちる環境の切り分けに使う。
+/// 起動時のヘッダの環境の1行（簡潔にも残す）。起動時だけ落ちる環境の切り分けに使う。
 pub fn system_line(os: Option<OsVersion>, sse2: bool, avx2: bool) -> String {
     let yn = |b: bool| if b { "あり" } else { "なし" };
     let os = match os {
@@ -88,7 +88,7 @@ pub fn system_line(os: Option<OsVersion>, sse2: bool, avx2: bool) -> String {
     format!("環境: {os}\nCPU: SSE2 {}・AVX2 {}", yn(sse2), yn(avx2))
 }
 
-/// 照合の本体。ログの行を `out` に書く（書けなくても続ける）。最後の「スレッドを終える」の行は呼び出し側が書く。
+/// 照合の本体。ログの行を`out`に書く（書き込めなくても続ける）。最後の「スレッドを終える」の行は呼び出し側が書く。
 pub fn run(
     env: &mut dyn Env,
     sites: &[SiteDef],
@@ -142,7 +142,7 @@ pub fn run(
         return summary;
     }
 
-    // 読み込まれた DLL が同じ表を持っている証拠として、表の検査をここでも行う。
+    // 読み込まれたDLLが同じ表を持っている証拠として表の検査をここでも行う。
     if let Err(e) = check_table(sites, forbidden) {
         let _ = writeln!(out, "表の検査: 失敗（{e:?}）");
         let _ = writeln!(out, "フック地点の照合: 未実行（表が破損している）");
@@ -208,13 +208,13 @@ pub fn run(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! 偽の `Env` で手順を見る。見たいのは「どの条件で読むか・読まないか」とログの配線。
+    //! 偽の`Env`で手順を見る。見たいのは「どの条件で読むか・読まないか」とログの配線。
     use super::*;
     use crate::th09_addr::{FORBIDDEN, IMAGE_BASE, SITES};
     use higanr_core::pe::IdentField;
     use std::collections::HashMap;
 
-    /// バージョンの欄の順・SSE2 と AVX2 の取り違え・取れなかったときの文を見る。
+    /// バージョンのフィールドの順・SSE2とAVX2の取り違え・取得できなかったときの文を見る。
     #[test]
     fn system_line_names_the_os_build_and_cpu_features() {
         let v = OsVersion {
@@ -346,7 +346,7 @@ pub(crate) mod tests {
     fn broken_table_reads_nothing() {
         let mut f = Fake::all_match();
         let mut table: Vec<SiteDef> = SITES.to_vec();
-        table[1].addr = table[2].addr; // 2 行を重ねる
+        table[1].addr = table[2].addr; // 2行を重ねる
         let mut out = Vec::new();
         let s = run(&mut f, &table, FORBIDDEN, IMAGE_BASE, &mut out);
         assert_eq!(f.reads, 0);
@@ -383,7 +383,7 @@ pub(crate) mod tests {
         )));
     }
 
-    /// 配るバージョンのビルドでは走らせない（行の末尾の出典は開発用のビルドだけが持つ）。
+    /// 配布するバージョンのビルドでは走らせない（行の末尾の出典は開発用のビルドだけが持つ）。
     #[cfg(not(feature = "dist"))]
     #[test]
     fn mismatch_and_unreadable_are_reported_and_the_rest_still_checked() {

@@ -1,10 +1,25 @@
-//! 差し替え先の入口（素のアセンブリ）と、入口が触る静的変数。アセンブリの unsafe はここだけ。
+//! 差し替え先の入口（素のアセンブリ）と入口が触る静的変数。アセンブリのunsafeはここだけ。
 //!
-//! `0x0043112D` の `call 0x0042E9C0` の rel32 をこの入口へ向ける。入口は回数を 1 つ増やし、tick ごとの記録を 1 件（1024 バイト）リングバッファに書いて、元の飛び先へ `jmp` する。**ゲームのスレッドで Rust のコードは走らない**（例外は `script_win::SCRIPT_ON` が 0 でないときの `script_on_tick` の呼び出しだけ）。使うレジスタは push / pop で戻し、`jmp` の時点のスタックは入った時と同じなので、元の飛び先（poll_all）の `ret` は呼び出し元（on_tick の call の次）へ直接戻る。
-//! 書く順は「`lock xadd` で番号を取る → 札を 0 → 中身 → 札 = 番号 + 1」。読み取りのスレッドは札・中身・札の順に読み、2 回とも番号 + 1 のときだけ採る（`read_slot`・`ticks::classify`）。x86 は普通の書きの順を入れ替えないので、札が番号 + 1 に見えたら中身は書き終わっている。先頭の 64 バイトの後ろへ**コピーの表**（最大 8 行）の範囲を `rep movsb` で札の前にコピーする（`rep movsb` の中の書きは互いに順が入れ替わりうるが、後の書き（札）とは入れ替わらない —— Intel SDM Vol.3A の「Fast-String Operation and Out-of-Order Stores」。原文は未確認で、検査 `concurrent_reader_never_takes_a_torn_slot` が破れた枠 0 件を見る）。
-//! **描画だけのフレーム**: 出口 `RENDER_ONLY_EXIT` が 0 でなく `RENDER_ONLY_LEFT` が 0 より大きければ、枠の `+52` に印 1 を書き、残りを 1 減らし、札を書き、スタックの頂上の戻りアドレスを出口へ替えて `ret` する（poll_all を呼ばない）。call の時点のスタックは [戻りアドレス `0x00431132`][esi][ebx] で、出口 `0x00431259` は `pop esi; mov eax,3; pop ebx; ret` ⇒ on_tick が 3 を返し、そのフレームは更新を走らせずに描画へ進む。普通の件は `+52` に 0 を書く。
-//! **台本・ネットワークの分かれ道**: 札を書いた後、`SCRIPT_ON` が 0 なら元の飛び先へ `jmp`。0 でなければ `script_on_tick(k)` を呼び、戻り値が 0 なら元の飛び先へ `jmp`、1 なら `ret`、2 なら戻りアドレスを `RENDER_ONLY_EXIT` へ替えて `ret`（lockstep で相手の入力ワードが揃わなかったフレーム）。
-//! **開始のフック**の入口 `match_start_entry`: `0x0041AB2B` の `call 0x0043BF30` の rel32 をここへ向け、回数を数え、`NET_ON` が 0 でなければ `match_start_on` を呼んでから元の飛び先へ `jmp` する。
+//! `0x0043112D`の`call 0x0042E9C0`のrel32をこの入口へ向ける。
+//! 入口は回数を1つ増やし、tickごとの記録を1件（1024バイト）リングバッファに書いて元の飛び先へ`jmp`する。
+//! **ゲームのスレッドでRustのコードは走らない**（例外は`script_win::SCRIPT_ON`が0でないときの`script_on_tick`の呼び出しだけ）。
+//! 使うレジスタはpush / popで戻す。`jmp`の時点のスタックは入った時と同じなので元の飛び先（poll_all）の`ret`は呼び出し元（on_tickのcallの次）へ直接戻る。
+//!
+//! 書く順は「`lock xadd`で番号を取る → チケットを0 → 中身 → チケット = 番号 + 1」。
+//! 読み取りのスレッドはチケット・中身・チケットの順に読み、2回とも番号 + 1 のときだけ採る（`read_slot`・`ticks::classify`）。
+//! x86は普通の書きの順を入れ替えないので、チケットが番号 + 1 に見えたら中身は書き終わっている。
+//! 先頭の64バイトの後ろへ**コピーの表**（最大8行）の範囲を`rep movsb`でチケットの前にコピーする。
+//! `rep movsb`の中の書きは互いに順が入れ替わりうるが、後の書き（チケット）とは入れ替わらない —— Intel SDM Vol.3Aの「Fast-String Operation and Out-of-Order Stores」。
+//! 原文は未確認。検査`concurrent_reader_never_takes_a_torn_slot`が破れた枠0件を見る。
+//!
+//! **描画だけのフレーム**: 出口`RENDER_ONLY_EXIT`が0でなく`RENDER_ONLY_LEFT`が0より大きければ、枠の`+52`にマーク1を書いて残りを1減らす。
+//! チケットを書いた後、スタックの頂上の戻りアドレスを出口へ替えて`ret`する（poll_allを呼ばない）。
+//! callの時点のスタックは[戻りアドレス`0x00431132`][esi][ebx]。出口`0x00431259`は`pop esi; mov eax,3; pop ebx; ret`なのでon_tickが3を返し、そのフレームは更新を走らせずに描画へ進む。
+//! 普通の件は`+52`に0を書く。
+//!
+//! **台本・ネットワークの分岐**: チケットを書いた後、`SCRIPT_ON`が0なら元の飛び先へ`jmp`。0でなければ`script_on_tick(k)`を呼び、戻り値が0なら元の飛び先へ`jmp`、1なら`ret`、2なら戻りアドレスを`RENDER_ONLY_EXIT`へ替えて`ret`（lockstepで相手の入力ワードが揃わなかったフレーム）。
+//!
+//! **開始のフック**の入口`match_start_entry`: `0x0041AB2B`の`call 0x0043BF30`のrel32をここへ向ける。回数を数え、`NET_ON`が0でなければ`match_start_on`を呼んでから元の飛び先へ`jmp`する。
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
@@ -17,53 +32,53 @@ use crate::ticks::{
     SlotState, Snap, classify,
 };
 
-/// 32 ビットの TEB の中のスレッド ID の位置（`ClientId` の `UniqueThread` = 0x24）。x86 の `GetCurrentThreadId` と同じ所を読む。
-/// 検査 `entry_writes_one_slot_per_call` が `GetCurrentThreadId` と比べる。
+/// 32ビットのTEBの中のスレッドIDの位置（`ClientId`の `UniqueThread` = 0x24）。x86の`GetCurrentThreadId`と同じ所を読む。
+/// 検査`entry_writes_one_slot_per_call`が`GetCurrentThreadId`と比べる。
 pub(crate) const TEB_THREAD_ID: u32 = 0x24;
 
-/// 入口を通った回数。ゲームのスレッドが `lock inc` で増やし、読み取りのスレッドが読む（1 秒ごとの行）。`AtomicU32` は `u32` と
-/// 同じ大きさ・並びなので、アセンブリから素の 4 バイトとして書いてよい（下の静的変数も同じ）。
+/// 入口を通った回数。ゲームのスレッドが`lock inc`で増やし、読み取りのスレッドが読む（1秒ごとの行）。
+/// `AtomicU32`は`u32`と同じ大きさ・並びなので、アセンブリから素の4バイトとして書いてよい（下の静的変数も同じ）。
 pub static CALLS: AtomicU32 = AtomicU32::new(0);
 
-/// 元の飛び先。設置の前に、rel32 から計算して表の値と一致したものだけを書く（`hook::install_call_hook`）。書く前（0 の間）は、
-/// この入口へ向いた call はまだ 1 つも無い。
+/// 元の飛び先。設置の前にrel32から計算して表の値と一致したものだけを書く（`hook::install_call_hook`）。
+/// 書く前（0の間）は、この入口へ向いたcallはまだ1つも無い。
 pub static ORIGINAL_TARGET: AtomicU32 = AtomicU32::new(0);
 
-/// ウィンドウの構造体のアドレス（花映塚では `th09_addr::WINDOW_ADDR`）。元の飛び先と同じく rel32 を書く前に設定する。
-/// **0 なら入口はウィンドウを読まず、ウィンドウの 2 欄に 0 を書く**（検査のプロセスや、ウィンドウが読めなかったとき）。
+/// ウィンドウの構造体のアドレス（花映塚では`th09_addr::WINDOW_ADDR`）。元の飛び先と同じくrel32を書く前に設定する。
+/// **0なら入口はウィンドウを読まず、ウィンドウの2つのフィールドに0を書く**（検査のプロセスやウィンドウが読めなかったとき）。
 pub static WINDOW: AtomicU32 = AtomicU32::new(0);
 
-/// 次に書く番号。入口が `lock xadd` で 1 つずつ取る（呼ぶスレッドが 1 本でなくても枠が重ならない）。
+/// 次に書く番号。入口が`lock xadd`で1つずつ取る（呼ぶスレッドが1本でなくても枠が重ならない）。
 pub static SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// 描画だけのフレームの出口（花映塚では `0x00431259`）。ウィンドウのアドレスと同じく rel32 を書く前に設定する。**0 なら入口は分岐を通らない**
-/// （検査のプロセスと、`render_only_exit` 行が照合で一致しなかったとき）。
+/// 描画だけのフレームの出口（花映塚では`0x00431259`）。ウィンドウのアドレスと同じくrel32を書く前に設定する。
+/// **0なら入口は分岐を通らない**（検査のプロセスと、`render_only_exit`行が照合で一致しなかったとき）。
 pub static RENDER_ONLY_EXIT: AtomicU32 = AtomicU32::new(0);
 
-/// 描画だけのフレームをあと何回作るか。0 から N にするのは読み取りのスレッドだけ（`try_start_render_only`。compare-exchange で
-/// 0 のときだけ）、1 減らすのは入口だけ（`lock dec`）。入口は「読んで 0 より大きい → 減らす」の 2 手で、その間に読み取りの
-/// スレッドが書かないのは「0 のときだけ N にする」決まりによる（入口を呼ぶゲームのスレッドは 1 本の見込み）。
+/// 描画だけのフレームをあと何回作るか。
+/// 0からNにするのは読み取りのスレッドだけ（`try_start_render_only`。compare-exchangeで0のときだけ）。1減らすのは入口だけ（`lock dec`）。
+/// 入口は「読んで0より大きい → 減らす」の2手で処理する。その間に読み取りのスレッドが書かないのは「0のときだけNにする」決まりによる（入口を呼ぶゲームのスレッドは1本の見込み）。
 pub static RENDER_ONLY_LEFT: AtomicU32 = AtomicU32::new(0);
 
-/// コピーの表の 1 行の大きさ（元・長さ・コピー先の 4 バイトずつ。入口のアセンブリが `add eax, 12` で進む）。
+/// コピーの表の1行の大きさ（元・長さ・コピー先の4バイトずつ。入口のアセンブリが`add eax, 12`で進む）。
 const COPY_ROW_BYTES: u32 = 12;
 const COPY_ROW_WORDS: usize = (COPY_ROW_BYTES / 4) as usize;
 
-/// コピーの表の行の数。**0 なら入口は何もコピーしない**（検査のプロセスと、表を設定できなかったとき）。元の飛び先・ウィンドウのアドレスと同じく、
-/// rel32 を書く前に設定する（`set_copy_table`）。
+/// コピーの表の行の数。**0なら入口は何もコピーしない**（検査のプロセスと、表を設定できなかったとき）。
+/// 元の飛び先・ウィンドウのアドレスと同じくrel32を書く前に設定する（`set_copy_table`）。
 pub static COPY_COUNT: AtomicU32 = AtomicU32::new(0);
-/// コピーの表（行 i は語 3i・3i+1・3i+2 に元・長さ・コピー先）。`COPY_COUNT` より後ろの行は読まれない。
+/// コピーの表（行iはワード3i・3i+1・3i+2に元・長さ・コピー先）。`COPY_COUNT`より後ろの行は読まれない。
 pub static COPY_ROWS: [AtomicU32; COPY_MAX_ROWS * COPY_ROW_WORDS] =
     [const { AtomicU32::new(0) }; COPY_MAX_ROWS * COPY_ROW_WORDS];
 
-/// リングバッファの 1 件（1024 バイト。中の配置は `ticks` の `OFF_*` と `OFF_COPY_*`）。64 バイト境界に揃え、先頭の 64 バイトがキャッシュの行
-/// 1 つに収まるようにする（読み取りのスレッドとゲームのスレッドが別の件を触るときに同じ行を取り合わない）。
+/// リングバッファの1件（1024バイト。中の配置は`ticks`の`OFF_*`と`OFF_COPY_*`）。
+/// 64バイト境界に揃え、先頭の64バイトがキャッシュライン1つに収まるようにする（読み取りのスレッドとゲームのスレッドが別の件を触るときに同じラインを取り合わない）。
 #[repr(C, align(64))]
 pub struct Slot {
     pub words: [AtomicU32; SLOT_WORDS],
 }
 
-/// リングバッファ（4096 件 = 4 MiB）。静的変数の初めの値は全部 0 で、DLL の .bss に入る。
+/// リングバッファ（4096件 = 4 MiB）。静的変数の初期値は全部0で、DLLの .bssに入る。
 #[repr(C, align(64))]
 pub struct Ring {
     pub slots: [Slot; RING_LEN as usize],
@@ -80,29 +95,30 @@ pub static RING: Ring = Ring {
     }; RING_LEN as usize],
 };
 
-// SAFETY（`#[unsafe(naked)]`）: 本体は `naked_asm!` だけで、入る時の状態（戻りアドレスがスタックの頂上、引数なし）をそのまま元の飛び先へ渡す:
-// - eax・ecx・edx・ebx を push し、最後に逆の順で pop してから `jmp`。esi・edi はコピーの間だけ使い push / pop で戻す。ebp・esp には書かない（esp は push / pop で動くだけで、`jmp` の時点では入った時と同じ）。
-// - 書くのは DLL の静的変数と、描画だけのフレームの経路での自分の戻りアドレスだけ。ゲームのメモリは読むだけ: `[esi + 0x454/0x58C/0x590]`
-//   （on_tick の this）と、WINDOW が 0 でなければ `[WINDOW + 0x2C/0x3C]` の 8 バイトずつ。枠の番号は `and RING_MASK` でリングバッファの中に収め、
-//   `shl SLOT_SHIFT` で 1024 バイトの位置にする。
-// - コピーの表の各行は `set_copy_table` が `copies::check_layout` を通したものだけ（枠の先頭 64 バイトの後ろ・1024 バイトの中・互いに重ならない）
-//   なので、`rep movsb` は自分の枠の中だけに書く。元の範囲は設置の前に読み取りのスレッドが「コミット済みで読める保護」と検証したもの（`session`。花映塚では th09.exe の .data）で、
-//   コピーする間は ecx（番号）・esi・edi を push / pop で戻す。`cld` は、呼ぶ側が決まりを
-//   破っても `rep movsb` が後ろ向きに枠の外へ書かないための守り。
-// - 静的変数は絶対アドレスで指す（32 ビットでは `sym` が絶対アドレスになり、リンカの再配置で直る。objdump で確認）。ORIGINAL_TARGET・WINDOW・
-//   コピーの表・RENDER_ONLY_EXIT は、この入口へ向く call を書く前に設定される（`hook::install_call_hook`）。
-// - 描画だけのフレームの経路は、`[esp + 16]` の戻りアドレスを RENDER_ONLY_EXIT（照合で `5E B8 03 00 00 00 5B C3` と一致したアドレス。0 ならこの経路を
-//   通らない）に書き換えて pop で全部戻して `ret` する（書き換えるのは自分が呼ばれた call の戻りアドレスだけ）。出口は esi と ebx を pop するので、呼ぶ側（on_tick）が call の前に
-//   push ebx; push esi を積んでいることが前提（`0x00431110`〜`0x00431111`）。
-// - 台本の経路: tick の番号 k を積んで `script_on_tick`（`extern "C"`。中は全部 `catch_unwind`）を呼ぶ。cdecl の決まりで ebx・esi・edi・ebp と
-//   esp は保たれ、DF は `cld` で 0、x87 は call の境目で空（制御語は変えない）。戻った後は 4 つの pop で入った時のレジスタへ戻し、戻り値が 0 なら元の飛び先へ `jmp`、0 でなければ `ret` で呼び出し元（`0x00431132`）へ
-//   戻る。そこは `mov al, [esi+0x5D4]` で eax を読み直すので eax は使われない。戻り値が 2 なら `[esp + 16]` を RENDER_ONLY_EXIT に書き換える
-//   （出口が 0 なら書き換えない）。
-// - 進め直しの回（`rollback_play_win::RESIM_TICK` が 0 でない）: 記録・時刻の記録・コピー・描画だけの分岐を全部飛ばし、`ecx = 1`（k = 0）で
-//   台本の分かれ道（`7:`）へ進む。`SCRIPT_ON` が 0 なら元の飛び先へ `jmp`（進め直しは `SCRIPT_ON` が開いたネットワークの経路の中でしか起きないので、実際には通らない守り）。
-// - 時刻の記録（`pacing::INPUT_STAMP_ON` が 0 でない）: `[esi + 0x454]` を積んで `pacing_win::pace_input`（`extern "C"`。中は `catch_unwind`）を
-//   呼び、`add esp, 4` で片付ける。壊れてよい eax・ecx・edx は、この後の命令が読む前に戻し直し、出口で 4 つの pop が入った時の値へ戻す。DF は `cld` で 0、x87 は使わない。
-/// 入力と待ちの call（`0x0043112D`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
+// SAFETY（`#[unsafe(naked)]`）: 本体は`naked_asm!`だけ。入る時の状態（戻りアドレスがスタックの頂上、引数なし）をそのまま元の飛び先へ渡す:
+// - eax・ecx・edx・ebxをpushし、最後に逆の順でpopしてから`jmp`する。esi・ediはコピーの間だけ使い、push / popで戻す。ebp・espには書かない（espはpush / popで動くだけで、`jmp`の時点では入った時と同じ）。
+// - 書くのはDLLの静的変数と、描画だけのフレームの経路での自分の戻りアドレスだけ。
+//   ゲームのメモリは読むだけ。読むのは`[esi + 0x454/0x58C/0x590]`（on_tickのthis）と、WINDOWが0でなければ`[WINDOW + 0x2C/0x3C]`の8バイトずつ。
+//   枠の番号は`and RING_MASK`でリングバッファの中に収め、`shl SLOT_SHIFT`で1024バイトの位置にする。
+// - コピーの表の各行は`set_copy_table`が`copies::check_layout`を通したものだけ（枠の先頭64バイトの後ろ・1024バイトの中・互いに重ならない）。
+//   そのため`rep movsb`は自分の枠の中だけに書く。
+//   元の範囲は設置の前に、読み取りのスレッドが「コミット済みで読み取り可能な保護」と検証したもの（`session`。花映塚ではth09.exeの .data）。
+//   コピーする間はecx（番号）・esi・ediをpush / popで戻す。
+//   `cld`は呼ぶ側が決まりを破っても`rep movsb`が後ろ向きに枠の外へ書かないための守り。
+// - 静的変数は絶対アドレスで指す（32ビットでは`sym`が絶対アドレスになり、リンカーの再配置で直る。objdumpで確認）。
+//   ORIGINAL_TARGET・WINDOW・コピーの表・RENDER_ONLY_EXITは、この入口へ向くcallを書く前に設定される（`hook::install_call_hook`）。
+// - 描画だけのフレームの経路は`[esp + 16]`の戻りアドレスをRENDER_ONLY_EXIT（照合で`5E B8 03 00 00 00 5B C3`と一致したアドレス。0ならこの経路を通らない）に書き換え、popで全部戻して`ret`する（書き換えるのは自分が呼ばれたcallの戻りアドレスだけ）。
+//   出口はesiとebxをpopするので、呼ぶ側（on_tick）がcallの前にpush ebx; push esiを積んでいることが前提（`0x00431110`〜`0x00431111`）。
+// - 台本の経路: tickの番号kを積んで`script_on_tick`（`extern "C"`。中は全部`catch_unwind`）を呼ぶ。
+//   cdeclの決まりでebx・esi・edi・ebpとespは保たれ、DFは`cld`で0、x87はcallの境目で空（制御ワードは変えない）。
+//   戻った後は4つのpopで入った時のレジスタへ戻す。
+//   戻り値が0なら元の飛び先へ`jmp`、0でなければ`ret`で呼び出し元（`0x00431132`）へ戻る。そこは`mov al, [esi+0x5D4]`でeaxを読み直すのでeaxは使われない。
+//   戻り値が2なら`[esp + 16]`をRENDER_ONLY_EXITに書き換える（出口が0なら書き換えない）。
+// - 進め直し中の呼び出し（`rollback_play_win::RESIM_TICK`が0でない）: 記録・時刻の記録・コピー・描画だけの分岐を全部飛ばし、`ecx = 1`（k = 0）で台本の分岐（`7:`）へ進む。
+//   `SCRIPT_ON`が0なら元の飛び先へ`jmp`する（進め直しは`SCRIPT_ON`が開いたネットワークの経路の中でしか起きないので、実際には通らない守り）。
+// - 時刻の記録（`pacing::INPUT_STAMP_ON`が0でない）: `[esi + 0x454]`を積んで`pacing_win::pace_input`（`extern "C"`。中は`catch_unwind`）を呼び、`add esp, 4`で後始末する。
+//   壊れてよいeax・ecx・edxはこの後の命令が読む前に戻し直し、出口で4つのpopが入った時の値へ戻す。DFは`cld`で0、x87は使わない。
+/// 入力と待ちのcall（`0x0043112D`）の差し替え先。Rustからは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn input_wait_entry() {
     core::arch::naked_asm!(
@@ -110,8 +126,8 @@ pub extern "C" fn input_wait_entry() {
         "push ecx",
         "push edx",
         "push ebx",
-        // 進め直しの回（rollback の Present の後の進め直し。`RESIM_TICK` が 0 でない）は、回数も tick の記録も時刻の記録も積まず、
-        // 台本の分かれ道へ直に進む（k は使わない）。0 の間は cmp と je の 2 命令だけ。
+        // 進め直し中の呼び出し（rollbackのPresentの後の進め直し。`RESIM_TICK`が0でない）は、回数もtickの記録も時刻の記録も積まない。
+        // その呼び出しは台本の分岐へ直に進む（kは使わない）。0の間はcmpとjeの2命令だけ。
         "cmp dword ptr [{resim}], 0",
         "je 13f",
         "cmp dword ptr [{script_on}], 0",
@@ -126,7 +142,7 @@ pub extern "C" fn input_wait_entry() {
         "jmp dword ptr [{orig}]",
         "13:",
         "lock inc dword ptr [{calls}]",
-        // 時刻の記録（`pacing::INPUT_STAMP_ON` が 0 なら cmp と je の 2 命令で素通り）。tick の欄を積んで、入った瞬間の QPC を記録のリングバッファへ。
+        // 時刻の記録（`pacing::INPUT_STAMP_ON`が0ならcmpとjeの2命令で素通り）。tickのフィールドを積んで入った瞬間のQPCを記録のリングバッファへ。
         "cmp dword ptr [{stamp_on}], 0",
         "je 12f",
         "cld",
@@ -140,7 +156,7 @@ pub extern "C" fn input_wait_entry() {
         "mov ebx, ecx",
         "and ebx, {mask}",
         "shl ebx, {shift}",
-        // 札を 0（書いている途中）。
+        // チケットを0にする（書いている途中）。
         "mov dword ptr [{ring} + ebx + {o_ticket}], 0",
         "rdtsc",
         "mov dword ptr [{ring} + ebx + {o_tsc_lo}], eax",
@@ -174,7 +190,7 @@ pub extern "C" fn input_wait_entry() {
         "mov dword ptr [{ring} + ebx + {o_tid}], eax",
         "mov dword ptr [{ring} + ebx + {o_fpucw}], 0",
         "fnstcw word ptr [{ring} + ebx + {o_fpucw}]",
-        // コピーの表（件数 edx。0 なら飛ばす）。eax = 行、ecx = 長さ、esi = 元、edi = 枠の中のコピー先。
+        // コピーの表（件数edx。0なら飛ばす）。eax = 行、ecx = 長さ、esi = 元、edi = 枠の中のコピー先。
         "mov edx, dword ptr [{copy_n}]",
         "test edx, edx",
         "jz 5f",
@@ -196,19 +212,19 @@ pub extern "C" fn input_wait_entry() {
         "pop esi",
         "pop ecx",
         "5:",
-        // 描画だけのフレームの分かれ道（edx = 出口、eax = 残り）。出口が 0 か残りが 0 なら普通の経路へ。
+        // 描画だけのフレームの分岐（edx = 出口、eax = 残り）。出口が0か残りが0なら普通の経路へ。
         "mov edx, dword ptr [{exit}]",
         "test edx, edx",
         "jz 6f",
         "mov eax, dword ptr [{left}]",
         "test eax, eax",
         "jz 6f",
-        // 印 1 → 残りを 1 減らす → 札（印は札より前に見える）。
+        // マーク1 → 残りを1減らす → チケット（マークはチケットより前に見える）。
         "mov dword ptr [{ring} + ebx + {o_mark}], 1",
         "lock dec dword ptr [{left}]",
         "inc ecx",
         "mov dword ptr [{ring} + ebx + {o_ticket}], ecx",
-        // 戻りアドレス（4 つの push の下。on_tick の call の次 0x00431132）を出口へ替えて戻る。poll_all は呼ばない。
+        // 戻りアドレス（4つのpushの下。on_tickのcallの次0x00431132）を出口へ替えて戻る。poll_allは呼ばない。
         "mov dword ptr [esp + 16], edx",
         "pop ebx",
         "pop edx",
@@ -216,12 +232,12 @@ pub extern "C" fn input_wait_entry() {
         "pop eax",
         "ret",
         "6:",
-        // 普通の件の印は 0（前の周の 1 を消す）。
+        // 普通の件のマークは0（前の周の1を消す）。
         "mov dword ptr [{ring} + ebx + {o_mark}], 0",
-        // 札 = seq + 1（ここまでの中身の書きより後に見える。x86 は書きの順を入れ替えない）。
+        // チケット = seq + 1（ここまでの中身の書きより後に見える。x86は書きの順を入れ替えない）。
         "inc ecx",
         "mov dword ptr [{ring} + ebx + {o_ticket}], ecx",
-        // 台本の分かれ道。SCRIPT_ON が 0 なら今までどおり（下の 4 つの pop と元の飛び先への jmp）。
+        // 台本の分岐。SCRIPT_ONが0なら今までどおり（下の4つのpopと元の飛び先へのjmp）。
         "cmp dword ptr [{script_on}], 0",
         "jne 7f",
         "pop ebx",
@@ -230,13 +246,13 @@ pub extern "C" fn input_wait_entry() {
         "pop eax",
         "jmp dword ptr [{orig}]",
         "7:",
-        // script_on_tick(k)。k = 札 - 1 = lock xadd で取った番号。cdecl（引数 1 つ、呼ぶ側が片付ける）。
+        // script_on_tick(k)。k = チケット - 1 = lock xaddで取った番号。cdecl（引数1つ。呼ぶ側が後始末する）。
         "dec ecx",
         "cld",
         "push ecx",
         "call {script_on_tick}",
         "add esp, 4",
-        // 戻り値 2 = 描画だけのフレーム。戻りアドレス（4 つの push の下）を出口へ替えてから、下の 1 と同じ経路で戻る。出口が 0 なら替えない。
+        // 戻り値 2 = 描画だけのフレーム。戻りアドレス（4つのpushの下）を出口へ替えてから下の1と同じ経路で戻る。出口が0なら替えない。
         "cmp eax, 2",
         "jne 9f",
         "mov edx, dword ptr [{exit}]",
@@ -244,8 +260,8 @@ pub extern "C" fn input_wait_entry() {
         "jz 9f",
         "mov dword ptr [esp + 16], edx",
         "9:",
-        // 戻り値 0 = 元の飛び先へ、それ以外 = poll_all を呼ばずに戻る（内蔵ネット対戦の枝と同じ）。
-        // pop はフラグを変えないので、test の結果を pop の後で使える。
+        // 戻り値 0 = 元の飛び先へ。それ以外 = poll_all を呼ばずに戻る（内蔵ネット対戦の分岐と同じ）。
+        // popはフラグを変えないのでtestの結果をpopの後で使える。
         "test eax, eax",
         "pop ebx",
         "pop edx",
@@ -299,19 +315,18 @@ pub fn entry_address() -> u32 {
     input_wait_entry as *const () as usize as u32
 }
 
-/// 開始のフックの元の飛び先（花映塚では `0x0043BF30`）。rel32 を書く前に設定する。
+/// 開始のフックの元の飛び先（花映塚では`0x0043BF30`）。rel32を書く前に設定する。
 pub static MATCH_ORIGINAL: AtomicU32 = AtomicU32::new(0);
 pub static MATCH_CALLS: AtomicU32 = AtomicU32::new(0);
 
-// SAFETY（`#[unsafe(naked)]`）: `0x0041AB2B` の `call 0x0043BF30` の差し替え先。呼ぶ側は thiscall（`0x0041AB23 mov 0x4dc550,%ecx`、
-// `0x0041AB29 push $0x8`）で、入った時のスタックは [戻りアドレス `0x0041AB30`][引数 8]。
-// - `lock inc` と `cmp` はフラグだけを変える（call の境目なので呼ぶ側はフラグを当てにしない）。
-// - `NET_ON` が 0 でなければ eax・ecx（this）・edx を push し、`script_win::match_start_on`（`extern "C"`、引数なし。中は全部
-//   `catch_unwind`）を呼び、逆の順で pop する。cdecl の決まりで ebx・esi・edi・ebp と esp は保たれる。DF は `cld` で 0。x87 の
-//   スタックは call の境目なので空。
-// - 最後の `jmp` の時点のスタックは入った時と同じなので、元の飛び先の `ret 4` は呼ぶ側へ直に戻る。MATCH_ORIGINAL は、この入口へ
-//   向く call を書く前に設定される（`hook::install_call_hook_at`）。
-/// 開始の call（`0x0041AB2B`）の差し替え先。Rust からは呼ばない（アドレスを取るだけ）。
+// SAFETY（`#[unsafe(naked)]`）: `0x0041AB2B`の`call 0x0043BF30`の差し替え先。
+// 呼ぶ側はthiscall（`0x0041AB23 mov 0x4dc550,%ecx`、`0x0041AB29 push $0x8`）で、入った時のスタックは[戻りアドレス`0x0041AB30`][引数8]。
+// - `lock inc`と`cmp`はフラグだけを変える（callの境目なので呼ぶ側はフラグを当てにしない）。
+// - `NET_ON`が0でなければeax・ecx（this）・edxをpushし、`script_win::match_start_on`（`extern "C"`、引数なし。中は全部`catch_unwind`）を呼び、逆の順でpopする。
+//   cdeclの決まりでebx・esi・edi・ebpとespは保たれる。DFは`cld`で0。x87のスタックはcallの境目なので空。
+// - 最後の`jmp`の時点のスタックは入った時と同じなので、元の飛び先の`ret 4`は呼ぶ側へ直に戻る。
+//   MATCH_ORIGINALは、この入口へ向くcallを書く前に設定される（`hook::install_call_hook_at`）。
+/// 開始のcall（`0x0041AB2B`）の差し替え先。Rustからは呼ばない（アドレスを取るだけ）。
 #[unsafe(naked)]
 pub extern "C" fn match_start_entry() {
     core::arch::naked_asm!(
@@ -347,23 +362,23 @@ pub fn calls() -> u32 {
     CALLS.load(Ordering::Acquire)
 }
 
-/// 元の飛び先を設定する。rel32 を書くより前に呼ぶこと（書いた後に呼ぶと、入口が 0 アドレスへ飛びうる）。
+/// 元の飛び先を設定する。rel32を書くより前に呼ぶこと（書いた後に呼ぶと入口が0アドレスへ飛びうる）。
 pub fn set_original_target(target: u32) {
     ORIGINAL_TARGET.store(target, Ordering::SeqCst);
 }
 
-/// ウィンドウのアドレスを設定する（0 なら入口はウィンドウを読まない）。rel32 を書くより前に呼ぶこと。
+/// ウィンドウのアドレスを設定する（0なら入口はウィンドウを読まない）。rel32を書くより前に呼ぶこと。
 pub fn set_window(addr: u32) {
     WINDOW.store(addr, Ordering::SeqCst);
 }
 
-/// 描画だけのフレームの出口を設定する（0 なら入口は分岐を通らない）。rel32 を書くより前に呼ぶこと。
+/// 描画だけのフレームの出口を設定する（0なら入口は分岐を通らない）。rel32を書くより前に呼ぶこと。
 pub fn set_render_only_exit(addr: u32) {
     RENDER_ONLY_EXIT.store(addr, Ordering::SeqCst);
 }
 
-/// 描画だけのフレームを `n` 回作るよう入口に頼む。残りが 0 のときだけセットし（compare-exchange）、セットできたら true。
-/// 残りが 0 でない（前の頼みをまだ使い切っていない）なら何もせず false。
+/// 描画だけのフレームを`n`回作るよう入口に頼む。残りが0のときだけセットし（compare-exchange）、セットできたらtrue。
+/// 残りが0でない（前の頼みをまだ使い切っていない）なら何もせずfalse。
 pub fn try_start_render_only(n: u32) -> bool {
     RENDER_ONLY_LEFT
         .compare_exchange(0, n, Ordering::SeqCst, Ordering::SeqCst)
@@ -374,9 +389,9 @@ pub fn render_only_left() -> u32 {
     RENDER_ONLY_LEFT.load(Ordering::SeqCst)
 }
 
-/// コピーの表を設定する。rel32 を書くより前に呼ぶこと。枠の側の検証（`copies::check_layout`）を通らなければ件数 0 のまま設定し、
-/// false を返す（入口が枠の外へ書かないための最後の守り。元が読めるかは呼び出し側が先に検証する）。件数をいったん 0 にしてから
-/// 行を書き、最後に件数を書く（書き換え途中の表を入口が使わない）。
+/// コピーの表を設定する。rel32を書くより前に呼ぶこと。
+/// 枠の側の検証（`copies::check_layout`）を通らなければ、件数0のまま設定してfalseを返す（入口が枠の外へ書かないための最後の守り。元が読み取り可能かどうかは呼び出し側が先に検証する）。
+/// 件数をいったん0にしてから行を書き、最後に件数を書く（書き換え途中の表を入口が使わない）。
 pub fn set_copy_table(rows: &[CopyRow]) -> bool {
     COPY_COUNT.store(0, Ordering::SeqCst);
     if check_layout(rows).is_err() {
@@ -406,13 +421,14 @@ pub fn copy_table() -> Vec<CopyRow> {
         .collect()
 }
 
-/// 次に書かれる番号（ここより前の番号は、入口が取った。書き終わったかは札で見る）。
+/// 次に書かれる番号（ここより前の番号は入口が取った。書き終わったかどうかはチケットで見る）。
 pub fn next_seq() -> u32 {
     SEQ.load(Ordering::Acquire)
 }
 
-/// 番号 `seq` の枠を、札・中身（1024 バイト全部）・札の順に読む。書き手は素のアセンブリなので、ここは原子変数で読む: 1 回目の札は
-/// Acquire、中身の後に Acquire の fence（2 回目の札の読みが中身の前へ動かない）。いわゆる seqlock の読み方。
+/// 番号`seq`の枠を、チケット・中身（1024バイト全部）・チケットの順に読む。
+/// 書き手は素のアセンブリなので、ここはアトミック変数で読む: 1回目のチケットはAcquire、中身の後にAcquireのfence（2回目のチケットの読みが中身の前へ動かない）。
+/// いわゆるseqlockの読み方。
 pub fn read_slot(seq: u32) -> SlotRead {
     let slot = &RING.slots[(seq & RING_MASK) as usize];
     let ticket = &slot.words[(OFF_TICKET / 4) as usize];
@@ -432,17 +448,18 @@ pub fn read_slot(seq: u32) -> SlotRead {
 
 #[cfg(test)]
 pub(crate) mod testkit {
-    //! 本物の入口を検査のプロセスで呼ぶためのツール（素のアセンブリ）。`seen_target` は元の飛び先の代わり（入った時のレジスタ・
-    //! `[esp]`・esp・EFLAGS を `SEEN` に書き、何も変えずに `ret`）。`call_with_regs(target)` は各レジスタに決まった値を入れ、
-    //! FPU の制御語を `TEST_CW` にして `target` を呼び、戻った直後のレジスタを `AFTER` に書く。`COPY_SRC` はコピーの表の元の代わり。
+    //! 本物の入口を検査のプロセスで呼ぶためのツール（素のアセンブリ）。
+    //! `seen_target`は元の飛び先の代わり（入った時のレジスタ・`[esp]`・esp・EFLAGSを`SEEN`に書き、何も変えずに`ret`）。
+    //! `call_with_regs(target)`は各レジスタに決まった値を設定し、FPUの制御ワードを`TEST_CW`にして`target`を呼び、戻った直後のレジスタを`AFTER`に書く。
+    //! `COPY_SRC`はコピーの表の元の代わり。
     use super::*;
     use std::sync::Mutex;
 
-    /// 本物の入口の静的変数は 1 つしか無いので、本物の検査は 1 本ずつ走らせる。
+    /// 本物の入口の静的変数は1つしか無いので本物の検査は1本ずつ走らせる。
     pub(crate) static REAL_HOOK_TESTS: Mutex<()> = Mutex::new(());
 
     pub(crate) const EFLAGS_DF: u32 = 1 << 10;
-    /// EFLAGS の算術系の旗（CF bit0・PF bit2・AF bit4・ZF bit6・SF bit7・OF bit11）。描画の入口が `pushfd`／`popfd` で全部戻すかを見る。
+    /// EFLAGSの算術系のフラグ（CF bit0・PF bit2・AF bit4・ZF bit6・SF bit7・OF bit11）。描画の入口が`pushfd`／`popfd`で全部戻すかどうかを見る。
     pub(crate) const EFLAGS_ARITH: u32 = 0x8D5;
 
     #[repr(C, align(16))]
@@ -465,16 +482,16 @@ pub(crate) mod testkit {
     pub(crate) const REG_EBX: u32 = 0x4444_4444;
     pub(crate) const REG_EDI: u32 = 0x6666_6666;
     pub(crate) const REG_EBP: u32 = 0x7777_7777;
-    /// 検査で入れる FPU の制御語（Windows の既定 0x027F と違う値）。
+    /// 検査で設定するFPUの制御ワード（Windowsの既定0x027Fと違う値）。
     pub(crate) const TEST_CW_VALUE: u32 = 0x007F;
 
-    /// `SEEN` の並び: eax, ecx, edx, ebx, esi, edi, ebp, [esp], esp, EFLAGS。
+    /// `SEEN`の並び: eax, ecx, edx, ebx, esi, edi, ebp, [esp], esp, EFLAGS。
     pub(crate) static SEEN: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
     pub(crate) static PRE_FLAGS: AtomicU32 = AtomicU32::new(0);
-    /// `AFTER` の並び: eax, ecx, edx, ebx, esi, edi, ebp, esp。
+    /// `AFTER`の並び: eax, ecx, edx, ebx, esi, edi, ebp, esp。
     pub(crate) static AFTER: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
     pub(crate) static TARGET_HITS: AtomicU32 = AtomicU32::new(0);
-    /// 呼ぶ直前の esp（呼ばれた側の esp はこれ - 4 のはず）と、戻りアドレスのはずの値（`call` の次）。
+    /// 呼ぶ直前のesp（呼ばれた側のespはこれ - 4のはず）と、戻りアドレスのはずの値（`call`の次）。
     pub(crate) static PRE_ESP: AtomicU32 = AtomicU32::new(0);
     pub(crate) static EXP_RET: AtomicU32 = AtomicU32::new(0);
     static CALL_TARGET: AtomicU32 = AtomicU32::new(0);
@@ -508,8 +525,8 @@ pub(crate) mod testkit {
         }
     }
 
-    // SAFETY（`#[unsafe(naked)]`）: 書くのは検査の静的変数（SEEN・TARGET_HITS）だけで、eax は一時に使った後で元の値へ戻す。
-    // フラグは `lock inc` より先に `pushfd` で取る（入った時のフラグを全部見る）。`pushfd` と `pop` でスタックは戻る。`ret` は入った時の `[esp]` へ戻る。
+    // SAFETY（`#[unsafe(naked)]`）: 書くのは検査の静的変数（SEEN・TARGET_HITS）だけ。eaxは一時に使った後で元の値へ戻す。
+    // フラグは`lock inc`より先に`pushfd`で取る（入った時のフラグを全部見る）。`pushfd`と`pop`でスタックは戻る。`ret`は入った時の`[esp]`へ戻る。
     #[unsafe(naked)]
     pub(crate) extern "C" fn seen_target() {
         core::arch::naked_asm!(
@@ -533,12 +550,12 @@ pub(crate) mod testkit {
         )
     }
 
-    /// 呼ぶ直前に入れる EFLAGS（CF・PF・AF・ZF・SF・OF を 1、bit 1 は常に 1、IF は 1 のまま、DF と TF は 0）。
+    /// 呼ぶ直前に設定するEFLAGS（CF・PF・AF・ZF・SF・OFを1、bit 1は常に1、IFは1のまま、DFとTFは0）。
     pub(crate) const TEST_FLAGS: u32 = 0x0000_0AD7;
 
-    // SAFETY（`#[unsafe(naked)]`）: cdecl の関数（引数 1 つ `target` を `[esp + 4]` に受け、戻り値なし）。ebx・esi・edi・ebp を
-    // push して最後に pop で戻す。FPU の制御語は SAVED_CW に取って戻す。EFLAGS は `TEST_FLAGS` にしてから呼ぶ。`target` は
-    // 「引数なし・戻り値なしで `ret` する関数」でなければならない。
+    // SAFETY（`#[unsafe(naked)]`）: cdeclの関数（引数1つ`target`を`[esp + 4]`に受け、戻り値なし）。
+    // ebx・esi・edi・ebpをpushして最後にpopで戻す。FPUの制御ワードはSAVED_CWに取って戻す。EFLAGSは`TEST_FLAGS`にしてから呼ぶ。
+    // `target`は「引数なし・戻り値なしで`ret`する関数」でなければならない。
     #[unsafe(naked)]
     unsafe extern "C" fn call_with_regs_asm(_target: u32) {
         core::arch::naked_asm!(
@@ -599,9 +616,9 @@ pub(crate) mod testkit {
     }
 
     pub(crate) fn call_with_regs(target: u32) {
-        // SAFETY: `target` は呼び出し元（検査）が上の約束どおりに選ぶ。入口を呼ぶときは、元の飛び先が `seen_target` に設定されていて、
-        // ウィンドウは 0 か `FAKE_WINDOW`、esi は `FAKE_THIS`（入口が読む `+0x590` まで入る大きさ）、コピーの表は 0 行か `COPY_SRC` の中を指す行だけ。RENDER_ONLY_EXIT は、入口を
-        // 直に呼ぶときは 0（戻りアドレスを替えられるとここへ戻れない）、`fake_on_tick` を呼ぶときは 0 か `fake_exit`。
+        // SAFETY: `target`は呼び出し元（検査）が上の約束どおりに選ぶ。
+        // 入口を呼ぶときは次が全部成り立つ: 元の飛び先が`seen_target`に設定されている・ウィンドウは0か`FAKE_WINDOW`・esiは`FAKE_THIS`（入口が読む`+0x590`まで入る大きさ）・コピーの表は0行か`COPY_SRC`の中を指す行だけ。
+        // RENDER_ONLY_EXITは、入口を直に呼ぶときは0（戻りアドレスを替えられるとここへ戻れない）。`fake_on_tick`を呼ぶときは0か`fake_exit`。
         unsafe { call_with_regs_asm(target) }
     }
 
@@ -609,10 +626,10 @@ pub(crate) mod testkit {
         seen_target as *const () as usize as u32
     }
 
-    // SAFETY（`#[unsafe(naked)]`）: on_tick `0x00431110` の先頭と、入口の call の次の真似。`push ebx; push esi` で call の時点の
-    // スタックを [戻りアドレス][esi][ebx] にして入口を呼ぶ。入口が元の飛び先（`seen_target`）へ飛べば、それが `ret` でここへ戻り、1 を
-    // 返す。入口が戻りアドレスを出口（`fake_exit`）へ替えれば、そちらが esi・ebx を pop して 3 を返す。どちらでも、積んだ 2 つは pop で
-    // 戻り、`ret` は呼んだ所へ戻る。
+    // SAFETY（`#[unsafe(naked)]`）: on_tick `0x00431110`の先頭と入口のcallの次を再現する。`push ebx; push esi`でcallの時点のスタックを[戻りアドレス][esi][ebx]にして入口を呼ぶ。
+    // 入口が元の飛び先（`seen_target`）へ飛べば、それが`ret`でここへ戻り1を返す。
+    // 入口が戻りアドレスを出口（`fake_exit`）へ替えれば、そちらがesi・ebxをpopして3を返す。
+    // どちらでも積んだ2つはpopで戻り、`ret`は呼んだ所へ戻る。
     #[unsafe(naked)]
     pub(crate) extern "C" fn fake_on_tick() {
         core::arch::naked_asm!(
@@ -627,8 +644,8 @@ pub(crate) mod testkit {
         )
     }
 
-    // SAFETY（`#[unsafe(naked)]`）: 出口 `0x00431259`（`5E B8 03 00 00 00 5B C3`）の真似。入口が `fake_on_tick` の戻りアドレスを替えて
-    // ここへ `ret` したとき、スタックの頂上は `fake_on_tick` が積んだ esi・ebx と、その呼び出し元への戻りアドレス。
+    // SAFETY（`#[unsafe(naked)]`）: 出口`0x00431259`（`5E B8 03 00 00 00 5B C3`）の再現。
+    // 入口が`fake_on_tick`の戻りアドレスを替えてここへ`ret`したとき、スタックの頂上は`fake_on_tick`が積んだesi・ebxと、その呼び出し元への戻りアドレス。
     #[unsafe(naked)]
     pub(crate) extern "C" fn fake_exit() {
         core::arch::naked_asm!("pop esi", "mov eax, 3", "pop ebx", "ret")
@@ -699,7 +716,7 @@ mod tests {
         }
     }
 
-    /// 検査のコピーの表: 4 バイト境界の元、4 バイト境界に無い元（+0x46 = 2 余り。InputManager の 2 本目と同じずれ）、奇数のアドレスの元で枠の終わりちょうどまで。
+    /// 検査のコピーの表: 4バイト境界の元、4バイト境界に無い元（+0x46 = 2余り。InputManagerの2本目と同じずれ）、奇数のアドレスの元で枠の終わりちょうどまで。
     fn test_table() -> [CopyRow; 3] {
         let s = copy_src_addr();
         [
@@ -845,7 +862,7 @@ mod tests {
         let good = test_table();
         assert!(set_copy_table(&good));
         let mut out = good;
-        out[2].len = 8; // 枠の終わりを 1 バイト越える
+        out[2].len = 8; // 枠の終わりを1バイト越える
         assert!(!set_copy_table(&out));
         assert_eq!(
             COPY_COUNT.load(Ordering::SeqCst),
@@ -919,7 +936,7 @@ mod tests {
             hits0 + 1,
             "台本の分岐が閉じているのに元の飛び先へ渡さなかった"
         );
-        // 対照: 進め直しでない回は今までどおり 1 件書く。
+        // 対照: 進め直しでない呼び出しは今までどおり1件書く。
         call_with_regs(entry_address());
         assert_eq!(next_seq(), s0.wrapping_add(1), "普通の回が番号を進めない");
         assert_eq!(calls(), c0 + 1);
@@ -946,7 +963,7 @@ mod tests {
         poison_slot(s0);
         let hits0 = TARGET_HITS.load(Ordering::SeqCst);
         RESIM_TICK.store(1, Ordering::SeqCst);
-        FORCE_RET.store(2, Ordering::SeqCst); // 台本の戻り値 1（feed した）
+        FORCE_RET.store(2, Ordering::SeqCst); // 台本の戻り値1（feedした）
         call_with_regs(entry_address());
         RESIM_TICK.store(0, Ordering::SeqCst);
         assert_eq!(
@@ -962,7 +979,7 @@ mod tests {
         assert_eq!(next_seq(), s0, "進め直しの回が番号を進めた");
         assert_eq!(calls(), c0, "進め直しの回を数えた");
         assert_eq!(ticket_of(s0), POISON, "進め直しの回が枠に書いた");
-        // 対照: 進め直しでない回は 1 件書く（同じ戻り値でも元の飛び先へは飛ばない）。
+        // 対照: 進め直しでない呼び出しは1件書く（同じ戻り値でも元の飛び先へは飛ばない）。
         FORCE_RET.store(2, Ordering::SeqCst);
         call_with_regs(entry_address());
         assert_eq!(next_seq(), s0.wrapping_add(1), "普通の回が番号を進めない");

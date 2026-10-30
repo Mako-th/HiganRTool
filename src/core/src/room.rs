@@ -1,11 +1,31 @@
 //! ルームサーバー（`src/server/`）のクライアントの純粋な部品。
 //!
-//! ルーム名の検証とパスの組み立て・文の読み書き（平らな JSON の小さな読み手）・閉じる番号・入口の HTTP の誤りの本文・クライアントの状態機械を持つ。ソケットも時計も持たない。WebSocket の運び（WinHTTP）と受信のスレッドは dll の仕事。サーバーの値は `src/server/src/rules.ts` と同じ（`tests/fixtures/room/rules.json` で突き合わせる）。順番は `room.ts`。
-//! サーバーの JSON の `"host"` / `"guest"` は、読んだ境目で [`Role::Offer`] / [`Role::Answer`] へコピーする（マッチのホスト（1P）と紛れないよう Rust の名前には host / guest を使わない）。dll は `Offer → CodeSide::Offer`・`Answer → CodeSide::Answer` とコピーする。
-//! 順番: 始める側（`host`）は `room` → こちらが `offer` → `matched` → `peer`（返す側のコード）→ サーバーが 1000 で閉じる。返す側（`guest`）は `room` → `peer`（始める側のコード）→ こちらが `answer` → 1000 で閉じる（`matched` は来ない）。順番違いは失敗にする。誤りで閉じるときは `{"t":"error","code":<名>}` を 1 通送ってから閉じ、error の文と閉じる番号は先に来た方で終える。
-//! 観戦を断る配る側は、観戦用のルームで `room` の後に `offer` の代わりに `refuse` を送り、ルームの期限（4408）まで残る。入ってきた観戦者は `room` の後に 4403 で閉じられる（[`Failure::Refused`]）。
-//! 時刻は呼び手が [`Now`] で渡す（`ms` は単調な時計、`unix_secs` は壁の時計）。サーバーの `expires_at` は UNIX 秒で PC の時計とずれうるので、こちらの期限は「サーバーが 4408 を送ってくるはずの時刻の後ろの予備」として持つ（[`DEADLINE_GRACE_MS`]）。時計のずれで残りが 0 以下か上限より長く見えたら、上限（ルームの期限 10 分・answer の期限 60 秒）で代える。
-//! dll の見張りのスレッドで回す。ゲームのスレッドでは呼ばない（文字列の確保がある）。ほかの `src/core/` と同じく unsafe 禁止・パニックしうる添字と unwrap を使わない。
+//! ルーム名の検証とパスの組み立て・文の読み書き（平らなJSONの小さな読み手）・閉じる番号・入口のHTTPの誤りの本文・クライアントのステートマシンを持つ。
+//! ソケットも時計も持たない。
+//! WebSocketの通信（WinHTTP）と受信のスレッドはdllの仕事。
+//! サーバーの値は`src/server/src/rules.ts`と同じ（`tests/fixtures/room/rules.json`で突き合わせる）。
+//! 順番は`room.ts`。
+//! サーバーのJSONの`"host"` / `"guest"`は読んだ境目で[`Role::Offer`] / [`Role::Answer`]へコピーする。
+//! マッチのホスト（1P）と紛れないようRustの名前にはhost / guestを使わない。
+//! dllは`Offer → CodeSide::Offer`・`Answer → CodeSide::Answer`とコピーする。
+//! 順番: 始める側（`host`）は`room` → こちらが`offer` → `matched` → `peer`（返す側のコード）。
+//! 返す側（`guest`）は`room` → `peer`（始める側のコード）→ こちらが`answer`（`matched`は来ない）。
+//! 対戦のルームでは始める側の`matched`と返す側の`peer`に席のチケット（[`SeatTicket`]。観戦用のルームのhostの席の資格）が載る。
+//! 順番違いは失敗にする。
+//! 誤りで閉じるときは`{"t":"error","code":<名>}`を1通送ってから閉じる。
+//! errorの文と閉じる番号は先に来た方で終える。
+//! 対戦のルームは成立（始める側は`peer`を受けた・返す側は`answer`を送った）の後も接続を保ち、pingだけを送る（[`State::Holding`]）。
+//! サーバーはその間ルーム名を使用中にし、3人目を409 `room_in_use`で断る。
+//! 保っている間にサーバーが閉じても失敗にしない。
+//! 観戦用のルームは成立でサーバーが1000で閉じる。
+//! 観戦を断る配信側は観戦用のルームで`room`の後に`offer`の代わりに`refuse`を送り、ルームの期限（4408）まで残る。
+//! 入ってきた観戦者は`room`の後に4403で閉じられる（[`Failure::Refused`]）。
+//! 時刻は呼び出し側が[`Now`]で渡す（`ms`は単調な時計、`unix_secs`は壁時計）。
+//! サーバーの`expires_at`はUNIX秒でPCの時計とずれうる。
+//! そのためこちらの期限は「サーバーが4408を送ってくるはずの時刻の後ろの予備」として持つ（[`DEADLINE_GRACE_MS`]）。
+//! 時計のずれで残りが0以下か上限より長く見えたら上限（ルームの期限10分・answerの期限60秒）で代える。
+//! dllの監視のスレッドで回す。ゲームのスレッドでは呼ばない（文字列の確保がある）。
+//! ほかの`src/core/`と同じくunsafe禁止。パニックしうる添字とunwrapを使わない。
 
 use std::borrow::Cow;
 
@@ -13,111 +33,149 @@ use sha2::{Digest, Sha256};
 
 // ---------------- サーバーの決まり ----------------
 
-/// URL のパスの先頭（バージョンを含む）。
+/// URLのパスの先頭（バージョンを含む）。
 pub const PATH_PREFIX: &str = "/v0/rooms/";
-/// ルーム名の長さの上限（文字 = コードポイントの数）。サーバーはこれを**揃えた後**（NFKC → 前後の空白を除く → 小文字）の文字で
-/// 数える。こちらは NFKC を持たないので、揃えても文字の数が変わらないと分かる ASCII だけの名にしかこの数を当てない
-/// （[`RoomName::parse`]）。
+/// ルーム名の長さの上限（文字 = コードポイントの数）。
+/// サーバーはこれを**揃えた後**（NFKC → 前後の空白を除く → 小文字）の文字で数える。
+/// こちらはNFKCを持たないので揃えても文字の数が変わらないと分かるASCIIだけの名にしかこの数を当てない（[`RoomName::parse`]）。
 pub const ROOM_NAME_MAX: usize = 32;
-/// ルーム名の大きさの上限（揃える前の UTF-8 のバイト）。揃えずに数えられるので、サーバーと同じ数で検証する。
+/// ルーム名の大きさの上限（揃える前のUTF-8のバイト）。揃えずに数えられるのでサーバーと同じ数で検証する。
 pub const ROOM_NAME_MAX_BYTES: usize = 128;
-/// 名そのものがこれなら断る（パスに載せると URL の読み方で区切りが消え、サーバーに届かず 404 になる）。
+/// 名そのものがこれなら断る（パスに載せるとURLの読み方で区切りが消え、サーバーに届かず404になる）。
 pub const ROOM_NAME_BAD_NAMES: [&str; 2] = [".", ".."];
-/// 接続コードの文字の上限。core の読み手の上限（`code::MAX_CODE_CHARS` = 512）とは別
-/// （サーバーはコードの中身を読まず、文字と長さだけを見る）。
+/// 接続コードの文字の上限。
+/// coreの読み手の上限（`code::MAX_CODE_CHARS` = 512）とは別。
+/// サーバーはコードの中身を読まず文字と長さだけを見る。
 pub const CODE_MAX_CHARS: usize = 1024;
-/// 1 通の文の上限（UTF-8 のバイト）。サーバーの送る文（いちばん長いのは 1024 文字のコードを載せた `peer`）もこれに収まるので、
-/// サーバーから届く文にも同じ上限を当てる（越えたら中を読まない）。
+/// 1通の文の上限（UTF-8のバイト）。
+/// サーバーの送る文（いちばん長いのは1024文字のコードを載せた`peer`）もこれに収まる。
+/// そのためサーバーから届く文にも同じ上限を当てる（越えたら中を読まない）。
 pub const MESSAGE_MAX_BYTES: usize = 2048;
 /// ルームの期限（始める側が接続してから）。
 pub const ROOM_TTL_MS: u64 = 10 * 60 * 1000;
-/// answer の期限（始める側のコードを返す側へ渡してから）。
+/// answerの期限（始める側のコードを返す側へ渡してから）。
 pub const ANSWER_TTL_MS: u64 = 60 * 1000;
-/// 生存チェックの文。サーバーは文字の完全一致でしか自動応答しない（`setWebSocketAutoResponse`）ので、
-/// 空白も鍵の順も変えずにこの 12 文字をそのまま送る。
+/// 対戦のルームの成立の後にサーバーが生存確認（pingの自動応答の時刻）の古さを許す上限。越えた接続と相手をサーバーが閉じる。
+pub const HELD_STALE_MS: u64 = 90 * 1000;
+/// 成立の後の部屋でサーバーが生存確認の古さをチェックするために起きる間隔。
+pub const HELD_SWEEP_MS: u64 = 5 * 60 * 1000;
+/// 生存チェックの文。
+/// サーバーは文字の完全一致でしか自動応答しない（`setWebSocketAutoResponse`）。
+/// そのため空白もキーの順も変えず、この12文字をそのまま送る。
 pub const PING_TEXT: &str = r#"{"t":"ping"}"#;
-/// 自動応答の文（読むときは JSON として読むので、文字の形はこれに限らない）。
+/// 自動応答の文（読むときはJSONとして読むので、文字の形はこれに限らない）。
 pub const PONG_TEXT: &str = r#"{"t":"pong"}"#;
-/// 観戦用のルームの配る側が、観戦を断るときに `offer` の代わりに送る文（`rules.ts` の `parseClientMessage` の `refuse`）。
+/// 観戦用のルームの配信側が観戦を断るときに`offer`の代わりに送る文（`rules.ts`の`parseClientMessage`の`refuse`）。
 pub const REFUSE_TEXT: &str = r#"{"t":"refuse"}"#;
-/// サーバーが 429 の本文に入れる待ちの秒。読み手は本文の `retry_after` を使い、この値で埋めない
-/// （本文に無いなら「サーバーの JSON でない」と見る）。
+/// サーバーが429の本文に入れる待ち時間（秒）。
+/// 読み手は本文の`retry_after`を使い、この値で埋めない（本文に無いなら「サーバーのJSONでない」と見る）。
 pub const RETRY_AFTER_SECS: u32 = 60;
 
-/// 入室の要求の問い `?cid=<16 進小文字>` の名。同じ値の古い接続はサーバーが入り直しとして置き換える（`rules.ts` の `CLIENT_ID_PARAM`）。
+/// 入室の要求のクエリ`?cid=<16 進小文字>`の名。同じ値の古い接続はサーバーが入り直しとして置き換える（`rules.ts`の`CLIENT_ID_PARAM`）。
 pub const CLIENT_ID_PARAM: &str = "cid";
 /// 起動ごとの乱数の長さ（バイト）。
 pub const CLIENT_ID_BYTES: usize = 16;
+/// 観戦用のルームのhostの席を取る接続が付けるクエリ`ticket=<席の札>`の名（`rules.ts`の`TICKET_PARAM`）。
+pub const TICKET_PARAM: &str = "ticket";
+/// 席のチケットの期限（発行から。`rules.ts`の`TICKET_TTL_SECS`）。期限はサーバーが見る。こちらはチケットの中身を読まずに受け渡す。
+pub const TICKET_TTL_SECS: u64 = 24 * 60 * 60;
+/// 観戦用のルームで観戦者が配信側のコードを受けてからanswerを送るまでの期限（`rules.ts`の`WATCH_ANSWER_TTL_MS`）。
+/// 過ぎた観戦者だけをサーバーが閉じ、配信側は残る。
+pub const WATCH_ANSWER_TTL_MS: u64 = 10 * 1000;
 
 // ---------------- こちらが決めた値（サーバーは使わない） ----------------
 
-/// ping を送る間隔。途中の機器が無言の WebSocket を切らないため。
+/// pingを送る間隔。途中の機器が無言のWebSocketを切らないため。
 pub const PING_INTERVAL_MS: u64 = 30_000;
-/// ping を送ってから、`pong` も他の文も来ないまま待つ長さ。ping の 3 周（90 秒）。これを過ぎたら「サーバーが応答しません」
-/// （[`Why::NoPong`]）。片側だけ切れた TCP は送っても誤りにならず受信も止まったままなので、これが無いとルームの期限（10 分）まで
-/// 気づけない。1 周でなく 3 周なのは、ping 1 通の行き違いで手順を落とさないため。
+/// pingを送ってから`pong`も他の文も来ないまま待つ長さ。pingの3周（90秒）。
+/// これを過ぎたら「サーバーが応答しません」（[`Why::NoPong`]）。
+/// 片側だけ切れたTCPは送っても誤りにならず受信も止まったままになる。
+/// そのためこれが無いとルームの期限（10分）まで気づけない。
+/// 1周でなく3周なのは、ping 1通の行き違いで手順を失敗にしないため。
 pub const PONG_TIMEOUT_MS: u64 = 3 * PING_INTERVAL_MS;
-/// 101（Upgrade）の後に `room` が来るのを待つ時間。サーバーは 101 を返す前に `room` を送るので普通はすぐ来る。
+// 成立の後に保つ接続では、サーバーが生存確認の古さで閉じる前に次のpingが届く。
+// こちらがpongを待つ上限もサーバーの上限を越えない。
+const _: () = assert!(PING_INTERVAL_MS < HELD_STALE_MS && PONG_TIMEOUT_MS <= HELD_STALE_MS);
+/// 101（Upgrade）の後に`room`が来るのを待つ時間。サーバーは101を返す前に`room`を送るので普通はすぐ来る。
 /// 来なければ「サーバーが応答しません」の扱い。
 pub const ROOM_GREETING_TIMEOUT_MS: u64 = 10_000;
-/// こちらの期限の予備。サーバーの期限（4408）が先に届くよう、その後ろの時刻にする。
-/// 秒の切り捨てで最大 2 秒ほど前へずれうるので、それより十分長く。
+/// こちらの期限の予備。サーバーの期限（4408）が先に届くようその後ろの時刻にする。
+/// 秒の切り捨てで最大2秒ほど前へずれうるのでそれより十分長く。
 pub const DEADLINE_GRACE_MS: u64 = 5_000;
 
-/// 接続コードに使える文字（ASCII の英数字・`-`・`_`）。
+/// 接続コードに使える文字（ASCIIの英数字・`-`・`_`）。
 fn is_allowed_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
 
-/// ルーム名に使える文字（ASCII の英数字・`-`・`_`・`@`）。パスには `%40` に符号化して載せ、サーバーは戻した `@` をそのまま通す。
+/// プレイヤー名・ルーム名に使える文字（印字できる半角0x20〜0x7Eのうち`` ` `` `;` `/` 以外）。`;` は ini のコメント、`/` はルーム名が
+/// パスの区切りに割れるため。`` ` `` は獣王園の名前の入力に合わせた。パスには英数字と `-` `.` `_` `~` 以外を `%XX` にして載せる。
 fn is_room_name_byte(b: u8) -> bool {
-    is_allowed_byte(b) || b == b'@'
+    matches!(b, 0x20..=0x7E) && !matches!(b, b'`' | b';' | b'/')
 }
 
 // ---------------- ルーム名とパス ----------------
 //
-// こちらは揃えない（NFKC を持たない。サーバーが揃える）。送る前に見るのは、揃えずに決まるガードだけ: 空・大きさ（揃える前の
-// UTF-8 のバイト）・制御文字・`/`・名そのものが `.` `..`・空白だけ・ASCII だけの名の長さ。
-// `RoomName::parse`（dll の本番）はこれに加えて ASCII の英数字と `-` `_` `@` 以外を断る（`NotAscii`）。`parse_server_rules` が断る名は
-// サーバーも必ず断る（逆は無い）。サーバーだけが断るのは、揃えて初めて長さの分かる ASCII 以外の名（33 文字以上の日本語・揃えると伸びる文字）で、
-// サーバーの 400 `bad_room_name`（[`Failure::BadRoomName`]）で知る。dll の `parse` は ASCII だけを通すので、ここは出ない。
+// こちらは揃えない（NFKCを持たない。サーバーが揃える）。
+// 送る前に見るのは揃えずに決まるガードだけ: 空・大きさ（揃える前のUTF-8のバイト）・制御文字・`/`・名そのものが`.` `..`・空白だけ・ASCIIだけの名の長さ。
+// `RoomName::parse`（dllの本番）はこれに加えて、使えない文字（`accepts_char`の外）と、前後の空白を除いた名が`w.` `q.`で始まるものを断る（`NotAscii`・`ReservedPrefix`）。
+// `parse_server_rules`が断る名はサーバーも必ず断る（逆は無い）。
+// サーバーだけが断るのは、揃えて初めて長さの分かるASCII以外の名（33文字以上の日本語・揃えると伸びる文字）。
+// これはサーバーの400 `bad_room_name`（[`Failure::BadRoomName`]）で知る。
+// dllの`parse`はASCIIだけを通すのでここは出ない。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomNameError {
     /// 空。
     Empty,
-    /// 揃える前の UTF-8 が [`ROOM_NAME_MAX_BYTES`] を越える（`bytes` はその数）。
+    /// 揃える前のUTF-8が[`ROOM_NAME_MAX_BYTES`]を越える（`bytes`はその数）。
     TooManyBytes { bytes: usize },
-    /// 使えない文字（制御文字か `/`。`pos` は 0 からの文字の位置）。
+    /// 使えない文字（制御文字か`/`。`pos`は0からの文字の位置）。
     BadChar { pos: usize },
-    /// 名そのものが `.` か `..`（[`ROOM_NAME_BAD_NAMES`]）。
+    /// 名そのものが`.`か`..`（[`ROOM_NAME_BAD_NAMES`]）。
     DotName,
     /// 空白だけ（サーバーが前後の空白を除くと空になる）。
     Blank,
-    /// ASCII だけの名で、前後の空白を除いて [`ROOM_NAME_MAX`] を越える（`len` はその文字の数）。
-    /// ASCII 以外を含む名は NFKC で文字の数が変わるので数えない。
+    /// ASCIIだけの名で、前後の空白を除いて[`ROOM_NAME_MAX`]を越える（`len`はその文字の数）。
+    /// ASCII以外を含む名はNFKCで文字の数が変わるので数えない。
     TooLong { len: usize },
-    /// ASCII の英数字と `-` `_` `@` 以外の文字がある（`pos` は 0 からの文字の位置）。サーバーは通すが、dll の側だけ断る
-    /// （画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。[`RoomName::parse`] だけが返す。
+    /// [`RoomName::accepts_char`]の外の文字がある（`pos`は0からの文字の位置）。
+    /// サーバーは通すがdllの側だけ断る（画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。
+    /// [`RoomName::parse`]だけが返す。
     NotAscii { pos: usize },
+    /// 前後の空白を除いて小文字にした名が`w.`か`q.`で始まる（観戦用のルームとランダムマッチの割り当ての名と重なる）。[`RoomName::parse`]だけが返す。
+    ReservedPrefix,
 }
 
 /// 送る前の検証を通ったルーム名（打った文字のまま。揃えていない）。確保しない。
 ///
-/// `==` は「同じ文字」で、「同じルーム」ではない（`ＡＢＣ` と `abc` は別の値だが、サーバーで同じルームになる）。
+/// `==`は「同じ文字」で「同じルーム」ではない（`ＡＢＣ`と`abc`は別の値だがサーバーで同じルームになる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomName {
     buf: [u8; ROOM_NAME_MAX_BYTES],
     len: usize,
 }
 
-/// サーバーが前後から除く空白（JS の `trim` が除く文字のうち、制御文字でないもの）。制御文字は先に断るので、
-/// Unicode の White_Space（`char::is_whitespace`）と U+FEFF の和で足りる。NFKC の後に除くサーバーと、揃える前に見るこちらは同じ答えになる。
+/// サーバーが前後から除く空白（JSの`trim`が除く文字のうち制御文字でないもの）。
+/// 制御文字は先に断るのでUnicodeのWhite_Space（`char::is_whitespace`）とU+FEFFの和集合で足りる。
+/// NFKCの後に除くサーバーと揃える前に見るこちらは同じ答えになる。
 fn is_trimmed_space(c: char) -> bool {
     c.is_whitespace() || c == '\u{FEFF}'
 }
 
-/// パスに符号化せずに載せる文字（RFC 3986 の unreserved）。ほかは全部 `%XX`（UTF-8 のバイトごと）。
+/// 前後の空白を除いた名が観戦用のルーム（[`SPECTATE_ROOM_PREFIX`]）かランダムマッチの割り当て（`room_queue::RANDOM_ROOM_PREFIX`）の先頭かどうか。
+/// 大文字小文字は見ない（サーバーが小文字にして検索する）。
+fn has_reserved_prefix(trimmed: &str) -> bool {
+    [SPECTATE_ROOM_PREFIX, crate::room_queue::RANDOM_ROOM_PREFIX]
+        .iter()
+        .any(|p| {
+            trimmed
+                .get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p))
+        })
+}
+
+/// パスに符号化せずに載せる文字（RFC 3986のunreserved）。ほかは全部`%XX`（UTF-8のバイトごと）。
 fn is_unreserved(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
 }
@@ -130,34 +188,41 @@ pub(crate) fn hex_lower(n: u8) -> u8 {
     char::from_digit(u32::from(n & 0x0F), 16).map_or(b'0', |c| c as u8)
 }
 
-/// 観戦用のルームの名の先頭（[`RoomName::spectate_of`]）。利用者は `.` を打てない（`parse` が断る）ので、対戦のルームと重ならない。
+/// 観戦用のルームの名の先頭（[`RoomName::spectate_of`]）。利用者がこの先頭の名を打てない（`parse`が断る）ので対戦のルームと重ならない。
 pub const SPECTATE_ROOM_PREFIX: &str = "w.";
-/// 観戦用のルームの名に使う SHA-256 の先頭のバイト数（16 進で 16 文字）。
+/// 観戦用のルームの名に使うSHA-256の先頭のバイト数（16進で16文字）。
 const SPECTATE_HASH_BYTES: usize = 8;
-/// 観戦用のルームの名の長さ（文字）: 先頭 2 ＋ 16 進 16。
+/// 観戦用のルームの名の長さ（文字）: 先頭2 ＋ 16進16。
 pub const SPECTATE_ROOM_NAME_LEN: usize = SPECTATE_ROOM_PREFIX.len() + 2 * SPECTATE_HASH_BYTES;
 
 impl RoomName {
-    /// ルーム名を検証する。サーバーの決まり（[`RoomName::parse_server_rules`]）に加えて、ASCII の英数字と `-` `_` `@` だけを通す
-    /// （画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。空白・記号・日本語・全角は
-    /// [`RoomNameError::NotAscii`]。大文字と小文字は別の文字のまま通す（同じルームにするのはサーバー）。
+    /// ルーム名を検証する。サーバーの決まり（[`RoomName::parse_server_rules`]）に加えて、[`RoomName::accepts_char`]の文字だけを通す
+    /// （画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。日本語・全角・`` ` `` `;` は
+    /// [`RoomNameError::NotAscii`]。前後の空白は除いた名を返す（間の空白は残す）。除いた名が`w.` `q.`で始まれば
+    /// [`RoomNameError::ReservedPrefix`]。大文字と小文字は別の文字のまま通す（同じルームにするのはサーバー）。
     pub fn parse(raw: &str) -> Result<RoomName, RoomNameError> {
-        let name = RoomName::parse_server_rules(raw)?;
+        RoomName::parse_server_rules(raw)?;
         // 長さ・大きさ・制御文字などの断りは上（サーバーと同じガード）が先に返す。ここは文字の種類だけを見る。
         if let Some(pos) = raw.chars().position(|c| !RoomName::accepts_char(c)) {
             return Err(RoomNameError::NotAscii { pos });
         }
-        Ok(name)
+        // ここまで通れば全部ASCIIなので、除く空白は半角の空白だけ。
+        let trimmed = raw.trim_matches(' ');
+        if has_reserved_prefix(trimmed) {
+            return Err(RoomNameError::ReservedPrefix);
+        }
+        RoomName::parse_server_rules(trimmed)
     }
 
-    /// ルーム名に使える文字か。[`RoomName::parse`] の文字のガードと、ゲーム内のルーム名の入力（`room_input`）が同じ式を使う。
+    /// プレイヤー名・ルーム名に使える文字かどうか。[`RoomName::parse`]・ゲーム内の入力（`room_input`・`player_name`）・一覧の名前（`watch_list`）が同じ式を使う。
     pub fn accepts_char(c: char) -> bool {
         c.is_ascii() && is_room_name_byte(c as u8)
     }
 
-    /// サーバーの決まりだけで検証する（揃えない。前後の空白もそのまま送り、サーバーが除く）。ガードの順はサーバーと同じ:
-    /// 大きさ → 制御文字と `/` → `.` `..` → 揃えた後の空と長さ。「サーバーは日本語の名も通す」ことを loopback の検査と
-    /// 見本の突き合わせで見るための入口で、画面の側の検証には使わない。
+    /// サーバーの決まりだけで検証する（揃えない。前後の空白もそのまま送り、サーバーが除く）。
+    /// ガードの順はサーバーと同じ: 大きさ → 制御文字と`/` → `.` `..` → 揃えた後の空と長さ。
+    /// 「サーバーは日本語の名も通す」ことをloopbackの検査と見本の突き合わせで見るための入口。
+    /// 画面の側の検証には使わない。
     pub fn parse_server_rules(raw: &str) -> Result<RoomName, RoomNameError> {
         if raw.is_empty() {
             return Err(RoomNameError::Empty);
@@ -175,7 +240,7 @@ impl RoomName {
         if trimmed.is_empty() {
             return Err(RoomNameError::Blank);
         }
-        // ASCII は NFKC で変わらず、小文字にしても文字の数は同じ。前後の空白を除いた数がサーバーの数と一致する。
+        // ASCIIはNFKCで変わらず、小文字にしても文字の数は同じ。前後の空白を除いた数がサーバーの数と一致する。
         if trimmed.is_ascii() && trimmed.len() > ROOM_NAME_MAX {
             return Err(RoomNameError::TooLong { len: trimmed.len() });
         }
@@ -191,17 +256,18 @@ impl RoomName {
 
     /// 打った文字のまま（揃えていない）。
     pub fn as_str(&self) -> &str {
-        // 作るときに &str の中身を丸ごとコピーしているので from_utf8 は落ちない。落ちたら空を返す。
+        // 作るときに &strの中身を丸ごとコピーしているのでfrom_utf8は失敗しない。失敗したら空を返す。
         self.buf
             .get(..self.len)
             .and_then(|b| std::str::from_utf8(b).ok())
             .unwrap_or("")
     }
 
-    /// このルームの観戦用のルームの名（インターネット越しの観戦）: `w.` ＋ SHA-256(小文字にしたルーム名の ASCII) の先頭 8 B の 16 進（小文字 16 文字）。計 18 文字（サーバーの 32 文字の上限の内）。今のルームの手順（2 人・host と guest）のまま、対戦する 2 人の dll と観戦者の dll がこの名のルームで会う。
-    /// - 利用者は `.` を打てない（[`RoomName::parse`] が `NotAscii` で断る）ので、対戦のルームの名と重ならない。作るのに `parse` は通さない（[`RoomName::parse_server_rules`] は通る）。
-    /// - 呼ぶのは `parse` を通った名。その名の `to_ascii_lowercase` はサーバーの「NFKC → 前後の空白を除く → 小文字」と同じ結果になるので、大文字小文字だけが違う名（サーバーでは同じルーム）は同じ観戦用のルームになる。`parse_server_rules` だけを通った名（日本語・全角など）は揃え方が食い違いうる（dll の本番は `parse` だけを使うので出ない）。
-    /// - 確保しない（バイトごとに小文字にしてハッシュへ流す）。
+    /// このルームの観戦用のルームの名（インターネット越しの観戦）: `w.` ＋ SHA-256(小文字にしたルーム名のASCII)の先頭8 Bの16進（小文字16文字）。計18文字（サーバーの32文字の上限の内）。
+    /// ルームの手順は今のまま（2人・hostとguest）で、対戦する2人のdllと観戦者のdllがこの名のルームで会う。
+    /// - 利用者は`w.`で始まる名を打てない（[`RoomName::parse`]が`ReservedPrefix`で断る）ので対戦のルームの名と重ならない。作るのに`parse`は通さない（[`RoomName::parse_server_rules`]は通る）。
+    /// - 呼ぶのは`parse`を通った名。その名の`to_ascii_lowercase`はサーバーの「NFKC → 前後の空白を除く → 小文字」と同じ結果になるので大文字小文字だけが違う名（サーバーでは同じルーム）は同じ観戦用のルームになる。`parse_server_rules`だけを通った名（日本語・全角など）は揃え方が食い違いうる（dllの本番は`parse`だけを使うので出ない）。
+    /// - 確保しない（バイトごとに小文字にしてハッシュへ渡す）。
     pub fn spectate_of(&self) -> RoomName {
         let mut h = Sha256::new();
         for b in self.as_str().trim_matches(is_trimmed_space).bytes() {
@@ -223,41 +289,163 @@ impl RoomName {
         }
     }
 
-    /// 接続するパス（`/v0/rooms/<ルーム名>`）。ルーム名は UTF-8 をパーセント符号化して載せる（unreserved のほかは全部 `%XX`、
-    /// 16 進は大文字）。WinHTTP は宿とパスを別に渡すのでパスだけを返す。
+    /// 接続するパス（`/v0/rooms/<ルーム名>`）。
+    /// ルーム名はUTF-8をパーセント符号化して載せる（unreservedのほかは全部`%XX`、16進は大文字）。
+    /// WinHTTPはホスト名とパスを別に渡すのでパスだけを返す。
     pub fn path(&self) -> String {
         let name = self.as_str();
         let mut out = String::with_capacity(PATH_PREFIX.len() + name.len() * 3);
         out.push_str(PATH_PREFIX);
-        for b in name.bytes() {
-            if is_unreserved(b) {
-                out.push(char::from(b));
-            } else {
-                out.push('%');
-                out.push(hex_upper(b >> 4));
-                out.push(hex_upper(b & 0x0F));
+        self.push_encoded(&mut out);
+        out
+    }
+
+    /// 名をUTF-8のバイトごとにパーセント符号化して足す。
+    fn push_encoded(&self, out: &mut String) {
+        push_percent_encoded(out, self.as_str());
+    }
+
+    /// [`RoomName::path`]に起動ごとの乱数のクエリ（`?cid=…`）を付けたパス。
+    pub fn path_with_client(&self, id: &[u8; CLIENT_ID_BYTES]) -> String {
+        self.path_with_query(Some(id), None)
+    }
+
+    /// 観戦用のルーム（`w.…`）のhostの席を取りに入るパス。
+    /// `ticket=<席の札>`を付ける（サーバーはこのルームの名について正しく期限内のチケットを持つ接続にだけhostの席を渡す）。
+    /// `id`があれば`cid`を先に付ける。
+    pub fn path_with_ticket(
+        &self,
+        id: Option<&[u8; CLIENT_ID_BYTES]>,
+        ticket: &SeatTicket,
+    ) -> String {
+        self.path_with_query(id, Some(ticket))
+    }
+
+    fn path_with_query(
+        &self,
+        id: Option<&[u8; CLIENT_ID_BYTES]>,
+        ticket: Option<&SeatTicket>,
+    ) -> String {
+        let mut out = self.path();
+        let mut sep = '?';
+        if let Some(id) = id {
+            out.push(sep);
+            sep = '&';
+            out.push_str(CLIENT_ID_PARAM);
+            out.push('=');
+            for b in id {
+                out.push(char::from(hex_lower(b >> 4)));
+                out.push(char::from(hex_lower(b & 0x0F)));
             }
         }
-        out
-    }
-
-    /// [`RoomName::path`] に、起動ごとの乱数の問い（`?cid=…`）を付けたパス。
-    pub fn path_with_client(&self, id: &[u8; CLIENT_ID_BYTES]) -> String {
-        let mut out = self.path();
-        out.push('?');
-        out.push_str(CLIENT_ID_PARAM);
-        out.push('=');
-        for b in id {
-            out.push(char::from(hex_lower(b >> 4)));
-            out.push(char::from(hex_lower(b & 0x0F)));
+        if let Some(ticket) = ticket {
+            out.push(sep);
+            out.push_str(TICKET_PARAM);
+            out.push('=');
+            push_percent_encoded(&mut out, ticket.as_str());
         }
         out
     }
 
-    /// 接続する URL。`base` はスキームと宿（例 `wss://example.workers.dev`）。末尾の `/` は除く
-    /// （`//v0/...` はサーバーで 404 になるため）。`base` の形は見ない。
+    /// 接続するURL。`base`はスキームとホスト（例`wss://example.workers.dev`）。
+    /// 末尾の`/`は除く（`//v0/...`はサーバーで404になるため）。
+    /// `base`の形は見ない。
     pub fn url(&self, base: &str) -> String {
         format!("{}{}", base.trim_end_matches('/'), self.path())
+    }
+}
+
+/// 文字列をUTF-8のバイトごとにパーセント符号化して足す（パスの末尾にも問いの値にも同じ式を使う。`+`も`%2B`にする）。
+fn push_percent_encoded(out: &mut String, s: &str) {
+    for b in s.bytes() {
+        if is_unreserved(b) {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(hex_upper(b >> 4));
+            out.push(hex_upper(b & 0x0F));
+        }
+    }
+}
+
+// ---------------- 席の札 ----------------
+
+/// チケットの発行・期限の10進の桁の上限（`rules.ts`の`TICKET_NUM_MAX_DIGITS`）。
+pub const TICKET_NUM_MAX_DIGITS: usize = 12;
+/// チケットのMAC（HMAC-SHA256の32 B）のbase64url（パディングなし）の文字数（`rules.ts`の`TICKET_MAC_CHARS`）。
+pub const TICKET_MAC_CHARS: usize = 43;
+/// サーバーがチケットの署名に含める用途を示す文字列（`rules.ts`の`TICKET_PURPOSE`）。クライアントはチケットの中身を読まないので使わない（dllの偽サーバーが使う）。
+pub const TICKET_PURPOSE: &str = "higanr-seat-v1";
+/// チケットの文字数の上限: `<発行>.<期限>.<MAC>`。
+pub const TICKET_MAX_CHARS: usize = 2 * TICKET_NUM_MAX_DIGITS + 2 + TICKET_MAC_CHARS;
+
+/// 席のチケット（対戦の成立でサーバーが2人へ渡す、観戦用のルームのhostの席と一覧への投稿の資格）。
+/// 中身は読まずに受け渡す。
+/// 形はサーバーと同じ厳しさで検証し、外れたものはチケットなしと同じに扱う。
+/// ルーム名と同じく本ログ・画面に出さない（`Debug`は中身を書かない）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SeatTicket {
+    buf: [u8; TICKET_MAX_CHARS],
+    len: usize,
+}
+
+impl core::fmt::Debug for SeatTicket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SeatTicket(..)")
+    }
+}
+
+/// チケットの数のフィールド: `0`か先頭が0でない12桁までの10進。
+fn is_ticket_number(s: &str) -> bool {
+    s == "0"
+        || (!s.is_empty()
+            && s.len() <= TICKET_NUM_MAX_DIGITS
+            && !s.starts_with('0')
+            && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// base64urlの1文字の値。
+fn base64url_value(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+impl SeatTicket {
+    /// サーバーの形（`<発行>.<期限>.<MAC>`。MACは32 Bのbase64urlを1通りの書き方で）だけを通す。
+    pub fn parse(s: &str) -> Option<SeatTicket> {
+        let mut parts = s.split('.');
+        let (Some(issued), Some(expires), Some(mac), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        if !is_ticket_number(issued) || !is_ticket_number(expires) {
+            return None;
+        }
+        let values: Option<Vec<u8>> = mac.bytes().map(base64url_value).collect();
+        let values = values?;
+        // 43文字は258 bit。最後の文字の下2 bitは使わない。0でないとサーバーは別の書き方として断る。
+        if values.len() != TICKET_MAC_CHARS || values.last().is_none_or(|v| v & 0b11 != 0) {
+            return None;
+        }
+        let mut buf = [0u8; TICKET_MAX_CHARS];
+        for (d, b) in buf.iter_mut().zip(s.bytes()) {
+            *d = b;
+        }
+        Some(SeatTicket { buf, len: s.len() })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.buf
+            .get(..self.len)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
     }
 }
 
@@ -265,11 +453,11 @@ impl RoomName {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeTextError {
-    /// 空（サーバーは 4422 bad_code で閉じる）。
+    /// 空（サーバーは4422 bad_codeで閉じる）。
     Empty,
-    /// [`CODE_MAX_CHARS`] を越える（サーバーは 4413 too_large で閉じる）。`chars` は JS の `length` と同じ UTF-16 の数。
+    /// [`CODE_MAX_CHARS`]を越える（サーバーは4413 too_largeで閉じる）。`chars`はJSの`length`と同じUTF-16の数。
     TooLong { chars: usize },
-    /// base64url でない文字（前後の空白を含む。4422 bad_code）。`pos` は 0 からの文字の位置。
+    /// base64urlでない文字（前後の空白を含む。4422 bad_code）。`pos`は0からの文字の位置。
     BadChar { pos: usize },
 }
 
@@ -282,9 +470,9 @@ impl CodeTextError {
     }
 }
 
-/// コードの文字と長さを見る（サーバーと同じ順: 長さ → 文字）。前後の空白は除かず断る（dll が整えてから送る）。
+/// コードの文字と長さを見る（サーバーと同じ順: 長さ → 文字）。前後の空白は除かず断る（dllが整えてから送る）。
 pub fn check_code(code: &str) -> Result<(), CodeTextError> {
-    // サーバーは JS の `code.length`（UTF-16 の数）で比べる。ASCII 以外の文字は結局 4422 だが、番号までサーバーに揃える。
+    // サーバーはJSの`code.length`（UTF-16の数）で比べる。ASCII以外の文字は結局4422だが、番号までサーバーに揃える。
     let chars: usize = code.chars().map(char::len_utf16).sum();
     if chars > CODE_MAX_CHARS {
         return Err(CodeTextError::TooLong { chars });
@@ -300,13 +488,13 @@ pub fn check_code(code: &str) -> Result<(), CodeTextError> {
     Ok(())
 }
 
-/// 始める側の文 `{"t":"offer","code":"..."}`。コードは base64url の文字だけなので JSON の逃がしは要らない（検証してから書く）。
+/// 始める側の文`{"t":"offer","code":"..."}`。コードはbase64urlの文字だけなのでJSONのエスケープは要らない（検証してから書く）。
 pub fn write_offer(code: &str) -> Result<String, CodeTextError> {
     check_code(code)?;
     Ok(format!(r#"{{"t":"offer","code":"{code}"}}"#))
 }
 
-/// 返す側の文 `{"t":"answer","code":"..."}`。
+/// 返す側の文`{"t":"answer","code":"..."}`。
 pub fn write_answer(code: &str) -> Result<String, CodeTextError> {
     check_code(code)?;
     Ok(format!(r#"{{"t":"answer","code":"{code}"}}"#))
@@ -314,29 +502,29 @@ pub fn write_answer(code: &str) -> Result<String, CodeTextError> {
 
 // ---------------- 閉じる番号 ----------------
 
-/// WebSocket を閉じる番号。
+/// WebSocketを閉じる番号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseCode {
     /// 手順を終えた（両者）。
     Done,
-    /// JSON でない・知らない t・役割や順番に合わない文。
+    /// JSONでない・知らないt・役割や順番に合わない文。
     BadMessage,
-    /// ルームの期限・answer の期限が切れた。
+    /// ルームの期限・answerの期限が切れた。
     Expired,
     /// 相手が手順の途中で切れた。
     PeerLeft,
-    /// 1 通が大きすぎる・コードが長すぎる。
+    /// 1通が大きすぎる・コードが長すぎる。
     TooLarge,
     /// コードの文字が悪い。
     BadCode,
-    /// 進行中のランダム対戦の一覧に載せられる数（全体・1 IP あたり）を越えた。
+    /// 進行中のランダム対戦の一覧に載せられる数（全体・1 IPあたり）を越えた。
     ListFull,
     /// 観戦用のルームのホストが観戦を許可していない（観戦者だけが閉じられ、ホストは残る）。
     Refused,
 }
 
 impl CloseCode {
-    /// 全部（見本との突き合わせと、番号 ↔ 名の往復の検査のため）。
+    /// 全部（見本との突き合わせと番号 ↔ 名の往復の検査のため）。
     pub const ALL: [CloseCode; 8] = [
         CloseCode::Done,
         CloseCode::BadMessage,
@@ -361,7 +549,7 @@ impl CloseCode {
         }
     }
 
-    /// 名（error の文の `code` と close の reason）。
+    /// 名（errorの文の`code`とcloseのreason）。
     pub fn name(self) -> &'static str {
         match self {
             CloseCode::Done => "done",
@@ -384,19 +572,19 @@ impl CloseCode {
     }
 }
 
-// ---------------- 平らな JSON の小さな読み手 ----------------
+// ---------------- 平らなJSONの小さな読み手 ----------------
 
-/// 値。読み手が中身まで要るのは文字列と整数だけ。ほか（小数・真偽・null・入れ子）は知らない鍵の値として読み飛ばす。
+/// 値。読み手が中身まで要るのは文字列と整数だけ。ほか（小数・真偽・null・入れ子）は知らないキーの値として読み飛ばす。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JsonValue<'a> {
     Str(Cow<'a, str>),
-    /// i64 に収まる整数（小数点・指数の無いもの）。
+    /// i64に収まる整数（小数点・指数の無いもの）。
     Int(i64),
     /// 上以外の値（形は検証したが中身は捨てた）。
     Other,
 }
 
-/// 知らない鍵の値を読み飛ばすときの入れ子の深さの上限（細工した深い入れ子で手間をかけさせないため）。
+/// 知らないキーの値を読み飛ばすときの入れ子の深さの上限（細工した深い入れ子で手間をかけさせないため）。
 const SKIP_DEPTH_MAX: usize = 16;
 
 struct Reader<'a> {
@@ -458,11 +646,11 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    /// 文字列（`"` から）。逃がしの無いものは借りたまま返す。
+    /// 文字列（`"`から）。エスケープの無いものは借りたまま返す。
     fn string(&mut self) -> Result<Cow<'a, str>, JsonAt> {
         self.eat(b'"')?;
         let start = self.i;
-        // 速い経路: `"` か `\` まで。止まるのは ASCII の文字なので、切る位置は必ず文字の境目。
+        // 速い経路: `"`か`\`まで。止まるのはASCIIの文字なので切る位置は必ず文字の境目。
         loop {
             match self.peek() {
                 None => return self.err(),
@@ -500,7 +688,7 @@ impl<'a> Reader<'a> {
                         Some(b'u') => {
                             let hi = self.hex4()?;
                             let cp = if (0xD800..0xDC00).contains(&hi) {
-                                // 上の代理。続けて下の代理が要る（片方だけの代理は Rust の文字列に入らない）。
+                                // 上位サロゲート。続けて下位サロゲートが要る（片方だけのサロゲートはRustの文字列に入らない）。
                                 self.eat(b'\\')?;
                                 self.eat(b'u')?;
                                 let lo = self.hex4()?;
@@ -524,7 +712,7 @@ impl<'a> Reader<'a> {
                 }
                 Some(c) if c < 0x20 => return self.err(),
                 Some(_) => {
-                    // 1 文字を丸ごとコピーする（多バイトの文字の途中で切らない）。
+                    // 1文字を丸ごとコピーする（多バイトの文字の途中で切らない）。
                     match self.s.get(self.i..).and_then(|r| r.chars().next()) {
                         Some(ch) => {
                             out.push(ch);
@@ -545,7 +733,7 @@ impl<'a> Reader<'a> {
         self.i - start
     }
 
-    /// 数（RFC 8259 §6 の形）。小数点・指数が無く i64 に収まれば `Int`、ほかは `Other`。
+    /// 数（RFC 8259 §6の形）。小数点・指数が無くi64に収まれば`Int`、ほかは`Other`。
     fn number(&mut self) -> Result<JsonValue<'a>, JsonAt> {
         let start = self.i;
         if self.peek() == Some(b'-') {
@@ -594,7 +782,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// どんな値でも形だけ検証して読み飛ばす（知らない鍵の値）。
+    /// どんな値でも形だけ検証して読み飛ばす（知らないキーの値）。
     fn skip_value(&mut self, depth: usize) -> Result<(), JsonAt> {
         if depth > SKIP_DEPTH_MAX {
             return self.err();
@@ -656,8 +844,10 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// 平らな JSON の物 1 つを、鍵と値の列に読む。同じ鍵が 2 回あれば誤り（JSON.parse は後を採るが、
-/// サーバーは同じ鍵を出さないので、2 通りの読み方がある文は受けない）。
+/// 平らなJSONのオブジェクト1つをキーと値の列に読む。
+/// 同じキーが2回あれば誤り。
+/// JSON.parseは後を採るが、サーバーは同じキーを出さない。
+/// そのため2通りの読み方がある文は受けない。
 pub(crate) fn parse_flat(text: &str) -> Result<Vec<(Cow<'_, str>, JsonValue<'_>)>, JsonAt> {
     let mut r = Reader::new(text);
     let out = flat_object(&mut r, None)?;
@@ -670,8 +860,10 @@ pub(crate) fn parse_flat(text: &str) -> Result<Vec<(Cow<'_, str>, JsonValue<'_>)
 
 pub(crate) type Pairs<'a> = Vec<(Cow<'a, str>, JsonValue<'a>)>;
 
-/// [`parse_flat`] の、平らな物の中に「平らな物の配列」が 1 つある形（`{"t":"list","items":[{…},{…}]}`）。`list_key` の値が配列なら、
-/// その要素の物を `items` へ読む（配列の中の物は平らなものだけ）。配列が `max_items` を越えれば誤り。戻りは配列を除いた本体と要素の列。
+/// [`parse_flat`]の平らなオブジェクトの中に「平らなオブジェクトの配列」が1つある形（`{"t":"list","items":[{…},{…}]}`）。
+/// `list_key`の値が配列なら、その要素のオブジェクトを`items`へ読む（配列の中のオブジェクトは平らなものだけ）。
+/// 配列が`max_items`を越えれば誤り。
+/// 戻りは配列を除いた本体と要素の列。
 pub(crate) fn parse_flat_with_items<'a>(
     text: &'a str,
     list_key: &str,
@@ -687,7 +879,7 @@ pub(crate) fn parse_flat_with_items<'a>(
     Ok((head, items))
 }
 
-/// 平らな物 1 つを読む（後ろの空白と終わりは見ない）。`list` があれば、その鍵の配列の要素を読む。
+/// 平らなオブジェクト1つを読む（後ろの空白と終わりは見ない）。`list`があればそのキーの配列の要素を読む。
 fn flat_object<'a>(
     r: &mut Reader<'a>,
     mut list: Option<(&str, usize, &mut Vec<Pairs<'a>>)>,
@@ -738,7 +930,7 @@ fn flat_object<'a>(
     }
 }
 
-/// `[` から `]` まで: 平らな物の配列。
+/// `[`から`]`まで: 平らなオブジェクトの配列。
 fn read_items<'a>(
     r: &mut Reader<'a>,
     max: usize,
@@ -771,17 +963,17 @@ fn read_items<'a>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgError {
-    /// [`MESSAGE_MAX_BYTES`] を越える（中を読まない）。
+    /// [`MESSAGE_MAX_BYTES`]を越える（中を読まない）。
     TooLarge { bytes: usize },
-    /// JSON の物でない（`at` は読めなくなったバイトの位置。同じ鍵が 2 回もここ）。
+    /// JSONのオブジェクトでない（`at`は読めなくなったバイトの位置。同じキーが2回もここ）。
     NotJson { at: usize },
-    /// 要る鍵が無い。
+    /// 要るキーが無い。
     Missing(&'static str),
-    /// 鍵の値の型が違う（文字列のところに数など）。
+    /// キーの値の型が違う（文字列のところに数など）。
     WrongType(&'static str),
     /// 型は合うが値が決まりの外（知らない役割・負の時刻・文字の悪いコードなど）。
     BadValue(&'static str),
-    /// 知らない `t`（ping も含む。サーバーは ping を送らない）。
+    /// 知らない`t`（pingも含む。サーバーはpingを送らない）。
     UnknownType,
 }
 
@@ -794,12 +986,12 @@ pub enum MsgKind {
     Error,
 }
 
-/// 役割（サーバーの `"host"` / `"guest"` を境目でコピーしたもの）。
+/// 役割（サーバーの`"host"` / `"guest"`を境目でコピーしたもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// 始める側（サーバーの `"host"`）。自分のコードを先に出し、相手の返す側のコードを待つ。
+    /// 始める側（サーバーの`"host"`）。自分のコードを先に出し、相手の返す側のコードを待つ。
     Offer,
-    /// 返す側（サーバーの `"guest"`）。相手の始める側のコードを受けてから、自分のコードを返す。
+    /// 返す側（サーバーの`"guest"`）。相手の始める側のコードを受けてから自分のコードを返す。
     Answer,
 }
 
@@ -813,18 +1005,24 @@ impl Role {
     }
 }
 
-/// サーバーから届く文（と自動応答の pong）。
+/// サーバーから届く文（と自動応答のpong）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMsg {
-    /// 接続した直後に 1 回。`expires_at` はルームの期限（UNIX 秒）。
+    /// 接続した直後に1回。`expires_at`はルームの期限（UNIX秒）。
     Room { role: Role, expires_at: u64 },
-    /// 相手のコード（返す側には始める側のコード、始める側には返す側のコード）。
-    Peer { code: String },
-    /// 始める側にだけ。`expires_at` は answer の期限（UNIX 秒）。
-    Matched { expires_at: u64 },
-    /// ping への自動応答。
+    /// 相手のコード（返す側には始める側のコード、始める側には返す側のコード）。`ticket`は対戦のルームの返す側へだけ届く席のチケット。
+    Peer {
+        code: String,
+        ticket: Option<SeatTicket>,
+    },
+    /// 始める側にだけ。`expires_at`はanswerの期限（UNIX秒）。`ticket`は対戦のルームの始める側へだけ届く席のチケット。
+    Matched {
+        expires_at: u64,
+        ticket: Option<SeatTicket>,
+    },
+    /// pingへの自動応答。
     Pong,
-    /// 閉じる直前の 1 通。知らない名は `None`（閉じる番号の側で読める）。
+    /// 閉じる直前の1通。知らない名は`None`（閉じる番号の側で読める）。
     Error { code: Option<CloseCode> },
 }
 
@@ -866,9 +1064,17 @@ impl<'a> Fields<'a, '_> {
     pub(crate) fn unix_secs(&self, key: &'static str) -> Result<u64, MsgError> {
         u64::try_from(self.int(key)?).map_err(|_| MsgError::BadValue(key))
     }
+
+    /// 席のチケットのフィールド。無い・文字列でない・形が外れたものはどれもチケットなし（対戦の手順は止めない）。
+    fn ticket(&self) -> Option<SeatTicket> {
+        match self.get("ticket") {
+            Some(JsonValue::Str(s)) => SeatTicket::parse(s),
+            _ => None,
+        }
+    }
 }
 
-/// サーバーから届いた 1 通を読む。知らない鍵は読み飛ばし、知らない `t` は誤り。順番と役割は見ない（[`RoomClient`] が見る）。
+/// サーバーから届いた1通を読む。知らないキーは読み飛ばし、知らない`t`は誤り。順番と役割は見ない（[`RoomClient`]が見る）。
 pub fn parse_server_message(text: &str) -> Result<ServerMsg, MsgError> {
     if text.len() > MESSAGE_MAX_BYTES {
         return Err(MsgError::TooLarge { bytes: text.len() });
@@ -885,14 +1091,16 @@ pub fn parse_server_message(text: &str) -> Result<ServerMsg, MsgError> {
         }
         "peer" => {
             let code = f.str("code")?;
-            // サーバーは文字を検証したコードしか渡さない。崩れていれば、サーバーか途中が壊れている。
+            // サーバーは文字を検証したコードしか渡さない。崩れていればサーバーか途中が壊れている。
             check_code(code).map_err(|_| MsgError::BadValue("code"))?;
             Ok(ServerMsg::Peer {
                 code: code.to_owned(),
+                ticket: f.ticket(),
             })
         }
         "matched" => Ok(ServerMsg::Matched {
             expires_at: f.unix_secs("expires_at")?,
+            ticket: f.ticket(),
         }),
         "pong" => Ok(ServerMsg::Pong),
         "error" => Ok(ServerMsg::Error {
@@ -902,23 +1110,27 @@ pub fn parse_server_message(text: &str) -> Result<ServerMsg, MsgError> {
     }
 }
 
-// ---------------- 入口の HTTP の誤り ----------------
+// ---------------- 入口のHTTPの誤り ----------------
 
-/// 入口が断るときの本文の `error`。
+/// 入口が断るときの本文の`error`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpErrorName {
-    /// 404。パスが `/v0/rooms/<名>` でない（バージョン違いを含む）。
+    /// 404。パスが`/v0/rooms/<名>`でない（バージョン違いを含む）。
     NotFound,
-    /// 405。GET でない。
+    /// 405。GETでない。
     MethodNotAllowed,
     /// 400。ルーム名の文字・長さが決まりの外。
     BadRoomName,
-    /// 426。WebSocket の Upgrade でない。
+    /// 426。WebSocketのUpgradeでない。
     UpgradeRequired,
-    /// 429。回数の歯止め（`retry_after` を伴う）。
+    /// 429。回数制限（`retry_after`を伴う）。
     RateLimited,
-    /// 409。ルームに既に 2 人。
+    /// 409。観戦用のルームに既に2人いるか、チケットの無い・期限の切れた接続が空の観戦用のルームに来た（古いサーバーは対戦のルームの3人目にも返す）。
     RoomFull,
+    /// 409。対戦のルームに2人いる（成立の前も後も。成立の後も2人が残ってルーム名を使用中にする）。
+    RoomInUse,
+    /// 400。観戦用のルームのhostの席を取る接続のチケットの形・署名が合わない（別のルームの名のチケットも）。
+    BadTicket,
 }
 
 impl HttpErrorName {
@@ -930,20 +1142,22 @@ impl HttpErrorName {
             "upgrade_required" => HttpErrorName::UpgradeRequired,
             "rate_limited" => HttpErrorName::RateLimited,
             "room_full" => HttpErrorName::RoomFull,
+            "room_in_use" => HttpErrorName::RoomInUse,
+            "bad_ticket" => HttpErrorName::BadTicket,
             _ => return None,
         })
     }
 }
 
-/// 入口の誤りの本文 `{"error":..., "retry_after":...}`。
+/// 入口の誤りの本文`{"error":..., "retry_after":...}`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpErrorBody {
     pub error: HttpErrorName,
-    /// 429 だけに付く待ちの秒。
+    /// 429だけに付く待ち時間（秒）。
     pub retry_after_secs: Option<u32>,
 }
 
-/// 入口の誤りの本文を読む。知らない `error` の名は `BadValue`（Cloudflare 自身の誤りの頁などと同じ扱い）。
+/// 入口の誤りの本文を読む。知らない`error`の名は`BadValue`（Cloudflare自身の誤りの頁などと同じ扱い）。
 pub fn read_http_error(body: &str) -> Result<HttpErrorBody, MsgError> {
     if body.len() > MESSAGE_MAX_BYTES {
         return Err(MsgError::TooLarge { bytes: body.len() });
@@ -965,30 +1179,30 @@ pub fn read_http_error(body: &str) -> Result<HttpErrorBody, MsgError> {
 
 // ---------------- 上に知らせる失敗 ----------------
 
-/// 「サーバーが応答しません」の中の、何が起きたか（記録と調べもの用。画面の文言は [`FailureKind`] で分ける）。
+/// 「サーバーが応答しません」の中で何が起きたか（記録と調査用。画面の文言は[`FailureKind`]で分ける）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
-    /// 接続する要求に応答が無い（名前が引けない・時間切れ・接続できない）。dll の運びが知らせる。
+    /// 接続する要求に応答が無い（名前解決できない・時間切れ・接続できない）。dllの通信の処理が知らせる。
     NoAnswer,
-    /// 101 以外の HTTP の番号（404 バージョン違い・405・426・5xx・その他）。
+    /// 101以外のHTTPの番号（404バージョン違い・405・426・5xx・その他）。
     HttpStatus(u16),
-    /// 400 / 409 / 429 なのに本文がサーバーの JSON でない（Cloudflare 自身の誤りの頁など）。
+    /// 400 / 409 / 429なのに本文がサーバーのJSONでない（Cloudflare自身の誤りの頁など）。
     NotOurBody(u16),
-    /// 101 の後に `room` が来ない（[`ROOM_GREETING_TIMEOUT_MS`]）。
+    /// 101の後に`room`が来ない（[`ROOM_GREETING_TIMEOUT_MS`]）。
     NoRoom,
     /// サーバーの文が読めない。
     BadMessage(MsgError),
     /// 役割や順番に合わない文。
     OutOfOrder(MsgKind),
-    /// サーバーが閉じた番号（早すぎる 1000・4400 / 4413 / 4422・知らない番号）。4400 系はこちらの送った文が悪かった印。
+    /// サーバーが閉じた番号（早すぎる1000・4400 / 4413 / 4422・知らない番号）。4400系はこちらの送った文が悪かったことを示す。
     Closed(u16),
-    /// 期限・相手以外の error の文（`None` は知らない名）。
+    /// 期限・相手以外のerrorの文（`None`は知らない名）。
     ErrorMessage(Option<CloseCode>),
-    /// answer を送った後、1000 で閉じられないまま answer の期限を過ぎた。
+    /// answerを送った後に1000で閉じられないままanswerの期限を過ぎた。
     NoClose,
     /// 閉じる番号なしに切れた（受信の誤り）。
     Lost,
-    /// ping を送った後 [`PONG_TIMEOUT_MS`] の間、`pong` も他の文も来ない（片側だけ切れた TCP）。
+    /// pingを送った後[`PONG_TIMEOUT_MS`]の間`pong`も他の文も来ない（片側だけ切れたTCP）。
     NoPong,
 }
 
@@ -996,22 +1210,26 @@ pub enum Why {
 pub enum Failure {
     /// 利用者が直せない。「サーバーが応答しません。接続コードで接続してください」の扱い。
     Unresponsive(Why),
-    /// 429。`retry_after_secs` 秒後に接続し直せる（コピペへは誘導しない）。
+    /// 429。`retry_after_secs`秒後に接続し直せる（コピペへは誘導しない）。
     RateLimited { retry_after_secs: u32 },
-    /// 409。ルームに既に 2 人。ルーム名を変える。
+    /// 409 `room_full`。観戦用のルームの席が無い（古いサーバーは対戦のルームの3人目にも返す）。ルーム名を変える。
     RoomFull,
-    /// 400。ルーム名が決まりの外（こちらでも検証するので、普通は来ない）。ルーム名を変える。
+    /// 409 `room_in_use`。対戦のルームを2人が使っている。ルーム名を変える。
+    RoomInUse,
+    /// 400。ルーム名が決まりの外（こちらでも検証するので普通は来ない）。ルーム名を変える。
     BadRoomName,
-    /// ルームの期限・answer の期限が切れた（4408、またはこちらの予備の期限）。始める側で相手がまだ来ていないときだけ
-    /// dll が自動で入り直す（`room_rejoin::should_rejoin`）。
+    /// ルームの期限・answerの期限が切れた（4408またはこちらの予備の期限）。
+    /// dllが自動で入り直すのは始める側で相手がまだ来ていないときだけ（`room_rejoin::should_rejoin`）。
     Expired,
     /// 相手が手順の途中で抜けた（4410）。
     PeerLeft,
-    /// 観戦用のルームの配る側が観戦を断っている（4403。観戦者だけに来る）。入り直しても変わらない。
+    /// 観戦用のルームの配信側が観戦を断っている（4403。観戦者だけに来る）。入り直しても変わらない。
     Refused,
+    /// 400 `bad_ticket`。観戦用のルームのhostの席を取る接続のチケットをサーバーが受けない（チケットを付けた接続だけに来る）。入り直しても変わらない。
+    BadTicket,
 }
 
-/// 画面の文言の種類（文そのものは dll の表が持つ）。
+/// 画面の文言の種類（文そのものはdllの表が持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     Unresponsive,
@@ -1025,9 +1243,12 @@ pub enum FailureKind {
 impl Failure {
     pub fn kind(self) -> FailureKind {
         match self {
-            Failure::Unresponsive(_) => FailureKind::Unresponsive,
+            // チケットは配信側だけが付けるので画面へ出す経路には来ない。
+            Failure::Unresponsive(_) | Failure::BadTicket => FailureKind::Unresponsive,
             Failure::RateLimited { .. } => FailureKind::WaitThenRetry,
-            Failure::RoomFull | Failure::BadRoomName => FailureKind::ChangeRoomName,
+            Failure::RoomFull | Failure::RoomInUse | Failure::BadRoomName => {
+                FailureKind::ChangeRoomName
+            }
             Failure::Expired => FailureKind::Expired,
             Failure::PeerLeft => FailureKind::PeerLeft,
             Failure::Refused => FailureKind::Refused,
@@ -1035,14 +1256,17 @@ impl Failure {
     }
 }
 
-/// 101 でない入口の応答を、dll へ知らせる失敗にコピーする。本文が番号に合うサーバーの JSON のときだけ 400 / 409 / 429 を
-/// ルーム名・待ちの扱いにし、ほかは全部「サーバーが応答しません」（無料枠を越えたときの Cloudflare の頁を含む）。
+/// 101でない入口の応答をdllへ知らせる失敗にコピーする。
+/// 本文が番号に合うサーバーのJSONのときだけ400 / 409 / 429をルーム名・待ちの扱いにする。
+/// ほかは全部「サーバーが応答しません」（無料枠を越えたときのCloudflareの頁を含む）。
 pub fn classify_http(status: u16, body: &str) -> Failure {
     let parsed = read_http_error(body).ok();
     let name = parsed.map(|b| b.error);
     match status {
         400 if name == Some(HttpErrorName::BadRoomName) => Failure::BadRoomName,
+        400 if name == Some(HttpErrorName::BadTicket) => Failure::BadTicket,
         409 if name == Some(HttpErrorName::RoomFull) => Failure::RoomFull,
+        409 if name == Some(HttpErrorName::RoomInUse) => Failure::RoomInUse,
         429 => match parsed {
             Some(HttpErrorBody {
                 error: HttpErrorName::RateLimited,
@@ -1055,59 +1279,65 @@ pub fn classify_http(status: u16, body: &str) -> Failure {
     }
 }
 
-// ---------------- クライアントの状態機械 ----------------
+// ---------------- クライアントのステートマシン ----------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Now {
-    /// 単調な時計（ms）。期限と ping の時刻はこれで持つ。
+    /// 単調な時計（ms）。期限とpingの時刻はこれで持つ。
     pub ms: u64,
-    /// 壁の時計（UNIX 秒）。サーバーの `expires_at` から残りを出すときだけ使う。
+    /// 壁時計（UNIX秒）。サーバーの`expires_at`から残りを出すときだけ使う。
     pub unix_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// ルームに入った。`role` に合うコードを作って [`RoomClient::submit_code`] へ（返す側は [`Event::PeerCode`] の後）。
-    /// `expires_at` はルームの期限（UNIX 秒。表示の目安）。
+    /// ルームに入った。`role`に合うコードを作って[`RoomClient::submit_code`]へ（返す側は[`Event::PeerCode`]の後）。
+    /// `expires_at`はルームの期限（UNIX秒。表示の目安）。
     Joined { role: Role, expires_at: u64 },
-    /// 始める側だけ: 自分のコードが相手へ渡った。`expires_at` は answer の期限（UNIX 秒）。
+    /// 始める側だけ: 自分のコードが相手へ渡った。`expires_at`はanswerの期限（UNIX秒）。
     Matched { expires_at: u64 },
-    /// 相手のコード。返す側はこれから自分のコードを作って返す。始める側はこの直後に [`Event::Done`]。
+    /// 相手のコード。返す側はこれから自分のコードを作って返す。始める側はこの直後に[`Event::Held`]（観戦用のルームは[`Event::Done`]）。
     PeerCode(String),
-    /// 手順を終えた。dll は WebSocket を閉じてよい（サーバーも閉じる）。
+    /// 対戦のルームで成立した（始める側は相手のコードを受けた・返す側は自分のコードを送った）。以後は接続を保ってpingだけを送る。
+    /// dllは対戦を終えるまで解放しない（解放するとサーバーがルーム名の使用中を解除する）。
+    Held,
+    /// 接続が終わった。観戦用のルームは手順を終えた（サーバーが閉じる）。
+    /// 対戦のルームは保っていた接続をサーバーが閉じたか応答が途絶えた（失敗にしない。対戦には関わらない）。
     Done,
-    /// 手順が終わらなかった。dll は WebSocket を閉じる。
+    /// 手順が終わらなかった。dllはWebSocketを閉じる。
     Failed(Failure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// サーバーへ、この文字をそのままテキストの文で送る。
+    /// サーバーへこの文字をそのままテキストの文で送る。
     Send(String),
     Notify(Event),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// 101 を待っている（運びは dll）。
+    /// 101を待っている（通信はdll）。
     Connecting,
-    /// 101 の後、`room` を待っている。
+    /// 101の後、`room`を待っている。
     AwaitRoom,
-    /// 自分のコードを待っている（始める側は `room` の後、返す側は `peer` の後）。
+    /// 自分のコードを待っている（始める側は`room`の後、返す側は`peer`の後）。
     NeedOwnCode,
-    /// 始める側: `offer` を送った後、`matched` を待っている。
+    /// 始める側: `offer`を送った後、`matched`を待っている。
     AwaitMatched,
-    /// 相手のコード（`peer`）を待っている（始める側は `matched` の後、返す側は `room` の後）。
+    /// 相手のコード（`peer`）を待っている（始める側は`matched`の後、返す側は`room`の後）。
     AwaitPeerCode,
-    /// 返す側: `answer` を送った後、サーバーの 1000 を待っている。
+    /// 返す側: `answer`を送った後にサーバーの1000を待っている。対戦のルームでは次の`poll`で[`State::Holding`]へ移る。
     AwaitClose,
-    /// 始める側: `refuse` を送った後、ルームの期限（4408）までルームに残っている。
+    /// 対戦のルームの成立の後に接続を保ってpingだけを送っている（ルーム名を使用中にする）。
+    Holding,
+    /// 始める側: `refuse`を送った後にルームの期限（4408）までルームに残っている。
     Refusing,
     Done,
     Failed(Failure),
 }
 
-/// [`RoomClient::submit_code`] が断った理由。断ったときは状態を変えない。
+/// [`RoomClient::submit_code`]が断った理由。断ったときは状態を変えない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitError {
     /// いまはコードを受ける番でない（そのときの状態）。
@@ -1116,23 +1346,27 @@ pub enum SubmitError {
     Code(CodeTextError),
 }
 
-/// ルームサーバーのクライアントの手順（モジュールの doc の「順番」）。I/O をせず、送る文と出来事の列を返す。
+/// ルームサーバーのクライアントの手順（モジュールのdocの「順番」）。I/Oをせず、送る文とイベントの列を返す。
 ///
-/// 使い方: 接続する前に `new` → 101 なら `on_upgraded`、101 でなければ `on_http_refused`、接続できなければ `on_transport_failed`。
-/// 以後、受けたテキストの文を `on_text`、閉じる番号を `on_close`、受信の誤りを `on_transport_failed` へ。
-/// [`RoomClient::next_wake`] の時刻か、それより前に `poll` を呼ぶ（ping と期限）。
+/// 使い方: 接続する前に`new` → 101なら`on_upgraded`、101でなければ`on_http_refused`、接続できなければ`on_transport_failed`。
+/// 以後は受けたテキストの文を`on_text`、閉じる番号を`on_close`、受信の誤りを`on_transport_failed`へ渡す。
+/// [`RoomClient::next_wake`]の時刻か、それより前に`poll`を呼ぶ（pingと期限）。
 #[derive(Debug, Clone)]
 pub struct RoomClient {
     state: State,
     role: Option<Role>,
-    /// いまの状態の期限（こちらの予備。過ぎたら `poll` が失敗にする）。
+    /// いまの状態の期限（こちらの予備。過ぎたら`poll`が失敗にする）。
     deadline_ms: Option<u64>,
-    /// ルームの期限（返す側が answer の期限と比べるため）。
+    /// ルームの期限（返す側がanswerの期限と比べるため）。
     room_deadline_ms: u64,
     next_ping_ms: Option<u64>,
-    /// 答えの来ていない最初の ping を送った時刻。文が 1 通でも届けば None に戻す。続けて送った ping では動かさない
-    /// （最初の ping から [`PONG_TIMEOUT_MS`] で切る）。
+    /// 答えの来ていない最初のpingを送った時刻。文が1通でも届けばNoneに戻す。
+    /// 続けて送ったpingでは動かさない（最初のpingから[`PONG_TIMEOUT_MS`]で切る）。
     unanswered_ping_ms: Option<u64>,
+    /// この入室で受けた席のチケット（始める側は`matched`、返す側は`peer`で届く）。手順を終えた後も残す。
+    ticket: Option<SeatTicket>,
+    /// 対戦のルーム: 成立の後も接続を保つ（[`State::Holding`]）。観戦用のルームは偽。
+    hold: bool,
 }
 
 impl Default for RoomClient {
@@ -1141,8 +1375,8 @@ impl Default for RoomClient {
     }
 }
 
-/// サーバーの期限（UNIX 秒）を、こちらの単調な時計の予備の期限へ。時計のずれで残りが 0 以下か `bound_ms` より長く
-/// 見えたら `bound_ms` で代える（モジュールの doc の「時刻」）。
+/// サーバーの期限（UNIX秒）を、こちらの単調な時計の予備の期限に変換する。
+/// 時計のずれで残りが0以下か`bound_ms`より長く見えたら`bound_ms`で代える（モジュールのdocの「時刻」）。
 pub(crate) fn backstop(now: Now, expires_at: u64, bound_ms: u64) -> u64 {
     let left_ms = expires_at
         .checked_sub(now.unix_secs)
@@ -1157,6 +1391,7 @@ pub(crate) fn backstop(now: Now, expires_at: u64, bound_ms: u64) -> u64 {
 }
 
 impl RoomClient {
+    /// 成立でサーバーが閉じる手順（観戦用のルーム）。
     pub fn new() -> RoomClient {
         RoomClient {
             state: State::Connecting,
@@ -1165,6 +1400,16 @@ impl RoomClient {
             room_deadline_ms: u64::MAX,
             next_ping_ms: None,
             unanswered_ping_ms: None,
+            ticket: None,
+            hold: false,
+        }
+    }
+
+    /// `room`に入る手順。対戦のルーム（観戦用の`w.`の名でない）なら成立の後も接続を保つ。
+    pub fn for_room(room: &RoomName) -> RoomClient {
+        RoomClient {
+            hold: !room.as_str().starts_with(SPECTATE_ROOM_PREFIX),
+            ..RoomClient::new()
         }
     }
 
@@ -1174,6 +1419,11 @@ impl RoomClient {
 
     pub fn role(&self) -> Option<Role> {
         self.role
+    }
+
+    /// この入室で受けた席のチケット。古いサーバー・鍵の無いサーバーは載せないので無いことがある。
+    pub fn ticket(&self) -> Option<SeatTicket> {
+        self.ticket
     }
 
     pub fn is_finished(&self) -> bool {
@@ -1189,13 +1439,13 @@ impl RoomClient {
         self.deadline_ms
     }
 
-    /// 答えの来ていない ping から数えた「応答しません」の時刻（ms）。答えを待っていなければ None。
+    /// 答えの来ていないpingから数えた「応答しません」の時刻（ms）。答えを待っていなければNone。
     pub fn silence_deadline_at(&self) -> Option<u64> {
         self.unanswered_ping_ms
             .map(|p| p.saturating_add(PONG_TIMEOUT_MS))
     }
 
-    /// 次に `poll` を呼ぶべき時刻（ms）。何も待っていなければ None。
+    /// 次に`poll`を呼ぶべき時刻（ms）。何も待っていなければNone。
     pub fn next_wake(&self) -> Option<u64> {
         [
             self.next_ping_ms,
@@ -1225,7 +1475,14 @@ impl RoomClient {
         Action::Notify(Event::Done)
     }
 
-    /// 101 を受けた。`room` を待ち始め、ping の時計を回す。
+    /// 成立の後: 期限を外し、pingの時計だけを残す。
+    fn hold_on(&mut self) -> Action {
+        self.state = State::Holding;
+        self.deadline_ms = None;
+        Action::Notify(Event::Held)
+    }
+
+    /// 101を受けた。`room`を待ち始め、pingの時計を回す。
     pub fn on_upgraded(&mut self, now: Now) -> Vec<Action> {
         if self.state != State::Connecting {
             return Vec::new();
@@ -1243,10 +1500,11 @@ impl RoomClient {
         self.fail(classify_http(status, body))
     }
 
-    /// 接続できない（名前が引けない・時間切れ）・接続した後に閉じる番号なしに切れた。
+    /// 接続できない（名前解決できない・時間切れ）・接続した後に閉じる番号なしに切れた。
     pub fn on_transport_failed(&mut self) -> Vec<Action> {
         match self.state {
             State::Done | State::Failed(_) => Vec::new(),
+            State::Holding => vec![self.finish()],
             State::Connecting => self.fail(Failure::Unresponsive(Why::NoAnswer)),
             _ => self.fail(Failure::Unresponsive(Why::Lost)),
         }
@@ -1255,6 +1513,9 @@ impl RoomClient {
     pub fn on_close(&mut self, code: u16) -> Vec<Action> {
         if self.is_finished() {
             return Vec::new();
+        }
+        if self.state == State::Holding {
+            return vec![self.finish()];
         }
         match CloseCode::from_number(code) {
             Some(CloseCode::Done) if self.state == State::AwaitClose => vec![self.finish()],
@@ -1269,7 +1530,7 @@ impl RoomClient {
         if self.is_finished() {
             return Vec::new();
         }
-        // 文が届いた = サーバーまでの経路は生きている（pong に限らない）。
+        // 文が届いた = サーバーまでの経路は生きている（pongに限らない）。
         self.unanswered_ping_ms = None;
         let msg = match parse_server_message(text) {
             Ok(m) => m,
@@ -1279,7 +1540,9 @@ impl RoomClient {
         match (self.state, self.role, msg) {
             (State::Connecting, _, _) => self.fail(Failure::Unresponsive(Why::OutOfOrder(kind))),
             (_, _, ServerMsg::Pong) => Vec::new(),
-            // error の文は閉じる番号と同じに扱う。1000（done）の error はサーバーが送らない。
+            // 保っている間に来る文は閉じる前のerrorだけ（サーバーはpingの答えのほかに送らない）。どれでも失敗にせず終える。
+            (State::Holding, _, _) => vec![self.finish()],
+            // errorの文は閉じる番号と同じに扱う。1000（done）のerrorはサーバーが送らない。
             (_, _, ServerMsg::Error { code }) => match code {
                 Some(CloseCode::Expired) => self.fail(Failure::Expired),
                 Some(CloseCode::PeerLeft) => self.fail(Failure::PeerLeft),
@@ -1296,17 +1559,24 @@ impl RoomClient {
                 };
                 vec![Action::Notify(Event::Joined { role, expires_at })]
             }
-            (State::AwaitMatched, Some(Role::Offer), ServerMsg::Matched { expires_at }) => {
+            (State::AwaitMatched, Some(Role::Offer), ServerMsg::Matched { expires_at, ticket }) => {
+                self.ticket = ticket;
                 let d = backstop(now, expires_at, ANSWER_TTL_MS).min(self.room_deadline_ms);
                 self.deadline_ms = Some(d);
                 self.state = State::AwaitPeerCode;
                 vec![Action::Notify(Event::Matched { expires_at })]
             }
-            (State::AwaitPeerCode, Some(Role::Offer), ServerMsg::Peer { code }) => {
-                vec![Action::Notify(Event::PeerCode(code)), self.finish()]
+            (State::AwaitPeerCode, Some(Role::Offer), ServerMsg::Peer { code, .. }) => {
+                let end = if self.hold {
+                    self.hold_on()
+                } else {
+                    self.finish()
+                };
+                vec![Action::Notify(Event::PeerCode(code)), end]
             }
-            (State::AwaitPeerCode, Some(Role::Answer), ServerMsg::Peer { code }) => {
-                // 返す側には matched が来ないので、answer の期限はこちらで数える。
+            (State::AwaitPeerCode, Some(Role::Answer), ServerMsg::Peer { code, ticket }) => {
+                self.ticket = ticket;
+                // 返す側にはmatchedが来ないのでanswerの期限はこちらで数える。
                 let d = now
                     .ms
                     .saturating_add(ANSWER_TTL_MS)
@@ -1320,7 +1590,7 @@ impl RoomClient {
         }
     }
 
-    /// 自分のコードをサーバーへ送る（始める側は `Joined` の後、返す側は `PeerCode` の後）。送る文を返す。
+    /// 自分のコードをサーバーへ送る（始める側は`Joined`の後、返す側は`PeerCode`の後）。送る文を返す。
     pub fn submit_code(&mut self, code: &str) -> Result<Vec<Action>, SubmitError> {
         let role = match (self.state, self.role) {
             (State::NeedOwnCode, Some(r)) => r,
@@ -1335,8 +1605,9 @@ impl RoomClient {
         Ok(vec![Action::Send(text)])
     }
 
-    /// 観戦を断る（観戦用のルームの始める側が `Joined` の後、`offer` の代わりに）。以後はルームの期限（4408）まで残り、来る観戦者は
-    /// サーバーが 4403 で閉じる。断ったときは状態を変えない。
+    /// 観戦を断る（観戦用のルームの始める側が`Joined`の後に`offer`の代わりに）。
+    /// 以後はルームの期限（4408）まで残る。来る観戦者はサーバーが4403で閉じる。
+    /// 断ったときは状態を変えない。
     pub fn refuse(&mut self) -> Result<Vec<Action>, SubmitError> {
         match (self.state, self.role) {
             (State::NeedOwnCode, Some(Role::Offer)) => {
@@ -1347,10 +1618,15 @@ impl RoomClient {
         }
     }
 
-    /// 時計を進める。期限を過ぎていれば失敗、ping の時刻なら ping。
+    /// 時計を進める。期限を過ぎていれば失敗、pingの時刻ならping。
     pub fn poll(&mut self, now: Now) -> Vec<Action> {
         if self.is_finished() || self.state == State::Connecting {
             return Vec::new();
+        }
+        if self.hold && self.state == State::AwaitClose {
+            // 対戦のルームの返す側はanswerを渡し終えた時点で成立（サーバーは閉じずに残す）。
+            // 送れなかったときは通信の処理がこの前に`on_transport_failed`で失敗にしている。
+            return vec![self.hold_on()];
         }
         if let Some(d) = self.deadline_ms
             && now.ms >= d
@@ -1362,16 +1638,19 @@ impl RoomClient {
             };
             return self.fail(f);
         }
-        // ping より先に見る（3 周目の後の 4 通目を送る前に切る）。
+        // pingより先に見る（3周目の後の4通目を送る前に切る）。
         if let Some(s) = self.silence_deadline_at()
             && now.ms >= s
         {
+            if self.state == State::Holding {
+                return vec![self.finish()];
+            }
             return self.fail(Failure::Unresponsive(Why::NoPong));
         }
         if let Some(p) = self.next_ping_ms
             && now.ms >= p
         {
-            // 長く呼ばれなかった後に続けて何通も出さないよう、次はいまから数える。
+            // 長く呼ばれなかった後に続けて何通も出さないよう次はいまから数える。
             self.next_ping_ms = Some(now.ms.saturating_add(PING_INTERVAL_MS));
             self.unanswered_ping_ms.get_or_insert(now.ms);
             return vec![Action::Send(PING_TEXT.to_owned())];
@@ -1382,13 +1661,13 @@ impl RoomClient {
 
 #[cfg(test)]
 mod tests {
-    //! 期待値の外の基準: サーバーの値は `tests/fixtures/room/rules.json`、文の形はサーバーの `JSON.stringify` の出力を手で書いたもの。
+    //! 期待値の外の基準: サーバーの値は`tests/fixtures/room/rules.json`、文の形はサーバーの`JSON.stringify`の出力を手で書いたもの。
     use super::*;
 
     const RULES: &str = include_str!("../../../tests/fixtures/room/rules.json");
     const NAMES: &str = include_str!("../../../tests/fixtures/room/names.json");
 
-    /// 見本の `U+0000-U+001F,U+007F-U+009F` の形を範囲の列に（形が違えば落ちる）。
+    /// 見本の`U+0000-U+001F,U+007F-U+009F`の形を範囲の列に変換する（形が違えば落ちる）。
     fn parse_ranges(s: &str) -> Vec<(u32, u32)> {
         s.split(',')
             .map(|part| {
@@ -1402,7 +1681,7 @@ mod tests {
             .collect()
     }
 
-    /// パスの `%XX` を戻す（検査の側の手書き。サーバーの `decodeURIComponent` の代わり）。`%` の後が 16 進 2 桁でなければ落ちる。
+    /// パスの`%XX`をデコードする（検査の側の手書き。サーバーの`decodeURIComponent`の代わり）。`%`の後が16進2桁でなければ落ちる。
     fn percent_decode(s: &str) -> String {
         let b = s.as_bytes();
         let mut out = Vec::new();
@@ -1421,7 +1700,7 @@ mod tests {
     }
 
     fn t(ms: u64) -> Now {
-        // 壁の時計は単調な時計と別の値にずらしておく（同じ値だと取り違えても通る）。
+        // 壁時計は単調な時計と別の値にずらしておく（同じ値だと取り違えても通る）。
         Now {
             ms,
             unix_secs: 1_790_000_000 + ms / 1000,
@@ -1464,7 +1743,7 @@ mod tests {
         assert!(RoomName::parse(&b64(max + 1)).is_err());
         let max_bytes = int(&mut used, "room_name_max_bytes") as usize;
         assert_eq!(max_bytes, ROOM_NAME_MAX_BYTES);
-        // 4 B の文字（U+20BB7）で大きさの端を作る（ASCII だと長さのガードが先に落ちるため）。
+        // 4 Bの文字（U+20BB7）で大きさの端を作る（ASCIIだと長さのガードが先に落ちるため）。
         let four = |n: usize| "\u{20BB7}".repeat(n);
         assert!(RoomName::parse_server_rules(&four(max_bytes / 4)).is_ok());
         assert_eq!(
@@ -1501,7 +1780,7 @@ mod tests {
         for n in &bad_names {
             assert_eq!(RoomName::parse(n), Err(RoomNameError::DotName), "{n}");
         }
-        // 揃えるのはサーバーだけ。こちらは手順の名を知っているだけで、打った文字のまま送る。
+        // 揃えるのはサーバーだけ。こちらは手順の名を知っているだけ。打った文字のまま送る。
         assert_eq!(text(&mut used, "room_name_fold"), "nfkc,trim,lower");
         assert_eq!(RoomName::parse("RoOm_Z-9").unwrap().as_str(), "RoOm_Z-9");
 
@@ -1527,6 +1806,27 @@ mod tests {
         );
         assert_eq!(int(&mut used, "room_ttl_ms") as u64, ROOM_TTL_MS);
         assert_eq!(int(&mut used, "answer_ttl_ms") as u64, ANSWER_TTL_MS);
+        assert_eq!(int(&mut used, "held_stale_ms") as u64, HELD_STALE_MS);
+        assert_eq!(int(&mut used, "held_sweep_ms") as u64, HELD_SWEEP_MS);
+        let mut n_http = 0;
+        for (k, v) in &list {
+            let Some(name) = k.strip_prefix("http_") else {
+                continue;
+            };
+            assert_eq!(v, &JsonValue::Str(name.into()), "{k}");
+            assert!(HttpErrorName::from_wire(name).is_some(), "{k}");
+            used.push(match name {
+                "room_in_use" => "http_room_in_use",
+                "room_full" => "http_room_full",
+                other => panic!("知らない http_ の鍵 {other}"),
+            });
+            n_http += 1;
+        }
+        assert_eq!(n_http, 2);
+        assert_eq!(
+            classify_http(409, r#"{"error":"room_in_use"}"#),
+            Failure::RoomInUse
+        );
         assert_eq!(text(&mut used, "ping_text"), PING_TEXT);
         assert_eq!(text(&mut used, "pong_text"), PONG_TEXT);
         assert_eq!(int(&mut used, "retry_after_secs") as u32, RETRY_AFTER_SECS);
@@ -1534,6 +1834,17 @@ mod tests {
         assert_eq!(
             int(&mut used, "client_id_len") as usize,
             2 * CLIENT_ID_BYTES
+        );
+        assert_eq!(text(&mut used, "ticket_param"), TICKET_PARAM);
+        assert_eq!(int(&mut used, "ticket_ttl_secs") as u64, TICKET_TTL_SECS);
+        assert_eq!(text(&mut used, "ticket_purpose"), TICKET_PURPOSE);
+        assert_eq!(
+            int(&mut used, "ticket_num_max_digits") as usize,
+            TICKET_NUM_MAX_DIGITS
+        );
+        assert_eq!(
+            int(&mut used, "ticket_mac_chars") as usize,
+            TICKET_MAC_CHARS
         );
 
         for c in CloseCode::ALL {
@@ -1548,11 +1859,11 @@ mod tests {
         let close_keys = list.iter().filter(|(k, _)| k.starts_with("close_")).count();
         assert_eq!(close_keys, CloseCode::ALL.len(), "見本の閉じる番号の数");
 
-        // 読まなかった鍵が無いこと（見本に足した値が、ここで比べられないまま通らないように）。
+        // 読まなかったキーが無いこと（見本に足した値がここで比べられないまま通らないように）。
         let unread: Vec<&str> = list
             .iter()
             .map(|(k, _)| k.as_ref())
-            // `random_` の鍵はランダム対戦の値（`room_queue.rs` の検査が同じ見本と突き合わせる）。`watch_` の鍵は一覧の値（`watch_list.rs`）。
+            // `random_`のキーはランダム対戦の値（`room_queue.rs`の検査が同じ見本と突き合わせる）。`watch_`のキーは一覧の値（`watch_list.rs`）。
             .filter(|k| {
                 !k.starts_with("close_")
                     && !k.starts_with("random_")
@@ -1567,7 +1878,7 @@ mod tests {
     fn ping_text_is_exact() {
         assert_eq!(PING_TEXT.len(), 12);
         assert_eq!(PING_TEXT.as_bytes(), br#"{"t":"ping"}"#);
-        // 1 文字違いは JSON としては ping でも、サーバーの自動応答には当たらない。ここでは読み手が 1 文字違いの t を pong と取り違えないこと。
+        // 1文字違いはJSONとしてはpingでもサーバーの自動応答には当たらない。ここでは読み手が1文字違いのtをpongと取り違えないこと。
         for bad in [
             r#"{"t":"Pong"}"#,
             r#"{"t":"pon"}"#,
@@ -1635,8 +1946,8 @@ mod tests {
             Err(RoomNameError::TooManyBytes { bytes: 130 })
         );
 
-        // 日本語・全角・記号は通る。ASCII 以外の名の長さはこちらでは数えない（揃えると縮む「ｶﾞ」40 文字はサーバーで 20 文字になって通るので、
-        // こちらが断ってはいけない）。
+        // 日本語・全角・記号は通る。
+        // ASCII以外の名の長さはこちらでは数えない（揃えると縮む「ｶﾞ」40文字はサーバーで20文字になって通るので、こちらが断ってはいけない）。
         for ok in [
             "花映塚の部屋",
             "ＡＢＣ",
@@ -1683,9 +1994,9 @@ mod tests {
             "/v0/rooms/%20a%2Bb%25c%3Fd%23e%5Cf%26g%3Dh%27"
         );
         assert_eq!(p("\u{3000}x\u{FEFF}"), "/v0/rooms/%E3%80%80x%EF%BB%BF");
-        // パスに生の `/` は決して入らない（`/` は parse が断る。全角の `／` は符号化される）。
+        // パスに生の`/`は決して入らない（`/`はparseが断る。全角の`／`は符号化される）。
         assert_eq!(p("Ａ／Ｂ"), "/v0/rooms/%EF%BC%A1%EF%BC%8F%EF%BC%A2");
-        // 128 B の名のパスは先頭 ＋ 384 文字まで（サーバーの区切りの前置きのガードの内）。
+        // 128 Bの名のパスは先頭 ＋ 384文字まで（サーバーの区切りの前置きのガードの内）。
         let big = "\u{20BB7}".repeat(32);
         assert_eq!(p(&big).len(), PATH_PREFIX.len() + 128 * 3);
     }
@@ -1694,7 +2005,7 @@ mod tests {
     fn client_id_goes_in_the_query_after_the_encoded_path() {
         let mut id = [0u8; CLIENT_ID_BYTES];
         for (i, b) in id.iter_mut().enumerate() {
-            // 上下の 4 bit が違う値（16 進の桁の入れ違いを落とす）。
+            // 上下の4 bitが違う値（16進の桁の入れ違いがあれば検査が落ちる）。
             *b = (i as u8).wrapping_mul(0x1F).wrapping_add(0xA3);
         }
         let name = RoomName::parse_server_rules("花 a").unwrap();
@@ -1710,6 +2021,84 @@ mod tests {
         );
         assert_eq!(&hex[..4], "a3c2", "先頭の 2 バイトは 0xA3 0xC2 の順");
         assert_eq!(p.matches('?').count(), 1);
+    }
+
+    /// 発行・期限・MACの3つのフィールドのチケット（MACの最後の文字は下2 bitが0の`w`）。
+    const TICKET: &str = "1790000000.1790086400.Ab9-_zAb9-_zAb9-_zAb9-_zAb9-_zAb9-_zAb9-_zw";
+
+    #[test]
+    fn the_ticket_goes_in_the_query_after_the_client_id_and_no_room_name_is_sent() {
+        let origin = RoomName::parse("Room_1").unwrap();
+        let w = origin.spectate_of();
+        let ticket = SeatTicket::parse(TICKET).unwrap();
+        assert_eq!(
+            w.path_with_ticket(None, &ticket),
+            format!("{}?ticket={TICKET}", w.path())
+        );
+        let id = [0xA3u8; CLIENT_ID_BYTES];
+        let p = w.path_with_ticket(Some(&id), &ticket);
+        assert_eq!(
+            p,
+            format!(
+                "{}?cid={}&ticket={TICKET}",
+                w.path(),
+                "a3".repeat(CLIENT_ID_BYTES)
+            )
+        );
+        assert!(!p.to_ascii_lowercase().contains("room_1"), "{p}");
+        assert!(!p.contains("origin"), "{p}");
+        // cidだけの形（対戦のルーム・観戦者）はチケットを含まない。
+        assert!(!w.path_with_client(&id).contains("ticket"));
+        assert!(!w.path().contains('?'));
+    }
+
+    #[test]
+    fn a_seat_ticket_passes_only_in_the_servers_exact_shape() {
+        let t = SeatTicket::parse(TICKET).unwrap();
+        assert_eq!(t.as_str(), TICKET);
+        assert_eq!(format!("{t:?}"), "SeatTicket(..)", "Debug に札が出た");
+        let mac = &TICKET[TICKET.len() - TICKET_MAC_CHARS..];
+        let longest = format!("{0}.{0}.{mac}", "9".repeat(TICKET_NUM_MAX_DIGITS));
+        assert_eq!(longest.len(), TICKET_MAX_CHARS);
+        assert!(SeatTicket::parse(&longest).is_some());
+        assert!(SeatTicket::parse(&format!("0.0.{mac}")).is_some());
+        // 下2 bitが0の最後の文字は16通り。
+        let ok_last: String = (0u8..64)
+            .filter_map(|v| {
+                let s = format!("1.2.{}{}", &mac[..42], char::from(b64_char(v)));
+                SeatTicket::parse(&s).map(|_| char::from(b64_char(v)))
+            })
+            .collect();
+        assert_eq!(ok_last, "AEIMQUYcgkosw048");
+        let bad = [
+            String::new(),
+            "1.2".to_owned(),
+            mac.to_owned(),
+            format!("1.2.{mac}.3"),
+            format!("01.2.{mac}"),
+            format!("1.02.{mac}"),
+            format!("{}.2.{mac}", "1".repeat(TICKET_NUM_MAX_DIGITS + 1)),
+            format!("1.{}.{mac}", "1".repeat(TICKET_NUM_MAX_DIGITS + 1)),
+            format!("-1.2.{mac}"),
+            format!(".2.{mac}"),
+            format!("1..{mac}"),
+            format!("1.2.{}", &mac[..42]),
+            format!("1.2.{mac}A"),
+            format!("1.2.{}+", &mac[..42]),
+            format!("1.2.{}=", &mac[..42]),
+            format!("1.2.{}x", &mac[..42]),
+            format!("1.2.{} ", &mac[..42]),
+            format!(" 1.2.{mac}"),
+            format!("1.2.{}%41", &mac[..40]),
+            format!("1.2.{}あ", &mac[..41]),
+        ];
+        for b in &bad {
+            assert_eq!(SeatTicket::parse(b), None, "{b:?}");
+        }
+    }
+
+    fn b64_char(v: u8) -> u8 {
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[usize::from(v)]
     }
 
     #[test]
@@ -1735,8 +2124,8 @@ mod tests {
                 panic!("names.json の鍵の接頭を知らない: {k}")
             };
             let got = RoomName::parse_server_rules(name);
-            // dll の本番（`parse`）の期待: サーバーの決まりを通る名のうち ASCII の英数字と `-` `_` だけが通り、ほかは `NotAscii`。
-            // サーバーの決まりで断る名は `parse` も断る（別の理由で）。
+            // dllの本番（`parse`）の期待: サーバーの決まりを通る名のうち使える文字（`accepts_char`）だけの名は前後の空白を除いて通る。
+            // ほかは`NotAscii`。サーバーの決まりで断る名は`parse`も断る（別の理由で）。
             let ascii_only = name.chars().all(RoomName::accepts_char);
             if client_passes {
                 let r = got.unwrap_or_else(|e| panic!("{k} をサーバーの決まりで断った: {e:?}"));
@@ -1750,10 +2139,14 @@ mod tests {
                 assert_eq!(percent_decode(seg), name.as_ref(), "{k}");
                 n_pass += 1;
                 if ascii_only {
+                    let trimmed = RoomName::parse_server_rules(name.trim_matches(' '))
+                        .unwrap_or_else(|e| {
+                            panic!("{k} を除いた名をサーバーの決まりで断った: {e:?}")
+                        });
                     assert_eq!(
                         RoomName::parse(name),
-                        Ok(r),
-                        "{k}: dll が ASCII の名を断った"
+                        Ok(trimmed),
+                        "{k}: dll が使える文字の名を断った"
                     );
                     n_dll_pass += 1;
                 } else {
@@ -1769,7 +2162,7 @@ mod tests {
                 n_bad += 1;
             }
         }
-        // 母数（どれも 0 件で素通りにならないように）。
+        // 母数（どれも0件で素通りにならないように）。
         assert!(
             n_pass > 0 && n_bad > 0 && n_dll_pass > 0 && n_dll_refuse > 0,
             "通す {n_pass}・断る {n_bad}・dll が通す {n_dll_pass}・dll だけが断る {n_dll_refuse}"
@@ -1783,14 +2176,27 @@ mod tests {
         let path = name.path();
         let seg = path.strip_prefix(PATH_PREFIX).unwrap();
         assert_eq!(percent_decode(seg), "Room@x_1");
-        // 観戦用のルームの名は ASCII の `w.` と 16 進だけで、`@` を含む名から作っても `@` は出ない。
+        // 観戦用のルームの名はASCIIの`w.`と16進だけで、`@`を含む名から作っても`@`は出ない。
         assert!(!name.spectate_of().as_str().contains('@'));
-        // 接続コードの文字のガードは `@` を通さないまま（base64url）。
+        // 接続コードの文字のガードは`@`を通さないまま（base64url）。
         assert_eq!(check_code("ab@cd"), Err(CodeTextError::BadChar { pos: 2 }));
     }
 
     #[test]
-    fn dll_room_names_are_ascii_only() {
+    fn dll_room_names_follow_the_printable_ascii_rule() {
+        // 使える文字は0x20〜0x7Eのうち`` ` `` `;` `/` 以外の92文字だけ。
+        let accepted: Vec<char> = (0..0x3100u32)
+            .filter_map(char::from_u32)
+            .filter(|&c| RoomName::accepts_char(c))
+            .collect();
+        assert_eq!(accepted.len(), 92);
+        assert!(accepted.iter().all(|c| (' '..='~').contains(c)));
+        for no in ['`', ';', '/', '\u{7F}', '\u{1F}', 'あ', 'Ａ', '\u{3000}'] {
+            assert!(!RoomName::accepts_char(no), "{no:?}");
+        }
+        for yes in ['.', '@', '"', '\\', ' ', '?', '#', '%', '+', '-', '_', '~'] {
+            assert!(RoomName::accepts_char(yes), "{yes:?}");
+        }
         for ok in [
             "a",
             "Z",
@@ -1803,6 +2209,21 @@ mod tests {
             "a@b",
             "@",
             &"x".repeat(32),
+            "a b",
+            "a.b",
+            ".a",
+            "...",
+            "a+b",
+            "a%20",
+            "a\"b",
+            "a\\b",
+            "a?b#c",
+            "w",
+            "q",
+            "w-x",
+            "ww.x",
+            "w .x",
+            "xq.",
         ] {
             assert_eq!(RoomName::parse(ok).unwrap().as_str(), ok, "{ok:?}");
         }
@@ -1810,22 +2231,32 @@ mod tests {
             RoomName::parse("Room-1").unwrap(),
             RoomName::parse("room-1").unwrap()
         );
-        // 断る: 文字の位置つき（0 からの文字の数。バイトでない: 「花」は 3 B）。
+        // 前後の空白は除き、間の空白は残す。
+        for (typed, kept) in [
+            ("  abc  ", "abc"),
+            (" a b ", "a b"),
+            ("a  b", "a  b"),
+            (" x", "x"),
+            ("x ", "x"),
+        ] {
+            assert_eq!(RoomName::parse(typed).unwrap().as_str(), kept, "{typed:?}");
+        }
+        assert_eq!(RoomName::parse(" a b ").unwrap().path(), "/v0/rooms/a%20b");
+        // 断る: 文字の位置つき（0からの文字の数。バイトでない: 「花」は3 B）。
         for (bad, pos) in [
             ("花映塚の部屋", 0),
             ("ab花", 2),
             ("ＡＢＣ", 0),
             ("abc１", 3),
             ("ｶﾞ", 0),
-            ("a b", 1),
-            (" abc", 0),
-            ("abc ", 3),
-            ("a.b", 1),
-            ("a+b", 1),
-            ("a%20", 1),
+            ("a`b", 1),
+            ("a;b", 1),
+            (";", 0),
+            ("abc`", 3),
             ("Ａ／Ｂ", 0),
             ("🌸abc", 0),
             ("\u{3000}x", 0),
+            ("x\u{3000}", 1),
         ] {
             assert_eq!(
                 RoomName::parse(bad),
@@ -1834,10 +2265,33 @@ mod tests {
             );
             assert!(RoomName::parse_server_rules(bad).is_ok(), "{bad:?}");
         }
+        // 前後の空白を除いて小文字にした名が`w.` `q.`で始まる名はサーバーの決まりを通るが、dllは断る。
+        for bad in [
+            "w.abc",
+            "W.abc",
+            "q.abc",
+            "Q.ABC",
+            "w.",
+            "q.",
+            " w.x",
+            "  Q.x  ",
+            "q.0123456789abcdef0123456789abcd",
+        ] {
+            assert_eq!(
+                RoomName::parse(bad),
+                Err(RoomNameError::ReservedPrefix),
+                "{bad:?}"
+            );
+            assert!(RoomName::parse_server_rules(bad).is_ok(), "{bad:?}");
+        }
         assert_eq!(RoomName::parse(""), Err(RoomNameError::Empty));
         assert_eq!(RoomName::parse("   "), Err(RoomNameError::Blank));
         assert_eq!(
             RoomName::parse("a\tb"),
+            Err(RoomNameError::BadChar { pos: 1 })
+        );
+        assert_eq!(
+            RoomName::parse("a/b"),
             Err(RoomNameError::BadChar { pos: 1 })
         );
         assert_eq!(
@@ -1865,7 +2319,7 @@ mod tests {
             check_code(&b64(1025)),
             Err(CodeTextError::TooLong { chars: 1025 })
         );
-        // サーバーは長さを先に見る。文字も悪い 1025 文字は too_large。
+        // サーバーは長さを先に見る。文字も悪い1025文字はtoo_large。
         let bad_long = format!("{} ", b64(1024));
         assert_eq!(
             check_code(&bad_long).map_err(CodeTextError::close_code),
@@ -1939,15 +2393,64 @@ mod tests {
         assert_eq!(
             parse_server_message(r#"{"t":"peer","code":"AbC-_0"}"#),
             Ok(ServerMsg::Peer {
-                code: "AbC-_0".into()
+                code: "AbC-_0".into(),
+                ticket: None
             })
         );
         assert_eq!(
             parse_server_message(r#"{"t":"matched","expires_at":1790000060}"#),
             Ok(ServerMsg::Matched {
-                expires_at: 1_790_000_060
+                expires_at: 1_790_000_060,
+                ticket: None
             })
         );
+        let ticket = SeatTicket::parse(TICKET);
+        assert!(ticket.is_some());
+        assert_eq!(
+            parse_server_message(&format!(
+                r#"{{"t":"matched","expires_at":1790000060,"ticket":"{TICKET}"}}"#
+            )),
+            Ok(ServerMsg::Matched {
+                expires_at: 1_790_000_060,
+                ticket
+            })
+        );
+        assert_eq!(
+            parse_server_message(&format!(
+                r#"{{"t":"peer","code":"AbC-_0","ticket":"{TICKET}"}}"#
+            )),
+            Ok(ServerMsg::Peer {
+                code: "AbC-_0".into(),
+                ticket
+            })
+        );
+        // 形の外れたチケット・文字列でないチケットはチケットなし（文そのものは読める）。
+        for bad in [
+            format!(r#""{TICKET}x""#),
+            r#""""#.to_owned(),
+            "1790000000".to_owned(),
+            "null".to_owned(),
+            format!(r#"["{TICKET}"]"#),
+        ] {
+            assert_eq!(
+                parse_server_message(&format!(
+                    r#"{{"t":"matched","expires_at":1,"ticket":{bad}}}"#
+                )),
+                Ok(ServerMsg::Matched {
+                    expires_at: 1,
+                    ticket: None
+                }),
+                "{bad}"
+            );
+            assert_eq!(
+                parse_server_message(&format!(r#"{{"t":"peer","code":"A","ticket":{bad}}}"#)),
+                Ok(ServerMsg::Peer {
+                    code: "A".into(),
+                    ticket: None
+                }),
+                "{bad}"
+            );
+        }
         assert_eq!(
             parse_server_message(r#"{"t":"error","code":"peer_left"}"#),
             Ok(ServerMsg::Error {
@@ -1987,7 +2490,7 @@ mod tests {
             (r#""pong""#, NotJson { at: 0 }),
             (r#"{"t":"pong",}"#, NotJson { at: 12 }),
             (r#"{'t':'pong'}"#, NotJson { at: 1 }),
-            // `\n` は JSON の逃がしなので読める（t は "po<改行>g" で知らない t）。生の制御文字は次の行。
+            // `\n`はJSONのエスケープなので読める（tは "po<改行>g" で知らないt）。生の制御文字は次の行。
             (r#"{"t":"po\ng"}"#, UnknownType),
             ("{\"t\":\"po\u{1}ng\"}", NotJson { at: 8 }),
             (r#"{"t":"\x"}"#, NotJson { at: 7 }),
@@ -2082,7 +2585,7 @@ mod tests {
         assert_eq!(parse_server_message(&p1025), Err(BadValue("code")));
     }
 
-    // ---- 入口の HTTP ----
+    // ---- 入口のHTTP ----
 
     #[test]
     fn http_refusals() {
@@ -2137,6 +2640,12 @@ mod tests {
             ),
             (400, r#"{"error":"bad_room_name"}"#, BadRoomName),
             (409, r#"{"error":"room_full"}"#, RoomFull),
+            (409, r#"{"error":"room_in_use"}"#, RoomInUse),
+            (
+                400,
+                r#"{"error":"room_in_use"}"#,
+                Unresponsive(Why::NotOurBody(400)),
+            ),
             (
                 429,
                 r#"{"error":"rate_limited","retry_after":60}"#,
@@ -2162,6 +2671,17 @@ mod tests {
             (
                 400,
                 r#"{"error":"room_full"}"#,
+                Unresponsive(Why::NotOurBody(400)),
+            ),
+            (400, r#"{"error":"bad_ticket"}"#, BadTicket),
+            (
+                409,
+                r#"{"error":"bad_ticket"}"#,
+                Unresponsive(Why::NotOurBody(409)),
+            ),
+            (
+                400,
+                r#"{"error":"bad_origin"}"#,
                 Unresponsive(Why::NotOurBody(400)),
             ),
             (
@@ -2194,10 +2714,12 @@ mod tests {
             FailureKind::WaitThenRetry
         );
         assert_eq!(RoomFull.kind(), FailureKind::ChangeRoomName);
+        assert_eq!(RoomInUse.kind(), FailureKind::ChangeRoomName);
         assert_eq!(BadRoomName.kind(), FailureKind::ChangeRoomName);
         assert_eq!(Expired.kind(), FailureKind::Expired);
         assert_eq!(PeerLeft.kind(), FailureKind::PeerLeft);
         assert_eq!(Refused.kind(), FailureKind::Refused);
+        assert_eq!(BadTicket.kind(), FailureKind::Unresponsive);
 
         let mut c = RoomClient::new();
         assert_eq!(
@@ -2209,7 +2731,7 @@ mod tests {
         assert!(c.is_finished());
     }
 
-    // ---- 状態機械 ----
+    // ---- ステートマシン ----
 
     const ROOM_OFFER: &str = r#"{"t":"room","role":"host","expires_at":1790000600}"#;
     const ROOM_ANSWER: &str = r#"{"t":"room","role":"guest","expires_at":1790000300}"#;
@@ -2301,6 +2823,211 @@ mod tests {
         assert_eq!(c.state(), State::Done);
     }
 
+    fn match_room() -> RoomName {
+        RoomName::parse("Synth-Room").unwrap()
+    }
+
+    /// 対戦のルームで成立して保っている始める側・返す側。
+    fn held(role: Role) -> RoomClient {
+        let mut c = RoomClient::for_room(&match_room());
+        match role {
+            Role::Offer => {
+                joined(&mut c, ROOM_OFFER, 0);
+                c.submit_code("OfferCode").unwrap();
+                c.on_text(t(5_000), r#"{"t":"matched","expires_at":1790000065}"#);
+                c.on_text(t(9_000), r#"{"t":"peer","code":"AnswerCode"}"#);
+            }
+            Role::Answer => {
+                joined(&mut c, ROOM_ANSWER, 0);
+                c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+                c.submit_code("AnswerCode").unwrap();
+                c.poll(t(40));
+            }
+        }
+        assert_eq!(c.state(), State::Holding, "{role:?}");
+        c
+    }
+
+    #[test]
+    fn a_match_room_holds_after_the_trade_and_keeps_only_the_ping() {
+        // 始める側: peerを受けたらHeldで閉じずに保つ。期限は持たずpingの時計だけが残る。
+        let mut c = RoomClient::for_room(&match_room());
+        joined(&mut c, ROOM_OFFER, 0);
+        c.submit_code("OfferCode").unwrap();
+        c.on_text(t(5_000), r#"{"t":"matched","expires_at":1790000065}"#);
+        assert_eq!(
+            c.on_text(t(9_000), r#"{"t":"peer","code":"AnswerCode"}"#),
+            vec![
+                Action::Notify(Event::PeerCode("AnswerCode".into())),
+                Action::Notify(Event::Held)
+            ]
+        );
+        assert_eq!(c.state(), State::Holding);
+        assert!(!c.is_finished());
+        assert_eq!(c.deadline_at(), None);
+        assert_eq!(c.next_wake(), Some(30_000));
+        // 1時間保っても30秒ごとのpingのほかに何もしない（answer・ルームの期限で切らない）。
+        let mut pings = 0;
+        for s in 1..=120u64 {
+            let at = 20 + s * PING_INTERVAL_MS;
+            for a in c.poll(t(at)) {
+                assert_eq!(a, send(PING_TEXT), "{at}");
+                pings += 1;
+            }
+            assert_eq!(c.on_text(t(at + 10), PONG_TEXT), vec![]);
+        }
+        assert_eq!(pings, 120);
+        assert_eq!(c.state(), State::Holding);
+        assert_eq!(
+            c.submit_code("Again"),
+            Err(SubmitError::NotNow(State::Holding))
+        );
+
+        // 返す側: answerを渡し終えた次のpollでHeld。閉じる番号を待たずanswerの期限（NoClose）でも切らない。
+        let mut c = RoomClient::for_room(&match_room());
+        joined(&mut c, ROOM_ANSWER, 0);
+        c.on_text(t(1_000), r#"{"t":"peer","code":"OfferCode"}"#);
+        assert_eq!(
+            c.submit_code("AnswerCode"),
+            Ok(vec![send(r#"{"t":"answer","code":"AnswerCode"}"#)])
+        );
+        assert_eq!(c.state(), State::AwaitClose);
+        assert_eq!(c.poll(t(1_010)), vec![Action::Notify(Event::Held)]);
+        assert_eq!(c.state(), State::Holding);
+        for at in [
+            1_000 + ANSWER_TTL_MS + DEADLINE_GRACE_MS,
+            20 + ROOM_TTL_MS + DEADLINE_GRACE_MS,
+        ] {
+            assert_eq!(c.poll(t(at)), vec![send(PING_TEXT)], "{at}");
+            assert_eq!(c.on_text(t(at + 10), PONG_TEXT), vec![]);
+        }
+        assert_eq!(c.state(), State::Holding);
+    }
+
+    #[test]
+    fn a_held_room_ends_quietly_on_any_close_error_or_silence() {
+        for role in [Role::Offer, Role::Answer] {
+            for n in [1000, 1006, 4400, 4408, 4410, 4999] {
+                let mut c = held(role);
+                assert_eq!(
+                    c.on_close(n),
+                    vec![Action::Notify(Event::Done)],
+                    "{role:?} {n}"
+                );
+                assert_eq!(c.state(), State::Done);
+                assert_eq!(c.on_close(n), vec![], "二重に知らせる");
+            }
+            for e in ["expired", "peer_left", "bad_message", "zzz"] {
+                let mut c = held(role);
+                assert_eq!(
+                    c.on_text(t(50), &format!(r#"{{"t":"error","code":"{e}"}}"#)),
+                    vec![Action::Notify(Event::Done)],
+                    "{role:?} {e}"
+                );
+            }
+            let mut c = held(role);
+            assert_eq!(c.on_transport_failed(), vec![Action::Notify(Event::Done)]);
+            // pongが途絶えても「応答しません」にしない。
+            let mut c = held(role);
+            let mut out = Vec::new();
+            for s in 1..=4u64 {
+                out.extend(c.poll(t(20 + s * PING_INTERVAL_MS)));
+            }
+            assert!(!has_failure(&out), "{out:?}");
+            assert_eq!(out.last(), Some(&Action::Notify(Event::Done)), "{role:?}");
+            assert!(c.is_finished());
+        }
+    }
+
+    #[test]
+    fn only_rooms_that_are_not_watch_rooms_hold() {
+        let watch = match_room().spectate_of();
+        let mut c = RoomClient::for_room(&watch);
+        joined(&mut c, ROOM_OFFER, 0);
+        c.submit_code("OfferCode").unwrap();
+        c.on_text(t(5_000), r#"{"t":"matched","expires_at":1790000065}"#);
+        assert_eq!(
+            c.on_text(t(9_000), r#"{"t":"peer","code":"AnswerCode"}"#),
+            vec![
+                Action::Notify(Event::PeerCode("AnswerCode".into())),
+                Action::Notify(Event::Done)
+            ],
+            "観戦用のルームは保たない"
+        );
+        let mut c = RoomClient::for_room(&watch);
+        joined(&mut c, ROOM_ANSWER, 0);
+        c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+        c.submit_code("AnswerCode").unwrap();
+        assert_eq!(c.poll(t(40)), vec![]);
+        assert_eq!(c.state(), State::AwaitClose);
+        // 割り当てのルーム（ランダムマッチのq.）は保つ。
+        let assigned = RoomName::parse_server_rules(&format!("q.{}", "0a".repeat(15))).unwrap();
+        let mut c = RoomClient::for_room(&assigned);
+        joined(&mut c, ROOM_ANSWER, 0);
+        c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+        c.submit_code("AnswerCode").unwrap();
+        assert_eq!(c.poll(t(40)), vec![Action::Notify(Event::Held)]);
+    }
+
+    #[test]
+    fn an_answer_that_could_not_be_sent_fails_before_holding() {
+        // answerを送れなかったときは通信の処理がpollより先にon_transport_failedを呼ぶ。
+        let mut c = RoomClient::for_room(&match_room());
+        joined(&mut c, ROOM_ANSWER, 0);
+        c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+        c.submit_code("AnswerCode").unwrap();
+        assert_eq!(c.on_transport_failed(), failed(Why::Lost));
+        assert_eq!(c.poll(t(40)), vec![]);
+        // answerの後pollより先にサーバーが相手の抜けを知らせたら成立にしない。
+        let mut c = RoomClient::for_room(&match_room());
+        joined(&mut c, ROOM_ANSWER, 0);
+        c.on_text(t(30), r#"{"t":"peer","code":"OfferCode"}"#);
+        c.submit_code("AnswerCode").unwrap();
+        assert_eq!(
+            c.on_text(t(35), r#"{"t":"error","code":"peer_left"}"#),
+            vec![Action::Notify(Event::Failed(Failure::PeerLeft))]
+        );
+    }
+
+    #[test]
+    fn each_side_keeps_the_ticket_of_its_own_message_after_the_room_is_done() {
+        let ticket = SeatTicket::parse(TICKET).unwrap();
+        let matched = format!(r#"{{"t":"matched","expires_at":1790000065,"ticket":"{TICKET}"}}"#);
+        let peer = format!(r#"{{"t":"peer","code":"OfferCode","ticket":"{TICKET}"}}"#);
+
+        let mut host = RoomClient::new();
+        joined(&mut host, ROOM_OFFER, 0);
+        host.submit_code("OfferCode").unwrap();
+        assert_eq!(host.ticket(), None);
+        host.on_text(t(100), &matched);
+        assert_eq!(host.ticket(), Some(ticket));
+        // 始める側へ来るpeerのチケットは読まない（サーバーは載せない）。
+        host.on_text(
+            t(200),
+            r#"{"t":"peer","code":"AnswerCode","ticket":"0.0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        );
+        assert_eq!(host.state(), State::Done);
+        assert_eq!(host.ticket(), Some(ticket), "手順を終えた後も残す");
+
+        let mut guest = RoomClient::new();
+        joined(&mut guest, ROOM_ANSWER, 0);
+        assert_eq!(
+            guest.on_text(t(30), &peer),
+            vec![Action::Notify(Event::PeerCode("OfferCode".into()))]
+        );
+        assert_eq!(guest.ticket(), Some(ticket));
+        guest.submit_code("AnswerCode").unwrap();
+        guest.on_close(1000);
+        assert_eq!(guest.ticket(), Some(ticket));
+
+        // チケットの無い成立（古いサーバー・鍵の無いサーバー）も手順は同じに進む。
+        let mut plain = RoomClient::new();
+        joined(&mut plain, ROOM_ANSWER, 0);
+        plain.on_text(t(30), r#"{"t":"peer","code":"OfferCode","ticket":"bad"}"#);
+        assert_eq!(plain.state(), State::NeedOwnCode);
+        assert_eq!(plain.ticket(), None);
+    }
+
     #[test]
     fn a_refusing_offer_side_stays_until_the_room_expires_and_only_the_offer_side_may_refuse() {
         let mut c = RoomClient::new();
@@ -2319,11 +3046,11 @@ mod tests {
             Err(SubmitError::NotNow(State::Refusing)),
             "断った後に offer を出さない"
         );
-        // ping は続け、pong では終わらない。
+        // pingは続け、pongでは終わらない。
         assert_eq!(c.poll(t(PING_INTERVAL_MS)), vec![send(PING_TEXT)]);
         assert_eq!(c.on_text(t(PING_INTERVAL_MS + 10), PONG_TEXT), vec![]);
         assert!(!c.is_finished());
-        // ルームの期限の 4408 で終わる（配る側は入り直して、また断る）。
+        // ルームの期限の4408で終わる（配信側は入り直してまた断る）。
         assert_eq!(
             c.on_close(4408),
             vec![Action::Notify(Event::Failed(Failure::Expired))]
@@ -2488,7 +3215,7 @@ mod tests {
                 make().on_text(t(40), r#"{"t":"error","code":"zzz"}"#),
                 failed(Why::ErrorMessage(None))
             );
-            // error の文の後に閉じる番号が来ても、もう何も知らせない（先に来た方で終える）。
+            // errorの文の後に閉じる番号が来てももう何も知らせない（先に来た方で終える）。
             let mut c = make();
             c.on_text(t(40), r#"{"t":"error","code":"expired"}"#);
             assert_eq!(c.on_close(4408), vec![]);
@@ -2537,7 +3264,7 @@ mod tests {
         joined(&mut c, ROOM_ANSWER, 0);
         assert_eq!(c.deadline_at(), Some(20 + 300_000 + DEADLINE_GRACE_MS));
 
-        // 時計のずれ: 利用者の時計が 1 時間進んでいる（残りが負）・1 時間遅れている（残りが上限より長い）。
+        // 時計のずれ: 利用者の時計が1時間進んでいる（残りが負）・1時間遅れている（残りが上限より長い）。
         for skew in [3_600i64, -3_600] {
             let mut c = RoomClient::new();
             c.on_upgraded(t(0));
@@ -2552,7 +3279,7 @@ mod tests {
                 "skew {skew}"
             );
         }
-        // 残りがちょうど 0 も上限で代える（サーバーは期限の過ぎたルームに入れないので、0 はずれの印）。
+        // 残りがちょうど0も上限で代える（サーバーは期限の過ぎたルームに入れないので0は時計のずれを示す）。
         let mut c = RoomClient::new();
         c.on_upgraded(t(0));
         c.on_text(
@@ -2576,7 +3303,7 @@ mod tests {
         assert!(!has_failure(&c.poll(t(d - 1))), "期限の 1 ms 前は切れない");
         assert_eq!(c.poll(t(d)), expired());
 
-        // 始める側: ルームの残りが answer の期限より短ければそちら（時計のずれで matched の値が使えず上限 60 秒、ルームの残りは 30 秒）。
+        // 始める側: ルームの残りがanswerの期限より短ければそちら（時計のずれでmatchedの値が使えず上限60秒、ルームの残りは30秒）。
         let mut c = RoomClient::new();
         c.on_upgraded(t(0));
         c.on_text(
@@ -2685,7 +3412,7 @@ mod tests {
         assert_eq!(c.poll(t(60_000)), vec![send(PING_TEXT)]);
         assert_eq!(c.silence_deadline_at(), Some(150_000));
 
-        // answer の期限が NoPong より先に来る（期限が優先）。
+        // answerの期限がNoPongより先に来る（期限が優先）。
         let mut c = RoomClient::new();
         joined(&mut c, ROOM_ANSWER, 0);
         c.poll(t(30_000));
@@ -2722,7 +3449,7 @@ mod tests {
         assert_ne!(spec, own);
         assert_eq!(
             RoomName::parse(spec.as_str()),
-            Err(RoomNameError::NotAscii { pos: 1 })
+            Err(RoomNameError::ReservedPrefix)
         );
         assert_eq!(RoomName::parse_server_rules(spec.as_str()), Ok(spec));
         assert_eq!(spec.path(), "/v0/rooms/w.2cb5ddf410150fdf");
@@ -2736,7 +3463,7 @@ mod tests {
             .spectate_of();
         assert_eq!(longest.as_str().len(), 18);
         assert!(RoomName::parse_server_rules(longest.as_str()).is_ok());
-        // 利用者が打てる名（ASCII の英数字と - _）は `w.` で始まれない。`w` で始まる名は別の文字（`.` が無い）。
+        // `w.`で始まる名は打てない。`w`だけで始まる名は打てるが、観戦用の名とは別の文字列。
         assert_ne!(
             RoomName::parse("w2cb5ddf410150fdf").unwrap().as_str(),
             spec.as_str()

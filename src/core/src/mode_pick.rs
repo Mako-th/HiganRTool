@@ -1,8 +1,11 @@
-//! 対戦の形（rollback か delay 方式か・rollback の入力の遅れ D）を、接続コードのウィンドウで選ぶための決まり。
+//! 対戦の形（rollbackかdelay方式か・rollbackの入力の遅れD）を接続コードのウィンドウで選ぶための決まり。
 //!
-//! ウィンドウ（ローダー）は打たれた文字を読んで `mode.txt` を書き、dll の見張りがそれを読む。文字の読み方・ファイルの形・ini の `mode` / `delay` の読み方は両者で同じでなければならず（食い違うとウィンドウは「delay 方式」と言うのに dll は rollback を名乗る）、dll のクレートはローダーから引けないので core に定義する。Win32 にもゲームのメモリにも触らない。
-//! - 選べるもの（`Pick`）: 打つ文字は `0`〜`8`（rollback の入力の遅れ D のフレーム数。範囲は `delay_pick::bounds`）と `delay`（delay 方式）だけ。前後の空白は落とし、`delay` は大文字・小文字を問わず、数字は全角（`０`〜`８`）も受ける。`9`（`delay_pick::AUTO`）はウィンドウの選択ではない。接続コードは 100 文字を越える base64url なので、これらの文字と一致しえない。
-//! - 受け渡しのファイル `mode.txt`（`code_files::MODE_FILE`）は `pid = <対象のゲームのプロセス番号>` と `pick = <選択>` の 2 行（書式は ini と同じ。`ini::parse`）。dll は自分の番号と一致するときだけ使う（置き場 `code\` は実行をまたいで残るので、前の実行の選択を今の実行が黙って使わないため）。
+//! ウィンドウ（ローダー）は打たれた文字を読んで`mode.txt`を書き、dllの監視の処理がそれを読む。
+//! 文字の読み方・ファイルの形・iniの`mode` / `delay`の読み方は両者で同じでなければならない（食い違うとウィンドウは「delay 方式」と言うのにdllはrollbackを名乗る）。
+//! dllのクレートはローダーから参照できないのでcoreに定義する。
+//! Win32にもゲームのメモリにも触らない。
+//! - 選べるもの（`Pick`）: 打つ文字は`0`〜`8`（rollbackの入力の遅れDのフレーム数。範囲は`delay_pick::bounds`）と`delay`（delay方式）だけ。前後の空白は落とす。`delay`は大文字・小文字を問わない。数字は全角（`０`〜`８`）も受ける。`9`（`delay_pick::AUTO`）はウィンドウの選択ではない。接続コードは100文字を越えるbase64urlなのでこれらの文字と一致しえない。
+//! - 受け渡しのファイル`mode.txt`（`code_files::MODE_FILE`）は`pid = <対象のゲームのプロセス番号>`と`pick = <選択>`の2行（書式はiniと同じ。`ini::parse`）。dllは自分の番号と一致するときだけ使う（置き場`code\`は実行をまたいで残る。前の実行の選択を今の実行が黙って使わないため）。
 
 #![forbid(unsafe_code)]
 
@@ -11,26 +14,27 @@ use crate::ini::{self, Ini};
 use crate::rollback;
 use crate::wire::Mode;
 
-/// 望むモードの既定（ini の `mode`）。オフにするなら `mode = delay`。
+/// 望むモードの既定（iniの`mode`）。オフにするなら`mode = delay`。
 pub const DEFAULT_MODE: Mode = Mode::Rollback;
 
-/// 選べる D の上限。マッチ中の Ctrl＋数字・ウィンドウで打つ文字・ホストがゲストの要求を詰める範囲の上限（引く先は `delay_pick::bounds`）。
-/// リング（128 枠）はマッチ中の `apply − F` が R + D ≤ 24 で余り、要求の期間（INPUT 1 通のワードは最大 32）は D = 8 で往復 400 ms まで。
+/// 選べるDの上限。マッチ中のCtrl＋数字・ウィンドウで打つ文字・ホストがゲストの要求を詰める範囲の上限（取得先は`delay_pick::bounds`）。
+/// リング（128枠）はマッチ中の`apply − F`が R + D ≤ 24 で余る。
+/// 要求の期間（INPUT 1通のワードは最大32）は D = 8 で往復400 msまで。
 pub const MAX_PICK_DELAY: u8 = 8;
 
-/// ini の遅延のキー。メニューの「ディレイ」は 1 つなので、rollback の D と delay 方式の希望 latency の両方をこの 1 つから作る。
+/// iniの遅延のキー。メニューの「ディレイ」は1つなのでrollbackのDとdelay方式の希望latencyの両方をこの1つから作る。
 pub const DELAY_KEY: &str = "delay";
 
-/// ini の `mode` と `delay` から決まる、この実行の既定の形。
+/// iniの`mode`と`delay`から決まるこの実行の既定の形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
     pub mode: Mode,
-    /// rollback のときの D（`delay = auto` なら既定値 `rollback::DEFAULT_DELAY`。auto かは `ini_delay` で見る）。
+    /// rollbackのときのD（`delay = auto`なら既定値`rollback::DEFAULT_DELAY`。autoかは`ini_delay`で見る）。
     pub delay: u8,
 }
 
-/// ini の `delay` の値 `v`（書いていなければ `None`）を読む。書かなければ auto。`auto`（大文字・小文字を問わない）か、
-/// 10 進か `0x` の 16 進の 0〜`MAX_PICK_DELAY`。それ以外は断る。
+/// iniの`delay`の値`v`（書いていなければ`None`）を読む。書かなければauto。
+/// 受け付けるのは`auto`（大文字・小文字を問わない）か、10進か`0x`の16進の0〜`MAX_PICK_DELAY`。それ以外は断る。
 pub fn ini_delay(v: Option<&str>) -> Result<DelayChoice, String> {
     let Some(v) = v else {
         return Ok(DelayChoice::Auto);
@@ -47,7 +51,7 @@ pub fn ini_delay(v: Option<&str>) -> Result<DelayChoice, String> {
     }
 }
 
-/// 10 進か `0x` の 16 進（dll の `net_config::num` と同じ形）。
+/// 10進か`0x`の16進（dllの`net_config::num`と同じ形）。
 fn num(s: &str, key: &str) -> Result<u64, String> {
     let r = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(h) => u64::from_str_radix(h, 16),
@@ -56,7 +60,7 @@ fn num(s: &str, key: &str) -> Result<u64, String> {
     r.map_err(|_| format!("{key} の値 {s:?} が数値として読み取り不能"))
 }
 
-/// ini の `mode` と `delay` を読む。`get` はキー → 値。値の誤りは理由つきで断る。
+/// iniの`mode`と`delay`を読む。`get`はキー → 値。値の誤りは理由つきで断る。
 pub fn ini_shape<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Result<Shape, String> {
     let mode = match get("mode") {
         None => DEFAULT_MODE,
@@ -75,7 +79,7 @@ pub fn ini_shape<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Result<Shape, Str
     Ok(Shape { mode, delay })
 }
 
-/// ini の本文の `[section]` から `ini_shape`。読めない ini は None。
+/// iniの本文の`[section]`から`ini_shape`。読めないiniはNone。
 pub fn ini_shape_of_text(text: &str, section: &str) -> Option<Result<Shape, String>> {
     let ini: Ini = ini::parse(text).ok()?;
     Some(ini_shape(|k| ini.get(section, k)))
@@ -89,7 +93,7 @@ pub enum Pick {
 }
 
 impl Pick {
-    /// ウィンドウに打たれた文字（`choose`・ファイルの `pick` の値も）。読めなければ None（接続コードとして扱う側へ戻る）。
+    /// ウィンドウに打たれた文字（`choose`・ファイルの`pick`の値も）。読めなければNone（接続コードとして扱う側へ戻る）。
     pub fn parse(s: &str) -> Option<Pick> {
         let t = s.trim().trim_start_matches('\u{FEFF}').trim();
         if t.eq_ignore_ascii_case("delay") {
@@ -100,7 +104,7 @@ impl Pick {
         if rest.is_some() {
             return None;
         }
-        // ASCII の 0〜9 と全角の ０〜９。範囲の外（auto の 9 を含む）は選択ではない。
+        // ASCIIの0〜9と全角の ０〜９。範囲の外（autoの9を含む）は選択ではない。
         let d = match c {
             '0'..='9' => c as u8 - b'0',
             '\u{FF10}'..='\u{FF19}' => (c as u32 - 0xFF10) as u8,
@@ -109,7 +113,7 @@ impl Pick {
         (d <= crate::delay_pick::bounds(Mode::Rollback).1).then_some(Pick::Rollback(d))
     }
 
-    /// `parse` が読める ASCII の文字（ファイルと run に書く形）。
+    /// `parse`が読めるASCIIの文字（ファイルとrunに書く形）。
     pub fn token(self) -> String {
         match self {
             Pick::Rollback(d) => d.to_string(),
@@ -131,7 +135,7 @@ pub enum FileRead {
     Mine(Pick),
     /// 別の実行のもの（前の実行の残り。使わない）。
     OtherRun { pid: u32 },
-    /// 読めない（形が違う・文字が足りない・UTF-8 でない）。使わない。
+    /// 読めない（形が違う・文字が足りない・UTF-8でない）。使わない。
     Unreadable,
 }
 
@@ -234,7 +238,7 @@ mod tests {
             assert_eq!(Pick::parse(c), None, "{c}");
             assert!(c.chars().count() >= code::MIN_CODE_CHARS, "{c}");
         }
-        // 選択の文字（最長は `delay` の 5 文字）は、どの接続コードよりもずっと短い。
+        // 選択の文字（最長は`delay`の5文字）はどの接続コードよりもずっと短い。
         assert!(code::MIN_CODE_CHARS > "delay".len() * 8);
     }
 
@@ -302,7 +306,7 @@ mod tests {
                 delay: 1
             })
         );
-        // 古いキーは読まない（D は `delay` だけから。書いていなければ auto の数）。
+        // 古いキーは読まない（Dは`delay`だけから。書いていなければautoの数）。
         assert_eq!(
             shape("[netplay]\nrollback_delay = 5\nlatency = 6\n")
                 .unwrap()

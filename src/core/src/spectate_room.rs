@@ -1,49 +1,60 @@
-//! 観戦用のルーム（インターネット越しの観戦）の**入り直しの判断**の状態機械 2 つ: 配る側 [`Caster`]（マッチのホストの dll）と観戦者 [`Joiner`]（観戦者の dll）。
+//! 観戦用のルーム（インターネット越しの観戦）の**入り直しの判断**のステートマシン2つ: 配信側[`Caster`]（マッチのホストのdll）と観戦者[`Joiner`]（観戦者のdll）。
 //!
-//! ルームサーバーの手順は対戦と同じ（2 人・先に入った方が `host`、後からが `guest`。ルーム名は `RoomName::spectate_of`）。配る側が先に入って観戦用のコード（種別 3）を offer し、観戦者が後から入って `peer` で受け、返し（種別 4）を answer で返す。1 回のルームのやり取りは `room::RoomClient` と dll の `net_room::RoomConn` が持ち、**ここはその外側**: いつ接続し直すか・何回まで接続するか・いつ諦めるかだけを決める。
-//! ソケットも時計も持たない（`now` は単調な ms を呼び手が渡す）。確保しない。見張りのスレッドで回す（ゲームのスレッドでは呼ばない）。
-//! `poll` は [`Caster::next_wake`] / [`Joiner::next_wake`] の時刻か、それより前に呼ぶ。
-//! **入る回数の歯止め**: サーバーは 1 IP（IPv6 は /64）あたり 60 秒に 30 回までで 429 を返し、対戦のルームの入室や同じ家の別の PC も数える。
-//! そこでどの 60 秒の期間でも、この機械が入る回数は [`ENTRY_WINDOW_MAX`]（8）回を越えないことを保証する（`window_limited`）。
-//! 観戦者は別に、全体で 30 分（[`JOINER_GIVE_UP_MS`]）待っても会えなければ諦める（`JoinerFailure::GaveUp`）。配る側が観戦を断っていれば（4403）すぐ終わる。
+//! ルームサーバーの手順は対戦と同じ（2人・先に入った方が`host`・後からが`guest`。ルーム名は`RoomName::spectate_of`）。
+//! 配信側が先に入って観戦用のコード（種別3）をofferする。観戦者が後から入って`peer`で受け取り、返答（種別4）をanswerで返す。
+//! 1回のルームのやり取りは`room::RoomClient`とdllの`net_room::RoomConn`が持つ。
+//! **ここはその外側**: いつ接続し直すか・何回まで接続するか・いつ諦めるかだけを決める。
+//! ソケットも時計も持たない（`now`は単調なmsを呼び手が渡す）。確保しない。監視スレッドで回す（ゲームのスレッドでは呼ばない）。
+//! `poll`は[`Caster::next_wake`] / [`Joiner::next_wake`]の時刻以前に呼ぶ。
+//! **入る回数の制限**: サーバーは1 IP（IPv6は /64）あたり60秒に30回までで429を返す。対戦のルームの入室や同じ家の別のPCも数える。
+//! そこでどの60秒の期間でも、このステートマシンが入る回数は[`ENTRY_WINDOW_MAX`]（8）回を越えないことを保証する（`window_limited`）。
+//! 観戦者は別に全体で30分（[`JOINER_GIVE_UP_MS`]）待っても会えなければ諦める（`JoinerFailure::GaveUp`）。
+//! 配信側が観戦を断っていれば（4403）すぐ終わる。
 
 use crate::code::CodeError;
-use crate::room::{Failure, Role, Why};
+use crate::room::{DEADLINE_GRACE_MS, Failure, Role, WATCH_ANSWER_TTL_MS, Why};
 
-// ---------------- 決めた値 ----------------
+// ---------------- 定数 ----------------
 
-/// 入る回数を数える期間の長さ（ms）。サーバーの回数制限の期間と同じ 60 秒。
+/// 入る回数を数える期間の長さ（ms）。サーバーの回数制限の期間と同じ60秒。
 pub const ENTRY_WINDOW_MS: u64 = 60_000;
-/// どの [`ENTRY_WINDOW_MS`] の期間でも越えない入る回数。サーバーの上限に対し、同じ IP の別の接続（対戦のルームの入室など）の
-/// 分の余裕を残した値。
+/// どの[`ENTRY_WINDOW_MS`]の期間でも越えない入る回数。
+/// サーバーの上限に対して同じIPの別の接続（対戦のルームの入室など）の分の余裕を残した値。
 pub const ENTRY_WINDOW_MAX: usize = 8;
 
-/// 配る側: 自分の外側のアドレスが変わって観戦用のコードを作り直すとき、入り直すまで（ms）。サーバーは同じ cid の前の入室を閉じるので待たない。
+/// 配信側: 自分の外側のアドレスが変わって観戦用のコードを作り直すときに入り直すまで（ms）。サーバーは同じcidの前の入室を閉じるので待たない。
 pub const CASTER_REMAP_MS: u64 = 0;
-/// 配る側: 1000（手順を終えた）の後、入り直すまでの最短（ms）。観戦者が答えを預けてから穴あけを始めるまでの間を空けず、
-/// 連続した入室で期間内の回数を使い切らない間隔。
+/// 配信側: 1000（手順を終えた）の後に入り直すまでの最短（ms）。
+/// 観戦者が答えを登録してから穴あけを始めるまでの間を空けず、連続した入室で期間内の回数を使い切らない間隔。
 pub const CASTER_REJOIN_MS: u64 = 2_000;
-/// 配る側: 役 `guest`（観戦者が一瞬いた）を受けて閉じた後、入り直すまで（ms）。
+/// 配信側: 役`guest`（観戦者が一瞬いた）を受けて閉じた後に入り直すまで（ms）。
 pub const CASTER_WRONG_ROLE_MS: u64 = 5_000;
-/// 配る側: 4408（ルームの期限）の後、入り直すまで（ms）。ルームの期限切れは正常な繰り返しなのですぐ。
+/// 配信側: 4408（ルームの期限）の後に入り直すまで（ms）。ルームの期限切れは正常な繰り返しなのですぐ入り直す。
 pub const CASTER_EXPIRED_MS: u64 = 0;
-/// 配る側: 4410（相手が抜けた）の後、入り直すまで（ms）。
+/// 配信側: 4410（相手が抜けた）の後に入り直すまで（ms）。
 pub const CASTER_PEER_LEFT_MS: u64 = 2_000;
-/// 配る側: 409（ルームが満員）の後、入り直すまで（ms）。
+/// 配信側: 席を持っている間に来た4410（より新しいチケットの配信側に席を渡した）の後と、その後の入室も役`guest`だったときに入り直すまで（ms。5分）。
+/// 同じルーム名で後から対戦を成立させた人が席を持つ間は、5秒ごとに入り直さない（その人が抜ければ次の入室で席が戻る）。
+pub const CASTER_EVICTED_MS: u64 = 5 * 60 * 1000;
+/// 配信側: 観戦者がコードを受け取った（`matched`）後に外側のアドレスが変わったとき、閉じて入り直すまでの最短（ms。`matched`から）。
+/// サーバーはこの観戦者を`WATCH_ANSWER_TTL_MS`で閉じる。
+/// それを過ぎても席にいれば、後から来る観戦者へ古い候補のコードを渡し続けていることになる。
+pub const CASTER_REMAP_AFTER_MATCH_MS: u64 = WATCH_ANSWER_TTL_MS + DEADLINE_GRACE_MS;
+/// 配信側: 409（ルームが満員）の後に入り直すまで（ms）。
 pub const CASTER_ROOM_FULL_MS: u64 = 10_000;
-/// 配る側: サーバーが応答しないときの最初の待ち（ms）。続けるたびに倍にする。
+/// 配信側: サーバーが応答しないときの最初の待ち（ms）。続けるたびに倍にする。
 pub const CASTER_UNRESPONSIVE_FIRST_MS: u64 = 30_000;
-/// 配る側: サーバーが応答しない間の待ちの上限（ms。5 分）。
+/// 配信側: サーバーが応答しない間の待ちの上限（ms。5分）。
 pub const CASTER_UNRESPONSIVE_MAX_MS: u64 = 5 * 60 * 1000;
 
-/// 観戦者: 役 `host`（配る側がいない）・409・4408・4410 の後、入り直すまで（ms）。12 秒なら 60 秒に 5 回で期間の 8 回に収まる。
+/// 観戦者: 役`host`（配信側がいない）・409・4408・4410の後に入り直すまで（ms）。12秒なら60秒に5回で期間の8回に収まる。
 pub const JOINER_RETRY_MS: u64 = 12_000;
-/// 観戦者: 始めてから、配る側に会えないまま諦めるまでの全体の長さ（ms。30 分）。
+/// 観戦者: 始めてから配信側に会えないまま諦めるまでの全体の長さ（ms。30分）。
 pub const JOINER_GIVE_UP_MS: u64 = 30 * 60 * 1000;
 
-/// 429 の `retry_after` を待つ長さの下限（ms）。0 秒と言われても、休まずに接続し続けない。
+/// 429の`retry_after`を待つ長さの下限（ms）。0秒と言われても休まずに接続し続けない。
 pub const RETRY_AFTER_MIN_MS: u64 = 1_000;
-/// 429 の `retry_after` を待つ長さの上限（ms）。サーバーの値が壊れていても何年も待たない。
+/// 429の`retry_after`を待つ長さの上限（ms）。サーバーの値が壊れていても何年も待たない。
 pub const RETRY_AFTER_MAX_MS: u64 = 5 * 60 * 1000;
 
 fn retry_after_ms(secs: u32) -> u64 {
@@ -52,8 +63,8 @@ fn retry_after_ms(secs: u32) -> u64 {
 
 // ---------------- 入る回数の期間 ----------------
 
-/// 入った時刻の直近 [`ENTRY_WINDOW_MAX`] 回を持つリングバッファ。新しい入室は、その最も古い入室から [`ENTRY_WINDOW_MS`] 以上
-/// 空いたときだけ許す。
+/// 入った時刻の直近[`ENTRY_WINDOW_MAX`]回を持つリングバッファ。
+/// 新しい入室はその最も古い入室から[`ENTRY_WINDOW_MS`]以上空いたときだけ許す。
 #[derive(Debug, Clone, Copy)]
 struct EntryWindow {
     times: [u64; ENTRY_WINDOW_MAX],
@@ -66,12 +77,12 @@ impl EntryWindow {
         total: 0,
     };
 
-    /// 次に入ってよい最初の時刻。8 回に満たなければ 0。
+    /// 次に入ってよい最初の時刻。8回に満たなければ0。
     fn allowed_at(&self) -> u64 {
         if self.total < ENTRY_WINDOW_MAX as u64 {
             return 0;
         }
-        // 次に上書きされる枠 = 8 回前の入室。
+        // 次に上書きされる枠 = 8回前の入室。
         let oldest = self
             .times
             .get((self.total % ENTRY_WINDOW_MAX as u64) as usize)
@@ -103,24 +114,26 @@ impl EntryWindow {
 /// 入り直しを待っている理由（状態の表示と記録用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
-    /// 始めたばかり（最初の入室。待ちは 0）。
+    /// 始めたばかり（最初の入室。待ちは0）。
     Start,
-    /// 配る側: 1000 で 1 人ぶんの手順を終えた。
+    /// 配信側: 1000で1人ぶんの手順を終えた。
     Done,
-    /// 4408（ルーム・answer の期限）。
+    /// 4408（ルーム・answerの期限）。
     Expired,
     /// 4410（相手が抜けた）。
     PeerLeft,
-    /// 役が合わなかった（配る側: 役 `guest`。観戦者: 役 `host` = 配る側がまだいない）。
+    /// 役が合わなかった（配信側: 役`guest`。観戦者: 役 `host` = 配信側がまだいない）。
     WrongRole,
     /// 409（ルームが満員）。
     RoomFull,
     /// 429。
     RateLimited { retry_after_secs: u32 },
-    /// サーバーが応答しない（`consecutive` は続けて何回目か）。配る側だけ。
+    /// サーバーが応答しない（`consecutive`は続けて何回目か）。配信側だけ。
     Unresponsive { consecutive: u32 },
-    /// 配る側: 外側のアドレスが変わり、預けたコードを作り直す。
+    /// 配信側: 外側のアドレスが変わり、登録したコードを作り直す。
     Remapped,
+    /// 配信側: より新しいチケットの配信側が席を持っている（4410で席を渡した・入り直しても役`guest`）。
+    Evicted,
 }
 
 // ---------------- 配る側 ----------------
@@ -128,10 +141,10 @@ pub enum WaitReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasterAction {
     Connect,
-    /// 観戦用のコードを**いまの時刻から新しい期限で**作り、`RoomClient::submit_code` で offer せよ。
+    /// 観戦用のコードを**いまの時刻から新しい期限で**作り、`RoomClient::submit_code`でofferせよ。
     MakeOffer,
-    /// 観戦者の返し（`peer` の文字）。`code::read_spectate_reply` で読み、読めたら候補から `spectate::PunchPlan` を作って
-    /// 受信スレッドへ渡せ（読めなければ捨てる）。
+    /// 観戦者の返答（`peer`の文字列）。
+    /// `code::read_spectate_reply`で読み、読めたら候補から`spectate::PunchPlan`を作って受信スレッドへ渡せ（読めなければ捨てる）。
     Punch(String),
     Close,
 }
@@ -141,37 +154,43 @@ pub enum CasterPhase {
     /// 接続していない。次の入室を待っている（`CasterStatus::next_entry_at`）。
     Waiting,
     Joining,
-    /// 役 `host` でルームにいる。観戦者を待っている（offer を預けた後）。
+    /// 役`host`でルームにいる。観戦者を待っている（offerを登録した後）。
     Casting,
+    /// サーバーがチケットを受け付けない（400 `bad_ticket`）。入り直しても変わらないのでもう入らない。
+    GaveUp,
     Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CasterStatus {
     pub phase: CasterPhase,
-    /// `Waiting` のとき、次に入る時刻（ms。待ちと入る回数の歯止めの遅い方）。
+    /// `Waiting`のときに次に入る時刻（ms。待ちと入る回数の制限の遅い方）。
     pub next_entry_at: Option<u64>,
     /// いちばん最近の待ちの理由（入った後も次の待ちまで残る）。
     pub last_wait: Option<WaitReason>,
-    /// 次の入室が、入る回数の歯止めで予定より遅れているか。
+    /// 次の入室が入る回数の制限で予定より遅れているかどうか。
     pub window_limited: bool,
     pub entries_in_window: usize,
     pub entries_total: u64,
-    /// サーバーが応答しない失敗が続いている回数（ほかの失敗か 1000 で 0 に戻る）。
+    /// サーバーが応答しない失敗が続いている回数（ほかの失敗か1000で0に戻る）。
     pub unresponsive_streak: u32,
 }
 
-/// 配る側（マッチのホストの dll）の入り直しの判断。止められるまで、ルームに入り直し続ける。
+/// 配信側（マッチのホストのdll）の入り直しの判断。止められるまでルームに入り直し続ける。
 #[derive(Debug, Clone, Copy)]
 pub struct Caster {
     phase: CasterPhase,
-    /// `Waiting` のとき、表の待ちだけで決まる入室の時刻（歯止めは別に見る）。
+    /// `Waiting`のときに表の待ちだけで決まる入室の時刻（入る回数の制限は別に見る）。
     wait_until: u64,
     last_wait: Option<WaitReason>,
     window: EntryWindow,
     streak: u32,
-    /// この入室で観戦者が来た（`matched`）。来た後は預けたコードで手順を終えさせる。
-    matched: bool,
+    /// この入室で観戦者が来た（`matched`）時刻。来た後は登録したコードで手順を終えさせる。
+    matched_at: Option<u64>,
+    /// 観戦者が来た後に外側のアドレスが変わった。`CASTER_REMAP_AFTER_MATCH_MS`を過ぎても席にいれば閉じて入り直す。
+    remap_pending: bool,
+    /// より新しいチケットの配信側に席を渡した。役`host`で入れるまで入り直しの間隔を`CASTER_EVICTED_MS`にする。
+    evicted: bool,
 }
 
 impl Caster {
@@ -182,7 +201,9 @@ impl Caster {
             last_wait: Some(WaitReason::Start),
             window: EntryWindow::NEW,
             streak: 0,
-            matched: false,
+            matched_at: None,
+            remap_pending: false,
+            evicted: false,
         }
     }
 
@@ -196,38 +217,69 @@ impl Caster {
         self.last_wait = Some(why);
     }
 
-    /// 入る時刻になっていれば `Connect`（このとき入る回数を 1 つ数える）。
+    /// 観戦者が来た後の外側のアドレスの変化で閉じて入り直す時刻。
+    fn remap_close_at(&self) -> Option<u64> {
+        (self.phase == CasterPhase::Casting && self.remap_pending).then(|| {
+            self.matched_at
+                .map_or(0, |m| m.saturating_add(CASTER_REMAP_AFTER_MATCH_MS))
+        })
+    }
+
+    /// 入る時刻になっていれば`Connect`（このとき入る回数を1つ数える）。
+    /// 観戦者が来た後に外側のアドレスが変わっていて、その観戦者の答えの期限を過ぎても席にいれば`Close`。
     pub fn poll(&mut self, now: u64) -> Option<CasterAction> {
+        if self.remap_close_at().is_some_and(|at| now >= at) {
+            self.wait(now, CASTER_REMAP_MS, WaitReason::Remapped);
+            return Some(CasterAction::Close);
+        }
         if self.phase == CasterPhase::Waiting && now >= self.next_entry() {
             self.window.record(now);
             self.phase = CasterPhase::Joining;
-            self.matched = false;
+            self.matched_at = None;
+            self.remap_pending = false;
             return Some(CasterAction::Connect);
         }
         None
     }
 
-    /// 次に `poll` を呼ぶべき時刻（ms）。待っていなければ `None`（出来事が来るまで）。
+    /// 次に`poll`を呼ぶべき時刻（ms）。待っていなければ`None`（イベントが来るまで）。
     pub fn next_wake(&self) -> Option<u64> {
-        (self.phase == CasterPhase::Waiting).then(|| self.next_entry())
+        if self.phase == CasterPhase::Waiting {
+            return Some(self.next_entry());
+        }
+        self.remap_close_at()
     }
 
-    /// サーバーの `matched`（観戦者が預けたコードを受け取った）。
-    pub fn on_matched(&mut self) {
-        if self.phase == CasterPhase::Casting {
-            self.matched = true;
+    /// サーバーの`matched`（配信側が登録したコードを観戦者が受け取った）。観戦用のルームでは1回の入室で1度しか来ない。
+    /// 答えずに抜けた観戦者の後に来る観戦者のことは、配信側には知らされない。
+    pub fn on_matched(&mut self, now: u64) {
+        if self.phase == CasterPhase::Casting && self.matched_at.is_none() {
+            self.matched_at = Some(now);
         }
     }
 
-    /// 自分の外側のアドレスが変わり、観戦用のコードの候補を作り直した。預けたコードを誰も受け取っていなければ、閉じて
-    /// 入り直す（`Close`。新しい入室で新しいコードを預ける）。観戦者が受け取った後は、閉じずにその手順を観戦者に終えさせる（次の入室で新しいコード）。
+    /// 自分の外側のアドレスが変わり、観戦用のコードの候補を作り直した。
+    /// 登録したコードを誰も受け取っていなければ閉じて入り直す（`Close`。新しい入室で新しいコードを登録する）。
+    /// 観戦者が受け取った後はその観戦者の答えの期限（`CASTER_REMAP_AFTER_MATCH_MS`）までは閉じずに手順を終えさせる。
+    /// 期限を過ぎても席にいれば`poll`が閉じる。
     /// 入る前・入っている途中は何もしない（入ったときに作るコードがもう新しい）。
     pub fn on_remapped(&mut self, now: u64) -> Option<CasterAction> {
-        if self.phase != CasterPhase::Casting || self.matched {
+        if self.phase != CasterPhase::Casting {
+            return None;
+        }
+        if let Some(m) = self.matched_at
+            && now < m.saturating_add(CASTER_REMAP_AFTER_MATCH_MS)
+        {
+            self.remap_pending = true;
             return None;
         }
         self.wait(now, CASTER_REMAP_MS, WaitReason::Remapped);
         Some(CasterAction::Close)
+    }
+
+    /// より新しいチケットの配信側に席を渡した後かどうか（役`host`で入れると戻る）。
+    pub fn evicted(&self) -> bool {
+        self.evicted
     }
 
     pub fn on_joined(&mut self, now: u64, role: Role) -> Option<CasterAction> {
@@ -237,7 +289,15 @@ impl Caster {
         match role {
             Role::Offer => {
                 self.phase = CasterPhase::Casting;
+                self.evicted = false;
                 Some(CasterAction::MakeOffer)
+            }
+            // チケットの無い観戦者は空のルームで席を取れない。
+            // そのため役`guest`になるのは、自分の前の接続が残っていたか、より新しいチケットの配信側がいるかのどちらか。
+            // 席を渡した後なら後者として長く待つ。
+            Role::Answer if self.evicted => {
+                self.wait(now, CASTER_EVICTED_MS, WaitReason::Evicted);
+                Some(CasterAction::Close)
             }
             Role::Answer => {
                 self.wait(now, CASTER_WRONG_ROLE_MS, WaitReason::WrongRole);
@@ -261,13 +321,24 @@ impl Caster {
         if !matches!(self.phase, CasterPhase::Joining | CasterPhase::Casting) {
             return;
         }
-        // 4403 は観戦者にしか来ない。来たら応答しないときと同じに、ゆっくり入り直す。
+        if f == Failure::BadTicket {
+            self.phase = CasterPhase::GaveUp;
+            return;
+        }
+        // 観戦用のルームで席を持つ配信側へ4410が来るのは、より新しいチケットの配信側が席を取ったときだけ（観戦者が抜けても配信側は閉じられない）。
+        if f == Failure::PeerLeft && self.phase == CasterPhase::Casting {
+            self.streak = 0;
+            self.evicted = true;
+            self.wait(now, CASTER_EVICTED_MS, WaitReason::Evicted);
+            return;
+        }
+        // 4403は観戦者にしか来ない。来たら応答しないときと同じにゆっくり入り直す。
         if matches!(
             f,
             Failure::Unresponsive(_) | Failure::BadRoomName | Failure::Refused
         ) {
             self.streak = self.streak.saturating_add(1);
-            // 30 秒 → 60 → 120 → 240 → 300（上限）。倍にする回数は 10 で頭打ちにして溢れさせない。
+            // 30秒 → 60 → 120 → 240 → 300（上限）。倍にする回数は10で頭打ちにして溢れさせない。
             let shift = self.streak.saturating_sub(1).min(10);
             let delay = CASTER_UNRESPONSIVE_FIRST_MS
                 .saturating_mul(1u64 << shift)
@@ -285,17 +356,23 @@ impl Caster {
         match f {
             Failure::Expired => self.wait(now, CASTER_EXPIRED_MS, WaitReason::Expired),
             Failure::PeerLeft => self.wait(now, CASTER_PEER_LEFT_MS, WaitReason::PeerLeft),
-            Failure::RoomFull => self.wait(now, CASTER_ROOM_FULL_MS, WaitReason::RoomFull),
+            // room_in_useは対戦のルームにだけ返る。観戦用のルームに来たら満員と同じに待つ。
+            Failure::RoomFull | Failure::RoomInUse => {
+                self.wait(now, CASTER_ROOM_FULL_MS, WaitReason::RoomFull)
+            }
             Failure::RateLimited { retry_after_secs } => self.wait(
                 now,
                 retry_after_ms(retry_after_secs),
                 WaitReason::RateLimited { retry_after_secs },
             ),
-            Failure::Unresponsive(_) | Failure::BadRoomName | Failure::Refused => {}
+            Failure::Unresponsive(_)
+            | Failure::BadRoomName
+            | Failure::Refused
+            | Failure::BadTicket => {}
         }
     }
 
-    /// 止める（接続の片づけ）。以後 `poll` は何も返さず、出来事は無視する。
+    /// 止める（接続の後始末）。以後`poll`は何も返さず、イベントは無視する。
     pub fn stop(&mut self) {
         self.phase = CasterPhase::Stopped;
     }
@@ -320,8 +397,8 @@ impl Caster {
 pub enum JoinerAction {
     Connect,
     Close,
-    /// 観戦用のコード（`peer` の文字）。`code::read_spectate` で読み、返しを作って answer せよ。出せたら
-    /// [`Joiner::on_answer_sent`]、読めない・作れない・出せないなら [`Joiner::abort`]。
+    /// 観戦用のコード（`peer`の文字列）。`code::read_spectate`で読み、返答を作ってanswerせよ。
+    /// 出せたら[`Joiner::on_answer_sent`]を呼び、読めない・作れない・出せないなら[`Joiner::abort`]を呼べ。
     SpectateCode(String),
 }
 
@@ -330,23 +407,23 @@ pub enum JoinerAction {
 pub enum JoinerFailure {
     Unresponsive(Why),
     BadRoomName,
-    /// 観戦用のコードを読めない・返しを作れない（中は理由。バージョン違い `BadVersion` を含む）。
+    /// 観戦用のコードを読めない・返答を作れない（中は理由。バージョン違い`BadVersion`を含む）。
     CodeUnreadable(CodeError),
     ReplyNotSent,
     GaveUp,
-    /// 配る側が観戦を断っている（4403。2 人のどちらかが観戦を許可していない）。
+    /// 配信側が観戦を断っている（4403。2人のどちらかが観戦を許可していない）。
     Refused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinerPhase {
-    /// 接続していない。次の入室を待っている（`last_wait` が `WrongRole` なら「配る側を待っている」）。
+    /// 接続していない。次の入室を待っている（`last_wait`が`WrongRole`なら「配る側を待っている」）。
     Waiting,
     Joining,
-    /// 役 `guest` でルームにいる。観戦用のコードを待っている（または読んで返しを作っている）。
+    /// 役`guest`でルームにいる。観戦用のコードを待っている（または読んで返答を作っている）。
     InRoom,
     AnswerSent,
-    /// 終わり（成功）。次は `Watcher` が JOIN を送る。
+    /// 終わり（成功）。次は`Watcher`がJOINを送る。
     Succeeded,
     Failed(JoinerFailure),
     Stopped,
@@ -355,9 +432,9 @@ pub enum JoinerPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinerStatus {
     pub phase: JoinerPhase,
-    /// `Waiting` のとき、次に入る時刻（ms）。
+    /// `Waiting`のとき、次に入る時刻（ms）。
     pub next_entry_at: Option<u64>,
-    /// いちばん最近の待ちの理由。`InRoom` に入ると消える。
+    /// いちばん最近の待ちの理由。`InRoom`に入ると消える。
     pub last_wait: Option<WaitReason>,
     pub window_limited: bool,
     pub entries_in_window: usize,
@@ -366,14 +443,17 @@ pub struct JoinerStatus {
 }
 
 impl JoinerStatus {
-    /// 「相手（配る側）を待っています」と出せる状態か: 配る側がまだルームにいなかったので入り直しを待っている間。
+    /// 「相手（配る側）を待っています」と出せる状態かどうか: 配信側がまだルームにいなかったので入り直しを待っている間。
+    /// 配信側がいない観戦用のルームはサーバーがhostの役ではなく409 `room_full`で断る（`WrongRole`は古いサーバーの断り方）。
     pub fn waiting_for_caster(&self) -> bool {
-        self.last_wait == Some(WaitReason::WrongRole)
-            && matches!(self.phase, JoinerPhase::Waiting | JoinerPhase::Joining)
+        matches!(
+            self.last_wait,
+            Some(WaitReason::WrongRole | WaitReason::RoomFull)
+        ) && matches!(self.phase, JoinerPhase::Waiting | JoinerPhase::Joining)
     }
 }
 
-/// 観戦者（観戦者の dll）の入り直しの判断。配る側に会えるか、失敗するか、30 分経つまで入り直す。
+/// 観戦者（観戦者のdll）の入り直しの判断。配信側に会えるか、失敗するか、30分経つまで入り直す。
 #[derive(Debug, Clone, Copy)]
 pub struct Joiner {
     phase: JoinerPhase,
@@ -411,8 +491,8 @@ impl Joiner {
         )
     }
 
-    /// 全体の時間切れなら諦め（接続があれば `Close`）、入る時刻になっていれば `Connect`。`AnswerSent` の後は諦めない
-    /// （あと少しで 1000 が来る）。
+    /// 全体の時間切れなら諦め（接続があれば`Close`）、入る時刻になっていれば`Connect`。`AnswerSent`の後は諦めない
+    /// （あと少しで1000が来る）。
     pub fn poll(&mut self, now: u64) -> Option<JoinerAction> {
         if self.is_active() && self.phase != JoinerPhase::AnswerSent && now >= self.give_up_at {
             let connected = matches!(self.phase, JoinerPhase::Joining | JoinerPhase::InRoom);
@@ -438,7 +518,7 @@ impl Joiner {
         }
     }
 
-    /// ルームに入れた。役 `host` は、配る側がまだいない。
+    /// ルームに入れた。役`host`は配信側がまだいない。
     pub fn on_joined(&mut self, now: u64, role: Role) -> Option<JoinerAction> {
         if self.phase != JoinerPhase::Joining {
             return None;
@@ -460,7 +540,7 @@ impl Joiner {
         (self.phase == JoinerPhase::InRoom).then_some(JoinerAction::SpectateCode(text))
     }
 
-    /// answer を出した。サーバーの 1000 を待つ。
+    /// answerを出した。サーバーの1000を待つ。
     pub fn on_answer_sent(&mut self) {
         if self.phase == JoinerPhase::InRoom {
             self.phase = JoinerPhase::AnswerSent;
@@ -484,21 +564,27 @@ impl Joiner {
             Failure::Unresponsive(why) => {
                 self.phase = JoinerPhase::Failed(JoinerFailure::Unresponsive(why));
             }
-            Failure::BadRoomName => self.phase = JoinerPhase::Failed(JoinerFailure::BadRoomName),
+            // チケットは配信側だけが付けるので観戦者に400 `bad_ticket`は来ないはず。来たらルーム名が不正なときと同じに終える。
+            Failure::BadRoomName | Failure::BadTicket => {
+                self.phase = JoinerPhase::Failed(JoinerFailure::BadRoomName)
+            }
             Failure::Refused => self.phase = JoinerPhase::Failed(JoinerFailure::Refused),
             Failure::RateLimited { retry_after_secs } => self.wait(
                 now,
                 retry_after_ms(retry_after_secs),
                 WaitReason::RateLimited { retry_after_secs },
             ),
-            Failure::RoomFull => self.wait(now, JOINER_RETRY_MS, WaitReason::RoomFull),
+            Failure::RoomFull | Failure::RoomInUse => {
+                self.wait(now, JOINER_RETRY_MS, WaitReason::RoomFull)
+            }
             Failure::Expired => self.wait(now, JOINER_RETRY_MS, WaitReason::Expired),
             Failure::PeerLeft => self.wait(now, JOINER_RETRY_MS, WaitReason::PeerLeft),
         }
     }
 
-    /// dll が続けられなくなった（コードを読めない・返しを作れない・answer を出せない）。失敗で終わり、接続を閉じさせる。
-    /// 終わっている・接続していない機械には何もしない。
+    /// dllが続けられなくなった（コードを読めない・返答を作れない・answerを出せない）。
+    /// 失敗で終わり、接続を閉じさせる。
+    /// 終わっている・接続していないステートマシンには何もしない。
     pub fn abort(&mut self, why: JoinerFailure) -> Option<JoinerAction> {
         if matches!(self.phase, JoinerPhase::InRoom | JoinerPhase::AnswerSent) {
             self.phase = JoinerPhase::Failed(why);
@@ -507,7 +593,7 @@ impl Joiner {
         None
     }
 
-    /// 利用者がやめた。接続していれば `Close`。終わっていた機械の結果は書き換えない。
+    /// 利用者がやめた。接続していれば`Close`。終わっていたステートマシンの結果は書き換えない。
     pub fn stop(&mut self) -> Option<JoinerAction> {
         let connected = matches!(
             self.phase,
@@ -555,7 +641,7 @@ mod tests {
         j
     }
 
-    /// `times` のどの 60 秒の期間にも 9 回以上入っていない（期間 `[t, t + 60 秒)` の数え直し）こと。一番混む期間の入る回数を返す。
+    /// 一番混む期間の入る回数を返す。`times`のどの60秒の期間（`[t, t + 60 秒)`）にも9回以上入っていないことの検査に使う。
     fn busiest_window(times: &[u64]) -> usize {
         times
             .iter()
@@ -580,6 +666,8 @@ mod tests {
         assert_eq!(CASTER_WRONG_ROLE_MS, 5_000);
         assert_eq!(CASTER_EXPIRED_MS, 0);
         assert_eq!(CASTER_PEER_LEFT_MS, 2_000);
+        assert_eq!(CASTER_EVICTED_MS, 300_000);
+        assert_eq!(CASTER_REMAP_AFTER_MATCH_MS, 15_000);
         assert_eq!(CASTER_ROOM_FULL_MS, 10_000);
         assert_eq!(CASTER_UNRESPONSIVE_FIRST_MS, 30_000);
         assert_eq!(CASTER_UNRESPONSIVE_MAX_MS, 300_000);
@@ -631,7 +719,7 @@ mod tests {
         assert_eq!(c.poll(NOW), Some(CasterAction::Connect));
         assert_eq!(c.on_remapped(NOW + 5), None);
         assert_eq!(c.status(NOW + 5).phase, CasterPhase::Joining);
-        // 預けたコードを誰も受け取っていなければ、閉じてすぐ入り直す。
+        // 登録したコードを誰も受け取っていなければ閉じてすぐ入り直す。
         assert_eq!(
             c.on_joined(NOW + 10, Role::Offer),
             Some(CasterAction::MakeOffer)
@@ -646,8 +734,8 @@ mod tests {
             c.on_joined(NOW + 30, Role::Offer),
             Some(CasterAction::MakeOffer)
         );
-        // 観戦者が受け取った後は、その手順を壊さない。
-        c.on_matched();
+        // 観戦者が受け取った後はその手順を壊さない。
+        c.on_matched(NOW + 35);
         assert_eq!(c.on_remapped(NOW + 40), None);
         assert_eq!(c.status(NOW + 40).phase, CasterPhase::Casting);
         assert_eq!(
@@ -655,7 +743,7 @@ mod tests {
             Some(CasterAction::Punch("ReplyText".to_string()))
         );
         c.on_done(NOW + 50);
-        // 次の入室では、また閉じて入り直せる（前の入室の matched を持ち越さない）。
+        // 次の入室ではまた閉じて入り直せる（前の入室のmatchedを持ち越さない）。
         assert_eq!(
             c.poll(NOW + 50 + CASTER_REJOIN_MS),
             Some(CasterAction::Connect)
@@ -665,7 +753,7 @@ mod tests {
         // 止めた後は何もしない。
         c.stop();
         assert_eq!(c.on_remapped(NOW + 2_080), None);
-        // 入る回数の歯止めは入り直しにも効く。
+        // 入る回数の制限は入り直しにも効く。
         let mut c = Caster::new(NOW);
         let mut entries = Vec::new();
         let mut t = NOW;
@@ -678,6 +766,117 @@ mod tests {
             t += 100;
         }
         assert_eq!(busiest_window(&entries), ENTRY_WINDOW_MAX, "{entries:?}");
+    }
+
+    #[test]
+    fn a_remap_after_a_match_closes_once_the_viewers_answer_window_has_passed() {
+        let mut c = caster_joining(NOW);
+        c.on_joined(NOW, Role::Offer);
+        c.on_matched(NOW + 100);
+        // 2度目のmatchedは来ないはず。来ても最初の時刻のまま。
+        c.on_matched(NOW + 9_000);
+        assert_eq!(c.next_wake(), None, "席にいて変化が無ければ起こさない");
+        assert_eq!(c.on_remapped(NOW + 1_000), None);
+        let at = NOW + 100 + CASTER_REMAP_AFTER_MATCH_MS;
+        assert_eq!(c.next_wake(), Some(at));
+        assert_eq!(c.poll(at - 1), None);
+        assert_eq!(c.status(at - 1).phase, CasterPhase::Casting);
+        assert_eq!(c.poll(at), Some(CasterAction::Close));
+        let s = c.status(at);
+        assert_eq!(s.phase, CasterPhase::Waiting);
+        assert_eq!(s.last_wait, Some(WaitReason::Remapped));
+        assert_eq!(c.poll(at), Some(CasterAction::Connect));
+        // 次の入室には持ち越さない。
+        c.on_joined(at, Role::Offer);
+        assert_eq!(c.poll(at + 10 * CASTER_REMAP_AFTER_MATCH_MS), None);
+
+        // 期限を過ぎてからの変化はすぐ閉じる。
+        let mut c = caster_joining(NOW);
+        c.on_joined(NOW, Role::Offer);
+        c.on_matched(NOW);
+        assert_eq!(
+            c.on_remapped(NOW + CASTER_REMAP_AFTER_MATCH_MS),
+            Some(CasterAction::Close)
+        );
+
+        // 観戦者が答えて手順を終えたら変化のフラグは残らない。
+        let mut c = caster_joining(NOW);
+        c.on_joined(NOW, Role::Offer);
+        c.on_matched(NOW);
+        assert_eq!(c.on_remapped(NOW + 10), None);
+        c.on_done(NOW + 20);
+        assert_eq!(
+            c.poll(NOW + CASTER_REMAP_AFTER_MATCH_MS),
+            Some(CasterAction::Connect)
+        );
+    }
+
+    #[test]
+    fn a_caster_that_lost_its_seat_to_a_newer_ticket_returns_only_every_five_minutes() {
+        let mut c = caster_joining(NOW);
+        c.on_joined(NOW, Role::Offer);
+        assert!(!c.evicted());
+        c.on_failed(NOW + 100, Failure::PeerLeft);
+        assert!(c.evicted());
+        let s = c.status(NOW + 100);
+        assert_eq!(s.phase, CasterPhase::Waiting);
+        assert_eq!(s.last_wait, Some(WaitReason::Evicted));
+        assert_eq!(s.next_entry_at, Some(NOW + 100 + CASTER_EVICTED_MS));
+        let mut t = NOW + 100 + CASTER_EVICTED_MS;
+        assert_eq!(c.poll(t - 1), None);
+        // 新しいチケットの配信側がまだいる: 役guestを何度受けても5分ごと。
+        for _ in 0..3 {
+            assert_eq!(c.poll(t), Some(CasterAction::Connect));
+            assert_eq!(c.on_joined(t + 10, Role::Answer), Some(CasterAction::Close));
+            let s = c.status(t + 10);
+            assert_eq!(s.last_wait, Some(WaitReason::Evicted));
+            assert_eq!(s.next_entry_at, Some(t + 10 + CASTER_EVICTED_MS));
+            assert_eq!(
+                c.poll(t + 10 + CASTER_WRONG_ROLE_MS),
+                None,
+                "5 秒で入り直した"
+            );
+            t += 10 + CASTER_EVICTED_MS;
+        }
+        // 席が空けば戻り、以後の役guestは今までどおり5秒。
+        assert_eq!(c.poll(t), Some(CasterAction::Connect));
+        assert_eq!(c.on_joined(t, Role::Offer), Some(CasterAction::MakeOffer));
+        assert!(!c.evicted());
+        c.on_done(t);
+        t += CASTER_REJOIN_MS;
+        assert_eq!(c.poll(t), Some(CasterAction::Connect));
+        c.on_joined(t, Role::Answer);
+        assert_eq!(c.status(t).last_wait, Some(WaitReason::WrongRole));
+        assert_eq!(c.status(t).next_entry_at, Some(t + CASTER_WRONG_ROLE_MS));
+        // 席に着く前の4410は席を渡したことを示さない（2秒で入り直す）。
+        let mut c = caster_joining(NOW);
+        c.on_failed(NOW, Failure::PeerLeft);
+        assert!(!c.evicted());
+        assert_eq!(c.status(NOW).next_entry_at, Some(NOW + CASTER_PEER_LEFT_MS));
+    }
+
+    #[test]
+    fn a_caster_whose_ticket_the_server_refuses_gives_up_for_good() {
+        for in_room in [false, true] {
+            let mut c = caster_joining(NOW);
+            if in_room {
+                c.on_joined(NOW, Role::Offer);
+            }
+            c.on_failed(NOW + 10, Failure::BadTicket);
+            let s = c.status(NOW + 10);
+            assert_eq!(s.phase, CasterPhase::GaveUp, "{in_room}");
+            assert_eq!(s.next_entry_at, None);
+            assert_eq!(c.next_wake(), None);
+            for t in [NOW + 10, NOW + 3_600_000, u64::MAX] {
+                assert_eq!(c.poll(t), None, "{in_room} {t}");
+            }
+            c.on_done(NOW + 20);
+            c.on_failed(NOW + 30, Failure::Expired);
+            assert_eq!(c.on_remapped(NOW + 40), None);
+            assert_eq!(c.status(NOW + 40).phase, CasterPhase::GaveUp);
+            c.stop();
+            assert_eq!(c.status(NOW + 40).phase, CasterPhase::Stopped);
+        }
     }
 
     #[test]
@@ -735,6 +934,10 @@ mod tests {
         ];
         for (f, delay, why) in cases {
             for in_room in [false, true] {
+                if f == Failure::PeerLeft && in_room {
+                    // 席を持つ間の4410は席を渡したことを示す（上の検査）。
+                    continue;
+                }
                 let mut c = caster_joining(NOW);
                 if in_room {
                     c.on_joined(NOW, Role::Offer);
@@ -944,6 +1147,36 @@ mod tests {
     }
 
     #[test]
+    fn a_joiner_refused_with_room_full_shows_waiting_for_the_caster_but_other_waits_do_not() {
+        for (f, waiting) in [
+            (Failure::RoomFull, true),
+            (Failure::Expired, false),
+            (Failure::PeerLeft, false),
+            (
+                Failure::RateLimited {
+                    retry_after_secs: 5,
+                },
+                false,
+            ),
+        ] {
+            for in_room in [false, true] {
+                let mut j = joiner_joining(NOW);
+                if in_room {
+                    j.on_joined(NOW, Role::Answer);
+                }
+                j.on_failed(NOW + 10, f);
+                let s = j.status(NOW + 10);
+                assert_eq!(s.phase, JoinerPhase::Waiting, "{f:?}");
+                assert_eq!(s.waiting_for_caster(), waiting, "{f:?} in_room={in_room}");
+            }
+        }
+        // 古いサーバーの断り方（hostの役が来る）も待機中のまま。
+        let mut j = joiner_joining(NOW);
+        j.on_joined(NOW, Role::Offer);
+        assert!(j.status(NOW).waiting_for_caster());
+    }
+
+    #[test]
     fn a_joiner_retries_busy_rooms_and_fails_when_the_server_does_not_answer() {
         let cases = [
             (Failure::RoomFull, 12_000, WaitReason::RoomFull),
@@ -1035,7 +1268,7 @@ mod tests {
             assert_eq!(j.next_wake(), None);
             assert_eq!(j.poll(NOW + JOINER_GIVE_UP_MS), None, "入り直した");
         }
-        // 配る側には来ない筋。来ても止まらず、ゆっくり入り直す。
+        // 配信側には来ないはず。来ても止まらずゆっくり入り直す。
         let mut c = caster_joining(NOW);
         c.on_failed(NOW, Failure::Refused);
         assert_eq!(c.status(NOW).next_entry_at, Some(NOW + 30_000));
@@ -1138,7 +1371,7 @@ mod tests {
         }
     }
 
-    // ---------------- 乱れた出来事の列 ----------------
+    // ---------------- 乱れたイベントの列 ----------------
 
     struct Rng(u64);
     impl Rng {
@@ -1232,7 +1465,7 @@ mod tests {
             total_caster += ct.len();
             total_joiner += jt.len();
         }
-        // 母数: 配る側は 200 本で数千回入る（0 件の列では保証を見ていない）。
+        // 母数: 配信側は200本で数千回入る（0件の列では保証を見ていない）。
         assert!(total_caster > 1_000, "配る側の入室 {total_caster}");
         assert!(total_joiner > 200, "観戦者の入室 {total_joiner}");
     }

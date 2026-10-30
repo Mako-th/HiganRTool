@@ -1,20 +1,21 @@
-//! ログの簡潔 / 詳細の切り替え（pure。unsafe 無し）。
+//! ログの簡潔 / 詳細の切り替え（pure。unsafe無し）。
 //!
-//! 簡潔は「本ログ 1 本だけ。起動・ネットワーク・試合の節目・異常・終わりのまとめ」、詳細は今までの全部（CSV も）。切り替えは ini の `[log] detail`
-//! （`higanr_core::log_cfg`）。決めるのは読み取りのスレッドの始まりで、それより前の行は書くときの値で選ぶ。
-//! 詳細だけの行は `writeln!(detail_out(out), ...)`、異常と節目の行は `writeln!(out, ...)`。迷う行は簡潔に残す。
+//! 簡潔は「本ログ1本だけ。起動・ネットワーク・試合の節目・異常・終わりのまとめ」。詳細は今までの全部（CSVも）。
+//! 切り替えはiniの`[log] detail`（`higanr_core::log_cfg`）。
+//! 決めるのは読み取りのスレッドの始まりで、それより前の行は書くときの値で選ぶ。
+//! 詳細だけの行は`writeln!(detail_out(out), ...)`。異常と節目の行は`writeln!(out, ...)`。迷う行は簡潔に残す。
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 配るバージョンは簡潔、開発用は詳細（実機の検証の解析が CSV に頼っている）。
+/// 配布するバージョンは簡潔で開発用は詳細（実機の検証の解析がCSVに頼っている）。
 pub const fn default_detail(dist: bool) -> bool {
     !dist
 }
 
-/// 検査のビルドは常に詳細から始める（既存の検査は詳細の行を見る）。簡潔を見る検査は `with_detail(false, ..)` で包む。
+/// 検査のビルドは常に詳細から始める（既存の検査は詳細の行を見る）。簡潔を見る検査は`with_detail(false, ..)`で包む。
 static DETAIL: AtomicBool = AtomicBool::new(true);
 
 #[cfg(test)]
@@ -22,7 +23,7 @@ thread_local! {
     static OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// いま詳細か。
+/// いま詳細かどうか。
 pub fn detail() -> bool {
     #[cfg(test)]
     if let Some(v) = OVERRIDE.with(std::cell::Cell::get) {
@@ -31,12 +32,12 @@ pub fn detail() -> bool {
     DETAIL.load(Ordering::Relaxed)
 }
 
-/// 読み取りのスレッドの始まりで 1 回設定する。
+/// 読み取りのスレッドの始まりで1回設定する。
 pub fn set_detail(on: bool) {
     DETAIL.store(on, Ordering::Relaxed);
 }
 
-/// 検査だけ: この検査のスレッドの間だけ値を決める（検査は並列に走るので、全体の値は触らない）。
+/// 検査だけで使う。この検査のスレッドの間だけ値を決める（検査は並列に走るので全体の値は触らない）。
 #[cfg(test)]
 pub fn with_detail<R>(on: bool, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<bool>);
@@ -49,7 +50,7 @@ pub fn with_detail<R>(on: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// パスの最後の 1 要素（ログにフォルダの並びを書かないため）。
+/// パスの最後の1要素（ログにフォルダの並びを書かないため）。
 pub fn leaf(path: &str) -> &str {
     path.trim_end_matches(['\\', '/'])
         .rsplit(['\\', '/'])
@@ -57,7 +58,7 @@ pub fn leaf(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// 詳細のときだけ中へ流す書き込み先。簡潔のときは書いたことにして捨てる。
+/// 詳細のときだけ中へ渡す書き込み先。簡潔のときは書いたことにして捨てる。
 pub struct DetailOut<'a> {
     inner: &'a mut dyn Write,
     on: bool,
@@ -92,7 +93,7 @@ mod tests {
     fn dist_defaults_to_brief_and_dev_to_detail() {
         assert!(!default_detail(true));
         assert!(default_detail(false));
-        // このビルドで、`[log]` の無い ini（古い ini）のときに実際に決まる値: 配るバージョンは簡潔、開発バージョンは詳細。
+        // このビルドで`[log]`の無いini（古いini）のときに実際に決まる値は、配布バージョンなら簡潔、開発バージョンなら詳細。
         let c = higanr_core::log_cfg::choose(
             Some("[netplay]\nenable = 1\n"),
             default_detail(cfg!(feature = "dist")),

@@ -1,5 +1,5 @@
-//! 一覧の接続のスレッド（`watch_feed.rs`）の検査。偽のルームサーバー（loopback）と本物の WinHTTP で実時間に回すものは `#[ignore]`。
-//! 外へは接続しない（`127.0.0.1` と `Proxy::Direct`）。名前・ルーム名は合成の値だけ。
+//! 一覧の接続のスレッド（`watch_feed.rs`）の検査。偽のルームサーバー（loopback）と本物のWinHTTPで実時間に回すものは`#[ignore]`。
+//! 外へは接続しない（`127.0.0.1`と`Proxy::Direct`）。名前・ルーム名は合成の値だけ。
 use super::*;
 
 use std::time::Instant;
@@ -29,18 +29,21 @@ fn opts(base: &str) -> RoomOptions {
     }
 }
 
-fn posting(p1: &str, q: &str) -> Posting {
+/// 偽サーバーが`q`の割り当てのルームについて発行したチケットを付けた投稿。
+fn posting(srv: &FakeServer, p1: &str, q: &str) -> Posting {
+    let room = AssignedRoom::parse(q).unwrap();
     Posting {
-        room: AssignedRoom::parse(q).unwrap(),
+        room,
         p1: WatchName::parse(p1).unwrap(),
         p2: WatchName::parse("bob").unwrap(),
         mode: Mode::Delay,
         delay: 2,
         cap: 10,
+        ticket: srv.mint_ticket(&room.name().spectate_of()),
     }
 }
 
-/// 一覧の入れ物を見る側（ゲームのスレッドの代わり）。
+/// 一覧のバッファを読む側（ゲームのスレッドの代わり）。
 struct Reader {
     link: Arc<UiLink>,
     seen: u32,
@@ -82,9 +85,10 @@ impl Reader {
     }
 }
 
-/// 載せる口に 1 件載せて、載るまで回す（対戦のホストの代わり）。
+/// 一覧に載せる接続で1件投稿し、載るまでポーリングする（対戦のホストの代わり）。
 fn host(srv: &FakeServer, p1: &str, q: &str) -> HostListConn {
-    let mut c = HostListConn::start_post(&opts(&srv.base()), BUILD, posting(p1, q), 0).unwrap();
+    let mut c =
+        HostListConn::start_post(&opts(&srv.base()), BUILD, posting(srv, p1, q), 0).unwrap();
     let t0 = Instant::now();
     let want = srv.watch_items(BUILD).len() + 1;
     while srv.watch_items(BUILD).len() < want {
@@ -92,7 +96,7 @@ fn host(srv: &FakeServer, p1: &str, q: &str) -> HostListConn {
         c.poll();
         std::thread::sleep(Duration::from_millis(5));
     }
-    // 載った知らせ（listed）を受けて、観戦者の数をルームサーバーへ送れる状態にする。
+    // 載った通知（listed）を受けて観戦者の数をルームサーバーへ送信できる状態にする。
     std::thread::sleep(Duration::from_millis(100));
     c.poll();
     c
@@ -115,7 +119,7 @@ fn a_stopped_feed_can_no_longer_write_the_box_and_a_new_one_can() {
     publish(&link, old, ListStatus::Ready, &[row]);
     r.poll();
     assert_eq!(r.snap.len(), 1, "いまの世代は書ける");
-    // 世代が進んだ（止めた・次を作った）ら、古い世代は書けない。
+    // 世代が進んだ（止めた・次を作った）ら古い世代は書き込めない。
     link.next_watch_generation();
     publish(&link, old, ListStatus::Ready, &[]);
     r.poll();
@@ -129,7 +133,7 @@ fn the_feed_shows_the_servers_list_follows_its_changes_and_closes_when_stopped()
     let link = Arc::new(UiLink::new());
     let mut rd = Reader::new(&link);
     let feed = WatchFeed::start(Arc::clone(&link), opts(&srv.base()), BUILD).unwrap();
-    // 空の一覧が届く（取得中 → 0 件）。
+    // 空の一覧が届く（取得中 → 0件）。
     rd.wait("空の一覧が届く", |s| s.status == ListStatus::Ready);
     assert_eq!(rd.snap.len(), 0);
     assert_eq!(
@@ -157,7 +161,7 @@ fn the_feed_shows_the_servers_list_follows_its_changes_and_closes_when_stopped()
         Some(AssignedRoom::parse(Q).unwrap().name().spectate_of()),
         "一覧の行から戻した観戦用のルーム名が、ホストの導く名と同じ"
     );
-    // 2 件目と、観戦者の数の変化。
+    // 2件目と観戦者の数の変化。
     let mut b = host(&srv, "carol", "q.a1b2c3d4e5f60718293a4b5c6d7e8f");
     rd.wait("2 件載る", |s| s.len() == 2);
     assert_eq!(
@@ -229,11 +233,56 @@ fn the_feed_says_failed_when_the_server_refuses_or_is_unreachable_and_never_rows
     rd.wait("失敗が届く", |s| s.status == ListStatus::Failed);
     assert!(rd.snap.is_empty());
     feed.join();
-    // 接続できない（閉じた loopback の番号）。
+    // 接続できない（閉じているloopbackのポート）。
     let link = Arc::new(UiLink::new());
     let mut rd = Reader::new(&link);
     let feed = WatchFeed::start(Arc::clone(&link), opts("ws://127.0.0.1:9"), BUILD).unwrap();
     rd.wait("失敗が届く", |s| s.status == ListStatus::Failed);
     assert!(rd.snap.is_empty());
+    feed.join();
+}
+
+#[test]
+#[ignore = "偽サーバーと本物のスレッド・WinHTTP（loopback）で実時間に回す（数秒）。全件の回（build.bat）で --ignored で走る"]
+fn the_feed_silently_rejoins_when_the_view_expires_and_keeps_doing_so_after_each_list() {
+    let srv = FakeServer::start();
+    let link = Arc::new(UiLink::new());
+    let mut rd = Reader::new(&link);
+    let feed = WatchFeed::start(Arc::clone(&link), opts(&srv.base()), BUILD).unwrap();
+    rd.wait("空の一覧が届く", |s| s.status == ListStatus::Ready);
+    let mut a = host(&srv, "alice", Q);
+    rd.wait("1 件載る", |s| s.len() == 1);
+    let views = || srv.seen.watch_view_upgrades.load(Ordering::Acquire);
+    assert_eq!(views(), 1);
+
+    // 期限切れ → 黙って入り直す。入り直した接続の一覧（2件目の追加）が届くまで画面は失敗にならない。
+    srv.expire_views(BUILD);
+    let t0 = Instant::now();
+    while views() < 2 {
+        rd.poll();
+        assert_ne!(rd.snap.status, ListStatus::Failed, "期限切れで失敗にした");
+        assert!(t0.elapsed() < Duration::from_secs(5), "入り直さない");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut b = host(&srv, "carol", "q.a1b2c3d4e5f60718293a4b5c6d7e8f");
+    rd.wait("入り直した接続で 2 件届く", |s| s.len() == 2);
+    assert_eq!(rd.snap.status, ListStatus::Ready);
+
+    // 一覧を受けた後の2回目の期限切れも入り直す（入り直しの回数がリセットされている）。
+    srv.expire_views(BUILD);
+    let t0 = Instant::now();
+    while views() < 3 {
+        rd.poll();
+        assert_ne!(rd.snap.status, ListStatus::Failed, "2 回目で失敗にした");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "2 回目は入り直さない"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    a.cancel();
+    rd.wait("3 本目の接続で 1 件消える", |s| s.len() == 1);
+    assert_eq!(rd.snap.status, ListStatus::Ready);
+    b.cancel();
     feed.join();
 }

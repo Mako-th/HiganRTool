@@ -1,11 +1,11 @@
-//! 続きの番号から記録を受け取り直すための JOIN（観戦者がホストへ送る。`JoinTree::resume_from`）と、ホストが観戦者ごとに持つ中継の木の欄。
+//! 続きの番号から記録を受け取り直すためのJOIN（観戦者がホストへ送る。`JoinTree::resume_from`）とホストが観戦者ごとに持つ中継の木のフィールド。
 
 use super::*;
 use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::spectate::TreeView;
 use higanr_core::wire::{JoinTree, RelayState};
 
-/// ホストと観戦者 `w`（送り元 `wa`）の間で、`from`〜`to` ms の間、便を落とさずすぐ渡し合う。使った記録を `got` へ。
+/// `from`〜`to` msの間はホストと観戦者`w`（送り元`wa`）の間で便を落とさずすぐ渡し合う。使った記録を`got`へ。
 fn pump(
     host: &mut SpectateHost,
     w: &mut Watcher,
@@ -56,13 +56,13 @@ struct Rejoin {
     /// 観戦者が使った列（番号つき）。
     got: Vec<(u32, Record)>,
     jumps: u64,
-    /// 入り直した流れの始まり（ホストの ack）。
+    /// 入り直した流れの始まり（ホストのack）。
     start: Option<u32>,
     /// ホストが積んだ列。
     log: Vec<Record>,
 }
 
-/// 観戦者が 10 記録を受けた後でホストに外され、その間に次の seg（15〜）が始まる。`resume` なら続きの番号で JOIN し直す。
+/// 観戦者が10記録を受けた後でホストに外され、その間に次のseg（15〜）が始まる。`resume`なら続きの番号でJOINし直す。
 fn rejoin_after_a_new_seg(resume: bool) -> Rejoin {
     let mut host = SpectateHost::with_capacity(host_cfg(), 256);
     let mut log = vec![Record::Seg { seg: 0 }];
@@ -125,7 +125,7 @@ fn a_rejoin_with_resume_from_continues_the_column_without_a_jump() {
     assert_eq!(got, want, "観戦者の列がホストの列と一致しない");
 }
 
-/// 比べ: 続きの番号が無ければ、いまの seg の始まりへ飛び、10〜14 を受けない（上の検査が `resume_from` を読んでいる証拠）。
+/// 比べ: 続きの番号が無いといまのsegの始まりへ飛んで10〜14を受けない（上の検査が`resume_from`を読んでいる証拠）。
 #[test]
 fn a_rejoin_without_resume_from_jumps_to_the_join_start() {
     let Rejoin {
@@ -139,7 +139,7 @@ fn a_rejoin_without_resume_from_jumps_to_the_join_start() {
 
 #[test]
 fn a_resume_from_outside_the_ring_falls_back_to_the_join_start() {
-    // リングバッファ 12 に 13 記録: 先頭は 9（seg 1 の始まり）、積んだ終わりは 13（`a_rematch_join_falls_back_…` と同じ形）。
+    // リングバッファ12に13記録: 先頭は9（seg 1の始まり）、積んだ終わりは13（`a_rematch_join_falls_back_…`と同じ形）。
     let recs = rematch_order();
     for (resume, want) in [
         (Some(8), 9),
@@ -185,6 +185,7 @@ fn ack_relay(host: &mut SpectateHost, next: u32, relay: RelayState, admit_ack: u
         next,
         relay,
         admit_ack,
+        cookie: host.cookie_of(addr(1)),
         sack: Bits512::EMPTY,
     };
     host.on_datagram(addr(1), &to_host(&m), now, &mut Sink::default());
@@ -222,7 +223,7 @@ fn the_host_keeps_the_tree_fields_of_the_join_and_the_last_ack() {
     };
     ack_relay(&mut host, 5, two, 4, 1);
     assert_eq!(host.tree_of(addr(1)), view(two, 4));
-    // 遅れて着いた古い ACK（ack が戻る）の値は持たない。
+    // 遅れて着いた古いACK（ackが戻る）の値は持たない。
     ack_relay(&mut host, 3, RelayState::NO_INTRO, 9, 2);
     assert_eq!(host.tree_of(addr(1)), view(two, 4));
     let one = RelayState {

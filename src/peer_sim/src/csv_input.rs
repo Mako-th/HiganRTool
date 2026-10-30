@@ -1,13 +1,13 @@
-//! 突き合わせの入力の CSV を読む。平文の `.csv` と dll が書く `.csv.gz` を、先頭の 2 B で見分ける。
+//! 突き合わせの入力のCSVを読む。平文の`.csv`とdllが書く`.csv.gz`を先頭の2 Bで見分ける。
 //!
-//! gzip が終わりの印を失っていても、最後の sync flush までの行を読み、標準エラーに 1 行出す
-//! （切れた CSV どうしの比べは「最後が違う」ように見えうるため）。
+//! gzipが終わりの印を失っていても最後のsync flushまでの行を読み、標準エラーに1行出す。
+//! 切れたCSVどうしの比較は「最後が違う」ように見えうるため。
 
 use std::path::Path;
 
 use higanr_core::gzlog;
 
-/// 読めなければ `<パス> が読めない: …`。gzip が切れていたら、読めた所までを返して標準エラーに知らせる。
+/// 読めなければ`<パス> が読めない: …`。gzipが切れていたら読めた所までを返して標準エラーに知らせる。
 pub fn read_csv_text(path: &Path) -> Result<String, String> {
     let t =
         gzlog::read_log_text(path).map_err(|e| format!("{} が読めない: {e}", path.display()))?;
@@ -30,7 +30,7 @@ mod tests {
         if finish {
             w.finish().unwrap()
         } else {
-            // `finish` でしか取れないので、終わりの 8 B（CRC32 ＋ 長さ）を落として切れを真似る。
+            // `finish`でしか取れないので終わりの8 B（CRC32 ＋ 長さ）を落として切れを真似る。
             let mut v = w.finish().unwrap();
             v.truncate(v.len() - 8);
             v

@@ -1,18 +1,28 @@
-// 観戦の断りの検査: 入口（index.ts）→ ルーム（room.ts）を、ローカルの workerd の上で本物の WebSocket で叩く。
-// 断りは観戦用のルーム（名の先頭 `w.`）の host が送り、来る観戦者（guest）を 4403 で閉じる。host は残す。
+// 観戦の断りの検査: 入口（index.ts）→ ルーム（room.ts）をローカルのworkerdの上で本物のWebSocketで叩く。
+// 断りは観戦用のルーム（名の先頭`w.`）のhostが送り、来る観戦者（guest）を4403で閉じる。hostは残す。
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Close, newRandomRoomName, spectateRoomName } from "../src/rules";
-import { Client, connect, fakeCode, freshRoom, sleep, stubFor } from "./helpers";
+import { Client, connect, fakeCode, freshRoom, sleep, stubFor, ticketFor } from "./helpers";
+
+/** 観戦用のルームの名 → その名のチケット（hostになるのに要る）。 */
+const tickets = new Map<string, string>();
 
 /** 観戦用のルームの名（割り当ての名から導く。実際の観戦用のルームと同じ形）。 */
 async function watchRoom(): Promise<string> {
-  return spectateRoomName(newRandomRoomName());
+  const w = await spectateRoomName(newRandomRoomName());
+  tickets.set(w, await ticketFor(w));
+  return w;
 }
 
-/** 観戦用のルームへ host として入り、断りを送るところまで。断りが処理されるのを少し待つ。 */
+/** hostとして入る。観戦用のルームならチケットを出す。 */
+function connectHost(room: string): Promise<Client> {
+  return connect(room, undefined, undefined, tickets.get(room));
+}
+
+/** 観戦用のルームへhostとして入り、断りを送るところまで。断りが処理されるのを少し待つ。 */
 async function refusingHost(room: string): Promise<Client> {
-  const h = await connect(room);
+  const h = await connectHost(room);
   expect(await h.next()).toMatchObject({ t: "room", role: "host" });
   h.sendJson({ t: "refuse" });
   await sleep(50);
@@ -40,7 +50,7 @@ async function expectRefusedGuest(room: string): Promise<void> {
 describe("観戦の断り（観戦用のルーム）", () => {
   it("host が断ると、入ってきた観戦者は room の次に refused で 4403 で閉じ、host は開いたまま（期限は通常の 10 分）", async () => {
     const w = await watchRoom();
-    const h = await connect(w);
+    const h = await connectHost(w);
     const r = await h.next();
     expect(r).toMatchObject({ t: "room", role: "host" });
     const nowSecs = Math.floor(Date.now() / 1000);
@@ -50,7 +60,7 @@ describe("観戦の断り（観戦用のルーム）", () => {
     await sleep(50);
 
     await expectRefusedGuest(w);
-    // 断った host には何も送られず、閉じられない。
+    // 断ったhostには何も送られず、閉じられない。
     expect(await h.silentFor(100)).toBeNull();
     expect(h.isClosed).toBe(false);
     h.close();
@@ -59,7 +69,7 @@ describe("観戦の断り（観戦用のルーム）", () => {
   it("断りの host は何人来ても断り続ける。閉じる途中の観戦者を 3 人目と数えず、409 にならない", async () => {
     const w = await watchRoom();
     const h = await refusingHost(w);
-    // 1 人目の close を待たずに 2 人目・3 人目を入れる（閉じる途中の観戦者が居ても断りが続くこと）。
+    // 1人目のcloseを待たずに2人目・3人目を接続する（閉じる途中の観戦者が居ても断りが続くこと）。
     const gs = [await connect(w), await connect(w), await connect(w)];
     for (const g of gs) {
       expect(await g.next()).toMatchObject({ t: "room", role: "guest" });
@@ -73,7 +83,7 @@ describe("観戦の断り（観戦用のルーム）", () => {
 
   it("待っていた観戦者は、host が断った時点でその場で refused で閉じられ、コードは渡らない。host は残る", async () => {
     const w = await watchRoom();
-    const h = await connect(w);
+    const h = await connectHost(w);
     await h.next();
     const g = await connect(w);
     expect(await g.next()).toMatchObject({ t: "room", role: "guest" });
@@ -93,7 +103,7 @@ describe("観戦の断り（観戦用のルーム）", () => {
     await runInDurableObject(stub, (inst) => {
       (inst as unknown as Record<string, unknown>).__mark = 1;
     });
-    await evictDurableObject(stub); // 既定は WebSocket を閉じずに眠らせる
+    await evictDurableObject(stub); // 既定はWebSocketを閉じずに眠らせる
     const marked = await runInDurableObject(stub, (inst, state) => ({
       mark: (inst as unknown as Record<string, unknown>).__mark,
       sockets: state.getWebSockets().length,
@@ -121,7 +131,7 @@ describe("観戦の断り（観戦用のルーム）", () => {
     h.close();
     await h.closed;
     await sleep(50);
-    const next = await connect(w);
+    const next = await connectHost(w);
     expect(await next.next()).toMatchObject({ t: "room", role: "host" });
     next.close();
   });
@@ -143,7 +153,7 @@ describe("観戦の断りの誤り（4400）", () => {
 
   it("否定: offer を送った host の refuse は誤り（断りと offer が両方来ない）", async () => {
     const w = await watchRoom();
-    const h = await connect(w);
+    const h = await connectHost(w);
     await h.next();
     h.sendJson({ t: "offer", code: fakeCode("offered") });
     await sleep(50);
@@ -170,7 +180,7 @@ describe("観戦の断りの誤り（4400）", () => {
 
   it("否定: guest が refuse を送ると誤り。guest だけが閉じ、host は残る", async () => {
     const w = await watchRoom();
-    const h = await connect(w);
+    const h = await connectHost(w);
     await h.next();
     const g = await connect(w);
     await g.next();

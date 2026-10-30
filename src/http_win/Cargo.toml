@@ -1,0 +1,24 @@
+[package]
+name = "higanr_http_win"
+description = "WinHTTP で GET を 1 本する。loader（起動前の更新）と dll（遊んでいる間の新バージョンの知らせ）が使う"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+higanr_core = { path = "../core" }
+
+# Win32 の宣言だけ（MIT OR Apache-2.0。dll・loader と同じ版）。
+#   Foundation            GetLastError
+#   Networking_WinHttp    WinHttpOpen ほか（OS の TLS とプロキシの設定をそのまま使い、クレートは足さない）
+[dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_Foundation", "Win32_Networking_WinHttp"]

@@ -1,31 +1,31 @@
-//! 配る `HiganRTool.ini` を、誤りのある行だけ捨てて読むための前処理（pure）。
+//! 配布用の`HiganRTool.ini`を誤りのある行だけ捨てて読むための前処理（pure）。
 //!
-//! 1 行の誤りで節ごと（ネットワークならネット対戦ごと）使えなくならないよう、読む前に誤りの行を空行に置き換える。
-//! 行の番号は変わらない。捨てた行は `IniNote` に残し、ログとメニューの 1 行に出す。
+//! 1行の誤りで節ごと（ネットワークならネット対戦ごと）使えなくならないようにする。読む前に誤りの行を空行に置き換える。
+//! 行の番号は変わらない。捨てた行は`IniNote`に残し、ログとメニューの1行に出す。
 //!
-//! - 書き方の誤り（`=` が無い・見出しが閉じない・キーが空・同じキーが 2 回）はどの節でも捨てる。
-//! - 値の誤り・知らないキーは、利用者が触る節（`CHECKED`）だけ、その節を読む関数で検証して捨てる。
-//!   `[netplay]` と `[spectate]` は、キーごとの既定を持つ dll の `net_config` が読むときに注を足す。
-//! - 実験用の節は検証しない（誤りは従来どおり、その節を読む側が断る）。
+//! - 書き方の誤り（`=`が無い・ヘッダが閉じない・キーが空・同じキーが2回）はどの節でも捨てる。
+//! - 値の誤り・知らないキーを検証して捨てるのは、利用者が触る節（`CHECKED`）だけ。検証はその節を読む関数で行う。
+//!   `[netplay]`と`[spectate]`の注はキーごとの既定を持つdllの`net_config`が読むときに足す。
+//! - 実験用の節は検証しない（誤りは従来どおりその節を読む側が断る）。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 
 use crate::ini::{self, IniError};
-use crate::{autosave, lang, log_cfg, pacing, pad_dirs, window_size};
+use crate::{autosave, lang, log_cfg, pacing, pad_dirs, split_kb, status_side, window_size};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteKind {
-    /// 読めない行を捨てて、既定値で動かす。
+    /// 読めない行を捨てて既定値で動かす。
     Ignored,
-    /// UTF-8 でなかったので Shift_JIS として読み直した。
+    /// UTF-8でなかったのでShift_JISとして読み直した。
     Encoding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IniNote {
     pub kind: NoteKind,
-    /// 行の番号（1 から）。行を持たない注は 0。
+    /// 行の番号（1から）。行を持たない注は0。
     pub line: usize,
     /// 節の名前（小文字）。分からなければ空。
     pub section: String,
@@ -76,7 +76,7 @@ impl IniNote {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cleaned {
-    /// 誤りの行を空行にした本文。`ini::parse` が断らない。
+    /// 誤りの行を空行にした本文。`ini::parse`が断らない。
     pub text: String,
     /// 行の番号の順。
     pub notes: Vec<IniNote>,
@@ -88,8 +88,8 @@ fn parsed(t: &str) -> Result<ini::Ini, String> {
     ini::parse(t).map_err(|e| e.to_string())
 }
 
-/// 値を検証する節と、その節を読む関数。
-const CHECKED: [(&str, Check); 6] = [
+/// 値を検証する節とその節を読む関数。
+const CHECKED: [(&str, Check); 7] = [
     (pacing::SECTION, |t| {
         pacing::mode_from_ini(&parsed(t)?).map(|_| ())
     }),
@@ -100,7 +100,9 @@ const CHECKED: [(&str, Check); 6] = [
         pad_dirs::settings_from_text(t).map(|_| ())
     }),
     (lang::SECTION, |t| {
-        lang::setting_in_ini(&parsed(t)?).map(|_| ())
+        let ini = parsed(t)?;
+        lang::setting_in_ini(&ini)?;
+        status_side::from_ini(&ini).map(|_| ())
     }),
     (log_cfg::SECTION, |t| {
         log_cfg::choose(Some(t), false).note.map_or(Ok(()), Err)
@@ -108,9 +110,12 @@ const CHECKED: [(&str, Check); 6] = [
     (window_size::SECTION, |t| {
         window_size::from_ini(&parsed(t)?).map(|_| ())
     }),
+    (split_kb::SECTION, |t| {
+        split_kb::from_ini(&parsed(t)?).map(|_| ())
+    }),
 ];
 
-/// `lines`（1 から）の行を空行にする。改行はそのまま残す。
+/// `lines`（1から）の行を空行にする。改行はそのまま残す。
 fn blank_lines(text: &str, lines: &BTreeSet<usize>) -> String {
     let mut out = String::with_capacity(text.len());
     for (i, raw) in text.split_inclusive('\n').enumerate() {
@@ -145,9 +150,9 @@ pub fn clean(text: &str) -> Cleaned {
     Cleaned { text: body, notes }
 }
 
-/// `section` の行を、先頭から 1 行ずつ「この行までを足しても `check` が通るか」で採るか捨てるかを決める。
-/// 後ろの行を足した形が通れば、残りは全部採る（後ろの行との組み合わせで通る行を、順番のせいで捨てない）。
-/// 最後まで通らない組み合わせが残ったら、その節の行を全部捨てる。
+/// `section`の行を先頭から1行ずつ「この行までを足しても`check`が通るか」で採るか捨てるかを決める。
+/// 後ろの行を足した形が通れば残りは全部採る（後ろの行との組み合わせで通る行を順番のせいで捨てない）。
+/// 最後まで通らない組み合わせが残ったらその節の行を全部捨てる。
 fn filter_section(
     body: &mut String,
     dropped: &mut BTreeSet<usize>,
@@ -206,8 +211,8 @@ mod tests {
         assert_eq!(c.text, DIST);
     }
 
-    /// 配る ini の `[pacing] mode` を手で替えても、配った行（`wait`・`vsync` を含む）は 1 行も断られない。
-    /// 名前を替える前の `auto_window` は知らないキーとして、その 1 行だけ断られる。
+    /// 配布用のiniの`[pacing] mode`を手で替えても配布した行（`wait`・`vsync`を含む）は1行も断られない。
+    /// 名前を替える前の`auto_window`は知らないキーとしてその1行だけ断られる。
     #[test]
     fn changing_the_pacing_mode_by_hand_drops_nothing_from_the_shipped_ini() {
         for mode in ["game", "b", "b-spin", "b-hybrid", "vpatch", "cycle"] {
@@ -243,6 +248,14 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_input_line_is_dropped_with_a_note_and_the_good_lines_stay() {
+        let c = clean("[input]\nsplit_keyboards = 2\n[pad]\npov = 0\n");
+        assert_eq!(c.text, "[input]\n\n[pad]\npov = 0\n");
+        assert_eq!(lines_of(&c), vec![(2, "split_keyboards")]);
+        assert!(clean("[input]\nsplit_keyboards = 0\n").notes.is_empty());
+    }
+
+    #[test]
     fn crlf_is_kept_when_a_line_is_blanked() {
         let c = clean("[pad]\r\nfoo\r\npov = 0\r\n");
         assert_eq!(c.text, "[pad]\r\n\r\npov = 0\r\n");
@@ -262,6 +275,35 @@ mod tests {
         assert_eq!(ini.get("pad", "pov"), Some("0"));
         assert_eq!(ini.get("pacing", "mode"), None);
         assert!(pacing::mode_from_ini(&ini).is_ok());
+    }
+
+    #[test]
+    fn the_ui_section_keeps_lang_and_status_side_independently() {
+        let ok = clean("[ui]\nlang = en\nstatus_side = self\n");
+        assert_eq!(ok.notes, vec![]);
+        assert_eq!(ok.text, "[ui]\nlang = en\nstatus_side = self\n");
+        for (text, dropped, kept) in [
+            (
+                "[ui]\nlang = en\nstatus_side = middle\n",
+                (3, "status_side"),
+                ("lang", "en"),
+            ),
+            (
+                "[ui]\nstatus_side = 2p\nlang = fr\n",
+                (3, "lang"),
+                ("status_side", "2p"),
+            ),
+            (
+                "[ui]\nlang = en\nstatus_sid = 2p\n",
+                (3, "status_sid"),
+                ("lang", "en"),
+            ),
+        ] {
+            let c = clean(text);
+            assert_eq!(lines_of(&c), vec![dropped], "{text:?}");
+            assert_eq!(ini::parse(&c.text).unwrap().get("ui", kept.0), Some(kept.1));
+            assert_eq!(ini::parse(&c.text).unwrap().get("ui", dropped.1), None);
+        }
     }
 
     #[test]

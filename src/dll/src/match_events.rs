@@ -1,9 +1,14 @@
-//! マッチの始まりと終わりを、ネットワークの数の変わり目から本ログの 1 行にする（pure。unsafe 無し）。
+//! マッチの始まりと終わりをネットワークの数の変わり目から本ログの1行にする（pure。unsafe無し）。
 //!
-//! 読み取りのスレッドが 1 秒ごとにネットワークの数（`NetSnapshot`）を `MatchWatch::step` に渡す。簡潔なログでもマッチごとの節目が残るように、
-//! 始まったマッチの数が増えたとき（始まり）と、マッチの最中の段階（`PHASE_LOCKSTEP`）を出たとき（終わり）に 1 行ずつ返す。
-//! 終わりの番号は始まりの番号と同じ（「N マッチ目が始まりました」に必ず「N マッチ目が終わりました」が対応する）。1 秒の間に段階を見逃した終わり
-//! （次の試合がすぐ始まった）・接続が終わった・接続が替わった終わりは、理由つきで同じ番号の終わりを書く。
+//! 読み取りのスレッドが1秒ごとにネットワークの数（`NetSnapshot`）を`MatchWatch::step`に渡す。
+//! 簡潔なログでもマッチごとの節目が残るよう、次のときに1行ずつ返す。
+//! - 始まったマッチの数が増えたとき（始まり）。
+//! - マッチの最中の段階（`PHASE_LOCKSTEP`）を出たとき（終わり）。
+//! 終わりの番号は始まりの番号と同じ（「N マッチ目が始まりました」に必ず「N マッチ目が終わりました」が対応する）。
+//! 次の場合は理由つきで同じ番号の終わりを書く。
+//! - 1秒の間に段階を見逃した（次の試合がすぐ始まった）。
+//! - 接続が終わった。
+//! - 接続が替わった。
 #![forbid(unsafe_code)]
 
 use crate::net_watch::{NetSnapshot, phase_code};
@@ -14,19 +19,19 @@ use crate::trial_summary::{N_END, end_item};
 pub struct MatchWatch {
     /// 前の秒までに始まりを書いたマッチの数（この接続の中の番号。接続が替わったら数え直す）。
     segs: u32,
-    /// 始まりを書いたが、終わりをまだ書いていないマッチがある（その番号は `segs`）。
+    /// 始まりを書いたが、終わりをまだ書いていないマッチがある（その番号は`segs`）。
     open: bool,
-    /// 開いているマッチで、マッチの最中の段階を見たか。見る前の段階の変わりを終わりと読まない。
+    /// 開いているマッチでマッチの最中の段階を見たかどうか。見る前の段階の変わりは終わりと読まない。
     seen_lockstep: bool,
     /// 前の秒のセッションを作った時刻（`NetSnapshot::link_started_ms`）。変わったら新しい接続。
     link: u32,
-    /// 観戦者の今のマッチで、対戦する側の値の行を出したか。
+    /// 観戦者の今のマッチで対戦する側の値の行を出したかどうか。
     peer_shown: bool,
-    /// 前の秒の「この接続の合計」（使ったフレーム・stall・CHECK の一致）。見逃した終わりは、次の試合や新しい接続の数でなくこちらで書く。
+    /// 前の秒の「この接続の合計」（使ったフレーム・stall・CHECKの一致）。見逃した終わりは次の試合や新しい接続の数でなくこちらで書く。
     last: (u32, u32, u32),
 }
 
-/// 観戦者の実行で、観戦の流れから対戦する側の値を受けていれば「対戦する2人: rollback・delay N」/「対戦する2人: delay 方式 N」。
+/// 観戦者の実行で観戦の流れから対戦する側の値を受けていれば「対戦する2人: rollback・delay N」/「対戦する2人: delay 方式 N」。
 fn peer_text(snap: &NetSnapshot) -> Option<String> {
     let p = snap.peer.filter(|_| snap.watcher)?;
     Some(if p.rollback.is_some() {
@@ -37,7 +42,7 @@ fn peer_text(snap: &NetSnapshot) -> Option<String> {
 }
 
 impl MatchWatch {
-    /// 開いているマッチの終わりの行を書いて閉じる。`why` は通常の終わり（段階を出た）以外の理由。`totals` はこの接続の合計。
+    /// 開いているマッチの終わりの行を書いて閉じる。`why`は通常の終わり（段階を出た）以外の理由。`totals`はこの接続の合計。
     fn close(&mut self, why: Option<&str>, totals: (u32, u32, u32), k: u32) -> String {
         self.open = false;
         let why = why.map_or(String::new(), |w| format!("{w}。"));
@@ -47,11 +52,11 @@ impl MatchWatch {
         )
     }
 
-    /// 1 秒ごとに呼ぶ。`k` は計測の経過秒。書く行を返す（無ければ空）。
+    /// 1秒ごとに呼ぶ。`k`は計測の経過秒。書く行を返す（無ければ空）。
     pub fn step(&mut self, snap: &NetSnapshot, k: u32) -> Vec<String> {
         let mut lines = Vec::new();
-        // ネットワークの数は接続ごとに 0 から数え直される（再接続）。セッションを作り直した（時刻が変わった）か、数が減ったら新しい接続。
-        // 前の接続のマッチの数と同じ数のまま次の接続の最初のマッチが始まっても、数え直しを逃さない。
+        // ネットワークの数は接続ごとに0から数え直される（再接続）。セッションを作り直した（時刻が変わった）か数が減ったら新しい接続。
+        // 前の接続のマッチの数と同じ数のまま次の接続の最初のマッチが始まっても数え直しを逃さない。
         if snap.link_started_ms != self.link || snap.segs_started < self.segs {
             if self.open {
                 lines.push(self.close(Some("接続が替わるまで終わりを見なかった"), self.last, k));
@@ -74,7 +79,7 @@ impl MatchWatch {
             self.seen_lockstep = false;
             self.peer_shown = false;
             let what = if snap.watcher {
-                // 観戦者は遅延と rollback の欄を書かないので、対戦する側の値は観戦の流れで受けた分だけを出す。
+                // 観戦者は遅延とrollbackのフィールドを書かないので対戦する側の値は観戦の流れで受けた分だけを出す。
                 match peer_text(snap) {
                     Some(t) => {
                         self.peer_shown = true;
@@ -107,7 +112,7 @@ impl MatchWatch {
             lines.push(format!("マッチ: {t}（{k} 秒の時点）"));
         }
         let totals = (snap.played, snap.stalls, snap.check_matches);
-        // 接続が終わった秒は、終わりの理由を添える（中断・相手が切った・自分から終えた など）。マッチの最中の段階を一度も見ないまま終わった試合も閉じる。
+        // 接続が終わった秒は終わりの理由を添える（中断・相手が切った・自分から終えた など）。マッチの最中の段階を一度も見ないまま終わった試合も閉じる。
         if self.open && snap.link_ended() {
             let reason = end_item(N_END, snap.end, snap.end_detail).text;
             lines.push(self.close(Some(&format!("接続が終わったため（{reason}）")), totals, k));
@@ -144,7 +149,7 @@ mod tests {
         w.step(&on(1000, 1, 4), 1);
         let end = w.step(&on(1000, 1, 5), 2);
         assert!(end[0].contains("1 マッチ目が終わりました"), "{end:?}");
-        // 数が 0 に戻る秒を見逃し、新しい接続の最初のマッチ（数は 1）が次の秒に見える。
+        // 数が0に戻る秒を見逃し、新しい接続の最初のマッチ（数は1）が次の秒に見える。
         let start = w.step(&on(5000, 1, 4), 3);
         assert!(start[0].contains("1 マッチ目が始まりました"), "{start:?}");
         let end = w.step(&on(5000, 1, 1), 4);
@@ -204,7 +209,7 @@ mod tests {
             "{start:?}"
         );
         assert!(w.step(&watching(1, 4, Some(rb)), 2).is_empty());
-        // 値が試合の始まりの後に届く場合は、届いた秒に 1 行。
+        // 値が試合の始まりの後に届く場合は届いた秒に1行。
         let mut w = MatchWatch::default();
         assert!(w.step(&watching(1, 4, None), 1)[0].ends_with("時点）"));
         assert!(w.step(&watching(1, 4, None), 2).is_empty());
@@ -257,7 +262,7 @@ mod tests {
         assert!(end[0].contains("1 マッチ目が終わりました"), "{end:?}");
     }
 
-    /// 「N マッチ目が始まりました」「N マッチ目が終わりました」の番号を、行から拾う。
+    /// 「N マッチ目が始まりました」「N マッチ目が終わりました」の番号を行から拾う。
     fn numbers(lines: &[String], word: &str) -> Vec<u32> {
         lines
             .iter()
@@ -278,7 +283,7 @@ mod tests {
     fn every_started_match_gets_an_end_line_with_the_same_number() {
         let mut w = MatchWatch::default();
         let mut all = Vec::new();
-        // 1 試合目: 段階を出て終わる。2 試合目: 段階が試合の最中のまま 3 試合目が始まる。3 試合目: 試合の最中に接続が終わる。
+        // 1試合目: 段階を出て終わる。2試合目: 段階が試合の最中のまま3試合目が始まる。3試合目: 試合の最中に接続が終わる。
         let seconds = [
             snap(1, 4),
             snap(1, 1),
@@ -311,7 +316,7 @@ mod tests {
             by_link.contains("接続が終わったため（自分から終えた）"),
             "{by_link}"
         );
-        // 終わりの行は 2 度出ない。
+        // 終わりの行は2度出ない。
         assert!(w.step(&snap(3, 5), 9).is_empty());
     }
 

@@ -1,79 +1,80 @@
-//! リプレイ（`.rpy`）の平文の部分を読み、HiganRTool の印（USER チャンク）を作って読む。
+//! リプレイ（`.rpy`）の平文の部分を読み、HiganRToolの印（USERチャンク）を作って読む。
 //!
-//! - 読むのは平文だけ: 先頭の `"T9RP"`、`comp_size`（`+0x0C`）、`comp_size` から末尾までの USER チャンクの列。
-//!   `+0x18` から `comp_size` の手前（暗号化と圧縮）は読まない。印には要らず、復号を実装しても合成の標本を同じ実装で
-//!   作ることになり、復号の間違いを検査が見つけられないため。
-//! - `comp_size` は `0x0042063B`（実測 1455/1455）、USER の全長の丸めは `0x00420F49`。
-//! - 印は thprac の `ReplaySaveParam` と同じ形（末尾に USER を 1 つ足し、`+0x08` をタグにする）。仕組みだけの参考で、コードはコピーしていない。タグは `HGRT`。
+//! - 読むのは平文だけ: 先頭の`"T9RP"`、`comp_size`（`+0x0C`）、`comp_size`から末尾までのUSERチャンクの列。
+//!   `+0x18`から`comp_size`の手前（暗号化と圧縮）は読まない。
+//!   印には要らない。また復号を実装しても合成のサンプルを同じ実装で作ることになり、復号の間違いを検査が見つけられない。
+//! - `comp_size`は`0x0042063B`（実測1455/1455）。USERの全長の丸めは`0x00420F49`。
+//! - 印はthpracの`ReplaySaveParam`と同じ形（末尾にUSERを1つ足し、`+0x08`をタグにする）。仕組みだけの参考でコードはコピーしていない。タグは`HGRT`。
 //!
-//! ファイルには触らない（バイト列を受け、足すバイト列・読めた印・理由を返すだけ）。書くのは dll。ゲームスレッドの外で呼ぶのでヒープを使う。
-//! どんなバイト列でもパニックしない（添字は `get`、足し算は `checked_add`）。
+//! ファイルには触らない（バイト列を受け、足すバイト列・読めた印・理由を返すだけ）。書くのはdll。ゲームスレッドの外で呼ぶのでヒープを使う。
+//! どんなバイト列でもパニックしない（添字は`get`、足し算は`checked_add`）。
 
 use crate::frame::MAX_DELAY;
 use crate::replay_detail::{self, DetailFields, MatchDetail};
 use crate::wire::NAME_MAX;
 
-/// ファイルの先頭 4 バイト（`0x000`）。
+/// ファイルの先頭4バイト（`0x000`）。
 pub const MAGIC: [u8; 4] = *b"T9RP";
 /// `comp_size`（u32 LE）の位置（`= 0xC0 + LZSS の長さ`）。
 const COMP_SIZE_OFFSET: usize = 0x0C;
-/// これより短いファイルは見出しすら無い（`0x018` から暗号化）。
+/// これより短いファイルはヘッダすら無い（`0x018`から暗号化）。
 pub const MIN_FILE_LEN: usize = 0x18;
-/// `comp_size` の下限。LZSS の長さが 0 でも `0xC0` はある。
+/// `comp_size`の下限。LZSSの長さが0でも`0xC0`はある。
 pub const MIN_COMP_SIZE: u32 = 0xC0;
 pub const USER_MAGIC: [u8; 4] = *b"USER";
-/// USER チャンクの見出しの長さ（`"USER"` 4 ＋ 全長 4 ＋ `+0x08` の 4）。
+/// USERチャンクのヘッダの長さ（`"USER"` 4 ＋ 全長4 ＋ `+0x08`の4）。
 pub const USER_HEADER_LEN: usize = 12;
-/// 印のタグ（USER の `+0x08`）。ゲームの USER ではここは未初期化の残り物（実測ほぼ `0x7FFFFF00`）なので、`HGRT` と偶然一致することは考えない。
+/// 印のタグ（USERの`+0x08`）。ゲームのUSERではここは未初期化の残り物（実測ほぼ`0x7FFFFF00`）なので`HGRT`と偶然一致することは考えない。
 pub const MARK_TAG: [u8; 4] = *b"HGRT";
 pub const MARK_HEAD: &str = "HIGANR";
 pub const MARK_VERSION: &str = "1";
-/// ゲームのメニューから保存したリプレイの印のバージョン。ネット対戦の印（`MARK_VERSION`）は必須の key を 7 つ持つが、こちらは持たない
-/// 別の形なので、バージョンを分けた。バージョン 1 しか知らない読み手はこの印を `UnknownVersion` として読み飛ばせる。
+/// ゲームのメニューから保存したリプレイの印のバージョン。
+/// ネット対戦の印（`MARK_VERSION`）は必須のkeyを7つ持つが、こちらは持たない別の形なのでバージョンを分けた。
+/// バージョン1しか知らない読み手はこの印を`UnknownVersion`として読み飛ばせる。
 pub const MENU_MARK_VERSION: &str = "2";
-/// メニューの保存の印の `kind` の値。知らない値（後で足す種類）は `UnknownVersion` として読み飛ばす。
+/// メニューの保存の印の`kind`の値。知らない値（後で足す種類）は`UnknownVersion`として読み飛ばす。
 pub const MENU_KIND: &str = "menu";
-/// メニューの保存の印の `ver`（バージョン名）の最大バイト数。
+/// メニューの保存の印の`ver`（バージョン名）の最大バイト数。
 pub const MENU_VER_MAX: usize = 32;
 
-/// ファイルの平文の部分が読めなかった理由（印を付けずにログへ出す）。ゲームの保存が壊れている可能性があるので、直さずに返す。
+/// ファイルの平文の部分が読めなかった理由（印を付けずにログへ出す）。ゲームの保存が壊れている可能性があるので直さずに返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayError {
-    /// 長さが `0x18` 未満。
+    /// 長さが`0x18`未満。
     TooShort { len: usize },
-    /// 先頭 4 バイトが `T9RP` でない。
+    /// 先頭4バイトが`T9RP`でない。
     BadMagic,
-    /// `comp_size` が `0xC0` 未満。
+    /// `comp_size`が`0xC0`未満。
     CompSizeTooSmall { comp_size: u32 },
-    /// `comp_size` がファイルの長さを超える。
+    /// `comp_size`がファイルの長さを超える。
     CompSizeBeyondEnd { comp_size: u32, len: usize },
-    /// `offset` のチャンクが `"USER"` で始まらない。
+    /// `offset`のチャンクが`"USER"`で始まらない。
     NotUser { offset: usize },
-    /// `offset` のチャンクの全長が 12 未満（見出しが収まらない）。
+    /// `offset`のチャンクの全長が12未満（ヘッダが収まらない）。
     ChunkTooShort { offset: usize, total: u32 },
-    /// `offset` のチャンクの全長がファイルの残りを超える。
+    /// `offset`のチャンクの全長がファイルの残りを超える。
     ChunkBeyondEnd {
         offset: usize,
         total: u32,
         remaining: usize,
     },
-    /// 最後のチャンクの後ろに、チャンクの見出し（12 バイト）にも満たない余りがある。
+    /// 最後のチャンクの後ろにチャンクのヘッダ（12バイト）にも満たない余りがある。
     TrailingBytes { offset: usize, len: usize },
-    /// USER チャンクが 1 つも無い（ゲームは必ず 1 つ書く）。
+    /// USERチャンクが1つも無い（ゲームは必ず1つ書く）。
     NoUserChunk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserChunk {
     pub offset: usize,
-    /// 全長（`+0x04`。見出しの 12 バイトを含む）。
+    /// 全長（`+0x04`。ヘッダの12バイトを含む）。
     pub len: usize,
-    /// `+0x08` の 4 バイト。印なら `HGRT`。
+    /// `+0x08`の4バイト。印なら`HGRT`。
     pub tag: [u8; 4],
 }
 
 impl UserChunk {
-    /// 本文（`+0x0C` から全長まで。末尾の NUL と詰め物を含む）。違うバイト列に当てても範囲外なら `None` で、パニックしない。
+    /// 本文（`+0x0C`から全長まで。末尾のNULと詰め物を含む）。違うバイト列に当てても範囲外なら`None`を返す。パニックしない。
     pub fn body<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
         let start = self.offset.checked_add(USER_HEADER_LEN)?;
         let end = self.offset.checked_add(self.len)?;
@@ -87,9 +88,9 @@ impl UserChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
-    /// `+0x0C`。`[0, comp_size)` がチェックサムの範囲を含む。
+    /// `+0x0C`。`[0, comp_size)`がチェックサムの範囲を含む。
     pub comp_size: u32,
-    /// `comp_size` から末尾まで、隙間なく並んだ USER チャンク（1 つ以上）。
+    /// `comp_size`から末尾まで、隙間なく並んだUSERチャンク（1つ以上）。
     pub chunks: Vec<UserChunk>,
 }
 
@@ -111,8 +112,9 @@ fn read_tag(bytes: &[u8], off: usize) -> Option<[u8; 4]> {
     Some([s[0], s[1], s[2], s[3]])
 }
 
-/// 平文の部分を読む。暗号化・圧縮された部分は読まない。残りが 12 バイト未満のところは `TrailingBytes`、
-/// 12 バイト以上あって `"USER"` で始まらなければ `NotUser`（どちらも印を付けない）。
+/// 平文の部分を読む。暗号化・圧縮された部分は読まない。
+/// 残りが12バイト未満なら`TrailingBytes`を返す。
+/// 12バイト以上あって`"USER"`で始まらなければ`NotUser`を返す（どちらも印を付けない）。
 pub fn parse(bytes: &[u8]) -> Result<Layout, ReplayError> {
     let len = bytes.len();
     if len < MIN_FILE_LEN {
@@ -125,7 +127,7 @@ pub fn parse(bytes: &[u8]) -> Result<Layout, ReplayError> {
     if comp_size < MIN_COMP_SIZE {
         return Err(ReplayError::CompSizeTooSmall { comp_size });
     }
-    // i686 が対象なので u32 は必ず usize に収まる。
+    // i686が対象なのでu32は必ずusizeに収まる。
     let comp = comp_size as usize;
     if comp > len {
         return Err(ReplayError::CompSizeBeyondEnd { comp_size, len });
@@ -168,7 +170,7 @@ pub fn parse(bytes: &[u8]) -> Result<Layout, ReplayError> {
             len: total as usize,
             tag,
         });
-        // total <= len - pos なので、あふれない。
+        // total <= len - posなのであふれない。
         pos += total as usize;
     }
     if chunks.is_empty() {
@@ -184,7 +186,7 @@ pub enum Side {
     P2,
 }
 
-/// マッチの結果（`result=`。対戦の印は自分から、観戦の印は 1P から見た結果）。
+/// マッチの結果（`result=`。対戦の印は自分から、観戦の印は1Pから見た結果）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchResult {
     Win,
@@ -204,7 +206,7 @@ impl MatchResult {
     }
 }
 
-/// 手元の時刻（core は時計を持たないので dll が渡す）。書式は `YYYY-MM-DDTHH:MM:SS`。
+/// 手元の時刻（coreは時計を持たないのでdllが渡す）。書式は`YYYY-MM-DDTHH:MM:SS`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
     pub year: u16,
@@ -230,7 +232,7 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 }
 
 impl Timestamp {
-    /// 4 桁の年、暦にある月日、`00:00:00`〜`23:59:59`（閏秒は書かない）のとき真。範囲外を書き出すと読むときに「壊れている」になる。
+    /// 4桁の年、暦にある月日、`00:00:00`〜`23:59:59`（閏秒は書かない）のとき真。範囲外を書き出すと読むときに「壊れている」になる。
     pub fn is_valid(&self) -> bool {
         self.year <= 9999
             && (1..=12).contains(&self.month)
@@ -248,7 +250,7 @@ impl Timestamp {
         )
     }
 
-    /// `YYYY-MM-DDTHH:MM:SS` を読む。桁数と区切りが違う・範囲外なら `None`。
+    /// `YYYY-MM-DDTHH:MM:SS`を読む。桁数と区切りが違う・範囲外なら`None`。
     pub fn from_text(text: &[u8]) -> Option<Timestamp> {
         if text.len() != 19 {
             return None;
@@ -267,14 +269,14 @@ impl Timestamp {
                 if !c.is_ascii_digit() {
                     return None;
                 }
-                // 4 桁まで（9999）なので u16 に収まる。
+                // 4桁まで（9999）なのでu16に収まる。
                 v = v * 10 + u16::from(c - b'0');
             }
             Some(v)
         };
         let ts = Timestamp {
             year: num(0, 4)?,
-            // 2 桁なので u8 に収まる。
+            // 2桁なのでu8に収まる。
             month: num(5, 7)? as u8,
             day: num(8, 10)? as u8,
             hour: num(11, 13)? as u8,
@@ -285,20 +287,21 @@ impl Timestamp {
     }
 }
 
-/// 印を残した側。観戦者の手元にも観戦したマッチのリプレイを残す。key は `role`・`p1`・`p2`（バージョン 1 のまま足した任意の key。
-/// 知らない key は読み飛ばす約束なので、足す前の読み手も観戦の印を普通の印として読める）。
+/// 印を残した側。観戦者の手元にも観戦したマッチのリプレイを残す。
+/// keyは`role`・`p1`・`p2`（バージョン1のまま足した任意のkey）。
+/// 知らないkeyは読み飛ばす約束なので足す前の読み手も観戦の印を普通の印として読める。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkRole {
-    /// 対戦に参加して遊んだ（`role` の key は書かない。足す前の印と同じバイト列）。
+    /// 対戦に参加して遊んだ（`role`のkeyは書かない。足す前の印と同じバイト列）。
     Play,
-    /// 観戦者として見た（`role=watch`）。`p1`・`p2` はマッチの 1P・2P の名前（無害化の前。UTF-8、32 バイトまで）。この印の `self_name` は
-    /// 観戦した人の名前、`peer` は空、`side` は 1、`result` は 1P から見た結果、`lat`・`ping` は 0。
+    /// 観戦者として見た（`role=watch`）。`p1`・`p2`はマッチの1P・2Pの名前（無害化の前。UTF-8で32バイトまで）。
+    /// この印の`self_name`は観戦した人の名前、`peer`は空、`side`は1、`result`は1Pから見た結果、`lat`・`ping`は0。
     Watch { p1: String, p2: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mark {
-    /// 相手の名前。無害化の前（UTF-8、32 バイトまで。HELLO と同じ上限）。
+    /// 相手の名前。無害化の前（UTF-8で32バイトまで。HELLOと同じ上限）。
     pub peer: String,
     pub self_name: String,
     pub side: Side,
@@ -308,13 +311,14 @@ pub struct Mark {
     pub result: MatchResult,
     pub at: Timestamp,
     pub role: MarkRole,
-    /// マッチの情報（ラウンドごとの記録・同期方式・ビルド番号・開始時刻・通信の要約。`replay_detail`）。`None` なら足す前の印と同じ
-    /// バイト列になる。
+    /// マッチの情報（ラウンドごとの記録・同期方式・ビルド番号・開始時刻・通信の要約。`replay_detail`）。
+    /// `None`なら足す前の印と同じバイト列になる。
     pub detail: Option<MatchDetail>,
 }
 
-/// ゲームのメニュー（Story・Extra・Match の保存）で保存したリプレイの印。ネット対戦の記録を持たない。`ver` は保存した
-/// HiganRTool のバージョン名（dll の `CARGO_PKG_VERSION`。1〜`MENU_VER_MAX` バイト）、`build` はそのビルド番号（`update::BUILD_NUMBER`。開発バージョンは 0）。
+/// ゲームのメニュー（Story・Extra・Matchの保存）で保存したリプレイの印。ネット対戦の記録を持たない。
+/// `ver`は保存したHiganRToolのバージョン名（dllの`CARGO_PKG_VERSION`。1〜`MENU_VER_MAX`バイト）。
+/// `build`はそのビルド番号（`update::BUILD_NUMBER`。開発バージョンは0）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuMark {
     pub ver: String,
@@ -325,12 +329,12 @@ pub struct MenuMark {
 pub enum MarkError {
     NotHiganr,
     MissingVersion,
-    /// 第 3 欄から先に `=` の無い欄がある（空の欄を含む）。
+    /// 第3フィールドから先に`=`の無いフィールドがある（空のフィールドを含む）。
     FieldWithoutEquals,
     DuplicateKey(&'static str),
     MissingKey(&'static str),
     BadEscape(&'static str),
-    /// 値が範囲の外（名前が UTF-8 でない・32 バイトを超える、side が 1 / 2 でない、など）。
+    /// 値が範囲の外（名前がUTF-8でない・32バイトを超える、sideが1 / 2でない、など）。
     BadValue(&'static str),
 }
 
@@ -346,7 +350,7 @@ pub enum AppendError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkRead {
     Absent,
-    /// `HGRT` はあるが、どれも知らないバージョン（読み飛ばした。§2）。
+    /// `HGRT`はあるが、どれも知らないバージョン（読み飛ばした。§2）。
     UnknownVersion,
     Broken(MarkError),
     Found(Mark),
@@ -361,7 +365,7 @@ pub enum BodyRead {
     Menu(MenuMark),
 }
 
-/// 値の逃がし方: `[0-9A-Za-z-_.~]` 以外のバイトを `%XX`（大文字の 16 進）にする。タブ・`=`・`%` を含む名前でも欄が崩れない。
+/// 値の逃がし方: `[0-9A-Za-z-_.~]`以外のバイトを`%XX`（大文字の16進）にする。タブ・`=`・`%`を含む名前でもフィールドが崩れない。
 fn escape_value(value: &[u8]) -> String {
     let mut out = String::with_capacity(value.len());
     for &b in value {
@@ -384,7 +388,7 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-/// `%XX` を戻す。`%` の後ろが 16 進 2 桁でなければ `None`。`%` 以外のバイトはそのまま。
+/// `%XX`を戻す。`%`の後ろが16進2桁でなければ`None`。`%`以外のバイトはそのまま。
 fn unescape_value(value: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(value.len());
     let mut i = 0;
@@ -430,7 +434,7 @@ fn check_mark(mark: &Mark) -> Result<(), MarkError> {
     Ok(())
 }
 
-/// 印の本文（1 行。NUL は含まない）。key の順は固定。
+/// 印の本文（1行。NULは含まない）。keyの順は固定。
 pub fn mark_body(mark: &Mark) -> Result<String, MarkError> {
     check_mark(mark)?;
     let side = match mark.side {
@@ -444,7 +448,7 @@ pub fn mark_body(mark: &Mark) -> Result<String, MarkError> {
         ("lat", escape_value(mark.lat.to_string().as_bytes())),
         ("ping", escape_value(mark.ping_ms.to_string().as_bytes())),
         ("result", escape_value(mark.result.as_str().as_bytes())),
-        // 値の中の `:` も逃がすので、時刻の `:` は `%3A` になる。
+        // 値の中の`:`も逃がすので、時刻の`:`は`%3A`になる。
         ("at", escape_value(mark.at.to_text().as_bytes())),
     ];
     let mut body = format!("{MARK_HEAD}\t{MARK_VERSION}");
@@ -454,7 +458,7 @@ pub fn mark_body(mark: &Mark) -> Result<String, MarkError> {
         body.push('=');
         body.push_str(value);
     }
-    // 観戦の印だけが、必須の 7 つの後ろに任意の key を足す。
+    // 観戦の印だけが、必須の7つの後ろに任意のkeyを足す。
     if let MarkRole::Watch { p1, p2 } = &mark.role {
         for (key, value) in [("role", "watch"), ("p1", p1.as_str()), ("p2", p2.as_str())] {
             body.push('\t');
@@ -474,13 +478,13 @@ pub fn mark_body(mark: &Mark) -> Result<String, MarkError> {
     Ok(body)
 }
 
-/// 印のチャンク 1 つ: `"USER"` ＋ 全長 ＋ `"HGRT"` ＋ 本文 ＋ NUL ＋ 詰め物の 0。
-/// 全長はゲームの USER と同じく偶数へ切り上げる（`strlen + 13` を偶数へ。`0x00420F49`）。
+/// 印のチャンク1つ: `"USER"` ＋ 全長 ＋ `"HGRT"` ＋ 本文 ＋ NUL ＋ 詰め物の0。
+/// 全長はゲームのUSERと同じく偶数へ切り上げる（`strlen + 13`を偶数へ。`0x00420F49`）。
 pub fn mark_chunk(mark: &Mark) -> Result<Vec<u8>, MarkError> {
     frame_chunk(&mark_body(mark)?)
 }
 
-/// メニューの保存の印の本文（1 行）: `HIGANR<TAB>2<TAB>kind=menu<TAB>ver=<バージョン名><TAB>build=<n>`。
+/// メニューの保存の印の本文（1行）: `HIGANR<TAB>2<TAB>kind=menu<TAB>ver=<バージョン名><TAB>build=<n>`。
 pub fn menu_mark_body(mark: &MenuMark) -> String {
     format!(
         "{MARK_HEAD}\t{MENU_MARK_VERSION}\tkind={MENU_KIND}\tver={}\tbuild={}",
@@ -489,7 +493,7 @@ pub fn menu_mark_body(mark: &MenuMark) -> String {
     )
 }
 
-/// メニューの保存の印のチャンク 1 つ（枠は `mark_chunk` と同じ）。`ver` が空か長すぎるものは、読むときに壊れている扱いになるので書かない。
+/// メニューの保存の印のチャンク1つ（枠は`mark_chunk`と同じ）。`ver`が空か長すぎるものは読むときに壊れている扱いになるので書かない。
 pub fn menu_mark_chunk(mark: &MenuMark) -> Result<Vec<u8>, MarkError> {
     if mark.ver.is_empty() || mark.ver.len() > MENU_VER_MAX {
         return Err(MarkError::BadValue("ver"));
@@ -498,7 +502,7 @@ pub fn menu_mark_chunk(mark: &MenuMark) -> Result<Vec<u8>, MarkError> {
 }
 
 fn frame_chunk(body: &str) -> Result<Vec<u8>, MarkError> {
-    // 本文は最大でも数百バイトなので u32 に収まる。念のため検証して、収まらなければ断る。
+    // 本文は最大でも数百バイトなのでu32に収まる。念のため検証して収まらなければ断る。
     let unpadded = USER_HEADER_LEN + body.len() + 1;
     let total = unpadded + (unpadded & 1);
     let total_u32 = u32::try_from(total).map_err(|_| MarkError::BadValue("body"))?;
@@ -512,14 +516,15 @@ fn frame_chunk(body: &str) -> Result<Vec<u8>, MarkError> {
     Ok(out)
 }
 
-/// `file` の末尾へ足す印のチャンクを返す（dll はそのままファイルの末尾へ書く）。壊れている・既に印がある・印の値が範囲外、を分けて断る。
-/// `parse` が最後のチャンクの後ろに余りが無いことを検証しているので、足したチャンクもたどれる。
+/// `file`の末尾へ足す印のチャンクを返す（dllはそのままファイルの末尾へ書く）。
+/// 壊れている・既に印がある・印の値が範囲外のそれぞれを分けて断る。
+/// `parse`が最後のチャンクの後ろに余りが無いことを検証しているので、足したチャンクもたどれる。
 pub fn chunk_to_append(file: &[u8], mark: &Mark) -> Result<Vec<u8>, AppendError> {
     check_appendable(file)?;
     mark_chunk(mark).map_err(AppendError::InvalidMark)
 }
 
-/// `chunk_to_append` のメニューの保存の印用。断る条件は同じ（壊れている・どの種類でも印が既にある）。
+/// `chunk_to_append`のメニューの保存の印用。断る条件は同じ（壊れている・どの種類でも印が既にある）。
 pub fn chunk_to_append_menu(file: &[u8], mark: &MenuMark) -> Result<Vec<u8>, AppendError> {
     check_appendable(file)?;
     menu_mark_chunk(mark).map_err(AppendError::InvalidMark)
@@ -533,7 +538,8 @@ fn check_appendable(file: &[u8]) -> Result<(), AppendError> {
     Ok(())
 }
 
-/// バージョン 1 の key。先頭の 7 つは必須、`role`・`p1`・`p2` は観戦の印にだけ付く任意の key。マッチの情報の key は `replay_detail::ALLOWED_KEYS`。
+/// バージョン1のkey。先頭の7つは必須。`role`・`p1`・`p2`は観戦の印にだけ付く任意のkey。
+/// マッチの情報のkeyは`replay_detail::ALLOWED_KEYS`。
 const KEYS: [&str; 10] = [
     "peer", "self", "side", "lat", "ping", "result", "at", "role", "p1", "p2",
 ];
@@ -545,8 +551,9 @@ fn parse_name(key: &'static str, value: Vec<u8>) -> Result<String, MarkError> {
     String::from_utf8(value).map_err(|_| MarkError::BadValue(key))
 }
 
-/// 1 つの `HGRT` の本文を読む。本文は最初の NUL まで。バージョンが `1` でなければ `UnknownVersion`。バージョン 1 は 7 つの key が
-/// 1 回ずつそろい、値が範囲の中のときだけ `Mark`。知らない key は無視する（後のバージョンで足せるように）。
+/// 1つの`HGRT`の本文を読む。本文は最初のNULまで。バージョンが`1`でなければ`UnknownVersion`。
+/// バージョン1は7つのkeyが1回ずつそろい、値が範囲の中のときだけ`Mark`。
+/// 知らないkeyは無視する（後のバージョンで足せるように）。
 pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
     let text = match body.iter().position(|&b| b == 0) {
         Some(n) => &body[..n],
@@ -573,7 +580,7 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
             .ok_or(MarkError::FieldWithoutEquals)?;
         let (key, value) = (&field[..eq], &field[eq + 1..]);
         let Some(idx) = KEYS.iter().position(|k| k.as_bytes() == key) else {
-            // マッチの情報の key は `replay_detail` が集める。それ以外の知らない key は無視する。
+            // マッチの情報のkeyは`replay_detail`が集める。それ以外の知らないkeyは無視する。
             if let Some(d_idx) = replay_detail::key_index(key) {
                 let bytes = unescape_value(value)
                     .ok_or(MarkError::BadEscape(replay_detail::key_name(d_idx)))?;
@@ -595,7 +602,7 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
     let ping = take(4)?;
     let result = take(5)?;
     let at = take(6)?;
-    // 任意の key。`role` が無い（か `play`）なら対戦に参加した側の印で、`p1`・`p2` があっても使わない（後のバージョンで意味を足せるように）。
+    // 任意のkey。`role`が無い（か`play`）なら対戦に参加した側の印。`p1`・`p2`があっても使わない（後のバージョンで意味を足せるように）。
     let role_value = values[7].take();
     let p1 = values[8].take();
     let p2 = values[9].take();
@@ -610,7 +617,7 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
         [d] if d.is_ascii_digit() && *d - b'0' <= MAX_DELAY => *d - b'0',
         _ => return Err(MarkError::BadValue("lat")),
     };
-    // `+` や空白を受けないように、数字だけを見てから変換する。
+    // `+`や空白を受けないように数字だけを見てから変換する。
     if ping.is_empty() || !ping.iter().all(u8::is_ascii_digit) {
         return Err(MarkError::BadValue("ping"));
     }
@@ -647,7 +654,7 @@ pub fn parse_mark_body(body: &[u8]) -> Result<BodyRead, MarkError> {
     }))
 }
 
-/// メニューの保存の印（バージョン 2）の key と値。`kind` が `menu` でなければ、後で足す種類として読み飛ばす。知らない key は無視する。
+/// メニューの保存の印（バージョン2）のkeyと値。`kind`が`menu`でなければ後で足す種類として読み飛ばす。知らないkeyは無視する。
 fn parse_menu_fields<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Result<BodyRead, MarkError> {
     let mut kind: Option<Vec<u8>> = None;
     let mut ver: Option<Vec<u8>> = None;
@@ -679,7 +686,7 @@ fn parse_menu_fields<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Result<BodyR
     }
     let ver = String::from_utf8(ver).map_err(|_| MarkError::BadValue("ver"))?;
     let build = build.ok_or(MarkError::MissingKey("build"))?;
-    // `+` や空白を受けないように、数字だけを見てから変換する。
+    // `+`や空白を受けないように数字だけを見てから変換する。
     if build.is_empty() || !build.iter().all(u8::is_ascii_digit) {
         return Err(MarkError::BadValue("build"));
     }
@@ -690,13 +697,14 @@ fn parse_menu_fields<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Result<BodyR
     Ok(BodyRead::Menu(MenuMark { ver, build }))
 }
 
-/// ファイルから印を読む。`comp_size` から USER を順にたどり、タグ `HGRT` のものだけを見る。知らないバージョンは読み飛ばし、
-/// 最初のバージョン 1 の結果（読めた / 壊れている）を返す。ファイル自体が読めなければ `Err`。
+/// ファイルから印を読む。`comp_size`からUSERを順にたどり、タグ`HGRT`のものだけを見る。
+/// 知らないバージョンは読み飛ばして最初のバージョン1の結果（読めた / 壊れている）を返す。
+/// ファイル自体が読めなければ`Err`。
 pub fn read_mark(file: &[u8]) -> Result<MarkRead, ReplayError> {
     let layout = parse(file)?;
     let mut saw_unknown = false;
     for chunk in layout.chunks.iter().filter(|c| c.is_mark()) {
-        // parse が作った位置なので必ず読める。読めなければ壊れているとは言わず飛ばす（パニックさせない）。
+        // parseが作った位置なので必ず読める。読めなければ壊れているとは言わず飛ばす（パニックさせない）。
         let Some(body) = chunk.body(file) else {
             continue;
         };
@@ -734,8 +742,8 @@ mod tests {
         }
     }
 
-    /// ゲームと同じ形の USER チャンク（全長 = strlen(本文) + 13 を偶数へ、`+0x08` は実測の残り物 `0x7FFFFF00`、末尾 NUL）。
-    /// `mark_chunk` を使わず手で組む（同じ式から作ると丸めの間違いを見逃す）。
+    /// ゲームと同じ形のUSERチャンク（全長 = strlen(本文) + 13 を偶数へ、`+0x08`は実測の残り物`0x7FFFFF00`、末尾NUL）。
+    /// `mark_chunk`を使わず手で組む（同じ式から作ると丸めの間違いを見逃す）。
     fn game_user_chunk(text: &[u8]) -> Vec<u8> {
         let total = (text.len() + 13 + 1) & !1;
         let mut c = Vec::new();
@@ -792,7 +800,7 @@ mod tests {
         }
     }
 
-    /// 3 ラウンド・通信の要約つきの、マッチの情報の見本。
+    /// 3ラウンド・通信の要約つきのマッチの情報の見本。
     fn sample_detail() -> MatchDetail {
         MatchDetail {
             sync: Some(SyncKind::Rollback),
@@ -904,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_reader_without_the_role_keys_still_reads_a_watch_mark() {
-        // 足す前の読みは、`role`・`p1`・`p2` を除いた本文を読むことで模す。
+        // 足す前の読みは`role`・`p1`・`p2`を除いた本文を読むことで模す。
         let m = watch_mark("a", "b", "me");
         let body = mark_body(&m).unwrap();
         let legacy: Vec<&str> = body
@@ -1016,7 +1024,7 @@ mod tests {
                 total: 11
             }
         );
-        // 全長 0 は「次のチャンクが同じ位置」で止まらなくなる形。
+        // 全長0は「次のチャンクが同じ位置」で止まらなくなる形。
         f[comp + 4..comp + 8].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(refuse(&f), ReplayError::ChunkTooShort { .. }));
 
@@ -1088,7 +1096,7 @@ mod tests {
         assert_eq!(mark_chunk(&m), Err(MarkError::BadValue("lat")));
         m = sample_mark("p", "s");
         m.at.month = 2;
-        m.at.day = 29; // 2026 は閏年でない
+        m.at.day = 29; // 2026は閏年でない
         assert_eq!(mark_chunk(&m), Err(MarkError::BadValue("at")));
         m.at.year = 2028;
         assert!(mark_chunk(&m).is_ok());
@@ -1231,7 +1239,7 @@ mod tests {
         let m = detail_mark();
         let chunk = mark_chunk(&m).unwrap();
         let plain = mark_chunk(&sample_mark("a b", "Z")).unwrap();
-        // 見本の名前は短い。実在の名前（各 32 バイトまで）が入っても 700 バイトに収まる。
+        // 見本の名前は短い。実在の名前（各32バイトまで）が入っても700バイトに収まる。
         assert!(chunk.len() < 420, "{} バイト", chunk.len());
         let worst = Mark {
             peer: "x".repeat(32),
@@ -1244,7 +1252,7 @@ mod tests {
 
     #[test]
     fn a_reader_that_does_not_know_the_detail_keys_reads_the_rest() {
-        // 足す前の読みは、マッチの情報のキーを除いた本文を読むことで模す。
+        // 足す前の読みはマッチの情報のキーを除いた本文を読むことで模す。
         let m = detail_mark();
         let body = mark_body(&m).unwrap();
         let old: Vec<&str> = body
@@ -1261,7 +1269,7 @@ mod tests {
         };
         assert_eq!(back, sample_mark("a b", "Z"));
         assert_eq!(back.detail, None);
-        // 逆向き: 今の読みは足す前の印（V1）を読み、マッチの情報は無い。
+        // 逆向き: 今の読みは足す前の印（V1）を読む。マッチの情報は無い。
         let BodyRead::Mark(v1) = parse_mark_body(V1.as_bytes()).unwrap() else {
             panic!("V1 が読めない");
         };
@@ -1284,7 +1292,7 @@ mod tests {
             matches!(&read, Ok(MarkRead::Found(f)) if f.detail.as_ref().unwrap().charge == Some([1, 0])),
             "{read:?}"
         );
-        // このキーを知らない読み（足す前）は、キーを除いた本文と同じに読む。
+        // このキーを知らない読み（足す前）はキーを除いた本文と同じに読む。
         let old: Vec<&str> = body
             .split('\t')
             .filter(|f| !f.starts_with("charge="))
@@ -1296,7 +1304,7 @@ mod tests {
         );
         // 無いときは書かない。
         assert!(!mark_body(&detail_mark()).unwrap().contains("charge"));
-        // 知らない key は無視して読む約束（足す前の読みはこの経路で `charge` を飛ばす）。
+        // 知らないkeyは無視して読む約束（足す前の読みはこの経路で`charge`を飛ばす）。
         assert!(parse_mark_body(format!("{V1}\tcharge=1.0").as_bytes()).is_ok());
     }
 
@@ -1398,7 +1406,7 @@ mod tests {
         assert_eq!(mark_chunk(&m), Err(MarkError::BadValue("rounds")));
     }
 
-    /// 印に入る key は閉じた一覧だけ。IP・ポート・接続コード・ルーム名・接続 ID の欄は無い（足せばここで落ちる）。
+    /// 印に入るkeyは閉じた一覧だけ。IP・ポート・接続コード・ルーム名・接続IDのフィールドは無い（足せばここで落ちる）。
     #[test]
     fn the_mark_has_only_the_listed_keys() {
         let mut keys: Vec<&str> = KEYS.to_vec();
@@ -1417,7 +1425,7 @@ mod tests {
             assert!(keys.contains(&key), "一覧に無い key {key:?}");
             seen += 1;
         }
-        // 必須 7 ＋ 観戦 3 ＋ sync/build/start/n/net/rx ＋ r1〜r3。
+        // 必須7 ＋ 観戦3 ＋ sync/build/start/n/net/rx ＋ r1〜r3。
         assert_eq!(seen, 7 + 3 + 6 + 3);
         for secret in ["room", "conn", "code", "addr", "host"] {
             assert!(!keys.iter().any(|k| k.contains(secret)), "{secret}");
@@ -1425,7 +1433,7 @@ mod tests {
         for secret in ["ip", "port", "sid", "cid", "session"] {
             assert!(!keys.contains(&secret), "{secret}");
         }
-        // 名前の値に `r1=` のような形が入っても欄を増やせない（`=` と `\t` は逃がされる）。
+        // 名前の値に`r1=`のような形が入ってもフィールドを増やせない（`=`と`\t`は逃がされる）。
         let sneaky = Mark {
             peer: "a\tr9=1".to_string(),
             ..sample_mark("p", "s")
@@ -1436,7 +1444,7 @@ mod tests {
 
     #[test]
     fn random_bytes_never_panic() {
-        // 半分は T9RP と USER の形を持たせて奥まで届かせ、奥まで届いた本数が 0 でないことも見る（全部が入口で断られると測れていない）。
+        // 半分はT9RPとUSERの形を持たせて奥まで届かせる。奥まで届いた本数が0でないことも検証する（全部が入口で断られると測れていない）。
         let mut rng = XorShift(0x9E37_79B9);
         let mut parsed_ok = 0u32;
         let mut marks_seen = 0u32;
@@ -1490,9 +1498,9 @@ mod tests {
         );
     }
 
-    // ---- ゲームのメニューから保存したリプレイの印（バージョン 2・kind=menu） ----
+    // ---- ゲームのメニューから保存したリプレイの印（バージョン2・kind=menu） ----
 
-    /// thprac の `PRAC` と同じ形の USER（`+0x08` が `PRAC`）。
+    /// thpracの`PRAC`と同じ形のUSER（`+0x08`が`PRAC`）。
     fn prac_chunk() -> Vec<u8> {
         let text = b"THPRAC test body";
         let total = (12 + text.len() + 1 + 1) & !1;
@@ -1603,7 +1611,7 @@ mod tests {
             ver: "1.1.1".into(),
             build: 7,
         };
-        // ネット対戦の印・メニューの印・知らないバージョンの印のどれが先にあっても、二重に付けない。
+        // ネット対戦の印・メニューの印・知らないバージョンの印のどれが先にあっても二重に付けない。
         let base = synthetic_replay(0xC0, 1);
         for first in [
             chunk_to_append(&base, &sample_mark("a", "b")).unwrap(),
@@ -1643,7 +1651,7 @@ mod tests {
                 build: 5
             }))
         );
-        // 順序・知らない key は問わない（後で足せる）。
+        // 順序・知らないkeyは問わない（後で足せる）。
         assert_eq!(
             read("HIGANR\t2\tbuild=5\tfuture=x\tver=1.1.1\tkind=menu"),
             Ok(BodyRead::Menu(MenuMark {
@@ -1651,7 +1659,7 @@ mod tests {
                 build: 5
             }))
         );
-        // 知らない種類は読み飛ばす（バージョン 1 の `UnknownVersion` と同じ扱い）。
+        // 知らない種類は読み飛ばす（バージョン1の`UnknownVersion`と同じ扱い）。
         assert_eq!(read("HIGANR\t2\tkind=other"), Ok(BodyRead::UnknownVersion));
         assert_eq!(
             read("HIGANR\t3\tkind=menu\tver=1.1.1\tbuild=5"),
@@ -1665,7 +1673,7 @@ mod tests {
             read("HIGANR\t2\tkind=menu\tver=1.1.1"),
             Err(MarkError::MissingKey("build"))
         );
-        // `ver` は必須（まだ配っていない形なので、key の無い古い形は読まない）。
+        // `ver`は必須（まだ配布していない形なのでkeyの無い古い形は読まない）。
         assert_eq!(
             read("HIGANR\t2\tkind=menu\tbuild=5"),
             Err(MarkError::MissingKey("ver"))
@@ -1733,7 +1741,7 @@ mod tests {
                 build: 3
             })
         );
-        // バージョン 1 の本文にメニューの key だけがあっても `Menu` にはならず、必須の key の欠けで壊れている扱い。
+        // バージョン1の本文にメニューのkeyだけがあっても`Menu`にはならない。必須のkeyの欠けで壊れている扱いになる。
         let mut g = synthetic_replay(0xC0, 2);
         g.extend_from_slice(&frame_chunk("HIGANR\t1\tkind=menu\tver=1.1.1\tbuild=3").unwrap());
         assert_eq!(

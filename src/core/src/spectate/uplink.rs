@@ -1,8 +1,10 @@
-//! 試合中の観戦者 → ホストの上りの太さの測り（中継役を選ぶ値 `note_uplink` を作る）。ホストは中継役が足りない間だけ、直接の観戦者に
-//! 1 人ずつ番（SPECTATE_MEASURE）を渡し、観戦者は 2 通の組（SPECTATE_PAIR。1,200 B ちょうど）を `PAIR_GAP_MS` ごとに
-//! `MEASURE_PAIRS` 組送る。ホストは組の 2 通の到着の差からその組の太さを出し（packet pair。差は経路のいちばん細い所の太さで決まる）、
-//! 使える組の中央値を見積もりにする。どれも受信スレッドで走り、確保しない。ホストの時刻は `poll` が ms、`on_pair` が µs
-//! （別の時計でよい。µs は組の 2 通の差にだけ使う）。
+//! 試合中の観戦者からホストへの上りの太さの測り（中継役を選ぶ値`note_uplink`を作る）。
+//! ホストは中継役が足りない間だけ、直接の観戦者に1人ずつ番（SPECTATE_MEASURE）を渡す。
+//! 番を受けた観戦者は、2通のペア（SPECTATE_PAIR。1,200 Bちょうど）を`PAIR_GAP_MS`ごとに`MEASURE_PAIRS`ペア送る。
+//! ホストはペアの2通の到着の差からそのペアの太さを出す（packet pair。差は経路のいちばん細い所の太さで決まる）。
+//! 使えるペアの中央値を見積もりにする。
+//! どれも受信スレッドで走り、確保しない。
+//! ホストの時刻は`poll`がms、`on_pair`がµs（別の時計でよい。µsはペアの2通の差にだけ使う）。
 
 use super::tree::before;
 use super::*;
@@ -10,44 +12,45 @@ use crate::host_pick::MIN_WIDTH_US;
 use crate::spectate_rate::{FULL_PPM, RELAY_MIN_BPS};
 use crate::wire::SpectatePair;
 
-/// 1 回の番で観戦者が送る組の数。
+/// 1回の番で観戦者が送るペアの数。
 pub const MEASURE_PAIRS: u8 = 10;
-/// PAIR 1 通の長さ（B。封じた全体）。経路 MTU を割らない上限いっぱいにして、組の 2 通の差を太さに比べて大きくする。
+/// PAIR 1通の長さ（B。封じた全体）。経路MTUを割らない上限いっぱいにしてペアの2通の差を太さに比べて大きくする。
 pub const PAIR_LEN: usize = MAX_DATAGRAM;
-/// 観戦者が組を送る間隔（ms）。組どうしを離し、前の組の後ろに次の組が詰まらないようにする（細い回線で詰まっても、組の 2 通は続けて
-/// 並ぶので差は変わらない）。
+/// 観戦者がペアを送る間隔（ms）。
+/// ペアどうしを離し、前のペアの後ろに次のペアが詰まらないようにする。
+/// 細い回線で詰まってもペアの2通は続けて並ぶので、差は変わらない。
 pub const PAIR_GAP_MS: u32 = 100;
-/// ホストが MEASURE を送り直す間隔（ms。最初の PAIR が来るまで）と、送る回数の上限（最初の 1 通を含む）。
+/// ホストがMEASUREを再送する間隔（ms。最初のPAIRが来るまで）と、送る回数の上限（最初の1通を含む）。
 pub const MEASURE_RESEND_MS: u32 = 300;
 pub const MEASURE_SENDS: u8 = 3;
 /// 番を渡してからこの時間で締める（ms）。
 pub const MEASURE_CLOSE_MS: u32 = 2_000;
-// 最後の MEASURE で始めた観戦者の組も、片道の分を残して締めの前に送り終える。
+// 最後のMEASUREで始めた観戦者のペアも片道の分を残して締めの前に送り終える。
 const _: () = assert!(
     (MEASURE_SENDS as u32 - 1) * MEASURE_RESEND_MS + (MEASURE_PAIRS as u32 - 1) * PAIR_GAP_MS
         < MEASURE_CLOSE_MS
 );
-/// 見積もりに要る、使える組の数の下限。
+/// 見積もりに要る使えるペアの数の下限。
 pub const MEASURE_MIN_PAIRS: usize = 3;
-/// 測れなかった観戦者に番をもう 1 回回すまでの時間（ms）と、1 人（観戦者の枠）の番の回数の上限。
+/// 測れなかった観戦者に番をもう1回回すまでの時間（ms）と、1人（観戦者の枠）の番の回数の上限。
 pub const MEASURE_RETRY_MS: u32 = 30_000;
 pub const MEASURE_ROUNDS: u8 = 2;
-/// 1 組の見積もりの上限（B/s）: 組の 2 通が `MIN_WIDTH_US` で届いた太さ（1.2 MB/s、約 9.6 Mbps）。これより太い同士の順は付かないが、
-/// 中継に要る太さを大きく越える。
+/// 1ペアの見積もりの上限（B/s）。ペアの2通が`MIN_WIDTH_US`で届いた太さ（1.2 MB/s。約9.6 Mbps）。
+/// これより太い同士の順は付かないが、中継に要る太さを大きく越える。
 pub const PAIR_CAP: u32 = (PAIR_LEN as u64 * 1_000_000 / MIN_WIDTH_US) as u32;
 const _: () = assert!(PAIR_CAP > RELAY_MIN_BPS);
 
-/// 1 組の 2 通の到着（µs）。
+/// 1ペアの2通の到着（µs）。
 #[derive(Debug, Clone, Copy, Default)]
 struct Arrival {
     first: Option<u64>,
     second: Option<u64>,
-    /// 2 通目が 1 通目より先に着いた（順の入れ替わった組は使わない）。
+    /// 2通目が1通目より先に着いた（順番が入れ替わったペアは使わない）。
     reversed: bool,
 }
 
 impl Arrival {
-    /// 使える組の太さ（B/s）。片方だけ・順の逆の組は None。
+    /// 使えるペアの太さ（B/s）。片方だけ・順番が逆のペアはNone。
     fn bps(&self) -> Option<u32> {
         let (Some(f), Some(s)) = (self.first, self.second) else {
             return None;
@@ -71,12 +74,12 @@ struct Turn {
     started: u32,
     sends: u8,
     last_send: u32,
-    /// PAIR を 1 通でも受けた（MEASURE の送り直しをやめる）。
+    /// PAIRを1通でも受けた（MEASUREの再送をやめる）。
     heard: bool,
     arrivals: [Arrival; MEASURE_PAIRS as usize],
 }
 
-/// ホストの測りの持ち物（ホストに 1 つ。観戦者の枠には回数と時刻だけ）。
+/// ホストの測りの状態（ホストに1つ。観戦者の枠には回数と時刻だけ）。
 pub(super) struct Meter {
     turn: Option<Turn>,
     last_turn: u16,
@@ -93,7 +96,7 @@ impl Meter {
     }
 }
 
-/// 使える組の太さの中央値（偶数個なら小さい方。中継役を太く見誤らない）。
+/// 使えるペアの太さの中央値（偶数個なら小さい方。中継役を太く見誤らない）。
 fn median(vals: &mut [u32]) -> Option<u32> {
     vals.sort_unstable();
     let mid = vals.len().checked_sub(1)? / 2;
@@ -101,20 +104,20 @@ fn median(vals: &mut [u32]) -> Option<u32> {
 }
 
 impl SpectateHost {
-    /// **検査のためだけ**: 使える組が 2 組以上そろった番の見積もりを、この値（B/s）にする。loopback では皆の太さが同じなので、
-    /// 実機のテストで片方を太く見せる。
+    /// **検査のためだけ**: 使えるペアが2ペア以上そろった番の見積もりを、この値（B/s）にする。
+    /// loopbackでは皆の太さが同じなので、実機のテストで片方を太く見せるために使う。
     #[doc(hidden)]
     pub fn set_fake_uplink(&mut self, bps: Option<u32>) {
         self.meter.fake = bps;
     }
 
-    /// `set_fake_uplink` で置いた値。
+    /// `set_fake_uplink`で置いた値。
     #[doc(hidden)]
     pub fn fake_uplink(&self) -> Option<u32> {
         self.meter.fake
     }
 
-    /// 送り元 `addr` の観戦者の上りの見積もり（B/s。0 はまだ分からない）。
+    /// 送信元`addr`の観戦者の上りの見積もり（B/s。0はまだ分からない）。
     pub fn uplink_of(&self, addr: SocketAddr) -> Option<u32> {
         self.slots
             .iter()
@@ -128,8 +131,10 @@ impl SpectateHost {
         self.meter.turn.as_ref().map(|t| t.addr)
     }
 
-    /// 測りの組 PAIR の 1 通（`wire::peek_type` が `SpectatePair` のもの）。`now_us` は受信スレッドが読んだ時刻（µs）。番を持つ観戦者の
-    /// 送り元から来たものだけを、その観戦者の鍵で開く（ほかは開かずに捨てる）。番の組として受けたら true。
+    /// 測りのペアPAIRの1通（`wire::peek_type`が`SpectatePair`のもの）。
+    /// `now_us`は受信スレッドが読んだ時刻（µs）。
+    /// 番を持つ観戦者の送信元から来たものだけをその観戦者の鍵で開く（ほかは開かずに捨てる）。
+    /// 番のペアとして受けたらtrue。
     pub fn on_pair(&mut self, from: SocketAddr, bytes: &[u8], now_us: u64) -> bool {
         let Some((slot, nonce, public, turn)) = self
             .meter
@@ -167,7 +172,7 @@ impl SpectateHost {
             self.counts.pairs_dropped += 1;
             return false;
         };
-        // 重なった便は最初の 1 通だけ使う。
+        // ペアの同じ位置のPAIRが重複して届いたら最初の1通だけ使う。
         let fresh = if p.second {
             a.second.is_none()
         } else {
@@ -190,8 +195,8 @@ impl SpectateHost {
         true
     }
 
-    /// 測ってよいか: 元のホストで、中継役（と中継役に向くと分かった直接の観戦者）が `RELAYS` 人に満たず、観戦者への送信を絞っていない
-    /// （対戦の往復が延びている間は、組の 1,200 B を相手の便の前に並べない）。
+    /// 測ってよいかどうか。次が全部揃ったとき: 元のホスト・中継役（と中継役に向くと分かった直接の観戦者）が`RELAYS`人に満たない・観戦者への送信を絞っていない。
+    /// 送信を絞っている間（対戦の往復が延びている間）はペアの1,200 Bを相手へのパケットの前に並べない。
     fn may_measure(&self) -> bool {
         if self.tree.is_relay() || self.throttle.level_ppm() < FULL_PPM || self.throttle.paused() {
             return false;
@@ -204,8 +209,8 @@ impl SpectateHost {
         relays < RELAYS
     }
 
-    /// 番を渡す観戦者（枠の順で最初の人）: 中継を許可し、回線の型が届く側で、ACK を返していて、中継役でなく、ACK が「紹介しないで」でなく
-    /// （組を送らないので番が空振りする）、上りがまだ分からず、番の回数が上限の内（2 回目は測れなかった番から `MEASURE_RETRY_MS` の後）。
+    /// 番を渡す観戦者（枠の順で最初の人）。次が全部揃っている人。
+    /// 中継を許可している・ネットワーク種別のフラグが届く側・ACKを返している・中継役でない・ACKが「紹介しないで」でない（「紹介しないで」の人はペアを送らないので番が空振りする）・上りがまだ分からない・番の回数が上限の内（2回目は測れなかった番から`MEASURE_RETRY_MS`の後）。
     fn measure_candidate(&self, now: u32) -> Option<usize> {
         (0..SLOT_CAP).find(|&i| {
             self.is_representative(i)
@@ -222,7 +227,7 @@ impl SpectateHost {
         })
     }
 
-    /// `poll` の測り: 番を持つ観戦者がいれば MEASURE の送り直しと締め、いなければ測ってよいときに次の 1 人へ番を渡す。
+    /// `poll`の測りの処理。番を持つ観戦者がいればMEASUREの再送と締めの処理をする。いなければ測ってよいときに次の1人へ番を渡す。
     pub(super) fn measure_poll<O: Outlet>(&mut self, now: u32, out: &mut O) {
         if self.meter.turn.is_some() {
             self.tend_turn(now, out);
@@ -267,8 +272,10 @@ impl SpectateHost {
         self.counts.measures += 1;
     }
 
-    /// 番を持つ観戦者の測り: 抜けた（枠が別の人になった）ら捨て、全部の組がそろったか `MEASURE_CLOSE_MS` 経ったら締め、まだ PAIR が
-    /// 来なければ MEASURE を送り直す。
+    /// 番を持つ観戦者の測りの処理。
+    /// 抜けた（枠が別の人になった）ら捨てる。
+    /// 全部のペアがそろったか`MEASURE_CLOSE_MS`経ったら締める。
+    /// まだPAIRが来なければMEASUREを再送する。
     fn tend_turn<O: Outlet>(&mut self, now: u32, out: &mut O) {
         let Some(t) = self.meter.turn else {
             return;
@@ -338,10 +345,10 @@ impl SpectateHost {
 
 // ============================ 観戦者 ============================
 
-/// 観戦者の測り（受けた番と、送った組）。
+/// 観戦者の測り（受けた番と送ったペア）。
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WatchMeter {
-    /// 最後に受けた番の番号（0 はまだ無い。同じ番号の送り直しは無視する）。
+    /// 最後に受けた番の番号（0はまだ無い。同じ番号の再送は無視する）。
     turn: u16,
     sent: u8,
     next_at: u32,
@@ -360,7 +367,7 @@ impl WatchMeter {
 }
 
 impl Watcher {
-    /// 元のホストの MEASURE: 測れる（`measurable`）ときだけ、新しい番号の番を始める（前の番は捨てる）。
+    /// 元のホストのMEASURE: 測れる（`measurable`）ときだけ新しい番号の番を始める（前の番は捨てる）。
     pub(super) fn on_measure(&mut self, turn: u16, now: u32) {
         if turn == self.meter.turn {
             return;
@@ -378,8 +385,9 @@ impl Watcher {
         self.tree.counts.measures_taken += 1;
     }
 
-    /// `poll` の測り: 番の間、`PAIR_GAP_MS` ごとに組（2 通を続けて）を元のホストへ送る。遅れて呼ばれても 1 回に 1 組だけ。測れなく
-    /// なったら（子ができた・親を替えた）やめる。
+    /// `poll`の測りの処理。番の間は`PAIR_GAP_MS`ごとにペア（2通を続けて）を元のホストへ送る。
+    /// 遅れて呼ばれても1回に1ペアだけ送る。
+    /// 測れなくなったら（子ができた・親を替えた）やめる。
     pub(super) fn send_pairs<O: Outlet>(&mut self, now: u32, out: &mut O) {
         let m = self.meter;
         if !m.active || before(now, m.next_at) {

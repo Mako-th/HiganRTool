@@ -1,7 +1,7 @@
-//! PE32 の見出しを読む（pure）。
+//! PE32のヘッダを読む（pure）。
 //!
-//! 32bit の PE32 だけを受け付ける（`MZ`・`PE\0\0`・machine `0x014C`・optional header の magic `0x10B`）。
-//! PE32+ や x64 は `Err`。どの読み取りも長さを検証してから行い、壊れたバイト列でもパニックしない。
+//! 32bitのPE32だけを受け付ける（`MZ`・`PE\0\0`・machine `0x014C`・optional headerのmagic `0x10B`）。
+//! PE32+ やx64は`Err`。どの読み取りも長さを検証してから行う。壊れたバイト列でもパニックしない。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeError {
@@ -19,7 +19,7 @@ pub enum PeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionHeader {
-    /// 生の 8 バイト（`.text` のように短ければ後ろは `0x00`）。
+    /// 生の8バイト（`.text`のように短ければ後ろは`0x00`）。
     pub name: [u8; 8],
     pub virtual_size: u32,
     pub virtual_address: u32,
@@ -55,7 +55,7 @@ const MACHINE_I386: u16 = 0x014C;
 const MAGIC_PE32: u16 = 0x10B;
 const MAGIC_PE32_PLUS: u16 = 0x20B;
 
-/// PE32 の見出しを読む。壊れた・切り詰められたバイト列は `Err` を返すだけでパニックしない。
+/// PE32のヘッダを読む。壊れた・切り詰められたバイト列は`Err`を返すだけでパニックしない。
 pub fn parse(bytes: &[u8]) -> Result<PeInfo, PeError> {
     if bytes.len() < 0x40 {
         return Err(PeError::TooShortForDosHeader);
@@ -70,7 +70,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeInfo, PeError> {
         return Err(PeError::NotPeSignature);
     }
 
-    let file_header_off = e_lfanew + 4; // e_lfanew は上で境界内と検証した u32 の値
+    let file_header_off = e_lfanew + 4; // e_lfanewは上で境界内と検証したu32の値
     if get_range(bytes, file_header_off, 20).is_none() {
         return Err(PeError::TooShortForFileHeader);
     }
@@ -153,15 +153,15 @@ impl PeInfo {
             .find(|s| trim_trailing_nul(&s.name) == target)
     }
 
-    /// RVA をファイル上の位置に変換する。どの節にも属さない、またはファイル実体の無い範囲（BSS 相当）なら `None`。
+    /// RVAをファイル上の位置に変換する。どの節にも属さない、またはファイル実体の無い範囲（BSS相当）なら`None`。
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         for s in &self.sections {
-            // BSS 相当の領域も「その節に属する RVA」として扱うため、範囲の判定には virtual_size を使う。
+            // BSS相当の領域も「その節に属するRVA」として扱うため範囲の判定にはvirtual_sizeを使う。
             let va_end = s.virtual_address.checked_add(s.virtual_size)?;
             if rva >= s.virtual_address && rva < va_end {
                 let delta = rva - s.virtual_address;
                 if delta >= s.size_of_raw_data {
-                    return None; // BSS 相当。ファイル上に実体が無い
+                    return None; // BSS相当。ファイル上に実体が無い
                 }
                 return s.pointer_to_raw_data.checked_add(delta);
             }
@@ -169,18 +169,18 @@ impl PeInfo {
         None
     }
 
-    /// 入口（`address_of_entry_point`）から `n` バイト。`image` は `PeInfo` を作った元のバイト列。
+    /// 入口（`address_of_entry_point`）から`n`バイト。`image`は`PeInfo`を作った元のバイト列。
     pub fn entry_bytes<'a>(&self, image: &'a [u8], n: usize) -> Option<&'a [u8]> {
         let file_off = self.rva_to_file_offset(self.address_of_entry_point)? as usize;
         get_range(image, file_off, n)
     }
 }
 
-/// ゲームの同定に使う組（thprac と同じ材料: timeStamp / textSize / 入口のバイト列）。
+/// ゲームの同定に使う値の組み合わせ（thpracと同じ材料: timeStamp / textSize / 入口のバイト列）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ident<'a> {
     pub time_date_stamp: u32,
-    /// `.text` 節の SizeOfRawData。optional header の SizeOfCode ではない（1.50a では偶然同じ値）。
+    /// `.text`節のSizeOfRawData。optional headerのSizeOfCodeではない（1.50aでは偶然同じ値）。
     pub text_size_of_raw_data: u32,
     pub entry_bytes: &'a [u8],
 }
@@ -192,14 +192,14 @@ pub enum IdentField {
     EntryBytes,
 }
 
-/// 花映塚 1.50a の入口（RVA `0x0007D45F`、ファイル位置 `0x0007C85F`）から 20 バイト（実機の exe を読み取り専用で読んだ）。
-/// 20 バイトは thprac が同定に使う長さ。
+/// 花映塚1.50aの入口（RVA `0x0007D45F`、ファイル位置`0x0007C85F`）から20バイト（実機のexeを読み取り専用で読んだ）。
+/// 20バイトはthpracが同定に使う長さ。
 pub const TH09_V150A_ENTRY_BYTES: [u8; 20] = [
     0x6A, 0x60, 0x68, 0xA8, 0x55, 0x49, 0x00, 0xE8, 0x45, 0x1C, 0x00, 0x00, 0xBF, 0x94, 0x00, 0x00,
     0x00, 0x8B, 0xC7, 0xE8,
 ];
 
-/// 花映塚 1.50a の同定の値。
+/// 花映塚1.50aの同定の値。
 pub const TH09_V150A: Ident<'static> = Ident {
     time_date_stamp: 1_128_708_539,     // 0x4346B9BB
     text_size_of_raw_data: 0x0008_CC00, // 576,512
@@ -211,7 +211,7 @@ pub struct IdentMismatch {
     pub fields: Vec<IdentField>,
 }
 
-/// `bytes` が `ident` の指すゲーム本体と一致するか。PE32 として読めなければ 3 欄すべてを食い違いとして返す。
+/// `bytes`が`ident`の指すゲーム本体と一致するかどうか。PE32として読めなければ3つのフィールドすべてを食い違いとして返す。
 pub fn check_ident(bytes: &[u8], ident: &Ident<'_>) -> Result<(), IdentMismatch> {
     let info = match parse(bytes) {
         Ok(info) => info,
@@ -230,7 +230,7 @@ pub fn check_ident(bytes: &[u8], ident: &Ident<'_>) -> Result<(), IdentMismatch>
     if info.time_date_stamp != ident.time_date_stamp {
         fields.push(IdentField::TimeDateStamp);
     }
-    // `.text` が無い exe は花映塚ではないので、既定値 0 と比べて素通りさせず食い違いに数える。
+    // `.text`が無いexeは花映塚ではないので既定値0と比べて素通りさせず食い違いに数える。
     let text_size = info.section_by_name(".text").map(|s| s.size_of_raw_data);
     if text_size != Some(ident.text_size_of_raw_data) {
         fields.push(IdentField::TextSizeOfRawData);
@@ -251,7 +251,7 @@ pub fn check_ident(bytes: &[u8], ident: &Ident<'_>) -> Result<(), IdentMismatch>
 
 #[cfg(test)]
 mod tests {
-    //! 実物の exe は使わず、合成の最小 PE32（データディレクトリ無しの 96 バイトの optional header）を組む。
+    //! 実物のexeは使わない。合成の最小PE32（データディレクトリ無しの96バイトのoptional header）を組む。
     use super::*;
 
     const E_LFANEW: usize = 0x40;
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn check_ident_ok_when_all_three_fields_match() {
         let entry = [0x11u8, 0x22, 0x33, 0x44];
-        // SizeOfCode と `.text` の SizeOfRawData をわざと違う値にしてある。
+        // SizeOfCodeと`.text`のSizeOfRawDataをわざと違う値にしてある。
         let image = one_section_image(0x5000_0000, 0x3000, &entry);
         let ident = Ident {
             time_date_stamp: 0x5000_0000,
@@ -512,7 +512,7 @@ mod tests {
         raw[delta..delta + 20].copy_from_slice(&TH09_V150A_ENTRY_BYTES);
         let image = build_minimal_pe32(
             TH09_V150A.time_date_stamp,
-            0x1234, // SizeOfCode はわざと違う値
+            0x1234, // SizeOfCodeはわざと違う値
             entry_rva,
             &[SectionSpec {
                 name: b".text",
@@ -607,7 +607,7 @@ mod tests {
         let image = one_section_image(0x1111_1111, 0x2222, &entry);
         let ident = Ident {
             time_date_stamp: 0x9999_9999,           // 違う
-            text_size_of_raw_data: 16,              // 同じ（`.text` は 16 バイト）
+            text_size_of_raw_data: 16,              // 同じ（`.text`は16バイト）
             entry_bytes: &[0xFF, 0xFF, 0xFF, 0xFF], // 違う
         };
         let err = check_ident(&image, &ident).unwrap_err();

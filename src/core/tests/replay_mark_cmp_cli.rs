@@ -1,5 +1,5 @@
-//! ツール `replay_mark_cmp` を本物のプロセスで走らせる検査（合成のリプレイと合成の印だけ）。
-//! 「引数 → フォルダをたどる → 印を読む → 並べる → 終了コード」の配線を見る。比べ方そのものは `replay_mark_cmp` の単体検査。
+//! ツール`replay_mark_cmp`を本物のプロセスで走らせる検査（合成のリプレイと合成の印だけ）。
+//! 「引数 → フォルダをたどる → 印を読む → 並べる → 終了コード」の配線を見る。比べ方そのものは`replay_mark_cmp`の単体検査。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -56,7 +56,7 @@ fn rounds(shift: u32) -> Vec<RoundRec> {
     vec![round(1800 + shift, Winner::P2), round(2400, Winner::P2)]
 }
 
-/// `start` の秒に始まったマッチの合成のリプレイ（2P の台。結果は自分から見て win）。`p2_word` は 2P の 2 フレーム目の語。
+/// `start`の秒に始まったマッチの合成のリプレイ（2Pの台。結果は自分から見てwin）。`p2_word`は2Pの2フレーム目のワード。
 fn replay_bytes(start: u64, rounds: Vec<RoundRec>, p2_word: u16) -> Vec<u8> {
     replay_bytes_with(start, rounds, p2_word, MatchResult::Win)
 }
@@ -100,7 +100,7 @@ fn replay_bytes_with(
     f
 }
 
-/// 台のフォルダに「相手の名前のフォルダ」を 1 段挟んで、マッチごとのリプレイを書き出す（保管庫と同じ形）。
+/// 台のフォルダに「相手の名前のフォルダ」を1階層挟んでマッチごとのリプレイを書き出す（保管庫と同じ形）。
 fn put(dir: &Path, n: usize, bytes: &[u8]) {
     let sub = dir.join("x vs y");
     std::fs::create_dir_all(&sub).unwrap();
@@ -131,7 +131,7 @@ fn three_equal_devices_exit_zero_and_a_differing_observer_exits_one() {
     assert!(text(&o.stdout).contains("a = b = c"), "{}", text(&o.stdout));
     assert!(text(&o.stdout).contains("a 2 本 / b 2 本 / c 2 本"));
 
-    // c の 2 マッチ目だけ、1 ラウンド目の長さが 7 フレーム違う。
+    // cの2マッチ目だけ1ラウンド目の長さが7フレーム違う。
     put(&c, 2, &replay_bytes(1_790_000_103, rounds(7), 8));
     let o = run(&[&s(&a), &s(&b), &s(&c)]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o.stdout));
@@ -162,7 +162,7 @@ fn a_single_file_per_device_and_two_devices_work() {
 fn since_drops_older_marks_and_unreadable_replays_but_without_it_they_are_errors() {
     let t = Tmp::new("since");
     let (a, b) = (t.dir("a"), t.dir("b"));
-    // a には前の回のリプレイ（印なし）と古い start の印、今の回の印がある。
+    // aには前の回のリプレイ（印なし）と古いstartの印、今の回の印がある。
     put(
         &a,
         1,
@@ -205,7 +205,7 @@ fn inputs_flag_compares_the_replay_words_between_devices() {
     let t = Tmp::new("inputs");
     let (a, b) = (t.dir("a"), t.dir("b"));
     put(&a, 1, &replay_bytes(1_790_000_000, rounds(0), 8));
-    // 印は同じで、2P の 2 フレーム目の語だけ違う。
+    // 印は同じで2Pの2フレーム目のワードだけ違う。
     put(&b, 1, &replay_bytes(1_790_000_001, rounds(0), 9));
     let o = run(&[&s(&a), &s(&b)]);
     assert_eq!(o.status.code(), Some(0), "--inputs なしでは印だけを見る");
@@ -254,7 +254,7 @@ fn skip_abort_drops_the_cut_off_match_and_says_so() {
     let t = Tmp::new("abort");
     let (a, b) = (t.dir("a"), t.dir("b"));
     put(&a, 1, &replay_bytes(1_790_000_000, rounds(0), 8));
-    // a だけに、台本の終わりで切れた途中のマッチ（結果 abort。ラウンドは 1 件だけ）がある。
+    // aだけに台本の終わりで切れた途中のマッチ（結果abort。ラウンドは1件だけ）がある。
     put(
         &a,
         2,

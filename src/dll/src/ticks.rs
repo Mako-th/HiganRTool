@@ -1,9 +1,11 @@
-//! tick ごとの記録の形・札の判定・集計・CSV の行（pure。unsafe 無し）。
+//! tickごとの記録の形・チケットの判定・集計・CSVの行（pure。unsafe無し）。
 //!
-//! 入口（`stub.rs` の素のアセンブリ）が 1 件 1024 バイトの枠をリングバッファに書き（先頭の 64 バイトは前のバージョンと同じ配置、その後ろにコピーの表の範囲）、
-//! 読み取りのスレッドが札・中身・札の順に読む。ここは「枠のどこに何があるか」（入口のアセンブリもこの定数を使う）と、
-//! 読んだ札の判定、読んだ件の集計・出口の判定・CSV の行を持つ。Win32 にもゲームのメモリにも触らない。
-//! 読み取りのスレッドで走るので、ヒープも I/O も構わない。
+//! 入口（`stub.rs`の素のアセンブリ）は1件1024バイトの枠をリングバッファに書く。
+//! 先頭の64バイトは前のバージョンと同じ配置で、その後ろにコピーの表の範囲が続く。
+//! 読み取りのスレッドは枠をチケット・中身・チケットの順に読む。
+//! ここが持つのは次のもの。「枠のどこに何があるか」（入口のアセンブリもこの定数を使う）・読んだチケットの判定・読んだ件の集計・出口の判定・CSVの行。
+//! Win32にもゲームのメモリにも触らない。
+//! 読み取りのスレッドで走るのでヒープもI/Oも使ってよい。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -14,21 +16,23 @@ use crate::th09_addr::{
     SEATS_RANGE,
 };
 
-/// リングバッファの件数（60 fps で約 68 秒分）。2 の冪（番号から枠を `and` で引くため）。
+/// リングバッファの件数（60 fpsで約68秒分）。2の冪（番号から枠を`and`で求めるため）。
 pub const RING_LEN: u32 = 4096;
 pub const RING_MASK: u32 = RING_LEN - 1;
-/// 1 件の大きさ。リングバッファは 4096 件 = 4 MiB で DLL の .bss。
+/// 1件の大きさ。リングバッファは4096件 = 4 MiBでDLLの .bss。
 pub const SLOT_BYTES: u32 = 1024;
-/// 枠の番号 → リングバッファの先頭からのバイト数の `shl` の値（1024 = 1 << 10）。
+/// 枠の番号 → リングバッファの先頭からのバイト数の`shl`の値（1024 = 1 << 10）。
 pub const SLOT_SHIFT: u32 = 10;
 pub const SLOT_WORDS: usize = (SLOT_BYTES / 4) as usize;
-/// 先頭の大きさ。前のバージョンの 64 バイトの枠と同じ配置で、札は `+48`、`+52` は描画だけのフレームの印、`+56`〜`+63` は予備。
+/// 先頭の大きさ。前のバージョンの64バイトの枠と同じ配置。
+/// チケットは`+48`。`+52`は描画だけのフレームの印。`+56`〜`+63`は予備。
 /// コピーはこの後ろにだけ書く。
 pub const HEAD_BYTES: u32 = 64;
-// 札（と先頭の欄）は先頭の中にある（コピーがどれも先頭の後ろなら、コピーが札を潰さない）。
+// チケットと先頭のフィールドは先頭の中にある。
+// コピーがどれも先頭の後ろならチケットを潰さない。
 const _: () = assert!(OFF_TICKET + 4 <= HEAD_BYTES);
 
-/// コピーの表の 1 行: ゲームの `src` から `len` バイトを、枠の `dst` バイト目へコピーする。
+/// コピーの表の1行: ゲームの`src`から`len`バイトを枠の`dst`バイト目へコピーする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyRow {
     pub src: u32,
@@ -36,25 +40,25 @@ pub struct CopyRow {
     pub dst: u32,
 }
 
-/// コピーの表の行の上限。このバージョンは 6 行を使い、2 行は予備。
+/// コピーの表の行の上限。このバージョンは6行を使い、2行は予備。
 pub const COPY_MAX_ROWS: usize = 8;
 
-// コピー先の位置（枠の中）。先頭の直後から、4 バイト境界にそろえて順に詰める（合計 548 バイトで 612 まで。
-// 612〜1023 は予備の 2 行のための空き）。
-/// 席のブロックからマップ・一時停止までの範囲（320 バイト）。
+// コピー先の位置（枠の中）。先頭の直後から4バイト境界にそろえて順に詰める。
+// 合計548バイトで612まで。612〜1023は予備の2行のための空き。
+/// サイドのブロックからマップ・一時停止までの範囲（320バイト）。
 pub const OFF_COPY_SEATS: u32 = HEAD_BYTES;
-/// 初期ライフ・読み込みの終わり・対戦の登録の範囲（48 バイト）。
+/// 初期ライフ・読み込みの終わり・対戦の登録の範囲（48バイト）。
 pub const OFF_COPY_MATCH: u32 = OFF_COPY_SEATS + SEATS_LEN;
-/// 乱数の 12 バイト。
+/// 乱数の12バイト。
 pub const OFF_COPY_RNG: u32 = OFF_COPY_MATCH + MATCH_LEN;
-/// InputManager 3 本の `+0x00`〜`+0x37`（56 バイトずつ）。
+/// InputManager 3本の`+0x00`〜`+0x37`（56バイトずつ）。
 pub const OFF_COPY_INPUT: [u32; 3] = [
     OFF_COPY_RNG + RNG_LEN,
     OFF_COPY_RNG + RNG_LEN + INPUT_COPY_LEN,
     OFF_COPY_RNG + RNG_LEN + 2 * INPUT_COPY_LEN,
 ];
 
-/// このバージョンのコピーの表（6 行）。アドレスは `th09_addr`、位置は上の `OFF_COPY_*` から作る。
+/// このバージョンのコピーの表（6行）。アドレスは`th09_addr`、位置は上の`OFF_COPY_*`から作る。
 pub const COPY_TABLE: [CopyRow; 6] = [
     CopyRow {
         src: SEATS_RANGE,
@@ -88,7 +92,7 @@ pub const COPY_TABLE: [CopyRow; 6] = [
     },
 ];
 
-/// 枠 1 件ぶんの中身（札・中身・札の読みを通ったもの）と、その先頭を読んだもの。
+/// 枠1件ぶんの中身（チケット・中身・チケットの読みを通ったもの）とその先頭を読んだもの。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snap {
     pub rec: Record,
@@ -105,13 +109,13 @@ impl Snap {
         }
     }
 
-    /// 枠の `off` バイト目の 1 バイト（範囲の外は `None`）。語はリトルエンディアンで並ぶ（x86 の書きと同じ）。
+    /// 枠の`off`バイト目の1バイト（範囲の外は`None`）。ワードはリトルエンディアンで並ぶ（x86の並びと同じ）。
     pub fn byte(&self, off: u32) -> Option<u8> {
         let w = self.words.get((off / 4) as usize)?;
         Some(w.to_le_bytes()[(off % 4) as usize])
     }
 
-    /// 枠の `off` バイト目から `width`（1〜4）バイトを、リトルエンディアンの数として読む（4 バイト境界に無くてよい）。
+    /// 枠の`off`バイト目から`width`（1〜4）バイトをリトルエンディアンの数として読む（4バイト境界に無くてよい）。
     pub fn read(&self, off: u32, width: u32) -> Option<u32> {
         let mut v = 0u32;
         for i in 0..width {
@@ -120,7 +124,7 @@ impl Snap {
         Some(v)
     }
 
-    /// 枠の 1024 バイト（`_snap.bin` に書く形）。
+    /// 枠の1024バイト（`_snap.bin`に書く形）。
     pub fn bytes(&self) -> Vec<u8> {
         self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
@@ -129,29 +133,31 @@ impl Snap {
 /// TSC（`rdtsc`）の下位 / 上位。
 pub const OFF_TSC_LO: u32 = 0;
 pub const OFF_TSC_HI: u32 = 4;
-/// ウィンドウ `+0x2C`（今の時刻、double）の 8 バイト。ウィンドウのアドレスが 0 なら 0。
+/// ウィンドウ`+0x2C`（今の時刻のdouble）の8バイト。ウィンドウのアドレスが0なら0。
 pub const OFF_NOW_LO: u32 = 8;
 pub const OFF_NOW_HI: u32 = 12;
-/// ウィンドウ `+0x3C`（期限、double）の 8 バイト。ウィンドウのアドレスが 0 なら 0。
+/// ウィンドウ`+0x3C`（期限のdouble）の8バイト。ウィンドウのアドレスが0なら0。
 pub const OFF_DEADLINE_LO: u32 = 16;
 pub const OFF_DEADLINE_HI: u32 = 20;
-/// on_tick の this の `+0x454`（tick ごとに 1 増える欄）。
+/// on_tickのthisの`+0x454`（tickごとに1増えるフィールド）。
 pub const OFF_SUP_FRAME: u32 = 24;
-/// on_tick の this の `+0x58C`（今の場面）/ `+0x590`（次の場面の要求）。
+/// on_tickのthisの`+0x58C`（今の場面）/ `+0x590`（次の場面の要求）。
 pub const OFF_SCENE_CUR: u32 = 28;
 pub const OFF_SCENE_REQ: u32 = 32;
-/// esi そのもの（on_tick の this）。
+/// esiそのもの（on_tickのthis）。
 pub const OFF_ESI: u32 = 36;
-/// スレッド ID（`fs:[0x24]`）。
+/// スレッドID（`fs:[0x24]`）。
 pub const OFF_TID: u32 = 40;
-/// FPU の制御語（`fnstcw` の 2 バイト。上位 2 バイトは 0）。
+/// FPUのコントロールワード（`fnstcw`の2バイト。上位2バイトは0）。
 pub const OFF_FPUCW: u32 = 44;
-/// 番号札（seq + 1）。0 は「書いている途中」。
+/// 番号のチケット（seq + 1）。0は「書いている途中」。
 pub const OFF_TICKET: u32 = 48;
-/// 中身の語の数（札の手前まで）。`+52` の印は `render_only_mark` で読む。`+56`〜`+63` は予備で、入口は書かない。
+/// 中身のワード数（チケットの手前まで）。`+52`の印は`render_only_mark`で読む。`+56`〜`+63`は予備。入口は書かない。
 pub const BODY_WORDS: usize = (OFF_TICKET / 4) as usize;
-/// 描画だけのフレームの印（4 バイト）。入口は毎回書く（普通の件は 0、描画だけのフレームは 1）: リングバッファは一周して枠を使い回すので、
-/// 普通の件で 0 を書かないと前の周の 1 が残る。札より前に書く（札・中身・札の読みで中身と一緒に採れる）。
+/// 描画だけのフレームの印（4バイト）。
+/// 入口は毎回書く（普通の件は0、描画だけのフレームは1）。
+/// リングバッファは一周して枠を使い回す。普通の件で0を書かないと前の周の1が残る。
+/// チケットより前に書く（チケット・中身・チケットの読みで中身と一緒に採れる）。
 pub const OFF_RENDER_ONLY: u32 = 52;
 const _: () = assert!(OFF_RENDER_ONLY == OFF_TICKET + 4 && OFF_RENDER_ONLY + 4 <= HEAD_BYTES);
 
@@ -161,8 +167,9 @@ impl Snap {
     }
 }
 
-/// 読み取りのスレッドが 1 回の実行で持つ件数の上限（先頭だけ。1 件 56 バイト）。15 分を 60 fps で 54,000 件、1 フレームに 3 回
-/// 呼ばれ続けても 162,000 件なので、その上の 2 の冪（約 14 MiB）。越えた分は数だけ数える（CSV とスナップには書く）。
+/// 読み取りのスレッドが1回の実行で持つ件数の上限（先頭だけ。1件56バイト）。
+/// 15分を60 fpsで54,000件。1フレームに3回呼ばれ続けても162,000件なので、その上の2の冪（約14 MiB）。
+/// 越えた分は数だけ数える（CSVとスナップには書く）。
 pub const MAX_RECORDS: usize = 1 << 18;
 
 /// 出口の判定の長さ。
@@ -179,7 +186,7 @@ pub struct Record {
     pub scene_req: u32,
     pub esi: u32,
     pub tid: u32,
-    /// `+44` の 4 バイト（下位 2 バイトが制御語、上位 2 バイトは 0 のはず）。
+    /// `+44`の4バイト（下位2バイトがコントロールワードで上位2バイトは0のはず）。
     pub fpucw: u32,
 }
 
@@ -235,19 +242,21 @@ impl Record {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
     Complete,
-    /// まだ書かれていない・書いている途中（札が 0 か、前の周の値）。次に読みに来る。
+    /// まだ書かれていない・書いている途中（チケットが0か前の周の値）。次に読みに来る。
     NotYet,
-    /// 札が seq + 1 より大きい: 読む前に一周して上書きされた（読み落とし = 欠番）。
+    /// チケットが seq + 1 より大きい: 読む前に一周して上書きされた（読み落とし = 欠番）。
     Overwritten,
 }
 
-/// `t` が `want` より後の周の札か（32 ビットで回り込む番号を、差の符号で比べる。0 は「書いている途中」）。
+/// `t`が`want`より後の周のチケットかどうか（32ビットで回り込む番号を差の符号で比べる。0は「書いている途中」）。
 fn is_later(t: u32, want: u32) -> bool {
     t != 0 && (t.wrapping_sub(want) as i32) > 0
 }
 
-/// 番号 `seq` の枠を読んだときの札 2 つ（中身の前 `t1` と後 `t2`）を判定する。どちらも seq + 1 のときだけ採り、札が大きければ読み落とし。
-/// seq が 32 ビットを一周する（60 fps で約 2.2 年）と札が 0 になり「途中」と区別できないが、読み取りのスレッドは 60 秒で終わるので扱わない。
+/// 番号`seq`の枠を読んだときのチケット2つ（中身の前`t1`と後`t2`）を判定する。
+/// どちらも seq + 1 のときだけ採る。チケットが大きければ読み落とし。
+/// seqが32ビットを一周すると（60 fpsで約2.2年）チケットが0になり「途中」と区別できない。
+/// ただし読み取りのスレッドは60秒で終わるので扱わない。
 pub fn classify(seq: u32, t1: u32, t2: u32) -> SlotState {
     let want = seq.wrapping_add(1);
     if t1 == want && t2 == want {
@@ -269,9 +278,9 @@ pub enum SlotRead {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Collected {
     pub records: Vec<Record>,
-    /// 読み落とし（札が大きかった件と、リングバッファを一周以上遅れて読まずに飛ばした件）。
+    /// 読み落とし（チケットが大きかった件と、リングバッファを一周以上遅れて読まずに飛ばした件）。
     pub lost: u64,
-    /// 採ったが `MAX_RECORDS` を越えて持たなかった件。
+    /// 採ったが`MAX_RECORDS`を越えて持たなかった件。
     pub overflow: u64,
 }
 
@@ -285,11 +294,12 @@ impl Collected {
     }
 }
 
-/// 間隔の区分の境目（ミリ秒）。60 fps の 1 周期 16.67 ms の前後を細かく、1 フレームに 2 回の近い間隔を 1 ms 未満で分ける。
-/// 区分は「境目より小さい」の順で、最後は「最後の境目以上」。
+/// 間隔の区分の境目（ミリ秒）。
+/// 60 fpsの1周期16.67 msの前後を細かく分ける。1フレームに2回の近い間隔は1 ms未満で分ける。
+/// 区分は「境目より小さい」の順に並べ、最後は「最後の境目以上」。
 pub const INTERVAL_EDGES_MS: [f64; 8] = [1.0, 8.0, 15.0, 16.0, 17.0, 18.0, 25.0, 40.0];
 
-/// 間隔の統計（マイクロ秒）。番号が隣り合う 2 件の TSC の差だけから取る（読み落としをまたぐ間隔は 2 tick 分になるので入れない）。
+/// 間隔の統計（マイクロ秒）。番号が隣り合う2件のTSCの差だけから取る（読み落としをまたぐ間隔は2 tick分になるので含めない）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntervalStats {
     pub count: usize,
@@ -307,7 +317,7 @@ pub struct SceneChange {
     pub req: u32,
 }
 
-/// 出口の判定の連なり（「番号が 1 ずつ・`+0x454` が 1 ずつ・ウィンドウ `+0x2C` が前の件より進む」が続いた件の列）。
+/// 出口の判定の連なり（「番号が1ずつ・`+0x454`が1ずつ・ウィンドウ`+0x2C`が前の件より進む」が続いた件の列）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Run {
     pub len: usize,
@@ -320,17 +330,17 @@ pub struct TickSummary {
     pub lost: u64,
     pub overflow: u64,
     pub seq_breaks: usize,
-    /// スレッド ID・esi・FPU の制御語の種類と件数（値の順）。
+    /// スレッドID・esi・FPUのコントロールワードの種類と件数（値の順）。
     pub tids: Vec<(u32, usize)>,
     pub esis: Vec<(u32, usize)>,
     pub fpucws: Vec<(u32, usize)>,
     pub interval: Option<IntervalStats>,
-    /// 番号が隣り合う 2 件のうち、ウィンドウ `+0x2C` のビットが前の件と同じ（= 同じ do_frame の中の 2 回目以降）数。
+    /// 番号が隣り合う2件のうちウィンドウ`+0x2C`のビットが前の件と同じ（= 同じdo_frameの中の2回目以降）数。
     pub same_frame: usize,
-    /// 番号が隣り合う 2 件の `+0x454` の増え方（符号つき）ごとの件数。
+    /// 番号が隣り合う2件の`+0x454`の増え方（符号つき）ごとの件数。
     pub d_frame: Vec<(i64, usize)>,
     pub scenes: Vec<SceneChange>,
-    /// TSC で区切った 1 秒ごとの件数（最初の件からの秒。最後の 1 秒は途中まで）。周波数が分からなければ空。
+    /// TSCで区切った1秒ごとの件数（最初の件からの秒。最後の1秒は途中まで）。周波数が分からなければ空。
     pub per_second: Vec<u32>,
     pub longest: Option<Run>,
 }
@@ -341,7 +351,7 @@ impl TickSummary {
     }
 }
 
-/// `+0x454` の増え方（32 ビットで回り込む欄なので、差を符号つきで取る）。
+/// `+0x454`の増え方（32ビットで回り込むフィールドなので差を符号つきで取る）。
 pub fn frame_delta(prev: u32, cur: u32) -> i64 {
     cur.wrapping_sub(prev) as i32 as i64
 }
@@ -356,7 +366,7 @@ pub fn step_ok(prev: &Record, cur: &Record) -> bool {
         && cur.game_now() > prev.game_now()
 }
 
-/// 最長の連なり（件がなければ `None`）。同じ長さなら先に来た方。
+/// 最長の連なり（件がなければ`None`）。同じ長さなら先に来た方。
 pub fn longest_run(records: &[Record]) -> Option<Run> {
     let first = records.first()?;
     let mut best = Run {
@@ -380,7 +390,7 @@ pub fn longest_run(records: &[Record]) -> Option<Run> {
     Some(best)
 }
 
-/// 近い順位の百分位（小さい順に並べた `sorted` の、ceil(p * n / 100) 番目。1 始まり）。空なら `None`。
+/// nearest-rank法のパーセンタイル（小さい順に並べた`sorted`のceil(p * n / 100)番目。1始まり）。空なら`None`。
 pub fn percentile(sorted: &[f64], p: usize) -> Option<f64> {
     let n = sorted.len();
     if n == 0 {
@@ -394,8 +404,8 @@ pub fn tsc_to_us(ticks: u64, freq_hz: f64) -> f64 {
     ticks as f64 * 1_000_000.0 / freq_hz
 }
 
-/// TSC の周波数（Hz）を、始めと終わりの (TSC, QPC) の対と QPC の周波数から求める。
-/// どちらかの差が 0 以下・QPC の周波数が 0 以下なら `None`。
+/// TSCの周波数（Hz）を始めと終わりの (TSC, QPC)のペアとQPCの周波数から求める。
+/// どちらかの差が0以下・QPCの周波数が0以下なら`None`。
 pub fn tsc_frequency(start: (u64, i64), end: (u64, i64), qpc_freq: i64) -> Option<f64> {
     let dtsc = end.0.checked_sub(start.0)?;
     let dqpc = end.1.checked_sub(start.1)?;
@@ -617,9 +627,10 @@ pub fn write_summary(out: &mut dyn Write, s: &TickSummary) {
 
 pub const CSV_HEADER: &str = "seq,t_us,dt_us,game_now,game_deadline,sup454,d454,scene_cur,scene_req,esi,tid,fpucw,same_frame";
 
-/// tick ごとの行（先頭の 13 列）を、記録を 1 件ずつ渡して作る。1 秒ごとの追記で呼ばれるので、最初の件の TSC と前の件を呼び出しをまたいで持つ。
-/// `t_us` は最初の件の TSC からの µs、`dt_us` と `d454` と `same_frame` は前の行（番号が飛んでいても前に採った件）との差。
-/// 最初の行は空。周波数が分からなければ時刻の 2 列は空。
+/// tickごとの行（先頭の13列）を作る。記録を1件ずつ渡す。
+/// 1秒ごとの追記で呼ばれるので、最初の件のTSCと前の件を呼び出しをまたいで持つ。
+/// `t_us`は最初の件のTSCからのµs。`dt_us`と`d454`と`same_frame`は前の行（番号が飛んでいても前に採った件）との差。
+/// 最初の行は空。周波数が分からなければ時刻の2列は空。
 #[derive(Debug, Clone, Default)]
 pub struct TickCsv {
     pub freq_hz: Option<f64>,
@@ -688,9 +699,9 @@ pub fn write_csv(
 pub(crate) mod tests {
     use super::*;
 
-    /// 検査の TSC の周波数（3 GHz）。
+    /// 検査のTSCの周波数（3 GHz）。
     pub(crate) const F: f64 = 3.0e9;
-    /// 60 fps の 1 周期の TSC。
+    /// 60 fpsの1周期のTSC。
     pub(crate) const FRAME_TSC: u64 = 50_000_000;
 
     pub(crate) fn rec(seq: u32, tsc: u64, now: f64, sup: u32, cur: u32, req: u32) -> Record {
@@ -708,7 +719,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// 60 fps の合成: n 件、番号・TSC・今の時刻・+0x454 が 1 周期ずつ進む。場面は 2 のまま。
+    /// 60 fpsの合成: n件、番号・TSC・今の時刻・+0x454が1周期ずつ進む。場面は2のまま。
     pub(crate) fn sixty_fps(n: u32) -> Vec<Record> {
         (0..n)
             .map(|i| {
@@ -735,21 +746,21 @@ pub(crate) mod tests {
     #[test]
     fn classify_tickets() {
         assert_eq!(classify(10, 11, 11), SlotState::Complete);
-        // 中身を読む間に書き始められた（2 回目の札が 0）・書き終わった（1 回目が 0）。
+        // 中身を読む間に書き始められた（2回目のチケットが0）・書き終わった（1回目が0）。
         assert_eq!(classify(10, 11, 0), SlotState::NotYet);
         assert_eq!(classify(10, 0, 11), SlotState::NotYet);
         assert_eq!(
             classify(5000, 5001 - RING_LEN, 5001 - RING_LEN),
             SlotState::NotYet
         );
-        // 次の周の札（上書きされた）。1 回目だけ・2 回目だけでも読み落とし。
+        // 次の周のチケット（上書きされた）。1回目だけ・2回目だけでも読み落とし。
         assert_eq!(
             classify(10, 11 + RING_LEN, 11 + RING_LEN),
             SlotState::Overwritten
         );
         assert_eq!(classify(10, 11, 11 + RING_LEN), SlotState::Overwritten);
         assert_eq!(classify(10, 11 + RING_LEN, 0), SlotState::Overwritten);
-        // 回り込み: seq = u32::MAX - 1 の札は u32::MAX。
+        // 回り込み: seq = u32::MAX - 1のチケットはu32::MAX。
         assert_eq!(
             classify(u32::MAX - 1, u32::MAX, u32::MAX),
             SlotState::Complete
@@ -867,7 +878,7 @@ pub(crate) mod tests {
             2,
         );
         rs.insert(3, extra);
-        // 挟んだ後ろの番号を 1 つずつ送る。+0x454 は元の列のまま（2 回目では増えていないので、次の件で +1）。
+        // 挟んだ後ろの番号を1つずつ振り直す。+0x454は元の列のまま（2回目では増えていないので次の件で +1）。
         for (i, r) in rs.iter_mut().enumerate().skip(4) {
             r.seq = i as u32;
         }
@@ -878,7 +889,7 @@ pub(crate) mod tests {
         let i = s.interval.as_ref().unwrap();
         assert!((i.min_us - 20.0).abs() < 0.001, "{}", i.min_us);
         assert_eq!(i.buckets[0], 1);
-        // 連なり: seq 0〜2（3 件）で切れ、seq 3〜10（8 件）が最長。
+        // 連なり: seq 0〜2（3件）で切れ、seq 3〜10（8件）が最長。
         assert_eq!(
             s.longest,
             Some(Run {
@@ -898,7 +909,7 @@ pub(crate) mod tests {
     #[test]
     fn a_gap_breaks_the_run_and_is_not_an_interval() {
         let mut rs = sixty_fps(20);
-        rs.remove(10); // seq 10 を読み落とした
+        rs.remove(10); // seq 10を読み落とした
         let c = Collected {
             records: rs,
             lost: 1,
@@ -920,13 +931,13 @@ pub(crate) mod tests {
     #[test]
     fn frame_deltas_and_time_going_backwards() {
         let mut rs = sixty_fps(8);
-        // seq 3 で 0 増え。seq 4 は元の値のままなので、seq 3 から 2 増え。以降は 1 ずつ。
+        // seq 3で0増え。seq 4は元の値のままなのでseq 3から2増え。以降は1ずつ。
         rs[3].sup_frame = rs[2].sup_frame;
-        rs[6].now_bits = rs[5].now_bits; // 今の時刻が止まった（+0x454 は 1 増え）
+        rs[6].now_bits = rs[5].now_bits; // 今の時刻が止まった（+0x454は1増え）
         let s = summarize(&collected(rs), Some(F));
         assert_eq!(s.d_frame, vec![(0, 1), (1, 5), (2, 1)]);
         assert_eq!(s.same_frame, 1);
-        // 連なり: 0〜2 / 3 / 4〜5 / 6〜7 → 最長 3（seq 0 から）。
+        // 連なり: 0〜2 / 3 / 4〜5 / 6〜7 → 最長3（seq 0から）。
         assert_eq!(
             s.longest,
             Some(Run {
@@ -943,7 +954,7 @@ pub(crate) mod tests {
         let mut rs = sixty_fps(6);
         rs[2].scene_req = 7; // 要求が出た
         rs[3].scene_req = 7;
-        rs[3].scene_cur = 7; // 次の tick で移った
+        rs[3].scene_cur = 7; // 次のtickで移った
         rs[4].scene_cur = 7;
         rs[4].scene_req = 7;
         rs[5].scene_cur = 7;
@@ -1006,7 +1017,7 @@ pub(crate) mod tests {
 
     #[test]
     fn tsc_frequency_from_two_pairs() {
-        // 10 MHz の QPC で 2 秒（20,000,000）、TSC は 6e9 進んだ → 3 GHz。
+        // 10 MHzのQPCで2秒（20,000,000）、TSCは6e9進んだ → 3 GHz。
         let f = tsc_frequency((1_000, 5), (6_000_001_000, 20_000_005), 10_000_000).unwrap();
         assert!((f - 3.0e9).abs() < 1.0, "{f}");
         assert_eq!(tsc_frequency((10, 5), (10, 9), 10), None);
@@ -1069,7 +1080,7 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(lines.len(), 3);
-        // 周波数が分からなければ時刻の 2 列は空。
+        // 周波数が分からなければ時刻の2列は空。
         let mut out = Vec::new();
         write_csv(&mut out, &rs, None).unwrap();
         let text = String::from_utf8(out).unwrap();

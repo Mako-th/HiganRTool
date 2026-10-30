@@ -1,8 +1,8 @@
-//! ウィンドウ。Windows 標準の部品（BUTTON・COMBOBOX・STATIC）で作った、普通のダイアログに近いウィンドウ。
-//! 見た目はコモンコントロール v6 のマニフェスト（build.rs）に、Tab・Enter・Esc は `IsDialogMessageW` に任せる。
-//! ウィンドウのクラスは `DefDlgProcW` を既定の処理にした「ダイアログウィンドウ」で、既定のボタンの管理・フォーカスの戻し・背景色を OS が受け持つ。
-//! 自分のウィンドウの部品へ送るメッセージ（WM_SETFONT / CB_*）にだけ `SendMessageW` を使う。他のプロセスのウィンドウへは送らない。
-//! 状態（何本目か・直した後の設定・押せるか）は `model`、文言は `text`、読み書きは `work` / `scan`。ここは部品の並べ方と入力の橋渡し。
+//! ウィンドウ。Windows標準の部品（BUTTON・COMBOBOX・STATIC）で作った普通のダイアログに近いウィンドウ。
+//! 見た目はコモンコントロールv6のマニフェスト（build.rs）に任せる。Tab・Enter・Escは`IsDialogMessageW`に任せる。
+//! ウィンドウのクラスは`DefDlgProcW`を既定の処理にした「ダイアログウィンドウ」。既定のボタンの管理・フォーカスの戻し・背景色はOSが受け持つ。
+//! 自分のウィンドウの部品へ送るメッセージ（WM_SETFONT / CB_*）にだけ`SendMessageW`を使う。他のプロセスのウィンドウへは送らない。
+//! 状態（何本目か・直した後の設定・押せるか）は`model`、文言は`text`、読み書きは`work` / `scan`。ここは部品の並べ方と入力の橋渡し。
 
 use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
@@ -50,8 +50,8 @@ use super::dialogs;
 
 const CLASS_NAME: &str = "HiganRToolReplayFix";
 
-/// 論理ピクセル（96 dpi）での寸法。ボタンの高さ 23・最小幅 75・ウィンドウの縁の余白 12 は Windows のダイアログの標準
-/// （ダイアログ単位の 14 と 50 と 7 を 96 dpi に直した値）。
+/// 論理ピクセル（96 dpi）での寸法。
+/// ボタンの高さ23・最小幅75・ウィンドウの縁の余白12はWindowsのダイアログの標準（ダイアログ単位の14と50と7を96 dpiに直した値）。
 const CLIENT_W: i32 = 560;
 const CLIENT_H: i32 = 323;
 const MARGIN: i32 = 12;
@@ -62,11 +62,11 @@ const BUTTON_GAP: i32 = 6;
 const BUTTON_GAP_EXIT: i32 = 18;
 const SEPARATOR_Y: i32 = 276;
 const BUTTON_Y: i32 = 288;
-/// 選択欄の閉じた高さ（文字に合わせて OS が決める）の目安と、開いたときの一覧の高さ。
+/// コンボボックスの閉じた高さ（文字に合わせてOSが決める）の目安と開いたときの一覧の高さ。
 const COMBO_H: i32 = 23;
 const COMBO_LIST_H: i32 = 66;
 
-/// 部品の識別番号。`Make` と `Close` は Enter と Esc に当たる標準の番号（`IDOK` / `IDCANCEL`）。
+/// 部品の識別番号。`Make`と`Close`はEnterとEscに当たる標準の番号（`IDOK` / `IDCANCEL`）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Id {
     ChooseReplays,
@@ -127,7 +127,7 @@ enum Tone {
     Bad,
 }
 
-/// 知らせの行の色。`WM_CTLCOLORSTATIC` は部品の作り直しの最中にも届くので、状態の借用とは別に持つ。
+/// 知らせの行の色。`WM_CTLCOLORSTATIC`は部品の作り直しの最中にも届くので状態の借用とは別に持つ。
 #[derive(Clone, Copy)]
 struct MessageStyle {
     hwnd: usize,
@@ -139,7 +139,7 @@ thread_local! {
     static MESSAGE_STYLE: Cell<MessageStyle> = const { Cell::new(MessageStyle { hwnd: 0, color: 0 }) };
 }
 
-/// ウィンドウの中の部品。作る順が Tab の順（言語は最後）。
+/// ウィンドウの中の部品。作る順がTabの順（言語は最後）。
 struct Controls {
     path: HWND,
     lang_label: HWND,
@@ -148,7 +148,7 @@ struct Controls {
     heads: [HWND; 2],
     /// 側 / 名前 / 今の設定 / 直した後の設定
     row_labels: [HWND; 4],
-    /// 側 / 名前 / 今の設定 の 1P と 2P
+    /// 側 / 名前 / 今の設定 の1Pと2P
     cells: [[HWND; 2]; 3],
     drops: [HWND; 2],
     message: HWND,
@@ -176,7 +176,7 @@ struct App {
     c: Controls,
 }
 
-/// 状態を借りて使う。借りられない（ウィンドウのメッセージの途中の再入）ときは `None` で、パニックしない。
+/// 状態を借りて使う。借りられない（ウィンドウのメッセージの途中の再入）ときは`None`を返す。パニックはしない。
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|c| {
         let mut b = c.try_borrow_mut().ok()?;
@@ -201,10 +201,10 @@ fn tone_color(tone: Tone) -> u32 {
     }
 }
 
-// ---- Win32 の薄い包み ----
+// ---- Win32の薄いラッパー ----
 
 fn system_font() -> HFONT {
-    // SAFETY: `ncm` は cbSize を設定した書ける構造体。取れなければ 0 のまま（既定のフォントで作る）。
+    // SAFETY: `ncm`はcbSizeを設定した書き込み可能な構造体。取得できなければ0のまま（既定のフォントで作る）。
     unsafe {
         let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
         ncm.cbSize = core::mem::size_of::<NONCLIENTMETRICSW>() as u32;
@@ -214,19 +214,19 @@ fn system_font() -> HFONT {
             &mut ncm as *mut _ as *mut c_void,
             0,
         );
-        ncm.lfMessageFont.lfCharSet = 1; // DEFAULT_CHARSET: 日本語など、顔の文字集合に無い文字も OS の代替で出す
+        ncm.lfMessageFont.lfCharSet = 1; // DEFAULT_CHARSET: フォントの文字集合に無い文字（日本語など）もOSの代替で出す
         CreateFontIndirectW(&ncm.lfMessageFont)
     }
 }
 
 fn set_text(h: HWND, text: &str) {
     let w = wide_nul(text);
-    // SAFETY: `h` は自分のウィンドウの部品。文字列は終端 0 つきで呼びの間生きている。
+    // SAFETY: `h`は自分のウィンドウの部品。文字列は終端0つきで呼びの間生きている。
     unsafe { SetWindowTextW(h, w.as_ptr()) };
 }
 
 fn place(h: HWND, x: i32, y: i32, w: i32, height: i32) {
-    // SAFETY: `h` は自分のウィンドウの部品。
+    // SAFETY: `h`は自分のウィンドウの部品。
     unsafe {
         MoveWindow(h, x, y, w, height, 1);
         ShowWindow(h, SW_SHOW);
@@ -234,23 +234,23 @@ fn place(h: HWND, x: i32, y: i32, w: i32, height: i32) {
 }
 
 fn hide(h: HWND) {
-    // SAFETY: `h` は自分のウィンドウの部品。
+    // SAFETY: `h`は自分のウィンドウの部品。
     unsafe { ShowWindow(h, SW_HIDE) };
 }
 
 fn enable(h: HWND, on: bool) {
-    // SAFETY: `h` は自分のウィンドウの部品。
+    // SAFETY: `h`は自分のウィンドウの部品。
     unsafe { EnableWindow(h, i32::from(on)) };
 }
 
 fn is_enabled(h: HWND) -> bool {
-    // SAFETY: `h` は自分のウィンドウの部品。
+    // SAFETY: `h`は自分のウィンドウの部品。
     unsafe { IsWindowEnabled(h) != 0 }
 }
 
 /// 自分のウィンドウの部品へのメッセージ。他のプロセスのウィンドウへは送らない。
 fn send(h: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // SAFETY: `h` は自分のウィンドウか、その部品。`lparam` に渡すポインタは呼び出し側が呼びの間生かす。
+    // SAFETY: `h`は自分のウィンドウかその部品。`lparam`に渡すポインタは呼び出し側が呼びの間生かす。
     unsafe { SendMessageW(h, msg, wparam, lparam) }
 }
 
@@ -260,7 +260,7 @@ fn combo_add(h: HWND, text: &str) {
 }
 
 fn combo_select(h: HWND, index: Option<usize>) {
-    // CB_SETCURSEL の -1 は「選ばない」。
+    // CB_SETCURSELの -1は「選ばない」。
     send(h, CB_SETCURSEL, index.unwrap_or(usize::MAX) as WPARAM, 0);
 }
 
@@ -271,7 +271,7 @@ fn combo_selected(h: HWND) -> Option<usize> {
 fn child(parent: HWND, class: &str, style: u32, id: i32, font: HFONT, hinst: *mut c_void) -> HWND {
     let c = wide_nul(class);
     let empty = wide_nul("");
-    // SAFETY: 文字列は終端 0 つきで呼びの間生きている。`parent` は作った自分のウィンドウ。識別番号は HMENU の欄で渡す決まり。
+    // SAFETY: 文字列は終端0つきで呼びの間生きている。`parent`は作った自分のウィンドウ。識別番号はHMENUのフィールドで渡す決まり。
     let h = unsafe {
         CreateWindowExW(
             0,
@@ -297,7 +297,7 @@ impl Controls {
         let stat = |style: u32| child(parent, "STATIC", style, -1, font, hinst);
         let label = SS_LEFT | SS_NOPREFIX;
         let cell = SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS;
-        // 既定のボタンの印は、画面ごとに DM_SETDEFID で OS が付け替える。
+        // 既定のボタンの印は画面ごとにDM_SETDEFIDでOSが付け替える。
         let button = |id: Id| {
             child(
                 parent,
@@ -331,7 +331,7 @@ impl Controls {
         let message = stat(label);
         let pos = stat(SS_CENTER | SS_NOPREFIX);
         let separator = stat(SS_ETCHEDHORZ);
-        // 以降は Tab の順。
+        // 以降はTabの順。
         let drops = [combo(Id::Drop(Player::P1)), combo(Id::Drop(Player::P2))];
         let prev = button(Id::Prev);
         let next = button(Id::Next);
@@ -371,7 +371,7 @@ impl Controls {
         }
     }
 
-    /// 1 本ずつの画面でだけ出す部品。
+    /// 1本ずつの画面でだけ出す部品。
     fn detail_only(&self) -> Vec<HWND> {
         let mut v = vec![self.path, self.pos, self.prev, self.next, self.make];
         v.extend([self.make_all, self.drops[0], self.drops[1]]);
@@ -399,7 +399,7 @@ impl App {
     fn text_width(&self, text: &str) -> i32 {
         let w: Vec<u16> = text.encode_utf16().collect();
         let mut size = SIZE { cx: 0, cy: 0 };
-        // SAFETY: ウィンドウの DC を借りてフォントを選び、元へ戻して返す。`w` は長さ付きで、`size` は書ける。
+        // SAFETY: ウィンドウのDCを借りてフォントを選び、元へ戻して返す。`w`は長さ付き。`size`は書き込み可能。
         unsafe {
             let dc: HDC = GetDC(self.hwnd);
             let old = SelectObject(dc, self.font as HGDIOBJ);
@@ -446,7 +446,7 @@ impl App {
         set_text(self.c.message, &text);
     }
 
-    /// 文言・値・有効／無効を、いまの言語と状態に合わせる。並べ方は `relayout`。
+    /// 文言・値・有効／無効をいまの言語と状態に合わせる。並べ方は`relayout`。
     fn fill(&self) {
         let (t, c) = (self.text(), &self.c);
         set_text(self.hwnd, t.title());
@@ -492,7 +492,7 @@ impl App {
             set_text(cells[0], a);
             set_text(cells[1], b);
         }
-        // 直せないリプレイでは選択欄を空にして押せなくする（理由は知らせの行に出る）。
+        // 直せないリプレイではコンボボックスを空にして押せなくする（理由は知らせの行に出る）。
         let pick = s.pick();
         for (i, h) in c.drops.into_iter().enumerate() {
             let kind = pick.map(|p| if i == 0 { p.0 } else { p.1 });
@@ -546,7 +546,7 @@ impl App {
         let label_x = combo_x - s(6) - label_w;
         place(c.lang_label, label_x, s(14), label_w, s(18));
 
-        // ウィンドウの下: 区切りの線と、右下の「終了」。直す画面の 2 つは左寄せ、最初の画面の 2 つは「終了」の左に右寄せ。
+        // ウィンドウの下: 区切りの線と右下の「終了」。直す画面のボタン2つは左寄せ。最初の画面のボタン2つは「終了」の左に右寄せ。
         place(c.separator, m, s(SEPARATOR_Y), w - 2 * m, s(2));
         let exit_w = self.button_width(t.close());
         let mut x = w - m - exit_w;
@@ -615,8 +615,8 @@ impl App {
         place(c.next, x0 + pw + pos_w, ny, nw, bh);
     }
 
-    /// 画面が切り替わったら既定のボタンと最初のフォーカスを設定する。そうでなくても、フォーカスのある部品が
-    /// 押せなくなっていたら（最後の 1 本で「次へ」を押したなど）既定のボタンへ移す。
+    /// 画面が切り替わったら既定のボタンと最初のフォーカスを設定する。
+    /// 切り替わっていなくてもフォーカスのある部品が押せなくなっていたら既定のボタンへ移す（最後の1本で「次へ」を押したときなど）。
     fn settle_focus(&mut self) {
         let now = self.screen_now();
         let default = if now == Screen::Detail {
@@ -632,7 +632,7 @@ impl App {
         // SAFETY: フォーカスの読み取りだけ。
         let f = unsafe { GetFocus() };
         let usable = !f.is_null()
-            // SAFETY: `f` は GetFocus が返したウィンドウ。親子と可視の判定だけ。
+            // SAFETY: `f`はGetFocusが返したウィンドウ。親子と可視の判定だけ。
             && unsafe { IsChild(self.hwnd, f) != 0 && IsWindowVisible(f) != 0 }
             && is_enabled(f);
         if changed || !usable {
@@ -678,7 +678,7 @@ impl App {
 
     // ---- 状態の変更 ----
 
-    /// 選ばれたもの（ファイル・フォルダ）を読み込んで、1 本ずつの画面へ。1 本も無ければ今の画面のまま知らせる。
+    /// 選ばれたもの（ファイル・フォルダ）を読み込んで1本ずつの画面へ。1本も無ければ今の画面のまま知らせる。
     fn load(&mut self, inputs: &[PathBuf]) {
         let found = collect(inputs);
         match Session::new(found.files) {
@@ -706,7 +706,7 @@ impl App {
         self.refresh();
     }
 
-    /// 調べたときは直せたのに、直す時点で直せないと分かったとき（ファイルが書き換わった）の知らせ。
+    /// 調べたときは直せたのに直す時点で直せないと分かったとき（ファイルが書き換わった）の知らせ。
     fn refused(&self, a: Analysis) -> Notice {
         Notice::Failed(self.text().unavailable(&a).unwrap_or_default())
     }
@@ -743,7 +743,7 @@ impl App {
         })
     }
 
-    /// 「直した後の設定」の選択欄が変わった。選択欄そのものは作り直さず、知らせの行だけ消す。
+    /// 「直した後の設定」のコンボボックスが変わった。コンボボックスそのものは作り直さず知らせの行だけ消す。
     fn pick_changed(&mut self, who: Player) {
         let h = self.control(Id::Drop(who));
         let Some(kind) = combo_selected(h).and_then(|i| Kind::ALL.get(i).copied()) else {
@@ -769,7 +769,7 @@ impl App {
 
 fn message_box(hwnd: HWND, caption: &str, text: &str, icon: u32) {
     let (t, c) = (wide_nul(text), wide_nul(caption));
-    // SAFETY: 2 つの文字列とも終端 0 つきで呼びの間生きている。`hwnd` は自分のウィンドウ（null でもよい）。
+    // SAFETY: 2つの文字列とも終端0つきで呼びの間生きている。`hwnd`は自分のウィンドウ（nullでもよい）。
     unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | icon) };
 }
 
@@ -781,7 +781,7 @@ fn activate(id: Id) {
     match id {
         Id::Close => {
             if let Some(h) = with_app(|a| a.hwnd) {
-                // SAFETY: 自分のウィンドウ。WM_DESTROY で終了の合図を出す。
+                // SAFETY: 自分のウィンドウ。WM_DESTROYで終了を通知する。
                 unsafe { DestroyWindow(h) };
             }
         }
@@ -803,7 +803,7 @@ fn activate(id: Id) {
             with_app(|a| a.step(id == Id::Next));
         }
         Id::Make => {
-            // ウィンドウは with_app の外で出す（ウィンドウの中でメッセージ処理が回るため）。
+            // ウィンドウはwith_appの外で出す（ウィンドウの中でメッセージ処理が回るため）。
             if let Some((h, t, r)) = with_app(|a| {
                 let r = a.make_current()?;
                 Some((a.hwnd, a.text(), r))
@@ -845,7 +845,7 @@ fn make_whole_folder() {
     // SAFETY: 標準のカーソルを読み、処理の間だけ待ちの形にして元へ戻す。
     let old = unsafe { SetCursor(LoadCursorW(ptr::null_mut(), IDC_WAIT)) };
     let report = make_all(&targets, pair);
-    // SAFETY: 上で得たカーソル（null でもよい）を戻す。
+    // SAFETY: 上で得たカーソル（nullでもよい）を戻す。
     unsafe { SetCursor(old) };
     show_result(h, t, &report);
     with_app(|a| {
@@ -856,7 +856,7 @@ fn make_whole_folder() {
 
 fn drop_files(hdrop: HDROP) {
     let mut paths = Vec::new();
-    // SAFETY: `hdrop` は WM_DROPFILES が渡した有効なハンドル。0xFFFFFFFF で件数、バッファは「長さ + 1」を渡す。終えたら DragFinish。
+    // SAFETY: `hdrop`はWM_DROPFILESが渡した有効なハンドル。0xFFFFFFFFを渡して件数を取る。バッファのサイズには「長さ + 1」を渡す。終えたらDragFinishを呼ぶ。
     unsafe {
         let n = DragQueryFileW(hdrop, u32::MAX, ptr::null_mut(), 0);
         for i in 0..n {
@@ -874,7 +874,7 @@ fn drop_files(hdrop: HDROP) {
     with_app(|a| a.load(&paths));
 }
 
-/// `WM_COMMAND`。ボタンの押下（Enter・Esc を `IsDialogMessageW` が変換したものを含む）と、選択欄の変更。
+/// `WM_COMMAND`。ボタンの押下（Enter・Escを`IsDialogMessageW`が変換したものを含む）とコンボボックスの変更。
 fn on_command(wparam: WPARAM) {
     let id = (wparam & 0xFFFF) as i32;
     let code = ((wparam >> 16) & 0xFFFF) as u32;
@@ -886,7 +886,7 @@ fn on_command(wparam: WPARAM) {
             with_app(|a| a.pick_changed(who));
         }
         Some(id) if code == BN_CLICKED => {
-            // 押せない部品の操作は無視（Enter が既定の「直す」へ来たときも同じ条件）。
+            // 押せない部品の操作は無視（Enterが既定の「直す」へ来たときも同じ条件）。
             let usable = with_app(|a| is_enabled(a.control(id))).unwrap_or(false);
             if usable {
                 activate(id);
@@ -924,7 +924,7 @@ unsafe extern "system" fn wnd_proc(
         WM_CTLCOLORSTATIC => {
             let style = MESSAGE_STYLE.with(Cell::get);
             if style.hwnd != 0 && style.hwnd == lparam as usize {
-                // SAFETY: `wparam` は STATIC が渡した描画用の DC。返すのはシステムの共有ブラシ（消さない）。
+                // SAFETY: `wparam`はSTATICが渡した描画用のDC。返すのはシステムの共有ブラシ（消さない）。
                 return unsafe {
                     SetTextColor(wparam as HDC, style.color);
                     SetBkMode(wparam as HDC, TRANSPARENT as i32);
@@ -938,12 +938,12 @@ unsafe extern "system" fn wnd_proc(
     unsafe { DefDlgProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// ウィンドウを出して、閉じるまで回る。`initial` は最初から選んだ状態にするもの。
+/// ウィンドウを出して閉じるまで回る。`initial`は最初から選択済みにするもの。
 pub fn run(lang: Lang, initial: &[PathBuf]) -> Result<(), String> {
     let class = wide_nul(CLASS_NAME);
     let title = wide_nul(Text(lang).title());
-    // SAFETY: ウィンドウクラスの登録・ウィンドウの作成・メッセージループという通常の手順。文字列は終端 0 つきで呼びの間生きている。
-    // ウィンドウの状態は thread_local に持ち、ウィンドウのメッセージの再入では借りられなければ既定の処理へ流す。
+    // SAFETY: ウィンドウクラスの登録・ウィンドウの作成・メッセージループという通常の手順。文字列は終端0つきで呼びの間生きている。
+    // ウィンドウの状態はthread_localに持つ。ウィンドウのメッセージの再入で借りられないときは既定の処理へ渡す。
     unsafe {
         SetProcessDPIAware();
         let icc = INITCOMMONCONTROLSEX {
@@ -957,7 +957,7 @@ pub fn run(lang: Lang, initial: &[PathBuf]) -> Result<(), String> {
             style: 0,
             lpfnWndProc: Some(wnd_proc),
             cbClsExtra: 0,
-            // DefDlgProcW が既定のボタンなどを覚えておく場所。
+            // DefDlgProcWが既定のボタンなどを覚えておく場所。
             cbWndExtra: DLGWINDOWEXTRA as i32,
             hInstance: hinst,
             hIcon: ptr::null_mut(),
@@ -1023,7 +1023,7 @@ pub fn run(lang: Lang, initial: &[PathBuf]) -> Result<(), String> {
         });
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
-        // ウィンドウが前面になった後で、既定のボタンへフォーカスを設定し直す（ウィンドウを出す前の SetFocus は最初の部品に取られうる）。
+        // ウィンドウが前面になった後で既定のボタンへフォーカスを設定し直す（ウィンドウを出す前のSetFocusは最初の部品に取られうる）。
         with_app(|a| {
             a.shown = None;
             a.settle_focus();

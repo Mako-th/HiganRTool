@@ -1,34 +1,35 @@
-//! D3D8 のバックバッファの画素（B,G,R,X などの並び）→ RGB8 への変換と、PNG への符号化。
+//! D3D8のバックバッファの画素（B,G,R,Xなどの並び）→ RGB8への変換と、PNGへの符号化。
 //!
-//! 32bit は B,G,R,X の並び、16bit は R5G6B5 / X1R5G5B5 / A1R5G5B5 の並びとビットの広げ方で変換する。
-//! ゲームのメモリには触らない（渡されたバイト列を読むだけ）。ゲームスレッドの外の読み取りのスレッドで呼ぶので
-//! ヒープを使ってよい。どんなバイト列・大きさを渡されてもパニックしない（添字は `get`、掛け算は `checked_mul`）。
+//! 32bitはB,G,R,Xの並び。16bitはR5G6B5 / X1R5G5B5 / A1R5G5B5の並びとビットの広げ方で変換する。
+//! ゲームのメモリには触らない（渡されたバイト列を読むだけ）。
+//! ゲームスレッドの外の読み取りのスレッドで呼ぶのでヒープを使ってよい。
+//! どんなバイト列・大きさを渡されてもパニックしない（添字は`get`・掛け算は`checked_mul`）。
 
 use std::fmt;
 
-/// D3DFORMAT の値（D3D8 の定数）。バックバッファとして読める形式だけを挙げる。ほかは撮らず、形式の番号を記録する。
+/// D3DFORMATの値（D3D8の定数）。バックバッファとして読み取り可能な形式だけを挙げる。ほかは撮らず形式の番号を記録する。
 pub const D3DFMT_A8R8G8B8: u32 = 21;
 pub const D3DFMT_X8R8G8B8: u32 = 22;
 pub const D3DFMT_R5G6B5: u32 = 23;
 pub const D3DFMT_X1R5G5B5: u32 = 24;
 pub const D3DFMT_A1R5G5B5: u32 = 25;
 
-/// 変換・符号化ができなかった理由。ゲームのメモリの壊れ方や D3D8 の想定外の返り値をそのまま反映し、直さずに返す。
+/// 変換・符号化ができなかった理由。ゲームのメモリの壊れ方やD3D8の想定外の返り値をそのまま反映し、直さずに返す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShotError {
-    /// 読める形式（上の 5 つ）のどれでもない。
+    /// 読み取り可能な形式（上の5つ）のどれでもない。
     UnknownFormat { format: u32 },
-    /// 幅か高さが 0。
+    /// 幅か高さが0。
     ZeroSize { width: u32, height: u32 },
-    /// `pitch` が 1 行ぶん（`width * bytes_per_pixel`）に満たない。
+    /// `pitch`が1行ぶん（`width * bytes_per_pixel`）に満たない。
     PitchTooSmall { pitch: u32, needed: u32 },
-    /// `data` が `(height-1)*pitch + 1行ぶん` に満たない。
+    /// `data`が`(height-1)*pitch + 1行ぶん`に満たない。
     DataTooShort { needed: usize, got: usize },
-    /// 大きさの計算（`width * height * 3` など）が `usize`（32bit）の範囲を超える。
+    /// 大きさの計算（`width * height * 3`など）が`usize`（32bit）の範囲を超える。
     Overflow,
-    /// `encode_png` に渡した `rgb` の長さが `width * height * 3` と合わない。
+    /// `encode_png`に渡した`rgb`の長さが`width * height * 3`と合わない。
     RgbLenMismatch { expected: usize, got: usize },
-    /// `png` クレートの符号化そのものが失敗した（`EncodingError` の文言をそのまま包む）。
+    /// `png`クレートの符号化そのものが失敗した（`EncodingError`の文言をそのまま包む）。
     PngEncode(String),
 }
 
@@ -65,7 +66,7 @@ impl fmt::Display for ShotError {
     }
 }
 
-/// 形式ごとの 1 画素のバイト数。読めない形式は `None`。
+/// 形式ごとの1画素のバイト数。読み取れない形式は`None`。
 pub fn bytes_per_pixel(format: u32) -> Option<u32> {
     match format {
         D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 => Some(4),
@@ -74,20 +75,20 @@ pub fn bytes_per_pixel(format: u32) -> Option<u32> {
     }
 }
 
-/// 5 ビットの値を 8 ビットへ広げる（`(v<<3)|(v>>2)`）。
+/// 5ビットの値を8ビットへ広げる（`(v<<3)|(v>>2)`）。
 fn expand5(v: u16) -> u8 {
     ((v << 3) | (v >> 2)) as u8
 }
 
-/// 6 ビットの値を 8 ビットへ広げる（`(v<<2)|(v>>4)`）。
+/// 6ビットの値を8ビットへ広げる（`(v<<2)|(v>>4)`）。
 fn expand6(v: u16) -> u8 {
     ((v << 2) | (v >> 4)) as u8
 }
 
-/// 1 画素（形式ごとの生バイト列）を RGB8 の 3 バイトへ変換する。`px` は `bytes_per_pixel(format)` の長さぴったり。
+/// 1画素（形式ごとの生バイト列）をRGB8の3バイトへ変換する。`px`は`bytes_per_pixel(format)`の長さぴったり。
 fn pixel_to_rgb(format: u32, px: &[u8]) -> Option<[u8; 3]> {
     match format {
-        // メモリ上は B,G,R,X（小さい端の 0xXXRRGGBB）の並び。
+        // メモリ上はB,G,R,X（小さい端の0xXXRRGGBB）の並び。
         D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 => {
             let b = *px.first()?;
             let g = *px.get(1)?;
@@ -112,8 +113,8 @@ fn pixel_to_rgb(format: u32, px: &[u8]) -> Option<[u8; 3]> {
     }
 }
 
-/// バックバッファの生バイト列（`data`。行 `i` は `data[i*pitch ..][.. width*bpp]`）を
-/// RGB8（上の行から `width*height*3` バイト）へ変換する。
+/// バックバッファの生バイト列（`data`。行`i`は`data[i*pitch ..][.. width*bpp]`）をRGB8へ変換する。
+/// 出力は上の行から`width*height*3`バイト。
 pub fn to_rgb(
     format: u32,
     width: u32,
@@ -132,8 +133,8 @@ pub fn to_rgb(
             needed: row_needed,
         });
     }
-    // 最後の行だけは pitch の詰め物まで要らない（1 行ぶんで足りる）ので、
-    // 必要な長さは `(height-1)*pitch + row_needed`。
+    // 最後の行だけはpitchの詰め物まで要らない（1行ぶんで足りる）。
+    // そのため必要な長さは`(height-1)*pitch + row_needed`。
     let full_rows = height - 1; // height != 0 を上で検証済み
     let required = (full_rows as usize)
         .checked_mul(pitch as usize)
@@ -153,7 +154,7 @@ pub fn to_rgb(
     let mut rgb = Vec::with_capacity(out_len);
 
     for y in 0..height {
-        // 理屈のうえではあふれないが、添字と同じく検証してから使うため `checked_mul` を通す。
+        // 理屈のうえではあふれないが、添字と同じく検証してから使うため`checked_mul`を通す。
         let row_start = (y as usize)
             .checked_mul(pitch as usize)
             .ok_or(ShotError::Overflow)?;
@@ -184,7 +185,7 @@ pub fn to_rgb(
     Ok(rgb)
 }
 
-/// RGB8（8bit・3チャンネル）を PNG のバイト列へ符号化する。`png` クレート（MIT OR Apache-2.0）。
+/// RGB8（8bit・3チャンネル）をPNGのバイト列へ符号化する。`png`クレート（MIT OR Apache-2.0）。
 pub fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, ShotError> {
     if width == 0 || height == 0 {
         return Err(ShotError::ZeroSize { width, height });
@@ -202,7 +203,7 @@ pub fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, ShotEr
 
     let mut buf: Vec<u8> = Vec::new();
     {
-        // `&mut Vec<u8>` は `Write` なので、符号化が終われば `buf` の所有権が戻る。
+        // `&mut Vec<u8>`は`Write`なので符号化が終われば`buf`の所有権が戻る。
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
@@ -218,17 +219,17 @@ pub fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, ShotEr
 
 #[cfg(test)]
 mod tests {
-    //! 期待値は画素を手で決め打ちした小さな絵で作る（`to_rgb` 自身の式を逆に辿って作らない）。
+    //! 期待値は画素を手で決め打ちした小さな絵で作る（`to_rgb`自身の式を逆に辿って作らない）。
     use super::*;
 
     #[test]
     fn x8r8g8b8_2x2_matches_hand_picked_pixels() {
-        // 画素 (0,0)=赤 (1,0)=緑 (0,1)=青 (1,1)=白。メモリは B,G,R,X の順。
-        // pitch=16（1 行 8 B の画素 + 8 B の詰め物）。最後の行は詰め物を含めなくてよい。
+        // 画素 (0,0)=赤 (1,0)=緑 (0,1)=青 (1,1)=白。メモリはB,G,R,Xの順。
+        // pitch=16（1行8 Bの画素 + 8 Bの詰め物）。最後の行は詰め物を含めなくてよい。
         #[rustfmt::skip]
         let data: [u8; 24] = [
             0x00, 0x00, 0xFF, 0x00,  0x00, 0xFF, 0x00, 0x00, // 行0: 赤, 緑
-            0,0,0,0, 0,0,0,0,                                // 行0 の詰め物
+            0,0,0,0, 0,0,0,0,                                // 行0の詰め物
             0xFF, 0x00, 0x00, 0x00,  0xFF, 0xFF, 0xFF, 0x00, // 行1: 青, 白（詰め物なし）
         ];
         let rgb = to_rgb(D3DFMT_X8R8G8B8, 2, 2, 16, &data).expect("convert");
@@ -242,7 +243,7 @@ mod tests {
 
     #[test]
     fn r5g6b5_pure_colors_expand_to_full_8bit() {
-        // 純粋な赤 → 0xF800、緑 → 0x07E0、青 → 0x001F。5bit/6bit の最大値は 8bit の最大値(255)へ広がる。
+        // 純粋な赤 → 0xF800、緑 → 0x07E0、青 → 0x001F。5bit/6bitの最大値は8bitの最大値(255)へ広がる。
         let red: u16 = 0xF800;
         let green: u16 = 0x07E0;
         let blue: u16 = 0x001F;
@@ -281,7 +282,7 @@ mod tests {
 
     #[test]
     fn pitch_padding_is_skipped_not_read_as_pixels() {
-        // width=1, bpp=4 だが pitch=8。詰め物に、間違えて読むと別の色になる値を入れる。
+        // width=1, bpp=4だがpitch=8。詰め物に、間違えて読むと別の色になる値を入れる。
         let data: [u8; 16] = [
             0x00, 0x00, 0xFF, 0x00, /*詰め物*/ 0xAA, 0xBB, 0xCC, 0xDD, // 行0: 赤
             0xFF, 0x00, 0x00, 0x00, /*詰め物*/ 0xAA, 0xBB, 0xCC, 0xDD, // 行1: 青

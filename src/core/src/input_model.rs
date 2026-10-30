@@ -1,20 +1,22 @@
-//! feed `0x0042ACE0` の模型。入力語を InputManager の 3 本 `[0]`/`[1]`/`[2]` に展開する規則
-//! （prev・リピート発火・押した瞬間・離した瞬間）。逆アセンブル `42ace0`〜`42ad62` を読んで検証した。
-//! feed 1 個ぶんの状態機械だけを持ち、1P・2P・合成の 3 本の呼び分けは呼び出し側が行う。
+//! feed `0x0042ACE0`の模型。入力ワードをInputManagerの3本`[0]`/`[1]`/`[2]`に展開する規則（prev・リピート発火・押した瞬間・離した瞬間）。
+//! 逆アセンブル`42ace0`〜`42ad62`を読んで検証した。
+//! feed 1個ぶんのステートマシンだけを持つ。1P・2P・合成の3本の呼び分けは呼び出し側が行う。
 
-/// 台本の語のうち、ゲームへ送ってよいビット。Z・X・Shift・Esc・方向の 8 ビットだけ。台本・peer_sim の語の検証が使う。
-/// ネットワークで送る語は Ctrl を足した `MATCH_SEND_MASK`（どちらも P/Home の `0x0800` は含まない）。
+/// 台本のワードのうちゲームへ送ってよいビット。Z・X・Shift・Esc・方向の8ビットだけ。台本・peer_simのワードの検証が使う。
+/// ネットワークで送るワードはCtrlを足した`MATCH_SEND_MASK`（どちらもP/Homeの`0x0800`は含まない）。
 pub const SEND_MASK: u16 = 0x00FF;
 
-/// ネットワークで送る入力ワード（選択の画面も試合も）のマスク。`SEND_MASK` に Ctrl（`keys::CTRL`）を足したもの。
-/// 相手の語のビットは自分の側でも効くので、Enter や P/Home（スクリーンショット `0x0042DBAA`）などは送らない
-/// （送ると相手の PC にスクリーンショットを書かせる）。P/Home は語に混ぜず、自分の PC では DLL が自分のキーボードの押した瞬間を覚え、
-/// Present のラッパを呼ぶ間だけゲーム自身の判定のビットを立てて撮らせる（DLL の `shot_key_win`）。
+/// ネットワークで送る入力ワード（選択の画面も試合も）のマスク。`SEND_MASK`にCtrl（`keys::CTRL`）を足したもの。
+/// 相手のワードのビットは自分の側でも効くのでEnterやP/Home（スクリーンショット`0x0042DBAA`）などは送らない。
+/// 送ると相手のPCにスクリーンショットを書かせてしまう。
+/// P/Homeはワードに混ぜない。
+/// 自分のPCではDLLが自分のキーボードの押した瞬間を覚える。
+/// Presentのラッパを呼ぶ間だけゲーム自身の判定のビットを立てて撮らせる（DLLの`shot_key_win`）。
 pub const MATCH_SEND_MASK: u16 = SEND_MASK | keys::CTRL;
 
-/// 台本の `p1=`/`p2=` に名前で書けるキーの値（InputManager の `+0x00` の語のビット）。
-/// 方向は分岐表 `0x0041C89C` を exe から読んだ値（実測の向きの一致 97.80%、母数 1,152,165 tick）。
-/// `ESC` は `0x0042BABC` を根拠に実測済み。`Z`・`X`・`SHIFT` は逆アセンブルの読みで、実機とは未照合。
+/// 台本の`p1=`/`p2=`に名前で書けるキーの値（InputManagerの`+0x00`のワードのビット）。
+/// 方向は分岐表`0x0041C89C`をexeから読んだ値（実測の向きの一致97.80%、母数1,152,165 tick）。
+/// `ESC`は`0x0042BABC`を根拠に実測済み。`Z`・`X`・`SHIFT`は逆アセンブルの読みで実機とは未照合。
 pub mod keys {
     pub const Z: u16 = 0x0001;
     pub const X: u16 = 0x0002;
@@ -24,13 +26,21 @@ pub mod keys {
     pub const DOWN: u16 = 0x0020;
     pub const LEFT: u16 = 0x0040;
     pub const RIGHT: u16 = 0x0080;
-    /// キーボードの Ctrl（VK_CONTROL。`0x0042BAAB`）とパッドのスキップのボタン。
+    /// キーボードのCtrl（VK_CONTROL。`0x0042BAAB`）とパッドのスキップのボタン。
     pub const CTRL: u16 = 0x0100;
+    /// キーボードのQ・S・Enter・D・R（`0x0042B88F`のGetKeyboardStateの道の添字）。
+    pub const Q: u16 = 0x0200;
+    pub const S: u16 = 0x0400;
+    /// PとHome（スクリーンショット。`0x0042DBAA`）。
+    pub const SHOT: u16 = 0x0800;
+    pub const ENTER: u16 = 0x1000;
+    pub const D: u16 = 0x2000;
+    pub const R: u16 = 0x4000;
 }
 
-/// feed が作る 1 本ぶんの状態（InputManager の `+0x00`〜`+0x29` のコピー）。
-/// 欄はゲームのオフセットに合わせる: `cur`=`+0x00`、`prev`=`+0x02`、`repeat`=`+0x04`、`pressed`=`+0x06`、
-/// `released`=`+0x08`、`cnt[16]`=`+0x0A`〜（各キーのリピートカウンタ u16）。`+0x2A` 以降は feed が書かないので持たない。
+/// feedが作る1本ぶんの状態（InputManagerの`+0x00`〜`+0x29`のコピー）。
+/// フィールドはゲームのオフセットに合わせる: `cur`=`+0x00`、`prev`=`+0x02`、`repeat`=`+0x04`、`pressed`=`+0x06`、
+/// `released`=`+0x08`、`cnt[16]`=`+0x0A`〜（各キーのリピートカウンタu16）。`+0x2A`以降はfeedが書かないので持たない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputState {
     pub cur: u16,
@@ -41,10 +51,10 @@ pub struct InputState {
     pub cnt: [u16; 16],
 }
 
-/// リピートの閾値。`42ad1d: cmpw $0x1a,(%esi)`。0 → 26 まで数えて発火する（初回 26 フレーム）。
+/// リピートの閾値。`42ad1d: cmpw $0x1a,(%esi)`。0 → 26まで数えて発火する（初回26フレーム）。
 const REPEAT_THRESHOLD: u16 = 0x1A;
 
-/// 発火のたびに引く量。`42ad27: addw $0xfff8,(%esi)`。以後は 8 フレームごとに発火する。
+/// 発火のたびに引く量。`42ad27: addw $0xfff8,(%esi)`。以後は8フレームごとに発火する。
 const REPEAT_DECREMENT: u16 = 8;
 
 impl InputState {
@@ -52,13 +62,13 @@ impl InputState {
         Self::default()
     }
 
-    /// feed 1 回ぶん。`word` は新しい入力語の下位 16 ビット（fastcall `edx`）。
+    /// feed 1回ぶん。`word`は新しい入力ワードの下位16ビット（fastcall `edx`）。
     ///
-    /// - `42acf2`/`42acf7`: `prev ← 旧 cur`（`cur` を書く前の値）
+    /// - `42acf2`/`42acf7`: `prev ← 旧 cur`（`cur`を書く前の値）
     /// - `42acfb`: `cur ← word`
     /// - `42ad06`: `repeat ← 0`（発火のビットは毎回作り直す）
-    /// - `42ad0c`〜`42ad3d`: b = 0..15 を新しい `cur` のビットで判定。立っていれば `cnt[b] += 1` し、
-    ///   `cnt[b] >= 0x1A` なら `repeat` の b ビットを立てて `cnt[b] -= 8`。立っていなければ `cnt[b] = 0`
+    /// - `42ad0c`〜`42ad3d`: b = 0..15 を新しい`cur`のビットで判定。立っていれば`cnt[b] += 1`し、
+    ///   `cnt[b] >= 0x1A`なら`repeat`のbビットを立てて`cnt[b] -= 8`。立っていなければ`cnt[b] = 0`
     /// - `42ad3f`〜`42ad53`: `changed = cur ^ prev`
     /// - `42ad56`: `released = changed & !cur`、`42ad5b`: `pressed = changed & cur`
     pub fn feed(&mut self, word: u16) {
@@ -85,7 +95,7 @@ impl InputState {
 
 #[cfg(test)]
 mod tests {
-    //! 期待値は手で数えた表で書く（`feed` の式やループから作らない）。
+    //! 期待値は手で数えた表で書く（`feed`の式やループから作らない）。
     use super::*;
 
     const BIT0: u16 = 0x0001;

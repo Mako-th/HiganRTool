@@ -1,6 +1,7 @@
-//! ローダーが使う Win32 の呼び出しを 1 つのトレイトにまとめたもの。
-//! 本物のプロセスを作らずに後始末の各地点を `cargo test` で検査するため、検査では好きな地点で失敗させる偽物を、
-//! 本番（`real::RealWin32`）と自己検査では本物を差し込む。ハンドルと相手のアドレスは生のポインタでなく数の包みで渡す。
+//! ローダーが使うWin32の呼び出しを1つのトレイトにまとめたもの。
+//! 本物のプロセスを作らずに後始末の各地点を`cargo test`で検査するため、呼び出しを差し替えられるようにしてある。
+//! 検査では好きな地点で失敗させる偽物を差し込む。本番（`real::RealWin32`）と自己検査では本物を差し込む。
+//! ハンドルと相手のアドレスは生のポインタでなく数値のラッパーで渡す。
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ pub struct Remote(pub usize);
 
 pub type ErrorCode = u32;
 
-/// `process` と `thread` は呼んだ側が閉じる。
+/// `process`と`thread`は呼んだ側が閉じる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessInfo {
     pub process: Handle,
@@ -42,32 +43,32 @@ pub struct Spawn {
     pub no_activate: bool,
 }
 
-/// 起動の途中で、画面とログに知らせたい出来事。
+/// 起動の途中で画面とログに知らせたいイベント。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchNote {
-    /// DLL の読み込みが最初の待ちで終わらず、ゲームのプロセスは生きているので待ちを延ばす。
+    /// DLLの読み込みが最初の待ちで終わらず、ゲームのプロセスは生きているので待ちを延ばす。
     SlowLoad,
 }
 
-/// どれも呼んだら何が起きたかを返すだけで、後始末は呼んだ側（`launch.rs`）が決める。
+/// どれも呼んだら何が起きたかを返すだけ。後始末は呼んだ側（`launch.rs`）が決める。
 pub trait Win32 {
     fn read_file(&mut self, path: &Path) -> Result<Vec<u8>, String>;
 
-    /// kernel32.dll は同じ起動の間どのプロセスでも同じアドレスなので、リモートスレッドの入口にそのまま使える。
+    /// kernel32.dllは同じ起動の間どのプロセスでも同じアドレスなのでリモートスレッドの入口にそのまま使える。
     fn load_library_w_address(&mut self) -> Result<usize, ErrorCode>;
 
     fn create_process_suspended(&mut self, spawn: &Spawn) -> Result<ProcessInfo, ErrorCode>;
 
     fn virtual_alloc(&mut self, process: Handle, size: usize) -> Result<Remote, ErrorCode>;
 
-    /// 全部書けなかったら失敗。
+    /// 全部書き込めなかったら失敗。
     fn write_memory(&mut self, process: Handle, at: Remote, data: &[u8]) -> Result<(), ErrorCode>;
 
-    /// 全部読めなかったら失敗。
+    /// 全部読み取れなかったら失敗。
     fn read_memory(&mut self, process: Handle, at: usize, len: usize)
     -> Result<Vec<u8>, ErrorCode>;
 
-    /// 保護を書けるようにして書き、戻し、`FlushInstructionCache`。照合と読み直しは呼んだ側が行う。
+    /// 保護を書き込み可能にして書き込み、元に戻して`FlushInstructionCache`を呼ぶ。照合と読み直しは呼んだ側が行う。
     fn patch_code(&mut self, process: Handle, at: usize, data: &[u8]) -> Result<(), ErrorCode>;
 
     /// 返したハンドルは呼んだ側が閉じる。
@@ -80,7 +81,7 @@ pub trait Win32 {
 
     fn wait(&mut self, handle: Handle, timeout_ms: u32) -> WaitResult;
 
-    /// `LoadLibraryW` の戻り値（読み込んだ DLL のアドレス。0 なら失敗）がここに来る。
+    /// `LoadLibraryW`の戻り値（読み込んだDLLのアドレス。0なら失敗）がここに来る。
     fn thread_exit_code(&mut self, thread: Handle) -> Result<u32, ErrorCode>;
 
     fn virtual_free(&mut self, process: Handle, at: Remote) -> Result<(), ErrorCode>;

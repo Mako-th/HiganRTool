@@ -1,10 +1,11 @@
-//! `HiganRTool.ini` の読み書き（ファイルの出し入れ。行の編集そのものは `ini_edit`）。
+//! `HiganRTool.ini`の読み書き（ファイルの出し入れ。行の編集そのものは`ini_edit`）。
 //!
-//! - 設定の原本は ini 1 つ。メニューで決めた値は決まった時点で該当の 1 行を書き換える（`update`）。
-//! - 書くのは一時ファイル（`<ini>.tmp`）へ書いてから置き換える（途中で落ちても ini が壊れない）。ini が無いときは作らない。
-//! - 読み書きは 1 本の鍵の中で行う。名前・ルーム名・同期方式・言語・ゲームのパスは別々のスレッドが頼むので、
-//!   読んで書く間に別の頼みが入って、片方の書き換えが消えないようにする。
-//! - 以前のバージョンが別ファイルに覚えていた値（`game_path.txt` など）は `migrate` が ini へ移す。
+//! - 設定の原本はini 1つ。メニューで決めた値は決まった時点で該当の1行を書き換える（`update`）。
+//! - 書くのは一時ファイル（`<ini>.tmp`）へ書いてから置き換える（途中で落ちてもiniが壊れない）。iniが無いときは作らない。
+//! - 読み書きは1本のロックの中で行う。
+//!   名前・ルーム名・同期方式・言語・ゲームのパスは別々のスレッドが更新を要求する。
+//!   読んで書く間に別の要求が割り込んで片方の書き換えが消えることを防ぐ。
+//! - 以前のバージョンが別ファイルに覚えていた値（`game_path.txt`など）は`migrate`がiniへ移す。
 #![forbid(unsafe_code)]
 
 use std::io::Read;
@@ -16,23 +17,23 @@ use encoding_rs::SHIFT_JIS;
 use crate::ini::{self, Ini};
 use crate::ini_edit::{self, Edit};
 
-/// ini を読む大きさの上限（B）。配る ini は 3 KB ほど。
+/// iniを読む大きさの上限（B）。配布用のiniは3 KBほど。
 const INI_MAX: u64 = 1 << 20;
-/// 引き継ぐファイルを読む大きさの上限（B）。中身は名前かパスの 1 行。
+/// 引き継ぐファイルを読む大きさの上限（B）。中身は名前かパスの1行。
 const LEGACY_MAX: u64 = 4096;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// 配る ini の原本（zip に入るものと同じファイル。コピーは作らない）。
+/// 配布用のiniの原本（zipに入るものと同じファイル。コピーは作らない）。
 const DIST_INI: &str = include_str!("../../../scripts/dist/HiganRTool.ini");
 
-/// 配る ini を書き出すときの中身。`tools/make_dist.py` が zip に入れるときと同じ改行（CRLF。古いメモ帳で 1 行に潰れないように）。
+/// 配布用のiniを書き出すときの中身。`tools/make_dist.py`がzipに追加するときと同じ改行（CRLF。古いメモ帳で1行に潰れないように）。
 pub fn dist_ini_text() -> String {
     DIST_INI.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
-    // 鍵を持つ者が落ちても、中身はファイルなので次の書きでやり直せる。
+    // ロックを持つ側が落ちても中身はファイルなので次の書き込みでやり直せる。
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -47,7 +48,7 @@ fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, std::io::Error> {
     Ok(bytes)
 }
 
-/// UTF-8 でなければ Shift_JIS として読む（dll が ini を読むのと同じ順）。どちらでもなければ `None`。
+/// UTF-8でなければShift_JISとして読む（dllがiniを読むのと同じ順）。どちらでもなければ`None`。
 pub fn decode(bytes: &[u8]) -> Option<String> {
     match std::str::from_utf8(bytes) {
         Ok(s) => Some(s.to_string()),
@@ -57,7 +58,7 @@ pub fn decode(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// ini が無いときは `initial`（あれば）を元の中身にする。
+/// iniが無いときは`initial`（あれば）を元の中身にする。
 fn read_or_initial(path: &Path, initial: Option<&str>) -> Result<Vec<u8>, String> {
     match (read_capped(path, INI_MAX), initial) {
         (Err(e), Some(text)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -67,13 +68,13 @@ fn read_or_initial(path: &Path, initial: Option<&str>) -> Result<Vec<u8>, String
     }
 }
 
-/// 読める行だけを読んだ ini。無い・読めないなら `None`。
+/// 読める行だけを読んだini。無い・読めないなら`None`。
 pub fn read(path: &Path) -> Option<Ini> {
     let text = decode(&read_capped(path, INI_MAX).ok()?)?;
     Some(ini::parse_lenient(&text).ini)
 }
 
-/// `[section] key` の値。無い・ini が読めない・空なら `None`。
+/// `[section] key`の値。無い・iniが読めない・空なら`None`。
 pub fn get(path: &Path, section: &str, key: &str) -> Option<String> {
     read(path)?
         .get(section, key)
@@ -102,22 +103,23 @@ fn update_locked(path: &Path, initial: Option<&str>, edits: &[Edit<'_>]) -> Resu
     Ok(true)
 }
 
-/// `edits` を ini に当てる。変えたら `Ok(true)`、中身が同じなら書かず `Ok(false)`。ini が無い・断られたときは何も書かない。
+/// `edits`をiniに当てる。変えたら`Ok(true)`。中身が同じなら書かず`Ok(false)`。iniが無い・断られたときは何も書かない。
 /// 誤りの文は値を含めない（名前・ルーム名・ゲームのパスをログに残さない）。
 pub fn update(path: &Path, edits: &[Edit<'_>]) -> Result<bool, String> {
     let _g = lock();
     update_locked(path, None, edits)
 }
 
-/// `update` に加えて、ini が無ければ `initial` を元に作る（ローダーが、DLL が既定の ini を書き出す前に書くとき。
-/// 設定の一部だけの ini を作ると DLL が既定を書き出さなくなるので、配るバージョンは `dist_ini_text()` を渡す）。
+/// `update`に加えてiniが無ければ`initial`を元に作る。
+/// ローダーがDLLによる既定のiniの書き出しより前に書くときに使う。
+/// 設定の一部だけのiniを作るとDLLが既定を書き出さなくなるので配布バージョンでは`dist_ini_text()`を渡す。
 pub fn update_creating(path: &Path, initial: &str, edits: &[Edit<'_>]) -> Result<bool, String> {
     let _g = lock();
     update_locked(path, Some(initial), edits)
 }
 
-/// `is_latest` が真のときだけ書く。検証するのは鍵の中なので、検証した後に別の頼みが入って古い値で上書きする隙間が無い。
-/// 偽なら何も書かず `Ok(false)`（もっと新しい頼みがある）。
+/// `is_latest`が真のときだけ書く。検証するのはロックの中なので検証した後に別の要求が割り込んで古い値で上書きする隙間が無い。
+/// 偽なら何も書かず`Ok(false)`（もっと新しい要求がある）。
 pub fn update_if(
     path: &Path,
     edits: &[Edit<'_>],
@@ -130,9 +132,10 @@ pub fn update_if(
     update_locked(path, None, edits)
 }
 
-/// ini の全文を作り直す。`make` に今の中身（UTF-8 に直したもの）を渡し、`Some(新しい中身)` で中身が変わるときだけ
-/// 一時ファイル経由で置き換える。書くのは UTF-8（Shift_JIS の ini も UTF-8 になる）。ini が無い・読めないときは何も書かない。
-/// 誤りの文は中身を含めない。返すのは書いたか。
+/// iniの全文を作り直す。
+/// `make`に今の中身（UTF-8に直したもの）を渡す。`Some(新しい中身)`が返って中身が変わるときだけ一時ファイル経由で置き換える。
+/// 書くのはUTF-8（Shift_JISのiniもUTF-8になる）。iniが無い・読めないときは何も書かない。
+/// 誤りの文は中身を含めない。返すのは書いたかどうか。
 pub fn rewrite(path: &Path, make: impl FnOnce(&str) -> Option<String>) -> Result<bool, String> {
     let _g = lock();
     let old =
@@ -149,21 +152,21 @@ pub fn rewrite(path: &Path, make: impl FnOnce(&str) -> Option<String>) -> Result
     Ok(true)
 }
 
-/// 以前のバージョンが別ファイルに覚えていた値 1 つ。
+/// 以前のバージョンが別ファイルに覚えていた値1つ。
 pub struct Legacy<'a> {
     pub file: PathBuf,
     pub section: &'a str,
     pub key: &'a str,
-    /// ファイルの中身から ini に書く値を取り出す。使えなければ `None`。
+    /// ファイルの中身からiniに書く値を取り出す。使えなければ`None`。
     pub parse: fn(&str) -> Option<String>,
-    /// ini に今ある値が「まだ利用者が決めていない既定のまま」か（そうなら、ファイルの値を移す）。
+    /// iniに今ある値が「まだ利用者が決めていない既定のまま」かどうか（そうならファイルの値を移す）。
     pub is_default: fn(&str) -> bool,
 }
 
-/// `items` のファイルがあれば中身を ini へ移し、移せたら（ini に既に値があって移さないときも）ファイルを消す。
-/// ini に空でない値が既にあれば ini を優先する（`is_default` の値は未設定と同じ）。
-/// 移せなければ（中身が使えない・ini が無い・書けない）ファイルを残す。返すのは本ログ用の文（値は含めない）。
-/// ini が無いとき `initial` があれば、それを元に ini を作って移す。
+/// `items`のファイルがあれば中身をiniへ移す。移せたら（iniに既に値があって移さないときも）ファイルを消す。
+/// iniに空でない値が既にあればiniを優先する（`is_default`の値は未設定と同じ）。
+/// 移せなければ（中身が使えない・iniが無い・書けない）ファイルを残す。返すのは本ログ用の文（値は含めない）。
+/// iniが無いとき`initial`があればそれを元にiniを作って移す。
 pub fn migrate(ini_path: &Path, initial: Option<&str>, items: &[Legacy<'_>]) -> Vec<String> {
     let mut logs = Vec::new();
     let present: Vec<&Legacy<'_>> = items
@@ -526,7 +529,7 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "[loader]\r\ngame = G\r\n"
         );
-        // 既にある ini は initial で置き換えない。
+        // 既にあるiniはinitialで置き換えない。
         std::fs::write(&p, "[s]\nx = 2\n").unwrap();
         update_creating(&p, initial, &[set("s", "x", "3")]).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "[s]\nx = 3\n");
@@ -543,7 +546,7 @@ mod tests {
         let t = Tmp::new("nowrite");
         let p = t.file("HiganRTool.ini");
         std::fs::write(&p, "[s]\nx = 1\n").unwrap();
-        // 一時ファイルの名前がフォルダで塞がっていて、書き込みが失敗する。
+        // 一時ファイルの名前をフォルダが使っているので書き込みが失敗する。
         std::fs::create_dir(t.file("HiganRTool.ini.tmp")).unwrap();
         std::fs::write(t.file("a.txt"), "v\n").unwrap();
         let logs = migrate(&p, None, &[item(&t, "a.txt", "a")]);

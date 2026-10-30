@@ -1,8 +1,8 @@
-//! 読み取りのスレッドの 1 回の実行（pure。unsafe 無し）: 照合（`probe::run`）→ 設置の条件 → ウィンドウのアドレスとコピーの表の検証 →
-//! 1 地点目のフックの設置（`hook::install_call_hook`）→ 回数と tick ごとの記録の計測（`observe::run`）。
+//! 読み取りのスレッドの1回の実行（pure。unsafe無し）。流れは次のとおり。
+//! 照合（`probe::run`）→ 設置の条件 → ウィンドウのアドレスとコピーの表の検証 → 1地点目のフックの設置（`hook::install_call_hook`）→ 回数とtickごとの記録の計測（`observe::run`）。
 //!
-//! 同定・image base・表の検査・14 地点の照合が**全部**通ったときだけ設置する（1 地点でも合わなければ何も書かない）。
-//! 条件の判定を Win32 の外へ分け、偽物で「欠けたら設置の呼び出しが 0 回」を見る。
+//! 同定・image base・表の検査・14地点の照合が**全部**通ったときだけ設置する（1地点でも合わなければ何も書かない）。
+//! 条件の判定はWin32の外に分けてある。偽物を使って「欠けたら設置の呼び出しが0回」になることを見る。
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -29,57 +29,62 @@ use crate::th09_addr::{
 use crate::ticks::CopyRow;
 use crate::trial_summary::{self, GameFacts, PaceEnd, PaceKind, Pacing, Setup, Stage, Wrote};
 
-/// 台本のインターフェース（台本のファイルと、ゲームのスレッドが使う静的変数）。本物は `script_win::RealScriptHost`。呼ぶ順は `run` が決める:
-/// 読む → 移す → バッファを確保 → 台本の状態と関数のアドレスを登録する → 2 つのフックを書く → 撮影を有効に → 分岐を開く。
+/// 台本のインターフェース（台本のファイルとゲームのスレッドが使う静的変数）。本物は`script_win::RealScriptHost`。
+/// 呼ぶ順は`run`が決める。
+/// 読む → 移す → バッファを確保 → 台本の状態と関数のアドレスを登録する → 2つのフックを書く → 撮影を有効に → 分岐を開く。
 pub trait ScriptHost {
     fn read_script(&mut self) -> Result<Option<Vec<u8>>, String>;
-    /// `script.txt` を本ログの隣の `<回の名前>_script.txt` へ上書きせずに移す。移した先の名前。
+    /// `script.txt`を本ログの隣の`<回の名前>_script.txt`へ上書きせずに移す。
+    /// 返すのは移した先の名前。
     fn move_script(&mut self) -> Result<String, String>;
-    /// 撮影のバッファ 4 枚を確保し、デバイスと present parameters のアドレスを保存する（撮影はまだ有効にしない）。
+    /// 撮影のバッファ4枚を確保してデバイスとpresent parametersのアドレスを保存する（撮影はまだ有効にしない）。
     fn prepare_shots(&mut self) -> Result<(), String>;
     fn arm(&mut self, script: Script, feed_fn: u32, local_fn: u32) -> Result<(), String>;
-    /// 台本の無いネットワーク実行: アドレスと関数のアドレスだけを登録し、台本の状態は空にする（分かれ道はまだ開かない）。
+    /// 台本の無いネットワーク実行: アドレスと関数のアドレスだけを登録して台本の状態は空にする（分岐はまだ開かない）。
     fn arm_io(&mut self, _feed_fn: u32, _local_fn: u32) -> Result<(), String> {
         Err("台本の無い走りの口が無い".to_string())
     }
     fn shots_on(&mut self);
     fn start(&mut self) -> Result<(), String>;
 
-    // ---- ネットワーク（既定は「ネットワークなし」。本物は `script_win::RealScriptHost`）----
-    /// DLL のフォルダの `HiganRTool.ini`（ローダーの `--ini` が渡したパスがあればそれ）を読む（移さない）。無ければ `Ok(None)`。
+    // ---- ネットワーク（既定は「ネットワークなし」。本物は`script_win::RealScriptHost`）----
+    /// DLLのフォルダの`HiganRTool.ini`（ローダーの`--ini`が渡したパスがあればそれ）を読む（移さない）。無ければ`Ok(None)`。
     fn read_net_ini(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
-    /// `read_net_ini` の本文に、読めない行を捨てた注と、Shift_JIS として読み直した注を添える。本文は誤りの行を空行にしたもの。
+    /// `read_net_ini`の本文に読めない行を捨てた注と、Shift_JISとして読み直した注を添える。本文は誤りの行を空行にしたもの。
     fn read_net_ini_noted(
         &mut self,
     ) -> Result<Option<(String, Vec<higanr_core::ini_lenient::IniNote>)>, String> {
         Ok(self.read_net_ini()?.map(|t| (t, Vec::new())))
     }
-    /// ini の場所の文（本ログの「ini: …」の行）。
+    /// iniの場所の文（本ログの「ini: …」の行）。
     fn ini_origin(&self) -> String {
         format!("DLL のフォルダの {INI_FILE}")
     }
-    /// ローダーの `--script` が渡した台本なら、その場所の文（`Some` なら読んだ後に移さない）。
+    /// ローダーの`--script`が渡した台本ならその場所の文（`Some`なら読んだ後に移さない）。
     fn explicit_script(&self) -> Option<String> {
         None
     }
-    /// ネットワークを開いてセッションを組み込む（ソケット・受信スレッド・入力の地点の判断。まだ動かさない）。開いた受信ソケットの文。
+    /// ネットワークを開いてセッションを組み込む（ソケット・受信スレッド・入力の地点の判断。まだ動かさない）。
+    /// 返すのは開いた受信ソケットの文。
     fn arm_net(&mut self, _s: &NetSettings, _set_state_fn: u32) -> Result<String, String> {
         Err("ネットワークの実装が無い".to_string())
     }
     fn start_net(&mut self) -> Result<(), String> {
         Err("ネットワークの実装が無い".to_string())
     }
-    /// 立ち絵の 3 本の関数の入口（`th09_addr::PORTRAIT_SITES` の順）を渡す。3 本のバイト列を全部照合して合ったときだけ呼ばれる。
-    /// 既定は何もしない（立ち絵は追わないだけで、選択は動く）。
+    /// 立ち絵の3本の関数の入口（`th09_addr::PORTRAIT_SITES`の順）を渡す。3本のバイト列を全部照合して合ったときだけ呼ばれる。
+    /// 既定は何もしない（立ち絵は追わないだけで選択は動く）。
     fn arm_portrait(&mut self, _fns: [u32; 3]) {}
-    /// 素の poll `0x0042B850` の入口（`th09_addr::POLL_SITES`）を渡す。先頭 8 バイトを照合して合ったときだけ呼ばれる。
-    /// 既定は何もしない（ローカル入力は今までの `0x0042BE40` で読む）。
+    /// 素のpoll `0x0042B850`の入口（`th09_addr::POLL_SITES`）を渡す。先頭8バイトを照合して合ったときだけ呼ばれる。
+    /// 既定は何もしない（ローカル入力は今までの`0x0042BE40`で読む）。
     fn arm_poll(&mut self, _addr: u32) {}
-    /// rollback のモードの入口（確保・解放・calloc・走査の call・Present の後の入口）を書く。ini で rollback を望む実行だけ
-    /// （望まなければ 1 バイトも書かない）。**ネットワークのセッションを組み込む前に**呼ぶ: HELLO で rollback を名乗るかは入口を全部書けたかで決まる
-    /// （書けなかったのに名乗ると、相手が予測で進めるのにこちらは待つ）。書けたら true。既定は「入れない」。
+    /// rollbackのモードの入口（確保・解放・calloc・走査のcall・Presentの後の入口）を書く。
+    /// iniでrollbackを望む実行だけが対象（望まなければ1バイトも書かない）。
+    /// **ネットワークのセッションを組み込む前に**呼ぶ。HELLOでrollbackを名乗るかどうかは入口を全部書けたかで決まるため。
+    /// 書けなかったのに名乗ると、相手は予測で進めるのにこちらは待つことになる。
+    /// 書けたらtrue。既定は何も書かずにfalseを返す。
     fn arm_rollback(
         &mut self,
         _s: &NetSettings,
@@ -90,41 +95,42 @@ pub trait ScriptHost {
         false
     }
 
-    // ---- 確保・解放の数え（既定は「数えない」）----
-    /// `Arm` は入力のフックを書いた後・台本の分岐を開く前（入口がゲームのスレッドの ID を tick の記録から取るため）、
-    /// `Finish` は計測の後。
+    // ---- 確保・解放の回数の計測（既定は「数えない」）----
+    /// `Arm`を呼ぶのは入力のフックを書いた後で台本の分岐を開く前（入口がゲームのスレッドのIDをtickの記録から取るため）。
+    /// `Finish`を呼ぶのは計測の後。
     fn alloc_count(&mut self, _step: AllocStep<'_>, _out: &mut dyn Write) {}
 
     // ---- ペースと時刻のインターフェース（既定は「無し」）----
-    /// ペースと時刻のインターフェース（`pacing::install` から `pacing::finish` まで `run` が持つ）。
+    /// ペースと時刻のインターフェース（`pacing::install`から`pacing::finish`まで`run`が持つ）。
     fn pacing_host(&mut self) -> Option<Box<dyn crate::pacing::PacingHost>> {
         None
     }
 
     // ---- 文字の描画（既定は「無し」）----
-    /// 文字の描画のインターフェース（`overlay::install` から `overlay::finish` まで `run` が持つ）。
+    /// 文字の描画のインターフェース（`overlay::install`から`overlay::finish`まで`run`が持つ）。
     fn overlay_host(&mut self) -> Option<Box<dyn crate::overlay::OverlayHost>> {
         None
     }
 
-    // ---- リプレイの自動保存（既定は「入れない」）----
-    /// ini の `[replay]` を読み、`enable = 1` なら自動保存を入れる。入れたらその文、設定に無ければ `Ok(None)`。
+    // ---- リプレイの自動保存（既定は「有効にしない」）----
+    /// iniの`[replay]`を読んで`enable = 1`なら自動保存を有効にする。有効にしたときはその文を返す。設定に無ければ`Ok(None)`。
     fn arm_replay(&mut self, _net: Option<&NetSettings>) -> Result<Option<String>, String> {
         Ok(None)
     }
 
-    /// 以前のバージョンが別ファイルに覚えていた名前・ルーム名を ini へ移す（`load_net` が ini を読む前に 1 回）。本ログに出す文を返す（値は含めない）。
+    /// 以前のバージョンが別ファイルに覚えていた名前・ルーム名をiniへ移す（`load_net`がiniを読む前に1回）。本ログに出す文を返す（値は含めない）。
     fn migrate_legacy(&mut self) -> Vec<String> {
         Vec::new()
     }
 
-    /// OS の UI の言語（LANGID）。既定は日本語。
+    /// OSのUIの言語（LANGID）。既定は日本語。
     fn os_langid(&mut self) -> u16 {
         0x0411
     }
 }
 
-/// 画面の言語を決めて保存する（ini の `[ui] lang`、`auto` なら OS の UI の言語）。ini の `[ui]` の誤りは本ログに出して自動で続ける。
+/// 画面の言語を決めて保存する（iniの`[ui] lang`。`auto`ならOSのUIの言語）。
+/// iniの`[ui]`の誤りは本ログに出して自動で続ける。
 fn decide_lang(host: &mut dyn ScriptHost, text: &str, out: &mut dyn Write) {
     let setting = match higanr_core::ini::parse(text)
         .map_err(|e| e.to_string())
@@ -148,8 +154,8 @@ fn decide_lang(host: &mut dyn ScriptHost, text: &str, out: &mut dyn Write) {
     let _ = writeln!(detail_out(out), "言語: {}（{from}）", lang.word());
 }
 
-/// ネットワークの設定を読む（ini が無い・`[netplay]` が無い・`enable = 0` なら `None`）。読めなければログに書いて `None`
-/// （ネットワークなしで走る）。
+/// ネットワークの設定を読む（iniが無い・`[netplay]`が無い・`enable = 0`なら`None`）。
+/// 読めなければログに書いて`None`を返す（ネットワークなしで走る）。
 fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSettings> {
     let _ = writeln!(detail_out(out), "ini: {}", host.ini_origin());
     for line in host.migrate_legacy() {
@@ -187,7 +193,7 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
             None
         }
         Ok(Some(mut s)) => {
-            // 前処理で捨てた行と、読むときに既定へ戻した行を合わせて、メニューの 1 か所とログに出す。
+            // 前処理で捨てた行と読むときに既定へ戻した行を合わせて、メニューの1か所とログに出す。
             let mut notes = host_notes;
             notes.append(&mut s.ini_notes);
             notes.sort_by_key(|n| n.line);
@@ -211,8 +217,9 @@ fn load_net(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<NetSetting
     }
 }
 
-/// 開始のフックを書き、ネットワークのセッションを組み込む（まだ動かさない）。どちらかができなければ Err（ネットワークなしで走る）。開始のフックが書けていれば
-/// 残るが、`NET_ON` が 0 の間は回数を数えて元の飛び先へ飛ぶだけ。書けたかは `start_hook` に書く。
+/// 開始のフックを書き、ネットワークのセッションを組み込む（まだ動かさない）。どちらかができなければErr（ネットワークなしで走る）。
+/// 開始のフックが書けていれば残る。ただし`NET_ON`が0の間は回数を数えて元の飛び先へ飛ぶだけ。
+/// 書けたかどうかは`start_hook`に書く。
 fn install_net(
     hook_env: &mut dyn DetourEnv,
     host: &mut dyn ScriptHost,
@@ -243,7 +250,7 @@ fn install_net(
         return Err("開始のフックが書けませんでした".to_string());
     }
     *start_hook = Wrote::Written;
-    // rollback のモードの入口。ネットワークのセッション（HELLO で名乗るモード）より先に書く。
+    // rollbackのモードの入口。ネットワークのセッション（HELLOで名乗るモード）より先に書く。
     host.arm_rollback(s, hook_env, forbidden, out);
     match host.arm_net(s, sdef.addr) {
         Ok(desc) => {
@@ -270,9 +277,9 @@ fn install_net(
     }
 }
 
-/// 立ち絵の 3 本の関数の入口を照合し、全部合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後、ネットワークを動かす前）。1 本でも合わない・
-/// 読めないときは何も渡さず理由をログに書く（立ち絵を追わないだけで、選択は今までどおり動く）。別の表（`PORTRAIT_SITES`）に
-/// するのは、`SITES` は 1 行でも合わなければ何も書かない表で、ここで止めたいのは立ち絵だけだから。
+/// 立ち絵の3本の関数の入口を照合し、全部合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後でネットワークを動かす前）。
+/// 1本でも合わない・読めないときは何も渡さず、理由をログに書く（立ち絵を追わないだけで選択は今までどおり動く）。
+/// 別の表（`PORTRAIT_SITES`）にするのは、`SITES`は1行でも合わなければ何も書かない表だから。ここで止めたいのは立ち絵だけ。
 fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
     let mut fns = [0u32; 3];
     for (slot, name) in fns.iter_mut().zip([
@@ -317,9 +324,10 @@ fn arm_portrait(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Writ
     );
 }
 
-/// 素の poll の入口を照合し、合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後、ネットワークを動かす前）。合わない・読めないときは何も渡さず
-/// 理由をログに書く（ローカル入力は今までの `0x0042BE40` で読む。ネットワークは開いたまま: 各自が自分の入力ワードを読んで送るので同期には効かない）。
-/// 別の表（`POLL_SITES`）にする理由は `th09_addr::POLL_SITES` の注。
+/// 素のpollの入口を照合し、合ったときだけ入口へ渡す（ネットワークのセッションを組み込んだ後でネットワークを動かす前）。
+/// 合わない・読めないときは何も渡さず、理由をログに書く。
+/// ローカル入力は今までの`0x0042BE40`で読む。ネットワークは開いたまま。各自が自分の入力ワードを読んで送るので同期には効かない。
+/// 別の表（`POLL_SITES`）にする理由は`th09_addr::POLL_SITES`の注。
 fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
     let Some(def) = POLL_SITES.iter().find(|d| d.name == POLL_SITE) else {
         let _ = writeln!(
@@ -358,9 +366,10 @@ fn arm_poll(env: &mut dyn Env, host: &mut dyn ScriptHost, out: &mut dyn Write) {
     }
 }
 
-/// 台本を読み、移し、読めたら返す。移せなければ使わない。UTF-8 でない・誤りなら使わない（台本なしで走る）。本文と読んだ結果を
-/// ログに書く。移すのは中身を検証する前（読めた台本は、誤りでも 1 回で片付け、残った台本が後の実行で押さないようにする）。
-/// ローダーの `--script` が渡した台本は移さない。
+/// 台本を読んで移し、読めたら返す。移せなければ使わない。UTF-8でない・誤りなら使わない（台本なしで走る）。
+/// 本文と読んだ結果をログに書く。
+/// 移すのは中身を検証する前。読めた台本は誤りでも1回で後始末し、残った台本が後の実行で押さないようにする。
+/// ローダーの`--script`が渡した台本は移さない。
 pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Script> {
     let bytes = match host.read_script() {
         Ok(None) => {
@@ -379,7 +388,7 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
             return None;
         }
     };
-    // ローダーが渡した台本は移さない（2 つのゲームがそれぞれのコピーを持てるように）。
+    // ローダーが渡した台本は移さない（2つのゲームがそれぞれのコピーを持てるように）。
     if let Some(from) = host.explicit_script() {
         let _ = writeln!(
             detail_out(out),
@@ -415,7 +424,7 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
             return None;
         }
     };
-    // 先頭の BOM（メモ帳が付けることがある）は読まない。
+    // 先頭のBOM（メモ帳が付けることがある）は読まない。
     let body = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
     let _ = writeln!(
         detail_out(out),
@@ -442,7 +451,7 @@ pub fn load_script(host: &mut dyn ScriptHost, out: &mut dyn Write) -> Option<Scr
     }
 }
 
-/// 台本を設定する（設置の前）。設定できたら台本の段階の数と、撮影のバッファを確保できたかを返す。
+/// 台本を設定する（設置の前）。設定できたら台本の段階の数と撮影のバッファを確保できたかを返す。
 fn arm_script(
     host: &mut dyn ScriptHost,
     sites: &[SiteDef],
@@ -482,7 +491,7 @@ fn arm_script(
     Some((steps, shots))
 }
 
-/// 台本の無いネットワーク実行: 入力の入口が読むアドレスと呼ぶ関数のアドレスだけを登録する。登録できなければ Err（ネットワークを開かない）。
+/// 台本の無いネットワーク実行: 入力の入口が読むアドレスと呼ぶ関数のアドレスだけを登録する。登録できなければErr（ネットワークを開かない）。
 fn arm_io(host: &mut dyn ScriptHost, sites: &[SiteDef], out: &mut dyn Write) -> Result<(), String> {
     let addr_of = |name: &str| sites.iter().find(|d| d.name == name).map(|d| d.addr);
     let (Some(feed), Some(local)) = (addr_of(FEED_SITE), addr_of(LOCAL_INPUT_SITE)) else {
@@ -510,15 +519,15 @@ fn arm_io(host: &mut dyn ScriptHost, sites: &[SiteDef], out: &mut dyn Write) -> 
     }
 }
 
-/// 分岐を開く直前の、ネットワークと自動保存（台本の有無によらず同じ順）。ネットワークを動かせたら true。動かせなかったこと・自動保存の入り方は、
-/// 試験のまとめの材料 `game` へ書く。
+/// 分岐を開く直前に行うネットワークと自動保存の起動（台本の有無によらず同じ順）。ネットワークを動かせたらtrue。
+/// ネットワークを動かせなかったことと自動保存の有効化の結果は、試験のまとめの材料`game`へ書く。
 fn start_net_and_replay(
     host: &mut dyn ScriptHost,
     net: Option<&NetSettings>,
     game: &mut GameFacts,
     out: &mut dyn Write,
 ) -> bool {
-    // ネットワークは分岐を開く直前に動かす（開始のフックは `NET_ON` を、入力の入口は `SCRIPT_ON` を見る）。
+    // ネットワークは分岐を開く直前に動かす（開始のフックは`NET_ON`を、入力の入口は`SCRIPT_ON`を見る）。
     let mut net_on = false;
     if game.net == Setup::On {
         match host.start_net() {
@@ -535,7 +544,7 @@ fn start_net_and_replay(
             }
         }
     }
-    // リプレイの自動保存（ini の `[replay]` に `enable = 1` があるときだけ。分岐を開く前に入れる）。
+    // リプレイの自動保存（iniの`[replay]`に`enable = 1`があるときだけ。分岐を開く前に有効にする）。
     match host.arm_replay(net) {
         Ok(Some(desc)) => {
             let _ = writeln!(detail_out(out), "自動保存: {desc}");
@@ -556,7 +565,7 @@ fn start_net_and_replay(
     net_on
 }
 
-/// 試験のまとめの終わりの節を本ログへ書く（`session::run` の全部の出口で、本ログの最後の行の前に 1 回）。
+/// 試験のまとめの終わりの節を本ログへ書く（`session::run`の全部の出口で本ログの最後の行の前に1回）。
 fn write_final_trial(
     out: &mut dyn Write,
     rec: &mut dyn RecordEnv,
@@ -572,12 +581,12 @@ fn write_final_trial(
 pub enum End {
     /// 何も書いていない。
     NotInstalled,
-    /// rel32 を書いた（フックは残る）。
+    /// rel32を書いた（フックは残る）。
     Installed,
 }
 
-/// 設置の条件。照合の集計から判定する: 同定・image base・表の検査が通ったときだけ `checked_sites` が true になり、そのうえで
-/// 表の全行を読んで全部一致したか。
+/// 設置の条件を照合の集計から判定する。
+/// 同定・image base・表の検査が通ったときだけ`checked_sites`がtrueになる。そのうえで表の全行を読み、全部一致したかどうかを見る。
 pub fn ready_to_install(s: &Summary, sites: &[SiteDef]) -> Result<(), &'static str> {
     if !s.checked_sites {
         return Err("同定・image base・表の検査が全通過でない");
@@ -591,8 +600,8 @@ pub fn ready_to_install(s: &Summary, sites: &[SiteDef]) -> Result<(), &'static s
     Ok(())
 }
 
-/// ウィンドウのアドレスを、入口に読ませてよいかを検証する（入口は `+0x2C` と `+0x3C` の 8 バイトずつを読む）。
-/// 読めなければ 0 を返し（入口はウィンドウを読まずに 0 を書く）、その旨をログに書く。読めれば今の値も書く。
+/// ウィンドウのアドレスを入口に読ませてよいかを検証する（入口は`+0x2C`と`+0x3C`の8バイトずつを読む）。
+/// 読めなければ0を返す（入口はウィンドウを読まずに0を書く）。その旨をログに書く。読めれば今の値も書く。
 fn checked_window(env: &mut dyn Env, window: u32, out: &mut dyn Write) -> u32 {
     if window == 0 {
         let _ = writeln!(
@@ -623,8 +632,8 @@ fn checked_window(env: &mut dyn Env, window: u32, out: &mut dyn Write) -> u32 {
     window
 }
 
-/// コピーの表を、入口に使わせてよいかを検証する。合わなければ 0 行を返し（入口はコピーしない）、ログに大きく書く。フックの設置そのものは
-/// 続ける（tick ごとの始まりはコピーが無くても取れる）。
+/// コピーの表を入口に使わせてよいかを検証する。合わなければ0行を返す（入口はコピーしない）。ログにも大きく書く。
+/// フックの設置そのものは続ける（tickごとの始まりはコピーが無くても取れる）。
 fn checked_copies(env: &mut dyn Env, rows: &[CopyRow], out: &mut dyn Write) -> Vec<CopyRow> {
     match check_copy_table(rows, |a, len| env.read(a, len as usize).is_some()) {
         Ok(()) => {
@@ -651,16 +660,16 @@ fn checked_copies(env: &mut dyn Env, rows: &[CopyRow], out: &mut dyn Write) -> V
 /// 実行に渡す地点の名前。
 #[derive(Debug, Clone, Copy)]
 pub struct Sites<'a> {
-    /// call 先の差し替えの行（ゲームの `on_tick` が呼ぶ `poll_all` の差し替え。入力と待ち。`th09_addr::HOOK_SITE`）。
+    /// call先の差し替えの行（ゲームの`on_tick`が呼ぶ`poll_all`の差し替え。入力と待ち。`th09_addr::HOOK_SITE`）。
     pub hook_site: &'a str,
-    /// inline detour で書く描画の行（`draw_before_endscene`）。
+    /// inline detourで書く描画の行（`draw_before_endscene`）。
     pub draw_site: &'a str,
     /// 描画だけのフレームの出口の行（照合だけ。`render_only_exit`）。一致していればそのアドレスを入口に渡す。
     pub exit_site: &'a str,
 }
 
-/// 描画だけのフレームの出口のアドレスを決める（`exit_site` 行があり、照合が全部通っていれば そのアドレス。無ければ 0）。
-/// ここに来る前に `ready_to_install` が全地点の一致をチェックしているので、行があれば一致している。
+/// 描画だけのフレームの出口のアドレスを決める（`exit_site`行があって照合が全部通っていればそのアドレス。無ければ0）。
+/// ここに来る前に`ready_to_install`が全地点の一致をチェックしているので、行があれば一致している。
 fn render_only_exit(sites: &[SiteDef], exit_site: &str, out: &mut dyn Write) -> u32 {
     match sites.iter().find(|d| d.name == exit_site) {
         Some(d) => {
@@ -682,12 +691,20 @@ fn render_only_exit(sites: &[SiteDef], exit_site: &str, out: &mut dyn Write) -> 
     }
 }
 
-/// 1 回の実行。ログの行を `out` に書く（書けなくても続ける）。`sites_used` は使う地点の名前、`window` は入口が tick ごとの記録で読むウィンドウのアドレス、`copies` は入口が枠へコピーする表、`seconds` は計測の長さ。
+/// 1回の実行。ログの行を`out`に書く（書けなくても続ける）。
+/// `sites_used`は使う地点の名前。`window`は入口がtickごとの記録で読むウィンドウのアドレス。`copies`は入口が枠へコピーする表。`seconds`は計測の長さ。
 ///
-/// call 先の差し替え（入力と待ち）を書いた後に、描画の地点へ inline detour を書き、どちらも書けたら計測（`observe::run`）へ進む。描画の detour が書けなくても call のフックは残る。設置の条件が通ったら台本（`script`）を読んで設定する。2 つのフックを書いた**後で**撮影を有効にし（detour が書けてバッファを確保できたときだけ）、分岐を開く。call 先の差し替えが断られたら開かない。設置の条件が通らない実行（花映塚でない・自己検査）では `script.txt` に触らない。
-/// 台本のある実行は台本が終わるか止まってから 10 秒で計測を終える（上限 `SCRIPT_MAX_SECONDS`）。
-/// ini に `[netplay] enable = 1` があれば、台本が無くてもネットワークを開く（`arm_io` → 開始のフック → ネットワークのセッション → ネットワークを動かす → 自動保存 → 分かれ道）。長さは `RunLen::Net`（ネットワークが終わってから 10 秒。上限は無い: 人が長く遊ぶと本ログが途中で止まるため）。台本があって `after_script = keep` なら、台本の後もネットワークを閉じず、長さも `RunLen::Net`（こちらは台本の実行と同じ上限のまま）。
-#[allow(clippy::too_many_arguments)] // 実行の入力を 1 か所で渡す
+/// call先の差し替え（入力と待ち）を書いた後に、描画の地点へinline detourを書く。どちらも書けたら計測（`observe::run`）へ進む。
+/// 描画のdetourが書けなくてもcallのフックは残る。
+/// 設置の条件が通ったら台本（`script`）を読んで設定する。
+/// 2つのフックを書いた**後で**撮影を有効にし、分岐を開く。撮影を有効にするのはdetourが書けてバッファを確保できたときだけ。
+/// call先の差し替えが断られたら分岐は開かない。
+/// 設置の条件が通らない実行（花映塚でない・自己検査）では`script.txt`に触らない。
+/// 台本のある実行は台本が終わるか止まってから10秒で計測を終える（上限`SCRIPT_MAX_SECONDS`）。
+/// iniに`[netplay] enable = 1`があれば台本が無くてもネットワークを開く（`arm_io` → 開始のフック → ネットワークのセッション → ネットワークを動かす → 自動保存 → 分岐）。
+/// 長さは`RunLen::Net`（ネットワークが終わってから10秒）。上限は無い。人が長く遊ぶと本ログが途中で止まるため。
+/// 台本があって`after_script = keep`なら台本の後もネットワークを閉じない。長さも`RunLen::Net`で、こちらは台本の実行と同じ上限のまま。
+#[allow(clippy::too_many_arguments)] // 実行の入力を1か所で渡す
 pub fn run(
     env: &mut dyn Env,
     hook_env: &mut dyn DetourEnv,
@@ -727,7 +744,7 @@ pub fn run(
             "フックの設置: 未実行（表に {} の行が無い）。",
             sites_used.hook_site
         );
-        // 書き換える行が表に無い（ビルドの誤り）。書いていないので、断ったのと同じく「フックの設置」は ×。
+        // 書き換える行が表に無い（ビルドの誤り）。書いていないので断ったのと同じく「フックの設置」は ×。
         game.input_hook = Wrote::Refused;
         write_final_trial(out, rec, &game, None);
         return End::NotInstalled;
@@ -737,7 +754,7 @@ pub fn run(
     let exit = render_only_exit(sites, sites_used.exit_site, out);
     let armed = arm_script(script, sites, out);
     let net_settings = load_net(script, out);
-    // 設置の前の番号から読む（本物では 0。設置と計測の始まりの間の件も落とさない）。
+    // 設置の前の番号から読む（本物では0。設置と計測の始まりの間の件も取りこぼさない）。
     let first_seq = rec.next_seq();
     let report = hook::install_call_hook(hook_env, def, window, &copies, exit);
     hook::write_report(out, def, &report);
@@ -779,13 +796,14 @@ pub fn run(
             );
         }
     }
-    // 文字の描画（ini の [overlay] に enable = 1 があり、描画の detour が書けたときだけ）。
+    // 文字の描画（iniの[overlay]に enable = 1 があり、描画のdetourが書けたときだけ）。
     let mut overlay = script.overlay_host();
     let overlay_on = overlay
         .as_deref_mut()
         .is_some_and(|o| crate::overlay::install(o, draw_written, out));
-    // ペースと時刻のインターフェース（ini や [pacing] が無ければ既定の auto —— ウィンドウと垂直同期を取らないフルスクリーンなら wait の方式・垂直同期を取るフルスクリーンなら game。`mode = game` なら先頭のフックは書かない。
-    // 書けなくても計測は続ける）。
+    // ペースと時刻のインターフェース。iniや[pacing]が無ければ既定のautoになる。
+    // autoはウィンドウと垂直同期を取らないフルスクリーンではwaitの方式、垂直同期を取るフルスクリーンではgameになる。
+    // `mode = game`なら先頭のフックは書かない。書けなくても計測は続ける。
     let mut pacing = script.pacing_host();
     if let Some(p) = pacing.as_deref_mut() {
         let pi = crate::pacing::install(hook_env, p, out);
@@ -799,8 +817,9 @@ pub fn run(
             used: pi.used.map(|m| m.name()),
         };
     }
-    // ネットワーク: 開始のフックを書き、セッションを組み込む。台本があれば台本の状態の後に、無ければ入力の関数のアドレスだけを登録してから（台本の無い実行は、
-    // 人が選択を押し、マッチの自分の入力ワードはローカル入力）。
+    // ネットワーク。開始のフックを書き、セッションを組み込む。
+    // 台本があれば台本の状態の後に、無ければ入力の関数のアドレスだけを登録してから組み込む。
+    // 台本の無い実行では人が選択を押し、マッチの自分の入力ワードはローカル入力になる。
     game.net = match &net_settings {
         None => Setup::NotConfigured,
         Some(s) => {
@@ -825,13 +844,13 @@ pub fn run(
             }
         }
     };
-    // ネットワークのセッションを組み込めたら、立ち絵の 3 本の関数の入口と素の poll の入口を照合して渡す（ネットワークを動かす前。合わなければ立ち絵だけ追わない・
-    // ローカル入力は今までの読み方）。台本だけの実行（ネットワークなし）のローカル入力は変えない。
+    // ネットワークのセッションを組み込めたら、立ち絵の3本の関数の入口と素のpollの入口を照合して渡す（ネットワークを動かす前）。
+    // 合わなければ立ち絵だけ追わない。ローカル入力は今までの読み方のまま。台本だけの実行（ネットワークなし）のローカル入力は変えない。
     if game.net == Setup::On {
         arm_portrait(env, script, out);
         arm_poll(env, script, out);
     }
-    // ini で有効なときだけ、確保・解放の入口 5 つに detour を書いて数え始める。
+    // iniで有効なときだけ確保・解放の入口5つにdetourを書いて数え始める。
     script.alloc_count(
         AllocStep::Arm {
             hook_env: &mut *hook_env,
@@ -839,8 +858,8 @@ pub fn run(
         },
         out,
     );
-    // ネットワークの設定がある実行の長さ: ネットワークが終わってから（台本があれば台本も終わってから）`SCRIPT_TAIL_SECONDS` 秒で終える。描画だけの
-    // フレームの実験（`RunLen::Fixed`）は、ネットワークを開けなかったときもしない（人が遊ぶつもりの実行で、更新を飛ばすフレームを作らない）。
+    // ネットワークの設定がある実行の長さ。ネットワークが終わってから（台本があれば台本も終わってから）`SCRIPT_TAIL_SECONDS`秒で終える。
+    // 描画だけのフレームの実験（`RunLen::Fixed`）は、ネットワークを開けなかったときもしない。人が遊ぶつもりの実行で、更新を飛ばすフレームを作らないため。
     // 上限（`max`）は台本のあるネットワーク実行（検査・実機の検証）だけ。台本の無いネットワーク実行はネットワークが開いている間は上限で止めない。
     let net_len = |steps: usize, feed_first: u32, max: Option<u32>| RunLen::Net {
         tail: SCRIPT_TAIL_SECONDS,
@@ -900,7 +919,7 @@ pub fn run(
                 );
             }
             let net_on = start_net_and_replay(script, net_settings.as_ref(), &mut game, out);
-            // 分岐を開く前の feed のリングバッファの番号（読み取りのスレッドはそこから読む）。
+            // 分岐を開く前のfeedのリングバッファの番号（読み取りのスレッドはそこから読む）。
             let feed_first = rec.feed_next_seq();
             match script.start() {
                 Ok(()) => {
@@ -989,7 +1008,7 @@ mod tests {
         run_with(env, h, sites, &mut FakeScript::default())
     }
 
-    /// 偽の台本のインターフェース。呼ばれた順を `events` に残す。
+    /// 偽の台本のインターフェース。呼ばれた順を`events`に残す。
     #[derive(Default)]
     pub(crate) struct FakeScript {
         pub file: Option<Vec<u8>>,
@@ -1000,15 +1019,15 @@ mod tests {
         pub events: Vec<String>,
         pub armed: Option<(usize, u32, u32)>,
         pub ini: Option<String>,
-        /// 本物の読み手と同じく、誤りの行を空行にする前処理（`ini_lenient::clean`）を掛けて返す。
+        /// 本物の読み手と同じく誤りの行を空行にする前処理（`ini_lenient::clean`）を掛けて返す。
         pub clean_ini: bool,
         pub ini_reads: u32,
         pub net_arm_fail: bool,
-        /// `arm_net` が返す文（None なら既定の合成の文）。
+        /// `arm_net`が返す文（Noneなら既定の合成の文）。
         pub net_desc: Option<String>,
-        /// ネットワークのセッションを組み込んだときの設定と set_state のアドレス。
+        /// ネットワークのセッションを組み込んだときの設定とset_stateのアドレス。
         pub net_armed: Option<(NetSettings, u32)>,
-        /// ローダーが渡した台本・ini の場所の文（2 台の走らせ方）。None なら既定（DLL のフォルダ）。
+        /// ローダーが渡した台本・iniの場所の文（2台の走らせ方）。Noneなら既定（DLLのフォルダ）。
         pub explicit: Option<String>,
         pub ini_from: Option<String>,
         pub io_fail: bool,
@@ -1016,14 +1035,14 @@ mod tests {
         pub io_armed: Option<(u32, u32)>,
         pub net_start_fail: bool,
         pub portrait_armed: Option<[u32; 3]>,
-        /// 素の poll の入口を渡されたとき（`events` には入れない）。
+        /// 素のpollの入口を渡されたとき（`events`には入れない）。
         pub poll_armed: Option<u32>,
-        /// `migrate_legacy` が返す文。
+        /// `migrate_legacy`が返す文。
         pub migrate_logs: Vec<String>,
-        /// `migrate_legacy` を呼んだ回数と、ini を最初に読んだときのその回数。
+        /// `migrate_legacy`を呼んだ回数と、iniを最初に読んだときのその回数。
         pub migrate_calls: u32,
         pub migrate_calls_at_read: Option<u32>,
-        /// OS の UI の言語（LANGID）。None なら日本語（0x0411）。
+        /// OSのUIの言語（LANGID）。Noneなら日本語（0x0411）。
         pub os_langid: Option<u16>,
     }
 
@@ -1307,7 +1326,7 @@ mod tests {
         let mut env = Fake::all_match();
         with_window(&mut env);
         with_copies(&mut env);
-        env.mem.remove(&COPY_TABLE[4].src); // InputManager の 2 本目（4 バイト境界に無い元）
+        env.mem.remove(&COPY_TABLE[4].src); // InputManagerの2本目（4バイト境界に無い元）
         let mut h = fake_hook_for_real_row();
         let (end, log) = run_both(&mut env, &mut h, SITES);
         assert_eq!(end, End::Installed);
@@ -1517,7 +1536,7 @@ mod tests {
         h
     }
 
-    /// 利用者へ配るバージョン（配布版）のビルドでは走らせない（配るバージョンは描画だけのフレームを作らない —— `observe.rs` の `makes_render_only`）。
+    /// 利用者へ配布するバージョン（配布版）のビルドでは走らせない（配布するバージョンは描画だけのフレームを作らない —— `observe.rs`の`makes_render_only`）。
     #[cfg(not(feature = "dist"))]
     #[test]
     fn no_script_runs_as_before() {
@@ -1715,7 +1734,7 @@ mod tests {
 
     const DIST_INI: &str = include_str!("../../../scripts/dist/HiganRTool.ini");
 
-    /// 利用者へ配る ini（`code_side = game`）を `edit` で書き換えて、ネットワークを開くところまで走らせる。
+    /// 利用者へ配布するini（`code_side = game`）を`edit`で書き換えてネットワークを開くところまで走らせる。
     fn run_dist_with(edit: impl Fn(&str) -> String) -> (FakeScript, String) {
         let dist = DIST_INI.replace("\r\n", "\n");
         let mut env = Fake::all_match();
@@ -1729,7 +1748,7 @@ mod tests {
         (s, log)
     }
 
-    /// `[section]` の中の最初の `from` を `to` に替える。
+    /// `[section]`の中の最初の`from`を`to`に替える。
     fn edit_in(dist: &str, section: &str, from: &str, to: &str) -> String {
         let at = dist.find(&format!("\n[{section}]\n")).unwrap() + 1;
         let (head, tail) = dist.split_at(at);
@@ -2540,7 +2559,7 @@ mod tests {
             assert!(log.contains(want), "{want:?}:\n{log}");
         }
         assert!(log.contains("× フックの設置: "), "{log}");
-        // ネットワークを開けない・ini が読めない・開始のフックが書けない。
+        // ネットワークを開けない・iniが読めない・開始のフックが書けない。
         let log = brief(|| {
             let mut env = Fake::all_match();
             let mut h = fake_hook_three_writable();
@@ -2614,7 +2633,7 @@ mod tests {
                 ..Default::default()
             };
             let (_, log) = run_with(&mut env, &mut h, SITES, &mut s);
-            // 本物の書き込み関数と同じに、1 行ずつ伏せる処理を通す。
+            // 本物の書き込み関数と同じに、1行ずつ伏せる処理を通す。
             let mut out = Vec::new();
             {
                 use higanr_core::log_scrub::{Scrub, ScrubWrite};

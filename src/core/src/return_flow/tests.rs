@@ -1,11 +1,13 @@
 use super::*;
+use crate::end_pick::model::EndMenu;
 use crate::ui_entry::{cursor_after_move, cursor_after_move_n};
 
 const ENTER: u16 = 0x1000;
 const Q: u16 = pause::KEY_TO_TITLE;
 
-/// ゲームの模型。逆アセンブルの処理の順そのまま（入力の地点の feed → その tick のハンドラが `+0x06`（押した瞬間）を読む）。
-/// 場面 2 は一時停止（`0x00434740`）と終わりのメニュー（`0x004355F0`）、場面 1 は MainMenu の画面 1・6・7・8・14・15・16。
+/// ゲームの模型。
+/// 逆アセンブルの処理の順そのまま（入力の地点のfeed → そのtickのハンドラが`+0x06`（押した瞬間）を読む）。
+/// 場面2は一時停止（`0x00434740`）と終わりのメニュー（`0x004355F0`）。場面1はMainMenuの画面1・6・7・8・14・15・16。
 #[derive(Debug, Clone)]
 struct Sim {
     ims: [InputState; 3],
@@ -16,17 +18,17 @@ struct Sim {
     pause: MenuState,
     end_menu: bool,
     end: MenuState,
-    /// 画面 15 で保存を飛ばす印（`save_skip`）が立っている。
+    /// 画面15で保存を飛ばす印（`save_skip`）が立っている。
     skip_mark: bool,
     screen: u32,
     sub: u32,
     trans: u32,
-    /// `[M+0x1B230]`（タイトルの決定は 10 以上で読む —— `0x0042A127`）。
+    /// `[M+0x1B230]`（タイトルの決定は10以上で読む —— `0x0042A127`）。
     anim: u32,
     cursor: i32,
     decided: [u32; 2],
     extra: bool,
-    /// MainMenu の作り直しの後、画面 1 → 6 → 7 → 8 を押下なしで進む（`[M+0x1B23C]`）。
+    /// MainMenuの作り直しの後に画面1 → 6 → 7 → 8を押下なしで進む（`[M+0x1B23C]`）。
     auto_walk: bool,
     /// 起きてはいけないことの記録。
     resumed: u32,
@@ -35,7 +37,7 @@ struct Sim {
     chara_change: u32,
     leaked: u32,
     wrong_decide: u32,
-    /// 画面 6 で決定が押された（カーソルを問わず）。
+    /// 画面6で決定が押された（カーソルを問わず）。
     mode_decides: u32,
     x_presses: u32,
     frozen: u32,
@@ -123,7 +125,7 @@ impl Sim {
         self.anim = 0;
     }
 
-    /// 1 フレーム。`out` は呼び手の答え、`user` は人の語（`Pass` ならゲーム自身がそれを読む）。
+    /// 1フレーム。`out`は呼び手の答え。`user`は人の入力ワード（`Pass`ならゲーム自身がそれを読む）。
     fn frame(&mut self, out: Out, user: u16) {
         let words = match out {
             Out::Freeze => {
@@ -148,18 +150,18 @@ impl Sim {
         }
         if switching {
             if self.next == 10 {
-                // 再戦: 場面 2 を作り直して読み込む。
+                // 再戦: 場面2を作り直して読み込む。
                 self.next = MATCH;
                 self.loading = 30;
                 return;
             }
-            // 要求 1 と 6 はどちらも MainMenu を作る（6 は画面 14 から）。
+            // 要求1と6はどちらもMainMenuを作る（6は画面14から）。
             self.scene = MENU;
             self.next = MENU;
             self.paused = false;
             self.end_menu = false;
             if self.auto_walk {
-                // 1 → 6 → 7 → 8 を 2 フレームで。最初のフレームは画面 1 の作る途中。
+                // 1 → 6 → 7 → 8を2フレームで。最初のフレームは画面1の作る途中。
                 self.screen = 1;
                 self.sub = 0;
                 self.trans = 1;
@@ -179,7 +181,7 @@ impl Sim {
         } else if self.end_menu {
             self.end_menu_frame(p2);
         } else if p2 & ESC != 0 {
-            // GameManager の tick（`0x0041AB8C`）。メニューは次のフレームから。
+            // GameManagerのtick（`0x0041AB8C`）。メニューは次のフレームから。
             self.paused = true;
         }
     }
@@ -255,49 +257,30 @@ impl Sim {
     }
 
     fn end_menu_frame(&mut self, p: u16) {
-        use end_menu::*;
-        let m = &mut self.end;
-        let ready = m.frames >= MENU_READ_FRAMES;
-        match m.state {
-            INIT => {
-                m.state = REMATCH;
-                m.frames = 0;
+        let mut m = EndMenu {
+            shown: self.end_menu,
+            state: self.end.state,
+            frames: self.end.frames,
+        };
+        let closed = m.frame(p);
+        self.end_menu = m.shown;
+        self.end = MenuState {
+            state: m.state,
+            frames: m.frames,
+        };
+        match closed {
+            Some(0) => {
+                self.rematch += 1;
+                self.next = 10;
             }
-            REMATCH | CHARA | SAVE if ready => {
-                let orig = m.state;
-                if p & UP != 0 {
-                    m.state = [0, SAVE, REMATCH, CHARA][orig as usize];
-                }
-                if p & DOWN != 0 {
-                    m.state = [0, CHARA, SAVE, REMATCH][orig as usize];
-                }
-                if p & DECIDE_BITS != 0 {
-                    // 決定は振り分けた元の状態で決まる（`0x0043577F` / `0x004358CD` / `0x004359ED`）。
-                    m.state = orig + 3;
-                    m.frames = 0;
-                }
+            Some(1) => {
+                self.chara_change += 1;
+                self.next = MENU;
+                self.auto_walk = true;
             }
-            4..=6 if m.frames >= 20 => {
-                match m.state {
-                    4 => {
-                        self.rematch += 1;
-                        self.next = 10;
-                    }
-                    5 => {
-                        self.chara_change += 1;
-                        self.next = MENU;
-                        self.auto_walk = true;
-                    }
-                    _ => {
-                        self.next = 6;
-                    }
-                }
-                m.state = INIT;
-                self.end_menu = false;
-            }
-            _ => {}
+            Some(_) => self.next = 6,
+            None => {}
         }
-        self.end.frames += 1;
     }
 
     fn menu_frame(&mut self, p0: u16, p2: u16, edge2: u16) {
@@ -338,7 +321,7 @@ impl Sim {
                 let before = self.cursor;
                 let c = cursor_after_move_n(self.cursor, edge2, TITLE_ITEMS);
                 self.cursor = if c != before && !self.extra && c == 1 {
-                    // 未解放の Extra を飛ばす（`0x0042A0D1`: 動いた向き + 1）。
+                    // 未解放のExtraを飛ばす（`0x0042A0D1`: 動いた向き + 1）。
                     if c < before || (before == TITLE_ITEMS - 1 && c == 0) {
                         0
                     } else {
@@ -357,7 +340,7 @@ impl Sim {
                 }
             }
             6 => {
-                // 上下の処理の後のカーソルで決定を読む（`ui_entry` の模型）。
+                // 上下の処理の後のカーソルで決定を読む（`ui_entry`の模型）。
                 self.cursor = cursor_after_move(self.cursor, edge2);
                 if p2 & DECIDE_BITS != 0 {
                     self.mode_decides += 1;
@@ -425,7 +408,7 @@ impl Run {
         }
     }
 
-    /// 1 tick: 答えを取り、`save_quit` なら呼び手と同じに保存を飛ばす印を立て、ゲームを 1 フレーム進める。
+    /// 1 tick: 答えを取り、`save_quit`なら呼び手と同じに保存を飛ばす印を立て、ゲームを1フレーム進める。
     fn tick(&mut self, user: u16) -> Step {
         let f = self.sim.facts();
         let mut rd = Rd {
@@ -471,7 +454,7 @@ impl Run {
     }
 }
 
-/// 決まった種の擬似乱数（xorshift）。
+/// 決まったシードの擬似乱数（xorshift）。
 fn rng(seed: &mut u64) -> u64 {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 7;
@@ -488,7 +471,7 @@ fn the_hold_freezes_the_match_and_drops_every_key() {
     }
     assert_eq!(r.sim.frozen, HOLD_TICKS);
     assert!(!r.sim.paused);
-    // 読み込み中の試合とメニューの場面は止めずに 0 を流す（読み込みを止めない）。
+    // 読み込み中の試合とメニューの場面は止めずに0を渡す（読み込みを止めない）。
     let mut sim = Sim::in_match();
     sim.loading = 50;
     let mut r = Run::new(sim);
@@ -511,7 +494,7 @@ fn after_the_hold_it_opens_the_pause_and_moves_the_cursor_off_resume() {
     assert_eq!(r.finish, None);
 }
 
-/// 人が何を押しても、再開・やり直し・再戦・キャラの変更・画面 6 の決定にならない。
+/// 人が何を押しても再開・やり直し・再戦・キャラの変更・画面6の決定にならない。
 #[test]
 fn mashing_keys_never_resumes_retries_or_decides_on_screen_six() {
     let keys = [
@@ -558,7 +541,7 @@ fn mashing_keys_never_resumes_retries_or_decides_on_screen_six() {
             }
         }
     }
-    // 押し続ければいつかは「タイトルへ戻る」→「はい」・保存して終了を選ぶ。0 なら検査が空。
+    // 押し続ければいつかは「タイトルへ戻る」→「はい」・保存して終了を選ぶ。0なら検査が空。
     assert!(reached > 20, "着いた回 {reached} / 80");
 }
 
@@ -584,7 +567,7 @@ fn in_the_pause_no_goes_back_to_the_title_item_and_yes_leaves_to_screen_six() {
         pause::TITLE,
         "「いいえ」の決定が「タイトルへ戻る」へ戻らない"
     );
-    // 押した tick の直後に見る（「再開」へ動いても、こちらが次の tick に下で戻すので後では見分けられない）。
+    // 押したtickの直後に見る（「再開」へ動いてもこちらが次のtickに下で戻すので後では見分けられない）。
     for k in [UP, DOWN, UP | DOWN] {
         r.tick(k);
         assert_eq!(r.sim.pause.state, pause::TITLE, "{k:#x} で「再開」へ動いた");
@@ -620,7 +603,7 @@ fn in_the_end_menu_only_save_and_quit_is_reachable_and_it_walks_from_the_title()
             let mut r = Run::new(sim);
             r.until_done(|_, _| 0, HOLD_TICKS + 30);
             assert_eq!(r.sim.end.state, end_menu::SAVE, "開始 {start}");
-            // 決定を押しっぱなしにしても、押した瞬間の 1 回だけ。
+            // 決定を押しっぱなしにしても押した瞬間の1回だけ。
             r.until_done(|_, t| if t < 30 { Z } else { 0 }, 40);
             r.until_done(|_, _| 0, 3_000);
             assert_eq!(
@@ -664,7 +647,7 @@ fn the_title_walk_reaches_match_with_and_without_extra() {
 
 #[test]
 fn cancels_on_the_selection_screens_follow_the_seat_flags() {
-    // (画面, 1P・2P の旗, 取消の回数)
+    // (画面, 1P・2Pの旗, 取消の回数)
     for (screen, decided, xs) in [
         (8, [0, 0], 2),
         (8, [1, 0], 3),
@@ -676,7 +659,7 @@ fn cancels_on_the_selection_screens_follow_the_seat_flags() {
         let mut sim = Sim::on_screen(screen, 3);
         sim.decided = decided;
         let mut r = Run::new(sim);
-        // 取消と決定を押し続けても数は変わらない。画面 6 では決定を離すまで手を返さない。
+        // キャンセルと決定を押し続けても数は変わらない。画面6では決定を離すまでゲームへ制御を返さない。
         r.until_done(|_, t| if t < 300 { X | Z } else { 0 }, 1_000);
         assert_eq!(
             r.finish,
@@ -711,7 +694,7 @@ fn screen_six_walks_the_shorter_way_to_four_and_never_presses_decide() {
             }
         }
     }
-    // 決定を押したまま着いたら、離すまで手を返さない（返すと次の tick に入口のメニューが開く）。
+    // 決定を押したまま着いたら離すまでゲームへ制御を返さない（返すと次のtickに入口のメニューが開く）。
     let mut r = Run::new(Sim::on_screen(6, 4));
     r.until_done(|_, _| Z, 400);
     assert_eq!(r.finish, None, "決定を押したまま手を返した");
@@ -771,7 +754,7 @@ fn values_out_of_range_give_up_without_feeding() {
         f.step(&facts, &mut rd).finish,
         Some(Finish::GaveUp(GiveUp::Unreadable))
     );
-    // 画面 6 のカーソルが範囲の外・戻り道に無い画面。
+    // 画面6のカーソルが範囲の外・戻り道に無い画面。
     for (screen, cursor, why) in [
         (6, 5, GiveUp::Unreadable),
         (6, -1, GiveUp::Unreadable),
@@ -848,7 +831,7 @@ fn a_rematch_decided_before_the_flow_ends_in_a_new_match_that_is_left_by_the_pau
         frames: 0,
     };
     let mut r = Run::new(sim);
-    // 人は 8 tick ごとに 1 回押す（押しっぱなしは押下にならない）。
+    // 人は8 tickごとに1回押す（押しっぱなしは押下にならない）。
     r.until_done(
         |s, t| {
             if t % 8 != 0 || !s.paused {
@@ -890,7 +873,8 @@ fn the_reason_lines_name_the_cause_and_keep_the_next_step() {
     }
 }
 
-/// 入力止めの前から押しっぱなしの決定は、ロックが人の語を通し始めても押下にならない（押しっぱなしで何かを選ばない）。
+/// 入力止めの前から押しっぱなしの決定は押下にならない。
+/// ロックが人の入力ワードを通し始めても同じ（押しっぱなしで何かを選ばない）。
 #[test]
 fn keys_held_since_the_hold_never_become_presses_in_the_locks() {
     for end in [false, true] {
@@ -918,7 +902,7 @@ fn keys_held_since_the_hold_never_become_presses_in_the_locks() {
     }
 }
 
-/// 「保存して終了」の切替（今 2・次 6）を何 tick 見ても、伝えるのは 1 回。
+/// 「保存して終了」の切替（今2・次6）を何tick見ても伝えるのは1回。
 #[test]
 fn save_quit_is_reported_once_even_if_the_switch_is_seen_twice() {
     let mut f = Flow::new();
@@ -938,7 +922,7 @@ fn save_quit_is_reported_once_even_if_the_switch_is_seen_twice() {
     assert_eq!(n, 1);
 }
 
-/// 一時停止が開かない間（会話の間など）は、人の決定の押した瞬間だけを通し、押している限り諦めない。
+/// 一時停止が開かない間（会話の間など）は人の決定の押した瞬間だけを通し、押している限り諦めない。
 #[test]
 fn while_the_pause_cannot_open_the_players_decide_passes_and_keeps_the_flow() {
     let sim = Sim::in_match();

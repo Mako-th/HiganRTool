@@ -1,12 +1,12 @@
-//! `HiganRTool.ini` の 1 行だけを書き換える（pure。ファイルは触らない）。
+//! `HiganRTool.ini`の1行だけを書き換える（pure。ファイルは触らない）。
 //!
-//! メニューで決めた設定を ini に戻すためのもの。利用者が書いたコメント・空行・並び・ほかの行は 1 バイトも変えない。
+//! メニューで決めた設定をiniに戻すためのもの。利用者が書いたコメント・空行・並び・ほかの行は1バイトも変えない。
 //!
-//! - 行単位で、書き換える行以外は元のバイト列をそのまま持つ（Shift_JIS の ini でも、触らない行は再符号化しない）。値の後ろの「空白 + `;`」の注は残す。改行は元のファイルの最初の改行（CRLF / LF）に合わせる。
-//! - キーの行が無ければ、その節の最後のキーの行の後ろ（キーが無ければ見出しの後ろ）に足す。節が無ければ末尾に節ごと足す。
-//! - 同じ節に同じキーが 2 回あるときは書き換えず断る（どちらを読み手が採るかを、書き手が決めない）。
-//! - 読めない行（`ini::parse_lenient` が捨てる行）には触らない。読めない見出しの下の行は、どの節にも数えない。
-//! - UTF-8 でなければ Shift_JIS（CP932）として扱い、書く値が Shift_JIS で表せなければ断る。
+//! - 行単位で扱い、書き換える行以外は元のバイト列をそのまま持つ（Shift_JISのiniでも触らない行は再符号化しない）。値の後ろの「空白 + `;`」の注は残す。改行は元のファイルの最初の改行（CRLF / LF）に合わせる。
+//! - キーの行が無ければその節の最後のキーの行の後ろ（キーが無ければヘッダの後ろ）に足す。節が無ければ末尾に節ごと足す。
+//! - 同じ節に同じキーが2回あるときは書き換えず断る（どちらを読み手が採るかを書き手が決めない）。
+//! - 読めない行（`ini::parse_lenient`が捨てる行）には触らない。読めないヘッダの下の行はどの節にも数えない。
+//! - UTF-8でなければShift_JIS（CP932）として扱う。書く値がShift_JISで表せなければ断る。
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -17,21 +17,21 @@ use crate::ini::{self, strip_comment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit<'a> {
-    /// `section` の `key` を `value` にする（無ければ足す）。
+    /// `section`の`key`を`value`にする（無ければ足す）。
     Set {
         section: &'a str,
         key: &'a str,
         value: &'a str,
     },
-    /// `section` の `key` の行を消す（無ければ何もしない）。「書かなければ既定」の設定を既定に戻すのに使う。
+    /// `section`の`key`の行を消す（無ければ何もしない）。「書かなければ既定」の設定を既定に戻すのに使う。
     Remove { section: &'a str, key: &'a str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
-    /// UTF-8 でも Shift_JIS でもない。
+    /// UTF-8でもShift_JISでもない。
     Undecodable,
-    /// 同じ節に同じキーが 2 回ある（行の番号は 1 から）。
+    /// 同じ節に同じキーが2回ある（行の番号は1から）。
     Duplicate {
         section: String,
         key: String,
@@ -42,7 +42,7 @@ pub enum EditError {
     BadValue(&'static str),
     /// 節かキーの名前が書けない形。
     BadName,
-    /// 値が Shift_JIS で表せない（ini が Shift_JIS のとき）。
+    /// 値がShift_JISで表せない（iniがShift_JISのとき）。
     Unencodable,
     /// 書いた結果を読み直すと、書いた値にならなかった。
     NotReadBack,
@@ -102,7 +102,7 @@ impl Enc {
         }
     }
 
-    /// 復号した文字列の先頭 `n` バイト分が、元のバイト列で何バイトだったか。
+    /// 復号した文字列の先頭`n`バイト分が、元のバイト列で何バイトだったか。
     fn byte_len(self, s: &str, n: usize) -> usize {
         match self {
             Enc::Utf8 => n,
@@ -135,12 +135,12 @@ fn check_value(v: &str) -> Result<(), EditError> {
     Ok(())
 }
 
-/// 1 行を読んだ結果。
+/// 1行を読んだ結果。
 enum Kind {
     Other,
-    /// 読める見出し（小文字の名前）。
+    /// 読めるヘッダ（小文字の名前）。
     Header(String),
-    /// 読めない見出し。次の見出しまでの行は読まれない。
+    /// 読めないヘッダ。次のヘッダまでの行は読まれない。
     BadHeader,
     /// `キー = 値`。
     Key(String),
@@ -221,7 +221,7 @@ impl Doc {
         self.lines[i].ends_with(b"\n")
     }
 
-    /// `section` の `key` の行（0 から）と、新しい行を足す位置の目印（節の最後のキーの行か見出しの行）。
+    /// `section`の`key`の行（0から）と新しい行を足す位置の目印（節の最後のキーの行かヘッダの行）。
     fn find(&self, section: &str, key: &str) -> (Vec<usize>, Option<usize>) {
         let (mut hits, mut anchor) = (Vec::new(), None);
         let mut in_sec = false;
@@ -233,7 +233,7 @@ impl Doc {
                         anchor = Some(i);
                     }
                 }
-                // 読めない見出しの下は、次の見出しまでどの節にも数えない。
+                // 読めないヘッダの下は次のヘッダまでどの節にも数えない。
                 Kind::BadHeader => in_sec = false,
                 Kind::Key(k) if in_sec => {
                     anchor = Some(i);
@@ -317,12 +317,12 @@ impl Doc {
         );
         let line = &self.lines[i];
         let mut out = line[..b_start].to_vec();
-        // `k=` に値を足すとき、`k=v` でなく `k= v` に揃える。
+        // `k=`に値を足すとき`k=v`でなく`k= v`に揃える。
         if old.is_empty() && out.last() == Some(&b'=') {
             out.push(b' ');
         }
         out.extend_from_slice(new_value);
-        // 空の値の後ろの注（`k = ; 注`）は、値と空白で離す（離さないと `;` が値に入る）。
+        // 空の値の後ろの注（`k = ; 注`）は値と空白で離す（離さないと`;`が値に入る）。
         if old.is_empty() && line[b_end..].starts_with(b";") {
             out.push(b' ');
         }
@@ -352,7 +352,7 @@ impl Doc {
     }
 }
 
-/// 先頭の行にだけある UTF-8 の BOM の長さ。
+/// 先頭の行にだけあるUTF-8のBOMの長さ。
 fn bom_len(i: usize, line: &[u8]) -> usize {
     if i == 0 && line.starts_with(BOM) {
         BOM.len()
@@ -361,7 +361,7 @@ fn bom_len(i: usize, line: &[u8]) -> usize {
     }
 }
 
-/// `edits` を順に当てた ini のバイト列を返す。当てる前後で変わらない行は元のバイト列のまま。
+/// `edits`を順に当てたiniのバイト列を返す。当てる前後で変わらない行は元のバイト列のまま。
 pub fn apply(bytes: &[u8], edits: &[Edit<'_>]) -> Result<Vec<u8>, EditError> {
     let mut doc = Doc::parse(bytes)?;
     for e in edits {
@@ -399,7 +399,7 @@ pub fn apply(bytes: &[u8], edits: &[Edit<'_>]) -> Result<Vec<u8>, EditError> {
         })
         .collect();
     let read = ini::parse_lenient(&text).ini;
-    // 後の編集で消した・書き直したキーは、最後の編集だけを検証する。
+    // 後の編集で消した・書き直したキーは最後の編集だけを検証する。
     let target = |e: &Edit<'_>| match *e {
         Edit::Set { section, key, .. } | Edit::Remove { section, key } => {
             (section.to_ascii_lowercase(), key.to_ascii_lowercase())
@@ -451,6 +451,32 @@ mod tests {
         );
     }
 
+    /// プレイヤー名・ルーム名に使える文字（`RoomName::accepts_char`）はどれも書いて読み直すと同じ値になる（`;`を使えなくした根拠）。
+    #[test]
+    fn every_usable_name_character_survives_a_write_and_read() {
+        let usable: Vec<char> = (0x20u8..0x7F)
+            .map(char::from)
+            .filter(|&c| crate::room::RoomName::accepts_char(c))
+            .collect();
+        assert_eq!(usable.len(), 92);
+        for &c in &usable {
+            for value in [format!("a{c}b"), format!("a {c}b"), format!("{c}x")] {
+                if value != value.trim() {
+                    continue;
+                }
+                let out = run(DIST_LIKE, &[set("netplay", "name", &value)]);
+                let ini = ini::parse(&out).unwrap();
+                assert_eq!(
+                    ini.get("netplay", "name"),
+                    Some(value.as_str()),
+                    "{value:?}"
+                );
+            }
+        }
+        // 使えない`;`は前に空白があると注として読まれ、書くのを断られる。
+        assert!(apply(DIST_LIKE.as_bytes(), &[set("netplay", "name", "a ;b")]).is_err());
+    }
+
     #[test]
     fn a_trailing_comment_and_the_spacing_around_the_value_stay() {
         let t = "[netplay]\nname   =\t  old  ; 自分の名前\ndelay=3 ; 注\n";
@@ -462,7 +488,7 @@ mod tests {
             run(t, &[set("netplay", "delay", "auto")]),
             "[netplay]\nname   =\t  old  ; 自分の名前\ndelay=auto ; 注\n"
         );
-        // `a;b` の `;` は値の一部（注ではない）。
+        // `a;b`の`;`は値の一部（注ではない）。
         assert_eq!(
             run("[s]\nk = a;b ; c\n", &[set("s", "k", "x")]),
             "[s]\nk = x ; c\n"
@@ -488,7 +514,7 @@ mod tests {
         );
         let out = run("[a]\nx = 1\n\n[b]\ny = 2\n", &[set("a", "z", "3")]);
         assert_eq!(out, "[a]\nx = 1\nz = 3\n\n[b]\ny = 2\n");
-        // キーの無い節は見出しの後ろ。コメントだけの節も。
+        // キーの無い節はヘッダの後ろ。コメントだけの節も。
         assert_eq!(
             run("[a]\n; c\n[b]\n", &[set("a", "z", "3")]),
             "[a]\nz = 3\n; c\n[b]\n"
@@ -511,7 +537,7 @@ mod tests {
             "[a]\nx = 1\n\n[b]\ny = 2\n"
         );
         assert_eq!(run("", &[set("b", "y", "2")]), "[b]\r\ny = 2\r\n");
-        // コメントになっている `; [loader]` は節ではない。
+        // コメントになっている`; [loader]`は節ではない。
         let out = run(DIST_LIKE, &[set("loader", "game", "v")]);
         assert!(out.starts_with(DIST_LIKE) && out.ends_with("\n[loader]\ngame = v\n"));
         // キーを足す先の節が最後の行（改行なし）でも崩れない。
@@ -602,7 +628,7 @@ mod tests {
             run("[a]\nk = 1\n[b]\nk = 2\n", &[set("b", "k", "9")]),
             "[a]\nk = 1\n[b]\nk = 9\n"
         );
-        // 別のキーの書き換えは、重複したキーがあっても進められる。
+        // 別のキーの書き換えは重複したキーがあっても進められる。
         assert_eq!(
             run(dup, &[set("a", "j", "7")]),
             "[a]\nk = 1\nj = 7\nk = 3\n"
@@ -614,10 +640,10 @@ mod tests {
         let t = "[a]\nfoo\n = 5\nk = 1\n[b\nk = 2\nj = 3\n[c]\nk = 4\n";
         let out = run(t, &[set("a", "k", "9"), set("c", "k", "8")]);
         assert_eq!(out, "[a]\nfoo\n = 5\nk = 9\n[b\nk = 2\nj = 3\n[c]\nk = 8\n");
-        // 読めない見出しの下のキーは、前の節 `[a]` にも `[b]` にも数えない: `[a]` に足す。
+        // 読めないヘッダの下のキーは前の節`[a]`にも`[b]`にも数えない。`[a]`に足す。
         let out = run("[a]\nx = 1\n[b\nk = 2\n", &[set("a", "k", "9")]);
         assert_eq!(out, "[a]\nx = 1\nk = 9\n[b\nk = 2\n");
-        // コメントの `; k = 1` は行として数えない。
+        // コメントの`; k = 1`は行として数えない。
         assert_eq!(
             run("[a]\n; k = 1\n# k = 2\n", &[set("a", "k", "3")]),
             "[a]\nk = 3\n; k = 1\n# k = 2\n"
@@ -634,7 +660,7 @@ mod tests {
             apply("\u{FEFF}k = 1\n[a]\n".as_bytes(), &[set("a", "j", "2")]).unwrap(),
             "\u{FEFF}k = 1\n[a]\nj = 2\n".as_bytes()
         );
-        // BOM の直後の見出し・キーも読める。
+        // BOMの直後のヘッダ・キーも読める。
         assert_eq!(
             apply(
                 "\u{FEFF}[a]\nk = 1\n".as_bytes(),
@@ -657,12 +683,12 @@ mod tests {
             out,
             sjis("; 設定（日本語のコメント）\r\n[netplay]\r\nname = new ; 名前\r\n")
         );
-        // 日本語の値は Shift_JIS で書く（UTF-8 にならない）。
+        // 日本語の値はShift_JISで書く（UTF-8にならない）。
         let out = apply(&text, &[set("loader", "game", "C:\\花映塚\\th09.exe")]).unwrap();
         assert!(out.starts_with(&text));
         assert!(out.ends_with(&sjis("\r\n[loader]\r\ngame = C:\\花映塚\\th09.exe\r\n")));
         assert!(std::str::from_utf8(&out).is_err());
-        // 値の前に日本語がある行を書き換えても、前後は元のバイトのまま。
+        // 値の前に日本語がある行を書き換えても前後は元のバイトのまま。
         text = sjis("[a]\r\n名前 = 旧 ; 注\r\nk = 1\r\n");
         let out = apply(&text, &[set("a", "k", "2")]).unwrap();
         assert_eq!(out, sjis("[a]\r\n名前 = 旧 ; 注\r\nk = 2\r\n"));
@@ -671,7 +697,7 @@ mod tests {
     #[test]
     fn a_shift_jis_value_with_japanese_chars_is_replaced_exactly() {
         let sjis = |s: &str| SHIFT_JIS.encode(s).0.into_owned();
-        // 値が日本語（1 文字 2 バイト）で、後ろに日本語の注がある。切る位置が復号した文字の長さとずれると、前後の文字が欠ける。
+        // 値が日本語（1文字2バイト）で後ろに日本語の注がある。切る位置が復号した文字の長さとずれると前後の文字が欠ける。
         let text = sjis("[loader]\r\ngame = C:\\旧い場所\\th09.exe ; 場所の注\r\nnext = 次\r\n");
         let out = apply(&text, &[set("loader", "game", "D:\\新\\th09.exe")]).unwrap();
         assert_eq!(
@@ -687,7 +713,7 @@ mod tests {
 
     #[test]
     fn untouched_shift_jis_lines_are_not_re_encoded() {
-        // 0xED40（NEC 選択 IBM 拡張の「纊」）は復号して再符号化すると別の符号（0xFA5C）になる。触らない行はそのまま残る。
+        // 0xED40（NEC選択IBM拡張の「纊」）は復号して再符号化すると別の符号（0xFA5C）になる。触らない行はそのまま残る。
         let mut text = b"; \xED\x40 comment\r\n[a]\r\nk = 1\r\n".to_vec();
         let out = apply(&text, &[set("a", "k", "2")]).unwrap();
         let at = text.len() - 3;
@@ -710,7 +736,7 @@ mod tests {
             Ok(()),
             "半角カナは表せる"
         );
-        // UTF-8 のファイルには何でも書ける。
+        // UTF-8のファイルには何でも書ける。
         assert!(apply(b"[a]\nk = 1\n", &[set("a", "k", "😀")]).is_ok());
         assert_eq!(
             apply(b"\xFF\xFE[a]\n", &[set("a", "k", "1")]),

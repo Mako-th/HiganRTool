@@ -1,12 +1,26 @@
-//! 進め直しを 1 回の描画の中で行う形の判断（pure。unsafe 無し）: 走査の呼び方と、進め直しの間に捨てる・戻す出力（SE・BGM・文字の数）の手順。Win32・ゲームのメモリ・入口のアセンブリは `rollback_win.rs`。
+//! 進め直しを1回の描画の中で行う形の判断（pure。unsafe無し）。走査の呼び方と、進め直しの間に捨てる・戻す出力（SE・BGM・文字の数）の手順を持つ。
+//! Win32・ゲームのメモリ・入口のアセンブリは`rollback_win.rs`。
 //!
-//! 本物の rollback は 1 フレームの中で k tick を進め直す。do_frame の走査 `0x42C700`（`0x42DCA9` の call）を、書き戻しのあったフレームだけ k 回呼び、途中の回を描かない形でも k = 1・8・60 で D1 と D2 が一致するかを見る。手順（1 フレームの中。ゲームのスレッドで）:
-//! 1. 走査を 1 回呼ぶ（普段はこれだけで戻り値をそのまま返す）。書き戻しのフレームでは、この回の入力の地点で `Probe` が D1 をコピー、S を書き戻し、記録した 1 個目の入力ワードを feed する。
-//! 2. 走査の後、`Probe` に「あと何回呼ぶか」を聞く（`take_owed`）。呼ぶ回が残っていれば、回と回の間（走査の外。臨界区間の外）で走査を呼び直し、最後の回の前に途中の回が積んだ SE・BGM・文字の数を戻す。回の入力の地点は記録した入力ワードを順に feed する。
-//! 3. 途中の回が 1 を返したら打ち切る（普通のマッチの走査はノード数 ≥ 2 を返す。1 は「3 を返すノードで抜けた」= 場面の切替・読み込み・一時停止・描画だけの出口。0 と負の値は do_frame が `0x430230` を呼んで描画へ進まずに抜ける値）。残りは次のフレームから実時間で続ける。
+//! 本物のrollbackは1フレームの中でk tickを進め直す。
+//! do_frameの走査`0x42C700`（`0x42DCA9`のcall）を、書き戻しのあったフレームだけk回呼ぶ。
+//! 途中の回を描かない形でも k = 1・8・60 でD1とD2が一致するかを見る。
+//! 手順（1フレームの中。ゲームのスレッドで）:
+//! 1. 走査を1回呼ぶ（普段はこれだけで戻り値をそのまま返す）。
+//! 書き戻しのフレームでは、この回の入力の地点で`Probe`がD1をコピーしてSを書き戻し、記録した1個目の入力ワードをfeedする。
+//! 2. 走査の後に`Probe`へ「あと何回呼ぶか」を聞く（`take_owed`）。
+//! 呼ぶ回が残っていれば、回と回の間（走査の外。臨界区間の外）で走査を呼び直す。
+//! 最後の回の前に途中の回が積んだSE・BGM・文字の数を戻す。
+//! 回の入力の地点では記録した入力ワードを順にfeedする。
+//! 3. 途中の回が1を返したら打ち切る。
+//! 普通のマッチの走査はノード数 ≥ 2を返す。1は「3を返すノードで抜けた」= 場面の切替・読み込み・一時停止・描画だけの出口。0と負の値はdo_frameが`0x430230`を呼んで描画へ進まずに抜ける値。
+//! 残りは次のフレームから実時間で続ける。
 //!
-//! 出力: 走査の外の do_frame は 1 フレームに 1 回しか SE・BGM を鳴らさず（`0x42DCB5 call 0x43F1F0`）、描画で文字の数を 0 に戻す（`0x00431611 call 0x430220`）。途中の回は描画も鳴らしもしないので積んだ物が溜まる。SE（`SoundManager +0x620`・`+0x650`）は最後の回の前に id を −1・回数を 0 にする。BGM の命令（`+0x1F88` から 0x10C × 31）と文字の数（`AsciiManager +0x8264`。戻さないと古い数字が重なり、256 本を超えた分は捨てられる）は、進め直しの前（D1 の点）にバックアップして戻す。
-//! ゲームのスレッドに確保・ロック・パニックを持ち込まない（`SavedOutputs` は固定長。`run_scan` は `ScanIo` の呼び出しだけ）。
+//! 出力: 走査の外のdo_frameは1フレームに1回しかSE・BGMを鳴らさず（`0x42DCB5 call 0x43F1F0`）、描画で文字の数を0に戻す（`0x00431611 call 0x430220`）。
+//! 途中の回は描画も鳴らしもしないので積んだ出力が溜まる。
+//! SE（`SoundManager +0x620`・`+0x650`）は最後の回の前にidを −1・回数を0にする。
+//! BGMの命令（`+0x1F88`から 0x10C × 31）と文字の数（`AsciiManager +0x8264`）は、進め直しの前（D1の点）にバックアップして戻す。
+//! 文字の数を戻さないと古い数字が重なり、256本を超えた分は捨てられる。
+//! ゲームのスレッドに確保・ロック・パニックを持ち込まない（`SavedOutputs`は固定長。`run_scan`は`ScanIo`の呼び出しだけ）。
 #![forbid(unsafe_code)]
 
 use crate::rollback_probe::{Outcome, TrialRecord};
@@ -16,13 +30,13 @@ use crate::th09_addr::{
     SND_SE_PAN_SLOT_BYTES, SND_SE_PANS, SND_SE_SLOTS, SOUND_MANAGER,
 };
 
-/// 進め直しの形。既定は `Realtime`（`resim` を書かない ini は今までどおり動く）。
+/// 進め直しの形。既定は`Realtime`（`resim`を書かないiniは今までどおり動く）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResimMode {
-    /// 実時間の k フレーム（描画つき）。
+    /// 実時間のkフレーム（描画つき）。
     #[default]
     Realtime,
-    /// 1 回の描画の中で走査を k 回。
+    /// 1回の描画の中で走査をk回。
     Frame,
 }
 
@@ -49,7 +63,7 @@ impl ResimMode {
 pub enum ScanAbort {
     /// 1（ノードの `3` = 抜ける）。
     One,
-    /// 0（ノードの `4`。do_frame は `0x430230` を呼んで 1 を返し、描画へ進まない）。
+    /// 0（ノードの`4`。do_frameは`0x430230`を呼んで1を返し、描画へ進まない）。
     Zero,
     Negative,
 }
@@ -65,15 +79,16 @@ pub fn abort_of(ret: i32) -> Option<ScanAbort> {
 
 pub trait ScanIo {
     fn call_scan(&mut self) -> i32;
-    /// このフレームであと何回呼ぶか。書き戻しのフレームだけ `Some(k − 1)`（k = 1 は `Some(0)`: 追加は無いが最初の回の記録は取る）、ほかは `None`。`call_scan` の後に 1 回だけ呼ぶ。
+    /// このフレームであと何回呼ぶか。書き戻しのフレームだけ`Some(k − 1)`（k = 1 は`Some(0)`: 追加は無いが最初の回の記録は取る）。ほかは`None`。`call_scan`の後に1回だけ呼ぶ。
     fn take_owed(&mut self) -> Option<u32>;
     fn before_last_call(&mut self);
     fn after_call(&mut self, index: u32, ret: i32);
     fn aborted(&mut self, index: u32, why: ScanAbort);
 }
 
-/// do_frame の走査の call の代わり。普段は `call_scan` 1 回と `take_owed` 1 回で戻り値をそのまま返す。書き戻しのフレームは `1 + owed` 回呼び、
-/// 途中の回が打ち切りの値を返したらその値をそのまま返して残りを呼ばない。
+/// do_frameの走査のcallの代わり。
+/// 普段は`call_scan` 1回と`take_owed` 1回で戻り値をそのまま返す。
+/// 書き戻しのフレームは`1 + owed`回呼ぶ。途中の回が打ち切りの値を返したらその値をそのまま返して残りを呼ばない。
 pub fn run_scan(io: &mut dyn ScanIo) -> i32 {
     let mut ret = io.call_scan();
     let Some(owed) = io.take_owed() else {
@@ -103,7 +118,7 @@ pub fn run_scan(io: &mut dyn ScanIo) -> i32 {
 pub const BGM_WORDS: usize = (SND_BGM_SLOT_BYTES * SND_BGM_SLOTS / 4) as usize;
 const _: () = assert!(SND_BGM_SLOT_BYTES.is_multiple_of(4));
 
-/// 出力を読み書きしてよい範囲 `[始まり, 終わり)`（SE の id と回数 / BGM の待ち行列 / 文字の数）。本物の読み書き（`rollback_win::RawOutputs`）はこの外を断る。
+/// 出力を読み書きしてよい範囲`[始まり, 終わり)`（SEのidと回数 / BGMの待ち行列 / 文字の数）。本物の読み書き（`rollback_win::RawOutputs`）はこの外を断る。
 pub const OUTPUT_RANGES: [(u32, u32); 3] = [
     (
         SOUND_MANAGER + SND_SE_IDS,
@@ -123,7 +138,7 @@ pub fn output_addr_allowed(addr: u32) -> bool {
             .any(|&(s, e)| s <= addr && addr.checked_add(4).is_some_and(|x| x <= e))
 }
 
-/// 読むだけの範囲: SE のパンの欄 `[+0x680, +0x680 + 12 × 0x200)`。進め直しの回が積んだ SE のパンをバックアップするため。書かない（id と回数を空にすればパンは消える）。
+/// 読むだけの範囲: SEのパンのフィールド`[+0x680, +0x680 + 12 × 0x200)`。進め直しの回が積んだSEのパンをバックアップするため。書かない（idと回数を空にすればパンは消える）。
 pub const OUTPUT_READ_RANGES: [(u32, u32); 1] = [(
     SOUND_MANAGER + SND_SE_PANS,
     SOUND_MANAGER + SND_SE_PANS + SND_SE_SLOTS * SND_SE_PAN_SLOT_BYTES,
@@ -146,7 +161,7 @@ pub trait OutputMem {
 pub struct SavedOutputs {
     pub ascii_count: u32,
     pub bgm: [u32; BGM_WORDS],
-    /// 全部読めてバックアップしたか（読めなかったら戻さない。一部だけ戻すと壊れた状態を作る）。
+    /// 全部読めてバックアップしたかどうか（読めなかったら戻さない。一部だけ戻すと壊れた状態を作る）。
     pub valid: bool,
 }
 
@@ -174,7 +189,7 @@ pub fn capture_outputs(mem: &mut dyn OutputMem, out: &mut SavedOutputs) -> bool 
     true
 }
 
-/// 最後の回の前に出力を戻す: SE の id を −1・回数を 0 に、BGM の待ち行列と文字の数をバックアップの値へ。バックアップが無効なら何も書かず false。書きは全部が書けたときだけ true。
+/// 最後の回の前に出力を戻す: SEのidを −1・回数を0に、BGMの待ち行列と文字の数をバックアップの値へ。バックアップが無効なら何も書かずfalseを返す。trueを返すのは全部書けたときだけ。
 pub fn apply_outputs(mem: &mut dyn OutputMem, saved: &SavedOutputs) -> bool {
     if !saved.valid {
         return false;
@@ -191,11 +206,13 @@ pub fn apply_outputs(mem: &mut dyn OutputMem, saved: &SavedOutputs) -> bool {
     ok
 }
 
-// ---- 進め直しの全部の回の後に、進め直しの前の値へ戻す ----
+// ---- 進め直しの全部の回の後に進め直しの前の値へ戻す ----
 //
-// `apply_outputs` は「1 回の do_frame の中で本物の走査の後に鳴らす」形の規則。Present の後の進め直しは全部が追加の回なので、
-// 進め直しの回の出力は全部捨て、進め直しの前の値（SE の id と回数も含む）へそのまま戻す。バックアップする所は `OUTPUT_RANGES` の 3 つだけ。
-/// 進め直しの前にバックアップする物（固定長。約 8.4 KB）。
+// `apply_outputs`は「1回のdo_frameの中で本物の走査の後に鳴らす」形の規則。
+// Presentの後の進め直しは全部が追加の回なので進め直しの回の出力は全部捨てる。
+// そして進め直しの前の値（SEのidと回数も含む）へそのまま戻す。
+// バックアップする所は`OUTPUT_RANGES`の3つだけ。
+/// 進め直しの前にバックアップする物（固定長。約8.4 KB）。
 #[derive(Clone, Copy)]
 pub struct FullOutputs {
     pub se_ids: [u32; SND_SE_SLOTS as usize],
@@ -260,31 +277,39 @@ pub fn restore_full(mem: &mut dyn OutputMem, saved: &FullOutputs) -> bool {
     ok
 }
 
-// ---- 進め直しで初めて起きた SE を遅れて鳴らす ----
+// ---- 進め直しで初めて起きたSEを遅れて鳴らす ----
 //
-// `restore_full` は進め直しの回が積んだ SE を全部捨てる。予測が外れて「相手の入力の変わり目で起きる出来事」（カットイン・被弾）は生きた tick では起きず（予測は相手の直前の確定の入力ワードの繰り返し）、進め直しの確定の回で初めて起きるので、その SE は一度も鳴らずに消えていた。
-// 直し: フレームごとに「鳴らした（積まれた）SE の id の集合」を覚え、進め直しの tick ごとに積まれた SE を読んで空にし、前後 2 フレームのどこにも無い id だけを、`restore_full` の後に積み直す。次の do_frame の `0x43F1F0` が鳴らす。
-/// SE の id を追える上限（ビット集合の大きさ）。ゲームの表は id < 0x86 のはず（`0x43E2F0` が `+0x408 + id × 4` を書き、`+0x620` の手前の 0x218 B が表の大きさ）。
-/// 越えた id は追わず（積み直さず）数える。
+// `restore_full`は進め直しの回が積んだSEを全部捨てる。
+// 予測が外れると「相手の入力の変わり目で起きるイベント」（カットイン・被弾）は生きたtickでは起きない（予測は相手の直前の確定の入力ワードの繰り返し）。
+// そのイベントは進め直しの確定の回で初めて起きる。そのためSEは一度も鳴らずに消えていた。
+// 直し: フレームごとに「鳴らした（積まれた）SEのidの集合」を覚える。
+// 進め直しのtickごとに積まれたSEを読んで空にし、前後2フレームのどこにも無いidだけを`restore_full`の後に積み直す。
+// 次のdo_frameの`0x43F1F0`が鳴らす。
+/// SEのidを追える上限（ビット集合の大きさ）。
+/// ゲームの表は id < 0x86 のはず（`0x43E2F0`が`+0x408 + id × 4`を書き、`+0x620`の手前の0x218 Bが表の大きさ）。
+/// 越えたidは追わず（積み直さず）数える。
 pub const SE_ID_LIMIT: u32 = 192;
-/// フレームごとの記録のリングの長さ。巻き戻しの幅（N − F ≤ `MAX_AHEAD` = 16）に前後 2 フレームを足しても足りる大きさ。
+/// フレームごとの記録のリングの長さ。巻き戻しの幅（N − F ≤ `MAX_AHEAD` = 16）に前後2フレームを足しても足りる大きさ。
 pub const SE_RING: usize = 32;
 pub const SE_NEAR: u32 = 2;
 pub const SE_PENDING_CAP: usize = 32;
 
-/// 被弾音（`SE_ID_HIT`・`SE_ID_LAST_LIFE`。ini の `rollback_hit_se`）とカットインの音（`SE_ID_CUTIN`・`SE_ID_CUTIN_SPELL`。ini の `rollback_cutin_se`）の鳴らし方。
-/// 予測で進めた tick の出来事は確定で起きなかったり位置がずれたりしうるが、鳴らした音は取り消せないので、鳴る前に待つ。delay 方式には予測が無いので効かない。
+/// 被弾音（`SE_ID_HIT`・`SE_ID_LAST_LIFE`。iniの`rollback_hit_se`）とカットインの音（`SE_ID_CUTIN`・`SE_ID_CUTIN_SPELL`。iniの`rollback_cutin_se`）の鳴らし方。
+/// 予測で進めたtickのイベントは確定で起きなかったり位置がずれたりしうる。
+/// 鳴らした音は取り消せないので鳴る前に待つ。
+/// delay方式には予測が無いので効かない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeTiming {
-    /// 確定した tick の音だけを即座に鳴らし、未確定の tick の音は確定の回で初めて出たときに積み直して鳴らす。
+    /// 確定したtickの音だけを即座に鳴らす。
+    /// 未確定のtickの音は確定の回で初めて出たときに積み直して鳴らす。
     #[default]
     Confirmed,
-    /// 今までどおり、生きた tick の音を即座に鳴らす（予測が外れても取り消せない）。
+    /// 今までどおり生きたtickの音を即座に鳴らす（予測が外れても取り消せない）。
     Live,
 }
 
 impl SeTiming {
-    /// `key` は断るときの文に出す ini のキー。
+    /// `key`は断るときの文に出すiniのキー。
     pub fn parse(key: &str, v: &str) -> Result<SeTiming, String> {
         match v {
             "confirmed" => Ok(SeTiming::Confirmed),
@@ -311,7 +336,7 @@ pub const fn is_cutin_se(id: u32) -> bool {
     id == SE_ID_CUTIN || id == SE_ID_CUTIN_SPELL
 }
 
-/// 被弾音とカットインの音それぞれの鳴らし方。待たせるのは `Confirmed` の側の id だけで、ほかの SE はいつでも今までどおり。
+/// 被弾音とカットインの音それぞれの鳴らし方。待たせるのは`Confirmed`の側のidだけ。ほかのSEはいつでも今までどおり。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SeHold {
     pub hit: SeTiming,
@@ -319,7 +344,7 @@ pub struct SeHold {
 }
 
 impl SeHold {
-    /// 未確定の tick が積んだ `id` を、確定の回まで鳴らさずに待たせるか。
+    /// 未確定のtickが積んだ`id`を確定の回まで鳴らさずに待たせるかどうか。
     pub const fn waits(self, id: u32) -> bool {
         (is_hit_se(id) && matches!(self.hit, SeTiming::Confirmed))
             || (is_cutin_se(id) && matches!(self.cutin, SeTiming::Confirmed))
@@ -379,7 +404,7 @@ impl SeQueue {
     }
 }
 
-/// SE の待ち行列を読む（書かない）。空き枠（id が負）か 12 枠で止める（鳴らす `0x43F1F0` も最初の空き枠で止めるので読み落としは無い）。パンは回数個の平均（ゲームが使うのと同じ `sum / count`）。
+/// SEの待ち行列を読む（書かない）。空き枠（idが負）か12枠で止める（鳴らす`0x43F1F0`も最初の空き枠で止めるので読み落としは無い）。パンは回数個の平均（ゲームが使うのと同じ`sum / count`）。
 pub fn read_se_queue(mem: &mut dyn OutputMem) -> SeQueue {
     let mut q = SeQueue::EMPTY;
     for slot in 0..SND_SE_SLOTS {
@@ -426,7 +451,8 @@ pub fn clear_se_queue(mem: &mut dyn OutputMem) -> bool {
     ok
 }
 
-/// フレームごとの SE の id の集合のリング（確保なし）。フレーム番号を印にして、印が違う枠は空とみなす（seg が変わるとフレーム番号が 0 に戻るので `clear` で捨てる）。
+/// フレームごとのSEのidの集合のリング（確保なし）。
+/// フレーム番号をタグにして、タグが違う枠は空とみなす（マッチが変わるとフレーム番号が0に戻るので`clear`で捨てる）。
 #[derive(Clone, Copy)]
 struct SeRing {
     frame: [Option<u32>; SE_RING],
@@ -500,11 +526,11 @@ impl SeRing {
     }
 }
 
-/// フレームごとの「鳴らした（積まれた）SE の id の集合」と、被弾音を確定まで待たせた（鳴らさずに待ち行列から抜いた）id の集合。確保なし。`clear` で両方を捨てる。
+/// フレームごとの「鳴らした（積まれた）SEのidの集合」と、被弾音を確定まで待たせた（鳴らさずに待ち行列から抜いた）idの集合。確保なし。`clear`で両方を捨てる。
 #[derive(Clone, Copy)]
 pub struct SePlayed {
     sounded: SeRing,
-    /// 生きた tick が積んだが確定まで鳴らさずに待たせた被弾音。確定の回が同じ出来事を見つけたら消す。消えずに残ったものが「確定では起きなかった被弾音」（幻）。
+    /// 生きたtickが積んだが確定まで鳴らさずに待たせた被弾音。確定の回が同じイベントを見つけたら消す。消えずに残ったものが「確定では起きなかった被弾音」（幻）。
     held: SeRing,
 }
 
@@ -539,7 +565,7 @@ impl SePlayed {
 pub struct SePending {
     n: usize,
     ev: [(SeEvent, u32); SE_PENDING_CAP],
-    /// この進め直しで更新した一番新しいフレーム（遅れ = `top + 1 − frame` の測りに使う）。
+    /// この進め直しで更新した一番新しいフレーム（遅れ = `top + 1 − frame` を測るのに使う）。
     top: u32,
 }
 
@@ -572,9 +598,9 @@ pub struct SeStats {
     pub live_ids: u32,
     pub live_cutin: u32,
     pub live_spell: u32,
-    /// 進め直しの tick で積まれた SE の数（id × tick）。下の 4 つの和 ＋ 追えなかった id。確定まで待たせる音（被弾音・カットインの音）の予測の回の分は数えない（確定の回で数える）。
+    /// 進め直しのtickで積まれたSEの数（id × tick）。下の4つの和 ＋ 追えなかったid。確定まで待たせる音（被弾音・カットインの音）の予測の回の分は数えない（確定の回で数える）。
     pub resim_ids: u32,
-    /// 進め直しで初めて出た（前後 2 フレームのどこにも無かった）SE の数と、うちカットイン（0xE）・スペルカードのカットイン（0x35）。
+    /// 進め直しで初めて出た（前後2フレームのどこにも無かった）SEの数と、うちカットイン（0xE）・スペルカードのカットイン（0x35）。
     pub new_ids: u32,
     pub new_cutin: u32,
     pub new_spell: u32,
@@ -590,27 +616,27 @@ pub struct SeStats {
     pub untracked: u32,
     pub hit_mode: SeTiming,
     pub cutin_mode: SeTiming,
-    /// カットインの音（0xE・0x35）で確定まで待たせた数と、確定の回で対応が付いた数。どちらも 1 つの枠（id × tick）を 1 と数える（回数個の積みも 1）。
+    /// カットインの音（0xE・0x35）で確定まで待たせた数と、確定の回で対応が付いた数。どちらも1つの枠（id × tick）を1と数える（回数個の積みも1）。
     /// 遅れて積み直した数は `replayed_cutin` + `replayed_spell`。
     pub cutin_waited: u32,
     pub cutin_matched: u32,
-    /// 遅れて積み直したカットインの音だけの遅れ（`late_sum` / `late_max` と同じ定義）。
+    /// 遅れて積み直したカットインの音だけの遅れ（`late_sum` / `late_max`と同じ定義）。
     pub cutin_late_sum: u64,
     pub cutin_late_max: u32,
-    /// 被弾音: 未確定の生きた tick が積んだので確定まで鳴らさずに待たせた数（`SeTiming::Confirmed` のときだけ増える。`live_ids` にはこの分を数えない）。
+    /// 被弾音: 未確定の生きたtickが積んだので確定まで鳴らさずに待たせた数（`SeTiming::Confirmed`のときだけ増える。`live_ids`にはこの分を数えない）。
     pub hit_waited: u32,
-    /// 確定の回が同じ出来事（前後 2 フレーム）を出して、待たせたものと対応が付いた数。待たせた数との差が、確定では起きなかった被弾音（幻）。
+    /// 確定の回が同じイベント（前後2フレーム）を出して、待たせたものと対応が付いた数。待たせた数との差が確定では起きなかった被弾音（幻）。
     pub hit_matched: u32,
-    /// 遅れて積み直した被弾音の数（`replayed` のうち `is_hit_se`）。待たせたものに対応が付かなかった分は、予測では起きず確定で初めて起きた被弾。
+    /// 遅れて積み直した被弾音の数（`replayed`のうち`is_hit_se`）。待たせたものに対応が付かなかった分は予測では起きず確定で初めて起きた被弾。
     pub replayed_hit: u32,
-    /// `SeTiming::Live` のときだけ増える。予測のうちに鳴らした被弾音の数: 未確定の生きた tick が積んだ分と、進め直しの予測の回で初めて出て記録に積めた分。
-    /// 記録が溢れて積めなかった分は鳴らないので数えない。確定の回の突き合わせ（`hit_live_matched`）が枠ごとなので、1 つの枠（id × tick）を 1 と数える。
+    /// `SeTiming::Live`のときだけ増える。予測のうちに鳴らした被弾音の数: 未確定の生きたtickが積んだ分と、進め直しの予測の回で初めて出て記録に積めた分。
+    /// 記録が溢れて積めなかった分は鳴らないので数えない。確定の回の突き合わせ（`hit_live_matched`）が枠ごとなので、1つの枠（id × tick）を1と数える。
     pub hit_live_sounded: u32,
-    /// 上のうち、確定の回が同じ出来事（前後 2 フレーム）を出して対応が付いた数。鳴らした数との差が、鳴ったのに確定では起きなかった被弾音（幻）。
+    /// 上のうち、確定の回が同じイベント（前後2フレーム）を出して対応が付いた数。鳴らした数との差が、鳴ったのに確定では起きなかった被弾音（幻）。
     pub hit_live_matched: u32,
 }
 
-/// 生きた tick（`pre` = 走査の前、`post` = 走査の後の待ち行列）で積まれた SE を `frame` の記録に足す。走査の前に積まれていた分（直前の進め直しが遅れて積み直したもの）は含めない。
+/// 生きたtick（`pre` = 走査の前、`post` = 走査の後の待ち行列）で積まれたSEを`frame`の記録に足す。走査の前に積まれていた分（直前の進め直しが遅れて積み直したもの）は含めない。
 pub fn note_live_se(
     played: &mut SePlayed,
     stats: &mut SeStats,
@@ -621,7 +647,7 @@ pub fn note_live_se(
     if !post.ok {
         stats.unreadable = stats.unreadable.saturating_add(1);
     }
-    // 走査の前が読めなかったときは、後の分を全部この tick のものとみなす。
+    // 走査の前が読めなかったときは後の分を全部このtickのものとみなす。
     let before = if pre.ok { *pre } else { SeQueue::EMPTY };
     for (e, c) in post.events() {
         if c > before.count_of(e.id) {
@@ -638,9 +664,10 @@ pub fn note_live_se(
     }
 }
 
-/// 未確定の生きた tick（`frame`）が積んだ音のうち `hold.waits` の id を、確定まで鳴らさずに待たせる。走査で増えた分を引いた残りの
-/// 待ち行列を返す（呼び手がゲームの待ち行列をこの残りへ書き直す）。待たせた音は `played` の待ちの記録に足し、鳴った記録（`add`）には足さない。
-/// 走査の前に積まれていた分は引かない。引くものが無い・読めなかったら None。
+/// 未確定の生きたtick（`frame`）が積んだ音のうち`hold.waits`のidを、確定まで鳴らさずに待たせる。
+/// 走査で増えた分を引いた残りの待ち行列を返す（呼び手がゲームの待ち行列をこの残りへ書き直す）。
+/// 待たせた音は`played`の待ちの記録に足し、鳴った記録（`add`）には足さない。
+/// 走査の前に積まれていた分は引かない。引くものが無い・読めなかったらNone。
 pub fn hold_se(
     played: &mut SePlayed,
     stats: &mut SeStats,
@@ -685,8 +712,10 @@ pub fn hold_se(
     Some(rest)
 }
 
-/// `SeTiming::Live` で未確定の生きた tick が積んだ被弾音を、待たせずに鳴らして、確定の回と突き合わせる記録にだけ覚える。確定の回が同じ出来事を出せば `sort_resim_se` が消して
-/// `hit_live_matched` に数える。残ったものが鳴ったのに確定では起きなかった被弾音。固定長の加算だけで確保しない。
+/// `SeTiming::Live`で未確定の生きたtickが積んだ被弾音を、待たせずに鳴らす。
+/// 確定の回と突き合わせる記録にだけ覚える。
+/// 確定の回が同じイベントを出せば`sort_resim_se`が消して`hit_live_matched`に数える。
+/// 残ったものが鳴ったのに確定では起きなかった被弾音。固定長の加算だけで確保しない。
 pub fn note_live_hit(
     played: &mut SePlayed,
     stats: &mut SeStats,
@@ -708,10 +737,14 @@ pub fn note_live_hit(
     }
 }
 
-/// 進め直しの tick（`frame`）が積んだ SE（`q`。空にする前に読んだもの）を仕分ける: 前後 2 フレームのどこにも無い id は新しいので記録に足して積み直しの列へ、あるものは抑える。
+/// 進め直しのtick（`frame`）が積んだSE（`q`。空にする前に読んだもの）を仕分ける。
+/// 前後2フレームのどこにも無いidは新しいので記録に足し、積み直しの列に載せる。あるidは抑える。
 ///
-/// `hold.waits` の id（被弾音・カットインの音。`Confirmed` の側）は予測の回（`confirmed` が偽）では鳴らさず記録にも足さない。確定の回で出たものは、未確定の生きた tick が待たせたものの前後 2 フレームに
-/// あれば対応を付ける（ずれて対応が付かなくても鳴るのは確定の回の 1 回だけ）。`hold.hit` が `Live` で予測の回に初めて出た被弾音は、記録に積めたときだけ `hit_live_sounded` に数えて確定の回と突き合わせる記録に覚える。
+/// `hold.waits`のid（被弾音・カットインの音。`Confirmed`の側）は予測の回（`confirmed`が偽）では鳴らさず記録にも足さない。
+/// 確定の回で出たものは未確定の生きたtickが待たせたものの前後2フレームにあれば対応を付ける。
+/// ずれて対応が付かなくても鳴るのは確定の回の1回だけ。
+/// `hold.hit`が`Live`で予測の回に初めて出た被弾音は、記録に積めたときだけ`hit_live_sounded`に数える。
+/// そのとき確定の回と突き合わせる記録にも覚える。
 pub fn sort_resim_se(
     played: &mut SePlayed,
     pending: &mut SePending,
@@ -726,7 +759,7 @@ pub fn sort_resim_se(
     }
     pending.top = pending.top.max(frame);
     for (e, _) in q.events() {
-        // 予測の回の待たせる音は新しい／抑えたのどちらにも数えない（確定の回で数える）ので `resim_ids` にも足さない。
+        // 予測の回の待たせる音は新しい／抑えたのどちらにも数えない（確定の回で数える）ので`resim_ids`にも足さない。
         if hold.waits(e.id) && !confirmed {
             continue;
         }
@@ -758,7 +791,8 @@ pub fn sort_resim_se(
             SE_ID_CUTIN_SPELL => stats.new_spell = stats.new_spell.saturating_add(1),
             _ => {}
         }
-        // `Live` の予測の回で初めて出た被弾音は、積めたのでこのあと積み直されて実際に鳴る。積めなかった分は鳴らないので数えず、確定の回と突き合わせる記録にも覚えない。
+        // `Live`の予測の回で初めて出た被弾音は、積めたのでこのあと積み直されて実際に鳴る。
+        // 積めなかった分は鳴らないので数えず、確定の回と突き合わせる記録にも覚えない。
         if !pending.push(e, frame) {
             stats.dropped = stats.dropped.saturating_add(1);
         } else if hold.hit == SeTiming::Live && !confirmed && is_hit_se(e.id) {
@@ -880,9 +914,11 @@ pub fn se_summary_line(s: &SeStats) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanRet {
     Normal,
-    /// 1（ノードが 3 を返して抜けた）。一時停止の間は GameManager（優先度 2）が 3 を返すので、止まっている tick もここ。入力の地点（優先度 0）は走っているので普通の tick として進め直せる。
+    /// 1（ノードが3を返して抜けた）。
+    /// 一時停止の間はGameManager（優先度2）が3を返すので止まっているtickもここに入る。
+    /// 入力の地点（優先度0）は走っているので普通のtickとして進め直せる。
     Stopped,
-    /// 0 か負の値（ノードの 4 / 5。do_frame は `0x430230` を呼んで描画へ進まずに抜ける）。異常として扱い、その tick は予測に使わない。
+    /// 0か負の値（ノードの4 / 5。do_frameは`0x430230`を呼んで描画へ進まずに抜ける）。異常として扱う。そのtickは予測に使わない。
     Abnormal,
 }
 
@@ -908,7 +944,7 @@ pub struct ResimRec {
 
 pub const MAX_SAMPLES: usize = 4096;
 
-/// 標本の分位（小さい方から数えて `p` 分の 1 の位置。標本が 0 個なら `None`）。`p` は 0〜100。順位は `ceil(p / 100 × n)` 番目（p50 の偶数個は下側の中央）。
+/// サンプルの分位（小さい方から数えて`p`分の1の位置。サンプルが0個なら`None`）。`p`は0〜100。順位は`ceil(p / 100 × n)`番目（p50の偶数個は下側の中央）。
 pub fn percentile(sorted: &[u32], p: u32) -> Option<u32> {
     if sorted.is_empty() {
         return None;
@@ -953,7 +989,7 @@ fn abort_text(a: ScanAbort) -> &'static str {
     }
 }
 
-/// 終わりの集計（本ログ）。`samples` は追加の回 1 回ずつの時間（マイクロ秒）、`dropped` は領域が足りずに落とした数。フレームの形の回が 1 つも無ければ空。
+/// 終わりの集計（本ログ）。`samples`は追加の回1回ずつの時間（マイクロ秒）。`dropped`は領域が足りずに落とした数。フレームの形の回が1つも無ければ空。
 pub fn summary_lines(rs: &[TrialRecord], samples: &[u32], dropped: u32) -> Vec<String> {
     let mut v = Vec::new();
     let frames: Vec<&TrialRecord> = rs.iter().filter(|r| r.resim.frame).collect();
@@ -1373,7 +1409,7 @@ mod tests {
         assert_eq!(words, [24, 2077, 1]);
     }
 
-    /// 「最後の回の前に戻す」が、最後の回の積んだ物を消さず、途中の回の積んだ物だけを消すことを見る。
+    /// 「最後の回の前に戻す」が最後の回の積んだ物を消さず、途中の回の積んだ物だけを消すことを検証する。
     struct MemScan<'a> {
         mem: &'a mut FakeMem,
         saved: SavedOutputs,
@@ -1416,7 +1452,7 @@ mod tests {
                 calls: 0,
             };
             assert_eq!(run_scan(&mut io), 9);
-            let last = owed; // 最後の回の番号（0 始まり）
+            let last = owed; // 最後の回の番号（0始まり）
             for i in 0..SND_SE_SLOTS.min(owed + 1) {
                 let id = m.get(SOUND_MANAGER + SND_SE_IDS + i * 4);
                 let cnt = m.get(SOUND_MANAGER + SND_SE_COUNTS + i * 4);
@@ -1597,7 +1633,7 @@ mod tests {
         };
     }
 
-    /// 被弾音だけを待たせ、カットインの音は今までどおり（live）にする。
+    /// 被弾音だけを待たせる。カットインの音は今までどおり（live）にする。
     fn hit_only(hit: SeTiming) -> SeHold {
         SeHold {
             hit,
@@ -1615,9 +1651,9 @@ mod tests {
     #[test]
     fn the_se_queue_is_read_like_the_game_plays_it_and_cleared() {
         let mut m = SeMem::empty();
-        m.put(0, 0x0E, &[-10, 30, 4]); // 平均 8
+        m.put(0, 0x0E, &[-10, 30, 4]); // 平均8
         m.put(1, 0x35, &[7]);
-        m.put(3, 0x22, &[1]); // 枠 2 が空きなので読まない
+        m.put(3, 0x22, &[1]); // 枠2が空きなので読まない
         let q = read_se_queue(&mut m);
         assert!(q.ok);
         assert_eq!(q.n, 2);

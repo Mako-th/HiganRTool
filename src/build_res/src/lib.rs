@@ -1,21 +1,21 @@
-//! 配る exe・DLL に付けるバージョン情報（VS_VERSIONINFO）の `.res` を作る。
-//! rc.exe は使わない。`.res` は link.exe がそのまま受け付けるので、バイト列を自分で組んで `OUT_DIR` へ書く。
-//! これで Windows SDK の場所探しに依存せず、Linux でも同じバイト列を作れる（`tests/against_llvm_rc.rs` が llvm-rc の出力と比べる）。
-//! 開発側の資料を読む検査のための cfg `dev_assets` を出す関数（`emit_dev_assets_cfg`）も、各クレートの build.rs が共有する。
-//! build.rs からだけ呼ぶ。配る成果物には入らない。
+//! 配布するexe・DLLに付けるバージョン情報（VS_VERSIONINFO）の`.res`を作る。
+//! rc.exeは使わない。`.res`はlink.exeがそのまま受け付けるのでバイト列を自分で組んで`OUT_DIR`へ書く。
+//! これでWindows SDKの場所探しに依存せずLinuxでも同じバイト列を作れる（`tests/against_llvm_rc.rs`がllvm-rcの出力と比べる）。
+//! 開発側の資料を読む検査のためのcfg `dev_assets`を出す関数（`emit_dev_assets_cfg`）も各クレートのbuild.rsが共有する。
+//! build.rsからだけ呼ぶ。配布する成果物には入らない。
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 
-/// 製品名。配る物すべてで同じ。
+/// 製品名。配布するものすべてで同じ。
 pub const PRODUCT_NAME: &str = "HiganRTool";
-/// 会社名の欄。作者名の取り決めが無いので製品名と同じにしてある。
+/// 会社名のフィールド。作者名の取り決めが無いので製品名と同じにしてある。
 pub const COMPANY_NAME: &str = "HiganRTool";
-/// LICENSE の先頭の著作権表示に合わせる。
+/// LICENSEの先頭の著作権表示に合わせる。
 pub const LEGAL_COPYRIGHT: &str = "Copyright (C) 2026 HiganRTool contributors";
 
-/// 言語は US 英語（0x0409）、文字コードは Unicode（0x04B0）。
-/// StringFileInfo の表の名前 "040904B0" と VarFileInfo の Translation はこの組から作る。
+/// 言語はUS英語（0x0409）。文字コードはUnicode（0x04B0）。
+/// StringFileInfoの表の名前 "040904B0" とVarFileInfoのTranslationはこの組み合わせから作る。
 const LANG_ID: u16 = 0x0409;
 const CODE_PAGE: u16 = 0x04B0;
 
@@ -37,7 +37,7 @@ impl FileKind {
     }
 }
 
-/// 成果物ごとに違う欄。
+/// 成果物ごとに違うフィールド。
 #[derive(Clone, Debug)]
 pub struct VersionInfo<'a> {
     pub file_description: &'a str,
@@ -46,7 +46,7 @@ pub struct VersionInfo<'a> {
     pub kind: FileKind,
 }
 
-/// `major.minor.patch[-pre][+build]` を 4 つ組の数にする。Cargo のバージョンは 3 つ組なので第 4 要素はいつも 0。
+/// `major.minor.patch[-pre][+build]`を4要素の配列にする。Cargoのバージョンは3要素なので第4要素はいつも0。
 pub fn parse_version(s: &str) -> Result<[u16; 4], String> {
     let core = s.split(['-', '+']).next().unwrap_or("");
     let mut out = [0u16; 4];
@@ -80,7 +80,7 @@ fn align4(v: &mut Vec<u8>) {
     }
 }
 
-/// UTF-16LE + 終端 NUL。
+/// UTF-16LE + 終端NUL。
 fn push_wstr(v: &mut Vec<u8>, s: &str) {
     for u in s.encode_utf16() {
         push_u16(v, u);
@@ -88,12 +88,11 @@ fn push_wstr(v: &mut Vec<u8>, s: &str) {
     push_u16(v, 0);
 }
 
-/// VERSIONINFO の入れ子の 1 ブロック。
-/// `value_len` は wValueLength（文字列なら語数・バイナリならバイト数）、`text` は wType。
-/// wLength は「最後の子の中身の終わりまで」で、子の間の詰め物は含み、最後の子の後ろの詰め物は含まない
-/// （rc.exe / llvm-rc の出力と同じ数え方）。
+/// VERSIONINFOの入れ子の1ブロック。
+/// `value_len`はwValueLength（文字列ならワード数・バイナリならバイト数）。`text`はwType。
+/// wLengthは「最後の子の中身の終わりまで」。子の間のパディングは含む。最後の子の後ろのパディングは含まない（rc.exe / llvm-rcの出力と同じ数え方）。
 fn block(key: &str, value: &[u8], value_len: u16, text: bool, children: &[Vec<u8>]) -> Vec<u8> {
-    let mut b = vec![0, 0]; // wLength は最後に入れる
+    let mut b = vec![0, 0]; // wLengthは最後に書き込む
     push_u16(&mut b, value_len);
     push_u16(&mut b, u16::from(text));
     push_wstr(&mut b, key);
@@ -111,19 +110,19 @@ fn block(key: &str, value: &[u8], value_len: u16, text: bool, children: &[Vec<u8
 fn string_entry(key: &str, value: &str) -> Vec<u8> {
     let mut v = Vec::new();
     push_wstr(&mut v, value);
-    // wValueLength は終端の NUL を含む語数。
+    // wValueLengthは終端のNULを含むワード数。
     let words = u16::try_from(v.len() / 2).expect("値が長すぎる");
     block(key, &v, words, true, &[])
 }
 
-/// VS_VERSIONINFO 本体（RT_VERSION の中身）。
+/// VS_VERSIONINFO本体（RT_VERSIONの中身）。
 pub fn version_info_data(info: &VersionInfo<'_>, version: [u16; 4]) -> Vec<u8> {
     let [a, b, c, d] = version;
     let mut fixed = Vec::new();
     push_u32(&mut fixed, 0xFEEF_04BD); // dwSignature
     push_u32(&mut fixed, 0x0001_0000); // dwStrucVersion
     for _ in 0..2 {
-        // dwFileVersionMS/LS の次に dwProductVersionMS/LS（MS = major.minor、LS = patch.build）。FileVersion と同じ値にする
+        // dwFileVersionMS/LSの次にdwProductVersionMS/LS（MS = major.minor・LS = patch.build）。FileVersionと同じ値にする
         push_u32(&mut fixed, (u32::from(a) << 16) | u32::from(b));
         push_u32(&mut fixed, (u32::from(c) << 16) | u32::from(d));
     }
@@ -172,12 +171,12 @@ pub fn version_info_data(info: &VersionInfo<'_>, version: [u16; 4]) -> Vec<u8> {
     )
 }
 
-/// `.res` ファイル全体。先頭の空のリソース（32 バイト）に続けて RT_VERSION（名前は ID 1）を 1 つ書く。
+/// `.res`ファイル全体。先頭の空のリソース（32バイト）に続けてRT_VERSION（名前はID 1）を1つ書く。
 pub fn version_res(info: &VersionInfo<'_>, version: [u16; 4]) -> Vec<u8> {
     const RT_VERSION: u16 = 16;
     const MOVEABLE_PURE: u16 = 0x0030;
     let mut out = Vec::new();
-    // 空のリソース: DataSize 0 / HeaderSize 32 / TYPE・NAME は序数 0 / 以降 0。.res の印として必ず先頭に要る。
+    // 空のリソース: DataSize 0 / HeaderSize 32 / TYPE・NAMEは序数0 / 以降0。.resと分かるように必ず先頭に要る。
     push_u32(&mut out, 0);
     push_u32(&mut out, 32);
     for v in [0xFFFFu16, 0, 0xFFFF, 0] {
@@ -214,9 +213,9 @@ pub enum Artifact {
     Cdylib,
 }
 
-/// build.rs から呼ぶ。MSVC でリンクするときだけ `.res` を書いて link.exe に渡す。
-/// バージョンは呼び出し側のクレートの `CARGO_PKG_VERSION`（ワークスペースの 1 か所）から取る。
-/// mingw（Linux の検査用）はリンカーが .res を読めず、配る物でもないので何もしない。
+/// build.rsから呼ぶ。MSVCでリンクするときだけ`.res`を書いてlink.exeに渡す。
+/// バージョンは呼び出し側のクレートの`CARGO_PKG_VERSION`（ワークスペースの1か所）から取る。
+/// mingw（Linuxの検査用）はリンカーが .resを読めない。配布するものでもないので何もしない。
 pub fn emit(info: &VersionInfo<'_>, artifact: Artifact) {
     println!("cargo:rerun-if-changed=build.rs");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -236,8 +235,8 @@ pub fn emit(info: &VersionInfo<'_>, artifact: Artifact) {
     println!("cargo:rustc-link-arg-{kind}={}", out.display());
 }
 
-/// 開発リポジトリにだけある資料の場所（根からの部品）。実機の検証の定義・解析のメモ・設計資料。
-/// 公開用に書き出したツリーには `scripts/dist` と `tests/fixtures` しか無いので、これらの有無で見分ける。
+/// 開発リポジトリにだけある資料の場所（ルートからのパスの要素）。実機の検証の定義・解析のメモ・設計資料。
+/// 公開用に書き出したツリーには`scripts/dist`と`tests/fixtures`しか無いのでこれらの有無で見分ける。
 const DEV_DIRS: [&[&str]; 2] = [&["scripts", "runs"], &["analysis", "notes"]];
 const DEV_FILES: [&[&str]; 1] = [&["docs", "Design_Architecture.md"]];
 
@@ -245,15 +244,15 @@ fn join_parts(root: &Path, parts: &[&str]) -> PathBuf {
     parts.iter().fold(root.to_path_buf(), |p, s| p.join(s))
 }
 
-/// 開発リポジトリにだけある資料が `repo_root` の下に全部あるか。
+/// 開発リポジトリにだけある資料が`repo_root`の下に全部あるかどうか。
 pub fn dev_assets_present(repo_root: &Path) -> bool {
     DEV_DIRS.iter().all(|d| join_parts(repo_root, d).is_dir())
         && DEV_FILES.iter().all(|f| join_parts(repo_root, f).is_file())
 }
 
-/// build.rs から呼ぶ。`dev_assets_present` が真なら cfg `dev_assets` を立てる。
-/// その資料を `include_str!` で読む検査は `#[cfg(dev_assets)]` の下に書き、資料の無い公開側では建てない。
-/// クレートは `<repo>/src/<name>/` にある前提（`CARGO_MANIFEST_DIR` の 2 つ上がリポジトリの根）。
+/// build.rsから呼ぶ。`dev_assets_present`が真ならcfg `dev_assets`を立てる。
+/// その資料を`include_str!`で読む検査は`#[cfg(dev_assets)]`の下に書く。資料の無い公開側ではビルドしない。
+/// クレートは`<repo>/src/<name>/`にある前提（`CARGO_MANIFEST_DIR`の2つ上がリポジトリのルート）。
 pub fn emit_dev_assets_cfg() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(dev_assets)");
@@ -304,7 +303,7 @@ mod tests {
         let full = tmp.join("full");
         make(&full, None);
         assert!(dev_assets_present(&full));
-        // 公開用に残る scripts/dist だけでは真にならない。
+        // 公開用に残るscripts/distだけでは真にならない。
         let public = tmp.join("public");
         std::fs::create_dir_all(public.join("scripts").join("dist")).unwrap();
         assert!(!dev_assets_present(&public));
@@ -336,7 +335,7 @@ mod tests {
         let sig = 0xFEEF_04BDu32.to_le_bytes();
         let at = data.windows(4).position(|w| w == sig).unwrap();
         let word = |i: usize| u32::from_le_bytes(data[at + i..at + i + 4].try_into().unwrap());
-        // FileVersion の MS/LS、続けて ProductVersion の MS/LS
+        // FileVersionのMS/LSに続けてProductVersionのMS/LS
         assert_eq!((word(8), word(12)), ((3 << 16) | 4, 5 << 16));
         assert_eq!((word(16), word(20)), ((3 << 16) | 4, 5 << 16));
         let utf16 = |s: &str| {

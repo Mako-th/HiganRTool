@@ -1,8 +1,8 @@
-//! MSVC でリンクするときだけ、コモンコントロール v6 を使うマニフェストとバージョン情報を exe に埋める。
-//! マニフェストが無いと Windows 標準の部品（BUTTON・COMBOBOX）が古い灰色の立体の見た目になる。
-//! 外のクレートは使わず、リンカー（link.exe）の `/MANIFEST:EMBED` と `/MANIFESTDEPENDENCY` に任せる。
-//! `windows_subsystem` や UAC の設定は link.exe の既定のまま（requestedExecutionLevel は asInvoker）。
-//! mingw（Linux での検査用）は別のリンカーで、v6 を指定しなくてもウィンドウは動くので何も渡さない。
+//! MSVCでリンクするときだけコモンコントロールv6を使うマニフェストとバージョン情報をexeに埋める。
+//! マニフェストが無いとWindows標準の部品（BUTTON・COMBOBOX）が古い灰色の立体の見た目になる。
+//! 外のクレートは使わず、リンカー（link.exe）の`/MANIFEST:EMBED`と`/MANIFESTDEPENDENCY`に任せる。
+//! `windows_subsystem`やUACの設定はlink.exeの既定のまま（requestedExecutionLevelはasInvoker）。
+//! mingw（Linuxでの検査用）は別のリンカーで、v6を指定しなくてもウィンドウは動くので何も渡さない。
 
 use higanr_build_res::{Artifact, FileKind, VersionInfo, emit};
 

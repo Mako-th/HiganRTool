@@ -27,19 +27,19 @@ pub fn analyze(path: &Path) -> Analysis {
     }
 }
 
-/// 1 本の結果。
+/// 1本の結果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MakeResult {
     /// 書いた先。
     Made(PathBuf),
     /// 直す値が元の値と同じ。
     Unchanged,
-    /// 印に `charge` がある。
+    /// 印に`charge`がある。
     Recorded,
     NoMark,
     /// ゲームのメニューから保存したリプレイ。
     MenuMark,
-    /// 見出しの値が 0 / 1 のどちらでもない。
+    /// ヘッダの値が0 / 1のどちらでもない。
     OddValue(u8, u8),
     /// 書く先に同じ名前のファイルが既にある（上書きしない）。
     Exists(PathBuf),
@@ -51,7 +51,7 @@ enum WriteError {
     Other(String),
 }
 
-/// 既にあれば書かない。`create_new` なので、存在をチェックしてから書く間に作られても上書きしない。
+/// 既にあれば書かない。`create_new`なので存在をチェックしてから書く間に作られても上書きしない。
 fn write_new(dst: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     if let Some(d) = dst.parent() {
         std::fs::create_dir_all(d)
@@ -69,7 +69,7 @@ fn write_new(dst: &Path, bytes: &[u8]) -> Result<(), WriteError> {
         .map_err(|e| WriteError::Other(format!("{} に書けない: {e}", dst.display())))
 }
 
-/// `src` のコピーを、見出しと印のチャージ型を `pair` にして `output_path` に書く。
+/// `src`のコピーを`output_path`に書く。ヘッダと印のチャージ型は`pair`にする。
 pub fn make(src: &Path, pair: Pair) -> MakeResult {
     let bytes = match read(src) {
         Ok(b) => b,
@@ -108,18 +108,18 @@ pub fn make(src: &Path, pair: Pair) -> MakeResult {
 pub struct Report {
     pub made: Vec<PathBuf>,
     pub unchanged: usize,
-    /// 直し済みか v1.0.0 より新しいため直さなかったもの。(対象の並びでの位置, パス)。
+    /// 直し済みかv1.0.0より新しいため直さなかったもの。(対象の並びでの位置, パス)。
     pub recorded: Vec<(usize, PathBuf)>,
     pub exists: usize,
     pub no_mark: usize,
-    /// ゲームのメニューから保存したもの（直す対象ではないので、問題には数えない）。
+    /// ゲームのメニューから保存したもの（直す対象ではないので問題には数えない）。
     pub menu_mark: usize,
     pub odd_value: usize,
     pub failed: Vec<(PathBuf, String)>,
 }
 
 impl Report {
-    /// 対象の `index` 番目 `src` の結果 `result` を数える。
+    /// 対象の`index`番目`src`の結果`result`を数える。
     pub fn add(&mut self, index: usize, src: &Path, result: MakeResult) {
         match result {
             MakeResult::Made(dst) => self.made.push(dst),
@@ -138,7 +138,7 @@ impl Report {
         self.made.len() + self.skipped()
     }
 
-    /// 作ったコピーのフォルダ（`<型>-<型>`）。重ならない順。
+    /// 作ったコピーのフォルダ（`<型>-<型>`）。作った順で重複は除く。
     pub fn output_dirs(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = Vec::new();
         for d in self.made.iter().filter_map(|p| p.parent()) {
@@ -160,13 +160,13 @@ impl Report {
             + self.failed.len()
     }
 
-    /// 直したいのに作れなかったものがあるか（「変えるものが無い」「直し済み」は含まない）。
+    /// 直したいのに作れなかったものがあるかどうか（「変えるものが無い」「直し済み」は含まない）。
     pub fn has_problem(&self) -> bool {
         self.exists + self.no_mark + self.odd_value + self.failed.len() > 0
     }
 }
 
-/// `paths` のそれぞれに同じ `pair` で `make` する。
+/// `paths`のそれぞれに同じ`pair`で`make`する。
 pub fn make_all(paths: &[PathBuf], pair: Pair) -> Report {
     let mut r = Report::default();
     for (i, p) in paths.iter().enumerate() {
@@ -194,7 +194,7 @@ pub(crate) mod tests {
         d
     }
 
-    /// 合成のリプレイ（実在の名前・実物のリプレイは使わない）。見出しは (`h1`, `h2`)、印の名前は Alice（自分）と Bob（相手）。
+    /// 合成のリプレイ（実在の名前・実物のリプレイは使わない）。ヘッダは (`h1`, `h2`)。印の名前はAlice（自分）とBob（相手）。
     pub(crate) fn replay(
         h1: u8,
         h2: u8,
@@ -410,7 +410,7 @@ pub(crate) mod tests {
         assert_eq!(r.recorded[0].0, 3, "対象の並びでの位置");
         assert_eq!((r.skipped(), r.total()), (2, 4));
         assert!(!r.has_problem());
-        // もう一度なら、作ったものは「既にある」になる。
+        // もう一度なら作ったものは「既にある」になる。
         let again = make_all(&[a, b], (Kind::Slow, Kind::Charge));
         assert_eq!((again.made.len(), again.exists), (0, 2));
         assert!(again.has_problem());

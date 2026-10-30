@@ -1,8 +1,8 @@
-//! 遅延とロスを揺らす UDP の中継（`peer_sim --shape`）。同じ PC の本物の花映塚 2 台（dll 同士）の間に挟み、向きごとに「落とす・遅らせる・重ねる・一定の遅れ」を掛ける。ロールバックと観戦を本物 2 台の間でローカルに検証する土台。
-//! peer_sim 自身の乱れ（`fault`）は自分が送る入力ワードにしか掛からず、巻き戻しの正しさは本物どうしの間でしか見えないので、中継は運ぶだけに徹する。
-//! ポートを 2 つ開く。`via_a` で a から受けたものを `via_b` から b へ（A→B）、`via_b` で b から受けたものを `via_a` から a へ（B→A）送る。dll の `peer` を中継のポートに向ければ、dll には相手が中継に見える。
-//! 中身は読まずにそのまま運ぶ（書き換えれば認証タグで捨てられる）。送り元が受けたポートの向きの相手（a / b）と違うものは捨てて数える（`route`。知らない送り元を流すと別人の入力ワードが見える）。
-//! 乱れは向きごとに別の `Faults`（別の乱数の列）で決める（決め方は `sim.rs` の `Tx::send` と同じ）。ガードは loopback だけで、開く前（`Args::check`）と送る直前に見る。
+//! 遅延とロスを揺らすUDPの中継（`peer_sim --shape`）。同じPCの本物の花映塚2台（dll同士）の間に挟み、向きごとに「落とす・遅らせる・重ねる・一定の遅れ」を掛ける。ロールバックと観戦を本物2台の間でローカルに検証する土台。
+//! peer_sim自身の乱れ（`fault`）は自分が送る入力ワードにしか掛からない。巻き戻しの正しさは本物どうしの間でしか見えないので中継は運ぶだけに徹する。
+//! ポートを2つ開く。`via_a`でaから受けたものを`via_b`からbへ送り（A→B）、`via_b`でbから受けたものを`via_a`からaへ送る（B→A）。dllの`peer`を中継のポートに向ければdllには相手が中継に見える。
+//! 中身は読まずにそのまま運ぶ（書き換えれば認証タグで捨てられる）。送信元が受けたポートの向きの相手（a / b）と違うものは捨てて数える（`route`。知らない送信元を中継すると別人の入力ワードが見える）。
+//! 乱れは向きごとに別の`Faults`（別の乱数の列）で決める（決め方は`sim.rs`の`Tx::send`と同じ）。ガードはloopbackだけ。開く前（`Args::check`）と送る直前に見る。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,15 +12,15 @@ use higanr_core::guard::{self, Scope};
 
 use crate::fault::{Fate, FaultConfig, Faults};
 
-/// `Args::max_sec` の既定（30 分）。
+/// `Args::max_sec`の既定（30分）。
 pub const DEFAULT_MAX_SEC: u32 = 1_800;
 
-/// `--max-sec` の上限（2 時間。落とし忘れて受信ソケットが残らないための上限）。
+/// `--max-sec`の上限（2時間。落とし忘れて受信ソケットが残らないための上限）。
 pub const MAX_MAX_SEC: u32 = 7_200;
 
 pub const REPORT_EVERY_SEC: u64 = 10;
 
-/// 運ぶ向き。`AtoB` は a から受けて b へ（受けるポートは `via_a`、出すポートは `via_b`）。
+/// 運ぶ向き。`AtoB`はaから受けてbへ（受けるポートは`via_a`で出すポートは`via_b`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     AtoB,
@@ -52,7 +52,7 @@ impl Dir {
     }
 }
 
-/// 本物の 2 台の受信ソケット（それぞれのゲームが送り出すアドレス。dll の ini の `bind`）。
+/// 本物の2台の受信ソケット（それぞれのゲームが送り出すアドレス。dllのiniの`bind`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ends {
     pub a: SocketAddr,
@@ -72,15 +72,16 @@ impl Ends {
     }
 }
 
-/// 受けた 1 通の行き先の判断。`arrived` は着いたポートが受ける向き。送り元がその向きの送り元と同じときだけその向きで運び、
-/// 食い違うもの（a が `via_b` へ送った・知らない相手）は `None`（捨てて数える）。
+/// 受けた1通の行き先の判断。`arrived`は着いたポートが受ける向き。
+/// 送信元がその向きの送信元と同じときだけその向きで運ぶ。
+/// 食い違うもの（aが`via_b`へ送った・知らない相手）は`None`（捨てて数える）。
 pub fn route(ends: &Ends, arrived: Dir, from: SocketAddr) -> Option<Dir> {
     (from == ends.source(arrived)).then_some(arrived)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneCounts {
-    /// 受けて運ぶことにした通数（送り元違いは含まない）。
+    /// 受けて運ぶことにした通数（送信元違いは含まない）。
     pub received: u64,
     pub dropped: u64,
     /// 運命が「遅らせる」だった通数（一定の遅れだけの通は数えない）。
@@ -113,7 +114,7 @@ impl Lane {
         }
     }
 
-    /// 受けた 1 通に運命を決める。いますぐ出すコピーを `out` に足す。一定の遅れは運命の後に、届けるコピーの全部へ足す。
+    /// 受けた1通に運命を決める。いますぐ出すコピーを`out`に足す。一定の遅れは運命を決めた後で、届けるコピーの全部へ足す。
     pub fn accept(&mut self, now: u32, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
         let lag = self.faults.one_way_ms();
         match self.faults.decide() {
@@ -128,7 +129,7 @@ impl Lane {
     }
 
     fn after(&mut self, now: u32, after_ms: u32, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
-        // 揺らぎはコピー 1 通ごとに別に引く。
+        // 揺らぎはコピー1通ごとに別に生成する。
         let after_ms = after_ms.saturating_add(self.faults.jitter());
         if after_ms == 0 {
             self.emitted += 1;
@@ -142,7 +143,7 @@ impl Lane {
     pub fn due(&mut self, now: u32, out: &mut Vec<Vec<u8>>) {
         let emitted = &mut self.emitted;
         self.pending.retain(|(at, b)| {
-            // 差で比べる（u32 の ms の折り返しでも正しい）。
+            // 差で比べる（u32のmsの折り返しでも正しい）。
             if (now.wrapping_sub(*at) as i32) >= 0 {
                 *emitted += 1;
                 out.push(b.clone());
@@ -180,7 +181,7 @@ impl Lane {
 pub struct Args {
     pub a: SocketAddr,
     pub b: SocketAddr,
-    /// A 向けのポート（A の ini の `peer` に書くアドレス）。
+    /// A向けのポート（Aのiniの`peer`に書くアドレス）。
     pub via_a: SocketAddr,
     pub via_b: SocketAddr,
     pub a2b: FaultConfig,
@@ -203,8 +204,8 @@ impl Args {
         }
     }
 
-    /// 開く前の検査: 4 つのアドレスが全部 loopback で、互いに違い（同じアドレスだと自分へ送り返すリングバッファができる）、
-    /// 乱れの設定が読めて、秒数が範囲の中。
+    /// 開く前の検査。次が全部成り立つこと。
+    /// 4つのアドレスが全部loopback・互いに違う（同じアドレスだと自分へ送り返すループができる）・乱れの設定が読める・秒数が範囲の中。
     pub fn check(&self) -> Result<(), String> {
         guard::check_peer(self.a, Scope::Loopback).map_err(|e| format!("--a: {e}"))?;
         guard::check_peer(self.b, Scope::Loopback).map_err(|e| format!("--b: {e}"))?;
@@ -306,7 +307,7 @@ pub fn run(
     run_with_sockets(args, sock_a, sock_b, stop, on_line)
 }
 
-/// 開いたポートで走らせる（検査用）。`sock_a` は A 向けのポート、`sock_b` は B 向けのポート。`stop` が立つか `max_sec` で終わる。
+/// 開いたポートで走らせる（検査用）。`sock_a`はA向けのポート。`sock_b`はB向けのポート。`stop`が立つか`max_sec`で終わる。
 pub fn run_with_sockets(
     args: &Args,
     sock_a: UdpSocket,
@@ -337,7 +338,7 @@ pub fn run_with_sockets(
         let now = elapsed_ms as u32;
         for dir in Dir::ALL {
             let (rx, tx) = socks[dir.idx()];
-            // 受け続ける相手がいても、遅らせたコピーを出す番が回るように。
+            // 受け続ける相手がいても遅らせたコピーを出す番が回るように。
             for _ in 0..256 {
                 match rx.recv_from(&mut buf) {
                     Ok((n, from)) => match route(&ends, dir, from) {
@@ -349,7 +350,7 @@ pub fn run_with_sockets(
                         None => lanes[dir.idx()].note_foreign(),
                     },
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    // 相手のポートが閉じていたときの ICMP の跳ね返り（Windows の 10054）や大きすぎる 1 通は読み捨てる。
+                    // 相手のポートが閉じていたときのICMPの跳ね返り（Windowsの10054）や大きすぎる1通は読み捨てる。
                     Err(_) => {}
                 }
             }
@@ -702,7 +703,7 @@ mod tests {
         );
         rig.a.send_to(b"a-to-b", rig.via_a).unwrap();
         assert!(recv(&rig.b).is_none(), "A→B の全部落としが効いていない");
-        // 送り元は A 向けのポート（dll の peer と同じアドレス）。
+        // 送信元はA向けのポート（dllのpeerと同じアドレス）。
         let t = Instant::now();
         rig.b.send_to(b"b-to-a\x00\xff", rig.via_b).unwrap();
         let (bytes, from) = recv(&rig.a).expect("B→A が着かない");

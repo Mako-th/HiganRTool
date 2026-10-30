@@ -1,9 +1,13 @@
-//! feed の記録（リングバッファ）と、読み取りのスレッドでのチェック（pure）。
+//! feedの記録（リングバッファ）と、読み取りのスレッドでのチェック（pure）。
 //!
-//! ゲームのスレッド（`script_win::script_on_tick`）は、台本で feed した tick ごとに、feed の前と後の InputManager 3 本の `+0x00`〜`+0x29`（0x2A バイト）を、
-//! tick の番号・段階・p1・p2・ローカル入力と一緒にこのリングバッファへ 1 件書く（書き手はゲームのスレッドだけ）。
-//! 読み取りのスレッドは、「前」を模型（`higanr_core::input_model`）で feed した結果と「後」を 3 本とも欄ごとに比べ、続けて feed した 2 件では「前の件の後」と「次の件の前」も比べる（間にゲームが書いていないか）。
-//! 書き方と読み方は tick のリングバッファ（`stub.rs`）と同じ seqlock: 札を 0 → 中身 → 札 = 番号 + 1 の順に書き、読み手は札・中身・札の順に読んで 2 回の札がどちらも番号 + 1 のときだけ採る。書き手（`FeedRing::push`）は確保もパニックもしない。
+//! ゲームのスレッド（`script_win::script_on_tick`）は、台本でfeedしたtickごとに記録を1件このリングバッファへ書く（書き手はゲームのスレッドだけ）。
+//! 記録はfeedの前と後のInputManager 3本の`+0x00`〜`+0x29`（0x2Aバイト）と、tickの番号・段階・p1・p2・ローカル入力。
+//! 読み取りのスレッドは、「前」を模型（`higanr_core::input_model`）でfeedした結果と「後」を3本ともフィールドごとに比べる。
+//! 続けてfeedした2件では「前の件の後」と「次の件の前」も比べる（間にゲームが書いていないか）。
+//! 書き方と読み方はtickのリングバッファ（`stub.rs`）と同じseqlock。
+//! 書き手はチケットを0 → 中身 → チケット = 番号 + 1 の順に書く。
+//! 読み手はチケット・中身・チケットの順に読み、2回のチケットがどちらも番号 + 1 のときだけ採る。
+//! 書き手（`FeedRing::push`）は確保もパニックもしない。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering, fence};
@@ -16,37 +20,37 @@ use crate::th09_addr::{
 };
 use crate::ticks::{SlotState, classify};
 
-/// InputManager 1 本からコピーする長さ（feed が書く範囲 `+0x00`〜`+0x29`）。
+/// InputManager 1本からコピーする長さ（feedが書く範囲`+0x00`〜`+0x29`）。
 pub const IM_BYTES: usize = IM_FEED_LEN as usize;
 
-/// リングバッファの件数（2 の冪。60 fps で約 17 秒ぶん）。
+/// リングバッファの件数（2の冪。60 fpsで約17秒ぶん）。
 pub const FEED_RING_LEN: u32 = 1024;
 const FEED_RING_MASK: u32 = FEED_RING_LEN - 1;
 const _: () = assert!(FEED_RING_LEN.is_power_of_two());
 
-/// 1 件の中身の語の数: k / 段階とローカル入力 / p1 と p2 / 前 3 本 ＋ 後 3 本（252 バイト = 63 語）。
+/// 1件の中身のワード数: k / 段階とローカル入力 / p1とp2 / 前3本 ＋ 後3本（252バイト = 63ワード）。
 const IM_ALL_BYTES: usize = IM_BYTES * 6;
 const _: () = assert!(IM_ALL_BYTES.is_multiple_of(4));
 pub const FEED_BODY_WORDS: usize = 3 + IM_ALL_BYTES / 4;
-/// 1 件の語の数（中身 ＋ 予備 1 ＋ 札 1。272 バイト）。
+/// 1件のワード数（中身 ＋ 予備1 ＋ チケット1。272バイト）。
 pub const FEED_SLOT_WORDS: usize = FEED_BODY_WORDS + 2;
 const W_TICKET: usize = FEED_SLOT_WORDS - 1;
 const W_K: usize = 0;
-/// 下位 16 ビットが段階、上位 16 ビットがローカル入力。
+/// 下位16ビットが段階、上位16ビットがローカル入力。
 const W_STEP_LOCAL: usize = 1;
-/// 下位 16 ビットが p1、上位 16 ビットが p2。
+/// 下位16ビットがp1、上位16ビットがp2。
 const W_KEYS: usize = 2;
 const W_BYTES: usize = 3;
 
-/// 台本で feed した 1 tick の記録。`before[i]` / `after[i]` は InputManager `[i]`（0 = 1P、1 = 2P、2 = 合成）の
-/// feed の前と後の `+0x00`〜`+0x29`。
+/// 台本でfeedした1 tickの記録。
+/// `before[i]` / `after[i]`はInputManager `[i]`（0 = 1P、1 = 2P、2 = 合成）のfeedの前と後の`+0x00`〜`+0x29`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeedRecord {
     pub k: u32,
     pub step: u16,
     pub p1: u16,
     pub p2: u16,
-    /// ローカル入力の下位 16 ビット（記録だけ。feed しない）。台本だけの実行では DLL が `0x0042BE40` で読んだ値。
+    /// ローカル入力の下位16ビット（記録だけ。feedしない）。台本だけの実行ではDLLが`0x0042BE40`で読んだ値。
     pub local: u16,
     pub before: [[u8; IM_BYTES]; 3],
     pub after: [[u8; IM_BYTES]; 3],
@@ -89,7 +93,7 @@ impl FeedRecord {
         }
     }
 
-    /// InputManager `[i]` へ feed した語（`0` に p1・`1` に p2・`2` に p1|p2）。
+    /// InputManager `[i]`へfeedしたワード（`0`にp1・`1`にp2・`2`にp1|p2）。
     pub fn words(&self) -> [u16; 3] {
         [self.p1, self.p2, self.p1 | self.p2]
     }
@@ -100,7 +104,7 @@ pub struct FeedSlot {
     words: [AtomicU32; FEED_SLOT_WORDS],
 }
 
-/// feed のリングバッファ。書き手はゲームのスレッドだけ（`push`）、読み手は読み取りのスレッドだけ（`read`）。
+/// feedのリングバッファ。書き手はゲームのスレッドだけ（`push`）。読み手は読み取りのスレッドだけ（`read`）。
 pub struct FeedRing {
     slots: [FeedSlot; FEED_RING_LEN as usize],
     next: AtomicU32,
@@ -118,7 +122,7 @@ impl FeedRing {
         }
     }
 
-    /// 1 件書く（ゲームのスレッドだけが呼ぶ）。seqlock の書き手: 札 0 の後の Release の fence で、中身の書きが札 0 より前に見えない。
+    /// 1件書く（ゲームのスレッドだけが呼ぶ）。seqlockの書き手: チケット0の後のReleaseのfenceにより、中身の書き込みがチケット0より前に見えない。
     pub fn push(&self, r: &FeedRecord) {
         let seq = self.next.load(Ordering::Relaxed);
         let slot = &self.slots[(seq & FEED_RING_MASK) as usize];
@@ -160,7 +164,7 @@ impl Default for FeedRing {
 
 pub static FEED_RING: FeedRing = FeedRing::new();
 
-/// 1 件を読んだ結果（`FeedRecord` は 270 バイトほどあるので`Box` に入れる）。
+/// 1件を読んだ結果（`FeedRecord`は270バイトほどあるので`Box`に入れる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedRead {
     Record(Box<FeedRecord>),
@@ -168,7 +172,7 @@ pub enum FeedRead {
     Overwritten,
 }
 
-/// リングバッファから新しい件を読む（`observe::drain` の feed バージョン）。`end` は書き手の次の番号。
+/// リングバッファから新しい件を読む（`observe::drain`のfeedバージョン）。`end`は書き手の次の番号。
 pub fn drain_feeds(
     end: u32,
     read: &dyn Fn(u32) -> FeedRead,
@@ -194,7 +198,7 @@ pub fn drain_feeds(
 
 // ---- チェック ----
 
-/// 比べる欄の数（cur・prev・リピート・押した瞬間・離した瞬間・カウンタ 16 個。0x2A バイトを全部覆う）。
+/// 比べるフィールドの数（cur・prev・リピート・押した瞬間・離した瞬間・カウンタ16個。0x2Aバイトを全部覆う）。
 pub const FIELD_COUNT: usize = 5 + 16;
 const _: () = assert!(FIELD_COUNT * 2 == IM_BYTES);
 
@@ -225,7 +229,7 @@ pub fn im_from_bytes(b: &[u8; IM_BYTES]) -> InputState {
     }
 }
 
-/// 模型の形を 0x2A バイトへ（`im_from_bytes` の逆。検査の偽の feed と、合成の記録に使う）。
+/// 模型の形を0x2Aバイトへ（`im_from_bytes`の逆。検査の偽のfeedと、合成の記録に使う）。
 #[cfg(test)]
 pub fn im_to_bytes(s: &InputState) -> [u8; IM_BYTES] {
     let mut b = [0u8; IM_BYTES];
@@ -280,21 +284,21 @@ fn mask_text(m: u32) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cont {
     First,
-    /// 前の件の k + 1 でない（間に台本で feed しなかった tick がある・読み落とし）。
+    /// 前の件の k + 1 でない（間に台本でfeedしなかったtickがある・読み落とし）。
     Gap,
-    /// 前の件の「後」と、この件の「前」の、3 本ごとの違う欄。全部 0 なら続いている。
+    /// 前の件の「後」とこの件の「前」で値が違うフィールド（3本ごと）。全部0なら続いている。
     Pair([u32; 3]),
 }
 
-/// 1 件のチェックの結果。`im[i]` は、InputManager `[i]` の「前を模型で feed した結果」と「後」で違う欄。
+/// 1件のチェックの結果。`im[i]`はInputManager `[i]`の「前を模型でfeedした結果」と「後」で値が違うフィールド。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckRow {
     pub im: [u32; 3],
     pub cont: Cont,
 }
 
-/// `_feed.csv` の見出し。im0〜im2 は 3 本の一致（`ok` か違う欄の名前）、cont は続きの一致
-/// （`-` 最初の件 / `gap` k が飛んだ / `ok` / `im0:cur+prev` の形）。
+/// `_feed.csv`のヘッダ。im0〜im2は3本の一致（`ok`か違うフィールドの名前）。
+/// contは続きの一致（`-`最初の件 / `gap` kが飛んだ / `ok` / `im0:cur+prev`の形）。
 pub const FEED_CSV_HEADER: &str = "k,step,p1,p2,local,im0,im1,im2,cont";
 
 #[derive(Debug, Clone, Default)]
@@ -303,7 +307,7 @@ pub struct FeedChecker {
     pub records: u64,
     pub mismatched_records: u64,
     pub mismatch: [[u64; FIELD_COUNT]; 3],
-    /// 続けて feed した組（k と k+1）の数と、そのうち前の後と次の前が違った組の数。
+    /// 続けてfeedしたペア（kとk+1）の数と、そのうち前の後と次の前が違ったペアの数。
     pub cont_pairs: u64,
     pub cont_breaks: u64,
     pub cont_fields: [[u64; FIELD_COUNT]; 3],

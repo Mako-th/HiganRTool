@@ -1,4 +1,4 @@
-//! 画面の文言（日本語・英語）。用語は slow / charge（ゲームの表記）、「リプレイ」「フォルダ」。
+//! 画面の文言（日本語・英語）。用語はslow / charge（ゲームの表記）、「リプレイ」「フォルダ」。
 
 use std::path::{Path, PathBuf};
 
@@ -100,7 +100,7 @@ impl Text {
         tx("リプレイ(*.rpy)", "Replays (*.rpy)").get(self.0)
     }
 
-    /// 「側」の行。`mine` が自分の側なら、そちらを「自分」にする。
+    /// 「側」の行。`mine`が自分の側ならそちらを「自分」にする。
     pub fn side_word(self, mine: bool) -> &'static str {
         if mine {
             tx("自分", "You").get(self.0)
@@ -109,12 +109,12 @@ impl Text {
         }
     }
 
-    /// 「n / 全体」。`index` は 0 始まり。
+    /// 「n / 全体」。`index`は0始まり。
     pub fn position(self, index: usize, len: usize) -> String {
         format!("{} / {}", index + 1, len)
     }
 
-    /// 直せないリプレイの理由。直せるなら `None`。
+    /// 直せないリプレイの理由。直せるなら`None`。
     pub fn unavailable(self, a: &Analysis) -> Option<String> {
         Some(match a {
             Analysis::Fixable(_) => return None,
@@ -182,7 +182,7 @@ impl Text {
         }
     }
 
-    /// 直した後の結果（単体・フォルダ全体・`--batch` で共通）。複数行。
+    /// 直した後の結果（単体・フォルダ全体・`--batch`で共通）。複数行。
     pub fn result_report(self, r: &Report) -> String {
         let ja = self.0 == Lang::Ja;
         let (total, made) = (r.total(), r.made.len());
@@ -258,7 +258,7 @@ impl Text {
         lines.join("\n")
     }
 
-    /// 「A〜B は修正が不要なのでスキップしました。」。`ranges` は空でない。
+    /// 「A〜B は修正が不要なのでスキップしました。」。`ranges`は空でない。
     fn skip_sentence(self, ranges: &[(String, String)]) -> String {
         let (sep, join) = match self.0 {
             Lang::Ja => ("〜", "、"),
@@ -293,7 +293,7 @@ impl Text {
     }
 }
 
-/// 言語の選択欄に出す名前。どちらの言語で表示していても、選ぶ人が読める自分の言語の名前のまま。
+/// 言語のコンボボックスに出す名前。どちらの言語で表示していても選ぶ人が読める自分の言語の名前のまま。
 pub fn lang_name(lang: Lang) -> &'static str {
     match lang {
         Lang::Ja => "日本語",
@@ -301,7 +301,7 @@ pub fn lang_name(lang: Lang) -> &'static str {
     }
 }
 
-/// スキップしたもの（対象の並びでの位置の昇順, パス）を、並びで続く同じフォルダのものどうしで「最初の名前, 最後の名前」にまとめる。
+/// スキップしたもの（対象の並びでの位置の昇順, パス）を並びで続く同じフォルダのものどうしで「最初の名前, 最後の名前」にまとめる。
 pub fn skip_ranges(items: &[(usize, PathBuf)]) -> Vec<(String, String)> {
     let name = |p: &Path| {
         p.file_name().map_or_else(
@@ -420,7 +420,7 @@ mod tests {
             ];
             assert_eq!(got, want);
         }
-        // 言語の選択欄の名前は、表示中の言語に関わらず自分の言語の名前。
+        // 言語のコンボボックスの名前は表示中の言語に関わらず自分の言語の名前。
         assert_eq!(lang_name(Lang::Ja), "日本語");
         assert_eq!(lang_name(Lang::En), "English");
         assert!(ja.prev().contains('◀') && en.next().contains('▶'));
@@ -505,7 +505,7 @@ mod tests {
             ranges(&[2, 4]),
             [names("0002", "0002"), names("0004", "0004")]
         );
-        // 位置が続いていても、フォルダが変われば別の範囲。
+        // 位置が続いていてもフォルダが変われば別の範囲。
         let items = [
             (0, PathBuf::from("a").join("1.rpy")),
             (1, PathBuf::from("b").join("2.rpy")),
@@ -542,7 +542,7 @@ mod tests {
         );
     }
 
-    /// `n` 本のうち `skip`（1 始まり）を直し済み、残りを作ったことにした結果と、作った先。
+    /// `n`本のうち`skip`（1始まり）を直し済みとし、残りは作ったものとした結果と作った先。
     fn report(n: usize, skip: &[usize]) -> (Report, PathBuf) {
         let dir: PathBuf = ["rep", "fix_replay", "Alice vs Bob", "charge-slow"]
             .iter()

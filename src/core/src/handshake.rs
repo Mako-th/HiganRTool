@@ -1,12 +1,17 @@
-//! 接続の手順（HELLO・HELLO_ACK・AGREE）の状態機械。
+//! 接続の手順（HELLO・HELLO_ACK・AGREE）のステートマシン。
 //!
-//! バイト列の形は `wire.rs`（検査は `decode` が済ませている）。ここは「いつ何を返し、いつ何を送り、いつ接続したとするか」だけを持つ。ソケットも時計も乱数も持たない。経路の選び方と自分の HELLO の跳ね返りを捨てるゲートは接続のセッション（`link.rs`）で、ここは相手が 1 つに決まっている形だけを持つ。
+//! バイト列の形は`wire.rs`にある（検査は`decode`が済ませている）。
+//! ここが持つのは「いつ何を返し、いつ何を送り、いつ接続したとするか」だけ。ソケットも時計も乱数も持たない。
+//! 経路の選び方と自分のHELLOの跳ね返りを捨てるゲートは接続のセッション（`link.rs`）の側にある。ここが扱うのは相手が1つに決まっている形だけ。
 //!
-//! dll の呼び方: 接続ごとに `Handshake::new`（rollback を望むなら最初の `poll_send` の前に `set_wish`）。受信した HELLO・HELLO_ACK・AGREE を `on_packet` へ渡し、返ったものは受けた相手へすぐ送る。1〜4 ms ごと、および `on_packet` の直後にも `poll_send` を呼んで返ったものを送る。
-//! `state()` が `Established` になったら選択（`selection.rs`）と lockstep を作るが、接続後も `on_packet`・`poll_send` を続ける（相手の確認が落ちると相手は送り続けているので、返しが要る）。時間切れの後も待つなら `restart` で作り直す（いつ・何回までかは `link.rs`）。
-//! AGREE を送るのは取りまとめ役（role_nonce の大きい方）。ホストの決め方（`set_host_pick`。`host_pick.rs`）を両者が使うなら、PROBE の列とゲストの PROBE_RESULT で決まった側がホストになる。
+//! dllの呼び方: 接続ごとに`Handshake::new`を呼ぶ（rollbackを望むなら最初の`poll_send`の前に`set_wish`を呼ぶ）。
+//! 受信したHELLO・HELLO_ACK・AGREEは`on_packet`へ渡し、返ったものは受けた相手へすぐ送る。
+//! `poll_send`は1〜4 msごとと`on_packet`の直後に呼び、返ったものを送る。
+//! `state()`が`Established`になったら選択（`selection.rs`）とlockstepを作る。接続後も`on_packet`・`poll_send`は続ける（相手の確認が落ちると相手は送り続けているので、返答が要る）。
+//! 時間切れの後も待つなら`restart`で作り直す（いつ・何回までかは`link.rs`）。
+//! AGREEを送るのは取りまとめ役（role_nonceの大きい方）。ホストの決め方（`set_host_pick`。`host_pick.rs`）を両者が使うならPROBEの列とゲストのPROBE_RESULTで決まった側がホストになる。
 //!
-//! 受信スレッドかゲームスレッドから呼ばれうるので、ヒープを使わず、パニックしうる添字と unwrap を置かない。名前は 32 B の固定の配列 ＋ 長さ。
+//! 受信スレッドかゲームスレッドから呼ばれうるので、ヒープを使わず、パニックしうる添字とunwrapを置かない。名前は32 Bの固定の配列と長さで持つ。
 
 use crate::frame::MAX_DELAY;
 use crate::host_pick::{self, Facts, Pick, PickNote, Train};
@@ -17,22 +22,23 @@ use crate::wire::{Hello, Message, Mode, NAME_MAX, PROTO_VER, Packet, Seat};
 
 pub use crate::lockstep::Role;
 
-/// HELLO を送り直す間隔（ms）。選択の 4 ms より間を空けたのは、候補アドレスが複数あり、最長 10 秒続く穴あけだから。
-/// 例外: 自分の HELLO がまだ ack されていない間に相手の HELLO を受けたら、間隔を待たずに次の `poll_send` で出す（`on_hello` の即送り）。
+/// HELLOを送り直す間隔（ms）。選択の4 msより間を空けたのは、候補アドレスが複数あり、最長10秒続く穴あけだから。
+/// 例外: 自分のHELLOがまだackされていない間に相手のHELLOを受けたら間隔を待たずに次の`poll_send`で出す（`on_hello`の即送り）。
 pub const HELLO_INTERVAL_MS: u32 = 20;
 
-/// ホストが AGREE を送り直す間隔（ms）。選択の `selection::RESEND_MS` と同じ値だが、由来が別なので別の名前で持つ。
+/// ホストがAGREEを送り直す間隔（ms）。選択の`selection::RESEND_MS`と同じ値だが、由来が別なので別の名前で持つ。
 pub const AGREE_INTERVAL_MS: u32 = 4;
 
-/// 始めてから接続しなければやめるまでの時間（ms）。1 回の手順の長さで、接続のセッションに作り直せる長さが設定されていれば、
-/// 時間切れの後に `restart` で作り直して待ち続ける。
+/// 始めてから接続できずにやめるまでの時間（ms）。1回の手順の長さ。
+/// 接続のセッションに作り直せる長さが設定されていれば、時間切れの後に`restart`で作り直して待ち続ける。
 pub const TIMEOUT_MS: u32 = 10_000;
 
-// 席は `Config::host_seat` で持つ（adonis と同じくホストが決められる）。
-// 各自が HELLO で席の希望と先にいたかを名乗り（`set_seat_ask`。置かなければ `SeatAsk::plain(host_seat)` = バージョン 3 までと同じ答え）、
-// 取りまとめ役が決まったホストの側から `seat_pick::host_seat` で決めて AGREE の host_seat で送る。ゲストは同じ式で検証する（`Counters::agree_bad_seat`）。
+// サイドは`Config::host_seat`で持つ（adonisと同じくホストが決められる）。
+// 各自がHELLOでサイドの希望と先にいたかを名乗る（`set_seat_ask`。設定しなければ `SeatAsk::plain(host_seat)` = バージョン3までと同じ答え）。
+// 取りまとめ役は決まったホストの側から`seat_pick::host_seat`で決めてAGREEのhost_seatで送る。
+// ゲストは同じ式で検証する（`Counters::agree_bad_seat`）。
 
-/// 名前（UTF-8、最大 32 B）。HELLO の name の欄と同じ形を、ヒープを使わずに持つ。
+/// 名前（UTF-8で最大32 B）。ヒープを使わずにHELLOのnameのフィールドと同じ形で持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Name {
     bytes: [u8; NAME_MAX],
@@ -45,8 +51,8 @@ impl Name {
         len: 0,
     };
 
-    /// 32 B に収まるよう、文字の境目で切って詰める。バイトの途中で切ると UTF-8 として読めなくなり、
-    /// 相手の `decode` が HELLO ごと捨てる。
+    /// 32 Bに収まるよう文字の境目で切って詰める。
+    /// バイトの途中で切るとUTF-8として読めなくなり、相手の`decode`がHELLOごと捨てる。
     pub fn new(s: &str) -> Name {
         let mut end = 0;
         for (i, c) in s.char_indices() {
@@ -86,20 +92,23 @@ impl Name {
 pub struct Config {
     pub session_id: u32,
     pub role_nonce: u64,
-    /// 希望 latency（0〜9）。範囲の外は 9 に詰める（相手の `decode` が HELLO ごと捨てるのを避ける）。
+    /// 希望latency（0〜9）。範囲の外は9に詰める（相手の`decode`がHELLOごと捨てるのを避ける）。
     pub latency: u8,
     pub name: Name,
-    /// 自分がホストになったときに座る席。ゲストになったら使わない。`set_seat_ask` を呼ばなければ、この席を希望として名乗る（`SeatAsk::plain`）。
+    /// 自分がホストになったときに座るサイド。ゲストになったら使わない。`set_seat_ask`を呼ばなければこのサイドを希望として名乗る（`SeatAsk::plain`）。
     pub host_seat: Seat,
 }
 
-/// 望むモード（HELLO の +3）と、rollback に決まったときの D。両者が rollback を望んだときだけ rollback、片方でも delay 方式なら delay 方式（古いバージョンの HELLO は +3 が 0 なので delay 方式）。
-/// rollback のときの D はホストの `rollback_delay`（AGREE の delay の欄で送る）。D は開始直後の穴埋めの長さを決めるので両者で同じでないとずれ、遅い回線でも待ちを生まない（遅れは予測が埋める）ので「希望の大きい方」にはしない。
-/// R（予測の上限）は確定の列が本物のワードだけで作られ R に依らないので、ネットワークに載せない。
+/// 望むモード（HELLOの +3）とrollbackに決まったときのD。
+/// 両者がrollbackを望んだときだけrollbackになる。片方でもdelay方式ならdelay方式になる（古いバージョンのHELLOは +3が0なのでdelay方式）。
+/// rollbackのときのDはホストの`rollback_delay`を使う（AGREEのdelayのフィールドで送る）。
+/// Dは開始直後の穴埋めの長さを決めるので両者で同じでないとずれる。
+/// また遅い回線でも待ちを生まない（遅れは予測が埋める）ので「希望の大きい方」にはしない。
+/// R（予測の上限）は確定の列が本物のワードだけで作られRに依らないので、ネットワークに載せない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeWish {
     pub mode: Mode,
-    /// rollback に決まったときの D（0〜9。範囲の外は 9 に詰める）。自分がゲストなら使わない（ホストの値に従う）。
+    /// rollbackに決まったときのD（0〜9。範囲の外は9に詰める）。自分がゲストなら使わない（ホストの値に従う）。
     pub rollback_delay: u8,
 }
 
@@ -123,8 +132,9 @@ impl Default for ModeWish {
     }
 }
 
-/// 両者の望むモードから決まるモード（`ModeWish` の「決まり方」）。ホストが AGREE を作るときと、ゲストが届いた AGREE を検証するときの
-/// 両方が使う。`able` は両者が rollback ができるか（HELLO の `can_rollback` の AND）: 両者が望んでも片方ができなければ delay 方式（防御）。
+/// 両者の望むモードから決まるモード（`ModeWish`の「決まり方」）。
+/// ホストがAGREEを作るときとゲストが届いたAGREEを検証するときの両方が使う。
+/// `able`は両者がrollbackができるかどうか（HELLOの`can_rollback`のAND）。両者が望んでも片方ができなければdelay方式になる（防御）。
 fn agreed_mode(mine: Mode, peer: Mode, able: bool) -> Mode {
     match (mine, peer) {
         (Mode::Rollback, Mode::Rollback) if able => Mode::Rollback,
@@ -146,20 +156,21 @@ pub struct Established {
     pub seat: Seat,
     pub host_seat: Seat,
     pub mode: Mode,
-    /// delay 方式: マッチを始めるときの delay（ホストが決めた値。両者の希望の大きい方）。
-    /// rollback のモード: D（ホストの `ModeWish::rollback_delay`。マッチの間は変えない）。
+    /// delay方式: マッチを始めるときのdelay（ホストが決めた値。両者の希望の大きい方）。
+    /// rollbackのモード: D（ホストの`ModeWish::rollback_delay`。マッチの間は変えない）。
     pub delay: u8,
-    /// 自分が HELLO で名乗った名前。メニューで名前を変えた値と実際に名乗った値がずれても、名乗った値を試合中の画面と、観戦者へ送る記録に出すために持つ。
+    /// 自分がHELLOで名乗った名前。メニューで名前を変えた値と実際に名乗った値がずれても、名乗った値を試合中の画面と観戦者へ送る記録に出すために持つ。
     pub own_name: Name,
     pub peer_name: Name,
     pub peer_latency: u8,
-    /// 相手の望むモード（HELLO の +3。古いバージョンは delay 方式）。「なぜ delay 方式になったか」を画面とログに出すため。
+    /// 相手の望むモード（HELLOの +3。古いバージョンはdelay方式）。「なぜ delay 方式になったか」を画面とログに出すため。
     pub peer_mode: Mode,
-    /// 両者が rollback ができる（HELLO の +3 の bit1 の AND）。真なら接続のセッションは rollback の状態機械を持ち、
-    /// キャラセレクトの Tab で形式を替えられる（`link::Connected::switch_format`）。
+    /// 両者がrollbackができる（HELLOの +3のbit1のAND）。
+    /// 真なら接続のセッションはrollbackのステートマシンを持つ。
+    /// またキャラセレクトのTabで形式を替えられる（`link::Connected::switch_format`）。
     pub rollback_able: bool,
-    /// 2 人とも観戦を許可すると名乗った（HELLO の +3 の bit2。決まりは `watch_list::may_list`）。偽ならホストはどの入口でも観戦の受付を
-    /// 作らない（ランダムマッチの一覧にも載せない）。
+    /// 2人とも観戦を許可すると名乗った（HELLOの +3のbit2。決まりは`watch_list::may_list`）。
+    /// 偽ならホストはどの入口でも観戦の受付を作らない（ランダムマッチの一覧にも載せない）。
     pub may_list: bool,
     /// どちらがホストに決まったかの材料（本ログに出す）。
     pub pick: PickNote,
@@ -167,17 +178,18 @@ pub struct Established {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailReason {
-    /// 相手の HELLO の role_nonce が自分と同じ（ほぼ自分の HELLO が自分に返った）。
+    /// 相手のHELLOのrole_nonceが自分と同じ（ほぼ自分のHELLOが自分に返った）。
     SameNonce,
-    /// 10 秒のあいだ、同じ session_id のものが 1 通も届かない（相手に届かない・直結できない組合せの可能性）。
+    /// 10秒のあいだ同じsession_idのものが1通も届かない（相手に届かない・直結できない組み合わせの可能性）。
     NothingReceived,
-    /// 同じ session_id のものは届いたが、10 秒で接続できない（片方向だけ通る、など）。
+    /// 同じsession_idのものは届いたが、10秒で接続できない（片方向だけ通るなど）。
     NoHandshake,
-    /// 相手が別のプロトコルのバージョンで送ってきた（`theirs` は相手のバージョン）。接続のセッションが、タグの合ったパケットの
-    /// `wire::DecodeError::BadVersion` を見て `Handshake::refuse_version` で設定する。何度作り直しても同じ答えなので作り直さない。
+    /// 相手が別のプロトコルのバージョンで送ってきた（`theirs`は相手のバージョン）。
+    /// 接続のセッションがタグの合ったパケットの`wire::DecodeError::BadVersion`を見て`Handshake::refuse_version`で設定する。
+    /// 何度作り直しても同じ答えなので作り直さない。
     OtherVersion { theirs: u8 },
-    /// 相手の HELLO のビルド番号（`theirs`）が自分（`update::BUILD_NUMBER`。`Handshake::set_build`）と違う（0 と 0 は同じ）。
-    /// プロトコルのバージョンが同じでも、配った zip が違う相手とは接続前に断る。作り直さない。
+    /// 相手のHELLOのビルド番号（`theirs`）が自分（`update::BUILD_NUMBER`。`Handshake::set_build`）と違う（0と0は同じ）。
+    /// プロトコルのバージョンが同じでも配布したzipが違う相手とは接続前に断る。作り直さない。
     OtherBuild { theirs: u32 },
 }
 
@@ -190,16 +202,16 @@ pub enum State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
-    /// 最初から（相手の HELLO をまだ受けていないか、この回に相手の値が食い違った —— 違う nonce の HELLO・値の違う AGREE。
-    /// 相手がセッションを作り直した印）。
+    /// 最初から作り直す。相手のHELLOをまだ受けていないか、この手順の間に相手の値が食い違った場合に使う。
+    /// 食い違いとは違うnonceのHELLOや値の違うAGREEのことで、相手がセッションを作り直した印になる。
     Fresh,
-    /// 相手の HELLO で決めた役割と相手の値は引き継ぎ、時間切れの数え始めを今にして、自分の HELLO を ack まで送り直す。
-    /// 引き継ぐのは、相手がこちらの HELLO_ACK を受けた後は HELLO を送らず、値を捨てると相手が次に時間切れになるまで役割を決められないため。
-    /// 送り直すのは、相手が同じ nonce のままセッションを作り直していれば、相手はこちらの値を持っていないため。
+    /// 相手のHELLOで決めた役割と相手の値は引き継ぐ。時間切れの数え始めは今に更新し、自分のHELLOをackまで送り直す。
+    /// 引き継ぐのは、相手がこちらのHELLO_ACKを受けた後はHELLOを送らず、値を捨てると相手が次に時間切れになるまで役割を決められないため。
+    /// 送り直すのは、相手が同じnonceのままセッションを作り直していれば、相手はこちらの値を持っていないため。
     Resume,
 }
 
-/// `poll_send` が返す、いま送るもの。HELLO と AGREE は同時に送り直し中になりうるので欄を分けた。
+/// `poll_send`が返す、いま送るもの。HELLOとAGREEは同時に送り直し中になりうるのでフィールドを分けた。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outbox {
     pub hello: Option<Message>,
@@ -211,29 +223,32 @@ pub struct Outbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Counters {
     pub wrong_session: u32,
-    /// 役割を決めた後に届いた、覚えた値と違う role_nonce の HELLO / HELLO_ACK（相手が接続をやり直した、など）。
+    /// 役割を決めた後に届いた、覚えた値と違うrole_nonceのHELLO / HELLO_ACK（相手が接続をやり直したなど）。
     pub stale_nonce: u32,
     pub wrong_echo: u32,
-    /// 役割を決める前の AGREE（ホストが送り直すので捨ててよい）。
+    /// 役割を決める前のAGREE（ホストが送り直すので捨ててよい）。
     pub agree_early: u32,
     pub agree_mismatch: u32,
-    /// ゲストが受けた、両者の望むモードから決まるモードと違う AGREE。例: 自分は delay 方式を望んだのに rollback と決めてきた。
-    /// 返さずに捨てる（接続すると語の使い方が食い違う）。相手がセッションを作り直した印ではないので `Counters::conflicts` には数えない。
+    /// ゲストが受けた、両者の望むモードから決まるモードと違うAGREE。例: 自分はdelay方式を望んだのにrollbackと決めてきた。
+    /// 返さずに捨てる（接続するとワードの使い方が食い違う）。相手がセッションを作り直した印ではないので`Counters::conflicts`には数えない。
     pub agree_bad_mode: u32,
-    /// ゲストが受けた、席の希望から決まる席（`seat_pick::host_seat`）と違う host_seat の AGREE。扱いは `agree_bad_mode` と同じ。
+    /// ゲストが受けた、サイドの希望から決まるサイド（`seat_pick::host_seat`）と違うhost_seatのAGREE。扱いは`agree_bad_mode`と同じ。
     pub agree_bad_seat: u32,
-    /// ゲストが受けた、どちらがホストかの値が合わない AGREE（載っている値から決まるホストと違う・知っている回線の型や自分が送った値と違う）。
-    /// 扱いは `agree_bad_mode` と同じ。
+    /// ゲストが受けた、どちらがホストかの値が合わないAGREE（載っている値から決まるホストと違う・知っているネットワーク種別のフラグや自分が送った値と違う）。
+    /// 扱いは`agree_bad_mode`と同じ。
     pub agree_bad_pick: u32,
-    /// 列に使った相手の PROBE。
+    /// 列に使った相手のPROBE。
     pub probes: u32,
     pub unrelated: u32,
     pub after_fail: u32,
-    /// 接続前に、同じ nonce で公開鍵だけ違う HELLO を受けて相手の公開鍵を取り替えた回数（相手がセッションを作り直した）。
-    /// 取り替えた後の手順は新しい相手の値で続くので、食い違い（`conflicts`）には数えない。
+    /// 接続前に同じnonceで公開鍵だけ違うHELLOを受けて相手の公開鍵を取り替えた回数（相手がセッションを作り直した）。
+    /// 取り替えた後の手順は新しい相手の値で続くので食い違い（`conflicts`）には数えない。
     pub rekeyed: u32,
-    /// 手放した古い公開鍵の HELLO（遅れて届いた古いセッションのもの）を、取り替え直さずに捨てた回数。
+    /// 手放した古い公開鍵のHELLO（遅れて届いた古いセッションのもの）を、取り替え直さずに捨てた回数。
     pub retired_hello: u32,
+    /// 接続前に自分の今の公開鍵を返したHELLO_ACKを根拠に、役割を決めた相手を取り替えた回数。
+    /// 先に届いた古いセッションのHELLOの相手は手放した。
+    pub swapped: u32,
 }
 
 impl Counters {
@@ -242,7 +257,7 @@ impl Counters {
     }
 }
 
-/// 前に送った時刻から `interval` 経ったか。まだ 1 度も送っていなければすぐ送る（遅延を足さないため）。
+/// 前に送った時刻から`interval`経ったかどうか。まだ1度も送っていなければすぐ送る（遅延を足さないため）。
 fn due(last: Option<u32>, now: u32, interval: u32) -> bool {
     match last {
         None => true,
@@ -266,64 +281,100 @@ struct Peer {
     can_rollback: bool,
     listable: bool,
     seat: SeatAsk,
-    /// ホストの決め方を使う（HELLO の +3 の bit3）。
+    /// ホストの決め方を使う（HELLOの +3のbit3）。
     pick: bool,
     nat: NatMark,
-    /// この人がホストに決まったときの rollback の D（HELLO の +83）。
+    /// この人がホストに決まったときのrollbackのD（HELLOの +83）。
     rollback_delay: u8,
-    /// 使い捨ての鍵の公開鍵（HELLO の +50）。役割を決めた後に、同じ nonce で違う公開鍵の HELLO / HELLO_ACK が来たら、
-    /// 違う nonce と同じく「相手がセッションを作り直した」と見る（`on_hello` の注）。
+    /// 使い捨ての鍵の公開鍵（HELLOの +50）。
+    /// 役割を決めた後に同じnonceで違う公開鍵のHELLO / HELLO_ACKが来たら、違うnonceと同じく「相手がセッションを作り直した」と見る（`on_hello`の注）。
     public: [u8; PUBLIC_LEN],
+}
+
+/// 相手の印（role_nonce, 使い捨ての鍵の公開鍵）。同じ相手でもセッションを作り直すと公開鍵が変わる。
+type PeerKey = (u64, [u8; PUBLIC_LEN]);
+
+impl Peer {
+    fn of_hello(h: &Hello) -> Peer {
+        Peer {
+            nonce: h.role_nonce,
+            name: Name::from_hello(h),
+            latency: h.latency.min(MAX_DELAY),
+            mode: h.mode,
+            can_rollback: h.can_rollback,
+            listable: h.listable,
+            seat: SeatAsk {
+                wish: h.seat_wish,
+                arrival: h.arrival,
+            },
+            public: h.public,
+            pick: h.host_pick,
+            nat: h.nat,
+            rollback_delay: h.rollback_delay.min(MAX_DELAY),
+        }
+    }
+
+    fn key(&self) -> PeerKey {
+        (self.nonce, self.public)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Handshake {
     cfg: Config,
-    /// 望むモード（`set_wish`。既定は delay 方式）。
+    /// 望むモード（`set_wish`。既定はdelay方式）。
     wish: ModeWish,
-    /// rollback ができるか（`set_can_rollback`。既定は true）。HELLO の +3 の bit1 で名乗る。
+    /// rollbackができるかどうか（`set_can_rollback`。既定はtrue）。HELLOの +3のbit1で名乗る。
     can_rollback: bool,
-    /// 観戦を許可するか（`set_listable`。既定は false）。HELLO の +3 の bit2 で名乗る。
+    /// 観戦を許可するかどうか（`set_listable`。既定はfalse）。HELLOの +3のbit2で名乗る。
     listable: bool,
     seat: SeatAsk,
-    /// 自分の使い捨ての鍵の公開鍵（HELLO / HELLO_ACK に載せる。`set_public`。接続のセッションが `Link::new` で設定する）。設定しなければ 0 の 32 B
-    /// —— セッションを通らない検査の形で、相手はこれから鍵を作れないので封じた便は交わせない。
+    /// 自分の使い捨ての鍵の公開鍵（HELLO / HELLO_ACKに載せる。`set_public`。接続のセッションが`Link::new`で設定する）。
+    /// 設定しなければ0の32 Bになる。これはセッションを通らない検査の形で、相手はこれから鍵を作れないので封じたパケットは交わせない。
     public: [u8; PUBLIC_LEN],
-    /// 自分のビルド番号（既定は `update::BUILD_NUMBER`）。
+    /// 自分のビルド番号（既定は`update::BUILD_NUMBER`）。
     build: u32,
     start: u32,
     state: State,
-    /// 取りまとめ役（role_nonce の大きい方。AGREE を送る）なら Host。決まったホストは接続したときの `Established::role`。
+    /// 取りまとめ役（role_nonceの大きい方。AGREEを送る）ならHost。決まったホストは接続したときの`Established::role`。
     role: Option<Role>,
     peer: Option<Peer>,
     got_ack: bool,
     received_any: bool,
     hello_sent: Option<u32>,
-    /// ホスト: 送る AGREE の値。ゲスト: 最初に受けた AGREE の値（以後もゲストは同じ値の AGREE を取りまとめ役へ返す）。
+    /// ホスト: 送るAGREEの値。ゲスト: 最初に受けたAGREEの値（以後もゲストは同じ値のAGREEを取りまとめ役へ返す）。
     terms: Option<Terms>,
     agree_sent: Option<u32>,
     counters: Counters,
     conflicts_at_start: u64,
-    /// 同じ nonce の相手がセッションを作り直して手放した公開鍵（新しい順）。遅れて届いた古いセッションの HELLO で取り替え直さないための記録。
+    /// 自分の今の公開鍵を返した最後のHELLO_ACKの送り手（`is_fresh_ack`）。前のセッションへの返答は自分の古い公開鍵を返すので入らない。
+    /// 役割を決めた相手と同じなら、その相手は今のセッションの自分のHELLOを受けている（このとき`got_ack`）。
+    /// 違えば、その相手のHELLOを待つ（その相手へはまだHELLO_ACKを返していないので、相手はHELLOを送り続けている）。
+    acked_by: Option<PeerKey>,
+    /// 役割を決めた後に取り替えて手放した相手（新しい順）。
+    /// 遅れて届いた・盗み見て送り直された古いセッションのHELLOで取り替え直さないための記録。
+    /// この中の相手から今の公開鍵への返答が届いたら、その相手へ戻す。
+    /// 古いHELLOで取り替えられても、今の相手はHELLO_ACKを受けた後なのでHELLOを送り直さない。
     /// 作り直した（`Fresh`）ときは持たない。
-    retired: [Option<[u8; PUBLIC_LEN]>; RETIRED_KEYS],
-    /// ホストの決め方の設定（`set_host_pick`）。None なら PROBE を交わさず、取りまとめ役がそのままホスト。
+    kept: [Option<Peer>; KEPT_PEERS],
+    /// ホストの決め方の設定（`set_host_pick`）。NoneならPROBEを交わさず、取りまとめ役がそのままホスト。
     host_pick: Option<host_pick::Setup>,
-    /// 相手の PROBE の列（相手の上りの見積もり）。
+    /// 相手のPROBEの列（相手の上りの見積もり）。
     train: Train,
-    /// この相手へ PROBE を送ったか（接続のセッションが `take_probe` で 1 回だけ取る）。
+    /// この相手へPROBEを送ったかどうか（接続のセッションが`take_probe`で1回だけ取る）。
     probe_taken: bool,
-    /// 取りまとめ役: 相手の HELLO で役割を決めた時刻（ゲストの値を待つ上限の起点）。
+    /// 取りまとめ役: 相手のHELLOで役割を決めた時刻（ゲストの値を待つ上限の起点）。
     lead_at: Option<u32>,
-    /// 取りまとめ役: ゲストが測った自分の上り（PROBE_RESULT の最初の値）。
+    /// 取りまとめ役: ゲストが測った自分の上り（PROBE_RESULTの最初の値）。
     peer_report: Option<u32>,
-    /// ゲスト: 自分が測った相手の上り（列を締めたら決まる）と、それを最後に送った時刻。
+    /// ゲスト: 自分が測った相手の上り（列を締めたら決まる）とそれを最後に送った時刻。
     my_report: Option<u32>,
     report_sent: Option<u32>,
 }
 
-/// 手放した公開鍵の記録の数。遅れて届きうるのは直前のセッションの HELLO だけなので 2 つあれば足りる。
-const RETIRED_KEYS: usize = 2;
+/// 手放した相手の記録の数。遅れて届きうるのはふつう直前のセッションのHELLOだけ。
+/// 同じsession・同じnonceの古いセッションのHELLOをこれより多く盗み見て送り直されると今の相手を忘れうる（その相手が時間切れで作り直してHELLOを送り直すまで接続しない（推定））。
+const KEPT_PEERS: usize = 4;
 
 impl Handshake {
     pub fn new(cfg: Config, now: u32) -> Self {
@@ -348,7 +399,8 @@ impl Handshake {
             agree_sent: None,
             counters: Counters::default(),
             conflicts_at_start: 0,
-            retired: [None; RETIRED_KEYS],
+            acked_by: None,
+            kept: [None; KEPT_PEERS],
             host_pick: None,
             train: Train::default(),
             probe_taken: false,
@@ -359,7 +411,7 @@ impl Handshake {
         }
     }
 
-    /// 相手を忘れたときに、ホストの決め方の途中の値も捨てる（相手がセッションを作り直した）。
+    /// 相手を忘れたときにホストの決め方の途中の値も捨てる（相手がセッションを作り直した）。
     fn forget_pick(&mut self) {
         self.train = Train::default();
         self.probe_taken = false;
@@ -369,15 +421,17 @@ impl Handshake {
         self.report_sent = None;
     }
 
-    /// 時間切れを `now` で見て、今の状態を返す。接続のセッションが、届いたものを `on_packet` で渡す前に作り直すかを決めるのに使う
-    /// （渡してから時間切れになると、その 1 通を「やめた後」として捨てる）。
+    /// 時間切れを`now`で見て今の状態を返す。
+    /// 接続のセッションが、届いたものを`on_packet`で渡す前に作り直すかどうかを決めるのに使う。
+    /// 渡してから時間切れになると、その1通を「やめた後」として捨てるため。
     pub fn expire(&mut self, now: u32) -> State {
         self.check_timeout(now);
         self.state
     }
 
-    /// 時間切れでやめた手順を作り直す。形は `Restart` の doc。数え（`Counters`）は続けて足す。時間切れでやめていない
-    /// （接続した・手順の中・同じ nonce でやめた）なら何もしない（`None`）。同じ nonce は作り直しても同じ答えになるので作り直さない。
+    /// 時間切れでやめた手順を作り直す。形は`Restart`のdoc。カウンタ（`Counters`）は続けて足す。
+    /// 時間切れでやめていない（接続した・手順の中・同じnonceでやめた）なら何もしない（`None`）。
+    /// 同じnonceは作り直しても同じ答えになるので作り直さない。
     pub fn restart(&mut self, now: u32) -> Option<Restart> {
         match self.state {
             State::Failed(FailReason::NothingReceived | FailReason::NoHandshake) => {}
@@ -397,8 +451,10 @@ impl Handshake {
             self.start = now;
             self.received_any = false;
             self.got_ack = false;
+            // 返答は前回の手順のもの。相手が今回の手順の自分のHELLOを受けたかどうかは、新しい返答で知り直す。
+            self.acked_by = None;
             self.hello_sent = None;
-            // ホストは AGREE もすぐ出す（相手が待っているなら 4 ms を待たせない）。
+            // ホストはAGREEもすぐ出す（相手が待っているなら4 msを待たせない）。
             self.agree_sent = None;
             Restart::Resume
         } else {
@@ -413,13 +469,13 @@ impl Handshake {
             *self = Handshake::new(self.cfg, now);
             self.host_pick = host_pick;
             self.counters = counters;
-            // 望むモードは接続の設定なので、作り直しても変えない（相手に別の値を名乗ると、決まるモードが回ごとに揺れる）。
+            // 望むモードは接続の設定なので作り直しても変えない（相手に別の値を名乗ると決まるモードが手順ごとに揺れる）。
             self.wish = wish;
             self.can_rollback = can;
             self.listable = listable;
             self.seat = seat;
-            // 公開鍵も変えない（role_nonce と同じ寿命）。最初からの作り直しでも role_nonce は引き直さないので、公開鍵だけ替えると、
-            // 自分の古い公開鍵を覚えている相手と鍵が食い違ったまま接続できない。
+            // 公開鍵も変えない（role_nonceと同じ寿命）。
+            // 最初からの作り直しでもrole_nonceは生成し直さないので、公開鍵だけ替えると自分の古い公開鍵を覚えている相手と鍵が食い違ったまま接続できない。
             self.public = public;
             self.build = build;
             Restart::Fresh
@@ -428,15 +484,15 @@ impl Handshake {
         Some(kind)
     }
 
-    /// 相手が別のバージョンで送ってきたので、接続前に手順をやめる（`FailReason::OtherVersion`）。接続後・やめた後は何もしない。
+    /// 相手が別のバージョンで送ってきたので接続前に手順をやめる（`FailReason::OtherVersion`）。接続後・やめた後は何もしない。
     pub fn refuse_version(&mut self, theirs: u8) {
         if self.state == State::Connecting {
             self.state = State::Failed(FailReason::OtherVersion { theirs });
         }
     }
 
-    /// 自分の使い捨ての鍵の公開鍵を設定する（接続のセッションが `Link::new` で 1 回）。HELLO を 1 通でも出した後・役割を決めた後は
-    /// 何もしない（相手が先に覚えた公開鍵と食い違う）。
+    /// 自分の使い捨ての鍵の公開鍵を設定する（接続のセッションが`Link::new`で1回）。
+    /// HELLOを1通でも出した後・役割を決めた後は何もしない（相手が先に覚えた公開鍵と食い違う）。
     pub fn set_public(&mut self, public: [u8; PUBLIC_LEN]) {
         if self.role.is_some() || self.hello_sent.is_some() {
             return;
@@ -444,7 +500,7 @@ impl Handshake {
         self.public = public;
     }
 
-    /// 自分のビルド番号を設定する（検査用）。最初の `poll_send` の前だけ効く。
+    /// 自分のビルド番号を設定する（検査用）。最初の`poll_send`の前だけ効く。
     pub fn set_build(&mut self, build: u32) {
         if self.role.is_some() || self.hello_sent.is_some() {
             return;
@@ -456,14 +512,14 @@ impl Handshake {
         self.build
     }
 
-    /// 役割を決めた相手の（role_nonce, 公開鍵）。相手の HELLO を受ける前と、最初から作り直した後は None。
-    /// 接続のセッションは、これが変わったときに向きごとの鍵を作り直す（`link.rs` の `refresh_keys`）。
+    /// 役割を決めた相手の（role_nonce, 公開鍵）。相手のHELLOを受ける前と最初から作り直した後はNone。
+    /// 接続のセッションはこれが変わったときに向きごとの鍵を作り直す（`link.rs`の`refresh_keys`）。
     pub fn peer_key(&self) -> Option<(u64, [u8; PUBLIC_LEN])> {
         self.peer.map(|p| (p.nonce, p.public))
     }
 
-    /// 望むモードと D を設定する。最初の `poll_send` の前に呼ぶ。HELLO を出した後に変えると、先に名乗った値と後の AGREE の値が
-    /// 食い違いうるので、役割を決めた後は何もしない。
+    /// 望むモードとDを設定する。最初の`poll_send`の前に呼ぶ。
+    /// HELLOを出した後に変えると先に名乗った値と後のAGREEの値が食い違いうるので、役割を決めた後は何もしない。
     pub fn set_wish(&mut self, wish: ModeWish) {
         if self.role.is_some() {
             return;
@@ -478,7 +534,7 @@ impl Handshake {
         self.wish
     }
 
-    /// rollback が「できる」かを設定する（HELLO の +3 の bit1）。`set_wish` と同じく最初の `poll_send` の前に呼ぶ。役割を決めた後は何もしない。
+    /// rollbackが「できる」かを設定する（HELLOの +3のbit1）。`set_wish`と同じく最初の`poll_send`の前に呼ぶ。役割を決めた後は何もしない。
     pub fn set_can_rollback(&mut self, can: bool) {
         if self.role.is_some() {
             return;
@@ -490,8 +546,8 @@ impl Handshake {
         self.can_rollback
     }
 
-    /// 観戦を許可するか（`[spectate] enable = 1`）を設定する（HELLO の +3 の bit2）。HELLO を 1 通でも出した後・
-    /// 役割を決めた後は何もしない（相手が最初に受けた HELLO の値で覚えるので、後から変えると両者の `may_list` が食い違う）。
+    /// 観戦を許可するかどうか（`[spectate] enable = 1`）を設定する（HELLOの +3のbit2）。
+    /// HELLOを1通でも出した後・役割を決めた後は何もしない（相手が最初に受けたHELLOの値で覚えるので後から変えると両者の`may_list`が食い違う）。
     pub fn set_listable(&mut self, on: bool) {
         if self.role.is_some() || self.hello_sent.is_some() {
             return;
@@ -503,8 +559,9 @@ impl Handshake {
         self.listable
     }
 
-    /// ホストの決め方を使うかを設定する（HELLO の +3 の bit3 と回線の型）。`set_listable` と同じく、HELLO を 1 通でも出した後・役割を決めた後は
-    /// 何もしない。両者が使うときだけ PROBE を交わして決める。
+    /// ホストの決め方を使うかどうかを設定する（HELLOの +3のbit3とネットワーク種別のフラグ）。
+    /// `set_listable`と同じくHELLOを1通でも出した後・役割を決めた後は何もしない。
+    /// 両者が使うときだけPROBEを交わして決める。
     pub fn set_host_pick(&mut self, p: Option<host_pick::Setup>) {
         if self.role.is_some() || self.hello_sent.is_some() {
             return;
@@ -520,23 +577,29 @@ impl Handshake {
         self.host_pick.map_or(NatMark::UNKNOWN, |p| p.nat)
     }
 
-    /// 両者がホストの決め方を使うか（相手の HELLO を受ける前は false）。
+    /// 両者がホストの決め方を使うかどうか（相手のHELLOを受ける前はfalse）。
     fn pick_active(&self) -> bool {
         self.host_pick.is_some() && self.peer.is_some_and(|p| p.pick)
     }
 
-    /// 相手へ PROBE の列を送る番か。相手の HELLO で両者が決め方を使うと分かった後、接続する前に 1 回だけ true を返す（接続のセッションは、
-    /// その HELLO の送り元へだけ送る）。
+    /// 相手へPROBEの列を送る番かどうか。
+    /// 相手のHELLOで両者が決め方を使うと分かった後から接続する前までに1回だけtrueを返す。
+    /// 接続のセッションは、そのHELLOの送り元へだけ送る。
     pub fn take_probe(&mut self) -> bool {
-        if self.probe_taken || self.state != State::Connecting || !self.pick_active() {
+        if !self.probe_due() {
             return false;
         }
         self.probe_taken = true;
         true
     }
 
-    /// 相手の PROBE（`at_us` は受けた時刻の µs。`now` と同じ時計）。接続する前で、自分が決め方を使うときだけ列に足す
-    /// （相手の HELLO より先に届いた便も使う）。
+    /// `take_probe`がtrueを返す状態かどうか（取らない）。接続のセッションが候補に無い送り元へ列を送るかどうかを決めるのに使う。
+    pub fn probe_due(&self) -> bool {
+        !self.probe_taken && self.state == State::Connecting && self.pick_active()
+    }
+
+    /// 相手のPROBE（`at_us`は受けた時刻のµs。`now`と同じ時計）。
+    /// 接続する前で自分が決め方を使うときだけ列に足す（相手のHELLOより先に届いた便も使う）。
     pub fn on_probe(&mut self, seq: u8, at_us: u64, now: u32) {
         self.check_timeout(now);
         if self.state != State::Connecting || self.host_pick.is_none() {
@@ -547,9 +610,10 @@ impl Handshake {
         }
     }
 
-    /// 席の希望と、先にいたか（ルームに先に入った側・接続コードを作った側。`wire::Arrival`）の名乗りを設定する（`seat_pick.rs`）。最初の `poll_send` の前に呼ぶ。HELLO を 1 通でも出した後・役割を決めた後は
-    /// 何もしない（相手は最初に受けた HELLO の希望で覚えるので、後から変えるとホストの AGREE の席とゲストの検証が食い違い、
-    /// `agree_bad_seat` で捨て続ける）。
+    /// サイドの希望と先にいたか（ルームに先に入った側・接続コードを作った側。`wire::Arrival`）の名乗りを設定する（`seat_pick.rs`）。
+    /// 最初の`poll_send`の前に呼ぶ。
+    /// HELLOを1通でも出した後・役割を決めた後は何もしない。
+    /// 相手は最初に受けたHELLOの希望で覚えるので、後から変えるとホストのAGREEのサイドとゲストの検証が食い違い、`agree_bad_seat`で捨て続ける。
     pub fn set_seat_ask(&mut self, ask: SeatAsk) {
         if self.role.is_some() || self.hello_sent.is_some() {
             return;
@@ -565,8 +629,8 @@ impl Handshake {
         self.state
     }
 
-    /// 自分が取りまとめ役（role_nonce の大きい方。AGREE を送る）か（相手の HELLO を受ける前は None）。
-    /// ホストの決め方を使わない接続ではそのままホストになる。決まったホストは `Established::role`。
+    /// 自分が取りまとめ役（role_nonceの大きい方。AGREEを送る）かどうか（相手のHELLOを受ける前はNone）。
+    /// ホストの決め方を使わない接続ではそのままホストになる。決まったホストは`Established::role`。
     pub fn coordinator(&self) -> Option<bool> {
         self.role.map(|r| r == Role::Host)
     }
@@ -608,8 +672,9 @@ impl Handshake {
         }
     }
 
-    /// 決まったホストの席。席は両者の希望から（`seat_pick.rs`）。名乗らない経路はバージョン 3 までと同じ「ホストの設定の席」。
-    /// 取りまとめ役が AGREE を作るときもゲストが検証するときもこれを使う。`me_host` は自分がホストか。
+    /// 決まったホストのサイド。サイドは両者の希望から決まる（`seat_pick.rs`）。名乗らない経路はバージョン3までと同じ「ホストの設定のサイド」。
+    /// 取りまとめ役がAGREEを作るときもゲストが検証するときもこれを使う。
+    /// `me_host`は自分がホストかどうか。
     fn host_seat_for(&self, peer: &Peer, me_host: bool) -> Seat {
         let (mine, theirs) = ((self.seat, self.cfg.role_nonce), (peer.seat, peer.nonce));
         let ((h_ask, h_nonce), (g_ask, g_nonce)) = if me_host {
@@ -620,13 +685,13 @@ impl Handshake {
         seat_pick::host_seat(h_ask, g_ask, h_nonce, g_nonce)
     }
 
-    /// 取りまとめ役が、決まったホスト（`pick.host_is_sender` なら自分）の側の値で AGREE の値を組み立てる。
+    /// 取りまとめ役が決まったホスト（`pick.host_is_sender`なら自分）の側の値でAGREEの値を組み立てる。
     fn terms_for(&self, peer: &Peer, pick: Pick) -> Terms {
         let me_host = pick.host_is_sender;
         let host_seat = self.host_seat_for(peer, me_host);
         let able = self.can_rollback && peer.can_rollback;
         match agreed_mode(self.wish.mode, peer.mode, able) {
-            // 希望の大きい方。小さい方にすると、大きい値を望んだ側（回線が遅い見込み）のワードが毎フレーム間に合わず、両者が待つ。
+            // 希望の大きい方にする。小さい方にすると大きい値を望んだ側（回線が遅い見込み）のワードが毎フレーム間に合わず、両者が待つ。
             Mode::Delay => Terms {
                 host_seat,
                 delay: self.cfg.latency.max(peer.latency),
@@ -646,10 +711,11 @@ impl Handshake {
         }
     }
 
-    /// ゲストが受けた AGREE のどちらがホストかの値を検証する。両者が決め方を使わない接続は `Pick::NONE` だけを通す。使う接続は、
-    /// 回線の型が HELLO で知った値と同じ・取りまとめ役の上りが自分の送った値か 0（届かなかった）・載っている値から決まるホストと同じ。
-    /// 自分がまだ値を持っていなければ（作り直して測り直す前）、取りまとめ役の上りは照らし合わせない: 相手が作り直さずに前の値で決めた
-    /// AGREE を断り続けると接続できない。役の一致は、その AGREE を採ることで保たれる。
+    /// ゲストが受けたAGREEのどちらがホストかの値を検証する。
+    /// 両者が決め方を使わない接続は`Pick::NONE`だけを通す。
+    /// 使う接続は次が全部揃ったときだけ通す: ネットワーク種別のフラグがHELLOで知った値と同じ・取りまとめ役の上りが自分の送った値か0（届かなかった）・載っている値から決まるホストと同じ。
+    /// 自分がまだ値を持っていなければ（作り直して測り直す前）、取りまとめ役の上りは照らし合わせない。
+    /// 相手が作り直さずに前の値で決めたAGREEを断り続けると接続できないため。役の一致は、そのAGREEを採ることで保たれる。
     fn pick_ok(&self, peer: &Peer, p: &Pick) -> bool {
         if !self.pick_active() {
             return *p == Pick::NONE;
@@ -661,7 +727,7 @@ impl Handshake {
         p.sender_nat == peer.nat && p.receiver_nat == self.own_nat() && up_ok && p.consistent()
     }
 
-    /// 接続前に 10 秒経ったらやめる。理由は「同じ session_id のものが届いたか」で分ける。`on_packet` と `poll_send` の両方の入口で見る。
+    /// 接続前に10秒経ったらやめる。理由は「同じsession_idのものが届いたか」で分ける。`on_packet`と`poll_send`の両方の入口で見る。
     fn check_timeout(&mut self, now: u32) {
         if self.state == State::Connecting && now.wrapping_sub(self.start) >= TIMEOUT_MS {
             self.state = State::Failed(if self.received_any {
@@ -672,7 +738,7 @@ impl Handshake {
         }
     }
 
-    /// 接続した結果を記録する。ホストとゲストで同じ `Terms` から作るので、席と delay は食い違わない。`role` は決まったホストから見た自分の役。
+    /// 接続した結果を記録する。ホストとゲストで同じ`Terms`から作るので、サイドとdelayは食い違わない。`role`は決まったホストから見た自分の役。
     fn establish(&mut self, role: Role, peer: Peer, t: Terms) {
         let i_sent = self.role == Some(Role::Host);
         let seat = match role {
@@ -695,7 +761,7 @@ impl Handshake {
         });
     }
 
-    /// 受けたパケット。返ったものがあれば、受けた相手へすぐ送る（HELLO_ACK か、ゲストの AGREE の返し）。
+    /// 受けたパケット。返ったものがあれば受けた相手へすぐ送る（HELLO_ACKか、ゲストのAGREEの返答）。
     pub fn on_packet(&mut self, pkt: &Packet, now: u32) -> Option<Message> {
         self.check_timeout(now);
         if let State::Failed(_) = self.state {
@@ -713,8 +779,9 @@ impl Handshake {
                 echo_nonce,
                 role_nonce,
                 public,
+                echo_public,
             } => {
-                self.on_hello_ack(echo_nonce, role_nonce, &public);
+                self.on_hello_ack((echo_nonce, echo_public), (role_nonce, public), now);
                 None
             }
             Message::Agree {
@@ -750,141 +817,204 @@ impl Handshake {
     fn on_hello(&mut self, h: &Hello, now: u32) -> Option<Message> {
         let mine = self.cfg.role_nonce;
         if h.build != self.build {
-            // ビルド番号が違う。HELLO はタグが合っているので、秘密を知る相手が別のビルドで動いている。バージョン違いと同じく、接続前に
-            // 手順をやめて理由を返す。相手への返し（HELLO_ACK など）も出さない（相手は自分の HELLO を受けて同じ理由でやめる。まだ 1 通も出していなければ
-            // `poll_send` が 1 通だけ出す）。
+            // ビルド番号が違う。HELLOはタグが合っているので、秘密の乱数を知る相手が別のビルドで動いている。
+            // バージョン違いと同じく、接続前に手順をやめて理由を返す。
+            // 相手への返答（HELLO_ACKなど）も出さない。相手は自分のHELLOを受けて同じ理由でやめる。まだ1通も出していなければ`poll_send`が1通だけ出す。
             if self.state == State::Connecting {
                 self.state = State::Failed(FailReason::OtherBuild { theirs: h.build });
             }
             return None;
         }
-        // 接続前に、同じ nonce で公開鍵だけ違う HELLO（タグは合っている）は、相手がセッションを作り直した印として新しい公開鍵で覚え直す
-        // （ゲーム内のメニューで取りやめた後に同じ相手のコードを貼り直すとこうなる。捨てると `TIMEOUT_MS` まで相手の便が開かないまま待つ）。
-        // 役割・席・条件も新しい HELLO から決め直す。向きごとの鍵は接続のセッションが `peer_key` の変化で作り直す。接続後は替えない。
-        if let Some(p) = self.peer
-            && self.state == State::Connecting
-            && p.nonce == h.role_nonce
-            && p.public != h.public
-        {
-            if self.retired.contains(&Some(h.public)) {
-                // 遅れて届いた古いセッションの HELLO。最後に受けたものを採る方針でも、手放した鍵へは戻らない（戻すと、相手が新しいセッションの
-                // HELLO を止めた後に古い鍵のまま残る）。食い違いの数にも入れない。
-                self.counters.retired_hello = self.counters.retired_hello.saturating_add(1);
-                return None;
-            }
-            self.retired = [Some(p.public), self.retired[0]];
-            self.peer = None;
-            self.role = None;
-            self.terms = None;
-            self.agree_sent = None;
-            self.forget_pick();
-            // 新しいセッションは自分の HELLO をまだ受けていない（古いセッションが返した HELLO_ACK は新しいセッションの印にならない）。
-            self.got_ack = false;
-            self.hello_sent = None;
-            self.counters.rekeyed = self.counters.rekeyed.saturating_add(1);
-        }
+        let key = (h.role_nonce, h.public);
         match self.peer {
             None => {
                 if h.role_nonce == mine {
-                    // 引き直さずにやめる。引き直すと、自分自身へ送っているときに止まらない。また、引き直す前の HELLO が遅れて届くと、
-                    // 両者が別の組で役割を決め、両方がホストになりうる。
+                    // 生成し直さずにやめる。生成し直すと、自分自身へ送っているときに止まらない。
+                    // また生成し直す前のHELLOが遅れて届くと、両者が別の組み合わせで役割を決めて両方がホストになりうる。
                     self.state = State::Failed(FailReason::SameNonce);
                     return None;
                 }
-                let peer = Peer {
-                    nonce: h.role_nonce,
-                    name: Name::from_hello(h),
-                    latency: h.latency.min(MAX_DELAY),
-                    mode: h.mode,
-                    can_rollback: h.can_rollback,
-                    listable: h.listable,
-                    seat: SeatAsk {
-                        wish: h.seat_wish,
-                        arrival: h.arrival,
-                    },
-                    public: h.public,
-                    pick: h.host_pick,
-                    nat: h.nat,
-                    rollback_delay: h.rollback_delay.min(MAX_DELAY),
-                };
-                self.peer = Some(peer);
-                if h.role_nonce < mine {
-                    self.role = Some(Role::Host);
-                    self.lead_at = Some(now);
-                    // 決め方を使わないなら自分がホストのまま、すぐ決める。使うならゲストの値を待ってから（`poll_send`）。
-                    if !self.pick_active() {
-                        self.terms = Some(self.terms_for(&peer, Pick::NONE));
-                    }
-                    self.agree_sent = None;
+                if self.acked_by.is_some_and(|k| k != key) {
+                    // 今の公開鍵への返答をくれた別の相手がいる。その相手のHELLOを待つ。
+                    self.counters.stale_nonce = self.counters.stale_nonce.saturating_add(1);
+                    return None;
+                }
+                self.adopt(Peer::of_hello(h), now);
+            }
+            Some(p) if p.key() == key => {}
+            Some(p) => {
+                if self.state != State::Connecting {
+                    // 接続後は鍵を替えない（セッションの送信側がその鍵で封じている）ので食い違いとして捨てる。
+                    self.counters.stale_nonce = self.counters.stale_nonce.saturating_add(1);
+                    return None;
+                }
+                if self.acked_by == Some(key) {
+                    // 今の公開鍵への返答をくれた相手のHELLO。先に届いたHELLO（古いセッションのものを送り直されたなど）の相手を手放す。
+                    self.counters.swapped = self.counters.swapped.saturating_add(1);
+                } else if self.kept.iter().flatten().any(|o| o.key() == key) {
+                    // 遅れて届いた古いセッションのHELLO。手放した相手へはHELLOでは戻らない。
+                    // 戻すと、相手が新しいセッションのHELLOを止めた後に古い鍵のまま残る。
+                    // 食い違いの数にも加えない。
+                    self.counters.retired_hello = self.counters.retired_hello.saturating_add(1);
+                    return None;
+                } else if p.nonce != h.role_nonce || self.acked_by.is_some_and(|k| k != p.key()) {
+                    // 違うnonce（相手の再起動・自分のHELLOの跳ね返りなど）か、今の公開鍵への返答をくれた別の相手を待っている。
+                    // 返答も出さない（出すと相手が別の組み合わせで役割を決めうる）。
+                    // 違うnonceの相手が今のセッションの相手なら、自分のHELLOに返すHELLO_ACKでここを通れるようになる。
+                    self.counters.stale_nonce = self.counters.stale_nonce.saturating_add(1);
+                    return None;
                 } else {
-                    self.role = Some(Role::Guest);
+                    // 同じnonceで公開鍵だけ違う。相手がセッションを作り直した印として新しい公開鍵で覚え直す。
+                    // ゲーム内のメニューで取りやめた後に同じ相手のコードを貼り直すとこうなる。
+                    // 捨てると`TIMEOUT_MS`まで相手のパケットを開けないまま待つ。
+                    // 古いセッションのHELLOを送り直されたのなら、今の相手が自分のHELLOに返すHELLO_ACKで戻る（`on_hello_ack`）。
+                    self.counters.rekeyed = self.counters.rekeyed.saturating_add(1);
+                }
+                self.adopt(Peer::of_hello(h), now);
+                if !self.got_ack {
+                    // 新しい相手は自分のHELLOをまだ受けていない（前の相手が返したHELLO_ACKは新しい相手の印にならない）。
+                    self.hello_sent = None;
                 }
             }
-            Some(p) if p.nonce != h.role_nonce || p.public != h.public => {
-                // 決めた後に違う nonce が来た（相手の再起動・自分の HELLO の跳ね返り、など）。それ以上しない。返しも出さない
-                // （出すと相手が別の組で役割を決めうる）。同じ nonce で公開鍵だけ違うものは、接続前なら上で覚え直している
-                // （ここへ来るのは接続後だけ）。接続後は鍵を替えない（セッションの送信側がその鍵で封じている）ので、食い違いとして捨てる。
-                self.counters.stale_nonce = self.counters.stale_nonce.saturating_add(1);
-                return None;
-            }
-            Some(_) => {}
         }
         if !self.got_ack {
-            // 即送り（自分の HELLO を相手へ）: 相手の HELLO が届いた = 相手はいま受けられるのに、自分の HELLO はまだ届いていないかもしれない。遅れて始めた相手にはそれまでの HELLO が全部落ちている
-            // ので、20 ms の間隔を待つと相手は役割を決められず、その間の AGREE を捨て続ける（片道が 20 ms より短い LAN ほど効く）。増える送信は、ack が届くまで相手の HELLO
-            // 1 通につき 1 通まで。同じ ms にもう HELLO を出していれば出し直さない（受信リングに溜まった相手の HELLO を 1 度に渡されたとき、1 通ごとに出すと相手の受信リング（64 枠）を溢れさせた）。
+            // 即送り（自分のHELLOを相手へ）: 相手のHELLOが届いたので、相手はいま受信できる。しかし自分のHELLOはまだ届いていないかもしれない。
+            // 遅れて始めた相手にはそれまでのHELLOが全部落ちている。
+            // そのため20 msの間隔を待つと、相手は役割を決められずその間のAGREEを捨て続ける（片道が20 msより短いLANほど効く）。
+            // 増える送信は、ackが届くまで相手のHELLO 1通につき1通まで。
+            // 同じmsにもうHELLOを出していれば出し直さない。
+            // 受信リングに溜まった相手のHELLOを1度に渡されたとき、1通ごとに出すと相手の受信リング（64枠）を溢れさせた。
             if self.hello_sent != Some(now) {
                 self.hello_sent = None;
             }
         }
-        // 接続後も返す。相手は自分の HELLO_ACK が届くまで HELLO を送り続けている。
+        // 接続後も返す。相手は自分のHELLO_ACKが届くまでHELLOを送り続けている。
         Some(Message::HelloAck {
             echo_nonce: h.role_nonce,
             role_nonce: mine,
             public: self.public,
+            echo_public: h.public,
         })
     }
 
-    fn on_hello_ack(&mut self, echo: u64, their: u64, public: &[u8; PUBLIC_LEN]) {
-        if echo != self.cfg.role_nonce {
+    /// `peer`を役割を決めた相手にする（前の相手は`kept`へ移す）。役割・サイド・条件は新しい相手の値で決め直す。
+    /// 向きごとの鍵は接続のセッションが`peer_key`の変化で作り直す。
+    fn adopt(&mut self, peer: Peer, now: u32) {
+        let key = peer.key();
+        let mut kept = [None; KEPT_PEERS];
+        let mut slots = kept.iter_mut();
+        if let Some(old) = self.peer.replace(peer) {
+            if self.acked_by == Some(old.key()) {
+                self.acked_by = None;
+            }
+            if let Some(s) = slots.next() {
+                *s = Some(old);
+            }
+        }
+        for o in self.kept.iter().flatten().filter(|o| o.key() != key) {
+            if let Some(s) = slots.next() {
+                *s = Some(*o);
+            }
+        }
+        self.kept = kept;
+        self.role = None;
+        self.terms = None;
+        self.agree_sent = None;
+        self.forget_pick();
+        self.got_ack = self.acked_by == Some(key);
+        if peer.nonce < self.cfg.role_nonce {
+            self.role = Some(Role::Host);
+            self.lead_at = Some(now);
+            // 決め方を使わないなら自分がホストのままですぐ決める。使うならゲストの値を待ってから決める（`poll_send`）。
+            if !self.pick_active() {
+                self.terms = Some(self.terms_for(&peer, Pick::NONE));
+            }
+        } else {
+            self.role = Some(Role::Guest);
+        }
+    }
+
+    /// 自分のHELLOへの今のセッションの返答かどうか（返ったrole_nonceと公開鍵が自分の今の値）。
+    /// 役割の乱数はメニューを開いている間は同じなので、公開鍵（セッションごとに生成する）まで比べないと前のセッションへの返答を見分けられない。
+    pub fn is_fresh_ack(&self, echo_nonce: u64, echo_public: &[u8; PUBLIC_LEN]) -> bool {
+        echo_nonce == self.cfg.role_nonce && *echo_public == self.public
+    }
+
+    fn on_hello_ack(
+        &mut self,
+        (echo, echo_public): (u64, [u8; PUBLIC_LEN]),
+        key: PeerKey,
+        now: u32,
+    ) {
+        if !self.is_fresh_ack(echo, &echo_public) {
             self.counters.wrong_echo = self.counters.wrong_echo.saturating_add(1);
             return;
         }
         if let Some(p) = self.peer
-            && (p.nonce != their || p.public != *public)
+            && p.key() != key
         {
-            // 自分の HELLO には返っているが、役割を決めた相手とは別の nonce。その相手が自分の HELLO を受けた印にはならないので、
-            // HELLO をやめない。
+            // 自分の今のHELLOには返答が来ているが、役割を決めた相手とは別の相手。
+            // 役割を決めた相手がもう返答している（`got_ack`）か接続後なら、先に決めた方を採る。
+            // まだなら、返答してきた方が今のセッションの相手になる。手放した相手ならすぐ戻し、知らない相手ならそのHELLOを待つ。
+            if self.state == State::Connecting && !self.got_ack {
+                self.acked_by = Some(key);
+                if let Some(o) = self.kept.iter().flatten().find(|o| o.key() == key).copied() {
+                    self.counters.swapped = self.counters.swapped.saturating_add(1);
+                    self.adopt(o, now);
+                    return;
+                }
+            }
             self.counters.stale_nonce = self.counters.stale_nonce.saturating_add(1);
             return;
         }
-        // 役割を決める前の HELLO_ACK でも HELLO はやめてよい。相手は自分の HELLO_ACK が届くまで HELLO を送り続けるので、
-        // 役割はそれで決まる。
-        self.got_ack = true;
+        // 役割を決める前のHELLO_ACKではHELLOをやめない（`got_ack`は相手のHELLOで役割を決めたとき`adopt`で立つ）。
+        // 返答した相手が取りやめて同じnonce・新しい鍵で始め直すと、そのHELLOは`acked_by`と食い違うので返答しない。
+        // そのため自分のHELLOが届かないと、新しい相手は返答を作れない。
+        self.acked_by = Some(key);
+        self.got_ack = self.peer.is_some();
+    }
+
+    /// 候補にも学んだ送り元にも無いアドレスから来たHELLOに、そのアドレスへ1回だけ返すもの（自分のHELLOと、取りまとめ役ならAGREE）。
+    /// 送った時刻は記録しない（候補へ送る間隔を動かさない）。
+    /// そのアドレスを覚えるのは、相手が今のセッションのHELLO_ACKを返してから（接続のセッション`link.rs`）。
+    pub fn answer_unlisted(&self) -> Outbox {
+        let mut out = Outbox::default();
+        if self.state != State::Connecting {
+            return out;
+        }
+        if !self.got_ack {
+            out.hello = Some(self.hello());
+        }
+        if self.role == Some(Role::Host)
+            && let Some(t) = self.terms
+        {
+            out.agree = Some(Self::agree(t));
+        }
+        out
     }
 
     fn on_agree(&mut self, got: Terms) -> Option<Message> {
         let (Some(role), Some(peer)) = (self.role, self.peer) else {
-            // ゲストは役割を決める前の AGREE を捨てる。ホストが送り直すので、HELLO が届いた後の AGREE で決まる。
+            // ゲストは役割を決める前のAGREEを捨てる。ホストが送り直すのでHELLOが届いた後のAGREEで決まる。
             self.counters.agree_early = self.counters.agree_early.saturating_add(1);
             return None;
         };
         match role {
             Role::Guest => {
                 if !self.pick_ok(&peer, &got.pick) {
-                    // どちらがホストかが食い違うと、両者がホスト（かゲスト）のまま接続する。モード・席より先に見る（席は決まったホストで変わる）。
+                    // どちらがホストかが食い違うと両者がホスト（かゲスト）のまま接続する。モード・サイドより先に見る（サイドは決まったホストで変わる）。
                     self.counters.agree_bad_pick = self.counters.agree_bad_pick.saturating_add(1);
                     return None;
                 }
                 let able = self.can_rollback && peer.can_rollback;
                 if got.mode != agreed_mode(self.wish.mode, peer.mode, able) {
-                    // 両者の望むモードから決まるモードと違う。値の比べ（下）より先に見る: 最初の AGREE でこれを受けて接続すると、
-                    // ホストの側の決まりと語の使い方が食い違う。
+                    // 両者の望むモードから決まるモードと違う。値の比較（下）より先に見る。
+                    // 最初のAGREEでこれを受けて接続すると、ホストの側の決まりとワードの使い方が食い違うため。
                     self.counters.agree_bad_mode = self.counters.agree_bad_mode.saturating_add(1);
                     return None;
                 }
                 if got.host_seat != self.host_seat_for(&peer, !got.pick.host_is_sender) {
-                    // 両者の席の希望から決まる席と違う。モードと同じく値の比べより先に見る。
+                    // 両者のサイドの希望から決まるサイドと違う。モードと同じく値の比較より先に見る。
                     self.counters.agree_bad_seat = self.counters.agree_bad_seat.saturating_add(1);
                     return None;
                 }
@@ -899,14 +1029,14 @@ impl Handshake {
                         self.establish(me, peer, got);
                     }
                     Some(t) if t != got => {
-                        // 最初と違う値に返すと、ホストは違う値で接続しうる。捨てて数える。
+                        // 最初と違う値に返答するとホストは違う値で接続しうる。捨てて数える。
                         self.counters.agree_mismatch =
                             self.counters.agree_mismatch.saturating_add(1);
                         return None;
                     }
                     Some(_) => {}
                 }
-                // 返しは最初の値で、接続後も続ける（ホストへの返しが落ちたとき）。
+                // 返答は最初の値で返す。接続後も続ける（ホストへの返答が落ちたとき）。
                 Some(Self::agree(got))
             }
             Role::Host => {
@@ -919,7 +1049,7 @@ impl Handshake {
                         };
                         self.establish(me, peer, got);
                     } else {
-                        // 送った値と違う返しで接続すると、両者の席か delay が食い違う。
+                        // 送った値と違う返答で接続すると両者のサイドかdelayが食い違う。
                         self.counters.agree_mismatch =
                             self.counters.agree_mismatch.saturating_add(1);
                     }
@@ -933,9 +1063,9 @@ impl Handshake {
         self.check_timeout(now);
         let mut out = Outbox::default();
         if let State::Failed(r) = self.state {
-            // バージョン違い・ビルド違いで断ったが自分の HELLO をまだ 1 通も出していない（相手の HELLO が最初の送りより先に届いた）なら、
-            // 1 通だけ出す。出さないと相手は断った理由を知らないまま 10 秒の時間切れになる。
-            // 相手の HELLO は相手の側で断られるので、手順は進まない。
+            // バージョン違い・ビルド違いで断ったが自分のHELLOをまだ1通も出していない（相手のHELLOが最初の送信より先に届いた）なら、1通だけ出す。
+            // 出さないと、相手は断った理由を知らないまま10秒の時間切れになる。
+            // 相手のHELLOは相手の側で断られるので手順は進まない。
             if matches!(
                 r,
                 FailReason::OtherVersion { .. } | FailReason::OtherBuild { .. }
@@ -964,8 +1094,8 @@ impl Handshake {
         out
     }
 
-    /// ホストの決め方の時計（接続する前・AGREE の値を決める前だけ）。取りまとめ役は、ゲストの値と自分の列が揃うか待つ上限が過ぎたら決める。
-    /// ゲストは、列を締めたら測った値を AGREE が届くまで送り直す。
+    /// ホストの決め方の時計（接続する前・AGREEの値を決める前だけ）。取りまとめ役は、ゲストの値と自分の列が揃うか待つ上限が過ぎたら決める。
+    /// ゲストは列を締めたら測った値をAGREEが届くまで送り直す。
     fn poll_pick(&mut self, now: u32, out: &mut Outbox) {
         let (Some(role), Some(peer)) = (self.role, self.peer) else {
             return;
@@ -1012,8 +1142,9 @@ impl Handshake {
 
 #[cfg(test)]
 mod tests {
-    //! 部品の検査（1 台に手でパケットを渡す）と、2 台の模型（1 ms 単位の時計・方向ごとの送達の列）。模型では送るものを必ず
-    //! `encode` → `decode` に通す。台 0 と台 1 の役割は nonce で決まるので、どちらがホストかを台の番号と揃えない筋も含める。
+    //! 部品の検査（1台に手でパケットを渡す）と2台の模型（1 ms単位の時計・方向ごとの送達の列）。
+    //! 模型では送るものを必ず`encode` → `decode`に通す。
+    //! 台0と台1の役割はnonceで決まるので、どちらがホストかを台の番号と揃えない筋も含める。
 
     use super::*;
     use crate::wire::{self, MAX_DATAGRAM, Message};
@@ -1041,7 +1172,7 @@ mod tests {
         wire::decode(&tkey(), Some(&tdir().opener()), bytes)
     }
 
-    /// 検査用の決まった乱数（splitmix64。`selection.rs` の検査のモジュールの中のものは使えないので書き直した）。
+    /// 検査用の決まった乱数（splitmix64。`selection.rs`の検査のモジュールの中のものは使えないので書き直した）。
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -1139,7 +1270,7 @@ mod tests {
     #[test]
     fn mode_is_rollback_only_when_both_wish_it() {
         use Mode::{Delay as Dl, Rollback as Rb};
-        // (ホストの望み, ゲストの望み, 決まるモード, AGREE の delay の欄)。ホスト: latency 2・D 3、ゲスト: latency 7・D 5。
+        // (ホストの望み, ゲストの望み, 決まるモード, AGREEのdelayのフィールド)。ホスト: latency 2・D 3、ゲスト: latency 7・D 5。
         let table = [
             (Rb, Rb, Rb, 3u8),
             (Rb, Dl, Dl, 7),
@@ -1292,8 +1423,8 @@ mod tests {
         assert!(!a.can_rollback());
     }
 
-    /// 観戦の許可の印は、ホストとゲストの 4 通りのうち両者が立てたときだけ両方の `may_list` が真になる。
-    /// 名乗りは HELLO の bit2 で運び、相手の印を自分の印で置き換えない（ホストだけ・ゲストだけでは決まらない）。
+    /// 観戦の許可のフラグは、ホストとゲストの4通りのうち両者が立てたときだけ両方の`may_list`が真になる。
+    /// 名乗りはHELLOのbit2で運ぶ。相手のフラグを自分のフラグで置き換えない（ホストだけ・ゲストだけでは決まらない）。
     #[test]
     fn may_list_needs_both_hellos_to_allow_listing() {
         for (host_on, guest_on) in [(true, true), (true, false), (false, true), (false, false)] {
@@ -1327,7 +1458,7 @@ mod tests {
                 assert_eq!(e.may_list, host_on && guest_on, "{tag} {who}");
             }
         }
-        // HELLO を出した後は変えない（相手が覚えた名乗りと食い違う）。
+        // HELLOを出した後は変えない（相手が覚えた名乗りと食い違う）。
         let mut a = Handshake::new(cfg(900, 2, "A"), 0);
         a.set_listable(true);
         assert!(a.poll_send(0).hello.is_some());
@@ -1347,7 +1478,7 @@ mod tests {
 
     #[test]
     fn a_peer_without_mode_bits_gets_a_delay_agree() {
-        // +3 が 0 の HELLO（delay 方式を望み、rollback ができない）。golden は wire.rs。
+        // +3が0のHELLO（delay方式を望み、rollbackができない）。goldenはwire.rs。
         let mut buf = [0u8; wire::MAX_DATAGRAM];
         let n = wire::encode(
             &tkey(),
@@ -1524,7 +1655,7 @@ mod tests {
         }
     }
 
-    /// 決め方を使う HELLO（回線の型 `nat`）。
+    /// 決め方を使うHELLO（ネットワーク種別のフラグ`nat`）。
     fn hello_pick(nonce: u64, nat: NatMark) -> Message {
         let Message::Hello(mut h) = hello_of(nonce, 2, "p") else {
             unreachable!("HELLO を作った");
@@ -1543,7 +1674,7 @@ mod tests {
         }
     }
 
-    /// ゲスト（nonce 100、回線の型はシンメトリックでない）が、取りまとめ役（nonce 900、シンメトリック）の列を 2 ms ごとに受けて測り終えた形。
+    /// ゲスト（nonce 100。ネットワーク種別はシンメトリックでない）が取りまとめ役（nonce 900。シンメトリック）の列を2 msごとに受けて測り終えた形。
     fn measured_guest() -> (Handshake, u32) {
         use crate::nat::Symmetry;
         let mut g = Handshake::new(cfg(100, 2, "guest"), 0);
@@ -1564,7 +1695,7 @@ mod tests {
         use crate::nat::Symmetry;
         let (_, up) = measured_guest();
         let (sym, open) = (nat_of(Symmetry::Yes), nat_of(Symmetry::No));
-        // 正しい形: 取りまとめ役はシンメトリックなので、ゲスト（受け手）がホスト。
+        // 正しい形: 取りまとめ役はシンメトリックなのでゲスト（受け手）がホスト。
         let good = Pick {
             host_is_sender: false,
             sender_up: up,
@@ -1615,7 +1746,7 @@ mod tests {
             assert_eq!(g.counters().agree_bad_pick, 1, "{tag}");
             assert_eq!(g.state(), State::Connecting, "{tag}");
         }
-        // 効く期間: 正しい形は通り、ゲストがホストになる。席はホスト（自分）の希望の 1P。
+        // 効く期間: 正しい形は通り、ゲストがホストになる。サイドはホスト（自分）の希望の1P。
         let (mut g, _) = measured_guest();
         assert!(g.on_packet(&pkt(agree_pick(Seat::P1, good)), 40).is_some());
         let State::Established(e) = g.state() else {
@@ -1623,7 +1754,7 @@ mod tests {
         };
         assert_eq!((e.role, e.seat), (Role::Host, Seat::P1));
         assert_eq!(g.counters().agree_bad_pick, 0);
-        // 値の便が届かなかった（送り手の上り 0）形も、値から決まるホストなら通る（ここでも NAT で受け手）。
+        // 値を運ぶパケットが届かなかった（送り手の上り0）形でも、値から決まるホストなら通る（ここでもNATで受け手）。
         let (mut g, _) = measured_guest();
         let lost = Pick {
             sender_up: 0,
@@ -1659,7 +1790,7 @@ mod tests {
         h.set_host_pick(Some(host_pick::Setup::new(open)));
         h.on_packet(&pkt(hello_pick(100, open)), 10);
         assert_eq!(h.poll_send(10).agree, None, "値が揃う前に AGREE を出した");
-        // 相手の列（1,200 B を 10 ms ごと = 120,000 B/s）。
+        // 相手の列（1,200 Bを10 msごと = 120,000 B/s）。
         for s in 0..host_pick::PROBE_COUNT {
             h.on_probe(s, 20_000 + u64::from(s) * 10_000, 20 + 10 * u32::from(s));
         }
@@ -1688,7 +1819,7 @@ mod tests {
             panic!("AGREE の送り直し");
         };
         assert_eq!(again, pick);
-        // 値が来なければ待つ上限で決める（受けた時刻から REPORT_WAIT_MS）。
+        // 値が来なければ待つ上限で決める（受けた時刻からREPORT_WAIT_MS）。
         let mut h = Handshake::new(cfg(900, 2, "host"), 0);
         h.set_host_pick(Some(host_pick::Setup::new(open)));
         h.on_packet(&pkt(hello_pick(100, open)), 10);
@@ -1703,8 +1834,9 @@ mod tests {
         );
     }
 
-    /// 取りまとめ役が値を決めた後に AGREE が落ち、両者が時間切れで作り直した: ゲストは食い違い（別の nonce の HELLO）を見たので
-    /// 最初から（Fresh）、取りまとめ役は値を引き継いで（Resume）。ゲストは測り直す前でも、前の値で決めた AGREE を採って接続する。
+    /// 取りまとめ役が値を決めた後にAGREEが落ち、両者が時間切れで作り直した。
+    /// ゲストは食い違い（別のnonceのHELLO）を見たので最初から作り直し（Fresh）、取りまとめ役は値を引き継ぐ（Resume）。
+    /// ゲストは測り直す前でも、前の値で決めたAGREEを採って接続する。
     /// ゲストは作り直した後も決め方を名乗る。
     #[test]
     fn a_fresh_guest_accepts_the_values_a_resumed_coordinator_kept() {
@@ -1733,7 +1865,7 @@ mod tests {
             pick.sender_up > 0,
             "効く期間: AGREE にゲストの値が載っている"
         );
-        // AGREE は落ちる。ゲストは別の nonce の HELLO を受ける（食い違い）。
+        // AGREEは落ちる。ゲストは別のnonceのHELLOを受ける（食い違い）。
         g.on_packet(&pkt(hello_pick(555, open)), 40);
         let t = TIMEOUT_MS + 1;
         h.expire(t);
@@ -1760,7 +1892,7 @@ mod tests {
         assert_eq!(g.counters().agree_bad_pick, 0);
     }
 
-    /// 同じ nonce で公開鍵だけ違う HELLO（相手がセッションを作り直した）で、列・測った値・PROBE を送ったかを捨てる。
+    /// 同じnonceで公開鍵だけ違うHELLO（相手がセッションを作り直した）で、列・測った値・PROBEを送ったかどうかを捨てる。
     #[test]
     fn a_rekeyed_peer_starts_the_probe_train_over() {
         use crate::nat::Symmetry;
@@ -1890,7 +2022,7 @@ mod tests {
         let s32 = "abcdefghijklmnopqrstuvwxyz012345";
         assert_eq!(Name::new(s32).as_str(), s32);
         assert_eq!(Name::new("").as_bytes(), b"");
-        // 詰めた名前は相手の decode を通る（途中で切ると UTF-8 でなくなり HELLO ごと捨てられる）。
+        // 詰めた名前は相手のdecodeを通る（途中で切るとUTF-8でなくなりHELLOごと捨てられる）。
         let p = pkt(Handshake::new(cfg(1, 0, s), 0).hello());
         assert!(matches!(p.msg, Message::Hello(h) if h.name_len == 30));
     }
@@ -1901,11 +2033,13 @@ mod tests {
         let mut sent = Vec::new();
         for t in 1000..1070 {
             if t == 1045 {
+                assert!(a.on_packet(&pkt(hello_of(7, 3, "B")), t).is_some());
                 let r = a.on_packet(
                     &pkt(Message::HelloAck {
                         echo_nonce: 100,
                         role_nonce: 7,
                         public: [0; PUBLIC_LEN],
+                        echo_public: [0; PUBLIC_LEN],
                     }),
                     t,
                 );
@@ -1939,6 +2073,7 @@ mod tests {
                 echo_nonce: 500,
                 role_nonce: 100,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             }),
             11,
         );
@@ -2014,6 +2149,7 @@ mod tests {
                 echo_nonce: 100,
                 role_nonce: 900,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             })
         );
         assert_eq!(h.coordinator(), Some(true));
@@ -2081,7 +2217,7 @@ mod tests {
         let before = g.state();
         assert_eq!(g.on_packet(&pkt(agree_of(Seat::P1, 5)), 3), None);
         assert_eq!(g.on_packet(&pkt(agree_of(Seat::P2, 6)), 4), None);
-        // 席の違う AGREE は、最初の値と比べる前に「両者の希望から決まる席と違う」（`agree_bad_seat`）で落ちる。
+        // サイドの違うAGREEは、最初の値と比べる前に「両者の希望から決まるサイドと違う」（`agree_bad_seat`）で落ちる。
         // どちらで落ちても返さず・値を変えないのは同じ。
         assert_eq!(g.counters().agree_mismatch, 1);
         assert_eq!(g.counters().agree_bad_seat, 1);
@@ -2105,6 +2241,7 @@ mod tests {
                     echo_nonce: 900,
                     role_nonce: 100,
                     public: [0; PUBLIC_LEN],
+                    echo_public: [0; PUBLIC_LEN],
                 })
             );
             assert_eq!(
@@ -2141,6 +2278,7 @@ mod tests {
                         echo_nonce: 500,
                         role_nonce: 100,
                         public: [0; PUBLIC_LEN],
+                        echo_public: [0; PUBLIC_LEN],
                     }
                 ),
                 1
@@ -2162,6 +2300,7 @@ mod tests {
                 echo_nonce: 500,
                 role_nonce: 9999,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             }),
             4,
         );
@@ -2170,6 +2309,7 @@ mod tests {
                 echo_nonce: 501,
                 role_nonce: 100,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             }),
             4,
         );
@@ -2181,6 +2321,7 @@ mod tests {
                 echo_nonce: 500,
                 role_nonce: 100,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             }),
             41,
         );
@@ -2211,6 +2352,7 @@ mod tests {
                 echo_nonce: 500,
                 role_nonce: 100,
                 public: p1,
+                echo_public: [0xA0; PUBLIC_LEN],
             }),
             3,
         );
@@ -2290,6 +2432,169 @@ mod tests {
         assert_eq!((c.rekeyed, c.stale_nonce, c.retired_hello), (0, 1, 0));
     }
 
+    /// 今のセッションの自分のHELLOへの返答（自分のnonceと公開鍵`mine`を返す）。
+    fn fresh_ack(
+        echo: u64,
+        mine: [u8; PUBLIC_LEN],
+        their: u64,
+        public: [u8; PUBLIC_LEN],
+    ) -> Message {
+        Message::HelloAck {
+            echo_nonce: echo,
+            role_nonce: their,
+            public,
+            echo_public: mine,
+        }
+    }
+
+    #[test]
+    fn an_earlier_sessions_hello_that_arrived_first_gives_way_to_the_peer_that_answers_the_current_hello()
+     {
+        let me = [0xA0u8; PUBLIC_LEN];
+        let (old, live) = ([1u8; PUBLIC_LEN], [2u8; PUBLIC_LEN]);
+        let mut a = Handshake::new(cfg(500, 2, "A"), 0);
+        a.set_public(me);
+        assert!(
+            a.on_packet(&pkt(hello_pub(100, 2, "old", old)), 1)
+                .is_some()
+        );
+        assert_eq!(a.peer_key(), Some((100, old)));
+        assert_eq!(a.on_packet(&pkt(hello_pub(101, 4, "live", live)), 2), None);
+        assert!(
+            a.poll_send(25).hello.is_some(),
+            "古い相手の返しが無いのに HELLO を止めた"
+        );
+        a.on_packet(&pkt(fresh_ack(500, me, 101, live)), 26);
+        assert_eq!(
+            a.peer_key(),
+            Some((100, old)),
+            "HELLO を受ける前に取り替えた"
+        );
+        let r = a.on_packet(&pkt(hello_pub(101, 4, "live", live)), 27);
+        assert!(
+            matches!(
+                r,
+                Some(Message::HelloAck {
+                    echo_nonce: 101,
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert_eq!(a.peer_key(), Some((101, live)));
+        assert_eq!(a.counters().swapped, 1);
+        assert!(
+            a.poll_send(60).hello.is_none(),
+            "返しを受けた相手なのに HELLO を続けた"
+        );
+        assert_eq!(a.on_packet(&pkt(hello_pub(100, 2, "old", old)), 61), None);
+        assert_eq!(a.peer_key(), Some((101, live)));
+        assert_eq!(a.counters().retired_hello, 1);
+        a.on_packet(&pkt(agree_of(Seat::P1, 4)), 62);
+        assert!(matches!(a.state(), State::Established(e) if e.peer_name.as_str() == "live"));
+    }
+
+    #[test]
+    fn an_old_key_replayed_after_the_live_one_is_undone_by_the_live_peers_answer() {
+        let me = [0xA0u8; PUBLIC_LEN];
+        let (old, live) = ([1u8; PUBLIC_LEN], [2u8; PUBLIC_LEN]);
+        let mut g = Handshake::new(cfg(100, 2, "G"), 0);
+        g.set_public(me);
+        g.on_packet(&pkt(hello_pub(900, 2, "live", live)), 1);
+        g.on_packet(&pkt(fresh_ack(100, me, 900, live)), 2);
+        assert!(
+            g.on_packet(&pkt(hello_pub(900, 2, "old", old)), 3)
+                .is_some()
+        );
+        assert_eq!(
+            g.peer_key(),
+            Some((900, old)),
+            "同じ nonce の新しい鍵は今までどおり覚え直す"
+        );
+        assert!(
+            g.poll_send(3).hello.is_some(),
+            "覚え直した相手へ HELLO を出し直さない"
+        );
+        g.on_packet(&pkt(fresh_ack(100, me, 900, live)), 4);
+        assert_eq!(g.peer_key(), Some((900, live)), "今の相手の返しで戻さない");
+        assert_eq!(g.counters().swapped, 1);
+        for t in 5..9 {
+            assert_eq!(g.on_packet(&pkt(hello_pub(900, 2, "old", old)), t), None);
+        }
+        assert_eq!(g.peer_key(), Some((900, live)));
+        assert_eq!(
+            g.on_packet(&pkt(agree_of(Seat::P1, 2)), 10),
+            Some(agree_of(Seat::P1, 2))
+        );
+        assert!(matches!(g.state(), State::Established(e) if e.peer_name.as_str() == "live"));
+    }
+
+    #[test]
+    fn an_answer_to_an_earlier_session_key_neither_stops_hello_nor_picks_a_peer() {
+        let me = [0xA0u8; PUBLIC_LEN];
+        let mut a = Handshake::new(cfg(500, 2, "A"), 0);
+        a.set_public(me);
+        a.on_packet(
+            &pkt(fresh_ack(500, [0xA1; PUBLIC_LEN], 100, [1; PUBLIC_LEN])),
+            1,
+        );
+        assert_eq!(a.counters().wrong_echo, 1);
+        assert!(a.poll_send(1).hello.is_some());
+        assert!(
+            a.on_packet(&pkt(hello_pub(101, 2, "C", [3; PUBLIC_LEN])), 2)
+                .is_some()
+        );
+        assert_eq!(a.peer_key(), Some((101, [3; PUBLIC_LEN])));
+    }
+
+    #[test]
+    fn an_answer_that_arrives_before_the_peers_hello_does_not_stop_hello() {
+        let me = [0xA0u8; PUBLIC_LEN];
+        let (k1, k2) = ([1u8; PUBLIC_LEN], [2u8; PUBLIC_LEN]);
+        let mut a = Handshake::new(cfg(500, 2, "A"), 0);
+        a.set_public(me);
+        assert!(a.poll_send(0).hello.is_some());
+        // B1の返答だけが届き、B1のHELLOは落ちた。その後Bが取りやめて同じnonce・新しい鍵で始め直した。
+        a.on_packet(&pkt(fresh_ack(500, me, 100, k1)), 5);
+        assert!(
+            a.poll_send(20).hello.is_some(),
+            "相手が決まる前に HELLO を止めた"
+        );
+        assert_eq!(a.on_packet(&pkt(hello_pub(100, 2, "B2", k2)), 21), None);
+        assert_eq!(a.peer_key(), None);
+        assert!(a.poll_send(40).hello.is_some());
+        a.on_packet(&pkt(fresh_ack(500, me, 100, k2)), 41);
+        assert!(a.on_packet(&pkt(hello_pub(100, 2, "B2", k2)), 42).is_some());
+        assert_eq!(a.peer_key(), Some((100, k2)));
+        let o = a.poll_send(60);
+        assert!(o.hello.is_none(), "返した相手が決まった後も HELLO を続けた");
+        let agree = o.agree.expect("取りまとめ役は AGREE を送る");
+        a.on_packet(&pkt(agree), 61);
+        assert!(matches!(a.state(), State::Established(e) if e.peer_name.as_str() == "B2"));
+    }
+
+    #[test]
+    fn while_waiting_for_the_peer_that_answered_no_other_hello_is_taken() {
+        let me = [0u8; PUBLIC_LEN];
+        let (k, other) = ([5u8; PUBLIC_LEN], [6u8; PUBLIC_LEN]);
+        let mut a = Handshake::new(cfg(500, 2, "A"), 0);
+        a.on_packet(&pkt(fresh_ack(500, me, 100, k)), 1);
+        assert_eq!(a.on_packet(&pkt(hello_pub(101, 2, "X", other)), 2), None);
+        assert_eq!(a.on_packet(&pkt(hello_pub(100, 2, "X", other)), 3), None);
+        assert_eq!(a.peer_key(), None);
+        assert!(a.on_packet(&pkt(hello_pub(100, 2, "K", k)), 4).is_some());
+        assert_eq!(a.peer_key(), Some((100, k)));
+        let mut b = Handshake::new(cfg(500, 2, "B"), 0);
+        b.on_packet(&pkt(hello_pub(100, 2, "old", [1; PUBLIC_LEN])), 1);
+        b.on_packet(&pkt(fresh_ack(500, me, 101, k)), 2);
+        assert_eq!(
+            b.on_packet(&pkt(hello_pub(100, 2, "old2", other)), 3),
+            None,
+            "返しをくれた相手を待つ間に、同じ nonce の別の鍵へ覚え直した"
+        );
+        assert_eq!(b.peer_key(), Some((100, [1; PUBLIC_LEN])));
+    }
+
     #[test]
     fn timeout_at_10s_and_silent_after() {
         let mut a = Handshake::new(cfg(500, 2, "A"), 50);
@@ -2314,6 +2619,7 @@ mod tests {
                 echo_nonce: 100,
                 role_nonce: 500,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             })
         );
         assert_eq!(
@@ -2354,6 +2660,7 @@ mod tests {
                 echo_nonce: 900,
                 role_nonce: 100,
                 public: [0; PUBLIC_LEN],
+                echo_public: [0; PUBLIC_LEN],
             }),
             6,
         );
@@ -2457,7 +2764,7 @@ mod tests {
         nth: u32,
     }
 
-    /// 筋書きが返す遅れの列の数だけ届く（空 = 落とす、2 つ = 重ねる、遅れの違い = 入れ替える）。
+    /// 筋書きが返す遅れの列の数だけ届く（空 = 落とす、2つ = 重ねる、遅れの違い = 入れ替える）。
     type Fate<'a> = dyn FnMut(Ctx) -> Vec<u32> + 'a;
 
     struct NodeCfg {
@@ -2545,8 +2852,8 @@ mod tests {
         }
     }
 
-    /// 1 ms ずつ: 届いたものを台へ渡す（台の返しはすぐ相手へ送る）→ 始める時刻の台を作る → 両台が `poll_send`。
-    /// `stop_after` は、両台が接続してからこの ms だけ回して止める（返しが続くことも見るため）。
+    /// 1 msずつ: 届いたものを台へ渡す（台の返答はすぐ相手へ送る）→ 始める時刻の台を作る → 両台が`poll_send`。
+    /// `stop_after`は、両台が接続してからこのmsだけ回して止める（返答が続くことも見るため）。
     fn run(
         cfgs: [NodeCfg; 2],
         end: u32,
@@ -2614,8 +2921,8 @@ mod tests {
         })
     }
 
-    /// 合格の不変量: 両者が接続し、役割が逆、席が食い違わない（host_seat はホストが設定した値で両者に同じ届き、
-    /// ゲストが設定した host_seat は使われない）、delay が同じで希望の大きい方、名前と希望 latency が入れ違いで届く。
+    /// 合格の不変量は次の通り: 両者が接続している・役割が逆・サイドが食い違わない・delayが同じで希望の大きい方・名前と希望latencyが入れ違いで届く。
+    /// サイドが食い違わないとは、host_seatはホストが設定した値が両者に同じく届き、ゲストが設定したhost_seatは使われないこと。
     fn check_pair(cfgs: &[Config; 2], out: &[NodeOut; 2]) -> Result<(), String> {
         let mut es = [None, None];
         for i in 0..2 {
@@ -2680,9 +2987,11 @@ mod tests {
 
     #[test]
     fn table_simultaneous_start() {
-        // 片道 7 ms、両者 t=0 に始める（手で追った期待値）。7: 両者が相手の HELLO を受けて HELLO_ACK を返し、未 ack なので即送りで HELLO。台 0（nonce が大きい）は
-        // ホストに決めて同じ poll_send で AGREE（以後 4 ms ごとに送り直し）。14: 台 1 が接続して返す（1 往復）。21: 台 0 が返し(14) で接続する（1.5 往復）。
-        // 両者とも ack 済みなので 27 の HELLO は出さない。
+        // 片道7 msで両者t=0に始める（手で追った期待値）。
+        // 7: 両者が相手のHELLOを受けてHELLO_ACKを返し、未ackなので即送りでHELLOを出す。台0（nonceが大きい）はホストに決めて、同じpoll_sendでAGREEを出す（以後4 msごとに送り直し）。
+        // 14: 台1が接続して返答する（1往復）。
+        // 21: 台0が返答(14) で接続する（1.5往復）。
+        // 両者ともack済みなので27のHELLOは出さない。
         let cfgs = pair_cfgs();
         let out = run(
             [
@@ -2735,9 +3044,12 @@ mod tests {
 
     #[test]
     fn table_late_start() {
-        // 片道 7 ms。台 0（ホスト）が t=0、台 1（ゲスト）が t=50 に始める（手で追った期待値）。台 0 の HELLO 0・20・40 は台 1 が始める前に届いて落ちる。
-        // 57: 台 0 が受けてホストに決め、即送りで HELLO と AGREE。64: 台 1 が HELLO_ACK → HELLO → AGREE の順に受けて接続して返す（1 往復）。71: 台 0 が返しで接続する。
-        // 即送りが無いと、64 の AGREE はゲストがホストの HELLO を受ける前に届いて捨てられ、68 / 75 に接続する。
+        // 片道7 ms。台0（ホスト）がt=0、台1（ゲスト）がt=50に始める（手で追った期待値）。
+        // 台0のHELLO 0・20・40は台1が始める前に届いて落ちる。
+        // 57: 台0が受けてホストに決め、即送りでHELLOとAGREEを出す。
+        // 64: 台1がHELLO_ACK → HELLO → AGREEの順に受けて接続し、返答する（1往復）。
+        // 71: 台0が返答で接続する。
+        // 即送りが無いと、64のAGREEはゲストがホストのHELLOを受ける前に届いて捨てられ、68 / 75に接続する。
         let cfgs = pair_cfgs();
         let out = run(
             [
@@ -2821,7 +3133,7 @@ mod tests {
                     }
                 }),
             ),
-            // ゲストの返しを全部落とす間に、ホストの AGREE だけは届く → ホストは送り続け、500 ms 後から返しが届く。
+            // ゲストの返答を全部落とす間にホストのAGREEだけは届く → ホストは送り続け、500 ms後から返答が届く。
             (
                 "echo_lost_500ms",
                 Box::new(|c: Ctx, h| {
@@ -2832,7 +3144,7 @@ mod tests {
                     }
                 }),
             ),
-            // ホストの HELLO だけ遅らせ、AGREE が先に届く（ゲストは HELLO の前の AGREE を捨てる）。
+            // ホストのHELLOだけ遅らせ、AGREEが先に届く（ゲストはHELLOの前のAGREEを捨てる）。
             (
                 "agree_before_hello",
                 Box::new(|c: Ctx, h| {
@@ -2873,8 +3185,8 @@ mod tests {
     #[test]
     fn model_scripted_losses() {
         let mut base = pair_cfgs();
-        // 両者の設定の席をばらばらにする。base[0] が nonce の大きい方（常にホスト）なので host_seat = 2P で通る。
-        // base[1]（ゲスト）の 1P は使われないはず。
+        // 両者の設定のサイドをばらばらにする。base[0]がnonceの大きい方（常にホスト）なので host_seat = 2P で通る。
+        // base[1]（ゲスト）の1Pは使われないはず。
         base[0].host_seat = Seat::P2;
         base[1].host_seat = Seat::P1;
         let mut agree_early_seen = 0;
@@ -2908,7 +3220,7 @@ mod tests {
                 }
             }
         }
-        // 「HELLO の前の AGREE」の筋が本当に効いている（ゲストが捨てた数が 0 なら筋が働いていない）。
+        // 「HELLOの前のAGREE」の筋が本当に効いている（ゲストが捨てた数が0なら筋が働いていない）。
         assert!(agree_early_seen > 0);
     }
 
@@ -2950,7 +3262,7 @@ mod tests {
         if rng.below(2) == 0 {
             std::mem::swap(&mut n0, &mut n1);
         }
-        // 両者の設定の席を互いに逆にして引き、接続した結果がホストの設定だけで決まる（ゲストの設定は使われない）ことを check_pair に検証させる。
+        // 両者の設定のサイドを互いに逆にして生成し、接続した結果がホストの設定だけで決まる（ゲストの設定は使われない）ことをcheck_pairに検証させる。
         let seat0 = if rng.below(2) == 0 {
             Seat::P1
         } else {
@@ -3026,7 +3338,7 @@ mod tests {
     #[test]
     fn model_one_way_loss_splits_reasons() {
         let cfgs = pair_cfgs();
-        // lost_from の台が送ったものだけを全部落とす。lost_from は相手の HELLO を受ける（届いたが接続できない）、相手は何も受けない（1 通も届かない）。
+        // lost_fromの台が送ったものだけを全部落とす。lost_from側は相手のHELLOを受けるが接続できない。相手側は何も受けない（1通も届かない）。
         for lost_from in [0usize, 1] {
             let out = run(
                 [
@@ -3151,8 +3463,8 @@ mod tests {
         );
     }
 
-    /// 両者の始める時刻を 0〜499 ms でばらし、遅く始めた側の開始から接続するまでの時間
-    /// （片道 `d` ms ＋ 揺らぎ 0〜2 ms、落とさない）。`(ゲスト, ホスト)` の列。
+    /// 両者の始める時刻を0〜499 msでばらし、遅く始めた側の開始から接続するまでの時間（片道`d` ms ＋ 揺らぎ0〜2 ms、落とさない）を測る。
+    /// 結果は`(ゲスト, ホスト)`の列。
     fn late_connect_times(n: u64, d: u32) -> Vec<(u32, u32)> {
         let mut rng = Rng(0x1A7E);
         let mut v = Vec::new();
@@ -3270,8 +3582,7 @@ mod tests {
     fn late_start_connect_time_lan() {
         let d = 3;
         let v = late_connect_times(1000, d);
-        // 上限は手で追った最悪の筋: ゲスト 3 片道・ホスト 4 片道に、片道ごとの揺らぎ 2 ms と、AGREE が HELLO を追い越したときの
-        // AGREE の送り直し 1 回分（4 + 2 ms）を足した。
+        // 上限は手で追った最悪の筋で、ゲスト3片道・ホスト4片道に、片道ごとの揺らぎ2 msとAGREEがHELLOを追い越したときのAGREEの送り直し1回分（4 + 2 ms）を足した。
         let (gmax, hmax) = (3 * d + 3 * 2 + 6, 4 * d + 4 * 2 + 6);
         for &(g, h) in &v {
             assert!(g <= gmax, "ゲスト {g} > {gmax}");

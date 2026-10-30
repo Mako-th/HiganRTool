@@ -1,16 +1,16 @@
-//! ローダーに埋めるアプリケーションマニフェストの、リンカー（link.exe）への引数。
-//! build.rs が使い、引数の中身を固定する検査（このファイルを `main.rs` の検査へも取り込む）が同じ定義を読む。
+//! ローダーに埋め込むアプリケーションマニフェストをリンカー（link.exe）へ渡す引数。
+//! build.rsが使う。引数の中身を固定する検査（このファイルを`main.rs`の検査へも取り込む）も同じ定義を読む。
 //!
-//! 実行レベルは `/MANIFESTUAC` に任せ（昇格を求めない・UI アクセスなし）、対応 OS だけを XML で足す。
-//! XML 側に `requestedExecutionLevel` は書かない（リンカーが作る分と二重になる）。
+//! 実行レベルは`/MANIFESTUAC`に任せる（昇格を求めない・UIアクセスなし）。対応OSだけをXMLで追加する。
+//! XML側に`requestedExecutionLevel`は書かない（リンカーが作る分と二重になる）。
 
-/// `CARGO_MANIFEST_DIR` からの相対パス。
+/// `CARGO_MANIFEST_DIR`からの相対パス。
 pub const SUPPORTED_OS_FILE: &str = "manifest/loader.manifest";
 
 pub const EMBED: &str = "/MANIFEST:EMBED";
 pub const UAC: &str = "/MANIFESTUAC:level='asInvoker' uiAccess='false'";
 
-/// `supported_os_file` は絶対パス。`/MANIFESTINPUT` は相対パスをリンカーの作業フォルダから引くため。
+/// `supported_os_file`は絶対パス。`/MANIFESTINPUT`は相対パスをリンカーの作業フォルダ基準で解決するため。
 pub fn link_args(supported_os_file: &str) -> [String; 3] {
     [
         EMBED.to_string(),
@@ -64,7 +64,7 @@ mod tests {
         }
     }
 
-    // build.rs の文面を読む検査なので、実際に link.exe へ渡った引数までは見ていない。
+    // build.rsの文面を読む検査なので実際にlink.exeへ渡った引数までは見ていない。
     #[test]
     fn build_rs_passes_the_args_to_the_msvc_linker_bins_only() {
         assert!(BUILD_RS.contains("manifest_link::link_args("));

@@ -1,5 +1,6 @@
-//! Win32 の呼び出しを素通しにしながら、呼ばれた順と「開いたのに閉じていないハンドル」「確保したのに返していない領域」を
-//! 帳簿に付ける包み。偽物の検査（`launch.rs`）と自己検査（`selftest.rs`）で共用する。本番の起動では包まない。
+//! Win32の呼び出しを素通しにしながら呼ばれた順を記録する包み。
+//! 開いたのに閉じていないハンドルと確保したのに返していない領域も帳簿に付ける。
+//! 偽物の検査（`launch.rs`）と自己検査（`selftest.rs`）で共用する。本番の起動では包まない。
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -100,7 +101,7 @@ pub struct Traced<W: Win32> {
     calls: Vec<Call>,
     open_handles: BTreeSet<Handle>,
     live_regions: BTreeSet<(Handle, Remote)>,
-    /// 開いた覚えの無い、または 2 回目のハンドルを閉じようとした記録。
+    /// 開いた覚えの無い、または2回目のハンドルを閉じようとした記録。
     bad_closes: Vec<Handle>,
     created_pids: Vec<u32>,
 }
@@ -146,14 +147,14 @@ impl<W: Win32> Traced<W> {
         &self.bad_closes
     }
 
-    // 自己検査（dist なしのビルド）だけが読む。
+    // 自己検査（distなしのビルド）だけが読む。
     #[cfg_attr(feature = "dist", allow(dead_code))]
     pub fn created_pids(&self) -> &[u32] {
         &self.created_pids
     }
 
     fn opened(&mut self, h: Handle) {
-        // 同じ値が 2 度開くのは本物では起こらない。起きたら二重の close と同じ扱いで記録する。
+        // 同じ値が2度開くのは本物では起こらない。起きたら二重のcloseと同じ扱いで記録する。
         if !self.open_handles.insert(h) {
             self.bad_closes.push(h);
         }

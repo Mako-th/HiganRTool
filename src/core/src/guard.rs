@@ -1,24 +1,31 @@
-//! ネットワークのガード。宛先と待ち受けのアドレスを、ネットワークの範囲（dll の ini の `scope`、peer_sim の `--scope`）が許すものに限る。peer_sim と dll の通信層が共有する。
+//! ネットワークのガード。宛先と待ち受けのアドレスをネットワークの範囲（dllのiniの`scope`・peer_simの`--scope`）が許すものに限る。
+//! peer_simとdllの通信層が共有する。
 //!
-//! 範囲は 3 つで、広い方は狭い方を含む: `loopback`（既定。ini に `scope` を書き忘れても外へ出ない）、`lan`（loopback ＋ 私設のアドレス。100.64.0.0/10 の CGNAT は事業者の中のアドレスなので入れない）、`internet`（上に加えて外のアドレス）。
-//! `lan` の仲間に `LanVpn`（VPN の接続で開くときだけ。ini では選べない）がある。`lan` に、そのアダプターのネットワーク 1 つ（私設でない Radmin VPN の 26/8 など。`vpn_net`）を足した範囲。
-//! どの範囲でも断るもの: 未指定アドレスと 0.0.0.0/8、マルチキャスト（UPnP の SSDP の 239.255.255.250 だけは dll の `upnp` が直接使う）、240.0.0.0/4、IPv4 を埋めた IPv6（IPv4 の判定を迂回するため）、宛先のポート 0。
-//! 待ち受けを未指定アドレスにしないのは、接続コードに載せるアドレスにならず、範囲の外のアドレスでも待つ形になるため。
-//! 名前は `check_*` と `allows` では受けない（DNS の問い合わせ自体が外への通信になる）。STUN の問い合わせ先だけは名前でも書ける（`check_host_name` は文字の形だけを見る）。
-//! 送る直前のガード（dll の `Outlet::send`、peer_sim の `Tx::raw`）はゲームのスレッドなので、確保しない `allows` を使う。
+//! 範囲は次の3つ。広い方は狭い方を含む。
+//! - `loopback`（既定。iniに`scope`を書き忘れても外へ出ない）
+//! - `lan`（loopback ＋ 私設のアドレス。100.64.0.0/10のCGNATは事業者の中のアドレスなので含めない）
+//! - `internet`（上に加えて外のアドレス）
+//!
+//! `lan`の仲間に`LanVpn`（VPNの接続で開くときだけ。iniでは選べない）がある。`lan`にそのアダプターのネットワーク1つ（私設でないRadmin VPNの26/8など。`vpn_net`）を足した範囲。
+//! どの範囲でも断るもの: 未指定アドレスと0.0.0.0/8、マルチキャスト（UPnPのSSDPの239.255.255.250だけはdllの`upnp`が直接使う）、240.0.0.0/4、IPv4を埋めたIPv6（IPv4の判定を迂回するため）、宛先のポート0。
+//! 待ち受けを未指定アドレスにしないのは次の理由による。接続コードに載せるアドレスにならない。範囲の外のアドレスでも待つ形になる。
+//! 名前は`check_*`と`allows`では受けない（DNSの問い合わせ自体が外への通信になる）。STUNの問い合わせ先だけは名前でも指定できる（`check_host_name`は文字の形だけを見る）。
+//! 送る直前のガード（dllの`Outlet::send`・peer_simの`Tx::raw`）はゲームのスレッドで走る。そのため確保しない`allows`を使う。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::vpn_net::Net4;
 
-/// ネットワークの範囲。並びは狭い順（`Ord` で「この範囲に収まるか」を比べる）。`LanVpn` は `Lan` と `Internet` の間で、
-/// `reach` の戻り（Loopback・Lan・Internet のどれか）との比べは `Lan` 以下だけを通す。足したネットワークは `admits` が別に見る。
+/// ネットワークの範囲。並びは狭い順（`Ord`で「この範囲に収まるか」を比べる）。
+/// `LanVpn`は`Lan`と`Internet`の間にある。
+/// そのため`reach`の戻り値（Loopback・Lan・Internetのどれか）と比べると`Lan`以下だけを通す。
+/// 足したネットワークは`admits`が別に見る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub enum Scope {
     #[default]
     Loopback,
     Lan,
-    /// `Lan` ＋ このネットワークの中の 1 台（ネットワークのアドレスとブロードキャストは除く）。
+    /// `Lan` ＋ このネットワークの中の1台（ネットワークのアドレスとブロードキャストは除く）。
     LanVpn(Net4),
     Internet,
 }
@@ -26,7 +33,7 @@ pub enum Scope {
 impl Scope {
     pub const NAMES: &'static str = "loopback / lan / internet";
 
-    /// 大文字や別の綴りは断る。黙って既定に落とすと、`scope = LAN` と書いても loopback のまま開くため。
+    /// 大文字や別の綴りは断る。黙って既定に落とすと`scope = LAN`と書いてもloopbackのまま開くため。
     pub fn parse(s: &str) -> Option<Scope> {
         match s {
             "loopback" => Some(Scope::Loopback),
@@ -44,8 +51,8 @@ impl Scope {
         }
     }
 
-    /// LAN の接続で開く範囲。自分のアドレス `local` が私設でなく、VPN のネットワーク `vpn` の中にあるときだけ `LanVpn`。
-    /// それ以外（私設の LAN・VPN のネットワークの外・VPN の指定なし）は `Lan` のままで、VPN でない接続を変えない。
+    /// LANの接続で開く範囲。自分のアドレス`local`が私設でなくVPNのネットワーク`vpn`の中にあるときだけ`LanVpn`。
+    /// それ以外（私設のLAN・VPNのネットワークの外・VPNの指定なし）は`Lan`のまま。VPNでない接続は変えない。
     pub fn lan_via(local: Ipv4Addr, vpn: Option<Net4>) -> Scope {
         match vpn {
             Some(n) if !is_lan_v4(local) && n.contains_host(local) => Scope::LanVpn(n),
@@ -54,8 +61,8 @@ impl Scope {
     }
 }
 
-/// loopback のアドレスか。IPv4 は 127.0.0.0/8、IPv6 は `::1` だけ。
-/// `::ffff:127.0.0.1` と `0.0.0.0` / `::` は断る（未指定アドレスで待つと LAN からも受けられてしまう）。
+/// loopbackのアドレスかどうか。IPv4は127.0.0.0/8。IPv6は`::1`だけ。
+/// `::ffff:127.0.0.1`と`0.0.0.0` / `::`は断る（未指定アドレスで待つとLANからも受けられてしまう）。
 pub fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
@@ -63,7 +70,7 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
-/// アドレスが入るいちばん狭い範囲。`None` はどの範囲でも断るアドレス。
+/// アドレスが入るいちばん狭い範囲。`None`はどの範囲でも断るアドレス。
 pub fn reach(ip: IpAddr) -> Option<Scope> {
     match ip {
         IpAddr::V4(v4) => reach_v4(v4),
@@ -73,7 +80,7 @@ pub fn reach(ip: IpAddr) -> Option<Scope> {
 
 fn reach_v4(ip: Ipv4Addr) -> Option<Scope> {
     let o = ip.octets();
-    // 0.0.0.0/8（RFC 1122 の「このネットワーク」）・224.0.0.0/4（マルチキャスト）・240.0.0.0/4（予約と 255.255.255.255）。
+    // 0.0.0.0/8（RFC 1122の「このネットワーク」）・224.0.0.0/4（マルチキャスト）・240.0.0.0/4（予約と255.255.255.255）。
     if o[0] == 0 || ip.is_multicast() || o[0] >= 240 {
         None
     } else if ip.is_loopback() {
@@ -85,18 +92,18 @@ fn reach_v4(ip: Ipv4Addr) -> Option<Scope> {
     }
 }
 
-/// 家の中（私設・リンクローカル。loopback は含まない）の IPv4 か。UPnP を頼む待ち受けアドレスの判定。
+/// 家の中（私設・リンクローカル。loopbackは含まない）のIPv4かどうか。UPnPを頼む待ち受けアドレスの判定。
 pub fn is_lan_v4(ip: Ipv4Addr) -> bool {
     reach_v4(ip) == Some(Scope::Lan)
 }
 
-/// 家の中か loopback の IPv4 か。UPnP の機器の URL に許すアドレス（loopback は検査の偽の機器が 127.0.0.1 で待つため）。
+/// 家の中かloopbackのIPv4かどうか。UPnPの機器のURLに許すアドレス（loopbackは検査の偽の機器が127.0.0.1で待つため）。
 pub fn is_home_v4(ip: Ipv4Addr) -> bool {
     reach_v4(ip).is_some_and(|r| r <= Scope::Lan)
 }
 
-/// 世界に通じる IPv4 か。`Internet` の範囲から、事業者の中のアドレス（100.64.0.0/10）・IETF の予約（192.0.0.0/24）・
-/// 機器の試験用（198.18.0.0/15）・文書用（192.0.2.0/24・198.51.100.0/24・203.0.113.0/24）を除く。
+/// 世界に通じるIPv4かどうか。
+/// `Internet`の範囲から次を除く: 事業者の中のアドレス（100.64.0.0/10）・IETFの予約（192.0.0.0/24）・機器の試験用（198.18.0.0/15）・文書用（192.0.2.0/24・198.51.100.0/24・203.0.113.0/24）。
 pub fn is_global_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     reach_v4(ip) == Some(Scope::Internet)
@@ -107,12 +114,12 @@ pub fn is_global_v4(ip: Ipv4Addr) -> bool {
 }
 
 fn reach_v6(ip: Ipv6Addr) -> Option<Scope> {
-    // `to_ipv4` は `::1` も `0.0.0.1` と読んで Some を返すので、`::1` を先に見る。
+    // `to_ipv4`は`::1`も`0.0.0.1`と読んでSomeを返すので`::1`を先に見る。
     if ip.is_loopback() {
         return Some(Scope::Loopback);
     }
     let head = ip.segments()[0];
-    // `to_ipv4` が Some になるのは `::/96` と `::ffff:0:0/96`（IPv4 を埋め込んだ形）。
+    // `to_ipv4`がSomeになるのは`::/96`と`::ffff:0:0/96`（IPv4を埋め込んだ形）。
     if ip.is_unspecified() || ip.is_multicast() || ip.to_ipv4().is_some() {
         None
     } else if head & 0xFE00 == 0xFC00 || head & 0xFFC0 == 0xFE80 {
@@ -122,12 +129,12 @@ fn reach_v6(ip: Ipv6Addr) -> Option<Scope> {
     }
 }
 
-/// 範囲 `scope` が、いちばん狭い範囲が `r` のアドレス `ip` を通すか。`LanVpn` はさらに、足したネットワークの中の 1 台を通す。
+/// 範囲`scope`がアドレス`ip`（いちばん狭い範囲は`r`）を通すかどうか。`LanVpn`は足したネットワークの中の1台も通す。
 fn admits(scope: Scope, r: Scope, ip: IpAddr) -> bool {
     r <= scope || matches!((scope, ip), (Scope::LanVpn(n), IpAddr::V4(v4)) if n.contains_host(v4))
 }
 
-/// 送ってよい宛先か（確保しない。送る直前のガード）。
+/// 送ってよい宛先かどうか（確保しない。送る直前のガード）。
 pub fn allows(scope: Scope, addr: SocketAddr) -> bool {
     addr.port() != 0 && reach(addr.ip()).is_some_and(|r| admits(scope, r, addr.ip()))
 }
@@ -146,12 +153,12 @@ fn check_reach(addr: SocketAddr, scope: Scope, what: &str) -> Result<(), String>
     }
 }
 
-/// 待ち受けのガード。ポート 0 は OS が選ぶので通す。
+/// 待ち受けのガード。ポート0はOSが選ぶので通す。
 pub fn check_bind(addr: SocketAddr, scope: Scope, what: &str) -> Result<(), String> {
     check_reach(addr, scope, what)
 }
 
-/// 宛先のガード（相手の候補・STUN の問い合わせ先）。ポート 0 も断る。
+/// 宛先のガード（相手の候補・STUNの問い合わせ先）。ポート0も断る。
 pub fn check_peer(addr: SocketAddr, scope: Scope) -> Result<(), String> {
     check_reach(addr, scope, "宛先")?;
     if addr.port() == 0 {
@@ -160,7 +167,7 @@ pub fn check_peer(addr: SocketAddr, scope: Scope) -> Result<(), String> {
     Ok(())
 }
 
-/// 範囲を持たない検査用のツール（peer_sim の偽の STUN の応答役）が使う、loopback だけのガード。
+/// 範囲を持たない検査用のツール（peer_simの偽のSTUNの応答役）が使うloopbackだけのガード。
 pub fn check_loopback(addr: SocketAddr, what: &str) -> Result<(), String> {
     if is_loopback(addr.ip()) {
         Ok(())
@@ -171,9 +178,10 @@ pub fn check_loopback(addr: SocketAddr, what: &str) -> Result<(), String> {
     }
 }
 
-/// DNS の名前として読める文字か（形だけ。引かない）。ホスト名の規則（RFC 1123・1035）に従い、最後のラベルが数字だけの
-/// 名前（`1.2.3`）は断る（IP の書き損じを名前として引くと OS が別のアドレスと読むことがある）。`_`・非 ASCII・
-/// 空のラベル・`:` も断る。
+/// DNSの名前として読める文字かどうか（形だけ見て名前解決はしない）。
+/// ホスト名の規則（RFC 1123・1035）に従い最後のラベルが数字だけの名前（`1.2.3`）は断る。
+/// IPの書き損じを名前解決するとOSが別のアドレスと読むことがある。
+/// `_`・非ASCII・空のラベル・`:`も断る。
 pub fn check_host_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("名前が空です".to_string());
@@ -220,8 +228,8 @@ pub fn is_localhost_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! 範囲ごとに通すものと断るものを同じ表に並べる（片方だけだと、全部断る・全部通す実装でも通る）。
-    //! 期待値は RFC のアドレスの区切りから書いた（`reach` の式から作らない）。
+    //! 範囲ごとに通すものと断るものを同じ表に並べる（片方だけだと全部断る・全部通す実装でも通る）。
+    //! 期待値はRFCのアドレスの区切りから書いた（`reach`の式から作らない）。
     use super::*;
 
     fn sa(s: &str) -> SocketAddr {
@@ -230,13 +238,13 @@ mod tests {
 
     use Scope::{Internet, Lan, Loopback};
 
-    /// (宛先, この範囲から通る。None はどの範囲でも断る)。各区切りの内側の端と外側の隣を並べる。
+    /// (宛先, この範囲から通る。Noneはどの範囲でも断る)。各区切りの内側の端と外側の隣を並べる。
     const TABLE: &[(&str, Option<Scope>)] = &[
         ("127.0.0.1:7000", Some(Loopback)),
         ("127.5.6.7:1", Some(Loopback)),
         ("127.255.255.254:65535", Some(Loopback)),
         ("[::1]:7000", Some(Loopback)),
-        // 私設の IPv4（RFC 1918・3927）。端と、区切りの外側の隣。
+        // 私設のIPv4（RFC 1918・3927）。端と、区切りの外側の隣。
         ("10.0.0.1:7000", Some(Lan)),
         ("10.255.255.254:7000", Some(Lan)),
         ("11.0.0.1:7000", Some(Internet)),
@@ -258,7 +266,7 @@ mod tests {
         ("128.0.0.1:7000", Some(Internet)),
         ("203.0.113.9:3478", Some(Internet)),
         ("223.255.255.254:7000", Some(Internet)),
-        // 私設の IPv6（RFC 4193・4291）
+        // 私設のIPv6（RFC 4193・4291）
         ("[fc00::1]:7000", Some(Lan)),
         ("[fd12:3456::1]:7000", Some(Lan)),
         ("[fdff:ffff::1]:7000", Some(Lan)),
@@ -307,7 +315,7 @@ mod tests {
                 Scope::LanVpn(_) => unreachable!("表の最小の範囲に LanVpn は無い"),
             })] += 1;
         }
-        // 表から行が消えても素通りしないよう、行の数を縛る。
+        // 表から行が消えても素通りしないよう行の数を縛る。
         assert_eq!(counts, [4, 13, 17, 13], "表の行の数");
     }
 
@@ -399,7 +407,7 @@ mod tests {
     fn lan_vpn_adds_exactly_one_network_to_lan() {
         let radmin = Scope::LanVpn(net("26.1.2.3", 8));
         let zt = Scope::LanVpn(net("28.7.7.9", 24));
-        // (宛先, radmin の 26/8, zerotier の 28.7.7.0/24, 範囲 lan だけ)
+        // (宛先, radminの26/8, zerotierの28.7.7.0/24, 範囲lanだけ)
         let rows = [
             ("26.0.0.1:7000", true, false, false),
             ("26.12.34.56:1", true, false, false),
@@ -437,7 +445,7 @@ mod tests {
                 }
             }
         }
-        // 名前は lan のまま（ログとエラーの文が「scope = lan」で揃う）。順序は lan と internet の間。
+        // 名前はlanのまま（ログとエラーの文が「scope = lan」で揃う）。順序はlanとinternetの間。
         assert_eq!(radmin.name(), "lan");
         assert!(Lan < radmin && radmin < Internet);
     }
@@ -455,7 +463,7 @@ mod tests {
         );
         assert_eq!(Scope::lan_via(ip("26.0.0.0"), Some(r)), Lan);
         assert_eq!(Scope::lan_via(ip("192.168.0.9"), None), Lan);
-        // 私設のアドレスは、VPN のネットワークを渡されても範囲 lan のまま。
+        // 私設のアドレスはVPNのネットワークを渡されても範囲lanのまま。
         let big = net("10.1.2.3", 8);
         assert_eq!(Scope::lan_via(ip("10.1.2.3"), Some(big)), Lan);
         assert_eq!(Scope::lan_via(ip("127.0.0.1"), None), Lan);
@@ -510,7 +518,7 @@ mod tests {
             "192.168.1",
             "example.123",
             "a".repeat(64).as_str(),
-            // 254 文字
+            // 254文字
             format!("{0}.{0}.{0}.{1}", "a".repeat(63), "b".repeat(62)).as_str(),
         ] {
             assert!(check_host_name(bad).is_err(), "通した: {bad:?}");

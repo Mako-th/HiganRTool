@@ -1,7 +1,7 @@
-//! コマンドラインの読み取り（pure）。使い方の全文は `USAGE`。
-//! `--game` なしは覚えた th09.exe の場所を使い、無い・使えないときだけウィンドウで選ばせる（`--choose-game` なら常にウィンドウ）。
-//! `--ini` / `--script` は DLL が読む場所を環境変数で子へ渡す（同じ PC の 2 つのゲームに別々のポートと台本を持たせる）。
-//! 自己検査（`--selftest`・`--selftest-target`）は配るビルド（feature `dist`）には入れない。
+//! コマンドラインの読み取り（pure）。使い方の全文は`USAGE`。
+//! `--game`なしのときは覚えているth09.exeの場所を使う。無いか使えないときだけウィンドウで選ばせる（`--choose-game`なら常にウィンドウ）。
+//! `--ini` / `--script`はDLLが読む場所を環境変数で子へ渡す（同じPCの2つのゲームに別々のポートと台本を持たせる）。
+//! 自己検査（`--selftest`・`--selftest-target`）は配布ビルド（feature `dist`）には含めない。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -13,9 +13,9 @@ use crate::ui_lang::by_lang;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameSource {
-    /// ini の `[loader] game` は読み書きしない。
+    /// iniの`[loader] game`は読み書きしない。
     Path(PathBuf),
-    /// `--game` なし。`choose` なら覚えた場所があってもウィンドウを出す。
+    /// `--game`なし。`choose`なら覚えた場所があってもウィンドウを出す。
     Remembered { choose: bool },
 }
 
@@ -26,12 +26,12 @@ pub enum Command {
         dll: Option<PathBuf>,
         ini: Option<PathBuf>,
         script: Option<PathBuf>,
-        /// 起動前にプロセスのメモリを 1 か所書き換える（`launch::SECOND_INSTANCE`）。
+        /// 起動前にプロセスのメモリを1か所書き換える（`launch::SECOND_INSTANCE`）。
         second: bool,
         no_clipboard: bool,
-        /// ウィンドウが開いた直後に、`0`〜`8` か `delay` と打ったのと同じ経路で対戦の形を選ぶ。ウィンドウを開かない回には効かない。
+        /// ウィンドウが開いた直後に`0`〜`8`か`delay`と打ったのと同じ経路で対戦の形を選ぶ。ウィンドウを開かない実行には効かない。
         choose: Option<Pick>,
-        /// `--script` ありなら無くても同じ。
+        /// `--script`を指定したときはこれを指定しなくても同じ動作になる。
         background: bool,
     },
     #[cfg(not(feature = "dist"))]
@@ -45,7 +45,7 @@ pub enum Command {
     Help,
 }
 
-/// 自己検査の行。配るビルドの使い方には出さない（`concat!` は展開したマクロの文字列も受ける）。
+/// 自己検査の行。配布ビルドの使い方には出さない（`concat!`は展開したマクロの文字列も受ける）。
 #[cfg(not(feature = "dist"))]
 macro_rules! selftest_usage_ja {
     () => {
@@ -129,7 +129,7 @@ pub fn parse(args: &[OsString], lang: Lang) -> Result<Command, String> {
     let mut script: Option<PathBuf> = None;
     #[cfg(not(feature = "dist"))]
     let mut selftest = false;
-    // 配るビルドには自己検査の引数が無い（下の分岐は常に「なし」になる）。
+    // 配布ビルドには自己検査の引数が無い（下の分岐は常に「なし」になる）。
     #[cfg(feature = "dist")]
     let selftest = false;
     let mut second = false;
@@ -215,7 +215,7 @@ pub fn parse(args: &[OsString], lang: Lang) -> Result<Command, String> {
     if help {
         return Ok(Command::Help);
     }
-    // 自己検査と的には渡す先が無い。黙って捨てない。
+    // 自己検査とそのターゲットにはこれらのオプションの渡し先が無い。黙って捨てずエラーにする。
     if game.is_none()
         && (ini.is_some()
             || script.is_some()
@@ -284,7 +284,7 @@ fn only_one_of(lang: Lang) -> String {
     .to_string()
 }
 
-// 配るビルドでは `selftest` が常に false・`target` が常に None で、実際にはここへ来ない。
+// 配布ビルドでは`selftest`が常にfalse・`target`が常にNoneなので、実際にはここへ来ない。
 #[cfg(feature = "dist")]
 fn only_one_of(lang: Lang) -> String {
     match lang {
@@ -294,7 +294,7 @@ fn only_one_of(lang: Lang) -> String {
     .to_string()
 }
 
-/// 起動したウィンドウを前面にしないか。`--script` か `--background` ならしない。台本の無い普通の起動は前面に出す。
+/// 起動したウィンドウを前面にしないかどうか。`--script`か`--background`ならしない。台本の無い普通の起動は前面に出す。
 pub fn launches_in_background(background: bool, script: Option<&PathBuf>) -> bool {
     background || script.is_some()
 }
@@ -476,7 +476,7 @@ mod tests {
                 "{v}"
             );
         }
-        // 9 は auto の印でウィンドウの選択ではない。auto の語も受けない。
+        // 9はautoを表す値。ウィンドウで選ぶ値ではない。autoという語も受け付けない。
         for bad in ["9", "auto", "rollback", "", "10"] {
             assert!(p(&["--game", "a.exe", "--choose", bad]).is_err(), "{bad:?}");
         }
@@ -556,7 +556,7 @@ mod tests {
         }
     }
 
-    // `dist` の有無は cfg なので、この検査が見るのは今のビルドの側だけ（dist なしでは「受け付ける」側）。
+    // `dist`の有無はcfgなのでこの検査が見るのは今のビルドの側だけ（distなしでは「受け付ける」側）。
     #[test]
     fn selftest_arguments_exist_only_without_dist() {
         for args in [&["--selftest"][..], &["--selftest-target", "x.dll"][..]] {

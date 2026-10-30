@@ -1,9 +1,10 @@
-//! Win32 の層（unsafe はこのファイルに閉じ込める。1 つずつ `// SAFETY:`）。
-//! 自分のモジュールのパス・exe の位置・自分のプロセスのメモリの読み取り（`VirtualQuery` で頁をチェックしてから読む）・時刻・
-//! 二重注入のミューテックス・スレッドを 1 本作ること・デバッガへの一言。ゲームのメモリに書く API はここに無い（書く層は `hook_win.rs`）。
-//! ウィンドウも作らず、ネットワークにも出ない。
+//! Win32の層（unsafeはこのファイルに閉じ込める。1つずつ`// SAFETY:`）。
+//! 自分のモジュールのパス・exeの位置・時刻・二重注入のミューテックス・スレッドを1本作ること・デバッガへのメッセージ出力を扱う。
+//! 自分のプロセスのメモリの読み取りも扱う（`VirtualQuery`でページをチェックしてから読む）。
+//! ゲームのメモリに書くAPIはここに無い（書く層は`hook_win.rs`）。
+//! ウィンドウを作らずネットワークにも出ない。
 
-// std の ProcessPrng の遅延読み込みが失敗したときのフック（build.rs の /DELAYLOAD と対）。
+// stdのProcessPrngの遅延読み込みが失敗したときのフック（build.rsの /DELAYLOADと対）。
 higanr_prng_shim::install_delay_load_hook!();
 
 use std::ffi::OsString;
@@ -15,10 +16,15 @@ use std::path::{Path, PathBuf};
 
 use core::ffi::c_void;
 
+use higanr_core::ansi::Ansi;
 use higanr_core::log_scrub::{Scrub, ScrubWrite};
 use higanr_core::pe::TH09_V150A;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HMODULE, SYSTEMTIME,
+};
+use windows_sys::Win32::Globalization::{
+    CP_UTF8, GetACP, MB_ERR_INVALID_CHARS, MultiByteToWideChar, WC_NO_BEST_FIT_CHARS,
+    WideCharToMultiByte,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{
@@ -34,6 +40,7 @@ use windows_sys::Win32::System::SystemInformation::{GetLocalTime, OSVERSIONINFOW
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, CreateThread, IsProcessorFeaturePresent, PF_XMMI64_INSTRUCTIONS_AVAILABLE,
 };
+use windows_sys::core::BOOL;
 
 use crate::hook_win::RealHook;
 use crate::log_mode::detail_out;
@@ -48,15 +55,15 @@ use crate::session::{self, End, ScriptHost, Sites};
 use crate::th09_addr::{FORBIDDEN, HOOK_SITE, IMAGE_BASE, SITES, WINDOW_ADDR};
 use crate::ticks::COPY_TABLE;
 
-/// `GetModuleFileNameW` が受け付ける最長（拡張パスの上限）。
+/// `GetModuleFileNameW`が受け付ける最長（拡張パスの上限）。
 const MAX_WIDE_PATH: usize = 32_768;
 
-/// モジュールのパス。`module` が NULL なら自分のプロセスの exe。日本語を含みうるので W の API で取る。
+/// モジュールのパス。`module`がNULLなら自分のプロセスのexe。日本語を含みうるのでWのAPIで取る。
 pub fn module_path(module: HMODULE) -> Option<PathBuf> {
     let mut buf: Vec<u16> = vec![0; 260];
     loop {
-        // SAFETY: `buf` は書ける領域で、長さをそのまま渡している。`module` は NULL か自分の DLL のハンドル
-        // （この DLL は自分を解放しない）。
+        // SAFETY: `buf`は書き込み可能な領域で、長さをそのまま渡している。
+        // `module`はNULLか自分のDLLのハンドル（このDLLは自分を解放しない）。
         let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
         if n == 0 {
             return None;
@@ -65,7 +72,7 @@ pub fn module_path(module: HMODULE) -> Option<PathBuf> {
             buf.truncate(n);
             return Some(PathBuf::from(OsString::from_wide(&buf)));
         }
-        // n == buf.len() は切り詰められた印。広げて取り直す。
+        // n == buf.len()は切り詰められたことを示す。広げて取り直す。
         if buf.len() >= MAX_WIDE_PATH {
             return None;
         }
@@ -73,12 +80,12 @@ pub fn module_path(module: HMODULE) -> Option<PathBuf> {
     }
 }
 
-/// アドレス `addr` が入っているモジュールのパス（参照カウントは増やさない）。
-/// どのモジュールにも入っていなければ `None`。
-#[cfg_attr(test, allow(dead_code))] // 使うのは `window_win::original`（検査の構成には無い）だけ
+/// アドレス`addr`が含まれるモジュールのパス（参照カウントは増やさない）。
+/// どのモジュールにも含まれなければ`None`。
+#[cfg_attr(test, allow(dead_code))] // 使うのは`window_win::original`（検査の構成には無い）だけ
 pub fn module_of_addr(addr: u32) -> Option<PathBuf> {
     let mut module: HMODULE = core::ptr::null_mut();
-    // SAFETY: 旗は「アドレスから引く」＋「参照カウントを増やさない」（閉じなくてよい）。第 2 引数はアドレスを指す疑似ポインタで、中身は読まれない。
+    // SAFETY: フラグは「アドレスから取得する」＋「参照カウントを増やさない」（閉じなくてよい）。第2引数はアドレスを指す疑似ポインタで中身は読まれない。
     let ok = unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -92,23 +99,23 @@ pub fn module_of_addr(addr: u32) -> Option<PathBuf> {
     module_path(module)
 }
 
-/// Wine のバージョン（`ntdll.dll` が `wine_get_version` を持つときだけ）。Windows では `None`。ログの 1 行のためで、ゲームのスレッドでは呼ばない。
+/// Wineのバージョン（`ntdll.dll`が`wine_get_version`を持つときだけ）。Windowsでは`None`。ログの1行に使う。ゲームのスレッドでは呼ばない。
 pub fn wine_version() -> Option<String> {
     let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
-    // SAFETY: 0 終わりの UTF-16 の名前。ntdll は全プロセスに読み込み済みで、参照カウントを増やさない。
+    // SAFETY: 0終わりのUTF-16の名前。ntdllは全プロセスに読み込み済み。参照カウントは増やさない。
     let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
     if module.is_null() {
         return None;
     }
-    // SAFETY: 読み込み済みのモジュールのハンドルと 0 終わりの ASCII の名前。無ければ None が返るだけ。
+    // SAFETY: 読み込み済みのモジュールのハンドルと0終わりのASCIIの名前。無ければNoneが返るだけ。
     let proc = unsafe { GetProcAddress(module, c"wine_get_version".as_ptr().cast()) }?;
-    // SAFETY: Wine の ntdll がこの名前で出す関数は引数なしで、静的な C 文字列へのポインタを返す（cdecl。i686 の extern "C" と同じ）。
+    // SAFETY: Wineのntdllがこの名前でエクスポートする関数は引数なしで静的なC文字列へのポインタを返す（cdecl。i686のextern "C" と同じ）。
     let get: extern "C" fn() -> *const core::ffi::c_char = unsafe { core::mem::transmute(proc) };
     let p = get();
     if p.is_null() {
         return None;
     }
-    // SAFETY: 上の関数が返す 0 終わりの静的な文字列。
+    // SAFETY: 上の関数が返す0終わりの静的な文字列。
     let s = unsafe { core::ffi::CStr::from_ptr(p) }.to_string_lossy();
     let s: String = s
         .chars()
@@ -118,24 +125,24 @@ pub fn wine_version() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// OS のバージョン（`ntdll!RtlGetVersion`。`GetVersionEx` と違い、exe の互換モードの宣言で値が変わらない）。ゲームのスレッドでは呼ばない。
+/// OSのバージョン（`ntdll!RtlGetVersion`。`GetVersionEx`と違いexeの互換モードの宣言で値が変わらない）。ゲームのスレッドでは呼ばない。
 pub fn os_version() -> Option<probe::OsVersion> {
     let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
-    // SAFETY: 0 終わりの UTF-16 の名前。ntdll は全プロセスに読み込み済みで、参照カウントを増やさない。
+    // SAFETY: 0終わりのUTF-16の名前。ntdllは全プロセスに読み込み済み。参照カウントは増やさない。
     let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
     if module.is_null() {
         return None;
     }
-    // SAFETY: 読み込み済みのモジュールのハンドルと 0 終わりの ASCII の名前。無ければ None が返るだけ。
+    // SAFETY: 読み込み済みのモジュールのハンドルと0終わりのASCIIの名前。無ければNoneが返るだけ。
     let proc = unsafe { GetProcAddress(module, c"RtlGetVersion".as_ptr().cast()) }?;
-    // SAFETY: RtlGetVersion は `NTSTATUS NTAPI (PRTL_OSVERSIONINFOW)`（stdcall。i686 の extern "system"）。
+    // SAFETY: RtlGetVersionは`NTSTATUS NTAPI (PRTL_OSVERSIONINFOW)`（stdcall。i686のextern "system"）。
     let get: unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32 =
         unsafe { core::mem::transmute(proc) };
     let mut info = OSVERSIONINFOW {
         dwOSVersionInfoSize: core::mem::size_of::<OSVERSIONINFOW>() as u32,
         ..Default::default()
     };
-    // SAFETY: 大きさの欄を埋めた OSVERSIONINFOW を渡す。関数はそれを書くだけ。
+    // SAFETY: 大きさのフィールドを埋めたOSVERSIONINFOWを渡す。関数はそれを書くだけ。
     let status = unsafe { get(&mut info) };
     (status >= 0).then_some(probe::OsVersion {
         major: info.dwMajorVersion,
@@ -144,21 +151,22 @@ pub fn os_version() -> Option<probe::OsVersion> {
     })
 }
 
-/// CPU の（SSE2, AVX2）。SSE2 は OS の見方（i686 のビルドは SSE2 を前提にしているので、無ければここまで来ない）、
-/// AVX2 は CPUID と OS の保存の対応（XGETBV）の両方。
+/// CPUの対応機能（SSE2, AVX2）を返す。
+/// SSE2はOSが報告する値を使う（i686のビルドはSSE2を前提にしているので、無ければここまで来ない）。
+/// AVX2はCPUIDとOSの保存の対応（XGETBV）の両方で判定する。
 pub fn cpu_features() -> (bool, bool) {
-    // SAFETY: 引数は機能の番号だけで、失敗しない。
+    // SAFETY: 引数は機能の番号だけ。失敗しない。
     let sse2 = unsafe { IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) } != 0;
     (sse2, std::arch::is_x86_feature_detected!("avx2"))
 }
 
 pub fn exe_image_base() -> usize {
-    // SAFETY: 引数 NULL は自分の exe の意味で、返るハンドルは参照カウントを増やさない。
+    // SAFETY: 引数NULLは自分のexeを意味する。返るハンドルは参照カウントを増やさない。
     unsafe { GetModuleHandleW(core::ptr::null()) as usize }
 }
 
-/// 頁の保護が「読める」か。`PAGE_GUARD` は読むと例外が一度起きて保護が外れる（ゲームの状態を変えうる）ので読めない扱い。
-/// 修飾は下位 8 ビットで見る。
+/// ページの保護が読み取り可能かどうか。`PAGE_GUARD`は読むと例外が一度起きて保護が外れる（ゲームの状態を変えうる）ので読み取り不可として扱う。
+/// 修飾は下位8ビットで見る。
 pub fn is_readable_protect(protect: u32) -> bool {
     if protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 {
         return false;
@@ -174,28 +182,29 @@ pub fn is_readable_protect(protect: u32) -> bool {
     )
 }
 
-/// 自分のプロセスのメモリ `[addr, addr + len)` を読む。頁がすべてコミット済みで読める保護でなければ `None`。読むだけで保護は変えない。
+/// 自分のプロセスのメモリ`[addr, addr + len)`を読む。ページがすべてコミット済みで読み取り可能な保護でなければ`None`。読むだけで保護は変えない。
 pub fn read_own_memory(addr: u32, len: usize) -> Option<Vec<u8>> {
     let mut out = vec![0u8; len];
     read_own_into(addr, &mut out).then_some(out)
 }
 
-/// `[addr, addr + buf.len())` を `buf` に読む。**ヒープを使わない**（フックの手順が、スレッドを止めている間に読み直すため）。
-/// 頁がすべてコミット済みで読める保護でなければ false（検証し終わるまで 1 バイトも書かない）。
+/// `[addr, addr + buf.len())`を`buf`に読み込む。**ヒープを使わない**（フックの手順がスレッドを止めている間に読み直すため）。
+/// ページがすべてコミット済みで読み取り可能な保護でなければfalse（検証し終わるまで1バイトも書かない）。
 pub fn read_own_into(addr: u32, buf: &mut [u8]) -> bool {
     readable_range(addr as usize, buf.len()) && {
         for (i, b) in buf.iter_mut().enumerate() {
-            // SAFETY: 範囲の頁を直前に VirtualQuery でコミット済み・読める保護と検証した。th09.exe のイメージの頁は解放されず、
-            // この DLL が保護を変えるのは `hook_win` だけで、それも読める保護の間を行き来するだけ。検証してから読むまでに別の DLL が保護を外すことは起きない
-            // 前提（ローダーがサスペンドで起動して読ませるので、他の注入物は並んでいない）。
-            // volatile なのは、ゲームのスレッドが書き換えうるアドレスの読みを最適化で畳ませないため。
+            // SAFETY: 範囲のページを直前にVirtualQueryでコミット済み・読み取り可能な保護と検証した。
+            // th09.exeのイメージのページは解放されない。
+            // このDLLが保護を変えるのは`hook_win`だけ。それも読み取り可能な保護の間を行き来するだけ。
+            // 検証してから読むまでに別のDLLが保護を外すことは起きない前提（ローダーがサスペンドで起動して読ませるので、他の注入物は並んでいない）。
+            // volatileで読むのは、ゲームのスレッドが書き換えうるアドレスの読み取りが最適化で省かれないようにするため。
             *b = unsafe { core::ptr::read_volatile((addr as usize + i) as *const u8) };
         }
         true
     }
 }
 
-/// `[start, start + len)` の頁がすべてコミット済みで読める保護か。ヒープを使わない。
+/// `[start, start + len)`のページがすべてコミット済みで読み取り可能な保護かどうか。ヒープを使わない。
 fn readable_range(start: usize, len: usize) -> bool {
     let Some(end) = start.checked_add(len) else {
         return false;
@@ -203,7 +212,7 @@ fn readable_range(start: usize, len: usize) -> bool {
     let mut cur = start;
     while cur < end {
         let mut mbi = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: VirtualQuery はアドレスの中身を読まず、領域の情報を書ける大きさの `mbi` に書くだけ。
+        // SAFETY: VirtualQueryはアドレスの中身を読まない。領域の情報を十分な大きさの`mbi`に書くだけ。
         let n = unsafe {
             VirtualQuery(
                 cur as *const c_void,
@@ -227,7 +236,7 @@ fn readable_range(start: usize, len: usize) -> bool {
 
 pub fn local_time() -> LocalTime {
     let mut st = SYSTEMTIME::default();
-    // SAFETY: `st` は GetLocalTime が書く SYSTEMTIME そのもの。
+    // SAFETY: `st`はGetLocalTimeが書くSYSTEMTIMEそのもの。
     unsafe { GetLocalTime(&mut st) };
     LocalTime {
         year: st.wYear,
@@ -240,10 +249,119 @@ pub fn local_time() -> LocalTime {
     }
 }
 
-/// デバッガ（DebugView など）への一言。ログを開けないときの最後の知らせ。ウィンドウは出さない。
+/// コードページ番号で決まるANSIの変換（`MultiByteToWideChar` / `WideCharToMultiByte`）。
+pub struct CodePage(pub u32);
+
+/// このプロセスのANSIコードページ（`GetACP`）。ゲームの`CreateFileA`が読むコードページと同じ。
+pub struct AcpAnsi;
+
+impl Ansi for AcpAnsi {
+    fn encode(&self, s: &str) -> Option<Vec<u8>> {
+        // SAFETY: 引数の無い呼び出し。
+        CodePage(unsafe { GetACP() }).encode(s)
+    }
+
+    fn decode(&self, b: &[u8]) -> Option<String> {
+        // SAFETY: 引数の無い呼び出し。
+        CodePage(unsafe { GetACP() }).decode(b)
+    }
+}
+
+impl Ansi for CodePage {
+    fn encode(&self, s: &str) -> Option<Vec<u8>> {
+        if s.is_empty() {
+            return Some(Vec::new());
+        }
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let wlen = i32::try_from(wide.len()).ok()?;
+        // UTF-8ではフラグと既定の文字の指定を渡せない（渡すと失敗する）。
+        let utf8 = self.0 == CP_UTF8;
+        let flags = if utf8 { 0 } else { WC_NO_BEST_FIT_CHARS };
+        let mut used_default: BOOL = 0;
+        let used_ptr: *mut BOOL = if utf8 {
+            core::ptr::null_mut()
+        } else {
+            &mut used_default
+        };
+        // SAFETY: `wide`は`wlen`個読み取り可能。出力先はNULL・0（必要な長さだけを返す呼び方）。`used_ptr`はNULLか書き込み可能なBOOL。
+        let n = unsafe {
+            WideCharToMultiByte(
+                self.0,
+                flags,
+                wide.as_ptr(),
+                wlen,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null(),
+                used_ptr,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let mut out = vec![0u8; usize::try_from(n).ok()?];
+        // SAFETY: 入力は上と同じ。出力先は`n`バイト書き込み可能。
+        let wrote = unsafe {
+            WideCharToMultiByte(
+                self.0,
+                flags,
+                wide.as_ptr(),
+                wlen,
+                out.as_mut_ptr(),
+                n,
+                core::ptr::null(),
+                used_ptr,
+            )
+        };
+        // 代替の文字や別の文字に置き換わったもの（CP932の`¥` → `\`など）は逆変換して元と比べて断る。
+        if wrote != n || used_default != 0 || self.decode(&out).as_deref() != Some(s) {
+            return None;
+        }
+        Some(out)
+    }
+
+    fn decode(&self, b: &[u8]) -> Option<String> {
+        if b.is_empty() {
+            return Some(String::new());
+        }
+        let len = i32::try_from(b.len()).ok()?;
+        // SAFETY: `b`は`len`バイト読み取り可能。出力先はNULL・0（必要な長さだけを返す呼び方）。
+        let n = unsafe {
+            MultiByteToWideChar(
+                self.0,
+                MB_ERR_INVALID_CHARS,
+                b.as_ptr(),
+                len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; usize::try_from(n).ok()?];
+        // SAFETY: 入力は上と同じ。出力先は`n`個のu16を書き込み可能。
+        let wrote = unsafe {
+            MultiByteToWideChar(
+                self.0,
+                MB_ERR_INVALID_CHARS,
+                b.as_ptr(),
+                len,
+                wide.as_mut_ptr(),
+                n,
+            )
+        };
+        if wrote != n {
+            return None;
+        }
+        String::from_utf16(&wide).ok()
+    }
+}
+
+/// デバッガ（DebugViewなど）へのメッセージ出力。ログを開けないときの最後の通知手段。ウィンドウは出さない。
 pub fn debug_out(s: &str) {
     let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide` は 0 で終わる UTF-16 の列で、呼び出しの間生きている。
+    // SAFETY: `wide`は0で終わるUTF-16の列で呼び出しの間生きている。
     unsafe { OutputDebugStringW(wide.as_ptr()) };
 }
 
@@ -253,19 +371,19 @@ fn to_wide_nul(s: &str) -> Vec<u16> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutexRefusal {
-    /// 同じ名前が既にある（同じ PID に 2 本目が読まれた）。
+    /// 同じ名前が既にある（同じPIDに2本目が読まれた）。
     AlreadyExists,
-    /// 作れなかった（`GetLastError` の値）。
+    /// 作れなかった（`GetLastError`の値）。
     Failed(u32),
 }
 
-/// 名前つきのミューテックスを作る。既にあれば、開いてしまったハンドルを閉じて断る。
-/// 返したハンドルは閉じない（プロセスが終わるまで名前を残し、2 本目を断り続けるため）。
+/// 名前つきのミューテックスを作る。既にあれば開いてしまったハンドルを閉じて断る。
+/// 返したハンドルは閉じない（プロセスが終わるまで名前を残して2本目を断り続けるため）。
 pub fn acquire_named_mutex(name: &str) -> Result<HANDLE, MutexRefusal> {
     let wide = to_wide_nul(name);
-    // SAFETY: 属性は NULL、初めから持たない（FALSE）、名前は呼び出しの間生きている 0 終わりの UTF-16。
+    // SAFETY: 属性はNULL。初めから持たない（FALSE）。名前は呼び出しの間生きている0終わりのUTF-16。
     let h = unsafe { CreateMutexW(core::ptr::null(), 0, wide.as_ptr()) };
-    // SAFETY: 引数の無い呼び出し。CreateMutexW の直後に読む。
+    // SAFETY: 引数の無い呼び出し。CreateMutexWの直後に読む。
     let last = unsafe { GetLastError() };
     if h.is_null() {
         return Err(MutexRefusal::Failed(last));
@@ -278,12 +396,12 @@ pub fn acquire_named_mutex(name: &str) -> Result<HANDLE, MutexRefusal> {
 }
 
 pub fn close_handle(h: HANDLE) {
-    // SAFETY: 呼び出し元は、自分が開いてまだ閉じていないハンドルだけを渡す。
+    // SAFETY: 呼び出し元は自分が開いてまだ閉じていないハンドルだけを渡す。
     unsafe { CloseHandle(h) };
 }
 
-/// DLL_PROCESS_ATTACH でやること（ローダーロックの下）: ミューテックスを取り、読み取りのスレッドを作るだけ。待たない。
-/// false を返すと DllMain が FALSE を返し、DLL は読まれない。
+/// DLL_PROCESS_ATTACHでの処理（ローダーロックの下）: ミューテックスを取って読み取りのスレッドを作るだけ。待たない。
+/// falseを返すとDllMainがFALSEを返し、DLLは読み込まれない。
 pub fn on_process_attach(module: HMODULE) -> bool {
     let name = mutex_name(std::process::id());
     let mutex = match acquire_named_mutex(&name) {
@@ -293,23 +411,23 @@ pub fn on_process_attach(module: HMODULE) -> bool {
             return false;
         }
         Err(MutexRefusal::Failed(code)) => {
-            // 1 本目と判定できないので読まない（2 本が同じ地点を見張るより、始めない方が安全）。
+            // 1本目と判定できないので読み込まない（2本が同じ地点を監視するより、始めない方が安全）。
             debug_out(&format!(
                 "HiganRTool: 二重注入のミューテックスを作れない（GetLastError = {code}）"
             ));
             return false;
         }
     };
-    // ウィンドウモードのウィンドウを作る呼び出しの差し替え（ini の `[window]`）。ゲームのメインスレッドが走り出す前のここでしか間に合わない。
-    // ini はここで読まない（ローダーロック）。失敗しても DLL の読み込みは止めない。
+    // ウィンドウモードのウィンドウを作る呼び出しの差し替え（iniの`[window]`）。ゲームのメインスレッドが走り出す前のここでしか間に合わない。
+    // iniはここで読まない（ローダーロック）。失敗してもDLLの読み込みは止めない。
     crate::window_win::install(module);
-    // 起動の計測の BeginScene の守り。同じく DllMain の中でしか間に合わず、失敗しても読み込みは止めない。
+    // 起動時の計測のBeginSceneのガード。同じくDllMainの中でしか間に合わない。失敗しても読み込みは止めない。
     crate::calib_guard_win::install();
-    // フルスクリーンの垂直同期の答え（ini の `[pacing] vsync`。ini は最初に答えるときに読む）と、デバイスが失われている間のメインループの寝。
+    // フルスクリーンの垂直同期の答え（iniの`[pacing] vsync`。iniは最初に答えるときに読む）と、デバイスが失われている間のメインループのスリープ。
     crate::vsync_answer_win::install(module);
     crate::lost_sleep_win::install();
-    // SAFETY: `probe_thread` は LPTHREAD_START_ROUTINE の形。引数は自分の DLL のハンドルで、この DLL は自分を解放しない。
-    // 属性 NULL・スタックの大きさ既定・すぐ走らせる・スレッド ID は不要。
+    // SAFETY: `probe_thread`はLPTHREAD_START_ROUTINEの形。引数は自分のDLLのハンドル。このDLLは自分を解放しない。
+    // 属性はNULL・スタックの大きさは既定・すぐ走らせる・スレッドIDは不要。
     let thread = unsafe {
         CreateThread(
             core::ptr::null(),
@@ -330,7 +448,7 @@ pub fn on_process_attach(module: HMODULE) -> bool {
     true
 }
 
-/// 読み取りのスレッドの入口。パニックはここで受け、OS へ出さない。
+/// 読み取りのスレッドの入口。パニックはここで受けてOSへは出さない。
 extern "system" fn probe_thread(param: *mut c_void) -> u32 {
     let r = catch_unwind(AssertUnwindSafe(|| run_probe_thread(param as HMODULE)));
     if r.is_err() {
@@ -355,9 +473,9 @@ fn run_probe_thread(module: HMODULE) {
             return;
         }
     };
-    // 例外の記録は、この後のどこで落ちても残るように、ログを開いた直後に入れる。
+    // 例外の記録はこの後のどこで落ちても残るように、ログを開いた直後に有効にする。
     let veh = crate::crash_win::install(&file);
-    // 区切りの行はウィンドウとパッドの頼まれた行（`DllMain` から積まれる）より先に、包みの外から 1 回で書く。
+    // 区切りの行はウィンドウとパッドの書き込み依頼の行（`DllMain`から積まれる）より先にラッパーの外から1回で書く。
     let stem = run_path.file_stem().map(|s| s.to_string_lossy());
     let header = format!(
         "{}\n",
@@ -371,25 +489,25 @@ fn run_probe_thread(module: HMODULE) {
     if let Some(note) = fallback_note {
         let _ = writeln!(file, "{note}");
     }
-    // ウィンドウとパッドの行（別のスレッドが頼む）は、この包みが本ログの行の先頭ごとに先に書く。
-    // 書く行は 1 行ずつ、ユーザー名・フォルダ・IP のアドレスを伏せてからファイルへ渡す。
+    // ウィンドウとパッドの行（別のスレッドが書き込みを依頼する）は、このラッパーが本ログの行の先頭ごとに先に書く。
+    // 書く行は1行ずつユーザー名・フォルダ・IPのアドレスを伏せてからファイルへ渡す。
     let mut file = crate::main_log::wrap(ScrubWrite::new(
         file,
         log_scrub(exe.as_deref(), dll.as_deref()),
     ));
-    // tick ごとの行などは本ログの隣に、回ごとの名前の先頭で。
+    // tickごとの行などは本ログの隣のファイルに書く。ファイル名は回ごとの名前で始める。
     let exe_dir = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    // 台本の読み込み（DLL のフォルダの script.txt を読み、そのファイルを本ログの隣へ移す。ゲームのフォルダの中には触らない）。
+    // 台本の読み込み（DLLのフォルダのscript.txtを読み、そのファイルを本ログの隣へ移す。ゲームのフォルダの中には触らない）。
     let mut script = RealScriptHost {
         dll_dir: dll.as_deref().and_then(Path::parent).map(Path::to_path_buf),
         run_path: Some(run_path.clone()),
         exe_dir: exe_dir.clone(),
     };
-    // 配るバージョンで ini が無ければ、最初に読む前に既定を書き出す（開発用のビルドは書かない）。
+    // 配布バージョンでiniが無ければ最初に読む前に既定を書き出す（開発用のビルドは書かない）。
     let seed_line = script
         .seed_default_ini(crate::ini_seed::default_for_build(cfg!(feature = "dist")).as_deref())
         .log_line();
-    // 簡潔か詳細かは、ログに書き始める前に決める（ini の読めない理由は後の `ini:` の行が書く）。
+    // 簡潔か詳細かをログに書き始める前に決める（iniが読めない理由は後の`ini:`の行に書く）。
     let choice = higanr_core::log_cfg::choose(
         script.read_net_ini().ok().flatten().as_deref(),
         crate::log_mode::default_detail(cfg!(feature = "dist")),
@@ -406,7 +524,7 @@ fn run_probe_thread(module: HMODULE) {
         let _ = writeln!(file, "環境: Wine {v}");
     }
     log_prng_fallback_once(&mut file);
-    // 落ちたときの `d3d8.dll+RVA` が OS のものか差し替えかを読めるように。
+    // クラッシュしたときの`d3d8.dll+RVA`がOSのものか差し替えかを判別できるように。
     let _ = writeln!(file, "{}", crate::d3d8_info_win::d3d8_line());
     if let Some(line) = &seed_line {
         let _ = writeln!(file, "{line}");
@@ -414,7 +532,7 @@ fn run_probe_thread(module: HMODULE) {
     if let Some(note) = &choice.note {
         let _ = writeln!(file, "{note}");
     }
-    // 配るバージョンだけ、`logs\` の古いログを消す（このスレッドはゲームのスレッドではない。フックを設置する前の数 ms）。
+    // 配布バージョンだけ`logs\`の古いログを消す（このスレッドはゲームのスレッドではない。フックを設置する前の数ms）。
     if cfg!(feature = "dist")
         && let Some(dir) = run_path.parent()
     {
@@ -450,12 +568,12 @@ fn run_probe_thread(module: HMODULE) {
             },
             WINDOW_ADDR,
             &COPY_TABLE,
-            // 描画だけのフレームの実験は 180 秒。
+            // 描画だけのフレームの実験は180秒。
             crate::render_only::TOTAL_SECONDS,
             &mut file,
         )
     }));
-    // パッドの終わりの数えの 1 行を頼む。次の本ログへの書き込みの始まりで本ログへ入る。
+    // パッドの終了時のカウントの1行の書き込みを依頼する。次の本ログへの書き込みの開始時に本ログへ入る。
     crate::pad_extra_win::push_final_counts();
     log_prng_fallback_once(&mut file);
     let _ = match r {
@@ -466,7 +584,7 @@ fn run_probe_thread(module: HMODULE) {
             detail_out(&mut file),
             "終了: スレッドを終了します（フックは残ります。外す手順はありません）"
         ),
-        // パニックがどこで起きたかで、書いたかどうかは変わる。止めたスレッドは `hook::Stopped` の Drop が戻している。
+        // パニックがどこで起きたかによって書いたかどうかは変わる。止めたスレッドは`hook::Stopped`のDropが戻している。
         Err(p) => writeln!(
             file,
             "終了: パニックを受けて止めました（{}）。スレッドを終えます（書いたかどうかは上の行を見てください）。",
@@ -476,12 +594,13 @@ fn run_probe_thread(module: HMODULE) {
     if let Some(line) = crate::crash_win::summary_line() {
         let _ = writeln!(file, "{line}");
     }
-    // 「終了」の行の後に頼まれた分も本ログの最後へ流す。
+    // 「終了」の行の後に書き込みを依頼された分も本ログの最後へ書き出す。
     file.drain_now();
 }
 
-/// `ProcessPrng` の代わりが使われていれば 1 回だけ書く。乱数は引かず数を読むだけなので、ログの先頭の時点で標準ライブラリの種が
-/// まだ引かれていなければ書かれない。終わりの前にもう一度呼ぶ。
+/// `ProcessPrng`の代わりが使われていれば1回だけ書く。
+/// 乱数は生成せず数を読むだけなので、ログの先頭の時点で標準ライブラリのシードがまだ生成されていなければ書かれない。
+/// 終わりの前にもう一度呼ぶ。
 fn log_prng_fallback_once(file: &mut impl Write) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if higanr_prng_shim::fallback_in_use()
@@ -491,7 +610,7 @@ fn log_prng_fallback_once(file: &mut impl Write) {
     }
 }
 
-/// ログに書く行から伏せるフォルダ（ゲームと DLL）。名前が出ない形に替えて書く。
+/// ログに書く行から伏せるフォルダ（ゲームとDLL）。名前が出ない形に替えて書く。
 fn log_scrub(exe: Option<&Path>, dll: Option<&Path>) -> Scrub {
     let mut s = Scrub::new();
     if let Some(d) = dll.and_then(Path::parent) {
@@ -522,7 +641,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// 台本・検査の実行か（`names::is_scripted_run`）。本ログを回ごとの名前にする。
+/// 台本・検査の実行かどうか（`names::is_scripted_run`）。本ログを回ごとの名前にする。
 fn scripted_run(dll: &Path) -> bool {
     is_scripted_run(
         std::env::var_os(higanr_core::ini::PATH_ENV).as_deref(),
@@ -532,8 +651,8 @@ fn scripted_run(dll: &Path) -> bool {
     )
 }
 
-/// DLL と同じフォルダの `logs\` に本ログを開く。`logs\` が exe のフォルダと同じかその下なら、書かずに断る。
-/// 開いたファイルと、隣のファイルの名前の元になるパス（回ごとの名前。台本の実行では本ログそのもの）を返す。
+/// DLLと同じフォルダの`logs\`に本ログを開く。`logs\`がexeのフォルダと同じかその下なら書かずに断る。
+/// 開いたファイルと隣のファイルの名前の元になるパス（回ごとの名前。台本の実行では本ログそのもの）を返す。
 fn open_log(dll: Option<&Path>, exe: Option<&Path>) -> Result<MainLog, String> {
     let dll = dll.ok_or("DLL のパスが取れない")?;
     let dir = dll
@@ -553,25 +672,26 @@ fn open_log(dll: Option<&Path>, exe: Option<&Path>) -> Result<MainLog, String> {
     open_main_log(&dir, &local_time(), std::process::id(), scripted_run(dll))
 }
 
-/// 開いた本ログ。`run_path` は隣のファイルの名前の元（回ごとの名前。台本の実行では本ログそのもの）。
+/// 開いた本ログ。`run_path`は隣のファイルの名前の元（回ごとの名前。台本の実行では本ログそのもの）。
 struct MainLog {
     file: File,
     run_path: PathBuf,
-    /// 日ごとの本ログを使えず起動ごとのファイルにしたときの、本ログの先頭に足す 1 行。
+    /// 日ごとの本ログを使えず起動ごとのファイルにしたときの、本ログの先頭に足す1行。
     fallback_note: Option<&'static str>,
 }
 
 const FALLBACK_NOTE: &str = "同日のログが他のプログラムに使われていて開けませんでした。\n起動ごとに別のファイルへ書きます。";
 
-/// 日ごとの本ログを開くときの共有の指定（`FILE_SHARE_READ | FILE_SHARE_DELETE`）。読みと削除だけ許し、書き込みは 1 つの起動に限る
-/// （同じ日の 2 つの起動が同じファイルへ書くと、区切りの行の範囲が崩れる）。
+/// 日ごとの本ログを開くときの共有の指定（`FILE_SHARE_READ | FILE_SHARE_DELETE`）。
+/// 読み取りと削除だけ許す。書き込みは1つの起動に限る。
+/// 同じ日の2つの起動が同じファイルへ書くと、区切りの行の範囲が崩れるため。
 const DAILY_SHARE: u32 = 1 | 4;
 
 /// `ERROR_SHARING_VIOLATION`。
 const SHARING_VIOLATION: i32 = 32;
 
-/// 回ごと（`per_run`）なら、回ごとの名前を `create_new` で開く。そうでなければ日ごとの名前を追記で開く。
-/// 日ごとのファイルを別の起動が書き込みで開いていれば（共有違反）、回ごとの名前へ逃がす。
+/// 回ごと（`per_run`）なら回ごとの名前を`create_new`で開く。そうでなければ日ごとの名前を追記で開く。
+/// 日ごとのファイルを別の起動が書き込みで開いていれば（共有違反）回ごとの名前へ切り替える。
 fn open_main_log(dir: &Path, t: &LocalTime, pid: u32, per_run: bool) -> Result<MainLog, String> {
     use std::os::windows::fs::OpenOptionsExt;
     if !per_run {
@@ -620,7 +740,7 @@ fn open_per_run(dir: &Path, t: &LocalTime, pid: u32) -> Result<(File, PathBuf), 
     Err("ログの名前がすべて使われていた".to_string())
 }
 
-/// `dir` の直下で、名前の日付が古いログを消す（判定は `names::is_expired_log`。フォルダとリンクには触らない）。（消した数, 消せなかった数）。
+/// `dir`の直下にあるログのうち名前の日付が古いものを消す（判定は`names::is_expired_log`。フォルダとリンクには触らない）。返り値は（消した数, 消せなかった数）。
 fn prune_old_logs(dir: &Path, today: &LocalTime, keep_days: i64) -> (usize, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (0, 0);
@@ -667,18 +787,64 @@ impl Env for RealEnv {
 
 #[cfg(test)]
 mod tests {
-    //! 本物の Win32 を、検査のプロセス自身に当てる（花映塚は使わない）。
+    //! 本物のWin32を、検査のプロセス自身に当てる（花映塚は使わない）。
     use super::*;
 
     static SAMPLE: [u8; 8] = [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE];
 
-    // 変数の綴りが違う・変数を設定する呼びが消えても、リンクは通り、`delayimp.lib` の既定の何もしない hook が選ばれてしまう。
+    // システムのコードページに依らず、番号を指定して本物の変換を実行する（936と932の表は日本語のWindowsにも入っている）。
+    #[test]
+    fn code_page_936_reads_and_writes_chinese_and_932_does_not() {
+        let gb = CodePage(936);
+        assert_eq!(gb.decode(&[0xB6, 0xAB]).as_deref(), Some("东"));
+        assert_eq!(
+            gb.encode("D:\\东方").unwrap(),
+            b"D:\\\xB6\xAB\xB7\xBD".to_vec()
+        );
+        let sj = CodePage(932);
+        assert_eq!(sj.decode(&[0xB6, 0xAB]).as_deref(), Some("ｶｫ"));
+        assert_eq!(sj.encode("东"), None);
+        assert_eq!(sj.encode("ア"), Some(vec![0x83, 0x41]));
+        assert_eq!(gb.encode("ｱ"), None);
+    }
+
+    #[test]
+    fn code_page_conversion_refuses_what_does_not_come_back() {
+        for cp in [CodePage(932), CodePage(936)] {
+            assert_eq!(cp.encode("a😀"), None);
+            assert_eq!(cp.encode("¥"), None);
+            assert_eq!(cp.encode(""), Some(vec![]));
+            assert_eq!(cp.decode(&[0x81]), None);
+            assert_eq!(cp.decode(b""), Some(String::new()));
+            assert_eq!(cp.encode("abc"), Some(b"abc".to_vec()));
+        }
+    }
+
+    #[test]
+    fn utf8_code_page_round_trips_without_flags() {
+        let u = CodePage(CP_UTF8);
+        assert_eq!(u.encode("东"), Some("东".as_bytes().to_vec()));
+        assert_eq!(u.decode("东".as_bytes()).as_deref(), Some("东"));
+        assert_eq!(u.decode(&[0xFF]), None);
+    }
+
+    #[test]
+    fn the_process_code_page_matches_its_number() {
+        // SAFETY: 引数の無い呼び出し。
+        let acp = unsafe { GetACP() };
+        let s = "abc\\def";
+        assert_eq!(AcpAnsi.encode(s), CodePage(acp).encode(s));
+        let all = (0x20u8..0x7F).collect::<Vec<_>>();
+        assert_eq!(AcpAnsi.decode(&all), CodePage(acp).decode(&all));
+    }
+
+    // 変数の綴りが違っても、変数を設定する呼び出しが消えてもリンクは通る。その場合`delayimp.lib`の既定の何もしないhookが選ばれてしまう。
     #[test]
     fn delay_load_hook_variables_are_ours() {
         higanr_prng_shim::assert_delay_load_hooks_installed!();
     }
 
-    // 文面を読む検査なので、リンクされた DLL は見ていない（配布のビルドの `check_pe` が通常の import を見る）。
+    // 文面を読む検査なのでリンクされたDLLは見ていない（配布のビルドの`check_pe`が通常のimportを見る）。
     #[test]
     fn build_rs_passes_the_delay_load_flags() {
         let build_rs = include_str!("../build.rs");
@@ -691,7 +857,7 @@ mod tests {
         }
     }
 
-    /// Windows では `wine_get_version` が無く `None`。Wine で走らせたときはバージョンの文字列（空でない ASCII）になる。
+    /// Windowsでは`wine_get_version`が無く`None`。Wineで走らせたときはバージョンの文字列（空でないASCII）になる。
     #[test]
     fn wine_version_is_none_or_a_plain_string() {
         if let Some(v) = wine_version() {
@@ -862,7 +1028,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 共有違反のときの理由の 1 行・書き込み中の日ごとの本ログを既定の共有で読めないことも見る。
+    /// 共有違反のときの理由の1行を検証する。書き込み中の日ごとの本ログを既定の共有で読み取れないことも検証する。
     #[test]
     fn a_second_launch_on_the_same_day_falls_back_to_its_own_file() {
         let d = temp_logs("share");

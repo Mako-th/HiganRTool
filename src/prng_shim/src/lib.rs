@@ -1,8 +1,12 @@
-//! `bcryptprimitives.dll!ProcessPrng` の遅延読み込みの失敗・欠落への備え。
-//! Rust の標準ライブラリは `HashMap` の乱数の種を `ProcessPrng` で引き、通常の import で結ぶ。この関数が無い・実装されていない Wine では exe や DLL が動き出す前後に落ちる。そこで loader と dll の `build.rs` が `/DELAYLOAD:` で最初の呼びまで遅らせ、MSVC の遅延読み込みの hook（`delayimp.h`）で次の 3 通りをふさぐ。
-//! DLL が読めない: 失敗の hook（`__pfnDliFailureHook2`、`dliFailLoadLib`）が自プロセスの exe のハンドルを返し、helper の `GetProcAddress` の失敗から次へ進む。DLL にその名前の export が無い: 失敗の hook（`dliFailGetProc`）が [`process_prng_fallback`] を返す。
-//! export はあるが `@ stub`（呼ぶと中断する穴埋め）: `GetProcAddress` が成功するので失敗の hook は呼ばれない。通知の hook（`__pfnDliNotifyHook2`、`dliNotePreGetProcAddress`）が、Wine の上でだけ先に代わりを返す。
-//! Windows では DLL も関数もあるので、どちらの hook も本物を使わせる。hook の変数は [`install_delay_load_hook!`] で使う側のクレートに定義する（rlib の中の定義は、リンカーが delayimp.lib の既定の定義より先に選ぶ保証が無い）。
+//! `bcryptprimitives.dll!ProcessPrng`の遅延読み込みの失敗・欠落への備え。
+//! Rustの標準ライブラリは`HashMap`の乱数の種を`ProcessPrng`で取得し、通常のimportで結ぶ。
+//! この関数が無い・実装されていないWineでは、exeやDLLが動き出す前後に落ちる。
+//! そこでloaderとdllの`build.rs`が`/DELAYLOAD:`で最初の呼び出しまで遅らせ、MSVCの遅延読み込みのhook（`delayimp.h`）で次の3通りをふさぐ。
+//! DLLが読めない場合: 失敗のhook（`__pfnDliFailureHook2`、`dliFailLoadLib`）が自プロセスのexeのハンドルを返す。helperの`GetProcAddress`が失敗して次へ進む。
+//! DLLにその名前のexportが無い場合: 失敗のhook（`dliFailGetProc`）が[`process_prng_fallback`]を返す。
+//! exportはあるが`@ stub`（呼ぶと中断する穴埋め）の場合: `GetProcAddress`が成功するので失敗のhookは呼ばれない。通知のhook（`__pfnDliNotifyHook2`、`dliNotePreGetProcAddress`）が、Wineの上でだけ先に代わりを返す。
+//! WindowsではDLLも関数もあるので、どちらのhookも本物を使わせる。
+//! hookの変数は[`install_delay_load_hook!`]で使う側のクレートに定義する。rlibの中の定義は、リンカーがdelayimp.libの既定の定義より先に選ぶ保証が無いため。
 
 use core::ffi::{CStr, c_void};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -15,27 +19,27 @@ use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 
-/// 遅延読み込みにする DLL の名前。`build.rs` の `/DELAYLOAD:` はこの定数から作る。
+/// 遅延読み込みにするDLLの名前。`build.rs`の`/DELAYLOAD:`はこの定数から作る。
 pub const PRNG_DLL: &str = "bcryptprimitives.dll";
-/// 標準ライブラリが引く関数の名前。
+/// 標準ライブラリが呼ぶ関数の名前。
 pub const PRNG_PROC: &str = "ProcessPrng";
-/// Wine の ntdll だけが出す関数。あれば Wine の上。
+/// Wineのntdllだけが出す関数。あればWineの上。
 const WINE_MODULE: &str = "ntdll.dll";
 const WINE_EXPORT: &CStr = c"wine_get_version";
 
-/// `delayimp.h` の通知の番号（0 始まり）。
+/// `delayimp.h`の通知の番号（0始まり）。
 pub const DLI_NOTE_PRE_GET_PROC: u32 = 2;
 pub const DLI_FAIL_LOAD_LIB: u32 = 3;
 pub const DLI_FAIL_GET_PROC: u32 = 4;
 
-/// `delayimp.h` の `DelayLoadProc`（`szProcName` と `dwOrdinal` の共用体は、i686 ではどちらも 4 バイト）。
+/// `delayimp.h`の`DelayLoadProc`（`szProcName`と`dwOrdinal`の共用体は、i686ではどちらも4バイト）。
 #[repr(C)]
 pub struct DelayLoadProc {
     pub import_by_name: i32,
     pub name_or_ordinal: *const u8,
 }
 
-/// `delayimp.h` の `DelayLoadInfo`。hook が読むだけ。
+/// `delayimp.h`の`DelayLoadInfo`。hookが読むだけ。
 #[repr(C)]
 pub struct DelayLoadInfo {
     pub cb: u32,
@@ -48,18 +52,18 @@ pub struct DelayLoadInfo {
     pub last_error: u32,
 }
 
-/// hook の型（`PfnDliHook`）。
+/// hookの型（`PfnDliHook`）。
 pub type DelayLoadHook = unsafe extern "system" fn(u32, *const DelayLoadInfo) -> *const c_void;
 
-/// `ProcessPrng` と同じ型（`BOOL ProcessPrng(PBYTE, SIZE_T)`）。
+/// `ProcessPrng`と同じ型（`BOOL ProcessPrng(PBYTE, SIZE_T)`）。
 pub type ProcessPrngFn = unsafe extern "system" fn(*mut u8, usize) -> i32;
 
-/// 戻り値は BOOLEAN（AL だけが有効）。上位ビットは不定なので、u32 で受けて下位 8 ビットだけ見る。
+/// 戻り値はBOOLEAN（ALだけが有効）。上位ビットは不定なのでu32で受けて下位8ビットだけ見る。
 type RtlGenRandomFn = unsafe extern "system" fn(*mut u8, u32) -> u32;
 
-/// hook の変数 `__pfnDliFailureHook2` と `__pfnDliNotifyHook2`（i686 の C の名前は先頭に `_` が付く）を定義する。
-/// 使う側のクレートで 1 回だけ呼ぶ（loader の `real.rs`・dll の `win.rs`）。
-/// `#[no_mangle]` の `static` にすると rustc が cdylib の export に出してしまうので、アセンブラで 4 バイトの定数として定義する。
+/// hookの変数`__pfnDliFailureHook2`と`__pfnDliNotifyHook2`（i686のCの名前は先頭に`_`が付く）を定義する。
+/// 使う側のクレートで1回だけ呼ぶ（loaderの`real.rs`・dllの`win.rs`）。
+/// `#[no_mangle]`の`static`にするとrustcがcdylibのexportに出してしまうので、アセンブラで4バイトの定数として定義する。
 #[macro_export]
 macro_rules! install_delay_load_hook {
     () => {
@@ -80,8 +84,9 @@ macro_rules! install_delay_load_hook {
     };
 }
 
-/// [`install_delay_load_hook!`] で定義した 2 つの変数が、リンカーに自前の hook として選ばれていることを検査する
-/// （変数の綴りを誤ると delayimp.lib の既定の定義が選ばれ、リンクは通る）。検査の中で 1 回呼ぶ。
+/// [`install_delay_load_hook!`]で定義した2つの変数が、リンカーに自前のhookとして選ばれていることを検査する。
+/// 変数の綴りを誤るとdelayimp.libの既定の定義が選ばれる（リンクは通る）。
+/// 検査の中で1回呼ぶ。
 #[macro_export]
 macro_rules! assert_delay_load_hooks_installed {
     () => {{
@@ -90,20 +95,20 @@ macro_rules! assert_delay_load_hooks_installed {
             static __pfnDliFailureHook2: usize;
             static __pfnDliNotifyHook2: usize;
         }
-        // SAFETY: どちらも `install_delay_load_hook!` が `.rdata` に置いた 4 バイトの定数。
+        // SAFETY: どちらも`install_delay_load_hook!`が`.rdata`に置いた4バイトの定数。
         let (failure, notify) = unsafe { (__pfnDliFailureHook2, __pfnDliNotifyHook2) };
         assert_eq!(failure, $crate::delay_load_failure_hook as *const () as usize);
         assert_eq!(notify, $crate::delay_load_notify_hook as *const () as usize);
     }};
 }
 
-/// 代わりの関数が呼ばれた回数（0 なら本物の `ProcessPrng` を使えている）。
+/// 代わりの関数が呼ばれた回数（0なら本物の`ProcessPrng`を使えている）。
 static FALLBACK_CALLS: AtomicU32 = AtomicU32::new(0);
-/// そのうち、OS の乱数が引けず非暗号の種で埋めた回数。
+/// そのうちOSの乱数を取得できず非暗号の種で埋めた回数。
 static WEAK_CALLS: AtomicU32 = AtomicU32::new(0);
-/// 非暗号の種を呼びごとに変えるための通し番号（時計の刻みが同じ瞬間の 2 回の呼びでも別の列になる）。
+/// 非暗号の種を呼び出しごとに変えるための通し番号（時計の値が同じ瞬間の2回の呼び出しでも別の列になる）。
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
-/// `advapi32!SystemFunction036` のアドレス。0 は未解決、1 は引けなかった。
+/// `advapi32!SystemFunction036`のアドレス。0は未解決。1は取得に失敗した。
 static RTL_GEN_RANDOM: AtomicUsize = AtomicUsize::new(0);
 
 pub fn fallback_calls() -> u32 {
@@ -114,13 +119,13 @@ pub fn weak_calls() -> u32 {
     WEAK_CALLS.load(Ordering::Relaxed)
 }
 
-/// 代わりが使われたか。数を読むだけで、乱数は引かない（引くと、まだ結ばれていない `ProcessPrng` をここで結んでしまい、
-/// 「使わなかった」と誤って記録する）。
+/// 代わりが使われたかどうか。数を読むだけ。乱数は生成しない。
+/// 生成すると、まだ結ばれていない`ProcessPrng`をここで結んでしまい、「使わなかった」と誤って記録する。
 pub fn fallback_in_use() -> bool {
     fallback_calls() > 0
 }
 
-/// `fallback_in_use` が真のときにログへ書く一行。
+/// `fallback_in_use`が真のときにログへ書く一行。
 pub fn fallback_log_line() -> String {
     let weak = weak_calls();
     format!(
@@ -133,25 +138,25 @@ fn eq_ignore_ascii_case(a: &[u8], b: &str) -> bool {
     a.eq_ignore_ascii_case(b.as_bytes())
 }
 
-/// 代わりを出す相手か。DLL 名は大文字小文字を区別せず、関数名は区別する（`GetProcAddress` と同じ）。
-/// 順序番号の import（`import_by_name` が 0）は断る。
+/// 代わりを出す相手かどうか。DLL名は大文字小文字を区別せず、関数名は区別する（`GetProcAddress`と同じ）。
+/// 順序番号のimport（`import_by_name`が0）は断る。
 pub fn is_prng_import(dll: &[u8], proc_name: Option<&[u8]>) -> bool {
     eq_ignore_ascii_case(dll, PRNG_DLL) && proc_name == Some(PRNG_PROC.as_bytes())
 }
 
-/// `module` が読み込み済みで `name` を export しているか（読み込みはしない）。
+/// `module`が読み込み済みで`name`をexportしているかどうか（読み込みはしない）。
 fn exports(module: &str, name: &CStr) -> bool {
     let mut w = [0u16; 32];
     for (d, s) in w.iter_mut().zip(module.encode_utf16().take(31)) {
         *d = s;
     }
-    // SAFETY: 終端 0 つきの UTF-16 の名前。参照カウントは増えない。
+    // SAFETY: 終端0つきのUTF-16の名前。参照カウントは増えない。
     let h = unsafe { GetModuleHandleW(w.as_ptr()) };
-    // SAFETY: 有効なモジュールのハンドル（NULL なら GetProcAddress が失敗を返すだけ）と終端 0 つきの名前。
+    // SAFETY: 有効なモジュールのハンドル（NULLならGetProcAddressが失敗を返すだけ）と終端0つきの名前。
     !h.is_null() && unsafe { GetProcAddress(h, name.as_ptr().cast()) }.is_some()
 }
 
-/// Wine の上か（`ntdll.dll` が `wine_get_version` を出している）。
+/// Wineの上かどうか（`ntdll.dll`が`wine_get_version`を出している）。
 pub fn is_wine() -> bool {
     is_wine_with(&exports)
 }
@@ -160,18 +165,18 @@ fn is_wine_with(lookup: &dyn Fn(&str, &CStr) -> bool) -> bool {
     lookup(WINE_MODULE, WINE_EXPORT)
 }
 
-/// hook に渡された import の (DLL 名, 関数名)。
+/// hookに渡されたimportの (DLL名, 関数名)。
 ///
 /// # Safety
-/// `info` の文字列は終端 0 つき（helper が渡す形）。
+/// `info`の文字列は終端0つき（helperが渡す形）。
 unsafe fn import_names(info: &DelayLoadInfo) -> Option<(&[u8], Option<&[u8]>)> {
     if info.sz_dll.is_null() {
         return None;
     }
-    // SAFETY: 呼び出し元の約束どおり、DLL の名前は import 表の終端 0 つきの文字列。
+    // SAFETY: 呼び出し元の約束どおり、DLLの名前はimport表の終端0つきの文字列。
     let dll = unsafe { CStr::from_ptr(info.sz_dll.cast()) }.to_bytes();
     let proc_name = if info.dlp.import_by_name != 0 && !info.dlp.name_or_ordinal.is_null() {
-        // SAFETY: 名前での import のとき、同じ共用体は終端 0 つきの関数名を指す。
+        // SAFETY: 名前でのimportのとき、同じ共用体は終端0つきの関数名を指す。
         Some(unsafe { CStr::from_ptr(info.dlp.name_or_ordinal.cast()) }.to_bytes())
     } else {
         None
@@ -183,11 +188,12 @@ fn fallback_ptr() -> *const c_void {
     process_prng_fallback as ProcessPrngFn as usize as *const c_void
 }
 
-/// 遅延読み込みの失敗の通知を受ける。`ProcessPrng` を求められたときだけ答え、ほかは 0（既定の動き = 例外）を返す。
-/// `dliFailLoadLib`（DLL が読めなかった）では、export の無い自プロセスの exe のハンドルを返す（有効な `HMODULE` を返すと helper がそこから `GetProcAddress` を試みて失敗し、次の `dliFailGetProc` に来る）。`dliFailGetProc`（DLL に export が無い）では代わりの関数を返す。
+/// 遅延読み込みの失敗の通知を受ける。`ProcessPrng`を求められたときだけ答える。ほかは0（既定の動き = 例外）を返す。
+/// `dliFailLoadLib`（DLLが読めなかった）では、exportの無い自プロセスのexeのハンドルを返す。有効な`HMODULE`を返すとhelperがそこから`GetProcAddress`を試みて失敗し、次の`dliFailGetProc`に来るため。
+/// `dliFailGetProc`（DLLにexportが無い）では代わりの関数を返す。
 ///
 /// # Safety
-/// `info` は helper が渡す有効な `DelayLoadInfo` を指す（文字列は終端 0 つき）。null なら何もしない。
+/// `info`はhelperが渡す有効な`DelayLoadInfo`を指す（文字列は終端0つき）。nullなら何もしない。
 pub unsafe extern "system" fn delay_load_failure_hook(
     notify: u32,
     info: *const DelayLoadInfo,
@@ -195,15 +201,15 @@ pub unsafe extern "system" fn delay_load_failure_hook(
     if !matches!(notify, DLI_FAIL_LOAD_LIB | DLI_FAIL_GET_PROC) || info.is_null() {
         return core::ptr::null();
     }
-    // SAFETY: 呼び出し元の約束どおり `info` は有効な構造体。
+    // SAFETY: 呼び出し元の約束どおり`info`は有効な構造体。
     let info = unsafe { &*info };
-    // SAFETY: 同上（文字列は終端 0 つき）。
+    // SAFETY: 同上（文字列は終端0つき）。
     let Some((dll, proc_name)) = (unsafe { import_names(info) }) else {
         return core::ptr::null();
     };
     match notify {
         DLI_FAIL_LOAD_LIB if eq_ignore_ascii_case(dll, PRNG_DLL) => {
-            // SAFETY: 引数 NULL は「この exe 自身」。参照カウントは増えない。
+            // SAFETY: 引数NULLは「このexe自身」。参照カウントは増えない。
             let exe = unsafe { GetModuleHandleW(core::ptr::null()) };
             exe.cast_const()
         }
@@ -212,11 +218,12 @@ pub unsafe extern "system" fn delay_load_failure_hook(
     }
 }
 
-/// 遅延読み込みの通知の hook。`dliNotePreGetProcAddress` で、`ProcessPrng` を求められ、かつ Wine の上のときだけ代わりを返す
-/// （helper は `GetProcAddress` を呼ばずにそれを使う）。Wine の判定は import が `ProcessPrng` のときにしか走らない。
+/// 遅延読み込みの通知のhook。`dliNotePreGetProcAddress`で`ProcessPrng`を求められ、かつWineの上のときだけ代わりを返す。
+/// helperは`GetProcAddress`を呼ばずにその代わりを使う。
+/// Wineの判定はimportが`ProcessPrng`のときにしか走らない。
 ///
 /// # Safety
-/// [`delay_load_failure_hook`] と同じ。
+/// [`delay_load_failure_hook`]と同じ。
 pub unsafe extern "system" fn delay_load_notify_hook(
     notify: u32,
     info: *const DelayLoadInfo,
@@ -225,10 +232,10 @@ pub unsafe extern "system" fn delay_load_notify_hook(
     unsafe { notify_hook_with(&is_wine, notify, info) }
 }
 
-/// [`delay_load_notify_hook`] の本体。Wine の判定を差し替えられる（本物の helper を通す検査が使う）。
+/// [`delay_load_notify_hook`]の本体。Wineの判定を差し替えられる（本物のhelperを通す検査が使う）。
 ///
 /// # Safety
-/// [`delay_load_failure_hook`] と同じ。
+/// [`delay_load_failure_hook`]と同じ。
 pub unsafe fn notify_hook_with(
     wine: &dyn Fn() -> bool,
     notify: u32,
@@ -237,9 +244,9 @@ pub unsafe fn notify_hook_with(
     if notify != DLI_NOTE_PRE_GET_PROC || info.is_null() {
         return core::ptr::null();
     }
-    // SAFETY: 呼び出し元の約束どおり `info` は有効な構造体。
+    // SAFETY: 呼び出し元の約束どおり`info`は有効な構造体。
     let info = unsafe { &*info };
-    // SAFETY: 同上（文字列は終端 0 つき）。
+    // SAFETY: 同上（文字列は終端0つき）。
     let Some((dll, proc_name)) = (unsafe { import_names(info) }) else {
         return core::ptr::null();
     };
@@ -250,17 +257,17 @@ pub unsafe fn notify_hook_with(
     }
 }
 
-/// `ProcessPrng` の代わり。常に TRUE（1）を返す（標準ライブラリは失敗を受けない作り）。
-/// `advapi32!SystemFunction036`（RtlGenRandom）で埋め、引けなければ [`weak_fill`] で埋める。
+/// `ProcessPrng`の代わり。常にTRUE（1）を返す（標準ライブラリは失敗を受けない作り）。
+/// `advapi32!SystemFunction036`（RtlGenRandom）で埋める。使えなければ[`weak_fill`]で埋める。
 ///
 /// # Safety
-/// `buf` は `len` バイト書ける（`ProcessPrng` と同じ約束。NULL または `len` が 0 なら何も書かない）。
+/// `buf`は`len`バイト書き込み可能（`ProcessPrng`と同じ約束。NULLまたは`len`が0なら何も書かない）。
 pub unsafe extern "system" fn process_prng_fallback(buf: *mut u8, len: usize) -> i32 {
     FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
     if buf.is_null() || len == 0 {
         return 1;
     }
-    // SAFETY: 呼び出し元（標準ライブラリ）が `len` バイト書ける領域を渡す約束（`ProcessPrng` と同じ）。
+    // SAFETY: 呼び出し元（標準ライブラリ）が`len`バイト書ける領域を渡す約束（`ProcessPrng`と同じ）。
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     if !os_random_fill(out) {
         WEAK_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -274,7 +281,7 @@ fn os_random_fill(out: &mut [u8]) -> bool {
         return false;
     };
     for chunk in out.chunks_mut(1 << 20) {
-        // SAFETY: `chunk` は書ける領域で、長さは u32 に収まる。`f` は advapi32 の SystemFunction036（BOOLEAN WINAPI RtlGenRandom(PVOID, ULONG)）。
+        // SAFETY: `chunk`は書き込み可能な領域で、長さはu32に収まる。`f`はadvapi32のSystemFunction036（BOOLEAN WINAPI RtlGenRandom(PVOID, ULONG)）。
         if unsafe { f(chunk.as_mut_ptr(), chunk.len() as u32) } & 0xFF == 0 {
             return false;
         }
@@ -286,7 +293,7 @@ fn rtl_gen_random() -> Option<RtlGenRandomFn> {
     match RTL_GEN_RANDOM.load(Ordering::Relaxed) {
         0 => {}
         1 => return None,
-        // SAFETY: 下で SystemFunction036 のアドレスとして置いた値。
+        // SAFETY: 下でSystemFunction036のアドレスとして置いた値。
         p => return Some(unsafe { core::mem::transmute::<usize, RtlGenRandomFn>(p) }),
     }
     let advapi32: [u16; 13] = {
@@ -296,10 +303,10 @@ fn rtl_gen_random() -> Option<RtlGenRandomFn> {
         }
         w
     };
-    // SAFETY: 終端 0 つきの UTF-16 の名前。読み込み済みならそれを使い、参照カウントは増やさない。
+    // SAFETY: 終端0つきのUTF-16の名前。読み込み済みならそれを使い、参照カウントは増やさない。
     let mut module = unsafe { GetModuleHandleW(advapi32.as_ptr()) };
     if module.is_null() {
-        // SAFETY: 同上。ファイルハンドルは NULL（予約）、探索は System32 だけ。
+        // SAFETY: 同上。ファイルハンドルはNULL（予約）、探索はSystem32だけ。
         module = unsafe {
             LoadLibraryExW(
                 advapi32.as_ptr(),
@@ -311,13 +318,13 @@ fn rtl_gen_random() -> Option<RtlGenRandomFn> {
     let addr = if module.is_null() {
         None
     } else {
-        // SAFETY: 有効なモジュールのハンドルと終端 0 つきの ASCII の名前。無ければ None。
+        // SAFETY: 有効なモジュールのハンドルと終端0つきのASCIIの名前。無ければNone。
         unsafe { GetProcAddress(module, c"SystemFunction036".as_ptr().cast()) }
     };
     match addr {
         Some(f) => {
             RTL_GEN_RANDOM.store(f as usize, Ordering::Relaxed);
-            // SAFETY: Windows の advapi32 がこの名前で出す関数は `BOOLEAN RtlGenRandom(PVOID, ULONG)`（stdcall）。
+            // SAFETY: Windowsのadvapi32がこの名前で出す関数は`BOOLEAN RtlGenRandom(PVOID, ULONG)`（stdcall）。
             Some(unsafe {
                 core::mem::transmute::<unsafe extern "system" fn() -> isize, RtlGenRandomFn>(f)
             })
@@ -329,11 +336,11 @@ fn rtl_gen_random() -> Option<RtlGenRandomFn> {
     }
 }
 
-/// OS の乱数が引けないときの最後の手の種。暗号の強さは無い（標準ライブラリの `HashMap` の種を 0 のままにしないためだけ。
-/// 秘密の鍵はこの経路を通らず、dll が `BCryptGenRandom` で直接引く）。
+/// OSの乱数を取得できないときの最後の手段の種。暗号の強さは無い。標準ライブラリの`HashMap`の種を0のままにしないためだけに使う。
+/// 秘密の鍵はこの経路を通らず、dllが`BCryptGenRandom`で直接生成する。
 fn weak_seed() -> u64 {
     let mut qpc = 0i64;
-    // SAFETY: 書ける i64 を渡す。失敗しても 0 のまま。
+    // SAFETY: 書き込み可能なi64を渡す。失敗しても0のまま。
     unsafe { QueryPerformanceCounter(&mut qpc) };
     // SAFETY: 引数なしの呼び。
     let (tick, pid, tid) = unsafe {
@@ -356,7 +363,7 @@ fn weak_seed() -> u64 {
     s
 }
 
-/// `seed` から決まる列で `out` を埋める（splitmix64）。
+/// `seed`から決まる列で`out`を埋める（splitmix64）。
 pub fn weak_fill(out: &mut [u8], seed: u64) {
     let mut s = seed;
     for chunk in out.chunks_mut(8) {
@@ -393,7 +400,7 @@ mod tests {
     }
 
     fn call(notify: u32, i: &DelayLoadInfo) -> *const c_void {
-        // SAFETY: `i` は有効な構造体で、文字列は 'static の終端 0 つき。
+        // SAFETY: `i`は有効な構造体で、文字列は 'staticの終端0つき。
         unsafe { delay_load_failure_hook(notify, i) }
     }
 
@@ -403,7 +410,7 @@ mod tests {
     }
 
     fn fb(buf: *mut u8, len: usize) -> i32 {
-        // SAFETY: 呼び出し側が渡すのは書ける配列か NULL（長さ 0 を含む）。
+        // SAFETY: 呼び出し側が渡すのは書き込み可能な配列かNULL（長さ0を含む）。
         unsafe { process_prng_fallback(buf, len) }
     }
 
@@ -411,7 +418,7 @@ mod tests {
         process_prng_fallback as ProcessPrngFn as usize as *const c_void
     }
 
-    // 通知の番号は本物の helper を通す検査（tests/delay_load.rs）が見る。
+    // 通知の番号は本物のhelperを通す検査（tests/delay_load.rs）が見る。
     #[test]
     fn layout_matches_delayimp_h() {
         #[cfg(target_arch = "x86")]
@@ -435,7 +442,7 @@ mod tests {
         let i = info(c"bcryptprimitives.dll", Some(c"ProcessPrng"));
         let h = call(DLI_FAIL_LOAD_LIB, &i);
         assert!(!h.is_null());
-        // SAFETY: 返ったハンドルは自分の exe。名前は終端 0 つきの ASCII。
+        // SAFETY: 返ったハンドルは自分のexe。名前は終端0つきのASCII。
         let p = unsafe { GetProcAddress(h.cast_mut(), c"ProcessPrng".as_ptr().cast()) };
         assert!(p.is_none());
     }
@@ -465,7 +472,7 @@ mod tests {
         for n in [0, 1, 2, 5, 99] {
             assert!(call(n, &i).is_null(), "{n}");
         }
-        // SAFETY: NULL を渡す約束の検査。
+        // SAFETY: NULLを渡す約束の検査。
         assert!(unsafe { delay_load_failure_hook(DLI_FAIL_GET_PROC, core::ptr::null()) }.is_null());
         let mut i = info(c"bcryptprimitives.dll", None);
         i.sz_dll = core::ptr::null();
@@ -506,7 +513,7 @@ mod tests {
         assert!(!is_wine_with(&only("kernel32.dll", c"wine_get_version")));
         assert!(!is_wine_with(&only("ntdll.dll", c"NtClose")));
         assert!(!is_wine_with(&|_, _| false));
-        // 本物の問い合わせが読めている証拠（陽性対照）。この PC は Windows なので `is_wine` は偽。
+        // 本物の問い合わせが読めている証拠（陽性対照）。このPCはWindowsなので`is_wine`は偽。
         assert!(exports("ntdll.dll", c"NtClose") && exports("kernel32.dll", c"GetProcAddress"));
         assert!(!exports("ntdll.dll", c"HigNoSuchExport") && !exports("higanr_no_such.dll", c"x"));
         assert!(!is_wine());
@@ -520,19 +527,19 @@ mod tests {
         assert_eq!(fb(a.as_mut_ptr(), a.len()), 1);
         assert_eq!(fb(b.as_mut_ptr(), b.len()), 1);
         assert!(fallback_calls() >= before + 2);
-        // この PC では advapi32 から引けるので、非暗号の種の道は通らない。
+        // このPCではadvapi32から取得できるので非暗号の種の経路は通らない。
         assert_eq!(weak_calls(), 0);
         assert_ne!(a, b);
         for x in [&a, &b] {
             assert!(x.iter().filter(|&&v| v == 0).count() < 100, "ほぼ 0 のまま");
             assert!(x[..8].iter().any(|&v| v != 0) && x[4088..].iter().any(|&v| v != 0));
         }
-        // 長さ 0・NULL は何も書かず TRUE。
+        // 長さ0・NULLは何も書かずTRUE。
         assert_eq!(fb(core::ptr::null_mut(), 16), 1);
         let mut c = [0xAAu8; 3];
         assert_eq!(fb(c.as_mut_ptr(), 0), 1);
         assert_eq!(c, [0xAA; 3]);
-        // 長さが 8 の倍数でなくても、指定の長さの先は書かない。
+        // 長さが8の倍数でなくても指定の長さの先は書かない。
         let mut d = [0u8; 12];
         assert_eq!(fb(d.as_mut_ptr(), 5), 1);
         assert_eq!(&d[5..], &[0u8; 7]);
@@ -555,13 +562,13 @@ mod tests {
         assert_ne!(weak_seed(), weak_seed());
     }
 
-    // この検査の exe は遅延読み込みではないので、標準ライブラリの種の取得では代わりが呼ばれない。
+    // この検査のexeは遅延読み込みではないので標準ライブラリの種の取得では代わりが呼ばれない。
     #[test]
     fn log_line_carries_the_counts_and_in_use_follows_the_counter() {
         let before = fallback_calls();
         fb(core::ptr::null_mut(), 0);
         assert!(fallback_in_use());
-        // 他の検査も並行して呼ぶので、回数は前の値より大きいことだけを見る。
+        // 他の検査も並行して呼ぶので回数は前の値より大きいことだけを見る。
         let line = fallback_log_line();
         let n: u32 = line
             .split_once('（')

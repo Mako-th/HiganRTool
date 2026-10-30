@@ -1,11 +1,13 @@
-//! 入口（素のアセンブリ）と、書き出しのスレッド・ファイルの層（unsafe は入口のアセンブリだけ）。表の形・集計・設置の手順は `alloc_count.rs`（pure）。
+//! 入口（素のアセンブリ）と、書き出しのスレッド・ファイルの層（unsafeは入口のアセンブリだけ）。表の形・集計・設置の手順は`alloc_count.rs`（pure）。
 //!
-//! - 入口 5 つ（`alloc_entry_0`〜`alloc_entry_4`。`th09_addr::ALLOC_SITES` の並び）。関数の先頭に書いた `E9` から飛んでくる。`[esp]`（呼び出し元の戻りアドレス）を鍵に、スレッドの別ごとの表へ数えてから、
-//!   その入口のトランポリン（盗んだ命令 ＋ 元の続きへの `E9`）へ飛ぶ。**ゲームのスレッドで Rust のコードは走らない**（呼ぶ関数も無い）。
-//! - 書き出しのスレッド: 1 秒ごとに表を読み、ゲームの場面の値を読み、`_alloc_sec.csv` と `_alloc_calls.csv` に 1 秒ぶんを足す。終わりに `_alloc_callers.csv` と `_alloc_table.csv`。
-//!   ファイルは本ログの隣（`logs\`）に、本ログの名前の先頭で `create_new`（既存を上書きしない）。
+//! - 入口5つ（`alloc_entry_0`〜`alloc_entry_4`。`th09_addr::ALLOC_SITES`の並び）。関数の先頭に書いた`E9`から飛んでくる。
+//!   `[esp]`（呼び出し元の戻りアドレス）を鍵に、スレッドの別ごとの表へ数える。
+//!   その後、その入口のトランポリン（盗んだ命令 ＋ 元の続きへの`E9`）へ飛ぶ。
+//!   **ゲームのスレッドでRustのコードは走らない**（呼ぶ関数も無い）。
+//! - 書き出しのスレッド: 1秒ごとに表とゲームの場面の値を読み、`_alloc_sec.csv`と`_alloc_calls.csv`に1秒ぶんを足す。終わりに`_alloc_callers.csv`と`_alloc_table.csv`を書く。
+//!   ファイルは本ログの隣（`logs\`）に、本ログの名前の先頭で`create_new`（既存を上書きしない）。
 //!
-//! ゲームには、`alloc_count::install_all` が照合を通した 5 地点の detour（6〜7 バイト）のほかは何も書かない。
+//! ゲームには、`alloc_count::install_all`が照合を通した5地点のdetour（6〜7バイト）のほかは何も書かない。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -34,22 +36,25 @@ use crate::th09_addr::{
 use crate::ticks::SlotRead;
 use crate::win::read_own_memory;
 
-// SAFETY（`#[unsafe(naked)]`。下の 5 つの入口に共通）: 本体は `naked_asm!` だけ。関数の先頭（`call` の直後で、`[esp]` が戻りアドレス）に
-// 書いた `E9` から飛んでくる。
-// - eax・ecx・edx・ebx・esi・edi を push し、最後に逆の順で pop してから、その入口のトランポリンへ `jmp` する（戻りアドレスを積まない）。
-//   esp は push / pop で動くだけで `jmp` の時点では入った時と同じ。ecx（包みの this `0x4AD018`）も戻すので、トランポリンが実行する
-//   盗んだ命令と元の続きは、入った時と同じレジスタとスタックを見る。ebp には書かない。
-// - フラグは戻さない: 関数の先頭では呼ぶ側はフラグを当てにできず（保たれるのは DF = 0 だけで、入口は DF を変えない）、
-//   5 つの盗んだ命令と直後の数命令はフラグを読まない。
-// - 書くのは DLL の静的変数（ALLOC_TOTALS・ALLOC_OVERFLOW・ALLOC_TABLES の 1 枠）だけ。ゲームのメモリは読まない
-//   （`[esp + 24]` は自分のスレッドのスタック、`fs:[0x24]` は自分の TEB）。
-// - 表の番号 edi = 地点 × 2 ＋ スレッドの別（0..TABLE_COUNT）、枠の番号 edx は `and SLOT_MASK` で表の中に収まり、
-//   `[ebx + edx*8]` は自分の表の中だけ。鍵（戻りアドレス）は 0 にならない。空きの枠は `lock cmpxchg` で取り、たどるのは PROBES 枠までなのでループは必ず終わる。
-// - トランポリンのアドレスは、この入口へ向く `E9` を書く前に設定される（`alloc_count::SiteDetourEnv::set_trampoline`）。
-// - 静的変数は絶対アドレスで指す（再配置で直る）。ラベルは 2〜6（0 と 1 だけの名前は Intel 記法で 2 進の数と紛れる）。
+// SAFETY（`#[unsafe(naked)]`。下の5つの入口に共通）: 本体は`naked_asm!`だけ。
+// 関数の先頭（`call`の直後で`[esp]`が戻りアドレス）に書いた`E9`から飛んでくる。
+// - eax・ecx・edx・ebx・esi・ediをpushし、最後に逆の順でpopしてから、その入口のトランポリンへ`jmp`する（戻りアドレスを積まない）。
+//   espはpush / popで動くだけ。`jmp`の時点では入った時と同じ。
+//   ecx（包みのthis `0x4AD018`）も戻す。そのためトランポリンが実行する盗んだ命令と元の続きは、入った時と同じレジスタとスタックを見る。
+//   ebpには書かない。
+// - フラグは戻さない。関数の先頭では呼ぶ側はフラグを当てにできない（保たれるのは DF = 0 だけで入口はDFを変えない）。
+//   また、5つの盗んだ命令と直後の数命令はフラグを読まない。
+// - 書くのはDLLの静的変数（ALLOC_TOTALS・ALLOC_OVERFLOW・ALLOC_TABLESの1枠）だけ。
+//   ゲームのメモリは読まない（`[esp + 24]`は自分のスレッドのスタック、`fs:[0x24]`は自分のTEB）。
+// - 表の番号 edi = 地点 × 2 ＋ スレッドの別（0..TABLE_COUNT）。枠の番号edxは`and SLOT_MASK`で表の中に収まる。
+//   `[ebx + edx*8]`は自分の表の中だけ。
+//   鍵（戻りアドレス）は0にならない。
+//   空きの枠は`lock cmpxchg`で確保し、たどるのはPROBES枠までなのでループは必ず終わる。
+// - トランポリンのアドレスは、この入口へ向く`E9`を書く前に設定される（`alloc_count::SiteDetourEnv::set_trampoline`）。
+// - 静的変数は絶対アドレスで指す（再配置で直る）。ラベルは2〜6（0と1だけの名前はIntel記法で2進の数と紛れる）。
 macro_rules! alloc_entry {
     ($name:ident, $site:expr) => {
-        /// 計測の入口（`ALLOC_SITES` の地点の番号の行）。Rust からは呼ばない（アドレスを取るだけ）。
+        /// 計測の入口（`ALLOC_SITES`の地点の番号の行）。Rustからは呼ばない（アドレスを取るだけ）。
         #[unsafe(naked)]
         pub extern "C" fn $name() {
             core::arch::naked_asm!(
@@ -59,9 +64,9 @@ macro_rules! alloc_entry {
                 "push ebx",
                 "push esi",
                 "push edi",
-                // esi = 呼び出し元（6 つの push の下の戻りアドレス）。
+                // esi = 呼び出し元（6つのpushの下の戻りアドレス）。
                 "mov esi, dword ptr [esp + 24]",
-                // edi = 表の番号（地点 × 2 ＋ スレッドの別。ゲームのスレッドなら 0、それ以外なら 1）。
+                // edi = 表の番号（地点 × 2 ＋ スレッドの別。ゲームのスレッドなら0、それ以外なら1）。
                 "mov edi, {site2}",
                 "mov eax, dword ptr fs:[{teb_tid}]",
                 "cmp eax, dword ptr [{main_tid}]",
@@ -69,7 +74,7 @@ macro_rules! alloc_entry {
                 "inc edi",
                 "2:",
                 "lock inc dword ptr [{totals} + edi*4]",
-                // ebx = 表の先頭。edx = 最初に見る枠（戻りアドレス × HASH_MUL の上位 SLOT_BITS ビット）。
+                // ebx = 表の先頭。edx = 最初に見る枠（戻りアドレス × HASH_MUL の上位SLOT_BITSビット）。
                 "mov ebx, edi",
                 "shl ebx, {tshift}",
                 "lea ebx, [{tables} + ebx]",
@@ -92,7 +97,7 @@ macro_rules! alloc_entry {
                 "and edx, {smask}",
                 "dec ecx",
                 "jnz 3b",
-                // PROBES 枠たどっても入れない: 溢れに数える。
+                // PROBES枠たどっても入れない: 溢れに数える。
                 "lock inc dword ptr [{overflow} + edi*4]",
                 "jmp 6f",
                 "5:",
@@ -131,7 +136,7 @@ alloc_entry!(alloc_entry_4, 4);
 
 const _: () = assert!(SITE_COUNT == 5);
 
-/// 入口 `site` のアドレス（範囲の外は 0）。
+/// 入口`site`のアドレス（範囲の外は0）。
 pub fn entry_address(site: usize) -> u32 {
     let f: extern "C" fn() = match site {
         0 => alloc_entry_0,
@@ -144,7 +149,7 @@ pub fn entry_address(site: usize) -> u32 {
     f as *const () as usize as u32
 }
 
-// ---- 本物の AllocHost ----
+// ---- 本物のAllocHost ----
 
 pub const SEC_SUFFIX: &str = "_alloc_sec.csv";
 pub const CALLS_SUFFIX: &str = "_alloc_calls.csv";
@@ -161,11 +166,11 @@ struct Outputs {
 static STOP: AtomicBool = AtomicBool::new(false);
 static WRITER: Mutex<Option<JoinHandle<Vec<String>>>> = Mutex::new(None);
 
-/// ゲームのスレッドの ID を tick の記録から探す上限（ゲームが動いていれば 1 フレーム（約 16.7 ms）で記録が出る）。
+/// ゲームのスレッドのIDをtickの記録から探す上限（ゲームが動いていれば1フレーム（約16.7 ms）で記録が出る）。
 const TID_WAIT_MS: u64 = 2000;
 
-/// ゲームのスレッドの ID を、入力のフックが書く tick の記録から `wait_ms` の間探す（見つからなければ `None`）。alloc の数えと
-/// rollback の設置が共に使う。
+/// ゲームのスレッドのIDを入力のフックが書くtickの記録から`wait_ms`の間探す（見つからなければ`None`）。
+/// allocの数えとrollbackの設置が共に使う。
 pub fn wait_game_thread_id(wait_ms: u64) -> Option<u32> {
     let t0 = Instant::now();
     loop {
@@ -283,8 +288,9 @@ impl AllocHost for RealAllocHost {
     }
 }
 
-/// `session::ScriptHost::alloc_count` の本物。`ini` は DLL のフォルダの `HiganRTool.ini` の本文、`run_path` は回ごとの名前のパス
-/// （書き出しのファイルの名前の元）。
+/// `session::ScriptHost::alloc_count`の本物。
+/// `ini`はDLLのフォルダの`HiganRTool.ini`の本文。
+/// `run_path`は回ごとの名前のパス（書き出しのファイルの名前の元）。
 pub fn on_step(
     ini: Result<Option<String>, String>,
     run_path: Option<PathBuf>,
@@ -301,7 +307,7 @@ pub fn on_step(
             hook_env,
             forbidden,
         } => {
-            // 巻き戻しの実験: ini に [rollback_probe] があればそちらを入れ、alloc の数えへは進まない（同じ地点を使う）。
+            // 巻き戻しの実験: iniに[rollback_probe]があればそちらを有効にして、allocの数えへは進まない（同じ地点を使う）。
             if let Some(Ok(Some(text))) = host.ini.as_ref()
                 && !matches!(crate::rollback_probe::settings_from_text(text), Ok(None))
             {
@@ -329,8 +335,8 @@ fn read_u8(addr: u32) -> Option<u8> {
     read_own_memory(addr, 1).and_then(|b| b.first().copied())
 }
 
-/// ゲームの場面の値を読む（読めないページは読まない）。どれも 4 バイト以下の 1 つの値なので、書いている最中でも前か後のどちらかの
-/// 値が読める。
+/// ゲームの場面の値を読む（読めないページは読まない）。
+/// どれも4バイト以下の1つの値なので、書いている最中でも前か後のどちらかの値が読める。
 fn read_obs() -> SceneObs {
     SceneObs {
         scene: read_u32(SUPERVISOR + SUP_SCENE_CUR),
@@ -370,12 +376,12 @@ fn writer(mut o: Outputs, seconds: u32, installed: [bool; SITE_COUNT]) -> Vec<St
             for l in alloc_count::calls_lines(r, ALLOC_SITES) {
                 put(&mut o.calls, &l, &mut errs);
             }
-            // 1 秒ごとに流す（途中で DLL ごと落ちても、そこまでの行は残る）。
+            // 1秒ごとにファイルへ書き出す（途中でDLLごと落ちてもそこまでの行は残る）。
             if o.sec.flush().is_err() || o.calls.flush().is_err() {
                 errs += 1;
             }
             last_end = now;
-            // 遅れても期間は 1 つずつ閉じる（遅れた期間は長さが 1 秒に近くないので表に入らない）。
+            // 遅れても期間は1つずつ閉じる（遅れた期間は長さが1秒に近くないので表に入らない）。
             while next <= now {
                 next += 1000;
             }
@@ -390,7 +396,7 @@ fn writer(mut o: Outputs, seconds: u32, installed: [bool; SITE_COUNT]) -> Vec<St
     let last = alloc_count::snapshot();
     put(&mut o.callers, CALLERS_HEADER, &mut errs);
     for ((t, k), total) in c.caller_totals() {
-        // 戻りアドレスの手前 6 バイト（呼んだ命令）。読めなければ unreadable と書く。
+        // 戻りアドレスの手前6バイト（呼んだ命令）。読めなければunreadableと書く。
         let before = read_own_memory(k.wrapping_sub(6), 6).and_then(|b| b.try_into().ok());
         let line = alloc_count::callers_line(ALLOC_SITES, t, k, before, total);
         put(&mut o.callers, &line, &mut errs);
@@ -460,7 +466,7 @@ mod tests {
     impl Page {
         fn build(len: usize, fill: impl FnOnce(u32) -> Vec<u8>) -> Self {
             let len = len.div_ceil(4096) * 4096;
-            // SAFETY: 新しく確保する（アドレスは OS に任せる）。失敗は下で見る。
+            // SAFETY: 新しく確保する（アドレスはOSに任せる）。失敗は下で見る。
             let base = unsafe {
                 VirtualAlloc(
                     core::ptr::null(),
@@ -492,7 +498,7 @@ mod tests {
 
     impl Drop for Page {
         fn drop(&mut self) {
-            // SAFETY: `build` で確保したページを 1 回だけ返す。このページへ飛ぶものは検査の中にしか無い。
+            // SAFETY: `build`で確保したページを1回だけ返す。このページへ飛ぶものは検査の中にしか無い。
             unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
         }
     }
@@ -573,8 +579,9 @@ mod tests {
         clear();
     }
 
-    /// `call [slot]`（`FF 15 abs32`）を `n` 個並べて最後に `ret` を書いたページ（`n` 個の違う戻りアドレス = ページ + 6(i+1) から
-    /// 入口を呼ぶ）と、トランポリンの代わりの `ret` のアドレス。`slot` はページの終わりに取り、入口のアドレスを入れる。
+    /// `call [slot]`（`FF 15 abs32`）を`n`個並べて最後に`ret`を書いたページと、トランポリンの代わりの`ret`のアドレスを返す。
+    /// ページは`n`個の違う戻りアドレス（ページ + 6(i+1)）から入口を呼ぶ。
+    /// `slot`はページの終わりに確保し、入口のアドレスを書き込む。
     fn call_page(entry: u32, n: usize) -> (Page, u32) {
         let ret_off = n * 6;
         let slot_off = ret_off + 4; // [call ×n][ret][int3 ×3][slot 4]
@@ -595,8 +602,8 @@ mod tests {
     }
 
     fn run_page(p: &Page) {
-        // SAFETY: ページは `call [slot]` の列と `ret`。入口は全部のレジスタを戻してトランポリン（ページの `ret`）へ飛ぶので、各 `call` は次の
-        // 命令へ戻る。
+        // SAFETY: ページは`call [slot]`の列と`ret`。入口は全部のレジスタを戻してトランポリン（ページの`ret`）へ飛ぶ。
+        // そのため各`call`は次の命令へ戻る。
         let f: extern "C" fn() = unsafe { core::mem::transmute(p.addr() as usize) };
         f();
     }
@@ -619,7 +626,7 @@ mod tests {
                 let b = start.clone();
                 std::thread::spawn(move || {
                     b.wait();
-                    // SAFETY: `run_page` と同じ（ページは検査の終わりまで生きている。join の後で返す）。
+                    // SAFETY: `run_page`と同じ（ページは検査の終わりまで生きている。joinの後で返す）。
                     let f: extern "C" fn() = unsafe { core::mem::transmute(addr as usize) };
                     for _ in 0..ROUNDS {
                         f();
@@ -692,10 +699,10 @@ mod tests {
 
     static ABS: AtomicU32 = AtomicU32::new(0x1234_5678);
 
-    /// 5 つの合成の関数（どれも `ALLOC_SITES` の各行と同じ形の先頭）と、その表の行。
+    /// 5つの合成の関数（どれも`ALLOC_SITES`の各行と同じ形の先頭）と、その表の行。
     /// - 0 / 1: `push ebp; mov ebp,esp; mov eax,[ebp+8]` ＋ `add eax,7; pop ebp; ret` → 引数 + 7
-    /// - 2: `push [ABS]` ＋ `pop eax; ret` → ABS の値
-    /// - 3: `push 1; push [esp+8]` ＋ `pop eax; pop ecx; ret` → 引数（esp 相対の盗んだ命令が同じアドレスを読むか）
+    /// - 2: `push [ABS]` ＋ `pop eax; ret` → ABSの値
+    /// - 3: `push 1; push [esp+8]` ＋ `pop eax; pop ecx; ret` → 引数（esp相対の盗んだ命令が同じアドレスを読むか）
     /// - 4: `push 0xC; push imm32` ＋ `pop eax; pop ecx; ret` → imm32
     fn synthetic_functions() -> (Page, Vec<SiteDef>) {
         let abs = (&ABS as *const AtomicU32 as usize as u32).to_le_bytes();
@@ -738,10 +745,10 @@ mod tests {
         (page, defs)
     }
 
-    /// 呼ぶ `call` 命令をこの関数の中の 1 か所に限る（畳み込まれると呼び出し元が増える）。
+    /// 呼ぶ`call`命令をこの関数の中の1か所に限る（畳み込まれると呼び出し元が増える）。
     #[inline(never)]
     fn call1(addr: u32, x: u32) -> u32 {
-        // SAFETY: `synthetic_functions` の関数（cdecl、引数 1 つ、戻り値 u32）。detour の後も同じ働き（検査が見る）。
+        // SAFETY: `synthetic_functions`の関数（cdecl、引数1つ、戻り値u32）。detourの後も同じ働き（検査が見る）。
         let f: extern "C" fn(u32) -> u32 = unsafe { core::mem::transmute(addr as usize) };
         f(x)
     }
@@ -799,7 +806,7 @@ mod tests {
         }
         for t in ALLOC_TRAMPS.iter() {
             let a = t.load(Ordering::SeqCst);
-            // SAFETY: `RealHook::alloc_trampoline` が確保したページ。このページへ飛ぶ E9 は下の `drop(page)` で消えるページの中だけ。
+            // SAFETY: `RealHook::alloc_trampoline`が確保したページ。このページへ飛ぶE9は下の`drop(page)`で消えるページの中だけ。
             unsafe { VirtualFree(a as usize as *mut c_void, 0, MEM_RELEASE) };
         }
         drop(page);

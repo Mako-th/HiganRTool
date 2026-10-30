@@ -1,8 +1,8 @@
-//! 相手との 1 回の接続ごとの本ログの行（pure。unsafe 無し）。
+//! 相手との1回の接続ごとの本ログの行（pure。unsafe無し）。
 //!
-//! - 接続したときの 1 行（`connect_line`）: 選んだ項目・自分の側・待った秒数。どちらがホストに決まったかの 1 行（`pick_line`）。書くのは接続コードの見張りのスレッド（ゲームのスレッドではない）。
-//! - 接続の間とその終わりの行（`LinkLog`）: 観戦者の出入り・stall の内訳・RTT の中央値と最大。読み取りのスレッドが 1 秒ごとに
-//!   `NetSnapshot` から作る。ゲームのスレッドは数を原子変数へ書くだけで、ここで確保するのは読み取りのスレッドの中だけ。
+//! - 接続したときの1行（`connect_line`）は選択した項目・自分の側・待った秒数。どちらがホストに決まったかの1行は`pick_line`。書くのは接続コードの監視の処理のスレッド（ゲームのスレッドではない）。
+//! - 接続の間とその終わりの行（`LinkLog`）は観戦者の出入り・stallの内訳・RTTの中央値と最大。読み取りのスレッドが1秒ごとに`NetSnapshot`から作る。
+//!   ゲームのスレッドは数をアトミック変数へ書くだけ。ここで確保するのは読み取りのスレッドの中だけ。
 #![forbid(unsafe_code)]
 
 use higanr_core::host_pick::{Basis, PickNote};
@@ -41,7 +41,7 @@ fn side_words(c: &CodeFacts, r: Route) -> &'static str {
     }
 }
 
-/// 「ランダムマッチ（待ち列に先に入った側）」の形。項目を選んでいない実行は None。
+/// 「ランダムマッチ（待ち列に先に入った側）」の形。項目を選んでいない実行はNone。
 pub fn route_label(c: &CodeFacts) -> Option<String> {
     let r = c.route?;
     Some(format!("{}（{}）", route_name(r), side_words(c, r)))
@@ -56,7 +56,7 @@ fn secs_phrase(what: &str, secs: Option<f32>) -> Option<String> {
     secs.map(|s| format!("{what} {s:.1} 秒"))
 }
 
-/// 相手のコードを受け取る（読む）までに待った秒数の句。まだ着いていない区間は出さない（0 秒と読まれないように）。
+/// 相手のコードを受け取る（読む）までに待った秒数の句。まだ着いていない区間は出さない（0秒と読まれないように）。
 pub fn waits_to_read(c: &CodeFacts) -> Vec<String> {
     let Some(r) = c.route else {
         return Vec::new();
@@ -91,7 +91,7 @@ pub fn waits_to_read(c: &CodeFacts) -> Vec<String> {
     v
 }
 
-/// `waits_to_read` に、接続の手順を始めてから接続できるまでを足したもの。
+/// `waits_to_read`に、接続の手順を始めてから接続できるまでを足したもの。
 pub fn waits(c: &CodeFacts) -> Vec<String> {
     let mut v = waits_to_read(c);
     if c.route.is_some() {
@@ -103,7 +103,7 @@ pub fn waits(c: &CodeFacts) -> Vec<String> {
     v
 }
 
-/// 接続した 1 行（見張りが接続を見た 1 回だけ）。
+/// 接続した1行（見張りが接続を見た1回だけ）。
 pub fn connect_line(c: &CodeFacts) -> String {
     let Some(r) = c.route else {
         return "メニューで選んだ項目は分からないまま、接続しました。".to_string();
@@ -143,7 +143,7 @@ fn nat_words(m: NatMark) -> String {
     }
 }
 
-/// どちらがホストに決まったかの 1 行（接続した 1 回だけ）。`host` は自分がホストか（分からなければ None）。
+/// どちらがホストに決まったかの1行（接続した1回だけ）。`host`は自分がホストかどうか（分からなければNone）。
 pub fn pick_line(p: &PickNote, host: Option<bool>) -> String {
     let who = match host {
         Some(true) => "自分",
@@ -167,7 +167,7 @@ pub fn pick_line(p: &PickNote, host: Option<bool>) -> String {
     )
 }
 
-/// 接続できないまま待ちが終わった 1 行。`what` は終わり方（取りやめました・時間切れ・ネットワークが終わりました）、`now` は見張りを起動してからの秒。
+/// 接続できないまま待ちが終わった1行。`what`は終わり方（取りやめました・時間切れ・ネットワークが終わりました）。`now`は監視の処理を起動してからの秒。
 pub fn unconnected_line(c: &CodeFacts, what: &str, now: f32) -> String {
     let Some(label) = route_label(c) else {
         return format!("{what}（メニューで選んだ項目は分からない）");
@@ -185,18 +185,18 @@ pub fn unconnected_line(c: &CodeFacts, what: &str, now: f32) -> String {
     format!("{what}。{label}{waited}{tail}")
 }
 
-// ---- 読み取りのスレッド（1 秒ごと）----
+// ---- 読み取りのスレッド（1秒ごと）----
 
-/// RTT の標本の枠の数（1 ms 刻み。最後の枠は「その値以上」）。
+/// RTTのサンプルのバケットの数（1 ms刻み。最後のバケットは「その値以上」）。
 const RTT_BUCKETS: usize = 1024;
 
-/// 接続の間の RTT の標本（1 秒ごとに読んだ最後の測定値）。同じ PONG を 2 度採らないよう PONG の数で見る。
+/// 接続の間のRTTのサンプル（1秒ごとに読んだ最後の測定値）。同じPONGを2度取り込まないようPONGの数で見る。
 #[derive(Debug, Clone)]
 struct RttTally {
     hist: Vec<u32>,
     n: u32,
     max: u32,
-    /// 最後に標本にした PONG の数と、標本にできずに見逃した PONG の数（1 秒の間に 2 個以上届いたとき）。
+    /// 最後にサンプルにしたPONGの数と、サンプルにできずに見逃したPONGの数（1秒の間に2個以上届いたとき）。
     seen_pongs: u32,
     missed: u32,
 }
@@ -231,7 +231,7 @@ impl RttTally {
         self.max = self.max.max(rtt);
     }
 
-    /// 偶数個なら真ん中の 2 つの平均（切り捨て）。枠の上限を越える値は上限に丸める。
+    /// 偶数個なら真ん中の2つの平均（切り捨て）。枠の上限を越える値は上限に丸める。
     fn median(&self) -> Option<u32> {
         if self.n == 0 {
             return None;
@@ -251,7 +251,7 @@ impl RttTally {
     }
 }
 
-/// 読み取りのスレッドが持つ、接続 1 本分の状態。接続が替わったら（`link_started_ms` が変わる）作り直す。
+/// 読み取りのスレッドが持つ接続1本分の状態。接続が替わったら（`link_started_ms`が変わる）作り直す。
 #[derive(Debug, Clone)]
 pub struct LinkLog {
     link: u32,
@@ -270,7 +270,7 @@ impl Default for LinkLog {
 }
 
 impl LinkLog {
-    /// 1 秒ごとに呼ぶ。書く行を返す（観戦者が来た・抜けた・断った。無ければ空）。
+    /// 1秒ごとに呼ぶ。書く行を返す（観戦者が来た・抜けた・断った。無ければ空）。
     pub fn step(&mut self, snap: &NetSnapshot, k: u32) -> Vec<String> {
         if snap.link_started_ms != self.link {
             *self = LinkLog {
@@ -308,7 +308,7 @@ impl LinkLog {
         lines
     }
 
-    /// 接続の終わりに足す行（stall の内訳・RTT・観戦者）。`snap` はこの接続の最後の数。
+    /// 接続の終わりに足す行（stallの内訳・RTT・観戦者）。`snap`はこの接続の最後の数。
     pub fn end_lines(&self, snap: &NetSnapshot) -> Vec<String> {
         let mut v = Vec::new();
         if let Some(l) = stall_line(snap) {
@@ -341,7 +341,7 @@ impl LinkLog {
     }
 }
 
-/// stall の内訳。5 つの和を「合計」に出す（`NetSnapshot::stalls` と同じ場所で数えた値）。
+/// stallの内訳。5つの和を「合計」に出す（`NetSnapshot::stalls`と同じ場所で数えた値）。
 pub fn stall_line(s: &NetSnapshot) -> Option<String> {
     if s.watcher || !s.connected {
         return None;

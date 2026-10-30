@@ -1,4 +1,4 @@
-//! ツール `replay_inputs` を本物のプロセスで走らせる検査（合成のリプレイと合成の `_net_frames.csv` だけ）。
+//! ツール`replay_inputs`を本物のプロセスで走らせる検査（合成のリプレイと合成の`_net_frames.csv`だけ）。
 //! 「引数 → 読む → 出す → 終了コード」の配線と、出力ファイルを上書きしないことを見る。
 
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// 合成のマッチ: 1P は Z を押し続けて時々動く、2P は時々撃つ。
+/// 合成のマッチ: 1PはZを押し続けて時々動く、2Pは時々撃つ。
 fn words(n: usize) -> (Vec<u16>, Vec<u16>) {
     let p1 = (0..n)
         .map(|i| 0x0001 | if i % 7 == 0 { 0x0040 } else { 0 })
@@ -113,7 +113,7 @@ fn compare_reports_full_match_partial_match_and_offset() {
     assert_eq!(o.status.code(), Some(0), "{}", text(&o.stdout));
 }
 
-/// 8 列の `_net_frames.csv`（`head_wait_us` 付き。今の形）にする。`net_csv` は 7 列の古い形（過去のログを読めることの検査）。
+/// 8列の`_net_frames.csv`（`head_wait_us`付き。今の形）にする。`net_csv`は7列の古い形（過去のログを読めることの検査）。
 fn net_csv8(seg: u16, p1: &[u16], p2: &[u16], first: usize) -> String {
     let mut s = String::from("seg,frame,p1,p2,delay,margin_us,wait_us,head_wait_us\n");
     for (f, (a, b)) in p1.iter().zip(p2).enumerate().skip(first) {
@@ -151,7 +151,7 @@ fn the_eight_column_csv_with_head_wait_compares_like_the_old_seven() {
         "{}",
         text(&n.stdout)
     );
-    // 否定: 8 列の見出しの下に 7 列の行は断る（先頭の待ちが抜けた行を黙って読まない）。
+    // 否定: 8列のヘッダの下に7列の行は断る（先頭の待ちが抜けた行を黙って読まない）。
     let mixed = t.path("mixed.csv");
     std::fs::write(
         &mixed,
@@ -212,9 +212,9 @@ fn zero_rows_and_bad_inputs_are_not_reported_as_a_match() {
     let empty = t.path("empty.csv");
     std::fs::write(&empty, "seg,frame,p1,p2,delay,margin_us,wait_us\n").unwrap();
     let o = run(&[&rpy, "--compare", &empty]);
-    assert_eq!(o.status.code(), Some(2)); // seg が選べない（行が無い）
+    assert_eq!(o.status.code(), Some(2)); // segが選べない（行が無い）
     let o = run(&[&rpy, "--compare", &empty, "--seg", "0"]);
-    assert_eq!(o.status.code(), Some(2)); // csv に seg 0 が無い
+    assert_eq!(o.status.code(), Some(2)); // csvにseg 0が無い
 
     let wrong_header = t.path("old.csv");
     std::fs::write(&wrong_header, "seg,frame,p1,p2\n0,0,0001,0000\n").unwrap();
@@ -282,7 +282,7 @@ fn out_file_is_written_once_and_never_overwritten() {
     assert!(!text(&o.stderr).contains("NO NAME") && !csv.contains("NO NAME"));
 }
 
-/// 合成の CSV を gzip にして返す。`finish` が false なら終わりの印の 8 B を落とす（強制終了で切れた形）。
+/// 合成のCSVをgzipにして返す。`finish`がfalseなら終わりの印の8 Bを落とす（強制終了で切れた形）。
 fn gz_bytes(csv: &str, finish: bool) -> Vec<u8> {
     use std::io::Write;
     let mut w =

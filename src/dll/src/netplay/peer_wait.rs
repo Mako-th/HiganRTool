@@ -1,30 +1,33 @@
 //! 相手を待ち続けている間の知らせと切断（pure）。
 //!
-//! 入力の地点が tick ごとに「この tick は相手を待っていたか」を `PeerWait::step` へ渡す。`NOTICE_TICKS` 続いたら画面に 1 行出し（`shown`）、その間に Esc が `ESC_HOLD_MS` 押され続けたら切る
-//! （一時停止のつもりの 1 回の押下では切らない）。待ちが `LIMIT_MS` 続いても切る。何を「待っていた」とするかは呼び手が決める（`NetPlay::peer_wait_tick`）。
-//! ゲームスレッドで毎 tick 走るので、確保しない・パニックしない。
+//! 入力の地点がtickごとに「このtickは相手を待っていたか」を`PeerWait::step`へ渡す。
+//! `NOTICE_TICKS`続いたら画面に1行出し（`shown`）、その間にEscが`ESC_HOLD_MS`押され続けたら切る（一時停止のつもりの1回の押下では切らない）。
+//! 待ちが`LIMIT_MS`続いても切る。
+//! 何を「待っていた」とするかは呼び手が決める（`NetPlay::peer_wait_tick`）。
+//! ゲームスレッドで毎tick走るので確保しない・パニックしない。
 #![forbid(unsafe_code)]
 
 use higanr_core::liveness::{PING_INTERVAL_MS, SILENCE_LIMIT_MS};
 
-/// 知らせを出すまでの、待ちが続いた tick の数（約 2 秒）。
+/// 待ちが何tick続いたら知らせを出すか（約2秒）。
 pub const NOTICE_TICKS: u32 = 120;
 /// 待ちが続いたら切るまで（ms）。自分のゲームスレッドが同じ長さ止まると相手の側でも切れる（`liveness::HEARTBEAT_LIMIT_MS`）ので、そろえた。
 /// 相手が最小化してコードを渡す間も待つ長さ。
 pub const LIMIT_MS: u32 = SILENCE_LIMIT_MS;
-/// 選択の画面で、相手のゲームスレッドが黙ったとみなす長さ（ms）。相手は 1 秒ごとに PING を送るので、その間隔より長くした。PING が 1 通
-/// 落ちても黙ったとみなすのは 0.5 秒ほどで、知らせ（`NOTICE_TICKS`）までは続かない。
+/// 選択の画面で相手のゲームスレッドが黙ったとみなす長さ（ms）。
+/// 相手は1秒ごとにPINGを送るので、その間隔より長くした。
+/// PINGが1通失われても黙ったとみなすのは0.5秒ほど。知らせ（`NOTICE_TICKS`）までは続かない。
 pub const QUIET_MS: u32 = 1_500;
 const _: () = assert!(QUIET_MS > PING_INTERVAL_MS);
-/// 知らせを出している間に、切るまで Esc を押し続ける長さ（ms）。画面の文（`net_menu::T_PEER_WAIT`）の「3秒」と同じ。
+/// 知らせを出している間にEscをこの長さ（ms）押し続けると切る。画面の文（`net_menu::T_PEER_WAIT`）の「3秒」と同じ。
 pub const ESC_HOLD_MS: u32 = 3_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Keep,
-    /// 知らせを出している間に Esc が `ESC_HOLD_MS` 押され続けた。
+    /// 知らせを出している間にEscが`ESC_HOLD_MS`押され続けた。
     Esc,
-    /// 待ちが `LIMIT_MS` 続いた。
+    /// 待ちが`LIMIT_MS`続いた。
     TimedOut,
 }
 
@@ -32,15 +35,15 @@ pub enum Verdict {
 pub struct PeerWait {
     run: u32,
     since_ms: u32,
-    /// 知らせを出してから Esc が離れているのを 1 度見たか（押したまま待ちに入った瞬間に切らないため）。
+    /// 知らせを出してからEscが離れているのを1度見たかどうか（押したまま待ちに入った瞬間に切らないため）。
     esc_armed: bool,
-    /// 離れているのを見た後に Esc が押され始めた時刻。離れたら None。
+    /// 離れているのを見た後にEscが押され始めた時刻。離れたらNone。
     esc_since: Option<u32>,
 }
 
 impl PeerWait {
-    /// 1 tick。`blocked` はこの tick に相手を待っていたなら `Some(待ちの始まりの時刻)`（始まりは待ちの最初の tick のものだけを使う）。
-    /// `esc` は Esc が押されているかの読み。この tick に知らせを出しているときだけ呼ぶ。
+    /// 1 tick。`blocked`はこのtickに相手を待っていたなら`Some(待ちの始まりの時刻)`（始まりは待ちの最初のtickのものだけを使う）。
+    /// `esc`はEscが押されているかどうかの読み。このtickに知らせを出しているときだけ呼ぶ。
     pub fn step(
         &mut self,
         blocked: Option<u32>,
@@ -128,7 +131,7 @@ mod tests {
             w.step(Some(T0), pressed + ESC_HOLD_MS, || true),
             Verdict::Esc
         );
-        // 知らせが出た tick に離れていれば、そこから押し続けて切る。
+        // 知らせが出たtickに離れていればそこから押し続けて切る。
         let mut w = PeerWait::default();
         waited(&mut w, NOTICE_TICKS - 1, true);
         let at = T0 + NOTICE_TICKS * FRAME_MS;
@@ -145,7 +148,7 @@ mod tests {
         let mut w = PeerWait::default();
         waited(&mut w, NOTICE_TICKS, false);
         let start = T0 + NOTICE_TICKS * FRAME_MS;
-        // 押し続けて、3 秒の 1 tick 手前までは切らない。
+        // 押し続けて、3秒の1 tick手前までは切らない。
         let mut t = start;
         while t < start + ESC_HOLD_MS {
             assert_eq!(
@@ -156,7 +159,7 @@ mod tests {
             );
             t += FRAME_MS;
         }
-        // 1 tick 離すと数え直し。続けて押しても、そこから 3 秒たつまで切らない。
+        // 1 tick離すと数え直し。続けて押してもそこから3秒たつまで切らない。
         assert_eq!(w.step(Some(T0), t, || false), Verdict::Keep);
         let again = t + FRAME_MS;
         assert_eq!(w.step(Some(T0), again, || true), Verdict::Keep);
@@ -176,7 +179,7 @@ mod tests {
         assert_eq!(w.step(Some(T0), T0 + 59_999, || false), Verdict::Keep);
         assert_eq!(w.step(Some(T0), T0 + 60_000, || false), Verdict::TimedOut);
         let mut w = PeerWait::default();
-        // 始まりは最初の tick のもの（後の tick の値は使わない）。
+        // 始まりは最初のtickのもの（後のtickの値は使わない）。
         assert_eq!(w.step(Some(T0 - 1_000), T0, || false), Verdict::Keep);
         assert_eq!(
             w.step(Some(T0), T0 + LIMIT_MS - 1_001, || false),
@@ -186,7 +189,7 @@ mod tests {
             w.step(Some(T0 + 5_000), T0 + LIMIT_MS - 1_000, || false),
             Verdict::TimedOut
         );
-        // 1 tick でも解ければ始まりから数え直す。
+        // 1 tickでも解ければ始まりから数え直す。
         let mut w = PeerWait::default();
         w.step(Some(T0), T0, || false);
         w.step(None, T0 + LIMIT_MS - 1, || false);

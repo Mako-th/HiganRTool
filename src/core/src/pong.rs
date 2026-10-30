@@ -1,11 +1,16 @@
-//! 受信スレッドがその場で返す PONG の応答役。
+//! 受信スレッドがその場で返すPONGの応答役。
 //!
-//! PING への PONG をゲームのスレッド側のセッション（`link.rs` → `liveness.rs`）が返すと、ゲームのスレッドがリングを空にするのは tick の始まりだけなので、マッチの外では PING が最大 1 tick（16.7 ms）待ち、相手の測る RTT がその分大きく出た。PONG は PING の send_time を返すだけでゲームの状態も自分の時計も要らないので、受信スレッドが受けたその場で返す（マッチの入力への遅延の増分は 0。
-//! PING でない 1 通は type の 1 バイトを見て素通り）。
-//! 応答役が持つのは、接続した後にセッションが作る値のコピー（session_id・鍵・相手の候補・採った経路。`Link::pong_responder`）だけで、生存の状態は持たない。**返してよいかは呼び手が生存の状態から決め、「生きている」の間だけ呼ぶ**（dll は `NetPlay` が tick ごとに見て、受信スレッドへ原子変数で渡す）。
-//! 受信のガードはセッション（`Link::on_datagram`）と同じ順と条件: type が PING → 候補（接続する前に学んだ候補を含む）のどれかから来た →session_id が同じ → タグが合う → 解ける。外れたら何も返さない。返した 1 通も受信スレッドはリングへ積み（生存の「届いた」の印を失わないため）、「PONG を返した」の印を添えて、セッションが PONG を重ねないようにする（`Link::on_datagram_marked`）。
-//! 受信スレッドで 1 通ごとに呼ぶので、ヒープを使わず、パニックしうる添字と unwrap を使わない（パニックすると以後何も受けない）。
-//! 返すバイト列は呼び手のスタックの `[u8; MAX_DATAGRAM]` に作る。
+//! ゲームのスレッドがリングを空にするのはtickの始まりだけ。
+//! そのためPINGへのPONGをゲームのスレッド側のセッション（`link.rs` → `liveness.rs`）が返すと、マッチの外ではPINGが最大1 tick（16.7 ms）待たされ、相手の測るRTTがその分大きく出た。
+//! PONGはPINGのsend_timeを返すだけでゲームの状態も自分の時計も要らない。そのため受信スレッドが受けたその場で返す。
+//! マッチの入力への遅延の増分は0。PINGでない1通はtypeの1バイトを見て素通りさせる。
+//! 応答役が持つのは接続した後にセッションが作る値のコピー（session_id・鍵・相手の候補・採った経路。`Link::pong_responder`）だけ。生存の状態は持たない。
+//! **返してよいかどうかは呼び手が生存の状態から判断し、「生きている」の間だけ呼ぶ**（dllは`NetPlay`がtickごとに見て、受信スレッドへアトミック変数で渡す）。
+//! 受信のガードはセッション（`Link::on_datagram`）と同じ順と条件: typeがPING → 候補（接続する前に学んだ候補を含む）のどれかから来た → session_idが同じ → タグが合う → 解ける。外れたら何も返さない。
+//! 返した1通も受信スレッドはリングへ積む（生存の「届いた」フラグを失わないため）。
+//! このとき「PONGを返した」フラグを添えて、セッションがPONGを重ねないようにする（`Link::on_datagram_marked`）。
+//! 受信スレッドで1通ごとに呼ぶのでヒープを使わない。パニックしうる添字とunwrapも使わない（パニックすると以後何も受けない）。
+//! 返すバイト列は呼び手のスタックの`[u8; MAX_DATAGRAM]`に作る。
 
 use std::net::SocketAddr;
 
@@ -14,24 +19,25 @@ use crate::candidate::{Candidates, Learned};
 use crate::seal::{Opener, Sealer, Seq};
 use crate::wire::{self, ByeReason, MAX_DATAGRAM, Message};
 
-/// 受信スレッドの PONG の応答役（接続した後のセッションの値のコピー）。接続ごとに 1 つ。
+/// 受信スレッドのPONGの応答役（接続した後のセッションの値のコピー）。接続ごとに1つ。
 ///
-/// PING も PONG も封じた便なので、相手からの向きの `Opener` と、送り手の印 `Sender::Pong` の `Sealer` を持つ。
-/// 通し番号は応答役に持たせず、返すたびに呼び手が渡す（[`PongResponder::answer`]）。dll では、ゲームのスレッドから受信スレッドへ応答役を渡す
-/// 入れ物が `Seq` を 1 つだけ持ち 0 に戻さない（2 本の受信スレッドと差し替えた応答役が全部使う）ので、同じ番号を
-/// 2 回使わない。ゲームのスレッド側のセッションとは送り手の印が違うので重ならない。
+/// PINGもPONGも封をしたパケットなので、相手からの向きの`Opener`と、送信元の識別子`Sender::Pong`の`Sealer`を持つ。
+/// 通し番号は応答役に持たせず、返すたびに呼び手が渡す（[`PongResponder::answer`]）。
+/// dllでは、ゲームのスレッドから受信スレッドへ応答役を渡すコンテナが`Seq`を1つだけ持ち、0に戻さない。
+/// 2本の受信スレッドと差し替えた応答役が全部これを使うので、同じ番号を2回使わない。
+/// ゲームのスレッド側のセッションとは送信元の識別子が違うので重ならない。
 #[derive(Debug, Clone)]
 pub struct PongResponder {
     session_id: u32,
-    /// バージョン違いの見分けにだけ使う鍵（`wire::decode` のガード）。
+    /// バージョン違いの見分けにだけ使う鍵（`wire::decode`のガード）。
     key: AuthKey,
     open: Opener,
     seal: Sealer,
-    /// 受ける送り元（セッションの `Paths::accepts` と同じ: 候補のどれか）。
+    /// 受ける送信元（セッションの`Paths::accepts`と同じ: 候補のどれか）。
     peers: Candidates,
-    /// 接続する前に学んだ候補（`Paths::learn`）。接続した経路が学んだアドレスのことがあるので受けにも含める（セッションと同じガード）。
+    /// 接続する前に学んだ候補（`Paths::learn`）。接続した経路が学んだアドレスのことがあるので受ける送信元にも含める（セッションと同じガード）。
     learned: Learned,
-    /// 返す先（セッションが接続した後の送りに使う経路と同じ）。
+    /// 返す先（セッションが接続した後の送信に使う経路と同じ）。
     path: SocketAddr,
 }
 
@@ -55,7 +61,7 @@ impl PongResponder {
         }
     }
 
-    /// 接続する前に学んだ候補も受ける送り元に加える（`Link::pong_responder` が `Paths::learned` を渡す）。
+    /// 接続する前に学んだ候補も受ける送信元に加える（`Link::pong_responder`が`Paths::learned`を渡す）。
     #[must_use]
     pub fn with_learned(mut self, learned: Learned) -> Self {
         self.learned = learned;
@@ -70,9 +76,10 @@ impl PongResponder {
         self.path
     }
 
-    /// 受けた 1 データグラム `bytes`（送り元 `from`）が本物の PING なら、同じ send_time の PONG を `out` に作り、
-    /// （返す先, 長さ）を返す。それ以外（PING でない・候補にない送り元・別の session・タグ違い・解けない・短すぎる）は
-    /// None。`seq` は PONG の通し番号で、**この応答役とそのコピーの全部が同じ 1 つを渡す**（同じ鍵の別の `Seq` だと nonce が重なる）。
+    /// 受けた1データグラム`bytes`（送信元`from`）が本物のPINGなら、同じsend_timeのPONGを`out`に作る。
+    /// 返り値は（返す先, 長さ）。
+    /// それ以外（PINGでない・候補にない送信元・別のsession・タグ違い・解けない・短すぎる）はNone。
+    /// `seq`はPONGの通し番号。**この応答役とそのコピーの全部が同じ1つを渡す**（同じ鍵の別の`Seq`だとnonceが重なる）。
     pub fn answer(
         &self,
         seq: &Seq,
@@ -84,8 +91,8 @@ impl PongResponder {
         self.seal_to_path(seq, &Message::Pong { send_time }, out)
     }
 
-    /// `answer` と同じガードで、本物の PING への返しを PONG の代わりに BYE にする（自分のゲームスレッドが止まった後、閉じたことを
-    /// 相手の PING のたびに知らせ直す。セッションの `Liveness::close` の後と同じ形）。
+    /// `answer`と同じガードで、本物のPINGへの返答をPONGの代わりにBYEにする。
+    /// 自分のゲームスレッドが止まった後に、閉じたことを相手のPINGのたびに知らせ直すため。セッションの`Liveness::close`の後と同じ形。
     pub fn answer_bye(
         &self,
         seq: &Seq,
@@ -98,7 +105,7 @@ impl PongResponder {
         self.seal_to_path(seq, &Message::Bye(reason), out)
     }
 
-    /// 頼まれずに出す BYE（返す先は経路）。
+    /// 頼まれずに出すBYE（返す先は経路）。
     pub fn bye(
         &self,
         seq: &Seq,
@@ -108,9 +115,9 @@ impl PongResponder {
         self.seal_to_path(seq, &Message::Bye(reason), out)
     }
 
-    /// 本物の PING なら send_time。
+    /// 本物のPINGならsend_time。
     fn real_ping(&self, from: SocketAddr, bytes: &[u8]) -> Option<u32> {
-        // 先に type だけを見る（INPUT などにタグの計算を足さない）。
+        // 先にtypeだけを見る（INPUTなどにタグの計算を足さない）。
         if !wire::peek_is_ping(bytes) {
             return None;
         }
@@ -141,7 +148,7 @@ impl PongResponder {
 
 #[cfg(test)]
 mod tests {
-    //! 期待値は仕様（PONG は PING の send_time を返す）から作り、PONG の読み戻しは相手の向きの `Opener` を使う `wire::decode`。
+    //! 期待値は仕様（PONGはPINGのsend_timeを返す）から作る。PONGの読み戻しは相手の向きの`Opener`を使う`wire::decode`。
     use super::*;
     use crate::auth::Secret;
     use crate::seal::{DirKeys, NONCE_FIELD_LEN, Sender, Seq, read_nonce_field};
@@ -157,7 +164,7 @@ mod tests {
         Secret([b; 16])
     }
 
-    /// 応答役の側から見た向きの鍵（送る向き A1…、受ける向き B2…）。相手は入れ替えた鍵で送る。
+    /// 応答役の側から見た向きの鍵（送る向きA1…、受ける向きB2…）。相手は入れ替えた鍵で送る。
     fn mine() -> DirKeys {
         DirKeys::from_raw([0xA1; 32], [0xB2; 32])
     }
@@ -166,7 +173,7 @@ mod tests {
         mine().swapped()
     }
 
-    /// 相手の候補は 2 つ（経路は 2 つ目）。受けは 1 つ目から来ても返す先は経路（候補と経路をわざと違える）。
+    /// 相手の候補は2つ（経路は2つ目）。受信が1つ目から来ても返す先は経路（候補と経路をわざと違える）。
     fn responder() -> PongResponder {
         let peers = Candidates::from_addrs(&[sa("127.0.0.1:4001"), sa("127.0.0.1:4002")]).unwrap();
         PongResponder::new(
@@ -180,11 +187,11 @@ mod tests {
     }
 
     thread_local! {
-        // 検査ごとの PONG の通し番号（検査は別スレッドで走るので、各検査の最初の PONG は 0 番）。
+        // 検査ごとのPONGの通し番号（検査は別スレッドで走るので各検査の最初のPONGは0番）。
         static SEQ: Seq = const { Seq::new() };
     }
 
-    /// 相手が送る 1 通（HMAC の便は秘密 `secret_byte` の鍵、封じる便は `keys` の送る向き）。
+    /// 相手が送る1通（HMACのパケットは秘密`secret_byte`の鍵・封をするパケットは`keys`の送る向き）。
     fn packet_with(secret_byte: u8, keys: DirKeys, sid: u32, msg: &Message) -> Vec<u8> {
         let mut buf = [0u8; MAX_DATAGRAM];
         let n = if wire::is_signed(msg) {
@@ -245,7 +252,7 @@ mod tests {
                 }
             })
         );
-        // 向きごとの鍵: 応答役の受ける向きの鍵（相手の送り）では開かない。
+        // 向きごとの鍵: 応答役の受ける向きの鍵（相手の送信）では開かない。
         assert_eq!(
             wire::decode(
                 &AuthKey::derive(&secret(7), SID),
@@ -317,7 +324,7 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(read_nonce_field(&field), (Sender::Pong as u8, 1));
-        // PING でない・候補の外の送り元には返さない（ガードは `answer` と同じ）。
+        // PINGでない・候補の外の送信元には返さない（ガードは`answer`と同じ）。
         let pong = packet(SID, &Message::Pong { send_time: 3 });
         for (from, bytes) in [("127.0.0.1:4001", &pong), ("127.0.0.1:4003", &ping(3))] {
             assert_eq!(
@@ -333,7 +340,7 @@ mod tests {
     fn nothing_is_returned_for_anything_but_a_real_ping() {
         let r = responder();
         let good = ping(42);
-        // 隣に「同じ標本の正しい形なら返す」を並べる（下の否定が、応答役が壊れて何も返さないだけで通らないように）。
+        // 隣に「同じサンプルの正しい形なら返す」を並べる。下の否定のテストが、応答役が壊れて何も返さないだけで通ってしまうのを防ぐため。
         assert!(ans(&r, "127.0.0.1:4001", &good).is_some());
 
         for i in HEADER_LEN..good.len() {
@@ -359,7 +366,7 @@ mod tests {
             ),
             None
         );
-        // ヘッダの session だけ書き換え（ヘッダは追加の認証データなので開かない）。
+        // ヘッダのsessionだけ書き換える。ヘッダは追加の認証データなので開かない。
         let mut bad = good.clone();
         bad[8] ^= 0x01;
         assert_eq!(ans(&r, "127.0.0.1:4001", &bad), None, "ヘッダの session");
@@ -448,12 +455,13 @@ mod tests {
                 echo_nonce: 1,
                 role_nonce: 2,
                 public: [3; 32],
+                echo_public: [4; 32],
             },
         ];
         for m in others {
             assert_eq!(ans(&r, "127.0.0.1:4001", &packet(SID, &m)), None, "{m:?}");
         }
-        // type だけを別の type に書き換えた 1 通も、type のガードで落ちる。
+        // typeだけを別のtypeに書き換えた1通もtypeのガードで落ちる。
         let mut bad = ping(5);
         bad[5] = 9;
         assert_eq!(ans(&r, "127.0.0.1:4001", &bad), None);
@@ -461,7 +469,7 @@ mod tests {
 
     #[test]
     fn poison_bytes_never_panic() {
-        // でたらめのバイト列（PING の先頭を持つものを含む）で落ちない。乱数は splitmix64 を数行で。
+        // でたらめのバイト列（PINGの先頭を持つものを含む）でもパニックしない。乱数はsplitmix64を数行で。
         let r = responder();
         let head = ping(9);
         let mut s: u64 = 0x1234_5678_9ABC_DEF0;
@@ -476,7 +484,7 @@ mod tests {
         for _ in 0..20_000 {
             let len = (next() % 1300) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            // 半分は PING のヘッダ 12 B を先頭に付ける（type のガードを越えて `Opener` のガードまで届かせる）。
+            // 半分はPINGのヘッダ12 Bを先頭に付ける（typeのガードを越えて`Opener`のガードまで届かせる）。
             if next() % 2 == 0 {
                 for (d, s) in b.iter_mut().zip(head.iter().take(HEADER_LEN)) {
                     *d = *s;

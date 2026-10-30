@@ -1,5 +1,5 @@
-//! ツール `pred_eval` を本物のプロセスで走らせる検査（合成の `_net_frames.csv` と合成のリプレイだけ）。
-//! 「引数 → 席ごとの列 → 採点 → CSV の書き出し → 終了コード」の配線と、出力のフォルダを上書きしないことを見る。
+//! ツール`pred_eval`を本物のプロセスで走らせる検査（合成の`_net_frames.csv`と合成のリプレイだけ）。
+//! 「引数 → サイドごとの列 → 採点 → CSVの書き出し → 終了コード」の配線と、出力のフォルダを上書きしないことを見る。
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -38,7 +38,7 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// 1P は左右を交互、2P は右を押し続ける 200 フレームの `_net_frames.csv`。
+/// 1Pは左右を交互、2Pは右を押し続ける200フレームの`_net_frames.csv`。
 fn net_csv() -> String {
     let mut s = String::from("seg,frame,p1,p2,delay,margin_us,wait_us\n");
     for f in 0..200u32 {
@@ -48,7 +48,7 @@ fn net_csv() -> String {
     s
 }
 
-/// `by_m.csv` の行から、列の名前で値を引く。
+/// `by_m.csv`の行から列の名前で値を取得する。
 fn cell(csv: &str, key: &[&str], col: &str) -> String {
     let mut lines = csv.lines();
     let head: Vec<&str> = lines.next().unwrap().split(',').collect();
@@ -66,7 +66,7 @@ fn cell(csv: &str, key: &[&str], col: &str) -> String {
 fn csv_and_replays_are_split_into_seat_streams_and_scored() {
     let t = Tmp::new("score");
     std::fs::write(t.path("n.csv"), net_csv()).unwrap();
-    // 人 対 CPU: 1P の列だけが対象。人 対 人: 両席。
+    // 人 対CPU: 1Pの列だけが対象。人間 対 人間: 両サイド。
     let w: Vec<u16> = (0..100)
         .map(|i| if i % 4 < 2 { LEFT } else { RIGHT })
         .collect();
@@ -95,12 +95,12 @@ fn csv_and_replays_are_split_into_seat_streams_and_scored() {
     assert!(so.contains("rpy_vs_human: 列 2 本・200 tick"), "{so}");
 
     let by_m = std::fs::read_to_string(format!("{out}/by_m.csv")).unwrap();
-    // 実回線の 2 席・m = 1: 1P は 199 tick 全部外れ、2P は外れ無し。
+    // 実回線の2サイド・m = 1: 1Pは199 tick全部外れ、2Pは外れ無し。
     assert_eq!(cell(&by_m, &["online", "net", "P0", "1"], "n"), "398");
     assert_eq!(cell(&by_m, &["online", "net", "P0", "1"], "miss"), "199");
-    // m = 2: 交互の列は 2 つ前と同じなので外れ無し。
+    // m = 2: 交互の列は2つ前と同じなので外れ無し。
     assert_eq!(cell(&by_m, &["online", "net", "P0", "2"], "miss"), "0");
-    // 人 対 CPU は 1 本・100 tick の m = 1 で 99 tick を採点する。
+    // 人 対CPUは1本・100 tickの m = 1 で99 tickを採点する。
     assert_eq!(cell(&by_m, &["online", "rpy_vs_cpu", "P0", "1"], "n"), "99");
     assert_eq!(
         cell(&by_m, &["online", "rpy_vs_cpu", "P0", "1"], "streams"),
@@ -111,7 +111,7 @@ fn csv_and_replays_are_split_into_seat_streams_and_scored() {
         "2"
     );
 
-    // 席の取り違え: 外れるのは 1P の列、2P の列は外れない。
+    // サイドの取り違え: 外れるのは1Pの列、2Pの列は外れない。
     let per = std::fs::read_to_string(format!("{out}/per_stream.csv")).unwrap();
     let seat = |s: &str| cell(&per, &["online", s, "net", "P0", "1"], "miss");
     assert_eq!(
@@ -119,8 +119,8 @@ fn csv_and_replays_are_split_into_seat_streams_and_scored() {
         ("199", "0")
     );
 
-    // 元のファイルが 1 本だけのときは「ほかのファイルで先に学ぶ」ものが無く、warm は online と同じになる
-    // （同じファイルの列を学習に混ぜると、学んだ表が使われて外れの数が変わる）。
+    // 元のファイルが1本だけのときは「ほかのファイルで先に学ぶ」ものが無いので、warmはonlineと同じになる。
+    // 同じファイルの列を学習に混ぜると学んだ表が使われて外れの数が変わる。
     let one = t.path("out_one");
     let o1 = run(&["--out", &one, "--csv", &t.path("n.csv"), "--skip-check"]);
     assert!(o1.status.success(), "{}", text(&o1.stderr));
@@ -134,7 +134,7 @@ fn csv_and_replays_are_split_into_seat_streams_and_scored() {
             );
         }
     }
-    // 同じ内容のファイルが 2 本なら、片方で学んだ表をもう片方に使う（交互の列を学んだ P3 は慣れる前の外れが無い）。
+    // 同じ内容のファイルが2本なら片方で学んだ表をもう片方に使う（交互の列を学んだP3は慣れる前の外れが無い）。
     let two = t.path("out_two");
     let n = t.path("n.csv");
     let o2 = run(&["--out", &two, "--csv", &n, "--csv", &n, "--skip-check"]);
@@ -157,7 +157,7 @@ fn csv_and_replays_are_split_into_seat_streams_and_scored() {
         "学ばない方法は同じ"
     );
 
-    // k・D の表: k = 9・D = 0 は m = 9 を R = 8 で打ち切り、1 − 8/9 ≒ 11.11 % 待つ。
+    // k・Dの表: k = 9・D = 0 は m = 9 を R = 8 で打ち切り、1 − 8/9 ≒ 11.11 % 待つ。
     let kd = std::fs::read_to_string(format!("{out}/by_k_d.csv")).unwrap();
     assert_eq!(cell(&kd, &["online", "net", "P0", "9", "0"], "m_eff"), "8");
     assert_eq!(

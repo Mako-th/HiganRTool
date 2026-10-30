@@ -1,7 +1,8 @@
-//! 撮影の、共有バッファの先頭の並び・コピーしてよいかの判断・読み取りのスレッドでの PNG と `_shots.csv` と集計（pure）。
-//! ゲームのスレッド（`shot_win::shot_on_draw`。描画の入口 `0x0042DD51` の中）がバックバッファを共有バッファ（640×480×4 バイトを 4 枚）へコピー、
-//! 共有バッファの先頭に各 HRESULT・desc の 8 語・present parameters の 3 語などを書く。形式の変換・PNG への符号化・書き込みは読み取りのスレッド（ここ）。
-//! 画素の変換と PNG は `higanr_core::shot`（`to_rgb`・`encode_png`）。
+//! 撮影の共有バッファの先頭の配置・コピーしてよいかの判断・読み取りのスレッドでのPNGと`_shots.csv`と集計（pure）。
+//! ゲームのスレッド（`shot_win::shot_on_draw`。描画の入口`0x0042DD51`の中）は、バックバッファを共有バッファ（640×480×4バイトを4枚）へコピーする。
+//! さらに共有バッファの先頭へ、各HRESULT・descの8ワード・present parametersの3ワードなどを書く。
+//! 形式の変換・PNGへの符号化・書き込みは読み取りのスレッド（ここ）が行う。
+//! 画素の変換とPNGは`higanr_core::shot`（`to_rgb`・`encode_png`）。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -16,20 +17,20 @@ pub const SHOT_SLOTS: usize = 4;
 pub const SHOT_CAP: usize = 640 * 480 * 4;
 pub const SHOT_FILE_LIMIT: u32 = 400;
 
-// ---- 共有バッファの先頭（u32 の語。ゲームのスレッドが書き、読み取りのスレッドが読む）----
+// ---- 共有バッファの先頭（u32のワード。ゲームのスレッドが書いて読み取りのスレッドが読む）----
 pub const HEAD_WORDS: usize = 32;
-/// 撮った順の番号（1 始まり。ゲームのスレッドが振る）。
+/// 撮った順の番号（1始まり。ゲームのスレッドが振る）。
 pub const H_SERIAL: usize = 0;
-/// 撮影の理由のビット（`higanr_core::script` の `START`〜`WAIT`）。
+/// 撮影の理由のビット（`higanr_core::script`の`START`〜`WAIT`）。
 pub const H_REASON: usize = 1;
 pub const H_STEP: usize = 2;
-/// 要求を出した tick の番号 k。
+/// 要求を出したtickの番号k。
 pub const H_K: usize = 3;
-/// 描画のときの `stub::SEQ`（tick k の後の描画なら k + 1。`render_only::draw_tag_after_tick`）。
+/// 描画のときの`stub::SEQ`（tick kの後の描画なら k + 1。`render_only::draw_tag_after_tick`）。
 pub const H_DRAW_SEQ: usize = 4;
-/// 描画の前に要求がまとめられた回数（同じ描画の前に 2 つの tick が要求を出したら 1）。
+/// 描画の前に要求がまとめられた回数（同じ描画の前に2つのtickが要求を出したら1）。
 pub const H_MERGED: usize = 5;
-/// 失敗の理由（`Fail::code`。0 はコピーできた）。
+/// 失敗の理由（`Fail::code`。0はコピーできた）。
 pub const H_FAIL: usize = 6;
 /// 呼んだ関数のビット（`C_*`）。
 pub const H_CALLS: usize = 7;
@@ -37,46 +38,46 @@ pub const H_HR_GETBACKBUFFER: usize = 8;
 pub const H_HR_GETDESC: usize = 9;
 pub const H_HR_LOCKRECT: usize = 10;
 pub const H_HR_UNLOCKRECT: usize = 11;
-/// Release が返した参照の数。
+/// Releaseが返した参照の数。
 pub const H_RELEASE: usize = 12;
-/// D3DSURFACE_DESC の 8 語（Format・Type・Usage・Pool・Size・MultiSampleType・Width・Height）。
+/// D3DSURFACE_DESCの8ワード（Format・Type・Usage・Pool・Size・MultiSampleType・Width・Height）。
 pub const H_DESC: usize = 13;
-/// present parameters の 3 語（幅・高さ・形式）。
+/// present parametersの3ワード（幅・高さ・形式）。
 pub const H_PP: usize = 21;
-/// LockRect が返した pitch。
+/// LockRectが返したpitch。
 pub const H_PITCH: usize = 24;
-/// コピーした幅・高さ・形式・バイト数（コピーできたときだけ。共有バッファの画素は幅 × 1 画素のバイト数で詰めてある）。
+/// コピーした幅・高さ・形式・バイト数（コピーできたときだけ。共有バッファの画素は幅 × 1画素のバイト数で詰めてある）。
 pub const H_WIDTH: usize = 25;
 pub const H_HEIGHT: usize = 26;
 pub const H_FORMAT: usize = 27;
 pub const H_BYTES: usize = 28;
-/// GetBackBuffer から Release までの TSC と、LockRect の後のコピーだけの TSC（どちらも差。32 ビットで飽和）。
+/// GetBackBufferからReleaseまでのTSCとLockRectの後のコピーだけのTSC（どちらも差。32ビットで飽和）。
 pub const H_TSC_TOTAL: usize = 29;
 pub const H_TSC_COPY: usize = 30;
-/// デバイスのアドレス（`[D3D8_DEVICE_PTR]` の値）。
+/// デバイスのアドレス（`[D3D8_DEVICE_PTR]`の値）。
 pub const H_DEVICE: usize = 31;
 const _: () = assert!(H_DESC + 8 == H_PP && H_PP + 3 == H_PITCH && H_DEVICE < HEAD_WORDS);
 
-/// 呼んだ関数のビット（`H_CALLS`）。「GetBackBuffer が通ったら、どの経路でも Release は 1 回だけ」を後から見るため。
+/// 呼んだ関数のビット（`H_CALLS`）。「GetBackBufferが通ったら、どの経路でもReleaseは1回だけ」を後から見るため。
 pub const C_GETBACKBUFFER: u32 = 1;
 pub const C_GETDESC: u32 = 2;
 pub const C_LOCKRECT: u32 = 4;
 pub const C_UNLOCKRECT: u32 = 8;
 pub const C_RELEASE: u32 = 16;
 
-/// 撮れなかった理由（`H_FAIL`）。どれでもゲームのスレッドが共有バッファを「できた」にして出す（先頭だけが意味を持つ）。
+/// 撮れなかった理由（`H_FAIL`）。どの理由でもゲームのスレッドが共有バッファを「できた」にして出す（先頭だけが意味を持つ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fail {
     Ok,
-    /// `[D3D8_DEVICE_PTR]` が 0。
+    /// `[D3D8_DEVICE_PTR]`が0。
     NoDevice,
     GetBackBuffer,
-    /// GetBackBuffer は通ったが面が NULL。
+    /// GetBackBufferは通ったが面がNULL。
     NullSurface,
     GetDesc,
-    /// 幅・高さが present parameters と違う。
+    /// 幅・高さがpresent parametersと違う。
     SizeMismatch,
-    /// 幅か高さが 0。
+    /// 幅か高さが0。
     ZeroSize,
     /// 読めない画素の形式。
     UnknownFormat,
@@ -85,7 +86,7 @@ pub enum Fail {
     /// 共有バッファが用意されていない（設置の前に確保していない）。
     NoBuffer,
     LockRect,
-    /// LockRect は通ったが、pBits が NULL か pitch が 1 行ぶんに満たない。
+    /// LockRectは通ったが、pBitsがNULLかpitchが1行ぶんに満たない。
     BadLock,
 }
 
@@ -148,13 +149,13 @@ pub struct CopyPlan {
     pub width: u32,
     pub height: u32,
     pub format: u32,
-    /// 1 行のバイト数（幅 × 1 画素のバイト数。共有バッファではこの幅で詰める）。
+    /// 1行のバイト数（幅 × 1画素のバイト数。共有バッファではこの幅で詰める）。
     pub row: u32,
     pub total: u32,
 }
 
-/// GetDesc の 8 語と present parameters の 3 語から、コピーしてよいかを決める（幅・高さが present parameters と同じで、形式が分かり、
-/// 共有バッファに収まるときだけ）。
+/// GetDescの8ワードとpresent parametersの3ワードからコピーしてよいかを決める。
+/// コピーしてよいのは、幅・高さがpresent parametersと同じで形式が分かり、共有バッファに収まるときだけ。
 pub fn plan_copy(desc: &[u32; 8], pp: &[u32; 3], cap: usize) -> Result<CopyPlan, Fail> {
     let (format, width, height) = (desc[0], desc[6], desc[7]);
     if (width, height) != (pp[0], pp[1]) {
@@ -178,7 +179,7 @@ pub fn plan_copy(desc: &[u32; 8], pp: &[u32; 3], cap: usize) -> Result<CopyPlan,
     })
 }
 
-/// 撮影の理由の名前（ファイル名と `_shots.csv`）。ビットの小さい順に `+` で連結する（`pre+post`）。
+/// 撮影の理由の名前（ファイル名と`_shots.csv`）。ビットの小さい順に`+`で連結する（`pre+post`）。
 pub fn reason_name(bits: u32) -> String {
     let names = [
         (START as u32, "start"),
@@ -230,7 +231,7 @@ impl ShotHead {
         released == (gbb_ok && !null_surface)
     }
 
-    /// 共有バッファの画素（`pixels`。幅 × 1 画素のバイト数で詰めたもの）を PNG へ。コピーできていない先頭なら `Err`。
+    /// 共有バッファの画素（`pixels`。幅 × 1画素のバイト数で詰めたもの）をPNGへ。コピーできていない先頭なら`Err`。
     pub fn to_png(self, pixels: &[u8]) -> Result<Vec<u8>, String> {
         if self.fail() != Some(Fail::Ok) {
             return Err("コピーできていない".to_string());
@@ -249,7 +250,7 @@ pub struct ShotCounters {
     pub dropped_off: u32,
     pub taken: u32,
     pub no_free: u32,
-    /// 描画の入口でパニックを受けた回数（1 回で撮影は止まる）。
+    /// 描画の入口でパニックを受けた回数（1回で撮影は止まる）。
     pub panicked: u32,
 }
 
@@ -267,34 +268,34 @@ fn us_text(tsc: u32, freq: Option<f64>) -> String {
 
 #[derive(Debug, Clone, Default)]
 pub struct ShotStats {
-    /// 取り出した共有バッファ（撮れた・撮れなかったの両方）の数。`_shots.csv` の通し番号。
+    /// 取り出した共有バッファ（撮れた・撮れなかったの両方）の数。`_shots.csv`の通し番号。
     pub taken: u32,
     pub ok: u32,
     pub written: u32,
-    /// 書けなかった（PNG にできない・ファイルを開けない / 書けない）。
+    /// 書き込めなかった数（PNGにできない・ファイルを開けない / 書き込めない）。
     pub write_failed: u32,
-    /// 上限（400 枚）を超えて書かなかった。
+    /// 上限（400枚）を超えて書かなかった。
     pub over_limit: u32,
     /// 失敗の理由ごとの数（コピーできなかったもの）。
     pub fails: BTreeMap<&'static str, u32>,
     pub unlock_failed: u32,
-    /// 「Release は 1 回だけ」が崩れた先頭の数。
+    /// 「Releaseは1回だけ」が崩れた先頭の数。
     pub release_unbalanced: u32,
     pub total_tsc: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Taken {
-    /// 撮れたので PNG に書く（本ログの名前の先頭に付ける接尾辞）。
+    /// 撮れたのでPNGに書く（本ログの名前の先頭に付ける接尾辞）。
     Write(String),
-    /// 撮れたが上限（400 枚）を超えたので書かない。
+    /// 撮れたが上限（400枚）を超えたので書かない。
     OverLimit,
     /// 撮れなかった（先頭の失敗の理由を数えた）。
     Failed,
 }
 
 impl ShotStats {
-    /// 1 枚ぶんを数え、通し番号とどうするかを返す。書けたかは呼び出し側が `written` / `write_failed` に足す。
+    /// 1枚ぶんを数えて、通し番号とどうするかを返す。書けたかどうかは呼び出し側が`written` / `write_failed`に足す。
     pub fn take(&mut self, head: &ShotHead) -> (u32, Taken) {
         self.taken += 1;
         let n = self.taken;
@@ -329,7 +330,7 @@ impl ShotStats {
         }
     }
 
-    /// `_shots.csv` の 1 行。`file` は書いた PNG の名前（書かなかったら空、上限なら `over_limit`）。
+    /// `_shots.csv`の1行。`file`は書いたPNGの名前（書かなかったら空。上限なら`over_limit`）。
     pub fn row(n: u32, head: &ShotHead, freq: Option<f64>, file: &str) -> String {
         let result = head.fail().map_or("unknown_code", Fail::name);
         let d = head.desc();
@@ -430,7 +431,7 @@ mod tests {
     use higanr_core::shot::{D3DFMT_R5G6B5, D3DFMT_X8R8G8B8};
 
     fn desc(format: u32, w: u32, h: u32) -> [u32; 8] {
-        // Size は判断に使わない語。桁あふれの件（幅 0x8000_0000）でも作れるよう wrapping で。
+        // Sizeは判断に使わないフィールド。桁あふれの件（幅0x8000_0000）でも作れるようwrappingで。
         [format, 1, 1, 0, w.wrapping_mul(h).wrapping_mul(4), 0, w, h]
     }
 

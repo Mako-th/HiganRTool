@@ -1,12 +1,13 @@
-//! 自動保存の、ゲームのスレッドの層と Win32 の層（unsafe はここにもある。1 つずつ `// SAFETY:`）。判断は `replay_save.rs`（pure）。
-//! 入れるのは `HiganRTool.ini` の `[replay]` に `enable = 1` があるときだけ（`arm`）。入れなければ `on_tick` は原子変数を 1 つ読んで戻る。
-//! - 入口 `on_tick`（台本・ネットワークの分かれ道 `script_win::script_on_tick` の先頭から、ゲームのスレッドで毎 tick 呼ばれる）と、ゲームのスレッドの状態
-//!   （`DRIVER`。触るのはゲームのスレッドだけなので `try_lock` は必ず取れる。待たない）
-//! - ゲームのメモリの読み書きと保存関数の呼び出し（`RealSaveIo`）。保存関数は素のアセンブリの踏み台 `save_call` で呼ぶ: `call` の直前に、
-//!   ゲームの見積もりのループ（`0x00420CA0`）が読む 10 語を読んで記録し、そこへヘッダの本当の印を書いてから（自分のスタックの esp より下だけ）、
-//!   書いた後の 10 語で見積もりを計算して、要る上限より小さければ呼ばない
-//! - 保管庫のスレッド（`arm` が作る）と、その Win32 のインターフェース（`RealVaultOs`: ゲームの exe のフォルダを読む・CP932 のパスを `CreateFileA` で
-//!   開いて押さえたファイルと同じかを見る）
+//! 自動保存の、ゲームのスレッドの層とWin32の層（unsafeはここにもある。1つずつ`// SAFETY:`）。判断は`replay_save.rs`（pure）。
+//! 有効にするのは`HiganRTool.ini`の`[replay]`に`enable = 1`があるときだけ（`arm`）。有効にしなければ`on_tick`はアトミック変数を1つ読んで戻る。
+//! - 入口`on_tick`（台本・ネットワークの分岐`script_win::script_on_tick`の先頭からゲームのスレッドで毎tick呼ばれる）とゲームのスレッドの状態（`DRIVER`）。
+//!   触るのはゲームのスレッドだけなので`try_lock`は必ず取れる。待たない。
+//! - ゲームのメモリの読み書きと保存関数の呼び出し（`RealSaveIo`）。保存関数は素のアセンブリのトランポリン`save_call`で呼ぶ。
+//!   `call`の直前に、ゲームの見積もりのループ（`0x00420CA0`）が読む10ワードを読んで記録する。
+//!   そこへヘッダの本当のフラグを書く（自分のスタックのespより下だけ）。
+//!   書いた後の10ワードで見積もりを計算し、要る上限より小さければ呼ばない。
+//! - 保管庫のスレッド（`arm`が作る）とそのWin32のインターフェース（`RealVaultOs`）。
+//!   このインターフェースはゲームのexeのフォルダを読み、ANSIのパスを`CreateFileA`で開いて確保したファイルと同じかどうかを見る。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -22,6 +23,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use higanr_core::ansi::Ansi;
 use higanr_core::autosave::{self, ChargeSync, NAME_BUF};
 use higanr_core::handshake::Name;
 use higanr_core::log_scrub::{Scrub, ScrubWrite};
@@ -60,18 +62,18 @@ use crate::trial_summary::ReplayFacts;
 use crate::win::{self, read_own_into, read_own_memory};
 use higanr_core::replay_rounds::Boundary;
 
-/// 自動保存が入っているか。0 から 1 にするのは `arm`（アドレスを保存し、保管庫のスレッドを作った後）、1 から 0 にするのはパニックを受けたとき。
+/// 自動保存が有効かどうか。0から1にするのは`arm`（アドレスを保存して保管庫のスレッドを作った後）。1から0にするのはパニックを受けたとき。
 pub static ARMED: AtomicU32 = AtomicU32::new(0);
 pub static PANICKED: AtomicU32 = AtomicU32::new(0);
 pub static HANDOFF: Handoff = Handoff::new();
-/// ゲームのスレッドの状態。触るのはゲームのスレッドの `on_tick` だけ（`try_lock` で、取れなければ何もしない）。
+/// ゲームのスレッドの状態。触るのはゲームのスレッドの`on_tick`だけ（`try_lock`で取れなければ何もしない）。
 static DRIVER: Mutex<Driver> = Mutex::new(Driver::new());
-/// QueryPerformanceFrequency（`arm` が設定する。0 なら所要は 0 と書く）。
+/// QueryPerformanceFrequency（`arm`が設定する。0なら所要は0と書く）。
 static QPC_FREQ: AtomicU64 = AtomicU64::new(0);
-/// 今の seg（マッチ）で保存関数を呼んだか（`Driver::saved_this_seg` のコピー。`on_tick` が毎 tick 書く）。錠を取らずに読むためのコピー。
+/// 今のマッチで保存関数を呼んだかどうか（`Driver::saved_this_seg`のコピー。`on_tick`が毎tick書く）。ロックを取らずに読むためのコピー。
 static SEG_SAVED: AtomicU32 = AtomicU32::new(0);
 
-/// ゲームのスレッドが直に読むアドレス（`arm` が読めると検証してから保存する。検査では自分の静的変数）。
+/// ゲームのスレッドが直接読むアドレス（`arm`が読み取り可能と検証してから保存する。検査では自分の静的変数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveAddrs {
     pub supervisor: u32,
@@ -79,7 +81,7 @@ pub struct SaveAddrs {
     pub loading: u32,
     pub game_mode: u32,
     pub manager_ptr: u32,
-    /// 1P の勝ち数・2P の勝ち数・勝ちに要る数。
+    /// 1Pの勝ち数・2Pの勝ち数・勝ちに要る数。
     pub wins: [u32; 3],
     pub rng: u32,
     pub save_fn: u32,
@@ -87,11 +89,11 @@ pub struct SaveAddrs {
     /// `completed_rounds`・`round_frames`（ラウンドごとの記録）。
     pub completed_rounds: u32,
     pub round_frames: u32,
-    /// 1P・2P の Player へのポインタの欄、スコアを持つ塊へのポインタの欄（欄そのものは直に読み、先は落ちない読み方でたどる）。
+    /// 1P・2PのPlayerへのポインタのフィールドとスコアを持つブロックへのポインタのフィールド。フィールドそのものは直接読み、先は例外を出さない読み方でたどる。
     pub players: [u32; 2],
     pub stats: [u32; 2],
-    /// ゲームの設定のコピーへのポインタの欄（`[欄]+0xB4` / `+0xB5` が生きた試合の 1P / 2P のチャージ型）。欄そのものは `arm` が読めると
-    /// 検証し、先は落ちない読み方でたどる。
+    /// ゲームの設定のコピーへのポインタのフィールド（`[欄]+0xB4` / `+0xB5`が生きた試合の1P / 2Pのチャージ型）。
+    /// フィールドそのものは`arm`が読み取り可能と検証し、先は例外を出さない読み方でたどる。
     pub options_copy: u32,
 }
 
@@ -174,7 +176,7 @@ impl SaveAddrs {
         Self::from_words(core::array::from_fn(|i| ADDRS[i].load(Ordering::Acquire)))
     }
 
-    /// `words` の逆。
+    /// `words`の逆。
     fn from_words(w: [u32; ADDR_WORDS]) -> SaveAddrs {
         SaveAddrs {
             supervisor: w[0],
@@ -199,7 +201,7 @@ pub fn armed() -> bool {
     ARMED.load(Ordering::Acquire) != 0
 }
 
-/// 自動保存の数（試験のまとめの「自動保存」の行。入れていなければ全部 0）。
+/// 自動保存の数（試験のまとめの「自動保存」の行。有効にしていなければ全部0）。
 pub fn facts() -> ReplayFacts {
     let o = HANDOFF.outcome_counts();
     ReplayFacts {
@@ -213,7 +215,7 @@ pub fn facts() -> ReplayFacts {
     }
 }
 
-/// 入力の地点（ゲームのスレッド）から毎 tick。`np` はネットワークが動いていればネットワークのセッション。`watching` は観戦者の実行で見えるもの。
+/// 入力の地点（ゲームのスレッド）から毎tick。`np`はネットワークが動いていればネットワークのセッション。`watching`は観戦者の実行で見えるもの。
 /// パニックは受けて外へ出さず、自動保存を止める（台本とネットワークはそのまま）。
 pub fn on_tick(np: Option<&NetPlay>, watching: Watching) {
     if ARMED.load(Ordering::Acquire) == 0 {
@@ -238,7 +240,7 @@ pub fn on_tick(np: Option<&NetPlay>, watching: Watching) {
 
 #[cfg(test)]
 thread_local! {
-    /// 検査の入口: このスレッドで `on_confirmed_tick` が呼ばれた回数（`GameWindow::tick` の配線を見る。検査はスレッドごとに走る）。
+    /// 検査の入口: このスレッドで`on_confirmed_tick`が呼ばれた回数（`GameWindow::tick`の配線を見る。検査はスレッドごとに走る）。
     static CONFIRMED_HOOK_CALLS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
@@ -247,9 +249,11 @@ pub(crate) fn confirmed_hook_calls() -> u32 {
     CONFIRMED_HOOK_CALLS.with(core::cell::Cell::get)
 }
 
-/// rollback の確定した tick の直後（`GameWindow::tick` から、ゲームのスレッドで）。ラウンドの境目の値をその tick のまま読む。入れていない実行は
-/// 原子変数を 1 つ読んで戻る。`DRIVER` は `on_tick` が終わった後（フレームの始まりの後）にしか来ないので `try_lock` は取れる。パニックは受けて
-/// 外へ出さず、自動保存を止める。
+/// rollbackで確定したtickの直後（`GameWindow::tick`からゲームのスレッドで呼ばれる）。
+/// ラウンドの境目の値をそのtickのまま読む。
+/// 有効にしていない実行はアトミック変数を1つ読んで戻る。
+/// `DRIVER`は`on_tick`が終わった後（フレームの始まりの後）にしか来ないので`try_lock`は取れる。
+/// パニックは受けて外へ出さず、自動保存を止める。
 pub fn on_confirmed_tick() {
     #[cfg(test)]
     CONFIRMED_HOOK_CALLS.with(|c| c.set(c.get() + 1));
@@ -272,24 +276,25 @@ pub fn on_confirmed_tick() {
     }
 }
 
-/// このツールの自動保存が、今のマッチ（seg）で保存関数を呼んだか。入れていない実行・パニックで止めた後・この seg で呼んでいない
-/// （見積もりで呼ばなかった・準備が間に合わなかった・試みていない）は false。同じ tick の `on_tick` の後に読むこと。
+/// このツールの自動保存が今のマッチで保存関数を呼んだかどうか。
+/// 次の場合はfalse: 有効にしていない実行・パニックで止めた後・このマッチで呼んでいない（見積もりで呼ばなかった・準備が間に合わなかった・試みていない）。
+/// 同じtickの`on_tick`の後に読むこと。
 pub fn saved_this_seg() -> bool {
     ARMED.load(Ordering::Acquire) != 0 && SEG_SAVED.load(Ordering::Relaxed) != 0
 }
 
-/// 検査の入口: `ARMED` と `SEG_SAVED` を直に設定する。`REAL_HOOK_TESTS` の錠を持つ間だけ呼び、戻すときは両方 false。
+/// 検査の入口: `ARMED`と`SEG_SAVED`を直接設定する。`REAL_HOOK_TESTS`のロックを持つ間だけ呼び、戻すときは両方false。
 #[cfg(test)]
 pub(crate) fn set_seg_saved_for_test(armed: bool, saved: bool) {
     SEG_SAVED.store(u32::from(saved), Ordering::SeqCst);
     ARMED.store(u32::from(armed), Ordering::SeqCst);
 }
 
-/// `[addr, addr + N)` を直に読む（1 バイトずつ）。呼んでよいのは `SaveAddrs::direct_ranges` の範囲の中（`arm` が読めると
-/// 検証した th09.exe の .data と .text）と、保存関数の先頭の署名の 12 バイトだけ。
+/// `[addr, addr + N)`を直接読む（1バイトずつ）。
+/// 呼んでよいのは`SaveAddrs::direct_ranges`の範囲の中（`arm`が読み取り可能と検証したth09.exeの .dataと .text）と、保存関数の先頭の署名の12バイトだけ。
 fn rd<const N: usize>(addr: u32) -> [u8; N] {
     core::array::from_fn(|i| {
-        // SAFETY: 呼び出し元が `arm` が検証した範囲のアドレスだけを渡す。volatile はゲームのスレッドが書き換える欄の読みを畳ませないため。
+        // SAFETY: 呼び出し元が`arm`が検証した範囲のアドレスだけを渡す。volatileはゲームのスレッドが書き換えるフィールドの読みをコンパイラにまとめさせないため。
         unsafe { core::ptr::read_volatile((addr as usize + i) as *const u8) }
     })
 }
@@ -316,7 +321,7 @@ fn qpc_now_us() -> u64 {
         return 0;
     }
     let mut q: i64 = 0;
-    // SAFETY: `q` は書ける i64（LARGE_INTEGER と同じ大きさ）。XP 以降は失敗しない。
+    // SAFETY: `q`は書き込み可能なi64（LARGE_INTEGERと同じ大きさ）。XP以降は失敗しない。
     unsafe { QueryPerformanceCounter(&mut q) };
     (u128::from(q.max(0) as u64) * 1_000_000 / u128::from(f)) as u64
 }
@@ -352,7 +357,7 @@ impl SaveIo for RealSaveIo {
         if hdr == 0 {
             return None;
         }
-        // 確保しない・落ちない読み方だけを使う（ゲームのスレッド）。
+        // 確保しない・例外を出さない読み方だけを使う（ゲームのスレッド）。
         let mut id = HeaderIdent {
             date: [0; HEADER_FIELD_LEN],
             name: [0; HEADER_FIELD_LEN],
@@ -395,8 +400,8 @@ impl SaveIo for RealSaveIo {
     }
     fn write_rng(&mut self, v: &[u8; RNG_BYTES]) {
         for (i, b) in v.iter().enumerate() {
-            // SAFETY: `[rng, rng + 12)` は `arm` が読めると検証した th09.exe の .data（乱数の状態と抽選回数 —— `th09_addr::RNG_ADDR`）。
-            // 書くのは同じスレッドが直前に読んだ値だけ（保存が引いた 3 回を無かったことにする）。
+            // SAFETY: `[rng, rng + 12)`は`arm`が読み取り可能と検証したth09.exeの .data（乱数の状態と抽選回数 —— `th09_addr::RNG_ADDR`）。
+            // 書くのは同じスレッドが直前に読んだ値だけ（保存が行った3回の抽選を無かったことにする）。
             unsafe { core::ptr::write_volatile((self.a.rng as usize + i) as *mut u8, *b) };
         }
     }
@@ -451,10 +456,13 @@ impl SaveIo for RealSaveIo {
         let mut seen = [0u32; STAGES];
         let mut written = [0u32; STAGES];
         let mut game_est = 0u32;
-        // SAFETY（`save_call` の約束）: `save_fn` は `arm` の照合とこの tick の `signature_ok` で、先頭の 12 バイトが花映塚の保存関数と
-        // 同じと検証したアドレス。`rm` は `[0x4A7E64]` の 0 でない値で `+0x114` が 0（記録の側）の ReplayManager（場面 2 の読み込み中でない tick。読み込みのスレッドは触っていない）。`path_addr` は
-        // `Handoff` のパスのバッファ（NUL で終わる CP932。この呼び出しの間、持ち主はゲームのスレッド）、`name` は NUL で終わる 8 文字。`seen`・`written`・`game_est` はこのスタックの
-        // 書けるバッファ、`est.flags` と `est.chunks` は読める 10 語。踏み台が書くのは自分のスタックの esp より下の 40 バイトだけ。
+        // SAFETY: `save_call`の約束を満たす。
+        // `save_fn`は`arm`の照合とこのtickの`signature_ok`で、先頭の12バイトが花映塚の保存関数と同じと検証したアドレス。
+        // `rm`は`[0x4A7E64]`の0でない値で、`+0x114`が0（記録の側）のReplayManager（場面2の読み込み中でないtick。読み込みのスレッドは触っていない）。
+        // `path_addr`は`Handoff`のパスのバッファ（NULで終わるANSI。この呼び出しの間の所有者はゲームのスレッド）。
+        // `name`はNULで終わる8文字。
+        // `seen`・`written`・`game_est`はこのスタックの書き込み可能なバッファ。`est.flags`と`est.chunks`は読み取り可能な10ワード。
+        // トランポリンが書くのは自分のスタックのespより下の40バイトだけ。
         // ゲームのスレッドから呼ぶ（ゲーム自身の保存も同じスレッド）。
         let called = unsafe {
             save_call(
@@ -480,8 +488,8 @@ impl SaveIo for RealSaveIo {
     }
 }
 
-/// 面ごとの塊の数（先頭の塊を含む）。先頭の塊は ReplayManager `rm` の中に埋め込まれていて、そこから次をたどる（`0x00420CB0`〜`0x00420CBF`）。
-/// 読めない・`CHAIN_LIMIT` を超えるなら `None`。確保しない。ゲームのスレッドで使える。
+/// 面ごとのチャンクの数（先頭のチャンクを含む）。先頭のチャンクはReplayManager `rm`の中に埋め込まれていて、そこから次をたどる（`0x00420CB0`〜`0x00420CBF`）。
+/// 読み取れない・`CHAIN_LIMIT`を超えるなら`None`。確保しない。ゲームのスレッドで使える。
 pub(crate) fn count_chunks<M: MemRead>(m: &mut M, rm: u32) -> Option<[u32; STAGES]> {
     let mut chunks = [0u32; STAGES];
     for (i, slot) in chunks.iter_mut().enumerate() {
@@ -500,11 +508,11 @@ pub(crate) fn count_chunks<M: MemRead>(m: &mut M, rm: u32) -> Option<[u32; STAGE
     Some(chunks)
 }
 
-/// 自分のプロセスへ 1 バイトを落ちない書き方で書く（アドレスが確保されていない・書けないなら false。例外は出ない）。
+/// 自分のプロセスへ1バイトを例外を出さない書き方で書く（アドレスが確保されていない・書き込めないならfalse。例外は出ない）。
 fn write_own_u8(addr: u32, v: u8) -> bool {
     let mut n: usize = 0;
-    // SAFETY: 自分のプロセスの擬似ハンドルと、書くアドレス・書く元（スタックの `v`）・長さ 1・書けたバイト数の書く先を渡すだけ。
-    // アドレスが確保されていない・書けないなら、OS が失敗を返す。
+    // SAFETY: 自分のプロセスの擬似ハンドルと書き込み先のアドレス・書き込み元（スタックの`v`）・長さ1・書き込んだバイト数の格納先を渡すだけ。
+    // アドレスが確保されていない・書き込めないならOSが失敗を返す。
     let ok = unsafe {
         WriteProcessMemory(
             GetCurrentProcess(),
@@ -517,27 +525,33 @@ fn write_own_u8(addr: u32, v: u8) -> bool {
     ok != 0 && n == 1
 }
 
-/// `call` の時点の esp（E）から、ゲームの見積もりのループが読む 10 語の始まりまで（`E − 0x200`）。
+/// `call`の時点のesp（E）から、ゲームの見積もりのループが読む10ワードの始まりまで（`E − 0x200`）。
 const SNAP_BELOW: u32 = REPLAY_SAVE_FRAME_SHIFT + SAVE_EST_FLAGS_EBP;
 
-// SAFETY（`#[unsafe(naked)]`）: cdecl の関数（引数 11 個 `[esp+4]`〜`[esp+44]`、戻り値 eax）。ebx・esi・edi・ebp は push して最後に pop で戻す。
-// - 名前を積んだ直後の esp を E とする。`[E − 0x200 + 4i]`（i = 0〜9）は、保存関数の先頭の `push ebp; mov ebp,esp` の後の
-//   `-0x1F8(%ebp,%esi,4)`（`0x00420CA0`）と同じアドレス（ebp = E − 8）。保存関数の先頭から `0x00420CA0` までにそこへ書く命令は無い。
-// - 順に: ① その 10 語を `before` へコピーする。② 本当の印（ヘッダ `[this+8]` の `+0x20` の 10 語のコピー `flags`）をそこへ書く。③ 読み戻して
-//   `after` へコピーする。④ `after` で見積もりを計算する。ゲームのループは印が 0 かどうかしか見ない（`0x00420CA7 test %eax,%eax`）ので、
-//   本当の印を書けば、ゲームが確保の後 `0x00420CEB` でヘッダをコピーしてから使うのと同じ面を数える。コピーは確保の後に同じ値で上書きされるので、
-//   書いた値がゲームのその後に残ることは無い。
-// - 書くのはこのスレッドのスタックの、esp より 0x200〜0x1DC バイト下の 40 バイトだけ（ゲームのメモリにもコードにも書かない）。
-//   esp より下は保存関数の枠になる所で呼び手の値は無く、1 頁（4 KiB）の内側なのでスタックの見張りの頁を越えない。割り込みはユーザーモードの
-//   スタックを使わず、この間にシステムコールも無い。②から `call` までの間に push も呼び出しも挟まない（挟めば書いた 10 語が E からずれるか、
-//   呼んだ関数の枠で壊れる）。見積もりは eax・ecx・edx・esi だけで計算し、`est_out` へ書き、`need` より小さければ
-//   名前を積み下ろして 0 を返す（保存関数を呼ばない）。
-// - 呼ぶときは ecx = this、edx = path、`[esp]` = 名前（fastcall。保存関数は `ret $0x4` で名前を片付ける）。保存関数は ebx・esi・edi・ebp を保つ
-//   （`0x00420C69`・`0x00420C7F`〜`0x00420C80` の push と `0x0042112B`〜`0x00421132` の pop。早い出口 `0x0042112D` は ebx・esi に触らない）。
-//   DF は呼ぶ側の Rust の決まりで 0。
-/// 保存関数を呼ぶ踏み台（`RealSaveIo::call_save`・メニューの保存の入口 `menu_save_win` と検査からだけ呼ぶ）。
+// SAFETY（`#[unsafe(naked)]`）: cdeclの関数（引数11個`[esp+4]`〜`[esp+44]`、戻り値eax）。ebx・esi・edi・ebpはpushして最後にpopで戻す。
+// - 名前を積んだ直後のespをEとする。
+//   `[E − 0x200 + 4i]`（i = 0〜9）は、保存関数の先頭の`push ebp; mov ebp,esp`の後の`-0x1F8(%ebp,%esi,4)`（`0x00420CA0`）と同じアドレス（ebp = E − 8）。
+//   保存関数の先頭から`0x00420CA0`までにそこへ書く命令は無い。
+// - 処理は次の順:
+//   ① その10ワードを`before`へコピーする。
+//   ② 本当のフラグ（ヘッダ`[this+8]`の`+0x20`の10ワードのコピー`flags`）をそこへ書く。
+//   ③ 読み戻して`after`へコピーする。
+//   ④ `after`で見積もりを計算する。
+//   ゲームのループはフラグが0かどうかしか見ない（`0x00420CA7 test %eax,%eax`）。
+//   そのため本当のフラグを書けば、ゲームが確保の後`0x00420CEB`でヘッダをコピーしてから使うのと同じ面を数える。
+//   コピーは確保の後に同じ値で上書きされるので、書いた値がゲームのその後に残ることは無い。
+// - 書くのはこのスレッドのスタックの、espより0x200〜0x1DCバイト下の40バイトだけ（ゲームのメモリにもコードにも書かない）。
+//   espより下は保存関数のフレームになる所で、呼び出し元の値は無い。
+//   また1ページ（4 KiB）の内側なので、スタックのガードページを越えない。
+//   割り込みはユーザーモードのスタックを使わず、この間にシステムコールも無い。
+//   ②から`call`までの間にpushも呼び出しも挟まない（挟めば書いた10ワードがEからずれるか、呼んだ関数のフレームで壊れる）。
+//   見積もりはeax・ecx・edx・esiだけで計算して`est_out`へ書く。`need`より小さければ名前を積み下ろして0を返す（保存関数を呼ばない）。
+// - 呼ぶときは ecx = this、edx = path、`[esp]` = 名前（fastcall。保存関数は`ret $0x4`で名前を後始末する）。
+//   保存関数はebx・esi・edi・ebpを保つ（`0x00420C69`・`0x00420C7F`〜`0x00420C80`のpushと`0x0042112B`〜`0x00421132`のpop。早い出口`0x0042112D`はebx・esiに触らない）。
+//   DFは呼ぶ側のRustの決まりで0。
+/// 保存関数を呼ぶトランポリン（`RealSaveIo::call_save`・メニューの保存の入口`menu_save_win`と検査からだけ呼ぶ）。
 #[allow(clippy::too_many_arguments)]
-// 引数の並びは素のアセンブリの `[ebp + 8]`〜`[ebp + 48]` と 1 対 1（構造体にするとアドレスの計算が増える）
+// 引数の並びは素のアセンブリの`[ebp + 8]`〜`[ebp + 48]`と1対1（構造体にするとアドレスの計算が増える）
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn save_call(
     _func: u32,
@@ -559,7 +573,7 @@ pub(crate) unsafe extern "C" fn save_call(
         "push esi",
         "push edi",
         "push dword ptr [ebp + 20]",
-        // esp = E。① 書く前の 10 語をコピーする。
+        // esp = E。① 書く前の10ワードをコピーする。
         "mov edi, dword ptr [ebp + 24]",
         "xor ecx, ecx",
         "6:",
@@ -568,7 +582,7 @@ pub(crate) unsafe extern "C" fn save_call(
         "inc ecx",
         "cmp ecx, {stages}",
         "jl 6b",
-        // ② 本当の印を、ゲームのループが読む所へ書く。
+        // ② 本当のフラグを、ゲームのループが読む場所へ書く。
         "mov esi, dword ptr [ebp + 28]",
         "xor ecx, ecx",
         "7:",
@@ -577,7 +591,7 @@ pub(crate) unsafe extern "C" fn save_call(
         "inc ecx",
         "cmp ecx, {stages}",
         "jl 7b",
-        // ③ 書いた 10 語を読み戻す（ここから call まで push も呼び出しも無い）。
+        // ③ 書いた10ワードを読み戻す（ここからcallまでpushも呼び出しも無い）。
         "mov edi, dword ptr [ebp + 32]",
         "xor ecx, ecx",
         "8:",
@@ -586,7 +600,7 @@ pub(crate) unsafe extern "C" fn save_call(
         "inc ecx",
         "cmp ecx, {stages}",
         "jl 8b",
-        // ④ ゲームの見積もり（eax）= 初めの値 ＋ 読み戻した印が 0 でない面の 0x60 ＋ 0x54D9 × 塊の数。
+        // ④ ゲームの見積もり（eax）= 初期値 ＋ 読み戻したフラグが0でない面の0x60 ＋ 0x54D9 × チャンクの数。
         "mov esi, dword ptr [ebp + 36]",
         "mov eax, dword ptr [ebp + 40]",
         "xor ecx, ecx",
@@ -628,17 +642,16 @@ pub(crate) unsafe extern "C" fn save_call(
     )
 }
 
-// ---- 保管庫のスレッドの Win32 のインターフェース ----
+// ---- 保管庫のスレッドのWin32のインターフェース ----
 
 fn file_id(h: HANDLE) -> Result<(u32, u32, u32), String> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `h` は呼び出しの間開いているファイルのハンドル、`info` は書ける構造体そのもの。
+    // SAFETY: `h`は呼び出しの間開いているファイルのハンドル。`info`は書き込み可能な構造体そのもの。
     let ok = unsafe { GetFileInformationByHandle(h, &mut info) };
     if ok == 0 {
         // SAFETY: 引数の無い呼び出し。直前の呼び出しの結果を指す。
-        return Err(format!("GetFileInformationByHandle が失敗（{}）", unsafe {
-            GetLastError()
-        }));
+        let code = unsafe { GetLastError() };
+        return Err(format!("GetFileInformationByHandle が失敗（{code}）"));
     }
     Ok((
         info.dwVolumeSerialNumber,
@@ -647,16 +660,16 @@ fn file_id(h: HANDLE) -> Result<(u32, u32, u32), String> {
     ))
 }
 
-/// CP932 のパス `ansi`（NUL なし）を、保存関数と同じ `CreateFileA` の経路で開き、`file` と同じファイル（ボリュームの番号と
-/// ファイルの番号が同じ）か。開くのは属性を読むためだけ。
+/// ANSIのパス`ansi`（NULなし）を保存関数と同じ`CreateFileA`の経路で開き、`file`と同じファイルかどうかを返す。
+/// 同じとは、ボリュームの番号とファイルの番号が同じこと。開くのは属性を読むためだけ。
 pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
     if ansi.contains(&0) {
         return Err("パスに NUL が含まれています".to_string());
     }
     let mut z = ansi.to_vec();
     z.push(0);
-    // SAFETY: `z` は NUL で終わるバイト列で呼び出しの間生きている。属性を読む権利だけ、共有は全部許す、既にあるものだけを開く。
-    // 返したハンドルは下で閉じる。
+    // SAFETY: `z`はNULで終わるバイト列で呼び出しの間生きている。属性を読む権利だけを指定し、共有は全部許し、既にあるファイルだけを開く。
+    // 返ったハンドルは下で閉じる。
     let h = unsafe {
         CreateFileA(
             z.as_ptr(),
@@ -669,11 +682,9 @@ pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
         )
     };
     if h == INVALID_HANDLE_VALUE {
-        // SAFETY: 引数の無い呼び出し。直前の CreateFileA の結果を指す。
-        return Err(format!(
-            "CreateFileA で開けません（GetLastError = {}）",
-            unsafe { GetLastError() }
-        ));
+        // SAFETY: 引数の無い呼び出し。直前のCreateFileAの結果を指す。
+        let code = unsafe { GetLastError() };
+        return Err(format!("CreateFileA で開けません（GetLastError = {code}）"));
     }
     let a = file_id(h);
     // SAFETY: 上で開いた、まだ閉じていないハンドル。
@@ -682,9 +693,9 @@ pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
     Ok(a? == b)
 }
 
-/// 押さえたファイルを、更新時刻を書くためだけに開く（属性の書き込みの権利 `FILE_WRITE_ATTRIBUTES` だけ、共有は全部許す、
-/// 既にあるものだけ）。データの読み書きの権利を持たないハンドルは共有の判定に数えられないので、ゲームの保存が
-/// `CreateFileA(GENERIC_WRITE, 共有 0, CREATE_ALWAYS)` で開いても断られない（検査 `touch_handle_does_not_block_the_games_create_always`）。
+/// 確保したファイルを更新時刻を書くためだけに開く（属性の書き込みの権利`FILE_WRITE_ATTRIBUTES`だけを指定し、共有は全部許し、既にあるファイルだけを開く）。
+/// データの読み書きの権利を持たないハンドルは共有の判定に数えられない。
+/// そのためゲームの保存が`CreateFileA(GENERIC_WRITE, 共有 0, CREATE_ALWAYS)`で開いても断られない（検査`touch_handle_does_not_block_the_games_create_always`）。
 fn open_attributes_only(file: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -696,6 +707,9 @@ fn open_attributes_only(file: &Path) -> std::io::Result<File> {
 pub struct RealVaultOs;
 
 impl VaultOs for RealVaultOs {
+    fn ansi(&self) -> &dyn Ansi {
+        &win::AcpAnsi
+    }
     fn exe_dir_box(&mut self) -> Option<Vec<u8>> {
         read_own_memory(EXE_DIR, EXE_DIR_LEN as usize)
     }
@@ -712,9 +726,9 @@ impl VaultOs for RealVaultOs {
     }
 }
 
-// ---- 入れる（読み取りのスレッド） ----
+// ---- 有効にする（読み取りのスレッド） ----
 
-/// 保管庫のスレッドのログの書き込み関数。簡潔なときはファイルを作らず捨てる。詳細のときも、ユーザー名とゲームのフォルダ・IP のアドレスは伏せて書く。
+/// 保管庫のスレッドのログの書き込み関数。簡潔なときはファイルを作らず捨てる。詳細のときもユーザー名とゲームのフォルダ・IPのアドレスは伏せて書く。
 fn open_worker_log(
     detail: bool,
     dir: &Path,
@@ -735,8 +749,9 @@ fn open_worker_log(
     )))
 }
 
-/// `HiganRTool.ini` の本文から `[replay]` を読み、`enable = 1` なら自動保存を入れる（保存関数の署名とアドレスを検証し、保管庫のスレッドのログを
-/// 開き、保管庫のスレッドを作り、`ARMED` = 1）。入れたら、入れた旨の 1 行を `Ok(Some(...))` で返し、設定に無ければ `Ok(None)`。台本の分かれ道を開く前に呼ぶ。
+/// `HiganRTool.ini`の本文から`[replay]`を読み、`enable = 1`なら自動保存を有効にする。
+/// 有効にする手順は、保存関数の署名とアドレスを検証し、保管庫のスレッドのログを開き、保管庫のスレッドを作り、`ARMED` = 1 にすること。
+/// 有効にしたら、その旨の1行を`Ok(Some(...))`で返す。設定に無ければ`Ok(None)`。台本の分岐を開く前に呼ぶ。
 pub fn arm(
     ini_text: Option<&str>,
     net: Option<&NetSettings>,
@@ -794,13 +809,14 @@ pub fn arm(
         settings.split,
     );
     let mut f: i64 = 0;
-    // SAFETY: `f` は書ける i64。
+    // SAFETY: `f`は書き込み可能なi64。
     unsafe { QueryPerformanceFrequency(&mut f) };
     QPC_FREQ.store(f.max(0) as u64, Ordering::SeqCst);
     a.store();
-    // ネットワークを組み込んだ実行では、接続している間にだけ名前を押さえる（`Worker::may_reserve`）。
+    // ネットワークを組み込んだ実行では接続している間にだけ名前を確保する（`Worker::may_reserve`）。
     let mut worker = Worker::new(settings.split, self_name, net.is_some(), file)
-        .with_problem_sink(Box::new(crate::main_log::push));
+        .with_problem_sink(Box::new(crate::main_log::push))
+        .with_name_template(&settings.name);
     std::thread::Builder::new()
         .name("higanrtool-replay".to_string())
         .spawn(move || {
@@ -834,7 +850,7 @@ pub fn arm(
 
 #[cfg(test)]
 mod tests {
-    //! 本物の踏み台と `RealSaveIo` を、偽の保存関数（先頭の 12 バイトを花映塚と同じにした素のアセンブリ）と偽のゲームのメモリで通す。
+    //! 本物のトランポリンと`RealSaveIo`を、偽の保存関数（先頭の12バイトを花映塚と同じにした素のアセンブリ）と偽のゲームのメモリで通す。
     use super::*;
     use crate::replay_save::{
         Attempt, ST_EMPTY, ST_READY, ST_USED, Skip, game_estimate, need_bound,
@@ -842,7 +858,7 @@ mod tests {
     use crate::th09_addr::{GAME_MODE_MATCH, SAVE_EST_BASE};
     use core::sync::atomic::AtomicU8;
 
-    /// 偽の保存関数と偽のゲームは 1 組しか無いので、1 本ずつ走らせる。
+    /// 偽の保存関数と偽のゲームは1セットしか無いので、1本ずつ走らせる。
     static SERIAL: Mutex<()> = Mutex::new(());
 
     static HITS: AtomicU32 = AtomicU32::new(0);
@@ -851,15 +867,15 @@ mod tests {
     static SEEN_NAME: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
     static SEEN_FLAGS: [AtomicU32; STAGES] = [const { AtomicU32::new(0) }; STAGES];
     static FAKE_RNG: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
-    /// 偽の保存関数が呼ばれた時点の、見出しの `+0x190` / `+0x191`（下位 2 バイト）。
+    /// 偽の保存関数が呼ばれた時点のヘッダの`+0x190` / `+0x191`（下位2バイト）。
     static SEEN_CHARGE: AtomicU32 = AtomicU32::new(u32::MAX);
-    /// 1 のときだけ、偽の保存関数が `this` を ReplayManager として見出しを読む（踏み台の検査の `this` は適当な値）。
+    /// 1のときだけ、偽の保存関数が`this`をReplayManagerとしてヘッダを読む（トランポリンの検査の`this`は適当な値）。
     static PROBE_HEADER: AtomicU32 = AtomicU32::new(0);
 
-    // SAFETY（`#[unsafe(naked)]`）: 花映塚の保存関数の真似。先頭の 12 バイトは署名と同じ（`.byte` で書くのは、アセンブラが
-    // `mov ebp,esp` を別の符号にしうるため）。呼ばれた回数・this・path・名前・ゲームの見積もりのループが読む 10 語を検査の
-    // 静的変数へコピー、偽の乱数をかき混ぜ、`ret 4` で戻る（本物と同じく名前を片付ける）。ebx・esi には触らない。
-    // 書くのは検査の静的変数と自分の枠だけ。
+    // SAFETY（`#[unsafe(naked)]`）: 花映塚の保存関数の真似。
+    // 先頭の12バイトは署名と同じ（`.byte`で書くのは、アセンブラが`mov ebp,esp`を別のバイト列にしうるため）。
+    // 呼ばれた回数・this・path・名前・ゲームの見積もりのループが読む10ワードを検査の静的変数へコピーし、偽の乱数をかき混ぜ、`ret 4`で戻る（本物と同じく名前を後始末する）。
+    // ebx・esiには触らない。書くのは検査の静的変数と自分のフレームだけ。
     #[unsafe(naked)]
     extern "C" fn fake_save() {
         core::arch::naked_asm!(
@@ -920,8 +936,8 @@ mod tests {
         )
     }
 
-    // SAFETY（`#[unsafe(naked)]`）: 先頭の 12 バイトの最後の 1 バイトだけが違う偽物。呼ばれたら数える（署名が合わないのに
-    // 呼んだことが分かる）。本体は `fake_save` と同じ形。
+    // SAFETY（`#[unsafe(naked)]`）: 先頭の12バイトの最後の1バイトだけが違う偽物。
+    // 呼ばれたら数える（署名が合わないのに呼んだことが分かる）。本体は`fake_save`と同じ形。
     #[unsafe(naked)]
     extern "C" fn wrong_save() {
         core::arch::naked_asm!(
@@ -943,9 +959,11 @@ mod tests {
     const HARNESS_BELOW: u32 = HARNESS_ARGS + 4 + 4 + 12 + 4 + SNAP_BELOW;
     const TABLE_WORDS: usize = 11 + STAGES;
 
-    // SAFETY（`#[unsafe(naked)]`）: cdecl（引数 1 つ = 21 語の表のアドレス）。呼ぶ側が保つレジスタを push / pop で戻す。踏み台を
-    // 呼ぶ前に、`E − 0x200` からの 10 語へ模様（本物のゲームで「呼び手のスタックの残り」に当たる値）を書く。そこは踏み台の積みと
-    // 保存関数の枠より下で、呼ぶ前に上書きされない。引数を積んで `save_call` を呼び、片付けて戻り値をそのまま返す。
+    // SAFETY（`#[unsafe(naked)]`）: cdecl（引数1つ = 21ワードの表のアドレス）。呼ぶ側が保つレジスタをpush / popで戻す。
+    // トランポリンを呼ぶ前に、`E − 0x200`からの10ワードへパターンを書く。
+    // パターンは本物のゲームで「呼び出し元のスタックの残り」に当たる値。
+    // そこはトランポリンの積みと保存関数のフレームより下で、呼ぶ前に上書きされない。
+    // 引数を積んで`save_call`を呼び、後始末して戻り値をそのまま返す。
     #[unsafe(naked)]
     unsafe extern "C" fn harness(_table: u32) -> u32 {
         core::arch::naked_asm!(
@@ -995,7 +1013,7 @@ mod tests {
         est: u32,
     }
 
-    /// `pattern` は呼び手のスタックの残り（書く前の値）、`real` はヘッダの本当の印。
+    /// `pattern`は呼び出し元のスタックの残り（書く前の値）、`real`はヘッダの本当のフラグ。
     fn run_harness(
         func: u32,
         pattern: [u32; STAGES],
@@ -1023,8 +1041,8 @@ mod tests {
         t[9] = need;
         t[10] = &mut est as *mut u32 as usize as u32;
         t[11..].copy_from_slice(&pattern);
-        // SAFETY: 表の 21 語は上で埋めた。関数は `fake_save` か `wrong_save`（先頭の 12 バイトの後で釣り合わせて `ret 4`）。
-        // 名前・パス・模様・印・塊のバッファはこの関数のスタックで、呼び出しの間生きている。
+        // SAFETY: 表の21ワードは上で埋めた。関数は`fake_save`か`wrong_save`（先頭の12バイトの後で釣り合わせて`ret 4`）。
+        // 名前・パス・パターン・フラグ・チャンクのバッファはこの関数のスタックにあり、呼び出しの間生きている。
         let ret = unsafe { harness(t.as_ptr() as usize as u32) };
         Run {
             ret,
@@ -1038,7 +1056,7 @@ mod tests {
         core::array::from_fn(|i| SEEN_FLAGS[i].load(Ordering::SeqCst))
     }
 
-    /// 本当の印の標本: 語ごとに違う値で、0 の面を混ぜる（0 の面を数えたら見積もりが変わる）。
+    /// 本当のフラグのサンプル: ワードごとに違う値にして0の面を混ぜる（0の面を数えたら見積もりが変わる）。
     fn real_sample() -> [u32; STAGES] {
         let mut r: [u32; STAGES] = core::array::from_fn(|i| 0x0BB4_7000 + i as u32 * 0x44);
         r[1] = 0;
@@ -1067,13 +1085,13 @@ mod tests {
         let mut want = [1; STAGES];
         want[3] = 3;
         assert_eq!(count_chunks(&mut m, RM), Some(want));
-        // 連鎖の途中が読めない。
+        // 連鎖の途中が読み取れない。
         m.0.insert(next_of(0xA000), 0xB000);
         assert_eq!(count_chunks(&mut m, RM), None);
         // 終わらない連鎖。
         m.0.insert(next_of(0xA000), 0xA000);
         assert_eq!(count_chunks(&mut m, RM), None);
-        // 先頭の塊が読めない。
+        // 先頭のチャンクが読み取れない。
         m.0.remove(&next_of(head(9)));
         m.0.insert(next_of(0xA000), 0);
         assert_eq!(count_chunks(&mut m, RM), None);
@@ -1166,17 +1184,17 @@ mod tests {
     #[repr(C, align(16))]
     struct Words<const N: usize>([AtomicU32; N]);
     static SUP: Words<{ 0x600 / 4 }> = Words([const { AtomicU32::new(0) }; 0x600 / 4]);
-    /// menu, loading, game_mode, manager_ptr, p1 wins, p2 wins, required, completed_rounds, round_frames, 1P / 2P の Player のポインタ、1P / 2P の stats のポインタ
+    /// menu, loading, game_mode, manager_ptr, p1 wins, p2 wins, required, completed_rounds, round_frames, 1P / 2PのPlayerのポインタ、1P / 2Pのstatsのポインタ
     static GLOBALS: Words<14> = Words([const { AtomicU32::new(0) }; 14]);
-    /// 偽の設定のコピー（`+0xB5` まで）。`GLOBALS` の 13 番目が、これを指すポインタの欄。
+    /// 偽の設定のコピー（`+0xB5`まで）。`GLOBALS`の13番目がこれを指すポインタのフィールド。
     static OPT_COPY: Words<{ 0xC0 / 4 }> = Words([const { AtomicU32::new(0) }; 0xC0 / 4]);
     static MENU_BYTE: AtomicU8 = AtomicU8::new(0);
-    /// 偽の ReplayManager（+0x114 まで）と偽のヘッダ（+0x48 まで）と、面 9 の次の塊（2 つ。長いマッチの検査では 3 つ）。
+    /// 偽のReplayManager（+0x114まで）と偽のヘッダ（+0x48まで）と面9の次のチャンク（2つ。長いマッチの検査では3つ）。
     static RM: Words<{ 0x120 / 4 }> = Words([const { AtomicU32::new(0) }; 0x120 / 4]);
     static HDR: Words<{ 0x1F0 / 4 }> = Words([const { AtomicU32::new(0) }; 0x1F0 / 4]);
     static NODES: Words<{ 0x80 / 4 }> = Words([const { AtomicU32::new(0) }; 0x80 / 4]);
     static BASE_SITE: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
-    /// 偽の Player（`+0xB8` まで）と、スコアを持つ塊（`+0x04` まで）。
+    /// 偽のPlayer（`+0xB8`まで）とスコアを持つブロック（`+0x04`まで）。
     static PLAYER_1: Words<{ 0x100 / 4 }> = Words([const { AtomicU32::new(0) }; 0x100 / 4]);
     static PLAYER_2: Words<{ 0x100 / 4 }> = Words([const { AtomicU32::new(0) }; 0x100 / 4]);
     static STATS_1: Words<4> = Words([const { AtomicU32::new(0) }; 4]);
@@ -1205,7 +1223,7 @@ mod tests {
         }
     }
 
-    /// 偽の設定のコピーのチャージ型（1P・2P）と、偽の見出しの `+0x190` / `+0x191`（下位 2 バイト）。
+    /// 偽の設定のコピーのチャージ型（1P・2P）と、偽のヘッダの`+0x190` / `+0x191`（下位2バイト）。
     fn set_copy_charge(p1: u8, p2: u8) {
         let w = u32::from(p1) | u32::from(p2) << 8;
         OPT_COPY.0[(OPT_CHARGE / 4) as usize].store(w << ((OPT_CHARGE % 4) * 8), Ordering::SeqCst);
@@ -1249,7 +1267,7 @@ mod tests {
         for w in OPT_COPY.0.iter() {
             w.store(0, Ordering::SeqCst);
         }
-        // 見出しは手元の cfg の値（0 / 0）、生きた試合の値は 1 / 0。
+        // ヘッダの値は手元のcfgの値（0 / 0）。生きた試合の値は1 / 0。
         set_copy_charge(1, 0);
         SEEN_CHARGE.store(u32::MAX, Ordering::SeqCst);
         PROBE_HEADER.store(1, Ordering::SeqCst);
@@ -1322,7 +1340,7 @@ mod tests {
         assert_eq!(SEEN_PATH.load(Ordering::SeqCst), h.path_addr());
         assert_eq!(r.wins, [0, 2, 2]);
         assert!(r.duration_us < 10_000_000);
-        // 見出しは保存関数が呼ばれた時点で、設定のコピーの値（1P = 1 / 2P = 0）になっている。
+        // ヘッダは保存関数が呼ばれた時点で設定のコピーの値（1P = 1 / 2P = 0）になっている。
         assert_eq!(r.charge, ChargeSync::Written { p1: 1, p2: 0 });
         assert_eq!(
             SEEN_CHARGE.load(Ordering::SeqCst),
@@ -1340,14 +1358,14 @@ mod tests {
         let mut io = RealSaveIo {
             a: fake_addrs(addr_of_fn(fake_save)),
         };
-        // 2P だけチャージ型。
+        // 2Pだけチャージ型。
         set_copy_charge(0, 1);
         assert_eq!(
             io.sync_header_charge(rm),
             ChargeSync::Written { p1: 0, p2: 1 }
         );
         assert_eq!(header_charge(), [0, 1]);
-        // 1P だけ。隣の欄（+0x18F / +0x192）には触らない。
+        // 1Pだけ。隣のフィールド（+0x18F / +0x192）には触らない。
         HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].store(0xAABB_CCDD, Ordering::SeqCst);
         HDR.0[(REPLAY_HEADER_CHARGE / 4 + 1) as usize].store(0x1122_3344, Ordering::SeqCst);
         set_copy_charge(1, 0);
@@ -1364,15 +1382,15 @@ mod tests {
             HDR.0[(REPLAY_HEADER_CHARGE / 4 + 1) as usize].load(Ordering::SeqCst),
             0x1122_3344
         );
-        // 悪いポインタでは書かない（落ちない）。
+        // 不正なポインタでは書かない（例外を出さない）。
         HDR.0[(REPLAY_HEADER_CHARGE / 4) as usize].store(0, Ordering::SeqCst);
         let good = a32(&OPT_COPY, 0);
         for (cell, cell_value, rm_arg, want) in [
-            // コピーのポインタの欄が読めない・値が 0・値が読めない場所を指す
+            // コピーのポインタのフィールドが読み取れない・値が0・値が読み取れない場所を指す
             (0x10, good, rm, ChargeSync::NoCopy),
             (a32(&GLOBALS, 13), 0, rm, ChargeSync::NoCopy),
             (a32(&GLOBALS, 13), 0x10, rm, ChargeSync::CopyUnreadable),
-            // ReplayManager が 0 か読めない場所
+            // ReplayManagerが0か読み取れない場所
             (a32(&GLOBALS, 13), good, 0, ChargeSync::NoHeader),
             (a32(&GLOBALS, 13), good, 0x10, ChargeSync::NoHeader),
         ] {
@@ -1390,11 +1408,11 @@ mod tests {
             );
             assert_eq!(header_charge(), [0, 0], "書いてはいけない");
         }
-        // 見出しのポインタが 0 の ReplayManager。
+        // ヘッダのポインタが0のReplayManager。
         GLOBALS.0[13].store(a32(&OPT_COPY, 0), Ordering::SeqCst);
         RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0, Ordering::SeqCst);
         assert_eq!(io.sync_header_charge(rm), ChargeSync::NoHeader);
-        // 見出しが読めない場所を指す。
+        // ヘッダが読み取れない場所を指す。
         RM.0[(REPLAY_HEADER_PTR / 4) as usize].store(0x10, Ordering::SeqCst);
         assert_eq!(io.sync_header_charge(rm), ChargeSync::WriteFailed);
     }
@@ -1428,7 +1446,7 @@ mod tests {
                 name: *b"12:34:56\0",
             })
         );
-        // 隣の欄（日付の直前の語・名前の直後の難易度）は読まない。
+        // 隣のフィールド（日付の直前のワード・名前の直後の難易度）は読まない。
         put(HEADER_DATE_OFFSET - 1, b"Z");
         put(HEADER_NAME_OFFSET + HEADER_FIELD_LEN, b"Q");
         let got = io.replay_ident(rm).unwrap();
@@ -1698,7 +1716,7 @@ mod tests {
         assert_eq!(b.frames, 3599);
         assert_eq!(b.wins, [1, 1]);
         assert_eq!(b.side, [side(4, 5, 6, 7, 1234), side(9, 10, 11, 12, 5678)]);
-        // 2P の Player が片付け済み（ポインタ 0）、1P のスコアの塊のポインタが読めないアドレス: その席だけ読めない。落ちない。
+        // 2PのPlayerが後始末済み（ポインタ0）で、1Pのスコアのブロックのポインタが読み取れないアドレスのとき: それぞれのサイドだけが読み取れない。例外は出ない。
         GLOBALS.0[10].store(0, Ordering::SeqCst);
         GLOBALS.0[11].store(0x10, Ordering::SeqCst);
         let b = io.read_boundary();
@@ -1706,7 +1724,7 @@ mod tests {
         assert_eq!((b.frames, b.wins), (3599, [1, 1]));
         GLOBALS.0[11].store(a32(&STATS_1, 0), Ordering::SeqCst);
         assert_eq!(io.read_boundary().side[0], side(4, 5, 6, 7, 1234));
-        // 悪い時計や UTC でない値でなく、いまの時刻（2023 年以後）が返る。
+        // 不正な時計やUTCでない値ではなく、今の時刻（2023年以後）が返る。
         assert!(io.unix_secs() > 1_700_000_000);
     }
 
@@ -1716,7 +1734,7 @@ mod tests {
             PLAYER_BOSS_ATTACKS, PLAYER_BOSS_REVERSALS, PLAYER_SPELL_ATTACKS, STATS_SCORE,
         };
         let a = SaveAddrs::th09();
-        // 値は逆アセンブルの命令の直値（`0x00415D81 incl 0x4a7e90`、`0x0041B069 mov $0x4a7dac,%esi` など）。名前では引けないので値で書く。
+        // 値は逆アセンブルの命令の即値（`0x00415D81 incl 0x4a7e90`、`0x0041B069 mov $0x4a7dac,%esi`など）。名前では参照できないので値で書く。
         assert_eq!(a.completed_rounds, 0x004A_7E90);
         assert_eq!(a.round_frames, 0x004A_7E40);
         assert_eq!(a.players, [0x004A_7D94, 0x004A_7DCC]);
@@ -1732,7 +1750,7 @@ mod tests {
             ),
             (0xB0, 0xB4, 0xB8, 0x04)
         );
-        // 起動のとき読めると検証する範囲に、新しい欄が全部入っている（入っていないと直読みが外れる）。
+        // 起動時に読めることを検証する範囲に新しいフィールドが全部入っている（入っていないと検証していない場所を直接読むことになる）。
         let ranges = a.direct_ranges();
         for addr in [
             a.completed_rounds,
@@ -1745,16 +1763,16 @@ mod tests {
         ] {
             assert!(ranges.contains(&(addr, 4)), "0x{addr:08X}");
         }
-        // 設定のコピーのポインタの欄と、チャージ型の位置は、ゲーム側の名前と同じ値（`net_game::write_charge` が生きた試合で書く先）。
+        // 設定のコピーのポインタのフィールドとチャージ型の位置は、ゲーム側の名前と同じ値（`net_game::write_charge`が生きた試合で書く先）。
         assert_eq!(a.options_copy, 0x004A_7E78);
         assert_eq!(OPT_CHARGE, 0xB4);
-        // 見出しの位置は、リプレイを書き換える側（core）の位置 `+0x190` と同じ。
+        // ヘッダの位置は、リプレイを書き換える側（core）の位置`+0x190`と同じ。
         assert_eq!(
             REPLAY_HEADER_CHARGE as usize,
             higanr_core::replay_rewrite::CHARGE_OFFSET
         );
         assert_eq!(REPLAY_HEADER_CHARGE, 0x190);
-        // 語へのコピーと戻しで欄が入れ替わらない（全部違う値で見る）。
+        // ワードへのコピーと戻しでフィールドが入れ替わらない（全部違う値で検証する）。
         let distinct = SaveAddrs {
             supervisor: 1,
             menu_flag: 2,
@@ -1779,8 +1797,8 @@ mod tests {
 
     #[test]
     fn the_confirmed_tick_hook_does_nothing_when_the_saver_is_off() {
-        // 入れていない実行（`ARMED` = 0）で呼んでも、ゲームのメモリに触らず、パニックもしない（他の検査が `ARMED` を立てている間に当たっても、
-        // マッチが始まっていない記録は読まずに戻る）。
+        // 有効にしていない実行（`ARMED` = 0）で呼んでもゲームのメモリに触らず、パニックもしない。
+        // 他の検査が`ARMED`を立てている間に当たっても、マッチが始まっていない記録は読まずに戻る。
         on_confirmed_tick();
     }
 

@@ -1,12 +1,14 @@
-//! 観戦のリングバッファ: ゲームのスレッド（書き手 1 本）が、使うと決めた語・止める地点の SELECT の結果・選択の画面で入った押下
-//! （`wire::Record`）を書き、受信スレッド（読み手 1 本。`spectate_host.rs`）が取り出して `SpectateHost::push` する。
+//! 観戦のリングバッファ: ゲームのスレッド（書き手1本）が、使うことが確定した入力のワード・止める地点のSELECTの結果・選択の画面で入った押下（`wire::Record`）を書く。
+//! 受信スレッド（読み手1本。`spectate_host.rs`）がそれを取り出して`SpectateHost::push`する。
 //!
-//! - 書き手は確保・ロック待ち・ブロッキング I/O・パニックしうる添字を持たない（枠は固定長の原子変数の配列。枠を `Relaxed` で書いてから書いた数を `Release` で進め、読み手は書いた数を `Acquire` で読んでから枠を読む）。
-//! - 溢れても対戦は止めない。書けなかった記録は捨てて数え、次の `Seg` まで捨て続ける（途中が欠けた列を観戦者へ流さない）。次に書けた `Seg` には `after_gap` の印が付き、読み手は `Record::End(Cancelled)` を挟んで「ここで切れた」を観戦者に知らせる。
-//! - 1 枠 9 語（36 B）。`Record::Name` が最長で、ほかの記録は先頭の 5 語（`BASE_WORDS`）だけを書く。語の割り付けはリングバッファの中だけの形で、ワイヤの形とは無関係。
+//! - 書き手は確保・ロック待ち・ブロッキングI/O・パニックしうる添字を持たない。
+//!   枠は固定長のアトミック変数の配列。枠を`Relaxed`で書いてから書いた数を`Release`で進め、読み手は書いた数を`Acquire`で読んでから枠を読む。
+//! - 溢れても対戦は止めない。書けなかった記録は捨ててカウントし、次の`Seg`まで捨て続ける（途中が欠けた列を観戦者へ渡さない）。
+//!   次に書けた`Seg`には`after_gap`のフラグが付く。読み手は`Record::End(Cancelled)`を挟んで「ここで切れた」を観戦者に知らせる。
+//! - 1枠9ワード（36 B）。`Record::Name`が最長。ほかの記録は先頭の5ワード（`BASE_WORDS`）だけを書く。ワードの割り付けはリングバッファの中だけの形で、ワイヤの形とは無関係。
 //!
-//! `RING_LEN` = 4096 記録は、受信スレッドが 1 秒止まっても溢れない見積もり: 書くのは 1 tick に 1〜2 記録（60 tick/秒で 1 秒に最大 120 記録ほど）。
-//! 受信スレッドは PING・INPUT のたび（約 4 ms〜16 ms）と、観戦者がいる間は 1 ms の待ちの上限ごとにリングバッファを空にする（見積もりで、測っていない）。
+//! `RING_LEN` = 4096記録は、受信スレッドが1秒止まっても溢れない見積もり: 書くのは1 tickに1〜2記録（60 tick/秒で1秒に最大120記録ほど）。
+//! 受信スレッドはPING・INPUTのたび（約4 ms〜16 ms）と、観戦者がいる間は1 msの待ちの上限ごとにリングバッファを空にする（見積もりで、測っていない）。
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use higanr_core::wire::{ByeReason, CheckKind, Record, Seat, Select, Step, StepKind, WatchCheck};
 
 pub const RING_LEN: usize = 4096;
-/// 1 枠の語の数（名前の記録が使う 1 + 8 語）。
+/// 1枠のワード数（名前の記録が使う 1 + 8ワード）。
 pub(crate) const WORDS: usize = 9;
-/// 名前の記録以外が使う語の数（`Record::Select` の 5 語）。書き手はこの数だけ書く。
+/// 名前の記録以外が使うワード数（`Record::Select`の5ワード）。書き手はこの数だけ書く。
 const BASE_WORDS: usize = 5;
-/// 語 0 の bit 8: 溢れの後の最初の記録（`Seg`）。
+/// ワード0のbit 8: 溢れの後の最初の記録（`Seg`）。
 const FLAG_AFTER_GAP: u32 = 1 << 8;
 
 const K_SEG: u32 = 1;
@@ -29,10 +31,10 @@ const K_FRAME: u32 = 5;
 const K_END: u32 = 6;
 const K_NAME: u32 = 7;
 const K_STATS: u32 = 8;
-/// 照合の記録。作り方は語 0 の bit 12〜15（bit 8・9 は溢れの印と受け渡しの飛びの印が使う）。
+/// 照合の記録。値の作り方はワード0のbit 12〜15（bit 8・9は溢れのフラグと受け渡しの飛びのフラグが使う）。
 const K_CHECK: u32 = 9;
 
-/// 記録を語に詰める（`unpack` の逆）。戻りの 2 つ目は書く語の数。
+/// 記録をワードに詰める（`unpack`の逆）。戻り値の2つ目は書くワードの数。
 pub(crate) fn pack(rec: &Record) -> ([u32; WORDS], usize) {
     let mut w = [0u32; WORDS];
     match rec {
@@ -106,8 +108,8 @@ fn seat_of(v: u32) -> Option<Seat> {
     }
 }
 
-/// リングバッファの語から STEP の種類を戻す。形式の切替（`StepKind::Format`）は観戦の流れに積まない（`NetPlay::menu_tick`・`wire::decode`）ので、
-/// リングバッファの中にあっても読まない（`None` = 読み手が数える異常）。
+/// リングバッファのワードからSTEPの種類を復元する。形式の切替（`StepKind::Format`）は観戦のストリームに積まない（`NetPlay::menu_tick`・`wire::decode`）。
+/// そのためリングバッファの中にあっても読まない（`None` = 読み手がカウントする異常）。
 fn kind_of(v: u32) -> Option<StepKind> {
     u8::try_from(v)
         .ok()
@@ -123,7 +125,7 @@ fn half(v: u32, shift: u32) -> u16 {
     (v >> shift) as u16
 }
 
-/// 語から記録を戻す。リングバッファの中の値は `pack` しか作らないので `None` は起きないはず（読み手が数える）。
+/// ワードから記録を復元する。リングバッファの中の値は`pack`しか作らないので`None`は起きないはず（読み手がカウントする）。
 pub(crate) fn unpack(w: &[u32; WORDS]) -> Option<Record> {
     let kind = w[0] & 0xFF;
     Some(match kind {
@@ -198,21 +200,21 @@ pub(crate) fn unpack(w: &[u32; WORDS]) -> Option<Record> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Popped {
     pub rec: Record,
-    /// 直前に溢れて記録を捨てた（この記録は溢れの後の最初の `Seg`）。
+    /// 直前に溢れて記録を捨てた（この記録は溢れの後の最初の`Seg`）。
     pub after_gap: bool,
 }
 
-/// 数え（ログ用）。
+/// カウント（ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RingCounts {
     pub pushed: u32,
     /// リングバッファが埋まっていて捨てた記録。
     pub dropped_full: u32,
-    /// 溢れの後、次の `Seg` まで捨てた記録。
+    /// 溢れの後に次の`Seg`まで捨てた記録。
     pub dropped_gap: u32,
     /// 溢れた回数（欠けの数）。
     pub gaps: u32,
-    /// 読み手が戻せなかった枠（起きないはず）。
+    /// 読み手が復元できなかった枠（起きないはず）。
     pub bad: u32,
 }
 
@@ -220,7 +222,7 @@ pub struct SpectateRing {
     cells: Box<[[AtomicU32; WORDS]]>,
     written: AtomicU32,
     read: AtomicU32,
-    /// 溢れて、次の `Seg` まで捨てている（書き手だけが書く）。
+    /// 溢れて次の`Seg`まで捨てている（書き手だけが書く）。
     gap: AtomicBool,
     pushed: AtomicU32,
     dropped_full: AtomicU32,
@@ -230,12 +232,12 @@ pub struct SpectateRing {
 }
 
 impl SpectateRing {
-    /// 確保は起動のときのこの 1 回だけ。
+    /// 確保は起動時のこの1回だけ。
     pub fn new() -> Self {
         Self::with_len(RING_LEN)
     }
 
-    /// 枠の数を指定して作る（検査の小さいリングバッファ。0 は 1 に上げる）。
+    /// 枠の数を指定して作る（検査の小さいリングバッファ。0は1に上げる）。
     pub fn with_len(len: usize) -> Self {
         Self {
             cells: (0..len.max(1))
@@ -252,7 +254,7 @@ impl SpectateRing {
         }
     }
 
-    /// 書き手（ゲームのスレッド）: 記録を 1 つ書く。書けたら true。確保しない・待たない。溢れたら記録を捨てて `gap` を立て、次の `Seg` まで捨てる。
+    /// 書き手（ゲームのスレッド）: 記録を1つ書く。書けたらtrue。確保しない・待たない。溢れたら記録を捨てて`gap`を立て、次の`Seg`まで捨てる。
     pub fn push(&self, rec: Record) -> bool {
         let is_seg = matches!(rec, Record::Seg { .. });
         let gap = self.gap.load(Ordering::Relaxed);
@@ -286,7 +288,7 @@ impl SpectateRing {
         true
     }
 
-    /// 読み手（受信スレッド）: 1 つ取り出す。無ければ None。読み手は 1 本だけ。
+    /// 読み手（受信スレッド）: 1つ取り出す。無ければNone。読み手は1本だけ。
     pub fn pop(&self) -> Option<Popped> {
         loop {
             let r = self.read.load(Ordering::Relaxed);
@@ -313,7 +315,7 @@ impl SpectateRing {
         }
     }
 
-    /// 数え。
+    /// カウント。
     pub fn counts(&self) -> RingCounts {
         let l = |a: &AtomicU32| a.load(Ordering::Relaxed);
         RingCounts {
@@ -332,7 +334,7 @@ impl Default for SpectateRing {
     }
 }
 
-/// 数えを 1 進める。同じ数を進めるのは 1 本のスレッドだけなので、読んでから書く形で足りる（`fetch_add` の排他命令を使わない）。
+/// カウンタを1進める。同じカウンタを進めるのは1本のスレッドだけなので、読んでから書く形で足りる（`fetch_add`の排他命令を使わない）。
 fn bump(a: &AtomicU32) {
     a.store(a.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
@@ -485,7 +487,7 @@ mod tests {
             assert!(ring.push(frame));
             assert_eq!(ring.pop().map(|p| p.rec), Some(frame));
         }
-        // 短い名前の枠に、長い名前の残りが混ざらない。
+        // 短い名前の枠に長い名前の残りが混ざらない。
         let short = Record::name(Seat::P1, b"a");
         assert!(ring.push(short));
         assert_eq!(ring.pop().map(|p| p.rec), Some(short));
@@ -504,7 +506,7 @@ mod tests {
         for n in 0..4 {
             assert!(ring.push(f(n)));
         }
-        // 満杯。捨てて、次の Seg まで捨て続ける（読み手が空けても、Seg でない記録は入れない）。
+        // 満杯。捨てて次のSegまで捨て続ける（読み手が空けてもSegでない記録は入れない）。
         assert!(!ring.push(f(4)));
         assert_eq!(ring.pop().map(|p| p.rec), Some(Record::Seg { seg: 0 }));
         assert!(!ring.push(f(5)), "溢れの後の Seg でない記録を入れた");

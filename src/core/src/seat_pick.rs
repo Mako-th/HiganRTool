@@ -1,15 +1,20 @@
-//! 席（1P / 2P）の希望から、ホストの席（AGREE の host_seat）を決める決まり（pure。確保しない）。
+//! サイド（1P / 2P）の希望からホストのサイド（AGREEのhost_seat）を決める決まり（pure。確保しない）。
 //!
-//! - 各自が「妖怪 対 妖怪」の画面（ゲーム内のメニュー）で、あらかじめ希望（1P / 2P / おまかせ）を選んでおく。
-//! - 片方がおまかせなら相手の希望を優先する。希望がぶつかったとき・両方おまかせのときは、ランダムに決める（先着では決めない）。
-//! - 乱数の答えは「先にいた人の席」に使う。先にいた人は、ルームでは先に入った人（始める側 `CodeSide::Offer`。ランダムマッチは待ち列に先に入った人）、クリップボードでは「接続コードを作る」を選んだ人。各自が HELLO の `arrival` で名乗る（`wire::Arrival`）。
-//! - 名乗らない経路（ini の `peer`・ローダーのウィンドウ・peer_sim）は、ホストの希望（ini の `host_seat`）が必ず通る（`Config::host_seat`。台本の回が席を決め打ちにするため）。
-//! - 両方おまかせ（`coin`）は、両者の role_nonce（HELLO で交換した u64 の乱数）の排他的論理和の立っているビット数の偶奇で決める。接続する前に両方の nonce を持っているので追加の通信は要らず（遅延の増分 0）、ゲストは AGREE の host_seat を同じ式で検証できる（`handshake.rs` の `Counters::agree_bad_seat`）。
+//! - 各自が「妖怪 対 妖怪」の画面（ゲーム内のメニュー）であらかじめ希望（1P / 2P / おまかせ）を選んでおく。
+//! - 片方がおまかせなら相手の希望を優先する。希望がぶつかったとき・両方おまかせのときはランダムに決める（先着では決めない）。
+//! - 乱数の答えは「先にいた人のサイド」に使う。
+//!   先にいた人とは、ルームでは先に入った人（始める側`CodeSide::Offer`。ランダムマッチは待ち列に先に入った人）のこと。
+//!   クリップボードでは「接続コードを作る」を選んだ人のこと。
+//!   各自がHELLOの`arrival`で名乗る（`wire::Arrival`）。
+//! - 名乗らない経路（iniの`peer`・ローダーのウィンドウ・peer_sim）はホストの希望（iniの`host_seat`）が必ず通る（`Config::host_seat`。台本を使う実行でサイドを決め打ちにするため）。
+//! - 両方おまかせ（`coin`）は両者のrole_nonce（HELLOで交換したu64の乱数）の排他的論理和の立っているビット数の偶奇で決める。
+//!   接続する前に両方のnonceを持っているので追加の通信は要らない（遅延の増分0）。
+//!   ゲストはAGREEのhost_seatを同じ式で検証できる（`handshake.rs`の`Counters::agree_bad_seat`）。
 #![forbid(unsafe_code)]
 
 use crate::wire::{Arrival, Seat, SeatWish};
 
-/// 片方の希望と、ルームに先にいたかの名乗り（HELLO の +44・+45）。
+/// 片方の希望とルームに先にいたかの名乗り（HELLOの +44・+45）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeatAsk {
     pub wish: SeatWish,
@@ -17,7 +22,7 @@ pub struct SeatAsk {
 }
 
 impl SeatAsk {
-    /// 名乗らない経路の形: ini の `host_seat` を希望にし、先かどうかは名乗らない。
+    /// 名乗らない経路の形: iniの`host_seat`を希望にし、先かどうかは名乗らない。
     pub const fn plain(host_seat: Seat) -> SeatAsk {
         SeatAsk {
             wish: match host_seat {
@@ -36,7 +41,7 @@ pub const fn other(s: Seat) -> Seat {
     }
 }
 
-/// 両方おまかせのときに、先にいた人が座る席。引数の順に依らない（排他的論理和）。
+/// 両方おまかせのときに先にいた人が座るサイド。引数の順に依らない（排他的論理和）。
 pub const fn coin(nonce_a: u64, nonce_b: u64) -> Seat {
     if (nonce_a ^ nonce_b).count_ones().is_multiple_of(2) {
         Seat::P1
@@ -45,11 +50,11 @@ pub const fn coin(nonce_a: u64, nonce_b: u64) -> Seat {
     }
 }
 
-/// 先にいた人の席。`first` が先にいた人の希望、`second` が後から来た人の希望。`coin` は乱数で決めるときの答え。
+/// 先にいた人のサイド。`first`は先にいた人の希望。`second`は後から来た人の希望。`coin`は乱数で決めるときの答え。
 ///
-/// - 希望がぶつかったら `coin`。
-/// - 先にいた人が 1P / 2P を望めば、それが通る。
-/// - 先にいた人がおまかせなら、後から来た人の希望の逆。後から来た人もおまかせなら `coin`。
+/// - 希望がぶつかったら`coin`。
+/// - 先にいた人が1P / 2Pを望めば、それが通る。
+/// - 先にいた人がおまかせなら後から来た人の希望の逆。後から来た人もおまかせなら`coin`。
 pub const fn first_seat(first: SeatWish, second: SeatWish, coin: Seat) -> Seat {
     match (first, second) {
         (SeatWish::P1, SeatWish::P1) | (SeatWish::P2, SeatWish::P2) => coin,
@@ -61,12 +66,12 @@ pub const fn first_seat(first: SeatWish, second: SeatWish, coin: Seat) -> Seat {
     }
 }
 
-/// ホストが先にいた人か。名乗りが揃ってゲストが先のときだけ偽。名乗らない・食い違うときは真（ホストを先と見る）。
+/// ホストが先にいた人かどうか。名乗りが揃ってゲストが先のときだけ偽。名乗らない・食い違うときは真（ホストを先と見る）。
 pub const fn host_is_first(host: Arrival, guest: Arrival) -> bool {
     !matches!((host, guest), (Arrival::Second, Arrival::First))
 }
 
-/// ホストの席。ホストが AGREE を作るときもゲストが検証するときもこれを使う。`host_nonce` / `guest_nonce` は両者の role_nonce。
+/// ホストのサイド。ホストがAGREEを作るときもゲストが検証するときもこれを使う。`host_nonce` / `guest_nonce`は両者のrole_nonce。
 pub const fn host_seat(host: SeatAsk, guest: SeatAsk, host_nonce: u64, guest_nonce: u64) -> Seat {
     let both_any = coin(host_nonce, guest_nonce);
     if matches!(
@@ -92,7 +97,7 @@ mod tests {
 
     const WISHES: [SeatWish; 3] = [SeatWish::P1, SeatWish::P2, SeatWish::Any];
 
-    /// 仕様をそのまま書いた表（先にいた人の希望, 後から来た人の希望 → 先にいた人の席。おまかせ同士は None = 乱数）。
+    /// 仕様をそのまま書いた表（先にいた人の希望, 後から来た人の希望 → 先にいた人のサイド。おまかせ同士は None = 乱数）。
     const TABLE: [(SeatWish, SeatWish, Option<Seat>); 9] = [
         // ぶつかる → 乱数（先着では決めない）。
         (SeatWish::P1, SeatWish::P1, None),
@@ -174,7 +179,7 @@ mod tests {
 
     #[test]
     fn host_seat_matches_the_table_whoever_came_first() {
-        let (hn, gn) = (0xFFFF_0000_0000_0001, 0x1); // 排他的論理和のビットは 16 本（偶数）→ 乱数の答えは 1P。
+        let (hn, gn) = (0xFFFF_0000_0000_0001, 0x1); // 排他的論理和のビットは16本（偶数）→ 乱数の答えは1P。
         assert_eq!(coin(hn, gn), Seat::P1);
         for (first, second, want) in TABLE {
             let want_first = want.unwrap_or(Seat::P1);
@@ -212,7 +217,7 @@ mod tests {
         let (even, odd) = ((3, 0), (1, 0)); // 乱数の答え: 偶数 → 1P、奇数 → 2P
         for w in [SeatWish::P1, SeatWish::P2] {
             let ask = |arrival| SeatAsk { wish: w, arrival };
-            // ホストが先でもゲストが先でも、同じ 1P を望んだ 2 人の席は乱数で入れ替わる（先着の希望が必ず通るのではない）。
+            // ホストが先でもゲストが先でも同じ1Pを望んだ2人のサイドは乱数で入れ替わる（先着の希望が必ず通るのではない）。
             let host_first = [
                 host_seat(ask(Arrival::First), ask(Arrival::Second), even.0, even.1),
                 host_seat(ask(Arrival::First), ask(Arrival::Second), odd.0, odd.1),
@@ -267,7 +272,7 @@ mod tests {
             wish: SeatWish::Any,
             arrival,
         };
-        let (even, odd) = ((3, 0), (1, 0)); // 3 = 0b11（2 本・偶数）、1 = 0b1（1 本・奇数）
+        let (even, odd) = ((3, 0), (1, 0)); // 3 = 0b11（2本・偶数）、1 = 0b1（1本・奇数）
         assert_eq!(coin(even.0, even.1), Seat::P1);
         assert_eq!(coin(odd.0, odd.1), Seat::P2);
         assert_eq!(

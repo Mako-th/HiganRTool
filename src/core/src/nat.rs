@@ -1,9 +1,10 @@
-//! 回線の型の印（接続コードに 1 B で載せる）と、接続できなかったときの文の選び分け（pure）。
+//! ネットワーク種別のフラグ（接続コードに1 Bで載せる）と接続できなかったときの文の選び分け（pure）。
 //!
-//! 印は 2 つ: 宛先ごとに外側のポートが変わる型（シンメトリック NAT）か（2 か所目の STUN の比べ）と、UPnP で待ち受けの
-//! ポートを割り当てられたか。相手の印は相手のコードから読み、自分の印は開くときに決めて自分のコードに載せる。
+//! フラグは2つ。宛先ごとに外側のポートが変わる型（シンメトリックNAT）かどうか（2か所目のSTUNとの比較）と、UPnPで待ち受けのポートを割り当てられたかどうか。
+//! 相手のフラグは相手のコードから読む。
+//! 自分のフラグは開くときに決めて自分のコードに載せる。
 
-/// 宛先ごとに外側のポートが変わる型か。比べられなかった（STUN が無答など）ときは `Unknown`。
+/// 宛先ごとに外側のポートが変わる型かどうか。比較できなかった（STUNの応答が無いなど）ときは`Unknown`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Symmetry {
     #[default]
@@ -13,7 +14,7 @@ pub enum Symmetry {
 }
 
 impl Symmetry {
-    /// 2 か所目の STUN の比べ（`stun::Mapping::depends_on_destination`。比べられていなければ `None`）から。
+    /// 2か所目のSTUNとの比較（`stun::Mapping::depends_on_destination`。比較できていなければ`None`）から。
     pub fn from_depends(v: Option<bool>) -> Symmetry {
         match v {
             None => Symmetry::Unknown,
@@ -40,12 +41,12 @@ impl Symmetry {
     }
 }
 
-/// 接続コードに載せる回線の型の印。コード中の 1 B: 下位 2 bit = `Symmetry`（3 は未定義）、bit 2 = UPnP で割り当てられた。
-/// 残りの bit は 0 でなければ断る（同じ中身に 2 通りの文字を許さない）。
+/// 接続コードに載せるネットワーク種別のフラグ。コード中の1 B: 下位2 bit = `Symmetry`（3は未定義）、bit 2 = UPnP で割り当てられた。
+/// 残りのbitは0でなければ断る（同じ中身に2通りの文字を許さない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NatMark {
     pub symmetry: Symmetry,
-    /// UPnP で待ち受けのポートを割り当てられた（自分の候補に割り当てた外側のポートが載っている）。
+    /// UPnPで待ち受けのポートを割り当てられた（自分の候補に割り当てた外側のポートが載っている）。
     pub upnp: bool,
 }
 
@@ -53,7 +54,7 @@ const UPNP_BIT: u8 = 0b100;
 const SYMMETRY_MASK: u8 = 0b011;
 
 impl NatMark {
-    /// 型が分からず、UPnP も使っていない。
+    /// 型が分からずUPnPも使っていない。
     pub const UNKNOWN: NatMark = NatMark {
         symmetry: Symmetry::Unknown,
         upnp: false,
@@ -63,7 +64,7 @@ impl NatMark {
         self.symmetry.bits() | if self.upnp { UPNP_BIT } else { 0 }
     }
 
-    /// 定義の外の bit が立っていれば `None`。
+    /// 定義の外のbitが立っていれば`None`。
     pub fn from_byte(b: u8) -> Option<NatMark> {
         if b & !(SYMMETRY_MASK | UPNP_BIT) != 0 {
             return None;
@@ -87,13 +88,13 @@ impl NatMark {
         )
     }
 
-    /// 直接接続する経路が塞がっている型か。シンメトリックでも、UPnP でポートを開けていれば相手の HELLO はそのポートに届くので塞がっていない。
+    /// 直接接続する経路が塞がっている型かどうか。シンメトリックでもUPnPでポートを開けていれば相手のHELLOはそのポートに届くので塞がっていない。
     fn blocked(self) -> bool {
         self.reachable() == Some(false)
     }
 
-    /// 相手から届くか（ホストの決め方 `host_pick::decide` と `blocked` が使う）。UPnP でポートを開けていれば型に依らず届く。
-    /// 型が分からず UPnP も使っていなければ `None`。
+    /// 相手から届くかどうか（ホストの決め方`host_pick::decide`と`blocked`が使う）。UPnPでポートを開けていれば型に依らず届く。
+    /// 型が分からずUPnPも使っていなければ`None`。
     pub fn reachable(self) -> Option<bool> {
         if self.upnp {
             return Some(true);
@@ -106,24 +107,25 @@ impl NatMark {
     }
 }
 
-/// 接続できなかったときに出す文の種類（番号は README「接続できないとき」の項と同じ）。
+/// 接続できなかったときに出す文の種類（番号はREADME「接続できないとき」の項と同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailKind {
-    /// 1: 型が分からない（下の 3 つに当たらない）。
+    /// 1: 型が分からない（下の3つに当たらない）。
     Unknown = 1,
-    /// 2: 相手がシンメトリック NAT で、こちらは UPnP を使えていない。
+    /// 2: 相手がシンメトリックNATで、こちらはUPnPを使えていない。
     PeerSymmetricNoUpnp = 2,
-    /// 3: こちらがシンメトリック NAT（相手は違う・不明・UPnP で開けている）。
+    /// 3: こちらがシンメトリックNAT（相手は違う・不明・UPnPで開けている）。
     OwnSymmetric = 3,
-    /// 4: 両方がシンメトリック NAT。
+    /// 4: 両方がシンメトリックNAT。
     BothSymmetric = 4,
 }
 
-/// 文を選ぶ。`own` は自分の今の印（シンメトリックかは 2 か所目の STUN の今の結果、`upnp` は割り当てられているか）、
-/// `peer` は相手のコードの印（まだ読んでいなければ `None`）。
+/// 文を選ぶ。
+/// `own`は自分の今のフラグ（シンメトリックかどうかは2か所目のSTUNの今の結果。`upnp`は割り当てられているかどうか）。
+/// `peer`は相手のコードのフラグ（まだ読んでいなければ`None`）。
 ///
-/// 自分か相手が UPnP でポートを開けているなら、そちら側はシンメトリックでも塞がっているとは見なさない
-/// （開けたポートへは相手から届くので、それでも接続できないなら原因は型でなく不明）。
+/// 自分か相手がUPnPでポートを開けているなら、そちら側はシンメトリックでも塞がっているとは見なさない。
+/// 開けたポートへは相手から届くので、それでも接続できないなら原因は型でなく不明。
 pub fn choose(own: NatMark, peer: Option<NatMark>) -> FailKind {
     let peer = peer.unwrap_or(NatMark::UNKNOWN);
     match (own.blocked(), peer.blocked()) {
@@ -156,7 +158,7 @@ mod tests {
         }
         assert_eq!(NatMark::UNKNOWN.to_byte(), 0);
         assert_eq!(mark(Symmetry::Yes, true).to_byte(), 0b110);
-        // 型の値 3 と、定義の外の bit は断る。256 通りのうち読めるのは 6 通りだけ。
+        // 型の値3と定義の外のbitは断る。256通りのうち読めるのは6通りだけ。
         let readable = (0..=255u8)
             .filter(|&b| NatMark::from_byte(b).is_some())
             .count();
@@ -185,32 +187,32 @@ mod tests {
         assert_eq!(Symmetry::from_depends(Some(true)), Symmetry::Yes);
     }
 
-    /// 自分 × 相手 × UPnP の可否の主な組を手で書いた答えで見て、全部の組み合わせ（3 × 2 × 3 × 2 = 36 通り）と相手を読んでいない 6 通りも
-    /// 別の書き方の規則と突き合わせる。
+    /// 自分 × 相手 × UPnP の可否の主な組み合わせを手で書いた答えで検証する。
+    /// 全部の組み合わせ（3 × 2 × 3 × 2 = 36通り）と相手を読んでいない6通りも、別の書き方の規則と突き合わせる。
     #[test]
     fn the_failure_kind_table() {
         use FailKind::{BothSymmetric, OwnSymmetric, PeerSymmetricNoUpnp};
         use Symmetry::{No, Yes};
         const U: Symmetry = Symmetry::Unknown;
         const UNK: FailKind = FailKind::Unknown;
-        // (自分の型, 自分の UPnP, 相手の型, 相手の UPnP, 答え)
+        // (自分の型, 自分のUPnP, 相手の型, 相手のUPnP, 答え)
         let table = [
-            // 両方が塞がっている型 → 4（UPnP を使えていない同士）
+            // 両方が塞がっている型 → 4（UPnPを使えていない同士）
             (Yes, false, Yes, false, BothSymmetric),
-            // 相手だけシンメトリック: こちらが UPnP を使えていなければ 2
+            // 相手だけシンメトリック: こちらがUPnPを使えていなければ2
             (No, false, Yes, false, PeerSymmetricNoUpnp),
             (U, false, Yes, false, PeerSymmetricNoUpnp),
-            // こちらが UPnP を使えていれば、型が原因とは言えない → 1
+            // こちらがUPnPを使えていれば、型が原因とは言えない → 1
             (No, true, Yes, false, UNK),
             (U, true, Yes, false, UNK),
-            // 相手が UPnP でポートを開けていれば、相手は塞がっていない
+            // 相手がUPnPでポートを開けていれば、相手は塞がっていない
             (No, false, Yes, true, UNK),
             (Yes, false, Yes, true, OwnSymmetric),
             // こちらだけシンメトリック → 3
             (Yes, false, No, false, OwnSymmetric),
             (Yes, false, U, false, OwnSymmetric),
             (Yes, false, No, true, OwnSymmetric),
-            // こちらが UPnP でポートを開けていれば、こちらは塞がっていない
+            // こちらがUPnPでポートを開けていれば、こちらは塞がっていない
             (Yes, true, No, false, UNK),
             (Yes, true, Yes, false, UNK),
             (Yes, true, Yes, true, UNK),
@@ -226,7 +228,7 @@ mod tests {
                 "自分 {os:?} upnp={ou} / 相手 {ps:?} upnp={pu}"
             );
         }
-        // 全部の組み合わせを、表の規則と別の書き方（塞がり方の真偽）で突き合わせる。
+        // 全部の組み合わせを表の規則と別の書き方（塞がり方の真偽）で突き合わせる。
         for os in ALL_SYM {
             for ou in [false, true] {
                 for ps in ALL_SYM {

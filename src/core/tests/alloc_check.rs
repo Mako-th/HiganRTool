@@ -1,8 +1,9 @@
-//! `Engine::step`・接続のセッション `link::Link` などがヒープを確保しないこと（ゲームのスレッドで走る）を、割り当て・解放の回数を
-//! 数える割り当て器で見る検査。
+//! `Engine::step`・接続のセッション`link::Link`などがヒープを確保しないこと（ゲームのスレッドで走る）を検査する。
+//! 割り当て・解放の回数を数えるアロケータで見る。
 //!
-//! `src/core/src/` でなく `tests/` にあるのは、割り当てを数えるには `unsafe impl GlobalAlloc` が要るが、`higanr_core` は
-//! `#![forbid(unsafe_code)]` で、integration test は lib とは別クレートなのでここでだけ `unsafe` を書けるため。
+//! この検査が`src/core/src/`でなく`tests/`にあるのは次の理由による。
+//! 割り当てを数えるには`unsafe impl GlobalAlloc`が要る。
+//! `higanr_core`は`#![forbid(unsafe_code)]`だが、integration testはlibとは別クレートなのでここでだけ`unsafe`を書ける。
 
 use higanr_core::auth::Secret;
 use higanr_core::candidate::Candidates;
@@ -20,12 +21,13 @@ use std::cell::Cell;
 use std::net::SocketAddr;
 
 thread_local! {
-    // `const` の初期化で、スレッドの局所記憶に直に置かれ、初めて触るときにも割り当てが起きない。
+    // `const`で初期化するので値はスレッドローカルストレージに直接置かれる。
+    // 初めて触るときにも割り当てが起きない。
     static COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 fn bump() {
-    // スレッドの終わりぎわ（局所記憶が片付いた後）には数えない。
+    // スレッドの終了間際（スレッドローカルストレージの後始末が済んだ後）には数えない。
     let _ = COUNT.try_with(|c| c.set(c.get() + 1));
 }
 
@@ -35,11 +37,12 @@ fn count() -> u64 {
 
 struct Counting;
 
-// SAFETY: どの関数も、受け取った引数をそのまま `System` の同じ関数へ渡して結果を返すだけで、割り当ても解放もしない。
+// SAFETY: どの関数も受け取った引数をそのまま`System`の同じ関数へ渡して結果を返すだけ。
+// 自分では割り当ても解放もしない。
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump();
-        // SAFETY: 呼び出し元が `GlobalAlloc::alloc` の約束（大きさ 0 でない `layout`）を守っている。
+        // SAFETY: 呼び出し元が`GlobalAlloc::alloc`の約束（大きさ0でない`layout`）を守っている。
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -49,12 +52,12 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         bump();
-        // SAFETY: `ptr` はこの割り当て器が `layout` で割り当てたもの（呼び出し元の約束）。
+        // SAFETY: `ptr`はこのアロケータが`layout`で割り当てたもの（呼び出し元の約束）。
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         bump();
-        // SAFETY: 同上。`new_size` の約束も呼び出し元が守っている。
+        // SAFETY: 同上。`new_size`の約束も呼び出し元が守っている。
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -82,7 +85,8 @@ fn obs_scene(scene: u32) -> Obs {
 fn engine_step_never_allocates() {
     let script = parse("scene=1 p1=Z wait=2 hold=3\nscene=2 wait=1\n").expect("parse");
     let mut eng = Engine::new(script);
-    // 1,1,1,1,1 は段階0の WaitCond→Wait→Hold の全部を、2,2,2 は段階1(Wait のみ)→Done を通す。
+    // 1,1,1,1,1は段階0のWaitCond→Wait→Holdの全部を通す。
+    // 2,2,2は段階1(Waitのみ)→Doneを通す。
     let scenes = [1u32, 1, 1, 1, 1, 1, 2, 2, 2];
 
     let before = count();
@@ -92,7 +96,7 @@ fn engine_step_never_allocates() {
     assert_eq!(count(), before, "Engine::step がヒープを確保した");
 }
 
-/// 予測の方法（`pred_eval`）は、作った後の `observe` / `predict` / `reset_stream` で確保しない。
+/// 予測の方法（`pred_eval`）は作った後の`observe` / `predict` / `reset_stream`で確保しない。
 #[test]
 fn predictors_never_allocate() {
     use higanr_core::pred_eval::{
@@ -111,7 +115,7 @@ fn predictors_never_allocate() {
     assert!(count() > probe, "割り当ての数え方が動いていない");
     let before = count();
     for i in 0..3000u32 {
-        // 押す・離すを不規則に混ぜた語。
+        // 押す・離すを不規則に混ぜた入力ワード。
         let w = ((i.wrapping_mul(2654435761) >> 13) & 0xFF) as u16;
         for p in [
             &mut p0 as &mut dyn Predictor,
@@ -131,7 +135,7 @@ fn predictors_never_allocate() {
     assert_eq!(count(), before, "予測の方法がヒープを確保した");
 }
 
-/// 送られたデータグラムを固定の枠に溜める `Outlet`（検査の側も確保しない）。溢れた分は捨てる。
+/// 送られたデータグラムを固定サイズのバッファに溜める`Outlet`（検査の側も確保しない）。溢れた分は捨てる。
 #[derive(Clone, Copy)]
 struct Mailbox {
     bufs: [[u8; MAX_DATAGRAM]; 16],
@@ -271,7 +275,7 @@ fn link_never_allocates() {
     assert!(ca.selection().selects_ready() && cb.selection().selects_ready());
     assert_eq!(after, made, "繋がりのセッションがヒープを確保した");
 
-    // PONG の応答側（受信スレッドへ渡すコピー）を作って、相手の封じた PING に返す。
+    // PONGの応答側（受信スレッドへ渡すコピー）を作って相手の封じたPINGに返す。
     let pong_seq = higanr_core::seal::Seq::new();
     let mut ping = Mailbox::new();
     let before = count();
@@ -299,7 +303,7 @@ fn link_never_allocates() {
     );
 }
 
-/// 観戦の送信側（`Outlet`）。送られたデータグラムを固定の枠に溜める（検査の側も確保しない）。
+/// 観戦の送信側（`Outlet`）。送られたデータグラムを固定サイズのバッファに溜める（検査の側も確保しない）。
 #[derive(Clone, Copy)]
 struct SpectateMail {
     bufs: [[u8; 512]; 16],
@@ -352,7 +356,7 @@ fn spectate_never_allocates() {
     );
     let (mut to_host, mut to_w) = (SpectateMail::new(), SpectateMail::new());
     let (mut got, mut seen, mut ranged) = (0u32, 0u32, 0u32);
-    // 観戦者の早送りの決め方（ゲームのスレッドで 1 表示ごとに呼ぶ）。
+    // 観戦者の早送りの決め方（ゲームのスレッドで1表示ごとに呼ぶ）。
     let mut pace = Pace::new();
     let (mut last_ack, mut extras) = (0u32, 0u32);
 
@@ -393,7 +397,7 @@ fn spectate_never_allocates() {
         if t % 16 == 8 {
             pace.on_display(w.ack().saturating_sub(last_ack));
             last_ack = w.ack();
-            // 溜まりは決め打ち（この検査はすぐ全部使うので溜まらない）。止まり・待ち・早送りの道を順に通す。
+            // 溜まりは決め打ち（この検査はすぐ全部使うので溜まらない）。止まり・待ち・早送りの経路を順に通す。
             let backlog = (t / 16) % 20;
             if pace.may_play(backlog, 3) {
                 if backlog == 0 {
@@ -421,8 +425,7 @@ fn spectate_never_allocates() {
     assert_eq!(after, before, "観戦の送りか組み立てがヒープを確保した");
 }
 
-/// 中継の木の便（JOIN の木の欄・ACK の中継の状態・INTRO・ADMIT・REHOME・MEASURE・PAIR）の encode / decode と `peek_type` は
-/// 受信スレッドで走る。
+/// 中継の木の便（JOINの木のフィールド・ACKの中継の状態・INTRO・ADMIT・REHOME・MEASURE・PAIR）のencode / decodeと`peek_type`は受信スレッドで走る。
 #[test]
 fn spectate_tree_wire_never_allocates() {
     use higanr_core::auth::AuthKey;
@@ -468,6 +471,7 @@ fn spectate_tree_wire_never_allocates() {
                 no_intro: false,
             },
             admit_ack: 1,
+            cookie: None,
             sack: higanr_core::bits512::Bits512::EMPTY,
         },
         Message::SpectateIntro(SpectateIntro {
@@ -519,7 +523,7 @@ fn spectate_tree_wire_never_allocates() {
     );
 }
 
-/// 中継の木の便の行き来（送り元・宛先つき）。受信スレッドの周回の分だけ固定の枠に溜める。
+/// 中継の木の便の行き来（送り元・宛先つき）。受信スレッドの周回の分だけ固定サイズのバッファに溜める。
 struct TreeMail {
     bufs: [[u8; 512]; 64],
     lens: [usize; 64],
@@ -560,7 +564,7 @@ impl Outlet for Post<'_> {
     }
 }
 
-/// 中継の木（紹介・受け入れの依頼・中継役が子へ配る側・中継役が抜けて子へ REHOME・ホストが取り置きを作って使う・`resume_from` つきの JOIN）は受信スレッドで走る。
+/// 中継の木（紹介・受け入れの依頼・中継役が子へ配信する側・中継役が抜けて子へREHOME・ホストが取り置きを作って使う・`resume_from`つきのJOIN）は受信スレッドで走る。
 #[test]
 fn spectate_tree_never_allocates() {
     use higanr_core::nat::{NatMark, Symmetry};
@@ -598,7 +602,7 @@ fn spectate_tree_never_allocates() {
     let mut c = Watcher::with_assembler(cfg(2, 0x33), Assembler::with_capacity(16));
     let (mut now_mail, mut next_mail) = (TreeMail::new(), TreeMail::new());
     let (mut noted, mut via_relay) = (false, 0u32);
-    // 子が中継役から受けている間に、中継役が観戦を終える（ホストへ BYE、子へ REHOME。以後は中継役への便を捨てる）。
+    // 子が中継役から受けている間に中継役が観戦を終える（ホストへBYEを送り、子へREHOMEを送る。以後は中継役への便を捨てる）。
     let leave_at = 3_500;
     let r_down = |t: u32| t > leave_at;
 
@@ -716,7 +720,7 @@ fn spectate_tree_never_allocates() {
     assert_eq!(after, before, "中継の木の処理がヒープを確保した");
 }
 
-/// 1,200 B の便（測りの組）も載る行き来の枠。
+/// 1,200 Bの便（測りのペア）も載る行き来のバッファ。
 struct BigMail {
     bufs: [[u8; MAX_DATAGRAM]; 64],
     lens: [usize; 64],
@@ -757,8 +761,7 @@ impl Outlet for BigPost<'_> {
     }
 }
 
-/// 上りの測り（ホストが観戦者へ番を渡す・ホストから観戦者への MEASURE の送り直し・観戦者が組を送る・ホストが組を受けて締める・PAIR を `on_datagram` が開かずに
-/// 捨てる）は受信スレッドで走る。
+/// 上りの測り（ホストが観戦者へ番を渡す・ホストから観戦者へのMEASUREの再送・観戦者がペアを送る・ホストがペアを受けて締める・PAIRを`on_datagram`が開かずに捨てる）は受信スレッドで走る。
 #[test]
 fn spectate_uplink_measure_never_allocates() {
     use higanr_core::nat::{NatMark, Symmetry};
@@ -792,7 +795,7 @@ fn spectate_uplink_measure_never_allocates() {
         symmetry: Symmetry::No,
         upnp: false,
     });
-    // dll が中継の配る側の状態を毎周渡したときと同じ（既定の「紹介しないで」のままだと番が来ない）。
+    // dllが中継の配信する側の状態を毎周渡したときと同じ（既定の「紹介しないで」のままだと番が来ない）。
     w.set_relay_state(RelayState {
         descendants: 0,
         no_intro: false,
@@ -834,7 +837,7 @@ fn spectate_uplink_measure_never_allocates() {
                     let _ = host.on_datagram(from, bytes, t, &mut post);
                 }
             } else if to == w_addr {
-                // 最初の MEASURE を落として、送り直しの道を通す。
+                // 最初のMEASUREを落として再送の経路を通す。
                 if kind == PeekedType::SpectateMeasure && !lost_measure {
                     lost_measure = true;
                     continue;
@@ -878,7 +881,7 @@ fn spectate_uplink_measure_never_allocates() {
     assert_eq!(after, before, "上りの測りがヒープを確保した");
 }
 
-/// 中継の木の端の道（中継役が飛んで子を REHOME する・中継役が持たない始まりの子へ REHOME を返す・ホストから観戦者への満杯の断り）。
+/// 中継の木の端の経路（中継役が飛んで子をREHOMEする・中継役が持たない始まりの子へREHOMEを返す・ホストから観戦者への満杯の断り）。
 #[test]
 fn spectate_tree_edges_never_allocate() {
     use higanr_core::seal::Ephemeral;
@@ -892,7 +895,7 @@ fn spectate_tree_edges_never_allocate() {
         key_seed: KeySeed([0x11; 32]),
     };
     let at = |n: u16| SocketAddr::from(([127, 0, 0, 1], 47_200 + n));
-    // 観戦者 n の JOIN（先に作っておく。作るのは検査の外）。
+    // 観戦者nのJOIN（先に作っておく。作るのは検査の外）。
     const N: usize = MAX_SPECTATORS + 1;
     let mut joins = [[0u8; MAX_DATAGRAM]; N + 2];
     let mut lens = [0usize; N + 2];
@@ -972,8 +975,10 @@ fn spectate_tree_edges_never_allocate() {
     assert_eq!(after, before, "中継の木の端の道がヒープを確保した");
 }
 
-/// 入れ替え（マッチの切れ目に直接の葉を中継役へ紹介し、中継役が受け取ったら元の枠を空ける）と、照合のずれで中継役の下から直接へ
-/// 戻る口と、中継役がホストへ知らせる JOIN は受信スレッドで走る。
+/// 次は受信スレッドで走る。
+/// 入れ替え（マッチの切れ目に直接の葉を中継役へ紹介し、中継役が受け取ったら元の枠を空ける）。
+/// 照合のずれで中継役の下から直接へ戻る経路。
+/// 中継役がホストへ知らせるJOIN。
 #[test]
 fn spectate_swap_and_mismatch_return_never_allocate() {
     use higanr_core::nat::{NatMark, Symmetry};
@@ -1006,14 +1011,14 @@ fn spectate_swap_and_mismatch_return_never_allocate() {
         upnp: false,
     });
     let mut relay = SpectateHost::relay_with_capacity(sid, secret, rkey, 1_024);
-    // 中継しない葉 2 人（中継役より先に直接入る）。
+    // 中継しない葉2人（中継役より先に直接入る）。
     let mut leaves = [
         Watcher::with_assembler(cfg(2, 0x33), Assembler::with_capacity(16)),
         Watcher::with_assembler(cfg(3, 0x34), Assembler::with_capacity(16)),
     ];
     let (mut now_mail, mut next_mail) = (TreeMail::new(), TreeMail::new());
     let (mut noted, mut returned, mut announced) = (false, false, false);
-    // マッチ 0 の語は 2 秒まで。その後は `Seg(1)` を積んで何も積まない（マッチの切れ目）。
+    // マッチ0のワードは2秒まで。その後は`Seg(1)`を積んで何も積まない（マッチの切れ目）。
     let seg1_at = 2_000;
     let mismatch_at = 4_500;
     let announce_at = 5_000;
@@ -1120,7 +1125,7 @@ fn spectate_swap_and_mismatch_return_never_allocate() {
     assert_eq!(after, before, "入れ替えか照合の口がヒープを確保した");
 }
 
-/// 観戦者の照合（ゲームのスレッドで 1 秒に 1 回）: 記録を作る・組にして比べる。
+/// 観戦者の照合（ゲームのスレッドで1秒に1回）: 記録を作る・ペアにして比べる。
 #[test]
 fn watch_checks_never_allocate() {
     use higanr_core::check::{OwnCheck, WatchChecks, WatchVerdict, is_watch_check_frame};
@@ -1163,7 +1168,7 @@ fn watch_checks_never_allocate() {
     assert_eq!(after, before, "照合がヒープを確保した");
 }
 
-/// 語の配列を領域にした `ArenaMem`。配列は検査の側が先に作る。
+/// ワードの配列を領域にした`ArenaMem`。配列は検査の側が先に作る。
 struct FixedMem(Box<[u32]>);
 
 impl higanr_core::arena::ArenaMem for FixedMem {
@@ -1202,7 +1207,7 @@ fn arena_alloc_and_free_never_allocate() {
     assert_eq!(after, before, "割り当て器の確保・解放がヒープを確保した");
 }
 
-/// 確保しない偽のゲーム（状態機械の側の確保だけを見るため、`Window` の呼び出しの側は確保しない）。
+/// 確保しない偽のゲーム（ステートマシンの側の確保だけを見るために`Window`の呼び出しの側は確保しない）。
 struct NoAllocGame {
     chain: u64,
     snap: u64,
@@ -1271,7 +1276,7 @@ fn rollback_never_allocates() {
                     }
                 }
             }
-            // マッチの途中の Ctrl＋数字（確保の検査が seg の途中の D の切替の経路も通る）。
+            // マッチの途中のCtrl＋数字（確保の検査がマッチの途中のDの切替の経路も通る）。
             if it % 37 == 11 {
                 nodes[i].press_delay(PRESSES[((it / 37 + i as u32) % 6) as usize]);
             }
@@ -1298,8 +1303,8 @@ fn rollback_never_allocates() {
                     nodes[i].press_delay([2, 0, 1][(next % 3) as usize]);
                 }
                 nodes[i].begin_seg(next);
-                // 選択の間（最初の取得の前）: 推奨値が替わり、ホストが押す（seg の始まりの D を直に替える経路と、auto の旗・seg の始まりの
-                // 推奨値の経路を通す）。
+                // 選択の間（最初の取得の前）: 推奨値が替わりホストが押す。
+                // これでマッチの始まりのDを直接替える経路と、autoのフラグ・マッチの始まりの推奨値の経路を通す。
                 nodes[i].set_recommend(Some(Recommend::flat(1 + (next % 5) as u8)));
                 if next.is_multiple_of(2) {
                     nodes[i].press_delay(PRESSES[(next % 6) as usize]);
@@ -1311,7 +1316,7 @@ fn rollback_never_allocates() {
     }
     let after = count();
     assert!(games[0].ticks > 0 && games[1].ticks > 0);
-    // 通った経路の確認（何も起きていなければ、確保が無いのは当たり前）。
+    // 通った経路の確認（何も起きていなければ確保が無いのは当たり前）。
     let s = nodes[0].stats();
     assert!(
         s.resims > 10 && s.scenes_ended > 0 && s.live_predicted > 0,

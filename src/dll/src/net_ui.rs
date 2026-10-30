@@ -1,13 +1,20 @@
-//! ゲーム内メニュー（`code_side = game`）のゲームのスレッドの側（pure。unsafe 無し）。
+//! ゲーム内メニュー（`code_side = game`）のゲームのスレッドの側（pure。unsafe無し）。
 //!
-//! 判断は core（`higanr_core::ui_entry` が入口の判定、`net_menu` が状態機械と固定の文、`ui_layout` が頂点の配置）。ここは、それをゲームのスレッドで 1 tick に 1 回ずつ進め、見張りのスレッドと原子変数だけで話し、描く行を「盤」に書き込む接続役。
-//! - **受け渡し（確保・ロック待ち無し）**: ゲームのスレッド → 見張りは指示のリングバッファ `UiLink::send` と対戦の形の値、見張り → ゲームのスレッドは状態 `Note`（種類と数。文字列を持たない）の札つきの入れ物 `NoteBox`、ゲームのスレッド → 描画の入口は描く行の盤 `Board`（`draw_board` が描く）。
-//! - **ゲームの入力**: Match の画面（6）の間は、入力の地点（`net_input`）でこの UI が入力を握る。メニューが閉じていれば素の poll の 3 本をそのまま feed し（`ui_entry::leaks` が漏れると決めた tick だけ 0 を 3 本）、開いていれば 0 を 3 本 feed する。画面 6 以外ではゲームの入力に触らない。
-//! - **遅延の増分**: 画面 6 の tick だけ（素の poll を 3 回 ＝ `poll_all` が元から呼ぶ回数と同じ）。入力 → Present の間に足すのは、描画の入口の盤の読み（原子変数の読みと、メニューが開いている間の頂点 100 行ほど）だけ。
-//! - ルーム名・プレイヤー名の入力、観戦者のセッション、観戦コードのコピー（Ctrl+C）、接続の組の作り直しは、この下の各関数にある。
+//! 判断はcoreが行う（`higanr_core::ui_entry`が入口の判定、`net_menu`がステートマシンと固定の文、`ui_layout`が頂点の配置）。
+//! ここはその判断をゲームのスレッドで1 tickに1回ずつ進める接続役。
+//! 監視スレッドとはアトミック変数だけで通信し、描く行を「盤」に書き込む。
+//! - **受け渡し（確保・ロック待ち無し）**: ゲームのスレッドから監視スレッドへは、指示のリングバッファ`UiLink::send`と対戦の形の値で渡す。
+//!   監視スレッドからゲームのスレッドへは、状態`Note`（種類と数。文字列を持たない）をタグつきのバッファ`NoteBox`で渡す。
+//!   ゲームのスレッドから描画の入口へは、描く行の盤`Board`（`draw_board`が描く）で渡す。
+//! - **ゲームの入力**: Matchの画面（6）の間は入力の地点（`net_input`）でこのUIが入力を占有する。
+//!   メニューが閉じていれば素のpollの3本をそのままfeedする（`ui_entry::leaks`が漏れると判定したtickだけ0を3本feedする）。
+//!   開いていれば0を3本feedする。画面6以外ではゲームの入力に触らない。
+//! - **遅延の増分**: 画面6のtickだけ（素のpollを3回 ＝ `poll_all`が元から呼ぶ回数と同じ）。
+//!   入力 → Presentの間に足すのは、描画の入口の盤の読みだけ（アトミック変数の読みと、メニューが開いている間の頂点100行ほど）。
+//! - ルーム名・プレイヤー名の入力、観戦者のセッション、観戦コードのコピー（Ctrl+C）、接続一式の作り直しはこの下の各関数にある。
 #![forbid(unsafe_code)]
 
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use std::sync::Arc;
 
 use higanr_core::delay_pick::DelayChoice;
@@ -21,16 +28,19 @@ use higanr_core::net_menu::return_lines;
 use higanr_core::net_menu::{
     Answer, Cmd, Conn, Event, HudView, LineBuf, MENU_ROWS, Menu, MenuRows, NOTE_WORDS, Note,
     PeerStats, RewindWindow, RoomItem, STALL_ROWS, Stall, T_PEER_WAIT, T_SPECTATE_ESC_HOLD,
-    T_SPECTATE_NEXT_SELECT, T_SPECTATE_PAUSED, TextIn, TickIn, WatchHudView, copy_hint,
-    copy_notice, corner_is_band, corner_lines, hud_line, name_band_line, stall_block,
-    watch_hud_line, watch_off_hint,
+    T_SPECTATE_NEXT_SELECT, T_SPECTATE_PAUSED, TextIn, TickIn, UPDATE_NOTICE_LINES, WatchHudView,
+    copy_hint, copy_notice, corner_is_band, corner_lines, hud_line, name_band_label_range,
+    name_band_line, stall_block, update_notice_lines, watch_hud_line, watch_off_hint,
 };
 use higanr_core::overlay::{AtlasSpec, MAX_TEXT_UTF8, Vertex, utf16_to_utf8};
 use higanr_core::player_name::{NAME_BUF_WORDS, NameBuf};
 use higanr_core::return_flow::{self, Facts, Finish, Flow, Reads, Screen, Why};
 use higanr_core::room_input::{ROOM_BUF_WORDS, RoomBuf};
+use higanr_core::split_kb::{self, DeviceTable};
+use higanr_core::status_side::StatusSide;
 use higanr_core::ui_entry::{self, Advance, EntryView, SCREEN_MATCH_MODE};
 use higanr_core::ui_layout::{self as lay, HUD_BAND_H, HUD_TEXT_MAX_W, HUD_X, HUD_Y, RowStyle};
+use higanr_core::update_notice::{Found, Poll, Trigger};
 use higanr_core::vpn_net::VpnSet;
 use higanr_core::watch_list::{
     ListStatus, WATCH_ROW_WORDS, WATCH_ROWS_MAX, WatchRow, WatchSnapshot,
@@ -44,9 +54,9 @@ use crate::overlay::{TEXT_UNITS, TextBox};
 use crate::scripted::SCENE_MENU;
 use crate::spectate_watch::{WatchNotice, WatchPlay};
 
-// ---- 見張りとのインターフェース ----
+// ---- 監視スレッドとのインターフェース ----
 
-/// 見張りへの指示の種類（`UiLink::send`）。`Cmd::Shape` は別の欄（`shape`）で渡す。
+/// 監視スレッドへの指示の種類（`UiLink::send`）。`Cmd::Shape`は別のフィールド（`shape`）で渡す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     Create,
@@ -54,13 +64,14 @@ pub enum Order {
     Cancel,
     /// ルームサーバーのルームで待つ。
     Room,
-    /// 観戦者として観戦用のルームで待つ（ルーム名は `UiLink::spectate_name`。`Room` の名の入れ物とは別）。
+    /// 観戦者として観戦用のルームで待つ（ルーム名は`UiLink::spectate_name`。`Room`の名のバッファとは別）。
     Spectate,
-    /// 観戦の待ちを取りやめる（`Cancel` は対戦する側の待ちの取りやめなので、受け手が取り違えないよう別の指示）。
+    /// 観戦の待ちを取りやめる。
+    /// `Cancel`は対戦する側の待ちの取りやめなので受け手が取り違えないよう別の指示にしている。
     SpectateCancel,
-    /// ランダムマッチの待ち列に入る（名の入れ物は使わない: ルーム名はサーバーが割り当てる）。
+    /// ランダムマッチの待ち列に入る（名のバッファは使わない: ルーム名はサーバーが割り当てる）。
     Random,
-    /// 観戦コードをコピー（対戦の最中。ホストの見張りがクリップボードへ書く）。
+    /// 観戦コードをコピー（対戦の最中。ホストの監視スレッドがクリップボードへ書く）。
     SpectateCopy,
 }
 
@@ -93,37 +104,37 @@ impl Order {
     }
 }
 
-/// 指示のリングバッファの長さ（2 の冪）。人の操作は 1 tick に 1 つ以下で、見張りは数十 ms ごとに取るので溢れない（溢れたら新しい指示を捨てる）。
+/// 指示のリングバッファの長さ（2の冪）。人の操作は1 tickに1つ以下。監視スレッドは数十msごとに取るので溢れない（溢れたら新しい指示を捨てる）。
 const ORDER_RING: usize = 8;
 
-/// ゲームのスレッドと見張りのスレッドの間のインターフェース。書き手と読み手は各 1 人（指示はゲームのスレッドが書き見張りが読む。状態は逆）。
+/// ゲームのスレッドと監視スレッドの間のインターフェース。書き手と読み手は各1人（指示はゲームのスレッドが書き監視スレッドが読む。状態は逆）。
 pub struct UiLink {
-    /// 指示のリングバッファ。書き手（ゲームのスレッド）が `head` を Release で進め、読み手（見張り）が Acquire で読んでから中身を読む。
+    /// 指示のリングバッファ。書き手（ゲームのスレッド）が`head`をReleaseで進める。読み手（監視スレッド）はAcquireで読んでから中身を読む。
     orders: [AtomicU32; ORDER_RING],
     head: AtomicU32,
     tail: AtomicU32,
-    /// 対戦の形（メニューで変えた値）。0 = 変えていない、1 + `Pick` の番号。
+    /// 対戦の形（メニューで変えた値）。0 = 変えていない。1 + `Pick` の番号。
     shape: AtomicU32,
-    /// 対戦の遅延（`Cmd::Shape` の後半）。0 = 変えていない、1 + `DelayChoice::raw`（auto は `AUTO` = 9）。
+    /// 対戦の遅延（`Cmd::Shape`の後半）。0 = 変えていない。1 + `DelayChoice::raw`（autoは `AUTO` = 9）。
     delay: AtomicU32,
-    /// サイド（メニューで変えた席の希望）。0 = 変えていない、1 + `seat_code` の番号。
+    /// サイド（メニューで変えたサイドの希望）。0 = 変えていない。1 + `seat_code` の番号。
     seat: AtomicU32,
     note: NoteBox,
-    /// ルーム名の入力で決めた名（`Order::Room` を積む前に書き、見張りがその指示を取るときに読む）。
+    /// ルーム名の入力で決定した名（`Order::Room`を積む前に書く。監視スレッドがその指示を取るときに読む）。
     room_name: RoomNameBox,
-    /// 観戦の「ルームマッチ」の入力で決めた名（`Order::Spectate` を積む前に書く）。対戦の「ルームマッチ」の名と入れ違わないよう別の入れ物にする。
+    /// 観戦の「ルームマッチ」の入力で決定した名（`Order::Spectate`を積む前に書く）。対戦の「ルームマッチ」の名と入れ違わないよう別のバッファにする。
     spectate_name: RoomNameBox,
-    /// メニューで決めたプレイヤー名（`Cmd::Name`。決めていなければ空で、ネットワークを開くスレッドは ini の名前を使う）。
-    /// 書き手はゲームのスレッド、読み手はネットワークを開くスレッドと見張りのスレッド。
+    /// メニューで決定したプレイヤー名（`Cmd::Name`）。決定していなければ空になり、ネットワークを開くスレッドはiniの名前を使う。
+    /// 書き手はゲームのスレッド。読み手はネットワークを開くスレッドと監視スレッド。
     player_name: PlayerNameBox,
-    /// 観戦の「ランダムマッチ」の一覧（書き手は一覧の接続のスレッド `watch_feed`、読み手はゲームのスレッド）。
+    /// 観戦の「ランダムマッチ」の一覧（書き手は一覧の接続のスレッド`watch_feed`。読み手はゲームのスレッド）。
     watch_list: WatchListBox,
-    /// 一覧の接続の世代（`watch_feed`。止めた古いスレッドが、次に開いた一覧の入れ物へ書かないための印）。
+    /// 一覧の接続の世代（`watch_feed`。止めた古いスレッドが次に開いた一覧のバッファへ書かないための印）。
     watch_gen: AtomicU32,
-    /// 一覧から選んだ行（`Cmd::SpectateListed`。`Order::Spectate` を積む前に書く）。読み手は観戦者のネットワークを開く仕事。
-    /// 観戦の「ルームマッチ」を決めると空にする（古い選びが入力した名を奪わないように）。
+    /// 一覧から選んだ行（`Cmd::SpectateListed`。`Order::Spectate`を積む前に書く）。読み手は観戦者のネットワークを開く仕事。
+    /// 観戦の「ルームマッチ」を決定すると空にする（古い選択が入力した名を奪わないように）。
     spectate_pick: WatchRowBox,
-    /// 観戦の決定が「観戦コード入力」か（1 = 観戦コード、0 = ルーム名か一覧の行）。`Order::Spectate` を積む前に書く。
+    /// 観戦の決定が「観戦コード入力」かどうか（1 = 観戦コード。0 = ルーム名か一覧の行）。`Order::Spectate`を積む前に書く。
     spectate_by_code: AtomicU32,
 }
 
@@ -133,7 +144,7 @@ impl Default for UiLink {
     }
 }
 
-/// `Pick` の番号（rollback の D は 0〜`MAX_PICK_DELAY` = 8 がその数、delay 方式は 9）。
+/// `Pick`の番号（rollbackのDは0〜`MAX_PICK_DELAY` = 8 がその数。delay方式は9）。
 fn pick_code(p: Pick) -> u32 {
     match p {
         Pick::Rollback(d) => u32::from(d.min(MAX_PICK_DELAY)),
@@ -141,7 +152,7 @@ fn pick_code(p: Pick) -> u32 {
     }
 }
 
-/// `SeatWish` の番号（0〜2。`net_menu` の並びと同じ: 1P・2P・おまかせ）。
+/// `SeatWish`の番号（0〜2。`net_menu`の並びと同じ: 1P・2P・おまかせ）。
 fn seat_code(w: SeatWish) -> u32 {
     match w {
         SeatWish::P1 => 0,
@@ -192,21 +203,21 @@ impl UiLink {
 
     pub fn send(&self, c: Cmd) {
         match c {
-            // 名前は指示のリングバッファを通さない（取りやめる・作るなどの順序に関わらない値。次にネットワーク・コードを作る側が入れ物から読む）。
+            // 名前は指示のリングバッファを通さない（取りやめる・作るなどの順序に関わらない値。次にネットワーク・コードを作る側がバッファから読む）。
             Cmd::Name(n) => self.player_name.publish(&n),
-            // 設定のルーム名は見張りへの指示ではない（見張りは最初の「ルームマッチ」まで居ない）。覚えるのは `NetUi::room_saver` が作る別のスレッド。
+            // 設定のルーム名は監視スレッドへの指示ではない（監視スレッドは最初の「ルームマッチ」まで存在しない）。保存するのは`NetUi::room_saver`が作る別のスレッド。
             Cmd::RoomSet(_) => {}
             Cmd::Shape(p, d) => {
-                // 遅延を先に設定する（見張りは形を読んだ後に遅延を読む。形だけ新しくて遅延が古い組を見せない向き）。
+                // 遅延を先に設定する。監視スレッドは形を読んだ後に遅延を読む。形だけ新しくて遅延が古い組み合わせを見せない順序にしている。
                 self.delay.store(1 + u32::from(d.raw()), Ordering::Release);
                 self.shape.store(1 + pick_code(p), Ordering::Release);
             }
-            // サイドも形と同じく指示のリングバッファを通さない（見張りがセッションの設定を登録するときに読む値）。
+            // サイドも形と同じく指示のリングバッファを通さない（監視スレッドがセッションの設定を登録するときに読む値）。
             Cmd::Seat(w) => self.seat.store(1 + seat_code(w), Ordering::Release),
-            // 言語は見張りに関係しない（ini へ書くのは `NetUi::lang_saver` が作る別のスレッド）。
+            // 言語は監視スレッドに関係しない（iniへ書くのは`NetUi::lang_saver`が作る別のスレッド）。
             Cmd::Lang(_) => {}
-            // LAN の申し込みは見張りへの指示ではない（見張りはまだ居ない。ゲームのスレッドが `UiOut::lan` で呼び手へ頼み、LAN の運び手のスレッドが
-            // 自分で指示のリングバッファを読む）。
+            // LANの申し込みは監視スレッドへの指示ではない（監視スレッドはまだ存在しない）。
+            // ゲームのスレッドが`UiOut::lan`で呼び手へ頼み、LANの運び手のスレッドが自分で指示のリングバッファを読む。
             Cmd::LanHost | Cmd::LanClient(_) | Cmd::LanWatch(_) => {}
             Cmd::Create => self.push(Order::Create),
             Cmd::Paste => self.push(Order::Paste),
@@ -237,38 +248,38 @@ impl UiLink {
         }
     }
 
-    /// 見張りのスレッド: `Order::Room` に添えられたルーム名（最後に決めた名。書きかけなら読み直し、まだ決めていなければ `None`）。
+    /// 監視スレッド: `Order::Room`に添えられたルーム名（最後に決定した名。書きかけなら読み直す。まだ決定していなければ`None`）。
     pub fn room_name(&self) -> Option<RoomBuf> {
         (0..4).find_map(|_| self.room_name.read())
     }
 
-    /// メニューで決めたプレイヤー名（最後に決めた名。まだ決めていなければ `None`）。ネットワークを開くスレッド・見張りのスレッドが、
-    /// 次に名乗る名前を決めるときに読む。
+    /// メニューで決定したプレイヤー名（最後に決定した名。まだ決定していなければ`None`）。
+    /// ネットワークを開くスレッドと監視スレッドが次に名乗る名前を決めるときに読む。
     pub fn player_name(&self) -> Option<NameBuf> {
         (0..4).find_map(|_| self.player_name.read())
     }
 
-    /// 観戦者のネットワークを開く仕事（`script_win::open_watch_net`）が読む、`Cmd::Spectate` に添えられたルーム名（`room_name` と同じ読み方。別の入れ物）。
+    /// `Cmd::Spectate`に添えられたルーム名（`room_name`と同じ読み方。別のバッファ）。観戦者のネットワークを開く仕事（`script_win::open_watch_net`）が読む。
     pub fn spectate_name(&self) -> Option<RoomBuf> {
         (0..4).find_map(|_| self.spectate_name.read())
     }
 
-    /// 観戦者のネットワークを開く仕事が読む: 最後の観戦の決定が「観戦コード入力」か（真ならクリップボードの観戦コードでホストへ直に接続する）。
+    /// 観戦者のネットワークを開く仕事が読む: 最後の観戦の決定が「観戦コード入力」かどうか（真ならクリップボードの観戦コードでホストへ直接接続する）。
     pub fn spectate_by_code(&self) -> bool {
         self.spectate_by_code.load(Ordering::Acquire) != 0
     }
 
-    /// 観戦者のネットワークを開く仕事が読む、一覧から選んだ行（選んでいなければ `None`。この場合は `spectate_name` を使う）。
+    /// 一覧から選んだ行（選んでいなければ`None`。その場合は`spectate_name`を使う）。観戦者のネットワークを開く仕事が読む。
     pub fn spectate_pick(&self) -> Option<WatchRow> {
         (0..4).find_map(|_| self.spectate_pick.read()).flatten()
     }
 
-    /// 一覧の接続のスレッド: 観戦の「ランダムマッチ」の一覧を書く（書き手は 1 つのスレッド）。
+    /// 一覧の接続のスレッド: 観戦の「ランダムマッチ」の一覧を書く（書き手は1つのスレッド）。
     pub fn publish_watch_list(&self, status: ListStatus, rows: &[WatchRow]) {
         self.watch_list.publish(status, rows);
     }
 
-    /// 一覧の接続の世代を 1 つ進めて、進めた後の値を返す（開く・止めるたびに）。
+    /// 一覧の接続の世代を1つ進めて、進めた後の値を返す（開く・止めるたびに）。
     pub fn next_watch_generation(&self) -> u32 {
         self.watch_gen
             .fetch_add(1, Ordering::AcqRel)
@@ -280,12 +291,12 @@ impl UiLink {
         self.watch_gen.load(Ordering::Acquire)
     }
 
-    /// 一覧のバージョン（書くたびに進む）。ゲームのスレッドが、一覧の画面に入った時点の値を覚えて「それより新しいものだけ」を読むために使う。
+    /// 一覧のバージョン（書くたびに進む）。ゲームのスレッドが一覧の画面に入った時点の値を覚えて「それより新しいものだけ」を読むために使う。
     pub fn watch_list_version(&self) -> u32 {
         self.watch_list.version()
     }
 
-    /// ゲームのスレッド: `seen` より新しい一覧があれば `scratch` へ読み、`seen` を進めて true。書きかけ・変わっていなければ false（`scratch` は使わない）。
+    /// ゲームのスレッド: `seen`より新しい一覧があれば`scratch`へ読み、`seen`を進めてtrueを返す。書きかけか変わっていなければfalseを返す（`scratch`は使わない）。
     pub fn read_watch_list(&self, scratch: &mut WatchSnapshot, seen: &mut u32) -> bool {
         self.watch_list.read_newer(scratch, seen)
     }
@@ -322,7 +333,7 @@ impl UiLink {
         }
     }
 
-    /// 見張りのスレッド: メニューで選んだ遅延（変えていなければ `None`。接続の始まりにホストが押下にする）。
+    /// 監視スレッド: メニューで選んだ遅延（変えていなければ`None`。接続の始まりにホストが押下にする）。
     pub fn start_delay(&self) -> Option<DelayChoice> {
         match self.delay.load(Ordering::Acquire) {
             0 => None,
@@ -341,17 +352,17 @@ impl UiLink {
         self.note.publish(n);
     }
 
-    /// ゲームのスレッド: ここまでに送った指示の数（片づけるときの印。`drop_orders_before` へ渡す）。原子変数を 1 つ読むだけ。
+    /// ゲームのスレッド: ここまでに送った指示の数（後始末のときの目印。`drop_orders_before`へ渡す）。アトミック変数を1つ読むだけ。
     pub fn order_mark(&self) -> u32 {
         self.head.load(Ordering::Acquire)
     }
 
-    /// 再接続の片づけ（ワーカースレッド。**前の見張りを止めて待った後、次の見張りを開始する前だけ**呼ぶ）: 前の見張りが取り残した
-    /// 指示（`mark` より前に送られたもの）を捨て、状態を「何も無い」にする。`mark` より後の指示（片づけている間に人が選んだ
-    /// 「作る」など）は残し、次の見張りが取る。
+    /// 再接続の後始末（ワーカースレッド。**前の監視スレッドを止めて待った後、次の監視スレッドを開始する前だけ**呼ぶ）。
+    /// 前の監視スレッドが取り残した指示（`mark`より前に送られたもの）を捨てて、状態を「何も無い」にする。
+    /// `mark`より後の指示（後始末している間に人が選んだ「作る」など）は残し、次の監視スレッドが取る。
     pub fn reset_for_next_watcher(&self, mark: u32) {
         let tail = self.tail.load(Ordering::Relaxed);
-        // `mark` が `tail` より前（もう取った）なら動かさない。リングバッファの長さを越える差は来ない（指示は 1 tick に 1 つ以下）。
+        // `mark`が`tail`より前（もう取った）なら動かさない。リングバッファの長さを越える差は来ない（指示は1 tickに1つ以下）。
         if mark.wrapping_sub(tail) as usize <= ORDER_RING {
             self.tail.store(mark, Ordering::Release);
         }
@@ -362,9 +373,10 @@ impl UiLink {
         });
     }
 
-    /// 観戦者のセッションの片づけ（ワーカースレッド。見張りが居ない間だけ）: `mark` より前に送られた指示を捨てる。状態は消さない（観戦の
-    /// 終わりの理由を左上に残す）。観戦の「ルームマッチ」の指示はネットワークを開く仕事（`UiOut::spectate_open`）が受けるので、誰も取らない指示が
-    /// リングバッファに溜まると新しい指示（対戦する側の「作る」）を捨ててしまう。
+    /// 観戦者のセッションの後始末（ワーカースレッド。監視スレッドが存在しない間だけ呼ぶ）。
+    /// `mark`より前に送られた指示を捨てる。状態は消さない（観戦の終わりの理由を左上に残す）。
+    /// 観戦の「ルームマッチ」の指示はネットワークを開く仕事（`UiOut::spectate_open`）が受けるので、リングバッファからは誰も取らない。
+    /// 溜まったままにすると新しい指示（対戦する側の「作る」）を捨ててしまう。
     pub fn drop_orders_before(&self, mark: u32) {
         let tail = self.tail.load(Ordering::Relaxed);
         if mark.wrapping_sub(tail) as usize <= ORDER_RING {
@@ -372,13 +384,13 @@ impl UiLink {
         }
     }
 
-    /// ゲームのスレッド: 最新の状態（書きかけなら `None`。呼び手は前の値を使い続ける）。
+    /// ゲームのスレッド: 最新の状態（書きかけなら`None`。呼び手は前の値を使い続ける）。
     pub fn note(&self) -> Option<Note> {
         self.note.read()
     }
 }
 
-/// 状態の札つきの入れ物（seqlock。書き手は 1 人。読み手は待たない: 書きかけなら `None`）。
+/// 状態のタグつきのバッファ（seqlock。書き手は1人。読み手は待たない: 書きかけなら`None`）。
 pub struct NoteBox {
     seq: AtomicU32,
     words: [AtomicU32; NOTE_WORDS],
@@ -423,7 +435,7 @@ impl Default for NoteBox {
     }
 }
 
-/// ルーム名の札つきの入れ物（`NoteBox` と同じ seqlock）。ルーム名は本ログに書かない（`RoomBuf` の `Debug` も名を出さない）。
+/// ルーム名のタグつきのバッファ（`NoteBox`と同じseqlock）。ルーム名は本ログに書かない（`RoomBuf`の`Debug`も名を出さない）。
 pub struct RoomNameBox {
     seq: AtomicU32,
     words: [AtomicU32; ROOM_BUF_WORDS],
@@ -468,7 +480,7 @@ impl Default for RoomNameBox {
     }
 }
 
-/// プレイヤー名の札つきの入れ物（`RoomNameBox` と同じ seqlock）。
+/// プレイヤー名のタグつきのバッファ（`RoomNameBox`と同じseqlock）。
 pub struct PlayerNameBox {
     seq: AtomicU32,
     words: [AtomicU32; NAME_BUF_WORDS],
@@ -513,10 +525,10 @@ impl Default for PlayerNameBox {
     }
 }
 
-/// 一覧の入れ物のバージョンの下の桁に使う語の数: 状態と行数の 1 語 ＋ 行の語。
+/// 一覧のバッファのバージョンの下の桁に使うワードの数: 状態と行数の1ワード ＋ 行のワード。
 const WATCH_BOX_WORDS: usize = 1 + WATCH_ROWS_MAX * WATCH_ROW_WORDS;
 
-/// 観戦の「ランダムマッチ」の一覧の札つきの入れ物（`NoteBox` と同じ seqlock。書き手は 1 人）。読み手は待たない: 書きかけなら読まない。
+/// 観戦の「ランダムマッチ」の一覧のタグつきのバッファ（`NoteBox`と同じseqlock。書き手は1人）。読み手は待たない: 書きかけなら読まない。
 pub struct WatchListBox {
     seq: AtomicU32,
     words: [AtomicU32; WATCH_BOX_WORDS],
@@ -530,7 +542,7 @@ impl WatchListBox {
         }
     }
 
-    /// 偶数のバージョンは書き終えた状態。書くたびに 2 進む。
+    /// 偶数のバージョンは書き終えた状態。書くたびに2進む。
     pub fn version(&self) -> u32 {
         self.seq.load(Ordering::Acquire) & !1
     }
@@ -565,7 +577,7 @@ impl WatchListBox {
         st | ((n as u32) << 8)
     }
 
-    /// `seen` より新しい（偶数の）バージョンが書き終わっていれば `out` へ読んで true。読んでいる最中に書き手が動いたら false（`out` は呼び手が捨てる）。
+    /// `seen`より新しい（偶数の）バージョンが書き終わっていれば`out`へ読んでtrueを返す。読んでいる最中に書き手が動いたらfalseを返す（`out`は呼び手が捨てる）。
     pub fn read_newer(&self, out: &mut WatchSnapshot, seen: &mut u32) -> bool {
         let s1 = self.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 || s1 == *seen || s1 == 0 {
@@ -592,7 +604,7 @@ impl WatchListBox {
                 Some(r) => {
                     ok &= out.push(r);
                 }
-                // 書き手が途中の語（バージョンが変わる前の読み）。バージョンのチェックで捨てる。
+                // 書き手が書いている途中のワード（バージョンが変わる前の読み）。バージョンのチェックで捨てる。
                 None => ok = false,
             }
         }
@@ -612,7 +624,7 @@ impl Default for WatchListBox {
     }
 }
 
-/// 一覧から選んだ行 1 つの札つきの入れ物（`NoteBox` と同じ seqlock）。`None` を書くと空（行の語が全部 0 = 上限 0 は行として読めない）。
+/// 一覧から選んだ行1つのタグつきのバッファ（`NoteBox`と同じseqlock）。`None`を書くと空になる（行のワードが全部 0 = 上限0 は行として読めない）。
 pub struct WatchRowBox {
     seq: AtomicU32,
     words: [AtomicU32; WATCH_ROW_WORDS],
@@ -637,7 +649,7 @@ impl WatchRowBox {
         self.seq.store(s.wrapping_add(2), Ordering::Release);
     }
 
-    /// 読めたら `Some(設定された行 or 空)`。書きかけなら `None`。
+    /// 読み取れたら`Some(設定された行 or 空)`。書きかけなら`None`。
     pub fn read(&self) -> Option<Option<WatchRow>> {
         let s1 = self.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
@@ -663,24 +675,27 @@ impl Default for WatchRowBox {
 
 // ---- 描く行の盤 ----
 
-/// 盤の行の割り当て: メニューの行（`MENU_ROWS`）・左上の 2 行（警告のときは続きの 2 行も）・マッチ中の行。
+/// 盤の行の割り当て: メニューの行（`MENU_ROWS`）・左上の2行（警告のときは続きの2行も）・マッチ中の行。
 pub const ROW_TL0: usize = MENU_ROWS;
 pub const ROW_TL1: usize = MENU_ROWS + 1;
 pub const ROW_HUD: usize = MENU_ROWS + 2;
-/// 待っている間の 1 行（ルームで待つ・接続コードで待つ。`net_menu::corner_is_band`）。マッチ中の行と同じ置き場・文字で描く。
+/// 待っている間の1行（ルームで待つ・接続コードで待つ。`net_menu::corner_is_band`）。マッチ中の行と同じ置き場・文字で描く。
 pub const ROW_WAIT: usize = MENU_ROWS + 3;
-/// 試合中の名前の帯（上の枠の左に 1P、右に 2P）。
+/// 試合中の名前の帯（上の枠の左に1P、右に2P）。
 pub const ROW_NAME_L: usize = MENU_ROWS + 4;
 pub const ROW_NAME_R: usize = MENU_ROWS + 5;
-/// 左上の警告の 3〜5 行目（`net_menu::STALL_ROWS` = 5 行）。
+/// 左上の警告の3〜5行目（`net_menu::STALL_ROWS` = 5行）。
 pub const ROW_TL2: usize = MENU_ROWS + 6;
 pub const ROW_TL3: usize = MENU_ROWS + 7;
 pub const ROW_TL4: usize = MENU_ROWS + 8;
-/// 相手を待つ知らせの 1 行（`NetPlay::peer_wait_shown`）。左上の行の続きに描く。
+/// 相手を待つ知らせの1行（`NetPlay::peer_wait_shown`）。左上の行の続きに描く。
 pub const ROW_PEER_WAIT: usize = MENU_ROWS + 9;
-/// 接続している間の観戦コードの知らせ（対戦のホストへの案内と、Ctrl+C の結果）の 1 行。左上の行の続きに描く。
+/// 接続している間の観戦コードの知らせ（対戦のホストへの案内とCtrl+Cの結果）の1行。左上の行の続きに描く。
 pub const ROW_COPY: usize = MENU_ROWS + 10;
-pub const BOARD_ROWS: usize = MENU_ROWS + 11;
+/// 新しいバージョンの知らせの2行（`net_menu::update_notice_lines`）。マッチ終了時のメニューが出ている間は左上の行の続きに描く。
+pub const ROW_UPD0: usize = MENU_ROWS + 11;
+pub const ROW_UPD1: usize = MENU_ROWS + 12;
+pub const BOARD_ROWS: usize = MENU_ROWS + 13;
 pub const SHOW_MENU: u32 = 1;
 pub const SHOW_TL0: u32 = 2;
 pub const SHOW_TL1: u32 = 4;
@@ -689,14 +704,18 @@ pub const SHOW_HUD: u32 = 8;
 pub const SHOW_WAIT: u32 = 16;
 /// 試合中の名前の帯（`ROW_NAME_L` / `ROW_NAME_R`）。
 pub const SHOW_NAMES: u32 = 32;
-/// 左上の警告の 3〜5 行目（`ROW_TL2` / `ROW_TL3` / `ROW_TL4`）。
+/// 左上の警告の3〜5行目（`ROW_TL2` / `ROW_TL3` / `ROW_TL4`）。
 pub const SHOW_TL2: u32 = 64;
 pub const SHOW_TL3: u32 = 128;
 pub const SHOW_TL4: u32 = 256;
 pub const SHOW_PEER_WAIT: u32 = 512;
 /// 観戦コードの知らせ（`ROW_COPY`）。
 pub const SHOW_COPY: u32 = 1024;
-/// 左上の行の旗と行の組（上から順）。
+/// 新しいバージョンの知らせ（`ROW_UPD0` / `ROW_UPD1`）。
+pub const SHOW_UPD0: u32 = 2048;
+pub const SHOW_UPD1: u32 = 4096;
+const SHOW_UPDATE: u32 = SHOW_UPD0 | SHOW_UPD1;
+/// 左上の行のフラグと行のペア（上から順）。
 const TL_ROWS: [(u32, usize); STALL_ROWS] = [
     (SHOW_TL0, ROW_TL0),
     (SHOW_TL1, ROW_TL1),
@@ -704,21 +723,24 @@ const TL_ROWS: [(u32, usize); STALL_ROWS] = [
     (SHOW_TL3, ROW_TL3),
     (SHOW_TL4, ROW_TL4),
 ];
-/// マッチ中だけ出る旗（`hud` が決める。メニュー・左上の行の更新が残す側）。
+/// マッチ中だけ出るフラグ（`hud`が設定する。メニュー・左上の行の更新が残す側）。
 const SHOW_MATCH: u32 = SHOW_HUD | SHOW_NAMES;
-/// メニュー・左上の行の更新が消さずに残す旗（相手を待つ知らせは `peer_wait` だけが、観戦コードの知らせは `copy_tick` だけが決める）。
-const SHOW_KEPT: u32 = SHOW_MATCH | SHOW_PEER_WAIT | SHOW_COPY;
+/// メニュー・左上の行の更新が消さずに残すフラグ。
+/// 相手を待つ知らせは`peer_wait`だけが、観戦コードの知らせは`copy_tick`だけが、新しいバージョンの知らせは`update_tick`だけが決める。
+const SHOW_KEPT: u32 = SHOW_MATCH | SHOW_PEER_WAIT | SHOW_COPY | SHOW_UPDATE;
 
-/// 左上の行の置き場（画素。ゲームの上の枠の下から）。マッチ中の行の置き場と幅の上限は `ui_layout` の `HUD_*`。
+/// 左上の行の置き場（画素。ゲームの上の枠の下から）。マッチ中の行の置き場と幅の上限は`ui_layout`の`HUD_*`。
 const TL_X: u32 = 6;
 const TL_Y: u32 = 20;
 
-/// 描く行の盤。書き手は 1 つのスレッド（ゲームのスレッド）。読み手は描画の入口（同じスレッド）と検査。
+/// 描く行の盤。書き手は1つのスレッド（ゲームのスレッド）。読み手は描画の入口（同じスレッド）と検査。
 pub struct Board {
     rows: [TextBox; BOARD_ROWS],
     styles: [AtomicU32; BOARD_ROWS],
     show: AtomicU32,
     menu_len: AtomicU32,
+    /// マッチ中の通信の状態の行を右下に置く（`NetUi::hud`が`status_side`と自分のサイドから決める。観戦者は常に左下）。
+    hud_right: AtomicBool,
 }
 
 pub static BOARD: Board = Board::new();
@@ -730,6 +752,7 @@ impl Board {
             styles: [const { AtomicU32::new(0) }; BOARD_ROWS],
             show: AtomicU32::new(0),
             menu_len: AtomicU32::new(0),
+            hud_right: AtomicBool::new(false),
         }
     }
 
@@ -748,11 +771,19 @@ impl Board {
         self.show.load(Ordering::Acquire)
     }
 
+    pub fn set_hud_right(&self, right: bool) {
+        self.hud_right.store(right, Ordering::Release);
+    }
+
+    pub fn hud_right(&self) -> bool {
+        self.hud_right.load(Ordering::Acquire)
+    }
+
     pub fn set_menu_len(&self, n: usize) {
         self.menu_len.store(n as u32, Ordering::Release);
     }
 
-    /// 行 `i` を UTF-8 で `out` へ読む。書きかけ・範囲の外なら `None`（読み直して駄目なら、その行は描かない）。確保しない。
+    /// 行`i`をUTF-8で`out`へ読む。書きかけか範囲の外なら`None`（読み直しても駄目ならその行は描かない）。確保しない。
     fn read_row<'a>(
         &self,
         i: usize,
@@ -774,13 +805,15 @@ enum Band {
     TopLeft,
     /// 下の枠の左（マッチ中の通信の状態の行）。
     BottomLeft,
-    /// 上の枠の左（試合中の 1P の名前）・右（2P の名前。右寄せ）。
+    /// 下の枠の右（`status_side`で右に置いたマッチ中の通信の状態の行。右寄せ）。
+    BottomRight,
+    /// 上の枠の左（試合中の1Pの名前）・右（2Pの名前。右寄せ）。
     NameLeft,
     NameRight,
 }
 
-/// 盤を描く頂点を作り、1 まとまりずつ `emit` へ渡す（呼び手が 1 まとまりごとに `DrawPrimitiveUP` する）。戻りはまとまりの数。
-/// 見せるものが無ければ 0（何も読まない）。確保しない（頂点の配列と行のコピーはスタック）・パニックしない。
+/// 盤を描く頂点を作り、1まとまりずつ`emit`へ渡す（呼び手が1まとまりごとに`DrawPrimitiveUP`する）。戻り値はまとまりの数。
+/// 見せるものが無ければ0を返す（何も読まない）。確保しない（頂点の配列と行のコピーはスタック）・パニックしない。
 pub fn draw_board(
     board: &Board,
     spec: &AtlasSpec,
@@ -800,7 +833,7 @@ pub fn draw_board(
         let mut bufs = [[0u8; MAX_TEXT_UTF8]; MENU_ROWS];
         let mut rows: [Option<(usize, usize, RowStyle)>; MENU_ROWS] = [None; MENU_ROWS];
         let mut widest = 0u32;
-        // 行の上端（枠の文字の置き場から）。隙間の行は行の高さより低いので、前の行の高さを足していく。読めない行は 1 行分とみなす。
+        // 行の上端（枠の文字の置き場から）。隙間の行は行の高さより低いので前の行の高さを足していく。読み取れない行は1行分とみなす。
         let mut tops = [0u32; MENU_ROWS];
         let mut total = 0u32;
         for (i, buf) in bufs.iter_mut().enumerate().take(n) {
@@ -852,10 +885,12 @@ pub fn draw_board(
     let mut buf = [0u8; MAX_TEXT_UTF8];
     // 左上の行は出ているものを上から詰める（相手を待つ知らせは左上の行の続き）。
     let mut next_line = 0u32;
-    for (bit, row) in TL_ROWS
-        .into_iter()
-        .chain([(SHOW_PEER_WAIT, ROW_PEER_WAIT), (SHOW_COPY, ROW_COPY)])
-    {
+    for (bit, row) in TL_ROWS.into_iter().chain([
+        (SHOW_PEER_WAIT, ROW_PEER_WAIT),
+        (SHOW_COPY, ROW_COPY),
+        (SHOW_UPD0, ROW_UPD0),
+        (SHOW_UPD1, ROW_UPD1),
+    ]) {
         if show & bit == 0 {
             continue;
         }
@@ -891,17 +926,23 @@ pub fn draw_board(
             batches += 1;
         }
     }
-    // 上の枠・下の枠の帯（下地の半透明の黒 ＋ GDI の文字。1 まとまり）。文字はゲームの文字でなく GDI の文字（半角 7 画素。
-    // `push_text_plain`）: ゲームの文字の 9 画素送りでは 2 つ空けの形が収まらない。下地の幅も同じ数え方（`text_width_plain`）。
-    // 文字は中央のタイマー・fps の手前までしか描かない（行の語が長くなっても、重ならずに後ろが切れる）。
+    // 上の枠・下の枠の帯（下地の半透明の黒 ＋ GDIの文字。1まとまり）。
+    // 文字はゲームの文字でなくGDIの文字（半角7画素。`push_text_plain`）。
+    // ゲームの文字の9画素送りでは2つ空けの形が収まらない。下地の幅も同じ数え方（`text_width_plain`）。
+    // 文字は中央のタイマー・fpsの手前までしか描かない（行の文字が長くなっても重ならずに後ろが切れる）。
     //
-    // - 待っている間の行（`ROW_WAIT`）: 上の枠の左。試合中の帯が出ている間は出さない（同じ場所に名前の帯が来るので重なる。
-    //   待ちと接続は同時にならないが、重なって読めなくなるよりは試合中の帯を優先する）。
-    // - マッチ中の行（`ROW_HUD`。通信の状態）: **下の枠の左**。
-    // - 名前の帯（`ROW_NAME_L` / `ROW_NAME_R`）: 上の枠の左に 1P、右に 2P（右寄せ）。
+    // - 待っている間の行（`ROW_WAIT`）: 上の枠の左。試合中の帯が出ている間は出さない（同じ場所に名前の帯が来て重なるため）。
+    //   待ちと接続は同時にならないが、重なって読めなくなるよりは試合中の帯を優先する。
+    // - マッチ中の行（`ROW_HUD`。通信の状態）: 下の枠の左（`status_side`で右にしたときは右寄せで右。観戦者は左）。
+    // - 名前の帯（`ROW_NAME_L` / `ROW_NAME_R`）: 上の枠の左に1P、右に2P（右寄せ）。サイドの語だけサイドの色。
+    let hud_band = if board.hud_right() {
+        Band::BottomRight
+    } else {
+        Band::BottomLeft
+    };
     for (bit, row, band) in [
         (SHOW_WAIT, ROW_WAIT, Band::TopLeft),
-        (SHOW_HUD, ROW_HUD, Band::BottomLeft),
+        (SHOW_HUD, ROW_HUD, hud_band),
         (SHOW_NAMES, ROW_NAME_L, Band::NameLeft),
         (SHOW_NAMES, ROW_NAME_R, Band::NameRight),
     ] {
@@ -914,18 +955,18 @@ pub fn draw_board(
         if text.is_empty() {
             continue;
         }
-        // 置き場: 文字の左端 `edge_x`・帯の上端 `y`・文字を描ける幅の上限 `cap`。
+        // 置き場: 文字の左端`edge_x`・帯の上端`y`・文字を描ける幅の上限`cap`。
         let (edge_x, y, cap) = match band {
             Band::TopLeft => (HUD_X, 0, HUD_TEXT_MAX_W),
-            Band::BottomLeft => (
+            Band::BottomLeft | Band::BottomRight => (
                 lay::HUD_EDGE_X,
                 lay::hud_bottom_y(screen_h),
-                lay::HUD_BOTTOM_TEXT_MAX_W,
+                lay::hud_bottom_cap(screen_w, band == Band::BottomRight),
             ),
             Band::NameLeft | Band::NameRight => (lay::HUD_EDGE_X, 0, lay::HUD_NAME_MAX_W),
         };
         let max_w = cap.min(screen_w.saturating_sub(2 * edge_x));
-        // 小さい文字の行（観戦者の左下の行）は、文字の送りと枠の描き方が違う（`RowStyle::Small`）。
+        // 小さい文字の行（観戦者の左下の行）は文字の間隔と枠の描き方が違う（`RowStyle::Small`）。
         let small = style == RowStyle::Small;
         let w = if small {
             lay::text_width_small(spec, text)
@@ -933,10 +974,16 @@ pub fn draw_board(
             lay::text_width_plain(spec, text)
         }
         .min(max_w);
-        let x = if band == Band::NameRight {
+        let x = if matches!(band, Band::NameRight | Band::BottomRight) {
             lay::hud_right_text_x(screen_w, w)
         } else {
             edge_x
+        };
+        // 名前の帯はサイドの語（「1P」「2P」）だけサイドの色。名前は行の色のまま。
+        let accent = match band {
+            Band::NameLeft => name_band_label_range(Seat::P1, text).map(|r| (r, SEAT_COLOR_1P)),
+            Band::NameRight => name_band_label_range(Seat::P2, text).map(|r| (r, SEAT_COLOR_2P)),
+            _ => None,
         };
         let back = lay::push_rect(
             &mut verts,
@@ -945,7 +992,7 @@ pub fn draw_board(
             (x.saturating_sub(lay::PAD), y, w + 2 * lay::PAD, HUD_BAND_H),
             lay::COLOR_LINE_BACK,
         );
-        let (at, _) = if small {
+        let at = if small {
             lay::push_text_small(
                 &mut verts,
                 back,
@@ -955,14 +1002,15 @@ pub fn draw_board(
                 style.color(),
                 max_w,
             )
+            .0
         } else {
-            lay::push_text_plain(
+            push_banded(
                 &mut verts,
                 back,
                 spec,
                 (x, y + HUD_Y),
                 text,
-                style.color(),
+                (style.color(), accent),
                 max_w,
             )
         };
@@ -974,15 +1022,69 @@ pub fn draw_board(
     batches
 }
 
+/// 名前の帯のサイドの語の色（マッチ終了時のメニューの縁取りと同じ色。不透明）。
+const SEAT_COLOR_1P: u32 = 0xFF00_0000 | higanr_core::end_outline::RGB_1P;
+const SEAT_COLOR_2P: u32 = 0xFF00_0000 | higanr_core::end_outline::RGB_2P;
+
+/// 帯の文字`text`を左端`x`・枠の上端`y`から`out[at..]`へ書く（`push_text_plain`）。
+/// `accent`のバイトの範囲だけ別の色で書く。範囲が文字の境目でなければ全部ふつうの色で書く。
+/// 幅が`max_w`を越える文字は落とす（範囲をまたいで続けて数える）。戻り値は次の位置。
+fn push_banded(
+    out: &mut [Vertex],
+    at: usize,
+    spec: &AtlasSpec,
+    (x, y): (u32, u32),
+    text: &str,
+    (color, accent): (u32, Option<(core::ops::Range<usize>, u32)>),
+    max_w: u32,
+) -> usize {
+    let (lo, hi, accent_color) = match accent {
+        Some((r, c))
+            if r.start <= r.end
+                && text.is_char_boundary(r.start)
+                && text.is_char_boundary(r.end) =>
+        {
+            (r.start, r.end, c)
+        }
+        _ => (0, 0, color),
+    };
+    let mut at = at;
+    let mut used = 0u32;
+    for (part, c) in [
+        (text.get(..lo), color),
+        (text.get(lo..hi), accent_color),
+        (text.get(hi..), color),
+    ] {
+        let Some(part) = part.filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let (next, w) = lay::push_text_plain(
+            out,
+            at,
+            spec,
+            (x.saturating_add(used), y),
+            part,
+            c,
+            max_w.saturating_sub(used),
+        );
+        at = next;
+        used = used.saturating_add(w);
+        if w < lay::text_width_plain(spec, part) {
+            break;
+        }
+    }
+    at
+}
+
 // ---- ゲームのスレッドの側 ----
 
-/// ネットワーク（受信ソケット・STUN・見張り）の状態。`code_side = game` は、メニューの最初の操作（作る / 貼る）で初めて開く
-/// （「妖怪 対 妖怪」が選ばれない限り、ゲームの動作に何も影響しない）。
+/// ネットワーク（受信ソケット・STUN・監視スレッド）の状態。`code_side = game`ではメニューの最初の操作（作る / 貼る）で初めて開く。
+/// 「妖怪 対 妖怪」が選ばれない限りゲームの動作に何も影響しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetPhase {
     /// まだ開いていない。
     Closed,
-    /// 開いている最中（別のスレッドが受信ソケットを開き、STUN を問い合わせ、見張りを開始する）。
+    /// 開いている最中（別のスレッドが受信ソケットを開き、STUNを問い合わせ、監視スレッドを開始する）。
     Opening,
     /// 開いた（ネットワークのセッションを登録した）。
     Open,
@@ -991,43 +1093,45 @@ pub enum NetPhase {
 #[derive(Debug, Clone, Copy)]
 pub struct UiFacts {
     pub conn: Conn,
-    /// 自分の語を読む席（接続していれば自分の席、まだなら 1P。台本の語の取り方が席で変わる）。
+    /// 自分の入力ワードを読むサイド（接続していれば自分のサイド。まだなら1P。台本の入力ワードの取り方がサイドで変わる）。
     pub seat: Seat,
-    /// 今の UNIX 秒（待った時間と有効期限の残り）。
+    /// 今のUNIX秒（待った時間と有効期限の残り）。
     pub now: u64,
     pub net: NetPhase,
-    /// 接続の手順が時間切れで作り直されているとき（か、相手のコードを読んで両方が直接接続できない型と分かったとき）の材料
-    /// （`net_input` が `NetPlay::restarts`・`Net::own_nat`・`NetPlay::peer_nat` から作る）。あれば左上を、小さい 1 行でなく
-    /// ゲームの文字の警告（最大 5 行。`net_menu::stall_block`）にする。ネットワークを開いていない実行は `None`。
+    /// 左上に警告を出すための材料。
+    /// 接続の手順が時間切れで作り直されているとき（または相手のコードを読んで両方が直接接続できないネットワーク種別と分かったとき）に`net_input`が作る（`NetPlay::restarts`・`Net::own_nat`・`NetPlay::peer_nat`から）。
+    /// あれば左上を小さい1行でなくゲームの文字の警告（最大5行。`net_menu::stall_block`）にする。ネットワークを開いていない実行は`None`。
     pub stall: Option<Stall>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HudFacts {
-    /// 入力の遅れ（rollback なら今の D、delay 方式なら今の遅れ。どちらも、両者が Ctrl＋数字で変えて決まった値・要求している値があればそれ ——
-    /// `NetPlay::shown_delay`）。
+    /// 入力の遅れ（rollbackなら今のD。delay方式なら今の遅れ）。
+    /// どちらも、両者がCtrl＋数字で変えて決まった値か要求している値があればその値（`NetPlay::shown_delay`）。
     pub latency: Option<u8>,
     pub rtt_ms: Option<u32>,
-    /// rollback のとき、前の tick から今までに進め直した更新の数（`Rollback::stats` の差）。delay 方式なら `None`。
+    /// rollbackのときは前のtickから今までに進め直した更新の数（`Rollback::stats`の差）。delay方式なら`None`。
     pub rewound: Option<u32>,
-    /// 遅れの推奨値（`Connected::recommend_now`。RTT が測れていなければ `None`）。
+    /// 遅れの推奨値（`Connected::recommend_now`。RTTが測れていなければ`None`）。
     pub recommend: Option<u8>,
-    /// auto の旗（ホストは自分の旗、ゲストはホストの旗か自分の auto の要求 —— `Connected::shown_auto`）。立っていれば行の括弧の中は `A`。
+    /// autoのフラグ（ホストは自分のフラグ。ゲストはホストのフラグか自分のautoの要求 —— `Connected::shown_auto`）。立っていれば行の括弧の中は`A`。
     pub auto: bool,
-    /// キャラセレクト（画面 8）の行のとき、先頭に出す対戦の形式（`NetPlay::hud_facts` が選択の局面で `Some` にする）。マッチ中は `None`。
+    /// キャラセレクト（画面8）の行のとき先頭に出す対戦の形式（`NetPlay::hud_facts`が選択の局面で`Some`にする）。マッチ中は`None`。
     pub format: Option<Mode>,
-    /// キャラセレクトの行で、この組は rollback へ替えられない（片方が rollback ができない）。`format` が delay 方式のとき
-    /// 行の語が「delay only」になる（`net_menu::HudView::delay_only`）。
+    /// キャラセレクトの行で、この組み合わせはrollbackへ替えられない（片方がrollbackできない）。
+    /// `format`がdelay方式のときは行に「delay only」と出る（`net_menu::HudView::delay_only`）。
     pub delay_only: bool,
-    /// 試合中の両者の名前（HELLO で交換した名前を席に合わせて並べたもの）。接続していなければ `None`。
+    /// 試合中の両者の名前（HELLOで交換した名前をサイドに合わせて並べたもの）。接続していなければ`None`。
     pub names: Option<HudNames>,
+    /// 自分のサイド（接続していれば`Some`。通信の状態の行の置き場所`status_side`が使う）。
+    pub seat: Option<Seat>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WatchHudFacts {
-    /// 観戦しているマッチの 1P・2P の名前（観戦の流れの `Name` の記録を両席受けるまで `None` = 名前の帯だけ出さない）。
+    /// 観戦しているマッチの1P・2Pの名前（観戦の流れの`Name`の記録を両サイド分受けるまでは`None`。その間は名前の帯だけ出さない）。
     pub names: Option<HudNames>,
-    /// ホストが流した対戦する 2 人の間の状態（観戦の流れの `Stats` の記録の最新の値。まだ受けていなければ `None`）。
+    /// ホストが配信した対戦する2人の間の状態（観戦の流れの`Stats`の記録の最新の値。まだ受けていなければ`None`）。
     pub stats: Option<PeerStats>,
     /// 使う直前に溜まっていたマッチのフレームの数（直近の期間の最大）。
     pub delay_frames: u32,
@@ -1052,34 +1156,35 @@ impl HudNames {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UiOut {
-    /// `Some` なら、この UI がゲームの入力を握って feed を済ませた（呼び手はその action を返す）。`None` ならゲームの入力に触っていない。
+    /// `Some`ならこのUIがゲームの入力を占有してfeedを済ませた（呼び手はそのactionを返す）。`None`ならゲームの入力に触っていない。
     pub action: Option<Action>,
-    /// ネットワークを開く頼み（メニューの最初の「作る」「貼る」。呼び手が別のスレッドで開く。2 回目からは出ない）。
+    /// ネットワークを開く頼み（メニューの最初の「作る」「貼る」。呼び手が別のスレッドで開く。2回目からは出ない）。
     pub open_net: bool,
     /// 確認の枠で「はい」と答えた。呼び手が対戦を終える（BYE。抜ける側の取消）。
     pub leave: bool,
-    /// 自分が「妖怪 対 妖怪」を選んだ（接続した後・成立の前に選んだか、接続した瞬間に Match の画面でメニューを開いていた）。
-    /// 呼び手が READY を送る（`NetPlay::set_ready`。`higanr_core::match_gate`）。
+    /// 自分が「妖怪 対 妖怪」を選んだ（接続した後・成立の前に選んだか、接続した瞬間にMatchの画面でメニューを開いていた）。
+    /// 呼び手がREADYを送る（`NetPlay::set_ready`。`higanr_core::match_gate`）。
     pub ready: bool,
-    /// 観戦の「ルームマッチ」が決まった（この tick に `Cmd::Spectate` を見張りへ送った）。呼び手が観戦者のネットワークを開く仕事を頼む
-    /// （`script_win::request_spectate`）。対戦する側のネットワークは開かない（`open_net` は出ない。インターネット越しの観戦 v1）。
+    /// 観戦の「ルームマッチ」が決定した（このtickに`Cmd::Spectate`を監視スレッドへ送った）。
+    /// 呼び手が観戦者のネットワークを開く仕事を頼む（`script_win::request_spectate`）。
+    /// 対戦する側のネットワークは開かない（`open_net`は出ない。インターネット越しの観戦v1）。
     pub spectate_open: bool,
-    /// 戻り道（`return_flow`）が、終わりのメニューの「リプレイを保存して終了」で試合の場面を出るのを見た。呼び手が保存の画面を飛ばす
-    /// 印を立てる（`save_skip`）。
+    /// 戻り道（`return_flow`）が終わりのメニューの「リプレイを保存して終了」で試合の場面を出るのを見た。
+    /// 呼び手が保存の画面を飛ばす印を立てる（`save_skip`）。
     pub save_quit: bool,
-    /// LAN の項目が決まった（この tick に `Cmd::LanHost` / `Cmd::LanClient` / `Cmd::LanWatch` が出た）。呼び手が LAN の運び手のスレッドを作る
-    /// （`script_win::request_lan`）。対戦する側のネットワークはここでは開かない（`open_net` は出ない）。
+    /// LANの項目が決定した（このtickに`Cmd::LanHost` / `Cmd::LanClient` / `Cmd::LanWatch`が出た）。
+    /// 呼び手がLANの運び手のスレッドを作る（`script_win::request_lan`）。対戦する側のネットワークはここでは開かない（`open_net`は出ない）。
     pub lan: Option<LanAsk>,
 }
 
-/// LAN の項目で頼まれたこと。
+/// LANの項目で頼まれたこと。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanAsk {
     /// ホストとして待つ。
     Host,
-    /// 打ったアドレスのホストへ、対戦する側として参加を申し込む。
+    /// 打ったアドレスのホストへ対戦する側として参加を申し込む。
     Client(LanAddr),
-    /// 打ったアドレスのホストへ、観戦を申し込む。
+    /// 打ったアドレスのホストへ観戦を申し込む。
     Watch(LanAddr),
 }
 
@@ -1089,28 +1194,48 @@ struct Shown {
     style: RowStyle,
 }
 
-/// 自動の前進（接続した後、Match の画面を「人間 対 人間」まで進める）が押し・待つのに使える tick の上限（10 秒。60 fps）。上へ動かすのは最大 4 回と決定 1 回で、10 tick ほどで足りる。カーソルが動かないなど、進まないまま押し続けるのを止める歯止めで、超えたら前進をやめて人の語に戻る。
-/// 前進は接続したとき Match の画面にいた側だけで（画面を出たら終わり）、後から Match の画面へ来た側は動かさない。`code_side = game` の「つながったとき」は「成立したとき」（両者が「妖怪 対 妖怪」を選んだとき。`Conn::Connected` になった tick）。
-/// 選んだ側は成立まで Match の画面で待つ（`tick` の 4'）ので、成立した瞬間は両者とも Match の画面にいる。
+/// 自動の前進（接続した後にMatchの画面を「人間 対 人間」まで進める）が押し・待つのに使えるtickの上限（10秒。60 fps）。
+/// 上へ動かすのは最大4回と決定1回なので10 tickほどで足りる。
+/// カーソルが動かないなどで進まないまま押し続けるのを止める歯止め。超えたら前進をやめて人の入力ワードに戻る。
+/// 前進は接続したときMatchの画面にいた側だけが行う（画面を出たら終わり）。後からMatchの画面へ来た側は動かさない。
+/// `code_side = game`の「つながったとき」は「成立したとき」を指す（両者が「妖怪 対 妖怪」を選んだとき。`Conn::Connected`になったtick）。
+/// 「妖怪 対 妖怪」を選んだ側は成立までMatchの画面で待つ（`tick`の4'）ので成立した瞬間は両者ともMatchの画面にいる。
 const AUTO_MAX_TICKS: u32 = 600;
 
-/// 取消の語（X。確認の枠で「はい」と答えた後、ゲームへ 1 tick だけ通す）。
+/// 取消の入力ワード（X。確認の枠で「はい」と答えた後にゲームへ1 tickだけ通す）。
 const KEY_CANCEL: u16 = keys::X;
 
-/// 観戦コードのコピーの結果を左上に出す秒数（UNIX 秒の刻みなので 4〜5 秒）。
+/// 観戦コードのコピーの結果を左上に出す秒数（UNIX秒の単位なので4〜5秒）。
 const COPY_NOTICE_SECS: u64 = 5;
 
-/// Ctrl+C を頼んでから結果の出来事を待つ上限（秒）。見張りは 50 ms ごとに指示を取るので普段は 1 秒もかからない。
-/// 超えたら（見張りがまだ接続を見ていない等）結果を待つのをやめる。
+/// Ctrl+Cを頼んでから結果のイベントを待つ上限（秒）。監視スレッドは50 msごとに指示を取るので普段は1秒もかからない。
+/// 超えたら（監視スレッドがまだ接続を見ていない等）結果を待つのをやめる。
 const COPY_WAIT_SECS: u64 = 10;
 
-/// LAN のアドレスの入力が使う、自分の PC の VPN のネットワークの控えの仕事（製品は `vpn_snap`）。
+/// LANのアドレスの入力が使う仕事。自分のPCのVPNのネットワークのスナップショットを扱う（製品は`vpn_snap`）。
 #[derive(Clone, Copy)]
 pub struct VpnHooks {
-    /// 控えの更新を頼む（別のスレッドを作って返る）。
+    /// スナップショットの更新を頼む（別のスレッドを作って返る）。
     pub scan: fn(),
-    /// 控えを読む（確保しない）。
+    /// スナップショットを読む（確保しない）。
     pub read: fn() -> VpnSet,
+}
+
+/// 新しいバージョンの確認の仕事（本物は`update_check`。確保しない・待たない）。
+#[derive(Clone, Copy)]
+pub struct UpdateHooks {
+    /// 確認を頼む（別のスレッドが取る）。
+    pub ask: fn(),
+    /// 見つかった新しいバージョン（`Found::to_raw`。0は見つかっていない）。
+    pub found: fn() -> u32,
+}
+
+/// `update_tick`が前のtickに見た状態（きっかけは立ち上がりだけで拾う）。
+#[derive(Debug, Clone, Copy, Default)]
+struct UpdateSeen {
+    menu_open: bool,
+    linked: bool,
+    end_menu: bool,
 }
 
 pub struct NetUi {
@@ -1124,67 +1249,71 @@ pub struct NetUi {
     rewind: RewindWindow,
     /// 成立した後の自動の前進（`Some(経った tick)`）。
     auto: Option<u32>,
-    /// 前の tick に成立していた。成立した瞬間に自動の前進を始める。
+    /// 前のtickに成立していた。成立した瞬間に自動の前進を始める。
     was_connected: bool,
-    /// 前の tick に「つながったが成立の前」（`Conn::Found`）だった。接続した瞬間を見る（その瞬間にメニューを開いていた側は
+    /// 前のtickに「つながったが成立の前」（`Conn::Found`）だった。接続した瞬間を見る（その瞬間にメニューを開いていた側は
     /// 選んだものとする）。
     was_found: bool,
     prev_word: u16,
-    /// ネットワークの組を片づけた（`after_teardown`）ときの終わりの状態。ネットワークを閉じている間、左上の行にこれを出し続ける。
-    /// 入口のメニューを開いた・次のネットワークを開き始めたら消す。
+    /// ネットワーク一式を後始末した（`after_teardown`）ときの終わりの状態。ネットワークを閉じている間は左上の行にこれを出し続ける。
+    /// 入口のメニューを開くか次のネットワークを開き始めたら消す。
     ended: Option<Conn>,
-    /// 片づけたとき、見張りの状態の札（`Note::seq`）がこの値のままなら読まない（前の見張りの状態を、ワーカースレッドが消すまでの
-    /// 数 ms に読み戻さない）。
+    /// 後始末したとき、監視スレッドの状態のタグ（`Note::seq`）がこの値のままなら読まない。
+    /// 前の監視スレッドの状態をワーカースレッドが消すまでの数msに読み戻さないため。
     note_hold: Option<u32>,
-    /// 観戦者のセッションが設定されていて、ホストの流れを受け始めた（`WatchPlay` が `Selecting`）ので、画面 6 で自分のゲームを画面 7 まで
-    /// 自動で進める（`set_watch_advance`）。接続の状態は `Conn::Waiting` のまま（`Conn::Connected` にすると左上に
-    /// 「つながりました。あなたは 1P です」が出て、取消が対戦の確認の枠になる）。
+    /// 観戦者のセッションが設定されていてホストの流れを受け始めた（`WatchPlay`が`Selecting`）。
+    /// そのため画面6で自分のゲームを画面7まで自動で進める（`set_watch_advance`）。
+    /// 接続の状態は`Conn::Waiting`のまま（`Conn::Connected`にすると左上に「つながりました。あなたは 1P です」が出て取消が対戦の確認の枠になる）。
     watch_advance: bool,
-    /// メニューの場面で最後に読んだ画面の番号（`tick_inner` が毎 tick 書く）。左上の「つながりました」の行を画面 7（難易度）
-    /// までだけ出すための印（`publish_corner`）。
+    /// メニューの場面で最後に読んだ画面の番号（`tick_inner`が毎tick書く）。
+    /// 左上の「つながりました」の行を画面7（難易度）までだけ出すための目印（`publish_corner`）。
     menu_screen: Option<u32>,
-    /// ウィンドウから文字を貯めるゲートを開けている（ルーム名の入力の間だけ）。
+    /// ウィンドウから文字を貯めるゲートが開いている（ルーム名の入力の間だけ）。
     text_gate: bool,
-    /// いまの入力で、ゲートを開けようとした（開けられたかは `text_gate`。入力を出ると false に戻る）。
+    /// いまの入力でゲートを開けようとしたかどうか（開けられたかは`text_gate`。入力を出るとfalseに戻る）。
     text_gate_tried: bool,
     hud_names: Option<HudNames>,
+    /// マッチ中の通信の状態の行の置き場所の設定（iniの`[ui] status_side`）。
+    status_side: StatusSide,
+    /// 盤へ書いた置き場所（右下か）。変わったときだけ書く。
+    hud_right: bool,
     /// 観戦者の知らせの行に今出している知らせ（`watch_notice`）。
     watch_notice_shown: Option<WatchNotice>,
-    /// プレイヤー名を決めたとき（`Cmd::Name`）に呼ぶ、ini の `name` へ書く仕事（`ini_save::save_name`）。
+    /// プレイヤー名を決定したとき（`Cmd::Name`）に呼ぶiniの`name`へ書く仕事（`ini_save::save_name`）。
     /// ゲームのスレッドでファイルに書かないため、別のスレッドを作って書かせる。設定しなければ（検査）書かない。
     name_saver: Option<fn(NameBuf)>,
-    /// 設定の「ルーム名」を決めたとき（`Cmd::RoomSet`）に呼ぶ、ini の `room` へ書く仕事（`ini_save::save_room`。
-    /// `name_saver` と同じ作り）。設定しなければ（検査）書かない。
+    /// 設定の「ルーム名」を決定したとき（`Cmd::RoomSet`）に呼ぶiniの`room`へ書く仕事（`ini_save::save_room`。
+    /// `name_saver`と同じ作り）。設定しなければ（検査）書かない。
     room_saver: Option<fn(RoomBuf)>,
-    /// 言語を替えたとき（`Cmd::Lang`）に呼ぶ、今の言語を設定して ini へ書く仕事（`script_win::save_ui_lang`）。設定しなければ（検査）書かない。
+    /// 言語を替えたとき（`Cmd::Lang`）に呼ぶ仕事。今の言語を設定してiniへ書く（`script_win::save_ui_lang`）。設定しなければ（検査）書かない。
     lang_saver: Option<fn(Lang)>,
-    /// LAN のホストのアドレスを決めたとき（`Cmd::LanClient` / `Cmd::LanWatch`）に呼ぶ、ini の `lan_host` へ書く仕事（`ini_save::save_lan_host`）。
+    /// LANのホストのアドレスを決定したとき（`Cmd::LanClient` / `Cmd::LanWatch`）に呼ぶiniの`lan_host`へ書く仕事（`ini_save::save_lan_host`）。
     /// 設定しなければ（検査）書かない。
     lan_saver: Option<fn(LanAddr)>,
-    /// LAN のアドレスの入力に入ったとき呼ぶ、自分の PC の VPN のネットワークの控えを更新させる仕事（別のスレッドを作る）と、控えの読み
-    /// （`vpn_snap`）。設定しなければ（検査）VPN のアドレスは受けない。
+    /// 自分のPCのVPNのネットワークのスナップショットを更新させる仕事（LANのアドレスの入力に入ったときに呼ぶ。別のスレッドを作る）と、スナップショットの読み取り（`vpn_snap`）。
+    /// 設定しなければ（検査）VPNのアドレスは受けない。
     vpn_hooks: Option<VpnHooks>,
-    /// 前の tick に LAN のアドレスの入力の間だった（入った瞬間に控えの更新を頼む）。
+    /// 前のtickにLANのアドレスの入力の間だった（入った瞬間にスナップショットの更新を頼む）。
     vpn_editing: bool,
-    /// Ctrl+C（観戦コードのコピー）の押した瞬間の取り方。数字・Tab の取り方（`NetPlay` の持つもの）とは別に持つ（二重に `feed` しても
-    /// 取り合わないように）。
+    /// Ctrl+C（観戦コードのコピー）の押した瞬間の取り方。
+    /// 数字・Tabの取り方（`NetPlay`の持つもの）とは別に持つ。二重に`feed`しても取り合わないようにするため。
     copy_edge: DigitEdge,
-    /// 対戦のホストへの案内（「Ctrl+C で観戦コードをコピーできます。」）を出す実行か（ini の `[spectate] enable = 1`）。
+    /// 対戦のホストへの案内（「Ctrl+C で観戦コードをコピーできます。」）を出す実行かどうか（iniの`[spectate] enable = 1`）。
     copy_hint_on: bool,
-    /// コピーを頼んだ後、結果の出来事を待っている（頼んだ時点の `Note::seq` と、待つのをやめる UNIX 秒）。
+    /// コピーを頼んだ後に結果のイベントを待っている（頼んだ時点の`Note::seq`と待つのをやめるUNIX秒）。
     copy_wait: Option<(u32, u64)>,
-    /// 左上に出している結果の出来事と、消す UNIX 秒。
+    /// 左上に出している結果のイベントと消すUNIX秒。
     copy_shown: Option<(Event, u64)>,
-    /// 同期方式かディレイを替えたとき（`Cmd::Shape`）に呼ぶ、ini の `mode` と `delay` へ書く仕事（`ini_save::save_shape`）。設定しなければ（検査）書かない。
+    /// 同期方式かディレイを替えたとき（`Cmd::Shape`）に呼ぶiniの`mode`と`delay`へ書く仕事（`ini_save::save_shape`）。設定しなければ（検査）書かない。
     shape_saver: Option<fn(Pick, DelayChoice)>,
-    /// サイドを替えたとき（`Cmd::Seat`）に呼ぶ、ini の `host_seat` へ書く仕事（`ini_save::save_seat`）。設定しなければ（検査）書かない。
+    /// サイドを替えたとき（`Cmd::Seat`）に呼ぶiniの`host_seat`へ書く仕事（`ini_save::save_seat`）。設定しなければ（検査）書かない。
     seat_saver: Option<fn(SeatWish)>,
-    /// 観戦の「ランダムマッチ」の一覧の画面に入った（`true`）・出た（`false`）ときに呼ぶ、一覧の接続を開け閉めする仕事（`script_win`。
-    /// 開ける仕事はスレッドを作る。メニューの外では呼ばない）。設定しなければ（検査）一覧は届かない。
+    /// 観戦の「ランダムマッチ」の一覧の画面に入った（`true`）・出た（`false`）ときに呼ぶ、一覧の接続を開け閉めする仕事（`script_win`）。
+    /// 開ける仕事はスレッドを作る。メニューの外では呼ばない。設定しなければ（検査）一覧は届かない。
     watch_feed: Option<fn(bool)>,
-    /// いま一覧の画面で、一覧の接続を開けた。
+    /// いま一覧の画面で一覧の接続を開けた。
     watch_on: bool,
-    /// メニューが読む一覧。読み込み用の `watch_scratch` で書きかけでないことを検証してから、中身を入れ替える（確保しない。どちらも作るときに 1 回だけ確保）。
+    /// メニューが読む一覧。読み込み用の`watch_scratch`で書きかけでないことを検証してから中身を入れ替える（確保しない。どちらも作るときに1回だけ確保）。
     watch: Box<WatchSnapshot>,
     watch_scratch: Box<WatchSnapshot>,
     /// 読んだ一覧のバージョン（`UiLink::read_watch_list`）。
@@ -1193,15 +1322,24 @@ pub struct NetUi {
     ret_on: bool,
     /// 戻している途中。
     ret: Option<Flow>,
-    /// 戻した理由（左上の 1 行目）。入口のメニューを開く・次の相手と接続するまで出す。
+    /// 戻した理由（左上の1行目）。入口のメニューを開く・次の相手と接続するまで出す。
     lost: Option<Why>,
     /// 戻り始めに鳴らす音（別のスレッドを作って鳴らす仕事。`script_win`）。
     lost_chime: Option<fn()>,
-    /// 確認の枠で「抜ける」と答えた（その BYE(取消) では戻さない。ゲームが取消で自分で画面 6 へ戻る）。
+    /// 確認の枠で「抜ける」と答えた（そのBYE(取消)では戻さない。ゲームが取消で自分で画面6へ戻る）。
     left_by_menu: bool,
-    /// 戻り道の数え（始めた・着いた・やめた）が変わるたびに呼ぶ。本ログへ出す原子変数へコピーする仕事（`script_win`）。設定しなければ（検査）呼ばない。
+    /// 戻り道のカウント（始めた・着いた・やめた）が変わるたびに呼ぶ。本ログへ出すアトミック変数へコピーする仕事（`script_win`）。設定しなければ（検査）呼ばない。
     ret_log: Option<fn(&UiStats)>,
     stats: UiStats,
+    /// 新しいバージョンの確認（設定しない実行・検査は確認しない）。
+    update_hooks: Option<UpdateHooks>,
+    update_poll: Poll,
+    update_found: Found,
+    update_seen: UpdateSeen,
+    /// ローカルの人間 対 人間でキーボード2台を分けるステートマシン・iniの設定・`tick_inner`が最後に見た場面。
+    split: split_kb::Machine,
+    split_on: bool,
+    scene: split_kb::Scene,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1211,22 +1349,22 @@ pub struct UiStats {
     pub held_ticks: u32,
     pub orders_sent: u32,
     pub auto_presses: u32,
-    /// 自動の前進を始めた回数（成立した瞬間に 1 回。重複・遅れた READY で 2 度始めないことを検査が見る）。
+    /// 自動の前進を始めた回数（成立した瞬間に1回。重複・遅れたREADYで2度始めないことを検査が見る）。
     pub auto_starts: u32,
-    /// 確認の枠を開いた回数と、「はい」と答えた回数。
+    /// 確認の枠を開いた回数と「はい」と答えた回数。
     pub confirms: u32,
     pub leaves: u32,
-    /// 「妖怪 対 妖怪」を選んだ（READY を頼んだ）回数（接続した瞬間にメニューを開いていた分を含む）。
+    /// 「妖怪 対 妖怪」を選んだ（READYを頼んだ）回数（接続した瞬間にメニューを開いていた分を含む）。
     pub readies: u32,
-    /// ネットワークの組を片づけてメニューを「つなぐ前」へ戻した回数（再接続。`after_teardown`）。
+    /// ネットワーク一式を後始末してメニューを「つなぐ前」へ戻した回数（再接続。`after_teardown`）。
     pub teardowns: u32,
-    /// Ctrl+C で観戦コードのコピーを頼んだ回数（押した瞬間に 1 回。押しっぱなしでは増えない）。
+    /// Ctrl+Cで観戦コードのコピーを頼んだ回数（押した瞬間に1回。押しっぱなしでは増えない）。
     pub copy_asks: u32,
     /// 「妖怪 対 妖怪」へ戻し始めた回数・着いた回数・途中でやめた回数（`return_flow::Finish`）。
     pub returns: u32,
     pub return_arrived: u32,
     pub return_gave_up: u32,
-    /// 最後に途中でやめた理由（`GiveUp::encode`。0 はまだ無い）。
+    /// 最後に途中でやめた理由（`GiveUp::encode`。0はまだ無い）。
     pub return_why: u32,
 }
 
@@ -1252,6 +1390,8 @@ impl NetUi {
             text_gate: false,
             text_gate_tried: false,
             hud_names: None,
+            status_side: StatusSide::default(),
+            hud_right: false,
             watch_notice_shown: None,
             name_saver: None,
             room_saver: None,
@@ -1277,11 +1417,25 @@ impl NetUi {
             left_by_menu: false,
             ret_log: None,
             stats: UiStats::default(),
+            update_hooks: None,
+            update_poll: Poll::new(0),
+            update_found: Found::None,
+            update_seen: UpdateSeen::default(),
+            split: split_kb::Machine::new(),
+            split_on: false,
+            scene: split_kb::Scene::Other,
         }
     }
 
-    /// LAN のアドレスの入力の間だけ、自分の PC の VPN のネットワークをメニューへ渡す。入った tick に控えの更新を頼む（別のスレッド。
-    /// 入力に何秒もかかるので、打ち終わるまでに更新は済む）。入力の間でなければ何もしない。
+    /// 新しいバージョンの確認の仕事を設定する。`build_number`が0（開発用のビルド）なら確認の依頼は出さない。
+    pub fn with_update_check(mut self, hooks: Option<UpdateHooks>, build_number: u32) -> NetUi {
+        self.update_hooks = hooks;
+        self.update_poll = Poll::new(build_number);
+        self
+    }
+
+    /// LANのアドレスの入力の間だけ自分のPCのVPNのネットワークをメニューへ渡す。入ったtickにスナップショットの更新を頼む（別のスレッド）。
+    /// 入力に何秒もかかるので打ち終わるまでに更新は済む。入力の間でなければ何もしない。
     fn feed_vpn_nets(&mut self) {
         let editing = self.menu.wants_lan_addr();
         if let (true, Some(h)) = (editing, self.vpn_hooks) {
@@ -1299,7 +1453,7 @@ impl NetUi {
         self
     }
 
-    /// ホストの案内を出す実行にする（観戦のホスト `[spectate] enable = 1` のとき）。
+    /// ホストの案内を出す実行にする（観戦のホスト`[spectate] enable = 1`のとき）。
     pub fn with_spectate_hint(mut self, on: bool) -> NetUi {
         self.copy_hint_on = on;
         self
@@ -1315,8 +1469,8 @@ impl NetUi {
         self
     }
 
-    /// 「名前」の項目を追加する（`name` は今のプレイヤー名。ゲーム内のメニューの実行だけ）。`saver` は決めた名前を ini へ
-    /// 書く仕事（ゲームのスレッドでは書かない）。
+    /// 「名前」の項目を追加する（`name`は今のプレイヤー名。ゲーム内のメニューの実行だけ）。
+    /// `saver`は決定した名前をiniへ書く仕事（ゲームのスレッドでは書かない）。
     pub fn with_player_name(mut self, name: NameBuf, saver: Option<fn(NameBuf)>) -> NetUi {
         self.menu = self.menu.with_player_name(name);
         self.name_saver = saver;
@@ -1328,39 +1482,117 @@ impl NetUi {
         self
     }
 
-    /// LAN の「クライアント」「観戦」のアドレスの入力の初めの値（前回打ったアドレス）と、決めたときに ini へ書く仕事。
+    /// LANの「クライアント」「観戦」のアドレスの入力の初めの値（前回打ったアドレス）と、決定したときにiniへ書く仕事。
     pub fn with_lan_addr(mut self, addr: AddrBuf, saver: Option<fn(LanAddr)>) -> NetUi {
         self.menu = self.menu.with_lan_addr(addr);
         self.lan_saver = saver;
         self
     }
 
-    /// LAN のアドレスの入力が VPN のネットワークを引く仕事を設定する。
+    /// LANのアドレスの入力がVPNのネットワークを取得する仕事を設定する。
     pub fn with_vpn_hooks(mut self, hooks: Option<VpnHooks>) -> NetUi {
         self.vpn_hooks = hooks;
         self
     }
 
-    /// 「同期方式」「ディレイ」を替えたときに呼ぶ、ini へ書く仕事。
+    /// 「同期方式」「ディレイ」を替えたときに呼ぶiniへ書く仕事。
     pub fn with_shape_saver(mut self, saver: Option<fn(Pick, DelayChoice)>) -> NetUi {
         self.shape_saver = saver;
         self
     }
 
-    /// 「サイド」を替えたときに呼ぶ、ini へ書く仕事。
+    /// マッチ中の通信の状態の行を左右どちらに置くか。
+    pub fn with_status_side(mut self, side: StatusSide) -> NetUi {
+        self.status_side = side;
+        self
+    }
+
+    /// ローカルの人間 対 人間でキーボード2台を1P・2Pに分けるか（iniの`[input] split_keyboards`）。
+    pub fn with_split_keyboards(mut self, on: bool) -> NetUi {
+        self.split_on = on;
+        self
+    }
+
+    pub fn split_on(&self) -> bool {
+        self.split_on
+    }
+
+    /// キーボード2台の分け方を1 tick進める（メニューが入力を占有しないtickに`script_win::ui_only_tick`が呼ぶ）。
+    /// `Act::Pass`以外のときは、呼び手が`Hold`なら0を、`Feed`なら台ごとの入力ワードをfeedする。
+    /// 左上の案内の行はここで出す。
+    ///
+    /// 遅延の増分: 台ごとの押下の表の読み（分けていない間は押された台の集合と記録の後始末だけ）。
+    /// 聞く間と、使わないと決めて離すのを待つ間は素のpollの3本の読み。
+    /// 分けている間は読まず、割り当てた2台の入力ワードをfeedする（ゲームが`poll_all`で読む分の代わりで増えない）。
+    /// 分けている間は前面の問い合わせも加わる。
+    pub fn split_step<G: Game>(
+        &mut self,
+        game: &mut G,
+        table: &DeviceTable,
+        net: bool,
+    ) -> split_kb::Act {
+        let scene = self.scene;
+        if self.split_on && self.split.arming(scene) && !game.scripted_run() {
+            // 聞き始める前にDirectInputがAcquireをやり直して登録のウィンドウを作り直していないかを1回調べる。
+            crate::split_kb_win::refresh();
+        }
+        let mut f = split_kb::Facts {
+            enabled: self.split_on,
+            net,
+            scene,
+            snap: table.snap(self.split.wants_full(scene)),
+            ..split_kb::Facts::default()
+        };
+        if self.split.polls() && !game.scripted_run() {
+            let [a, b, c] = game.menu_words(Seat::P1);
+            f.game_word = a | b | c;
+        }
+        if self.split.is_active() {
+            f.gate = game.keys_gate();
+        }
+        if scene == split_kb::Scene::Match && self.split.is_engaged() {
+            f.replay = game.replaying();
+        }
+        let act = self.split.step(&f);
+        // イベントは詳細のログだけに1行ずつ（tickごとには起きない）。
+        if let Some(ev) = self.split.take_event() {
+            crate::split_kb_win::log_event(ev);
+        }
+        if let split_kb::Act::Hold(Some(prompt)) = act {
+            let (n, lines) = higanr_core::net_menu::split_ask_lines(prompt, self.menu.lang());
+            let mut mask = self.shown_mask & !(SHOW_TL0 | SHOW_TL1);
+            for ((row, bit), (text, style)) in [(ROW_TL0, SHOW_TL0), (ROW_TL1, SHOW_TL1)]
+                .into_iter()
+                .zip(lines)
+                .take(n)
+            {
+                self.put(row, text, style);
+                mask |= bit;
+            }
+            self.set_mask(mask);
+        }
+        act
+    }
+
+    #[cfg(test)]
+    pub fn split_phase(&self) -> split_kb::Phase {
+        self.split.phase()
+    }
+
+    /// 「サイド」を替えたときに呼ぶiniへ書く仕事。
     pub fn with_seat_saver(mut self, saver: Option<fn(SeatWish)>) -> NetUi {
         self.seat_saver = saver;
         self
     }
 
-    /// 画面の言語の初めの値と、「言語」の行で替えたときの仕事。
+    /// 画面の言語の初めの値と「言語」の行で替えたときの仕事。
     pub fn with_lang(mut self, lang: Lang, saver: Option<fn(Lang)>) -> NetUi {
         self.menu = self.menu.with_lang(lang);
         self.lang_saver = saver;
         self
     }
 
-    /// ini の読めない行を捨てたことを、メニューの下に出す。
+    /// iniの読み取れない行を捨てたことをメニューの下に出す。
     pub fn with_ini_notice(mut self, notice: Option<higanr_core::net_menu::IniNotice>) -> NetUi {
         self.menu = self.menu.with_ini_notice(notice);
         self
@@ -1371,21 +1603,22 @@ impl NetUi {
         self.menu.lang()
     }
 
-    /// 観戦者のセッションが設定されていて、ホストの流れを受けている間 true（`watch_input` が毎 tick 設定する）。真の間、接続した対戦する側と
-    /// 同じ自動の前進（画面 6 でカーソルを人間 対 人間まで上げて決定）がかかる。
+    /// 観戦者のセッションが設定されていてホストの流れを受けている間true（`watch_input`が毎tick設定する）。
+    /// 真の間は、接続した対戦する側と同じ自動の前進（画面6でカーソルを人間 対 人間まで上げて決定）がかかる。
     pub fn set_watch_advance(&mut self, on: bool) {
         self.watch_advance = on;
     }
 
-    /// 観戦者のセッションを手放した（ゲームのスレッド。確保しない）: 自動の前進の印を消す。前の見張りの状態は消さない（観戦の終わりの
-    /// 理由を左上に残す。観戦者の状態は見張り（`spectate_join`）が最後に書いたものが片づけの後も正しい）。
+    /// 観戦者のセッションを手放した（ゲームのスレッド。確保しない）: 自動の前進の印を消す。
+    /// 前の監視スレッドの状態は消さない（観戦の終わりの理由を左上に残す）。
+    /// 観戦者の状態は監視スレッド（`spectate_join`）が最後に書いたものが後始末の後も正しい。
     pub fn after_watch_teardown(&mut self) {
         self.watch_advance = false;
         self.auto = None;
         self.was_connected = false;
         self.was_found = false;
         self.ended = None;
-        // 観戦のマッチ中の帯（名前・通信の状態）を残さない（セッションを手放した後は `watch_hud` を呼ぶ者がいない）。
+        // 観戦のマッチ中の帯（名前・通信の状態）を残さない（セッションを手放した後は`watch_hud`を呼ぶ者がいない）。
         self.hud(false, HudFacts::default());
         self.watch_select_wait(false);
         self.copy_clear();
@@ -1396,12 +1629,14 @@ impl NetUi {
         &self.link
     }
 
-    /// ネットワークの組を片づけた（ゲームのスレッド。`script_win` がネットワークのセッションを手放した tick に 1 回。確保しない）: メニューを「つなぐ前」へ
-    /// 戻す。`last` は片づける直前の接続の状態（`NetPlay::ui_conn`）で、終わりの状態なら左上に出し続ける。
+    /// ネットワーク一式を後始末した（ゲームのスレッド。`script_win`がネットワークのセッションを手放したtickに1回。確保しない）。
+    /// メニューを「つなぐ前」へ戻す。
+    /// `last`は後始末する直前の接続の状態（`NetPlay::ui_conn`）で、終わりの状態なら左上に出し続ける。
     ///
-    /// メニューの開き具合（状態・カーソル・選んだ対戦の形）は変えない: 開いていれば、次の tick から「作る」「貼る」の項目に戻る
-    /// （開いたまま閉じると、押したままのキーをゲームが押した瞬間と読みうる）。前の見張りの状態は捨てて、ワーカースレッドが既定の
-    /// 状態を書くまで読み戻さない（`note_hold`）。成立・自動の前進の印は次の接続へ持ち越さない。
+    /// メニューの開き具合（状態・カーソル・選択中の対戦の形）は変えない。
+    /// 開いていれば次のtickから「作る」「貼る」の項目に戻る（開いたまま閉じると、押したままのキーをゲームが押した瞬間と読みうる）。
+    /// 前の監視スレッドの状態は捨てて、ワーカースレッドが既定の状態を書くまで読み戻さない（`note_hold`）。
+    /// 成立・自動の前進の印は次の接続へ持ち越さない。
     pub fn after_teardown(&mut self, last: Conn) {
         self.ended = last.is_end().then_some(last);
         self.note_hold = Some(self.note.seq);
@@ -1411,7 +1646,7 @@ impl NetUi {
         self.was_found = false;
         self.peer_wait(false);
         self.copy_clear();
-        // 戻り道（`ret`）と理由の行（`lost`）は片づけをまたいで続ける（片づけは終わりから 2 秒後で、場面を問わない）。
+        // 戻り道（`ret`）と理由の行（`lost`）は後始末をまたいで続ける（後始末は終わりから2秒後で場面を問わない）。
         self.left_by_menu = false;
         self.stats.teardowns = self.stats.teardowns.saturating_add(1);
     }
@@ -1455,7 +1690,7 @@ impl NetUi {
     fn refresh_note(&mut self) {
         if let Some(n) = self.link.note() {
             if self.note_hold == Some(n.seq) {
-                // 片づけた前の見張りの状態のまま（ワーカースレッドがまだ消していない）。
+                // 後始末した前の監視スレッドの状態のまま（ワーカースレッドがまだ消していない）。
                 return;
             }
             self.note_hold = None;
@@ -1501,7 +1736,7 @@ impl NetUi {
         self.set_mask(SHOW_MENU | hud);
     }
 
-    /// 「つながりました」の行を出してよい場面か（メニューの場面の画面 7 まで）。
+    /// 「つながりました」の行を出してよい場面かどうか（メニューの場面の画面7まで）。
     fn connected_line_shows(&self) -> bool {
         self.menu_screen
             .is_some_and(|s| s <= u32::from(SCREEN_DIFFICULTY))
@@ -1509,14 +1744,14 @@ impl NetUi {
 
     /// 左上の行を盤へ（メニューは閉じている）。
     ///
-    /// 「つながりました」（`Conn::Connected`）は画面 7（難易度）までだけ出す。画面 8 から先は名前の帯と左下の行が替わりに出る。
-    /// 待ち・見つかった・閉じた理由などの他の行は、画面によらず出す（別の知らせまで消さない）。
+    /// 「つながりました」（`Conn::Connected`）は画面7（難易度）までだけ出す。画面8から先は名前の帯と左下の行が替わりに出る。
+    /// 待ち・見つかった・閉じた理由などの他の行は画面によらず出す（別の知らせまで消さない）。
     fn publish_corner(&mut self, f: &UiFacts) {
         let conn = self.corner_conn(f);
         let mut lines = [LineBuf::new(); 2];
         let mut styles = [RowStyle::Normal; 2];
         let lang = self.menu.lang();
-        // 接続できないときの警告は最大 5 行。出す場面では `corner_lines` は 0 を返す。
+        // 接続できないときの警告は最大5行。出す場面では`corner_lines`は0を返す。
         let mut block = [LineBuf::new(); STALL_ROWS];
         let mut block_styles = [RowStyle::Normal; STALL_ROWS];
         let blocks = stall_block(
@@ -1552,7 +1787,7 @@ impl NetUi {
                 }
             }
         } else if n > 0 && corner_is_band(conn, &self.note, f.stall) {
-            // 待っている間の 1 行は、左上の 2 行の置き場でなくマッチ中の行と同じ置き場へ（`net_menu::corner_is_band`）。
+            // 待っている間の1行は左上の2行の置き場でなくマッチ中の行と同じ置き場へ置く（`net_menu::corner_is_band`）。
             self.put(ROW_WAIT, lines[0].as_str(), styles[0]);
             mask |= SHOW_WAIT;
         } else {
@@ -1574,10 +1809,11 @@ impl NetUi {
         }
     }
 
-    /// 場面がメニューでない（マッチ・読み込み）ときは、メニューを閉じ、左上の行を消す（マッチ中の行は `hud` が決める）。
+    /// 場面がメニューでない（マッチ・読み込み）ときはメニューを閉じて左上の行を消す（マッチ中の行は`hud`が決める）。
     /// ただし待っている間の行（`Conn::Waiting`）・見つかった行（`Conn::Found`）・成立しないまま閉じた理由の行（`Conn::Unmatched`）・相手のバージョン違いの行（`Conn::OtherVersion`）は、どの場面でも出す（別のモードで遊んでいる側が左上の行と音で知れるように）。
-    /// 位置は、見つかった・閉じた理由の行は上の枠の下の左上（`TL_Y`）、待っている間の 1 行はマッチ中の行と同じ上の枠の左（`ROW_WAIT`）。成立した行・終わった行はマッチの中では出さない。
-    /// 同期ズレでマッチを止めている間の 2 行（`Conn::Desynced`）はマッチの場面で出す唯一の終わりの行（止めたまま Esc を待つ間、画面に理由と次にすることを残す）。
+    /// 位置は次のとおり。見つかった行と閉じた理由の行は上の枠の下の左上（`TL_Y`）。待っている間の1行はマッチ中の行と同じ上の枠の左（`ROW_WAIT`）。
+    /// 成立した行・終わった行はマッチの中では出さない。
+    /// 同期ズレでマッチを止めている間の2行（`Conn::Desynced`）はマッチの場面で出す唯一の終わりの行（止めたままEscを待つ間は画面に理由と次にすることを残す）。
     fn leave_menu_scene(&mut self, f: &UiFacts) {
         self.menu.reset();
         self.auto = None;
@@ -1604,7 +1840,7 @@ impl NetUi {
         self.stats.readies = self.stats.readies.saturating_add(1);
     }
 
-    /// 0 を 3 本 feed して、この tick を終える（メニューか確認の枠か自動の前進の「何も押さない」）。
+    /// 0を3本feedしてこのtickを終える（メニュー・確認の枠・自動の前進のどれでも「何も押さない」）。
     fn hold<G: Game>(&mut self, game: &mut G, f: &UiFacts, mut out: UiOut) -> UiOut {
         Self::feed3(game, 0, 0);
         self.publish_state(f);
@@ -1612,28 +1848,101 @@ impl NetUi {
         out
     }
 
-    /// 入力の地点の先頭で 1 tick に 1 回呼ぶ。
+    /// 入力の地点の先頭で1 tickに1回呼ぶ。
     ///
-    /// 画面 6（Match）の間は、メニューの有無によらずこの UI がゲームの入力を握る（`Game::local_input` で語を読み、`feed` で流す）: 「妖怪 対 妖怪」の決定を**ゲームが読む前に**語から判定するため（ゲーム自身の poll に任せると、判定した語とゲームが後で読む語の間にキーが動きうる）。
-    /// 語は漏れると決めた tick だけ 0 に替え、それ以外は変えずに流す。接続した後は、画面 7（難易度）の取消も見張る（確認の枠）。画面 7 の取消でない tick は、読んだ語を `stash_local` に預けて `None` を返す（ネットの選択が同じ語を使う。台本・デバイスを二重に読まない）。
+    /// 画面6（Match）の間はメニューの有無によらずこのUIがゲームの入力を占有する（`Game::local_input`でワードを読み、`feed`で渡す）。
+    /// これは「妖怪 対 妖怪」の決定を**ゲームが読む前に**ワードから判定するため。
+    /// ゲーム自身のpollに任せると判定したワードとゲームが後で読むワードの間にキーが動きうる。
+    /// ゲームへ漏れると判定したtickだけワードを0に替え、それ以外は変えずに渡す。
+    /// 接続した後は画面7（難易度）の取消も監視する（確認の枠）。
+    /// 画面7の取消でないtickは読んだワードを`stash_local`に登録して`None`を返す（ネットの選択が同じワードを使うので台本・デバイスを二重に読まない）。
     ///
-    /// 対戦の成立（`Conn::Found` の間。`higanr_core::match_gate`）: 接続した瞬間に Match の画面で入口のメニューを開いていた側と、成立の前に「妖怪 対 妖怪」を選んだ側は「選んだ」になり（`UiOut::ready`）、Match の画面で入力を握って相手を待つ（取消は「対戦から抜けますか？」）。選んでいない側の入力には触らない（別のモードで遊べる。画面 7 も握らない）。
+    /// 対戦の成立（`Conn::Found`の間。`higanr_core::match_gate`）では、次の側が選択済み（`UiOut::ready`）になる。
+    /// 接続した瞬間にMatchの画面で入口のメニューを開いていた側と、成立の前に「妖怪 対 妖怪」を選んだ側。
+    /// 選択済みの側はMatchの画面で入力を占有して相手を待つ（キャンセルすると「対戦から抜けますか？」を出す）。
+    /// 選択済みでない側の入力には触らない（別のモードで遊べる。画面7も占有しない）。
     ///
-    /// ルーム名の入力の間は、ウィンドウから文字を貯めるゲートを開け（`Game::text_gate`。どの経路で tick を終えても通る）、貯まった文字を 1 tick に 1 回まとめて取ってメニューへ渡す（`Game::typed`）。入力の間もゲームへは 0 を 3 本 feed する（メニューがゲームの入力を握る）ので、打った文字のキーはゲームへ届かない。
+    /// ルーム名の入力の間はウィンドウから文字を貯めるゲートを開ける（`Game::text_gate`。どの経路でtickを終えても通る）。
+    /// 貯まった文字は1 tickに1回まとめて取ってメニューへ渡す（`Game::typed`）。
+    /// 入力の間もゲームへは0を3本feedする（メニューがゲームの入力を占有する）ので打った文字のキーはゲームへ届かない。
     pub fn tick<G: Game>(&mut self, game: &mut G, f: &UiFacts) -> UiOut {
         let out = self.tick_inner(game, f);
         self.sync_text_gate(game);
         self.sync_watch_feed();
         self.copy_tick(game, f.conn, f.now);
+        self.update_tick(game, f.conn, f.now);
         out
     }
 
-    /// 観戦コードのコピー（Ctrl+C）を 1 tick 進める。ゲームのスレッドで確保しない。入力を握る tick もマッチの中（rollback の間は `tick` が呼ばれないので `script_win::rb_scan_handler` からも）も毎 tick 呼ぶ。
+    /// 新しいバージョンの知らせを1 tick進める（`tick`から呼ぶ。`tick`が呼ばれないrollbackのマッチの間は`script_win::rb_scan_handler`が毎フレーム呼ぶ）。
+    /// ゲームのスレッドで確保しない・待たない（確認は別のスレッドへ頼むだけ。見つかったかどうかはアトミック変数1つの読み取り）。
     ///
-    /// 接続している間（`Conn::is_linked`: 見つかった・接続した）だけキーを読む（Ctrl+数字と同じ取り方: `Game::digit_keys`、押した瞬間だけ・Ctrl が押されている間だけ）。押した瞬間に見張りへ頼みを 1 回送る（ホストなら観戦コードがクリップボードへ入り、ゲストなら「ホストの画面で」の知らせが返る）。
-    /// 接続する前・台本の実行は本物のキーを読まない（台本の実行は段階の `copy=1` を押下にする）。結果の出来事（`Event::is_copy_result`）は左上に `COPY_NOTICE_SECS` 秒出す。ホストには、接続した直後の左上（「つながりました」の行と同じ間）に案内を出す（相手が観戦を許可していなければ、ホストにもゲストにも代わりにそれを出す）。
+    /// 確認を頼むきっかけは、メニューが開いた・接続が成立した・接続している間にマッチ終了時のメニューが出た（立ち上がりだけ）。
+    /// 確認の間隔と「見つかったら止まる」処理は`update_notice::Poll`。
+    /// 見つかった後はメニューの一番下（`Menu::set_update`）に出す。
+    /// 接続している間は、終わりのメニューが出ている間だけ左上（`ROW_UPD0` / `ROW_UPD1`）にも出す。
+    /// 遅延の増分: 設定の無い実行・開発用のビルドは何もしない。確認が要る間は、接続している間だけ終わりのメニューの印を1ワード読む。
+    pub fn update_tick<G: Game>(&mut self, game: &mut G, conn: Conn, now: u64) {
+        let Some(hooks) = self.update_hooks else {
+            return;
+        };
+        if !self.update_found.is_found() {
+            let found = Found::from_raw((hooks.found)());
+            if found.is_found() {
+                self.update_found = found;
+                self.update_poll.mark_found();
+                self.menu.set_update(found);
+            }
+        }
+        let linked = matches!(conn, Conn::Connected { .. });
+        let menu_open = self.menu.is_active();
+        let wants_end = self.update_poll.active() || self.update_found.is_found();
+        let end_menu = linked && wants_end && game.end_view().shown;
+        let seen = self.update_seen;
+        for (rose, trigger) in [
+            (menu_open && !seen.menu_open, Trigger::MenuOpened),
+            (linked && !seen.linked, Trigger::Connected),
+            (end_menu && !seen.end_menu, Trigger::EndMenu),
+        ] {
+            if rose && self.update_poll.due(trigger, now) {
+                (hooks.ask)();
+                break;
+            }
+        }
+        self.update_seen = UpdateSeen {
+            menu_open,
+            linked,
+            end_menu,
+        };
+        self.publish_update_rows(end_menu && !menu_open);
+    }
+
+    fn publish_update_rows(&mut self, show: bool) {
+        let mut mask = self.shown_mask & !SHOW_UPDATE;
+        let mut lines = [LineBuf::new(); UPDATE_NOTICE_LINES];
+        if show && update_notice_lines(self.update_found, self.menu.lang(), &mut lines) > 0 {
+            for ((line, row), bit) in lines
+                .iter()
+                .zip([ROW_UPD0, ROW_UPD1])
+                .zip([SHOW_UPD0, SHOW_UPD1])
+            {
+                self.put(row, line.as_str(), RowStyle::Notice);
+                mask |= bit;
+            }
+        }
+        self.set_mask(mask);
+    }
+
+    /// 観戦コードのコピー（Ctrl+C）を1 tick進める。ゲームのスレッドで確保しない。
+    /// 入力を占有するtickもマッチの中も毎tick呼ぶ（rollbackの間は`tick`が呼ばれないので`script_win::rb_scan_handler`からも呼ぶ）。
     ///
-    /// 遅延の増分: 接続している間は `digit_keys` の読み 1 回（同じ tick に Ctrl+数字の読みが同じ `NetGame` で済んでいれば足さない）。
+    /// 接続している間（`Conn::is_linked`: 見つかった・接続した）だけキーを読む。取り方はCtrl+数字と同じ（`Game::digit_keys`。押した瞬間だけ・Ctrlが押されている間だけ読む）。
+    /// 押した瞬間に監視の処理へ依頼を1回送る（ホストなら観戦コードがクリップボードへ入り、ゲストなら「ホストの画面で」という知らせが返る）。
+    /// 接続する前・台本の実行は本物のキーを読まない（台本の実行では段階の`copy=1`を押下とみなす）。
+    /// 結果のイベント（`Event::is_copy_result`）は左上に`COPY_NOTICE_SECS`秒出す。
+    /// ホストには接続した直後の左上（「つながりました」の行と同じ間）に案内を出す（相手が観戦を許可していないときは、ホストにもゲストにも案内の代わりにその旨を出す）。
+    ///
+    /// 遅延の増分: 接続している間は`digit_keys`を1回読む（同じtickにCtrl+数字の読み取りが同じ`NetGame`で済んでいれば足さない）。
     pub fn copy_tick<G: Game>(&mut self, game: &mut G, conn: Conn, now: u64) {
         let linked = conn.is_linked();
         let held = if linked && !game.scripted_run() {
@@ -1642,7 +1951,7 @@ impl NetUi {
             None
         };
         let pressed = self.copy_edge.feed(held);
-        // 台本の実行は本物のキーを読まない代わりに、段階の `copy=1` を押下にする（実機の検証で人のクリップボードを使わず、`clipboard = file` の置き場へ書かせる）。
+        // 台本の実行は本物のキーを読まない代わりに段階の`copy=1`を押下とみなす（実機の検証で人のクリップボードを使わず`clipboard = file`の置き場へ書かせる）。
         let scripted = linked && game.scripted_run() && game.copy_script();
         if digit_keys::copy_pressed(pressed) || scripted {
             let seq = self.link.note().map_or(0, |n| n.seq);
@@ -1695,8 +2004,9 @@ impl NetUi {
         }
     }
 
-    /// 一覧の接続を、メニューが一覧の画面か（`Menu::wants_watch_list`）に合わせる。どの経路でメニューが一覧の画面を出ても（取消・
-    /// 行を選ぶ・接続する・画面が替わる）ここで閉じる。入る tick に開け、出る tick に閉じる（開ける仕事はスレッドを作る。人が操作した tick の 1 回だけ）。
+    /// 一覧の接続をメニューが一覧の画面かどうか（`Menu::wants_watch_list`）に合わせる。
+    /// 一覧の画面を出る経路（キャンセル・行を選ぶ・接続する・画面が替わる）はどれでも、ここで接続を閉じる。
+    /// 入るtickに開け、出るtickに閉じる（開ける仕事はスレッドを作る。人が操作したtickの1回だけ）。
     fn sync_watch_feed(&mut self) {
         let want = self.menu.wants_watch_list();
         if want == self.watch_on {
@@ -1705,7 +2015,7 @@ impl NetUi {
         self.watch_on = want;
         self.watch.set(ListStatus::Loading, &[]);
         if want {
-            // 前に開いたときの一覧が入れ物に残っていても、これから書かれるものだけを読む。
+            // 前に開いたときの一覧がバッファに残っていてもこれから書かれるものだけを読む。
             self.watch_seen = self.link.watch_list_version();
         }
         if let Some(feed) = self.watch_feed {
@@ -1713,7 +2023,7 @@ impl NetUi {
         }
     }
 
-    /// 一覧の画面の間、接続のスレッドが書いた新しい一覧を読んでメニューへ渡す。
+    /// 一覧の画面の間は接続のスレッドが書いた新しい一覧を読んでメニューへ渡す。
     fn refresh_watch(&mut self) {
         if self.watch_on
             && self
@@ -1724,9 +2034,10 @@ impl NetUi {
         }
     }
 
-    /// ウィンドウから文字を貯めるゲートを、メニューが文字を欲しがっているか（`Menu::wants_text`）に合わせる。開けられなかったら（ウィンドウへ文字を受ける
-    /// 仕組みが設定できない）メニューへ知らせ、入力の画面に断りの行を出させる。開けようとするのは入力 1 回につき 1 回だけ
-    /// （`text_gate_tried`）: ウィンドウが見つからなかったときの探し直しはウィンドウを数え上げる重い呼び出しなので、毎 tick やらない。
+    /// ウィンドウから文字を貯めるゲートをメニューが文字を欲しがっているかどうか（`Menu::wants_text`）に合わせる。
+    /// 開けられなかったとき（ウィンドウへ文字を受ける仕組みを設定できない）はメニューへ知らせて、入力の画面に断りの行を出させる。
+    /// 開けようとするのは入力1回につき1回だけ（`text_gate_tried`）。
+    /// ウィンドウが見つからなかったときの探し直しは、ウィンドウを列挙する重い呼び出しなので毎tickはやらない。
     fn sync_text_gate<G: Game>(&mut self, game: &mut G) {
         let want = self.menu.wants_text();
         if !want {
@@ -1749,7 +2060,7 @@ impl NetUi {
     fn tick_inner<G: Game>(&mut self, game: &mut G, f: &UiFacts) -> UiOut {
         self.refresh_note();
         self.refresh_watch();
-        // 片づけた後の終わりの行は、人が入口のメニューを開いた・次のネットワークを開き始めたら役目を終える。
+        // 後始末した後の終わりの行は、人が入口のメニューを開いたか次のネットワークを開き始めたら役目を終える。
         if f.net != NetPhase::Closed || self.menu.is_active() {
             self.ended = None;
         }
@@ -1760,26 +2071,43 @@ impl NetUi {
         let found_edge = found && !self.was_found;
         self.was_found = found;
         let (cur, next) = game.scenes();
-        // 場面 2 への切替の tick は MainMenu が片付けられうるので読まない（`Game::menu_view`）。
+        // 場面2への切替のtickはMainMenuが取り除かれうるので読まない（`Game::menu_view`）。
         if cur != SCENE_MENU || next == SCENE_MATCH {
+            self.scene = if cur == SCENE_MATCH || next == SCENE_MATCH {
+                split_kb::Scene::Match
+            } else {
+                split_kb::Scene::Other
+            };
             self.leave_menu_scene(f);
             return UiOut::default();
         }
         let Some(v) = game.menu_view() else {
+            self.scene = split_kb::Scene::Other;
             self.leave_menu_scene(f);
             return UiOut::default();
         };
+        self.scene = split_kb::Scene::Menu {
+            screen: v.screen,
+            select_kind: v.select_kind,
+            accepting: higanr_core::menu_model::reads_presses(v.sub, v.trans),
+        };
+        // 画面6はメニューが入力を占有して`split_step`が呼ばれないので、画面の遷移はここで毎tick記録する。
+        // 割り当てを解除したイベントは`split_step`を通らないtickでも取りこぼさないよう、ここで取り出して書く。
+        self.split.observe(self.scene);
+        if let Some(ev) = self.split.take_event() {
+            crate::split_kb_win::log_event(ev);
+        }
         self.menu_screen = Some(v.screen);
         let connected = matches!(f.conn, Conn::Connected { .. });
-        // 自動の前進をかける間: 成立した対戦する側、か、ホストの流れを受けている観戦者（`watch_advance`）。取消の確認の枠・難易度の画面を
-        // 握る判断は `connected`（対戦する側）のまま。
+        // 自動の前進をかける間は次のどちらか: 成立した対戦する側・ホストの流れを受けている観戦者（`watch_advance`）。
+        // 取消の確認の枠・難易度の画面を占有するかどうかの判断は`connected`（対戦する側）のまま。
         let advancing = connected || self.watch_advance;
         let parked = matches!(f.conn, Conn::Found { ready: true, .. });
         if advancing && !self.was_connected {
             self.auto = Some(0);
             self.stats.auto_starts = self.stats.auto_starts.saturating_add(1);
-            // 観戦者: 観戦の「ルームマッチ」を決めたメニューは開いたまま（待ちの項目）なので、ホストの流れを受け始めたら閉じる。開いたままだと
-            // 下の 1. でメニューが入力を握り、3. の自動の前進が走らず、観戦者のゲームが画面 6 に留まる。
+            // 観戦者: 観戦の「ルームマッチ」を決定したメニューは待ちの項目で開いたままなので、ホストの流れを受け始めたら閉じる。
+            // 開いたままだと下の1. でメニューが入力を占有して3. の自動の前進が走らず、観戦者のゲームが画面6に留まる。
             if self.watch_advance && !connected && self.menu.is_active() {
                 self.menu.reset();
             }
@@ -1788,7 +2116,7 @@ impl NetUi {
             self.auto = None;
         }
         self.was_connected = advancing;
-        // 自動の前進は Match の画面の中だけ。画面を出た（難易度の画面へ進んだ・タイトルなどへ移った）ら終わり。
+        // 自動の前進はMatchの画面の中だけ。画面を出た（難易度の画面へ進んだ・タイトルなどへ移った）ら終わり。
         if v.screen != SCREEN_MATCH_MODE {
             self.auto = None;
         }
@@ -1806,8 +2134,8 @@ impl NetUi {
             return UiOut::default();
         }
         self.stats.held_ticks = self.stats.held_ticks.saturating_add(1);
-        // 画面 6 は 3 本とも自分で読んで流す（`Game::menu_words`。ゲームは `[2]` だけを読むので、2P のパッドも入る席 2 の語で決める）。
-        // 画面 7 は今までどおり自分の席の 1 語で、ネットの選択へ預ける（`stash_local`）。
+        // 画面6は3本とも自分で読んで渡す（`Game::menu_words`）。ゲームは`[2]`だけを読むので2Pのパッドも入る[2]のワードで判定する。
+        // 画面7は今までどおり自分のサイドの1ワードをネットの選択へ登録する（`stash_local`）。
         let on_match = v.screen == SCREEN_MATCH_MODE;
         let devs: [u16; 3] = if on_match {
             game.menu_words(f.seat)
@@ -1825,8 +2153,8 @@ impl NetUi {
             trans: v.trans,
             cursor: v.cursor,
         };
-        // 0. 接続した瞬間に Match の画面で入口のメニューを開いていた側は、選んだものとする。メニューを閉じていた・別の画面にいた側は
-        //    選んでいない（左上の行と音で知り、自分で選ぶ）。
+        // 0. 接続した瞬間にMatchの画面で入口のメニューを開いていた側は選択済みにする。
+        //    メニューを閉じていた側と別の画面にいた側は未選択のままにする（左上の行と音で知らせ、自分で選ばせる）。
         if found_edge && on_match && self.menu.is_open() && !parked {
             self.choose(&mut out);
         }
@@ -1848,13 +2176,13 @@ impl NetUi {
             );
             if let Some(c) = o.cmd {
                 self.link.send(c);
-                // 名前は見張りへの指示ではない（入れ物に書いただけ）ので数えない。ini へは別のスレッドが書く（人が名前を決めた tick に 1 回）。
+                // 名前は監視の処理への指示ではない（バッファに書いただけ）ので数えない。iniへは別のスレッドが書く（人が名前を決定したtickに1回）。
                 if let Cmd::Name(n) = c {
                     if let Some(save) = self.name_saver {
                         save(n);
                     }
                 } else if let Cmd::RoomSet(n) = c {
-                    // 設定で名を決めただけでも、使った名として覚える（指示ではないので数えない）。
+                    // 設定で名を決定しただけでも使った名として覚える（指示ではないので数えない）。
                     if let Some(save) = self.room_saver {
                         save(n);
                     }
@@ -1863,7 +2191,7 @@ impl NetUi {
                         save(l);
                     }
                 } else if let Cmd::LanClient(a) | Cmd::LanWatch(a) = c {
-                    // 決めたアドレスを使った値として覚える（指示のリングバッファは通らないので数えない）。
+                    // 決定したアドレスを使った値として覚える（指示のリングバッファは通らないので数えない）。
                     if let Some(save) = self.lan_saver {
                         save(a);
                     }
@@ -1876,7 +2204,7 @@ impl NetUi {
                     Cmd::LanWatch(a) => Some(LanAsk::Watch(a)),
                     _ => None,
                 };
-                // 替えた設定は ini の該当の行へ書く（指示は指示として数える）。
+                // 替えた設定はiniの該当の行へ書く（指示は指示として数える）。
                 match c {
                     Cmd::Shape(pick, delay) => {
                         if let Some(save) = self.shape_saver {
@@ -1913,15 +2241,15 @@ impl NetUi {
                 return self.hold(game, f, out);
             }
         }
-        // 2. 確認の枠で「はい」と答えた後の取消を、閉じ終えた次の tick に 1 回だけゲームへ通す。
+        // 2. 確認の枠で「はい」と答えた後の取消を、閉じ終えた次のtickに1回だけゲームへ通す。
         if self.menu.take_pending_cancel() {
             Self::feed3(game, KEY_CANCEL, 0);
             self.publish_state(f);
             out.action = Some(Action::Menu);
             return out;
         }
-        // 3. 自動の前進（成立した後、Match の画面を「人間 対 人間」まで進める）。使うのは `AUTO_MAX_TICKS` tick まで
-        //    （進まないまま押し続けないための歯止め。超えたら前進をやめる）。
+        // 3. 自動の前進（成立した後にMatchの画面を「人間 対 人間」まで進める）。
+        //    使うのは`AUTO_MAX_TICKS` tickまで（進まないまま押し続けないための上限。超えたら前進をやめる）。
         if on_match
             && advancing
             && let Some(n) = self.auto
@@ -1943,25 +2271,27 @@ impl NetUi {
                 }
             }
         }
-        // 4. 成立した後の、難易度の画面より前へ戻る取消（Match の画面から、難易度の画面から）と、選んで相手を待っている間の
-        //    Match の画面の取消: 飲み込んで確認の枠を出す（選んだのを取り消す経路は「抜ける」だけ —— `match_gate` の「単調」）。
+        // 4. 次のキャンセルはゲームへ渡さず飲み込んで確認の枠を出す。
+        //    ・成立した後に難易度の画面より前へ戻るキャンセル（Matchの画面から・難易度の画面から）
+        //    ・選択済みで相手を待っている間のMatchの画面のキャンセル
+        //    選択を取り消す経路は「抜ける」だけ（`match_gate`の「単調」）。
         if (connected || (parked && on_match)) && cancel_edge {
             self.menu.open_confirm(word);
             self.stats.confirms = self.stats.confirms.saturating_add(1);
             return self.hold(game, f, out);
         }
-        // 4'. 選んで相手を待っている間の Match の画面は、何も押さない（カーソルを動かして別の項目を決めない。成立したら自動の
-        //     前進が Match の画面から進める）。
+        // 4'. 選択済みで相手を待っている間のMatchの画面は何も押さない（カーソルを動かして別の項目を決定しない）。
+        //     成立したら自動の前進がMatchの画面から進める。
         if parked && on_match {
             return self.hold(game, f, out);
         }
-        // 5. Match の画面: 入口。決めるのはゲームが読む `[2]` の語（`devs[2]`）。漏れると決めた tick は 3 本とも 0。それ以外は
-        //    `poll_all` と同じ 3 本（1P・2P の機器の語と合成）をそのまま流す。
+        // 5. Matchの画面（入口）: 「妖怪 対 妖怪」の決定の判定に使うのはゲームが読む`[2]`のワード（`devs[2]`）。
+        //    ゲームへ漏れると判定したtickは3本とも0を渡す。それ以外は`poll_all`と同じ3本（1P・2Pの機器のワードと合成）をそのまま渡す。
         if on_match {
             let im2: InputState = game.input_state(2);
             if ui_entry::leaks(&ev, &im2, word) {
                 if found {
-                    // 接続した後・成立の前: 「妖怪 対 妖怪」を選んだ（メニューは開かない。接続した後のメニューには項目が無い）。
+                    // 接続した後・成立の前: 「妖怪 対 妖怪」を選択済みにする（メニューは開かない。接続した後のメニューには項目が無い）。
                     self.choose(&mut out);
                     self.stats.intercepts = self.stats.intercepts.saturating_add(1);
                     return self.hold(game, f, out);
@@ -2011,11 +2341,20 @@ impl NetUi {
             },
         );
         self.put(ROW_HUD, line.as_str(), RowStyle::Normal);
+        self.set_hud_right(self.status_side.on_right(h.seat.unwrap_or(Seat::P1)));
         self.show_match_rows(h.names);
     }
 
-    /// 観戦者のマッチ中の表示を更新する（フレームごと。`on` が偽なら消す）。対戦する側の `hud` と同じ置き場・同じ見た目で、名前の帯と
-    /// 左下の通信の状態の行（`watch_hud_line`）を出す。値が変わったときだけ盤へ書く。
+    /// 通信の状態の行の置き場所を盤へ書く（変わったときだけ）。
+    fn set_hud_right(&mut self, right: bool) {
+        if right != self.hud_right {
+            self.board.set_hud_right(right);
+            self.hud_right = right;
+        }
+    }
+
+    /// 観戦者のマッチ中の表示を更新する（フレームごと。`on`が偽なら消す）。
+    /// 対戦する側の`hud`と同じ置き場・同じ見た目で、名前の帯と左下の通信の状態の行（`watch_hud_line`）を出す。値が変わったときだけ盤へ書く。
     pub fn watch_hud(&mut self, on: bool, w: WatchHudFacts) {
         if !on {
             self.hud(false, HudFacts::default());
@@ -2032,21 +2371,22 @@ impl NetUi {
             },
         );
         self.put(ROW_HUD, line.as_str(), RowStyle::Small);
+        self.set_hud_right(false);
         self.show_match_rows(w.names);
     }
 
-    /// 相手を待つ知らせの 1 行を出す・消す（tick ごと）。変わった tick だけ盤へ書く（ふだんの増分は比べ 1 回）。
+    /// 相手を待つ知らせの1行を出す・消す（tickごと）。変わったtickだけ盤へ書く（ふだんの増分は比較1回）。
     pub fn peer_wait(&mut self, on: bool) {
         self.wait_notice(on, T_PEER_WAIT, RowStyle::Warn);
     }
 
-    /// 観戦者が次のキャラ選択まで映らない間の知らせ（`watch_notice` の 1 つ）。
+    /// 観戦者が次のキャラ選択まで映らない間の知らせ（`watch_notice`の1つ）。
     pub fn watch_select_wait(&mut self, on: bool) {
         self.watch_notice(on.then_some(WatchNotice::NextSelect));
     }
 
-    /// 観戦者の知らせの 1 行を出す・替える・消す（tick ごと。`peer_wait` と同じ置き場。観戦者のセッションでは `peer_wait` は呼ばれない）。
-    /// 変わった tick だけ盤へ書く。
+    /// 観戦者の知らせの1行を出す・替える・消す（tickごと。`peer_wait`と同じ置き場。観戦者のセッションでは`peer_wait`は呼ばれない）。
+    /// 変わったtickだけ盤へ書く。
     pub fn watch_notice(&mut self, n: Option<WatchNotice>) {
         if n == self.watch_notice_shown && (n.is_some() == (self.shown_mask & SHOW_PEER_WAIT != 0))
         {
@@ -2100,13 +2440,13 @@ impl NetUi {
     }
 }
 
-// ---- 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す（判断は `higanr_core::return_flow`）----
+// ---- 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す（判断は`higanr_core::return_flow`）----
 //
-// 始めるのは `net_input` が `NetPlay::take_lost` で理由を受けた tick。以後は場面を問わず `tick_inner` の先頭で 1 tick に 1 回進め、
-// ネットワークの組を片づけた後（`ui_only_step`）も続ける。ゲームのメモリには書かず、入力の語だけを作る。接続している試合の tick には
-// `ret` の有無の比べ 1 回しか足さない。
+// 始まるのは`net_input`が`NetPlay::take_lost`で理由を受けたtick。以後は場面を問わず`tick_inner`の先頭で1 tickに1回進める。
+// ネットワークのセッションを後始末した後（`ui_only_step`）も続ける。ゲームのメモリには書かず、入力のワードだけを作る。
+// 接続している試合のtickに足す処理は、`ret`があるかどうかの比較1回だけ。
 
-/// 戻り道が読む人の語と InputManager（読むのは要る tick だけ）。
+/// 戻り道が読む人のワードとInputManager（読むのは要るtickだけ）。
 struct FlowReads<'a, G: Game> {
     game: &'a mut G,
     seat: Seat,
@@ -2114,7 +2454,7 @@ struct FlowReads<'a, G: Game> {
 
 impl<G: Game> Reads for FlowReads<'_, G> {
     fn raw(&mut self) -> u16 {
-        // 一時停止・終わりのメニューが読む `[2]` の語（素の poll の席 2 = キーボードと両方のパッド）。
+        // 一時停止・終わりのメニューが読む`[2]`のワード（素のpollの[2] = キーボードと両方のパッド）。
         self.game.menu_words(self.seat)[2]
     }
     fn im(&mut self, index: usize) -> InputState {
@@ -2123,15 +2463,15 @@ impl<G: Game> Reads for FlowReads<'_, G> {
 }
 
 impl NetUi {
-    /// 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す。`chime` は戻り始めに 1 回呼ぶ音の仕事（ゲームのスレッドから呼ぶので、
-    /// スレッドを作るだけにする）。
+    /// 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す。`chime`は戻り始めに1回呼ぶ音を鳴らす処理。
+    /// ゲームのスレッドから呼ぶので、スレッドを作るだけにする。
     pub fn with_return_flow(mut self, chime: Option<fn()>) -> NetUi {
         self.ret_on = true;
         self.lost_chime = chime;
         self
     }
 
-    /// 戻り道の数えを本ログへ出す仕事を設定する（始めた・着いた・途中でやめたときに呼ぶ。ゲームのスレッドで確保しない仕事に限る）。
+    /// 戻り道の集計を本ログへ出す処理を設定する（始まったとき・着いたとき・途中でやめたときに呼ぶ。ゲームのスレッドで確保しない処理に限る）。
     pub fn with_return_log(mut self, log: Option<fn(&UiStats)>) -> NetUi {
         self.ret_log = log;
         self
@@ -2143,8 +2483,8 @@ impl NetUi {
         }
     }
 
-    /// 成立した後にネットワークが終わった（`NetPlay::take_lost`。1 接続に 1 回）。確認の枠で自分から抜けたときは戻さない
-    /// （取消でゲームが自分で戻る）。
+    /// 成立した後にネットワークが終わったときに呼ぶ（`NetPlay::take_lost`。1接続に1回）。
+    /// 確認の枠で自分から抜けたときは戻さない（キャンセルでゲームが自分で戻る）。
     pub fn on_lost(&mut self, why: Why) {
         let by_menu = core::mem::take(&mut self.left_by_menu);
         if !self.ret_on || (by_menu && why != Why::PeerLeft) {
@@ -2152,7 +2492,7 @@ impl NetUi {
         }
         self.ret = Some(Flow::new());
         self.lost = Some(why);
-        // 開いていた確認の枠と、その後に通す取消を捨てる（戻り道が入力を握る）。
+        // 開いていた確認の枠と、その後に通すキャンセルを捨てる（戻り道が入力を占有する）。
         self.menu.reset();
         self.auto = None;
         self.stats.returns = self.stats.returns.saturating_add(1);
@@ -2169,8 +2509,8 @@ impl NetUi {
         self.ret.is_some()
     }
 
-    /// 戻り道の 1 tick。入力を握ったら `Some`（feed は済ませた）。握らない tick（保存の画面・やめた tick）は `None` で、
-    /// 呼び手はいつもの処理へ進む。
+    /// 戻り道の1 tick。入力を占有したら`Some`を返す（feedは済ませてある）。
+    /// 占有しないtick（保存の画面・やめたtick）は`None`を返し、呼び手はいつもの処理へ進む。
     fn return_tick<G: Game>(&mut self, game: &mut G, f: &UiFacts) -> Option<UiOut> {
         if self.ret.is_none() && (self.menu.is_active() || f.conn.is_linked()) {
             self.lost = None;
@@ -2186,7 +2526,7 @@ impl NetUi {
             } else {
                 None
             },
-            // 場面 2 への切替の tick は MainMenu が片付けられうるので読まない（`Game::menu_view`）。
+            // 場面2への切替のtickはMainMenuが取り除かれうるので読まない（`Game::menu_view`）。
             menu: if cur == SCENE_MENU && next != SCENE_MATCH {
                 game.menu_view().map(|v| Screen {
                     id: v.screen,
@@ -2239,14 +2579,13 @@ impl NetUi {
     }
 }
 
-/// ネットワークの経路（ネットワークのセッションが動いている実行）の 1 tick の入力の部分。順序がこの関数の要:
+/// ネットワークの経路（ネットワークのセッションが動いている実行）の1 tickの入力の部分。順序がこの関数の要。
 ///
-/// 1. ネットワークの手入れ（`NetPlay::tend`）。**メニューが入力を握る tick も毎 tick 先に呼ぶ**（ここで手入れを止めると、貼っても接続できない）。
-/// 2. メニュー（`ui`）。握ったら（`UiOut::action` が `Some`）その action を返し、場面ごとの判断（`dispatch`）は呼ばない
-///    （feed の二重化を防ぐ）。握らなければ `dispatch`。
+/// 1. ネットワークの保守処理（`NetPlay::tend`）。**メニューが入力を占有するtickも毎tick先に呼ぶ**（ここで保守処理を止めると貼っても接続できない）。
+/// 2. メニュー（`ui`）。占有したら（`UiOut::action`が`Some`）そのactionを返し、場面ごとの判断（`dispatch`）は呼ばない（feedの二重化を防ぐ）。
+/// 占有しなければ`dispatch`を呼ぶ。
 ///
-/// ネットワークのセッションが動いているので `UiFacts::net` は `Open`（`open_net` は出ない）。`ui` が `None`（メニューを設定していない実行）なら
-/// 手入れ → 判断。
+/// ネットワークのセッションが動いているので`UiFacts::net`は`Open`（`open_net`は出ない）。`ui`が`None`（メニューを設定していない実行）なら保守処理 → 判断の順に進む。
 pub fn net_input<G: Game, N: Net>(
     ui: Option<&mut NetUi>,
     game: &mut G,
@@ -2261,7 +2600,7 @@ pub fn net_input<G: Game, N: Net>(
                 ui.on_lost(why);
             }
             let (conn, seat) = np.ui_conn((net.now_us() / 1_000) as u32);
-            // 作り直しが 1 回でもあるとき、か相手のコードを読んだ後だけ、自分の回線の型を読む（原子変数が数個）。確保しない。
+            // 作り直しが1回でもあったとき、または相手のコードを読んだ後だけ、自分のネットワーク種別のフラグを読む（アトミック変数が数個）。確保しない。
             let r = np.restarts();
             let peer = np.peer_nat();
             let stall = if r.count > 0 || peer.is_some() {
@@ -2283,7 +2622,7 @@ pub fn net_input<G: Game, N: Net>(
             };
             let out = ui.tick(game, &f);
             if out.ready {
-                // 自分が選んだ: READY の 1 通目をこの tick に出す（成立は相手の READY を受けた tick の手入れで見る）。
+                // 自分が選択済みになった: READYの1通目をこのtickに送る（成立は相手のREADYを受けたtickの保守処理で判定する）。
                 np.set_ready(net);
             }
             if out.leave {
@@ -2300,14 +2639,15 @@ pub fn net_input<G: Game, N: Net>(
     (action, out)
 }
 
-/// 観戦者のセッションが動いている実行（ゲーム内のメニューの観戦の「ルームマッチ」）の 1 tick の入力の部分。`net_input` の観戦者の形で、順序が要:
+/// 観戦者のセッションが動いている実行（ゲーム内のメニューの観戦の「ルームマッチ」）の1 tickの入力の部分。`net_input`の観戦者版で、順序が要。
 ///
-/// 1. ネットワークの手入れ（`WatchPlay::tend`）。**メニューが入力を握る tick も毎 tick 先に呼ぶ**（最初の tick が受け取りを受信スレッドへ渡し、以後は接続・終わりを見る）。
-/// 2. 自分の Esc の読み（`WatchPlay::esc_edge`）。**メニューより先**: `peek_local_input` が台本をこの tick の分だけ進め、続くメニューの `menu_words` は進めた結果を使う（台本は 1 tick に 1 回。二重に進めない）。
-/// 3. メニュー（`NetUi::tick`）。画面 6 は握り、ホストの流れを受けている間（`Phase::Selecting`）は接続した対戦する側と同じ自動の前進で画面 7 まで進める。Esc を 3 秒長押しすると、握った tick でも観戦をやめる（`esc_edge` が数える）。
-/// 4. 握らなければ `WatchPlay::dispatch`（記録の列がゲームを動かす・自分の入力を通す）。
+/// 1. ネットワークの保守処理（`WatchPlay::tend`）。**メニューが入力を占有するtickも毎tick先に呼ぶ**（最初のtickが受け取りを受信スレッドへ渡し、以後は接続・終わりを監視する）。
+/// 2. 自分のEscの読み取り（`WatchPlay::esc_edge`）。**メニューより先に呼ぶ**。`peek_local_input`が台本をこのtickの分だけ進め、続くメニューの`menu_words`は進めた結果を使う（台本は1 tickに1回。二重に進めない）。
+/// 3. メニュー（`NetUi::tick`）。画面6は占有する。ホストの流れを受けている間（`Phase::Selecting`）は、接続した対戦する側と同じ自動の前進で画面7まで進める。Escを3秒長押しすると占有したtickでも観戦をやめる（`esc_edge`が数える）。
+/// 4. 占有しなければ`WatchPlay::dispatch`を呼ぶ（記録の列がゲームを動かす・自分の入力を通す）。
 ///
-/// 左上の行と項目は見張り（`spectate_join`）が書く状態で出す。接続の状態は `Conn::Waiting` のまま（`Conn::Connected` は対戦する側の行になる）。観戦者のセッションは対戦のセッションではないので `NetPhase::Open`（`open_net` は出ない）。
+/// 左上の行と項目は監視の処理（`spectate_join`）が書く状態から出す。接続の状態は`Conn::Waiting`のまま（`Conn::Connected`は対戦する側の行になる）。
+/// 観戦者のセッションは対戦のセッションではないので`NetPhase::Open`になる（`open_net`は出ない）。
 pub fn watch_input<G: Game, N: Net>(
     ui: &mut NetUi,
     game: &mut G,
@@ -2326,18 +2666,18 @@ pub fn watch_input<G: Game, N: Net>(
         stall: None,
     };
     let out = ui.tick(game, &f);
-    // マッチ中の表示（名前の帯と通信の状態の行）。判断（`dispatch`）の前に読む（読むだけで状態を動かさない。1 tick 古いが、
-    // 帯は変わったときだけ書くので見た目は変わらない）。マッチの外では消す。
+    // マッチ中の表示（名前の帯と通信の状態の行）は判断（`dispatch`）の前に読む。読むだけで状態は動かさない。
+    // 1 tick古い値になるが、帯は変わったときだけ書くので見た目は変わらない。マッチの外では消す。
     match wp.hud_facts() {
         Some(h) => ui.watch_hud(true, h),
         None => ui.watch_hud(false, WatchHudFacts::default()),
     }
-    // メニューが握る tick は、Esc の長押し（`esc_edge` が見る）のほかは観戦者の判断を通さない。
+    // メニューが占有するtickはEscの長押し（`esc_edge`が見る）のほかは観戦者の判断を通さない。
     let action = match out.action {
         Some(a) => a,
         None => wp.dispatch(game, net, esc),
     };
-    // 知らせは判断の後に読む（Esc を押した tick に案内・一時停止の行が出る）。
+    // 知らせは判断の後に読む（Escを押したtickに案内・一時停止の行が出る）。
     ui.watch_notice(wp.notice());
     (action, out)
 }
@@ -2373,26 +2713,30 @@ mod tests {
         local_reads: u32,
         stashed: Option<u16>,
         stash_calls: u32,
-        /// 2P の機器（素の poll の席 1）の語。`menu_words` の 2 本目で、席 2（合成）の語は 1P の語にこれを足したもの。
+        /// 2Pの機器（素のpollの[1]）のワード。`menu_words`の2本目で、[2]（合成）のワードは1Pのワードにこれを足したもの。
         dev1: u16,
-        /// ウィンドウから貯まった文字（`Game::typed` が古い順に渡す）。本物はゲートが閉じている間は貯めないが、偽物は貯めたまま持ち、
-        /// ゲートが開いている間にだけ渡す。
+        /// ウィンドウから貯まった文字（`Game::typed`が古い順に渡す）。本物はゲートが閉じている間は貯めない。
+        /// 偽物は貯めたまま持っておき、ゲートが開いている間にだけ渡す。
         typed: std::collections::VecDeque<u16>,
         gate_calls: Vec<bool>,
         gate_ok: bool,
         gate_open: bool,
-        /// ゲートが閉じている間に `typed` が呼ばれた回数（閉じている間は取りに行かない約束）。
+        /// ゲートが閉じている間に`typed`が呼ばれた回数（閉じている間は取りに行かない約束）。
         typed_while_closed: u32,
-        /// 観戦者の Esc の読み（`peek_local_input`）が返す語。`local_input` の語とは別に読むので `words` を消費しない。
+        /// 観戦者のEscの読み取り（`peek_local_input`）が返すワード。`local_input`のワードとは別に読むので`words`を消費しない。
         esc_word: u16,
-        /// 本物のキーの読み（`Game::digit_keys`）の代わり。`None` は読んではいけない間。
+        /// 本物のキーの読み取り（`Game::digit_keys`）の代わり。`None`は読んではいけない間。
         keys: Option<u16>,
-        /// `digit_keys` を呼ばれた回数。
+        /// `digit_keys`を呼ばれた回数。
         keys_reads: u32,
         /// 台本の実行（`Game::scripted_run`）。
         scripted: bool,
-        /// 台本の `copy=1`（`Game::copy_script`）。次の 1 回だけ `true` を返す。
+        /// 台本の`copy=1`（`Game::copy_script`）。次の1回だけ`true`を返す。
         copy_script_next: bool,
+        /// マッチ終了時のメニューが出ている（`Game::end_view`）。
+        end_menu: bool,
+        /// `end_view`を読まれた回数。
+        end_reads: u32,
     }
 
     impl Fake {
@@ -2424,6 +2768,8 @@ mod tests {
                 keys_reads: 0,
                 scripted: false,
                 copy_script_next: false,
+                end_menu: false,
+                end_reads: 0,
             }
         }
 
@@ -2431,8 +2777,8 @@ mod tests {
             Fake::on_screen(6, cursor)
         }
 
-        /// 1 tick を回す（語 `w` を押す）。ゲームの `feed` が届いたら、その語で InputManager[2] の模型も進める
-        /// （次の tick の入口の判定が前の feed の続きになる）。
+        /// 1 tickを回す（ワード`w`を押す）。ゲームの`feed`が届いたら、そのワードでInputManager[2]の模型も進める。
+        /// これで次のtickの入口の判定が前のfeedの続きになる。
         fn step(&mut self, ui: &mut NetUi, f: &UiFacts, w: u16) -> UiOut {
             self.words.push_back(w);
             self.cur_feed = [None; 3];
@@ -2492,6 +2838,13 @@ mod tests {
         }
         fn copy_script(&mut self) -> bool {
             std::mem::take(&mut self.copy_script_next)
+        }
+        fn end_view(&mut self) -> higanr_core::end_pick::View {
+            self.end_reads += 1;
+            higanr_core::end_pick::View {
+                shown: self.end_menu,
+                ..Default::default()
+            }
         }
         fn feed(&mut self, index: u32, word: u16) {
             if let Some(s) = self.cur_feed.get_mut(index as usize) {
@@ -2626,7 +2979,7 @@ mod tests {
         assert_eq!(l.take_order(), None);
         assert_eq!(l.spectate_name(), RoomBuf::from_name("Watch-1"));
         assert_eq!(l.room_name(), RoomBuf::from_name("Synth-Room_1"));
-        // 観戦コード入力は観戦の決定と同じ指示で、開く仕事が印を見て観戦コードの経路を選ぶ。ルーム名で観戦を決め直すと印は消える。
+        // 観戦コード入力は観戦の決定と同じ指示。開く処理が印を見て観戦コードの経路を選ぶ。ルーム名で観戦を決定し直すと印は消える。
         assert!(!l.spectate_by_code());
         l.send(Cmd::SpectateCode);
         assert_eq!(l.take_order(), Some(Order::Spectate));
@@ -2740,7 +3093,7 @@ mod tests {
             "3 で下 + 決定は 4 への決定なので奪う"
         );
         assert!(ui.menu_active());
-        // Z を押したままのカーソル 4 の画面: 前の tick の feed が Z だった（押した瞬間ではない）なら奪わない。
+        // Zを押したままのカーソル4の画面: 前のtickのfeedがZだった（押した瞬間ではない）なら奪わない。
         let (mut ui2, _l2, _b2) = new_ui();
         let mut g = Fake::on_match_screen(4);
         g.im2.feed(Z);
@@ -2814,13 +3167,13 @@ mod tests {
         assert_eq!(link.take_order(), Some(Order::Paste));
     }
 
-    /// 開いたメニューで「ランダムマッチ」から対戦の「ルームマッチ」まで下へ 1 つ動かす。
+    /// 開いたメニューで「ランダムマッチ」から対戦の「ルームマッチ」まで下へ1つ動かす。
     fn down_to_play(ui: &mut NetUi, g: &mut Fake) {
         g.step(ui, &facts(), DOWN);
         g.step(ui, &facts(), 0);
     }
 
-    /// 開いたメニューで対戦の「ルームマッチ」から観戦の「ルームマッチ」まで下へ 3 つ動かす（間に「ルーム名」と観戦の「ランダムマッチ」の行がある）。
+    /// 開いたメニューで対戦の「ルームマッチ」から観戦の「ルームマッチ」まで下へ3つ動かす（間に「ルーム名」と観戦の「ランダムマッチ」の行がある）。
     fn down_to_watch(ui: &mut NetUi, g: &mut Fake) {
         for _ in 0..3 {
             g.step(ui, &facts(), DOWN);
@@ -2828,8 +3181,8 @@ mod tests {
         }
     }
 
-    /// ルーム名の入力を開く（画面 6 でメニューを開き、対戦の「ルームマッチ」を決める）。ルーム名が決まっていると入力を経ずに始まるので、
-    /// ルーム名は空にする。決めたキーを離すところまで進める。
+    /// ルーム名の入力を開く（画面6でメニューを開いて対戦の「ルームマッチ」を決定する）。
+    /// ルーム名が設定済みだと入力を経ずに始まるので、ルーム名は空にする。決定のキーを離すところまで進める。
     fn open_room_input() -> (NetUi, Arc<UiLink>, &'static Board, Fake) {
         let link = Arc::new(UiLink::new());
         let b = board();
@@ -3234,8 +3587,8 @@ mod tests {
         );
     }
 
-    /// 観戦者の経路の用意: 本物の `WatchPlay` と仮のネットワーク（相手は居ない）。コードは設定してある（`pump` が `Watcher` を作って
-    /// 観戦のホストへ JOIN を送り始める）。
+    /// 観戦者の経路の用意: 本物の`WatchPlay`と仮のネットワーク（相手は居ない）。
+    /// コードは設定済み（`pump`が`Watcher`を作って観戦のホストへJOINを送り始める）。
     fn watch_rig() -> (
         crate::spectate_watch::WatchPlay,
         crate::netplay::fake::FakeNet,
@@ -3306,7 +3659,7 @@ mod tests {
             "{:?}",
             menu_rows(b)
         );
-        // 画面 7 は握らない（観戦者の判断。接続する前は自分の入力を通す）。メニューを開いていないセッションで見る（開いているメニューは画面 7 でも握る）。
+        // 画面7は占有しない（観戦者の判断。接続する前は自分の入力を通す）。メニューを開いていないセッションで見る（開いているメニューは画面7でも占有する）。
         let (mut ui, _l, _b) = new_ui();
         let mut g7 = Fake::on_screen(7, 0);
         g7.cur_feed = [None; 3];
@@ -3356,7 +3709,7 @@ mod tests {
             net: &mut crate::netplay::fake::FakeNet,
         ) -> (Action, UiOut) {
             g.cur_feed = [None; 3];
-            // 1 tick ごとに仮の時計を 100 ms 進める（届く便は無いので待ちの長さだけ進む）。
+            // 1 tickごとに仮の時計を100 ms進める（届くパケットは無いので待ちの長さだけ進む）。
             net.wait(100_000);
             watch_input(ui, g, wp, net, 1_000_000)
         }
@@ -3364,7 +3717,7 @@ mod tests {
         let (mut wp, mut net) = watch_rig();
         wp.set_phase_for_test(Phase::Selecting);
         let mut g = Fake::on_match_screen(2);
-        // 押しっぱなしで接続したときは、離すまで長押しを数えない。
+        // 押しっぱなしで接続したときは離すまで長押しを数えない。
         g.esc_word = ESC;
         for _ in 0..40 {
             let _ = tick(&mut ui, &mut g, &mut wp, &mut net);
@@ -3373,7 +3726,7 @@ mod tests {
         g.esc_word = 0;
         let _ = tick(&mut ui, &mut g, &mut wp, &mut net);
         assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "押す前に案内が出た");
-        // 2.9 秒で離すと終わらない。押している間と離して 3 秒は案内を出す。
+        // 2.9秒で離すと終わらない。押している間と離して3秒は案内を出す。
         g.esc_word = ESC;
         for _ in 0..30 {
             let _ = tick(&mut ui, &mut g, &mut wp, &mut net);
@@ -3393,7 +3746,7 @@ mod tests {
         let _ = tick(&mut ui, &mut g, &mut wp, &mut net);
         assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "離して 3 秒たっても残った");
         assert_eq!(wp.end(), None);
-        // 3 秒押し続けると、メニューが握る tick でも終える。
+        // 3秒押し続けると、メニューが握るtickでも終える。
         g.esc_word = ESC;
         for _ in 0..30 {
             let _ = tick(&mut ui, &mut g, &mut wp, &mut net);
@@ -3402,7 +3755,7 @@ mod tests {
         let (a, out) = tick(&mut ui, &mut g, &mut wp, &mut net);
         assert_eq!(wp.end(), Some(crate::spectate_watch::WatchEnd::Quit));
         assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "終えた後も案内が残った");
-        // 画面 6 は握る（自動の前進の tick はメニューが 0 や上・決定を流すので、この tick の Esc はゲームへ届かない）。
+        // 画面6は占有する（自動の前進のtickはメニューが0や上・決定をゲームへ渡すので、このtickのEscはゲームへ届かない）。
         assert_eq!(out.action, Some(Action::Menu));
         assert_eq!(a, Action::Menu);
         g.words.push_back(ESC);
@@ -3413,9 +3766,9 @@ mod tests {
             "やめた後の Esc がゲームへ届かない"
         );
 
-        // 開いているメニュー（観戦の「ルームマッチ」を決めたメニューは待ちの間ずっと開いている）: ホストの流れを受け始めた tick に閉じ、
-        // 自動の前進が画面 6 を進める（開いたままだとメニューが握って前進が走らず、画面 6 に留まる）。閉じる前の Esc はメニューを
-        // 閉じるだけで、観戦は続く。
+        // 開いているメニュー（観戦の「ルームマッチ」を決定したメニューは待ちの間ずっと開いている）は、ホストの流れを受け始めたtickに閉じる。
+        // 閉じると自動の前進が画面6を進める（開いたままだとメニューが入力を占有して前進が走らず、画面6に留まる）。
+        // 閉じる前のEscはメニューを閉じるだけで観戦は続く。
         let (mut ui, _l, _b) = new_ui();
         let (mut wp, mut net) = watch_rig();
         let mut g = Fake::on_match_screen(4);
@@ -3533,7 +3886,7 @@ mod tests {
         assert_eq!(menu_rows(b)[2], "ルーム名: |");
         g.step(&mut ui, &facts(), ESC);
         assert!(!ui.menu.wants_text(), "Esc で戻れない");
-        // 開けられなかったゲートは閉じる必要が無い。開けようとした呼び出しだけが並ぶ。開けようとするのは入力 1 回につき 1 回（ウィンドウの探し直しは重いので毎 tick やらない）。
+        // 開けられなかったゲートは閉じる必要が無い。開けようとした呼び出しだけが並ぶ。開けようとするのは入力1回につき1回（ウィンドウの探し直しは重いので毎tickやらない）。
         assert_eq!(g.gate_calls, vec![true], "入力の間に毎 tick 開け直した");
         g.step(&mut ui, &facts(), 0);
         g.gate_ok = true;
@@ -3708,7 +4061,7 @@ mod tests {
             }
         }
         let at_cap = at_cap.unwrap();
-        // 上を押す tick と離す tick が交互に来るので、上限までに押した数は上限の半分ほど（0 でも上限いっぱいでもない）。
+        // 上を押すtickと離すtickが交互に来るので上限までに押した数は上限の半分ほど（0でも上限いっぱいでもない）。
         assert!(
             at_cap > AUTO_MAX_TICKS / 4 && at_cap <= AUTO_MAX_TICKS / 2 + 1,
             "上限までの押下 {at_cap}"
@@ -3729,7 +4082,7 @@ mod tests {
         g.dev1 = UP;
         g.step(&mut ui, &facts(), 0x0004);
         assert_eq!(g.last_feed(), Some([0x0004, UP, 0x0004 | UP]));
-        // カーソル 4 で 2P のパッドの決定: 1P の語は 0 でも、ゲームが読む [2] に決定が立つので奪う（0 を 3 本、メニューが開く）。
+        // カーソル4で2Pのパッドの決定: 1Pのワードは0でもゲームが読む[2]に決定が立つので奪う（0を3本、メニューが開く）。
         let (mut ui, _l, _b) = new_ui();
         let mut g = Fake::on_match_screen(4);
         g.dev1 = Z;
@@ -4134,6 +4487,165 @@ mod tests {
     }
 
     #[test]
+    fn update_notice_rows_render_to_preview_images() {
+        use crate::overlay_win::{FONT_FACES, FONT_HEIGHT, FONT_SCALE, gdi_atlas};
+        use higanr_core::overlay::Vertex;
+        const W: u32 = 640;
+        const H: u32 = 480;
+        const COLORS: [(&str, u32); 3] = [
+            ("green", 0xFF80_E0A0),
+            ("red", 0xFFFF_5050),
+            ("pink", 0xFFFF_9090),
+        ];
+        assert_eq!(
+            COLORS[2].1,
+            lay::COLOR_NOTICE,
+            "既定の色の見本が定数とずれた"
+        );
+        let atlas = gdi_atlas(&FONT_FACES, FONT_HEIGHT, FONT_SCALE).expect("GDI の文字の表");
+        let gradient: Vec<u8> = (0..W * H)
+            .flat_map(|i| {
+                let (x, y) = (i % W, i / W);
+                [(40 + x * 180 / W) as u8, (60 + y * 120 / H) as u8, 110]
+            })
+            .collect();
+        let load = |var: &str| -> Option<Vec<u8>> {
+            let path = std::env::var_os(var)?;
+            let mut r = png::Decoder::new(std::io::Cursor::new(std::fs::read(path).ok()?))
+                .read_info()
+                .ok()?;
+            let mut buf = vec![0u8; r.output_buffer_size()?];
+            let info = r.next_frame(&mut buf).ok()?;
+            (info.width == W
+                && info.height == H
+                && info.color_type == png::ColorType::Rgb
+                && info.bit_depth == png::BitDepth::Eight)
+                .then_some(buf)
+        };
+        let bg_menu = load("HIGANR_PREVIEW_BG_MENU").unwrap_or_else(|| gradient.clone());
+        let bg_end = load("HIGANR_PREVIEW_BG_END").unwrap_or_else(|| gradient.clone());
+        let out_dir = std::env::var_os("HIGANR_PREVIEW_DIR").map(std::path::PathBuf::from);
+        let stamp = {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let (days, rem) = (secs / 86_400, secs % 86_400);
+            // 1970-01-01からの日数を年月日へ（グレゴリオ暦。UTC）。
+            let z = days as i64 + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z.rem_euclid(146_097);
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            format!(
+                "{year:04}{month:02}{day:02}_{:02}{:02}{:02}_{}",
+                rem / 3600,
+                rem % 3600 / 60,
+                rem % 60,
+                std::process::id()
+            )
+        };
+        let write = |name: &str, w: u32, h: u32, rgb: &[u8]| {
+            if let Some(dir) = &out_dir {
+                std::fs::create_dir_all(dir).expect("プレビューのフォルダ");
+                let path = dir.join(format!("update_notice_{name}_{stamp}.png"));
+                assert!(!path.exists(), "既存のファイルを上書きしない");
+                let big = higanr_core::overlay::upscale_rgb(rgb, w, h, 2);
+                let png = higanr_core::shot::encode_png(w * 2, h * 2, &big).expect("PNG に符号化");
+                std::fs::write(&path, png).expect("PNG を書く");
+                println!("PNG: {}", path.display());
+            }
+        };
+        // 色だけ差し替えて描く。返すのは（絵・差し替えた頂点の数・知らせの文字のyの範囲）。
+        let render = |b: &Board, bg: &[u8], color: u32| {
+            let mut sheet = bg.to_vec();
+            let (mut replaced, mut y0, mut y1) = (0usize, f32::MAX, f32::MIN);
+            draw_board(b, &atlas.spec, W, H, &mut |v| {
+                let mut v: Vec<Vertex> = v.to_vec();
+                for p in &mut v {
+                    if p.color == lay::COLOR_NOTICE {
+                        p.color = color;
+                        replaced += 1;
+                        y0 = y0.min(p.y);
+                        y1 = y1.max(p.y);
+                    }
+                }
+                blit_quads(
+                    &v,
+                    &atlas.texels,
+                    atlas.spec.tex_w,
+                    atlas.spec.tex_h,
+                    &mut sheet,
+                    W,
+                    H,
+                    0,
+                    0,
+                );
+            });
+            assert!(replaced > 0 && sheet != bg, "知らせの頂点が描かれていない");
+            (sheet, y0, y1)
+        };
+        let scene = |kind: &str, b: &Board, bg: &[u8]| {
+            let mut strips: Vec<u8> = Vec::new();
+            let mut strip_h = 0;
+            for (name, color) in COLORS {
+                let (sheet, y0, y1) = render(b, bg, color);
+                write(&format!("{kind}_{name}"), W, H, &sheet);
+                // 比べる絵は知らせの上下に30画素ずつ足した帯を3色ぶん縦に並べる。
+                let top = (y0 as i64 - 30).clamp(0, H as i64 - 1) as u32;
+                let bottom = ((y1 as i64 + 30).clamp(1, H as i64) as u32).max(top + 1);
+                strip_h = bottom - top;
+                strips.extend_from_slice(&sheet[(top * W * 3) as usize..(bottom * W * 3) as usize]);
+            }
+            write(&format!("{kind}_compare"), W, strip_h * 3, &strips);
+        };
+        // 場面 (a): ネット対戦メニューの一番下。
+        let (mut ui, b) = update_ui(BUILD);
+        news_is_out(Found::Newer(higanr_core::update_notice::Version::new(
+            1, 2, 2,
+        )));
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), 0);
+        open_the_menu(&mut g, &mut ui, &facts());
+        g.step(&mut ui, &facts(), 0);
+        let rows = menu_rows(b);
+        let n = rows.len();
+        assert_eq!(
+            rows[n - 2],
+            "新しいバージョンがリリースされています（v1.2.2）"
+        );
+        assert_eq!(row_style(b, n - 1), RowStyle::Notice);
+        scene("menu", b, &bg_menu);
+        // 場面 (b): 接続中・マッチ終了時のメニュー・名前の帯あり。
+        let (mut ui, b) = update_ui(BUILD);
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        g.end_menu = true;
+        g.step(&mut ui, &linked(true), 0);
+        let names = HudNames::of(Seat::P1, Name::new("Reimu-fan"), Name::new("Marisa-fan"));
+        ui.hud(
+            true,
+            HudFacts {
+                latency: Some(2),
+                rtt_ms: Some(33),
+                recommend: Some(2),
+                names: Some(names),
+                ..HudFacts::default()
+            },
+        );
+        assert_eq!(b.show() & SHOW_UPDATE, SHOW_UPDATE);
+        assert_eq!(b.show() & SHOW_NAMES, SHOW_NAMES);
+        assert_eq!(
+            row_text(b, ROW_UPD0),
+            "新しいバージョンがリリースされています（v1.2.2）"
+        );
+        scene("end", b, &bg_end);
+    }
+
+    #[test]
     fn the_connected_line_stops_at_the_difficulty_screen_and_other_lines_stay() {
         const CONNECTED: &str = "接続しました。あなたは1Pです。（rollback・delay 1）";
         let c = connected_facts();
@@ -4222,7 +4734,7 @@ mod tests {
         let span = border.iter().cloned().fold(f32::MIN, f32::max)
             - border.iter().cloned().fold(f32::MAX, f32::min);
         assert_eq!(span, bx.h as f32, "枠の高さが行の高さの合計");
-        // 1 まとまり目は枠の下地。文字の行は上から順に 1 行 1 まとまり: 見出し・a・b・c。
+        // 1まとまり目は枠の下地。文字の行は上から順に1行1まとまり: 見出し・a・b・c。
         let top = |k: usize| batches[1 + k].iter().map(|v| v.y).fold(f32::MAX, f32::min);
         let at = |k: usize| top(k) - top(0);
         assert_eq!(at(1), (row_h + row_h / 3) as f32, "小さな隙間の分");
@@ -4285,8 +4797,8 @@ mod tests {
         };
         assert_eq!(px(TL_X, TL_Y), [255, 255, 255]);
         assert_eq!(px(TL_X, TL_Y - lay::PAD - 1), [0, 0, 0]);
-        // マッチ中の行（通信の状態）は下の枠の左: 帯は y = 465..480（画面の下端から `HUD_BAND_H`）、文字は x = `HUD_EDGE_X`・y = 466 から
-        // （下地は半透明の黒なので黒のまま。文字の白で見る）。上の枠には何も描かない。
+        // マッチ中の行（通信の状態）は下の枠の左に出る。帯は y = 465..480（画面の下端から`HUD_BAND_H`）。文字は x = `HUD_EDGE_X`・y = 466 から。
+        // 下地は半透明の黒なので黒のまま。文字の白で見る。上の枠には何も描かない。
         let top = lay::hud_bottom_y(sh);
         assert_eq!(top, 465);
         assert_eq!(px(lay::HUD_EDGE_X, top + HUD_Y), [255, 255, 255]);
@@ -4309,8 +4821,8 @@ mod tests {
 
     #[test]
     fn a_too_long_band_is_cut_before_the_timer_and_the_fps_text() {
-        // core の幅の検査は、実物の文字の表と同じ枠（高さ 14 → 半角 7・全角 14）で数えている。実物の文字の高さを変えたら
-        // core の検査の表も合わせる（ここで落ちる）。
+        // coreの幅の検査は実物の文字の表と同じ枠（高さ14 → 半角7・全角14）で数えている。
+        // 実物の文字の高さを変えたらcoreの検査の表も合わせる（ここで落ちる）。
         const { assert!(crate::overlay_win::FONT_HEIGHT == 14) };
         let s = spec();
         let long = "Delay* 9 (9)  ping 4294967295ms  rollback 255  ".repeat(3);
@@ -4368,7 +4880,7 @@ mod tests {
         assert!(right <= 640.0, "右端 {right}");
     }
 
-    /// 実物の関数が描く表と同じ、ゲームの文字（英数字 `!`〜`~`。`` ` `` を除く）をコピーした文字の表（8 × 12 の塗りつぶしの文字）。
+    /// 実物の関数が描く表と同じ、ゲームの文字（英数字`!`〜`~`。`` ` `` を除く）をコピーした文字の表（8 × 12 の塗りつぶしの文字）。
     fn game_font_spec() -> AtlasSpec {
         use higanr_core::overlay::{GAME_ADVANCE, GameGlyphSrc, apply_game_font, texels};
         let glyphs = ui_glyphs();
@@ -4407,8 +4919,8 @@ mod tests {
         let hud = batch(SHOW_HUD);
         let wait = batch(SHOW_WAIT);
         assert_eq!((hud.len(), wait.len()), (1, 1));
-        // 同じ形（下地・文字の送りまで。置き場だけが違う）。待っている行は上の枠の左（x = 6・y = 0）、マッチ中の行は下の枠の左
-        // （x = `HUD_EDGE_X`・y = 465）。頂点ごとに、座標の差が全部同じで、色と文字の位置（u・v）は同じ。
+        // 同じ形（下地・文字の送り幅まで。置き場だけが違う）。待っている行は上の枠の左（x = 6・y = 0）。マッチ中の行は下の枠の左（x = `HUD_EDGE_X`・y = 465）。
+        // 頂点ごとに座標の差が全部同じで、色と文字の位置（u・v）は同じ。
         let (dx, dy) = (hud[0][0].x - wait[0][0].x, hud[0][0].y - wait[0][0].y);
         assert_eq!(
             (dx, dy),
@@ -4577,8 +5089,8 @@ mod tests {
             "つながった後（{c} tick 目）もメニューが閉じない"
         );
         assert!(g.feeds.len() > 6);
-        // 画面 7（難易度。ネットの選択の画面）で取消 → 確認の枠。枠の間は毎 tick メニューが握る。このとき場面ごとの判断
-        // （`dispatch` の `menu_tick`）まで呼ぶと、同じ tick に feed が 2 回になる（偽のゲームが落とす）。
+        // 画面7（難易度。ネットの選択の画面）でキャンセルすると確認の枠が出る。枠の間は毎tickメニューが入力を占有する。
+        // このとき場面ごとの判断（`dispatch`の`menu_tick`）まで呼ぶと、同じtickにfeedが2回になる（偽のゲームが落とす）。
         g.view = Some(MenuView {
             screen: 7,
             sub: 1,
@@ -4598,8 +5110,8 @@ mod tests {
         assert!(ui.menu_active());
     }
 
-    /// 自分と相手の回線の型の印で、左上の警告（最大 5 行）がどの文になるかを、セッションを動かして見る。
-    /// 表の列: 自分の「宛先ごとに変わる型か」・自分の UPnP・相手のコードの印（None は読んでいない）・出る行。
+    /// 自分と相手のネットワーク種別のフラグで、左上の警告（最大5行）がどの文になるかをセッションを動かして検証する。
+    /// 表の列: 自分の「宛先ごとに変わる型か」・自分のUPnP・相手のコードのフラグ（Noneは読んでいない）・出る行。
     #[test]
     fn a_timed_out_handshake_turns_the_corner_into_warn_rows_chosen_by_the_nat_marks_until_it_connects()
      {
@@ -4609,7 +5121,7 @@ mod tests {
         const F1: &[&str] = &[
             "接続失敗：",
             "不明な原因で相手からのUDPパケットが届きません。",
-            "iniをdetail=1に書き換えてもう一度試し、ログを添えて開発者に伝えてください。",
+            "iniをdetail=1にして再度試し、zipにしたlogsフォルダを添えて開発者に伝えてください。",
             "（README「接続できないとき」1）",
         ];
         const F2: &[&str] = &[
@@ -4757,7 +5269,7 @@ mod tests {
             );
             assert_eq!(board.show() & SHOW_WAIT, 0);
         }
-        // 相手の接続を待つのを取りやめた後（見張りの状態は `Idle`）: 古い作り直しの数（`Some(stall)`）が残っていても、何も出ない。
+        // 相手の接続を待つのを取りやめた後（見張りの状態は`Idle`）: 古い作り直しの数（`Some(stall)`）が残っていても、何も出ない。
         let (mut ui, link, board) = new_ui();
         link.publish(&Note {
             seq: 1,
@@ -5035,7 +5547,7 @@ mod tests {
         }
     }
 
-    /// 組み上がりの検査の 2 台（偽のネットワーク・偽のゲーム・メニュー）。A は Match の画面で入口のメニューを開いて待つ側、B は別の画面にいる側。
+    /// 組み上がりの検査の2台（偽のネットワーク・偽のゲーム・メニュー）。AはMatchの画面で入口のメニューを開いて待つ側。Bは別の画面にいる側。
     struct Rig {
         na: crate::netplay::fake::FakeNet,
         nb: crate::netplay::fake::FakeNet,
@@ -5057,7 +5569,7 @@ mod tests {
             Rig::new_sides(gate, gate, ga, gb)
         }
 
-        /// ゲートの有無を側ごとに決める（ゲートの無い相手 = 古いバージョンの `code_side = game` か、同じバージョンの `offer` / `answer` の模型）。
+        /// ゲートの有無を側ごとに決める（ゲートの無い相手 = 古いバージョンの`code_side = game`か、同じバージョンの`offer` / `answer`の模型）。
         fn new_sides(gate_a: bool, gate_b: bool, ga: Fake, gb: Fake) -> Rig {
             use crate::netplay::fake::FakeNet;
             let (a, b) = (
@@ -5119,7 +5631,7 @@ mod tests {
             panic!("つながらない");
         }
 
-        /// 成立の前に送ってはいけない type（INPUT 3・CHECK 4・SELECT 11・MENU 16・STEP_REQ 17・STEP 18）を、両者が送った数。
+        /// 成立の前に送ってはいけないtype（INPUT 3・CHECK 4・SELECT 11・MENU 16・STEP_REQ 17・STEP 18）を両者が送った数。
         fn post_match_sent(&self) -> u32 {
             [3usize, 4, 11, 16, 17, 18]
                 .iter()
@@ -5211,7 +5723,7 @@ mod tests {
         assert_eq!(r.np_a.phase(), crate::netplay::Phase::Selecting);
         assert_eq!(r.np_b.phase(), crate::netplay::Phase::Selecting);
         assert!(r.ui_a.stats().auto_presses > 0 && r.ui_b.stats().auto_presses > 0);
-        // 成立した後も、相手の成立後の通信が来るまで自分の側から READY を送り直す。重複の READY で自動の前進を 2 度始めない。
+        // 成立した後も相手の成立後の通信が来るまで自分の側からREADYを送り直す。重複のREADYで自動の前進を2度始めない。
         for _ in 0..200 {
             r.tick(0, 0);
         }
@@ -5226,8 +5738,8 @@ mod tests {
             (r.ui_a.stats().auto_starts, r.ui_b.stats().auto_starts),
             (1, 1)
         );
-        // 正の対照: 上の「成立の前は送らない」の 0 が、この模型ではいつまでも 0 なのか（送る経路が無い）を区別する。
-        // 成立の後に両者の偽のゲームを難易度の画面（7）へ進めると、選択の同期の MENU が流れ始める。
+        // 正の対照: 上の「成立の前は送らない」の0が、この模型ではいつまでも0のまま（送る経路が無い）なのかを区別する。
+        // 成立の後に両者の偽のゲームを難易度の画面（7）へ進めると選択の同期のMENUが送られ始める。
         assert_eq!(r.post_match_sent(), 0, "画面を動かす前（検査の前提）");
         for g in [&mut r.ga, &mut r.gb] {
             g.view = Some(MenuView {
@@ -5294,8 +5806,8 @@ mod tests {
             }
         }
         let at = ended_at.expect("10 分を過ぎても閉じない");
-        // 起点 t0 は `link_up` が返った後の時刻で、セッションが接続した時刻（ゲートの時計の起点）はその 1〜2 tick 前。1 ms ずつ進めると、
-        // その差（2 フレーム以内）だけ 10 分より早く見える。
+        // 起点t0は`link_up`が返った後の時刻。セッションが接続した時刻（ゲートの時計の起点）はその1〜2 tick前になる。
+        // 1 msずつ進めるとその差（2フレーム以内）だけ10分より早く見える。
         assert!(
             at + 2 * crate::netplay::fake::FRAME_US >= wait_us && at <= wait_us + 1_000_000,
             "閉じたのは {} ms",
@@ -5309,7 +5821,7 @@ mod tests {
         assert_eq!(r.np_b.ui_conn(0).0, Conn::Unmatched(NoMatch::TimedOut));
         assert!(r.nb.types[TYPE_BYE] >= 1, "BYE を送っていない");
         assert_eq!(r.post_match_sent(), 0);
-        // A は B の BYE(取消) で終わる。成立の前の BYE(取消) は「相手が閉じた」で、遊んだ後の「つながりが終わりました。」と見分ける。
+        // AはBのBYE(取消)で終わる。成立の前のBYE(取消)は「相手が閉じた」で、遊んだ後の「つながりが終わりました。」と見分ける。
         for _ in 0..10 {
             r.tick(0, 0);
         }
@@ -5467,8 +5979,9 @@ mod tests {
             r.np_b.connected().unwrap().match_gate().is_none(),
             "B はゲートなし"
         );
-        // B の MENU の 1 通目は、それを送った tick の始まりの時刻（A が受けたのはその後）、A が閉じたのは、閉じた tick の終わりの
-        // 時刻（閉じたのはその前）で測る。差は 3 秒を下回らない。
+        // BのMENUの1通目の時刻は、それを送ったtickの始まり（Aが受けたのはその後）。
+        // Aが閉じた時刻は、閉じたtickの終わり（閉じたのはその前）。
+        // この差は3秒を下回らない。
         let mut first_menu_at = None;
         let mut a_ended_at = None;
         for _ in 0..600 {
@@ -5596,7 +6109,7 @@ mod tests {
         assert!(r.np_a.connected().unwrap().match_gate().is_none());
     }
 
-    /// 確保しない偽のゲーム（固定の配列だけ。確保の検査用。`Fake` は記録に `Vec` を使う）。
+    /// 確保しない偽のゲーム（固定の配列だけ。確保の検査用。`Fake`は記録に`Vec`を使う）。
     struct Quiet {
         screen: u32,
         cursor: u32,
@@ -5721,7 +6234,7 @@ mod tests {
             ..unmatched
         };
         let mut draws = 0usize;
-        // 1 回の巡りの中身。1 周目は静的変数の初期化などを済ませ、2 周目の確保の数を見る。
+        // 1回の巡りの中身。1周目は静的変数の初期化などを済ませる。2周目の確保の数を見る。
         let tick = |ui: &mut NetUi,
                     g: &mut Quiet,
                     f: &UiFacts,
@@ -5786,6 +6299,7 @@ mod tests {
                             Name::new("synth-self"),
                             Name::new("synth-peer"),
                         )),
+                        ..HudFacts::default()
                     },
                 );
                 draws += draw_board(b, &s, 640, 480, &mut |v| {
@@ -5842,8 +6356,8 @@ mod tests {
         let mut draws = 0usize;
         for round in 0..2 {
             let before = crate::test_alloc::count();
-            // 開く → 設定「ルーム名」を決めて入力へ（決めたキーを離すまでの間に Enter の文字が来ても読み捨て）。ルーム名が決まっていると
-            // 「ルームマッチ」は入力を経ずに始まるので、入力へ入る経路は「ルーム名」から通す。
+            // 開く → 設定「ルーム名」を決定して入力へ（決定のキーを離すまでの間にEnterの文字が来ても読み捨てる）。
+            // ルーム名が設定済みだと「ルームマッチ」は入力を経ずに始まるので、入力へ入る経路は「ルーム名」から通す。
             for w in [Z, 0, DOWN, 0, DOWN, 0, Z, 0, 0, 0, 0, 0, 0, 0, 0] {
                 g.word = w;
                 let _ = ui.tick(&mut g, &f);
@@ -5891,7 +6405,7 @@ mod tests {
         assert_eq!(link.take_order(), Some(Order::Room));
     }
 
-    /// 設定で決めたルーム名の記録（本物は別のスレッドが ini へ書く `ini_save::save_room`）。
+    /// 設定で決定したルーム名の記録（本物は別のスレッドがiniへ書く`ini_save::save_room`）。
     static SAVED_ROOMS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     fn record_saved_room(n: RoomBuf) {
@@ -6012,7 +6526,7 @@ mod tests {
         };
         let link = Arc::new(UiLink::new());
         let b = board();
-        // ルーム名は未設定で始める（決まっていると観戦の「ルームマッチ」は入力を経ずに始まり、入力の画面が撮れない）。
+        // ルーム名は未設定で始める（設定済みだと観戦の「ルームマッチ」は入力を経ずに始まって入力の画面が撮れない）。
         let mut ui =
             NetUi::new(ini(), Arc::clone(&link), b).with_room(RoomItem::On(RoomBuf::new()));
         let mut g = Fake::on_match_screen(4);
@@ -6030,7 +6544,7 @@ mod tests {
         g.step(&mut ui, &f, 0);
         assert!(menu_rows(b).iter().any(|l| l == "観戦"));
         shot(b, "1_list");
-        // 観戦の「ランダムマッチ」: 一覧（満員の行・8 行を越えるスクロール）と空の一覧。
+        // 観戦の「ランダムマッチ」: 一覧（満員の行・8行を越えるスクロール）と空の一覧。
         for _ in 0..3 {
             g.step(&mut ui, &f, DOWN);
             g.step(&mut ui, &f, 0);
@@ -6159,8 +6673,8 @@ mod tests {
         let mut seq = 10u32;
         for round in 0..2 {
             let before = crate::test_alloc::count();
-            // 開く → 「ルーム名」を決めて入力へ → 打って Enter（決める）→ 下の観戦の「ルームマッチ」を決める（ルーム名が決まっているので入力を経ずに
-            // その名で始まる）。前の回の終わりの状態のままだと項目が観戦者のものになるので、何も待っていない状態から始める。
+            // 開く → 「ルーム名」を決定して入力へ → 打ってEnter（決定）→ 下の観戦の「ルームマッチ」を決定する（ルーム名が設定済みなので入力を経ずにその名で始まる）。
+            // 前の回の終わりの状態のままだと項目が観戦者のものになるので、何も待っていない状態から始める。
             seq += 1;
             link.publish(&note(seq, CodeState::Idle, Event::None));
             for w in [Z, 0, DOWN, 0, DOWN, 0, Z, 0, 0, 0, 0, 0, 0, 0, 0] {
@@ -6391,7 +6905,7 @@ mod tests {
         let mut k = 0;
         loop {
             let (_, sa, sb, _) = step(&mut ga, &mut gb);
-            // 自動保存へ見せる値にも、止めたマッチの印が立つ（止めたマッチは保存しない）。止める前は立たない。
+            // 自動保存へ見せる値にも止めたマッチの印が立つ（止めたマッチは保存しない）。止める前は立たない。
             assert_eq!(
                 views.get()[0].unwrap_or(false),
                 sa,
@@ -6415,7 +6929,7 @@ mod tests {
         }
         let want = [
             "同期がずれたため、試合を終了しました。",
-            "logsフォルダのログを添えて、開発者に伝えてください（Escでメニューへ）。",
+            "zipにしたlogsフォルダを添えて、開発者に伝えてください（Escでメニューへ）。",
         ];
         for (who, b) in [("A", board_a), ("B", board_b)] {
             assert_eq!(
@@ -6487,7 +7001,7 @@ mod tests {
         }
     }
 
-    /// 本物のキーの読みを `keys` にして 1 tick 回す。
+    /// 本物のキーの読み取りを`keys`にして1 tick回す。
     fn tick_keys(g: &mut Fake, ui: &mut NetUi, f: &UiFacts, keys: Option<u16>) {
         g.keys = keys;
         g.step(ui, f, 0);
@@ -6502,7 +7016,7 @@ mod tests {
         b.read_row(i, &mut buf).map(|(_, s)| s).unwrap()
     }
 
-    /// 押した瞬間に見張りへ 1 回だけ頼む（押しっぱなしでは繰り返さない）。ホストもゲストも・見つかった間も接続した後も・メニューの場面もマッチの場面も同じ。
+    /// 押した瞬間に監視の処理へ1回だけ頼む（押しっぱなしでは繰り返さない）。ホストもゲストも・見つかった間も接続した後も・メニューの場面もマッチの場面も同じ。
     #[test]
     fn ctrl_c_asks_the_watcher_once_per_press_while_linked() {
         for (name, f, scene) in [
@@ -6533,7 +7047,7 @@ mod tests {
         }
     }
 
-    /// 接続する前はキーを読まない。押したまま接続しても、読めない間に押されたキーも、Alt・Win と一緒のものも、台本の実行も取らない。
+    /// 接続する前はキーを読まない。次のものは取らない: 押したまま接続したキー・読めない間に押されたキー・Alt・Winと一緒のキー・台本の実行。
     #[test]
     fn ctrl_c_is_ignored_before_the_link_after_a_gap_with_alt_and_in_a_scripted_run() {
         let (mut ui, link, _b) = new_ui();
@@ -6583,14 +7097,14 @@ mod tests {
         tick_keys(&mut g, &mut ui, &facts(), None);
         assert_eq!(orders(&link), [], "つながる前に頼んだ");
         assert!(g.copy_script_next, "つながる前に押下を取り出した");
-        // 台本の無い実行は `copy_script` を見ない。
+        // 台本の無い実行は`copy_script`を見ない。
         g.scripted = false;
         tick_keys(&mut g, &mut ui, &f, Some(0));
         assert_eq!(orders(&link), [], "台本の無い実行で台本の押下を使った");
         assert_eq!(ui.stats().copy_asks, 1);
     }
 
-    /// 頼んだ後に来た結果だけを、メニューの場面でもマッチの場面でも数秒、左上の知らせの行に出す。
+    /// 頼んだ後に来た結果だけを左上の知らせの行に数秒間出す。メニューの場面でもマッチの場面でも同じ。
     #[test]
     fn the_copy_result_shows_for_a_few_seconds_after_asking_on_every_scene() {
         for scene in [(SCENE_MENU, 0), (SCENE_MATCH, 0)] {
@@ -6620,7 +7134,7 @@ mod tests {
                     event: ev,
                     ..Note::default()
                 };
-                // 頼んでいないのに来ていた出来事は出さない。
+                // 頼んでいないのに来ていたイベントは出さない。
                 link.publish(&note(5));
                 tick_keys(&mut g, &mut ui, &f, Some(0));
                 tick_keys(&mut g, &mut ui, &f, Some(0));
@@ -6645,7 +7159,7 @@ mod tests {
         }
     }
 
-    /// rollback のマッチの間は `NetUi::tick` が呼ばれず、`copy_tick` だけが毎フレーム呼ばれる。そこでも頼みと結果の知らせが動く。
+    /// rollbackのマッチの間は`NetUi::tick`が呼ばれない。`copy_tick`だけが毎フレーム呼ばれ、そこでも依頼と結果の知らせが動く。
     #[test]
     fn copy_tick_alone_asks_and_shows_the_result() {
         let (mut ui, link, b) = new_ui();
@@ -6669,7 +7183,7 @@ mod tests {
         assert_eq!(b.show() & SHOW_COPY, 0, "つながりが終わった後も残った");
     }
 
-    /// 案内は対戦のホストにだけ、`[spectate] enable = 1` のときだけ、「つながりました」の行が出ている間（画面 7 まで）出る。
+    /// 案内が出るのは次の条件がすべて揃ったとき: 対戦のホスト・`[spectate] enable = 1`・「つながりました」の行が出ている間（画面7まで）。
     #[test]
     fn the_hint_shows_only_to_a_host_with_spectating_on_while_the_connected_line_shows() {
         let build = |on: bool| {
@@ -6716,7 +7230,7 @@ mod tests {
         let mut g = Fake::on_screen(7, 0);
         g.step(&mut ui, &linked(true), 0);
         assert_eq!(row_text(b, ROW_COPY), T_SPECTATE_CODE_HINT.en);
-        // 結果が出ている間は結果、消えたら案内に戻る。画面 8 へ進めば案内も消える。
+        // 結果が出ている間は結果、消えたら案内に戻る。画面8へ進めば案内も消える。
         g.keys = Some(0);
         g.step(&mut ui, &linked(true), 0);
         g.keys = Some(K_C | K_CTRL);
@@ -6769,7 +7283,7 @@ mod tests {
                 "ホスト {host}"
             );
             assert_eq!(row_style(b, ROW_COPY), RowStyle::Hint);
-            // Ctrl+C の結果は左上の知らせに出る。
+            // Ctrl+Cの結果は左上の知らせに出る。
             g.keys = Some(0);
             g.step(&mut ui, &off(host), 0);
             g.keys = Some(K_C | K_CTRL);
@@ -6796,7 +7310,7 @@ mod tests {
         assert_eq!(b.show() & SHOW_COPY, 0);
     }
 
-    /// 片づけ（再接続）で案内も結果も待ちも消える。知らせの行は盤に描かれる。
+    /// 後始末（再接続）で案内も結果も待ちも消える。知らせの行は盤に描かれる。
     #[test]
     fn the_copy_row_is_cleared_on_teardown_and_drawn_on_the_board() {
         let (mut ui, link, b) = new_ui();
@@ -6819,7 +7333,7 @@ mod tests {
         ui.after_teardown(Conn::Finished);
         assert_eq!(b.show() & SHOW_COPY, 0);
         assert_eq!(draw_board(b, &s, 640, 480, &mut |_| {}), 0);
-        // 片づけた後に前の結果が来ても、頼んでいないので出ない。
+        // 後始末した後に前の結果が来ても頼んでいないので出ない。
         link.publish(&Note {
             seq: 2,
             event: Event::SpectateCodeCopied,
@@ -6829,9 +7343,315 @@ mod tests {
         assert_eq!(b.show() & SHOW_COPY, 0);
     }
 
+    // ---- 新しいバージョンの知らせ ----
+
+    thread_local! {
+        static ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static FOUND_RAW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn fake_ask() {
+        ASKS.with(|a| a.set(a.get() + 1));
+    }
+
+    fn fake_found() -> u32 {
+        FOUND_RAW.with(std::cell::Cell::get)
+    }
+
+    fn asks() -> u32 {
+        ASKS.with(std::cell::Cell::get)
+    }
+
+    fn news_is_out(f: Found) {
+        FOUND_RAW.with(|c| c.set(f.to_raw()));
+    }
+
+    fn the_news() -> Found {
+        Found::Newer(higanr_core::update_notice::Version::new(1, 2, 3))
+    }
+
+    const BUILD: u32 = 7;
+
+    fn update_ui(build: u32) -> (NetUi, &'static Board) {
+        let b = board();
+        let ui = NetUi::new(ini(), Arc::new(UiLink::new()), b).with_update_check(
+            Some(UpdateHooks {
+                ask: fake_ask,
+                found: fake_found,
+            }),
+            build,
+        );
+        (ui, b)
+    }
+
+    fn at(f: &UiFacts, secs: u64) -> UiFacts {
+        UiFacts {
+            now: f.now + secs,
+            ..*f
+        }
+    }
+
+    /// 「妖怪 対 妖怪」の決定でメニューを開く（画面6・カーソル4で決定を押して離す）。
+    fn open_the_menu(g: &mut Fake, ui: &mut NetUi, f: &UiFacts) {
+        g.step(ui, f, Z);
+        g.step(ui, f, 0);
+        assert!(ui.menu_active(), "メニューが開かない");
+    }
+
+    #[test]
+    fn opening_the_menu_asks_but_not_again_within_ten_minutes() {
+        let (mut ui, _b) = update_ui(BUILD);
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(asks(), 0, "開く前に頼んだ");
+        open_the_menu(&mut g, &mut ui, &facts());
+        assert_eq!(asks(), 1);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(asks(), 1, "開いている間に毎 tick 頼んだ");
+        // 閉じて10分より前に開き直しても取りに行かない。
+        ui.menu.reset();
+        open_the_menu(&mut g, &mut ui, &at(&facts(), 599));
+        assert_eq!(asks(), 1, "10 分より前の開き直しで頼んだ");
+        ui.menu.reset();
+        g.step(&mut ui, &at(&facts(), 600), 0);
+        open_the_menu(&mut g, &mut ui, &at(&facts(), 600));
+        assert_eq!(asks(), 2, "10 分たったのに頼まない");
+    }
+
+    #[test]
+    fn a_dev_build_or_no_hooks_never_ask_nor_read_the_end_menu() {
+        let (mut ui, _b) = update_ui(0);
+        let mut g = Fake::on_match_screen(4);
+        g.end_menu = true;
+        open_the_menu(&mut g, &mut ui, &facts());
+        for f in [linked(true), at(&linked(true), 100_000)] {
+            g.step(&mut ui, &f, 0);
+        }
+        assert_eq!((asks(), g.end_reads), (0, 0));
+        let b = board();
+        let mut bare = NetUi::new(ini(), Arc::new(UiLink::new()), b);
+        let mut g2 = Fake::on_match_screen(4);
+        open_the_menu(&mut g2, &mut bare, &facts());
+        g2.step(&mut bare, &linked(true), 0);
+        assert_eq!((asks(), g2.end_reads), (0, 0), "設定が無いのに動いた");
+    }
+
+    #[test]
+    fn a_connection_asks_once_and_the_end_menu_waits_thirty_minutes() {
+        let (mut ui, _b) = update_ui(BUILD);
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let f = linked(true);
+        g.step(&mut ui, &facts(), 0);
+        g.step(&mut ui, &f, 0);
+        assert_eq!(asks(), 1, "接続が成立したときに頼まない");
+        g.step(&mut ui, &f, 0);
+        assert_eq!(asks(), 1);
+        // 終わりのメニューは前の確認から30分たってから。
+        g.end_menu = true;
+        g.step(&mut ui, &at(&f, 1799), 0);
+        assert_eq!(asks(), 1, "30 分より前に頼んだ");
+        g.end_menu = false;
+        g.step(&mut ui, &at(&f, 1800), 0);
+        g.end_menu = true;
+        g.step(&mut ui, &at(&f, 1800), 0);
+        assert_eq!(asks(), 2, "30 分たったのに頼まない");
+        g.step(&mut ui, &at(&f, 1801), 0);
+        assert_eq!(asks(), 2, "出ている間に毎 tick 頼んだ");
+    }
+
+    #[test]
+    fn the_end_menu_does_nothing_without_a_connection() {
+        let (mut ui, b) = update_ui(BUILD);
+        news_is_out(the_news());
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        g.end_menu = true;
+        for f in [facts(), found_facts(false)] {
+            g.step(&mut ui, &f, 0);
+            assert_eq!(b.show() & SHOW_UPDATE, 0, "接続していないのに出た");
+        }
+        assert_eq!(g.end_reads, 0, "接続していないのに読んだ");
+    }
+
+    #[test]
+    fn once_found_it_stops_asking_and_shows_on_the_end_menu_only_when_connected() {
+        let (mut ui, b) = update_ui(BUILD);
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let f = linked(true);
+        g.step(&mut ui, &f, 0);
+        assert_eq!(asks(), 1);
+        news_is_out(the_news());
+        // 試合中（終わりのメニューが出ていない）は出さない。
+        g.step(&mut ui, &f, 0);
+        assert_eq!(b.show() & SHOW_UPDATE, 0, "試合中に出た");
+        g.end_menu = true;
+        g.step(&mut ui, &f, 0);
+        assert_eq!(b.show() & SHOW_UPDATE, SHOW_UPDATE);
+        assert_eq!(
+            row_text(b, ROW_UPD0),
+            "新しいバージョンがリリースされています（v1.2.3）"
+        );
+        assert_eq!(
+            row_text(b, ROW_UPD1),
+            "更新する場合は開いている花映塚を閉じ、HiganRTool.exeから起動しなおしてください。"
+        );
+        assert_eq!(row_style(b, ROW_UPD0), RowStyle::Notice);
+        assert_eq!(row_style(b, ROW_UPD1), RowStyle::Notice);
+        // 見つかった後は時間がたっても・立ち上がりがあっても取りに行かない。
+        for k in 1..4u64 {
+            g.end_menu = false;
+            g.step(&mut ui, &at(&f, k * 100_000), 0);
+            g.end_menu = true;
+            g.step(&mut ui, &at(&f, k * 100_000), 0);
+        }
+        assert_eq!(asks(), 1, "見つかった後に頼んだ");
+        assert_eq!(b.show() & SHOW_UPDATE, SHOW_UPDATE);
+        // 終わりのメニューが消えれば、左上の行も消える。
+        g.end_menu = false;
+        g.step(&mut ui, &f, 0);
+        assert_eq!(
+            b.show() & SHOW_UPDATE,
+            0,
+            "終わりのメニューが消えても残った"
+        );
+        // 接続が終われば、終わりのメニューが出ていても出さない。
+        g.end_menu = true;
+        g.step(&mut ui, &f, 0);
+        assert_eq!(b.show() & SHOW_UPDATE, SHOW_UPDATE);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(b.show() & SHOW_UPDATE, 0, "接続が終わった後も残った");
+    }
+
+    #[test]
+    fn the_notice_is_in_english_and_without_a_version_when_the_display_is_unreadable() {
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::new(UiLink::new()), b)
+            .with_lang(Lang::En, None)
+            .with_update_check(
+                Some(UpdateHooks {
+                    ask: fake_ask,
+                    found: fake_found,
+                }),
+                BUILD,
+            );
+        news_is_out(Found::Newer(None));
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        g.end_menu = true;
+        g.step(&mut ui, &linked(true), 0);
+        assert_eq!(row_text(b, ROW_UPD0), "A new version has been released");
+        assert_eq!(
+            row_text(b, ROW_UPD1),
+            "To update, close the game and restart it from HiganRTool.exe."
+        );
+    }
+
+    #[test]
+    fn the_notice_goes_under_the_menu_while_it_is_open_and_not_in_the_corner() {
+        let (mut ui, b) = update_ui(BUILD);
+        news_is_out(the_news());
+        let mut g = Fake::on_match_screen(4);
+        g.step(&mut ui, &facts(), 0);
+        open_the_menu(&mut g, &mut ui, &facts());
+        g.step(&mut ui, &facts(), 0);
+        let rows = menu_rows(b);
+        let n = rows.len();
+        assert_eq!(
+            rows[n - 2],
+            "新しいバージョンがリリースされています（v1.2.3）"
+        );
+        assert_eq!(
+            rows[n - 1],
+            "更新する場合は開いている花映塚を閉じ、HiganRTool.exeから起動しなおしてください。"
+        );
+        assert_eq!(row_style(b, n - 1), RowStyle::Notice);
+        assert_eq!(b.show() & SHOW_UPDATE, 0, "メニューの間に左上へも出た");
+        // 接続していて終わりのメニューが出ていても、メニューが開いている間は左上に出さない。
+        let f = linked(true);
+        g.end_menu = true;
+        g.step(&mut ui, &f, 0);
+        assert_eq!(b.show() & SHOW_UPDATE, 0);
+    }
+
+    #[test]
+    fn the_notice_rows_are_drawn_after_the_other_corner_rows() {
+        let (mut ui, b) = update_ui(BUILD);
+        news_is_out(the_news());
+        let mut g = Fake::on_screen(8, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        g.end_menu = true;
+        g.step(&mut ui, &linked(true), 0);
+        let notice_bits = b.show() & SHOW_UPDATE;
+        assert_eq!(notice_bits, SHOW_UPDATE);
+        let s = spec();
+        // 描いたまとまりごとの (左端, 右端, 上端, 下端)。
+        let extents = |show: u32| {
+            b.set_show(show);
+            let mut out = Vec::new();
+            draw_board(b, &s, 640, 480, &mut |v| {
+                assert!(v.len() % 6 == 0);
+                let f = |pick: fn(&Vertex) -> f32, init: f32, step: fn(f32, f32) -> f32| {
+                    v.iter().map(pick).fold(init, step)
+                };
+                out.push((
+                    f(|p| p.x, f32::MAX, f32::min),
+                    f(|p| p.x, f32::MIN, f32::max),
+                    f(|p| p.y, f32::MAX, f32::min),
+                    f(|p| p.y, f32::MIN, f32::max),
+                ));
+            });
+            out
+        };
+        let only = extents(notice_bits);
+        assert_eq!(only.len(), 2, "知らせだけなら 2 行ぶんのまとまり");
+        assert!(only[0].2 < only[1].2, "{only:?}");
+        // 左上の行の置き場（上の枠の下）から始まる。
+        assert!(
+            only[0].2 >= (TL_Y as f32) - 1.0 - lay::PAD as f32,
+            "{only:?}"
+        );
+
+        // 観戦コードの知らせ（左上の続き）と名前の帯を同時に出す。知らせの行はそれらより下。
+        b.set_row(ROW_COPY, "copy", RowStyle::Hint);
+        b.set_row(ROW_NAME_L, "1P ab", RowStyle::Normal);
+        b.set_row(ROW_NAME_R, "cd 2P", RowStyle::Normal);
+        let copy_alone = extents(SHOW_COPY);
+        assert_eq!(copy_alone.len(), 1);
+        let all = extents(notice_bits | SHOW_COPY | SHOW_NAMES);
+        assert_eq!(
+            all.len(),
+            5,
+            "観戦コードの知らせ 1 ＋ 知らせ 2 ＋ 名前の帯 2"
+        );
+        let width = |e: &(f32, f32, f32, f32)| e.1 - e.0;
+        let copy: Vec<_> = all
+            .iter()
+            .filter(|e| width(e) == width(&copy_alone[0]))
+            .collect();
+        assert_eq!(
+            copy.len(),
+            1,
+            "観戦コードの知らせのまとまりが見つからない: {all:?}"
+        );
+        let bands: Vec<_> = all.iter().filter(|e| e.2 < 1.0).collect();
+        assert_eq!(bands.len(), 2, "名前の帯は上の枠の高さ: {all:?}");
+        let bands_bottom = bands.iter().map(|e| e.3).fold(f32::MIN, f32::max);
+        let notice: Vec<_> = all
+            .iter()
+            .filter(|e| e.2 >= 1.0 && width(e) != width(&copy_alone[0]))
+            .collect();
+        assert_eq!(notice.len(), 2, "{all:?}");
+        for n in &notice {
+            assert!(n.2 > copy[0].2, "知らせが観戦コードの知らせより上: {all:?}");
+            assert!(n.2 >= bands_bottom, "知らせが名前の帯と重なる: {all:?}");
+        }
+    }
+
     // ---- プレイヤー名 ----
 
-    /// 名前を覚える仕事の記録（本物は別のスレッドが ini へ書く `ini_save::save_name`）。
+    /// 名前を覚える仕事の記録（本物は別のスレッドがiniへ書く`ini_save::save_name`）。
     static SAVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     fn record_saved(n: NameBuf) {
@@ -6868,7 +7688,7 @@ mod tests {
         );
         assert_eq!(link.take_order(), None, "見張りへの指示にしてはいけない");
         assert_eq!(ui.stats().orders_sent, 0);
-        // クライアント: 初めの値は前回のアドレス。打ち足して決めると呼び手へ届き、ini へ覚えさせる。
+        // クライアント: 初めの値は前回のアドレス。打ち足して決定すると呼び手へ届いてiniへ覚えさせる。
         cursor_to(&mut g, &mut ui, b, "クライアント");
         let o = g.step(&mut ui, &facts(), Z);
         assert_eq!(o.lan, None, "入力を経ずに頼みが出た");
@@ -6884,11 +7704,11 @@ mod tests {
         assert_eq!(o.lan, Some(LanAsk::Client(want)));
         assert_eq!(*LAN_SAVED.lock().unwrap(), vec![want]);
         assert_eq!(link.take_order(), None);
-        // 観戦: 次の初めの値は今決めたアドレス。
+        // 観戦: 次の初めの値は今決定したアドレス。
         g.step(&mut ui, &facts(), 0);
         g.step(&mut ui, &facts(), 0);
         cursor_to(&mut g, &mut ui, b, "観戦");
-        // 入口の「観戦」の見出しの下の行とは別に、LAN の中の「観戦」を選ぶ。
+        // 入口の「観戦」の見出しの下の行とは別にLANの中の「観戦」を選ぶ。
         let rows = menu_rows(b);
         let lan_at = rows.iter().position(|r| r == "LAN").unwrap();
         while !menu_rows(b).iter().skip(lan_at).any(|r| r == "> 観戦") {
@@ -6899,7 +7719,7 @@ mod tests {
         g.step(&mut ui, &facts(), 0);
         assert_eq!(menu_rows(b)[0], "LAN ─ 観戦");
         assert_eq!(menu_rows(b)[2], "ホストのアドレス: 10.0.0.5:19000|");
-        // 「:19000」の 6 文字を消して、ポートを省いた形にする。
+        // 「:19000」の6文字を消して、ポートを省いた形にする。
         g.typed
             .extend("\u{8}".repeat(6).encode_utf16().chain(Some(0x0D)));
         let o = g.step(&mut ui, &facts(), 0);
@@ -6968,14 +7788,14 @@ mod tests {
                 port: 17723
             }))
         );
-        // 出て、入り直す: もう 1 回頼む。
+        // 出て入り直す: もう1回頼む。
         for _ in 0..3 {
             g.step(&mut ui, &facts(), 0);
         }
         enter_client(&mut ui, &mut g, b);
         g.step(&mut ui, &facts(), 0);
         assert_eq!(VPN_SCANS.load(Ordering::SeqCst) - before, 2);
-        // 仕事なし: 同じアドレスを断り、理由を出す。
+        // 仕事なし: 同じアドレスを断って理由を出す。
         let b = board();
         let mut ui = NetUi::new(ini(), Arc::new(UiLink::new()), b);
         let mut g = Fake::on_match_screen(4);
@@ -7069,7 +7889,7 @@ mod tests {
 
     // ---- 画面の言語 ----
 
-    /// 言語を ini へ書く仕事の記録（本物は `script_win::save_ui_lang`）。
+    /// 言語をiniへ書く仕事の記録（本物は`script_win::save_ui_lang`）。
     static LANG_SAVED: std::sync::Mutex<Vec<Lang>> = std::sync::Mutex::new(Vec::new());
 
     fn record_lang(l: Lang) {
@@ -7143,14 +7963,14 @@ mod tests {
         SEAT_SAVED.lock().unwrap_or_else(|e| e.into_inner()).push(w);
     }
 
-    /// 入口のメニューの「設定」の行へ動かして決め、設定の画面を開く（開いたメニューから）。
+    /// 開いたメニューから入口のメニューの「設定」の行へ動かして決定し、設定の画面を開く。
     fn open_settings(g: &mut Fake, ui: &mut NetUi, b: &'static Board) {
         cursor_to(g, ui, b, "設定");
         g.step(ui, &facts(), Z);
         g.step(ui, &facts(), 0);
     }
 
-    /// カーソルを `label` の行まで下げる（設定の画面の行は 名前 → サイド → 同期方式 → ディレイ → 言語 の順）。
+    /// カーソルを`label`の行まで下げる（設定の画面の行は 名前 → サイド → 同期方式 → ディレイ → 言語 の順）。
     fn cursor_to(g: &mut Fake, ui: &mut NetUi, b: &'static Board, label: &str) {
         for _ in 0..16 {
             if menu_rows(b)
@@ -7356,7 +8176,7 @@ mod tests {
         ui.hud(true, hud_with(Some(names_of(Seat::P1))));
         ui.peer_wait(true);
         assert_eq!(row_text(b, ROW_PEER_WAIT), T_PEER_WAIT.ja);
-        // マッチの場面の tick・左上の行・メニューの更新・マッチ中の行を消す更新のどれも、知らせを消さない。
+        // マッチの場面のtick・左上の行・メニューの更新・マッチ中の行を消す更新のどれも知らせを消さない。
         let mut g = Fake::on_screen(6, 0);
         g.scenes = (SCENE_MATCH, 0);
         g.view = None;
@@ -7377,7 +8197,7 @@ mod tests {
         ui.after_teardown(Conn::Finished);
         assert_eq!(b.show() & SHOW_PEER_WAIT, 0, "片づけた後も残った");
 
-        // 描く: 左上の行の続き（左上の行が無ければ 1 行目）。
+        // 描く: 左上の行の続き（左上の行が無ければ1行目）。
         let s = spec();
         let (sw, sh) = (640u32, 480u32);
         let texels = vec![0xFFFF_FFFFu32; s.texel_count()];
@@ -7514,7 +8334,7 @@ mod tests {
             (lay::HUD_EDGE_X..lay::HUD_EDGE_X + 5).contains(&x0),
             "左端 {x0}"
         );
-        // 最後の文字（`>`）の右端が fps の文字（x = 284）の手前（半角 1 文字ぶんの隙間を残す: `HUD_BOTTOM_RIGHT` = 277）に収まる。
+        // 最後の文字（`>`）の右端がfpsの文字（x = 284）の手前（半角1文字ぶんの隙間を残す: `HUD_BOTTOM_RIGHT` = 277）に収まる。
         assert!(x1 < lay::HUD_BOTTOM_RIGHT, "右端 {x1} が fps に近すぎる");
         assert!(
             x1 + 1 >= lay::HUD_EDGE_X + 50 * 5,
@@ -7529,6 +8349,12 @@ mod tests {
             "墨が文字の高さを越える"
         );
         assert_eq!(ink(RowStyle::Normal, "ping 14ms"), None);
+    }
+
+    use higanr_core::end_outline::{RGB_1P, RGB_2P};
+
+    fn rgb_of(c: u32) -> [u8; 3] {
+        [(c >> 16) as u8, (c >> 8) as u8, c as u8]
     }
 
     #[test]
@@ -7551,9 +8377,17 @@ mod tests {
             [canvas[i], canvas[i + 1], canvas[i + 2]]
         };
         let white = [255, 255, 255];
+        let (red, blue) = (rgb_of(RGB_1P), rgb_of(RGB_2P));
         let w_left = lay::text_width_plain(&s, "1P ab");
         let w_right = lay::text_width_plain(&s, "cd 2P");
-        assert_eq!(px(lay::HUD_EDGE_X, HUD_Y), white);
+        let w_label = lay::text_width_plain(&s, "1P");
+        assert_eq!(px(lay::HUD_EDGE_X, HUD_Y), red, "1P の語は赤");
+        assert_eq!(px(lay::HUD_EDGE_X + w_label - 1, HUD_Y), red);
+        assert_eq!(
+            px(lay::HUD_EDGE_X + w_label + 7, HUD_Y),
+            white,
+            "名前の文字は白のまま"
+        );
         assert_eq!(
             px(lay::HUD_EDGE_X + w_left - 1, HUD_Y),
             white,
@@ -7567,10 +8401,20 @@ mod tests {
         let right_end = sw - lay::HUD_EDGE_X;
         assert_eq!(
             px(right_end - 1, HUD_Y),
-            white,
-            "右の帯の最後の文字が右端でない"
+            blue,
+            "右の帯の最後の文字が右端でない（2P の語は青）"
         );
         assert_eq!(px(right_end, HUD_Y), [0, 0, 0]);
+        assert_eq!(
+            px(right_end - lay::text_width_plain(&s, "2P"), HUD_Y),
+            blue,
+            "2P の語の最初の文字"
+        );
+        assert_eq!(
+            px(right_end - lay::text_width_plain(&s, "2P") - 1, HUD_Y),
+            [0, 0, 0],
+            "名前と語の間の空白"
+        );
         assert_eq!(px(right_end - w_right, HUD_Y), white, "右の帯の最初の文字");
         assert_eq!(px(right_end - w_right - 1, HUD_Y), [0, 0, 0]);
         assert_eq!(
@@ -7587,6 +8431,180 @@ mod tests {
         assert_eq!(n, 3);
         let i = ((((lay::hud_bottom_y(sh) + HUD_Y) * sw) + lay::HUD_EDGE_X) * 3) as usize;
         assert_eq!(&canvas[i..i + 3], &white);
+    }
+
+    /// 全面が白の文字の表で`b`を描き、白（255）の画素の外接の矩形`(x0, y0, x1, y1)`を返す（下の枠`y >= from_y`だけ）。
+    fn white_ink(b: &Board, from_y: u32) -> Option<(u32, u32, u32, u32)> {
+        let s = spec();
+        let (sw, sh) = (640u32, 480u32);
+        let texels = vec![0xFFFF_FFFFu32; s.texel_count()];
+        let mut canvas = vec![0u8; (sw * sh * 3) as usize];
+        draw_board(b, &s, sw, sh, &mut |v| {
+            blit_quads(v, &texels, s.tex_w, s.tex_h, &mut canvas, sw, sh, 0, 0);
+        });
+        let mut r: Option<(u32, u32, u32, u32)> = None;
+        for y in from_y..sh {
+            for x in 0..sw {
+                if canvas[((y * sw + x) * 3) as usize] == 255 {
+                    r = Some(match r {
+                        None => (x, y, x, y),
+                        Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x), d.max(y)),
+                    });
+                }
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn the_status_line_on_the_right_is_right_aligned_and_never_reaches_the_fps_text() {
+        let s = spec();
+        let top = lay::hud_bottom_y(480);
+        let b = board();
+        b.set_row(ROW_HUD, "xy", RowStyle::Normal);
+        b.set_show(SHOW_HUD);
+        assert_eq!(
+            white_ink(b, top).map(|r| r.0),
+            Some(lay::HUD_EDGE_X),
+            "既定は左下"
+        );
+        b.set_hud_right(true);
+        let w = lay::text_width_plain(&s, "xy");
+        let (x0, y0, x1, y1) = white_ink(b, top).expect("右下に出ない");
+        assert_eq!(
+            (x0, x1),
+            (640 - lay::HUD_EDGE_X - w, 640 - lay::HUD_EDGE_X - 1),
+            "右端から HUD_EDGE_X あけて右寄せ"
+        );
+        assert_eq!((y0, y1), (top + HUD_Y, top + HUD_Y + 13));
+        // 出しうる一番長い行（左下の上限いっぱい）でも、fpsの文字（x = 284..352）に重ならない。
+        let longest = "Delay* 9 (9)  ping 4294967295ms  rollback 255  ".repeat(3);
+        for right in [false, true] {
+            b.set_row(ROW_HUD, &longest, RowStyle::Normal);
+            b.set_hud_right(right);
+            let (x0, _, x1, _) = white_ink(b, top).unwrap();
+            let (lo, hi) = if right {
+                (lay::HUD_BOTTOM_LEFT_MIN, 640 - lay::HUD_EDGE_X)
+            } else {
+                (lay::HUD_EDGE_X, lay::HUD_BOTTOM_RIGHT)
+            };
+            assert!(
+                x0 >= lo && x1 < hi,
+                "right={right}: 墨 {x0}..{x1} が {lo}..{hi} の外"
+            );
+            assert!(
+                x1 < lay::FPS_LEFT || x0 > lay::FPS_RIGHT,
+                "right={right}: 墨 {x0}..{x1} が fps（{}..{}）に重なる",
+                lay::FPS_LEFT,
+                lay::FPS_RIGHT
+            );
+            assert!(
+                x1 - x0 + 1 >= 200,
+                "right={right}: 長い行が途中で切れすぎ（{x0}..{x1}）"
+            );
+        }
+    }
+
+    #[test]
+    fn a_banded_text_colors_only_the_accent_range_and_is_cut_by_the_total_width() {
+        let s = spec();
+        let (base, hot) = (0xFFFF_FFFFu32, SEAT_COLOR_1P);
+        let mut out = [Vertex::default(); 120];
+        let colors = |out: &[Vertex], n: usize| -> Vec<u32> {
+            (0..n / 6).map(|q| out[q * 6].color).collect()
+        };
+        // 語の2文字が赤、空白は四角なし、名前の文字は白。
+        let n = push_banded(
+            &mut out,
+            0,
+            &s,
+            (2, 1),
+            "1P ab",
+            (base, Some((0..2, hot))),
+            1000,
+        );
+        assert_eq!(colors(&out, n), vec![hot, hot, base, base]);
+        // 末尾の語（2Pの帯）。
+        let n = push_banded(
+            &mut out,
+            0,
+            &s,
+            (2, 1),
+            "ab 2P",
+            (base, Some((3..5, hot))),
+            1000,
+        );
+        assert_eq!(colors(&out, n), vec![base, base, hot, hot]);
+        // 全体の幅で切る: 幅3文字ぶん（21）なら語の2文字と空白で終わり、名前は描かない。
+        let n = push_banded(
+            &mut out,
+            0,
+            &s,
+            (2, 1),
+            "1P ab",
+            (base, Some((0..2, hot))),
+            21,
+        );
+        assert_eq!(colors(&out, n), vec![hot, hot]);
+        // 語の途中で切れたら後ろの部分を詰めて描かない。
+        let n = push_banded(
+            &mut out,
+            0,
+            &s,
+            (2, 1),
+            "ab 2P",
+            (base, Some((3..5, hot))),
+            20,
+        );
+        assert_eq!(colors(&out, n), vec![base, base]);
+        // 範囲が文字の境目でない・逆なら色は付けない（全部ふつうの色）。
+        let reversed = core::ops::Range { start: 2, end: 1 };
+        for bad in [1..2, reversed, 0..9] {
+            let n = push_banded(
+                &mut out,
+                0,
+                &s,
+                (2, 1),
+                "あb",
+                (base, Some((bad, hot))),
+                1000,
+            );
+            assert_eq!(colors(&out, n), vec![base, base]);
+        }
+        let n = push_banded(&mut out, 0, &s, (2, 1), "ab", (base, None), 1000);
+        assert_eq!(colors(&out, n), vec![base, base]);
+    }
+
+    #[test]
+    fn the_status_side_setting_picks_the_side_from_the_own_seat_and_watchers_stay_left() {
+        let hud = |seat| HudFacts {
+            latency: Some(1),
+            seat,
+            ..HudFacts::default()
+        };
+        let mut checked = 0;
+        for side in StatusSide::ALL {
+            for seat in [Some(Seat::P1), Some(Seat::P2), None] {
+                let (ui, _l, b) = new_ui();
+                let mut ui = ui.with_status_side(side);
+                assert!(!b.hud_right());
+                ui.hud(true, hud(seat));
+                assert_eq!(
+                    b.hud_right(),
+                    side.on_right(seat.unwrap_or(Seat::P1)),
+                    "{side:?} {seat:?}"
+                );
+                checked += 1;
+                // 観戦者の画面は設定によらず左下。
+                ui.watch_hud(true, WatchHudFacts::default());
+                assert!(!b.hud_right(), "{side:?}: 観戦者の行が右に出た");
+                // 試合の外（消す）で置き場所を触らず、次の試合で設定に戻る。
+                ui.hud(true, hud(seat));
+                ui.hud(false, HudFacts::default());
+                assert_eq!(b.hud_right(), side.on_right(seat.unwrap_or(Seat::P1)));
+            }
+        }
+        assert_eq!(checked, 12);
     }
 
     // ---------------- 観戦の「ランダムマッチ」の一覧 ----------------
@@ -7612,7 +8630,7 @@ mod tests {
             !link.read_watch_list(&mut snap, &mut seen),
             "同じバージョンは読み直さない"
         );
-        // 行が減る・状態だけ変わる・100 件を越える分は捨てる。
+        // 行が減る・状態だけ変わる・100件を越える分は捨てる。
         link.publish_watch_list(ListStatus::Failed, &[]);
         assert!(link.read_watch_list(&mut snap, &mut seen));
         assert_eq!((snap.status, snap.len()), (ListStatus::Failed, 0));
@@ -7620,7 +8638,7 @@ mod tests {
         link.publish_watch_list(ListStatus::Ready, &many);
         assert!(link.read_watch_list(&mut snap, &mut seen));
         assert_eq!(snap.len(), 100);
-        // 開いた時点のバージョンを覚えれば、それ以前に設定された一覧は読まない。
+        // 開いた時点のバージョンを覚えればそれ以前に設定された一覧は読まない。
         let mut seen = link.watch_list_version();
         assert!(!link.read_watch_list(&mut snap, &mut seen));
         link.publish_watch_list(ListStatus::Loading, &[]);
@@ -7645,7 +8663,7 @@ mod tests {
         let other = watch_row(8, "Carol", "Dave", 0);
         link.send(Cmd::SpectateListed(other));
         assert_eq!(link.spectate_pick(), Some(other));
-        // 観戦の「ルームマッチ」でルーム名を打ったら、古い選びは残らない（その名で入る）。
+        // 観戦の「ルームマッチ」でルーム名を打ったら古い選びは残らない（その名で入る）。
         link.send(Cmd::Spectate(RoomBuf::from_name("typed-1").unwrap()));
         assert_eq!(link.spectate_pick(), None);
         assert_eq!(link.spectate_name(), RoomBuf::from_name("typed-1"));
@@ -7700,7 +8718,7 @@ mod tests {
                 let _ = ui.tick(g, &f);
             }
         };
-        // 開く → 観戦の「ランダムマッチ」（上から 3 つ下）を決める。
+        // 開く → 観戦の「ランダムマッチ」（上から3つ下）を決める。
         tick(&mut ui, &mut g, &[Z, 0, DOWN, 0, DOWN, 0, DOWN, 0, Z, 0]);
         assert!(ui.menu.wants_watch_list());
         assert_eq!(
@@ -7740,7 +8758,7 @@ mod tests {
             1,
             "画面の中で接続を開け直した"
         );
-        // 行を決めると、その行が指示になって一覧の画面を出る（接続を閉じる）。満員の 2 行目は飛んでいる。
+        // 行を決定するとその行が指示になって一覧の画面を出る（接続を閉じる）。満員の2行目は飛ばされる。
         let shown = menu_rows(b);
         let marked: Vec<&String> = shown.iter().filter(|l| l.starts_with("> ")).collect();
         assert_eq!(marked.len(), 1, "{shown:?}");
@@ -7800,7 +8818,7 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("Alice") && l.contains("3/10"))
         );
-        // キャンセル: 接続を閉じ、次に開いたときは前の行を見せない（取得中から）。
+        // キャンセル: 接続を閉じる。次に開いたときは前の行を見せない（取得中から）。
         g.step(&mut ui, &facts(), X);
         g.step(&mut ui, &facts(), 0);
         assert!(!ui.menu.wants_watch_list() && ui.menu_active());
@@ -7818,7 +8836,7 @@ mod tests {
             t.iter().any(|l| l.contains("一覧を取得しています。")),
             "{t:?}"
         );
-        // 前に書いた一覧が入れ物に残っていても、開き直した後に設定されたものだけを読む。
+        // 前に書いた一覧がバッファに残っていても開き直した後に設定されたものだけを読む。
         g.step(&mut ui, &facts(), 0);
         assert!(!menu_rows(b).iter().any(|l| l.contains("Alice")));
     }

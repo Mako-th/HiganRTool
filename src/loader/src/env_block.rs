@@ -1,8 +1,9 @@
-//! 子のプロセスへ渡す環境ブロック（`CreateProcessW` の lpEnvironment。pure）。
+//! 子のプロセスへ渡す環境ブロック（`CreateProcessW`のlpEnvironment。pure）。
 //!
-//! ゲームごとの ini と台本の場所を DLL へ伝える環境変数を、親の環境を変えずに子のためだけに組む。
-//! 形は `名前=値\0` を並べて最後にもう 1 つ `\0`（UTF-16 なので `CREATE_UNICODE_ENVIRONMENT`）。並びは大文字小文字を区別しない順
-//! （ASCII の英字だけ折る。ずれても子は起動する）。`=C:=C:\…` のような隠れた行もそのまま残す。
+//! ゲームごとのiniと台本の場所をDLLへ伝える環境変数を親の環境を変えずに子のためだけに組む。
+//! 形は`名前=値\0`を並べて最後にもう1つ`\0`（UTF-16なので`CREATE_UNICODE_ENVIRONMENT`）。
+//! 並びは大文字小文字を区別しない順（ASCIIの英字だけ折る。ずれても子は起動する）。
+//! `=C:=C:\…`のような隠れた行もそのまま残す。
 
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
@@ -20,12 +21,12 @@ fn cmp_name(a: &[u16], b: &[u16]) -> Ordering {
     a.iter().map(|&u| fold(u)).cmp(b.iter().map(|&u| fold(u)))
 }
 
-/// 上書きする名前として使えるか。空・`=` を含む・0 を含む名前は断る（`=` を入れると子が別の名前と読む）。
+/// 上書きする名前として使えるかどうか。空・`=`を含む・0を含む名前は断る（`=`を含めると子が別の名前と読む）。
 fn valid_override_name(name: &[u16]) -> bool {
     !name.is_empty() && !name.contains(&u16::from(b'=')) && !name.contains(&0)
 }
 
-/// 同名（大文字小文字を区別しない）は置き換え、無ければ足す。名前か値が使えなければ `None`。親の行に 0 があればその行だけ落とす。
+/// 同名（大文字小文字を区別しない）は置き換え、無ければ足す。名前か値が使えなければ`None`。親の行に0があればその行だけ落とす。
 pub fn build<I>(parent: I, overrides: &[(OsString, OsString)]) -> Option<Vec<u16>>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
@@ -49,7 +50,7 @@ where
         .filter(|(k, _)| !over.iter().any(|(o, _)| cmp_name(o, k) == Ordering::Equal))
         .collect();
     rows.extend(over);
-    // 安定した並べ替え（同名が親に 2 度あっても順を保つ）。
+    // 安定した並べ替え（同名が親に2度あっても順を保つ）。
     rows.sort_by(|a, b| cmp_name(&a.0, &b.0));
     let mut block = Vec::new();
     for (k, v) in rows {
@@ -58,7 +59,7 @@ where
         block.extend_from_slice(&v);
         block.push(0);
     }
-    // 空のブロックでも終端は 2 つの 0（1 つだと子が次のアドレスを読みに行く）。
+    // 空のブロックでも終端は2つの0（1つだと子が次のアドレスを読みに行く）。
     if block.is_empty() {
         block.push(0);
     }

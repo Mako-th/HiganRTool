@@ -1,52 +1,54 @@
 //! 進行中のランダム対戦の一覧（`src/server/src/watch_list.ts`）のクライアントの純粋な部品。
-//! - **載せる口**（[`HostClient`]）: ランダム対戦のホストが持ち続ける。接続したら割り当てのルーム名（`q.…`）・1P と 2P の名前・同期方式・
-//!   観戦者の数と上限を `post` で送り、`listed` を待つ。以後は観戦者の数が変わるたびに `count` を送る。切れたら一覧から消える。
+//! - **載せる口**（[`HostClient`]）: ランダム対戦のホストが持ち続ける。
+//!   接続したら割り当てのルーム名（`q.…`）・1Pと2Pの名前・同期方式・観戦者の数と上限を`post`で送り、`listed`を待つ。
+//!   以後は観戦者の数が変わるたびに`count`を送る。切れたら一覧から消える。
 //! - **見る口**（[`ViewClient`]）: 観戦者が一覧を開いている間だけ持つ。接続すると一覧の全体が届き、変わるたびに全体が届く。
 //!
-//! サーバーは観戦用のルーム名（`w.…`）を割り当ての名から自分で導き、一覧には `w.…` だけを載せる。割り当ての名は画面にもログにも出さない
-//! （[`crate::room_queue::AssignedRoom`] の `Debug` は名を伏せる）。待ち列・ルームの手順と同じく、ソケットも時計も持たない。
-//! 見張りのスレッドで回す。ゲームのスレッドでは呼ばない（一覧をゲームのスレッドへ渡す入れ物は [`WatchSnapshot`]・[`WatchRow::to_words`]）。
+//! サーバーは観戦用のルーム名（`w.…`）を割り当ての名から自分で導き、一覧には`w.…`だけを載せる。
+//! 割り当ての名は画面にもログにも出さない（[`crate::room_queue::AssignedRoom`]の`Debug`は名を伏せる）。
+//! 待ち列・ルームの手順と同じくソケットも時計も持たない。
+//! 監視のスレッドで回す。ゲームのスレッドでは呼ばない（一覧をゲームのスレッドへ渡すバッファは[`WatchSnapshot`]・[`WatchRow::to_words`]）。
 #![forbid(unsafe_code)]
 
 use crate::room::{
     CloseCode, Failure, Fields, JsonAt, JsonValue, MESSAGE_MAX_BYTES, MsgError, Now,
-    PING_INTERVAL_MS, PING_TEXT, PONG_TIMEOUT_MS, ROOM_GREETING_TIMEOUT_MS, RoomName, Why,
-    classify_http, hex_lower, parse_flat, parse_flat_with_items,
+    PING_INTERVAL_MS, PING_TEXT, PONG_TIMEOUT_MS, ROOM_GREETING_TIMEOUT_MS, RoomName, SeatTicket,
+    Why, classify_http, hex_lower, parse_flat, parse_flat_with_items,
 };
 use crate::room_queue::AssignedRoom;
 use crate::spectate::MAX_SPECTATORS;
 use crate::wire::Mode;
 
-// ---------------- サーバーの決まり（見本 tests/fixtures/room/rules.json の watch_*） ----------------
+// ---------------- サーバーの決まり（見本tests/fixtures/room/rules.jsonのwatch_*） ----------------
 
-/// 一覧のパスの先頭。後ろにビルド番号（10 進）と `post` か `view` が付く（`rules.ts` の `WATCH_PATH_PREFIX`）。
+/// 一覧のパスの先頭。後ろにビルド番号（10進）と`post`か`view`が付く（`rules.ts`の`WATCH_PATH_PREFIX`）。
 pub const WATCH_PATH_PREFIX: &str = "/v0/watch/";
 pub const WATCH_POST_SEGMENT: &str = "post";
 pub const WATCH_VIEW_SEGMENT: &str = "view";
 /// 一覧の件数の上限（サーバーが全体で受ける数）。
 pub const WATCH_ROWS_MAX: usize = 100;
-/// 観戦者の上限として受ける値（サーバーの `WATCH_CAP_MAX`。観戦のホストの上限と同じ）。
+/// 観戦者の上限として受ける値（サーバーの`WATCH_CAP_MAX`。観戦のホストの上限と同じ）。
 pub const WATCH_CAP_MAX: usize = MAX_SPECTATORS;
-/// 受ける遅延フレーム数の最大（サーバーの `WATCH_DELAY_MAX`）。
+/// 受ける遅延フレーム数の最大（サーバーの`WATCH_DELAY_MAX`）。
 pub const WATCH_DELAY_MAX: u8 = 15;
-/// プレイヤー名の文字数の上限（サーバーの `WATCH_NAME_MAX`。HELLO の name の上限と同じ）。
+/// プレイヤー名の文字数の上限（サーバーの`WATCH_NAME_MAX`。HELLOのnameの上限と同じ）。
 pub const WATCH_NAME_MAX: usize = crate::wire::NAME_MAX;
-/// 一覧の 1 通の上限（バイト。サーバーの `WATCH_LIST_MAX_BYTES`）。ふつうの 1 通は 2 KB に収まらないので、ルームの上限とは別に持つ。
+/// 一覧の1通の上限（バイト。サーバーの`WATCH_LIST_MAX_BYTES`）。ふつうの1通は2 KBに収まらないのでルームの上限とは別に持つ。
 pub const WATCH_LIST_MAX_BYTES: usize = 32 * 1024;
-/// 観戦用のルーム名の先頭と、続く 16 進の文字数（[`RoomName::spectate_of`] と同じ）。
+/// 観戦用のルーム名の先頭と、続く16進の文字数（[`RoomName::spectate_of`]と同じ）。
 const SPECTATE_PREFIX: &str = crate::room::SPECTATE_ROOM_PREFIX;
 const HASH_BYTES: usize = 8;
 
 const _: () = assert!(WATCH_CAP_MAX == 10);
 
-/// このマッチを観戦させてよいか。`own` は自分の `[spectate] enable = 1`、`peer` は相手が HELLO の +3 の bit2 で名乗った同じ設定。
-/// 片方でも許可していなければ、どの入口（ランダムマッチの一覧・観戦用のルーム・観戦コード・LAN の観戦）でも観戦の受付を作らない。
-/// 2 人が同じ 2 つの値から決めるので、どちらがホストになっても結論は同じ。
+/// このマッチを観戦させてよいかどうか。`own`は自分の`[spectate] enable = 1`、`peer`は相手がHELLOの +3のbit2で名乗った同じ設定。
+/// 片方でも許可していなければどの入口（ランダムマッチの一覧・観戦用のルーム・観戦コード・LANの観戦）でも観戦の受付を作らない。
+/// 2人が同じ2つの値から決めるのでどちらがホストになっても結論は同じ。
 pub fn may_list(own: bool, peer: bool) -> bool {
     own && peer
 }
 
-/// 載せる口のパス（`/v0/watch/<ビルド番号>/post`。ビルド番号は 10 進で先頭に 0 を付けない）。
+/// 載せる口のパス（`/v0/watch/<ビルド番号>/post`。ビルド番号は10進で先頭に0を付けない）。
 pub fn watch_post_path(build: u32) -> String {
     format!("{WATCH_PATH_PREFIX}{build}/{WATCH_POST_SEGMENT}")
 }
@@ -58,7 +60,7 @@ pub fn watch_view_path(build: u32) -> String {
 
 // ---------------- 名前 ----------------
 
-/// 一覧に載せるプレイヤー名。サーバーが受ける文字（ASCII の英数字・`-`・`_`・`@` と、受けない文字の置き換えの `?`）の 1〜32 文字だけ。
+/// 一覧に載せるプレイヤー名。サーバーが受ける文字（`RoomName::accepts_char`。受けない文字の置き換えの`?`も含む）の1〜32文字で、前後に空白を持たない。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WatchName {
     bytes: [u8; WATCH_NAME_MAX],
@@ -72,7 +74,7 @@ impl core::fmt::Debug for WatchName {
 }
 
 fn name_byte_ok(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'@' | b'?')
+    RoomName::accepts_char(char::from(b))
 }
 
 impl WatchName {
@@ -87,6 +89,9 @@ impl WatchName {
         if b.is_empty() || b.len() > WATCH_NAME_MAX || !b.iter().all(|&c| name_byte_ok(c)) {
             return None;
         }
+        if b.first() == Some(&b' ') || b.last() == Some(&b' ') {
+            return None;
+        }
         let mut bytes = [0u8; WATCH_NAME_MAX];
         bytes.get_mut(..b.len())?.copy_from_slice(b);
         Some(WatchName {
@@ -95,8 +100,8 @@ impl WatchName {
         })
     }
 
-    /// 任意の名前（プレイヤー名の文字の決まりの外を含む）を載せられる形にする（書き手用）: 前後の空白を除き、使えない文字は `?` 1 つに
-    /// して 32 文字で切る。空になれば `?`。
+    /// 任意の名前（プレイヤー名の文字の決まりの外を含む）を載せられる形にする（書き手用）。
+    /// 前後の空白を除き、使えない文字は`?` 1つにして32文字で切る。空になれば`?`。
     pub fn lossy(s: &str) -> WatchName {
         let mut bytes = [0u8; WATCH_NAME_MAX];
         let mut n = 0usize;
@@ -111,6 +116,13 @@ impl WatchName {
                 n += 1;
             }
         }
+        // 32文字で切った端が空白なら落とす。サーバーが断る形（前後の空白）になるため。
+        while n > 0 && bytes.get(n - 1) == Some(&b' ') {
+            n -= 1;
+            if let Some(slot) = bytes.get_mut(n) {
+                *slot = 0;
+            }
+        }
         if n == 0 {
             bytes[0] = b'?';
             n = 1;
@@ -122,7 +134,7 @@ impl WatchName {
     }
 
     pub fn as_str(&self) -> &str {
-        // 入るのは ASCII だけ。
+        // 入るのはASCIIだけ。
         core::str::from_utf8(self.bytes.get(..usize::from(self.len)).unwrap_or(&[])).unwrap_or("")
     }
 
@@ -135,9 +147,9 @@ impl WatchName {
     }
 }
 
-// ---------------- 一覧の 1 行 ----------------
+// ---------------- 一覧の1行 ----------------
 
-/// 一覧の 1 行（進行中のランダム対戦 1 つ）。観戦用のルーム名はハッシュの 8 B で持つ（`w.` ＋ 16 進 16 文字）。
+/// 一覧の1行（進行中のランダム対戦1つ）。観戦用のルーム名はハッシュの8 Bで持つ（`w.` ＋ 16進16文字）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchRow {
     pub hash: [u8; HASH_BYTES],
@@ -149,7 +161,7 @@ pub struct WatchRow {
     pub cap: u8,
 }
 
-/// `WatchRow::to_words` の語の数（ハッシュ 2・名前 8 + 8・名前の長さ ＋ 方式 ＋ 遅延 1・観戦者の数と上限 1）。
+/// `WatchRow::to_words`のワードの数（ハッシュ2・名前 8 + 8・名前の長さ ＋ 方式 ＋ 遅延1・観戦者の数と上限1）。
 pub const WATCH_ROW_WORDS: usize = 2 + WATCH_NAME_MAX / 4 + WATCH_NAME_MAX / 4 + 1 + 1;
 const _: () = assert!(WATCH_NAME_MAX.is_multiple_of(4));
 
@@ -169,7 +181,7 @@ impl WatchRow {
         self.watchers >= self.cap
     }
 
-    /// 観戦用のルーム名（`w.` ＋ ハッシュの 16 進）。観戦者はこの名で今の観戦の入り方（観戦用のルームの guest）へ入る。
+    /// 観戦用のルーム名（`w.` ＋ ハッシュの16進）。観戦者はこの名で今の観戦の入り方（観戦用のルームのguest）へ入る。
     pub fn room_name(&self) -> Option<RoomName> {
         let mut s = String::with_capacity(SPECTATE_PREFIX.len() + 2 * HASH_BYTES);
         s.push_str(SPECTATE_PREFIX);
@@ -180,7 +192,7 @@ impl WatchRow {
         RoomName::parse_server_rules(&s).ok()
     }
 
-    /// 見張りの側（書き手）が、ゲームのスレッドへ渡す入れ物（原子変数の語）に詰める。
+    /// 監視の処理（書き手）がゲームのスレッドへ渡すバッファ（アトミック変数のワード）に詰める。
     pub fn to_words(&self) -> [u32; WATCH_ROW_WORDS] {
         let mut w = [0u32; WATCH_ROW_WORDS];
         let le = |c: &[u8]| u32::from_le_bytes(c.try_into().unwrap_or([0; 4]));
@@ -197,7 +209,7 @@ impl WatchRow {
             i += 1;
         }
         let mode = u32::from(self.mode == Mode::Rollback);
-        // 語 18: 1P の長さ（0〜7 ビット）・2P の長さ（8〜15）・方式（16）・遅延（24〜31）。
+        // ワード18: 1Pの長さ（0〜7ビット）・2Pの長さ（8〜15）・方式（16）・遅延（24〜31）。
         w[i] = u32::from(self.p1.len)
             | (u32::from(self.p2.len) << 8)
             | (mode << 16)
@@ -206,7 +218,7 @@ impl WatchRow {
         w
     }
 
-    /// `to_words` の逆。長さ・文字・数が決まりの外なら `None`（読み出しの途中で別の書き手が書いた語を取り違えない保険）。
+    /// `to_words`の逆。長さ・文字・数が決まりの外なら`None`（読み出しの途中で別の書き手が書いたワードを取り違えない保険）。
     pub fn from_words(w: &[u32; WATCH_ROW_WORDS]) -> Option<WatchRow> {
         let mut hash = [0u8; HASH_BYTES];
         for (c, v) in hash.chunks_mut(4).zip(&w[0..2]) {
@@ -277,7 +289,7 @@ fn int_in(f: &Fields<'_, '_>, key: &'static str, lo: i64, hi: i64) -> Option<i64
     }
 }
 
-/// サーバーの一覧の 1 行を読む。決まりの外なら `None`。
+/// サーバーの一覧の1行を読む。決まりの外なら`None`。
 fn read_row(pairs: &[(std::borrow::Cow<'_, str>, JsonValue<'_>)]) -> Option<WatchRow> {
     let f = Fields(pairs);
     let hash = parse_hash(f.str("room").ok()?)?;
@@ -309,13 +321,13 @@ pub enum ListStatus {
     /// まだ一覧が届いていない（接続している）。
     #[default]
     Loading,
-    /// 一覧が届いている（0 件でもここ）。
+    /// 一覧が届いている（0件でもここ）。
     Ready,
     /// 接続できなかった・切れた。
     Failed,
 }
 
-/// メニューが読む一覧（ゲームのスレッドで確保しない固定の配列）。書き手は見張りの側。
+/// メニューが読む一覧（ゲームのスレッドで確保しない固定の配列）。書き手は監視の処理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchSnapshot {
     pub status: ListStatus,
@@ -342,7 +354,7 @@ impl WatchSnapshot {
         self.len == 0
     }
 
-    /// 行を入れ替える（`WATCH_ROWS_MAX` を越える分は捨てる）。
+    /// 行を入れ替える（`WATCH_ROWS_MAX`を越える分は捨てる）。
     pub fn set(&mut self, status: ListStatus, rows: &[WatchRow]) {
         self.status = status;
         self.len = rows.len().min(WATCH_ROWS_MAX);
@@ -351,7 +363,7 @@ impl WatchSnapshot {
         }
     }
 
-    /// 検査と読み手が 1 行ずつ足すとき用。満杯なら足さずに false。
+    /// 検査と読み手が1行ずつ足すとき用。満杯なら足さずにfalse。
     pub fn push(&mut self, row: WatchRow) -> bool {
         match self.rows.get_mut(self.len) {
             Some(slot) => {
@@ -379,10 +391,10 @@ impl Default for WatchSnapshot {
 /// 載せる口に届く文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMsg {
-    /// `post` が通って一覧に載った。
+    /// `post`が通って一覧に載った。
     Listed,
     Pong,
-    /// 閉じる直前の 1 通。知らない名は `None`。
+    /// 閉じる直前の1通。知らない名は`None`。
     Error {
         code: Option<CloseCode>,
     },
@@ -407,7 +419,8 @@ pub fn parse_host_message(text: &str) -> Result<HostMsg, MsgError> {
 /// 見る口に届く文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMsg {
-    /// 一覧の全体。決まりの外の行は捨てて、その数を `skipped` に（サーバーは出さないので、増えたらサーバーか途中が壊れている）。
+    /// 一覧の全体。決まりの外の行は捨てて、その数を`skipped`に数える。
+    /// サーバーは決まりの外の行を出さないので、増えたらサーバーか途中が壊れている。
     List {
         rows: Vec<WatchRow>,
         skipped: usize,
@@ -427,7 +440,7 @@ pub fn parse_view_message(text: &str) -> Result<ViewMsg, MsgError> {
     let f = Fields(&head);
     match f.str("t")? {
         "list" => {
-            // `items` が配列でなければ（鍵が無い・別の型）一覧の文ではない。
+            // `items`が配列でなければ（キーが無い・別の型）一覧の文ではない。
             if !matches!(f.get("items"), Some(JsonValue::Other)) {
                 return Err(MsgError::Missing("items"));
             }
@@ -443,7 +456,9 @@ pub fn parse_view_message(text: &str) -> Result<ViewMsg, MsgError> {
     }
 }
 
-/// 載せる口の最初の 1 通の中身。割り当てのルーム名は、サーバーが `w.…` を導く元（画面にもログにも出さない）。
+/// 載せる口の最初の1通の中身。
+/// 割り当てのルーム名はサーバーが`w.…`を導く元になる（画面にもログにも出さない）。
+/// `ticket`はその割り当てのルームで対戦が成立したときに受けたサイドのチケット（サーバーは導いた`w.…`について正しいチケットの投稿だけを載せる。チケットも画面・ログに出さない）。
 #[derive(Clone, Copy)]
 pub struct Posting {
     pub room: AssignedRoom,
@@ -452,6 +467,7 @@ pub struct Posting {
     pub mode: Mode,
     pub delay: u8,
     pub cap: u8,
+    pub ticket: SeatTicket,
 }
 
 impl core::fmt::Debug for Posting {
@@ -460,17 +476,34 @@ impl core::fmt::Debug for Posting {
     }
 }
 
-/// `{"t":"post",…}` の文を作る。名前・ルーム名・方式は逃がしの要らない文字だけ（作る前に検証してある）ので、そのまま書く。
+/// JSONの文字列に入れる形にする。名前は0x20〜0x7Eだけだが制御文字もエスケープして文を壊さない。
+fn json_escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `{"t":"post",…}`の文を作る。
+/// 名前は`"` `\`を含みうるのでエスケープする。
+/// ルーム名・方式・チケットはエスケープの要らない文字だけ（作る前に検証してある）なのでそのまま書く。
 pub fn write_post(p: &Posting, watchers: u8) -> String {
     format!(
-        r#"{{"t":"post","room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},"watchers":{},"cap":{}}}"#,
+        r#"{{"t":"post","room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},"watchers":{},"cap":{},"ticket":"{}"}}"#,
         p.room.name().as_str(),
-        p.p1.as_str(),
-        p.p2.as_str(),
+        json_escaped(p.p1.as_str()),
+        json_escaped(p.p2.as_str()),
         mode_wire(p.mode),
         p.delay.min(WATCH_DELAY_MAX),
         watchers.min(p.cap),
         p.cap.clamp(1, WATCH_CAP_MAX as u8),
+        p.ticket.as_str(),
     )
 }
 
@@ -478,7 +511,7 @@ fn write_count(watchers: u8) -> String {
     format!(r#"{{"t":"count","watchers":{watchers}}}"#)
 }
 
-// ---------------- 共通: ping と pong の見張り ----------------
+// ---------------- 共通: pingとpongの監視 ----------------
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Pings {
@@ -500,12 +533,12 @@ impl Pings {
             .map(|p| p.saturating_add(PONG_TIMEOUT_MS))
     }
 
-    /// pong が来ないまま `PONG_TIMEOUT_MS` 経ったか。
+    /// pongが来ないまま`PONG_TIMEOUT_MS`経ったかどうか。
     fn silent(&self, now: Now) -> bool {
         self.silence_deadline().is_some_and(|d| now.ms >= d)
     }
 
-    /// ping の時刻なら次の時刻を決めて ping の文を返す。
+    /// pingの時刻なら次の時刻を決めてpingの文を返す。
     fn due(&mut self, now: Now) -> Option<String> {
         let p = self.next_ping_ms?;
         if now.ms < p {
@@ -539,13 +572,13 @@ fn error_failure(code: Option<CloseCode>) -> Failure {
     }
 }
 
-// ---------------- 載せる口の状態機械 ----------------
+// ---------------- 載せる口のステートマシン ----------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostEvent {
     /// 一覧に載った。
     Listed,
-    /// 手順が終わった（一覧から消えた）。`RoomFull` は件数の上限（全体か 1 IP あたり）。
+    /// 手順が終わった（一覧から消えた）。`RoomFull`は件数の上限（全体か1 IPあたり）。
     Failed(Failure),
 }
 
@@ -559,20 +592,21 @@ pub enum HostAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostState {
     Connecting,
-    /// `post` を送った後、`listed` を待っている。
+    /// `post`を送った後、`listed`を待っている。
     AwaitListed,
     Listed,
     Failed(Failure),
 }
 
-/// 載せる口の手順。接続する前に `new` → 101 なら `on_upgraded`（この中で `post` を送る）、101 でなければ `on_http_refused`、接続できなければ
-/// `on_transport_failed`。以後、受けた文を `on_text`、閉じる番号を `on_close`。観戦者の数が変わったら `set_watchers`。
-/// `next_wake` の時刻か、それより前に `poll` を呼ぶ。終わりは失敗だけ（載せている間は閉じない）。
+/// 載せる口の手順。
+/// 呼ぶ順: 接続する前に`new`。101なら`on_upgraded`（この中で`post`を送る）。101でなければ`on_http_refused`。接続できなければ`on_transport_failed`。
+/// 以後は受けた文を`on_text`に渡し、閉じる番号を`on_close`に渡す。観戦者の数が変わったら`set_watchers`。
+/// `next_wake`の時刻かそれより前に`poll`を呼ぶ。終わりは失敗だけ（載せている間は閉じない）。
 #[derive(Debug, Clone)]
 pub struct HostClient {
     state: HostState,
     posting: Posting,
-    /// いまの観戦者の数（`set_watchers` が更新する）と、サーバーへ最後に送った（`post` か `count` の）数。
+    /// いまの観戦者の数（`set_watchers`が更新する）と、サーバーへ最後に送った（`post`か`count`の）数。
     watchers: u8,
     sent: u8,
     deadline_ms: Option<u64>,
@@ -648,7 +682,7 @@ impl HostClient {
         self.fail(close_failure(code))
     }
 
-    /// 観戦者の数が変わった。載っていれば `count` を送る（載る前なら、載った直後に送る）。
+    /// 観戦者の数が変わった。載っていれば`count`を送る（載る前なら載った直後に送る）。
     pub fn set_watchers(&mut self, n: u8) -> Vec<HostAction> {
         self.watchers = n.min(self.posting.cap);
         self.flush_count()
@@ -711,11 +745,11 @@ impl HostClient {
     }
 }
 
-// ---------------- 見る口の状態機械 ----------------
+// ---------------- 見る口のステートマシン ----------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewEvent {
-    /// 一覧の全体（接続した直後と、変わるたびに届く）。
+    /// 一覧の全体（接続した直後と変わるたびに届く）。
     List {
         rows: Vec<WatchRow>,
         skipped: usize,
@@ -732,13 +766,13 @@ pub enum ViewAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewState {
     Connecting,
-    /// 101 の後、最初の一覧を待っている。
+    /// 101の後に最初の一覧を待っている。
     AwaitList,
     Viewing,
     Failed(Failure),
 }
 
-/// 見る口の手順。使い方は [`HostClient`] と同じ（`post` も `count` も送らない。終わるのは閉じる・失敗のときだけ）。
+/// 見る口の手順。使い方は[`HostClient`]と同じ（`post`も`count`も送らない。終わるのは閉じる・失敗のときだけ）。
 #[derive(Debug, Clone)]
 pub struct ViewClient {
     state: ViewState,

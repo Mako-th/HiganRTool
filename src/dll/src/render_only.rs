@@ -1,10 +1,11 @@
 //! 描画だけのフレームの実験の予定と集計（pure）。読み取りのスレッドで走る（ゲームのスレッドではない）。
-//! - 予定: 設置の後 20 秒は作らない（基準）。その後 3 秒ごとに N = 1, 2, 3, 10, 60 を順に繰り返し、設置から 180 秒で終える。
-//!   0 から N にするのは読み取りのスレッドだけ（`stub::try_start_render_only`。compare-exchange で 0 のときだけ）、減らすのは入口だけ。
-//!   判定は時刻から決まる純粋な計算で、`RENDER_ONLY_LEFT` を書くのは `observe.rs`。
-//! - 集計: 描画だけのフレームの件 k と次の件 k+1 を比べ、`+0x454` が進んでいないか / 抽選回数 `0x4ACE10` が同じか /
-//!   コピーの範囲（548 バイト）の中で変わったアドレスと回数 / 番号 k を持つ描画の件の数 / 前後の件との間隔（TSC）。
-//!   デモの間（`0x4A7EC4` の bit1）とそれ以外に分けて数える。
+//! - 予定: 設置の後20秒は作らない（基準）。その後3秒ごとに N = 1, 2, 3, 10, 60 を順に繰り返す。設置から180秒で終える。
+//!   0からNにするのは読み取りのスレッドだけ（`stub::try_start_render_only`。compare-exchangeで0のときだけ）。
+//!   減らすのは入口だけ。
+//!   判定は時刻から決まる純粋な計算。`RENDER_ONLY_LEFT`を書くのは`observe.rs`。
+//! - 集計: 描画だけのフレームの件kと次の件k+1を比べる。見る項目は次のとおり。
+//!   `+0x454`が進んでいないか / 抽選回数`0x4ACE10`が同じか / コピーの範囲（548バイト）の中で変わったアドレスと回数 / 番号kを持つ描画の件の数 / 前後の件との間隔（TSC）。
+//!   デモの間（`0x4A7EC4`のbit1）とそれ以外に分けて数える。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -21,12 +22,12 @@ use crate::ticks::{Snap, tsc_to_us};
 pub const TOTAL_SECONDS: u32 = 180;
 /// 基準の長さ（この秒までは描画だけのフレームを作らない）。
 pub const BASELINE_SECONDS: u32 = 20;
-/// 塊と塊の間隔（秒）。
+/// バーストとバーストの間隔（秒）。
 pub const STEP_SECONDS: u32 = 3;
-/// N の並び（順に繰り返す）。
+/// Nの並び（順に繰り返す）。
 pub const N_SEQUENCE: [u32; 5] = [1, 2, 3, 10, 60];
 
-/// 経過 `second` 秒の区切りで、描画だけのフレームを何回頼むか（頼まない秒は `None`）。基準の間と終わりは `None`。
+/// 経過`second`秒の区切りで描画だけのフレームを何回頼むか（頼まない秒は`None`）。基準の間と終わりは`None`。
 pub fn burst_at(second: u32) -> Option<u32> {
     if !(BASELINE_SECONDS..TOTAL_SECONDS).contains(&second) {
         return None;
@@ -41,16 +42,18 @@ pub fn burst_at(second: u32) -> Option<u32> {
 
 // ---- 集計 ----
 
-/// tick `k` の後に走った描画が、描画のリングバッファに書く番号（`DrawRecord::tick_seq`）。**`k + 1`。**
+/// tick `k`の後に走った描画が描画のリングバッファに書く番号（`DrawRecord::tick_seq`）。**`k + 1`。**
 ///
-/// 入力の入口（`stub.rs` の `input_wait_entry`）は `lock xadd` で `SEQ` の値 k を自分の番号として取り `SEQ` を k+1 へ進め、
-/// 描画の入口（`draw.rs` の `draw_entry`）は `SEQ` をそのまま書く。tick k と同じ do_frame の描画は k+1 を書くので、
-/// k で引くと前のフレームの描画を数えて、いつも 1 回に見える。この関係はここ 1 か所に書く。
+/// 入力の入口（`stub.rs`の`input_wait_entry`）は`lock xadd`で`SEQ`の値kを自分の番号として取る。そして`SEQ`をk+1へ進める。
+/// 描画の入口（`draw.rs`の`draw_entry`）は`SEQ`をそのまま書く。
+/// tick kと同じdo_frameの描画はk+1を書く。
+/// kで検索すると前のフレームの描画を数える。そのためいつも1回に見える。
+/// この関係はここ1か所に書く。
 pub fn draw_tag_after_tick(k: u32) -> u32 {
     k.wrapping_add(1)
 }
 
-/// デモの間か（`0x4A7EC4` の bit1 = タイトルデモ再生中）。読めなければ `None`。
+/// デモの間か（`0x4A7EC4`の bit1 = タイトルデモ再生中）。読み取れなければ`None`。
 pub fn is_demo(rows: &[crate::ticks::CopyRow], snap: &Snap) -> Option<bool> {
     crate::copies::value_at(rows, snap, GLOBAL_STATE, 4).map(|v| v & GLOBAL_STATE_DEMO != 0)
 }
@@ -60,15 +63,15 @@ pub struct RenderOnlyFrame {
     pub seq: u32,
     pub demo: Option<bool>,
     pub has_next: bool,
-    /// `+0x454`（`sup_frame`）が k から k+1 で進んだか。**描画だけのフレームでは進まないはず。**
+    /// `+0x454`（`sup_frame`）がkからk+1で進んだか。**描画だけのフレームでは進まないはず。**
     pub frame_advanced: Option<bool>,
-    /// 抽選回数 `0x4ACE10` の k のときの値（読めなければ `None`）。
+    /// 抽選回数`0x4ACE10`のkのときの値（読み取れなければ`None`）。
     pub rng_count: Option<u32>,
-    /// 抽選回数が k と k+1 で同じか。**同じはず。**
+    /// 抽選回数がkとk+1で同じか。**同じはず。**
     pub rng_count_same: Option<bool>,
-    /// コピーの範囲（548 バイト）の中で k から k+1 で変わったアドレス（アドレス・前・後）。
+    /// コピーの範囲（548バイト）の中でkからk+1で変わったアドレス（アドレス・前・後）。
     pub changed: Vec<(u32, u32, u32)>,
-    /// tick k と k+1 の間に走った描画の数（描画のリングバッファで `tick_seq == draw_tag_after_tick(k)` の件）。1 なら更新なしで描画だけが 1 回走った。
+    /// tick kとk+1の間に走った描画の数（描画のリングバッファで`tick_seq == draw_tag_after_tick(k)`の件）。1なら更新なしで描画だけが1回走った。
     pub draws_for_k: u32,
     pub dt_tsc: Option<u64>,
 }
@@ -78,19 +81,19 @@ pub struct RenderOnlySummary {
     pub frames: usize,
     pub demo_frames: usize,
     pub nondemo_frames: usize,
-    /// `+0x454` が進んでしまった件（0 のはず。進むと「更新が走った」＝出口を満たさない）。
+    /// `+0x454`が進んでしまった件（0のはず。進むと「更新が走った」＝出口を満たさない）。
     pub frame_advanced_count: usize,
-    /// 抽選回数が変わってしまった件（0 のはず）。
+    /// 抽選回数が変わってしまった件（0のはず）。
     pub rng_changed_count: usize,
-    /// tick k と tick k+1 の間に描画がちょうど 1 回走った件（1 でない件は下の `draws_not_one`）。
+    /// tick kとtick k+1の間に描画がちょうど1回走った件（1でない件は下の`draws_not_one`）。
     pub draws_one_count: usize,
     pub draws_not_one: usize,
     /// 変わったアドレスごとの件数（何件の描画だけのフレームでそのアドレスが変わったか。アドレスの順）。
     pub changed_addr_hist: Vec<(u32, usize)>,
 }
 
-/// 描画だけのフレーム（k）と次の件（k+1。無ければ `None`）の組から集計する。`draws_for(n)` は描画のリングバッファで `tick_seq == n` の件の数
-/// （`draw_tag_after_tick(k)` で引く）。
+/// 描画だけのフレーム（k）と次の件（k+1。無ければ`None`）のペアから集計する。
+/// `draws_for(n)`は描画のリングバッファで`tick_seq == n`の件の数。引数には`draw_tag_after_tick(k)`を渡す。
 pub fn analyze(
     frames: &[(Snap, Option<Snap>)],
     rows: &[crate::ticks::CopyRow],
@@ -159,8 +162,8 @@ pub fn analyze(
     (out, s)
 }
 
-/// コピーの範囲（`CHANGE_RANGES` の 548 バイト）を 4 バイトずつ、k と k+1 で比べて変わったアドレス（アドレス・前・後）。
-/// 表に無くて読めない語は数えない。
+/// コピーの範囲（`CHANGE_RANGES`の548バイト）を4バイトずつkとk+1で比べて変わったアドレス（アドレス・前・後）。
+/// 表に無くて読み取れないワードは数えない。
 fn changed_addresses(
     rows: &[crate::ticks::CopyRow],
     k: &Snap,
@@ -184,25 +187,25 @@ pub fn changed_words_total() -> u32 {
     CHANGE_RANGES.iter().map(|(_, len)| len / 4).sum()
 }
 
-/// 描画だけのフレームと次の件（k+1）を、tick の流れから拾い集める（100 ms ごとに読む件を順に食わせる）。描画の記録は番号ごとに数える。
+/// 描画だけのフレームと次の件（k+1）をtickの流れから拾い集める（100 msごとに読む件を順に渡す）。描画の記録は番号ごとに数える。
 #[derive(Debug, Default)]
 pub struct Collector {
     /// 次の件（k+1）を待っている描画だけのフレーム。
     pending: Option<Snap>,
-    /// 拾った (k, k+1)。次の件が採れなければ k+1 は `None`（番号が飛んだ・計測が終わった）。
+    /// 拾った (k, k+1)。次の件が取得できなければk+1は`None`（番号が飛んだ・計測が終わった）。
     pub frames: Vec<(Snap, Option<Snap>)>,
     draws_by_seq: BTreeMap<u32, u32>,
     pub seen: usize,
 }
 
 impl Collector {
-    /// tick の件を 1 つ食わせる（番号の順に呼ぶこと）。
+    /// tickの件を1つ渡す（番号の順に呼ぶこと）。
     pub fn feed_tick(&mut self, s: &Snap) {
         if let Some(p) = self.pending.take() {
             if s.rec.seq == p.rec.seq.wrapping_add(1) {
                 self.frames.push((p, Some(s.clone())));
             } else {
-                // 次の件が飛んだ（読み落とし・番号の乱れ）。k+1 は採れない。
+                // 次の件が飛んだ（読み落とし・番号の乱れ）。k+1は取得できない。
                 self.frames.push((p, None));
             }
         }
@@ -216,7 +219,7 @@ impl Collector {
         *self.draws_by_seq.entry(r.tick_seq).or_default() += 1;
     }
 
-    /// 描画のリングバッファで `tick_seq == seq` の件の数（生の番号。tick k の後の描画は `draws_for(draw_tag_after_tick(k))`）。
+    /// 描画のリングバッファで`tick_seq == seq`の件の数（生の番号。tick kの後の描画は`draws_for(draw_tag_after_tick(k))`）。
     pub fn draws_for(&self, seq: u32) -> u32 {
         self.draws_by_seq.get(&seq).copied().unwrap_or(0)
     }
@@ -228,12 +231,12 @@ impl Collector {
     }
 }
 
-// ---- CSV と集計のログ ----
+// ---- CSVと集計のログ ----
 
 pub const RENDERONLY_HEADER: &str =
     "seq,demo,has_next,frame_advanced,rng_count,rng_same,draws_for_k,dt_us,changed_count";
 
-/// 描画だけのフレーム 1 件の行（`freq_hz` があれば間隔を µs で）。
+/// 描画だけのフレーム1件の行（`freq_hz`があれば間隔をµsで）。
 pub fn renderonly_row(f: &RenderOnlyFrame, freq_hz: Option<f64>) -> String {
     let b = |o: Option<bool>| match o {
         Some(true) => "1",
@@ -259,7 +262,7 @@ pub fn renderonly_row(f: &RenderOnlyFrame, freq_hz: Option<f64>) -> String {
 
 pub const DRAWS_HEADER: &str = "seq,tick_seq,t_us,dt_us";
 
-/// 描画の記録の行を流して作る（`t_us` は最初の件からの µs、`dt_us` は前の件との差。周波数が無ければ空）。
+/// 描画の記録の行を順に渡して作る（`t_us`は最初の件からのµs。`dt_us`は前の件との差。周波数が無ければ空）。
 #[derive(Debug, Clone, Default)]
 pub struct DrawCsv {
     pub freq_hz: Option<f64>,
@@ -405,10 +408,11 @@ mod tests {
             (k1.clone(), Some(n1.clone())),
             (k2.clone(), None),
         ];
-        // 描画のリングバッファは本物の関係で作る: tick k と同じ do_frame の描画は tick_seq = k+1 を書く。前の do_frame の描画は tick_seq = k で、
-        // どの k にも 1 件ずつある（数えてはいけない）。番号は `draw_tag_after_tick` を通さずに文字で書く（関数を k に戻す変異で落ちるように）。
+        // 描画のリングバッファは本物の関係で作る: tick kと同じdo_frameの描画は tick_seq = k+1 を書く。
+        // 前のdo_frameの描画は tick_seq = k。この描画はどのkにも1件ずつある（数えてはいけない）。
+        // 番号は`draw_tag_after_tick`を通さずに文字で書く（関数をkに戻す変異で落ちるように）。
         let draws_for = |tick_seq: u32| match tick_seq {
-            0 | 2 | 4 => 1, // 1 つ前の do_frame の描画
+            0 | 2 | 4 => 1, // 1つ前のdo_frameの描画
             1 => 1,
             3 => 2,
             _ => 0,

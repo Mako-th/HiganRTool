@@ -3,8 +3,12 @@ name = "higanr_prng_shim"
 description = "std の ProcessPrng（bcryptprimitives.dll）の遅延読み込みが失敗したときの代わり。loader と dll が使う"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/lib.rs"

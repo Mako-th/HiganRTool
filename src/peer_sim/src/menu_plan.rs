@@ -1,8 +1,8 @@
-//! 選択の台本（`--menu <ファイル>`）: ネットの選択で、peer_sim が「決めた MENU の語」と「画面を移る押下」を台本どおりに出す形。
-//! ゲームが無いので、画面は core の模型 `higanr_core::menu_model::Model` で追う（dll と共用）。この台本が決めるのは「どの画面で・何フレーム待って・何を出すか」だけで、押下がいつ入るか（ホストが順番を決める）は core の `selection.rs`。
-//! 1 行 1 項目（`#` から行末は注）。形は `screen=S [wait=N] 動作`、動作は `word=キー[+キー…] [hold=N]` / `press=decide|cancel [value=V | cursor=C shift=0|1]` / `enter` のどれか 1 つ。
-//! `word` は送るときに `--mask` を掛け、画面を移るビット（`menu_model::TRANSITION_BITS`。Z・X・Esc）を落とす（画面を移るのは STEP でだけ）。
-//! 知らない名前・範囲の外・同じ名前の 2 回目・動作の無い行・動作が 2 つある行は、行の番号を添えて断り、台本全体を使わない（`higanr_core::script::parse` と同じ `ParseError`）。
+//! 選択の台本（`--menu <ファイル>`）: ネットの選択でpeer_simがMENUのワードと画面を移る押下を台本どおりに出す形。
+//! ゲームが無いので画面はcoreのモデル`higanr_core::menu_model::Model`で追う（dllと共用）。この台本が決めるのは「どの画面で・何フレーム待って・何を出すか」だけ。押下がいつ入るか（ホストが順番を決める）はcoreの`selection.rs`が決める。
+//! 1行1項目（`#`から行末まではコメント）。形は`screen=S [wait=N] 動作`。動作は`word=キー[+キー…] [hold=N]` / `press=decide|cancel [value=V | cursor=C shift=0|1]` / `enter`のどれか1つ。
+//! `word`は送るときに`--mask`を掛け、画面を移るビット（`menu_model::TRANSITION_BITS`。Z・X・Esc）を落とす（画面を移るのはSTEPでだけ）。
+//! 知らない名前・範囲の外・同じ名前の2回目・動作の無い行・動作が2つある行は、行の番号を添えて断り、台本全体を使わない（`higanr_core::script::parse`と同じ`ParseError`）。
 
 use std::collections::HashMap;
 
@@ -20,14 +20,14 @@ use higanr_core::wire::{CURSOR_NONE, Step, StepKind};
 /// ゲストの要求が捨てられてから押し直すまで（フレーム）。すぐ押し直すと同じ理由でまた捨てられやすい。
 pub const RETRY_FRAMES: u32 = 30;
 
-/// peer_sim がホストの役のときに出す合わせの value。peer_sim は画面のカーソルを持たないので固定にした。実機が相手のとき、受けた
-/// ゲスト（dll）はカーソルを難易度 2、マップは値 14（一覧の最後から 2 番目）へ書く。
+/// peer_simがホストの役のときに出す合わせのvalue。peer_simは画面のカーソルを持たないので固定にした。
+/// 実機が相手のときに受けたゲスト（dll）は、カーソルを難易度なら2へ、マップなら値14（一覧の最後から2番目）へ書く。
 pub const SIM_ALIGN_DIFFICULTY: u8 = 2;
 pub const SIM_ALIGN_MAP_ITEM: u8 = 14;
-/// peer_sim の席のキャラのカーソルの最初の値（1P・2P）。MENU の末尾で相手へ知らせる（相手の dll は相手の席をこの位置へ書く）。
+/// peer_simのサイドのキャラのカーソルの最初の値（1P・2P）。MENUの末尾で相手へ知らせる（相手のdllは相手のサイドをこの位置へ書く）。
 pub const SIM_CHARA_CURSORS: [u8; 2] = [4, 6];
 
-/// 模型の画面 `screen` の、peer_sim がホストの役のときの合わせの押下。合わせを使う画面（難易度・マップ）でなければ None。
+/// モデルの画面`screen`に対する、peer_simがホストの役のときの合わせの押下。合わせを使う画面（難易度・マップ）でなければNone。
 pub fn sim_align_press(screen: u8) -> Option<Press> {
     let value = match screen {
         SCREEN_DIFFICULTY => SIM_ALIGN_DIFFICULTY,
@@ -41,19 +41,19 @@ pub fn sim_align_press(screen: u8) -> Option<Press> {
     })
 }
 
-/// `wait` と `hold` の上限（10 分。`higanr_core::script` の tick の上限と同じ）。
+/// `wait`と`hold`の上限（10分。`higanr_core::script`のtickの上限と同じ）。
 const MAX_FRAMES: u32 = 36_000;
 /// 項目の数の上限（台本の誤りで巨大なファイルを読まないように）。
 const MAX_ITEMS: usize = 1_000;
 
-/// 押下の中身（value は画面によって作り方が違う）。
+/// 押下の中身（valueは画面によって作り方が違う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PressSpec {
-    /// 難易度・マップの画面: value をそのまま。
+    /// 難易度・マップの画面: valueをそのまま。
     Value { kind: StepKind, value: u8 },
-    /// キャラの画面の決定: 自分の席・Shift・カーソルから `chara_value`。
+    /// キャラの画面の決定: 自分のサイド・Shift・カーソルから`chara_value`を作る。
     CharaDecide { cursor: u8, shift: bool },
-    /// キャラの画面の取消: 自分の席とカーソル 0。
+    /// キャラの画面のキャンセル: 自分のサイドとカーソル0で作る。
     CharaCancel,
 }
 
@@ -77,7 +77,7 @@ impl PressSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// MENU の自分の語（`--mask` と画面を移るビットはまだ落としていない）を `hold` フレーム。
+    /// MENUの自分のワード（`--mask`と画面を移るビットはまだ落としていない）を`hold`フレームの間出す。
     Word {
         keys: u16,
         hold: u32,
@@ -136,7 +136,7 @@ fn ranged(
     Ok(v)
 }
 
-/// `word=` の値: キー名を `+` で区切ったものか `0x` の 16 進。`SEND_MASK` の外は誤り。
+/// `word=`の値: キー名を`+`で区切ったものか`0x`の16進。`SEND_MASK`の外は誤り。
 fn parse_keys(line: u32, v: &str) -> Result<u16, ParseError> {
     let keys = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
         u16::from_str_radix(h, 16)
@@ -273,7 +273,7 @@ fn parse_line(line: u32, tokens: &[&str]) -> Result<Item, ParseError> {
                     }
                     PressSpec::CharaCancel
                 }
-                // 上の match は決定と取消しか返さない（合わせはホストの役が自分で出す。形式の切替は台本に無い）。
+                // 上のmatchは決定とキャンセルしか返さない（合わせはホストの役が自分で出す。形式の切替は台本に無い）。
                 StepKind::Align | StepKind::Format => {
                     return Err(err(line, "press は decide か cancel"));
                 }
@@ -322,16 +322,17 @@ pub fn parse(text: &str) -> Result<MenuPlan, ParseError> {
     Ok(MenuPlan { items })
 }
 
-/// 台本のファイルを読む（`--menu`）。読めない・誤りがあれば、パスと行番号を添えた文で返す。
+/// 台本のファイルを読む（`--menu`）。読めない・誤りがあればパスと行番号を添えた文で返す。
 pub fn load(path: &std::path::Path) -> Result<MenuPlan, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("選択の台本 {} が読めない: {e}", path.display()))?;
     parse(&text).map_err(|e| format!("選択の台本 {} の {e}", path.display()))
 }
 
-/// peer_sim の席のキャラのカーソル（MENU の末尾で相手へ知らせる位置）。ゲームが無いので、自分の語の方向の押した瞬間で ±1 し
-/// （ゲームの `0x0042474A` と同じく左 → 右 → 上 → 下の順に 1 つ。Shift を押している間は初期ライフの操作なので動かさない）、自分の席の
-/// キャラの決定が入ったらその値にする。未解放のキャラの飛ばしとランダムは無い。
+/// peer_simのサイドのキャラのカーソル（MENUの末尾で相手へ知らせる位置）。
+/// ゲームが無いので自分のワードの方向を押した瞬間に ±1する（ゲームの`0x0042474A`と同じく左 → 右 → 上 → 下の順に1つ。Shiftを押している間は初期ライフの操作なので動かさない）。
+/// 自分のサイドのキャラの決定が入ったらその値にする。
+/// 未解放のキャラを飛ばす処理とランダムは無い。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimCursor {
     cursor: u8,
@@ -346,7 +347,7 @@ impl SimCursor {
         }
     }
 
-    /// このフレームの自分の語（送る語）で動かす。キャラの画面のときだけ。
+    /// このフレームの自分のワード（送るワード）で動かす。キャラの画面のときだけ。
     pub fn on_word(&mut self, screen: u8, word: u16) {
         let pressed = word & !self.prev;
         self.prev = word;
@@ -367,7 +368,7 @@ impl SimCursor {
         self.cursor = (self.cursor + step) % 16;
     }
 
-    /// 入った押下が自分の席のキャラの決定なら、そのカーソルにする。
+    /// 入った押下が自分のサイドのキャラの決定ならそのカーソルにする。
     pub fn on_applied(&mut self, st: &Step, seat: usize) {
         if st.screen == SCREEN_CHARA && st.kind == StepKind::Decide {
             let (s, _, c) = chara_value_parts(st.value);
@@ -377,7 +378,7 @@ impl SimCursor {
         }
     }
 
-    /// MENU に載せる（画面, カーソル）。キャラの画面の外は `CURSOR_NONE`。
+    /// MENUに載せる（画面, カーソル）。キャラの画面の外は`CURSOR_NONE`。
     pub fn report(&self, screen: u8) -> (u8, u8) {
         if screen == SCREEN_CHARA {
             (screen, self.cursor)
@@ -393,8 +394,8 @@ pub struct FrameIn {
     pub seat: usize,
     pub role: Role,
     pub peer_present: bool,
-    /// 今の画面の合わせを入れ終えたか（`Selection::is_aligned`）。ゲストは届くまで要求しない（要求してもホストが先に出す合わせに
-    /// 負けて捨てられ、押し直しを待つことになる）。ホストには効かない。
+    /// 今の画面の合わせを反映し終えたか（`Selection::is_aligned`）。ゲストは届くまで要求しない。
+    /// 要求してもホストが先に出す合わせに負けて捨てられるので押し直しを待つことになる。ホストには効かない。
     pub aligned: bool,
     /// ゲストの持っている要求（`Selection::pending_press`）。
     pub pending: Option<Press>,
@@ -402,24 +403,24 @@ pub struct FrameIn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Want {
-    /// 自分の語（まだ `--mask` と画面を移るビットを落としていない。項目の外は 0）。
+    /// 自分のワード（まだ`--mask`と画面を移るビットを落としていない。項目の外は0）。
     pub word: u16,
     pub press: Option<Press>,
     /// 自分で次の選択に入る（選択の外にいるときだけ意味を持つ）。
     pub enter: bool,
 }
 
-/// 台本を 1 フレームずつ進める。ソケットにも時計にも触らない（呼び手が 1 フレームの枠ごとに `frame` → `selection_frame` →
-/// `after_frame` の順に呼ぶ）。`wait` と `RETRY_FRAMES` はフレームで数えるので、実時間はペースに付いてくる。
+/// 台本を1フレームずつ進める。ソケットにも時計にも触らない（呼び出し側が1フレームごとに`frame` → `selection_frame` → `after_frame`の順に呼ぶ）。
+/// `wait`と`RETRY_FRAMES`はフレームで数えるので実時間はペースに付いてくる。
 #[derive(Debug, Clone)]
 pub struct Runner {
     items: Vec<Item>,
     idx: usize,
-    /// 今の項目で、画面が合ってから数えたフレーム。
+    /// 今の項目で画面が合ってから数えたフレーム。
     since: u32,
-    /// 語の項目で、出したフレーム。
+    /// ワードの項目で出したフレーム。
     held: u32,
-    /// 押した押下（入るまで持つ。入ったかを `after_frame` で比べる）。
+    /// 押した押下（入るまで持つ。入ったかを`after_frame`で比べる）。
     pressed: Option<Press>,
     /// ゲスト: 押し直すまでの残り。
     retry_left: u32,
@@ -469,7 +470,7 @@ impl Runner {
             return Want::default();
         }
         if fi.role == Role::Guest && !fi.aligned && item.action != Action::Enter {
-            // ゲストは、この画面の合わせが届くまで動かず、要求しない（dll と同じ）。待つフレームは wait にも押し直しの待ちにも数えない。
+            // ゲストはこの画面の合わせが届くまで動かず要求もしない（dllと同じ）。待つフレームはwaitにも押し直しの待ちにも数えない。
             return Want::default();
         }
         if self.since < item.wait {
@@ -501,11 +502,11 @@ impl Runner {
                     screen: fi.screen,
                 };
                 let go = match fi.role {
-                    // ホストの押下は、相手が来ていて前の STEP が届いていれば入る（届いていなければ core が捨てて数える）。入るまで毎フレーム押す。
+                    // ホストの押下は相手が来ていて前のSTEPが届いていれば入る（届いていなければcoreが捨てて数える）。入るまで毎フレーム押す。
                     Role::Host => fi.peer_present,
                     Role::Guest => {
                         if fi.pending.is_some() {
-                            // 要求を持っている間の押下は core が捨てる。ホストの STEP を待つ。
+                            // 要求を持っている間の押下はcoreが捨てる。ホストのSTEPを待つ。
                             false
                         } else if self.retry_left > 0 {
                             self.retry_left -= 1;
@@ -527,7 +528,7 @@ impl Runner {
         }
     }
 
-    /// `selection_frame` の後。`applied` はこのフレームに入った押下、`pending_after` はその後のゲストの要求。
+    /// `selection_frame`の後。`applied`はこのフレームに入った押下。`pending_after`はその後のゲストの要求。
     pub fn after_frame(&mut self, applied: Option<Step>, pending_after: Option<Press>, role: Role) {
         let Some(p) = self.pressed else {
             return;
@@ -541,14 +542,14 @@ impl Runner {
             return;
         }
         if role == Role::Guest && pending_after.is_none() {
-            // 要求が捨てられた（相手が来ていない / ホストが別の押下を先に入れた）。
+            // 要求が捨てられた（相手が来ていない / ホストが別の押下を先に反映した）。
             self.pressed = None;
             self.retry_left = RETRY_FRAMES;
             self.retries += 1;
         }
     }
 
-    /// 相手が先に次の選択に入った（`Recv::PeerSelecting`）。今の項目が `enter` なら行わずに終える。
+    /// 相手が先に次の選択に入った（`Recv::PeerSelecting`）。今の項目が`enter`なら行わずに終える。
     pub fn peer_entered(&mut self) {
         if let Some(Item {
             action: Action::Enter,
@@ -614,7 +615,7 @@ mod tests {
                 }
             }
         );
-        // 2P（席 1）・Shift・カーソル 9 = 1 | 2 | 9 << 2 = 0x27。1P なら 0x26。
+        // 2P（サイド1）・Shift・カーソル 9 = 1 | 2 | 9 << 2 = 0x27。1Pなら0x26。
         let Action::Press(s) = it[2].action else {
             panic!()
         };
@@ -855,7 +856,7 @@ mod tests {
         assert!(n >= 2, "scripts/*.plan が {n} 本");
     }
 
-    /// 押し続け・Shift 付き・キャラの画面の外・相手の席の決定では動かない。
+    /// 押し続け・Shift付き・キャラの画面の外・相手のサイドの決定では動かない。
     #[test]
     fn sim_cursor_moves_on_edges_and_takes_its_own_decide() {
         use keys::{DOWN, LEFT, RIGHT, SHIFT, UP};

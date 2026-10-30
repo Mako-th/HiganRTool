@@ -1,5 +1,5 @@
-//! ツール `replay_playcheck` を本物のプロセスで走らせる検査（合成のリプレイと合成のログだけ）。
-//! 「引数 → ファイルを読む → ログの再生の行を選ぶ → 比べる → 終了コード」の配線を見る。比べ方そのものは `replay_playcheck` の単体検査。
+//! ツール`replay_playcheck`を本物のプロセスで走らせる検査（合成のリプレイと合成のログだけ）。
+//! 「引数 → ファイルを読む → ログの再生の行を選ぶ → 比べる → 終了コード」の配線を見る。比べ方そのものは`replay_playcheck`の単体検査。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -88,7 +88,7 @@ fn replay_bytes(rounds: Vec<RoundRec>, marked: bool) -> Vec<u8> {
     f
 }
 
-/// 合成のリプレイの見出し（日付 `26/01/01`・名前 `NO NAME`）と同じ。
+/// 合成のリプレイのヘッダ（日付`26/01/01`・名前`NO NAME`）と同じ。
 fn ident() -> Ident {
     Ident {
         date: Some("26/01/01".into()),

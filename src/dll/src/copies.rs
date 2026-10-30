@@ -1,8 +1,11 @@
-//! コピーの表のチェックと、コピーした範囲の読み方（pure。unsafe 無し）。入口は枠の先頭（64 バイト）の後ろへ、コピーの表の範囲をそのままコピーする。ここは
-//! - 表のチェック（枠に収まる・先頭と重ならない・互いに重ならない・元が読める）。入口が枠の外へ書かないための守りなので、`stub::set_copy_table` も設定する前に枠の側（`check_layout`）を通す。
-//! - `_ticks.csv` のコピーの列（乱数・InputManager 3 本・選んだグローバル）、`_changes.csv`（2 つのグローバルの範囲を 4 バイトずつ前の件と比べた差分）、`_snap.bin` の先頭。
+//! コピーの表のチェックと、コピーした範囲の読み方（pure。unsafe無し）。
+//! 入口は枠の先頭（64バイト）の後ろへ、コピーの表の範囲をそのままコピーする。
+//! このファイルが受け持つのは次のとおり。
+//! - 表のチェック（枠に収まる・先頭と重ならない・互いに重ならない・元が読み取り可能）。
+//!   入口が枠の外へ書かないための守りなので、`stub::set_copy_table`も設定する前に枠の側（`check_layout`）を通す。
+//! - `_ticks.csv`のコピーの列（乱数・InputManager 3本・選んだグローバル）、`_changes.csv`（2つのグローバルの範囲を4バイトずつ前の件と比べた差分）、`_snap.bin`の先頭。
 //!
-//! コピーした値は「入口が実際に使っている表」から引く。表に無いアドレスの列は空にする（0 と書くと「測れていない」が「0 だった」に見える）。
+//! コピーした値は「入口が実際に使っている表」から取得する。表に無いアドレスの列は空にする（0と書くと「測れていない」が「0だった」に見える）。
 #![forbid(unsafe_code)]
 
 use crate::th09_addr::{
@@ -15,17 +18,17 @@ use crate::ticks::{COPY_MAX_ROWS, CopyRow, HEAD_BYTES, SLOT_BYTES, Snap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyError {
-    /// 行が `COPY_MAX_ROWS` より多い。
+    /// 行が`COPY_MAX_ROWS`より多い。
     TooMany { rows: usize },
-    /// 長さが 0（表の書き誤りの印なので断る）。
+    /// 長さが0（表の書き間違いなので断る）。
     Empty { row: usize },
-    /// 枠の外（1024 バイトを越える・アドレスの計算が 32 ビットを越える）。
+    /// 枠の外（1024バイトを越える・アドレスの計算が32ビットを越える）。
     OutOfSlot { row: usize },
-    /// 先頭（`+0`〜`+63`。札を含む）と重なる。
+    /// 先頭（`+0`〜`+63`。タグを含む）と重なる。
     OverlapsHead { row: usize },
-    /// 2 つの行の置き場が重なる。
+    /// 2つの行の置き場が重なる。
     Overlap { a: usize, b: usize },
-    /// 元の範囲が読めない（コミット済みで読める保護でない）。
+    /// 元の範囲が読み取りできない（コミット済みで読み取り可能な保護でない）。
     Unreadable { row: usize },
 }
 
@@ -50,7 +53,7 @@ impl CopyError {
     }
 }
 
-/// 枠の中の置き場 `[dst, dst + len)`（はみ出しの計算で回り込まない）。
+/// 枠の中の置き場`[dst, dst + len)`（はみ出しの計算で回り込まない）。
 fn dst_range(r: &CopyRow) -> Option<(u32, u32)> {
     Some((r.dst, r.dst.checked_add(r.len)?))
 }
@@ -85,7 +88,7 @@ pub fn check_layout(rows: &[CopyRow]) -> Result<(), CopyError> {
     Ok(())
 }
 
-/// 表の全部のチェック: 枠の側に加えて、各行の元が読めるか（`readable`。本物は `Env::read`: コミット済みで読める保護のページだけ）。
+/// 表の全部のチェック。枠の側に加えて、各行の元が読み取り可能か（`readable`。本物は`Env::read`: コミット済みで読み取り可能な保護のページだけ）。
 pub fn check_copy_table(
     rows: &[CopyRow],
     mut readable: impl FnMut(u32, u32) -> bool,
@@ -104,8 +107,8 @@ pub fn row_text(r: &CopyRow) -> String {
     format!("0x{:08X} から {} バイト → 枠 +{}", r.src, r.len, r.dst)
 }
 
-/// ゲームのアドレス `addr` の `width` バイトを、入口が使った表 `rows` を通して枠から読む。
-/// 表のどの行も `[addr, addr + width)` を丸ごと含まなければ `None`（コピーしていない）。
+/// ゲームのアドレス`addr`の`width`バイトを入口が使った表`rows`を通して枠から読む。
+/// 表のどの行も`[addr, addr + width)`を丸ごと含まなければ`None`（コピーしていない）。
 pub fn value_at(rows: &[CopyRow], snap: &Snap, addr: u32, width: u32) -> Option<u32> {
     let r = rows.iter().find(|r| {
         addr >= r.src
@@ -180,7 +183,7 @@ pub fn csv_header() -> String {
         .join(",")
 }
 
-/// 1 件のコピーの列（先頭のカンマなし）。表に無いアドレスは空。
+/// 1件のコピーの列（先頭のカンマなし）。表に無いアドレスは空。
 pub fn csv_columns(rows: &[CopyRow], snap: &Snap) -> String {
     columns()
         .into_iter()
@@ -200,10 +203,10 @@ pub fn csv_columns(rows: &[CopyRow], snap: &Snap) -> String {
 
 pub const CHANGES_HEADER: &str = "seq,addr,before,after,sup454,scene_cur,scene_req";
 
-/// 差分を見る 2 つの範囲（2 つのグローバルを 4 バイトずつ）。
+/// 差分を見る2つの範囲（2つのグローバルを4バイトずつ）。
 pub const CHANGE_RANGES: [(u32, u32); 2] = [(SEATS_RANGE, SEATS_LEN), (MATCH_RANGE, MATCH_LEN)];
 
-/// 2 つの範囲の 4 バイトずつの値（アドレスの順）。表に無い範囲の語は `None`。
+/// 2つの範囲の4バイトずつの値（アドレスの順）。表に無い範囲のワードは`None`。
 pub fn change_words(rows: &[CopyRow], snap: &Snap) -> Vec<(u32, Option<u32>)> {
     let mut v = Vec::new();
     for (start, len) in CHANGE_RANGES {
@@ -215,8 +218,8 @@ pub fn change_words(rows: &[CopyRow], snap: &Snap) -> Vec<(u32, Option<u32>)> {
     v
 }
 
-/// 差分の行を作る（前の件から変わった語だけ。前が無ければ全部の語。値が取れない語は書かない）。
-/// 呼び出し側は、書いた後に `words` を次の件の `prev` として持つ。
+/// 差分の行を作る（前の件から変わったワードだけ。前が無ければ全部のワード。値が取れないワードは書かない）。
+/// 呼び出し側は書いた後に`words`を次の件の`prev`として持つ。
 pub fn change_rows(
     prev: Option<&[(u32, Option<u32>)]>,
     words: &[(u32, Option<u32>)],
@@ -246,14 +249,14 @@ pub fn change_rows(
     out
 }
 
-/// `_snap.bin` の先頭の大きさ（この後ろに 1024 バイトの枠が取れた順に並ぶ）。
+/// `_snap.bin`の先頭の大きさ（この後ろに1024バイトの枠が取れた順に並ぶ）。
 pub const SNAP_HEADER_BYTES: usize = 128;
 pub const SNAP_MAGIC: &[u8; 8] = b"HRTSNAP\0";
 pub const SNAP_VERSION: u32 = 1;
 
-/// `_snap.bin` の先頭: 印 8 / バージョン 4 / 枠の大きさ 4 / 先頭の大きさ 4 / 表の行の数 4 / 表の 8 行（元・長さ・置き場の
-/// 4 バイトずつ。使わない行は 0）96 / 残り 0。数はリトルエンディアン。枠の札（`+48`）が番号 + 1 なので、
-/// 件ごとの先頭は持たない。
+/// `_snap.bin`の先頭: 印8 / バージョン4 / 枠の大きさ4 / 先頭の大きさ4 / 表の行の数4 / 表の8行（元・長さ・置き場の4バイトずつ。使わない行は0）96 / 残り0。
+/// 数はリトルエンディアン。
+/// 枠のタグ（`+48`）が番号 + 1 なので件ごとの先頭は持たない。
 pub fn snap_header(rows: &[CopyRow]) -> Vec<u8> {
     let mut h = Vec::with_capacity(SNAP_HEADER_BYTES);
     h.extend_from_slice(SNAP_MAGIC);
@@ -281,7 +284,7 @@ pub(crate) mod tests {
     use crate::ticks::tests::rec;
     use crate::ticks::{COPY_TABLE, OFF_COPY_INPUT, OFF_COPY_MATCH, OFF_COPY_RNG, SLOT_WORDS};
 
-    /// 枠を 1 つ作る。先頭は `rec` の値、コピーの所は `fill(枠のバイト位置)` のバイト。
+    /// 枠を1つ作る。先頭は`rec`の値、コピーの所は`fill(枠のバイト位置)`のバイト。
     pub(crate) fn snap_with(seq: u32, sup: u32, fill: impl Fn(u32) -> u8) -> Snap {
         let r = rec(seq, 1000 + seq as u64, 1.0 + seq as f64, sup, 2, 2);
         let mut words = Box::new([0u32; SLOT_WORDS]);

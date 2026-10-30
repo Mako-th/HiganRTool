@@ -1,13 +1,14 @@
-//! Ctrl+上段の数字（0〜9）・Ctrl+Tab・Ctrl+C のキーの読み（`GetAsyncKeyState` の層。unsafe はこの中だけ）。押した瞬間の取り方は `digit_keys.rs`、
-//! 読んでよい間の判断は `net_game::NetGame::digit_keys`。
+//! Ctrl+上段の数字（0〜9）・Ctrl+Tab・Ctrl+Cのキーの読み（`GetAsyncKeyState`の層。unsafeはこの中だけ）。押した瞬間の取り方は`digit_keys.rs`。
+//! 読んでよい間の判断は`net_game::NetGame::digit_keys`。
 //!
-//! 読むだけ: OS への入力の注入も、前面を奪う呼び出しもしない。`GetAsyncKeyState` はゲームの入力の関数が読む表（`GetKeyboardState`）とは別の経路で、
-//! IME が開いていてもキーそのものの状態を返す（公開資料の仕様から。実機では検証していない）。
-//! 1 tick に 12 回の問い合わせ（数字 10 個 ＋ Tab ＋ C。どれかが押されている tick だけ、Ctrl・Alt・左右の Win の 4 回が足される）。ゲームのスレッドで、確保しない。
+//! 読むだけ: OSへの入力の注入も前面を奪う呼び出しもしない。
+//! `GetAsyncKeyState`はゲームの入力の関数が読む表（`GetKeyboardState`）とは別の経路。
+//! IMEが開いていてもキーそのものの状態を返す（公開資料の仕様から。実機では検証していない）。
+//! 1 tickに12回問い合わせる（数字10個 ＋ Tab ＋ C。どれかが押されているtickだけCtrl・Alt・左右のWinの4回が足される）。ゲームのスレッドで走り、確保しない。
 
 use crate::digit_keys::{ALL_HELD, C_BIT, CTRL_BIT, MOD_BIT, TAB_BIT};
 
-/// 検査用の偽の読み: `-1` は「読んではいけない間」（`held` が `None`）、それ以外は押している集合。
+/// 検査用の偽の読み: `-1`は「読んではいけない間」（`held`が`None`）を表す。それ以外は押している集合。
 #[cfg(test)]
 static TEST_HELD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -25,23 +26,24 @@ pub(crate) fn test_set_foreground(mine: bool) {
     TEST_FOREGROUND.store(mine, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Windows の前面のウィンドウがこのプロセス（ゲーム）のウィンドウか。ほかのアプリが前面なら false、前面のウィンドウが無いときも false。
-/// HWND でなく持ち主のプロセス ID で比べる: `notify_win::game_window` は `EnumWindows` で全部のウィンドウを走査するので 1 tick ごとには
-/// 重く、`text_input_win` の差し替えたウィンドウは最初の文字の入力まで無い。ゲームの主ウィンドウは 1 つなので、同じプロセスのウィンドウが前面＝
-/// ゲームのウィンドウが前面とみなす。読むだけで、前面は変えない。
+/// Windowsの前面のウィンドウがこのプロセス（ゲーム）のウィンドウかどうか。ほかのアプリが前面ならfalse。前面のウィンドウが無いときもfalse。
+/// HWNDでなく所有者のプロセスIDで比べる。
+/// `notify_win::game_window`は`EnumWindows`で全部のウィンドウを走査するので1 tickごとには重い。
+/// `text_input_win`の差し替えたウィンドウは最初の文字の入力まで無い。
+/// ゲームの主ウィンドウは1つなので、同じプロセスのウィンドウが前面ならゲームのウィンドウが前面とみなす。読むだけで前面は変えない。
 #[cfg(not(test))]
 pub fn foreground_is_game() -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
     };
-    // SAFETY: 引数の無い読み取りの問い合わせ。前面のウィンドウが消えていれば NULL が返るだけ。
+    // SAFETY: 引数の無い読み取りの問い合わせ。前面のウィンドウが消えていればNULLが返るだけ。
     let fg = unsafe { GetForegroundWindow() };
     if fg.is_null() {
         return false;
     }
     let mut pid = 0u32;
-    // SAFETY: `fg` は今取ったウィンドウ（消えていても 0 が返るだけ）。`pid` は書ける u32。
+    // SAFETY: `fg`は今取ったウィンドウ（消えていても0が返るだけ）。`pid`は書き込み可能なu32。
     let tid = unsafe { GetWindowThreadProcessId(fg, &mut pid) };
     // SAFETY: 引数の無い問い合わせ。
     tid != 0 && pid == unsafe { GetCurrentProcessId() }
@@ -52,10 +54,10 @@ pub fn foreground_is_game() -> bool {
     TEST_FOREGROUND.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 仮想キー C（文字キーの仮想キーコードは大文字の ASCII）。
+/// 仮想キーC（文字キーの仮想キーコードは大文字のASCII）。
 const VK_C: u16 = 0x43;
 
-/// 仮想キーが今押されているか（`shot_key_win` の P・Home の読みも使う）。
+/// 仮想キーが今押されているかどうか（`shot_key_win`のP・Homeの読みも使う）。
 #[cfg(not(test))]
 pub(crate) fn key_down(vk: u16) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -65,9 +67,9 @@ pub(crate) fn key_down(vk: u16) -> bool {
     s < 0
 }
 
-/// 数字キー 0〜9・Tab・C のうち今押されているものの集合（bit `d` = 数字 `d`、bit10 = Tab、bit13 = C）。どれかが押されているときだけ、
-/// Ctrl（bit12）と Alt・Win のどれか（bit11）も読む（Ctrl+数字・Ctrl+Tab・Ctrl+C だけを取り、Alt+Tab などを取らない）。
-/// `down` はキー（仮想キーコード）が今押されているかの問い合わせ（本物は `key_down`、検査は偽物）。
+/// 数字キー0〜9・Tab・Cのうち今押されているものの集合（bit `d` = 数字`d`・bit10 = Tab・bit13 = C）。
+/// どれかが押されているときだけCtrl（bit12）とAlt・Winのどれか（bit11）も読む（Ctrl+数字・Ctrl+Tab・Ctrl+Cだけを取り、Alt+Tabなどは取らない）。
+/// `down`はキー（仮想キーコード）が今押されているかの問い合わせ（本物は`key_down`、検査は偽物）。
 fn held_with(mut down: impl FnMut(u16) -> bool) -> u16 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_TAB,
@@ -95,7 +97,7 @@ fn held_with(mut down: impl FnMut(u16) -> bool) -> u16 {
     set & ALL_HELD
 }
 
-/// `held_with` を本物のキーで読む。ルーム名などの文字の入力がウィンドウから文字を受けている間は読まず `None`。
+/// `held_with`を本物のキーで読む。ルーム名などの文字の入力がウィンドウから文字を受けている間は読まず`None`。
 #[cfg(not(test))]
 pub fn held() -> Option<u16> {
     if crate::text_input_win::gate_open() {
@@ -118,7 +120,7 @@ mod tests {
     const VK_CTRL: u16 = 0x11;
     const VK_ALT: u16 = 0x12;
 
-    /// 押されている仮想キーが `pressed` の読み。戻りは（集合, 問い合わせの数）。
+    /// 押されている仮想キーが`pressed`の読み。戻りは（集合, 問い合わせの数）。
     fn read(pressed: &[u16]) -> (u16, usize) {
         let asked = Cell::new(0);
         let set = held_with(|vk| {

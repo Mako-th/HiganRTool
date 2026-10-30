@@ -1,10 +1,14 @@
-//! 起動前の更新（配るバージョンだけ）。花映塚を起動する前に署名つきの目録を取り、新しいバージョンがあればウィンドウで尋ね、「はい」なら
-//! 必要なファイルを置き換えて新しい `HiganRTool.exe` を同じ引数で起動し直す。通信とウィンドウは `Net` / `Host` の向こう。
-//! - 更新を確認するのは配るバージョン（feature `dist`）の通常起動だけ（`skip_reason`）。ゲームのフォルダが決まってからで、その中では何もしない。
-//! - 待ちは全体で `CHECK_DEADLINE_MS`（約 2 秒）まで。通信は別スレッドで走らせ、時間が来たら起動へ進む。
-//! - 置き換えは `<名前>.new` に書いて読み戻し、全部そろってから 1 つずつ「いまの物を `.old` へ改名 → `.new` を本来の名前へ」（動いている exe や dll は上書きできないが改名はできるため）。途中で失敗したら逆順に戻し、自分の exe は最後に置く。
-//! - `.old` は、新しいバージョンが花映塚を起動できた印（`note_launched`）を残した次の起動が消す。
-//! - 進み具合は `Host::progress` で同じ行に書き直す。更新して起動し直した初回は `post_update` が ini を合わせて変更点を出す。
+//! 起動前の更新（配布バージョンだけ）。
+//! 花映塚を起動する前に署名つきの目録を取り、新しいバージョンがあればウィンドウで尋ねる。
+//! 「はい」なら必要なファイルを置き換えて新しい`HiganRTool.exe`を同じ引数で起動し直す。
+//! 通信とウィンドウは`Net` / `Host`のトレイトを通して行う。
+//! - 更新を確認するのは配布バージョン（feature `dist`）の通常起動だけ（`skip_reason`）。ゲームのフォルダが決まってから確認し、ゲームのフォルダの中では何もしない。
+//! - 待ちは全体で`CHECK_DEADLINE_MS`（約2秒）まで。通信は別スレッドで走らせ、時間が来たら起動へ進む。
+//! - 置き換えは`<名前>.new`に書いて読み戻し、全部そろってから1つずつ行う。
+//!   手順は「いまの物を`.old`へ改名 → `.new`を本来の名前へ」。動いているexeやdllは上書きできないが改名はできるため、この手順にする。
+//!   途中で失敗したら逆順に戻す。自分のexeは最後に置く。
+//! - `.old`は新しいバージョンが花映塚を起動できた印（`note_launched`）を残した次の起動が消す。
+//! - 進み具合は`Host::progress`で同じ行に書き直す。更新して起動し直した初回は`post_update`がiniを合わせて変更点を出す。
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,9 +20,9 @@ use higanr_core::update::{self, FileEntry, Manifest};
 
 use crate::crash_log::is_inside_game;
 use crate::game_pick;
-use crate::http_win::{self, HttpError, Proxy, Timeouts};
 use crate::post_update;
 use crate::ui_lang::by_lang;
+use higanr_http_win::{self as http_win, HttpError, Proxy, Timeouts};
 
 /// 全体の上限（`CHECK_DEADLINE_MS`）より短くする。
 const CHECK_TIMEOUTS: Timeouts = Timeouts {
@@ -36,9 +40,9 @@ const DOWNLOAD_TIMEOUTS: Timeouts = Timeouts {
 };
 
 pub trait Net {
-    /// Net の実装が、待ちを `CHECK_DEADLINE_MS` に収める。
+    /// Netの実装が待ちを`CHECK_DEADLINE_MS`に収める。
     fn get_manifest(&mut self) -> Result<Vec<u8>, String>;
-    /// `size` は目録の大きさ。Net の実装は、越える応答を断る。`progress` には、受け取り進むたびにそこまでのバイト数を渡す。
+    /// `size`は目録の大きさ。Netの実装は越える応答を断る。`progress`には受け取りが進むたびにそこまでのバイト数を渡す。
     fn get_file(
         &mut self,
         name: &str,
@@ -56,16 +60,16 @@ pub trait Host {
     fn record(&mut self, _line: &str) {}
     /// 見出しなどの飾りのない行を出す（変更点の文）。
     fn show(&mut self, text: &str);
-    /// 同じ行を書き直して進み具合を出す。区切りは `progress_end`。
+    /// 同じ行を書き直して進み具合を出す。区切りは`progress_end`。
     fn progress(&mut self, line: &str);
     /// 書き直していた行を確定して改行する。出していなければ何もしない。
     fn progress_end(&mut self);
-    /// 標準入力も出力もコンソールか（パイプや検査のツールからの起動は偽）。
+    /// 標準入力も出力もコンソールかどうか（パイプや検査のツールからの起動は偽）。
     fn interactive(&self) -> bool;
-    /// Enter が押されるまで待つ。
+    /// Enterが押されるまで待つ。
     fn wait_enter(&mut self);
-    /// 起動した子が終わるまで待ち、その終了コードを返す。起動できなければ Err（呼び出し側が全部戻す）。
-    /// 子が失敗して終わっても更新は戻さないので、それは Ok。待つ間は何も読まず・書かない（子が同じコンソールの入力を使う）。
+    /// 起動した子が終わるまで待ち、その終了コードを返す。起動できなければErr（呼び出し側が全部戻す）。
+    /// 子が失敗して終わっても更新は戻さないのでそれはOk。待つ間は何も読まず・書かない（子が同じコンソールの入力を使う）。
     fn restart(&mut self, exe: &Path, args: &[OsString]) -> Result<i32, String>;
 }
 
@@ -85,7 +89,7 @@ pub enum Outcome {
     Restarted(i32),
 }
 
-/// 通信とウィンドウの失敗は全部 `Proceed`（花映塚の起動を止めない）。更新の途中の失敗は、元へ戻して知らせてから `Proceed`。
+/// 通信とウィンドウの失敗は全部`Proceed`（花映塚の起動を止めない）。更新の途中の失敗は元へ戻して知らせてから`Proceed`。
 pub fn run(s: &Setup<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outcome {
     let lang = s.lang;
     let bytes = match net.get_manifest() {
@@ -197,7 +201,7 @@ fn give_up(host: &mut dyn Host, why: &str, lang: Lang) -> Outcome {
     Outcome::Proceed
 }
 
-/// 全部落とし、大きさと SHA-256 を照らす。1 つでも合わなければ Err（何も置き換えない）。
+/// 全部ダウンロードし、大きさとSHA-256を照合する。1つでも合わなければErr（何も置き換えない）。
 fn download_all(
     net: &mut dyn Net,
     m: &Manifest,
@@ -251,14 +255,14 @@ impl Progress {
         p
     }
 
-    /// 大きさ 0 のファイルは最初から 100%。
+    /// 大きさ0のファイルは最初から100%。
     fn percent(&self, got: u64) -> u64 {
         got.saturating_mul(100)
             .checked_div(self.size)
             .map_or(100, |p| p.min(100))
     }
 
-    /// 割合が前の行から変わっていれば、書き直す行。
+    /// 割合が前の行から変わっていれば書き直す行を返す。
     fn update(&mut self, got: u64) -> Option<String> {
         let percent = self.percent(got);
         (percent != self.last_percent).then(|| {
@@ -311,7 +315,7 @@ fn check_file(f: &FileEntry, data: &[u8], lang: Lang) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placed {
     pub name: String,
-    /// 置き換える前にあった物を `.old` に取ったか。
+    /// 置き換える前にあった物を`.old`に取ったかどうか。
     pub had_old: bool,
 }
 
@@ -331,14 +335,14 @@ impl ReplaceError {
     }
 }
 
-/// 自分の exe を最後に置き換える（失敗しても、前の分を全部戻せるうちに済ませるため）。
+/// 自分のexeを最後に置き換える（失敗しても前の分を全部戻せるうちに済ませるため）。
 fn commit_order(files: &[(String, Vec<u8>)]) -> Vec<&(String, Vec<u8>)> {
     let (own, others): (Vec<_>, Vec<_>) = files.iter().partition(|(n, _)| n == update::SELF_EXE);
     others.into_iter().chain(own).collect()
 }
 
-/// `dir` の直下を置き換える。成功なら置き換えた分（起動し直しに失敗したら `undo` で戻す）。失敗なら済んだ分は戻し `.new` は消す。
-/// 名前は `update::is_allowed_name` の規則に合うものだけ（1 つでも外れたら何も書かない）。
+/// `dir`の直下を置き換える。成功なら置き換えた分（起動し直しに失敗したら`undo`で戻す）。失敗なら済んだ分は戻し`.new`は消す。
+/// 名前は`update::is_allowed_name`の規則に合うものだけ（1つでも外れたら何も書かない）。
 pub fn replace_files(
     dir: &Path,
     files: &[(String, Vec<u8>)],
@@ -357,7 +361,7 @@ pub fn replace_files(
             )));
         }
     }
-    // `.new` に書いて読み戻す（書き損じや途中の差し替えを、置き換えの前に見つける）。
+    // `.new`に書いて読み戻す（書き損じや途中の差し替えを置き換えの前に見つける）。
     for (name, data) in files {
         let new = dir.join(update::new_name(name));
         let shown = new.display();
@@ -406,13 +410,13 @@ pub fn replace_files(
     Ok(placed)
 }
 
-/// 失敗するときは、このファイルの分は元に戻してから返す。
+/// 失敗するときはこのファイルの分は元に戻してから返す。
 fn place_one(dir: &Path, name: &str, lang: Lang) -> Result<bool, String> {
     let target = dir.join(name);
     let old = dir.join(update::old_name(name));
     let new = dir.join(update::new_name(name));
     let (target_shown, old_shown) = (target.display(), old.display());
-    // 前の更新の `.old` が残っていたら消す（読み込み中の dll などで消せないことがある）。
+    // 前の更新の`.old`が残っていたら消す（読み込み中のdllなどで消せないことがある）。
     if old.symlink_metadata().is_ok() {
         std::fs::remove_file(&old).map_err(|e| {
             by_lang!(
@@ -434,7 +438,7 @@ fn place_one(dir: &Path, name: &str, lang: Lang) -> Result<bool, String> {
     }
     if let Err(e) = std::fs::rename(&new, &target) {
         if had_old {
-            // 取った物を戻す。戻せなければ元の物は `.old` に残るので、その旨を理由に足す。
+            // 取った物を戻す。戻せなければ元の物は`.old`に残るのでその旨を理由に足す。
             if let Err(e2) = std::fs::rename(&old, &target) {
                 return Err(by_lang!(
                     lang,
@@ -480,7 +484,7 @@ fn remove_staged(dir: &Path, files: &[(String, Vec<u8>)]) {
     }
 }
 
-/// `.new` を消し、`remove_old` なら `.old` も消す。消せなかったものは `retries` 回まで `wait` ずつ待って試し、残れば返す。
+/// `.new`を消し、`remove_old`なら`.old`も消す。消せなかったものは`retries`回まで`wait`ずつ待って試し、残れば返す。
 pub fn cleanup_leftovers(
     dir: &Path,
     retries: u32,
@@ -512,8 +516,8 @@ pub fn cleanup_leftovers(
     left
 }
 
-/// 起動のときの片づけ。ゲームのフォルダの中では触らない。`.old` は新しいバージョンが起動できた印を残した次の起動だけ消す。
-/// `just_updated` の親は子が終わるまで動き続けるので、親の exe の `.old` はこの間は消せない（消せなければ残し、次の起動で消す）。
+/// 起動時の後始末。ゲームのフォルダの中では触らない。`.old`は新しいバージョンが起動できた印を残した次の起動だけ消す。
+/// `just_updated`の親は子が終わるまで動き続けるので親のexeの`.old`はこの間は消せない（消せなければ残し、次の起動で消す）。
 pub fn clear_leftovers_at(
     dir: &Path,
     in_game: bool,
@@ -533,7 +537,7 @@ pub fn clear_leftovers_at(
     cleanup_leftovers(dir, retries, wait, remove_old)
 }
 
-/// exe のフォルダに `th09.exe` があるとき。置き換えも片づけもしない。決まったゲームのフォルダとの比べは `is_inside_game`。
+/// exeのフォルダに`th09.exe`があるとき。置き換えも後始末もしない。決まったゲームのフォルダとの比較は`is_inside_game`。
 pub fn in_game_folder(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|rd| {
         rd.flatten().any(|e| {
@@ -544,7 +548,7 @@ pub fn in_game_folder(dir: &Path) -> bool {
     })
 }
 
-/// 花映塚を起動できたことを印に残す（配るバージョンだけ）。書けなくても起動は止めない。
+/// 花映塚を起動できたことを印に残す（配布バージョンだけ）。書き込めなくても起動は止めない。
 /// ゲームのフォルダが分からなければ書かない。
 pub fn note_launched(game_dir: Option<&Path>, lang: Lang) {
     if !this_build_is_dist() {
@@ -571,7 +575,7 @@ pub fn note_launched(game_dir: Option<&Path>, lang: Lang) {
     }
 }
 
-/// 書いたら Ok(true)。ビルド番号 0・ゲームのフォルダの中なら書かず Ok(false)。
+/// 書いたらOk(true)。ビルド番号0・ゲームのフォルダの中なら書かずOk(false)。
 pub fn note_launched_at(
     dir: &Path,
     build_number: u32,
@@ -662,10 +666,45 @@ pub fn skip_reason(g: &Gate) -> Option<Skip> {
     }
 }
 
+/// 起動の条件から`Gate`を作る（更新の確認とDLLの知らせの許しが同じ条件を見る）。
+fn gate_of(c: &Start<'_>, in_game: bool, ini_enabled: bool) -> Gate {
+    Gate {
+        dist: c.dist,
+        in_game_folder: in_game,
+        dev_args: c.dev_args,
+        just_updated: c.just_updated,
+        inherited_ini: c.inherited_ini,
+        build_number: c.build_number,
+        exe_name_ok: is_release_exe_name(c.exe),
+        ini_enabled,
+    }
+}
+
+/// exeのフォルダのiniの`[loader] update_check`。iniが無い・読めないときは確認する側（`Ok(true)`）。
+fn ini_update_check(dir: &Path) -> Result<bool, String> {
+    let text = std::fs::read_to_string(dir.join(crate::code_relay::INI_FILE)).ok();
+    update::update_check_enabled(text.as_deref())
+}
+
+/// 遊んでいる間の新しいバージョンの知らせ（DLL。`update_notice::NOTICE_ENV`）を許すかどうか。
+/// 更新の確認（`skip_reason`）と同じ条件のうち開発用のビルド・開発用の引数・ビルド番号0・iniの`update_check = 0`だけを残す。
+/// 自動更新できない置き方（ゲームのフォルダの中・exeの名前違い）でも知らせる。
+/// `JustUpdated`・`InheritedIni`でも知らせは止めない。前者は起動前に更新が続く事故を止める歯止めで、後者は更新の確認が読むiniと別のiniを使う起動を表す。どちらも知らせとは関係が無い。
+pub fn notice_allowed(g: &Gate) -> bool {
+    skip_reason(&Gate {
+        in_game_folder: false,
+        just_updated: false,
+        inherited_ini: false,
+        exe_name_ok: true,
+        ..*g
+    })
+    .is_none()
+}
+
 // ---- 本物 ----
 
 pub struct WinHttpNet {
-    /// 検査は `http://127.0.0.1:<port>`。
+    /// 検査は`http://127.0.0.1:<port>`。
     pub server: String,
     pub proxy: Proxy,
     pub manifest_budget: Duration,
@@ -694,7 +733,7 @@ impl Net for WinHttpNet {
         let ep = update::parse_url(&url).ok_or_else(|| self.bad_url(&url))?;
         let proxy = self.proxy;
         let (tx, rx) = mpsc::channel();
-        // 通信は別スレッドで。名前の解決やプロキシの自動探索は操作ごとの上限だけでは収まらないので、時間で見切る。
+        // 通信は別スレッドで。名前の解決やプロキシの自動探索は操作ごとの上限だけでは収まらないので時間で見切る。
         std::thread::Builder::new()
             .name("higanr-update-check".into())
             .spawn(move || {
@@ -764,7 +803,7 @@ impl Net for WinHttpNet {
 /// 本物のウィンドウとコンソール。
 #[derive(Default)]
 pub struct RealHost {
-    /// 書き直す途中の行（改行していない）があるか。
+    /// 書き直す途中の行（改行していない）があるかどうか。
     line_open: bool,
 }
 
@@ -827,7 +866,7 @@ impl Host for RealHost {
     }
 
     fn restart(&mut self, exe: &Path, args: &[OsString]) -> Result<i32, String> {
-        // 待たずに終わると、コマンドプロンプトのプロンプトと子の Enter 待ちが同じ入力を取り合う。
+        // 待たずに終わるとコマンドプロンプトのプロンプトと子のEnter待ちが同じ入力を取り合う。
         std::process::Command::new(exe)
             .args(args)
             .env(update::JUST_UPDATED_ENV, "1")
@@ -848,7 +887,7 @@ pub const fn this_build_is_dist() -> bool {
 }
 
 pub struct Start<'a> {
-    /// 偽なら何も読まず・触らず `Proceed`（開発用ビルドの exe の隣を片づけない）。
+    /// 偽なら何も読まず・触らず`Proceed`（開発用ビルドのexeの隣を後始末しない）。
     pub dist: bool,
     pub build_number: u32,
     pub exe: &'a Path,
@@ -856,19 +895,19 @@ pub struct Start<'a> {
     pub just_updated: bool,
     pub inherited_ini: bool,
     pub args: &'a [OsString],
-    /// 読めなければ None（その回は確認しない）。
+    /// 読めなければNone（今回は確認しない）。
     pub key: Option<[u8; 32]>,
-    /// 決まったゲームのフォルダ。None（まだ決まっていない）なら何も読まず・書かず `Proceed`
-    /// （ツールがゲームの下の階層にあっても、その中へ `.new` などを書かないため）。
+    /// 決定済みのゲームのフォルダ。None（まだ決定していない）なら何も読まず・書かず`Proceed`。
+    /// ツールがゲームの下の階層にあってもその中へ`.new`などを書かないようにするため。
     pub game_dir: Option<&'a Path>,
     pub lang: Lang,
-    /// 更新して起動し直した初回に、ini を合わせる先の形（配る ini の全文）。
+    /// 更新して起動し直した初回にiniを合わせる先の形（配布iniの全文）。
     pub ini_template: &'a str,
     /// 更新して起動し直した初回に出す変更点。
     pub notes: &'a str,
 }
 
-/// 起動の入口の本体。条件がそろえば確認し、`Restarted` なら呼び出し側は子の終了コードで終わる。
+/// 起動の入口の本体。条件がそろえば確認し、`Restarted`なら呼び出し側は子の終了コードで終わる。
 pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outcome {
     if !c.dist {
         host.record(&not_checked(Skip::NotDist.reason()));
@@ -896,7 +935,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
             )
         );
     }
-    // 更新を確認するのは通常の起動だけなので、起動し直しの初回は開発用の引数も継いだ ini も付かない。付いていたら人の起動ではない。
+    // 更新を確認するのは通常の起動だけなので起動し直しの初回は開発用の引数も継いだiniも付かない。付いていたら人の起動ではない。
     if c.just_updated && !in_game && !c.dev_args && !c.inherited_ini {
         post_update::run(
             host,
@@ -908,8 +947,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
             },
         );
     }
-    let ini_text = std::fs::read_to_string(dir.join(crate::code_relay::INI_FILE)).ok();
-    let ini_enabled = match update::update_check_enabled(ini_text.as_deref()) {
+    let ini_enabled = match ini_update_check(dir) {
         Ok(b) => b,
         Err(why) => {
             eprintln!(
@@ -923,17 +961,7 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
             true
         }
     };
-    let gate = Gate {
-        dist: c.dist,
-        in_game_folder: in_game,
-        dev_args: c.dev_args,
-        just_updated: c.just_updated,
-        inherited_ini: c.inherited_ini,
-        build_number: c.build_number,
-        exe_name_ok: is_release_exe_name(c.exe),
-        ini_enabled,
-    };
-    if let Some(reason) = skip_reason(&gate) {
+    if let Some(reason) = skip_reason(&gate_of(c, in_game, ini_enabled)) {
         host.record(&not_checked(reason.reason()));
         match reason {
             Skip::InGameFolder => println!(
@@ -982,16 +1010,19 @@ pub fn start_with(c: &Start<'_>, net: &mut dyn Net, host: &mut dyn Host) -> Outc
     )
 }
 
-/// 起動し直す exe に渡す引数。`--choose-game` は外す（更新の前に選び終えて覚えてあり、残すと選ぶウィンドウがもう一度出る）。
+/// 起動し直すexeに渡す引数。`--choose-game`は外す（更新の前に選び終えて覚えてあり、残すと選ぶウィンドウがもう一度出る）。
 pub fn restart_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     args.into_iter().filter(|a| a != "--choose-game").collect()
 }
 
-/// 環境から `Start` を組み、本物の通信とウィンドウで `start_with` を呼ぶ。`game_dir` は決まったゲームのフォルダ。
-pub fn startup(dev_args: bool, game_dir: &Path, lang: Lang) -> Outcome {
-    let Ok(exe) = std::env::current_exe() else {
-        return Outcome::Proceed;
-    };
+/// 環境から`Start`を組んで`f`へ渡す。`game_dir`は決定済みのゲームのフォルダ。自分のexeの場所が取れなければ`None`。
+fn with_env_start<R>(
+    dev_args: bool,
+    game_dir: &Path,
+    lang: Lang,
+    f: impl FnOnce(&Start<'_>) -> R,
+) -> Option<R> {
+    let exe = std::env::current_exe().ok()?;
     let args = restart_args(std::env::args_os().skip(1));
     let ini_template = higanr_core::ini_store::dist_ini_text();
     let c = Start {
@@ -1008,11 +1039,37 @@ pub fn startup(dev_args: bool, game_dir: &Path, lang: Lang) -> Outcome {
         ini_template: &ini_template,
         notes: post_update::NOTES.get(lang),
     };
-    start_with(
-        &c,
-        &mut WinHttpNet::production(lang),
-        &mut RealHost::default(),
-    )
+    Some(f(&c))
+}
+
+/// 環境から`Start`を組み、本物の通信とウィンドウで`start_with`を呼ぶ。
+pub fn startup(dev_args: bool, game_dir: &Path, lang: Lang) -> Outcome {
+    with_env_start(dev_args, game_dir, lang, |c| {
+        start_with(
+            c,
+            &mut WinHttpNet::production(lang),
+            &mut RealHost::default(),
+        )
+    })
+    .unwrap_or(Outcome::Proceed)
+}
+
+/// DLLの知らせを許すかどうか（`notice_allowed`）。ファイルは読むだけで何も書かない。
+pub fn notice_allowed_now(dev_args: bool, game_dir: &Path, lang: Lang) -> bool {
+    with_env_start(dev_args, game_dir, lang, notice_allowed_at).unwrap_or(false)
+}
+
+fn notice_allowed_at(c: &Start<'_>) -> bool {
+    let (Some(dir), Some(game_dir)) = (c.exe.parent(), c.game_dir) else {
+        return false;
+    };
+    if !c.dist {
+        return false;
+    }
+    let in_game = in_game_folder(dir) || is_inside_game(dir, game_dir);
+    // 読めない値は更新の確認と同じく確認する側。
+    let ini_enabled = ini_update_check(dir).unwrap_or(true);
+    notice_allowed(&gate_of(c, in_game, ini_enabled))
 }
 
 #[cfg(test)]
@@ -1027,13 +1084,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    // ---- 偽の HTTP サーバー（loopback。外へは出ない）----
+    // ---- 偽のHTTPサーバー（loopback。外へは出ない）----
 
     #[derive(Clone)]
     enum Route {
         Body(Vec<u8>),
         Redirect(String),
-        /// 偽の HTTP サーバーが、別ポート（別のサーバー）への絶対 URL へ回す。
+        /// 偽のHTTPサーバーが別ポート（別のサーバー）への絶対URLへ回す。
         RedirectTo(String),
         /// 待ってから中の応答をする。
         Slow(Duration, Box<Route>),
@@ -1043,7 +1100,7 @@ mod tests {
             sent: Vec<u8>,
         },
         Delay(Duration, Vec<u8>),
-        /// 本文を 3 つに分けて 1 秒おきに送る（1 回の待ちは受信の上限 1.5 秒より短いが、全体は 3 秒）。
+        /// 本文を3つに分けて1秒おきに送る（1回の待ちは受信の上限1.5秒より短いが、全体は3秒）。
         Trickle(Vec<u8>),
     }
 
@@ -1190,7 +1247,7 @@ mod tests {
         /// `record`（ログだけの行）。
         recorded: Vec<String>,
         shown: Vec<String>,
-        /// `progress` で書き直した行（`progress_end` で確定したものは `finished` にも入る）。
+        /// `progress`で書き直した行（`progress_end`で確定したものは`finished`にも入る）。
         progress: Vec<String>,
         finished: Vec<String>,
         interactive: bool,
@@ -1513,7 +1570,7 @@ mod tests {
         }
     }
 
-    /// 手元に無いリプレイ修復ツールが目録に載っていても、更新は壊れずにその名前で新しく追加する（v1.0.0 の手順も同じ）。
+    /// 手元に無いリプレイ修復ツールが目録に載っていても更新は壊れずにその名前で新しく追加する（v1.0.0の手順も同じ）。
     #[test]
     fn a_new_replay_fix_exe_in_the_manifest_is_placed_and_removed_again_when_the_restart_fails() {
         const FIX: &str = "HiganRTool_replay_fix.exe";
@@ -1779,8 +1836,8 @@ mod tests {
         }
     }
 
-    /// 本番の道（配るサーバー → 配布元の Releases → 配信の宿）を、別ポートの 3 つの宿に見立てる。
-    /// `delays` は目録の応答に入る前の、宿ごとの待ち（ファイルは待たせない）。
+    /// 本番の経路（配布サーバー → 配布元のReleases → 配信サーバー）を別ポートの3つの偽のサーバーに見立てる。
+    /// `delays`は目録の応答に入る前のサーバーごとの待ち（ファイルは待たせない）。
     struct Chain {
         front: Server,
         release: Server,
@@ -1894,7 +1951,7 @@ mod tests {
 
     #[test]
     fn waits_on_each_of_three_hosts_count_against_one_two_second_budget() {
-        // 1 つの宿の待ちは 1.5 秒の上限の内でも、3 つ合わせて 2 秒を越えれば見切る。
+        // 1つのサーバーの待ちは1.5秒の上限の内でも3つ合わせて2秒を越えれば見切る。
         for (what, delays, applied) in [
             ("3 つで 1.5 秒", each_hop(500), true),
             ("3 つで 2.4 秒", each_hop(800), false),
@@ -2291,6 +2348,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_notice_is_allowed_for_every_skip_reason_exactly_as_the_table_says() {
+        let ok = Gate {
+            dist: true,
+            in_game_folder: false,
+            dev_args: false,
+            just_updated: false,
+            inherited_ini: false,
+            build_number: 5,
+            exe_name_ok: true,
+            ini_enabled: true,
+        };
+        let table: [(Option<Skip>, Gate, bool); 9] = [
+            (None, ok, true),
+            (Some(Skip::NotDist), Gate { dist: false, ..ok }, false),
+            (
+                Some(Skip::InGameFolder),
+                Gate {
+                    in_game_folder: true,
+                    ..ok
+                },
+                true,
+            ),
+            (
+                Some(Skip::DevArgs),
+                Gate {
+                    dev_args: true,
+                    ..ok
+                },
+                false,
+            ),
+            (
+                Some(Skip::JustUpdated),
+                Gate {
+                    just_updated: true,
+                    ..ok
+                },
+                true,
+            ),
+            (
+                Some(Skip::InheritedIni),
+                Gate {
+                    inherited_ini: true,
+                    ..ok
+                },
+                true,
+            ),
+            (
+                Some(Skip::NoBuildNumber),
+                Gate {
+                    build_number: 0,
+                    ..ok
+                },
+                false,
+            ),
+            (
+                Some(Skip::OtherExeName),
+                Gate {
+                    exe_name_ok: false,
+                    ..ok
+                },
+                true,
+            ),
+            (
+                Some(Skip::IniOff),
+                Gate {
+                    ini_enabled: false,
+                    ..ok
+                },
+                false,
+            ),
+        ];
+        for (skip, g, allowed) in table {
+            assert_eq!(skip_reason(&g), skip, "{g:?}");
+            assert_eq!(notice_allowed(&g), allowed, "{skip:?}");
+        }
+        // 外す4つの条件が立っていても、後ろの条件（ビルド番号・ini・開発用の引数）は隠れずに効く。
+        for (name, g) in [
+            (
+                "更新直後でビルド番号 0",
+                Gate {
+                    just_updated: true,
+                    build_number: 0,
+                    ..ok
+                },
+            ),
+            (
+                "ゲームのフォルダの中で ini が update_check = 0",
+                Gate {
+                    in_game_folder: true,
+                    ini_enabled: false,
+                    ..ok
+                },
+            ),
+            (
+                "exe の名前が違って ini が update_check = 0",
+                Gate {
+                    exe_name_ok: false,
+                    ini_enabled: false,
+                    ..ok
+                },
+            ),
+            (
+                "ゲームのフォルダの中で開発用の引数",
+                Gate {
+                    in_game_folder: true,
+                    dev_args: true,
+                    ..ok
+                },
+            ),
+            (
+                "更新直後で ini が update_check = 0",
+                Gate {
+                    just_updated: true,
+                    ini_enabled: false,
+                    ..ok
+                },
+            ),
+            (
+                "引き継いだ ini で開発用の引数",
+                Gate {
+                    inherited_ini: true,
+                    dev_args: true,
+                    ..ok
+                },
+            ),
+        ] {
+            assert!(!notice_allowed(&g), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_notice_follows_the_exe_folder_ini_and_the_game_folder_on_disk() {
+        let dir = temp_dir("notice_disk");
+        install(&dir);
+        let exe = dir.join("HiganRTool.exe");
+        let args: Vec<OsString> = Vec::new();
+        let ini = dir.join("HiganRTool.ini");
+        assert!(notice_allowed_at(&start(&exe, &args, true, OLD_VERSION)));
+        assert!(
+            !notice_allowed_at(&start(&exe, &args, false, OLD_VERSION)),
+            "開発用のビルド"
+        );
+        assert!(
+            !notice_allowed_at(&start(&exe, &args, true, 0)),
+            "ビルド番号 0"
+        );
+        assert!(
+            !notice_allowed_at(&start_game(&exe, &args, true, OLD_VERSION, None)),
+            "ゲームのフォルダが決まっていない"
+        );
+        // 自動更新できないゲームのフォルダの中でも知らせる。
+        assert!(
+            notice_allowed_at(&start_game(&exe, &args, true, OLD_VERSION, Some(&dir))),
+            "ゲームのフォルダの中"
+        );
+        std::fs::write(&ini, "[loader]\nupdate_check = 0\n").expect("ini");
+        assert!(
+            !notice_allowed_at(&start(&exe, &args, true, OLD_VERSION)),
+            "update_check = 0"
+        );
+        // 値が読めないiniは更新の確認と同じく許す側。
+        std::fs::write(&ini, "[loader]\nupdate_check = maybe\n").expect("ini");
+        assert!(notice_allowed_at(&start(&exe, &args, true, OLD_VERSION)));
+        // 読むだけで、何も書かず消さない。
+        for n in NAMES {
+            assert_eq!(read(&dir, n), file_bytes(n, OLD_VERSION), "{n} が変わった");
+            assert!(!dir.join(update::old_name(n)).exists(), "{n}.old が残った");
+            assert!(!dir.join(update::new_name(n)).exists(), "{n}.new が残った");
+        }
+        assert_eq!(
+            read(&dir, "HiganRTool.ini"),
+            b"[loader]\nupdate_check = maybe\n"
+        );
+        std::fs::remove_dir_all(&dir).expect("後片づけ");
+    }
+
     struct FakeNet {
         manifest: Vec<u8>,
         calls: Vec<String>,
@@ -2401,7 +2635,7 @@ mod tests {
         assert!(host.recorded[0].contains("確認しませんでした（開発用のビルド）"));
         assert!(host.said.is_empty());
 
-        // 確認しなかった: ini の update_check = 0（ログと画面）。
+        // 確認しなかった: iniの update_check = 0（ログと画面）。
         std::fs::write(dir.join("HiganRTool.ini"), "[loader]\nupdate_check = 0\n").expect("ini");
         let mut host = FakeHost::default();
         let mut net = fake_net();
@@ -2435,7 +2669,7 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
-        // 英語の回の画面の文に日本語が混ざらない。
+        // 英語のとき画面の文に日本語が混ざらない。
         std::fs::write(dir.join("HiganRTool.ini"), "[loader]\nupdate_check = 0\n").expect("ini");
         let mut host = FakeHost::default();
         let mut c = start(&exe, &args, true, OLD_VERSION);
@@ -2592,7 +2826,7 @@ mod tests {
             !game.join(update::LAUNCHED_MARK).exists(),
             "ゲームのフォルダに印"
         );
-        // th09.exe が無い、ゲームのフォルダの下の階層。
+        // th09.exeが無い、ゲームのフォルダの下の階層。
         let sub = game.join("tools");
         std::fs::create_dir_all(&sub).expect("下の階層");
         assert_eq!(
@@ -2607,7 +2841,7 @@ mod tests {
         std::fs::remove_dir_all(&game).expect("後片づけ");
     }
 
-    // ツールをゲームのフォルダの下の階層（th09.exe が無い）に置いた初回で、ゲームのフォルダを見ないと更新の確認が `.new` などをその階層に書く。
+    // ツールをゲームのフォルダの下の階層（th09.exeが無い）に置いた初回の検査。ゲームのフォルダを見ないと更新の確認が`.new`などをその階層に書いてしまう。
     #[test]
     fn the_check_waits_for_the_game_folder_and_stays_out_of_it() {
         let root = temp_dir("below_game");
@@ -2632,7 +2866,7 @@ mod tests {
         };
         let before = snapshot(&tool);
 
-        // 決まっていない: 通信もウィンドウも片づけもしない。
+        // 未決定: 通信もウィンドウも後始末もしない。
         let mut net = fake_net();
         let mut host = FakeHost {
             answer: true,
@@ -2646,7 +2880,7 @@ mod tests {
         );
         assert_eq!(snapshot(&tool), before);
 
-        // 中（同じ・上の階層で名指し・`..` を含む別名）: 同じく何もしない。
+        // 中（同じ・上の階層で名指し・`..`を含む別名）: 同じく何もしない。
         let upper = other.join("..").join("Game");
         for g in [&game, &upper] {
             let mut net = fake_net();
@@ -2665,7 +2899,7 @@ mod tests {
             );
         }
 
-        // 外: 今までどおり尋ねて、「はい」なら置き換えて起動し直す。
+        // 外: 今までどおり尋ねて「はい」なら置き換えて起動し直す。
         let mut net = fake_net();
         let mut host = FakeHost {
             answer: true,
@@ -2731,7 +2965,7 @@ mod tests {
             .expect("SystemRoot");
         let cmd = sysroot.join("System32").join("cmd.exe");
         let mut host = RealHost::default();
-        // 子が終わるまで待って、その終了コードを返す。
+        // 子が終わるまで待ってその終了コードを返す。
         for code in [0, 3] {
             assert_eq!(
                 host.restart(
@@ -2793,7 +3027,7 @@ mod tests {
         let done = p.update(3_500_000).expect("100%");
         assert!(done.ends_with("3.3 / 3.3 MB  100%"), "{done}");
         assert_eq!(p.update(3_500_000), None);
-        // 大きさを越えて受けても 100% で止まる。
+        // 大きさを越えて受けても100%で止まる。
         assert_eq!(p.percent(9_999_999), 100);
 
         let small = Progress::new("README.txt", 3, 3, 2048, Lang::En);
@@ -2945,7 +3179,7 @@ mod tests {
             "{:?}",
             host.said
         );
-        // 変更点が先、Enter の案内が最後。起動はその後（戻り値が Proceed）。
+        // 変更点が先、Enterの案内が最後。起動はその後（戻り値がProceed）。
         assert!(host.asked.is_empty() && host.restarts.is_empty());
         for n in NAMES {
             assert_eq!(read(&dir, n), file_bytes(n, OLD_VERSION), "{n} に触った");

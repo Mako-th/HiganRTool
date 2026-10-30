@@ -1,6 +1,6 @@
 {
   "about": "部屋サーバー v0 の決まりのコピー（平らな JSON。文字列と整数だけ。逃がしは \\\" と \\\\ だけを使う —— dll の偽サーバーの読み手が \\u を読まないため）。原本は src/server/src/rules.ts。行は鍵ごとに下の about_* に。Rust の側は src/core/src/room.rs の検査が include_str! で読んで自分の定数と突き合わせ、dll の偽サーバー（src/dll/src/net_room.rs の fake）はこの値で振る舞い、vitest の側は src/server/test/fixture.test.ts が同じファイルを rules.ts と突き合わせる。部屋名の見本の名の列は names.json。値を変えるときは rules.ts・room.rs・net_room.rs の fake・このファイルを一緒に変える。",
-  "about_lines": "path_prefix=rules.ts:7 / room_name_min,room_name_max,room_name_max_bytes=rules.ts:33-35 / room_name_controls=rules.ts:37 の ROOM_NAME_CONTROL_RE（Unicode の Cc。範囲を U+XXXX-U+YYYY をカンマで並べて書く）/ room_name_bad_chars=rules.ts:39 / room_name_bad_names=rules.ts:41（カンマで区切る）/ room_name_fold=rules.ts:43（カンマで区切った順）/ 門の順は rules.ts:142-155 の normalizeRoomName、符号化を戻すのは rules.ts:129-136 の decodeRoomName / code_*=rules.ts:56-57 の CODE_MAX_CHARS と CODE_RE / message_max_bytes=rules.ts:60 / room_ttl_ms=rules.ts:68 / answer_ttl_ms=rules.ts:75 / ping_text,pong_text=rules.ts:83-84 / retry_after_secs=rules.ts:92 / client_id_param,client_id_len=rules.ts の CLIENT_ID_PARAM と CLIENT_ID_LEN（入室の問い。16 進小文字の長さ）/close_*=rules.ts:313-347 の Close と CLOSE_NAME（鍵の後半が CLOSE_NAME の名）/ random_*=rules.ts の RANDOM_PATH_PREFIX・RANDOM_ROOM_PREFIX・RANDOM_ROOM_HEX_LEN・RANDOM_QUEUE_TTL_MS・RANDOM_ROOM_TTL_MS（ランダム対戦）/ watch_*=rules.ts の WATCH_*（進行中のランダム対戦の一覧）",
+  "about_lines": "path_prefix=rules.ts:7 / room_name_min,room_name_max,room_name_max_bytes=rules.ts:33-35 / room_name_controls=rules.ts:37 の ROOM_NAME_CONTROL_RE（Unicode の Cc。範囲を U+XXXX-U+YYYY をカンマで並べて書く）/ room_name_bad_chars=rules.ts:39 / room_name_bad_names=rules.ts:41（カンマで区切る）/ room_name_fold=rules.ts:43（カンマで区切った順）/ 門の順は rules.ts:142-155 の normalizeRoomName、符号化を戻すのは rules.ts:129-136 の decodeRoomName / code_*=rules.ts:56-57 の CODE_MAX_CHARS と CODE_RE / message_max_bytes=rules.ts:60 / room_ttl_ms=rules.ts:68 / answer_ttl_ms=rules.ts の ANSWER_TTL_MS / held_stale_ms,held_sweep_ms=rules.ts の HELD_STALE_MS・HELD_SWEEP_MS（対戦のルームは成立の後も 2 人が部屋に残ってルーム名を使用中にする。生存の合図（ping の自動応答の時刻）がこれより古い接続はアラームで閉じ、もう 1 人も閉じて部屋を空ける。アラームの間隔）/ http_room_in_use,http_room_full=rules.ts の RoomRefusal（入口の 409 の本文の error。対戦のルームに 2 人いる（成立の前も後も）は room_in_use、観戦用のルーム w. の席が無いのは room_full）/ ping_text,pong_text=rules.ts:83-84 / retry_after_secs=rules.ts:92 / client_id_param,client_id_len=rules.ts の CLIENT_ID_PARAM と CLIENT_ID_LEN（入室の問い。16 進小文字の長さ）/close_*=rules.ts:313-347 の Close と CLOSE_NAME（鍵の後半が CLOSE_NAME の名）/ random_*=rules.ts の RANDOM_PATH_PREFIX・RANDOM_ROOM_PREFIX・RANDOM_ROOM_HEX_LEN・RANDOM_QUEUE_TTL_MS・RANDOM_ROOM_TTL_MS（ランダム対戦）/ watch_*=rules.ts の WATCH_*（進行中のランダム対戦の一覧。watch_answer_ttl_ms は w. の部屋の観戦者が host のコードを受けてから answer を送るまでの期限で、過ぎた観戦者だけを閉じる）/ ticket_param=rules.ts の TICKET_PARAM（w. の部屋の host の席を取る接続が URL の問いに付ける席の札。札は対戦の成立で matched と peer に載る。無い・期限切れは 409 room_full・形や MAC が合わないと 400 bad_ticket）/ ticket_ttl_secs=rules.ts の TICKET_TTL_SECS（札の期限。発行から）/ ticket_purpose,ticket_num_max_digits,ticket_mac_chars=rules.ts の TICKET_PURPOSE・TICKET_NUM_MAX_DIGITS・TICKET_MAC_CHARS（札の署名に入れる用途の印・発行と期限の 10 進の桁の上限・MAC の base64url の文字数。ticket.ts の TICKET_RE はこの 2 つの数から組む）",
   "path_prefix": "/v0/rooms/",
   "room_name_min": 1,
   "room_name_max": 32,
@@ -15,6 +15,10 @@
   "message_max_bytes": 2048,
   "room_ttl_ms": 600000,
   "answer_ttl_ms": 60000,
+  "held_stale_ms": 90000,
+  "held_sweep_ms": 300000,
+  "http_room_in_use": "room_in_use",
+  "http_room_full": "room_full",
   "ping_text": "{\"t\":\"ping\"}",
   "pong_text": "{\"t\":\"pong\"}",
   "retry_after_secs": 60,
@@ -45,5 +49,11 @@
   "watch_name_max": 32,
   "watch_modes": "rollback,delay",
   "watch_stale_ms": 100000,
-  "watch_list_max_bytes": 32768
+  "watch_list_max_bytes": 32768,
+  "watch_answer_ttl_ms": 10000,
+  "ticket_param": "ticket",
+  "ticket_ttl_secs": 86400,
+  "ticket_purpose": "higanr-seat-v1",
+  "ticket_num_max_digits": 12,
+  "ticket_mac_chars": 43
 }

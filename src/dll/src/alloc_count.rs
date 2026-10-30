@@ -1,10 +1,16 @@
-//! 花映塚の確保・解放を、呼び出し元ごと・スレッドの別ごとに数える観測の表と集計（pure。入口のアセンブリと Win32 は `alloc_win.rs`）。確保を呼び出し元ごとに数える考えは giuroll を参考にした（コードはコピーしていない）。
+//! 花映塚の確保・解放を呼び出し元ごと・スレッドの別ごとに数える観測の表と集計（pure）。入口のアセンブリとWin32は`alloc_win.rs`。
+//! 確保を呼び出し元ごとに数える考えはgiurollを参考にした（コードはコピーしていない）。
 //!
-//! - 入口は 5 つ（`th09_addr::ALLOC_SITES`）。どれも関数の先頭に inline detour を書き（`detour::install_detour` を、トランポリンの置き場と入口のアドレスだけ差し替えた `SiteDetourEnv` で呼ぶ）、入口のアセンブリは `[esp]`（呼び出し元の戻りアドレス）を数える。
-//! - 表は「入口 × スレッドの別（ゲームのスレッド / それ以外）」の 10 本。1 本は開アドレス法の 1024 枠（鍵 = 戻りアドレス、値 = 回数）。入口はロックを取らず、空きの枠を `lock cmpxchg` で取り、回数を `lock inc` で足す。
-//!   64 枠たどっても入れなければ溢れを数える。鍵は一度書いたら変えないので、読み手は鍵 → 回数の順に読めばよい。
-//! - 書き出しのスレッドが 1 秒ごとに表を読み、前の秒との差を `_alloc_sec.csv`・`_alloc_calls.csv` へ書く。終わりに `_alloc_callers.csv` と `_alloc_table.csv`。
-//! - 「0 件」を静かに出さない: 書けなかった入口は `installed` の列が 0、場面の秒が 0 なら `seconds` が 0 の行を出す。
+//! - 入口は5つ（`th09_addr::ALLOC_SITES`）。どれも関数の先頭にinline detourを書く。
+//!   書くには`detour::install_detour`を呼ぶ。このときトランポリンの置き場と入口のアドレスだけを差し替えた`SiteDetourEnv`を渡す。
+//!   入口のアセンブリは`[esp]`（呼び出し元の戻りアドレス）を数える。
+//! - 表は「入口 × スレッドの別（ゲームのスレッド / それ以外）」の10本。
+//!   1本は開アドレス法の1024枠（鍵は戻りアドレス、値は回数）。
+//!   入口はロックを取らない。空きの枠は`lock cmpxchg`で確保し、回数は`lock inc`で足す。
+//!   64枠たどっても入れなければ溢れを数える。
+//!   鍵は一度書いたら変えない。そのため読み手は鍵 → 回数の順に読めばよい。
+//! - 書き出しのスレッドが1秒ごとに表を読み、前の秒との差を`_alloc_sec.csv`・`_alloc_calls.csv`へ書く。終わりに`_alloc_callers.csv`と`_alloc_table.csv`。
+//! - 「0件」を静かに出さない。書けなかった入口は`installed`の列が0の行を出す。場面の秒が0なら`seconds`が0の行を出す。
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -21,35 +27,36 @@ use crate::log_mode::detail_out;
 use crate::sites::{SiteDef, check_table, hex_bytes};
 use crate::ticks::CopyRow;
 
-// ---- 表の形（入口のアセンブリが `const` で使う）----
+// ---- 表の形（入口のアセンブリが`const`で使う）----
 
-/// 入口の数（`th09_addr::ALLOC_SITES` の行の数と同じ）。
+/// 入口の数（`th09_addr::ALLOC_SITES`の行の数と同じ）。
 pub const SITE_COUNT: usize = 5;
 /// スレッドの別（0 = ゲームのスレッド、1 = それ以外）。
 pub const CLASS_COUNT: usize = 2;
-/// 表の本数（入口 × スレッドの別）。表の番号は `site * 2 + class`。
+/// 表の本数（入口 × スレッドの別）。表の番号は`site * 2 + class`。
 pub const TABLE_COUNT: usize = SITE_COUNT * CLASS_COUNT;
-/// 1 本の枠の数の 2 の冪。呼び出し元は exe 全体の `call` の即値で free が 119 + 180 か所なので、1024 枠なら埋まりは 3 割ほど（推定）。
+/// 1本の枠の数の2の冪。呼び出し元はexe全体の`call`の即値でfreeが 119 + 180か所。1024枠なら埋まりは3割ほど（推定）。
 pub const SLOT_BITS: u32 = 10;
 pub const SLOTS: usize = 1 << SLOT_BITS;
-/// 枠の番号 → 次の枠の `and` の値。
+/// 枠の番号 → 次の枠の`and`の値。
 pub const SLOT_MASK: u32 = (SLOTS as u32) - 1;
-/// 1 枠の語の数（鍵・回数）。入口は `[表 + 枠 * 8]` を鍵、`+ 4` を回数として触る。
+/// 1枠のワードの数（鍵・回数）。入口は`[表 + 枠 * 8]`を鍵として、`+ 4`を回数として触る。
 pub const SLOT_WORDS: usize = 2;
-/// 1 本の表のバイト数の `shl` の値（1024 枠 × 8 バイト = 8192 = 1 << 13）。
+/// 1本の表のバイト数の`shl`の値（1024枠 × 8バイト = 8192 = 1 << 13）。
 pub const TABLE_SHIFT: u32 = SLOT_BITS + 3;
-/// 空きを探してたどる枠の上限。越えたら溢れに数える（入口の 1 回の手間に上限を設けるため）。
+/// 空きを探してたどる枠の上限。越えたら溢れに数える（入口の1回の手間に上限を設けるため）。
 pub const PROBES: u32 = 64;
-/// 鍵（戻りアドレス）→ 最初に見る枠の掛け算（黄金比の 2^32 倍を奇数にした値。Knuth の乗算ハッシュ）。戻りアドレスは近いので、
-/// 下位ビットをそのまま使うと固まる。入口の `imul` は符号つきの即値なので `i32`。
+/// 鍵（戻りアドレス）から最初に見る枠を求める掛け算の値（黄金比の2^32倍を奇数にした値。Knuthの乗算ハッシュ）。
+/// 戻りアドレスは近いので下位ビットをそのまま使うと固まる。
+/// 入口の`imul`は符号つきの即値なので`i32`。
 pub const HASH_MUL: i32 = 0x9E37_79B1_u32 as i32;
-/// 掛けた後に上位 `SLOT_BITS` ビットを取る `shr` の値。
+/// 掛けた後に上位`SLOT_BITS`ビットを取る`shr`の値。
 pub const HASH_SHIFT: u32 = 32 - SLOT_BITS;
 
 const _: () = assert!(1usize << TABLE_SHIFT == SLOTS * SLOT_WORDS * 4);
 const _: () = assert!(TABLE_COUNT == 10);
 
-/// 表 10 本（80 KiB）。DLL の .bss にあり、入口のアセンブリが `[ALLOC_TABLES + 表の番号 << TABLE_SHIFT + 枠 * 8]` で触る。
+/// 表10本（80 KiB）。DLLの .bssにある。入口のアセンブリが`[ALLOC_TABLES + 表の番号 << TABLE_SHIFT + 枠 * 8]`で触る。
 #[repr(C, align(64))]
 pub struct AllocTables {
     pub words: [AtomicU32; TABLE_COUNT * SLOTS * SLOT_WORDS],
@@ -58,13 +65,13 @@ pub struct AllocTables {
 pub static ALLOC_TABLES: AllocTables = AllocTables {
     words: [const { AtomicU32::new(0) }; TABLE_COUNT * SLOTS * SLOT_WORDS],
 };
-/// 表ごとの総数（入口が表を引く前に `lock inc`）。
+/// 表ごとの総数（入口が表を参照する前に`lock inc`する）。
 pub static ALLOC_TOTALS: [AtomicU32; TABLE_COUNT] = [const { AtomicU32::new(0) }; TABLE_COUNT];
-/// 表ごとの溢れ（`PROBES` 枠たどっても入れなかった回数）。
+/// 表ごとの溢れ（`PROBES`枠たどっても入れなかった回数）。
 pub static ALLOC_OVERFLOW: [AtomicU32; TABLE_COUNT] = [const { AtomicU32::new(0) }; TABLE_COUNT];
-/// ゲームのスレッドの ID。入口は `fs:[0x24]` とこれを比べる。***inline detour を書く前に設定する**（0 のままなら全部が「それ以外」に入る）。
+/// ゲームのスレッドのID。入口は`fs:[0x24]`とこれを比べる。***inline detourを書く前に設定する**（0のままなら全部が「それ以外」に入る）。
 pub static ALLOC_MAIN_TID: AtomicU32 = AtomicU32::new(0);
-/// 入口ごとのトランポリンのアドレス（`SiteDetourEnv::set_trampoline` が JMP を書く前に設定する）。
+/// 入口ごとのトランポリンのアドレス（`SiteDetourEnv::set_trampoline`がJMPを書く前に設定する）。
 pub static ALLOC_TRAMPS: [AtomicU32; SITE_COUNT] = [const { AtomicU32::new(0) }; SITE_COUNT];
 
 pub const CLASS_NAMES: [&str; CLASS_COUNT] = ["main", "other"];
@@ -73,13 +80,13 @@ pub fn table_index(site: usize, class: usize) -> usize {
     site * CLASS_COUNT + class
 }
 
-/// 鍵が最初に見る枠（入口のアセンブリの `imul` と `shr` と同じ式。検査用）。
+/// 鍵が最初に見る枠（入口のアセンブリの`imul`と`shr`と同じ式。検査用）。
 #[cfg(test)]
 pub fn home_slot(caller: u32) -> u32 {
     caller.wrapping_mul(HASH_MUL as u32) >> HASH_SHIFT
 }
 
-/// 表と数を全部 0 に戻す（detour を書く前だけ。書いた後は入口と競る）。
+/// 表と数を全部0に戻す。detourを書く前だけ使う（書いた後は入口と競合する）。
 pub fn reset_counters() {
     for w in ALLOC_TABLES.words.iter() {
         w.store(0, Ordering::SeqCst);
@@ -109,7 +116,8 @@ impl Snapshot {
     }
 }
 
-/// 表を読む。鍵を先に読み（`Acquire`）、その後で回数を読む。総数と溢れは枠の後に読むので、「総数 ≧ 枠の和 ＋ 溢れ」になる向きにずれる。
+/// 表を読む。鍵を先に読み（`Acquire`）、その後で回数を読む。
+/// 総数と溢れは枠の後に読む。そのため「総数 ≧ 枠の和 ＋ 溢れ」になる向きにずれる。
 pub fn snapshot() -> Snapshot {
     let mut slots = Vec::new();
     for t in 0..TABLE_COUNT {
@@ -134,9 +142,9 @@ pub fn snapshot() -> Snapshot {
 // ---- ini ----
 
 pub const SECTION: &str = "alloc_count";
-/// `seconds` を書かなかったときの長さ（9 分）。
+/// `seconds`を書かなかったときの長さ（9分）。
 pub const DEFAULT_SECONDS: u32 = 540;
-/// `seconds` の上限（`observe::SCRIPT_MAX_SECONDS` と同じ）。
+/// `seconds`の上限（`observe::SCRIPT_MAX_SECONDS`と同じ）。
 pub const MAX_SECONDS: u32 = crate::observe::SCRIPT_MAX_SECONDS;
 const KEYS: [&str; 2] = ["enable", "seconds"];
 
@@ -145,7 +153,7 @@ pub struct AllocSettings {
     pub seconds: u32,
 }
 
-/// ini の本文から読む。`[alloc_count]` が無い・`enable = 0` なら `Ok(None)`。知らないキーは断る（綴りの誤りで既定のまま走らないように）。
+/// iniの本文から読む。`[alloc_count]`が無い・`enable = 0`なら`Ok(None)`。知らないキーは断る（綴りの誤りで既定のまま走らないように）。
 pub fn settings_from_text(text: &str) -> Result<Option<AllocSettings>, String> {
     let ini = ini::parse(text).map_err(|e| e.to_string())?;
     if !ini.has_section(SECTION) {
@@ -182,30 +190,30 @@ pub fn settings_from_text(text: &str) -> Result<Option<AllocSettings>, String> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SceneObs {
-    /// 今の場面 `[0x4B3100 + 0x58C]`（1 = メニュー、2 = マッチ）。
+    /// 今の場面`[0x4B3100 + 0x58C]`（1 = メニュー、2 = マッチ）。
     pub scene: Option<u32>,
-    /// `th09_addr::LOADING`（0 でなければ読み込み中）。
+    /// `th09_addr::LOADING`（0でなければ読み込み中）。
     pub loading: Option<u32>,
     /// `th09_addr::GLOBAL_STATE`（bit1 = タイトルデモ）。
     pub global: Option<u32>,
-    /// `th09_addr::MATCH_END_MENU`（1 = マッチの終わりのメニュー）。
+    /// `th09_addr::MATCH_END_MENU`（1 = マッチ終了時のメニュー）。
     pub end_menu: Option<u8>,
-    /// `th09_addr::PAUSE` の下位 1 バイト（0 でなければ一時停止）。
+    /// `th09_addr::PAUSE`の下位1バイト（0でなければ一時停止）。
     pub pause: Option<u8>,
     pub wins: [Option<u32>; 2],
-    /// 入力の入口を通った tick の数（`stub::SEQ`。秒ごとの差がその秒の tick の数）。
+    /// 入力の入口を通ったtickの数（`stub::SEQ`。秒ごとの差がその秒のtickの数）。
     pub tick_seq: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scene {
-    /// 場面 2 で、読み込み・マッチの終わりのメニュー・一時停止のどれでもない。
+    /// 場面2で読み込み・マッチ終了時のメニュー・一時停止のどれでもない。
     Match,
     EndMenu,
     Loading,
     Pause,
     Demo,
-    /// 場面 1。
+    /// 場面1。
     Menu,
     /// ほかの場面の値。
     Other(u32),
@@ -228,8 +236,10 @@ impl Scene {
     }
 }
 
-/// 場面を決める。デモを先に見る（デモの間も場面は 2 になる）。場面 2 の中は、読み込み → マッチの終わりのメニュー → 一時停止 の順
-/// （メニューの間も一時停止の下位 1 バイトは 0 のまま）。補助の値が読めなければ `Unknown`。
+/// 場面を判定する。デモを先に見る（デモの間も場面は2になる）。
+/// 場面2の中は読み込み → マッチ終了時のメニュー → 一時停止の順に見る。
+/// メニューの間も一時停止の下位1バイトは0のまま。
+/// 補助の値が読めなければ`Unknown`。
 pub fn classify(o: &SceneObs) -> Scene {
     let Some(scene) = o.scene else {
         return Scene::Unknown;
@@ -254,7 +264,7 @@ pub fn classify(o: &SceneObs) -> Scene {
 
 // ---- 秒ごとの集計 ----
 
-/// 1 秒の期間の長さの許し（ミリ秒）。この外の期間は表の中央値・最大に入れない（`full` が 0）。
+/// 1秒の期間の長さの許容範囲（ミリ秒）。この外の期間は表の中央値・最大に含めない（`full`が0）。
 pub const FULL_MIN_MS: u64 = 900;
 pub const FULL_MAX_MS: u64 = 1100;
 
@@ -270,7 +280,7 @@ pub struct SecRow {
     pub ticks: u32,
     pub counts: [u32; TABLE_COUNT],
     pub overflow: [u32; TABLE_COUNT],
-    /// (表の番号, 呼び出し元, 回数)。回数が 0 でないものだけ。
+    /// (表の番号, 呼び出し元, 回数)。回数が0でないものだけ。
     pub callers: Vec<(u8, u32, u32)>,
 }
 
@@ -278,7 +288,7 @@ impl SecRow {
     pub fn full(&self) -> bool {
         (FULL_MIN_MS..=FULL_MAX_MS).contains(&self.dur_ms)
     }
-    /// 期間の場面の名前（始めと終わりが違えば `mixed`）。
+    /// 期間の場面の名前（始めと終わりが違えば`mixed`）。
     pub fn label(&self) -> String {
         if self.start == self.end {
             self.end.label()
@@ -288,7 +298,7 @@ impl SecRow {
     }
 }
 
-/// 秒ごとの差を取り、行を貯める（書き出しのスレッドの中身。Win32 に触らない）。
+/// 秒ごとの差を取り、行を貯める（書き出しのスレッドの中身。Win32に触らない）。
 #[derive(Debug, Clone)]
 pub struct Collector {
     prev: Snapshot,
@@ -305,7 +315,7 @@ fn counts_of(s: &Snapshot) -> BTreeMap<(u8, u32), u32> {
 }
 
 impl Collector {
-    /// 数え始め（`now_ms` は数え始めからのミリ秒。ふつうは 0）。
+    /// 数え始め（`now_ms`は数え始めからのミリ秒。ふつうは0）。
     pub fn new(now_ms: u64, obs: &SceneObs, snap: Snapshot, installed: [bool; SITE_COUNT]) -> Self {
         Collector {
             prev_counts: counts_of(&snap),
@@ -318,7 +328,7 @@ impl Collector {
         }
     }
 
-    /// 1 つの期間を閉じる。回数は前の読みとの差（`wrapping_sub`。u32 の回数が 1 周しても差は合う）。
+    /// 1つの期間を閉じる。回数は前の読みとの差（`wrapping_sub`。u32の回数が1周しても差は合う）。
     pub fn sample(&mut self, now_ms: u64, obs: &SceneObs, snap: Snapshot) -> &SecRow {
         let counts = core::array::from_fn(|t| snap.totals[t].wrapping_sub(self.prev.totals[t]));
         let overflow =
@@ -363,8 +373,9 @@ impl Collector {
         m
     }
 
-    /// 場面ごとの表の行。場面は `match` / `end_menu` / `loading` / `pause` / `menu` を必ず出し（0 秒でも）、
-    /// ほかは現れたものだけ。`mixed` と長さが 1 秒に近くない期間は場面の行に入れない（`all` の行にだけ入る）。
+    /// 場面ごとの表の行。場面は`match` / `end_menu` / `loading` / `pause` / `menu`を必ず出す（0秒でも）。
+    /// ほかの場面は現れたものだけ出す。
+    /// `mixed`と長さが1秒に近くない期間は場面の行に含めない（`all`の行にだけ含める）。
     pub fn table(&self) -> Vec<TableRow> {
         let mut labels: Vec<String> = ["match", "end_menu", "loading", "pause", "menu"]
             .iter()
@@ -412,7 +423,7 @@ impl Collector {
                     &ovf,
                     self.installed[site],
                 ));
-                // この場面の秒に 1 回でも出た呼び出し元（出なかった秒は 0 として中央値に入れる）。
+                // この場面の秒に1回でも出た呼び出し元（出なかった秒は0として中央値に含める）。
                 let mut keys: Vec<u32> = rows
                     .iter()
                     .flat_map(|r| r.callers.iter())
@@ -461,7 +472,7 @@ pub struct TableRow {
     pub caller: CallerCol,
     pub seconds: usize,
     pub total: u64,
-    /// 1 秒あたりの中央値（秒の数が偶数なら真ん中の 2 つの平均）。秒が 0 なら `None`。
+    /// 1秒あたりの中央値（秒の数が偶数なら真ん中の2つの平均）。秒が0なら`None`。
     pub median: Option<f64>,
     pub max: Option<u64>,
     pub installed: bool,
@@ -600,13 +611,13 @@ pub fn table_line(r: &TableRow, sites: &[SiteDef]) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallKind {
-    /// `E8 rel32`（戻りアドレスの 5 バイト前）。値は飛び先。
+    /// `E8 rel32`（戻りアドレスの5バイト前）。値は飛び先。
     Rel32 { at: u32, target: u32 },
-    /// `FF 15 abs32`（6 バイト前。`call [abs]`）。値はアドレスを読む所。
+    /// `FF 15 abs32`（6バイト前。`call [abs]`）。値はアドレスを読む所。
     Abs { at: u32, slot: u32 },
-    /// `FF /2` のレジスタ（2 バイト前 `FF D0+r`）。
+    /// `FF /2`のレジスタ（2バイト前`FF D0+r`）。
     Reg { at: u32, reg: u8 },
-    /// `FF /2` の `[reg + disp8]`（3 バイト前 `FF 50+r xx`。r = 4 は SIB なので除く）。
+    /// `FF /2`の`[reg + disp8]`（3バイト前`FF 50+r xx`。r = 4 はSIBなので除く）。
     RegDisp8 { at: u32, reg: u8, disp: i8 },
     /// どれでもない（読めなかったときも）。
     Unknown,
@@ -614,7 +625,7 @@ pub enum CallKind {
 
 const REG_NAMES: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
 
-/// 戻りアドレス `ret` と、その手前 6 バイト（`[ret - 6, ret)`。読めなければ `None`）から、呼んだ命令を読む。
+/// 戻りアドレス`ret`とその手前6バイト（`[ret - 6, ret)`。読めなければ`None`）から呼んだ命令を読む。
 pub fn decode_call(ret: u32, before: Option<[u8; 6]>) -> CallKind {
     let Some(b) = before else {
         return CallKind::Unknown;
@@ -689,32 +700,34 @@ pub fn callers_line(
 
 // ---- 設置 ----
 
-/// 入口ごとのアドレスとトランポリンの置き場（本物は `alloc_win`、検査では偽物）と、数えの始めと終わり。
+/// 入口ごとのアドレスとトランポリンの置き場（本物は`alloc_win`、検査では偽物）と、数え始めと数え終わりの処理。
 pub trait AllocHost {
-    /// `HiganRTool.ini` の本文（無ければ `Ok(None)`）。
+    /// `HiganRTool.ini`の本文（無ければ`Ok(None)`）。
     fn read_ini(&mut self) -> Result<Option<String>, String>;
-    /// ゲームのスレッドの ID（入力の入口の tick の記録から）。上限まで待っても記録が無ければ `None`。
+    /// ゲームのスレッドのID（入力の入口のtickの記録から）。上限まで待っても記録が無ければ`None`。
     fn game_thread_id(&mut self) -> Option<u32>;
     /// 書き出しのファイルを開く（回ごとに別名。既存を上書きしない）。開けなければ数えない。
     fn open_outputs(&mut self) -> Result<String, String>;
-    /// 表を 0 に戻し、ゲームのスレッドの ID を設定する（detour を書く前）。
+    /// 表を0に戻し、ゲームのスレッドのIDを設定する（detourを書く前）。
     fn prepare_counters(&mut self, main_tid: u32);
-    /// 入口 `site` のアセンブリのアドレス。
+    /// 入口`site`のアセンブリのアドレス。
     fn entry_address(&self, site: usize) -> u32;
-    /// 入口 `site` のトランポリンのアドレスを設定する（JMP を書く前）。
+    /// 入口`site`のトランポリンのアドレスを設定する（JMPを書く前）。
     fn set_trampoline(&mut self, site: usize, addr: u32);
-    /// 書き出しのスレッドを開始する（detour を書いた後）。
+    /// 書き出しのスレッドを開始する（detourを書いた後）。
     fn start_writer(
         &mut self,
         s: &AllocSettings,
         installed: [bool; SITE_COUNT],
     ) -> Result<(), String>;
-    /// 書き出しのスレッドを止めて待ち、終わりの集計の文を返す（開始していなければ `None`）。
+    /// 書き出しのスレッドを止めて待ち、終わりの集計の文を返す（開始していなければ`None`）。
     fn finish(&mut self) -> Option<Vec<String>>;
 }
 
-/// `detour::install_detour` に渡す、入口 1 つぶんの `DetourEnv`。スレッドの停止・読み書き・トランポリンのページは包んだ本物へ渡し、
-/// トランポリンの置き場と入口のアドレスだけを差し替える。入力の入口の静的変数を設定する口は何もしない（入力のフックを書き換えないように）。
+/// `detour::install_detour`に渡す、入口1つぶんの`DetourEnv`。
+/// スレッドの停止・読み書き・トランポリンのページは包んだ本物へ委譲する。
+/// 差し替えるのはトランポリンの置き場と入口のアドレスだけ。
+/// 入力の入口の静的変数を設定するメソッドは何もしない（入力のフックを書き換えないように）。
 pub struct SiteDetourEnv<'a> {
     pub inner: &'a mut dyn DetourEnv,
     pub host: &'a mut dyn AllocHost,
@@ -783,8 +796,10 @@ impl DetourEnv for SiteDetourEnv<'_> {
     }
 }
 
-/// 5 つの入口に detour を書く。表の検査と 5 行ぶんのバイト列の照合が全部通ったときだけ書く（1 行でも合わなければ 1 バイトも書かない）。
-/// 途中の 1 つが書けなくても、書けた入口はそのまま残る（外す手順は無い）。書けたかを入口ごとに返す。
+/// 5つの入口にdetourを書く。
+/// 書くのは表の検査と5行ぶんのバイト列の照合が全部通ったときだけ（1行でも合わなければ1バイトも書かない）。
+/// 途中の1つが書けなくても書けた入口はそのまま残る（外す手順は無い）。
+/// 書けたかどうかを入口ごとに返す。
 pub fn install_all(
     hook_env: &mut dyn DetourEnv,
     host: &mut dyn AllocHost,
@@ -850,10 +865,10 @@ pub fn install_all(
     written
 }
 
-/// 数える処理の入口（`session::ScriptHost::alloc_count`）の 2 つの呼び時。
+/// 数える処理の入口（`session::ScriptHost::alloc_count`）が呼ばれる2つの時点。
 pub enum AllocStep<'a> {
-    /// 入力のフックを書いた後・台本の分岐を開く前。ini を読み、有効なら 5 つの入口に detour を書いて、
-    /// 書き出しのスレッドを作る。
+    /// 入力のフックを書いた後で台本の分岐を開く前。
+    /// iniを読み、有効なら5つの入口にdetourを書いて書き出しのスレッドを作る。
     Arm {
         hook_env: &'a mut dyn DetourEnv,
         forbidden: &'a [AddrRange],
@@ -862,7 +877,7 @@ pub enum AllocStep<'a> {
     Finish,
 }
 
-/// ini を読み、有効なら数え始める。数え始めたら true。
+/// iniを読み、有効なら数え始める。数え始めたらtrue。
 pub fn arm(
     host: &mut dyn AllocHost,
     hook_env: &mut dyn DetourEnv,
@@ -967,8 +982,8 @@ pub fn finish(host: &mut dyn AllocHost, out: &mut dyn Write) {
     }
 }
 
-/// 終わりの集計の文: 入口 × スレッドの別ごとの総数・表の和・溢れと、「総数 − 表の和 − 溢れ」
-/// （読みの途中で入口が進んだ分だけ 0 より大きくなりうる。負なら数え方の誤り）。
+/// 終わりの集計の文。入口 × スレッドの別ごとに総数・表の和・溢れ・「総数 − 表の和 − 溢れ」を出す。
+/// 「総数 − 表の和 − 溢れ」は、読みの途中で入口が進んだ分だけ0より大きくなりうる。負なら数え方の誤り。
 pub fn summary_lines(sites: &[SiteDef], c: &Collector, last: &Snapshot) -> Vec<String> {
     let mut v = Vec::new();
     let full = c.rows.iter().filter(|r| r.full()).count();
@@ -1402,7 +1417,7 @@ mod tests {
 
     // ---- 設置（偽物）----
 
-    /// 偽の `DetourEnv` と `AllocHost`: アドレス → バイトの表を持ち、スレッドは 0 本。
+    /// 偽の`DetourEnv`と`AllocHost`: アドレス → バイトの表を持ち、スレッドは0本。
     struct FakeAlloc {
         mem: BTreeMap<u32, u8>,
         writes: Vec<(u32, Vec<u8>)>,
@@ -1505,7 +1520,7 @@ mod tests {
         }
     }
 
-    /// 偽の `AllocHost`（`FakeAlloc` とは別の入れ物。`install_all` は両方を同時に借りる）。
+    /// 偽の`AllocHost`（`FakeAlloc`とは別のコンテナ。`install_all`は両方を同時に借りる）。
     struct FakeHost {
         ini: Result<Option<String>, String>,
         tid: Option<u32>,
@@ -1646,8 +1661,8 @@ mod tests {
         }
     }
 
-    /// 検査の場合（名前と、偽の入れ物を崩す手）。ini が無い・無効・読めない、ゲームのスレッドの ID が取れない、書き出し先を開けない
-    /// のどれでも、1 バイトも書かず表も 0 にしない。
+    /// 検査の場合（名前と、偽のホストの前提を崩す関数）。
+    /// iniが無い・無効・読めない・ゲームのスレッドのIDが取れない・書き出し先を開けないのどれでも、1バイトも書かず表も0にしない。
     type Case = (&'static str, fn(&mut FakeHost));
 
     #[test]

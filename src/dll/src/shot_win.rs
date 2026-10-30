@@ -1,12 +1,14 @@
-//! 撮影の D3D8 の層（unsafe はここにもある。1 つずつ `// SAFETY:`）: 描画の入口（`draw.rs` の `draw_entry`）が撮影の要求を見て呼ぶ
-//! `shot_on_draw`、要求の登録、コピー用のバッファ 4 枚、読み取りのスレッドが、できたバッファを受け取る入口（`take_done`）。
+//! 撮影のD3D8の層（unsafeはここにもある。1つずつ`// SAFETY:`を付けてある）。中身は次のとおり。
+//! - `shot_on_draw`（描画の入口`draw.rs`の`draw_entry`が撮影の要求を見て呼ぶ）
+//! - 要求の登録
+//! - コピー用のバッファ4枚
+//! - 読み取りのスレッドが、できたバッファを受け取る入口（`take_done`）
 //!
-//! 読み方: デバイス `[0x4B3108]` の GetBackBuffer（vtable `+0x40`。引数 0, 0）→ 面の GetDesc（`+0x20`）→ LockRect（`+0x24`。全面、フラグ 0）→
-//! 行ごとにコピーする → UnlockRect（`+0x28`）→ Release（`+0x08`）。ゲーム自身の撮影 `0x0042F540` と同じ関数。コピーしてよいかの判断
-//! （幅・高さ・形式・バッファに収まるか）は `shots::plan_copy`（pure）にだけ書き、ここは呼ぶ順とコピーだけを持つ。
+//! 読み方は次の順。デバイス`[0x4B3108]`のGetBackBuffer（vtable `+0x40`。引数0, 0）→ 面のGetDesc（`+0x20`）→ LockRect（`+0x24`。全面・フラグ0）→ 行ごとにコピーする → UnlockRect（`+0x28`）→ Release（`+0x08`）。
+//! ゲーム自身の撮影`0x0042F540`と同じ関数を呼ぶ。コピーしてよいかの判断（幅・高さ・形式・バッファに収まるか）は`shots::plan_copy`（pure）にだけ書く。ここは呼ぶ順とコピーだけを持つ。
 //!
-//! ゲームのスレッドの経路（`shot_on_draw` と `place_request`）では、確保・ファイル・ロック待ちをしない。中は全部 `catch_unwind` で、パニックを受けたら撮影を止める。
-//! バッファの受け渡しは状態の原子変数（空き → 書いている → できた → 空き）で、各遷移の書き手は 1 人だけ（空き → 書いている → できた はゲームのスレッド、できた → 空き は読み取りのスレッド）。
+//! ゲームのスレッドの経路（`shot_on_draw`と`place_request`）では確保・ファイル・ロック待ちをしない。処理は全部`catch_unwind`の中で実行し、パニックを受けたら撮影を止める。
+//! バッファの受け渡しは状態のアトミック変数（空き → 書き込み中 → できた → 空き）で行う。各遷移の書き手は1人だけ（空き → 書き込み中 → できた はゲームのスレッド、できた → 空き は読み取りのスレッド）。
 
 #[cfg(not(target_arch = "x86"))]
 compile_error!(
@@ -30,17 +32,18 @@ use crate::th09_addr::{
 };
 use crate::win::read_own_memory;
 
-/// 撮影の要求（理由のビット。0 なら要求なし）。描画の入口のアセンブリが `cmp dword ptr [SHOT_REQ], 0` で見て、0 でなければ
-/// `shot_on_draw` を呼ぶ。書くのも取り出すのもゲームのスレッドだけ。
+/// 撮影の要求（理由のビット。0なら要求なし）。
+/// 描画の入口のアセンブリが`cmp dword ptr [SHOT_REQ], 0`で見る。0でなければ`shot_on_draw`を呼ぶ。
+/// 書くのも取り出すのもゲームのスレッドだけ。
 pub static SHOT_REQ: AtomicU32 = AtomicU32::new(0);
-/// 要求を出した tick の番号・段階・まとめた回数（ゲームのスレッドだけが触る）。
+/// 要求を出したtickの番号・段階・まとめた回数（ゲームのスレッドだけが触る）。
 static REQ_K: AtomicU32 = AtomicU32::new(0);
 static REQ_STEP: AtomicU32 = AtomicU32::new(0);
 static REQ_MERGED: AtomicU32 = AtomicU32::new(0);
 
-/// 撮影が有効か。読み取りのスレッドがバッファを確保し、描画の detour が書けた後で 1 にする。ゲームのスレッドがパニックを受けたら 0 にする。
+/// 撮影が有効かどうか。読み取りのスレッドがバッファを確保し、描画のdetourが書けた後で1にする。ゲームのスレッドがパニックを受けたら0にする。
 pub static SHOT_ON: AtomicU32 = AtomicU32::new(0);
-/// デバイスへのポインタが入っているアドレス（花映塚では `D3D8_DEVICE_PTR`）と present parameters のコピー（`D3D8_PRESENT_PARAMS`）。`prepare` が読めると検証してから保存する。
+/// デバイスへのポインタが入っているアドレス（花映塚では`D3D8_DEVICE_PTR`）とpresent parametersのコピー（`D3D8_PRESENT_PARAMS`）。`prepare`が読めることを検証してから保存する。
 static DEVICE_PTR_ADDR: AtomicU32 = AtomicU32::new(0);
 static PP_ADDR: AtomicU32 = AtomicU32::new(0);
 
@@ -48,7 +51,7 @@ const FREE: u32 = 0;
 const BUSY: u32 = 1;
 const DONE: u32 = 2;
 
-/// バッファの画素（`SHOT_CAP` バイトずつ。`prepare` が確保し、プロセスが終わるまで返さない）。
+/// バッファの画素（`SHOT_CAP`バイトずつ）。`prepare`が確保してプロセスが終わるまで解放しない。
 static BUFS: [AtomicUsize; SHOT_SLOTS] = [const { AtomicUsize::new(0) }; SHOT_SLOTS];
 static STATES: [AtomicU32; SHOT_SLOTS] = [const { AtomicU32::new(FREE) }; SHOT_SLOTS];
 struct Head([AtomicU32; HEAD_WORDS]);
@@ -67,7 +70,7 @@ static PANICKED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PANIC_NEXT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// 読み取りのスレッドが、設置の前にバッファ 4 枚を確保しアドレスを保存する。撮影はまだ有効にしない（`set_on`）。アドレスが読めなければ断る。
+/// 読み取りのスレッドが設置の前にバッファ4枚を確保しアドレスを保存する。撮影はまだ有効にしない（`set_on`）。アドレスが読めなければ断る。
 pub fn prepare(device_ptr_addr: u32, pp_addr: u32) -> Result<(), String> {
     if SHOT_ON.load(Ordering::SeqCst) != 0 {
         return Err("撮影は既に有効です".to_string());
@@ -84,7 +87,7 @@ pub fn prepare(device_ptr_addr: u32, pp_addr: u32) -> Result<(), String> {
     PP_ADDR.store(pp_addr, Ordering::SeqCst);
     for (b, s) in BUFS.iter().zip(STATES.iter()) {
         if b.load(Ordering::SeqCst) == 0 {
-            // 1 枚 1.2 MB。ゲームのスレッドがいつ書くか分からないので、プロセスが終わるまで持つ。
+            // 1枚1.2 MB。ゲームのスレッドがいつ書くか分からないのでプロセスが終わるまで持つ。
             let buf: &'static mut [u8] = Box::leak(vec![0u8; SHOT_CAP].into_boxed_slice());
             b.store(buf.as_mut_ptr() as usize, Ordering::SeqCst);
         }
@@ -104,8 +107,9 @@ pub fn set_off() {
     SHOT_REQ.store(0, Ordering::SeqCst);
 }
 
-/// 撮影の要求を出す（ゲームのスレッドの台本の入口から。確保しない）。同じ描画の前に 2 回出されたら理由を OR し、tick の番号と段階は後のものにし、
-/// まとめた回数を数える。撮影が無効なら捨てて数える。
+/// 撮影の要求を出す（ゲームのスレッドの台本の入口から。確保しない）。
+/// 同じ描画の前に2回出されたら、理由をORし、tickの番号と段階は後のものにし、まとめた回数を数える。
+/// 撮影が無効なら捨てて数える。
 pub fn place_request(reason: u8, step: u16, k: u32) {
     if reason == 0 {
         return;
@@ -138,11 +142,11 @@ pub fn counters() -> ShotCounters {
 }
 
 fn rdtsc() -> u64 {
-    // SAFETY: `rdtsc` は読むだけの命令で、ユーザーモードで許されている。
+    // SAFETY: `rdtsc`は読むだけの命令で、ユーザーモードで許されている。
     unsafe { core::arch::x86::_rdtsc() }
 }
 
-/// 描画の入口（`draw.rs`）が、撮影の要求が 0 でないときに呼ぶ（全部のレジスタとフラグは入口が保つ）。パニックは止めて数える。
+/// 描画の入口（`draw.rs`）が撮影の要求が0でないときに呼ぶ（全部のレジスタとフラグは入口が保つ）。パニックは止めて数える。
 pub extern "C" fn shot_on_draw() {
     if catch_unwind(AssertUnwindSafe(shot_inner)).is_err() {
         set_off();
@@ -201,32 +205,32 @@ fn shot_inner() {
     STATES[i].store(DONE, Ordering::Release);
 }
 
-// D3D8 の関数の形（stdcall = `extern "system"`、第 1 引数が this。32 ビットなのでアドレスは u32）。
+// D3D8の関数の形（stdcall = `extern "system"`。第1引数がthis。32ビットなのでアドレスはu32）。
 type GetBackBufferFn = unsafe extern "system" fn(u32, u32, u32, *mut u32) -> i32;
 type GetDescFn = unsafe extern "system" fn(u32, *mut u32) -> i32;
 type LockRectFn = unsafe extern "system" fn(u32, *mut u32, *const c_void, u32) -> i32;
 type UnlockRectFn = unsafe extern "system" fn(u32) -> i32;
 type ReleaseFn = unsafe extern "system" fn(u32) -> u32;
 
-/// `addr` の 4 バイト。
+/// `addr`の4バイト。
 ///
 /// # Safety
-/// `addr` から 4 バイトが読めること。
+/// `addr`から4バイトが読めること。
 unsafe fn read_u32(addr: u32) -> u32 {
     // SAFETY: 呼び出し側の約束。境界を問わない読み（`read_unaligned`）。
     unsafe { (addr as usize as *const u32).read_unaligned() }
 }
 
-/// COM の物 `obj` の vtable の `slot` バイト目の関数のアドレス。
+/// COMオブジェクト`obj`のvtableの`slot`バイト目の関数のアドレス。
 ///
 /// # Safety
-/// `obj` が生きている COM の物（先頭の 4 バイトが vtable へのアドレス）であること。
+/// `obj`が生きているCOMオブジェクト（先頭の4バイトがvtableへのアドレス）であること。
 unsafe fn vtable_fn(obj: u32, slot: u32) -> usize {
-    // SAFETY: 呼び出し側の約束（先頭が vtable）。`slot` は D3D8 の決まった並びの中。
+    // SAFETY: 呼び出し側の約束（先頭がvtable）。`slot`はD3D8の決まった並びの中。
     unsafe { read_u32(read_u32(obj).wrapping_add(slot)) as usize }
 }
 
-/// デバイスから面を取り、コピー、面を返す。GetBackBuffer が通ったら、どの経路でも Release は 1 回だけ。
+/// デバイスから面を取ってコピーし、面を返す。GetBackBufferが通ったらどの経路でもReleaseは1回だけ。
 fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
     let set = |idx: usize, v: u32| head[idx].store(v, Ordering::Relaxed);
     let (dev_at, pp_at) = (
@@ -236,7 +240,7 @@ fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
     if dev_at == 0 || pp_at == 0 {
         return Fail::NoDevice;
     }
-    // SAFETY: どちらも `prepare` が読めると検証してから保存したアドレス（th09.exe の .data の `0x4B3108` と `0x4B3450`。プロセスが終わるまで読める）。
+    // SAFETY: どちらも`prepare`が読めると検証してから保存したアドレス（th09.exeの .dataの`0x4B3108`と`0x4B3450`。プロセスが終わるまで読める）。
     let (device, pp) = unsafe {
         (
             read_u32(dev_at),
@@ -255,8 +259,8 @@ fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
         return Fail::NoDevice;
     }
     let mut surf: u32 = 0;
-    // SAFETY: `device` はゲームが作った IDirect3DDevice8（`[0x4B3108]` が 0 でない。ゲームも描画の直前 `0x0042DD51` で同じアドレスを読む）。
-    // vtable の `+0x40` は GetBackBuffer。引数はゲームの撮影と同じ 0, 0 と書ける `surf`。ゲームのスレッドから呼ぶ。
+    // SAFETY: `device`はゲームが作ったIDirect3DDevice8（`[0x4B3108]`が0でない。ゲームも描画の直前`0x0042DD51`で同じアドレスを読む）。
+    // vtableの`+0x40`はGetBackBuffer。引数はゲームの撮影と同じ0, 0と書ける`surf`。ゲームのスレッドから呼ぶ。
     let hr = unsafe {
         let f: GetBackBufferFn = core::mem::transmute::<usize, GetBackBufferFn>(vtable_fn(
             device,
@@ -273,7 +277,7 @@ fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
         return Fail::NullSurface;
     }
     let fail = with_surface(i, surf, &pp, head, calls);
-    // SAFETY: `surf` は GetBackBuffer が参照を 1 つ足して返した面。ここで 1 回だけ返す（`+0x08` は IUnknown の Release）。
+    // SAFETY: `surf`はGetBackBufferが参照を1つ足して返した面。ここで1回だけ返す（`+0x08`はIUnknownのRelease）。
     let refs = unsafe {
         let f: ReleaseFn =
             core::mem::transmute::<usize, ReleaseFn>(vtable_fn(surf, D3D8_SURF_RELEASE_SLOT));
@@ -284,7 +288,7 @@ fn capture(i: usize, head: &[AtomicU32; HEAD_WORDS], calls: &mut u32) -> Fail {
     fail
 }
 
-/// 面の GetDesc → 判断 → LockRect → コピー → UnlockRect。UnlockRect は LockRect が通ったときだけ。
+/// 面のGetDesc → 判断 → LockRect → コピー → UnlockRect。UnlockRectはLockRectが通ったときだけ。
 fn with_surface(
     i: usize,
     surf: u32,
@@ -294,7 +298,7 @@ fn with_surface(
 ) -> Fail {
     let set = |idx: usize, v: u32| head[idx].store(v, Ordering::Relaxed);
     let mut desc = [0u32; 8];
-    // SAFETY: `surf` は GetBackBuffer が返した生きている面。`+0x20` は GetDesc で、書く先は D3DSURFACE_DESC と同じ 8 語のスタックの配列。
+    // SAFETY: `surf`はGetBackBufferが返した生きている面。`+0x20`はGetDescで、書く先はD3DSURFACE_DESCと同じ8語のスタックの配列。
     let hr = unsafe {
         let f: GetDescFn =
             core::mem::transmute::<usize, GetDescFn>(vtable_fn(surf, D3D8_SURF_GETDESC_SLOT));
@@ -317,7 +321,7 @@ fn with_surface(
         return Fail::NoBuffer;
     }
     let mut locked = [0u32; 2];
-    // SAFETY: 同じ面。`+0x24` は LockRect。書く先は D3DLOCKED_RECT（Pitch・pBits の 2 語）で、矩形は NULL（全面）、フラグ 0。
+    // SAFETY: 同じ面。`+0x24`はLockRect。書く先はD3DLOCKED_RECT（Pitch・pBitsの2語）で、矩形はNULL（全面）、フラグ0。
     let hr = unsafe {
         let f: LockRectFn =
             core::mem::transmute::<usize, LockRectFn>(vtable_fn(surf, D3D8_SURF_LOCKRECT_SLOT));
@@ -335,8 +339,8 @@ fn with_surface(
     } else {
         let t = rdtsc();
         for y in 0..plan.height as usize {
-            // SAFETY: 元は LockRect が返した画素で、行 y は `bits + y * pitch` から `row` バイト（pitch >= row を検証済み。y < Height）。
-            // 先は `prepare` が確保したバッファで、`y * row + row <= total <= SHOT_CAP`（`plan_copy` が検証した）。「書いている」の間は読み取りのスレッドが触らない。
+            // SAFETY: 元はLockRectが返した画素で、行yは`bits + y * pitch`から`row`バイト（pitch >= row を検証済み。y < Height）。
+            // 先は`prepare`が確保したバッファで、`y * row + row <= total <= SHOT_CAP`（`plan_copy`が検証した）。「書き込み中」の間は読み取りのスレッドが触らない。
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (bits as usize).wrapping_add(y * pitch as usize) as *const u8,
@@ -355,7 +359,7 @@ fn with_surface(
         set(H_BYTES, plan.total);
         Fail::Ok
     };
-    // SAFETY: 同じ面。`+0x28` は UnlockRect。LockRect が通ったので対にして 1 回だけ呼ぶ。
+    // SAFETY: 同じ面。`+0x28`はUnlockRect。LockRectが通ったので対にして1回だけ呼ぶ。
     let hr = unsafe {
         let f: UnlockRectFn =
             core::mem::transmute::<usize, UnlockRectFn>(vtable_fn(surf, D3D8_SURF_UNLOCKRECT_SLOT));
@@ -366,7 +370,7 @@ fn with_surface(
     fail
 }
 
-/// 「できた」バッファのうち、撮った順の番号がいちばん小さいものの番号と先頭（無ければ `None`）。
+/// 「できた」バッファのうち撮った順の番号がいちばん小さいものの番号と先頭（無ければ`None`）。
 pub fn take_done() -> Option<(usize, ShotHead)> {
     (0..SHOT_SLOTS)
         .filter(|&i| STATES[i].load(Ordering::Acquire) == DONE)
@@ -378,7 +382,7 @@ pub fn take_done() -> Option<(usize, ShotHead)> {
         .min_by_key(|(_, h)| h.0[H_SERIAL])
 }
 
-/// 「できた」バッファ `slot` の画素の先頭 `len` バイトをコピーして返す（読み取りのスレッド）。バッファが無い・範囲の外なら空。
+/// 「できた」バッファ`slot`の画素の先頭`len`バイトをコピーして返す（読み取りのスレッド）。バッファが無い・範囲の外なら空。
 pub fn copy_pixels(slot: usize, len: usize) -> Vec<u8> {
     let Some(b) = BUFS.get(slot) else {
         return Vec::new();
@@ -388,8 +392,8 @@ pub fn copy_pixels(slot: usize, len: usize) -> Vec<u8> {
         return Vec::new();
     }
     let len = len.min(SHOT_CAP);
-    // SAFETY: `p` は `prepare` が確保して返さない `SHOT_CAP` バイトのバッファで `len <= SHOT_CAP`。状態が「できた」の間はゲームのスレッドは書かず、
-    // Acquire の読みで、Release で書かれた画素が見える。
+    // SAFETY: `p`は`prepare`が確保して返さない`SHOT_CAP`バイトのバッファで`len <= SHOT_CAP`。状態が「できた」の間はゲームのスレッドは書かず、
+    // Acquireの読みで、Releaseで書かれた画素が見える。
     unsafe { core::slice::from_raw_parts(p as *const u8, len) }.to_vec()
 }
 
@@ -401,7 +405,7 @@ pub fn release(slot: usize) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    //! 偽の COM（vtable を持つ静的な偽のデバイスと面）で、本物の描画の入口から撮影の経路を通す。
+    //! 偽のCOM（vtableを持つ静的な偽のデバイスと面）で本物の描画の入口から撮影の経路を通す。
     use super::*;
     use crate::draw::{draw_entry_address, draw_next_seq, set_draw_trampoline};
     use crate::shots::{H_TSC_COPY, H_TSC_TOTAL};
@@ -419,11 +423,11 @@ pub(crate) mod tests {
     static FAKE_SURF: Obj = Obj(AtomicU32::new(0));
     static DEV_VTBL: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
     static SURF_VTBL: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
-    /// `[0x4B3108]` の代わり（中身は偽のデバイスのアドレスか 0）。
+    /// `[0x4B3108]`の代わり（中身は偽のデバイスのアドレスか0）。
     pub(crate) static FAKE_DEVICE_PTR: AtomicU32 = AtomicU32::new(0);
     pub(crate) static FAKE_PP: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 
-    /// 合成の絵: 4×2 の X8R8G8B8、pitch 24 バイト（1 行 16 バイト ＋ 詰め物 8 バイト）。詰め物は 0xEE。
+    /// 合成の絵は4×2のX8R8G8B8でpitch 24バイト（1行16バイト ＋ パディング8バイト）。パディングは0xEE。
     const W: u32 = 4;
     const H: u32 = 2;
     const PITCH: u32 = 24;
@@ -464,7 +468,7 @@ pub(crate) mod tests {
         } else {
             addr_of(&FAKE_SURF)
         };
-        // SAFETY: `out` は `capture` のスタックの `surf`（書ける 4 バイト）。
+        // SAFETY: `out`は`capture`のスタックの`surf`（書ける4バイト）。
         unsafe { out.write(s) };
         0
     }
@@ -484,7 +488,7 @@ pub(crate) mod tests {
             H,
         ];
         for (j, v) in d.iter().enumerate() {
-            // SAFETY: `desc` は `with_surface` のスタックの 8 語の配列。
+            // SAFETY: `desc`は`with_surface`のスタックの8語の配列。
             unsafe { desc.add(j).write(*v) };
         }
         0
@@ -503,7 +507,7 @@ pub(crate) mod tests {
         if hr < 0 {
             return hr;
         }
-        // SAFETY: `locked` は `with_surface` のスタックの 2 語の配列。
+        // SAFETY: `locked`は`with_surface`のスタックの2語の配列。
         unsafe {
             locked.write(PITCH);
             locked.add(1).write(addr_of(&FAKE_BITS));

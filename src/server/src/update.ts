@@ -1,27 +1,27 @@
-// 更新のエンドポイント。配るバージョンのローダー（HiganRTool.exe）が花映塚を起動する前に、署名つきの目録とファイルを取りに来る。
-// このサーバーは中身を持たず、ファイルはいまの配り場所（GitHub の Releases の最新）へ 302 で回す。配り場所は wrangler.jsonc の
-// vars.UPDATE_BASE_URL の 1 値で、変えても配った exe を作り直さずに済む。
-// 目録だけは Worker が配り場所から取り寄せて本文を返す。ローダーが目録の応答を待つ時間は約 2 秒で、302 を辿ると宿ごとに名前の解決と TLS が要るため。
-// 取り寄せた目録は MANIFEST_CACHE_MS だけ isolate の中にためる（配り場所への取りに行きが、起動の回数でなく時間あたりになる）。
-// 取り寄せに失敗したら、これまでどおり 302 で回す。
-// 目録は署名つきで、ファイルは目録の SHA-256 と照らされるので、回す先・ためた物が荒らされても署名のない物は使われない。
-// パス・ファイル名の規則の原本は src/core/src/update.rs（MANIFEST_PATH・FILES_PATH・is_allowed_name）。
+// 更新のエンドポイント。配布バージョンのローダー（HiganRTool.exe）は花映塚を起動する前にここへ来て署名つきの目録とファイルを取得する。
+// このサーバーは中身を持たない。ファイルはいまの配布場所（GitHubのReleasesの最新）へ302でリダイレクトする。
+// 配布場所はwrangler.jsoncのvars.UPDATE_BASE_URLの1値で、変えても配布したexeを作り直さずに済む。
+// 目録だけはWorkerが配布場所から取得して本文を返す。理由は、ローダーが目録の応答を待つ時間が約2秒で、302を辿るとホストごとに名前解決とTLSが要るため。
+// 取得した目録はMANIFEST_CACHE_MSだけisolateの中にキャッシュする。配布場所への取得が起動の回数でなく時間あたりになる。
+// 取得に失敗したらこれまでどおり302でリダイレクトする。
+// 目録は署名つきで、ファイルは目録のSHA-256と照らされる。そのためリダイレクト先やキャッシュが荒らされても署名のない物は使われない。
+// パス・ファイル名の規則の原本はsrc/core/src/update.rs（MANIFEST_PATH・FILES_PATH・is_allowed_name）。
 
-/** 目録のエンドポイント（Rust の MANIFEST_PATH）。 */
+/** 目録のエンドポイント（RustのMANIFEST_PATH）。 */
 export const MANIFEST_PATH = "/update/manifest";
-/** ファイルのエンドポイントの先頭（Rust の FILES_PATH）。後ろにファイル名が付く。 */
+/** ファイルのエンドポイントの先頭（RustのFILES_PATH）。後ろにファイル名が付く。 */
 export const FILES_PREFIX = "/update/files/";
-/** 配り場所に用意する目録のファイル名。 */
+/** 配布場所に用意する目録のファイル名。 */
 export const MANIFEST_ASSET = "manifest.txt";
-/** 目録の大きさの上限（Rust の MAX_MANIFEST_BYTES）。越える応答はためも返しもしない。 */
+/** 目録の大きさの上限（RustのMAX_MANIFEST_BYTES）。越える応答はキャッシュも返答もしない。 */
 export const MAX_MANIFEST_BYTES = 8 * 1024;
-/** 取り寄せた目録をためる時間。新しいバージョンが利用者に見えるまでの遅れの上限でもある。 */
+/** 取得した目録をキャッシュする時間。新しいバージョンが利用者に見えるまでの遅れの上限でもある。 */
 export const MANIFEST_CACHE_MS = 5 * 60 * 1000;
-/** 取り寄せの待ち。ローダーの待ち（Rust の CHECK_DEADLINE_MS = 2000）の半分で見切り、302 に戻る余地を残す。 */
+/** 目録を取得するときのタイムアウト。ローダーの待ち（Rustの CHECK_DEADLINE_MS = 2000）の半分で打ち切って302に戻る余地を残す。 */
 export const MANIFEST_FETCH_TIMEOUT_MS = 1000;
-/** 名前の長さの上限（Rust の MAX_NAME_LEN）。 */
+/** 名前の長さの上限（RustのMAX_NAME_LEN）。 */
 export const MAX_NAME_LEN = 64;
-/** 更新が置き換えない名前（Rust の RESERVED_NAMES）。小文字にして、大文字小文字を区別せずに比べる。 */
+/** 更新が置き換えない名前（RustのRESERVED_NAMES）。小文字にして大文字小文字を区別せずに比べる。 */
 const RESERVED_NAMES: readonly string[] = [
   "HiganRTool.ini",
   "game_path.txt",
@@ -34,9 +34,9 @@ const RESERVED_NAMES: readonly string[] = [
 ].map((n) => n.toLowerCase());
 
 /**
- * 回してよいファイル名か（Rust の is_allowed_name と同じ規則）。ASCII の英数字と . _ - だけ・1〜64 文字で、
- * . で始まらず・終わらず・.. を含まず、.old / .new で終わらず、利用者のものでなく、Windows の機器の名前（CON・NUL・COM1 など）でない。
- * 目録は署名で守られているので名前の表は持たず、この規則に合えば回す。規則の外は 404。
+ * リダイレクトしてよいファイル名かどうか（Rustのis_allowed_nameと同じ規則）。次が全部揃ったときだけ許す:
+ * ASCIIの英数字と . _ - だけ・1〜64文字・. で始まらず終わらない・.. を含まない・.old / .newで終わらない・利用者のものでない・Windowsのデバイス名（CON・NUL・COM1など）でない。
+ * 目録は署名で守られているので名前の表は持たない。この規則に合えばリダイレクトする。規則の外は404。
  */
 export function isUpdatableFileName(name: string): boolean {
   if (name.length < 1 || name.length > MAX_NAME_LEN) return false;
@@ -55,8 +55,8 @@ export type UpdateTarget =
   | { kind: "error"; status: number; error: string };
 
 /**
- * パス `pathname` が更新のエンドポイントなら回す先（配り場所 `base` ＋ 名前）か断りを返す。更新のエンドポイントでなければ null（ルームのエンドポイントへ渡す）。
- * 名前の比べは百分率符号化を解かずにそのまま（`%2e%2e` などは規則の外なので 404）。
+ * パス`pathname`が更新のエンドポイントならリダイレクト先（配布場所`base` ＋ 名前）か断りを返す。更新のエンドポイントでなければnull（ルームのエンドポイントへ渡す）。
+ * 名前の比較はパーセント符号化を解かずにそのまま行う（`%2e%2e`などは規則の外なので404）。
  */
 export function updateTarget(pathname: string, base: string | undefined): UpdateTarget | null {
   if (pathname !== "/update" && !pathname.startsWith("/update/")) return null;
@@ -74,7 +74,7 @@ export function updateTarget(pathname: string, base: string | undefined): Update
   return { kind: "redirect", location: root + asset };
 }
 
-/** 配り場所の URL を「https で、末尾が / 」に揃える。設定が無い・https でない・URL でないものは null。 */
+/** 配布場所のURLを「httpsで末尾が / 」に揃える。設定が無い・httpsでない・URLでないものはnull。 */
 export function normalizeBase(base: string | undefined): string | null {
   if (!base) return null;
   let url: URL;
@@ -94,19 +94,19 @@ export interface UpdateDeps {
 }
 
 const realDeps: UpdateDeps = {
-  // globalThis.fetch は呼ぶ時に引く（検査が差し替えられるように）。
+  // globalThis.fetchは呼ぶ時に参照する（検査が差し替えられるように）。
   fetch: (input, init) => globalThis.fetch(input, init),
   now: () => Date.now(),
 };
 
-/** isolate ごとの目録のため。URL ごとに 1 つ。失敗は入れない。 */
+/** isolateごとの目録のキャッシュ。URLごとに1つ。失敗は追加しない。 */
 const manifestCache = new Map<string, { body: Uint8Array; expires: number }>();
 
 export function clearManifestCache(): void {
   manifestCache.clear();
 }
 
-/** 本文が上限を越えたら null。 */
+/** 本文が上限を越えたらnull。 */
 async function readCapped(res: Response, max: number): Promise<Uint8Array | null> {
   const declared = Number(res.headers.get("Content-Length"));
   if (Number.isFinite(declared) && declared > max) return null;
@@ -134,9 +134,9 @@ async function readCapped(res: Response, max: number): Promise<Uint8Array | null
 }
 
 /**
- * 配り場所の目録の本文。ためが生きていればそれを、無ければ取り寄せる。取り寄せ（redirect を辿った先の 200）に失敗したら null。
- * ためは isolate の中だけ（MANIFEST_CACHE_MS）。Cloudflare の層には任せない（任せると、新しいバージョンが利用者に見えるまでの遅れが
- * MANIFEST_CACHE_MS に収まらなくなる）。
+ * 配布場所の目録の本文。キャッシュが有効ならそれを返し、無ければ取得する。取得（redirectを辿った先の200）に失敗したらnull。
+ * キャッシュはisolateの中だけ（MANIFEST_CACHE_MS）。Cloudflareのキャッシュ層には任せない。
+ * 任せると新しいバージョンが利用者に見えるまでの遅れがMANIFEST_CACHE_MSに収まらなくなる。
  */
 async function manifestBody(url: string, deps: UpdateDeps): Promise<Uint8Array | null> {
   const hit = manifestCache.get(url);
@@ -153,7 +153,7 @@ async function manifestBody(url: string, deps: UpdateDeps): Promise<Uint8Array |
   }
 }
 
-/** 更新のエンドポイントの Response。GET と HEAD だけ。 */
+/** 更新のエンドポイントのResponse。GETとHEADだけ。 */
 export async function handleUpdate(
   req: Request,
   base: string | undefined,
@@ -166,11 +166,11 @@ export async function handleUpdate(
     return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { Allow: "GET, HEAD" } });
   }
   if (t.kind === "error") return Response.json({ error: t.error }, { status: t.status });
-  // HEAD は取り寄せずに回す（本文が要らないので配り場所を叩かない）。
+  // HEADは取得せずにリダイレクトする（本文が要らないので配布場所にリクエストしない）。
   if (pathname === MANIFEST_PATH && req.method === "GET") {
     const body = await manifestBody(t.location, deps);
     if (body !== null) {
-      // 古い目録を中継の層に残させない。ため（MANIFEST_CACHE_MS）はこの Worker の中だけ。
+      // 古い目録を中継のキャッシュ層に残させない。キャッシュ（MANIFEST_CACHE_MS）はこのWorkerの中だけ。
       return new Response(body, {
         headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
       });

@@ -1,11 +1,20 @@
-//! UPnP（IGD）でソケットの UDP ポートの割り当てを家のルーターに頼む（dll の側。文面の読み書きは `higanr_core::upnp`）。
+//! UPnP（IGD）でソケットのUDPポートの割り当てを家のルーターに頼む（dllの側。文面の読み書きは`higanr_core::upnp`）。
 //!
-//! ネットワークを開くとき別のスレッド（`Handle::spawn`）で、SSDP の探索 → 機器の記述 → AddPortMapping の順に問い合わせ、割り当てた外側のポートを自分の候補に載せる（`NetSettings::candidates_for_upnp`）。開く側は上限の時間（`OPEN_BUDGET`）だけ待ち、過ぎたら「使用不可」として進む（遅れて割り当てられても、誰も使わないので自分で消す）。
-//! 割り当ては期限つき（`LEASE_SECS`）で、スレッドは期限の半分ごとに頼み直し、止められたら DeletePortMapping で消す。プロセスごと落ちても期限で消える。期限つきを 725（期限なししか受けない）で断られたら、期限なし（リース 0）で 1 回だけ頼み直す。期限なしは頼み直さず、落ちると残るので、説明（`MAPPING_DESCRIPTION`）を印にして次の起動が引き継ぐ。
-//! 足す前に GetSpecificPortMappingEntry で同じ外側のポートを引く。この PC・このソケット向けで期限なしかつ説明が印でない（手で開けた形）なら足さず、頼み直しも削除もしない。期限つき、または期限なしで説明が印のものは前の起動の消し残りと見て自分のものにする（期限つきは足し直して期限を延ばす。どちらも閉じるとき消す）。
-//! 足した後にルーターの外側のアドレスを引き、STUN で見えたアドレスと突き合わせるのは開く側（`net_udp::nat_settle`）。
+//! ネットワークを開くとき別のスレッド（`Handle::spawn`）でSSDPの探索 → 機器の記述 → AddPortMappingの順に問い合わせる。
+//! 割り当てた外側のポートは自分の候補に載せる（`NetSettings::candidates_for_upnp`）。
+//! 開く側は上限の時間（`OPEN_BUDGET`）だけ待ち、過ぎたら「使用不可」として進む。遅れて割り当てられても誰も使わないので自分で消す。
+//! 割り当ては期限つき（`LEASE_SECS`）。スレッドは期限の半分ごとに頼み直し、止められたらDeletePortMappingで消す。
+//! プロセスごと落ちても期限で消える。
+//! 期限つきを725（期限なししか受けない）で断られたら期限なし（リース0）で1回だけ頼み直す。
+//! 期限なしは頼み直さない。プロセスが落ちると残るので説明（`MAPPING_DESCRIPTION`）を印にして次の起動が引き継ぐ。
+//! 足す前にGetSpecificPortMappingEntryで同じ外側のポートの割り当てを取得する。
+//! このPC・このソケット向けで期限なしかつ説明が印でない（手で開けた形）なら足さず、頼み直しも削除もしない。
+//! 期限つき、または期限なしで説明が印のものは前の起動の消し残りと見て自分のものにする。
+//! 期限つきは足し直して期限を延ばす。どちらも閉じるとき消す。
+//! 足した後にルーターの外側のアドレスを取得してSTUNで見えたアドレスと突き合わせるのは開く側（`net_udp::nat_settle`）。
 //!
-//! 通信は LAN の中だけ（SSDP はマルチキャスト TTL 2、HTTP の宛先は LAN のアドレスに限る。`higanr_core::upnp::Url`）。ゲームのスレッドでは呼ばない（ブロッキング I/O）。本ログに出すのは結果とポートだけで、ルーターのアドレスは書かない。
+//! 通信はLANの中だけ（SSDPはマルチキャストTTL 2。HTTPの宛先はLANのアドレスに限る。`higanr_core::upnp::Url`）。ゲームのスレッドでは呼ばない（ブロッキングI/O）。
+//! 本ログに出すのは結果とポートだけ。ルーターのアドレスは書かない。
 #![forbid(unsafe_code)]
 
 use std::io::{ErrorKind, Read, Write};
@@ -28,26 +37,26 @@ use crate::net_win;
 pub const LEASE_SECS: u32 = 3600;
 /// 頼み直す間隔。期限の半分。
 pub const RENEW_EVERY: Duration = Duration::from_secs(1800);
-/// 頼み直しに失敗したとき、次に頼み直すまでの間隔。通常の間隔のままだと、次は期限ちょうどになる。
+/// 頼み直しに失敗したとき次に頼み直すまでの間隔。通常の間隔のままだと次は期限ちょうどになる。
 pub const RETRY_AFTER_FAIL: Duration = Duration::from_secs(60);
 /// ネットワークを開く側が割り当てを待つ上限。
 pub const OPEN_BUDGET: Duration = Duration::from_secs(2);
-/// SSDP の返事を待つ上限。
+/// SSDPの返事を待つ上限。
 const DISCOVER_BUDGET: Duration = Duration::from_millis(1200);
-/// HTTP 1 往復の上限（LAN の機器なので短い）。
+/// HTTP 1往復の上限（LANの機器なので短い）。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
-/// 外側のポートが他の割り当てと重なったとき、頼み直す別のポートの数。
+/// 外側のポートが他の割り当てと重なったとき頼み直す別のポートの数。
 pub const ALT_PORTS: usize = 3;
 
-/// 通信の差し替え口。本物は std の UDP / TCP（`NetWire`）、検査は偽のルーター。
+/// 通信の差し替え口。本物はstdのUDP / TCP（`NetWire`）、検査は偽のルーター。
 pub trait Wire: Send {
-    /// M-SEARCH を `local` のソケットから出し、返事のあった機器の記述の URL を返す（最初の返事で返してよい）。返事が無ければ空。
+    /// M-SEARCHを`local`のソケットから出し、返事のあった機器の記述のURLを返す（最初の返事で返してよい）。返事が無ければ空。
     fn discover(
         &mut self,
         local: std::net::Ipv4Addr,
         budget: Duration,
     ) -> Result<Vec<Url>, UpnpError>;
-    /// HTTP の 1 往復。`request` を `to` へ送り、返事を読む。
+    /// HTTPの1往復。`request`を`to`へ送り、返事を読む。
     fn exchange(
         &mut self,
         to: &Url,
@@ -62,8 +71,9 @@ fn io_err(e: std::io::Error) -> UpnpError {
 
 pub struct NetWire;
 
-/// SSDP が答えなかったソケットの記録（0 は無し）。答えない機器に、接続し直すたびに探索の上限まで待たないための、プロセスの中の記憶。
-/// ソケットのアドレスごとに覚えるので、別のネットワークへ移れば探し直す。誤りと断りは覚えない。
+/// SSDPが答えなかったソケットの記録（0は無し）。
+/// 接続し直すたびに答えない機器を探索の上限まで待たないための、プロセスの中の記憶。
+/// ソケットのアドレスごとに覚えるので別のネットワークへ移れば探し直す。エラーと拒否は覚えない。
 struct SsdpMemo(AtomicU32);
 
 static SSDP_SILENT: SsdpMemo = SsdpMemo(AtomicU32::new(0));
@@ -87,7 +97,7 @@ impl SsdpMemo {
 }
 
 impl NetWire {
-    /// `dest` へ M-SEARCH を出し、返事を待つ。本番の `dest` は SSDP のマルチキャスト（検査は loopback の偽の機器）。
+    /// `dest`へM-SEARCHを出し、返事を待つ。本番の`dest`はSSDPのマルチキャスト（検査はloopbackの偽の機器）。
     fn search(
         local: Ipv4Addr,
         budget: Duration,
@@ -102,7 +112,7 @@ impl NetWire {
         let mut sent = 0u32;
         let mut buf = [0u8; 2048];
         while start.elapsed() < budget {
-            // 取りこぼしに備え、0 ms と 500 ms の 2 回送る。
+            // 取りこぼしに備えて0 msと500 msの2回送る。
             if sent < 2 && start.elapsed() >= Duration::from_millis(500) * sent {
                 for t in proto::SEARCH_TARGETS {
                     let _ = sock.send_to(&proto::search_request(t), dest);
@@ -111,7 +121,7 @@ impl NetWire {
             }
             match sock.recv_from(&mut buf) {
                 Ok((n, from)) => {
-                    // 送り手と LOCATION のアドレスが違う返事は、別の機器へ誘導する形なので使わない。
+                    // 送信元とLOCATIONのアドレスが違う返事は別の機器へ誘導する形なので使わない。
                     if let Ok(url) =
                         proto::parse_search_reply_from(buf.get(..n).unwrap_or(&[]), from.ip())
                     {
@@ -164,7 +174,7 @@ impl Wire for NetWire {
                         return Err(UpnpError::Malformed("返事が大きすぎる"));
                     }
                 }
-                // 閉じない機器でも、読めたところまでで読む（Content-Length が足りていなければ読みで断る）。
+                // 接続を閉じない機器でも読み取れたところまでで解析する（Content-Lengthが足りていなければ解析でエラーにする）。
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     if buf.is_empty() {
                         return Err(io_err(e));
@@ -184,19 +194,19 @@ impl Wire for NetWire {
 /// 一連の問い合わせの結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// SSDP に答える機器が無い（UPnP がオフ・対応していない・経路が違う）。
+    /// SSDPに答える機器が無い（UPnPがオフ・対応していない・経路が違う）。
     NoAnswer,
-    /// 答えたが、WAN の接続のサービスが読めない。
+    /// 答えたが、WANの接続のサービスが読めない。
     NoService(UpnpError),
-    /// 割り当てを断られた（errorCode つき）。
+    /// 割り当てを断られた（errorCodeつき）。
     Refused(UpnpError),
-    /// 通信の誤り。
+    /// 通信のエラー。
     Failed(UpnpError),
     /// 待つ上限を過ぎた（開く側が諦めた）。
     TimedOut,
     Mapped {
         external: u16,
-        /// ルーターが答えた外側のアドレス。引けなければ None（STUN のアドレスとの突き合わせができない）。
+        /// ルーターが答えた外側のアドレス。取得できなければNone（STUNのアドレスとの突き合わせができない）。
         outer_ip: Option<Ipv4Addr>,
     },
 }
@@ -207,7 +217,7 @@ pub enum Lease {
     /// 期限つき。期限の半分ごとに頼み直す。
     #[default]
     Timed,
-    /// 期限つきを 725 で断られ、期限なしで頼み直した。頼み直しは要らない。
+    /// 期限つきを725で断られ、期限なしで頼み直した。頼み直しは要らない。
     Permanent,
     /// 前の起動が作った期限なしの割り当て（説明が印）を引き継いだ。頼み直しは要らない。
     Inherited,
@@ -220,7 +230,7 @@ pub struct Established {
     pub external: u16,
     pub outer_ip: Option<Ipv4Addr>,
     pub lease: Lease,
-    /// 足す前から、この PC・このソケット向けの期限なしの割り当てがあった（手で開けた形）。足していないので、頼み直しも削除もしない。
+    /// 足す前からこのPC・このソケット向けの期限なしの割り当てがあった（手で開けた形）。足していないので頼み直しも削除もしない。
     pub already_open: bool,
 }
 
@@ -237,7 +247,7 @@ fn add_mapping(
     proto::soap_result(&resp).map(|_| ())
 }
 
-/// `lease` で頼み、725 なら期限なしで 1 回だけ頼み直す。
+/// `lease`で頼み、725なら期限なしで1回だけ頼み直す。
 fn add_mapping_or_permanent(
     w: &mut dyn Wire,
     svc: &Service,
@@ -276,13 +286,13 @@ pub fn get_external_ip(w: &mut dyn Wire, svc: &Service) -> Result<Ipv4Addr, Upnp
     proto::parse_external_ip(proto::soap_result(&resp)?)
 }
 
-/// `external` に既にある割り当ての見立て。
+/// `external`に既にある割り当ての見立て。
 enum Existing {
     /// 無い（足してよい）。
     Free,
-    /// この PC・このソケット向けの有効なもので、期限なしで説明が印でない（手で開けた形）。
+    /// このPC・このソケット向けの有効なもので、期限なしで説明が印でない（手で開けた形）。
     Ours,
-    /// この PC・このソケット向けの有効なもので、期限なしで説明が印（前の起動の消し残り）。
+    /// このPC・このソケット向けの有効なもので、期限なしで説明が印（前の起動の消し残り）。
     Leftover,
     /// ほかの機器・ほかのポート向け（読めない答えも安全側でこちら）。
     Other,
@@ -300,7 +310,7 @@ fn existing_mapping(
                 && e.internal_client.trim() == local.ip().to_string();
             Ok(match (mine, e.enabled) {
                 // 期限つきは前の起動が消し損ねたもの。足し直して延ばす。
-                // 期限が読めない答えは 0 になり、触らない側に倒れる。
+                // 期限が読めない答えは0になり触らない側に倒れる。
                 (true, true)
                     if e.lease_secs == 0 && e.description.trim() == MAPPING_DESCRIPTION =>
                 {
@@ -312,7 +322,7 @@ fn existing_mapping(
                 (false, _) => Existing::Other,
             })
         }
-        // 無いときの答え（714 が普通。機器により違う）。足す側が重なりを断れば、そこで分かる。
+        // 無いときの答え（714が普通。機器により違う）。足す側が重なりを断ればそこで分かる。
         Err(UpnpError::Fault { .. }) => Ok(Existing::Free),
         Err(e @ UpnpError::Io(_)) => Err(e),
         Err(_) => Ok(Existing::Other),
@@ -325,7 +335,7 @@ pub fn delete_mapping(w: &mut dyn Wire, svc: &Service, external: u16) -> Result<
     proto::soap_result(&resp).map(|_| ())
 }
 
-/// 機器を探し、機器の記述から WAN のサービスを選ぶ。
+/// 機器を探し、機器の記述からWANのサービスを選ぶ。
 pub fn find_service(
     w: &mut dyn Wire,
     local: std::net::Ipv4Addr,
@@ -359,8 +369,9 @@ pub fn find_service(
     Err(Outcome::NoService(why))
 }
 
-/// 探して、`ports` の順に割り当てる（重なり 718 か、ほかの機器向けの割り当てがあるときだけ次のポート）。`ports` の先頭は
-/// 内側と同じポート。足した後にルーターの外側のアドレスを引く（引けなくても割り当ては成り立つ。判定は呼び手）。
+/// 機器を探し、`ports`の順に割り当てる（重なり718かほかの機器向けの割り当てがあるときだけ次のポート）。
+/// `ports`の先頭は内側と同じポート。
+/// 足した後にルーターの外側のアドレスを取得する（取得できなくても割り当ては成り立つ。判定は呼び出し側）。
 pub fn establish(
     w: &mut dyn Wire,
     local: SocketAddrV4,
@@ -375,7 +386,7 @@ pub fn establish(
             Ok(Existing::Ours) => (true, false),
             Ok(Existing::Leftover) => (false, true),
             Ok(Existing::Other) => {
-                // 重なりと同じ扱い（機器は 718 で断るはずのもの）。
+                // 重なりと同じ扱い（機器は718で断るはずのもの）。
                 last = Outcome::Refused(UpnpError::Fault {
                     status: 500,
                     code: Some(FAULT_CONFLICT),
@@ -420,7 +431,7 @@ pub fn establish(
 pub enum Release {
     #[default]
     NotYet,
-    /// DeletePortMapping が通った。
+    /// DeletePortMappingが通った。
     Done,
     /// 機器に割り当てが無かった（714。期限で消えたか、ほかが消した）。
     Gone,
@@ -443,7 +454,7 @@ impl Release {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum State {
-    /// 頼んでいない（ini の `upnp = off`・scope が internet でない・ソケットが LAN のアドレスでない）。
+    /// 頼んでいない（iniの`upnp = off`・scopeがinternetでない・ソケットがLANのアドレスでない）。
     #[default]
     NotTried,
     Working,
@@ -453,13 +464,13 @@ pub enum State {
     Failed,
     TimedOut,
     Mapped,
-    /// 割り当てたが、ルーターの外側のアドレスが STUN で見えたアドレスと違う（または世界に通じない）ので使わない。
+    /// 割り当てたがルーターの外側のアドレスがSTUNで見えたアドレスと違う（または世界に通じない）ので使わない。
     OuterBehind,
-    /// 割り当てたが、外側のアドレスを突き合わせられない（ルーターが答えない・STUN の IPv4 のアドレスが無い）ので使わない。
+    /// 割り当てたが外側のアドレスを突き合わせられない（ルーターが答えない・STUNのIPv4のアドレスが無い）ので使わない。
     OuterUnchecked,
-    /// 割り当てたが、自分の候補の並びに足せないので使わない。
+    /// 割り当てたが自分の候補の並びに足せないので使わない。
     NoRoom,
-    /// 割り当てたが、中継する観戦者の中継の配る側を作れなかったので使わない。
+    /// 割り当てたが中継する観戦者の中継の配信側を作れなかったので使わない。
     NoRelay,
 }
 
@@ -468,7 +479,7 @@ pub enum State {
 pub struct Stats {
     pub state: State,
     pub external_port: u16,
-    /// 断られたときの HTTP の状態と errorCode（無ければ 0）。
+    /// 断られたときのHTTPの状態とerrorCode（無ければ0）。
     pub http_status: u16,
     pub fault_code: u32,
     /// 頼み始めてから結果が出るまで（ms）。
@@ -578,7 +589,7 @@ struct Inner {
     outcome: Option<Outcome>,
     stats: Stats,
     stop: bool,
-    /// 開く側が待つのをやめた。後から割り当てられても使われないので、その場で消す。
+    /// 開く側が待つのをやめた。後から割り当てられても使われないのでその場で消す。
     abandoned: bool,
 }
 
@@ -596,7 +607,7 @@ impl Shared {
 /// 結果を待たずに覗いたもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peek {
-    /// まだ出ていない（錠を取れなかったときも）。
+    /// まだ出ていない（ロックを取れなかったときも）。
     Pending,
     Mapped {
         external: u16,
@@ -606,7 +617,7 @@ pub enum Peek {
     NotMapped,
 }
 
-/// 別のスレッドで割り当てを頼み、持ち続け、止められたら消す持ち手。
+/// 別のスレッドで割り当てを頼んで持ち続け、止められたら消すハンドル。
 pub struct Handle {
     shared: Arc<Shared>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -614,8 +625,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// 頼み始める。`ports` の先頭が内側と同じポート（重なったとき順に別のポート）。`renew` ごとに頼み直す
-    /// （失敗したら `RETRY_AFTER_FAIL` 後に頼み直す）。
+    /// 頼み始める。`ports`の先頭が内側と同じポートで重なったときは順に別のポートを使う。
+    /// `renew`ごとに頼み直す（失敗したら`RETRY_AFTER_FAIL`後に頼み直す）。
     pub fn spawn(
         wire: Box<dyn Wire>,
         local: SocketAddrV4,
@@ -626,7 +637,7 @@ impl Handle {
         Self::spawn_with_retry(wire, local, ports, lease_secs, renew, RETRY_AFTER_FAIL)
     }
 
-    /// `spawn` の中身（頼み直しの失敗後の間隔を渡す。検査は短くする）。
+    /// `spawn`の中身（頼み直しの失敗後の間隔を渡す。検査は短くする）。
     pub fn spawn_with_retry(
         wire: Box<dyn Wire>,
         local: SocketAddrV4,
@@ -681,7 +692,7 @@ impl Handle {
         })
     }
 
-    /// 頼み始めてから `total` 経つまで、結果を待つ。出なければ待つのをやめて `TimedOut` を返す（後から割り当てられたら自分で消す）。
+    /// 頼み始めてから`total`経つまで結果を待つ。出なければ待つのをやめて`TimedOut`を返す（後から割り当てられたら自分で消す）。
     pub fn wait_until(&self, total: Duration) -> Outcome {
         let left = total.saturating_sub(self.started.elapsed());
         let g = self.shared.lock();
@@ -698,8 +709,8 @@ impl Handle {
         Outcome::TimedOut
     }
 
-    /// 結果を待たずに覗く（受信スレッドの周回から呼ぶ。錠を待たない）。`wait_until` と違って諦めの印を立てないので、遅れて出た
-    /// 割り当ても残る。
+    /// 結果を待たずに覗く（受信スレッドの周回から呼ぶ。ロックを待たない）。
+    /// `wait_until`と違って諦めの印を立てないので、遅れて出た割り当ても残る。
     pub fn peek(&self) -> Peek {
         let g = match self.shared.m.try_lock() {
             Ok(g) => g,
@@ -720,8 +731,8 @@ impl Handle {
         self.shared.lock().stats
     }
 
-    /// 割り当てられたが使わないと決めた（理由は `why`）。待たずに、スレッドへ消すよう知らせる（消すのはスレッドで、
-    /// 済むのは `stop` で待ったとき）。
+    /// 割り当てられたが使わない扱いにする（理由は`why`）。待たずにスレッドへ消すよう知らせる。
+    /// 消すのはスレッドで、消し終わるのは`stop`で待ったとき。
     pub fn discard(&self, why: State) {
         {
             let mut g = self.shared.lock();
@@ -731,7 +742,7 @@ impl Handle {
         self.shared.cv.notify_all();
     }
 
-    /// 止めて待つ（割り当てを消す往復が終わるまで。機器の応答が無くても `HTTP_TIMEOUT` の数倍で戻る）。何度呼んでもよい。
+    /// 止めて待つ（割り当てを消す往復が終わるまで。機器の応答が無くても`HTTP_TIMEOUT`の数倍で戻る）。何度呼んでもよい。
     pub fn stop(&self) {
         {
             let mut g = self.shared.lock();
@@ -768,7 +779,7 @@ struct Plan {
     retry: Duration,
 }
 
-/// 次に頼み直すまでの間隔。失敗の後は通常の間隔より短くする（通常の間隔だと、次は期限ちょうどになる）。
+/// 次に頼み直すまでの間隔。失敗の後は通常の間隔より短くする（通常の間隔だと次は期限ちょうどになる）。
 fn next_wait(renew: Duration, retry: Duration, last_ok: bool) -> Duration {
     if last_ok { renew } else { renew.min(retry) }
 }
@@ -802,7 +813,7 @@ fn worker(mut w: Box<dyn Wire>, shared: &Shared, ports: &[u16], plan: &Plan, sta
     };
     let mut g = shared.lock();
     if g.abandoned || g.stop {
-        // 開く側が待つのをやめた（または止める印が立った）。割り当てを使わないので、その場で消す。
+        // 開く側が待つのをやめた（または止める印が立った）。割り当てを使わないのでその場で消す。
         drop(g);
         let r = finish(&mut *w);
         let mut g = shared.lock();
@@ -831,7 +842,7 @@ fn worker(mut w: Box<dyn Wire>, shared: &Shared, ports: &[u16], plan: &Plan, sta
             break;
         }
         if timeout.timed_out() && !est.already_open && est.lease == Lease::Timed {
-            // 通信の間は錠を持たない。
+            // 通信の間はロックを持たない。
             drop(g);
             let r = add_mapping(&mut *w, &est.service, est.external, local, lease);
             g = shared.lock();
@@ -848,7 +859,7 @@ fn worker(mut w: Box<dyn Wire>, shared: &Shared, ports: &[u16], plan: &Plan, sta
     shared.lock().stats.release = r;
 }
 
-/// ソケットのアドレスが UPnP を頼む対象か。家の中の IPv4 のアドレス（private / link-local）だけ。
+/// ソケットのアドレスがUPnPを頼む対象かどうか。家の中のIPv4のアドレス（private / link-local）だけ。
 pub fn lan_source(local: SocketAddr) -> Option<SocketAddrV4> {
     match local {
         SocketAddr::V4(a) if guard::is_lan_v4(*a.ip()) => Some(a),
@@ -856,12 +867,12 @@ pub fn lan_source(local: SocketAddr) -> Option<SocketAddrV4> {
     }
 }
 
-/// 内側のポートと同じ外側のポートを先頭に、重なったときの別のポート（動的ポートの範囲）を `seed` から作る。
+/// 外側のポートの並びを`seed`から作る。先頭は内側のポートと同じで、重なったときの別のポートは動的ポートの範囲から選ぶ。
 pub fn port_order(internal: u16, seed: [u8; 2 * ALT_PORTS]) -> Vec<u16> {
     let mut v = vec![internal];
     for pair in seed.as_chunks::<2>().0 {
         let raw = u16::from_le_bytes(*pair);
-        // 49152〜65535（16384 個）。
+        // 49152〜65535（16384個）。
         let p = 49_152 + raw % 16_384;
         if !v.contains(&p) {
             v.push(p);
@@ -889,14 +900,14 @@ mod tests {
         description_status: u16,
         description: String,
         mappings: BTreeMap<u16, (String, u16, u32)>,
-        /// 外側のポートごとの説明（入れていなければ空）。
+        /// 外側のポートごとの説明（設定されていなければ空）。
         descriptions: BTreeMap<u16, String>,
-        /// AddPortMapping で受けたリース（断ったものも含む）。
+        /// AddPortMappingで受けたリース（断ったものも含む）。
         add_leases: Vec<u32>,
         adds: u32,
         gets: u32,
         deletes: u32,
-        /// GetExternalIPAddress の答え（None は断る）と、その回数。
+        /// GetExternalIPAddressの答え（Noneは断る）とその回数。
         outer_ip: Option<Ipv4Addr>,
         outer_gets: u32,
         conflict: Vec<u16>,
@@ -938,7 +949,7 @@ mod tests {
         }
     }
 
-    /// 偽のルーター。要求の文面を読み、状態を替えて返す（こちらが作った文面をそのまま読むので、書き方の誤りも落ちる）。
+    /// 偽のルーター。要求の文面を読んで状態を替え、返答を返す（こちらが作った文面をそのまま読むので、書き方に誤りがあれば検査が失敗する）。
     struct FakeWire(Arc<Mutex<Router>>);
 
     impl Wire for FakeWire {
@@ -1147,7 +1158,7 @@ mod tests {
                 ..
             }
         ));
-        // 頼み直しの間隔（20 ms）を何度も越える間、足さない。
+        // 頼み直しの間隔（20 ms）を何度も越える間は足さない。
         std::thread::sleep(Duration::from_millis(120));
         let s = h.stats();
         assert_eq!(
@@ -1386,7 +1397,7 @@ mod tests {
         assert_eq!(h.stats().release, Release::Done);
     }
 
-    /// `cond` が真になるまで最大 5 秒待つ。
+    /// `cond`が真になるまで最大5秒待つ。
     fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
         let t0 = Instant::now();
         while !cond() {
@@ -1406,7 +1417,7 @@ mod tests {
         // 80 ms × 数往復（記述・確認・追加）より短く待つ。
         assert_eq!(h.wait_until(Duration::from_millis(30)), Outcome::TimedOut);
         assert_eq!(h.stats().state, State::TimedOut);
-        // 止める前に、スレッドが自分で消すこと（止めたときの後始末と区別する）。
+        // 止める前にスレッドが自分で消すこと（止めたときの後始末と区別する）。
         assert!(
             wait_for(|| r.lock().unwrap().deletes == 1),
             "諦めた後の割り当てを自分で消さない"
@@ -1466,7 +1477,7 @@ mod tests {
             assert_eq!(g.adds, g.deletes, "足したものは消した");
             assert_eq!(g.deletes, 1);
         }
-        // 止められた後に、使える割り当てとして知らせない。
+        // 止められた後に使える割り当てとして知らせない。
         assert_eq!(h.stats().state, State::TimedOut);
         assert_eq!(h.stats().release, Release::Done);
         assert_eq!(h.wait_until(Duration::ZERO), Outcome::TimedOut);
@@ -1494,7 +1505,7 @@ mod tests {
                 outer_ip: Some(PUBLIC)
             }
         );
-        // 頼み直しの間隔（20 ms）を何度も越える間、何も足さない。
+        // 頼み直しの間隔（20 ms）を何度も越える間は何も足さない。
         std::thread::sleep(Duration::from_millis(120));
         let s = h.stats();
         assert!(s.already_open);
@@ -1513,7 +1524,7 @@ mod tests {
     #[test]
     fn a_leftover_timed_mapping_for_this_pc_is_taken_over_renewed_and_deleted() {
         let r = router();
-        // 前の起動が作って消し損ねた形（残り 90 秒）。
+        // 前の起動が作って消し損ねた形（残り90秒）。
         r.lock()
             .unwrap()
             .mappings
@@ -1570,7 +1581,7 @@ mod tests {
             );
             assert_eq!(g.mappings.get(&50001).map(|m| m.1), Some(47001));
         }
-        // 全部ほかの機器向けなら、足さずに重なりとして断る。
+        // 全部ほかの機器向けなら足さずに重なりとして断る。
         let r = router();
         for p in ports() {
             r.lock()
@@ -1589,7 +1600,7 @@ mod tests {
         let e = establish(&mut FakeWire(Arc::clone(&r)), LOCAL, &ports(), LEASE_SECS).unwrap();
         assert_eq!(e.outer_ip, Some(PUBLIC));
         assert_eq!(r.lock().unwrap().outer_gets, 1);
-        // 答えない機器でも、割り当て自体は成り立つ（判定は呼び手）。
+        // 答えない機器でも割り当て自体は成り立つ（判定は呼び出し側）。
         let r = router();
         r.lock().unwrap().outer_ip = None;
         let e = establish(&mut FakeWire(Arc::clone(&r)), LOCAL, &ports(), LEASE_SECS).unwrap();
@@ -1645,7 +1656,7 @@ mod tests {
         .unwrap();
         h.wait_until(Duration::from_secs(5));
         r.lock().unwrap().refuse = Some((500, 501));
-        // 最初の頼み直し（約 600 ms 後）が失敗してから、次の 3 回は通常の間隔（600 ms）なら 1.8 秒かかる。
+        // 最初の頼み直し（約600 ms後）が失敗してから次の3回は通常の間隔（600 ms）なら1.8秒かかる。
         assert!(wait_for(|| h.stats().renew_failed >= 1));
         let t = Instant::now();
         assert!(wait_for(|| h.stats().renew_failed >= 4));
@@ -1670,12 +1681,12 @@ mod tests {
                 r
             })
         };
-        // 誤りは覚えない。
+        // エラーは覚えない。
         assert!(run(a, Err(UpnpError::Io("bind".into()))).is_err());
         assert!(run(a, Err(UpnpError::Io("bind".into()))).is_err());
         // 答えがあれば覚えない。
         assert_eq!(run(a, Ok(vec![url()])).unwrap().len(), 1);
-        // 答えが無かったソケットは、次から探さない。
+        // 答えが無かったソケットは次から探さない。
         assert!(run(a, Ok(Vec::new())).unwrap().is_empty());
         assert!(run(a, Ok(vec![url()])).unwrap().is_empty());
         // 別のソケット（別のネットワーク）では探す。
@@ -1683,9 +1694,9 @@ mod tests {
         assert_eq!(searched, 5, "探した数（覚えた口では探さない）");
     }
 
-    // ---- SSDP の返事のガード（本物の UDP。loopback の偽の機器へ送る）----
+    // ---- SSDPの返事のガード（本物のUDP。loopbackの偽の機器へ送る）----
 
-    /// 受けた M-SEARCH に `location` を載せた返事を 1 通返す偽の機器。
+    /// 受けたM-SEARCHに`location`を載せた返事を1通返す偽の機器。
     fn ssdp_responder(location: &'static str) -> (SocketAddrV4, JoinHandle<()>) {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1705,7 +1716,7 @@ mod tests {
     #[test]
     fn discovery_uses_a_reply_only_when_the_sender_is_the_machine_it_names() {
         let local = Ipv4Addr::LOCALHOST;
-        // 返事を送った機器（127.0.0.1）と LOCATION のアドレス（127.0.0.2）が違う返事は使わない。
+        // 返事を送った機器（127.0.0.1）とLOCATIONのアドレス（127.0.0.2）が違う返事は使わない。
         let (dest, j) = ssdp_responder("http://127.0.0.2:5000/d.xml");
         let found = NetWire::search(local, Duration::from_millis(400), dest).unwrap();
         j.join().unwrap();
@@ -1720,7 +1731,7 @@ mod tests {
 
     // ---- 本物のルーターの検査のガード ----
 
-    /// 呼ばれたら数える偽の `Wire`。
+    /// 呼ばれたら数える偽の`Wire`。
     #[derive(Default)]
     struct CountingWire(u32);
 
@@ -1821,7 +1832,7 @@ mod tests {
         assert_eq!(port_order(47001, [7; 6]).len(), 2);
     }
 
-    // ---- 本物の TCP で HTTP を話す偽の機器（SSDP だけは注入。マルチキャストは検査で使わない）----
+    // ---- 本物のTCPでHTTPを話す偽の機器（SSDPだけは注入。マルチキャストは検査で使わない）----
 
     struct LoopWire {
         base: Url,
@@ -1841,7 +1852,7 @@ mod tests {
         }
     }
 
-    /// 127.0.0.1 の TCP で、機器の記述（chunked で返す）と SOAP（Content-Length で返す）を話し、接続を閉じる。
+    /// 127.0.0.1のTCPで、機器の記述（chunkedで返す）とSOAP（Content-Lengthで返す）を話し、接続を閉じる。
     fn serve_igd(stop_after: usize) -> (Url, JoinHandle<Vec<String>>) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
@@ -1938,7 +1949,7 @@ mod tests {
 
     #[test]
     fn a_real_tcp_round_trip_maps_checks_and_deletes() {
-        // 往復: 記述 1・先に確認 1（無い）・追加 1・外側のアドレス 1・確認 1・削除 1・確認 1（消えている）。
+        // 往復: 記述1・先に確認1（無い）・追加1・外側のアドレス1・確認1・削除1・確認1（消えている）。
         let (base, server) = serve_igd(7);
         let mut w = LoopWire { base };
         let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47001);
@@ -1982,13 +1993,14 @@ mod tests {
 
     // ---- 本物のルーター（手で回す。ルーターの設定を一時的に変える）----
 
-    /// 本物のルーターの検査を回す許可の環境変数。値が `1` のときだけ回す。
+    /// 本物のルーターの検査を回す許可の環境変数。値が`1`のときだけ回す。
     const REAL_ROUTER_ENV: &str = "HIGANR_REAL_ROUTER";
 
-    /// 本物のルーターで 追加 → 確認 → 削除 → 確認 を 1 回ずつ行う。外のインターネットへは何も送らない（SSDP は LAN、HTTP は
-    /// ルーターの LAN 側）。割り当ては期限 60 秒で、消し損ねても 1 分で消える。
+    /// 本物のルーターで 追加 → 確認 → 削除 → 確認 を1回ずつ行う。
+    /// 外のインターネットへは何も送らない（SSDPはLAN、HTTPはルーターのLAN側）。
+    /// 割り当ては期限60秒なので、消し損ねても1分で消える。
     /// 回し方: `HIGANR_REAL_ROUTER=1 cargo test -p higanrtool_dll real_router_round_trip -- --ignored --nocapture`
-    /// 許可が無ければ何もせずに戻る（全件の `--ignored` に混ざっても、ルーターの設定を変えない）。
+    /// 許可が無ければ何もせずに戻る（全件の`--ignored`に混ざってもルーターの設定を変えない）。
     #[test]
     #[ignore = "本物のルーターの設定を一時的に変える。手で回す"]
     fn real_router_round_trip() {
@@ -1996,7 +2008,7 @@ mod tests {
         real_router_run(opt_in.as_deref(), &mut NetWire);
     }
 
-    /// 許可があれば本物のルーターの検査を回して true、無ければネットワークへ触らず false。
+    /// 許可があれば本物のルーターの検査を回してtrue、無ければネットワークへ触らずfalse。
     fn real_router_run(opt_in: Option<&str>, w: &mut dyn Wire) -> bool {
         const TEST_PORT: u16 = 47_999;
         const LEASE: u32 = 60;
@@ -2023,7 +2035,7 @@ mod tests {
             t.elapsed().as_millis(),
             svc.service_type
         );
-        // 最後に消すので、もとからある割り当てには触らない。
+        // 最後に消すのでもとからある割り当てには触らない。
         assert!(
             get_mapping(w, &svc, TEST_PORT).is_err(),
             "検査用のポートに割り当てが既にある。触らずに止める"

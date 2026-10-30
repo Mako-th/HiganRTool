@@ -1,8 +1,8 @@
-//! peer_sim —— 偽の相手。花映塚を使わず、HiganRTool のプロトコルだけを話す。
-//! peer_sim 同士を同じ PC の loopback で接続し、`higanr_core` の状態機械（接続 → 選択 → lockstep ＋ CHECK、接続した後の生存）が本物の UDP の上で通しで動くかを見る。
-//! プロトコルの決まりはここに書かない（決まりは `higanr_core`、受けたパケットの振り分けと呼ぶ順は `higanr_core::link`）。ここはツールとしての決め事（時計のペース・台本の語・わざと壊す・記録・いつ終えるか）だけ。
-//! ネットワークの範囲（`--scope`。既定 loopback）の外の宛先と受信ソケットは断る（`higanr_core::guard`）。unsafe は使わない。
-//! 本体は `sim::run`（台本つきは `sim::run_with_menu`）。exe（`main.rs`）は引数を読み（`cli`）、ソケットを開き、`run_with_menu` を呼び、記録を書く（`record`）。
+//! peer_sim —— 偽の相手。花映塚を使わず、HiganRToolのプロトコルだけを話す。
+//! peer_sim同士を同じPCのloopbackで接続し、`higanr_core`のステートマシン（接続 → 選択 → lockstep ＋ CHECK、接続した後の生存）が本物のUDPの上で通しで動くかを見る。
+//! プロトコルの決まりはここに書かない（決まりは`higanr_core`にある。受けたパケットの振り分けと呼ぶ順は`higanr_core::link`にある）。ここはツールとしての決め事（時計のペース・台本の書式・わざと壊す・記録・いつ終えるか）だけ。
+//! ネットワークの範囲（`--scope`。既定loopback）の外の宛先と受信ソケットは断る（`higanr_core::guard`）。unsafeは使わない。
+//! 本体は`sim::run`（台本つきは`sim::run_with_menu`）。exe（`main.rs`）は引数を読み（`cli`）、ソケットを開き、`run_with_menu`を呼び、記録を書く（`record`）。
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +27,7 @@ pub mod watch;
 mod dev_assets_guard {
     use std::path::Path;
 
-    /// 資料の有無は判定の関数とは別に、解析のメモのフォルダだけで見る（判定が常に偽でも通らないように）。
+    /// 資料の有無は判定の関数とは別に解析のメモのフォルダだけで見る（判定が常に偽でも通らないように）。
     #[test]
     fn dev_asset_checks_are_compiled_when_the_dev_files_exist() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

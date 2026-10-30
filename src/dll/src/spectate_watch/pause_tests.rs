@@ -1,12 +1,13 @@
-//! マッチの中の一時停止（`pause.rs`）・マッチの外の Esc・照合の検査。ポーズのメニュー（`0x00434740`）と GameManager の模型（`Model`）を
-//! ホストのゲームと観戦者のゲームに 1 つずつ持たせる。模型の振る舞いは逆アセンブルと実機の検証のとおり:
-//! - 優先度 1 のポーズのメニューが先に走る: 先頭で `[2]+0x06` の Esc は状態 3（状態 3 なら何もしない）、Q は状態 8 へ。状態 3 で数えが 20 以上なら閉じ、
-//!   状態 8 で 20 以上なら閉じて次の要求 1。最後に数えを 1 足す。
-//! - 優先度 2 の GameManager: ポーズでも終わりのメニューでもなく `[2]+0x06 & 8` なら開いて止める。開いている間は止める。どちらでもなければ試合が
-//!   `[0]`・`[1]` の語で 1 フレーム進む（`applied` に積み、乱数を混ぜる）。
+//! マッチの中の一時停止（`pause.rs`）・マッチの外のEsc・照合の検査。
+//! ポーズのメニュー（`0x00434740`）とGameManagerの模型（`Model`）を、ホストのゲームと観戦者のゲームに1つずつ持たせる。
+//! 模型の振る舞いは逆アセンブルと実機の検証のとおり:
+//! - 優先度1のポーズのメニューが先に走る。先頭で`[2]+0x06`にEscがあれば状態3へ移る（すでに状態3なら何もしない）。Qがあれば状態8へ移る。
+//!   状態3で数えが20以上なら閉じる。状態8で数えが20以上なら閉じて次の要求を1にする。最後に数えを1足す。
+//! - 優先度2のGameManager。ポーズでも終わりのメニューでもなく`[2]+0x06 & 8`なら開いて止める。開いている間は止める。
+//!   どちらでもなければ試合が`[0]`・`[1]`のワードで1フレーム進む（`applied`に積み、乱数を混ぜる）。
 //!
-//! ホストは 1 tick に 1 つ `Frame`（約 1 秒ごとにその前に `Check`）を積む。ホストのポーズの間も積む（本物と同じ）。合格は、観戦者の試合が進んだ列
-//! （`applied`）がホストと全行一致すること。
+//! ホストは1 tickに1つ`Frame`を積む（約1秒ごとにその前に`Check`も積む）。ホストのポーズの間も積む（本物と同じ）。
+//! 合格は、観戦者の試合が進んだ列（`applied`）がホストと全行一致すること。
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// ゲームの模型（1 本のマッチの中だけ）。
+/// ゲームの模型（1本のマッチの中だけ）。
 #[derive(Clone)]
 struct Model {
     ims: [InputState; 3],
@@ -44,7 +45,7 @@ struct Model {
     rng: u64,
     cur: u32,
     next: u32,
-    /// 崩れの検査: GameManager がポーズを開かない / 閉じる数えをずらす。
+    /// 崩れの検査: GameManagerがポーズを開かない / 閉じる数えをずらす。
     refuse_open: bool,
     close_at: u32,
 }
@@ -66,7 +67,7 @@ impl Model {
         }
     }
 
-    /// feed された InputManager だけを更新する（入力の地点が poll を呼ばずに戻る tick は、feed しない本はそのまま）。
+    /// feedされたInputManagerだけを更新する（入力の地点がpollを呼ばずに戻るtickではfeedしないInputManagerはそのまま）。
     fn feed(&mut self, w: [Option<u16>; 3]) {
         for (im, w) in self.ims.iter_mut().zip(w) {
             if let Some(w) = w {
@@ -197,7 +198,7 @@ impl Game for WGame {
     }
 }
 
-/// ホストの n tick 目の語（Esc を含まない。`esc_at` の tick だけ 1P に Esc、`z_at` の tick だけ 1P に Z を足す）。
+/// ホストのn tick目のワード（Escを含まない。`esc_at`のtickだけ1PにEscを足し、`z_at`のtickだけ1PにZを足す）。
 struct HostPlan {
     esc_at: Vec<u32>,
     z_at: Vec<u32>,
@@ -233,13 +234,13 @@ struct Rig {
     net: FakeNet,
     _peer: FakeNet,
     clock: Rc<Cell<u64>>,
-    /// ホストが積んだフレームの数（次の frame の番号）。
+    /// ホストが積んだフレームの数（次のframeの番号）。
     n: u32,
     streaming: bool,
-    /// 照合を積むか（偽なら `Frame` だけ）。
+    /// 照合を積むか（偽なら`Frame`だけ）。
     checks: bool,
     ticks: u32,
-    /// 積んだ照合の記録の（frame, リングの位置）。
+    /// 積んだ照合の記録ごとの（frame, リングの位置）。
     check_at: Vec<(u32, u32)>,
 }
 
@@ -285,7 +286,7 @@ impl Rig {
         (self.clock.get() / 1_000) as u32
     }
 
-    /// ホストの 1 tick: 照合（約 1 秒ごと。feed の前の値）→ `Frame` → ホストのゲームの更新。
+    /// ホストの1 tick: 照合（約1秒ごと。feedの前の値）→ `Frame` → ホストのゲームの更新。
     fn host_tick(&mut self) {
         let n = self.n;
         let (p1, p2) = self.plan.words(n);
@@ -310,7 +311,7 @@ impl Rig {
         self.n += 1;
     }
 
-    /// 観戦者の 1 tick（手元の入力 `local`）。
+    /// 観戦者の1 tick（手元の入力`local`）。
     fn tick(&mut self, local: u16) -> Action {
         self.clock.set(self.clock.get() + FRAME_US);
         if self.streaming {
@@ -319,7 +320,7 @@ impl Rig {
         self.scan(local)
     }
 
-    /// 入力の地点 1 回と、その後の更新 1 回（時計とホストは進めない。早送りの余分な更新もこの形）。
+    /// 入力の地点1回とその後の更新1回（時計とホストは進めない。早送りの余分な更新もこの形）。
     fn scan(&mut self, local: u16) -> Action {
         self.ticks += 1;
         self.g.local = local;
@@ -332,7 +333,7 @@ impl Rig {
             }
             Action::Local => {
                 assert_eq!(self.g.fed, [None; 3], "Local で feed した");
-                // poll（`0x0042E9C0`）がキーボードを 1P と合成へ入れる。
+                // poll（`0x0042E9C0`）がキーボードを1Pと合成へ書き込む。
                 self.g.m.feed([Some(local), Some(0), Some(local)]);
             }
             Action::Played(_) => {
@@ -373,7 +374,7 @@ impl Rig {
         self.g.fed
     }
 
-    /// 手元で押して 1 tick 離す（押した瞬間を 1 回作る）。
+    /// 手元で押して1 tick離す（押した瞬間を1回作る）。
     fn tap(&mut self, key: u16) -> Action {
         let a = self.tick(key);
         self.tick(0);
@@ -407,7 +408,7 @@ impl Rig {
     }
 }
 
-/// 早送り（`run_display`）の走査の口。最初の更新と余分な更新で、手元の入力を分けて渡す。
+/// 早送り（`run_display`）の走査の入口。最初の更新と余分な更新で手元の入力を分けて渡す。
 struct FfRig<'a> {
     r: &'a mut Rig,
     first: u16,
@@ -445,7 +446,7 @@ impl FfHost for FfRig<'_> {
 }
 
 impl Rig {
-    /// 1 表示（時計とホストを 1 tick 進め、走査を早送りの包みで回す）。戻りは（余分な更新の数, 余分な更新の中でポーズに入ったか）。
+    /// 1表示（時計とホストを1 tick進め、走査を早送りのラッパーで回す）。戻り値は（余分な更新の数, 余分な更新の中でポーズに入ったか）。
     fn display(&mut self, first: u16, extra: u16) -> (u32, bool) {
         self.clock.set(self.clock.get() + FRAME_US);
         if self.streaming {
@@ -462,12 +463,12 @@ impl Rig {
         (h.extras, h.opened_in_extra)
     }
 
-    /// `[0]`・`[1]` の InputManager の今の状態（ポーズの前後で変わらないことを見る）。
+    /// `[0]`・`[1]`のInputManagerの今の状態（ポーズの前後で変わらないことを見る）。
     fn seats(&self) -> [InputState; 2] {
         [self.g.m.ims[0], self.g.m.ims[1]]
     }
 
-    /// 終えるまで Esc を押し続けた tick の数（上限つき）。
+    /// 終えるまでEscを押し続けたtickの数（上限つき）。
     fn hold_until_end(&mut self, limit: u32) -> Option<u32> {
         for i in 1..=limit {
             self.tick(ESC);
@@ -479,14 +480,15 @@ impl Rig {
     }
 }
 
-/// 3 秒（`ESC_HOLD_MS`）押し続けて終える tick: 押し始めの tick から 180 tick 後（16.667 ms × 180 ≥ 3,000 ms）。
+/// 3秒（`ESC_HOLD_MS`）押し続けて終えるtick: 押し始めのtickから180 tick後（16.667 ms × 180 ≥ 3,000 ms）。
 const HOLD_END_TICK: u32 = 181;
-/// 2.9 秒（押し始めの tick を含めて 175 tick）。
+/// 2.9秒（押し始めのtickを含めて175 tick）。
 const SHORT_HOLD_TICKS: u32 = 175;
 
-/// ゲームのポーズを開いて「再開」で閉じる: Esc の tick は記録を使わず `[2]` だけに最後の語と Esc を入れる。ポーズの間の `[2]` は手元の入力を
-/// `MATCH_SEND_MASK` で切ったもの（Q・P/Home・Enter は落ちる）、再開を決めた後は最後の `p1|p2`。`[0]`・`[1]` は feed せず、InputManager は
-/// ポーズの前と同じ。決定の tick から 20 tick 目に次の `Frame` を使い、最後までホストと同じ列になる。
+/// ゲームのポーズを開いて「再開」で閉じる。Escのtickは記録を使わず、`[2]`だけに最後のワードとEscを書き込む。
+/// ポーズの間の`[2]`は、手元の入力を`MATCH_SEND_MASK`で切ったもの（Q・P/Home・Enterは落ちる）。再開の決定後は最後の`p1|p2`になる。
+/// `[0]`・`[1]`はfeedせず、InputManagerはポーズの前と同じ。
+/// 決定のtickから20 tick目に次の`Frame`を使い、最後までホストと同じ列になる。
 #[test]
 fn the_games_pause_opens_without_a_frame_and_resumes_on_the_predicted_tick() {
     let mut r = Rig::new(HostPlan::none());
@@ -505,7 +507,7 @@ fn the_games_pause_opens_without_a_frame_and_resumes_on_the_predicted_tick() {
         played,
         "Esc の tick に試合が進んだ"
     );
-    // ポーズの間: [2] は手元の生の語から、送る語の外（Q 0x200・P/Home 0x800・Enter 0x1000）を落としたもの。
+    // ポーズの間: [2]は手元の生のワードから送るワードの外（Q 0x200・P/Home 0x800・Enter 0x1000）を落としたもの。
     for (k, want) in [
         (X | LEFT | Q, X | LEFT),
         (0, 0),
@@ -561,12 +563,12 @@ fn the_games_pause_opens_without_a_frame_and_resumes_on_the_predicted_tick() {
     assert_eq!(r.wp.end(), None, "ポーズで観戦が終わった");
 }
 
-/// ポーズの間に `[0]`・`[1]` を毎 tick 入れないので、長押ししていたキーのリピートの数え（`+0x0A`〜）がホストより進まない。
+/// ポーズの間に`[0]`・`[1]`を毎tick feedしないので長押ししていたキーのリピートの数え（`+0x0A`〜）がホストより進まない。
 #[test]
 fn a_held_key_in_the_last_frame_does_not_repeat_on_during_the_pause() {
     let mut r = Rig::new(HostPlan::none());
     r.run(120);
-    // 最後の語に押しっぱなしのキーがある形（どの語も 0 でない）。
+    // 最後のワードに押しっぱなしのキーがある形（どのワードも0でない）。
     assert_ne!(r.wp.last_words.0, 0);
     let seats = r.seats();
     r.tap(ESC);
@@ -578,7 +580,7 @@ fn a_held_key_in_the_last_frame_does_not_repeat_on_during_the_pause() {
     r.assert_same_as_host("長いポーズの後");
 }
 
-/// 再開の Esc（状態 1 からの近道）でも同じ: 決定の tick から 20 tick 目に使う。押しっぱなしの Esc は状態 3 を作り直さない。
+/// 再開のEsc（状態1からの近道）でも同じ: 決定のtickから20 tick目に使う。押しっぱなしのEscは状態3を作り直さない。
 #[test]
 fn resuming_by_esc_and_holding_it_closes_on_the_same_tick() {
     let mut r = Rig::new(HostPlan::none());
@@ -588,7 +590,7 @@ fn resuming_by_esc_and_holding_it_closes_on_the_same_tick() {
     let d = r.ticks + 1;
     let mut at = None;
     for i in 0..40 {
-        // 再開の Esc を押したまま（状態 3 の間は [2] に入らない）。
+        // 再開のEscを押したまま（状態3の間は[2]に入らない）。
         if let Action::Played(_) = r.tick(ESC) {
             at = Some(r.ticks);
             break;
@@ -598,14 +600,14 @@ fn resuming_by_esc_and_holding_it_closes_on_the_same_tick() {
         }
     }
     assert_eq!(at.map(|t| t - d), Some(CLOSE_FRAMES));
-    // 閉じた後も押したままなので、押した瞬間が無くポーズは開かない。
+    // 閉じた後も押したままなので押した瞬間が無くポーズは開かない。
     r.run(1);
     assert!(!r.g.m.paused);
     r.drain();
     r.assert_same_as_host("Esc で再開");
 }
 
-/// 閉じる tick に記録が無い: 描画だけのフレームで待ち（ポーズのメニューは数え 20 のまま）、記録が届いた tick に使う。
+/// 閉じるtickに記録が無い: 描画だけのフレームで待ち（ポーズのメニューは数え20のまま）、記録が届いたtickに使う。
 #[test]
 fn the_closing_tick_waits_for_a_record_without_moving_the_menu() {
     let mut r = Rig::new(HostPlan::none());
@@ -643,7 +645,7 @@ fn the_closing_tick_waits_for_a_record_without_moving_the_menu() {
     assert_eq!(r.wp.stats().pause.close_slips, 0);
 }
 
-/// ホストのポーズの再現中（記録で開いたポーズ）の Esc は、ゲームのポーズを開かず描画だけのフレームで止め、もう 1 回で戻る。止めた間は記録を使わない。
+/// ホストのポーズの再現中（記録で開いたポーズ）のEscはゲームのポーズを開かず描画だけのフレームで止め、もう1回で戻る。止めた間は記録を使わない。
 #[test]
 fn esc_during_the_hosts_pause_holds_by_the_overlay_and_a_second_esc_resumes() {
     let mut r = Rig::new(HostPlan {
@@ -677,7 +679,7 @@ fn esc_during_the_hosts_pause_holds_by_the_overlay_and_a_second_esc_resumes() {
     assert_eq!(r.wp.end(), None);
 }
 
-/// 終わりのメニューが出ている・前の語に Esc が入っている（押した瞬間を作れない）・ポーズを読めないときも、ゲームのポーズを開かない。
+/// 終わりのメニューが出ている・前のワードにEscが入っている（押した瞬間を作れない）・ポーズを読めないときもゲームのポーズを開かない。
 #[test]
 fn the_overlay_is_used_when_the_games_pause_cannot_be_opened() {
     for case in ["終わりのメニュー", "前の語に Esc", "読めない"] {
@@ -698,8 +700,8 @@ fn the_overlay_is_used_when_the_games_pause_cannot_be_opened() {
     }
 }
 
-/// ポーズの「タイトルへ戻る」→「はい」（状態 8）で BYE を頼み、以後の手元の Esc・Q は `[2]` に入れない（観戦を終えた後も、場面がマッチを出るまで）。
-/// 状態 8 は 20 tick で閉じて 1 フレーム進み、場面が移る。移った後は `Local`。
+/// ポーズの「タイトルへ戻る」→「はい」（状態8）でBYEを頼む。以後の手元のEsc・Qは`[2]`に書き込まない（観戦を終えた後も場面がマッチを出るまで）。
+/// 状態8は20 tickで閉じて1フレーム進み、場面が移る。移った後は`Local`。
 #[test]
 fn title_from_the_pause_ends_the_watch_and_later_escs_never_reopen_the_match() {
     let mut r = Rig::new(HostPlan::none());
@@ -734,8 +736,8 @@ fn title_from_the_pause_ends_the_watch_and_later_escs_never_reopen_the_match() {
     assert_eq!(st.get(S_END_DETAIL), QUIT_BY_PAUSE);
 }
 
-/// 観戦を終えた後に Esc・Q・Z を叩き続けても、場面がマッチを出るまで手元の語は `[2]` に入らず（入るのはこちらが作る 0・Q・Esc だけ）、
-/// `[0]`・`[1]` も feed しない。マッチを出た後の `Local` の tick の数を返す。
+/// 観戦を終えた後にEsc・Q・Zを叩き続けても、場面がマッチを出るまでは手元のワードは`[2]`に入らない（入るのはこちらが作る0・Q・Escだけ）。
+/// `[0]`・`[1]`もfeedしない。マッチを出た後の`Local`のtickの数を返す。
 fn leave_with_noisy_keys(r: &mut Rig) -> u32 {
     let mut locals = 0;
     for i in 0..120 {
@@ -764,7 +766,7 @@ fn leave_with_noisy_keys(r: &mut Rig) -> u32 {
     locals
 }
 
-/// 閉じる tick に使う `Frame` でホストがポーズを開いた（`[2]` に Esc の押した瞬間）: 閉じた直後に開き直し、試合は進まない（ホストも進んでいない）。
+/// 閉じるtickに使う`Frame`でホストがポーズを開いた（`[2]`にEscの押した瞬間）: 閉じた直後に開き直し、試合は進まない（ホストも進んでいない）。
 #[test]
 fn a_host_pause_on_the_closing_frame_reopens_right_after() {
     let k = 200u32;
@@ -789,7 +791,7 @@ fn a_host_pause_on_the_closing_frame_reopens_right_after() {
     r.assert_same_as_host("閉じる tick にホストのポーズ");
 }
 
-/// 崩れ（Esc の tick に開かなかった・閉じる tick に閉じなかった）を 1 回見たら、その seg の残りは重ね描きの一時停止だけを使う。次の seg で戻る。
+/// 崩れ（Escのtickに開かなかった・閉じるtickに閉じなかった）を1回見たら、そのマッチの残りは重ね描きの一時停止だけを使う。次のマッチで戻る。
 /// 数えは本ログの行に出る（観戦は続ける）。
 #[test]
 fn a_slip_keeps_the_rest_of_the_seg_on_the_overlay() {
@@ -810,7 +812,7 @@ fn a_slip_keeps_the_rest_of_the_seg_on_the_overlay() {
     assert_eq!(r.wp.notice(), Some(WatchNotice::Paused));
     r.tick(0);
     assert_ne!(r.tick(ESC), Action::RenderOnly);
-    // 次の seg では、またゲームのポーズを開く。閉じる tick が外れたら、また重ね描きだけになる。
+    // 次のマッチではまたゲームのポーズを開く。閉じるtickが外れたらまた重ね描きだけになる。
     r.wp.begin_seg_for_test(1);
     r.run(10);
     r.g.m.close_at = CLOSE_FRAMES + 3;
@@ -838,7 +840,7 @@ fn a_slip_keeps_the_rest_of_the_seg_on_the_overlay() {
     assert!(t.contains("異常の後にオーバーレイにした 2"), "{t}");
 }
 
-/// 長いポーズ（30 秒・10 分）: ホストは最後の 25 秒だけ黙る。溜めた記録がある間は観戦を終えず、明けた後の列がホストと一致する（10 分は約 3.4 万フレーム溜まる）。
+/// 長いポーズ（30秒・10分）: ホストは最後の25秒だけ黙る。溜めた記録がある間は観戦を終えず、明けた後の列がホストと一致する（10分は約3.4万フレーム溜まる）。
 /// 重ね描きの一時停止も同じ。
 #[test]
 fn a_long_pause_outlasts_a_silent_host_and_the_rest_matches_afterwards() {
@@ -875,13 +877,13 @@ fn a_long_pause_outlasts_a_silent_host_and_the_rest_matches_afterwards() {
             r.tick(0);
         }
         r.assert_same_as_host(&tag);
-        // 使い切った後は、黙ったホストで終える。
+        // 使い切った後は黙ったホストで終える。
         r.run(10);
         assert_eq!(r.wp.end(), Some(WatchEnd::HostSilent), "{tag}");
     }
 }
 
-/// マッチの外の Esc: 2.9 秒で離すと終えない（押している間と離して 3 秒は案内を出す）。3 秒押し続けると終える。
+/// マッチの外のEsc: 2.9秒で離すと終えない（押している間と離して3秒は案内を出す）。3秒押し続けると終える。
 #[test]
 fn holding_esc_for_three_seconds_outside_the_match_stops_watching() {
     let mut r = Rig::new(HostPlan::none());
@@ -926,8 +928,8 @@ fn holding_esc_for_three_seconds_outside_the_match_stops_watching() {
     assert_eq!(st.get(S_END_DETAIL), 0, "長押しの詳細");
 }
 
-/// マッチの中の長押し: 最初の押下でゲームのポーズが開き、押したままでは再開しない。2.9 秒で離すと続き、3 秒で終える。終えた後は Q で
-/// 「タイトルへ戻る」へ送り、場面がマッチを出るまで手元の Esc・Q で試合を進めない。
+/// マッチの中の長押し: 最初の押下でゲームのポーズが開き、押したままでは再開しない。2.9秒で離すと続き、3秒で終える。
+/// 終えた後はQで「タイトルへ戻る」へ送る。場面がマッチを出るまで手元のEsc・Qで試合を進めない。
 #[test]
 fn holding_esc_in_the_match_opens_the_pause_then_stops_watching_and_leaves_to_the_title() {
     let mut r = Rig::new(HostPlan::none());
@@ -961,8 +963,8 @@ fn holding_esc_in_the_match_opens_the_pause_then_stops_watching_and_leaves_to_th
     assert_eq!(st.get(S_END_DETAIL), 0, "長押しの詳細");
 }
 
-/// 開いているポーズの中で押し始めた長押し: 押し始めの Esc はポーズのメニューが再開に使い（状態 3）、試合が続く。3 秒で終えた時には
-/// ポーズは閉じているので、Esc で開き直してから「タイトルへ戻る」へ送る。
+/// 開いているポーズの中で押し始めた長押し: 押し始めのEscはポーズのメニューが再開に使い（状態3）、試合が続く。
+/// 3秒で終えた時にはポーズは閉じているので、Escで開き直してから「タイトルへ戻る」へ送る。
 #[test]
 fn a_hold_begun_inside_the_pause_resumes_then_stops_watching_and_leaves_to_the_title() {
     let mut r = Rig::new(HostPlan::none());
@@ -985,8 +987,8 @@ fn a_hold_begun_inside_the_pause_resumes_then_stops_watching_and_leaves_to_the_t
     );
 }
 
-/// 重ね描きの一時停止の間の長押し（ホストのポーズの再現中）: 最初の押下で重ね描き、3 秒で終える。終えた後は開いているホストのポーズから
-/// 「タイトルへ戻る」へ送る。
+/// 重ね描きの一時停止の間の長押し（ホストのポーズの再現中）: 最初の押下で重ね描き、3秒で終える。
+/// 終えた後は開いているホストのポーズから「タイトルへ戻る」へ送る。
 #[test]
 fn holding_esc_on_the_overlay_stops_watching_and_leaves_to_the_title() {
     let mut r = Rig::new(HostPlan {
@@ -1022,7 +1024,7 @@ fn an_end_during_the_pause_leaves_to_the_title_without_the_keyboard() {
     assert_eq!(r.g.m.applied.len(), applied + 1);
 }
 
-/// 早送りの余分な更新の中で Esc を押し始めても、その更新ではポーズを開かず、次の表示の最初の更新で開く。
+/// 早送りの余分な更新の中でEscを押し始めてもその更新ではポーズを開かず、次の表示の最初の更新で開く。
 #[test]
 fn an_esc_pressed_during_fast_forward_opens_the_pause_on_the_next_display() {
     let mut r = Rig::new(HostPlan::none());
@@ -1057,7 +1059,7 @@ fn an_esc_pressed_during_fast_forward_opens_the_pause_on_the_next_display() {
     r.assert_same_as_host("早送りの途中のポーズ");
 }
 
-/// 照合: ずれたら数えて最初のずれを持ち、観戦は続ける。本ログに 1 行出る。
+/// 照合: ずれたら数えて最初のずれを持ち、観戦は続ける。本ログに1行出る。
 #[test]
 fn a_mismatching_check_is_counted_and_the_watch_goes_on() {
     let mut r = Rig::new(HostPlan::none());
@@ -1081,7 +1083,7 @@ fn a_mismatching_check_is_counted_and_the_watch_goes_on() {
     assert!(t.contains(&format!("frame {}", host.frame)), "{t}");
 }
 
-/// 照合のずれは seg の最初の 1 回だけ、ずれた Check の記録の位置と、その seg のポーズの崩れを受信スレッドへ渡す。
+/// 照合のずれはマッチの最初の1回だけ、ずれたCheckの記録の位置とそのマッチのポーズの崩れを受信スレッドへ渡す。
 #[test]
 fn the_first_mismatch_of_a_seg_hands_its_check_records_position_to_the_receive_thread() {
     let mut r = Rig::new(HostPlan::none());
@@ -1112,7 +1114,7 @@ fn the_first_mismatch_of_a_seg_hands_its_check_records_position_to_the_receive_t
         None,
         "同じ seg の 2 回目のずれを渡した"
     );
-    // 次の seg では、また最初のずれを渡す。
+    // 次のマッチではまた最初のずれを渡す。
     r.wp.begin_seg_for_test(1);
     let n = r.check_at.len();
     r.run(130);
@@ -1134,7 +1136,7 @@ fn a_mismatch_in_a_seg_whose_pause_slipped_is_handed_over_as_broken() {
     assert!(matches!(r.wp.feed.take_mismatch(), Some((_, true))));
 }
 
-/// 照合の記録は時間を使わない: 積んでも積まなくても、使ったフレーム・溜まり・描画だけのフレームの数が変わらない。
+/// 照合の記録は時間を使わない: 積んでも積まなくても使ったフレーム・溜まり・描画だけのフレームの数が変わらない。
 #[test]
 fn checks_do_not_count_as_frames_or_backlog() {
     let run = |checks: bool| {
@@ -1172,7 +1174,7 @@ fn checks_do_not_count_as_frames_or_backlog() {
     );
 }
 
-/// ゲームのスレッドの規則: ポーズの開閉・重ね描きの一時停止・照合・長押しで終えた後の tick に確保しない。
+/// ゲームのスレッドの規則: ポーズの開閉・重ね描きの一時停止・照合・長押しで終えた後のtickに確保しない。
 #[test]
 fn the_pause_and_the_checks_never_allocate() {
     let mut r = Rig::new(HostPlan {

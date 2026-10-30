@@ -1,9 +1,11 @@
-//! リプレイ（`.rpy`）の見出しの 1P / 2P のチャージ型を書き換えたコピーを作る（再生のずれを直す）。
+//! リプレイ（`.rpy`）のヘッダの1P / 2Pのチャージ型を書き換えたコピーを作る（再生のずれを直す）。
 //!
-//! 見出しのオプションの塊（`+0xDC` から 0xCC バイト。`th09.cfg` と同じ並び）の `+0xB4` / `+0xB5` が 1P / 2P のチャージ型で、
-//! 展開した本体の座標では `+0x190` / `+0x191`。再生はこの塊から試合の設定を作る。
-//! 書き換えたら本体を圧縮し直し、`comp_size`・LZSS の長さ・チェックサムを付け直して暗号化し直す。`comp_size` より後ろ
-//! （USER チャンクの列。印 `HGRT` を含む）はそのまま付ける。
+//! ヘッダのオプションのブロック（`+0xDC`から0xCCバイト。`th09.cfg`と同じ並び）の`+0xB4` / `+0xB5`が1P / 2Pのチャージ型。
+//! 展開した本体の座標では`+0x190` / `+0x191`。
+//! 再生はこのブロックから試合の設定を作る。
+//! 書き換えたら本体を圧縮し直す。
+//! そのうえで`comp_size`・LZSSの長さ・チェックサムを付け直して暗号化し直す。
+//! `comp_size`より後ろ（USERチャンクの列。印`HGRT`を含む）はそのまま付ける。
 //!
 //! ファイルには触らない（バイト列を受けてバイト列を返す）。
 #![forbid(unsafe_code)]
@@ -18,11 +20,11 @@ use crate::replay_decode::{
     encrypt_in_place,
 };
 
-/// 見出しのオプションの塊の先頭（展開した本体の座標）。
+/// ヘッダのオプションのブロックの先頭（展開した本体の座標）。
 pub const OPTIONS_OFFSET: usize = 0xDC;
-/// オプションの塊の中の 1P のチャージ型（2P は次の 1 バイト）。
+/// オプションのブロックの中の1Pのチャージ型（2Pは次の1バイト）。
 pub const OPT_CHARGE: usize = 0xB4;
-/// 1P のチャージ型の位置（展開した本体の座標）。
+/// 1Pのチャージ型の位置（展開した本体の座標）。
 pub const CHARGE_OFFSET: usize = OPTIONS_OFFSET + OPT_CHARGE;
 const _: () = assert!(CHARGE_OFFSET == 0x190);
 
@@ -30,12 +32,12 @@ const COMP_SIZE_OFFSET: usize = 0x0C;
 const LZSS_LEN_OFFSET: usize = 0x18;
 const DECOMP_SIZE_OFFSET: usize = 0x1C;
 
-/// 見出しの (1P, 2P) のチャージ型。
+/// ヘッダの (1P, 2P)のチャージ型。
 pub fn charge(image: &[u8]) -> Option<(u8, u8)> {
     Some((*image.get(CHARGE_OFFSET)?, *image.get(CHARGE_OFFSET + 1)?))
 }
 
-/// `file` のチャージ型を (`p1`, `p2`) に書き換えたコピー。読めないリプレイは `decode_image` の理由で断る。
+/// `file`のチャージ型を (`p1`, `p2`)に書き換えたコピー。読めないリプレイは`decode_image`の理由で断る。
 pub fn with_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, DecodeError> {
     let mut image = decode_image(file)?;
     image[CHARGE_OFFSET] = p1;
@@ -43,8 +45,8 @@ pub fn with_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, DecodeError> 
     Ok(reencode(file, &image))
 }
 
-/// `decode_image` の形の `image` から、`file` と同じ鍵・同じ末尾のファイルを組み直す。
-/// `image` は `decode_image(file)` が通ったものを書き換えたものであること（見出しと長さは呼ぶ側が保つ）。
+/// `decode_image`の形の`image`から`file`と同じ鍵・同じ末尾のファイルを組み直す。
+/// `image`は`decode_image(file)`が通ったものを書き換えたものであること（ヘッダと長さは呼ぶ側が保つ）。
 fn reencode(file: &[u8], image: &[u8]) -> Vec<u8> {
     let old_comp = u32_at(file, COMP_SIZE_OFFSET) as usize;
     let body = &image[BODY_START..];
@@ -65,38 +67,40 @@ fn reencode(file: &[u8], image: &[u8]) -> Vec<u8> {
 
 // ---- 古いリプレイの直し ----
 //
-// 見出しは、保存した PC の th09.cfg の (1P の枠, 2P の枠) のまま。生きた試合の値は、保存した人の PC からは分からない
-// （相手の値が要る）ので、直す値は呼び出し側（人）が決める。
+// ヘッダは保存したPCのth09.cfgの (1Pの枠, 2Pの枠)のまま。
+// 生きた試合の値は保存した人のPCからは分からない（相手の値が要る）。
+// そのため直す値は呼び出し側（人）が決める。
 
-/// 1 本のリプレイの直しの下調べ。
+/// 1本のリプレイの直しの下調べ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixPlan {
-    /// 保存した人の側。観戦者のリプレイは `None`。
+    /// 保存した人の側。観戦者のリプレイは`None`。
     pub side: Option<Side>,
-    /// (1P, 2P) の名前（印から。対戦した側のリプレイは自分と相手を `side` で並べる）。
+    /// (1P, 2P)の名前（印から。対戦した側のリプレイは自分と相手を`side`で並べる）。
     pub names: (String, String),
-    /// 見出しの今の (1P, 2P) のチャージ型。
+    /// ヘッダの今の (1P, 2P)のチャージ型。
     pub current: (u8, u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanError {
-    /// 印 `HGRT` が無い（このツールが保存したものでない）か、読めない。
+    /// 印`HGRT`が無い（このツールが保存したものでない）か、読めない。
     NoMark,
     /// ゲームのメニューから保存したリプレイの印（ネット対戦の記録が無く、チャージ型を直す対象ではない）。
     MenuMark,
-    /// 印に `charge` がある（見出しを生きた試合の値に直して保存したバージョンか、直し済み）。直すものは無い。
+    /// 印に`charge`がある（ヘッダを生きた試合の値に直して保存したバージョンか直し済み）。直すものは無い。
     Recorded([u8; 2]),
-    /// 印のビルド番号が `LAST_UNFIXED_BUILD` より新しい（見出しを直して保存するバージョン）。
+    /// 印のビルド番号が`LAST_UNFIXED_BUILD`より新しい（ヘッダを直して保存するバージョン）。
     Newer(u32),
     Decode(DecodeError),
 }
 
-/// 見出しのチャージ型を直さずに保存した最後の配るビルド（v1.0.0）。これより新しい配るビルドのリプレイは直さない。
-/// 開発バージョンのビルド番号は 0 なので対象に残る。
+/// ヘッダのチャージ型を直さずに保存した最後の配布ビルド（v1.0.0）。
+/// これより新しい配布ビルドのリプレイは直さない。
+/// 開発バージョンのビルド番号は0なので対象に残る。
 pub const LAST_UNFIXED_BUILD: u32 = 411_272;
 
-/// 印と見出しから、名前・側・今の値を出す。
+/// 印とヘッダから名前・側・今の値を出す。
 pub fn plan(file: &[u8]) -> Result<FixPlan, PlanError> {
     let mark = match read_mark(file) {
         Ok(MarkRead::Found(m)) => m,
@@ -139,13 +143,13 @@ pub fn plan(file: &[u8]) -> Result<FixPlan, PlanError> {
 pub enum MarkEditError {
     /// 印が無い・読めない・知らないバージョンだけ。
     NoMark,
-    /// 平文の部分（USER チャンクの列）が読めない。
+    /// 平文の部分（USERチャンクの列）が読めない。
     Replay(ReplayError),
     /// 印を組み直せない（値が範囲の外）。
     Mark(MarkError),
 }
 
-/// 印の `charge` を (`p1`, `p2`) にしたコピー。印の他の項目と、他の USER チャンクはそのまま。見出しは触らない。
+/// 印の`charge`を (`p1`, `p2`)にしたコピー。印の他の項目と他のUSERチャンクはそのまま。ヘッダは触らない。
 pub fn with_mark_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, MarkEditError> {
     let layout = parse(file).map_err(MarkEditError::Replay)?;
     for chunk in layout.chunks.iter().filter(|c| c.is_mark()) {
@@ -154,7 +158,7 @@ pub fn with_mark_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, MarkEdit
         };
         let mut mark = match parse_mark_body(body) {
             Ok(BodyRead::Mark(m)) => m,
-            // メニューの保存の印は、直す対象のネット対戦の印ではない。
+            // メニューの保存の印は直す対象のネット対戦の印ではない。
             Ok(BodyRead::UnknownVersion | BodyRead::Menu(_)) => continue,
             Err(_) => return Err(MarkEditError::NoMark),
         };
@@ -172,13 +176,13 @@ pub fn with_mark_charge(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, MarkEdit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixError {
     Plan(PlanError),
-    /// 渡した値が、見出しに入っている値と同じ（変えるものが無い）。
+    /// 渡した値がヘッダに入っている値と同じ（変えるものが無い）。
     Unchanged,
     Mark(MarkEditError),
 }
 
-/// 見出しのチャージ型を (`p1`, `p2`) にし、印にも `charge=<p1>.<p2>`（直し済みの印）を入れたコピー。
-/// 印に `charge` があるリプレイ・印が読めないリプレイ・値が今と同じリプレイは断る。
+/// ヘッダのチャージ型を (`p1`, `p2`)にし、印にも`charge=<p1>.<p2>`（直し済みの印）を書き込んだコピー。
+/// 印に`charge`があるリプレイ・印が読めないリプレイ・値が今と同じリプレイは断る。
 pub fn fixed_copy(file: &[u8], p1: u8, p2: u8) -> Result<Vec<u8>, FixError> {
     let plan = plan(file).map_err(FixError::Plan)?;
     if plan.current == (p1, p2) {
@@ -219,7 +223,7 @@ mod tests {
     fn only_the_two_charge_bytes_change_and_the_tail_is_kept() {
         let f = sample();
         let before = decode_image(&f).unwrap();
-        // 合成の見出しの塊は (i % 251) なので、ここは 0xB4 / 0xB5。
+        // 合成のヘッダのブロックは (i % 251)なので、ここは0xB4 / 0xB5。
         assert_eq!(charge(&before), Some((0xB4, 0xB5)));
         let g = with_charge(&f, 1, 0).unwrap();
         let after = decode_image(&g)
@@ -268,7 +272,7 @@ mod tests {
         assert_eq!(with_charge(&f, 0, 0), Err(DecodeError::BadMagic));
     }
 
-    /// 見出しを (`h1`, `h2`) にして、印を付けたリプレイ。
+    /// ヘッダを (`h1`, `h2`)にして印を付けたリプレイ。
     fn marked(h1: u8, h2: u8, side: Side, role: MarkRole) -> Vec<u8> {
         marked_with(h1, h2, side, role, None)
     }
@@ -317,7 +321,7 @@ mod tests {
 
     #[test]
     fn plan_lines_the_names_up_by_side() {
-        // 保存した人 "Me"・相手 "Peer"。ゲスト（2P 側）なら 1P は相手、ホストなら 1P は自分。
+        // 保存した人 "Me"・相手 "Peer"。ゲスト（2P側）なら1Pは相手。ホストなら1Pは自分。
         let guest = plan(&marked(0, 1, Side::P2, MarkRole::Play)).unwrap();
         assert_eq!(guest.side, Some(Side::P2));
         assert_eq!(guest.names, ("Peer".to_string(), "Me".to_string()));
@@ -331,7 +335,7 @@ mod tests {
         assert_eq!(w.names, ("B".to_string(), "A".to_string()));
     }
 
-    /// 印の他の項目と他の USER チャンクが、印の差し替えで変わらないことを見るための、チャンクを 2 つ足したリプレイ。
+    /// 印の差し替えで印の他の項目と他のUSERチャンクが変わらないことを検証するための、チャンクを2つ足したリプレイ。
     fn marked_between_other_chunks(detail: Option<crate::replay_detail::MatchDetail>) -> Vec<u8> {
         let game_chunk = |text: &[u8]| {
             let total = (text.len() + 13 + 1) & !1;
@@ -436,7 +440,7 @@ mod tests {
         };
         assert_eq!(m.detail.unwrap().charge, Some([1, 0]));
         assert_eq!(m.peer, "Peer");
-        // 直したコピーは「直し済み」なので、もう一度直そうとしても断る（反転が戻る事故を防ぐ）。
+        // 直したコピーは「直し済み」なのでもう一度直そうとしても断る（反転が戻る事故を防ぐ）。
         assert_eq!(
             fixed_copy(&g, 0, 0),
             Err(FixError::Plan(PlanError::Recorded([1, 0])))
@@ -468,14 +472,14 @@ mod tests {
             charge: Some([1, 0]),
             ..Default::default()
         };
-        // 新しいバージョンのゲストのリプレイ: 見出しは直してあり (1, 0)。1P の枠を自分の値と読むと 1 になり、壊す。
+        // 新しいバージョンのゲストのリプレイ: ヘッダは直してあり (1, 0)。1Pの枠を自分の値と読むと1になって壊す。
         let f = marked_with(1, 0, Side::P2, MarkRole::Play, Some(d));
         assert_eq!(plan(&f), Err(PlanError::Recorded([1, 0])));
         let without = marked_with(1, 0, Side::P2, MarkRole::Play, Some(Default::default()));
         assert!(plan(&without).is_ok(), "charge の無い印は直す対象");
     }
 
-    /// 境目は v1.0.0 のビルド番号 411272（`847dc03` の配る zip）。
+    /// 境目はv1.0.0のビルド番号411272（`847dc03`の配布zip）。
     #[test]
     fn a_replay_from_a_build_newer_than_v1_0_0_is_not_planned() {
         let with_build = |b| crate::replay_detail::MatchDetail {
