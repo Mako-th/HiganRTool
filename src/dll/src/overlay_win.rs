@@ -4198,7 +4198,11 @@ pub(crate) mod tests {
             ("Yu Gothic UI", "Yu Gothic UI"),
         ] {
             let a = mk(jp);
-            assert!(a.matched && !a.ascii_face.is_empty(), "{jp}: {}", a.face);
+            if !a.matched {
+                println!("このPCに{jp}が無いので確認しない: {}", a.face);
+                continue;
+            }
+            assert!(!a.ascii_face.is_empty(), "{jp}: {}", a.face);
             panels.push((format!("{label} + ASCII {}", a.ascii_face), a));
         }
         let mut sheet: Vec<u8> = Vec::new();
@@ -5600,7 +5604,10 @@ pub(crate) mod tests {
     fn ms_gothic_atlas_is_not_touched_by_the_ascii_substitution() {
         let with = default_atlas().expect("既定の文字の表");
         if !same_face(FONT_FACES[0], &with.face) {
-            println!("この PC に ＭＳ ゴシックが無いので見ない: {}", with.face);
+            println!(
+                "この PC に ＭＳ ゴシックが無いので確認しない: {}",
+                with.face
+            );
             return;
         }
         let without =
@@ -5631,7 +5638,7 @@ pub(crate) mod tests {
         for jp in faces {
             let base = gdi_atlas_with(&[jp], FONT_HEIGHT, FONT_SCALE, true, &[]).unwrap();
             if !base.matched {
-                println!("この PC に {jp} が無いので見ない");
+                println!("この PC に {jp} が無いので確認しない");
                 continue;
             }
             let with = gdi_atlas_with(&[jp], FONT_HEIGHT, FONT_SCALE, true, &ASCII_FACES).unwrap();
@@ -5748,7 +5755,10 @@ pub(crate) mod tests {
         let base = gdi_atlas_with(&["Yu Gothic UI"], FONT_HEIGHT, FONT_SCALE, true, &[])
             .expect("文字の表");
         if !base.matched {
-            println!("この PC に Yu Gothic UI が無いので見ない: {}", base.face);
+            println!(
+                "この PC に Yu Gothic UI が無いので確認しない: {}",
+                base.face
+            );
             return;
         }
         let mk = |ascii: &[&str]| {
