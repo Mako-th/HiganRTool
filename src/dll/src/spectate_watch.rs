@@ -40,7 +40,7 @@ use higanr_core::seal::{KeySeed, PUBLIC_LEN};
 use higanr_core::spectate::{
     AsmCounts, RelayKey, SpectateHost, Watcher, WatcherConfig, WatcherCounts,
 };
-use higanr_core::spectate_pace::{FF_UPDATES_MAX, Pace};
+use higanr_core::spectate_pace::{FF_FPS_MAX, FF_FPS_MIN, Pace};
 use higanr_core::wire::{ByeReason, CheckKind, Record, Seat, Select, Step, StepKind, WatchCheck};
 
 use crate::net_portrait::Followed;
@@ -61,7 +61,10 @@ mod pause;
 mod recv;
 pub use feed::{RelayCounts, WatchFeed, WatchUpnp};
 use ff::FfState;
-pub use ff::{FF_BUDGET_US, FF_ENTER_FRAMES, FF_EXIT_FRAMES, FfHost, FfStats, run_display};
+pub use ff::{
+    FF_BUDGET_US, FF_ENTER_FRAMES, FF_EXIT_FRAMES, FfHost, FfStats, ReplayFfHost, run_display,
+    run_replay_display,
+};
 use pause::LocalPause;
 pub use pause::{ESC_HINT_KEEP_MS, PauseStats, WatchNotice};
 pub use recv::{UpnpNews, WatchRecv};
@@ -298,8 +301,8 @@ pub struct WatchConfig {
     /// trueのとき、マップの決定が記録で入っていない場面2（タイトルのデモなど）では止める地点に入らず`Local`になる。
     /// また、接続する前の選択の画面では決定を落とす。
     pub require_net_selection: bool,
-    /// 早送りの速さ（1表示あたりの更新の数。iniの`[spectate] ff_max`。1〜`FF_UPDATES_MAX`）。上限は`Pace`がこれから決める。
-    pub ff_max: u32,
+    /// 早送りの最大の速さ（毎秒の更新の数。iniの`[spectate] ff_fps`）。1表示の上限は`Pace`がこれから決める。
+    pub ff_fps: u32,
 }
 
 /// 観戦をやめた理由。
@@ -521,7 +524,7 @@ impl WatchPlay {
             Arc::new(WatchFeed::try_with_len(len).ok_or_else(|| {
                 format!("観戦者の受け渡しのリングバッファ（{len} 記録）の確保不能")
             })?);
-        let recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), cfg.ff_max);
+        let recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), cfg.ff_fps);
         Ok(WatchPlay {
             cfg,
             slot,
@@ -575,7 +578,7 @@ impl WatchPlay {
             timing: FrameTiming::default(),
             stats: WatchStats::default(),
             ff: FfState::default(),
-            pace: Pace::with_updates(cfg.ff_max),
+            pace: Pace::with_fps(cfg.ff_fps),
             seen_written: 0,
             hud_delay: 0,
             hud_win_max: 0,
@@ -1758,8 +1761,8 @@ const S_REFILL: usize = 67;
 const S_NOT_HGRT: usize = 68;
 const S_NOT_HGRT_V6: usize = 69;
 const S_VIA: usize = 70;
-// 早送りの速さの設定（1表示あたりの更新の数。iniの`ff_max`）。
-const S_FF_UPDATES: usize = 71;
+// 早送りの最大の速さの設定（毎秒の更新の数。iniの`ff_fps`）。
+const S_FF_FPS: usize = 71;
 // 受け渡しのリングで読み取れなかった枠（0のはず）。
 const S_FEED_BAD: usize = 72;
 // マッチの中の一時停止（`spectate_watch/pause.rs`）。
@@ -1855,7 +1858,7 @@ impl WatchStatus {
         set(S_FF_CUTOFFS, s.ff.cutoffs);
         set(S_FF_DROP_FAIL, s.ff.drop_fail);
         set(S_FF_ACTIVE, u32::from(s.ff.active));
-        set(S_FF_UPDATES, wp.ff_updates());
+        set(S_FF_FPS, wp.ff_fps());
         set(S_FEED_BAD, wp.feed().bad());
         let p = s.pause;
         set(S_PAUSE_OPENED, p.opened);
@@ -2146,13 +2149,13 @@ impl WatchStatus {
             NO_VALUE => "まだ".to_string(),
             ms => format!("{ms} ms（{}）", secs(ms)),
         };
-        let updates = g(S_FF_UPDATES);
+        let fps = g(S_FF_FPS);
         let enter = match g(S_FF_ENTER_BACKLOG) {
             NO_VALUE => "なし".to_string(),
             n => format!("{n} フレーム"),
         };
         format!(
-            "観戦者の早送り: 設定（溜まりが {FF_ENTER_FRAMES} フレームを越えたら入り {FF_EXIT_FRAMES} 以下で戻る・1 表示の更新は最大 {updates} 回（ini の ff_max。1〜{FF_UPDATES_MAX}）・余分に使う時間の上限 {FF_BUDGET_US} µs） / 早送り用フックを通った表示 {}（0 のまま観戦者の tick が進むなら早送りの処理フローが無い） / 早送りした表示 {}（余分に回した更新 {}・1 表示の余分の時間の最大 {} µs） / 追いつくまで（入ってから戻るまで）最初の 1 回 {first}・入った回数 {}（戻った回数 {}・最初に入ったときの溜まり {enter}）・最長 {} ms・合計 {} ms / いま早送り中 {} / 時間の上限で打ち切った {} / SE・文字の数を整え不能で早送りをやめた {}",
+            "観戦者の早送り: 設定（溜まりが {FF_ENTER_FRAMES} フレームを越えたら入り {FF_EXIT_FRAMES} 以下で戻る・最大の速さ {fps} fps（ini の ff_fps。{FF_FPS_MIN}〜{FF_FPS_MAX}）・余分に使う時間の上限 {FF_BUDGET_US} µs） / 早送り用フックを通った表示 {}（0 のまま観戦者の tick が進むなら早送りの処理フローが無い） / 早送りした表示 {}（余分に回した更新 {}・1 表示の余分の時間の最大 {} µs） / 追いつくまで（入ってから戻るまで）最初の 1 回 {first}・入った回数 {}（戻った回数 {}・最初に入ったときの溜まり {enter}）・最長 {} ms・合計 {} ms / いま早送り中 {} / 時間の上限で打ち切った {} / SE・文字の数を整え不能で早送りをやめた {}",
             g(S_FF_BEGUN),
             g(S_FF_DISPLAYS),
             g(S_FF_EXTRA),

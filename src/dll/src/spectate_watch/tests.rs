@@ -72,7 +72,7 @@ fn the_log_line_appears_only_after_a_watcher_published() {
             wait_budget_us: 16_000,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     s.publish(&wp);
@@ -182,7 +182,7 @@ fn shot_step_code_carries_phase_and_screen_above_script_steps() {
 }
 
 #[test]
-fn the_join_carries_the_ff_max_of_the_watch_config() {
+fn the_join_carries_the_updates_per_display_of_the_watch_configs_ff_fps() {
     use crate::netplay::fake::FakeNet;
     use crate::netplay::{Game, Net};
     use higanr_core::wire::{self, MAX_DATAGRAM, Message};
@@ -216,8 +216,8 @@ fn the_join_carries_the_ff_max_of_the_watch_config() {
             (0, 0, 0, 0)
         }
     }
-    // 既定（8）と違う値を使い、範囲の両端も含める。
-    for ff_max in [3u32, 1, 16] {
+    // 切り上げと16での頭打ち（960を越える設定）を含める。
+    for (ff_fps, updates) in [(180u32, 3u32), (120, 2), (500, 9), (960, 16), (6_000, 16)] {
         let a = std::net::SocketAddr::from(([127, 0, 0, 1], 41_302));
         let h = std::net::SocketAddr::from(([127, 0, 0, 1], 47_001));
         let (mut net, mut host, _clock) = FakeNet::pair(a, h, 0);
@@ -230,7 +230,7 @@ fn the_join_carries_the_ff_max_of_the_watch_config() {
                 wait_budget_us: 16_000,
                 margin_frames: 3,
                 require_net_selection: false,
-                ff_max,
+                ff_fps,
             },
         );
         wp.on_input(&mut Idle, &mut net);
@@ -238,7 +238,9 @@ fn the_join_carries_the_ff_max_of_the_watch_config() {
         let (_, n, _) = host.recv(&mut buf).expect("JOIN が届いていない");
         let key = higanr_core::auth::AuthKey::derive(&c.secret, c.session_id);
         match wire::decode(&key, None, &buf[..n]).map(|p| p.msg) {
-            Ok(Message::SpectateJoin(j)) => assert_eq!(u32::from(j.ff_max), ff_max),
+            Ok(Message::SpectateJoin(j)) => {
+                assert_eq!(u32::from(j.ff_max), updates, "ff_fps {ff_fps}")
+            }
             other => panic!("JOIN でない: {other:?}"),
         }
     }
@@ -259,7 +261,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
             wait_budget_us: 16_000,
             margin_frames: 3,
             require_net_selection: false,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     struct Idle;
@@ -309,7 +311,7 @@ fn a_give_up_ends_a_watch_that_has_a_watcher_but_is_not_joined() {
             wait_budget_us: 16_000,
             margin_frames: 3,
             require_net_selection: false,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     wp2.set_phase_for_test(Phase::Selecting);
@@ -369,7 +371,7 @@ fn a_watcher_asks_to_skip_the_save_screen_only_when_its_game_leaves_by_save_and_
                 wait_budget_us: 16_000,
                 margin_frames: 3,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         )
     };
@@ -448,7 +450,7 @@ fn names_are_fixed_per_seg_by_the_first_complete_pair() {
             wait_budget_us: 0,
             margin_frames: 3,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let name = |seat, s: &str| Record::name(seat, s.as_bytes());
@@ -546,7 +548,7 @@ fn match_frame_words_are_masked_before_the_game_and_the_pause_memory() {
             wait_budget_us: 0,
             margin_frames: 3,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     wp.set_phase_for_test(Phase::Lockstep);
@@ -623,7 +625,7 @@ fn a_stall_in_the_match_waits_for_the_margin_before_playing_again() {
             wait_budget_us: 0,
             margin_frames: 3,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     wp.set_phase_for_test(Phase::Lockstep);

@@ -716,7 +716,7 @@ fn watch_through(recs: &[higanr_core::wire::Record]) -> crate::spectate_watch::W
             wait_budget_us: 0,
             margin_frames: 0,
             require_net_selection: false,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     wp.set_phase_for_test(Phase::Lockstep);

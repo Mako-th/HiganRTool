@@ -3,6 +3,7 @@
 // Durable Objectへの要求は無料枠に数えられるので、使えない文字を含む名前や回数超過では呼ばない。
 
 import {
+  LOBBY_PATH_PREFIX,
   RANDOM_PATH_PREFIX,
   RETRY_AFTER_SECS,
   WATCH_PATH_PREFIX,
@@ -10,6 +11,7 @@ import {
   decodeRoomName,
   normalizeRoomName,
   parseBuildSegment,
+  parseLobbyPath,
   parseWatchPath,
   roomNameFromPath,
 } from "./rules";
@@ -17,6 +19,7 @@ import {
 import { handleUpdate } from "./update";
 
 export { ConnectLimiter } from "./connect_limiter";
+export { Lobby } from "./lobby";
 export { RandomQueue } from "./random_queue";
 export { Room } from "./room";
 export { WatchList } from "./watch_list";
@@ -53,6 +56,22 @@ export default {
       const limited = await overLimit(req, env);
       if (limited !== null) return limited;
       return env.WATCH_LIST.get(env.WATCH_LIST.idFromName(`b${build}`)).fetch(req);
+    }
+
+    // ルーム名ごとの一覧のエンドポイント（/v0/lobby/<ビルド番号>/<ルーム名>）。名前は入口と同じ決まりで揃え、揃えた名ごとのDurable Objectへ渡す。
+    // 揃えた名が割り当て・観戦用の先頭で始まるものは断る（人が打てない名。割り当てのルームと混ざらないように）。
+    if (url.pathname.startsWith(LOBBY_PATH_PREFIX)) {
+      if (req.method !== "GET") return Response.json({ error: "method_not_allowed" }, { status: 405 });
+      const path = parseLobbyPath(url.pathname);
+      if (path.kind !== "ok") {
+        return Response.json({ error: path.kind }, { status: path.kind === "not_found" ? 404 : 400 });
+      }
+      if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return Response.json({ error: "upgrade_required" }, { status: 426 });
+      }
+      const limited = await overLimit(req, env);
+      if (limited !== null) return limited;
+      return env.LOBBY.get(env.LOBBY.idFromName(`b${path.build}:${path.name}`)).fetch(req);
     }
 
     const raw = roomNameFromPath(url.pathname);

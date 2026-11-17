@@ -749,7 +749,7 @@ impl Runner {
                 self.bump(match f {
                     Failure::Unresponsive(_) => Stat::FailUnresponsive,
                     Failure::RateLimited { .. } => Stat::FailRate,
-                    Failure::RoomFull | Failure::RoomInUse => Stat::FailFull,
+                    Failure::RoomFull | Failure::ListFull | Failure::RoomInUse => Stat::FailFull,
                     Failure::Expired => Stat::FailExpired,
                     Failure::PeerLeft => Stat::FailPeerLeft,
                     Failure::BadRoomName | Failure::BadTicket => Stat::FailBadName,

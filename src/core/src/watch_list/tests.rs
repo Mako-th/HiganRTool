@@ -665,7 +665,7 @@ fn the_host_that_changes_back_before_listing_sends_nothing_extra() {
 #[test]
 fn the_host_fails_with_the_servers_reason() {
     for (text, want) in [
-        (r#"{"t":"error","code":"list_full"}"#, Failure::RoomFull),
+        (r#"{"t":"error","code":"list_full"}"#, Failure::ListFull),
         (r#"{"t":"error","code":"expired"}"#, Failure::Expired),
         (
             r#"{"t":"error","code":"bad_message"}"#,
@@ -687,7 +687,7 @@ fn the_host_fails_with_the_servers_reason() {
         assert_eq!(c.next_wake(), None);
     }
     for (code, want) in [
-        (4429u16, Failure::RoomFull),
+        (4429u16, Failure::ListFull),
         (4408, Failure::Expired),
         (4410, Failure::PeerLeft),
         (1000, Failure::Unresponsive(Why::Closed(1000))),

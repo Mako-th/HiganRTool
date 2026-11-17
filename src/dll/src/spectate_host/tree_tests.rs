@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use higanr_core::code;
 use higanr_core::spectate::{Watcher, WatcherConfig};
-use higanr_core::spectate_pace::FF_UPDATES_DEFAULT;
+use higanr_core::spectate_pace::FF_FPS_DEFAULT;
 use higanr_core::spectate_rate::RELAY_MIN_BPS;
 
 use crate::net_udp::{self, GameNet, RecvThread, SecondStun};
@@ -106,7 +106,7 @@ impl Cluster {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: FF_UPDATES_DEFAULT,
+                ff_fps: FF_FPS_DEFAULT,
             },
             4_096,
         );

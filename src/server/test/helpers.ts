@@ -147,6 +147,22 @@ export async function connectWatch(build: number, kind: "post" | "view", ip?: st
   return new Client(res.webSocket);
 }
 
+/** ルーム名ごとの一覧へ接続する（パス`/v0/lobby/<ビルド番号>/<ルーム名>`。ルーム名は符号化して載せる）。 */
+export async function connectLobby(build: number, name: string, ip?: string): Promise<Client> {
+  const res = await rawConnect(`/v0/lobby/${build}/${encodeURIComponent(name)}`, { ip });
+  if (res.status !== 101 || res.webSocket === null) {
+    throw new Error(`expected 101, got ${res.status}: ${await res.text()}`);
+  }
+  return new Client(res.webSocket);
+}
+
+/** 揃えた名`name`の一覧のDurable Object（入口と同じ`b<ビルド番号>:<揃えた名>`）。 */
+export function lobbyStub(build: number, name: string): DurableObjectStub {
+  const key = normalizeRoomName(name);
+  if (key === null) throw new Error(`部屋名の決まりの外: ${JSON.stringify(name)}`);
+  return env.LOBBY.get(env.LOBBY.idFromName(`b${build}:${key}`));
+}
+
 let cidSeq = 0;
 /** 起動ごとの乱数の見本（16進32文字）。検査ごとに別の値。 */
 export function freshCid(): string {

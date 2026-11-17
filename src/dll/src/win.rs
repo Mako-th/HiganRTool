@@ -26,6 +26,10 @@ use windows_sys::Win32::Globalization::{
     CP_UTF8, GetACP, MB_ERR_INVALID_CHARS, MultiByteToWideChar, WC_NO_BEST_FIT_CHARS,
     WideCharToMultiByte,
 };
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenElevation,
+    TokenVirtualizationEnabled,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -38,7 +42,8 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::SystemInformation::{GetLocalTime, OSVERSIONINFOW};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, CreateThread, IsProcessorFeaturePresent, PF_XMMI64_INSTRUCTIONS_AVAILABLE,
+    CreateMutexW, CreateThread, GetCurrentProcess, IsProcessorFeaturePresent, OpenProcessToken,
+    PF_XMMI64_INSTRUCTIONS_AVAILABLE,
 };
 use windows_sys::core::BOOL;
 
@@ -158,6 +163,42 @@ pub fn cpu_features() -> (bool, bool) {
     // SAFETY: 引数は機能の番号だけ。失敗しない。
     let sse2 = unsafe { IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) } != 0;
     (sse2, std::arch::is_x86_feature_detected!("avx2"))
+}
+
+/// 自分のプロセスのトークンから`u32`1つの情報を読む。`TokenElevation`と`TokenVirtualizationEnabled`はどちらも4バイト。
+fn process_token_u32(class: TOKEN_INFORMATION_CLASS) -> Option<u32> {
+    let mut token: HANDLE = core::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess`は閉じなくてよい疑似ハンドルを返す。読み取りの権限だけを求め、トークンは書き込み可能な変数に受ける。
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut value = 0u32;
+    let mut got = 0u32;
+    // SAFETY: `token`は直前に開いた有効なハンドル。出力先は4バイトの変数で、長さをそのまま渡している。
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            (&mut value as *mut u32).cast(),
+            core::mem::size_of::<u32>() as u32,
+            &mut got,
+        )
+    };
+    close_handle(token);
+    (ok != 0 && got as usize == core::mem::size_of::<u32>()).then_some(value)
+}
+
+/// 保存先の切り分けに要る環境（ANSIコードページ・管理者・VirtualStoreの差し替え・ゲームのフォルダ名）。読み取りのスレッドで1回呼ぶ。ゲームのスレッドでは呼ばない。
+pub fn access_info(exe: Option<&Path>) -> probe::AccessInfo {
+    // SAFETY: 引数の無い呼び出し。
+    let acp = unsafe { GetACP() };
+    probe::AccessInfo {
+        code_page: (acp != 0).then_some(acp),
+        elevated: process_token_u32(TokenElevation).map(|v| v != 0),
+        virtualization: process_token_u32(TokenVirtualizationEnabled).map(|v| v != 0),
+        game_dir_non_ascii: probe::dir_has_non_ascii(exe),
+        game_dir_in_ansi: probe::dir_fits_ansi(exe, &AcpAnsi),
+    }
 }
 
 pub fn exe_image_base() -> usize {
@@ -426,6 +467,8 @@ pub fn on_process_attach(module: HMODULE) -> bool {
     // フルスクリーンの垂直同期の答え（iniの`[pacing] vsync`。iniは最初に答えるときに読む）と、デバイスが失われている間のメインループのスリープ。
     crate::vsync_answer_win::install(module);
     crate::lost_sleep_win::install();
+    // fpsの表示の測り（フレームを始めた時刻のQPC）。ペースが格子を刻んでいない間と読み込みのスレッドの呼びはゲーム自身の測りのまま。
+    crate::fps_win::install();
     // SAFETY: `probe_thread`はLPTHREAD_START_ROUTINEの形。引数は自分のDLLのハンドル。このDLLは自分を解放しない。
     // 属性はNULL・スタックの大きさは既定・すぐ走らせる・スレッドIDは不要。
     let thread = unsafe {
@@ -516,6 +559,7 @@ fn run_probe_thread(module: HMODULE) {
     let _ = writeln!(file, "{}", mode_line(choice.detail));
     let (sse2, avx2) = cpu_features();
     let _ = writeln!(file, "{}", probe::system_line(os_version(), sse2, avx2));
+    let _ = writeln!(file, "{}", probe::access_line(&access_info(exe.as_deref())));
     let _ = match &veh {
         Ok(()) => writeln!(detail_out(&mut file), "例外: ハンドラ登録済み"),
         Err(why) => writeln!(file, "例外: ハンドラ登録不能（{why}）"),
@@ -874,6 +918,29 @@ mod tests {
         assert!(v.major >= 6 && v.build > 0, "{v:?}");
         let (sse2, _avx2) = cpu_features();
         assert!(sse2, "i686 のビルドが走っているなら SSE2 はある");
+    }
+
+    /// このテスト自身のプロセスでトークンの2項目とコードページが取れる（取れなければ「取得不能」の行になる）。
+    #[test]
+    fn access_info_reads_the_token_and_code_page() {
+        let exe = std::env::current_exe().ok();
+        let a = access_info(exe.as_deref());
+        assert!(a.code_page.is_some_and(|c| c > 0), "{a:?}");
+        assert!(a.elevated.is_some(), "{a:?}");
+        assert!(a.virtualization.is_some(), "{a:?}");
+        assert!(a.game_dir_non_ascii.is_some(), "{a:?}");
+        assert!(a.game_dir_in_ansi.is_some(), "{a:?}");
+        assert!(!probe::access_line(&a).contains("取得不能"));
+        // 管理者として実行しているプロセスは書き込みをVirtualStoreへ差し替えられない。
+        if a.elevated == Some(true) {
+            assert_eq!(a.virtualization, Some(false), "{a:?}");
+        }
+        // ASCIIだけのパスはANSIで表せる。
+        if a.game_dir_non_ascii == Some(false) {
+            assert_eq!(a.game_dir_in_ansi, Some(true), "{a:?}");
+        }
+        // SAFETY: 引数の無い呼び出し。
+        assert_eq!(a.code_page, Some(unsafe { GetACP() }));
     }
 
     #[test]

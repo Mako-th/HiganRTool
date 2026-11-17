@@ -1343,3 +1343,135 @@ fn rollback_never_allocates() {
     assert!(games[0].checks > 0 && games[0].confirmed > 0);
     assert_eq!(after, before, "rollback の状態機械がヒープを確保した");
 }
+
+#[test]
+fn lobby_menu_never_allocates() {
+    use higanr_core::lobby::{LobbyRoom, LobbyRow, LobbySnapshot, PlayRow, WaitRow};
+    use higanr_core::mode_pick::Shape;
+    use higanr_core::net_menu::{Conn, Menu, MenuRows, Note, RoomItem, TextIn, TickIn};
+    use higanr_core::room_input::RoomBuf;
+    use higanr_core::watch_list::{ListStatus, WatchName, WatchRow, WatchSnapshot};
+    use higanr_core::wire::Mode;
+
+    const Z: u16 = 0x0001;
+    const X: u16 = 0x0002;
+    const DOWN: u16 = 0x0020;
+    let name = |s: &str| WatchName::parse(s).unwrap();
+    let rows: Vec<LobbyRow> = (0..20u8)
+        .map(|i| {
+            if i % 2 == 0 {
+                LobbyRow::Wait(WaitRow {
+                    name: name("Alice"),
+                    room: LobbyRoom::parse(&format!("r.{:030x}", u128::from(i))).unwrap(),
+                })
+            } else {
+                LobbyRow::Play(PlayRow {
+                    row: WatchRow {
+                        hash: [i; 8],
+                        p1: name("Bob"),
+                        p2: name("Carol"),
+                        mode: Mode::Rollback,
+                        delay: 1,
+                        watchers: i % 4,
+                        cap: 3,
+                    },
+                    watch: i % 3 != 0,
+                })
+            }
+        })
+        .collect();
+    let mut lobby = Box::new(LobbySnapshot::EMPTY);
+    lobby.set(ListStatus::Ready, &rows);
+    let watch = Box::new(WatchSnapshot::EMPTY);
+    let mut menu = Menu::new(Shape {
+        mode: Mode::Rollback,
+        delay: 1,
+    })
+    .with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()))
+    .with_lobby(true);
+    let mut out = Box::new(MenuRows::new());
+    let input = |word: u16| TickIn {
+        word,
+        note: Note::default(),
+        conn: Conn::Waiting,
+        text: TextIn::NONE,
+    };
+    menu.open(0);
+    menu.tick_with(&input(DOWN), &watch, &lobby);
+    menu.tick_with(&input(0), &watch, &lobby);
+    let own = LobbyRoom::parse(&format!("r.{:030x}", 2u128)).unwrap();
+    let before = count();
+    // 「ルームマッチ」を決定して一覧の画面へ入り、一覧を回って決定し、入室の失敗で戻る。
+    for _ in 0..3 {
+        // 自分の待機中の行がある一覧も回す。
+        menu.set_own_lobby(Some(own));
+        menu.tick_with(&input(Z), &watch, &lobby);
+        assert!(menu.wants_lobby().is_some(), "一覧の画面へ入っていない");
+        for _ in 0..30 {
+            menu.tick_with(&input(0), &watch, &lobby);
+            menu.tick_with(&input(DOWN), &watch, &lobby);
+            menu.render_with(Conn::Waiting, &Note::default(), 0, &mut out, &watch, &lobby);
+        }
+        menu.tick_with(&input(0), &watch, &lobby);
+        menu.tick_with(&input(Z), &watch, &lobby);
+        menu.tick_with(&input(0), &watch, &lobby);
+        assert!(menu.wants_lobby().is_none(), "決定しても一覧の画面を出ない");
+        menu.return_to_lobby();
+        assert!(menu.wants_lobby().is_some(), "一覧へ戻らない");
+        menu.render_with(Conn::Waiting, &Note::default(), 0, &mut out, &watch, &lobby);
+        // キャンセルで入口のメニューへ戻る（次の周も同じ項目から入る）。
+        menu.tick_with(&input(X), &watch, &lobby);
+        menu.tick_with(&input(0), &watch, &lobby);
+        assert!(menu.wants_lobby().is_none());
+    }
+    assert_eq!(count(), before, "一覧の画面がヒープを確保した");
+}
+
+/// 一覧のワードから行と割り当てのルーム名を戻す処理（ゲームのスレッドが一覧を読むたびに通る）。
+#[test]
+fn lobby_rows_from_words_never_allocate() {
+    use higanr_core::lobby::{LobbyRoom, LobbyRow, PlayRow, WaitRow};
+    use higanr_core::watch_list::{WatchName, WatchRow};
+    use higanr_core::wire::Mode;
+
+    let name = |s: &str| WatchName::parse(s).unwrap();
+    let words: Vec<_> = (0..20u8)
+        .map(|i| {
+            let row = if i % 2 == 0 {
+                LobbyRow::Wait(WaitRow {
+                    name: name("Alice"),
+                    room: LobbyRoom::parse(&format!("r.{:030x}", u128::from(i) << 64)).unwrap(),
+                })
+            } else {
+                LobbyRow::Play(PlayRow {
+                    row: WatchRow {
+                        hash: [i; 8],
+                        p1: name("Bob"),
+                        p2: name("Carol"),
+                        mode: Mode::Rollback,
+                        delay: 1,
+                        watchers: i % 4,
+                        cap: 3,
+                    },
+                    watch: i % 3 != 0,
+                })
+            };
+            (row, row.to_words())
+        })
+        .collect();
+    let before = count();
+    let mut waits = 0u32;
+    for (row, w) in &words {
+        assert_eq!(LobbyRow::from_words(w).as_ref(), Some(row));
+        if let LobbyRow::Wait(r) = row {
+            assert_eq!(LobbyRoom::from_words(&r.room.to_words()), Some(r.room));
+            waits += 1;
+        }
+    }
+    let after = count();
+    assert_eq!(waits, 10, "待機中の行を通っていない");
+    assert_eq!(
+        after, before,
+        "一覧のワードから行を戻す処理がヒープを確保した"
+    );
+}

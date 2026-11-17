@@ -17,12 +17,14 @@ use crate::ini::{self, Ini, strip_comment};
 /// これまでに配布したバージョンの配布用ini（値の比べ先）。
 /// 配布用のzipを作るときにそのバージョンの`scripts/dist/HiganRTool.ini`を`ini_templates/`へ足す。
 /// さらにここへ1行足す（足し忘れは`every_old_template_file_is_listed`が落とす）。
-pub const OLD_TEMPLATES: [&str; 5] = [
+pub const OLD_TEMPLATES: [&str; 7] = [
     include_str!("ini_templates/v1.0.0.ini"),
     include_str!("ini_templates/v1.1.0.ini"),
     include_str!("ini_templates/v1.1.1.ini"),
     include_str!("ini_templates/v1.2.0.ini"),
     include_str!("ini_templates/v1.2.1.ini"),
+    include_str!("ini_templates/v1.2.2.ini"),
+    include_str!("ini_templates/v1.3.0.ini"),
 ];
 
 /// 名前を替えたキー: (節, 古いキー, 新しいキー, 値の読み替え)。表に無い値はそのまま移す（読めない値ならdllがその行を使わない）。
@@ -34,12 +36,38 @@ pub type Renamed = (
     &'static [(&'static str, &'static str)],
 );
 
-pub const RENAMED: [Renamed; 1] = [(
-    "pacing",
-    "auto_window",
-    "wait",
-    &[("b-hybrid", "passive"), ("b-spin", "active")],
-)];
+/// `ff_max`（1表示あたりの更新の数n）は`ff_fps`の60 × nに読み替える（下限の120を割る値は120）。
+pub const RENAMED: [Renamed; 2] = [
+    (
+        "pacing",
+        "auto_window",
+        "wait",
+        &[("b-hybrid", "passive"), ("b-spin", "active")],
+    ),
+    (
+        "spectate",
+        "ff_max",
+        "ff_fps",
+        &[
+            ("1", "120"),
+            ("2", "120"),
+            ("3", "180"),
+            ("4", "240"),
+            ("5", "300"),
+            ("6", "360"),
+            ("7", "420"),
+            ("8", "480"),
+            ("9", "540"),
+            ("10", "600"),
+            ("11", "660"),
+            ("12", "720"),
+            ("13", "780"),
+            ("14", "840"),
+            ("15", "900"),
+            ("16", "960"),
+        ],
+    ),
+];
 
 /// `entry`の古いキーを新しいキーと値に読み替える。名前を替えたキーでなければそのまま。
 fn renamed(entry: (String, String, String)) -> (String, String, String) {
@@ -729,6 +757,41 @@ lang = auto
         assert!(r.defaulted.is_empty(), "{r:?}");
     }
 
+    // リプレイ再生の速さの2キー: 古いiniには行が無いので足され、利用者が書いた値は残る。
+    #[test]
+    fn the_replay_fps_keys_are_added_to_older_inis_and_keep_a_users_values() {
+        let dist = crate::ini_store::dist_ini_text();
+        assert!(dist.contains("\nreplay_skip_fps = 240"), "配る ini");
+        assert!(dist.contains("\nreplay_slow_fps = 30"), "配る ini");
+        // 行の上のコメントの範囲が実際に読む範囲（skipだけ上限が違う）と合っている。
+        let lf = dist.replace("\r\n", "\n");
+        assert!(
+            lf.contains(": 1〜6000（fps。既定240）\nreplay_skip_fps"),
+            "配る ini の skip の範囲"
+        );
+        assert!(
+            lf.contains(": 1〜1000（fps。既定30）\nreplay_slow_fps"),
+            "配る ini の slow の範囲"
+        );
+        for (i, old) in OLD_TEMPLATES.iter().enumerate() {
+            let r = upgrade_known(&dist, old);
+            let got = ini::parse(&r.text).unwrap();
+            assert_eq!(got.get("pacing", "replay_skip_fps"), Some("240"), "{i}");
+            assert_eq!(got.get("pacing", "replay_slow_fps"), Some("30"), "{i}");
+        }
+        // v1.2.1までの雛形に行が無いこと（無ければ上は「足された」ことの検査になる）。
+        assert!(!OLD_TEMPLATES[4].contains("replay_skip_fps"));
+        let user =
+            OLD_TEMPLATES[4].replace("\nvsync = off\n", "\nvsync = on\nreplay_slow_fps = 45\n");
+        assert_ne!(user, OLD_TEMPLATES[4]);
+        let r = upgrade_known(&dist, &user);
+        assert!(r.is_safe(), "{r:?}");
+        let got = ini::parse(&r.text).unwrap();
+        assert_eq!(got.get("pacing", "replay_slow_fps"), Some("45"));
+        assert_eq!(got.get("pacing", "replay_skip_fps"), Some("240"));
+        assert_eq!(got.get("pacing", "vsync"), Some("on"));
+    }
+
     // 新しいキーも書いてあるときは古いキーの値で上書きしない。読み替えた行は雛形の`wait`の行に入る。
     #[test]
     fn auto_window_is_carried_over_as_wait() {
@@ -763,6 +826,30 @@ lang = auto
         let both = "[pacing]\nwait = passive\nauto_window = b-spin\n";
         let got = ini::parse(&upgrade_known(&dist, both).text).unwrap();
         assert_eq!(got.get("pacing", "wait"), Some("passive"), "順番に依らない");
+    }
+
+    // 変えた`ff_max`はfpsに読み替える（60 × n。120を割る値は120）。既定の8は移さず雛形の480になる。
+    #[test]
+    fn ff_max_is_carried_over_as_ff_fps() {
+        let dist = crate::ini_store::dist_ini_text();
+        let v122 = OLD_TEMPLATES[5];
+        assert!(v122.contains("\nff_max = 8\n"), "v1.2.2 の配る ini");
+        for (old, new) in [("1", "120"), ("3", "180"), ("12", "720"), ("16", "960")] {
+            let user = v122.replace("\nff_max = 8\n", &format!("\nff_max = {old}\n"));
+            let r = upgrade_known(&dist, &user);
+            assert!(r.is_safe(), "{r:?}");
+            let got = ini::parse(&r.text).unwrap();
+            assert_eq!(got.get("spectate", "ff_fps"), Some(new), "{old}");
+            assert_eq!(got.get("spectate", "ff_max"), None, "{old}");
+            assert!(r.carried.is_empty(), "{r:?}");
+        }
+        let r = upgrade_known(&dist, v122);
+        let got = ini::parse(&r.text).unwrap();
+        assert_eq!(got.get("spectate", "ff_fps"), Some("480"));
+        assert_eq!(r.text, dist);
+        let both = "[spectate]\nff_max = 4\nff_fps = 600\n";
+        let got = ini::parse(&upgrade_known(&dist, both).text).unwrap();
+        assert_eq!(got.get("spectate", "ff_fps"), Some("600"));
     }
 
     #[test]

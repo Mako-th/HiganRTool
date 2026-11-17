@@ -350,6 +350,44 @@ fn feed_watch_list(on: bool) {
     }
 }
 
+/// ルーム名ごとの一覧の画面の接続（メニューが一覧の画面を開いている間だけ持つ）。触るのは`feed_lobby_list`だけ。
+static LOBBY_FEED: std::sync::Mutex<Option<crate::lobby_feed::LobbyFeed>> =
+    std::sync::Mutex::new(None);
+
+/// メニューがルーム名ごとの一覧の画面に入った（`Some((ルーム名, 世代))`）・出た（`None`）。入るときに一覧の接続のスレッドを作り、出るときに止める（ゲームのスレッド。人が画面を操作したtickに1回。確保・待ちは作ったスレッドの側）。
+/// 作れなかったらfalseを返す（バッファには書かない。`NetUi`が自分のコピーを「取得できなかった」にする）。
+fn feed_lobby_list(req: Option<(higanr_core::room_input::RoomBuf, u32)>) -> bool {
+    let mut g = LOBBY_FEED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut f) = g.take() {
+        f.stop();
+    }
+    let Some((name, generation)) = req else {
+        return true;
+    };
+    let Some(lazy) = LAZY.get() else {
+        return false;
+    };
+    let (Some(base), Ok(room)) = (lazy.settings.room_server.clone(), name.parse()) else {
+        return false;
+    };
+    match crate::lobby_feed::LobbyFeed::start(
+        Arc::clone(&lazy.link),
+        RoomOptions::product(base),
+        higanr_core::update::BUILD_NUMBER,
+        room,
+        generation,
+    ) {
+        Ok(f) => {
+            *g = Some(f);
+            true
+        }
+        Err(e) => {
+            game_net_problem(e);
+            false
+        }
+    }
+}
+
 // ---- LAN ----
 //
 // メニューのLANの項目（「ホスト」「クライアント」「観戦」）を選んだとき、ゲームのスレッドがすることは運び手のスレッド（`lan_link`）を1本作ることだけ（`request_lan`）。
@@ -1150,6 +1188,7 @@ fn arm_game_ui_with(
         .with_shape_saver(Some(crate::ini_save::save_shape))
         .with_seat_saver(Some(crate::ini_save::save_seat))
         .with_watch_feed(Some(feed_watch_list))
+        .with_lobby(Some(feed_lobby_list))
         .with_update_check(
             update_hooks(notice, higanr_core::update::BUILD_NUMBER),
             higanr_core::update::BUILD_NUMBER,
@@ -1733,7 +1772,7 @@ fn open_watch_net(lazy: &'static LazyNet) -> Result<Box<WatchNetSlot>, String> {
             margin_frames: WATCH_MARGIN_FRAMES,
             // 本物のゲームは選択の画面を持つ。
             require_net_selection: true,
-            ff_max: s.ff_max,
+            ff_fps: s.ff_fps,
         },
     )?;
     let kit = JoinKit {
@@ -2362,7 +2401,7 @@ pub fn open_net(
                 margin_frames: WATCH_MARGIN_FRAMES,
                 // 本物のゲームは選択の画面を持つ。
                 require_net_selection: true,
-                ff_max: s.ff_max,
+                ff_fps: s.ff_fps,
             },
         )
         .map_err(not_started)?;
@@ -4034,6 +4073,223 @@ fn watch_scan(this: u32) -> Option<i32> {
     Some(crate::spectate_watch::run_display(&mut host))
 }
 
+/// 余分な更新を回してよい状態かどうか。対戦・観戦のセッションが無く、グローバル状態の下位バイトがリプレイ再生中で、読み込み中でないこと。読めなければ偽。
+fn replay_playing_of(net_on: bool, state: Option<u32>, loading: Option<u32>) -> bool {
+    !net_on
+        && state.is_some_and(|v| v & 0xFF == u32::from(higanr_core::pacing::REPLAY_PLAYING_STATE))
+        && loading == Some(0)
+}
+
+/// ゲームのメモリの1ワードを直に読む（余分な更新ごとに呼ぶのでsyscallを避ける）。
+#[cfg(not(test))]
+fn game_word(addr: u32) -> Option<u32> {
+    crate::rollback_play_win::read_fast(addr)
+}
+
+/// 検査のプロセスにはゲームのメモリが無いので検査が置いた値を返す（`u32::MAX`は読めない）。
+#[cfg(test)]
+fn game_word(addr: u32) -> Option<u32> {
+    let v = if addr == crate::th09_addr::GLOBAL_STATE {
+        &tests::TEST_GAME_STATE
+    } else {
+        &tests::TEST_GAME_LOADING
+    };
+    Some(v.load(Ordering::SeqCst)).filter(|&v| v != u32::MAX)
+}
+
+/// 文字の数のフィールドの読み書きと場面の要求の読み。検査のプロセスにはゲームのメモリが無いので検査では置き換える。
+#[cfg(not(test))]
+fn ascii_read() -> Option<u32> {
+    crate::rollback_win::ff_read_ascii()
+}
+
+#[cfg(not(test))]
+fn ascii_restore(v: u32) -> bool {
+    crate::rollback_win::ff_drop_outputs(v)
+}
+
+#[cfg(not(test))]
+fn scene_pending() -> bool {
+    crate::rollback_win::scene_request_pending_fast()
+}
+
+#[cfg(test)]
+fn ascii_read() -> Option<u32> {
+    Some(0)
+}
+
+#[cfg(test)]
+fn ascii_restore(_v: u32) -> bool {
+    true
+}
+
+#[cfg(test)]
+fn scene_pending() -> bool {
+    assert!(
+        !tests::TEST_PANIC_IN_BOUNDARY.swap(false, Ordering::SeqCst),
+        "検査: 余分な更新の途中のパニック"
+    );
+    false
+}
+
+/// リプレイの高速再生が走査を呼ぶ側の本物。観戦者の早送りと同じ`ExtraTick`・文字の数・場面の要求の読みを使い、セッションは持たない。
+struct RealReplayFf {
+    this: u32,
+    ascii0: Option<u32>,
+    /// 最初の走査の戻り値（パニックを受けたときに更新を1回余分に回さずに返す）。
+    first_ret: Option<i32>,
+}
+
+impl crate::spectate_watch::ReplayFfHost for RealReplayFf {
+    fn scan(&mut self, extra: bool) -> i32 {
+        let _extra = extra.then(ExtraTick::new);
+        let r = crate::rollback_win::call_scan(self.this);
+        if !extra {
+            self.first_ret = Some(r);
+        }
+        r
+    }
+
+    fn begin(&mut self) -> bool {
+        self.ascii0 = ascii_read();
+        self.ascii0.is_some()
+    }
+
+    fn drop_outputs(&mut self) -> bool {
+        self.ascii0.is_some_and(ascii_restore)
+    }
+
+    fn boundary(&mut self) -> bool {
+        scene_pending()
+    }
+
+    fn playing(&mut self) -> bool {
+        replay_playing_of(
+            NET_ON.load(Ordering::Acquire) != 0,
+            game_word(crate::th09_addr::GLOBAL_STATE),
+            game_word(crate::th09_addr::LOADING),
+        )
+    }
+
+    fn now_us(&mut self) -> u64 {
+        let qpf = crate::pacing_win::qpf().max(1);
+        (u128::from(crate::pacing_win::qpc()) * 1_000_000 / u128::from(qpf)) as u64
+    }
+
+    fn note(&mut self, ran: u32, cutoff: bool, used_us: u32) {
+        crate::pacing::REPLAY_EXTRA.note_display(ran, cutoff, used_us);
+    }
+}
+
+/// リプレイの高速再生の走査の包みのフック。ペースの判断が公開した数（`REPLAY_EXTRA`）だけ、1回の表示の中でゲームの更新を余分に回す。
+/// 数が0（Skipを離している・再生中でない）と対戦・観戦のセッションがあるときは`None`（普段の1回）。
+/// 対戦の経路では数が0なので、足されるのはアトミック変数の読み1回だけ。
+/// 包みにパニックが届くと`SCAN_HANDLER`が外れ、以後のrollbackの対戦が包みを通らなくなる。
+/// そのためパニックはここで受ける。
+/// 受けたら高速再生だけを止め、最初の走査を呼んでいればその戻り値を返す（呼んでいなければ包みが普通の1回を呼ぶ）。
+fn replay_scan(this: u32) -> Option<i32> {
+    let planned = crate::pacing::REPLAY_EXTRA.planned();
+    if planned == 0 || NET_ON.load(Ordering::Acquire) != 0 || !crate::rollback_win::scan_hooked() {
+        return None;
+    }
+    let mut host = RealReplayFf {
+        this,
+        ascii0: None,
+        first_ret: None,
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        crate::spectate_watch::run_replay_display(&mut host, planned)
+    })) {
+        Ok(r) => Some(r),
+        Err(_) => {
+            crate::pacing::REPLAY_EXTRA.disable();
+            crate::main_log::push(
+                "ペース: リプレイの高速再生の処理でパニックを受けたので、以後は無効にします。",
+            );
+            host.first_ret
+        }
+    }
+}
+
+/// 走査のcallが書かれているのにフックが未設定なら設定する（rollbackの設置が一部だけ書けた実行など）。設定したら真。
+fn ensure_scan_handler() -> bool {
+    if crate::rollback_win::scan_hooked() && !crate::rollback_win::scan_handler_is_set() {
+        crate::rollback_win::set_scan_handler(Some(rb_scan_handler));
+        return true;
+    }
+    false
+}
+
+/// リプレイの高速再生が走査のcallの書き込みを要求したとき、書き出しのスレッドが書く（100 msごとに呼ばれる）。
+/// 要求が無いときはアトミック変数を1回読んで戻る。1プロセスで1回だけ試し、書けなくても再試行しない。
+/// 対戦のセッションが立っているときは書かずに要求を戻す。
+pub fn replay_scan_service() {
+    if !crate::pacing::REPLAY_EXTRA.take_arm_request() {
+        return;
+    }
+    if NET_ON.load(Ordering::Acquire) != 0 {
+        crate::pacing::REPLAY_EXTRA.cancel_arm();
+        return;
+    }
+    for (concise, l) in replay_scan_arm_with(&mut crate::hook_win::RealHook::new()) {
+        if concise {
+            crate::main_log::push(l);
+        } else {
+            crate::main_log::push_detail(l);
+        }
+    }
+}
+
+/// `replay_scan_service`の本体（止めて書く環境を受ける）。本ログの行を（簡潔にも出すか, 文）で返す。
+/// 書く手順と照合は観戦者の早送りと同じ（`arm_scan_call`。合わなければ1バイトも書かない）。
+/// 書いた後と、すでに書いてあったのにフックが未設定のときは走査の包みのフックを設定する。
+fn replay_scan_arm_with(env: &mut dyn crate::hook::HookEnv) -> Vec<(bool, String)> {
+    let mut out: Vec<u8> = Vec::new();
+    let result =
+        crate::rollback_play_win::arm_scan_call(env, crate::th09_addr::FORBIDDEN, &mut out);
+    let detail = String::from_utf8_lossy(&out)
+        .lines()
+        .collect::<Vec<_>>()
+        .join(" / ");
+    match result {
+        Ok(true) => {
+            crate::rollback_win::set_scan_handler(Some(rb_scan_handler));
+            vec![
+                (
+                    true,
+                    "ペース: リプレイの高速再生のために、ゲームの更新の呼び出しを 1 か所書き換えました。"
+                        .to_string(),
+                ),
+                (
+                    false,
+                    format!("ペース: ゲームの更新の呼び出しの書き換え: {detail}"),
+                ),
+            ]
+        }
+        Ok(false) => {
+            ensure_scan_handler();
+            vec![(
+                false,
+                "ペース: リプレイの高速再生は、書き換え済みのゲームの更新の呼び出しを使います。"
+                    .to_string(),
+            )]
+        }
+        Err(why) => vec![
+            (
+                true,
+                format!(
+                    "ペース: ゲームの更新の呼び出しの書き換え不能（{}）。垂直同期を取るフルスクリーンでのリプレイの高速再生は無効です。",
+                    why.noun()
+                ),
+            ),
+            (
+                false,
+                format!("ペース: ゲームの更新の呼び出しの書き換えの詳細: {detail}"),
+            ),
+        ],
+    }
+}
+
 /// 走査の包み（`0x0042DCA9`）のフック（`rollback_win::set_scan_handler`）。
 /// rollbackのモードのマッチの間は、ここで自分の入力ワードの取得・送信と入力の地点の処理を行う（止まっていれば書き戻しと進め直しも）。
 /// そして更新1回か描画だけのフレームのために、走査を自分で呼ぶ。
@@ -4042,7 +4298,8 @@ fn watch_scan(this: u32) -> Option<i32> {
 pub fn rb_scan_handler(this: u32) -> Option<i32> {
     let Some(slot) = rb_slot() else {
         // 対戦のセッションが無い。観戦者のセッションがあれば早送りの経路へ進む（遅れて入った観戦者を追いつかせる）。
-        return watch_scan(this);
+        // どちらでもなければリプレイの高速再生（数が0なら素通り）。
+        return watch_scan(this).or_else(|| replay_scan(this));
     };
     // 前のフレームの後半でマッチをやめていたらここでコピーする（やめた後は`active`がfalseになり、下のカウントのコピーが回らない）。
     rb_note_abort(&slot.np);
@@ -4157,7 +4414,8 @@ fn install_rollback_wiring() {
 /// 観戦者のネットワークを開くとき、走査のcallだけを書いてフックを設定する（観戦者を追いつかせる早送り）。
 /// 観戦者がどの方式のマッチを見るかは接続するまで分からない。
 /// 早送りは方式に依らないので、マッチの方式に関わらず設定する。
-/// **対戦の実行からは呼ばない**（delay方式の対戦の実行は1バイトも書かない約束）。
+/// 呼ぶのは観戦者の実行だけ。走査のcallを書くのはrollbackの設置・この観戦者の実行・リプレイの高速再生（再生中にSkipを押したとき。`replay_scan_service`）。
+/// delay方式の対戦だけのプロセスはリプレイの高速再生を使わない限り書かない。
 /// Presentの後のフックは設定しない（観戦者は巻き戻さない）。書いた（または既に書いてあった）らtrue。
 pub fn arm_watch_scan(
     hook_env: &mut dyn crate::hook::HookEnv,
@@ -4184,6 +4442,8 @@ fn arm_watch_scan_at_open() -> String {
 /// `arm_watch_scan_at_open`の本体（止めて書く環境を受ける。検査は偽の命令の表を渡す）。
 fn arm_watch_scan_at_open_with(env: &mut dyn crate::hook::HookEnv) -> String {
     if crate::rollback_win::scan_hooked() {
+        // rollbackの設置が一部だけ書けた実行ではフックが未設定のままなのでここで設定する。
+        ensure_scan_handler();
         return "走査の call は書いてある（早送りが効く）".to_string();
     }
     let mut out: Vec<u8> = Vec::new();
@@ -6484,7 +6744,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         (
@@ -7058,7 +7318,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let here = &FAKE_DATA as *const _ as usize as u32;
@@ -7119,7 +7379,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let mut slot = Slot::Watch(Box::new(WatchNetSlot {
@@ -7930,7 +8190,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let wslot = Box::new(WatchNetSlot {
@@ -8022,6 +8282,264 @@ pub(crate) mod tests {
         assert!(note.starts_with("走査の call を書けなかった"), "{note}");
         assert!(f.writes.is_empty(), "文字の数の欄の頁を確かめずに書いた");
         reset();
+    }
+
+    pub(crate) static TEST_GAME_STATE: AtomicU32 = AtomicU32::new(u32::MAX);
+    pub(crate) static TEST_GAME_LOADING: AtomicU32 = AtomicU32::new(u32::MAX);
+    static FAKE_SCAN_HITS: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static TEST_PANIC_IN_BOUNDARY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    extern "thiscall" fn fake_scan_original(_this: u32) -> i32 {
+        FAKE_SCAN_HITS.fetch_add(1, Ordering::SeqCst);
+        2
+    }
+
+    #[test]
+    fn replay_playing_needs_no_session_the_replay_state_and_no_loading() {
+        let state = u32::from(higanr_core::pacing::REPLAY_PLAYING_STATE);
+        assert!(replay_playing_of(false, Some(state), Some(0)));
+        // 上位バイトは見ない（グローバル状態のビットのワード）。
+        assert!(replay_playing_of(false, Some(0x1200 | state), Some(0)));
+        assert!(
+            !replay_playing_of(true, Some(state), Some(0)),
+            "セッション中"
+        );
+        for other in [0x00, 0x04, 0x0E, 0x08, 0x8C] {
+            assert!(
+                !replay_playing_of(false, Some(other), Some(0)),
+                "{other:#x}"
+            );
+        }
+        assert!(
+            !replay_playing_of(false, Some(state), Some(1)),
+            "読み込み中"
+        );
+        assert!(!replay_playing_of(false, None, Some(0)), "状態が読めない");
+        assert!(
+            !replay_playing_of(false, Some(state), None),
+            "読み込みが読めない"
+        );
+    }
+
+    #[test]
+    fn the_replay_scan_hook_stays_out_of_the_way_unless_planned_hooked_and_session_free() {
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let extra = &crate::pacing::REPLAY_EXTRA;
+        extra.reset_for_test();
+        crate::rollback_win::set_scan_original(0);
+        FAKE_SCAN_HITS.store(0, Ordering::SeqCst);
+        TEST_GAME_STATE.store(u32::MAX, Ordering::SeqCst);
+        TEST_GAME_LOADING.store(u32::MAX, Ordering::SeqCst);
+        // 走査のcallを書いていなければ予定があっても何もしない。
+        extra.set_planned(3);
+        assert_eq!(replay_scan(7), None, "書いていないのに走査を呼んだ");
+        crate::rollback_win::set_scan_original(fake_scan_original as *const () as usize as u32);
+        // 予定が0なら素通り（対戦のゲームスレッドが通る道に足すのはこの1回の読みだけ）。
+        extra.set_planned(0);
+        assert_eq!(replay_scan(7), None);
+        assert_eq!(rb_scan_handler(7), None, "ハンドラ経由でも素通り");
+        assert_eq!(FAKE_SCAN_HITS.load(Ordering::SeqCst), 0);
+        // 予定があっても再生中と読めなければ走査は1回だけ（余分に回さない）。
+        extra.set_planned(3);
+        assert_eq!(replay_scan(7), Some(2));
+        assert_eq!(rb_scan_handler(7), Some(2), "ハンドラが断った");
+        assert_eq!(FAKE_SCAN_HITS.load(Ordering::SeqCst), 2, "1 表示 1 回");
+        assert!(!crate::rollback_play_win::resim_active(), "印が残った");
+        // 対戦・観戦のセッションがあるときは予定があっても触らない。
+        NET_ON.store(1, Ordering::SeqCst);
+        assert_eq!(replay_scan(7), None);
+        assert_eq!(rb_scan_handler(7), None);
+        NET_ON.store(0, Ordering::SeqCst);
+        assert_eq!(FAKE_SCAN_HITS.load(Ordering::SeqCst), 2);
+        extra.reset_for_test();
+        crate::rollback_win::set_scan_original(0);
+    }
+
+    #[test]
+    fn the_replay_scan_call_is_written_only_on_request_and_never_during_a_session() {
+        use crate::rollback_play::tests::FakeCode;
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = || {
+            crate::rollback_win::set_scan_original(0);
+            crate::rollback_win::set_scan_handler(None);
+            crate::pacing::REPLAY_EXTRA.reset_for_test();
+            NET_ON.store(0, Ordering::SeqCst);
+        };
+        reset();
+        // 要求が無ければ何もしない。
+        replay_scan_service();
+        assert!(!crate::rollback_win::scan_hooked());
+        // 対戦のセッションが立っているときは要求を受けても書かず、要求を戻す（後でまた要求できる）。
+        crate::pacing::REPLAY_EXTRA.request_arm();
+        NET_ON.store(1, Ordering::SeqCst);
+        replay_scan_service();
+        NET_ON.store(0, Ordering::SeqCst);
+        assert!(!crate::rollback_win::scan_hooked(), "セッション中に書いた");
+        assert!(!crate::rollback_win::scan_handler_is_set());
+        assert_eq!(crate::pacing::REPLAY_EXTRA.arm_state_for_test(), 0);
+        // 書く手順（偽の命令の表）: 1回書いて走査の包みのフックも設定する。2回目は書き足さない。
+        crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(true, Ordering::SeqCst);
+        let mut f = FakeCode::new();
+        let lines = replay_scan_arm_with(&mut f);
+        assert_eq!(f.writes.len(), 1, "{lines:?}");
+        assert!(crate::rollback_win::scan_hooked());
+        assert!(crate::rollback_win::scan_handler_is_set());
+        assert_eq!(
+            lines[0],
+            (
+                true,
+                "ペース: リプレイの高速再生のために、ゲームの更新の呼び出しを 1 か所書き換えました。"
+                    .to_string()
+            )
+        );
+        let lines = replay_scan_arm_with(&mut f);
+        assert_eq!(f.writes.len(), 1, "2 回目で書き足した");
+        assert_eq!(
+            lines,
+            vec![(
+                false,
+                "ペース: リプレイの高速再生は、書き換え済みのゲームの更新の呼び出しを使います。"
+                    .to_string()
+            )]
+        );
+        // 期待バイト列が合わなければ1バイトも書かず、簡潔にも1行残す。
+        reset();
+        let mut f = FakeCode::new();
+        f.mem.insert(crate::th09_addr::RESIM_SITES[0].addr, 0x90);
+        let lines = replay_scan_arm_with(&mut f);
+        assert!(f.writes.is_empty(), "不一致なのに書いた");
+        assert!(!crate::rollback_win::scan_hooked());
+        assert!(!crate::rollback_win::scan_handler_is_set());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            (
+                true,
+                "ペース: ゲームの更新の呼び出しの書き換え不能（不一致）。垂直同期を取るフルスクリーンでのリプレイの高速再生は無効です。"
+                    .to_string()
+            )
+        );
+        assert!(!lines[1].0, "詳細は簡潔に出さない");
+        // 文字の数のフィールドが読み書きできないページなら書かない。
+        reset();
+        crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(false, Ordering::SeqCst);
+        crate::rollback_win::TEST_OUTPUT_RANGES_NG.store(true, Ordering::SeqCst);
+        let mut f = FakeCode::new();
+        let lines = replay_scan_arm_with(&mut f);
+        crate::rollback_win::TEST_OUTPUT_RANGES_NG.store(false, Ordering::SeqCst);
+        assert!(f.writes.is_empty());
+        assert!(
+            lines[0]
+                .1
+                .contains("書き換え不能（文字の数のフィールドが書き込み不能）"),
+            "{lines:?}"
+        );
+        reset();
+    }
+
+    #[test]
+    fn an_already_written_scan_call_gets_its_handler_and_a_failed_write_leaves_nothing_behind() {
+        use crate::rollback_play::tests::FakeCode;
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = || {
+            crate::rollback_win::set_scan_original(0);
+            crate::rollback_win::set_scan_handler(None);
+            crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(false, Ordering::SeqCst);
+        };
+        reset();
+        crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(true, Ordering::SeqCst);
+        // 走査のcallは書いてあるのにフックが無い（rollbackの設置が一部だけ書けた実行など）。
+        // 高速再生の経路もルームで観戦の経路も、書かずにフックだけ設定する。
+        crate::rollback_win::set_scan_original(fake_scan_original as *const () as usize as u32);
+        assert!(!crate::rollback_win::scan_handler_is_set());
+        let mut f = FakeCode::new();
+        let lines = replay_scan_arm_with(&mut f);
+        assert!(f.writes.is_empty(), "書いてあるのに書いた");
+        assert!(
+            crate::rollback_win::scan_handler_is_set(),
+            "フックが未設定のまま「使います」と出した: {lines:?}"
+        );
+        assert_eq!(lines.len(), 1);
+        crate::rollback_win::set_scan_handler(None);
+        let note = arm_watch_scan_at_open_with(&mut f);
+        assert!(note.contains("書いてある"), "{note}");
+        assert!(f.writes.is_empty());
+        assert!(
+            crate::rollback_win::scan_handler_is_set(),
+            "ルームで観戦の経路がフックを設定しない"
+        );
+        // 書き込みに失敗したら、書く前に設定した元の飛び先を戻す（書いたと見えない）。フックも設定しない。
+        for via_open in [false, true] {
+            reset();
+            crate::rollback_win::TEST_OUTPUT_RANGES_OK.store(true, Ordering::SeqCst);
+            let mut f = FakeCode::new();
+            f.fail_write_at = Some(crate::th09_addr::RESIM_SITES[0].addr + 1);
+            if via_open {
+                let note = arm_watch_scan_at_open_with(&mut f);
+                assert!(note.starts_with("走査の call を書けなかった"), "{note}");
+            } else {
+                let lines = replay_scan_arm_with(&mut f);
+                assert!(lines[0].0 && lines[0].1.contains("書き換え不能（書き込み不能）"));
+            }
+            assert!(f.writes.is_empty());
+            assert!(
+                !crate::rollback_win::scan_hooked(),
+                "書けなかったのに書いたと見える (open {via_open})"
+            );
+            assert!(!crate::rollback_win::scan_handler_is_set());
+        }
+        reset();
+    }
+
+    #[test]
+    fn extra_updates_run_in_a_replay_and_a_panic_stops_only_the_replay_speed() {
+        let _g = REAL_HOOK_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let extra = &crate::pacing::REPLAY_EXTRA;
+        extra.reset_for_test();
+        crate::rollback_win::set_scan_original(fake_scan_original as *const () as usize as u32);
+        crate::rollback_win::set_scan_handler(Some(rb_scan_handler));
+        let state = u32::from(higanr_core::pacing::REPLAY_PLAYING_STATE);
+        TEST_GAME_STATE.store(state, Ordering::SeqCst);
+        TEST_GAME_LOADING.store(0, Ordering::SeqCst);
+        FAKE_SCAN_HITS.store(0, Ordering::SeqCst);
+        // 再生中で予定が3なら1表示で4回走査を呼ぶ。余分な3回は印が立ち、終わると印が戻る。
+        extra.set_planned(3);
+        assert_eq!(rb_scan_handler(7), Some(2));
+        assert_eq!(FAKE_SCAN_HITS.load(Ordering::SeqCst), 4);
+        assert!(!crate::rollback_play_win::resim_active(), "印が残った");
+        assert_eq!(
+            extra.take_stats().map(|s| (s.displays, s.ran)),
+            Some((1, 3))
+        );
+        // 読み込み中は1回だけ。
+        TEST_GAME_LOADING.store(1, Ordering::SeqCst);
+        FAKE_SCAN_HITS.store(0, Ordering::SeqCst);
+        assert_eq!(rb_scan_handler(7), Some(2));
+        assert_eq!(FAKE_SCAN_HITS.load(Ordering::SeqCst), 1);
+        TEST_GAME_LOADING.store(0, Ordering::SeqCst);
+        // 余分な更新の途中でパニックしてもここで受ける。最初の走査の戻り値を返し、高速再生だけを止める。
+        // 包みまで届くとフックが外れて以後のrollbackの対戦が包みを通らなくなるので、フックは残っていること。
+        FAKE_SCAN_HITS.store(0, Ordering::SeqCst);
+        TEST_PANIC_IN_BOUNDARY.store(true, Ordering::SeqCst);
+        extra.set_planned(3);
+        assert_eq!(rb_scan_handler(7), Some(2), "パニックを受けて戻り値を返す");
+        assert_eq!(
+            FAKE_SCAN_HITS.load(Ordering::SeqCst),
+            1,
+            "更新を余分に回した"
+        );
+        assert!(!crate::rollback_play_win::resim_active(), "印が残った");
+        assert_eq!(extra.planned(), 0, "止めていない");
+        extra.set_planned(3);
+        assert_eq!(extra.planned(), 0, "止めた後に予定を立てられる");
+        assert!(crate::rollback_win::scan_handler_is_set(), "フックが外れた");
+        assert_eq!(rb_scan_handler(7), None, "止めた後も走査を呼ぶ");
+        TEST_GAME_STATE.store(u32::MAX, Ordering::SeqCst);
+        TEST_GAME_LOADING.store(u32::MAX, Ordering::SeqCst);
+        extra.reset_for_test();
+        crate::rollback_win::set_scan_original(0);
+        crate::rollback_win::set_scan_handler(None);
     }
 
     #[test]
@@ -8264,7 +8782,7 @@ pub(crate) mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let word = || fake_mem::get(FAKE_STATE).unwrap();

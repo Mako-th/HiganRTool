@@ -28,7 +28,9 @@ higanr_http_win = { path = "../http_win" }
 higanr_prng_shim = { path = "../prng_shim" }
 # Win32 の宣言だけ（MIT OR Apache-2.0。dll と loader が使う）。
 # 機能は使う API の分だけ開ける。Win32_Security は CreateMutexW / CreateThread の引数の型
-# （SECURITY_ATTRIBUTES）に要る。Win32_System_Kernel は x86 の CONTEXT（GetThreadContext）の中の
+# （SECURITY_ATTRIBUTES）と、起動時のログに書く管理者の実行・VirtualStore の差し替えの有効か
+# （GetTokenInformation —— src/dll/src/win.rs の `access_info`。OpenProcessToken は Win32_System_Threading）に要る。
+# Win32_System_Kernel は x86 の CONTEXT（GetThreadContext）の中の
 # FLOATING_SAVE_AREA に、Win32_System_Diagnostics_ToolHelp はスレッドの一覧に要る（どちらも最初のフックで使う）。
 # Win32_System_Performance は QueryPerformanceCounter / QueryPerformanceFrequency（tick ごとの記録で
 # TSC の周波数を求める）に要る。

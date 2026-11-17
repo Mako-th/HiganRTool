@@ -6,6 +6,7 @@
 
 use std::io::Write;
 
+use higanr_core::ansi::Ansi;
 use higanr_core::patch::AddrRange;
 use higanr_core::pe::{Ident, IdentMismatch, check_ident};
 
@@ -86,6 +87,53 @@ pub fn system_line(os: Option<OsVersion>, sse2: bool, avx2: bool) -> String {
         None => "Windows（バージョン取得不能）".to_string(),
     };
     format!("環境: {os}\nCPU: SSE2 {}・AVX2 {}", yn(sse2), yn(avx2))
+}
+
+/// 保存先の切り分けに要る環境。取れなかった項目は`None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessInfo {
+    /// ANSIコードページの番号（`GetACP`）。
+    pub code_page: Option<u32>,
+    /// 管理者として実行しているか（トークンの`TokenElevation`）。
+    pub elevated: Option<bool>,
+    /// VirtualStoreへの差し替えが有効か（トークンの`TokenVirtualizationEnabled`）。
+    pub virtualization: Option<bool>,
+    /// ゲームのフォルダのパスにASCII以外の文字があるか。
+    pub game_dir_non_ascii: Option<bool>,
+    /// ゲームのフォルダのパスをANSIコードページで表せるか（表せないとゲームの`CreateFileA`が開けない）。
+    pub game_dir_in_ansi: Option<bool>,
+}
+
+/// ゲームのフォルダにASCII以外の文字があるか。フォルダが分からなければ`None`。
+/// パスがUTF-16として不正でも非ASCIIの文字を含む。そのため置換文字になっても真になる。
+pub fn dir_has_non_ascii(exe: Option<&std::path::Path>) -> Option<bool> {
+    let dir = exe?.parent()?;
+    Some(!dir.to_string_lossy().is_ascii())
+}
+
+/// ゲームのフォルダのパスを`ansi`で表せるか。フォルダが分からなければ`None`。
+pub fn dir_fits_ansi(exe: Option<&std::path::Path>, ansi: &dyn Ansi) -> Option<bool> {
+    let dir = exe?.parent()?;
+    Some(ansi.encode(&dir.to_string_lossy()).is_some())
+}
+
+/// 起動時のヘッダの保存先に関わる環境の2行（簡潔にも残す）。取れなかった項目は「取得不能」。
+pub fn access_line(a: &AccessInfo) -> String {
+    let yn = |b: Option<bool>, yes: &str, no: &str| match b {
+        Some(true) => yes.to_string(),
+        Some(false) => no.to_string(),
+        None => "取得不能".to_string(),
+    };
+    let code_page = a
+        .code_page
+        .map_or_else(|| "取得不能".to_string(), |c| c.to_string());
+    format!(
+        "ゲームのフォルダ名: ASCII 以外の文字 {}・ANSI（コードページ {code_page}）で表せる {}\n権限: 管理者として実行 {}・VirtualStore への差し替え {}",
+        yn(a.game_dir_non_ascii, "あり", "なし"),
+        yn(a.game_dir_in_ansi, "はい", "いいえ"),
+        yn(a.elevated, "はい", "いいえ"),
+        yn(a.virtualization, "有効", "無効"),
+    )
 }
 
 /// 照合の本体。ログの行を`out`に書く（書き込めなくても続ける）。最後の「スレッドを終える」の行は呼び出し側が書く。
@@ -230,6 +278,76 @@ pub(crate) mod tests {
             system_line(None, false, true),
             "環境: Windows（バージョン取得不能）\nCPU: SSE2 なし・AVX2 あり"
         );
+    }
+
+    #[test]
+    fn access_line_names_each_item_and_marks_the_missing_ones() {
+        let all = AccessInfo {
+            code_page: Some(936),
+            elevated: Some(false),
+            virtualization: Some(true),
+            game_dir_non_ascii: Some(true),
+            game_dir_in_ansi: Some(false),
+        };
+        assert_eq!(
+            access_line(&all),
+            "ゲームのフォルダ名: ASCII 以外の文字 あり・ANSI（コードページ 936）で表せる いいえ\n権限: 管理者として実行 いいえ・VirtualStore への差し替え 有効"
+        );
+        let flipped = AccessInfo {
+            elevated: Some(true),
+            virtualization: Some(false),
+            game_dir_non_ascii: Some(false),
+            game_dir_in_ansi: Some(true),
+            ..all
+        };
+        assert_eq!(
+            access_line(&flipped),
+            "ゲームのフォルダ名: ASCII 以外の文字 なし・ANSI（コードページ 936）で表せる はい\n権限: 管理者として実行 はい・VirtualStore への差し替え 無効"
+        );
+        // 取れなかった項目は既定値（なし・いいえ）にせず「取得不能」と出す。
+        let none = AccessInfo {
+            code_page: None,
+            elevated: None,
+            virtualization: None,
+            game_dir_non_ascii: None,
+            game_dir_in_ansi: None,
+        };
+        let line = access_line(&none);
+        assert_eq!(line.matches("取得不能").count(), 5, "{line}");
+        assert!(!line.contains("あり") && !line.contains("なし"), "{line}");
+        assert!(!line.contains("はい") && !line.contains("いいえ"), "{line}");
+        assert!(!line.contains("有効") && !line.contains("無効"), "{line}");
+    }
+
+    /// ANSIで表せるかは親のフォルダのパスで決める（exe名は数えない）。分からなければ`None`。
+    #[test]
+    fn game_dir_fits_ansi_depends_on_the_code_page() {
+        use higanr_core::ansi::EncodingAnsi;
+        use std::path::Path;
+        let sj = EncodingAnsi::shift_jis();
+        let gb = EncodingAnsi::gbk();
+        let f = |p: &str, a: &dyn Ansi| dir_fits_ansi(Some(Path::new(p)), a);
+        assert_eq!(f(r"C:\Synthetic\Game\th09.exe", &sj), Some(true));
+        assert_eq!(f(r"C:\Synthetic\ゲーム\th09.exe", &sj), Some(true));
+        assert_eq!(f(r"C:\Synthetic\戏\th09.exe", &sj), Some(false));
+        assert_eq!(f(r"C:\Synthetic\戏\th09.exe", &gb), Some(true));
+        assert_eq!(f(r"C:\Synthetic\😀\th09.exe", &gb), Some(false));
+        assert_eq!(f(r"C:\Synthetic\Game\戏.exe", &sj), Some(true));
+        assert_eq!(dir_fits_ansi(None, &sj), None);
+        assert_eq!(f("", &sj), None);
+    }
+
+    /// パスそのものは出さず、親のフォルダだけを見る（exe名の文字は数えない）。
+    #[test]
+    fn game_dir_non_ascii_looks_at_the_folder_not_the_exe_name() {
+        use std::path::Path;
+        let d = |p: &str| dir_has_non_ascii(Some(Path::new(p)));
+        assert_eq!(d(r"C:\Synthetic\Game\th09.exe"), Some(false));
+        assert_eq!(d(r"C:\Synthetic\ゲーム\th09.exe"), Some(true));
+        assert_eq!(d(r"C:\Synthetic\游戏\th09.exe"), Some(true));
+        assert_eq!(d(r"C:\Synthetic\Game\花映塚.exe"), Some(false));
+        assert_eq!(dir_has_non_ascii(None), None);
+        assert_eq!(d(""), None);
     }
 
     pub(crate) struct Fake {

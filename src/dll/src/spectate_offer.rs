@@ -554,7 +554,6 @@ pub fn arm(
 }
 
 impl OfferKit {
-    #[cfg(test)]
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
@@ -791,7 +790,7 @@ impl Runner {
                     l.fails = l.fails.saturating_add(1);
                     // 件数の上限（全体・1 IPあたり）は入り直しても変わらない。429はサーバーに指定された秒数の後。
                     match f {
-                        Failure::RoomFull => l.gave_up = true,
+                        Failure::RoomFull | Failure::ListFull => l.gave_up = true,
                         Failure::RateLimited { retry_after_secs } => {
                             l.retry_at_ms = now_ms + u64::from(retry_after_secs) * 1000;
                         }
@@ -878,7 +877,7 @@ impl Runner {
                 self.stats().bump(match f {
                     Failure::Expired => Stat::FailExpired,
                     Failure::PeerLeft => Stat::FailPeerLeft,
-                    Failure::RoomFull | Failure::RoomInUse => Stat::FailFull,
+                    Failure::RoomFull | Failure::ListFull | Failure::RoomInUse => Stat::FailFull,
                     Failure::RateLimited { .. } => Stat::FailRate,
                     // 4403は観戦者にしか来ない筋。来たら応答しない扱い（`Caster`も同じ）。
                     Failure::Unresponsive(_) | Failure::Refused => Stat::FailUnresponsive,
@@ -975,7 +974,7 @@ impl Runner {
 }
 
 /// 一覧へ入り直すまでの間隔（失敗が続くほど倍々。上限5分）。
-fn relist_delay(fails: u32) -> u64 {
+pub(crate) fn relist_delay(fails: u32) -> u64 {
     RELIST_FIRST_MS
         .saturating_mul(1u64 << fails.saturating_sub(1).min(4))
         .min(RELIST_MAX_MS)

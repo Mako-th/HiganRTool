@@ -357,7 +357,7 @@ impl Caster {
             Failure::Expired => self.wait(now, CASTER_EXPIRED_MS, WaitReason::Expired),
             Failure::PeerLeft => self.wait(now, CASTER_PEER_LEFT_MS, WaitReason::PeerLeft),
             // room_in_useは対戦のルームにだけ返る。観戦用のルームに来たら満員と同じに待つ。
-            Failure::RoomFull | Failure::RoomInUse => {
+            Failure::RoomFull | Failure::ListFull | Failure::RoomInUse => {
                 self.wait(now, CASTER_ROOM_FULL_MS, WaitReason::RoomFull)
             }
             Failure::RateLimited { retry_after_secs } => self.wait(
@@ -574,7 +574,7 @@ impl Joiner {
                 retry_after_ms(retry_after_secs),
                 WaitReason::RateLimited { retry_after_secs },
             ),
-            Failure::RoomFull | Failure::RoomInUse => {
+            Failure::RoomFull | Failure::ListFull | Failure::RoomInUse => {
                 self.wait(now, JOINER_RETRY_MS, WaitReason::RoomFull)
             }
             Failure::Expired => self.wait(now, JOINER_RETRY_MS, WaitReason::Expired),

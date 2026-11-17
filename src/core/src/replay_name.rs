@@ -1,5 +1,5 @@
 //! 自動保存のリプレイのファイル名のテンプレート（`HiganRTool.ini`の`[replay] name`）。
-//! 解析・展開・使える文字・長さ・重複のときの名前を決める（pure。ファイルには触らない）。
+//! 解析・展開・使えない文字の置き換え・長さ・重複時の名前を決める（pure。ファイルには触らない）。
 //! キャラ・ラウンド数・勝者は書き終えたリプレイのバイト列から読む（`read_file_facts`）。
 
 #![forbid(unsafe_code)]
@@ -7,15 +7,14 @@
 use crate::replay::{MarkRead, MarkRole, MatchResult, Side, Timestamp, read_mark};
 use crate::replay_decode::decode_inputs;
 use crate::replay_detail::{RoundRec, SyncKind, Winner};
+use crate::replay_name_limit::{NameLimit, is_cut_length};
 use crate::vault::is_reserved_stem;
 
 /// 既定のテンプレート。予約の名前（`th9_udNNNN`）と同じになるので名前は変えない。
 pub const DEFAULT_TEMPLATE: &str = "th9_ud{num}";
-/// 展開後の名前（`.rpy`を除く）の文字数の上限。
-pub const NAME_LIMIT: usize = 100;
 /// 重複のときに`_2`〜`_N`を試す上限。
 pub const DUP_LIMIT: u32 = 999;
-const EXT: &str = ".rpy";
+pub(crate) const EXT: &str = ".rpy";
 /// 枠9はMatch（`replay_decode`）。
 const MATCH_SLOT: u8 = 9;
 
@@ -29,18 +28,24 @@ pub fn character_name(id: u8) -> Option<&'static str> {
     CHARACTERS.get(usize::from(id)).copied()
 }
 
-/// 名前に使える文字: 半角英数字と`- _ . ( ) [ ] +`と半角スペース。
-pub fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '(' | ')' | '[' | ']' | '+' | ' ')
+/// Windowsのファイル名に使えない文字（`\ / : * ? " < > |`と制御文字）。名前ではこの文字を`-`に置き換える。
+/// 使える文字を並べる方式にすると日本語や記号が全部断られる。そのため使えない文字の一覧で決める。
+fn is_forbidden_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+}
+
+/// 名前の1文字。使えない文字は`-`にする（テンプレートの文字と`{1Pname}`などの値に同じ式を使う）。
+fn usable_char(c: char) -> char {
+    if is_forbidden_char(c) { '-' } else { c }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameError {
     UnknownPlaceholder(String),
     Unclosed,
-    BadChar(char),
+    /// 対応する`{`の無い`}`。`{num}}`のような書き間違いを名前に入れないため断る。
+    StrayClose,
     Empty,
-    TooLong(usize),
     Reserved,
     /// 展開に要る値をリプレイから読み取れない（置き換えの名前）。名前は変えない。
     Unreadable(&'static str),
@@ -59,12 +64,8 @@ impl NameError {
                 format!("不明な置き換え {{{shown}}}")
             }
             NameError::Unclosed => "閉じていない {".to_string(),
-            NameError::BadChar(c) if c.is_control() => {
-                format!("使用不可の文字 U+{:04X}", u32::from(*c))
-            }
-            NameError::BadChar(c) => format!("使用不可の文字 {c}"),
+            NameError::StrayClose => "対応する { の無い }".to_string(),
             NameError::Empty => "名前が空".to_string(),
-            NameError::TooLong(n) => format!("{n} 文字の名前（上限 {NAME_LIMIT}）"),
             NameError::Reserved => "Windows の予約名".to_string(),
             NameError::Unreadable(what) => format!("{{{what}}} をリプレイから読めない"),
         }
@@ -219,6 +220,27 @@ fn strip_ext(s: &str) -> &str {
     }
 }
 
+/// 予約の名前の判定に使う形。上付きの¹²³を数字に直す。`COM¹`などはWindowsでCOM1などと同じ予約の名前になる（推定。未確認）。
+fn reserved_form(stem: &str) -> String {
+    stem.chars()
+        .map(|c| match c {
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            c => c,
+        })
+        .collect()
+}
+
+/// 名前（`.rpy`を除く）の最初の`.`の前がWindowsの予約の名前なら`Reserved`。
+pub(crate) fn check_reserved(name: &str) -> Result<(), NameError> {
+    let stem_end = name.find('.').unwrap_or(name.len());
+    if is_reserved_stem(&reserved_form(name[..stem_end].trim_end_matches(' '))) {
+        return Err(NameError::Reserved);
+    }
+    Ok(())
+}
+
 impl Template {
     /// `raw`はiniの値（前後の空白はiniの読み手が除去済み）。末尾の`.rpy`は付けても付けなくても同じ。
     pub fn parse(raw: &str) -> Result<Template, NameError> {
@@ -246,10 +268,10 @@ impl Template {
                 rest = &after[end + 1..];
                 continue;
             }
-            if !is_name_char(c) {
-                return Err(NameError::BadChar(c));
+            if c == '}' {
+                return Err(NameError::StrayClose);
             }
-            lit.push(c);
+            lit.push(usable_char(c));
             rest = &rest[c.len_utf8()..];
         }
         if !lit.is_empty() {
@@ -275,24 +297,34 @@ impl Template {
         self.holes().any(Placeholder::needs_file)
     }
 
-    /// 展開した名前（`.rpy`を除く）。長さと予約名もここで見る。
+    /// 展開した名前（`.rpy`を除く）。長さは見ない（`replay_name_limit::fit`が保存先に合わせて切る）。予約の名前はここで見る。
     pub fn expand(&self, f: &Facts) -> Result<String, NameError> {
+        self.expand_spans(f).map(|(name, _)| name)
+    }
+
+    /// `expand`と同じ名前と、そのうち`{1Pname}`・`{2Pname}`が入った範囲。
+    pub fn expand_spans(&self, f: &Facts) -> Result<(String, Vec<NameSpan>), NameError> {
         let mut out = String::new();
+        let mut len = 0;
+        let mut spans = Vec::new();
         for p in &self.pieces {
-            match p {
-                Piece::Lit(s) => out.push_str(s),
-                Piece::Hole(h) => out.push_str(&hole_text(*h, f)?),
+            let text = match p {
+                Piece::Lit(s) => s.clone(),
+                Piece::Hole(h) => hole_text(*h, f)?,
+            };
+            let n = text.chars().count();
+            if let Piece::Hole(Placeholder::Name(side)) = p {
+                spans.push(NameSpan {
+                    side: *side,
+                    start: len,
+                    end: len + n,
+                });
             }
+            out.push_str(&text);
+            len += n;
         }
-        let n = out.chars().count();
-        if n > NAME_LIMIT {
-            return Err(NameError::TooLong(n));
-        }
-        let stem_end = out.find('.').unwrap_or(out.len());
-        if is_reserved_stem(out[..stem_end].trim_end_matches(' ')) {
-            return Err(NameError::Reserved);
-        }
-        Ok(out)
+        check_reserved(&out)?;
+        Ok((out, spans))
     }
 
     /// 既定の`th9_ud{num}`（大文字小文字違いも）かどうか。予約の名前と同じになるので付け替えない。
@@ -304,11 +336,16 @@ impl Template {
     }
 
     /// 既存のファイル名`file_name`がこのテンプレートで作られた名前ならその`{num}`。
-    /// `{num}`は4桁の数字。ほかの置き換えは`expand`が作る形（`shape_lens`。名前だけは使える文字の1文字以上）に当てる。
-    /// 文字の部分は大文字小文字を区別せずに当てる。
+    /// `{num}`は4桁の数字。ほかの置き換えは`expand`が作る形（`shape_lens`。名前は使えない文字以外の1文字以上）に当てる。
+    /// 文字の部分は大文字小文字を区別せずに当てる。長さで切られた名前は当たらない（`number_in_within`）。
     /// `{num}`が2回あれば同じ番号でなければ外れ。重複で付く`_2`などの末尾も許す。
     /// 当たり方が複数あって番号が割れるとき、または試す回数が上限を越えたときは`None`（別の番号に読み違えるより数えない）。
     pub fn number_in(&self, file_name: &str) -> Option<u16> {
+        self.number_in_within(file_name, None)
+    }
+
+    /// `number_in`と同じ。`limit`があればその上限の長さで切られた名前は`{num}`より後ろが欠けていても番号を読む。
+    pub fn number_in_within(&self, file_name: &str, limit: Option<&NameLimit>) -> Option<u16> {
         if !self.has_num() {
             return None;
         }
@@ -316,28 +353,38 @@ impl Template {
         if stem.len() == file_name.len() {
             return None;
         }
+        let dup = stem
+            .rsplit_once('_')
+            .filter(|(_, t)| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(head, _)| head);
         let mut m = Matcher::new(&self.pieces);
-        match m.run(stem) {
-            Run::Found(n) => return Some(n),
-            Run::Failed => return None,
-            Run::NoMatch => {}
+        let mut tries = vec![(stem, false)];
+        tries.extend(dup.map(|h| (h, false)));
+        if let Some(l) = limit {
+            tries.extend(
+                [Some(stem), dup]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| is_cut_length(s, l))
+                    .map(|s| (s, true)),
+            );
         }
-        let (head, tail) = stem.rsplit_once('_')?;
-        if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+        for (s, cut) in tries {
+            match m.run(s, cut) {
+                Run::Found(n) => return Some(n),
+                Run::Failed => return None,
+                Run::NoMatch => {}
+            }
         }
-        match m.run(head) {
-            Run::Found(n) => Some(n),
-            Run::Failed | Run::NoMatch => None,
-        }
+        None
     }
 
     /// 起動の直後にフォルダの既存の名前から次の予約の番号の下限（当たった最大の `{num}` + 1）を求める。
-    /// `{num}`を含まないテンプレートや当たる名前が無いときは`None`。
-    pub fn next_floor<S: AsRef<str>>(&self, names: &[S]) -> Option<u16> {
+    /// `limit`はそのフォルダの名前の上限（`number_in_within`）。`{num}`を含まないテンプレートや当たる名前が無いときは`None`。
+    pub fn next_floor<S: AsRef<str>>(&self, names: &[S], limit: Option<&NameLimit>) -> Option<u16> {
         names
             .iter()
-            .filter_map(|n| self.number_in(n.as_ref()))
+            .filter_map(|n| self.number_in_within(n.as_ref(), limit))
             .max()
             .map(|m| m.saturating_add(1))
     }
@@ -358,6 +405,8 @@ struct Matcher<'a> {
     budget: u32,
     found: Option<u16>,
     failed: bool,
+    /// 名前が後ろで切られている。`{num}`を読んだ後は途中で尽きても当たりにする。
+    cut: bool,
 }
 
 impl<'a> Matcher<'a> {
@@ -367,14 +416,16 @@ impl<'a> Matcher<'a> {
             budget: MATCH_BUDGET,
             found: None,
             failed: false,
+            cut: false,
         }
     }
 
     /// 当たり方を全部たどり、番号が1つに決まるかを見る。
-    fn run(&mut self, s: &str) -> Run {
+    fn run(&mut self, s: &str, cut: bool) -> Run {
         self.budget = MATCH_BUDGET;
         self.found = None;
         self.failed = false;
+        self.cut = cut;
         self.go(0, s, None);
         match (self.failed, self.found) {
             (true, _) => Run::Failed,
@@ -384,18 +435,31 @@ impl<'a> Matcher<'a> {
     }
 
     fn go(&mut self, pi: usize, s: &str, num: Option<u16>) {
-        let Some(piece) = self.pieces.get(pi) else {
-            if let (true, Some(n)) = (s.is_empty(), num) {
-                match self.found {
-                    Some(f) if f != n => self.failed = true,
-                    _ => self.found = Some(n),
+        let piece = match self.pieces.get(pi) {
+            Some(p) if !(self.cut && s.is_empty()) => p,
+            _ => {
+                if let (true, Some(n)) = (s.is_empty(), num) {
+                    match self.found {
+                        Some(f) if f != n => self.failed = true,
+                        _ => self.found = Some(n),
+                    }
                 }
+                return;
             }
-            return;
         };
+        // 切られた名前の最後の欠片。`{num}`を読んだ後なら残りを全部この欠片の頭として当てる。
+        let cut_tail = self.cut && num.is_some();
         match piece {
             Piece::Lit(l) => {
                 let n = l.len();
+                if cut_tail
+                    && s.len() < n
+                    && l.is_char_boundary(s.len())
+                    && l[..s.len()].eq_ignore_ascii_case(s)
+                {
+                    self.go(pi + 1, "", num);
+                    return;
+                }
                 if s.len() < n || !s.is_char_boundary(n) || !s[..n].eq_ignore_ascii_case(l) {
                     return;
                 }
@@ -403,6 +467,9 @@ impl<'a> Matcher<'a> {
             }
             Piece::Hole(Placeholder::Num) => {
                 let Some(d) = s.as_bytes().get(..4) else {
+                    if cut_tail && s.bytes().all(|b| b.is_ascii_digit()) {
+                        self.go(pi + 1, "", num);
+                    }
                     return;
                 };
                 if !d.iter().all(u8::is_ascii_digit) {
@@ -417,7 +484,11 @@ impl<'a> Matcher<'a> {
                 self.go(pi + 1, &s[4..], Some(n));
             }
             Piece::Hole(h) => {
-                for len in shape_lens(*h, s) {
+                let mut lens = shape_lens(*h, s);
+                if cut_tail && !lens.contains(&s.len()) {
+                    lens.push(s.len());
+                }
+                for len in lens {
                     if self.failed {
                         return;
                     }
@@ -517,7 +588,7 @@ fn joined_lens(s: &str, pos: usize, item: fn(&str) -> Vec<usize>, out: &mut Vec<
 }
 
 /// 置き換え`h`が`s`の先頭に当たる長さ（バイト）の全部。形は`hole_text`が作る値と合わせる。
-/// 名前だけは使える文字の1文字以上なら何でも当たる。
+/// 名前は使えない文字以外の1文字以上なら何でも当たる。
 fn shape_lens(h: Placeholder, s: &str) -> Vec<usize> {
     match h {
         Placeholder::Num => Vec::new(),
@@ -526,7 +597,7 @@ fn shape_lens(h: Placeholder, s: &str) -> Vec<usize> {
         Placeholder::Chara(_) => word_lens(s, &CHARACTERS),
         Placeholder::Name(_) => s
             .char_indices()
-            .take_while(|&(_, c)| is_name_char(c))
+            .take_while(|&(_, c)| !is_forbidden_char(c))
             .map(|(i, c)| i + c.len_utf8())
             .collect(),
         Placeholder::Round => count_lens(s),
@@ -570,12 +641,9 @@ fn clock(frames: u64) -> String {
     format!("{}m{:02}s", secs / 60, secs % 60)
 }
 
-/// プレイヤー名を名前に使える文字だけにする。使えない文字は`-`、空なら`-`。
+/// プレイヤー名を名前に使える形にする。使えない文字は`-`、空なら`-`。
 fn clean_player_name(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if is_name_char(c) { c } else { '-' })
-        .collect();
+    let s: String = name.chars().map(usable_char).collect();
     if s.is_empty() { "-".to_string() } else { s }
 }
 
@@ -660,12 +728,52 @@ fn hole_text(h: Placeholder, f: &Facts) -> Result<String, NameError> {
 }
 
 /// `base`の`k`番目の候補のファイル名。1番目は`<base>.rpy`、2番目からは`<base>_<k>.rpy`。
+/// `base`の末尾が空白か`.`でも`.rpy`が付くので、Windowsは末尾の空白と`.`を落とさない。
 pub fn candidate_file(base: &str, k: u32) -> String {
     if k <= 1 {
         format!("{base}{EXT}")
     } else {
         format!("{base}_{k}{EXT}")
     }
+}
+
+/// 展開した名前の中で`{1Pname}`・`{2Pname}`が入った範囲（`start..end`は文字単位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameSpan {
+    pub side: Side,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// 本ログ用にファイル名`file_name`のうち展開時に名前が入った範囲を`<1P の名前>`・`<2P の名前>`に置き換える。
+/// `kept`は上限で切った後に残った文字数。切られた範囲は残った分だけを置き換える。
+/// 範囲は展開した名前の先頭からの位置なので、後ろに付く`_2`や`.rpy`は動かさない。
+pub fn mask_spans(file_name: &str, spans: &[NameSpan], kept: usize) -> String {
+    let chars: Vec<char> = file_name.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut ordered: Vec<NameSpan> = spans
+        .iter()
+        .map(|s| NameSpan {
+            end: s.end.min(kept),
+            ..*s
+        })
+        .filter(|s| s.start < s.end && s.start < chars.len())
+        .collect();
+    ordered.sort_by_key(|s| s.start);
+    for s in ordered {
+        if s.start < i {
+            continue;
+        }
+        out.extend(&chars[i..s.start]);
+        out.push_str(match s.side {
+            Side::P1 => "<1P の名前>",
+            Side::P2 => "<2P の名前>",
+        });
+        i = s.end.min(chars.len());
+    }
+    out.extend(&chars[i..]);
+    out
 }
 
 /// 印の結果とサイドから求めるマッチの勝者（引き分け・途中終了は決まらない）。
@@ -832,39 +940,42 @@ mod tests {
 
     #[test]
     fn a_syntax_error_names_its_reason() {
-        let cases: [(&str, &str); 6] = [
+        let cases: [(&str, &str); 5] = [
             ("a{foo}", "不明な置き換え {foo}"),
             ("a{}", "不明な置き換え {}"),
             ("a{num", "閉じていない {"),
             ("a{n{num}", "閉じていない {"),
-            ("a:b", "使用不可の文字 :"),
-            ("a}b", "使用不可の文字 }"),
+            ("a}b", "対応する { の無い }"),
         ];
         for (t, why) in cases {
             assert_eq!(Template::parse(t).unwrap_err().reason(), why, "{t}");
         }
         assert_eq!(
-            Template::parse("日本語").unwrap_err(),
-            NameError::BadChar('日')
-        );
-        assert_eq!(
-            Template::parse("a\tb").unwrap_err().reason(),
-            "使用不可の文字 U+0009"
+            Template::parse("a{num}}").unwrap_err(),
+            NameError::StrayClose
         );
     }
 
     #[test]
-    fn every_allowed_literal_character_is_accepted() {
+    fn characters_that_a_file_name_can_hold_are_kept_as_written() {
         let f = facts(None);
-        let all = "azAZ09-_.()[]+ x";
-        assert_eq!(expand(all, &f).as_deref(), Ok(all));
+        for t in ["azAZ09-_.()[]+ x", "a,b;c=d&e%f~!@#$^`'", "日本語", "😀"] {
+            assert_eq!(expand(t, &f).as_deref(), Ok(t), "{t}");
+        }
+    }
+
+    /// `\ / : * ? " < > |`と制御文字は`-`になる。テンプレートの文字と`{1Pname}`の値のどちらも。
+    #[test]
+    fn windows_forbidden_characters_and_controls_become_a_hyphen() {
+        let f = facts(None);
         for c in [
-            '\\', '/', ':', '*', '?', '"', '<', '>', '|', ',', ';', '=', '&', '%',
+            '\\', '/', ':', '*', '?', '"', '<', '>', '|', '\t', '\0', '\u{7f}', '\u{9f}',
         ] {
-            assert_eq!(
-                Template::parse(&format!("a{c}")).unwrap_err(),
-                NameError::BadChar(c)
-            );
+            assert_eq!(expand(&format!("a{c}b"), &f).as_deref(), Ok("a-b"), "{c:?}");
+            let mut m = play_mark();
+            m.side = Side::P1;
+            m.self_name = format!("a{c}b");
+            assert_eq!(name_for("{1Pname}", &m).as_deref(), Ok("a-b"), "{c:?}");
         }
     }
 
@@ -903,25 +1014,70 @@ mod tests {
     }
 
     #[test]
-    fn the_expanded_name_is_at_most_100_characters() {
+    fn the_expanded_name_is_not_cut_here() {
         let f = facts(None);
-        let hundred = "a".repeat(100);
-        assert_eq!(expand(&hundred, &f).as_deref(), Ok(hundred.as_str()));
-        let long = "a".repeat(97) + "{num}";
-        assert_eq!(expand(&long, &f), Err(NameError::TooLong(101)));
-        assert_eq!(
-            NameError::TooLong(101).reason(),
-            "101 文字の名前（上限 100）"
-        );
+        let long = "a".repeat(300) + "{num}";
+        let want = "a".repeat(300) + "0007";
+        assert_eq!(expand(&long, &f).as_deref(), Ok(want.as_str()));
     }
 
     #[test]
     fn windows_reserved_names_are_refused() {
         let f = facts(None);
-        for t in ["con", "NUL", "com1", "Lpt9.x", "aux "] {
+        for t in [
+            "con", "NUL", "com1", "Lpt9.x", "aux ", "COM¹", "lpt³.x", "COM²",
+        ] {
             assert_eq!(expand(t, &f), Err(NameError::Reserved), "{t}");
         }
         assert!(expand("con1", &f).is_ok());
+        assert!(expand("COM⁴", &f).is_ok(), "上付きの4は予約にしない");
+        assert_eq!(
+            expand(&format!("con.{}", "a".repeat(99)), &f),
+            Err(NameError::Reserved)
+        );
+        assert_eq!(check_reserved("con  "), Err(NameError::Reserved));
+        assert_eq!(check_reserved("con x"), Ok(()));
+    }
+
+    #[test]
+    fn a_trailing_space_or_dot_stays_in_front_of_the_rpy() {
+        let f = facts(None);
+        for (t, want) in [("a ", "a .rpy"), ("b.", "b..rpy"), ("c. ", "c. .rpy")] {
+            let stem = expand(t, &f).unwrap();
+            assert_eq!(candidate_file(&stem, 1), want, "{t}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_names_are_kept_and_their_number_is_read_back() {
+        let f = facts(None);
+        assert_eq!(expand("日本語{num}", &f).as_deref(), Ok("日本語0007"));
+        assert_eq!(number_in("{1Pname}{num}", "日本語0007.rpy"), Some(7));
+        assert_eq!(number_in("{1Pname}{num}", "😀0007.rpy"), Some(7));
+        assert_eq!(number_in("{num}{1Pname}", "0007é.rpy"), Some(7));
+        assert_eq!(
+            number_in("{1Pname}{num}", &format!("{}0007.rpy", "日".repeat(30))),
+            Some(7)
+        );
+        // 2つの`{1Pname}`の切り方は1通りだけ番号が1になる。
+        assert_eq!(
+            number_in("{1Pname}{num}{2Pname}", "日0001本0002.rpy"),
+            Some(1)
+        );
+        assert_eq!(number_in("{num}", "日0001.rpy"), None);
+    }
+
+    /// `expand`は使えない文字を`-`にする。そのため使えない文字を含む名前はこのテンプレートで作られたものではない。
+    #[test]
+    fn a_name_with_a_forbidden_character_is_not_read_back() {
+        assert_eq!(number_in("{1Pname}{num}", "a-b0007.rpy"), Some(7));
+        for c in ['\\', ':', '*', '?', '"', '<', '>', '|', '\t'] {
+            assert_eq!(
+                number_in("{1Pname}{num}", &format!("a{c}b0007.rpy")),
+                None,
+                "{c:?}"
+            );
+        }
     }
 
     fn number_in(t: &str, name: &str) -> Option<u16> {
@@ -980,11 +1136,14 @@ mod tests {
             "readme.txt",
             "th9_ud0100.rpy",
         ];
-        assert_eq!(t.next_floor(&names), Some(10));
-        assert_eq!(t.next_floor(&["0004-b.rpy"]), None);
-        assert_eq!(t.next_floor::<&str>(&[]), None);
-        assert_eq!(Template::parse("x").unwrap().next_floor(&["x.rpy"]), None);
-        assert_eq!(t.next_floor(&["9999-a.rpy"]), Some(10_000));
+        assert_eq!(t.next_floor(&names, None), Some(10));
+        assert_eq!(t.next_floor(&["0004-b.rpy"], None), None);
+        assert_eq!(t.next_floor::<&str>(&[], None), None);
+        assert_eq!(
+            Template::parse("x").unwrap().next_floor(&["x.rpy"], None),
+            None
+        );
+        assert_eq!(t.next_floor(&["9999-a.rpy"], None), Some(10_000));
     }
 
     #[test]
@@ -1173,9 +1332,8 @@ mod tests {
         })
     }
 
-    /// 1つの置き換えを含むテンプレートで作った名前を`number_in`が読み戻せる。
-    #[test]
-    fn every_placeholder_is_read_back_from_what_expand_makes() {
+    /// 置き換えの値の形が違う印のグループ（16ラウンド・読めない値・使えない文字・観戦・delay）。
+    fn sample_marks() -> [Mark; 6] {
         let mut sixteen = play_mark();
         sixteen.detail.as_mut().unwrap().rounds = (0..16)
             .map(|i| rec(600 * (i + 1), Winner::P2, [Some(i), Some(0)]))
@@ -1198,12 +1356,19 @@ mod tests {
         let mut delay = play_mark();
         delay.detail.as_mut().unwrap().sync = Some(SyncKind::Delay);
         delay.result = MatchResult::Draw;
-        let marks = [play_mark(), sixteen, unknown, odd_names, watch, delay];
-        let names = [
-            "date", "1Pchara", "2Pchara", "1Pname", "2Pname", "round", "winner", "wins", "time",
-            "length", "rlengths", "rlifes", "sync", "delay", "ping", "side", "result",
-        ];
-        for p in names {
+        [play_mark(), sixteen, unknown, odd_names, watch, delay]
+    }
+
+    const PLACEHOLDERS: [&str; 17] = [
+        "date", "1Pchara", "2Pchara", "1Pname", "2Pname", "round", "winner", "wins", "time",
+        "length", "rlengths", "rlifes", "sync", "delay", "ping", "side", "result",
+    ];
+
+    /// 1つの置き換えを含むテンプレートで作った名前を`number_in`が読み戻せる。
+    #[test]
+    fn every_placeholder_is_read_back_from_what_expand_makes() {
+        let marks = sample_marks();
+        for p in PLACEHOLDERS {
             let mut made = 0;
             for form in [
                 "{P}-{num}",
@@ -1225,6 +1390,108 @@ mod tests {
             }
             assert!(made >= 20, "{p}: 作れた名前が {made} 本しかない");
         }
+    }
+
+    fn limit(units: usize, bytes: Option<usize>) -> NameLimit {
+        NameLimit {
+            units,
+            bytes,
+            dir_units: 0,
+            virtual_counted: false,
+        }
+    }
+
+    /// `{num}`より後ろのどこで切られても、切った上限を渡せば番号を読み戻せる（Windowsの文字数とWineのバイト数）。
+    #[test]
+    fn a_name_cut_after_its_number_is_read_back_with_the_limit() {
+        use crate::replay_name_limit::fit;
+        let marks = sample_marks();
+        let (mut cuts, mut missed_without_limit) = (0, 0);
+        for p in PLACEHOLDERS {
+            for (form, head) in [
+                ("{num}-{P}", "{num}"),
+                ("{num}{P}", "{num}"),
+                ("x{P}y{num}-{P}z", "x{P}y{num}"),
+            ] {
+                let t = form.replace("{P}", &format!("{{{p}}}"));
+                let h = head.replace("{P}", &format!("{{{p}}}"));
+                for m in &marks {
+                    let (Ok(stem), Ok(head)) = (name_with_num(&t, m, 42), name_with_num(&h, m, 42))
+                    else {
+                        continue;
+                    };
+                    let units = stem.encode_utf16().count();
+                    let head_units = head.encode_utf16().count();
+                    let windows = (head_units..units).map(|k| limit(k, None));
+                    let wine = (head.len()..stem.len()).map(|b| limit(1000, Some(b)));
+                    for l in windows.chain(wine) {
+                        let Ok(f) = fit(&stem, &l) else {
+                            continue;
+                        };
+                        if f.cut_from.is_none() {
+                            continue;
+                        }
+                        cuts += 1;
+                        for file in [candidate_file(&f.name, 1), candidate_file(&f.name, 2)] {
+                            let tpl = Template::parse(&t).unwrap();
+                            assert_eq!(
+                                tpl.number_in_within(&file, Some(&l)),
+                                Some(42),
+                                "{t} / {file} / {l:?}"
+                            );
+                            if tpl.number_in(&file).is_none() {
+                                missed_without_limit += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cuts >= 1000, "切った名前が {cuts} 本しかない");
+        assert!(missed_without_limit > 0, "上限なしでも全部読めている");
+    }
+
+    #[test]
+    fn a_cut_name_still_has_to_match_up_to_its_number() {
+        let t = |s: &str| Template::parse(s).unwrap();
+        let at9 = limit(9, None);
+        assert_eq!(
+            t("{num}-{date}").number_in_within("0042-2026.rpy", Some(&at9)),
+            Some(42)
+        );
+        assert_eq!(
+            t("{num}-{date}").number_in_within("0042-2026.rpy", Some(&limit(100, None))),
+            None,
+            "上限より短い名前は切られていない"
+        );
+        assert_eq!(
+            t("x{num}-{date}").number_in_within("y0042-202.rpy", Some(&at9)),
+            None,
+            "番号の前が違う"
+        );
+        assert_eq!(
+            t("{num}-{date}").number_in_within("0042x2026.rpy", Some(&at9)),
+            None,
+            "番号の直後の文字が違う"
+        );
+        assert_eq!(
+            t("x{num}").number_in_within("x004.rpy", Some(&limit(4, None))),
+            None,
+            "番号が欠けている"
+        );
+        assert_eq!(
+            t("{num}-{num}").number_in_within("0005-00.rpy", Some(&limit(7, None))),
+            Some(5)
+        );
+        assert_eq!(
+            t("{num}-{num}-a").number_in_within("0005-0006-.rpy", Some(&limit(10, None))),
+            None,
+            "2つ目の番号が違う"
+        );
+        assert_eq!(
+            t("{num}-{date}").next_floor(&["0042-2026.rpy", "0007-20261028.rpy"], Some(&at9)),
+            Some(43)
+        );
     }
 
     #[test]
@@ -1267,7 +1534,7 @@ mod tests {
         );
         m.self_name = "日本語".to_string();
         m.peer = "A:b/c (1)_x".to_string();
-        assert_eq!(name_for("{1Pname}", &m).as_deref(), Ok("---"));
+        assert_eq!(name_for("{1Pname}", &m).as_deref(), Ok("日本語"));
         assert_eq!(name_for("{2Pname}", &m).as_deref(), Ok("A-b-c (1)_x"));
         m.peer = String::new();
         assert_eq!(name_for("{2Pname}", &m).as_deref(), Ok("-"), "空は -");
@@ -1388,16 +1655,18 @@ mod tests {
     }
 
     #[test]
-    fn a_name_over_100_characters_is_refused_whatever_the_placeholder() {
+    fn a_long_mark_placeholder_is_expanded_in_full() {
         let mut m = play_mark();
         // 印に入るラウンドは最大16。`0m10s`の5文字 × 16 ＋ 区切り15 = 95文字、`1vs0`の4文字 × 16 ＋ 15 = 79文字。
         m.detail.as_mut().unwrap().rounds = (0..16)
             .map(|_| rec(600, Winner::P1, [Some(1), Some(0)]))
             .collect();
+        let rl = ["0m10s"; 16].join("-");
         assert_eq!(name_for("{rlengths}", &m).map(|s| s.len()), Ok(95));
+        let rf = ["1vs0"; 16].join("-");
         assert_eq!(
             name_for("{rlengths}x{rlifes}", &m),
-            Err(NameError::TooLong(175))
+            Ok(format!("{rl}x{rf}"))
         );
     }
 
@@ -1412,5 +1681,95 @@ mod tests {
         let f = read_file_facts(&unmarked);
         assert_eq!((f.rounds, f.winner), (None, None));
         assert!(f.chars.is_some());
+    }
+
+    fn names_template(t: &str, p1: &str, p2: &str) -> (String, Vec<NameSpan>) {
+        let mark = MarkFacts {
+            names: [p1.to_string(), p2.to_string()],
+            rounds: Vec::new(),
+            sync: None,
+            lat: 0,
+            ping_ms: 0,
+            ping_median_ms: None,
+            seat: Some(Side::P1),
+            result: MatchResult::Win,
+        };
+        let file = FileFacts {
+            mark: Some(mark),
+            ..FileFacts::default()
+        };
+        Template::parse(t)
+            .unwrap()
+            .expand_spans(&facts(Some(file)))
+            .unwrap()
+    }
+
+    /// 範囲は名前が入った位置だけ。同じ文字が名前以外にあっても伏せない。
+    #[test]
+    fn expand_spans_marks_only_where_a_name_went() {
+        let (name, spans) = names_template("a{1Pname}-{num}-{2Pname}b", "Al:ce", "Bob");
+        assert_eq!(name, "aAl-ce-0007-Bobb");
+        assert_eq!(
+            spans,
+            [
+                NameSpan {
+                    side: Side::P1,
+                    start: 1,
+                    end: 6
+                },
+                NameSpan {
+                    side: Side::P2,
+                    start: 12,
+                    end: 15
+                },
+            ]
+        );
+        assert_eq!(
+            mask_spans("aAl-ce-0007-Bobb.rpy", &spans, 16),
+            "a<1P の名前>-0007-<2P の名前>b.rpy"
+        );
+        // 名前を含まないテンプレートに範囲は無い。
+        assert!(names_template("th9_ud{num}", "a", "b").1.is_empty());
+        // 展開の結果は`expand`と同じ。
+        let t = Template::parse("a{1Pname}-{num}").unwrap();
+        let f = facts(None);
+        assert_eq!(t.expand(&f), t.expand_spans(&f).map(|(n, _)| n));
+    }
+
+    /// 同じ名前がテンプレートの別の部分に重なっても入った位置で伏せる。
+    #[test]
+    fn mask_spans_keeps_text_equal_to_a_name_outside_the_spans() {
+        let (name, spans) = names_template("Bob{1Pname}Bob", "Bob", "Bob");
+        assert_eq!(name, "BobBobBob");
+        assert_eq!(
+            mask_spans("BobBobBob_2.rpy", &spans, 9),
+            "Bob<1P の名前>Bob_2.rpy"
+        );
+    }
+
+    /// 上限で切られた範囲は残った分だけ、全部切られた範囲は何も置き換えない。
+    #[test]
+    fn mask_spans_clips_to_the_kept_length() {
+        let (name, spans) = names_template("x{1Pname}{2Pname}", "Alice", "Bob");
+        assert_eq!(name, "xAliceBob");
+        assert_eq!(mask_spans("xAli.rpy", &spans, 4), "x<1P の名前>.rpy");
+        assert_eq!(
+            mask_spans("xAliceB_3.rpy", &spans, 7),
+            "x<1P の名前><2P の名前>_3.rpy"
+        );
+        assert_eq!(mask_spans("x.rpy", &spans, 1), "x.rpy");
+        // 範囲が無ければそのまま。
+        assert_eq!(mask_spans("th9_ud0001.rpy", &[], 10), "th9_ud0001.rpy");
+    }
+
+    /// 日本語の名前も文字単位の位置で伏せる。
+    #[test]
+    fn mask_spans_counts_characters_not_bytes() {
+        let (name, spans) = names_template("甲{1Pname}_{num}", "乙丙", "x");
+        assert_eq!(name, "甲乙丙_0007");
+        assert_eq!(
+            mask_spans("甲乙丙_0007.rpy", &spans, 8),
+            "甲<1P の名前>_0007.rpy"
+        );
     }
 }

@@ -2,14 +2,14 @@
 //! 確保の入口のアセンブリ・DLLの領域・コピーの方法・走査のラッパーは`rollback_win.rs`と共用する。
 //! 入口の関数は`arm`以外どれもゲームのスレッドから呼ぶ:
 //! - `arm`: 読み取りのスレッドから、入力のフックを書いた後に1回呼ぶ。rollbackを望んだ実行でだけ書き込む（`rollback_play::install_wanted`）。
-//! - [`with_play`]: コンテナ（`PlayState`と本物の`PlayMem`）を貸す。
+//! - [`with_play`]はコンテナ（`PlayState`と本物の`PlayMem`）を貸す。
 //!   走査のラッパー（`0x0042DCA9`）のフックとPresentの後のフックは、この中で`NetPlay`のrollbackの経路（`netplay/rollback.rs`）を呼ぶ。
 //!   ステートマシンは`Connected`の中にあり、外から`&mut`で借りられない。そのためpureな経路がコンテナを借りて進める。
 //! - [`input_hook`]（入力の地点`0x0043112D`の入口から）: `Some(r)`なら入口へ`r`を返す（1 = feedした / 2 = 描画だけ）。`None`なら従来の経路。
 //!   feedのフックはローカル入力を読まず、InputManagerの3本へ書き込む。自分のワードは走査のラッパーのフックが1フレームに1回だけ読む。
-//! - [`resim_active`]: 進め直しの走査の中かどうか（`_ticks.csv`の記録・ペースの時刻の取得・台本の時計が見るフラグ）。
+//! - [`resim_active`]は進め直しの走査の中かどうかを返す（`_ticks.csv`の記録・ペースの時刻の取得・台本の時計が見るフラグ）。
 //!   `stub.rs`の入口のアセンブリも`RESIM_TICK`を直接見る。
-//! - [`with_game_fpu`]: 進め直しの間のx87の制御ワード。
+//! - [`with_game_fpu`]は進め直しの間のx87の制御ワードをゲームの値にする。
 //! - カウントと食い違い: [`publish_summary`]（ゲームのスレッド）/ [`summary_text`]（読み取りのスレッド）。
 
 #[cfg(not(target_arch = "x86"))]
@@ -560,40 +560,55 @@ impl PlayHooks for RealHooks {
     }
 }
 
+/// 走査のcallだけを書き込む（確保の入口と領域は要らない）。`Ok(true)`は書いた、`Ok(false)`はすでに書いてあった。
+/// 余分な更新は文字数のフィールド（`ASCII_COUNT`）を直接読み書きする（`ff_read_ascii`）ので、このフィールドが読み書き可能なページかどうかを書く前に検証する。
+/// 書き方と照合は`rollback_play::install_scan_call`。
+pub fn arm_scan_call(
+    hook_env: &mut dyn crate::hook::HookEnv,
+    forbidden: &[AddrRange],
+    out: &mut dyn Write,
+) -> Result<bool, rollback_play::ScanFail> {
+    if rollback_win::scan_hooked() {
+        return Ok(false);
+    }
+    if !rollback_win::output_ranges_rw() {
+        let _ = writeln!(
+            out,
+            "SE・BGM・文字の数の欄が読み書きできるページでないので走査の call を書きません。"
+        );
+        return Err(rollback_play::ScanFail::OutputPage);
+    }
+    rollback_play::install_scan_call(hook_env, &mut RealHooks, forbidden, out).map(|()| true)
+}
+
 /// 観戦者の実行で、早送りのために走査のcallだけを書き込む。
-/// 確保の入口と領域は要らない（観戦者は巻き戻さない）。判断と書き方は`rollback_play::install_watch_scan`。
-/// 呼ぶのは観戦者のネットワークを開くときの2か所（起動時の`RealScriptHost::arm_rollback`の観戦者の実行と、ゲーム内のメニューの観戦で「ルームマッチ」を開くスレッド）。**どちらも対戦の実行では呼ばない**。
+/// 確保の入口と領域は要らない（観戦者は巻き戻さない）。判断と書き方は`arm_scan_call`。
+/// 呼ぶのは観戦者のネットワークを開くときの2か所（起動時の`RealScriptHost::arm_rollback`の観戦者の実行と、ゲーム内のメニューの観戦で「ルームマッチ」を開くスレッド）。
+/// 走査のcallを書くのはこの観戦者の実行のほか、rollbackの設置とリプレイの高速再生（再生中にSkipを押したとき）。
+/// delay方式の対戦だけのプロセスはリプレイの高速再生を使わない限り書かない。
 /// 走査のcallが既に書かれていれば何もしない。書き込んだか既に書かれていればtrueを返す。
-/// 早送りは文字数のフィールド（`ASCII_COUNT`）を直接読み書きする（`ff_read_ascii`）。
-/// そのため、このフィールドが読み書き可能なページかどうかを検証する。
 pub fn arm_watch_scan(
     hook_env: &mut dyn crate::hook::HookEnv,
     forbidden: &[AddrRange],
     out: &mut dyn Write,
 ) -> bool {
-    if rollback_win::scan_hooked() {
-        let _ = writeln!(
-            detail_out(out),
-            "観戦者の早送り: 走査の call は書き込み済み（rollback の設置などが先に書きました）なので何もしません"
-        );
-        return true;
+    match arm_scan_call(hook_env, forbidden, out) {
+        Ok(false) => {
+            let _ = writeln!(
+                detail_out(out),
+                "観戦者の早送り: 走査の call は書き込み済み（rollback の設置などが先に書きました）なので何もしません"
+            );
+            true
+        }
+        Ok(true) => {
+            let _ = writeln!(
+                detail_out(out),
+                "観戦者の早送り: 走査の call だけを書きました（確保・解放の入口は書きません。マッチの方式に関わらず早送りが効きます）"
+            );
+            true
+        }
+        Err(_) => false,
     }
-    if !rollback_win::output_ranges_rw() {
-        let _ = writeln!(
-            out,
-            "観戦者の早送り: SE・BGM・文字の数の欄が読み書きできるページでないので走査の call を書きません（早送りは効かない）。"
-        );
-        return false;
-    }
-    let wrote =
-        rollback_play::install_watch_scan(true, false, hook_env, &mut RealHooks, forbidden, out);
-    if wrote {
-        let _ = writeln!(
-            detail_out(out),
-            "観戦者の早送り: 走査の call だけを書きました（確保・解放の入口は書きません。マッチの方式に関わらず早送りが効きます）"
-        );
-    }
-    wrote
 }
 
 /// DLLの領域の既定の大きさ（16 MiB。マッチの112秒まで足りた）。

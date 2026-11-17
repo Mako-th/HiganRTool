@@ -81,7 +81,7 @@ fn drive_menu_watcher(host: SocketAddr, mut wg: MenuGame, wait_budget_us: u32) -
             wait_budget_us,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let (mut allocs_joined, mut local_at_join, mut leaks) = (0u64, None, 0u32);
@@ -559,7 +559,7 @@ fn watch_fake(slot: Arc<WatchSlot>, sc: Scenario) -> WatchRun {
             wait_budget_us: WAIT_BUDGET_US,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: false,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let mut g = fake(0xD22, sc);

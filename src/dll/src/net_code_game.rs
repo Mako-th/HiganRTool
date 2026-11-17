@@ -21,6 +21,7 @@ use higanr_core::candidate::Candidates;
 use higanr_core::code;
 use higanr_core::delay_pick::DelayChoice;
 use higanr_core::link;
+use higanr_core::lobby::{LobbyEvent, LobbyPosting, LobbyRoom};
 use higanr_core::mode_pick::Pick;
 use higanr_core::nat::NatMark;
 use higanr_core::net_menu::{
@@ -44,12 +45,13 @@ use crate::clipboard::Clipboard;
 use crate::ini_save;
 use crate::lan_link::{BridgeCmd, LanBridge};
 use crate::link_log;
+use crate::lobby_post::{self, LobbyPoster};
 use crate::net_code::{
     Kind, ModeCtx, Notify, Say, Shared, Step, Swapper, Timing, Watch, addrs_text, connected_say,
     decided_shape_log, draw_session,
 };
 use crate::net_config::{CodeSide, NetSettings};
-use crate::net_room::{QueueConn, RoomConn, RoomOptions, SubmitRefused, code_side};
+use crate::net_room::{LobbyConn, QueueConn, RoomConn, RoomOptions, SubmitRefused, code_side};
 use crate::net_udp::{self, GameNet, RecvThread};
 use crate::net_ui::{Order, UiLink};
 use crate::netplay::{LinkSlot, NetPlay};
@@ -83,6 +85,10 @@ pub struct GameUi {
 /// LANで相手のコードを読んでから接続が成立するまで待つ上限。越えたら「接続できませんでした」で待ちをやめる。
 const LAN_LINK_LIMIT: Duration = Duration::from_secs(45);
 
+/// 作った人が来るのを待つ長さ。一覧の待機中の行から入った側が割り当てのルームのhostになったときに使う。
+/// サーバーは`created`を送った直後に一覧を配信するので作った人より先に入ることがある。
+const LOBBY_HOST_GRACE: Duration = Duration::from_secs(3);
+
 /// 対戦の成立で入室許可のチケットを受けていない（古いルームサーバー・鍵の無いルームサーバー）。
 /// 観戦用のルームに入ることと一覧への投稿にはチケットが要るので、どちらも行わない。
 const NO_TICKET_OFFER: &str = "観戦の受付: 未作成（ルームサーバーが観戦用のルームの入室許可を未発行。サーバーが古いか未設定）。対戦は続きます。";
@@ -109,6 +115,30 @@ struct RoomRun {
     sw: Option<Swapper>,
     /// セッションの設定を登録した（以後のルームの手順の失敗は画面に出さず、接続するかはP2Pの側に任せる）。
     placed: bool,
+    /// ルーム名ごとの一覧の経路で入ったルームならその一覧の材料。
+    lobby: Option<LobbyMeet>,
+    /// 作った人が来るのを待つ期限（`LOBBY_HOST_GRACE`）。一覧から入った側が先にhostになったときに使う。
+    lobby_wait_until: Option<Instant>,
+}
+
+/// ルーム名ごとの一覧の経路で入った2人用のルームの材料。`RoomName`は名を`Debug`に出すので本ログに`{:?}`で書かない。
+#[derive(Clone, Copy)]
+struct LobbyMeet {
+    /// 打ったルーム名（一覧のパスの元）。
+    name: RoomName,
+    /// 割り当てのルーム名（試合中の1件を載せる`post`の`room`）。
+    room: LobbyRoom,
+    /// 一覧へ`create`した側かどうか（偽は一覧の待機中の行から入った側）。
+    created: bool,
+}
+
+/// 一覧へ`create`して待機中の1件として載る接続（作った人が待つ間だけ持つ）。
+struct LobbyRun {
+    conn: LobbyConn,
+    /// 打ったルーム名。
+    name: RoomName,
+    /// `create`を送った。
+    sent: bool,
 }
 
 pub(crate) struct GameWatcher {
@@ -168,6 +198,16 @@ pub(crate) struct GameWatcher {
     lan_started: Option<Instant>,
     /// 観戦用のルームで観戦者に断りを返すスレッド（`start_refusing`）。接続の後の定期処理を終えるときに手放して止める。
     refuser: Option<Refuser>,
+    /// ルーム名ごとの一覧で待機中の1件として載る接続（`Order::LobbyCreate`から相手と会うまで）。
+    lobby: Option<LobbyRun>,
+    /// `lobby`を作り直した回数（`lobby_tick`が古い接続のイベントを捨てるために見る）。
+    lobby_gen: u32,
+    /// `met_room`のルームがルーム名ごとの一覧の経路ならその材料（試合中の1件を載せる元）。
+    met_lobby: Option<LobbyMeet>,
+    /// ルーム名ごとの一覧へ試合中の1件を載せるスレッド（`start_lobby_post`）。接続の後の定期処理を終えるときに止める。
+    poster: Option<LobbyPoster>,
+    /// メニューへ渡している「自分が一覧へ作って待っているルーム」（`UiLink::set_own_lobby`に書いた最後の値。同じ値は書き直さない）。
+    own_lobby: Option<LobbyRoom>,
 }
 
 impl GameWatcher {
@@ -221,6 +261,11 @@ impl GameWatcher {
             build: BUILD_NUMBER,
             lan_started: None,
             refuser: None,
+            lobby: None,
+            lobby_gen: 0,
+            met_lobby: None,
+            poster: None,
+            own_lobby: None,
         }
     }
 
@@ -243,6 +288,7 @@ impl GameWatcher {
     /// 理由は本ログへ書く（ルーム名は書かない）。
     /// 監視のスレッドで呼ぶ。
     pub(crate) fn start_casting(&mut self) {
+        self.start_lobby_post();
         let kit = self.spectate.take();
         let Some(room) = self.met_room else {
             if kit.is_some() {
@@ -333,18 +379,7 @@ impl GameWatcher {
     /// サイドが分からなければ自分を1Pとする。
     fn listing_info(&self, room: &RoomName, ticket: SeatTicket) -> Option<ListingInfo> {
         let assigned = AssignedRoom::parse(room.as_str())?;
-        let own = WatchName::lossy(&self.s.name);
-        let peer = WatchName::lossy(
-            &self
-                .peer_name
-                .map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())
-                .unwrap_or_default(),
-        );
-        let (p1, p2) = match self.slot.seat() {
-            Some(Seat::P2) => (peer, own),
-            _ => (own, peer),
-        };
-        let (mode, delay) = self.slot.shape().unwrap_or((Mode::Delay, 0));
+        let (p1, p2, mode, delay) = self.listing_shape();
         Some(ListingInfo {
             build: self.build,
             posting: Posting {
@@ -357,6 +392,23 @@ impl GameWatcher {
                 ticket,
             },
         })
+    }
+
+    /// 一覧に載せる1P・2Pの名前と合意した同期方式・遅延。
+    fn listing_shape(&self) -> (WatchName, WatchName, Mode, u8) {
+        let own = WatchName::lossy(&self.s.name);
+        let peer = WatchName::lossy(
+            &self
+                .peer_name
+                .map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())
+                .unwrap_or_default(),
+        );
+        let (p1, p2) = match self.slot.seat() {
+            Some(Seat::P2) => (peer, own),
+            _ => (own, peer),
+        };
+        let (mode, delay) = self.slot.shape().unwrap_or((Mode::Delay, 0));
+        (p1, p2, mode, delay)
     }
 
     /// 行の頭の言葉。選んだ項目の名前（ランダムマッチ・ルームマッチ・LAN）。コードの項目とまだ選んでいない間は「接続コード」。
@@ -552,6 +604,8 @@ impl GameWatcher {
             Order::Paste => self.paste(),
             Order::Cancel => self.cancel(),
             Order::Room => self.room_start(),
+            Order::LobbyCreate => self.lobby_create_start(),
+            Order::LobbyJoin => self.lobby_join_start(),
             Order::Random => self.random_start(),
             // 観戦者の入口。観戦者のネットワークを開くことと観戦用のルームへ入ることは、この監視の処理（対戦する側のネットワークの監視の処理）では行わない。
             // メニューでの決定は`UiOut::spectate_open`として入力の入口が受ける（`script_win::request_spectate`。待っているだけの対戦する側のネットワークはそこで後始末してから開く）。
@@ -672,6 +726,9 @@ impl GameWatcher {
         }
         if let Some(r) = self.refuser.take() {
             self.log(r.finish().text());
+        }
+        if let Some(p) = self.poster.take() {
+            self.log(p.finish().text());
         }
     }
 
@@ -1010,7 +1067,12 @@ impl GameWatcher {
         // ルームで会った相手ではなくなる（作成・入力・取りやめる・別のルーム名）。観戦の配信側は元のルーム名とチケットを失う。
         self.met_room = None;
         self.met_ticket = None;
+        self.met_lobby = None;
         self.random_met = false;
+        if let Some(mut l) = self.lobby.take() {
+            l.conn.cancel();
+            self.log("ルーム名ごとの一覧の待機をやめた（別の操作が選ばれた）");
+        }
         if let Some(mut q) = self.queue.take() {
             q.cancel();
             self.log("ランダムマッチの待ち列をやめた（別の操作が選ばれた）");
@@ -1024,12 +1086,17 @@ impl GameWatcher {
         if self.note.state.is_room() {
             self.note.state = CodeState::Idle;
         }
+        self.sync_own_lobby();
     }
 
     fn room_end(&mut self, ev: Event) {
+        if let Some(mut l) = self.lobby.take() {
+            l.conn.cancel();
+        }
         if let Some(mut r) = self.room.take() {
             r.conn.cancel();
         }
+        self.sync_own_lobby();
         self.note.state = CodeState::Idle;
         self.event(ev);
     }
@@ -1053,24 +1120,46 @@ impl GameWatcher {
         }
     }
 
-    /// 対戦の「ルームマッチ」: メニューの入力で決めたルーム名でルームサーバーへ接続し始める（待たない）。
-    fn room_start(&mut self) {
+    /// 対戦の「ルームマッチ」の指示の材料（サーバーの設定・メニューで決めたルーム名）。足りなければ知らせて`None`。
+    fn room_order(&mut self) -> Option<(RoomOptions, RoomBuf, RoomName)> {
         let Some(opts) = self.ui.room.clone() else {
             self.log_problem(
                 "ルームサーバーの設定（room_server）が無いのに、対戦のルームマッチが選ばれました。",
             );
             self.event(Event::Internal);
-            return;
+            return None;
         };
         let Some(buf) = self.ui.link.room_name() else {
             // メニューは名を設定してから指示を積む（`UiLink::send`）ので、来ない見込み。
-            return self.room_name_bad(RoomNameWhy::Empty, "ルーム名が置かれていない");
+            self.room_name_bad(RoomNameWhy::Empty, "ルーム名が置かれていない");
+            return None;
         };
         // メニューも同じガード（`RoomName::parse`）で見て渡すが、ここでも見直す（断った理由は名を含まない）。
-        let name = match buf.parse() {
-            Ok(n) => n,
+        match buf.parse() {
+            Ok(n) => Some((opts, buf, n)),
             // `RoomNameError`のDebugは位置と数だけで、名の文字を含まない。
-            Err(e) => return self.room_name_bad(RoomNameWhy::of(e), &format!("{e:?}")),
+            Err(e) => {
+                self.room_name_bad(RoomNameWhy::of(e), &format!("{e:?}"));
+                None
+            }
+        }
+    }
+
+    /// 待ち始めの画面の材料（左上に出すルーム名と待った時間の起点）。
+    fn begin_room_wait(&mut self, name: &RoomName) {
+        let glyphs = &self.glyphs;
+        self.note.room = sanitize_room(name.as_str(), |c| glyphs.binary_search(&c).is_ok());
+        // 待ち始めた時刻（左上の「待った時間」の起点。期限が切れて自動で入り直しても変えない）。
+        self.note.since = net_udp::now_unix() as u32;
+        self.last_rejoin = None;
+        self.note.name = [0; NAME_UNITS];
+        self.note.state = CodeState::RoomJoining;
+    }
+
+    /// 対戦の「ルームマッチ」: メニューの入力で決めたルーム名でルームサーバーへ接続し始める（待たない）。
+    fn room_start(&mut self) {
+        let Some((opts, buf, name)) = self.room_order() else {
+            return;
         };
         if let Some(r) = self.room.as_ref().filter(|r| !r.placed) {
             if r.name == name && self.random_order.is_none() {
@@ -1080,8 +1169,8 @@ impl GameWatcher {
             }
             self.leave_room();
         }
-        if self.queue.is_some() || self.random_order.is_some() {
-            // ランダムマッチの待ち（待ち列・割り当てのルーム・設定した後）から、名前つきのルームへ移る。
+        if self.queue.is_some() || self.random_order.is_some() || self.lobby.is_some() {
+            // ランダムマッチの待ち（待ち列・割り当てのルーム・設定した後）か一覧の待機から名前つきのルームへ移る。
             self.leave_room();
         }
         // コードの経路からルームの経路へ移る。作った・読んだコードを忘れ、登録したセッションがあれば接続できないセッションに替える。
@@ -1097,13 +1186,7 @@ impl GameWatcher {
         // 名を覚えるのはサーバーへ接続し始められた後だけ。
         // 接続し始められなかった名（打ち間違い・始められない設定の名）を次の入力の初めの値にしないため。
         self.remember_room(&buf);
-        let glyphs = &self.glyphs;
-        self.note.room = sanitize_room(name.as_str(), |c| glyphs.binary_search(&c).is_ok());
-        // 待ち始めた時刻（左上の「待った時間」の起点。期限が切れて自動で入り直しても変えない）。
-        self.note.since = net_udp::now_unix() as u32;
-        self.last_rejoin = None;
-        self.note.name = [0; NAME_UNITS];
-        self.note.state = CodeState::RoomJoining;
+        self.begin_room_wait(&name);
         self.room_gen = self.room_gen.wrapping_add(1);
         self.room = Some(RoomRun {
             conn,
@@ -1112,6 +1195,8 @@ impl GameWatcher {
             peer_came: false,
             sw: None,
             placed: false,
+            lobby: None,
+            lobby_wait_until: None,
         });
         self.choose(Route::Room);
         self.log("ルームサーバーへの接続を開始しました（ルーム名は記録しません）。");
@@ -1140,6 +1225,8 @@ impl GameWatcher {
                     peer_came: false,
                     sw: None,
                     placed: false,
+                    lobby: old.lobby,
+                    lobby_wait_until: None,
                 });
                 self.log(
                     "ルームの期限が切れたので、同じルーム名で入り直した（ルーム名は記録しない）",
@@ -1149,6 +1236,375 @@ impl GameWatcher {
                 self.log_problem(e);
                 self.room_end(Event::Internal);
             }
+        }
+    }
+
+    // ---- ルーム名ごとの一覧の経路 ----
+    //
+    // 「対戦を募集する」は一覧へ`create`し、割り当てのルーム（`r.…`）で待つ。待つ間は一覧の接続を持ち続け、相手と会ったら閉じる。
+    // 待機中の行を選んだ側はその割り当てのルームへguestとして入る。あとは名前つきのルームと同じ手順。
+    // 割り当てのルーム名は画面にもログにも出さず、iniの`room`には打ったルーム名を書く。
+
+    /// 「対戦を募集する」: 打ったルーム名の一覧へ接続し始める（待たない）。最初の一覧が届いたら`create`する（`lobby_listed`）。
+    fn lobby_create_start(&mut self) {
+        let Some((opts, buf, name)) = self.room_order() else {
+            return;
+        };
+        let waiting = self.lobby.as_ref().is_some_and(|l| l.name == name)
+            || self
+                .room
+                .as_ref()
+                .is_some_and(|r| !r.placed && r.lobby.is_some_and(|m| m.created && m.name == name));
+        if waiting {
+            // 2件目を作ると同じ人の待機中の行が一覧に2つ並ぶ。
+            self.log("もう同じルーム名の一覧で待っているので、対戦を募集する指示を読み捨てた");
+            return;
+        }
+        self.leave_room();
+        self.forget_code();
+        if let Err(e) = self.lobby_connect(&opts, name) {
+            self.log_problem(e);
+            self.event(Event::Internal);
+            return;
+        }
+        self.remember_room(&buf);
+        self.begin_room_wait(&name);
+        self.choose(Route::Room);
+        self.log(
+            "ルーム名ごとの一覧への接続を開始しました（対戦を募集する。ルーム名は記録しません）。",
+        );
+        self.event(Event::RoomJoining);
+    }
+
+    fn lobby_connect(&mut self, opts: &RoomOptions, name: RoomName) -> Result<(), String> {
+        let conn = LobbyConn::start_lobby(opts, self.build, &name)?;
+        self.lobby_gen = self.lobby_gen.wrapping_add(1);
+        self.lobby = Some(LobbyRun {
+            conn,
+            name,
+            sent: false,
+        });
+        Ok(())
+    }
+
+    /// 一覧の待機中の行を選んだ: その割り当てのルームへguestとして入る（待たない）。
+    fn lobby_join_start(&mut self) {
+        let Some((opts, buf, name)) = self.room_order() else {
+            return;
+        };
+        let Some(room) = self.ui.link.lobby_pick() else {
+            // メニューは割り当てのルーム名を設定してから指示を積むので来ない見込み。
+            self.log_problem(
+                "一覧から選んだ行が置かれていないのに、一覧の行から入る指示が来ました。",
+            );
+            self.event(Event::Internal);
+            return;
+        };
+        if self
+            .room
+            .as_ref()
+            .is_some_and(|r| !r.placed && r.lobby.is_some_and(|m| m.created && m.room == room))
+        {
+            // 自分が作って待っている行を選んだ（入ると自分の待ちを手放す）。
+            self.log("自分が待っている一覧の行が選ばれたので、指示を読み捨てた");
+            return;
+        }
+        self.leave_room();
+        self.forget_code();
+        let conn = match RoomConn::start(&opts, &room.name()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.log_problem(e);
+                self.event(Event::Internal);
+                return;
+            }
+        };
+        self.remember_room(&buf);
+        self.begin_room_wait(&name);
+        self.room_gen = self.room_gen.wrapping_add(1);
+        self.room = Some(RoomRun {
+            conn,
+            name: room.name(),
+            side: None,
+            peer_came: false,
+            sw: None,
+            placed: false,
+            lobby: Some(LobbyMeet {
+                name,
+                room,
+                created: false,
+            }),
+            lobby_wait_until: None,
+        });
+        self.choose(Route::Room);
+        self.log("一覧から選んだ相手のルームへの接続を開始しました（ルーム名は記録しません）。");
+        self.event(Event::RoomJoining);
+    }
+
+    /// いまのルームが一覧の待機中の行から入ったもので、まだ相手のコードを読んでいないかどうか。
+    fn lobby_joining(&self) -> bool {
+        self.room
+            .as_ref()
+            .is_some_and(|r| !r.placed && r.lobby.is_some_and(|m| !m.created))
+    }
+
+    /// 選んだ相手がもう待っていなかった。入室をやめてメニューを一覧へ戻させる（`Event::LobbyGone`）。
+    fn lobby_gone(&mut self, why: &str) {
+        if let Some(mut r) = self.room.take() {
+            r.conn.cancel();
+        }
+        // 同じポーリングで続く古いルームのイベント（失敗など）がこの知らせを上書きしないように捨てさせる。
+        self.room_gen = self.room_gen.wrapping_add(1);
+        self.note.state = CodeState::Idle;
+        self.log_event(format!("{why}ので、一覧へ戻します。"));
+        self.event(Event::LobbyGone);
+    }
+
+    fn lobby_tick(&mut self) {
+        let Some(l) = self.lobby.as_mut() else {
+            return;
+        };
+        let evs = l.conn.poll();
+        let notes = l.conn.take_notes();
+        let gen_now = self.lobby_gen;
+        for n in notes {
+            self.log_problem(format!("ルーム名ごとの一覧との通信: {n:?}"));
+        }
+        for e in evs {
+            if self.lobby_gen != gen_now || self.lobby.is_none() {
+                // このポーリングの途中で一覧の接続を作り直した・閉じた。残りは古い接続のイベントなので捨てる。
+                break;
+            }
+            match e {
+                LobbyEvent::List { .. } => self.lobby_listed(),
+                LobbyEvent::Created { room } => self.lobby_created(room),
+                LobbyEvent::Failed(f) => self.lobby_failed(f),
+            }
+        }
+        if self.lobby.as_ref().is_some_and(|l| l.conn.is_finished()) {
+            self.lobby = None;
+        }
+    }
+
+    /// 一覧が届いた。まだなら待機中の1件として載る（名前は一覧に載せられる文字に直す）。
+    fn lobby_listed(&mut self) {
+        let own = WatchName::lossy(&self.s.name);
+        let Some(l) = self.lobby.as_mut() else {
+            return;
+        };
+        if l.sent {
+            return;
+        }
+        // 送れなかった失敗は次のポーリングで届く。
+        l.sent = l.conn.create(&own);
+        if l.sent {
+            self.log("ルーム名ごとの一覧へ待機中の1件として載せる文を送った");
+        }
+    }
+
+    /// 待機中の1件として載った。割り当てのルームへ入って待つ（一覧の接続は持ち続ける）。
+    fn lobby_created(&mut self, room: LobbyRoom) {
+        let Some(name) = self.lobby.as_ref().map(|l| l.name) else {
+            return;
+        };
+        let Some(opts) = self.ui.room.clone() else {
+            return self.room_end(Event::Internal);
+        };
+        match RoomConn::start(&opts, &room.name()) {
+            Ok(conn) => {
+                self.room_gen = self.room_gen.wrapping_add(1);
+                self.room = Some(RoomRun {
+                    conn,
+                    name: room.name(),
+                    side: None,
+                    peer_came: false,
+                    sw: None,
+                    placed: false,
+                    lobby: Some(LobbyMeet {
+                        name,
+                        room,
+                        created: true,
+                    }),
+                    lobby_wait_until: None,
+                });
+                self.sync_own_lobby();
+                self.log_event(
+                    "ルーム名ごとの一覧に載りました。割り当てのルームへ入って待ちます（ルーム名は記録しない）。",
+                );
+            }
+            Err(e) => {
+                self.log_problem(e);
+                self.room_end(Event::Internal);
+            }
+        }
+    }
+
+    /// 一覧へ作ってまだ相手と会っていない割り当てのルーム（待機中の行が一覧に載っている間）。
+    fn own_lobby_room(&self) -> Option<LobbyRoom> {
+        self.room
+            .as_ref()
+            .filter(|r| !r.placed)
+            .and_then(|r| r.lobby)
+            .filter(|m| m.created)
+            .map(|m| m.room)
+    }
+
+    /// メニューへ渡す「自分の待機中のルーム」をいまの状態に合わせる。変わったときだけ書く。
+    fn sync_own_lobby(&mut self) {
+        self.publish_own_lobby(self.own_lobby_room());
+    }
+
+    fn clear_own_lobby(&mut self) {
+        self.publish_own_lobby(None);
+    }
+
+    fn publish_own_lobby(&mut self, want: Option<LobbyRoom>) {
+        if want != self.own_lobby {
+            self.ui.link.set_own_lobby(want.as_ref());
+            self.own_lobby = want;
+        }
+    }
+
+    /// 一覧の接続が終わった。相手がもうルームに来ていれば対戦はそのまま続ける。
+    fn lobby_failed(&mut self, f: Failure) {
+        let room = self.room.as_ref().map(|r| (r.peer_came, r.placed));
+        if room.is_some_and(|(came, placed)| came || placed) {
+            self.lobby = None;
+            self.log(format!(
+                "ルーム名ごとの一覧の接続が閉じました（{f:?}）が、相手はもうルームに来ています。"
+            ));
+            return;
+        }
+        let s = Situation {
+            first_in: true,
+            peer_came: false,
+            placed: false,
+            since_last_rejoin_secs: self.last_rejoin.map(|t| t.elapsed().as_secs()),
+        };
+        if should_rejoin(f, &s) {
+            return self.lobby_recreate("一覧の待機中の1件の期限が切れた");
+        }
+        if let Failure::RateLimited { retry_after_secs } = f {
+            self.note.retry_secs = u16::try_from(retry_after_secs).unwrap_or(u16::MAX);
+        }
+        self.log_problem(format!("ルーム名ごとの一覧で待てませんでした: {f:?}"));
+        // 件数の上限（`list_full`）と見る接続の上限（409）は別の文。ほかはルームの失敗と同じ文。
+        self.room_end(if matches!(f, Failure::ListFull | Failure::RoomFull) {
+            Event::LobbyFull
+        } else {
+            room_failure_event(f)
+        });
+    }
+
+    /// 一覧に作った側: 相手のコードを読む前に相手が抜けた。同じ割り当てのルームへ入り直して待ち続ける（一覧の接続は持ったまま）。
+    /// 期限切れの入り直しの間隔（`last_rejoin`）には数えない。
+    fn lobby_reenter(&mut self) {
+        let Some(mut old) = self.room.take() else {
+            return;
+        };
+        old.conn.cancel();
+        let Some(opts) = self.ui.room.clone() else {
+            return self.room_end(Event::Internal);
+        };
+        match RoomConn::start(&opts, &old.name) {
+            Ok(conn) => {
+                self.room_gen = self.room_gen.wrapping_add(1);
+                self.room = Some(RoomRun {
+                    conn,
+                    name: old.name,
+                    side: None,
+                    peer_came: false,
+                    sw: None,
+                    placed: false,
+                    lobby: old.lobby,
+                    lobby_wait_until: None,
+                });
+                self.log("相手が抜けたので、同じ割り当てのルームへ入り直して待つ（ルーム名は記録しない）");
+            }
+            Err(e) => {
+                self.log_problem(e);
+                self.room_end(Event::Internal);
+            }
+        }
+    }
+
+    /// 一覧の待機中の1件を作り直す（一覧の接続か割り当てのルームの期限切れ）。新しい割り当てのルーム名で待ち続ける。状態は待機中のまま。
+    fn lobby_recreate(&mut self, why: &str) {
+        let name = self
+            .lobby
+            .as_ref()
+            .map(|l| l.name)
+            .or_else(|| self.room.as_ref().and_then(|r| r.lobby).map(|m| m.name));
+        if let Some(mut l) = self.lobby.take() {
+            l.conn.cancel();
+        }
+        if let Some(mut r) = self.room.take() {
+            r.conn.cancel();
+        }
+        let (Some(name), Some(opts)) = (name, self.ui.room.clone()) else {
+            return self.room_end(Event::Internal);
+        };
+        match self.lobby_connect(&opts, name) {
+            Ok(()) => {
+                self.last_rejoin = Some(Instant::now());
+                self.log(format!(
+                    "{why}ので、ルーム名ごとの一覧へ作り直した（ルーム名は記録しない）"
+                ));
+            }
+            Err(e) => {
+                self.log_problem(e);
+                self.room_end(Event::Internal);
+            }
+        }
+    }
+
+    /// 一覧の経路で会ったマッチのホストがルーム名ごとの一覧へ試合中の1件を載せる（観戦を許可していないペアも`watch:false`で載せる）。
+    /// 観戦を許可していても観戦の受付の材料が無ければ観戦不可で載せる。受付があればその観戦者の数を送る。
+    /// チケットが無い（古いサーバー）・ゲスト・役が分からないときは載せない。
+    fn start_lobby_post(&mut self) {
+        let Some(lobby) = self.met_lobby else {
+            return;
+        };
+        if self.slot.is_host() != Some(true) {
+            return;
+        }
+        let Some(opts) = self.ui.room.clone() else {
+            return;
+        };
+        let Some(ticket) = self.met_ticket else {
+            self.log_event(
+                "ルーム名ごとの一覧: 試合中として載せません（ルームサーバーが入室許可を未発行）。",
+            );
+            return;
+        };
+        // 観戦の受付の材料が無い（`[spectate]`なし・用意できなかった）ペアは観戦者を受けられないので観戦不可で載せる。
+        let watch = self.slot.may_list() == Some(true) && self.spectate.is_some();
+        let watchers = if watch {
+            self.spectate.as_ref().map(|k| Arc::clone(k.shared()))
+        } else {
+            None
+        };
+        let (p1, p2, mode, delay) = self.listing_shape();
+        let posting = LobbyPosting {
+            room: lobby.room,
+            p1,
+            p2,
+            mode,
+            delay,
+            watch,
+            cap: u8::try_from(MAX_SPECTATORS).unwrap_or(u8::MAX),
+            ticket,
+        };
+        match lobby_post::spawn(opts, self.build, lobby.name, posting, watchers) {
+            Ok(p) => {
+                self.poster = Some(p);
+                self.log_event(if watch {
+                    "ルーム名ごとの一覧に試合中として載せます（ルーム名は記録しない）。"
+                } else {
+                    "ルーム名ごとの一覧に試合中（観戦不可）として載せます（ルーム名は記録しない）。"
+                });
+            }
+            Err(e) => self.log_problem(format!("{e}（対戦は続く）。")),
         }
     }
 
@@ -1304,6 +1760,8 @@ impl GameWatcher {
                     peer_came: false,
                     sw: None,
                     placed: false,
+                    lobby: None,
+                    lobby_wait_until: None,
                 });
                 let secs = self.t0.elapsed().as_secs_f32();
                 self.shared.update(|f| {
@@ -1340,19 +1798,30 @@ impl GameWatcher {
         };
         let evs = r.conn.poll();
         let notes = r.conn.take_notes();
-        let gen_now = self.room_gen;
         for n in notes {
             self.log_problem(format!("ルームサーバーとの通信: {n:?}"));
         }
+        self.on_room_events(evs);
+        if self.room.as_ref().is_some_and(|r| r.conn.is_finished()) {
+            self.room = None;
+        }
+        let late = self.room.as_ref().is_some_and(|r| {
+            !r.peer_came && !r.placed && r.lobby_wait_until.is_some_and(|t| Instant::now() >= t)
+        });
+        if late {
+            self.lobby_gone("選んだ相手はもう待機していなかった（割り当てのルームに来なかった）");
+        }
+    }
+
+    /// 1回のポーリングで届いたイベントを順に処理する。
+    fn on_room_events(&mut self, evs: Vec<room::Event>) {
+        let gen_now = self.room_gen;
         for e in evs {
             if self.room_gen != gen_now {
-                // このポーリングの途中でルームの経路が入れ替わった（期限切れで入り直した）。残りは古いルームのイベントなので捨てる。
+                // このポーリングの途中でルームの経路が入れ替わった（入り直した・一覧へ戻った）。残りは古いルームのイベントなので捨てる。
                 break;
             }
             self.on_room_event(e);
-        }
-        if self.room.as_ref().is_some_and(|r| r.conn.is_finished()) {
-            self.room = None;
         }
     }
 
@@ -1377,6 +1846,13 @@ impl GameWatcher {
     }
 
     fn room_joined(&mut self, role: Role, expires_at: u64) {
+        // 一覧の待機中の行から入ったのにhostになった。作った人がまだ割り当てのルームへ入っていないだけかもしれないので少し待つ。
+        if role == Role::Offer && self.lobby_joining() {
+            if let Some(r) = self.room.as_mut() {
+                r.lobby_wait_until = Some(Instant::now() + LOBBY_HOST_GRACE);
+            }
+            self.log("一覧から選んだ相手より先に割り当てのルームへ入った（来るのを待つ）");
+        }
         let now = net_udp::now_unix();
         let ttl = room::ROOM_TTL_MS / 1000;
         // サーバーの期限（UNIX秒）をこちらの時計の期限に換算する。
@@ -1531,6 +2007,12 @@ impl GameWatcher {
         self.met_room = self.room.as_ref().map(|r| r.name);
         // チケットは始める側にはmatched、返す側にはpeerで届き、ここ（相手のコードを読んだ後）までに受けている。
         self.met_ticket = self.room.as_ref().and_then(|r| r.conn.ticket());
+        self.met_lobby = self.room.as_ref().and_then(|r| r.lobby);
+        // 相手と会ったので一覧の待機中の1件を外す（以後はマッチのホストが試合中の1件として載せる）。
+        if let Some(mut l) = self.lobby.take() {
+            l.conn.cancel();
+            self.log("相手と会ったので、ルーム名ごとの一覧の待機中の1件を外した");
+        }
         self.note.state = CodeState::RoomLinking;
         self.say(
             &Say::new(
@@ -1568,8 +2050,27 @@ impl GameWatcher {
                 placed: r.placed,
                 since_last_rejoin_secs: self.last_rejoin.map(|t| t.elapsed().as_secs()),
             };
+            let lobby = r.lobby;
+            // 一覧の待機中の行から入ったが先に別の人が入っていた。
+            if f == Failure::RoomInUse && lobby.is_some_and(|m| !m.created) {
+                return self.lobby_gone("選んだ相手には先に別の人が入っていた");
+            }
+            // 相手のコードを読む前に相手が抜けた。作った側は同じ割り当てのルームで待ち続け、入った側は一覧へ戻る。
+            if f == Failure::PeerLeft {
+                match lobby {
+                    Some(m) if m.created => return self.lobby_reenter(),
+                    Some(_) => {
+                        return self.lobby_gone("選んだ相手が待機をやめていた");
+                    }
+                    None => {}
+                }
+            }
             if should_rejoin(f, &s) {
-                return self.room_rejoin();
+                // 一覧へ作った待機中の1件は新しい割り当てのルーム名で作り直す。
+                return match lobby {
+                    Some(m) if m.created => self.lobby_recreate("ルームの期限が切れた"),
+                    _ => self.room_rejoin(),
+                };
             }
         }
         if let Failure::RateLimited { retry_after_secs } = f {
@@ -1596,7 +2097,11 @@ impl GameWatcher {
     /// 使えるコードが`window`の間に届かなかったら待ちをやめる（ネットワークは終えない。メニューからやり直せる）。
     fn check_window(&mut self) {
         // ルームマッチで待つ間はルームの期限（10分。サーバーが4408で切り、coreが予備の期限を持つ）に任せる。LANは`lan_tick`が自分の上限で見る。
-        if self.room.is_some() || self.queue.is_some() || self.ui.lan.is_some() {
+        if self.room.is_some()
+            || self.queue.is_some()
+            || self.lobby.is_some()
+            || self.ui.lan.is_some()
+        {
             return;
         }
         let Some(t) = self.started else {
@@ -1669,8 +2174,10 @@ impl GameWatcher {
             }
             // ルームの処理（受信は別のスレッドが積む。ここは取り出して手順を進めるだけなので止まらない）。
             self.lan_tick();
+            self.lobby_tick();
             self.queue_tick();
             self.room_tick();
+            self.sync_own_lobby();
             self.check_shape_late();
             self.check_window();
             std::thread::sleep(GAME_POLL);
@@ -1697,7 +2204,7 @@ fn room_failure_event(f: Failure) -> Event {
         Failure::Unresponsive(_) => Event::RoomUnresponsive,
         Failure::RateLimited { .. } => Event::RoomBusy,
         // 古いサーバーは対戦のルームの3人目にroom_fullを返す。どちらも同じルーム名を2人が使っている。
-        Failure::RoomFull | Failure::RoomInUse => Event::RoomInUse,
+        Failure::RoomFull | Failure::ListFull | Failure::RoomInUse => Event::RoomInUse,
         Failure::BadRoomName => Event::RoomRefused,
         Failure::Expired => Event::RoomExpired,
         Failure::PeerLeft => Event::RoomPeerLeft,
@@ -1818,6 +2325,8 @@ pub fn start_game(
             if let Some(b) = lan {
                 b.close();
             }
+            // パニックで抜けても待っていないメニューに自分の待機中の行が残らないようにする。
+            w.clear_own_lobby();
         })
         .map_err(|e| format!("接続コードの見張りのスレッドの作成不能: {e}"))?;
     Ok((Watch::from_parts(shared, join), note, parts))
@@ -2845,8 +3354,10 @@ mod tests {
         let t0 = Instant::now();
         loop {
             for s in sides.iter_mut() {
+                s.w.lobby_tick();
                 s.w.queue_tick();
                 s.w.room_tick();
+                s.w.sync_own_lobby();
                 s.w.check_window();
             }
             if stop(sides) {
@@ -3550,6 +4061,583 @@ mod tests {
             assert_eq!(offers(), before, "{stop:?} の後に入り直した");
             assert!(!log_of(&c).contains("入り直した"), "{}", log_of(&c));
         }
+    }
+
+    // ---- ルーム名ごとの一覧の経路 ----
+
+    const LOBBY_BUILD: u32 = 14;
+
+    fn lobby_side(name: &str, port: u16, nonce: u64, base: &str) -> Side {
+        let mut s = side_with(
+            name,
+            port,
+            nonce,
+            T,
+            &format!("room_server = {base}\n"),
+            Some(room_opts(base)),
+        );
+        s.w.build = LOBBY_BUILD;
+        s
+    }
+
+    /// メニューの指示を監視の処理へ渡す（`UiLink::send` ＋ 指示の取り出し。本物の経路と同じ）。
+    fn order(s: &mut Side, c: Cmd) {
+        s.link.send(c);
+        while let Some(o) = s.link.take_order() {
+            s.w.handle(o);
+        }
+    }
+
+    fn typed(name: &str) -> RoomBuf {
+        RoomBuf::from_name(name).unwrap()
+    }
+
+    /// 一覧へ作って割り当てのルームで待つところまで進め、割り当てのルーム名を返す。
+    fn lobby_wait(srv: &FakeServer, a: &mut Side, name: &str) -> LobbyRoom {
+        let key = name.to_lowercase();
+        order(a, Cmd::LobbyCreate(typed(name)));
+        let n = a.link.note().unwrap();
+        assert_eq!(
+            (n.event, n.state),
+            (Event::RoomJoining, CodeState::RoomJoining)
+        );
+        pump(&mut [&mut *a], 5, |s| {
+            s[0].link.note().unwrap().state == CodeState::RoomWaiting
+                && srv.lobby_wait_rooms(LOBBY_BUILD, &key).len() == 1
+        });
+        let rooms = srv.lobby_wait_rooms(LOBBY_BUILD, &key);
+        LobbyRoom::parse(&rooms[0]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_lobby_creator_waits_and_a_joiner_from_the_list_meets_it() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        let mut a = lobby_side("alice", 41_141, 0xF000, &base);
+        let mut b = lobby_side("bob", 41_142, 0x0F00, &base);
+        let room = lobby_wait(&srv, &mut a, "Synth-Lobby");
+        assert!(a.w.lobby.is_some(), "待つ間に一覧の接続を閉じた");
+        assert_eq!(
+            srv.lobby_rows(LOBBY_BUILD, "synth-lobby"),
+            ["wait:alice"],
+            "待機中の 1 件として載っていない"
+        );
+        assert_eq!(
+            a.w.room.as_ref().map(|r| (r.name, r.side)),
+            Some((room.name(), Some(CodeSide::Offer))),
+            "割り当てのルームで始める側として待っていない"
+        );
+        assert_eq!(shown_room(&a.link.note().unwrap()), "Synth-Lobby");
+        assert_eq!(
+            a.link.own_lobby(),
+            Some(room),
+            "待つ間にメニューへ自分の行を渡していない"
+        );
+        // 2人目は一覧の行（割り当てのルーム名）から入る。
+        order(&mut b, Cmd::LobbyJoin(typed("synth-lobby"), room));
+        assert_eq!(b.link.note().unwrap().event, Event::RoomJoining);
+        pump(&mut [&mut a, &mut b], 5, |s| {
+            s.iter().all(|x| x.slot.generation() > 0)
+        });
+        for (s, created) in [(&a, true), (&b, false)] {
+            let n = s.link.note().unwrap();
+            assert_eq!(
+                (n.event, n.state),
+                (Event::RoomPeer, CodeState::RoomLinking)
+            );
+            assert!(
+                s.w.met_lobby
+                    .is_some_and(|m| m.created == created && m.room == room),
+                "一覧の材料を覚えていない（作った側 {created}）"
+            );
+            assert_eq!(
+                shown_room(&n),
+                if created {
+                    "Synth-Lobby"
+                } else {
+                    "synth-lobby"
+                }
+            );
+        }
+        assert_eq!(
+            b.w.room.as_ref().and_then(|r| r.side),
+            Some(CodeSide::Answer)
+        );
+        assert!(
+            a.w.lobby.is_none(),
+            "相手と会った後も待機中の1件を持っている"
+        );
+        a.w.sync_own_lobby();
+        assert_eq!(a.link.own_lobby(), None, "会った後も自分の行を渡している");
+        pump(&mut [&mut a, &mut b], 5, |_| {
+            srv.lobby_rows(LOBBY_BUILD, "synth-lobby").is_empty()
+        });
+        for s in [&a, &b] {
+            let log = log_of(s);
+            assert!(
+                !log.contains(room.name().as_str()),
+                "割り当てのルーム名: {log}"
+            );
+            assert!(
+                !log.to_lowercase().contains("synth-lobby"),
+                "ルーム名: {log}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_joiner_goes_back_to_the_list_when_the_room_is_empty_or_taken() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        // 作った人がもういない（誰もいない割り当てのルームにhostとして入る）。
+        let mut b = lobby_side("bob", 41_143, 0x0F00, &base);
+        let empty = LobbyRoom::parse("r.0000000000000000000000000000ff").unwrap();
+        let t0 = Instant::now();
+        order(&mut b, Cmd::LobbyJoin(typed("synth-gone"), empty));
+        pump(&mut [&mut b], 8, |s| {
+            s[0].link.note().unwrap().event == Event::LobbyGone
+        });
+        assert!(
+            t0.elapsed() >= LOBBY_HOST_GRACE,
+            "作った人を待たずに一覧へ戻った: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(b.link.note().unwrap().state, CodeState::Idle);
+        assert!(b.w.room.is_none(), "入室をやめていない");
+        assert!(log_of(&b).contains("一覧へ戻します"), "{}", log_of(&b));
+        // 先に別の人が入っていた（409 room_in_use）。
+        let mut a = lobby_side("alice", 41_144, 0xF000, &base);
+        let room = lobby_wait(&srv, &mut a, "synth-taken");
+        order(&mut b, Cmd::LobbyJoin(typed("synth-taken"), room));
+        pump(&mut [&mut a, &mut b], 5, |s| {
+            s.iter().all(|x| x.slot.generation() > 0)
+        });
+        let mut c = lobby_side("carol", 41_145, 0x00F0, &base);
+        order(&mut c, Cmd::LobbyJoin(typed("synth-taken"), room));
+        pump(&mut [&mut c], 5, |s| {
+            s[0].link.note().unwrap().event == Event::LobbyGone
+        });
+        assert!(c.w.room.is_none());
+        assert_eq!(c.slot.generation(), 0);
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（2 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_creator_makes_a_new_room_when_the_room_or_the_list_entry_expires() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        // ルームの期限切れ。
+        srv.knobs
+            .room_ttl_ms
+            .store(400, std::sync::atomic::Ordering::Release);
+        let mut a = lobby_side("alice", 41_146, 0xF000, &base);
+        let first = lobby_wait(&srv, &mut a, "synth-exp");
+        pump(&mut [&mut a], 5, |s| {
+            let rooms = srv.lobby_wait_rooms(LOBBY_BUILD, "synth-exp");
+            rooms.len() == 1
+                && rooms[0] != first.name().as_str()
+                && s[0].link.note().unwrap().state == CodeState::RoomWaiting
+                && s[0].w.room.is_some()
+        });
+        assert_ne!(a.link.note().unwrap().event, Event::RoomExpired);
+        assert!(log_of(&a).contains("作り直した"), "{}", log_of(&a));
+        srv.knobs
+            .room_ttl_ms
+            .store(0, std::sync::atomic::Ordering::Release);
+        // 一覧の待機中の1件の期限切れ（サーバーは生存確認が途絶えたら閉じる）。
+        let mut d = lobby_side("dave", 41_147, 0x000F, &base);
+        let first = lobby_wait(&srv, &mut d, "synth-exp2");
+        srv.expire_lobby(LOBBY_BUILD, "synth-exp2", true);
+        pump(&mut [&mut d], 5, |s| {
+            let rooms = srv.lobby_wait_rooms(LOBBY_BUILD, "synth-exp2");
+            rooms.len() == 1
+                && rooms[0] != first.name().as_str()
+                && s[0].w.room.is_some()
+                && s[0].w.lobby.is_some()
+        });
+        assert_eq!(d.link.note().unwrap().state, CodeState::RoomWaiting);
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_full_list_ends_the_wait_with_its_own_line() {
+        let srv = FakeServer::start();
+        srv.knobs
+            .lobby_full
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut a = lobby_side("alice", 41_148, 0xF000, &srv.base());
+        order(&mut a, Cmd::LobbyCreate(typed("synth-full")));
+        pump(&mut [&mut a], 5, |s| {
+            s[0].link.note().unwrap().event == Event::LobbyFull
+        });
+        assert_eq!(a.link.note().unwrap().state, CodeState::Idle);
+        assert!(a.w.lobby.is_none() && a.w.room.is_none());
+    }
+
+    #[test]
+    fn the_lobby_post_needs_the_host_a_ticket_and_a_lobby_meeting() {
+        use higanr_core::lockstep::Role;
+        let room = LobbyRoom::parse("r.0000000000000000000000000000aa").unwrap();
+        let meet = LobbyMeet {
+            name: RoomName::parse("synth-post").unwrap(),
+            room,
+            created: true,
+        };
+        // 一覧の経路でない・ゲスト・チケットが無い: 載せない（接続もしない）。
+        let s = no_spectate_side();
+        let mut s = s;
+        mark_listing(&s, Some(Role::Host), true);
+        s.w.met_ticket = Some(synth_ticket());
+        s.w.start_lobby_post();
+        assert!(s.w.poster.is_none(), "一覧の経路でないのに載せた");
+        let mut s = no_spectate_side();
+        mark_listing(&s, Some(Role::Guest), true);
+        s.w.met_lobby = Some(meet);
+        s.w.met_ticket = Some(synth_ticket());
+        s.w.start_lobby_post();
+        assert!(s.w.poster.is_none(), "ゲストが載せた");
+        let mut s = no_spectate_side();
+        mark_listing(&s, Some(Role::Host), false);
+        s.w.met_lobby = Some(meet);
+        s.w.start_lobby_post();
+        assert!(s.w.poster.is_none(), "チケットが無いのに載せた");
+        assert!(log_of(&s).contains("入室許可を未発行"), "{}", log_of(&s));
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn the_lobby_host_posts_the_match_with_or_without_watching() {
+        use higanr_core::lockstep::Role;
+        let srv = FakeServer::start();
+        // （2人とも観戦を許可・観戦の受付の材料がある）→ 観戦可で載るか。
+        for (i, (may_list, kit, watch)) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let room = LobbyRoom::parse(&format!("r.{:030x}", 0xa0 + i)).unwrap();
+            let port = 41_150 + i as u16;
+            let mut s = lobby_side("alice", port, 0xF000, &srv.base());
+            if kit {
+                let a = arm_with(
+                    &s.w.s,
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    None,
+                    None,
+                    None,
+                    Some(room_opts(&srv.base())),
+                    || Ok(0x5EED_0C02),
+                    || Ok(Secret([0x32; 16])),
+                )
+                .unwrap();
+                a.kit.shared().set_spectators(3);
+                s.w.set_spectate(a.kit);
+            }
+            mark_listing(&s, Some(Role::Host), may_list);
+            s.w.met_room = Some(room.name());
+            s.w.met_lobby = Some(LobbyMeet {
+                name: RoomName::parse("Synth-Post").unwrap(),
+                room,
+                created: false,
+            });
+            s.w.met_ticket = Some(srv.mint_ticket(&room.name().spectate_of()));
+            if kit {
+                // 観戦の受付のスレッドは作らず、載せる接続だけを見る（観戦者の数は受付の集計から送る）。
+                s.w.start_lobby_post();
+            } else {
+                // 観戦の受付の材料が無くても一覧には載る。
+                s.w.start_casting();
+            }
+            assert!(s.w.poster.is_some(), "{}", log_of(&s));
+            let want = format!("play:alice:?:{watch}:{}", if watch { 3 } else { 0 });
+            let t0 = Instant::now();
+            while srv.lobby_rows(LOBBY_BUILD, "synth-post") != [want.clone()] {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(5),
+                    "{want} にならない: {:?}",
+                    srv.lobby_rows(LOBBY_BUILD, "synth-post")
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // 接続の後の定期処理を終えるまで持ち続け、終えたら外れる。
+            s.slot.mark_done();
+            s.w.serve_linked();
+            assert!(s.w.poster.is_none());
+            assert!(
+                log_of(&s).contains("ルーム名ごとの一覧: 試合中として載った"),
+                "{}",
+                log_of(&s)
+            );
+            let t0 = Instant::now();
+            while !srv.lobby_rows(LOBBY_BUILD, "synth-post").is_empty() {
+                assert!(t0.elapsed() < Duration::from_secs(5), "外れない");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// 一覧へ`create`だけして割り当てのルームにはまだ入っていない作った人（一覧の接続と割り当てのルーム名）。
+    fn created_only(srv: &FakeServer, name: &str) -> (LobbyConn, LobbyRoom) {
+        let mut c = LobbyConn::start_lobby(
+            &room_opts(&srv.base()),
+            LOBBY_BUILD,
+            &RoomName::parse(name).unwrap(),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        let mut sent = false;
+        loop {
+            for e in c.poll() {
+                match e {
+                    LobbyEvent::List { .. } if !sent => {
+                        sent = c.create(&WatchName::parse("alice").unwrap());
+                    }
+                    LobbyEvent::Created { room } => return (c, room),
+                    LobbyEvent::Failed(f) => panic!("作れない: {f:?}"),
+                    _ => {}
+                }
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "載らない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_joiner_who_enters_before_the_creator_waits_for_it_and_meets_it() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        let (conn, room) = created_only(&srv, "synth-early");
+        let mut b = lobby_side("bob", 41_160, 0x0F00, &base);
+        order(&mut b, Cmd::LobbyJoin(typed("synth-early"), room));
+        pump(&mut [&mut b], 5, |s| {
+            s[0].w
+                .room
+                .as_ref()
+                .is_some_and(|r| r.side == Some(CodeSide::Offer))
+        });
+        assert_ne!(b.link.note().unwrap().event, Event::LobbyGone);
+        // 作った人が遅れて割り当てのルームへ入る（`lobby_create_start`の後に`created`を受けた形）。
+        let name = RoomName::parse("synth-early").unwrap();
+        let mut a = lobby_side("alice", 41_161, 0xF000, &base);
+        a.w.lobby_gen = a.w.lobby_gen.wrapping_add(1);
+        a.w.lobby = Some(LobbyRun {
+            conn,
+            name,
+            sent: true,
+        });
+        a.w.begin_room_wait(&name);
+        a.w.choose(Route::Room);
+        a.w.lobby_created(room);
+        pump(&mut [&mut a, &mut b], 5, |s| {
+            s.iter().all(|x| x.slot.generation() > 0)
+        });
+        assert_eq!(
+            (
+                a.w.room.as_ref().and_then(|r| r.side),
+                b.w.room.as_ref().and_then(|r| r.side)
+            ),
+            (Some(CodeSide::Answer), Some(CodeSide::Offer)),
+            "先に入った側が始める側にならない"
+        );
+        for (s, created) in [(&a, true), (&b, false)] {
+            assert_eq!(s.link.note().unwrap().event, Event::RoomPeer);
+            assert!(
+                s.w.met_lobby
+                    .is_some_and(|m| m.created == created && m.room == room),
+                "一覧の材料を覚えていない（作った側 {created}）"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（2 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_creator_reenters_its_room_when_the_peer_leaves_before_its_code_is_read() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        let mut a = lobby_side("alice", 41_162, 0xF000, &base);
+        let room = lobby_wait(&srv, &mut a, "synth-left");
+        // 相手が入り、作った人のコードを受けてから返さずに抜ける（作った人には4410が届く）。
+        let mut peer = RoomConn::start(&room_opts(&base), &room.name()).unwrap();
+        let t0 = Instant::now();
+        while !peer
+            .poll()
+            .into_iter()
+            .any(|e| matches!(e, room::Event::PeerCode(_)))
+        {
+            a.w.lobby_tick();
+            a.w.room_tick();
+            assert!(t0.elapsed() < Duration::from_secs(5), "コードが届かない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        peer.cancel();
+        pump(&mut [&mut a], 5, |s| {
+            log_of(s[0]).contains("同じ割り当てのルームへ入り直して")
+                && s[0].w.room.as_ref().is_some_and(|r| {
+                    r.name == room.name() && r.side == Some(CodeSide::Offer) && !r.peer_came
+                })
+        });
+        let n = a.link.note().unwrap();
+        assert_ne!(n.event, Event::RoomPeerLeft, "待ちを終えた");
+        assert_eq!(n.state, CodeState::RoomWaiting);
+        assert!(a.w.lobby.is_some(), "一覧の接続を閉じた");
+        assert_eq!(srv.lobby_rows(LOBBY_BUILD, "synth-left"), ["wait:alice"]);
+        assert_eq!(
+            srv.lobby_wait_rooms(LOBBY_BUILD, "synth-left"),
+            [room.name().as_str().to_string()],
+            "待機中の行の割り当てのルームが変わった"
+        );
+        // 次の相手は同じ行から会える。
+        let mut b = lobby_side("bob", 41_163, 0x0F00, &base);
+        order(&mut b, Cmd::LobbyJoin(typed("synth-left"), room));
+        pump(&mut [&mut a, &mut b], 5, |s| {
+            s.iter().all(|x| x.slot.generation() > 0)
+        });
+        assert!(!log_of(&a).contains(room.name().as_str()), "{}", log_of(&a));
+    }
+
+    #[test]
+    #[ignore = "loopback の偽サーバーと本物の WinHTTP で実時間に回す（1 秒ほど）。全件の回（build.bat）で --ignored で走る"]
+    fn a_joiner_goes_back_to_the_list_when_the_creator_leaves_before_its_code_is_read() {
+        let srv = FakeServer::start();
+        let base = srv.base();
+        // 作った人の代わりにhostとして入り、コードを渡さずに抜ける（入った側には4410が届く）。
+        let (_list, room) = created_only(&srv, "synth-quit");
+        let mut host = RoomConn::start(&room_opts(&base), &room.name()).unwrap();
+        let t0 = Instant::now();
+        while !host
+            .poll()
+            .into_iter()
+            .any(|e| matches!(e, room::Event::Joined { .. }))
+        {
+            assert!(t0.elapsed() < Duration::from_secs(5), "入れない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut b = lobby_side("bob", 41_164, 0x0F00, &base);
+        order(&mut b, Cmd::LobbyJoin(typed("synth-quit"), room));
+        pump(&mut [&mut b], 5, |s| {
+            s[0].w
+                .room
+                .as_ref()
+                .is_some_and(|r| r.side == Some(CodeSide::Answer))
+        });
+        host.cancel();
+        pump(&mut [&mut b], 5, |s| {
+            s[0].link.note().unwrap().event == Event::LobbyGone
+        });
+        assert_eq!(b.link.note().unwrap().state, CodeState::Idle);
+        assert!(b.w.room.is_none(), "入室をやめていない");
+        assert!(log_of(&b).contains("待機をやめていた"), "{}", log_of(&b));
+    }
+
+    #[test]
+    fn going_back_to_the_list_drops_the_rest_of_the_polls_room_events() {
+        let mut s = no_spectate_side();
+        let room = LobbyRoom::parse("r.0000000000000000000000000000ab").unwrap();
+        s.w.room = Some(RoomRun {
+            conn: RoomConn::start(&room_opts("ws://127.0.0.1:9"), &room.name()).unwrap(),
+            name: room.name(),
+            side: Some(CodeSide::Answer),
+            peer_came: false,
+            sw: None,
+            placed: false,
+            lobby: Some(LobbyMeet {
+                name: RoomName::parse("synth-g").unwrap(),
+                room,
+                created: false,
+            }),
+            lobby_wait_until: None,
+        });
+        s.w.on_room_events(vec![
+            room::Event::Failed(Failure::PeerLeft),
+            room::Event::Failed(Failure::Unresponsive(room::Why::Lost)),
+        ]);
+        assert_eq!(s.link.note().unwrap().event, Event::LobbyGone);
+        assert!(s.w.room.is_none());
+    }
+
+    fn lobby_room_run(room: LobbyRoom, created: bool) -> RoomRun {
+        RoomRun {
+            conn: RoomConn::start(&room_opts("ws://127.0.0.1:9"), &room.name()).unwrap(),
+            name: room.name(),
+            side: None,
+            peer_came: false,
+            sw: None,
+            placed: false,
+            lobby: Some(LobbyMeet {
+                name: RoomName::parse("synth-own").unwrap(),
+                room,
+                created,
+            }),
+            lobby_wait_until: None,
+        }
+    }
+
+    #[test]
+    fn the_menu_is_told_the_room_i_wait_in_until_the_wait_ends() {
+        let mut s = no_spectate_side();
+        let room = LobbyRoom::parse("r.0000000000000000000000000000cd").unwrap();
+        assert_eq!(s.link.own_lobby(), None);
+        // 一覧の待機中の行から入った側は自分の行ではないので渡さない。
+        s.w.room = Some(lobby_room_run(room, false));
+        s.w.sync_own_lobby();
+        assert_eq!(s.link.own_lobby(), None, "入った側が自分の行にした");
+        // 作って待つ間は渡す。
+        s.w.room = Some(lobby_room_run(room, true));
+        s.w.sync_own_lobby();
+        assert_eq!(s.link.own_lobby(), Some(room), "待つ間に渡していない");
+        // 相手のコードを読んだ後（placed）は載っていない。
+        s.w.room.as_mut().unwrap().placed = true;
+        s.w.sync_own_lobby();
+        assert_eq!(s.link.own_lobby(), None, "成立した後も残った");
+        // 取りやめ・失敗・監視の処理の終わりでも消える。
+        for end in 0..3 {
+            s.w.room = Some(lobby_room_run(room, true));
+            s.w.sync_own_lobby();
+            assert_eq!(s.link.own_lobby(), Some(room));
+            match end {
+                0 => s.w.leave_room(),
+                1 => s.w.room_end(Event::Internal),
+                _ => s.w.clear_own_lobby(),
+            }
+            assert_eq!(s.link.own_lobby(), None, "終わり方 {end} で残った");
+        }
+        // 割り当てのルームを入れ替えたら新しい方（作り直し）。
+        let next = LobbyRoom::parse("r.0000000000000000000000000000ce").unwrap();
+        s.w.room = Some(lobby_room_run(room, true));
+        s.w.sync_own_lobby();
+        s.w.room = Some(lobby_room_run(next, true));
+        s.w.sync_own_lobby();
+        assert_eq!(s.link.own_lobby(), Some(next));
+    }
+
+    /// 配線の検査（文の中身はここでは作れない）。
+    #[test]
+    fn the_watch_loop_and_the_thread_end_keep_the_own_lobby_in_sync() {
+        let src = include_str!("net_code_game.rs");
+        let body = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            body.contains("self.room_tick();\n            self.sync_own_lobby();"),
+            "見張りの周期で自分の待ちを合わせていない"
+        );
+        assert!(
+            body.contains("w.clear_own_lobby();"),
+            "見張りが終わったときに消していない"
+        );
+        let created = body
+            .split("fn lobby_created(")
+            .nth(1)
+            .and_then(|t| t.split("\n    fn ").next())
+            .unwrap();
+        assert!(
+            created.contains("self.sync_own_lobby();"),
+            "一覧に載った直後に渡していない"
+        );
     }
 
     /// 配線の検査（文の中身はここでは作れない）。
@@ -5572,7 +6660,7 @@ mod tests {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let typed = "Synth-Watch-ROOM";
@@ -5989,7 +7077,7 @@ mod tests {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: false,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let glyphs = ui_glyphs();

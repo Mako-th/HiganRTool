@@ -6,10 +6,10 @@
 //! 列の長さは帯域の`buffer_ms`ぶん。越えた便は落とす。
 //! 相手 → ホストの向きは絞らない（ホストの上りだけの模型）。
 
-use super::catchup::{Display, Policy};
+use super::catchup::{Display, FF_FPS_HOST_CAP, Policy};
 use super::*;
 use higanr_core::rtt_probe::{DelayProbe, DelaySnapshot, EchoClock};
-use higanr_core::spectate_pace::FF_UPDATES_DEFAULT;
+use higanr_core::spectate_pace::{FF_FPS_DEFAULT, join_updates};
 use higanr_core::wire::Stamp;
 use std::collections::VecDeque;
 
@@ -168,7 +168,7 @@ pub(super) struct BwCase {
     pub live: u16,
     pub late: u16,
     pub late_s: u32,
-    pub ff_max: u32,
+    pub ff_fps: u32,
     /// 有れば固定の全体の上限（B/s。観戦者ごとの上限と往復の延びによる下げなし）で比べる。
     pub fixed: Option<u32>,
     /// falseなら往復を観戦者への送信へ渡さない。
@@ -232,8 +232,8 @@ pub(super) fn run_bw(c: BwCase) -> BwOutcome {
         let at = if n <= c.live { 0 } else { start };
         sim.add_watcher(n, at, 0, ASM_CAP);
         let w = sim.watchers.last_mut().expect("足した");
-        w.w.set_ff_max(c.ff_max);
-        w.display = Some(Box::new(Display::new(Policy::Pace, one_way, c.ff_max)));
+        w.w.set_ff_max(u32::from(join_updates(c.ff_fps)));
+        w.display = Some(Box::new(Display::new(Policy::Pace, one_way, c.ff_fps)));
     }
     let end = start + c.limit_s * 1_000;
     let mut done_at: Option<u32> = None;
@@ -311,12 +311,12 @@ pub(super) fn run_bw(c: BwCase) -> BwOutcome {
 
 fn line(label: &str, c: &BwCase, o: &BwOutcome) -> String {
     format!(
-        "| {label} | {} kbps | {} ms | 追いついている {} 人 + 遅れて入る {} 人（ff_max {}） | {} | {:.1} / {:.1} / {:.1} ms | {:.1} ms | {} / {} | {} | {}・{}・{} |",
+        "| {label} | {} kbps | {} ms | 追いついている {} 人 + 遅れて入る {} 人（ff_fps {}） | {} | {:.1} / {:.1} / {:.1} ms | {:.1} ms | {} / {} | {} | {}・{}・{} |",
         c.bps / 1_000,
         c.rtt,
         c.live,
         c.late,
-        c.ff_max,
+        c.ff_fps,
         o.waits.len(),
         f64::from(o.max()) / 1_000.0,
         f64::from(o.pct(99)) / 1_000.0,
@@ -334,7 +334,7 @@ fn line(label: &str, c: &BwCase, o: &BwOutcome) -> String {
     )
 }
 
-fn case(bps: u64, live: u16, late: u16, ff_max: u32) -> BwCase {
+fn case(bps: u64, live: u16, late: u16, ff_fps: u32) -> BwCase {
     BwCase {
         bps,
         buffer_ms: 250,
@@ -342,7 +342,7 @@ fn case(bps: u64, live: u16, late: u16, ff_max: u32) -> BwCase {
         live,
         late,
         late_s: 30,
-        ff_max,
+        ff_fps,
         fixed: None,
         feed: true,
         seed: 0x5EED_B4D0,
@@ -369,9 +369,9 @@ const DUEL_WAIT_MAX_MS: u32 = higanr_core::spectate_rate::TARGET_MS;
 /// 追いつく間に対戦の便が列で待つ増分は最大でも`DUEL_WAIT_MAX_MS`以下。対戦の便は1通も落ちず、観戦者は追いつく。
 #[test]
 fn a_late_spectator_catching_up_on_a_thin_uplink_keeps_the_match_flow_wait_under_the_target() {
-    let ff_top = higanr_core::spectate_pace::FF_UPDATES_MAX;
+    let ff_top = FF_FPS_HOST_CAP;
     for bps in [1_000_000, 500_000] {
-        for (live, late, ff) in [(1, 1, FF_UPDATES_DEFAULT), (1, 1, ff_top), (0, 2, ff_top)] {
+        for (live, late, ff) in [(1, 1, FF_FPS_DEFAULT), (1, 1, ff_top), (0, 2, ff_top)] {
             let c = case(bps, live, late, ff);
             let o = run_bw(c);
             eprintln!("{}", line("新", &c, &o));
@@ -400,7 +400,7 @@ fn when_live_spectators_alone_fill_the_uplink_the_host_pauses_them_and_the_match
         late: 0,
         late_s: 10,
         limit_s: 20,
-        ..case(250_000, 10, 0, FF_UPDATES_DEFAULT)
+        ..case(250_000, 10, 0, FF_FPS_DEFAULT)
     };
     let adaptive = run_bw(c);
     let blind = run_bw(blind_of(c));
@@ -446,7 +446,7 @@ const BW_LIVE_P99_MAX_MS: u32 = 210;
 #[test]
 fn when_the_caps_exceed_the_uplink_the_host_stops_raising_and_the_match_flow_waits_less_than_without_it()
  {
-    let c = case(200_000, 0, 2, higanr_core::spectate_pace::FF_UPDATES_MAX);
+    let c = case(200_000, 0, 2, FF_FPS_HOST_CAP);
     let adaptive = run_bw(c);
     let blind = run_bw(blind_of(c));
     eprintln!(
@@ -477,11 +477,11 @@ const BW_THIN_MAX_MS: u32 = 80;
 /// 追いついている8人（1人1秒に約3 KB）がいても遅れて入った1人は自分の上限の速さで追いつく（上りは絞らない）。
 #[test]
 fn live_spectators_do_not_use_up_the_total_cap_of_a_late_one() {
-    let c = case(100_000_000, 8, 1, FF_UPDATES_DEFAULT);
+    let c = case(100_000_000, 8, 1, FF_FPS_DEFAULT);
     let o = run_bw(c);
     eprintln!("{}", line("新", &c, &o));
     let ms = o.catchup_ms.expect("追いつかない");
-    // ff_max 8の1人だけのときと同じ速さ（30秒の遅れを8倍で約4.5秒）に余白を足した値。
+    // ff_fps 480の1人だけのときと同じ速さ（30秒の遅れを8倍で約4.5秒）に余白を足した値。
     assert!(ms <= 7_000, "追いつくまで {ms} ms");
 }
 
@@ -493,7 +493,11 @@ fn measure_the_match_flow_wait_on_thin_uplinks_new_and_old() {
         "| 形 | 上り | 往復 | 観戦者 | 対戦の便の数 | 列で待った 最大 / p99 / p50 | 入る前の最大 | 落ちた対戦の便 / 落ちた便 | 追いつくまで | 下げ・止め・戻し |"
     );
     for bps in [1_000_000, 500_000, 200_000] {
-        for (live, late, ff) in [(1, 1, FF_UPDATES_DEFAULT), (1, 1, 16), (0, 2, 16)] {
+        for (live, late, ff) in [
+            (1, 1, FF_FPS_DEFAULT),
+            (1, 1, FF_FPS_HOST_CAP),
+            (0, 2, FF_FPS_HOST_CAP),
+        ] {
             let c = case(bps, live, late, ff);
             let new = run_bw(c);
             eprintln!("{}", line("新", &c, &new));

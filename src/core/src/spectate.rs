@@ -78,7 +78,7 @@ const SLOTS_PER_IDENTITY: usize = 2;
 /// 1記録は36 B（名前の記録が最大。`wire::tests::a_record_stays_within_36_bytes`が検証する）なので全体で約9.4 MB（起動時に1回確保）。
 pub const RING_CAP: usize = 262_144;
 /// 遅れてJOINした観戦者を、いまのマッチの始まりより前の選択があったマッチまで遡らせてよい記録の数（60 fpsで20分）。
-/// 観戦者の早送りは既定8倍（`ff_max`）。
+/// 観戦者の早送りは既定8倍（`ff_fps` 480）。
 /// そのため遡った分を追うのに3分近く（16倍で80秒ほど）と再戦ごとの読み込みがかかる（外挿）。
 /// 越えたら遡らず、観戦者は次の選択を待つ。
 pub const REWIND_MAX: u32 = 72_000;
@@ -2276,7 +2276,7 @@ impl Watcher {
         self.build = build;
     }
 
-    /// JOINに載せる早送りの速さ（iniの`[spectate] ff_max`。1〜16に収める）。ホストはこれで追いつき送信の上限を決める。
+    /// JOINに載せる早送りの速さ（1表示あたりの更新の数。`spectate_pace::join_updates`の値を渡す。1〜16に収める）。ホストはこれで追いつき送信の上限を決める。
     pub fn set_ff_max(&mut self, ff_max: u32) {
         self.ff_max = ff_max.clamp(FF_UPDATES_MIN, FF_UPDATES_MAX) as u8;
     }

@@ -10,6 +10,7 @@
 //! 監視のスレッドで回す。ゲームのスレッドでは呼ばない（一覧をゲームのスレッドへ渡すバッファは[`WatchSnapshot`]・[`WatchRow::to_words`]）。
 #![forbid(unsafe_code)]
 
+use crate::lobby::{LobbyPosting, parse_lobby_host_message, write_lobby_post};
 use crate::room::{
     CloseCode, Failure, Fields, JsonAt, JsonValue, MESSAGE_MAX_BYTES, MsgError, Now,
     PING_INTERVAL_MS, PING_TEXT, PONG_TIMEOUT_MS, ROOM_GREETING_TIMEOUT_MS, RoomName, SeatTicket,
@@ -258,7 +259,7 @@ impl WatchRow {
     }
 }
 
-fn mode_wire(m: Mode) -> &'static str {
+pub(crate) fn mode_wire(m: Mode) -> &'static str {
     match m {
         Mode::Rollback => "rollback",
         Mode::Delay => "delay",
@@ -290,7 +291,7 @@ fn int_in(f: &Fields<'_, '_>, key: &'static str, lo: i64, hi: i64) -> Option<i64
 }
 
 /// サーバーの一覧の1行を読む。決まりの外なら`None`。
-fn read_row(pairs: &[(std::borrow::Cow<'_, str>, JsonValue<'_>)]) -> Option<WatchRow> {
+pub(crate) fn read_row(pairs: &[(std::borrow::Cow<'_, str>, JsonValue<'_>)]) -> Option<WatchRow> {
     let f = Fields(pairs);
     let hash = parse_hash(f.str("room").ok()?)?;
     let p1 = WatchName::parse(f.str("p1").ok()?)?;
@@ -394,6 +395,8 @@ pub enum HostMsg {
     /// `post`が通って一覧に載った。
     Listed,
     Pong,
+    /// ルーム名ごとの一覧の接続が開いた直後に届く一覧の全体。載せる側は使わないので読み捨てる（[`crate::lobby`]）。
+    Ignored,
     /// 閉じる直前の1通。知らない名は`None`。
     Error {
         code: Option<CloseCode>,
@@ -477,7 +480,7 @@ impl core::fmt::Debug for Posting {
 }
 
 /// JSONの文字列に入れる形にする。名前は0x20〜0x7Eだけだが制御文字もエスケープして文を壊さない。
-fn json_escaped(s: &str) -> String {
+pub(crate) fn json_escaped(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -494,16 +497,49 @@ fn json_escaped(s: &str) -> String {
 /// 名前は`"` `\`を含みうるのでエスケープする。
 /// ルーム名・方式・チケットはエスケープの要らない文字だけ（作る前に検証してある）なのでそのまま書く。
 pub fn write_post(p: &Posting, watchers: u8) -> String {
+    post_text(&PostFields {
+        room: p.room.name().as_str(),
+        p1: p.p1,
+        p2: p.p2,
+        mode: p.mode,
+        delay: p.delay,
+        watch: None,
+        watchers,
+        cap: p.cap,
+        ticket: p.ticket.as_str(),
+    })
+}
+
+/// `post`の文の中身。ランダム対戦の一覧とルーム名ごとの一覧（`watch`が付く）が共有する。
+pub(crate) struct PostFields<'a> {
+    pub room: &'a str,
+    pub p1: WatchName,
+    pub p2: WatchName,
+    pub mode: Mode,
+    pub delay: u8,
+    /// ルーム名ごとの一覧だけ。観戦を許可しているペアかどうか。
+    pub watch: Option<bool>,
+    pub watchers: u8,
+    pub cap: u8,
+    pub ticket: &'a str,
+}
+
+pub(crate) fn post_text(f: &PostFields<'_>) -> String {
+    let watch = match f.watch {
+        Some(w) => format!(r#""watch":{w},"#),
+        None => String::new(),
+    };
     format!(
-        r#"{{"t":"post","room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},"watchers":{},"cap":{},"ticket":"{}"}}"#,
-        p.room.name().as_str(),
-        json_escaped(p.p1.as_str()),
-        json_escaped(p.p2.as_str()),
-        mode_wire(p.mode),
-        p.delay.min(WATCH_DELAY_MAX),
-        watchers.min(p.cap),
-        p.cap.clamp(1, WATCH_CAP_MAX as u8),
-        p.ticket.as_str(),
+        r#"{{"t":"post","room":"{}","p1":"{}","p2":"{}","mode":"{}","delay":{},{}"watchers":{},"cap":{},"ticket":"{}"}}"#,
+        f.room,
+        json_escaped(f.p1.as_str()),
+        json_escaped(f.p2.as_str()),
+        mode_wire(f.mode),
+        f.delay.min(WATCH_DELAY_MAX),
+        watch,
+        f.watchers.min(f.cap),
+        f.cap.clamp(1, WATCH_CAP_MAX as u8),
+        f.ticket,
     )
 }
 
@@ -514,32 +550,32 @@ fn write_count(watchers: u8) -> String {
 // ---------------- 共通: pingとpongの監視 ----------------
 
 #[derive(Debug, Clone, Copy, Default)]
-struct Pings {
-    next_ping_ms: Option<u64>,
-    unanswered_ms: Option<u64>,
+pub(crate) struct Pings {
+    pub next_ping_ms: Option<u64>,
+    pub unanswered_ms: Option<u64>,
 }
 
 impl Pings {
-    fn start(&mut self, now: Now) {
+    pub fn start(&mut self, now: Now) {
         self.next_ping_ms = Some(now.ms.saturating_add(PING_INTERVAL_MS));
     }
 
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         *self = Pings::default();
     }
 
-    fn silence_deadline(&self) -> Option<u64> {
+    pub fn silence_deadline(&self) -> Option<u64> {
         self.unanswered_ms
             .map(|p| p.saturating_add(PONG_TIMEOUT_MS))
     }
 
     /// pongが来ないまま`PONG_TIMEOUT_MS`経ったかどうか。
-    fn silent(&self, now: Now) -> bool {
+    pub fn silent(&self, now: Now) -> bool {
         self.silence_deadline().is_some_and(|d| now.ms >= d)
     }
 
     /// pingの時刻なら次の時刻を決めてpingの文を返す。
-    fn due(&mut self, now: Now) -> Option<String> {
+    pub fn due(&mut self, now: Now) -> Option<String> {
         let p = self.next_ping_ms?;
         if now.ms < p {
             return None;
@@ -550,24 +586,24 @@ impl Pings {
     }
 }
 
-fn wake_min(a: &[Option<u64>]) -> Option<u64> {
+pub(crate) fn wake_min(a: &[Option<u64>]) -> Option<u64> {
     a.iter().copied().flatten().min()
 }
 
-fn close_failure(code: u16) -> Failure {
+pub(crate) fn close_failure(code: u16) -> Failure {
     match CloseCode::from_number(code) {
         Some(CloseCode::Expired) => Failure::Expired,
         Some(CloseCode::PeerLeft) => Failure::PeerLeft,
-        Some(CloseCode::ListFull) => Failure::RoomFull,
+        Some(CloseCode::ListFull) => Failure::ListFull,
         _ => Failure::Unresponsive(Why::Closed(code)),
     }
 }
 
-fn error_failure(code: Option<CloseCode>) -> Failure {
+pub(crate) fn error_failure(code: Option<CloseCode>) -> Failure {
     match code {
         Some(CloseCode::Expired) => Failure::Expired,
         Some(CloseCode::PeerLeft) => Failure::PeerLeft,
-        Some(CloseCode::ListFull) => Failure::RoomFull,
+        Some(CloseCode::ListFull) => Failure::ListFull,
         other => Failure::Unresponsive(Why::ErrorMessage(other)),
     }
 }
@@ -578,7 +614,7 @@ fn error_failure(code: Option<CloseCode>) -> Failure {
 pub enum HostEvent {
     /// 一覧に載った。
     Listed,
-    /// 手順が終わった（一覧から消えた）。`RoomFull`は件数の上限（全体か1 IPあたり）。
+    /// 手順が終わった（一覧から消えた）。`ListFull`は件数の上限（全体か1 IPあたり）。`RoomFull`は見る接続の上限。
     Failed(Failure),
 }
 
@@ -598,6 +634,36 @@ pub enum HostState {
     Failed(Failure),
 }
 
+/// 載せる接続の最初の1通。ランダム対戦の一覧（`q.…`）かルーム名ごとの一覧（`r.…`・`watch`付き。[`crate::lobby`]）。
+#[derive(Debug, Clone, Copy)]
+enum PostBody {
+    Random(Posting),
+    Lobby(LobbyPosting),
+}
+
+impl PostBody {
+    fn cap(&self) -> u8 {
+        match self {
+            PostBody::Random(p) => p.cap,
+            PostBody::Lobby(p) => p.cap,
+        }
+    }
+
+    fn write(&self, watchers: u8) -> String {
+        match self {
+            PostBody::Random(p) => write_post(p, watchers),
+            PostBody::Lobby(p) => write_lobby_post(p, watchers),
+        }
+    }
+
+    fn parse(&self, text: &str) -> Result<HostMsg, MsgError> {
+        match self {
+            PostBody::Random(_) => parse_host_message(text),
+            PostBody::Lobby(_) => parse_lobby_host_message(text),
+        }
+    }
+}
+
 /// 載せる口の手順。
 /// 呼ぶ順: 接続する前に`new`。101なら`on_upgraded`（この中で`post`を送る）。101でなければ`on_http_refused`。接続できなければ`on_transport_failed`。
 /// 以後は受けた文を`on_text`に渡し、閉じる番号を`on_close`に渡す。観戦者の数が変わったら`set_watchers`。
@@ -605,7 +671,7 @@ pub enum HostState {
 #[derive(Debug, Clone)]
 pub struct HostClient {
     state: HostState,
-    posting: Posting,
+    posting: PostBody,
     /// いまの観戦者の数（`set_watchers`が更新する）と、サーバーへ最後に送った（`post`か`count`の）数。
     watchers: u8,
     sent: u8,
@@ -615,7 +681,16 @@ pub struct HostClient {
 
 impl HostClient {
     pub fn new(posting: Posting, watchers: u8) -> HostClient {
-        let watchers = watchers.min(posting.cap);
+        HostClient::with_body(PostBody::Random(posting), watchers)
+    }
+
+    /// ルーム名ごとの一覧へ試合中の1件を載せる接続。使い方は[`HostClient::new`]と同じ（接続先のパスだけが違う: [`crate::lobby::lobby_path`]）。
+    pub fn new_lobby(posting: LobbyPosting, watchers: u8) -> HostClient {
+        HostClient::with_body(PostBody::Lobby(posting), watchers)
+    }
+
+    fn with_body(posting: PostBody, watchers: u8) -> HostClient {
+        let watchers = watchers.min(posting.cap());
         HostClient {
             state: HostState::Connecting,
             posting,
@@ -628,6 +703,14 @@ impl HostClient {
 
     pub fn state(&self) -> HostState {
         self.state
+    }
+
+    /// 受ける1通の上限（バイト）。ルーム名ごとの一覧は載せる接続にも最初に一覧の全体が届く。
+    pub fn message_max(&self) -> usize {
+        match self.posting {
+            PostBody::Random(_) => MESSAGE_MAX_BYTES,
+            PostBody::Lobby(_) => crate::lobby::LOBBY_LIST_MAX_BYTES,
+        }
     }
 
     pub fn is_finished(&self) -> bool {
@@ -657,7 +740,7 @@ impl HostClient {
         self.deadline_ms = Some(now.ms.saturating_add(ROOM_GREETING_TIMEOUT_MS));
         self.pings.start(now);
         self.sent = self.watchers;
-        vec![HostAction::Send(write_post(&self.posting, self.watchers))]
+        vec![HostAction::Send(self.posting.write(self.watchers))]
     }
 
     pub fn on_http_refused(&mut self, status: u16, body: &str) -> Vec<HostAction> {
@@ -684,7 +767,7 @@ impl HostClient {
 
     /// 観戦者の数が変わった。載っていれば`count`を送る（載る前なら載った直後に送る）。
     pub fn set_watchers(&mut self, n: u8) -> Vec<HostAction> {
-        self.watchers = n.min(self.posting.cap);
+        self.watchers = n.min(self.posting.cap());
         self.flush_count()
     }
 
@@ -701,13 +784,13 @@ impl HostClient {
             return Vec::new();
         }
         self.pings.unanswered_ms = None;
-        let msg = match parse_host_message(text) {
+        let msg = match self.posting.parse(text) {
             Ok(m) => m,
             Err(e) => return self.fail(Failure::Unresponsive(Why::BadMessage(e))),
         };
         match (self.state, msg) {
             (HostState::Connecting, _) => self.out_of_order(),
-            (_, HostMsg::Pong) => Vec::new(),
+            (_, HostMsg::Pong | HostMsg::Ignored) => Vec::new(),
             (_, HostMsg::Error { code }) => self.fail(error_failure(code)),
             (HostState::AwaitListed, HostMsg::Listed) => {
                 self.state = HostState::Listed;

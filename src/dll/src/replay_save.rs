@@ -18,7 +18,11 @@ use higanr_core::autosave::{
 use higanr_core::handshake::Name;
 use higanr_core::replay::{self, Mark, MarkRead, MarkRole, MatchResult, Side, Timestamp};
 use higanr_core::replay_name::{
-    self, DEFAULT_TEMPLATE, DUP_LIMIT, Facts, NameError, Template, candidate_file,
+    self, DEFAULT_TEMPLATE, DUP_LIMIT, Facts, NameError, NameSpan, Template, candidate_file,
+    mask_spans,
+};
+use higanr_core::replay_name_limit::{
+    FitError, NameLimit, fit, name_limit, saved_line, virtual_copy, virtual_store_dir,
 };
 use higanr_core::replay_rounds::{
     Boundary, MatchLog, MatchSummary, NetSample, NetTotals, SUMMARY_WORDS, SideSnap,
@@ -1013,6 +1017,9 @@ impl Driver {
     }
 }
 
+/// ボリュームの番号・ファイルの番号の上位・下位。全部同じならNTFS上で同じファイル。
+pub type FileId = (u32, u32, u32);
+
 /// 保管庫のワーカーがWin32とゲームのメモリに依頼する処理（本物は`replay_save_win::RealVaultOs`）。
 pub trait VaultOs {
     /// ゲームが持つexeのフォルダのバッファ（`0x4ACD08`の0x104バイト）。読み取れなければ`None`。
@@ -1021,6 +1028,9 @@ pub trait VaultOs {
     fn ansi(&self) -> &dyn Ansi;
     /// ANSIのパス`ansi`を保存関数と同じ`CreateFileA`の経路で開いて`file`と同じファイルかどうか。
     fn same_file_ansi(&mut self, ansi: &[u8], file: &fs::File) -> Result<bool, String>;
+    /// `path`を（ゲームのプロセスから）開いたファイルのボリュームの番号とファイルの番号。
+    /// VirtualStoreの差し替えが有効ならOSが差し替え先を開く。開けなければ理由。
+    fn file_id(&mut self, path: &Path) -> Result<FileId, String>;
     fn now(&mut self) -> Timestamp;
     /// 確保している0バイトのファイルの更新時刻を今にする（中身は変えない）。
     /// ゲームの保存が同時に開いても断られない開き方で行う（本物は属性だけの権利）。
@@ -1050,6 +1060,17 @@ struct Reserved {
 
 /// 番号が尽きた枝のフォルダ（`名前_2`, `名前_3` …）を試す数の上限。
 const BRANCH_LIMIT: u32 = 1000;
+
+/// リプレイ名の上限を決める実行環境。読み取りは保存のスレッドで行う（ゲームのスレッドでは呼ばない）。
+#[derive(Debug, Clone, Default)]
+pub struct NameEnv {
+    /// Wine / Proton上かどうか。UTF-8のバイト数でも上限を数える。
+    pub wine: bool,
+    /// Windowsが書き込みをVirtualStoreへ差し替えることがある場所（Program Filesなど）。
+    pub protected_roots: Vec<String>,
+    /// `%LOCALAPPDATA%`。VirtualStoreの置き場。
+    pub local_app_data: String,
+}
 
 pub struct Worker {
     pub split: Split,
@@ -1089,6 +1110,8 @@ pub struct Worker {
     ud_floor: HashMap<PathBuf, u16>,
     /// 展開できないテンプレートの知らせを出したかどうか（1回だけ）。
     name_notified: bool,
+    /// リプレイ名の上限の計算に使う環境。
+    pub name_env: NameEnv,
 }
 
 const BACKOFF_STEPS: u32 = 40;
@@ -1153,6 +1176,24 @@ fn shown_dir(p: &Path) -> String {
     }
 }
 
+/// 保存したファイルの最終的なパス（`Worker::rename_saved`の結果）。
+struct SavedAs {
+    path: PathBuf,
+    /// 付け替えた名前のうち`{1Pname}`・`{2Pname}`が入った範囲。付け替えなかったときは空。
+    spans: Vec<NameSpan>,
+    /// 上限で切った後に残った名前の文字数（`spans`の範囲を切る）。
+    kept: usize,
+}
+
+/// 保存成功の行に書く保存先。保管庫の下のフォルダ名には相手の名前が入るので書かない。
+fn saved_place(dir: &Path) -> String {
+    if shown_dir(dir) == VAULT_DIR {
+        VAULT_DIR.to_string()
+    } else {
+        format!("{VAULT_DIR} の下のフォルダ")
+    }
+}
+
 fn hex_bytes(a: &[u8]) -> String {
     a.iter()
         .map(|v| format!("{v:02X}"))
@@ -1202,6 +1243,7 @@ impl Worker {
             template: None,
             ud_floor: HashMap::new(),
             name_notified: false,
+            name_env: NameEnv::default(),
         }
     }
 
@@ -1346,7 +1388,7 @@ impl Worker {
 
     pub fn step(&mut self, h: &Handoff, os: &mut dyn VaultOs) {
         if h.state() == ST_USED {
-            self.finish_save(h);
+            self.finish_save(h, os);
         }
         self.log_skips(h);
         let Some((info_gen, info)) = h.read_info() else {
@@ -1569,7 +1611,7 @@ impl Worker {
                     // フォルダを最初に使うとき前の起動が付け替えた名前の最大の`{num}`の次から始める。
                     if !self.ud_floor.contains_key(&dir) {
                         let start = match (&self.template, slot) {
-                            (Some(t), None) => t.next_floor(&names),
+                            (Some(t), None) => t.next_floor(&names, Some(&self.limit_for(&dir))),
                             _ => None,
                         };
                         self.ud_floor.insert(dir.clone(), start.unwrap_or(1));
@@ -1702,7 +1744,7 @@ impl Worker {
         }
     }
 
-    fn finish_save(&mut self, h: &Handoff) {
+    fn finish_save(&mut self, h: &Handoff, os: &mut dyn VaultOs) {
         let Some(r) = h.read_record() else {
             self.problem("★ 保存の記録の読み取り不能（結果の番号が範囲の外）".to_string());
             h.state.store(ST_READY, Ordering::Release);
@@ -1744,7 +1786,8 @@ impl Worker {
                     summary.rounds.iter().map_while(|b| *b).count(),
                     summary.rounds_dropped
                 );
-                self.rename_saved(&p.file, r.at, p.slot);
+                let saved = self.rename_saved(&p.file, r.at, p.slot);
+                self.log_saved(&saved, os);
             }
             Err(why) => {
                 h.note_outcome(Outcome::MarkFailed);
@@ -1755,20 +1798,59 @@ impl Worker {
         h.state.store(ST_EMPTY, Ordering::Release);
     }
 
-    /// 保存と印が済んだファイルをテンプレートの名前へ付け替える。
+    /// 保存成功の行を本ログへ出す。OSがVirtualStoreへ差し替えたかどうかも調べる（利用者のログから保存先を切り分けるため）。
+    fn log_saved(&mut self, saved: &SavedAs, os: &mut dyn VaultOs) {
+        let (Some(dir), Some(name)) = (
+            saved.path.parent(),
+            saved
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+        ) else {
+            return;
+        };
+        let shown = mask_spans(&name, &saved.spans, saved.kept);
+        let copy = virtual_copy(
+            &saved.path.to_string_lossy(),
+            &self.name_env.local_app_data,
+            |v| Path::new(v).try_exists().ok(),
+            |v| Some(os.file_id(&saved.path).ok()? == os.file_id(Path::new(v)).ok()?),
+        );
+        self.notice(saved_line(&shown, &saved_place(dir), copy));
+    }
+
+    /// 保存先のフォルダ`dir`のリプレイ名の上限。
+    fn limit_for(&self, dir: &Path) -> NameLimit {
+        let dir_text = dir.to_string_lossy();
+        let virtual_dir = virtual_store_dir(
+            &dir_text,
+            &self.name_env.protected_roots,
+            &self.name_env.local_app_data,
+        );
+        name_limit(&dir_text, virtual_dir.as_deref(), self.name_env.wine)
+    }
+
+    /// 保存と印が済んだファイルをテンプレートの名前へ付け替え、付け替えた後（付け替えなかったときは元）のパスを返す。
     /// テンプレートが無い（既定）か展開に要る値を読み取れなければ予約の名前のまま。
     /// 行き先は先に`create_new`で確保してから置き換える（Windowsの`rename`は既存のファイルを上書きするので同じ名前のファイルや別のゲームが同時に付け替える先を消さないため）。
-    fn rename_saved(&mut self, file: &Path, at: Timestamp, slot: Option<u16>) {
+    fn rename_saved(&mut self, file: &Path, at: Timestamp, slot: Option<u16>) -> SavedAs {
+        let plain = SavedAs {
+            path: file.to_path_buf(),
+            spans: Vec::new(),
+            kept: 0,
+        };
         let Some(tpl) = self.template.clone() else {
-            return;
+            return plain;
         };
         let (Some(dir), Some(name)) = (file.parent(), file.file_name().and_then(|n| n.to_str()))
         else {
-            return;
+            return plain;
         };
         let Some(reserved_num) = vault::ud_number(name) else {
-            return;
+            return plain;
         };
+        let limit = self.limit_for(dir);
+        self.notice(limit.describe());
         let num = slot.unwrap_or(reserved_num);
         let file_facts = if tpl.needs_file() {
             match fs::read(file) {
@@ -1778,32 +1860,52 @@ impl Worker {
                         "リプレイのファイル名: {} を読めません（{e}）。名前は変えません。",
                         shown_file(file)
                     ));
-                    return;
+                    return plain;
                 }
             }
         } else {
             None
         };
-        let base = match tpl.expand(&Facts {
+        let facts = Facts {
             num,
             at,
             file: file_facts,
-        }) {
-            Ok(b) => b,
-            // 展開した結果が使えない（読み取れない値・長すぎ・予約名）のはその保存だけの問題。テンプレートそのものの誤りは読み込みで出す。
+        };
+        let (fitted, spans) = match tpl
+            .expand_spans(&facts)
+            .map_err(FitError::Name)
+            .and_then(|(b, spans)| fit(&b, &limit).map(|f| (f, spans)))
+        {
+            Ok(f) => f,
+            // 保存先のフォルダが長すぎるときは予約の名前のまま保存する。
+            Err(e @ FitError::TooNarrow { .. }) => {
+                self.notice(format!(
+                    "リプレイ名: {}。{DEFAULT_TEMPLATE} で保存します。",
+                    e.reason()
+                ));
+                return plain;
+            }
+            // 展開した結果が使えない（読み取れない値・予約名）のはその保存だけの問題。テンプレートそのものの誤りは読み込みで出す。
             Err(e) => {
                 self.problem(format!(
                     "リプレイのファイル名: {}。{} の名前は変えません。",
                     e.reason(),
                     shown_file(file)
                 ));
-                return;
+                return plain;
             }
         };
+        if let Some(line) = fitted.describe() {
+            self.notice(line);
+        }
+        let base = fitted.name;
+        let kept = base.chars().count();
+        // 失敗の行に出す名前も成功の行と同じく1P・2Pの名前を伏せる。
+        let hide = |n: &str| mask_spans(n, &spans, kept);
         for k in 1..=DUP_LIMIT {
             let cand = candidate_file(&base, k);
             if cand.eq_ignore_ascii_case(name) {
-                return;
+                return plain;
             }
             let dst = dir.join(&cand);
             match OpenOptions::new().write(true).create_new(true).open(&dst) {
@@ -1814,28 +1916,37 @@ impl Worker {
                             self.ud_floor
                                 .insert(dir.to_path_buf(), reserved_num.saturating_add(1));
                             let _ = writeln!(self.out, "名前: {name} を {cand} に変えた");
+                            return SavedAs {
+                                path: dst,
+                                spans,
+                                kept,
+                            };
                         }
                         Err(e) => {
                             let _ = fs::remove_file(&dst);
                             self.problem(format!(
-                                "リプレイのファイル名: {name} を {cand} に変えられません（{e}）。"
+                                "リプレイのファイル名: {name} を {} に変えられません（{e}）。",
+                                hide(&cand)
                             ));
                         }
                     }
-                    return;
+                    return plain;
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
                 Err(e) => {
                     self.problem(format!(
-                        "リプレイのファイル名: {cand} を作れません（{e}）。名前は変えません。"
+                        "リプレイのファイル名: {} を作れません（{e}）。名前は変えません。",
+                        hide(&cand)
                     ));
-                    return;
+                    return plain;
                 }
             }
         }
         self.problem(format!(
-            "リプレイのファイル名: {base} の重複が {DUP_LIMIT} 件を越えました。名前は変えません。"
+            "リプレイのファイル名: {} の重複が {DUP_LIMIT} 件を越えました。名前は変えません。",
+            hide(&base)
         ));
+        plain
     }
 
     /// 保存の記録と対戦の情報から印を作る。
@@ -2850,6 +2961,8 @@ pub(crate) mod tests {
         now: Timestamp,
         asked: Vec<Vec<u8>>,
         touched: Vec<PathBuf>,
+        /// `file_id`の答え。無いパスは開けなかったことにする。
+        ids: Vec<(PathBuf, FileId)>,
     }
 
     impl FakeOs {
@@ -2876,6 +2989,7 @@ pub(crate) mod tests {
                 },
                 asked: Vec::new(),
                 touched: Vec::new(),
+                ids: Vec::new(),
             }
         }
     }
@@ -2890,6 +3004,13 @@ pub(crate) mod tests {
         fn same_file_ansi(&mut self, ansi: &[u8], _file: &fs::File) -> Result<bool, String> {
             self.asked.push(ansi.to_vec());
             self.same.clone()
+        }
+        fn file_id(&mut self, path: &Path) -> Result<FileId, String> {
+            self.ids
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, id)| *id)
+                .ok_or_else(|| "開けません".to_string())
         }
         fn now(&mut self) -> Timestamp {
             self.now
@@ -4767,6 +4888,8 @@ pub(crate) mod tests {
         w: Worker,
         log: Log,
         notices: Arc<Mutex<Vec<String>>>,
+        /// 予約の名前に書いた後ワーカーが付け替える前に、削除の共有を許さずに開いておく（付け替えの後で閉じる）。
+        hold: bool,
     }
 
     impl NameRig {
@@ -4791,6 +4914,7 @@ pub(crate) mod tests {
                 w,
                 log,
                 notices,
+                hold: false,
             };
             r.d.tick(&r.h, &mut r.g, None);
             r.w.step(&r.h, &mut r.os);
@@ -4821,7 +4945,16 @@ pub(crate) mod tests {
             let path = self.w.prepared.as_ref().unwrap().file.clone();
             fs::write(&path, bytes).unwrap();
             let name = shown_file(&path);
+            let held = self.hold.then(|| {
+                use std::os::windows::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(1 | 2)
+                    .open(&path)
+                    .unwrap()
+            });
             self.w.step(&self.h, &mut self.os);
+            drop(held);
             self.g.menu = 0;
             self.g.req = 10;
             self.d.tick(&self.h, &mut self.g, None);
@@ -4853,9 +4986,39 @@ pub(crate) mod tests {
             shown_file(&self.w.prepared.as_ref().unwrap().file)
         }
 
+        /// 本ログへ出た行のうち保存のたびに出る上限の行と保存成功の行を除いたもの。
         fn notices(&self) -> Vec<String> {
-            self.notices.lock().unwrap().clone()
+            let all = self.notices.lock().unwrap().clone();
+            all.into_iter()
+                .filter(|l| !is_limit_line(l) && !is_saved_line(l))
+                .collect()
         }
+
+        /// 保存のたびに出る保存成功の行。
+        fn saved_lines(&self) -> Vec<String> {
+            let all = self.notices.lock().unwrap().clone();
+            all.into_iter().filter(|l| is_saved_line(l)).collect()
+        }
+
+        /// 保存のたびに出る上限の行。
+        fn limit_lines(&self) -> Vec<String> {
+            let all = self.notices.lock().unwrap().clone();
+            all.into_iter().filter(|l| is_limit_line(l)).collect()
+        }
+
+        /// 単独の実行（`Split::Flat`）・既定の環境での名前の上限。
+        fn limit(&self) -> higanr_core::replay_name_limit::NameLimit {
+            let dir = format!("{}/{VAULT_DIR}", self.dir.display());
+            name_limit(&dir, None, false)
+        }
+    }
+
+    fn is_limit_line(l: &str) -> bool {
+        l.starts_with("リプレイ名の上限:")
+    }
+
+    fn is_saved_line(l: &str) -> bool {
+        l.starts_with("自動保存: ") && l.contains(" を保存しました（")
     }
 
     impl Drop for NameRig {
@@ -4942,6 +5105,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn num_continues_after_a_restart_when_the_names_were_cut_after_the_number() {
+        let template = format!("{{num}}{}", "a".repeat(300));
+        let mut r = NameRig::new("name_restart_cut", Split::Flat, &template);
+        r.save(&match_replay(0, 1, 30));
+        r.save(&match_replay(0, 1, 31));
+        let tail = "a".repeat(r.limit().units - 4);
+        let mut r = r.restart(&template);
+        assert_eq!(r.reserved(), "th9_ud0003.rpy", "切られた名前の番号の次");
+        r.save(&match_replay(0, 1, 32));
+        assert_eq!(
+            r.files(),
+            [
+                format!("0001{tail}.rpy"),
+                format!("0002{tail}.rpy"),
+                format!("0003{tail}.rpy"),
+                "th9_ud0004.rpy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn the_default_template_still_fills_the_lowest_free_number_after_a_restart() {
         let mut r = NameRig::new("name_restart_default", Split::Flat, "th9_ud{num}");
         r.save(&match_replay(0, 1, 30));
@@ -4986,7 +5170,7 @@ pub(crate) mod tests {
     fn a_bad_template_saves_under_the_default_and_says_so_once() {
         for (template, why) in [
             ("a{foo}", "不明な置き換え {foo}"),
-            ("a:b", "使用不可の文字 :"),
+            ("a}b", "対応する { の無い }"),
             ("a{num", "閉じていない {"),
         ] {
             let mut r = NameRig::new("name_bad", Split::Flat, template);
@@ -5005,23 +5189,360 @@ pub(crate) mod tests {
         }
     }
 
+    /// 上限を越えたら切って保存する。`{num}`は切られて残らない。そのため2回目は同じ名前になり`_2`で重ねる（上書きしない）。
     #[test]
-    fn a_name_that_is_too_long_after_expansion_keeps_the_reserved_name_and_says_so_every_save() {
-        let template = format!("{}{{num}}", "a".repeat(97));
-        let mut r = NameRig::new("name_long", Split::Flat, &template);
+    fn a_name_over_the_limit_is_cut_and_a_later_save_does_not_overwrite() {
+        let mut r = NameRig::new(
+            "name_long",
+            Split::Flat,
+            &format!("{}{{num}}", "a".repeat(300)),
+        );
+        let limit = r.limit();
+        assert!(limit.units >= 100, "{limit:?}");
         r.save(&match_replay(0, 1, 30));
         r.save(&match_replay(0, 1, 31));
-        assert_eq!(
-            r.files(),
-            ["th9_ud0001.rpy", "th9_ud0002.rpy", "th9_ud0003.rpy"]
+        let cut = "a".repeat(limit.units);
+        let files = r.files();
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert!(files.contains(&format!("{cut}.rpy")), "{files:?}");
+        assert!(files.contains(&format!("{cut}_2.rpy")), "{files:?}");
+        assert!(files.contains(&"th9_ud0003.rpy".to_string()), "{files:?}");
+        let cut_line = format!(
+            "リプレイ名: 304 文字を {} 文字に切り捨てました。",
+            limit.units
         );
-        assert_eq!(
-            r.notices(),
-            [
-                "自動保存: リプレイのファイル名: 101 文字の名前（上限 100）。th9_ud0001.rpy の名前は変えません。",
-                "自動保存: リプレイのファイル名: 101 文字の名前（上限 100）。th9_ud0002.rpy の名前は変えません。"
-            ]
+        assert_eq!(r.notices(), [cut_line.clone(), cut_line]);
+    }
+
+    /// 保存のたびに上限を1行ずつ出す。パスそのものは書かない。
+    #[test]
+    fn every_save_with_a_template_logs_the_limit_without_the_path() {
+        let mut r = NameRig::new("name_limit_log", Split::Flat, "x{num}");
+        r.save(&match_replay(0, 1, 30));
+        r.save(&match_replay(0, 1, 31));
+        let want = r.limit().describe();
+        assert_eq!(r.limit_lines(), [want.clone(), want.clone()]);
+        assert!(want.starts_with("リプレイ名の上限: "), "{want}");
+        let dir = r.dir.to_string_lossy().to_string();
+        assert!(r.limit_lines().iter().all(|l| !l.contains(&dir)));
+        assert!(r.notices().is_empty(), "{:?}", r.notices());
+    }
+
+    /// 既定の名前（テンプレートなし）は付け替えないので上限の行は出ない。
+    #[test]
+    fn the_default_template_logs_no_limit() {
+        let mut r = NameRig::new("name_limit_default", Split::Flat, "th9_ud{num}");
+        r.save(&match_replay(0, 1, 30));
+        assert!(r.limit_lines().is_empty());
+    }
+
+    /// VirtualStoreの置き場として`r.dir\local`を使い、`file_name`の保存先と差し替え先のパスを返す。
+    fn with_virtual_env(r: &mut NameRig, file_name: &str) -> (PathBuf, PathBuf) {
+        let local = r.dir.join("local").to_string_lossy().to_string();
+        let dir = r.dir.to_string_lossy().to_string();
+        r.w.name_env = NameEnv {
+            wine: false,
+            protected_roots: vec![dir.clone()],
+            local_app_data: local.clone(),
+        };
+        let v = virtual_store_dir(&format!("{dir}\\{VAULT_DIR}"), &[dir], &local).unwrap();
+        (
+            r.dir.join(VAULT_DIR).join(file_name),
+            PathBuf::from(v).join(file_name),
+        )
+    }
+
+    /// 差し替え先にファイルを作る。
+    fn make_virtual_copy(v: &Path) {
+        fs::create_dir_all(v.parent().unwrap()).unwrap();
+        fs::write(v, b"copy").unwrap();
+    }
+
+    fn last_saved_line(r: &NameRig) -> String {
+        r.saved_lines().pop().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_save_logs_one_line_per_match_in_the_agreed_form() {
+        let mut r = NameRig::new("saved_form", Split::Flat, "th9_ud{num}");
+        r.save(&match_replay(0, 1, 30));
+        r.save(&match_replay(0, 1, 31));
+        // 環境の指定が無いので差し替え先を調べられない。
+        let want = "自動保存: th9_ud0001.rpy を保存しました（保存先 Replay_HiganRTool・VirtualStore への差し替え 確認不能）";
+        assert_eq!(r.saved_lines()[0], want);
+        assert_eq!(r.saved_lines().len(), 2, "マッチごとに1行");
+    }
+
+    /// 差し替え先に無ければ「なし」。ほかの名前のファイルがあっても「あり」にならない。
+    #[test]
+    fn no_virtual_copy_is_reported_as_none() {
+        let mut r = NameRig::new("saved_vs_none", Split::Flat, "x");
+        let (_, v) = with_virtual_env(&mut r, "x.rpy");
+        make_virtual_copy(&v.with_file_name("other.rpy"));
+        r.save(&match_replay(0, 1, 30));
+        let line = last_saved_line(&r);
+        assert!(line.contains("自動保存: x.rpy を保存しました（"), "{line}");
+        assert!(line.ends_with("VirtualStore への差し替え なし）"), "{line}");
+    }
+
+    /// 保存したパスと差し替え先が同じファイルなら「あり」、別のファイルなら「同名の別のファイルあり」。
+    #[test]
+    fn a_virtual_copy_is_present_only_when_it_is_the_saved_file() {
+        for (same, tail) in [
+            (true, "VirtualStore への差し替え あり）"),
+            (
+                false,
+                "VirtualStore への差し替え なし・VirtualStore に同名の別のファイルあり）",
+            ),
+        ] {
+            let mut r = NameRig::new("saved_vs_id", Split::Flat, "x");
+            let (real, v) = with_virtual_env(&mut r, "x.rpy");
+            make_virtual_copy(&v);
+            r.os.ids.push((real, (7, 0, 1)));
+            r.os.ids.push((v, (7, 0, if same { 1 } else { 2 })));
+            r.save(&match_replay(0, 1, 30));
+            let line = last_saved_line(&r);
+            assert!(line.ends_with(tail), "{same}: {line}");
+        }
+    }
+
+    /// 差し替え先にあっても保存したパスか差し替え先が開けなければ確認不能。
+    #[test]
+    fn an_unopenable_path_makes_the_virtual_copy_unknown() {
+        for open_real in [false, true] {
+            let mut r = NameRig::new("saved_vs_open", Split::Flat, "x");
+            let (real, v) = with_virtual_env(&mut r, "x.rpy");
+            make_virtual_copy(&v);
+            if open_real {
+                r.os.ids.push((real, (7, 0, 1)));
+            } else {
+                r.os.ids.push((v, (7, 0, 1)));
+            }
+            r.save(&match_replay(0, 1, 30));
+            let line = last_saved_line(&r);
+            assert!(
+                line.ends_with("VirtualStore への差し替え 確認不能）"),
+                "{line}"
+            );
+        }
+    }
+
+    /// 名前のテンプレートで付けたファイル名の中の1P・2Pの名前は伏せる。
+    #[test]
+    fn the_saved_line_masks_player_names_in_the_file_name() {
+        let mut r = NameRig::new("saved_mask", Split::Flat, "{1Pname}vs{2Pname}_{num}");
+        r.save(&match_replay(0, 1, 30));
+        assert!(r.files().contains(&"1Pvs2P_0001.rpy".to_string()));
+        let line = &r.saved_lines()[0];
+        assert!(
+            line.starts_with("自動保存: <1P の名前>vs<2P の名前>_0001.rpy を保存しました（"),
+            "{line}"
         );
+        assert!(!line.contains("1Pvs"), "{line}");
+    }
+
+    /// 名前と同じ文字が名前以外の所にあっても名前が入った位置だけを伏せる。
+    #[test]
+    fn the_saved_line_masks_by_position_not_by_text() {
+        let mut r = NameRig::new("saved_mask_pos", Split::Flat, "1P{1Pname}-{num}");
+        r.save(&match_replay(0, 1, 30));
+        assert!(r.files().contains(&"1P1P-0001.rpy".to_string()));
+        let line = &r.saved_lines()[0];
+        assert!(
+            line.starts_with("自動保存: 1P<1P の名前>-0001.rpy を保存しました（"),
+            "{line}"
+        );
+    }
+
+    /// 上限で名前の途中が切れて末尾に残った分も伏せる。
+    #[test]
+    fn the_saved_line_masks_a_player_name_cut_by_the_limit() {
+        let r = NameRig::new("saved_mask_cut", Split::Flat, "x");
+        let limit = r.limit();
+        drop(r);
+        let template = format!("{}{{1Pname}}", "a".repeat(limit.units - 1));
+        let mut r = NameRig::new("saved_mask_cut", Split::Flat, &template);
+        r.save(&match_replay(0, 1, 30));
+        let cut = format!("{}1", "a".repeat(limit.units - 1));
+        assert!(r.files().contains(&format!("{cut}.rpy")), "{:?}", r.files());
+        let line = &r.saved_lines()[0];
+        assert!(
+            line.starts_with(&format!(
+                "自動保存: {}<1P の名前>.rpy を保存しました（",
+                "a".repeat(limit.units - 1)
+            )),
+            "{line}"
+        );
+    }
+
+    /// 重複の`_2`などは名前の範囲に入らないので伏せずに残る。
+    #[test]
+    fn the_saved_line_keeps_the_duplicate_suffix() {
+        let mut r = NameRig::new("saved_mask_dup", Split::Flat, "{1Pname}");
+        r.save(&match_replay(0, 1, 30));
+        r.save(&match_replay(0, 1, 31));
+        let lines = r.saved_lines();
+        assert!(
+            lines[0].starts_with("自動保存: <1P の名前>.rpy を"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("自動保存: <1P の名前>_2.rpy を"),
+            "{lines:?}"
+        );
+    }
+
+    /// 付け替えの失敗の行のファイル名も名前を伏せる（重複が上限を越えた場合）。
+    #[test]
+    fn the_duplicate_overflow_line_masks_player_names() {
+        let mut r = NameRig::new("saved_dup_over", Split::Flat, "{1Pname}vs{2Pname}");
+        let vault = r.dir.join(VAULT_DIR);
+        fs::create_dir_all(&vault).unwrap();
+        for k in 1..=DUP_LIMIT {
+            fs::write(vault.join(candidate_file("1Pvs2P", k)), b"x").unwrap();
+        }
+        r.save(&match_replay(0, 1, 30));
+        let notices = r.notices();
+        let over = format!(
+            "自動保存: リプレイのファイル名: <1P の名前>vs<2P の名前> の重複が {DUP_LIMIT} 件を越えました。名前は変えません。"
+        );
+        assert!(notices.contains(&over), "{notices:?}");
+        assert!(notices.iter().all(|l| !l.contains("1Pvs2P")), "{notices:?}");
+    }
+
+    /// 付け替えの失敗の行のファイル名も名前を伏せる（付け替え先を作れない場合）。
+    #[test]
+    fn the_cannot_create_line_masks_player_names() {
+        let mut r = NameRig::new("saved_create_fail", Split::Flat, "{1Pname}vs{2Pname}");
+        // 同じ名前のフォルダがあると付け替え先のファイルを作れない。
+        fs::create_dir_all(r.dir.join(VAULT_DIR).join("1Pvs2P.rpy")).unwrap();
+        r.save(&match_replay(0, 1, 30));
+        let notices = r.notices();
+        let line = notices
+            .iter()
+            .find(|l| l.contains("を作れません"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(
+            line.contains("リプレイのファイル名: <1P の名前>vs<2P の名前>.rpy を作れません"),
+            "{line}"
+        );
+        assert!(!line.contains("1Pvs2P"), "{line}");
+    }
+
+    /// 付け替えの失敗の行のファイル名も名前を伏せる（付け替えの失敗）。
+    #[test]
+    fn the_rename_failure_line_masks_player_names() {
+        let mut r = NameRig::new("saved_rename_fail", Split::Flat, "{1Pname}vs{2Pname}");
+        // 予約の名前を共有の削除を許さずに開いておくと付け替えが断られる。
+        r.hold = true;
+        r.save(&match_replay(0, 1, 30));
+        let notices = r.notices();
+        let line = notices
+            .iter()
+            .find(|l| l.contains("に変えられません"))
+            .unwrap_or_else(|| panic!("{notices:?}"));
+        assert!(
+            line.contains(" を <1P の名前>vs<2P の名前>.rpy に変えられません"),
+            "{line}"
+        );
+        assert!(!line.contains("1Pvs2P"), "{line}");
+        assert!(r.saved_lines().iter().all(|l| !l.contains("1Pvs2P")));
+    }
+
+    /// 保存先の名前（相手の名前が入る）は書かない。
+    #[test]
+    fn the_saved_line_does_not_name_a_peer_folder() {
+        let mut r = NameRig::new("saved_place", Split::Peer, "th9_ud{num}");
+        r.save(&match_replay(0, 1, 30));
+        let line = &r.saved_lines()[0];
+        assert!(
+            line.contains("保存先 Replay_HiganRTool の下のフォルダ・"),
+            "{line}"
+        );
+        assert!(!line.contains("vs"), "{line}");
+    }
+
+    /// 保護された場所では差し替え先のパスの方が長いのでそちらで数える。
+    #[test]
+    fn a_protected_folder_is_counted_by_its_virtual_store_path() {
+        let mut r = NameRig::new(
+            "name_limit_virtual",
+            Split::Flat,
+            &format!("{}{{num}}", "a".repeat(300)),
+        );
+        let plain = r.limit();
+        r.w.name_env = NameEnv {
+            wine: false,
+            protected_roots: vec![r.dir.to_string_lossy().to_string()],
+            local_app_data: format!("C:\\{}", "L".repeat(30)),
+        };
+        r.save(&match_replay(0, 1, 30));
+        let lines = r.limit_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("VirtualStore で計算"), "{lines:?}");
+        let dir = r.dir.to_string_lossy().to_string();
+        let rest = &dir[2..];
+        let v = format!("C:\\{}\\VirtualStore{rest}\\{VAULT_DIR}", "L".repeat(30));
+        let want = name_limit(&v, None, false);
+        assert!(want.units < plain.units, "{want:?} {plain:?}");
+        let cut = "a".repeat(want.units);
+        assert!(r.files().contains(&format!("{cut}.rpy")), "{:?}", r.files());
+    }
+
+    /// Wineでは名前をUTF-8のバイト数でも数え、文字の途中では切らない。
+    #[test]
+    fn on_wine_the_name_is_also_cut_by_utf8_bytes() {
+        let mut r = NameRig::new(
+            "name_limit_wine",
+            Split::Flat,
+            &format!("{}{{num}}", "全".repeat(200)),
+        );
+        r.w.name_env.wine = true;
+        let limit = r.limit();
+        r.save(&match_replay(0, 1, 30));
+        let chars = limit.units.min(247 / 3);
+        let cut = "全".repeat(chars);
+        assert!(cut.len() <= 247);
+        assert!(r.files().contains(&format!("{cut}.rpy")), "{:?}", r.files());
+        let line = &r.limit_lines()[0];
+        assert!(line.contains("UTF-8 で 247 バイト"), "{line}");
+        assert!(line.contains("Wine でバイト数も計算"), "{line}");
+    }
+
+    /// 保存先のフォルダが長すぎて名前が`MIN_BODY`文字に満たないときはテンプレートを使わず予約の名前のまま保存する。
+    #[test]
+    fn a_folder_that_leaves_no_room_keeps_the_reserved_name_and_says_so() {
+        let mut r = NameRig::new(
+            "name_limit_narrow",
+            Split::Flat,
+            &format!("{}{{num}}", "a".repeat(300)),
+        );
+        r.w.name_env = NameEnv {
+            wine: false,
+            protected_roots: vec![r.dir.to_string_lossy().to_string()],
+            local_app_data: format!("C:\\{}", "L".repeat(250)),
+        };
+        r.save(&match_replay(0, 1, 30));
+        assert_eq!(r.files(), ["th9_ud0001.rpy", "th9_ud0002.rpy"]);
+        let notices = r.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("リプレイ名: 保存先のフォルダが長すぎます（名前の上限 "),
+            "{notices:?}"
+        );
+        assert!(
+            notices[0].ends_with("th9_ud{num} で保存します。"),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn forbidden_characters_become_a_hyphen_and_the_name_is_still_used() {
+        let mut r = NameRig::new("name_forbidden", Split::Flat, "a:b*{num}日本");
+        r.save(&match_replay(0, 1, 30));
+        let files = r.files();
+        assert!(files.contains(&"a-b-0001日本.rpy".to_string()), "{files:?}");
+        assert!(r.notices().is_empty(), "{:?}", r.notices());
     }
 
     #[test]
@@ -5176,17 +5697,27 @@ pub(crate) mod tests {
         assert!(r.notices().is_empty(), "{:?}", r.notices());
     }
 
+    /// 印の値で上限を越えても切って保存する。
     #[test]
-    fn a_mark_placeholder_that_overflows_100_characters_keeps_the_reserved_name_with_the_notice() {
-        let template = format!("{}{{wins}}", "a".repeat(97));
+    fn a_mark_placeholder_that_overflows_the_limit_is_cut() {
+        let r = NameRig::new("name_mark_long", Split::Flat, "x");
+        let limit = r.limit();
+        drop(r);
+        let template = format!("{}{{wins}}", "a".repeat(limit.units - 3));
         let mut r = NameRig::new("name_mark_long", Split::Flat, &template);
         r.save(&match_replay(0, 1, 30));
-        assert_eq!(r.files(), ["th9_ud0001.rpy", "th9_ud0002.rpy"]);
+        let cut = format!("{}0vs", "a".repeat(limit.units - 3));
+        assert_eq!(
+            r.files(),
+            [format!("{cut}.rpy"), "th9_ud0002.rpy".to_string()]
+        );
         assert_eq!(
             r.notices(),
-            [
-                "自動保存: リプレイのファイル名: 101 文字の名前（上限 100）。th9_ud0001.rpy の名前は変えません。"
-            ]
+            [format!(
+                "リプレイ名: {} 文字を {} 文字に切り捨てました。",
+                limit.units + 1,
+                limit.units
+            )]
         );
     }
 

@@ -25,7 +25,7 @@ use std::io::Write;
 
 use higanr_core::pacing::{
     self as pace, CpuClasses, Cycle, FrameRow, Head, Mode, Pace, PacingIni, Phase, Preamble,
-    Report, Screen, Splitter,
+    ReplayFrames, ReplayRead, ReplaySpeed, Report, Screen, Splitter,
 };
 use higanr_core::pacing_hybrid::{Doze, HybridParams, Wait};
 use higanr_core::pacing_vpatch::{self as vpatch, Begin, Vpatch};
@@ -34,8 +34,8 @@ use crate::hook::{self, HookEnv};
 use crate::log_mode::detail_out;
 use crate::sites::{SiteDef, hex_bytes};
 use crate::th09_addr::{
-    OPTION_WINDOWED, PACING_EARLY_EXIT_SITE, PACING_HEAD_SITE, PACING_RESUME_SITE, PACING_SITES,
-    PRESENT_SITE, WINDOW_ADDR, WINDOW_SPAN,
+    GLOBAL_STATE, IM_CUR, INPUT_MANAGERS, OPTION_WINDOWED, PACING_EARLY_EXIT_SITE,
+    PACING_HEAD_SITE, PACING_RESUME_SITE, PACING_SITES, PRESENT_SITE, WINDOW_ADDR, WINDOW_SPAN,
 };
 use crate::trial_summary::PaceEnd;
 
@@ -82,6 +82,181 @@ pub const HEAD_NOT_YET: u32 = 2;
 
 /// 入力の入口（`stub::input_wait_entry`）が時刻を記録するかどうか。0の間、入口のこの経路の命令は`cmp`と`je`の2つだけ。1にするのは`install`がPresentのcallを書いた後だけ。
 pub static INPUT_STAMP_ON: AtomicU32 = AtomicU32::new(0);
+
+// ---- リプレイの高速再生（画面はそのままで1回の表示の中でゲームの更新だけを増やす）----
+/// 走査のcallを書く要求の状態。0 = 要求なし / 1 = 要求あり（書き出しのスレッドが書く） / 2 = 書く手順を済ませた（成否にかかわらず二度と書かない）。
+const ARM_IDLE: u32 = 0;
+const ARM_REQUESTED: u32 = 1;
+const ARM_TRIED: u32 = 2;
+
+/// 余分な更新のカウント（Skipを押していた区間ごとに本ログへ1行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayExtraStats {
+    /// 余分な更新を回した表示の数。
+    pub displays: u32,
+    /// 回した余分な更新の数。
+    pub ran: u32,
+    /// 時間の上限で打ち切った表示の数。
+    pub cutoffs: u32,
+    /// 余分な更新を回した表示で余分な更新に使った時間（µs）の合計。
+    pub used_us: u64,
+    /// 1表示の余分な更新に使った時間（µs）の最大。
+    pub max_us: u32,
+}
+
+impl ReplayExtraStats {
+    /// 本ログの詳細の行。1表示あたりの更新は最初の1回を含む。
+    pub fn line(&self) -> String {
+        let per = f64::from(self.ran) / f64::from(self.displays.max(1)) + 1.0;
+        let each = self.used_us / u64::from(self.ran.max(1));
+        format!(
+            "ペース: リプレイの高速再生 {} 表示で余分な更新 {} 回（1 表示あたりの更新 平均 {per:.2}、時間の上限で打ち切り {} 回、余分な更新 1 回あたり 平均 {each} µs、1 表示の余分な更新の時間 最大 {} µs）",
+            self.displays, self.ran, self.cutoffs, self.max_us
+        )
+    }
+}
+
+/// 先頭（ペースの判断）・走査の包み（どちらもゲームのスレッド）・書き出しのスレッドの受け渡し。確保しない・待たない。
+pub struct ReplayExtraCell {
+    planned: AtomicU32,
+    arm: AtomicU32,
+    displays: AtomicU32,
+    ran: AtomicU32,
+    cutoffs: AtomicU32,
+    used_us: AtomicU64,
+    max_us: AtomicU32,
+    /// 余分な更新の処理でパニックを受けた後は1にする。以後は予定を立てない。
+    disabled: AtomicU32,
+}
+
+pub static REPLAY_EXTRA: ReplayExtraCell = ReplayExtraCell {
+    planned: AtomicU32::new(0),
+    arm: AtomicU32::new(ARM_IDLE),
+    displays: AtomicU32::new(0),
+    ran: AtomicU32::new(0),
+    cutoffs: AtomicU32::new(0),
+    used_us: AtomicU64::new(0),
+    max_us: AtomicU32::new(0),
+    disabled: AtomicU32::new(0),
+};
+
+impl ReplayExtraCell {
+    /// 次の表示に足す更新の数（先頭がフレームごとに書き直す）。
+    pub fn planned(&self) -> u32 {
+        self.planned.load(Ordering::Relaxed)
+    }
+
+    /// 無効にした後は0しか立てない。
+    pub fn set_planned(&self, n: u32) {
+        let n = if self.disabled.load(Ordering::Relaxed) != 0 {
+            0
+        } else {
+            n
+        };
+        self.planned.store(n, Ordering::Relaxed);
+    }
+
+    /// 余分な更新の処理でパニックを受けたとき。予定を0にし、以後は立てない。
+    pub fn disable(&self) {
+        self.disabled.store(1, Ordering::Relaxed);
+        self.planned.store(0, Ordering::Relaxed);
+    }
+
+    /// 走査のcallの書き込みを要求する（ゲームのスレッド）。まだ要求していなければ要求を立てる。
+    pub fn request_arm(&self) {
+        let _ =
+            self.arm
+                .compare_exchange(ARM_IDLE, ARM_REQUESTED, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// 要求があれば受け取る（書き出しのスレッド）。受け取ったら真を返し、書く手順を済ませたことを示すフラグを立てる。
+    pub fn take_arm_request(&self) -> bool {
+        self.arm
+            .compare_exchange(
+                ARM_REQUESTED,
+                ARM_TRIED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// 受け取った要求を書かずに戻す（対戦のセッションが立っていたとき）。後でまた要求できる。
+    pub fn cancel_arm(&self) {
+        let _ = self
+            .arm
+            .compare_exchange(ARM_TRIED, ARM_IDLE, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// 1回の表示で余分な更新を回し終えた（走査の包み）。`used_us`はその表示の余分な更新に使った時間。
+    pub fn note_display(&self, ran: u32, cutoff: bool, used_us: u32) {
+        if ran == 0 && !cutoff {
+            return;
+        }
+        if ran != 0 {
+            self.displays.fetch_add(1, Ordering::Relaxed);
+            self.ran.fetch_add(ran, Ordering::Relaxed);
+            self.used_us
+                .fetch_add(u64::from(used_us), Ordering::Relaxed);
+        }
+        self.max_us.fetch_max(used_us, Ordering::Relaxed);
+        if cutoff {
+            self.cutoffs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// カウントを取り出して0に戻す（書き出しのスレッドと終わり）。何も回していなければ`None`。
+    pub fn take_stats(&self) -> Option<ReplayExtraStats> {
+        let s = ReplayExtraStats {
+            displays: self.displays.swap(0, Ordering::Relaxed),
+            ran: self.ran.swap(0, Ordering::Relaxed),
+            cutoffs: self.cutoffs.swap(0, Ordering::Relaxed),
+            used_us: self.used_us.swap(0, Ordering::Relaxed),
+            max_us: self.max_us.swap(0, Ordering::Relaxed),
+        };
+        (s.displays != 0 || s.cutoffs != 0).then_some(s)
+    }
+
+    #[cfg(test)]
+    pub fn reset_for_test(&self) {
+        self.disabled.store(0, Ordering::SeqCst);
+        self.planned.store(0, Ordering::SeqCst);
+        self.arm.store(ARM_IDLE, Ordering::SeqCst);
+        let _ = self.take_stats();
+    }
+
+    #[cfg(test)]
+    pub fn arm_state_for_test(&self) -> u32 {
+        self.arm.load(Ordering::SeqCst)
+    }
+}
+
+/// 書き出しのスレッドが100 msごとに呼ぶ。Skipを離した後のカウントを本ログの詳細に出す（押している間は区間の終わりまで溜める）。
+pub fn drain_replay_extra(mut push: impl FnMut(String)) {
+    if REPLAY_EXTRA.planned() == 0
+        && let Some(s) = REPLAY_EXTRA.take_stats()
+    {
+        push(s.line());
+    }
+}
+
+/// 開発用の切り替え: `[pacing_dev]`の`replay_extra = 1`のとき、垂直同期を取らない道（格子）でもSkipで更新を増やす（実機でフルスクリーンの垂直同期を取れない環境でこの経路を通すため）。
+/// 配布バージョン（`dist`）は常に偽。iniの読み込み不能や書式の誤りも偽。
+pub fn dev_replay_extra(read: Result<Option<String>, String>, dist: bool) -> bool {
+    if dist {
+        return false;
+    }
+    let Ok(Some(text)) = read else {
+        return false;
+    };
+    higanr_core::ini::parse(&text)
+        .ok()
+        .and_then(|ini| {
+            ini.get("pacing_dev", "replay_extra")
+                .map(|v| v.trim() == "1")
+        })
+        .unwrap_or(false)
+}
 
 // ---- 格子の寄せ ----
 /// 寄せた枠として数える最小の寄せ幅（ppm）。`pacing_sum`も同じ値で数える。
@@ -269,10 +444,79 @@ pub struct PaceSlot {
     w: [AtomicU32; SLOT_WORDS],
 }
 
+/// リプレイ再生を出たときのフレーム数の枠の数。再生を出る操作は人の手で、読み手は100 msごとに空にするので溢れない。
+const REPLAY_SLOTS: usize = 4;
+
+/// リプレイ再生を出るたびの速さごとのフレーム数をゲームのスレッド（書き手1本）から本ログへ頼むスレッド（読み手1本）へ渡す。
+/// ゲームのスレッドでは確保しない・待たない。
+pub struct ReplayFramesHandoff {
+    written: AtomicU32,
+    taken: AtomicU32,
+    slots: [[AtomicU32; 3]; REPLAY_SLOTS],
+}
+
+impl ReplayFramesHandoff {
+    const fn new() -> Self {
+        ReplayFramesHandoff {
+            written: AtomicU32::new(0),
+            taken: AtomicU32::new(0),
+            slots: [const { [const { AtomicU32::new(0) }; 3] }; REPLAY_SLOTS],
+        }
+    }
+
+    /// 枠を埋めてから回数を`Release`で進める。
+    pub fn publish(&self, f: &ReplayFrames) {
+        let n = self.written.load(Ordering::Relaxed);
+        let slot = &self.slots[n as usize % REPLAY_SLOTS];
+        for (a, v) in slot.iter().zip([f.normal, f.skip, f.slow]) {
+            a.store(v, Ordering::Relaxed);
+        }
+        self.written.store(n.wrapping_add(1), Ordering::Release);
+    }
+
+    /// 書かれた分を古い順に`f`へ渡す。書き手に追い越された分は捨てて数を返す。読み手は同時に1本だけ。
+    pub fn drain(&self, mut f: impl FnMut(ReplayFrames)) -> u32 {
+        let mut lost = 0u32;
+        let w = self.written.load(Ordering::Acquire);
+        let mut read = self.taken.load(Ordering::Relaxed);
+        // 書き手が次に書く枠は読めない。そのため信じるのは新しい`REPLAY_SLOTS - 1`回分まで。
+        let keep = REPLAY_SLOTS as u32 - 1;
+        if w.wrapping_sub(read) > keep {
+            lost += w.wrapping_sub(read) - keep;
+            read = w.wrapping_sub(keep);
+        }
+        while read != w {
+            let s = &self.slots[read as usize % REPLAY_SLOTS];
+            let v: [u32; 3] = core::array::from_fn(|i| s[i].load(Ordering::Relaxed));
+            fence(Ordering::Acquire);
+            let overrun =
+                self.written.load(Ordering::Relaxed).wrapping_sub(read) >= REPLAY_SLOTS as u32;
+            read = read.wrapping_add(1);
+            if overrun {
+                lost += 1;
+            } else {
+                f(ReplayFrames {
+                    normal: v[0],
+                    skip: v[1],
+                    slow: v[2],
+                });
+            }
+        }
+        self.taken.store(read, Ordering::Relaxed);
+        lost
+    }
+
+    fn reset(&self) {
+        self.written.store(0, Ordering::Relaxed);
+        self.taken.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 記録のリングバッファ。書くのはゲームのスレッドだけ（入力の入口・先頭・Presentの入口はどれもゲームのスレッドで走る）。
 pub struct PaceRing {
     slots: [PaceSlot; PACE_RING_LEN as usize],
     cur: AtomicU32,
+    replay_frames: ReplayFramesHandoff,
 }
 
 pub static PACE_RING: PaceRing = PaceRing {
@@ -282,6 +526,7 @@ pub static PACE_RING: PaceRing = PaceRing {
         }
     }; PACE_RING_LEN as usize],
     cur: AtomicU32::new(0),
+    replay_frames: ReplayFramesHandoff::new(),
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +634,14 @@ impl PaceRing {
         s.w[W_SKIPPED].store(skipped.min(u32::MAX as u64) as u32, Ordering::Relaxed);
     }
 
+    /// いまのフレームを始めた時刻（QPC）。始めていなければ0（ゲーム自身の処理フローの区間・Presentの後から次の先頭まで）。
+    /// 書き手と同じゲームのスレッドから読む。
+    pub fn current_start(&self) -> u64 {
+        let s = self.cur_slot();
+        u64::from(s.w[W_START].load(Ordering::Relaxed))
+            | u64::from(s.w[W_START + 1].load(Ordering::Relaxed)) << 32
+    }
+
     pub fn on_input(&self, now: u64, sup_frame: u32, cpu: u32, cycles: u64) {
         let s = self.cur_slot();
         if s.w[W_INPUTS].load(Ordering::Relaxed) == 0 {
@@ -483,6 +736,11 @@ impl PaceRing {
             }
         }
         self.cur.store(0, Ordering::Release);
+        self.replay_frames.reset();
+    }
+
+    pub fn replay_frames(&self) -> &ReplayFramesHandoff {
+        &self.replay_frames
     }
 }
 
@@ -495,9 +753,40 @@ pub trait PaceClock {
     fn cpu(&mut self) -> u32;
     /// 花映塚の画面の形（`mode = auto`がフレームの最初の先頭のフックで1回だけ読む）。本物は`OPTION_WINDOWED`の1バイトを読むだけ。設置で読めると検証できなかったときは読まずに`Screen::Unknown`。
     fn screen(&mut self) -> Screen;
+    /// リプレイ再生の速さを決める材料（フレームに1回）。設置で読めると検証できなかったときは読まずに`None`。本物は1バイトと2バイトを読むだけ。
+    fn replay_read(&mut self) -> Option<ReplayRead>;
 }
 
 const SPIN_GUARD: u32 = 20_000_000;
+
+/// リプレイ再生中の速さの切り替え（`replay_skip_fps` / `replay_slow_fps`）。
+struct ReplayPace {
+    /// 格子を刻む形（auto・b・b-spin・b-hybrid）でだけ読む。game・cycle・vpatchは速さを変えない。
+    on: bool,
+    /// 通常 / Skip / Slowの順のfps。
+    fps: [u64; 3],
+    /// いまの格子の速さ。
+    speed: ReplaySpeed,
+    /// 前のフレームでリプレイ再生中だったかどうか（出たときにフレーム数を渡す）。
+    inside: bool,
+    frames: ReplayFrames,
+    /// 開発用の切り替え（`dev_replay_extra`）。格子の道でもSkipを余分な更新で作る。
+    dev_extra: bool,
+    /// `replay_extra_updates`の持ち越し。
+    carry: u64,
+    /// 更新を増やしているフレームかどうか。格子は通常のままなので`speed`では分からない。
+    extra: bool,
+}
+
+impl ReplayPace {
+    fn index(s: ReplaySpeed) -> usize {
+        match s {
+            ReplaySpeed::Normal => 0,
+            ReplaySpeed::Skip => 1,
+            ReplaySpeed::Slow => 2,
+        }
+    }
+}
 
 pub struct Pacer {
     pace: Pace,
@@ -514,6 +803,7 @@ pub struct Pacer {
     slept: bool,
     /// `mode = vpatch`の期限と準備時間（他の方式ではNone）。
     vp: Option<Vpatch>,
+    replay: ReplayPace,
 }
 
 impl Pacer {
@@ -533,6 +823,7 @@ impl Pacer {
         };
         glide().reset();
         glide().set_frame_us((1_000_000 / cfg.fps.max(1)) as u32);
+        let usable = |f: u64| if pace::can_tick(qpf, f) { f } else { cfg.fps };
         Some(Pacer {
             fresh: pace.clone(),
             pace,
@@ -549,7 +840,27 @@ impl Pacer {
             } else {
                 None
             },
+            replay: ReplayPace {
+                on: cfg.mode.paces_replay(),
+                // 刻めないfps（QPFより大きい）は通常のfpsのままにして、速さを変えても格子を作り損ねない。
+                fps: [
+                    cfg.fps,
+                    usable(cfg.replay_skip_fps),
+                    usable(cfg.replay_slow_fps),
+                ],
+                speed: ReplaySpeed::Normal,
+                inside: false,
+                frames: ReplayFrames::default(),
+                dev_extra: false,
+                carry: 0,
+                extra: false,
+            },
         })
+    }
+
+    /// 開発用の切り替えを設定する（設置時に1回。配布バージョンでは呼ばれない）。
+    pub fn set_dev_replay_extra(&mut self, on: bool) {
+        self.replay.dev_extra = on;
     }
 
     #[cfg(test)]
@@ -573,6 +884,7 @@ impl Pacer {
         } else if self.auto {
             self.phase = pace::auto_phase_with(clock.screen(), self.wait);
         }
+        self.replay_for_frame(clock, ring);
         // b-hybridで寝た後に期限を越える枠が続いてb-spinへ戻した後は、b-hybridの枠をb-spinとして走らせてタグもb-spinにする。
         if self.phase == Phase::BHybrid && self.doze.fell_back() {
             self.phase = Phase::BSpin;
@@ -584,6 +896,92 @@ impl Pacer {
         self.slept = false;
         ring.on_phase(self.phase);
         true
+    }
+
+    /// 先頭が実際に使うSkip・Slowのfps（QPFで刻めないものは通常のfpsに置き換え済み）。
+    pub fn replay_fps(&self) -> (u64, u64) {
+        (self.replay.fps[1], self.replay.fps[2])
+    }
+
+    /// リプレイ再生中の速さを読み、変わったフレームで格子を作り直す（基点は次の期限を決めるときの時刻になる）。フレームに1回だけ。
+    /// 垂直同期を取るフルスクリーン（`Phase::Game`）ではPresentが垂直同期を待つ。そのため格子の速さは上げられない。
+    /// Skipは、格子は通常のままで1回の表示の中のゲームの更新を増やして作る（`REPLAY_EXTRA`。走査の包みが回す）。低速だけは格子の方式に切り替えて効かせる。
+    fn replay_for_frame(&mut self, clock: &mut dyn PaceClock, ring: &PaceRing) {
+        if !self.replay.on {
+            return;
+        }
+        let seen = clock
+            .replay_read()
+            .and_then(|r| pace::replay_speed(r.global_state, r.cur, r.net_session));
+        let Some(mut speed) = seen else {
+            self.leave_replay(ring);
+            return;
+        };
+        self.replay.inside = true;
+        let mut extra = false;
+        if self.phase == Phase::Game {
+            if speed == ReplaySpeed::Slow {
+                self.phase = self.wait;
+            } else {
+                extra = speed == ReplaySpeed::Skip;
+                speed = ReplaySpeed::Normal;
+            }
+        } else if self.replay.dev_extra && speed == ReplaySpeed::Skip {
+            extra = true;
+            speed = ReplaySpeed::Normal;
+        }
+        self.plan_extra(extra);
+        // 格子は通常のままでも更新を増やして作った高速のフレームは高速に数える。
+        self.replay
+            .frames
+            .add(if extra { ReplaySpeed::Skip } else { speed });
+        self.set_speed(speed);
+    }
+
+    /// 次の表示に足す更新の数を決めて公開する。足すなら走査のcallの書き込みを要求する（まだ書いていなければ書き出しのスレッドが書く）。
+    fn plan_extra(&mut self, extra: bool) {
+        self.replay.extra = extra;
+        if !extra {
+            self.replay.carry = 0;
+            REPLAY_EXTRA.set_planned(0);
+            return;
+        }
+        let n = pace::replay_extra_updates(
+            self.replay.fps[1],
+            self.replay.fps[0],
+            &mut self.replay.carry,
+        );
+        REPLAY_EXTRA.set_planned(n);
+        if self.replay.fps[1] > self.replay.fps[0] {
+            REPLAY_EXTRA.request_arm();
+        }
+    }
+
+    fn set_speed(&mut self, speed: ReplaySpeed) {
+        if speed == self.replay.speed {
+            return;
+        }
+        let fps = self.replay.fps[ReplayPace::index(speed)];
+        let Some(p) = Pace::new(self.pace.qpf(), fps) else {
+            return;
+        };
+        self.fresh = p.clone();
+        self.pace = p;
+        self.replay.speed = speed;
+    }
+
+    /// リプレイ再生を出た。格子を通常の速さへ戻し、その再生のフレーム数を本ログへ頼むスレッドへ渡す。
+    fn leave_replay(&mut self, ring: &PaceRing) {
+        self.plan_extra(false);
+        self.set_speed(ReplaySpeed::Normal);
+        if !self.replay.inside {
+            return;
+        }
+        self.replay.inside = false;
+        let frames = core::mem::take(&mut self.replay.frames);
+        if !frames.is_empty() {
+            ring.replay_frames().publish(&frames);
+        }
     }
 
     /// 先頭へ来たときの判断。`HEAD_RUN`・`HEAD_NOT_YET`（寝た・譲った後）・`HEAD_FALLBACK`（cycleのgameの区間・autoのフルスクリーンのフレーム）を返し、枠に書く。
@@ -670,7 +1068,14 @@ impl Pacer {
             Head::Run { deadline, late } => {
                 ring.on_head(now, deadline);
                 // 寝た後に期限を越えた枠を数える（数がiniの`hybrid_fallback_*`に達したら次の枠からb-spinへ戻す）。
-                if late && self.slept && self.phase == Phase::BHybrid {
+                // リプレイ再生で速さを変えている間（格子を変えている間と、更新を増やしている間）は数えない。
+                // 数えないのは高速では1枠が短いか更新で長くなり、一度戻すとその実行の残り（後の対戦も）がb-spinになるため。
+                if late
+                    && self.slept
+                    && self.phase == Phase::BHybrid
+                    && self.replay.speed == ReplaySpeed::Normal
+                    && !self.replay.extra
+                {
                     self.doze.late_after_sleep();
                 }
                 self.start(now, late, rebased, clock, ring)
@@ -875,6 +1280,14 @@ pub trait PacingHost {
         screen_flag: u32,
         window: u32,
     ) -> Result<String, String>;
+    /// リプレイ再生の速さの判定が読む2つのアドレス（グローバル状態の1バイトと1Pの入力ワードの2バイト）を渡す。`arm_pacer`が成功した後に、設置で両方を読めると検証したときだけ呼ぶ。
+    /// 呼ばれなければ先頭は読まず、リプレイ再生の速さは変えない。
+    /// 戻り値は先頭が実際に使う（高速・低速）のfps（QPFで刻めない値は通常のfpsに置き換えた後）。先頭の箱を触れなかったときは`None`。
+    fn arm_replay_speed(&mut self, _state: u32, _cur: u32) -> Option<(u64, u64)> {
+        None
+    }
+    /// 開発用の切り替え（`dev_replay_extra`）を先頭の箱へ渡す。`arm_replay_speed`が成功した後で、切り替えが有効なときだけ呼ぶ。
+    fn arm_replay_extra_dev(&mut self) {}
     fn cpu_classes(&mut self) -> Result<CpuClasses, String>;
     /// 記録のリングバッファを空にし、書き出しのスレッドを作る（CSVを開く）。戻り値は開いたファイルの名前。`fps`は集計のペース。
     fn start_writer(
@@ -954,6 +1367,21 @@ fn checked_window(env: &mut dyn HookEnv, out: &mut dyn Write) -> u32 {
     WINDOW_ADDR
 }
 
+/// リプレイ再生の速さの判定が読む2つのアドレス（グローバル状態の1バイト・1Pの入力ワードの2バイト）を設置の時に読めるかどうかでチェックする。
+/// 読めなければ`None`を返し、その実行ではリプレイ再生の速さを変えない。値は設置の時には決まっていないので読めるかどうかだけを見る。
+fn checked_replay_addrs(env: &mut dyn HookEnv, out: &mut dyn Write) -> Option<(u32, u32)> {
+    let cur = INPUT_MANAGERS[0] + IM_CUR;
+    let (mut state_b, mut cur_b) = ([0u8; 1], [0u8; 2]);
+    if !env.read_code(GLOBAL_STATE, &mut state_b) || !env.read_code(cur, &mut cur_b) {
+        let _ = writeln!(
+            out,
+            "ペース: リプレイ再生の速さの判定に使うアドレス 0x{GLOBAL_STATE:08X} / 0x{cur:08X} が読み取り不能。リプレイ再生の速さの変更は無効です。"
+        );
+        return None;
+    }
+    Some((GLOBAL_STATE, cur))
+}
+
 /// iniから形を決める。`Ok((形, 既定になった理由))`、`Err`は本ログへ書く理由（何も触らない）。iniが無い・節が無い・`mode`を書かないときは既定のauto（`pace::DEFAULT_MODE`）。
 /// 読めないini・節の中の誤りは触らない（誤った設定のまま黙って既定を走らせない）。`mode = auto`と明示したときは既定の行を出さない。
 fn cfg_from_ini(
@@ -1016,7 +1444,9 @@ fn install_modes(
     out: &mut dyn Write,
     modes: &mut (Option<Mode>, Option<Mode>),
 ) -> Installed {
-    let cfg = match cfg_from_ini(host.read_ini()) {
+    let read = host.read_ini();
+    let dev_extra = dev_replay_extra(read.clone(), cfg!(feature = "dist"));
+    let cfg = match cfg_from_ini(read) {
         Ok((c, None)) => c,
         Ok((c, Some(why))) => {
             // 既定になったことを本ログで見分けられるよう、どの経路で既定になったかを1行書く。
@@ -1041,6 +1471,8 @@ fn install_modes(
         cycle_phases,
         wait,
         vsync: _,
+        replay_skip_fps: _,
+        replay_slow_fps: _,
         hybrid,
     } = cfg;
     modes.0 = Some(mode);
@@ -1139,6 +1571,22 @@ fn install_modes(
                     detail_out(out),
                     "ペース: 先頭の待ちを用意しました（{desc}）"
                 );
+                if mode.paces_replay()
+                    && let Some((state, cur)) = checked_replay_addrs(env, out)
+                    && let Some((skip, slow)) = host.arm_replay_speed(state, cur)
+                {
+                    let _ = writeln!(
+                        detail_out(out),
+                        "ペース: リプレイ再生の高速 {skip} fps・低速 {slow} fps（Skip・Slow を押している間）"
+                    );
+                    if dev_extra {
+                        host.arm_replay_extra_dev();
+                        let _ = writeln!(
+                            detail_out(out),
+                            "ペース: 開発用の切り替え（[pacing_dev] replay_extra）が有効です。格子の道でも Skip で 1 表示の更新を増やします。"
+                        );
+                    }
+                }
             }
             Err(why) => {
                 let _ = writeln!(
@@ -1318,6 +1766,17 @@ fn hybrid_text(p: &HybridParams) -> String {
     )
 }
 
+/// リプレイ再生を出たときのフレーム数の行（`ReplayFrames::line`）を渡された分だけ`out`へ書く。書き出しのスレッドと`finish`が呼ぶ（同時には呼ばない）。
+fn drain_replay_frames(out: &mut dyn Write) {
+    PACE_RING.replay_frames().drain(|f| {
+        let _ = writeln!(out, "{}", f.line());
+    });
+    // Skipを押したまま終わった区間のカウントもここで出す。
+    if let Some(s) = REPLAY_EXTRA.take_stats() {
+        let _ = writeln!(out, "{}", s.line());
+    }
+}
+
 /// 書き出しを止め、集計を本ログへ書く（`session::run`が計測の後に呼ぶ）。戻り値は試験のまとめの材料（書き出しを作っていない・終わりを受け取れなければNone）。
 pub fn finish(host: &mut dyn PacingHost, out: &mut dyn Write) -> Option<PaceEnd> {
     let end = host.stop_writer()?;
@@ -1360,6 +1819,7 @@ pub fn finish(host: &mut dyn PacingHost, out: &mut dyn Write) -> Option<PaceEnd>
                 let _ = writeln!(out, "{l}");
             }
             let _ = writeln!(out, "{}", glide().line(host.qpf()));
+            drain_replay_frames(&mut detail_out(out));
             Some(PaceEnd {
                 rows: e.tally.rows,
                 lost: e.tally.lost,
@@ -1404,6 +1864,10 @@ pub(crate) mod tests {
                 }
             }
             mem.insert(OPTION_WINDOWED, 1);
+            mem.insert(GLOBAL_STATE, 0);
+            for i in 0..2 {
+                mem.insert(INPUT_MANAGERS[0] + IM_CUR + i, 0);
+            }
             for i in 0..WINDOW_SPAN {
                 mem.insert(WINDOW_ADDR + i, 0);
             }
@@ -1513,6 +1977,13 @@ pub(crate) mod tests {
         pub armed: Option<PacingIni>,
         pub armed_screen_flag: Option<u32>,
         pub armed_window: Option<u32>,
+        pub armed_replay: Option<(u32, u32)>,
+        /// `arm_replay_speed`が返す（高速・低速）のfps。`None`なら読んだiniの値。
+        pub replay_fps: Option<(u64, u64)>,
+        /// 先頭の箱を触れなかった（`arm_replay_speed`が`None`を返す）。
+        pub replay_box_fail: bool,
+        /// `arm_replay_extra_dev`が呼ばれた。
+        pub dev_extra_armed: bool,
         pub writer_pre: Option<Preamble>,
         pub writer_classes: Option<CpuClasses>,
         pub classes: Option<CpuClasses>,
@@ -1567,6 +2038,18 @@ pub(crate) mod tests {
             self.armed_screen_flag = Some(screen_flag);
             self.armed_window = Some(window);
             Ok("合成のタイマー".into())
+        }
+        fn arm_replay_extra_dev(&mut self) {
+            self.dev_extra_armed = true;
+        }
+        fn arm_replay_speed(&mut self, state: u32, cur: u32) -> Option<(u64, u64)> {
+            self.events.push("arm_replay_speed".into());
+            self.armed_replay = Some((state, cur));
+            if self.replay_box_fail {
+                return None;
+            }
+            self.replay_fps
+                .or(self.armed.map(|c| (c.replay_skip_fps, c.replay_slow_fps)))
         }
         fn cpu_classes(&mut self) -> Result<CpuClasses, String> {
             self.events.push("cpu_classes".into());
@@ -1733,6 +2216,7 @@ pub(crate) mod tests {
                 "read_ini",
                 "cpu_classes",
                 "arm_pacer",
+                "arm_replay_speed",
                 "start_writer",
                 "set_present_original",
                 "start_stamps",
@@ -2171,6 +2655,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn current_start_is_the_start_of_the_frame_in_progress() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        assert_eq!(ring.current_start(), 0, "始める前");
+        ring.on_start(0x1_2345_6789, false, false, 0);
+        assert_eq!(ring.current_start(), 0x1_2345_6789, "上位32ビットも読む");
+        ring.on_present_begin(0x1_2345_9999, 0, 0);
+        assert_eq!(
+            ring.current_start(),
+            0x1_2345_6789,
+            "Presentの前は変わらない"
+        );
+        ring.on_present_end(0x1_2345_9999);
+        assert_eq!(ring.current_start(), 0, "次のフレームが始まるまで0");
+        ring.on_start(0x1_2346_0000, false, false, 0);
+        assert_eq!(ring.current_start(), 0x1_2346_0000);
+        ring.reset();
+    }
+
+    #[test]
     fn ring_keeps_one_frame_per_present() {
         let _g = lock();
         let ring = &PACE_RING;
@@ -2465,6 +2970,8 @@ pub(crate) mod tests {
         overshoot: u64,
         screen: Screen,
         screen_reads: u32,
+        replay: Option<ReplayRead>,
+        replay_reads: u32,
     }
 
     impl FakeClock {
@@ -2479,6 +2986,8 @@ pub(crate) mod tests {
                 overshoot: 700,
                 screen: Screen::Unknown,
                 screen_reads: 0,
+                replay: None,
+                replay_reads: 0,
             }
         }
     }
@@ -2507,6 +3016,10 @@ pub(crate) mod tests {
         fn screen(&mut self) -> Screen {
             self.screen_reads += 1;
             self.screen
+        }
+        fn replay_read(&mut self) -> Option<ReplayRead> {
+            self.replay_reads += 1;
+            self.replay
         }
     }
 
@@ -2902,6 +3415,103 @@ pub(crate) mod tests {
                 other => panic!("{n}: {other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn late_frames_while_the_replay_speed_is_changed_do_not_send_b_hybrid_back_to_b_spin() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        for (read, falls_back) in [
+            (rd(PLAYING, 0, false), true),
+            (rd(PLAYING, CTRL, false), false),
+            (rd(PLAYING, SHIFT, false), false),
+            (None, true),
+        ] {
+            ring.reset();
+            let cfg = PacingIni {
+                hybrid: HybridParams {
+                    fallback_count: 2,
+                    ..HybridParams::DEFAULT
+                },
+                replay_skip_fps: 120,
+                ..cfg(Mode::BHybrid)
+            };
+            let mut p = Pacer::new(10_000_000, &cfg).unwrap();
+            let mut c = FakeClock::at(1_000_000_000, 3);
+            c.overshoot = 150_000;
+            c.replay = read;
+            let rows = run_frames(&mut p, &mut c, ring, 12);
+            assert_eq!(p.doze().fell_back(), falls_back, "{read:?}");
+            assert_eq!(
+                p.doze().late_after_sleep_count() > 0,
+                falls_back,
+                "{read:?}: 数えたかどうか"
+            );
+            // 数えなかったときも、遅れて寝た枠そのものは起きている（検査が空振りでないこと）。
+            assert!(rows.iter().any(|r| r.late && r.sleeps > 0), "{read:?}");
+        }
+        // 速さを戻したら数え始め、戻す条件に達すれば戻す。
+        ring.reset();
+        let cfg = PacingIni {
+            hybrid: HybridParams {
+                fallback_count: 2,
+                ..HybridParams::DEFAULT
+            },
+            replay_skip_fps: 120,
+            ..cfg(Mode::BHybrid)
+        };
+        let mut p = Pacer::new(10_000_000, &cfg).unwrap();
+        let mut c = FakeClock::at(1_000_000_000, 3);
+        c.overshoot = 150_000;
+        c.replay = rd(PLAYING, CTRL, false);
+        for n in 0..6 {
+            run_one(&mut p, &mut c, ring, n);
+        }
+        assert!(!p.doze().fell_back());
+        c.replay = rd(PLAYING, 0, false);
+        for n in 6..12 {
+            run_one(&mut p, &mut c, ring, n);
+        }
+        assert!(p.doze().fell_back());
+        ring.reset();
+    }
+
+    #[test]
+    fn late_frames_while_extra_updates_run_do_not_send_b_hybrid_back_to_b_spin() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        REPLAY_EXTRA.reset_for_test();
+        // 開発用の切り替えで更新を増やす間は格子が通常のままでも数えない。離せば数える。
+        for (read, falls_back) in [
+            (rd(PLAYING, CTRL, false), false),
+            (rd(PLAYING, 0, false), true),
+        ] {
+            ring.reset();
+            let cfg = PacingIni {
+                hybrid: HybridParams {
+                    fallback_count: 2,
+                    ..HybridParams::DEFAULT
+                },
+                replay_skip_fps: 6_000,
+                ..cfg(Mode::BHybrid)
+            };
+            let mut p = Pacer::new(10_000_000, &cfg).unwrap();
+            p.set_dev_replay_extra(true);
+            let mut c = FakeClock::at(1_000_000_000, 3);
+            c.overshoot = 150_000;
+            c.replay = read;
+            let rows = run_frames(&mut p, &mut c, ring, 12);
+            assert_eq!(p.pace().fps(), 60, "{read:?}: 格子を上げた");
+            assert_eq!(p.doze().fell_back(), falls_back, "{read:?}");
+            assert_eq!(
+                p.doze().late_after_sleep_count() > 0,
+                falls_back,
+                "{read:?}: 数えたかどうか"
+            );
+            assert!(rows.iter().any(|r| r.late && r.sleeps > 0), "{read:?}");
+        }
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
     }
 
     #[test]
@@ -3914,5 +4524,671 @@ pub(crate) mod tests {
             r * 100.0
         );
         assert!(r < 0.5, "{r}");
+    }
+
+    // ---- リプレイ再生の速さ ----
+
+    const PLAYING: u8 = pace::REPLAY_PLAYING_STATE;
+    const CTRL: u16 = higanr_core::input_model::keys::CTRL;
+    const SHIFT: u16 = higanr_core::input_model::keys::SHIFT;
+
+    fn rd(global_state: u8, cur: u16, net_session: bool) -> Option<ReplayRead> {
+        Some(ReplayRead {
+            global_state,
+            cur,
+            net_session,
+        })
+    }
+
+    /// 1フレーム: 先頭が「始める」を返すまで繰り返し、Presentの前後を記録する。
+    fn replay_frame(p: &mut Pacer, c: &mut FakeClock, ring: &PaceRing) {
+        let mut n = 0;
+        while p.head(c, ring) != HEAD_RUN {
+            n += 1;
+            assert!(n < 100_000, "始まらない");
+        }
+        ring.on_present_begin(c.now, 0, 0);
+        ring.on_present_end(c.now + 1);
+    }
+
+    fn published(ring: &PaceRing) -> Vec<ReplayFrames> {
+        let mut v = Vec::new();
+        assert_eq!(ring.replay_frames().drain(|f| v.push(f)), 0);
+        v
+    }
+
+    fn frames(normal: u32, skip: u32, slow: u32) -> ReplayFrames {
+        ReplayFrames { normal, skip, slow }
+    }
+
+    #[test]
+    fn replay_speed_follows_the_buttons_and_regrids_only_when_it_changes() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let mut p = Pacer::new(10_000_000, &cfg(Mode::B)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        // 再生中でない状態（生の試合0x04・タイトルのデモ0x0E）では押していても60のまま。
+        let script = [
+            (rd(0x04, CTRL, false), 60),
+            (rd(0x0E, SHIFT, false), 60),
+            (rd(PLAYING, 0, false), 60),
+            (rd(PLAYING, CTRL, false), 240),
+            (rd(PLAYING, CTRL, false), 240),
+            (rd(PLAYING, CTRL | SHIFT, false), 240),
+            (rd(PLAYING, 0, false), 60),
+            (rd(PLAYING, SHIFT, false), 30),
+            (rd(PLAYING, SHIFT, false), 30),
+            (rd(PLAYING, 0, false), 60),
+            (rd(PLAYING, CTRL, false), 240),
+            (rd(PLAYING, SHIFT, false), 30),
+            (rd(0x04, 0, false), 60),
+            (rd(0x04, CTRL, false), 60),
+        ];
+        let mut prev: Option<(u64, u64)> = None;
+        for (i, (r, fps)) in script.into_iter().enumerate() {
+            c.replay = r;
+            replay_frame(&mut p, &mut c, ring);
+            let base = p.pace().grid().unwrap().base();
+            assert_eq!(p.pace().fps(), fps, "frame {i}");
+            let PaceRead::Row(row) = ring.read(i as u32) else {
+                panic!("frame {i}")
+            };
+            if let Some((pfps, pbase)) = prev {
+                if pfps != fps {
+                    assert_ne!(
+                        base, pbase,
+                        "frame {i}: 速さが変わったのに基点を置き直さない"
+                    );
+                    assert_eq!(
+                        (row.deadline, row.late),
+                        (row.first_head, false),
+                        "frame {i}: 置き直したフレームは今から始める"
+                    );
+                } else {
+                    assert_eq!(base, pbase, "frame {i}: 変わらないのに基点を置き直した");
+                    assert!(row.deadline > row.first_head, "frame {i}");
+                }
+            }
+            prev = Some((fps, base));
+        }
+        // 再生中だった10フレーム（i = 2〜11）。通常 i = 2・6・9、高速 i = 3・4・5・10、低速 i = 7・8・11。
+        assert_eq!(published(ring), vec![frames(3, 4, 3)]);
+        ring.reset();
+    }
+
+    #[test]
+    fn a_6000_fps_grid_that_fell_far_behind_does_not_catch_up_after_the_skip_is_released() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::B, 6_000)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        c.replay = rd(PLAYING, CTRL, false);
+        for _ in 0..40 {
+            replay_frame(&mut p, &mut c, ring);
+            // 描画が追いつかず、1フレームが50 ms（格子の300周期分）かかる。
+            c.now += 500_000;
+        }
+        assert_eq!(p.pace().fps(), 6_000);
+        let late = (0..40)
+            .filter(|&n| matches!(ring.read(n), PaceRead::Row(r) if r.late))
+            .count();
+        assert!(late >= 30, "遅れていない: {late}");
+        // 離したら基点を置き直し、離したフレームから通常の周期で進む（遅れの分を取り戻して60を越えない）。
+        c.replay = rd(PLAYING, 0, false);
+        let t0 = c.now;
+        for _ in 0..61 {
+            replay_frame(&mut p, &mut c, ring);
+        }
+        assert_eq!(p.pace().fps(), 60);
+        let used = c.now - t0;
+        assert!(used >= 60 * 166_666 * 99 / 100, "取り戻して走った: {used}");
+        for n in 40..101 {
+            let PaceRead::Row(r) = ring.read(n) else {
+                panic!("{n}")
+            };
+            if n > 40 {
+                assert!(!r.late && r.skipped == 0, "{n}: {r:?}");
+            }
+        }
+        ring.reset();
+    }
+
+    #[test]
+    fn replay_speed_is_left_alone_during_a_net_session() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let mut p = Pacer::new(10_000_000, &cfg(Mode::BSpin)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        for (r, fps) in [
+            (rd(PLAYING, CTRL, true), 60),
+            (rd(PLAYING, SHIFT, true), 60),
+            (rd(PLAYING, CTRL, false), 240),
+            (rd(PLAYING, CTRL, true), 60),
+            (rd(PLAYING, CTRL, true), 60),
+        ] {
+            c.replay = r;
+            replay_frame(&mut p, &mut c, ring);
+            assert_eq!(p.pace().fps(), fps);
+        }
+        assert_eq!(
+            published(ring),
+            vec![frames(0, 1, 0)],
+            "対戦の最中のフレームは数えない"
+        );
+        ring.reset();
+    }
+
+    #[test]
+    fn replay_speed_is_not_read_where_the_pacer_does_not_own_the_pace() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        assert!(Pacer::new(10_000_000, &cfg(Mode::Game)).is_none());
+        for mode in [Mode::Cycle, Mode::Vpatch] {
+            let mut p = Pacer::new(10_000_000, &cfg(mode)).unwrap();
+            let mut c = FakeClock::at(1_000_000, 3);
+            c.replay = rd(PLAYING, CTRL, false);
+            p.head(&mut c, ring);
+            assert_eq!(c.replay_reads, 0, "{mode:?}");
+            assert_eq!(p.pace().fps(), 60, "{mode:?}");
+        }
+        for mode in [Mode::Auto, Mode::B, Mode::BSpin, Mode::BHybrid] {
+            let mut p = Pacer::new(10_000_000, &cfg(mode)).unwrap();
+            let mut c = FakeClock::at(1_000_000, 3);
+            c.screen = Screen::Windowed;
+            c.replay = rd(PLAYING, SHIFT, false);
+            replay_frame(&mut p, &mut c, ring);
+            assert_eq!((c.replay_reads, p.pace().fps()), (1, 30), "{mode:?}");
+            ring.reset();
+        }
+        ring.reset();
+    }
+
+    #[test]
+    fn replay_speed_without_a_readable_game_stays_normal() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let mut p = Pacer::new(10_000_000, &cfg(Mode::B)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        c.replay = None;
+        for _ in 0..3 {
+            replay_frame(&mut p, &mut c, ring);
+        }
+        assert_eq!((c.replay_reads, p.pace().fps()), (3, 60));
+        assert_eq!(published(ring), vec![]);
+        ring.reset();
+    }
+
+    #[test]
+    fn replay_slow_works_under_vsync_fullscreen_but_skip_does_not() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let mut p = Pacer::new(10_000_000, &cfg(Mode::Auto)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        c.screen = Screen::Fullscreen;
+        let game_frame = |p: &mut Pacer, c: &mut FakeClock| {
+            assert_eq!(p.head(c, ring), HEAD_FALLBACK);
+            ring.on_present_begin(c.now, 0, 0);
+            ring.on_present_end(c.now + 1);
+        };
+        c.replay = rd(PLAYING, 0, false);
+        game_frame(&mut p, &mut c);
+        c.replay = rd(PLAYING, CTRL, false);
+        game_frame(&mut p, &mut c);
+        assert_eq!(p.pace().fps(), 60, "垂直同期ありで高速にした");
+        c.replay = rd(PLAYING, SHIFT, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(p.pace().fps(), 30);
+        replay_frame(&mut p, &mut c, ring);
+        let PaceRead::Row(row) = ring.read(2) else {
+            panic!()
+        };
+        assert_eq!((row.phase, row.paced), (Some(Phase::BHybrid), true));
+        c.replay = rd(PLAYING, 0, false);
+        game_frame(&mut p, &mut c);
+        assert_eq!(p.pace().fps(), 60, "離したら通常に戻す");
+        let PaceRead::Row(row) = ring.read(4) else {
+            panic!()
+        };
+        assert_eq!(row.phase, Some(Phase::Game));
+        // 再生を出る。更新を増やして作ったSkipの1フレームは高速に数える。
+        c.replay = rd(0x04, 0, false);
+        game_frame(&mut p, &mut c);
+        assert_eq!(published(ring), vec![frames(2, 1, 2)]);
+        // 垂直同期なしのウィンドウでは高速も効く。
+        c.screen = Screen::Windowed;
+        c.replay = rd(PLAYING, CTRL, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(p.pace().fps(), 240);
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn a_replay_fps_the_clock_cannot_tick_leaves_the_pace_unchanged() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        let qpf = 500;
+        let cfg = PacingIni {
+            replay_skip_fps: 1_000,
+            replay_slow_fps: 30,
+            ..cfg(Mode::B)
+        };
+        let mut p = Pacer::new(qpf, &cfg).unwrap();
+        assert_eq!(
+            p.replay_fps(),
+            (60, 30),
+            "刻めない値は通常のfpsに置き換える"
+        );
+        let mut c = FakeClock::at(1_000_000, 1);
+        c.overshoot = 0;
+        for (r, fps) in [
+            (rd(PLAYING, CTRL, false), 60),
+            (rd(PLAYING, SHIFT, false), 30),
+        ] {
+            c.replay = r;
+            replay_frame(&mut p, &mut c, ring);
+            assert_eq!(p.pace().fps(), fps);
+        }
+        ring.reset();
+    }
+
+    #[test]
+    fn replay_frames_handoff_keeps_order_and_counts_what_it_lost() {
+        let h = ReplayFramesHandoff::new();
+        let mut got = Vec::new();
+        assert_eq!(h.drain(|f| got.push(f)), 0);
+        assert!(got.is_empty());
+        for i in 1..=2 {
+            h.publish(&frames(i, i + 10, i + 20));
+        }
+        assert_eq!(h.drain(|f| got.push(f)), 0);
+        assert_eq!(got, vec![frames(1, 11, 21), frames(2, 12, 22)]);
+        got.clear();
+        assert_eq!(h.drain(|f| got.push(f)), 0, "読んだ分は二度渡さない");
+        assert!(got.is_empty());
+        for i in 1..=6 {
+            h.publish(&frames(i, 0, 0));
+        }
+        assert_eq!(h.drain(|f| got.push(f)), 3, "追い越された分");
+        assert_eq!(got, vec![frames(4, 0, 0), frames(5, 0, 0), frames(6, 0, 0)]);
+        h.reset();
+        h.publish(&frames(9, 9, 9));
+        got.clear();
+        assert_eq!(h.drain(|f| got.push(f)), 0);
+        assert_eq!(got, vec![frames(9, 9, 9)]);
+    }
+
+    #[test]
+    fn install_arms_the_replay_speed_only_where_the_pacer_owns_the_pace() {
+        let state_cur = (GLOBAL_STATE, INPUT_MANAGERS[0] + IM_CUR);
+        for (ini, want) in [
+            (INI_B, Some(state_cur)),
+            ("", Some(state_cur)),
+            ("[pacing]\nmode = auto\n", Some(state_cur)),
+            ("[pacing]\nmode = b-hybrid\n", Some(state_cur)),
+            (INI_GAME, None),
+            ("[pacing]\nmode = cycle\n", None),
+            ("[pacing]\nmode = vpatch\n", None),
+        ] {
+            let mut code = FakeCode::original();
+            let mut host = FakeHost::with_ini(ini);
+            let (r, log) = run(&mut code, &mut host);
+            assert!(r != Installed::Nothing, "{ini:?}: {log}");
+            assert_eq!(host.armed_replay, want, "{ini:?}");
+            if want.is_some() {
+                let ev = &host.events;
+                let at = ev.iter().position(|e| e == "arm_pacer").unwrap();
+                assert_eq!(ev[at + 1], "arm_replay_speed", "{ini:?}: {ev:?}");
+                assert!(
+                    log.contains(
+                        "ペース: リプレイ再生の高速 240 fps・低速 30 fps（Skip・Slow を押している間）"
+                    ),
+                    "{ini:?}: {log}"
+                );
+            }
+        }
+        let mut code = FakeCode::original();
+        let mut host =
+            FakeHost::with_ini("[pacing]\nmode = b\nreplay_skip_fps = 500\nreplay_slow_fps = 20\n");
+        let (_, log) = run(&mut code, &mut host);
+        assert_eq!(
+            host.armed.map(|c| (c.replay_skip_fps, c.replay_slow_fps)),
+            Some((500, 20))
+        );
+        assert!(
+            log.contains("リプレイ再生の高速 500 fps・低速 20 fps（Skip・Slow を押している間）"),
+            "{log}"
+        );
+        // 行に出す数は先頭が実際に使う値（置き換え後）。iniの値ではない。
+        let mut code = FakeCode::original();
+        let mut host = FakeHost {
+            replay_fps: Some((60, 20)),
+            ..FakeHost::with_ini(
+                "[pacing]\nmode = b\nreplay_skip_fps = 500\nreplay_slow_fps = 20\n",
+            )
+        };
+        let (_, log) = run(&mut code, &mut host);
+        assert!(
+            log.contains("リプレイ再生の高速 60 fps・低速 20 fps（"),
+            "{log}"
+        );
+        assert!(!log.contains("高速 500 fps"), "{log}");
+        // 先頭の箱を触れなかったときは行を出さない。
+        let mut code = FakeCode::original();
+        let mut host = FakeHost {
+            replay_box_fail: true,
+            ..FakeHost::with_ini(INI_B)
+        };
+        let (r, log) = run(&mut code, &mut host);
+        assert_eq!(r, Installed::Paced, "{log}");
+        assert!(!log.contains("リプレイ再生の高速"), "{log}");
+        // アドレスが読めなければ速さを変えず、読めなかったと本ログに残す（簡潔にも）。
+        for missing in [GLOBAL_STATE, INPUT_MANAGERS[0] + IM_CUR + 1] {
+            let mut code = FakeCode::original();
+            code.mem.remove(&missing);
+            let mut host = FakeHost::with_ini(INI_B);
+            let (r, log) = crate::log_mode::with_detail(false, || run(&mut code, &mut host));
+            assert_eq!(r, Installed::Paced, "{log}");
+            assert_eq!(host.armed_replay, None, "{missing:#X}");
+            assert!(
+                log.contains(
+                    "ペース: リプレイ再生の速さの判定に使うアドレス 0x004A7EC4 / 0x004ACE18 が読み取り不能。リプレイ再生の速さの変更は無効です。"
+                ),
+                "{log}"
+            );
+        }
+        // 不正な値のiniはペース全体を触らない。
+        let mut code = FakeCode::original();
+        let mut host = FakeHost::with_ini("[pacing]\nreplay_skip_fps = 0\n");
+        let (r, log) = run(&mut code, &mut host);
+        assert_eq!(r, Installed::Nothing, "{log}");
+        assert!(log.contains("replay_skip_fps の値"), "{log}");
+    }
+
+    // ---- リプレイの高速再生（更新を増やす道）----
+
+    fn extra_cfg(mode: Mode, skip_fps: u64) -> PacingIni {
+        PacingIni {
+            replay_skip_fps: skip_fps,
+            ..cfg(mode)
+        }
+    }
+
+    /// 垂直同期を取るフルスクリーンの1フレーム（先頭はゲーム自身の経路を返す）。
+    fn vsync_frame(p: &mut Pacer, c: &mut FakeClock, ring: &PaceRing, r: Option<ReplayRead>) {
+        c.screen = Screen::Fullscreen;
+        c.replay = r;
+        assert_eq!(p.head(c, ring), HEAD_FALLBACK);
+        ring.on_present_begin(c.now, 0, 0);
+        ring.on_present_end(c.now + 1);
+    }
+
+    #[test]
+    fn skip_under_vsync_fullscreen_plans_extra_updates_and_asks_for_the_hook_once() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        REPLAY_EXTRA.reset_for_test();
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::Auto, 240)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, 0, false));
+        assert_eq!(
+            (REPLAY_EXTRA.planned(), REPLAY_EXTRA.arm_state_for_test()),
+            (0, 0),
+            "押していないのに要求した"
+        );
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+        // 格子は通常のまま、更新を3回足す（1表示4回 = 240 / 60）。
+        assert_eq!(p.pace().fps(), 60);
+        assert_eq!(REPLAY_EXTRA.planned(), 3);
+        assert_eq!(REPLAY_EXTRA.arm_state_for_test(), 1);
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL | SHIFT, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 3, "Skip と Slow が両方なら Skip");
+        // 離したら0。要求は受け取られるまで残り、受け取れるのは1回だけ。
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, 0, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 0, "離しても余分が残る");
+        assert!(REPLAY_EXTRA.take_arm_request());
+        assert!(!REPLAY_EXTRA.take_arm_request());
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 3);
+        assert!(
+            !REPLAY_EXTRA.take_arm_request(),
+            "試した後にもう一度要求した（1プロセスで1回だけ）"
+        );
+        // 低速は格子の道（予定なし）。
+        c.screen = Screen::Fullscreen;
+        c.replay = rd(PLAYING, SHIFT, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(REPLAY_EXTRA.planned(), 0);
+        // 再生を出た・対戦のセッションが立っているときは0。
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 3);
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, true));
+        assert_eq!(REPLAY_EXTRA.planned(), 0, "対戦のセッション中に足した");
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+        vsync_frame(&mut p, &mut c, ring, rd(0x04, CTRL, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 0, "再生を出ても残った");
+        vsync_frame(&mut p, &mut c, ring, None);
+        assert_eq!(REPLAY_EXTRA.planned(), 0);
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn skip_fps_6000_under_vsync_fullscreen_plans_99_extra_updates_every_display() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        REPLAY_EXTRA.reset_for_test();
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::Auto, 6_000)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        for _ in 0..3 {
+            vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+            assert_eq!(REPLAY_EXTRA.planned(), 99);
+        }
+        assert_eq!(p.pace().fps(), 60);
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn extra_updates_are_not_planned_where_they_do_not_apply() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        REPLAY_EXTRA.reset_for_test();
+        // 格子の道は開発用の切り替えが無ければ今までどおりfpsを上げる。更新は足さず要求も立てない。
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::B, 240)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        c.replay = rd(PLAYING, CTRL, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(p.pace().fps(), 240);
+        assert_eq!(
+            (REPLAY_EXTRA.planned(), REPLAY_EXTRA.arm_state_for_test()),
+            (0, 0)
+        );
+        // 速さが通常以下の設定ならフルスクリーンでも足さず要求しない。
+        for skip in [60, 30] {
+            let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::Auto, skip)).unwrap();
+            let mut c = FakeClock::at(1_000_000, 3);
+            vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+            assert_eq!(
+                (REPLAY_EXTRA.planned(), REPLAY_EXTRA.arm_state_for_test()),
+                (0, 0),
+                "skip {skip}"
+            );
+        }
+        // 刻めない高速（通常のfpsに置き換え済み）でも足さない。
+        let mut p = Pacer::new(500, &extra_cfg(Mode::Auto, 1_000)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 1);
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+        assert_eq!(REPLAY_EXTRA.planned(), 0);
+        // リプレイの速さを変えない形（cycle・vpatch）は読みもしない。
+        for mode in [Mode::Cycle, Mode::Vpatch] {
+            let mut p = Pacer::new(10_000_000, &extra_cfg(mode, 240)).unwrap();
+            let mut c = FakeClock::at(1_000_000, 3);
+            c.replay = rd(PLAYING, CTRL, false);
+            p.head(&mut c, ring);
+            assert_eq!(REPLAY_EXTRA.planned(), 0, "{mode:?}");
+        }
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn the_dev_switch_makes_the_grid_path_plan_extra_updates_instead_of_a_faster_grid() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        REPLAY_EXTRA.reset_for_test();
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::BHybrid, 240)).unwrap();
+        p.set_dev_replay_extra(true);
+        let mut c = FakeClock::at(1_000_000, 3);
+        c.replay = rd(PLAYING, CTRL, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(p.pace().fps(), 60, "格子を上げた");
+        assert_eq!(REPLAY_EXTRA.planned(), 3);
+        assert_eq!(REPLAY_EXTRA.arm_state_for_test(), 1);
+        // 低速は今までどおり格子を下げる。離せば0。
+        c.replay = rd(PLAYING, SHIFT, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!((p.pace().fps(), REPLAY_EXTRA.planned()), (30, 0));
+        c.replay = rd(PLAYING, CTRL, false);
+        replay_frame(&mut p, &mut c, ring);
+        c.replay = rd(PLAYING, 0, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!((p.pace().fps(), REPLAY_EXTRA.planned()), (60, 0));
+        // 切り替えを切れば同じ入力でfpsを上げて足さない。
+        p.set_dev_replay_extra(false);
+        c.replay = rd(PLAYING, CTRL, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!((p.pace().fps(), REPLAY_EXTRA.planned()), (240, 0));
+        // フレーム数は更新を増やして作った高速も高速に数える（高速 3 = 開発用の 2 + 格子の 1）。
+        c.replay = rd(0x04, 0, false);
+        replay_frame(&mut p, &mut c, ring);
+        assert_eq!(published(ring), vec![frames(1, 3, 1)]);
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn a_skip_ratio_that_does_not_divide_carries_the_remainder_across_displays() {
+        let _g = lock();
+        let ring = &PACE_RING;
+        ring.reset();
+        REPLAY_EXTRA.reset_for_test();
+        let mut p = Pacer::new(10_000_000, &extra_cfg(Mode::Auto, 100)).unwrap();
+        let mut c = FakeClock::at(1_000_000, 3);
+        let mut seen = Vec::new();
+        // 5表示で離す。ここで持ち越しは20（割り切れる周期の途中）。
+        for _ in 0..5 {
+            vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+            seen.push(REPLAY_EXTRA.planned());
+        }
+        assert_eq!(seen, vec![0, 1, 1, 0, 1]);
+        // 離すと持ち越しも捨てる。次の押下は最初から（0, 1, 1）。捨てなければ最初が1になる。
+        vsync_frame(&mut p, &mut c, ring, rd(PLAYING, 0, false));
+        let mut again = Vec::new();
+        for _ in 0..3 {
+            vsync_frame(&mut p, &mut c, ring, rd(PLAYING, CTRL, false));
+            again.push(REPLAY_EXTRA.planned());
+        }
+        assert_eq!(again, vec![0, 1, 1]);
+        REPLAY_EXTRA.reset_for_test();
+        ring.reset();
+    }
+
+    #[test]
+    fn the_dev_switch_is_read_only_in_a_dev_build_and_only_from_the_pacing_dev_section() {
+        let ini = |t: &str| Ok(Some(t.to_string()));
+        let on = "[pacing_dev]\nreplay_extra = 1\n";
+        assert!(dev_replay_extra(ini(on), false));
+        // 配布バージョンでは同じiniでも効かない。
+        assert!(!dev_replay_extra(ini(on), true));
+        for off in [
+            "",
+            "[pacing]\nmode = auto\n",
+            "[pacing_dev]\nreplay_extra = 0\n",
+            "[pacing_dev]\nreplay_extra = on\n",
+            "[pacing]\nreplay_extra = 1\n",
+            "[pacing_dev]\nother = 1\n",
+            "[[[",
+        ] {
+            assert!(!dev_replay_extra(ini(off), false), "{off:?}");
+        }
+        assert!(!dev_replay_extra(Ok(None), false));
+        assert!(!dev_replay_extra(Err("読めない".into()), false));
+    }
+
+    #[test]
+    fn install_hands_the_dev_switch_to_the_pacer_only_when_asked_and_not_in_a_dist_build() {
+        let dev_ini = "[pacing]\nmode = auto\n[pacing_dev]\nreplay_extra = 1\n";
+        let mut code = FakeCode::original();
+        let mut host = FakeHost::with_ini(dev_ini);
+        let (r, log) = run(&mut code, &mut host);
+        assert_eq!(r, Installed::Paced, "{log}");
+        assert_eq!(
+            host.dev_extra_armed,
+            !cfg!(feature = "dist"),
+            "開発用の切り替えの受け渡し: {log}"
+        );
+        // 切り替えが無いiniでは渡さない。
+        let mut code = FakeCode::original();
+        let mut host = FakeHost::with_ini("[pacing]\nmode = auto\n");
+        let (_, log) = run(&mut code, &mut host);
+        assert!(!host.dev_extra_armed, "{log}");
+        assert!(!log.contains("開発用の切り替え"), "{log}");
+        // リプレイの速さを変えない形（game）では渡さない。
+        let mut code = FakeCode::original();
+        let mut host =
+            FakeHost::with_ini("[pacing]\nmode = game\n[pacing_dev]\nreplay_extra = 1\n");
+        let (_, _) = run(&mut code, &mut host);
+        assert!(!host.dev_extra_armed);
+    }
+
+    #[test]
+    fn extra_stats_print_one_line_after_the_skip_is_released() {
+        let _g = lock();
+        REPLAY_EXTRA.reset_for_test();
+        let mut lines = Vec::new();
+        drain_replay_extra(|l| lines.push(l));
+        assert!(lines.is_empty(), "回していないのに行を出した");
+        REPLAY_EXTRA.note_display(3, false, 300);
+        REPLAY_EXTRA.note_display(3, false, 360);
+        REPLAY_EXTRA.note_display(1, true, 12_000);
+        REPLAY_EXTRA.note_display(0, true, 12_050);
+        // 何も回さず打ち切りもない表示は数えない。
+        REPLAY_EXTRA.note_display(0, false, 99_999);
+        // 押している間は区間の終わりまで溜める。
+        REPLAY_EXTRA.set_planned(3);
+        drain_replay_extra(|l| lines.push(l));
+        assert!(lines.is_empty(), "押している途中で行を出した");
+        REPLAY_EXTRA.set_planned(0);
+        drain_replay_extra(|l| lines.push(l));
+        assert_eq!(
+            lines,
+            vec![
+                "ペース: リプレイの高速再生 3 表示で余分な更新 7 回（1 表示あたりの更新 平均 3.33、時間の上限で打ち切り 2 回、余分な更新 1 回あたり 平均 1808 µs、1 表示の余分な更新の時間 最大 12050 µs）"
+                    .to_string()
+            ]
+        );
+        // 出した分は二度出さない。
+        lines.clear();
+        drain_replay_extra(|l| lines.push(l));
+        assert!(lines.is_empty());
+        // 受け取った要求は対戦のセッションを理由に戻せば後でまた要求できる。
+        REPLAY_EXTRA.request_arm();
+        assert!(REPLAY_EXTRA.take_arm_request());
+        REPLAY_EXTRA.cancel_arm();
+        REPLAY_EXTRA.request_arm();
+        assert!(REPLAY_EXTRA.take_arm_request());
+        REPLAY_EXTRA.reset_for_test();
     }
 }

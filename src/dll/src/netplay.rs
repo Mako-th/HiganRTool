@@ -837,6 +837,56 @@ const NO_ARRIVAL: Arrival = Arrival {
     t_us: 0,
 };
 
+/// 観戦者へ積んだ選択の押下を控える数。あふれた選択は再戦で積み直さない。
+const SPEC_STEPS_MAX: usize = 32;
+
+/// 観戦: 最後の選択で積んだ押下（`Step`と同じtickの`Menu`のワード）。
+/// 再戦の`Seg`の後ろにもう一度積み、再戦の途中から入った観戦者を1戦目でなく再戦の頭から始めさせる。
+/// 再戦は乱数を引き継ぐ。そのため積み直す`Select`のシードは切替のtickの値にする。
+#[derive(Clone, Copy)]
+struct SpecSteps {
+    cur: [Option<(Step, u16, u16)>; SPEC_STEPS_MAX],
+    cur_len: usize,
+    cur_over: bool,
+    last: [Option<(Step, u16, u16)>; SPEC_STEPS_MAX],
+    /// 0なら積み直さない（押下の無い選択・あふれた選択）。
+    last_len: usize,
+}
+
+impl SpecSteps {
+    const fn new() -> Self {
+        Self {
+            cur: [None; SPEC_STEPS_MAX],
+            cur_len: 0,
+            cur_over: false,
+            last: [None; SPEC_STEPS_MAX],
+            last_len: 0,
+        }
+    }
+
+    fn note(&mut self, st: Step, m1: u16, m2: u16) {
+        match self.cur.get_mut(self.cur_len) {
+            Some(slot) => {
+                *slot = Some((st, m1, m2));
+                self.cur_len += 1;
+            }
+            None => self.cur_over = true,
+        }
+    }
+
+    /// 選択が揃った（`Select`を積んだ）。ここまでの押下を再戦で積み直す分にする。
+    fn seal(&mut self) {
+        self.last = self.cur;
+        self.last_len = if self.cur_over { 0 } else { self.cur_len };
+        self.cur_len = 0;
+        self.cur_over = false;
+    }
+
+    fn last(&self) -> impl Iterator<Item = (Step, u16, u16)> + '_ {
+        self.last.iter().take(self.last_len).flatten().copied()
+    }
+}
+
 /// 入力の地点の判断。`Local` = 元の飛び先へ、`Zero` / `Played` = poll_all を呼ばずに戻る、`RenderOnly` = 戻りアドレスを`0x00431259`へ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -1081,6 +1131,9 @@ pub struct NetPlay {
     menu_hold_run: u32,
     menu_retry: Option<(Press, u32)>,
     steps: StepLog,
+    spec_steps: SpecSteps,
+    /// 再戦で選択の記録を積み直すかどうか。常にtrue（積み直さない古いホストの形を検査で作るときだけfalse）。
+    spec_rematch: bool,
     own_select: Option<Select>,
     agreed: Option<Agreed>,
     lat_next: usize,
@@ -1250,6 +1303,8 @@ impl NetPlay {
             menu_hold_run: 0,
             menu_retry: None,
             steps: StepLog::new(),
+            spec_steps: SpecSteps::new(),
+            spec_rematch: true,
             own_select: None,
             agreed: None,
             lat_next: 0,
@@ -2303,22 +2358,54 @@ impl NetPlay {
     }
 
     /// マッチが始まったsegを出る。相手が先に終えていたら、ここでやめる。
-    fn leave_seg(&mut self) {
+    /// 接続したまま次のsegへ進んだ（観戦者へ`Seg`を積んだ）かどうかを返す。
+    fn leave_seg(&mut self) -> bool {
         if self.peer_finished {
             self.finish(End::PeerBye(ByeReason::Finished));
         }
         if !self.seg_started {
-            return;
+            return false;
         }
+        let mut next_seg = false;
         if let Some(c) = self.link.connected_mut() {
             let next = c.seg().wrapping_add(1);
             // rollbackのモードの次のマッチのDは前のマッチの最後の予定の値（数字キーで替えた値）。`Rollback::begin_seg`が決め、INPUTのlatで相手へ渡る。
             c.begin_seg(next);
             self.rb_epoch = self.rb_epoch.wrapping_add(1);
             Self::spec_seg(&self.spec, next, &c.established());
+            next_seg = true;
         }
         self.seg_started = false;
         self.held_local = None;
+        next_seg
+    }
+
+    /// 観戦: 再戦の`Seg`の後ろに最後の選択の押下と`Select`をもう一度積む。
+    /// 再戦の途中から入った観戦者はここから選択を辿り再戦の頭から観る（1戦目まで遡らない）。
+    /// 再戦はシードを置き直さず乱数を引き継ぐ。そのためシードは切替のtickの入力の地点の値にする（止める地点で読むのと同じ所）。
+    /// すでに観ている観戦者はマッチの中でこれらを読み飛ばす。
+    /// 遅延の増分: 切替のtickに乱数を1回読み、十数記録を積むだけ。マッチの中のフレームには何も足さない。
+    fn spec_rematch<G: Game>(&mut self, game: &mut G) {
+        if self.spec.is_none()
+            || !self.spec_rematch
+            || self.phase == Phase::Ended
+            || self.spec_steps.last_len == 0
+        {
+            return;
+        }
+        let (Some(c), Some(a)) = (self.link.connected(), self.agreed) else {
+            return;
+        };
+        if c.role() != Role::Host {
+            return;
+        }
+        let seat = c.seat();
+        let rng_seed = game.own_select(seat, Role::Host).rng_seed;
+        for (st, p1, p2) in self.spec_steps.last() {
+            Self::spec_to(&self.spec, Record::Step(st));
+            Self::spec_to(&self.spec, Record::Menu { p1, p2 });
+        }
+        Self::spec_selects(&self.spec, seat, self.own_select, &Agreed { rng_seed, ..a });
     }
 
     /// まだ接続していない間の1 tick。
@@ -2533,6 +2620,7 @@ impl NetPlay {
             let left = retried.map_or(MENU_RETRY_TICKS, |l| l.saturating_sub(1));
             self.menu_retry = (left > 0).then_some((p, left));
         }
+        let mut spec_step = None;
         let words = match fo.apply {
             None => net_select::normal_words(seat, local, remote),
             Some(st) => {
@@ -2575,6 +2663,7 @@ impl NetPlay {
                     // 観戦: 入った押下。このtickの`Record::Menu`（下）より先に積む。
                     // 形式の切替は積まない。観戦者のマッチは対戦する側の形式に依らず入力ワードの列だけで動くので、積むと観戦者が押下として入れてしまう。
                     Self::spec_to(&self.spec, Record::Step(st));
+                    spec_step = Some(st);
                 }
                 self.stats.menu_applied = self.stats.menu_applied.saturating_add(1);
                 if st.kind == StepKind::Decide {
@@ -2601,6 +2690,9 @@ impl NetPlay {
         game.feed(2, p3);
         let (m1, m2) = by_seat(seat, local, remote_rec);
         Self::spec_to(&self.spec, Record::Menu { p1: m1, p2: m2 });
+        if let Some(st) = spec_step {
+            self.spec_steps.note(st, m1, m2);
+        }
         self.stats.menu_frames = self.stats.menu_frames.saturating_add(1);
         Action::Menu
     }
@@ -2748,6 +2840,7 @@ impl NetPlay {
             return Action::Zero;
         }
         Self::spec_selects(&self.spec, c.seat(), self.own_select, &a);
+        self.spec_steps.seal();
         self.peer_charge = a.peer.charge;
         self.count_agreed(&a);
         self.agreed = Some(a);
@@ -2764,7 +2857,9 @@ impl NetPlay {
     fn lockstep_tick<G: Game, N: Net>(&mut self, game: &mut G, net: &mut N) -> Action {
         let (cur, next) = game.scenes();
         if cur == SCENE_MATCH && REQ_REBUILD_MATCH.contains(&next) {
-            self.leave_seg();
+            if self.leave_seg() {
+                self.spec_rematch(game);
+            }
             self.phase = Phase::Loading;
             return self.zero(game);
         }

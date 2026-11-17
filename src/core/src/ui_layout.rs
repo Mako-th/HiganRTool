@@ -11,12 +11,38 @@
 #![forbid(unsafe_code)]
 
 use crate::overlay::{
-    AtlasSpec, Face, GAME_BASELINE_SHIFT, MAX_TEXT, SMALL_CELL_H, Vertex, game_glyph_left, quad,
-    rect_uv, resolve, resolve_plain, resolve_small, slot_uv,
+    AtlasSpec, Face, GAME_BASELINE_SHIFT, MAX_TEXT, SMALL_CELL_H, Vertex, game_glyph_left,
+    glyph_cells, quad, rect_uv, resolve, resolve_plain, resolve_small, slot_uv,
 };
 
 /// 文字の幅と絵の決め方（`overlay::resolve`か、ゲームの文字を使わない`overlay::resolve_plain`）。
 type Resolver = fn(&AtlasSpec, char, Option<u32>) -> (u32, Face);
+
+/// 行の中のこの印より後ろを、行全体を半角の枠（`glyph_cells`）で数えた列の右端に揃えて描く。印は描かず幅も持たない。
+/// 1枠の幅は空白の送り幅。ゲームの文字では英数字が9画素・全角が14画素で全角が半角2つ分にならないので空白で詰めた右寄せがずれる。
+/// 前の文字に重なるときは前の文字の直後から描く。印は最初の1つだけ効く。
+pub const ALIGN_RIGHT: char = '\u{1F}';
+
+/// `ALIGN_RIGHT`のある行の（印より後ろを描き始めるx・印より後ろの幅）。印が無ければ`None`。
+fn align_right_at(spec: &AtlasSpec, text: &str, by: Resolver) -> Option<(u32, u32)> {
+    let fallback = spec.slot_of('?');
+    let (mut cells, mut before, mut rest, mut seen) = (0u32, 0u32, 0u32, false);
+    for c in text.chars().take(MAX_TEXT) {
+        if c == ALIGN_RIGHT {
+            seen = true;
+            continue;
+        }
+        cells += glyph_cells(c);
+        let w = by(spec, c, fallback).0;
+        if seen {
+            rest = rest.saturating_add(w);
+        } else {
+            before = before.saturating_add(w);
+        }
+    }
+    let right = cells.saturating_mul(by(spec, ' ', fallback).0);
+    seen.then(|| (right.saturating_sub(rest).max(before), rest))
+}
 
 /// 行の下地の余白（画素。`overlay::STYLE_DEFAULT.pad`と同じ）。
 pub const PAD: u32 = 2;
@@ -229,6 +255,9 @@ pub fn text_width_plain(spec: &AtlasSpec, text: &str) -> u32 {
 }
 
 fn width_by(spec: &AtlasSpec, text: &str, by: Resolver) -> u32 {
+    if let Some((x, rest)) = align_right_at(spec, text, by) {
+        return x.saturating_add(rest);
+    }
     let fallback = spec.slot_of('?');
     text.chars()
         .take(MAX_TEXT)
@@ -316,9 +345,18 @@ fn push_by(
     by: Resolver,
 ) -> (usize, u32) {
     let fallback = spec.slot_of('?');
+    let align = align_right_at(spec, text, by);
+    let mut aligned = false;
     let mut at = at;
     let mut used = 0u32;
     for c in text.chars().take(MAX_TEXT) {
+        if c == ALIGN_RIGHT {
+            if let (Some((x, _)), false) = (align, aligned) {
+                used = x;
+                aligned = true;
+            }
+            continue;
+        }
         let (w, face) = by(spec, c, fallback);
         if used.saturating_add(w) > max_w {
             break;
@@ -429,6 +467,46 @@ mod tests {
     fn pixel(canvas: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
         let i = (y as usize * w as usize + x as usize) * 3;
         [canvas[i], canvas[i + 1], canvas[i + 2]]
+    }
+
+    #[test]
+    fn align_right_ends_the_rest_at_the_cell_column_and_draws_no_mark() {
+        use crate::overlay::{GAME_ADVANCE, GameGlyphSrc, apply_game_font, texels};
+        let base = AtlasSpec::fit_game(7, 14, &ui_glyphs()).unwrap();
+        let t = texels(&base, &vec![0; base.texel_count()]).unwrap();
+        let px = vec![0xFFFF_FFFFu32; 13 * 12];
+        let gs: Vec<GameGlyphSrc> = ['A', 'B']
+            .iter()
+            .map(|&c| GameGlyphSrc {
+                c,
+                w: 13,
+                h: 12,
+                pixels: &px,
+                quad_w: 13,
+                quad_h: 12,
+            })
+            .collect();
+        let (game, _) = apply_game_font(&base, &t, &gs, GAME_ADVANCE).unwrap();
+        let m = ALIGN_RIGHT;
+        // 7枠（AB・空白・◀◀）の右端は7 × 9。◀◀は28画素なので35から描く（印が無ければ27から）。
+        let line = format!("AB {m}◀◀");
+        let mut out = [Vertex::default(); 64];
+        let (at, used) = push_text(&mut out, 0, &game, (100, 50), &line, 0xFFFF_FFFF, 400);
+        assert_eq!((at, used), (24, 63), "印は四角形を作らない");
+        assert_eq!(text_width(&game, &line), 63);
+        assert_eq!(out[2 * 6].x + 0.5, 135.0, "◀ の左端");
+        assert_eq!(
+            text_width(&game, "AB ◀◀"),
+            55,
+            "印が無いと右端が8画素足りない"
+        );
+        // GDIの文字（全角 = 半角2つ）では印の有無で位置が変わらない。
+        let plain = spec();
+        assert_eq!(text_width(&plain, &line), text_width(&plain, "AB ◀◀"));
+        let (_, used) = push_text(&mut out, 0, &plain, (0, 0), &line, 0xFFFF_FFFF, 400);
+        assert_eq!(used, 49);
+        // 2つ目の印は効かない: 右端は4枠 × 9、Bは最初の印が決めた13から続けて描く。
+        assert_eq!(text_width(&game, &format!("A{m}B{m}◀")), 36);
     }
 
     #[test]

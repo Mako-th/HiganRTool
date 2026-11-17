@@ -34,12 +34,13 @@ use higanr_core::overlay::{
 };
 use higanr_core::shot::D3DFMT_A8R8G8B8;
 
+use crate::menu_save_win::TOOL_VERSION;
 use crate::net_ui::{BOARD, draw_board};
 use crate::overlay::{
     Fail, GET_RENDER_STATE, GET_TEXTURE_STAGE_STATE, GET_VERTEX_SHADER, GET_VIEWPORT, GameAddrs,
     GameFontWhy, GfGate, OverlayCounters, OverlayHost, TEXT, TEXT_UNITS, TIMINGS, TimingSnapshot,
     Updater, gf_gate, gf_lock_gives_up, probe_game_font, stop_detail, stream0_to_restore,
-    swap_should_try,
+    swap_should_try, title_mark_up,
 };
 use crate::pacing_win::{qpc, qpf};
 use crate::th09_addr::{
@@ -609,15 +610,28 @@ fn overlay_inner() {
         &STYLE_DEFAULT,
         &mut verts,
     );
+    // タイトル画面のバージョンの行。フラグが偽の間は頂点を組まない。
+    let mut mark_verts = [Vertex::default(); ov::TITLE_MARK_VERTS];
+    let mark_n = ov::layout_title_mark(
+        title_mark_up(),
+        TOOL_VERSION,
+        &draw_atlas.spec,
+        screen_w,
+        screen_h,
+        &mut mark_verts,
+    );
     // ゲーム内のメニューの盤。見せるものが無ければアトミック変数を1つ読むだけ。
     let board_on = BOARD.show() != 0;
-    if n == 0 && !board_on {
+    if n == 0 && mark_n == 0 && !board_on {
         return;
     }
-    // 状態の保存と戻しは1回にまとめ、右下の行（あれば）と盤の行を続けて描く。
+    // 状態の保存と復元は1回にまとめ、右下の行（あれば）・バージョンの行（あれば）・盤の行を続けて描く。
     if let Err((f, hr, detail)) = draw_with_saved_state(d, tex, screen_w, screen_h, &mut |emit| {
         if n > 0 {
             emit(&verts[..n]);
+        }
+        if mark_n > 0 {
+            emit(&mark_verts[..mark_n]);
         }
         draw_board(&BOARD, &draw_atlas.spec, screen_w, screen_h, emit);
     }) {
@@ -2017,6 +2031,7 @@ fn apply_captured_game_font_with(cfg: &UpdaterCfg, known: &[u64]) {
 /// - `<本ログの名前の先頭>_glyphs_lines.png`: GDIだけの表とゲームの文字の表を並べた、日本語と英数字の混ざった行・ASCII全部。3倍に拡大。
 /// - `_glyphs_atlas.png`: コピーした後の文字の表そのもの。3倍。
 /// - `_glyphs.txt`（`game_font_text`）。
+///
 /// 本ログは回ごとに別名で、開くのは`create_new`（既存を上書きしない）。
 /// 出力先がゲームのフォルダの中なら書かない —— `RealRecord`。
 /// 失敗は本ログには書けない（更新スレッドは本ログを持たない）ので、`GF_NOTE`に残して本ログの集計が読む。
@@ -3415,6 +3430,44 @@ pub(crate) mod tests {
             (0, 0),
             "参照を返す Get* を呼んだ / その Release を呼んだ"
         );
+        teardown();
+    }
+
+    #[test]
+    fn title_mark_is_drawn_only_while_the_mark_is_up() {
+        use crate::overlay::{hide_title_mark, publish_title_mark};
+        let _g = setup();
+        TEXT.publish("");
+        let n0 = N_DRAW.load(Ordering::SeqCst);
+        hide_title_mark();
+        overlay_on_draw();
+        assert_eq!(
+            N_DRAW.load(Ordering::SeqCst),
+            n0,
+            "印が下りているのに描いた"
+        );
+        publish_title_mark(1, Some(1), false);
+        overlay_on_draw();
+        assert_eq!(N_DRAW.load(Ordering::SeqCst), n0 + 1);
+        let mut want = [Vertex::default(); ov::TITLE_MARK_VERTS];
+        let n = ov::layout_title_mark(true, TOOL_VERSION, &atlas().spec, 640, 480, &mut want);
+        assert!(n > 0);
+        assert_eq!(AT_DRAW[1].load(Ordering::SeqCst), (n / 3) as u32);
+        assert_eq!(
+            f32::from_bits(AT_DRAW_V0[0].load(Ordering::SeqCst)),
+            want[0].x,
+            "バージョンの行の最初の頂点"
+        );
+        publish_title_mark(2, Some(1), false);
+        overlay_on_draw();
+        assert_eq!(
+            N_DRAW.load(Ordering::SeqCst),
+            n0 + 1,
+            "場面2で画面番号が残っていても描いた"
+        );
+        let c = counters();
+        assert_eq!((c.fail, c.set_failed, c.panics), (0, 0, 0));
+        hide_title_mark();
         teardown();
     }
 

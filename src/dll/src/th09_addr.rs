@@ -236,6 +236,11 @@ pub const SUPERVISOR: u32 = 0x004B_3100;
 pub const GLOBAL_STATE_DEMO: u32 = 0x2;
 /// `GLOBAL_STATE`のbit3（リプレイ再生中。タイトルデモを含む）。
 pub const GLOBAL_STATE_REPLAY: u32 = 0x8;
+// リプレイ再生の速さを変える状態値はリプレイ再生中のビットが立ち、タイトルデモのビットが落ちている値。
+const _: () = assert!(
+    higanr_core::pacing::REPLAY_PLAYING_STATE as u32 & GLOBAL_STATE_REPLAY != 0
+        && higanr_core::pacing::REPLAY_PLAYING_STATE as u32 & GLOBAL_STATE_DEMO == 0
+);
 /// InputManagerのリピートのカウンタ`cnt[b]`（u16 × 16）の始まり（`+0x0A + 2*b`）。
 pub const IM_REPEAT_COUNTERS: u32 = 0x0A;
 /// feed `0x0042ACE0`が書く範囲の長さ（`+0x00`〜`+0x29`。`+0x2A`以降には書かない）。`+0x2A`は次のフィールド（`IM_CHARGE`）の始まりなので、その値を使う。
@@ -503,10 +508,11 @@ pub const SITES: &[SiteDef] = &[
     },
 ];
 
-/// 禁止の範囲（半開区間`[start, end)`）: vpatchのパッチ5箇所・飛ばす範囲2つ・tickのジャンプ表の手前。
-/// vpatchの書き込み範囲は、書き始める位置から書くバイト数ぶん（`0x0042DC45`と`0x0047D5DF`はcallのrel32の位置で、オペコード`E8`は範囲に入れていない）。
-/// 残る3か所の飛ばす範囲は未確定（vpatch.dllの解析が要る）。
+/// 禁止の範囲（半開区間`[start, end)`）: vpatchのパッチ3箇所・飛ばす範囲1つ・tickのジャンプ表の手前。
+/// vpatchの書き込み範囲は書き始める位置から書くバイト数ぶん（`0x0047D5DF`はcallのrel32の位置。オペコード`E8`は範囲に入れていない）。
+/// 残る飛ばす範囲は未確定（vpatch.dllの解析が要る）。
 /// vpatchの`0x0042DC45`（7バイト）とその飛ばす範囲`0x0042DC4C`〜`0x0042DC8C`の2行は、ペースBの頭の入口が使う（`PACING_SITES`）ので外した。
+/// vpatchの`0x004316C2`（6バイト）はfpsの表示の測り（`FPS_SITES`）が使うため外した。vpatchが先に書いていれば`FPS_SITES`の照合が断る。
 pub const FORBIDDEN: &[AddrRange] = &[
     // vpatch 0x0042DB59: 7バイト。
     AddrRange {
@@ -522,11 +528,6 @@ pub const FORBIDDEN: &[AddrRange] = &[
     AddrRange {
         start: 0x0042_F7F7,
         end: 0x0042_F7FC,
-    },
-    // vpatch 0x004316C2: 6バイト（末尾1バイトの中身は推定だが長さは原バイトから確定）。
-    AddrRange {
-        start: 0x0043_16C2,
-        end: 0x0043_16C8,
     },
     // vpatch 0x0047D5DF: 4バイト。
     AddrRange {
@@ -2326,7 +2327,7 @@ mod tests {
         let sec21 = note_section("### 2-1 ").expect("§2-1");
         let sec22 = note_section("### 2-2 ").expect("§2-2");
         let sec23 = note_section("### 2-3 ").expect("§2-3");
-        let vpatch_starts = [0x0042_DB59u32, 0x0042_F7F7, 0x0043_16C2, 0x0047_D5DF];
+        let vpatch_starts = [0x0042_DB59u32, 0x0042_F7F7, 0x0047_D5DF];
         let skips = [(0x0042_DB60u32, 0x0042_DB99u32)];
         let tick = (0x0042_C7B5u32, 0x0042_C7D3u32);
         assert_eq!(FORBIDDEN.len(), vpatch_starts.len() + skips.len() + 1);
@@ -3636,6 +3637,148 @@ mod fullscreen_vsync_tests {
                 }
             }
         }
+    }
+}
+
+// ---- fpsの表示の測り（`0x4316B0`）----
+// ゲームの測りはtimeGetTimeのmsで描画した時刻を読む。描画の回数を足す`0x4316C2`をinline detourで差し替え、フレームを始めた時刻（QPC）で測ったfpsを出す（`fps_win`）。
+// 差し替え先は表示を作る`0x431805`（st(0) = fps・`-0x4(%ebp)` = floatのfps・espを8下げ・`[0x4B42CC]` = 0）か、作らない`0x4318E5`。
+// 逆アセンブルは`th09_disasm.txt`のL63274〜L63445（`0x4316B0`〜`0x431928`）。`SITES`には追加しない: DllMainの中で独立に照合して書く。
+// vpatchが同じ地点を書いていれば先頭の行の照合が断る。
+
+/// 描画の回数を足す命令の行の名前（`FPS_SITES[0]`）。
+pub const FPS_HOOK_SITE: &str = "fps_draw_count";
+/// 描画を飛ばす設定（u8。`0x4316B6 movzbl 0x4b353a,%eax`）。盗む命令の時点で`eax`にゼロ拡張で入っている。
+#[cfg(test)]
+pub const FPS_SKIP_WORD: u32 = 0x004B_353A;
+/// 0以外ならゲームはtimeGetTimeの代わりにもう1つの時計（`*0x48e098`）で測る（`0x4316CC mov 0x4b3844,%eax`・`0x4316D3 cmp %ebx,%eax`・`0x4316DB jne 0x431749`）。
+/// 読む命令は2つだけで、書く命令は逆アセンブルに無い（exeの`.data`のうちファイルに実体が無い範囲なので0）。差し替えた測りはこれが0以外のときは使わない。
+pub const FPS_QPC_FLAG: u32 = 0x004B_3844;
+/// 表示を作る側の入口（`fstpl (%esp)`）。st(0)にfpsを積んで入る。
+pub const FPS_SHOW_AT: u32 = 0x0043_1805;
+/// 表示を作らない側の入口（`mov 0x4b36a8,%eax`）。
+pub const FPS_NO_SHOW_AT: u32 = 0x0043_18E5;
+
+/// fpsの測りの照合の表（5行）。先頭の1行だけ書く（`Detour`）。残り4行は照合だけ。
+/// 照合するのは関数の頭（`edi` = this・`eax` = 描画を飛ばす設定の前提）、盗む命令の次の2命令（`ecx`・`edx`・`ebx`が死んでいる前提）、2つの入口。
+pub const FPS_SITES: &[SiteDef] = &[
+    SiteDef {
+        name: FPS_HOOK_SITE,
+        addr: 0x0043_16C2,
+        expected: &[0x8B, 0x0D, 0xCC, 0x42, 0x4B, 0x00],
+        kind: Use::Detour { instr_lens: &[6] },
+        source: site_source!("th09_disasm.txt L63282（0x4316B0 の関数の中。vpatch の地点）"),
+    },
+    SiteDef {
+        name: "fps_fn_head",
+        addr: 0x0043_16B0,
+        expected: &[
+            0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x0F, 0xB6, 0x05, 0x3A, 0x35, 0x4B, 0x00, 0x53,
+            0x56, 0x57, 0x8B, 0xF9,
+        ],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[1, 2, 3, 7, 1, 1, 1, 2]),
+        },
+        source: site_source!("th09_disasm.txt L63274〜L63281"),
+    },
+    SiteDef {
+        name: "fps_after_count",
+        addr: 0x0043_16C8,
+        expected: &[
+            0x8D, 0x54, 0x01, 0x01, 0xA1, 0x44, 0x38, 0x4B, 0x00, 0x33, 0xDB,
+        ],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[4, 5, 2]),
+        },
+        source: site_source!("th09_disasm.txt L63283〜L63285"),
+    },
+    SiteDef {
+        name: "fps_show_target",
+        addr: FPS_SHOW_AT,
+        expected: &[0xDD, 0x1C, 0x24, 0x68, 0x08, 0x0B, 0x49, 0x00],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[3, 5]),
+        },
+        source: site_source!("th09_disasm.txt L63369〜L63370"),
+    },
+    SiteDef {
+        name: "fps_no_show_target",
+        addr: FPS_NO_SHOW_AT,
+        expected: &[0xA1, 0xA8, 0x36, 0x4B, 0x00, 0x85, 0xC0],
+        kind: Use::VerifyOnly {
+            instr_lens: Some(&[5, 2]),
+        },
+        source: site_source!("th09_disasm.txt L63423〜L63424"),
+    },
+];
+
+#[cfg(test)]
+mod fps_tests {
+    //! fpsの測りの表の検査（花映塚は使わない）。実物の命令との突き合わせは逆アセンブルの原本（隣リポ）で人が行った。
+    use super::*;
+
+    fn imm32(b: &[u8]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    #[test]
+    fn the_table_passes_and_overlaps_nothing() {
+        assert_eq!(crate::sites::check_table(FPS_SITES, FORBIDDEN), Ok(()));
+        assert_eq!(FPS_SITES[0].name, FPS_HOOK_SITE);
+        for (i, s) in FPS_SITES.iter().enumerate() {
+            let r = s.range();
+            for tables in [
+                SITES,
+                POLL_SITES,
+                PORTRAIT_SITES,
+                ALLOC_SITES,
+                PACING_SITES,
+                RESIM_SITES,
+                CALLOC_SITES,
+                PAD_SITES,
+                WINDOW_CREATE_SITES,
+                CALIB_GUARD_SITES,
+                VSYNC_ANSWER_SITES,
+                LOST_SLEEP_SITES,
+            ] {
+                for other in tables {
+                    assert!(
+                        !r.overlaps(&other.range()),
+                        "{}（行 {i}）と {} が重なる",
+                        s.name,
+                        other.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_rows_agree_with_the_constants() {
+        let hook = &FPS_SITES[0];
+        assert!(matches!(hook.kind, Use::Detour { instr_lens: [6] }));
+        // 盗む命令は`mov 0x4b42cc,%ecx`（`8B 0D abs32`）。
+        assert_eq!(&hook.expected[..2], &[0x8B, 0x0D]);
+        assert_eq!(imm32(&hook.expected[2..]), FPS_DRAWS);
+        // 関数の頭の`movzbl 0x4b353a,%eax`（`0F B6 05 abs32`）と`mov %ecx,%edi`。盗む命令はその直後の`push`3つと`mov %ecx,%edi`の後。
+        let head = &FPS_SITES[1];
+        assert_eq!(&head.expected[6..9], &[0x0F, 0xB6, 0x05]);
+        assert_eq!(imm32(&head.expected[9..]), FPS_SKIP_WORD);
+        assert_eq!(&head.expected[16..], &[0x8B, 0xF9], "mov %ecx,%edi");
+        assert_eq!(head.addr + head.expected.len() as u32, hook.addr);
+        // 次の2命令は`lea 0x1(%ecx,%eax,1),%edx`と`mov 0x4b3844,%eax`と`xor %ebx,%ebx`。
+        let after = &FPS_SITES[2];
+        assert_eq!(after.addr, hook.addr + 6, "戻り先は盗む命令の次");
+        assert_eq!(&after.expected[..4], &[0x8D, 0x54, 0x01, 0x01]);
+        assert_eq!(after.expected[4], 0xA1);
+        assert_eq!(imm32(&after.expected[5..]), FPS_QPC_FLAG);
+        assert_eq!(&after.expected[9..], &[0x33, 0xDB]);
+        // 入口: 表示を作る側は`fstpl (%esp)`、作らない側は`mov 0x4b36a8,%eax`。
+        assert_eq!(&FPS_SITES[3].expected[..3], &[0xDD, 0x1C, 0x24]);
+        assert_eq!(FPS_SITES[3].addr, FPS_SHOW_AT);
+        assert_eq!(FPS_SITES[4].expected[0], 0xA1);
+        assert_eq!(imm32(&FPS_SITES[4].expected[1..]), 0x004B_36A8);
+        assert_eq!(FPS_SITES[4].addr, FPS_NO_SHOW_AT);
     }
 }
 

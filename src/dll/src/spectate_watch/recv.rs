@@ -17,6 +17,7 @@ use higanr_core::candidate::Candidates;
 use higanr_core::link::Outlet;
 use higanr_core::nat::NatMark;
 use higanr_core::spectate::{JOIN_RESEND_MS, SpectateHost, Watcher, leave_tree, tend_relay};
+use higanr_core::spectate_pace::join_updates;
 use higanr_core::wire::{self, ByeReason, PeekedType};
 
 use super::WatchSlot;
@@ -87,7 +88,7 @@ pub struct WatchRecv {
     /// `parent_from`を決めたときのepoch。
     seen_epoch: u16,
     mismatch_stays: u64,
-    ff_max: u32,
+    ff_fps: u32,
     seen_jumps: u64,
     /// 次に移す記録が、流れが飛んだ後の最初の記録かどうか。
     jump: bool,
@@ -99,7 +100,7 @@ pub struct WatchRecv {
 }
 
 impl WatchRecv {
-    pub fn new(slot: Arc<WatchSlot>, feed: Arc<WatchFeed>, ff_max: u32) -> Self {
+    pub fn new(slot: Arc<WatchSlot>, feed: Arc<WatchFeed>, ff_fps: u32) -> Self {
         Self {
             slot,
             feed,
@@ -118,7 +119,7 @@ impl WatchRecv {
             parent_from: 0,
             seen_epoch: 0,
             mismatch_stays: 0,
-            ff_max,
+            ff_fps,
             seen_jumps: 0,
             jump: false,
             done: false,
@@ -138,7 +139,7 @@ impl WatchRecv {
         if let Some(o) = self.slot.take_newer(&mut self.seen_gen) {
             let mut w = o.watcher;
             // ホストはJOINの早送りの速さでこの観戦者への追いつきの送信の上限を決める。
-            w.set_ff_max(self.ff_max);
+            w.set_ff_max(u32::from(join_updates(self.ff_fps)));
             if o.relay.is_some() {
                 w.set_nat(self.nat);
                 if let Some(own) = self.slot.upnp_own() {

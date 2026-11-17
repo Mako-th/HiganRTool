@@ -45,8 +45,8 @@ use crate::names::{LocalTime, is_same_or_inside, side_file_name};
 use crate::net_config::NetSettings;
 use crate::netplay::NetPlay;
 use crate::replay_save::{
-    CHAIN_LIMIT, CallOut, Driver, EstimateReal, Handoff, LOG_SUFFIX, NetView, Outcome, RNG_BYTES,
-    STAGES, SaveIo, VaultOs, WORKER_PERIOD_MS, Watching, Worker, read_sides,
+    CHAIN_LIMIT, CallOut, Driver, EstimateReal, Handoff, LOG_SUFFIX, NameEnv, NetView, Outcome,
+    RNG_BYTES, STAGES, SaveIo, VaultOs, WORKER_PERIOD_MS, Watching, Worker, read_sides,
 };
 use crate::replay_watch::HeaderIdent;
 use crate::th09_addr::{
@@ -660,6 +660,18 @@ fn file_id(h: HANDLE) -> Result<(u32, u32, u32), String> {
     ))
 }
 
+/// `path`をこのプロセスから開いたファイルの識別子。属性を読む権利だけで開く（データを読み書きしない）。
+/// VirtualStoreの差し替えが有効ならOSが差し替え先を開く。
+fn file_id_of_path(path: &Path) -> Result<(u32, u32, u32), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .map_err(|e| format!("開けません（{e}）"))?;
+    file_id(f.as_raw_handle() as HANDLE)
+}
+
 /// ANSIのパス`ansi`（NULなし）を保存関数と同じ`CreateFileA`の経路で開き、`file`と同じファイルかどうかを返す。
 /// 同じとは、ボリュームの番号とファイルの番号が同じこと。開くのは属性を読むためだけ。
 pub fn same_file_ansi(ansi: &[u8], file: &File) -> Result<bool, String> {
@@ -716,6 +728,9 @@ impl VaultOs for RealVaultOs {
     fn same_file_ansi(&mut self, ansi: &[u8], file: &File) -> Result<bool, String> {
         same_file_ansi(ansi, file)
     }
+    fn file_id(&mut self, path: &Path) -> Result<(u32, u32, u32), String> {
+        file_id_of_path(path)
+    }
     fn now(&mut self) -> Timestamp {
         to_timestamp(win::local_time())
     }
@@ -727,6 +742,31 @@ impl VaultOs for RealVaultOs {
 }
 
 // ---- 有効にする（読み取りのスレッド） ----
+
+/// リプレイ名の上限に使う環境を読む。Wineの判定は`ntdll`から関数を取得するので保存のスレッドで呼ぶ。
+fn name_env_from_os() -> NameEnv {
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    // Windowsが書き込みを差し替えるのはProgram Files（32ビット側と64ビット側）とWindowsのフォルダの下。
+    let protected_roots = [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "SystemRoot",
+    ]
+    .iter()
+    .map(|k| var(k))
+    .filter(|v| !v.is_empty())
+    .collect();
+    NameEnv {
+        wine: win::wine_version().is_some(),
+        protected_roots,
+        local_app_data: var("LOCALAPPDATA"),
+    }
+}
 
 /// 保管庫のスレッドのログの書き込み関数。簡潔なときはファイルを作らず捨てる。詳細のときもユーザー名とゲームのフォルダ・IPのアドレスは伏せて書く。
 fn open_worker_log(
@@ -821,6 +861,7 @@ pub fn arm(
         .name("higanrtool-replay".to_string())
         .spawn(move || {
             let mut os = RealVaultOs;
+            worker.name_env = name_env_from_os();
             let r = catch_unwind(AssertUnwindSafe(|| {
                 loop {
                     worker.step(&HANDOFF, &mut os);

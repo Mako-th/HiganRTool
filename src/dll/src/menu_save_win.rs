@@ -38,7 +38,7 @@ use crate::th09_addr::{
 use crate::win::{debug_out, read_own_into, read_own_memory};
 
 /// 印に書くHiganRToolのバージョン名（ワークスペースの`version`）。
-const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// ゲームのスレッドが書き、印を足すスレッドが拾う通知。
 static SIGNAL: SaveSignal = SaveSignal::new();

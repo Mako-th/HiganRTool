@@ -14,6 +14,7 @@
 //! この経路を通るのは観戦者のセッションがある実行（`Slot::Watch`）だけ。対戦の経路（`Slot::Play`）とdelay方式の実行は通らないので、対戦相手への遅延の増分は0。
 #![forbid(unsafe_code)]
 
+use higanr_core::spectate_pace::REPLAY_MAX_EXTRA;
 use higanr_core::wire::Record;
 
 use super::WatchPlay;
@@ -26,6 +27,9 @@ pub use higanr_core::spectate_pace::{FF_ENTER_FRAMES, FF_EXIT_FRAMES, FF_MAX_EXT
 /// 60 Hzの1フレーム16.7 msの半分を越えて描画とメッセージ処理を遅らせないため。
 /// 遅いPCでは上の回数に届く前にここで止まるので、PCが回せる速さまで自然に落ちる。
 pub const FF_BUDGET_US: u64 = 8_000;
+/// リプレイの高速再生で1回の表示の中の余分な更新に使う時間の上限（µs。12 ms）。
+/// 60 Hzの1フレーム16.7 msから描画とPresentの分に4 ms強を残す。
+pub const REPLAY_BUDGET_US: u64 = 12_000;
 
 /// 早送りの数（本ログ用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,9 +105,9 @@ pub(super) fn decide(
 }
 
 impl WatchPlay {
-    /// 早送りの速さ（1表示あたりの更新の数。iniの`ff_max`を`Pace`が範囲に収めたもの）。
-    pub fn ff_updates(&self) -> u32 {
-        self.pace.updates()
+    /// 早送りの最大の速さ（毎秒の更新の数。iniの`ff_fps`を`Pace`が範囲に収めたもの）。
+    pub fn ff_fps(&self) -> u32 {
+        self.pace.fps()
     }
 
     /// 表示の始まり。前の表示の間に使えるようになった記録の数（受信スレッドがリングへ移した数）を`Pace`へ渡す。
@@ -256,6 +260,53 @@ pub fn run_display<H: FfHost>(h: &mut H) -> i32 {
     ret
 }
 
+/// リプレイの高速再生が走査を呼ぶ側（本物は`script_win::RealReplayFf`。検査では偽のゲーム）。観戦者のセッションは使わない。
+pub trait ReplayFfHost {
+    /// 走査（更新1 tick）を1回呼んでdo_frameへ返す値を返す。`extra`は余分な更新かどうか。
+    fn scan(&mut self, extra: bool) -> i32;
+    /// 最初の走査の前: 文字の数をバックアップする。できなければ偽（その表示では余分に回さない）。
+    fn begin(&mut self) -> bool;
+    /// 余分な更新の前に呼ぶ。文字の数をバックアップの値へ戻す。できたら真。
+    fn drop_outputs(&mut self) -> bool;
+    /// 次の場面の要求が立っているかどうか。
+    fn boundary(&mut self) -> bool;
+    /// 余分な更新を回してよい状態かどうか。リプレイの再生中で、対戦・観戦のセッションが無く、読み込み中でないこと。余分な更新ごとに聞く。
+    fn playing(&mut self) -> bool;
+    /// いまの時刻（µs）。
+    fn now_us(&mut self) -> u64;
+    /// 余分な更新を回した数・時間の上限で打ち切ったかどうか・その表示の余分な更新に使った時間（µs）をカウントに積む。
+    fn note(&mut self, ran: u32, cutoff: bool, used_us: u32);
+}
+
+/// リプレイの高速再生の1回の表示。普段は走査1回で戻り値をそのまま返し、`planned`回までゲームの更新だけを余分に回す。
+/// 回す前に毎回、打ち切りの値・場面の要求・再生中かどうかを見る。戻り値は最後の走査の値。
+pub fn run_replay_display<H: ReplayFfHost>(h: &mut H, planned: u32) -> i32 {
+    let allow = planned.min(REPLAY_MAX_EXTRA);
+    if allow == 0 || !h.playing() || !h.begin() {
+        return h.scan(false);
+    }
+    let mut ret = h.scan(false);
+    let t0 = h.now_us();
+    let (mut ran, mut cutoff) = (0, false);
+    while ran < allow {
+        if abort_of(ret).is_some() || h.boundary() || !h.playing() {
+            break;
+        }
+        if h.now_us().saturating_sub(t0) >= REPLAY_BUDGET_US {
+            cutoff = true;
+            break;
+        }
+        if !h.drop_outputs() {
+            break;
+        }
+        ret = h.scan(true);
+        ran += 1;
+    }
+    let used = h.now_us().saturating_sub(t0);
+    h.note(ran, cutoff, u32::try_from(used).unwrap_or(u32::MAX));
+    ret
+}
+
 #[cfg(test)]
 mod tests {
     //! 早送りの判断（数の表）と`run_display`の外側（セッションが無い・打ち切りの値・マッチの外・溜まりが無い）の検査。
@@ -264,20 +315,20 @@ mod tests {
 
     use super::*;
     use crate::spectate_watch::{WatchConfig, WatchSlot};
-    use higanr_core::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX};
+    use higanr_core::spectate_pace::{FF_FPS_DEFAULT, FF_FPS_MAX, FF_GRID_FPS};
 
     fn wp() -> WatchPlay {
-        wp_with(FF_UPDATES_DEFAULT)
+        wp_with(FF_FPS_DEFAULT)
     }
 
-    fn wp_with(ff_max: u32) -> WatchPlay {
+    fn wp_with(ff_fps: u32) -> WatchPlay {
         WatchPlay::new(
             Arc::new(WatchSlot::new()),
             WatchConfig {
                 wait_budget_us: 16_000,
                 margin_frames: 3,
                 require_net_selection: false,
-                ff_max,
+                ff_fps,
             },
         )
     }
@@ -292,14 +343,14 @@ mod tests {
         assert_eq!(decide(true, 50, 3, 3, 0), Verdict::Max);
         assert_eq!(decide(true, 50, 0, 0, 0), Verdict::Max);
         // 上限の数（許しが上限を越えても）。
-        assert_eq!(decide(true, 50, FF_MAX_EXTRA - 1, 40, 0), Verdict::Go);
-        assert_eq!(decide(true, 50, FF_MAX_EXTRA, 40, 0), Verdict::Max);
+        assert_eq!(decide(true, 50, FF_MAX_EXTRA - 1, 200, 0), Verdict::Go);
+        assert_eq!(decide(true, 50, FF_MAX_EXTRA, 200, 0), Verdict::Max);
         // 戻る閾値が先。
         for b in 0..=FF_EXIT_FRAMES {
             assert_eq!(decide(true, b, 0, 5, 0), Verdict::Leave, "溜まり {b}");
         }
         assert_eq!(
-            decide(true, FF_EXIT_FRAMES, FF_MAX_EXTRA, 40, 0),
+            decide(true, FF_EXIT_FRAMES, FF_MAX_EXTRA, 200, 0),
             Verdict::Leave
         );
         assert_eq!(decide(true, FF_EXIT_FRAMES + 1, 0, 5, 0), Verdict::Go);
@@ -343,12 +394,12 @@ mod tests {
         }
 
         fn in_match(backlog: u32) -> Stub {
-            Stub::in_match_with(backlog, FF_UPDATES_DEFAULT)
+            Stub::in_match_with(backlog, FF_FPS_DEFAULT)
         }
 
-        fn in_match_with(backlog: u32, ff_max: u32) -> Stub {
+        fn in_match_with(backlog: u32, ff_fps: u32) -> Stub {
             let mut s = Stub::new();
-            s.wp = wp_with(ff_max);
+            s.wp = wp_with(ff_fps);
             s.wp.set_phase_for_test(Phase::Lockstep);
             s.wp.started = true;
             s.wp.look[0] = Some((
@@ -436,24 +487,24 @@ mod tests {
 
     #[test]
     fn a_large_backlog_runs_extra_scans_up_to_the_caps_and_stops_at_every_guard() {
-        // 溜まりが多い: 1表示 = 最初の走査 ＋ 余分（`ff_max` − 1）回。余分の前に必ずSE・文字の数を整える。
-        for ff_max in [FF_UPDATES_DEFAULT, FF_UPDATES_MAX] {
-            let extra = ff_max - 1;
-            let mut s = Stub::in_match_with(50, ff_max);
+        // 溜まりが多い: 1表示 = 最初の走査 ＋ 余分（`ff_fps` ÷ 60 − 1）回。余分の前に必ずSE・文字の数を整える。
+        for ff_fps in [FF_FPS_DEFAULT, 960, FF_FPS_MAX] {
+            let extra = ff_fps / FF_GRID_FPS - 1;
+            let mut s = Stub::in_match_with(200, ff_fps);
             assert_eq!(run_display(&mut s), 2);
             let mut want = vec![false];
             want.extend(std::iter::repeat_n(true, extra as usize));
-            assert_eq!(s.scans, want, "ff_max {ff_max}");
+            assert_eq!(s.scans, want, "ff_fps {ff_fps}");
             assert_eq!(s.drops, extra);
             let ff = s.wp.stats().ff;
             assert_eq!(
                 (ff.begun, ff.displays, ff.extra_ticks, ff.episodes),
                 (1, 1, u64::from(extra), 1)
             );
-            assert_eq!((ff.first_enter_backlog, ff.active), (Some(50), true));
+            assert_eq!((ff.first_enter_backlog, ff.active), (Some(200), true));
         }
-        // ff_max 1は余分に回さない（溜まりが多くても早送りに入らない）。
-        let mut s = Stub::in_match_with(50, 1);
+        // ff_fpsが格子と同じ60なら余分に回さない（溜まりが多くても早送りに入らない）。
+        let mut s = Stub::in_match_with(50, FF_GRID_FPS);
         assert_eq!(run_display(&mut s), 2);
         assert_eq!(s.scans, vec![false]);
         assert_eq!(s.wp.stats().ff.episodes, 0);
@@ -544,6 +595,177 @@ mod tests {
         assert_eq!(
             (ff.finished, ff.first_ms, ff.max_ms, ff.total_ms),
             (2, Some(250), 400, 650)
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    //! リプレイの高速再生の1表示（`run_replay_display`）の検査。偽のゲームで回す数・止める条件・時間の上限を見る。
+    use super::*;
+
+    struct Stub {
+        scans: Vec<bool>,
+        ret: i32,
+        begin_ok: bool,
+        drop_ok: bool,
+        boundary: bool,
+        /// 何回目の`playing`の問いから偽にするか（`None`なら常に真）。
+        stop_playing_at: Option<u32>,
+        playing_calls: u32,
+        now: u64,
+        cost_us: u64,
+        begins: u32,
+        drops: u32,
+        noted: Vec<(u32, bool)>,
+        used: Vec<u32>,
+    }
+
+    impl Stub {
+        fn new() -> Stub {
+            Stub {
+                scans: Vec::new(),
+                ret: 2,
+                begin_ok: true,
+                drop_ok: true,
+                boundary: false,
+                stop_playing_at: None,
+                playing_calls: 0,
+                now: 0,
+                cost_us: 0,
+                begins: 0,
+                drops: 0,
+                noted: Vec::new(),
+                used: Vec::new(),
+            }
+        }
+    }
+
+    impl ReplayFfHost for Stub {
+        fn scan(&mut self, extra: bool) -> i32 {
+            self.scans.push(extra);
+            self.now += self.cost_us;
+            self.ret
+        }
+        fn begin(&mut self) -> bool {
+            self.begins += 1;
+            self.begin_ok
+        }
+        fn drop_outputs(&mut self) -> bool {
+            self.drops += 1;
+            self.drop_ok
+        }
+        fn boundary(&mut self) -> bool {
+            self.boundary
+        }
+        fn playing(&mut self) -> bool {
+            self.playing_calls += 1;
+            self.stop_playing_at.is_none_or(|n| self.playing_calls < n)
+        }
+        fn now_us(&mut self) -> u64 {
+            self.now
+        }
+        fn note(&mut self, ran: u32, cutoff: bool, used_us: u32) {
+            self.noted.push((ran, cutoff));
+            self.used.push(used_us);
+        }
+    }
+
+    #[test]
+    fn a_display_runs_the_planned_extra_updates_after_the_first_scan() {
+        let mut s = Stub::new();
+        assert_eq!(run_replay_display(&mut s, 3), 2);
+        assert_eq!(s.scans, vec![false, true, true, true]);
+        assert_eq!((s.begins, s.drops), (1, 3));
+        assert_eq!(s.noted, vec![(3, false)]);
+    }
+
+    #[test]
+    fn nothing_extra_runs_when_not_planned_or_not_in_a_replay() {
+        // 予定が0なら状態も読まずに1回だけ。
+        let mut s = Stub::new();
+        run_replay_display(&mut s, 0);
+        assert_eq!(
+            (s.scans.clone(), s.begins, s.playing_calls),
+            (vec![false], 0, 0)
+        );
+        assert!(s.noted.is_empty());
+        // 再生中でない（対戦のセッションが立っている・読み込み中・再生を出た）なら走査は1回だけ。文字の数にも触らない。
+        let mut s = Stub::new();
+        s.stop_playing_at = Some(1);
+        run_replay_display(&mut s, 3);
+        assert_eq!((s.scans.clone(), s.begins, s.drops), (vec![false], 0, 0));
+        // 文字の数をバックアップできない。
+        let mut s = Stub::new();
+        s.begin_ok = false;
+        run_replay_display(&mut s, 3);
+        assert_eq!((s.scans.clone(), s.drops), (vec![false], 0));
+    }
+
+    #[test]
+    fn extra_updates_stop_at_every_guard() {
+        // 打ち切りの値（0・1・負）と場面の要求は観戦者の早送りと同じ。
+        for ret in [0, 1, -1] {
+            let mut s = Stub::new();
+            s.ret = ret;
+            assert_eq!(run_replay_display(&mut s, 3), ret);
+            assert_eq!(s.scans, vec![false], "ret {ret}");
+            assert_eq!(s.noted, vec![(0, false)]);
+        }
+        let mut s = Stub::new();
+        s.boundary = true;
+        run_replay_display(&mut s, 3);
+        assert_eq!(s.scans, vec![false]);
+        // 途中で再生中でなくなったらそこで止める（最初の問いと1回目の余分の前の問いは真、2回目の余分の前から偽）。
+        let mut s = Stub::new();
+        s.stop_playing_at = Some(3);
+        run_replay_display(&mut s, 5);
+        assert_eq!(s.scans, vec![false, true]);
+        assert_eq!(s.noted, vec![(1, false)]);
+        // 文字の数を戻せなければ余分を回さない。
+        let mut s = Stub::new();
+        s.drop_ok = false;
+        run_replay_display(&mut s, 3);
+        assert_eq!(s.scans, vec![false]);
+    }
+
+    #[test]
+    fn the_count_and_the_time_of_one_display_are_capped() {
+        // 予定が多くてもリプレイ用の上限（99）まで。
+        let mut s = Stub::new();
+        run_replay_display(&mut s, 1_000);
+        assert_eq!(s.scans.len() as u32, 1 + REPLAY_MAX_EXTRA);
+        assert_eq!(REPLAY_MAX_EXTRA, FF_MAX_EXTRA);
+        assert_eq!(s.noted, vec![(REPLAY_MAX_EXTRA, false)]);
+        // 走査1回が5 msなら最初の走査の後から数えて12 msに届く前の3回で止まる（観戦者の早送りの8 msなら2回）。
+        let mut s = Stub::new();
+        s.cost_us = 5_000;
+        run_replay_display(&mut s, 10);
+        assert_eq!(s.scans, vec![false, true, true, true]);
+        assert_eq!(s.noted, vec![(3, true)]);
+        assert_eq!(s.used, vec![15_000]);
+        assert!(s.used[0] >= REPLAY_BUDGET_US as u32);
+        assert_eq!((FF_BUDGET_US, REPLAY_BUDGET_US), (8_000, 12_000));
+    }
+
+    #[test]
+    fn the_time_used_by_the_extra_updates_is_reported() {
+        // 走査1回300 µsで3回なら900 µs（最初の走査の分は含まない）。
+        let mut s = Stub::new();
+        s.cost_us = 300;
+        run_replay_display(&mut s, 3);
+        assert_eq!(
+            (s.noted.clone(), s.used.clone()),
+            (vec![(3, false)], vec![900])
+        );
+        // 余分を回さない表示も時間は0で積む（最初の走査だけ）。
+        let mut s = Stub::new();
+        s.cost_us = 300;
+        s.ret = 0;
+        run_replay_display(&mut s, 3);
+        assert_eq!(
+            (s.noted.clone(), s.used.clone()),
+            (vec![(0, false)], vec![0])
         );
     }
 }

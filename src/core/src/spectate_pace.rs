@@ -18,15 +18,37 @@ pub const FF_ENTER_FRAMES: u32 = 6;
 /// 早送りから戻る溜まり: この数以下になったら普段の速さに戻す。
 /// 余裕と同じ3にするのは、戻った後も記録を待たずに続けられるようにするため。
 pub const FF_EXIT_FRAMES: u32 = 3;
-/// 1回の表示の中で余分に回す更新の数の天井（配列の長さ。実行時の上限はiniの`ff_max`から決まる`Pace::with_updates`）。
+/// 1回の表示の中で余分に回す更新の数の天井。上限`FF_FPS_MAX`を格子`FF_GRID_FPS`で割った100更新から最初の1回を引いた数。
+/// 実行時の上限はiniの`ff_fps`から決まる`Pace::with_fps`。
 /// 遅いPCではdllの時間の上限（`FF_BUDGET_US`）が先に効き、回せる速さまで自然に落ちる。
-/// 更新1回はp50 0.04 / p99 0.07 ms（n = 660。弾の多い場面は重い見込み）。
-/// そのため16回で1 ms前後の見込み（外挿）。
-pub const FF_MAX_EXTRA: u32 = 16;
-/// 早送りの速さ（1表示あたりの更新の数。普段の1回 ＋ 余分）の範囲と既定。8は毎秒480更新（8倍）。
+pub const FF_MAX_EXTRA: u32 = 99;
+/// リプレイの高速再生で1表示に足す更新の数の天井。`replay_skip_fps`の上限6000を格子60で割った100更新から最初の1回を引いた数。
+pub const REPLAY_MAX_EXTRA: u32 = 99;
+/// 表示の格子（毎秒の表示の数）。fpsを1表示あたりの更新の数へ直す単位。
+pub const FF_GRID_FPS: u32 = 60;
+/// 観戦者の早送りの速さ（毎秒の更新の数。iniの`[spectate] ff_fps`）の範囲と既定。
+/// 下限の120は2倍。上限の6000は`replay_skip_fps`と同じ。
+pub const FF_FPS_MIN: u32 = 120;
+pub const FF_FPS_MAX: u32 = 6_000;
+pub const FF_FPS_DEFAULT: u32 = 480;
+/// JOINに載せる早送りの速さ（1表示あたりの更新の数）の範囲と既定。
+/// ホストの追いつきの送信の上限（`spectate_rate::watcher_cap_bps`）はこの値で決まる。上限の16は`ff_fps` 960に当たる。
 pub const FF_UPDATES_MIN: u32 = 1;
-pub const FF_UPDATES_MAX: u32 = FF_MAX_EXTRA;
+pub const FF_UPDATES_MAX: u32 = 16;
 pub const FF_UPDATES_DEFAULT: u32 = 8;
+
+/// `ff_fps`をJOINに載せる1表示あたりの更新の数（切り上げ。`FF_UPDATES_MIN`〜`FF_UPDATES_MAX`に収める）にする。
+pub const fn join_updates(fps: u32) -> u8 {
+    let n = fps.div_ceil(FF_GRID_FPS);
+    let n = if n < FF_UPDATES_MIN {
+        FF_UPDATES_MIN
+    } else if n > FF_UPDATES_MAX {
+        FF_UPDATES_MAX
+    } else {
+        n
+    };
+    n as u8
+}
 /// 届いた速さと何も届かない続きを見る表示の数（60 Hzで約1.07秒）。往復1秒までの回線で往復ごとのまとまりを1つ以上含む。
 pub const PACE_WINDOW: usize = 64;
 /// 取っておく数を越えた溜まりを何表示かけて減らすか（約0.13秒）。
@@ -65,7 +87,9 @@ pub struct Pace {
     active: bool,
     /// 止まった後に溜まりが戻るのを待った表示の数（待っていなければ`None`）。
     refill: Option<u32>,
-    /// 1表示に余分に回す更新の数の上限（1表示の更新の数 − 1。0は早送りしない）。
+    /// 早送りの速さ（毎秒の更新の数。`FF_GRID_FPS`以下は早送りしない）。
+    fps: u32,
+    /// 1表示に余分に回す更新の数の上限（`fps`の速さを端数の持ち越しで出すのに要る数。0は早送りしない）。
     max_extra: u32,
 }
 
@@ -77,17 +101,18 @@ impl Default for Pace {
 
 impl Pace {
     pub const fn new() -> Self {
-        Self::with_updates(FF_UPDATES_DEFAULT)
+        Self::with_fps(FF_FPS_DEFAULT)
     }
 
-    /// 1表示あたりの更新の数の上限`updates`（`FF_UPDATES_MIN`〜`FF_UPDATES_MAX`に収める）で作る。
-    pub const fn with_updates(updates: u32) -> Self {
-        let updates = if updates < FF_UPDATES_MIN {
-            FF_UPDATES_MIN
-        } else if updates > FF_UPDATES_MAX {
-            FF_UPDATES_MAX
+    /// 早送りの最大の速さ`fps`（毎秒の更新の数。`FF_GRID_FPS`〜`FF_FPS_MAX`に収める）で作る。
+    /// 1表示で進めきれない端数は次の表示へ持ち越すので格子で割り切れない`fps`でも平均がその速さになる。
+    pub const fn with_fps(fps: u32) -> Self {
+        let fps = if fps < FF_GRID_FPS {
+            FF_GRID_FPS
+        } else if fps > FF_FPS_MAX {
+            FF_FPS_MAX
         } else {
-            updates
+            fps
         };
         Self {
             arrived: [0; PACE_WINDOW],
@@ -97,13 +122,19 @@ impl Pace {
             credit: 0,
             active: false,
             refill: None,
-            max_extra: updates - 1,
+            fps,
+            max_extra: Self::top_milli_of(fps).div_ceil(MILLI) - 1,
         }
     }
 
-    /// 1表示あたりの更新の数の上限（`with_updates`が範囲に収めた値）。
-    pub const fn updates(&self) -> u32 {
-        self.max_extra + 1
+    /// 最大の速さ（`with_fps`が範囲に収めた毎秒の更新の数）。
+    pub const fn fps(&self) -> u32 {
+        self.fps
+    }
+
+    /// 最大の速さ（1表示あたりの更新の数 × `MILLI`）。
+    const fn top_milli_of(fps: u32) -> u32 {
+        fps * MILLI / FF_GRID_FPS
     }
 
     /// 表示の始まりに、前の表示の間に使えるようになった記録の数（組み立ての連続の終わりが進んだ数）を渡す。
@@ -190,7 +221,7 @@ impl Pace {
         } else {
             PACE_GAIN
         };
-        let top = i64::from(MILLI * (1 + self.max_extra));
+        let top = i64::from(Self::top_milli_of(self.fps));
         // 取っておく数を1ウィンドウぶん越えた溜まりはまとまりの揺れ（最大1ウィンドウ）ではなく遅れそのもの。
         // 届くのが普段の速さ（まとまりで届いていない）なら越えた分はどれも遅れ。
         // どちらも最大の速さで減らす（追いつきの終わり・ホストが止まった後）。
@@ -356,27 +387,57 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_line_runs_at_the_cap_set_by_ff_max_and_no_faster() {
-        for updates in [2, FF_UPDATES_DEFAULT, FF_UPDATES_MAX] {
-            let mut p = Pace::with_updates(updates);
+    fn a_fast_line_runs_at_the_cap_set_by_ff_fps_and_no_faster() {
+        for fps in [120, FF_FPS_DEFAULT, 960, FF_FPS_MAX] {
+            let mut p = Pace::with_fps(fps);
             for _ in 0..PACE_WINDOW {
                 p.on_display(64);
             }
-            let cap = updates - 1;
-            assert_eq!(p.extras(1_000, 3), cap, "updates={updates}");
-            assert_eq!(p.extras(1_000, 3), cap, "上限の端数を貯めない: {updates}");
+            let cap = fps / FF_GRID_FPS - 1;
+            assert_eq!(p.extras(1_000, 3), cap, "fps={fps}");
+            assert_eq!(p.extras(1_000, 3), cap, "上限の端数を貯めない: {fps}");
         }
         let mut p = fed(&[64; PACE_WINDOW]);
-        assert_eq!(p.extras(1_000, 3), FF_UPDATES_DEFAULT - 1);
-        assert_eq!(Pace::with_updates(0).max_extra, 0, "範囲の下は余分なし");
-        assert_eq!(Pace::with_updates(99).max_extra, FF_MAX_EXTRA - 1);
+        assert_eq!(p.extras(1_000, 3), FF_FPS_DEFAULT / FF_GRID_FPS - 1);
+        assert_eq!(Pace::with_fps(0).max_extra, 0, "範囲の下は余分なし");
+        let top = Pace::with_fps(u32::MAX);
+        assert_eq!((top.fps(), top.max_extra), (FF_FPS_MAX, FF_MAX_EXTRA));
     }
 
     #[test]
-    fn ff_max_one_never_enters_fast_forward() {
-        let mut p = Pace::with_updates(1);
+    fn a_fraction_of_the_cap_is_carried_to_the_next_display() {
+        // 500 fpsは1表示に8.33更新。1秒（60表示）の余分は500 − 60 = 440で（速さの端数の切り捨てで1少ないことがある）。1表示の余分は7か8。
+        let mut p = Pace::with_fps(500);
+        for _ in 0..PACE_WINDOW {
+            p.on_display(64);
+        }
+        let ns: Vec<u32> = (0..60).map(|_| p.extras(10_000, 3)).collect();
+        let total = ns.iter().sum::<u32>();
+        assert!((439..=440).contains(&total), "{ns:?}");
+        assert_eq!((ns.iter().min(), ns.iter().max()), (Some(&7), Some(&8)));
+        // 溜まりが少なければ戻る閾値までしか回さない。
+        let mut p = Pace::with_fps(500);
+        for _ in 0..PACE_WINDOW {
+            p.on_display(64);
+        }
+        assert_eq!(
+            p.extras(FF_ENTER_FRAMES + 1, 3),
+            FF_ENTER_FRAMES + 1 - FF_EXIT_FRAMES
+        );
+    }
+
+    #[test]
+    fn ff_fps_at_the_grid_never_enters_fast_forward() {
+        let mut p = Pace::with_fps(FF_GRID_FPS);
         assert_eq!(p.extras(10_000, 3), 0);
         assert!(!p.is_active());
+    }
+
+    #[test]
+    fn the_join_carries_the_updates_per_display_rounded_up_and_capped() {
+        let got = [1, 60, 61, 120, 121, 480, 960, 961, FF_FPS_MAX].map(join_updates);
+        assert_eq!(got, [1, 1, 2, 2, 3, 8, 16, 16, 16]);
+        assert_eq!(u32::from(join_updates(FF_FPS_DEFAULT)), FF_UPDATES_DEFAULT);
     }
 
     #[test]

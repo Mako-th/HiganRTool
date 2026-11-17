@@ -12,9 +12,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import {
-  CLOSE_NAME,
   Close,
-  MESSAGE_MAX_BYTES,
   PING_TEXT,
   PONG_TEXT,
   type ServerMessage,
@@ -27,7 +25,6 @@ import {
   WATCH_UNPOSTED_MS,
   WATCH_VIEW_MAX_PER_KEY,
   WATCH_VIEW_MAX_TOTAL,
-  WATCH_VIEW_SWEEP_MS,
   WATCH_VIEW_TTL_MS,
   type WatchItem,
   connectLimitKey,
@@ -36,6 +33,7 @@ import {
   spectateRoomName,
 } from "./rules";
 import { judgeTicket, seatKey } from "./ticket";
+import { OPEN, closeWith, parseObject, send, sweepDeadline } from "./ws_util";
 
 interface PostAtt {
   kind: "post";
@@ -62,8 +60,6 @@ interface ViewAtt {
 }
 
 type Att = PostAtt | ViewAtt;
-
-const OPEN = 1;
 
 export class WatchList extends DurableObject<Env> {
   /** 最後に観戦者へ全体を送った時刻（復帰し直したら0から。すぐ送る側に倒れる）。 */
@@ -321,48 +317,9 @@ export class WatchList extends DurableObject<Env> {
 
 /** 作ってからWATCH_VIEW_TTL_MS後を掃除の間隔に切り上げた時刻。createdが無い古いattachmentは次のアラームで閉じる。 */
 function viewDeadline(a: ViewAtt): number {
-  return Math.ceil(((a.created ?? 0) + WATCH_VIEW_TTL_MS) / WATCH_VIEW_SWEEP_MS) * WATCH_VIEW_SWEEP_MS;
+  return sweepDeadline(a.created ?? 0, WATCH_VIEW_TTL_MS);
 }
 
 function att(ws: WebSocket): Att {
   return ws.deserializeAttachment() as Att;
-}
-
-/** 届いた1通をJSONとして読む。大きさを最初に見る（大きなものをJSONとして解かない）。 */
-function parseObject(data: string | ArrayBuffer): Record<string, unknown> | typeof Close.TooLarge | typeof Close.BadMessage {
-  if (typeof data !== "string") return Close.BadMessage;
-  if (new TextEncoder().encode(data).byteLength > MESSAGE_MAX_BYTES) return Close.TooLarge;
-  let v: unknown;
-  try {
-    v = JSON.parse(data);
-  } catch {
-    return Close.BadMessage;
-  }
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return Close.BadMessage;
-  return v as Record<string, unknown>;
-}
-
-function send(ws: WebSocket, m: ServerMessage): void {
-  try {
-    ws.send(JSON.stringify(m));
-  } catch {
-    // 相手が先に切れた。
-  }
-}
-
-function closeWith(ws: WebSocket, code: number, withError: boolean): void {
-  const a = att(ws);
-  a.done = true;
-  try {
-    ws.serializeAttachment(a);
-  } catch {
-    // 閉じたWebSocketには書き込めないことがある。
-  }
-  const name = CLOSE_NAME[code] ?? "bad_message";
-  if (withError && name !== "done") send(ws, { t: "error", code: name });
-  try {
-    ws.close(code, name);
-  } catch {
-    // 二重のclose。
-  }
 }

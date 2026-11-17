@@ -24,11 +24,15 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use higanr_core::lobby::{
+    LOBBY_LIST_MAX_BYTES, LobbyAction, LobbyClient, LobbyEvent, LobbyPosting, lobby_path,
+};
 use higanr_core::room::{
     Action, CLIENT_ID_BYTES, Event, MESSAGE_MAX_BYTES, Now, Role, RoomClient, RoomName, SeatTicket,
     State, SubmitError,
 };
 use higanr_core::room_queue::{QueueAction, QueueClient, QueueEvent, random_path};
+use higanr_core::watch_list::WatchName;
 use higanr_core::watch_list::{
     HostAction, HostClient, HostEvent, Posting, ViewAction, ViewClient, ViewEvent,
     WATCH_LIST_MAX_BYTES, watch_post_path, watch_view_path,
@@ -443,6 +447,49 @@ impl Machine for HostClient {
     fn next_wake(&self) -> Option<u64> {
         HostClient::next_wake(self)
     }
+    fn message_max(&self) -> usize {
+        HostClient::message_max(self)
+    }
+}
+
+fn acts_of_lobby(v: Vec<LobbyAction>) -> Vec<Act<LobbyEvent>> {
+    v.into_iter()
+        .map(|a| match a {
+            LobbyAction::Send(t) => Act::Send(t),
+            LobbyAction::Notify(e) => Act::Notify(e),
+        })
+        .collect()
+}
+
+impl Machine for LobbyClient {
+    type Event = LobbyEvent;
+    fn on_upgraded(&mut self, now: Now) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::on_upgraded(self, now))
+    }
+    fn on_http_refused(&mut self, status: u16, body: &str) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::on_http_refused(self, status, body))
+    }
+    fn on_transport_failed(&mut self) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::on_transport_failed(self))
+    }
+    fn on_close(&mut self, code: u16) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::on_close(self, code))
+    }
+    fn on_text(&mut self, now: Now, text: &str) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::on_text(self, now, text))
+    }
+    fn poll(&mut self, now: Now) -> Vec<Act<LobbyEvent>> {
+        acts_of_lobby(LobbyClient::poll(self, now))
+    }
+    fn is_finished(&self) -> bool {
+        LobbyClient::is_finished(self)
+    }
+    fn next_wake(&self) -> Option<u64> {
+        LobbyClient::next_wake(self)
+    }
+    fn message_max(&self) -> usize {
+        LOBBY_LIST_MAX_BYTES
+    }
 }
 
 impl Machine for ViewClient {
@@ -505,6 +552,8 @@ pub type QueueConn = Conn<QueueClient>;
 pub type HostListConn = Conn<HostClient>;
 /// 進行中のランダム対戦の一覧を見る手順（観戦者が一覧の画面を開いている間だけ持つ）。
 pub type ViewListConn = Conn<ViewClient>;
+/// ルーム名ごとの一覧の手順（一覧の画面の間だけ見るか、`create`して待機中の1件として載っている間持つ）。
+pub type LobbyConn = Conn<LobbyClient>;
 
 impl Conn<RoomClient> {
     /// 受信スレッドを作って接続し始める（待たない）。スレッドを作れなければエラーの文を返す。
@@ -612,6 +661,51 @@ impl Conn<HostClient> {
         let mut out = Vec::new();
         self.run(acts, &mut out);
         self.pending.extend(out);
+    }
+}
+
+impl Conn<HostClient> {
+    /// ルーム名ごとの一覧へ試合中の1件を載せる接続を始める（待たない）。`name`は打ったルーム名（一覧のパスの元）。
+    pub fn start_lobby_post(
+        opts: &RoomOptions,
+        build: u32,
+        name: &RoomName,
+        posting: LobbyPosting,
+        watchers: u8,
+    ) -> Result<HostListConn, String> {
+        Conn::start_at(
+            opts,
+            lobby_path(build, name),
+            HostClient::new_lobby(posting, watchers),
+        )
+    }
+}
+
+impl Conn<LobbyClient> {
+    /// ルーム名ごとの一覧へ接続し始める（待たない）。一覧の全体は`LobbyEvent::List`で届く。
+    pub fn start_lobby(
+        opts: &RoomOptions,
+        build: u32,
+        name: &RoomName,
+    ) -> Result<LobbyConn, String> {
+        Conn::start_at(opts, lobby_path(build, name), LobbyClient::new())
+    }
+
+    /// 待機中の1件として載る。最初の一覧が届いた後でなければ何もせずfalseを返す。
+    /// 送れなかった失敗は次の`poll`で返る。
+    pub fn create(&mut self, name: &WatchName) -> bool {
+        if self.cancelled {
+            return false;
+        }
+        let now = self.now();
+        let acts = acts_of_lobby(self.client.create(now, name));
+        if acts.is_empty() {
+            return false;
+        }
+        let mut out = Vec::new();
+        let sent = self.run(acts, &mut out);
+        self.pending.extend(out);
+        sent
     }
 }
 
@@ -892,6 +986,7 @@ pub(crate) mod fake {
     //! - 同じcidの入り直しの置き換え: 検査の一部は1つのプロセスから2人分を接続する。クエリは受けて`seen`に残すだけ。
     //! - IPごとの数え: 1本にまとめ、通す数は検査が`limit`で設定する。
     //! - 成立後のアラームの間隔: 生存確認（ping）の古さはポーリングの5 msごとに見る。
+    //!
     //! クライアントの文はJSON.parseでなく、こちらのクライアントが送る4つの形（offer・answer・refuse・pingの12文字）との文字列の一致で読む。
     //! ほかはroom.tsと同じく4400にする。
     //! WebSocketの握手のSHA-1はOSのBCrypt（`room_win::sha1`）。フレームの組み立てとマスク解きはRFC 6455 §5を読んで手で書いた。
@@ -951,11 +1046,16 @@ pub(crate) mod fake {
         pub watch_answer_ttl_ms: u64,
         pub ticket_param: String,
         pub ticket_ttl_secs: u64,
+        pub lobby_path_prefix: String,
+        pub lobby_room_prefix: String,
+        pub lobby_room_hex_len: usize,
+        pub lobby_max_total: usize,
     }
 
     enum Val {
         S(String),
         I(i64),
+        B(bool),
     }
 
     fn skip_ws(b: &[u8], i: &mut usize) {
@@ -1033,6 +1133,12 @@ pub(crate) mod fake {
             skip_ws(b, &mut i);
             let v = if b[i] == b'"' {
                 Val::S(read_str(b, &mut i))
+            } else if s[i..].starts_with("true") {
+                i += 4;
+                Val::B(true)
+            } else if s[i..].starts_with("false") {
+                i += 5;
+                Val::B(false)
             } else {
                 let st = i;
                 while i < b.len() && (b[i] == b'-' || b[i].is_ascii_digit()) {
@@ -1127,6 +1233,10 @@ pub(crate) mod fake {
                 watch_answer_ttl_ms: n("watch_answer_ttl_ms") as u64,
                 ticket_param: s("ticket_param"),
                 ticket_ttl_secs: n("ticket_ttl_secs") as u64,
+                lobby_path_prefix: s("lobby_path_prefix"),
+                lobby_room_prefix: s("lobby_room_prefix"),
+                lobby_room_hex_len: n("lobby_room_hex_len") as usize,
+                lobby_max_total: n("lobby_max_total") as usize,
             }
         }
 
@@ -1344,6 +1454,8 @@ pub(crate) mod fake {
         pub held_stale_ms: AtomicU64,
         /// 入口で必ずこの応答を返す（ステータスコード・本文）。Cloudflare自身のエラーページなどのコピー。
         pub forced: Mutex<Option<(u16, String)>>,
+        /// ルーム名ごとの一覧がcreateとpostをlist_fullで断る（件数の上限のコピー）。
+        pub lobby_full: AtomicBool,
     }
 
     #[derive(Default)]
@@ -1364,6 +1476,10 @@ pub(crate) mod fake {
         pub watch_view_upgrades: AtomicUsize,
         /// 一覧へ掲載するエンドポイントへ届いたpostの文（検査が1P・2Pの名前・方式を検証する）。
         pub posts: Mutex<Vec<String>>,
+        /// ルーム名ごとの一覧に入った数（Upgradeした数）と届いたcreate・postの文。
+        pub lobby_upgrades: AtomicUsize,
+        pub lobby_creates: Mutex<Vec<String>>,
+        pub lobby_posts: Mutex<Vec<String>>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,6 +1570,8 @@ pub(crate) mod fake {
         queues: Mutex<HashMap<u32, Vec<QMember>>>,
         /// ビルド番号ごとの一覧（載せた順）とそれを見ている人。
         watch: Mutex<HashMap<u32, WatchBook>>,
+        /// ルーム名ごとの一覧（鍵は`b<ビルド番号>:<揃えた名>`）。
+        lobbies: Mutex<HashMap<String, LobbyBook>>,
         next_id: AtomicUsize,
         passed: AtomicUsize,
         streams: Mutex<Vec<TcpStream>>,
@@ -1487,6 +1605,7 @@ pub(crate) mod fake {
                 rooms: Mutex::new(HashMap::new()),
                 queues: Mutex::new(HashMap::new()),
                 watch: Mutex::new(HashMap::new()),
+                lobbies: Mutex::new(HashMap::new()),
                 next_id: AtomicUsize::new(1),
                 passed: AtomicUsize::new(0),
                 streams: Mutex::new(Vec::new()),
@@ -1586,6 +1705,78 @@ pub(crate) mod fake {
                         .collect()
                 })
                 .unwrap_or_default()
+        }
+
+        /// ルーム名ごとの一覧（`name`は揃えた名）の行を一覧の並びで返す。待機中は`wait:名前`。試合中は`play:1P:2P:観戦:観戦者数`。
+        pub fn lobby_rows(&self, build: u32, name: &str) -> Vec<String> {
+            lock(&self.inner.lobbies)
+                .get(&lobby_key(build, name))
+                .map(|b| {
+                    lobby_sorted(b)
+                        .iter()
+                        .map(|m| match &m.kind {
+                            LKind::Wait { name, .. } => format!("wait:{name}"),
+                            LKind::Play(i) => {
+                                format!("play:{}:{}:{}:{}", i.p1, i.p2, i.watch, i.watchers)
+                            }
+                            LKind::View => String::new(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// ルーム名ごとの一覧の待機中の行の割り当てのルーム名（並びの順）。
+        pub fn lobby_wait_rooms(&self, build: u32, name: &str) -> Vec<String> {
+            lock(&self.inner.lobbies)
+                .get(&lobby_key(build, name))
+                .map(|b| {
+                    lobby_sorted(b)
+                        .iter()
+                        .filter_map(|m| match &m.kind {
+                            LKind::Wait { room, .. } => Some(room.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// ルーム名ごとの一覧を見ている接続の数。
+        pub fn lobby_views(&self, build: u32, name: &str) -> usize {
+            lock(&self.inner.lobbies)
+                .get(&lobby_key(build, name))
+                .map_or(0, |b| {
+                    b.members
+                        .iter()
+                        .filter(|m| matches!(m.kind, LKind::View))
+                        .count()
+                })
+        }
+
+        /// ルーム名ごとの一覧の接続を今すぐ4408 expiredで閉じる（`waits`なら待機中の行、でなければ見る接続）。
+        /// サーバーは見る接続を10分で閉じ、載せた接続は生存確認（ping）が途絶えたら閉じる。待たずに検査が起こすための関数。
+        pub fn expire_lobby(&self, build: u32, name: &str, waits: bool) {
+            let mut lobbies = lock(&self.inner.lobbies);
+            let Some(book) = lobbies.get_mut(&lobby_key(build, name)) else {
+                return;
+            };
+            let mut changed = false;
+            book.members.retain(|m| {
+                let hit = match m.kind {
+                    LKind::View => !waits,
+                    LKind::Wait { .. } => waits,
+                    LKind::Play(_) => false,
+                };
+                if hit {
+                    lobby_close(&self.inner, &m.w, "expired", true);
+                    changed |= waits;
+                }
+                !hit
+            });
+            if changed {
+                lobby_broadcast(book);
+            }
         }
 
         /// 一覧を見ている接続の数（ビルド番号ごと）。
@@ -1821,6 +2012,9 @@ pub(crate) mod fake {
         }
         if path.starts_with(rules.watch_path_prefix.as_str()) {
             return serve_watch(inner, s, &head, path);
+        }
+        if path.starts_with(rules.lobby_path_prefix.as_str()) {
+            return serve_lobby(inner, s, &head, path);
         }
         let Some(raw) = rules.room_from_path(path) else {
             return respond(&mut s, 404, "", r#"{"error":"not_found"}"#);
@@ -2467,6 +2661,440 @@ pub(crate) mod fake {
         }
         broadcast_watch(book);
         None
+    }
+
+    // ---- ルーム名ごとの一覧（lobby.tsのコピー）----
+    //
+    // コピーしていないもの: 同じ鍵（IP）からの件数の上限・見る接続の上限と寿命・載せた接続の生存確認の期限・変化のまとめ送信・別の鍵の同じ試合の断り。
+    // 生存確認と寿命の代わりに検査が`expire_lobby`で期限切れを起こす。変わるたびにすぐ全体を送る。
+    // 割り当てのルーム名は乱数でなく連番の16進（偽サーバーの中だけ）。
+
+    #[derive(Clone)]
+    struct LItem {
+        /// 観戦用のルーム名w.…（割り当てのr.…から導いたもの）。
+        room: String,
+        p1: String,
+        p2: String,
+        mode: String,
+        delay: i64,
+        watch: bool,
+        watchers: i64,
+        cap: i64,
+    }
+
+    enum LKind {
+        View,
+        Wait { name: String, room: String },
+        Play(LItem),
+    }
+
+    struct LMember {
+        id: usize,
+        kind: LKind,
+        seq: usize,
+        w: Arc<Mutex<TcpStream>>,
+    }
+
+    #[derive(Default)]
+    struct LobbyBook {
+        members: Vec<LMember>,
+        next_seq: usize,
+        next_room: u64,
+    }
+
+    fn lobby_key(build: u32, name: &str) -> String {
+        format!("b{build}:{name}")
+    }
+
+    /// 待機中（来た順）→ 試合中（来た順）。
+    fn lobby_sorted(book: &LobbyBook) -> Vec<&LMember> {
+        let mut waits: Vec<&LMember> = book
+            .members
+            .iter()
+            .filter(|m| matches!(m.kind, LKind::Wait { .. }))
+            .collect();
+        let mut plays: Vec<&LMember> = book
+            .members
+            .iter()
+            .filter(|m| matches!(m.kind, LKind::Play(_)))
+            .collect();
+        waits.sort_by_key(|m| m.seq);
+        plays.sort_by_key(|m| m.seq);
+        waits.extend(plays);
+        waits
+    }
+
+    /// `Lobby.listMessage`のコピー（キーの順はJSON.stringifyの出力と同じ）。
+    fn lobby_list_text(book: &LobbyBook) -> String {
+        let items: Vec<String> = lobby_sorted(book)
+            .iter()
+            .map(|m| match &m.kind {
+                LKind::Wait { name, room } => format!(
+                    r#"{{"kind":"wait","name":"{}","room":"{room}"}}"#,
+                    json_str(name)
+                ),
+                LKind::Play(i) => format!(
+                    r#"{{"kind":"play","p1":"{}","p2":"{}","room":"{}","watch":{},"watchers":{},"cap":{},"mode":"{}","delay":{}}}"#,
+                    json_str(&i.p1),
+                    json_str(&i.p2),
+                    i.room,
+                    i.watch,
+                    i.watchers,
+                    i.cap,
+                    i.mode,
+                    i.delay
+                ),
+                LKind::View => String::new(),
+            })
+            .collect();
+        format!(r#"{{"t":"list","items":[{}]}}"#, items.join(","))
+    }
+
+    fn lobby_broadcast(book: &LobbyBook) {
+        let text = lobby_list_text(book);
+        for m in &book.members {
+            if matches!(m.kind, LKind::View) {
+                write_frame(&m.w, 0x1, text.as_bytes());
+            }
+        }
+    }
+
+    /// `closeWith`のコピー（withErrorならerrorの文を1通送ってから閉じる。doneでは送らない）。
+    fn lobby_close(inner: &Inner, w: &Mutex<TcpStream>, name: &str, with_error: bool) {
+        if with_error && name != "done" {
+            write_frame(
+                w,
+                0x1,
+                format!(r#"{{"t":"error","code":"{name}"}}"#).as_bytes(),
+            );
+        }
+        let mut p = inner.rules.close(name).to_be_bytes().to_vec();
+        p.extend_from_slice(name.as_bytes());
+        write_frame(w, 0x8, &p);
+    }
+
+    fn lobby_items(book: &LobbyBook) -> usize {
+        book.members
+            .iter()
+            .filter(|m| !matches!(m.kind, LKind::View))
+            .count()
+    }
+
+    fn is_lobby_room(rules: &Rules, name: &str) -> bool {
+        name.strip_prefix(rules.lobby_room_prefix.as_str())
+            .is_some_and(|hex| {
+                hex.len() == rules.lobby_room_hex_len
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }
+
+    /// `parseLobbyPost`のコピー（`parse_post`と同じ検証に、割り当ての形r.…と`watch`の真偽を足した）。
+    fn parse_lobby_post(rules: &Rules, text: &str, keyed: bool) -> Option<(String, LItem)> {
+        let list = std::panic::catch_unwind(|| read_flat(text)).ok()?;
+        let get = |k: &str| list.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+        let st = |k: &str| match get(k) {
+            Some(Val::S(v)) => Some(v.clone()),
+            _ => None,
+        };
+        let num = |k: &str| match get(k) {
+            Some(Val::I(v)) => Some(*v),
+            _ => None,
+        };
+        let watch = match get("watch") {
+            Some(Val::B(b)) => *b,
+            _ => return None,
+        };
+        if st("t")? != "post" {
+            return None;
+        }
+        let r = st("room")?;
+        if !is_lobby_room(rules, &r) {
+            return None;
+        }
+        let ticket = st("ticket")?;
+        let (p1, p2, mode) = (st("p1")?, st("p2")?, st("mode")?);
+        let (delay, watchers, cap) = (num("delay")?, num("watchers")?, num("cap")?);
+        let ok = is_name(&p1)
+            && is_name(&p2)
+            && rules.watch_modes.contains(&mode)
+            && (0..=rules.watch_delay_max).contains(&delay)
+            && (1..=rules.watch_cap_max).contains(&cap)
+            && (0..=cap).contains(&watchers);
+        if !ok {
+            return None;
+        }
+        let room = higanr_core::room::RoomName::parse_server_rules(&r)
+            .ok()?
+            .spectate_of()
+            .as_str()
+            .to_owned();
+        if !matches!(
+            judge_ticket(Some(&ticket), &room, unix_ms() / 1000, keyed),
+            TicketVerdict::Valid(_)
+        ) {
+            return None;
+        }
+        Some((
+            r,
+            LItem {
+                room,
+                p1,
+                p2,
+                mode,
+                delay,
+                watch,
+                watchers,
+                cap,
+            },
+        ))
+    }
+
+    /// index.tsのルーム名ごとの一覧の入口と`Lobby.fetch`。
+    fn serve_lobby(inner: &Inner, mut s: TcpStream, head: &Head, path: &str) {
+        let rules = &inner.rules;
+        if head.method != "GET" {
+            return respond(&mut s, 405, "", r#"{"error":"method_not_allowed"}"#);
+        }
+        let rest = path
+            .strip_prefix(rules.lobby_path_prefix.as_str())
+            .unwrap_or("");
+        let mut parts = rest.split('/');
+        let (Some(seg), Some(raw), None) = (parts.next(), parts.next(), parts.next()) else {
+            return respond(&mut s, 404, "", r#"{"error":"not_found"}"#);
+        };
+        let Some(build) = Rules::build_from_segment(seg) else {
+            return respond(&mut s, 400, "", r#"{"error":"bad_build"}"#);
+        };
+        // 割り当ての名（w. q. r.）で始まる名の一覧は作らない。
+        let reserved = |n: &str| {
+            [
+                rules.watch_room_prefix.as_str(),
+                rules.random_room_prefix.as_str(),
+                rules.lobby_room_prefix.as_str(),
+            ]
+            .iter()
+            .any(|p| n.starts_with(p))
+        };
+        let Some(name) = rules.normalize(raw).filter(|n| !reserved(n)) else {
+            return respond(&mut s, 400, "", r#"{"error":"bad_room_name"}"#);
+        };
+        if !head
+            .header("Upgrade")
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        {
+            return respond(&mut s, 426, "", r#"{"error":"upgrade_required"}"#);
+        }
+        if refuse_if_over_limit(inner, &mut s) {
+            return;
+        }
+        let Some(key) = head.header("Sec-WebSocket-Key") else {
+            return respond(&mut s, 400, "", "");
+        };
+        let accept =
+            base64(&crate::room_win::sha1(format!("{key}{WS_GUID}").as_bytes()).expect("SHA-1"));
+        let id = inner.next_id.fetch_add(1, Ordering::AcqRel);
+        let lkey = lobby_key(build, &name);
+        {
+            let mut lobbies = lock(&inner.lobbies);
+            let book = lobbies.entry(lkey.clone()).or_default();
+            let hs = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            if s.write_all(hs.as_bytes()).is_err() {
+                return;
+            }
+            let Ok(w) = s.try_clone() else { return };
+            let w = Arc::new(Mutex::new(w));
+            inner.seen.lobby_upgrades.fetch_add(1, Ordering::AcqRel);
+            write_frame(&w, 0x1, lobby_list_text(book).as_bytes());
+            book.members.push(LMember {
+                id,
+                kind: LKind::View,
+                seq: 0,
+                w,
+            });
+        }
+        lobby_loop(inner, &lkey, id, &mut s);
+        let _ = s.shutdown(Shutdown::Both);
+    }
+
+    fn lobby_loop(inner: &Inner, lkey: &str, id: usize, s: &mut TcpStream) {
+        let leave = |inner: &Inner| {
+            let mut lobbies = lock(&inner.lobbies);
+            let Some(book) = lobbies.get_mut(lkey) else {
+                return;
+            };
+            let listed = book
+                .members
+                .iter()
+                .any(|m| m.id == id && !matches!(m.kind, LKind::View));
+            book.members.retain(|m| m.id != id);
+            if listed {
+                lobby_broadcast(book);
+            }
+        };
+        loop {
+            let Ok((op, payload)) = read_frame(s) else {
+                return leave(inner);
+            };
+            if inner.knobs.deaf.load(Ordering::Acquire) {
+                continue;
+            }
+            match op {
+                0x1 => {
+                    let text = String::from_utf8_lossy(&payload).into_owned();
+                    lock(&inner.seen.texts).push(text.clone());
+                    let mut lobbies = lock(&inner.lobbies);
+                    let Some(book) = lobbies.get_mut(lkey) else {
+                        return;
+                    };
+                    let Some(w) = book
+                        .members
+                        .iter()
+                        .find(|m| m.id == id)
+                        .map(|m| Arc::clone(&m.w))
+                    else {
+                        return;
+                    };
+                    if text == inner.rules.ping_text {
+                        if !inner.knobs.no_pong.load(Ordering::Acquire) {
+                            write_frame(&w, 0x1, inner.rules.pong_text.as_bytes());
+                        }
+                        continue;
+                    }
+                    if let Some(name) = on_lobby_text(inner, book, id, &text) {
+                        lobby_close(inner, &w, name, true);
+                        drop(lobbies);
+                        return leave(inner);
+                    }
+                }
+                0x8 => {
+                    let lobbies = lock(&inner.lobbies);
+                    if let Some(m) = lobbies
+                        .get(lkey)
+                        .and_then(|b| b.members.iter().find(|m| m.id == id))
+                    {
+                        let mut p = 1000u16.to_be_bytes().to_vec();
+                        p.extend_from_slice(b"bye");
+                        write_frame(&m.w, 0x8, &p);
+                    }
+                    drop(lobbies);
+                    lock(&inner.seen.client_closes).push(
+                        (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]])),
+                    );
+                    return leave(inner);
+                }
+                0x9 => {
+                    let lobbies = lock(&inner.lobbies);
+                    if let Some(m) = lobbies
+                        .get(lkey)
+                        .and_then(|b| b.members.iter().find(|m| m.id == id))
+                    {
+                        write_frame(&m.w, 0xA, &payload);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 一覧の接続に届いた1通（`webSocketMessage`）。断るならerrorの名を返す（呼び出し側が閉じる）。
+    fn on_lobby_text(
+        inner: &Inner,
+        book: &mut LobbyBook,
+        id: usize,
+        text: &str,
+    ) -> Option<&'static str> {
+        let rules = &inner.rules;
+        let full = |rest: usize| {
+            inner.knobs.lobby_full.load(Ordering::Acquire) || rest >= rules.lobby_max_total
+        };
+        let i = book.members.iter().position(|m| m.id == id)?;
+        let is_view = matches!(book.members[i].kind, LKind::View);
+        if is_view && text.starts_with(r#"{"t":"create""#) {
+            lock(&inner.seen.lobby_creates).push(text.to_owned());
+            let list = std::panic::catch_unwind(|| read_flat(text)).ok();
+            let name = list.and_then(|l| {
+                l.into_iter().find_map(|(k, v)| match v {
+                    Val::S(n) if k == "name" => Some(n),
+                    _ => None,
+                })
+            });
+            let Some(name) = name.filter(|n| is_name(n)) else {
+                return Some("bad_message");
+            };
+            if full(lobby_items(book)) {
+                return Some("list_full");
+            }
+            book.next_room += 1;
+            let room = format!(
+                "{}{:0width$x}",
+                rules.lobby_room_prefix,
+                book.next_room,
+                width = rules.lobby_room_hex_len
+            );
+            book.next_seq += 1;
+            let m = &mut book.members[i];
+            write_frame(
+                &m.w,
+                0x1,
+                format!(r#"{{"t":"created","room":"{room}"}}"#).as_bytes(),
+            );
+            m.kind = LKind::Wait { name, room };
+            m.seq = book.next_seq;
+            lobby_broadcast(book);
+            return None;
+        }
+        if is_view && text.starts_with(r#"{"t":"post""#) {
+            lock(&inner.seen.lobby_posts).push(text.to_owned());
+            let keyed = !inner.knobs.no_seat_key.load(Ordering::Acquire);
+            let Some((r, item)) = parse_lobby_post(rules, text, keyed) else {
+                return Some("bad_message");
+            };
+            // 同じr.…の待機中の1件は作った人が誰でも外す。同じ試合の載せ直しは置き換える（鍵は1本にまとめてある）。
+            let gone: Vec<usize> = book
+                .members
+                .iter()
+                .filter(|m| match &m.kind {
+                    LKind::Wait { room, .. } => *room == r,
+                    LKind::Play(p) => p.room == item.room,
+                    LKind::View => false,
+                })
+                .map(|m| m.id)
+                .collect();
+            let rest = lobby_items(book) - gone.len();
+            if full(rest) {
+                return Some("list_full");
+            }
+            for m in book.members.iter().filter(|m| gone.contains(&m.id)) {
+                lobby_close(inner, &m.w, "done", false);
+            }
+            book.members.retain(|m| !gone.contains(&m.id));
+            book.next_seq += 1;
+            let seq = book.next_seq;
+            let m = book.members.iter_mut().find(|m| m.id == id)?;
+            write_frame(&m.w, 0x1, br#"{"t":"listed"}"#);
+            m.kind = LKind::Play(item);
+            m.seq = seq;
+            lobby_broadcast(book);
+            return None;
+        }
+        if let LKind::Play(item) = &mut book.members[i].kind
+            && let Some(n) = text
+                .strip_prefix(r#"{"t":"count","watchers":"#)
+                .and_then(|t| t.strip_suffix('}'))
+                .and_then(|t| t.parse::<i64>().ok())
+        {
+            if !(0..=item.cap).contains(&n) {
+                return Some("bad_message");
+            }
+            item.watchers = n;
+            lobby_broadcast(book);
+            return None;
+        }
+        Some("bad_message")
     }
 
     fn read_loop(inner: &Inner, name: &str, id: usize, s: &mut TcpStream) {

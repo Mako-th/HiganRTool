@@ -993,6 +993,54 @@ pub const STYLE_DEFAULT: Style = Style {
     pad: 2,
 };
 
+/// 1行を置く画面の隅と隅からの余白。`left`・`top`が真なら左・上の端から`x`・`y`画素離す。偽なら右・下の端から離す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Corner {
+    pub left: bool,
+    pub top: bool,
+    pub x: u32,
+    pub y: u32,
+}
+
+pub const CORNER_BOTTOM_LEFT: Corner = Corner {
+    left: true,
+    top: false,
+    x: 2,
+    y: 2,
+};
+pub const CORNER_BOTTOM_RIGHT: Corner = Corner {
+    left: false,
+    top: false,
+    x: 2,
+    y: 2,
+};
+pub const CORNER_TOP_LEFT: Corner = Corner {
+    left: true,
+    top: true,
+    x: 2,
+    y: 2,
+};
+pub const CORNER_TOP_RIGHT: Corner = Corner {
+    left: false,
+    top: true,
+    x: 2,
+    y: 2,
+};
+
+/// タイトル画面のバージョンの行を置く隅。
+pub const TITLE_MARK_CORNER: Corner = CORNER_BOTTOM_RIGHT;
+/// バージョンの行の色。文字は白の約60%、下地は黒の約19%。
+pub const TITLE_MARK_STYLE: Style = Style {
+    text: 0x99FF_FFFF,
+    back: 0x3000_0000,
+    pad: 2,
+};
+pub const TITLE_MARK_PREFIX: &str = "HiganRTool v";
+/// バージョンの行の文字数の上限（`TITLE_MARK_PREFIX`とバージョンの合計。超えた分は落とす）。
+pub const TITLE_MARK_CHARS: usize = 32;
+/// バージョンの行に要る頂点の数（文字ごとに6頂点と下地の6頂点）。
+pub const TITLE_MARK_VERTS: usize = (TITLE_MARK_CHARS + 1) * 6;
+
 /// 四角形1つ（6頂点）を`out[at..at + 6]`に書く。`(x0, y0)`〜`(x1, y1)`は画素の端の座標。
 /// D3D8の画素の中心は整数の座標なのでテクセルと画素を1対1に合わせるために0.5引く。
 pub(crate) fn quad(out: &mut [Vertex], at: usize, px: [f32; 4], uv: [f32; 4], color: u32) -> bool {
@@ -1132,9 +1180,28 @@ pub fn layout_line(
     style: &Style,
     out: &mut [Vertex],
 ) -> usize {
+    let corner = Corner {
+        left: false,
+        top: false,
+        x: place.right,
+        y: place.bottom,
+    };
+    layout_corner_line(text, spec, screen_w, screen_h, corner, style, out)
+}
+
+/// 置き場を4隅から選べる`layout_line`（空白の扱い・切り捨て・メモリを確保しないことは同じ）。
+pub fn layout_corner_line(
+    text: &str,
+    spec: &AtlasSpec,
+    screen_w: u32,
+    screen_h: u32,
+    corner: Corner,
+    style: &Style,
+    out: &mut [Vertex],
+) -> usize {
     let cap_by_out = (out.len() / 6).saturating_sub(1);
     let avail_w = screen_w
-        .saturating_sub(place.right)
+        .saturating_sub(corner.x)
         .saturating_sub(2 * style.pad);
     let fallback = spec.slot_of('?');
     let limit = MAX_TEXT.min(cap_by_out);
@@ -1152,10 +1219,18 @@ pub fn layout_line(
     }
     let box_w = total + 2 * style.pad;
     let box_h = spec.cell_h + 2 * style.pad;
-    let (Some(x0), Some(y0)) = (
-        screen_w.checked_sub(place.right + box_w),
-        screen_h.checked_sub(place.bottom + box_h),
-    ) else {
+    let x0 = if corner.left {
+        Some(corner.x)
+    } else {
+        screen_w.checked_sub(corner.x + box_w)
+    };
+    let y0 = if corner.top {
+        // 下の端が画面に収まるときだけ置く（下の隅は`checked_sub`が見る）。
+        (corner.y + box_h <= screen_h).then_some(corner.y)
+    } else {
+        screen_h.checked_sub(corner.y + box_h)
+    };
+    let (Some(x0), Some(y0)) = (x0, y0) else {
         return 0;
     };
     let (x1, y1) = (x0 + box_w, y0 + box_h);
@@ -1230,6 +1305,48 @@ pub fn layout_lines(
         at += layout_line(line, spec, screen_w, screen_h, p, style, rest);
     }
     at
+}
+
+/// タイトル画面のバージョンの行（`HiganRTool v<version>`）を`TITLE_MARK_CORNER`に置き、その頂点を`out`に書く。
+/// `show`が偽のとき・画面に収まらないとき・`out`が足りないときは0を返す。
+/// 毎フレーム呼ぶので文字列はスタックの配列で組む（メモリの確保もパニックもしない）。
+pub fn layout_title_mark(
+    show: bool,
+    version: &str,
+    spec: &AtlasSpec,
+    screen_w: u32,
+    screen_h: u32,
+    out: &mut [Vertex],
+) -> usize {
+    if !show {
+        return 0;
+    }
+    let mut buf = [0u8; TITLE_MARK_CHARS];
+    let mut len = 0;
+    for &b in TITLE_MARK_PREFIX
+        .as_bytes()
+        .iter()
+        .chain(version.as_bytes())
+    {
+        let Some(slot) = buf.get_mut(len) else {
+            break;
+        };
+        *slot = b;
+        len += 1;
+    }
+    // バージョンはASCII。多バイト文字の途中で切れたときは行ごと出さない。
+    let Ok(text) = core::str::from_utf8(buf.get(..len).unwrap_or(&[])) else {
+        return 0;
+    };
+    layout_corner_line(
+        text,
+        spec,
+        screen_w,
+        screen_h,
+        TITLE_MARK_CORNER,
+        &TITLE_MARK_STYLE,
+        out,
+    )
 }
 
 // ---- 見本の絵（検査用。ゲームには使わない）----
@@ -1589,6 +1706,91 @@ mod tests {
         assert!(a.iter().all(|v| v.color == STYLE_DEFAULT.text));
         assert_eq!(out[12].x, 615.0 + 14.0 - 0.5);
         assert_eq!((out[12].u, out[12].v), (14.0 / 128.0, 28.0 / 128.0));
+    }
+
+    fn within(v: &[Vertex], w: u32, h: u32) -> bool {
+        v.iter()
+            .all(|p| p.x >= -0.5 && p.y >= -0.5 && p.x <= w as f32 && p.y <= h as f32)
+    }
+
+    #[test]
+    fn title_mark_text_is_prefix_and_cargo_version() {
+        let s = spec();
+        let ver = env!("CARGO_PKG_VERSION");
+        let mut out = [Vertex::default(); TITLE_MARK_VERTS];
+        let n = layout_title_mark(true, ver, &s, 640, 480, &mut out);
+        let text = format!("HiganRTool v{ver}");
+        let glyphs: Vec<char> = text.chars().filter(|&c| c != ' ').collect();
+        assert_eq!(n, (glyphs.len() + 1) * 6);
+        for (i, c) in glyphs.iter().enumerate() {
+            let uv = slot_uv(&s, s.slot_of(*c).unwrap());
+            let q = &out[6 + 6 * i..12 + 6 * i];
+            assert_eq!((q[0].u, q[0].v), (uv[0], uv[1]), "{i}文字目 {c}");
+            assert!(q.iter().all(|v| v.color == TITLE_MARK_STYLE.text));
+        }
+        assert!(out[..6].iter().all(|v| v.color == TITLE_MARK_STYLE.back));
+    }
+
+    #[test]
+    fn title_mark_sits_in_the_chosen_corner_on_screen() {
+        let s = spec();
+        let ver = env!("CARGO_PKG_VERSION");
+        for (w, h) in [(640, 480), (1280, 960), (400, 120)] {
+            let mut out = [Vertex::default(); TITLE_MARK_VERTS];
+            let n = layout_title_mark(true, ver, &s, w, h, &mut out);
+            assert!(n > 0, "{w}x{h}");
+            assert!(within(&out[..n], w, h), "{w}x{h}");
+            let c = TITLE_MARK_CORNER;
+            let b = &out[..6];
+            let (x0, y0, x1, y1) = (b[0].x + 0.5, b[0].y + 0.5, b[5].x + 0.5, b[5].y + 0.5);
+            let mx = if c.left { x0 } else { w as f32 - x1 };
+            let my = if c.top { y0 } else { h as f32 - y1 };
+            assert_eq!((mx, my), (c.x as f32, c.y as f32), "{w}x{h}");
+        }
+        // 画面が狭いときは後ろの文字を落とし、画面の外へ出さない。
+        let mut out = [Vertex::default(); TITLE_MARK_VERTS];
+        let n = layout_title_mark(true, env!("CARGO_PKG_VERSION"), &s, 60, 480, &mut out);
+        assert!(n > 0 && within(&out[..n], 60, 480));
+    }
+
+    #[test]
+    fn all_four_corners_stay_on_screen_and_anchor_to_their_edges() {
+        let s = spec();
+        let corners = [
+            CORNER_BOTTOM_LEFT,
+            CORNER_TOP_LEFT,
+            CORNER_TOP_RIGHT,
+            CORNER_BOTTOM_RIGHT,
+        ];
+        for c in corners {
+            let mut out = [Vertex::default(); 6 * 4];
+            let n = layout_corner_line("AB", &s, 640, 480, c, &STYLE_DEFAULT, &mut out);
+            assert_eq!(n, 18, "{c:?}");
+            assert!(within(&out[..n], 640, 480), "{c:?}");
+            let b = &out[..6];
+            assert_eq!(b[0].x + 0.5 == c.x as f32, c.left, "{c:?}");
+            assert_eq!(b[0].y + 0.5 == c.y as f32, c.top, "{c:?}");
+            if !c.left {
+                assert_eq!(640.0 - (b[5].x + 0.5), c.x as f32, "{c:?}");
+            }
+            if !c.top {
+                assert_eq!(480.0 - (b[5].y + 0.5), c.y as f32, "{c:?}");
+            }
+        }
+        // 上の隅に置くとき画面の縦が足りなければ何も描かない。
+        let mut out = [Vertex::default(); 6 * 4];
+        assert_eq!(
+            layout_corner_line("AB", &s, 640, 10, CORNER_TOP_LEFT, &STYLE_DEFAULT, &mut out),
+            0
+        );
+    }
+
+    #[test]
+    fn title_mark_is_not_drawn_while_the_mark_is_down() {
+        let s = spec();
+        let mut out = [Vertex::default(); TITLE_MARK_VERTS];
+        assert_eq!(layout_title_mark(false, "1.0.0", &s, 640, 480, &mut out), 0);
+        assert!(layout_title_mark(true, "1.0.0", &s, 640, 480, &mut out) > 0);
     }
 
     #[test]

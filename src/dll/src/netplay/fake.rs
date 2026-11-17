@@ -410,7 +410,12 @@ impl Game for FakeGame {
             cpu_1p: 0,
             cpu_2p: 0,
             background: 0,
-            rng_seed: if role == Role::Host { 777 } else { 0 },
+            // マッチごとに変える（再戦で積み直すシードが切替のtickの値かを見分けるため）。
+            rng_seed: if role == Role::Host {
+                777u16.wrapping_add(self.segs_done as u16)
+            } else {
+                0
+            },
             option_digest: 0,
         }
     }

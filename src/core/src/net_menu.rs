@@ -13,6 +13,7 @@ use crate::input_model::keys;
 use crate::lan_addr::{AddrBuf, AddrInput, AddrWhy, LanAddr};
 use crate::lang::{Lang, Tx};
 use crate::link::Restarts;
+use crate::lobby::{LobbyRoom, LobbyRow, LobbySnapshot};
 use crate::match_gate::{MATCH_WAIT_MS, NoMatch};
 use crate::menu_model::{CANCEL_BITS, DECIDE_BITS};
 use crate::mode_pick::{MAX_PICK_DELAY, Pick, Shape};
@@ -342,15 +343,15 @@ texts! {
     T_RANDOM_LINKING = "見つかった相手と接続しています。", "Connecting to the opponent.";
     T_RANDOM_BUSY_NEXT = "秒ほど待ってから、「ランダムマッチ」を選び直してください。", " seconds, then choose \"Random match\" again.";
     T_RANDOM_AGAIN = "「ランダムマッチ」を選び直してください。", "Choose \"Random match\" again.";
-    /// こちらの文字の決まり（`room::RoomName::parse`）で断ったルーム名。名そのものは出さない（断った文字は表に無いことがある）。入力の画面は使える文字だけを受けるので文字の断りはふつうは来ない（`w.` `q.`の断りは来る）。
+    /// こちらの文字の決まり（`room::RoomName::parse`）で断ったルーム名。名そのものは出さない（断った文字は表に無いことがある）。入力の画面は使える文字だけを受けるので文字の断りはふつうは来ない（`w.` `q.` `r.`の断りは来る）。
     T_ROOM_NAME_LONG_OPEN = "ルーム名が長すぎます（", "The room name is too long (max ";
     T_ROOM_NAME_LONG_CLOSE = "文字まで）。", " chars).";
     T_ROOM_NAME_CHAR = "ルーム名に使えない文字（改行や / など）があります。", "The room name has a character not allowed (newline, / etc.).";
     T_ROOM_NAME_DOT = "ルーム名を「.」や「..」にはできません。", "The room name cannot be \".\" or \"..\".";
     /// 使える文字（`RoomName::accepts_char`）の外（`` ` `` `;` と日本語・全角）。文字の表に無い漢字は「?」で描かれ、相手と同じ名かを画面で見分けられないため。
     T_ROOM_NAME_ASCII = "ルーム名に「`」「;」「/」は使えません。", "` ; / cannot be used in room names.";
-    /// 前後の空白を除いた名が`w.`か`q.`で始まる（観戦用のルームとランダムマッチの割り当ての名と重なる）。
-    T_ROOM_NAME_RESERVED = "「w.」か「q.」で始まるルーム名は使えません。", "Room names starting with \"w.\" or \"q.\" cannot be used.";
+    /// 前後の空白を除いた名が`w.` `q.` `r.`で始まる（観戦用のルームとランダムマッチ・ルーム名ごとの一覧の割り当ての名と重なる）。
+    T_ROOM_NAME_RESERVED = "「w.」「q.」「r.」で始まるルーム名は使えません。", "Room names starting with \"w.\", \"q.\" or \"r.\" cannot be used.";
     T_ROOM_FIX = "ルーム名を直して、「ルームマッチ」を選び直してください。", "Fix the room name and choose \"Room match\" again.";
     /// 観戦者の入口。観戦の「ルームマッチ」は対戦の「ルームマッチ」と同じルーム名の入力へ入る（題だけがこの文字）。待ちの間の項目は「観戦をやめる」だけ。
     /// 接続する途中は`T_ROOM_JOINING`、失敗の1行目のうち応答しない・400は`T_ROOM_UNRESPONSIVE`・`T_ROOM_REFUSED`、バージョン違いは`other_version_line`を使い、次にすることだけ「観戦」に替える。
@@ -367,6 +368,21 @@ texts! {
     T_WATCH_MORE_DOWN = "▼ ほか ", "▼ ";
     T_WATCH_MORE_CLOSE = " 件", " more";
     T_KEYS_WATCH = "↑↓ メニューの移動　決定で観戦　キャンセルでもどる", "↑↓ Move   Confirm: Watch   Cancel: Back";
+    /// ルーム名ごとの一覧の画面。題は対戦「ルームマッチ ─ 名」・観戦「観戦 ─ ルームマッチ ─ 名」。待機中の行は名前の右（観戦者数の列）に`T_LOBBY_WAITING`を右寄せで出す。
+    /// 試合中の行は観戦の「ランダムマッチ」の一覧と同じ形（観戦を許可していないペアは観戦者数の代わりに`T_LOBBY_NO_WATCH`で灰色）。キーの行はカーソルの行で替わる（試合中の行は`T_KEYS_WATCH`・「もどる」は`T_KEYS_LOBBY_BACK`）。
+    T_LOBBY_WAITING = "待機中", "Waiting";
+    T_LOBBY_NO_WATCH = "観戦不可", "No watching";
+    T_LOBBY_CREATE = "対戦を募集する", "Host a match";
+    /// 観戦で試合中のペアが無い。「ルーム「名」で試合中の組はありません。」
+    T_LOBBY_NONE_OPEN = "ルーム「", "No matches are being played in room \"";
+    T_LOBBY_NONE_CLOSE = "」で試合中の組はありません。", "\".";
+    /// 入室に失敗して一覧へ戻したとき（`Menu::return_to_lobby`）の警告。
+    T_LOBBY_GONE = "選んだ相手はもう待機していません。", "That player is no longer waiting.";
+    /// 一覧の件数の上限（サーバーの`list_full`）。次にすることは`T_ROOM_RENAME`。
+    T_LOBBY_FULL = "このルーム名ではこれ以上作成できません。", "No more can be created with this room name.";
+    T_KEYS_LOBBY_JOIN = "↑↓ メニューの移動　決定で対戦　キャンセルでもどる", "↑↓ Move   Confirm: Play   Cancel: Back";
+    T_KEYS_LOBBY_CREATE = "↑↓ メニューの移動　決定で作成　キャンセルでもどる", "↑↓ Move   Confirm: Create   Cancel: Back";
+    T_KEYS_LOBBY_BACK = "↑↓ メニューの移動　決定で確定　キャンセルでもどる", "↑↓ Move   Confirm: Select   Cancel: Back";
     /// 「観戦 名前 で待機中 12:34」（`T_SPECTATE_OPEN` ＋ 名前 ＋ `T_ROOM_WAITING_CLOSE` ＋ 時計）。配信する側がルームに来るまでの入り直しの間（`JoinerStatus::waiting_for_caster`）。時計は待った時間。
     T_SPECTATE_OPEN = "観戦 ", "Watch ";
     /// 「相手「名前」に接続しています。」。観戦用のコードを受け、対戦する側へ接続しに行く間。
@@ -752,7 +768,7 @@ pub enum RoomNameWhy {
     Dot,
     /// 使える文字の外の文字がある（`` ` `` `;` と日本語・全角）。
     NotAscii,
-    /// `w.`か`q.`で始まる。
+    /// `w.` `q.` `r.`で始まる。
     Reserved,
 }
 
@@ -903,10 +919,14 @@ pub enum Event {
     SpectateFull,
     /// 観戦コードの経路の観戦者: 同上。
     SpectateCodeFull,
+    /// ルーム名ごとの一覧の件数の上限で「対戦を募集する」を断られた（`list_full`）。
+    LobbyFull,
+    /// 一覧から選んだ相手がもう待っていない（`room_in_use`か自分がhostになった）。呼び手は`Menu::return_to_lobby`で一覧へ戻す。
+    LobbyGone,
 }
 
 /// イベントの番号の表（番号 = 並びの位置。アトミック変数で渡すので足すときは末尾に足す）。
-const EVENTS: [Event; 68] = [
+const EVENTS: [Event; 70] = [
     Event::None,
     Event::Made,
     Event::ReplyMade,
@@ -975,6 +995,8 @@ const EVENTS: [Event; 68] = [
     Event::SpectateFullEnded,
     Event::SpectateFull,
     Event::SpectateCodeFull,
+    Event::LobbyFull,
+    Event::LobbyGone,
 ];
 
 impl Event {
@@ -1030,6 +1052,7 @@ impl Event {
                 | Event::SpectateCodePeerOff
                 | Event::LanPeer
                 | Event::LanCancelled
+                | Event::LobbyGone
         )
     }
 
@@ -1042,6 +1065,7 @@ impl Event {
                 | Event::RoomUnresponsive
                 | Event::RoomBusy
                 | Event::RoomInUse
+                | Event::LobbyFull
                 | Event::RoomRefused
                 | Event::RoomExpired
                 | Event::RoomPeerLeft
@@ -1687,6 +1711,13 @@ pub enum Cmd {
     /// 観戦の「ランダムマッチ」の一覧から選んだ行。観戦用のルーム名は行のハッシュから導く。
     /// 受け取る側は一覧の接続を閉じる。そして`Spectate`と同じように観戦者のセッションを設定する。
     SpectateListed(WatchRow),
+    /// ルーム名ごとの一覧（`Menu::with_lobby`）から「対戦を募集する」を決定した。最初の一覧が空で画面を出さずに作る場合も同じ。
+    /// 受け取る側は一覧へ`create`を送って待機中の1件として載り、割り当てのルームで待つ（`Room`の待つ側と同じ状態）。
+    LobbyCreate(RoomBuf),
+    /// ルーム名ごとの一覧の待機中の行を決定した。受け取る側は一覧の接続を閉じ、その2席のルームへguestとして入る。
+    /// 先に別の人が入っていた（`room_in_use`）か自分がhostになったら`Menu::return_to_lobby`で一覧へ戻す。
+    /// 前は打ったルーム名（画面の待機の行とiniの`room`に使う。割り当てのルーム名は出さない）。
+    LobbyJoin(RoomBuf, LobbyRoom),
     /// 設定の「ルーム名」を決定した（ルームへは入らない）。受け取る側はiniの`room`へ書く（次の起動時のルーム名の初めの値になる。ゲームのスレッドでは書かない）。
     RoomSet(RoomBuf),
     /// LANのホストとして待つ（アドレスはホストが自分のLANのアドレスを全部見せる）。
@@ -1787,6 +1818,8 @@ enum State {
     RoomName,
     /// 観戦の「ランダムマッチ」の一覧（進行中のランダムマッチから選ぶ。一覧は呼び手が毎tick渡す）。
     WatchList,
+    /// ルーム名ごとの一覧（`with_lobby`。「ルームマッチ」「観戦のルームマッチ」でルーム名を決定した後。一覧は呼び手が毎tick渡す）。
+    Lobby,
     /// 閉じ始めた。ワードが0になるまで（か`CLOSE_MAX_TICKS`まで）呼び手がゲームへ0を渡す。数は経ったtick。
     Closing(u32),
 }
@@ -1868,6 +1901,19 @@ pub struct Menu {
     /// 観戦の「ランダムマッチ」の一覧の画面のカーソル（行の中身で覚える。一覧が入れ替わっても別の行を選ばない）と表示の先頭の行の番号。
     watch_sel: WatchSel,
     watch_top: usize,
+    /// ルーム名ごとの一覧を使うかどうか（`with_lobby`）。偽なら「ルームマッチ」の決定が`Cmd::Room` / `Cmd::Spectate`をすぐ返す。
+    use_lobby: bool,
+    /// 一覧の画面の状態。何のための一覧か・打ったルーム名・カーソル（行の中身で覚える）・表示の先頭の行。
+    lobby_kind: LobbyKind,
+    lobby_name: RoomBuf,
+    lobby_sel: LobbySel,
+    lobby_top: usize,
+    /// 自分が一覧へ作って待っている割り当てのルーム（呼び手が`set_own_lobby`で渡す）。その待機中の行は灰色で選べない。
+    own_lobby: Option<LobbyRoom>,
+    /// 最初の一覧が届いたかどうか（対戦で最初の一覧が空なら画面を出さずに作る。入り直しで戻ったときは作らない）。
+    lobby_seen: bool,
+    /// 入室に失敗して戻った警告の行を出す（カーソルを動かすか画面を出たら消す）。
+    lobby_gone: bool,
     /// LANの待機でアドレスが`LAN_VISIBLE`を越えるときの、カーソルが指しているアドレスの行（項目の並びの次に回る。`None`は項目側）と表示の先頭の行。
     lan_row: Option<usize>,
     lan_top: usize,
@@ -1887,10 +1933,32 @@ enum WatchSel {
     Back,
 }
 
+/// ルーム名ごとの一覧が何のためか。観戦では「対戦を募集する」を出さず、待機中の行は選べない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LobbyKind {
+    Play,
+    Watch,
+}
+
+/// ルーム名ごとの一覧のカーソルの位置（行の中身で覚える。一覧が入れ替わっても別の行を選ばない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LobbySel {
+    /// 動かしていない。選べる最初の行（無ければ「対戦を募集する」、それも無ければ「もどる」）。
+    Auto,
+    /// 待機中の行（割り当てのルームで覚える）。
+    Wait(LobbyRoom),
+    /// 試合中の行（観戦用のルームのハッシュで覚える）。
+    Play([u8; 8]),
+    Create,
+    Back,
+}
+
 /// 一覧の画面に出す行の数（これを越える分はスクロールして上下の「ほか N 件」で知らせる）。
 pub const WATCH_VISIBLE: usize = 8;
 /// 一覧の1行の名前のフィールドの幅（文字）。越える名前は切って出す。
 const WATCH_NAME_CELLS: usize = 12;
+/// 観戦で試合中のペアが無い文に出すルーム名の文字数の上限（英語の文が枠の幅に収まる長さ）。
+const LOBBY_NONE_NAME_MAX: usize = 22;
 
 /// 項目の数の上限。入口のメニューは最大13（ランダムマッチ・ルームマッチ・ルーム名・観戦のランダムマッチ・観戦のルームマッチ・対戦コード作成・対戦コード入力・観戦コード入力・ホスト・クライアント・観戦・設定・もどる）。
 /// 待ちの間は観戦・LAN・ルーム名が無く、代わりに「待機をやめる」が1つ加わる。
@@ -1976,6 +2044,14 @@ impl Menu {
             at: None,
             watch_sel: WatchSel::Auto,
             watch_top: 0,
+            use_lobby: false,
+            lobby_kind: LobbyKind::Play,
+            lobby_name: RoomBuf::new(),
+            lobby_sel: LobbySel::Auto,
+            lobby_top: 0,
+            own_lobby: None,
+            lobby_seen: false,
+            lobby_gone: false,
             lan_row: None,
             lan_top: 0,
             ini_notice: None,
@@ -1985,6 +2061,11 @@ impl Menu {
 
     pub fn set_update(&mut self, found: Found) {
         self.update = found;
+    }
+
+    /// 自分が一覧へ作って待っている割り当てのルームを渡す（待っていなければ`None`）。一覧の画面の間は毎tick渡す。
+    pub fn set_own_lobby(&mut self, room: Option<LobbyRoom>) {
+        self.own_lobby = room;
     }
 
     pub fn with_ini_notice(mut self, notice: Option<IniNotice>) -> Menu {
@@ -2036,6 +2117,12 @@ impl Menu {
         self
     }
 
+    /// ルーム名ごとの一覧を使う。偽（初期値）ならルーム名を決定するとすぐ`Cmd::Room` / `Cmd::Spectate`を返す。
+    pub fn with_lobby(mut self, on: bool) -> Menu {
+        self.use_lobby = on;
+        self
+    }
+
     pub fn set_text_available(&mut self, ok: bool) {
         self.text_unavailable = !ok;
     }
@@ -2066,14 +2153,18 @@ impl Menu {
     /// 空か文字の決まりの外ならルーム名の入力の画面へ入る（入力で決定するとそのまま始まる）。
     fn start_room(&mut self, for_: EditFor) -> Option<Cmd> {
         match self.room {
-            RoomItem::On(name) if name.parse().is_ok() => Some(match for_ {
-                EditFor::Spectate => Cmd::Spectate(name),
+            RoomItem::On(name) if name.parse().is_ok() => match for_ {
+                EditFor::Wait | EditFor::Spectate if self.use_lobby => {
+                    self.begin_lobby(for_, name);
+                    None
+                }
+                EditFor::Spectate => Some(Cmd::Spectate(name)),
                 EditFor::Wait
                 | EditFor::Name
                 | EditFor::RoomSet
                 | EditFor::LanClient
-                | EditFor::LanWatch => Cmd::Room(name),
-            }),
+                | EditFor::LanWatch => Some(Cmd::Room(name)),
+            },
             RoomItem::On(_) | RoomItem::Off => {
                 self.begin_room_input(for_);
                 None
@@ -2184,7 +2275,7 @@ impl Menu {
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
-            State::Open | State::Settings | State::RoomName | State::WatchList
+            State::Open | State::Settings | State::RoomName | State::WatchList | State::Lobby
         )
     }
 
@@ -2342,6 +2433,272 @@ impl Menu {
         }
     }
 
+    /// ルーム名ごとの一覧の画面かどうか。
+    /// 呼び手はこれが`Some`の間だけそのルーム名の一覧の接続を持つ（`None`になったら閉じる）。毎tickの一覧を`tick_with` / `render_with`へ渡す。
+    pub fn wants_lobby(&self) -> Option<(RoomBuf, LobbyKind)> {
+        (self.state == State::Lobby).then_some((self.lobby_name, self.lobby_kind))
+    }
+
+    /// 入室に失敗した（選んだ相手が先に別の人と入った・自分がhostになった）ときに一覧の画面へ戻す。
+    /// 画面の上に警告の1行を出す（カーソルを動かすか画面を出たら消える）。打ったルーム名はメニューが覚えている。
+    /// 一覧の画面から`Cmd::LobbyJoin`を出した後（入口のメニューが開いている間）だけ効く。
+    pub fn return_to_lobby(&mut self) {
+        if self.state == State::Open && self.use_lobby && !self.lobby_name.is_empty() {
+            self.state = State::Lobby;
+            self.lobby_seen = true;
+            self.lobby_gone = true;
+        }
+    }
+
+    fn begin_lobby(&mut self, for_: EditFor, name: RoomBuf) {
+        self.state = State::Lobby;
+        self.lobby_kind = if for_ == EditFor::Spectate {
+            LobbyKind::Watch
+        } else {
+            LobbyKind::Play
+        };
+        self.lobby_name = name;
+        self.lobby_sel = LobbySel::Auto;
+        self.lobby_top = 0;
+        self.lobby_seen = false;
+        self.lobby_gone = false;
+        // 決定したEnterのワードが遅れて届いて最初の行を決定しないよう全部離れるまで押下を読まない。
+        self.quiet = Some(0);
+    }
+
+    fn leave_lobby(&mut self) {
+        self.state = State::Open;
+        self.lobby_gone = false;
+    }
+
+    /// 一覧の画面に出す行。読み込み中・失敗の間と観戦で試合中のペアが無い間は空（観戦では待機中の行だけを出さない）。
+    fn lobby_shown<'a>(&self, snap: &'a LobbySnapshot) -> &'a [LobbyRow] {
+        let rows = snap.rows();
+        let any_play = rows.iter().any(|r| matches!(r, LobbyRow::Play(_)));
+        if snap.status != ListStatus::Ready || (self.lobby_kind == LobbyKind::Watch && !any_play) {
+            &[]
+        } else {
+            rows
+        }
+    }
+
+    /// 「対戦を募集する」を出すかどうか（対戦で一覧が届いている間だけ）。
+    fn lobby_has_create(&self, snap: &LobbySnapshot) -> bool {
+        self.lobby_kind == LobbyKind::Play && snap.status == ListStatus::Ready
+    }
+
+    /// 一覧の画面のカーソルの位置（行 → 「対戦を募集する」 → 「もどる」の順の番号）と表示の先頭の行。
+    /// 副作用なし（`tick`が結果を覚え`render`が同じ値を使う）。
+    fn lobby_view(&self, snap: &LobbySnapshot) -> LobbyView {
+        let rows = self.lobby_shown(snap);
+        let n = rows.len();
+        let create = self.lobby_has_create(snap);
+        let back = n + usize::from(create);
+        let first = rows
+            .iter()
+            .position(|r| lobby_row_ok(self.lobby_kind, self.own_lobby, r))
+            .unwrap_or(if create { n } else { back });
+        let cursor = match self.lobby_sel {
+            LobbySel::Auto => first,
+            LobbySel::Back => back,
+            LobbySel::Create if create => n,
+            LobbySel::Create => first,
+            LobbySel::Wait(room) => rows
+                .iter()
+                .position(|r| matches!(r, LobbyRow::Wait(w) if w.room == room))
+                .unwrap_or(first),
+            LobbySel::Play(h) => rows
+                .iter()
+                .position(|r| matches!(r, LobbyRow::Play(p) if p.row.hash == h))
+                .unwrap_or(first),
+        };
+        let last_top = n.saturating_sub(WATCH_VISIBLE);
+        let mut top = self.lobby_top.min(last_top);
+        if cursor >= n {
+            // 「対戦を募集する」「もどる」は最後の行の下。最後の行が見える位置まで送る。
+            top = last_top;
+        } else if cursor < top {
+            top = cursor;
+        } else if cursor >= top + WATCH_VISIBLE {
+            top = cursor + 1 - WATCH_VISIBLE;
+        }
+        LobbyView {
+            cursor,
+            top,
+            n,
+            create,
+        }
+    }
+
+    /// 一覧の画面の行を作る。題・警告・（8行を越えるときだけ）上の「ほか N 件」・行・下の「ほか N 件」・「対戦を募集する」・「もどる」・キーの行。
+    /// 8行を越える一覧は上下の行を空の行でも残す（スクロールしても枠の高さが変わらない）。
+    fn render_lobby(&self, rows: &mut MenuRows, snap: &LobbySnapshot) {
+        let lang = self.lang;
+        let list = self.lobby_shown(snap);
+        let v = self.lobby_view(snap);
+        let title = rows.next(RowStyle::Title);
+        if self.lobby_kind == LobbyKind::Watch {
+            title
+                .push_str(T_SPECTATE.get(lang))
+                .push_str(T_WATCH_DASH.get(lang));
+        }
+        title
+            .push_str(T_ROOM.get(lang))
+            .push_str(T_WATCH_DASH.get(lang))
+            .push_str(self.lobby_name.as_str());
+        if self.lobby_gone {
+            rows.next(RowStyle::Warn)
+                .push_str("  ")
+                .push_str(T_LOBBY_GONE.get(lang));
+        }
+        if v.n == 0 {
+            match snap.status {
+                ListStatus::Loading => {
+                    rows.next(RowStyle::Hint)
+                        .push_str("  ")
+                        .push_str(T_WATCH_LOADING.get(lang));
+                }
+                ListStatus::Failed => {
+                    rows.next(RowStyle::Warn)
+                        .push_str("  ")
+                        .push_str(T_WATCH_FAILED.get(lang));
+                }
+                ListStatus::Ready if self.lobby_kind == LobbyKind::Watch => {
+                    // 英語の文は32文字の名前だと枠に収まらないので長い名前は切る（ルーム名はASCIIだけ）。
+                    let name = self.lobby_name.as_str();
+                    let shown = name.get(..LOBBY_NONE_NAME_MAX).unwrap_or(name);
+                    let line = rows.next(RowStyle::Hint);
+                    line.push_str("  ")
+                        .push_str(T_LOBBY_NONE_OPEN.get(lang))
+                        .push_str(shown);
+                    if shown.len() < name.len() {
+                        line.push_str("...");
+                    }
+                    line.push_str(T_LOBBY_NONE_CLOSE.get(lang));
+                }
+                ListStatus::Ready => {}
+            }
+        } else {
+            let scroll = v.n > WATCH_VISIBLE;
+            if scroll {
+                push_more(rows.next(RowStyle::Hint), lang, T_WATCH_MORE_UP, v.top);
+            }
+            for (i, r) in list.iter().enumerate().skip(v.top).take(WATCH_VISIBLE) {
+                let sel = i == v.cursor;
+                let style = if sel {
+                    RowStyle::Selected
+                } else if lobby_row_ok(self.lobby_kind, self.own_lobby, r) {
+                    RowStyle::Normal
+                } else {
+                    RowStyle::Hint
+                };
+                let line = rows.next(style);
+                line.push_str(if sel { "> " } else { "  " });
+                lobby_row_text(line, r, lang);
+            }
+            if scroll {
+                let below = v.n.saturating_sub(v.top + WATCH_VISIBLE);
+                push_more(rows.next(RowStyle::Hint), lang, T_WATCH_MORE_DOWN, below);
+            }
+        }
+        rows.next(RowStyle::GapMedium);
+        if v.create {
+            let sel = v.cursor == v.n;
+            rows.next(if sel {
+                RowStyle::Selected
+            } else {
+                RowStyle::Normal
+            })
+            .push_str(if sel { "> " } else { "  " })
+            .push_str(T_LOBBY_CREATE.get(lang));
+        }
+        let back = v.cursor == v.n + usize::from(v.create);
+        rows.next(if back {
+            RowStyle::Selected
+        } else {
+            RowStyle::Normal
+        })
+        .push_str(if back { "> " } else { "  " })
+        .push_str(T_BACK.get(lang));
+        rows.next(RowStyle::GapMedium);
+        let keys = match list.get(v.cursor) {
+            Some(LobbyRow::Wait(_)) => T_KEYS_LOBBY_JOIN,
+            Some(LobbyRow::Play(_)) => T_KEYS_WATCH,
+            None if v.create && v.cursor == v.n => T_KEYS_LOBBY_CREATE,
+            None => T_KEYS_LOBBY_BACK,
+        };
+        rows.next(RowStyle::Hint).push_str(keys.get(lang));
+    }
+
+    /// 一覧の画面を1 tick進める。↑↓ は選べる行（待機中の行は対戦のとき（自分が待っている行を除く）・試合中の行は観戦を許可していて満員でないとき）と「対戦を募集する」「もどる」だけを回る。
+    fn tick_lobby(&mut self, pressed: u16, snap: &LobbySnapshot, out: &mut TickOut) {
+        // 対戦で最初の一覧が空なら画面を出さずに作る。
+        if !self.lobby_seen && snap.status == ListStatus::Ready {
+            self.lobby_seen = true;
+            if self.lobby_kind == LobbyKind::Play && snap.is_empty() {
+                out.cmd = Some(Cmd::LobbyCreate(self.lobby_name));
+                self.leave_lobby();
+                return;
+            }
+        }
+        let rows = self.lobby_shown(snap);
+        let v = self.lobby_view(snap);
+        self.lobby_top = v.top;
+        if pressed & CANCEL_BITS != 0 {
+            self.leave_lobby();
+            return;
+        }
+        let kind = self.lobby_kind;
+        let own = self.own_lobby;
+        let total = v.n + usize::from(v.create) + 1;
+        // 動かしていない間は一覧が変わっても「選べる最初の行」を指し続ける。動かしたら行の中身で覚える。
+        let sel_of = |idx: usize| match rows.get(idx) {
+            Some(LobbyRow::Wait(w)) => LobbySel::Wait(w.room),
+            Some(LobbyRow::Play(p)) => LobbySel::Play(p.row.hash),
+            None if v.create && idx == v.n => LobbySel::Create,
+            None => LobbySel::Back,
+        };
+        let step = |from: usize, forward: bool| {
+            let mut i = from;
+            for _ in 0..total {
+                i = if forward {
+                    (i + 1) % total
+                } else {
+                    (i + total - 1) % total
+                };
+                if rows.get(i).is_none_or(|r| lobby_row_ok(kind, own, r)) {
+                    return i;
+                }
+            }
+            total - 1
+        };
+        if pressed & (keys::UP | keys::DOWN) != 0 {
+            self.lobby_gone = false;
+            // 同時に押したら ↑ が勝つ（観戦の一覧と同じ）。
+            let to = step(v.cursor, pressed & keys::UP == 0);
+            self.lobby_sel = sel_of(to);
+            self.lobby_top = self.lobby_view(snap).top;
+        } else if pressed & DECIDE_BITS != 0 {
+            match rows.get(v.cursor) {
+                // 選べない行は決定しても何も起きない（選んだ後に満員になった行の上にカーソルが残っている場合）。
+                Some(r) if !lobby_row_ok(kind, own, r) => {}
+                Some(LobbyRow::Wait(w)) => {
+                    out.cmd = Some(Cmd::LobbyJoin(self.lobby_name, w.room));
+                    self.leave_lobby();
+                }
+                Some(LobbyRow::Play(p)) => {
+                    out.cmd = Some(Cmd::SpectateListed(p.row));
+                    self.leave_lobby();
+                }
+                None if v.create && v.cursor == v.n => {
+                    out.cmd = Some(Cmd::LobbyCreate(self.lobby_name));
+                    self.leave_lobby();
+                }
+                None => self.leave_lobby(),
+            }
+        }
+    }
+
     pub fn shape(&self) -> ShapeSel {
         self.shape
     }
@@ -2468,16 +2825,50 @@ impl Menu {
 
     /// 一覧の無い呼び手（一覧の画面を開く項目を使わない検査）用。
     pub fn tick(&mut self, i: &TickIn) -> TickOut {
-        self.tick_with(i, &WatchSnapshot::EMPTY)
+        self.tick_with(i, &WatchSnapshot::EMPTY, &LobbySnapshot::EMPTY)
     }
 
-    /// `watch`は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
-    pub fn tick_with(&mut self, i: &TickIn, watch: &WatchSnapshot) -> TickOut {
+    /// 全部の押下を無視する猶予（`quiet`）が続いていれば0、終わっていれば`pressed`をそのまま返す。
+    fn take_quiet(&mut self, word: u16, pressed: u16) -> u16 {
+        match self.quiet {
+            Some(n) => {
+                self.quiet = if word == 0 || n >= CLOSE_MAX_TICKS {
+                    None
+                } else {
+                    Some(n + 1)
+                };
+                0
+            }
+            None => pressed,
+        }
+    }
+
+    /// `watch`は観戦の「ランダムマッチ」の一覧・`lobby`はルーム名ごとの一覧（それぞれの一覧の画面の間だけ読む）。
+    pub fn tick_with(
+        &mut self,
+        i: &TickIn,
+        watch: &WatchSnapshot,
+        lobby: &LobbySnapshot,
+    ) -> TickOut {
         let word = i.word;
         let pressed = word & !self.prev;
         self.prev = word;
         match self.state {
             State::Closed => TickOut::default(),
+            State::Lobby => {
+                let mut out = TickOut {
+                    cmd: None,
+                    hold_game: true,
+                    answer: None,
+                };
+                if i.conn.is_linked() {
+                    self.state = State::Closing(0);
+                    return out;
+                }
+                let pressed = self.take_quiet(word, pressed);
+                self.tick_lobby(pressed, lobby, &mut out);
+                out
+            }
             State::WatchList => {
                 let mut out = TickOut {
                     cmd: None,
@@ -2612,6 +3003,16 @@ impl Menu {
                                         .unwrap_or(*self.edit.text());
                                     // 次の「ルームマッチ」の名は今決定した名（iniや前回の名より新しい）。
                                     self.room = RoomItem::On(name);
+                                    // 一覧を使うときはコマンドを出さず、一覧の画面へ入る（一覧の画面が決定を出す）。
+                                    if self.use_lobby
+                                        && matches!(
+                                            self.edit_for,
+                                            EditFor::Wait | EditFor::Spectate
+                                        )
+                                    {
+                                        self.begin_lobby(self.edit_for, name);
+                                        return out;
+                                    }
                                     out.cmd = match self.edit_for {
                                         // 名前の入力のEnterは上の枠が先に受ける（ここへは来ない）。
                                         EditFor::Wait | EditFor::Name => Some(Cmd::Room(name)),
@@ -2641,17 +3042,7 @@ impl Menu {
                     self.state = State::Closing(0);
                     return out;
                 }
-                let pressed = match self.quiet {
-                    Some(n) => {
-                        self.quiet = if word == 0 || n >= CLOSE_MAX_TICKS {
-                            None
-                        } else {
-                            Some(n + 1)
-                        };
-                        0
-                    }
-                    None => pressed,
-                };
+                let pressed = self.take_quiet(word, pressed);
                 let (items, n) = self.items(i.conn, i.note.state);
                 self.cursor = self.settled_cursor(&(items, n));
                 self.home = false;
@@ -2780,10 +3171,17 @@ impl Menu {
 
     /// 開いているメニューの行を作る（毎tickか行が変わりうるときに呼ぶ）。`now`はUNIX秒。
     pub fn render(&self, conn: Conn, note: &Note, now: u64, rows: &mut MenuRows) {
-        self.render_with(conn, note, now, rows, &WatchSnapshot::EMPTY);
+        self.render_with(
+            conn,
+            note,
+            now,
+            rows,
+            &WatchSnapshot::EMPTY,
+            &LobbySnapshot::EMPTY,
+        );
     }
 
-    /// `watch`は観戦の「ランダムマッチ」の一覧（一覧の画面の間だけ読む）。
+    /// `watch`は観戦の「ランダムマッチ」の一覧・`lobby`はルーム名ごとの一覧（それぞれの一覧の画面の間だけ読む）。
     pub fn render_with(
         &self,
         conn: Conn,
@@ -2791,9 +3189,14 @@ impl Menu {
         now: u64,
         rows: &mut MenuRows,
         watch: &WatchSnapshot,
+        lobby: &LobbySnapshot,
     ) {
         let lang = self.lang;
         rows.len = 0;
+        if self.state == State::Lobby {
+            self.render_lobby(rows, lobby);
+            return;
+        }
         if self.state == State::WatchList {
             self.render_watch_list(rows, watch);
             return;
@@ -3161,21 +3564,82 @@ fn watch_first_selectable(rows: &[WatchRow]) -> usize {
     rows.iter().position(|r| !r.is_full()).unwrap_or(rows.len())
 }
 
-/// 一覧の1行の本文: 「1P 名 vs 2P 名　観戦者の数/上限」。名前は`WATCH_NAME_CELLS`文字のフィールドに左寄せ（越える分は切る）。
-/// 数は右寄せで5文字（「10/10」）。
+/// ルーム名ごとの一覧の画面のカーソルと表示（`Menu::lobby_view`の結果）。行の後ろに「対戦を募集する」（`create`のとき）・「もどる」が続く。
+struct LobbyView {
+    cursor: usize,
+    top: usize,
+    /// 出す行の数。
+    n: usize,
+    create: bool,
+}
+
+/// 一覧の行を選べるかどうか。待機中の行は対戦のときだけ（自分が待っている行は除く）・試合中の行は観戦を許可していて満員でないときだけ。
+fn lobby_row_ok(kind: LobbyKind, own: Option<LobbyRoom>, r: &LobbyRow) -> bool {
+    match r {
+        LobbyRow::Wait(w) => kind == LobbyKind::Play && own != Some(w.room),
+        LobbyRow::Play(p) => p.can_watch(),
+    }
+}
+
+/// ルーム名ごとの一覧の1行の本文。試合中の行は観戦の「ランダムマッチ」の一覧と同じ（観戦を許可していないペアは観戦者数の代わりに`T_LOBBY_NO_WATCH`）。
+/// 待機中の行は名前（`WATCH_NAME_CELLS`文字に詰める）の右に`T_LOBBY_WAITING`を行の右端へ寄せる。
+fn lobby_row_text(line: &mut LineBuf, r: &LobbyRow, lang: Lang) {
+    match r {
+        LobbyRow::Wait(w) => {
+            push_name_field(line, w.name.as_str());
+            push_right_aligned(line, WATCH_NAME_CELLS as u32, T_LOBBY_WAITING.get(lang));
+        }
+        LobbyRow::Play(p) if p.watch => watch_row_text(line, &p.row, lang),
+        LobbyRow::Play(p) => {
+            push_row_names(line, &p.row, lang);
+            let used = (2 * WATCH_NAME_CELLS) as u32 + cells_of(T_WATCH_VS.get(lang));
+            push_right_aligned(line, used, T_LOBBY_NO_WATCH.get(lang));
+        }
+    }
+}
+
+/// 一覧の1行の幅（枠。名前2つ・` vs `・空白2・数5）。
+const WATCH_ROW_CELLS: u32 = (2 * WATCH_NAME_CELLS + 4 + 2 + 5) as u32;
+
+/// 左が`used`枠の行へ`text`を`WATCH_ROW_CELLS`枠の右端に合わせて置く（収まらなければ空白1つで続ける）。
+/// 全角の文字は描くと半角2つ分の幅にならない。収まるときは`ui_layout::ALIGN_RIGHT`の印を入れ、描く側で画素単位で揃える。
+/// 収まらないときは印を入れない（入れると全角の分だけ右へ押し出される）。
+fn push_right_aligned(line: &mut LineBuf, used: u32, text: &str) {
+    let fits = used + cells_of(text) < WATCH_ROW_CELLS;
+    let pad = WATCH_ROW_CELLS.saturating_sub(used + cells_of(text)).max(1);
+    for _ in 0..pad {
+        line.push_char(' ');
+    }
+    if fits {
+        line.push_char(crate::ui_layout::ALIGN_RIGHT);
+    }
+    line.push_str(text);
+}
+
+/// 名前を`WATCH_NAME_CELLS`文字のフィールドに左寄せで置く（越える分は切る）。
 /// 名前はASCIIだけ（`WatchName`）なので、フィールドの幅は文字数のままで揃う。
-fn watch_row_text(line: &mut LineBuf, r: &WatchRow, lang: Lang) {
+fn push_name_field(line: &mut LineBuf, s: &str) {
+    let shown = s.get(..WATCH_NAME_CELLS.min(WATCH_NAME_MAX)).unwrap_or(s);
+    line.push_str(shown);
+    for _ in shown.len()..WATCH_NAME_CELLS {
+        line.push_char(' ');
+    }
+}
+
+/// 一覧の1行の名前の部分: 「1P 名 vs 2P 名」。
+fn push_row_names(line: &mut LineBuf, r: &WatchRow, lang: Lang) {
     for (i, name) in [r.p1, r.p2].into_iter().enumerate() {
         if i == 1 {
             line.push_str(T_WATCH_VS.get(lang));
         }
-        let s = name.as_str();
-        let shown = s.get(..WATCH_NAME_CELLS.min(WATCH_NAME_MAX)).unwrap_or(s);
-        line.push_str(shown);
-        for _ in shown.len()..WATCH_NAME_CELLS {
-            line.push_char(' ');
-        }
+        push_name_field(line, name.as_str());
     }
+}
+
+/// 一覧の1行の本文: 「1P 名 vs 2P 名　観戦者の数/上限」。名前は`WATCH_NAME_CELLS`文字のフィールドに左寄せ（越える分は切る）。
+/// 数は右寄せで5文字（「10/10」）。
+fn watch_row_text(line: &mut LineBuf, r: &WatchRow, lang: Lang) {
+    push_row_names(line, r, lang);
     line.push_str("  ");
     let digits = |n: u8| {
         if n >= 100 {
@@ -3527,12 +3991,12 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
                     });
             });
         }
-        Event::RoomInUse | Event::RoomRefused => {
+        Event::RoomInUse | Event::RoomRefused | Event::LobbyFull => {
             line(&mut |l| {
-                l.push_str(if ev == Event::RoomInUse {
-                    T_ROOM_IN_USE.get(lang)
-                } else {
-                    T_ROOM_REFUSED.get(lang)
+                l.push_str(match ev {
+                    Event::RoomInUse => T_ROOM_IN_USE.get(lang),
+                    Event::LobbyFull => T_LOBBY_FULL.get(lang),
+                    _ => T_ROOM_REFUSED.get(lang),
                 });
             });
             line(&mut |l| {
@@ -3638,6 +4102,9 @@ fn event_lines(note: &Note, lang: Lang, out: &mut [LineBuf], warn: &mut [bool]) 
                 l.push_str(T_SPECTATE_CODE_FULL_NEXT.get(lang));
             });
         }
+        Event::LobbyGone => line(&mut |l| {
+            l.push_str(T_LOBBY_GONE.get(lang));
+        }),
         Event::SpectateCodeCopied => line(&mut |l| {
             l.push_str(T_SPECTATE_CODE_COPIED.get(lang));
         }),
@@ -4859,6 +5326,7 @@ impl RewindWindow {
 mod tests {
     use super::*;
     use crate::overlay::{AtlasSpec, ui_glyphs};
+    use crate::ui_layout::ALIGN_RIGHT;
 
     const Z: u16 = 0x0001;
     const X: u16 = 0x0002;
@@ -5608,7 +6076,7 @@ mod tests {
         }
         // イベントの数。足したら`EVENTS`と合わせて直す。
         assert_eq!(
-            troubles, 49,
+            troubles, 50,
             "断り・失敗の出来事の数（増減したら文を見直す）"
         );
         let name = sanitize_name("テスト名".as_bytes(), |c| c != '名');
@@ -9301,6 +9769,33 @@ mod tests {
             ]
         );
         assert_eq!(
+            lines(Event::LobbyFull, &none),
+            [
+                "このルーム名ではこれ以上作成できません。",
+                "別のルーム名で「ルームマッチ」を選び直してください。"
+            ]
+        );
+        // 一覧へ戻すときの知らせ。一覧の画面が警告の行を出すので断りの扱いにはしない。
+        let n = Note {
+            event: Event::LobbyGone,
+            ..Note::default()
+        };
+        let mut out = [LineBuf::new(); STATUS_ROWS];
+        let mut w = [false; STATUS_ROWS];
+        let k = event_lines(&n, Lang::Ja, &mut out, &mut w);
+        assert_eq!(
+            (k, out[0].as_str()),
+            (1, "選んだ相手はもう待機していません。")
+        );
+        for ev in [Event::LobbyFull, Event::LobbyGone] {
+            assert_eq!(Event::from_code(ev.code()), ev);
+        }
+        assert!(Event::LobbyFull.is_room_trouble(), "左上に残らない");
+        assert!(
+            !Event::LobbyGone.is_room_trouble() && !Event::LobbyGone.is_trouble(),
+            "一覧へ戻した後も左上に残る"
+        );
+        assert_eq!(
             lines(Event::RoomPeerLeft, &none),
             [
                 "ルームの相手が途中で抜けました。",
@@ -9325,7 +9820,7 @@ mod tests {
             ),
             (
                 RoomNameWhy::Reserved,
-                "「w.」か「q.」で始まるルーム名は使えません。",
+                "「w.」「q.」「r.」で始まるルーム名は使えません。",
             ),
         ] {
             let got = lines(Event::RoomNameBad, &|n| n.room_why = why);
@@ -11934,17 +12429,31 @@ mod tests {
         }
 
         fn tap(&mut self, key: u16) -> TickOut {
-            let down = self.m.tick_with(&input(key, quiet(), self.conn), &self.w);
+            let down = self.m.tick_with(
+                &input(key, quiet(), self.conn),
+                &self.w,
+                &LobbySnapshot::EMPTY,
+            );
             self.cmds.extend(down.cmd);
-            let up = self.m.tick_with(&input(0, quiet(), self.conn), &self.w);
+            let up = self.m.tick_with(
+                &input(0, quiet(), self.conn),
+                &self.w,
+                &LobbySnapshot::EMPTY,
+            );
             self.cmds.extend(up.cmd);
             down
         }
 
         fn rows(&self) -> MenuRows {
             let mut r = MenuRows::new();
-            self.m
-                .render_with(self.conn, &quiet(), 1_000_000, &mut r, &self.w);
+            self.m.render_with(
+                self.conn,
+                &quiet(),
+                1_000_000,
+                &mut r,
+                &self.w,
+                &LobbySnapshot::EMPTY,
+            );
             r
         }
 
@@ -12320,6 +12829,871 @@ mod tests {
                         }
                     }
                     d.tap(DOWN);
+                }
+            }
+        }
+        let h = tallest + 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
+        assert!(
+            h <= 480 - 2 * crate::ui_layout::SCREEN_MARGIN,
+            "枠の高さ {h} 画素"
+        );
+    }
+
+    // ---------------- ルーム名ごとの一覧の画面 ----------------
+
+    use crate::lobby::{PlayRow, WaitRow};
+    use crate::watch_list::WatchName;
+
+    fn lroom(i: u8) -> LobbyRoom {
+        LobbyRoom::parse(&format!("r.{:030x}", u128::from(i))).unwrap()
+    }
+
+    fn wait_row(i: u8, name: &str) -> LobbyRow {
+        LobbyRow::Wait(WaitRow {
+            name: WatchName::parse(name).unwrap(),
+            room: lroom(i),
+        })
+    }
+
+    fn play_row(i: u8, p1: &str, p2: &str, watchers: u8, cap: u8, watch: bool) -> LobbyRow {
+        LobbyRow::Play(PlayRow {
+            row: wrow(i, p1, p2, watchers, cap),
+            watch,
+        })
+    }
+
+    fn lsnap(status: ListStatus, rows: &[LobbyRow]) -> Box<LobbySnapshot> {
+        let mut s = Box::new(LobbySnapshot::EMPTY);
+        s.set(status, rows);
+        s
+    }
+
+    fn abc() -> RoomBuf {
+        RoomBuf::from_name("abc").unwrap()
+    }
+
+    /// 待機中の行の本文（名前を12枠に詰め、`T_LOBBY_WAITING`を35枠の右端へ寄せる）。
+    fn wait_line(name: &str, lang: Lang) -> String {
+        let st = T_LOBBY_WAITING.get(lang);
+        let pad = 35 - 12 - cells_of(st) as usize;
+        format!("{name:<12}{}{ALIGN_RIGHT}{st}", " ".repeat(pad))
+    }
+
+    /// 観戦を許可していないペアの行の本文（観戦者数の代わりに`T_LOBBY_NO_WATCH`）。
+    fn nowatch_line(p1: &str, p2: &str, lang: Lang) -> String {
+        format!("{p1:<12} vs {p2:<12} {}", T_LOBBY_NO_WATCH.get(lang))
+    }
+
+    /// ルーム名「abc」の「ルームマッチ」（対戦か観戦）を決定して一覧の画面を開いた状態。最初の一覧は読み込み中。
+    struct LobbyDriver {
+        m: Menu,
+        l: Box<LobbySnapshot>,
+        cmds: Vec<Cmd>,
+        conn: Conn,
+    }
+
+    impl LobbyDriver {
+        fn open(kind: LobbyKind, lang: Lang) -> LobbyDriver {
+            let m = Menu::new(ini())
+                .with_room(RoomItem::On(abc()))
+                .with_lang(lang)
+                .with_lobby(true);
+            let mut d = LobbyDriver {
+                m,
+                l: lsnap(ListStatus::Loading, &[]),
+                cmds: Vec::new(),
+                conn: Conn::Waiting,
+            };
+            d.m.open(0);
+            // 項目はランダムマッチ・ルームマッチ・ルーム名・観戦のランダムマッチ・観戦のルームマッチの順。
+            let downs = if kind == LobbyKind::Play { 1 } else { 4 };
+            for _ in 0..downs {
+                d.tap(DOWN);
+            }
+            d.tap(Z);
+            assert_eq!(
+                d.m.wants_lobby(),
+                Some((abc(), kind)),
+                "一覧の画面が開かない"
+            );
+            assert_eq!(d.cmds, vec![], "一覧を待つ間は指示を出さない");
+            d
+        }
+
+        /// 一覧を届けて1 tick進める。
+        fn with(kind: LobbyKind, lang: Lang, rows: &[LobbyRow]) -> LobbyDriver {
+            let mut d = LobbyDriver::open(kind, lang);
+            d.feed(ListStatus::Ready, rows);
+            d
+        }
+
+        fn feed(&mut self, status: ListStatus, rows: &[LobbyRow]) {
+            self.l.set(status, rows);
+            self.tap(0);
+        }
+
+        fn tap(&mut self, key: u16) {
+            for w in [key, 0] {
+                let out = self.m.tick_with(
+                    &input(w, quiet(), self.conn),
+                    &WatchSnapshot::EMPTY,
+                    &self.l,
+                );
+                assert!(out.hold_game);
+                self.cmds.extend(out.cmd);
+            }
+        }
+
+        fn rows(&self) -> MenuRows {
+            let mut r = MenuRows::new();
+            self.m.render_with(
+                self.conn,
+                &quiet(),
+                1_000_000,
+                &mut r,
+                &WatchSnapshot::EMPTY,
+                &self.l,
+            );
+            r
+        }
+
+        fn text(&self) -> Vec<String> {
+            let r = self.rows();
+            r.lines[..r.len]
+                .iter()
+                .map(|l| l.as_str().to_string())
+                .collect()
+        }
+
+        fn marked(&self) -> Vec<String> {
+            self.text()
+                .into_iter()
+                .filter(|l| l.starts_with("> "))
+                .collect()
+        }
+
+        fn at_back(&self) -> Vec<String> {
+            vec![format!("> {}", T_BACK.ja)]
+        }
+    }
+
+    #[test]
+    fn a_play_lobby_with_an_empty_first_list_creates_without_showing_the_screen() {
+        let mut d = LobbyDriver::open(LobbyKind::Play, Lang::Ja);
+        let t = d.text();
+        assert_eq!(t[0], format!("{}{}abc", T_ROOM.ja, T_WATCH_DASH.ja));
+        assert_eq!(t[1], format!("  {}", T_WATCH_LOADING.ja));
+        d.tap(0);
+        assert_eq!(d.cmds, vec![], "一覧が届く前に作った");
+        d.l.set(ListStatus::Ready, &[]);
+        // このtickで作る。画面の行を作る前に抜けるので「対戦を募集する」の画面は出ない。
+        let out =
+            d.m.tick_with(&input(0, quiet(), d.conn), &WatchSnapshot::EMPTY, &d.l);
+        assert_eq!(out.cmd, Some(Cmd::LobbyCreate(abc())));
+        assert!(d.m.wants_lobby().is_none() && d.m.is_open() && d.m.is_active());
+        d.tap(0);
+        d.tap(0);
+        assert_eq!(
+            d.cmds,
+            vec![],
+            "作った後に一覧の画面が戻った・指示が重なった"
+        );
+        assert!(d.m.wants_lobby().is_none());
+    }
+
+    #[test]
+    fn a_failed_or_loading_first_list_never_creates_and_offers_only_back() {
+        for (status, text, style) in [
+            (ListStatus::Loading, T_WATCH_LOADING, RowStyle::Hint),
+            (ListStatus::Failed, T_WATCH_FAILED, RowStyle::Warn),
+        ] {
+            for kind in [LobbyKind::Play, LobbyKind::Watch] {
+                for lang in Lang::ALL {
+                    let mut d = LobbyDriver::open(kind, lang);
+                    // 古い行が残っていても読み込み中・失敗の間は出さない。
+                    d.feed(
+                        status,
+                        &[wait_row(1, "Alice"), play_row(2, "A", "B", 0, 10, true)],
+                    );
+                    let t = d.text();
+                    assert_eq!(t[1], format!("  {}", text.get(lang)), "{status:?} {kind:?}");
+                    assert_eq!(d.rows().styles[1], style);
+                    assert_eq!(d.marked(), [format!("> {}", T_BACK.get(lang))]);
+                    assert_eq!(t.len(), 6, "{t:?}");
+                    assert_eq!(*t.last().unwrap(), T_KEYS_LOBBY_BACK.get(lang));
+                    assert!(!t.iter().any(|l| l.contains(T_LOBBY_CREATE.get(lang))));
+                    d.tap(Z);
+                    assert_eq!(d.cmds, vec![]);
+                    assert!(d.m.wants_lobby().is_none(), "もどるで出ない");
+                }
+            }
+        }
+    }
+
+    /// ゲームの文字は英数字9画素・全角14画素なので空白で詰めただけでは「待機中」が観戦者数の右端より左で終わる。
+    /// 「観戦不可」は列に収まらず空白1つで続ける行なので印を入れない（入れると右へ押し出される）。
+    #[test]
+    fn lobby_waiting_ends_where_the_watcher_count_ends() {
+        let game = game_font_spec("");
+        let plain = AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap();
+        let rows = [
+            wait_row(1, "Alice"),
+            play_row(2, "P1", "P2", 3, 10, true),
+            play_row(3, "P3", "P4", 0, 10, false),
+        ];
+        let mut measured = 0;
+        for lang in Lang::ALL {
+            let t = LobbyDriver::with(LobbyKind::Play, lang, &rows).text();
+            assert!(t[1].contains(ALIGN_RIGHT), "{lang:?}: {t:?}");
+            assert!(
+                t[3].contains(T_LOBBY_NO_WATCH.get(lang)) && !t[3].contains(ALIGN_RIGHT),
+                "{lang:?}: {t:?}"
+            );
+            for spec in [&game, &plain] {
+                let w = |l: &str| crate::ui_layout::text_width(spec, l);
+                assert_eq!(w(&t[1]), w(&t[2]), "{lang:?}: {t:?}");
+                measured += 1;
+            }
+        }
+        assert_eq!(measured, 2 * Lang::ALL.len());
+    }
+
+    #[test]
+    fn a_play_lobby_lists_rows_then_create_then_back_and_each_decision_sends_its_command() {
+        let rows = [
+            wait_row(1, "Alice"),
+            play_row(2, "P1", "P2", 3, 10, true),
+            wait_row(3, "Bob"),
+        ];
+        let d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        let t = d.text();
+        assert_eq!(t.len(), 9, "{t:?}");
+        assert_eq!(t[0], format!("{}{}abc", T_ROOM.ja, T_WATCH_DASH.ja));
+        assert_eq!(t[1], format!("> {}", wait_line("Alice", Lang::Ja)));
+        assert_eq!(t[2], format!("  {}", row_line(&wrow(2, "P1", "P2", 3, 10))));
+        assert_eq!(t[3], format!("  {}", wait_line("Bob", Lang::Ja)));
+        assert_eq!(t[4], "", "行と「対戦を募集する」の間は空ける");
+        assert_eq!(t[5], format!("  {}", T_LOBBY_CREATE.ja));
+        assert_eq!(
+            t[6],
+            format!("  {}", T_BACK.ja),
+            "「対戦を募集する」と「もどる」は続ける"
+        );
+        assert_eq!(t[8], T_KEYS_LOBBY_JOIN.ja);
+        // 待機中の行 → LobbyJoin。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyJoin(abc(), lroom(1))]);
+        assert!(d.m.wants_lobby().is_none() && d.m.is_open());
+        // 試合中の行 → SpectateListed。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        d.tap(DOWN);
+        d.tap(Z);
+        assert_eq!(
+            d.cmds,
+            vec![Cmd::SpectateListed(wrow(2, "P1", "P2", 3, 10))]
+        );
+        assert!(d.m.wants_lobby().is_none());
+        // 「対戦を募集する」 → LobbyCreate（打ったルーム名つき）。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        for _ in 0..3 {
+            d.tap(DOWN);
+        }
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyCreate(abc())]);
+        assert!(d.m.wants_lobby().is_none() && d.m.is_open());
+        // 「もどる」とキャンセルは指示を出さずに入口のメニューへ。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        for _ in 0..4 {
+            d.tap(DOWN);
+        }
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![]);
+        assert!(d.m.wants_lobby().is_none() && d.m.is_active());
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        d.tap(X);
+        assert_eq!(d.cmds, vec![]);
+        assert!(d.m.wants_lobby().is_none() && d.m.is_active());
+    }
+
+    #[test]
+    fn a_play_lobby_greys_full_and_unwatchable_matches_and_the_key_line_follows_the_cursor() {
+        let rows = [
+            wait_row(1, "Alice"),
+            play_row(2, "Full-A", "Full-B", 10, 10, true),
+            play_row(3, "No-A", "No-B", 0, 10, false),
+            play_row(4, "Open-A", "Open-B", 2, 10, true),
+        ];
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        let t = d.text();
+        assert_eq!(
+            t[3],
+            format!("  {}", nowatch_line("No-A", "No-B", Lang::Ja))
+        );
+        let r = d.rows();
+        assert_eq!(
+            r.styles[1..7],
+            [
+                RowStyle::Selected,
+                RowStyle::Hint,
+                RowStyle::Hint,
+                RowStyle::Normal,
+                RowStyle::GapMedium,
+                RowStyle::Normal
+            ]
+        );
+        assert_eq!(*t.last().unwrap(), T_KEYS_LOBBY_JOIN.ja);
+        // 灰色の2行を飛ばす。キーの行は試合中の行 → 作成 → もどるの順で替わる。
+        d.tap(DOWN);
+        assert_eq!(
+            d.marked(),
+            [format!(
+                "> {}",
+                row_line(&wrow(4, "Open-A", "Open-B", 2, 10))
+            )]
+        );
+        assert_eq!(*d.text().last().unwrap(), T_KEYS_WATCH.ja);
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        assert_eq!(*d.text().last().unwrap(), T_KEYS_LOBBY_CREATE.ja);
+        d.tap(DOWN);
+        assert_eq!(d.marked(), d.at_back());
+        assert_eq!(*d.text().last().unwrap(), T_KEYS_LOBBY_BACK.ja);
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [format!("> {}", wait_line("Alice", Lang::Ja))]);
+        d.tap(UP);
+        assert_eq!(d.marked(), d.at_back(), "↑ も灰色を飛ばして折り返す");
+        d.tap(UP);
+        d.tap(UP);
+        d.tap(UP);
+        assert_eq!(d.marked(), [format!("> {}", wait_line("Alice", Lang::Ja))]);
+        assert_eq!(d.cmds, vec![]);
+        // 英語。
+        let e = LobbyDriver::with(LobbyKind::Play, Lang::En, &rows);
+        let t = e.text();
+        assert_eq!(t[0], "Room match ─ abc");
+        assert_eq!(t[1], format!("> {}", wait_line("Alice", Lang::En)));
+        assert!(t[1].ends_with("Waiting"), "{t:?}");
+        assert_eq!(
+            t[3],
+            format!("  {}", nowatch_line("No-A", "No-B", Lang::En))
+        );
+        assert!(t[3].ends_with("No watching"), "{t:?}");
+        assert_eq!(t[6], "  Host a match");
+        assert_eq!(*t.last().unwrap(), "↑↓ Move   Confirm: Play   Cancel: Back");
+    }
+
+    #[test]
+    fn the_row_of_the_room_i_am_waiting_in_is_grey_with_my_name_and_cannot_be_joined() {
+        let rows = [
+            wait_row(1, "Me"),
+            wait_row(2, "Bob"),
+            play_row(3, "Open-A", "Open-B", 2, 10, true),
+        ];
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        d.m.set_own_lobby(Some(lroom(1)));
+        d.tap(0);
+        let t = d.text();
+        assert_eq!(t[1], format!("  {}", wait_line("Me", Lang::Ja)));
+        let r = d.rows();
+        assert_eq!(
+            r.styles[1..4],
+            [RowStyle::Hint, RowStyle::Selected, RowStyle::Normal],
+            "自分の行は灰色・カーソルは次の待機中の行"
+        );
+        // ↓ も ↑ も自分の行へ止まらない。
+        let bob = format!("> {}", wait_line("Bob", Lang::Ja));
+        for _ in 0..3 {
+            d.tap(DOWN);
+        }
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [bob], "もどるの次は Bob（自分の行を飛ばす）");
+        d.tap(UP);
+        assert_eq!(d.marked(), d.at_back(), "↑ も自分の行を飛ばす");
+        d.tap(DOWN);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyJoin(abc(), lroom(2))]);
+
+        // カーソルが自分の行に残っていても決定は何も出さない。画面も出ない。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows[..2]);
+        // 動かした後は行の中身で覚えるので自分の行だと分かってもカーソルは残る。
+        d.tap(DOWN);
+        d.tap(UP);
+        assert_eq!(
+            d.marked(),
+            [format!("> {}", wait_line("Me", Lang::Ja))],
+            "前提: 自分の行にカーソルがある"
+        );
+        d.m.set_own_lobby(Some(lroom(1)));
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![]);
+        assert!(d.m.wants_lobby().is_some());
+
+        // 自分の行だけならカーソルは「対戦を募集する」から始まる。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows[..1]);
+        d.m.set_own_lobby(Some(lroom(1)));
+        d.tap(0);
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyCreate(abc())]);
+    }
+
+    #[test]
+    fn without_a_room_of_mine_in_the_list_every_waiting_row_stays_selectable() {
+        let rows = [wait_row(1, "Alice"), wait_row(2, "Bob")];
+        for own in [None, Some(lroom(9))] {
+            let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+            d.m.set_own_lobby(own);
+            d.tap(0);
+            let r = d.rows();
+            assert_eq!(r.styles[1..3], [RowStyle::Selected, RowStyle::Normal]);
+            d.tap(Z);
+            assert_eq!(d.cmds, vec![Cmd::LobbyJoin(abc(), lroom(1))], "{own:?}");
+        }
+    }
+
+    #[test]
+    fn a_watch_lobby_has_no_create_and_skips_waiting_unwatchable_and_full_rows() {
+        let rows = [
+            wait_row(1, "Alice"),
+            wait_row(2, "Bob"),
+            play_row(3, "Open-A", "Open-B", 2, 10, true),
+            play_row(4, "Full-A", "Full-B", 10, 10, true),
+            play_row(5, "No-A", "No-B", 0, 10, false),
+            play_row(6, "Open-C", "Open-D", 0, 10, true),
+        ];
+        let mut d = LobbyDriver::with(LobbyKind::Watch, Lang::Ja, &rows);
+        let t = d.text();
+        assert_eq!(
+            t[0],
+            format!(
+                "{}{}{}{}abc",
+                T_SPECTATE.ja, T_WATCH_DASH.ja, T_ROOM.ja, T_WATCH_DASH.ja
+            )
+        );
+        assert_eq!(
+            t[1],
+            format!("  {}", wait_line("Alice", Lang::Ja)),
+            "待機中の行は出す"
+        );
+        assert!(!t.iter().any(|l| l.contains(T_LOBBY_CREATE.ja)), "{t:?}");
+        let r = d.rows();
+        assert_eq!(
+            r.styles[1..7],
+            [
+                RowStyle::Hint,
+                RowStyle::Hint,
+                RowStyle::Selected,
+                RowStyle::Hint,
+                RowStyle::Hint,
+                RowStyle::Normal
+            ],
+            "待機中・満員・観戦不可は灰色。選べる最初の行にカーソル"
+        );
+        assert_eq!(
+            d.marked(),
+            [format!(
+                "> {}",
+                row_line(&wrow(3, "Open-A", "Open-B", 2, 10))
+            )]
+        );
+        d.tap(DOWN);
+        assert_eq!(
+            d.marked(),
+            [format!(
+                "> {}",
+                row_line(&wrow(6, "Open-C", "Open-D", 0, 10))
+            )]
+        );
+        d.tap(DOWN);
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(DOWN);
+        assert_eq!(
+            d.marked(),
+            [format!(
+                "> {}",
+                row_line(&wrow(3, "Open-A", "Open-B", 2, 10))
+            )],
+            "折り返しで待機中の行に止まらない"
+        );
+        d.tap(UP);
+        assert_eq!(d.marked(), d.at_back());
+        assert_eq!(d.cmds, vec![]);
+        d.tap(UP);
+        d.tap(Z);
+        assert_eq!(
+            d.cmds,
+            vec![Cmd::SpectateListed(wrow(6, "Open-C", "Open-D", 0, 10))]
+        );
+        // 選べる試合中の行が無い（全部満員か観戦不可）ならカーソルは「もどる」にある。決定しても観戦しない。
+        let only_grey = [
+            wait_row(1, "Alice"),
+            play_row(4, "Full-A", "Full-B", 10, 10, true),
+            play_row(5, "No-A", "No-B", 0, 10, false),
+        ];
+        let mut d = LobbyDriver::with(LobbyKind::Watch, Lang::Ja, &only_grey);
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![]);
+        assert!(d.m.wants_lobby().is_none());
+    }
+
+    #[test]
+    fn a_watch_lobby_without_a_match_says_so_hides_waiting_rows_and_never_creates() {
+        for lang in Lang::ALL {
+            for rows in [vec![], vec![wait_row(1, "Alice"), wait_row(2, "Bob")]] {
+                let mut d = LobbyDriver::with(LobbyKind::Watch, lang, &rows);
+                let t = d.text();
+                let msg = format!(
+                    "  {}abc{}",
+                    T_LOBBY_NONE_OPEN.get(lang),
+                    T_LOBBY_NONE_CLOSE.get(lang)
+                );
+                assert_eq!(t[1], msg, "{lang:?} {}", rows.len());
+                assert_eq!(d.rows().styles[1], RowStyle::Hint);
+                assert_eq!(t.len(), 6, "待機中の行を出さない: {t:?}");
+                assert_eq!(d.marked(), [format!("> {}", T_BACK.get(lang))]);
+                d.tap(0);
+                assert_eq!(d.cmds, vec![], "ルームを作った");
+                assert!(d.m.wants_lobby().is_some());
+                // 試合中のペアが現れたら行を出す（待機中の行も一緒に）。
+                let mut with_play = rows.clone();
+                with_play.push(play_row(3, "Open-A", "Open-B", 0, 10, true));
+                d.feed(ListStatus::Ready, &with_play);
+                let t = d.text();
+                assert!(!t.iter().any(|l| l.contains(&msg[2..])), "{t:?}");
+                assert!(t.iter().any(|l| l.contains("Open-A")), "{t:?}");
+                d.tap(DOWN);
+                d.tap(DOWN);
+                d.tap(Z);
+                assert_eq!(
+                    d.cmds,
+                    vec![Cmd::SpectateListed(wrow(3, "Open-A", "Open-B", 0, 10))]
+                );
+            }
+        }
+        let d = LobbyDriver::with(LobbyKind::Watch, Lang::En, &[]);
+        assert_eq!(
+            d.text()[1],
+            "  No matches are being played in room \"abc\"."
+        );
+    }
+
+    #[test]
+    fn the_lobby_cursor_follows_the_row_content_when_the_list_changes() {
+        let (w1, p2, w3, p4) = (
+            wait_row(1, "Alice"),
+            play_row(2, "P1", "P2", 0, 10, true),
+            wait_row(3, "Bob"),
+            play_row(4, "P3", "P4", 0, 10, true),
+        );
+        let line = |r: &LobbyRow| match r {
+            LobbyRow::Wait(w) => wait_line(w.name.as_str(), Lang::Ja),
+            LobbyRow::Play(p) => row_line(&p.row),
+        };
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[w1, p2, w3, p4]);
+        d.tap(DOWN);
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [format!("> {}", line(&w3))]);
+        // 上の行が消えても同じ待機中の行（番号は2 → 1）。
+        d.feed(ListStatus::Ready, &[p2, w3, p4]);
+        assert_eq!(d.marked(), [format!("> {}", line(&w3))]);
+        // 先頭に新しい行が割り込んでも同じ。
+        let fresh = wait_row(9, "New");
+        d.feed(ListStatus::Ready, &[fresh, p2, w3, p4]);
+        assert_eq!(d.marked(), [format!("> {}", line(&w3))]);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyJoin(abc(), lroom(3))]);
+        // 試合中の行も中身で覚える。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[w1, p2, w3, p4]);
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [format!("> {}", line(&p2))]);
+        d.feed(ListStatus::Ready, &[fresh, w1, p2, w3, p4]);
+        assert_eq!(d.marked(), [format!("> {}", line(&p2))]);
+        // 選んでいた行が消えたら別の行を指したままにせず選べる最初の行へ戻る。
+        d.feed(ListStatus::Ready, &[fresh, w1, w3, p4]);
+        assert_eq!(d.marked(), [format!("> {}", line(&fresh))]);
+        // 動かしていない間は選べる最初の行を指し続ける。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[w1]);
+        d.feed(ListStatus::Ready, &[fresh, w1]);
+        assert_eq!(d.marked(), [format!("> {}", line(&fresh))]);
+        // 「対戦を募集する」「もどる」に動かしたら一覧が変わってもそこに留まる。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[w1, p2]);
+        d.tap(UP);
+        assert_eq!(d.marked(), d.at_back());
+        d.feed(ListStatus::Ready, &[fresh, w1, p2]);
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(UP);
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        d.feed(ListStatus::Ready, &[fresh, w1, p2, w3]);
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyCreate(abc())]);
+    }
+
+    #[test]
+    fn a_row_that_fills_up_under_the_lobby_cursor_cannot_be_decided() {
+        let ok = play_row(2, "Open-A", "Open-B", 9, 10, true);
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[wait_row(1, "Alice"), ok]);
+        d.tap(DOWN);
+        let full = play_row(2, "Open-A", "Open-B", 10, 10, true);
+        d.feed(ListStatus::Ready, &[wait_row(1, "Alice"), full]);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![], "満員になった行を観戦する指示が出た");
+        assert!(d.m.wants_lobby().is_some());
+    }
+
+    #[test]
+    fn returning_to_the_lobby_shows_a_warning_until_the_cursor_moves_or_the_screen_ends() {
+        let rows = [wait_row(1, "Alice"), wait_row(3, "Bob")];
+        let gone = format!("  {}", T_LOBBY_GONE.ja);
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![Cmd::LobbyJoin(abc(), lroom(1))]);
+        assert!(d.m.wants_lobby().is_none());
+        d.m.return_to_lobby();
+        assert_eq!(
+            d.m.wants_lobby(),
+            Some((abc(), LobbyKind::Play)),
+            "ルーム名を覚えている"
+        );
+        let t = d.text();
+        assert_eq!(t[0], format!("{}{}abc", T_ROOM.ja, T_WATCH_DASH.ja));
+        assert_eq!(t[1], gone);
+        assert_eq!(d.rows().styles[1], RowStyle::Warn);
+        // 何もしなければ残る。
+        d.tap(0);
+        assert_eq!(d.text()[1], gone);
+        // 戻った後に一覧が空になっても作らない（一覧を見せる）。
+        d.feed(ListStatus::Ready, &[]);
+        assert_eq!(d.cmds.len(), 1, "戻った後に作った");
+        assert!(d.text().contains(&format!("> {}", T_LOBBY_CREATE.ja)));
+        d.feed(ListStatus::Ready, &rows);
+        // カーソルを動かすと消える。
+        d.tap(DOWN);
+        assert_ne!(d.text()[1], gone);
+        assert_eq!(d.text().len(), 8, "{:?}", d.text());
+        // 画面を出たら消える（次に戻ったときの警告は新しい）。
+        d.m.return_to_lobby();
+        assert!(!d.m.lobby_gone, "一覧の画面にいる間は何も変えない");
+        d.tap(X);
+        assert!(!d.m.lobby_gone && d.m.wants_lobby().is_none());
+        // 英語。
+        let mut e = LobbyDriver::with(LobbyKind::Play, Lang::En, &rows);
+        e.tap(Z);
+        e.m.return_to_lobby();
+        assert_eq!(e.text()[1], "  That player is no longer waiting.");
+    }
+
+    #[test]
+    fn return_to_lobby_does_nothing_outside_the_open_menu_after_a_lobby_entry() {
+        let mut m = Menu::new(ini()).with_lobby(true);
+        m.return_to_lobby();
+        assert!(
+            m.wants_lobby().is_none() && !m.is_active(),
+            "閉じているメニューを開いた"
+        );
+        m.open(0);
+        m.return_to_lobby();
+        assert!(
+            m.wants_lobby().is_none(),
+            "一覧に入っていないのに画面が出た"
+        );
+        // 一覧を使わない呼び手では効かない。
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[wait_row(1, "Alice")]);
+        d.tap(Z);
+        d.m = d.m.with_lobby(false);
+        d.m.return_to_lobby();
+        assert!(d.m.wants_lobby().is_none());
+    }
+
+    #[test]
+    fn a_lobby_of_twenty_rows_scrolls_eight_at_a_time_with_more_lines_above_and_below() {
+        let rows: Vec<LobbyRow> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    wait_row(i + 1, &format!("W{i}"))
+                } else {
+                    play_row(i + 1, &format!("P{i}"), "Q", 0, 10, true)
+                }
+            })
+            .collect();
+        assert_eq!(rows.len(), crate::lobby::LOBBY_ROWS_MAX);
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows);
+        let first_name = |t: &[String]| t[2][2..].split_whitespace().next().unwrap().to_string();
+        let t = d.text();
+        assert_eq!(t[1], "", "先頭では上の行は空");
+        assert_eq!(first_name(&t), "W0");
+        assert_eq!(t[10], "  ▼ ほか 12 件", "{t:?}");
+        let len = d.rows().len;
+        for _ in 0..8 {
+            d.tap(DOWN);
+        }
+        let t = d.text();
+        assert_eq!(first_name(&t), "P1");
+        assert_eq!(t[1], "  ▲ ほか 1 件");
+        assert_eq!(t[10], "  ▼ ほか 11 件");
+        assert_eq!(d.rows().len, len, "スクロールしても枠の高さが変わらない");
+        // 最後の行を越えて「対戦を募集する」へ。最後の行が見える。
+        for _ in 0..12 {
+            d.tap(DOWN);
+        }
+        assert_eq!(d.marked(), [format!("> {}", T_LOBBY_CREATE.ja)]);
+        let t = d.text();
+        assert_eq!(t[1], "  ▲ ほか 12 件");
+        assert_eq!(t[10], "");
+        assert!(t[9].contains("Q"), "最後の行が見える: {t:?}");
+        d.tap(DOWN);
+        assert_eq!(d.marked(), d.at_back());
+        d.tap(DOWN);
+        assert_eq!(d.marked(), [format!("> {}", wait_line("W0", Lang::Ja))]);
+        assert_eq!(d.text()[1], "");
+        // 8行以下なら「ほか」の行は出ない。
+        let d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &rows[..8]);
+        assert!(!d.text().iter().any(|l| l.contains("ほか")));
+        assert_eq!(d.rows().len, len - 2);
+        // 英語。
+        let mut e = LobbyDriver::with(LobbyKind::Play, Lang::En, &rows);
+        assert_eq!(e.text()[10], "  ▼ 12 more");
+        e.tap(UP);
+        e.tap(UP);
+        assert_eq!(e.text()[1], "  ▲ 12 more");
+    }
+
+    #[test]
+    fn the_lobby_screen_ends_when_the_link_is_made() {
+        let mut d = LobbyDriver::with(LobbyKind::Play, Lang::Ja, &[wait_row(1, "Alice")]);
+        d.conn = connected();
+        d.tap(Z);
+        assert_eq!(d.cmds, vec![], "つながった後に指示が出た");
+        assert!(d.m.wants_lobby().is_none());
+    }
+
+    #[test]
+    fn without_with_lobby_the_room_decision_sends_the_old_commands_immediately() {
+        // 設定済みのルーム名（iniの`room`）で決定する。
+        let mut m = Menu::new(ini()).with_room(RoomItem::On(abc()));
+        m.open(0);
+        let mut cmds = Vec::new();
+        for (downs, want) in [(1, Cmd::Room(abc())), (4, Cmd::Spectate(abc()))] {
+            for key in std::iter::repeat_n(DOWN, downs).chain([Z]) {
+                for w in [key, 0] {
+                    cmds.extend(m.tick(&input(w, quiet(), Conn::Waiting)).cmd);
+                }
+            }
+            assert_eq!(cmds.last(), Some(&want));
+            assert!(m.wants_lobby().is_none());
+            m.open(0);
+        }
+        // 入力で決定する。
+        let mut d = Driver::open_room_input();
+        d.idle(2);
+        let out = d.tick_text(0, &format!("abc{ENTER}"));
+        assert_eq!(out.cmd, Some(Cmd::Room(abc())));
+        assert!(d.m.wants_lobby().is_none());
+    }
+
+    #[test]
+    fn a_typed_room_name_opens_the_lobby_and_the_held_enter_does_not_decide_a_row() {
+        for (kind, for_) in [
+            (LobbyKind::Play, EditFor::Wait),
+            (LobbyKind::Watch, EditFor::Spectate),
+        ] {
+            let mut d = Driver::new();
+            d.m = Menu::new(ini())
+                .with_room(RoomItem::On(RoomBuf::new()))
+                .with_lobby(true);
+            d.m.open(0);
+            d.cursor_to(if for_ == EditFor::Wait {
+                Item::Room
+            } else {
+                Item::Spectate
+            });
+            d.tap(Z);
+            assert!(d.m.wants_text());
+            d.idle(2);
+            let out = d.tick_text(0, &format!("abc{ENTER}"));
+            assert_eq!(out.cmd, None, "一覧を使うときは決定がすぐ指示にならない");
+            assert_eq!(d.m.wants_lobby(), Some((abc(), kind)));
+            assert!(out.hold_game);
+            // 遅れて立ち上がった決定のワードが最初の「もどる」を決定しない。
+            let w = LobbySnapshot::EMPTY;
+            for _ in 0..3 {
+                let o =
+                    d.m.tick_with(&input(Z, quiet(), Conn::Waiting), &WatchSnapshot::EMPTY, &w);
+                assert_eq!(o.cmd, None);
+                assert!(
+                    d.m.wants_lobby().is_some(),
+                    "{kind:?}: 押したままのEnterで一覧を出た"
+                );
+            }
+            // 離すと一覧が操作できる。
+            d.m.tick_with(&input(0, quiet(), Conn::Waiting), &WatchSnapshot::EMPTY, &w);
+            d.m.tick_with(&input(X, quiet(), Conn::Waiting), &WatchSnapshot::EMPTY, &w);
+            assert!(d.m.wants_lobby().is_none() && d.m.is_active());
+            // 次に同じ項目を決定すると入力は前に打った名で始まる（一覧の使用有無に関わらず覚える）。
+            d.idle(2);
+            d.cursor_to(Item::RoomName);
+            d.tap(Z);
+            assert_eq!(d.input_line(), "ルーム名: abc|");
+        }
+    }
+
+    #[test]
+    fn every_lobby_screen_row_fits_the_box_and_the_screen() {
+        let spec = AtlasSpec::fit(7, 14, &ui_glyphs()).unwrap();
+        let game = game_font_spec("");
+        let limit = 640
+            - 2 * crate::ui_layout::SCREEN_MARGIN
+            - 2 * (crate::ui_layout::BOX_MARGIN + crate::ui_layout::BORDER);
+        let longest = "W".repeat(32);
+        let rows: Vec<LobbyRow> = (0..crate::lobby::LOBBY_ROWS_MAX as u8)
+            .map(|i| match i % 3 {
+                0 => wait_row(i + 1, &longest),
+                1 => play_row(i + 1, &longest, &longest, 10, 10, true),
+                _ => play_row(i + 1, &longest, &longest, 0, 10, false),
+            })
+            .collect();
+        let long_room = RoomBuf::from_name(&"W".repeat(32)).unwrap();
+        let mut tallest = 0;
+        for lang in Lang::ALL {
+            for kind in [LobbyKind::Play, LobbyKind::Watch] {
+                for (status, list) in [
+                    (ListStatus::Ready, &rows[..]),
+                    (ListStatus::Ready, &rows[..3]),
+                    (ListStatus::Ready, &rows[..0]),
+                    (ListStatus::Loading, &rows[..0]),
+                    (ListStatus::Failed, &rows[..0]),
+                ] {
+                    for warn in [false, true] {
+                        let mut d = LobbyDriver::open(kind, lang);
+                        d.m.lobby_name = long_room;
+                        d.feed(status, list);
+                        if warn {
+                            d.m.lobby_gone = true;
+                        }
+                        for step in 0..8 {
+                            let r = d.rows();
+                            assert!(r.len <= MENU_ROWS);
+                            tallest = tallest
+                                .max(crate::ui_layout::rows_height(&spec, &r.styles[..r.len]));
+                            for l in &r.lines[..r.len] {
+                                assert!(l.as_str().chars().count() <= crate::overlay::MAX_TEXT);
+                                for s in [&spec, &game] {
+                                    let w = crate::ui_layout::text_width(s, l.as_str());
+                                    assert!(
+                                        w <= limit,
+                                        "{lang:?} {kind:?} {step}: {w} 画素 > {limit}: {}",
+                                        l.as_str()
+                                    );
+                                }
+                            }
+                            d.tap(DOWN);
+                        }
+                    }
                 }
             }
         }

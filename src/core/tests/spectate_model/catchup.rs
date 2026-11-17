@@ -7,10 +7,17 @@
 
 use super::*;
 use higanr_core::spectate_pace::{
-    FF_ENTER_FRAMES, FF_EXIT_FRAMES, FF_MAX_EXTRA, FF_UPDATES_DEFAULT, FF_UPDATES_MAX, Pace,
+    FF_ENTER_FRAMES, FF_EXIT_FRAMES, FF_FPS_DEFAULT, FF_GRID_FPS, FF_UPDATES_MAX, Pace,
+    join_updates,
 };
 
 /// 観戦者の余裕（dllの`WATCH_MARGIN_FRAMES`）と、マッチの1フレーム目の前に観戦者が余裕を待つ上限（`START_HOLD_TICKS`）。
+/// 旧の早送りが1表示に余分に回す更新の数の上限。
+const OLD_MAX_EXTRA: u32 = 16;
+/// 1表示に使った記録の数の度数の長さ（旧の17回と16倍の早送りまで。それを越えた表示は数えない）。
+const HIST_LEN: usize = 18;
+/// ホストの追いつきの送信の上限（JOINの1表示あたりの更新の数の最大）に当たる`ff_fps`。
+pub(super) const FF_FPS_HOST_CAP: u32 = FF_UPDATES_MAX * FF_GRID_FPS;
 const MARGIN: u32 = 3;
 const START_HOLD: u32 = 30;
 /// 追いついたと見る遅れ: 観戦者が使う記録が積まれてから 片道 ＋ これ 以内。
@@ -41,17 +48,17 @@ pub(super) struct Display {
     pub refill_displays: u64,
     pub caught_up_at: Option<u32>,
     /// 追いつくまでの表示ごとに使った記録の数（1 = 普段の速さ）の度数。
-    pub speed_hist: [u64; FF_MAX_EXTRA as usize + 2],
+    pub speed_hist: [u64; HIST_LEN],
 }
 
 impl Display {
-    pub(super) fn new(policy: Policy, one_way: u32, ff_max: u32) -> Display {
+    pub(super) fn new(policy: Policy, one_way: u32, ff_fps: u32) -> Display {
         Display {
             policy,
             one_way,
             t0: None,
             n: 0,
-            pace: Pace::with_updates(ff_max),
+            pace: Pace::with_fps(ff_fps),
             old_active: false,
             last_ack: None,
             started: false,
@@ -61,7 +68,7 @@ impl Display {
             stall_displays: 0,
             refill_displays: 0,
             caught_up_at: None,
-            speed_hist: [0; FF_MAX_EXTRA as usize + 2],
+            speed_hist: [0; HIST_LEN],
         }
     }
 
@@ -95,7 +102,7 @@ impl Display {
             self.old_active = false;
             return 0;
         }
-        let n = FF_MAX_EXTRA.min(backlog - FF_EXIT_FRAMES);
+        let n = OLD_MAX_EXTRA.min(backlog - FF_EXIT_FRAMES);
         self.old_active = backlog - n > FF_EXIT_FRAMES;
         n
     }
@@ -179,8 +186,8 @@ pub(super) struct Case {
     pub late_s: u32,
     pub watchers: u16,
     pub policy: Policy,
-    /// 観戦者の早送りの速さ（1表示あたりの更新の数。iniの`ff_max`）。`Old`は17回で固定。
-    pub ff_max: u32,
+    /// 観戦者の早送りの速さ（毎秒の更新の数。iniの`ff_fps`）。`Old`は1表示17回で固定。
+    pub ff_fps: u32,
     pub seed: u64,
     /// 追いつかないときに打ち切るまでの秒数（入ってから数える）。
     pub limit_s: u32,
@@ -203,7 +210,7 @@ pub(super) struct Outcome {
     pub stall_displays: u64,
     pub refill_displays: u64,
     /// 追いつくまでの表示で使った記録の数（添字）ごとの度数。
-    pub hist: [u64; FF_MAX_EXTRA as usize + 2],
+    pub hist: [u64; HIST_LEN],
 }
 
 pub(super) fn run(c: Case) -> Outcome {
@@ -222,8 +229,8 @@ pub(super) fn run(c: Case) -> Outcome {
         sim.add_watcher(n, start, 0, ASM_CAP);
         let w = sim.watchers.last_mut().expect("足した");
         // dllの観戦者と同じくJOINに早送りの速さを載せる（ホストがこの観戦者へ追いつきの送信をする上限）。
-        w.w.set_ff_max(c.ff_max);
-        w.display = Some(Box::new(Display::new(c.policy, one_way, c.ff_max)));
+        w.w.set_ff_max(u32::from(join_updates(c.ff_fps)));
+        w.display = Some(Box::new(Display::new(c.policy, one_way, c.ff_fps)));
     }
     let end = start + c.limit_s * 1_000;
     let mut done_at: Option<u32> = None;
@@ -243,7 +250,7 @@ pub(super) fn run(c: Case) -> Outcome {
         }
     }
     let mut o = Outcome::default();
-    let mut hist = [0u64; FF_MAX_EXTRA as usize + 2];
+    let mut hist = [0u64; HIST_LEN];
     o.catchup_ms = Some(0);
     for w in &sim.watchers {
         // 使った列はホストが積んだ列の頭からの続きと一致する（追いつきの途中で打ち切っても使った所まで）。
@@ -296,7 +303,7 @@ struct Row {
     freezes: u32,
     stall_displays: u64,
     refill_displays: u64,
-    hist: [u64; FF_MAX_EXTRA as usize + 2],
+    hist: [u64; HIST_LEN],
 }
 
 pub(super) const MEASURE_SEEDS: [u64; 3] = [0x5EED_C47C, 0x0BAD_F00D, 0x1357_9BDF];
@@ -314,7 +321,7 @@ fn measure(c: Case) -> Row {
         freezes: 0,
         stall_displays: 0,
         refill_displays: 0,
-        hist: [0; FF_MAX_EXTRA as usize + 2],
+        hist: [0; HIST_LEN],
     };
     for seed in MEASURE_SEEDS {
         let o = run(Case { seed, ..c });
@@ -408,7 +415,7 @@ fn measure_a_late_spectators_catchup_by_round_trip_and_loss() {
                 late_s: 135,
                 watchers,
                 policy,
-                ff_max: FF_UPDATES_DEFAULT,
+                ff_fps: FF_FPS_DEFAULT,
                 seed: 0,
                 limit_s: 400,
             };
@@ -427,7 +434,7 @@ fn a_late_spectator_on_a_300ms_line_gets_few_duplicates_and_does_not_freeze() {
         late_s: 60,
         watchers: 1,
         policy: Policy::Pace,
-        ff_max: FF_UPDATES_DEFAULT,
+        ff_fps: FF_FPS_DEFAULT,
         seed: 0,
         limit_s: 120,
     };
@@ -448,7 +455,7 @@ fn a_late_spectator_on_a_300ms_line_gets_few_duplicates_and_does_not_freeze() {
     );
 }
 
-/// 往復600 ms・`ff_max` 16の観戦者: 届く速さ（ウィンドウ ÷ 往復 ≒ 1表示に14記録）が早送りの最大より遅い回線で、`Pace`は往復ごとのまとまりで止まらない。
+/// 往復600 ms・`ff_fps` 960の観戦者: 届く速さ（ウィンドウ ÷ 往復 ≒ 1表示に14記録）が早送りの最大より遅い回線では`Pace`は往復ごとのまとまりで止まらない。
 /// 比べるために旧の早送り（溜まりが閾値を越えたら最大の速さ）を同じ回線で回し、止まりが1桁以上少ないことを見る。
 #[test]
 fn on_a_window_limited_600ms_line_pace_freezes_far_less_than_the_old_fast_forward() {
@@ -458,7 +465,7 @@ fn on_a_window_limited_600ms_line_pace_freezes_far_less_than_the_old_fast_forwar
         late_s: 135,
         watchers: 1,
         policy,
-        ff_max: FF_UPDATES_MAX,
+        ff_fps: FF_FPS_HOST_CAP,
         seed: 0,
         limit_s: 120,
     };
@@ -497,49 +504,51 @@ impl Row {
     }
 }
 
-/// 往復30 msで遅れて入った観戦者は早送りの最大の速さ（1表示に`ff_max`記録）で追いつく。
-/// 遅れL秒を、ホストが積む速さ（1表示に約1記録）を引いた（`ff_max` − 1）記録 / 表示で詰める時間を求める。その時間に2割と0.5秒の余白を足した値を上限にする。
+/// 往復30 msで遅れて入った観戦者は早送りの最大の速さ（1表示に`ff_fps` ÷ 60記録）で追いつく。
+/// 遅れL秒を詰める時間はホストが積む速さ（1表示に約1記録）を引いた記録 / 表示で求める。その時間に2割と0.5秒の余白を足した値を上限にする。
+/// ホストの追いつきの送信の上限は16倍相当。それを越える`ff_fps`は16倍の速さで見る。
 #[test]
-fn a_late_spectator_on_a_30ms_line_catches_up_at_the_top_speed_of_ff_max() {
+fn a_late_spectator_on_a_30ms_line_catches_up_at_the_top_speed_of_ff_fps() {
     let late_s = 30;
-    for ff_max in [FF_UPDATES_DEFAULT, FF_UPDATES_MAX] {
+    for ff_fps in [FF_FPS_DEFAULT, 500, FF_FPS_HOST_CAP, 6_000] {
         let c = Case {
             rtt: 30,
             loss: 0,
             late_s,
             watchers: 1,
             policy: Policy::Pace,
-            ff_max,
+            ff_fps,
             seed: 0,
             limit_s: 60,
         };
         let r = measure(c);
-        eprintln!("ff_max {ff_max}: {}", row(c, &r));
+        eprintln!("ff_fps {ff_fps}: {}", row(c, &r));
         let lag_records = f64::from(late_s) * 1000.0 / 16.0;
-        let ideal_ms = lag_records / f64::from(ff_max - 1) * 1000.0 / 60.0;
+        let top = f64::from(ff_fps.min(FF_FPS_HOST_CAP)) / f64::from(FF_GRID_FPS);
+        let ideal_ms = lag_records / (top - 1.0) * 1000.0 / 60.0;
         for m in &r.catchup {
             let m = f64::from(m.expect("追いつかない"));
             assert!(
                 m <= ideal_ms * 1.2 + 500.0,
-                "ff_max {ff_max}: 追いつくまで {m} ms（最大の速さで {ideal_ms:.0} ms）"
+                "ff_fps {ff_fps}: 追いつくまで {m} ms（最大の速さで {ideal_ms:.0} ms）"
             );
         }
     }
 }
 
-/// 往復290 ms・30秒遅れて入った観戦者が、既定の`ff_max` 8で平均7倍以上（追いつくまでの表示1回あたりに使った記録の数の平均）で追いつく。
+/// 往復290 ms・30秒遅れて入った観戦者が既定の`ff_fps` 480で平均7倍以上（追いつくまでの表示1回あたりに使った記録の数の平均）で追いつく。
 /// 先送りが往復で切れる（64記録 ÷ 0.29 s ≒ 3.7倍）と届かない。
 /// 最初のACKまで1往復待つので待たない場合の7.5倍よりわずかに低い。
 #[test]
-fn a_30s_late_spectator_on_a_290ms_line_averages_7x_or_more_at_ff_max_8() {
-    assert_eq!(FF_UPDATES_DEFAULT, 8, "この検査の前提は既定の 8");
+fn a_30s_late_spectator_on_a_290ms_line_averages_7x_or_more_at_ff_fps_480() {
+    assert_eq!(FF_FPS_DEFAULT, 480, "この検査の前提は既定の 480");
     let c = Case {
         rtt: 290,
         loss: 0,
         late_s: 30,
         watchers: 1,
         policy: Policy::Pace,
-        ff_max: FF_UPDATES_DEFAULT,
+        ff_fps: FF_FPS_DEFAULT,
         seed: 0,
         limit_s: 60,
     };

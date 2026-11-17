@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use crate::ini::Ini;
+use crate::input_model::keys;
 use crate::pacing_hybrid::{HYBRID_KEYS, HybridParams};
 
 /// 1秒あたりのフレーム数の既定（花映塚の `[0x490278]` = 1/60）。iniに`fps`が無ければこれ。
@@ -208,7 +209,16 @@ pub fn us_to_ticks_ceil(us: u64, qpf: u64) -> u64 {
 
 pub const SECTION: &str = "pacing";
 /// カテゴリの中で読むキー（これと`pacing_hybrid::HYBRID_KEYS`の`hybrid_*`以外は断る。綴りの誤りで既定のまま走らないように）。
-const KEYS: [&str; 6] = ["mode", "fps", "cycle_secs", "cycle_phases", "wait", "vsync"];
+const KEYS: [&str; 8] = [
+    "mode",
+    "fps",
+    "cycle_secs",
+    "cycle_phases",
+    "wait",
+    "vsync",
+    "replay_skip_fps",
+    "replay_slow_fps",
+];
 
 /// `mode = cycle`の1区間の長さ（秒）の既定。6分のマッチなら1方式あたり4区間になる。
 pub const DEFAULT_CYCLE_SECS: u64 = 30;
@@ -272,6 +282,12 @@ impl Mode {
     /// DLLがゲームの`0x0042DC44`に始まりのcallを書くかどうか。gameだけが書かない（autoはフルスクリーンのフレームでも書いたまま、始まりの入口がゲーム自身の経路へ任せる）。
     pub fn uses_head(self) -> bool {
         self != Mode::Game
+    }
+
+    /// リプレイ再生中の速さ（`replay_skip_fps` / `replay_slow_fps`）を変える形かどうか。自分の格子でペースを刻むwait系の形とauto。
+    /// game（Pacerが無い）とcycle・vpatch（測定用）は変えない。
+    pub fn paces_replay(self) -> bool {
+        matches!(self, Mode::Auto | Mode::B | Mode::BSpin | Mode::BHybrid)
     }
 
     pub fn fixed_phase(self) -> Option<Phase> {
@@ -599,6 +615,93 @@ impl Cycle {
     }
 }
 
+/// `replay_skip_fps` / `replay_slow_fps`の既定。vpatchの`ReplaySkipFPS`（240）・`ReplaySlowFPS`（30）と同じ。
+pub const DEFAULT_REPLAY_SKIP_FPS: u64 = 240;
+pub const DEFAULT_REPLAY_SLOW_FPS: u64 = 30;
+/// `replay_skip_fps`の上限。vpatch.iniの`ReplaySkipFPS`で使われている値（6000）に合わせた。
+pub const MAX_REPLAY_SKIP_FPS: u64 = 6_000;
+/// リプレイ再生中のグローバル状態`0x004A7EC4`の下位バイト。タイトルのデモ（`0x0E`）と生の試合（`0x04`）は含まない。
+/// vpatchの毎フレームの判定と同じ（`cmp byte [0x4A7EC4], 0x0C`）。
+pub const REPLAY_PLAYING_STATE: u8 = 0x0C;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaySpeed {
+    Normal,
+    /// Skipのボタン（キーボードはCtrl）を押している間。
+    Skip,
+    /// Slowのボタン（キーボードはShift）を押している間。
+    Slow,
+}
+
+/// ゲームから読んだ、再生の速さを決める材料。`net_session`は対戦・観戦のセッションがあるかどうか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayRead {
+    pub global_state: u8,
+    /// 1Pの入力ワード（`INPUT_MANAGERS[0] + IM_CUR`）。
+    pub cur: u16,
+    pub net_session: bool,
+}
+
+/// 再生中の速さ。リプレイ再生中でない・対戦のセッション中なら`None`。SkipとSlowが両方なら`Skip`（vpatchと同じ順）。
+pub fn replay_speed(global_state: u8, cur: u16, net_session: bool) -> Option<ReplaySpeed> {
+    if net_session || global_state != REPLAY_PLAYING_STATE {
+        return None;
+    }
+    Some(if cur & keys::CTRL != 0 {
+        ReplaySpeed::Skip
+    } else if cur & keys::SHIFT != 0 {
+        ReplaySpeed::Slow
+    } else {
+        ReplaySpeed::Normal
+    })
+}
+
+/// 1回の表示に足す更新の数。画面の更新（表示）は`grid_fps`のまま保ち、その表示の中でゲームの更新だけを`skip_fps / grid_fps`倍で回す。
+/// 割り切れない分は`carry`（呼び手が持ち越す。毎回`grid_fps`未満に戻る）で次の表示へ回す。平均は`skip_fps / grid_fps`倍になる。
+/// 上限は`REPLAY_MAX_EXTRA`（観戦者の早送りとは別）。`skip_fps`が`grid_fps`以下なら0。
+pub fn replay_extra_updates(skip_fps: u64, grid_fps: u64, carry: &mut u64) -> u32 {
+    if grid_fps == 0 {
+        return 0;
+    }
+    *carry = carry.saturating_add(skip_fps);
+    let total = *carry / grid_fps;
+    *carry %= grid_fps;
+    total
+        .saturating_sub(1)
+        .min(u64::from(crate::spectate_pace::REPLAY_MAX_EXTRA)) as u32
+}
+
+/// 1回のリプレイ再生で、速さごとに進めたフレームの数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplayFrames {
+    pub normal: u32,
+    pub skip: u32,
+    pub slow: u32,
+}
+
+impl ReplayFrames {
+    pub fn add(&mut self, s: ReplaySpeed) {
+        let n = match s {
+            ReplaySpeed::Normal => &mut self.normal,
+            ReplaySpeed::Skip => &mut self.skip,
+            ReplaySpeed::Slow => &mut self.slow,
+        };
+        *n = n.saturating_add(1);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == ReplayFrames::default()
+    }
+
+    /// 本ログの詳細の行。
+    pub fn line(&self) -> String {
+        format!(
+            "ペース: リプレイ再生のフレーム数 通常 {} / 高速 {} / 低速 {}",
+            self.normal, self.skip, self.slow
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacingIni {
     pub mode: Mode,
@@ -609,6 +712,10 @@ pub struct PacingIni {
     /// `mode = auto`で格子を刻むフレームの方式（`wait`。b-hybridかb-spin）。ほかのmodeでは使わない。
     pub wait: Phase,
     pub vsync: Vsync,
+    /// リプレイ再生中にSkipを押している間のfps（`replay_skip_fps`）。
+    pub replay_skip_fps: u64,
+    /// リプレイ再生中にSlowを押している間のfps（`replay_slow_fps`）。
+    pub replay_slow_fps: u64,
     pub hybrid: HybridParams,
 }
 
@@ -621,6 +728,8 @@ impl PacingIni {
         cycle_phases: CyclePhases::DEFAULT,
         wait: DEFAULT_WAIT,
         vsync: DEFAULT_VSYNC,
+        replay_skip_fps: DEFAULT_REPLAY_SKIP_FPS,
+        replay_slow_fps: DEFAULT_REPLAY_SLOW_FPS,
         hybrid: HybridParams::DEFAULT,
     };
 
@@ -636,15 +745,20 @@ impl PacingIni {
 
 /// `fps`の値を読む（iniと`pacing_sum --fps`が同じ読み方をする）。10進の整数で`MIN_FPS`〜`MAX_FPS`。
 pub fn parse_fps(v: &str) -> Result<u64, String> {
+    parse_fps_of("fps", DEFAULT_FPS, MAX_FPS, v)
+}
+
+/// キーの名前・既定・上限を指定して`parse_fps`と同じ読み方をする（`replay_skip_fps` / `replay_slow_fps`用）。
+fn parse_fps_of(key: &str, default: u64, max: u64, v: &str) -> Result<u64, String> {
     let t = v.trim();
     // `u64::from_str`は先頭の`+`を通すので数字だけかを先に見る。
     let n = (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
         .then(|| t.parse::<u64>().ok())
         .flatten();
     match n {
-        Some(n) if (MIN_FPS..=MAX_FPS).contains(&n) => Ok(n),
+        Some(n) if (MIN_FPS..=max).contains(&n) => Ok(n),
         _ => Err(format!(
-            "fps の値 {v:?} は {MIN_FPS}〜{MAX_FPS} の整数にしてください（既定 {DEFAULT_FPS}）"
+            "{key} の値 {v:?} は {MIN_FPS}〜{max} の整数にしてください（既定 {default}）"
         )),
     }
 }
@@ -667,6 +781,7 @@ pub fn parse_cycle_secs(v: &str) -> Result<u64, String> {
 /// ゲーム自身のペースはこのツールが変えないので、書いたのに効かない実行や区間ごとに速さの違う実行を作らないために断る。
 /// `cycle_secs`と`cycle_phases`はcycleでだけ書ける。`hybrid_*`はb-hybridのフレームがありうる形（`PacingIni::uses_hybrid`）でだけ書ける。
 /// `wait`と`vsync`はどのmodeでも書ける（配布するiniに行として書くので`mode`を手で替えても断らない）。`wait`が効くのはautoだけ。
+/// `replay_skip_fps`と`replay_slow_fps`も同じ。効くのは格子を刻むmode（b・b-spin・b-hybrid・auto）のリプレイ再生中だけ。
 pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
     if !ini.has_section(SECTION) {
         return Ok(PacingIni::DEFAULT);
@@ -735,6 +850,21 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
             "[{SECTION}] の vsync の値 {v:?} は game / on / off のどれかにしてください"
         ))?,
     };
+    let replay_skip_fps = match ini.get(SECTION, "replay_skip_fps") {
+        None => DEFAULT_REPLAY_SKIP_FPS,
+        Some(v) => parse_fps_of(
+            "replay_skip_fps",
+            DEFAULT_REPLAY_SKIP_FPS,
+            MAX_REPLAY_SKIP_FPS,
+            v,
+        )
+        .map_err(|e| format!("[{SECTION}] の {e}"))?,
+    };
+    let replay_slow_fps = match ini.get(SECTION, "replay_slow_fps") {
+        None => DEFAULT_REPLAY_SLOW_FPS,
+        Some(v) => parse_fps_of("replay_slow_fps", DEFAULT_REPLAY_SLOW_FPS, MAX_FPS, v)
+            .map_err(|e| format!("[{SECTION}] の {e}"))?,
+    };
     let mut cfg = PacingIni {
         mode,
         fps,
@@ -742,6 +872,8 @@ pub fn mode_from_ini(ini: &Ini) -> Result<PacingIni, String> {
         cycle_phases,
         wait,
         vsync,
+        replay_skip_fps,
+        replay_slow_fps,
         hybrid: HybridParams::DEFAULT,
     };
     for k in &HYBRID_KEYS {
@@ -3475,8 +3607,166 @@ mod tests {
         }
         err(
             "[pacing]\nmode = b-hybrid\nhybrid_margin = 2000\n",
-            "の記法が不適切です（使用可能なキー: mode / fps / cycle_secs / cycle_phases / wait / vsync / hybrid_margin_us /",
+            "の記法が不適切です（使用可能なキー: mode / fps / cycle_secs / cycle_phases / wait / vsync / replay_skip_fps / replay_slow_fps / hybrid_margin_us /",
         );
+    }
+
+    #[test]
+    fn replay_speed_follows_the_play_state_and_the_buttons() {
+        use ReplaySpeed::{Normal, Skip, Slow};
+        let z = keys::Z;
+        for (cur, want) in [
+            (0, Normal),
+            (z, Normal),
+            (keys::CTRL, Skip),
+            (keys::CTRL | z, Skip),
+            (keys::SHIFT, Slow),
+            (keys::SHIFT | keys::LEFT, Slow),
+            (keys::CTRL | keys::SHIFT, Skip),
+        ] {
+            assert_eq!(
+                replay_speed(REPLAY_PLAYING_STATE, cur, false),
+                Some(want),
+                "{cur:#06x}"
+            );
+        }
+        // 再生中でなければ押していても何もしない（タイトルのデモ0x0E・生の試合0x04・その他）。
+        for state in [0x00u8, 0x04, 0x08, 0x0A, 0x0D, 0x0E, 0x1C, 0x8C, 0xFF] {
+            for cur in [0, keys::CTRL, keys::SHIFT, keys::CTRL | keys::SHIFT] {
+                assert_eq!(replay_speed(state, cur, false), None, "{state:#04x}");
+            }
+        }
+        // 対戦・観戦のセッション中は再生中の値でも変えない。
+        for cur in [0, keys::CTRL, keys::SHIFT] {
+            assert_eq!(replay_speed(REPLAY_PLAYING_STATE, cur, true), None);
+        }
+        assert_eq!(REPLAY_PLAYING_STATE, 0x0C);
+    }
+
+    #[test]
+    fn extra_updates_average_the_skip_ratio_and_stay_within_the_cap() {
+        let run = |skip: u64, grid: u64, n: usize| -> Vec<u32> {
+            let mut carry = 0;
+            (0..n)
+                .map(|_| replay_extra_updates(skip, grid, &mut carry))
+                .collect()
+        };
+        // 割り切れる: 240 / 60は毎回4回の更新（足すのは3）。
+        assert_eq!(run(240, 60, 4), vec![3, 3, 3, 3]);
+        // 割り切れない: 100 / 60 = 1.67倍。更新の合計は1, 2, 2の繰り返し（足すのは0, 1, 1）。
+        assert_eq!(run(100, 60, 6), vec![0, 1, 1, 0, 1, 1]);
+        let long = run(100, 60, 600);
+        assert_eq!(long.iter().map(|&e| u64::from(e) + 1).sum::<u64>(), 1000);
+        // 通常以下の速さは足さない。
+        assert_eq!(run(60, 60, 3), vec![0, 0, 0]);
+        assert_eq!(run(30, 60, 4), vec![0, 0, 0, 0]);
+        // 上限は観戦者の早送り（16）と別。skip_fps 6000 / 格子 60 = 100 更新がちょうど入る。
+        let cap = crate::spectate_pace::REPLAY_MAX_EXTRA;
+        assert_eq!(cap, 99);
+        assert_eq!(
+            cap + 1,
+            (MAX_REPLAY_SKIP_FPS / DEFAULT_FPS) as u32,
+            "上限と skip の上限の関係"
+        );
+        assert!(run(MAX_REPLAY_SKIP_FPS, 60, 60).iter().all(|&e| e <= cap));
+        assert_eq!(run(1000, 60, 1), vec![15]);
+        assert_eq!(run(5000, 60, 1), vec![82]);
+        assert_eq!(run(MAX_REPLAY_SKIP_FPS, 60, 2), vec![cap, cap]);
+        assert_eq!(run(MAX_REPLAY_SKIP_FPS, 30, 1), vec![cap]);
+        // 持ち越しは毎回grid_fps未満に戻る（溜まり続けない）。
+        let mut carry = 0;
+        for _ in 0..1000 {
+            replay_extra_updates(MAX_REPLAY_SKIP_FPS, 7, &mut carry);
+            assert!(carry < 7);
+        }
+        assert_eq!(replay_extra_updates(240, 0, &mut carry), 0);
+    }
+
+    #[test]
+    fn replay_fps_keys_have_defaults_and_the_fps_range() {
+        let m = |t: &str| mode_from_ini(&crate::ini::parse(t).unwrap());
+        let c = m("[pacing]\nmode = auto\n").unwrap();
+        assert_eq!((c.replay_skip_fps, c.replay_slow_fps), (240, 30));
+        assert_eq!(
+            (
+                PacingIni::DEFAULT.replay_skip_fps,
+                PacingIni::DEFAULT.replay_slow_fps
+            ),
+            (DEFAULT_REPLAY_SKIP_FPS, DEFAULT_REPLAY_SLOW_FPS)
+        );
+        // どのmodeでも書ける（配布するiniの行を手で替えても断らない）。fpsと違い60以外でも断らない。
+        for mode in ["game", "b", "b-spin", "b-hybrid", "vpatch", "cycle", "auto"] {
+            let c = m(&format!(
+                "[pacing]\nmode = {mode}\nreplay_skip_fps = 500\nreplay_slow_fps = 20\n"
+            ))
+            .unwrap();
+            assert_eq!((c.replay_skip_fps, c.replay_slow_fps), (500, 20), "{mode}");
+        }
+        // skipだけ上限が6000。slowは対戦のfpsと同じ1000。
+        let c = m("[pacing]\nreplay_skip_fps = 6000\nreplay_slow_fps = 1000\n").unwrap();
+        assert_eq!(
+            (c.replay_skip_fps, c.replay_slow_fps),
+            (MAX_REPLAY_SKIP_FPS, MAX_FPS)
+        );
+        assert_eq!(MAX_REPLAY_SKIP_FPS, 6_000);
+        let c = m("[pacing]\nreplay_skip_fps = 1\nreplay_slow_fps = 1\n").unwrap();
+        assert_eq!((c.replay_skip_fps, c.replay_slow_fps), (MIN_FPS, MIN_FPS));
+        for (key, max, over) in [
+            ("replay_skip_fps", 6000, "6001"),
+            ("replay_slow_fps", 1000, "1001"),
+        ] {
+            for v in ["", "0", over, "-1", "+5", "1.5", "x"] {
+                let e = m(&format!("[pacing]\n{key} = {v}\n")).unwrap_err();
+                assert!(e.contains(&format!("{key} の値")), "{key} = {v:?}: {e}");
+                assert!(
+                    e.contains(&format!("1〜{max} の整数")),
+                    "{key} = {v:?}: {e}"
+                );
+            }
+        }
+        assert!(m("[pacing]\nreplay_slow_fps = 1500\n").is_err());
+        // 片方だけ書いてもほかの値に影響しない。
+        let c = m("[pacing]\nreplay_slow_fps = 45\n").unwrap();
+        assert_eq!((c.replay_skip_fps, c.replay_slow_fps), (240, 45));
+    }
+
+    #[test]
+    fn only_the_forms_that_own_the_grid_change_the_replay_speed() {
+        for (m, want) in [
+            (Mode::Game, false),
+            (Mode::B, true),
+            (Mode::BSpin, true),
+            (Mode::BHybrid, true),
+            (Mode::Cycle, false),
+            (Mode::Vpatch, false),
+            (Mode::Auto, true),
+        ] {
+            assert_eq!(m.paces_replay(), want, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn replay_frames_count_each_speed_and_print_one_line() {
+        let mut f = ReplayFrames::default();
+        assert!(f.is_empty());
+        for s in [
+            ReplaySpeed::Normal,
+            ReplaySpeed::Normal,
+            ReplaySpeed::Skip,
+            ReplaySpeed::Slow,
+            ReplaySpeed::Slow,
+            ReplaySpeed::Slow,
+        ] {
+            f.add(s);
+        }
+        assert!(!f.is_empty());
+        assert_eq!(
+            f.line(),
+            "ペース: リプレイ再生のフレーム数 通常 2 / 高速 1 / 低速 3"
+        );
+        f.skip = u32::MAX;
+        f.add(ReplaySpeed::Skip);
+        assert_eq!(f.skip, u32::MAX);
     }
 
     #[test]

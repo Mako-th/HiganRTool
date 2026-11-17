@@ -1,6 +1,6 @@
 //! rollbackのモードの製品の経路の部品（pure。unsafe無し。Win32・ゲームのメモリ・入口のアセンブリは`rollback_play_win.rs`と`rollback_win.rs`）。
 //!
-//! - [`GameWindow`]: 本物の花映塚のための`higanr_core::rollback::Window`。
+//! - [`GameWindow`]は本物の花映塚のための`higanr_core::rollback::Window`。
 //!   次の処理を持つ。コピー（決まったブロック・`.data`の範囲・DLLの領域の使った所・更新の列のリンク（レジストリの先頭の2つの節0x40 B））・コピーのときのSupervisorの`+0x58C` / `+0x590`のバックアップ・書き戻し・更新だけを1回回すtick・進め直しの前後のSE・BGM・文字の数のバックアップと復元。
 //! - 入口の手順[`scan_point_with`] / [`post_present_with`]: ステートマシンを1フレーム進める。
 //!   ステートマシンは[`Machine`]のインターフェースの向こうにある（本物は`netplay/rollback.rs`の`NpMachine`。検査は`Rollback`そのもの）。
@@ -2246,7 +2246,7 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
             s.tint_checked
         ),
         format!(
-            "巻き戻し（製品の処理フロー）: fps の表示（丸めた値 0x4B36C8。Present の後に読んだ {} 回の分布）: {}・平均 {}。書き戻しの前後で描画の回数 0x4B42CC が変わった書き戻し {}（見た {} のうち。fps の計測の欄を書き戻していなければ 0）",
+            "巻き戻し（製品の処理フロー）: fps の表示（丸めた値 0x4B36C8。Present の後に読んだ {} 回の分布）: {}・平均 {}。書き戻しの前後で描画の回数 0x4B42CC が変わった書き戻し {}（見た {} のうち。fps の計測のフィールドを書き戻していなければ 0）。fps の表示の測りの差し替え: {}",
             s.fps_n,
             hist_text(&FPS_LABELS, &s.fps_hist),
             if s.fps_n == 0 {
@@ -2255,7 +2255,8 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
                 format!("{:.2}", s.fps_sum as f64 / f64::from(s.fps_n))
             },
             s.fps_words_restored,
-            s.fps_words_checked
+            s.fps_words_checked,
+            fps_replaced_text(crate::fps_win::replaced())
         ),
         format!(
             "巻き戻し（製品の処理フロー）: 陣の背景（中の名前は Stage）の VM の時計が描画 1 回あたりに進んだ tick（Present × 陣ごとの最大。delay 方式と同じく 1 に集まるのが正しい形）: {}。読めなかった {}。VM の本数 最大 {}（写す上限 {}。越えて写さなかった陣 {}）・書き戻しで背景の VM を書き戻した {}（書き戻し × 陣のうち）",
@@ -2278,6 +2279,15 @@ pub fn summary_lines(s: &PlayStats, fault: Option<Fault>) -> Vec<String> {
 }
 
 /// 分布の文（数が0の枠は出さない。全部0なら「なし」。測れていないことを0件の分布に見せない）。
+/// 差し替え中はゲームの描画の回数を使わない。そのため`fps_words_restored`の0は測れていない。
+fn fps_replaced_text(on: bool) -> &'static str {
+    if on {
+        "有効（ゲームの描画の回数 0x4B42CC を使わないため、変わった書き戻しの数は測れていません）"
+    } else {
+        "無効"
+    }
+}
+
 fn hist_text(labels: &[&str], counts: &[u32]) -> String {
     let parts: Vec<String> = labels
         .iter()
@@ -2607,6 +2617,10 @@ pub fn install_play(
             });
             hook::write_report(out, def, &r);
             written[i] = r.written();
+            if !written[i] {
+                // 元の飛び先は書く前に設定される。そのため書けなかったら戻す（走査のフックが設置済みと見えないように）。
+                hooks.set_scan_original(0);
+            }
         } else {
             let mut host = HooksHost(&mut *hooks);
             let mut denv = SiteDetourEnv {
@@ -2637,45 +2651,80 @@ pub fn install_play(
     PlayInstall::Written(written)
 }
 
-/// 観戦者の早送りのために、走査のcall（`RESIM_SITES[0]`）の1地点だけを書く。
-/// 早送り（`spectate_watch/ff.rs`）は走査の包みの中で余分に更新を回すだけで、観戦するマッチの方式（rollback / delay）とは関わらない。
-/// ただし走査のcallは`install_play`でしか書かれず、iniがdelayの実行には書かれなかった。
-/// そのため観戦者の実行（`watching`）は、走査のcallがまだ書かれていなければ（`scan_hooked`が偽）そこだけを書く。
-/// 確保・解放・callocの入口は書かない（観戦者は巻き戻さない）。
-/// 観戦者でない実行（対戦）は何も書かない。delay方式の対戦の実行は1バイトも書かない約束（遅延の増分0）を、この関数の入口で守る。
-/// 書く前の照合は`install_call_hook_at`が止めた後の再読みまで含めて行い、合わなければ何も書かない。書いたらtrueを返す。
-pub fn install_watch_scan(
-    watching: bool,
-    scan_hooked: bool,
+/// 走査のcallを書けなかった理由。本ログの簡潔な行に短い名詞で出す（詳しい文は詳細の行へ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFail {
+    NoEntry,
+    Table,
+    Unreadable,
+    Mismatch,
+    Shape,
+    /// 止めたスレッドのEIPが範囲にあり続けた・スレッドを止められなかった・保護を変えられなかった。
+    Write,
+    /// 文字の数のフィールドが読み書き可能なページでない。
+    OutputPage,
+}
+
+impl ScanFail {
+    pub fn noun(self) -> &'static str {
+        match self {
+            ScanFail::NoEntry => "入口のアドレス無し",
+            ScanFail::Table => "表の検査不能",
+            ScanFail::Unreadable => "読み取り不能",
+            ScanFail::Mismatch => "不一致",
+            ScanFail::Shape => "命令の形が不一致",
+            ScanFail::Write => "書き込み不能",
+            ScanFail::OutputPage => "文字の数のフィールドが書き込み不能",
+        }
+    }
+}
+
+/// 走査のcall（`RESIM_SITES[0]`）の1地点だけを書く。観戦者の早送りとリプレイの高速再生が使う（確保・解放・callocの入口は書かない）。
+/// 走査のcallを書くのはrollbackの設置（`install_play`）・観戦者の実行・リプレイの高速再生（再生中にSkipを押したとき）。
+/// delay方式の対戦だけのプロセスはリプレイの高速再生を使わない限り書かない。
+/// 早送りも高速再生も走査の包みの中で余分に更新を回すだけ。マッチの方式（rollback / delay）とは関わらない。
+/// 書く前の照合は`install_call_hook_at`が止めた後の再読みまで含めて行い、合わなければ何も書かない。
+/// 書けなかったときは書く前に設定された元の飛び先を0へ戻す（走査のフックが設置済みと見えないように）。
+pub fn install_scan_call(
     env: &mut dyn hook::HookEnv,
     hooks: &mut dyn PlayHooks,
     forbidden: &[AddrRange],
     out: &mut dyn Write,
-) -> bool {
-    if !watching || scan_hooked {
-        return false;
-    }
+) -> Result<(), ScanFail> {
     let def = &RESIM_SITES[0];
     let entry = hooks.scan_entry();
     if entry == 0 {
         let _ = writeln!(
             out,
-            "観戦者の早送り: 走査の包みの入口のアドレスが無いのでどこにも書きません。"
+            "走査の包みの入口のアドレスが無いのでどこにも書きません。"
         );
-        return false;
+        return Err(ScanFail::NoEntry);
     }
     if let Err(e) = check_table(core::slice::from_ref(def), forbidden) {
         let _ = writeln!(
             out,
-            "観戦者の早送り: 走査の call の表の検査に失敗した（{e:?}）のでどこにも書きません。"
+            "走査の call の表の検査に失敗した（{e:?}）のでどこにも書きません。"
         );
-        return false;
+        return Err(ScanFail::Table);
     }
     let r = hook::install_call_hook_at(env, def, entry, &mut |_, original| {
         hooks.set_scan_original(original);
     });
     hook::write_report(out, def, &r);
-    r.written()
+    if r.written() {
+        return Ok(());
+    }
+    hooks.set_scan_original(0);
+    Err(match r.outcome {
+        hook::Outcome::Refused(hook::Refusal::Unreadable) => ScanFail::Unreadable,
+        hook::Outcome::Refused(hook::Refusal::Mismatch(_)) => ScanFail::Mismatch,
+        hook::Outcome::Refused(hook::Refusal::Plan(_)) => ScanFail::Shape,
+        hook::Outcome::Aborted(hook::Abort::RereadUnreadable) => ScanFail::Unreadable,
+        hook::Outcome::Aborted(hook::Abort::RereadMismatch(_)) => ScanFail::Mismatch,
+        hook::Outcome::Aborted(_) | hook::Outcome::GaveUp { .. } | hook::Outcome::Written(_) => {
+            ScanFail::Write
+        }
+    })
 }
 
 #[cfg(test)]
@@ -5160,6 +5209,8 @@ pub(crate) mod tests {
         pub(crate) mem: BTreeMap<u32, u8>,
         pub(crate) writes: Vec<(u32, Vec<u8>)>,
         next_tramp: u32,
+        /// このアドレスへの書き込みを失敗させる（書く前の照合は通り、書き込みだけが失敗する場面）。
+        pub(crate) fail_write_at: Option<u32>,
     }
 
     impl FakeCode {
@@ -5174,6 +5225,7 @@ pub(crate) mod tests {
                 mem,
                 writes: Vec::new(),
                 next_tramp: 0x0090_0000,
+                fail_write_at: None,
             }
         }
     }
@@ -5202,6 +5254,12 @@ pub(crate) mod tests {
             true
         }
         fn write_code(&mut self, addr: u32, bytes: &[u8]) -> Result<WriteDone, u32> {
+            if self
+                .fail_write_at
+                .is_some_and(|a| a >= addr && a < addr + bytes.len() as u32)
+            {
+                return Err(5);
+            }
             for (i, &b) in bytes.iter().enumerate() {
                 self.mem.insert(addr + i as u32, b);
             }
@@ -5405,14 +5463,9 @@ pub(crate) mod tests {
         let mut h = FakeHooks::default();
         let mut out = Vec::new();
         install_play(wish, &mut f, &mut h, FORBIDDEN, &mut out);
-        install_watch_scan(
-            watching,
-            h.scan_original.is_some(),
-            &mut f,
-            &mut h,
-            FORBIDDEN,
-            &mut out,
-        );
+        if watching && h.scan_original.is_none() {
+            let _ = install_scan_call(&mut f, &mut h, FORBIDDEN, &mut out);
+        }
         (scan_call_points_at_our_entry(&mut f), f.writes.len())
     }
 
@@ -5424,9 +5477,7 @@ pub(crate) mod tests {
         let mut f = FakeCode::new();
         let mut h = FakeHooks::default();
         let mut out = Vec::new();
-        assert!(install_watch_scan(
-            true, false, &mut f, &mut h, FORBIDDEN, &mut out
-        ));
+        assert!(install_scan_call(&mut f, &mut h, FORBIDDEN, &mut out).is_ok());
         assert_eq!(f.writes.len(), 1);
         assert_eq!(
             f.writes[0].0,
@@ -5447,12 +5498,6 @@ pub(crate) mod tests {
             scan_call_written_after_setup(Mode::Rollback, true),
             (true, 5)
         );
-        let mut f = FakeCode::new();
-        let mut h = FakeHooks::default();
-        assert!(!install_watch_scan(
-            true, true, &mut f, &mut h, FORBIDDEN, &mut out
-        ));
-        assert!(f.writes.is_empty());
         let def = &RESIM_SITES[0];
         for pos in 0..def.expected.len() as u32 {
             for unreadable in [false, true] {
@@ -5465,8 +5510,13 @@ pub(crate) mod tests {
                 }
                 let mut h = FakeHooks::default();
                 let mut out = Vec::new();
-                assert!(
-                    !install_watch_scan(true, false, &mut f, &mut h, FORBIDDEN, &mut out),
+                assert_eq!(
+                    install_scan_call(&mut f, &mut h, FORBIDDEN, &mut out),
+                    Err(if unreadable {
+                        ScanFail::Unreadable
+                    } else {
+                        ScanFail::Mismatch
+                    }),
                     "+{pos} {unreadable}"
                 );
                 assert!(
@@ -5481,10 +5531,50 @@ pub(crate) mod tests {
         }];
         let mut f = FakeCode::new();
         let mut h = FakeHooks::default();
-        assert!(!install_watch_scan(
-            true, false, &mut f, &mut h, &forbidden, &mut out
-        ));
+        assert_eq!(
+            install_scan_call(&mut f, &mut h, &forbidden, &mut out),
+            Err(ScanFail::Table)
+        );
         assert!(f.writes.is_empty(), "禁止の範囲に重なるのに書いた");
+    }
+
+    #[test]
+    fn a_failed_scan_write_gives_back_the_original_target_so_the_call_does_not_look_installed() {
+        let def = &RESIM_SITES[0];
+        // 観戦者・リプレイの高速再生の1地点だけの設置。
+        let mut f = FakeCode::new();
+        f.fail_write_at = Some(def.addr + 1);
+        let mut h = FakeHooks::default();
+        let mut out = Vec::new();
+        assert_eq!(
+            install_scan_call(&mut f, &mut h, FORBIDDEN, &mut out),
+            Err(ScanFail::Write)
+        );
+        assert!(f.writes.is_empty(), "失敗する書き込みが記録された");
+        assert_eq!(
+            h.scan_original,
+            Some(0),
+            "書けなかったのに元の飛び先が残った"
+        );
+        // 書けたときは元の飛び先を残す（対照）。
+        let mut f = FakeCode::new();
+        let mut h = FakeHooks::default();
+        assert!(install_scan_call(&mut f, &mut h, FORBIDDEN, &mut out).is_ok());
+        assert_eq!(h.scan_original, Some(0x0042_C700));
+        // rollbackの5地点の設置でも同じ。走査のcallだけが書けなかったとき。
+        let mut f = FakeCode::new();
+        f.fail_write_at = Some(def.addr + 1);
+        let mut h = FakeHooks::default();
+        let (r, _) = install(&mut f, &mut h, Mode::Rollback, FORBIDDEN);
+        let PlayInstall::Written(w) = r else {
+            panic!("{r:?}");
+        };
+        assert_eq!(w, [true, true, true, true, false]);
+        assert_eq!(
+            h.scan_original,
+            Some(0),
+            "書けなかったのに元の飛び先が残った"
+        );
     }
 
     #[test]
@@ -6296,9 +6386,13 @@ pub(crate) mod tests {
             "平均 59.67",
             "変わった書き戻し 4（見た 9 のうち",
             "1: 5 / 8 以上: 2",
+            "fps の表示の測りの差し替え: 無効",
         ] {
             assert!(t.contains(want), "{want} が無い: {t}");
         }
+        assert!(fps_replaced_text(true).starts_with("有効"));
+        assert!(fps_replaced_text(true).contains("測れていません"));
+        assert_eq!(fps_replaced_text(false), "無効");
         assert_eq!(fps_bucket(-3), 0);
         assert_eq!(fps_bucket(55), 5);
         assert_eq!(fps_bucket(62), 12);

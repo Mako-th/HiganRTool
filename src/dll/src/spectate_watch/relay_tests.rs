@@ -13,7 +13,7 @@ use higanr_core::link::Outlet;
 use higanr_core::nat::{NatMark, Symmetry};
 use higanr_core::seal::{Ephemeral, KeySeed, Sender, Seq};
 use higanr_core::spectate::{HostConfig, JOIN_RESEND_MS, SpectateHost, Watcher, WatcherConfig};
-use higanr_core::spectate_pace::FF_UPDATES_DEFAULT;
+use higanr_core::spectate_pace::FF_FPS_DEFAULT;
 use higanr_core::spectate_rate::RELAY_MIN_BPS;
 use higanr_core::wire::{
     self, ByeReason, JoinTree, MAX_DATAGRAM, Message, PeekedType, Record, SpectateIntro,
@@ -84,7 +84,7 @@ fn watch_cfg() -> WatchConfig {
         wait_budget_us: 16_000,
         margin_frames: WATCH_MARGIN_FRAMES,
         require_net_selection: false,
-        ff_max: FF_UPDATES_DEFAULT,
+        ff_fps: FF_FPS_DEFAULT,
     }
 }
 
@@ -222,7 +222,7 @@ fn node(addr: SocketAddr, relay: bool, nonce: u64, seed: u8, start_us: u64) -> N
         relay.then_some(Ok(KeySeed([seed ^ 0x5A; 32]))),
     );
     let feed = Arc::new(WatchFeed::with_len(4_096));
-    let mut recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), FF_UPDATES_DEFAULT);
+    let mut recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), FF_FPS_DEFAULT);
     recv.note_nat(REACHABLE);
     Node {
         addr,
@@ -893,7 +893,7 @@ fn records_held_beyond_the_ack_at_the_intro_count_as_the_previous_parents() {
     let slot = Arc::new(WatchSlot::new());
     slot.offer_with(watcher_cfg(HOST, 0xC1, 0x51), None);
     let feed = Arc::new(WatchFeed::with_len(4_096));
-    let mut recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), FF_UPDATES_DEFAULT);
+    let mut recv = WatchRecv::new(Arc::clone(&slot), Arc::clone(&feed), FF_FPS_DEFAULT);
     let mut sink = Sink::default();
     let mut t_us = 1_000;
     recv.service(t_us, &mut sink);

@@ -12,7 +12,7 @@ use higanr_core::handshake::Name;
 use higanr_core::link::Outlet;
 use higanr_core::seal::KeySeed;
 use higanr_core::spectate::{HostConfig, SpectateHost, WatcherConfig};
-use higanr_core::spectate_pace::FF_UPDATES_DEFAULT;
+use higanr_core::spectate_pace::FF_FPS_DEFAULT;
 use higanr_core::wire::{MAX_DATAGRAM, Record, Seat};
 
 use super::*;
@@ -33,7 +33,7 @@ fn watch_cfg(wait_budget_us: u32) -> WatchConfig {
         wait_budget_us,
         margin_frames: WATCH_MARGIN_FRAMES,
         require_net_selection: false,
-        ff_max: FF_UPDATES_DEFAULT,
+        ff_fps: FF_FPS_DEFAULT,
     }
 }
 

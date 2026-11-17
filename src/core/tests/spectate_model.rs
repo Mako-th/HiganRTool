@@ -1471,6 +1471,41 @@ fn a_late_join_in_a_rematch_starts_from_the_last_select_seg() {
     assert_eq!(flow.first().copied(), Some((19, Record::Seg { seg: 3 })));
 }
 
+/// ホストが再戦の`Seg`の名前の後ろに選択の記録を積み直した並び。番号:
+/// 0〜8は`rematch_order`と同じ・9 `Seg` 1・10 11名前・12 STEP・13 MENU・14 15 SELECT・16 17マッチ。
+#[test]
+fn a_late_join_in_a_rematch_with_selection_records_starts_at_that_rematch() {
+    let mut recs: Vec<Record> = rematch_order().into_iter().take(9).collect();
+    recs.extend([
+        Record::Seg { seg: 1 },
+        Record::name(Seat::P1, "p1".as_bytes()),
+        Record::name(Seat::P2, "p2".as_bytes()),
+        Record::Step(Step {
+            step: 0,
+            kind: StepKind::Decide,
+            value: 3,
+            screen: 8,
+        }),
+        menu_rec(0),
+        select_rec(Seat::P1, 3),
+        select_rec(Seat::P2, 4),
+        frame(0),
+        frame(1),
+    ]);
+    for n in [13, 16, 18] {
+        let mut host = host_after(64, &recs, n);
+        assert_eq!(host.join_start(), 9, "{n} 個積んだ後");
+        host.set_rewind_max(0);
+        assert_eq!(host.join_start(), 9, "{n} 個積んだ後（遡りの上限 0）");
+        let (flow, _) = first_flow(&mut host);
+        assert_eq!(
+            flow.first().copied(),
+            Some((9, Record::Seg { seg: 1 })),
+            "{n}"
+        );
+    }
+}
+
 #[test]
 fn a_rematch_join_falls_back_to_the_current_seg_when_the_select_seg_is_gone_or_too_far() {
     let recs = rematch_order();

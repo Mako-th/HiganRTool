@@ -13,6 +13,7 @@
 //! - 数えがtickより速く進まないこと（`frames_vs_ticks`）。
 //! - 求めた移りが全部見えたかどうか（`coverage`）。
 //! - 1回目の一時停止の移りの列（`pause.first_moves`）。
+//!
 //! 母数0は「測れていない」: 求めたのに区間が1つも無いときは`Status::NotMeasured`で合格に数えない。
 //! 合否（`Report::not_all_passed`）を決めるのは求めた区間・求めた検査の結果だけ。求めていない区間の結果は照らして出すが数えない。
 #![forbid(unsafe_code)]

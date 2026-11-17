@@ -14,7 +14,9 @@
       // ランダム対戦の待ち列（ビルド番号ごとに 1 つ。src/random_queue.ts）。
       { "name": "RANDOM_QUEUE", "class_name": "RandomQueue" },
       // 進行中のランダム対戦の一覧（ビルド番号ごとに 1 つ。src/watch_list.ts）。
-      { "name": "WATCH_LIST", "class_name": "WatchList" }
+      { "name": "WATCH_LIST", "class_name": "WatchList" },
+      // ルーム名ごとの一覧（ビルド番号と揃えた名ごとに 1 つ。src/lobby.ts）。
+      { "name": "LOBBY", "class_name": "Lobby" }
     ]
   },
   // 粗い前段の回数制限（src/rules.ts の CONNECT_PRELIMIT_PER_MINUTE と同じ値にする）。
@@ -31,7 +33,8 @@
     { "tag": "v1", "new_sqlite_classes": ["Room"] },
     { "tag": "v2", "new_sqlite_classes": ["ConnectLimiter"] },
     { "tag": "v3", "new_sqlite_classes": ["RandomQueue"] },
-    { "tag": "v4", "new_sqlite_classes": ["WatchList"] }
+    { "tag": "v4", "new_sqlite_classes": ["WatchList"] },
+    { "tag": "v5", "new_sqlite_classes": ["Lobby"] }
   ],
   // 接続コードや部屋名をログに残さない。
   "observability": { "enabled": false },

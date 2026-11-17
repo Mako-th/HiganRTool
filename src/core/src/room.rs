@@ -118,7 +118,7 @@ fn is_room_name_byte(b: u8) -> bool {
 //
 // こちらは揃えない（NFKCを持たない。サーバーが揃える）。
 // 送る前に見るのは揃えずに決まるガードだけ: 空・大きさ（揃える前のUTF-8のバイト）・制御文字・`/`・名そのものが`.` `..`・空白だけ・ASCIIだけの名の長さ。
-// `RoomName::parse`（dllの本番）はこれに加えて、使えない文字（`accepts_char`の外）と、前後の空白を除いた名が`w.` `q.`で始まるものを断る（`NotAscii`・`ReservedPrefix`）。
+// `RoomName::parse`（dllの本番）はこれに加えて、使えない文字（`accepts_char`の外）を断る。前後の空白を除いた名が`w.` `q.` `r.`で始まるものも断る（`NotAscii`・`ReservedPrefix`）。
 // `parse_server_rules`が断る名はサーバーも必ず断る（逆は無い）。
 // サーバーだけが断るのは、揃えて初めて長さの分かるASCII以外の名（33文字以上の日本語・揃えると伸びる文字）。
 // これはサーバーの400 `bad_room_name`（[`Failure::BadRoomName`]）で知る。
@@ -143,7 +143,7 @@ pub enum RoomNameError {
     /// サーバーは通すがdllの側だけ断る（画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。
     /// [`RoomName::parse`]だけが返す。
     NotAscii { pos: usize },
-    /// 前後の空白を除いて小文字にした名が`w.`か`q.`で始まる（観戦用のルームとランダムマッチの割り当ての名と重なる）。[`RoomName::parse`]だけが返す。
+    /// 前後の空白を除いて小文字にした名が`w.` `q.` `r.`で始まる（観戦用のルームとランダムマッチ・ルーム名ごとの一覧の割り当ての名と重なる）。[`RoomName::parse`]だけが返す。
     ReservedPrefix,
 }
 
@@ -163,16 +163,20 @@ fn is_trimmed_space(c: char) -> bool {
     c.is_whitespace() || c == '\u{FEFF}'
 }
 
-/// 前後の空白を除いた名が観戦用のルーム（[`SPECTATE_ROOM_PREFIX`]）かランダムマッチの割り当て（`room_queue::RANDOM_ROOM_PREFIX`）の先頭かどうか。
+/// 前後の空白を除いた名が観戦用のルーム（[`SPECTATE_ROOM_PREFIX`]）・ランダムマッチの割り当て（`room_queue::RANDOM_ROOM_PREFIX`）・ルーム名ごとの一覧の割り当て（`lobby::LOBBY_ROOM_PREFIX`）の先頭かどうか。
 /// 大文字小文字は見ない（サーバーが小文字にして検索する）。
 fn has_reserved_prefix(trimmed: &str) -> bool {
-    [SPECTATE_ROOM_PREFIX, crate::room_queue::RANDOM_ROOM_PREFIX]
-        .iter()
-        .any(|p| {
-            trimmed
-                .get(..p.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(p))
-        })
+    [
+        SPECTATE_ROOM_PREFIX,
+        crate::room_queue::RANDOM_ROOM_PREFIX,
+        crate::lobby::LOBBY_ROOM_PREFIX,
+    ]
+    .iter()
+    .any(|p| {
+        trimmed
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    })
 }
 
 /// パスに符号化せずに載せる文字（RFC 3986のunreserved）。ほかは全部`%XX`（UTF-8のバイトごと）。
@@ -198,7 +202,7 @@ pub const SPECTATE_ROOM_NAME_LEN: usize = SPECTATE_ROOM_PREFIX.len() + 2 * SPECT
 impl RoomName {
     /// ルーム名を検証する。サーバーの決まり（[`RoomName::parse_server_rules`]）に加えて、[`RoomName::accepts_char`]の文字だけを通す
     /// （画面の文字の表に無い漢字は「?」で描かれ、相手と同じ名かを見分けられないため）。日本語・全角・`` ` `` `;` は
-    /// [`RoomNameError::NotAscii`]。前後の空白は除いた名を返す（間の空白は残す）。除いた名が`w.` `q.`で始まれば
+    /// [`RoomNameError::NotAscii`]。前後の空白は除いた名を返す（間の空白は残す）。除いた名が`w.` `q.` `r.`で始まれば
     /// [`RoomNameError::ReservedPrefix`]。大文字と小文字は別の文字のまま通す（同じルームにするのはサーバー）。
     pub fn parse(raw: &str) -> Result<RoomName, RoomNameError> {
         RoomName::parse_server_rules(raw)?;
@@ -356,7 +360,7 @@ impl RoomName {
 }
 
 /// 文字列をUTF-8のバイトごとにパーセント符号化して足す（パスの末尾にも問いの値にも同じ式を使う。`+`も`%2B`にする）。
-fn push_percent_encoded(out: &mut String, s: &str) {
+pub(crate) fn push_percent_encoded(out: &mut String, s: &str) {
     for b in s.bytes() {
         if is_unreserved(b) {
             out.push(char::from(b));
@@ -574,12 +578,14 @@ impl CloseCode {
 
 // ---------------- 平らなJSONの小さな読み手 ----------------
 
-/// 値。読み手が中身まで要るのは文字列と整数だけ。ほか（小数・真偽・null・入れ子）は知らないキーの値として読み飛ばす。
+/// 値。読み手が中身まで要るのは文字列・整数・真偽だけ。ほか（小数・null・入れ子）は知らないキーの値として読み飛ばす。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JsonValue<'a> {
     Str(Cow<'a, str>),
     /// i64に収まる整数（小数点・指数の無いもの）。
     Int(i64),
+    /// `true`か`false`（一覧の行の`watch`）。
+    Bool(bool),
     /// 上以外の値（形は検証したが中身は捨てた）。
     Other,
 }
@@ -909,6 +915,14 @@ fn flat_object<'a>(
             }
             Some(b'"') => JsonValue::Str(r.string()?),
             Some(b'-' | b'0'..=b'9') => r.number()?,
+            Some(b't') => {
+                r.literal(b"true")?;
+                JsonValue::Bool(true)
+            }
+            Some(b'f') => {
+                r.literal(b"false")?;
+                JsonValue::Bool(false)
+            }
             _ => {
                 r.skip_value(1)?;
                 JsonValue::Other
@@ -1213,7 +1227,10 @@ pub enum Failure {
     /// 429。`retry_after_secs`秒後に接続し直せる（コピペへは誘導しない）。
     RateLimited { retry_after_secs: u32 },
     /// 409 `room_full`。観戦用のルームの席が無い（古いサーバーは対戦のルームの3人目にも返す）。ルーム名を変える。
+    /// 一覧の接続では見る接続の数の上限（一時的な断り）。
     RoomFull,
+    /// 一覧の件数の上限（closeの`list_full`・4429。全体か1 IPあたり）。
+    ListFull,
     /// 409 `room_in_use`。対戦のルームを2人が使っている。ルーム名を変える。
     RoomInUse,
     /// 400。ルーム名が決まりの外（こちらでも検証するので普通は来ない）。ルーム名を変える。
@@ -1246,7 +1263,7 @@ impl Failure {
             // チケットは配信側だけが付けるので画面へ出す経路には来ない。
             Failure::Unresponsive(_) | Failure::BadTicket => FailureKind::Unresponsive,
             Failure::RateLimited { .. } => FailureKind::WaitThenRetry,
-            Failure::RoomFull | Failure::RoomInUse | Failure::BadRoomName => {
+            Failure::RoomFull | Failure::ListFull | Failure::RoomInUse | Failure::BadRoomName => {
                 FailureKind::ChangeRoomName
             }
             Failure::Expired => FailureKind::Expired,
@@ -1863,11 +1880,12 @@ mod tests {
         let unread: Vec<&str> = list
             .iter()
             .map(|(k, _)| k.as_ref())
-            // `random_`のキーはランダム対戦の値（`room_queue.rs`の検査が同じ見本と突き合わせる）。`watch_`のキーは一覧の値（`watch_list.rs`）。
+            // `random_`のキーはランダム対戦の値（`room_queue.rs`の検査が同じ見本と突き合わせる）。`watch_`のキーは一覧の値（`watch_list.rs`）。`lobby_`のキーはルーム名ごとの一覧の値（`lobby.rs`）。
             .filter(|k| {
                 !k.starts_with("close_")
                     && !k.starts_with("random_")
                     && !k.starts_with("watch_")
+                    && !k.starts_with("lobby_")
                     && !used.iter().any(|u| u == k)
             })
             .collect();
@@ -2265,17 +2283,22 @@ mod tests {
             );
             assert!(RoomName::parse_server_rules(bad).is_ok(), "{bad:?}");
         }
-        // 前後の空白を除いて小文字にした名が`w.` `q.`で始まる名はサーバーの決まりを通るが、dllは断る。
+        // 前後の空白を除いて小文字にした名が`w.` `q.` `r.`で始まる名はサーバーの決まりを通る。dllは断る。
         for bad in [
             "w.abc",
             "W.abc",
             "q.abc",
             "Q.ABC",
+            "r.abc",
+            "R.ABC",
             "w.",
             "q.",
+            "r.",
             " w.x",
             "  Q.x  ",
+            " r.x ",
             "q.0123456789abcdef0123456789abcd",
+            "r.0123456789abcdef0123456789abcd",
         ] {
             assert_eq!(
                 RoomName::parse(bad),
@@ -2283,6 +2306,10 @@ mod tests {
                 "{bad:?}"
             );
             assert!(RoomName::parse_server_rules(bad).is_ok(), "{bad:?}");
+        }
+        // 先頭の2文字が違うだけの名は通す（予約するのは`w.` `q.` `r.`の先頭だけ）。
+        for ok in ["r", "rr.abc", "ar.abc", "r-abc", "x.r.y"] {
+            assert!(RoomName::parse(ok).is_ok(), "{ok:?}");
         }
         assert_eq!(RoomName::parse(""), Err(RoomNameError::Empty));
         assert_eq!(RoomName::parse("   "), Err(RoomNameError::Blank));
@@ -2714,6 +2741,7 @@ mod tests {
             FailureKind::WaitThenRetry
         );
         assert_eq!(RoomFull.kind(), FailureKind::ChangeRoomName);
+        assert_eq!(ListFull.kind(), FailureKind::ChangeRoomName);
         assert_eq!(RoomInUse.kind(), FailureKind::ChangeRoomName);
         assert_eq!(BadRoomName.kind(), FailureKind::ChangeRoomName);
         assert_eq!(Expired.kind(), FailureKind::Expired);

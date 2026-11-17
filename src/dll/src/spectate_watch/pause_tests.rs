@@ -255,7 +255,7 @@ impl Rig {
                 wait_budget_us: 0,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
             1 << 17,
         );

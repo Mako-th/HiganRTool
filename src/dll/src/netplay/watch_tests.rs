@@ -54,6 +54,8 @@ thread_local! {
     static DROP_NAMES: Cell<bool> = const { Cell::new(false) };
     /// `Some`の間に作った`Rig`のホストは、遅れたJOINの遡りの上限をこの値にする（0 = 選択のsegまで遡れない形）。
     static HOST_REWIND: Cell<Option<u32>> = const { Cell::new(None) };
+    /// 真の間に作った`Rig`のホストは再戦で選択の記録を積み直さない（古いバージョンのホストの形）。
+    static OLD_HOST: Cell<bool> = const { Cell::new(false) };
     /// `Some((n, k))`の間に作った`Rig`は、観戦者がマッチのフレームをn使ったところで、観戦者のゲームのスレッドをkフレーム止める。
     /// 受信スレッドの代わりは回り続ける（ウィンドウのドラッグなどの形）。
     static WATCHER_FREEZE: Cell<Option<(u64, u32)>> = const { Cell::new(None) };
@@ -192,7 +194,7 @@ impl Rig {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         Rig {
@@ -545,6 +547,7 @@ fn run_rig_inner(
     if let Some(n) = HOST_REWIND.with(Cell::get) {
         rig.host.set_rewind_max(n);
     }
+    npa.spec_rematch = !OLD_HOST.with(Cell::get);
     rig.end_delay_ticks = end_delay_ticks;
     rig.bare_tail = bare_tail;
     rig.ff_on = ff.is_some();
@@ -1713,9 +1716,143 @@ fn rematch_run(bare_tail: bool) -> Out {
     )
 }
 
+/// ホストが再戦の`Seg`の後ろに積み直した`Select`（再戦ごとに1組）。
+fn rematch_selects(recs: &[Record]) -> Vec<(u16, [wire::Select; 2])> {
+    let mut seg = 0;
+    let mut out = Vec::new();
+    let mut pending: Option<wire::Select> = None;
+    for r in recs {
+        match *r {
+            Record::Seg { seg: s } => seg = s,
+            Record::Select {
+                seat: Seat::P1,
+                sel,
+            } => pending = Some(sel),
+            Record::Select {
+                seat: Seat::P2,
+                sel,
+            } => {
+                if let Some(p1) = pending.take() {
+                    out.push((seg, [p1, sel]));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[test]
-fn a_late_joiner_in_a_rematch_seg_replays_the_rematches_from_the_last_selection() {
+fn a_late_joiner_in_a_rematch_seg_starts_at_the_head_of_that_rematch() {
     let o = rematch_run(false);
+    assert!(o.rig.started);
+    let (wp, wg) = (&o.rig.wp, &o.rig.wg);
+    let s = wp.stats();
+    assert_eq!(
+        wp.end(),
+        Some(WatchEnd::HostEnded(ByeReason::Finished)),
+        "{s:?}"
+    );
+    assert_eq!(o.a.played.len(), 150, "A が 3 試合していない");
+    let from_seg1 = o.a.played.iter().take_while(|r| r.0 < 1).count();
+    assert_eq!(from_seg1, 50);
+    assert_eq!(wg.played, o.a.played[from_seg1..], "再戦の seg 1 の頭から");
+    assert_eq!(wg.played, o.b.played[from_seg1..]);
+    // 選択の記録はseg 0（選択）・1・2（再戦の積み直し）の3組。シードはそれぞれの切替のtickの値。
+    let sels = rematch_selects(&o.rig.recs);
+    let seeds: Vec<_> = sels
+        .iter()
+        .map(|(g, [p1, p2])| (*g, p1.rng_seed, p2.rng_seed))
+        .collect();
+    assert_eq!(
+        seeds,
+        [
+            (0, 0x4243, 0x4243),
+            (1, 0x4244, 0x4244),
+            (2, 0x4245, 0x4245)
+        ],
+        "積み直しのシードが切替の tick の値でない"
+    );
+    assert_eq!(wg.watched.len(), 1, "止める地点は再戦の seg 1 の 1 回");
+    assert_eq!(
+        wg.watched[0], sels[1].1,
+        "seg 1 の積み直しの Select を書いた"
+    );
+    assert_eq!(
+        (wg.watched[0][0].chara, wg.watched[0][1].chara),
+        (sels[0].1[0].chara, sels[0].1[1].chara),
+        "キャラが最初の選択と違う"
+    );
+    // 観戦者の偽のゲームはseg 1を1試合目と数えて3試合目も始める（フレームは来ない）。そのため試合の数は使ったフレームで見る。
+    assert_eq!(s.played, 100, "{s:?}");
+    assert_eq!(s.orphan_frames, 0, "{s:?}");
+    assert!(
+        o.rig.awaiting.iter().all(|(a, _)| !a),
+        "遡れたのに次の選択を待つ印が立った"
+    );
+    // seg 2の積み直しは試合を観ている間に届くので読み飛ばす（押下と同じtickのMenu・Select × 2）。
+    let sel_recs_after = |seg: u16| {
+        o.rig
+            .recs
+            .iter()
+            .skip_while(|r| !matches!(r, Record::Seg { seg: s } if *s == seg))
+            .take_while(|r| !matches!(r, Record::Frame { .. }))
+            .filter(|r| {
+                matches!(
+                    r,
+                    Record::Step(_) | Record::Menu { .. } | Record::Select { .. }
+                )
+            })
+            .count()
+    };
+    let copied = sel_recs_after(2);
+    assert!(copied > 2, "seg 2 に押下が積み直されていない");
+    let recs = &o.rig.recs;
+    assert!(
+        recs.iter()
+            .enumerate()
+            .all(|(i, r)| !matches!(r, Record::Step(_))
+                || matches!(recs.get(i + 1), Some(Record::Menu { .. }))),
+        "積み直しの Step の直後に同じ tick の Menu が無い"
+    );
+    // 観戦者の偽のゲームが3試合目にいるので最後のseg 3の後の選択の記録も読み飛ばす。
+    assert_eq!(
+        s.stray_records,
+        (copied + sel_recs_after(3)) as u64,
+        "{s:?}"
+    );
+    assert_eq!((s.stalls, s.jumps), (0, 0), "{s:?}");
+    assert_eq!(o.rig.leaks, 0);
+    assert_eq!(wg.ignored_presses, 0);
+}
+
+#[test]
+fn a_late_joiner_in_a_rematch_seg_starts_at_its_head_even_when_the_selection_is_past_the_rewind() {
+    HOST_REWIND.with(|c| c.set(Some(0)));
+    let o = rematch_run(false);
+    HOST_REWIND.with(|c| c.set(None));
+    let (wp, wg) = (&o.rig.wp, &o.rig.wg);
+    let s = wp.stats();
+    assert_eq!(
+        wp.end(),
+        Some(WatchEnd::HostEnded(ByeReason::Finished)),
+        "{s:?}"
+    );
+    let from_seg1 = o.a.played.iter().take_while(|r| r.0 < 1).count();
+    assert_eq!(wg.played, o.a.played[from_seg1..], "再戦の seg 1 の頭から");
+    assert_eq!(wg.watched.len(), 1, "{s:?}");
+    assert_eq!(s.orphan_frames, 0, "{s:?}");
+    assert!(
+        o.rig.awaiting.iter().all(|(a, _)| !a),
+        "次の選択を待つ印が立った"
+    );
+}
+
+#[test]
+fn a_late_joiner_in_a_rematch_seg_of_an_old_host_replays_the_rematches_from_the_last_selection() {
+    OLD_HOST.with(|c| c.set(true));
+    let o = rematch_run(false);
+    OLD_HOST.with(|c| c.set(false));
     assert!(o.rig.started);
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     let s = wp.stats();
@@ -1740,11 +1877,13 @@ fn a_late_joiner_in_a_rematch_seg_replays_the_rematches_from_the_last_selection(
 }
 
 #[test]
-fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
+fn a_late_joiner_in_a_rematch_seg_of_an_old_host_discards_the_frames_it_cannot_replay() {
     HOST_REWIND.with(|c| c.set(Some(0)));
+    OLD_HOST.with(|c| c.set(true));
     // ホストは最後の試合の後の選択を積まない: 印が立ったまま`End`を受ける形（終われば下りる）。
     let o = rematch_run(true);
     HOST_REWIND.with(|c| c.set(None));
+    OLD_HOST.with(|c| c.set(false));
     assert!(o.rig.started);
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     assert_eq!(wp.end(), Some(WatchEnd::HostEnded(ByeReason::Finished)));
@@ -1765,8 +1904,10 @@ fn a_late_joiner_in_a_rematch_seg_discards_the_frames_it_cannot_replay() {
 }
 
 #[test]
-fn a_late_joiner_in_a_rematch_seg_waits_for_the_next_seg_and_walks_into_its_selection() {
+fn a_late_joiner_in_a_rematch_seg_of_an_old_host_waits_for_the_next_seg_and_walks_into_its_selection()
+ {
     HOST_REWIND.with(|c| c.set(Some(0)));
+    OLD_HOST.with(|c| c.set(true));
     let (pa, pb) = plans();
     let remap = |p: Vec<Act>| {
         p.into_iter()
@@ -1795,6 +1936,7 @@ fn a_late_joiner_in_a_rematch_seg_waits_for_the_next_seg_and_walks_into_its_sele
     let late = |a: &MenuGame| a.matches == 1 && a.played.len() >= 50;
     let o = run_rig(a, b, w, true, &late, 5_000, 40_000);
     HOST_REWIND.with(|c| c.set(None));
+    OLD_HOST.with(|c| c.set(false));
     assert!(o.rig.started, "W を起こせていない");
     let (wp, wg) = (&o.rig.wp, &o.rig.wg);
     let s = wp.stats();
@@ -1996,7 +2138,7 @@ fn before_joining_decides_are_dropped() {
             wait_budget_us: WAIT_BUDGET_US,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let mut g = MenuGame::new(
@@ -2019,7 +2161,7 @@ fn before_joining_decides_are_dropped() {
             wait_budget_us: WAIT_BUDGET_US,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: false,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let mut g2 = MenuGame::new(
@@ -2697,7 +2839,7 @@ fn a_new_seg_forgets_the_previous_matchs_peer_stats() {
             wait_budget_us: WAIT_BUDGET_US,
             margin_frames: WATCH_MARGIN_FRAMES,
             require_net_selection: true,
-            ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+            ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
         },
     );
     let s = PeerStats::from_record(14, 1, 2);
@@ -2797,7 +2939,7 @@ fn the_slot_and_the_log_remember_the_family_the_first_stream_came_over() {
                 wait_budget_us: WAIT_BUDGET_US,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         let mut host = SpectateHost::with_capacity(

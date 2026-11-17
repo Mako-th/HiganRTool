@@ -26,7 +26,7 @@ use higanr_core::lan_addr::{self, LanAddr};
 use higanr_core::link;
 use higanr_core::mode_pick::{self, Pick, Shape};
 use higanr_core::rollback;
-use higanr_core::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX, FF_UPDATES_MIN};
+use higanr_core::spectate_pace::{FF_FPS_DEFAULT, FF_FPS_MAX, FF_FPS_MIN};
 use higanr_core::status_side::StatusSide;
 use higanr_core::wire::{Mode, Seat};
 
@@ -112,9 +112,9 @@ const OLD_DELAY_KEYS: [&str; 2] = ["latency", "rollback_delay"];
 
 /// 観戦の節。`[netplay]`の`enable = 1`と一緒にだけ効く（ネットワークが無ければ観戦もしない）。
 /// この節が無い・`enable = 0`なら観戦のホストは何もしない。
-/// `ff_max`と`relay`は観戦者の側の設定で`enable`に関わらず効く。
+/// `ff_fps`と`relay`は観戦者の側の設定で`enable`に関わらず効く。
 pub const SPECTATE_SECTION: &str = "spectate";
-const SPECTATE_KEYS: [&str; 5] = ["enable", "code_dir", "ff_max", "relay", "fake_uplink"];
+const SPECTATE_KEYS: [&str; 5] = ["enable", "code_dir", "ff_fps", "relay", "fake_uplink"];
 
 /// iniの`[spectate] enable = 1`のときの設定（ホストの側。観戦者は`[netplay] code_side = spectate`）。
 ///
@@ -180,29 +180,22 @@ fn spectate_of(ini: &Ini, notes: &mut Vec<IniNote>) -> Result<Option<SpectateSet
     }))
 }
 
-/// iniの`[spectate] ff_max`（観戦者の早送りの速さ。1表示あたりの更新の数。8なら8倍）。
+/// iniの`[spectate] ff_fps`（観戦者の早送りの速さ。毎秒の更新の数。480なら8倍）。
 /// 観戦者の側の設定なので`enable`に関わらず読む。範囲の外・数でない値は注を残して既定に戻す。
-fn ff_max_of(ini: &Ini, notes: &mut Vec<IniNote>) -> u32 {
-    let Some(v) = ini.get(SPECTATE_SECTION, "ff_max") else {
-        return FF_UPDATES_DEFAULT;
+fn ff_fps_of(ini: &Ini, notes: &mut Vec<IniNote>) -> u32 {
+    let Some(v) = ini.get(SPECTATE_SECTION, "ff_fps") else {
+        return FF_FPS_DEFAULT;
     };
-    let read = num_in::<u32>(v, "ff_max").and_then(|n| {
-        if (FF_UPDATES_MIN..=FF_UPDATES_MAX).contains(&n) {
+    let read = num_in::<u32>(v, "ff_fps").and_then(|n| {
+        if (FF_FPS_MIN..=FF_FPS_MAX).contains(&n) {
             Ok(n)
         } else {
             Err(format!(
-                "ff_max の値 {n} は {FF_UPDATES_MIN}〜{FF_UPDATES_MAX} にしてください"
+                "ff_fps の値 {n} は {FF_FPS_MIN}〜{FF_FPS_MAX} にしてください"
             ))
         }
     });
-    soft(
-        notes,
-        ini,
-        SPECTATE_SECTION,
-        "ff_max",
-        read,
-        FF_UPDATES_DEFAULT,
-    )
+    soft(notes, ini, SPECTATE_SECTION, "ff_fps", read, FF_FPS_DEFAULT)
 }
 
 /// iniの`[spectate] relay`（観戦中にほかの観戦者へ中継するかどうか。既定1）。観戦者の側の設定なので`enable`に関わらず読む。
@@ -390,8 +383,8 @@ pub struct NetSettings {
     pub after_script: AfterScript,
     /// 観戦のホスト（`[spectate] enable = 1`）。Noneなら観戦しない。
     pub spectate: Option<SpectateSettings>,
-    /// 観戦者の早送りの速さ（iniの`[spectate] ff_max`。1〜16、既定`FF_UPDATES_DEFAULT`。観戦のホストの設定とは別で`enable`に関わらず読む）。
-    pub ff_max: u32,
+    /// 観戦者の早送りの速さ（iniの`[spectate] ff_fps`。120〜6000の毎秒の更新の数。既定は`FF_FPS_DEFAULT`。観戦のホストの設定とは別に`enable`に関わらず読む）。
+    pub ff_fps: u32,
     /// 観戦中にほかの観戦者へ中継するかどうか（iniの`[spectate] relay`。既定true。観戦のホストの設定とは別で`enable`に関わらず読む）。
     pub relay: bool,
     /// 望むモード（iniの`mode = rollback | delay`。既定rollback）。両者がrollbackを望んだときだけrollback
@@ -745,7 +738,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         _ => bind_of(need("bind")?, scope)?,
     };
     let spectate = spectate_of(ini, &mut notes)?;
-    let ff_max = ff_max_of(ini, &mut notes);
+    let ff_fps = ff_fps_of(ini, &mut notes);
     let relay = relay_of(ini, &mut notes);
     let clipboard = match (code_side, get("clipboard")) {
         (_, None) => ClipboardKind::default(),
@@ -1100,7 +1093,7 @@ pub fn from_ini(ini: &Ini) -> Result<Option<NetSettings>, String> {
         lat_plan,
         after_script,
         spectate,
-        ff_max,
+        ff_fps,
         relay,
         mode,
         rollback_delay,
@@ -4042,10 +4035,16 @@ mod tests {
             !dist.lines().any(|l| l.starts_with("host_seat")),
             "おまかせは行が無いこと"
         );
-        // [pacing]のmode・wait・vsyncの行は既定値と同じ。
+        // [pacing]のmode・wait・vsync・replay_skip_fps・replay_slow_fpsの行は既定値と同じ。
         let pacing = |t: &str| higanr_core::pacing::mode_from_ini(&ini::parse(t).unwrap());
         let mut bare = dist.clone();
-        for line in ["mode = auto\n", "wait = passive\n", "vsync = off\n"] {
+        for line in [
+            "mode = auto\n",
+            "wait = passive\n",
+            "vsync = off\n",
+            "replay_skip_fps = 240\n",
+            "replay_slow_fps = 30\n",
+        ] {
             assert_eq!(dist.matches(&format!("\n{line}")).count(), 1, "{line}");
             bare = bare.replacen(&format!("\n{line}"), "\n", 1);
         }
@@ -4274,44 +4273,48 @@ mod tests {
         assert_eq!(from_text(off).unwrap(), None);
     }
 
-    /// `[spectate] ff_max`は観戦者の側の設定で`enable`に関わらず読む。既定は8。範囲は1〜16。範囲の外・数でない値は注を残して既定にする。
+    /// `[spectate] ff_fps`は観戦者の側の設定で`enable`に関わらず読む。既定は480。範囲は120〜6000。範囲の外・数でない値は注を残して既定にする。
     #[test]
-    fn ff_max_reads_one_to_sixteen_with_or_without_enable_and_falls_back_on_bad_values() {
-        assert_eq!(FF_UPDATES_DEFAULT, 8);
+    fn ff_fps_reads_120_to_6000_with_or_without_enable_and_falls_back_on_bad_values() {
+        assert_eq!(FF_FPS_DEFAULT, 480);
         let base = from_text(OK).unwrap().unwrap();
-        assert_eq!(base.ff_max, 8, "既定");
+        assert_eq!(base.ff_fps, 480, "既定");
         for (text, want) in [
-            ("[spectate]\nff_max = 1\n", 1),
-            ("[spectate]\nff_max = 16\n", 16),
-            ("[spectate]\nff_max = 4\n", 4),
+            ("[spectate]\nff_fps = 120\n", 120),
+            ("[spectate]\nff_fps = 6000\n", 6000),
+            ("[spectate]\nff_fps = 500\n", 500),
             // 観戦のホスト（enable）と関係なく読む。
-            ("[spectate]\nenable = 0\nff_max = 12\n", 12),
-            ("[spectate]\nenable = 1\nff_max = 12\n", 12),
+            ("[spectate]\nenable = 0\nff_fps = 720\n", 720),
+            ("[spectate]\nenable = 1\nff_fps = 720\n", 720),
         ] {
             let s = from_text(&format!("{OK}{text}")).unwrap().unwrap();
-            assert_eq!(s.ff_max, want, "{text:?}");
+            assert_eq!(s.ff_fps, want, "{text:?}");
             assert!(s.ini_notes.is_empty(), "{text:?}: 正しい値に注が付いた");
         }
         // 観戦者の形（code_side = spectate）でも読める。
         let viewer_base = "[netplay]\nenable = 1\nscope = lan\nbind = 127.0.0.1:47201\n";
         let viewer = from_text(&format!(
-            "{viewer_base}code_side = spectate\nname = viewer\ncode_dir = watch_a\n[spectate]\nff_max = 3\n"
+            "{viewer_base}code_side = spectate\nname = viewer\ncode_dir = watch_a\n[spectate]\nff_fps = 180\n"
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(viewer.ff_max, 3);
-        for bad in ["0", "17", "-1", "abc", "", "8.5", "4294967297"] {
-            let s = from_text(&format!("{OK}[spectate]\nff_max = {bad}\n"))
+        assert_eq!(viewer.ff_fps, 180);
+        for bad in ["0", "119", "6001", "-1", "abc", "", "8.5", "4294967297"] {
+            let s = from_text(&format!("{OK}[spectate]\nff_fps = {bad}\n"))
                 .unwrap()
                 .unwrap();
-            assert_eq!(s.ff_max, 8, "{bad:?}: 読めない行は既定");
-            assert_eq!(note_keys(&s), vec!["ff_max"], "{bad:?}");
+            assert_eq!(s.ff_fps, 480, "{bad:?}: 読めない行は既定");
+            assert_eq!(note_keys(&s), vec!["ff_fps"], "{bad:?}");
         }
-        // キーの綴りを間違えるとff_maxは読まれず、そのキーに注が付く。
+        // キーの綴りを間違えるとff_fpsは読まれず、そのキーに注が付く。古いキーのff_maxも同じ。
         let typo = from_text(&format!("{OK}[spectate]\nff_mx = 3\n"))
             .unwrap()
             .unwrap();
-        assert_eq!((typo.ff_max, note_keys(&typo)), (8, vec!["ff_mx"]));
+        assert_eq!((typo.ff_fps, note_keys(&typo)), (480, vec!["ff_mx"]));
+        let old = from_text(&format!("{OK}[spectate]\nff_max = 4\n"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((old.ff_fps, note_keys(&old)), (480, vec!["ff_max"]));
     }
 
     #[test]

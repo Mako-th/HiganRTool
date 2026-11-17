@@ -5,7 +5,7 @@ use super::*;
 use higanr_core::spectate::{
     BEHIND_RECORDS, CATCHUP_PACKETS_PER_POLL, CATCHUP_PACKETS_PER_WATCHER, RESEND_CAP_MIN_MS,
 };
-use higanr_core::spectate_pace::{FF_UPDATES_DEFAULT, FF_UPDATES_MAX};
+use higanr_core::spectate_pace::{FF_FPS_DEFAULT, FF_UPDATES_DEFAULT, FF_UPDATES_MAX};
 use higanr_core::spectate_rate::{burst_bytes, total_cap_bps, watcher_cap_bps};
 
 /// 観戦者1をJOINさせる。16記録を積んで送り`rtt` ms後に全部届いたACKを返す。これを`rounds`回くり返したホスト（往復の見積もりが`rtt`に落ち着いた形）。
@@ -479,7 +479,7 @@ fn ten_late_spectators_stay_within_the_total_cap() {
         late_s: 20,
         watchers: 1,
         policy: Policy::Pace,
-        ff_max: FF_UPDATES_DEFAULT,
+        ff_fps: FF_FPS_DEFAULT,
         seed: MEASURE_SEEDS[0],
         limit_s: 60,
     };

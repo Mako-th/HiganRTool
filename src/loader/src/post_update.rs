@@ -396,4 +396,19 @@ mod tests {
         let en = crate::ui_lang::without_game_items(NOTES.en);
         assert!(!has_japanese(&en), "英語の変更点に日本語がある");
     }
+
+    #[test]
+    fn the_notes_headline_names_the_crate_version() {
+        let want = format!("HiganRTool v{}", env!("CARGO_PKG_VERSION"));
+        for lang in Lang::ALL {
+            let head = NOTES.get(lang).lines().next().unwrap_or("");
+            let next = head
+                .strip_prefix(&want)
+                .and_then(|rest| rest.chars().next());
+            assert!(
+                next.is_some_and(|c| !c.is_ascii_digit() && c != '.'),
+                "{lang:?}: {head}"
+            );
+        }
+    }
 }

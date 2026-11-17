@@ -7,13 +7,15 @@
 //! - 上乗せの時間: ゲームのスレッドが`TIMINGS.record`で書き、読み取りのスレッドが終わりに`snapshot`で読む。
 #![forbid(unsafe_code)]
 
-use core::sync::atomic::{AtomicU32, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 use std::io::Write;
 
 use higanr_core::overlay::{self as ov, GAME_GLYPHS, MAX_TEXT, Rect, Status, game_index};
 use higanr_core::pacing::Dist;
+use higanr_core::save_skip::SCREEN_TITLE;
 
 use crate::log_mode::detail_out;
+use crate::scripted::SCENE_MENU;
 use crate::th09_addr::{
     ANM_LOADED_START, ANM_LOADED_STRIDE, ANM_QUAD_VB, ANM_VTX_FORMAT, ANM_VTX_FORMAT_QUAD_VB,
     ASCII_ANM_INDEX, ASCII_ANM_NAME, LOADED_FILE, LOADED_NAME, LOADED_PROGRESS, LOADED_SPRITES,
@@ -139,6 +141,50 @@ impl Default for TextBox {
 
 /// 表示する文（描画の入口が読む。`\n`区切りで最大`MAX_LINES`行）。
 pub static TEXT: TextBox = TextBox::new();
+
+/// タイトル画面にいる間だけ真（ゲームのスレッドが`publish_title_mark`で書き、描画の入口が`title_mark_up`で読む）。
+/// 検査ではスレッドごとに持つ（別の検査のtickが描画の検査に混ざらないように）。
+#[cfg(not(test))]
+static TITLE_MARK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static TITLE_MARK: AtomicBool = const { AtomicBool::new(false) };
+}
+
+#[cfg(not(test))]
+fn set_title_mark(on: bool) {
+    TITLE_MARK.store(on, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_title_mark(on: bool) {
+    TITLE_MARK.with(|m| m.store(on, Ordering::Relaxed));
+}
+
+#[cfg(not(test))]
+pub fn title_mark_up() -> bool {
+    TITLE_MARK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn title_mark_up() -> bool {
+    TITLE_MARK.with(|m| m.load(Ordering::Relaxed))
+}
+
+/// タイトル画面のバージョンの行を出すかどうか。
+/// MainMenuのポインタは場面2になっても0に戻らないので画面番号はメニューの場面のときだけ読む。
+/// `screen`は読めなかったときは`None`。`board_shown`は盤が出ている間だけ真（画面6の盤と重ねないため）。
+pub fn title_mark_visible(scene: u32, screen: Option<u32>, board_shown: bool) -> bool {
+    scene == SCENE_MENU && screen == Some(SCREEN_TITLE) && !board_shown
+}
+
+pub fn hide_title_mark() {
+    set_title_mark(false);
+}
+
+pub fn publish_title_mark(scene: u32, screen: Option<u32>, board_shown: bool) {
+    set_title_mark(title_mark_visible(scene, screen, board_shown));
+}
 
 /// 接続で決まったLatency（`NO_LATENCY`なら出さない）。ネットワークのスレッドが書き、更新スレッドが250 msごとに読んで文にする。
 pub static LATENCY: AtomicU32 = AtomicU32::new(NO_LATENCY);
@@ -877,6 +923,17 @@ pub(crate) mod tests {
         let mut utf8 = [0u8; ov::MAX_TEXT_UTF8];
         let m = ov::utf16_to_utf8(&units[..n], &mut utf8);
         Some(String::from_utf8(utf8[..m].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn title_mark_shows_only_on_the_title_screen_without_a_board() {
+        assert!(title_mark_visible(SCENE_MENU, Some(SCREEN_TITLE), false));
+        // メニューのほかの画面（Matchの画面6）。
+        assert!(!title_mark_visible(SCENE_MENU, Some(6), false));
+        // 場面2（試合・リプレイ・タイトルのデモ）ではMainMenuの画面番号が1のまま残っていても出さない。
+        assert!(!title_mark_visible(2, Some(SCREEN_TITLE), false));
+        assert!(!title_mark_visible(SCENE_MENU, Some(SCREEN_TITLE), true));
+        assert!(!title_mark_visible(SCENE_MENU, None, false));
     }
 
     #[test]

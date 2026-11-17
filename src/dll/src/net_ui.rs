@@ -22,6 +22,9 @@ use higanr_core::handshake::Name;
 use higanr_core::input_model::{InputState, keys};
 use higanr_core::lan_addr::{AddrBuf, LanAddr};
 use higanr_core::lang::{Lang, Tx};
+use higanr_core::lobby::{
+    LOBBY_ROOM_WORDS, LOBBY_ROW_WORDS, LOBBY_ROWS_MAX, LobbyRoom, LobbyRow, LobbySnapshot,
+};
 use higanr_core::menu_model::{CANCEL_BITS, SCREEN_DIFFICULTY};
 use higanr_core::mode_pick::{MAX_PICK_DELAY, Pick, Shape};
 use higanr_core::net_menu::return_lines;
@@ -50,7 +53,7 @@ use higanr_core::wire::{ByeReason, Mode, Seat, SeatWish};
 use crate::digit_keys::{self, DigitEdge};
 use crate::netplay::REQ_SAVE_AND_QUIT;
 use crate::netplay::{Action, Game, Net, NetPlay, Phase, SCENE_MATCH};
-use crate::overlay::{TEXT_UNITS, TextBox};
+use crate::overlay::{TEXT_UNITS, TextBox, hide_title_mark, publish_title_mark};
 use crate::scripted::SCENE_MENU;
 use crate::spectate_watch::{WatchNotice, WatchPlay};
 
@@ -73,6 +76,10 @@ pub enum Order {
     Random,
     /// 観戦コードをコピー（対戦の最中。ホストの監視スレッドがクリップボードへ書く）。
     SpectateCopy,
+    /// ルーム名ごとの一覧へ`create`して割り当てのルームで待つ（打ったルーム名は`Room`と同じバッファ）。
+    LobbyCreate,
+    /// 一覧の待機中の行の2人用のルームへguestとして入る（割り当てのルーム名は`UiLink::lobby_pick`。打ったルーム名は`Room`と同じバッファ）。
+    LobbyJoin,
 }
 
 impl Order {
@@ -86,6 +93,8 @@ impl Order {
             Order::SpectateCancel => 6,
             Order::Random => 7,
             Order::SpectateCopy => 8,
+            Order::LobbyCreate => 9,
+            Order::LobbyJoin => 10,
         }
     }
 
@@ -99,10 +108,16 @@ impl Order {
             6 => Some(Order::SpectateCancel),
             7 => Some(Order::Random),
             8 => Some(Order::SpectateCopy),
+            9 => Some(Order::LobbyCreate),
+            10 => Some(Order::LobbyJoin),
             _ => None,
         }
     }
 }
+
+/// ルーム名ごとの一覧の接続を開け閉めする仕事。`Some((ルーム名, 世代))`で開け、`None`で閉じる。
+/// 開けられなかったらfalseを返す（`NetUi`がコピーを「取得できなかった」にする）。
+pub type LobbyFeedFn = fn(Option<(RoomBuf, u32)>) -> bool;
 
 /// 指示のリングバッファの長さ（2の冪）。人の操作は1 tickに1つ以下。監視スレッドは数十msごとに取るので溢れない（溢れたら新しい指示を捨てる）。
 const ORDER_RING: usize = 8;
@@ -136,6 +151,13 @@ pub struct UiLink {
     spectate_pick: WatchRowBox,
     /// 観戦の決定が「観戦コード入力」かどうか（1 = 観戦コード。0 = ルーム名か一覧の行）。`Order::Spectate`を積む前に書く。
     spectate_by_code: AtomicU32,
+    /// ルーム名ごとの一覧（書き手は一覧の接続のスレッド`lobby_feed`。読み手はゲームのスレッド）と、その接続の世代（`watch_gen`と同じ使い方）。
+    lobby_list: LobbyListBox,
+    lobby_gen: AtomicU32,
+    /// 一覧から選んだ待機中の行の割り当てのルーム名（`Order::LobbyJoin`を積む前に書く）。
+    lobby_pick: LobbyRoomBox,
+    /// 自分が一覧へ作って待っている割り当てのルーム（書き手は監視スレッド。読み手はゲームのスレッド）。待っていなければ空。
+    own_lobby: LobbyRoomBox,
 }
 
 impl Default for UiLink {
@@ -198,6 +220,10 @@ impl UiLink {
             watch_gen: AtomicU32::new(0),
             spectate_pick: WatchRowBox::new(),
             spectate_by_code: AtomicU32::new(0),
+            lobby_list: LobbyListBox::new(),
+            lobby_gen: AtomicU32::new(0),
+            lobby_pick: LobbyRoomBox::new(),
+            own_lobby: LobbyRoomBox::new(),
         }
     }
 
@@ -226,6 +252,15 @@ impl UiLink {
             Cmd::Room(name) => {
                 self.room_name.publish(&name);
                 self.push(Order::Room);
+            }
+            Cmd::LobbyCreate(name) => {
+                self.room_name.publish(&name);
+                self.push(Order::LobbyCreate);
+            }
+            Cmd::LobbyJoin(name, room) => {
+                self.room_name.publish(&name);
+                self.lobby_pick.publish(&room);
+                self.push(Order::LobbyJoin);
             }
             Cmd::Spectate(name) => {
                 self.spectate_name.publish(&name);
@@ -299,6 +334,62 @@ impl UiLink {
     /// ゲームのスレッド: `seen`より新しい一覧があれば`scratch`へ読み、`seen`を進めてtrueを返す。書きかけか変わっていなければfalseを返す（`scratch`は使わない）。
     pub fn read_watch_list(&self, scratch: &mut WatchSnapshot, seen: &mut u32) -> bool {
         self.watch_list.read_newer(scratch, seen)
+    }
+
+    /// 監視スレッド: `Order::LobbyJoin`に添えられた割り当てのルーム名（書きかけなら読み直す。まだ無ければ`None`）。
+    pub fn lobby_pick(&self) -> Option<LobbyRoom> {
+        (0..4).find_map(|_| self.lobby_pick.read()).flatten()
+    }
+
+    /// 監視スレッド: 自分が一覧へ作って待っているルームを書く（待ちが終わったら`None`）。書き手は監視スレッドだけ。
+    pub fn set_own_lobby(&self, room: Option<&LobbyRoom>) {
+        match room {
+            Some(r) => self.own_lobby.publish(r),
+            None => self.own_lobby.clear(),
+        }
+    }
+
+    /// ゲームのスレッド: 自分が一覧へ作って待っているルーム（書きかけなら読み直す。4回読んでも読めなければ`None`）。確保しない。
+    pub fn own_lobby(&self) -> Option<LobbyRoom> {
+        (0..4).find_map(|_| self.own_lobby.read()).flatten()
+    }
+
+    /// 一覧の接続のスレッド: `generation`がいまの世代のときだけルーム名ごとの一覧を書き、書いたかどうかを返す。
+    /// 止めた古いスレッドと書き合うと待つことがあるのでゲームのスレッドは呼ばない。
+    pub fn publish_lobby_list(
+        &self,
+        generation: u32,
+        status: ListStatus,
+        rows: &[LobbyRow],
+    ) -> bool {
+        self.lobby_list
+            .publish(generation, &self.lobby_gen, status, rows)
+    }
+
+    /// ゲームのスレッド: 一覧の画面を開け閉めするたびに世代を1つ進めて、進めた後の値を返す。
+    pub fn next_lobby_generation(&self) -> u32 {
+        self.lobby_gen
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    #[cfg(test)]
+    pub fn lobby_generation(&self) -> u32 {
+        self.lobby_gen.load(Ordering::Acquire)
+    }
+
+    pub fn lobby_list_version(&self) -> u32 {
+        self.lobby_list.version()
+    }
+
+    /// ゲームのスレッド: `read_watch_list`と同じ読み方でルーム名ごとの一覧を読む。`generation`の世代で書かれた一覧だけを受け取る。
+    pub fn read_lobby_list(
+        &self,
+        scratch: &mut LobbySnapshot,
+        seen: &mut u32,
+        generation: u32,
+    ) -> bool {
+        self.lobby_list.read_newer(scratch, seen, generation)
     }
 
     fn push(&self, o: Order) {
@@ -673,6 +764,193 @@ impl Default for WatchRowBox {
     }
 }
 
+/// `WatchListBox`の状態の1ワードを読む。
+fn list_meta_read(meta: u32) -> (ListStatus, usize) {
+    let status = match meta & 0xFF {
+        1 => ListStatus::Ready,
+        2 => ListStatus::Failed,
+        _ => ListStatus::Loading,
+    };
+    (status, (meta >> 8) as usize)
+}
+
+/// ワード0は書いた世代。ワード1は状態と件数。行はワード2から。
+const LOBBY_BOX_HEAD: usize = 2;
+const LOBBY_BOX_WORDS: usize = LOBBY_BOX_HEAD + LOBBY_ROWS_MAX * LOBBY_ROW_WORDS;
+
+/// ルーム名ごとの一覧のタグつきのバッファ（`WatchListBox`と同じseqlockに世代を足したもの）。
+/// 書き手は止めた古いスレッドと新しいスレッドの2本になりうるので書く権利（奇数のseq）を比較交換で取る。
+pub struct LobbyListBox {
+    seq: AtomicU32,
+    words: [AtomicU32; LOBBY_BOX_WORDS],
+}
+
+impl LobbyListBox {
+    pub fn new() -> LobbyListBox {
+        LobbyListBox {
+            seq: AtomicU32::new(0),
+            words: [const { AtomicU32::new(0) }; LOBBY_BOX_WORDS],
+        }
+    }
+
+    pub fn version(&self) -> u32 {
+        self.seq.load(Ordering::Acquire) & !1
+    }
+
+    /// 書く権利を取ってから`current`を読み、`generation`と違えば何も書かずにfalseを返す。
+    /// 権利を取った後に世代を見るので世代が進んだ後に古い書き手が書くことはない。
+    pub fn publish(
+        &self,
+        generation: u32,
+        current: &AtomicU32,
+        status: ListStatus,
+        rows: &[LobbyRow],
+    ) -> bool {
+        let s = loop {
+            let s = self.seq.load(Ordering::Relaxed);
+            if s & 1 == 0
+                && self
+                    .seq
+                    .compare_exchange_weak(
+                        s,
+                        s.wrapping_add(1),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                break s;
+            }
+            std::thread::yield_now();
+        };
+        fence(Ordering::Release);
+        if current.load(Ordering::Acquire) != generation {
+            // 中身を変えていないので元のseqへ戻す（読みかけの読み手もそのまま読める）。
+            self.seq.store(s, Ordering::Release);
+            return false;
+        }
+        let n = rows.len().min(LOBBY_ROWS_MAX);
+        let [g, meta, ..] = &self.words;
+        g.store(generation, Ordering::Relaxed);
+        meta.store(WatchListBox::meta(status, n), Ordering::Relaxed);
+        for (i, row) in rows.iter().take(n).enumerate() {
+            for (d, v) in self
+                .words
+                .iter()
+                .skip(LOBBY_BOX_HEAD + i * LOBBY_ROW_WORDS)
+                .zip(row.to_words())
+            {
+                d.store(v, Ordering::Relaxed);
+            }
+        }
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+        true
+    }
+
+    /// `generation`の世代で書かれた一覧だけを読む。違う世代の一覧は`out`を使わずに読んだことにする（同じものを読み直さない）。
+    pub fn read_newer(&self, out: &mut LobbySnapshot, seen: &mut u32, generation: u32) -> bool {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 || s1 == *seen || s1 == 0 {
+            return false;
+        }
+        let [g, meta, ..] = &self.words;
+        let (g, meta) = (g.load(Ordering::Relaxed), meta.load(Ordering::Relaxed));
+        if g != generation {
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == s1 {
+                *seen = s1;
+            }
+            return false;
+        }
+        let (status, n) = list_meta_read(meta);
+        let n = n.min(LOBBY_ROWS_MAX);
+        out.clear();
+        let mut ok = true;
+        for i in 0..n {
+            let mut w = [0u32; LOBBY_ROW_WORDS];
+            for (d, v) in w
+                .iter_mut()
+                .zip(self.words.iter().skip(LOBBY_BOX_HEAD + i * LOBBY_ROW_WORDS))
+            {
+                *d = v.load(Ordering::Relaxed);
+            }
+            match LobbyRow::from_words(&w) {
+                Some(r) => ok &= out.push(r),
+                None => ok = false,
+            }
+        }
+        fence(Ordering::Acquire);
+        if !ok || self.seq.load(Ordering::Relaxed) != s1 {
+            return false;
+        }
+        out.status = status;
+        *seen = s1;
+        true
+    }
+}
+
+impl Default for LobbyListBox {
+    fn default() -> Self {
+        LobbyListBox::new()
+    }
+}
+
+/// 割り当てのルーム名1つのタグつきのバッファ（`RoomNameBox`と同じseqlock）。読めたら`Some(名 or 空)`。書きかけなら`None`。
+pub struct LobbyRoomBox {
+    seq: AtomicU32,
+    words: [AtomicU32; LOBBY_ROOM_WORDS],
+}
+
+impl LobbyRoomBox {
+    pub const fn new() -> LobbyRoomBox {
+        LobbyRoomBox {
+            seq: AtomicU32::new(0),
+            words: [const { AtomicU32::new(0) }; LOBBY_ROOM_WORDS],
+        }
+    }
+
+    pub fn publish(&self, room: &LobbyRoom) {
+        self.store(room.to_words());
+    }
+
+    /// 空にする（全部0のワードは`LobbyRoom::from_words`が読めないので`read`は`Some(None)`を返す）。
+    pub fn clear(&self) {
+        self.store([0; LOBBY_ROOM_WORDS]);
+    }
+
+    fn store(&self, w: [u32; LOBBY_ROOM_WORDS]) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (d, v) in self.words.iter().zip(w) {
+            d.store(v, Ordering::Relaxed);
+        }
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    pub fn read(&self) -> Option<Option<LobbyRoom>> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            return None;
+        }
+        if s1 == 0 {
+            return Some(None);
+        }
+        let mut w = [0u32; LOBBY_ROOM_WORDS];
+        for (d, v) in w.iter_mut().zip(&self.words) {
+            *d = v.load(Ordering::Relaxed);
+        }
+        fence(Ordering::Acquire);
+        (self.seq.load(Ordering::Relaxed) == s1).then(|| LobbyRoom::from_words(&w))
+    }
+}
+
+impl Default for LobbyRoomBox {
+    fn default() -> Self {
+        LobbyRoomBox::new()
+    }
+}
+
 // ---- 描く行の盤 ----
 
 /// 盤の行の割り当て: メニューの行（`MENU_ROWS`）・左上の2行（警告のときは続きの2行も）・マッチ中の行。
@@ -728,6 +1006,18 @@ const SHOW_MATCH: u32 = SHOW_HUD | SHOW_NAMES;
 /// メニュー・左上の行の更新が消さずに残すフラグ。
 /// 相手を待つ知らせは`peer_wait`だけが、観戦コードの知らせは`copy_tick`だけが、新しいバージョンの知らせは`update_tick`だけが決める。
 const SHOW_KEPT: u32 = SHOW_MATCH | SHOW_PEER_WAIT | SHOW_COPY | SHOW_UPDATE;
+
+/// 試合中（ネット対戦でない試合も）に左上の警告の行を出しておく秒数。過ぎたら消す。試合を出たらまた出す。
+const MATCH_WARN_SECS: u64 = 30;
+
+/// 試合中に出している警告の種類。種類が替わったら秒数を数え直す（同じ種類の中で文が変わっても数え直さない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarnKey {
+    /// 接続できないときの最大5行（`stall_block`）。
+    Stall,
+    /// 左上の2行（`corner_lines`・`return_lines`）。
+    Corner(Conn),
+}
 
 /// 左上の行の置き場（画素。ゲームの上の枠の下から）。マッチ中の行の置き場と幅の上限は`ui_layout`の`HUD_*`。
 const TL_X: u32 = 6;
@@ -1258,6 +1548,8 @@ pub struct NetUi {
     /// ネットワーク一式を後始末した（`after_teardown`）ときの終わりの状態。ネットワークを閉じている間は左上の行にこれを出し続ける。
     /// 入口のメニューを開くか次のネットワークを開き始めたら消す。
     ended: Option<Conn>,
+    /// 試合中に出している警告の種類と出し始めたUNIX秒（`MATCH_WARN_SECS`）。試合の外と警告の無い間は`None`。
+    match_warn: Option<(WarnKey, u64)>,
     /// 後始末したとき、監視スレッドの状態のタグ（`Note::seq`）がこの値のままなら読まない。
     /// 前の監視スレッドの状態をワーカースレッドが消すまでの数msに読み戻さないため。
     note_hold: Option<u32>,
@@ -1318,6 +1610,18 @@ pub struct NetUi {
     watch_scratch: Box<WatchSnapshot>,
     /// 読んだ一覧のバージョン（`UiLink::read_watch_list`）。
     watch_seen: u32,
+    /// ルーム名ごとの一覧の接続を開け閉めする仕事（`script_win`）。設定しなければ（検査）一覧は届かない。
+    lobby_feed: Option<LobbyFeedFn>,
+    /// いま一覧の接続を開けているルーム名。
+    lobby_on: Option<RoomBuf>,
+    /// メニューが読むルーム名ごとの一覧（持ち方は`watch`と同じ）。
+    lobby: Box<LobbySnapshot>,
+    lobby_scratch: Box<LobbySnapshot>,
+    lobby_seen: u32,
+    /// 最後に開け閉めしたときに進めた一覧の世代。この世代の一覧だけを受け取る。
+    lobby_gen: u32,
+    /// 最後に一覧へ戻した知らせ（`Event::LobbyGone`の`Note::seq`）。同じ知らせで2回戻さない。
+    lobby_gone_seq: u32,
     /// 対戦の後に接続が終わったら「妖怪 対 妖怪」へ戻す（`with_return_flow`。設定しない実行・検査は今までどおり）。
     ret_on: bool,
     /// 戻している途中。
@@ -1384,6 +1688,7 @@ impl NetUi {
             was_found: false,
             prev_word: 0,
             ended: None,
+            match_warn: None,
             note_hold: None,
             watch_advance: false,
             menu_screen: None,
@@ -1410,6 +1715,13 @@ impl NetUi {
             watch: Box::new(WatchSnapshot::EMPTY),
             watch_scratch: Box::new(WatchSnapshot::EMPTY),
             watch_seen: 0,
+            lobby_feed: None,
+            lobby_on: None,
+            lobby: Box::new(LobbySnapshot::EMPTY),
+            lobby_scratch: Box::new(LobbySnapshot::EMPTY),
+            lobby_seen: 0,
+            lobby_gen: 0,
+            lobby_gone_seq: 0,
             ret_on: false,
             ret: None,
             lost: None,
@@ -1450,6 +1762,13 @@ impl NetUi {
     /// 観戦の「ランダムマッチ」の一覧の接続を開け閉めする仕事を設定する。
     pub fn with_watch_feed(mut self, feed: Option<fn(bool)>) -> NetUi {
         self.watch_feed = feed;
+        self
+    }
+
+    /// ルーム名を決定したらルーム名ごとの一覧を出す（`Menu::with_lobby`）。`feed`は一覧の接続を開け閉めする仕事。
+    pub fn with_lobby(mut self, feed: Option<LobbyFeedFn>) -> NetUi {
+        self.menu = self.menu.with_lobby(true);
+        self.lobby_feed = feed;
         self
     }
 
@@ -1722,8 +2041,14 @@ impl NetUi {
 
     fn publish_menu(&mut self, f: &UiFacts) {
         let mut rows = MenuRows::new();
-        self.menu
-            .render_with(f.conn, &self.note, f.now, &mut rows, &self.watch);
+        self.menu.render_with(
+            f.conn,
+            &self.note,
+            f.now,
+            &mut rows,
+            &self.watch,
+            &self.lobby,
+        );
         for i in 0..rows.len {
             let (text, style) = (rows.lines[i], rows.styles[i]);
             self.put(i, text.as_str(), style);
@@ -1746,6 +2071,7 @@ impl NetUi {
     ///
     /// 「つながりました」（`Conn::Connected`）は画面7（難易度）までだけ出す。画面8から先は名前の帯と左下の行が替わりに出る。
     /// 待ち・見つかった・閉じた理由などの他の行は画面によらず出す（別の知らせまで消さない）。
+    /// ただし試合中は警告の行（閉じた理由・接続できないとき）を`MATCH_WARN_SECS`秒で消す（別のモードの試合を隠さないため）。
     fn publish_corner(&mut self, f: &UiFacts) {
         let conn = self.corner_conn(f);
         let mut lines = [LineBuf::new(); 2];
@@ -1778,6 +2104,19 @@ impl NetUi {
         if matches!(conn, Conn::Connected { .. }) && !self.connected_line_shows() {
             n = 0;
         }
+        let key = if blocks > 0 {
+            Some(WarnKey::Stall)
+        } else if n > 0 && styles[0] == RowStyle::Warn && conn != Conn::Desynced {
+            // 同期ズレの2行は今のマッチの話なので消さない。
+            Some(WarnKey::Corner(conn))
+        } else {
+            None
+        };
+        let (blocks, n) = if self.warn_expired(key, f.now) {
+            (0, 0)
+        } else {
+            (blocks, n)
+        };
         let mut mask = self.shown_mask & SHOW_KEPT;
         if blocks > 0 {
             for (i, (bit, row)) in TL_ROWS.into_iter().enumerate() {
@@ -1799,6 +2138,23 @@ impl NetUi {
             }
         }
         self.set_mask(mask);
+    }
+
+    /// 試合中の警告を出しておく秒数（`MATCH_WARN_SECS`）を過ぎたかどうか。
+    /// 試合の外では数えない。そのため試合を出るとまた出る。
+    fn warn_expired(&mut self, key: Option<WarnKey>, now: u64) -> bool {
+        let in_match = self.scene == split_kb::Scene::Match;
+        let Some(k) = key.filter(|_| in_match) else {
+            self.match_warn = None;
+            return false;
+        };
+        match self.match_warn {
+            Some((shown, since)) if shown == k => now.saturating_sub(since) >= MATCH_WARN_SECS,
+            _ => {
+                self.match_warn = Some((k, now));
+                false
+            }
+        }
     }
 
     fn publish_state(&mut self, f: &UiFacts) {
@@ -1869,6 +2225,7 @@ impl NetUi {
         let out = self.tick_inner(game, f);
         self.sync_text_gate(game);
         self.sync_watch_feed();
+        self.sync_lobby_feed();
         self.copy_tick(game, f.conn, f.now);
         self.update_tick(game, f.conn, f.now);
         out
@@ -2023,6 +2380,52 @@ impl NetUi {
         }
     }
 
+    /// ルーム名ごとの一覧の接続をメニューの一覧の画面（`Menu::wants_lobby`）に合わせる。
+    /// 開け閉めのたびにコピーを「取得中」・空に戻す。前の一覧が残っていると最初の一覧を空と読み違え、画面を出さずに作ってしまう。
+    fn sync_lobby_feed(&mut self) {
+        let want = self.menu.wants_lobby().map(|(name, _)| name);
+        if want == self.lobby_on {
+            return;
+        }
+        self.lobby_on = want;
+        self.lobby.set(ListStatus::Loading, &[]);
+        // 止めた古いスレッドはこの世代を書けず、書き終えていた古い一覧もこの世代でないので受け取らない。
+        self.lobby_gen = self.link.next_lobby_generation();
+        if want.is_some() {
+            self.lobby_seen = self.link.lobby_list_version();
+        }
+        if let Some(feed) = self.lobby_feed {
+            let started = feed(want.map(|n| (n, self.lobby_gen)));
+            // バッファはゲームのスレッドから書かない（古い書き手を待つことがある）。コピーを直接「取得できなかった」にする。
+            if want.is_some() && !started {
+                self.lobby.set(ListStatus::Failed, &[]);
+            }
+        }
+    }
+
+    fn refresh_lobby(&mut self) {
+        if self.lobby_on.is_some()
+            && self.link.read_lobby_list(
+                &mut self.lobby_scratch,
+                &mut self.lobby_seen,
+                self.lobby_gen,
+            )
+        {
+            core::mem::swap(&mut self.lobby, &mut self.lobby_scratch);
+        }
+        if self.lobby_on.is_some() {
+            self.menu.set_own_lobby(self.link.own_lobby());
+        }
+    }
+
+    /// 一覧から選んだ相手がもう待っていなかった（監視の処理の`Event::LobbyGone`）ら一覧の画面へ戻す。
+    fn follow_lobby_gone(&mut self) {
+        if self.note.event == Event::LobbyGone && self.note.seq != self.lobby_gone_seq {
+            self.lobby_gone_seq = self.note.seq;
+            self.menu.return_to_lobby();
+        }
+    }
+
     /// 一覧の画面の間は接続のスレッドが書いた新しい一覧を読んでメニューへ渡す。
     fn refresh_watch(&mut self) {
         if self.watch_on
@@ -2059,12 +2462,15 @@ impl NetUi {
 
     fn tick_inner<G: Game>(&mut self, game: &mut G, f: &UiFacts) -> UiOut {
         self.refresh_note();
+        self.follow_lobby_gone();
         self.refresh_watch();
+        self.refresh_lobby();
         // 後始末した後の終わりの行は、人が入口のメニューを開いたか次のネットワークを開き始めたら役目を終える。
         if f.net != NetPhase::Closed || self.menu.is_active() {
             self.ended = None;
         }
         if let Some(out) = self.return_tick(game, f) {
+            hide_title_mark();
             return out;
         }
         let found = matches!(f.conn, Conn::Found { .. });
@@ -2073,6 +2479,7 @@ impl NetUi {
         let (cur, next) = game.scenes();
         // 場面2への切替のtickはMainMenuが取り除かれうるので読まない（`Game::menu_view`）。
         if cur != SCENE_MENU || next == SCENE_MATCH {
+            hide_title_mark();
             self.scene = if cur == SCENE_MATCH || next == SCENE_MATCH {
                 split_kb::Scene::Match
             } else {
@@ -2082,10 +2489,13 @@ impl NetUi {
             return UiOut::default();
         }
         let Some(v) = game.menu_view() else {
+            hide_title_mark();
             self.scene = split_kb::Scene::Other;
             self.leave_menu_scene(f);
             return UiOut::default();
         };
+        // タイトル画面のバージョンの行を出すかどうかのフラグを書く。毎tick読んでいるMainMenuの画面番号をそのまま使う。
+        publish_title_mark(cur, Some(v.screen), self.board.show() != 0);
         self.scene = split_kb::Scene::Menu {
             screen: v.screen,
             select_kind: v.select_kind,
@@ -2173,6 +2583,7 @@ impl NetUi {
                     text,
                 },
                 &self.watch,
+                &self.lobby,
             );
             if let Some(c) = o.cmd {
                 self.link.send(c);
@@ -2218,8 +2629,15 @@ impl NetUi {
                     }
                     _ => {}
                 }
-                if matches!(c, Cmd::Create | Cmd::Paste | Cmd::Room(_) | Cmd::Random)
-                    && f.net == NetPhase::Closed
+                if matches!(
+                    c,
+                    Cmd::Create
+                        | Cmd::Paste
+                        | Cmd::Room(_)
+                        | Cmd::LobbyCreate(_)
+                        | Cmd::LobbyJoin(..)
+                        | Cmd::Random
+                ) && f.net == NetPhase::Closed
                 {
                     out.open_net = true;
                 }
@@ -2583,7 +3001,7 @@ impl NetUi {
 ///
 /// 1. ネットワークの保守処理（`NetPlay::tend`）。**メニューが入力を占有するtickも毎tick先に呼ぶ**（ここで保守処理を止めると貼っても接続できない）。
 /// 2. メニュー（`ui`）。占有したら（`UiOut::action`が`Some`）そのactionを返し、場面ごとの判断（`dispatch`）は呼ばない（feedの二重化を防ぐ）。
-/// 占有しなければ`dispatch`を呼ぶ。
+///    占有しなければ`dispatch`を呼ぶ。
 ///
 /// ネットワークのセッションが動いているので`UiFacts::net`は`Open`（`open_net`は出ない）。`ui`が`None`（メニューを設定していない実行）なら保守処理 → 判断の順に進む。
 pub fn net_input<G: Game, N: Net>(
@@ -2936,6 +3354,31 @@ mod tests {
         let link = Arc::new(UiLink::new());
         let b = board();
         (NetUi::new(ini(), Arc::clone(&link), b), link, b)
+    }
+
+    #[test]
+    fn title_mark_follows_scene_and_screen_every_tick() {
+        use crate::overlay::title_mark_up;
+        let (mut ui, _link, b) = new_ui();
+        let mut g = Fake::on_screen(1, 0);
+        g.step(&mut ui, &facts(), 0);
+        assert!(title_mark_up(), "タイトル");
+        g.scenes = (2, 2);
+        g.step(&mut ui, &facts(), 0);
+        assert!(!title_mark_up(), "場面2で画面番号が1のまま残っている");
+        g.scenes = (SCENE_MENU, 0);
+        g.step(&mut ui, &facts(), 0);
+        assert!(title_mark_up());
+        g.view = None;
+        g.step(&mut ui, &facts(), 0);
+        assert!(!title_mark_up(), "MainMenuが読めない");
+        let mut g6 = Fake::on_match_screen(0);
+        g6.step(&mut ui, &facts(), 0);
+        assert!(!title_mark_up(), "画面6");
+        b.set_show(SHOW_MENU);
+        let mut g = Fake::on_screen(1, 0);
+        g.step(&mut ui, &facts(), 0);
+        assert!(!title_mark_up(), "盤が出ている間");
     }
 
     const Z: u16 = 0x0001;
@@ -3619,7 +4062,7 @@ mod tests {
                 wait_budget_us: 16_000,
                 margin_frames: WATCH_MARGIN_FRAMES,
                 require_net_selection: true,
-                ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
             },
         );
         (wp, net)
@@ -5518,6 +5961,110 @@ mod tests {
                 assert_eq!(row_text(b, ROW_TL0), want, "{why:?} {scenes:?}");
                 assert_eq!(row_text(b, ROW_TL1), T_AGAIN.ja, "{why:?} {scenes:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_closing_reason_in_a_match_goes_away_after_thirty_seconds_and_comes_back_after_it() {
+        let at = |now: u64| UiFacts {
+            conn: Conn::Unmatched(NoMatch::PeerLeft),
+            net: NetPhase::Open,
+            now,
+            ..facts()
+        };
+        let rows = SHOW_TL0 | SHOW_TL1;
+        let (mut ui, _l, b) = new_ui();
+        let mut g = Fake::on_screen(1, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let t0 = 1_000_000;
+        g.step(&mut ui, &at(t0), 0);
+        assert_eq!(b.show() & rows, rows);
+        g.step(&mut ui, &at(t0 + MATCH_WARN_SECS - 1), 0);
+        assert_eq!(b.show() & rows, rows, "30秒より前に消えた");
+        g.step(&mut ui, &at(t0 + MATCH_WARN_SECS), 0);
+        assert_eq!(b.show() & rows, 0, "30秒たっても消えない");
+        g.scenes = (SCENE_MENU, 0);
+        g.step(&mut ui, &at(t0 + 100), 0);
+        assert_eq!(b.show() & rows, rows, "試合を出ても出ない");
+        assert_eq!(
+            row_text(b, ROW_TL0),
+            "相手が対戦を始めないまま抜けたので、接続を閉じました。"
+        );
+        // 次の試合でまた30秒出す。
+        g.scenes = (SCENE_MATCH, 0);
+        g.step(&mut ui, &at(t0 + 200), 0);
+        assert_eq!(b.show() & rows, rows, "次の試合の頭で出ない");
+        g.step(&mut ui, &at(t0 + 200 + MATCH_WARN_SECS), 0);
+        assert_eq!(b.show() & rows, 0);
+    }
+
+    #[test]
+    fn the_cannot_connect_block_in_a_match_goes_away_after_thirty_seconds() {
+        use higanr_core::net_menu::{CodeState, Event, Stall, StallWhy};
+        let (mut ui, link, b) = new_ui();
+        link.publish(&Note {
+            seq: 1,
+            state: CodeState::RoomLinking,
+            event: Event::RoomPeer,
+            since: 1_000_000 - 42,
+            ..Note::default()
+        });
+        let at = |now: u64| UiFacts {
+            stall: Some(Stall {
+                why: StallWhy::NothingReceived,
+                fail: higanr_core::nat::FailKind::BothSymmetric,
+            }),
+            net: NetPhase::Open,
+            now,
+            ..facts()
+        };
+        let mut g = Fake::on_screen(1, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let t0 = 1_000_000;
+        g.step(&mut ui, &at(t0), 0);
+        assert_ne!(b.show() & SHOW_TL0, 0, "警告が出ていない");
+        assert_eq!(row_style(b, ROW_TL0), RowStyle::Warn);
+        g.step(&mut ui, &at(t0 + MATCH_WARN_SECS - 1), 0);
+        assert_ne!(b.show() & SHOW_TL0, 0, "30秒より前に消えた");
+        g.step(&mut ui, &at(t0 + MATCH_WARN_SECS), 0);
+        let all = TL_ROWS.iter().fold(0, |m, (bit, _)| m | bit);
+        assert_eq!(b.show() & (all | SHOW_WAIT), 0, "30秒たっても消えない");
+    }
+
+    #[test]
+    fn the_desync_lines_and_the_waiting_line_stay_in_a_match_past_thirty_seconds() {
+        let desynced = |now: u64| UiFacts {
+            conn: Conn::Desynced,
+            net: NetPhase::Open,
+            now,
+            ..facts()
+        };
+        let (mut ui, _l, b) = new_ui();
+        let mut g = Fake::on_screen(1, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        let t0 = 1_000_000;
+        for t in [t0, t0 + MATCH_WARN_SECS, t0 + 10 * MATCH_WARN_SECS] {
+            g.step(&mut ui, &desynced(t), 0);
+            assert_ne!(b.show() & SHOW_TL0, 0, "同期ズレの行が {t} で消えた");
+        }
+        // ルームで待つ間の1行（警告ではない）も残す。
+        let (mut ui, link, b) = new_ui();
+        link.publish(&Note {
+            seq: 1,
+            state: higanr_core::net_menu::CodeState::RoomWaiting,
+            since: 1_000_000 - 42,
+            ..Note::default()
+        });
+        let mut g = Fake::on_screen(1, 0);
+        g.scenes = (SCENE_MATCH, 0);
+        for t in [t0, t0 + 10 * MATCH_WARN_SECS] {
+            let f = UiFacts {
+                net: NetPhase::Open,
+                now: t,
+                ..facts()
+            };
+            g.step(&mut ui, &f, 0);
+            assert_ne!(b.show() & SHOW_WAIT, 0, "待つ間の行が {t} で消えた");
         }
     }
 
@@ -8839,5 +9386,304 @@ mod tests {
         // 前に書いた一覧がバッファに残っていても開き直した後に設定されたものだけを読む。
         g.step(&mut ui, &facts(), 0);
         assert!(!menu_rows(b).iter().any(|l| l.contains("Alice")));
+    }
+
+    // ---------------- ルーム名ごとの一覧 ----------------
+
+    fn lobby_wait(i: u8, name: &str) -> LobbyRow {
+        use higanr_core::lobby::WaitRow;
+        use higanr_core::watch_list::WatchName;
+        let room = LobbyRoom::parse(&format!("r.{:030x}", i)).unwrap();
+        LobbyRow::Wait(WaitRow {
+            name: WatchName::parse(name).unwrap(),
+            room,
+        })
+    }
+
+    #[test]
+    fn the_lobby_box_and_the_pick_carry_rows_and_rooms_and_only_newer_lists() {
+        let link = UiLink::new();
+        let g = link.next_lobby_generation();
+        let mut snap = Box::new(LobbySnapshot::EMPTY);
+        let mut seen = link.lobby_list_version();
+        assert!(!link.read_lobby_list(&mut snap, &mut seen, g));
+        let rows: Vec<_> = (0..LOBBY_ROWS_MAX as u8 + 3)
+            .map(|i| {
+                if i % 2 == 0 {
+                    lobby_wait(i + 1, &format!("W{i}"))
+                } else {
+                    LobbyRow::Play(higanr_core::lobby::PlayRow {
+                        row: watch_row(i, "Alice", "Bob", i % 4),
+                        watch: i % 3 == 0,
+                    })
+                }
+            })
+            .collect();
+        assert!(link.publish_lobby_list(g, ListStatus::Ready, &rows));
+        assert!(link.read_lobby_list(&mut snap, &mut seen, g));
+        assert_eq!(snap.status, ListStatus::Ready);
+        assert_eq!(
+            snap.rows(),
+            &rows[..LOBBY_ROWS_MAX],
+            "上限を越える分は捨てる"
+        );
+        assert!(
+            !link.read_lobby_list(&mut snap, &mut seen, g),
+            "同じバージョン"
+        );
+        assert!(link.publish_lobby_list(g, ListStatus::Failed, &[]));
+        assert!(link.read_lobby_list(&mut snap, &mut seen, g));
+        assert_eq!((snap.status, snap.len()), (ListStatus::Failed, 0));
+        // 一覧の行から入る指示は打った名と割り当てのルーム名を別々のバッファで渡す。
+        assert_eq!(link.lobby_pick(), None);
+        let typed = RoomBuf::from_name("Typed-1").unwrap();
+        let LobbyRow::Wait(w) = lobby_wait(9, "Bob") else {
+            unreachable!()
+        };
+        link.send(Cmd::LobbyJoin(typed, w.room));
+        assert_eq!(link.take_order(), Some(Order::LobbyJoin));
+        assert_eq!(link.lobby_pick(), Some(w.room));
+        assert_eq!(link.room_name(), Some(typed));
+        link.send(Cmd::LobbyCreate(RoomBuf::from_name("Typed-2").unwrap()));
+        assert_eq!(link.take_order(), Some(Order::LobbyCreate));
+        assert_eq!(link.room_name(), RoomBuf::from_name("Typed-2"));
+        assert_eq!(link.take_order(), None);
+    }
+
+    static LOBBY_LOG: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+
+    fn lobby_probe(req: Option<(RoomBuf, u32)>) -> bool {
+        LOBBY_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.map(|(n, _)| n.as_str().to_string()));
+        true
+    }
+
+    /// 一覧の接続を開けられない仕事（設定が無い・スレッドを作れない）。
+    fn lobby_probe_fails(req: Option<(RoomBuf, u32)>) -> bool {
+        req.is_none()
+    }
+
+    /// 一覧の接続のスレッドの代わりにいまの世代で書く。
+    fn feed_list(link: &UiLink, rows: &[LobbyRow]) {
+        assert!(link.publish_lobby_list(link.lobby_generation(), ListStatus::Ready, rows));
+    }
+
+    fn lobby_log() -> Vec<Option<String>> {
+        LOBBY_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 対戦の「ルームマッチ」（上から1つ下）を決めてルーム名ごとの一覧の画面に入る。
+    fn enter_lobby(ui: &mut NetUi, g: &mut Fake, open: bool) {
+        if open {
+            g.step(ui, &facts(), Z);
+            g.step(ui, &facts(), 0);
+            g.step(ui, &facts(), DOWN);
+            g.step(ui, &facts(), 0);
+        }
+        g.step(ui, &facts(), Z);
+        g.step(ui, &facts(), 0);
+    }
+
+    /// 一覧の接続の開け閉め・コピーの戻し・一覧へ戻す知らせを1本で見る（`LOBBY_LOG`を使う検査はこれだけ）。
+    #[test]
+    fn the_lobby_feed_follows_the_screen_and_a_stale_list_never_creates_a_room() {
+        LOBBY_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()))
+            .with_lobby(Some(lobby_probe));
+        let mut g = Fake::on_match_screen(4);
+        enter_lobby(&mut ui, &mut g, true);
+        assert!(ui.menu.wants_lobby().is_some());
+        assert_eq!(lobby_log(), [Some("abc".to_string())], "入ったのに開けない");
+        assert_eq!(link.take_order(), None, "一覧を待つ間に指示を出した");
+        feed_list(&link, &[lobby_wait(1, "Alice")]);
+        g.step(&mut ui, &facts(), 0);
+        assert!(menu_rows(b).iter().any(|l| l.contains("Alice")));
+        // キャンセルで閉じる。
+        let first_gen = link.lobby_generation();
+        g.step(&mut ui, &facts(), X);
+        g.step(&mut ui, &facts(), 0);
+        assert!(ui.menu.wants_lobby().is_none());
+        assert_eq!(lobby_log().last(), Some(&None), "出たのに閉じない");
+        // 開き直す前にバッファに残った空の一覧（前の接続が書いたもの）では作らない。
+        feed_list(&link, &[]);
+        enter_lobby(&mut ui, &mut g, false);
+        assert!(ui.menu.wants_lobby().is_some());
+        // 止めた古いスレッドが世代の確認を通った後に書き終えた空の一覧（開き直した後に届く）でも作らない。
+        assert!(link.lobby_list.publish(
+            first_gen,
+            &AtomicU32::new(first_gen),
+            ListStatus::Ready,
+            &[]
+        ));
+        for _ in 0..5 {
+            g.step(&mut ui, &facts(), 0);
+        }
+        assert_eq!(link.take_order(), None, "古い空の一覧で作った");
+        let t = menu_rows(b);
+        assert!(
+            !t.iter().any(|l| l.contains("Alice")),
+            "前の行が残った: {t:?}"
+        );
+        // 開き直した後の空の一覧なら画面を出さずに作る（ネットワークも開く）。
+        feed_list(&link, &[]);
+        let o = g.step(&mut ui, &facts(), 0);
+        assert_eq!(link.take_order(), Some(Order::LobbyCreate));
+        assert!(o.open_net, "作るのにネットワークを開かない");
+        g.step(&mut ui, &facts(), 0);
+        assert!(ui.menu.wants_lobby().is_none());
+        assert_eq!(lobby_log().last(), Some(&None));
+        let opened = lobby_log().iter().filter(|e| e.is_some()).count();
+        assert_eq!(opened, 2);
+
+        // 待機中の行を選ぶ → 入れなかった知らせで一覧へ戻る（コピーは取得中から）。メニューは開いたまま。
+        enter_lobby(&mut ui, &mut g, false);
+        feed_list(&link, &[lobby_wait(1, "Alice")]);
+        g.step(&mut ui, &facts(), 0);
+        let o = g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(link.take_order(), Some(Order::LobbyJoin));
+        assert!(o.open_net, "入るのにネットワークを開かない");
+        assert!(ui.menu.wants_lobby().is_none());
+        link.publish(&Note {
+            seq: 41,
+            event: Event::LobbyGone,
+            ..Note::default()
+        });
+        g.step(&mut ui, &facts(), 0);
+        assert!(ui.menu.wants_lobby().is_some(), "一覧へ戻らない");
+        assert_eq!(lobby_log().last(), Some(&Some("abc".to_string())));
+        let t = menu_rows(b);
+        assert!(
+            t.iter()
+                .any(|l| l.contains("選んだ相手はもう待機していません。")),
+            "{t:?}"
+        );
+        assert!(
+            !t.iter().any(|l| l.contains("Alice")),
+            "戻ったときに前の行が残った: {t:?}"
+        );
+        // 戻った後は空の一覧でも作らない（人が選ぶ）。
+        feed_list(&link, &[]);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(link.take_order(), None, "戻った後に作った");
+        // 同じ知らせで2回は戻さない。
+        g.step(&mut ui, &facts(), X);
+        g.step(&mut ui, &facts(), 0);
+        g.step(&mut ui, &facts(), 0);
+        assert!(ui.menu.wants_lobby().is_none(), "同じ知らせでまた戻った");
+    }
+
+    #[test]
+    fn a_lobby_feed_that_cannot_start_shows_failed_without_writing_the_box() {
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()))
+            .with_lobby(Some(lobby_probe_fails));
+        let mut g = Fake::on_match_screen(4);
+        let v = link.lobby_list_version();
+        enter_lobby(&mut ui, &mut g, true);
+        assert!(ui.menu.wants_lobby().is_some());
+        assert_eq!(
+            ui.lobby.status,
+            ListStatus::Failed,
+            "取得できなかったにしない"
+        );
+        assert_eq!(
+            link.lobby_list_version(),
+            v,
+            "ゲームのスレッドがバッファに書いた"
+        );
+        for _ in 0..3 {
+            g.step(&mut ui, &facts(), 0);
+        }
+        assert_eq!(ui.lobby.status, ListStatus::Failed);
+        assert_eq!(link.take_order(), None, "取得できなかった一覧で作った");
+    }
+
+    #[test]
+    fn the_own_lobby_box_holds_a_room_until_it_is_cleared() {
+        let link = UiLink::new();
+        assert_eq!(link.own_lobby(), None);
+        let LobbyRow::Wait(w) = lobby_wait(7, "Me") else {
+            unreachable!()
+        };
+        link.set_own_lobby(Some(&w.room));
+        assert_eq!(link.own_lobby(), Some(w.room));
+        link.set_own_lobby(None);
+        assert_eq!(link.own_lobby(), None, "空にしても残る");
+        link.set_own_lobby(Some(&w.room));
+        assert_eq!(link.own_lobby(), Some(w.room), "空にした後に書き直せない");
+        assert_eq!(link.lobby_pick(), None, "選んだ行の箱と混ざった");
+    }
+
+    fn lobby_probe_quiet(_req: Option<(RoomBuf, u32)>) -> bool {
+        true
+    }
+
+    /// 一覧の画面の行のうちカーソルが指す行の文。
+    fn marked_row(b: &Board) -> String {
+        menu_rows(b)
+            .into_iter()
+            .find(|l| l.starts_with("> "))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_menu_greys_the_row_of_the_room_the_watcher_is_waiting_in() {
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()))
+            .with_lobby(Some(lobby_probe_quiet));
+        let mut g = Fake::on_match_screen(4);
+        enter_lobby(&mut ui, &mut g, true);
+        feed_list(&link, &[lobby_wait(1, "Me"), lobby_wait(2, "Bob")]);
+        g.step(&mut ui, &facts(), 0);
+        assert!(marked_row(b).contains("Me"), "前提: 自分の行が先頭");
+        // 監視の処理が自分の待ちを書くと次のtickで自分の行を飛ばす。
+        let LobbyRow::Wait(me) = lobby_wait(1, "Me") else {
+            unreachable!()
+        };
+        link.set_own_lobby(Some(&me.room));
+        g.step(&mut ui, &facts(), 0);
+        let t = menu_rows(b);
+        assert!(
+            t.iter().any(|l| l.contains("Me")),
+            "自分の名前は残る: {t:?}"
+        );
+        assert!(marked_row(b).contains("Bob"), "{t:?}");
+        // 待ちが終わると元に戻る。
+        link.set_own_lobby(None);
+        g.step(&mut ui, &facts(), 0);
+        assert!(marked_row(b).contains("Me"));
+        // 決定が選ぶのは自分の行でなく次の待機中の行。
+        link.set_own_lobby(Some(&me.room));
+        g.step(&mut ui, &facts(), 0);
+        let o = g.step(&mut ui, &facts(), Z);
+        g.step(&mut ui, &facts(), 0);
+        assert_eq!(link.take_order(), Some(Order::LobbyJoin));
+        assert!(o.open_net);
+        let LobbyRow::Wait(bob) = lobby_wait(2, "Bob") else {
+            unreachable!()
+        };
+        assert_eq!(link.lobby_pick(), Some(bob.room), "自分の行へ入ろうとした");
+    }
+
+    #[test]
+    fn without_with_lobby_the_room_match_still_sends_a_room_order() {
+        let link = Arc::new(UiLink::new());
+        let b = board();
+        let mut ui = NetUi::new(ini(), Arc::clone(&link), b)
+            .with_room(RoomItem::On(RoomBuf::from_name("abc").unwrap()));
+        let mut g = Fake::on_match_screen(4);
+        enter_lobby(&mut ui, &mut g, true);
+        assert!(ui.menu.wants_lobby().is_none());
+        assert_eq!(link.take_order(), Some(Order::Room));
     }
 }

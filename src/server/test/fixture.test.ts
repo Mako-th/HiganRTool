@@ -12,6 +12,15 @@ import {
   Close,
   HELD_STALE_MS,
   HELD_SWEEP_MS,
+  LOBBY_LIST_MAX_BYTES,
+  LOBBY_MAX_PER_KEY,
+  LOBBY_MAX_TOTAL,
+  LOBBY_PATH_PREFIX,
+  LOBBY_ROOM_HEX_LEN,
+  LOBBY_ROOM_PREFIX,
+  LOBBY_VIEW_MAX_PER_KEY,
+  LOBBY_VIEW_MAX_TOTAL,
+  LOBBY_VIEW_TTL_MS,
   MESSAGE_MAX_BYTES,
   PING_TEXT,
   PONG_TEXT,
@@ -197,6 +206,15 @@ describe("rules.json と rules.ts", () => {
     expect(num("watch_stale_ms")).toBe(WATCH_STALE_MS);
     expect(num("watch_list_max_bytes")).toBe(WATCH_LIST_MAX_BYTES);
     expect(num("watch_answer_ttl_ms")).toBe(WATCH_ANSWER_TTL_MS);
+    expect(text("lobby_path_prefix")).toBe(LOBBY_PATH_PREFIX);
+    expect(text("lobby_room_prefix")).toBe(LOBBY_ROOM_PREFIX);
+    expect(num("lobby_room_hex_len")).toBe(LOBBY_ROOM_HEX_LEN);
+    expect(num("lobby_max_total")).toBe(LOBBY_MAX_TOTAL);
+    expect(num("lobby_max_per_key")).toBe(LOBBY_MAX_PER_KEY);
+    expect(num("lobby_view_max_total")).toBe(LOBBY_VIEW_MAX_TOTAL);
+    expect(num("lobby_view_max_per_key")).toBe(LOBBY_VIEW_MAX_PER_KEY);
+    expect(num("lobby_view_ttl_ms")).toBe(LOBBY_VIEW_TTL_MS);
+    expect(num("lobby_list_max_bytes")).toBe(LOBBY_LIST_MAX_BYTES);
     expect(text("ticket_param")).toBe(TICKET_PARAM);
     expect(num("ticket_ttl_secs")).toBe(TICKET_TTL_SECS);
     expect(text("ticket_purpose")).toBe(TICKET_PURPOSE);

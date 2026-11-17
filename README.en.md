@@ -21,18 +21,19 @@ It also has rollback netcode, which earlier tools for this game did not have, so
 
 ## Features
 
-- **Random match**: Play someone who chose Random match at the same time, without deciding on a room name.
+- **Random match**: Play someone who is in Random match at the same time, without deciding on a room name.
 - **Room match**: Both players enter the same room name to play. It works much like the rooms in Ju.N.Owen.
-- **Spectating**: Watch a random match by choosing it from the list, or a room match by entering its room name. When the server is unavailable, you can also watch with a watch code from the host. Up to 10 people can watch. When there are many spectators, a spectator relays the match to other spectators. Spectators who join mid-match catch up from the start of the match in fast-forward.
-- **Connection codes**: If rooms are not available, you can connect by sending connection codes to each other over Discord or similar. This works like Pure P2P in Ju.N.Owen.
-- **LAN**: Play someone on the same LAN. Spectating is also possible. It also works over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
-- **Rollback netcode**: When the opponent's input is late, the game predicts it and keeps going, and goes back and re-runs the frames if the prediction was wrong. It rarely stops even on an unstable connection, and you can play with about 1-2 frames (F) less delay than with adonis. You can also switch to the delay netcode, which waits for the opponent's input like adonis.
+- **Spectating**: Watch a random match by choosing it from the list, or a room match by entering its room name and choosing it from the list (up to 10 spectators). Spectators who join mid-match catch up in fast-forward.
+- **Connection codes**: If rooms are not available, you can connect by sending connection codes to each other over Discord or similar. You can also watch with a watch code. This works like Pure P2P in Ju.N.Owen.
+- **LAN**: Play and watch with someone on the same LAN. It also works over the virtual LANs of Radmin VPN, Hamachi and ZeroTier.
+- **Rollback netcode**: When the opponent's input is late, the game predicts it and keeps going, and goes back and re-runs the frames if the prediction was wrong. It rarely stops even on an unstable connection, and you can play with about 1-2 frames (F) less delay than with adonis. You can also switch to the delay netcode, which waits until the inputs arrive.
 - **Change the delay at any time**: Press Ctrl+number key, even during a match.
-- **Automatic replays**: Every match is saved to `Replay_HiganRTool\`. File names are in the `th9_udXXXX.rpy` form from the start. Match information is stored inside the replay file, so it is not lost when you move the file.
-- **Almost no port forwarding**: The server is used only for matchmaking. Match traffic goes directly between the two players' PCs (UDP). You need an open port only when your opponent is behind a symmetric NAT (→ "When you cannot connect"), and if your router supports UPnP the tool opens it automatically.
+- **Automatic replays**: Every match is saved to `Replay_HiganRTool\`. File names are `th9_udXXXX.rpy` by default and can be changed. Match information is stored inside the replay file, so it is not lost when you move the file.
+- **Fast and slow replay playback**: While a replay plays, holding Skip (Ctrl) plays it fast and holding Slow (Shift) plays it slow. The speeds can be set in `HiganRTool.ini`.
+- **Almost no port forwarding**: The server is used for matchmaking, and once connected the players communicate directly. You need an open port only when your opponent is behind a symmetric NAT (→ "When you cannot connect"), and if your router supports UPnP the tool opens and closes it automatically.
 - **Encrypted traffic**: Match and spectator traffic is encrypted with a one-time key made for each connection.
-- **Automatic updates**: Checks for a new version every time it starts and updates if there is one. After an update it shows what changed. Settings you changed are kept.
-- **Two keyboards in 人間 対 人間**: In Match Mode's "人間 対 人間", 1P and 2P can each play on their own keyboard (→ "Two keyboards" under "How it works").
+- **Automatic updates**: Checks for a new version every time it starts and updates if there is one. After an update it shows what changed.
+- **Two keyboards in 人間 対 人間**: In Match Mode's "人間 対 人間", 1P and 2P can each play on their own keyboard (→ "Two keyboards in 人間 対 人間" under "Other features").
 
 
 ## Requirements
@@ -42,13 +43,15 @@ It also has rollback netcode, which earlier tools for this game did not have, so
 - A way to talk to your opponent (Discord, etc.)
 
 
-## Installation
+## Installation and starting
+
+### Installation
 
 1. Download the latest zip from [Releases](https://github.com/Mako-th/HiganRTool/releases).
 2. Extract it **outside the game folder** (e.g. `C:\Games\HiganRTool\`).
 3. Run `HiganRTool.exe`. The first time, a window asks for the game folder. Choose the folder that has `th09.exe`.
 4. When the game starts, go to Title → Match Mode → 妖怪 対 妖怪 to open the online menu.
-5. First, set your name with "Player name" in the menu. It is shown to your opponent and spectators.
+5. First, choose "Settings" and set your name with "Player name". It is shown to your opponent and spectators.
 
 ### Location and contents
 
@@ -57,37 +60,34 @@ It also has rollback netcode, which earlier tools for this game did not have, so
 | HiganRTool.exe | Start from here |
 | HiganRTool.dll | The main part that runs inside the game |
 | HiganRTool.ini | Settings (see "Settings" below) |
-| HiganRTool_replay_fix.exe | The Replay Repair Tool, which fixes replays saved by v1.0.0 that desync on playback (see "Replay Repair Tool" under "How it works") |
+| HiganRTool_replay_fix.exe | The Replay Repair Tool, which fixes replays saved by v1.0.0 that desync on playback (see "Replay Repair Tool" under "Other features") |
 | README.txt / README_en.txt / LICENSE.txt / THIRD_PARTY_LICENSES.txt | This manual (Japanese / English) and licenses |
 
-After the first start, the folder also has `logs\` (logs).
+Starting the tool creates `logs\` (logs) in the folder. They are used when something goes wrong.
 
+### Starting
 
-## Starting
-
-From then on, just run `HiganRTool.exe`.
-If the game is already running, starting `HiganRTool.exe` exits without starting a second copy.
+From then on, just run `HiganRTool.exe` to start the game.
 The tool is not loaded if you start `th09.exe` or vpatch directly. Always start the game from `HiganRTool.exe`.
-You do not need vpatch. The tool does the frame timing instead, with a shorter time from input to screen than vpatch.
+You cannot run two copies of the game at once. The tool does not load vpatch, but does the frame timing instead, with a shorter time from input to screen than vpatch.
 
 - To choose the game folder again, clear the `game` value under `[loader]` in `HiganRTool.ini` or start with `--choose-game`.
-- If the game does not start, a black window shows the reason and stops. Please tell the developer that line.
+- If the game does not start, a black window shows the reason and stops. Please tell the developer that message.
 - If the game is set to "Run as administrator", set `HiganRTool.exe` to "Run as administrator" too.
 
-
-## Updates
+### Updates
 
 Every time you start, the tool checks for updates (at most about 2 seconds; if there is no internet connection, it just starts).
-If there is a new version, it asks whether to update (the window says 更新しますか？ in Japanese).
+If there is a new version, it asks whether to update (the window says 更新しますか？ in Japanese). Choosing Yes or No does the following.
 
 - **Yes**: It stops starting, replaces the exe, dll, READMEs, etc., and starts again with the new version. If replacing or restarting fails, it goes back to the old version automatically.
   - The download progress is shown in the black window.
-  - The first time the new version starts, it brings `HiganRTool.ini` to the new layout and then shows the change notes. Settings you changed are kept (comments you added yourself are not). Press Enter to start the game. The logs are kept.
+  - The first time the new version starts, it brings `HiganRTool.ini` to the new layout and then shows the change notes. Settings you changed are kept (comments you added yourself are not). When the update is done, press Enter to start the game.
   - If the new version causes problems, you can go back to the version before the update (close the game and `HiganRTool.exe`, rename the new `HiganRTool.exe` and `HiganRTool.dll` to other names, and remove `.old` from `HiganRTool.exe.old` and `HiganRTool.dll.old`). The `.old` files are deleted on the start after the new version has started the game once.
 - **No**: It starts with the current version. If your version differs from your opponent's, you cannot connect.
 
 
-## Usage
+## Playing
 
 ### Menu
 
@@ -102,22 +102,29 @@ To stop waiting, choose "Stop waiting" at the bottom of the menu.
 Play someone who chose Random match at the same time, without deciding on a room name.
 
 1. Choose "Random match" at the top of the menu.
-2. When an opponent is found, a sound plays and you are connected automatically (→ "After connecting").
+2. When an opponent is found, a sound plays and you are connected automatically (→ "From connecting to the match").
 
 While waiting, "Random match waiting" is shown at the top left.
 **In a random match, your global IP address is visible to an opponent you do not know.** If that worries you, use a room match or connection codes.
-Random matches appear in the Random match list under Watch, and anyone can watch them (to refuse, see "Refuse spectators" under "Settings" below).
+Random matches appear in the Random match list under Watch, and anyone can watch them (you can also refuse spectators in `HiganRTool.ini`; see "Refuse spectators" under "Settings").
 
 ### Room match
 
 Two players who enter the same room name play each other.
 
-1. Agree on a room name with your opponent. Use letters, digits and symbols (except `` ` ``, `;` and `/`), up to 32 characters. Spaces at the start and end are removed. Names starting with `w.` or `q.` cannot be used. Choose a name others are unlikely to use.
+1. Agree on a room name with your opponent. Use letters, digits and symbols (except `` ` ``, `;` and `/`), up to 32 characters. Spaces at the start and end are removed. Names starting with `w.`, `q.` or `r.` cannot be used. Choose a name others are unlikely to use.
 2. Both players enter it in "Room name" in the menu, then choose "Room match" under Play.
-3. When your opponent arrives, a sound plays and you are connected automatically (→ "After connecting").
+3. If someone is waiting or two players are in a match under that room name, a list appears.
+   Choose your opponent's row to connect (choosing a match row starts watching it).
+   If nobody is there, you start waiting (you can also wait with "Host a match" in the list).
+4. When your opponent arrives, a sound plays and you are connected automatically (→ "From connecting to the match").
 
-While waiting, "Room ... waiting" is shown at the top left.
-A room holds only 2 players.
+<!-- zip:skip -->
+<img src="images/room_list_en.png" width="400" alt="The room match list">
+<!-- /zip:skip -->
+
+While you are hosting, "Room ... waiting" is shown at the top left.
+Two hosting players are not connected to each other, so if both of you ended up waiting, one of you should choose "Stop waiting", choose "Room match" again and pick the other's row.
 
 ### Connection codes
 
@@ -129,7 +136,7 @@ This connects without the server. Use it when the room server does not respond, 
 
 "Connect code" is the name for the play code and the watch code together.
 Codes expire after 30 minutes.
-Matches connected with codes can be watched with a watch code (see "Spectating").
+Matches connected with codes can be watched with a watch code (see "Watch code" under "Spectating").
 
 ### LAN
 
@@ -147,7 +154,7 @@ Use it at an offline venue, or for two PCs joined by a LAN cable.
 1. Choose "Client" under LAN in the menu.
 2. Enter the host's address as `192.168.0.2:17723`. If the port is left out, 17723 is used.
    The address you entered last time is remembered.
-3. When connected, a sound plays (→ "After connecting").
+3. When connected, a sound plays (→ "From connecting to the match").
 
 The host accepts only the first player to join.
 With different hosts, any number of pairs can play on the same LAN at the same time (an experimental feature, not checked on real machines).
@@ -166,22 +173,24 @@ Tell your opponent the address with the name of the VPN you both use.
 When the VPN tool connects through its relay, the delay increases by that much.
 Windows may treat the VPN network as public. Then also allow "Public networks" in the firewall prompt for `th09.exe` (→ "Troubleshooting").
 
-### After connecting
+### From connecting to the match
 
 - When both players choose 妖怪 対 妖怪 in Match Mode, the game goes to difficulty select and the match starts. If you were playing another mode, stop at a good point and choose 妖怪 対 妖怪.
 - 1P / 2P follow the "Side" setting in "Settings".
 - To disconnect, press Cancel on the Match Mode or difficulty screen and choose "Yes".
 - At the end of a match, each player chooses from the menu (→ "End-of-match menu").
-- When the connection closes after a match, you return to 妖怪 対 妖怪 on the title screen. To connect again, choose it there.
+- When the connection closes after a match, you return to 妖怪 対 妖怪 on the title screen. To connect again, choose 妖怪 対 妖怪.
 - If the opponent does not respond for 60 seconds, the tool closes the connection (your game does not stay frozen either).
 - When the opponent stops responding for about 2 seconds, "Waiting for the opponent" appears at the top left. Hold Esc for 3 seconds while it is shown to disconnect yourself.
 
 ### During a match
 
-- **Change the delay**: Ctrl+number key on the top row. 0-8 set the value and 9 sets auto. Either player can press it at any time to change the delay for both players.
-- **Change the netcode**: Ctrl+Tab on the character select screen. Either player can press it to change the netcode for both players.
-- **Copy the watch code**: Ctrl+C. The host presses it once the two players have connected. Whether it was copied is shown at the top left for a few seconds.
-- **Random character / map, skip dialogue**: Ctrl, or the skip button on a gamepad (as in the game). Ctrl+number and Ctrl+Tab also count as pressing Ctrl. If either player presses Ctrl, the dialogue is skipped for both.
+Changing the delay or the netcode, stage selection and skipping apply to both players whichever of you presses the key, so be careful.
+
+- **Change the delay**: Press Ctrl+number key to change the delay at any time. 0-8 set that value and 9 sets auto.
+- **Change the netcode**: Press Ctrl+Tab on the character select screen to change the netcode.
+- **Copy the watch code**: Once connected, the host presses Ctrl+C to copy it. Whether it was copied is shown at the top left for a few seconds.
+- **Random character / map, skip dialogue**: Press Ctrl on the keyboard or the skip button on a gamepad to pick at random or to skip the dialogue after a match (Ctrl+number and Ctrl+Tab also count as pressing Ctrl).
 
 ### End-of-match menu
 
@@ -192,55 +201,11 @@ The item each player is choosing is outlined in red for 1P and blue for 2P.
 <img src="images/end_menu.png" width="400" alt="The end-of-match menu"> <img src="images/end_menu_zoom.png" width="400" alt="Close-up of the menu with 1P on Rematch and 2P on Change character">
 <!-- /zip:skip -->
 
-- When both have decided on different items, the lower item wins ("Save replay and quit" > "Change character" > "Rematch").
+- When both have decided, the game moves on. If the items differ, the lower item wins ("Save replay and quit" > "Change character" > "Rematch").
 - If either player decides on "Save replay and quit", the connection ends at that moment without waiting for the opponent.
   If the replay of the match was saved automatically, the game's replay save screen does not appear.
-- Until both have decided, you can cancel your decision with Up or Down.
+- Until both players have decided at the same time, you can cancel your decision with Up or Down.
 - If a new version is released while you are playing, it appears at the top left of the menu.
-
-### Spectating
-
-Up to 10 people can watch each random match and each room match.
-If you join mid-match, you catch up from the start of the match in fast-forward (8x by default; the speed is `ff_max` under `[spectate]`).
-Spectators do not change the delay of the two players.
-In random matches and room matches, the host sends the match directly to basically up to 2 spectators, and the other spectators receive it from a spectator who relays it to them (when relaying is not possible, the host sends directly).
-When spectators relay to each other, the relaying spectator and the spectator receiving the relay can see each other's global IP addresses.
-If you do not want to relay, see "Do not relay while watching" under "Settings" below.
-If you watch a match to the end, the replay is saved on your side too.
-Press Esc during a match to open the game's pause menu (when it cannot be opened, "Paused" is shown at the top left).
-To stop watching, hold Esc for 3 seconds.
-You can also stop watching with "Return to title" in the pause menu.
-To refuse spectators, see "Refuse spectators" under "Settings" below.
-
-**Random match**
-
-1. Choose "Random match" under Watch in the menu. The random matches in progress are listed as "1P name vs 2P name   spectators/limit".
-2. Choose the match you want to watch (full matches are greyed out; if there are more than 8, scroll with ↑↓).
-3. You can watch the match between the two players.
-
-**Room match**
-
-1. Ask the two players for their room name.
-2. Enter it in "Room name" in the menu, then choose "Room match" under Watch.
-3. The match appears automatically when the two players start.
-
-Anyone who knows the room name can watch.
-
-**Watch code**
-
-Use this when you cannot reach the server.
-
-1. Once the two players have connected, the host presses Ctrl+C. The watch code is copied to the clipboard, so send it to the spectator.
-2. The spectator copies the watch code, then chooses "Paste watch code" under Connect code in the menu.
-
-The host is the player whose top-left message says "(host)" when connected.
-With a watch code, the spectator must be able to reach the host directly.
-Make sure you are on the same LAN, or that the host's UPnP works.
-
-**LAN**
-
-1. After the two players have connected, the spectator chooses "Watch" under LAN in the menu.
-2. Enter the host's address to watch.
 
 ### Reading the screen
 
@@ -250,11 +215,11 @@ Make sure you are on the same LAN, or that the host's UPnP works.
 <img src="images/menu_guide_en.png" width="640" alt="What the menu shows">
 <!-- /zip:skip -->
 
-1. **Play**: Random match (play without deciding on a room name) and Room match (play with a room name). The cursor starts on Random match when the menu opens.
-2. **Watch**: Random match (pick from a list) and Room match (enter the room name).
-3. **Connect code**: Create play code, Paste play code (while waiting for the reply: Paste reply code) and Paste watch code. Connect without the server (a backup).
+1. **Play**: Random match and Room match. The cursor starts on Random match when the menu opens.
+2. **Watch**: Watch random matches and room matches.
+3. **Connect code**: Create play code, Paste play code (while waiting for the reply: Paste reply code) and Paste watch code. Connect without the server (a backup feature).
 4. **LAN**: Host, Client and Watch. Connect inside the same LAN without the server.
-5. **Settings**: Change your player name, side, netcode, delay and language. The menu shows one "Settings" row, which opens a screen one level down.
+5. **Settings**: Change your player name, side, netcode, delay and language. The menu shows a single "Settings" row; choosing it shows the settings.
 
 If your player name is the default (`HiganRTool`), a note is shown below the menu.
 Only the first time you open the menu after starting, the cursor is on "Settings", so set your player name there.
@@ -274,6 +239,102 @@ While waiting, "waiting 0:42" is shown to the right of the row you are waiting o
 On the character select screen, the netcode is also shown at the bottom left.
 
 
+## Spectating
+
+Up to 10 people can watch each random match and each room match.
+If you join mid-match, you catch up from the start of the match in fast-forward (480 fps by default; the speed is `ff_fps` under `[spectate]`, and it may not reach that speed depending on the connection).
+By adapting the sending rate and having spectators relay to each other, spectators have little effect on the two players' connection.
+In random matches and room matches, the host sends the match directly to basically up to 2 spectators, and the other spectators receive it from a spectator who relays it to them (when relaying is not possible, the host sends directly).
+When spectators relay to each other, the relaying spectator and the spectator receiving the relay can see each other's global IP addresses.
+If you do not want to relay, set "Do not relay while watching" under "Settings" below.
+If you watch a match to the end, the replay is saved on your side too.
+Press Esc during a match to open the game's pause menu (when it cannot be opened, "Paused" is shown at the top left).
+To stop watching, hold Esc for 3 seconds. You can also stop watching with "Return to title" in the pause menu.
+To refuse spectators, see "Refuse spectators" under "Settings".
+
+### Random match
+
+1. Choose "Random match" under Watch in the menu. The random matches in progress are listed as "1P name vs 2P name   spectators/limit".
+2. Choose the match you want to watch (full matches are greyed out; if there are more than 8, scroll with ↑↓).
+3. You can watch the match between the two players.
+
+### Room match
+
+1. Ask the two players for their room name.
+2. Enter it in "Room name" in the menu, then choose "Room match" under Watch.
+3. Matches under that room name appear in a list. Choose the one you want to watch.
+
+Anyone who knows the room name can watch.
+
+### Watch code
+
+Use this when you cannot reach the server.
+
+1. Once the two players have connected, the host presses Ctrl+C. The watch code is copied to the clipboard, so send it to the spectator.
+2. The spectator copies the watch code, then chooses "Paste watch code" under Connect code in the menu.
+
+The host is the player whose top-left message says "(host)" when connected.
+With a watch code, the spectator must be able to reach the host directly.
+Make sure you are on the same LAN, or that the host's UPnP works.
+
+### LAN
+
+1. After the two players have connected, the spectator chooses "Watch" under LAN in the menu.
+2. Enter the host's address to watch.
+
+
+## Other features
+
+### Two keyboards in 人間 対 人間
+
+- If keys have been pressed on two or more keyboards since the game started, a prompt appears at the top left when you choose "人間 対 人間" in Match Mode.
+- Following the prompt, 1P and 2P each press Z, X, Shift, Up, Down, Left and Right in order on their own keyboard. The keyboard you press the keys on becomes yours (there can be more than one).
+  If you use two devices, such as a keyboard and a separate numpad, press on each of them and both are yours.
+- While the keyboards are split, input from anything other than the assigned keyboards (including gamepads) is ignored.
+- The assignment stays when you return from the pause menu during a match, and when you change characters or rematch after a match.
+  Normal input comes back when you return to the title or the Match Mode screen, or move on to the replay save screen.
+- Press a gamepad button or Esc while the prompt is shown to play without splitting that time.
+
+### Replays
+
+- One replay is saved automatically after every match, to `Replay_HiganRTool\<1P> vs <2P>\` in the game folder.
+- If the game is in a folder that needs administrator rights to write to, such as Program Files, Windows saves the replays to the folder of the same name under `%LOCALAPPDATA%\VirtualStore\` instead (the game's own `replay` folder works the same way).
+  Type `%LOCALAPPDATA%\VirtualStore` into the Explorer address bar to open it.
+  When you start the tool as administrator, it saves directly into the game folder.
+- Nothing is written to the game's `replay` folder. To watch one in the game, copy the file into the `replay` folder.
+- When a folder is full up to `th9_ud9999`, saving goes on in a folder with the same name plus `_2`, `_3`, and so on.
+- The game has a bug that crashes when saving the replay of a long match. This tool makes the game estimate the needed size correctly before saving, so it does not crash.
+- Fast and slow playback only work while a replay started from the menu is playing.
+  In fullscreen with vsync on, the screen stays at 60 fps and fast playback advances the game's internal processing several times per displayed frame.
+  In this case it can take up to about 0.1 seconds to start working the first time you press Skip.
+  Neither works when `mode` under `[pacing]` is `game`.
+
+### Replay Repair Tool (HiganRTool_replay_fix.exe)
+
+- **What it fixes**: Replays saved by v1.0.0 or earlier.
+  Replays saved by v1.1.0 or later, and replays already fixed by this tool, are skipped as "need no fix".
+  Replays not saved by HiganRTool cannot be fixed.
+- **How to use**:
+  1. Double-click `HiganRTool_replay_fix.exe`.
+  2. Choose with "Choose replays" or "Choose a folder". You can also drop them onto the exe or its window.
+     When you choose a folder, all replays inside it (up to 4 levels down) are loaded.
+  3. Each replay shows the 1P and 2P names and the charge settings (slow / charge) stored in it. Switch with "Prev" and "Next".
+  4. Under "New", choose the settings the two players actually used in that match.
+  5. "Fix this replay" fixes the replay on screen; "Fix the whole folder the same way" fixes every replay in the same folder with the same settings.
+  6. When it finishes, it shows how many were processed, where they were saved, and which were skipped.
+- **Where fixed replays go**: A copy with the same file name is made in `fix_replay\<original folder name>\<1P setting>-<2P setting>\`, one level above the original folder.
+  For example, fixing `Replay_HiganRTool\Alice vs Bob\th9_ud0008.rpy` with 1P charge / 2P slow makes `Replay_HiganRTool\fix_replay\Alice vs Bob\charge-slow\th9_ud0008.rpy`.
+  The original files are not changed.
+  Existing files with the same name are not overwritten.
+- **Which settings to choose**: Choose the settings the two players actually used in the match, not your PC's setting.
+  If you are not sure, make both and play both to compare.
+  `Replay_HiganRTool` has one folder per `<1P> vs <2P>`, and 1P and 2P are in the same order within a folder.
+  If the opponent did not change their setting, you can fix that folder all at once.
+- **Watching in the game**: Copy the fixed replays into the game's `replay` folder.
+  Checking them in the game and replacing the replays that go out of sync are up to you.
+- **Window language**: Switch between 日本語 and English with "Language" at the top right.
+
+
 ## Settings
 
 - **Player name**: The name shown to your opponent and spectators. It appears at the top left and right during a match.
@@ -283,7 +344,7 @@ On the character select screen, the netcode is also shown at the bottom left.
 - **Delay**: auto / 0F-8F. Auto picks the value from ping (→ "How it works", "Delay").
 - **Language**: 日本語 / English. At first, it follows the Windows display language. Logs are always in Japanese.
 
-Settings you change in the menu and the game location you choose are written to the matching line of `HiganRTool.ini` in this tool's folder as soon as you decide them.
+Settings you change in the menu and the game location you choose are written to the matching line of `HiganRTool.ini` as soon as you decide them.
 `HiganRTool.ini` and the menu always show the same value; neither takes priority.
 For settings not in the menu, edit `HiganRTool.ini`.
 
@@ -292,7 +353,7 @@ For settings not in the menu, edit `HiganRTool.ini`.
 - **Turn on vsync**: With the default `vsync = off` under `[pacing]`, vsync is off and the tool keeps 60.000 fps. Set `on` to use vsync, or `game` to follow the custom.exe setting. The custom.exe setting is not rewritten.
   The game never uses vsync in windowed mode, so only fullscreen changes.
 - **Refuse spectators**: Set `enable = 0` under `[spectate]`.
-  If either player has `0`, no match can be watched (random matches are not listed).
+  If either player has `0`, the match cannot be watched (random matches are not listed).
 - **Do not relay while watching**: Set `relay = 0` under `[spectate]`.
   You no longer relay to other spectators. You may still receive the match from a relaying spectator.
 - **Turn off automatic updates**: Set `update_check = 0` under `[loader]`.
@@ -326,29 +387,31 @@ All settings are listed in the table below.
 | | room | Room name |
 | | lan_host | The host address last entered under LAN "Client" or "Watch" (`192.168.0.2` or `192.168.0.2:17723`) |
 | | mode | Netcode. `rollback` (default) / `delay` |
-| | delay | Delay. `0`-`8` / `auto` (default; shared by rollback and the delay netcode) |
+| | delay | Delay (frames of input delay; shared by rollback and the delay netcode). `0`-`8` / `auto` (default) |
 | | host_seat | The Side. `1` / `2` (Any if there is no line) |
-| | rollback_hit_se | Hit sound with rollback. `confirmed` (only when confirmed; default) / `live` (already when predicted) |
-| | rollback_cutin_se | Cut-in sound with rollback. `confirmed` (only when confirmed; default) / `live` (already when predicted) |
+| | rollback_hit_se | Hit sound with rollback. `confirmed` (only when confirmed; the sound can be up to about 130 ms late; default) / `live` (already when predicted) |
+| | rollback_cutin_se | Cut-in sound with rollback. `confirmed` (only when confirmed; the sound can be up to about 130 ms late; default) / `live` (already when predicted) |
 | | ipv6 | Whether to use IPv6. `on` (default) / `off` (do not use) |
-| | stun / stun2 | Servers asked for your outside address. Empty means no query |
+| | stun / stun2 | Servers asked for your global address. Empty means no query |
 | | enable / scope / code_side / room_server / check | Basic network settings. Do not change |
 | | bind | The UDP port to listen on (default `auto:17723`; `auto:` tells the tool to pick your own address automatically). You may change it to a port you can open (forward). The two players do not need to use the same value |
 | | upnp | Whether to ask the router (UPnP) to open the listening port (`bind`). `on` (default; only while waiting, during a match and while relaying as a spectator, closed afterwards) / `off` (do not use) |
-| [pacing] | mode | How frames advance. `auto` (default; in windowed mode and in fullscreen without vsync, the tool keeps 60.000 fps) / `game` (left to the game) |
-| | wait | How the wait is done while the tool keeps 60.000 fps. `passive` (default; rests until just before each deadline, lighter processing load) / `active` (always busy-waits; see "Cut the delay a little more" above) |
-| | vsync | Vsync. `off` (default) / `on` / `game` (the custom.exe setting as is). Only fullscreen changes |
-| [replay] | enable | Automatic replay saving. `1` (save each match) / `0` (do not save). The save location is under "How it works", "Replays" |
+| [pacing] | mode | How frames advance. `auto` (default; the tool keeps 60.000 fps, except in fullscreen with vsync, where the game's own timing is used) / `game` (always the game's own timing) |
+| | wait | How the wait is done while the tool keeps 60.000 fps. `passive` (default; rests until just before each deadline, lighter processing load) / `active` (always busy-waits) |
+| | vsync | Vsync. `off` (default) / `on` / `game` (follow the custom.exe setting). Only fullscreen changes |
+| | replay_skip_fps | Speed while you hold Skip (Ctrl) during replay playback. `1`–`6000` (fps; default `240`; capped by what your PC and the tool can process) |
+| | replay_slow_fps | Speed while you hold Slow (Shift) during replay playback. `1`–`1000` (fps; default `30`) |
+| [replay] | enable | Automatic replay saving. `1` (save each match) / `0` (do not save) |
 | | layout | How the save folder is split. `peer` (`<1P> vs <2P>` folders) / `date` (by date) / `flat` (not split) / `pack50` (50 per folder, with names you can copy straight into the game's `replay` folder) |
-| | name | File name of saved replays. Default `th9_ud{num}`. You can use `{num}` (4-digit number) / `{date}` (yyyymmdd, `20261028`) / `{time}` (hhmm, `2313`) / `{1Pchara}` / `{2Pchara}` (characters) / `{1Pname}` / `{2Pname}` (names; characters that cannot be used become `-`) / `{round}` (number of rounds) / `{wins}` (rounds won, `2vs1`) / `{winner}` (`1P` or `2P`; `none` when undecided) / `{length}` (length of the match, `3m42s`) / `{rlengths}` (length of each round, `1m05s-1m22s`) / `{rlifes}` (life at the end of each round, `10vs0-0vs3`) / `{sync}` (`rollback` or `delay`) / `{delay}` (`2F`) / `{ping}` (`33ms`) / `{side}` (your side) / `{result}` (`win`, `lose` or `draw`); other characters are used as written. Allowed characters are ASCII letters, digits, `- _ . ( ) [ ] +` and spaces. Example: `th9_ud{date}-{time}_{1Pchara}VS{2Pchara}_{round}R_{winner}win`. |
-| [spectate] | enable | Accept spectators. `1` (accept; default) / `0` (refuse). If either player has `0`, no match can be watched |
+| | name | File name of saved replays. Default `th9_ud{num}`. You can use `{num}` (4-digit number) / `{date}` (yyyymmdd, `20261028`) / `{time}` (hhmm, `2313`) / `{1Pchara}` / `{2Pchara}` (characters) / `{1Pname}` / `{2Pname}` (names; characters that cannot be used become `-`) / `{round}` (number of rounds) / `{wins}` (rounds won, `2vs1`) / `{winner}` (`1P` or `2P`; `none` when undecided) / `{length}` (length of the match, `3m42s`) / `{rlengths}` (length of each round, `1m05s-1m22s`) / `{rlifes}` (life at the end of each round, `10vs0-0vs3`) / `{sync}` (`rollback` or `delay`) / `{delay}` (`2F`) / `{ping}` (`33ms`) / `{side}` (your side) / `{result}` (`win`, `lose` or `draw`); other characters are used as written. Characters that cannot be used in a file name (`\ / : * ? " < >`, the vertical bar and control characters) become `-`. A name that is too long is cut from the end (about 80 characters as a guide; the limit is written to the log). Example: `th9_ud{date}-{time}_{1Pchara}VS{2Pchara}_{round}R_{winner}win`. |
+| [spectate] | enable | Accept spectators. `1` (accept; default) / `0` (refuse). If either player has `0`, the match cannot be watched |
 | | relay | Relaying while watching. `1` (relay to other spectators; default) / `0` (do not relay). Used only when watching random matches and room matches |
-| | ff_max | Fast-forward speed when you join mid-match. `1`–`16` (times; default `8`) |
+| | ff_fps | Fast-forward speed when you join mid-match. `120`–`6000` (fps; default `480`; it may not reach that speed depending on the connection) |
 | [window] | width / height | Window size in pixels of the game image |
 | | x / y | Position of the window's top-left corner (only when both are written) |
 | | titlebar | Frame and title bar. `1` (show) / `0` (hide) |
 | | alwaysontop | Always on top. `1` (in front of other windows) / `0` (no) |
-| [pad] | pov | Whether to read the gamepad's D-pad as directions. `1` (read; default) / `0` (do not read) / `always` (for diagnosis). For gamepads the game does not read |
+| [pad] | pov | Whether to read the gamepad's D-pad as directions (for gamepads the game does not read). `1` (read; default) / `0` (do not read) / `always` (for diagnosis) |
 | [input] | split_keyboards | Split two keyboards between 1P and 2P in "人間 対 人間". `1` (split; default) / `0` (do not split) |
 | [ui] | lang | Language of the tool's screens. `auto` (Windows display language) / `ja` / `en` |
 | | status_side | Position of the connection status and delay row during a match. `1p` (bottom left; default) / `2p` (bottom right) / `self` (bottom left if you are 1P, bottom right if 2P) / `opponent` (bottom right if you are 1P, bottom left if 2P). Spectators always see it at the bottom left |
@@ -356,88 +419,50 @@ All settings are listed in the table below.
 | [loader] | game | The location of the game's `th09.exe` (if empty, a window to choose the folder opens) |
 | | update_check | Update check before starting, and the new-version notice while playing. `1` (check; default) / `0` (do not check) |
 
-If `[window]` is not written, the window stays as before. No effect in fullscreen.
+If `[window]` is not written, the window opens at the default size as before. No effect in fullscreen.
 
 
 ## How it works
 
-**Delay**
+### Delay
+
 - Delay N (shown as "Delay NF" on screen) means your input is delayed by N frames (N x 16.7 ms) so that both players can play on the same frame.
 - auto picks the value from ping: about 1F per 33 ms of round trip with the delay netcode, and about 1F per 67 ms with rollback (half of the one-way frames). When the ping is low and stable, it picks 0F. It is reviewed only at the start of a match and when you press Ctrl+9, never in the middle of a match.
 - To avoid changing every match, it goes up only when the round trip passes the boundary by more than 5 ms, and goes down only after 2 matches in a row were lower (pressing Ctrl+9 applies it at once).
 
-**rollback (default)**
-- For frames where the opponent's input has not arrived yet, the game predicts "the same input as before" and keeps going. When the real input arrives and differs, it goes back to that frame and runs again. So you can play at a lower delay than with a waiting netcode without stops.
+### rollback (default)
+
+- For frames where the opponent's input has not arrived yet, the game predicts "the same input as before" and keeps going. When the real input arrives and differs, it goes back to that frame and runs again. So you can play at a lower delay than with the delay netcode without stops.
 - When a prediction is wrong, bullets or the opponent may jump.
 - The two games compare their random state and life regularly, and if they differ, the match is stopped and a sound plays.
 
-**delay netcode**
+### delay netcode
+
 - Waits until the opponent's input arrives (the same as adonis). The screen keeps drawing while waiting.
 
-**Network**
+### Network
+
 - Match traffic goes directly between the two PCs (UDP), not through a server. Usually you do not need port forwarding.
 - Only when your opponent is behind a symmetric NAT does your port need to be open. If your router supports UPnP, the tool opens it automatically (→ "When you cannot connect").
 - The server is used only to find your opponent in a room and to ask for your outside address (STUN).
 
-**Replays**
-- One replay is saved automatically after every match, to `Replay_HiganRTool\<1P> vs <2P>\` in the game folder.
-- If the game is in a folder that needs administrator rights to write to, such as Program Files, Windows saves the replays to the folder of the same name under `%LOCALAPPDATA%\VirtualStore\` instead (the game's own `replay` folder works the same way).
-  Type `%LOCALAPPDATA%\VirtualStore` into the Explorer address bar to open it.
-  When you start the tool as administrator, it saves directly into the game folder.
-- Nothing is written to the game's `replay` folder. To watch one, copy it into the `replay` folder.
-- When a folder is full up to `th9_ud9999`, saving goes on in a folder with the same name plus `_2`, `_3`, and so on.
-- The game has a bug that crashes when saving the replay of a long match. This tool makes the game estimate the needed size correctly before saving, so it does not crash.
+### What the tool does to the game
 
-**Replay Repair Tool (HiganRTool_replay_fix.exe)**
-- **What it fixes**: Replays saved by v1.0.0 or earlier.
-  Replays saved by v1.1.0 or later, and replays already fixed by this tool, are skipped as "need no fix".
-  Replays not saved by HiganRTool cannot be fixed.
-- **How to use**:
-  1. Double-click `HiganRTool_replay_fix.exe`.
-  2. Choose with "Choose replays" or "Choose a folder". You can also drop them onto the exe or its window.
-     When you choose a folder, all replays inside it (up to 4 levels down) are loaded.
-  3. Each replay shows the 1P and 2P names and the charge settings (slow / charge) stored in it. Switch with "Prev" and "Next".
-  4. Under "New", choose the settings the two players actually used in that match.
-  5. "Fix this replay" fixes the replay on screen; "Fix the whole folder the same way" fixes every replay in the same folder with the same settings.
-  6. When it finishes, it shows how many were processed, where they were saved, and which were skipped.
-- **Where fixed replays go**: A copy with the same file name is made in `fix_replay\<original folder name>\<1P setting>-<2P setting>\`, one level above the original folder.
-  For example, fixing `Replay_HiganRTool\Alice vs Bob\th9_ud0008.rpy` with 1P charge / 2P slow makes `Replay_HiganRTool\fix_replay\Alice vs Bob\charge-slow\th9_ud0008.rpy`.
-  The original files are not changed.
-  Existing files with the same name are not overwritten.
-- **Which settings to choose**: Choose the settings the two players actually used in the match, not your PC's setting.
-  If you are not sure, make both and play both to compare.
-  `Replay_HiganRTool` has one folder per `<1P> vs <2P>`, and 1P and 2P are in the same order within a folder.
-  If the opponent did not change their setting, you can fix that folder all at once.
-- **Watching in the game**: Copy the fixed replays into the game's `replay` folder.
-  Checking them in the game and replacing the replays that go out of sync are up to you.
-- **Window language**: Switch between 日本語 and English with "Language" at the top right.
-
-**What the tool does to the game**
 - It starts the game suspended, loads the DLL, and changes only fixed places in memory. Before changing them, it checks that they match ver.1.50a, and changes nothing if they do not.
 - It never changes files in the game folder (exe, settings, save data, replays). It writes only inside `Replay_HiganRTool`.
   During online play, you can still take a screenshot with P / Home (the game itself saves it to its usual `snapshot` folder). Pressing them does not take one on the opponent's PC.
 
-**Two keyboards**
-- If keys have been pressed on two or more keyboards since the game started, a prompt appears at the top left each time you choose "人間 対 人間" in Match Mode.
-- Following the prompt, 1P and 2P each press Z, X, Shift, Up, Down, Left and Right in order on their own keyboard. The keyboard you press becomes yours.
-  If you use two devices, such as a keyboard and a separate numpad, press on each of them and both are yours.
-- While the keyboards are split, input from anything other than the assigned keyboards (including gamepads) is ignored.
-- The assignment stays when you return from the pause menu during a match, and when you change characters or rematch after a match.
-  Normal input comes back when you return to the title or the Match Mode screen, or move on to the replay save screen.
-- Press a gamepad button or Esc while the prompt is shown to play without splitting that time.
-
-
-## Safety
+### Safety
 
 - **Impersonation**: All match traffic carries an authentication tag made with a secret key for each connection. If someone who does not know the connection code sends fake inputs or disconnects, they are dropped without being read.
 - **Contents**: The contents of match and spectator traffic (inputs and names) are encrypted with a one-time key made for each connection. Even the developer, who runs the room server, cannot read them.
 - **What your opponent sees**: Your global IP address (in a match between the two players, each sees the other's; spectators see the host's; when spectators relay, the relaying spectator and the spectator receiving the relay see each other's; anyone can watch a random match from the list, so unknown spectators can see the host's too). It is also inside the connection code. Play only with people you trust, and do not give connection codes or logs to people you do not know.
 - **The room server**: Run by the developer on Cloudflare. It receives room names and connection codes over encrypted traffic (HTTPS), passes them to the other player and keeps no records. However, since connection codes pass through the server, the design cannot stop the server from handing over a fake code and sitting in between. If that worries you, send connection codes to each other by hand.
-- **UPnP**: Only while waiting, during a match and while relaying to other spectators, the tool asks your home router to open the listening port (`bind`) (only the router inside your home is asked).
+- **UPnP**: Only while waiting, during a match and while relaying to other spectators, the tool asks your home router to open the listening port (`bind`) (only your home router is asked).
   - It closes the port afterwards. If closing fails, the mapping expires after 1 hour.
   - For routers that refuse mappings with a time limit, it asks for one without a limit. If the tool crashes then, a mapping named "HiganRTool" stays on the router, but the tool takes it over at the next start and removes it when the tool next exits. You may also remove it by hand in the router settings.
   - While open, traffic from outside can reach that port, but anything with a wrong authentication tag is dropped (→ "Impersonation"). To turn this off, set `upnp = off` in `HiganRTool.ini`.
-- **Outgoing queries**: Once per start, the update check (the room server, and the GitHub download source it points to; only a query is sent). When connecting, one query each to STUN (Cloudflare and Google), repeated every 15 seconds until connected (if both players allow watching and you are the host, also during the match). Otherwise, if you only play without opening the menu, nothing is sent.
+- **Outgoing queries**: Once per start, the update check (the room server and the GitHub download source). When connecting, one query each to STUN (Cloudflare and Google), repeated every 15 seconds until connected (if both players allow watching, the host also repeats it during the match). Otherwise, if you only play without opening the menu, nothing is sent.
 - **Updates**: The hash list of the update files is signed by the developer. A list with a wrong signature, a version older than the current one, or a file whose hash (SHA-256) differs from the list is not used.
 
 
@@ -450,8 +475,7 @@ If `[window]` is not written, the window stays as before. No effect in fullscree
 - **"Desync detected. This match was stopped."**: Press Esc to go back to the menu. Both players, please attach the `logs` folder as a zip and tell the developer.
 - **A firewall prompt about `th09.exe`**: Check "Private networks" and click "Allow access".
 
-
-## When you cannot connect
+### When you cannot connect
 
 If you cannot connect, the cause and a number appear at the top left.
 
@@ -468,19 +492,15 @@ If both players have IPv6, you can connect regardless of the NAT type (`ipv6` in
    If not, one of you should connect from another network (a home connection, etc.), or both of you can join a virtual LAN and play over LAN (see "LAN").
 5. **Packets arrive from the opponent but you cannot connect**: If one connection code is old, packets may arrive in one direction only. Both players choose "Stop waiting", and one creates a new code and sends it to the opponent at once (in a room match or a random match, stop waiting first, then choose "Create play code" under Connect code). If it still does not connect, send the logs as in 1.
 
-
-## Logs
+### Logs
 
 - Logs are kept in the `logs` folder, one file per day (`dll_YYYYMMDD.log`). Starting several times on the same day adds to the same file, with a "==== 起動 ..." line at each start. Files older than 3 days are deleted automatically.
 - To send logs to the developer, zip the `logs` folder and send the zip.
-- Only when asked for a detailed record, change `detail = 0` under `[log]` in `HiganRTool.ini` to `detail = 1` (in an old `HiganRTool.ini` without `[log]`, add the two lines `[log]` and `detail = 1`), and play again.
-  Then zip the `logs` folder and send it in the same way.
+- Only when asked for a detailed record, change `detail = 0` under `[log]` in `HiganRTool.ini` to `detail = 1`, reproduce the problem again, and afterwards zip the `logs` folder and send it in the same way.
 - Logs do not contain names, Windows user names or raw IP addresses (only the kind of IP, such as "outside" or "home", and port numbers). Even so, please send them only as part of a bug report (contacts are in "Troubleshooting"), and avoid posting them as-is where anyone can see them.
 
+### Limitations
 
-## Limitations
-
-- When the file name made with `name` under `[replay]` in `HiganRTool.ini` is longer than 100 characters, or has characters that cannot be used, the replay is saved with the usual `th9_udXXXX.rpy` name.
 - Only ver.1.50a is supported.
 - Two players who are both behind symmetric NATs, or a connection that blocks UDP, cannot connect. This needs a relay server, and there is no plan for it yet.
 - From mainland China, the room server (Random Match, Room Match and the spectate list) may be unreachable without a VPN. Connection codes, LAN play and watch codes do not use the server and still work.
@@ -488,11 +508,10 @@ If both players have IPv6, you can connect regardless of the NAT type (`ipv6` in
 - Under Linux (Wine), the launcher may time out while waiting for the DLL to load. Run `wineserver -k` and start it again.
 - It cannot be used together with other tools for this game (other netplay tools, practice tools), because they patch the same places and conflict.
 - When assigning two keyboards, keys entered by remote tools such as Parsec or by an on-screen keyboard are all treated as one keyboard.
-- Replays saved automatically by v1.0.0 desync when played back in the game if the two players used different charge settings (slow / charge).
-  The netcode (rollback / delay) does not matter.
-  The match itself was played with the correct settings; only the replay playback desyncs.
-  From v1.1.0, replays are saved with the correct settings.
-  How to fix replays saved by v1.0.0 is under "Replay Repair Tool (HiganRTool_replay_fix.exe)" in "How it works".
+- When the folder where replays are saved is so long that fewer than 8 characters are left for `name` under `[replay]` in `HiganRTool.ini`, the replay is saved with the usual `th9_udXXXX.rpy` name (see `name` in "Settings").
+- Replays saved by v1.0.0 of matches where the two players used different charge settings (slow / charge) desync on playback.
+  The netcode (rollback / delay) does not matter, and they can be fixed afterwards. From v1.1.0 they do not desync.
+  How to fix replays saved by v1.0.0 is under "Replay Repair Tool (HiganRTool_replay_fix.exe)" in "Other features".
 
 
 <!-- zip:skip -->
@@ -547,7 +566,7 @@ Rename them to `HiganRTool.exe` and `HiganRTool.dll` and put them in the same fo
 ## License
 
 <!-- zip:skip -->
-[GPL-3.0](./LICENSE).
+[GPL-3.0](./LICENSE)
 <!-- /zip:skip -->
 <!-- zip:only
 GPL-3.0 (with an exception for Team Shanghai Alice; see `LICENSE.txt`).

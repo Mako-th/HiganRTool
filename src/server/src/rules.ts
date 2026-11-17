@@ -105,6 +105,24 @@ export const RANDOM_ROOM_HEX_LEN = 30;
 const RANDOM_ROOM_RE = /^q\.[0-9a-f]{30}$/;
 
 /**
+ * ルーム名ごとの一覧（`/v0/lobby/<ビルド番号>/<ルーム名>`）。1つのエンドポイントが見る・待機中を載せる（create）・試合中を載せる（post）を兼ねる。
+ * 一覧の1件ごとに割り当てる2席のルームの名は`r.` ＋ 乱数120 bitの16進30文字（`q.`と同じ作り）。クライアントは`r.`で始まる名を断る（room.rsの`parse`）。
+ */
+export const LOBBY_PATH_PREFIX = "/v0/lobby/";
+export const LOBBY_ROOM_PREFIX = "r.";
+export const LOBBY_ROOM_HEX_LEN = 30;
+const LOBBY_ROOM_RE = /^r\.[0-9a-f]{30}$/;
+/** 一覧の件数（待機中と試合中の合計）と同じ鍵（connectLimitKey）から載せられる件数。 */
+export const LOBBY_MAX_TOTAL = 20;
+export const LOBBY_MAX_PER_KEY = 2;
+/** 見る接続の上限（1つの一覧あたり）・同じ鍵から・作ってから閉じるまで。 */
+export const LOBBY_VIEW_MAX_TOTAL = 50;
+export const LOBBY_VIEW_MAX_PER_KEY = 3;
+export const LOBBY_VIEW_TTL_MS = 10 * 60 * 1000;
+/** 一覧の1通の上限（バイト）。1件260 B（名前の`"`と`\`を全部エスケープした最大）× 20件に余裕を足した値。 */
+export const LOBBY_LIST_MAX_BYTES = 8 * 1024;
+
+/**
  * 進行中のランダム対戦の一覧（`/v0/watch/<ビルド番号>/post`と`/v0/watch/<ビルド番号>/view`）。
  * postは対戦のホストが持ち続けて載せるエンドポイント。viewは観戦者が一覧を開いている間だけ持つエンドポイント。
  * ビルド番号ごとに別の一覧にする（違うビルドは観戦できないため）。
@@ -120,6 +138,9 @@ export const WATCH_MAX_PER_IP = 2;
 /** 観戦用のルーム名: `w.` ＋ SHA-256(ルーム名のASCII小文字)の先頭8 Bの16進（クライアントのroom.rsの`spectate_of`と同じ）。 */
 export const WATCH_ROOM_PREFIX = "w.";
 export const WATCH_HASH_BYTES = 8;
+
+/** ルーム名として人が打てない先頭（揃えた名で見る）。割り当ての名・観戦用の名とぶつけない。 */
+export const RESERVED_ROOM_PREFIXES: readonly string[] = [WATCH_ROOM_PREFIX, RANDOM_ROOM_PREFIX, LOBBY_ROOM_PREFIX];
 
 /** 観戦者の上限として受ける値（クライアントの`spectate::MAX_SPECTATORS`）。 */
 export const WATCH_CAP_MAX = 10;
@@ -176,6 +197,11 @@ export interface WatchItem {
   cap: number;
 }
 
+/** ルーム名ごとの一覧の1件。待機中は割り当てのルーム名r.…を出し、試合中は観戦用のw.…だけを出す。 */
+export type LobbyItem =
+  | { kind: "wait"; name: string; room: string }
+  | { kind: "play"; p1: string; p2: string; room: string; watch: boolean; watchers: number; cap: number; mode: string; delay: number };
+
 /** 元のルーム名の前後から除く文字（クライアントのroom.rsの `is_trimmed_space` = Unicode のWhite_SpaceとU+FEFF）。 */
 const SPECTATE_TRIM_CLASS = "[\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]";
 const SPECTATE_TRIM_RE = new RegExp(`^${SPECTATE_TRIM_CLASS}+|${SPECTATE_TRIM_CLASS}+$`, "g");
@@ -209,9 +235,9 @@ function intIn(v: unknown, lo: number, hi: number): v is number {
  * 載せるエンドポイントの最初の1通`{"t":"post",…}`を読む。割り当ての形の名（isRandomRoomName。揃えずに厳密に）・名前の文字・方式・数の範囲を全部見る。
  * チケット（ticket）は文字列であることだけを見る（形と署名はWatchListがticket.tsで見る）。
  */
-export function parsePost(o: Record<string, unknown>): ParsedPost {
+export function parsePost(o: Record<string, unknown>, roomOk: (room: string) => boolean = isRandomRoomName): ParsedPost {
   const { room, p1, p2, mode, delay, watchers, cap, ticket } = o;
-  if (typeof room !== "string" || !isRandomRoomName(room)) return { ok: false };
+  if (typeof room !== "string" || !roomOk(room)) return { ok: false };
   if (typeof ticket !== "string") return { ok: false };
   if (typeof p1 !== "string" || !WATCH_NAME_RE.test(p1)) return { ok: false };
   if (typeof p2 !== "string" || !WATCH_NAME_RE.test(p2)) return { ok: false };
@@ -220,6 +246,46 @@ export function parsePost(o: Record<string, unknown>): ParsedPost {
   if (!intIn(cap, 1, WATCH_CAP_MAX)) return { ok: false };
   if (!intIn(watchers, 0, cap)) return { ok: false };
   return { ok: true, room, p1, p2, mode, delay, watchers, cap, ticket };
+}
+
+export type ParsedLobbyPost =
+  | { ok: true; room: string; p1: string; p2: string; mode: string; delay: number; watch: boolean; watchers: number; cap: number; ticket: string }
+  | { ok: false };
+
+/** ルーム名ごとの一覧の`post`を読む。`room`が`r.…`の形で`watch`（真偽）が付く以外は[parsePost]と同じ。 */
+export function parseLobbyPost(o: Record<string, unknown>): ParsedLobbyPost {
+  const p = parsePost(o, isLobbyRoomName);
+  if (!p.ok || typeof o.watch !== "boolean") return { ok: false };
+  return { ...p, watch: o.watch };
+}
+
+/** ルーム名ごとの一覧の`create`を読む。名前は一覧に載せるプレイヤー名の決まり。 */
+export function parseCreate(o: Record<string, unknown>): { ok: true; name: string } | { ok: false } {
+  const { name } = o;
+  if (typeof name !== "string" || !WATCH_NAME_RE.test(name)) return { ok: false };
+  return { ok: true, name };
+}
+
+export type LobbyPath =
+  | { kind: "ok"; build: number; name: string }
+  | { kind: "not_found" }
+  | { kind: "bad_build" }
+  | { kind: "bad_room_name" };
+
+/**
+ * パス`/v0/lobby/<番号>/<ルーム名>`を読む。決まりの外の組み立ては入口が断る形（404 / 400）に分ける。
+ * ルーム名は揃えた形を返す。揃えた名が割り当て・観戦用の先頭（RESERVED_ROOM_PREFIXES）で始まれば`bad_room_name`。
+ */
+export function parseLobbyPath(pathname: string): LobbyPath {
+  if (!pathname.startsWith(LOBBY_PATH_PREFIX)) return { kind: "not_found" };
+  const parts = pathname.slice(LOBBY_PATH_PREFIX.length).split("/");
+  if (parts.length !== 2 || parts[1].length === 0) return { kind: "not_found" };
+  const build = parseBuildSegment(parts[0]);
+  if (build === null) return { kind: "bad_build" };
+  const decoded = decodeRoomName(parts[1]);
+  const name = decoded === null ? null : normalizeRoomName(decoded);
+  if (name === null || RESERVED_ROOM_PREFIXES.some((p) => name.startsWith(p))) return { kind: "bad_room_name" };
+  return { kind: "ok", build, name };
 }
 
 /** パス`/v0/watch/<番号>/<post|view>`を読む。決まりの外ならnull。 */
@@ -238,22 +304,36 @@ export function parseBuildSegment(seg: string): number | null {
   return n <= BUILD_MAX ? n : null;
 }
 
-/** 割り当てるルーム名を生成する（OSの乱数。`random`は検査が差し替える箇所）。 */
-export function newRandomRoomName(
-  random: (buf: Uint8Array) => void = (b) => {
-    crypto.getRandomValues(b);
-  },
-): string {
-  const bytes = new Uint8Array(RANDOM_ROOM_HEX_LEN / 2);
+function randomHexName(prefix: string, hexLen: number, random: (buf: Uint8Array) => void): string {
+  const bytes = new Uint8Array(hexLen / 2);
   random(bytes);
   let hex = "";
   for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return RANDOM_ROOM_PREFIX + hex;
+  return prefix + hex;
+}
+
+const osRandom = (b: Uint8Array): void => {
+  crypto.getRandomValues(b);
+};
+
+/** 割り当てるルーム名を作成する（OSの乱数。`random`は検査が差し替える箇所）。 */
+export function newRandomRoomName(random: (buf: Uint8Array) => void = osRandom): string {
+  return randomHexName(RANDOM_ROOM_PREFIX, RANDOM_ROOM_HEX_LEN, random);
+}
+
+/** ルーム名ごとの一覧の待機中の1件へ割り当てるルーム名（`r.`）を作成する。 */
+export function newLobbyRoomName(random: (buf: Uint8Array) => void = osRandom): string {
+  return randomHexName(LOBBY_ROOM_PREFIX, LOBBY_ROOM_HEX_LEN, random);
 }
 
 /** 揃えた後のルーム名がランダム対戦の割り当てた形かどうか。 */
 export function isRandomRoomName(name: string): boolean {
   return RANDOM_ROOM_RE.test(name);
+}
+
+/** ルーム名ごとの一覧の割り当てた形（`r.` ＋ 小文字の16進30文字）かどうか。 */
+export function isLobbyRoomName(name: string): boolean {
+  return LOBBY_ROOM_RE.test(name);
 }
 
 /** ルームのエンドポイントのパス（`/v0/rooms/<名>`）の名の符号化だけを戻す（クライアントが打った形にする）。戻せなければnull。 */
@@ -508,5 +588,6 @@ export type ServerMessage =
   /** ticketは対戦のルームのguestへ渡すときだけ（SEAT_KEYがあるときだけ）。 */
   | { t: "peer"; code: string; ticket?: string }
   | { t: "listed" }
-  | { t: "list"; items: WatchItem[] }
+  | { t: "list"; items: WatchItem[] | LobbyItem[] }
+  | { t: "created"; room: string }
   | { t: "error"; code: CloseName };

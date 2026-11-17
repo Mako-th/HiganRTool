@@ -1067,8 +1067,7 @@ pub fn set_scan_handler(h: Option<ScanHandler>) {
     SCAN_HANDLER.store(h.map_or(0, |f| f as usize as u32), Ordering::Release);
 }
 
-/// 走査の包みのフックが設定されているかどうか（観戦者の設置がフックまで設定したことを検査が検証する）。
-#[cfg(test)]
+/// 走査の包みのフックが設定されているかどうか。
 pub(crate) fn scan_handler_is_set() -> bool {
     SCAN_HANDLER.load(Ordering::Acquire) != 0
 }

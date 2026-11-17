@@ -937,7 +937,12 @@ impl Game for MenuGame {
             cpu_1p: 0,
             cpu_2p: 0,
             background: 0,
-            rng_seed: if role == Role::Host { 0x4243 } else { 0 },
+            // マッチごとに変える（再戦で積み直すシードが切替のtickの値かを見分けるため）。
+            rng_seed: if role == Role::Host {
+                0x4243u16.wrapping_add(self.matches as u16)
+            } else {
+                0
+            },
             option_digest: 0,
         }
     }

@@ -11,6 +11,7 @@
 //! - r > spin + 余裕: 高分解能の待機タイマーで寝る（長さ = min(r − spin − 余裕, `hybrid_chunk_us`)をµsに切り捨て）。
 //! - r ≤ spin + 余裕: `Sleep(0)`で譲る。
 //! - r ≤ spin: QPCを読み続けて期限ちょうどに始める（`Pace::decide`の`Head::Spin`）。
+//!
 //! **余裕**（`Doze::margin`）= max(`hybrid_margin_us`, 寝過ごしの山 + `hybrid_guard_us`)を`hybrid_margin_max_us`で抑えたもの。
 //! 寝過ごし = 実際に寝た長さ − 頼んだ長さ。
 //! 山は寝るたびに減る。新しい寝過ごしがそれより大きければその値になる。

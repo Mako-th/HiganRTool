@@ -21,8 +21,8 @@ use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::{
-    CreateWaitableTimerW, GetCurrentProcessorNumberEx, GetCurrentThread, SetWaitableTimer, Sleep,
-    WaitForSingleObject,
+    CreateWaitableTimerW, GetCurrentProcessorNumberEx, GetCurrentThread, GetCurrentThreadId,
+    SetWaitableTimer, Sleep, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
 
@@ -200,6 +200,9 @@ pub struct RealClock {
     interval: u32,
     /// ゲーム自身の時計の経路で読むウィンドウの構造体のアドレス（`th09_addr::WINDOW_ADDR`）。0なら読まない（`game_due`は偽 —— 始まりで待たない）。
     window: u32,
+    /// リプレイ再生の速さの判定が読むアドレス（グローバル状態の1バイトと1Pの入力ワードの2バイト。`RealPacingHost::arm_replay_speed`が設定する）。どちらかが0なら読まない。
+    replay_state: u32,
+    replay_cur: u32,
 }
 
 /// 検査だけ: PresentationIntervalの代わりのアドレス（0なら本物と同じ決め方）。
@@ -284,6 +287,26 @@ impl PaceClock for RealClock {
         let v = unsafe { core::ptr::read_volatile(self.interval as usize as *const u32) };
         pace::fullscreen_screen(v)
     }
+    fn replay_read(&mut self) -> Option<pace::ReplayRead> {
+        if self.replay_state == 0 || self.replay_cur == 0 {
+            return None;
+        }
+        // SAFETY: 0でないアドレスは`pacing::install`が設置の時に読めると検証してから`arm_replay_speed`で渡したものだけ。
+        // 対象は`GLOBAL_STATE`の1バイトと`INPUT_MANAGERS[0] + IM_CUR`の2バイト（どちらもth09.exeの .data。image baseの一致と地点の照合が通った後にだけ来る）。
+        // 後者は2バイト揃え。exeの .dataはプロセスが終わるまで読み取り可能。
+        // 書き手（ゲームの状態遷移・入力の関数）はこの先頭と同じゲームのスレッドなので読む間に変わらない。確保も待ちもしない。
+        let (global_state, cur) = unsafe {
+            (
+                core::ptr::read_volatile(self.replay_state as usize as *const u8),
+                core::ptr::read_volatile(self.replay_cur as usize as *const u16),
+            )
+        };
+        Some(pace::ReplayRead {
+            global_state,
+            cur,
+            net_session: crate::script_win::NET_ON.load(Ordering::Acquire) != 0,
+        })
+    }
 }
 
 /// 先頭のフック。ゲームのスレッドは`try_lock`だけで取り（待たない）、取れなければゲーム自身の経路へ任せる。
@@ -307,6 +330,17 @@ static FPU_CW: AtomicU32 = AtomicU32::new(GAME_FPU_CW as u32);
 /// 先頭でゲーム自身の経路へ任せた回数・パニックを受けた回数。
 static FALLBACKS: AtomicU32 = AtomicU32::new(0);
 static PANICS: AtomicU32 = AtomicU32::new(0);
+
+/// 先頭を呼んだ最初のスレッド（ゲームのスレッド）のID。0は先頭がまだ呼ばれていない。fpsの測り（`fps_win`）が、読み込みのスレッドからの呼びを見分けるのに読む。
+pub static HEAD_TID: AtomicU32 = AtomicU32::new(0);
+
+/// `cell`が0のときだけ呼んだスレッドのIDを書く（先頭は1フレームに何千回も来るため、書いた後はAPIを呼ばない）。
+fn note_game_thread(cell: &AtomicU32) {
+    if cell.load(Ordering::Relaxed) == 0 {
+        // SAFETY: 引数の無い呼び出し。
+        cell.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+    }
+}
 
 /// 始まりの中で相手の入力ワードを待つフック（`script_win::head_wait_hook`。delay方式のlockstepのときだけ待つ）。0なら何もしない。
 /// 設定するのはネットワークのセッションを動かす実行だけ。それ以外では`pace_head`はアトミック変数を1回読んで戻るだけ。
@@ -342,6 +376,7 @@ fn run_head_wait() {
 ///
 /// 「まだ」（`HEAD_NOT_YET`）・ロックが取れない・箱が無い・パニックの経路では待たない。ロックは待つ前に手放す（待つ間に読み取りのスレッドが先頭のフックを触れるように）。
 pub extern "C" fn pace_head() -> u32 {
+    note_game_thread(&HEAD_TID);
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut g) = PACER.try_lock() else {
             return None;
@@ -612,6 +647,8 @@ impl PacingHost for RealPacingHost {
                 screen_flag,
                 interval: interval_addr(screen_flag),
                 window,
+                replay_state: 0,
+                replay_cur: 0,
             },
         ));
         VPATCH_WAIT_ON.store(u32::from(vpatch), Ordering::SeqCst);
@@ -628,6 +665,22 @@ impl PacingHost for RealPacingHost {
             pacing::SPIN_US,
             pacing::CHUNK_US
         ))
+    }
+
+    fn arm_replay_speed(&mut self, state: u32, cur: u32) -> Option<(u64, u64)> {
+        let mut g = PACER.lock().ok()?;
+        let (p, c) = g.as_mut()?;
+        c.replay_state = state;
+        c.replay_cur = cur;
+        Some(p.replay_fps())
+    }
+
+    fn arm_replay_extra_dev(&mut self) {
+        if let Ok(mut g) = PACER.lock()
+            && let Some((p, _)) = g.as_mut()
+        {
+            p.set_dev_replay_extra(true);
+        }
     }
 
     fn cpu_classes(&mut self) -> Result<CpuClasses, String> {
@@ -675,7 +728,15 @@ impl PacingHost for RealPacingHost {
                     &classes,
                     &mut *w,
                     &|| stop2.load(Ordering::Acquire),
-                    &mut |ms| std::thread::sleep(Duration::from_millis(ms)),
+                    &mut |ms| {
+                        PACE_RING
+                            .replay_frames()
+                            .drain(|f| crate::main_log::push_detail(f.line()));
+                        pacing::drain_replay_extra(crate::main_log::push_detail);
+                        // リプレイの高速再生が要求した走査のcallの書き込み（ゲームのスレッドの外で行う）。パニックしても書き出しは続ける。
+                        let _ = catch_unwind(crate::script_win::replay_scan_service);
+                        std::thread::sleep(Duration::from_millis(ms));
+                    },
                     // CSVを書かない実行は、行を組み立てずに集計にだけ入れる（CSVの秒数0）。
                     pacing::WriterLimits {
                         csv_seconds: if write_csv { limits.csv_seconds } else { 0 },
@@ -1258,6 +1319,73 @@ mod tests {
         *PACER.lock().unwrap() = None;
     }
 
+    #[test]
+    fn real_clock_reads_the_replay_words_it_was_given() {
+        use crate::script_win::NET_ON;
+        use core::sync::atomic::{AtomicU8, AtomicU16};
+        use higanr_core::pacing::ReplayRead;
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        static CUR: AtomicU16 = AtomicU16::new(0);
+        let _g = lock();
+        let mut h = RealPacingHost::new(None, None, None);
+        let auto = PacingIni {
+            mode: Mode::Auto,
+            ..PacingIni::DEFAULT
+        };
+        let read = || {
+            PACER
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|(_, c)| c.replay_read())
+        };
+        let (state, cur) = (STATE.as_ptr() as usize as u32, CUR.as_ptr() as usize as u32);
+        *PACER.lock().unwrap() = None;
+        assert_eq!(
+            h.arm_replay_speed(state, cur),
+            None,
+            "箱が無ければ何もしない"
+        );
+        h.arm_pacer(10_000_000, &auto, 0, 0).expect("auto の箱");
+        assert_eq!(read(), None, "アドレスを渡す前は読まない");
+        h.arm_replay_speed(state, 0);
+        assert_eq!(read(), None, "片方が0なら読まない");
+        h.arm_replay_speed(0, cur);
+        assert_eq!(read(), None, "片方が0なら読まない");
+        assert_eq!(h.arm_replay_speed(state, cur), Some((240, 30)));
+        NET_ON.store(0, Ordering::SeqCst);
+        for (s, c, net) in [
+            (0x0Cu8, 0x0100u16, 0u32),
+            (0x04, 0x0004, 0),
+            (0x0C, 0x0000, 1),
+        ] {
+            STATE.store(s, Ordering::SeqCst);
+            CUR.store(c, Ordering::SeqCst);
+            NET_ON.store(net, Ordering::SeqCst);
+            assert_eq!(
+                read(),
+                Some(ReplayRead {
+                    global_state: s,
+                    cur: c,
+                    net_session: net != 0
+                })
+            );
+        }
+        NET_ON.store(0, Ordering::SeqCst);
+        // 刻めないfps（QPF 500 Hzに1000 fps）は通常のfps（60）に置き換えた値を返す。
+        let slow_qpf = PacingIni {
+            mode: Mode::B,
+            replay_skip_fps: 1_000,
+            ..PacingIni::DEFAULT
+        };
+        h.arm_pacer(500, &slow_qpf, 0, 0).expect("B の箱");
+        assert_eq!(h.arm_replay_speed(state, cur), Some((60, 30)));
+        // 箱を作り直すと渡したアドレスは消える。
+        h.arm_pacer(10_000_000, &auto, 0, 0).expect("auto の箱");
+        assert_eq!(read(), None);
+        *PACER.lock().unwrap() = None;
+    }
+
     /// IMMEDIATEを見落とさない。本物のフラグのアドレスでないときは本物のPresentationIntervalのアドレスを読まない。
     #[test]
     fn real_clock_reads_the_present_interval_only_in_fullscreen() {
@@ -1302,6 +1430,30 @@ mod tests {
 
     fn panic_hook() {
         panic!("検査: 先頭のフックの中の待ちのフックのパニック");
+    }
+
+    #[test]
+    fn pace_head_notes_the_first_thread_that_calls_it() {
+        let _g = lock();
+        *PACER.lock().unwrap() = None;
+        set_head_wait(None);
+        HEAD_TID.store(0, Ordering::SeqCst);
+        let first = std::thread::spawn(|| {
+            pace_head();
+            // SAFETY: 引数の無い呼び出し。
+            unsafe { GetCurrentThreadId() }
+        })
+        .join()
+        .unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(HEAD_TID.load(Ordering::SeqCst), first);
+        pace_head();
+        assert_eq!(
+            HEAD_TID.load(Ordering::SeqCst),
+            first,
+            "2 回目以降は別のスレッドでも書き換えない"
+        );
+        HEAD_TID.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -1471,6 +1623,8 @@ mod tests {
             screen_flag: 0,
             interval: 0,
             window: 0,
+            replay_state: 0,
+            replay_cur: 0,
         };
         let mut p = Pacer::new(
             q,

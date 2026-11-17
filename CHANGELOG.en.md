@@ -6,6 +6,41 @@ Different versions cannot connect to each other.
 Use the same version as your opponent.
 
 
+## v1.3.0
+
+### Added
+
+- Room match now lists the players waiting and the pairs in a match under the same room name. Several pairs can now play under the same room name.
+  Choose a waiting opponent in the list to play them, or a match row to watch it.
+  If nobody is there, or you choose "Host a match" in the list, you wait (your own waiting row is shown greyed out).
+- "Room match" under Watch now also lets you choose a match under that room name from a list.
+- While a replay plays, holding Skip (Ctrl) now plays it fast (4x by default) and holding Slow (Shift) plays it slow (0.5x by default).
+  You can change the speeds with `replay_skip_fps` and `replay_slow_fps` under `[pacing]` in `HiganRTool.ini`.
+- The tool version is now shown on the title screen and on the first line of `README.txt`.
+  The folder inside the zip is now named `HiganRTool`, without the version.
+  The automatic update does not rename the folder, so a versioned name stopped matching after an update.
+
+### Changed
+
+- `ff_max` (fast-forward multiplier) under `[spectate]` in `HiganRTool.ini` is replaced by `ff_fps` (fast-forward fps; `120`–`6000`, default `480`).
+  The automatic update carries over your current value (`ff_max = 8` becomes `ff_fps = 480`).
+
+### Fixed
+
+- Fixed the fps display wavering between 59.8 and 60.2 even when the game ran at 60 fps.
+  The game measures with millisecond timestamps, so the tool now measures with a finer clock.
+  In cases such as fullscreen with vsync, the game's own measurement is still shown as before.
+- Fixed replays not being saved with the `name` set under `[replay]` in `HiganRTool.ini` when it contained symbols such as `&`.
+  Characters that cannot be used in a file name are replaced with `-`.
+  A name that is too long is cut from the end.
+  The limit depends on the length of the save folder and is written to the log.
+- Fixed spectating from partway through a rematch replaying from the first match of the same pairing.
+- Fixed error messages, such as a failed connection, staying at the top of the screen for a whole game when you play another mode while waiting for an opponent.
+  During a game they now disappear after 30 seconds and are shown again after the game.
+- The log now records where each auto-saved replay was saved, and the environment at startup (code page, whether the game runs as administrator, and so on).
+  This makes it possible to find the cause of problems such as replays not being saved from the log.
+
+
 ## v1.2.1
 
 ### Added

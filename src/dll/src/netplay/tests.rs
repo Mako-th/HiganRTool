@@ -2748,7 +2748,7 @@ fn a_watcher_closes_the_end_menu_with_the_players_item_at_the_same_frame() {
                     wait_budget_us: 0,
                     margin_frames: WATCH_MARGIN_FRAMES,
                     require_net_selection: true,
-                    ff_max: higanr_core::spectate_pace::FF_UPDATES_DEFAULT,
+                    ff_fps: higanr_core::spectate_pace::FF_FPS_DEFAULT,
                 },
                 1 << 14,
             );
